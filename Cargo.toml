@@ -1,0 +1,19 @@
+[package]
+name = "meganeura"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "E-graph optimized neural network training on blade-graphics"
+license = "MIT"
+
+[dependencies]
+blade-graphics = "0.7"
+blade-macros = "0.3"
+egglog = "2.0"
+bytemuck = { version = "1", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+
+[[example]]
+name = "mnist"
+path = "examples/mnist.rs"
