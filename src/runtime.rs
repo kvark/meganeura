@@ -164,8 +164,7 @@ impl Pipelines {
 
         let mut map = HashMap::new();
         for (file, entries) in &needed {
-            let source = std::fs::read_to_string(file)
-                .unwrap_or_else(|e| panic!("failed to read shader {}: {}", file, e));
+            let source = crate::codegen::generate_wgsl(file);
             let shader = gpu.create_shader(bg::ShaderDesc { source: &source });
 
             for entry in entries {

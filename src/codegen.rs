@@ -1,0 +1,1813 @@
+//! Shader codegen via Naga IR.
+//!
+//! Instead of loading static `.wgsl` files, this module builds `naga::Module`
+//! objects programmatically and emits WGSL via `naga::back::wgsl`. When blade
+//! gains `create_shader_from_module()`, we can skip the WGSL roundtrip.
+
+use naga::*;
+
+const S: Span = Span::UNDEFINED;
+
+// ---------------------------------------------------------------------------
+// Builder: wraps a naga::Module and provides convenience methods
+// ---------------------------------------------------------------------------
+
+struct Builder {
+    m: Module,
+    // Cached types
+    ty_f32: Handle<Type>,
+    ty_u32: Handle<Type>,
+    ty_vec3u: Handle<Type>,
+    ty_arr_f32: Handle<Type>,
+}
+
+impl Builder {
+    fn new() -> Self {
+        let mut m = Module::default();
+
+        let ty_f32 = m.types.insert(
+            Type {
+                name: None,
+                inner: TypeInner::Scalar(Scalar::F32),
+            },
+            S,
+        );
+        let ty_u32 = m.types.insert(
+            Type {
+                name: None,
+                inner: TypeInner::Scalar(Scalar::U32),
+            },
+            S,
+        );
+        let ty_vec3u = m.types.insert(
+            Type {
+                name: None,
+                inner: TypeInner::Vector {
+                    size: VectorSize::Tri,
+                    scalar: Scalar::U32,
+                },
+            },
+            S,
+        );
+        let ty_arr_f32 = m.types.insert(
+            Type {
+                name: None,
+                inner: TypeInner::Array {
+                    base: ty_f32,
+                    size: ArraySize::Dynamic,
+                    stride: 4,
+                },
+            },
+            S,
+        );
+
+        Self {
+            m,
+            ty_f32,
+            ty_u32,
+            ty_vec3u,
+            ty_arr_f32,
+        }
+    }
+
+    /// Create a Params struct type with named u32 fields (4 fields, 16 bytes).
+    fn params_u32x4(&mut self, name: &str, fields: &[&str]) -> Handle<Type> {
+        let members: Vec<StructMember> = fields
+            .iter()
+            .enumerate()
+            .map(|(i, n)| StructMember {
+                name: Some(n.to_string()),
+                ty: self.ty_u32,
+                binding: None,
+                offset: (i as u32) * 4,
+            })
+            .collect();
+        self.m.types.insert(
+            Type {
+                name: Some(name.to_string()),
+                inner: TypeInner::Struct {
+                    members,
+                    span: 16,
+                },
+            },
+            S,
+        )
+    }
+
+    /// Create a Params struct where the second field is f32 (for SGD lr).
+    fn params_u32_f32_u32_u32(
+        &mut self,
+        name: &str,
+        fields: &[&str],
+    ) -> Handle<Type> {
+        assert_eq!(fields.len(), 4);
+        let tys = [self.ty_u32, self.ty_f32, self.ty_u32, self.ty_u32];
+        let members: Vec<StructMember> = fields
+            .iter()
+            .enumerate()
+            .map(|(i, n)| StructMember {
+                name: Some(n.to_string()),
+                ty: tys[i],
+                binding: None,
+                offset: (i as u32) * 4,
+            })
+            .collect();
+        self.m.types.insert(
+            Type {
+                name: Some(name.to_string()),
+                inner: TypeInner::Struct {
+                    members,
+                    span: 16,
+                },
+            },
+            S,
+        )
+    }
+
+    /// Add a storage buffer global variable (read-only).
+    fn storage_ro(&mut self, name: &str) -> Handle<GlobalVariable> {
+        self.m.global_variables.append(
+            GlobalVariable {
+                name: Some(name.to_string()),
+                space: AddressSpace::Storage {
+                    access: StorageAccess::LOAD,
+                },
+                binding: None,
+                ty: self.ty_arr_f32,
+                init: None,
+            },
+            S,
+        )
+    }
+
+    /// Add a storage buffer global variable (read-write).
+    fn storage_rw(&mut self, name: &str) -> Handle<GlobalVariable> {
+        self.m.global_variables.append(
+            GlobalVariable {
+                name: Some(name.to_string()),
+                space: AddressSpace::Storage {
+                    access: StorageAccess::LOAD | StorageAccess::STORE,
+                },
+                binding: None,
+                ty: self.ty_arr_f32,
+                init: None,
+            },
+            S,
+        )
+    }
+
+    /// Add a uniform buffer global variable.
+    fn uniform(&mut self, name: &str, ty: Handle<Type>) -> Handle<GlobalVariable> {
+        self.m.global_variables.append(
+            GlobalVariable {
+                name: Some(name.to_string()),
+                space: AddressSpace::Uniform,
+                binding: None,
+                ty,
+                init: None,
+            },
+            S,
+        )
+    }
+
+    /// Add a workgroup variable (array<f32, N>).
+    fn workgroup_array(&mut self, name: &str, count: u32) -> Handle<GlobalVariable> {
+        let ty = self.m.types.insert(
+            Type {
+                name: None,
+                inner: TypeInner::Array {
+                    base: self.ty_f32,
+                    size: ArraySize::Constant(std::num::NonZeroU32::new(count).unwrap()),
+                    stride: 4,
+                },
+            },
+            S,
+        );
+        self.m.global_variables.append(
+            GlobalVariable {
+                name: Some(name.to_string()),
+                space: AddressSpace::WorkGroup,
+                binding: None,
+                ty,
+                init: None,
+            },
+            S,
+        )
+    }
+
+    /// Add a compute entry point.
+    fn entry_point(
+        &mut self,
+        name: &str,
+        workgroup_size: [u32; 3],
+        func: Function,
+    ) {
+        self.m.entry_points.push(EntryPoint {
+            name: name.to_string(),
+            stage: ShaderStage::Compute,
+            early_depth_test: None,
+            workgroup_size,
+            workgroup_size_overrides: None,
+            function: func,
+        });
+    }
+
+    fn finish(self) -> Module {
+        self.m
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FnBuilder: builds a single function body
+// ---------------------------------------------------------------------------
+
+struct FnBuilder {
+    f: Function,
+    #[allow(dead_code)]
+    ty_f32: Handle<Type>,
+    #[allow(dead_code)]
+    ty_u32: Handle<Type>,
+    ty_vec3u: Handle<Type>,
+}
+
+impl FnBuilder {
+    fn new(b: &Builder) -> Self {
+        Self {
+            f: Function::default(),
+            ty_f32: b.ty_f32,
+            ty_u32: b.ty_u32,
+            ty_vec3u: b.ty_vec3u,
+        }
+    }
+
+    /// Add the gid argument: @builtin(global_invocation_id) gid: vec3<u32>
+    fn arg_gid(&mut self) -> Handle<Expression> {
+        self.f.arguments.push(FunctionArgument {
+            name: Some("gid".to_string()),
+            ty: self.ty_vec3u,
+            binding: Some(Binding::BuiltIn(BuiltIn::GlobalInvocationId)),
+        });
+        self.expr(Expression::FunctionArgument(
+            self.f.arguments.len() as u32 - 1,
+        ))
+    }
+
+    /// Add the lid argument: @builtin(local_invocation_id) lid: vec3<u32>
+    fn arg_lid(&mut self) -> Handle<Expression> {
+        self.f.arguments.push(FunctionArgument {
+            name: Some("lid".to_string()),
+            ty: self.ty_vec3u,
+            binding: Some(Binding::BuiltIn(BuiltIn::LocalInvocationId)),
+        });
+        self.expr(Expression::FunctionArgument(
+            self.f.arguments.len() as u32 - 1,
+        ))
+    }
+
+    fn expr(&mut self, e: Expression) -> Handle<Expression> {
+        self.f.expressions.append(e, S)
+    }
+
+    fn named(&mut self, name: &str, e: Expression) -> Handle<Expression> {
+        let h = self.f.expressions.append(e, S);
+        self.f
+            .named_expressions
+            .insert(h, name.to_string());
+        h
+    }
+
+    /// Give a name to an existing expression handle.
+    fn label(&mut self, name: &str, h: Handle<Expression>) -> Handle<Expression> {
+        self.f.named_expressions.insert(h, name.to_string());
+        h
+    }
+
+    /// Push Emit statements to the function body, skipping pre-emitted
+    /// expressions (GlobalVariable, Literal, etc.).
+    fn emit(&mut self, first: Handle<Expression>, last: Handle<Expression>) {
+        push_emit(&self.f.expressions, &mut self.f.body, first, last);
+    }
+
+    /// GlobalVariable pointer expression.
+    fn global(&mut self, gv: Handle<GlobalVariable>) -> Handle<Expression> {
+        self.expr(Expression::GlobalVariable(gv))
+    }
+
+    /// Extract .x from a vec3 value (produces a value, not a pointer).
+    fn vec_x(&mut self, vec: Handle<Expression>) -> Handle<Expression> {
+        self.expr(Expression::AccessIndex {
+            base: vec,
+            index: 0,
+        })
+    }
+
+    /// Extract .y from a vec3 value (produces a value, not a pointer).
+    fn vec_y(&mut self, vec: Handle<Expression>) -> Handle<Expression> {
+        self.expr(Expression::AccessIndex {
+            base: vec,
+            index: 1,
+        })
+    }
+
+    /// AccessIndex on a struct or array
+    fn field(&mut self, base: Handle<Expression>, index: u32) -> Handle<Expression> {
+        self.expr(Expression::AccessIndex { base, index })
+    }
+
+    /// Dynamic array access: base[index]
+    fn index(
+        &mut self,
+        base: Handle<Expression>,
+        idx: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.expr(Expression::Access {
+            base,
+            index: idx,
+        })
+    }
+
+    fn load(&mut self, ptr: Handle<Expression>) -> Handle<Expression> {
+        self.expr(Expression::Load { pointer: ptr })
+    }
+
+    fn literal_f32(&mut self, v: f32) -> Handle<Expression> {
+        self.expr(Expression::Literal(Literal::F32(v)))
+    }
+
+    fn literal_u32(&mut self, v: u32) -> Handle<Expression> {
+        self.expr(Expression::Literal(Literal::U32(v)))
+    }
+
+    fn binary(
+        &mut self,
+        op: BinaryOperator,
+        l: Handle<Expression>,
+        r: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.expr(Expression::Binary {
+            op,
+            left: l,
+            right: r,
+        })
+    }
+
+    fn unary(
+        &mut self,
+        op: UnaryOperator,
+        e: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.expr(Expression::Unary { op, expr: e })
+    }
+
+    fn math1(
+        &mut self,
+        fun: MathFunction,
+        arg: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.expr(Expression::Math {
+            fun,
+            arg,
+            arg1: None,
+            arg2: None,
+            arg3: None,
+        })
+    }
+
+    fn math2(
+        &mut self,
+        fun: MathFunction,
+        arg: Handle<Expression>,
+        arg1: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.expr(Expression::Math {
+            fun,
+            arg,
+            arg1: Some(arg1),
+            arg2: None,
+            arg3: None,
+        })
+    }
+
+    fn select(
+        &mut self,
+        cond: Handle<Expression>,
+        accept: Handle<Expression>,
+        reject: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.expr(Expression::Select {
+            condition: cond,
+            accept,
+            reject,
+        })
+    }
+
+    fn cast_f32(&mut self, e: Handle<Expression>) -> Handle<Expression> {
+        self.expr(Expression::As {
+            expr: e,
+            kind: ScalarKind::Float,
+            convert: Some(4),
+        })
+    }
+
+    fn local_var(
+        &mut self,
+        name: &str,
+        ty: Handle<Type>,
+        init: Option<Handle<Expression>>,
+    ) -> Handle<LocalVariable> {
+        self.f.local_variables.append(
+            LocalVariable {
+                name: Some(name.to_string()),
+                ty,
+                init,
+            },
+            S,
+        )
+    }
+
+    fn local_ptr(&mut self, lv: Handle<LocalVariable>) -> Handle<Expression> {
+        self.expr(Expression::LocalVariable(lv))
+    }
+
+    fn store(
+        &self,
+        ptr: Handle<Expression>,
+        value: Handle<Expression>,
+    ) -> Statement {
+        Statement::Store {
+            pointer: ptr,
+            value,
+        }
+    }
+
+    fn if_return(&self, cond: Handle<Expression>) -> Statement {
+        Statement::If {
+            condition: cond,
+            accept: Block::from_vec(vec![Statement::Return { value: None }]),
+            reject: Block::new(),
+        }
+    }
+
+    fn finish(self) -> Function {
+        self.f
+    }
+}
+
+/// Push Emit statements to a block for a range of expressions,
+/// automatically splitting around pre-emitted expressions.
+fn push_emit(
+    exprs: &Arena<Expression>,
+    block: &mut Block,
+    first: Handle<Expression>,
+    last: Handle<Expression>,
+) {
+    let first_idx = first.index();
+    let last_idx = last.index();
+    let mut run_start: Option<Handle<Expression>> = None;
+    let mut prev_h: Option<Handle<Expression>> = None;
+
+    for (h, expr) in exprs
+        .iter()
+        .skip(first_idx)
+        .take(last_idx - first_idx + 1)
+    {
+        if expr.needs_pre_emit() {
+            if let (Some(start), Some(end)) = (run_start, prev_h) {
+                block.push(Statement::Emit(Range::new_from_bounds(start, end)), S);
+            }
+            run_start = None;
+            prev_h = None;
+        } else {
+            if run_start.is_none() {
+                run_start = Some(h);
+            }
+            prev_h = Some(h);
+        }
+    }
+    if let (Some(start), Some(end)) = (run_start, prev_h) {
+        block.push(Statement::Emit(Range::new_from_bounds(start, end)), S);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shader generators — one per "file group"
+// ---------------------------------------------------------------------------
+
+/// Generate WGSL source for a shader group (replaces reading .wgsl files).
+pub fn generate_wgsl(shader_file: &str) -> String {
+    let module = generate_module(shader_file);
+    module_to_wgsl(&module)
+}
+
+/// Generate a `naga::Module` for a shader group.
+pub fn generate_module(shader_file: &str) -> Module {
+    match shader_file {
+        "shaders/unary.wgsl" => gen_unary(),
+        "shaders/binary.wgsl" => gen_binary(),
+        "shaders/bias_add.wgsl" => gen_bias_add(),
+        "shaders/sgd.wgsl" => gen_sgd(),
+        "shaders/transpose.wgsl" => gen_transpose(),
+        "shaders/matmul.wgsl" => gen_matmul(MatMulFusion::None),
+        "shaders/matmul_relu.wgsl" => gen_matmul(MatMulFusion::Relu),
+        "shaders/matmul_bias_relu.wgsl" => gen_matmul(MatMulFusion::BiasRelu),
+        "shaders/reduce.wgsl" => gen_reduce(),
+        "shaders/softmax.wgsl" => gen_softmax(),
+        "shaders/cross_entropy.wgsl" => gen_cross_entropy(),
+        other => panic!("unknown shader file: {other}"),
+    }
+}
+
+/// Convert a naga Module to WGSL source text.
+pub fn module_to_wgsl(module: &Module) -> String {
+    let flags =
+        naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
+    let info = naga::valid::Validator::new(flags, naga::valid::Capabilities::empty())
+        .validate(module)
+        .expect("generated module failed validation");
+    naga::back::wgsl::write_string(
+        module,
+        &info,
+        naga::back::wgsl::WriterFlags::empty(),
+    )
+    .expect("WGSL write failed")
+}
+
+// ---------------------------------------------------------------------------
+// unary.wgsl: relu, sigmoid, neg
+// ---------------------------------------------------------------------------
+
+fn gen_unary() -> Module {
+    let mut b = Builder::new();
+    let ty_params = b.params_u32x4("Params", &["len", "_pad0", "_pad1", "_pad2"]);
+    let gv_src = b.storage_ro("src");
+    let gv_dst = b.storage_rw("dst");
+    let gv_params = b.uniform("params", ty_params);
+
+    // relu
+    {
+        let mut f = FnBuilder::new(&b);
+        let gid = f.arg_gid();
+
+        // let i = gid.x;
+        let i = f.vec_x(gid);
+        f.label("i", i);
+
+        let params_ptr = f.global(gv_params);
+        let len_ptr = f.field(params_ptr, 0);
+        let len = f.load(len_ptr);
+        let cond = f.binary(BinaryOperator::GreaterEqual, i, len);
+        let src_ptr = f.global(gv_src);
+        let elem_ptr = f.index(src_ptr, i);
+        let val = f.load(elem_ptr);
+        let zero = f.literal_f32(0.0);
+        let result = f.math2(MathFunction::Max, val, zero);
+        let dst_ptr = f.global(gv_dst);
+        let dst_elem = f.index(dst_ptr, i);
+
+        f.emit(i, i);
+        f.emit(len_ptr, cond);
+        f.f.body.push(f.if_return(cond), S);
+        f.emit(src_ptr, result);
+        f.emit(dst_elem, dst_elem);
+        f.f.body.push(f.store(dst_elem, result), S);
+
+        b.entry_point("relu", [256, 1, 1], f.finish());
+    }
+
+    // sigmoid
+    {
+        let mut f = FnBuilder::new(&b);
+        let gid = f.arg_gid();
+        let i = f.vec_x(gid);
+        f.label("i", i);
+        let params_ptr = f.global(gv_params);
+        let len_ptr = f.field(params_ptr, 0);
+        let len = f.load(len_ptr);
+        let cond = f.binary(BinaryOperator::GreaterEqual, i, len);
+        let src_ptr = f.global(gv_src);
+        let elem_ptr = f.index(src_ptr, i);
+        let val = f.load(elem_ptr);
+        let neg_val = f.unary(UnaryOperator::Negate, val);
+        let exp_neg = f.math1(MathFunction::Exp, neg_val);
+        let one = f.literal_f32(1.0);
+        let denom = f.binary(BinaryOperator::Add, one, exp_neg);
+        let one2 = f.literal_f32(1.0);
+        let result = f.binary(BinaryOperator::Divide, one2, denom);
+        let dst_ptr = f.global(gv_dst);
+        let dst_elem = f.index(dst_ptr, i);
+
+        f.emit(i, i);
+        f.emit(len_ptr, cond);
+        f.f.body.push(f.if_return(cond), S);
+        f.emit(src_ptr, result);
+        f.emit(dst_elem, dst_elem);
+        f.f.body.push(f.store(dst_elem, result), S);
+
+        b.entry_point("sigmoid", [256, 1, 1], f.finish());
+    }
+
+    // neg
+    {
+        let mut f = FnBuilder::new(&b);
+        let gid = f.arg_gid();
+        let i = f.vec_x(gid);
+        f.label("i", i);
+        let params_ptr = f.global(gv_params);
+        let len_ptr = f.field(params_ptr, 0);
+        let len = f.load(len_ptr);
+        let cond = f.binary(BinaryOperator::GreaterEqual, i, len);
+        let src_ptr = f.global(gv_src);
+        let elem_ptr = f.index(src_ptr, i);
+        let val = f.load(elem_ptr);
+        let result = f.unary(UnaryOperator::Negate, val);
+        let dst_ptr = f.global(gv_dst);
+        let dst_elem = f.index(dst_ptr, i);
+
+        f.emit(i, i);
+        f.emit(len_ptr, cond);
+        f.f.body.push(f.if_return(cond), S);
+        f.emit(src_ptr, result);
+        f.emit(dst_elem, dst_elem);
+        f.f.body.push(f.store(dst_elem, result), S);
+
+        b.entry_point("neg", [256, 1, 1], f.finish());
+    }
+
+    b.finish()
+}
+
+// ---------------------------------------------------------------------------
+// binary.wgsl: add, mul, greater
+// ---------------------------------------------------------------------------
+
+fn gen_binary() -> Module {
+    let mut b = Builder::new();
+    let ty_params = b.params_u32x4("Params", &["len", "_pad0", "_pad1", "_pad2"]);
+    let gv_src_a = b.storage_ro("src_a");
+    let gv_src_b = b.storage_ro("src_b");
+    let gv_dst = b.storage_rw("dst");
+    let gv_params = b.uniform("params", ty_params);
+
+    fn binary_ep(
+        b: &Builder,
+        name: &str,
+        gv_src_a: Handle<GlobalVariable>,
+        gv_src_b: Handle<GlobalVariable>,
+        gv_dst: Handle<GlobalVariable>,
+        gv_params: Handle<GlobalVariable>,
+        make_result: fn(
+            &mut FnBuilder,
+            Handle<Expression>,
+            Handle<Expression>,
+        ) -> Handle<Expression>,
+    ) -> Function {
+        let mut f = FnBuilder::new(b);
+        let gid = f.arg_gid();
+        let i = f.vec_x(gid);
+        f.label("i", i);
+        let params_ptr = f.global(gv_params);
+        let len_ptr = f.field(params_ptr, 0);
+        let len = f.load(len_ptr);
+        let cond = f.binary(BinaryOperator::GreaterEqual, i, len);
+        let src_a_ptr = f.global(gv_src_a);
+        let a_ptr = f.index(src_a_ptr, i);
+        let a_val = f.load(a_ptr);
+        let src_b_ptr = f.global(gv_src_b);
+        let b_ptr = f.index(src_b_ptr, i);
+        let b_val = f.load(b_ptr);
+        let result = make_result(&mut f, a_val, b_val);
+        let dst_ptr = f.global(gv_dst);
+        let dst_elem = f.index(dst_ptr, i);
+
+        f.emit(i, i);
+        f.emit(len_ptr, cond);
+        f.f.body.push(f.if_return(cond), S);
+        f.emit(src_a_ptr, result);
+        f.emit(dst_elem, dst_elem);
+        f.f.body.push(f.store(dst_elem, result), S);
+
+        let _ = name;
+        f.finish()
+    }
+
+    let func = binary_ep(
+        &b,
+        "add",
+        gv_src_a,
+        gv_src_b,
+        gv_dst,
+        gv_params,
+        |f, a, bv| f.binary(BinaryOperator::Add, a, bv),
+    );
+    b.entry_point("add", [256, 1, 1], func);
+
+    let func = binary_ep(
+        &b,
+        "mul",
+        gv_src_a,
+        gv_src_b,
+        gv_dst,
+        gv_params,
+        |f, a, bv| f.binary(BinaryOperator::Multiply, a, bv),
+    );
+    b.entry_point("mul", [256, 1, 1], func);
+
+    // greater: select(0.0, 1.0, a > b)
+    let func = binary_ep(
+        &b,
+        "greater",
+        gv_src_a,
+        gv_src_b,
+        gv_dst,
+        gv_params,
+        |f, a, bv| {
+            let cmp = f.binary(BinaryOperator::Greater, a, bv);
+            let one = f.literal_f32(1.0);
+            let zero = f.literal_f32(0.0);
+            f.select(cmp, one, zero)
+        },
+    );
+    b.entry_point("greater", [256, 1, 1], func);
+
+    b.finish()
+}
+
+// ---------------------------------------------------------------------------
+// bias_add.wgsl
+// ---------------------------------------------------------------------------
+
+fn gen_bias_add() -> Module {
+    let mut b = Builder::new();
+    let ty_params =
+        b.params_u32x4("Params", &["len", "bias_len", "_pad0", "_pad1"]);
+    let gv_src = b.storage_ro("src");
+    let gv_bias = b.storage_ro("bias");
+    let gv_dst = b.storage_rw("dst");
+    let gv_params = b.uniform("params", ty_params);
+
+    let mut f = FnBuilder::new(&b);
+    let gid = f.arg_gid();
+    let i = f.vec_x(gid);
+    f.label("i", i);
+    let params_ptr = f.global(gv_params);
+    let len_ptr = f.field(params_ptr, 0);
+    let len = f.load(len_ptr);
+    let cond = f.binary(BinaryOperator::GreaterEqual, i, len);
+
+    let src_ptr = f.global(gv_src);
+    let src_elem = f.index(src_ptr, i);
+    let src_val = f.load(src_elem);
+
+    let bias_len_ptr = f.field(params_ptr, 1);
+    let bias_len = f.load(bias_len_ptr);
+    let bias_idx = f.binary(BinaryOperator::Modulo, i, bias_len);
+    let bias_ptr = f.global(gv_bias);
+    let bias_elem = f.index(bias_ptr, bias_idx);
+    let bias_val = f.load(bias_elem);
+
+    let result = f.binary(BinaryOperator::Add, src_val, bias_val);
+    let dst_ptr = f.global(gv_dst);
+    let dst_elem = f.index(dst_ptr, i);
+
+    f.emit(i, i);
+    f.emit(len_ptr, cond);
+    f.f.body.push(f.if_return(cond), S);
+    f.emit(src_ptr, result);
+    f.emit(dst_elem, dst_elem);
+    f.f.body.push(f.store(dst_elem, result), S);
+
+    b.entry_point("main", [256, 1, 1], f.finish());
+    b.finish()
+}
+
+// ---------------------------------------------------------------------------
+// sgd.wgsl
+// ---------------------------------------------------------------------------
+
+fn gen_sgd() -> Module {
+    let mut b = Builder::new();
+    let ty_params =
+        b.params_u32_f32_u32_u32("Params", &["len", "lr", "_pad0", "_pad1"]);
+    let gv_param = b.storage_ro("param");
+    let gv_grad = b.storage_ro("grad");
+    let gv_dst = b.storage_rw("dst");
+    let gv_params = b.uniform("params", ty_params);
+
+    let mut f = FnBuilder::new(&b);
+    let gid = f.arg_gid();
+    let i = f.vec_x(gid);
+    f.label("i", i);
+    let params_ptr = f.global(gv_params);
+    let len_ptr = f.field(params_ptr, 0);
+    let len = f.load(len_ptr);
+    let cond = f.binary(BinaryOperator::GreaterEqual, i, len);
+
+    let lr_ptr = f.field(params_ptr, 1);
+    let lr = f.load(lr_ptr);
+
+    let param_ptr = f.global(gv_param);
+    let p_elem = f.index(param_ptr, i);
+    let p_val = f.load(p_elem);
+
+    let grad_ptr = f.global(gv_grad);
+    let g_elem = f.index(grad_ptr, i);
+    let g_val = f.load(g_elem);
+
+    // dst[i] = param[i] - lr * grad[i]
+    let lr_g = f.binary(BinaryOperator::Multiply, lr, g_val);
+    let result = f.binary(BinaryOperator::Subtract, p_val, lr_g);
+
+    let dst_ptr = f.global(gv_dst);
+    let dst_elem = f.index(dst_ptr, i);
+
+    f.emit(i, i);
+    f.emit(len_ptr, cond);
+    f.f.body.push(f.if_return(cond), S);
+    f.emit(lr_ptr, result);
+    f.emit(dst_elem, dst_elem);
+    f.f.body.push(f.store(dst_elem, result), S);
+
+    b.entry_point("main", [256, 1, 1], f.finish());
+    b.finish()
+}
+
+// ---------------------------------------------------------------------------
+// transpose.wgsl
+// ---------------------------------------------------------------------------
+
+fn gen_transpose() -> Module {
+    let mut b = Builder::new();
+    let ty_params = b.params_u32x4("Params", &["m", "n", "_pad0", "_pad1"]);
+    let gv_src = b.storage_ro("src");
+    let gv_dst = b.storage_rw("dst");
+    let gv_params = b.uniform("params", ty_params);
+
+    let mut f = FnBuilder::new(&b);
+    let gid = f.arg_gid();
+    let col = f.vec_x(gid);
+    f.label("col", col);
+    let row = f.vec_y(gid);
+    f.label("row", row);
+
+    let params_ptr = f.global(gv_params);
+    let m_ptr = f.field(params_ptr, 0);
+    let m = f.load(m_ptr);
+    let n_ptr = f.field(params_ptr, 1);
+    let n = f.load(n_ptr);
+
+    let cond_r = f.binary(BinaryOperator::GreaterEqual, row, m);
+    let cond_c = f.binary(BinaryOperator::GreaterEqual, col, n);
+    let cond = f.binary(BinaryOperator::LogicalOr, cond_r, cond_c);
+
+    // src[row * n + col]
+    let row_n = f.binary(BinaryOperator::Multiply, row, n);
+    let src_idx = f.binary(BinaryOperator::Add, row_n, col);
+    let src_ptr = f.global(gv_src);
+    let src_elem = f.index(src_ptr, src_idx);
+    let val = f.load(src_elem);
+
+    // dst[col * m + row]
+    let col_m = f.binary(BinaryOperator::Multiply, col, m);
+    let dst_idx = f.binary(BinaryOperator::Add, col_m, row);
+    let dst_ptr = f.global(gv_dst);
+    let dst_elem = f.index(dst_ptr, dst_idx);
+
+    f.emit(col, row);
+    f.emit(params_ptr, cond);
+    f.f.body.push(f.if_return(cond), S);
+    f.emit(row_n, val);
+    f.emit(dst_elem, dst_elem);
+    f.f.body.push(f.store(dst_elem, val), S);
+
+    b.entry_point("main", [16, 16, 1], f.finish());
+    b.finish()
+}
+
+// ---------------------------------------------------------------------------
+// matmul.wgsl / matmul_relu.wgsl / matmul_bias_relu.wgsl
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq)]
+enum MatMulFusion {
+    None,
+    Relu,
+    BiasRelu,
+}
+
+fn gen_matmul(fusion: MatMulFusion) -> Module {
+    let mut b = Builder::new();
+    let ty_params = b.params_u32x4("Params", &["m", "k", "n", "_pad"]);
+    let gv_a = b.storage_ro("a");
+    let gv_b = b.storage_ro("b");
+    let gv_bias = if fusion == MatMulFusion::BiasRelu {
+        Some(b.storage_ro("bias"))
+    } else {
+        None
+    };
+    let gv_c = b.storage_rw("c");
+    let gv_params = b.uniform("params", ty_params);
+    let gv_tile_a = b.workgroup_array("tile_a", 256);
+    let gv_tile_b = b.workgroup_array("tile_b", 256);
+
+    let mut f = FnBuilder::new(&b);
+    let gid = f.arg_gid();
+    let lid = f.arg_lid();
+
+    // Extract indices
+    let col = f.vec_x(gid);
+    f.label("col", col);
+    let row = f.vec_y(gid);
+    f.label("row", row);
+    let local_col = f.vec_x(lid);
+    f.label("local_col", local_col);
+    let local_row = f.vec_y(lid);
+    f.label("local_row", local_row);
+
+    f.emit(col, local_row);
+
+    // Load params
+    let params_ptr = f.global(gv_params);
+    let m_ptr = f.field(params_ptr, 0);
+    let pm = f.load(m_ptr);
+    let k_ptr = f.field(params_ptr, 1);
+    let pk = f.load(k_ptr);
+    let n_ptr = f.field(params_ptr, 2);
+    let pn = f.load(n_ptr);
+    f.emit(params_ptr, pn);
+
+    // var sum = 0.0;
+    let zero_f = f.literal_f32(0.0);
+    f.emit(zero_f, zero_f);
+    let sum_var = f.local_var("sum", b.ty_f32, None);
+    let sum_ptr = f.local_ptr(sum_var);
+    f.f.body.push(f.store(sum_ptr, zero_f), S);
+
+    // num_tiles = (k + TILE - 1) / TILE
+    let tile_const = f.literal_u32(16);
+    let tile_m1 = f.literal_u32(15);
+    let k_plus = f.binary(BinaryOperator::Add, pk, tile_m1);
+    let num_tiles = f.named(
+        "num_tiles",
+        Expression::Binary {
+            op: BinaryOperator::Divide,
+            left: k_plus,
+            right: tile_const,
+        },
+    );
+    f.emit(tile_const, num_tiles);
+
+    // Loop: for (var t = 0u; t < num_tiles; t++)
+    let t_var = f.local_var("t", b.ty_u32, None);
+    let zero_u = f.literal_u32(0);
+    f.emit(zero_u, zero_u);
+    let t_ptr = f.local_ptr(t_var);
+    f.f.body.push(f.store(t_ptr, zero_u), S);
+
+    // Build loop body
+    let mut loop_body = Block::new();
+    {
+        // break_if: t >= num_tiles
+        let t_val = f.load(t_ptr);
+        let break_cond = f.binary(BinaryOperator::GreaterEqual, t_val, num_tiles);
+
+        // a_col = t * TILE + local_col
+        let tile16 = f.literal_u32(16);
+        let t_tile = f.binary(BinaryOperator::Multiply, t_val, tile16);
+        let a_col = f.named(
+            "a_col",
+            Expression::Binary {
+                op: BinaryOperator::Add,
+                left: t_tile,
+                right: local_col,
+            },
+        );
+        // b_row = t * TILE + local_row
+        let b_row = f.named(
+            "b_row",
+            Expression::Binary {
+                op: BinaryOperator::Add,
+                left: t_tile,
+                right: local_row,
+            },
+        );
+
+        push_emit(&f.f.expressions, &mut loop_body, t_val, b_row);
+
+        // tile_a[local_row * TILE + local_col]
+        let tile16_2 = f.literal_u32(16);
+        let lr_tile = f.binary(BinaryOperator::Multiply, local_row, tile16_2);
+        let ta_idx = f.binary(BinaryOperator::Add, lr_tile, local_col);
+        let tile_a_ptr = f.global(gv_tile_a);
+        let ta_elem = f.index(tile_a_ptr, ta_idx);
+
+        // Condition: row < m && a_col < k
+        let r_lt_m = f.binary(BinaryOperator::Less, row, pm);
+        let ac_lt_k = f.binary(BinaryOperator::Less, a_col, pk);
+        let cond_a = f.binary(BinaryOperator::LogicalAnd, r_lt_m, ac_lt_k);
+
+        // a[row * k + a_col]
+        let a_ptr = f.global(gv_a);
+        let row_k = f.binary(BinaryOperator::Multiply, row, pk);
+        let a_idx = f.binary(BinaryOperator::Add, row_k, a_col);
+        let a_elem = f.index(a_ptr, a_idx);
+        let a_val = f.load(a_elem);
+
+        let zero_f2 = f.literal_f32(0.0);
+
+        push_emit(&f.f.expressions, &mut loop_body, tile16_2, a_val);
+        push_emit(&f.f.expressions, &mut loop_body, zero_f2, zero_f2);
+
+        // if (cond_a) { tile_a[..] = a_val } else { tile_a[..] = 0.0 }
+        loop_body.push(
+            Statement::If {
+                condition: cond_a,
+                accept: Block::from_vec(vec![f.store(ta_elem, a_val)]),
+                reject: Block::from_vec(vec![f.store(ta_elem, zero_f2)]),
+            },
+            S,
+        );
+
+        // tile_b[local_row * TILE + local_col]
+        let tile_b_ptr = f.global(gv_tile_b);
+        let tb_elem = f.index(tile_b_ptr, ta_idx); // same index
+
+        // Condition: b_row < k && col < n
+        let br_lt_k = f.binary(BinaryOperator::Less, b_row, pk);
+        let c_lt_n = f.binary(BinaryOperator::Less, col, pn);
+        let cond_b = f.binary(BinaryOperator::LogicalAnd, br_lt_k, c_lt_n);
+
+        // b[b_row * n + col]
+        let b_ptr = f.global(gv_b);
+        let br_n = f.binary(BinaryOperator::Multiply, b_row, pn);
+        let b_idx = f.binary(BinaryOperator::Add, br_n, col);
+        let b_elem = f.index(b_ptr, b_idx);
+        let b_val = f.load(b_elem);
+
+        let zero_f3 = f.literal_f32(0.0);
+
+        push_emit(&f.f.expressions, &mut loop_body, tile_b_ptr, b_val);
+        push_emit(&f.f.expressions, &mut loop_body, zero_f3, zero_f3);
+
+        loop_body.push(
+            Statement::If {
+                condition: cond_b,
+                accept: Block::from_vec(vec![f.store(tb_elem, b_val)]),
+                reject: Block::from_vec(vec![f.store(tb_elem, zero_f3)]),
+            },
+            S,
+        );
+
+        // workgroupBarrier()
+        loop_body.push(Statement::Barrier(Barrier::WORK_GROUP), S);
+
+        // Inner loop: for (var i = 0u; i < TILE; i++)
+        let i_var = f.local_var("i", b.ty_u32, None);
+        let i_ptr = f.local_ptr(i_var);
+        let zero_i = f.literal_u32(0);
+        push_emit(&f.f.expressions, &mut loop_body, zero_i, zero_i);
+        loop_body.push(f.store(i_ptr, zero_i), S);
+
+        let mut inner_body = Block::new();
+        {
+            let i_val = f.load(i_ptr);
+            let tile16_3 = f.literal_u32(16);
+            let i_break = f.binary(BinaryOperator::GreaterEqual, i_val, tile16_3);
+
+            // tile_a[local_row * TILE + i]
+            let tile16_4 = f.literal_u32(16);
+            let lr_t2 = f.binary(BinaryOperator::Multiply, local_row, tile16_4);
+            let ta_i = f.binary(BinaryOperator::Add, lr_t2, i_val);
+            let ta_ptr2 = f.global(gv_tile_a);
+            let ta_e2 = f.index(ta_ptr2, ta_i);
+            let ta_v = f.load(ta_e2);
+
+            // tile_b[i * TILE + local_col]
+            let i_t = f.binary(BinaryOperator::Multiply, i_val, tile16_4);
+            let tb_i = f.binary(BinaryOperator::Add, i_t, local_col);
+            let tb_ptr2 = f.global(gv_tile_b);
+            let tb_e2 = f.index(tb_ptr2, tb_i);
+            let tb_v = f.load(tb_e2);
+
+            // sum += ta_v * tb_v
+            let prod = f.binary(BinaryOperator::Multiply, ta_v, tb_v);
+            let old_sum = f.load(sum_ptr);
+            let new_sum = f.binary(BinaryOperator::Add, old_sum, prod);
+
+            push_emit(&f.f.expressions, &mut inner_body, i_val, new_sum);
+            inner_body.push(f.store(sum_ptr, new_sum), S);
+
+            // i++
+            let one_u = f.literal_u32(1);
+            let i_val2 = f.load(i_ptr);
+            let i_next = f.binary(BinaryOperator::Add, i_val2, one_u);
+            push_emit(&f.f.expressions, &mut inner_body, one_u, i_next);
+            inner_body.push(f.store(i_ptr, i_next), S);
+
+            loop_body.push(
+                Statement::Loop {
+                    body: inner_body,
+                    continuing: Block::new(),
+                    break_if: Some(i_break),
+                },
+                S,
+            );
+        }
+
+        // workgroupBarrier()
+        loop_body.push(Statement::Barrier(Barrier::WORK_GROUP), S);
+
+        // t++
+        let one_t = f.literal_u32(1);
+        let t_val2 = f.load(t_ptr);
+        let t_next = f.binary(BinaryOperator::Add, t_val2, one_t);
+        push_emit(&f.f.expressions, &mut loop_body, one_t, t_next);
+        loop_body.push(f.store(t_ptr, t_next), S);
+
+        f.f.body.push(
+            Statement::Loop {
+                body: loop_body,
+                continuing: Block::new(),
+                break_if: Some(break_cond),
+            },
+            S,
+        );
+    }
+
+    // Final store: if (row < m && col < n) { c[row * n + col] = ... }
+    let r_lt_m2 = f.binary(BinaryOperator::Less, row, pm);
+    let c_lt_n2 = f.binary(BinaryOperator::Less, col, pn);
+    let store_cond = f.binary(BinaryOperator::LogicalAnd, r_lt_m2, c_lt_n2);
+
+    let row_n2 = f.binary(BinaryOperator::Multiply, row, pn);
+    let c_idx = f.binary(BinaryOperator::Add, row_n2, col);
+    let c_ptr = f.global(gv_c);
+    let c_elem = f.index(c_ptr, c_idx);
+
+    let final_val = f.load(sum_ptr);
+
+    f.emit(r_lt_m2, final_val);
+
+    let store_val = match fusion {
+        MatMulFusion::None => final_val,
+        MatMulFusion::Relu => {
+            let zero = f.literal_f32(0.0);
+            let relu_val = f.math2(MathFunction::Max, final_val, zero);
+            f.emit(zero, relu_val);
+            relu_val
+        }
+        MatMulFusion::BiasRelu => {
+            let bias_ptr = f.global(gv_bias.unwrap());
+            let bias_elem = f.index(bias_ptr, col);
+            let bias_val = f.load(bias_elem);
+            let biased = f.binary(BinaryOperator::Add, final_val, bias_val);
+            let zero = f.literal_f32(0.0);
+            let relu_val = f.math2(MathFunction::Max, biased, zero);
+            f.emit(bias_ptr, relu_val);
+            relu_val
+        }
+    };
+
+    let store_block = Block::from_vec(vec![f.store(c_elem, store_val)]);
+    f.f.body.push(
+        Statement::If {
+            condition: store_cond,
+            accept: store_block,
+            reject: Block::new(),
+        },
+        S,
+    );
+
+    b.entry_point("main", [16, 16, 1], f.finish());
+    b.finish()
+}
+
+// ---------------------------------------------------------------------------
+// reduce.wgsl: sum_all, mean_all
+// ---------------------------------------------------------------------------
+
+fn gen_reduce() -> Module {
+    let mut b = Builder::new();
+    let ty_params = b.params_u32x4("Params", &["len", "_pad0", "_pad1", "_pad2"]);
+    let gv_src = b.storage_ro("src");
+    let gv_dst = b.storage_rw("dst");
+    let gv_params = b.uniform("params", ty_params);
+    let gv_wg = b.workgroup_array("wg_data", 256);
+
+    // Helper to build either sum_all or mean_all
+    fn gen_reduce_fn(
+        b: &Builder,
+        is_mean: bool,
+        gv_src: Handle<GlobalVariable>,
+        gv_dst: Handle<GlobalVariable>,
+        gv_params: Handle<GlobalVariable>,
+        gv_wg: Handle<GlobalVariable>,
+    ) -> Function {
+        let mut f = FnBuilder::new(b);
+        let gid = f.arg_gid();
+        let lid = f.arg_lid();
+
+        let i = f.vec_x(gid);
+        f.label("i", i);
+        let local_id = f.vec_x(lid);
+        f.label("local_id", local_id);
+        f.emit(i, local_id);
+
+        let params_ptr = f.global(gv_params);
+        let len_ptr = f.field(params_ptr, 0);
+        let len = f.load(len_ptr);
+        f.emit(params_ptr, len);
+
+        // Load src[i] or 0.0 into wg_data[local_id]
+        let i_lt_len = f.binary(BinaryOperator::Less, i, len);
+        let src_ptr = f.global(gv_src);
+        let src_elem = f.index(src_ptr, i);
+        let src_val = f.load(src_elem);
+        let zero = f.literal_f32(0.0);
+        f.emit(i_lt_len, zero);
+
+        let wg_ptr = f.global(gv_wg);
+        let wg_elem = f.index(wg_ptr, local_id);
+        f.emit(wg_elem, wg_elem);
+        f.f.body.push(
+            Statement::If {
+                condition: i_lt_len,
+                accept: Block::from_vec(vec![f.store(wg_elem, src_val)]),
+                reject: Block::from_vec(vec![f.store(wg_elem, zero)]),
+            },
+            S,
+        );
+        f.f.body.push(Statement::Barrier(Barrier::WORK_GROUP), S);
+
+        // Reduction loop: for stride = 128; stride > 0; stride /= 2
+        let stride_var = f.local_var("stride", b.ty_u32, None);
+        let stride_ptr = f.local_ptr(stride_var);
+        let init_stride = f.literal_u32(128);
+        f.emit(init_stride, init_stride);
+        f.f.body.push(f.store(stride_ptr, init_stride), S);
+
+        let mut loop_body = Block::new();
+        {
+            let stride = f.load(stride_ptr);
+            let zero_u = f.literal_u32(0);
+            let break_cond = f.binary(BinaryOperator::LessEqual, stride, zero_u);
+
+            let cond = f.binary(BinaryOperator::Less, local_id, stride);
+            push_emit(&f.f.expressions, &mut loop_body, stride, cond);
+
+            // if local_id < stride { wg_data[local_id] += wg_data[local_id + stride] }
+            let partner = f.binary(BinaryOperator::Add, local_id, stride);
+            let wg_ptr2 = f.global(gv_wg);
+            let wg_self = f.index(wg_ptr2, local_id);
+            let wg_partner = f.index(wg_ptr2, partner);
+            let self_val = f.load(wg_self);
+            let partner_val = f.load(wg_partner);
+            let new_val = f.binary(BinaryOperator::Add, self_val, partner_val);
+            push_emit(&f.f.expressions, &mut loop_body, partner, new_val);
+
+            loop_body.push(
+                Statement::If {
+                    condition: cond,
+                    accept: Block::from_vec(vec![f.store(wg_self, new_val)]),
+                    reject: Block::new(),
+                },
+                S,
+            );
+
+            loop_body.push(Statement::Barrier(Barrier::WORK_GROUP), S);
+
+            // stride /= 2
+            let two = f.literal_u32(2);
+            let stride2 = f.load(stride_ptr);
+            let next = f.binary(BinaryOperator::Divide, stride2, two);
+            push_emit(&f.f.expressions, &mut loop_body, two, next);
+            loop_body.push(f.store(stride_ptr, next), S);
+
+            f.f.body.push(
+                Statement::Loop {
+                    body: loop_body,
+                    continuing: Block::new(),
+                    break_if: Some(break_cond),
+                },
+                S,
+            );
+        }
+
+        // if local_id == 0 { dst[gid.x / WG_SIZE] = wg_data[0]; }
+        let zero_u2 = f.literal_u32(0);
+        let is_zero = f.binary(BinaryOperator::Equal, local_id, zero_u2);
+        let wg_size = f.literal_u32(256);
+        let out_idx = f.binary(BinaryOperator::Divide, i, wg_size);
+        let wg_ptr3 = f.global(gv_wg);
+        let zero_idx = f.literal_u32(0);
+        let wg_0 = f.index(wg_ptr3, zero_idx);
+        let wg_0_val = f.load(wg_0);
+
+        let dst_ptr = f.global(gv_dst);
+        let dst_elem = f.index(dst_ptr, out_idx);
+
+        f.emit(zero_u2, wg_0_val);
+        f.emit(dst_elem, dst_elem);
+
+        if is_mean {
+            let len_f = f.cast_f32(len);
+            let mean_val = f.binary(BinaryOperator::Divide, wg_0_val, len_f);
+            f.emit(len_f, mean_val);
+
+            f.f.body.push(
+                Statement::If {
+                    condition: is_zero,
+                    accept: Block::from_vec(vec![f.store(dst_elem, mean_val)]),
+                    reject: Block::new(),
+                },
+                S,
+            );
+        } else {
+            f.f.body.push(
+                Statement::If {
+                    condition: is_zero,
+                    accept: Block::from_vec(vec![f.store(dst_elem, wg_0_val)]),
+                    reject: Block::new(),
+                },
+                S,
+            );
+        }
+
+        f.finish()
+    }
+
+    let sum_fn = gen_reduce_fn(&b, false, gv_src, gv_dst, gv_params, gv_wg);
+    b.entry_point("sum_all", [256, 1, 1], sum_fn);
+
+    let mean_fn = gen_reduce_fn(&b, true, gv_src, gv_dst, gv_params, gv_wg);
+    b.entry_point("mean_all", [256, 1, 1], mean_fn);
+
+    b.finish()
+}
+
+// ---------------------------------------------------------------------------
+// softmax.wgsl
+// ---------------------------------------------------------------------------
+
+fn gen_softmax() -> Module {
+    let mut b = Builder::new();
+    let ty_params =
+        b.params_u32x4("Params", &["batch", "features", "_pad0", "_pad1"]);
+    let gv_src = b.storage_ro("src");
+    let gv_dst = b.storage_rw("dst");
+    let gv_params = b.uniform("params", ty_params);
+
+    let mut f = FnBuilder::new(&b);
+    let gid = f.arg_gid();
+    let row = f.vec_x(gid);
+    f.label("row", row);
+    f.emit(row, row);
+
+    let params_ptr = f.global(gv_params);
+    let batch_ptr = f.field(params_ptr, 0);
+    let batch = f.load(batch_ptr);
+    let feat_ptr = f.field(params_ptr, 1);
+    let features = f.load(feat_ptr);
+    f.emit(params_ptr, features);
+
+    let cond = f.binary(BinaryOperator::GreaterEqual, row, batch);
+    f.emit(cond, cond);
+    f.f.body.push(f.if_return(cond), S);
+
+    // offset = row * features
+    let offset = f.named(
+        "offset",
+        Expression::Binary {
+            op: BinaryOperator::Multiply,
+            left: row,
+            right: features,
+        },
+    );
+    f.emit(offset, offset);
+
+    // Find max
+    let src_ptr = f.global(gv_src);
+    let src_0 = f.index(src_ptr, offset);
+    let src_0_val = f.load(src_0);
+    f.emit(src_ptr, src_0_val);
+
+    let max_var = f.local_var("max_val", b.ty_f32, None);
+    let max_ptr = f.local_ptr(max_var);
+    f.f.body.push(f.store(max_ptr, src_0_val), S);
+
+    // Loop j = 1..features for max
+    let j_var = f.local_var("j", b.ty_u32, None);
+    let j_ptr = f.local_ptr(j_var);
+    let one_u = f.literal_u32(1);
+    f.emit(one_u, one_u);
+    f.f.body.push(f.store(j_ptr, one_u), S);
+
+    {
+        let mut body = Block::new();
+        let j = f.load(j_ptr);
+        let brk = f.binary(BinaryOperator::GreaterEqual, j, features);
+        let idx = f.binary(BinaryOperator::Add, offset, j);
+        let src_ptr2 = f.global(gv_src);
+        let elem = f.index(src_ptr2, idx);
+        let val = f.load(elem);
+        let cur_max = f.load(max_ptr);
+        let new_max = f.math2(MathFunction::Max, cur_max, val);
+        push_emit(&f.f.expressions, &mut body, j, new_max);
+        body.push(f.store(max_ptr, new_max), S);
+
+        let one = f.literal_u32(1);
+        let j2 = f.load(j_ptr);
+        let j_next = f.binary(BinaryOperator::Add, j2, one);
+        push_emit(&f.f.expressions, &mut body, one, j_next);
+        body.push(f.store(j_ptr, j_next), S);
+
+        f.f.body.push(
+            Statement::Loop {
+                body,
+                continuing: Block::new(),
+                break_if: Some(brk),
+            },
+            S,
+        );
+    }
+
+    // Compute exp and sum
+    let sum_var = f.local_var("sum_exp", b.ty_f32, None);
+    let sum_ptr_local = f.local_ptr(sum_var);
+    let zero_f = f.literal_f32(0.0);
+    f.emit(zero_f, zero_f);
+    f.f.body.push(f.store(sum_ptr_local, zero_f), S);
+
+    let j2_var = f.local_var("j2", b.ty_u32, None);
+    let j2_ptr = f.local_ptr(j2_var);
+    let zero_u = f.literal_u32(0);
+    f.emit(zero_u, zero_u);
+    f.f.body.push(f.store(j2_ptr, zero_u), S);
+
+    {
+        let mut body = Block::new();
+        let j = f.load(j2_ptr);
+        let brk = f.binary(BinaryOperator::GreaterEqual, j, features);
+        let idx = f.binary(BinaryOperator::Add, offset, j);
+        let src_ptr2 = f.global(gv_src);
+        let elem = f.index(src_ptr2, idx);
+        let val = f.load(elem);
+        let mx = f.load(max_ptr);
+        let diff = f.binary(BinaryOperator::Subtract, val, mx);
+        let e = f.math1(MathFunction::Exp, diff);
+        push_emit(&f.f.expressions, &mut body, j, e);
+
+        // dst[offset + j] = e
+        let dst_ptr = f.global(gv_dst);
+        let dst_elem = f.index(dst_ptr, idx);
+        push_emit(&f.f.expressions, &mut body, dst_elem, dst_elem);
+        body.push(f.store(dst_elem, e), S);
+
+        // sum_exp += e
+        let old_sum = f.load(sum_ptr_local);
+        let new_sum = f.binary(BinaryOperator::Add, old_sum, e);
+        push_emit(&f.f.expressions, &mut body, old_sum, new_sum);
+        body.push(f.store(sum_ptr_local, new_sum), S);
+
+        let one = f.literal_u32(1);
+        let j3 = f.load(j2_ptr);
+        let j_next = f.binary(BinaryOperator::Add, j3, one);
+        push_emit(&f.f.expressions, &mut body, one, j_next);
+        body.push(f.store(j2_ptr, j_next), S);
+
+        f.f.body.push(
+            Statement::Loop {
+                body,
+                continuing: Block::new(),
+                break_if: Some(brk),
+            },
+            S,
+        );
+    }
+
+    // Normalize
+    let j3_var = f.local_var("j3", b.ty_u32, None);
+    let j3_ptr = f.local_ptr(j3_var);
+    let zero_u2 = f.literal_u32(0);
+    f.emit(zero_u2, zero_u2);
+    f.f.body.push(f.store(j3_ptr, zero_u2), S);
+
+    {
+        let mut body = Block::new();
+        let j = f.load(j3_ptr);
+        let brk = f.binary(BinaryOperator::GreaterEqual, j, features);
+        let idx = f.binary(BinaryOperator::Add, offset, j);
+        let dst_ptr = f.global(gv_dst);
+        let dst_elem = f.index(dst_ptr, idx);
+        let cur = f.load(dst_elem);
+        let sum_val = f.load(sum_ptr_local);
+        let normed = f.binary(BinaryOperator::Divide, cur, sum_val);
+        push_emit(&f.f.expressions, &mut body, j, normed);
+        body.push(f.store(dst_elem, normed), S);
+
+        let one = f.literal_u32(1);
+        let j4 = f.load(j3_ptr);
+        let j_next = f.binary(BinaryOperator::Add, j4, one);
+        push_emit(&f.f.expressions, &mut body, one, j_next);
+        body.push(f.store(j3_ptr, j_next), S);
+
+        f.f.body.push(
+            Statement::Loop {
+                body,
+                continuing: Block::new(),
+                break_if: Some(brk),
+            },
+            S,
+        );
+    }
+
+    b.entry_point("main", [256, 1, 1], f.finish());
+    b.finish()
+}
+
+// ---------------------------------------------------------------------------
+// cross_entropy.wgsl
+// ---------------------------------------------------------------------------
+
+fn gen_cross_entropy() -> Module {
+    let mut b = Builder::new();
+    let ty_params =
+        b.params_u32x4("Params", &["batch", "features", "_pad0", "_pad1"]);
+    let gv_logits = b.storage_ro("logits");
+    let gv_labels = b.storage_ro("labels");
+    let gv_grad = b.storage_rw("grad_out");
+    let gv_loss = b.storage_rw("loss_out");
+    let gv_params = b.uniform("params", ty_params);
+
+    let mut f = FnBuilder::new(&b);
+    let _gid = f.arg_gid();
+
+    let params_ptr = f.global(gv_params);
+    let batch_ptr = f.field(params_ptr, 0);
+    let batch = f.load(batch_ptr);
+    let feat_ptr = f.field(params_ptr, 1);
+    let features = f.load(feat_ptr);
+    f.emit(params_ptr, features);
+
+    // var total_loss = 0.0;
+    let zero_f = f.literal_f32(0.0);
+    f.emit(zero_f, zero_f);
+    let loss_var = f.local_var("total_loss", b.ty_f32, None);
+    let loss_ptr = f.local_ptr(loss_var);
+    f.f.body.push(f.store(loss_ptr, zero_f), S);
+
+    // Outer loop: for b = 0..batch
+    let b_var = f.local_var("b_idx", b.ty_u32, None);
+    let b_ptr = f.local_ptr(b_var);
+    let zero_u = f.literal_u32(0);
+    f.emit(zero_u, zero_u);
+    f.f.body.push(f.store(b_ptr, zero_u), S);
+
+    {
+        let mut outer = Block::new();
+        let bv = f.load(b_ptr);
+        let brk = f.binary(BinaryOperator::GreaterEqual, bv, batch);
+
+        // offset = b * features
+        let offset = f.binary(BinaryOperator::Multiply, bv, features);
+        push_emit(&f.f.expressions, &mut outer, bv, offset);
+
+        // Find max
+        let logits_ptr = f.global(gv_logits);
+        let first = f.index(logits_ptr, offset);
+        let first_val = f.load(first);
+        push_emit(&f.f.expressions, &mut outer, logits_ptr, first_val);
+
+        let max_var = f.local_var("max_val", b.ty_f32, None);
+        let max_ptr = f.local_ptr(max_var);
+        outer.push(f.store(max_ptr, first_val), S);
+
+        // max loop
+        let mj_var = f.local_var("mj", b.ty_u32, None);
+        let mj_ptr = f.local_ptr(mj_var);
+        let one_u = f.literal_u32(1);
+        push_emit(&f.f.expressions, &mut outer, one_u, one_u);
+        outer.push(f.store(mj_ptr, one_u), S);
+
+        {
+            let mut mbody = Block::new();
+            let j = f.load(mj_ptr);
+            let mbrk = f.binary(BinaryOperator::GreaterEqual, j, features);
+            let idx = f.binary(BinaryOperator::Add, offset, j);
+            let lp = f.global(gv_logits);
+            let elem = f.index(lp, idx);
+            let val = f.load(elem);
+            let cur = f.load(max_ptr);
+            let nmax = f.math2(MathFunction::Max, cur, val);
+            push_emit(&f.f.expressions, &mut mbody, j, nmax);
+            mbody.push(f.store(max_ptr, nmax), S);
+
+            let one = f.literal_u32(1);
+            let j2 = f.load(mj_ptr);
+            let jn = f.binary(BinaryOperator::Add, j2, one);
+            push_emit(&f.f.expressions, &mut mbody, one, jn);
+            mbody.push(f.store(mj_ptr, jn), S);
+
+            outer.push(
+                Statement::Loop {
+                    body: mbody,
+                    continuing: Block::new(),
+                    break_if: Some(mbrk),
+                },
+                S,
+            );
+        }
+
+        // Log-sum-exp: sum_exp
+        let se_var = f.local_var("sum_exp", b.ty_f32, None);
+        let se_ptr = f.local_ptr(se_var);
+        let zero_f2 = f.literal_f32(0.0);
+        push_emit(&f.f.expressions, &mut outer, zero_f2, zero_f2);
+        outer.push(f.store(se_ptr, zero_f2), S);
+
+        let sj_var = f.local_var("sj", b.ty_u32, None);
+        let sj_ptr = f.local_ptr(sj_var);
+        let zero_u2 = f.literal_u32(0);
+        push_emit(&f.f.expressions, &mut outer, zero_u2, zero_u2);
+        outer.push(f.store(sj_ptr, zero_u2), S);
+
+        {
+            let mut sbody = Block::new();
+            let j = f.load(sj_ptr);
+            let sbrk = f.binary(BinaryOperator::GreaterEqual, j, features);
+            let idx = f.binary(BinaryOperator::Add, offset, j);
+            let lp = f.global(gv_logits);
+            let elem = f.index(lp, idx);
+            let val = f.load(elem);
+            let mx = f.load(max_ptr);
+            let diff = f.binary(BinaryOperator::Subtract, val, mx);
+            let e = f.math1(MathFunction::Exp, diff);
+            let old = f.load(se_ptr);
+            let nsum = f.binary(BinaryOperator::Add, old, e);
+            push_emit(&f.f.expressions, &mut sbody, j, nsum);
+            sbody.push(f.store(se_ptr, nsum), S);
+
+            let one = f.literal_u32(1);
+            let j2 = f.load(sj_ptr);
+            let jn = f.binary(BinaryOperator::Add, j2, one);
+            push_emit(&f.f.expressions, &mut sbody, one, jn);
+            sbody.push(f.store(sj_ptr, jn), S);
+
+            outer.push(
+                Statement::Loop {
+                    body: sbody,
+                    continuing: Block::new(),
+                    break_if: Some(sbrk),
+                },
+                S,
+            );
+        }
+
+        // log_sum_exp = log(sum_exp) + max_val
+        let se_val = f.load(se_ptr);
+        let log_se = f.math1(MathFunction::Log, se_val);
+        let mx = f.load(max_ptr);
+        let lse = f.binary(BinaryOperator::Add, log_se, mx);
+        push_emit(&f.f.expressions, &mut outer, se_val, lse);
+
+        // Loss + gradient loop
+        let lj_var = f.local_var("lj", b.ty_u32, None);
+        let lj_ptr = f.local_ptr(lj_var);
+        let zero_u3 = f.literal_u32(0);
+        push_emit(&f.f.expressions, &mut outer, zero_u3, zero_u3);
+        outer.push(f.store(lj_ptr, zero_u3), S);
+
+        {
+            let mut lbody = Block::new();
+            let j = f.load(lj_ptr);
+            let lbrk = f.binary(BinaryOperator::GreaterEqual, j, features);
+            let idx = f.binary(BinaryOperator::Add, offset, j);
+
+            // log_softmax = logits[idx] - log_sum_exp
+            let lp = f.global(gv_logits);
+            let elem = f.index(lp, idx);
+            let logit_val = f.load(elem);
+            let log_softmax = f.binary(BinaryOperator::Subtract, logit_val, lse);
+            let softmax_val = f.math1(MathFunction::Exp, log_softmax);
+
+            // label
+            let lab_ptr = f.global(gv_labels);
+            let lab_elem = f.index(lab_ptr, idx);
+            let label_val = f.load(lab_elem);
+
+            // total_loss -= label * log_softmax
+            let prod = f.binary(BinaryOperator::Multiply, label_val, log_softmax);
+            let old_loss = f.load(loss_ptr);
+            let new_loss = f.binary(BinaryOperator::Subtract, old_loss, prod);
+
+            // grad = softmax - label
+            let grad_val = f.binary(BinaryOperator::Subtract, softmax_val, label_val);
+
+            push_emit(&f.f.expressions, &mut lbody, j, grad_val);
+            lbody.push(f.store(loss_ptr, new_loss), S);
+
+            let grad_ptr = f.global(gv_grad);
+            let grad_elem = f.index(grad_ptr, idx);
+            push_emit(&f.f.expressions, &mut lbody, grad_elem, grad_elem);
+            lbody.push(f.store(grad_elem, grad_val), S);
+
+            let one = f.literal_u32(1);
+            let j2 = f.load(lj_ptr);
+            let jn = f.binary(BinaryOperator::Add, j2, one);
+            push_emit(&f.f.expressions, &mut lbody, one, jn);
+            lbody.push(f.store(lj_ptr, jn), S);
+
+            outer.push(
+                Statement::Loop {
+                    body: lbody,
+                    continuing: Block::new(),
+                    break_if: Some(lbrk),
+                },
+                S,
+            );
+        }
+
+        // b++
+        let one_b = f.literal_u32(1);
+        let bv2 = f.load(b_ptr);
+        let bn = f.binary(BinaryOperator::Add, bv2, one_b);
+        push_emit(&f.f.expressions, &mut outer, one_b, bn);
+        outer.push(f.store(b_ptr, bn), S);
+
+        f.f.body.push(
+            Statement::Loop {
+                body: outer,
+                continuing: Block::new(),
+                break_if: Some(brk),
+            },
+            S,
+        );
+    }
+
+    // loss_out[0] = total_loss / f32(batch)
+    let total = f.load(loss_ptr);
+    let batch_f = f.cast_f32(batch);
+    let avg = f.binary(BinaryOperator::Divide, total, batch_f);
+    let loss_out_ptr = f.global(gv_loss);
+    let zero_idx = f.literal_u32(0);
+    let loss_elem = f.index(loss_out_ptr, zero_idx);
+    f.emit(total, loss_elem);
+    f.f.body.push(f.store(loss_elem, avg), S);
+
+    b.entry_point("main", [1, 1, 1], f.finish());
+    b.finish()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify every shader generates valid WGSL.
+    #[test]
+    fn all_shaders_generate_valid_wgsl() {
+        let files = [
+            "shaders/unary.wgsl",
+            "shaders/binary.wgsl",
+            "shaders/bias_add.wgsl",
+            "shaders/sgd.wgsl",
+            "shaders/transpose.wgsl",
+            "shaders/matmul.wgsl",
+            "shaders/matmul_relu.wgsl",
+            "shaders/matmul_bias_relu.wgsl",
+            "shaders/reduce.wgsl",
+            "shaders/softmax.wgsl",
+            "shaders/cross_entropy.wgsl",
+        ];
+
+        for file in &files {
+            let wgsl = generate_wgsl(file);
+            // Verify it round-trips through naga's WGSL parser
+            naga::front::wgsl::parse_str(&wgsl)
+                .unwrap_or_else(|e| panic!("{file}: generated WGSL failed to re-parse: {e}"));
+        }
+    }
+
+    /// Verify the generated modules contain the expected entry points.
+    #[test]
+    fn entry_points_present() {
+        let m = generate_module("shaders/unary.wgsl");
+        let names: Vec<&str> = m.entry_points.iter().map(|ep| ep.name.as_str()).collect();
+        assert!(names.contains(&"relu"), "missing relu");
+        assert!(names.contains(&"sigmoid"), "missing sigmoid");
+        assert!(names.contains(&"neg"), "missing neg");
+
+        let m = generate_module("shaders/binary.wgsl");
+        let names: Vec<&str> = m.entry_points.iter().map(|ep| ep.name.as_str()).collect();
+        assert!(names.contains(&"add"));
+        assert!(names.contains(&"mul"));
+        assert!(names.contains(&"greater"));
+
+        let m = generate_module("shaders/reduce.wgsl");
+        let names: Vec<&str> = m.entry_points.iter().map(|ep| ep.name.as_str()).collect();
+        assert!(names.contains(&"sum_all"));
+        assert!(names.contains(&"mean_all"));
+    }
+}

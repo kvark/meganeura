@@ -18,6 +18,7 @@
 //! sequences — no manual CUDA-graphing needed.
 
 pub mod autodiff;
+pub mod codegen;
 pub mod compile;
 pub mod graph;
 pub mod optimize;

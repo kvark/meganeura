@@ -11,6 +11,7 @@ blade-graphics = "0.7"
 blade-macros = "0.3"
 egglog = "2.0"
 bytemuck = { version = "1", features = ["derive"] }
+naga = { version = "25", features = ["wgsl-in", "wgsl-out"] }
 log = "0.4"
 env_logger = "0.11"
 
