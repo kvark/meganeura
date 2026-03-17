@@ -29,42 +29,38 @@ pub enum ShaderEntry {
 impl ShaderEntry {
     pub fn shader_file(&self) -> &'static str {
         match *self {
-            ShaderEntry::MatMul | ShaderEntry::MatMulRelu => "shaders/matmul.wgsl",
-            ShaderEntry::MatMulBiasRelu => "shaders/matmul_bias.wgsl",
-            ShaderEntry::Relu
-            | ShaderEntry::Sigmoid
-            | ShaderEntry::Neg
-            | ShaderEntry::Add
-            | ShaderEntry::Mul
-            | ShaderEntry::Greater
-            | ShaderEntry::BiasAdd
-            | ShaderEntry::SgdUpdate => "shaders/elementwise.wgsl",
-            ShaderEntry::SumAll
-            | ShaderEntry::MeanAll
-            | ShaderEntry::Softmax
-            | ShaderEntry::CrossEntropyLoss
-            | ShaderEntry::Transpose => "shaders/reduce.wgsl",
+            ShaderEntry::MatMul => "shaders/matmul.wgsl",
+            ShaderEntry::MatMulRelu => "shaders/matmul_relu.wgsl",
+            ShaderEntry::MatMulBiasRelu => "shaders/matmul_bias_relu.wgsl",
+            ShaderEntry::Relu | ShaderEntry::Sigmoid | ShaderEntry::Neg => "shaders/unary.wgsl",
+            ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater => "shaders/binary.wgsl",
+            ShaderEntry::BiasAdd => "shaders/bias_add.wgsl",
+            ShaderEntry::SgdUpdate => "shaders/sgd.wgsl",
+            ShaderEntry::SumAll | ShaderEntry::MeanAll => "shaders/reduce.wgsl",
+            ShaderEntry::Softmax => "shaders/softmax.wgsl",
+            ShaderEntry::CrossEntropyLoss => "shaders/cross_entropy.wgsl",
+            ShaderEntry::Transpose => "shaders/transpose.wgsl",
         }
     }
 
     pub fn entry_point(&self) -> &'static str {
         match *self {
-            ShaderEntry::MatMul => "matmul",
-            ShaderEntry::MatMulRelu => "matmul_relu",
-            ShaderEntry::MatMulBiasRelu => "matmul_bias_relu",
+            ShaderEntry::MatMul
+            | ShaderEntry::MatMulRelu
+            | ShaderEntry::MatMulBiasRelu
+            | ShaderEntry::BiasAdd
+            | ShaderEntry::SgdUpdate
+            | ShaderEntry::Softmax
+            | ShaderEntry::CrossEntropyLoss
+            | ShaderEntry::Transpose => "main",
             ShaderEntry::Relu => "relu",
             ShaderEntry::Sigmoid => "sigmoid",
             ShaderEntry::Neg => "neg",
             ShaderEntry::Add => "add",
             ShaderEntry::Mul => "mul",
             ShaderEntry::Greater => "greater",
-            ShaderEntry::BiasAdd => "bias_add",
-            ShaderEntry::SgdUpdate => "sgd_update",
             ShaderEntry::SumAll => "sum_all",
             ShaderEntry::MeanAll => "mean_all",
-            ShaderEntry::Softmax => "softmax",
-            ShaderEntry::CrossEntropyLoss => "cross_entropy_loss",
-            ShaderEntry::Transpose => "transpose",
         }
     }
 }

@@ -1,6 +1,6 @@
-// Matrix multiplication: C = A @ B
-// A: [M, K], B: [K, N], C: [M, N]
-// Uses tiled shared memory for better cache behavior.
+// Fused matrix multiplication + bias add + ReLU
+// C = relu(A @ B + bias)
+// A: [M, K], B: [K, N], bias: [N], C: [M, N]
 
 struct Params {
     m: u32,
@@ -11,12 +11,13 @@ struct Params {
 
 var<storage, read> a: array<f32>;
 var<storage, read> b: array<f32>;
+var<storage, read> bias: array<f32>;
 var<storage, read_write> c: array<f32>;
 var<uniform> params: Params;
 
 const TILE: u32 = 16u;
 
-var<workgroup> tile_a: array<f32, 256>; // TILE * TILE
+var<workgroup> tile_a: array<f32, 256>;
 var<workgroup> tile_b: array<f32, 256>;
 
 @compute @workgroup_size(16, 16)
@@ -58,6 +59,6 @@ fn main(
     }
 
     if row < params.m && col < params.n {
-        c[row * params.n + col] = sum;
+        c[row * params.n + col] = max(sum + bias[col], 0.0);
     }
 }
