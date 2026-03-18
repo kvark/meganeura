@@ -97,6 +97,37 @@ struct SgdParams {
 
 // reduce: var src, dst, params (same layout as UnaryData)
 
+// rms_norm: var src, bias (weight), dst, params
+#[derive(blade_macros::ShaderData)]
+struct RmsNormData {
+    src: blade_graphics::BufferPiece,
+    bias: blade_graphics::BufferPiece, // weight, named "bias" to match binding
+    dst: blade_graphics::BufferPiece,
+    params: BiasAddParams, // reuse: rows=len, cols=bias_len, _pad x2
+}
+
+// embedding: var indices (u32), src (table), dst, params
+#[derive(blade_macros::ShaderData)]
+struct EmbeddingData {
+    indices: blade_graphics::BufferPiece,
+    src: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: UnaryParams, // seq in len field
+}
+
+// rope: var src, dst, params
+// (same layout as UnaryData)
+
+// causal_attention: var src_a (q), src_b (k), bias (v), dst, params
+#[derive(blade_macros::ShaderData)]
+struct CausalAttentionData {
+    src_a: blade_graphics::BufferPiece,
+    src_b: blade_graphics::BufferPiece,
+    bias: blade_graphics::BufferPiece, // v, named "bias" to match binding
+    dst: blade_graphics::BufferPiece,
+    params: MatMulParams, // seq, num_heads, num_kv_heads, head_dim → reuse 4xu32
+}
+
 // softmax: var src, dst, params
 #[derive(blade_macros::ShaderData)]
 struct SoftmaxData {
@@ -200,7 +231,9 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
     match *entry {
         ShaderEntry::MatMul | ShaderEntry::MatMulRelu => MatMulData::layout(),
         ShaderEntry::MatMulBiasRelu => MatMulBiasReluData::layout(),
-        ShaderEntry::Relu | ShaderEntry::Sigmoid | ShaderEntry::Neg => UnaryData::layout(),
+        ShaderEntry::Relu | ShaderEntry::Sigmoid | ShaderEntry::Neg | ShaderEntry::Silu => {
+            UnaryData::layout()
+        }
         ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater => BinaryData::layout(),
         ShaderEntry::BiasAdd => BiasAddData::layout(),
         ShaderEntry::SgdUpdate => SgdData::layout(),
@@ -208,6 +241,10 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::Softmax => SoftmaxData::layout(),
         ShaderEntry::CrossEntropyLoss => CrossEntropyData::layout(),
         ShaderEntry::Transpose => TransposeData::layout(),
+        ShaderEntry::RmsNorm => RmsNormData::layout(),
+        ShaderEntry::Embedding => EmbeddingData::layout(),
+        ShaderEntry::RoPE => UnaryData::layout(), // same layout: src, dst, params
+        ShaderEntry::CausalAttention => CausalAttentionData::layout(),
     }
 }
 
@@ -285,6 +322,17 @@ impl Session {
 
     /// Upload input data.
     pub fn set_input(&mut self, name: &str, data: &[f32]) {
+        for &(ref input_name, buf_ref) in &self.plan.input_buffers {
+            if input_name == name {
+                self.upload_buffer(buf_ref, bytemuck::cast_slice(data));
+                return;
+            }
+        }
+        panic!("unknown input: {}", name);
+    }
+
+    /// Upload u32 input data (e.g. token IDs for embedding lookup).
+    pub fn set_input_u32(&mut self, name: &str, data: &[u32]) {
         for &(ref input_name, buf_ref) in &self.plan.input_buffers {
             if input_name == name {
                 self.upload_buffer(buf_ref, bytemuck::cast_slice(data));
@@ -402,7 +450,7 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::Relu | ShaderEntry::Sigmoid | ShaderEntry::Neg => {
+            ShaderEntry::Relu | ShaderEntry::Sigmoid | ShaderEntry::Neg | ShaderEntry::Silu => {
                 pc.bind(
                     0,
                     &UnaryData {
@@ -523,6 +571,70 @@ impl Session {
                             n: dispatch.params[1],
                             _pad0: 0,
                             _pad1: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::RmsNorm => {
+                pc.bind(
+                    0,
+                    &RmsNormData {
+                        src: buf(dispatch.input_buffers[0]),
+                        bias: buf(dispatch.input_buffers[1]),
+                        dst: buf(dispatch.output_buffer),
+                        params: BiasAddParams {
+                            len: dispatch.params[0],
+                            bias_len: dispatch.params[1],
+                            _pad0: dispatch.params[2], // eps_bits
+                            _pad1: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::Embedding => {
+                pc.bind(
+                    0,
+                    &EmbeddingData {
+                        indices: buf(dispatch.input_buffers[0]),
+                        src: buf(dispatch.input_buffers[1]),
+                        dst: buf(dispatch.output_buffer),
+                        params: UnaryParams {
+                            len: dispatch.params[0],
+                            _pad0: dispatch.params[1],
+                            _pad1: 0,
+                            _pad2: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::RoPE => {
+                pc.bind(
+                    0,
+                    &UnaryData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: UnaryParams {
+                            len: dispatch.params[0],
+                            _pad0: dispatch.params[1],
+                            _pad1: dispatch.params[2],
+                            _pad2: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::CausalAttention => {
+                pc.bind(
+                    0,
+                    &CausalAttentionData {
+                        src_a: buf(dispatch.input_buffers[0]),
+                        src_b: buf(dispatch.input_buffers[1]),
+                        bias: buf(dispatch.input_buffers[2]),
+                        dst: buf(dispatch.output_buffer),
+                        params: MatMulParams {
+                            m: dispatch.params[0],
+                            k: dispatch.params[1],
+                            n: dispatch.params[2],
+                            _pad: dispatch.params[3],
                         },
                     },
                 );

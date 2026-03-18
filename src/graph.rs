@@ -5,12 +5,14 @@ pub type NodeId = u32;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DType {
     F32,
+    U32,
 }
 
 impl DType {
     pub fn size_bytes(self) -> usize {
         match self {
             DType::F32 => 4,
+            DType::U32 => 4,
         }
     }
 }
@@ -92,6 +94,31 @@ pub enum Op {
 
     // Log-softmax (for numerical stability)
     LogSoftmax,
+
+    // --- Transformer ops ---
+
+    // SiLU activation: x * sigmoid(x)
+    Silu,
+
+    // RMSNorm: x / sqrt(mean(x²) + eps) * weight
+    // inputs: [x, weight], eps stored as f32 bits in params
+    RmsNorm { eps: f32 },
+
+    // Embedding lookup: indices → table rows
+    // inputs: [indices (U32), table (F32)]
+    Embedding,
+
+    // Rotary position embeddings
+    // inputs: [x], params encode theta
+    RoPE { theta: f32 },
+
+    // Fused causal multi-head attention with GQA
+    // inputs: [q, k, v] as 2D: q=[seq, num_heads*head_dim], k/v=[seq, num_kv_heads*head_dim]
+    CausalAttention {
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -271,6 +298,87 @@ impl Graph {
     pub fn log_softmax(&mut self, x: NodeId) -> NodeId {
         let ty = self.node(x).ty.clone();
         self.add_node(Op::LogSoftmax, vec![x], ty)
+    }
+
+    // --- Transformer ops ---
+
+    pub fn silu(&mut self, x: NodeId) -> NodeId {
+        let ty = self.node(x).ty.clone();
+        self.add_node(Op::Silu, vec![x], ty)
+    }
+
+    pub fn rms_norm(&mut self, x: NodeId, weight: NodeId, eps: f32) -> NodeId {
+        let x_shape = &self.node(x).ty.shape;
+        let w_shape = &self.node(weight).ty.shape;
+        assert_eq!(x_shape.len(), 2, "rms_norm requires 2D input");
+        assert_eq!(w_shape.len(), 1, "rms_norm weight must be 1D");
+        assert_eq!(x_shape[1], w_shape[0], "rms_norm weight size must match last dim");
+        let ty = self.node(x).ty.clone();
+        self.add_node(Op::RmsNorm { eps }, vec![x, weight], ty)
+    }
+
+    pub fn input_u32(&mut self, name: &str, shape: &[usize]) -> NodeId {
+        let ty = TensorType::new(shape.to_vec(), DType::U32);
+        self.add_node(
+            Op::Input {
+                name: name.to_string(),
+            },
+            vec![],
+            ty,
+        )
+    }
+
+    pub fn embedding(&mut self, indices: NodeId, table: NodeId) -> NodeId {
+        let idx_shape = &self.node(indices).ty.shape;
+        let tbl_shape = &self.node(table).ty.shape;
+        assert_eq!(self.node(indices).ty.dtype, DType::U32, "embedding indices must be U32");
+        assert_eq!(idx_shape.len(), 1, "embedding indices must be 1D");
+        assert_eq!(tbl_shape.len(), 2, "embedding table must be 2D");
+        let seq_len = idx_shape[0];
+        let hidden = tbl_shape[1];
+        let ty = TensorType::f32(vec![seq_len, hidden]);
+        self.add_node(Op::Embedding, vec![indices, table], ty)
+    }
+
+    pub fn rope(&mut self, x: NodeId, theta: f32) -> NodeId {
+        let x_shape = &self.node(x).ty.shape;
+        assert_eq!(x_shape.len(), 2, "rope requires 2D input");
+        assert_eq!(x_shape[1] % 2, 0, "rope requires even last dim");
+        let ty = self.node(x).ty.clone();
+        self.add_node(Op::RoPE { theta }, vec![x], ty)
+    }
+
+    pub fn causal_attention(
+        &mut self,
+        q: NodeId,
+        k: NodeId,
+        v: NodeId,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+    ) -> NodeId {
+        let q_shape = &self.node(q).ty.shape;
+        let k_shape = &self.node(k).ty.shape;
+        let v_shape = &self.node(v).ty.shape;
+        assert_eq!(q_shape.len(), 2, "q must be 2D");
+        assert_eq!(k_shape.len(), 2, "k must be 2D");
+        assert_eq!(v_shape.len(), 2, "v must be 2D");
+        let seq = q_shape[0];
+        assert_eq!(q_shape[1], (num_heads * head_dim) as usize, "q dim mismatch");
+        assert_eq!(k_shape[0], seq, "k seq must match q seq");
+        assert_eq!(k_shape[1], (num_kv_heads * head_dim) as usize, "k dim mismatch");
+        assert_eq!(v_shape[0], seq, "v seq must match q seq");
+        assert_eq!(v_shape[1], (num_kv_heads * head_dim) as usize, "v dim mismatch");
+        let ty = TensorType::f32(vec![seq, (num_heads * head_dim) as usize]);
+        self.add_node(
+            Op::CausalAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            },
+            vec![q, k, v],
+            ty,
+        )
     }
 
     // --- Loss ---

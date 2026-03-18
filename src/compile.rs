@@ -21,6 +21,11 @@ pub enum ShaderEntry {
     Softmax,
     CrossEntropyLoss,
     Transpose,
+    Silu,
+    RmsNorm,
+    Embedding,
+    RoPE,
+    CausalAttention,
 }
 
 impl ShaderEntry {
@@ -38,6 +43,11 @@ impl ShaderEntry {
             ShaderEntry::Softmax => ShaderGroup::Softmax,
             ShaderEntry::CrossEntropyLoss => ShaderGroup::CrossEntropy,
             ShaderEntry::Transpose => ShaderGroup::Transpose,
+            ShaderEntry::Silu => ShaderGroup::Unary,
+            ShaderEntry::RmsNorm => ShaderGroup::RmsNorm,
+            ShaderEntry::Embedding => ShaderGroup::Embedding,
+            ShaderEntry::RoPE => ShaderGroup::RoPE,
+            ShaderEntry::CausalAttention => ShaderGroup::CausalAttention,
         }
     }
 
@@ -59,6 +69,11 @@ impl ShaderEntry {
             ShaderEntry::Greater => "greater",
             ShaderEntry::SumAll => "sum_all",
             ShaderEntry::MeanAll => "mean_all",
+            ShaderEntry::Silu => "silu",
+            ShaderEntry::RmsNorm => "main",
+            ShaderEntry::Embedding => "main",
+            ShaderEntry::RoPE => "main",
+            ShaderEntry::CausalAttention => "main",
         }
     }
 }
@@ -357,6 +372,73 @@ impl<'a> Compiler<'a> {
                     input_buffers: vec![input],
                     output_buffer: out_buf,
                     params: vec![m, n, 0, 0],
+                });
+            }
+
+            Op::Silu => {
+                self.emit_unary(ShaderEntry::Silu, node, out_buf);
+            }
+
+            Op::RmsNorm { eps } => {
+                let x = self.get_buffer(node.inputs[0]);
+                let w = self.get_buffer(node.inputs[1]);
+                let shape = &self.graph.node(node.inputs[0]).ty.shape;
+                let rows = shape[0] as u32;
+                let cols = shape[1] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::RmsNorm,
+                    workgroups: [ceil_div(rows, 256), 1, 1],
+                    input_buffers: vec![x, w],
+                    output_buffer: out_buf,
+                    params: vec![rows, cols, eps.to_bits(), 0],
+                });
+            }
+
+            Op::Embedding => {
+                let indices = self.get_buffer(node.inputs[0]);
+                let table = self.get_buffer(node.inputs[1]);
+                let idx_shape = &self.graph.node(node.inputs[0]).ty.shape;
+                let tbl_shape = &self.graph.node(node.inputs[1]).ty.shape;
+                let seq = idx_shape[0] as u32;
+                let hidden = tbl_shape[1] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::Embedding,
+                    workgroups: [ceil_div(seq * hidden, 256), 1, 1],
+                    input_buffers: vec![indices, table],
+                    output_buffer: out_buf,
+                    params: vec![seq, hidden, 0, 0],
+                });
+            }
+
+            Op::RoPE { theta } => {
+                let input = self.get_buffer(node.inputs[0]);
+                let shape = &self.graph.node(node.inputs[0]).ty.shape;
+                let seq = shape[0] as u32;
+                let dim = shape[1] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::RoPE,
+                    workgroups: [ceil_div(seq * dim / 2, 256), 1, 1],
+                    input_buffers: vec![input],
+                    output_buffer: out_buf,
+                    params: vec![seq, dim, theta.to_bits(), 0],
+                });
+            }
+
+            Op::CausalAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            } => {
+                let q = self.get_buffer(node.inputs[0]);
+                let k = self.get_buffer(node.inputs[1]);
+                let v = self.get_buffer(node.inputs[2]);
+                let seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::CausalAttention,
+                    workgroups: [ceil_div(seq, 1), num_heads, 1],
+                    input_buffers: vec![q, k, v],
+                    output_buffer: out_buf,
+                    params: vec![seq, num_heads, num_kv_heads, head_dim],
                 });
             }
         }

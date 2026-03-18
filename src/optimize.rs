@@ -182,6 +182,12 @@ fn graph_to_egglog(graph: &Graph) -> String {
   ; Fused ops
   (FusedMatMulRelu Op Op)
   (FusedMatMulBiasRelu Op Op Op)
+  ; Transformer ops (passthrough, no fusion rules)
+  (Silu Op)
+  (RmsNorm Op Op)
+  (Embedding Op Op)
+  (RoPE Op)
+  (CausalAttention Op Op Op)
 )
 
 ",
@@ -245,6 +251,14 @@ fn node_to_egglog_expr(node: &Node) -> String {
         }
         Op::FusedMatMulBiasRelu => format!(
             "(FusedMatMulBiasRelu n{} n{} n{})",
+            node.inputs[0], node.inputs[1], node.inputs[2]
+        ),
+        Op::Silu => format!("(Silu n{})", node.inputs[0]),
+        Op::RmsNorm { .. } => format!("(RmsNorm n{} n{})", node.inputs[0], node.inputs[1]),
+        Op::Embedding => format!("(Embedding n{} n{})", node.inputs[0], node.inputs[1]),
+        Op::RoPE { .. } => format!("(RoPE n{})", node.inputs[0]),
+        Op::CausalAttention { .. } => format!(
+            "(CausalAttention n{} n{} n{})",
             node.inputs[0], node.inputs[1], node.inputs[2]
         ),
         Op::Nop => unreachable!("Nop nodes should be filtered before conversion"),

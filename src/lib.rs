@@ -23,6 +23,7 @@ pub mod codegen;
 pub mod compile;
 pub mod data;
 pub mod graph;
+pub mod models;
 pub mod optimize;
 pub mod runtime;
 pub mod train;

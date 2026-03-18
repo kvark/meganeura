@@ -23,6 +23,7 @@ env_logger = "0.11"
 flate2 = "1"
 safetensors = "0.4"
 hf-hub = { version = "0.4", default-features = false, features = ["ureq", "native-tls"] }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 
 [[example]]
 name = "mnist"
@@ -35,3 +36,7 @@ path = "examples/diffusion.rs"
 [[example]]
 name = "huggingface"
 path = "examples/huggingface.rs"
+
+[[example]]
+name = "smollm2"
+path = "examples/smollm2.rs"
