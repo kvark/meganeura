@@ -982,23 +982,30 @@ fn gen_matmul(fusion: MatMulFusion) -> Module {
         let ac_lt_k = f.binary(BinaryOperator::Less, a_col, pk);
         let cond_a = f.binary(BinaryOperator::LogicalAnd, r_lt_m, ac_lt_k);
 
-        // a[row * k + a_col]
+        // a[row * k + a_col] — index expressions only (no load yet)
         let a_ptr = f.global(gv_a);
         let row_k = f.binary(BinaryOperator::Multiply, row, pk);
         let a_idx = f.binary(BinaryOperator::Add, row_k, a_col);
         let a_elem = f.index(a_ptr, a_idx);
+        // Load is deferred into the accept block to avoid OOB reads
         let a_val = f.load(a_elem);
 
         let zero_f2 = f.literal_f32(0.0);
 
-        push_emit(&f.f.expressions, &mut loop_body, tile16_2, a_val);
+        // Emit index arithmetic and condition into loop_body (no load yet)
+        push_emit(&f.f.expressions, &mut loop_body, tile16_2, cond_a);
         push_emit(&f.f.expressions, &mut loop_body, zero_f2, zero_f2);
 
-        // if (cond_a) { tile_a[..] = a_val } else { tile_a[..] = 0.0 }
+        // Build accept block: emit load, then store
+        let mut accept_a = Block::new();
+        push_emit(&f.f.expressions, &mut accept_a, a_ptr, a_val);
+        accept_a.push(f.store(ta_elem, a_val), S);
+
+        // if (cond_a) { a_val = a[..]; tile_a[..] = a_val } else { tile_a[..] = 0.0 }
         loop_body.push(
             Statement::If {
                 condition: cond_a,
-                accept: Block::from_vec(vec![f.store(ta_elem, a_val)]),
+                accept: accept_a,
                 reject: Block::from_vec(vec![f.store(ta_elem, zero_f2)]),
             },
             S,
@@ -1013,22 +1020,29 @@ fn gen_matmul(fusion: MatMulFusion) -> Module {
         let c_lt_n = f.binary(BinaryOperator::Less, col, pn);
         let cond_b = f.binary(BinaryOperator::LogicalAnd, br_lt_k, c_lt_n);
 
-        // b[b_row * n + col]
+        // b[b_row * n + col] — index expressions only (no load yet)
         let b_ptr = f.global(gv_b);
         let br_n = f.binary(BinaryOperator::Multiply, b_row, pn);
         let b_idx = f.binary(BinaryOperator::Add, br_n, col);
         let b_elem = f.index(b_ptr, b_idx);
+        // Load is deferred into the accept block to avoid OOB reads
         let b_val = f.load(b_elem);
 
         let zero_f3 = f.literal_f32(0.0);
 
-        push_emit(&f.f.expressions, &mut loop_body, tile_b_ptr, b_val);
+        // Emit index arithmetic and condition into loop_body (no load yet)
+        push_emit(&f.f.expressions, &mut loop_body, tile_b_ptr, cond_b);
         push_emit(&f.f.expressions, &mut loop_body, zero_f3, zero_f3);
+
+        // Build accept block: emit load, then store
+        let mut accept_b = Block::new();
+        push_emit(&f.f.expressions, &mut accept_b, b_ptr, b_val);
+        accept_b.push(f.store(tb_elem, b_val), S);
 
         loop_body.push(
             Statement::If {
                 condition: cond_b,
-                accept: Block::from_vec(vec![f.store(tb_elem, b_val)]),
+                accept: accept_b,
                 reject: Block::from_vec(vec![f.store(tb_elem, zero_f3)]),
             },
             S,
