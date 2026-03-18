@@ -4,12 +4,9 @@ use std::collections::HashMap;
 /// Identifies which shader and entry point to use.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ShaderEntry {
-    // matmul.wgsl
     MatMul,
     MatMulRelu,
-    // matmul_bias.wgsl
     MatMulBiasRelu,
-    // elementwise.wgsl
     Relu,
     Sigmoid,
     Neg,
@@ -18,7 +15,6 @@ pub enum ShaderEntry {
     Greater,
     BiasAdd,
     SgdUpdate,
-    // reduce.wgsl
     SumAll,
     MeanAll,
     Softmax,
@@ -27,19 +23,20 @@ pub enum ShaderEntry {
 }
 
 impl ShaderEntry {
-    pub fn shader_file(&self) -> &'static str {
+    pub fn shader_group(&self) -> crate::codegen::ShaderGroup {
+        use crate::codegen::ShaderGroup;
         match *self {
-            ShaderEntry::MatMul => "shaders/matmul.wgsl",
-            ShaderEntry::MatMulRelu => "shaders/matmul_relu.wgsl",
-            ShaderEntry::MatMulBiasRelu => "shaders/matmul_bias_relu.wgsl",
-            ShaderEntry::Relu | ShaderEntry::Sigmoid | ShaderEntry::Neg => "shaders/unary.wgsl",
-            ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater => "shaders/binary.wgsl",
-            ShaderEntry::BiasAdd => "shaders/bias_add.wgsl",
-            ShaderEntry::SgdUpdate => "shaders/sgd.wgsl",
-            ShaderEntry::SumAll | ShaderEntry::MeanAll => "shaders/reduce.wgsl",
-            ShaderEntry::Softmax => "shaders/softmax.wgsl",
-            ShaderEntry::CrossEntropyLoss => "shaders/cross_entropy.wgsl",
-            ShaderEntry::Transpose => "shaders/transpose.wgsl",
+            ShaderEntry::MatMul => ShaderGroup::MatMul,
+            ShaderEntry::MatMulRelu => ShaderGroup::MatMulRelu,
+            ShaderEntry::MatMulBiasRelu => ShaderGroup::MatMulBiasRelu,
+            ShaderEntry::Relu | ShaderEntry::Sigmoid | ShaderEntry::Neg => ShaderGroup::Unary,
+            ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater => ShaderGroup::Binary,
+            ShaderEntry::BiasAdd => ShaderGroup::BiasAdd,
+            ShaderEntry::SgdUpdate => ShaderGroup::Sgd,
+            ShaderEntry::SumAll | ShaderEntry::MeanAll => ShaderGroup::Reduce,
+            ShaderEntry::Softmax => ShaderGroup::Softmax,
+            ShaderEntry::CrossEntropyLoss => ShaderGroup::CrossEntropy,
+            ShaderEntry::Transpose => ShaderGroup::Transpose,
         }
     }
 

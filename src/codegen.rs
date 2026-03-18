@@ -1,8 +1,9 @@
 //! Shader codegen via Naga IR.
 //!
-//! Instead of loading static `.wgsl` files, this module builds `naga::Module`
-//! objects programmatically and emits WGSL via `naga::back::wgsl`. When blade
-//! gains `create_shader_from_module()`, we can skip the WGSL roundtrip.
+//! Builds `naga::Module` objects programmatically for each [`ShaderGroup`].
+//! Currently emits WGSL via `naga::back::wgsl` for blade consumption;
+//! direct `naga::Module` passthrough is possible via blade's `naga_module`
+//! field once the SPIR-V backend handles hand-built IR emit ranges.
 
 use naga::*;
 
@@ -135,6 +136,7 @@ impl Builder {
                 binding: None,
                 ty: self.ty_arr_f32,
                 init: None,
+                memory_decorations: MemoryDecorations::empty(),
             },
             S,
         )
@@ -151,6 +153,7 @@ impl Builder {
                 binding: None,
                 ty: self.ty_arr_f32,
                 init: None,
+                memory_decorations: MemoryDecorations::empty(),
             },
             S,
         )
@@ -165,6 +168,7 @@ impl Builder {
                 binding: None,
                 ty,
                 init: None,
+                memory_decorations: MemoryDecorations::empty(),
             },
             S,
         )
@@ -190,6 +194,7 @@ impl Builder {
                 binding: None,
                 ty,
                 init: None,
+                memory_decorations: MemoryDecorations::empty(),
             },
             S,
         )
@@ -209,6 +214,9 @@ impl Builder {
             workgroup_size,
             workgroup_size_overrides: None,
             function: func,
+            mesh_info: None,
+            task_payload: None,
+            incoming_ray_payload: None,
         });
     }
 
@@ -490,31 +498,47 @@ fn push_emit(
 }
 
 // ---------------------------------------------------------------------------
-// Shader generators — one per "file group"
+// Shader groups — each group is a naga::Module with one or more entry points
 // ---------------------------------------------------------------------------
 
-/// Generate WGSL source for a shader group (replaces reading .wgsl files).
-pub fn generate_wgsl(shader_file: &str) -> String {
-    let module = generate_module(shader_file);
-    module_to_wgsl(&module)
+/// A shader group corresponds to a single `naga::Module` that may
+/// contain multiple entry points (e.g. `Unary` has relu, sigmoid, neg).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ShaderGroup {
+    Unary,
+    Binary,
+    BiasAdd,
+    Sgd,
+    Transpose,
+    MatMul,
+    MatMulRelu,
+    MatMulBiasRelu,
+    Reduce,
+    Softmax,
+    CrossEntropy,
 }
 
 /// Generate a `naga::Module` for a shader group.
-pub fn generate_module(shader_file: &str) -> Module {
-    match shader_file {
-        "shaders/unary.wgsl" => gen_unary(),
-        "shaders/binary.wgsl" => gen_binary(),
-        "shaders/bias_add.wgsl" => gen_bias_add(),
-        "shaders/sgd.wgsl" => gen_sgd(),
-        "shaders/transpose.wgsl" => gen_transpose(),
-        "shaders/matmul.wgsl" => gen_matmul(MatMulFusion::None),
-        "shaders/matmul_relu.wgsl" => gen_matmul(MatMulFusion::Relu),
-        "shaders/matmul_bias_relu.wgsl" => gen_matmul(MatMulFusion::BiasRelu),
-        "shaders/reduce.wgsl" => gen_reduce(),
-        "shaders/softmax.wgsl" => gen_softmax(),
-        "shaders/cross_entropy.wgsl" => gen_cross_entropy(),
-        other => panic!("unknown shader file: {other}"),
+pub fn generate_module(group: ShaderGroup) -> Module {
+    match group {
+        ShaderGroup::Unary => gen_unary(),
+        ShaderGroup::Binary => gen_binary(),
+        ShaderGroup::BiasAdd => gen_bias_add(),
+        ShaderGroup::Sgd => gen_sgd(),
+        ShaderGroup::Transpose => gen_transpose(),
+        ShaderGroup::MatMul => gen_matmul(MatMulFusion::None),
+        ShaderGroup::MatMulRelu => gen_matmul(MatMulFusion::Relu),
+        ShaderGroup::MatMulBiasRelu => gen_matmul(MatMulFusion::BiasRelu),
+        ShaderGroup::Reduce => gen_reduce(),
+        ShaderGroup::Softmax => gen_softmax(),
+        ShaderGroup::CrossEntropy => gen_cross_entropy(),
     }
+}
+
+/// Generate WGSL source for a shader group.
+pub fn generate_wgsl(group: ShaderGroup) -> String {
+    let module = generate_module(group);
+    module_to_wgsl(&module)
 }
 
 /// Convert a naga Module to WGSL source text.
@@ -1058,7 +1082,7 @@ fn gen_matmul(fusion: MatMulFusion) -> Module {
         );
 
         // workgroupBarrier()
-        loop_body.push(Statement::Barrier(Barrier::WORK_GROUP), S);
+        loop_body.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
 
         // Inner loop: for (var i = 0u; i < TILE; i++)
         let i_var = f.local_var("i", b.ty_u32, None);
@@ -1114,7 +1138,7 @@ fn gen_matmul(fusion: MatMulFusion) -> Module {
         }
 
         // workgroupBarrier()
-        loop_body.push(Statement::Barrier(Barrier::WORK_GROUP), S);
+        loop_body.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
 
         // t++
         let one_t = f.literal_u32(1);
@@ -1236,7 +1260,7 @@ fn gen_reduce() -> Module {
             },
             S,
         );
-        f.f.body.push(Statement::Barrier(Barrier::WORK_GROUP), S);
+        f.f.body.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
 
         // Reduction loop: for stride = 128; stride > 0; stride /= 2
         let stride_var = f.local_var("stride", b.ty_u32, None);
@@ -1273,7 +1297,7 @@ fn gen_reduce() -> Module {
                 S,
             );
 
-            loop_body.push(Statement::Barrier(Barrier::WORK_GROUP), S);
+            loop_body.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
 
             // stride /= 2
             let two = f.literal_u32(2);
@@ -1765,47 +1789,46 @@ fn gen_cross_entropy() -> Module {
 mod tests {
     use super::*;
 
-    /// Verify every shader generates valid WGSL.
+    /// Verify every shader group generates valid WGSL.
     #[test]
     fn all_shaders_generate_valid_wgsl() {
-        let files = [
-            "shaders/unary.wgsl",
-            "shaders/binary.wgsl",
-            "shaders/bias_add.wgsl",
-            "shaders/sgd.wgsl",
-            "shaders/transpose.wgsl",
-            "shaders/matmul.wgsl",
-            "shaders/matmul_relu.wgsl",
-            "shaders/matmul_bias_relu.wgsl",
-            "shaders/reduce.wgsl",
-            "shaders/softmax.wgsl",
-            "shaders/cross_entropy.wgsl",
+        let groups = [
+            ShaderGroup::Unary,
+            ShaderGroup::Binary,
+            ShaderGroup::BiasAdd,
+            ShaderGroup::Sgd,
+            ShaderGroup::Transpose,
+            ShaderGroup::MatMul,
+            ShaderGroup::MatMulRelu,
+            ShaderGroup::MatMulBiasRelu,
+            ShaderGroup::Reduce,
+            ShaderGroup::Softmax,
+            ShaderGroup::CrossEntropy,
         ];
 
-        for file in &files {
-            let wgsl = generate_wgsl(file);
-            // Verify it round-trips through naga's WGSL parser
+        for group in &groups {
+            let wgsl = generate_wgsl(*group);
             naga::front::wgsl::parse_str(&wgsl)
-                .unwrap_or_else(|e| panic!("{file}: generated WGSL failed to re-parse: {e}"));
+                .unwrap_or_else(|e| panic!("{group:?}: generated WGSL failed to re-parse: {e}"));
         }
     }
 
     /// Verify the generated modules contain the expected entry points.
     #[test]
     fn entry_points_present() {
-        let m = generate_module("shaders/unary.wgsl");
+        let m = generate_module(ShaderGroup::Unary);
         let names: Vec<&str> = m.entry_points.iter().map(|ep| ep.name.as_str()).collect();
         assert!(names.contains(&"relu"), "missing relu");
         assert!(names.contains(&"sigmoid"), "missing sigmoid");
         assert!(names.contains(&"neg"), "missing neg");
 
-        let m = generate_module("shaders/binary.wgsl");
+        let m = generate_module(ShaderGroup::Binary);
         let names: Vec<&str> = m.entry_points.iter().map(|ep| ep.name.as_str()).collect();
         assert!(names.contains(&"add"));
         assert!(names.contains(&"mul"));
         assert!(names.contains(&"greater"));
 
-        let m = generate_module("shaders/reduce.wgsl");
+        let m = generate_module(ShaderGroup::Reduce);
         let names: Vec<&str> = m.entry_points.iter().map(|ep| ep.name.as_str()).collect();
         assert!(names.contains(&"sum_all"));
         assert!(names.contains(&"mean_all"));
