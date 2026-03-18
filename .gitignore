@@ -1,2 +1,4 @@
 /target
 Cargo.lock
+data/mnist-mlp.safetensors
+data/*.gz

@@ -40,3 +40,6 @@ jobs:
 
       - name: GPU smoke test (lavapipe)
         run: cargo test --test gpu_smoke
+
+      - name: Cache + inference roundtrip test (lavapipe)
+        run: cargo test --test cache_inference

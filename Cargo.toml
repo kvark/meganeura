@@ -21,6 +21,8 @@ ron = "0.8"
 log = "0.4"
 env_logger = "0.11"
 flate2 = "1"
+safetensors = "0.4"
+hf-hub = { version = "0.4", default-features = false, features = ["ureq", "native-tls"] }
 
 [[example]]
 name = "mnist"
@@ -29,3 +31,7 @@ path = "examples/mnist.rs"
 [[example]]
 name = "diffusion"
 path = "examples/diffusion.rs"
+
+[[example]]
+name = "huggingface"
+path = "examples/huggingface.rs"
