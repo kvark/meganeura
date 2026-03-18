@@ -3,10 +3,9 @@ use std::collections::HashMap;
 
 type Gpu = blade_graphics::Context;
 
-// ---- ShaderData structs matching WGSL var declarations ----
-// Field names must match WGSL global variable names exactly.
+// ---- ShaderData structs matching codegen global variable names ----
 
-// matmul.wgsl, matmul_relu.wgsl: var a, b, c, params
+// matmul / matmul_relu: var a, b, c, params
 #[derive(blade_macros::ShaderData)]
 struct MatMulData {
     a: blade_graphics::BufferPiece,
@@ -15,7 +14,7 @@ struct MatMulData {
     params: MatMulParams,
 }
 
-// matmul_bias_relu.wgsl: var a, b, bias, c, params
+// matmul_bias_relu: var a, b, bias, c, params
 #[derive(blade_macros::ShaderData)]
 struct MatMulBiasReluData {
     a: blade_graphics::BufferPiece,
@@ -34,7 +33,7 @@ struct MatMulParams {
     _pad: u32,
 }
 
-// unary.wgsl: var src, dst, params
+// unary: var src, dst, params
 #[derive(blade_macros::ShaderData)]
 struct UnaryData {
     src: blade_graphics::BufferPiece,
@@ -51,7 +50,7 @@ struct UnaryParams {
     _pad2: u32,
 }
 
-// binary.wgsl: var src_a, src_b, dst, params
+// binary: var src_a, src_b, dst, params
 #[derive(blade_macros::ShaderData)]
 struct BinaryData {
     src_a: blade_graphics::BufferPiece,
@@ -60,7 +59,7 @@ struct BinaryData {
     params: UnaryParams, // same layout: len + padding
 }
 
-// bias_add.wgsl: var src, bias, dst, params
+// bias_add: var src, bias, dst, params
 #[derive(blade_macros::ShaderData)]
 struct BiasAddData {
     src: blade_graphics::BufferPiece,
@@ -78,7 +77,7 @@ struct BiasAddParams {
     _pad1: u32,
 }
 
-// sgd.wgsl: var param, grad, dst, params
+// sgd: var param, grad, dst, params
 #[derive(blade_macros::ShaderData)]
 struct SgdData {
     param: blade_graphics::BufferPiece,
@@ -96,10 +95,9 @@ struct SgdParams {
     _pad1: u32,
 }
 
-// reduce.wgsl: var src, dst, params
-// (same layout as UnaryData)
+// reduce: var src, dst, params (same layout as UnaryData)
 
-// softmax.wgsl: var src, dst, params
+// softmax: var src, dst, params
 #[derive(blade_macros::ShaderData)]
 struct SoftmaxData {
     src: blade_graphics::BufferPiece,
@@ -116,7 +114,7 @@ struct SoftmaxParams {
     _pad1: u32,
 }
 
-// cross_entropy.wgsl: var logits, labels, grad_out, loss_out, params
+// cross_entropy: var logits, labels, grad_out, loss_out, params
 #[derive(blade_macros::ShaderData)]
 struct CrossEntropyData {
     logits: blade_graphics::BufferPiece,
@@ -126,7 +124,7 @@ struct CrossEntropyData {
     params: SoftmaxParams,
 }
 
-// transpose.wgsl: var src, dst, params
+// transpose: var src, dst, params
 #[derive(blade_macros::ShaderData)]
 struct TransposeData {
     src: blade_graphics::BufferPiece,
@@ -152,20 +150,27 @@ struct Pipelines {
 impl Pipelines {
     fn new(gpu: &Gpu, plan: &ExecutionPlan) -> Self {
         use blade_graphics as bg;
+        use crate::codegen::ShaderGroup;
 
-        // Collect unique (shader_file, entry) pairs
-        let mut needed: HashMap<&str, Vec<&ShaderEntry>> = HashMap::new();
+        // Collect unique (ShaderGroup, entries) pairs
+        let mut needed: HashMap<ShaderGroup, Vec<&ShaderEntry>> = HashMap::new();
         for dispatch in &plan.dispatches {
             needed
-                .entry(dispatch.shader.shader_file())
+                .entry(dispatch.shader.shader_group())
                 .or_default()
                 .push(&dispatch.shader);
         }
 
         let mut map = HashMap::new();
-        for (file, entries) in &needed {
-            let source = crate::codegen::generate_wgsl(file);
-            let shader = gpu.create_shader(bg::ShaderDesc { source: &source });
+        for (group, entries) in &needed {
+            // Generate WGSL from Naga IR, then let blade parse it.
+            // Passing naga::Module directly hits SPIR-V backend caching issues
+            // with hand-built IR; the WGSL roundtrip normalizes emit ranges.
+            let source = crate::codegen::generate_wgsl(*group);
+            let shader = gpu.create_shader(bg::ShaderDesc {
+                source: &source,
+                naga_module: None,
+            });
 
             for entry in entries {
                 if map.contains_key(*entry) {
