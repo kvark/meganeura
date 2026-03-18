@@ -13,16 +13,13 @@
 //! meganeura::profiler::save("trace.pftrace").unwrap();
 //! ```
 
-use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
-
-use tracing::span;
-use tracing::Subscriber;
-use tracing_subscriber::layer::Context;
-use tracing_subscriber::prelude::*;
-use tracing_subscriber::registry::LookupSpan;
-use tracing_subscriber::Layer;
+use std::{
+    path::Path,
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
+};
+use tracing::{span, Subscriber};
+use tracing_subscriber::{layer::Context, prelude::*, registry::LookupSpan, Layer};
 
 // ---- Track IDs ----
 
@@ -94,7 +91,7 @@ pub fn record_gpu_passes(submit_offset_ns: u64, passes: &[(String, Duration)]) {
     if let Some(inner) = PROFILER.get() {
         let mut guard = inner.lock().unwrap();
         let mut offset = submit_offset_ns;
-        for (name, dur) in passes {
+        for &(ref name, dur) in passes {
             guard.events.push(TraceEvent {
                 name: name.clone(),
                 timestamp_ns: offset,
@@ -145,7 +142,7 @@ pub fn event_count() -> usize {
 /// Write all collected events to a Perfetto `.pftrace` binary trace file.
 pub fn save(path: impl AsRef<Path>) -> std::io::Result<()> {
     let inner = PROFILER.get().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::Other, "profiler not initialized")
+        std::io::Error::other("profiler not initialized")
     })?;
     let guard = inner.lock().unwrap();
     write_pftrace(path.as_ref(), &guard.events)

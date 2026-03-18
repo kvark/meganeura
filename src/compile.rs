@@ -51,28 +51,6 @@ impl ShaderEntry {
         }
     }
 
-    /// Human-readable name for this shader, used in profiling traces.
-    pub fn name(&self) -> &'static str {
-        match *self {
-            ShaderEntry::MatMul => "matmul",
-            ShaderEntry::MatMulRelu => "matmul_relu",
-            ShaderEntry::MatMulBiasRelu => "matmul_bias_relu",
-            ShaderEntry::Relu => "relu",
-            ShaderEntry::Sigmoid => "sigmoid",
-            ShaderEntry::Neg => "neg",
-            ShaderEntry::Add => "add",
-            ShaderEntry::Mul => "mul",
-            ShaderEntry::Greater => "greater",
-            ShaderEntry::BiasAdd => "bias_add",
-            ShaderEntry::SgdUpdate => "sgd_update",
-            ShaderEntry::SumAll => "sum_all",
-            ShaderEntry::MeanAll => "mean_all",
-            ShaderEntry::Softmax => "softmax",
-            ShaderEntry::CrossEntropyLoss => "cross_entropy_loss",
-            ShaderEntry::Transpose => "transpose",
-        }
-    }
-
     pub fn entry_point(&self) -> &'static str {
         match *self {
             ShaderEntry::MatMul

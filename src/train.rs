@@ -1,11 +1,10 @@
-use crate::autodiff;
-use crate::cache;
-use crate::compile;
-use crate::data::DataLoader;
-use crate::graph::Graph;
-use crate::optimize;
-use crate::optimize::OptimizeReport;
-use crate::runtime::Session;
+use crate::{
+    autodiff, cache, compile,
+    data::DataLoader,
+    graph::Graph,
+    optimize::{self, OptimizeReport},
+    runtime::Session,
+};
 use std::path::Path;
 
 /// Configuration for training.
