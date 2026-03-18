@@ -315,6 +315,20 @@ impl Session {
         }
     }
 
+    /// Read back the output tensor (first graph output).
+    ///
+    /// Returns the data as a `Vec<f32>`. For inference graphs this is the
+    /// model's prediction; for training graphs it's the loss scalar.
+    pub fn read_output(&self, len: usize) -> Vec<f32> {
+        if let Some(buf_ref) = self.plan.loss_buffer {
+            let mut out = vec![0.0_f32; len];
+            self.read_buffer(buf_ref, &mut out);
+            out
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Read back a buffer's contents.
     pub fn read_buffer(&self, buf_ref: BufferRef, out: &mut [f32]) {
         let buffer = &self.buffers[buf_ref.0 as usize];

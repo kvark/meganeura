@@ -135,6 +135,33 @@ impl Trainer {
     }
 }
 
+/// Build an inference-only session from a forward-pass graph.
+///
+/// Skips autodiff (no backward pass). Runs egglog optimization and
+/// compiles the graph to a GPU session ready for forward evaluation.
+pub fn build_inference_session(forward_graph: &Graph) -> Session {
+    log::info!("building inference session...");
+    log::info!("forward graph:\n{}", forward_graph);
+
+    // Optimize with egglog (fusions still help for inference)
+    log::info!("running egglog optimization...");
+    let optimized = optimize::optimize(forward_graph);
+    log::info!("optimized graph: {} nodes", optimized.nodes().len());
+
+    // Compile to execution plan
+    log::info!("compiling execution plan...");
+    let plan = compile::compile(&optimized);
+    log::info!(
+        "execution plan: {} buffers, {} dispatches",
+        plan.buffers.len(),
+        plan.dispatches.len()
+    );
+
+    // Create GPU session
+    log::info!("initializing GPU session...");
+    Session::new(plan)
+}
+
 /// Build a complete training session from a forward-pass graph.
 ///
 /// This is the main entry point. It:

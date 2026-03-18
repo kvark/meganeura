@@ -32,6 +32,6 @@ pub use graph::{DType, Graph, NodeId, TensorType};
 pub use optimize::OptimizeReport;
 pub use runtime::Session;
 pub use train::{
-    EpochStats, TrainConfig, TrainHistory, Trainer, build_session, build_session_cached,
-    build_session_with_report, compile_training_graph,
+    EpochStats, TrainConfig, TrainHistory, Trainer, build_inference_session, build_session,
+    build_session_cached, build_session_with_report, compile_training_graph,
 };
