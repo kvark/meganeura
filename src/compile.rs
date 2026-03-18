@@ -427,4 +427,216 @@ mod tests {
         assert_eq!(plan.dispatches.len(), 1);
         assert_eq!(plan.dispatches[0].shader, ShaderEntry::MatMulRelu);
     }
+
+    #[test]
+    fn test_compile_all_unary_ops() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 8]);
+        let r = g.relu(x);
+        let s = g.sigmoid(x);
+        let n = g.neg(x);
+        g.set_outputs(vec![r, s, n]);
+
+        let plan = compile(&g);
+        assert_eq!(plan.dispatches.len(), 3);
+        assert_eq!(plan.dispatches[0].shader, ShaderEntry::Relu);
+        assert_eq!(plan.dispatches[1].shader, ShaderEntry::Sigmoid);
+        assert_eq!(plan.dispatches[2].shader, ShaderEntry::Neg);
+        // All unary ops: params = [len, 0, 0, 0]
+        for d in &plan.dispatches {
+            assert_eq!(d.params[0], 32); // 4*8
+            assert_eq!(d.input_buffers.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_compile_all_binary_ops() {
+        let mut g = Graph::new();
+        let a = g.input("a", &[4, 8]);
+        let b = g.input("b", &[4, 8]);
+        let add = g.add(a, b);
+        let mul = g.mul(a, b);
+        let gt = g.greater(a, b);
+        g.set_outputs(vec![add, mul, gt]);
+
+        let plan = compile(&g);
+        assert_eq!(plan.dispatches.len(), 3);
+        assert_eq!(plan.dispatches[0].shader, ShaderEntry::Add);
+        assert_eq!(plan.dispatches[1].shader, ShaderEntry::Mul);
+        assert_eq!(plan.dispatches[2].shader, ShaderEntry::Greater);
+        for d in &plan.dispatches {
+            assert_eq!(d.input_buffers.len(), 2);
+            assert_eq!(d.params[0], 32);
+        }
+    }
+
+    #[test]
+    fn test_compile_bias_add() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 128]);
+        let b = g.parameter("b", &[128]);
+        let out = g.bias_add(x, b);
+        g.set_outputs(vec![out]);
+
+        let plan = compile(&g);
+        assert_eq!(plan.dispatches.len(), 1);
+        assert_eq!(plan.dispatches[0].shader, ShaderEntry::BiasAdd);
+        assert_eq!(plan.dispatches[0].params[0], 512); // 4*128
+        assert_eq!(plan.dispatches[0].params[1], 128); // bias len
+    }
+
+    #[test]
+    fn test_compile_reductions() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 8]);
+        let sa = g.sum_all(x);
+        let ma = g.mean_all(x);
+        g.set_outputs(vec![sa, ma]);
+
+        let plan = compile(&g);
+        assert_eq!(plan.dispatches.len(), 2);
+        assert_eq!(plan.dispatches[0].shader, ShaderEntry::SumAll);
+        assert_eq!(plan.dispatches[1].shader, ShaderEntry::MeanAll);
+        // params = [len, 0, 0, 0]
+        for d in &plan.dispatches {
+            assert_eq!(d.params[0], 32);
+        }
+    }
+
+    #[test]
+    fn test_compile_softmax() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 10]);
+        let sm = g.softmax(x);
+        g.set_outputs(vec![sm]);
+
+        let plan = compile(&g);
+        assert_eq!(plan.dispatches.len(), 1);
+        assert_eq!(plan.dispatches[0].shader, ShaderEntry::Softmax);
+        assert_eq!(plan.dispatches[0].params[0], 4);  // batch
+        assert_eq!(plan.dispatches[0].params[1], 10); // features
+    }
+
+    #[test]
+    fn test_compile_cross_entropy() {
+        let mut g = Graph::new();
+        let logits = g.input("logits", &[4, 10]);
+        let labels = g.input("labels", &[4, 10]);
+        let loss = g.cross_entropy_loss(logits, labels);
+        g.set_outputs(vec![loss]);
+
+        let plan = compile(&g);
+        assert_eq!(plan.dispatches.len(), 1);
+        assert_eq!(plan.dispatches[0].shader, ShaderEntry::CrossEntropyLoss);
+        assert_eq!(plan.dispatches[0].workgroups, [1, 1, 1]);
+        assert_eq!(plan.dispatches[0].params[0], 4);
+        assert_eq!(plan.dispatches[0].params[1], 10);
+    }
+
+    #[test]
+    fn test_compile_transpose() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 8]);
+        let t = g.transpose(x);
+        g.set_outputs(vec![t]);
+
+        let plan = compile(&g);
+        assert_eq!(plan.dispatches.len(), 1);
+        assert_eq!(plan.dispatches[0].shader, ShaderEntry::Transpose);
+        assert_eq!(plan.dispatches[0].params[0], 4); // m
+        assert_eq!(plan.dispatches[0].params[1], 8); // n
+    }
+
+    #[test]
+    fn test_compile_matmul_workgroups() {
+        let mut g = Graph::new();
+        let a = g.input("a", &[33, 64]);
+        let b = g.input("b", &[64, 17]);
+        let y = g.matmul(a, b);
+        g.set_outputs(vec![y]);
+
+        let plan = compile(&g);
+        let d = &plan.dispatches[0];
+        // workgroups = [ceil(N/16), ceil(M/16), 1] = [ceil(17/16), ceil(33/16), 1] = [2, 3, 1]
+        assert_eq!(d.workgroups, [2, 3, 1]);
+        assert_eq!(d.params, vec![33, 64, 17, 0]);
+    }
+
+    #[test]
+    fn test_compile_loss_buffer() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 8]);
+        let loss = g.mean_all(x);
+        g.set_outputs(vec![loss]);
+
+        let plan = compile(&g);
+        assert!(plan.loss_buffer.is_some());
+    }
+
+    #[test]
+    fn test_compile_param_grad_pairs() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 3]);
+        let w = g.parameter("w", &[3, 2]);
+        let y = g.matmul(x, w);
+        let loss = g.mean_all(y);
+        g.set_outputs(vec![loss]);
+
+        let diff = crate::autodiff::differentiate(&g);
+        let plan = compile(&diff);
+        assert_eq!(plan.param_grad_pairs.len(), 1);
+        // param buffer and grad buffer should be different
+        assert_ne!(plan.param_grad_pairs[0].0, plan.param_grad_pairs[0].1);
+    }
+
+    #[test]
+    fn test_compile_nop_skipped() {
+        use crate::graph::{Op, TensorType};
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 8]);
+        let _nop = g.add_raw_node(Op::Nop, vec![], TensorType::f32(vec![1]));
+        let r = g.relu(x);
+        g.set_outputs(vec![r]);
+
+        let plan = compile(&g);
+        // Nop should produce no dispatch
+        assert_eq!(plan.dispatches.len(), 1);
+        assert_eq!(plan.dispatches[0].shader, ShaderEntry::Relu);
+    }
+
+    #[test]
+    fn test_compile_fused_matmul_bias_relu() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 8]);
+        let w = g.parameter("w", &[8, 4]);
+        let b = g.parameter("b", &[4]);
+        let mm = g.matmul(x, w);
+        let ba = g.bias_add(mm, b);
+        let h = g.relu(ba);
+        g.set_outputs(vec![h]);
+
+        let opt = crate::optimize::optimize(&g);
+        let plan = compile(&opt);
+        assert_eq!(plan.dispatches.len(), 1);
+        assert_eq!(plan.dispatches[0].shader, ShaderEntry::MatMulBiasRelu);
+        assert_eq!(plan.dispatches[0].input_buffers.len(), 3); // a, b, bias
+    }
+
+    #[test]
+    fn test_shader_entry_mappings() {
+        // Verify all shader entries have valid group and entry_point
+        let entries = [
+            ShaderEntry::MatMul, ShaderEntry::MatMulRelu, ShaderEntry::MatMulBiasRelu,
+            ShaderEntry::Relu, ShaderEntry::Sigmoid, ShaderEntry::Neg,
+            ShaderEntry::Add, ShaderEntry::Mul, ShaderEntry::Greater,
+            ShaderEntry::BiasAdd, ShaderEntry::SgdUpdate,
+            ShaderEntry::SumAll, ShaderEntry::MeanAll,
+            ShaderEntry::Softmax, ShaderEntry::CrossEntropyLoss, ShaderEntry::Transpose,
+        ];
+        for entry in &entries {
+            let _group = entry.shader_group();
+            let ep = entry.entry_point();
+            assert!(!ep.is_empty());
+        }
+    }
 }

@@ -113,4 +113,71 @@ mod tests {
         // Cleanup
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn test_load_missing_file() {
+        let g = Graph::new();
+        let path = std::env::temp_dir().join("meganeura_nonexistent_cache.ron");
+        let result = load_plan(&g, &path).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_load_corrupt_file() {
+        let dir = std::env::temp_dir().join("meganeura_test_cache_corrupt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("corrupt.ron");
+        std::fs::write(&path, "this is not valid RON").unwrap();
+
+        let g = Graph::new();
+        let result = load_plan(&g, &path);
+        assert!(result.is_err());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_hash_graph_deterministic() {
+        let build = || {
+            let mut g = Graph::new();
+            let x = g.input("x", &[4, 8]);
+            let w = g.parameter("w", &[8, 4]);
+            let y = g.matmul(x, w);
+            g.set_outputs(vec![y]);
+            g
+        };
+        let h1 = hash_graph(&build());
+        let h2 = hash_graph(&build());
+        assert_eq!(h1, h2, "same graph should produce same hash");
+    }
+
+    #[test]
+    fn test_hash_graph_differs_on_change() {
+        let mut g1 = Graph::new();
+        let x = g1.input("x", &[4, 8]);
+        let w = g1.parameter("w", &[8, 4]);
+        let y = g1.matmul(x, w);
+        g1.set_outputs(vec![y]);
+
+        let mut g2 = Graph::new();
+        let x2 = g2.input("x", &[4, 8]);
+        let w2 = g2.parameter("w", &[8, 5]); // different shape
+        let y2 = g2.matmul(x2, w2);
+        g2.set_outputs(vec![y2]);
+
+        assert_ne!(hash_graph(&g1), hash_graph(&g2));
+    }
+
+    #[test]
+    fn test_hash_graph_differs_on_name_change() {
+        let mut g1 = Graph::new();
+        let x = g1.input("x", &[4, 8]);
+        g1.set_outputs(vec![x]);
+
+        let mut g2 = Graph::new();
+        let x = g2.input("y", &[4, 8]); // different name
+        g2.set_outputs(vec![x]);
+
+        assert_ne!(hash_graph(&g1), hash_graph(&g2));
+    }
 }

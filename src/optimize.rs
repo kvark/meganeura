@@ -439,4 +439,131 @@ mod tests {
         let mut egraph = egglog::EGraph::default();
         egraph.parse_and_run_program(None, &program).unwrap();
     }
+
+    #[test]
+    fn test_no_fusion_when_not_applicable() {
+        // Graph with no fusable patterns should pass through unchanged
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 8]);
+        let s = g.sigmoid(x); // sigmoid(input) — not fusable
+        g.set_outputs(vec![s]);
+
+        let opt = optimize(&g);
+        let output_id = opt.outputs()[0];
+        assert!(
+            matches!(opt.node(output_id).op, Op::Sigmoid),
+            "sigmoid should remain unfused"
+        );
+    }
+
+    #[test]
+    fn test_optimize_preserves_non_fusable_graph() {
+        let mut g = Graph::new();
+        let a = g.input("a", &[4, 8]);
+        let b = g.input("b", &[4, 8]);
+        let sum = g.add(a, b);
+        let neg = g.neg(sum);
+        g.set_outputs(vec![neg]);
+
+        let opt = optimize(&g);
+        assert_eq!(opt.nodes().len(), g.nodes().len());
+        let out = opt.node(opt.outputs()[0]);
+        assert!(matches!(out.op, Op::Neg));
+    }
+
+    #[test]
+    fn test_optimize_report_no_fusions() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 8]);
+        let s = g.sigmoid(x);
+        g.set_outputs(vec![s]);
+
+        let (_opt, report) = optimize_with_report(&g);
+        assert!(report.fusions_applied.is_empty());
+        assert!(report.rules_fired.is_empty());
+        assert_eq!(report.nodes_before, report.nodes_after);
+    }
+
+    #[test]
+    fn test_optimize_deep_chain_multiple_fusions() {
+        // 3-layer MLP: each matmul+relu should fuse independently
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 16]);
+        let w1 = g.parameter("w1", &[16, 8]);
+        let mm1 = g.matmul(x, w1);
+        let h1 = g.relu(mm1);
+        let w2 = g.parameter("w2", &[8, 4]);
+        let mm2 = g.matmul(h1, w2);
+        let h2 = g.relu(mm2);
+        let w3 = g.parameter("w3", &[4, 2]);
+        let mm3 = g.matmul(h2, w3);
+        let h3 = g.relu(mm3);
+        g.set_outputs(vec![h3]);
+
+        let (_opt, report) = optimize_with_report(&g);
+        assert_eq!(report.fusions_applied.len(), 3);
+        assert!(report.fusions_applied.iter().all(|(n, _)| n == "FusedMatMulRelu"));
+    }
+
+    #[test]
+    fn test_dump_egglog_program() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 8]);
+        let w = g.parameter("w", &[8, 4]);
+        let y = g.matmul(x, w);
+        let h = g.relu(y);
+        g.set_outputs(vec![h]);
+
+        let program = dump_egglog_program(&g);
+        assert!(program.contains("(datatype Op"));
+        assert!(program.contains("(rewrite (Relu (MatMul ?a ?b)) (FusedMatMulRelu ?a ?b))"));
+        assert!(program.contains("(extract n"));
+    }
+
+    #[test]
+    fn test_egglog_all_ops() {
+        // Verify egglog program generation and parsing for all op types
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 8]);
+        let w = g.parameter("w", &[8, 4]);
+        let _c = g.constant(vec![0.0; 32], &[4, 8]);
+        let mm = g.matmul(x, w);
+        let _a = g.add(mm, mm);
+        let _m = g.mul(mm, mm);
+        let b = g.parameter("b", &[4]);
+        let _ba = g.bias_add(mm, b);
+        let _r = g.relu(mm);
+        let _s = g.sigmoid(mm);
+        let _n = g.neg(mm);
+        let _t = g.transpose(mm);
+        let _sm = g.softmax(mm);
+        let _lsm = g.log_softmax(mm);
+        let sa = g.sum_all(mm);
+        let _ma = g.mean_all(mm);
+        let _gt = g.greater(mm, mm);
+        let _cel = g.cross_entropy_loss(mm, mm);
+        g.set_outputs(vec![sa]);
+
+        let program = graph_to_egglog(&g);
+        let mut egraph = egglog::EGraph::default();
+        egraph.parse_and_run_program(None, &program).unwrap();
+    }
+
+    #[test]
+    fn test_clone_graph_preserves_structure() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 8]);
+        let w = g.parameter("w", &[8, 4]);
+        let y = g.matmul(x, w);
+        g.set_outputs(vec![y]);
+
+        let cloned = clone_graph(&g);
+        assert_eq!(cloned.nodes().len(), g.nodes().len());
+        assert_eq!(cloned.outputs(), g.outputs());
+        for (a, b) in cloned.nodes().iter().zip(g.nodes().iter()) {
+            assert_eq!(a.id, b.id);
+            assert_eq!(a.inputs, b.inputs);
+            assert_eq!(a.ty.shape, b.ty.shape);
+        }
+    }
 }
