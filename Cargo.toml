@@ -25,3 +25,7 @@ flate2 = "1"
 [[example]]
 name = "mnist"
 path = "examples/mnist.rs"
+
+[[example]]
+name = "diffusion"
+path = "examples/diffusion.rs"
