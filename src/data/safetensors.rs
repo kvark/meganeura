@@ -1,14 +1,14 @@
-//! HuggingFace Hub integration for loading pre-trained models.
+//! Safetensors model weight loading.
 //!
-//! Downloads safetensors model weights from the HuggingFace Hub and
-//! provides them as named tensors that can be loaded into a [`Session`].
+//! Loads named tensors from `.safetensors` files (local or downloaded from
+//! the HuggingFace Hub) into f32 data that can be uploaded to a [`Session`].
 //!
 //! # Example
 //!
 //! ```no_run
-//! use meganeura::data::huggingface::HfModel;
+//! use meganeura::data::safetensors::SafeTensorsModel;
 //!
-//! let model = HfModel::download("dacorvo/mnist-mlp").unwrap();
+//! let model = SafeTensorsModel::download("dacorvo/mnist-mlp").unwrap();
 //! for (name, info) in model.tensor_info() {
 //!     println!("{}: shape={:?}", name, info.shape);
 //! }
@@ -26,15 +26,16 @@ pub struct TensorInfo {
     pub dtype: safetensors::Dtype,
 }
 
-/// A downloaded HuggingFace model with parsed safetensors weights.
-pub struct HfModel {
+/// Parsed safetensors weights, loaded from a local file or downloaded
+/// from the HuggingFace Hub.
+pub struct SafeTensorsModel {
     /// Raw bytes of the safetensors file (kept alive for zero-copy access).
     data: Vec<u8>,
     /// Cached tensor metadata.
     info: HashMap<String, TensorInfo>,
 }
 
-impl HfModel {
+impl SafeTensorsModel {
     /// Download a model from HuggingFace Hub by repository ID.
     ///
     /// Downloads `model.safetensors` from the given repo (e.g. `"dacorvo/mnist-mlp"`).
@@ -107,6 +108,75 @@ impl HfModel {
             .collect();
 
         Ok(floats)
+    }
+
+    /// Read a tensor as f32 data, auto-converting from BF16 if necessary.
+    ///
+    /// Supports F32 (direct) and BF16 (converted). Other dtypes return an error.
+    pub fn tensor_f32_auto(&self, name: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let tensors = SafeTensors::deserialize(&self.data)?;
+        let view = tensors
+            .tensor(name)
+            .map_err(|e| format!("tensor '{}': {}", name, e))?;
+
+        match view.dtype() {
+            safetensors::Dtype::F32 => {
+                let bytes = view.data();
+                let floats: Vec<f32> = bytes
+                    .chunks_exact(4)
+                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .collect();
+                Ok(floats)
+            }
+            safetensors::Dtype::BF16 => {
+                let bytes = view.data();
+                let floats: Vec<f32> = bytes
+                    .chunks_exact(2)
+                    .map(|chunk| {
+                        let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                        // BF16 → F32: just shift left by 16 bits
+                        f32::from_bits((bits as u32) << 16)
+                    })
+                    .collect();
+                Ok(floats)
+            }
+            other => Err(format!(
+                "tensor '{}' has dtype {:?}, expected F32 or BF16",
+                name, other
+            )
+            .into()),
+        }
+    }
+
+    /// Read a tensor as f32 and transpose, auto-converting from BF16 if necessary.
+    pub fn tensor_f32_auto_transposed(
+        &self,
+        name: &str,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let info = self
+            .info
+            .get(name)
+            .ok_or_else(|| format!("tensor '{}' not found", name))?;
+
+        if info.shape.len() != 2 {
+            return Err(format!(
+                "tensor '{}' has {} dims, expected 2 for transpose",
+                name,
+                info.shape.len()
+            )
+            .into());
+        }
+
+        let data = self.tensor_f32_auto(name)?;
+        let rows = info.shape[0];
+        let cols = info.shape[1];
+        let mut transposed = vec![0.0_f32; rows * cols];
+        for r in 0..rows {
+            for c in 0..cols {
+                transposed[c * rows + r] = data[r * cols + c];
+            }
+        }
+        Ok(transposed)
     }
 
     /// Read a tensor as f32 and transpose it from (rows, cols) to (cols, rows).

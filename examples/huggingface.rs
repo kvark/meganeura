@@ -13,8 +13,10 @@
 /// MNIST test data is expected in `data/` (gzipped or raw):
 ///   data/t10k-images-idx3-ubyte.gz
 ///   data/t10k-labels-idx1-ubyte.gz
-use meganeura::data::huggingface::HfModel;
-use meganeura::{Graph, MnistDataset, build_inference_session};
+use meganeura::{
+    Graph, MnistDataset, build_inference_session,
+    data::safetensors::SafeTensorsModel,
+};
 use std::path::{Path, PathBuf};
 
 fn main() {
@@ -28,10 +30,10 @@ fn main() {
     // --- Load model: CLI path or download from HuggingFace ---
     let hf = if let Some(path) = std::env::args().nth(1) {
         println!("loading model from {}...", path);
-        HfModel::load(PathBuf::from(path)).expect("failed to load model")
+        SafeTensorsModel::load(PathBuf::from(path)).expect("failed to load model")
     } else {
         println!("downloading dacorvo/mnist-mlp from HuggingFace Hub...");
-        HfModel::download("dacorvo/mnist-mlp").expect("failed to download model")
+        SafeTensorsModel::download("dacorvo/mnist-mlp").expect("failed to download model")
     };
 
     // Print tensor info

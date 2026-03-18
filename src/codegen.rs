@@ -205,6 +205,34 @@ impl Builder {
         });
     }
 
+    /// Add a storage buffer global variable for u32 array (read-only).
+    fn storage_ro_u32(&mut self) -> Handle<GlobalVariable> {
+        let ty_arr_u32 = self.m.types.insert(
+            Type {
+                name: None,
+                inner: TypeInner::Array {
+                    base: self.ty_u32,
+                    size: ArraySize::Dynamic,
+                    stride: 4,
+                },
+            },
+            S,
+        );
+        self.m.global_variables.append(
+            GlobalVariable {
+                name: Some("indices".to_string()),
+                space: AddressSpace::Storage {
+                    access: StorageAccess::LOAD,
+                },
+                binding: None,
+                ty: ty_arr_u32,
+                init: None,
+                memory_decorations: MemoryDecorations::empty(),
+            },
+            S,
+        )
+    }
+
     fn finish(self) -> Module {
         self.m
     }
@@ -476,6 +504,10 @@ pub enum ShaderGroup {
     Reduce,
     Softmax,
     CrossEntropy,
+    RmsNorm,
+    Embedding,
+    RoPE,
+    CausalAttention,
 }
 
 /// Generate a `naga::Module` for a shader group.
@@ -492,6 +524,10 @@ pub fn generate_module(group: ShaderGroup) -> Module {
         ShaderGroup::Reduce => gen_reduce(),
         ShaderGroup::Softmax => gen_softmax(),
         ShaderGroup::CrossEntropy => gen_cross_entropy(),
+        ShaderGroup::RmsNorm => gen_rms_norm(),
+        ShaderGroup::Embedding => gen_embedding(),
+        ShaderGroup::RoPE => gen_rope(),
+        ShaderGroup::CausalAttention => gen_causal_attention(),
     }
 }
 
@@ -610,6 +646,39 @@ fn gen_unary() -> Module {
         f.f.body.push(f.store(dst_elem, result), S);
 
         b.entry_point("neg", [256, 1, 1], f.finish());
+    }
+
+    // silu: x * sigmoid(x) = x / (1 + exp(-x))
+    {
+        let mut f = FnBuilder::new(&b);
+        let gid = f.arg_gid();
+        let i = f.vec_x(gid);
+        f.label("i", i);
+        let params_ptr = f.global(gv_params);
+        let len_ptr = f.field(params_ptr, 0);
+        let len = f.load(len_ptr);
+        let cond = f.binary(BinaryOperator::GreaterEqual, i, len);
+        let src_ptr = f.global(gv_src);
+        let elem_ptr = f.index(src_ptr, i);
+        let val = f.load(elem_ptr);
+        let neg_val = f.unary(UnaryOperator::Negate, val);
+        let exp_neg = f.math1(MathFunction::Exp, neg_val);
+        let one = f.literal_f32(1.0);
+        let denom = f.binary(BinaryOperator::Add, one, exp_neg);
+        let one2 = f.literal_f32(1.0);
+        let sigmoid = f.binary(BinaryOperator::Divide, one2, denom);
+        let result = f.binary(BinaryOperator::Multiply, val, sigmoid);
+        let dst_ptr = f.global(gv_dst);
+        let dst_elem = f.index(dst_ptr, i);
+
+        f.emit(i, i);
+        f.emit(len_ptr, cond);
+        f.f.body.push(f.if_return(cond), S);
+        f.emit(src_ptr, result);
+        f.emit(dst_elem, dst_elem);
+        f.f.body.push(f.store(dst_elem, result), S);
+
+        b.entry_point("silu", [256, 1, 1], f.finish());
     }
 
     b.finish()
@@ -1748,6 +1817,729 @@ fn gen_cross_entropy() -> Module {
 }
 
 // ---------------------------------------------------------------------------
+// rms_norm.wgsl: y[i,j] = x[i,j] / sqrt(mean(x[i,:]²) + eps) * weight[j]
+// ---------------------------------------------------------------------------
+
+fn gen_rms_norm() -> Module {
+    let mut b = Builder::new();
+    // params: rows, cols, eps_bits, _pad
+    let ty_params = b.params_u32x4("Params", &["rows", "cols", "eps_bits", "_pad"]);
+    let gv_src = b.storage_ro("src");
+    let gv_weight = b.storage_ro("bias"); // named "bias" to match blade binding convention
+    let gv_dst = b.storage_rw("dst");
+    let gv_params = b.uniform("params", ty_params);
+
+    let mut f = FnBuilder::new(&b);
+    let gid = f.arg_gid();
+    let row = f.vec_x(gid);
+    f.label("row", row);
+    f.emit(row, row);
+
+    let params_ptr = f.global(gv_params);
+    let rows_ptr = f.field(params_ptr, 0);
+    let rows = f.load(rows_ptr);
+    let cols_ptr = f.field(params_ptr, 1);
+    let cols = f.load(cols_ptr);
+    let eps_ptr = f.field(params_ptr, 2);
+    let eps_bits = f.load(eps_ptr);
+    let eps = f.expr(Expression::As {
+        expr: eps_bits,
+        kind: ScalarKind::Float,
+        convert: None, // bitcast
+    });
+    f.emit(params_ptr, eps);
+
+    let cond = f.binary(BinaryOperator::GreaterEqual, row, rows);
+    f.emit(cond, cond);
+    f.f.body.push(f.if_return(cond), S);
+
+    // offset = row * cols
+    let offset = f.binary(BinaryOperator::Multiply, row, cols);
+    f.emit(offset, offset);
+
+    // Compute sum of squares: var ss = 0.0; for j in 0..cols { ss += x[offset+j]² }
+    let ss_var = f.local_var("ss", b.ty_f32, None);
+    let ss_ptr = f.local_ptr(ss_var);
+    let zero_f = f.literal_f32(0.0);
+    f.emit(zero_f, zero_f);
+    f.f.body.push(f.store(ss_ptr, zero_f), S);
+
+    let j_var = f.local_var("j", b.ty_u32, None);
+    let j_ptr = f.local_ptr(j_var);
+    let zero_u = f.literal_u32(0);
+    f.emit(zero_u, zero_u);
+    f.f.body.push(f.store(j_ptr, zero_u), S);
+
+    {
+        let mut body = Block::new();
+        let j = f.load(j_ptr);
+        let brk = f.binary(BinaryOperator::GreaterEqual, j, cols);
+        let idx = f.binary(BinaryOperator::Add, offset, j);
+        let src_ptr = f.global(gv_src);
+        let elem = f.index(src_ptr, idx);
+        let val = f.load(elem);
+        let sq = f.binary(BinaryOperator::Multiply, val, val);
+        let old_ss = f.load(ss_ptr);
+        let new_ss = f.binary(BinaryOperator::Add, old_ss, sq);
+        push_emit(&f.f.expressions, &mut body, j, new_ss);
+        body.push(f.store(ss_ptr, new_ss), S);
+
+        let one = f.literal_u32(1);
+        let j2 = f.load(j_ptr);
+        let jn = f.binary(BinaryOperator::Add, j2, one);
+        push_emit(&f.f.expressions, &mut body, one, jn);
+        body.push(f.store(j_ptr, jn), S);
+
+        f.f.body.push(
+            Statement::Loop {
+                body,
+                continuing: Block::new(),
+                break_if: Some(brk),
+            },
+            S,
+        );
+    }
+
+    // rms = 1.0 / sqrt(ss / cols_f + eps)
+    let ss_val = f.load(ss_ptr);
+    let cols_f = f.cast_f32(cols);
+    let mean_sq = f.binary(BinaryOperator::Divide, ss_val, cols_f);
+    let mean_sq_eps = f.binary(BinaryOperator::Add, mean_sq, eps);
+    let rsqrt = f.math1(MathFunction::InverseSqrt, mean_sq_eps);
+    f.emit(ss_val, rsqrt);
+
+    // Normalize loop: dst[offset+j] = x[offset+j] * rsqrt * weight[j]
+    let j2_var = f.local_var("j2", b.ty_u32, None);
+    let j2_ptr = f.local_ptr(j2_var);
+    let zero_u2 = f.literal_u32(0);
+    f.emit(zero_u2, zero_u2);
+    f.f.body.push(f.store(j2_ptr, zero_u2), S);
+
+    {
+        let mut body = Block::new();
+        let j = f.load(j2_ptr);
+        let brk = f.binary(BinaryOperator::GreaterEqual, j, cols);
+        let idx = f.binary(BinaryOperator::Add, offset, j);
+        let src_ptr = f.global(gv_src);
+        let elem = f.index(src_ptr, idx);
+        let val = f.load(elem);
+        let normed = f.binary(BinaryOperator::Multiply, val, rsqrt);
+        let w_ptr = f.global(gv_weight);
+        let w_elem = f.index(w_ptr, j);
+        let w_val = f.load(w_elem);
+        let result = f.binary(BinaryOperator::Multiply, normed, w_val);
+        push_emit(&f.f.expressions, &mut body, j, result);
+
+        let dst_ptr = f.global(gv_dst);
+        let dst_elem = f.index(dst_ptr, idx);
+        push_emit(&f.f.expressions, &mut body, dst_elem, dst_elem);
+        body.push(f.store(dst_elem, result), S);
+
+        let one = f.literal_u32(1);
+        let j3 = f.load(j2_ptr);
+        let jn = f.binary(BinaryOperator::Add, j3, one);
+        push_emit(&f.f.expressions, &mut body, one, jn);
+        body.push(f.store(j2_ptr, jn), S);
+
+        f.f.body.push(
+            Statement::Loop {
+                body,
+                continuing: Block::new(),
+                break_if: Some(brk),
+            },
+            S,
+        );
+    }
+
+    b.entry_point("main", [256, 1, 1], f.finish());
+    b.finish()
+}
+
+// ---------------------------------------------------------------------------
+// embedding.wgsl: dst[i*hidden+j] = table[indices[i]*hidden+j]
+// ---------------------------------------------------------------------------
+
+fn gen_embedding() -> Module {
+    let mut b = Builder::new();
+    let ty_params = b.params_u32x4("Params", &["seq", "hidden", "_pad0", "_pad1"]);
+    let gv_indices = b.storage_ro_u32();
+    let gv_table = b.storage_ro("src");
+    let gv_dst = b.storage_rw("dst");
+    let gv_params = b.uniform("params", ty_params);
+
+    let mut f = FnBuilder::new(&b);
+    let gid = f.arg_gid();
+    let i = f.vec_x(gid);
+    f.label("i", i);
+    f.emit(i, i);
+
+    let params_ptr = f.global(gv_params);
+    let seq_ptr = f.field(params_ptr, 0);
+    let seq = f.load(seq_ptr);
+    let hidden_ptr = f.field(params_ptr, 1);
+    let hidden = f.load(hidden_ptr);
+    f.emit(params_ptr, hidden);
+
+    // total = seq * hidden
+    let total = f.binary(BinaryOperator::Multiply, seq, hidden);
+    let cond = f.binary(BinaryOperator::GreaterEqual, i, total);
+    f.emit(total, cond);
+    f.f.body.push(f.if_return(cond), S);
+
+    // row = i / hidden, col = i % hidden
+    let row = f.binary(BinaryOperator::Divide, i, hidden);
+    let col = f.binary(BinaryOperator::Modulo, i, hidden);
+
+    // token_id = indices[row]
+    let idx_ptr = f.global(gv_indices);
+    let idx_elem = f.index(idx_ptr, row);
+    let token_id = f.load(idx_elem);
+
+    // src_idx = token_id * hidden + col
+    let tok_off = f.binary(BinaryOperator::Multiply, token_id, hidden);
+    let src_idx = f.binary(BinaryOperator::Add, tok_off, col);
+    let tbl_ptr = f.global(gv_table);
+    let tbl_elem = f.index(tbl_ptr, src_idx);
+    let val = f.load(tbl_elem);
+
+    let dst_ptr = f.global(gv_dst);
+    let dst_elem = f.index(dst_ptr, i);
+
+    f.emit(row, val);
+    f.emit(dst_elem, dst_elem);
+    f.f.body.push(f.store(dst_elem, val), S);
+
+    b.entry_point("main", [256, 1, 1], f.finish());
+    b.finish()
+}
+
+// ---------------------------------------------------------------------------
+// rope.wgsl: Rotary position embeddings
+// For each position pos and pair (2i, 2i+1):
+//   cos_t = cos(pos * theta^(-2i/dim))
+//   sin_t = sin(pos * theta^(-2i/dim))
+//   out[2i]   = x[2i]*cos_t - x[2i+1]*sin_t
+//   out[2i+1] = x[2i]*sin_t + x[2i+1]*cos_t
+// ---------------------------------------------------------------------------
+
+fn gen_rope() -> Module {
+    let mut b = Builder::new();
+    // params: seq, dim, theta_bits, _pad
+    let ty_params = b.params_u32x4("Params", &["seq", "dim", "theta_bits", "_pad"]);
+    let gv_src = b.storage_ro("src");
+    let gv_dst = b.storage_rw("dst");
+    let gv_params = b.uniform("params", ty_params);
+
+    let mut f = FnBuilder::new(&b);
+    let gid = f.arg_gid();
+    let i = f.vec_x(gid);
+    f.label("i", i);
+    f.emit(i, i);
+
+    let params_ptr = f.global(gv_params);
+    let seq_ptr = f.field(params_ptr, 0);
+    let seq = f.load(seq_ptr);
+    let dim_ptr = f.field(params_ptr, 1);
+    let dim = f.load(dim_ptr);
+    let theta_ptr = f.field(params_ptr, 2);
+    let theta_bits = f.load(theta_ptr);
+    let theta = f.expr(Expression::As {
+        expr: theta_bits,
+        kind: ScalarKind::Float,
+        convert: None, // bitcast
+    });
+    f.emit(params_ptr, theta);
+
+    // half_dim = dim / 2
+    let two_u = f.literal_u32(2);
+    let half_dim = f.binary(BinaryOperator::Divide, dim, two_u);
+    let total = f.binary(BinaryOperator::Multiply, seq, half_dim);
+    let cond = f.binary(BinaryOperator::GreaterEqual, i, total);
+    f.emit(two_u, cond);
+    f.f.body.push(f.if_return(cond), S);
+
+    // pos = i / half_dim, pair_idx = i % half_dim
+    let pos = f.binary(BinaryOperator::Divide, i, half_dim);
+    let pair_idx = f.binary(BinaryOperator::Modulo, i, half_dim);
+
+    // freq = pos * pow(theta, -2.0 * pair_idx / dim)
+    let two_f = f.literal_f32(2.0);
+    let pair_f = f.cast_f32(pair_idx);
+    let dim_f = f.cast_f32(dim);
+    let exponent = f.binary(BinaryOperator::Multiply, two_f, pair_f);
+    let exponent = f.binary(BinaryOperator::Divide, exponent, dim_f);
+    let exponent = f.unary(UnaryOperator::Negate, exponent);
+    let inv_freq = f.math2(MathFunction::Pow, theta, exponent);
+    let pos_f = f.cast_f32(pos);
+    let angle = f.binary(BinaryOperator::Multiply, pos_f, inv_freq);
+
+    let cos_val = f.math1(MathFunction::Cos, angle);
+    let sin_val = f.math1(MathFunction::Sin, angle);
+
+    // src indices: base = pos * dim + pair_idx * 2
+    let pos_dim = f.binary(BinaryOperator::Multiply, pos, dim);
+    let pair2 = f.binary(BinaryOperator::Multiply, pair_idx, two_u);
+    let idx0 = f.binary(BinaryOperator::Add, pos_dim, pair2);
+    let one_u = f.literal_u32(1);
+    let idx1 = f.binary(BinaryOperator::Add, idx0, one_u);
+
+    let src_ptr = f.global(gv_src);
+    let s0 = f.index(src_ptr, idx0);
+    let v0 = f.load(s0);
+    let s1 = f.index(src_ptr, idx1);
+    let v1 = f.load(s1);
+
+    // out[idx0] = v0 * cos - v1 * sin
+    let v0_cos = f.binary(BinaryOperator::Multiply, v0, cos_val);
+    let v1_sin = f.binary(BinaryOperator::Multiply, v1, sin_val);
+    let r0 = f.binary(BinaryOperator::Subtract, v0_cos, v1_sin);
+
+    // out[idx1] = v0 * sin + v1 * cos
+    let v0_sin = f.binary(BinaryOperator::Multiply, v0, sin_val);
+    let v1_cos = f.binary(BinaryOperator::Multiply, v1, cos_val);
+    let r1 = f.binary(BinaryOperator::Add, v0_sin, v1_cos);
+
+    let dst_ptr = f.global(gv_dst);
+    let d0 = f.index(dst_ptr, idx0);
+    let d1 = f.index(dst_ptr, idx1);
+
+    f.emit(pos, r1);
+    f.emit(d0, d1);
+    f.f.body.push(f.store(d0, r0), S);
+    f.f.body.push(f.store(d1, r1), S);
+
+    b.entry_point("main", [256, 1, 1], f.finish());
+    b.finish()
+}
+
+// ---------------------------------------------------------------------------
+// causal_attention.wgsl: Fused multi-head causal attention with GQA
+// One workgroup per (position, head) pair.
+// params: seq, num_heads, num_kv_heads, head_dim
+// inputs: q[seq, num_heads*head_dim], k[seq, num_kv_heads*head_dim], v[seq, ...]
+// output: [seq, num_heads*head_dim]
+// ---------------------------------------------------------------------------
+
+fn gen_causal_attention() -> Module {
+    let mut b = Builder::new();
+    let ty_params = b.params_u32x4("Params", &["seq", "num_heads", "num_kv_heads", "head_dim"]);
+    let gv_q = b.storage_ro("src_a"); // q
+    let gv_k = b.storage_ro("src_b"); // k
+    let gv_v = b.storage_ro("bias");  // v (reusing binding slot name)
+    let gv_dst = b.storage_rw("dst");
+    let gv_params = b.uniform("params", ty_params);
+
+    let mut f = FnBuilder::new(&b);
+    let gid = f.arg_gid();
+
+    // pos = gid.x, head = gid.y
+    let pos = f.vec_x(gid);
+    f.label("pos", pos);
+    let head = f.vec_y(gid);
+    f.label("head", head);
+    f.emit(pos, head);
+
+    let params_ptr = f.global(gv_params);
+    let seq_ptr = f.field(params_ptr, 0);
+    let seq = f.load(seq_ptr);
+    let nh_ptr = f.field(params_ptr, 1);
+    let num_heads = f.load(nh_ptr);
+    let nkv_ptr = f.field(params_ptr, 2);
+    let num_kv_heads = f.load(nkv_ptr);
+    let hd_ptr = f.field(params_ptr, 3);
+    let head_dim = f.load(hd_ptr);
+    f.emit(params_ptr, head_dim);
+
+    // Bounds check
+    let cond_pos = f.binary(BinaryOperator::GreaterEqual, pos, seq);
+    let cond_head = f.binary(BinaryOperator::GreaterEqual, head, num_heads);
+    let cond = f.binary(BinaryOperator::LogicalOr, cond_pos, cond_head);
+    f.emit(cond_pos, cond);
+    f.f.body.push(f.if_return(cond), S);
+
+    // GQA: kv_head = head / (num_heads / num_kv_heads)
+    let heads_per_kv = f.binary(BinaryOperator::Divide, num_heads, num_kv_heads);
+    let kv_head = f.binary(BinaryOperator::Divide, head, heads_per_kv);
+
+    // q_dim = num_heads * head_dim
+    let q_dim = f.binary(BinaryOperator::Multiply, num_heads, head_dim);
+    // kv_dim = num_kv_heads * head_dim
+    let kv_dim = f.binary(BinaryOperator::Multiply, num_kv_heads, head_dim);
+
+    // q_base = pos * q_dim + head * head_dim
+    let pos_q = f.binary(BinaryOperator::Multiply, pos, q_dim);
+    let head_off = f.binary(BinaryOperator::Multiply, head, head_dim);
+    let q_base = f.binary(BinaryOperator::Add, pos_q, head_off);
+
+    // scale = 1.0 / sqrt(head_dim)
+    let hd_f = f.cast_f32(head_dim);
+    let scale = f.math1(MathFunction::InverseSqrt, hd_f);
+
+    // causal_len = pos + 1
+    let one_cl = f.literal_u32(1);
+    let causal_len = f.binary(BinaryOperator::Add, pos, one_cl);
+
+    f.emit(heads_per_kv, causal_len);
+
+    // Store key values in local vars so inner scopes can load them fresh
+    let q_base_var = f.local_var("q_base", b.ty_u32, None);
+    let q_base_ptr = f.local_ptr(q_base_var);
+    f.f.body.push(f.store(q_base_ptr, q_base), S);
+
+    let kv_head_var = f.local_var("kv_head", b.ty_u32, None);
+    let kv_head_ptr = f.local_ptr(kv_head_var);
+    f.f.body.push(f.store(kv_head_ptr, kv_head), S);
+
+    let kv_dim_var = f.local_var("kv_dim", b.ty_u32, None);
+    let kv_dim_ptr = f.local_ptr(kv_dim_var);
+    f.f.body.push(f.store(kv_dim_ptr, kv_dim), S);
+
+    let head_dim_var = f.local_var("hd", b.ty_u32, None);
+    let head_dim_ptr = f.local_ptr(head_dim_var);
+    f.f.body.push(f.store(head_dim_ptr, head_dim), S);
+
+    let scale_var = f.local_var("scale", b.ty_f32, None);
+    let scale_ptr = f.local_ptr(scale_var);
+    f.f.body.push(f.store(scale_ptr, scale), S);
+
+    let causal_var = f.local_var("clen", b.ty_u32, None);
+    let causal_ptr = f.local_ptr(causal_var);
+    f.f.body.push(f.store(causal_ptr, causal_len), S);
+
+    let pos_q_var = f.local_var("pos_q", b.ty_u32, None);
+    let pos_q_ptr = f.local_ptr(pos_q_var);
+    f.f.body.push(f.store(pos_q_ptr, pos_q), S);
+
+    let head_off_var = f.local_var("head_off", b.ty_u32, None);
+    let head_off_ptr = f.local_ptr(head_off_var);
+    f.f.body.push(f.store(head_off_ptr, head_off), S);
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_dot_loop(
+        f: &mut FnBuilder,
+        parent: &mut Block,
+        gv_q: Handle<GlobalVariable>,
+        gv_k: Handle<GlobalVariable>,
+        q_base_ptr: Handle<Expression>,
+        head_dim_ptr: Handle<Expression>,
+        k_base: Handle<Expression>,  // already in scope of parent
+        dot_ptr: Handle<Expression>,
+        ty_u32: Handle<Type>,
+        d_name: &str,
+    ) {
+        let d_var = f.local_var(d_name, ty_u32, None);
+        let d_ptr = f.local_ptr(d_var);
+        let zero_d = f.literal_u32(0);
+        push_emit(&f.f.expressions, parent, zero_d, zero_d);
+        parent.push(f.store(d_ptr, zero_d), S);
+
+        let mut inner = Block::new();
+        let d = f.load(d_ptr);
+        let hd = f.load(head_dim_ptr);
+        let dbrk = f.binary(BinaryOperator::GreaterEqual, d, hd);
+
+        let qb = f.load(q_base_ptr);
+        let q_idx = f.binary(BinaryOperator::Add, qb, d);
+        let q_gp = f.global(gv_q);
+        let q_elem = f.index(q_gp, q_idx);
+        let q_val = f.load(q_elem);
+
+        let k_idx = f.binary(BinaryOperator::Add, k_base, d);
+        let k_gp = f.global(gv_k);
+        let k_elem = f.index(k_gp, k_idx);
+        let k_val = f.load(k_elem);
+
+        let prod = f.binary(BinaryOperator::Multiply, q_val, k_val);
+        let old_dot = f.load(dot_ptr);
+        let new_dot = f.binary(BinaryOperator::Add, old_dot, prod);
+        push_emit(&f.f.expressions, &mut inner, d, new_dot);
+        inner.push(f.store(dot_ptr, new_dot), S);
+
+        let one_d = f.literal_u32(1);
+        let d2 = f.load(d_ptr);
+        let dn = f.binary(BinaryOperator::Add, d2, one_d);
+        push_emit(&f.f.expressions, &mut inner, one_d, dn);
+        inner.push(f.store(d_ptr, dn), S);
+
+        parent.push(
+            Statement::Loop {
+                body: inner,
+                continuing: Block::new(),
+                break_if: Some(dbrk),
+            },
+            S,
+        );
+    }
+
+    // Helper: compute k_base = t * kv_dim + kv_head * head_dim, emit into block
+    fn compute_k_base(
+        f: &mut FnBuilder,
+        block: &mut Block,
+        t: Handle<Expression>,
+        kv_dim_ptr: Handle<Expression>,
+        kv_head_ptr: Handle<Expression>,
+        head_dim_ptr: Handle<Expression>,
+    ) -> Handle<Expression> {
+        let kvd = f.load(kv_dim_ptr);
+        let t_kv = f.binary(BinaryOperator::Multiply, t, kvd);
+        let kvh = f.load(kv_head_ptr);
+        let hd = f.load(head_dim_ptr);
+        let kvh_off = f.binary(BinaryOperator::Multiply, kvh, hd);
+        let k_base = f.binary(BinaryOperator::Add, t_kv, kvh_off);
+        push_emit(&f.f.expressions, block, kvd, k_base);
+        k_base
+    }
+
+    // === Pass 1: find max score ===
+    let max_var = f.local_var("max_score", b.ty_f32, None);
+    let max_ptr = f.local_ptr(max_var);
+    let neg_inf = f.literal_f32(-1.0e30);
+    f.emit(neg_inf, neg_inf);
+    f.f.body.push(f.store(max_ptr, neg_inf), S);
+
+    let t_var = f.local_var("t", b.ty_u32, None);
+    let t_ptr = f.local_ptr(t_var);
+    let zero_u = f.literal_u32(0);
+    f.emit(zero_u, zero_u);
+    f.f.body.push(f.store(t_ptr, zero_u), S);
+
+    {
+        let mut body = Block::new();
+        let t = f.load(t_ptr);
+        let cl = f.load(causal_ptr);
+        let brk = f.binary(BinaryOperator::GreaterEqual, t, cl);
+
+        let dot_var = f.local_var("dot", b.ty_f32, None);
+        let dot_ptr = f.local_ptr(dot_var);
+        let zero_f = f.literal_f32(0.0);
+        push_emit(&f.f.expressions, &mut body, t, zero_f);
+        body.push(f.store(dot_ptr, zero_f), S);
+
+        let k_base = compute_k_base(
+            &mut f, &mut body, t, kv_dim_ptr, kv_head_ptr, head_dim_ptr,
+        );
+
+        build_dot_loop(
+            &mut f, &mut body, gv_q, gv_k,
+            q_base_ptr, head_dim_ptr, k_base, dot_ptr,
+            b.ty_u32, "d1",
+        );
+
+        // score = dot * scale; max_score = max(max_score, score)
+        let dot_val = f.load(dot_ptr);
+        let sc = f.load(scale_ptr);
+        let score = f.binary(BinaryOperator::Multiply, dot_val, sc);
+        let old_max = f.load(max_ptr);
+        let new_max = f.math2(MathFunction::Max, old_max, score);
+        push_emit(&f.f.expressions, &mut body, dot_val, new_max);
+        body.push(f.store(max_ptr, new_max), S);
+
+        let one_t = f.literal_u32(1);
+        let t2 = f.load(t_ptr);
+        let tn = f.binary(BinaryOperator::Add, t2, one_t);
+        push_emit(&f.f.expressions, &mut body, one_t, tn);
+        body.push(f.store(t_ptr, tn), S);
+
+        f.f.body.push(
+            Statement::Loop {
+                body,
+                continuing: Block::new(),
+                break_if: Some(brk),
+            },
+            S,
+        );
+    }
+
+    // === Pass 2: compute exp sum ===
+    let sum_var = f.local_var("sum_exp", b.ty_f32, None);
+    let sum_ptr_local = f.local_ptr(sum_var);
+    let zero_f2 = f.literal_f32(0.0);
+    f.emit(zero_f2, zero_f2);
+    f.f.body.push(f.store(sum_ptr_local, zero_f2), S);
+
+    let t2_var = f.local_var("t2", b.ty_u32, None);
+    let t2_ptr = f.local_ptr(t2_var);
+    let zero_t2 = f.literal_u32(0);
+    f.emit(zero_t2, zero_t2);
+    f.f.body.push(f.store(t2_ptr, zero_t2), S);
+
+    {
+        let mut body = Block::new();
+        let t = f.load(t2_ptr);
+        let cl = f.load(causal_ptr);
+        let brk = f.binary(BinaryOperator::GreaterEqual, t, cl);
+
+        let dot_var2 = f.local_var("dot2", b.ty_f32, None);
+        let dot_ptr2 = f.local_ptr(dot_var2);
+        let zero_f3 = f.literal_f32(0.0);
+        push_emit(&f.f.expressions, &mut body, t, zero_f3);
+        body.push(f.store(dot_ptr2, zero_f3), S);
+
+        let k_base = compute_k_base(
+            &mut f, &mut body, t, kv_dim_ptr, kv_head_ptr, head_dim_ptr,
+        );
+
+        build_dot_loop(
+            &mut f, &mut body, gv_q, gv_k,
+            q_base_ptr, head_dim_ptr, k_base, dot_ptr2,
+            b.ty_u32, "d2",
+        );
+
+        let dot_val = f.load(dot_ptr2);
+        let sc = f.load(scale_ptr);
+        let score = f.binary(BinaryOperator::Multiply, dot_val, sc);
+        let mx = f.load(max_ptr);
+        let shifted = f.binary(BinaryOperator::Subtract, score, mx);
+        let e = f.math1(MathFunction::Exp, shifted);
+        let old_sum = f.load(sum_ptr_local);
+        let new_sum = f.binary(BinaryOperator::Add, old_sum, e);
+        push_emit(&f.f.expressions, &mut body, dot_val, new_sum);
+        body.push(f.store(sum_ptr_local, new_sum), S);
+
+        let one_t = f.literal_u32(1);
+        let t3 = f.load(t2_ptr);
+        let tn = f.binary(BinaryOperator::Add, t3, one_t);
+        push_emit(&f.f.expressions, &mut body, one_t, tn);
+        body.push(f.store(t2_ptr, tn), S);
+
+        f.f.body.push(
+            Statement::Loop {
+                body,
+                continuing: Block::new(),
+                break_if: Some(brk),
+            },
+            S,
+        );
+    }
+
+    // === Pass 3: weighted sum of values ===
+    let d3_var = f.local_var("d3", b.ty_u32, None);
+    let d3_ptr = f.local_ptr(d3_var);
+    let zero_d3 = f.literal_u32(0);
+    f.emit(zero_d3, zero_d3);
+    f.f.body.push(f.store(d3_ptr, zero_d3), S);
+
+    {
+        let mut d_body = Block::new();
+        let d = f.load(d3_ptr);
+        let hd = f.load(head_dim_ptr);
+        let d_brk = f.binary(BinaryOperator::GreaterEqual, d, hd);
+
+        let acc_var = f.local_var("acc", b.ty_f32, None);
+        let acc_ptr = f.local_ptr(acc_var);
+        let zero_acc = f.literal_f32(0.0);
+        push_emit(&f.f.expressions, &mut d_body, d, zero_acc);
+        d_body.push(f.store(acc_ptr, zero_acc), S);
+
+        // Pre-compute output base index (pos_q + head_off) so we can use it after the inner loop
+        // without a wide emit range spanning inner-loop expressions
+        let pq = f.load(pos_q_ptr);
+        let ho = f.load(head_off_ptr);
+        let out_base = f.binary(BinaryOperator::Add, pq, ho);
+        // Store in local var to avoid cross-scope emit issues
+        let out_base_var = f.local_var("out_base", b.ty_u32, None);
+        let out_base_ptr = f.local_ptr(out_base_var);
+        push_emit(&f.f.expressions, &mut d_body, pq, out_base);
+        d_body.push(f.store(out_base_ptr, out_base), S);
+
+        let t3_var = f.local_var("t3", b.ty_u32, None);
+        let t3_iptr = f.local_ptr(t3_var);
+        let zero_t3 = f.literal_u32(0);
+        push_emit(&f.f.expressions, &mut d_body, zero_t3, zero_t3);
+        d_body.push(f.store(t3_iptr, zero_t3), S);
+
+        {
+            let mut t_body = Block::new();
+            let t = f.load(t3_iptr);
+            let cl = f.load(causal_ptr);
+            let t_brk = f.binary(BinaryOperator::GreaterEqual, t, cl);
+
+            // Recompute dot product for attention weight
+            let dot_var3 = f.local_var("dot3", b.ty_f32, None);
+            let dot_ptr3 = f.local_ptr(dot_var3);
+            let zero_dot = f.literal_f32(0.0);
+            push_emit(&f.f.expressions, &mut t_body, t, zero_dot);
+            t_body.push(f.store(dot_ptr3, zero_dot), S);
+
+            let k_base = compute_k_base(
+                &mut f, &mut t_body, t, kv_dim_ptr, kv_head_ptr, head_dim_ptr,
+            );
+
+            build_dot_loop(
+                &mut f, &mut t_body, gv_q, gv_k,
+                q_base_ptr, head_dim_ptr, k_base, dot_ptr3,
+                b.ty_u32, "d4",
+            );
+
+            // attn_weight = exp(score * scale - max) / sum_exp
+            let dot_val = f.load(dot_ptr3);
+            let sc = f.load(scale_ptr);
+            let score = f.binary(BinaryOperator::Multiply, dot_val, sc);
+            let mx = f.load(max_ptr);
+            let shifted = f.binary(BinaryOperator::Subtract, score, mx);
+            let e = f.math1(MathFunction::Exp, shifted);
+            let sum_val = f.load(sum_ptr_local);
+            let weight = f.binary(BinaryOperator::Divide, e, sum_val);
+
+            // v_val = v[k_base + d]
+            let v_idx = f.binary(BinaryOperator::Add, k_base, d);
+            let v_gp = f.global(gv_v);
+            let v_elem = f.index(v_gp, v_idx);
+            let v_val = f.load(v_elem);
+
+            let contrib = f.binary(BinaryOperator::Multiply, weight, v_val);
+            let old_acc = f.load(acc_ptr);
+            let new_acc = f.binary(BinaryOperator::Add, old_acc, contrib);
+            push_emit(&f.f.expressions, &mut t_body, dot_val, new_acc);
+            t_body.push(f.store(acc_ptr, new_acc), S);
+
+            let one_t = f.literal_u32(1);
+            let t4 = f.load(t3_iptr);
+            let tn = f.binary(BinaryOperator::Add, t4, one_t);
+            push_emit(&f.f.expressions, &mut t_body, one_t, tn);
+            t_body.push(f.store(t3_iptr, tn), S);
+
+            d_body.push(
+                Statement::Loop {
+                    body: t_body,
+                    continuing: Block::new(),
+                    break_if: Some(t_brk),
+                },
+                S,
+            );
+        }
+
+        // dst[out_base + d] = acc
+        let ob = f.load(out_base_ptr);
+        let out_idx = f.binary(BinaryOperator::Add, ob, d);
+        let dst_gp = f.global(gv_dst);
+        let dst_elem = f.index(dst_gp, out_idx);
+        let acc_val = f.load(acc_ptr);
+        // Single emit range covers ob through acc_val (dst_gp is pre-emit/skipped)
+        push_emit(&f.f.expressions, &mut d_body, ob, acc_val);
+        d_body.push(f.store(dst_elem, acc_val), S);
+
+        let one_d = f.literal_u32(1);
+        let d5 = f.load(d3_ptr);
+        let dn = f.binary(BinaryOperator::Add, d5, one_d);
+        push_emit(&f.f.expressions, &mut d_body, one_d, dn);
+        d_body.push(f.store(d3_ptr, dn), S);
+
+        f.f.body.push(
+            Statement::Loop {
+                body: d_body,
+                continuing: Block::new(),
+                break_if: Some(d_brk),
+            },
+            S,
+        );
+    }
+
+    b.entry_point("main", [1, 1, 1], f.finish());
+    b.finish()
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1770,6 +2562,10 @@ mod tests {
             ShaderGroup::Reduce,
             ShaderGroup::Softmax,
             ShaderGroup::CrossEntropy,
+            ShaderGroup::RmsNorm,
+            ShaderGroup::Embedding,
+            ShaderGroup::RoPE,
+            ShaderGroup::CausalAttention,
         ];
 
         for group in &groups {
@@ -1787,6 +2583,7 @@ mod tests {
         assert!(names.contains(&"relu"), "missing relu");
         assert!(names.contains(&"sigmoid"), "missing sigmoid");
         assert!(names.contains(&"neg"), "missing neg");
+        assert!(names.contains(&"silu"), "missing silu");
 
         let m = generate_module(ShaderGroup::Binary);
         let names: Vec<&str> = m.entry_points.iter().map(|ep| ep.name.as_str()).collect();
@@ -1798,5 +2595,25 @@ mod tests {
         let names: Vec<&str> = m.entry_points.iter().map(|ep| ep.name.as_str()).collect();
         assert!(names.contains(&"sum_all"));
         assert!(names.contains(&"mean_all"));
+    }
+
+    #[test]
+    fn test_rms_norm_wgsl() {
+        let _ = generate_wgsl(ShaderGroup::RmsNorm);
+    }
+
+    #[test]
+    fn test_embedding_wgsl() {
+        let _ = generate_wgsl(ShaderGroup::Embedding);
+    }
+
+    #[test]
+    fn test_rope_wgsl() {
+        let _ = generate_wgsl(ShaderGroup::RoPE);
+    }
+
+    #[test]
+    fn test_causal_attention_wgsl() {
+        let _ = generate_wgsl(ShaderGroup::CausalAttention);
     }
 }
