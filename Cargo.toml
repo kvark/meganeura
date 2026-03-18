@@ -12,6 +12,8 @@ blade-macros = { git = "https://github.com/kvark/blade.git", branch = "main" }
 egglog = "2.0"
 bytemuck = { version = "1", features = ["derive"] }
 naga = { git = "https://github.com/gfx-rs/wgpu", rev = "9ed77372b413cffa52104e424338d9e655e6208e", features = ["wgsl-in", "wgsl-out"] }
+serde = { version = "1", features = ["derive"] }
+ron = "0.8"
 log = "0.4"
 env_logger = "0.11"
 

@@ -18,6 +18,7 @@
 //! sequences — no manual CUDA-graphing needed.
 
 pub mod autodiff;
+pub mod cache;
 pub mod codegen;
 pub mod compile;
 pub mod graph;
@@ -26,5 +27,6 @@ pub mod runtime;
 pub mod train;
 
 pub use graph::{DType, Graph, NodeId, TensorType};
+pub use optimize::OptimizeReport;
 pub use runtime::Session;
-pub use train::{build_session, TrainConfig};
+pub use train::{build_session, build_session_cached, build_session_with_report, TrainConfig};

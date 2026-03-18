@@ -1,8 +1,9 @@
 use crate::graph::{Graph, Node, NodeId, Op};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Identifies which shader and entry point to use.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ShaderEntry {
     MatMul,
     MatMulRelu,
@@ -63,7 +64,7 @@ impl ShaderEntry {
 }
 
 /// A single GPU dispatch in the execution plan.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Dispatch {
     pub shader: ShaderEntry,
     pub workgroups: [u32; 3],
@@ -75,11 +76,11 @@ pub struct Dispatch {
 }
 
 /// Reference to a GPU buffer in the execution plan.
-#[derive(Clone, Debug, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BufferRef(pub u32);
 
 /// The complete execution plan: a static sequence of dispatches.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecutionPlan {
     /// Buffer sizes in bytes, indexed by BufferRef.
     pub buffers: Vec<usize>,

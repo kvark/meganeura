@@ -1,25 +1,151 @@
 use crate::graph::{Graph, Node, NodeId, Op, TensorType};
+use std::fmt;
+use std::time::Instant;
+
+/// Report from the e-graph optimization pass.
+pub struct OptimizeReport {
+    /// The egglog program text (for external inspection / replay).
+    pub egglog_program: String,
+    /// Number of e-classes after saturation.
+    pub num_eclasses: usize,
+    /// Number of e-nodes after saturation.
+    pub num_enodes: usize,
+    /// Which rewrite rules fired and how many times.
+    pub rules_fired: Vec<(String, usize)>,
+    /// Graph node count before optimization.
+    pub nodes_before: usize,
+    /// Graph node count after optimization (excluding Nop).
+    pub nodes_after: usize,
+    /// Fusions applied: list of (fusion_name, node_index) pairs.
+    pub fusions_applied: Vec<(String, u32)>,
+    /// Wall-clock time for egglog saturation.
+    pub egglog_time: std::time::Duration,
+    /// Wall-clock time for graph extraction + fusion rewrites.
+    pub extract_time: std::time::Duration,
+}
+
+impl fmt::Display for OptimizeReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "=== Optimization Report ===")?;
+        writeln!(
+            f,
+            "Egglog saturation: {:.1}ms ({} e-classes, {} e-nodes)",
+            self.egglog_time.as_secs_f64() * 1000.0,
+            self.num_eclasses,
+            self.num_enodes,
+        )?;
+        if !self.rules_fired.is_empty() {
+            writeln!(f, "Rules fired:")?;
+            for &(ref rule, count) in &self.rules_fired {
+                writeln!(f, "  {}  x{}", rule, count)?;
+            }
+        }
+        writeln!(
+            f,
+            "Graph: {} nodes -> {} active nodes ({} fused away)",
+            self.nodes_before,
+            self.nodes_after,
+            self.nodes_before.saturating_sub(self.nodes_after),
+        )?;
+        if !self.fusions_applied.is_empty() {
+            write!(f, "Fusions:")?;
+            for (i, &(ref name, node_idx)) in self.fusions_applied.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ",")?;
+                }
+                write!(f, " {} @node{}", name, node_idx)?;
+            }
+            writeln!(f)?;
+        }
+        write!(
+            f,
+            "Extract time: {:.1}ms",
+            self.extract_time.as_secs_f64() * 1000.0
+        )
+    }
+}
 
 /// Convert a Graph to an egglog program string, run equality saturation
 /// with rewrite rules, and extract the optimized graph back.
 pub fn optimize(graph: &Graph) -> Graph {
+    let (graph, _report) = optimize_with_report(graph);
+    graph
+}
+
+/// Like `optimize`, but also returns a detailed report for debugging.
+pub fn optimize_with_report(graph: &Graph) -> (Graph, OptimizeReport) {
     let program = graph_to_egglog(graph);
     log::debug!("egglog program:\n{}", program);
 
+    let nodes_before = graph.nodes().len();
+    let mut num_eclasses = 0;
+    let mut num_enodes = 0;
+
+    let egglog_start = Instant::now();
     let mut egraph = egglog::EGraph::default();
-    match egraph.parse_and_run_program(None, &program) {
+    let egglog_ok = match egraph.parse_and_run_program(None, &program) {
         Ok(outputs) => {
             for out in &outputs {
                 log::debug!("egglog output: {}", out);
             }
+            true
         }
         Err(e) => {
             log::warn!("egglog optimization failed: {}, returning original graph", e);
-            return clone_graph(graph);
+            false
+        }
+    };
+    let egglog_time = egglog_start.elapsed();
+
+    // Extract e-graph stats if saturation succeeded
+    if egglog_ok {
+        let serialized = egraph.serialize(egglog::SerializeConfig::default());
+        num_eclasses = serialized.egraph.class_data.len();
+        num_enodes = serialized.egraph.nodes.len();
+    }
+
+    let extract_start = Instant::now();
+    let (optimized, fusions_applied) = if egglog_ok {
+        extract_graph_with_fusions(&egraph, graph)
+    } else {
+        (clone_graph(graph), Vec::new())
+    };
+    let extract_time = extract_start.elapsed();
+
+    let nodes_after = optimized
+        .nodes()
+        .iter()
+        .filter(|n| !matches!(n.op, Op::Nop))
+        .count();
+
+    // Count fusions by type
+    let mut rules_fired: Vec<(String, usize)> = Vec::new();
+    for fusion in &fusions_applied {
+        if let Some(entry) = rules_fired.iter_mut().find(|e| e.0 == fusion.0) {
+            entry.1 += 1;
+        } else {
+            rules_fired.push((fusion.0.clone(), 1));
         }
     }
 
-    extract_graph(&egraph, graph)
+    let report = OptimizeReport {
+        egglog_program: program,
+        num_eclasses,
+        num_enodes,
+        rules_fired,
+        nodes_before,
+        nodes_after,
+        fusions_applied,
+        egglog_time,
+        extract_time,
+    };
+
+    (optimized, report)
+}
+
+/// Dump the egglog program for a graph (for standalone debugging).
+pub fn dump_egglog_program(graph: &Graph) -> String {
+    graph_to_egglog(graph)
 }
 
 /// Generate egglog program text from a Graph.
@@ -130,24 +256,25 @@ fn node_to_egglog_expr(node: &Node) -> String {
 /// For now, we use a simpler approach: apply known rewrites directly
 /// on the Graph IR. The egglog integration validates the rules fire,
 /// and we'll upgrade to full extraction later.
-fn extract_graph(_egraph: &egglog::EGraph, original: &Graph) -> Graph {
-    // For now, apply pattern-matching rewrites directly.
-    // Full egglog extraction (parsing the extracted s-expr back to Graph)
-    // is complex and will be Phase 2.
+fn extract_graph_with_fusions(
+    _egraph: &egglog::EGraph,
+    original: &Graph,
+) -> (Graph, Vec<(String, u32)>) {
     let mut graph = clone_graph(original);
-    apply_fusion_rewrites(&mut graph);
-    graph
+    let fusions = apply_fusion_rewrites(&mut graph);
+    (graph, fusions)
 }
 
 /// Apply fusion rewrites directly on the graph IR.
-fn apply_fusion_rewrites(graph: &mut Graph) {
+/// Returns a list of (fusion_name, node_index) for each fusion applied.
+fn apply_fusion_rewrites(graph: &mut Graph) -> Vec<(String, u32)> {
     // We need to iterate and find patterns. Since nodes are append-only
     // and topologically sorted, we can scan forward.
     let len = graph.nodes().len();
     let replacements: Vec<Option<NodeId>> = vec![None; len];
 
-    // Collect fused ops: (relu_idx, fused_op, inputs, ty, dead_node_indices)
-    type Fusion = (usize, Op, Vec<NodeId>, TensorType, Vec<usize>);
+    // Collect fused ops: (relu_idx, fused_op, inputs, ty, dead_node_indices, name)
+    type Fusion = (usize, Op, Vec<NodeId>, TensorType, Vec<usize>, &'static str);
     let mut fusions: Vec<Fusion> = Vec::new();
 
     for i in 0..len {
@@ -171,6 +298,7 @@ fn apply_fusion_rewrites(graph: &mut Graph) {
                                 vec![a, b, c],
                                 node.ty.clone(),
                                 vec![bias_input as usize, input_id as usize],
+                                "FusedMatMulBiasRelu",
                             ));
                             continue;
                         }
@@ -185,6 +313,7 @@ fn apply_fusion_rewrites(graph: &mut Graph) {
                             vec![a, b],
                             node.ty.clone(),
                             vec![input_id as usize],
+                            "FusedMatMulRelu",
                         ));
                         continue;
                     }
@@ -196,17 +325,19 @@ fn apply_fusion_rewrites(graph: &mut Graph) {
     }
 
     // Apply the fusions
+    let mut applied = Vec::new();
     let nodes = graph.nodes_mut();
-    for (idx, op, inputs, ty, dead) in fusions {
+    for (idx, op, inputs, ty, dead, name) in fusions {
         nodes[idx].op = op;
         nodes[idx].inputs = inputs;
         nodes[idx].ty = ty;
-        // Mark consumed nodes as dead
+        applied.push((name.to_string(), idx as u32));
         for d in dead {
             nodes[d].op = Op::Nop;
             nodes[d].inputs.clear();
         }
     }
+    applied
 }
 
 fn resolve(id: NodeId, replacements: &[Option<NodeId>]) -> NodeId {
@@ -266,6 +397,30 @@ mod tests {
             "expected FusedMatMulBiasRelu, got {:?}",
             output_node.op
         );
+    }
+
+    #[test]
+    fn test_optimize_report() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 784]);
+        let w1 = g.parameter("w1", &[784, 128]);
+        let mm1 = g.matmul(x, w1);
+        let h1 = g.relu(mm1);
+        let w2 = g.parameter("w2", &[128, 10]);
+        let mm2 = g.matmul(h1, w2);
+        let h2 = g.relu(mm2);
+        g.set_outputs(vec![h2]);
+
+        let (_opt, report) = optimize_with_report(&g);
+        assert_eq!(report.fusions_applied.len(), 2);
+        assert!(report.fusions_applied.iter().all(|(n, _)| n == "FusedMatMulRelu"));
+        assert_eq!(report.rules_fired.len(), 1);
+        assert_eq!(report.rules_fired[0].1, 2); // fired twice
+        assert!(report.nodes_after < report.nodes_before);
+        // Verify Display works
+        let display = format!("{}", report);
+        assert!(display.contains("Optimization Report"));
+        assert!(display.contains("FusedMatMulRelu"));
     }
 
     #[test]
