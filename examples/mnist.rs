@@ -16,9 +16,9 @@ use std::path::Path;
 fn main() {
     env_logger::init();
 
-    // Set up Perfetto profiling when MEGANEURA_PROFILE is set.
-    let profiling = std::env::var("MEGANEURA_PROFILE").is_ok();
-    if profiling {
+    // Set up Perfetto profiling: MEGANEURA_TRACE=path.pftrace
+    let trace_path = std::env::var("MEGANEURA_TRACE").ok();
+    if trace_path.is_some() {
         meganeura::profiler::init();
     }
 
@@ -99,8 +99,8 @@ fn main() {
     }
 
     // Save Perfetto trace when profiling.
-    if profiling {
-        let path = Path::new("trace.pftrace");
+    if let Some(ref trace_file) = trace_path {
+        let path = Path::new(trace_file);
         meganeura::profiler::save(path).expect("failed to save profile");
         println!("profile saved to {}", path.display());
     }

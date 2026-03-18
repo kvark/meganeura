@@ -411,7 +411,7 @@ impl Session {
         for i in 0..self.plan.dispatches.len() {
             let dispatch = &self.plan.dispatches[i];
             let pipeline = self.pipelines.get(&dispatch.shader);
-            let mut pass = self.encoder.compute(dispatch.shader.name());
+            let mut pass = self.encoder.compute(&format!("{:?}", dispatch.shader));
             let mut pc = pass.with(pipeline);
             Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
             pc.dispatch(dispatch.workgroups);

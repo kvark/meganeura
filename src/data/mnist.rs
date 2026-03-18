@@ -3,8 +3,10 @@
 //! Supports both raw and gzip-compressed files.
 
 use super::DataLoader;
-use std::io::{self, Read};
-use std::path::Path;
+use std::{
+    io::{self, Read},
+    path::Path,
+};
 
 /// MNIST dataset loaded into memory.
 ///

@@ -1,6 +1,5 @@
 use crate::graph::{Graph, Node, NodeId, Op, TensorType};
-use std::fmt;
-use std::time::Instant;
+use std::{fmt, time::Instant};
 
 /// Report from the e-graph optimization pass.
 pub struct OptimizeReport {

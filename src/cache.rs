@@ -1,10 +1,11 @@
-use crate::compile::ExecutionPlan;
-use crate::graph::Graph;
+use crate::{compile::ExecutionPlan, graph::Graph};
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-use std::io;
-use std::path::Path;
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    io,
+    path::Path,
+};
 
 /// Cached execution plan with a graph fingerprint for invalidation.
 #[derive(Serialize, Deserialize)]
