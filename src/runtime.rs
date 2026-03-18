@@ -222,6 +222,7 @@ pub struct Session {
     buffers: Vec<blade_graphics::Buffer>,
     pipelines: Pipelines,
     plan: ExecutionPlan,
+    encoder: blade_graphics::CommandEncoder,
     sync_point: Option<blade_graphics::SyncPoint>,
 }
 
@@ -256,12 +257,17 @@ impl Session {
             .collect();
 
         let pipelines = Pipelines::new(&gpu, &plan);
+        let encoder = gpu.create_command_encoder(blade_graphics::CommandEncoderDesc {
+            name: "meganeura",
+            buffer_count: 2,
+        });
 
         Self {
             gpu,
             buffers,
             pipelines,
             plan,
+            encoder,
             sync_point: None,
         }
     }
@@ -296,10 +302,6 @@ impl Session {
         }
     }
 
-    fn buf(&self, r: BufferRef) -> blade_graphics::BufferPiece {
-        self.buffers[r.0 as usize].at(0)
-    }
-
     /// Read back the loss value.
     pub fn read_loss(&self) -> f32 {
         if let Some(buf_ref) = self.plan.loss_buffer {
@@ -332,33 +334,34 @@ impl Session {
     /// Execute the full dispatch sequence (forward + backward + update).
     pub fn step(&mut self) {
         self.wait();
-
-        let mut encoder = self.gpu.create_command_encoder(blade_graphics::CommandEncoderDesc {
-            name: "meganeura_step",
-            buffer_count: self.plan.dispatches.len() as u32 + 1,
-        });
+        self.encoder.start();
 
         for i in 0..self.plan.dispatches.len() {
-            self.execute_dispatch(&mut encoder, i);
+            let dispatch = &self.plan.dispatches[i];
+            let pipeline = self.pipelines.get(&dispatch.shader);
+            let mut pass = self.encoder.compute(dispatch.shader.entry_point());
+            let mut pc = pass.with(pipeline);
+            Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
+            pc.dispatch(dispatch.workgroups);
         }
 
-        self.sync_point = Some(self.gpu.submit(&mut encoder));
+        self.sync_point = Some(self.gpu.submit(&mut self.encoder));
     }
 
-    fn execute_dispatch(&self, encoder: &mut blade_graphics::CommandEncoder, idx: usize) {
-        let dispatch = &self.plan.dispatches[idx];
-        let pipeline = self.pipelines.get(&dispatch.shader);
-        let mut pass = encoder.compute(dispatch.shader.entry_point());
-        let mut pc = pass.with(pipeline);
-
+    fn bind_dispatch(
+        buffers: &[blade_graphics::Buffer],
+        dispatch: &crate::compile::Dispatch,
+        pc: &mut blade_graphics::PipelineEncoder<'_, '_>,
+    ) {
+        let buf = |r: BufferRef| buffers[r.0 as usize].at(0);
         match dispatch.shader {
             ShaderEntry::MatMul | ShaderEntry::MatMulRelu => {
                 pc.bind(
                     0,
                     &MatMulData {
-                        a: self.buf(dispatch.input_buffers[0]),
-                        b: self.buf(dispatch.input_buffers[1]),
-                        c: self.buf(dispatch.output_buffer),
+                        a: buf(dispatch.input_buffers[0]),
+                        b: buf(dispatch.input_buffers[1]),
+                        c: buf(dispatch.output_buffer),
                         params: MatMulParams {
                             m: dispatch.params[0],
                             k: dispatch.params[1],
@@ -372,10 +375,10 @@ impl Session {
                 pc.bind(
                     0,
                     &MatMulBiasReluData {
-                        a: self.buf(dispatch.input_buffers[0]),
-                        b: self.buf(dispatch.input_buffers[1]),
-                        bias: self.buf(dispatch.input_buffers[2]),
-                        c: self.buf(dispatch.output_buffer),
+                        a: buf(dispatch.input_buffers[0]),
+                        b: buf(dispatch.input_buffers[1]),
+                        bias: buf(dispatch.input_buffers[2]),
+                        c: buf(dispatch.output_buffer),
                         params: MatMulParams {
                             m: dispatch.params[0],
                             k: dispatch.params[1],
@@ -389,8 +392,8 @@ impl Session {
                 pc.bind(
                     0,
                     &UnaryData {
-                        src: self.buf(dispatch.input_buffers[0]),
-                        dst: self.buf(dispatch.output_buffer),
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
                         params: UnaryParams {
                             len: dispatch.params[0],
                             _pad0: 0,
@@ -404,9 +407,9 @@ impl Session {
                 pc.bind(
                     0,
                     &BinaryData {
-                        src_a: self.buf(dispatch.input_buffers[0]),
-                        src_b: self.buf(dispatch.input_buffers[1]),
-                        dst: self.buf(dispatch.output_buffer),
+                        src_a: buf(dispatch.input_buffers[0]),
+                        src_b: buf(dispatch.input_buffers[1]),
+                        dst: buf(dispatch.output_buffer),
                         params: UnaryParams {
                             len: dispatch.params[0],
                             _pad0: 0,
@@ -420,9 +423,9 @@ impl Session {
                 pc.bind(
                     0,
                     &BiasAddData {
-                        src: self.buf(dispatch.input_buffers[0]),
-                        bias: self.buf(dispatch.input_buffers[1]),
-                        dst: self.buf(dispatch.output_buffer),
+                        src: buf(dispatch.input_buffers[0]),
+                        bias: buf(dispatch.input_buffers[1]),
+                        dst: buf(dispatch.output_buffer),
                         params: BiasAddParams {
                             len: dispatch.params[0],
                             bias_len: dispatch.params[1],
@@ -436,9 +439,9 @@ impl Session {
                 pc.bind(
                     0,
                     &SgdData {
-                        param: self.buf(dispatch.input_buffers[0]),
-                        grad: self.buf(dispatch.input_buffers[1]),
-                        dst: self.buf(dispatch.output_buffer),
+                        param: buf(dispatch.input_buffers[0]),
+                        grad: buf(dispatch.input_buffers[1]),
+                        dst: buf(dispatch.output_buffer),
                         params: SgdParams {
                             len: dispatch.params[0],
                             lr: f32::from_bits(dispatch.params[1]),
@@ -452,8 +455,8 @@ impl Session {
                 pc.bind(
                     0,
                     &UnaryData {
-                        src: self.buf(dispatch.input_buffers[0]),
-                        dst: self.buf(dispatch.output_buffer),
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
                         params: UnaryParams {
                             len: dispatch.params[0],
                             _pad0: 0,
@@ -467,8 +470,8 @@ impl Session {
                 pc.bind(
                     0,
                     &SoftmaxData {
-                        src: self.buf(dispatch.input_buffers[0]),
-                        dst: self.buf(dispatch.output_buffer),
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
                         params: SoftmaxParams {
                             batch: dispatch.params[0],
                             features: dispatch.params[1],
@@ -482,10 +485,10 @@ impl Session {
                 pc.bind(
                     0,
                     &CrossEntropyData {
-                        logits: self.buf(dispatch.input_buffers[0]),
-                        labels: self.buf(dispatch.input_buffers[1]),
-                        grad_out: self.buf(dispatch.output_buffer),
-                        loss_out: self.buf(dispatch.output_buffer),
+                        logits: buf(dispatch.input_buffers[0]),
+                        labels: buf(dispatch.input_buffers[1]),
+                        grad_out: buf(dispatch.output_buffer),
+                        loss_out: buf(dispatch.output_buffer),
                         params: SoftmaxParams {
                             batch: dispatch.params[0],
                             features: dispatch.params[1],
@@ -499,8 +502,8 @@ impl Session {
                 pc.bind(
                     0,
                     &TransposeData {
-                        src: self.buf(dispatch.input_buffers[0]),
-                        dst: self.buf(dispatch.output_buffer),
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
                         params: TransposeParams {
                             m: dispatch.params[0],
                             n: dispatch.params[1],
@@ -512,29 +515,24 @@ impl Session {
             }
         }
 
-        pc.dispatch(dispatch.workgroups);
     }
 
     /// Apply SGD updates to all parameters on the GPU.
     pub fn sgd_step(&mut self, learning_rate: f32) {
         self.wait();
-
-        let mut encoder = self.gpu.create_command_encoder(blade_graphics::CommandEncoderDesc {
-            name: "sgd_update",
-            buffer_count: self.plan.param_grad_pairs.len() as u32 + 1,
-        });
+        self.encoder.start();
 
         for &(param_buf, grad_buf) in &self.plan.param_grad_pairs {
             let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
             let pipeline = self.pipelines.get(&ShaderEntry::SgdUpdate);
-            let mut pass = encoder.compute("sgd");
+            let mut pass = self.encoder.compute("sgd");
             let mut pc = pass.with(pipeline);
             pc.bind(
                 0,
                 &SgdData {
-                    param: self.buf(param_buf),
-                    grad: self.buf(grad_buf),
-                    dst: self.buf(param_buf), // write back to param buffer
+                    param: self.buffers[param_buf.0 as usize].at(0),
+                    grad: self.buffers[grad_buf.0 as usize].at(0),
+                    dst: self.buffers[param_buf.0 as usize].at(0),
                     params: SgdParams {
                         len,
                         lr: learning_rate,
@@ -546,7 +544,7 @@ impl Session {
             pc.dispatch([len.div_ceil(256), 1, 1]);
         }
 
-        self.sync_point = Some(self.gpu.submit(&mut encoder));
+        self.sync_point = Some(self.gpu.submit(&mut self.encoder));
     }
 
     /// CPU-fallback SGD update.
@@ -574,6 +572,10 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.wait();
+        self.gpu.destroy_command_encoder(&mut self.encoder);
+        for (_, pipeline) in self.pipelines.map.iter_mut() {
+            self.gpu.destroy_compute_pipeline(pipeline);
+        }
         for buffer in &self.buffers {
             self.gpu.destroy_buffer(*buffer);
         }
