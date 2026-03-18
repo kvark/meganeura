@@ -261,6 +261,9 @@ pub struct Session {
     plan: ExecutionPlan,
     encoder: blade_graphics::CommandEncoder,
     sync_point: Option<blade_graphics::SyncPoint>,
+    /// Nanosecond offset (in profiler time) of the most recent GPU submit,
+    /// used to place GPU pass timings on the GPU track.
+    last_submit_ns: u64,
 }
 
 impl Session {
@@ -271,6 +274,7 @@ impl Session {
         let gpu = unsafe {
             blade_graphics::Context::init(blade_graphics::ContextDesc {
                 validation: cfg!(debug_assertions),
+                timing: true,
                 capture: false,
                 overlay: false,
                 device_id: 0,
@@ -306,6 +310,7 @@ impl Session {
             plan,
             encoder,
             sync_point: None,
+            last_submit_ns: 0,
         }
     }
 
@@ -389,24 +394,30 @@ impl Session {
     /// Wait for any pending GPU work.
     pub fn wait(&mut self) {
         if let Some(sp) = self.sync_point.take() {
+            let _span = tracing::info_span!("wait").entered();
             self.gpu.wait_for(&sp, !0);
         }
     }
 
     /// Execute the full dispatch sequence (forward + backward + update).
     pub fn step(&mut self) {
+        let _span = tracing::info_span!("step").entered();
         self.wait();
+
         self.encoder.start();
+        // After start(), blade exposes GPU timings from the *previous* submission.
+        self.drain_gpu_timings();
 
         for i in 0..self.plan.dispatches.len() {
             let dispatch = &self.plan.dispatches[i];
             let pipeline = self.pipelines.get(&dispatch.shader);
-            let mut pass = self.encoder.compute(dispatch.shader.entry_point());
+            let mut pass = self.encoder.compute(dispatch.shader.name());
             let mut pc = pass.with(pipeline);
             Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
             pc.dispatch(dispatch.workgroups);
         }
 
+        self.last_submit_ns = crate::profiler::now_ns();
         self.sync_point = Some(self.gpu.submit(&mut self.encoder));
     }
 
@@ -642,15 +653,26 @@ impl Session {
         }
     }
 
+    /// Read GPU pass timings from the encoder (available after `encoder.start()`)
+    /// and record them on the GPU profiling track.
+    fn drain_gpu_timings(&self) {
+        let timings = self.encoder.timings();
+        if !timings.is_empty() {
+            crate::profiler::record_gpu_passes(self.last_submit_ns, timings);
+        }
+    }
+
     /// Apply SGD updates to all parameters on the GPU.
     pub fn sgd_step(&mut self, learning_rate: f32) {
+        let _span = tracing::info_span!("sgd_step").entered();
         self.wait();
         self.encoder.start();
+        self.drain_gpu_timings();
 
         for &(param_buf, grad_buf) in &self.plan.param_grad_pairs {
             let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
             let pipeline = self.pipelines.get(&ShaderEntry::SgdUpdate);
-            let mut pass = self.encoder.compute("sgd");
+            let mut pass = self.encoder.compute("sgd_update");
             let mut pc = pass.with(pipeline);
             pc.bind(
                 0,
@@ -669,11 +691,13 @@ impl Session {
             pc.dispatch([len.div_ceil(256), 1, 1]);
         }
 
+        self.last_submit_ns = crate::profiler::now_ns();
         self.sync_point = Some(self.gpu.submit(&mut self.encoder));
     }
 
     /// CPU-fallback SGD update.
     pub fn sgd_step_cpu(&mut self, learning_rate: f32) {
+        let _span = tracing::info_span!("sgd_step_cpu").entered();
         self.wait();
         for &(param_buf, grad_buf) in &self.plan.param_grad_pairs {
             let size = self.plan.buffers[param_buf.0 as usize] / 4;

@@ -16,6 +16,12 @@ use std::path::Path;
 fn main() {
     env_logger::init();
 
+    // Set up Perfetto profiling when MEGANEURA_PROFILE is set.
+    let profiling = std::env::var("MEGANEURA_PROFILE").is_ok();
+    if profiling {
+        meganeura::profiler::init();
+    }
+
     let batch = 32;
     let input_dim = 784; // 28x28
     let hidden = 128;
@@ -90,6 +96,13 @@ fn main() {
         println!("done! final avg_loss = {:.4}", final_loss);
     } else {
         println!("done! (no epochs ran)");
+    }
+
+    // Save Perfetto trace when profiling.
+    if profiling {
+        let path = Path::new("trace.pftrace");
+        meganeura::profiler::save(path).expect("failed to save profile");
+        println!("profile saved to {}", path.display());
     }
 }
 

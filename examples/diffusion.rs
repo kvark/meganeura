@@ -18,6 +18,12 @@ use std::time::Instant;
 fn main() {
     env_logger::init();
 
+    // Set up Perfetto profiling when MEGANEURA_PROFILE is set.
+    let profiling = std::env::var("MEGANEURA_PROFILE").is_ok();
+    if profiling {
+        meganeura::profiler::init();
+    }
+
     let batch = 64;
     let img_dim = 784; // 28×28 flattened
     let hidden = 256;
@@ -142,6 +148,13 @@ fn main() {
     }
     if let Some(final_loss) = history.final_loss() {
         println!("final loss:      {:.6}", final_loss);
+    }
+
+    // Save Perfetto trace when profiling.
+    if profiling {
+        let path = std::path::Path::new("trace.pftrace");
+        meganeura::profiler::save(path).expect("failed to save profile");
+        println!("profile saved to {}", path.display());
     }
 }
 
