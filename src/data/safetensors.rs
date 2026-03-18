@@ -129,12 +129,14 @@ impl SafeTensorsModel {
                 Ok(floats)
             }
             safetensors::Dtype::BF16 => {
+                // BF16 is a truncated F32: same sign + exponent bits,
+                // fewer mantissa bits. Widening is a simple 16-bit left
+                // shift (zero-fills the lower mantissa bits).
                 let bytes = view.data();
                 let floats: Vec<f32> = bytes
                     .chunks_exact(2)
                     .map(|chunk| {
                         let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-                        // BF16 → F32: just shift left by 16 bits
                         f32::from_bits((bits as u32) << 16)
                     })
                     .collect();

@@ -22,6 +22,12 @@ use std::path::{Path, PathBuf};
 fn main() {
     env_logger::init();
 
+    // Set up Perfetto profiling: MEGANEURA_TRACE=path.pftrace
+    let trace_path = std::env::var("MEGANEURA_TRACE").ok();
+    if trace_path.is_some() {
+        meganeura::profiler::init();
+    }
+
     let batch = 1;
     let input_dim = 784;
     let hidden = 256;
@@ -85,7 +91,8 @@ fn main() {
 
     // --- Load weights from safetensors ---
     // PyTorch Linear stores weights as (out_features, in_features),
-    // meganeura matmul expects (in_features, out_features) → transpose.
+    // but meganeura matmul expects (in_features, out_features).
+    // Weight matrices need transposing; biases are loaded as-is.
     println!("loading weights...");
     for name in ["input_layer.weight", "mid_layer.weight", "output_layer.weight"] {
         let data = hf
@@ -107,11 +114,13 @@ fn main() {
     println!("loaded {} MNIST test images", mnist.n);
 
     // --- Run inference on all test images ---
+    // Feed each 28×28 image one at a time (batch=1), applying the same
+    // normalization the model was trained with (MNIST channel statistics).
     let mut correct = 0usize;
     let mut total = 0usize;
 
     for i in 0..mnist.n {
-        // Extract and normalize one image: (pixel - 0.1307) / 0.3081
+        // Normalize with MNIST channel mean / std used during training.
         let raw = &mnist.images[i * 784..(i + 1) * 784];
         let image: Vec<f32> = raw.iter().map(|&v| (v - 0.1307) / 0.3081).collect();
 
@@ -159,6 +168,13 @@ fn main() {
         "\naccuracy: {}/{} ({:.2}%)",
         correct, total, accuracy
     );
+
+    // Save Perfetto trace when profiling.
+    if let Some(ref trace_file) = trace_path {
+        let path = Path::new(trace_file);
+        meganeura::profiler::save(path).expect("failed to save profile");
+        println!("profile saved to {}", path.display());
+    }
 }
 
 fn load_mnist_test(data_dir: &Path) -> MnistDataset {
