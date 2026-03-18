@@ -3,9 +3,15 @@
 /// Demonstrates the full pipeline:
 ///   Graph definition → autodiff → egglog optimization → compile → GPU execution
 ///
-/// This example uses synthetic data since we don't bundle MNIST files.
-/// Replace with real MNIST loading for actual training.
-use meganeura::{Graph, build_session};
+/// If MNIST data files are present in `data/`, loads them automatically.
+/// Otherwise falls back to synthetic data. Download MNIST from:
+///   <https://yann.lecun.com/exdb/mnist/>
+///
+/// Expected files (gzipped or raw):
+///   data/train-images-idx3-ubyte.gz  (or without .gz)
+///   data/train-labels-idx1-ubyte.gz  (or without .gz)
+use meganeura::{DataLoader, Graph, MnistDataset, build_session};
+use std::path::Path;
 
 fn main() {
     env_logger::init();
@@ -15,8 +21,12 @@ fn main() {
     let hidden = 128;
     let classes = 10;
     let epochs = 10;
-    let steps_per_epoch = 100;
     let lr = 0.01_f32;
+
+    // --- Load data ---
+    let mut loader = load_mnist_or_synthetic(batch, input_dim, classes);
+    let steps_per_epoch = loader.num_batches();
+    println!("{} samples, {} batches/epoch", loader.len(), steps_per_epoch);
 
     // --- Build the model graph ---
     let mut g = Graph::new();
@@ -69,12 +79,13 @@ fn main() {
     // --- Training loop ---
     println!("training...");
     for epoch in 0..epochs {
+        loader.shuffle(epoch as u64);
+        loader.reset();
         let mut total_loss = 0.0_f32;
-        for step in 0..steps_per_epoch {
-            // Generate synthetic batch
-            let (images, targets) = synthetic_batch(batch, input_dim, classes);
-            session.set_input("x", &images);
-            session.set_input("labels", &targets);
+        let mut step = 0;
+        while let Some(batch) = loader.next_batch() {
+            session.set_input("x", batch.data);
+            session.set_input("labels", batch.labels);
 
             // Forward + backward
             session.step();
@@ -89,15 +100,57 @@ fn main() {
             if step % 50 == 0 {
                 println!("  epoch {} step {}: loss = {:.4}", epoch, step, loss_val);
             }
+            step += 1;
         }
         println!(
             "epoch {}: avg_loss = {:.4}",
             epoch,
-            total_loss / steps_per_epoch as f32
+            total_loss / step as f32
         );
     }
 
     println!("done!");
+}
+
+fn load_mnist_or_synthetic(batch: usize, input_dim: usize, classes: usize) -> DataLoader {
+    let data_dir = Path::new("data");
+
+    // Try gzipped files first, then raw
+    let gz_images = data_dir.join("train-images-idx3-ubyte.gz");
+    let gz_labels = data_dir.join("train-labels-idx1-ubyte.gz");
+    let raw_images = data_dir.join("train-images-idx3-ubyte");
+    let raw_labels = data_dir.join("train-labels-idx1-ubyte");
+
+    if gz_images.exists() && gz_labels.exists() {
+        println!("loading MNIST from {} (gzipped)...", data_dir.display());
+        let mnist = MnistDataset::load_gz(&gz_images, &gz_labels)
+            .expect("failed to parse MNIST gz files");
+        println!("loaded {} MNIST images", mnist.n);
+        return mnist.loader(batch);
+    }
+
+    if raw_images.exists() && raw_labels.exists() {
+        println!("loading MNIST from {} (raw)...", data_dir.display());
+        let mnist = MnistDataset::load(&raw_images, &raw_labels)
+            .expect("failed to parse MNIST files");
+        println!("loaded {} MNIST images", mnist.n);
+        return mnist.loader(batch);
+    }
+
+    println!("MNIST not found in data/, using synthetic data");
+    let n = 3200; // enough for 100 batches of 32
+    synthetic_loader(n, input_dim, classes, batch)
+}
+
+fn synthetic_loader(n: usize, input_dim: usize, classes: usize, batch: usize) -> DataLoader {
+    let images: Vec<f32> = (0..n * input_dim)
+        .map(|i| ((i % 256) as f32) / 255.0)
+        .collect();
+    let mut labels = vec![0.0_f32; n * classes];
+    for b in 0..n {
+        labels[b * classes + (b % classes)] = 1.0;
+    }
+    DataLoader::new(images, labels, input_dim, classes, batch)
 }
 
 fn xavier_init(fan_in: usize, fan_out: usize) -> Vec<f32> {
@@ -111,18 +164,4 @@ fn xavier_init(fan_in: usize, fan_out: usize) -> Vec<f32> {
             (x * PI * 2.0).sin() * scale
         })
         .collect()
-}
-
-fn synthetic_batch(batch: usize, input_dim: usize, classes: usize) -> (Vec<f32>, Vec<f32>) {
-    let images: Vec<f32> = (0..batch * input_dim)
-        .map(|i| ((i % 256) as f32) / 255.0)
-        .collect();
-
-    // One-hot labels
-    let mut labels = vec![0.0_f32; batch * classes];
-    for b in 0..batch {
-        labels[b * classes + (b % classes)] = 1.0;
-    }
-
-    (images, labels)
 }

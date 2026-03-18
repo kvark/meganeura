@@ -21,11 +21,13 @@ pub mod autodiff;
 pub mod cache;
 pub mod codegen;
 pub mod compile;
+pub mod data;
 pub mod graph;
 pub mod optimize;
 pub mod runtime;
 pub mod train;
 
+pub use data::{DataLoader, MnistDataset};
 pub use graph::{DType, Graph, NodeId, TensorType};
 pub use optimize::OptimizeReport;
 pub use runtime::Session;
