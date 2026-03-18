@@ -149,8 +149,8 @@ struct Pipelines {
 
 impl Pipelines {
     fn new(gpu: &Gpu, plan: &ExecutionPlan) -> Self {
-        use blade_graphics as bg;
         use crate::codegen::ShaderGroup;
+        use blade_graphics as bg;
 
         // Collect unique (ShaderGroup, entries) pairs
         let mut needed: HashMap<ShaderGroup, Vec<&ShaderEntry>> = HashMap::new();
@@ -514,7 +514,6 @@ impl Session {
                 );
             }
         }
-
     }
 
     /// Apply SGD updates to all parameters on the GPU.

@@ -151,12 +151,24 @@ impl Graph {
 
     pub fn input(&mut self, name: &str, shape: &[usize]) -> NodeId {
         let ty = TensorType::f32(shape.to_vec());
-        self.add_node(Op::Input { name: name.to_string() }, vec![], ty)
+        self.add_node(
+            Op::Input {
+                name: name.to_string(),
+            },
+            vec![],
+            ty,
+        )
     }
 
     pub fn parameter(&mut self, name: &str, shape: &[usize]) -> NodeId {
         let ty = TensorType::f32(shape.to_vec());
-        self.add_node(Op::Parameter { name: name.to_string() }, vec![], ty)
+        self.add_node(
+            Op::Parameter {
+                name: name.to_string(),
+            },
+            vec![],
+            ty,
+        )
     }
 
     pub fn constant(&mut self, data: Vec<f32>, shape: &[usize]) -> NodeId {
@@ -423,7 +435,9 @@ mod tests {
     fn add_raw_node() {
         let mut g = Graph::new();
         let id = g.add_raw_node(
-            Op::Input { name: "raw".to_string() },
+            Op::Input {
+                name: "raw".to_string(),
+            },
             vec![],
             TensorType::f32(vec![2, 3]),
         );
@@ -454,7 +468,9 @@ mod tests {
     fn transpose_non_2d() {
         let mut g = Graph::new();
         let x = g.add_raw_node(
-            Op::Input { name: "x".to_string() },
+            Op::Input {
+                name: "x".to_string(),
+            },
             vec![],
             TensorType::f32(vec![2, 3, 4]),
         );

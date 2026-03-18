@@ -86,21 +86,14 @@ impl Builder {
         self.m.types.insert(
             Type {
                 name: Some(name.to_string()),
-                inner: TypeInner::Struct {
-                    members,
-                    span: 16,
-                },
+                inner: TypeInner::Struct { members, span: 16 },
             },
             S,
         )
     }
 
     /// Create a Params struct where the second field is f32 (for SGD lr).
-    fn params_u32_f32_u32_u32(
-        &mut self,
-        name: &str,
-        fields: &[&str],
-    ) -> Handle<Type> {
+    fn params_u32_f32_u32_u32(&mut self, name: &str, fields: &[&str]) -> Handle<Type> {
         assert_eq!(fields.len(), 4);
         let tys = [self.ty_u32, self.ty_f32, self.ty_u32, self.ty_u32];
         let members: Vec<StructMember> = fields
@@ -116,10 +109,7 @@ impl Builder {
         self.m.types.insert(
             Type {
                 name: Some(name.to_string()),
-                inner: TypeInner::Struct {
-                    members,
-                    span: 16,
-                },
+                inner: TypeInner::Struct { members, span: 16 },
             },
             S,
         )
@@ -201,12 +191,7 @@ impl Builder {
     }
 
     /// Add a compute entry point.
-    fn entry_point(
-        &mut self,
-        name: &str,
-        workgroup_size: [u32; 3],
-        func: Function,
-    ) {
+    fn entry_point(&mut self, name: &str, workgroup_size: [u32; 3], func: Function) {
         self.m.entry_points.push(EntryPoint {
             name: name.to_string(),
             stage: ShaderStage::Compute,
@@ -278,9 +263,7 @@ impl FnBuilder {
 
     fn named(&mut self, name: &str, e: Expression) -> Handle<Expression> {
         let h = self.f.expressions.append(e, S);
-        self.f
-            .named_expressions
-            .insert(h, name.to_string());
+        self.f.named_expressions.insert(h, name.to_string());
         h
     }
 
@@ -323,15 +306,8 @@ impl FnBuilder {
     }
 
     /// Dynamic array access: base[index]
-    fn index(
-        &mut self,
-        base: Handle<Expression>,
-        idx: Handle<Expression>,
-    ) -> Handle<Expression> {
-        self.expr(Expression::Access {
-            base,
-            index: idx,
-        })
+    fn index(&mut self, base: Handle<Expression>, idx: Handle<Expression>) -> Handle<Expression> {
+        self.expr(Expression::Access { base, index: idx })
     }
 
     fn load(&mut self, ptr: Handle<Expression>) -> Handle<Expression> {
@@ -359,19 +335,11 @@ impl FnBuilder {
         })
     }
 
-    fn unary(
-        &mut self,
-        op: UnaryOperator,
-        e: Handle<Expression>,
-    ) -> Handle<Expression> {
+    fn unary(&mut self, op: UnaryOperator, e: Handle<Expression>) -> Handle<Expression> {
         self.expr(Expression::Unary { op, expr: e })
     }
 
-    fn math1(
-        &mut self,
-        fun: MathFunction,
-        arg: Handle<Expression>,
-    ) -> Handle<Expression> {
+    fn math1(&mut self, fun: MathFunction, arg: Handle<Expression>) -> Handle<Expression> {
         self.expr(Expression::Math {
             fun,
             arg,
@@ -437,11 +405,7 @@ impl FnBuilder {
         self.expr(Expression::LocalVariable(lv))
     }
 
-    fn store(
-        &self,
-        ptr: Handle<Expression>,
-        value: Handle<Expression>,
-    ) -> Statement {
+    fn store(&self, ptr: Handle<Expression>, value: Handle<Expression>) -> Statement {
         Statement::Store {
             pointer: ptr,
             value,
@@ -474,11 +438,7 @@ fn push_emit(
     let mut run_start: Option<Handle<Expression>> = None;
     let mut prev_h: Option<Handle<Expression>> = None;
 
-    for (h, expr) in exprs
-        .iter()
-        .skip(first_idx)
-        .take(last_idx - first_idx + 1)
-    {
+    for (h, expr) in exprs.iter().skip(first_idx).take(last_idx - first_idx + 1) {
         if expr.needs_pre_emit() {
             if let (Some(start), Some(end)) = (run_start, prev_h) {
                 block.push(Statement::Emit(Range::new_from_bounds(start, end)), S);
@@ -543,17 +503,12 @@ pub fn generate_wgsl(group: ShaderGroup) -> String {
 
 /// Convert a naga Module to WGSL source text.
 pub fn module_to_wgsl(module: &Module) -> String {
-    let flags =
-        naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
+    let flags = naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
     let info = naga::valid::Validator::new(flags, naga::valid::Capabilities::empty())
         .validate(module)
         .expect("generated module failed validation");
-    naga::back::wgsl::write_string(
-        module,
-        &info,
-        naga::back::wgsl::WriterFlags::empty(),
-    )
-    .expect("WGSL write failed")
+    naga::back::wgsl::write_string(module, &info, naga::back::wgsl::WriterFlags::empty())
+        .expect("WGSL write failed")
 }
 
 // ---------------------------------------------------------------------------
@@ -762,8 +717,7 @@ fn gen_binary() -> Module {
 
 fn gen_bias_add() -> Module {
     let mut b = Builder::new();
-    let ty_params =
-        b.params_u32x4("Params", &["len", "bias_len", "_pad0", "_pad1"]);
+    let ty_params = b.params_u32x4("Params", &["len", "bias_len", "_pad0", "_pad1"]);
     let gv_src = b.storage_ro("src");
     let gv_bias = b.storage_ro("bias");
     let gv_dst = b.storage_rw("dst");
@@ -810,8 +764,7 @@ fn gen_bias_add() -> Module {
 
 fn gen_sgd() -> Module {
     let mut b = Builder::new();
-    let ty_params =
-        b.params_u32_f32_u32_u32("Params", &["len", "lr", "_pad0", "_pad1"]);
+    let ty_params = b.params_u32_f32_u32_u32("Params", &["len", "lr", "_pad0", "_pad1"]);
     let gv_param = b.storage_ro("param");
     let gv_grad = b.storage_ro("grad");
     let gv_dst = b.storage_rw("dst");
@@ -1260,7 +1213,8 @@ fn gen_reduce() -> Module {
             },
             S,
         );
-        f.f.body.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
+        f.f.body
+            .push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
 
         // Reduction loop: for stride = 128; stride > 0; stride /= 2
         let stride_var = f.local_var("stride", b.ty_u32, None);
@@ -1374,8 +1328,7 @@ fn gen_reduce() -> Module {
 
 fn gen_softmax() -> Module {
     let mut b = Builder::new();
-    let ty_params =
-        b.params_u32x4("Params", &["batch", "features", "_pad0", "_pad1"]);
+    let ty_params = b.params_u32x4("Params", &["batch", "features", "_pad0", "_pad1"]);
     let gv_src = b.storage_ro("src");
     let gv_dst = b.storage_rw("dst");
     let gv_params = b.uniform("params", ty_params);
@@ -1554,8 +1507,7 @@ fn gen_softmax() -> Module {
 
 fn gen_cross_entropy() -> Module {
     let mut b = Builder::new();
-    let ty_params =
-        b.params_u32x4("Params", &["batch", "features", "_pad0", "_pad1"]);
+    let ty_params = b.params_u32x4("Params", &["batch", "features", "_pad0", "_pad1"]);
     let gv_logits = b.storage_ro("logits");
     let gv_labels = b.storage_ro("labels");
     let gv_grad = b.storage_rw("grad_out");
