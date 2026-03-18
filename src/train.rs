@@ -83,6 +83,7 @@ impl Trainer {
 
     /// Run a single epoch, returning its statistics.
     pub fn train_epoch(&mut self, loader: &mut DataLoader, epoch: usize) -> EpochStats {
+        let _span = tracing::info_span!("train_epoch", epoch).entered();
         loader.shuffle(epoch as u64);
         loader.reset();
 
@@ -90,9 +91,12 @@ impl Trainer {
         let mut steps = 0usize;
 
         while let Some(batch) = loader.next_batch() {
-            self.session.set_input(&self.config.data_input, batch.data);
-            self.session
-                .set_input(&self.config.label_input, batch.labels);
+            {
+                let _span = tracing::info_span!("set_input").entered();
+                self.session.set_input(&self.config.data_input, batch.data);
+                self.session
+                    .set_input(&self.config.label_input, batch.labels);
+            }
 
             self.session.step();
             self.session.wait();
@@ -176,13 +180,22 @@ pub fn build_session(forward_graph: &Graph) -> Session {
 }
 
 /// Like `build_session`, but also returns the optimization report.
+///
+/// Build-phase stages (autodiff, egglog, compile, gpu_init) are captured
+/// as tracing spans and will appear in Perfetto traces when profiling is
+/// active.
 pub fn build_session_with_report(forward_graph: &Graph) -> (Session, OptimizeReport) {
+    let _span = tracing::info_span!("build_session").entered();
+
     log::info!("building training session...");
     log::info!("forward graph:\n{}", forward_graph);
 
     // Step 1: Autodiff
     log::info!("running autodiff...");
-    let full_graph = autodiff::differentiate(forward_graph);
+    let full_graph = {
+        let _span = tracing::info_span!("autodiff").entered();
+        autodiff::differentiate(forward_graph)
+    };
     log::info!(
         "full graph (forward + backward): {} nodes",
         full_graph.nodes().len()
@@ -190,12 +203,18 @@ pub fn build_session_with_report(forward_graph: &Graph) -> (Session, OptimizeRep
 
     // Step 2: Optimize with egglog
     log::info!("running egglog optimization...");
-    let (optimized, report) = optimize::optimize_with_report(&full_graph);
+    let (optimized, report) = {
+        let _span = tracing::info_span!("egglog_optimize").entered();
+        optimize::optimize_with_report(&full_graph)
+    };
     log::info!("optimized graph: {} nodes", optimized.nodes().len());
 
     // Step 3: Compile to execution plan
     log::info!("compiling execution plan...");
-    let plan = compile::compile(&optimized);
+    let plan = {
+        let _span = tracing::info_span!("compile").entered();
+        compile::compile(&optimized)
+    };
     log::info!(
         "execution plan: {} buffers, {} dispatches",
         plan.buffers.len(),
@@ -204,7 +223,12 @@ pub fn build_session_with_report(forward_graph: &Graph) -> (Session, OptimizeRep
 
     // Step 4: Create GPU session
     log::info!("initializing GPU session...");
-    (Session::new(plan), report)
+    let session = {
+        let _span = tracing::info_span!("gpu_init").entered();
+        Session::new(plan)
+    };
+
+    (session, report)
 }
 
 /// Build a session, using a cache file if available.

@@ -24,6 +24,8 @@ flate2 = "1"
 safetensors = "0.4"
 hf-hub = { version = "0.4", default-features = false, features = ["ureq", "native-tls"] }
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["registry"] }
 
 [[example]]
 name = "mnist"
