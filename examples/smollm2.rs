@@ -16,6 +16,12 @@ const REPO_ID: &str = "HuggingFaceTB/SmolLM2-135M";
 fn main() {
     env_logger::init();
 
+    // Set up Perfetto profiling: MEGANEURA_TRACE=path.pftrace
+    let trace_path = std::env::var("MEGANEURA_TRACE").ok();
+    if trace_path.is_some() {
+        meganeura::profiler::init();
+    }
+
     let prompt = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "The meaning of life is".to_string());
@@ -74,6 +80,8 @@ fn main() {
     );
 
     // --- Load weights ---
+    // HuggingFace Linear layers store weights as (out, in) but meganeura
+    // matmul expects (in, out), so certain tensors need transposing.
     println!("loading weights...");
     let transposed = smollm2::transposed_weight_names(&config);
     let transposed_set: std::collections::HashSet<&str> =
@@ -81,7 +89,9 @@ fn main() {
 
     for (name, _) in session.plan().param_buffers.clone() {
         if name == "lm_head.weight" {
-            // lm_head is often tied to embed_tokens
+            // The language-model head is often weight-tied to the token
+            // embedding table. If a dedicated lm_head tensor exists in the
+            // file we load it; otherwise we reuse embed_tokens transposed.
             if model.tensor_info().contains_key("lm_head.weight") {
                 let data = if transposed_set.contains(name.as_str()) {
                     model.tensor_f32_auto_transposed(&name)
@@ -111,26 +121,29 @@ fn main() {
     }
     println!("weights loaded.");
 
-    // --- Generate tokens ---
+    // --- Generate tokens (greedy, autoregressive) ---
+    // Each step feeds the full sequence (prompt + generated so far,
+    // zero-padded to seq_len) through the model, then picks the
+    // highest-probability next token from the logits at the current
+    // position.
     println!("generating...\n");
 
-    // Pad input_ids to seq_len with 0s
     let mut tokens = vec![0u32; seq_len];
     tokens[..input_ids.len()].copy_from_slice(&input_ids);
 
     let mut generated = input_ids.clone();
 
     for step in 0..max_new_tokens {
-        // Set full token sequence
         session.set_input_u32("token_ids", &tokens);
         session.step();
         session.wait();
 
-        // Read logits: [seq_len, vocab_size]
+        // The model outputs logits shaped [seq_len, vocab_size].
+        // We only care about the position just before the next token
+        // we want to predict (causal: position N-1 predicts token N).
         let vocab = config.vocab_size;
         let all_logits = session.read_output(seq_len * vocab);
 
-        // Get logits for the current position (last non-padding token)
         let cur_pos = input_ids.len() + step;
         let pos_logits = &all_logits[(cur_pos - 1) * vocab..cur_pos * vocab];
 
@@ -158,4 +171,11 @@ fn main() {
         .decode(&generated, true)
         .unwrap_or_else(|_| "decode error".to_string());
     println!("\n--- Full output ---\n{}", full_text);
+
+    // Save Perfetto trace when profiling.
+    if let Some(ref trace_file) = trace_path {
+        let path = std::path::Path::new(trace_file);
+        meganeura::profiler::save(path).expect("failed to save profile");
+        println!("profile saved to {}", path.display());
+    }
 }

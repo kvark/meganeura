@@ -5,14 +5,26 @@
 
 use crate::graph::{Graph, NodeId};
 
+/// Hyperparameters for a SmolLM2 model instance.
+///
+/// Values correspond to the `config.json` published alongside the
+/// HuggingFace model weights.
 pub struct SmolLM2Config {
+    /// Vocabulary size (number of token embeddings).
     pub vocab_size: usize,
+    /// Dimensionality of the transformer hidden state.
     pub hidden_size: usize,
+    /// Number of transformer decoder blocks.
     pub num_hidden_layers: usize,
+    /// Number of query heads in grouped-query attention (GQA).
     pub num_attention_heads: u32,
+    /// Number of key/value heads (fewer than query heads for GQA).
     pub num_key_value_heads: u32,
+    /// Inner dimension of the SwiGLU feed-forward network.
     pub intermediate_size: usize,
+    /// Epsilon for RMSNorm numerical stability.
     pub rms_norm_eps: f32,
+    /// Base frequency for Rotary Position Embeddings (RoPE).
     pub rope_theta: f32,
 }
 
