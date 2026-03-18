@@ -3,12 +3,12 @@
     clippy::redundant_pattern_matching,
     clippy::needless_lifetimes,
     clippy::new_without_default,
-    clippy::single_match,
+    clippy::single_match
 )]
 #![warn(
     trivial_numeric_casts,
     unused_extern_crates,
-    clippy::pattern_type_mismatch,
+    clippy::pattern_type_mismatch
 )]
 
 //! Meganeura: E-graph optimized neural network framework on blade-graphics.
@@ -29,4 +29,7 @@ pub mod train;
 pub use graph::{DType, Graph, NodeId, TensorType};
 pub use optimize::OptimizeReport;
 pub use runtime::Session;
-pub use train::{build_session, build_session_cached, build_session_with_report, compile_training_graph, TrainConfig};
+pub use train::{
+    TrainConfig, build_session, build_session_cached, build_session_with_report,
+    compile_training_graph,
+};

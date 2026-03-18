@@ -513,7 +513,7 @@ mod tests {
         let plan = compile(&g);
         assert_eq!(plan.dispatches.len(), 1);
         assert_eq!(plan.dispatches[0].shader, ShaderEntry::Softmax);
-        assert_eq!(plan.dispatches[0].params[0], 4);  // batch
+        assert_eq!(plan.dispatches[0].params[0], 4); // batch
         assert_eq!(plan.dispatches[0].params[1], 10); // features
     }
 
@@ -626,12 +626,22 @@ mod tests {
     fn test_shader_entry_mappings() {
         // Verify all shader entries have valid group and entry_point
         let entries = [
-            ShaderEntry::MatMul, ShaderEntry::MatMulRelu, ShaderEntry::MatMulBiasRelu,
-            ShaderEntry::Relu, ShaderEntry::Sigmoid, ShaderEntry::Neg,
-            ShaderEntry::Add, ShaderEntry::Mul, ShaderEntry::Greater,
-            ShaderEntry::BiasAdd, ShaderEntry::SgdUpdate,
-            ShaderEntry::SumAll, ShaderEntry::MeanAll,
-            ShaderEntry::Softmax, ShaderEntry::CrossEntropyLoss, ShaderEntry::Transpose,
+            ShaderEntry::MatMul,
+            ShaderEntry::MatMulRelu,
+            ShaderEntry::MatMulBiasRelu,
+            ShaderEntry::Relu,
+            ShaderEntry::Sigmoid,
+            ShaderEntry::Neg,
+            ShaderEntry::Add,
+            ShaderEntry::Mul,
+            ShaderEntry::Greater,
+            ShaderEntry::BiasAdd,
+            ShaderEntry::SgdUpdate,
+            ShaderEntry::SumAll,
+            ShaderEntry::MeanAll,
+            ShaderEntry::Softmax,
+            ShaderEntry::CrossEntropyLoss,
+            ShaderEntry::Transpose,
         ];
         for entry in &entries {
             let _group = entry.shader_group();

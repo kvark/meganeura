@@ -5,7 +5,7 @@
 ///
 /// This example uses synthetic data since we don't bundle MNIST files.
 /// Replace with real MNIST loading for actual training.
-use meganeura::{build_session, Graph};
+use meganeura::{Graph, build_session};
 
 fn main() {
     env_logger::init();
@@ -87,10 +87,7 @@ fn main() {
             total_loss += loss_val;
 
             if step % 50 == 0 {
-                println!(
-                    "  epoch {} step {}: loss = {:.4}",
-                    epoch, step, loss_val
-                );
+                println!("  epoch {} step {}: loss = {:.4}", epoch, step, loss_val);
             }
         }
         println!(

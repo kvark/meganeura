@@ -91,7 +91,10 @@ pub fn optimize_with_report(graph: &Graph) -> (Graph, OptimizeReport) {
             true
         }
         Err(e) => {
-            log::warn!("egglog optimization failed: {}, returning original graph", e);
+            log::warn!(
+                "egglog optimization failed: {}, returning original graph",
+                e
+            );
             false
         }
     };
@@ -234,10 +237,7 @@ fn node_to_egglog_expr(node: &Node) -> String {
         Op::SumAll => format!("(SumAll n{})", node.inputs[0]),
         Op::MeanAll => format!("(MeanAll n{})", node.inputs[0]),
         Op::CrossEntropyLoss => {
-            format!(
-                "(CrossEntropyLoss n{} n{})",
-                node.inputs[0], node.inputs[1]
-            )
+            format!("(CrossEntropyLoss n{} n{})", node.inputs[0], node.inputs[1])
         }
         Op::Greater => format!("(Greater n{} n{})", node.inputs[0], node.inputs[1]),
         Op::FusedMatMulRelu => {
@@ -353,7 +353,6 @@ fn clone_graph(graph: &Graph) -> Graph {
     new_graph
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,7 +412,12 @@ mod tests {
 
         let (_opt, report) = optimize_with_report(&g);
         assert_eq!(report.fusions_applied.len(), 2);
-        assert!(report.fusions_applied.iter().all(|(n, _)| n == "FusedMatMulRelu"));
+        assert!(
+            report
+                .fusions_applied
+                .iter()
+                .all(|(n, _)| n == "FusedMatMulRelu")
+        );
         assert_eq!(report.rules_fired.len(), 1);
         assert_eq!(report.rules_fired[0].1, 2); // fired twice
         assert!(report.nodes_after < report.nodes_before);
@@ -502,7 +506,12 @@ mod tests {
 
         let (_opt, report) = optimize_with_report(&g);
         assert_eq!(report.fusions_applied.len(), 3);
-        assert!(report.fusions_applied.iter().all(|(n, _)| n == "FusedMatMulRelu"));
+        assert!(
+            report
+                .fusions_applied
+                .iter()
+                .all(|(n, _)| n == "FusedMatMulRelu")
+        );
     }
 
     #[test]

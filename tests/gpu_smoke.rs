@@ -1,6 +1,6 @@
 /// GPU smoke test: validates that all shaders compile with blade + lavapipe
 /// and that a simple forward pass executes without errors.
-use meganeura::{build_session, Graph};
+use meganeura::{Graph, build_session};
 
 #[test]
 fn shader_compilation_and_forward_pass() {
@@ -44,6 +44,14 @@ fn shader_compilation_and_forward_pass() {
 
     // Read back loss - should be a finite number
     let loss_val = session.read_loss();
-    assert!(loss_val.is_finite(), "loss should be finite, got {}", loss_val);
-    assert!(loss_val > 0.0, "cross-entropy loss should be positive, got {}", loss_val);
+    assert!(
+        loss_val.is_finite(),
+        "loss should be finite, got {}",
+        loss_val
+    );
+    assert!(
+        loss_val > 0.0,
+        "cross-entropy loss should be positive, got {}",
+        loss_val
+    );
 }

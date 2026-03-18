@@ -91,10 +91,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
             Op::Sigmoid => {
                 // dL/dx = dL/dy * y * (1 - y)
                 let y = node.id;
-                let one = graph.constant(
-                    vec![1.0; node.ty.num_elements()],
-                    &node.ty.shape,
-                );
+                let one = graph.constant(vec![1.0; node.ty.num_elements()], &node.ty.shape);
                 let neg_y = graph.neg(y);
                 let one_minus_y = graph.add(one, neg_y);
                 let dy = graph.mul(y, one_minus_y);
@@ -119,10 +116,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 // broadcast of the scalar gradient).
                 let x = node.inputs[0];
                 let x_shape = &forward.nodes()[x as usize].ty.shape;
-                let ones = graph.constant(
-                    vec![1.0; x_shape.iter().product()],
-                    x_shape,
-                );
+                let ones = graph.constant(vec![1.0; x_shape.iter().product()], x_shape);
                 // grad_output is scalar — just use the constant directly
                 accumulate_grad(&mut graph, &mut grads, x, ones);
             }
@@ -132,10 +126,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let x_shape = &forward.nodes()[x as usize].ty.shape;
                 let n = x_shape.iter().product::<usize>() as f32;
                 let scale = 1.0 / n;
-                let scaled_ones = graph.constant(
-                    vec![scale; x_shape.iter().product()],
-                    x_shape,
-                );
+                let scaled_ones = graph.constant(vec![scale; x_shape.iter().product()], x_shape);
                 accumulate_grad(&mut graph, &mut grads, x, scaled_ones);
             }
             Op::Neg => {
@@ -156,10 +147,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 log::warn!("standalone softmax/log_softmax gradient not yet implemented");
             }
             // Leaf nodes, fused ops don't appear in forward pass before optimization
-            Op::Input { .. }
-            | Op::Parameter { .. }
-            | Op::Constant { .. }
-            | Op::Greater => {}
+            Op::Input { .. } | Op::Parameter { .. } | Op::Constant { .. } | Op::Greater => {}
             Op::Nop => {}
             Op::FusedMatMulRelu | Op::FusedMatMulBiasRelu => {
                 log::warn!("autodiff should run before fusion optimization");
@@ -170,10 +158,10 @@ pub fn differentiate(forward: &Graph) -> Graph {
     // Collect parameter gradients as outputs
     let mut param_grad_outputs = Vec::new();
     for node in forward.nodes() {
-        if let Op::Parameter { .. } = node.op {
-            if let Some(&grad_id) = grads.get(&node.id) {
-                param_grad_outputs.push((node.id, grad_id));
-            }
+        if let Op::Parameter { .. } = node.op
+            && let Some(&grad_id) = grads.get(&node.id)
+        {
+            param_grad_outputs.push((node.id, grad_id));
         }
     }
 
@@ -198,7 +186,12 @@ impl Graph {
     }
 }
 
-fn accumulate_grad(graph: &mut Graph, grads: &mut HashMap<NodeId, NodeId>, node: NodeId, grad: NodeId) {
+fn accumulate_grad(
+    graph: &mut Graph,
+    grads: &mut HashMap<NodeId, NodeId>,
+    node: NodeId,
+    grad: NodeId,
+) {
     match grads.get(&node) {
         Some(&existing) => {
             // Multiple paths contribute to this gradient — sum them

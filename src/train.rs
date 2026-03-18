@@ -74,7 +74,9 @@ pub fn build_session_with_report(forward_graph: &Graph) -> (Session, OptimizeRep
 /// Run the full pipeline (autodiff → optimize → compile) without creating a GPU session.
 ///
 /// Useful for testing the compilation pipeline in environments without GPU access.
-pub fn compile_training_graph(forward_graph: &Graph) -> (crate::compile::ExecutionPlan, OptimizeReport) {
+pub fn compile_training_graph(
+    forward_graph: &Graph,
+) -> (crate::compile::ExecutionPlan, OptimizeReport) {
     let full_graph = autodiff::differentiate(forward_graph);
     let (optimized, report) = optimize::optimize_with_report(&full_graph);
     let plan = compile::compile(&optimized);
