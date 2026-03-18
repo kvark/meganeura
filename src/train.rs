@@ -1,6 +1,7 @@
 use crate::autodiff;
 use crate::cache;
 use crate::compile;
+use crate::data::DataLoader;
 use crate::graph::Graph;
 use crate::optimize;
 use crate::optimize::OptimizeReport;
@@ -10,7 +11,12 @@ use std::path::Path;
 /// Configuration for training.
 pub struct TrainConfig {
     pub learning_rate: f32,
+    /// Print loss every `log_interval` steps. 0 disables step logging.
     pub log_interval: usize,
+    /// Name of the graph input that receives sample data (e.g. `"x"`).
+    pub data_input: String,
+    /// Name of the graph input that receives labels (e.g. `"labels"`).
+    pub label_input: String,
 }
 
 impl Default for TrainConfig {
@@ -18,7 +24,114 @@ impl Default for TrainConfig {
         Self {
             learning_rate: 0.01,
             log_interval: 100,
+            data_input: "x".into(),
+            label_input: "labels".into(),
         }
+    }
+}
+
+/// Per-epoch training statistics.
+#[derive(Clone, Debug)]
+pub struct EpochStats {
+    pub epoch: usize,
+    pub avg_loss: f32,
+    pub steps: usize,
+}
+
+/// Accumulated training history returned by [`Trainer::train`].
+#[derive(Clone, Debug, Default)]
+pub struct TrainHistory {
+    pub epochs: Vec<EpochStats>,
+}
+
+impl TrainHistory {
+    /// Final average loss (from the last epoch), or `None` if no epochs ran.
+    pub fn final_loss(&self) -> Option<f32> {
+        self.epochs.last().map(|e| e.avg_loss)
+    }
+}
+
+/// Drives the training loop over a [`Session`] and [`DataLoader`].
+///
+/// Encapsulates the epoch → batch → step → SGD update cycle, with
+/// configurable logging and loss tracking.
+pub struct Trainer {
+    session: Session,
+    config: TrainConfig,
+}
+
+impl Trainer {
+    pub fn new(session: Session, config: TrainConfig) -> Self {
+        Self { session, config }
+    }
+
+    /// Run `epochs` full passes over the data, returning training history.
+    pub fn train(&mut self, loader: &mut DataLoader, epochs: usize) -> TrainHistory {
+        let mut history = TrainHistory::default();
+        for epoch in 0..epochs {
+            let stats = self.train_epoch(loader, epoch);
+            log::info!(
+                "epoch {}: avg_loss = {:.4} ({} steps)",
+                stats.epoch,
+                stats.avg_loss,
+                stats.steps,
+            );
+            history.epochs.push(stats);
+        }
+        history
+    }
+
+    /// Run a single epoch, returning its statistics.
+    pub fn train_epoch(&mut self, loader: &mut DataLoader, epoch: usize) -> EpochStats {
+        loader.shuffle(epoch as u64);
+        loader.reset();
+
+        let mut total_loss = 0.0_f32;
+        let mut steps = 0usize;
+
+        while let Some(batch) = loader.next_batch() {
+            self.session.set_input(&self.config.data_input, batch.data);
+            self.session
+                .set_input(&self.config.label_input, batch.labels);
+
+            self.session.step();
+            self.session.wait();
+            self.session.sgd_step_cpu(self.config.learning_rate);
+
+            let loss = self.session.read_loss();
+            total_loss += loss;
+
+            if self.config.log_interval > 0 && steps.is_multiple_of(self.config.log_interval) {
+                log::info!("  epoch {} step {}: loss = {:.4}", epoch, steps, loss);
+            }
+            steps += 1;
+        }
+
+        let avg_loss = if steps > 0 {
+            total_loss / steps as f32
+        } else {
+            0.0
+        };
+        EpochStats {
+            epoch,
+            avg_loss,
+            steps,
+        }
+    }
+
+    /// Borrow the underlying session.
+    pub fn session(&self) -> &Session {
+        &self.session
+    }
+
+    /// Mutably borrow the underlying session (e.g. to set parameters).
+    pub fn session_mut(&mut self) -> &mut Session {
+        &mut self.session
+    }
+
+    /// Consume the trainer and return the session.
+    pub fn into_session(self) -> Session {
+        self.session
     }
 }
 
@@ -169,6 +282,37 @@ mod tests {
         let config = TrainConfig::default();
         assert_eq!(config.learning_rate, 0.01);
         assert_eq!(config.log_interval, 100);
+        assert_eq!(config.data_input, "x");
+        assert_eq!(config.label_input, "labels");
+    }
+
+    #[test]
+    fn test_train_history_final_loss() {
+        let mut h = TrainHistory::default();
+        assert_eq!(h.final_loss(), None);
+        h.epochs.push(EpochStats {
+            epoch: 0,
+            avg_loss: 2.5,
+            steps: 10,
+        });
+        h.epochs.push(EpochStats {
+            epoch: 1,
+            avg_loss: 1.2,
+            steps: 10,
+        });
+        assert_eq!(h.final_loss(), Some(1.2));
+    }
+
+    #[test]
+    fn test_epoch_stats_fields() {
+        let stats = EpochStats {
+            epoch: 3,
+            avg_loss: 0.42,
+            steps: 100,
+        };
+        assert_eq!(stats.epoch, 3);
+        assert!((stats.avg_loss - 0.42).abs() < 1e-6);
+        assert_eq!(stats.steps, 100);
     }
 
     #[test]

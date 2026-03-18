@@ -10,7 +10,7 @@
 /// Expected files (gzipped or raw):
 ///   data/train-images-idx3-ubyte.gz  (or without .gz)
 ///   data/train-labels-idx1-ubyte.gz  (or without .gz)
-use meganeura::{DataLoader, Graph, MnistDataset, build_session};
+use meganeura::{DataLoader, Graph, MnistDataset, TrainConfig, Trainer, build_session};
 use std::path::Path;
 
 fn main() {
@@ -78,38 +78,19 @@ fn main() {
 
     // --- Training loop ---
     println!("training...");
-    for epoch in 0..epochs {
-        loader.shuffle(epoch as u64);
-        loader.reset();
-        let mut total_loss = 0.0_f32;
-        let mut step = 0;
-        while let Some(batch) = loader.next_batch() {
-            session.set_input("x", batch.data);
-            session.set_input("labels", batch.labels);
+    let config = TrainConfig {
+        learning_rate: lr,
+        log_interval: 50,
+        ..TrainConfig::default()
+    };
+    let mut trainer = Trainer::new(session, config);
+    let history = trainer.train(&mut loader, epochs);
 
-            // Forward + backward
-            session.step();
-            session.wait();
-
-            // SGD update (CPU fallback until GPU shader binding is complete)
-            session.sgd_step_cpu(lr);
-
-            let loss_val = session.read_loss();
-            total_loss += loss_val;
-
-            if step % 50 == 0 {
-                println!("  epoch {} step {}: loss = {:.4}", epoch, step, loss_val);
-            }
-            step += 1;
-        }
-        println!(
-            "epoch {}: avg_loss = {:.4}",
-            epoch,
-            total_loss / step as f32
-        );
+    if let Some(final_loss) = history.final_loss() {
+        println!("done! final avg_loss = {:.4}", final_loss);
+    } else {
+        println!("done! (no epochs ran)");
     }
-
-    println!("done!");
 }
 
 fn load_mnist_or_synthetic(batch: usize, input_dim: usize, classes: usize) -> DataLoader {
