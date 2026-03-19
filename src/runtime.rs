@@ -128,6 +128,16 @@ struct CausalAttentionData {
     params: MatMulParams, // seq, num_heads, num_kv_heads, head_dim → reuse 4xu32
 }
 
+// layer_norm: var src, src_b (weight), bias, dst, params
+#[derive(blade_macros::ShaderData)]
+struct LayerNormData {
+    src: blade_graphics::BufferPiece,
+    src_b: blade_graphics::BufferPiece,  // weight
+    bias: blade_graphics::BufferPiece,   // bias
+    dst: blade_graphics::BufferPiece,
+    params: MatMulParams, // rows, cols, eps_bits, _pad
+}
+
 // softmax: var src, dst, params
 #[derive(blade_macros::ShaderData)]
 struct SoftmaxData {
@@ -245,6 +255,9 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::Embedding => EmbeddingData::layout(),
         ShaderEntry::RoPE => UnaryData::layout(), // same layout: src, dst, params
         ShaderEntry::CausalAttention => CausalAttentionData::layout(),
+        ShaderEntry::Gelu => UnaryData::layout(),
+        ShaderEntry::LayerNorm => LayerNormData::layout(),
+        ShaderEntry::FullAttention | ShaderEntry::CrossAttention => CausalAttentionData::layout(),
     }
 }
 
@@ -633,11 +646,45 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::CausalAttention => {
+            ShaderEntry::CausalAttention
+            | ShaderEntry::FullAttention
+            | ShaderEntry::CrossAttention => {
                 pc.bind(
                     0,
                     &CausalAttentionData {
                         src_a: buf(dispatch.input_buffers[0]),
+                        src_b: buf(dispatch.input_buffers[1]),
+                        bias: buf(dispatch.input_buffers[2]),
+                        dst: buf(dispatch.output_buffer),
+                        params: MatMulParams {
+                            m: dispatch.params[0],
+                            k: dispatch.params[1],
+                            n: dispatch.params[2],
+                            _pad: dispatch.params[3],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::Gelu => {
+                pc.bind(
+                    0,
+                    &UnaryData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: UnaryParams {
+                            len: dispatch.params[0],
+                            _pad0: 0,
+                            _pad1: 0,
+                            _pad2: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::LayerNorm => {
+                pc.bind(
+                    0,
+                    &LayerNormData {
+                        src: buf(dispatch.input_buffers[0]),
                         src_b: buf(dispatch.input_buffers[1]),
                         bias: buf(dispatch.input_buffers[2]),
                         dst: buf(dispatch.output_buffer),

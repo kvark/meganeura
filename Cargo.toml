@@ -44,5 +44,9 @@ name = "smollm2"
 path = "examples/smollm2.rs"
 
 [[example]]
+name = "smolvlm2"
+path = "examples/smolvlm2.rs"
+
+[[example]]
 name = "bench_meganeura"
 path = "bench/bench_meganeura.rs"

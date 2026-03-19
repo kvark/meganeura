@@ -152,12 +152,16 @@ pub fn differentiate(forward: &Graph) -> Graph {
             Op::FusedMatMulRelu | Op::FusedMatMulBiasRelu => {
                 log::warn!("autodiff should run before fusion optimization");
             }
-            // Transformer ops: inference-only, no autodiff support
+            // Transformer / vision ops: inference-only, no autodiff support
             Op::Silu
             | Op::RmsNorm { .. }
             | Op::Embedding
             | Op::RoPE { .. }
-            | Op::CausalAttention { .. } => {
+            | Op::CausalAttention { .. }
+            | Op::Gelu
+            | Op::LayerNorm { .. }
+            | Op::FullAttention { .. }
+            | Op::CrossAttention { .. } => {
                 log::warn!(
                     "autodiff not supported for {:?}, inference-only op",
                     node.op
