@@ -1,0 +1,15 @@
+{
+  "framework": "meganeura",
+  "model": "lerobot/smolvla_base",
+  "device": "blade-gpu",
+  "dtype": "float32",
+  "chunk_size": 50,
+  "vlm_seq_len": 16,
+  "denoise_steps": 10,
+  "runs": 3,
+  "avg_latency_ms": 64942.77,
+  "median_latency_ms": 64822.20,
+  "stdev_latency_ms": 271.71,
+  "avg_per_step_ms": 6494.28,
+  "steps_per_second": 0.15
+}

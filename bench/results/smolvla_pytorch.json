@@ -1,0 +1,15 @@
+{
+  "framework": "pytorch",
+  "model": "lerobot/smolvla_base",
+  "device": "cpu",
+  "dtype": "float32",
+  "chunk_size": 50,
+  "vlm_seq_len": 16,
+  "denoise_steps": 10,
+  "runs": 3,
+  "avg_latency_ms": 547.5587593333936,
+  "median_latency_ms": 541.6265440001098,
+  "stdev_latency_ms": 12.119502333779167,
+  "avg_per_step_ms": 54.75587593333936,
+  "steps_per_second": 18.262880155865194
+}
