@@ -260,6 +260,19 @@ fn node_to_egglog_expr(node: &Node) -> String {
             "(CausalAttention n{} n{} n{})",
             node.inputs[0], node.inputs[1], node.inputs[2]
         ),
+        Op::Gelu => format!("(Gelu n{})", node.inputs[0]),
+        Op::LayerNorm { .. } => format!(
+            "(LayerNorm n{} n{} n{})",
+            node.inputs[0], node.inputs[1], node.inputs[2]
+        ),
+        Op::FullAttention { .. } => format!(
+            "(FullAttention n{} n{} n{})",
+            node.inputs[0], node.inputs[1], node.inputs[2]
+        ),
+        Op::CrossAttention { .. } => format!(
+            "(CrossAttention n{} n{} n{})",
+            node.inputs[0], node.inputs[1], node.inputs[2]
+        ),
         Op::Nop => unreachable!("Nop nodes should be filtered before conversion"),
     }
 }

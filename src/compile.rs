@@ -26,6 +26,10 @@ pub enum ShaderEntry {
     Embedding,
     RoPE,
     CausalAttention,
+    Gelu,
+    LayerNorm,
+    FullAttention,
+    CrossAttention,
 }
 
 impl ShaderEntry {
@@ -48,6 +52,10 @@ impl ShaderEntry {
             ShaderEntry::Embedding => ShaderGroup::Embedding,
             ShaderEntry::RoPE => ShaderGroup::RoPE,
             ShaderEntry::CausalAttention => ShaderGroup::CausalAttention,
+            ShaderEntry::Gelu => ShaderGroup::Unary,
+            ShaderEntry::LayerNorm => ShaderGroup::LayerNorm,
+            ShaderEntry::FullAttention => ShaderGroup::FullAttention,
+            ShaderEntry::CrossAttention => ShaderGroup::CrossAttention,
         }
     }
 
@@ -74,6 +82,10 @@ impl ShaderEntry {
             ShaderEntry::Embedding => "main",
             ShaderEntry::RoPE => "main",
             ShaderEntry::CausalAttention => "main",
+            ShaderEntry::Gelu => "gelu",
+            ShaderEntry::LayerNorm => "main",
+            ShaderEntry::FullAttention => "main",
+            ShaderEntry::CrossAttention => "main",
         }
     }
 }
@@ -439,6 +451,64 @@ impl<'a> Compiler<'a> {
                     input_buffers: vec![q, k, v],
                     output_buffer: out_buf,
                     params: vec![seq, num_heads, num_kv_heads, head_dim],
+                });
+            }
+
+            Op::Gelu => {
+                self.emit_unary(ShaderEntry::Gelu, node, out_buf);
+            }
+
+            Op::LayerNorm { eps } => {
+                let x = self.get_buffer(node.inputs[0]);
+                let w = self.get_buffer(node.inputs[1]);
+                let bias = self.get_buffer(node.inputs[2]);
+                let shape = &self.graph.node(node.inputs[0]).ty.shape;
+                let rows = shape[0] as u32;
+                let cols = shape[1] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::LayerNorm,
+                    workgroups: [ceil_div(rows, 256), 1, 1],
+                    input_buffers: vec![x, w, bias],
+                    output_buffer: out_buf,
+                    params: vec![rows, cols, eps.to_bits(), 0],
+                });
+            }
+
+            Op::FullAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            } => {
+                let q = self.get_buffer(node.inputs[0]);
+                let k = self.get_buffer(node.inputs[1]);
+                let v = self.get_buffer(node.inputs[2]);
+                let seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::FullAttention,
+                    workgroups: [ceil_div(seq, 1), num_heads, 1],
+                    input_buffers: vec![q, k, v],
+                    output_buffer: out_buf,
+                    params: vec![seq, num_heads, num_kv_heads, head_dim],
+                });
+            }
+
+            Op::CrossAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            } => {
+                let q = self.get_buffer(node.inputs[0]);
+                let k = self.get_buffer(node.inputs[1]);
+                let v = self.get_buffer(node.inputs[2]);
+                let q_seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
+                let kv_seq = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::CrossAttention,
+                    workgroups: [ceil_div(q_seq, 1), num_heads, 1],
+                    input_buffers: vec![q, k, v],
+                    output_buffer: out_buf,
+                    // Pack both seq lengths: q_seq in first, kv_seq encoded via head_dim slot
+                    params: vec![q_seq, kv_seq, (num_heads << 16) | num_kv_heads, head_dim],
                 });
             }
         }

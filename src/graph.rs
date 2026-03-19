@@ -119,6 +119,31 @@ pub enum Op {
         num_kv_heads: u32,
         head_dim: u32,
     },
+
+    // --- Vision / VLA ops ---
+
+    // GELU activation: x * 0.5 * (1 + erf(x / sqrt(2)))
+    Gelu,
+
+    // Standard Layer Normalization: (x - mean) / sqrt(var + eps) * weight + bias
+    // inputs: [x, weight, bias]
+    LayerNorm { eps: f32 },
+
+    // Non-causal (full) multi-head attention with GQA
+    // inputs: [q, k, v] as 2D: q=[seq, num_heads*head_dim], k/v=[seq, num_kv_heads*head_dim]
+    FullAttention {
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+    },
+
+    // Cross-attention: query attends to key/value from a different sequence
+    // inputs: [q, k, v] where q=[q_seq, num_heads*head_dim], k/v=[kv_seq, num_kv_heads*head_dim]
+    CrossAttention {
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -372,6 +397,92 @@ impl Graph {
         let ty = TensorType::f32(vec![seq, (num_heads * head_dim) as usize]);
         self.add_node(
             Op::CausalAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            },
+            vec![q, k, v],
+            ty,
+        )
+    }
+
+    // --- Vision / VLA ops ---
+
+    pub fn gelu(&mut self, x: NodeId) -> NodeId {
+        let ty = self.node(x).ty.clone();
+        self.add_node(Op::Gelu, vec![x], ty)
+    }
+
+    pub fn layer_norm(&mut self, x: NodeId, weight: NodeId, bias: NodeId, eps: f32) -> NodeId {
+        let x_shape = &self.node(x).ty.shape;
+        let w_shape = &self.node(weight).ty.shape;
+        let b_shape = &self.node(bias).ty.shape;
+        assert_eq!(x_shape.len(), 2, "layer_norm requires 2D input");
+        assert_eq!(w_shape.len(), 1, "layer_norm weight must be 1D");
+        assert_eq!(b_shape.len(), 1, "layer_norm bias must be 1D");
+        assert_eq!(x_shape[1], w_shape[0], "layer_norm weight size must match last dim");
+        assert_eq!(x_shape[1], b_shape[0], "layer_norm bias size must match last dim");
+        let ty = self.node(x).ty.clone();
+        self.add_node(Op::LayerNorm { eps }, vec![x, weight, bias], ty)
+    }
+
+    pub fn full_attention(
+        &mut self,
+        q: NodeId,
+        k: NodeId,
+        v: NodeId,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+    ) -> NodeId {
+        let q_shape = &self.node(q).ty.shape;
+        let k_shape = &self.node(k).ty.shape;
+        let v_shape = &self.node(v).ty.shape;
+        assert_eq!(q_shape.len(), 2, "q must be 2D");
+        assert_eq!(k_shape.len(), 2, "k must be 2D");
+        assert_eq!(v_shape.len(), 2, "v must be 2D");
+        let seq = q_shape[0];
+        assert_eq!(q_shape[1], (num_heads * head_dim) as usize, "q dim mismatch");
+        assert_eq!(k_shape[0], seq, "k seq must match q seq");
+        assert_eq!(k_shape[1], (num_kv_heads * head_dim) as usize, "k dim mismatch");
+        assert_eq!(v_shape[0], seq, "v seq must match q seq");
+        assert_eq!(v_shape[1], (num_kv_heads * head_dim) as usize, "v dim mismatch");
+        let ty = TensorType::f32(vec![seq, (num_heads * head_dim) as usize]);
+        self.add_node(
+            Op::FullAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            },
+            vec![q, k, v],
+            ty,
+        )
+    }
+
+    pub fn cross_attention(
+        &mut self,
+        q: NodeId,
+        k: NodeId,
+        v: NodeId,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+    ) -> NodeId {
+        let q_shape = &self.node(q).ty.shape;
+        let k_shape = &self.node(k).ty.shape;
+        let v_shape = &self.node(v).ty.shape;
+        assert_eq!(q_shape.len(), 2, "q must be 2D");
+        assert_eq!(k_shape.len(), 2, "k must be 2D");
+        assert_eq!(v_shape.len(), 2, "v must be 2D");
+        let q_seq = q_shape[0];
+        let kv_seq = k_shape[0];
+        assert_eq!(q_shape[1], (num_heads * head_dim) as usize, "q dim mismatch");
+        assert_eq!(k_shape[1], (num_kv_heads * head_dim) as usize, "k dim mismatch");
+        assert_eq!(v_shape[0], kv_seq, "v seq must match k seq");
+        assert_eq!(v_shape[1], (num_kv_heads * head_dim) as usize, "v dim mismatch");
+        let ty = TensorType::f32(vec![q_seq, (num_heads * head_dim) as usize]);
+        self.add_node(
+            Op::CrossAttention {
                 num_heads,
                 num_kv_heads,
                 head_dim,
