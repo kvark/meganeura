@@ -240,8 +240,16 @@ fn write_pftrace(path: &Path, events: &[TraceEvent]) -> std::io::Result<()> {
     pkt.uint32(10, 1);
     trace.message(1, &pkt);
 
+    // Sort events by timestamp so Perfetto sees them in order within the
+    // shared packet sequence. GPU pass events are appended after CPU events
+    // but carry earlier timestamps (the submit offset), which causes
+    // "misplaced End" warnings if written in insertion order.
+    let mut sorted: Vec<usize> = (0..events.len()).collect();
+    sorted.sort_by_key(|&i| events[i].timestamp_ns);
+
     // Event packets.
-    for ev in events {
+    for &i in &sorted {
+        let ev = &events[i];
         let mut te = ProtoBuf::new();
         te.uint64(11, ev.track_uuid); // track_uuid
         te.int32(9, ev.kind as i32); // type enum
