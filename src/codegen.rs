@@ -509,6 +509,8 @@ pub enum ShaderGroup {
     MatMul,
     MatMulRelu,
     MatMulBiasRelu,
+    MatMulSilu,
+    MatMulGelu,
     Reduce,
     Softmax,
     CrossEntropy,
@@ -532,6 +534,8 @@ pub fn generate_module(group: ShaderGroup) -> Module {
         ShaderGroup::MatMul => gen_matmul(MatMulFusion::None),
         ShaderGroup::MatMulRelu => gen_matmul(MatMulFusion::Relu),
         ShaderGroup::MatMulBiasRelu => gen_matmul(MatMulFusion::BiasRelu),
+        ShaderGroup::MatMulSilu => gen_matmul(MatMulFusion::Silu),
+        ShaderGroup::MatMulGelu => gen_matmul(MatMulFusion::Gelu),
         ShaderGroup::Reduce => gen_reduce(),
         ShaderGroup::Softmax => gen_softmax(),
         ShaderGroup::CrossEntropy => gen_cross_entropy(),
@@ -1005,6 +1009,8 @@ enum MatMulFusion {
     None,
     Relu,
     BiasRelu,
+    Silu,
+    Gelu,
 }
 
 fn gen_matmul(fusion: MatMulFusion) -> Module {
@@ -1295,6 +1301,36 @@ fn gen_matmul(fusion: MatMulFusion) -> Module {
             let relu_val = f.math2(MathFunction::Max, biased, zero);
             f.emit(bias_ptr, relu_val);
             relu_val
+        }
+        // silu: x * sigmoid(x) = x / (1 + exp(-x))
+        MatMulFusion::Silu => {
+            let neg_val = f.unary(UnaryOperator::Negate, final_val);
+            let exp_neg = f.math1(MathFunction::Exp, neg_val);
+            let one = f.literal_f32(1.0);
+            let denom = f.binary(BinaryOperator::Add, one, exp_neg);
+            let one2 = f.literal_f32(1.0);
+            let sigmoid = f.binary(BinaryOperator::Divide, one2, denom);
+            let silu_val = f.binary(BinaryOperator::Multiply, final_val, sigmoid);
+            f.emit(neg_val, silu_val);
+            silu_val
+        }
+        // gelu: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+        MatMulFusion::Gelu => {
+            let sqrt_2_pi = f.literal_f32(0.797_884_6);
+            let coeff = f.literal_f32(0.044715);
+            let half = f.literal_f32(0.5);
+            let one = f.literal_f32(1.0);
+            let x2 = f.binary(BinaryOperator::Multiply, final_val, final_val);
+            let x3 = f.binary(BinaryOperator::Multiply, x2, final_val);
+            let cx3 = f.binary(BinaryOperator::Multiply, coeff, x3);
+            let inner = f.binary(BinaryOperator::Add, final_val, cx3);
+            let scaled = f.binary(BinaryOperator::Multiply, sqrt_2_pi, inner);
+            let tanh_val = f.math1(MathFunction::Tanh, scaled);
+            let one_plus_tanh = f.binary(BinaryOperator::Add, one, tanh_val);
+            let half_x = f.binary(BinaryOperator::Multiply, half, final_val);
+            let gelu_val = f.binary(BinaryOperator::Multiply, half_x, one_plus_tanh);
+            f.emit(sqrt_2_pi, gelu_val);
+            gelu_val
         }
     };
 
@@ -3330,6 +3366,8 @@ mod tests {
             ShaderGroup::MatMul,
             ShaderGroup::MatMulRelu,
             ShaderGroup::MatMulBiasRelu,
+            ShaderGroup::MatMulSilu,
+            ShaderGroup::MatMulGelu,
             ShaderGroup::Reduce,
             ShaderGroup::Softmax,
             ShaderGroup::CrossEntropy,

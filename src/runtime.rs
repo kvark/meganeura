@@ -239,7 +239,7 @@ impl Pipelines {
 fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
     use blade_graphics::ShaderData;
     match *entry {
-        ShaderEntry::MatMul | ShaderEntry::MatMulRelu => MatMulData::layout(),
+        ShaderEntry::MatMul | ShaderEntry::MatMulRelu | ShaderEntry::MatMulSilu | ShaderEntry::MatMulGelu => MatMulData::layout(),
         ShaderEntry::MatMulBiasRelu => MatMulBiasReluData::layout(),
         ShaderEntry::Relu | ShaderEntry::Sigmoid | ShaderEntry::Neg | ShaderEntry::Silu => {
             UnaryData::layout()
@@ -441,7 +441,7 @@ impl Session {
     ) {
         let buf = |r: BufferRef| buffers[r.0 as usize].at(0);
         match dispatch.shader {
-            ShaderEntry::MatMul | ShaderEntry::MatMulRelu => {
+            ShaderEntry::MatMul | ShaderEntry::MatMulRelu | ShaderEntry::MatMulSilu | ShaderEntry::MatMulGelu => {
                 pc.bind(
                     0,
                     &MatMulData {

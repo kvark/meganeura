@@ -82,6 +82,8 @@ pub enum Op {
     // Fused ops (created by optimizer)
     FusedMatMulRelu,
     FusedMatMulBiasRelu,
+    FusedMatMulSilu,
+    FusedMatMulGelu,
 
     // Transpose (swap last two dims)
     Transpose,

@@ -181,12 +181,18 @@ fn graph_to_egglog(graph: &Graph) -> String {
   ; Fused ops
   (FusedMatMulRelu Op Op)
   (FusedMatMulBiasRelu Op Op Op)
+  (FusedMatMulSilu Op Op)
+  (FusedMatMulGelu Op Op)
   ; Transformer ops (passthrough, no fusion rules)
   (Silu Op)
+  (Gelu Op)
   (RmsNorm Op Op)
   (Embedding Op Op)
   (RoPE Op)
   (CausalAttention Op Op Op)
+  (LayerNorm Op Op Op)
+  (FullAttention Op Op Op)
+  (CrossAttention Op Op Op)
 )
 
 ",
@@ -198,6 +204,8 @@ fn graph_to_egglog(graph: &Graph) -> String {
 ; --- Operator fusion ---
 (rewrite (Relu (MatMul ?a ?b)) (FusedMatMulRelu ?a ?b))
 (rewrite (Relu (BiasAdd (MatMul ?a ?b) ?c)) (FusedMatMulBiasRelu ?a ?b ?c))
+(rewrite (Silu (MatMul ?a ?b)) (FusedMatMulSilu ?a ?b))
+(rewrite (Gelu (MatMul ?a ?b)) (FusedMatMulGelu ?a ?b))
 
 ; --- Algebraic simplifications ---
 (rewrite (Neg (Neg ?x)) ?x)
@@ -252,6 +260,12 @@ fn node_to_egglog_expr(node: &Node) -> String {
             "(FusedMatMulBiasRelu n{} n{} n{})",
             node.inputs[0], node.inputs[1], node.inputs[2]
         ),
+        Op::FusedMatMulSilu => {
+            format!("(FusedMatMulSilu n{} n{})", node.inputs[0], node.inputs[1])
+        }
+        Op::FusedMatMulGelu => {
+            format!("(FusedMatMulGelu n{} n{})", node.inputs[0], node.inputs[1])
+        }
         Op::Silu => format!("(Silu n{})", node.inputs[0]),
         Op::RmsNorm { .. } => format!("(RmsNorm n{} n{})", node.inputs[0], node.inputs[1]),
         Op::Embedding => format!("(Embedding n{} n{})", node.inputs[0], node.inputs[1]),
@@ -344,6 +358,42 @@ fn apply_fusion_rewrites(graph: &mut Graph) -> Vec<(String, u32)> {
                         continue;
                     }
                     _ => {}
+                }
+            }
+            // Silu(MatMul(a,b)) → FusedMatMulSilu(a,b)
+            Op::Silu => {
+                let input_id = resolve(node.inputs[0], &replacements);
+                let input_node = &graph.nodes()[input_id as usize];
+                if let Op::MatMul = input_node.op {
+                    let a = resolve(input_node.inputs[0], &replacements);
+                    let b = resolve(input_node.inputs[1], &replacements);
+                    fusions.push((
+                        i,
+                        Op::FusedMatMulSilu,
+                        vec![a, b],
+                        node.ty.clone(),
+                        vec![input_id as usize],
+                        "FusedMatMulSilu",
+                    ));
+                    continue;
+                }
+            }
+            // Gelu(MatMul(a,b)) → FusedMatMulGelu(a,b)
+            Op::Gelu => {
+                let input_id = resolve(node.inputs[0], &replacements);
+                let input_node = &graph.nodes()[input_id as usize];
+                if let Op::MatMul = input_node.op {
+                    let a = resolve(input_node.inputs[0], &replacements);
+                    let b = resolve(input_node.inputs[1], &replacements);
+                    fusions.push((
+                        i,
+                        Op::FusedMatMulGelu,
+                        vec![a, b],
+                        node.ty.clone(),
+                        vec![input_id as usize],
+                        "FusedMatMulGelu",
+                    ));
+                    continue;
                 }
             }
             _ => {}
@@ -582,6 +632,44 @@ mod tests {
         let program = graph_to_egglog(&g);
         let mut egraph = egglog::EGraph::default();
         egraph.parse_and_run_program(None, &program).unwrap();
+    }
+
+    #[test]
+    fn test_fusion_matmul_silu() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 784]);
+        let w = g.parameter("w", &[784, 128]);
+        let mm = g.matmul(x, w);
+        let h = g.silu(mm);
+        g.set_outputs(vec![h]);
+
+        let opt = optimize(&g);
+        let output_id = opt.outputs()[0];
+        let output_node = opt.node(output_id);
+        assert!(
+            matches!(output_node.op, Op::FusedMatMulSilu),
+            "expected FusedMatMulSilu, got {:?}",
+            output_node.op
+        );
+    }
+
+    #[test]
+    fn test_fusion_matmul_gelu() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 784]);
+        let w = g.parameter("w", &[784, 128]);
+        let mm = g.matmul(x, w);
+        let h = g.gelu(mm);
+        g.set_outputs(vec![h]);
+
+        let opt = optimize(&g);
+        let output_id = opt.outputs()[0];
+        let output_node = opt.node(output_id);
+        assert!(
+            matches!(output_node.op, Op::FusedMatMulGelu),
+            "expected FusedMatMulGelu, got {:?}",
+            output_node.op
+        );
     }
 
     #[test]

@@ -8,6 +8,8 @@ pub enum ShaderEntry {
     MatMul,
     MatMulRelu,
     MatMulBiasRelu,
+    MatMulSilu,
+    MatMulGelu,
     Relu,
     Sigmoid,
     Neg,
@@ -39,6 +41,8 @@ impl ShaderEntry {
             ShaderEntry::MatMul => ShaderGroup::MatMul,
             ShaderEntry::MatMulRelu => ShaderGroup::MatMulRelu,
             ShaderEntry::MatMulBiasRelu => ShaderGroup::MatMulBiasRelu,
+            ShaderEntry::MatMulSilu => ShaderGroup::MatMulSilu,
+            ShaderEntry::MatMulGelu => ShaderGroup::MatMulGelu,
             ShaderEntry::Relu | ShaderEntry::Sigmoid | ShaderEntry::Neg => ShaderGroup::Unary,
             ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater => ShaderGroup::Binary,
             ShaderEntry::BiasAdd => ShaderGroup::BiasAdd,
@@ -64,6 +68,8 @@ impl ShaderEntry {
             ShaderEntry::MatMul
             | ShaderEntry::MatMulRelu
             | ShaderEntry::MatMulBiasRelu
+            | ShaderEntry::MatMulSilu
+            | ShaderEntry::MatMulGelu
             | ShaderEntry::BiasAdd
             | ShaderEntry::SgdUpdate
             | ShaderEntry::Softmax
@@ -246,6 +252,40 @@ impl<'a> Compiler<'a> {
                 let n = b_shape[1] as u32;
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::MatMulRelu,
+                    workgroups: [ceil_div(n, 16), ceil_div(m, 16), 1],
+                    input_buffers: vec![a, b],
+                    output_buffer: out_buf,
+                    params: vec![m, k, n, 0],
+                });
+            }
+
+            Op::FusedMatMulSilu => {
+                let a = self.get_buffer(node.inputs[0]);
+                let b = self.get_buffer(node.inputs[1]);
+                let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
+                let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
+                let m = a_shape[0] as u32;
+                let k = a_shape[1] as u32;
+                let n = b_shape[1] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::MatMulSilu,
+                    workgroups: [ceil_div(n, 16), ceil_div(m, 16), 1],
+                    input_buffers: vec![a, b],
+                    output_buffer: out_buf,
+                    params: vec![m, k, n, 0],
+                });
+            }
+
+            Op::FusedMatMulGelu => {
+                let a = self.get_buffer(node.inputs[0]);
+                let b = self.get_buffer(node.inputs[1]);
+                let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
+                let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
+                let m = a_shape[0] as u32;
+                let k = a_shape[1] as u32;
+                let n = b_shape[1] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::MatMulGelu,
                     workgroups: [ceil_div(n, 16), ceil_div(m, 16), 1],
                     input_buffers: vec![a, b],
                     output_buffer: out_buf,
@@ -781,6 +821,8 @@ mod tests {
             ShaderEntry::MatMul,
             ShaderEntry::MatMulRelu,
             ShaderEntry::MatMulBiasRelu,
+            ShaderEntry::MatMulSilu,
+            ShaderEntry::MatMulGelu,
             ShaderEntry::Relu,
             ShaderEntry::Sigmoid,
             ShaderEntry::Neg,
