@@ -239,7 +239,9 @@ impl Pipelines {
 fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
     use blade_graphics::ShaderData;
     match *entry {
-        ShaderEntry::MatMul | ShaderEntry::MatMulRelu | ShaderEntry::MatMulSilu | ShaderEntry::MatMulGelu => MatMulData::layout(),
+        ShaderEntry::MatMul | ShaderEntry::MatMulRelu | ShaderEntry::MatMulSilu | ShaderEntry::MatMulGelu
+        | ShaderEntry::MatMulSplitK => MatMulData::layout(),
+        ShaderEntry::MatMulSplitKFinalize => UnaryData::layout(),
         ShaderEntry::MatMulBiasRelu => MatMulBiasReluData::layout(),
         ShaderEntry::Relu | ShaderEntry::Sigmoid | ShaderEntry::Neg | ShaderEntry::Silu => {
             UnaryData::layout()
@@ -441,7 +443,8 @@ impl Session {
     ) {
         let buf = |r: BufferRef| buffers[r.0 as usize].at(0);
         match dispatch.shader {
-            ShaderEntry::MatMul | ShaderEntry::MatMulRelu | ShaderEntry::MatMulSilu | ShaderEntry::MatMulGelu => {
+            ShaderEntry::MatMul | ShaderEntry::MatMulRelu | ShaderEntry::MatMulSilu | ShaderEntry::MatMulGelu
+            | ShaderEntry::MatMulSplitK => {
                 pc.bind(
                     0,
                     &MatMulData {
@@ -452,7 +455,22 @@ impl Session {
                             m: dispatch.params[0],
                             k: dispatch.params[1],
                             n: dispatch.params[2],
-                            _pad: 0,
+                            _pad: dispatch.params[3],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::MatMulSplitKFinalize => {
+                pc.bind(
+                    0,
+                    &UnaryData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: UnaryParams {
+                            len: dispatch.params[0],
+                            _pad0: dispatch.params[1],
+                            _pad1: 0,
+                            _pad2: 0,
                         },
                     },
                 );

@@ -10,6 +10,8 @@ pub enum ShaderEntry {
     MatMulBiasRelu,
     MatMulSilu,
     MatMulGelu,
+    MatMulSplitK,
+    MatMulSplitKFinalize,
     Relu,
     Sigmoid,
     Neg,
@@ -43,6 +45,8 @@ impl ShaderEntry {
             ShaderEntry::MatMulBiasRelu => ShaderGroup::MatMulBiasRelu,
             ShaderEntry::MatMulSilu => ShaderGroup::MatMulSilu,
             ShaderEntry::MatMulGelu => ShaderGroup::MatMulGelu,
+            ShaderEntry::MatMulSplitK => ShaderGroup::MatMulSplitK,
+            ShaderEntry::MatMulSplitKFinalize => ShaderGroup::MatMulSplitKFinalize,
             ShaderEntry::Relu | ShaderEntry::Sigmoid | ShaderEntry::Neg => ShaderGroup::Unary,
             ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater => ShaderGroup::Binary,
             ShaderEntry::BiasAdd => ShaderGroup::BiasAdd,
@@ -70,6 +74,8 @@ impl ShaderEntry {
             | ShaderEntry::MatMulBiasRelu
             | ShaderEntry::MatMulSilu
             | ShaderEntry::MatMulGelu
+            | ShaderEntry::MatMulSplitK
+            | ShaderEntry::MatMulSplitKFinalize
             | ShaderEntry::BiasAdd
             | ShaderEntry::SgdUpdate
             | ShaderEntry::Softmax
@@ -142,6 +148,8 @@ struct Compiler<'a> {
     plan: ExecutionPlan,
     /// Map from NodeId → BufferRef for each node's output.
     node_buffers: HashMap<NodeId, BufferRef>,
+    /// Intermediate buffers for multi-dispatch ops (e.g. split-K partial sums).
+    split_k_buffers: HashMap<NodeId, BufferRef>,
 }
 
 impl<'a> Compiler<'a> {
@@ -157,6 +165,7 @@ impl<'a> Compiler<'a> {
                 param_grad_pairs: Vec::new(),
             },
             node_buffers: HashMap::new(),
+            split_k_buffers: HashMap::new(),
         }
     }
 
@@ -185,6 +194,17 @@ impl<'a> Compiler<'a> {
                     self.plan.input_buffers.push((name.clone(), buf));
                 }
                 _ => {}
+            }
+        }
+
+        // Allocate intermediate buffers for split-K nodes (partial sums).
+        // Each split produces M*N f32 values, so the intermediate is num_splits * M * N * 4 bytes.
+        for node in self.graph.nodes() {
+            if let Op::MatMulSplitK { num_splits } = node.op {
+                let out_elements = node.ty.num_elements(); // M * N
+                let intermediate_size = (num_splits as usize) * out_elements * 4;
+                let buf = self.alloc_buffer(intermediate_size);
+                self.split_k_buffers.insert(node.id, buf);
             }
         }
 
@@ -239,6 +259,35 @@ impl<'a> Compiler<'a> {
                     input_buffers: vec![a, b],
                     output_buffer: out_buf,
                     params: vec![m, k, n, 0],
+                });
+            }
+
+            Op::MatMulSplitK { num_splits } => {
+                let a = self.get_buffer(node.inputs[0]);
+                let b = self.get_buffer(node.inputs[1]);
+                let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
+                let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
+                let m = a_shape[0] as u32;
+                let k = a_shape[1] as u32;
+                let n = b_shape[1] as u32;
+                let partial_buf = self.split_k_buffers[&node.id];
+
+                // Dispatch 1: each z-slice computes a partial sum over its K range
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::MatMulSplitK,
+                    workgroups: [ceil_div(n, 16), ceil_div(m, 16), num_splits],
+                    input_buffers: vec![a, b],
+                    output_buffer: partial_buf,
+                    params: vec![m, k, n, num_splits],
+                });
+
+                // Dispatch 2: reduce partial sums across splits → final output
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::MatMulSplitKFinalize,
+                    workgroups: [ceil_div(m * n, 256), 1, 1],
+                    input_buffers: vec![partial_buf],
+                    output_buffer: out_buf,
+                    params: vec![m * n, num_splits, 0, 0],
                 });
             }
 
@@ -823,6 +872,8 @@ mod tests {
             ShaderEntry::MatMulBiasRelu,
             ShaderEntry::MatMulSilu,
             ShaderEntry::MatMulGelu,
+            ShaderEntry::MatMulSplitK,
+            ShaderEntry::MatMulSplitKFinalize,
             ShaderEntry::Relu,
             ShaderEntry::Sigmoid,
             ShaderEntry::Neg,

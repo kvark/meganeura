@@ -85,6 +85,11 @@ pub enum Op {
     FusedMatMulSilu,
     FusedMatMulGelu,
 
+    // Split-K MatMul: splits K-reduction across workgroups for better
+    // parallelism when M or N is small relative to K (e.g. inference).
+    // Compiles to two dispatches: partial accumulation + finalize reduction.
+    MatMulSplitK { num_splits: u32 },
+
     // Transpose (swap last two dims)
     Transpose,
 

@@ -183,6 +183,8 @@ fn graph_to_egglog(graph: &Graph) -> String {
   (FusedMatMulBiasRelu Op Op Op)
   (FusedMatMulSilu Op Op)
   (FusedMatMulGelu Op Op)
+  ; Split-K: equivalent to MatMul but compiled with K-parallel strategy
+  (MatMulSplitK Op Op)
   ; Transformer ops (passthrough, no fusion rules)
   (Silu Op)
   (Gelu Op)
@@ -206,6 +208,9 @@ fn graph_to_egglog(graph: &Graph) -> String {
 (rewrite (Relu (BiasAdd (MatMul ?a ?b) ?c)) (FusedMatMulBiasRelu ?a ?b ?c))
 (rewrite (Silu (MatMul ?a ?b)) (FusedMatMulSilu ?a ?b))
 (rewrite (Gelu (MatMul ?a ?b)) (FusedMatMulGelu ?a ?b))
+
+; --- Split-K exploration: e-graph explores both strategies ---
+(rewrite (MatMul ?a ?b) (MatMulSplitK ?a ?b))
 
 ; --- Algebraic simplifications ---
 (rewrite (Neg (Neg ?x)) ?x)
@@ -253,6 +258,9 @@ fn node_to_egglog_expr(node: &Node) -> String {
             format!("(CrossEntropyLoss n{} n{})", node.inputs[0], node.inputs[1])
         }
         Op::Greater => format!("(Greater n{} n{})", node.inputs[0], node.inputs[1]),
+        Op::MatMulSplitK { .. } => {
+            format!("(MatMulSplitK n{} n{})", node.inputs[0], node.inputs[1])
+        }
         Op::FusedMatMulRelu => {
             format!("(FusedMatMulRelu n{} n{})", node.inputs[0], node.inputs[1])
         }
@@ -301,7 +309,8 @@ fn extract_graph_with_fusions(
     original: &Graph,
 ) -> (Graph, Vec<(String, u32)>) {
     let mut graph = clone_graph(original);
-    let fusions = apply_fusion_rewrites(&mut graph);
+    let mut fusions = apply_fusion_rewrites(&mut graph);
+    fusions.extend(apply_split_k_rewrites(&mut graph));
     (graph, fusions)
 }
 
@@ -412,6 +421,39 @@ fn apply_fusion_rewrites(graph: &mut Graph) -> Vec<(String, u32)> {
             nodes[d].op = Op::Nop;
             nodes[d].inputs.clear();
         }
+    }
+    applied
+}
+
+/// Convert standalone MatMul nodes to MatMulSplitK when K is large relative
+/// to M and N. This improves GPU occupancy on shapes like [1, 4096] × [4096, 1024]
+/// where the output tile grid is small but K provides ample parallelism.
+fn apply_split_k_rewrites(graph: &mut Graph) -> Vec<(String, u32)> {
+    let mut applied = Vec::new();
+    let nodes = graph.nodes_mut();
+    for i in 0..nodes.len() {
+        if !matches!(nodes[i].op, Op::MatMul) {
+            continue;
+        }
+        // Look up input shapes to decide split-K eligibility
+        let a_id = nodes[i].inputs[0] as usize;
+        let b_id = nodes[i].inputs[1] as usize;
+        let m = nodes[a_id].ty.shape[0] as u32;
+        let k = nodes[a_id].ty.shape[1] as u32;
+        let n = nodes[b_id].ty.shape[1] as u32;
+
+        // Heuristic: split-K when K is large and the output tile grid is small.
+        // The output grid is ceil(M/16)*ceil(N/16) tiles; if that's small (<= 32)
+        // but K is large (>= 256), splitting K across workgroups helps.
+        let output_tiles = m.div_ceil(16) * n.div_ceil(16);
+        if output_tiles > 32 || k < 256 {
+            continue;
+        }
+        // Choose num_splits: each split should handle >= 64 K-elements,
+        // cap at 16 splits to avoid excessive overhead.
+        let num_splits = (k / 64).clamp(2, 16);
+        nodes[i].op = Op::MatMulSplitK { num_splits };
+        applied.push(("MatMulSplitK".to_string(), i as u32));
     }
     applied
 }
@@ -669,6 +711,82 @@ mod tests {
             matches!(output_node.op, Op::FusedMatMulGelu),
             "expected FusedMatMulGelu, got {:?}",
             output_node.op
+        );
+    }
+
+    #[test]
+    fn test_split_k_matmul_triggered() {
+        // Small M, large K → split-K should activate
+        let mut g = Graph::new();
+        let x = g.input("x", &[2, 1024]);
+        let w = g.parameter("w", &[1024, 64]);
+        let y = g.matmul(x, w);
+        g.set_outputs(vec![y]);
+
+        let opt = optimize(&g);
+        let output_id = opt.outputs()[0];
+        let output_node = opt.node(output_id);
+        assert!(
+            matches!(output_node.op, Op::MatMulSplitK { .. }),
+            "expected MatMulSplitK, got {:?}",
+            output_node.op
+        );
+        if let Op::MatMulSplitK { num_splits } = output_node.op {
+            assert!(num_splits >= 2, "expected at least 2 splits, got {num_splits}");
+            assert!(num_splits <= 16, "expected at most 16 splits, got {num_splits}");
+        }
+    }
+
+    #[test]
+    fn test_split_k_not_triggered_large_output() {
+        // Large M and N → output tile grid is big, split-K should NOT activate
+        let mut g = Graph::new();
+        let x = g.input("x", &[128, 256]);
+        let w = g.parameter("w", &[256, 128]);
+        let y = g.matmul(x, w);
+        g.set_outputs(vec![y]);
+
+        let opt = optimize(&g);
+        let output_id = opt.outputs()[0];
+        let output_node = opt.node(output_id);
+        assert!(
+            matches!(output_node.op, Op::MatMul),
+            "expected MatMul (no split-K), got {:?}",
+            output_node.op
+        );
+    }
+
+    #[test]
+    fn test_split_k_compile_dual_dispatch() {
+        // Verify that split-K compiles to 2 dispatches
+        let mut g = Graph::new();
+        let x = g.input("x", &[2, 512]);
+        let w = g.parameter("w", &[512, 32]);
+        let y = g.matmul(x, w);
+        g.set_outputs(vec![y]);
+
+        let opt = optimize(&g);
+        let plan = crate::compile::compile(&opt);
+        // Should have 2 dispatches: split-K partial + finalize
+        assert_eq!(
+            plan.dispatches.len(),
+            2,
+            "expected 2 dispatches for split-K, got {}",
+            plan.dispatches.len()
+        );
+        assert_eq!(
+            plan.dispatches[0].shader,
+            crate::compile::ShaderEntry::MatMulSplitK
+        );
+        assert_eq!(
+            plan.dispatches[1].shader,
+            crate::compile::ShaderEntry::MatMulSplitKFinalize
+        );
+        // Z-dimension of first dispatch should be > 1
+        assert!(
+            plan.dispatches[0].workgroups[2] > 1,
+            "expected Z > 1 for split-K, got {:?}",
+            plan.dispatches[0].workgroups
         );
     }
 
