@@ -1374,7 +1374,7 @@ fn gen_matmul_split_k() -> Module {
     let ty_params = b.params_u32x4("Params", &["m", "k", "n", "num_splits"]);
     let gv_a = b.storage_ro("a");
     let gv_b = b.storage_ro("b");
-    let gv_partial = b.storage_rw("partial");
+    let gv_c = b.storage_rw("c"); // output partial sums (blade binds by name via MatMulData)
     let gv_params = b.uniform("params", ty_params);
     let gv_tile_a = b.workgroup_array("tile_a", 256);
     let gv_tile_b = b.workgroup_array("tile_b", 256);
@@ -1595,13 +1595,13 @@ fn gen_matmul_split_k() -> Module {
     let row_n = f.binary(BinaryOperator::Multiply, row, pn);
     let rc = f.binary(BinaryOperator::Add, row_n, col);
     let out_idx = f.binary(BinaryOperator::Add, split_offset, rc);
-    let p_ptr = f.global(gv_partial);
-    let p_elem = f.index(p_ptr, out_idx);
+    let c_ptr = f.global(gv_c);
+    let c_elem = f.index(c_ptr, out_idx);
     let final_val = f.load(sum_ptr);
 
     f.emit(r_lt_m, final_val);
 
-    let store_block = Block::from_vec(vec![f.store(p_elem, final_val)]);
+    let store_block = Block::from_vec(vec![f.store(c_elem, final_val)]);
     f.f.body.push(
         Statement::If {
             condition: store_cond,
@@ -1626,8 +1626,8 @@ fn gen_matmul_split_k() -> Module {
 fn gen_matmul_split_k_finalize() -> Module {
     let mut b = Builder::new();
     let ty_params = b.params_u32x4("Params", &["total", "num_splits", "_pad0", "_pad1"]);
-    let gv_partial = b.storage_ro("partial");
-    let gv_out = b.storage_rw("out");
+    let gv_src = b.storage_ro("src"); // partial sums input (blade binds by name via UnaryData)
+    let gv_dst = b.storage_rw("dst"); // final output
     let gv_params = b.uniform("params", ty_params);
 
     let mut f = FnBuilder::new(&b);
@@ -1670,7 +1670,7 @@ fn gen_matmul_split_k_finalize() -> Module {
         let s_break = f.binary(BinaryOperator::GreaterEqual, s_val, num_splits);
         let s_off = f.binary(BinaryOperator::Multiply, s_val, total);
         let p_idx = f.binary(BinaryOperator::Add, s_off, idx);
-        let p_ptr = f.global(gv_partial);
+        let p_ptr = f.global(gv_src);
         let p_elem = f.index(p_ptr, p_idx);
         let p_val = f.load(p_elem);
         let old_sum = f.load(sum_ptr);
@@ -1699,7 +1699,7 @@ fn gen_matmul_split_k_finalize() -> Module {
     );
 
     // Store result
-    let out_ptr = f.global(gv_out);
+    let out_ptr = f.global(gv_dst);
     let out_elem = f.index(out_ptr, idx);
     let result = f.load(sum_ptr);
     f.emit(out_ptr, result);
@@ -3790,5 +3790,98 @@ mod tests {
     #[test]
     fn test_causal_attention_wgsl() {
         let _ = generate_wgsl(ShaderGroup::CausalAttention);
+    }
+
+    /// Verify that shader global variable names match the runtime ShaderData
+    /// struct field names. Blade resolves bindings by name — a mismatch causes
+    /// a runtime panic ("Unable to resolve binding for ...").
+    #[test]
+    fn shader_globals_match_runtime_bindings() {
+        use std::collections::HashSet;
+        use crate::compile::ShaderEntry;
+
+        // Expected global variable names for each ShaderEntry, derived from
+        // the runtime ShaderData structs. Workgroup vars (tile_a, tile_b) and
+        // builtin args are not bound by blade and can be ignored.
+        fn expected_globals(entry: &ShaderEntry) -> Vec<&'static str> {
+            match entry {
+                ShaderEntry::MatMul | ShaderEntry::MatMulRelu
+                | ShaderEntry::MatMulSilu | ShaderEntry::MatMulGelu
+                | ShaderEntry::MatMulSplitK => vec!["a", "b", "c", "params"],
+                ShaderEntry::MatMulBiasRelu => vec!["a", "b", "bias", "c", "params"],
+                ShaderEntry::MatMulSplitKFinalize
+                | ShaderEntry::Relu | ShaderEntry::Sigmoid | ShaderEntry::Neg
+                | ShaderEntry::Silu | ShaderEntry::Gelu
+                | ShaderEntry::SumAll | ShaderEntry::MeanAll
+                | ShaderEntry::RoPE => vec!["src", "dst", "params"],
+                ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater
+                    => vec!["src_a", "src_b", "dst", "params"],
+                ShaderEntry::BiasAdd => vec!["src", "bias", "dst", "params"],
+                ShaderEntry::SgdUpdate => vec!["param", "grad", "dst", "params"],
+                ShaderEntry::Softmax => vec!["src", "dst", "params"],
+                ShaderEntry::CrossEntropyLoss => vec!["logits", "labels", "grad_out", "loss_out", "params"],
+                ShaderEntry::Transpose => vec!["src", "dst", "params"],
+                ShaderEntry::RmsNorm => vec!["src", "bias", "dst", "params"],
+                ShaderEntry::Embedding => vec!["indices", "src", "dst", "params"],
+                ShaderEntry::CausalAttention | ShaderEntry::FullAttention
+                | ShaderEntry::CrossAttention => vec!["src_a", "src_b", "bias", "dst", "params"],
+                ShaderEntry::LayerNorm => vec!["src", "src_b", "bias", "dst", "params"],
+            }
+        }
+
+        let entries = [
+            ShaderEntry::MatMul,
+            ShaderEntry::MatMulRelu,
+            ShaderEntry::MatMulBiasRelu,
+            ShaderEntry::MatMulSilu,
+            ShaderEntry::MatMulGelu,
+            ShaderEntry::MatMulSplitK,
+            ShaderEntry::MatMulSplitKFinalize,
+            ShaderEntry::Relu,
+            ShaderEntry::Sigmoid,
+            ShaderEntry::Neg,
+            ShaderEntry::Add,
+            ShaderEntry::Mul,
+            ShaderEntry::Greater,
+            ShaderEntry::BiasAdd,
+            ShaderEntry::SgdUpdate,
+            ShaderEntry::SumAll,
+            ShaderEntry::MeanAll,
+            ShaderEntry::Softmax,
+            ShaderEntry::CrossEntropyLoss,
+            ShaderEntry::Transpose,
+            ShaderEntry::Silu,
+            ShaderEntry::RmsNorm,
+            ShaderEntry::Embedding,
+            ShaderEntry::RoPE,
+            ShaderEntry::CausalAttention,
+            ShaderEntry::Gelu,
+            ShaderEntry::LayerNorm,
+            ShaderEntry::FullAttention,
+            ShaderEntry::CrossAttention,
+        ];
+
+        for entry in &entries {
+            let group = entry.shader_group();
+            let module = generate_module(group);
+            let expected: HashSet<&str> = expected_globals(entry).into_iter().collect();
+            let actual: HashSet<&str> = module
+                .global_variables
+                .iter()
+                .filter_map(|(_, gv)| {
+                    // Skip workgroup variables — blade doesn't bind those
+                    if gv.space == naga::AddressSpace::WorkGroup {
+                        return None;
+                    }
+                    gv.name.as_deref()
+                })
+                .collect();
+
+            assert_eq!(
+                expected, actual,
+                "{entry:?} (group {group:?}): shader globals {actual:?} \
+                 don't match expected runtime bindings {expected:?}"
+            );
+        }
     }
 }
