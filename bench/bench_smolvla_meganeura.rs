@@ -19,6 +19,10 @@ const REPO_ID: &str = "lerobot/smolvla_base";
 
 fn main() {
     env_logger::init();
+    let trace_path = std::env::var("MEGANEURA_TRACE").ok();
+    if trace_path.is_some() {
+        meganeura::profiler::init();
+    }
 
     let mut args = std::env::args().skip(1);
     let mut warmup: usize = 3;
@@ -172,4 +176,10 @@ fn main() {
     println!("  \"avg_per_step_ms\": {:.2},", avg_per_step * 1000.0);
     println!("  \"steps_per_second\": {:.2}", steps_per_sec);
     println!("}}");
+
+    if let Some(path) = trace_path {
+        eprintln!("saving trace to {}...", path);
+        meganeura::profiler::save(&path).expect("failed to save trace");
+        eprintln!("trace saved ({} events)", meganeura::profiler::event_count());
+    }
 }

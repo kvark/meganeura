@@ -17,6 +17,10 @@ const REPO_ID: &str = "HuggingFaceTB/SmolLM2-135M";
 
 fn main() {
     env_logger::init();
+    let trace_path = std::env::var("MEGANEURA_TRACE").ok();
+    if trace_path.is_some() {
+        meganeura::profiler::init();
+    }
 
     let mut args = std::env::args().skip(1);
     let mut prompt = "The meaning of life is".to_string();
@@ -221,4 +225,10 @@ fn main() {
             .replace('\n', "\\n")
     );
     println!("}}");
+
+    if let Some(path) = trace_path {
+        eprintln!("saving trace to {}...", path);
+        meganeura::profiler::save(&path).expect("failed to save trace");
+        eprintln!("trace saved ({} events)", meganeura::profiler::event_count());
+    }
 }
