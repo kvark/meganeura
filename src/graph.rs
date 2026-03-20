@@ -84,6 +84,9 @@ pub enum Op {
     FusedMatMulBiasRelu,
     FusedMatMulSilu,
     FusedMatMulGelu,
+    /// MatMul + residual Add: C = A×B + D
+    /// inputs: [a, b, d] where a=[M,K], b=[K,N], d=[M,N]
+    FusedMatMulAdd,
 
     // Split-K MatMul: splits K-reduction across workgroups for better
     // parallelism when M or N is small relative to K (e.g. inference).

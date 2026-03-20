@@ -150,7 +150,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
             Op::Input { .. } | Op::Parameter { .. } | Op::Constant { .. } | Op::Greater => {}
             Op::Nop => {}
             Op::FusedMatMulRelu | Op::FusedMatMulBiasRelu | Op::FusedMatMulSilu | Op::FusedMatMulGelu
-            | Op::MatMulSplitK { .. } => {
+            | Op::FusedMatMulAdd | Op::MatMulSplitK { .. } => {
                 log::warn!("autodiff should run before fusion optimization");
             }
             // Transformer / vision ops: inference-only, no autodiff support

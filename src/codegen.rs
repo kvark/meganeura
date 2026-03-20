@@ -519,6 +519,7 @@ pub enum ShaderGroup {
     MatMulBiasRelu,
     MatMulSilu,
     MatMulGelu,
+    MatMulAdd,
     MatMulSplitK,
     MatMulSplitKFinalize,
     Reduce,
@@ -546,6 +547,7 @@ pub fn generate_module(group: ShaderGroup) -> Module {
         ShaderGroup::MatMulBiasRelu => gen_matmul(MatMulFusion::BiasRelu),
         ShaderGroup::MatMulSilu => gen_matmul(MatMulFusion::Silu),
         ShaderGroup::MatMulGelu => gen_matmul(MatMulFusion::Gelu),
+        ShaderGroup::MatMulAdd => gen_matmul(MatMulFusion::ResidualAdd),
         ShaderGroup::MatMulSplitK => gen_matmul_split_k(),
         ShaderGroup::MatMulSplitKFinalize => gen_matmul_split_k_finalize(),
         ShaderGroup::Reduce => gen_reduce(),
@@ -1023,6 +1025,8 @@ enum MatMulFusion {
     BiasRelu,
     Silu,
     Gelu,
+    /// Residual add: C = A×B + D
+    ResidualAdd,
 }
 
 fn gen_matmul(fusion: MatMulFusion) -> Module {
@@ -1032,6 +1036,11 @@ fn gen_matmul(fusion: MatMulFusion) -> Module {
     let gv_b = b.storage_ro("b");
     let gv_bias = if fusion == MatMulFusion::BiasRelu {
         Some(b.storage_ro("bias"))
+    } else {
+        None
+    };
+    let gv_d = if fusion == MatMulFusion::ResidualAdd {
+        Some(b.storage_ro("d"))
     } else {
         None
     };
@@ -1343,6 +1352,15 @@ fn gen_matmul(fusion: MatMulFusion) -> Module {
             let gelu_val = f.binary(BinaryOperator::Multiply, half_x, one_plus_tanh);
             f.emit(sqrt_2_pi, gelu_val);
             gelu_val
+        }
+        // residual add: C[i] = A×B[i] + D[i]
+        MatMulFusion::ResidualAdd => {
+            let d_ptr = f.global(gv_d.unwrap());
+            let d_elem = f.index(d_ptr, c_idx);
+            let d_val = f.load(d_elem);
+            let add_val = f.binary(BinaryOperator::Add, final_val, d_val);
+            f.emit(d_ptr, add_val);
+            add_val
         }
     };
 
@@ -3729,6 +3747,7 @@ mod tests {
             ShaderGroup::MatMulBiasRelu,
             ShaderGroup::MatMulSilu,
             ShaderGroup::MatMulGelu,
+            ShaderGroup::MatMulAdd,
             ShaderGroup::MatMulSplitK,
             ShaderGroup::MatMulSplitKFinalize,
             ShaderGroup::Reduce,
@@ -3808,6 +3827,7 @@ mod tests {
                 ShaderEntry::MatMul | ShaderEntry::MatMulRelu
                 | ShaderEntry::MatMulSilu | ShaderEntry::MatMulGelu
                 | ShaderEntry::MatMulSplitK => vec!["a", "b", "c", "params"],
+                ShaderEntry::MatMulAdd => vec!["a", "b", "d", "c", "params"],
                 ShaderEntry::MatMulBiasRelu => vec!["a", "b", "bias", "c", "params"],
                 ShaderEntry::MatMulSplitKFinalize
                 | ShaderEntry::Relu | ShaderEntry::Sigmoid | ShaderEntry::Neg
@@ -3835,6 +3855,7 @@ mod tests {
             ShaderEntry::MatMulBiasRelu,
             ShaderEntry::MatMulSilu,
             ShaderEntry::MatMulGelu,
+            ShaderEntry::MatMulAdd,
             ShaderEntry::MatMulSplitK,
             ShaderEntry::MatMulSplitKFinalize,
             ShaderEntry::Relu,

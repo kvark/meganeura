@@ -10,6 +10,7 @@ pub enum ShaderEntry {
     MatMulBiasRelu,
     MatMulSilu,
     MatMulGelu,
+    MatMulAdd,
     MatMulSplitK,
     MatMulSplitKFinalize,
     Relu,
@@ -45,6 +46,7 @@ impl ShaderEntry {
             ShaderEntry::MatMulBiasRelu => ShaderGroup::MatMulBiasRelu,
             ShaderEntry::MatMulSilu => ShaderGroup::MatMulSilu,
             ShaderEntry::MatMulGelu => ShaderGroup::MatMulGelu,
+            ShaderEntry::MatMulAdd => ShaderGroup::MatMulAdd,
             ShaderEntry::MatMulSplitK => ShaderGroup::MatMulSplitK,
             ShaderEntry::MatMulSplitKFinalize => ShaderGroup::MatMulSplitKFinalize,
             ShaderEntry::Relu | ShaderEntry::Sigmoid | ShaderEntry::Neg => ShaderGroup::Unary,
@@ -74,6 +76,7 @@ impl ShaderEntry {
             | ShaderEntry::MatMulBiasRelu
             | ShaderEntry::MatMulSilu
             | ShaderEntry::MatMulGelu
+            | ShaderEntry::MatMulAdd
             | ShaderEntry::MatMulSplitK
             | ShaderEntry::MatMulSplitKFinalize
             | ShaderEntry::BiasAdd
@@ -337,6 +340,24 @@ impl<'a> Compiler<'a> {
                     shader: ShaderEntry::MatMulGelu,
                     workgroups: [ceil_div(n, 16), ceil_div(m, 16), 1],
                     input_buffers: vec![a, b],
+                    output_buffer: out_buf,
+                    params: vec![m, k, n, 0],
+                });
+            }
+
+            Op::FusedMatMulAdd => {
+                let a = self.get_buffer(node.inputs[0]);
+                let b = self.get_buffer(node.inputs[1]);
+                let d = self.get_buffer(node.inputs[2]); // residual
+                let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
+                let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
+                let m = a_shape[0] as u32;
+                let k = a_shape[1] as u32;
+                let n = b_shape[1] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::MatMulAdd,
+                    workgroups: [ceil_div(n, 16), ceil_div(m, 16), 1],
+                    input_buffers: vec![a, b, d],
                     output_buffer: out_buf,
                     params: vec![m, k, n, 0],
                 });
@@ -872,6 +893,7 @@ mod tests {
             ShaderEntry::MatMulBiasRelu,
             ShaderEntry::MatMulSilu,
             ShaderEntry::MatMulGelu,
+            ShaderEntry::MatMulAdd,
             ShaderEntry::MatMulSplitK,
             ShaderEntry::MatMulSplitKFinalize,
             ShaderEntry::Relu,
@@ -894,4 +916,5 @@ mod tests {
             assert!(!ep.is_empty());
         }
     }
+
 }
