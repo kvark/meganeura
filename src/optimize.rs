@@ -183,6 +183,7 @@ fn graph_to_egglog(graph: &Graph) -> String {
   (FusedMatMulBiasRelu Op Op Op)
   (FusedMatMulSilu Op Op)
   (FusedMatMulGelu Op Op)
+  (FusedMatMulAdd Op Op Op)
   ; Split-K: equivalent to MatMul but compiled with K-parallel strategy
   (MatMulSplitK Op Op)
   ; Transformer ops (passthrough, no fusion rules)
@@ -208,6 +209,10 @@ fn graph_to_egglog(graph: &Graph) -> String {
 (rewrite (Relu (BiasAdd (MatMul ?a ?b) ?c)) (FusedMatMulBiasRelu ?a ?b ?c))
 (rewrite (Silu (MatMul ?a ?b)) (FusedMatMulSilu ?a ?b))
 (rewrite (Gelu (MatMul ?a ?b)) (FusedMatMulGelu ?a ?b))
+
+; --- MatMul + residual Add fusion (commutative) ---
+(rewrite (Add (MatMul ?a ?b) ?d) (FusedMatMulAdd ?a ?b ?d))
+(rewrite (Add ?d (MatMul ?a ?b)) (FusedMatMulAdd ?a ?b ?d))
 
 ; --- Split-K exploration: e-graph explores both strategies ---
 (rewrite (MatMul ?a ?b) (MatMulSplitK ?a ?b))
@@ -274,6 +279,10 @@ fn node_to_egglog_expr(node: &Node) -> String {
         Op::FusedMatMulGelu => {
             format!("(FusedMatMulGelu n{} n{})", node.inputs[0], node.inputs[1])
         }
+        Op::FusedMatMulAdd => format!(
+            "(FusedMatMulAdd n{} n{} n{})",
+            node.inputs[0], node.inputs[1], node.inputs[2]
+        ),
         Op::Silu => format!("(Silu n{})", node.inputs[0]),
         Op::RmsNorm { .. } => format!("(RmsNorm n{} n{})", node.inputs[0], node.inputs[1]),
         Op::Embedding => format!("(Embedding n{} n{})", node.inputs[0], node.inputs[1]),
@@ -321,6 +330,18 @@ fn apply_fusion_rewrites(graph: &mut Graph) -> Vec<(String, u32)> {
     // and topologically sorted, we can scan forward.
     let len = graph.nodes().len();
     let replacements: Vec<Option<NodeId>> = vec![None; len];
+
+    // Count how many times each node is used as an input (for safe fusion).
+    let mut use_count = vec![0u32; len];
+    for node in graph.nodes() {
+        for &inp in &node.inputs {
+            use_count[inp as usize] += 1;
+        }
+    }
+    // Output nodes also count as uses.
+    for &out in graph.outputs() {
+        use_count[out as usize] += 1;
+    }
 
     // Collect fused ops: (relu_idx, fused_op, inputs, ty, dead_node_indices, name)
     type Fusion = (usize, Op, Vec<NodeId>, TensorType, Vec<usize>, &'static str);
@@ -401,6 +422,42 @@ fn apply_fusion_rewrites(graph: &mut Graph) -> Vec<(String, u32)> {
                         node.ty.clone(),
                         vec![input_id as usize],
                         "FusedMatMulGelu",
+                    ));
+                    continue;
+                }
+            }
+            // Add(MatMul(a,b), d) → FusedMatMulAdd(a,b,d)  (commutative)
+            // Only fuse when the matmul output has a single consumer (this Add).
+            Op::Add => {
+                let lhs = resolve(node.inputs[0], &replacements);
+                let rhs = resolve(node.inputs[1], &replacements);
+                let lhs_node = &graph.nodes()[lhs as usize];
+                let rhs_node = &graph.nodes()[rhs as usize];
+
+                // Try both orderings (Add is commutative)
+                let candidate = if matches!(lhs_node.op, Op::MatMul)
+                    && use_count[lhs as usize] == 1
+                {
+                    Some((lhs, rhs))
+                } else if matches!(rhs_node.op, Op::MatMul)
+                    && use_count[rhs as usize] == 1
+                {
+                    Some((rhs, lhs))
+                } else {
+                    None
+                };
+
+                if let Some((matmul_id, residual_id)) = candidate {
+                    let mm = &graph.nodes()[matmul_id as usize];
+                    let a = resolve(mm.inputs[0], &replacements);
+                    let b = resolve(mm.inputs[1], &replacements);
+                    fusions.push((
+                        i,
+                        Op::FusedMatMulAdd,
+                        vec![a, b, residual_id],
+                        node.ty.clone(),
+                        vec![matmul_id as usize],
+                        "FusedMatMulAdd",
                     ));
                     continue;
                 }
@@ -806,5 +863,102 @@ mod tests {
             assert_eq!(a.inputs, b.inputs);
             assert_eq!(a.ty.shape, b.ty.shape);
         }
+    }
+
+    #[test]
+    fn test_fusion_matmul_add() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 8]);
+        let w = g.parameter("w", &[8, 4]);
+        let residual = g.input("res", &[4, 4]);
+        let mm = g.matmul(x, w);
+        let out = g.add(mm, residual);
+        g.set_outputs(vec![out]);
+
+        let opt = optimize(&g);
+        let output_id = opt.outputs()[0];
+        let output_node = opt.node(output_id);
+        assert!(
+            matches!(output_node.op, Op::FusedMatMulAdd),
+            "expected FusedMatMulAdd, got {:?}",
+            output_node.op
+        );
+        // MatMul node should be dead (Nop)
+        assert!(
+            opt.nodes().iter().filter(|n| matches!(n.op, Op::MatMul)).count() == 0,
+            "MatMul should be consumed by fusion"
+        );
+    }
+
+    #[test]
+    fn test_fusion_matmul_add_commutative() {
+        // Add with matmul as second operand
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 8]);
+        let w = g.parameter("w", &[8, 4]);
+        let residual = g.input("res", &[4, 4]);
+        let mm = g.matmul(x, w);
+        let out = g.add(residual, mm); // reversed order
+        g.set_outputs(vec![out]);
+
+        let opt = optimize(&g);
+        let output_id = opt.outputs()[0];
+        assert!(matches!(opt.node(output_id).op, Op::FusedMatMulAdd));
+    }
+
+    #[test]
+    fn test_fusion_matmul_add_not_when_multi_use() {
+        // MatMul used by both Add and another op → don't fuse
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 8]);
+        let w = g.parameter("w", &[8, 4]);
+        let residual = g.input("res", &[4, 4]);
+        let mm = g.matmul(x, w);
+        let out1 = g.add(mm, residual);
+        let out2 = g.relu(mm); // second use of mm
+        g.set_outputs(vec![out1, out2]);
+
+        let opt = optimize(&g);
+        // Should NOT fuse because mm has 2 consumers
+        let add_node = opt.node(opt.outputs()[0]);
+        assert!(
+            matches!(add_node.op, Op::Add),
+            "should not fuse when matmul has multiple consumers, got {:?}",
+            add_node.op
+        );
+    }
+
+    #[test]
+    fn test_smolvla_dispatch_reduction() {
+        use crate::compile;
+        use crate::models::smolvla::{self, SmolVLAConfig};
+
+        let config = SmolVLAConfig::smolvla_base();
+        let mut g = Graph::new();
+        let out = smolvla::build_action_expert(&mut g, &config, config.chunk_size, 16);
+        g.set_outputs(vec![out]);
+
+        // Without optimization
+        let plan_unopt = compile::compile(&g);
+
+        // With optimization
+        let optimized = optimize(&g);
+        let plan_opt = compile::compile(&optimized);
+
+        // FusedMatMulAdd should reduce Add dispatches
+        let matmul_add_count = plan_opt.dispatches.iter()
+            .filter(|d| matches!(d.shader, compile::ShaderEntry::MatMulAdd))
+            .count();
+
+        assert!(matmul_add_count > 0, "FusedMatMulAdd should be applied");
+        assert!(
+            plan_opt.dispatches.len() < plan_unopt.dispatches.len(),
+            "optimization should reduce dispatch count: {} vs {}",
+            plan_opt.dispatches.len(), plan_unopt.dispatches.len()
+        );
+
+        // Expect ~32 fewer dispatches (32 residual Adds fused into MatMulAdd)
+        let saved = plan_unopt.dispatches.len() - plan_opt.dispatches.len();
+        assert!(saved >= 20, "expected significant dispatch reduction, got only {} fewer", saved);
     }
 }

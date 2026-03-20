@@ -14,6 +14,16 @@ struct MatMulData {
     params: MatMulParams,
 }
 
+// matmul_add: var a, b, d, c, params  (C = A×B + D)
+#[derive(blade_macros::ShaderData)]
+struct MatMulAddData {
+    a: blade_graphics::BufferPiece,
+    b: blade_graphics::BufferPiece,
+    d: blade_graphics::BufferPiece,
+    c: blade_graphics::BufferPiece,
+    params: MatMulParams,
+}
+
 // matmul_bias_relu: var a, b, bias, c, params
 #[derive(blade_macros::ShaderData)]
 struct MatMulBiasReluData {
@@ -241,6 +251,7 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
     match *entry {
         ShaderEntry::MatMul | ShaderEntry::MatMulRelu | ShaderEntry::MatMulSilu | ShaderEntry::MatMulGelu
         | ShaderEntry::MatMulSplitK => MatMulData::layout(),
+        ShaderEntry::MatMulAdd => MatMulAddData::layout(),
         ShaderEntry::MatMulSplitKFinalize => UnaryData::layout(),
         ShaderEntry::MatMulBiasRelu => MatMulBiasReluData::layout(),
         ShaderEntry::Relu | ShaderEntry::Sigmoid | ShaderEntry::Neg | ShaderEntry::Silu => {
@@ -456,6 +467,23 @@ impl Session {
                             k: dispatch.params[1],
                             n: dispatch.params[2],
                             _pad: dispatch.params[3],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::MatMulAdd => {
+                pc.bind(
+                    0,
+                    &MatMulAddData {
+                        a: buf(dispatch.input_buffers[0]),
+                        b: buf(dispatch.input_buffers[1]),
+                        d: buf(dispatch.input_buffers[2]),
+                        c: buf(dispatch.output_buffer),
+                        params: MatMulParams {
+                            m: dispatch.params[0],
+                            k: dispatch.params[1],
+                            n: dispatch.params[2],
+                            _pad: 0,
                         },
                     },
                 );
