@@ -566,10 +566,7 @@ pub fn generate_module(group: ShaderGroup) -> Module {
 /// Generate WGSL source for a shader group.
 pub fn generate_wgsl(group: ShaderGroup) -> String {
     let module = generate_module(group);
-    let capabilities = match group {
-        ShaderGroup::MatMul => naga::valid::Capabilities::COOPERATIVE_MATRIX,
-        _ => naga::valid::Capabilities::empty(),
-    };
+    let capabilities = naga::valid::Capabilities::empty();
     module_to_wgsl(&module, capabilities)
 }
 
@@ -1019,194 +1016,283 @@ fn gen_transpose() -> Module {
 }
 
 // ---------------------------------------------------------------------------
-// matmul.wgsl — cooperative matrix multiply (8×8 tiles)
+// matmul.wgsl — tiled matrix multiply (16×16 tiles)
 //
-// Uses `enable wgpu_cooperative_matrix` with coopLoad / coopMultiplyAdd /
-// coopStore for hardware-accelerated matrix multiply on supported GPUs
-// (VK_KHR_cooperative_matrix on Vulkan, simdgroup_matrix on Metal).
-//
-// Workgroup [8, 8, 1], dispatched as [ceil(M/8), ceil(N/8), 1].
-// Each workgroup computes one 8×8 output tile, iterating over K in
-// steps of 8.
+// Workgroup [16, 16, 1], dispatched as [ceil(N/16), ceil(M/16), 1].
+// Each thread computes one element of the output, iterating over K in
+// tiles of 16 using workgroup shared memory.
 // ---------------------------------------------------------------------------
 
-/// Cooperative matrix matmul: C = A × B via Naga IR.
+/// Tiled matmul: C = A × B via Naga IR.
 ///
-/// Generates `CooperativeLoad` / `CooperativeMultiplyAdd` / `CooperativeStore`
-/// expressions that the WGSL backend renders with `enable wgpu_cooperative_matrix`.
-/// Hardware-accelerated on Vulkan (VK_KHR_cooperative_matrix) and Metal
-/// (simdgroup_matrix).
-///
-/// Workgroup [8, 8, 1], dispatched as [ceil(M/8), ceil(N/8), 1].
-/// Each workgroup computes one 8×8 output tile, iterating over K in
-/// steps of 8.
+/// Uses 16×16 workgroup tiles with shared memory for coalesced access.
+/// Workgroup [16, 16, 1], dispatched as [ceil(N/16), ceil(M/16), 1].
 fn gen_matmul() -> Module {
-    const TILE: u32 = 8;
-
     let mut b = Builder::new();
-    let ty_params = b.params_u32x4("Params", &["m", "n", "k", "_pad"]);
+    let ty_params = b.params_u32x4("Params", &["m", "k", "n", "_pad"]);
     let gv_a = b.storage_ro("matrix_a");
     let gv_b = b.storage_ro("matrix_b");
     let gv_c = b.storage_rw("matrix_c");
     let gv_params = b.uniform("params", ty_params);
+    let gv_tile_a = b.workgroup_array("tile_a", 256);
+    let gv_tile_b = b.workgroup_array("tile_b", 256);
 
     let mut f = FnBuilder::new(&b);
-    let wgid = f.arg_wgid();
+    let gid = f.arg_gid();
+    let lid = f.arg_lid();
 
-    let wg_x = f.vec_x(wgid);
-    let wg_y = f.vec_y(wgid);
+    // Extract indices
+    let col = f.vec_x(gid);
+    f.label("col", col);
+    let row = f.vec_y(gid);
+    f.label("row", row);
+    let local_col = f.vec_x(lid);
+    f.label("local_col", local_col);
+    let local_row = f.vec_y(lid);
+    f.label("local_row", local_row);
 
-    f.emit(wg_x, wg_y);
+    f.emit(col, local_row);
 
-    // row = wg.x * 8, col = wg.y * 8
-    let tile_c = f.literal_u32(TILE);
-    let row = f.binary(BinaryOperator::Multiply, wg_x, tile_c);
-    let tile_c2 = f.literal_u32(TILE);
-    let col = f.binary(BinaryOperator::Multiply, wg_y, tile_c2);
-    f.emit(tile_c, col);
-
-    // Load params: n, k
+    // Load params
     let params_ptr = f.global(gv_params);
-    let n_ptr = f.field(params_ptr, 1);
-    let pn = f.load(n_ptr);
-    let k_ptr = f.field(params_ptr, 2);
+    let m_ptr = f.field(params_ptr, 0);
+    let pm = f.load(m_ptr);
+    let k_ptr = f.field(params_ptr, 1);
     let pk = f.load(k_ptr);
-    f.emit(params_ptr, pk);
+    let n_ptr = f.field(params_ptr, 2);
+    let pn = f.load(n_ptr);
+    f.emit(params_ptr, pn);
 
-    // c_offset = row * n + col
-    let c_off_base = f.binary(BinaryOperator::Multiply, row, pn);
-    let c_offset = f.binary(BinaryOperator::Add, c_off_base, col);
-    f.emit(c_off_base, c_offset);
+    // var sum = 0.0;
+    let zero_f = f.literal_f32(0.0);
+    f.emit(zero_f, zero_f);
+    let sum_var = f.local_var("sum", b.ty_f32, None);
+    let sum_ptr = f.local_ptr(sum_var);
+    f.f.body.push(f.store(sum_ptr, zero_f), S);
 
-    // acc = coopLoad<coop_mat8x8<f32, C>>(&matrix_c[c_offset], n)
-    let c_ptr = f.global(gv_c);
-    let c_elem = f.index(c_ptr, c_offset);
-    let acc_load = f.expr(Expression::CooperativeLoad {
-        columns: CooperativeSize::Eight,
-        rows: CooperativeSize::Eight,
-        role: CooperativeRole::C,
-        data: CooperativeData {
-            pointer: c_elem,
-            stride: pn,
-            row_major: false,
+    // num_tiles = (k + TILE - 1) / TILE
+    let tile_const = f.literal_u32(16);
+    let tile_m1 = f.literal_u32(15);
+    let k_plus = f.binary(BinaryOperator::Add, pk, tile_m1);
+    let num_tiles = f.named(
+        "num_tiles",
+        Expression::Binary {
+            op: BinaryOperator::Divide,
+            left: k_plus,
+            right: tile_const,
         },
-    });
-    f.emit(c_ptr, acc_load);
-
-    // var acc: coop_mat8x8<f32, C>
-    let ty_coop_c = b.m.types.insert(
-        Type {
-            name: None,
-            inner: TypeInner::CooperativeMatrix {
-                columns: CooperativeSize::Eight,
-                rows: CooperativeSize::Eight,
-                scalar: Scalar::F32,
-                role: CooperativeRole::C,
-            },
-        },
-        S,
     );
-    let acc_var = f.local_var("acc", ty_coop_c, None);
-    let acc_ptr = f.local_ptr(acc_var);
-    f.f.body.push(f.store(acc_ptr, acc_load), S);
+    f.emit(tile_const, num_tiles);
 
-    // var t: u32 = 0
+    // Loop: for (var t = 0u; t < num_tiles; t++)
     let t_var = f.local_var("t", b.ty_u32, None);
     let zero_u = f.literal_u32(0);
     f.emit(zero_u, zero_u);
     let t_ptr = f.local_ptr(t_var);
     f.f.body.push(f.store(t_ptr, zero_u), S);
 
-    // ===== K-tile loop: for (var t = 0u; t < k; t += 8u) =====
+    // Build loop body
     let mut loop_body = Block::new();
     {
+        // break_if: t >= num_tiles
         let t_val = f.load(t_ptr);
-        let break_cond = f.binary(BinaryOperator::GreaterEqual, t_val, pk);
-        push_emit(&f.f.expressions, &mut loop_body, t_val, break_cond);
-        loop_body.push(FnBuilder::if_break(break_cond), S);
+        let break_cond = f.binary(BinaryOperator::GreaterEqual, t_val, num_tiles);
 
-        // a_offset = row * k + t
-        let a_off_base = f.binary(BinaryOperator::Multiply, row, pk);
-        let a_offset = f.binary(BinaryOperator::Add, a_off_base, t_val);
+        // a_col = t * TILE + local_col
+        let tile16 = f.literal_u32(16);
+        let t_tile = f.binary(BinaryOperator::Multiply, t_val, tile16);
+        let a_col = f.named(
+            "a_col",
+            Expression::Binary {
+                op: BinaryOperator::Add,
+                left: t_tile,
+                right: local_col,
+            },
+        );
+        // b_row = t * TILE + local_row
+        let b_row = f.named(
+            "b_row",
+            Expression::Binary {
+                op: BinaryOperator::Add,
+                left: t_tile,
+                right: local_row,
+            },
+        );
 
-        // a = coopLoad<coop_mat8x8<f32, A>>(&matrix_a[a_offset], k)
+        push_emit(&f.f.expressions, &mut loop_body, t_val, b_row);
+
+        // tile_a[local_row * TILE + local_col]
+        let tile16_2 = f.literal_u32(16);
+        let lr_tile = f.binary(BinaryOperator::Multiply, local_row, tile16_2);
+        let ta_idx = f.binary(BinaryOperator::Add, lr_tile, local_col);
+        let tile_a_ptr = f.global(gv_tile_a);
+        let ta_elem = f.index(tile_a_ptr, ta_idx);
+
+        // Condition: row < m && a_col < k
+        let r_lt_m = f.binary(BinaryOperator::Less, row, pm);
+        let ac_lt_k = f.binary(BinaryOperator::Less, a_col, pk);
+        let cond_a = f.binary(BinaryOperator::LogicalAnd, r_lt_m, ac_lt_k);
+
+        // a[row * k + a_col]
         let a_ptr = f.global(gv_a);
-        let a_elem = f.index(a_ptr, a_offset);
-        let a_load = f.expr(Expression::CooperativeLoad {
-            columns: CooperativeSize::Eight,
-            rows: CooperativeSize::Eight,
-            role: CooperativeRole::A,
-            data: CooperativeData {
-                pointer: a_elem,
-                stride: pk,
-                row_major: false,
+        let row_k = f.binary(BinaryOperator::Multiply, row, pk);
+        let a_idx = f.binary(BinaryOperator::Add, row_k, a_col);
+        let a_elem = f.index(a_ptr, a_idx);
+        let a_val = f.load(a_elem);
+
+        let zero_f2 = f.literal_f32(0.0);
+
+        push_emit(&f.f.expressions, &mut loop_body, tile16_2, cond_a);
+        push_emit(&f.f.expressions, &mut loop_body, zero_f2, zero_f2);
+
+        let mut accept_a = Block::new();
+        push_emit(&f.f.expressions, &mut accept_a, a_ptr, a_val);
+        accept_a.push(f.store(ta_elem, a_val), S);
+
+        loop_body.push(
+            Statement::If {
+                condition: cond_a,
+                accept: accept_a,
+                reject: Block::from_vec(vec![f.store(ta_elem, zero_f2)]),
             },
-        });
+            S,
+        );
 
-        // b_offset = t * n + col
-        let b_off_base = f.binary(BinaryOperator::Multiply, t_val, pn);
-        let b_offset = f.binary(BinaryOperator::Add, b_off_base, col);
+        // tile_b[local_row * TILE + local_col]
+        let tile_b_ptr = f.global(gv_tile_b);
+        let tb_elem = f.index(tile_b_ptr, ta_idx); // same index
 
-        // b_tile = coopLoad<coop_mat8x8<f32, B>>(&matrix_b[b_offset], n)
+        // Condition: b_row < k && col < n
+        let br_lt_k = f.binary(BinaryOperator::Less, b_row, pk);
+        let c_lt_n = f.binary(BinaryOperator::Less, col, pn);
+        let cond_b = f.binary(BinaryOperator::LogicalAnd, br_lt_k, c_lt_n);
+
+        // b[b_row * n + col]
         let b_ptr = f.global(gv_b);
-        let b_elem = f.index(b_ptr, b_offset);
-        let b_load = f.expr(Expression::CooperativeLoad {
-            columns: CooperativeSize::Eight,
-            rows: CooperativeSize::Eight,
-            role: CooperativeRole::B,
-            data: CooperativeData {
-                pointer: b_elem,
-                stride: pn,
-                row_major: false,
+        let br_n = f.binary(BinaryOperator::Multiply, b_row, pn);
+        let b_idx = f.binary(BinaryOperator::Add, br_n, col);
+        let b_elem = f.index(b_ptr, b_idx);
+        let b_val = f.load(b_elem);
+
+        let zero_f3 = f.literal_f32(0.0);
+
+        push_emit(&f.f.expressions, &mut loop_body, tile_b_ptr, cond_b);
+        push_emit(&f.f.expressions, &mut loop_body, zero_f3, zero_f3);
+
+        let mut accept_b = Block::new();
+        push_emit(&f.f.expressions, &mut accept_b, b_ptr, b_val);
+        accept_b.push(f.store(tb_elem, b_val), S);
+
+        loop_body.push(
+            Statement::If {
+                condition: cond_b,
+                accept: accept_b,
+                reject: Block::from_vec(vec![f.store(tb_elem, zero_f3)]),
             },
-        });
+            S,
+        );
 
-        // acc = coopMultiplyAdd(a, b_tile, acc)
-        let old_acc = f.load(acc_ptr);
-        let fma = f.expr(Expression::CooperativeMultiplyAdd {
-            a: a_load,
-            b: b_load,
-            c: old_acc,
-        });
+        // workgroupBarrier()
+        loop_body.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
 
-        push_emit(&f.f.expressions, &mut loop_body, a_off_base, fma);
-        loop_body.push(f.store(acc_ptr, fma), S);
+        // Inner loop: for (var i = 0u; i < TILE; i++)
+        let i_var = f.local_var("i", b.ty_u32, None);
+        let i_ptr = f.local_ptr(i_var);
+        let zero_i = f.literal_u32(0);
+        push_emit(&f.f.expressions, &mut loop_body, zero_i, zero_i);
+        loop_body.push(f.store(i_ptr, zero_i), S);
 
-        // t += 8
-        let tile_inc = f.literal_u32(TILE);
+        let mut inner_body = Block::new();
+        {
+            let i_val = f.load(i_ptr);
+            let tile16_3 = f.literal_u32(16);
+            let i_break = f.binary(BinaryOperator::GreaterEqual, i_val, tile16_3);
+
+            // tile_a[local_row * TILE + i]
+            let tile16_4 = f.literal_u32(16);
+            let lr_t2 = f.binary(BinaryOperator::Multiply, local_row, tile16_4);
+            let ta_i = f.binary(BinaryOperator::Add, lr_t2, i_val);
+            let ta_ptr2 = f.global(gv_tile_a);
+            let ta_e2 = f.index(ta_ptr2, ta_i);
+            let ta_v = f.load(ta_e2);
+
+            // tile_b[i * TILE + local_col]
+            let i_t = f.binary(BinaryOperator::Multiply, i_val, tile16_4);
+            let tb_i = f.binary(BinaryOperator::Add, i_t, local_col);
+            let tb_ptr2 = f.global(gv_tile_b);
+            let tb_e2 = f.index(tb_ptr2, tb_i);
+            let tb_v = f.load(tb_e2);
+
+            // sum += ta_v * tb_v
+            let prod = f.binary(BinaryOperator::Multiply, ta_v, tb_v);
+            let old_sum = f.load(sum_ptr);
+            let new_sum = f.binary(BinaryOperator::Add, old_sum, prod);
+
+            push_emit(&f.f.expressions, &mut inner_body, i_val, new_sum);
+            inner_body.push(f.store(sum_ptr, new_sum), S);
+
+            // i++
+            let one_u = f.literal_u32(1);
+            let i_val2 = f.load(i_ptr);
+            let i_next = f.binary(BinaryOperator::Add, i_val2, one_u);
+            push_emit(&f.f.expressions, &mut inner_body, one_u, i_next);
+            inner_body.push(f.store(i_ptr, i_next), S);
+
+            loop_body.push(
+                Statement::Loop {
+                    body: inner_body,
+                    continuing: Block::new(),
+                    break_if: Some(i_break),
+                },
+                S,
+            );
+        }
+
+        // workgroupBarrier()
+        loop_body.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
+
+        // t++
+        let one_t = f.literal_u32(1);
         let t_val2 = f.load(t_ptr);
-        let t_next = f.binary(BinaryOperator::Add, t_val2, tile_inc);
-        push_emit(&f.f.expressions, &mut loop_body, tile_inc, t_next);
+        let t_next = f.binary(BinaryOperator::Add, t_val2, one_t);
+        push_emit(&f.f.expressions, &mut loop_body, one_t, t_next);
         loop_body.push(f.store(t_ptr, t_next), S);
+
+        f.f.body.push(
+            Statement::Loop {
+                body: loop_body,
+                continuing: Block::new(),
+                break_if: Some(break_cond),
+            },
+            S,
+        );
     }
 
+    // Final store: if (row < m && col < n) { c[row * n + col] = sum }
+    let r_lt_m2 = f.binary(BinaryOperator::Less, row, pm);
+    let c_lt_n2 = f.binary(BinaryOperator::Less, col, pn);
+    let store_cond = f.binary(BinaryOperator::LogicalAnd, r_lt_m2, c_lt_n2);
+
+    let row_n2 = f.binary(BinaryOperator::Multiply, row, pn);
+    let c_idx = f.binary(BinaryOperator::Add, row_n2, col);
+    let c_ptr = f.global(gv_c);
+    let c_elem = f.index(c_ptr, c_idx);
+
+    let final_val = f.load(sum_ptr);
+
+    f.emit(r_lt_m2, final_val);
+
+    let store_block = Block::from_vec(vec![f.store(c_elem, final_val)]);
     f.f.body.push(
-        Statement::Loop {
-            body: loop_body,
-            continuing: Block::new(),
-            break_if: None,
+        Statement::If {
+            condition: store_cond,
+            accept: store_block,
+            reject: Block::new(),
         },
         S,
     );
 
-    // coopStore(acc, &matrix_c[c_offset], n)
-    let c_ptr2 = f.global(gv_c);
-    let c_elem2 = f.index(c_ptr2, c_offset);
-    let final_acc = f.load(acc_ptr);
-    f.emit(c_ptr2, final_acc);
-    f.f.body.push(
-        Statement::CooperativeStore {
-            target: final_acc,
-            data: CooperativeData {
-                pointer: c_elem2,
-                stride: pn,
-                row_major: false,
-            },
-        },
-        S,
-    );
-
-    b.entry_point("main", [TILE, TILE, 1], f.finish());
+    b.entry_point("main", [16, 16, 1], f.finish());
     b.finish()
 }
 // ---------------------------------------------------------------------------
@@ -3224,7 +3310,7 @@ mod tests {
             (ShaderGroup::BiasAdd, naga::valid::Capabilities::empty()),
             (ShaderGroup::Sgd, naga::valid::Capabilities::empty()),
             (ShaderGroup::Transpose, naga::valid::Capabilities::empty()),
-            (ShaderGroup::MatMul, naga::valid::Capabilities::COOPERATIVE_MATRIX),
+            (ShaderGroup::MatMul, naga::valid::Capabilities::empty()),
             (ShaderGroup::Reduce, naga::valid::Capabilities::empty()),
             (ShaderGroup::Softmax, naga::valid::Capabilities::empty()),
             (ShaderGroup::CrossEntropy, naga::valid::Capabilities::empty()),
