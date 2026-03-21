@@ -194,10 +194,10 @@ impl Pipelines {
 
         let mut map = HashMap::new();
         for (group, entries) in &needed {
-            let module = crate::codegen::generate_module(*group);
+            let wgsl = crate::codegen::generate_wgsl(*group);
             let shader = gpu.create_shader(bg::ShaderDesc {
-                source: "",
-                naga_module: Some(module),
+                source: &wgsl,
+                naga_module: None,
             });
 
             for entry in entries {

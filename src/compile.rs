@@ -221,10 +221,10 @@ impl<'a> Compiler<'a> {
                 let m = a_shape[0] as u32;
                 let k = a_shape[1] as u32;
                 let n = b_shape[1] as u32;
-                // Cooperative matrix: 8×8 tiles, one workgroup per tile
+                // Tiled matmul: 16×16 workgroups, x=col(N), y=row(M)
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::MatMul,
-                    workgroups: [ceil_div(m, 8), ceil_div(n, 8), 1],
+                    workgroups: [ceil_div(n, 16), ceil_div(m, 16), 1],
                     input_buffers: vec![a, b],
                     output_buffer: out_buf,
                     params: vec![m, k, n, 0],
@@ -670,8 +670,8 @@ mod tests {
 
         let plan = compile(&g);
         let d = &plan.dispatches[0];
-        // workgroups = [ceil(M/8), ceil(N/8), 1] = [ceil(33/8), ceil(17/8), 1] = [5, 3, 1]
-        assert_eq!(d.workgroups, [5, 3, 1]);
+        // workgroups = [ceil(N/16), ceil(M/16), 1] = [ceil(17/16), ceil(33/16), 1] = [2, 3, 1]
+        assert_eq!(d.workgroups, [2, 3, 1]);
         assert_eq!(d.params, vec![33, 64, 17, 0]);
     }
 
