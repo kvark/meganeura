@@ -149,10 +149,6 @@ pub fn differentiate(forward: &Graph) -> Graph {
             // Leaf nodes, fused ops don't appear in forward pass before optimization
             Op::Input { .. } | Op::Parameter { .. } | Op::Constant { .. } | Op::Greater => {}
             Op::Nop => {}
-            Op::FusedMatMulRelu | Op::FusedMatMulBiasRelu | Op::FusedMatMulSilu | Op::FusedMatMulGelu
-            | Op::FusedMatMulAdd | Op::MatMulSplitK { .. } => {
-                log::warn!("autodiff should run before fusion optimization");
-            }
             // Transformer / vision ops: inference-only, no autodiff support
             Op::Silu
             | Op::RmsNorm { .. }

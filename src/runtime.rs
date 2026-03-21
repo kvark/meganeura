@@ -5,32 +5,12 @@ type Gpu = blade_graphics::Context;
 
 // ---- ShaderData structs matching codegen global variable names ----
 
-// matmul / matmul_relu: var a, b, c, params
+// matmul (cooperative matrix): var matrix_a, matrix_b, matrix_c, params
 #[derive(blade_macros::ShaderData)]
 struct MatMulData {
-    a: blade_graphics::BufferPiece,
-    b: blade_graphics::BufferPiece,
-    c: blade_graphics::BufferPiece,
-    params: MatMulParams,
-}
-
-// matmul_add: var a, b, d, c, params  (C = A×B + D)
-#[derive(blade_macros::ShaderData)]
-struct MatMulAddData {
-    a: blade_graphics::BufferPiece,
-    b: blade_graphics::BufferPiece,
-    d: blade_graphics::BufferPiece,
-    c: blade_graphics::BufferPiece,
-    params: MatMulParams,
-}
-
-// matmul_bias_relu: var a, b, bias, c, params
-#[derive(blade_macros::ShaderData)]
-struct MatMulBiasReluData {
-    a: blade_graphics::BufferPiece,
-    b: blade_graphics::BufferPiece,
-    bias: blade_graphics::BufferPiece,
-    c: blade_graphics::BufferPiece,
+    matrix_a: blade_graphics::BufferPiece,
+    matrix_b: blade_graphics::BufferPiece,
+    matrix_c: blade_graphics::BufferPiece,
     params: MatMulParams,
 }
 
@@ -38,8 +18,8 @@ struct MatMulBiasReluData {
 #[repr(C)]
 struct MatMulParams {
     m: u32,
-    k: u32,
     n: u32,
+    k: u32,
     _pad: u32,
 }
 
@@ -214,13 +194,10 @@ impl Pipelines {
 
         let mut map = HashMap::new();
         for (group, entries) in &needed {
-            // Generate WGSL from Naga IR, then let blade parse it.
-            // Passing naga::Module directly hits SPIR-V backend caching issues
-            // with hand-built IR; the WGSL roundtrip normalizes emit ranges.
-            let source = crate::codegen::generate_wgsl(*group);
+            let module = crate::codegen::generate_module(*group);
             let shader = gpu.create_shader(bg::ShaderDesc {
-                source: &source,
-                naga_module: None,
+                source: "",
+                naga_module: Some(module),
             });
 
             for entry in entries {
@@ -249,11 +226,7 @@ impl Pipelines {
 fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
     use blade_graphics::ShaderData;
     match *entry {
-        ShaderEntry::MatMul | ShaderEntry::MatMulRelu | ShaderEntry::MatMulSilu | ShaderEntry::MatMulGelu
-        | ShaderEntry::MatMulSplitK => MatMulData::layout(),
-        ShaderEntry::MatMulAdd => MatMulAddData::layout(),
-        ShaderEntry::MatMulSplitKFinalize => UnaryData::layout(),
-        ShaderEntry::MatMulBiasRelu => MatMulBiasReluData::layout(),
+        ShaderEntry::MatMul => MatMulData::layout(),
         ShaderEntry::Relu | ShaderEntry::Sigmoid | ShaderEntry::Neg | ShaderEntry::Silu => {
             UnaryData::layout()
         }
@@ -303,7 +276,7 @@ impl Session {
                 timing: true,
                 capture: false,
                 overlay: false,
-                device_id: 0,
+                device_id: None,
                 ..Default::default()
             })
         }
@@ -454,67 +427,17 @@ impl Session {
     ) {
         let buf = |r: BufferRef| buffers[r.0 as usize].at(0);
         match dispatch.shader {
-            ShaderEntry::MatMul | ShaderEntry::MatMulRelu | ShaderEntry::MatMulSilu | ShaderEntry::MatMulGelu
-            | ShaderEntry::MatMulSplitK => {
+            ShaderEntry::MatMul => {
                 pc.bind(
                     0,
                     &MatMulData {
-                        a: buf(dispatch.input_buffers[0]),
-                        b: buf(dispatch.input_buffers[1]),
-                        c: buf(dispatch.output_buffer),
+                        matrix_a: buf(dispatch.input_buffers[0]),
+                        matrix_b: buf(dispatch.input_buffers[1]),
+                        matrix_c: buf(dispatch.output_buffer),
                         params: MatMulParams {
                             m: dispatch.params[0],
-                            k: dispatch.params[1],
                             n: dispatch.params[2],
-                            _pad: dispatch.params[3],
-                        },
-                    },
-                );
-            }
-            ShaderEntry::MatMulAdd => {
-                pc.bind(
-                    0,
-                    &MatMulAddData {
-                        a: buf(dispatch.input_buffers[0]),
-                        b: buf(dispatch.input_buffers[1]),
-                        d: buf(dispatch.input_buffers[2]),
-                        c: buf(dispatch.output_buffer),
-                        params: MatMulParams {
-                            m: dispatch.params[0],
                             k: dispatch.params[1],
-                            n: dispatch.params[2],
-                            _pad: 0,
-                        },
-                    },
-                );
-            }
-            ShaderEntry::MatMulSplitKFinalize => {
-                pc.bind(
-                    0,
-                    &UnaryData {
-                        src: buf(dispatch.input_buffers[0]),
-                        dst: buf(dispatch.output_buffer),
-                        params: UnaryParams {
-                            len: dispatch.params[0],
-                            _pad0: dispatch.params[1],
-                            _pad1: 0,
-                            _pad2: 0,
-                        },
-                    },
-                );
-            }
-            ShaderEntry::MatMulBiasRelu => {
-                pc.bind(
-                    0,
-                    &MatMulBiasReluData {
-                        a: buf(dispatch.input_buffers[0]),
-                        b: buf(dispatch.input_buffers[1]),
-                        bias: buf(dispatch.input_buffers[2]),
-                        c: buf(dispatch.output_buffer),
-                        params: MatMulParams {
-                            m: dispatch.params[0],
-                            k: dispatch.params[1],
-                            n: dispatch.params[2],
                             _pad: 0,
                         },
                     },
