@@ -6,13 +6,6 @@ use std::collections::HashMap;
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ShaderEntry {
     MatMul,
-    MatMulRelu,
-    MatMulBiasRelu,
-    MatMulSilu,
-    MatMulGelu,
-    MatMulAdd,
-    MatMulSplitK,
-    MatMulSplitKFinalize,
     Relu,
     Sigmoid,
     Neg,
@@ -42,13 +35,6 @@ impl ShaderEntry {
         use crate::codegen::ShaderGroup;
         match *self {
             ShaderEntry::MatMul => ShaderGroup::MatMul,
-            ShaderEntry::MatMulRelu => ShaderGroup::MatMulRelu,
-            ShaderEntry::MatMulBiasRelu => ShaderGroup::MatMulBiasRelu,
-            ShaderEntry::MatMulSilu => ShaderGroup::MatMulSilu,
-            ShaderEntry::MatMulGelu => ShaderGroup::MatMulGelu,
-            ShaderEntry::MatMulAdd => ShaderGroup::MatMulAdd,
-            ShaderEntry::MatMulSplitK => ShaderGroup::MatMulSplitK,
-            ShaderEntry::MatMulSplitKFinalize => ShaderGroup::MatMulSplitKFinalize,
             ShaderEntry::Relu | ShaderEntry::Sigmoid | ShaderEntry::Neg => ShaderGroup::Unary,
             ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater => ShaderGroup::Binary,
             ShaderEntry::BiasAdd => ShaderGroup::BiasAdd,
@@ -72,13 +58,6 @@ impl ShaderEntry {
     pub fn entry_point(&self) -> &'static str {
         match *self {
             ShaderEntry::MatMul
-            | ShaderEntry::MatMulRelu
-            | ShaderEntry::MatMulBiasRelu
-            | ShaderEntry::MatMulSilu
-            | ShaderEntry::MatMulGelu
-            | ShaderEntry::MatMulAdd
-            | ShaderEntry::MatMulSplitK
-            | ShaderEntry::MatMulSplitKFinalize
             | ShaderEntry::BiasAdd
             | ShaderEntry::SgdUpdate
             | ShaderEntry::Softmax
@@ -151,8 +130,6 @@ struct Compiler<'a> {
     plan: ExecutionPlan,
     /// Map from NodeId → BufferRef for each node's output.
     node_buffers: HashMap<NodeId, BufferRef>,
-    /// Intermediate buffers for multi-dispatch ops (e.g. split-K partial sums).
-    split_k_buffers: HashMap<NodeId, BufferRef>,
 }
 
 impl<'a> Compiler<'a> {
@@ -168,7 +145,6 @@ impl<'a> Compiler<'a> {
                 param_grad_pairs: Vec::new(),
             },
             node_buffers: HashMap::new(),
-            split_k_buffers: HashMap::new(),
         }
     }
 
@@ -197,17 +173,6 @@ impl<'a> Compiler<'a> {
                     self.plan.input_buffers.push((name.clone(), buf));
                 }
                 _ => {}
-            }
-        }
-
-        // Allocate intermediate buffers for split-K nodes (partial sums).
-        // Each split produces M*N f32 values, so the intermediate is num_splits * M * N * 4 bytes.
-        for node in self.graph.nodes() {
-            if let Op::MatMulSplitK { num_splits } = node.op {
-                let out_elements = node.ty.num_elements(); // M * N
-                let intermediate_size = (num_splits as usize) * out_elements * 4;
-                let buf = self.alloc_buffer(intermediate_size);
-                self.split_k_buffers.insert(node.id, buf);
             }
         }
 
@@ -256,126 +221,11 @@ impl<'a> Compiler<'a> {
                 let m = a_shape[0] as u32;
                 let k = a_shape[1] as u32;
                 let n = b_shape[1] as u32;
+                // Cooperative matrix: 8×8 tiles, one workgroup per tile
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::MatMul,
-                    workgroups: [ceil_div(n, 16), ceil_div(m, 16), 1],
+                    workgroups: [ceil_div(m, 8), ceil_div(n, 8), 1],
                     input_buffers: vec![a, b],
-                    output_buffer: out_buf,
-                    params: vec![m, k, n, 0],
-                });
-            }
-
-            Op::MatMulSplitK { num_splits } => {
-                let a = self.get_buffer(node.inputs[0]);
-                let b = self.get_buffer(node.inputs[1]);
-                let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
-                let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
-                let m = a_shape[0] as u32;
-                let k = a_shape[1] as u32;
-                let n = b_shape[1] as u32;
-                let partial_buf = self.split_k_buffers[&node.id];
-
-                // Dispatch 1: each z-slice computes a partial sum over its K range
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::MatMulSplitK,
-                    workgroups: [ceil_div(n, 16), ceil_div(m, 16), num_splits],
-                    input_buffers: vec![a, b],
-                    output_buffer: partial_buf,
-                    params: vec![m, k, n, num_splits],
-                });
-
-                // Dispatch 2: reduce partial sums across splits → final output
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::MatMulSplitKFinalize,
-                    workgroups: [ceil_div(m * n, 256), 1, 1],
-                    input_buffers: vec![partial_buf],
-                    output_buffer: out_buf,
-                    params: vec![m * n, num_splits, 0, 0],
-                });
-            }
-
-            Op::FusedMatMulRelu => {
-                let a = self.get_buffer(node.inputs[0]);
-                let b = self.get_buffer(node.inputs[1]);
-                let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
-                let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
-                let m = a_shape[0] as u32;
-                let k = a_shape[1] as u32;
-                let n = b_shape[1] as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::MatMulRelu,
-                    workgroups: [ceil_div(n, 16), ceil_div(m, 16), 1],
-                    input_buffers: vec![a, b],
-                    output_buffer: out_buf,
-                    params: vec![m, k, n, 0],
-                });
-            }
-
-            Op::FusedMatMulSilu => {
-                let a = self.get_buffer(node.inputs[0]);
-                let b = self.get_buffer(node.inputs[1]);
-                let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
-                let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
-                let m = a_shape[0] as u32;
-                let k = a_shape[1] as u32;
-                let n = b_shape[1] as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::MatMulSilu,
-                    workgroups: [ceil_div(n, 16), ceil_div(m, 16), 1],
-                    input_buffers: vec![a, b],
-                    output_buffer: out_buf,
-                    params: vec![m, k, n, 0],
-                });
-            }
-
-            Op::FusedMatMulGelu => {
-                let a = self.get_buffer(node.inputs[0]);
-                let b = self.get_buffer(node.inputs[1]);
-                let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
-                let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
-                let m = a_shape[0] as u32;
-                let k = a_shape[1] as u32;
-                let n = b_shape[1] as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::MatMulGelu,
-                    workgroups: [ceil_div(n, 16), ceil_div(m, 16), 1],
-                    input_buffers: vec![a, b],
-                    output_buffer: out_buf,
-                    params: vec![m, k, n, 0],
-                });
-            }
-
-            Op::FusedMatMulAdd => {
-                let a = self.get_buffer(node.inputs[0]);
-                let b = self.get_buffer(node.inputs[1]);
-                let d = self.get_buffer(node.inputs[2]); // residual
-                let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
-                let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
-                let m = a_shape[0] as u32;
-                let k = a_shape[1] as u32;
-                let n = b_shape[1] as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::MatMulAdd,
-                    workgroups: [ceil_div(n, 16), ceil_div(m, 16), 1],
-                    input_buffers: vec![a, b, d],
-                    output_buffer: out_buf,
-                    params: vec![m, k, n, 0],
-                });
-            }
-
-            Op::FusedMatMulBiasRelu => {
-                let a = self.get_buffer(node.inputs[0]);
-                let b = self.get_buffer(node.inputs[1]);
-                let bias = self.get_buffer(node.inputs[2]);
-                let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
-                let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
-                let m = a_shape[0] as u32;
-                let k = a_shape[1] as u32;
-                let n = b_shape[1] as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::MatMulBiasRelu,
-                    workgroups: [ceil_div(n, 16), ceil_div(m, 16), 1],
-                    input_buffers: vec![a, b, bias],
                     output_buffer: out_buf,
                     params: vec![m, k, n, 0],
                 });
@@ -685,9 +535,10 @@ mod tests {
 
         let optimized = crate::optimize::optimize(&g);
         let plan = compile(&optimized);
-        // After fusion, matmul+relu → single FusedMatMulRelu dispatch
-        assert_eq!(plan.dispatches.len(), 1);
-        assert_eq!(plan.dispatches[0].shader, ShaderEntry::MatMulRelu);
+        // MatMul + Relu are now separate dispatches (no fusion with cooperative matrix)
+        assert_eq!(plan.dispatches.len(), 2);
+        assert_eq!(plan.dispatches[0].shader, ShaderEntry::MatMul);
+        assert_eq!(plan.dispatches[1].shader, ShaderEntry::Relu);
     }
 
     #[test]
@@ -819,8 +670,8 @@ mod tests {
 
         let plan = compile(&g);
         let d = &plan.dispatches[0];
-        // workgroups = [ceil(N/16), ceil(M/16), 1] = [ceil(17/16), ceil(33/16), 1] = [2, 3, 1]
-        assert_eq!(d.workgroups, [2, 3, 1]);
+        // workgroups = [ceil(M/8), ceil(N/8), 1] = [ceil(33/8), ceil(17/8), 1] = [5, 3, 1]
+        assert_eq!(d.workgroups, [5, 3, 1]);
         assert_eq!(d.params, vec![33, 64, 17, 0]);
     }
 
@@ -867,7 +718,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_fused_matmul_bias_relu() {
+    fn test_compile_matmul_bias_relu_unfused() {
         let mut g = Graph::new();
         let x = g.input("x", &[4, 8]);
         let w = g.parameter("w", &[8, 4]);
@@ -879,9 +730,11 @@ mod tests {
 
         let opt = crate::optimize::optimize(&g);
         let plan = compile(&opt);
-        assert_eq!(plan.dispatches.len(), 1);
-        assert_eq!(plan.dispatches[0].shader, ShaderEntry::MatMulBiasRelu);
-        assert_eq!(plan.dispatches[0].input_buffers.len(), 3); // a, b, bias
+        // With cooperative matrix, matmul+bias_add+relu are separate dispatches
+        assert_eq!(plan.dispatches.len(), 3);
+        assert_eq!(plan.dispatches[0].shader, ShaderEntry::MatMul);
+        assert_eq!(plan.dispatches[1].shader, ShaderEntry::BiasAdd);
+        assert_eq!(plan.dispatches[2].shader, ShaderEntry::Relu);
     }
 
     #[test]
@@ -889,13 +742,6 @@ mod tests {
         // Verify all shader entries have valid group and entry_point
         let entries = [
             ShaderEntry::MatMul,
-            ShaderEntry::MatMulRelu,
-            ShaderEntry::MatMulBiasRelu,
-            ShaderEntry::MatMulSilu,
-            ShaderEntry::MatMulGelu,
-            ShaderEntry::MatMulAdd,
-            ShaderEntry::MatMulSplitK,
-            ShaderEntry::MatMulSplitKFinalize,
             ShaderEntry::Relu,
             ShaderEntry::Sigmoid,
             ShaderEntry::Neg,

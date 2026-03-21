@@ -323,8 +323,8 @@ mod tests {
         assert_eq!(plan.param_buffers.len(), 3);
         assert_eq!(plan.input_buffers.len(), 2); // x and labels
         assert!(plan.loss_buffer.is_some());
-        // Should have fusions
-        assert!(!report.fusions_applied.is_empty());
+        // With cooperative matrix, no matmul fusions are applied
+        assert!(report.fusions_applied.is_empty());
     }
 
     #[test]
