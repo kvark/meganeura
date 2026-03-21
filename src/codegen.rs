@@ -1,9 +1,9 @@
 //! Shader codegen via Naga IR.
 //!
 //! Builds `naga::Module` objects programmatically for each [`ShaderGroup`].
-//! Currently emits WGSL via `naga::back::wgsl` for blade consumption;
-//! direct `naga::Module` passthrough is possible via blade's `naga_module`
-//! field once the SPIR-V backend handles hand-built IR emit ranges.
+//! Modules are passed directly to blade via `naga_module` for SPIR-V
+//! compilation. Emit ranges must be correct for all expressions —
+//! the SPIR-V backend panics on uncached expressions.
 
 use naga::*;
 
@@ -529,6 +529,7 @@ pub enum ShaderGroup {
     Sgd,
     Transpose,
     MatMul,
+    MatMulCoop,
     Reduce,
     Softmax,
     CrossEntropy,
@@ -550,6 +551,7 @@ pub fn generate_module(group: ShaderGroup) -> Module {
         ShaderGroup::Sgd => gen_sgd(),
         ShaderGroup::Transpose => gen_transpose(),
         ShaderGroup::MatMul => gen_matmul(),
+        ShaderGroup::MatMulCoop => gen_matmul_coop(),
         ShaderGroup::Reduce => gen_reduce(),
         ShaderGroup::Softmax => gen_softmax(),
         ShaderGroup::CrossEntropy => gen_cross_entropy(),
@@ -566,7 +568,10 @@ pub fn generate_module(group: ShaderGroup) -> Module {
 /// Generate WGSL source for a shader group.
 pub fn generate_wgsl(group: ShaderGroup) -> String {
     let module = generate_module(group);
-    let capabilities = naga::valid::Capabilities::empty();
+    let capabilities = match group {
+        ShaderGroup::MatMulCoop => naga::valid::Capabilities::COOPERATIVE_MATRIX,
+        _ => naga::valid::Capabilities::empty(),
+    };
     module_to_wgsl(&module, capabilities)
 }
 
@@ -1007,8 +1012,7 @@ fn gen_transpose() -> Module {
     f.emit(col, row);
     f.emit(params_ptr, cond);
     f.f.body.push(f.if_return(cond), S);
-    f.emit(row_n, val);
-    f.emit(dst_elem, dst_elem);
+    f.emit(row_n, dst_elem);
     f.f.body.push(f.store(dst_elem, val), S);
 
     b.entry_point("main", [16, 16, 1], f.finish());
@@ -1029,7 +1033,7 @@ fn gen_transpose() -> Module {
 /// Workgroup [16, 16, 1], dispatched as [ceil(N/16), ceil(M/16), 1].
 fn gen_matmul() -> Module {
     let mut b = Builder::new();
-    let ty_params = b.params_u32x4("Params", &["m", "k", "n", "_pad"]);
+    let ty_params = b.params_u32x4("Params", &["m", "n", "k", "_pad"]);
     let gv_a = b.storage_ro("matrix_a");
     let gv_b = b.storage_ro("matrix_b");
     let gv_c = b.storage_rw("matrix_c");
@@ -1053,15 +1057,15 @@ fn gen_matmul() -> Module {
 
     f.emit(col, local_row);
 
-    // Load params
+    // Load params: m at field 0, n at field 1, k at field 2
     let params_ptr = f.global(gv_params);
     let m_ptr = f.field(params_ptr, 0);
     let pm = f.load(m_ptr);
-    let k_ptr = f.field(params_ptr, 1);
-    let pk = f.load(k_ptr);
-    let n_ptr = f.field(params_ptr, 2);
+    let n_ptr = f.field(params_ptr, 1);
     let pn = f.load(n_ptr);
-    f.emit(params_ptr, pn);
+    let k_ptr = f.field(params_ptr, 2);
+    let pk = f.load(k_ptr);
+    f.emit(params_ptr, pk);
 
     // var sum = 0.0;
     let zero_f = f.literal_f32(0.0);
@@ -1295,6 +1299,197 @@ fn gen_matmul() -> Module {
     b.entry_point("main", [16, 16, 1], f.finish());
     b.finish()
 }
+// ---------------------------------------------------------------------------
+// matmul_coop.wgsl — cooperative matrix multiply (8×8 tiles)
+//
+// Uses cooperative matrix operations for hardware-accelerated matrix multiply
+// on supported GPUs (VK_KHR_cooperative_matrix on Vulkan, simdgroup_matrix
+// on Metal).
+//
+// Workgroup [8, 8, 1], dispatched as [ceil(M/8), ceil(N/8), 1].
+// Each workgroup computes one 8×8 output tile, iterating over K in
+// steps of 8.
+// ---------------------------------------------------------------------------
+
+/// Cooperative matrix matmul: C = A × B via Naga IR.
+///
+/// Generates `CooperativeLoad` / `CooperativeMultiplyAdd` / `CooperativeStore`
+/// expressions. Hardware-accelerated on Vulkan (VK_KHR_cooperative_matrix)
+/// and Metal (simdgroup_matrix).
+///
+/// Workgroup [8, 8, 1], dispatched as [ceil(M/8), ceil(N/8), 1].
+fn gen_matmul_coop() -> Module {
+    const TILE: u32 = 8;
+
+    let mut b = Builder::new();
+    // Params layout must match MatMulParams in runtime: m, n, k, _pad
+    let ty_params = b.params_u32x4("Params", &["m", "n", "k", "_pad"]);
+    let gv_a = b.storage_ro("matrix_a");
+    let gv_b = b.storage_ro("matrix_b");
+    let gv_c = b.storage_rw("matrix_c");
+    let gv_params = b.uniform("params", ty_params);
+
+    let mut f = FnBuilder::new(&b);
+    let wgid = f.arg_wgid();
+
+    let wg_x = f.vec_x(wgid);
+    let wg_y = f.vec_y(wgid);
+
+    f.emit(wg_x, wg_y);
+
+    // row = wg.x * 8, col = wg.y * 8
+    let tile_c = f.literal_u32(TILE);
+    let row = f.binary(BinaryOperator::Multiply, wg_x, tile_c);
+    let tile_c2 = f.literal_u32(TILE);
+    let col = f.binary(BinaryOperator::Multiply, wg_y, tile_c2);
+    f.emit(tile_c, col);
+
+    // Load params: n at field 1, k at field 2
+    let params_ptr = f.global(gv_params);
+    let n_ptr = f.field(params_ptr, 1);
+    let pn = f.load(n_ptr);
+    let k_ptr = f.field(params_ptr, 2);
+    let pk = f.load(k_ptr);
+    f.emit(params_ptr, pk);
+
+    // c_offset = row * n + col
+    let c_off_base = f.binary(BinaryOperator::Multiply, row, pn);
+    let c_offset = f.binary(BinaryOperator::Add, c_off_base, col);
+    f.emit(c_off_base, c_offset);
+
+    // acc = coopLoad<coop_mat8x8<f32, C>>(&matrix_c[c_offset], n)
+    let c_ptr = f.global(gv_c);
+    let c_elem = f.index(c_ptr, c_offset);
+    let acc_load = f.expr(Expression::CooperativeLoad {
+        columns: CooperativeSize::Eight,
+        rows: CooperativeSize::Eight,
+        role: CooperativeRole::C,
+        data: CooperativeData {
+            pointer: c_elem,
+            stride: pn,
+            row_major: false,
+        },
+    });
+    f.emit(c_ptr, acc_load);
+
+    // var acc: coop_mat8x8<f32, C>
+    let ty_coop_c = b.m.types.insert(
+        Type {
+            name: None,
+            inner: TypeInner::CooperativeMatrix {
+                columns: CooperativeSize::Eight,
+                rows: CooperativeSize::Eight,
+                scalar: Scalar::F32,
+                role: CooperativeRole::C,
+            },
+        },
+        S,
+    );
+    let acc_var = f.local_var("acc", ty_coop_c, None);
+    let acc_ptr = f.local_ptr(acc_var);
+    f.f.body.push(f.store(acc_ptr, acc_load), S);
+
+    // var t: u32 = 0
+    let t_var = f.local_var("t", b.ty_u32, None);
+    let zero_u = f.literal_u32(0);
+    f.emit(zero_u, zero_u);
+    let t_ptr = f.local_ptr(t_var);
+    f.f.body.push(f.store(t_ptr, zero_u), S);
+
+    // ===== K-tile loop: for (var t = 0u; t < k; t += 8u) =====
+    let mut loop_body = Block::new();
+    {
+        let t_val = f.load(t_ptr);
+        let break_cond = f.binary(BinaryOperator::GreaterEqual, t_val, pk);
+        push_emit(&f.f.expressions, &mut loop_body, t_val, break_cond);
+        loop_body.push(FnBuilder::if_break(break_cond), S);
+
+        // a_offset = row * k + t
+        let a_off_base = f.binary(BinaryOperator::Multiply, row, pk);
+        let a_offset = f.binary(BinaryOperator::Add, a_off_base, t_val);
+
+        // a = coopLoad<coop_mat8x8<f32, A>>(&matrix_a[a_offset], k)
+        let a_ptr = f.global(gv_a);
+        let a_elem = f.index(a_ptr, a_offset);
+        let a_load = f.expr(Expression::CooperativeLoad {
+            columns: CooperativeSize::Eight,
+            rows: CooperativeSize::Eight,
+            role: CooperativeRole::A,
+            data: CooperativeData {
+                pointer: a_elem,
+                stride: pk,
+                row_major: false,
+            },
+        });
+
+        // b_offset = t * n + col
+        let b_off_base = f.binary(BinaryOperator::Multiply, t_val, pn);
+        let b_offset = f.binary(BinaryOperator::Add, b_off_base, col);
+
+        // b_tile = coopLoad<coop_mat8x8<f32, B>>(&matrix_b[b_offset], n)
+        let b_ptr = f.global(gv_b);
+        let b_elem = f.index(b_ptr, b_offset);
+        let b_load = f.expr(Expression::CooperativeLoad {
+            columns: CooperativeSize::Eight,
+            rows: CooperativeSize::Eight,
+            role: CooperativeRole::B,
+            data: CooperativeData {
+                pointer: b_elem,
+                stride: pn,
+                row_major: false,
+            },
+        });
+
+        // acc = coopMultiplyAdd(a, b_tile, acc)
+        let old_acc = f.load(acc_ptr);
+        let fma = f.expr(Expression::CooperativeMultiplyAdd {
+            a: a_load,
+            b: b_load,
+            c: old_acc,
+        });
+
+        push_emit(&f.f.expressions, &mut loop_body, a_off_base, fma);
+        loop_body.push(f.store(acc_ptr, fma), S);
+
+        // t += 8
+        let tile_inc = f.literal_u32(TILE);
+        let t_val2 = f.load(t_ptr);
+        let t_next = f.binary(BinaryOperator::Add, t_val2, tile_inc);
+        push_emit(&f.f.expressions, &mut loop_body, tile_inc, t_next);
+        loop_body.push(f.store(t_ptr, t_next), S);
+    }
+
+    f.f.body.push(
+        Statement::Loop {
+            body: loop_body,
+            continuing: Block::new(),
+            break_if: None,
+        },
+        S,
+    );
+
+    // coopStore(acc, &matrix_c[c_offset], n)
+    // Re-emit c_offset and its dependencies for the SPIR-V backend
+    let c_ptr2 = f.global(gv_c);
+    let c_elem2 = f.index(c_ptr2, c_offset);
+    let final_acc = f.load(acc_ptr);
+    f.emit(c_ptr2, final_acc);
+    f.f.body.push(
+        Statement::CooperativeStore {
+            target: final_acc,
+            data: CooperativeData {
+                pointer: c_elem2,
+                stride: pn,
+                row_major: false,
+            },
+        },
+        S,
+    );
+
+    b.entry_point("main", [TILE, TILE, 1], f.finish());
+    b.finish()
+}
+
 // ---------------------------------------------------------------------------
 // reduce.wgsl: sum_all, mean_all
 // ---------------------------------------------------------------------------
@@ -3311,6 +3506,7 @@ mod tests {
             (ShaderGroup::Sgd, naga::valid::Capabilities::empty()),
             (ShaderGroup::Transpose, naga::valid::Capabilities::empty()),
             (ShaderGroup::MatMul, naga::valid::Capabilities::empty()),
+            (ShaderGroup::MatMulCoop, naga::valid::Capabilities::COOPERATIVE_MATRIX),
             (ShaderGroup::Reduce, naga::valid::Capabilities::empty()),
             (ShaderGroup::Softmax, naga::valid::Capabilities::empty()),
             (ShaderGroup::CrossEntropy, naga::valid::Capabilities::empty()),
@@ -3372,6 +3568,84 @@ mod tests {
     #[test]
     fn test_causal_attention_wgsl() {
         let _ = generate_wgsl(ShaderGroup::CausalAttention);
+    }
+
+    /// Verify every shader group compiles to SPIR-V without panics.
+    /// This catches "Expression [N] is not cached!" bugs in hand-built IR.
+    #[test]
+    fn all_shaders_compile_to_spirv() {
+        let empty = naga::valid::Capabilities::empty();
+        let coop = naga::valid::Capabilities::COOPERATIVE_MATRIX;
+        let groups: &[(ShaderGroup, naga::valid::Capabilities)] = &[
+            (ShaderGroup::Unary, empty),
+            (ShaderGroup::Binary, empty),
+            (ShaderGroup::BiasAdd, empty),
+            (ShaderGroup::Sgd, empty),
+            (ShaderGroup::Transpose, empty),
+            (ShaderGroup::MatMul, empty),
+            (ShaderGroup::MatMulCoop, coop),
+            (ShaderGroup::Reduce, empty),
+            (ShaderGroup::Softmax, empty),
+            (ShaderGroup::CrossEntropy, empty),
+            (ShaderGroup::RmsNorm, empty),
+            (ShaderGroup::Embedding, empty),
+            (ShaderGroup::RoPE, empty),
+            (ShaderGroup::CausalAttention, empty),
+            (ShaderGroup::LayerNorm, empty),
+            (ShaderGroup::FullAttention, empty),
+            (ShaderGroup::CrossAttention, empty),
+        ];
+
+        let flags = naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
+        let options = naga::back::spv::Options {
+            lang_version: (1, 0),
+            flags: naga::back::spv::WriterFlags::empty(),
+            capabilities: None,
+            bounds_check_policies: naga::proc::BoundsCheckPolicies::default(),
+            binding_map: Default::default(),
+            ..Default::default()
+        };
+
+        let mut failed = Vec::new();
+        for &(group, caps) in groups {
+            let module = generate_module(group);
+            let info = match naga::valid::Validator::new(flags, caps).validate(&module) {
+                Ok(info) => info,
+                Err(e) => {
+                    failed.push(format!("{group:?}: validation failed: {e}"));
+                    continue;
+                }
+            };
+            // Try each entry point
+            for ep in &module.entry_points {
+                let pipeline_options = naga::back::spv::PipelineOptions {
+                    shader_stage: naga::ShaderStage::Compute,
+                    entry_point: ep.name.clone(),
+                };
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    naga::back::spv::write_vec(
+                        &module,
+                        &info,
+                        &options,
+                        Some(&pipeline_options),
+                    )
+                }));
+                match result {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => failed.push(format!("{group:?}/{}: SPIR-V error: {e}", ep.name)),
+                    Err(e) => {
+                        let msg = e.downcast_ref::<String>()
+                            .map(|s| s.as_str())
+                            .or_else(|| e.downcast_ref::<&str>().copied())
+                            .unwrap_or("unknown panic");
+                        failed.push(format!("{group:?}/{}: SPIR-V panic: {msg}", ep.name));
+                    }
+                }
+            }
+        }
+        if !failed.is_empty() {
+            panic!("SPIR-V compilation failures:\n{}", failed.join("\n"));
+        }
     }
 
     /// Verify that shader global variable names match the runtime ShaderData

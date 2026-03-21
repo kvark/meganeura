@@ -3,9 +3,13 @@ use std::collections::HashMap;
 
 type Gpu = blade_graphics::Context;
 
+fn ceil_div(a: u32, b: u32) -> u32 {
+    a.div_ceil(b)
+}
+
 // ---- ShaderData structs matching codegen global variable names ----
 
-// matmul (cooperative matrix): var matrix_a, matrix_b, matrix_c, params
+// matmul: var matrix_a, matrix_b, matrix_c, params
 #[derive(blade_macros::ShaderData)]
 struct MatMulData {
     matrix_a: blade_graphics::BufferPiece,
@@ -179,25 +183,30 @@ struct Pipelines {
 }
 
 impl Pipelines {
-    fn new(gpu: &Gpu, plan: &ExecutionPlan) -> Self {
+    fn new(gpu: &Gpu, plan: &ExecutionPlan, use_coop_matmul: bool) -> Self {
         use crate::codegen::ShaderGroup;
         use blade_graphics as bg;
 
         // Collect unique (ShaderGroup, entries) pairs
         let mut needed: HashMap<ShaderGroup, Vec<&ShaderEntry>> = HashMap::new();
         for dispatch in &plan.dispatches {
+            let mut group = dispatch.shader.shader_group();
+            // Upgrade MatMul to cooperative matrix path if supported
+            if group == ShaderGroup::MatMul && use_coop_matmul {
+                group = ShaderGroup::MatMulCoop;
+            }
             needed
-                .entry(dispatch.shader.shader_group())
+                .entry(group)
                 .or_default()
                 .push(&dispatch.shader);
         }
 
         let mut map = HashMap::new();
         for (group, entries) in &needed {
-            let wgsl = crate::codegen::generate_wgsl(*group);
+            let module = crate::codegen::generate_module(*group);
             let shader = gpu.create_shader(bg::ShaderDesc {
-                source: &wgsl,
-                naga_module: None,
+                source: "",
+                naga_module: Some(module),
             });
 
             for entry in entries {
@@ -282,6 +291,28 @@ impl Session {
         }
         .expect("failed to initialize blade GPU context");
 
+        let use_coop_matmul = gpu.capabilities().cooperative_matrix;
+        if !use_coop_matmul {
+            let info = gpu.device_information();
+            log::warn!(
+                "cooperative matrix not supported on {} ({}); using tiled matmul fallback (slower)",
+                info.device_name,
+                info.driver_name,
+            );
+        }
+
+        let mut plan = plan;
+        if use_coop_matmul {
+            // Recompute matmul dispatch workgroups for 8×8 cooperative tiles
+            for dispatch in &mut plan.dispatches {
+                if dispatch.shader == ShaderEntry::MatMul {
+                    let m = dispatch.params[0];
+                    let n = dispatch.params[2];
+                    dispatch.workgroups = [ceil_div(m, 8), ceil_div(n, 8), 1];
+                }
+            }
+        }
+
         let buffers: Vec<blade_graphics::Buffer> = plan
             .buffers
             .iter()
@@ -296,7 +327,7 @@ impl Session {
             })
             .collect();
 
-        let pipelines = Pipelines::new(&gpu, &plan);
+        let pipelines = Pipelines::new(&gpu, &plan, use_coop_matmul);
         let encoder = gpu.create_command_encoder(blade_graphics::CommandEncoderDesc {
             name: "meganeura",
             buffer_count: 2,
