@@ -2,3 +2,5 @@
 Cargo.lock
 data/mnist-mlp.safetensors
 data/*.gz
+bench/results/*.json
+*.trace

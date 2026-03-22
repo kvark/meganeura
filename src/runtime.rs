@@ -126,8 +126,8 @@ struct CausalAttentionData {
 #[derive(blade_macros::ShaderData)]
 struct LayerNormData {
     src: blade_graphics::BufferPiece,
-    src_b: blade_graphics::BufferPiece,  // weight
-    bias: blade_graphics::BufferPiece,   // bias
+    src_b: blade_graphics::BufferPiece, // weight
+    bias: blade_graphics::BufferPiece,  // bias
     dst: blade_graphics::BufferPiece,
     params: MatMulParams, // rows, cols, eps_bits, _pad
 }
@@ -195,10 +195,7 @@ impl Pipelines {
             if group == ShaderGroup::MatMul && use_coop_matmul {
                 group = ShaderGroup::MatMulCoop;
             }
-            needed
-                .entry(group)
-                .or_default()
-                .push(&dispatch.shader);
+            needed.entry(group).or_default().push(&dispatch.shader);
         }
 
         let mut map = HashMap::new();
@@ -275,6 +272,112 @@ pub struct Session {
 }
 
 impl Session {
+    /// Run a tiny cooperative matmul and check the result.
+    /// Returns false if the GPU doesn't support the required cooperative
+    /// matrix types (e.g. AMD RADV advertises the extension but rejects
+    /// the specific f32 matrix shapes).
+    fn test_coop_matmul(gpu: &Gpu) -> bool {
+        use crate::codegen::ShaderGroup;
+        use blade_graphics as bg;
+
+        let module = crate::codegen::generate_module(ShaderGroup::MatMulCoop);
+        let shader = match gpu.try_create_shader(bg::ShaderDesc {
+            source: "",
+            naga_module: Some(module),
+        }) {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("cooperative matmul shader rejected: {}", e);
+                return false;
+            }
+        };
+        let layout = shader_data_layout(&ShaderEntry::MatMul);
+        let mut pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
+            name: "main",
+            data_layouts: &[&layout],
+            compute: shader.at("main"),
+        });
+
+        // Non-trivial 16×16 test: A filled with 0.5, B = identity → C should be 0.5 * I * B = A
+        const N: usize = 16;
+        const BUF_SIZE: u64 = (N * N * 4) as u64;
+        let a_buf = gpu.create_buffer(bg::BufferDesc {
+            name: "test_a",
+            size: BUF_SIZE,
+            memory: bg::Memory::Shared,
+        });
+        let b_buf = gpu.create_buffer(bg::BufferDesc {
+            name: "test_b",
+            size: BUF_SIZE,
+            memory: bg::Memory::Shared,
+        });
+        let c_buf = gpu.create_buffer(bg::BufferDesc {
+            name: "test_c",
+            size: BUF_SIZE,
+            memory: bg::Memory::Shared,
+        });
+        unsafe {
+            let a = std::slice::from_raw_parts_mut(a_buf.data() as *mut f32, N * N);
+            let b = std::slice::from_raw_parts_mut(b_buf.data() as *mut f32, N * N);
+            let c = std::slice::from_raw_parts_mut(c_buf.data() as *mut f32, N * N);
+            // A = all 0.5
+            a.fill(0.5);
+            // B = identity
+            b.fill(0.0);
+            for i in 0..N {
+                b[i * N + i] = 1.0;
+            }
+            // C = 0 (accumulator)
+            c.fill(0.0);
+        }
+
+        let mut encoder = gpu.create_command_encoder(bg::CommandEncoderDesc {
+            name: "coop_test",
+            buffer_count: 2,
+        });
+        encoder.start();
+        {
+            let mut pass = encoder.compute("coop_test");
+            let mut pc = pass.with(&pipeline);
+            pc.bind(
+                0,
+                &MatMulData {
+                    matrix_a: a_buf.at(0),
+                    matrix_b: b_buf.at(0),
+                    matrix_c: c_buf.at(0),
+                    params: MatMulParams {
+                        m: N as u32,
+                        n: N as u32,
+                        k: N as u32,
+                        _pad: 0,
+                    },
+                },
+            );
+            pc.dispatch([1, 1, 1]);
+        }
+        let sp = gpu.submit(&mut encoder);
+        let _ = gpu.wait_for(&sp, !0);
+
+        let result =
+            unsafe { std::slice::from_raw_parts(c_buf.data() as *const f32, N * N).to_vec() };
+
+        gpu.destroy_command_encoder(&mut encoder);
+        gpu.destroy_compute_pipeline(&mut pipeline);
+        gpu.destroy_buffer(a_buf);
+        gpu.destroy_buffer(b_buf);
+        gpu.destroy_buffer(c_buf);
+
+        // A * I should equal A (all 0.5)
+        let ok = result.iter().all(|v| (*v - 0.5).abs() < 0.05);
+        if !ok {
+            log::warn!(
+                "cooperative matmul self-test failed: expected [1,1,1,1], got {:?}",
+                result
+            );
+        }
+        ok
+    }
+
     /// Create a session from a compiled execution plan.
     pub fn new(plan: ExecutionPlan) -> Self {
         // Safety: we only create one GPU context per session, and the
@@ -291,24 +394,33 @@ impl Session {
         }
         .expect("failed to initialize blade GPU context");
 
-        let use_coop_matmul = gpu.capabilities().cooperative_matrix;
+        let coop_caps = gpu.capabilities().cooperative_matrix;
+        let use_coop_matmul = coop_caps.is_supported() && Self::test_coop_matmul(&gpu);
         if !use_coop_matmul {
             let info = gpu.device_information();
             log::warn!(
-                "cooperative matrix not supported on {} ({}); using tiled matmul fallback (slower)",
+                "cooperative matrix not available on {} ({}) (f32_tile={}, f16_tile={}); using naive matmul",
                 info.device_name,
                 info.driver_name,
+                coop_caps.f32_tile,
+                coop_caps.f16_tile,
+            );
+        } else {
+            log::info!(
+                "cooperative matrix enabled (f32_tile={}, f16_tile={})",
+                coop_caps.f32_tile,
+                coop_caps.f16_tile,
             );
         }
 
         let mut plan = plan;
         if use_coop_matmul {
-            // Recompute matmul dispatch workgroups for 8×8 cooperative tiles
+            // Recompute matmul dispatch workgroups for 16×16 cooperative tiles
             for dispatch in &mut plan.dispatches {
                 if dispatch.shader == ShaderEntry::MatMul {
                     let m = dispatch.params[0];
                     let n = dispatch.params[2];
-                    dispatch.workgroups = [ceil_div(m, 8), ceil_div(n, 8), 1];
+                    dispatch.workgroups = [ceil_div(m, 16), ceil_div(n, 16), 1];
                 }
             }
         }
@@ -425,7 +537,7 @@ impl Session {
     pub fn wait(&mut self) {
         if let Some(sp) = self.sync_point.take() {
             let _span = tracing::info_span!("wait").entered();
-            self.gpu.wait_for(&sp, !0);
+            let _ = self.gpu.wait_for(&sp, !0);
         }
     }
 

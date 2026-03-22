@@ -48,12 +48,16 @@ fn main() {
     println!("loading tokenizer...");
     let api = hf_hub::api::sync::Api::new().expect("failed to create HF API");
     let repo = api.model(REPO_ID.to_string());
-    let tokenizer_path = repo.get("tokenizer.json").expect("failed to download tokenizer.json");
+    let tokenizer_path = repo
+        .get("tokenizer.json")
+        .expect("failed to download tokenizer.json");
     let tokenizer =
         tokenizers::Tokenizer::from_file(tokenizer_path).expect("failed to load tokenizer");
 
     // Encode prompt
-    let encoding = tokenizer.encode(prompt.as_str(), false).expect("tokenization failed");
+    let encoding = tokenizer
+        .encode(prompt.as_str(), false)
+        .expect("tokenization failed");
     let input_ids: Vec<u32> = encoding.get_ids().to_vec();
     let seq_len = input_ids.len() + max_new_tokens;
     println!(

@@ -1,6 +1,6 @@
 /// GPU smoke test: validates that all shaders compile with blade + lavapipe
 /// and that a simple forward pass executes without errors.
-use meganeura::{Graph, build_session};
+use meganeura::{Graph, build_inference_session, build_session};
 
 #[test]
 fn shader_compilation_and_forward_pass() {
@@ -54,4 +54,45 @@ fn shader_compilation_and_forward_pass() {
         "cross-entropy loss should be positive, got {}",
         loss_val
     );
+}
+
+#[test]
+fn matmul_produces_correct_values() {
+    // 16x32 @ 32x16 matmul — tile-aligned for cooperative matmul (16×16 tiles)
+    // A: 16×32 filled with 0.1 → each output element = 32 * 0.1 * 0.1 = 0.32
+    // B: 32×16 filled with 0.1
+    let m = 16;
+    let k = 32;
+    let n = 16;
+
+    let mut g = Graph::new();
+    let a = g.input("a", &[m, k]);
+    let b = g.parameter("b", &[k, n]);
+    let c = g.matmul(a, b);
+    g.set_outputs(vec![c]);
+
+    let mut session = build_inference_session(&g);
+
+    let a_data = vec![0.1_f32; m * k];
+    let b_data = vec![0.1_f32; k * n];
+    session.set_input("a", &a_data);
+    session.set_parameter("b", &b_data);
+
+    session.step();
+    session.wait();
+
+    let output = session.read_output(m * n);
+    eprintln!("matmul output first 4: {:?}", &output[..4]);
+    assert_eq!(output.len(), m * n);
+    // Each element = sum_{i=0}^{k-1} 0.1 * 0.1 = k * 0.01 = 0.32
+    let expected = k as f32 * 0.01;
+    for (i, &got) in output.iter().enumerate() {
+        assert!(
+            (got - expected).abs() < 0.02, // f16 precision tolerance
+            "matmul output[{}]: got {}, expected {}",
+            i,
+            got,
+            expected
+        );
+    }
 }

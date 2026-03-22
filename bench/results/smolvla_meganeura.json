@@ -6,10 +6,10 @@
   "chunk_size": 50,
   "vlm_seq_len": 16,
   "denoise_steps": 10,
-  "runs": 3,
-  "avg_latency_ms": 64942.77,
-  "median_latency_ms": 64822.20,
-  "stdev_latency_ms": 271.71,
-  "avg_per_step_ms": 6494.28,
-  "steps_per_second": 0.15
+  "runs": 5,
+  "avg_latency_ms": 915.69,
+  "median_latency_ms": 914.68,
+  "stdev_latency_ms": 2.83,
+  "avg_per_step_ms": 91.57,
+  "steps_per_second": 10.92
 }

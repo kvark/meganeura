@@ -22,11 +22,20 @@ fn layer_norm_basic() {
     let out = session.read_output(8);
     println!("layer_norm output: {:?}", out);
     for (i, v) in out.iter().enumerate() {
-        assert!(v.is_finite(), "layer_norm output[{}] = {} is not finite", i, v);
+        assert!(
+            v.is_finite(),
+            "layer_norm output[{}] = {} is not finite",
+            i,
+            v
+        );
     }
     // Each row should be normalized to mean≈0, std≈1
     let row0_mean: f32 = out[0..4].iter().sum::<f32>() / 4.0;
-    assert!(row0_mean.abs() < 0.01, "row0 mean should be ~0, got {}", row0_mean);
+    assert!(
+        row0_mean.abs() < 0.01,
+        "row0 mean should be ~0, got {}",
+        row0_mean
+    );
 }
 
 #[test]
@@ -49,7 +58,11 @@ fn gelu_basic() {
     }
     // GELU(0) ≈ 0, GELU(1) ≈ 0.841
     assert!(out[2].abs() < 0.01, "GELU(0) should be ~0, got {}", out[2]);
-    assert!((out[3] - 0.841).abs() < 0.05, "GELU(1) should be ~0.841, got {}", out[3]);
+    assert!(
+        (out[3] - 0.841).abs() < 0.05,
+        "GELU(1) should be ~0.841, got {}",
+        out[3]
+    );
 }
 
 #[test]
@@ -78,7 +91,12 @@ fn full_attention_basic() {
     let out = session.read_output(24);
     println!("full_attention output: {:?}", out);
     for (i, v) in out.iter().enumerate() {
-        assert!(v.is_finite(), "full_attention output[{}] = {} is not finite", i, v);
+        assert!(
+            v.is_finite(),
+            "full_attention output[{}] = {} is not finite",
+            i,
+            v
+        );
     }
 }
 
@@ -145,6 +163,11 @@ fn vision_encoder_one_layer() {
     let out = session.read_output(num_patches * hidden);
     println!("vision_one_layer output: {:?}", out);
     for (i, v) in out.iter().enumerate() {
-        assert!(v.is_finite(), "vision_one_layer output[{}] = {} is not finite", i, v);
+        assert!(
+            v.is_finite(),
+            "vision_one_layer output[{}] = {} is not finite",
+            i,
+            v
+        );
     }
 }

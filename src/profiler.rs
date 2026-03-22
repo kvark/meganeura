@@ -18,8 +18,8 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
-use tracing::{span, Subscriber};
-use tracing_subscriber::{layer::Context, prelude::*, registry::LookupSpan, Layer};
+use tracing::{Subscriber, span};
+use tracing_subscriber::{Layer, layer::Context, prelude::*, registry::LookupSpan};
 
 // ---- Track IDs ----
 
@@ -141,9 +141,9 @@ pub fn event_count() -> usize {
 
 /// Write all collected events to a Perfetto `.pftrace` binary trace file.
 pub fn save(path: impl AsRef<Path>) -> std::io::Result<()> {
-    let inner = PROFILER.get().ok_or_else(|| {
-        std::io::Error::other("profiler not initialized")
-    })?;
+    let inner = PROFILER
+        .get()
+        .ok_or_else(|| std::io::Error::other("profiler not initialized"))?;
     let guard = inner.lock().unwrap();
     write_pftrace(path.as_ref(), &guard.events)
 }
@@ -383,7 +383,11 @@ mod tests {
 
         let bytes = std::fs::read(&path).unwrap();
         // Should be a non-trivial protobuf file.
-        assert!(bytes.len() > 50, "trace file too small: {} bytes", bytes.len());
+        assert!(
+            bytes.len() > 50,
+            "trace file too small: {} bytes",
+            bytes.len()
+        );
         // First byte should be a protobuf tag for field 1, wire type 2 (length-delimited).
         assert_eq!(bytes[0] & 0x07, 2, "expected length-delimited wire type");
         assert_eq!(bytes[0] >> 3, 1, "expected field number 1 (Trace.packet)");

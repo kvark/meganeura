@@ -46,10 +46,7 @@ impl MnistDataset {
         if images.n != labels.n {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "image count ({}) != label count ({})",
-                    images.n, labels.n
-                ),
+                format!("image count ({}) != label count ({})", images.n, labels.n),
             ));
         }
 
@@ -104,10 +101,7 @@ fn parse_idx_images(buf: &[u8]) -> io::Result<ParsedImages> {
     if magic != 0x00000803 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "bad IDX image magic: 0x{:08x}, expected 0x00000803",
-                magic
-            ),
+            format!("bad IDX image magic: 0x{:08x}, expected 0x00000803", magic),
         ));
     }
     let n = read_u32_be(buf, 4) as usize;
@@ -143,10 +137,7 @@ fn parse_idx_labels(buf: &[u8]) -> io::Result<ParsedLabels> {
     if magic != 0x00000801 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "bad IDX label magic: 0x{:08x}, expected 0x00000801",
-                magic
-            ),
+            format!("bad IDX label magic: 0x{:08x}, expected 0x00000801", magic),
         ));
     }
     let n = read_u32_be(buf, 4) as usize;

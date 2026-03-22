@@ -3,8 +3,8 @@
 //! Provides a [`DataLoader`] that yields mini-batches from an in-memory
 //! dataset, and an [`MnistDataset`] that reads the standard IDX file format.
 
-pub mod safetensors;
 pub mod mnist;
+pub mod safetensors;
 
 pub use mnist::MnistDataset;
 

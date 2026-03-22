@@ -44,10 +44,17 @@ fn main() {
     let config = SmolVLAConfig::smolvla_base();
     let action_seq_len = config.chunk_size; // 50
     let vlm_seq_len = 16; // representative VLM context length
-    let denoise_steps = if num_steps > 0 { num_steps } else { config.num_steps };
+    let denoise_steps = if num_steps > 0 {
+        num_steps
+    } else {
+        config.num_steps
+    };
 
     eprintln!("SmolVLA action expert benchmark");
-    eprintln!("  chunk_size={}, vlm_seq_len={}, denoise_steps={}", action_seq_len, vlm_seq_len, denoise_steps);
+    eprintln!(
+        "  chunk_size={}, vlm_seq_len={}, denoise_steps={}",
+        action_seq_len, vlm_seq_len, denoise_steps
+    );
 
     // --- Download model ---
     eprintln!("downloading model...");
@@ -123,6 +130,27 @@ fn main() {
         t0.elapsed().as_secs_f64()
     };
 
+    // --- Single forward pass to dump output for correctness check ---
+    {
+        session.set_input("noisy_actions", &noisy_actions);
+        session.set_input("timestep", &timestep);
+        for i in 0..config.expert.num_layers {
+            if i % config.expert.self_attn_every_n_layers != 0 {
+                session.set_input(&format!("vlm_kv_layer_{}", i), &vlm_kv);
+            }
+        }
+        session.step();
+        session.wait();
+
+        let output_len = action_seq_len * config.max_action_dim;
+        let output = session.read_output(output_len);
+        let output_path = "bench/results/smolvla_meganeura_output.json";
+        let output_str: Vec<String> = output.iter().map(|v| format!("{:.8e}", v)).collect();
+        let output_json = format!("[{}]", output_str.join(", "));
+        std::fs::write(output_path, &output_json).expect("write output");
+        eprintln!("output saved to {} ({} floats)", output_path, output.len());
+    }
+
     // --- Warmup ---
     eprintln!("warming up ({} runs)...", warmup);
     for _ in 0..warmup {
@@ -130,7 +158,10 @@ fn main() {
     }
 
     // --- Benchmark ---
-    eprintln!("benchmarking ({} runs, {} denoise steps each)...", runs, denoise_steps);
+    eprintln!(
+        "benchmarking ({} runs, {} denoise steps each)...",
+        runs, denoise_steps
+    );
     let mut latencies = Vec::new();
 
     for i in 0..runs {
@@ -180,6 +211,9 @@ fn main() {
     if let Some(path) = trace_path {
         eprintln!("saving trace to {}...", path);
         meganeura::profiler::save(&path).expect("failed to save trace");
-        eprintln!("trace saved ({} events)", meganeura::profiler::event_count());
+        eprintln!(
+            "trace saved ({} events)",
+            meganeura::profiler::event_count()
+        );
     }
 }

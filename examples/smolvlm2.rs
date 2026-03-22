@@ -124,7 +124,10 @@ fn main() {
     let finite = vision_features.iter().filter(|x| x.is_finite()).count();
     println!(
         "  output: [{}, {}] — {}/{} finite",
-        test_num_patches, hidden, finite, vision_features.len()
+        test_num_patches,
+        hidden,
+        finite,
+        vision_features.len()
     );
     assert_eq!(finite, vision_features.len(), "vision output has NaN/Inf!");
     // Drop vision session to reclaim GPU memory
@@ -174,8 +177,8 @@ fn main() {
         for j in 0..text_hidden {
             let mut sum = 0.0f32;
             for k in 0..connector_input_dim {
-                sum += shuffled[i * connector_input_dim + k]
-                    * connector_weight[k * text_hidden + j];
+                sum +=
+                    shuffled[i * connector_input_dim + k] * connector_weight[k * text_hidden + j];
             }
             vision_projected[i * text_hidden + j] = sum;
         }
@@ -183,7 +186,10 @@ fn main() {
     let finite = vision_projected.iter().filter(|x| x.is_finite()).count();
     println!(
         "  [{}, {}] — {}/{} finite",
-        test_vision_tokens, text_hidden, finite, vision_projected.len()
+        test_vision_tokens,
+        text_hidden,
+        finite,
+        vision_projected.len()
     );
 
     // ======== Text Decoder ========
@@ -240,7 +246,10 @@ fn main() {
     let finite = all_logits.iter().filter(|x| x.is_finite()).count();
     println!(
         "  logits: [{}, {}] — {}/{} finite",
-        total_seq_len, vocab, finite, all_logits.len()
+        total_seq_len,
+        vocab,
+        finite,
+        all_logits.len()
     );
     assert_eq!(finite, all_logits.len(), "logits have NaN/Inf!");
 

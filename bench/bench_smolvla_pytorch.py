@@ -2,8 +2,8 @@
 """Benchmark SmolVLA action expert inference with PyTorch.
 
 Measures per-step latency for the action expert denoising loop using
-the lerobot/smolvla_base checkpoint. Uses synthetic inputs to match
-the meganeura benchmark.
+the lerobot/smolvla_base checkpoint. Uses deterministic synthetic inputs
+identical to the meganeura benchmark for correctness comparison.
 
 Usage:
     pip install torch transformers
@@ -20,6 +20,33 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def make_deterministic_inputs(chunk_size, action_dim, expert_hidden, vlm_seq_len, kv_dim, device, dtype):
+    """Generate deterministic synthetic inputs matching meganeura's bench.
+
+    Uses the same sin/cos patterns as bench_smolvla_meganeura.rs so that
+    both frameworks receive identical data for output comparison.
+    """
+    # noisy_actions: (i * 0.01).sin() * 0.1
+    na = torch.tensor(
+        [math.sin(i * 0.01) * 0.1 for i in range(chunk_size * action_dim)],
+        device=device, dtype=dtype,
+    ).view(1, chunk_size, action_dim)
+
+    # timestep: (i * 0.005).cos() * 0.1
+    ts = torch.tensor(
+        [math.cos(i * 0.005) * 0.1 for i in range(expert_hidden * 2)],
+        device=device, dtype=dtype,
+    ).view(1, 1, expert_hidden * 2)
+
+    # vlm_kv: (i * 0.002).sin() * 0.05
+    kv = torch.tensor(
+        [math.sin(i * 0.002) * 0.05 for i in range(vlm_seq_len * kv_dim)],
+        device=device, dtype=dtype,
+    ).view(1, vlm_seq_len, kv_dim)
+
+    return na, ts, kv
 
 
 class RMSNorm(nn.Module):
@@ -128,10 +155,11 @@ class ActionExpert(nn.Module):
     def forward(self, noisy_actions, timestep, vlm_kv):
         x = self.action_in_proj(noisy_actions)
 
-        # Timestep conditioning (computed but broadcast-added is omitted for parity)
+        # Timestep conditioning: MLP then broadcast-add to action tokens
         t = self.action_time_mlp_in(timestep)
         t = F.silu(t)
-        _t = self.action_time_mlp_out(t)
+        t = self.action_time_mlp_out(t)
+        x = x + t  # broadcast [1, 1, hidden] + [1, chunk, hidden]
 
         for i, layer in enumerate(self.layers):
             is_cross = (i % self.self_attn_every_n != 0)
@@ -172,7 +200,11 @@ def load_expert_weights(expert, state_dict):
             if key in state_dict:
                 mapping[f"{dst}.{part}"] = state_dict[key]
 
-    expert.load_state_dict(mapping, strict=False)
+    missing, unexpected = expert.load_state_dict(mapping, strict=False)
+    if missing:
+        print(f"WARNING: missing keys: {missing}", file=sys.stderr)
+    if unexpected:
+        print(f"WARNING: unexpected keys: {unexpected}", file=sys.stderr)
     return expert
 
 
@@ -197,6 +229,9 @@ def main():
 
     print(f"device: {device}, dtype: {args.dtype}", file=sys.stderr)
 
+    if device == "cpu":
+        print("WARNING: running on CPU — comparison with GPU-based meganeura is not apples-to-apples", file=sys.stderr)
+
     # --- Load checkpoint ---
     print("downloading model...", file=sys.stderr)
     from huggingface_hub import hf_hub_download
@@ -218,8 +253,11 @@ def main():
 
     # --- Build expert model ---
     print("building action expert...", file=sys.stderr)
+    expert_hidden = 720
+    kv_dim = 5 * 64  # num_kv_heads * head_dim
+
     expert = ActionExpert(
-        expert_hidden=720,
+        expert_hidden=expert_hidden,
         text_hidden=960,
         num_layers=16,
         num_heads=15,
@@ -235,11 +273,21 @@ def main():
     expert = expert.to(device=device, dtype=torch_dtype)
     expert.eval()
 
-    # --- Synthetic inputs ---
-    kv_dim = 5 * 64  # num_kv_heads * head_dim
-    noisy_actions = torch.randn(1, args.chunk_size, 32, device=device, dtype=torch_dtype) * 0.1
-    timestep = torch.randn(1, 1, 720 * 2, device=device, dtype=torch_dtype) * 0.1
-    vlm_kv = torch.randn(1, args.vlm_seq_len, kv_dim, device=device, dtype=torch_dtype) * 0.05
+    # --- Deterministic synthetic inputs (matches meganeura) ---
+    noisy_actions, timestep, vlm_kv = make_deterministic_inputs(
+        args.chunk_size, 32, expert_hidden, args.vlm_seq_len, kv_dim,
+        device, torch_dtype,
+    )
+
+    # --- Single forward pass to dump output for correctness check ---
+    print("running single forward pass for output comparison...", file=sys.stderr)
+    with torch.no_grad():
+        output = expert(noisy_actions, timestep, vlm_kv)
+    output_flat = output.view(-1).cpu().float().tolist()
+    output_path = "bench/results/smolvla_pytorch_output.json"
+    with open(output_path, "w") as f:
+        json.dump(output_flat, f)
+    print(f"output saved to {output_path} ({len(output_flat)} floats)", file=sys.stderr)
 
     def run_denoise():
         if device == "cuda":

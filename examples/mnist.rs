@@ -32,7 +32,11 @@ fn main() {
     // --- Load data ---
     let mut loader = load_mnist_or_synthetic(batch, input_dim, classes);
     let steps_per_epoch = loader.num_batches();
-    println!("{} samples, {} batches/epoch", loader.len(), steps_per_epoch);
+    println!(
+        "{} samples, {} batches/epoch",
+        loader.len(),
+        steps_per_epoch
+    );
 
     // --- Build the model graph ---
     let mut g = Graph::new();
@@ -117,16 +121,16 @@ fn load_mnist_or_synthetic(batch: usize, input_dim: usize, classes: usize) -> Da
 
     if gz_images.exists() && gz_labels.exists() {
         println!("loading MNIST from {} (gzipped)...", data_dir.display());
-        let mnist = MnistDataset::load_gz(&gz_images, &gz_labels)
-            .expect("failed to parse MNIST gz files");
+        let mnist =
+            MnistDataset::load_gz(&gz_images, &gz_labels).expect("failed to parse MNIST gz files");
         println!("loaded {} MNIST images", mnist.n);
         return mnist.loader(batch);
     }
 
     if raw_images.exists() && raw_labels.exists() {
         println!("loading MNIST from {} (raw)...", data_dir.display());
-        let mnist = MnistDataset::load(&raw_images, &raw_labels)
-            .expect("failed to parse MNIST files");
+        let mnist =
+            MnistDataset::load(&raw_images, &raw_labels).expect("failed to parse MNIST files");
         println!("loaded {} MNIST images", mnist.n);
         return mnist.loader(batch);
     }

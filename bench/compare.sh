@@ -117,6 +117,7 @@ run_smolvla() {
 
     echo "=== SmolVLA Results ==="
     print_table "$OUT_DIR/smolvla_meganeura.json" "$OUT_DIR/smolvla_pytorch.json" \
+        "device:Device" \
         "avg_latency_ms:Avg latency (ms)" \
         "median_latency_ms:Median latency (ms)" \
         "stdev_latency_ms:Stdev (ms)" \
@@ -124,6 +125,59 @@ run_smolvla() {
         "steps_per_second:Steps/second" \
         "peak_memory_mb:Peak GPU memory (MB)"
     echo ""
+
+    # Output correctness comparison
+    local mega_out="$OUT_DIR/smolvla_meganeura_output.json"
+    local pytorch_out="$OUT_DIR/smolvla_pytorch_output.json"
+    if [[ -f "$mega_out" && -f "$pytorch_out" ]]; then
+        echo "=== Output Comparison ==="
+        python3 -c "
+import json, math, sys
+
+with open('$mega_out') as f:
+    mega = json.load(f)
+with open('$pytorch_out') as f:
+    pytorch = json.load(f)
+
+if len(mega) != len(pytorch):
+    print(f'ERROR: output length mismatch: meganeura={len(mega)}, pytorch={len(pytorch)}')
+    sys.exit(1)
+
+n = len(mega)
+max_err = 0.0
+sum_sq = 0.0
+sum_abs = 0.0
+for a, b in zip(mega, pytorch):
+    d = abs(a - b)
+    max_err = max(max_err, d)
+    sum_sq += d * d
+    sum_abs += d
+
+l2 = math.sqrt(sum_sq)
+mae = sum_abs / n
+rmse = math.sqrt(sum_sq / n)
+
+# Also compute relative error vs output magnitude
+mag = math.sqrt(sum(v*v for v in pytorch) / n)
+
+print(f'  output length:    {n}')
+print(f'  max abs error:    {max_err:.6e}')
+print(f'  mean abs error:   {mae:.6e}')
+print(f'  RMSE:             {rmse:.6e}')
+print(f'  L2 norm of diff:  {l2:.6e}')
+print(f'  RMS output mag:   {mag:.6e}')
+if mag > 0:
+    print(f'  relative RMSE:    {rmse/mag:.6e}')
+
+if max_err < 1e-3:
+    print('  PASS: outputs match within 1e-3')
+elif max_err < 1e-1:
+    print('  WARN: outputs differ (max error > 1e-3, likely floating-point divergence)')
+else:
+    print('  FAIL: outputs diverge significantly')
+" 2>/dev/null || echo "(output comparison requires python3)"
+        echo ""
+    fi
 }
 
 # ============================================================

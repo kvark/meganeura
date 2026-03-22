@@ -54,9 +54,15 @@ impl fmt::Display for TensorType {
 #[derive(Clone, Debug)]
 pub enum Op {
     // Leaf nodes
-    Parameter { name: String },
-    Input { name: String },
-    Constant { data: Vec<f32> },
+    Parameter {
+        name: String,
+    },
+    Input {
+        name: String,
+    },
+    Constant {
+        data: Vec<f32>,
+    },
 
     // Binary
     MatMul,
@@ -98,7 +104,9 @@ pub enum Op {
 
     // RMSNorm: x / sqrt(mean(x²) + eps) * weight
     // inputs: [x, weight], eps stored as f32 bits in params
-    RmsNorm { eps: f32 },
+    RmsNorm {
+        eps: f32,
+    },
 
     // Embedding lookup: indices → table rows
     // inputs: [indices (U32), table (F32)]
@@ -106,7 +114,9 @@ pub enum Op {
 
     // Rotary position embeddings
     // inputs: [x], params encode theta
-    RoPE { theta: f32 },
+    RoPE {
+        theta: f32,
+    },
 
     // Fused causal multi-head attention with GQA
     // inputs: [q, k, v] as 2D: q=[seq, num_heads*head_dim], k/v=[seq, num_kv_heads*head_dim]
@@ -123,7 +133,9 @@ pub enum Op {
 
     // Standard Layer Normalization: (x - mean) / sqrt(var + eps) * weight + bias
     // inputs: [x, weight, bias]
-    LayerNorm { eps: f32 },
+    LayerNorm {
+        eps: f32,
+    },
 
     // Non-causal (full) multi-head attention with GQA
     // inputs: [q, k, v] as 2D: q=[seq, num_heads*head_dim], k/v=[seq, num_kv_heads*head_dim]
@@ -259,6 +271,26 @@ impl Graph {
         self.add_node(Op::BiasAdd, vec![a, bias], ty)
     }
 
+    /// Broadcast-add a `[1, N]` tensor across a `[M, N]` tensor.
+    ///
+    /// Uses the BiasAdd shader which does `dst[i] = a[i] + b[i % N]`.
+    pub fn broadcast_add(&mut self, a: NodeId, b: NodeId) -> NodeId {
+        let a_shape = &self.node(a).ty.shape;
+        let b_shape = &self.node(b).ty.shape;
+        assert_eq!(a_shape.len(), 2, "broadcast_add requires 2D input");
+        assert_eq!(b_shape.len(), 2, "broadcast_add requires 2D addend");
+        assert_eq!(
+            b_shape[0], 1,
+            "broadcast_add requires addend with first dim = 1"
+        );
+        assert_eq!(
+            a_shape[1], b_shape[1],
+            "broadcast_add requires matching last dim"
+        );
+        let ty = self.node(a).ty.clone();
+        self.add_node(Op::BiasAdd, vec![a, b], ty)
+    }
+
     pub fn mul(&mut self, a: NodeId, b: NodeId) -> NodeId {
         let a_ty = &self.node(a).ty;
         let b_ty = &self.node(b).ty;
@@ -333,7 +365,10 @@ impl Graph {
         let w_shape = &self.node(weight).ty.shape;
         assert_eq!(x_shape.len(), 2, "rms_norm requires 2D input");
         assert_eq!(w_shape.len(), 1, "rms_norm weight must be 1D");
-        assert_eq!(x_shape[1], w_shape[0], "rms_norm weight size must match last dim");
+        assert_eq!(
+            x_shape[1], w_shape[0],
+            "rms_norm weight size must match last dim"
+        );
         let ty = self.node(x).ty.clone();
         self.add_node(Op::RmsNorm { eps }, vec![x, weight], ty)
     }
@@ -352,7 +387,11 @@ impl Graph {
     pub fn embedding(&mut self, indices: NodeId, table: NodeId) -> NodeId {
         let idx_shape = &self.node(indices).ty.shape;
         let tbl_shape = &self.node(table).ty.shape;
-        assert_eq!(self.node(indices).ty.dtype, DType::U32, "embedding indices must be U32");
+        assert_eq!(
+            self.node(indices).ty.dtype,
+            DType::U32,
+            "embedding indices must be U32"
+        );
         assert_eq!(idx_shape.len(), 1, "embedding indices must be 1D");
         assert_eq!(tbl_shape.len(), 2, "embedding table must be 2D");
         let seq_len = idx_shape[0];
@@ -385,11 +424,23 @@ impl Graph {
         assert_eq!(k_shape.len(), 2, "k must be 2D");
         assert_eq!(v_shape.len(), 2, "v must be 2D");
         let seq = q_shape[0];
-        assert_eq!(q_shape[1], (num_heads * head_dim) as usize, "q dim mismatch");
+        assert_eq!(
+            q_shape[1],
+            (num_heads * head_dim) as usize,
+            "q dim mismatch"
+        );
         assert_eq!(k_shape[0], seq, "k seq must match q seq");
-        assert_eq!(k_shape[1], (num_kv_heads * head_dim) as usize, "k dim mismatch");
+        assert_eq!(
+            k_shape[1],
+            (num_kv_heads * head_dim) as usize,
+            "k dim mismatch"
+        );
         assert_eq!(v_shape[0], seq, "v seq must match q seq");
-        assert_eq!(v_shape[1], (num_kv_heads * head_dim) as usize, "v dim mismatch");
+        assert_eq!(
+            v_shape[1],
+            (num_kv_heads * head_dim) as usize,
+            "v dim mismatch"
+        );
         let ty = TensorType::f32(vec![seq, (num_heads * head_dim) as usize]);
         self.add_node(
             Op::CausalAttention {
@@ -416,8 +467,14 @@ impl Graph {
         assert_eq!(x_shape.len(), 2, "layer_norm requires 2D input");
         assert_eq!(w_shape.len(), 1, "layer_norm weight must be 1D");
         assert_eq!(b_shape.len(), 1, "layer_norm bias must be 1D");
-        assert_eq!(x_shape[1], w_shape[0], "layer_norm weight size must match last dim");
-        assert_eq!(x_shape[1], b_shape[0], "layer_norm bias size must match last dim");
+        assert_eq!(
+            x_shape[1], w_shape[0],
+            "layer_norm weight size must match last dim"
+        );
+        assert_eq!(
+            x_shape[1], b_shape[0],
+            "layer_norm bias size must match last dim"
+        );
         let ty = self.node(x).ty.clone();
         self.add_node(Op::LayerNorm { eps }, vec![x, weight, bias], ty)
     }
@@ -438,11 +495,23 @@ impl Graph {
         assert_eq!(k_shape.len(), 2, "k must be 2D");
         assert_eq!(v_shape.len(), 2, "v must be 2D");
         let seq = q_shape[0];
-        assert_eq!(q_shape[1], (num_heads * head_dim) as usize, "q dim mismatch");
+        assert_eq!(
+            q_shape[1],
+            (num_heads * head_dim) as usize,
+            "q dim mismatch"
+        );
         assert_eq!(k_shape[0], seq, "k seq must match q seq");
-        assert_eq!(k_shape[1], (num_kv_heads * head_dim) as usize, "k dim mismatch");
+        assert_eq!(
+            k_shape[1],
+            (num_kv_heads * head_dim) as usize,
+            "k dim mismatch"
+        );
         assert_eq!(v_shape[0], seq, "v seq must match q seq");
-        assert_eq!(v_shape[1], (num_kv_heads * head_dim) as usize, "v dim mismatch");
+        assert_eq!(
+            v_shape[1],
+            (num_kv_heads * head_dim) as usize,
+            "v dim mismatch"
+        );
         let ty = TensorType::f32(vec![seq, (num_heads * head_dim) as usize]);
         self.add_node(
             Op::FullAttention {
@@ -472,10 +541,22 @@ impl Graph {
         assert_eq!(v_shape.len(), 2, "v must be 2D");
         let q_seq = q_shape[0];
         let kv_seq = k_shape[0];
-        assert_eq!(q_shape[1], (num_heads * head_dim) as usize, "q dim mismatch");
-        assert_eq!(k_shape[1], (num_kv_heads * head_dim) as usize, "k dim mismatch");
+        assert_eq!(
+            q_shape[1],
+            (num_heads * head_dim) as usize,
+            "q dim mismatch"
+        );
+        assert_eq!(
+            k_shape[1],
+            (num_kv_heads * head_dim) as usize,
+            "k dim mismatch"
+        );
         assert_eq!(v_shape[0], kv_seq, "v seq must match k seq");
-        assert_eq!(v_shape[1], (num_kv_heads * head_dim) as usize, "v dim mismatch");
+        assert_eq!(
+            v_shape[1],
+            (num_kv_heads * head_dim) as usize,
+            "v dim mismatch"
+        );
         let ty = TensorType::f32(vec![q_seq, (num_heads * head_dim) as usize]);
         self.add_node(
             Op::CrossAttention {

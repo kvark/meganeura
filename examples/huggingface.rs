@@ -14,8 +14,7 @@
 ///   data/t10k-images-idx3-ubyte.gz
 ///   data/t10k-labels-idx1-ubyte.gz
 use meganeura::{
-    Graph, MnistDataset, build_inference_session,
-    data::safetensors::SafeTensorsModel,
+    Graph, MnistDataset, build_inference_session, data::safetensors::SafeTensorsModel,
 };
 use std::path::{Path, PathBuf};
 
@@ -94,7 +93,11 @@ fn main() {
     // but meganeura matmul expects (in_features, out_features).
     // Weight matrices need transposing; biases are loaded as-is.
     println!("loading weights...");
-    for name in ["input_layer.weight", "mid_layer.weight", "output_layer.weight"] {
+    for name in [
+        "input_layer.weight",
+        "mid_layer.weight",
+        "output_layer.weight",
+    ] {
         let data = hf
             .tensor_f32_transposed(name)
             .unwrap_or_else(|e| panic!("failed to load {}: {}", name, e));
@@ -158,16 +161,17 @@ fn main() {
                 true_label,
                 predicted,
                 probs[predicted] * 100.0,
-                if predicted == true_label { "OK" } else { "WRONG" }
+                if predicted == true_label {
+                    "OK"
+                } else {
+                    "WRONG"
+                }
             );
         }
     }
 
     let accuracy = correct as f64 / total as f64 * 100.0;
-    println!(
-        "\naccuracy: {}/{} ({:.2}%)",
-        correct, total, accuracy
-    );
+    println!("\naccuracy: {}/{} ({:.2}%)", correct, total, accuracy);
 
     // Save Perfetto trace when profiling.
     if let Some(ref trace_file) = trace_path {
@@ -188,8 +192,7 @@ fn load_mnist_test(data_dir: &Path) -> MnistDataset {
             .expect("failed to parse MNIST gz files");
     }
     if raw_images.exists() && raw_labels.exists() {
-        return MnistDataset::load(&raw_images, &raw_labels)
-            .expect("failed to parse MNIST files");
+        return MnistDataset::load(&raw_images, &raw_labels).expect("failed to parse MNIST files");
     }
     panic!(
         "MNIST test data not found in {}.\n\

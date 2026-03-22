@@ -41,16 +41,30 @@ fn cache_roundtrip_preserves_plan() {
     cache::save_plan(&plan, &g, &path).unwrap();
 
     // Load it back
-    let loaded = cache::load_plan(&g, &path).unwrap().expect("cache should hit");
+    let loaded = cache::load_plan(&g, &path)
+        .unwrap()
+        .expect("cache should hit");
 
     // Every field must match
     assert_eq!(plan.buffers, loaded.buffers, "buffer sizes");
     assert_eq!(plan.param_buffers, loaded.param_buffers, "param_buffers");
     assert_eq!(plan.input_buffers, loaded.input_buffers, "input_buffers");
     assert_eq!(plan.loss_buffer, loaded.loss_buffer, "loss_buffer");
-    assert_eq!(plan.param_grad_pairs, loaded.param_grad_pairs, "param_grad_pairs");
-    assert_eq!(plan.dispatches.len(), loaded.dispatches.len(), "dispatch count");
-    for (i, (a, b)) in plan.dispatches.iter().zip(loaded.dispatches.iter()).enumerate() {
+    assert_eq!(
+        plan.param_grad_pairs, loaded.param_grad_pairs,
+        "param_grad_pairs"
+    );
+    assert_eq!(
+        plan.dispatches.len(),
+        loaded.dispatches.len(),
+        "dispatch count"
+    );
+    for (i, (a, b)) in plan
+        .dispatches
+        .iter()
+        .zip(loaded.dispatches.iter())
+        .enumerate()
+    {
         assert_eq!(a.shader, b.shader, "dispatch[{}] shader", i);
         assert_eq!(a.workgroups, b.workgroups, "dispatch[{}] workgroups", i);
         assert_eq!(a.input_buffers, b.input_buffers, "dispatch[{}] inputs", i);
@@ -71,7 +85,9 @@ fn infer_from_loaded_plan() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("inference_plan2.ron");
     cache::save_plan(&plan, &g, &path).unwrap();
-    let loaded = cache::load_plan(&g, &path).unwrap().expect("cache should hit");
+    let loaded = cache::load_plan(&g, &path)
+        .unwrap()
+        .expect("cache should hit");
 
     // Build a GPU session from the loaded plan and run inference
     let mut session = Session::new(loaded);
@@ -93,7 +109,12 @@ fn infer_from_loaded_plan() {
     // All outputs should be finite and non-zero (matmul+bias with non-zero weights/input)
     for (i, &v) in output.iter().enumerate() {
         assert!(v.is_finite(), "output[{}] = {} is not finite", i, v);
-        assert!(v.abs() > 1e-10, "output[{}] = {} is unexpectedly zero", i, v);
+        assert!(
+            v.abs() > 1e-10,
+            "output[{}] = {} is unexpectedly zero",
+            i,
+            v
+        );
     }
 
     let _ = std::fs::remove_file(&path);

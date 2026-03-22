@@ -149,7 +149,10 @@ fn main() {
     }
 
     // --- Benchmark ---
-    eprintln!("benchmarking ({} runs, {} tokens each)...", runs, max_tokens);
+    eprintln!(
+        "benchmarking ({} runs, {} tokens each)...",
+        runs, max_tokens
+    );
     let mut latencies = Vec::new();
     let mut ttft_values = Vec::new();
     let mut sample_output = String::new();
@@ -229,6 +232,9 @@ fn main() {
     if let Some(path) = trace_path {
         eprintln!("saving trace to {}...", path);
         meganeura::profiler::save(&path).expect("failed to save trace");
-        eprintln!("trace saved ({} events)", meganeura::profiler::event_count());
+        eprintln!(
+            "trace saved ({} events)",
+            meganeura::profiler::event_count()
+        );
     }
 }

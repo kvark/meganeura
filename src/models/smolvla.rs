@@ -86,7 +86,7 @@ impl SmolVLAConfig {
                 scale_factor: 4,
             },
             expert: ExpertConfig {
-                hidden_size: 720,  // 960 * 0.75
+                hidden_size: 720, // 960 * 0.75
                 num_layers: 16,
                 num_attention_heads: 15,
                 num_key_value_heads: 5,
@@ -157,8 +157,9 @@ pub fn build_action_expert(
     let time_h = g.bias_add(time_h, time_in_b);
     let time_h = g.silu(time_h);
     let time_h = g.matmul(time_h, time_out_w);
-    let _time_embed = g.bias_add(time_h, time_out_b);
+    let time_embed = g.bias_add(time_h, time_out_b);
     // time_embed: [1, expert_hidden] — broadcast-added to action tokens
+    x = g.broadcast_add(x, time_embed);
 
     // VLM hidden states for cross-attention KV
     let _vlm_hidden = g.input("vlm_hidden", &[vlm_seq_len, text_hidden]);
@@ -198,10 +199,7 @@ pub fn build_action_expert(
 
             // VLM K/V: project VLM hidden → kv_dim using VLM's projections
             // The cross-attention reuses VLM's pre-computed KV
-            let vlm_kv = g.input(
-                &format!("vlm_kv_layer_{}", i),
-                &[vlm_seq_len, kv_dim],
-            );
+            let vlm_kv = g.input(&format!("vlm_kv_layer_{}", i), &[vlm_seq_len, kv_dim]);
             let k = g.matmul(vlm_kv, wk);
             let v = g.matmul(vlm_kv, wv);
 
@@ -300,10 +298,7 @@ pub fn build_action_expert(
 /// Projects robot state observations into the VLM embedding space.
 /// Input: "observation_state" F32 `[1, state_dim]`
 /// Returns: projected state token `[1, text_hidden]`
-pub fn build_state_projection(
-    g: &mut Graph,
-    config: &SmolVLAConfig,
-) -> NodeId {
+pub fn build_state_projection(g: &mut Graph, config: &SmolVLAConfig) -> NodeId {
     let state_input = g.input("observation_state", &[1, config.max_state_dim]);
     let w = g.parameter(
         "model.state_proj.weight",

@@ -127,11 +127,7 @@ impl SmolVLM2Config {
 ///   where patch_dim = 3 * patch_size² (patches extracted and flattened on CPU).
 ///
 /// Returns the vision feature tensor node, shape `[num_patches, vision_hidden]`.
-pub fn build_vision_encoder(
-    g: &mut Graph,
-    config: &VisionConfig,
-    num_patches: usize,
-) -> NodeId {
+pub fn build_vision_encoder(g: &mut Graph, config: &VisionConfig, num_patches: usize) -> NodeId {
     let hidden = config.hidden_size;
     let eps = config.layer_norm_eps;
     let num_heads = config.num_attention_heads;
@@ -171,26 +167,17 @@ pub fn build_vision_encoder(
             &format!("{}.self_attn.q_proj.weight", prefix),
             &[hidden, hidden],
         );
-        let bq = g.parameter(
-            &format!("{}.self_attn.q_proj.bias", prefix),
-            &[hidden],
-        );
+        let bq = g.parameter(&format!("{}.self_attn.q_proj.bias", prefix), &[hidden]);
         let wk = g.parameter(
             &format!("{}.self_attn.k_proj.weight", prefix),
             &[hidden, hidden],
         );
-        let bk = g.parameter(
-            &format!("{}.self_attn.k_proj.bias", prefix),
-            &[hidden],
-        );
+        let bk = g.parameter(&format!("{}.self_attn.k_proj.bias", prefix), &[hidden]);
         let wv = g.parameter(
             &format!("{}.self_attn.v_proj.weight", prefix),
             &[hidden, hidden],
         );
-        let bv = g.parameter(
-            &format!("{}.self_attn.v_proj.bias", prefix),
-            &[hidden],
-        );
+        let bv = g.parameter(&format!("{}.self_attn.v_proj.bias", prefix), &[hidden]);
 
         let q = g.matmul(h, wq);
         let q = g.bias_add(q, bq);
@@ -207,10 +194,7 @@ pub fn build_vision_encoder(
             &format!("{}.self_attn.out_proj.weight", prefix),
             &[hidden, hidden],
         );
-        let bo = g.parameter(
-            &format!("{}.self_attn.out_proj.bias", prefix),
-            &[hidden],
-        );
+        let bo = g.parameter(&format!("{}.self_attn.out_proj.bias", prefix), &[hidden]);
         let attn_out = g.matmul(attn, wo);
         let attn_out = g.bias_add(attn_out, bo);
 
@@ -356,11 +340,7 @@ pub fn build_text_decoder(
 /// - "combined_embeds": F32 `[total_seq_len, text_hidden]` — combined vision + text embeddings
 ///
 /// Returns logits node, shape `[total_seq_len, vocab_size]`.
-pub fn build_graph(
-    g: &mut Graph,
-    config: &SmolVLM2Config,
-    text_seq_len: usize,
-) -> NodeId {
+pub fn build_graph(g: &mut Graph, config: &SmolVLM2Config, text_seq_len: usize) -> NodeId {
     let num_patches = config.vision.num_patches();
     let num_vision_tokens = config.num_vision_tokens();
     let total_seq_len = num_vision_tokens + text_seq_len;
@@ -397,10 +377,7 @@ pub fn build_graph(
     let _text_embeds = g.embedding(token_ids, embed_weight);
 
     // Combined sequence embedding input
-    let combined_embeds = g.input(
-        "combined_embeds",
-        &[total_seq_len, config.text.hidden_size],
-    );
+    let combined_embeds = g.input("combined_embeds", &[total_seq_len, config.text.hidden_size]);
 
     // Text decoder
     let logits = build_text_decoder(g, &config.text, combined_embeds, total_seq_len);

@@ -48,7 +48,11 @@ impl SafeTensorsModel {
         repo_id: &str,
         filename: &str,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        log::info!("downloading {}/{} from HuggingFace Hub...", repo_id, filename);
+        log::info!(
+            "downloading {}/{} from HuggingFace Hub...",
+            repo_id,
+            filename
+        );
         let api = hf_hub::api::sync::Api::new()?;
         let repo = api.model(repo_id.to_string());
         let path = repo.get(filename)?;

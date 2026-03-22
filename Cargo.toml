@@ -10,9 +10,8 @@ description = "E-graph optimized neural network training on blade-graphics"
 license = "MIT"
 
 [dependencies]
-# Needs https://github.com/kvark/blade/pull/316
-blade-graphics = { git = "https://github.com/kvark/blade.git", rev = "69e0c547b77c4d513e51339be7152a2704742240" }
-blade-macros = { git = "https://github.com/kvark/blade.git", rev = "69e0c547b77c4d513e51339be7152a2704742240" }
+blade-graphics = { git = "https://github.com/kvark/blade.git", rev = "c68ad15339d754f234f3bcc845f41fea55617b39" }
+blade-macros = { git = "https://github.com/kvark/blade.git", rev = "c68ad15339d754f234f3bcc845f41fea55617b39" }
 egglog = "2.0"
 bytemuck = { version = "1", features = ["derive"] }
 naga = { version = "29", features = ["wgsl-out"] }

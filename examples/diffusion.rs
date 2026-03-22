@@ -37,8 +37,7 @@ fn main() {
         "generating {} denoising pairs (σ={})...",
         n_samples, noise_level
     );
-    let (noisy_images, noise_targets) =
-        generate_denoising_data(n_samples, img_dim, noise_level);
+    let (noisy_images, noise_targets) = generate_denoising_data(n_samples, img_dim, noise_level);
     let mut loader = DataLoader::new(noisy_images, noise_targets, img_dim, img_dim, batch);
     println!(
         "{} samples, {} batches/epoch",
@@ -88,9 +87,10 @@ fn main() {
     g.set_outputs(vec![loss]);
 
     println!("denoising MLP: 4 layers, {} hidden units", hidden);
-    println!("parameters: {}",
+    println!(
+        "parameters: {}",
         2 * (img_dim * hidden + hidden)       // layers 1 & 4
-        + 2 * (hidden * hidden + hidden)      // layers 2 & 3
+        + 2 * (hidden * hidden + hidden) // layers 2 & 3
     );
 
     // --- Build session ---
@@ -163,11 +163,7 @@ fn main() {
 /// Clean images are procedural 28×28 patterns (gradients, circles,
 /// checkerboards). Noise is sampled from a simple deterministic PRNG
 /// that approximates Gaussian via the Irwin-Hall method.
-fn generate_denoising_data(
-    n: usize,
-    dim: usize,
-    noise_level: f32,
-) -> (Vec<f32>, Vec<f32>) {
+fn generate_denoising_data(n: usize, dim: usize, noise_level: f32) -> (Vec<f32>, Vec<f32>) {
     let side = (dim as f32).sqrt() as usize; // 28 for dim=784
 
     let mut noisy = vec![0.0_f32; n * dim];
@@ -206,11 +202,7 @@ fn generate_denoising_data(
                         let dx = fx - 0.5;
                         let dy = fy - 0.5;
                         let r = (dx * dx + dy * dy).sqrt();
-                        if r < 0.3 + phase * 0.1 {
-                            1.0
-                        } else {
-                            0.0
-                        }
+                        if r < 0.3 + phase * 0.1 { 1.0 } else { 0.0 }
                     }
                     3 => {
                         // checkerboard (varying frequency)
