@@ -533,6 +533,47 @@ impl Session {
         }
     }
 
+    /// Print GPU pass timings from the last completed step.
+    ///
+    /// Must be called after `step()` + `wait()`, then another `step()`
+    /// (which triggers `encoder.start()` to collect timings from the
+    /// previous submission).
+    pub fn dump_gpu_timings(&self) {
+        let timings = self.encoder.timings();
+        if timings.is_empty() {
+            eprintln!("(no GPU timings available)");
+            return;
+        }
+        let total: std::time::Duration = timings.iter().map(|&(_, d)| d).sum();
+        eprintln!(
+            "--- GPU pass timings ({} passes, {:.2}ms total) ---",
+            timings.len(),
+            total.as_secs_f64() * 1000.0
+        );
+
+        // Aggregate by shader type
+        let mut by_type: std::collections::HashMap<&str, (u32, std::time::Duration)> =
+            std::collections::HashMap::new();
+        for &(ref name, dur) in timings {
+            let entry = by_type.entry(name.as_str()).or_default();
+            entry.0 += 1;
+            entry.1 += dur;
+        }
+        let mut sorted: Vec<_> = by_type.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.1.cmp(&a.1.1));
+        for &(name, (count, dur)) in &sorted {
+            let pct = dur.as_secs_f64() / total.as_secs_f64() * 100.0;
+            eprintln!(
+                "  {:>20}: {:>3}x {:>8.2}ms ({:>5.1}%)",
+                name,
+                count,
+                dur.as_secs_f64() * 1000.0,
+                pct
+            );
+        }
+        eprintln!("---");
+    }
+
     /// Wait for any pending GPU work.
     pub fn wait(&mut self) {
         if let Some(sp) = self.sync_point.take() {

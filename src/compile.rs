@@ -359,7 +359,7 @@ impl<'a> Compiler<'a> {
                 let cols = shape[1] as u32;
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::RmsNorm,
-                    workgroups: [ceil_div(rows, 256), 1, 1],
+                    workgroups: [rows, 1, 1], // one workgroup per row
                     input_buffers: vec![x, w],
                     output_buffer: out_buf,
                     params: vec![rows, cols, eps.to_bits(), 0],

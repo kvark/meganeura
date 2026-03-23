@@ -580,19 +580,7 @@ pub fn generate_wgsl(group: ShaderGroup) -> String {
 
 /// Convert a naga Module to WGSL source text.
 pub fn module_to_wgsl(module: &Module, capabilities: naga::valid::Capabilities) -> String {
-    module_to_wgsl_flags(
-        module,
-        capabilities,
-        naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS,
-    )
-}
-
-/// Convert a naga Module to WGSL with custom validation flags.
-pub fn module_to_wgsl_flags(
-    module: &Module,
-    capabilities: naga::valid::Capabilities,
-    flags: naga::valid::ValidationFlags,
-) -> String {
+    let flags = naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
     let info = naga::valid::Validator::new(flags, capabilities)
         .validate(module)
         .expect("generated module failed validation");
@@ -2108,21 +2096,33 @@ fn gen_cross_entropy() -> Module {
 // rms_norm.wgsl: y[i,j] = x[i,j] / sqrt(mean(x[i,:]²) + eps) * weight[j]
 // ---------------------------------------------------------------------------
 
+/// Parallel RMSNorm: one workgroup (256 threads) per row.
+///
+/// Each thread handles cols/256 elements, then tree-reduces the partial
+/// sums-of-squares in shared memory. Much faster than the serial version
+/// for wide rows (e.g. 720 columns in SmolVLA).
+///
+/// Dispatch: [rows, 1, 1].
 fn gen_rms_norm() -> Module {
+    const WG: u32 = 256;
+
     let mut b = Builder::new();
     // params: rows, cols, eps_bits, _pad
     let ty_params = b.params_u32x4("Params", &["rows", "cols", "eps_bits", "_pad"]);
     let gv_src = b.storage_ro("src");
-    let gv_weight = b.storage_ro("bias"); // named "bias" to match blade binding convention
+    let gv_weight = b.storage_ro("bias"); // named "bias" to match blade binding
     let gv_dst = b.storage_rw("dst");
     let gv_params = b.uniform("params", ty_params);
+    let gv_shared = b.workgroup_array("shared", WG);
 
     let mut f = FnBuilder::new(&b);
-    let gid = f.arg_gid();
-    let row = f.vec_x(gid);
-    f.label("row", row);
-    f.emit(row, row);
+    let wgid = f.arg_wgid();
+    let lid = f.arg_lid();
+    let row = f.vec_x(wgid);
+    let tid = f.vec_x(lid);
+    f.emit(row, tid);
 
+    // Load params
     let params_ptr = f.global(gv_params);
     let rows_ptr = f.field(params_ptr, 0);
     let rows = f.load(rows_ptr);
@@ -2137,6 +2137,7 @@ fn gen_rms_norm() -> Module {
     });
     f.emit(params_ptr, eps);
 
+    // Early return for extra workgroups
     let cond = f.binary(BinaryOperator::GreaterEqual, row, rows);
     f.emit(cond, cond);
     f.f.body.push(f.if_return(cond), S);
@@ -2145,7 +2146,8 @@ fn gen_rms_norm() -> Module {
     let offset = f.binary(BinaryOperator::Multiply, row, cols);
     f.emit(offset, offset);
 
-    // Compute sum of squares: var ss = 0.0; for j in 0..cols { ss += x[offset+j]² }
+    // Phase 1: Each thread accumulates partial sum of squares
+    // for (j = tid; j < cols; j += WG) { partial_ss += src[offset+j]² }
     let ss_var = f.local_var("ss", b.ty_f32, None);
     let ss_ptr = f.local_ptr(ss_var);
     let zero_f = f.literal_f32(0.0);
@@ -2154,14 +2156,15 @@ fn gen_rms_norm() -> Module {
 
     let j_var = f.local_var("j", b.ty_u32, None);
     let j_ptr = f.local_ptr(j_var);
-    let zero_u = f.literal_u32(0);
-    f.emit(zero_u, zero_u);
-    f.f.body.push(f.store(j_ptr, zero_u), S);
+    f.f.body.push(f.store(j_ptr, tid), S); // j starts at tid
 
     {
         let mut body = Block::new();
         let j = f.load(j_ptr);
         let brk = f.binary(BinaryOperator::GreaterEqual, j, cols);
+        push_emit(&f.f.expressions, &mut body, j, brk);
+        body.push(FnBuilder::if_break(brk), S);
+
         let idx = f.binary(BinaryOperator::Add, offset, j);
         let src_ptr = f.global(gv_src);
         let elem = f.index(src_ptr, idx);
@@ -2169,15 +2172,14 @@ fn gen_rms_norm() -> Module {
         let sq = f.binary(BinaryOperator::Multiply, val, val);
         let old_ss = f.load(ss_ptr);
         let new_ss = f.binary(BinaryOperator::Add, old_ss, sq);
-        push_emit(&f.f.expressions, &mut body, j, brk);
-        body.push(FnBuilder::if_break(brk), S);
         push_emit(&f.f.expressions, &mut body, idx, new_ss);
         body.push(f.store(ss_ptr, new_ss), S);
 
-        let one = f.literal_u32(1);
+        // j += WG
+        let wg_size = f.literal_u32(WG);
         let j2 = f.load(j_ptr);
-        let jn = f.binary(BinaryOperator::Add, j2, one);
-        push_emit(&f.f.expressions, &mut body, one, jn);
+        let jn = f.binary(BinaryOperator::Add, j2, wg_size);
+        push_emit(&f.f.expressions, &mut body, wg_size, jn);
         body.push(f.store(j_ptr, jn), S);
 
         f.f.body.push(
@@ -2190,25 +2192,96 @@ fn gen_rms_norm() -> Module {
         );
     }
 
-    // rms = 1.0 / sqrt(ss / cols_f + eps)
-    let ss_val = f.load(ss_ptr);
+    // Store partial sum to shared memory
+    let partial_ss = f.load(ss_ptr);
+    let sh_ptr = f.global(gv_shared);
+    let sh_elem = f.index(sh_ptr, tid);
+    f.emit(partial_ss, sh_elem);
+    f.f.body.push(f.store(sh_elem, partial_ss), S);
+    f.f.body
+        .push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
+
+    // Phase 2: Tree reduction in shared memory
+    // for (stride = 128; stride > 0; stride /= 2)
+    let stride_var = f.local_var("stride", b.ty_u32, None);
+    let stride_ptr = f.local_ptr(stride_var);
+    let init_stride = f.literal_u32(WG / 2);
+    f.emit(init_stride, init_stride);
+    f.f.body.push(f.store(stride_ptr, init_stride), S);
+
+    {
+        let mut body = Block::new();
+        let stride = f.load(stride_ptr);
+        let zero_s = f.literal_u32(0);
+        let brk = f.binary(BinaryOperator::LessEqual, stride, zero_s);
+        push_emit(&f.f.expressions, &mut body, stride, brk);
+        body.push(FnBuilder::if_break(brk), S);
+
+        // if (tid < stride) { shared[tid] += shared[tid + stride] }
+        let cond_r = f.binary(BinaryOperator::Less, tid, stride);
+        let partner = f.binary(BinaryOperator::Add, tid, stride);
+        let sh_ptr2 = f.global(gv_shared);
+        let sh_self = f.index(sh_ptr2, tid);
+        let sh_partner = f.index(sh_ptr2, partner);
+        let self_val = f.load(sh_self);
+        let partner_val = f.load(sh_partner);
+        let sum = f.binary(BinaryOperator::Add, self_val, partner_val);
+        push_emit(&f.f.expressions, &mut body, cond_r, sum);
+
+        let mut accept = Block::new();
+        accept.push(f.store(sh_self, sum), S);
+        body.push(
+            Statement::If {
+                condition: cond_r,
+                accept,
+                reject: Block::new(),
+            },
+            S,
+        );
+
+        body.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
+
+        // stride /= 2
+        let two = f.literal_u32(2);
+        let s2 = f.load(stride_ptr);
+        let next = f.binary(BinaryOperator::Divide, s2, two);
+        push_emit(&f.f.expressions, &mut body, two, next);
+        body.push(f.store(stride_ptr, next), S);
+
+        f.f.body.push(
+            Statement::Loop {
+                body,
+                continuing: Block::new(),
+                break_if: None,
+            },
+            S,
+        );
+    }
+
+    // Phase 3: Compute rsqrt from shared[0]
+    let sh_ptr3 = f.global(gv_shared);
+    let zero_idx = f.literal_u32(0);
+    let sh_zero = f.index(sh_ptr3, zero_idx);
+    let total_ss = f.load(sh_zero);
     let cols_f = f.cast_f32(cols);
-    let mean_sq = f.binary(BinaryOperator::Divide, ss_val, cols_f);
+    let mean_sq = f.binary(BinaryOperator::Divide, total_ss, cols_f);
     let mean_sq_eps = f.binary(BinaryOperator::Add, mean_sq, eps);
     let rsqrt = f.math1(MathFunction::InverseSqrt, mean_sq_eps);
-    f.emit(ss_val, rsqrt);
+    f.emit(sh_ptr3, rsqrt);
 
-    // Normalize loop: dst[offset+j] = x[offset+j] * rsqrt * weight[j]
+    // Phase 4: Normalize output
+    // for (j = tid; j < cols; j += WG) { dst[offset+j] = src[offset+j] * rsqrt * weight[j] }
     let j2_var = f.local_var("j2", b.ty_u32, None);
     let j2_ptr = f.local_ptr(j2_var);
-    let zero_u2 = f.literal_u32(0);
-    f.emit(zero_u2, zero_u2);
-    f.f.body.push(f.store(j2_ptr, zero_u2), S);
+    f.f.body.push(f.store(j2_ptr, tid), S);
 
     {
         let mut body = Block::new();
         let j = f.load(j2_ptr);
         let brk = f.binary(BinaryOperator::GreaterEqual, j, cols);
+        push_emit(&f.f.expressions, &mut body, j, brk);
+        body.push(FnBuilder::if_break(brk), S);
+
         let idx = f.binary(BinaryOperator::Add, offset, j);
         let src_ptr = f.global(gv_src);
         let elem = f.index(src_ptr, idx);
@@ -2218,8 +2291,6 @@ fn gen_rms_norm() -> Module {
         let w_elem = f.index(w_ptr, j);
         let w_val = f.load(w_elem);
         let result = f.binary(BinaryOperator::Multiply, normed, w_val);
-        push_emit(&f.f.expressions, &mut body, j, brk);
-        body.push(FnBuilder::if_break(brk), S);
         push_emit(&f.f.expressions, &mut body, idx, result);
 
         let dst_ptr = f.global(gv_dst);
@@ -2227,10 +2298,11 @@ fn gen_rms_norm() -> Module {
         push_emit(&f.f.expressions, &mut body, dst_elem, dst_elem);
         body.push(f.store(dst_elem, result), S);
 
-        let one = f.literal_u32(1);
+        // j += WG
+        let wg_size = f.literal_u32(WG);
         let j3 = f.load(j2_ptr);
-        let jn = f.binary(BinaryOperator::Add, j3, one);
-        push_emit(&f.f.expressions, &mut body, one, jn);
+        let jn = f.binary(BinaryOperator::Add, j3, wg_size);
+        push_emit(&f.f.expressions, &mut body, wg_size, jn);
         body.push(f.store(j2_ptr, jn), S);
 
         f.f.body.push(
@@ -2243,7 +2315,7 @@ fn gen_rms_norm() -> Module {
         );
     }
 
-    b.entry_point("main", [256, 1, 1], f.finish());
+    b.entry_point("main", [WG, 1, 1], f.finish());
     b.finish()
 }
 

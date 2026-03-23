@@ -151,10 +151,24 @@ fn main() {
         eprintln!("output saved to {} ({} floats)", output_path, output.len());
     }
 
-    // --- Warmup ---
+    // --- Warmup + GPU timing dump ---
     eprintln!("warming up ({} runs)...", warmup);
     for _ in 0..warmup {
         run_denoise(&mut session);
+    }
+    // Run one more step to trigger encoder.start() which collects timings
+    // from the previous submission.
+    {
+        session.set_input("noisy_actions", &noisy_actions);
+        session.set_input("timestep", &timestep);
+        for i in 0..config.expert.num_layers {
+            if i % config.expert.self_attn_every_n_layers != 0 {
+                session.set_input(&format!("vlm_kv_layer_{}", i), &vlm_kv);
+            }
+        }
+        session.step();
+        session.dump_gpu_timings();
+        session.wait();
     }
 
     // --- Benchmark ---
