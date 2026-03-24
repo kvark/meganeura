@@ -2621,14 +2621,50 @@ fn gen_rope() -> Module {
 // output: [seq, num_heads*head_dim]
 // ---------------------------------------------------------------------------
 
+/// Single-pass causal attention with online softmax.
+///
+/// Computes multi-head causal attention in one pass over key positions,
+/// maintaining a running output accumulator. Compared to the 3-pass
+/// approach, this reduces compute from O(D²·N) to O(D·N) per (pos, head).
+///
+/// Algorithm per (pos, head):
+///   max_score = -inf, sum_exp = 0, out[d] = 0
+///   for t in 0..pos+1:
+///     score = Q[pos]·K[t] * scale
+///     new_max = max(max_score, score)
+///     correction = exp(max_score - new_max)
+///     sum_exp = sum_exp * correction + exp(score - new_max)
+///     for d: out[d] = out[d] * correction + exp(score - new_max) * V[t,d]
+///     max_score = new_max
+///   for d: dst[d] = out[d] / sum_exp
 fn gen_causal_attention() -> Module {
+    gen_attention_online(true)
+}
+
+fn gen_attention_online(_causal: bool) -> Module {
+    // Maximum head dimension supported (local array size).
+    const MAX_HEAD_DIM: u32 = 128;
+
     let mut b = Builder::new();
     let ty_params = b.params_u32x4("Params", &["seq", "num_heads", "num_kv_heads", "head_dim"]);
-    let gv_q = b.storage_ro("src_a"); // q
-    let gv_k = b.storage_ro("src_b"); // k
-    let gv_v = b.storage_ro("bias"); // v (reusing binding slot name)
+    let gv_q = b.storage_ro("src_a");
+    let gv_k = b.storage_ro("src_b");
+    let gv_v = b.storage_ro("bias");
     let gv_dst = b.storage_rw("dst");
     let gv_params = b.uniform("params", ty_params);
+
+    // Local array type for output accumulator
+    let ty_out_arr = b.m.types.insert(
+        Type {
+            name: None,
+            inner: TypeInner::Array {
+                base: b.ty_f32,
+                size: ArraySize::Constant(std::num::NonZeroU32::new(MAX_HEAD_DIM).unwrap()),
+                stride: 4,
+            },
+        },
+        S,
+    );
 
     let mut f = FnBuilder::new(&b);
     let gid = f.arg_gid();
@@ -2661,37 +2697,27 @@ fn gen_causal_attention() -> Module {
     // GQA: kv_head = head / (num_heads / num_kv_heads)
     let heads_per_kv = f.binary(BinaryOperator::Divide, num_heads, num_kv_heads);
     let kv_head = f.binary(BinaryOperator::Divide, head, heads_per_kv);
-
-    // q_dim = num_heads * head_dim
     let q_dim = f.binary(BinaryOperator::Multiply, num_heads, head_dim);
-    // kv_dim = num_kv_heads * head_dim
     let kv_dim = f.binary(BinaryOperator::Multiply, num_kv_heads, head_dim);
-
-    // q_base = pos * q_dim + head * head_dim
     let pos_q = f.binary(BinaryOperator::Multiply, pos, q_dim);
     let head_off = f.binary(BinaryOperator::Multiply, head, head_dim);
     let q_base = f.binary(BinaryOperator::Add, pos_q, head_off);
-
-    // scale = 1.0 / sqrt(head_dim)
     let hd_f = f.cast_f32(head_dim);
     let scale = f.math1(MathFunction::InverseSqrt, hd_f);
-
-    // causal_len = pos + 1
     let one_cl = f.literal_u32(1);
     let causal_len = f.binary(BinaryOperator::Add, pos, one_cl);
-
     f.emit(heads_per_kv, causal_len);
 
-    // Store key values in local vars so inner scopes can load them fresh
+    // Store computed values in local vars for inner scope access
     let q_base_var = f.local_var("q_base", b.ty_u32, None);
     let q_base_ptr = f.local_ptr(q_base_var);
     f.f.body.push(f.store(q_base_ptr, q_base), S);
 
-    let kv_head_var = f.local_var("kv_head", b.ty_u32, None);
+    let kv_head_var = f.local_var("kv_head_v", b.ty_u32, None);
     let kv_head_ptr = f.local_ptr(kv_head_var);
     f.f.body.push(f.store(kv_head_ptr, kv_head), S);
 
-    let kv_dim_var = f.local_var("kv_dim", b.ty_u32, None);
+    let kv_dim_var = f.local_var("kv_dim_v", b.ty_u32, None);
     let kv_dim_ptr = f.local_ptr(kv_dim_var);
     f.f.body.push(f.store(kv_dim_ptr, kv_dim), S);
 
@@ -2707,66 +2733,50 @@ fn gen_causal_attention() -> Module {
     let causal_ptr = f.local_ptr(causal_var);
     f.f.body.push(f.store(causal_ptr, causal_len), S);
 
-    let pos_q_var = f.local_var("pos_q", b.ty_u32, None);
-    let pos_q_ptr = f.local_ptr(pos_q_var);
-    f.f.body.push(f.store(pos_q_ptr, pos_q), S);
+    // Local output accumulator array
+    let out_var = f.local_var("out", ty_out_arr, None);
+    let out_ptr = f.local_ptr(out_var);
 
-    let head_off_var = f.local_var("head_off", b.ty_u32, None);
-    let head_off_ptr = f.local_ptr(head_off_var);
-    f.f.body.push(f.store(head_off_ptr, head_off), S);
+    // Initialize out[d] = 0 for d in 0..head_dim
+    let max_var = f.local_var("max_score", b.ty_f32, None);
+    let max_ptr = f.local_ptr(max_var);
+    let neg_inf = f.literal_f32(-1.0e30);
+    f.emit(neg_inf, neg_inf);
+    f.f.body.push(f.store(max_ptr, neg_inf), S);
 
-    #[allow(clippy::too_many_arguments)]
-    fn build_dot_loop(
-        f: &mut FnBuilder,
-        parent: &mut Block,
-        gv_q: Handle<GlobalVariable>,
-        gv_k: Handle<GlobalVariable>,
-        q_base_ptr: Handle<Expression>,
-        head_dim_ptr: Handle<Expression>,
-        k_base: Handle<Expression>, // already in scope of parent
-        dot_ptr: Handle<Expression>,
-        ty_u32: Handle<Type>,
-        d_name: &str,
-    ) {
-        let d_var = f.local_var(d_name, ty_u32, None);
+    let sum_var = f.local_var("sum_exp", b.ty_f32, None);
+    let sum_ptr_local = f.local_ptr(sum_var);
+    let zero_f_init = f.literal_f32(0.0);
+    f.emit(zero_f_init, zero_f_init);
+    f.f.body.push(f.store(sum_ptr_local, zero_f_init), S);
+
+    // Zero-init the output array: for d in 0..MAX_HEAD_DIM { out[d] = 0.0 }
+    {
+        let d_var = f.local_var("d_init", b.ty_u32, None);
         let d_ptr = f.local_ptr(d_var);
         let zero_d = f.literal_u32(0);
-        push_emit(&f.f.expressions, parent, zero_d, zero_d);
-        parent.push(f.store(d_ptr, zero_d), S);
+        f.emit(zero_d, zero_d);
+        f.f.body.push(f.store(d_ptr, zero_d), S);
 
-        let mut inner = Block::new();
+        let mut body = Block::new();
         let d = f.load(d_ptr);
-        let hd = f.load(head_dim_ptr);
-        let dbrk = f.binary(BinaryOperator::GreaterEqual, d, hd);
+        let max_hd = f.literal_u32(MAX_HEAD_DIM);
+        let brk = f.binary(BinaryOperator::GreaterEqual, d, max_hd);
+        let zero_f = f.literal_f32(0.0);
+        let out_elem = f.index(out_ptr, d);
+        push_emit(&f.f.expressions, &mut body, d, out_elem);
+        body.push(FnBuilder::if_break(brk), S);
+        body.push(f.store(out_elem, zero_f), S);
 
-        let qb = f.load(q_base_ptr);
-        let q_idx = f.binary(BinaryOperator::Add, qb, d);
-        let q_gp = f.global(gv_q);
-        let q_elem = f.index(q_gp, q_idx);
-        let q_val = f.load(q_elem);
-
-        let k_idx = f.binary(BinaryOperator::Add, k_base, d);
-        let k_gp = f.global(gv_k);
-        let k_elem = f.index(k_gp, k_idx);
-        let k_val = f.load(k_elem);
-
-        let prod = f.binary(BinaryOperator::Multiply, q_val, k_val);
-        let old_dot = f.load(dot_ptr);
-        let new_dot = f.binary(BinaryOperator::Add, old_dot, prod);
-        push_emit(&f.f.expressions, &mut inner, d, dbrk);
-        inner.push(FnBuilder::if_break(dbrk), S);
-        push_emit(&f.f.expressions, &mut inner, qb, new_dot);
-        inner.push(f.store(dot_ptr, new_dot), S);
-
-        let one_d = f.literal_u32(1);
+        let one = f.literal_u32(1);
         let d2 = f.load(d_ptr);
-        let dn = f.binary(BinaryOperator::Add, d2, one_d);
-        push_emit(&f.f.expressions, &mut inner, one_d, dn);
-        inner.push(f.store(d_ptr, dn), S);
+        let dn = f.binary(BinaryOperator::Add, d2, one);
+        push_emit(&f.f.expressions, &mut body, one, dn);
+        body.push(f.store(d_ptr, dn), S);
 
-        parent.push(
+        f.f.body.push(
             Statement::Loop {
-                body: inner,
+                body,
                 continuing: Block::new(),
                 break_if: None,
             },
@@ -2774,32 +2784,14 @@ fn gen_causal_attention() -> Module {
         );
     }
 
-    // Helper: compute k_base = t * kv_dim + kv_head * head_dim, emit into block
-    fn compute_k_base(
-        f: &mut FnBuilder,
-        block: &mut Block,
-        t: Handle<Expression>,
-        kv_dim_ptr: Handle<Expression>,
-        kv_head_ptr: Handle<Expression>,
-        head_dim_ptr: Handle<Expression>,
-    ) -> Handle<Expression> {
-        let kvd = f.load(kv_dim_ptr);
-        let t_kv = f.binary(BinaryOperator::Multiply, t, kvd);
-        let kvh = f.load(kv_head_ptr);
-        let hd = f.load(head_dim_ptr);
-        let kvh_off = f.binary(BinaryOperator::Multiply, kvh, hd);
-        let k_base = f.binary(BinaryOperator::Add, t_kv, kvh_off);
-        push_emit(&f.f.expressions, block, kvd, k_base);
-        k_base
-    }
-
-    // === Pass 1: find max score ===
-    let max_var = f.local_var("max_score", b.ty_f32, None);
-    let max_ptr = f.local_ptr(max_var);
-    let neg_inf = f.literal_f32(-1.0e30);
-    f.emit(neg_inf, neg_inf);
-    f.f.body.push(f.store(max_ptr, neg_inf), S);
-
+    // === Single-pass online softmax attention ===
+    // for t in 0..causal_len:
+    //   score = Q·K[t] * scale
+    //   new_max = max(max_score, score)
+    //   correction = exp(max_score - new_max)
+    //   sum_exp = sum_exp * correction + exp(score - new_max)
+    //   for d: out[d] = out[d] * correction + exp(score - new_max) * V[t,d]
+    //   max_score = new_max
     let t_var = f.local_var("t", b.ty_u32, None);
     let t_ptr = f.local_ptr(t_var);
     let zero_u = f.literal_u32(0);
@@ -2811,39 +2803,137 @@ fn gen_causal_attention() -> Module {
         let t = f.load(t_ptr);
         let cl = f.load(causal_ptr);
         let brk = f.binary(BinaryOperator::GreaterEqual, t, cl);
-
-        let dot_var = f.local_var("dot", b.ty_f32, None);
-        let dot_ptr = f.local_ptr(dot_var);
-        let zero_f = f.literal_f32(0.0);
         push_emit(&f.f.expressions, &mut body, t, brk);
         body.push(FnBuilder::if_break(brk), S);
-        push_emit(&f.f.expressions, &mut body, dot_ptr, zero_f);
-        body.push(f.store(dot_ptr, zero_f), S);
 
-        let k_base = compute_k_base(&mut f, &mut body, t, kv_dim_ptr, kv_head_ptr, head_dim_ptr);
+        // k_base = t * kv_dim + kv_head * head_dim
+        let kvd = f.load(kv_dim_ptr);
+        let t_kv = f.binary(BinaryOperator::Multiply, t, kvd);
+        let kvh = f.load(kv_head_ptr);
+        let hd = f.load(head_dim_ptr);
+        let kvh_off = f.binary(BinaryOperator::Multiply, kvh, hd);
+        let k_base = f.binary(BinaryOperator::Add, t_kv, kvh_off);
+        push_emit(&f.f.expressions, &mut body, kvd, k_base);
 
-        build_dot_loop(
-            &mut f,
-            &mut body,
-            gv_q,
-            gv_k,
-            q_base_ptr,
-            head_dim_ptr,
-            k_base,
-            dot_ptr,
-            b.ty_u32,
-            "d1",
-        );
+        // Dot product: score = sum_d Q[q_base+d] * K[k_base+d]
+        let dot_var = f.local_var("dot", b.ty_f32, None);
+        let dot_ptr = f.local_ptr(dot_var);
+        let zero_dot = f.literal_f32(0.0);
+        push_emit(&f.f.expressions, &mut body, dot_ptr, zero_dot);
+        body.push(f.store(dot_ptr, zero_dot), S);
 
-        // score = dot * scale; max_score = max(max_score, score)
+        // Inner dot product loop
+        {
+            let di_var = f.local_var("di", b.ty_u32, None);
+            let di_ptr = f.local_ptr(di_var);
+            let zero_di = f.literal_u32(0);
+            push_emit(&f.f.expressions, &mut body, di_ptr, zero_di);
+            body.push(f.store(di_ptr, zero_di), S);
+
+            let mut inner = Block::new();
+            let d = f.load(di_ptr);
+            let hd2 = f.load(head_dim_ptr);
+            let dbrk = f.binary(BinaryOperator::GreaterEqual, d, hd2);
+            push_emit(&f.f.expressions, &mut inner, d, dbrk);
+            inner.push(FnBuilder::if_break(dbrk), S);
+
+            let qb = f.load(q_base_ptr);
+            let q_idx = f.binary(BinaryOperator::Add, qb, d);
+            let q_gp = f.global(gv_q);
+            let q_elem = f.index(q_gp, q_idx);
+            let q_val = f.load(q_elem);
+            let k_idx = f.binary(BinaryOperator::Add, k_base, d);
+            let k_gp = f.global(gv_k);
+            let k_elem = f.index(k_gp, k_idx);
+            let k_val = f.load(k_elem);
+            let prod = f.binary(BinaryOperator::Multiply, q_val, k_val);
+            let old_dot = f.load(dot_ptr);
+            let new_dot = f.binary(BinaryOperator::Add, old_dot, prod);
+            push_emit(&f.f.expressions, &mut inner, qb, new_dot);
+            inner.push(f.store(dot_ptr, new_dot), S);
+
+            let one_d = f.literal_u32(1);
+            let d2 = f.load(di_ptr);
+            let dn = f.binary(BinaryOperator::Add, d2, one_d);
+            push_emit(&f.f.expressions, &mut inner, one_d, dn);
+            inner.push(f.store(di_ptr, dn), S);
+
+            body.push(
+                Statement::Loop {
+                    body: inner,
+                    continuing: Block::new(),
+                    break_if: None,
+                },
+                S,
+            );
+        }
+
+        // score = dot * scale
         let dot_val = f.load(dot_ptr);
         let sc = f.load(scale_ptr);
         let score = f.binary(BinaryOperator::Multiply, dot_val, sc);
+
+        // Online softmax update
         let old_max = f.load(max_ptr);
         let new_max = f.math2(MathFunction::Max, old_max, score);
-        push_emit(&f.f.expressions, &mut body, dot_val, new_max);
+        let correction = f.binary(BinaryOperator::Subtract, old_max, new_max);
+        let correction_exp = f.math1(MathFunction::Exp, correction);
+        let weight_shift = f.binary(BinaryOperator::Subtract, score, new_max);
+        let weight = f.math1(MathFunction::Exp, weight_shift);
+
+        // sum_exp = sum_exp * correction_exp + weight
+        let old_sum = f.load(sum_ptr_local);
+        let scaled_sum = f.binary(BinaryOperator::Multiply, old_sum, correction_exp);
+        let new_sum = f.binary(BinaryOperator::Add, scaled_sum, weight);
+        push_emit(&f.f.expressions, &mut body, dot_val, new_sum);
+        body.push(f.store(sum_ptr_local, new_sum), S);
         body.push(f.store(max_ptr, new_max), S);
 
+        // Update output: for d: out[d] = out[d] * correction_exp + weight * V[t,d]
+        {
+            let dv_var = f.local_var("dv", b.ty_u32, None);
+            let dv_ptr = f.local_ptr(dv_var);
+            let zero_dv = f.literal_u32(0);
+            push_emit(&f.f.expressions, &mut body, dv_ptr, zero_dv);
+            body.push(f.store(dv_ptr, zero_dv), S);
+
+            let mut inner = Block::new();
+            let d = f.load(dv_ptr);
+            let hd3 = f.load(head_dim_ptr);
+            let dbrk = f.binary(BinaryOperator::GreaterEqual, d, hd3);
+            push_emit(&f.f.expressions, &mut inner, d, dbrk);
+            inner.push(FnBuilder::if_break(dbrk), S);
+
+            // out[d] = out[d] * correction_exp + weight * V[k_base + d]
+            let out_elem = f.index(out_ptr, d);
+            let old_out = f.load(out_elem);
+            let scaled_out = f.binary(BinaryOperator::Multiply, old_out, correction_exp);
+            let v_idx = f.binary(BinaryOperator::Add, k_base, d);
+            let v_gp = f.global(gv_v);
+            let v_elem = f.index(v_gp, v_idx);
+            let v_val = f.load(v_elem);
+            let wv = f.binary(BinaryOperator::Multiply, weight, v_val);
+            let new_out = f.binary(BinaryOperator::Add, scaled_out, wv);
+            push_emit(&f.f.expressions, &mut inner, out_elem, new_out);
+            inner.push(f.store(out_elem, new_out), S);
+
+            let one_d = f.literal_u32(1);
+            let d2 = f.load(dv_ptr);
+            let dn = f.binary(BinaryOperator::Add, d2, one_d);
+            push_emit(&f.f.expressions, &mut inner, one_d, dn);
+            inner.push(f.store(dv_ptr, dn), S);
+
+            body.push(
+                Statement::Loop {
+                    body: inner,
+                    continuing: Block::new(),
+                    break_if: None,
+                },
+                S,
+            );
+        }
+
+        // t++
         let one_t = f.literal_u32(1);
         let t2 = f.load(t_ptr);
         let tn = f.binary(BinaryOperator::Add, t2, one_t);
@@ -2860,207 +2950,42 @@ fn gen_causal_attention() -> Module {
         );
     }
 
-    // === Pass 2: compute exp sum ===
-    let sum_var = f.local_var("sum_exp", b.ty_f32, None);
-    let sum_ptr_local = f.local_ptr(sum_var);
-    let zero_f2 = f.literal_f32(0.0);
-    f.emit(zero_f2, zero_f2);
-    f.f.body.push(f.store(sum_ptr_local, zero_f2), S);
-
-    let t2_var = f.local_var("t2", b.ty_u32, None);
-    let t2_ptr = f.local_ptr(t2_var);
-    let zero_t2 = f.literal_u32(0);
-    f.emit(zero_t2, zero_t2);
-    f.f.body.push(f.store(t2_ptr, zero_t2), S);
-
+    // Normalize and store: dst[q_base + d] = out[d] / sum_exp
     {
+        let d_var = f.local_var("d_store", b.ty_u32, None);
+        let d_ptr = f.local_ptr(d_var);
+        let zero_ds = f.literal_u32(0);
+        f.emit(zero_ds, zero_ds);
+        f.f.body.push(f.store(d_ptr, zero_ds), S);
+
         let mut body = Block::new();
-        let t = f.load(t2_ptr);
-        let cl = f.load(causal_ptr);
-        let brk = f.binary(BinaryOperator::GreaterEqual, t, cl);
-
-        let dot_var2 = f.local_var("dot2", b.ty_f32, None);
-        let dot_ptr2 = f.local_ptr(dot_var2);
-        let zero_f3 = f.literal_f32(0.0);
-        push_emit(&f.f.expressions, &mut body, t, brk);
+        let d = f.load(d_ptr);
+        let hd_s = f.load(head_dim_ptr);
+        let brk = f.binary(BinaryOperator::GreaterEqual, d, hd_s);
+        push_emit(&f.f.expressions, &mut body, d, brk);
         body.push(FnBuilder::if_break(brk), S);
-        push_emit(&f.f.expressions, &mut body, dot_ptr2, zero_f3);
-        body.push(f.store(dot_ptr2, zero_f3), S);
 
-        let k_base = compute_k_base(&mut f, &mut body, t, kv_dim_ptr, kv_head_ptr, head_dim_ptr);
+        let out_elem = f.index(out_ptr, d);
+        let out_val = f.load(out_elem);
+        let sum_val = f.load(sum_ptr_local);
+        let normed = f.binary(BinaryOperator::Divide, out_val, sum_val);
 
-        build_dot_loop(
-            &mut f,
-            &mut body,
-            gv_q,
-            gv_k,
-            q_base_ptr,
-            head_dim_ptr,
-            k_base,
-            dot_ptr2,
-            b.ty_u32,
-            "d2",
-        );
+        let qb = f.load(q_base_ptr);
+        let dst_idx = f.binary(BinaryOperator::Add, qb, d);
+        let dst_gp = f.global(gv_dst);
+        let dst_elem = f.index(dst_gp, dst_idx);
+        push_emit(&f.f.expressions, &mut body, out_elem, dst_elem);
+        body.push(f.store(dst_elem, normed), S);
 
-        let dot_val = f.load(dot_ptr2);
-        let sc = f.load(scale_ptr);
-        let score = f.binary(BinaryOperator::Multiply, dot_val, sc);
-        let mx = f.load(max_ptr);
-        let shifted = f.binary(BinaryOperator::Subtract, score, mx);
-        let e = f.math1(MathFunction::Exp, shifted);
-        let old_sum = f.load(sum_ptr_local);
-        let new_sum = f.binary(BinaryOperator::Add, old_sum, e);
-        push_emit(&f.f.expressions, &mut body, dot_val, new_sum);
-        body.push(f.store(sum_ptr_local, new_sum), S);
-
-        let one_t = f.literal_u32(1);
-        let t3 = f.load(t2_ptr);
-        let tn = f.binary(BinaryOperator::Add, t3, one_t);
-        push_emit(&f.f.expressions, &mut body, one_t, tn);
-        body.push(f.store(t2_ptr, tn), S);
+        let one_d = f.literal_u32(1);
+        let d2 = f.load(d_ptr);
+        let dn = f.binary(BinaryOperator::Add, d2, one_d);
+        push_emit(&f.f.expressions, &mut body, one_d, dn);
+        body.push(f.store(d_ptr, dn), S);
 
         f.f.body.push(
             Statement::Loop {
                 body,
-                continuing: Block::new(),
-                break_if: None,
-            },
-            S,
-        );
-    }
-
-    // === Pass 3: weighted sum of values ===
-    let d3_var = f.local_var("d3", b.ty_u32, None);
-    let d3_ptr = f.local_ptr(d3_var);
-    let zero_d3 = f.literal_u32(0);
-    f.emit(zero_d3, zero_d3);
-    f.f.body.push(f.store(d3_ptr, zero_d3), S);
-
-    {
-        let mut d_body = Block::new();
-        let d = f.load(d3_ptr);
-        let hd = f.load(head_dim_ptr);
-        let d_brk = f.binary(BinaryOperator::GreaterEqual, d, hd);
-
-        let acc_var = f.local_var("acc", b.ty_f32, None);
-        let acc_ptr = f.local_ptr(acc_var);
-        let zero_acc = f.literal_f32(0.0);
-        push_emit(&f.f.expressions, &mut d_body, d, d_brk);
-        d_body.push(FnBuilder::if_break(d_brk), S);
-        push_emit(&f.f.expressions, &mut d_body, acc_ptr, zero_acc);
-        d_body.push(f.store(acc_ptr, zero_acc), S);
-
-        // Pre-compute output base index (pos_q + head_off) so we can use it after the inner loop
-        // without a wide emit range spanning inner-loop expressions
-        let pq = f.load(pos_q_ptr);
-        let ho = f.load(head_off_ptr);
-        let out_base = f.binary(BinaryOperator::Add, pq, ho);
-        // Store in local var to avoid cross-scope emit issues
-        let out_base_var = f.local_var("out_base", b.ty_u32, None);
-        let out_base_ptr = f.local_ptr(out_base_var);
-        push_emit(&f.f.expressions, &mut d_body, pq, out_base);
-        d_body.push(f.store(out_base_ptr, out_base), S);
-
-        let t3_var = f.local_var("t3", b.ty_u32, None);
-        let t3_iptr = f.local_ptr(t3_var);
-        let zero_t3 = f.literal_u32(0);
-        push_emit(&f.f.expressions, &mut d_body, zero_t3, zero_t3);
-        d_body.push(f.store(t3_iptr, zero_t3), S);
-
-        {
-            let mut t_body = Block::new();
-            let t = f.load(t3_iptr);
-            let cl = f.load(causal_ptr);
-            let t_brk = f.binary(BinaryOperator::GreaterEqual, t, cl);
-
-            // Recompute dot product for attention weight
-            let dot_var3 = f.local_var("dot3", b.ty_f32, None);
-            let dot_ptr3 = f.local_ptr(dot_var3);
-            let zero_dot = f.literal_f32(0.0);
-            push_emit(&f.f.expressions, &mut t_body, t, t_brk);
-            t_body.push(FnBuilder::if_break(t_brk), S);
-            push_emit(&f.f.expressions, &mut t_body, dot_ptr3, zero_dot);
-            t_body.push(f.store(dot_ptr3, zero_dot), S);
-
-            let k_base = compute_k_base(
-                &mut f,
-                &mut t_body,
-                t,
-                kv_dim_ptr,
-                kv_head_ptr,
-                head_dim_ptr,
-            );
-
-            build_dot_loop(
-                &mut f,
-                &mut t_body,
-                gv_q,
-                gv_k,
-                q_base_ptr,
-                head_dim_ptr,
-                k_base,
-                dot_ptr3,
-                b.ty_u32,
-                "d4",
-            );
-
-            // attn_weight = exp(score * scale - max) / sum_exp
-            let dot_val = f.load(dot_ptr3);
-            let sc = f.load(scale_ptr);
-            let score = f.binary(BinaryOperator::Multiply, dot_val, sc);
-            let mx = f.load(max_ptr);
-            let shifted = f.binary(BinaryOperator::Subtract, score, mx);
-            let e = f.math1(MathFunction::Exp, shifted);
-            let sum_val = f.load(sum_ptr_local);
-            let weight = f.binary(BinaryOperator::Divide, e, sum_val);
-
-            // v_val = v[k_base + d]
-            let v_idx = f.binary(BinaryOperator::Add, k_base, d);
-            let v_gp = f.global(gv_v);
-            let v_elem = f.index(v_gp, v_idx);
-            let v_val = f.load(v_elem);
-
-            let contrib = f.binary(BinaryOperator::Multiply, weight, v_val);
-            let old_acc = f.load(acc_ptr);
-            let new_acc = f.binary(BinaryOperator::Add, old_acc, contrib);
-            push_emit(&f.f.expressions, &mut t_body, dot_val, new_acc);
-            t_body.push(f.store(acc_ptr, new_acc), S);
-
-            let one_t = f.literal_u32(1);
-            let t4 = f.load(t3_iptr);
-            let tn = f.binary(BinaryOperator::Add, t4, one_t);
-            push_emit(&f.f.expressions, &mut t_body, one_t, tn);
-            t_body.push(f.store(t3_iptr, tn), S);
-
-            d_body.push(
-                Statement::Loop {
-                    body: t_body,
-                    continuing: Block::new(),
-                    break_if: None,
-                },
-                S,
-            );
-        }
-
-        // dst[out_base + d] = acc
-        let ob = f.load(out_base_ptr);
-        let out_idx = f.binary(BinaryOperator::Add, ob, d);
-        let dst_gp = f.global(gv_dst);
-        let dst_elem = f.index(dst_gp, out_idx);
-        let acc_val = f.load(acc_ptr);
-        // Single emit range covers ob through acc_val (dst_gp is pre-emit/skipped)
-        push_emit(&f.f.expressions, &mut d_body, ob, acc_val);
-        d_body.push(f.store(dst_elem, acc_val), S);
-
-        let one_d = f.literal_u32(1);
-        let d5 = f.load(d3_ptr);
-        let dn = f.binary(BinaryOperator::Add, d5, one_d);
-        push_emit(&f.f.expressions, &mut d_body, one_d, dn);
-        d_body.push(f.store(d3_ptr, dn), S);
-
-        f.f.body.push(
-            Statement::Loop {
-                body: d_body,
                 continuing: Block::new(),
                 break_if: None,
             },
