@@ -6,6 +6,7 @@ use std::collections::HashMap;
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ShaderEntry {
     MatMul,
+    FusedMatMulAdd,
     Relu,
     Sigmoid,
     Neg,
@@ -35,6 +36,7 @@ impl ShaderEntry {
         use crate::codegen::ShaderGroup;
         match *self {
             ShaderEntry::MatMul => ShaderGroup::MatMul,
+            ShaderEntry::FusedMatMulAdd => ShaderGroup::MatMulAdd,
             ShaderEntry::Relu | ShaderEntry::Sigmoid | ShaderEntry::Neg => ShaderGroup::Unary,
             ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater => ShaderGroup::Binary,
             ShaderEntry::BiasAdd => ShaderGroup::BiasAdd,
@@ -58,6 +60,7 @@ impl ShaderEntry {
     pub fn entry_point(&self) -> &'static str {
         match *self {
             ShaderEntry::MatMul
+            | ShaderEntry::FusedMatMulAdd
             | ShaderEntry::BiasAdd
             | ShaderEntry::SgdUpdate
             | ShaderEntry::Softmax
@@ -221,11 +224,29 @@ impl<'a> Compiler<'a> {
                 let m = a_shape[0] as u32;
                 let k = a_shape[1] as u32;
                 let n = b_shape[1] as u32;
-                // Tiled matmul: 16×16 workgroups, x=col(N), y=row(M)
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::MatMul,
                     workgroups: [ceil_div(n, 16), ceil_div(m, 16), 1],
                     input_buffers: vec![a, b],
+                    output_buffer: out_buf,
+                    params: vec![m, k, n, 0],
+                });
+            }
+
+            Op::FusedMatMulAdd => {
+                // C = A × B + D (inputs: [a, b, d])
+                let a = self.get_buffer(node.inputs[0]);
+                let b = self.get_buffer(node.inputs[1]);
+                let d = self.get_buffer(node.inputs[2]);
+                let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
+                let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
+                let m = a_shape[0] as u32;
+                let k = a_shape[1] as u32;
+                let n = b_shape[1] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::FusedMatMulAdd,
+                    workgroups: [ceil_div(n, 16), ceil_div(m, 16), 1],
+                    input_buffers: vec![a, b, d],
                     output_buffer: out_buf,
                     params: vec![m, k, n, 0],
                 });

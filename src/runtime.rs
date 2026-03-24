@@ -18,6 +18,16 @@ struct MatMulData {
     params: MatMulParams,
 }
 
+// fused_matmul_add: var matrix_a, matrix_b, matrix_c, src (addend), params
+#[derive(blade_macros::ShaderData)]
+struct FusedMatMulAddData {
+    matrix_a: blade_graphics::BufferPiece,
+    matrix_b: blade_graphics::BufferPiece,
+    matrix_c: blade_graphics::BufferPiece,
+    src: blade_graphics::BufferPiece, // addend buffer (named "src" to match codegen)
+    params: MatMulParams,
+}
+
 #[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
 #[repr(C)]
 struct MatMulParams {
@@ -191,9 +201,13 @@ impl Pipelines {
         let mut needed: HashMap<ShaderGroup, Vec<&ShaderEntry>> = HashMap::new();
         for dispatch in &plan.dispatches {
             let mut group = dispatch.shader.shader_group();
-            // Upgrade MatMul to cooperative matrix path if supported
-            if group == ShaderGroup::MatMul && use_coop_matmul {
-                group = ShaderGroup::MatMulCoop;
+            // Upgrade MatMul/MatMulAdd to cooperative matrix path if supported
+            if use_coop_matmul {
+                if group == ShaderGroup::MatMul {
+                    group = ShaderGroup::MatMulCoop;
+                } else if group == ShaderGroup::MatMulAdd {
+                    group = ShaderGroup::MatMulCoopAdd;
+                }
             }
             needed.entry(group).or_default().push(&dispatch.shader);
         }
@@ -233,6 +247,7 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
     use blade_graphics::ShaderData;
     match *entry {
         ShaderEntry::MatMul => MatMulData::layout(),
+        ShaderEntry::FusedMatMulAdd => FusedMatMulAddData::layout(),
         ShaderEntry::Relu | ShaderEntry::Sigmoid | ShaderEntry::Neg | ShaderEntry::Silu => {
             UnaryData::layout()
         }
@@ -417,7 +432,9 @@ impl Session {
         if use_coop_matmul {
             // Recompute matmul dispatch workgroups for 16×16 cooperative tiles
             for dispatch in &mut plan.dispatches {
-                if dispatch.shader == ShaderEntry::MatMul {
+                if dispatch.shader == ShaderEntry::MatMul
+                    || dispatch.shader == ShaderEntry::FusedMatMulAdd
+                {
                     let m = dispatch.params[0];
                     let n = dispatch.params[2];
                     dispatch.workgroups = [ceil_div(m, 16), ceil_div(n, 16), 1];
@@ -591,13 +608,24 @@ impl Session {
         // After start(), blade exposes GPU timings from the *previous* submission.
         self.drain_gpu_timings();
 
-        for i in 0..self.plan.dispatches.len() {
-            let dispatch = &self.plan.dispatches[i];
-            let pipeline = self.pipelines.get(&dispatch.shader);
-            let mut pass = self.encoder.compute(&format!("{:?}", dispatch.shader));
-            let mut pc = pass.with(pipeline);
-            Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
-            pc.dispatch(dispatch.workgroups);
+        if std::env::var("MEGANEURA_SINGLE_PASS").is_ok() {
+            let mut pass = self.encoder.compute("step");
+            for i in 0..self.plan.dispatches.len() {
+                let dispatch = &self.plan.dispatches[i];
+                let pipeline = self.pipelines.get(&dispatch.shader);
+                let mut pc = pass.with(pipeline);
+                Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
+                pc.dispatch(dispatch.workgroups);
+            }
+        } else {
+            for i in 0..self.plan.dispatches.len() {
+                let dispatch = &self.plan.dispatches[i];
+                let pipeline = self.pipelines.get(&dispatch.shader);
+                let mut pass = self.encoder.compute(&format!("{:?}", dispatch.shader));
+                let mut pc = pass.with(pipeline);
+                Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
+                pc.dispatch(dispatch.workgroups);
+            }
         }
 
         self.last_submit_ns = crate::profiler::now_ns();
@@ -618,6 +646,23 @@ impl Session {
                         matrix_a: buf(dispatch.input_buffers[0]),
                         matrix_b: buf(dispatch.input_buffers[1]),
                         matrix_c: buf(dispatch.output_buffer),
+                        params: MatMulParams {
+                            m: dispatch.params[0],
+                            n: dispatch.params[2],
+                            k: dispatch.params[1],
+                            _pad: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::FusedMatMulAdd => {
+                pc.bind(
+                    0,
+                    &FusedMatMulAddData {
+                        matrix_a: buf(dispatch.input_buffers[0]),
+                        matrix_b: buf(dispatch.input_buffers[1]),
+                        matrix_c: buf(dispatch.output_buffer),
+                        src: buf(dispatch.input_buffers[2]), // addend
                         params: MatMulParams {
                             m: dispatch.params[0],
                             n: dispatch.params[2],

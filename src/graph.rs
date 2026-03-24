@@ -91,6 +91,9 @@ pub enum Op {
     // Broadcast add (bias add: [M,N] + [N])
     BiasAdd,
 
+    // Fused MatMul + Add: C = A × B + D (inputs: [a, b, d])
+    FusedMatMulAdd,
+
     // Dead node (consumed by fusion, skip during compilation)
     Nop,
 

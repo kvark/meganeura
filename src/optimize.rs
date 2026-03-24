@@ -263,7 +263,9 @@ fn node_to_egglog_expr(node: &Node) -> String {
             "(CrossAttention n{} n{} n{})",
             node.inputs[0], node.inputs[1], node.inputs[2]
         ),
-        Op::Nop => unreachable!("Nop nodes should be filtered before conversion"),
+        Op::Nop | Op::FusedMatMulAdd => {
+            unreachable!("Nop/FusedMatMulAdd nodes should not appear before optimization")
+        }
     }
 }
 
@@ -276,11 +278,46 @@ fn extract_graph_with_fusions(
     _egraph: &egglog::EGraph,
     original: &Graph,
 ) -> (Graph, Vec<(String, u32)>) {
-    // With cooperative matrix, matmul fusion is not needed — the hardware
-    // handles tiling. We just clone the graph with algebraic simplifications
-    // applied by egglog.
-    let graph = clone_graph(original);
-    (graph, Vec::new())
+    use crate::graph::Op;
+    let mut graph = clone_graph(original);
+    let mut fusions = Vec::new();
+
+    // Fuse Add(MatMul(a, b), d) → FusedMatMulAdd(a, b, d)
+    let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
+    for &id in &node_ids {
+        let node = &graph.nodes()[id];
+        if !matches!(node.op, Op::Add) {
+            continue;
+        }
+        let (lhs, rhs) = (node.inputs[0], node.inputs[1]);
+        let (mm_id, addend_id) = if matches!(graph.node(lhs).op, Op::MatMul) {
+            (lhs, rhs)
+        } else if matches!(graph.node(rhs).op, Op::MatMul) {
+            (rhs, lhs)
+        } else {
+            continue;
+        };
+
+        // Only fuse if the MatMul result is used exclusively by this Add.
+        let mm_use_count = graph
+            .nodes()
+            .iter()
+            .filter(|n| n.inputs.contains(&mm_id) && !matches!(n.op, Op::Nop))
+            .count();
+        if mm_use_count != 1 {
+            continue;
+        }
+
+        // Rewrite: Add node becomes FusedMatMulAdd, MatMul becomes Nop
+        let mm_node = graph.node(mm_id);
+        let (a, b) = (mm_node.inputs[0], mm_node.inputs[1]);
+        graph.nodes_mut()[id].op = Op::FusedMatMulAdd;
+        graph.nodes_mut()[id].inputs = vec![a, b, addend_id];
+        graph.nodes_mut()[mm_id as usize].op = Op::Nop;
+        fusions.push(("MatMul+Add→FusedMatMulAdd".to_string(), id as u32));
+    }
+
+    (graph, fusions)
 }
 
 fn clone_graph(graph: &Graph) -> Graph {

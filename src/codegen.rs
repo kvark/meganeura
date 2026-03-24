@@ -529,7 +529,9 @@ pub enum ShaderGroup {
     Sgd,
     Transpose,
     MatMul,
+    MatMulAdd,
     MatMulCoop,
+    MatMulCoopAdd,
     Reduce,
     Softmax,
     CrossEntropy,
@@ -551,7 +553,9 @@ pub fn generate_module(group: ShaderGroup) -> Module {
         ShaderGroup::Sgd => gen_sgd(),
         ShaderGroup::Transpose => gen_transpose(),
         ShaderGroup::MatMul => gen_matmul(),
+        ShaderGroup::MatMulAdd => gen_matmul_add(),
         ShaderGroup::MatMulCoop => gen_matmul_coop(),
+        ShaderGroup::MatMulCoopAdd => gen_matmul_coop_add(),
         ShaderGroup::Reduce => gen_reduce(),
         ShaderGroup::Softmax => gen_softmax(),
         ShaderGroup::CrossEntropy => gen_cross_entropy(),
@@ -569,7 +573,7 @@ pub fn generate_module(group: ShaderGroup) -> Module {
 pub fn generate_wgsl(group: ShaderGroup) -> String {
     let module = generate_module(group);
     let capabilities = match group {
-        ShaderGroup::MatMulCoop => {
+        ShaderGroup::MatMulCoop | ShaderGroup::MatMulCoopAdd => {
             naga::valid::Capabilities::COOPERATIVE_MATRIX
                 | naga::valid::Capabilities::SHADER_FLOAT16
         }
@@ -1148,8 +1152,125 @@ fn gen_matmul() -> Module {
     b.entry_point("main", [16, 16, 1], f.finish());
     b.finish()
 }
+
+/// Fused matmul + add: C = A × B + D.
+///
+/// Same as naive matmul but reads a 4th buffer `addend` and adds it
+/// to the result before storing. Eliminates a separate Add dispatch.
+fn gen_matmul_add() -> Module {
+    let mut b = Builder::new();
+    let ty_params = b.params_u32x4("Params", &["m", "n", "k", "_pad"]);
+    let gv_a = b.storage_ro("matrix_a");
+    let gv_b = b.storage_ro("matrix_b");
+    let gv_c = b.storage_rw("matrix_c");
+    // 4th buffer: addend (residual)
+    let gv_d = b.storage_ro("src"); // "src" to reuse existing binding slot name
+    let gv_params = b.uniform("params", ty_params);
+
+    let mut f = FnBuilder::new(&b);
+    let gid = f.arg_gid();
+
+    let col = f.vec_x(gid);
+    let row = f.vec_y(gid);
+    f.emit(col, row);
+
+    let params_ptr = f.global(gv_params);
+    let m_ptr = f.field(params_ptr, 0);
+    let pm = f.load(m_ptr);
+    let n_ptr = f.field(params_ptr, 1);
+    let pn = f.load(n_ptr);
+    let k_ptr = f.field(params_ptr, 2);
+    let pk = f.load(k_ptr);
+    f.emit(params_ptr, pk);
+
+    let zero_f = f.literal_f32(0.0);
+    f.emit(zero_f, zero_f);
+    let sum_var = f.local_var("sum", b.ty_f32, None);
+    let sum_ptr = f.local_ptr(sum_var);
+    f.f.body.push(f.store(sum_ptr, zero_f), S);
+
+    let i_var = f.local_var("i", b.ty_u32, None);
+    let zero_u = f.literal_u32(0);
+    f.emit(zero_u, zero_u);
+    let i_ptr = f.local_ptr(i_var);
+    f.f.body.push(f.store(i_ptr, zero_u), S);
+
+    let mut loop_body = Block::new();
+    {
+        let i_val = f.load(i_ptr);
+        let break_cond = f.binary(BinaryOperator::GreaterEqual, i_val, pk);
+        push_emit(&f.f.expressions, &mut loop_body, i_val, break_cond);
+        loop_body.push(FnBuilder::if_break(break_cond), S);
+
+        let a_ptr = f.global(gv_a);
+        let row_k = f.binary(BinaryOperator::Multiply, row, pk);
+        let a_idx = f.binary(BinaryOperator::Add, row_k, i_val);
+        let a_elem = f.index(a_ptr, a_idx);
+        let a_val = f.load(a_elem);
+
+        let b_ptr = f.global(gv_b);
+        let i_n = f.binary(BinaryOperator::Multiply, i_val, pn);
+        let b_idx = f.binary(BinaryOperator::Add, i_n, col);
+        let b_elem = f.index(b_ptr, b_idx);
+        let b_val = f.load(b_elem);
+
+        let prod = f.binary(BinaryOperator::Multiply, a_val, b_val);
+        let old_sum = f.load(sum_ptr);
+        let new_sum = f.binary(BinaryOperator::Add, old_sum, prod);
+        push_emit(&f.f.expressions, &mut loop_body, a_ptr, new_sum);
+        loop_body.push(f.store(sum_ptr, new_sum), S);
+
+        let one_u = f.literal_u32(1);
+        let i_val2 = f.load(i_ptr);
+        let i_next = f.binary(BinaryOperator::Add, i_val2, one_u);
+        push_emit(&f.f.expressions, &mut loop_body, one_u, i_next);
+        loop_body.push(f.store(i_ptr, i_next), S);
+
+        f.f.body.push(
+            Statement::Loop {
+                body: loop_body,
+                continuing: Block::new(),
+                break_if: None,
+            },
+            S,
+        );
+    }
+
+    // if (row < m && col < n) { c[idx] = sum + d[idx] }
+    let r_lt_m = f.binary(BinaryOperator::Less, row, pm);
+    let c_lt_n = f.binary(BinaryOperator::Less, col, pn);
+    let store_cond = f.binary(BinaryOperator::LogicalAnd, r_lt_m, c_lt_n);
+    let row_n = f.binary(BinaryOperator::Multiply, row, pn);
+    let c_idx = f.binary(BinaryOperator::Add, row_n, col);
+
+    let d_ptr = f.global(gv_d);
+    let d_elem = f.index(d_ptr, c_idx);
+    let d_val = f.load(d_elem);
+    let final_sum = f.load(sum_ptr);
+    let fused_val = f.binary(BinaryOperator::Add, final_sum, d_val);
+
+    let c_ptr = f.global(gv_c);
+    let c_elem = f.index(c_ptr, c_idx);
+    f.emit(r_lt_m, fused_val);
+
+    let mut store_block = Block::new();
+    push_emit(&f.f.expressions, &mut store_block, c_ptr, c_elem);
+    store_block.push(f.store(c_elem, fused_val), S);
+    f.f.body.push(
+        Statement::If {
+            condition: store_cond,
+            accept: store_block,
+            reject: Block::new(),
+        },
+        S,
+    );
+
+    b.entry_point("main", [16, 16, 1], f.finish());
+    b.finish()
+}
+
 // ---------------------------------------------------------------------------
-// matmul_coop.wgsl — cooperative matrix multiply (8×8 tiles)
+// matmul_coop.wgsl — cooperative matrix multiply (16×16 tiles)
 //
 // Uses cooperative matrix operations for hardware-accelerated matrix multiply
 // on supported GPUs (VK_KHR_cooperative_matrix on Vulkan, simdgroup_matrix
@@ -1181,6 +1302,16 @@ fn gen_matmul() -> Module {
 ///
 /// Workgroup [64, 1, 1], dispatched as [ceil(M/16), ceil(N/16), 1].
 fn gen_matmul_coop() -> Module {
+    gen_matmul_coop_inner(false)
+}
+
+/// Cooperative matmul with fused addend: C = A × B + D.
+/// Same as gen_matmul_coop but loads the accumulator from a 4th buffer.
+fn gen_matmul_coop_add() -> Module {
+    gen_matmul_coop_inner(true)
+}
+
+fn gen_matmul_coop_inner(fused_add: bool) -> Module {
     const TILE: u32 = 16;
     const TILE_ELEMS: u32 = TILE * TILE; // 256
     const WG_SIZE: u32 = 64;
@@ -1191,6 +1322,12 @@ fn gen_matmul_coop() -> Module {
     let gv_a = b.storage_ro("matrix_a");
     let gv_b = b.storage_ro("matrix_b");
     let gv_c = b.storage_rw("matrix_c");
+    // 4th buffer for fused add: load accumulator from addend instead of output
+    let gv_addend = if fused_add {
+        Some(b.storage_ro("src"))
+    } else {
+        None
+    };
     let gv_params = b.uniform("params", ty_params);
 
     // Shared memory for f16 staging: array<f32, 128> (packing two f16 per u32 slot,
@@ -1268,20 +1405,20 @@ fn gen_matmul_coop() -> Module {
     let c_offset = f.binary(BinaryOperator::Add, c_off_base, tile_col);
     f.emit(c_off_base, c_offset);
 
-    // Load C tile (f32 cooperative matrix — matches output buffer type)
-    let c_ptr = f.global(gv_c);
-    let c_elem = f.index(c_ptr, c_offset);
+    // Load accumulator: from addend buffer (fused) or output buffer (regular)
+    let acc_src = f.global(gv_addend.unwrap_or(gv_c));
+    let acc_elem = f.index(acc_src, c_offset);
     let acc_load = f.expr(Expression::CooperativeLoad {
         columns: CooperativeSize::Sixteen,
         rows: CooperativeSize::Sixteen,
         role: CooperativeRole::C,
         data: CooperativeData {
-            pointer: c_elem,
+            pointer: acc_elem,
             stride: pn,
             row_major: false,
         },
     });
-    f.emit(c_ptr, acc_load);
+    f.emit(acc_src, acc_load);
 
     let ty_coop_c = b.m.types.insert(
         Type {
@@ -3647,8 +3784,14 @@ mod tests {
             (ShaderGroup::Sgd, naga::valid::Capabilities::empty()),
             (ShaderGroup::Transpose, naga::valid::Capabilities::empty()),
             (ShaderGroup::MatMul, naga::valid::Capabilities::empty()),
+            (ShaderGroup::MatMulAdd, naga::valid::Capabilities::empty()),
             (
                 ShaderGroup::MatMulCoop,
+                naga::valid::Capabilities::COOPERATIVE_MATRIX
+                    | naga::valid::Capabilities::SHADER_FLOAT16,
+            ),
+            (
+                ShaderGroup::MatMulCoopAdd,
                 naga::valid::Capabilities::COOPERATIVE_MATRIX
                     | naga::valid::Capabilities::SHADER_FLOAT16,
             ),
@@ -3743,7 +3886,9 @@ mod tests {
             (ShaderGroup::Sgd, empty),
             (ShaderGroup::Transpose, empty),
             (ShaderGroup::MatMul, empty),
+            (ShaderGroup::MatMulAdd, empty),
             (ShaderGroup::MatMulCoop, coop),
+            (ShaderGroup::MatMulCoopAdd, coop),
             (ShaderGroup::Reduce, empty),
             (ShaderGroup::Softmax, empty),
             (ShaderGroup::CrossEntropy, empty),
@@ -3769,7 +3914,7 @@ mod tests {
         let mut failed = Vec::new();
         for &(group, caps) in groups {
             // See note in all_shaders_generate_valid_modules
-            if group == ShaderGroup::MatMulCoop {
+            if group == ShaderGroup::MatMulCoop || group == ShaderGroup::MatMulCoopAdd {
                 continue;
             }
             let module = generate_module(group);
@@ -3822,6 +3967,9 @@ mod tests {
         fn expected_globals(entry: &ShaderEntry) -> Vec<&'static str> {
             match entry {
                 ShaderEntry::MatMul => vec!["matrix_a", "matrix_b", "matrix_c", "params"],
+                ShaderEntry::FusedMatMulAdd => {
+                    vec!["matrix_a", "matrix_b", "matrix_c", "src", "params"]
+                }
                 ShaderEntry::Relu
                 | ShaderEntry::Sigmoid
                 | ShaderEntry::Neg
@@ -3851,6 +3999,7 @@ mod tests {
 
         let entries = [
             ShaderEntry::MatMul,
+            ShaderEntry::FusedMatMulAdd,
             ShaderEntry::Relu,
             ShaderEntry::Sigmoid,
             ShaderEntry::Neg,

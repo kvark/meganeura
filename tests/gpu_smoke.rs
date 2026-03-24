@@ -96,3 +96,43 @@ fn matmul_produces_correct_values() {
         );
     }
 }
+
+#[test]
+fn fused_matmul_add_correct() {
+    // Test FusedMatMulAdd: C = A × B + D
+    // A: 16×32 all 0.1, B: 32×16 all 0.1 → A×B = 0.32 per element
+    // D: 16×16 all 1.0 → result should be 1.32 per element
+    let m = 16;
+    let k = 32;
+    let n = 16;
+
+    let mut g = Graph::new();
+    let a = g.input("a", &[m, k]);
+    let b = g.parameter("b", &[k, n]);
+    let d = g.input("d", &[m, n]);
+    let mm = g.matmul(a, b);
+    let out = g.add(mm, d);
+    g.set_outputs(vec![out]);
+
+    let mut session = build_inference_session(&g);
+
+    session.set_input("a", &vec![0.1_f32; m * k]);
+    session.set_parameter("b", &vec![0.1_f32; k * n]);
+    session.set_input("d", &vec![1.0_f32; m * n]);
+
+    session.step();
+    session.wait();
+
+    let output = session.read_output(m * n);
+    eprintln!("fused matmul+add first 4: {:?}", &output[..4]);
+    let expected = k as f32 * 0.01 + 1.0; // 0.32 + 1.0 = 1.32
+    for (i, &got) in output.iter().enumerate() {
+        assert!(
+            (got - expected).abs() < 0.02,
+            "fused_matmul_add output[{}]: got {}, expected {}",
+            i,
+            got,
+            expected
+        );
+    }
+}
