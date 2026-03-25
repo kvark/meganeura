@@ -15,6 +15,168 @@ use meganeura::{
     models::smolvla::{self, SmolVLAConfig},
 };
 
+/// Check that the system is in a good state for reliable benchmarking.
+///
+/// Warns (or aborts) if:
+///  - Running on battery power (throttled clocks)
+///  - GPU is busy (> threshold %) from other processes
+///  - GPU GTT memory is nearly exhausted
+///
+/// Only performs sysfs checks on Linux; on other platforms it's a no-op.
+fn check_bench_preconditions(abort_on_warn: bool) {
+    #[cfg(not(target_os = "linux"))]
+    {
+        eprintln!("preconditions: skipped (not Linux)");
+        let _ = abort_on_warn;
+        return;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut warnings = Vec::new();
+
+        // --- AC power check ---
+        let on_ac = std::fs::read_dir("/sys/class/power_supply")
+            .ok()
+            .and_then(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .find(|e| {
+                        let name = e.file_name();
+                        let s = name.to_string_lossy();
+                        s.starts_with("AC") || s.starts_with("ADP")
+                    })
+                    .map(|e| {
+                        let online_path = e.path().join("online");
+                        std::fs::read_to_string(online_path)
+                            .ok()
+                            .map(|s| s.trim() == "1")
+                            .unwrap_or(false)
+                    })
+            })
+            .unwrap_or(true); // assume AC if we can't check
+
+        if !on_ac {
+            warnings.push(
+                "running on BATTERY — GPU clocks may be throttled, results unreliable".to_string(),
+            );
+        }
+
+        // --- GPU busy + GTT + clock check (per card) ---
+        const GPU_BUSY_THRESHOLD: u64 = 10; // percent
+        const GTT_FREE_THRESHOLD: u64 = 500 * 1024 * 1024; // 500 MB
+        const GPU_CLOCK_MIN_RATIO: f64 = 0.7; // must be >= 70% of peak clock
+
+        let cards: Vec<_> = std::fs::read_dir("/sys/class/drm")
+            .ok()
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_name().to_string_lossy().starts_with("card"))
+                    .filter(|e| !e.file_name().to_string_lossy().contains('-'))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for card in &cards {
+            let dev = card.path().join("device");
+
+            // GPU busy %
+            if let Some(pct) = std::fs::read_to_string(dev.join("gpu_busy_percent"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+            {
+                if pct > GPU_BUSY_THRESHOLD {
+                    warnings.push(format!(
+                        "{}: GPU {}% busy — other processes using GPU, results may be noisy",
+                        card.file_name().to_string_lossy(),
+                        pct
+                    ));
+                } else {
+                    eprintln!(
+                        "  {}: GPU busy {}% (ok)",
+                        card.file_name().to_string_lossy(),
+                        pct
+                    );
+                }
+            }
+
+            // GTT memory (system RAM mapped for GPU) — main memory pool for iGPU
+            let gtt_used = std::fs::read_to_string(dev.join("mem_info_gtt_used"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok());
+            let gtt_total = std::fs::read_to_string(dev.join("mem_info_gtt_total"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok());
+            if let (Some(used), Some(total)) = (gtt_used, gtt_total) {
+                let free = total.saturating_sub(used);
+                eprintln!(
+                    "  {}: GTT {:.0}MB / {:.0}MB used ({:.0}MB free)",
+                    card.file_name().to_string_lossy(),
+                    used as f64 / 1e6,
+                    total as f64 / 1e6,
+                    free as f64 / 1e6
+                );
+                if free < GTT_FREE_THRESHOLD {
+                    warnings.push(format!(
+                        "{}: only {:.0}MB GTT memory free — risk of GPU OOM",
+                        card.file_name().to_string_lossy(),
+                        free as f64 / 1e6
+                    ));
+                }
+            }
+
+            // GPU clock frequency: read pp_dpm_sclk, find current (*) and max
+            if let Ok(dpm) = std::fs::read_to_string(dev.join("pp_dpm_sclk")) {
+                let mut cur_mhz: Option<u64> = None;
+                let mut max_mhz: u64 = 0;
+                for line in dpm.lines() {
+                    let mhz = line
+                        .split_whitespace()
+                        .find(|t| t.ends_with("Mhz"))
+                        .and_then(|t| t.trim_end_matches("Mhz").parse::<u64>().ok())
+                        .unwrap_or(0);
+                    if mhz > max_mhz {
+                        max_mhz = mhz;
+                    }
+                    if line.contains('*') {
+                        cur_mhz = Some(mhz);
+                    }
+                }
+                if let Some(cur) = cur_mhz {
+                    let ratio = cur as f64 / max_mhz.max(1) as f64;
+                    eprintln!(
+                        "  {}: GPU clock {}MHz / {}MHz ({:.0}%)",
+                        card.file_name().to_string_lossy(),
+                        cur,
+                        max_mhz,
+                        ratio * 100.0
+                    );
+                    if ratio < GPU_CLOCK_MIN_RATIO {
+                        warnings.push(format!(
+                            "{}: GPU clock {}MHz is only {:.0}% of max {}MHz — clocks not boosted, results will be slow",
+                            card.file_name().to_string_lossy(), cur, ratio * 100.0, max_mhz
+                        ));
+                    }
+                }
+            }
+        }
+
+        if warnings.is_empty() {
+            eprintln!("preconditions ok");
+            return;
+        }
+
+        for w in &warnings {
+            eprintln!("WARNING: {}", w);
+        }
+        if abort_on_warn {
+            eprintln!("Aborting. Pass --force to run anyway.");
+            std::process::exit(1);
+        }
+    }
+}
+
 const REPO_ID: &str = "lerobot/smolvla_base";
 
 fn main() {
@@ -28,18 +190,23 @@ fn main() {
     let mut warmup: usize = 3;
     let mut runs: usize = 5;
     let mut num_steps: usize = 0; // 0 = use config default
+    let mut force = false; // skip precondition abort
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--warmup" => warmup = args.next().expect("--warmup value").parse().unwrap(),
             "--runs" => runs = args.next().expect("--runs value").parse().unwrap(),
             "--steps" => num_steps = args.next().expect("--steps value").parse().unwrap(),
+            "--force" => force = true,
             _ => {
                 eprintln!("unknown arg: {}", arg);
                 std::process::exit(1);
             }
         }
     }
+
+    eprintln!("checking preconditions...");
+    check_bench_preconditions(!force);
 
     let config = SmolVLAConfig::smolvla_base();
     let action_seq_len = config.chunk_size; // 50

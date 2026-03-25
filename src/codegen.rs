@@ -1034,25 +1034,48 @@ fn gen_transpose() -> Module {
 // tiles of 16 using workgroup shared memory.
 // ---------------------------------------------------------------------------
 
-/// Naive matmul: C = A × B via Naga IR.
+/// Tiled matmul: C = A × B via Naga IR with shared memory.
 ///
-/// Each thread computes one element of C by looping over K.
+/// Uses 16×16 tiles loaded into workgroup shared memory for data reuse.
+/// Each thread computes one element of the output tile.
 /// Workgroup [16, 16, 1], dispatched as [ceil(N/16), ceil(M/16), 1].
 fn gen_matmul() -> Module {
+    gen_tiled_matmul_inner(false)
+}
+
+fn gen_tiled_matmul_inner(fused_add: bool) -> Module {
+    const TILE: u32 = 16;
+
     let mut b = Builder::new();
     let ty_params = b.params_u32x4("Params", &["m", "n", "k", "_pad"]);
     let gv_a = b.storage_ro("matrix_a");
     let gv_b = b.storage_ro("matrix_b");
     let gv_c = b.storage_rw("matrix_c");
+    let gv_d = if fused_add {
+        Some(b.storage_ro("src"))
+    } else {
+        None
+    };
     let gv_params = b.uniform("params", ty_params);
+    let gv_sa = b.workgroup_array("shared_a", TILE * TILE);
+    let gv_sb = b.workgroup_array("shared_b", TILE * TILE);
 
     let mut f = FnBuilder::new(&b);
-    let gid = f.arg_gid();
+    let wgid = f.arg_wgid();
+    let lid = f.arg_lid();
 
-    // col = gid.x, row = gid.y — one thread per output element
-    let col = f.vec_x(gid);
-    let row = f.vec_y(gid);
-    f.emit(col, row);
+    let wg_x = f.vec_x(wgid);
+    let wg_y = f.vec_y(wgid);
+    let lx = f.vec_x(lid);
+    let ly = f.vec_y(lid);
+    f.emit(wg_x, ly);
+
+    // tile_col = wg_x * 16, tile_row = wg_y * 16
+    let tile_c = f.literal_u32(TILE);
+    let tile_col = f.binary(BinaryOperator::Multiply, wg_x, tile_c);
+    let tile_c2 = f.literal_u32(TILE);
+    let tile_row = f.binary(BinaryOperator::Multiply, wg_y, tile_c2);
+    f.emit(tile_c, tile_row);
 
     // Load params
     let params_ptr = f.global(gv_params);
@@ -1071,65 +1094,108 @@ fn gen_matmul() -> Module {
     let sum_ptr = f.local_ptr(sum_var);
     f.f.body.push(f.store(sum_ptr, zero_f), S);
 
-    // Loop: for (var i = 0u; i < k; i++)
-    let i_var = f.local_var("i", b.ty_u32, None);
+    // var t = 0u;  (K-tile offset)
+    let t_var = f.local_var("t", b.ty_u32, None);
     let zero_u = f.literal_u32(0);
     f.emit(zero_u, zero_u);
-    let i_ptr = f.local_ptr(i_var);
-    f.f.body.push(f.store(i_ptr, zero_u), S);
+    let t_ptr = f.local_ptr(t_var);
+    f.f.body.push(f.store(t_ptr, zero_u), S);
 
+    // ===== K-tile loop =====
     let mut loop_body = Block::new();
     {
-        // if (i >= k) { break; }
-        let i_val = f.load(i_ptr);
-        let break_cond = f.binary(BinaryOperator::GreaterEqual, i_val, pk);
-        push_emit(&f.f.expressions, &mut loop_body, i_val, break_cond);
-        loop_body.push(
-            Statement::If {
-                condition: break_cond,
-                accept: Block::from_vec(vec![Statement::Break]),
-                reject: Block::new(),
-            },
-            S,
-        );
+        let t_val = f.load(t_ptr);
+        let break_cond = f.binary(BinaryOperator::GreaterEqual, t_val, pk);
+        push_emit(&f.f.expressions, &mut loop_body, t_val, break_cond);
+        loop_body.push(FnBuilder::if_break(break_cond), S);
 
-        // sum += a[row * k + i] * b[i * n + col]
+        // --- Load A tile into shared_a ---
+        // shared_a[ly * 16 + lx] = A[(tile_row + ly) * k + (t + lx)]  (0 if OOB)
+        let sa_ptr = f.global(gv_sa);
         let a_ptr = f.global(gv_a);
-        let row_k = f.binary(BinaryOperator::Multiply, row, pk);
-        let a_idx = f.binary(BinaryOperator::Add, row_k, i_val);
-        let a_elem = f.index(a_ptr, a_idx);
+        let ly_16 = f.binary(BinaryOperator::Multiply, ly, tile_c);
+        let sa_idx = f.binary(BinaryOperator::Add, ly_16, lx);
+        let sa_elem = f.index(sa_ptr, sa_idx);
+        let a_row = f.binary(BinaryOperator::Add, tile_row, ly);
+        let a_col = f.binary(BinaryOperator::Add, t_val, lx);
+        let in_m = f.binary(BinaryOperator::Less, a_row, pm);
+        let in_k = f.binary(BinaryOperator::Less, a_col, pk);
+        let a_in_bounds = f.binary(BinaryOperator::LogicalAnd, in_m, in_k);
+        let a_row_k = f.binary(BinaryOperator::Multiply, a_row, pk);
+        let a_global = f.binary(BinaryOperator::Add, a_row_k, a_col);
+        let a_elem = f.index(a_ptr, a_global);
         let a_val = f.load(a_elem);
+        let zero_pad_a = f.literal_f32(0.0);
+        let a_selected = f.select(a_in_bounds, a_val, zero_pad_a);
+        push_emit(&f.f.expressions, &mut loop_body, sa_ptr, a_selected);
+        loop_body.push(f.store(sa_elem, a_selected), S);
 
+        // --- Load B tile into shared_b ---
+        // shared_b[ly * 16 + lx] = B[(t + ly) * n + (tile_col + lx)]  (0 if OOB)
+        let sb_ptr = f.global(gv_sb);
         let b_ptr = f.global(gv_b);
-        let i_n = f.binary(BinaryOperator::Multiply, i_val, pn);
-        let b_idx = f.binary(BinaryOperator::Add, i_n, col);
-        let b_elem = f.index(b_ptr, b_idx);
+        let sb_elem = f.index(sb_ptr, sa_idx); // same local index
+        let b_row = f.binary(BinaryOperator::Add, t_val, ly);
+        let b_col = f.binary(BinaryOperator::Add, tile_col, lx);
+        let b_in_k = f.binary(BinaryOperator::Less, b_row, pk);
+        let b_in_n = f.binary(BinaryOperator::Less, b_col, pn);
+        let b_in_bounds = f.binary(BinaryOperator::LogicalAnd, b_in_k, b_in_n);
+        let b_row_n = f.binary(BinaryOperator::Multiply, b_row, pn);
+        let b_global = f.binary(BinaryOperator::Add, b_row_n, b_col);
+        let b_elem = f.index(b_ptr, b_global);
         let b_val = f.load(b_elem);
+        let zero_pad_b = f.literal_f32(0.0);
+        let b_selected = f.select(b_in_bounds, b_val, zero_pad_b);
+        push_emit(&f.f.expressions, &mut loop_body, sb_ptr, b_selected);
+        loop_body.push(f.store(sb_elem, b_selected), S);
 
-        let prod = f.binary(BinaryOperator::Multiply, a_val, b_val);
-        let old_sum = f.load(sum_ptr);
-        let new_sum = f.binary(BinaryOperator::Add, old_sum, prod);
-        push_emit(&f.f.expressions, &mut loop_body, a_ptr, new_sum);
-        loop_body.push(f.store(sum_ptr, new_sum), S);
+        // workgroupBarrier — shared memory is populated
+        loop_body.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
 
-        // i++
-        let one_u = f.literal_u32(1);
-        let i_val2 = f.load(i_ptr);
-        let i_next = f.binary(BinaryOperator::Add, i_val2, one_u);
-        push_emit(&f.f.expressions, &mut loop_body, one_u, i_next);
-        loop_body.push(f.store(i_ptr, i_next), S);
+        // --- Accumulate: sum += shared_a[ly*16+j] * shared_b[j*16+lx] for j in 0..16 ---
+        // Unroll the inner loop for better performance
+        for j in 0..TILE {
+            let j_c = f.literal_u32(j);
+            let ly_tile = f.binary(BinaryOperator::Multiply, ly, tile_c);
+            let sa_j = f.binary(BinaryOperator::Add, ly_tile, j_c);
+            let sa_j_elem = f.index(sa_ptr, sa_j);
+            let sa_j_val = f.load(sa_j_elem);
 
-        f.f.body.push(
-            Statement::Loop {
-                body: loop_body,
-                continuing: Block::new(),
-                break_if: None,
-            },
-            S,
-        );
+            let j_tile = f.binary(BinaryOperator::Multiply, j_c, tile_c);
+            let sb_j = f.binary(BinaryOperator::Add, j_tile, lx);
+            let sb_j_elem = f.index(sb_ptr, sb_j);
+            let sb_j_val = f.load(sb_j_elem);
+
+            let prod = f.binary(BinaryOperator::Multiply, sa_j_val, sb_j_val);
+            let old_sum = f.load(sum_ptr);
+            let new_sum = f.binary(BinaryOperator::Add, old_sum, prod);
+            push_emit(&f.f.expressions, &mut loop_body, j_c, new_sum);
+            loop_body.push(f.store(sum_ptr, new_sum), S);
+        }
+
+        // workgroupBarrier — before next tile overwrites shared memory
+        loop_body.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
+
+        // t += 16
+        let tile_inc = f.literal_u32(TILE);
+        let t_val2 = f.load(t_ptr);
+        let t_next = f.binary(BinaryOperator::Add, t_val2, tile_inc);
+        push_emit(&f.f.expressions, &mut loop_body, tile_inc, t_next);
+        loop_body.push(f.store(t_ptr, t_next), S);
     }
 
-    // if (row < m && col < n) { c[row * n + col] = sum }
+    f.f.body.push(
+        Statement::Loop {
+            body: loop_body,
+            continuing: Block::new(),
+            break_if: None,
+        },
+        S,
+    );
+
+    // Store result: if (row < m && col < n) { c[row * n + col] = sum [+ d] }
+    let row = f.binary(BinaryOperator::Add, tile_row, ly);
+    let col = f.binary(BinaryOperator::Add, tile_col, lx);
     let r_lt_m = f.binary(BinaryOperator::Less, row, pm);
     let c_lt_n = f.binary(BinaryOperator::Less, col, pn);
     let store_cond = f.binary(BinaryOperator::LogicalAnd, r_lt_m, c_lt_n);
@@ -1137,136 +1203,47 @@ fn gen_matmul() -> Module {
     let c_idx = f.binary(BinaryOperator::Add, row_n, col);
     let c_ptr = f.global(gv_c);
     let c_elem = f.index(c_ptr, c_idx);
-    let final_val = f.load(sum_ptr);
-    f.emit(r_lt_m, final_val);
+    let final_sum = f.load(sum_ptr);
+    f.emit(row, final_sum);
 
-    f.f.body.push(
-        Statement::If {
-            condition: store_cond,
-            accept: Block::from_vec(vec![f.store(c_elem, final_val)]),
-            reject: Block::new(),
-        },
-        S,
-    );
+    if let Some(gv_d) = gv_d {
+        // Fused add: result = sum + d[idx]
+        let d_ptr = f.global(gv_d);
+        let d_elem = f.index(d_ptr, c_idx);
+        let d_val = f.load(d_elem);
+        let fused_val = f.binary(BinaryOperator::Add, final_sum, d_val);
+        let mut store_block = Block::new();
+        push_emit(&f.f.expressions, &mut store_block, d_ptr, fused_val);
+        store_block.push(f.store(c_elem, fused_val), S);
+        f.f.body.push(
+            Statement::If {
+                condition: store_cond,
+                accept: store_block,
+                reject: Block::new(),
+            },
+            S,
+        );
+    } else {
+        f.f.body.push(
+            Statement::If {
+                condition: store_cond,
+                accept: Block::from_vec(vec![f.store(c_elem, final_sum)]),
+                reject: Block::new(),
+            },
+            S,
+        );
+    }
 
     b.entry_point("main", [16, 16, 1], f.finish());
     b.finish()
 }
 
-/// Fused matmul + add: C = A × B + D.
+/// Tiled fused matmul + add: C = A × B + D with shared memory.
 ///
-/// Same as naive matmul but reads a 4th buffer `addend` and adds it
+/// Same as tiled matmul but reads a 4th buffer `addend` and adds it
 /// to the result before storing. Eliminates a separate Add dispatch.
 fn gen_matmul_add() -> Module {
-    let mut b = Builder::new();
-    let ty_params = b.params_u32x4("Params", &["m", "n", "k", "_pad"]);
-    let gv_a = b.storage_ro("matrix_a");
-    let gv_b = b.storage_ro("matrix_b");
-    let gv_c = b.storage_rw("matrix_c");
-    // 4th buffer: addend (residual)
-    let gv_d = b.storage_ro("src"); // "src" to reuse existing binding slot name
-    let gv_params = b.uniform("params", ty_params);
-
-    let mut f = FnBuilder::new(&b);
-    let gid = f.arg_gid();
-
-    let col = f.vec_x(gid);
-    let row = f.vec_y(gid);
-    f.emit(col, row);
-
-    let params_ptr = f.global(gv_params);
-    let m_ptr = f.field(params_ptr, 0);
-    let pm = f.load(m_ptr);
-    let n_ptr = f.field(params_ptr, 1);
-    let pn = f.load(n_ptr);
-    let k_ptr = f.field(params_ptr, 2);
-    let pk = f.load(k_ptr);
-    f.emit(params_ptr, pk);
-
-    let zero_f = f.literal_f32(0.0);
-    f.emit(zero_f, zero_f);
-    let sum_var = f.local_var("sum", b.ty_f32, None);
-    let sum_ptr = f.local_ptr(sum_var);
-    f.f.body.push(f.store(sum_ptr, zero_f), S);
-
-    let i_var = f.local_var("i", b.ty_u32, None);
-    let zero_u = f.literal_u32(0);
-    f.emit(zero_u, zero_u);
-    let i_ptr = f.local_ptr(i_var);
-    f.f.body.push(f.store(i_ptr, zero_u), S);
-
-    let mut loop_body = Block::new();
-    {
-        let i_val = f.load(i_ptr);
-        let break_cond = f.binary(BinaryOperator::GreaterEqual, i_val, pk);
-        push_emit(&f.f.expressions, &mut loop_body, i_val, break_cond);
-        loop_body.push(FnBuilder::if_break(break_cond), S);
-
-        let a_ptr = f.global(gv_a);
-        let row_k = f.binary(BinaryOperator::Multiply, row, pk);
-        let a_idx = f.binary(BinaryOperator::Add, row_k, i_val);
-        let a_elem = f.index(a_ptr, a_idx);
-        let a_val = f.load(a_elem);
-
-        let b_ptr = f.global(gv_b);
-        let i_n = f.binary(BinaryOperator::Multiply, i_val, pn);
-        let b_idx = f.binary(BinaryOperator::Add, i_n, col);
-        let b_elem = f.index(b_ptr, b_idx);
-        let b_val = f.load(b_elem);
-
-        let prod = f.binary(BinaryOperator::Multiply, a_val, b_val);
-        let old_sum = f.load(sum_ptr);
-        let new_sum = f.binary(BinaryOperator::Add, old_sum, prod);
-        push_emit(&f.f.expressions, &mut loop_body, a_ptr, new_sum);
-        loop_body.push(f.store(sum_ptr, new_sum), S);
-
-        let one_u = f.literal_u32(1);
-        let i_val2 = f.load(i_ptr);
-        let i_next = f.binary(BinaryOperator::Add, i_val2, one_u);
-        push_emit(&f.f.expressions, &mut loop_body, one_u, i_next);
-        loop_body.push(f.store(i_ptr, i_next), S);
-
-        f.f.body.push(
-            Statement::Loop {
-                body: loop_body,
-                continuing: Block::new(),
-                break_if: None,
-            },
-            S,
-        );
-    }
-
-    // if (row < m && col < n) { c[idx] = sum + d[idx] }
-    let r_lt_m = f.binary(BinaryOperator::Less, row, pm);
-    let c_lt_n = f.binary(BinaryOperator::Less, col, pn);
-    let store_cond = f.binary(BinaryOperator::LogicalAnd, r_lt_m, c_lt_n);
-    let row_n = f.binary(BinaryOperator::Multiply, row, pn);
-    let c_idx = f.binary(BinaryOperator::Add, row_n, col);
-
-    let d_ptr = f.global(gv_d);
-    let d_elem = f.index(d_ptr, c_idx);
-    let d_val = f.load(d_elem);
-    let final_sum = f.load(sum_ptr);
-    let fused_val = f.binary(BinaryOperator::Add, final_sum, d_val);
-
-    let c_ptr = f.global(gv_c);
-    let c_elem = f.index(c_ptr, c_idx);
-    f.emit(r_lt_m, fused_val);
-
-    let mut store_block = Block::new();
-    push_emit(&f.f.expressions, &mut store_block, c_ptr, c_elem);
-    store_block.push(f.store(c_elem, fused_val), S);
-    f.f.body.push(
-        Statement::If {
-            condition: store_cond,
-            accept: store_block,
-            reject: Block::new(),
-        },
-        S,
-    );
-
-    b.entry_point("main", [16, 16, 1], f.finish());
-    b.finish()
+    gen_tiled_matmul_inner(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -1405,21 +1382,6 @@ fn gen_matmul_coop_inner(fused_add: bool) -> Module {
     let c_offset = f.binary(BinaryOperator::Add, c_off_base, tile_col);
     f.emit(c_off_base, c_offset);
 
-    // Load accumulator: from addend buffer (fused) or output buffer (regular)
-    let acc_src = f.global(gv_addend.unwrap_or(gv_c));
-    let acc_elem = f.index(acc_src, c_offset);
-    let acc_load = f.expr(Expression::CooperativeLoad {
-        columns: CooperativeSize::Sixteen,
-        rows: CooperativeSize::Sixteen,
-        role: CooperativeRole::C,
-        data: CooperativeData {
-            pointer: acc_elem,
-            stride: pn,
-            row_major: false,
-        },
-    });
-    f.emit(acc_src, acc_load);
-
     let ty_coop_c = b.m.types.insert(
         Type {
             name: None,
@@ -1434,7 +1396,29 @@ fn gen_matmul_coop_inner(fused_add: bool) -> Module {
     );
     let acc_var = f.local_var("acc", ty_coop_c, None);
     let acc_ptr = f.local_ptr(acc_var);
-    f.f.body.push(f.store(acc_ptr, acc_load), S);
+
+    if let Some(gv_add) = gv_addend {
+        // Fused add: load accumulator from addend buffer (residual connection).
+        let add_src = f.global(gv_add);
+        let add_elem = f.index(add_src, c_offset);
+        let acc_load = f.expr(Expression::CooperativeLoad {
+            columns: CooperativeSize::Sixteen,
+            rows: CooperativeSize::Sixteen,
+            role: CooperativeRole::C,
+            data: CooperativeData {
+                pointer: add_elem,
+                stride: pn,
+                row_major: false,
+            },
+        });
+        f.emit(add_src, acc_load);
+        f.f.body.push(f.store(acc_ptr, acc_load), S);
+    } else {
+        // Regular MatMul: accumulator starts at zero — no global memory read needed.
+        let zero_acc = f.expr(Expression::ZeroValue(ty_coop_c));
+        f.emit(zero_acc, zero_acc);
+        f.f.body.push(f.store(acc_ptr, zero_acc), S);
+    }
 
     // var t: u32 = 0
     let t_var = f.local_var("t", b.ty_u32, None);
@@ -1442,6 +1426,31 @@ fn gen_matmul_coop_inner(fused_add: bool) -> Module {
     f.emit(zero_u, zero_u);
     let t_ptr = f.local_ptr(t_var);
     f.f.body.push(f.store(t_ptr, zero_u), S);
+
+    // Pre-compute loop-invariant values (depend only on tid, tile_row, tile_col):
+    //   flat_idx = tid + e * 64
+    //   src_col  = flat_idx % 16 = tid % 16       (same for all e and all K-tiles)
+    //   src_row  = flat_idx / 16 = tid/16 + e*4   (same for a given e across K-tiles)
+    //
+    // Hoisted before the K-tile loop so they're emitted in the outer scope.
+    // Loop-variant values (depend on t_val) remain inside the loop.
+
+    // A staging: src_col_a = tid & 15, base_row_a = tid >> 4
+    let mask15 = f.literal_u32(TILE - 1);
+    let src_col_a = f.binary(BinaryOperator::And, tid, mask15);
+    let shift4 = f.literal_u32(4);
+    let base_row_a = f.binary(BinaryOperator::ShiftRight, tid, shift4);
+    f.emit(mask15, base_row_a);
+
+    // B staging: src_col_b = tid & 15, cc = tile_col + src_col_b, in_n = cc < pn
+    // (in_n is fully loop-invariant since tile_col and pn don't change)
+    let mask15_b = f.literal_u32(TILE - 1);
+    let src_col_b = f.binary(BinaryOperator::And, tid, mask15_b);
+    let cc = f.binary(BinaryOperator::Add, tile_col, src_col_b);
+    let in_n = f.binary(BinaryOperator::Less, cc, pn);
+    let shift4_b = f.literal_u32(4);
+    let base_row_b = f.binary(BinaryOperator::ShiftRight, tid, shift4_b);
+    f.emit(mask15_b, base_row_b);
 
     // ===== K-tile loop =====
     let mut loop_body = Block::new();
@@ -1452,39 +1461,33 @@ fn gen_matmul_coop_inner(fused_add: bool) -> Module {
         loop_body.push(FnBuilder::if_break(break_cond), S);
 
         // --- Stage A tile: f32 global → f16 shared ---
-        // Each of 64 threads loads 4 elements (256 total = 16×16 tile)
-        let elems = f.literal_u32(ELEMS_PER_THREAD);
-        let tile16 = f.literal_u32(TILE);
+        // Each of 64 threads loads 4 elements (256 total = 16×16 tile).
         let sa_ptr = f.global(gv_sa);
         let a_ptr = f.global(gv_a);
-        // Pre-create zero f16 constant for out-of-bounds padding
         let zero_f32_a = f.literal_f32(0.0);
         let zero_f16_a = f.expr(Expression::As {
             expr: zero_f32_a,
             kind: ScalarKind::Float,
             convert: Some(2),
         });
-        push_emit(&f.f.expressions, &mut loop_body, elems, zero_f16_a);
+        // Loop-variant: tc_a = t_val + src_col_a, in_k_a = tc_a < pk
+        let tc_a = f.binary(BinaryOperator::Add, t_val, src_col_a);
+        let in_k_a = f.binary(BinaryOperator::Less, tc_a, pk);
+        push_emit(&f.f.expressions, &mut loop_body, sa_ptr, in_k_a);
 
         for e in 0..ELEMS_PER_THREAD {
-            // flat_idx = tid + e * 64
             let offset = f.literal_u32(e * WG_SIZE);
             let flat_idx = f.binary(BinaryOperator::Add, tid, offset);
-            // sa_elem must be created before data loads so it's in the outer scope
             let sa_elem = f.index(sa_ptr, flat_idx);
-            // src_row = flat_idx / 16, src_col = flat_idx % 16
-            let src_row = f.binary(BinaryOperator::Divide, flat_idx, tile16);
-            let src_col = f.binary(BinaryOperator::Modulo, flat_idx, tile16);
-            // Bounds: (tile_row + src_row) < m && (t + src_col) < k
+            // src_row = base_row_a + e*4 (e*64/16 = e*4)
+            let e_rows = f.literal_u32(e * ELEMS_PER_THREAD); // e * 4
+            let src_row = f.binary(BinaryOperator::Add, base_row_a, e_rows);
             let gr = f.binary(BinaryOperator::Add, tile_row, src_row);
-            let tc = f.binary(BinaryOperator::Add, t_val, src_col);
             let in_m = f.binary(BinaryOperator::Less, gr, pm);
-            let in_k = f.binary(BinaryOperator::Less, tc, pk);
-            let in_bounds = f.binary(BinaryOperator::LogicalAnd, in_m, in_k);
+            let in_bounds = f.binary(BinaryOperator::LogicalAnd, in_m, in_k_a);
             push_emit(&f.f.expressions, &mut loop_body, offset, in_bounds);
-            // Data load + convert only in accept block
             let grk = f.binary(BinaryOperator::Multiply, gr, pk);
-            let global_idx = f.binary(BinaryOperator::Add, grk, tc);
+            let global_idx = f.binary(BinaryOperator::Add, grk, tc_a);
             let a_elem = f.index(a_ptr, global_idx);
             let a_val = f.load(a_elem);
             let a_f16 = f.expr(Expression::As {
@@ -1514,22 +1517,21 @@ fn gen_matmul_coop_inner(fused_add: bool) -> Module {
             kind: ScalarKind::Float,
             convert: Some(2),
         });
+        // in_n is fully loop-invariant (hoisted outside loop).
+        // Loop-variant: in_k_b depends on t_val via tr.
         push_emit(&f.f.expressions, &mut loop_body, sb_ptr, zero_f16_b);
 
         for e in 0..ELEMS_PER_THREAD {
             let offset = f.literal_u32(e * WG_SIZE);
             let flat_idx = f.binary(BinaryOperator::Add, tid, offset);
             let sb_elem = f.index(sb_ptr, flat_idx);
-            let src_row = f.binary(BinaryOperator::Divide, flat_idx, tile16);
-            let src_col = f.binary(BinaryOperator::Modulo, flat_idx, tile16);
-            // Bounds: (t + src_row) < k && (tile_col + src_col) < n
+            // src_row = base_row_b + e*4
+            let e_rows_b = f.literal_u32(e * ELEMS_PER_THREAD); // e * 4
+            let src_row = f.binary(BinaryOperator::Add, base_row_b, e_rows_b);
             let tr = f.binary(BinaryOperator::Add, t_val, src_row);
-            let cc = f.binary(BinaryOperator::Add, tile_col, src_col);
-            let in_k = f.binary(BinaryOperator::Less, tr, pk);
-            let in_n = f.binary(BinaryOperator::Less, cc, pn);
-            let in_bounds = f.binary(BinaryOperator::LogicalAnd, in_k, in_n);
+            let in_k_b = f.binary(BinaryOperator::Less, tr, pk);
+            let in_bounds = f.binary(BinaryOperator::LogicalAnd, in_k_b, in_n);
             push_emit(&f.f.expressions, &mut loop_body, offset, in_bounds);
-            // Data load + convert only in accept block
             let trn = f.binary(BinaryOperator::Multiply, tr, pn);
             let global_idx = f.binary(BinaryOperator::Add, trn, cc);
             let b_elem = f.index(b_ptr, global_idx);
