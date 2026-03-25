@@ -854,10 +854,13 @@ impl Session {
                         src_b: buf(dispatch.input_buffers[1]),
                         bias: buf(dispatch.input_buffers[2]),
                         dst: buf(dispatch.output_buffer),
+                        // Attention params are sequential: [seq/q_seq, num_heads/kv_seq,
+                        // num_kv_heads/packed_heads, head_dim]. Use n/k in definition order
+                        // so memory layout matches the shader's u32x4 field reads.
                         params: MatMulParams {
                             m: dispatch.params[0],
-                            k: dispatch.params[1],
-                            n: dispatch.params[2],
+                            n: dispatch.params[1],
+                            k: dispatch.params[2],
                             _pad: dispatch.params[3],
                         },
                     },

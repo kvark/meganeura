@@ -16,6 +16,7 @@ MODEL="${MODEL:-smolvla}"
 RUNS="${RUNS:-5}"
 WARMUP="${WARMUP:-3}"
 PYTORCH_DTYPE="${PYTORCH_DTYPE:-float32}"
+FORCE=""
 
 # SmolLM2 defaults
 MAX_TOKENS="${MAX_TOKENS:-32}"
@@ -26,13 +27,14 @@ STEPS="${STEPS:-10}"
 CHUNK_SIZE="${CHUNK_SIZE:-50}"
 VLM_SEQ_LEN="${VLM_SEQ_LEN:-16}"
 
-# Parse --model argument
+# Parse arguments
 for arg in "$@"; do
     case "$arg" in
         --model=*) MODEL="${arg#*=}" ;;
-        --model) shift_next=1 ;;
+        --model) shift_next=model ;;
+        --force) FORCE="--force" ;;
         *)
-            if [[ "${shift_next:-}" == "1" ]]; then
+            if [[ "${shift_next:-}" == "model" ]]; then
                 MODEL="$arg"
                 shift_next=
             fi
@@ -93,6 +95,7 @@ run_smolvla() {
         --steps "$STEPS" \
         --warmup "$WARMUP" \
         --runs "$RUNS" \
+        ${FORCE} \
         > "$OUT_DIR/smolvla_meganeura.json" 2>/dev/stderr
     echo "  -> $OUT_DIR/smolvla_meganeura.json"
     echo ""
@@ -199,6 +202,7 @@ run_smollm2() {
         --max-tokens "$MAX_TOKENS" \
         --warmup "$WARMUP" \
         --runs "$RUNS" \
+        ${FORCE} \
         > "$OUT_DIR/meganeura.json" 2>/dev/stderr
     echo "  -> $OUT_DIR/meganeura.json"
     echo ""
