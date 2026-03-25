@@ -145,19 +145,21 @@ fn check_bench_preconditions(abort_on_warn: bool) {
                 }
                 if let Some(cur) = cur_mhz {
                     let ratio = cur as f64 / max_mhz.max(1) as f64;
+                    // Clock will boost under load during warmup — print as info only,
+                    // not a hard warning that blocks benchmarking.
+                    let boost_note = if ratio < GPU_CLOCK_MIN_RATIO {
+                        " — will boost under load"
+                    } else {
+                        ""
+                    };
                     eprintln!(
-                        "  {}: GPU clock {}MHz / {}MHz ({:.0}%)",
+                        "  {}: GPU clock {}MHz / {}MHz ({:.0}%){}",
                         card.file_name().to_string_lossy(),
                         cur,
                         max_mhz,
-                        ratio * 100.0
+                        ratio * 100.0,
+                        boost_note
                     );
-                    if ratio < GPU_CLOCK_MIN_RATIO {
-                        warnings.push(format!(
-                            "{}: GPU clock {}MHz is only {:.0}% of max {}MHz — clocks not boosted, results will be slow",
-                            card.file_name().to_string_lossy(), cur, ratio * 100.0, max_mhz
-                        ));
-                    }
                 }
             }
         }

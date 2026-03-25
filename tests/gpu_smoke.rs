@@ -3,6 +3,50 @@
 use meganeura::{Graph, build_inference_session, build_session};
 
 #[test]
+fn matmul_non_uniform_values() {
+    // Non-uniform matmul: A (16×16) where A[i,j]=i+1, B (16×16) where B[i,j]=j+1.
+    // C[i,j] = sum_{k=0}^{15} (i+1) * (k+1) = (i+1) * sum_{k=0}^{15}(k+1) = (i+1) * 136.
+    // This catches A@B vs B@A bugs because B@A[i,j] = (j+1)*136 ≠ (i+1)*136 for i≠j.
+    let m = 16;
+    let k = 16;
+    let n = 16;
+    let mut g = Graph::new();
+    let a = g.input("a", &[m, k]);
+    let b = g.parameter("b", &[k, n]);
+    let c = g.matmul(a, b);
+    g.set_outputs(vec![c]);
+
+    let mut session = build_inference_session(&g);
+
+    let a_data: Vec<f32> = (0..m * k).map(|i| (i / k + 1) as f32).collect(); // A[i,j] = i+1
+    let b_data: Vec<f32> = (0..k * n).map(|i| (i % n + 1) as f32).collect(); // B[i,j] = j+1
+    session.set_input("a", &a_data);
+    session.set_parameter("b", &b_data);
+
+    session.step();
+    session.wait();
+
+    let output = session.read_output(m * n);
+    // C[i,j] = sum_{k=0}^{15} A[i,k]*B[k,j] = sum_k (i+1)*(j+1) = 16*(i+1)*(j+1)
+    // B@A[i,j] = sum_k (k+1)*(j+1) = (j+1)*136  — varies only with j, not i
+    // A@B[i,j] = 16*(i+1)*(j+1)               — varies with both i and j
+    for row in 0..m {
+        for col in 0..n {
+            let got = output[row * n + col];
+            let expected = k as f32 * (row as f32 + 1.0) * (col as f32 + 1.0);
+            assert!(
+                (got - expected).abs() < expected.abs() * 0.02 + 1.0,
+                "C[{},{}]: got {}, expected {} (f16 precision)",
+                row,
+                col,
+                got,
+                expected
+            );
+        }
+    }
+}
+
+#[test]
 fn shader_compilation_and_forward_pass() {
     // Build a small MLP graph
     let batch = 4;

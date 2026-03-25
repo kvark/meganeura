@@ -1435,15 +1435,29 @@ fn gen_matmul_coop_inner(fused_add: bool) -> Module {
     // Hoisted before the K-tile loop so they're emitted in the outer scope.
     // Loop-variant values (depend on t_val) remain inside the loop.
 
-    // A staging: src_col_a = tid & 15, base_row_a = tid >> 4
+    // Fix #4: stage matrix_b into shared_a and matrix_a into shared_b.
+    // Col-major CooperativeLoad (row_major=false) of row-major staged data gives the
+    // transpose of each tile:
+    //   sa = B staged row-major → col-major load as role=A → B.T in A
+    //   sb = A staged row-major → col-major load as role=B → A.T in B
+    //   B.T @ A.T = (A@B).T; col-major store of (A@B).T = A@B row-major ✓
+    //
+    // Keeps original sa→role=A, sb→role=B cooperative load order (AMD's fast path).
+    //
+    // Invariants hoisted before K-tile loop:
+    //   src_col_a = tid & 15 → K col for A (used in sb/A staging)
+    //   base_row_a = tid >> 4 → M row base (used in sb/A staging)
+    //   src_col_b = tid & 15 → N col for B (used in sa/B staging)
+    //   cc = tile_col + src_col_b → global N col [FULLY LOOP INVARIANT]
+    //   in_n = cc < pn         [FULLY LOOP INVARIANT]
+    //   base_row_b = tid >> 4 → K row base for B (used in sa/B staging)
     let mask15 = f.literal_u32(TILE - 1);
     let src_col_a = f.binary(BinaryOperator::And, tid, mask15);
     let shift4 = f.literal_u32(4);
     let base_row_a = f.binary(BinaryOperator::ShiftRight, tid, shift4);
     f.emit(mask15, base_row_a);
 
-    // B staging: src_col_b = tid & 15, cc = tile_col + src_col_b, in_n = cc < pn
-    // (in_n is fully loop-invariant since tile_col and pn don't change)
+    // B staging invariants: cc = tile_col + (tid & 15), in_n = cc < pn
     let mask15_b = f.literal_u32(TILE - 1);
     let src_col_b = f.binary(BinaryOperator::And, tid, mask15_b);
     let cc = f.binary(BinaryOperator::Add, tile_col, src_col_b);
@@ -1460,25 +1474,69 @@ fn gen_matmul_coop_inner(fused_add: bool) -> Module {
         push_emit(&f.f.expressions, &mut loop_body, t_val, break_cond);
         loop_body.push(FnBuilder::if_break(break_cond), S);
 
-        // --- Stage A tile: f32 global → f16 shared ---
+        // --- Stage sa tile: matrix_b → shared_a (row-major, coalesced) ---
         // Each of 64 threads loads 4 elements (256 total = 16×16 tile).
         let sa_ptr = f.global(gv_sa);
+        let b_ptr = f.global(gv_b);
+        let zero_f32_sa = f.literal_f32(0.0);
+        let zero_f16_sa = f.expr(Expression::As {
+            expr: zero_f32_sa,
+            kind: ScalarKind::Float,
+            convert: Some(2),
+        });
+        // in_n is fully loop-invariant (hoisted). Loop-variant: tr = t_val + base_row_b + e*4
+        push_emit(&f.f.expressions, &mut loop_body, sa_ptr, zero_f16_sa);
+
+        for e in 0..ELEMS_PER_THREAD {
+            let offset = f.literal_u32(e * WG_SIZE);
+            let flat_idx = f.binary(BinaryOperator::Add, tid, offset);
+            let sa_elem = f.index(sa_ptr, flat_idx);
+            let e_rows_b = f.literal_u32(e * ELEMS_PER_THREAD); // e * 4
+            let src_row = f.binary(BinaryOperator::Add, base_row_b, e_rows_b);
+            let tr = f.binary(BinaryOperator::Add, t_val, src_row);
+            let in_k_b = f.binary(BinaryOperator::Less, tr, pk);
+            let in_bounds = f.binary(BinaryOperator::LogicalAnd, in_k_b, in_n);
+            push_emit(&f.f.expressions, &mut loop_body, offset, in_bounds);
+            let trn = f.binary(BinaryOperator::Multiply, tr, pn);
+            let global_idx = f.binary(BinaryOperator::Add, trn, cc);
+            let b_elem = f.index(b_ptr, global_idx);
+            let b_val = f.load(b_elem);
+            let b_f16 = f.expr(Expression::As {
+                expr: b_val,
+                kind: ScalarKind::Float,
+                convert: Some(2),
+            });
+            let mut accept = Block::new();
+            push_emit(&f.f.expressions, &mut accept, trn, b_f16);
+            accept.push(f.store(sa_elem, b_f16), S);
+            loop_body.push(
+                Statement::If {
+                    condition: in_bounds,
+                    accept,
+                    reject: Block::from_vec(vec![f.store(sa_elem, zero_f16_sa)]),
+                },
+                S,
+            );
+        }
+
+        // --- Stage sb tile: matrix_a → shared_b (row-major, coalesced) ---
+        let sb_ptr = f.global(gv_sb);
         let a_ptr = f.global(gv_a);
-        let zero_f32_a = f.literal_f32(0.0);
-        let zero_f16_a = f.expr(Expression::As {
-            expr: zero_f32_a,
+        let zero_f32_sb = f.literal_f32(0.0);
+        let zero_f16_sb = f.expr(Expression::As {
+            expr: zero_f32_sb,
             kind: ScalarKind::Float,
             convert: Some(2),
         });
         // Loop-variant: tc_a = t_val + src_col_a, in_k_a = tc_a < pk
         let tc_a = f.binary(BinaryOperator::Add, t_val, src_col_a);
         let in_k_a = f.binary(BinaryOperator::Less, tc_a, pk);
-        push_emit(&f.f.expressions, &mut loop_body, sa_ptr, in_k_a);
+        push_emit(&f.f.expressions, &mut loop_body, sb_ptr, in_k_a);
 
         for e in 0..ELEMS_PER_THREAD {
             let offset = f.literal_u32(e * WG_SIZE);
             let flat_idx = f.binary(BinaryOperator::Add, tid, offset);
-            let sa_elem = f.index(sa_ptr, flat_idx);
+            let sb_elem = f.index(sb_ptr, flat_idx);
             // src_row = base_row_a + e*4 (e*64/16 = e*4)
             let e_rows = f.literal_u32(e * ELEMS_PER_THREAD); // e * 4
             let src_row = f.binary(BinaryOperator::Add, base_row_a, e_rows);
@@ -1497,58 +1555,12 @@ fn gen_matmul_coop_inner(fused_add: bool) -> Module {
             });
             let mut accept = Block::new();
             push_emit(&f.f.expressions, &mut accept, grk, a_f16);
-            accept.push(f.store(sa_elem, a_f16), S);
+            accept.push(f.store(sb_elem, a_f16), S);
             loop_body.push(
                 Statement::If {
                     condition: in_bounds,
                     accept,
-                    reject: Block::from_vec(vec![f.store(sa_elem, zero_f16_a)]),
-                },
-                S,
-            );
-        }
-
-        // --- Stage B tile: f32 global → f16 shared ---
-        let sb_ptr = f.global(gv_sb);
-        let b_ptr = f.global(gv_b);
-        let zero_f32_b = f.literal_f32(0.0);
-        let zero_f16_b = f.expr(Expression::As {
-            expr: zero_f32_b,
-            kind: ScalarKind::Float,
-            convert: Some(2),
-        });
-        // in_n is fully loop-invariant (hoisted outside loop).
-        // Loop-variant: in_k_b depends on t_val via tr.
-        push_emit(&f.f.expressions, &mut loop_body, sb_ptr, zero_f16_b);
-
-        for e in 0..ELEMS_PER_THREAD {
-            let offset = f.literal_u32(e * WG_SIZE);
-            let flat_idx = f.binary(BinaryOperator::Add, tid, offset);
-            let sb_elem = f.index(sb_ptr, flat_idx);
-            // src_row = base_row_b + e*4
-            let e_rows_b = f.literal_u32(e * ELEMS_PER_THREAD); // e * 4
-            let src_row = f.binary(BinaryOperator::Add, base_row_b, e_rows_b);
-            let tr = f.binary(BinaryOperator::Add, t_val, src_row);
-            let in_k_b = f.binary(BinaryOperator::Less, tr, pk);
-            let in_bounds = f.binary(BinaryOperator::LogicalAnd, in_k_b, in_n);
-            push_emit(&f.f.expressions, &mut loop_body, offset, in_bounds);
-            let trn = f.binary(BinaryOperator::Multiply, tr, pn);
-            let global_idx = f.binary(BinaryOperator::Add, trn, cc);
-            let b_elem = f.index(b_ptr, global_idx);
-            let b_val = f.load(b_elem);
-            let b_f16 = f.expr(Expression::As {
-                expr: b_val,
-                kind: ScalarKind::Float,
-                convert: Some(2),
-            });
-            let mut accept = Block::new();
-            push_emit(&f.f.expressions, &mut accept, trn, b_f16);
-            accept.push(f.store(sb_elem, b_f16), S);
-            loop_body.push(
-                Statement::If {
-                    condition: in_bounds,
-                    accept,
-                    reject: Block::from_vec(vec![f.store(sb_elem, zero_f16_b)]),
+                    reject: Block::from_vec(vec![f.store(sb_elem, zero_f16_sb)]),
                 },
                 S,
             );
