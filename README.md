@@ -1,5 +1,9 @@
 # meganeura
 
+[![CI](https://github.com/kvark/meganeura/actions/workflows/ci.yml/badge.svg)](https://github.com/kvark/meganeura/actions/workflows/ci.yml)
+[![Docs](https://docs.rs/meganeura/badge.svg)](https://docs.rs/meganeura)
+[![Crates.io](https://img.shields.io/crates/v/meganeura.svg?label=meganeura)](https://crates.io/crates/meganeura)
+
 Meganeura - a cross-platform Neural Network training and inference library in Rust.
 
 ![logo](etc/logo.png)

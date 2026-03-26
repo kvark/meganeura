@@ -6,12 +6,12 @@ repository = "https://github.com/kvark/meganeura"
 categories = ["science"]
 edition = "2024"
 rust-version = "1.88"
-description = "E-graph optimized neural network training on blade-graphics"
+description = "E-graph optimized neural network training on Blade"
 license = "MIT"
 
 [dependencies]
-blade-graphics = { git = "https://github.com/kvark/blade.git", rev = "c68ad15339d754f234f3bcc845f41fea55617b39" }
-blade-macros = { git = "https://github.com/kvark/blade.git", rev = "c68ad15339d754f234f3bcc845f41fea55617b39" }
+blade-graphics = { version = "0.8" }
+blade-macros = { version = "0.3" }
 egglog = "2.0"
 bytemuck = { version = "1", features = ["derive"] }
 naga = { version = "29", features = ["wgsl-out"] }
