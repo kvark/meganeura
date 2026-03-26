@@ -1,5 +1,5 @@
-use crate::compile::{BufferRef, ExecutionPlan, ShaderEntry};
-use std::collections::HashMap;
+use crate::compile::{BufferRef, Dispatch, ExecutionPlan, ShaderEntry};
+use std::collections::{HashMap, HashSet};
 
 type Gpu = blade_graphics::Context;
 
@@ -268,6 +268,65 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
     }
 }
 
+// ---- Dispatch scheduling ----
+
+/// Reorder dispatches by dependency level so parallel branches cluster together.
+///
+/// Level is defined as: 0 for dispatches with no dependencies on other
+/// dispatches (only on inputs/params), and `1 + max(level of producers)`
+/// otherwise. A stable sort by level produces a valid topological order where
+/// all dispatches at the same level are mutually independent — they can share
+/// a single compute pass without any barrier between them.
+fn reorder_by_level(dispatches: &mut Vec<Dispatch>) {
+    let n = dispatches.len();
+    if n == 0 {
+        return;
+    }
+    // Map: buffer id → index of the dispatch that writes it.
+    let mut producer: HashMap<u32, usize> = HashMap::new();
+    let mut levels = vec![0u32; n];
+    for (i, dispatch) in dispatches.iter().enumerate() {
+        let level = dispatch
+            .input_buffers
+            .iter()
+            .filter_map(|b| producer.get(&b.0))
+            .map(|&pred| levels[pred] + 1)
+            .max()
+            .unwrap_or(0);
+        levels[i] = level;
+        producer.insert(dispatch.output_buffer.0, i);
+    }
+    // Stable sort by level keeps topological order within a level.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| levels[i]);
+    let old = std::mem::take(dispatches);
+    *dispatches = order.iter().map(|&i| old[i].clone()).collect();
+}
+
+/// Partition the (reordered) dispatch list into barrier groups.
+///
+/// Dispatches in the same group share one compute pass (no barrier between
+/// them). A new group starts whenever a dispatch reads a buffer written by
+/// an earlier dispatch in the current group (RAW hazard). After level-based
+/// reordering this aligns exactly with level boundaries.
+fn compute_groups(dispatches: &[Dispatch]) -> Vec<std::ops::Range<usize>> {
+    let mut groups = Vec::new();
+    let mut dirty = HashSet::<u32>::new();
+    let mut start = 0;
+    for (i, dispatch) in dispatches.iter().enumerate() {
+        if dispatch.input_buffers.iter().any(|b| dirty.contains(&b.0)) {
+            groups.push(start..i);
+            start = i;
+            dirty.clear();
+        }
+        dirty.insert(dispatch.output_buffer.0);
+    }
+    if !dispatches.is_empty() {
+        groups.push(start..dispatches.len());
+    }
+    groups
+}
+
 // ---- Session ----
 
 /// A compiled, ready-to-execute GPU session.
@@ -279,6 +338,9 @@ pub struct Session {
     buffers: Vec<blade_graphics::Buffer>,
     pipelines: Pipelines,
     plan: ExecutionPlan,
+    /// Pre-computed barrier groups: each range of dispatch indices shares one
+    /// compute pass. Pass boundaries in blade emit ALL_COMMANDS barriers.
+    groups: Vec<std::ops::Range<usize>>,
     encoder: blade_graphics::CommandEncoder,
     sync_point: Option<blade_graphics::SyncPoint>,
     /// Nanosecond offset (in profiler time) of the most recent GPU submit,
@@ -443,6 +505,16 @@ impl Session {
             }
         }
 
+        // Reorder dispatches by dependency level so parallel branches (e.g. Q/K/V
+        // projections) cluster together, then partition into barrier groups.
+        reorder_by_level(&mut plan.dispatches);
+        let groups = compute_groups(&plan.dispatches);
+        log::info!(
+            "{} dispatches → {} barrier groups",
+            plan.dispatches.len(),
+            groups.len()
+        );
+
         let buffers: Vec<blade_graphics::Buffer> = plan
             .buffers
             .iter()
@@ -468,6 +540,7 @@ impl Session {
             buffers,
             pipelines,
             plan,
+            groups,
             encoder,
             sync_point: None,
             last_submit_ns: 0,
@@ -609,16 +682,9 @@ impl Session {
         // After start(), blade exposes GPU timings from the *previous* submission.
         self.drain_gpu_timings();
 
-        if std::env::var("MEGANEURA_SINGLE_PASS").is_ok() {
-            let mut pass = self.encoder.compute("step");
-            for i in 0..self.plan.dispatches.len() {
-                let dispatch = &self.plan.dispatches[i];
-                let pipeline = self.pipelines.get(&dispatch.shader);
-                let mut pc = pass.with(pipeline);
-                Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
-                pc.dispatch(dispatch.workgroups);
-            }
-        } else {
+        if std::env::var("MEGANEURA_MULTI_PASS").is_ok() {
+            // Multi-pass mode: one compute pass per dispatch with per-pass barriers
+            // and GPU timestamps. Useful for profiling (dump_gpu_timings).
             for i in 0..self.plan.dispatches.len() {
                 let dispatch = &self.plan.dispatches[i];
                 let pipeline = self.pipelines.get(&dispatch.shader);
@@ -626,6 +692,23 @@ impl Session {
                 let mut pc = pass.with(pipeline);
                 Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
                 pc.dispatch(dispatch.workgroups);
+            }
+        } else {
+            // Group mode (default): one compute pass per barrier group.
+            // Groups were pre-computed at session creation by reordering dispatches
+            // by dependency level and partitioning on RAW hazards. Each pass
+            // boundary in blade emits an ALL_COMMANDS barrier, so N groups =
+            // N barriers — far fewer than one per dispatch.
+            for gi in 0..self.groups.len() {
+                let group = self.groups[gi].clone();
+                let mut pass = self.encoder.compute("step");
+                for i in group {
+                    let dispatch = &self.plan.dispatches[i];
+                    let pipeline = self.pipelines.get(&dispatch.shader);
+                    let mut pc = pass.with(pipeline);
+                    Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
+                    pc.dispatch(dispatch.workgroups);
+                }
             }
         }
 

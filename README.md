@@ -8,6 +8,18 @@ For GPU access, we use [blade-graphics](https://github.com/kvark/blade/tree/main
 
 Instead of including the "batteries" - kernels for all kind of cases and hardware - we are going to explore the search space using [e-graph](https://egraphs-good.github.io/), similar to [Luminal](https://github.com/luminal-ai/luminal). To translate a given graph into hardware instructions, we are generating [Naga IR](https://docs.rs/naga/latest/naga/) directly, skipping the intermediate text.
 
+## Benchmarks
+
+SmolVLA action expert on AMD RDNA3 (chunk_size=50, vlm_seq_len=16, 10 denoise steps, float32):
+
+| Metric | meganeura | PyTorch ROCm |
+|---|---|---|
+| Steps/second | 40.9 | 41.6 |
+| ms / step | 24.5 | 24.1 |
+| ms / full chunk | 245 | 241 |
+
+Run `bash bench/compare.sh` to reproduce.
+
 ## System Requirements
 
 Matrix multiplication uses [cooperative matrix operations](https://registry.khronos.org/vulkan/specs/latest/man/html/VK_KHR_cooperative_matrix.html) for hardware-accelerated 8x8 tile math. This requires one of:
