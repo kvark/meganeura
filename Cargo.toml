@@ -53,3 +53,7 @@ path = "bench/bench_meganeura.rs"
 [[example]]
 name = "bench_smolvla_meganeura"
 path = "bench/bench_smolvla_meganeura.rs"
+
+[[example]]
+name = "bench_smolvla_train"
+path = "bench/bench_smolvla_train.rs"

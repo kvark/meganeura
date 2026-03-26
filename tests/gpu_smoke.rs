@@ -1,6 +1,9 @@
 /// GPU smoke test: validates that all shaders compile with blade + lavapipe
 /// and that a simple forward pass executes without errors.
-use meganeura::{Graph, build_inference_session, build_session};
+use meganeura::{
+    Graph, build_inference_session, build_session,
+    models::smolvla::{self, SmolVLAConfig},
+};
 
 #[test]
 fn matmul_non_uniform_values() {
@@ -179,4 +182,153 @@ fn fused_matmul_add_correct() {
             expected
         );
     }
+}
+
+#[test]
+fn simple_sgd_decreases_loss() {
+    // Verify the basic training loop (SGD on matmul+mean_all) actually decreases loss.
+    let mut g = Graph::new();
+    let x = g.input("x", &[4, 8]);
+    let w = g.parameter("w", &[8, 4]);
+    let y = g.matmul(x, w);
+    let loss = g.mean_all(y);
+    g.set_outputs(vec![loss]);
+
+    let mut session = build_session(&g);
+    session.set_parameter("w", &vec![0.1_f32; 8 * 4]);
+    session.set_input("x", &vec![1.0_f32; 4 * 8]);
+    session.step();
+    session.wait();
+    let initial_loss = session.read_loss();
+    assert!(initial_loss.is_finite());
+
+    session.sgd_step_cpu(0.1);
+    session.set_input("x", &vec![1.0_f32; 4 * 8]);
+    session.step();
+    session.wait();
+    let final_loss = session.read_loss();
+    assert!(
+        final_loss < initial_loss,
+        "basic SGD should decrease loss: {} → {}",
+        initial_loss,
+        final_loss
+    );
+}
+
+#[test]
+fn silu_swiglu_rmsnorm_gradients() {
+    // Smoke test: backward pass through Silu, SwiGLU, RmsNorm doesn't crash
+    // and produces a finite loss.
+    let seq = 4;
+    let d = 8;
+    let mut g = Graph::new();
+    let x = g.input("x", &[seq, d]);
+    let w1 = g.parameter("w1", &[d, d]);
+    let mm1 = g.matmul(x, w1);
+    let s = g.silu(mm1); // test Silu backward
+    let w_gate = g.parameter("w_gate", &[d, d]);
+    let w_up = g.parameter("w_up", &[d, d]);
+    let gate = g.matmul(s, w_gate);
+    let up = g.matmul(s, w_up);
+    let ffn = g.swiglu(gate, up); // test SwiGLU backward
+    let rn_w = g.parameter("rn_w", &[d]);
+    let rn = g.rms_norm(ffn, rn_w, 1e-5); // test RmsNorm backward
+    let loss = g.mean_all(rn);
+    g.set_outputs(vec![loss]);
+
+    let mut session = build_session(&g);
+    session.set_parameter("w1", &vec![0.1_f32; d * d]);
+    session.set_parameter("w_gate", &vec![0.1_f32; d * d]);
+    session.set_parameter("w_up", &vec![0.1_f32; d * d]);
+    session.set_parameter("rn_w", &vec![1.0_f32; d]);
+    session.set_input("x", &vec![0.5_f32; seq * d]);
+
+    session.step();
+    session.wait();
+
+    let loss_val = session.read_loss();
+    assert!(
+        loss_val.is_finite(),
+        "loss should be finite after silu/swiglu/rmsnorm backward, got {}",
+        loss_val
+    );
+}
+
+#[test]
+fn smolvla_training_backprop_smoke() {
+    // Smoke test: SmolVLA action expert training graph compiles, runs,
+    // and decreases loss over 5 gradient steps.
+    let config = SmolVLAConfig::small_test();
+    let action_seq_len = config.chunk_size; // 4
+    let vlm_seq_len = 4;
+
+    let training_g =
+        smolvla::build_action_expert_training(&config, action_seq_len, vlm_seq_len);
+    let mut session = build_session(&training_g);
+
+    // Initialize with small uniform weights
+    for (name, buf_ref) in session.plan().param_buffers.clone() {
+        let size_bytes = session.plan().buffers[buf_ref.0 as usize];
+        let n = size_bytes / 4;
+        session.set_parameter(&name, &vec![0.01_f32; n]);
+    }
+
+    let expert_hidden = config.expert.hidden_size;
+    let kv_dim = config.expert.kv_dim();
+    let noisy_actions = vec![0.5_f32; action_seq_len * config.max_action_dim];
+    let timestep = vec![0.1_f32; expert_hidden * 2];
+    let vlm_kv = vec![0.1_f32; vlm_seq_len * kv_dim];
+    let target_actions = vec![0.0_f32; action_seq_len * config.max_action_dim];
+
+    let set_inputs = |s: &mut meganeura::Session| {
+        s.set_input("noisy_actions", &noisy_actions);
+        s.set_input("timestep", &timestep);
+        for i in 0..config.expert.num_layers {
+            if i % config.expert.self_attn_every_n_layers != 0 {
+                s.set_input(&format!("vlm_kv_layer_{}", i), &vlm_kv);
+            }
+        }
+        s.set_input("target_actions", &target_actions);
+    };
+
+    // Diagnostic: check session structure
+    eprintln!(
+        "param_buffers={}, param_grad_pairs={}",
+        session.plan().param_buffers.len(),
+        session.plan().param_grad_pairs.len()
+    );
+    assert!(
+        !session.plan().param_grad_pairs.is_empty(),
+        "no gradient pairs — autodiff may have failed"
+    );
+
+    // Step 1 — record initial loss
+    set_inputs(&mut session);
+    session.step();
+    session.wait();
+    let initial_loss = session.read_loss();
+    assert!(
+        initial_loss.is_finite(),
+        "initial loss should be finite, got {}",
+        initial_loss
+    );
+
+    // Steps 2-5 — train with SGD
+    let lr = 0.01;
+    for _ in 0..4 {
+        session.sgd_step_cpu(lr);
+        set_inputs(&mut session);
+        session.step();
+        session.wait();
+        let l = session.read_loss();
+        assert!(l.is_finite(), "loss diverged to NaN/inf during training: {}", l);
+    }
+
+    let final_loss = session.read_loss();
+    assert!(
+        final_loss < initial_loss,
+        "loss should decrease after 5 gradient steps: initial={:.6}, final={:.6}",
+        initial_loss,
+        final_loss
+    );
 }

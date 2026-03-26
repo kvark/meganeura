@@ -7,10 +7,10 @@
   "vlm_seq_len": 16,
   "denoise_steps": 10,
   "runs": 5,
-  "avg_latency_ms": 226.8739144084975,
-  "median_latency_ms": 222.46023299521767,
-  "stdev_latency_ms": 11.264264843334713,
-  "avg_per_step_ms": 22.687391440849755,
-  "steps_per_second": 44.07734589528223,
+  "avg_latency_ms": 229.95769379776902,
+  "median_latency_ms": 220.425386010902,
+  "stdev_latency_ms": 14.29344938162089,
+  "avg_per_step_ms": 22.995769379776902,
+  "steps_per_second": 43.48625973260224,
   "peak_memory_mb": 501.46728515625
 }

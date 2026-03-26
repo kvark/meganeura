@@ -13,6 +13,7 @@
 set -euo pipefail
 
 MODEL="${MODEL:-smolvla}"
+TRAIN_LR="${TRAIN_LR:-0.00001}"
 RUNS="${RUNS:-5}"
 WARMUP="${WARMUP:-3}"
 PYTORCH_DTYPE="${PYTORCH_DTYPE:-float32}"
@@ -184,6 +185,54 @@ else:
 }
 
 # ============================================================
+# SmolVLA action expert training benchmark (random weights)
+# ============================================================
+run_smolvla_train() {
+    echo "=== SmolVLA Action Expert Training Benchmark ==="
+    echo "  chunk_size:  $CHUNK_SIZE"
+    echo "  vlm_seq_len: $VLM_SEQ_LEN"
+    echo "  warmup:      $WARMUP"
+    echo "  runs:        $RUNS"
+    echo ""
+
+    echo ">>> meganeura training (blade-graphics, f32, random weights)"
+    cargo build --release --example bench_smolvla_train --manifest-path "$ROOT/Cargo.toml" 2>&1 | tail -1
+    "$ROOT/target/release/examples/bench_smolvla_train" \
+        --warmup "$WARMUP" \
+        --runs "$RUNS" \
+        ${FORCE} \
+        > "$OUT_DIR/smolvla_train_meganeura.json" 2>/dev/stderr
+    echo "  -> $OUT_DIR/smolvla_train_meganeura.json"
+    echo ""
+
+    echo ">>> PyTorch training ($PYTORCH_DTYPE, random weights)"
+    if python3 -c "import torch" 2>/dev/null; then
+        python3 "$DIR/bench_smolvla_train_pytorch.py" \
+            --warmup "$WARMUP" \
+            --runs "$RUNS" \
+            --dtype "$PYTORCH_DTYPE" \
+            --chunk-size "$CHUNK_SIZE" \
+            --vlm-seq-len "$VLM_SEQ_LEN" \
+            > "$OUT_DIR/smolvla_train_pytorch.json" 2>/dev/stderr
+        echo "  -> $OUT_DIR/smolvla_train_pytorch.json"
+    else
+        echo "  SKIPPED (torch not installed)"
+        echo '{"framework":"pytorch","error":"not installed"}' > "$OUT_DIR/smolvla_train_pytorch.json"
+    fi
+    echo ""
+
+    echo "=== SmolVLA Training Results ==="
+    print_table "$OUT_DIR/smolvla_train_meganeura.json" "$OUT_DIR/smolvla_train_pytorch.json" \
+        "device:Device" \
+        "fwd_avg_ms:Fwd avg (ms)" \
+        "fwd_median_ms:Fwd median (ms)" \
+        "train_step_avg_ms:Train step avg (ms)" \
+        "train_step_median_ms:Train step median (ms)" \
+        "approx_bwd_ms:Approx bwd (ms)"
+    echo ""
+}
+
+# ============================================================
 # SmolLM2-135M text generation benchmark
 # ============================================================
 run_smollm2() {
@@ -241,12 +290,13 @@ run_smollm2() {
 # Dispatch
 # ============================================================
 case "$MODEL" in
-    smolvla)  run_smolvla ;;
-    smollm2)  run_smollm2 ;;
-    all)      run_smolvla; run_smollm2 ;;
+    smolvla)        run_smolvla ;;
+    smolvla_train)  run_smolvla_train ;;
+    smollm2)        run_smollm2 ;;
+    all)            run_smolvla; run_smolvla_train; run_smollm2 ;;
     *)
         echo "Unknown model: $MODEL"
-        echo "Usage: bash bench/compare.sh [--model smolvla|smollm2|all]"
+        echo "Usage: bash bench/compare.sh [--model smolvla|smolvla_train|smollm2|all]"
         exit 1
         ;;
 esac
