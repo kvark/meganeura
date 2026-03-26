@@ -1458,6 +1458,17 @@ fn gen_matmul_coop_inner(fused_add: bool) -> Module {
     let c_offset_11 = f.binary(BinaryOperator::Add, c_off_10, tile_col_16);
     f.emit(c_offset_11, c_offset_11);
 
+    // Bounds conditions for the secondary (N1, M1) output tiles.
+    // tile_col + 16 may exceed pn for edge workgroups: the N1-tile's output positions
+    // wrap into the next row of the flat buffer, corrupting valid data.  Guard every
+    // load/store of acc_01, acc_10, acc_11 with these flags.
+    let cond_n1_valid = f.binary(BinaryOperator::Less, tile_col_16, pn); // tile_col+16 < pn
+    f.emit(cond_n1_valid, cond_n1_valid);
+    let cond_m1_valid = f.binary(BinaryOperator::Less, tile_row_16, pm); // tile_row+16 < pm
+    f.emit(cond_m1_valid, cond_m1_valid);
+    let cond_n1m1_valid = f.binary(BinaryOperator::LogicalAnd, cond_n1_valid, cond_m1_valid);
+    f.emit(cond_n1m1_valid, cond_n1m1_valid);
+
     // 4 cooperative matrix accumulators (f32, 16×16 each)
     let ty_coop_c = b.m.types.insert(
         Type {
@@ -1895,8 +1906,12 @@ fn gen_matmul_coop_inner(fused_add: bool) -> Module {
         S,
     );
 
-    // Store 4 accumulators. OOB writes (partial edge tiles) are silently discarded
-    // by Vulkan robustness, so no explicit bounds guard is needed.
+    // Store 4 accumulators.
+    // acc_00: always valid (workgroups are only launched when tile_row < pm, tile_col < pn).
+    // acc_01/acc_10/acc_11: guarded by the bounds conditions computed above.
+    // Without guards the secondary tiles write zeros (or stale residual values) to
+    // valid-but-wrong buffer positions (wrapping into the next row), corrupting the
+    // output from the primary tile.
     let c_ptr0 = f.global(gv_c);
     let c_elem_00 = f.index(c_ptr0, c_offset_00);
     let final_00 = f.load(acc_00_ptr);
@@ -1913,53 +1928,89 @@ fn gen_matmul_coop_inner(fused_add: bool) -> Module {
         S,
     );
 
-    let c_ptr1 = f.global(gv_c);
-    let c_elem_01 = f.index(c_ptr1, c_offset_01);
-    let final_01 = f.load(acc_01_ptr);
-    f.emit(c_ptr1, final_01);
-    f.f.body.push(
-        Statement::CooperativeStore {
-            target: final_01,
-            data: CooperativeData {
-                pointer: c_elem_01,
-                stride: pn,
-                row_major: false,
+    // acc_01: only store if N1-tile is within the output column range
+    {
+        let c_ptr1 = f.global(gv_c);
+        let c_elem_01 = f.index(c_ptr1, c_offset_01);
+        let final_01 = f.load(acc_01_ptr);
+        f.emit(c_ptr1, final_01);
+        let mut accept_01 = Block::new();
+        accept_01.push(
+            Statement::CooperativeStore {
+                target: final_01,
+                data: CooperativeData {
+                    pointer: c_elem_01,
+                    stride: pn,
+                    row_major: false,
+                },
             },
-        },
-        S,
-    );
+            S,
+        );
+        f.f.body.push(
+            Statement::If {
+                condition: cond_n1_valid,
+                accept: accept_01,
+                reject: Block::new(),
+            },
+            S,
+        );
+    }
 
-    let c_ptr2 = f.global(gv_c);
-    let c_elem_10 = f.index(c_ptr2, c_offset_10);
-    let final_10 = f.load(acc_10_ptr);
-    f.emit(c_ptr2, final_10);
-    f.f.body.push(
-        Statement::CooperativeStore {
-            target: final_10,
-            data: CooperativeData {
-                pointer: c_elem_10,
-                stride: pn,
-                row_major: false,
+    // acc_10: only store if M1-tile is within the output row range
+    {
+        let c_ptr2 = f.global(gv_c);
+        let c_elem_10 = f.index(c_ptr2, c_offset_10);
+        let final_10 = f.load(acc_10_ptr);
+        f.emit(c_ptr2, final_10);
+        let mut accept_10 = Block::new();
+        accept_10.push(
+            Statement::CooperativeStore {
+                target: final_10,
+                data: CooperativeData {
+                    pointer: c_elem_10,
+                    stride: pn,
+                    row_major: false,
+                },
             },
-        },
-        S,
-    );
+            S,
+        );
+        f.f.body.push(
+            Statement::If {
+                condition: cond_m1_valid,
+                accept: accept_10,
+                reject: Block::new(),
+            },
+            S,
+        );
+    }
 
-    let c_ptr3 = f.global(gv_c);
-    let c_elem_11 = f.index(c_ptr3, c_offset_11);
-    let final_11 = f.load(acc_11_ptr);
-    f.emit(c_ptr3, final_11);
-    f.f.body.push(
-        Statement::CooperativeStore {
-            target: final_11,
-            data: CooperativeData {
-                pointer: c_elem_11,
-                stride: pn,
-                row_major: false,
+    // acc_11: only store if both N1- and M1-tiles are within bounds
+    {
+        let c_ptr3 = f.global(gv_c);
+        let c_elem_11 = f.index(c_ptr3, c_offset_11);
+        let final_11 = f.load(acc_11_ptr);
+        f.emit(c_ptr3, final_11);
+        let mut accept_11 = Block::new();
+        accept_11.push(
+            Statement::CooperativeStore {
+                target: final_11,
+                data: CooperativeData {
+                    pointer: c_elem_11,
+                    stride: pn,
+                    row_major: false,
+                },
             },
-        },
-        S,
-    );
+            S,
+        );
+        f.f.body.push(
+            Statement::If {
+                condition: cond_n1m1_valid,
+                accept: accept_11,
+                reject: Block::new(),
+            },
+            S,
+        );
+    }
 
     b.entry_point("main", [WG_SIZE, 1, 1], f.finish());
     b.finish()
