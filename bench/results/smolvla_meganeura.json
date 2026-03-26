@@ -7,9 +7,9 @@
   "vlm_seq_len": 16,
   "denoise_steps": 10,
   "runs": 5,
-  "avg_latency_ms": 1726.81,
-  "median_latency_ms": 1730.69,
-  "stdev_latency_ms": 123.08,
-  "avg_per_step_ms": 172.68,
-  "steps_per_second": 5.79
+  "avg_latency_ms": 437.68,
+  "median_latency_ms": 443.95,
+  "stdev_latency_ms": 36.85,
+  "avg_per_step_ms": 43.77,
+  "steps_per_second": 22.85
 }

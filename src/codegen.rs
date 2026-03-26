@@ -2652,57 +2652,97 @@ fn gen_rope() -> Module {
 ///     max_score = new_max
 ///   for d: dst[d] = out[d] / sum_exp
 fn gen_causal_attention() -> Module {
-    gen_attention_online(true)
+    gen_attention_parallel(true, false)
 }
 
-fn gen_attention_online(_causal: bool) -> Module {
-    // Maximum head dimension supported (local array size).
-    const MAX_HEAD_DIM: u32 = 128;
+/// Parallel attention kernel: 64 threads per workgroup, one per head_dim element.
+/// Dispatch [q_seq, num_heads, 1] workgroups; workgroup_id gives (pos, head), local_id.x is tid.
+///
+/// Algorithm: single-pass online softmax across KV positions.
+/// - All 64 threads compute partial dot Q[tid]*K[t,tid] → store to wg_dot[tid]
+/// - 6-stage parallel reduction gives scalar score = sum_d Q[d]*K[t,d]
+/// - Online softmax update (same scalar ops for all threads)
+/// - Each thread accumulates its own V dimension: out[tid] += weight * V[t,tid]
+/// - Output: dst[q_base + tid] = out[tid] / sum_exp
+///
+/// is_causal: kv_len = pos+1 (causal mask); else kv_len = kv_seq (all KV positions)
+/// is_cross:  params = [q_seq, kv_seq, (nh<<16)|nkv, hd]; else [seq, nh, nkv, hd]
+fn gen_attention_parallel(is_causal: bool, is_cross: bool) -> Module {
+    const WG: u32 = 64; // one thread per head_dim element (head_dim == 64 for SmolVLA)
 
     let mut b = Builder::new();
-    let ty_params = b.params_u32x4("Params", &["seq", "num_heads", "num_kv_heads", "head_dim"]);
+    let ty_params = if is_cross {
+        b.params_u32x4("Params", &["q_seq", "kv_seq", "packed_heads", "head_dim"])
+    } else {
+        b.params_u32x4("Params", &["seq", "num_heads", "num_kv_heads", "head_dim"])
+    };
     let gv_q = b.storage_ro("src_a");
     let gv_k = b.storage_ro("src_b");
     let gv_v = b.storage_ro("bias");
     let gv_dst = b.storage_rw("dst");
     let gv_params = b.uniform("params", ty_params);
-
-    // Local array type for output accumulator
-    let ty_out_arr = b.m.types.insert(
-        Type {
-            name: None,
-            inner: TypeInner::Array {
-                base: b.ty_f32,
-                size: ArraySize::Constant(std::num::NonZeroU32::new(MAX_HEAD_DIM).unwrap()),
-                stride: 4,
-            },
-        },
-        S,
-    );
+    // Workgroup shared memory for parallel dot-product reduction
+    let gv_wg = b.workgroup_array("wg_dot", WG);
 
     let mut f = FnBuilder::new(&b);
-    let gid = f.arg_gid();
-
-    // pos = gid.x, head = gid.y
-    let pos = f.vec_x(gid);
+    // pos = workgroup_id.x, head = workgroup_id.y — same for all 64 threads in workgroup.
+    // tid  = local_invocation_id.x — this thread's head_dim element (0..63).
+    let wgid = f.arg_wgid();
+    let lid = f.arg_lid();
+    let pos = f.vec_x(wgid);
     f.label("pos", pos);
-    let head = f.vec_y(gid);
+    let head = f.vec_y(wgid);
     f.label("head", head);
-    f.emit(pos, head);
+    let tid = f.vec_x(lid);
+    f.label("tid", tid);
+    f.emit(pos, tid);
 
+    // Load params[0] = q_seq (always first field)
     let params_ptr = f.global(gv_params);
-    let seq_ptr = f.field(params_ptr, 0);
-    let seq = f.load(seq_ptr);
-    let nh_ptr = f.field(params_ptr, 1);
-    let num_heads = f.load(nh_ptr);
-    let nkv_ptr = f.field(params_ptr, 2);
-    let num_kv_heads = f.load(nkv_ptr);
-    let hd_ptr = f.field(params_ptr, 3);
-    let head_dim = f.load(hd_ptr);
-    f.emit(params_ptr, head_dim);
+    let p0 = f.field(params_ptr, 0);
+    let q_seq = f.load(p0);
+    f.emit(params_ptr, q_seq);
 
-    // Bounds check
-    let cond_pos = f.binary(BinaryOperator::GreaterEqual, pos, seq);
+    // Parse remaining params; compute kv_len for this attention type
+    let num_heads: Handle<Expression>;
+    let num_kv_heads: Handle<Expression>;
+    let head_dim: Handle<Expression>;
+    let kv_len: Handle<Expression>;
+    if is_cross {
+        // params: [q_seq, kv_seq, (num_heads<<16)|num_kv_heads, head_dim]
+        let p1 = f.field(params_ptr, 1);
+        let kv_seq = f.load(p1);
+        let p2 = f.field(params_ptr, 2);
+        let packed = f.load(p2);
+        let p3 = f.field(params_ptr, 3);
+        head_dim = f.load(p3);
+        let shift16 = f.literal_u32(16);
+        num_heads = f.binary(BinaryOperator::ShiftRight, packed, shift16);
+        let mask = f.literal_u32(0xFFFF);
+        num_kv_heads = f.binary(BinaryOperator::And, packed, mask);
+        kv_len = kv_seq;
+        f.emit(p1, num_kv_heads);
+    } else {
+        // params: [seq, num_heads, num_kv_heads, head_dim]
+        let p1 = f.field(params_ptr, 1);
+        num_heads = f.load(p1);
+        let p2 = f.field(params_ptr, 2);
+        num_kv_heads = f.load(p2);
+        let p3 = f.field(params_ptr, 3);
+        head_dim = f.load(p3);
+        if is_causal {
+            let one = f.literal_u32(1);
+            kv_len = f.binary(BinaryOperator::Add, pos, one);
+            f.emit(p1, kv_len);
+        } else {
+            kv_len = q_seq; // full non-causal self-attention: attend to all positions
+            f.emit(p1, head_dim);
+        }
+    }
+
+    // Bounds check — pos/head are workgroup-uniform, so the return is taken by all
+    // threads in the workgroup or none (preserves uniform control flow for barriers).
+    let cond_pos = f.binary(BinaryOperator::GreaterEqual, pos, q_seq);
     let cond_head = f.binary(BinaryOperator::GreaterEqual, head, num_heads);
     let cond = f.binary(BinaryOperator::LogicalOr, cond_pos, cond_head);
     f.emit(cond_pos, cond);
@@ -2713,99 +2753,52 @@ fn gen_attention_online(_causal: bool) -> Module {
     let kv_head = f.binary(BinaryOperator::Divide, head, heads_per_kv);
     let q_dim = f.binary(BinaryOperator::Multiply, num_heads, head_dim);
     let kv_dim = f.binary(BinaryOperator::Multiply, num_kv_heads, head_dim);
+    // q_base = pos * q_dim + head * head_dim  (base offset for Q and output)
     let pos_q = f.binary(BinaryOperator::Multiply, pos, q_dim);
     let head_off = f.binary(BinaryOperator::Multiply, head, head_dim);
     let q_base = f.binary(BinaryOperator::Add, pos_q, head_off);
+    // kv_head_off = kv_head * head_dim  (offset within a KV row for this head group)
+    let kv_head_off = f.binary(BinaryOperator::Multiply, kv_head, head_dim);
     let hd_f = f.cast_f32(head_dim);
     let scale = f.math1(MathFunction::InverseSqrt, hd_f);
-    let one_cl = f.literal_u32(1);
-    let causal_len = f.binary(BinaryOperator::Add, pos, one_cl);
-    f.emit(heads_per_kv, causal_len);
+    f.emit(heads_per_kv, scale);
 
-    // Store computed values in local vars for inner scope access
-    let q_base_var = f.local_var("q_base", b.ty_u32, None);
-    let q_base_ptr = f.local_ptr(q_base_var);
-    f.f.body.push(f.store(q_base_ptr, q_base), S);
+    // Preload Q[q_base + tid] once — reused for every KV position
+    let q_gp = f.global(gv_q);
+    let q_idx = f.binary(BinaryOperator::Add, q_base, tid);
+    let q_elem = f.index(q_gp, q_idx);
+    let q_val = f.load(q_elem);
+    f.emit(q_idx, q_val);
 
-    let kv_head_var = f.local_var("kv_head_v", b.ty_u32, None);
-    let kv_head_ptr = f.local_ptr(kv_head_var);
-    f.f.body.push(f.store(kv_head_ptr, kv_head), S);
-
-    let kv_dim_var = f.local_var("kv_dim_v", b.ty_u32, None);
+    // Spill loop-invariant values to local vars (accessible from inside loop body)
+    let kv_dim_var = f.local_var("kv_dim", b.ty_u32, None);
     let kv_dim_ptr = f.local_ptr(kv_dim_var);
     f.f.body.push(f.store(kv_dim_ptr, kv_dim), S);
-
-    let head_dim_var = f.local_var("hd", b.ty_u32, None);
-    let head_dim_ptr = f.local_ptr(head_dim_var);
-    f.f.body.push(f.store(head_dim_ptr, head_dim), S);
-
+    let kv_hd_off_var = f.local_var("kv_hd_off", b.ty_u32, None);
+    let kv_hd_off_ptr = f.local_ptr(kv_hd_off_var);
+    f.f.body.push(f.store(kv_hd_off_ptr, kv_head_off), S);
     let scale_var = f.local_var("scale", b.ty_f32, None);
     let scale_ptr = f.local_ptr(scale_var);
     f.f.body.push(f.store(scale_ptr, scale), S);
+    let kv_len_var = f.local_var("kv_len", b.ty_u32, None);
+    let kv_len_ptr = f.local_ptr(kv_len_var);
+    f.f.body.push(f.store(kv_len_ptr, kv_len), S);
 
-    let causal_var = f.local_var("clen", b.ty_u32, None);
-    let causal_ptr = f.local_ptr(causal_var);
-    f.f.body.push(f.store(causal_ptr, causal_len), S);
-
-    // Local output accumulator array
-    let out_var = f.local_var("out", ty_out_arr, None);
-    let out_ptr = f.local_ptr(out_var);
-
-    // Initialize out[d] = 0 for d in 0..head_dim
+    // Per-thread running state: output accumulator + online softmax scalars
+    let my_out_var = f.local_var("my_out", b.ty_f32, None);
+    let my_out_ptr = f.local_ptr(my_out_var);
     let max_var = f.local_var("max_score", b.ty_f32, None);
     let max_ptr = f.local_ptr(max_var);
-    let neg_inf = f.literal_f32(-1.0e30);
-    f.emit(neg_inf, neg_inf);
-    f.f.body.push(f.store(max_ptr, neg_inf), S);
-
     let sum_var = f.local_var("sum_exp", b.ty_f32, None);
-    let sum_ptr_local = f.local_ptr(sum_var);
-    let zero_f_init = f.literal_f32(0.0);
-    f.emit(zero_f_init, zero_f_init);
-    f.f.body.push(f.store(sum_ptr_local, zero_f_init), S);
+    let sum_ptr = f.local_ptr(sum_var);
+    let zero_f = f.literal_f32(0.0);
+    let neg_inf = f.literal_f32(-1.0e30);
+    f.emit(zero_f, neg_inf);
+    f.f.body.push(f.store(my_out_ptr, zero_f), S);
+    f.f.body.push(f.store(max_ptr, neg_inf), S);
+    f.f.body.push(f.store(sum_ptr, zero_f), S);
 
-    // Zero-init the output array: for d in 0..MAX_HEAD_DIM { out[d] = 0.0 }
-    {
-        let d_var = f.local_var("d_init", b.ty_u32, None);
-        let d_ptr = f.local_ptr(d_var);
-        let zero_d = f.literal_u32(0);
-        f.emit(zero_d, zero_d);
-        f.f.body.push(f.store(d_ptr, zero_d), S);
-
-        let mut body = Block::new();
-        let d = f.load(d_ptr);
-        let max_hd = f.literal_u32(MAX_HEAD_DIM);
-        let brk = f.binary(BinaryOperator::GreaterEqual, d, max_hd);
-        let zero_f = f.literal_f32(0.0);
-        let out_elem = f.index(out_ptr, d);
-        push_emit(&f.f.expressions, &mut body, d, out_elem);
-        body.push(FnBuilder::if_break(brk), S);
-        body.push(f.store(out_elem, zero_f), S);
-
-        let one = f.literal_u32(1);
-        let d2 = f.load(d_ptr);
-        let dn = f.binary(BinaryOperator::Add, d2, one);
-        push_emit(&f.f.expressions, &mut body, one, dn);
-        body.push(f.store(d_ptr, dn), S);
-
-        f.f.body.push(
-            Statement::Loop {
-                body,
-                continuing: Block::new(),
-                break_if: None,
-            },
-            S,
-        );
-    }
-
-    // === Single-pass online softmax attention ===
-    // for t in 0..causal_len:
-    //   score = Q·K[t] * scale
-    //   new_max = max(max_score, score)
-    //   correction = exp(max_score - new_max)
-    //   sum_exp = sum_exp * correction + exp(score - new_max)
-    //   for d: out[d] = out[d] * correction + exp(score - new_max) * V[t,d]
-    //   max_score = new_max
+    // T-loop: iterate over all KV positions
     let t_var = f.local_var("t", b.ty_u32, None);
     let t_ptr = f.local_ptr(t_var);
     let zero_u = f.literal_u32(0);
@@ -2814,138 +2807,95 @@ fn gen_attention_online(_causal: bool) -> Module {
 
     {
         let mut body = Block::new();
+
+        // Break if t >= kv_len
         let t = f.load(t_ptr);
-        let cl = f.load(causal_ptr);
-        let brk = f.binary(BinaryOperator::GreaterEqual, t, cl);
+        let kl = f.load(kv_len_ptr);
+        let brk = f.binary(BinaryOperator::GreaterEqual, t, kl);
         push_emit(&f.f.expressions, &mut body, t, brk);
         body.push(FnBuilder::if_break(brk), S);
 
-        // k_base = t * kv_dim + kv_head * head_dim
+        // k_base = t * kv_dim + kv_head_off
         let kvd = f.load(kv_dim_ptr);
         let t_kv = f.binary(BinaryOperator::Multiply, t, kvd);
-        let kvh = f.load(kv_head_ptr);
-        let hd = f.load(head_dim_ptr);
-        let kvh_off = f.binary(BinaryOperator::Multiply, kvh, hd);
-        let k_base = f.binary(BinaryOperator::Add, t_kv, kvh_off);
+        let kho = f.load(kv_hd_off_ptr);
+        let k_base = f.binary(BinaryOperator::Add, t_kv, kho);
         push_emit(&f.f.expressions, &mut body, kvd, k_base);
 
-        // Dot product: score = sum_d Q[q_base+d] * K[k_base+d]
-        let dot_var = f.local_var("dot", b.ty_f32, None);
-        let dot_ptr = f.local_ptr(dot_var);
-        let zero_dot = f.literal_f32(0.0);
-        push_emit(&f.f.expressions, &mut body, dot_ptr, zero_dot);
-        body.push(f.store(dot_ptr, zero_dot), S);
+        // Each thread loads K[k_base + tid] and writes partial dot-product to wg_dot[tid]
+        let k_idx = f.binary(BinaryOperator::Add, k_base, tid);
+        let k_gp = f.global(gv_k);
+        let k_elem = f.index(k_gp, k_idx);
+        let k_val = f.load(k_elem);
+        let partial = f.binary(BinaryOperator::Multiply, q_val, k_val);
+        push_emit(&f.f.expressions, &mut body, k_idx, partial);
 
-        // Inner dot product loop
-        {
-            let di_var = f.local_var("di", b.ty_u32, None);
-            let di_ptr = f.local_ptr(di_var);
-            let zero_di = f.literal_u32(0);
-            push_emit(&f.f.expressions, &mut body, di_ptr, zero_di);
-            body.push(f.store(di_ptr, zero_di), S);
+        let wg_ptr = f.global(gv_wg);
+        let wg_tid = f.index(wg_ptr, tid);
+        push_emit(&f.f.expressions, &mut body, wg_tid, wg_tid);
+        body.push(f.store(wg_tid, partial), S);
+        body.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
 
-            let mut inner = Block::new();
-            let d = f.load(di_ptr);
-            let hd2 = f.load(head_dim_ptr);
-            let dbrk = f.binary(BinaryOperator::GreaterEqual, d, hd2);
-            push_emit(&f.f.expressions, &mut inner, d, dbrk);
-            inner.push(FnBuilder::if_break(dbrk), S);
-
-            let qb = f.load(q_base_ptr);
-            let q_idx = f.binary(BinaryOperator::Add, qb, d);
-            let q_gp = f.global(gv_q);
-            let q_elem = f.index(q_gp, q_idx);
-            let q_val = f.load(q_elem);
-            let k_idx = f.binary(BinaryOperator::Add, k_base, d);
-            let k_gp = f.global(gv_k);
-            let k_elem = f.index(k_gp, k_idx);
-            let k_val = f.load(k_elem);
-            let prod = f.binary(BinaryOperator::Multiply, q_val, k_val);
-            let old_dot = f.load(dot_ptr);
-            let new_dot = f.binary(BinaryOperator::Add, old_dot, prod);
-            push_emit(&f.f.expressions, &mut inner, qb, new_dot);
-            inner.push(f.store(dot_ptr, new_dot), S);
-
-            let one_d = f.literal_u32(1);
-            let d2 = f.load(di_ptr);
-            let dn = f.binary(BinaryOperator::Add, d2, one_d);
-            push_emit(&f.f.expressions, &mut inner, one_d, dn);
-            inner.push(f.store(di_ptr, dn), S);
-
+        // 6-stage parallel reduction: wg_dot[0] = sum_{d=0}^{63} partial[d]
+        // Each stage: threads with tid < stride add their partner's value; then barrier.
+        // Barriers are unconditional — uniform control flow preserved.
+        for stride_val in [32u32, 16, 8, 4, 2, 1] {
+            let stride = f.literal_u32(stride_val);
+            let cond_s = f.binary(BinaryOperator::Less, tid, stride);
+            let partner = f.binary(BinaryOperator::Add, tid, stride);
+            let wg_p = f.global(gv_wg);
+            let wg_self = f.index(wg_p, tid);
+            let wg_part = f.index(wg_p, partner);
+            let sv = f.load(wg_self);
+            let pv = f.load(wg_part);
+            let reduced = f.binary(BinaryOperator::Add, sv, pv);
+            push_emit(&f.f.expressions, &mut body, cond_s, reduced);
             body.push(
-                Statement::Loop {
-                    body: inner,
-                    continuing: Block::new(),
-                    break_if: None,
+                Statement::If {
+                    condition: cond_s,
+                    accept: Block::from_vec(vec![f.store(wg_self, reduced)]),
+                    reject: Block::new(),
                 },
                 S,
             );
+            body.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
         }
 
-        // score = dot * scale
-        let dot_val = f.load(dot_ptr);
+        // All threads read scalar dot-product from wg_dot[0] and compute score
         let sc = f.load(scale_ptr);
-        let score = f.binary(BinaryOperator::Multiply, dot_val, sc);
+        let wg_p0 = f.global(gv_wg);
+        let z_idx = f.literal_u32(0);
+        let wg_0 = f.index(wg_p0, z_idx);
+        let dot_sum = f.load(wg_0);
+        let score = f.binary(BinaryOperator::Multiply, dot_sum, sc);
+        push_emit(&f.f.expressions, &mut body, sc, score);
 
-        // Online softmax update
+        // Online softmax update — identical for all 64 threads (scalar ops on registers)
         let old_max = f.load(max_ptr);
         let new_max = f.math2(MathFunction::Max, old_max, score);
         let correction = f.binary(BinaryOperator::Subtract, old_max, new_max);
-        let correction_exp = f.math1(MathFunction::Exp, correction);
-        let weight_shift = f.binary(BinaryOperator::Subtract, score, new_max);
-        let weight = f.math1(MathFunction::Exp, weight_shift);
-
-        // sum_exp = sum_exp * correction_exp + weight
-        let old_sum = f.load(sum_ptr_local);
-        let scaled_sum = f.binary(BinaryOperator::Multiply, old_sum, correction_exp);
-        let new_sum = f.binary(BinaryOperator::Add, scaled_sum, weight);
-        push_emit(&f.f.expressions, &mut body, dot_val, new_sum);
-        body.push(f.store(sum_ptr_local, new_sum), S);
+        let corr_exp = f.math1(MathFunction::Exp, correction);
+        let w_shift = f.binary(BinaryOperator::Subtract, score, new_max);
+        let weight = f.math1(MathFunction::Exp, w_shift);
+        let old_sum = f.load(sum_ptr);
+        let sc_sum = f.binary(BinaryOperator::Multiply, old_sum, corr_exp);
+        let new_sum = f.binary(BinaryOperator::Add, sc_sum, weight);
+        push_emit(&f.f.expressions, &mut body, old_max, new_sum);
+        body.push(f.store(sum_ptr, new_sum), S);
         body.push(f.store(max_ptr, new_max), S);
 
-        // Update output: for d: out[d] = out[d] * correction_exp + weight * V[t,d]
-        {
-            let dv_var = f.local_var("dv", b.ty_u32, None);
-            let dv_ptr = f.local_ptr(dv_var);
-            let zero_dv = f.literal_u32(0);
-            push_emit(&f.f.expressions, &mut body, dv_ptr, zero_dv);
-            body.push(f.store(dv_ptr, zero_dv), S);
-
-            let mut inner = Block::new();
-            let d = f.load(dv_ptr);
-            let hd3 = f.load(head_dim_ptr);
-            let dbrk = f.binary(BinaryOperator::GreaterEqual, d, hd3);
-            push_emit(&f.f.expressions, &mut inner, d, dbrk);
-            inner.push(FnBuilder::if_break(dbrk), S);
-
-            // out[d] = out[d] * correction_exp + weight * V[k_base + d]
-            let out_elem = f.index(out_ptr, d);
-            let old_out = f.load(out_elem);
-            let scaled_out = f.binary(BinaryOperator::Multiply, old_out, correction_exp);
-            let v_idx = f.binary(BinaryOperator::Add, k_base, d);
-            let v_gp = f.global(gv_v);
-            let v_elem = f.index(v_gp, v_idx);
-            let v_val = f.load(v_elem);
-            let wv = f.binary(BinaryOperator::Multiply, weight, v_val);
-            let new_out = f.binary(BinaryOperator::Add, scaled_out, wv);
-            push_emit(&f.f.expressions, &mut inner, out_elem, new_out);
-            inner.push(f.store(out_elem, new_out), S);
-
-            let one_d = f.literal_u32(1);
-            let d2 = f.load(dv_ptr);
-            let dn = f.binary(BinaryOperator::Add, d2, one_d);
-            push_emit(&f.f.expressions, &mut inner, one_d, dn);
-            inner.push(f.store(dv_ptr, dn), S);
-
-            body.push(
-                Statement::Loop {
-                    body: inner,
-                    continuing: Block::new(),
-                    break_if: None,
-                },
-                S,
-            );
-        }
+        // V accumulation: thread tid owns output element d=tid, independent across threads
+        // my_out = my_out * corr_exp + weight * V[k_base + tid]
+        let v_gp = f.global(gv_v);
+        let v_idx = f.binary(BinaryOperator::Add, k_base, tid);
+        let v_elem = f.index(v_gp, v_idx);
+        let v_val = f.load(v_elem);
+        let wv = f.binary(BinaryOperator::Multiply, weight, v_val);
+        let old_out = f.load(my_out_ptr);
+        let sc_out = f.binary(BinaryOperator::Multiply, old_out, corr_exp);
+        let new_out = f.binary(BinaryOperator::Add, sc_out, wv);
+        push_emit(&f.f.expressions, &mut body, v_idx, new_out);
+        body.push(f.store(my_out_ptr, new_out), S);
 
         // t++
         let one_t = f.literal_u32(1);
@@ -2964,50 +2914,17 @@ fn gen_attention_online(_causal: bool) -> Module {
         );
     }
 
-    // Normalize and store: dst[q_base + d] = out[d] / sum_exp
-    {
-        let d_var = f.local_var("d_store", b.ty_u32, None);
-        let d_ptr = f.local_ptr(d_var);
-        let zero_ds = f.literal_u32(0);
-        f.emit(zero_ds, zero_ds);
-        f.f.body.push(f.store(d_ptr, zero_ds), S);
+    // Normalize and write: dst[q_base + tid] = my_out / sum_exp
+    let out_val = f.load(my_out_ptr);
+    let sum_val = f.load(sum_ptr);
+    let normed = f.binary(BinaryOperator::Divide, out_val, sum_val);
+    let dst_idx = f.binary(BinaryOperator::Add, q_base, tid);
+    let dst_gp = f.global(gv_dst);
+    let dst_elem = f.index(dst_gp, dst_idx);
+    f.emit(out_val, dst_elem);
+    f.f.body.push(f.store(dst_elem, normed), S);
 
-        let mut body = Block::new();
-        let d = f.load(d_ptr);
-        let hd_s = f.load(head_dim_ptr);
-        let brk = f.binary(BinaryOperator::GreaterEqual, d, hd_s);
-        push_emit(&f.f.expressions, &mut body, d, brk);
-        body.push(FnBuilder::if_break(brk), S);
-
-        let out_elem = f.index(out_ptr, d);
-        let out_val = f.load(out_elem);
-        let sum_val = f.load(sum_ptr_local);
-        let normed = f.binary(BinaryOperator::Divide, out_val, sum_val);
-
-        let qb = f.load(q_base_ptr);
-        let dst_idx = f.binary(BinaryOperator::Add, qb, d);
-        let dst_gp = f.global(gv_dst);
-        let dst_elem = f.index(dst_gp, dst_idx);
-        push_emit(&f.f.expressions, &mut body, out_elem, dst_elem);
-        body.push(f.store(dst_elem, normed), S);
-
-        let one_d = f.literal_u32(1);
-        let d2 = f.load(d_ptr);
-        let dn = f.binary(BinaryOperator::Add, d2, one_d);
-        push_emit(&f.f.expressions, &mut body, one_d, dn);
-        body.push(f.store(d_ptr, dn), S);
-
-        f.f.body.push(
-            Statement::Loop {
-                body,
-                continuing: Block::new(),
-                break_if: None,
-            },
-            S,
-        );
-    }
-
-    b.entry_point("main", [1, 1, 1], f.finish());
+    b.entry_point("main", [WG, 1, 1], f.finish());
     b.finish()
 }
 
@@ -3224,7 +3141,7 @@ fn gen_layer_norm() -> Module {
 // ---------------------------------------------------------------------------
 
 fn gen_full_attention() -> Module {
-    gen_attention_common(false)
+    gen_attention_parallel(false, false)
 }
 
 // ---------------------------------------------------------------------------
@@ -3233,477 +3150,9 @@ fn gen_full_attention() -> Module {
 // ---------------------------------------------------------------------------
 
 fn gen_cross_attention() -> Module {
-    gen_attention_common(true)
+    gen_attention_parallel(false, true)
 }
 
-/// Shared attention generator for both full self-attention and cross-attention.
-/// When `is_cross` is true, q_seq and kv_seq may differ (params layout differs).
-/// When `is_cross` is false, it's non-causal self-attention (q_seq == kv_seq).
-fn gen_attention_common(is_cross: bool) -> Module {
-    let mut b = Builder::new();
-    let ty_params = if is_cross {
-        // params: q_seq, kv_seq, (num_heads<<16)|num_kv_heads, head_dim
-        b.params_u32x4("Params", &["q_seq", "kv_seq", "packed_heads", "head_dim"])
-    } else {
-        // params: seq, num_heads, num_kv_heads, head_dim
-        b.params_u32x4("Params", &["seq", "num_heads", "num_kv_heads", "head_dim"])
-    };
-    let gv_q = b.storage_ro("src_a"); // q
-    let gv_k = b.storage_ro("src_b"); // k
-    let gv_v = b.storage_ro("bias"); // v (reusing binding slot name)
-    let gv_dst = b.storage_rw("dst");
-    let gv_params = b.uniform("params", ty_params);
-
-    let mut f = FnBuilder::new(&b);
-    let gid = f.arg_gid();
-
-    // pos = gid.x, head = gid.y
-    let pos = f.vec_x(gid);
-    f.label("pos", pos);
-    let head = f.vec_y(gid);
-    f.label("head", head);
-    f.emit(pos, head);
-
-    let params_ptr = f.global(gv_params);
-
-    // Parse params based on attention type
-    let (q_seq, kv_seq, num_heads, num_kv_heads, head_dim);
-    if is_cross {
-        let p0 = f.field(params_ptr, 0);
-        q_seq = f.load(p0);
-        let p1 = f.field(params_ptr, 1);
-        kv_seq = f.load(p1);
-        let p2 = f.field(params_ptr, 2);
-        let packed = f.load(p2);
-        let p3 = f.field(params_ptr, 3);
-        head_dim = f.load(p3);
-        // Unpack: num_heads = packed >> 16, num_kv_heads = packed & 0xFFFF
-        let shift = f.literal_u32(16);
-        num_heads = f.binary(BinaryOperator::ShiftRight, packed, shift);
-        let mask = f.literal_u32(0xFFFF);
-        num_kv_heads = f.binary(BinaryOperator::And, packed, mask);
-        f.emit(params_ptr, num_kv_heads);
-    } else {
-        let p0 = f.field(params_ptr, 0);
-        q_seq = f.load(p0);
-        kv_seq = q_seq; // same for self-attention
-        let p1 = f.field(params_ptr, 1);
-        num_heads = f.load(p1);
-        let p2 = f.field(params_ptr, 2);
-        num_kv_heads = f.load(p2);
-        let p3 = f.field(params_ptr, 3);
-        head_dim = f.load(p3);
-        f.emit(params_ptr, head_dim);
-    }
-
-    // Bounds check
-    let cond_pos = f.binary(BinaryOperator::GreaterEqual, pos, q_seq);
-    let cond_head = f.binary(BinaryOperator::GreaterEqual, head, num_heads);
-    let cond = f.binary(BinaryOperator::LogicalOr, cond_pos, cond_head);
-    f.emit(cond_pos, cond);
-    f.f.body.push(f.if_return(cond), S);
-
-    // GQA: kv_head = head / (num_heads / num_kv_heads)
-    let heads_per_kv = f.binary(BinaryOperator::Divide, num_heads, num_kv_heads);
-    let kv_head = f.binary(BinaryOperator::Divide, head, heads_per_kv);
-
-    // q_dim = num_heads * head_dim
-    let q_dim = f.binary(BinaryOperator::Multiply, num_heads, head_dim);
-    // kv_dim = num_kv_heads * head_dim
-    let kv_dim = f.binary(BinaryOperator::Multiply, num_kv_heads, head_dim);
-
-    // q_base = pos * q_dim + head * head_dim
-    let pos_q = f.binary(BinaryOperator::Multiply, pos, q_dim);
-    let head_off = f.binary(BinaryOperator::Multiply, head, head_dim);
-    let q_base = f.binary(BinaryOperator::Add, pos_q, head_off);
-
-    // scale = 1.0 / sqrt(head_dim)
-    let hd_f = f.cast_f32(head_dim);
-    let scale = f.math1(MathFunction::InverseSqrt, hd_f);
-
-    f.emit(heads_per_kv, scale);
-
-    // Store needed values in local vars
-    let q_base_var = f.local_var("q_base", b.ty_u32, None);
-    let q_base_ptr = f.local_ptr(q_base_var);
-    f.f.body.push(f.store(q_base_ptr, q_base), S);
-
-    let kv_head_var = f.local_var("kv_head", b.ty_u32, None);
-    let kv_head_ptr = f.local_ptr(kv_head_var);
-    f.f.body.push(f.store(kv_head_ptr, kv_head), S);
-
-    let kv_dim_var = f.local_var("kv_dim", b.ty_u32, None);
-    let kv_dim_ptr = f.local_ptr(kv_dim_var);
-    f.f.body.push(f.store(kv_dim_ptr, kv_dim), S);
-
-    let head_dim_var = f.local_var("hd", b.ty_u32, None);
-    let head_dim_ptr = f.local_ptr(head_dim_var);
-    f.f.body.push(f.store(head_dim_ptr, head_dim), S);
-
-    let scale_var = f.local_var("scale", b.ty_f32, None);
-    let scale_ptr = f.local_ptr(scale_var);
-    f.f.body.push(f.store(scale_ptr, scale), S);
-
-    let kv_seq_var = f.local_var("kv_len", b.ty_u32, None);
-    let kv_seq_ptr = f.local_ptr(kv_seq_var);
-    f.f.body.push(f.store(kv_seq_ptr, kv_seq), S);
-
-    let pos_q_var = f.local_var("pos_q", b.ty_u32, None);
-    let pos_q_ptr = f.local_ptr(pos_q_var);
-    f.f.body.push(f.store(pos_q_ptr, pos_q), S);
-
-    let head_off_var = f.local_var("head_off", b.ty_u32, None);
-    let head_off_ptr = f.local_ptr(head_off_var);
-    f.f.body.push(f.store(head_off_ptr, head_off), S);
-
-    #[allow(clippy::too_many_arguments)]
-    fn build_dot_loop_attn(
-        f: &mut FnBuilder,
-        parent: &mut Block,
-        gv_q: Handle<GlobalVariable>,
-        gv_k: Handle<GlobalVariable>,
-        q_base_ptr: Handle<Expression>,
-        head_dim_ptr: Handle<Expression>,
-        k_base: Handle<Expression>,
-        dot_ptr: Handle<Expression>,
-        ty_u32: Handle<Type>,
-        d_name: &str,
-    ) {
-        let d_var = f.local_var(d_name, ty_u32, None);
-        let d_ptr = f.local_ptr(d_var);
-        let zero_d = f.literal_u32(0);
-        push_emit(&f.f.expressions, parent, zero_d, zero_d);
-        parent.push(f.store(d_ptr, zero_d), S);
-
-        let mut inner = Block::new();
-        let d = f.load(d_ptr);
-        let hd = f.load(head_dim_ptr);
-        let dbrk = f.binary(BinaryOperator::GreaterEqual, d, hd);
-
-        let qb = f.load(q_base_ptr);
-        let q_idx = f.binary(BinaryOperator::Add, qb, d);
-        let q_gp = f.global(gv_q);
-        let q_elem = f.index(q_gp, q_idx);
-        let q_val = f.load(q_elem);
-
-        let k_idx = f.binary(BinaryOperator::Add, k_base, d);
-        let k_gp = f.global(gv_k);
-        let k_elem = f.index(k_gp, k_idx);
-        let k_val = f.load(k_elem);
-
-        let prod = f.binary(BinaryOperator::Multiply, q_val, k_val);
-        let old_dot = f.load(dot_ptr);
-        let new_dot = f.binary(BinaryOperator::Add, old_dot, prod);
-        push_emit(&f.f.expressions, &mut inner, d, dbrk);
-        inner.push(FnBuilder::if_break(dbrk), S);
-        push_emit(&f.f.expressions, &mut inner, qb, new_dot);
-        inner.push(f.store(dot_ptr, new_dot), S);
-
-        let one_d = f.literal_u32(1);
-        let d2 = f.load(d_ptr);
-        let dn = f.binary(BinaryOperator::Add, d2, one_d);
-        push_emit(&f.f.expressions, &mut inner, one_d, dn);
-        inner.push(f.store(d_ptr, dn), S);
-
-        parent.push(
-            Statement::Loop {
-                body: inner,
-                continuing: Block::new(),
-                break_if: None,
-            },
-            S,
-        );
-    }
-
-    fn compute_k_base_attn(
-        f: &mut FnBuilder,
-        block: &mut Block,
-        t: Handle<Expression>,
-        kv_dim_ptr: Handle<Expression>,
-        kv_head_ptr: Handle<Expression>,
-        head_dim_ptr: Handle<Expression>,
-    ) -> Handle<Expression> {
-        let kvd = f.load(kv_dim_ptr);
-        let t_kv = f.binary(BinaryOperator::Multiply, t, kvd);
-        let kvh = f.load(kv_head_ptr);
-        let hd = f.load(head_dim_ptr);
-        let kvh_off = f.binary(BinaryOperator::Multiply, kvh, hd);
-        let k_base = f.binary(BinaryOperator::Add, t_kv, kvh_off);
-        push_emit(&f.f.expressions, block, kvd, k_base);
-        k_base
-    }
-
-    // === Pass 1: find max score ===
-    let max_var = f.local_var("max_score", b.ty_f32, None);
-    let max_ptr = f.local_ptr(max_var);
-    let neg_inf = f.literal_f32(-1.0e30);
-    f.emit(neg_inf, neg_inf);
-    f.f.body.push(f.store(max_ptr, neg_inf), S);
-
-    let t_var = f.local_var("t", b.ty_u32, None);
-    let t_ptr = f.local_ptr(t_var);
-    let zero_u = f.literal_u32(0);
-    f.emit(zero_u, zero_u);
-    f.f.body.push(f.store(t_ptr, zero_u), S);
-
-    {
-        let mut body = Block::new();
-        let t = f.load(t_ptr);
-        let kv_len = f.load(kv_seq_ptr);
-        let brk = f.binary(BinaryOperator::GreaterEqual, t, kv_len);
-
-        let dot_var = f.local_var("dot", b.ty_f32, None);
-        let dot_ptr = f.local_ptr(dot_var);
-        let zero_f = f.literal_f32(0.0);
-        push_emit(&f.f.expressions, &mut body, t, brk);
-        body.push(FnBuilder::if_break(brk), S);
-        push_emit(&f.f.expressions, &mut body, dot_ptr, zero_f);
-        body.push(f.store(dot_ptr, zero_f), S);
-
-        let k_base =
-            compute_k_base_attn(&mut f, &mut body, t, kv_dim_ptr, kv_head_ptr, head_dim_ptr);
-
-        build_dot_loop_attn(
-            &mut f,
-            &mut body,
-            gv_q,
-            gv_k,
-            q_base_ptr,
-            head_dim_ptr,
-            k_base,
-            dot_ptr,
-            b.ty_u32,
-            "d1",
-        );
-
-        let dot_val = f.load(dot_ptr);
-        let sc = f.load(scale_ptr);
-        let score = f.binary(BinaryOperator::Multiply, dot_val, sc);
-        let old_max = f.load(max_ptr);
-        let new_max = f.math2(MathFunction::Max, old_max, score);
-        push_emit(&f.f.expressions, &mut body, dot_val, new_max);
-        body.push(f.store(max_ptr, new_max), S);
-
-        let one_t = f.literal_u32(1);
-        let t2 = f.load(t_ptr);
-        let tn = f.binary(BinaryOperator::Add, t2, one_t);
-        push_emit(&f.f.expressions, &mut body, one_t, tn);
-        body.push(f.store(t_ptr, tn), S);
-
-        f.f.body.push(
-            Statement::Loop {
-                body,
-                continuing: Block::new(),
-                break_if: None,
-            },
-            S,
-        );
-    }
-
-    // === Pass 2: compute exp sum ===
-    let sum_var = f.local_var("sum_exp", b.ty_f32, None);
-    let sum_ptr_local = f.local_ptr(sum_var);
-    let zero_f2 = f.literal_f32(0.0);
-    f.emit(zero_f2, zero_f2);
-    f.f.body.push(f.store(sum_ptr_local, zero_f2), S);
-
-    let t2_var = f.local_var("t2", b.ty_u32, None);
-    let t2_ptr = f.local_ptr(t2_var);
-    let zero_t2 = f.literal_u32(0);
-    f.emit(zero_t2, zero_t2);
-    f.f.body.push(f.store(t2_ptr, zero_t2), S);
-
-    {
-        let mut body = Block::new();
-        let t = f.load(t2_ptr);
-        let kv_len = f.load(kv_seq_ptr);
-        let brk = f.binary(BinaryOperator::GreaterEqual, t, kv_len);
-
-        let dot_var2 = f.local_var("dot2", b.ty_f32, None);
-        let dot_ptr2 = f.local_ptr(dot_var2);
-        let zero_f3 = f.literal_f32(0.0);
-        push_emit(&f.f.expressions, &mut body, t, brk);
-        body.push(FnBuilder::if_break(brk), S);
-        push_emit(&f.f.expressions, &mut body, dot_ptr2, zero_f3);
-        body.push(f.store(dot_ptr2, zero_f3), S);
-
-        let k_base =
-            compute_k_base_attn(&mut f, &mut body, t, kv_dim_ptr, kv_head_ptr, head_dim_ptr);
-
-        build_dot_loop_attn(
-            &mut f,
-            &mut body,
-            gv_q,
-            gv_k,
-            q_base_ptr,
-            head_dim_ptr,
-            k_base,
-            dot_ptr2,
-            b.ty_u32,
-            "d2",
-        );
-
-        let dot_val = f.load(dot_ptr2);
-        let sc = f.load(scale_ptr);
-        let score = f.binary(BinaryOperator::Multiply, dot_val, sc);
-        let mx = f.load(max_ptr);
-        let shifted = f.binary(BinaryOperator::Subtract, score, mx);
-        let e = f.math1(MathFunction::Exp, shifted);
-        let old_sum = f.load(sum_ptr_local);
-        let new_sum = f.binary(BinaryOperator::Add, old_sum, e);
-        push_emit(&f.f.expressions, &mut body, dot_val, new_sum);
-        body.push(f.store(sum_ptr_local, new_sum), S);
-
-        let one_t = f.literal_u32(1);
-        let t3 = f.load(t2_ptr);
-        let tn = f.binary(BinaryOperator::Add, t3, one_t);
-        push_emit(&f.f.expressions, &mut body, one_t, tn);
-        body.push(f.store(t2_ptr, tn), S);
-
-        f.f.body.push(
-            Statement::Loop {
-                body,
-                continuing: Block::new(),
-                break_if: None,
-            },
-            S,
-        );
-    }
-
-    // === Pass 3: weighted sum of values ===
-    let d3_var = f.local_var("d3", b.ty_u32, None);
-    let d3_ptr = f.local_ptr(d3_var);
-    let zero_d3 = f.literal_u32(0);
-    f.emit(zero_d3, zero_d3);
-    f.f.body.push(f.store(d3_ptr, zero_d3), S);
-
-    {
-        let mut d_body = Block::new();
-        let d = f.load(d3_ptr);
-        let hd = f.load(head_dim_ptr);
-        let d_brk = f.binary(BinaryOperator::GreaterEqual, d, hd);
-
-        let acc_var = f.local_var("acc", b.ty_f32, None);
-        let acc_ptr = f.local_ptr(acc_var);
-        let zero_acc = f.literal_f32(0.0);
-        push_emit(&f.f.expressions, &mut d_body, d, d_brk);
-        d_body.push(FnBuilder::if_break(d_brk), S);
-        push_emit(&f.f.expressions, &mut d_body, acc_ptr, zero_acc);
-        d_body.push(f.store(acc_ptr, zero_acc), S);
-
-        let pq = f.load(pos_q_ptr);
-        let ho = f.load(head_off_ptr);
-        let out_base = f.binary(BinaryOperator::Add, pq, ho);
-        let out_base_var = f.local_var("out_base", b.ty_u32, None);
-        let out_base_ptr = f.local_ptr(out_base_var);
-        push_emit(&f.f.expressions, &mut d_body, pq, out_base);
-        d_body.push(f.store(out_base_ptr, out_base), S);
-
-        let t3_var = f.local_var("t3", b.ty_u32, None);
-        let t3_iptr = f.local_ptr(t3_var);
-        let zero_t3 = f.literal_u32(0);
-        push_emit(&f.f.expressions, &mut d_body, zero_t3, zero_t3);
-        d_body.push(f.store(t3_iptr, zero_t3), S);
-
-        {
-            let mut t_body = Block::new();
-            let t = f.load(t3_iptr);
-            let kv_len = f.load(kv_seq_ptr);
-            let t_brk = f.binary(BinaryOperator::GreaterEqual, t, kv_len);
-
-            let dot_var3 = f.local_var("dot3", b.ty_f32, None);
-            let dot_ptr3 = f.local_ptr(dot_var3);
-            let zero_dot = f.literal_f32(0.0);
-            push_emit(&f.f.expressions, &mut t_body, t, t_brk);
-            t_body.push(FnBuilder::if_break(t_brk), S);
-            push_emit(&f.f.expressions, &mut t_body, dot_ptr3, zero_dot);
-            t_body.push(f.store(dot_ptr3, zero_dot), S);
-
-            let k_base = compute_k_base_attn(
-                &mut f,
-                &mut t_body,
-                t,
-                kv_dim_ptr,
-                kv_head_ptr,
-                head_dim_ptr,
-            );
-
-            build_dot_loop_attn(
-                &mut f,
-                &mut t_body,
-                gv_q,
-                gv_k,
-                q_base_ptr,
-                head_dim_ptr,
-                k_base,
-                dot_ptr3,
-                b.ty_u32,
-                "d4",
-            );
-
-            let dot_val = f.load(dot_ptr3);
-            let sc = f.load(scale_ptr);
-            let score = f.binary(BinaryOperator::Multiply, dot_val, sc);
-            let mx = f.load(max_ptr);
-            let shifted = f.binary(BinaryOperator::Subtract, score, mx);
-            let e = f.math1(MathFunction::Exp, shifted);
-            let sum_val = f.load(sum_ptr_local);
-            let weight = f.binary(BinaryOperator::Divide, e, sum_val);
-
-            let v_idx = f.binary(BinaryOperator::Add, k_base, d);
-            let v_gp = f.global(gv_v);
-            let v_elem = f.index(v_gp, v_idx);
-            let v_val = f.load(v_elem);
-
-            let contrib = f.binary(BinaryOperator::Multiply, weight, v_val);
-            let old_acc = f.load(acc_ptr);
-            let new_acc = f.binary(BinaryOperator::Add, old_acc, contrib);
-            push_emit(&f.f.expressions, &mut t_body, dot_val, new_acc);
-            t_body.push(f.store(acc_ptr, new_acc), S);
-
-            let one_t = f.literal_u32(1);
-            let t4 = f.load(t3_iptr);
-            let tn = f.binary(BinaryOperator::Add, t4, one_t);
-            push_emit(&f.f.expressions, &mut t_body, one_t, tn);
-            t_body.push(f.store(t3_iptr, tn), S);
-
-            d_body.push(
-                Statement::Loop {
-                    body: t_body,
-                    continuing: Block::new(),
-                    break_if: None,
-                },
-                S,
-            );
-        }
-
-        let ob = f.load(out_base_ptr);
-        let out_idx = f.binary(BinaryOperator::Add, ob, d);
-        let dst_gp = f.global(gv_dst);
-        let dst_elem = f.index(dst_gp, out_idx);
-        let acc_val = f.load(acc_ptr);
-        push_emit(&f.f.expressions, &mut d_body, ob, acc_val);
-        d_body.push(f.store(dst_elem, acc_val), S);
-
-        let one_d = f.literal_u32(1);
-        let d5 = f.load(d3_ptr);
-        let dn = f.binary(BinaryOperator::Add, d5, one_d);
-        push_emit(&f.f.expressions, &mut d_body, one_d, dn);
-        d_body.push(f.store(d3_ptr, dn), S);
-
-        f.f.body.push(
-            Statement::Loop {
-                body: d_body,
-                continuing: Block::new(),
-                break_if: None,
-            },
-            S,
-        );
-    }
-
-    b.entry_point("main", [1, 1, 1], f.finish());
-    b.finish()
-}
 
 // ---------------------------------------------------------------------------
 // Tests
