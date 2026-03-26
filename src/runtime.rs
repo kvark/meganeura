@@ -437,7 +437,8 @@ impl Session {
                 {
                     let m = dispatch.params[0];
                     let n = dispatch.params[2];
-                    dispatch.workgroups = [ceil_div(m, 16), ceil_div(n, 16), 1];
+                    // 2×2 output tile per workgroup (32×32 total)
+                    dispatch.workgroups = [ceil_div(m, 32), ceil_div(n, 32), 1];
                 }
             }
         }
