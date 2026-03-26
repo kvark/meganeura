@@ -133,9 +133,8 @@ pub fn build_graph(g: &mut Graph, config: &SmolLM2Config, seq_len: usize) -> Nod
         let w_down = g.parameter(&format!("{}.mlp.down_proj.weight", prefix), &[ffn, hidden]);
 
         let gate = g.matmul(h, w_gate); // [seq, ffn]
-        let gate = g.silu(gate);
         let up = g.matmul(h, w_up); // [seq, ffn]
-        let ffn_out = g.mul(gate, up);
+        let ffn_out = g.swiglu(gate, up);
         let ffn_out = g.matmul(ffn_out, w_down); // [seq, hidden]
 
         // Residual connection

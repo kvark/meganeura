@@ -151,6 +151,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
             Op::Nop | Op::FusedMatMulAdd => {}
             // Transformer / vision ops: inference-only, no autodiff support
             Op::Silu
+            | Op::SwiGLU
             | Op::RmsNorm { .. }
             | Op::Embedding
             | Op::RoPE { .. }

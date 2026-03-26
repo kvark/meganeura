@@ -314,9 +314,8 @@ pub fn build_text_decoder(
         let w_down = g.parameter(&format!("{}.mlp.down_proj.weight", prefix), &[ffn, hidden]);
 
         let gate = g.matmul(h, w_gate);
-        let gate = g.silu(gate);
         let up = g.matmul(h, w_up);
-        let gate_up = g.mul(gate, up);
+        let gate_up = g.swiglu(gate, up);
         let ffn_out = g.matmul(gate_up, w_down);
 
         x = g.add(x, ffn_out);

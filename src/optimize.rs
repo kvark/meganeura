@@ -180,6 +180,7 @@ fn graph_to_egglog(graph: &Graph) -> String {
   (Greater Op Op)
   ; Transformer ops (passthrough, no fusion rules)
   (Silu Op)
+  (SwiGLU Op Op)
   (Gelu Op)
   (RmsNorm Op Op)
   (Embedding Op Op)
@@ -243,6 +244,7 @@ fn node_to_egglog_expr(node: &Node) -> String {
         }
         Op::Greater => format!("(Greater n{} n{})", node.inputs[0], node.inputs[1]),
         Op::Silu => format!("(Silu n{})", node.inputs[0]),
+        Op::SwiGLU => format!("(SwiGLU n{} n{})", node.inputs[0], node.inputs[1]),
         Op::RmsNorm { .. } => format!("(RmsNorm n{} n{})", node.inputs[0], node.inputs[1]),
         Op::Embedding => format!("(Embedding n{} n{})", node.inputs[0], node.inputs[1]),
         Op::RoPE { .. } => format!("(RoPE n{})", node.inputs[0]),

@@ -251,7 +251,9 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::Relu | ShaderEntry::Sigmoid | ShaderEntry::Neg | ShaderEntry::Silu => {
             UnaryData::layout()
         }
-        ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater => BinaryData::layout(),
+        ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater | ShaderEntry::SwiGLU => {
+            BinaryData::layout()
+        }
         ShaderEntry::BiasAdd => BiasAddData::layout(),
         ShaderEntry::SgdUpdate => SgdData::layout(),
         ShaderEntry::SumAll | ShaderEntry::MeanAll => UnaryData::layout(),
@@ -771,7 +773,7 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater => {
+            ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater | ShaderEntry::SwiGLU => {
                 pc.bind(
                     0,
                     &BinaryData {

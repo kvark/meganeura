@@ -21,6 +21,7 @@ pub enum ShaderEntry {
     CrossEntropyLoss,
     Transpose,
     Silu,
+    SwiGLU,
     RmsNorm,
     Embedding,
     RoPE,
@@ -46,6 +47,7 @@ impl ShaderEntry {
             ShaderEntry::CrossEntropyLoss => ShaderGroup::CrossEntropy,
             ShaderEntry::Transpose => ShaderGroup::Transpose,
             ShaderEntry::Silu => ShaderGroup::Unary,
+            ShaderEntry::SwiGLU => ShaderGroup::Binary,
             ShaderEntry::RmsNorm => ShaderGroup::RmsNorm,
             ShaderEntry::Embedding => ShaderGroup::Embedding,
             ShaderEntry::RoPE => ShaderGroup::RoPE,
@@ -75,6 +77,7 @@ impl ShaderEntry {
             ShaderEntry::SumAll => "sum_all",
             ShaderEntry::MeanAll => "mean_all",
             ShaderEntry::Silu => "silu",
+            ShaderEntry::SwiGLU => "swiglu",
             ShaderEntry::RmsNorm => "main",
             ShaderEntry::Embedding => "main",
             ShaderEntry::RoPE => "main",
@@ -370,6 +373,10 @@ impl<'a> Compiler<'a> {
 
             Op::Silu => {
                 self.emit_unary(ShaderEntry::Silu, node, out_buf);
+            }
+
+            Op::SwiGLU => {
+                self.emit_binary(ShaderEntry::SwiGLU, node, out_buf);
             }
 
             Op::RmsNorm { eps } => {
