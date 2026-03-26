@@ -60,6 +60,49 @@ pub struct SmolVLAConfig {
 }
 
 impl SmolVLAConfig {
+    /// Small configuration for unit/smoke tests (no download needed).
+    pub fn small_test() -> Self {
+        Self {
+            vlm: SmolVLM2Config {
+                vision: VisionConfig {
+                    image_size: 32,
+                    patch_size: 16,
+                    hidden_size: 64,
+                    num_attention_heads: 2,
+                    num_hidden_layers: 2,
+                    intermediate_size: 128,
+                    layer_norm_eps: 1e-6,
+                },
+                text: TextConfig {
+                    vocab_size: 256,
+                    hidden_size: 64,
+                    num_hidden_layers: 2,
+                    num_attention_heads: 2,
+                    num_key_value_heads: 2,
+                    intermediate_size: 128,
+                    rms_norm_eps: 1e-5,
+                    rope_theta: 10000.0,
+                },
+                scale_factor: 1,
+            },
+            expert: ExpertConfig {
+                hidden_size: 64,
+                num_layers: 2,
+                num_attention_heads: 2,
+                num_key_value_heads: 2,
+                head_dim: 32,
+                intermediate_size: 128,
+                rms_norm_eps: 1e-5,
+                self_attn_every_n_layers: 2,
+            },
+            max_action_dim: 8,
+            max_state_dim: 8,
+            chunk_size: 4,
+            num_steps: 2,
+            num_vlm_layers: 2,
+        }
+    }
+
     /// Default SmolVLA base configuration (lerobot/smolvla_base).
     pub fn smolvla_base() -> Self {
         Self {
@@ -342,6 +385,224 @@ pub fn expert_weight_names(config: &SmolVLAConfig) -> Vec<String> {
     }
 
     names
+}
+
+/// Primitive self-attention without fused kernel (for autodiff).
+///
+/// Decomposes attention into matmul → scale → softmax → matmul so the
+/// backward pass can propagate through each step independently.
+/// Simplified: single-head-equivalent (no GQA head splitting).
+///
+/// q, k, v must all have shape `[seq, d]`. Returns `[seq, d]`.
+fn primitive_self_attention(
+    g: &mut Graph,
+    q: NodeId,
+    k: NodeId,
+    v: NodeId,
+    seq: usize,
+    d: usize,
+) -> NodeId {
+    let scale = 1.0 / (d as f32).sqrt();
+    let k_t = g.transpose(k); // [d, seq]
+    let scores = g.matmul(q, k_t); // [seq, seq]
+    let scale_c = g.constant(vec![scale; seq * seq], &[seq, seq]);
+    let scores_s = g.mul(scores, scale_c); // [seq, seq]
+    let probs = g.softmax(scores_s); // [seq, seq]
+    g.matmul(probs, v) // [seq, d]
+}
+
+/// Primitive cross-attention without fused kernel (for autodiff).
+///
+/// q has shape `[q_seq, d]`, k and v have shape `[kv_seq, d]`.
+/// Returns `[q_seq, d]`.
+fn primitive_cross_attention(
+    g: &mut Graph,
+    q: NodeId,
+    k: NodeId,
+    v: NodeId,
+    q_seq: usize,
+    kv_seq: usize,
+    d: usize,
+) -> NodeId {
+    let scale = 1.0 / (d as f32).sqrt();
+    let k_t = g.transpose(k); // [d, kv_seq]
+    let scores = g.matmul(q, k_t); // [q_seq, kv_seq]
+    let scale_c = g.constant(vec![scale; q_seq * kv_seq], &[q_seq, kv_seq]);
+    let scores_s = g.mul(scores, scale_c); // [q_seq, kv_seq]
+    let probs = g.softmax(scores_s); // [q_seq, kv_seq]
+    g.matmul(probs, v) // [q_seq, d]
+}
+
+/// Build a training graph for the action expert with MSE loss.
+///
+/// Replaces fused `CausalAttention`/`CrossAttention` ops with primitive
+/// `matmul → scale → softmax → matmul` chains so autodiff can propagate
+/// through all parameters. Uses a simplified single-head projection
+/// (head_dim-sized Q/K/V instead of full GQA) — the dominant matmul cost
+/// is identical; only the output projection dimension differs.
+///
+/// Inputs:
+/// - `noisy_actions`: `[action_seq_len, max_action_dim]`
+/// - `timestep`:      `[1, expert_hidden * 2]`
+/// - `vlm_kv_layer_i` for each cross-attn layer: `[vlm_seq_len, kv_dim]`
+/// - `target_actions`: `[action_seq_len, max_action_dim]` (training targets)
+///
+/// Output: scalar MSE loss.
+pub fn build_action_expert_training(
+    config: &SmolVLAConfig,
+    action_seq_len: usize,
+    vlm_seq_len: usize,
+) -> Graph {
+    let mut g = Graph::new();
+    let expert = &config.expert;
+    let expert_hidden = expert.hidden_size;
+    let kv_dim = expert.kv_dim();
+    let head_dim = expert.head_dim as usize;
+    let eps = expert.rms_norm_eps;
+
+    // --- Inputs ---
+    let noisy_actions = g.input("noisy_actions", &[action_seq_len, config.max_action_dim]);
+    let timestep = g.input("timestep", &[1, expert_hidden * 2]);
+
+    // --- Action input projection ---
+    let action_in_w = g.parameter(
+        "model.action_in_proj.weight",
+        &[config.max_action_dim, expert_hidden],
+    );
+    let action_in_b = g.parameter("model.action_in_proj.bias", &[expert_hidden]);
+    let mut x = g.matmul(noisy_actions, action_in_w);
+    x = g.bias_add(x, action_in_b);
+
+    // --- Timestep MLP ---
+    let time_in_w = g.parameter(
+        "model.action_time_mlp_in.weight",
+        &[expert_hidden * 2, expert_hidden],
+    );
+    let time_in_b = g.parameter("model.action_time_mlp_in.bias", &[expert_hidden]);
+    let time_out_w = g.parameter(
+        "model.action_time_mlp_out.weight",
+        &[expert_hidden, expert_hidden],
+    );
+    let time_out_b = g.parameter("model.action_time_mlp_out.bias", &[expert_hidden]);
+    let time_h = g.matmul(timestep, time_in_w);
+    let time_h = g.bias_add(time_h, time_in_b);
+    let time_h = g.silu(time_h);
+    let time_h = g.matmul(time_h, time_out_w);
+    let time_embed = g.bias_add(time_h, time_out_b);
+    x = g.broadcast_add(x, time_embed);
+
+    // --- Expert transformer layers ---
+    for i in 0..expert.num_layers {
+        let prefix = format!("model.vlm_with_expert.lm_expert.layers.{}", i);
+        let is_cross_attn = i % expert.self_attn_every_n_layers != 0;
+
+        // Pre-attention RMSNorm
+        let ln1_w = g.parameter(
+            &format!("{}.input_layernorm.weight", prefix),
+            &[expert_hidden],
+        );
+        let h = g.rms_norm(x, ln1_w, eps);
+
+        if is_cross_attn {
+            // Cross-attention: primitive decomposition (q from action, k/v from VLM)
+            let wq = g.parameter(
+                &format!("{}.self_attn.q_proj.weight", prefix),
+                &[expert_hidden, head_dim],
+            );
+            let q = g.matmul(h, wq); // [action_seq, head_dim]
+
+            let vlm_kv = g.input(&format!("vlm_kv_layer_{}", i), &[vlm_seq_len, kv_dim]);
+            let wk = g.parameter(
+                &format!("{}.self_attn.k_proj.weight", prefix),
+                &[kv_dim, head_dim],
+            );
+            let wv = g.parameter(
+                &format!("{}.self_attn.v_proj.weight", prefix),
+                &[kv_dim, head_dim],
+            );
+            let k = g.matmul(vlm_kv, wk); // [vlm_seq, head_dim]
+            let v = g.matmul(vlm_kv, wv); // [vlm_seq, head_dim]
+
+            let attn =
+                primitive_cross_attention(&mut g, q, k, v, action_seq_len, vlm_seq_len, head_dim);
+
+            let wo = g.parameter(
+                &format!("{}.self_attn.o_proj.weight", prefix),
+                &[head_dim, expert_hidden],
+            );
+            let attn_out = g.matmul(attn, wo); // [action_seq, expert_hidden]
+            x = g.add(x, attn_out);
+        } else {
+            // Self-attention: primitive decomposition
+            let wq = g.parameter(
+                &format!("{}.self_attn.q_proj.weight", prefix),
+                &[expert_hidden, head_dim],
+            );
+            let wk = g.parameter(
+                &format!("{}.self_attn.k_proj.weight", prefix),
+                &[expert_hidden, head_dim],
+            );
+            let wv = g.parameter(
+                &format!("{}.self_attn.v_proj.weight", prefix),
+                &[expert_hidden, head_dim],
+            );
+            let q = g.matmul(h, wq); // [action_seq, head_dim]
+            let k = g.matmul(h, wk); // [action_seq, head_dim]
+            let v = g.matmul(h, wv); // [action_seq, head_dim]
+
+            let attn = primitive_self_attention(&mut g, q, k, v, action_seq_len, head_dim);
+
+            let wo = g.parameter(
+                &format!("{}.self_attn.o_proj.weight", prefix),
+                &[head_dim, expert_hidden],
+            );
+            let attn_out = g.matmul(attn, wo); // [action_seq, expert_hidden]
+            x = g.add(x, attn_out);
+        }
+
+        // Post-attention RMSNorm + SwiGLU FFN
+        let ln2_w = g.parameter(
+            &format!("{}.post_attention_layernorm.weight", prefix),
+            &[expert_hidden],
+        );
+        let h = g.rms_norm(x, ln2_w, eps);
+
+        let w_gate = g.parameter(
+            &format!("{}.mlp.gate_proj.weight", prefix),
+            &[expert_hidden, expert.intermediate_size],
+        );
+        let w_up = g.parameter(
+            &format!("{}.mlp.up_proj.weight", prefix),
+            &[expert_hidden, expert.intermediate_size],
+        );
+        let w_down = g.parameter(
+            &format!("{}.mlp.down_proj.weight", prefix),
+            &[expert.intermediate_size, expert_hidden],
+        );
+        let gate = g.matmul(h, w_gate);
+        let up = g.matmul(h, w_up);
+        let gate_up = g.swiglu(gate, up);
+        let ffn_out = g.matmul(gate_up, w_down);
+        x = g.add(x, ffn_out);
+    }
+
+    // --- Action output projection ---
+    let action_out_w = g.parameter(
+        "model.action_out_proj.weight",
+        &[expert_hidden, config.max_action_dim],
+    );
+    let action_out_b = g.parameter("model.action_out_proj.bias", &[config.max_action_dim]);
+    let out = g.matmul(x, action_out_w);
+    let out = g.bias_add(out, action_out_b); // [action_seq, max_action_dim]
+
+    // --- MSE loss ---
+    let target = g.input("target_actions", &[action_seq_len, config.max_action_dim]);
+    let neg_target = g.neg(target);
+    let diff = g.add(out, neg_target);
+    let sq_diff = g.mul(diff, diff);
+    let loss = g.mean_all(sq_diff);
+    g.set_outputs(vec![loss]);
+    g
 }
 
 /// Names of expert weight tensors that need transposing.

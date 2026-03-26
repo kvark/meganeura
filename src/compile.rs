@@ -115,6 +115,8 @@ pub struct ExecutionPlan {
     pub param_buffers: Vec<(String, BufferRef)>,
     /// Which buffers hold inputs (filled each step).
     pub input_buffers: Vec<(String, BufferRef)>,
+    /// Constant buffers with their initial data (uploaded once at session creation).
+    pub constant_buffers: Vec<(BufferRef, Vec<f32>)>,
     /// The dispatch sequence. For a training graph, this includes
     /// forward, backward, and parameter update dispatches.
     pub dispatches: Vec<Dispatch>,
@@ -146,6 +148,7 @@ impl<'a> Compiler<'a> {
                 buffers: Vec::new(),
                 param_buffers: Vec::new(),
                 input_buffers: Vec::new(),
+                constant_buffers: Vec::new(),
                 dispatches: Vec::new(),
                 loss_buffer: None,
                 param_grad_pairs: Vec::new(),
@@ -177,6 +180,9 @@ impl<'a> Compiler<'a> {
                 }
                 Op::Input { ref name } => {
                     self.plan.input_buffers.push((name.clone(), buf));
+                }
+                Op::Constant { ref data } => {
+                    self.plan.constant_buffers.push((buf, data.clone()));
                 }
                 _ => {}
             }

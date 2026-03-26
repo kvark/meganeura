@@ -560,6 +560,15 @@ impl Session {
             })
             .collect();
 
+        // Upload constant buffer data (gradient constants, scale factors, etc.)
+        for &(buf_ref, ref data) in &plan.constant_buffers {
+            let buffer = &buffers[buf_ref.0 as usize];
+            unsafe {
+                let ptr = buffer.data() as *mut f32;
+                std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+            }
+        }
+
         let pipelines = Pipelines::new(&gpu, &plan, use_coop_matmul);
         let encoder = gpu.create_command_encoder(blade_graphics::CommandEncoderDesc {
             name: "meganeura",
