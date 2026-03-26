@@ -105,6 +105,9 @@ pub enum Op {
     // SiLU activation: x * sigmoid(x)
     Silu,
 
+    // SwiGLU: silu(gate) * up  (inputs: [gate, up])
+    SwiGLU,
+
     // RMSNorm: x / sqrt(mean(x²) + eps) * weight
     // inputs: [x, weight], eps stored as f32 bits in params
     RmsNorm {
@@ -361,6 +364,12 @@ impl Graph {
     pub fn silu(&mut self, x: NodeId) -> NodeId {
         let ty = self.node(x).ty.clone();
         self.add_node(Op::Silu, vec![x], ty)
+    }
+
+    /// Fused SwiGLU: silu(gate) * up. gate and up must have the same shape.
+    pub fn swiglu(&mut self, gate: NodeId, up: NodeId) -> NodeId {
+        let ty = self.node(gate).ty.clone();
+        self.add_node(Op::SwiGLU, vec![gate, up], ty)
     }
 
     pub fn rms_norm(&mut self, x: NodeId, weight: NodeId, eps: f32) -> NodeId {

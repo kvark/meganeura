@@ -275,9 +275,8 @@ pub fn build_action_expert(
         );
 
         let gate = g.matmul(h, w_gate);
-        let gate = g.silu(gate);
         let up = g.matmul(h, w_up);
-        let gate_up = g.mul(gate, up);
+        let gate_up = g.swiglu(gate, up);
         let ffn_out = g.matmul(gate_up, w_down);
 
         x = g.add(x, ffn_out);

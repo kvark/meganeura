@@ -875,6 +875,28 @@ fn gen_binary() -> Module {
     );
     b.entry_point("greater", [256, 1, 1], func);
 
+    // swiglu: silu(gate) * up = (gate / (1 + exp(-gate))) * up
+    // src_a = gate, src_b = up
+    let func = binary_ep(
+        &b,
+        "swiglu",
+        gv_src_a,
+        gv_src_b,
+        gv_dst,
+        gv_params,
+        |f, gate, up| {
+            let neg_gate = f.unary(UnaryOperator::Negate, gate);
+            let exp_neg = f.math1(MathFunction::Exp, neg_gate);
+            let one = f.literal_f32(1.0);
+            let denom = f.binary(BinaryOperator::Add, one, exp_neg);
+            let one2 = f.literal_f32(1.0);
+            let sigmoid = f.binary(BinaryOperator::Divide, one2, denom);
+            let silu_gate = f.binary(BinaryOperator::Multiply, gate, sigmoid);
+            f.binary(BinaryOperator::Multiply, silu_gate, up)
+        },
+    );
+    b.entry_point("swiglu", [256, 1, 1], func);
+
     b.finish()
 }
 
@@ -3656,7 +3678,10 @@ mod tests {
                 | ShaderEntry::SumAll
                 | ShaderEntry::MeanAll
                 | ShaderEntry::RoPE => vec!["src", "dst", "params"],
-                ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater => {
+                ShaderEntry::Add
+                | ShaderEntry::Mul
+                | ShaderEntry::Greater
+                | ShaderEntry::SwiGLU => {
                     vec!["src_a", "src_b", "dst", "params"]
                 }
                 ShaderEntry::BiasAdd => vec!["src", "bias", "dst", "params"],
