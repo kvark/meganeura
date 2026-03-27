@@ -16,7 +16,14 @@ fn ceil_div(a: u32, b: u32) -> u32 {
 /// for its largest matmuls (e.g. m=50, n=2048 → 2×64=128 WGs), so the scalar path
 /// runs ≈50% faster for that workload.  Larger batch sizes or model widths that do
 /// exceed this threshold will automatically use the coop path.
-const MIN_COOP_WORKGROUPS: u32 = 512;
+///
+/// For dispatches with a large K (reduction dimension, K ≥ 1024), each coop workgroup
+/// does proportionally more arithmetic even when the tile count is low, so a lower
+/// threshold applies.  This primarily benefits backward-pass input-gradient matmuls like
+/// [50,720]×[2048,720]^T (k=2048) while leaving small-K dispatches (k=720) on the faster
+/// scalar path at low tile counts.
+const MIN_COOP_WORKGROUPS: u32 = 128;
+const MIN_COOP_WORKGROUPS_HIGH_K: u32 = 32; // used when K >= 1024
 
 // ---- ShaderData structs matching codegen global variable names ----
 
@@ -251,18 +258,26 @@ impl Pipelines {
             // MatMul/FusedMatMulAdd: params=[m,k,n,0] → n at index 2.
             // MatMulAT/MatMulBT:    params=[m,n,k,0] → n at index 1.
             if use_coop_matmul {
-                let (m, n) = match group {
+                let (m, n, k) = match group {
                     ShaderGroup::MatMul | ShaderGroup::MatMulAdd => {
-                        (dispatch.params[0], dispatch.params[2])
+                        (dispatch.params[0], dispatch.params[2], dispatch.params[1])
                     }
                     ShaderGroup::MatMulAT | ShaderGroup::MatMulBT => {
-                        (dispatch.params[0], dispatch.params[1])
+                        (dispatch.params[0], dispatch.params[1], dispatch.params[2])
                     }
-                    _ => (0, 0),
+                    _ => (0, 0, 0),
                 };
                 if m > 0 {
                     let coop_wgs = ceil_div(m, 32) * ceil_div(n, 32);
-                    if coop_wgs >= MIN_COOP_WORKGROUPS {
+                    // Use a lower workgroup threshold when K is large: each coop tile
+                    // does proportionally more arithmetic so fewer tiles are needed for
+                    // coop to beat scalar occupancy.
+                    let min_wgs = if k >= 1024 {
+                        MIN_COOP_WORKGROUPS_HIGH_K
+                    } else {
+                        MIN_COOP_WORKGROUPS
+                    };
+                    if coop_wgs >= min_wgs {
                         group = match group {
                             ShaderGroup::MatMul => ShaderGroup::MatMulCoop,
                             ShaderGroup::MatMulAdd => ShaderGroup::MatMulCoopAdd,
@@ -593,17 +608,22 @@ impl Session {
             // path which is faster at low parallelism.
             // MatMul/FusedMatMulAdd: params=[m,k,n,0]; MatMulAT/BT: params=[m,n,k,0].
             for dispatch in &mut plan.dispatches {
-                let (m, n) = match dispatch.shader {
+                let (m, n, k) = match dispatch.shader {
                     ShaderEntry::MatMul | ShaderEntry::FusedMatMulAdd => {
-                        (dispatch.params[0], dispatch.params[2])
+                        (dispatch.params[0], dispatch.params[2], dispatch.params[1])
                     }
                     ShaderEntry::MatMulAT | ShaderEntry::MatMulBT => {
-                        (dispatch.params[0], dispatch.params[1])
+                        (dispatch.params[0], dispatch.params[1], dispatch.params[2])
                     }
                     _ => continue,
                 };
                 let coop_wgs = ceil_div(m, 32) * ceil_div(n, 32);
-                if coop_wgs >= MIN_COOP_WORKGROUPS {
+                let min_wgs = if k >= 1024 {
+                    MIN_COOP_WORKGROUPS_HIGH_K
+                } else {
+                    MIN_COOP_WORKGROUPS
+                };
+                if coop_wgs >= min_wgs {
                     dispatch.workgroups = [ceil_div(m, 32), ceil_div(n, 32), 1];
                 }
                 // else: keep scalar workgroups [ceil(n/16), ceil(m/16), 1]
