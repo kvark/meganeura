@@ -5,9 +5,9 @@
   "chunk_size": 50,
   "vlm_seq_len": 16,
   "num_layers": 16,
-  "fwd_avg_ms": 23.61,
-  "fwd_median_ms": 23.47,
-  "train_step_avg_ms": 104.84,
-  "train_step_median_ms": 104.97,
-  "approx_bwd_ms": 81.23
+  "fwd_avg_ms": 25.46,
+  "fwd_median_ms": 27.51,
+  "train_step_avg_ms": 71.94,
+  "train_step_median_ms": 71.18,
+  "approx_bwd_ms": 46.48
 }
