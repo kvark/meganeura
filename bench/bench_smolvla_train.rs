@@ -204,7 +204,8 @@ fn main() {
         set_inputs(&mut train_session);
         train_session.step();
         train_session.wait();
-        train_session.sgd_step_cpu(1e-5);
+        train_session.sgd_step(1e-5);
+        train_session.wait();
     }
 
     // --- Per-kernel profiling (--profile flag) ---
@@ -264,12 +265,18 @@ fn main() {
         );
         set_inputs(&mut train_session);
         train_session.step();
+        train_session.wait();
+        train_session.sgd_step(1e-5);
         train_session.wait(); // step A
         set_inputs(&mut train_session);
         train_session.step();
+        train_session.wait();
+        train_session.sgd_step(1e-5);
         train_session.wait(); // step B
         set_inputs(&mut train_session);
-        train_session.step(); // step C — reads step A's timestamps
+        train_session.step();
+        train_session.wait();
+        train_session.sgd_step(1e-5); // step C — reads step A's timestamps
         train_session.dump_gpu_timings();
         train_session.wait();
 
@@ -297,7 +304,8 @@ fn main() {
         let t0 = Instant::now();
         train_session.step();
         train_session.wait();
-        train_session.sgd_step_cpu(1e-5);
+        train_session.sgd_step(1e-5);
+        train_session.wait();
         let elapsed = t0.elapsed().as_secs_f64();
         train_latencies.push(elapsed);
         eprintln!("  train run {}: {:.2}ms", i + 1, elapsed * 1000.0);

@@ -276,6 +276,15 @@ impl Pipelines {
             needed.entry(group).or_default().push(&dispatch.shader);
         }
 
+        // Always compile SgdUpdate if the plan has trainable parameters,
+        // so sgd_step() can be called without dispatches in the plan.
+        if !plan.param_grad_pairs.is_empty() {
+            needed
+                .entry(ShaderGroup::Sgd)
+                .or_default()
+                .push(&ShaderEntry::SgdUpdate);
+        }
+
         let mut map = HashMap::new();
         for (group, entries) in &needed {
             let module = crate::codegen::generate_module(*group);

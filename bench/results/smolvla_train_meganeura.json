@@ -1,0 +1,13 @@
+{
+  "framework": "meganeura",
+  "model": "smolvla_action_expert",
+  "device": "blade-gpu",
+  "chunk_size": 50,
+  "vlm_seq_len": 16,
+  "num_layers": 16,
+  "fwd_avg_ms": 23.61,
+  "fwd_median_ms": 23.47,
+  "train_step_avg_ms": 104.84,
+  "train_step_median_ms": 104.97,
+  "approx_bwd_ms": 81.23
+}
