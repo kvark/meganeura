@@ -30,6 +30,10 @@ pub enum ShaderEntry {
     LayerNorm,
     FullAttention,
     CrossAttention,
+    MultiHeadAttn,
+    MultiHeadAttnGradQ,
+    MultiHeadAttnGradK,
+    MultiHeadAttnGradV,
 }
 
 impl ShaderEntry {
@@ -56,6 +60,10 @@ impl ShaderEntry {
             ShaderEntry::LayerNorm => ShaderGroup::LayerNorm,
             ShaderEntry::FullAttention => ShaderGroup::FullAttention,
             ShaderEntry::CrossAttention => ShaderGroup::CrossAttention,
+            ShaderEntry::MultiHeadAttn => ShaderGroup::MultiHeadAttn,
+            ShaderEntry::MultiHeadAttnGradQ => ShaderGroup::MultiHeadAttnGradQ,
+            ShaderEntry::MultiHeadAttnGradK => ShaderGroup::MultiHeadAttnGradK,
+            ShaderEntry::MultiHeadAttnGradV => ShaderGroup::MultiHeadAttnGradV,
         }
     }
 
@@ -86,6 +94,10 @@ impl ShaderEntry {
             ShaderEntry::LayerNorm => "main",
             ShaderEntry::FullAttention => "main",
             ShaderEntry::CrossAttention => "main",
+            ShaderEntry::MultiHeadAttn
+            | ShaderEntry::MultiHeadAttnGradQ
+            | ShaderEntry::MultiHeadAttnGradK
+            | ShaderEntry::MultiHeadAttnGradV => "main",
         }
     }
 }
@@ -98,6 +110,8 @@ pub struct Dispatch {
     /// Buffer bindings: maps the node IDs for inputs/outputs to buffer slots.
     pub input_buffers: Vec<BufferRef>,
     pub output_buffer: BufferRef,
+    /// Extra output buffer (e.g. LSE for MultiHeadAttn forward).
+    pub extra_output: Option<BufferRef>,
     /// Extra params to upload as a uniform buffer.
     pub params: Vec<u32>,
 }
@@ -124,6 +138,8 @@ pub struct ExecutionPlan {
     pub loss_buffer: Option<BufferRef>,
     /// Parameter buffer → gradient buffer mapping (for SGD).
     pub param_grad_pairs: Vec<(BufferRef, BufferRef)>,
+    /// LSE buffers allocated for MultiHeadAttn forward nodes: (node_id, buffer).
+    pub lse_buffers: Vec<(NodeId, BufferRef)>,
 }
 
 /// Compile a differentiated graph into an ExecutionPlan.
@@ -152,6 +168,7 @@ impl<'a> Compiler<'a> {
                 dispatches: Vec::new(),
                 loss_buffer: None,
                 param_grad_pairs: Vec::new(),
+                lse_buffers: Vec::new(),
             },
             node_buffers: HashMap::new(),
         }
@@ -183,6 +200,12 @@ impl<'a> Compiler<'a> {
                 }
                 Op::Constant { ref data } => {
                     self.plan.constant_buffers.push((buf, data.clone()));
+                }
+                Op::MultiHeadAttn { num_heads, .. } => {
+                    let q_seq = node.ty.shape[0];
+                    let lse_size = q_seq * num_heads as usize * 4; // f32 per (pos, head)
+                    let lse_buf = self.alloc_buffer(lse_size);
+                    self.plan.lse_buffers.push((node.id, lse_buf));
                 }
                 _ => {}
             }
@@ -238,6 +261,7 @@ impl<'a> Compiler<'a> {
                     workgroups: [ceil_div(n, 16), ceil_div(m, 16), 1],
                     input_buffers: vec![a, b],
                     output_buffer: out_buf,
+                    extra_output: None,
                     params: vec![m, k, n, 0],
                 });
             }
@@ -257,6 +281,7 @@ impl<'a> Compiler<'a> {
                     workgroups: [ceil_div(n, 16), ceil_div(m, 16), 1],
                     input_buffers: vec![a, b, d],
                     output_buffer: out_buf,
+                    extra_output: None,
                     params: vec![m, k, n, 0],
                 });
             }
@@ -281,6 +306,7 @@ impl<'a> Compiler<'a> {
                     workgroups: [ceil_div(len, 256), 1, 1],
                     input_buffers: vec![a, b],
                     output_buffer: out_buf,
+                    extra_output: None,
                     params: vec![len, bias_len, 0, 0],
                 });
             }
@@ -303,6 +329,7 @@ impl<'a> Compiler<'a> {
                     workgroups: [ceil_div(len, 256), 1, 1],
                     input_buffers: vec![input],
                     output_buffer: out_buf,
+                    extra_output: None,
                     params: vec![len, 0, 0, 0],
                 });
             }
@@ -315,6 +342,7 @@ impl<'a> Compiler<'a> {
                     workgroups: [ceil_div(len, 256), 1, 1],
                     input_buffers: vec![input],
                     output_buffer: out_buf,
+                    extra_output: None,
                     params: vec![len, 0, 0, 0],
                 });
             }
@@ -329,6 +357,7 @@ impl<'a> Compiler<'a> {
                     workgroups: [ceil_div(batch, 256), 1, 1],
                     input_buffers: vec![input],
                     output_buffer: out_buf,
+                    extra_output: None,
                     params: vec![batch, features, 0, 0],
                 });
             }
@@ -344,6 +373,7 @@ impl<'a> Compiler<'a> {
                     workgroups: [ceil_div(batch, 256), 1, 1],
                     input_buffers: vec![input],
                     output_buffer: out_buf,
+                    extra_output: None,
                     params: vec![batch, features, 0, 0],
                 });
             }
@@ -359,6 +389,7 @@ impl<'a> Compiler<'a> {
                     workgroups: [1, 1, 1],
                     input_buffers: vec![logits, labels],
                     output_buffer: out_buf,
+                    extra_output: None,
                     params: vec![batch, features, 0, 0],
                 });
             }
@@ -373,6 +404,7 @@ impl<'a> Compiler<'a> {
                     workgroups: [ceil_div(n, 16), ceil_div(m, 16), 1],
                     input_buffers: vec![input],
                     output_buffer: out_buf,
+                    extra_output: None,
                     params: vec![m, n, 0, 0],
                 });
             }
@@ -396,6 +428,7 @@ impl<'a> Compiler<'a> {
                     workgroups: [rows, 1, 1], // one workgroup per row
                     input_buffers: vec![x, w],
                     output_buffer: out_buf,
+                    extra_output: None,
                     params: vec![rows, cols, eps.to_bits(), 0],
                 });
             }
@@ -412,6 +445,7 @@ impl<'a> Compiler<'a> {
                     workgroups: [ceil_div(seq * hidden, 256), 1, 1],
                     input_buffers: vec![indices, table],
                     output_buffer: out_buf,
+                    extra_output: None,
                     params: vec![seq, hidden, 0, 0],
                 });
             }
@@ -426,6 +460,7 @@ impl<'a> Compiler<'a> {
                     workgroups: [ceil_div(seq * dim / 2, 256), 1, 1],
                     input_buffers: vec![input],
                     output_buffer: out_buf,
+                    extra_output: None,
                     params: vec![seq, dim, theta.to_bits(), 0],
                 });
             }
@@ -444,6 +479,7 @@ impl<'a> Compiler<'a> {
                     workgroups: [ceil_div(seq, 1), num_heads, 1],
                     input_buffers: vec![q, k, v],
                     output_buffer: out_buf,
+                    extra_output: None,
                     params: vec![seq, num_heads, num_kv_heads, head_dim],
                 });
             }
@@ -464,6 +500,7 @@ impl<'a> Compiler<'a> {
                     workgroups: [ceil_div(rows, 256), 1, 1],
                     input_buffers: vec![x, w, bias],
                     output_buffer: out_buf,
+                    extra_output: None,
                     params: vec![rows, cols, eps.to_bits(), 0],
                 });
             }
@@ -482,6 +519,7 @@ impl<'a> Compiler<'a> {
                     workgroups: [ceil_div(seq, 1), num_heads, 1],
                     input_buffers: vec![q, k, v],
                     output_buffer: out_buf,
+                    extra_output: None,
                     params: vec![seq, num_heads, num_kv_heads, head_dim],
                 });
             }
@@ -501,11 +539,118 @@ impl<'a> Compiler<'a> {
                     workgroups: [ceil_div(q_seq, 1), num_heads, 1],
                     input_buffers: vec![q, k, v],
                     output_buffer: out_buf,
+                    extra_output: None,
                     // Pack both seq lengths: q_seq in first, kv_seq encoded via head_dim slot
                     params: vec![q_seq, kv_seq, (num_heads << 16) | num_kv_heads, head_dim],
                 });
             }
+
+            Op::MultiHeadAttn {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                ..
+            } => {
+                let q = self.get_buffer(node.inputs[0]);
+                let k = self.get_buffer(node.inputs[1]);
+                let v = self.get_buffer(node.inputs[2]);
+                let q_seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
+                let kv_seq = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
+                let lse_buf = self.find_lse_buffer(node.id);
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::MultiHeadAttn,
+                    workgroups: [q_seq, num_heads, 1],
+                    input_buffers: vec![q, k, v],
+                    output_buffer: out_buf,
+                    extra_output: Some(lse_buf),
+                    params: vec![q_seq, kv_seq, (num_heads << 16) | num_kv_heads, head_dim],
+                });
+            }
+
+            Op::MultiHeadAttnGradQ {
+                fwd_node,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                ..
+            } => {
+                let d_out = self.get_buffer(node.inputs[0]);
+                let q = self.get_buffer(node.inputs[1]);
+                let k = self.get_buffer(node.inputs[2]);
+                let v = self.get_buffer(node.inputs[3]);
+                let fwd_o = self.get_buffer(fwd_node);
+                let lse_buf = self.find_lse_buffer(fwd_node);
+                let q_seq = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
+                let kv_seq = self.graph.node(node.inputs[2]).ty.shape[0] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::MultiHeadAttnGradQ,
+                    workgroups: [q_seq, num_heads, 1],
+                    input_buffers: vec![d_out, q, k, v, lse_buf, fwd_o],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![q_seq, kv_seq, (num_heads << 16) | num_kv_heads, head_dim],
+                });
+            }
+
+            Op::MultiHeadAttnGradK {
+                fwd_node,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                ..
+            } => {
+                let d_out = self.get_buffer(node.inputs[0]);
+                let q = self.get_buffer(node.inputs[1]);
+                let k = self.get_buffer(node.inputs[2]);
+                let v = self.get_buffer(node.inputs[3]);
+                let fwd_o = self.get_buffer(fwd_node);
+                let lse_buf = self.find_lse_buffer(fwd_node);
+                let q_seq = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
+                let kv_seq = self.graph.node(node.inputs[2]).ty.shape[0] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::MultiHeadAttnGradK,
+                    workgroups: [kv_seq, num_kv_heads, 1],
+                    input_buffers: vec![d_out, q, k, v, lse_buf, fwd_o],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![q_seq, kv_seq, (num_heads << 16) | num_kv_heads, head_dim],
+                });
+            }
+
+            Op::MultiHeadAttnGradV {
+                fwd_node,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                ..
+            } => {
+                let d_out = self.get_buffer(node.inputs[0]);
+                let q = self.get_buffer(node.inputs[1]);
+                let k = self.get_buffer(node.inputs[2]);
+                let v = self.get_buffer(node.inputs[3]);
+                let fwd_o = self.get_buffer(fwd_node);
+                let lse_buf = self.find_lse_buffer(fwd_node);
+                let q_seq = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
+                let kv_seq = self.graph.node(node.inputs[2]).ty.shape[0] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::MultiHeadAttnGradV,
+                    workgroups: [kv_seq, num_kv_heads, 1],
+                    input_buffers: vec![d_out, q, k, v, lse_buf, fwd_o],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![q_seq, kv_seq, (num_heads << 16) | num_kv_heads, head_dim],
+                });
+            }
         }
+    }
+
+    fn find_lse_buffer(&self, fwd_node: NodeId) -> BufferRef {
+        self.plan
+            .lse_buffers
+            .iter()
+            .find(|(id, _)| *id == fwd_node)
+            .expect("LSE buffer not found for MultiHeadAttn forward node")
+            .1
     }
 
     fn emit_unary(&mut self, shader: ShaderEntry, node: &Node, out_buf: BufferRef) {
@@ -516,6 +661,7 @@ impl<'a> Compiler<'a> {
             workgroups: [ceil_div(len, 256), 1, 1],
             input_buffers: vec![input],
             output_buffer: out_buf,
+            extra_output: None,
             params: vec![len, 0, 0, 0],
         });
     }
@@ -529,6 +675,7 @@ impl<'a> Compiler<'a> {
             workgroups: [ceil_div(len, 256), 1, 1],
             input_buffers: vec![a, b],
             output_buffer: out_buf,
+            extra_output: None,
             params: vec![len, 0, 0, 0],
         });
     }

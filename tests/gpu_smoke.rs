@@ -2,6 +2,7 @@
 /// and that a simple forward pass executes without errors.
 use meganeura::{
     Graph, build_inference_session, build_session,
+    compile::BufferRef,
     models::smolvla::{self, SmolVLAConfig},
 };
 
@@ -262,8 +263,7 @@ fn smolvla_training_backprop_smoke() {
     let action_seq_len = config.chunk_size; // 4
     let vlm_seq_len = 4;
 
-    let training_g =
-        smolvla::build_action_expert_training(&config, action_seq_len, vlm_seq_len);
+    let training_g = smolvla::build_action_expert_training(&config, action_seq_len, vlm_seq_len);
     let mut session = build_session(&training_g);
 
     // Initialize with small uniform weights
@@ -321,7 +321,11 @@ fn smolvla_training_backprop_smoke() {
         session.step();
         session.wait();
         let l = session.read_loss();
-        assert!(l.is_finite(), "loss diverged to NaN/inf during training: {}", l);
+        assert!(
+            l.is_finite(),
+            "loss diverged to NaN/inf during training: {}",
+            l
+        );
     }
 
     let final_loss = session.read_loss();
@@ -330,5 +334,167 @@ fn smolvla_training_backprop_smoke() {
         "loss should decrease after 5 gradient steps: initial={:.6}, final={:.6}",
         initial_loss,
         final_loss
+    );
+}
+
+#[test]
+fn multi_head_attn_gradient_check() {
+    // Numerical gradient check for MultiHeadAttn backward pass.
+    // Uses head_dim=64 to match the WG=64 hardcoding in attention shaders.
+    // Compares analytical gradients (from backprop) to central-difference
+    // finite differences for a subset of Q, K, V elements.
+
+    let q_seq: usize = 4;
+    let kv_seq: usize = 4;
+    let num_heads: u32 = 1;
+    let num_kv_heads: u32 = 1;
+    let head_dim: u32 = 64;
+    let d_q = (num_heads * head_dim) as usize;
+    let d_kv = (num_kv_heads * head_dim) as usize;
+    let n_q = q_seq * d_q;
+    let n_kv = kv_seq * d_kv;
+
+    // --- Analytical gradients via backprop ---
+    let mut g_train = Graph::new();
+    let qn = g_train.parameter("q", &[q_seq, d_q]);
+    let kn = g_train.parameter("k", &[kv_seq, d_kv]);
+    let vn = g_train.parameter("v", &[kv_seq, d_kv]);
+    let out = g_train.multi_head_attn(qn, kn, vn, num_heads, num_kv_heads, head_dim, false);
+    let loss_node = g_train.mean_all(out);
+    g_train.set_outputs(vec![loss_node]);
+
+    let mut train_sess = build_session(&g_train);
+
+    // Varied initialisation — using sin patterns to avoid degenerate cases
+    let q_data: Vec<f32> = (0..n_q).map(|i| (i as f32 * 0.01).sin() * 0.1).collect();
+    let k_data: Vec<f32> = (0..n_kv)
+        .map(|i| (i as f32 * 0.013 + 1.0).sin() * 0.1)
+        .collect();
+    let v_data: Vec<f32> = (0..n_kv)
+        .map(|i| (i as f32 * 0.017 + 2.0).sin() * 0.1)
+        .collect();
+
+    train_sess.set_parameter("q", &q_data);
+    train_sess.set_parameter("k", &k_data);
+    train_sess.set_parameter("v", &v_data);
+
+    train_sess.step();
+    train_sess.wait();
+
+    let loss_val = train_sess.read_loss();
+    assert!(loss_val.is_finite(), "MHA loss is not finite: {}", loss_val);
+
+    // Map parameter names → (param_buf, grad_buf)
+    let param_buffers: std::collections::HashMap<String, BufferRef> =
+        train_sess.plan().param_buffers.iter().cloned().collect();
+    let grad_map: std::collections::HashMap<BufferRef, BufferRef> =
+        train_sess.plan().param_grad_pairs.iter().cloned().collect();
+
+    let q_buf = param_buffers["q"];
+    let k_buf = param_buffers["k"];
+    let v_buf = param_buffers["v"];
+
+    let mut grad_q = vec![0.0f32; n_q];
+    let mut grad_k = vec![0.0f32; n_kv];
+    let mut grad_v = vec![0.0f32; n_kv];
+    train_sess.read_buffer(grad_map[&q_buf], &mut grad_q);
+    train_sess.read_buffer(grad_map[&k_buf], &mut grad_k);
+    train_sess.read_buffer(grad_map[&v_buf], &mut grad_v);
+
+    // --- Numerical gradients via central differences ---
+    let mut g_infer = Graph::new();
+    let qi = g_infer.parameter("q", &[q_seq, d_q]);
+    let ki = g_infer.parameter("k", &[kv_seq, d_kv]);
+    let vi = g_infer.parameter("v", &[kv_seq, d_kv]);
+    let out_i = g_infer.multi_head_attn(qi, ki, vi, num_heads, num_kv_heads, head_dim, false);
+    let loss_i = g_infer.mean_all(out_i);
+    g_infer.set_outputs(vec![loss_i]);
+    let mut infer_sess = build_inference_session(&g_infer);
+
+    let fwd = |sess: &mut meganeura::Session, qd: &[f32], kd: &[f32], vd: &[f32]| -> f32 {
+        sess.set_parameter("q", qd);
+        sess.set_parameter("k", kd);
+        sess.set_parameter("v", vd);
+        sess.step();
+        sess.wait();
+        sess.read_loss()
+    };
+
+    let eps = 1e-3_f32;
+    // Check a spread of element indices across Q, K, V
+    let check_idxs = [0usize, 8, 32, 63, 128, 200, 255];
+    let mut max_rel_err = 0.0f32;
+    let mut checks = 0usize;
+
+    // grad_q
+    for &idx in &check_idxs {
+        if idx >= n_q {
+            continue;
+        }
+        let mut qd = q_data.clone();
+        qd[idx] += eps;
+        let lp = fwd(&mut infer_sess, &qd, &k_data, &v_data);
+        qd[idx] -= 2.0 * eps;
+        let lm = fwd(&mut infer_sess, &qd, &k_data, &v_data);
+        let num = (lp - lm) / (2.0 * eps);
+        let ana = grad_q[idx];
+        let rel = (num - ana).abs() / (num.abs().max(ana.abs()).max(1e-6));
+        eprintln!("grad_q[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
+        if max_rel_err < rel {
+            max_rel_err = rel;
+        }
+        checks += 1;
+    }
+
+    // grad_k
+    for &idx in &check_idxs {
+        if idx >= n_kv {
+            continue;
+        }
+        let mut kd = k_data.clone();
+        kd[idx] += eps;
+        let lp = fwd(&mut infer_sess, &q_data, &kd, &v_data);
+        kd[idx] -= 2.0 * eps;
+        let lm = fwd(&mut infer_sess, &q_data, &kd, &v_data);
+        let num = (lp - lm) / (2.0 * eps);
+        let ana = grad_k[idx];
+        let rel = (num - ana).abs() / (num.abs().max(ana.abs()).max(1e-6));
+        eprintln!("grad_k[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
+        if max_rel_err < rel {
+            max_rel_err = rel;
+        }
+        checks += 1;
+    }
+
+    // grad_v
+    for &idx in &check_idxs {
+        if idx >= n_kv {
+            continue;
+        }
+        let mut vd = v_data.clone();
+        vd[idx] += eps;
+        let lp = fwd(&mut infer_sess, &q_data, &k_data, &vd);
+        vd[idx] -= 2.0 * eps;
+        let lm = fwd(&mut infer_sess, &q_data, &k_data, &vd);
+        let num = (lp - lm) / (2.0 * eps);
+        let ana = grad_v[idx];
+        let rel = (num - ana).abs() / (num.abs().max(ana.abs()).max(1e-6));
+        eprintln!("grad_v[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
+        if max_rel_err < rel {
+            max_rel_err = rel;
+        }
+        checks += 1;
+    }
+
+    assert!(checks > 0, "no gradient elements were checked");
+    assert!(
+        max_rel_err < 0.05,
+        "MultiHeadAttn gradient check FAILED: max relative error {:.4} (>5%) across {} elements",
+        max_rel_err,
+        checks,
+    );
+    eprintln!(
+        "MultiHeadAttn gradient check PASSED: max relative error {:.4} across {} elements",
+        max_rel_err, checks
     );
 }

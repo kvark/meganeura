@@ -197,6 +197,30 @@ struct TransposeParams {
     _pad1: u32,
 }
 
+// multi_head_attn: var src_a (Q), src_b (K), bias (V), dst, lse, params
+#[derive(blade_macros::ShaderData)]
+struct MultiHeadAttnData {
+    src_a: blade_graphics::BufferPiece,
+    src_b: blade_graphics::BufferPiece,
+    bias: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    lse: blade_graphics::BufferPiece,
+    params: MatMulParams,
+}
+
+// multi_head_attn_grad: var d_out (dO), src_a (Q), src_b (K), bias (V), lse, fwd_dst (O), dst (dQ/dK/dV), params
+#[derive(blade_macros::ShaderData)]
+struct MultiHeadAttnGradData {
+    d_out: blade_graphics::BufferPiece,
+    src_a: blade_graphics::BufferPiece,
+    src_b: blade_graphics::BufferPiece,
+    bias: blade_graphics::BufferPiece,
+    lse: blade_graphics::BufferPiece,
+    fwd_dst: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: MatMulParams,
+}
+
 // ---- Pipeline collection ----
 
 struct Pipelines {
@@ -285,6 +309,10 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::Gelu => UnaryData::layout(),
         ShaderEntry::LayerNorm => LayerNormData::layout(),
         ShaderEntry::FullAttention | ShaderEntry::CrossAttention => CausalAttentionData::layout(),
+        ShaderEntry::MultiHeadAttn => MultiHeadAttnData::layout(),
+        ShaderEntry::MultiHeadAttnGradQ
+        | ShaderEntry::MultiHeadAttnGradK
+        | ShaderEntry::MultiHeadAttnGradV => MultiHeadAttnGradData::layout(),
     }
 }
 
@@ -315,6 +343,9 @@ fn reorder_by_level(dispatches: &mut Vec<Dispatch>) {
             .unwrap_or(0);
         levels[i] = level;
         producer.insert(dispatch.output_buffer.0, i);
+        if let Some(extra) = dispatch.extra_output {
+            producer.insert(extra.0, i);
+        }
     }
     // Stable sort by level keeps topological order within a level.
     let mut order: Vec<usize> = (0..n).collect();
@@ -340,6 +371,9 @@ fn compute_groups(dispatches: &[Dispatch]) -> Vec<std::ops::Range<usize>> {
             dirty.clear();
         }
         dirty.insert(dispatch.output_buffer.0);
+        if let Some(extra) = dispatch.extra_output {
+            dirty.insert(extra.0);
+        }
     }
     if !dispatches.is_empty() {
         groups.push(start..dispatches.len());
@@ -1017,6 +1051,46 @@ impl Session {
                             m: dispatch.params[0],
                             k: dispatch.params[1],
                             n: dispatch.params[2],
+                            _pad: dispatch.params[3],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::MultiHeadAttn => {
+                pc.bind(
+                    0,
+                    &MultiHeadAttnData {
+                        src_a: buf(dispatch.input_buffers[0]),
+                        src_b: buf(dispatch.input_buffers[1]),
+                        bias: buf(dispatch.input_buffers[2]),
+                        dst: buf(dispatch.output_buffer),
+                        lse: buf(dispatch.extra_output.expect("MultiHeadAttn needs extra_output")),
+                        params: MatMulParams {
+                            m: dispatch.params[0],
+                            n: dispatch.params[1],
+                            k: dispatch.params[2],
+                            _pad: dispatch.params[3],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::MultiHeadAttnGradQ
+            | ShaderEntry::MultiHeadAttnGradK
+            | ShaderEntry::MultiHeadAttnGradV => {
+                pc.bind(
+                    0,
+                    &MultiHeadAttnGradData {
+                        d_out: buf(dispatch.input_buffers[0]),
+                        src_a: buf(dispatch.input_buffers[1]),
+                        src_b: buf(dispatch.input_buffers[2]),
+                        bias: buf(dispatch.input_buffers[3]),
+                        lse: buf(dispatch.input_buffers[4]),
+                        fwd_dst: buf(dispatch.input_buffers[5]),
+                        dst: buf(dispatch.output_buffer),
+                        params: MatMulParams {
+                            m: dispatch.params[0],
+                            n: dispatch.params[1],
+                            k: dispatch.params[2],
                             _pad: dispatch.params[3],
                         },
                     },

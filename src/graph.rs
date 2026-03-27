@@ -158,6 +158,43 @@ pub enum Op {
         num_kv_heads: u32,
         head_dim: u32,
     },
+
+    // Differentiable multi-head attention (GQA-capable) with LSE saved for backward.
+    // inputs: [q, k, v]
+    // output: O [q_seq, num_heads*head_dim]
+    // During compilation, also allocates an LSE buffer [q_seq * num_heads].
+    // Params reuse cross-attention encoding: [q_seq, kv_seq, (num_heads<<16)|num_kv_heads, head_dim]
+    MultiHeadAttn {
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        is_cross: bool,
+    },
+
+    // Backward gradient ops for MultiHeadAttn.
+    // inputs: [dO, q, k, v]
+    // fwd_node: NodeId of the forward MultiHeadAttn — compile looks up O and LSE buffers.
+    MultiHeadAttnGradQ {
+        fwd_node: NodeId,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        is_cross: bool,
+    },
+    MultiHeadAttnGradK {
+        fwd_node: NodeId,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        is_cross: bool,
+    },
+    MultiHeadAttnGradV {
+        fwd_node: NodeId,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        is_cross: bool,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -575,6 +612,55 @@ impl Graph {
                 num_heads,
                 num_kv_heads,
                 head_dim,
+            },
+            vec![q, k, v],
+            ty,
+        )
+    }
+
+    /// Differentiable multi-head attention with LSE output for backward.
+    /// Handles both self-attention (q_seq == kv_seq, is_cross=false) and
+    /// cross-attention (q_seq != kv_seq, is_cross=true).
+    pub fn multi_head_attn(
+        &mut self,
+        q: NodeId,
+        k: NodeId,
+        v: NodeId,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        is_cross: bool,
+    ) -> NodeId {
+        let q_shape = &self.node(q).ty.shape;
+        let k_shape = &self.node(k).ty.shape;
+        let v_shape = &self.node(v).ty.shape;
+        assert_eq!(q_shape.len(), 2, "q must be 2D");
+        assert_eq!(k_shape.len(), 2, "k must be 2D");
+        assert_eq!(v_shape.len(), 2, "v must be 2D");
+        let q_seq = q_shape[0];
+        assert_eq!(
+            q_shape[1],
+            (num_heads * head_dim) as usize,
+            "q dim mismatch"
+        );
+        assert_eq!(
+            k_shape[1],
+            (num_kv_heads * head_dim) as usize,
+            "k dim mismatch"
+        );
+        assert_eq!(v_shape[0], k_shape[0], "v seq must match k seq");
+        assert_eq!(
+            v_shape[1],
+            (num_kv_heads * head_dim) as usize,
+            "v dim mismatch"
+        );
+        let ty = TensorType::f32(vec![q_seq, (num_heads * head_dim) as usize]);
+        self.add_node(
+            Op::MultiHeadAttn {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                is_cross,
             },
             vec![q, k, v],
             ty,

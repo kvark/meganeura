@@ -2,14 +2,11 @@
 """Benchmark SmolVLA action expert training with PyTorch.
 
 Implements the exact same graph as meganeura's build_action_expert_training():
-  - Single-head attention (head_dim-sized Q/K/V/O projections, no GQA reshape)
+  - Full GQA attention (num_heads=15, num_kv_heads=5, head_dim=64)
   - No causal mask (plain softmax attention)
   - RMSNorm, SwiGLU FFN
   - MSE loss against target actions
   - SGD optimizer (lr=1e-5, matching meganeura's sgd_step_cpu)
-
-This is NOT the full GQA SmolVLA model — it is an apples-to-apples comparison
-with meganeura's training graph, which does not yet support multi-head reshape.
 
 Usage:
     python bench/bench_smolvla_train_pytorch.py [--warmup 3] [--runs 5]
@@ -48,42 +45,61 @@ class SwiGLU(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class SingleHeadAttention(nn.Module):
-    """Single-head attention matching meganeura's primitive_self/cross_attention.
+class GQAAttention(nn.Module):
+    """GQA attention matching meganeura's MultiHeadAttn op.
 
-    Projects Q, K, V to head_dim (not num_heads * head_dim).
-    No causal mask; plain softmax.
+    Projects Q to num_heads*head_dim, K/V to num_kv_heads*head_dim.
+    No causal mask; plain softmax. Identical to the fused kernel's math.
     """
 
-    def __init__(self, hidden, head_dim, kv_dim, is_cross):
+    def __init__(self, hidden, num_heads, num_kv_heads, head_dim, kv_dim, is_cross):
         super().__init__()
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.is_cross = is_cross
-        self.q_proj = nn.Linear(hidden, head_dim, bias=False)
+        self.heads_per_kv = num_heads // num_kv_heads
+
+        self.q_proj = nn.Linear(hidden, num_heads * head_dim, bias=False)
         kv_in = kv_dim if is_cross else hidden
-        self.k_proj = nn.Linear(kv_in, head_dim, bias=False)
-        self.v_proj = nn.Linear(kv_in, head_dim, bias=False)
-        self.o_proj = nn.Linear(head_dim, hidden, bias=False)
+        self.k_proj = nn.Linear(kv_in, num_kv_heads * head_dim, bias=False)
+        self.v_proj = nn.Linear(kv_in, num_kv_heads * head_dim, bias=False)
+        self.o_proj = nn.Linear(num_heads * head_dim, hidden, bias=False)
 
     def forward(self, x, kv_input=None):
-        # x: [B, seq, hidden], kv_input: [B, kv_seq, kv_dim] or None
+        B, q_seq, _ = x.shape
         src = kv_input if self.is_cross and kv_input is not None else x
-        q = self.q_proj(x)    # [B, seq, head_dim]
-        k = self.k_proj(src)  # [B, kv_seq, head_dim]
-        v = self.v_proj(src)  # [B, kv_seq, head_dim]
-        # Plain softmax attention, no causal mask — matches meganeura graph
+        kv_seq = src.shape[1]
+
+        q = self.q_proj(x)    # [B, q_seq, nh*hd]
+        k = self.k_proj(src)  # [B, kv_seq, nkv*hd]
+        v = self.v_proj(src)  # [B, kv_seq, nkv*hd]
+
+        # Reshape: [B, seq, heads, head_dim] → [B, heads, seq, head_dim]
+        q = q.view(B, q_seq, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, kv_seq, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, kv_seq, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        # GQA: each KV head shared by heads_per_kv query heads
+        k = k.repeat_interleave(self.heads_per_kv, dim=1)  # [B, nh, kv_seq, hd]
+        v = v.repeat_interleave(self.heads_per_kv, dim=1)
+
         scale = 1.0 / math.sqrt(self.head_dim)
-        scores = torch.bmm(q, k.transpose(1, 2)) * scale  # [B, seq, kv_seq]
+        scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B, nh, q_seq, kv_seq]
         probs = F.softmax(scores, dim=-1)
-        out = torch.bmm(probs, v)                          # [B, seq, head_dim]
+        out = torch.matmul(probs, v)  # [B, nh, q_seq, hd]
+
+        out = out.transpose(1, 2).contiguous().view(B, q_seq, self.num_heads * self.head_dim)
         return self.o_proj(out)
 
 
 class ExpertLayer(nn.Module):
-    def __init__(self, hidden, head_dim, kv_dim, intermediate, eps, is_cross):
+    def __init__(self, hidden, num_heads, num_kv_heads, head_dim, kv_dim,
+                 intermediate, eps, is_cross):
         super().__init__()
         self.input_layernorm = RMSNorm(hidden, eps)
-        self.self_attn = SingleHeadAttention(hidden, head_dim, kv_dim, is_cross)
+        self.self_attn = GQAAttention(hidden, num_heads, num_kv_heads, head_dim,
+                                      kv_dim, is_cross)
         self.post_attention_layernorm = RMSNorm(hidden, eps)
         self.mlp = SwiGLU(hidden, intermediate)
 
@@ -99,8 +115,8 @@ class ActionExpert(nn.Module):
     """Matches meganeura's build_action_expert_training() graph exactly."""
 
     def __init__(self, expert_hidden=720, num_layers=16,
-                 head_dim=64, kv_dim=320,
-                 intermediate=2048, action_dim=32, eps=1e-5,
+                 num_heads=15, num_kv_heads=5, head_dim=64,
+                 kv_dim=320, intermediate=2048, action_dim=32, eps=1e-5,
                  self_attn_every_n=2):
         super().__init__()
         self.action_in_proj = nn.Linear(action_dim, expert_hidden, bias=True)
@@ -108,7 +124,8 @@ class ActionExpert(nn.Module):
         self.action_time_mlp_out = nn.Linear(expert_hidden, expert_hidden, bias=True)
         self.layers = nn.ModuleList([
             ExpertLayer(
-                expert_hidden, head_dim, kv_dim, intermediate, eps,
+                expert_hidden, num_heads, num_kv_heads, head_dim, kv_dim,
+                intermediate, eps,
                 is_cross=(i % self_attn_every_n != 0),
             )
             for i in range(num_layers)
@@ -159,25 +176,29 @@ def main():
     vlm_seq_len = args.vlm_seq_len
     expert_hidden = 720
     num_layers = 16
-    head_dim = 64
+    num_heads = 15
     num_kv_heads = 5
+    head_dim = 64
     kv_dim = num_kv_heads * head_dim  # 320
     action_dim = 32
     intermediate = 2048
 
     print(
-        f"SmolVLA single-head training: chunk={chunk_size}, vlm_seq={vlm_seq_len}, "
-        f"layers={num_layers}, hidden={expert_hidden}, head_dim={head_dim}",
+        f"SmolVLA GQA training: chunk={chunk_size}, vlm_seq={vlm_seq_len}, "
+        f"layers={num_layers}, hidden={expert_hidden}, "
+        f"num_heads={num_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}",
         file=sys.stderr,
     )
     print(
-        "(single-head projection matching meganeura build_action_expert_training)",
+        "(full GQA matching meganeura build_action_expert_training)",
         file=sys.stderr,
     )
 
     expert = ActionExpert(
         expert_hidden=expert_hidden,
         num_layers=num_layers,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         kv_dim=kv_dim,
         intermediate=intermediate,
@@ -245,12 +266,15 @@ def main():
 
     result = {
         "framework": "pytorch",
-        "model": "smolvla_action_expert_single_head",
+        "model": "smolvla_action_expert_gqa",
         "device": device,
         "dtype": args.dtype,
         "chunk_size": chunk_size,
         "vlm_seq_len": vlm_seq_len,
         "num_layers": num_layers,
+        "num_heads": num_heads,
+        "num_kv_heads": num_kv_heads,
+        "head_dim": head_dim,
         "fwd_avg_ms": round(fwd_avg * 1000, 2),
         "fwd_median_ms": round(fwd_median * 1000, 2),
         "train_step_avg_ms": round(train_avg * 1000, 2),
