@@ -530,8 +530,12 @@ pub enum ShaderGroup {
     Transpose,
     MatMul,
     MatMulAdd,
+    MatMulAT,
+    MatMulBT,
     MatMulCoop,
     MatMulCoopAdd,
+    MatMulCoopAT,
+    MatMulCoopBT,
     Reduce,
     Softmax,
     CrossEntropy,
@@ -546,6 +550,7 @@ pub enum ShaderGroup {
     MultiHeadAttnGradQ,
     MultiHeadAttnGradK,
     MultiHeadAttnGradV,
+    SwiGLUGrad,
 }
 
 /// Generate a `naga::Module` for a shader group.
@@ -558,8 +563,12 @@ pub fn generate_module(group: ShaderGroup) -> Module {
         ShaderGroup::Transpose => gen_transpose(),
         ShaderGroup::MatMul => gen_matmul(),
         ShaderGroup::MatMulAdd => gen_matmul_add(),
+        ShaderGroup::MatMulAT => gen_matmul_at(),
+        ShaderGroup::MatMulBT => gen_matmul_bt(),
         ShaderGroup::MatMulCoop => gen_matmul_coop(),
         ShaderGroup::MatMulCoopAdd => gen_matmul_coop_add(),
+        ShaderGroup::MatMulCoopAT => gen_matmul_coop_at(),
+        ShaderGroup::MatMulCoopBT => gen_matmul_coop_bt(),
         ShaderGroup::Reduce => gen_reduce(),
         ShaderGroup::Softmax => gen_softmax(),
         ShaderGroup::CrossEntropy => gen_cross_entropy(),
@@ -574,6 +583,7 @@ pub fn generate_module(group: ShaderGroup) -> Module {
         ShaderGroup::MultiHeadAttnGradQ => gen_mha_grad_q(),
         ShaderGroup::MultiHeadAttnGradK => gen_mha_grad_k(),
         ShaderGroup::MultiHeadAttnGradV => gen_mha_grad_v(),
+        ShaderGroup::SwiGLUGrad => gen_swiglu_grad(),
     }
 }
 
@@ -581,7 +591,10 @@ pub fn generate_module(group: ShaderGroup) -> Module {
 pub fn generate_wgsl(group: ShaderGroup) -> String {
     let module = generate_module(group);
     let capabilities = match group {
-        ShaderGroup::MatMulCoop | ShaderGroup::MatMulCoopAdd => {
+        ShaderGroup::MatMulCoop
+        | ShaderGroup::MatMulCoopAdd
+        | ShaderGroup::MatMulCoopAT
+        | ShaderGroup::MatMulCoopBT => {
             naga::valid::Capabilities::COOPERATIVE_MATRIX
                 | naga::valid::Capabilities::SHADER_FLOAT16
         }
@@ -904,6 +917,190 @@ fn gen_binary() -> Module {
         },
     );
     b.entry_point("swiglu", [256, 1, 1], func);
+
+    b.finish()
+}
+
+// ---------------------------------------------------------------------------
+// swiglu_grad: fused backward kernels for SwiGLU and Silu
+//   swiglu_grad_gate: (src_a=grad_out, src_b=gate, src_c=up) → dst
+//   swiglu_grad_up:   (src_a=grad_out, src_b=gate)            → dst
+//   silu_grad:        (src_a=grad_out, src_b=x)               → dst
+// ---------------------------------------------------------------------------
+
+fn gen_swiglu_grad() -> Module {
+    let mut b = Builder::new();
+    let ty_params = b.params_u32x4("Params", &["len", "_pad0", "_pad1", "_pad2"]);
+    let gv_src_a = b.storage_ro("src_a");
+    let gv_src_b = b.storage_ro("src_b");
+    let gv_src_c = b.storage_ro("src_c");
+    let gv_dst = b.storage_rw("dst");
+    let gv_params = b.uniform("params", ty_params);
+
+    // Helper: build sigma(x) and return (sig, silu_x) from a gate value.
+    // This is inlined in each entry point since FnBuilder can't be shared.
+
+    // --- swiglu_grad_gate: dst[i] = grad_out[i] * up[i] * dsilu(gate[i]) ---
+    // dsilu(g) = sig(g) + silu(g) * (1 - sig(g))
+    {
+        let mut f = FnBuilder::new(&b);
+        let gid = f.arg_gid();
+        let i = f.vec_x(gid);
+        f.label("i", i);
+        let params_ptr = f.global(gv_params);
+        let len_ptr = f.field(params_ptr, 0);
+        let len = f.load(len_ptr);
+        let cond = f.binary(BinaryOperator::GreaterEqual, i, len);
+
+        // Load inputs
+        let src_a_ptr = f.global(gv_src_a);
+        let a_ptr = f.index(src_a_ptr, i);
+        let grad_out = f.load(a_ptr); // grad_out[i]
+
+        let src_b_ptr = f.global(gv_src_b);
+        let b_ptr = f.index(src_b_ptr, i);
+        let gate = f.load(b_ptr); // gate[i]
+
+        let src_c_ptr = f.global(gv_src_c);
+        let c_ptr = f.index(src_c_ptr, i);
+        let up = f.load(c_ptr); // up[i]
+
+        // sig = 1 / (1 + exp(-gate))
+        let neg_gate = f.unary(UnaryOperator::Negate, gate);
+        let exp_neg = f.math1(MathFunction::Exp, neg_gate);
+        let one = f.literal_f32(1.0);
+        let denom = f.binary(BinaryOperator::Add, one, exp_neg);
+        let one2 = f.literal_f32(1.0);
+        let sig = f.binary(BinaryOperator::Divide, one2, denom);
+
+        // silu_g = gate * sig
+        let silu_g = f.binary(BinaryOperator::Multiply, gate, sig);
+
+        // dsilu_g = sig + silu_g * (1 - sig)
+        // 1 - sig = 1 + (-sig)
+        let neg_sig = f.unary(UnaryOperator::Negate, sig);
+        let one3 = f.literal_f32(1.0);
+        let one_minus_sig = f.binary(BinaryOperator::Add, one3, neg_sig);
+        let silu_times_oms = f.binary(BinaryOperator::Multiply, silu_g, one_minus_sig);
+        let dsilu_g = f.binary(BinaryOperator::Add, sig, silu_times_oms);
+
+        // result = grad_out * up * dsilu_g
+        let grad_times_up = f.binary(BinaryOperator::Multiply, grad_out, up);
+        let result = f.binary(BinaryOperator::Multiply, grad_times_up, dsilu_g);
+
+        let dst_ptr = f.global(gv_dst);
+        let dst_elem = f.index(dst_ptr, i);
+
+        f.emit(i, i);
+        f.emit(len_ptr, cond);
+        f.f.body.push(f.if_return(cond), S);
+        f.emit(src_a_ptr, result);
+        f.emit(dst_elem, dst_elem);
+        f.f.body.push(f.store(dst_elem, result), S);
+
+        b.entry_point("swiglu_grad_gate", [256, 1, 1], f.finish());
+    }
+
+    // --- swiglu_grad_up: dst[i] = grad_out[i] * silu(gate[i]) ---
+    {
+        let mut f = FnBuilder::new(&b);
+        let gid = f.arg_gid();
+        let i = f.vec_x(gid);
+        f.label("i", i);
+        let params_ptr = f.global(gv_params);
+        let len_ptr = f.field(params_ptr, 0);
+        let len = f.load(len_ptr);
+        let cond = f.binary(BinaryOperator::GreaterEqual, i, len);
+
+        let src_a_ptr = f.global(gv_src_a);
+        let a_ptr = f.index(src_a_ptr, i);
+        let grad_out = f.load(a_ptr);
+
+        let src_b_ptr = f.global(gv_src_b);
+        let b_ptr = f.index(src_b_ptr, i);
+        let gate = f.load(b_ptr);
+
+        // sig = 1 / (1 + exp(-gate))
+        let neg_gate = f.unary(UnaryOperator::Negate, gate);
+        let exp_neg = f.math1(MathFunction::Exp, neg_gate);
+        let one = f.literal_f32(1.0);
+        let denom = f.binary(BinaryOperator::Add, one, exp_neg);
+        let one2 = f.literal_f32(1.0);
+        let sig = f.binary(BinaryOperator::Divide, one2, denom);
+
+        // silu_g = gate * sig
+        let silu_g = f.binary(BinaryOperator::Multiply, gate, sig);
+
+        // result = grad_out * silu_g
+        let result = f.binary(BinaryOperator::Multiply, grad_out, silu_g);
+
+        let dst_ptr = f.global(gv_dst);
+        let dst_elem = f.index(dst_ptr, i);
+
+        f.emit(i, i);
+        f.emit(len_ptr, cond);
+        f.f.body.push(f.if_return(cond), S);
+        f.emit(src_a_ptr, result);
+        f.emit(dst_elem, dst_elem);
+        f.f.body.push(f.store(dst_elem, result), S);
+
+        b.entry_point("swiglu_grad_up", [256, 1, 1], f.finish());
+    }
+
+    // --- silu_grad: dst[i] = grad_out[i] * dsilu(x[i]) ---
+    // dsilu(x) = sig(x) + x * sig(x) * (1 - sig(x))
+    {
+        let mut f = FnBuilder::new(&b);
+        let gid = f.arg_gid();
+        let i = f.vec_x(gid);
+        f.label("i", i);
+        let params_ptr = f.global(gv_params);
+        let len_ptr = f.field(params_ptr, 0);
+        let len = f.load(len_ptr);
+        let cond = f.binary(BinaryOperator::GreaterEqual, i, len);
+
+        let src_a_ptr = f.global(gv_src_a);
+        let a_ptr = f.index(src_a_ptr, i);
+        let grad_out = f.load(a_ptr);
+
+        let src_b_ptr = f.global(gv_src_b);
+        let b_ptr = f.index(src_b_ptr, i);
+        let x_val = f.load(b_ptr);
+
+        // sig = 1 / (1 + exp(-x))
+        let neg_x = f.unary(UnaryOperator::Negate, x_val);
+        let exp_neg = f.math1(MathFunction::Exp, neg_x);
+        let one = f.literal_f32(1.0);
+        let denom = f.binary(BinaryOperator::Add, one, exp_neg);
+        let one2 = f.literal_f32(1.0);
+        let sig = f.binary(BinaryOperator::Divide, one2, denom);
+
+        // silu_x = x * sig
+        let silu_x = f.binary(BinaryOperator::Multiply, x_val, sig);
+
+        // dsilu = sig + silu_x * (1 - sig)
+        // 1 - sig = 1 + (-sig)
+        let neg_sig = f.unary(UnaryOperator::Negate, sig);
+        let one3 = f.literal_f32(1.0);
+        let one_minus_sig = f.binary(BinaryOperator::Add, one3, neg_sig);
+        let silu_times_oms = f.binary(BinaryOperator::Multiply, silu_x, one_minus_sig);
+        let dsilu = f.binary(BinaryOperator::Add, sig, silu_times_oms);
+
+        // result = grad_out * dsilu
+        let result = f.binary(BinaryOperator::Multiply, grad_out, dsilu);
+
+        let dst_ptr = f.global(gv_dst);
+        let dst_elem = f.index(dst_ptr, i);
+
+        f.emit(i, i);
+        f.emit(len_ptr, cond);
+        f.f.body.push(f.if_return(cond), S);
+        f.emit(src_a_ptr, result);
+        f.emit(dst_elem, dst_elem);
+        f.f.body.push(f.store(dst_elem, result), S);
+
+        b.entry_point("silu_grad", [256, 1, 1], f.finish());
+    }
 
     b.finish()
 }
@@ -1276,6 +1473,347 @@ fn gen_matmul_add() -> Module {
     gen_tiled_matmul_inner(true)
 }
 
+/// MatMulBT: C = A @ B^T  (A=[M,K], B=[N,K], C=[M,N])
+///
+/// Tiled 16×16 matmul where B is accessed transposed.
+/// sA loads: same as MatMul — sA[ly*16+lx] = A[(tile_row+ly)*K + (t+lx)]
+/// sB loads: transposed — sB[ly*16+lx] = B[(tile_col+ly)*K + (t+lx)]
+/// Inner product: sum += sA[ly*16+j] * sB[lx*16+j]
+/// Params: [m, n, k, _pad]
+fn gen_matmul_bt() -> Module {
+    const TILE: u32 = 16;
+
+    let mut b = Builder::new();
+    let ty_params = b.params_u32x4("Params", &["m", "n", "k", "_pad"]);
+    let gv_a = b.storage_ro("matrix_a");
+    let gv_b = b.storage_ro("matrix_b");
+    let gv_c = b.storage_rw("matrix_c");
+    let gv_params = b.uniform("params", ty_params);
+    let gv_sa = b.workgroup_array("shared_a", TILE * TILE);
+    let gv_sb = b.workgroup_array("shared_b", TILE * TILE);
+
+    let mut f = FnBuilder::new(&b);
+    let wgid = f.arg_wgid();
+    let lid = f.arg_lid();
+
+    let wg_x = f.vec_x(wgid);
+    let wg_y = f.vec_y(wgid);
+    let lx = f.vec_x(lid);
+    let ly = f.vec_y(lid);
+    f.emit(wg_x, ly);
+
+    let tile_c = f.literal_u32(TILE);
+    let tile_col = f.binary(BinaryOperator::Multiply, wg_x, tile_c);
+    let tile_c2 = f.literal_u32(TILE);
+    let tile_row = f.binary(BinaryOperator::Multiply, wg_y, tile_c2);
+    f.emit(tile_c, tile_row);
+
+    let params_ptr = f.global(gv_params);
+    let m_ptr = f.field(params_ptr, 0);
+    let pm = f.load(m_ptr);
+    let n_ptr = f.field(params_ptr, 1);
+    let pn = f.load(n_ptr);
+    let k_ptr = f.field(params_ptr, 2);
+    let pk = f.load(k_ptr);
+    f.emit(params_ptr, pk);
+
+    let zero_f = f.literal_f32(0.0);
+    f.emit(zero_f, zero_f);
+    let sum_var = f.local_var("sum", b.ty_f32, None);
+    let sum_ptr = f.local_ptr(sum_var);
+    f.f.body.push(f.store(sum_ptr, zero_f), S);
+
+    let t_var = f.local_var("t", b.ty_u32, None);
+    let zero_u = f.literal_u32(0);
+    f.emit(zero_u, zero_u);
+    let t_ptr = f.local_ptr(t_var);
+    f.f.body.push(f.store(t_ptr, zero_u), S);
+
+    // ===== K-tile loop =====
+    let mut loop_body = Block::new();
+    {
+        let t_val = f.load(t_ptr);
+        let break_cond = f.binary(BinaryOperator::GreaterEqual, t_val, pk);
+        push_emit(&f.f.expressions, &mut loop_body, t_val, break_cond);
+        loop_body.push(FnBuilder::if_break(break_cond), S);
+
+        // --- Load A tile into shared_a (same as MatMul) ---
+        // sA[ly*16+lx] = A[(tile_row+ly)*K + (t+lx)]
+        let sa_ptr = f.global(gv_sa);
+        let a_ptr = f.global(gv_a);
+        let ly_16 = f.binary(BinaryOperator::Multiply, ly, tile_c);
+        let sa_idx = f.binary(BinaryOperator::Add, ly_16, lx);
+        let sa_elem = f.index(sa_ptr, sa_idx);
+        let a_row = f.binary(BinaryOperator::Add, tile_row, ly);
+        let a_col = f.binary(BinaryOperator::Add, t_val, lx);
+        let in_m = f.binary(BinaryOperator::Less, a_row, pm);
+        let in_k = f.binary(BinaryOperator::Less, a_col, pk);
+        let a_in_bounds = f.binary(BinaryOperator::LogicalAnd, in_m, in_k);
+        let a_row_k = f.binary(BinaryOperator::Multiply, a_row, pk);
+        let a_global = f.binary(BinaryOperator::Add, a_row_k, a_col);
+        let a_elem = f.index(a_ptr, a_global);
+        let a_val = f.load(a_elem);
+        let zero_pad_a = f.literal_f32(0.0);
+        let a_selected = f.select(a_in_bounds, a_val, zero_pad_a);
+        push_emit(&f.f.expressions, &mut loop_body, sa_ptr, a_selected);
+        loop_body.push(f.store(sa_elem, a_selected), S);
+
+        // --- Load B tile into shared_b (transposed: B[n_local, k_local]) ---
+        // sB[ly*16+lx] = B[(tile_col+ly)*K + (t+lx)]
+        let sb_ptr = f.global(gv_sb);
+        let b_ptr = f.global(gv_b);
+        let sb_elem = f.index(sb_ptr, sa_idx); // same local index
+        let b_row = f.binary(BinaryOperator::Add, tile_col, ly); // row in N dimension
+        let b_col = f.binary(BinaryOperator::Add, t_val, lx); // col in K dimension
+        let b_in_n = f.binary(BinaryOperator::Less, b_row, pn);
+        let b_in_k = f.binary(BinaryOperator::Less, b_col, pk);
+        let b_in_bounds = f.binary(BinaryOperator::LogicalAnd, b_in_n, b_in_k);
+        let b_row_k = f.binary(BinaryOperator::Multiply, b_row, pk); // stride is K (not N)
+        let b_global = f.binary(BinaryOperator::Add, b_row_k, b_col);
+        let b_elem = f.index(b_ptr, b_global);
+        let b_val = f.load(b_elem);
+        let zero_pad_b = f.literal_f32(0.0);
+        let b_selected = f.select(b_in_bounds, b_val, zero_pad_b);
+        push_emit(&f.f.expressions, &mut loop_body, sb_ptr, b_selected);
+        loop_body.push(f.store(sb_elem, b_selected), S);
+
+        loop_body.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
+
+        // --- Accumulate: sum += sA[ly*16+j] * sB[lx*16+j] ---
+        // (sB indexed as [col_local][k], because sB[lx*16+j] = B[tile_col+lx][t+j])
+        for j in 0..TILE {
+            let j_c = f.literal_u32(j);
+            let ly_tile = f.binary(BinaryOperator::Multiply, ly, tile_c);
+            let sa_j = f.binary(BinaryOperator::Add, ly_tile, j_c);
+            let sa_j_elem = f.index(sa_ptr, sa_j);
+            let sa_j_val = f.load(sa_j_elem);
+
+            // sB[lx*16+j]: col_local=lx, k_local=j
+            let lx_tile = f.binary(BinaryOperator::Multiply, lx, tile_c);
+            let sb_j = f.binary(BinaryOperator::Add, lx_tile, j_c);
+            let sb_j_elem = f.index(sb_ptr, sb_j);
+            let sb_j_val = f.load(sb_j_elem);
+
+            let prod = f.binary(BinaryOperator::Multiply, sa_j_val, sb_j_val);
+            let old_sum = f.load(sum_ptr);
+            let new_sum = f.binary(BinaryOperator::Add, old_sum, prod);
+            push_emit(&f.f.expressions, &mut loop_body, j_c, new_sum);
+            loop_body.push(f.store(sum_ptr, new_sum), S);
+        }
+
+        loop_body.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
+
+        let tile_inc = f.literal_u32(TILE);
+        let t_val2 = f.load(t_ptr);
+        let t_next = f.binary(BinaryOperator::Add, t_val2, tile_inc);
+        push_emit(&f.f.expressions, &mut loop_body, tile_inc, t_next);
+        loop_body.push(f.store(t_ptr, t_next), S);
+    }
+
+    f.f.body.push(
+        Statement::Loop {
+            body: loop_body,
+            continuing: Block::new(),
+            break_if: None,
+        },
+        S,
+    );
+
+    let row = f.binary(BinaryOperator::Add, tile_row, ly);
+    let col = f.binary(BinaryOperator::Add, tile_col, lx);
+    let r_lt_m = f.binary(BinaryOperator::Less, row, pm);
+    let c_lt_n = f.binary(BinaryOperator::Less, col, pn);
+    let store_cond = f.binary(BinaryOperator::LogicalAnd, r_lt_m, c_lt_n);
+    let row_n = f.binary(BinaryOperator::Multiply, row, pn);
+    let c_idx = f.binary(BinaryOperator::Add, row_n, col);
+    let c_ptr = f.global(gv_c);
+    let c_elem = f.index(c_ptr, c_idx);
+    let final_sum = f.load(sum_ptr);
+    f.emit(row, final_sum);
+
+    f.f.body.push(
+        Statement::If {
+            condition: store_cond,
+            accept: Block::from_vec(vec![f.store(c_elem, final_sum)]),
+            reject: Block::new(),
+        },
+        S,
+    );
+
+    b.entry_point("main", [16, 16, 1], f.finish());
+    b.finish()
+}
+
+/// MatMulAT: C = A^T @ B  (A=[K,M], B=[K,N], C=[M,N])
+///
+/// Tiled 16×16 matmul where A is accessed transposed.
+/// sA loads: transposed — sA[ly*16+lx] = A[(t+ly)*M + (tile_row+lx)]
+/// sB loads: same as MatMul — sB[ly*16+lx] = B[(t+ly)*N + (tile_col+lx)]
+/// Inner product: sum += sA[j*16+ly] * sB[j*16+lx]
+/// Params: [m, n, k, _pad]
+fn gen_matmul_at() -> Module {
+    const TILE: u32 = 16;
+
+    let mut b = Builder::new();
+    let ty_params = b.params_u32x4("Params", &["m", "n", "k", "_pad"]);
+    let gv_a = b.storage_ro("matrix_a");
+    let gv_b = b.storage_ro("matrix_b");
+    let gv_c = b.storage_rw("matrix_c");
+    let gv_params = b.uniform("params", ty_params);
+    let gv_sa = b.workgroup_array("shared_a", TILE * TILE);
+    let gv_sb = b.workgroup_array("shared_b", TILE * TILE);
+
+    let mut f = FnBuilder::new(&b);
+    let wgid = f.arg_wgid();
+    let lid = f.arg_lid();
+
+    let wg_x = f.vec_x(wgid);
+    let wg_y = f.vec_y(wgid);
+    let lx = f.vec_x(lid);
+    let ly = f.vec_y(lid);
+    f.emit(wg_x, ly);
+
+    let tile_c = f.literal_u32(TILE);
+    let tile_col = f.binary(BinaryOperator::Multiply, wg_x, tile_c);
+    let tile_c2 = f.literal_u32(TILE);
+    let tile_row = f.binary(BinaryOperator::Multiply, wg_y, tile_c2);
+    f.emit(tile_c, tile_row);
+
+    let params_ptr = f.global(gv_params);
+    let m_ptr = f.field(params_ptr, 0);
+    let pm = f.load(m_ptr);
+    let n_ptr = f.field(params_ptr, 1);
+    let pn = f.load(n_ptr);
+    let k_ptr = f.field(params_ptr, 2);
+    let pk = f.load(k_ptr);
+    f.emit(params_ptr, pk);
+
+    let zero_f = f.literal_f32(0.0);
+    f.emit(zero_f, zero_f);
+    let sum_var = f.local_var("sum", b.ty_f32, None);
+    let sum_ptr = f.local_ptr(sum_var);
+    f.f.body.push(f.store(sum_ptr, zero_f), S);
+
+    let t_var = f.local_var("t", b.ty_u32, None);
+    let zero_u = f.literal_u32(0);
+    f.emit(zero_u, zero_u);
+    let t_ptr = f.local_ptr(t_var);
+    f.f.body.push(f.store(t_ptr, zero_u), S);
+
+    // ===== K-tile loop =====
+    let mut loop_body = Block::new();
+    {
+        let t_val = f.load(t_ptr);
+        let break_cond = f.binary(BinaryOperator::GreaterEqual, t_val, pk);
+        push_emit(&f.f.expressions, &mut loop_body, t_val, break_cond);
+        loop_body.push(FnBuilder::if_break(break_cond), S);
+
+        // --- Load A tile into shared_a (transposed: A[k_local, row_local]) ---
+        // sA[ly*16+lx] = A[(t+ly)*M + (tile_row+lx)]
+        let sa_ptr = f.global(gv_sa);
+        let a_ptr = f.global(gv_a);
+        let ly_16 = f.binary(BinaryOperator::Multiply, ly, tile_c);
+        let sa_idx = f.binary(BinaryOperator::Add, ly_16, lx);
+        let sa_elem = f.index(sa_ptr, sa_idx);
+        let a_row = f.binary(BinaryOperator::Add, t_val, ly); // k_local = t + ly
+        let a_col = f.binary(BinaryOperator::Add, tile_row, lx); // row_local = tile_row + lx
+        let in_k = f.binary(BinaryOperator::Less, a_row, pk); // a_row < K
+        let in_m = f.binary(BinaryOperator::Less, a_col, pm); // a_col < M
+        let a_in_bounds = f.binary(BinaryOperator::LogicalAnd, in_k, in_m);
+        let a_row_m = f.binary(BinaryOperator::Multiply, a_row, pm); // stride is M (not K)
+        let a_global = f.binary(BinaryOperator::Add, a_row_m, a_col);
+        let a_elem = f.index(a_ptr, a_global);
+        let a_val = f.load(a_elem);
+        let zero_pad_a = f.literal_f32(0.0);
+        let a_selected = f.select(a_in_bounds, a_val, zero_pad_a);
+        push_emit(&f.f.expressions, &mut loop_body, sa_ptr, a_selected);
+        loop_body.push(f.store(sa_elem, a_selected), S);
+
+        // --- Load B tile into shared_b (same as MatMul) ---
+        // sB[ly*16+lx] = B[(t+ly)*N + (tile_col+lx)]
+        let sb_ptr = f.global(gv_sb);
+        let b_ptr = f.global(gv_b);
+        let sb_elem = f.index(sb_ptr, sa_idx); // same local index
+        let b_row = f.binary(BinaryOperator::Add, t_val, ly);
+        let b_col = f.binary(BinaryOperator::Add, tile_col, lx);
+        let b_in_k = f.binary(BinaryOperator::Less, b_row, pk);
+        let b_in_n = f.binary(BinaryOperator::Less, b_col, pn);
+        let b_in_bounds = f.binary(BinaryOperator::LogicalAnd, b_in_k, b_in_n);
+        let b_row_n = f.binary(BinaryOperator::Multiply, b_row, pn);
+        let b_global = f.binary(BinaryOperator::Add, b_row_n, b_col);
+        let b_elem = f.index(b_ptr, b_global);
+        let b_val = f.load(b_elem);
+        let zero_pad_b = f.literal_f32(0.0);
+        let b_selected = f.select(b_in_bounds, b_val, zero_pad_b);
+        push_emit(&f.f.expressions, &mut loop_body, sb_ptr, b_selected);
+        loop_body.push(f.store(sb_elem, b_selected), S);
+
+        loop_body.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
+
+        // --- Accumulate: sum += sA[j*16+ly] * sB[j*16+lx] ---
+        // sA[j*16+ly]: k_tile_idx=j, row_local=ly  (transposed tile)
+        // sB[j*16+lx]: k_tile_idx=j, col_local=lx
+        for j in 0..TILE {
+            let j_c = f.literal_u32(j);
+            let j_tile = f.binary(BinaryOperator::Multiply, j_c, tile_c);
+            let sa_j = f.binary(BinaryOperator::Add, j_tile, ly); // sA[j*16+ly]
+            let sa_j_elem = f.index(sa_ptr, sa_j);
+            let sa_j_val = f.load(sa_j_elem);
+
+            let sb_j = f.binary(BinaryOperator::Add, j_tile, lx); // sB[j*16+lx]
+            let sb_j_elem = f.index(sb_ptr, sb_j);
+            let sb_j_val = f.load(sb_j_elem);
+
+            let prod = f.binary(BinaryOperator::Multiply, sa_j_val, sb_j_val);
+            let old_sum = f.load(sum_ptr);
+            let new_sum = f.binary(BinaryOperator::Add, old_sum, prod);
+            push_emit(&f.f.expressions, &mut loop_body, j_c, new_sum);
+            loop_body.push(f.store(sum_ptr, new_sum), S);
+        }
+
+        loop_body.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
+
+        let tile_inc = f.literal_u32(TILE);
+        let t_val2 = f.load(t_ptr);
+        let t_next = f.binary(BinaryOperator::Add, t_val2, tile_inc);
+        push_emit(&f.f.expressions, &mut loop_body, tile_inc, t_next);
+        loop_body.push(f.store(t_ptr, t_next), S);
+    }
+
+    f.f.body.push(
+        Statement::Loop {
+            body: loop_body,
+            continuing: Block::new(),
+            break_if: None,
+        },
+        S,
+    );
+
+    let row = f.binary(BinaryOperator::Add, tile_row, ly);
+    let col = f.binary(BinaryOperator::Add, tile_col, lx);
+    let r_lt_m = f.binary(BinaryOperator::Less, row, pm);
+    let c_lt_n = f.binary(BinaryOperator::Less, col, pn);
+    let store_cond = f.binary(BinaryOperator::LogicalAnd, r_lt_m, c_lt_n);
+    let row_n = f.binary(BinaryOperator::Multiply, row, pn);
+    let c_idx = f.binary(BinaryOperator::Add, row_n, col);
+    let c_ptr = f.global(gv_c);
+    let c_elem = f.index(c_ptr, c_idx);
+    let final_sum = f.load(sum_ptr);
+    f.emit(row, final_sum);
+
+    f.f.body.push(
+        Statement::If {
+            condition: store_cond,
+            accept: Block::from_vec(vec![f.store(c_elem, final_sum)]),
+            reject: Block::new(),
+        },
+        S,
+    );
+
+    b.entry_point("main", [16, 16, 1], f.finish());
+    b.finish()
+}
+
 // ---------------------------------------------------------------------------
 // matmul_coop.wgsl — cooperative matrix multiply (16×16 tiles)
 //
@@ -1309,16 +1847,37 @@ fn gen_matmul_add() -> Module {
 ///
 /// Workgroup [64, 1, 1], dispatched as [ceil(M/16), ceil(N/16), 1].
 fn gen_matmul_coop() -> Module {
-    gen_matmul_coop_inner(false)
+    gen_matmul_coop_inner(false, MatMulCoopVariant::Normal)
 }
 
 /// Cooperative matmul with fused addend: C = A × B + D.
 /// Same as gen_matmul_coop but loads the accumulator from a 4th buffer.
 fn gen_matmul_coop_add() -> Module {
-    gen_matmul_coop_inner(true)
+    gen_matmul_coop_inner(true, MatMulCoopVariant::Normal)
 }
 
-fn gen_matmul_coop_inner(fused_add: bool) -> Module {
+/// Cooperative matmul: C = A @ B^T  (A=[M,K], B=[N,K], C=[M,N])
+fn gen_matmul_coop_bt() -> Module {
+    gen_matmul_coop_inner(false, MatMulCoopVariant::BT)
+}
+
+/// Cooperative matmul: C = A^T @ B  (A=[K,M], B=[K,N], C=[M,N])
+fn gen_matmul_coop_at() -> Module {
+    gen_matmul_coop_inner(false, MatMulCoopVariant::AT)
+}
+
+/// Variant selector for gen_matmul_coop_inner.
+#[derive(Clone, Copy, PartialEq)]
+enum MatMulCoopVariant {
+    /// C = A @ B  (standard)
+    Normal,
+    /// C = A @ B^T  (B is [N,K], accessed transposed)
+    BT,
+    /// C = A^T @ B  (A is [K,M], accessed transposed)
+    AT,
+}
+
+fn gen_matmul_coop_inner(fused_add: bool, variant: MatMulCoopVariant) -> Module {
     const TILE: u32 = 16;
     const TILE_ELEMS: u32 = TILE * TILE; // 256
     const WG_SIZE: u32 = 64;
@@ -1640,8 +2199,18 @@ fn gen_matmul_coop_inner(fused_add: bool) -> Module {
             let in_k_b = f.binary(BinaryOperator::Less, tr, pk);
             let in_bounds = f.binary(BinaryOperator::LogicalAnd, in_k_b, in_n);
             push_emit(&f.f.expressions, &mut loop_body, offset, in_bounds);
-            let trn = f.binary(BinaryOperator::Multiply, tr, pn);
-            let global_idx = f.binary(BinaryOperator::Add, trn, cc);
+            // Normal: B[tr, cc] (B is [K,N]) → tr*N + cc
+            // BT:     B[cc, tr] (B is [N,K]) → cc*K + tr
+            let trn = if variant == MatMulCoopVariant::BT {
+                f.binary(BinaryOperator::Multiply, cc, pk)
+            } else {
+                f.binary(BinaryOperator::Multiply, tr, pn)
+            };
+            let global_idx = if variant == MatMulCoopVariant::BT {
+                f.binary(BinaryOperator::Add, trn, tr)
+            } else {
+                f.binary(BinaryOperator::Add, trn, cc)
+            };
             let b_elem = f.index(b_ptr0, global_idx);
             let b_val = f.load(b_elem);
             let b_f16 = f.expr(Expression::As {
@@ -1684,8 +2253,16 @@ fn gen_matmul_coop_inner(fused_add: bool) -> Module {
             let in_k_b1 = f.binary(BinaryOperator::Less, tr1, pk);
             let in_bounds1 = f.binary(BinaryOperator::LogicalAnd, in_k_b1, in_n1);
             push_emit(&f.f.expressions, &mut loop_body, offset1, in_bounds1);
-            let trn1 = f.binary(BinaryOperator::Multiply, tr1, pn);
-            let global_idx1 = f.binary(BinaryOperator::Add, trn1, cc1);
+            let trn1 = if variant == MatMulCoopVariant::BT {
+                f.binary(BinaryOperator::Multiply, cc1, pk)
+            } else {
+                f.binary(BinaryOperator::Multiply, tr1, pn)
+            };
+            let global_idx1 = if variant == MatMulCoopVariant::BT {
+                f.binary(BinaryOperator::Add, trn1, tr1)
+            } else {
+                f.binary(BinaryOperator::Add, trn1, cc1)
+            };
             let b_elem1 = f.index(b_ptr1, global_idx1);
             let b_val1 = f.load(b_elem1);
             let b_f16_1 = f.expr(Expression::As {
@@ -1730,8 +2307,18 @@ fn gen_matmul_coop_inner(fused_add: bool) -> Module {
             let in_m0 = f.binary(BinaryOperator::Less, gr0, pm);
             let in_bounds2 = f.binary(BinaryOperator::LogicalAnd, in_m0, in_k_a);
             push_emit(&f.f.expressions, &mut loop_body, offset2, in_bounds2);
-            let gr0k = f.binary(BinaryOperator::Multiply, gr0, pk);
-            let global_idx2 = f.binary(BinaryOperator::Add, gr0k, tc_a);
+            // Normal/BT: A[gr0, tc_a] (A is [M,K]) → gr0*K + tc_a
+            // AT:        A[tc_a, gr0] (A is [K,M]) → tc_a*M + gr0
+            let gr0k = if variant == MatMulCoopVariant::AT {
+                f.binary(BinaryOperator::Multiply, tc_a, pm)
+            } else {
+                f.binary(BinaryOperator::Multiply, gr0, pk)
+            };
+            let global_idx2 = if variant == MatMulCoopVariant::AT {
+                f.binary(BinaryOperator::Add, gr0k, gr0)
+            } else {
+                f.binary(BinaryOperator::Add, gr0k, tc_a)
+            };
             let a_elem0 = f.index(a_ptr0, global_idx2);
             let a_val0 = f.load(a_elem0);
             let a_f16_0 = f.expr(Expression::As {
@@ -1774,8 +2361,16 @@ fn gen_matmul_coop_inner(fused_add: bool) -> Module {
             let in_m1 = f.binary(BinaryOperator::Less, gr1, pm);
             let in_bounds3 = f.binary(BinaryOperator::LogicalAnd, in_m1, in_k_a);
             push_emit(&f.f.expressions, &mut loop_body, offset3, in_bounds3);
-            let gr1k = f.binary(BinaryOperator::Multiply, gr1, pk);
-            let global_idx3 = f.binary(BinaryOperator::Add, gr1k, tc_a);
+            let gr1k = if variant == MatMulCoopVariant::AT {
+                f.binary(BinaryOperator::Multiply, tc_a, pm)
+            } else {
+                f.binary(BinaryOperator::Multiply, gr1, pk)
+            };
+            let global_idx3 = if variant == MatMulCoopVariant::AT {
+                f.binary(BinaryOperator::Add, gr1k, gr1)
+            } else {
+                f.binary(BinaryOperator::Add, gr1k, tc_a)
+            };
             let a_elem1 = f.index(a_ptr1, global_idx3);
             let a_val1 = f.load(a_elem1);
             let a_f16_1 = f.expr(Expression::As {
@@ -3862,7 +4457,8 @@ fn gen_mha_grad_q() -> Module {
     let wg_tid = f.index(wg_ptr, tid);
     f.emit(wg_tid, wg_tid);
     f.f.body.push(f.store(wg_tid, row_partial), S);
-    f.f.body.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
+    f.f.body
+        .push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
     for stride_val in [32u32, 16, 8, 4, 2, 1] {
         let stride = f.literal_u32(stride_val);
         let cond_s = f.binary(BinaryOperator::Less, tid, stride);
@@ -3882,7 +4478,8 @@ fn gen_mha_grad_q() -> Module {
             },
             S,
         );
-        f.f.body.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
+        f.f.body
+            .push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
     }
     let wg_p0 = f.global(gv_wg);
     let z_idx = f.literal_u32(0);
@@ -4685,6 +5282,8 @@ mod tests {
             (ShaderGroup::Transpose, naga::valid::Capabilities::empty()),
             (ShaderGroup::MatMul, naga::valid::Capabilities::empty()),
             (ShaderGroup::MatMulAdd, naga::valid::Capabilities::empty()),
+            (ShaderGroup::MatMulAT, naga::valid::Capabilities::empty()),
+            (ShaderGroup::MatMulBT, naga::valid::Capabilities::empty()),
             (
                 ShaderGroup::MatMulCoop,
                 naga::valid::Capabilities::COOPERATIVE_MATRIX
@@ -4692,6 +5291,16 @@ mod tests {
             ),
             (
                 ShaderGroup::MatMulCoopAdd,
+                naga::valid::Capabilities::COOPERATIVE_MATRIX
+                    | naga::valid::Capabilities::SHADER_FLOAT16,
+            ),
+            (
+                ShaderGroup::MatMulCoopAT,
+                naga::valid::Capabilities::COOPERATIVE_MATRIX
+                    | naga::valid::Capabilities::SHADER_FLOAT16,
+            ),
+            (
+                ShaderGroup::MatMulCoopBT,
                 naga::valid::Capabilities::COOPERATIVE_MATRIX
                     | naga::valid::Capabilities::SHADER_FLOAT16,
             ),
@@ -4733,6 +5342,7 @@ mod tests {
                 ShaderGroup::MultiHeadAttnGradV,
                 naga::valid::Capabilities::empty(),
             ),
+            (ShaderGroup::SwiGLUGrad, naga::valid::Capabilities::empty()),
         ];
 
         let flags = naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
@@ -4803,8 +5413,12 @@ mod tests {
             (ShaderGroup::Transpose, empty),
             (ShaderGroup::MatMul, empty),
             (ShaderGroup::MatMulAdd, empty),
+            (ShaderGroup::MatMulAT, empty),
+            (ShaderGroup::MatMulBT, empty),
             (ShaderGroup::MatMulCoop, coop),
             (ShaderGroup::MatMulCoopAdd, coop),
+            (ShaderGroup::MatMulCoopAT, coop),
+            (ShaderGroup::MatMulCoopBT, coop),
             (ShaderGroup::Reduce, empty),
             (ShaderGroup::Softmax, empty),
             (ShaderGroup::CrossEntropy, empty),
@@ -4815,6 +5429,7 @@ mod tests {
             (ShaderGroup::LayerNorm, empty),
             (ShaderGroup::FullAttention, empty),
             (ShaderGroup::CrossAttention, empty),
+            (ShaderGroup::SwiGLUGrad, empty),
         ];
 
         let flags = naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
@@ -4830,7 +5445,13 @@ mod tests {
         let mut failed = Vec::new();
         for &(group, caps) in groups {
             // See note in all_shaders_generate_valid_modules
-            if group == ShaderGroup::MatMulCoop || group == ShaderGroup::MatMulCoopAdd {
+            if matches!(
+                group,
+                ShaderGroup::MatMulCoop
+                    | ShaderGroup::MatMulCoopAdd
+                    | ShaderGroup::MatMulCoopAT
+                    | ShaderGroup::MatMulCoopBT
+            ) {
                 continue;
             }
             let module = generate_module(group);
@@ -4882,7 +5503,9 @@ mod tests {
         // builtin args are not bound by blade and can be ignored.
         fn expected_globals(entry: &ShaderEntry) -> Vec<&'static str> {
             match entry {
-                ShaderEntry::MatMul => vec!["matrix_a", "matrix_b", "matrix_c", "params"],
+                ShaderEntry::MatMul | ShaderEntry::MatMulAT | ShaderEntry::MatMulBT => {
+                    vec!["matrix_a", "matrix_b", "matrix_c", "params"]
+                }
                 ShaderEntry::FusedMatMulAdd => {
                     vec!["matrix_a", "matrix_b", "matrix_c", "src", "params"]
                 }
@@ -4923,11 +5546,17 @@ mod tests {
                         "d_out", "src_a", "src_b", "bias", "lse", "fwd_dst", "dst", "params",
                     ]
                 }
+                // All three SwiGLUGrad entries share the same module globals
+                ShaderEntry::SwiGLUGradGate | ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => {
+                    vec!["src_a", "src_b", "src_c", "dst", "params"]
+                }
             }
         }
 
         let entries = [
             ShaderEntry::MatMul,
+            ShaderEntry::MatMulAT,
+            ShaderEntry::MatMulBT,
             ShaderEntry::FusedMatMulAdd,
             ShaderEntry::Relu,
             ShaderEntry::Sigmoid,
@@ -4955,6 +5584,9 @@ mod tests {
             ShaderEntry::MultiHeadAttnGradQ,
             ShaderEntry::MultiHeadAttnGradK,
             ShaderEntry::MultiHeadAttnGradV,
+            ShaderEntry::SwiGLUGradGate,
+            ShaderEntry::SwiGLUGradUp,
+            ShaderEntry::SiluGrad,
         ];
 
         for entry in &entries {

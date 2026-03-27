@@ -74,6 +74,16 @@ struct BinaryData {
     params: UnaryParams, // same layout: len + padding
 }
 
+// ternary (swiglu_grad_gate): var src_a, src_b, src_c, dst, params
+#[derive(blade_macros::ShaderData)]
+struct TernaryData {
+    src_a: blade_graphics::BufferPiece,
+    src_b: blade_graphics::BufferPiece,
+    src_c: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: UnaryParams,
+}
+
 // bias_add: var src, bias, dst, params
 #[derive(blade_macros::ShaderData)]
 struct BiasAddData {
@@ -236,19 +246,31 @@ impl Pipelines {
         let mut needed: HashMap<ShaderGroup, Vec<&ShaderEntry>> = HashMap::new();
         for dispatch in &plan.dispatches {
             let mut group = dispatch.shader.shader_group();
-            // Upgrade MatMul/MatMulAdd to cooperative matrix path if supported AND
+            // Upgrade matmul ops to cooperative matrix path if supported AND
             // the dispatch has enough workgroups for coop to be efficient.
-            if use_coop_matmul && (group == ShaderGroup::MatMul || group == ShaderGroup::MatMulAdd)
-            {
-                let m = dispatch.params[0];
-                let n = dispatch.params[2];
-                let coop_wgs = ceil_div(m, 32) * ceil_div(n, 32);
-                if coop_wgs >= MIN_COOP_WORKGROUPS {
-                    group = if group == ShaderGroup::MatMul {
-                        ShaderGroup::MatMulCoop
-                    } else {
-                        ShaderGroup::MatMulCoopAdd
-                    };
+            // MatMul/FusedMatMulAdd: params=[m,k,n,0] → n at index 2.
+            // MatMulAT/MatMulBT:    params=[m,n,k,0] → n at index 1.
+            if use_coop_matmul {
+                let (m, n) = match group {
+                    ShaderGroup::MatMul | ShaderGroup::MatMulAdd => {
+                        (dispatch.params[0], dispatch.params[2])
+                    }
+                    ShaderGroup::MatMulAT | ShaderGroup::MatMulBT => {
+                        (dispatch.params[0], dispatch.params[1])
+                    }
+                    _ => (0, 0),
+                };
+                if m > 0 {
+                    let coop_wgs = ceil_div(m, 32) * ceil_div(n, 32);
+                    if coop_wgs >= MIN_COOP_WORKGROUPS {
+                        group = match group {
+                            ShaderGroup::MatMul => ShaderGroup::MatMulCoop,
+                            ShaderGroup::MatMulAdd => ShaderGroup::MatMulCoopAdd,
+                            ShaderGroup::MatMulAT => ShaderGroup::MatMulCoopAT,
+                            ShaderGroup::MatMulBT => ShaderGroup::MatMulCoopBT,
+                            _ => unreachable!(),
+                        };
+                    }
                 }
             }
             needed.entry(group).or_default().push(&dispatch.shader);
@@ -288,7 +310,7 @@ impl Pipelines {
 fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
     use blade_graphics::ShaderData;
     match *entry {
-        ShaderEntry::MatMul => MatMulData::layout(),
+        ShaderEntry::MatMul | ShaderEntry::MatMulAT | ShaderEntry::MatMulBT => MatMulData::layout(),
         ShaderEntry::FusedMatMulAdd => FusedMatMulAddData::layout(),
         ShaderEntry::Relu | ShaderEntry::Sigmoid | ShaderEntry::Neg | ShaderEntry::Silu => {
             UnaryData::layout()
@@ -313,6 +335,8 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::MultiHeadAttnGradQ
         | ShaderEntry::MultiHeadAttnGradK
         | ShaderEntry::MultiHeadAttnGradV => MultiHeadAttnGradData::layout(),
+        ShaderEntry::SwiGLUGradGate => TernaryData::layout(),
+        ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => BinaryData::layout(),
     }
 }
 
@@ -400,6 +424,9 @@ pub struct Session {
     /// Nanosecond offset (in profiler time) of the most recent GPU submit,
     /// used to place GPU pass timings on the GPU track.
     last_submit_ns: u64,
+    /// When true, run in multi-pass mode: one compute pass per dispatch
+    /// with individual GPU timestamps. Enables `dump_gpu_timings()`.
+    profiling: bool,
 }
 
 impl Session {
@@ -555,18 +582,22 @@ impl Session {
             // Only upgrade dispatches where the coop WG count meets the occupancy
             // threshold; small matmuls (e.g. SmolVLA's m=50) are left on the scalar
             // path which is faster at low parallelism.
+            // MatMul/FusedMatMulAdd: params=[m,k,n,0]; MatMulAT/BT: params=[m,n,k,0].
             for dispatch in &mut plan.dispatches {
-                if dispatch.shader == ShaderEntry::MatMul
-                    || dispatch.shader == ShaderEntry::FusedMatMulAdd
-                {
-                    let m = dispatch.params[0];
-                    let n = dispatch.params[2];
-                    let coop_wgs = ceil_div(m, 32) * ceil_div(n, 32);
-                    if coop_wgs >= MIN_COOP_WORKGROUPS {
-                        dispatch.workgroups = [ceil_div(m, 32), ceil_div(n, 32), 1];
+                let (m, n) = match dispatch.shader {
+                    ShaderEntry::MatMul | ShaderEntry::FusedMatMulAdd => {
+                        (dispatch.params[0], dispatch.params[2])
                     }
-                    // else: keep scalar workgroups [ceil(n/16), ceil(m/16), 1]
+                    ShaderEntry::MatMulAT | ShaderEntry::MatMulBT => {
+                        (dispatch.params[0], dispatch.params[1])
+                    }
+                    _ => continue,
+                };
+                let coop_wgs = ceil_div(m, 32) * ceil_div(n, 32);
+                if coop_wgs >= MIN_COOP_WORKGROUPS {
+                    dispatch.workgroups = [ceil_div(m, 32), ceil_div(n, 32), 1];
                 }
+                // else: keep scalar workgroups [ceil(n/16), ceil(m/16), 1]
             }
         }
 
@@ -618,7 +649,18 @@ impl Session {
             encoder,
             sync_point: None,
             last_submit_ns: 0,
+            profiling: false,
         }
+    }
+
+    /// Enable or disable per-dispatch GPU profiling.
+    ///
+    /// When enabled, `step()` runs one compute pass per dispatch with
+    /// individual GPU timestamps. Call `dump_gpu_timings()` after the
+    /// *next* `step()` to see per-pass timings from the profiled run.
+    /// Note: blade limits timestamps to 100 passes per submission.
+    pub fn set_profiling(&mut self, enabled: bool) {
+        self.profiling = enabled;
     }
 
     /// Upload parameter data to GPU buffers.
@@ -756,9 +798,10 @@ impl Session {
         // After start(), blade exposes GPU timings from the *previous* submission.
         self.drain_gpu_timings();
 
-        if std::env::var("MEGANEURA_MULTI_PASS").is_ok() {
+        if self.profiling {
             // Multi-pass mode: one compute pass per dispatch with per-pass barriers
-            // and GPU timestamps. Useful for profiling (dump_gpu_timings).
+            // and GPU timestamps. Enables dump_gpu_timings() after the next step().
+            // Note: blade caps timestamps at 100 passes per submission.
             for i in 0..self.plan.dispatches.len() {
                 let dispatch = &self.plan.dispatches[i];
                 let pipeline = self.pipelines.get(&dispatch.shader);
@@ -808,6 +851,23 @@ impl Session {
                             m: dispatch.params[0],
                             n: dispatch.params[2],
                             k: dispatch.params[1],
+                            _pad: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::MatMulAT | ShaderEntry::MatMulBT => {
+                // params layout: [m, n, k, 0]
+                pc.bind(
+                    0,
+                    &MatMulData {
+                        matrix_a: buf(dispatch.input_buffers[0]),
+                        matrix_b: buf(dispatch.input_buffers[1]),
+                        matrix_c: buf(dispatch.output_buffer),
+                        params: MatMulParams {
+                            m: dispatch.params[0],
+                            n: dispatch.params[1],
+                            k: dispatch.params[2],
                             _pad: 0,
                         },
                     },
@@ -1064,7 +1124,9 @@ impl Session {
                         src_b: buf(dispatch.input_buffers[1]),
                         bias: buf(dispatch.input_buffers[2]),
                         dst: buf(dispatch.output_buffer),
-                        lse: buf(dispatch.extra_output.expect("MultiHeadAttn needs extra_output")),
+                        lse: buf(dispatch
+                            .extra_output
+                            .expect("MultiHeadAttn needs extra_output")),
                         params: MatMulParams {
                             m: dispatch.params[0],
                             n: dispatch.params[1],
@@ -1092,6 +1154,55 @@ impl Session {
                             n: dispatch.params[1],
                             k: dispatch.params[2],
                             _pad: dispatch.params[3],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::SwiGLUGradGate => {
+                pc.bind(
+                    0,
+                    &TernaryData {
+                        src_a: buf(dispatch.input_buffers[0]), // grad_out
+                        src_b: buf(dispatch.input_buffers[1]), // gate
+                        src_c: buf(dispatch.input_buffers[2]), // up
+                        dst: buf(dispatch.output_buffer),
+                        params: UnaryParams {
+                            len: dispatch.params[0],
+                            _pad0: 0,
+                            _pad1: 0,
+                            _pad2: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::SwiGLUGradUp => {
+                pc.bind(
+                    0,
+                    &BinaryData {
+                        src_a: buf(dispatch.input_buffers[0]), // grad_out
+                        src_b: buf(dispatch.input_buffers[1]), // gate
+                        dst: buf(dispatch.output_buffer),
+                        params: UnaryParams {
+                            len: dispatch.params[0],
+                            _pad0: 0,
+                            _pad1: 0,
+                            _pad2: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::SiluGrad => {
+                pc.bind(
+                    0,
+                    &BinaryData {
+                        src_a: buf(dispatch.input_buffers[0]), // grad_out
+                        src_b: buf(dispatch.input_buffers[1]), // x
+                        dst: buf(dispatch.output_buffer),
+                        params: UnaryParams {
+                            len: dispatch.params[0],
+                            _pad0: 0,
+                            _pad1: 0,
+                            _pad2: 0,
                         },
                     },
                 );
