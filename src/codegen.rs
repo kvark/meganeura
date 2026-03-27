@@ -542,6 +542,10 @@ pub enum ShaderGroup {
     LayerNorm,
     FullAttention,
     CrossAttention,
+    MultiHeadAttn,
+    MultiHeadAttnGradQ,
+    MultiHeadAttnGradK,
+    MultiHeadAttnGradV,
 }
 
 /// Generate a `naga::Module` for a shader group.
@@ -566,6 +570,10 @@ pub fn generate_module(group: ShaderGroup) -> Module {
         ShaderGroup::LayerNorm => gen_layer_norm(),
         ShaderGroup::FullAttention => gen_full_attention(),
         ShaderGroup::CrossAttention => gen_cross_attention(),
+        ShaderGroup::MultiHeadAttn => gen_mha_forward(),
+        ShaderGroup::MultiHeadAttnGradQ => gen_mha_grad_q(),
+        ShaderGroup::MultiHeadAttnGradK => gen_mha_grad_k(),
+        ShaderGroup::MultiHeadAttnGradV => gen_mha_grad_v(),
     }
 }
 
@@ -3518,6 +3526,1147 @@ fn gen_cross_attention() -> Module {
 }
 
 // ---------------------------------------------------------------------------
+// multi_head_attn (forward, saves LSE for backward)
+// Same as gen_attention_parallel(false, true) but with an extra `lse` binding.
+// After normalization, thread 0 writes lse[pos * num_heads + head] = max + log(sum_exp).
+// ---------------------------------------------------------------------------
+
+fn gen_mha_forward() -> Module {
+    const WG: u32 = 64;
+
+    let mut b = Builder::new();
+    // Same param layout as cross-attention: [q_seq, kv_seq, (num_heads<<16)|num_kv_heads, head_dim]
+    let ty_params = b.params_u32x4("Params", &["q_seq", "kv_seq", "packed_heads", "head_dim"]);
+    let gv_q = b.storage_ro("src_a");
+    let gv_k = b.storage_ro("src_b");
+    let gv_v = b.storage_ro("bias");
+    let gv_dst = b.storage_rw("dst");
+    let gv_lse = b.storage_rw("lse"); // EXTRA: LSE output
+    let gv_params = b.uniform("params", ty_params);
+    let gv_wg = b.workgroup_array("wg_dot", WG);
+
+    let mut f = FnBuilder::new(&b);
+    let wgid = f.arg_wgid();
+    let lid = f.arg_lid();
+    let pos = f.vec_x(wgid);
+    f.label("pos", pos);
+    let head = f.vec_y(wgid);
+    f.label("head", head);
+    let tid = f.vec_x(lid);
+    f.label("tid", tid);
+    f.emit(pos, tid);
+
+    let params_ptr = f.global(gv_params);
+    let p0 = f.field(params_ptr, 0);
+    let q_seq = f.load(p0);
+    f.emit(params_ptr, q_seq);
+
+    // Parse cross-attention style params
+    let p1 = f.field(params_ptr, 1);
+    let kv_seq = f.load(p1);
+    let p2 = f.field(params_ptr, 2);
+    let packed = f.load(p2);
+    let p3 = f.field(params_ptr, 3);
+    let head_dim = f.load(p3);
+    let shift16 = f.literal_u32(16);
+    let num_heads = f.binary(BinaryOperator::ShiftRight, packed, shift16);
+    let mask = f.literal_u32(0xFFFF);
+    let num_kv_heads = f.binary(BinaryOperator::And, packed, mask);
+    let kv_len = kv_seq;
+    f.emit(p1, num_kv_heads);
+
+    let cond_pos = f.binary(BinaryOperator::GreaterEqual, pos, q_seq);
+    let cond_head = f.binary(BinaryOperator::GreaterEqual, head, num_heads);
+    let cond = f.binary(BinaryOperator::LogicalOr, cond_pos, cond_head);
+    f.emit(cond_pos, cond);
+    f.f.body.push(f.if_return(cond), S);
+
+    let heads_per_kv = f.binary(BinaryOperator::Divide, num_heads, num_kv_heads);
+    let kv_head = f.binary(BinaryOperator::Divide, head, heads_per_kv);
+    let q_dim = f.binary(BinaryOperator::Multiply, num_heads, head_dim);
+    let kv_dim = f.binary(BinaryOperator::Multiply, num_kv_heads, head_dim);
+    let pos_q = f.binary(BinaryOperator::Multiply, pos, q_dim);
+    let head_off = f.binary(BinaryOperator::Multiply, head, head_dim);
+    let q_base = f.binary(BinaryOperator::Add, pos_q, head_off);
+    let kv_head_off = f.binary(BinaryOperator::Multiply, kv_head, head_dim);
+    let hd_f = f.cast_f32(head_dim);
+    let scale = f.math1(MathFunction::InverseSqrt, hd_f);
+    f.emit(heads_per_kv, scale);
+
+    let q_gp = f.global(gv_q);
+    let q_idx = f.binary(BinaryOperator::Add, q_base, tid);
+    let q_elem = f.index(q_gp, q_idx);
+    let q_val = f.load(q_elem);
+    f.emit(q_idx, q_val);
+
+    let kv_dim_var = f.local_var("kv_dim", b.ty_u32, None);
+    let kv_dim_ptr = f.local_ptr(kv_dim_var);
+    f.f.body.push(f.store(kv_dim_ptr, kv_dim), S);
+    let kv_hd_off_var = f.local_var("kv_hd_off", b.ty_u32, None);
+    let kv_hd_off_ptr = f.local_ptr(kv_hd_off_var);
+    f.f.body.push(f.store(kv_hd_off_ptr, kv_head_off), S);
+    let scale_var = f.local_var("scale", b.ty_f32, None);
+    let scale_ptr = f.local_ptr(scale_var);
+    f.f.body.push(f.store(scale_ptr, scale), S);
+    let kv_len_var = f.local_var("kv_len", b.ty_u32, None);
+    let kv_len_ptr = f.local_ptr(kv_len_var);
+    f.f.body.push(f.store(kv_len_ptr, kv_len), S);
+
+    let my_out_var = f.local_var("my_out", b.ty_f32, None);
+    let my_out_ptr = f.local_ptr(my_out_var);
+    let max_var = f.local_var("max_score", b.ty_f32, None);
+    let max_ptr = f.local_ptr(max_var);
+    let sum_var = f.local_var("sum_exp", b.ty_f32, None);
+    let sum_ptr = f.local_ptr(sum_var);
+    let zero_f = f.literal_f32(0.0);
+    let neg_inf = f.literal_f32(-1.0e30);
+    f.emit(zero_f, neg_inf);
+    f.f.body.push(f.store(my_out_ptr, zero_f), S);
+    f.f.body.push(f.store(max_ptr, neg_inf), S);
+    f.f.body.push(f.store(sum_ptr, zero_f), S);
+
+    let t_var = f.local_var("t", b.ty_u32, None);
+    let t_ptr = f.local_ptr(t_var);
+    let zero_u = f.literal_u32(0);
+    f.emit(zero_u, zero_u);
+    f.f.body.push(f.store(t_ptr, zero_u), S);
+
+    {
+        let mut body = Block::new();
+
+        let t = f.load(t_ptr);
+        let kl = f.load(kv_len_ptr);
+        let brk = f.binary(BinaryOperator::GreaterEqual, t, kl);
+        push_emit(&f.f.expressions, &mut body, t, brk);
+        body.push(FnBuilder::if_break(brk), S);
+
+        let kvd = f.load(kv_dim_ptr);
+        let t_kv = f.binary(BinaryOperator::Multiply, t, kvd);
+        let kho = f.load(kv_hd_off_ptr);
+        let k_base = f.binary(BinaryOperator::Add, t_kv, kho);
+        push_emit(&f.f.expressions, &mut body, kvd, k_base);
+
+        let k_idx = f.binary(BinaryOperator::Add, k_base, tid);
+        let k_gp = f.global(gv_k);
+        let k_elem = f.index(k_gp, k_idx);
+        let k_val = f.load(k_elem);
+        let partial = f.binary(BinaryOperator::Multiply, q_val, k_val);
+        push_emit(&f.f.expressions, &mut body, k_idx, partial);
+
+        let wg_ptr = f.global(gv_wg);
+        let wg_tid = f.index(wg_ptr, tid);
+        push_emit(&f.f.expressions, &mut body, wg_tid, wg_tid);
+        body.push(f.store(wg_tid, partial), S);
+        body.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
+
+        for stride_val in [32u32, 16, 8, 4, 2, 1] {
+            let stride = f.literal_u32(stride_val);
+            let cond_s = f.binary(BinaryOperator::Less, tid, stride);
+            let partner = f.binary(BinaryOperator::Add, tid, stride);
+            let wg_p = f.global(gv_wg);
+            let wg_self = f.index(wg_p, tid);
+            let wg_part = f.index(wg_p, partner);
+            let sv = f.load(wg_self);
+            let pv = f.load(wg_part);
+            let reduced = f.binary(BinaryOperator::Add, sv, pv);
+            push_emit(&f.f.expressions, &mut body, cond_s, reduced);
+            body.push(
+                Statement::If {
+                    condition: cond_s,
+                    accept: Block::from_vec(vec![f.store(wg_self, reduced)]),
+                    reject: Block::new(),
+                },
+                S,
+            );
+            body.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
+        }
+
+        let sc = f.load(scale_ptr);
+        let wg_p0 = f.global(gv_wg);
+        let z_idx = f.literal_u32(0);
+        let wg_0 = f.index(wg_p0, z_idx);
+        let dot_sum = f.load(wg_0);
+        let score = f.binary(BinaryOperator::Multiply, dot_sum, sc);
+        push_emit(&f.f.expressions, &mut body, sc, score);
+
+        let old_max = f.load(max_ptr);
+        let new_max = f.math2(MathFunction::Max, old_max, score);
+        let correction = f.binary(BinaryOperator::Subtract, old_max, new_max);
+        let corr_exp = f.math1(MathFunction::Exp, correction);
+        let w_shift = f.binary(BinaryOperator::Subtract, score, new_max);
+        let weight = f.math1(MathFunction::Exp, w_shift);
+        let old_sum = f.load(sum_ptr);
+        let sc_sum = f.binary(BinaryOperator::Multiply, old_sum, corr_exp);
+        let new_sum = f.binary(BinaryOperator::Add, sc_sum, weight);
+        push_emit(&f.f.expressions, &mut body, old_max, new_sum);
+        body.push(f.store(sum_ptr, new_sum), S);
+        body.push(f.store(max_ptr, new_max), S);
+
+        let v_gp = f.global(gv_v);
+        let v_idx = f.binary(BinaryOperator::Add, k_base, tid);
+        let v_elem = f.index(v_gp, v_idx);
+        let v_val = f.load(v_elem);
+        let wv = f.binary(BinaryOperator::Multiply, weight, v_val);
+        let old_out = f.load(my_out_ptr);
+        let sc_out = f.binary(BinaryOperator::Multiply, old_out, corr_exp);
+        let new_out = f.binary(BinaryOperator::Add, sc_out, wv);
+        push_emit(&f.f.expressions, &mut body, v_idx, new_out);
+        body.push(f.store(my_out_ptr, new_out), S);
+
+        let one_t = f.literal_u32(1);
+        let t2 = f.load(t_ptr);
+        let tn = f.binary(BinaryOperator::Add, t2, one_t);
+        push_emit(&f.f.expressions, &mut body, one_t, tn);
+        body.push(f.store(t_ptr, tn), S);
+
+        f.f.body.push(
+            Statement::Loop {
+                body,
+                continuing: Block::new(),
+                break_if: None,
+            },
+            S,
+        );
+    }
+
+    // Normalize and write: dst[q_base + tid] = my_out / sum_exp
+    let out_val = f.load(my_out_ptr);
+    let sum_val = f.load(sum_ptr);
+    let normed = f.binary(BinaryOperator::Divide, out_val, sum_val);
+    let dst_idx = f.binary(BinaryOperator::Add, q_base, tid);
+    let dst_gp = f.global(gv_dst);
+    let dst_elem = f.index(dst_gp, dst_idx);
+    f.emit(out_val, dst_elem);
+    f.f.body.push(f.store(dst_elem, normed), S);
+
+    // Write LSE: only thread 0 writes lse[pos * num_heads + head] = max_score + log(sum_exp)
+    let max_val = f.load(max_ptr);
+    let sum_val_lse = f.load(sum_ptr);
+    let log_sum = f.math1(MathFunction::Log, sum_val_lse);
+    let lse_val = f.binary(BinaryOperator::Add, max_val, log_sum);
+    let lse_pos_off = f.binary(BinaryOperator::Multiply, pos, num_heads);
+    let lse_idx = f.binary(BinaryOperator::Add, lse_pos_off, head);
+    let lse_gp = f.global(gv_lse);
+    let lse_elem = f.index(lse_gp, lse_idx);
+    let zero_tid = f.literal_u32(0);
+    let tid_is_zero = f.binary(BinaryOperator::Equal, tid, zero_tid);
+    f.emit(max_val, tid_is_zero);
+    // Only thread 0 writes LSE (all threads computed same max/sum scalars)
+    f.f.body.push(
+        Statement::If {
+            condition: tid_is_zero,
+            accept: Block::from_vec(vec![f.store(lse_elem, lse_val)]),
+            reject: Block::new(),
+        },
+        S,
+    );
+
+    b.entry_point("main", [WG, 1, 1], f.finish());
+    b.finish()
+}
+
+// ---------------------------------------------------------------------------
+// gen_mha_grad_q: dQ computation for MultiHeadAttn backward
+// dispatch [q_seq, num_heads, 1], WG=64
+// inputs: [dO, Q, K, V, LSE, O], output: dQ
+// ---------------------------------------------------------------------------
+
+fn gen_mha_grad_q() -> Module {
+    const WG: u32 = 64;
+
+    let mut b = Builder::new();
+    let ty_params = b.params_u32x4("Params", &["q_seq", "kv_seq", "packed_heads", "head_dim"]);
+    let gv_d_out = b.storage_ro("d_out"); // dO
+    let gv_q = b.storage_ro("src_a"); // Q
+    let gv_k = b.storage_ro("src_b"); // K
+    let gv_v = b.storage_ro("bias"); // V
+    let gv_lse = b.storage_ro("lse"); // LSE (from forward)
+    let gv_fwd_o = b.storage_ro("fwd_dst"); // O (from forward)
+    let gv_dst = b.storage_rw("dst"); // dQ output
+    let gv_params = b.uniform("params", ty_params);
+    let gv_wg = b.workgroup_array("wg_dot", WG);
+
+    let mut f = FnBuilder::new(&b);
+    let wgid = f.arg_wgid();
+    let lid = f.arg_lid();
+    let pos = f.vec_x(wgid);
+    f.label("pos", pos);
+    let head = f.vec_y(wgid);
+    f.label("head", head);
+    let tid = f.vec_x(lid);
+    f.label("tid", tid);
+    f.emit(pos, tid);
+
+    let params_ptr = f.global(gv_params);
+    let p0 = f.field(params_ptr, 0);
+    let q_seq = f.load(p0);
+    let p1 = f.field(params_ptr, 1);
+    let kv_seq = f.load(p1);
+    let p2 = f.field(params_ptr, 2);
+    let packed = f.load(p2);
+    let p3 = f.field(params_ptr, 3);
+    let head_dim = f.load(p3);
+    let shift16 = f.literal_u32(16);
+    let num_heads = f.binary(BinaryOperator::ShiftRight, packed, shift16);
+    let mask = f.literal_u32(0xFFFF);
+    let num_kv_heads = f.binary(BinaryOperator::And, packed, mask);
+    f.emit(params_ptr, num_kv_heads);
+
+    let cond_pos = f.binary(BinaryOperator::GreaterEqual, pos, q_seq);
+    let cond_head = f.binary(BinaryOperator::GreaterEqual, head, num_heads);
+    let cond = f.binary(BinaryOperator::LogicalOr, cond_pos, cond_head);
+    f.emit(cond_pos, cond);
+    f.f.body.push(f.if_return(cond), S);
+
+    // GQA indexing
+    let heads_per_kv = f.binary(BinaryOperator::Divide, num_heads, num_kv_heads);
+    let kv_head = f.binary(BinaryOperator::Divide, head, heads_per_kv);
+    let q_dim = f.binary(BinaryOperator::Multiply, num_heads, head_dim);
+    let kv_dim = f.binary(BinaryOperator::Multiply, num_kv_heads, head_dim);
+    let pos_q_off = f.binary(BinaryOperator::Multiply, pos, q_dim);
+    let head_off = f.binary(BinaryOperator::Multiply, head, head_dim);
+    let q_base = f.binary(BinaryOperator::Add, pos_q_off, head_off);
+    let kv_head_off = f.binary(BinaryOperator::Multiply, kv_head, head_dim);
+    let hd_f = f.cast_f32(head_dim);
+    let scale = f.math1(MathFunction::InverseSqrt, hd_f);
+    f.emit(heads_per_kv, scale);
+
+    // Spill to local vars
+    let kv_dim_var = f.local_var("kv_dim", b.ty_u32, None);
+    let kv_dim_ptr = f.local_ptr(kv_dim_var);
+    f.f.body.push(f.store(kv_dim_ptr, kv_dim), S);
+    let kv_head_off_var = f.local_var("kv_head_off", b.ty_u32, None);
+    let kv_head_off_ptr = f.local_ptr(kv_head_off_var);
+    f.f.body.push(f.store(kv_head_off_ptr, kv_head_off), S);
+    let scale_var = f.local_var("scale", b.ty_f32, None);
+    let scale_ptr = f.local_ptr(scale_var);
+    f.f.body.push(f.store(scale_ptr, scale), S);
+    let q_base_var = f.local_var("q_base", b.ty_u32, None);
+    let q_base_ptr = f.local_ptr(q_base_var);
+    f.f.body.push(f.store(q_base_ptr, q_base), S);
+
+    // Parallel reduce: row_sum = sum_d dO[q_base+d] * O[q_base+d]
+    let d_out_gp = f.global(gv_d_out);
+    let fwd_o_gp = f.global(gv_fwd_o);
+    let q_base_val = f.load(q_base_ptr);
+    let do_idx = f.binary(BinaryOperator::Add, q_base_val, tid);
+    let do_elem = f.index(d_out_gp, do_idx);
+    let do_val = f.load(do_elem);
+    let o_idx = f.binary(BinaryOperator::Add, q_base_val, tid);
+    let o_elem = f.index(fwd_o_gp, o_idx);
+    let o_val = f.load(o_elem);
+    let row_partial = f.binary(BinaryOperator::Multiply, do_val, o_val);
+    f.emit(q_base_val, row_partial);
+
+    let wg_ptr = f.global(gv_wg);
+    let wg_tid = f.index(wg_ptr, tid);
+    f.emit(wg_tid, wg_tid);
+    f.f.body.push(f.store(wg_tid, row_partial), S);
+    f.f.body.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
+    for stride_val in [32u32, 16, 8, 4, 2, 1] {
+        let stride = f.literal_u32(stride_val);
+        let cond_s = f.binary(BinaryOperator::Less, tid, stride);
+        let partner = f.binary(BinaryOperator::Add, tid, stride);
+        let wg_p = f.global(gv_wg);
+        let wg_self = f.index(wg_p, tid);
+        let wg_part = f.index(wg_p, partner);
+        let sv = f.load(wg_self);
+        let pv = f.load(wg_part);
+        let reduced = f.binary(BinaryOperator::Add, sv, pv);
+        push_emit(&f.f.expressions, &mut f.f.body, cond_s, reduced);
+        f.f.body.push(
+            Statement::If {
+                condition: cond_s,
+                accept: Block::from_vec(vec![f.store(wg_self, reduced)]),
+                reject: Block::new(),
+            },
+            S,
+        );
+        f.f.body.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
+    }
+    let wg_p0 = f.global(gv_wg);
+    let z_idx = f.literal_u32(0);
+    let wg_0 = f.index(wg_p0, z_idx);
+    let row_sum = f.load(wg_0);
+    f.emit(row_sum, row_sum);
+
+    // Store row_sum to local var
+    let row_sum_var = f.local_var("row_sum", b.ty_f32, None);
+    let row_sum_ptr = f.local_ptr(row_sum_var);
+    f.f.body.push(f.store(row_sum_ptr, row_sum), S);
+
+    // Load Q[q_base+tid] for score computation
+    let q_gp = f.global(gv_q);
+    let q_idx = f.binary(BinaryOperator::Add, q_base, tid);
+    let q_elem = f.index(q_gp, q_idx);
+    let q_val = f.load(q_elem);
+    f.emit(q_idx, q_val);
+    let q_val_var = f.local_var("q_val", b.ty_f32, None);
+    let q_val_ptr = f.local_ptr(q_val_var);
+    f.f.body.push(f.store(q_val_ptr, q_val), S);
+
+    // Load dO[q_base+tid] for use in the loop
+    let do_idx2 = f.binary(BinaryOperator::Add, q_base, tid);
+    let do_elem2 = f.index(d_out_gp, do_idx2);
+    let do_val2 = f.load(do_elem2);
+    f.emit(do_idx2, do_val2);
+    let do_val_var = f.local_var("do_val", b.ty_f32, None);
+    let do_val_ptr = f.local_ptr(do_val_var);
+    f.f.body.push(f.store(do_val_ptr, do_val2), S);
+
+    // Load LSE[pos * num_heads + head]
+    let lse_gp = f.global(gv_lse);
+    let lse_pos_off = f.binary(BinaryOperator::Multiply, pos, num_heads);
+    let lse_idx = f.binary(BinaryOperator::Add, lse_pos_off, head);
+    let lse_elem = f.index(lse_gp, lse_idx);
+    let lse_val = f.load(lse_elem);
+    f.emit(lse_pos_off, lse_val);
+    let lse_var = f.local_var("lse_val", b.ty_f32, None);
+    let lse_ptr = f.local_ptr(lse_var);
+    f.f.body.push(f.store(lse_ptr, lse_val), S);
+
+    // my_dq accumulator (per thread owns element d=tid)
+    let my_dq_var = f.local_var("my_dq", b.ty_f32, None);
+    let my_dq_ptr = f.local_ptr(my_dq_var);
+    let zero_f = f.literal_f32(0.0);
+    f.emit(zero_f, zero_f);
+    f.f.body.push(f.store(my_dq_ptr, zero_f), S);
+
+    // KV loop: for t in 0..kv_seq
+    let t_var = f.local_var("t", b.ty_u32, None);
+    let t_ptr = f.local_ptr(t_var);
+    let zero_u = f.literal_u32(0);
+    f.emit(zero_u, zero_u);
+    f.f.body.push(f.store(t_ptr, zero_u), S);
+
+    {
+        let mut body = Block::new();
+
+        let t = f.load(t_ptr);
+        let brk = f.binary(BinaryOperator::GreaterEqual, t, kv_seq);
+        push_emit(&f.f.expressions, &mut body, t, brk);
+        body.push(FnBuilder::if_break(brk), S);
+
+        // k_base = t * kv_dim + kv_head_off
+        let kvd = f.load(kv_dim_ptr);
+        let t_kv = f.binary(BinaryOperator::Multiply, t, kvd);
+        let kho = f.load(kv_head_off_ptr);
+        let k_base = f.binary(BinaryOperator::Add, t_kv, kho);
+        push_emit(&f.f.expressions, &mut body, kvd, k_base);
+
+        // Parallel reduce score = sum_d Q[q_base+d] * K[k_base+d] * scale
+        let qv = f.load(q_val_ptr);
+        let k_gp = f.global(gv_k);
+        let k_idx = f.binary(BinaryOperator::Add, k_base, tid);
+        let k_elem = f.index(k_gp, k_idx);
+        let k_val = f.load(k_elem);
+        let qk_partial = f.binary(BinaryOperator::Multiply, qv, k_val);
+        push_emit(&f.f.expressions, &mut body, qv, qk_partial);
+
+        let wg_p2 = f.global(gv_wg);
+        let wg_tid2 = f.index(wg_p2, tid);
+        push_emit(&f.f.expressions, &mut body, wg_tid2, wg_tid2);
+        body.push(f.store(wg_tid2, qk_partial), S);
+        body.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
+        for stride_val in [32u32, 16, 8, 4, 2, 1] {
+            let stride = f.literal_u32(stride_val);
+            let cond_s = f.binary(BinaryOperator::Less, tid, stride);
+            let partner = f.binary(BinaryOperator::Add, tid, stride);
+            let wg_p = f.global(gv_wg);
+            let wg_self = f.index(wg_p, tid);
+            let wg_part = f.index(wg_p, partner);
+            let sv = f.load(wg_self);
+            let pv = f.load(wg_part);
+            let reduced = f.binary(BinaryOperator::Add, sv, pv);
+            push_emit(&f.f.expressions, &mut body, cond_s, reduced);
+            body.push(
+                Statement::If {
+                    condition: cond_s,
+                    accept: Block::from_vec(vec![f.store(wg_self, reduced)]),
+                    reject: Block::new(),
+                },
+                S,
+            );
+            body.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
+        }
+        let sc2 = f.load(scale_ptr);
+        let wg_p3 = f.global(gv_wg);
+        let z_idx2 = f.literal_u32(0);
+        let wg_02 = f.index(wg_p3, z_idx2);
+        let dot_sum2 = f.load(wg_02);
+        let score = f.binary(BinaryOperator::Multiply, dot_sum2, sc2);
+        push_emit(&f.f.expressions, &mut body, sc2, score);
+
+        // P_t = exp(score - lse)
+        let lse2 = f.load(lse_ptr);
+        let score_shifted = f.binary(BinaryOperator::Subtract, score, lse2);
+        let p_t = f.math1(MathFunction::Exp, score_shifted);
+        push_emit(&f.f.expressions, &mut body, lse2, p_t);
+
+        // Parallel reduce dP_t = sum_d dO[q_base+d] * V[k_base+d]
+        let dov = f.load(do_val_ptr);
+        let v_gp = f.global(gv_v);
+        let v_idx = f.binary(BinaryOperator::Add, k_base, tid);
+        let v_elem = f.index(v_gp, v_idx);
+        let v_val = f.load(v_elem);
+        let dov_v = f.binary(BinaryOperator::Multiply, dov, v_val);
+        push_emit(&f.f.expressions, &mut body, dov, dov_v);
+
+        let wg_p4 = f.global(gv_wg);
+        let wg_tid4 = f.index(wg_p4, tid);
+        push_emit(&f.f.expressions, &mut body, wg_tid4, wg_tid4);
+        body.push(f.store(wg_tid4, dov_v), S);
+        body.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
+        for stride_val in [32u32, 16, 8, 4, 2, 1] {
+            let stride = f.literal_u32(stride_val);
+            let cond_s = f.binary(BinaryOperator::Less, tid, stride);
+            let partner = f.binary(BinaryOperator::Add, tid, stride);
+            let wg_p = f.global(gv_wg);
+            let wg_self = f.index(wg_p, tid);
+            let wg_part = f.index(wg_p, partner);
+            let sv = f.load(wg_self);
+            let pv = f.load(wg_part);
+            let reduced = f.binary(BinaryOperator::Add, sv, pv);
+            push_emit(&f.f.expressions, &mut body, cond_s, reduced);
+            body.push(
+                Statement::If {
+                    condition: cond_s,
+                    accept: Block::from_vec(vec![f.store(wg_self, reduced)]),
+                    reject: Block::new(),
+                },
+                S,
+            );
+            body.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
+        }
+        let wg_p5 = f.global(gv_wg);
+        let z_idx3 = f.literal_u32(0);
+        let wg_03 = f.index(wg_p5, z_idx3);
+        let dp_t = f.load(wg_03);
+        push_emit(&f.f.expressions, &mut body, dp_t, dp_t);
+
+        // dS_t = P_t * (dP_t - row_sum)
+        let rs = f.load(row_sum_ptr);
+        let dp_minus_rs = f.binary(BinaryOperator::Subtract, dp_t, rs);
+        let ds_t = f.binary(BinaryOperator::Multiply, p_t, dp_minus_rs);
+        push_emit(&f.f.expressions, &mut body, rs, ds_t);
+
+        // my_dq += dS_t * scale * K[k_base+tid]
+        let sc3 = f.load(scale_ptr);
+        let k_gp2 = f.global(gv_k);
+        let k_idx2 = f.binary(BinaryOperator::Add, k_base, tid);
+        let k_elem2 = f.index(k_gp2, k_idx2);
+        let k_val2 = f.load(k_elem2);
+        let ds_sc = f.binary(BinaryOperator::Multiply, ds_t, sc3);
+        let contrib = f.binary(BinaryOperator::Multiply, ds_sc, k_val2);
+        let old_dq = f.load(my_dq_ptr);
+        let new_dq = f.binary(BinaryOperator::Add, old_dq, contrib);
+        push_emit(&f.f.expressions, &mut body, sc3, new_dq);
+        body.push(f.store(my_dq_ptr, new_dq), S);
+
+        // t++
+        let one_t = f.literal_u32(1);
+        let t2 = f.load(t_ptr);
+        let tn = f.binary(BinaryOperator::Add, t2, one_t);
+        push_emit(&f.f.expressions, &mut body, one_t, tn);
+        body.push(f.store(t_ptr, tn), S);
+
+        f.f.body.push(
+            Statement::Loop {
+                body,
+                continuing: Block::new(),
+                break_if: None,
+            },
+            S,
+        );
+    }
+
+    // Write dst[q_base+tid] = my_dq
+    let dq_val = f.load(my_dq_ptr);
+    let dst_idx = f.binary(BinaryOperator::Add, q_base, tid);
+    let dst_gp = f.global(gv_dst);
+    let dst_elem = f.index(dst_gp, dst_idx);
+    f.emit(dq_val, dst_elem);
+    f.f.body.push(f.store(dst_elem, dq_val), S);
+
+    b.entry_point("main", [WG, 1, 1], f.finish());
+    b.finish()
+}
+
+// ---------------------------------------------------------------------------
+// gen_mha_grad_k: dK computation for MultiHeadAttn backward
+// dispatch [kv_seq, num_kv_heads, 1], WG=64
+// ---------------------------------------------------------------------------
+
+fn gen_mha_grad_k() -> Module {
+    const WG: u32 = 64;
+
+    let mut b = Builder::new();
+    let ty_params = b.params_u32x4("Params", &["q_seq", "kv_seq", "packed_heads", "head_dim"]);
+    let gv_d_out = b.storage_ro("d_out");
+    let gv_q = b.storage_ro("src_a");
+    let gv_k = b.storage_ro("src_b");
+    let gv_v = b.storage_ro("bias");
+    let gv_lse = b.storage_ro("lse");
+    let gv_fwd_o = b.storage_ro("fwd_dst");
+    let gv_dst = b.storage_rw("dst"); // dK output
+    let gv_params = b.uniform("params", ty_params);
+    let gv_wg = b.workgroup_array("wg_dot", WG);
+
+    let mut f = FnBuilder::new(&b);
+    let wgid = f.arg_wgid();
+    let lid = f.arg_lid();
+    let t = f.vec_x(wgid); // kv position
+    f.label("t", t);
+    let kv_head = f.vec_y(wgid);
+    f.label("kv_head", kv_head);
+    let tid = f.vec_x(lid);
+    f.label("tid", tid);
+    f.emit(t, tid);
+
+    let params_ptr = f.global(gv_params);
+    let p0 = f.field(params_ptr, 0);
+    let q_seq = f.load(p0);
+    let p1 = f.field(params_ptr, 1);
+    let kv_seq = f.load(p1);
+    let p2 = f.field(params_ptr, 2);
+    let packed = f.load(p2);
+    let p3 = f.field(params_ptr, 3);
+    let head_dim = f.load(p3);
+    let shift16 = f.literal_u32(16);
+    let num_heads = f.binary(BinaryOperator::ShiftRight, packed, shift16);
+    let mask = f.literal_u32(0xFFFF);
+    let num_kv_heads = f.binary(BinaryOperator::And, packed, mask);
+    f.emit(params_ptr, num_kv_heads);
+
+    let cond_t = f.binary(BinaryOperator::GreaterEqual, t, kv_seq);
+    let cond_kv = f.binary(BinaryOperator::GreaterEqual, kv_head, num_kv_heads);
+    let cond = f.binary(BinaryOperator::LogicalOr, cond_t, cond_kv);
+    f.emit(cond_t, cond);
+    f.f.body.push(f.if_return(cond), S);
+
+    // kv_base = t * kv_dim + kv_head * head_dim
+    let kv_dim = f.binary(BinaryOperator::Multiply, num_kv_heads, head_dim);
+    let t_kv = f.binary(BinaryOperator::Multiply, t, kv_dim);
+    let kv_head_off = f.binary(BinaryOperator::Multiply, kv_head, head_dim);
+    let kv_base = f.binary(BinaryOperator::Add, t_kv, kv_head_off);
+    let heads_per_kv = f.binary(BinaryOperator::Divide, num_heads, num_kv_heads);
+    let q_dim = f.binary(BinaryOperator::Multiply, num_heads, head_dim);
+    let hd_f = f.cast_f32(head_dim);
+    let scale = f.math1(MathFunction::InverseSqrt, hd_f);
+    f.emit(kv_dim, scale);
+
+    // Spill to local vars
+    let kv_base_var = f.local_var("kv_base", b.ty_u32, None);
+    let kv_base_ptr = f.local_ptr(kv_base_var);
+    f.f.body.push(f.store(kv_base_ptr, kv_base), S);
+    let heads_per_kv_var = f.local_var("heads_per_kv", b.ty_u32, None);
+    let heads_per_kv_ptr = f.local_ptr(heads_per_kv_var);
+    f.f.body.push(f.store(heads_per_kv_ptr, heads_per_kv), S);
+    let q_dim_var = f.local_var("q_dim", b.ty_u32, None);
+    let q_dim_ptr = f.local_ptr(q_dim_var);
+    f.f.body.push(f.store(q_dim_ptr, q_dim), S);
+    let scale_var = f.local_var("scale", b.ty_f32, None);
+    let scale_ptr = f.local_ptr(scale_var);
+    f.f.body.push(f.store(scale_ptr, scale), S);
+
+    // my_dk accumulator
+    let my_dk_var = f.local_var("my_dk", b.ty_f32, None);
+    let my_dk_ptr = f.local_ptr(my_dk_var);
+    let zero_f = f.literal_f32(0.0);
+    f.emit(zero_f, zero_f);
+    f.f.body.push(f.store(my_dk_ptr, zero_f), S);
+
+    // Outer loop: for pos in 0..q_seq
+    let pos_var = f.local_var("pos", b.ty_u32, None);
+    let pos_ptr = f.local_ptr(pos_var);
+    let zero_u = f.literal_u32(0);
+    f.emit(zero_u, zero_u);
+    f.f.body.push(f.store(pos_ptr, zero_u), S);
+
+    {
+        let mut body_pos = Block::new();
+
+        let pos = f.load(pos_ptr);
+        let brk_pos = f.binary(BinaryOperator::GreaterEqual, pos, q_seq);
+        push_emit(&f.f.expressions, &mut body_pos, pos, brk_pos);
+        body_pos.push(FnBuilder::if_break(brk_pos), S);
+
+        // Inner loop: for head_rel in 0..heads_per_kv
+        let head_rel_var = f.local_var("head_rel", b.ty_u32, None);
+        let head_rel_ptr = f.local_ptr(head_rel_var);
+        let zero_u2 = f.literal_u32(0);
+        push_emit(&f.f.expressions, &mut body_pos, zero_u2, zero_u2);
+        body_pos.push(f.store(head_rel_ptr, zero_u2), S);
+
+        {
+            let mut body_hr = Block::new();
+
+            let head_rel = f.load(head_rel_ptr);
+            let hpk = f.load(heads_per_kv_ptr);
+            let brk_hr = f.binary(BinaryOperator::GreaterEqual, head_rel, hpk);
+            push_emit(&f.f.expressions, &mut body_hr, head_rel, brk_hr);
+            body_hr.push(FnBuilder::if_break(brk_hr), S);
+
+            // head = kv_head * heads_per_kv + head_rel
+            let kv_h = kv_head;
+            let kv_h_hpk = f.binary(BinaryOperator::Multiply, kv_h, hpk);
+            let head_cur = f.binary(BinaryOperator::Add, kv_h_hpk, head_rel);
+            // q_base = pos * q_dim + head * head_dim
+            let qdim = f.load(q_dim_ptr);
+            let pos_qdim = f.binary(BinaryOperator::Multiply, pos, qdim);
+            let head_hd = f.binary(BinaryOperator::Multiply, head_cur, head_dim);
+            let q_base = f.binary(BinaryOperator::Add, pos_qdim, head_hd);
+            push_emit(&f.f.expressions, &mut body_hr, kv_h_hpk, q_base);
+
+            // Parallel reduce score = sum_d Q[q_base+d] * K[kv_base+d] * scale
+            let q_gp = f.global(gv_q);
+            let q_idx = f.binary(BinaryOperator::Add, q_base, tid);
+            let q_elem = f.index(q_gp, q_idx);
+            let q_val = f.load(q_elem);
+            let kvb = f.load(kv_base_ptr);
+            let k_gp = f.global(gv_k);
+            let k_idx = f.binary(BinaryOperator::Add, kvb, tid);
+            let k_elem = f.index(k_gp, k_idx);
+            let k_val = f.load(k_elem);
+            let qk_partial = f.binary(BinaryOperator::Multiply, q_val, k_val);
+            push_emit(&f.f.expressions, &mut body_hr, q_idx, qk_partial);
+
+            let wg_p = f.global(gv_wg);
+            let wg_tid = f.index(wg_p, tid);
+            push_emit(&f.f.expressions, &mut body_hr, wg_tid, wg_tid);
+            body_hr.push(f.store(wg_tid, qk_partial), S);
+            body_hr.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
+            for stride_val in [32u32, 16, 8, 4, 2, 1] {
+                let stride = f.literal_u32(stride_val);
+                let cond_s = f.binary(BinaryOperator::Less, tid, stride);
+                let partner = f.binary(BinaryOperator::Add, tid, stride);
+                let wg_pp = f.global(gv_wg);
+                let wg_self = f.index(wg_pp, tid);
+                let wg_part = f.index(wg_pp, partner);
+                let sv = f.load(wg_self);
+                let pv = f.load(wg_part);
+                let reduced = f.binary(BinaryOperator::Add, sv, pv);
+                push_emit(&f.f.expressions, &mut body_hr, cond_s, reduced);
+                body_hr.push(
+                    Statement::If {
+                        condition: cond_s,
+                        accept: Block::from_vec(vec![f.store(wg_self, reduced)]),
+                        reject: Block::new(),
+                    },
+                    S,
+                );
+                body_hr.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
+            }
+            let sc = f.load(scale_ptr);
+            let wg_p0 = f.global(gv_wg);
+            let z_idx = f.literal_u32(0);
+            let wg_0 = f.index(wg_p0, z_idx);
+            let dot_sum = f.load(wg_0);
+            let score = f.binary(BinaryOperator::Multiply, dot_sum, sc);
+            push_emit(&f.f.expressions, &mut body_hr, sc, score);
+
+            // P_t = exp(score - lse[pos * num_heads + head])
+            let lse_gp = f.global(gv_lse);
+            let lse_pos_off = f.binary(BinaryOperator::Multiply, pos, num_heads);
+            let lse_idx = f.binary(BinaryOperator::Add, lse_pos_off, head_cur);
+            let lse_elem = f.index(lse_gp, lse_idx);
+            let lse_val = f.load(lse_elem);
+            let score_shifted = f.binary(BinaryOperator::Subtract, score, lse_val);
+            let p_t = f.math1(MathFunction::Exp, score_shifted);
+            push_emit(&f.f.expressions, &mut body_hr, lse_pos_off, p_t);
+
+            // Parallel reduce row_sum = sum_d dO[q_base+d] * O[q_base+d]
+            let d_out_gp = f.global(gv_d_out);
+            let fwd_o_gp = f.global(gv_fwd_o);
+            let do_idx = f.binary(BinaryOperator::Add, q_base, tid);
+            let do_elem = f.index(d_out_gp, do_idx);
+            let do_val_rs = f.load(do_elem);
+            let o_idx = f.binary(BinaryOperator::Add, q_base, tid);
+            let o_elem = f.index(fwd_o_gp, o_idx);
+            let o_val_rs = f.load(o_elem);
+            let rs_partial = f.binary(BinaryOperator::Multiply, do_val_rs, o_val_rs);
+            push_emit(&f.f.expressions, &mut body_hr, do_idx, rs_partial);
+
+            let wg_p2 = f.global(gv_wg);
+            let wg_tid2 = f.index(wg_p2, tid);
+            push_emit(&f.f.expressions, &mut body_hr, wg_tid2, wg_tid2);
+            body_hr.push(f.store(wg_tid2, rs_partial), S);
+            body_hr.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
+            for stride_val in [32u32, 16, 8, 4, 2, 1] {
+                let stride = f.literal_u32(stride_val);
+                let cond_s = f.binary(BinaryOperator::Less, tid, stride);
+                let partner = f.binary(BinaryOperator::Add, tid, stride);
+                let wg_pp = f.global(gv_wg);
+                let wg_self = f.index(wg_pp, tid);
+                let wg_part = f.index(wg_pp, partner);
+                let sv = f.load(wg_self);
+                let pv = f.load(wg_part);
+                let reduced = f.binary(BinaryOperator::Add, sv, pv);
+                push_emit(&f.f.expressions, &mut body_hr, cond_s, reduced);
+                body_hr.push(
+                    Statement::If {
+                        condition: cond_s,
+                        accept: Block::from_vec(vec![f.store(wg_self, reduced)]),
+                        reject: Block::new(),
+                    },
+                    S,
+                );
+                body_hr.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
+            }
+            let wg_p3 = f.global(gv_wg);
+            let z_idx2 = f.literal_u32(0);
+            let wg_02 = f.index(wg_p3, z_idx2);
+            let row_sum = f.load(wg_02);
+            push_emit(&f.f.expressions, &mut body_hr, row_sum, row_sum);
+
+            // Parallel reduce dP_t = sum_d dO[q_base+d] * V[kv_base+d]
+            let do_idx2 = f.binary(BinaryOperator::Add, q_base, tid);
+            let do_elem2 = f.index(d_out_gp, do_idx2);
+            let do_val2 = f.load(do_elem2);
+            let v_gp = f.global(gv_v);
+            let v_idx = f.binary(BinaryOperator::Add, kvb, tid);
+            let v_elem = f.index(v_gp, v_idx);
+            let v_val = f.load(v_elem);
+            let dp_partial = f.binary(BinaryOperator::Multiply, do_val2, v_val);
+            push_emit(&f.f.expressions, &mut body_hr, do_idx2, dp_partial);
+
+            let wg_p4 = f.global(gv_wg);
+            let wg_tid4 = f.index(wg_p4, tid);
+            push_emit(&f.f.expressions, &mut body_hr, wg_tid4, wg_tid4);
+            body_hr.push(f.store(wg_tid4, dp_partial), S);
+            body_hr.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
+            for stride_val in [32u32, 16, 8, 4, 2, 1] {
+                let stride = f.literal_u32(stride_val);
+                let cond_s = f.binary(BinaryOperator::Less, tid, stride);
+                let partner = f.binary(BinaryOperator::Add, tid, stride);
+                let wg_pp = f.global(gv_wg);
+                let wg_self = f.index(wg_pp, tid);
+                let wg_part = f.index(wg_pp, partner);
+                let sv = f.load(wg_self);
+                let pv = f.load(wg_part);
+                let reduced = f.binary(BinaryOperator::Add, sv, pv);
+                push_emit(&f.f.expressions, &mut body_hr, cond_s, reduced);
+                body_hr.push(
+                    Statement::If {
+                        condition: cond_s,
+                        accept: Block::from_vec(vec![f.store(wg_self, reduced)]),
+                        reject: Block::new(),
+                    },
+                    S,
+                );
+                body_hr.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
+            }
+            let wg_p5 = f.global(gv_wg);
+            let z_idx3 = f.literal_u32(0);
+            let wg_03 = f.index(wg_p5, z_idx3);
+            let dp_t = f.load(wg_03);
+            push_emit(&f.f.expressions, &mut body_hr, dp_t, dp_t);
+
+            // dS_t = P_t * (dP_t - row_sum)
+            let dp_minus_rs = f.binary(BinaryOperator::Subtract, dp_t, row_sum);
+            let ds_t = f.binary(BinaryOperator::Multiply, p_t, dp_minus_rs);
+            push_emit(&f.f.expressions, &mut body_hr, dp_minus_rs, ds_t);
+
+            // my_dk += dS_t * scale * Q[q_base+tid]
+            let sc2 = f.load(scale_ptr);
+            let q_gp2 = f.global(gv_q);
+            let q_idx2 = f.binary(BinaryOperator::Add, q_base, tid);
+            let q_elem2 = f.index(q_gp2, q_idx2);
+            let q_val2 = f.load(q_elem2);
+            let ds_sc = f.binary(BinaryOperator::Multiply, ds_t, sc2);
+            let contrib = f.binary(BinaryOperator::Multiply, ds_sc, q_val2);
+            let old_dk = f.load(my_dk_ptr);
+            let new_dk = f.binary(BinaryOperator::Add, old_dk, contrib);
+            push_emit(&f.f.expressions, &mut body_hr, sc2, new_dk);
+            body_hr.push(f.store(my_dk_ptr, new_dk), S);
+
+            // head_rel++
+            let one_hr = f.literal_u32(1);
+            let hr2 = f.load(head_rel_ptr);
+            let hrn = f.binary(BinaryOperator::Add, hr2, one_hr);
+            push_emit(&f.f.expressions, &mut body_hr, one_hr, hrn);
+            body_hr.push(f.store(head_rel_ptr, hrn), S);
+
+            body_pos.push(
+                Statement::Loop {
+                    body: body_hr,
+                    continuing: Block::new(),
+                    break_if: None,
+                },
+                S,
+            );
+        }
+
+        // pos++
+        let one_pos = f.literal_u32(1);
+        let pos2 = f.load(pos_ptr);
+        let posn = f.binary(BinaryOperator::Add, pos2, one_pos);
+        push_emit(&f.f.expressions, &mut body_pos, one_pos, posn);
+        body_pos.push(f.store(pos_ptr, posn), S);
+
+        f.f.body.push(
+            Statement::Loop {
+                body: body_pos,
+                continuing: Block::new(),
+                break_if: None,
+            },
+            S,
+        );
+    }
+
+    // Write dst[kv_base+tid] = my_dk
+    let dk_val = f.load(my_dk_ptr);
+    let kvb_final = f.load(kv_base_ptr);
+    let dst_idx = f.binary(BinaryOperator::Add, kvb_final, tid);
+    let dst_gp = f.global(gv_dst);
+    let dst_elem = f.index(dst_gp, dst_idx);
+    f.emit(dk_val, dst_elem);
+    f.f.body.push(f.store(dst_elem, dk_val), S);
+
+    b.entry_point("main", [WG, 1, 1], f.finish());
+    b.finish()
+}
+
+// ---------------------------------------------------------------------------
+// gen_mha_grad_v: dV computation for MultiHeadAttn backward
+// dispatch [kv_seq, num_kv_heads, 1], WG=64
+// ---------------------------------------------------------------------------
+
+fn gen_mha_grad_v() -> Module {
+    const WG: u32 = 64;
+
+    let mut b = Builder::new();
+    let ty_params = b.params_u32x4("Params", &["q_seq", "kv_seq", "packed_heads", "head_dim"]);
+    let gv_d_out = b.storage_ro("d_out");
+    let gv_q = b.storage_ro("src_a");
+    let gv_k = b.storage_ro("src_b");
+    let _gv_v = b.storage_ro("bias"); // V not needed for dV calc but must match binding layout
+    let gv_lse = b.storage_ro("lse");
+    let _gv_fwd_o = b.storage_ro("fwd_dst"); // O not needed for dV but must match layout
+    let gv_dst = b.storage_rw("dst"); // dV output
+    let gv_params = b.uniform("params", ty_params);
+    let gv_wg = b.workgroup_array("wg_dot", WG);
+
+    let mut f = FnBuilder::new(&b);
+    let wgid = f.arg_wgid();
+    let lid = f.arg_lid();
+    let t = f.vec_x(wgid);
+    f.label("t", t);
+    let kv_head = f.vec_y(wgid);
+    f.label("kv_head", kv_head);
+    let tid = f.vec_x(lid);
+    f.label("tid", tid);
+    f.emit(t, tid);
+
+    let params_ptr = f.global(gv_params);
+    let p0 = f.field(params_ptr, 0);
+    let q_seq = f.load(p0);
+    let p1 = f.field(params_ptr, 1);
+    let kv_seq = f.load(p1);
+    let p2 = f.field(params_ptr, 2);
+    let packed = f.load(p2);
+    let p3 = f.field(params_ptr, 3);
+    let head_dim = f.load(p3);
+    let shift16 = f.literal_u32(16);
+    let num_heads = f.binary(BinaryOperator::ShiftRight, packed, shift16);
+    let mask = f.literal_u32(0xFFFF);
+    let num_kv_heads = f.binary(BinaryOperator::And, packed, mask);
+    f.emit(params_ptr, num_kv_heads);
+
+    let cond_t = f.binary(BinaryOperator::GreaterEqual, t, kv_seq);
+    let cond_kv = f.binary(BinaryOperator::GreaterEqual, kv_head, num_kv_heads);
+    let cond = f.binary(BinaryOperator::LogicalOr, cond_t, cond_kv);
+    f.emit(cond_t, cond);
+    f.f.body.push(f.if_return(cond), S);
+
+    // kv_base = t * kv_dim + kv_head * head_dim
+    let kv_dim = f.binary(BinaryOperator::Multiply, num_kv_heads, head_dim);
+    let t_kv = f.binary(BinaryOperator::Multiply, t, kv_dim);
+    let kv_head_off = f.binary(BinaryOperator::Multiply, kv_head, head_dim);
+    let kv_base = f.binary(BinaryOperator::Add, t_kv, kv_head_off);
+    let heads_per_kv = f.binary(BinaryOperator::Divide, num_heads, num_kv_heads);
+    let q_dim = f.binary(BinaryOperator::Multiply, num_heads, head_dim);
+    let hd_f = f.cast_f32(head_dim);
+    let scale = f.math1(MathFunction::InverseSqrt, hd_f);
+    f.emit(kv_dim, scale);
+
+    let kv_base_var = f.local_var("kv_base", b.ty_u32, None);
+    let kv_base_ptr = f.local_ptr(kv_base_var);
+    f.f.body.push(f.store(kv_base_ptr, kv_base), S);
+    let heads_per_kv_var = f.local_var("heads_per_kv", b.ty_u32, None);
+    let heads_per_kv_ptr = f.local_ptr(heads_per_kv_var);
+    f.f.body.push(f.store(heads_per_kv_ptr, heads_per_kv), S);
+    let q_dim_var = f.local_var("q_dim", b.ty_u32, None);
+    let q_dim_ptr = f.local_ptr(q_dim_var);
+    f.f.body.push(f.store(q_dim_ptr, q_dim), S);
+    let scale_var = f.local_var("scale", b.ty_f32, None);
+    let scale_ptr = f.local_ptr(scale_var);
+    f.f.body.push(f.store(scale_ptr, scale), S);
+
+    let my_dv_var = f.local_var("my_dv", b.ty_f32, None);
+    let my_dv_ptr = f.local_ptr(my_dv_var);
+    let zero_f = f.literal_f32(0.0);
+    f.emit(zero_f, zero_f);
+    f.f.body.push(f.store(my_dv_ptr, zero_f), S);
+
+    // Outer loop: for pos in 0..q_seq
+    let pos_var = f.local_var("pos", b.ty_u32, None);
+    let pos_ptr = f.local_ptr(pos_var);
+    let zero_u = f.literal_u32(0);
+    f.emit(zero_u, zero_u);
+    f.f.body.push(f.store(pos_ptr, zero_u), S);
+
+    {
+        let mut body_pos = Block::new();
+
+        let pos = f.load(pos_ptr);
+        let brk_pos = f.binary(BinaryOperator::GreaterEqual, pos, q_seq);
+        push_emit(&f.f.expressions, &mut body_pos, pos, brk_pos);
+        body_pos.push(FnBuilder::if_break(brk_pos), S);
+
+        // Inner loop: for head_rel in 0..heads_per_kv
+        let head_rel_var = f.local_var("head_rel", b.ty_u32, None);
+        let head_rel_ptr = f.local_ptr(head_rel_var);
+        let zero_u2 = f.literal_u32(0);
+        push_emit(&f.f.expressions, &mut body_pos, zero_u2, zero_u2);
+        body_pos.push(f.store(head_rel_ptr, zero_u2), S);
+
+        {
+            let mut body_hr = Block::new();
+
+            let head_rel = f.load(head_rel_ptr);
+            let hpk = f.load(heads_per_kv_ptr);
+            let brk_hr = f.binary(BinaryOperator::GreaterEqual, head_rel, hpk);
+            push_emit(&f.f.expressions, &mut body_hr, head_rel, brk_hr);
+            body_hr.push(FnBuilder::if_break(brk_hr), S);
+
+            // head = kv_head * heads_per_kv + head_rel
+            let kv_h = kv_head;
+            let kv_h_hpk = f.binary(BinaryOperator::Multiply, kv_h, hpk);
+            let head_cur = f.binary(BinaryOperator::Add, kv_h_hpk, head_rel);
+            // q_base = pos * q_dim + head * head_dim
+            let qdim = f.load(q_dim_ptr);
+            let pos_qdim = f.binary(BinaryOperator::Multiply, pos, qdim);
+            let head_hd = f.binary(BinaryOperator::Multiply, head_cur, head_dim);
+            let q_base = f.binary(BinaryOperator::Add, pos_qdim, head_hd);
+            push_emit(&f.f.expressions, &mut body_hr, kv_h_hpk, q_base);
+
+            // Parallel reduce score = sum_d Q[q_base+d] * K[kv_base+d] * scale
+            let q_gp = f.global(gv_q);
+            let q_idx = f.binary(BinaryOperator::Add, q_base, tid);
+            let q_elem = f.index(q_gp, q_idx);
+            let q_val = f.load(q_elem);
+            let kvb = f.load(kv_base_ptr);
+            let k_gp = f.global(gv_k);
+            let k_idx = f.binary(BinaryOperator::Add, kvb, tid);
+            let k_elem = f.index(k_gp, k_idx);
+            let k_val = f.load(k_elem);
+            let qk_partial = f.binary(BinaryOperator::Multiply, q_val, k_val);
+            push_emit(&f.f.expressions, &mut body_hr, q_idx, qk_partial);
+
+            let wg_p = f.global(gv_wg);
+            let wg_tid = f.index(wg_p, tid);
+            push_emit(&f.f.expressions, &mut body_hr, wg_tid, wg_tid);
+            body_hr.push(f.store(wg_tid, qk_partial), S);
+            body_hr.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
+            for stride_val in [32u32, 16, 8, 4, 2, 1] {
+                let stride = f.literal_u32(stride_val);
+                let cond_s = f.binary(BinaryOperator::Less, tid, stride);
+                let partner = f.binary(BinaryOperator::Add, tid, stride);
+                let wg_pp = f.global(gv_wg);
+                let wg_self = f.index(wg_pp, tid);
+                let wg_part = f.index(wg_pp, partner);
+                let sv = f.load(wg_self);
+                let pv = f.load(wg_part);
+                let reduced = f.binary(BinaryOperator::Add, sv, pv);
+                push_emit(&f.f.expressions, &mut body_hr, cond_s, reduced);
+                body_hr.push(
+                    Statement::If {
+                        condition: cond_s,
+                        accept: Block::from_vec(vec![f.store(wg_self, reduced)]),
+                        reject: Block::new(),
+                    },
+                    S,
+                );
+                body_hr.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
+            }
+            let sc = f.load(scale_ptr);
+            let wg_p0 = f.global(gv_wg);
+            let z_idx = f.literal_u32(0);
+            let wg_0 = f.index(wg_p0, z_idx);
+            let dot_sum = f.load(wg_0);
+            let score = f.binary(BinaryOperator::Multiply, dot_sum, sc);
+            push_emit(&f.f.expressions, &mut body_hr, sc, score);
+
+            // P_t = exp(score - lse[pos * num_heads + head])
+            let lse_gp = f.global(gv_lse);
+            let lse_pos_off = f.binary(BinaryOperator::Multiply, pos, num_heads);
+            let lse_idx = f.binary(BinaryOperator::Add, lse_pos_off, head_cur);
+            let lse_elem = f.index(lse_gp, lse_idx);
+            let lse_val = f.load(lse_elem);
+            let score_shifted = f.binary(BinaryOperator::Subtract, score, lse_val);
+            let p_t = f.math1(MathFunction::Exp, score_shifted);
+            push_emit(&f.f.expressions, &mut body_hr, lse_pos_off, p_t);
+
+            // my_dv += P_t * dO[q_base+tid]
+            let d_out_gp = f.global(gv_d_out);
+            let do_idx = f.binary(BinaryOperator::Add, q_base, tid);
+            let do_elem = f.index(d_out_gp, do_idx);
+            let do_val = f.load(do_elem);
+            let contrib = f.binary(BinaryOperator::Multiply, p_t, do_val);
+            let old_dv = f.load(my_dv_ptr);
+            let new_dv = f.binary(BinaryOperator::Add, old_dv, contrib);
+            push_emit(&f.f.expressions, &mut body_hr, do_idx, new_dv);
+            body_hr.push(f.store(my_dv_ptr, new_dv), S);
+
+            // head_rel++
+            let one_hr = f.literal_u32(1);
+            let hr2 = f.load(head_rel_ptr);
+            let hrn = f.binary(BinaryOperator::Add, hr2, one_hr);
+            push_emit(&f.f.expressions, &mut body_hr, one_hr, hrn);
+            body_hr.push(f.store(head_rel_ptr, hrn), S);
+
+            body_pos.push(
+                Statement::Loop {
+                    body: body_hr,
+                    continuing: Block::new(),
+                    break_if: None,
+                },
+                S,
+            );
+        }
+
+        // pos++
+        let one_pos = f.literal_u32(1);
+        let pos2 = f.load(pos_ptr);
+        let posn = f.binary(BinaryOperator::Add, pos2, one_pos);
+        push_emit(&f.f.expressions, &mut body_pos, one_pos, posn);
+        body_pos.push(f.store(pos_ptr, posn), S);
+
+        f.f.body.push(
+            Statement::Loop {
+                body: body_pos,
+                continuing: Block::new(),
+                break_if: None,
+            },
+            S,
+        );
+    }
+
+    // Write dst[kv_base+tid] = my_dv
+    let dv_val = f.load(my_dv_ptr);
+    let kvb_final = f.load(kv_base_ptr);
+    let dst_idx = f.binary(BinaryOperator::Add, kvb_final, tid);
+    let dst_gp = f.global(gv_dst);
+    let dst_elem = f.index(dst_gp, dst_idx);
+    f.emit(dv_val, dst_elem);
+    f.f.body.push(f.store(dst_elem, dv_val), S);
+
+    b.entry_point("main", [WG, 1, 1], f.finish());
+    b.finish()
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -3566,6 +4715,22 @@ mod tests {
             ),
             (
                 ShaderGroup::CrossAttention,
+                naga::valid::Capabilities::empty(),
+            ),
+            (
+                ShaderGroup::MultiHeadAttn,
+                naga::valid::Capabilities::empty(),
+            ),
+            (
+                ShaderGroup::MultiHeadAttnGradQ,
+                naga::valid::Capabilities::empty(),
+            ),
+            (
+                ShaderGroup::MultiHeadAttnGradK,
+                naga::valid::Capabilities::empty(),
+            ),
+            (
+                ShaderGroup::MultiHeadAttnGradV,
                 naga::valid::Capabilities::empty(),
             ),
         ];
@@ -3748,6 +4913,16 @@ mod tests {
                 | ShaderEntry::FullAttention
                 | ShaderEntry::CrossAttention => vec!["src_a", "src_b", "bias", "dst", "params"],
                 ShaderEntry::LayerNorm => vec!["src", "src_b", "bias", "dst", "params"],
+                ShaderEntry::MultiHeadAttn => {
+                    vec!["src_a", "src_b", "bias", "dst", "lse", "params"]
+                }
+                ShaderEntry::MultiHeadAttnGradQ
+                | ShaderEntry::MultiHeadAttnGradK
+                | ShaderEntry::MultiHeadAttnGradV => {
+                    vec![
+                        "d_out", "src_a", "src_b", "bias", "lse", "fwd_dst", "dst", "params",
+                    ]
+                }
             }
         }
 
@@ -3776,6 +4951,10 @@ mod tests {
             ShaderEntry::LayerNorm,
             ShaderEntry::FullAttention,
             ShaderEntry::CrossAttention,
+            ShaderEntry::MultiHeadAttn,
+            ShaderEntry::MultiHeadAttnGradQ,
+            ShaderEntry::MultiHeadAttnGradK,
+            ShaderEntry::MultiHeadAttnGradV,
         ];
 
         for entry in &entries {

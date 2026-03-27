@@ -202,9 +202,66 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 accumulate_grad(&mut graph, &mut grads, w, grad_w);
                 accumulate_grad(&mut graph, &mut grads, x, grad_output);
             }
+            Op::MultiHeadAttn {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                is_cross,
+            } => {
+                let q = node.inputs[0];
+                let k = node.inputs[1];
+                let v = node.inputs[2];
+                let fwd_node = node.id;
+
+                let q_ty = forward.nodes()[q as usize].ty.clone();
+                let k_ty = forward.nodes()[k as usize].ty.clone();
+                let v_ty = forward.nodes()[v as usize].ty.clone();
+
+                let grad_q = graph.add_raw_node(
+                    Op::MultiHeadAttnGradQ {
+                        fwd_node,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        is_cross,
+                    },
+                    vec![grad_output, q, k, v],
+                    q_ty,
+                );
+                let grad_k = graph.add_raw_node(
+                    Op::MultiHeadAttnGradK {
+                        fwd_node,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        is_cross,
+                    },
+                    vec![grad_output, q, k, v],
+                    k_ty,
+                );
+                let grad_v = graph.add_raw_node(
+                    Op::MultiHeadAttnGradV {
+                        fwd_node,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        is_cross,
+                    },
+                    vec![grad_output, q, k, v],
+                    v_ty,
+                );
+
+                accumulate_grad(&mut graph, &mut grads, q, grad_q);
+                accumulate_grad(&mut graph, &mut grads, k, grad_k);
+                accumulate_grad(&mut graph, &mut grads, v, grad_v);
+            }
             // Leaf nodes, fused ops don't appear in forward pass before optimization
             Op::Input { .. } | Op::Parameter { .. } | Op::Constant { .. } | Op::Greater => {}
             Op::Nop | Op::FusedMatMulAdd => {}
+            // Backward grad ops: never appear in forward pass
+            Op::MultiHeadAttnGradQ { .. }
+            | Op::MultiHeadAttnGradK { .. }
+            | Op::MultiHeadAttnGradV { .. } => {}
             // Inference-only ops: should not appear in training graphs
             Op::Embedding
             | Op::RoPE { .. }

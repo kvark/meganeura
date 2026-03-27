@@ -23,15 +23,15 @@ SmolVLA action expert on AMD RDNA3 (chunk_size=50, vlm_seq_len=16, 10 denoise st
 | ms / full chunk | 245 | 241 |
 
 SmolVLA action expert training (chunk_size=50, vlm_seq_len=16, 16 layers, float32, random weights, AMD RDNA3).
-Single-head attention (head_dim=64) — GQA reshape not yet implemented in meganeura:
+Full GQA (num_heads=15, num_kv_heads=5, head_dim=64) — differentiable MultiHeadAttn with saved LSE:
 
 | Metric | meganeura | PyTorch ROCm |
 |---|---|---|
-| Forward avg | 22.8 ms | 18.8 ms |
-| Forward median | 22.5 ms | 18.6 ms |
-| Train step avg | 77.9 ms | 68.2 ms |
-| Train step median | 78.2 ms | 68.2 ms |
-| Approx backward | 55.1 ms | 49.4 ms |
+| Forward avg | 26.0 ms | 23.2 ms |
+| Forward median | 25.7 ms | 23.0 ms |
+| Train step avg | 152 ms | 84.0 ms |
+| Train step median | 170 ms | 84.0 ms |
+| Approx backward | 126 ms | 60.8 ms |
 
 Run `bash bench/compare.sh` to reproduce, or `bash bench/compare.sh --model smolvla_train` for training only.
 

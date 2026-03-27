@@ -387,59 +387,11 @@ pub fn expert_weight_names(config: &SmolVLAConfig) -> Vec<String> {
     names
 }
 
-/// Primitive self-attention without fused kernel (for autodiff).
-///
-/// Decomposes attention into matmul → scale → softmax → matmul so the
-/// backward pass can propagate through each step independently.
-/// Simplified: single-head-equivalent (no GQA head splitting).
-///
-/// q, k, v must all have shape `[seq, d]`. Returns `[seq, d]`.
-fn primitive_self_attention(
-    g: &mut Graph,
-    q: NodeId,
-    k: NodeId,
-    v: NodeId,
-    seq: usize,
-    d: usize,
-) -> NodeId {
-    let scale = 1.0 / (d as f32).sqrt();
-    let k_t = g.transpose(k); // [d, seq]
-    let scores = g.matmul(q, k_t); // [seq, seq]
-    let scale_c = g.constant(vec![scale; seq * seq], &[seq, seq]);
-    let scores_s = g.mul(scores, scale_c); // [seq, seq]
-    let probs = g.softmax(scores_s); // [seq, seq]
-    g.matmul(probs, v) // [seq, d]
-}
-
-/// Primitive cross-attention without fused kernel (for autodiff).
-///
-/// q has shape `[q_seq, d]`, k and v have shape `[kv_seq, d]`.
-/// Returns `[q_seq, d]`.
-fn primitive_cross_attention(
-    g: &mut Graph,
-    q: NodeId,
-    k: NodeId,
-    v: NodeId,
-    q_seq: usize,
-    kv_seq: usize,
-    d: usize,
-) -> NodeId {
-    let scale = 1.0 / (d as f32).sqrt();
-    let k_t = g.transpose(k); // [d, kv_seq]
-    let scores = g.matmul(q, k_t); // [q_seq, kv_seq]
-    let scale_c = g.constant(vec![scale; q_seq * kv_seq], &[q_seq, kv_seq]);
-    let scores_s = g.mul(scores, scale_c); // [q_seq, kv_seq]
-    let probs = g.softmax(scores_s); // [q_seq, kv_seq]
-    g.matmul(probs, v) // [q_seq, d]
-}
 
 /// Build a training graph for the action expert with MSE loss.
 ///
-/// Replaces fused `CausalAttention`/`CrossAttention` ops with primitive
-/// `matmul → scale → softmax → matmul` chains so autodiff can propagate
-/// through all parameters. Uses a simplified single-head projection
-/// (head_dim-sized Q/K/V instead of full GQA) — the dominant matmul cost
-/// is identical; only the output projection dimension differs.
+/// Uses full GQA-capable `MultiHeadAttn` op (differentiable, with LSE saved
+/// for backward) for both self-attention and cross-attention layers.
 ///
 /// Inputs:
 /// - `noisy_actions`: `[action_seq_len, max_action_dim]`
@@ -457,8 +409,13 @@ pub fn build_action_expert_training(
     let expert = &config.expert;
     let expert_hidden = expert.hidden_size;
     let kv_dim = expert.kv_dim();
-    let head_dim = expert.head_dim as usize;
     let eps = expert.rms_norm_eps;
+
+    let num_heads = expert.num_attention_heads;
+    let num_kv_heads = expert.num_key_value_heads;
+    let hd = expert.head_dim;
+    let q_dim = (num_heads * hd) as usize;
+    let kv_dim_full = (num_kv_heads * hd) as usize;
 
     // --- Inputs ---
     let noisy_actions = g.input("noisy_actions", &[action_seq_len, config.max_action_dim]);
@@ -504,57 +461,56 @@ pub fn build_action_expert_training(
         let h = g.rms_norm(x, ln1_w, eps);
 
         if is_cross_attn {
-            // Cross-attention: primitive decomposition (q from action, k/v from VLM)
+            // Cross-attention: q from action tokens, k/v from VLM hidden states
             let wq = g.parameter(
                 &format!("{}.self_attn.q_proj.weight", prefix),
-                &[expert_hidden, head_dim],
+                &[expert_hidden, q_dim],
             );
-            let q = g.matmul(h, wq); // [action_seq, head_dim]
+            let q = g.matmul(h, wq); // [action_seq, num_heads*head_dim]
 
             let vlm_kv = g.input(&format!("vlm_kv_layer_{}", i), &[vlm_seq_len, kv_dim]);
             let wk = g.parameter(
                 &format!("{}.self_attn.k_proj.weight", prefix),
-                &[kv_dim, head_dim],
+                &[kv_dim, kv_dim_full],
             );
             let wv = g.parameter(
                 &format!("{}.self_attn.v_proj.weight", prefix),
-                &[kv_dim, head_dim],
+                &[kv_dim, kv_dim_full],
             );
-            let k = g.matmul(vlm_kv, wk); // [vlm_seq, head_dim]
-            let v = g.matmul(vlm_kv, wv); // [vlm_seq, head_dim]
+            let k = g.matmul(vlm_kv, wk); // [vlm_seq, num_kv_heads*head_dim]
+            let v = g.matmul(vlm_kv, wv); // [vlm_seq, num_kv_heads*head_dim]
 
-            let attn =
-                primitive_cross_attention(&mut g, q, k, v, action_seq_len, vlm_seq_len, head_dim);
+            let attn = g.multi_head_attn(q, k, v, num_heads, num_kv_heads, hd, true);
 
             let wo = g.parameter(
                 &format!("{}.self_attn.o_proj.weight", prefix),
-                &[head_dim, expert_hidden],
+                &[q_dim, expert_hidden],
             );
             let attn_out = g.matmul(attn, wo); // [action_seq, expert_hidden]
             x = g.add(x, attn_out);
         } else {
-            // Self-attention: primitive decomposition
+            // Self-attention: q/k/v all from action tokens
             let wq = g.parameter(
                 &format!("{}.self_attn.q_proj.weight", prefix),
-                &[expert_hidden, head_dim],
+                &[expert_hidden, q_dim],
             );
             let wk = g.parameter(
                 &format!("{}.self_attn.k_proj.weight", prefix),
-                &[expert_hidden, head_dim],
+                &[expert_hidden, kv_dim_full],
             );
             let wv = g.parameter(
                 &format!("{}.self_attn.v_proj.weight", prefix),
-                &[expert_hidden, head_dim],
+                &[expert_hidden, kv_dim_full],
             );
-            let q = g.matmul(h, wq); // [action_seq, head_dim]
-            let k = g.matmul(h, wk); // [action_seq, head_dim]
-            let v = g.matmul(h, wv); // [action_seq, head_dim]
+            let q = g.matmul(h, wq); // [action_seq, num_heads*head_dim]
+            let k = g.matmul(h, wk); // [action_seq, num_kv_heads*head_dim]
+            let v = g.matmul(h, wv); // [action_seq, num_kv_heads*head_dim]
 
-            let attn = primitive_self_attention(&mut g, q, k, v, action_seq_len, head_dim);
+            let attn = g.multi_head_attn(q, k, v, num_heads, num_kv_heads, hd, false);
 
             let wo = g.parameter(
                 &format!("{}.self_attn.o_proj.weight", prefix),
-                &[head_dim, expert_hidden],
+                &[q_dim, expert_hidden],
             );
             let attn_out = g.matmul(attn, wo); // [action_seq, expert_hidden]
             x = g.add(x, attn_out);

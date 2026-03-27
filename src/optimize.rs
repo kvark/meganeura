@@ -189,6 +189,7 @@ fn graph_to_egglog(graph: &Graph) -> String {
   (LayerNorm Op Op Op)
   (FullAttention Op Op Op)
   (CrossAttention Op Op Op)
+  (MultiHeadAttn Op Op Op)
 )
 
 ",
@@ -207,7 +208,13 @@ fn graph_to_egglog(graph: &Graph) -> String {
 
     // Define expressions for each node
     for node in graph.nodes() {
-        if let Op::Nop = node.op {
+        if matches!(
+            node.op,
+            Op::Nop
+                | Op::MultiHeadAttnGradQ { .. }
+                | Op::MultiHeadAttnGradK { .. }
+                | Op::MultiHeadAttnGradV { .. }
+        ) {
             continue;
         }
         let expr = node_to_egglog_expr(node);
@@ -265,6 +272,16 @@ fn node_to_egglog_expr(node: &Node) -> String {
             "(CrossAttention n{} n{} n{})",
             node.inputs[0], node.inputs[1], node.inputs[2]
         ),
+        Op::MultiHeadAttn { .. } => format!(
+            "(MultiHeadAttn n{} n{} n{})",
+            node.inputs[0], node.inputs[1], node.inputs[2]
+        ),
+        // Grad ops are skipped before node_to_egglog_expr is called
+        Op::MultiHeadAttnGradQ { .. }
+        | Op::MultiHeadAttnGradK { .. }
+        | Op::MultiHeadAttnGradV { .. } => {
+            unreachable!("Grad ops are filtered before egglog encoding")
+        }
         Op::Nop | Op::FusedMatMulAdd => {
             unreachable!("Nop/FusedMatMulAdd nodes should not appear before optimization")
         }
