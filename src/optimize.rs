@@ -176,6 +176,7 @@ fn graph_to_egglog(graph: &Graph) -> String {
   (LogSoftmax Op)
   (SumAll Op)
   (MeanAll Op)
+  (SumRows Op)
   (CrossEntropyLoss Op Op)
   (Greater Op Op)
   ; Transformer ops (passthrough, no fusion rules)
@@ -239,6 +240,7 @@ fn graph_to_egglog(graph: &Graph) -> String {
                 | Op::SwiGLUGradGate
                 | Op::SwiGLUGradUp
                 | Op::SiluGrad
+                | Op::SumRows
         )
     };
     for &out in graph.outputs() {
@@ -269,6 +271,7 @@ fn node_to_egglog_expr(node: &Node) -> String {
         Op::LogSoftmax => format!("(LogSoftmax n{})", node.inputs[0]),
         Op::SumAll => format!("(SumAll n{})", node.inputs[0]),
         Op::MeanAll => format!("(MeanAll n{})", node.inputs[0]),
+        Op::SumRows => format!("(SumRows n{})", node.inputs[0]),
         Op::CrossEntropyLoss => {
             format!("(CrossEntropyLoss n{} n{})", node.inputs[0], node.inputs[1])
         }

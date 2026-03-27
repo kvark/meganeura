@@ -127,6 +127,19 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let scaled_ones = graph.constant(vec![scale; x_shape.iter().product()], x_shape);
                 accumulate_grad(&mut graph, &mut grads, x, scaled_ones);
             }
+            Op::SumRows => {
+                // SumRows: [M, N] → [N]. Backward broadcasts [N] gradient back to [M, N].
+                // dL/dx[i,j] = dL/dy[j] for all rows i
+                let x = node.inputs[0];
+                let x_ty = &forward.nodes()[x as usize].ty;
+                let m = x_ty.shape[0];
+                let n = x_ty.shape[1];
+                // Backward broadcasts [N] gradient back to [M, N].
+                // BiasAdd(zeros[M,N], grad_output[N]) = grad_output broadcast to [M, N].
+                let zeros = graph.constant(vec![0.0; m * n], &[m, n]);
+                let grad_broadcast = graph.bias_add(zeros, grad_output);
+                accumulate_grad(&mut graph, &mut grads, x, grad_broadcast);
+            }
             Op::Neg => {
                 let x = node.inputs[0];
                 let grad_x = graph.neg(grad_output);
@@ -287,11 +300,8 @@ pub fn differentiate(forward: &Graph) -> Graph {
 /// Helper to implement sum_rows: reduce [M,N] → [N] by summing rows
 impl Graph {
     pub fn sum_rows(&mut self, x: NodeId, target_ty: &TensorType) -> NodeId {
-        // This is a specialized reduction. We'll implement it as a SumRows op.
-        // For now, we use MeanAll as a placeholder and scale.
-        // TODO: proper SumRows op
         let ty = target_ty.clone();
-        self.add_raw_node(Op::SumAll, vec![x], ty)
+        self.add_raw_node(Op::SumRows, vec![x], ty)
     }
 }
 
