@@ -3,7 +3,9 @@
     clippy::redundant_pattern_matching,
     clippy::needless_lifetimes,
     clippy::new_without_default,
-    clippy::single_match
+    clippy::single_match,
+    clippy::too_many_arguments,
+    clippy::collapsible_if
 )]
 #![warn(
     trivial_numeric_casts,

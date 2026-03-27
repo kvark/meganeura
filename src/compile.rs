@@ -3,8 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Identifies which shader and entry point to use.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ShaderEntry {
+    #[default]
     MatMul,
     MatMulAT,
     MatMulBT,
@@ -40,6 +41,8 @@ pub enum ShaderEntry {
     SwiGLUGradUp,
     SiluGrad,
     SumRows,
+    RmsNormGradW,
+    RmsNormGradX,
 }
 
 impl ShaderEntry {
@@ -76,6 +79,7 @@ impl ShaderEntry {
                 ShaderGroup::SwiGLUGrad
             }
             ShaderEntry::SumRows => ShaderGroup::SumRows,
+            ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => ShaderGroup::RmsNormGrad,
         }
     }
 
@@ -116,12 +120,14 @@ impl ShaderEntry {
             ShaderEntry::SwiGLUGradUp => "swiglu_grad_up",
             ShaderEntry::SiluGrad => "silu_grad",
             ShaderEntry::SumRows => "sum_rows",
+            ShaderEntry::RmsNormGradW => "rms_norm_grad_w",
+            ShaderEntry::RmsNormGradX => "rms_norm_grad_x",
         }
     }
 }
 
 /// A single GPU dispatch in the execution plan.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Dispatch {
     pub shader: ShaderEntry,
     pub workgroups: [u32; 3],
@@ -132,10 +138,14 @@ pub struct Dispatch {
     pub extra_output: Option<BufferRef>,
     /// Extra params to upload as a uniform buffer.
     pub params: Vec<u32>,
+    /// When true, this dispatch uses the cooperative matrix pipeline
+    /// (set at runtime based on per-dispatch eligibility).
+    #[serde(default)]
+    pub use_coop: bool,
 }
 
 /// Reference to a GPU buffer in the execution plan.
-#[derive(Clone, Debug, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BufferRef(pub u32);
 
 /// The complete execution plan: a static sequence of dispatches.
@@ -281,6 +291,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![m, k, n, 0],
+                    use_coop: false,
                 });
             }
 
@@ -300,6 +311,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![m, n, k, 0],
+                    use_coop: false,
                 });
             }
 
@@ -319,6 +331,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![m, n, k, 0],
+                    use_coop: false,
                 });
             }
 
@@ -339,6 +352,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![m, k, n, 0],
+                    use_coop: false,
                 });
             }
 
@@ -364,6 +378,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![len, bias_len, 0, 0],
+                    use_coop: false,
                 });
             }
 
@@ -382,11 +397,12 @@ impl<'a> Compiler<'a> {
                 let len = self.graph.node(node.inputs[0]).ty.num_elements() as u32;
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::SumAll,
-                    workgroups: [ceil_div(len, 256), 1, 1],
+                    workgroups: [1, 1, 1],
                     input_buffers: vec![input],
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![len, 0, 0, 0],
+                    use_coop: false,
                 });
             }
 
@@ -395,11 +411,12 @@ impl<'a> Compiler<'a> {
                 let len = self.graph.node(node.inputs[0]).ty.num_elements() as u32;
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::MeanAll,
-                    workgroups: [ceil_div(len, 256), 1, 1],
+                    workgroups: [1, 1, 1],
                     input_buffers: vec![input],
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![len, 0, 0, 0],
+                    use_coop: false,
                 });
             }
 
@@ -416,6 +433,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![m, n, 0, 0],
+                    use_coop: false,
                 });
             }
 
@@ -431,6 +449,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![batch, features, 0, 0],
+                    use_coop: false,
                 });
             }
 
@@ -447,6 +466,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![batch, features, 0, 0],
+                    use_coop: false,
                 });
             }
 
@@ -463,6 +483,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![batch, features, 0, 0],
+                    use_coop: false,
                 });
             }
 
@@ -478,6 +499,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![m, n, 0, 0],
+                    use_coop: false,
                 });
             }
 
@@ -502,6 +524,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![rows, cols, eps.to_bits(), 0],
+                    use_coop: false,
                 });
             }
 
@@ -519,6 +542,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![seq, hidden, 0, 0],
+                    use_coop: false,
                 });
             }
 
@@ -534,6 +558,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![seq, dim, theta.to_bits(), 0],
+                    use_coop: false,
                 });
             }
 
@@ -553,6 +578,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![seq, num_heads, num_kv_heads, head_dim],
+                    use_coop: false,
                 });
             }
 
@@ -574,6 +600,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![rows, cols, eps.to_bits(), 0],
+                    use_coop: false,
                 });
             }
 
@@ -593,6 +620,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![seq, num_heads, num_kv_heads, head_dim],
+                    use_coop: false,
                 });
             }
 
@@ -614,6 +642,7 @@ impl<'a> Compiler<'a> {
                     extra_output: None,
                     // Pack both seq lengths: q_seq in first, kv_seq encoded via head_dim slot
                     params: vec![q_seq, kv_seq, (num_heads << 16) | num_kv_heads, head_dim],
+                    use_coop: false,
                 });
             }
 
@@ -636,6 +665,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_output: Some(lse_buf),
                     params: vec![q_seq, kv_seq, (num_heads << 16) | num_kv_heads, head_dim],
+                    use_coop: false,
                 });
             }
 
@@ -661,6 +691,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![q_seq, kv_seq, (num_heads << 16) | num_kv_heads, head_dim],
+                    use_coop: false,
                 });
             }
 
@@ -686,6 +717,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![q_seq, kv_seq, (num_heads << 16) | num_kv_heads, head_dim],
+                    use_coop: false,
                 });
             }
 
@@ -711,6 +743,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![q_seq, kv_seq, (num_heads << 16) | num_kv_heads, head_dim],
+                    use_coop: false,
                 });
             }
 
@@ -727,6 +760,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![len, 0, 0, 0],
+                    use_coop: false,
                 });
             }
 
@@ -742,6 +776,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![len, 0, 0, 0],
+                    use_coop: false,
                 });
             }
 
@@ -757,6 +792,43 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![len, 0, 0, 0],
+                    use_coop: false,
+                });
+            }
+
+            Op::RmsNormGradW { eps } => {
+                let dy = self.get_buffer(node.inputs[0]);
+                let x = self.get_buffer(node.inputs[1]);
+                let w = self.get_buffer(node.inputs[2]);
+                let x_shape = &self.graph.node(node.inputs[1]).ty.shape;
+                let rows = x_shape[0] as u32;
+                let cols = x_shape[1] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::RmsNormGradW,
+                    workgroups: [ceil_div(cols, 256), 1, 1],
+                    input_buffers: vec![dy, x, w],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![rows, cols, eps.to_bits(), 0],
+                    use_coop: false,
+                });
+            }
+
+            Op::RmsNormGradX { eps } => {
+                let dy = self.get_buffer(node.inputs[0]);
+                let x = self.get_buffer(node.inputs[1]);
+                let w = self.get_buffer(node.inputs[2]);
+                let x_shape = &self.graph.node(node.inputs[1]).ty.shape;
+                let rows = x_shape[0] as u32;
+                let cols = x_shape[1] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::RmsNormGradX,
+                    workgroups: [rows, 1, 1],
+                    input_buffers: vec![dy, x, w],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![rows, cols, eps.to_bits(), 0],
+                    use_coop: false,
                 });
             }
         }
@@ -766,7 +838,7 @@ impl<'a> Compiler<'a> {
         self.plan
             .lse_buffers
             .iter()
-            .find(|(id, _)| *id == fwd_node)
+            .find(|item| item.0 == fwd_node)
             .expect("LSE buffer not found for MultiHeadAttn forward node")
             .1
     }
@@ -781,6 +853,7 @@ impl<'a> Compiler<'a> {
             output_buffer: out_buf,
             extra_output: None,
             params: vec![len, 0, 0, 0],
+            use_coop: false,
         });
     }
 
@@ -795,6 +868,7 @@ impl<'a> Compiler<'a> {
             output_buffer: out_buf,
             extra_output: None,
             params: vec![len, 0, 0, 0],
+            use_coop: false,
         });
     }
 }
@@ -1058,6 +1132,8 @@ mod tests {
             ShaderEntry::SwiGLUGradGate,
             ShaderEntry::SwiGLUGradUp,
             ShaderEntry::SiluGrad,
+            ShaderEntry::RmsNormGradW,
+            ShaderEntry::RmsNormGradX,
         ];
         for entry in &entries {
             let _group = entry.shader_group();

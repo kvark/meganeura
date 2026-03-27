@@ -209,6 +209,17 @@ pub enum Op {
         head_dim: u32,
         is_cross: bool,
     },
+
+    // Exact RmsNorm backward: grad_w[j] = sum_i(dy[i,j] * x[i,j] * rsqrt_i)
+    // inputs: [dy, x, w] → [cols]
+    RmsNormGradW {
+        eps: f32,
+    },
+    // Exact RmsNorm backward: grad_x[i,j] = rsqrt_i * (dy[i,j]*w[j] - x[i,j]*s_i)
+    // inputs: [dy, x, w] → [rows, cols]
+    RmsNormGradX {
+        eps: f32,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -474,6 +485,16 @@ impl Graph {
         );
         let ty = self.node(x).ty.clone();
         self.add_node(Op::RmsNorm { eps }, vec![x, weight], ty)
+    }
+
+    pub fn rms_norm_grad_w(&mut self, dy: NodeId, x: NodeId, w: NodeId, eps: f32) -> NodeId {
+        let w_ty = self.node(w).ty.clone();
+        self.add_raw_node(Op::RmsNormGradW { eps }, vec![dy, x, w], w_ty)
+    }
+
+    pub fn rms_norm_grad_x(&mut self, dy: NodeId, x: NodeId, w: NodeId, eps: f32) -> NodeId {
+        let x_ty = self.node(x).ty.clone();
+        self.add_raw_node(Op::RmsNormGradX { eps }, vec![dy, x, w], x_ty)
     }
 
     pub fn input_u32(&mut self, name: &str, shape: &[usize]) -> NodeId {

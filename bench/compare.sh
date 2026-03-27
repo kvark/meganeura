@@ -12,7 +12,7 @@
 #   SmolVLA-specific:  STEPS=10  CHUNK_SIZE=50  VLM_SEQ_LEN=16
 set -euo pipefail
 
-MODEL="${MODEL:-smolvla}"
+MODEL="${MODEL:-all}"
 TRAIN_LR="${TRAIN_LR:-0.00001}"
 RUNS="${RUNS:-5}"
 WARMUP="${WARMUP:-3}"
@@ -96,7 +96,7 @@ run_smolvla() {
         --steps "$STEPS" \
         --warmup "$WARMUP" \
         --runs "$RUNS" \
-        ${FORCE} \
+        --force \
         > "$OUT_DIR/smolvla_meganeura.json" 2>/dev/stderr
     echo "  -> $OUT_DIR/smolvla_meganeura.json"
     echo ""
@@ -200,7 +200,7 @@ run_smolvla_train() {
     "$ROOT/target/release/examples/bench_smolvla_train" \
         --warmup "$WARMUP" \
         --runs "$RUNS" \
-        ${FORCE} \
+        --force \
         > "$OUT_DIR/smolvla_train_meganeura.json" 2>/dev/stderr
     echo "  -> $OUT_DIR/smolvla_train_meganeura.json"
     echo ""
@@ -251,7 +251,7 @@ run_smollm2() {
         --max-tokens "$MAX_TOKENS" \
         --warmup "$WARMUP" \
         --runs "$RUNS" \
-        ${FORCE} \
+        --force \
         > "$OUT_DIR/meganeura.json" 2>/dev/stderr
     echo "  -> $OUT_DIR/meganeura.json"
     echo ""

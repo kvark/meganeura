@@ -241,92 +241,96 @@ struct MultiHeadAttnGradData {
 // ---- Pipeline collection ----
 
 struct Pipelines {
+    /// Scalar (default) pipelines.
     map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
+    /// Cooperative-matrix pipelines for dispatches with `use_coop = true`.
+    coop_map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
 }
 
 impl Pipelines {
-    fn new(gpu: &Gpu, plan: &ExecutionPlan, use_coop_matmul: bool) -> Self {
+    fn new(gpu: &Gpu, plan: &ExecutionPlan) -> Self {
         use crate::codegen::ShaderGroup;
         use blade_graphics as bg;
 
-        // Collect unique (ShaderGroup, entries) pairs
-        let mut needed: HashMap<ShaderGroup, Vec<&ShaderEntry>> = HashMap::new();
+        // Collect which shader groups are needed.
+        // For matmul entries, compile BOTH scalar and coop if any dispatch uses coop.
+        let mut needed: HashSet<ShaderGroup> = HashSet::new();
+        let mut needed_coop: HashSet<ShaderGroup> = HashSet::new();
+        let mut entries_for_group: HashMap<ShaderGroup, HashSet<ShaderEntry>> = HashMap::new();
+
         for dispatch in &plan.dispatches {
-            let mut group = dispatch.shader.shader_group();
-            // Upgrade matmul ops to cooperative matrix path if supported AND
-            // the dispatch has enough workgroups for coop to be efficient.
-            // MatMul/FusedMatMulAdd: params=[m,k,n,0] → n at index 2.
-            // MatMulAT/MatMulBT:    params=[m,n,k,0] → n at index 1.
-            if use_coop_matmul {
-                let (m, n, k) = match group {
-                    ShaderGroup::MatMul | ShaderGroup::MatMulAdd => {
-                        (dispatch.params[0], dispatch.params[2], dispatch.params[1])
-                    }
-                    ShaderGroup::MatMulAT | ShaderGroup::MatMulBT => {
-                        (dispatch.params[0], dispatch.params[1], dispatch.params[2])
-                    }
-                    _ => (0, 0, 0),
+            let group = dispatch.shader.shader_group();
+            needed.insert(group);
+            entries_for_group
+                .entry(group)
+                .or_default()
+                .insert(dispatch.shader.clone());
+            if dispatch.use_coop {
+                let coop_group = match group {
+                    ShaderGroup::MatMul => ShaderGroup::MatMulCoop,
+                    ShaderGroup::MatMulAdd => ShaderGroup::MatMulCoopAdd,
+                    ShaderGroup::MatMulAT => ShaderGroup::MatMulCoopAT,
+                    ShaderGroup::MatMulBT => ShaderGroup::MatMulCoopBT,
+                    _ => continue,
                 };
-                if m > 0 {
-                    let coop_wgs = ceil_div(m, 32) * ceil_div(n, 32);
-                    // Use a lower workgroup threshold when K is large: each coop tile
-                    // does proportionally more arithmetic so fewer tiles are needed for
-                    // coop to beat scalar occupancy.
-                    let min_wgs = if k >= 1024 {
-                        MIN_COOP_WORKGROUPS_HIGH_K
-                    } else {
-                        MIN_COOP_WORKGROUPS
-                    };
-                    if coop_wgs >= min_wgs {
-                        group = match group {
-                            ShaderGroup::MatMul => ShaderGroup::MatMulCoop,
-                            ShaderGroup::MatMulAdd => ShaderGroup::MatMulCoopAdd,
-                            ShaderGroup::MatMulAT => ShaderGroup::MatMulCoopAT,
-                            ShaderGroup::MatMulBT => ShaderGroup::MatMulCoopBT,
-                            _ => unreachable!(),
-                        };
-                    }
-                }
+                needed_coop.insert(coop_group);
+                entries_for_group
+                    .entry(coop_group)
+                    .or_default()
+                    .insert(dispatch.shader.clone());
             }
-            needed.entry(group).or_default().push(&dispatch.shader);
         }
 
-        // Always compile SgdUpdate if the plan has trainable parameters,
-        // so sgd_step() can be called without dispatches in the plan.
+        // Always compile SgdUpdate if the plan has trainable parameters.
         if !plan.param_grad_pairs.is_empty() {
-            needed
+            needed.insert(ShaderGroup::Sgd);
+            entries_for_group
                 .entry(ShaderGroup::Sgd)
                 .or_default()
-                .push(&ShaderEntry::SgdUpdate);
+                .insert(ShaderEntry::SgdUpdate);
         }
 
         let mut map = HashMap::new();
-        for (group, entries) in &needed {
-            let module = crate::codegen::generate_module(*group);
-            let shader = gpu.create_shader(bg::ShaderDesc {
-                source: "",
-                naga_module: Some(module),
-            });
+        let mut coop_map = HashMap::new();
 
-            for entry in entries {
-                if map.contains_key(*entry) {
-                    continue;
-                }
-                let layout = shader_data_layout(entry);
-                let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                    name: (*entry).entry_point(),
-                    data_layouts: &[&layout],
-                    compute: shader.at((*entry).entry_point()),
+        let compile_group =
+            |group: ShaderGroup,
+             target: &mut HashMap<ShaderEntry, blade_graphics::ComputePipeline>| {
+                let module = crate::codegen::generate_module(group);
+                let shader = gpu.create_shader(bg::ShaderDesc {
+                    source: "",
+                    naga_module: Some(module),
                 });
-                map.insert((*entry).clone(), pipeline);
-            }
+                if let Some(entries) = entries_for_group.get(&group) {
+                    for entry in entries {
+                        let layout = shader_data_layout(entry);
+                        let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
+                            name: entry.entry_point(),
+                            data_layouts: &[&layout],
+                            compute: shader.at(entry.entry_point()),
+                        });
+                        target.insert(entry.clone(), pipeline);
+                    }
+                }
+            };
+
+        for &group in &needed {
+            compile_group(group, &mut map);
+        }
+        for &group in &needed_coop {
+            compile_group(group, &mut coop_map);
         }
 
-        Self { map }
+        Self { map, coop_map }
     }
 
-    fn get(&self, entry: &ShaderEntry) -> &blade_graphics::ComputePipeline {
-        &self.map[entry]
+    fn get(&self, dispatch: &Dispatch) -> &blade_graphics::ComputePipeline {
+        if dispatch.use_coop {
+            if let Some(p) = self.coop_map.get(&dispatch.shader) {
+                return p;
+            }
+        }
+        &self.map[&dispatch.shader]
     }
 }
 
@@ -361,6 +365,7 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         | ShaderEntry::MultiHeadAttnGradV => MultiHeadAttnGradData::layout(),
         ShaderEntry::SwiGLUGradGate => TernaryData::layout(),
         ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => BinaryData::layout(),
+        ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => CausalAttentionData::layout(),
     }
 }
 
@@ -601,18 +606,18 @@ impl Session {
         }
 
         let mut plan = plan;
+        // Mark individual dispatches for coop and recompute their workgroups.
+        // Unlike the old all-or-nothing policy, each dispatch is independently
+        // evaluated. Pipelines now stores both scalar and coop variants.
         if use_coop_matmul {
-            // Recompute matmul dispatch workgroups for 2×2-tile cooperative kernels.
-            // Only upgrade dispatches where the coop WG count meets the occupancy
-            // threshold; small matmuls (e.g. SmolVLA's m=50) are left on the scalar
-            // path which is faster at low parallelism.
-            // MatMul/FusedMatMulAdd: params=[m,k,n,0]; MatMulAT/BT: params=[m,n,k,0].
+            use crate::codegen::ShaderGroup;
             for dispatch in &mut plan.dispatches {
-                let (m, n, k) = match dispatch.shader {
-                    ShaderEntry::MatMul | ShaderEntry::FusedMatMulAdd => {
+                let group = dispatch.shader.shader_group();
+                let (m, n, k) = match group {
+                    ShaderGroup::MatMul | ShaderGroup::MatMulAdd => {
                         (dispatch.params[0], dispatch.params[2], dispatch.params[1])
                     }
-                    ShaderEntry::MatMulAT | ShaderEntry::MatMulBT => {
+                    ShaderGroup::MatMulAT | ShaderGroup::MatMulBT => {
                         (dispatch.params[0], dispatch.params[1], dispatch.params[2])
                     }
                     _ => continue,
@@ -623,10 +628,12 @@ impl Session {
                 } else {
                     MIN_COOP_WORKGROUPS
                 };
-                if coop_wgs >= min_wgs {
+                let m_edge_safe = m % 32 <= 16;
+                let n_edge_safe = n % 32 <= 16;
+                if coop_wgs >= min_wgs && m_edge_safe && n_edge_safe {
+                    dispatch.use_coop = true;
                     dispatch.workgroups = [ceil_div(m, 32), ceil_div(n, 32), 1];
                 }
-                // else: keep scalar workgroups [ceil(n/16), ceil(m/16), 1]
             }
         }
 
@@ -663,7 +670,7 @@ impl Session {
             }
         }
 
-        let pipelines = Pipelines::new(&gpu, &plan, use_coop_matmul);
+        let pipelines = Pipelines::new(&gpu, &plan);
         let encoder = gpu.create_command_encoder(blade_graphics::CommandEncoderDesc {
             name: "meganeura",
             buffer_count: 2,
@@ -833,7 +840,7 @@ impl Session {
             // Note: blade caps timestamps at 100 passes per submission.
             for i in 0..self.plan.dispatches.len() {
                 let dispatch = &self.plan.dispatches[i];
-                let pipeline = self.pipelines.get(&dispatch.shader);
+                let pipeline = self.pipelines.get(dispatch);
                 let mut pass = self.encoder.compute(&format!("{:?}", dispatch.shader));
                 let mut pc = pass.with(pipeline);
                 Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
@@ -850,7 +857,7 @@ impl Session {
                 let mut pass = self.encoder.compute("step");
                 for i in group {
                     let dispatch = &self.plan.dispatches[i];
-                    let pipeline = self.pipelines.get(&dispatch.shader);
+                    let pipeline = self.pipelines.get(dispatch);
                     let mut pc = pass.with(pipeline);
                     Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
                     pc.dispatch(dispatch.workgroups);
@@ -1005,7 +1012,7 @@ impl Session {
                         src: buf(dispatch.input_buffers[0]),
                         dst: buf(dispatch.output_buffer),
                         params: UnaryParams {
-                            len: dispatch.params[0],  // m
+                            len: dispatch.params[0],   // m
                             _pad0: dispatch.params[1], // n
                             _pad1: 0,
                             _pad2: 0,
@@ -1252,6 +1259,23 @@ impl Session {
                     },
                 );
             }
+            ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => {
+                pc.bind(
+                    0,
+                    &CausalAttentionData {
+                        src_a: buf(dispatch.input_buffers[0]), // dy
+                        src_b: buf(dispatch.input_buffers[1]), // x
+                        bias: buf(dispatch.input_buffers[2]),  // w
+                        dst: buf(dispatch.output_buffer),
+                        params: MatMulParams {
+                            m: dispatch.params[0], // rows
+                            n: dispatch.params[1], // cols
+                            k: dispatch.params[2], // eps_bits
+                            _pad: dispatch.params[3],
+                        },
+                    },
+                );
+            }
         }
     }
 
@@ -1273,7 +1297,7 @@ impl Session {
 
         for &(param_buf, grad_buf) in &self.plan.param_grad_pairs {
             let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
-            let pipeline = self.pipelines.get(&ShaderEntry::SgdUpdate);
+            let pipeline = &self.pipelines.map[&ShaderEntry::SgdUpdate];
             let mut pass = self.encoder.compute("sgd_update");
             let mut pc = pass.with(pipeline);
             pc.bind(
@@ -1325,6 +1349,9 @@ impl Drop for Session {
         self.wait();
         self.gpu.destroy_command_encoder(&mut self.encoder);
         for (_, pipeline) in self.pipelines.map.iter_mut() {
+            self.gpu.destroy_compute_pipeline(pipeline);
+        }
+        for (_, pipeline) in self.pipelines.coop_map.iter_mut() {
             self.gpu.destroy_compute_pipeline(pipeline);
         }
         for buffer in &self.buffers {

@@ -552,6 +552,7 @@ pub enum ShaderGroup {
     MultiHeadAttnGradV,
     SwiGLUGrad,
     SumRows,
+    RmsNormGrad,
 }
 
 /// Generate a `naga::Module` for a shader group.
@@ -586,6 +587,7 @@ pub fn generate_module(group: ShaderGroup) -> Module {
         ShaderGroup::MultiHeadAttnGradV => gen_mha_grad_v(),
         ShaderGroup::SwiGLUGrad => gen_swiglu_grad(),
         ShaderGroup::SumRows => gen_sum_rows(),
+        ShaderGroup::RmsNormGrad => gen_rms_norm_grad(),
     }
 }
 
@@ -2643,39 +2645,66 @@ fn gen_reduce() -> Module {
         gv_wg: Handle<GlobalVariable>,
     ) -> Function {
         let mut f = FnBuilder::new(b);
-        let gid = f.arg_gid();
+        let _gid = f.arg_gid();
         let lid = f.arg_lid();
 
-        let i = f.vec_x(gid);
-        f.label("i", i);
         let local_id = f.vec_x(lid);
         f.label("local_id", local_id);
-        f.emit(i, local_id);
+        f.emit(local_id, local_id);
 
         let params_ptr = f.global(gv_params);
         let len_ptr = f.field(params_ptr, 0);
         let len = f.load(len_ptr);
         f.emit(params_ptr, len);
 
-        // Load src[i] or 0.0 into wg_data[local_id]
-        let i_lt_len = f.binary(BinaryOperator::Less, i, len);
-        let src_ptr = f.global(gv_src);
-        let src_elem = f.index(src_ptr, i);
-        let src_val = f.load(src_elem);
+        // Strided accumulation: each thread sums src[local_id], src[local_id+256], ...
+        let acc_var = f.local_var("acc", b.ty_f32, None);
+        let acc_ptr = f.local_ptr(acc_var);
         let zero = f.literal_f32(0.0);
-        f.emit(i_lt_len, zero);
+        f.emit(zero, zero);
+        f.f.body.push(f.store(acc_ptr, zero), S);
 
+        let idx_var = f.local_var("idx", b.ty_u32, None);
+        let idx_ptr = f.local_ptr(idx_var);
+        f.f.body.push(f.store(idx_ptr, local_id), S);
+
+        {
+            let mut loop_body = Block::new();
+            let idx = f.load(idx_ptr);
+            let brk = f.binary(BinaryOperator::GreaterEqual, idx, len);
+            push_emit(&f.f.expressions, &mut loop_body, idx, brk);
+            loop_body.push(FnBuilder::if_break(brk), S);
+
+            let src_ptr = f.global(gv_src);
+            let src_elem = f.index(src_ptr, idx);
+            let src_val = f.load(src_elem);
+            let old_acc = f.load(acc_ptr);
+            let new_acc = f.binary(BinaryOperator::Add, old_acc, src_val);
+            push_emit(&f.f.expressions, &mut loop_body, src_ptr, new_acc);
+            loop_body.push(f.store(acc_ptr, new_acc), S);
+
+            let wg_size = f.literal_u32(256);
+            let idx2 = f.load(idx_ptr);
+            let next_idx = f.binary(BinaryOperator::Add, idx2, wg_size);
+            push_emit(&f.f.expressions, &mut loop_body, wg_size, next_idx);
+            loop_body.push(f.store(idx_ptr, next_idx), S);
+
+            f.f.body.push(
+                Statement::Loop {
+                    body: loop_body,
+                    continuing: Block::new(),
+                    break_if: None,
+                },
+                S,
+            );
+        }
+
+        // Store accumulated value to wg_data[local_id]
+        let final_acc = f.load(acc_ptr);
         let wg_ptr = f.global(gv_wg);
         let wg_elem = f.index(wg_ptr, local_id);
-        f.emit(wg_elem, wg_elem);
-        f.f.body.push(
-            Statement::If {
-                condition: i_lt_len,
-                accept: Block::from_vec(vec![f.store(wg_elem, src_val)]),
-                reject: Block::from_vec(vec![f.store(wg_elem, zero)]),
-            },
-            S,
-        );
+        f.emit(final_acc, wg_elem);
+        f.f.body.push(f.store(wg_elem, final_acc), S);
         f.f.body
             .push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
 
@@ -2735,18 +2764,16 @@ fn gen_reduce() -> Module {
             );
         }
 
-        // if local_id == 0 { dst[gid.x / WG_SIZE] = wg_data[0]; }
+        // if local_id == 0 { dst[0] = wg_data[0] [/ len]; }
         let zero_u2 = f.literal_u32(0);
         let is_zero = f.binary(BinaryOperator::Equal, local_id, zero_u2);
-        let wg_size = f.literal_u32(256);
-        let out_idx = f.binary(BinaryOperator::Divide, i, wg_size);
         let wg_ptr3 = f.global(gv_wg);
         let zero_idx = f.literal_u32(0);
         let wg_0 = f.index(wg_ptr3, zero_idx);
         let wg_0_val = f.load(wg_0);
 
         let dst_ptr = f.global(gv_dst);
-        let dst_elem = f.index(dst_ptr, out_idx);
+        let dst_elem = f.index(dst_ptr, zero_u2);
 
         f.emit(zero_u2, wg_0_val);
         f.emit(dst_elem, dst_elem);
@@ -3523,6 +3550,524 @@ fn gen_rms_norm() -> Module {
     }
 
     b.entry_point("main", [WG, 1, 1], f.finish());
+    b.finish()
+}
+
+// ---------------------------------------------------------------------------
+// rms_norm_grad: exact backward for RmsNorm
+// Two entry points: rms_norm_grad_w (dispatch [ceil(cols/256), 1, 1])
+//                   rms_norm_grad_x (dispatch [rows, 1, 1])
+// Bindings: src_a (dy, ro), src_b (x, ro), bias (w, ro), dst (rw), params (uniform)
+// Params: rows (field 0), cols (field 1), eps_bits (field 2), _pad (field 3)
+// ---------------------------------------------------------------------------
+
+fn gen_rms_norm_grad() -> Module {
+    const WG: u32 = 256;
+
+    let mut b = Builder::new();
+    // Use m/n/k/_pad names to match MatMulParams struct layout used by CausalAttentionData
+    let ty_params = b.params_u32x4("Params", &["m", "n", "k", "_pad"]);
+    let gv_dy = b.storage_ro("src_a"); // dy
+    let gv_x = b.storage_ro("src_b"); // x
+    let gv_w = b.storage_ro("bias"); // w (weight)
+    let gv_dst = b.storage_rw("dst");
+    let gv_params = b.uniform("params", ty_params);
+
+    // --- Entry point: rms_norm_grad_w ---
+    // dispatch [ceil(cols/256), 1, 1], one thread per output column
+    // grad_w[col] = sum_i(dy[i*cols+col] * x[i*cols+col] * rsqrt_i)
+    // where rsqrt_i = 1/sqrt(sum_j(x[i*cols+j]^2)/cols + eps)
+    {
+        let mut f = FnBuilder::new(&b);
+        let gid = f.arg_gid();
+        let col = f.vec_x(gid);
+
+        // Load params
+        let params_ptr = f.global(gv_params);
+        let rows_ptr = f.field(params_ptr, 0);
+        let rows = f.load(rows_ptr);
+        let cols_ptr = f.field(params_ptr, 1);
+        let cols = f.load(cols_ptr);
+        let eps_ptr = f.field(params_ptr, 2);
+        let eps_bits = f.load(eps_ptr);
+        let eps = f.expr(Expression::As {
+            expr: eps_bits,
+            kind: ScalarKind::Float,
+            convert: None, // bitcast
+        });
+        f.emit(col, eps);
+
+        // Early return if col >= cols
+        let cond = f.binary(BinaryOperator::GreaterEqual, col, cols);
+        f.emit(cond, cond);
+        f.f.body.push(f.if_return(cond), S);
+
+        // acc = 0.0
+        let acc_var = f.local_var("acc", b.ty_f32, None);
+        let acc_ptr = f.local_ptr(acc_var);
+        let zero_f = f.literal_f32(0.0);
+        f.emit(zero_f, zero_f);
+        f.f.body.push(f.store(acc_ptr, zero_f), S);
+
+        // row = 0
+        let row_var = f.local_var("row", b.ty_u32, None);
+        let row_ptr = f.local_ptr(row_var);
+        let zero_u = f.literal_u32(0);
+        f.emit(zero_u, zero_u);
+        f.f.body.push(f.store(row_ptr, zero_u), S);
+
+        // Loop over rows
+        {
+            let mut body = Block::new();
+            let row = f.load(row_ptr);
+            let brk = f.binary(BinaryOperator::GreaterEqual, row, rows);
+            push_emit(&f.f.expressions, &mut body, row, brk);
+            body.push(FnBuilder::if_break(brk), S);
+
+            // Compute rsqrt_i for this row: loop over cols to get sum_of_squares
+            let ss_var = f.local_var("ss", b.ty_f32, None);
+            let ss_ptr = f.local_ptr(ss_var);
+            let zero_f2 = f.literal_f32(0.0);
+            push_emit(&f.f.expressions, &mut body, zero_f2, zero_f2);
+            body.push(f.store(ss_ptr, zero_f2), S);
+
+            let offset = f.binary(BinaryOperator::Multiply, row, cols);
+            push_emit(&f.f.expressions, &mut body, offset, offset);
+
+            // Inner loop: for j in 0..cols { ss += x[offset+j]^2 }
+            let j_var = f.local_var("j", b.ty_u32, None);
+            let j_ptr = f.local_ptr(j_var);
+            let zero_u2 = f.literal_u32(0);
+            push_emit(&f.f.expressions, &mut body, zero_u2, zero_u2);
+            body.push(f.store(j_ptr, zero_u2), S);
+
+            {
+                let mut inner = Block::new();
+                let j = f.load(j_ptr);
+                let brk_j = f.binary(BinaryOperator::GreaterEqual, j, cols);
+                push_emit(&f.f.expressions, &mut inner, j, brk_j);
+                inner.push(FnBuilder::if_break(brk_j), S);
+
+                let idx = f.binary(BinaryOperator::Add, offset, j);
+                let x_ptr = f.global(gv_x);
+                let x_elem = f.index(x_ptr, idx);
+                let x_val = f.load(x_elem);
+                let x_sq = f.binary(BinaryOperator::Multiply, x_val, x_val);
+                let old_ss = f.load(ss_ptr);
+                let new_ss = f.binary(BinaryOperator::Add, old_ss, x_sq);
+                push_emit(&f.f.expressions, &mut inner, idx, new_ss);
+                inner.push(f.store(ss_ptr, new_ss), S);
+
+                let one_u = f.literal_u32(1);
+                let j2 = f.load(j_ptr);
+                let j_next = f.binary(BinaryOperator::Add, j2, one_u);
+                push_emit(&f.f.expressions, &mut inner, one_u, j_next);
+                inner.push(f.store(j_ptr, j_next), S);
+
+                body.push(
+                    Statement::Loop {
+                        body: inner,
+                        continuing: Block::new(),
+                        break_if: None,
+                    },
+                    S,
+                );
+            }
+
+            // rsqrt_i = inverseSqrt(ss / cols + eps)
+            let ss_val = f.load(ss_ptr);
+            let cols_f = f.cast_f32(cols);
+            let mean_sq = f.binary(BinaryOperator::Divide, ss_val, cols_f);
+            let mean_sq_eps = f.binary(BinaryOperator::Add, mean_sq, eps);
+            let rsqrt_i = f.math1(MathFunction::InverseSqrt, mean_sq_eps);
+            push_emit(&f.f.expressions, &mut body, ss_val, rsqrt_i);
+
+            // acc += dy[offset+col] * x[offset+col] * rsqrt_i
+            let idx2 = f.binary(BinaryOperator::Add, offset, col);
+            let dy_ptr = f.global(gv_dy);
+            let dy_elem = f.index(dy_ptr, idx2);
+            let dy_val = f.load(dy_elem);
+            let x_ptr2 = f.global(gv_x);
+            let x_elem2 = f.index(x_ptr2, idx2);
+            let x_val2 = f.load(x_elem2);
+            let dyx = f.binary(BinaryOperator::Multiply, dy_val, x_val2);
+            let dyx_rsqrt = f.binary(BinaryOperator::Multiply, dyx, rsqrt_i);
+            let old_acc = f.load(acc_ptr);
+            let new_acc = f.binary(BinaryOperator::Add, old_acc, dyx_rsqrt);
+            push_emit(&f.f.expressions, &mut body, idx2, new_acc);
+            body.push(f.store(acc_ptr, new_acc), S);
+
+            // row++
+            let one_u2 = f.literal_u32(1);
+            let row2 = f.load(row_ptr);
+            let row_next = f.binary(BinaryOperator::Add, row2, one_u2);
+            push_emit(&f.f.expressions, &mut body, one_u2, row_next);
+            body.push(f.store(row_ptr, row_next), S);
+
+            f.f.body.push(
+                Statement::Loop {
+                    body,
+                    continuing: Block::new(),
+                    break_if: None,
+                },
+                S,
+            );
+        }
+
+        // dst[col] = acc
+        let acc_val = f.load(acc_ptr);
+        let dst_ptr = f.global(gv_dst);
+        let dst_elem = f.index(dst_ptr, col);
+        f.emit(acc_val, acc_val);
+        f.emit(dst_elem, dst_elem);
+        f.f.body.push(f.store(dst_elem, acc_val), S);
+
+        b.entry_point("rms_norm_grad_w", [WG, 1, 1], f.finish());
+    }
+
+    // --- Entry point: rms_norm_grad_x ---
+    // dispatch [rows, 1, 1], one workgroup (256 threads) per row
+    // Uses shared memory reduction like forward RmsNorm.
+    // grad_x[i,j] = rsqrt_i * (dy[i,j]*w[j] - x[i,j] * s_i)
+    // where s_i = (rsqrt_i^2 / cols) * sum_j(dy[i,j]*w[j]*x[i,j])
+    {
+        let gv_shared = b.workgroup_array("shared", WG);
+
+        let mut f = FnBuilder::new(&b);
+        let wgid = f.arg_wgid();
+        let lid = f.arg_lid();
+        let row = f.vec_x(wgid);
+        let tid = f.vec_x(lid);
+        f.emit(row, tid);
+
+        // Load params
+        let params_ptr = f.global(gv_params);
+        let rows_ptr = f.field(params_ptr, 0);
+        let rows = f.load(rows_ptr);
+        let cols_ptr = f.field(params_ptr, 1);
+        let cols = f.load(cols_ptr);
+        let eps_ptr = f.field(params_ptr, 2);
+        let eps_bits = f.load(eps_ptr);
+        let eps = f.expr(Expression::As {
+            expr: eps_bits,
+            kind: ScalarKind::Float,
+            convert: None,
+        });
+        f.emit(params_ptr, eps);
+
+        // Early return for extra workgroups
+        let cond = f.binary(BinaryOperator::GreaterEqual, row, rows);
+        f.emit(cond, cond);
+        f.f.body.push(f.if_return(cond), S);
+
+        // offset = row * cols
+        let offset = f.binary(BinaryOperator::Multiply, row, cols);
+        f.emit(offset, offset);
+
+        // ---- Phase 1: Compute rsqrt_i via shared memory reduction ----
+        // Partial sum of x^2
+        let ss_var = f.local_var("ss", b.ty_f32, None);
+        let ss_ptr = f.local_ptr(ss_var);
+        let zero_f = f.literal_f32(0.0);
+        f.emit(zero_f, zero_f);
+        f.f.body.push(f.store(ss_ptr, zero_f), S);
+
+        // for (j = tid; j < cols; j += WG) { ss += x[offset+j]^2 }
+        let j_var = f.local_var("j", b.ty_u32, None);
+        let j_ptr = f.local_ptr(j_var);
+        f.f.body.push(f.store(j_ptr, tid), S);
+
+        {
+            let mut body = Block::new();
+            let j = f.load(j_ptr);
+            let brk = f.binary(BinaryOperator::GreaterEqual, j, cols);
+            push_emit(&f.f.expressions, &mut body, j, brk);
+            body.push(FnBuilder::if_break(brk), S);
+
+            let idx = f.binary(BinaryOperator::Add, offset, j);
+            let x_ptr = f.global(gv_x);
+            let x_elem = f.index(x_ptr, idx);
+            let x_val = f.load(x_elem);
+            let x_sq = f.binary(BinaryOperator::Multiply, x_val, x_val);
+            let old_ss = f.load(ss_ptr);
+            let new_ss = f.binary(BinaryOperator::Add, old_ss, x_sq);
+            push_emit(&f.f.expressions, &mut body, idx, new_ss);
+            body.push(f.store(ss_ptr, new_ss), S);
+
+            let wg_size = f.literal_u32(WG);
+            let j2 = f.load(j_ptr);
+            let jn = f.binary(BinaryOperator::Add, j2, wg_size);
+            push_emit(&f.f.expressions, &mut body, wg_size, jn);
+            body.push(f.store(j_ptr, jn), S);
+
+            f.f.body.push(
+                Statement::Loop {
+                    body,
+                    continuing: Block::new(),
+                    break_if: None,
+                },
+                S,
+            );
+        }
+
+        // Store partial to shared memory
+        let partial_ss = f.load(ss_ptr);
+        let sh_ptr = f.global(gv_shared);
+        let sh_elem = f.index(sh_ptr, tid);
+        f.emit(partial_ss, sh_elem);
+        f.f.body.push(f.store(sh_elem, partial_ss), S);
+        f.f.body
+            .push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
+
+        // Tree reduction for sum of squares
+        let stride_var = f.local_var("stride", b.ty_u32, None);
+        let stride_ptr = f.local_ptr(stride_var);
+        let init_stride = f.literal_u32(WG / 2);
+        f.emit(init_stride, init_stride);
+        f.f.body.push(f.store(stride_ptr, init_stride), S);
+
+        {
+            let mut body = Block::new();
+            let stride = f.load(stride_ptr);
+            let zero_s = f.literal_u32(0);
+            let brk = f.binary(BinaryOperator::LessEqual, stride, zero_s);
+            push_emit(&f.f.expressions, &mut body, stride, brk);
+            body.push(FnBuilder::if_break(brk), S);
+
+            let cond_r = f.binary(BinaryOperator::Less, tid, stride);
+            let partner = f.binary(BinaryOperator::Add, tid, stride);
+            let sh_ptr2 = f.global(gv_shared);
+            let sh_self = f.index(sh_ptr2, tid);
+            let sh_partner = f.index(sh_ptr2, partner);
+            let self_val = f.load(sh_self);
+            let partner_val = f.load(sh_partner);
+            let sum = f.binary(BinaryOperator::Add, self_val, partner_val);
+            push_emit(&f.f.expressions, &mut body, cond_r, sum);
+
+            let mut accept = Block::new();
+            accept.push(f.store(sh_self, sum), S);
+            body.push(
+                Statement::If {
+                    condition: cond_r,
+                    accept,
+                    reject: Block::new(),
+                },
+                S,
+            );
+
+            body.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
+
+            let two = f.literal_u32(2);
+            let s2 = f.load(stride_ptr);
+            let next = f.binary(BinaryOperator::Divide, s2, two);
+            push_emit(&f.f.expressions, &mut body, two, next);
+            body.push(f.store(stride_ptr, next), S);
+
+            f.f.body.push(
+                Statement::Loop {
+                    body,
+                    continuing: Block::new(),
+                    break_if: None,
+                },
+                S,
+            );
+        }
+
+        // Compute rsqrt from shared[0]
+        let sh_ptr3 = f.global(gv_shared);
+        let zero_idx = f.literal_u32(0);
+        let sh_zero = f.index(sh_ptr3, zero_idx);
+        let total_ss = f.load(sh_zero);
+        let cols_f = f.cast_f32(cols);
+        let mean_sq = f.binary(BinaryOperator::Divide, total_ss, cols_f);
+        let mean_sq_eps = f.binary(BinaryOperator::Add, mean_sq, eps);
+        let rsqrt_i = f.math1(MathFunction::InverseSqrt, mean_sq_eps);
+        f.emit(sh_ptr3, rsqrt_i);
+
+        // ---- Phase 2: Compute s_i via shared memory reduction ----
+        // s_i = (rsqrt_i^2 / cols) * sum_j(dy[i,j]*w[j]*x[i,j])
+        // First compute partial dot product: sum_j(dy*w*x) for j in tid..cols step WG
+        let dot_var = f.local_var("dot", b.ty_f32, None);
+        let dot_ptr = f.local_ptr(dot_var);
+        let zero_f2 = f.literal_f32(0.0);
+        f.emit(zero_f2, zero_f2);
+        f.f.body.push(f.store(dot_ptr, zero_f2), S);
+
+        // for (j = tid; j < cols; j += WG) { dot += dy[offset+j]*w[j]*x[offset+j] }
+        let j2_var = f.local_var("j2", b.ty_u32, None);
+        let j2_ptr = f.local_ptr(j2_var);
+        f.f.body.push(f.store(j2_ptr, tid), S);
+
+        {
+            let mut body = Block::new();
+            let j = f.load(j2_ptr);
+            let brk = f.binary(BinaryOperator::GreaterEqual, j, cols);
+            push_emit(&f.f.expressions, &mut body, j, brk);
+            body.push(FnBuilder::if_break(brk), S);
+
+            let idx = f.binary(BinaryOperator::Add, offset, j);
+            let dy_ptr = f.global(gv_dy);
+            let dy_elem = f.index(dy_ptr, idx);
+            let dy_val = f.load(dy_elem);
+            let w_ptr = f.global(gv_w);
+            let w_elem = f.index(w_ptr, j);
+            let w_val = f.load(w_elem);
+            let x_ptr = f.global(gv_x);
+            let x_elem = f.index(x_ptr, idx);
+            let x_val = f.load(x_elem);
+            let dyw = f.binary(BinaryOperator::Multiply, dy_val, w_val);
+            let dywx = f.binary(BinaryOperator::Multiply, dyw, x_val);
+            let old_dot = f.load(dot_ptr);
+            let new_dot = f.binary(BinaryOperator::Add, old_dot, dywx);
+            push_emit(&f.f.expressions, &mut body, idx, new_dot);
+            body.push(f.store(dot_ptr, new_dot), S);
+
+            let wg_size = f.literal_u32(WG);
+            let j3 = f.load(j2_ptr);
+            let jn = f.binary(BinaryOperator::Add, j3, wg_size);
+            push_emit(&f.f.expressions, &mut body, wg_size, jn);
+            body.push(f.store(j2_ptr, jn), S);
+
+            f.f.body.push(
+                Statement::Loop {
+                    body,
+                    continuing: Block::new(),
+                    break_if: None,
+                },
+                S,
+            );
+        }
+
+        // Store partial dot to shared memory
+        let partial_dot = f.load(dot_ptr);
+        let sh_ptr4 = f.global(gv_shared);
+        let sh_elem4 = f.index(sh_ptr4, tid);
+        f.emit(partial_dot, sh_elem4);
+        f.f.body.push(f.store(sh_elem4, partial_dot), S);
+        f.f.body
+            .push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
+
+        // Tree reduction for dot product
+        let stride2_var = f.local_var("stride2", b.ty_u32, None);
+        let stride2_ptr = f.local_ptr(stride2_var);
+        let init_stride2 = f.literal_u32(WG / 2);
+        f.emit(init_stride2, init_stride2);
+        f.f.body.push(f.store(stride2_ptr, init_stride2), S);
+
+        {
+            let mut body = Block::new();
+            let stride = f.load(stride2_ptr);
+            let zero_s = f.literal_u32(0);
+            let brk = f.binary(BinaryOperator::LessEqual, stride, zero_s);
+            push_emit(&f.f.expressions, &mut body, stride, brk);
+            body.push(FnBuilder::if_break(brk), S);
+
+            let cond_r = f.binary(BinaryOperator::Less, tid, stride);
+            let partner = f.binary(BinaryOperator::Add, tid, stride);
+            let sh_ptr5 = f.global(gv_shared);
+            let sh_self = f.index(sh_ptr5, tid);
+            let sh_partner = f.index(sh_ptr5, partner);
+            let self_val = f.load(sh_self);
+            let partner_val = f.load(sh_partner);
+            let sum = f.binary(BinaryOperator::Add, self_val, partner_val);
+            push_emit(&f.f.expressions, &mut body, cond_r, sum);
+
+            let mut accept = Block::new();
+            accept.push(f.store(sh_self, sum), S);
+            body.push(
+                Statement::If {
+                    condition: cond_r,
+                    accept,
+                    reject: Block::new(),
+                },
+                S,
+            );
+
+            body.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
+
+            let two = f.literal_u32(2);
+            let s2 = f.load(stride2_ptr);
+            let next = f.binary(BinaryOperator::Divide, s2, two);
+            push_emit(&f.f.expressions, &mut body, two, next);
+            body.push(f.store(stride2_ptr, next), S);
+
+            f.f.body.push(
+                Statement::Loop {
+                    body,
+                    continuing: Block::new(),
+                    break_if: None,
+                },
+                S,
+            );
+        }
+
+        // s_i = (rsqrt_i^2 / cols) * shared[0]
+        let sh_ptr6 = f.global(gv_shared);
+        let zero_idx2 = f.literal_u32(0);
+        let sh_zero2 = f.index(sh_ptr6, zero_idx2);
+        let total_dot = f.load(sh_zero2);
+        let rsqrt_sq = f.binary(BinaryOperator::Multiply, rsqrt_i, rsqrt_i);
+        let rsqrt_sq_over_cols = f.binary(BinaryOperator::Divide, rsqrt_sq, cols_f);
+        let s_i = f.binary(BinaryOperator::Multiply, rsqrt_sq_over_cols, total_dot);
+        f.emit(sh_ptr6, s_i);
+
+        // ---- Phase 3: Write output ----
+        // for (j = tid; j < cols; j += WG) {
+        //     dst[offset+j] = rsqrt_i * (dy[offset+j]*w[j] - x[offset+j]*s_i)
+        // }
+        let j3_var = f.local_var("j3", b.ty_u32, None);
+        let j3_ptr = f.local_ptr(j3_var);
+        f.f.body.push(f.store(j3_ptr, tid), S);
+
+        {
+            let mut body = Block::new();
+            let j = f.load(j3_ptr);
+            let brk = f.binary(BinaryOperator::GreaterEqual, j, cols);
+            push_emit(&f.f.expressions, &mut body, j, brk);
+            body.push(FnBuilder::if_break(brk), S);
+
+            let idx = f.binary(BinaryOperator::Add, offset, j);
+            let dy_ptr = f.global(gv_dy);
+            let dy_elem = f.index(dy_ptr, idx);
+            let dy_val = f.load(dy_elem);
+            let w_ptr = f.global(gv_w);
+            let w_elem = f.index(w_ptr, j);
+            let w_val = f.load(w_elem);
+            let x_ptr = f.global(gv_x);
+            let x_elem = f.index(x_ptr, idx);
+            let x_val = f.load(x_elem);
+
+            // dy*w - x*s_i
+            let dyw = f.binary(BinaryOperator::Multiply, dy_val, w_val);
+            let xs = f.binary(BinaryOperator::Multiply, x_val, s_i);
+            let diff = f.binary(BinaryOperator::Subtract, dyw, xs);
+            let result = f.binary(BinaryOperator::Multiply, rsqrt_i, diff);
+            push_emit(&f.f.expressions, &mut body, idx, result);
+
+            let dst_ptr = f.global(gv_dst);
+            let dst_elem = f.index(dst_ptr, idx);
+            push_emit(&f.f.expressions, &mut body, dst_elem, dst_elem);
+            body.push(f.store(dst_elem, result), S);
+
+            let wg_size = f.literal_u32(WG);
+            let j4 = f.load(j3_ptr);
+            let jn = f.binary(BinaryOperator::Add, j4, wg_size);
+            push_emit(&f.f.expressions, &mut body, wg_size, jn);
+            body.push(f.store(j3_ptr, jn), S);
+
+            f.f.body.push(
+                Statement::Loop {
+                    body,
+                    continuing: Block::new(),
+                    break_if: None,
+                },
+                S,
+            );
+        }
+
+        b.entry_point("rms_norm_grad_x", [WG, 1, 1], f.finish());
+    }
+
     b.finish()
 }
 
@@ -5433,6 +5978,7 @@ mod tests {
             ),
             (ShaderGroup::SwiGLUGrad, naga::valid::Capabilities::empty()),
             (ShaderGroup::SumRows, naga::valid::Capabilities::empty()),
+            (ShaderGroup::RmsNormGrad, naga::valid::Capabilities::empty()),
         ];
 
         let flags = naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
@@ -5521,6 +6067,7 @@ mod tests {
             (ShaderGroup::CrossAttention, empty),
             (ShaderGroup::SwiGLUGrad, empty),
             (ShaderGroup::SumRows, empty),
+            (ShaderGroup::RmsNormGrad, empty),
         ];
 
         let flags = naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
@@ -5642,6 +6189,9 @@ mod tests {
                 ShaderEntry::SwiGLUGradGate | ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => {
                     vec!["src_a", "src_b", "src_c", "dst", "params"]
                 }
+                ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => {
+                    vec!["src_a", "src_b", "bias", "dst", "params"]
+                }
             }
         }
 
@@ -5679,6 +6229,8 @@ mod tests {
             ShaderEntry::SwiGLUGradGate,
             ShaderEntry::SwiGLUGradUp,
             ShaderEntry::SiluGrad,
+            ShaderEntry::RmsNormGradW,
+            ShaderEntry::RmsNormGradX,
         ];
 
         for entry in &entries {
