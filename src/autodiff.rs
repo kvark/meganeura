@@ -35,14 +35,12 @@ pub fn differentiate(forward: &Graph) -> Graph {
         match node.op {
             Op::MatMul => {
                 // C = A @ B
-                // dL/dA = dL/dC @ B^T
-                // dL/dB = A^T @ dL/dC
+                // dL/dA = dL/dC @ B^T  →  MatMulBT(dL/dC, B)
+                // dL/dB = A^T @ dL/dC  →  MatMulAT(A, dL/dC)
                 let a = node.inputs[0];
                 let b = node.inputs[1];
-                let bt = graph.transpose(b);
-                let grad_a = graph.matmul(grad_output, bt);
-                let at = graph.transpose(a);
-                let grad_b = graph.matmul(at, grad_output);
+                let grad_a = graph.matmul_bt(grad_output, b);
+                let grad_b = graph.matmul_at(a, grad_output);
                 accumulate_grad(&mut graph, &mut grads, a, grad_a);
                 accumulate_grad(&mut graph, &mut grads, b, grad_b);
             }
@@ -156,15 +154,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 // silu(x) = x * sigmoid(x)
                 // d/dx silu(x) = sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))
                 let x = node.inputs[0];
-                let n = node.ty.num_elements();
-                let sig = graph.sigmoid(x);
-                let one = graph.constant(vec![1.0; n], &node.ty.shape);
-                let neg_sig = graph.neg(sig);
-                let one_minus_sig = graph.add(one, neg_sig);
-                let silu_x = node.id; // forward silu output = x * sig(x)
-                let silu_times_one_minus = graph.mul(silu_x, one_minus_sig);
-                let dsilu = graph.add(sig, silu_times_one_minus);
-                let grad_x = graph.mul(grad_output, dsilu);
+                let grad_x = graph.silu_grad(grad_output, x);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
             Op::SwiGLU => {
@@ -173,19 +163,10 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 // d/dgate = dL * up * d_silu(gate)
                 let gate = node.inputs[0];
                 let up = node.inputs[1];
-                let n = node.ty.num_elements();
-                let sig_g = graph.sigmoid(gate);
-                let silu_g = graph.mul(gate, sig_g); // silu(gate)
-                let one = graph.constant(vec![1.0; n], &node.ty.shape);
-                let neg_sig_g = graph.neg(sig_g);
-                let one_minus_sig_g = graph.add(one, neg_sig_g);
-                let silu_times_one_minus_g = graph.mul(silu_g, one_minus_sig_g);
-                let dsilu_g = graph.add(sig_g, silu_times_one_minus_g);
-                let grad_up = graph.mul(grad_output, silu_g);
-                let up_times_dsilu = graph.mul(up, dsilu_g);
-                let grad_gate = graph.mul(grad_output, up_times_dsilu);
-                accumulate_grad(&mut graph, &mut grads, up, grad_up);
+                let grad_gate = graph.swiglu_grad_gate(grad_output, gate, up);
+                let grad_up = graph.swiglu_grad_up(grad_output, gate);
                 accumulate_grad(&mut graph, &mut grads, gate, grad_gate);
+                accumulate_grad(&mut graph, &mut grads, up, grad_up);
             }
             Op::RmsNorm { .. } => {
                 // y = (x / rms(x)) * w,  rms = sqrt(mean(x^2) + eps)
@@ -261,7 +242,12 @@ pub fn differentiate(forward: &Graph) -> Graph {
             // Backward grad ops: never appear in forward pass
             Op::MultiHeadAttnGradQ { .. }
             | Op::MultiHeadAttnGradK { .. }
-            | Op::MultiHeadAttnGradV { .. } => {}
+            | Op::MultiHeadAttnGradV { .. }
+            | Op::MatMulAT
+            | Op::MatMulBT
+            | Op::SwiGLUGradGate
+            | Op::SwiGLUGradUp
+            | Op::SiluGrad => {}
             // Inference-only ops: should not appear in training graphs
             Op::Embedding
             | Op::RoPE { .. }

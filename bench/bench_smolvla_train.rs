@@ -107,12 +107,14 @@ fn main() {
     let mut warmup: usize = 3;
     let mut runs: usize = 5;
     let mut force = false;
+    let mut profile = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--warmup" => warmup = args.next().expect("--warmup value").parse().unwrap(),
             "--runs" => runs = args.next().expect("--runs value").parse().unwrap(),
             "--force" => force = true,
+            "--profile" => profile = true,
             _ => {
                 eprintln!("unknown arg: {}", arg);
                 std::process::exit(1);
@@ -135,8 +137,7 @@ fn main() {
 
     // --- Build training graph ---
     eprintln!("building training graph...");
-    let training_g =
-        smolvla::build_action_expert_training(&config, action_seq_len, vlm_seq_len);
+    let training_g = smolvla::build_action_expert_training(&config, action_seq_len, vlm_seq_len);
 
     // --- Build sessions ---
     eprintln!("compiling inference session (forward only)...");
@@ -204,6 +205,75 @@ fn main() {
         train_session.step();
         train_session.wait();
         train_session.sgd_step_cpu(1e-5);
+    }
+
+    // --- Per-kernel profiling (--profile flag) ---
+    if profile {
+        // Dispatch-count breakdown by shader type (free, no pass limit)
+        let count_dispatches = |plan: &meganeura::compile::ExecutionPlan| {
+            let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+            for d in &plan.dispatches {
+                *counts.entry(format!("{:?}", d.shader)).or_default() += 1;
+            }
+            counts
+        };
+
+        eprintln!(
+            "\n=== Forward pass dispatch counts ({} total) ===",
+            infer_session.plan().dispatches.len()
+        );
+        for (name, count) in count_dispatches(infer_session.plan()) {
+            eprintln!("  {:>30}: {}", name, count);
+        }
+
+        eprintln!(
+            "\n=== Training step dispatch counts ({} total) ===",
+            train_session.plan().dispatches.len()
+        );
+        for (name, count) in count_dispatches(train_session.plan()) {
+            eprintln!("  {:>30}: {}", name, count);
+        }
+
+        // GPU timing breakdown — blade caps at 100 timestamps per submission,
+        // so only the first 100 dispatches are timed.
+        //
+        // Blade's command encoder uses a 2-buffer ring: start() reads timestamps
+        // from 2 submissions ago. So we need 3 steps to get step A's timings:
+        //   step A (profiling=true) → step B (advances ring) → step C's start()
+        //   reads A's data → dump_gpu_timings() shows A's per-shader breakdown.
+        infer_session.set_profiling(true);
+        eprintln!(
+            "\n=== Forward pass GPU timings (first 100 of {} dispatches) ===",
+            infer_session.plan().dispatches.len()
+        );
+        set_inputs(&mut infer_session);
+        infer_session.step();
+        infer_session.wait(); // step A — profiling run, records shader timestamps
+        set_inputs(&mut infer_session);
+        infer_session.step();
+        infer_session.wait(); // step B — advances ring buffer
+        set_inputs(&mut infer_session);
+        infer_session.step(); // step C — start() reads step A's timestamps
+        infer_session.dump_gpu_timings();
+        infer_session.wait();
+
+        train_session.set_profiling(true);
+        eprintln!(
+            "\n=== Training step GPU timings (first 100 of {} dispatches) ===",
+            train_session.plan().dispatches.len()
+        );
+        set_inputs(&mut train_session);
+        train_session.step();
+        train_session.wait(); // step A
+        set_inputs(&mut train_session);
+        train_session.step();
+        train_session.wait(); // step B
+        set_inputs(&mut train_session);
+        train_session.step(); // step C — reads step A's timestamps
+        train_session.dump_gpu_timings();
+        train_session.wait();
+
+        return;
     }
 
     // --- Benchmark forward ---

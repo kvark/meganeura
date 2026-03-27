@@ -6,6 +6,8 @@ use std::collections::HashMap;
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ShaderEntry {
     MatMul,
+    MatMulAT,
+    MatMulBT,
     FusedMatMulAdd,
     Relu,
     Sigmoid,
@@ -34,6 +36,9 @@ pub enum ShaderEntry {
     MultiHeadAttnGradQ,
     MultiHeadAttnGradK,
     MultiHeadAttnGradV,
+    SwiGLUGradGate,
+    SwiGLUGradUp,
+    SiluGrad,
 }
 
 impl ShaderEntry {
@@ -41,6 +46,8 @@ impl ShaderEntry {
         use crate::codegen::ShaderGroup;
         match *self {
             ShaderEntry::MatMul => ShaderGroup::MatMul,
+            ShaderEntry::MatMulAT => ShaderGroup::MatMulAT,
+            ShaderEntry::MatMulBT => ShaderGroup::MatMulBT,
             ShaderEntry::FusedMatMulAdd => ShaderGroup::MatMulAdd,
             ShaderEntry::Relu | ShaderEntry::Sigmoid | ShaderEntry::Neg => ShaderGroup::Unary,
             ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater => ShaderGroup::Binary,
@@ -64,12 +71,17 @@ impl ShaderEntry {
             ShaderEntry::MultiHeadAttnGradQ => ShaderGroup::MultiHeadAttnGradQ,
             ShaderEntry::MultiHeadAttnGradK => ShaderGroup::MultiHeadAttnGradK,
             ShaderEntry::MultiHeadAttnGradV => ShaderGroup::MultiHeadAttnGradV,
+            ShaderEntry::SwiGLUGradGate | ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => {
+                ShaderGroup::SwiGLUGrad
+            }
         }
     }
 
     pub fn entry_point(&self) -> &'static str {
         match *self {
             ShaderEntry::MatMul
+            | ShaderEntry::MatMulAT
+            | ShaderEntry::MatMulBT
             | ShaderEntry::FusedMatMulAdd
             | ShaderEntry::BiasAdd
             | ShaderEntry::SgdUpdate
@@ -98,6 +110,9 @@ impl ShaderEntry {
             | ShaderEntry::MultiHeadAttnGradQ
             | ShaderEntry::MultiHeadAttnGradK
             | ShaderEntry::MultiHeadAttnGradV => "main",
+            ShaderEntry::SwiGLUGradGate => "swiglu_grad_gate",
+            ShaderEntry::SwiGLUGradUp => "swiglu_grad_up",
+            ShaderEntry::SiluGrad => "silu_grad",
         }
     }
 }
@@ -263,6 +278,44 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![m, k, n, 0],
+                });
+            }
+
+            Op::MatMulAT => {
+                // C = A^T @ B  (A is [K, M], B is [K, N], C is [M, N])
+                let a = self.get_buffer(node.inputs[0]);
+                let b = self.get_buffer(node.inputs[1]);
+                let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
+                let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
+                let k = a_shape[0] as u32; // A is [K, M]
+                let m = a_shape[1] as u32;
+                let n = b_shape[1] as u32; // B is [K, N]
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::MatMulAT,
+                    workgroups: [ceil_div(n, 16), ceil_div(m, 16), 1],
+                    input_buffers: vec![a, b],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![m, n, k, 0],
+                });
+            }
+
+            Op::MatMulBT => {
+                // C = A @ B^T  (A is [M, K], B is [N, K], C is [M, N])
+                let a = self.get_buffer(node.inputs[0]);
+                let b = self.get_buffer(node.inputs[1]);
+                let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
+                let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
+                let m = a_shape[0] as u32; // A is [M, K]
+                let k = a_shape[1] as u32;
+                let n = b_shape[0] as u32; // B is [N, K]
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::MatMulBT,
+                    workgroups: [ceil_div(n, 16), ceil_div(m, 16), 1],
+                    input_buffers: vec![a, b],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![m, n, k, 0],
                 });
             }
 
@@ -641,6 +694,52 @@ impl<'a> Compiler<'a> {
                     params: vec![q_seq, kv_seq, (num_heads << 16) | num_kv_heads, head_dim],
                 });
             }
+
+            Op::SwiGLUGradGate => {
+                // inputs: [grad_out, gate, up]
+                let grad_out = self.get_buffer(node.inputs[0]);
+                let gate = self.get_buffer(node.inputs[1]);
+                let up = self.get_buffer(node.inputs[2]);
+                let len = node.ty.num_elements() as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::SwiGLUGradGate,
+                    workgroups: [ceil_div(len, 256), 1, 1],
+                    input_buffers: vec![grad_out, gate, up],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![len, 0, 0, 0],
+                });
+            }
+
+            Op::SwiGLUGradUp => {
+                // inputs: [grad_out, gate]
+                let grad_out = self.get_buffer(node.inputs[0]);
+                let gate = self.get_buffer(node.inputs[1]);
+                let len = node.ty.num_elements() as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::SwiGLUGradUp,
+                    workgroups: [ceil_div(len, 256), 1, 1],
+                    input_buffers: vec![grad_out, gate],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![len, 0, 0, 0],
+                });
+            }
+
+            Op::SiluGrad => {
+                // inputs: [grad_out, x]
+                let grad_out = self.get_buffer(node.inputs[0]);
+                let x = self.get_buffer(node.inputs[1]);
+                let len = node.ty.num_elements() as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::SiluGrad,
+                    workgroups: [ceil_div(len, 256), 1, 1],
+                    input_buffers: vec![grad_out, x],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![len, 0, 0, 0],
+                });
+            }
         }
     }
 
@@ -936,6 +1035,9 @@ mod tests {
             ShaderEntry::Softmax,
             ShaderEntry::CrossEntropyLoss,
             ShaderEntry::Transpose,
+            ShaderEntry::SwiGLUGradGate,
+            ShaderEntry::SwiGLUGradUp,
+            ShaderEntry::SiluGrad,
         ];
         for entry in &entries {
             let _group = entry.shader_group();

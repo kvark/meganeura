@@ -1,4 +1,4 @@
-use crate::graph::{Graph, Node, Op};
+use crate::graph::{Graph, Node, NodeId, Op};
 use std::{fmt, time::Instant};
 
 /// Report from the e-graph optimization pass.
@@ -107,11 +107,9 @@ pub fn optimize_with_report(graph: &Graph) -> (Graph, OptimizeReport) {
     }
 
     let extract_start = Instant::now();
-    let (optimized, fusions_applied) = if egglog_ok {
-        extract_graph_with_fusions(&egraph, graph)
-    } else {
-        (clone_graph(graph), Vec::new())
-    };
+    // Always run graph fusions — extract_graph_with_fusions doesn't use egglog output
+    // directly, so it works even if egglog saturation failed.
+    let (optimized, fusions_applied) = extract_graph_with_fusions(&egraph, graph);
     let extract_time = extract_start.elapsed();
 
     let nodes_after = optimized
@@ -165,6 +163,8 @@ fn graph_to_egglog(graph: &Graph) -> String {
   (Parameter String)
   (Const i64)
   (MatMul Op Op)
+  (MatMulAT Op Op)
+  (MatMulBT Op Op)
   (Add Op Op)
   (Mul Op Op)
   (BiasAdd Op Op)
@@ -214,6 +214,11 @@ fn graph_to_egglog(graph: &Graph) -> String {
                 | Op::MultiHeadAttnGradQ { .. }
                 | Op::MultiHeadAttnGradK { .. }
                 | Op::MultiHeadAttnGradV { .. }
+                | Op::MatMulAT
+                | Op::MatMulBT
+                | Op::SwiGLUGradGate
+                | Op::SwiGLUGradUp
+                | Op::SiluGrad
         ) {
             continue;
         }
@@ -221,9 +226,25 @@ fn graph_to_egglog(graph: &Graph) -> String {
         prog.push_str(&format!("(let n{} {})\n", node.id, expr));
     }
 
-    // Extract the output nodes
+    // Extract only forward output nodes (backward/grad outputs are not in the egglog program)
+    let is_egglog_node = |id: NodeId| -> bool {
+        !matches!(
+            graph.node(id).op,
+            Op::Nop
+                | Op::MultiHeadAttnGradQ { .. }
+                | Op::MultiHeadAttnGradK { .. }
+                | Op::MultiHeadAttnGradV { .. }
+                | Op::MatMulAT
+                | Op::MatMulBT
+                | Op::SwiGLUGradGate
+                | Op::SwiGLUGradUp
+                | Op::SiluGrad
+        )
+    };
     for &out in graph.outputs() {
-        prog.push_str(&format!("(extract n{})\n", out));
+        if is_egglog_node(out) {
+            prog.push_str(&format!("(extract n{})\n", out));
+        }
     }
 
     prog
@@ -235,6 +256,8 @@ fn node_to_egglog_expr(node: &Node) -> String {
         Op::Parameter { ref name } => format!("(Parameter \"{}\")", name),
         Op::Constant { .. } => format!("(Const {})", node.id),
         Op::MatMul => format!("(MatMul n{} n{})", node.inputs[0], node.inputs[1]),
+        Op::MatMulAT => format!("(MatMulAT n{} n{})", node.inputs[0], node.inputs[1]),
+        Op::MatMulBT => format!("(MatMulBT n{} n{})", node.inputs[0], node.inputs[1]),
         Op::Add => format!("(Add n{} n{})", node.inputs[0], node.inputs[1]),
         Op::Mul => format!("(Mul n{} n{})", node.inputs[0], node.inputs[1]),
         Op::BiasAdd => format!("(BiasAdd n{} n{})", node.inputs[0], node.inputs[1]),
@@ -276,10 +299,13 @@ fn node_to_egglog_expr(node: &Node) -> String {
             "(MultiHeadAttn n{} n{} n{})",
             node.inputs[0], node.inputs[1], node.inputs[2]
         ),
-        // Grad ops are skipped before node_to_egglog_expr is called
+        // Grad ops and backward-only ops are skipped before node_to_egglog_expr is called
         Op::MultiHeadAttnGradQ { .. }
         | Op::MultiHeadAttnGradK { .. }
-        | Op::MultiHeadAttnGradV { .. } => {
+        | Op::MultiHeadAttnGradV { .. }
+        | Op::SwiGLUGradGate
+        | Op::SwiGLUGradUp
+        | Op::SiluGrad => {
             unreachable!("Grad ops are filtered before egglog encoding")
         }
         Op::Nop | Op::FusedMatMulAdd => {
@@ -316,7 +342,6 @@ fn extract_graph_with_fusions(
         } else {
             continue;
         };
-
         // Only fuse if the MatMul result is used exclusively by this Add.
         let mm_use_count = graph
             .nodes()

@@ -66,6 +66,10 @@ pub enum Op {
 
     // Binary
     MatMul,
+    // MatMulAT: C = A^T @ B  (A stored as [K,M], B stored as [K,N], C is [M,N])
+    MatMulAT,
+    // MatMulBT: C = A @ B^T  (A stored as [M,K], B stored as [N,K], C is [M,N])
+    MatMulBT,
     Add,
     Mul,
 
@@ -107,6 +111,14 @@ pub enum Op {
 
     // SwiGLU: silu(gate) * up  (inputs: [gate, up])
     SwiGLU,
+
+    // Fused backward gradient ops for SwiGLU and Silu
+    // SwiGLUGradGate: (grad_out, gate, up) → grad_gate
+    SwiGLUGradGate,
+    // SwiGLUGradUp: (grad_out, gate) → grad_up
+    SwiGLUGradUp,
+    // SiluGrad: (grad_out, x) → grad_x
+    SiluGrad,
 
     // RMSNorm: x / sqrt(mean(x²) + eps) * weight
     // inputs: [x, weight], eps stored as f32 bits in params
@@ -296,6 +308,28 @@ impl Graph {
         self.add_node(Op::MatMul, vec![a, b], ty)
     }
 
+    /// C = A^T @ B  (A is [K, M], B is [K, N], C is [M, N])
+    pub fn matmul_at(&mut self, a: NodeId, b: NodeId) -> NodeId {
+        let a_shape = &self.node(a).ty.shape;
+        let b_shape = &self.node(b).ty.shape;
+        assert_eq!(a_shape.len(), 2);
+        assert_eq!(b_shape.len(), 2);
+        assert_eq!(a_shape[0], b_shape[0], "MatMulAT: K dimensions must match");
+        let ty = TensorType::f32(vec![a_shape[1], b_shape[1]]);
+        self.add_node(Op::MatMulAT, vec![a, b], ty)
+    }
+
+    /// C = A @ B^T  (A is [M, K], B is [N, K], C is [M, N])
+    pub fn matmul_bt(&mut self, a: NodeId, b: NodeId) -> NodeId {
+        let a_shape = &self.node(a).ty.shape;
+        let b_shape = &self.node(b).ty.shape;
+        assert_eq!(a_shape.len(), 2);
+        assert_eq!(b_shape.len(), 2);
+        assert_eq!(a_shape[1], b_shape[1], "MatMulBT: K dimensions must match");
+        let ty = TensorType::f32(vec![a_shape[0], b_shape[0]]);
+        self.add_node(Op::MatMulBT, vec![a, b], ty)
+    }
+
     pub fn add(&mut self, a: NodeId, b: NodeId) -> NodeId {
         let a_ty = &self.node(a).ty;
         let b_ty = &self.node(b).ty;
@@ -407,6 +441,24 @@ impl Graph {
     pub fn swiglu(&mut self, gate: NodeId, up: NodeId) -> NodeId {
         let ty = self.node(gate).ty.clone();
         self.add_node(Op::SwiGLU, vec![gate, up], ty)
+    }
+
+    /// Fused SwiGLU backward: grad_gate = grad_out * up * dsilu(gate)
+    pub fn swiglu_grad_gate(&mut self, grad_out: NodeId, gate: NodeId, up: NodeId) -> NodeId {
+        let ty = self.node(gate).ty.clone();
+        self.add_raw_node(Op::SwiGLUGradGate, vec![grad_out, gate, up], ty)
+    }
+
+    /// Fused SwiGLU backward: grad_up = grad_out * silu(gate)
+    pub fn swiglu_grad_up(&mut self, grad_out: NodeId, gate: NodeId) -> NodeId {
+        let ty = self.node(gate).ty.clone();
+        self.add_raw_node(Op::SwiGLUGradUp, vec![grad_out, gate], ty)
+    }
+
+    /// Fused Silu backward: grad_x = grad_out * dsilu(x)
+    pub fn silu_grad(&mut self, grad_out: NodeId, x: NodeId) -> NodeId {
+        let ty = self.node(x).ty.clone();
+        self.add_raw_node(Op::SiluGrad, vec![grad_out, x], ty)
     }
 
     pub fn rms_norm(&mut self, x: NodeId, weight: NodeId, eps: f32) -> NodeId {
