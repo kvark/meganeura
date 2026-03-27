@@ -387,7 +387,6 @@ pub fn expert_weight_names(config: &SmolVLAConfig) -> Vec<String> {
     names
 }
 
-
 /// Build a training graph for the action expert with MSE loss.
 ///
 /// Uses full GQA-capable `MultiHeadAttn` op (differentiable, with LSE saved
