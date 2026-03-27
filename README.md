@@ -14,26 +14,26 @@ Instead of including the "batteries" - kernels for all kind of cases and hardwar
 
 ## Benchmarks
 
-SmolVLA action expert on AMD RDNA3 (chunk_size=50, vlm_seq_len=16, 10 denoise steps, float32):
+SmolVLA action expert inference on AMD RDNA3 (chunk_size=50, vlm_seq_len=16, 10 denoise steps, float32):
 
 | Metric | meganeura | PyTorch ROCm |
 |---|---|---|
-| Steps/second | 40.9 | 41.6 |
-| ms / step | 24.5 | 24.1 |
-| ms / full chunk | 245 | 241 |
+| Avg latency (ms) | 275.8 | 221.5 |
+| ms / step | 27.6 | 22.2 |
+| Steps/second | 36.3 | 45.1 |
 
-SmolVLA action expert training (chunk_size=50, vlm_seq_len=16, 16 layers, float32, random weights, AMD RDNA3).
-Full GQA (num_heads=15, num_kv_heads=5, head_dim=64) — differentiable MultiHeadAttn with saved LSE:
+SmolVLA action expert training on AMD RDNA3 (chunk_size=50, vlm_seq_len=16, float32, random weights).
+Full GQA (15/5 heads, head_dim=64), exact backward through all ops including fused MHA and RmsNorm:
 
 | Metric | meganeura | PyTorch ROCm |
 |---|---|---|
-| Forward avg | 26.0 ms | 23.2 ms |
-| Forward median | 25.7 ms | 23.0 ms |
-| Train step avg | 152 ms | 84.0 ms |
-| Train step median | 170 ms | 84.0 ms |
-| Approx backward | 126 ms | 60.8 ms |
+| Forward avg | 28.9 ms | 23.9 ms |
+| Train step avg | 164.8 ms | 87.9 ms |
+| Approx backward | 135.9 ms | 64.0 ms |
 
-Run `bash bench/compare.sh` to reproduce, or `bash bench/compare.sh --model smolvla_train` for training only.
+Gradients verified against PyTorch: 152/152 parameters pass (cos_sim > 0.99, norm_err < 5%) on the full production config.
+
+Run `bash bench/compare.sh` to reproduce (runs inference + training + SmolLM2 benchmarks by default).
 
 ## System Requirements
 

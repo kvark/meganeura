@@ -220,6 +220,8 @@ fn graph_to_egglog(graph: &Graph) -> String {
                 | Op::SwiGLUGradGate
                 | Op::SwiGLUGradUp
                 | Op::SiluGrad
+                | Op::RmsNormGradW { .. }
+                | Op::RmsNormGradX { .. }
         ) {
             continue;
         }
@@ -240,6 +242,8 @@ fn graph_to_egglog(graph: &Graph) -> String {
                 | Op::SwiGLUGradGate
                 | Op::SwiGLUGradUp
                 | Op::SiluGrad
+                | Op::RmsNormGradW { .. }
+                | Op::RmsNormGradX { .. }
                 | Op::SumRows
         )
     };
@@ -308,7 +312,9 @@ fn node_to_egglog_expr(node: &Node) -> String {
         | Op::MultiHeadAttnGradV { .. }
         | Op::SwiGLUGradGate
         | Op::SwiGLUGradUp
-        | Op::SiluGrad => {
+        | Op::SiluGrad
+        | Op::RmsNormGradW { .. }
+        | Op::RmsNormGradX { .. } => {
             unreachable!("Grad ops are filtered before egglog encoding")
         }
         Op::Nop | Op::FusedMatMulAdd => {

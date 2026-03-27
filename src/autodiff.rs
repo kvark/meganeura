@@ -181,20 +181,13 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 accumulate_grad(&mut graph, &mut grads, gate, grad_gate);
                 accumulate_grad(&mut graph, &mut grads, up, grad_up);
             }
-            Op::RmsNorm { .. } => {
-                // y = (x / rms(x)) * w,  rms = sqrt(mean(x^2) + eps)
-                // Approximate backward: treat rms as constant.
-                // grad_w ≈ sum_rows(dL/dy * y)  (y used as proxy for x/rms * w)
-                // grad_x ≈ dL/dy               (identity; omits 1/rms and Jacobian)
-                // TODO: exact backward needs SumRows op + Div op
+            Op::RmsNorm { eps } => {
                 let x = node.inputs[0];
                 let w = node.inputs[1];
-                let y = node.id; // forward RmsNorm output
-                let w_ty = forward.nodes()[w as usize].ty.clone();
-                let dy_times_y = graph.mul(grad_output, y);
-                let grad_w = graph.sum_rows(dy_times_y, &w_ty);
+                let grad_w = graph.rms_norm_grad_w(grad_output, x, w, eps);
+                let grad_x = graph.rms_norm_grad_x(grad_output, x, w, eps);
                 accumulate_grad(&mut graph, &mut grads, w, grad_w);
-                accumulate_grad(&mut graph, &mut grads, x, grad_output);
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
             Op::MultiHeadAttn {
                 num_heads,
@@ -260,7 +253,9 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::MatMulBT
             | Op::SwiGLUGradGate
             | Op::SwiGLUGradUp
-            | Op::SiluGrad => {}
+            | Op::SiluGrad
+            | Op::RmsNormGradW { .. }
+            | Op::RmsNormGradX { .. } => {}
             // Inference-only ops: should not appear in training graphs
             Op::Embedding
             | Op::RoPE { .. }
