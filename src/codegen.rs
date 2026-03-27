@@ -551,6 +551,7 @@ pub enum ShaderGroup {
     MultiHeadAttnGradK,
     MultiHeadAttnGradV,
     SwiGLUGrad,
+    SumRows,
 }
 
 /// Generate a `naga::Module` for a shader group.
@@ -584,6 +585,7 @@ pub fn generate_module(group: ShaderGroup) -> Module {
         ShaderGroup::MultiHeadAttnGradK => gen_mha_grad_k(),
         ShaderGroup::MultiHeadAttnGradV => gen_mha_grad_v(),
         ShaderGroup::SwiGLUGrad => gen_swiglu_grad(),
+        ShaderGroup::SumRows => gen_sum_rows(),
     }
 }
 
@@ -2782,6 +2784,93 @@ fn gen_reduce() -> Module {
     let mean_fn = gen_reduce_fn(&b, true, gv_src, gv_dst, gv_params, gv_wg);
     b.entry_point("mean_all", [256, 1, 1], mean_fn);
 
+    b.finish()
+}
+
+// ---------------------------------------------------------------------------
+// sum_rows.wgsl: [M, N] → [N], column-wise sum
+// ---------------------------------------------------------------------------
+
+fn gen_sum_rows() -> Module {
+    let mut b = Builder::new();
+    let ty_params = b.params_u32x4("Params", &["m", "n", "_pad0", "_pad1"]);
+    let gv_src = b.storage_ro("src");
+    let gv_dst = b.storage_rw("dst");
+    let gv_params = b.uniform("params", ty_params);
+
+    let mut f = FnBuilder::new(&b);
+    let gid = f.arg_gid();
+    let col = f.vec_x(gid);
+    f.label("col", col);
+
+    let params_ptr = f.global(gv_params);
+    let m_ptr = f.field(params_ptr, 0);
+    let m = f.load(m_ptr);
+    let n_ptr = f.field(params_ptr, 1);
+    let n = f.load(n_ptr);
+    f.emit(col, n);
+
+    // if col >= n { return; }
+    let cond = f.binary(BinaryOperator::GreaterEqual, col, n);
+    f.emit(cond, cond);
+    f.f.body.push(f.if_return(cond), S);
+
+    // acc = 0.0
+    let acc_var = f.local_var("acc", b.ty_f32, None);
+    let acc_ptr = f.local_ptr(acc_var);
+    let zero_f = f.literal_f32(0.0);
+    f.emit(zero_f, zero_f);
+    f.f.body.push(f.store(acc_ptr, zero_f), S);
+
+    // row = 0
+    let row_var = f.local_var("row", b.ty_u32, None);
+    let row_ptr = f.local_ptr(row_var);
+    let zero_u = f.literal_u32(0);
+    f.emit(zero_u, zero_u);
+    f.f.body.push(f.store(row_ptr, zero_u), S);
+
+    // Loop: for row in 0..m { acc += src[row * n + col]; row++; }
+    {
+        let mut body = Block::new();
+        let row = f.load(row_ptr);
+        let brk = f.binary(BinaryOperator::GreaterEqual, row, m);
+        let row_n = f.binary(BinaryOperator::Multiply, row, n);
+        let idx = f.binary(BinaryOperator::Add, row_n, col);
+        let src_ptr = f.global(gv_src);
+        let elem = f.index(src_ptr, idx);
+        let val = f.load(elem);
+        let cur_acc = f.load(acc_ptr);
+        let new_acc = f.binary(BinaryOperator::Add, cur_acc, val);
+        push_emit(&f.f.expressions, &mut body, row, brk);
+        body.push(FnBuilder::if_break(brk), S);
+        push_emit(&f.f.expressions, &mut body, row_n, new_acc);
+        body.push(f.store(acc_ptr, new_acc), S);
+
+        let one = f.literal_u32(1);
+        let row2 = f.load(row_ptr);
+        let row_next = f.binary(BinaryOperator::Add, row2, one);
+        push_emit(&f.f.expressions, &mut body, one, row_next);
+        body.push(f.store(row_ptr, row_next), S);
+
+        f.f.body.push(
+            Statement::Loop {
+                body,
+                continuing: Block::new(),
+                break_if: None,
+            },
+            S,
+        );
+    }
+
+    // dst[col] = acc
+    let acc_val = f.load(acc_ptr);
+    let dst_ptr = f.global(gv_dst);
+    let dst_elem = f.index(dst_ptr, col);
+    f.emit(acc_val, acc_val);
+    f.emit(dst_elem, dst_elem);
+    f.f.body.push(f.store(dst_elem, acc_val), S);
+
+    b.entry_point("sum_rows", [256, 1, 1], f.finish());
     b.finish()
 }
 
@@ -5343,6 +5432,7 @@ mod tests {
                 naga::valid::Capabilities::empty(),
             ),
             (ShaderGroup::SwiGLUGrad, naga::valid::Capabilities::empty()),
+            (ShaderGroup::SumRows, naga::valid::Capabilities::empty()),
         ];
 
         let flags = naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
@@ -5430,6 +5520,7 @@ mod tests {
             (ShaderGroup::FullAttention, empty),
             (ShaderGroup::CrossAttention, empty),
             (ShaderGroup::SwiGLUGrad, empty),
+            (ShaderGroup::SumRows, empty),
         ];
 
         let flags = naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
@@ -5516,6 +5607,7 @@ mod tests {
                 | ShaderEntry::Gelu
                 | ShaderEntry::SumAll
                 | ShaderEntry::MeanAll
+                | ShaderEntry::SumRows
                 | ShaderEntry::RoPE => vec!["src", "dst", "params"],
                 ShaderEntry::Add
                 | ShaderEntry::Mul

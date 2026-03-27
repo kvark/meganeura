@@ -39,6 +39,7 @@ pub enum ShaderEntry {
     SwiGLUGradGate,
     SwiGLUGradUp,
     SiluGrad,
+    SumRows,
 }
 
 impl ShaderEntry {
@@ -74,6 +75,7 @@ impl ShaderEntry {
             ShaderEntry::SwiGLUGradGate | ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => {
                 ShaderGroup::SwiGLUGrad
             }
+            ShaderEntry::SumRows => ShaderGroup::SumRows,
         }
     }
 
@@ -113,6 +115,7 @@ impl ShaderEntry {
             ShaderEntry::SwiGLUGradGate => "swiglu_grad_gate",
             ShaderEntry::SwiGLUGradUp => "swiglu_grad_up",
             ShaderEntry::SiluGrad => "silu_grad",
+            ShaderEntry::SumRows => "sum_rows",
         }
     }
 }
@@ -397,6 +400,22 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![len, 0, 0, 0],
+                });
+            }
+
+            Op::SumRows => {
+                // [M, N] → [N]: one thread per column, loops over M rows
+                let input = self.get_buffer(node.inputs[0]);
+                let in_shape = &self.graph.node(node.inputs[0]).ty.shape;
+                let m = in_shape[0] as u32;
+                let n = in_shape[1] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::SumRows,
+                    workgroups: [ceil_div(n, 256), 1, 1],
+                    input_buffers: vec![input],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![m, n, 0, 0],
                 });
             }
 
@@ -1032,6 +1051,7 @@ mod tests {
             ShaderEntry::SgdUpdate,
             ShaderEntry::SumAll,
             ShaderEntry::MeanAll,
+            ShaderEntry::SumRows,
             ShaderEntry::Softmax,
             ShaderEntry::CrossEntropyLoss,
             ShaderEntry::Transpose,

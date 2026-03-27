@@ -81,6 +81,8 @@ pub enum Op {
     // Reduction
     SumAll,
     MeanAll,
+    /// Column-wise sum: [M, N] → [N]  (sum over rows)
+    SumRows,
     Softmax,
 
     // Loss

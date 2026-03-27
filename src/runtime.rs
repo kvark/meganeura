@@ -320,7 +320,7 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         }
         ShaderEntry::BiasAdd => BiasAddData::layout(),
         ShaderEntry::SgdUpdate => SgdData::layout(),
-        ShaderEntry::SumAll | ShaderEntry::MeanAll => UnaryData::layout(),
+        ShaderEntry::SumAll | ShaderEntry::MeanAll | ShaderEntry::SumRows => UnaryData::layout(),
         ShaderEntry::Softmax => SoftmaxData::layout(),
         ShaderEntry::CrossEntropyLoss => CrossEntropyData::layout(),
         ShaderEntry::Transpose => TransposeData::layout(),
@@ -962,6 +962,22 @@ impl Session {
                         params: UnaryParams {
                             len: dispatch.params[0],
                             _pad0: 0,
+                            _pad1: 0,
+                            _pad2: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::SumRows => {
+                // params[0] = m (rows), params[1] = n (cols)
+                pc.bind(
+                    0,
+                    &UnaryData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: UnaryParams {
+                            len: dispatch.params[0],  // m
+                            _pad0: dispatch.params[1], // n
                             _pad1: 0,
                             _pad2: 0,
                         },
