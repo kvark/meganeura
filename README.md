@@ -37,7 +37,7 @@ Run `bash bench/compare.sh` to reproduce (runs inference + training + SmolLM2 be
 
 ## System Requirements
 
-Matrix multiplication uses [cooperative matrix operations](https://registry.khronos.org/vulkan/specs/latest/man/html/VK_KHR_cooperative_matrix.html) for hardware-accelerated 8x8 tile math. This requires one of:
-
+It works on on anything with Vulkan, including LavaPipe, or MacOS devices.
+Runs best when [cooperative matrix operations](https://registry.khronos.org/vulkan/specs/latest/man/html/VK_KHR_cooperative_matrix.html) is hardware-accelerated for 8x8 tile math:
 - **Vulkan**: GPU and driver supporting `VK_KHR_cooperative_matrix` (NVIDIA Volta+, AMD RDNA3+, Intel Arc)
 - **Metal**: Apple GPU with simdgroup matrix support (Apple M1+)
