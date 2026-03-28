@@ -580,14 +580,19 @@ impl Session {
                 timing: true,
                 capture: false,
                 overlay: false,
-                device_id: None,
+                device_id: std::env::var("MEGANEURA_DEVICE_ID")
+                    .ok()
+                    .and_then(|s| s.parse().ok()),
                 ..Default::default()
             })
         }
         .expect("failed to initialize blade GPU context");
 
         let coop_caps = gpu.capabilities().cooperative_matrix;
-        let use_coop_matmul = coop_caps.is_supported() && Self::test_coop_matmul(&gpu);
+        // Our coop shader is hardcoded for 16×16 f16 tiles (RDNA3/Volta+).
+        // Skip if the device reports a different tile size (e.g. lavapipe 8×8).
+        let use_coop_matmul =
+            coop_caps.is_supported() && coop_caps.f16_tile == 16 && Self::test_coop_matmul(&gpu);
         if !use_coop_matmul {
             let info = gpu.device_information();
             log::warn!(
