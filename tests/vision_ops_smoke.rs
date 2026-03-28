@@ -107,7 +107,7 @@ fn vision_encoder_one_layer() {
     let hidden = 8;
     let num_heads = 2u32;
     let head_dim = (hidden / num_heads as usize) as u32;
-    let intermediate = 16;
+    let _intermediate = 16;
 
     let mut g = Graph::new();
     let x = g.input("x", &[num_patches, hidden]);
@@ -145,7 +145,7 @@ fn vision_encoder_one_layer() {
     session.set_parameter("ln1_b", &zeros);
 
     let small_weights: Vec<f32> = (0..hidden * hidden)
-        .map(|i| ((i as f32 * 0.37).sin() * 0.1))
+        .map(|i| (i as f32 * 0.37).sin() * 0.1)
         .collect();
     session.set_parameter("wq", &small_weights);
     session.set_parameter("wk", &small_weights);
@@ -153,7 +153,7 @@ fn vision_encoder_one_layer() {
     session.set_parameter("wo", &small_weights);
 
     let input: Vec<f32> = (0..num_patches * hidden)
-        .map(|i| ((i as f32 * 0.13).sin() * 0.5))
+        .map(|i| (i as f32 * 0.13).sin() * 0.5)
         .collect();
     session.set_input("x", &input);
 
