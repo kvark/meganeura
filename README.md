@@ -18,18 +18,18 @@ SmolVLA action expert inference on AMD RDNA3 (chunk_size=50, vlm_seq_len=16, 10 
 
 | Metric | meganeura | PyTorch ROCm |
 |---|---|---|
-| Avg latency (ms) | 275.8 | 221.5 |
-| ms / step | 27.6 | 22.2 |
-| Steps/second | 36.3 | 45.1 |
+| Avg latency (ms) | **181.4** | 277.5 |
+| ms / step | **18.1** | 27.8 |
+| Steps/second | **55.1** | 36.0 |
 
 SmolVLA action expert training on AMD RDNA3 (chunk_size=50, vlm_seq_len=16, float32, random weights).
 Full GQA (15/5 heads, head_dim=64), exact backward through all ops including fused MHA and RmsNorm:
 
 | Metric | meganeura | PyTorch ROCm |
 |---|---|---|
-| Forward avg | 28.9 ms | 23.9 ms |
-| Train step avg | 164.8 ms | 87.9 ms |
-| Approx backward | 135.9 ms | 64.0 ms |
+| Forward avg | **21.1 ms** | 28.4 ms |
+| Train step avg | 157.1 ms | 97.3 ms |
+| Approx backward | 136.0 ms | 68.8 ms |
 
 Gradients verified against PyTorch: 152/152 parameters pass (cos_sim > 0.99, norm_err < 5%) on the full production config.
 

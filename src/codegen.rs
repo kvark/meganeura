@@ -1258,24 +1258,29 @@ fn gen_transpose() -> Module {
 }
 
 // ---------------------------------------------------------------------------
-// matmul.wgsl — tiled matrix multiply (16×16 tiles)
+// matmul.wgsl — 4×4 register-tiled matrix multiply (64×64 output tiles)
 //
-// Workgroup [16, 16, 1], dispatched as [ceil(N/16), ceil(M/16), 1].
-// Each thread computes one element of the output, iterating over K in
-// tiles of 16 using workgroup shared memory.
+// Workgroup [16, 16, 1] = 256 threads, dispatched as [ceil(N/64), ceil(M/64), 1].
+// Each thread computes a 4×4 sub-tile of the output using register blocking.
+// Shared memory tiles: shared_a[64*16], shared_b[16*64].
 // ---------------------------------------------------------------------------
 
-/// Tiled matmul: C = A × B via Naga IR with shared memory.
+/// Register-tiled matmul: C = A × B via Naga IR with shared memory.
 ///
-/// Uses 16×16 tiles loaded into workgroup shared memory for data reuse.
-/// Each thread computes one element of the output tile.
-/// Workgroup [16, 16, 1], dispatched as [ceil(N/16), ceil(M/16), 1].
+/// BM=64, BN=64, KTILE=16, TM=4, TN=4.
+/// Workgroup [16, 16, 1], dispatched as [ceil(N/64), ceil(M/64), 1].
 fn gen_matmul() -> Module {
     gen_tiled_matmul_inner(false)
 }
 
 fn gen_tiled_matmul_inner(fused_add: bool) -> Module {
-    const TILE: u32 = 16;
+    const BM: u32 = 64;
+    const BN: u32 = 64;
+    const KTILE: u32 = 16;
+    const TM: u32 = 4;
+    const TN: u32 = 4;
+    const WG: u32 = 16; // workgroup dimension
+    const THREADS: u32 = WG * WG; // 256
 
     let mut b = Builder::new();
     let ty_params = b.params_u32x4("Params", &["m", "n", "k", "_pad"]);
@@ -1288,27 +1293,35 @@ fn gen_tiled_matmul_inner(fused_add: bool) -> Module {
         None
     };
     let gv_params = b.uniform("params", ty_params);
-    let gv_sa = b.workgroup_array("shared_a", TILE * TILE);
-    let gv_sb = b.workgroup_array("shared_b", TILE * TILE);
+    let gv_sa = b.workgroup_array("shared_a", BM * KTILE); // 1024
+    let gv_sb = b.workgroup_array("shared_b", KTILE * BN); // 1024
 
     let mut f = FnBuilder::new(&b);
     let wgid = f.arg_wgid();
     let lid = f.arg_lid();
 
+    // tx = lid.x (0..15), ty = lid.y (0..15)
     let wg_x = f.vec_x(wgid);
     let wg_y = f.vec_y(wgid);
-    let lx = f.vec_x(lid);
-    let ly = f.vec_y(lid);
-    f.emit(wg_x, ly);
+    let tx = f.vec_x(lid);
+    let ty = f.vec_y(lid);
+    f.emit(wg_x, ty);
 
-    // tile_col = wg_x * 16, tile_row = wg_y * 16
-    let tile_c = f.literal_u32(TILE);
-    let tile_col = f.binary(BinaryOperator::Multiply, wg_x, tile_c);
-    let tile_c2 = f.literal_u32(TILE);
-    let tile_row = f.binary(BinaryOperator::Multiply, wg_y, tile_c2);
-    f.emit(tile_c, tile_row);
+    // tile_col = wg_x * 64, tile_row = wg_y * 64
+    let c_bm = f.literal_u32(BM);
+    let tile_row = f.binary(BinaryOperator::Multiply, wg_y, c_bm);
+    let c_bn = f.literal_u32(BN);
+    let tile_col = f.binary(BinaryOperator::Multiply, wg_x, c_bn);
+    f.emit(c_bm, tile_col);
 
-    // Load params
+    // tid = ty * 16 + tx
+    let c_wg = f.literal_u32(WG);
+    let ty_wg = f.binary(BinaryOperator::Multiply, ty, c_wg);
+    let tid = f.binary(BinaryOperator::Add, ty_wg, tx);
+    f.emit(c_wg, tid);
+
+    // Load params: field(0)=M, field(1)=N, field(2)=K
+    // (runtime uploads MatMulParams { m, n, k, _pad })
     let params_ptr = f.global(gv_params);
     let m_ptr = f.field(params_ptr, 0);
     let pm = f.load(m_ptr);
@@ -1318,12 +1331,21 @@ fn gen_tiled_matmul_inner(fused_add: bool) -> Module {
     let pk = f.load(k_ptr);
     f.emit(params_ptr, pk);
 
-    // var sum = 0.0;
+    // 16 accumulator local vars: s_i_j for i in 0..4, j in 0..4
     let zero_f = f.literal_f32(0.0);
     f.emit(zero_f, zero_f);
-    let sum_var = f.local_var("sum", b.ty_f32, None);
-    let sum_ptr = f.local_ptr(sum_var);
-    f.f.body.push(f.store(sum_ptr, zero_f), S);
+    let mut s_vars = Vec::new();
+    let mut s_ptrs = Vec::new();
+    for i in 0..TM {
+        for j in 0..TN {
+            let name = format!("s{}_{}", i, j);
+            let sv = f.local_var(&name, b.ty_f32, None);
+            let sp = f.local_ptr(sv);
+            f.f.body.push(f.store(sp, zero_f), S);
+            s_vars.push(sv);
+            s_ptrs.push(sp);
+        }
+    }
 
     // var t = 0u;  (K-tile offset)
     let t_var = f.local_var("t", b.ty_u32, None);
@@ -1331,6 +1353,13 @@ fn gen_tiled_matmul_inner(fused_add: bool) -> Module {
     f.emit(zero_u, zero_u);
     let t_ptr = f.local_ptr(t_var);
     f.f.body.push(f.store(t_ptr, zero_u), S);
+
+    // Constants used inside loop
+    let c_ktile = f.literal_u32(KTILE);
+    let c_bn2 = f.literal_u32(BN);
+    let c_tm = f.literal_u32(TM);
+    let c_tn = f.literal_u32(TN);
+    f.emit(c_ktile, c_tn);
 
     // ===== K-tile loop =====
     let mut loop_body = Block::new();
@@ -1340,75 +1369,127 @@ fn gen_tiled_matmul_inner(fused_add: bool) -> Module {
         push_emit(&f.f.expressions, &mut loop_body, t_val, break_cond);
         loop_body.push(FnBuilder::if_break(break_cond), S);
 
-        // --- Load A tile into shared_a ---
-        // shared_a[ly * 16 + lx] = A[(tile_row + ly) * k + (t + lx)]  (0 if OOB)
+        // --- Load A tile into shared_a[BM*KTILE] ---
+        // Each thread loads 4 elements at strides of 256
         let sa_ptr = f.global(gv_sa);
         let a_ptr = f.global(gv_a);
-        let ly_16 = f.binary(BinaryOperator::Multiply, ly, tile_c);
-        let sa_idx = f.binary(BinaryOperator::Add, ly_16, lx);
-        let sa_elem = f.index(sa_ptr, sa_idx);
-        let a_row = f.binary(BinaryOperator::Add, tile_row, ly);
-        let a_col = f.binary(BinaryOperator::Add, t_val, lx);
-        let in_m = f.binary(BinaryOperator::Less, a_row, pm);
-        let in_k = f.binary(BinaryOperator::Less, a_col, pk);
-        let a_in_bounds = f.binary(BinaryOperator::LogicalAnd, in_m, in_k);
-        let a_row_k = f.binary(BinaryOperator::Multiply, a_row, pk);
-        let a_global = f.binary(BinaryOperator::Add, a_row_k, a_col);
-        let a_elem = f.index(a_ptr, a_global);
-        let a_val = f.load(a_elem);
-        let zero_pad_a = f.literal_f32(0.0);
-        let a_selected = f.select(a_in_bounds, a_val, zero_pad_a);
-        push_emit(&f.f.expressions, &mut loop_body, sa_ptr, a_selected);
-        loop_body.push(f.store(sa_elem, a_selected), S);
+        for e in 0..4u32 {
+            let c_off = f.literal_u32(e * THREADS);
+            let flat = f.binary(BinaryOperator::Add, tid, c_off);
+            // row = flat / KTILE, col = flat % KTILE
+            let row_local = f.binary(BinaryOperator::Divide, flat, c_ktile);
+            let col_local = f.binary(BinaryOperator::Modulo, flat, c_ktile);
+            let sa_elem = f.index(sa_ptr, flat);
+            // global coords
+            let a_row = f.binary(BinaryOperator::Add, tile_row, row_local);
+            let a_col = f.binary(BinaryOperator::Add, t_val, col_local);
+            let in_m = f.binary(BinaryOperator::Less, a_row, pm);
+            let in_k = f.binary(BinaryOperator::Less, a_col, pk);
+            let a_in_bounds = f.binary(BinaryOperator::LogicalAnd, in_m, in_k);
+            let a_row_k = f.binary(BinaryOperator::Multiply, a_row, pk);
+            let a_global = f.binary(BinaryOperator::Add, a_row_k, a_col);
+            let a_elem = f.index(a_ptr, a_global);
+            let a_val = f.load(a_elem);
+            let zero_pad = f.literal_f32(0.0);
+            let a_selected = f.select(a_in_bounds, a_val, zero_pad);
+            push_emit(&f.f.expressions, &mut loop_body, c_off, a_selected);
+            loop_body.push(f.store(sa_elem, a_selected), S);
+        }
 
-        // --- Load B tile into shared_b ---
-        // shared_b[ly * 16 + lx] = B[(t + ly) * n + (tile_col + lx)]  (0 if OOB)
+        // --- Load B tile into shared_b[KTILE*BN] ---
         let sb_ptr = f.global(gv_sb);
         let b_ptr = f.global(gv_b);
-        let sb_elem = f.index(sb_ptr, sa_idx); // same local index
-        let b_row = f.binary(BinaryOperator::Add, t_val, ly);
-        let b_col = f.binary(BinaryOperator::Add, tile_col, lx);
-        let b_in_k = f.binary(BinaryOperator::Less, b_row, pk);
-        let b_in_n = f.binary(BinaryOperator::Less, b_col, pn);
-        let b_in_bounds = f.binary(BinaryOperator::LogicalAnd, b_in_k, b_in_n);
-        let b_row_n = f.binary(BinaryOperator::Multiply, b_row, pn);
-        let b_global = f.binary(BinaryOperator::Add, b_row_n, b_col);
-        let b_elem = f.index(b_ptr, b_global);
-        let b_val = f.load(b_elem);
-        let zero_pad_b = f.literal_f32(0.0);
-        let b_selected = f.select(b_in_bounds, b_val, zero_pad_b);
-        push_emit(&f.f.expressions, &mut loop_body, sb_ptr, b_selected);
-        loop_body.push(f.store(sb_elem, b_selected), S);
+        for e in 0..4u32 {
+            let c_off = f.literal_u32(e * THREADS);
+            let flat = f.binary(BinaryOperator::Add, tid, c_off);
+            // row = flat / BN, col = flat % BN
+            let row_local = f.binary(BinaryOperator::Divide, flat, c_bn2);
+            let col_local = f.binary(BinaryOperator::Modulo, flat, c_bn2);
+            let sb_elem = f.index(sb_ptr, flat);
+            // global coords
+            let b_row = f.binary(BinaryOperator::Add, t_val, row_local);
+            let b_col = f.binary(BinaryOperator::Add, tile_col, col_local);
+            let b_in_k = f.binary(BinaryOperator::Less, b_row, pk);
+            let b_in_n = f.binary(BinaryOperator::Less, b_col, pn);
+            let b_in_bounds = f.binary(BinaryOperator::LogicalAnd, b_in_k, b_in_n);
+            let b_row_n = f.binary(BinaryOperator::Multiply, b_row, pn);
+            let b_global = f.binary(BinaryOperator::Add, b_row_n, b_col);
+            let b_elem = f.index(b_ptr, b_global);
+            let b_val = f.load(b_elem);
+            let zero_pad = f.literal_f32(0.0);
+            let b_selected = f.select(b_in_bounds, b_val, zero_pad);
+            push_emit(&f.f.expressions, &mut loop_body, c_off, b_selected);
+            loop_body.push(f.store(sb_elem, b_selected), S);
+        }
 
         // workgroupBarrier — shared memory is populated
         loop_body.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
 
-        // --- Accumulate: sum += shared_a[ly*16+j] * shared_b[j*16+lx] for j in 0..16 ---
-        // Unroll the inner loop for better performance
-        for j in 0..TILE {
-            let j_c = f.literal_u32(j);
-            let ly_tile = f.binary(BinaryOperator::Multiply, ly, tile_c);
-            let sa_j = f.binary(BinaryOperator::Add, ly_tile, j_c);
-            let sa_j_elem = f.index(sa_ptr, sa_j);
-            let sa_j_val = f.load(sa_j_elem);
+        // --- Compute: unrolled over KTILE ---
+        // a_regs[i] = shared_a[(ty*4+i)*16 + kk]  for i=0..3
+        // b_regs[j] = shared_b[kk*64 + tx*4+j]    for j=0..3
+        // s[i][j] += a_regs[i] * b_regs[j]
+        for kk in 0..KTILE {
+            let c_kk = f.literal_u32(kk);
 
-            let j_tile = f.binary(BinaryOperator::Multiply, j_c, tile_c);
-            let sb_j = f.binary(BinaryOperator::Add, j_tile, lx);
-            let sb_j_elem = f.index(sb_ptr, sb_j);
-            let sb_j_val = f.load(sb_j_elem);
+            // Load 4 A registers
+            let mut a_regs = Vec::new();
+            for i in 0..TM {
+                // (ty*4+i)*16 + kk
+                let ty_tm = f.binary(BinaryOperator::Multiply, ty, c_tm);
+                let c_i = f.literal_u32(i);
+                let ty_tm_i = f.binary(BinaryOperator::Add, ty_tm, c_i);
+                let row_ktile = f.binary(BinaryOperator::Multiply, ty_tm_i, c_ktile);
+                let sa_idx = f.binary(BinaryOperator::Add, row_ktile, c_kk);
+                let sa_elem = f.index(sa_ptr, sa_idx);
+                let sa_val = f.load(sa_elem);
+                a_regs.push(sa_val);
+            }
 
-            let prod = f.binary(BinaryOperator::Multiply, sa_j_val, sb_j_val);
-            let old_sum = f.load(sum_ptr);
-            let new_sum = f.binary(BinaryOperator::Add, old_sum, prod);
-            push_emit(&f.f.expressions, &mut loop_body, j_c, new_sum);
-            loop_body.push(f.store(sum_ptr, new_sum), S);
+            // Load 4 B registers
+            let mut b_regs = Vec::new();
+            for j in 0..TN {
+                // kk*64 + tx*4+j
+                let kk_bn = f.binary(BinaryOperator::Multiply, c_kk, c_bn2);
+                let tx_tn = f.binary(BinaryOperator::Multiply, tx, c_tn);
+                let c_j = f.literal_u32(j);
+                let tx_tn_j = f.binary(BinaryOperator::Add, tx_tn, c_j);
+                let sb_idx = f.binary(BinaryOperator::Add, kk_bn, tx_tn_j);
+                let sb_elem = f.index(sb_ptr, sb_idx);
+                let sb_val = f.load(sb_elem);
+                b_regs.push(sb_val);
+            }
+
+            // Emit all A and B register loads together
+            push_emit(
+                &f.f.expressions,
+                &mut loop_body,
+                c_kk,
+                b_regs[TN as usize - 1],
+            );
+
+            // Accumulate: s[i][j] += a_regs[i] * b_regs[j]
+            for i in 0..TM {
+                for j in 0..TN {
+                    let idx = (i * TN + j) as usize;
+                    let prod = f.binary(
+                        BinaryOperator::Multiply,
+                        a_regs[i as usize],
+                        b_regs[j as usize],
+                    );
+                    let old_s = f.load(s_ptrs[idx]);
+                    let new_s = f.binary(BinaryOperator::Add, old_s, prod);
+                    push_emit(&f.f.expressions, &mut loop_body, prod, new_s);
+                    loop_body.push(f.store(s_ptrs[idx], new_s), S);
+                }
+            }
         }
 
         // workgroupBarrier — before next tile overwrites shared memory
         loop_body.push(Statement::ControlBarrier(Barrier::WORK_GROUP), S);
 
-        // t += 16
-        let tile_inc = f.literal_u32(TILE);
+        // t += KTILE
+        let tile_inc = f.literal_u32(KTILE);
         let t_val2 = f.load(t_ptr);
         let t_next = f.binary(BinaryOperator::Add, t_val2, tile_inc);
         push_emit(&f.f.expressions, &mut loop_body, tile_inc, t_next);
@@ -1424,45 +1505,62 @@ fn gen_tiled_matmul_inner(fused_add: bool) -> Module {
         S,
     );
 
-    // Store result: if (row < m && col < n) { c[row * n + col] = sum [+ d] }
-    let row = f.binary(BinaryOperator::Add, tile_row, ly);
-    let col = f.binary(BinaryOperator::Add, tile_col, lx);
-    let r_lt_m = f.binary(BinaryOperator::Less, row, pm);
-    let c_lt_n = f.binary(BinaryOperator::Less, col, pn);
-    let store_cond = f.binary(BinaryOperator::LogicalAnd, r_lt_m, c_lt_n);
-    let row_n = f.binary(BinaryOperator::Multiply, row, pn);
-    let c_idx = f.binary(BinaryOperator::Add, row_n, col);
+    // Store results with bounds check
+    // for i in 0..4, j in 0..4:
+    //   row = tile_row + ty*4 + i; col = tile_col + tx*4 + j
+    //   if row < m && col < n: C[row*n + col] = s[i][j] (+D if fused_add)
     let c_ptr = f.global(gv_c);
-    let c_elem = f.index(c_ptr, c_idx);
-    let final_sum = f.load(sum_ptr);
-    f.emit(row, final_sum);
+    let d_ptr_opt = gv_d.map(|gv| f.global(gv));
 
-    if let Some(gv_d) = gv_d {
-        // Fused add: result = sum + d[idx]
-        let d_ptr = f.global(gv_d);
-        let d_elem = f.index(d_ptr, c_idx);
-        let d_val = f.load(d_elem);
-        let fused_val = f.binary(BinaryOperator::Add, final_sum, d_val);
-        let mut store_block = Block::new();
-        push_emit(&f.f.expressions, &mut store_block, d_ptr, fused_val);
-        store_block.push(f.store(c_elem, fused_val), S);
-        f.f.body.push(
-            Statement::If {
-                condition: store_cond,
-                accept: store_block,
-                reject: Block::new(),
-            },
-            S,
-        );
-    } else {
-        f.f.body.push(
-            Statement::If {
-                condition: store_cond,
-                accept: Block::from_vec(vec![f.store(c_elem, final_sum)]),
-                reject: Block::new(),
-            },
-            S,
-        );
+    for i in 0..TM {
+        for j in 0..TN {
+            let idx = (i * TN + j) as usize;
+            let ty_tm = f.binary(BinaryOperator::Multiply, ty, c_tm);
+            let c_i = f.literal_u32(i);
+            let ty_tm_i = f.binary(BinaryOperator::Add, ty_tm, c_i);
+            let row = f.binary(BinaryOperator::Add, tile_row, ty_tm_i);
+
+            let tx_tn = f.binary(BinaryOperator::Multiply, tx, c_tn);
+            let c_j = f.literal_u32(j);
+            let tx_tn_j = f.binary(BinaryOperator::Add, tx_tn, c_j);
+            let col = f.binary(BinaryOperator::Add, tile_col, tx_tn_j);
+
+            let r_lt_m = f.binary(BinaryOperator::Less, row, pm);
+            let c_lt_n = f.binary(BinaryOperator::Less, col, pn);
+            let store_cond = f.binary(BinaryOperator::LogicalAnd, r_lt_m, c_lt_n);
+
+            let row_n = f.binary(BinaryOperator::Multiply, row, pn);
+            let c_idx = f.binary(BinaryOperator::Add, row_n, col);
+            let c_elem = f.index(c_ptr, c_idx);
+            let final_s = f.load(s_ptrs[idx]);
+            f.emit(ty_tm, final_s);
+
+            if let Some(d_ptr) = d_ptr_opt {
+                let d_elem = f.index(d_ptr, c_idx);
+                let d_val = f.load(d_elem);
+                let fused_val = f.binary(BinaryOperator::Add, final_s, d_val);
+                let mut store_block = Block::new();
+                push_emit(&f.f.expressions, &mut store_block, d_elem, fused_val);
+                store_block.push(f.store(c_elem, fused_val), S);
+                f.f.body.push(
+                    Statement::If {
+                        condition: store_cond,
+                        accept: store_block,
+                        reject: Block::new(),
+                    },
+                    S,
+                );
+            } else {
+                f.f.body.push(
+                    Statement::If {
+                        condition: store_cond,
+                        accept: Block::from_vec(vec![f.store(c_elem, final_s)]),
+                        reject: Block::new(),
+                    },
+                    S,
+                );
+            }
+        }
     }
 
     b.entry_point("main", [16, 16, 1], f.finish());
@@ -1471,7 +1569,7 @@ fn gen_tiled_matmul_inner(fused_add: bool) -> Module {
 
 /// Tiled fused matmul + add: C = A × B + D with shared memory.
 ///
-/// Same as tiled matmul but reads a 4th buffer `addend` and adds it
+/// Same as register-tiled matmul but reads a 4th buffer `addend` and adds it
 /// to the result before storing. Eliminates a separate Add dispatch.
 fn gen_matmul_add() -> Module {
     gen_tiled_matmul_inner(true)
