@@ -7,8 +7,51 @@ use crate::{
 };
 use std::path::Path;
 
+/// Optimizer selection.
+#[derive(Clone, Debug)]
+pub enum Optimizer {
+    /// Stochastic gradient descent.
+    Sgd { learning_rate: f32 },
+    /// Adam optimizer.
+    Adam {
+        learning_rate: f32,
+        beta1: f32,
+        beta2: f32,
+        epsilon: f32,
+    },
+}
+
+impl Optimizer {
+    /// SGD with the given learning rate.
+    pub fn sgd(lr: f32) -> Self {
+        Self::Sgd { learning_rate: lr }
+    }
+
+    /// Adam with standard defaults (beta1=0.9, beta2=0.999, eps=1e-8).
+    pub fn adam(lr: f32) -> Self {
+        Self::Adam {
+            learning_rate: lr,
+            beta1: 0.9,
+            beta2: 0.999,
+            epsilon: 1e-8,
+        }
+    }
+}
+
+impl Default for Optimizer {
+    fn default() -> Self {
+        Self::Sgd {
+            learning_rate: 0.01,
+        }
+    }
+}
+
 /// Configuration for training.
 pub struct TrainConfig {
+    /// Optimizer to use (SGD or Adam).
+    pub optimizer: Optimizer,
+    /// Backward-compatible alias: sets SGD learning rate.
+    /// Ignored if `optimizer` is explicitly set to Adam.
     pub learning_rate: f32,
     /// Print loss every `log_interval` steps. 0 disables step logging.
     pub log_interval: usize,
@@ -21,6 +64,7 @@ pub struct TrainConfig {
 impl Default for TrainConfig {
     fn default() -> Self {
         Self {
+            optimizer: Optimizer::default(),
             learning_rate: 0.01,
             log_interval: 100,
             data_input: "x".into(),
@@ -97,9 +141,22 @@ impl Trainer {
                     .set_input(&self.config.label_input, batch.labels);
             }
 
+            // Set optimizer for fused step
+            match self.config.optimizer {
+                Optimizer::Sgd { learning_rate } => {
+                    self.session.set_learning_rate(learning_rate);
+                }
+                Optimizer::Adam {
+                    learning_rate,
+                    beta1,
+                    beta2,
+                    epsilon,
+                } => {
+                    self.session.set_adam(learning_rate, beta1, beta2, epsilon);
+                }
+            }
             self.session.step();
             self.session.wait();
-            self.session.sgd_step_cpu(self.config.learning_rate);
 
             let loss = self.session.read_loss();
             total_loss += loss;

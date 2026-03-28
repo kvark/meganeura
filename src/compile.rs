@@ -20,6 +20,7 @@ pub enum ShaderEntry {
     Greater,
     BiasAdd,
     SgdUpdate,
+    AdamUpdate,
     SumAll,
     MeanAll,
     Softmax,
@@ -64,6 +65,7 @@ impl ShaderEntry {
             ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater => ShaderGroup::Binary,
             ShaderEntry::BiasAdd => ShaderGroup::BiasAdd,
             ShaderEntry::SgdUpdate => ShaderGroup::Sgd,
+            ShaderEntry::AdamUpdate => ShaderGroup::Adam,
             ShaderEntry::SumAll | ShaderEntry::MeanAll => ShaderGroup::Reduce,
             ShaderEntry::Softmax => ShaderGroup::Softmax,
             ShaderEntry::CrossEntropyLoss => ShaderGroup::CrossEntropy,
@@ -102,6 +104,7 @@ impl ShaderEntry {
             | ShaderEntry::FusedMatMulBTAdd
             | ShaderEntry::BiasAdd
             | ShaderEntry::SgdUpdate
+            | ShaderEntry::AdamUpdate
             | ShaderEntry::Softmax
             | ShaderEntry::CrossEntropyLoss
             | ShaderEntry::Transpose => "main",
@@ -1381,6 +1384,7 @@ mod tests {
             ShaderEntry::Greater,
             ShaderEntry::BiasAdd,
             ShaderEntry::SgdUpdate,
+            ShaderEntry::AdamUpdate,
             ShaderEntry::SumAll,
             ShaderEntry::MeanAll,
             ShaderEntry::SumRows,
