@@ -296,10 +296,10 @@ impl Pipelines {
         let compile_group =
             |group: ShaderGroup,
              target: &mut HashMap<ShaderEntry, blade_graphics::ComputePipeline>| {
-                let module = crate::codegen::generate_module(group);
+                let sm = crate::codegen::generate_module(group);
                 let shader = gpu.create_shader(bg::ShaderDesc {
-                    source: "",
-                    naga_module: Some(module),
+                    source: &sm.source,
+                    naga_module: Some(sm.module),
                 });
                 if let Some(entries) = entries_for_group.get(&group) {
                     for entry in entries {
@@ -467,10 +467,10 @@ impl Session {
         use crate::codegen::ShaderGroup;
         use blade_graphics as bg;
 
-        let module = crate::codegen::generate_module(ShaderGroup::MatMulCoop);
+        let sm = crate::codegen::generate_module(ShaderGroup::MatMulCoop);
         let shader = match gpu.try_create_shader(bg::ShaderDesc {
-            source: "",
-            naga_module: Some(module),
+            source: &sm.source,
+            naga_module: Some(sm.module),
         }) {
             Ok(s) => s,
             Err(e) => {

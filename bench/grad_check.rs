@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use meganeura::{
     build_session,
-    graph::{Graph, Op},
+    graph::Op,
     models::smolvla::{self, SmolVLAConfig},
 };
 
