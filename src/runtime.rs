@@ -458,6 +458,9 @@ pub struct Session {
     /// When true, run in multi-pass mode: one compute pass per dispatch
     /// with individual GPU timestamps. Enables `dump_gpu_timings()`.
     profiling: bool,
+    /// Pending SGD learning rate. When set, `step()` appends SGD updates
+    /// to the same GPU submission (avoiding a separate submit/wait cycle).
+    pending_lr: Option<f32>,
 }
 
 impl Session {
@@ -694,6 +697,7 @@ impl Session {
             sync_point: None,
             last_submit_ns: 0,
             profiling: false,
+            pending_lr: None,
         }
     }
 
@@ -881,6 +885,35 @@ impl Session {
                     let mut pc = pass.with(pipeline);
                     Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
                     pc.dispatch(dispatch.workgroups);
+                }
+            }
+        }
+
+        // If training, append SGD updates as a final barrier group (all
+        // independent, so one pass). This avoids a second submit/wait cycle.
+        if !self.plan.param_grad_pairs.is_empty() {
+            let lr = self.pending_lr.take();
+            if let Some(learning_rate) = lr {
+                let pipeline = &self.pipelines.map[&ShaderEntry::SgdUpdate];
+                let mut pass = self.encoder.compute("sgd_update");
+                for &(param_buf, grad_buf) in &self.plan.param_grad_pairs {
+                    let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
+                    let mut pc = pass.with(pipeline);
+                    pc.bind(
+                        0,
+                        &SgdData {
+                            param: self.buffers[param_buf.0 as usize].at(0),
+                            grad: self.buffers[grad_buf.0 as usize].at(0),
+                            dst: self.buffers[param_buf.0 as usize].at(0),
+                            params: SgdParams {
+                                len,
+                                lr: learning_rate,
+                                _pad0: 0,
+                                _pad1: 0,
+                            },
+                        },
+                    );
+                    pc.dispatch([len.div_ceil(256), 1, 1]);
                 }
             }
         }
@@ -1333,10 +1366,12 @@ impl Session {
         self.encoder.start();
         self.drain_gpu_timings();
 
+        // All SGD updates are independent (different param/grad buffers),
+        // so they share a single compute pass — no barriers between them.
+        let pipeline = &self.pipelines.map[&ShaderEntry::SgdUpdate];
+        let mut pass = self.encoder.compute("sgd_update");
         for &(param_buf, grad_buf) in &self.plan.param_grad_pairs {
             let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
-            let pipeline = &self.pipelines.map[&ShaderEntry::SgdUpdate];
-            let mut pass = self.encoder.compute("sgd_update");
             let mut pc = pass.with(pipeline);
             pc.bind(
                 0,
@@ -1354,9 +1389,19 @@ impl Session {
             );
             pc.dispatch([len.div_ceil(256), 1, 1]);
         }
+        drop(pass);
 
         self.last_submit_ns = crate::profiler::now_ns();
         self.sync_point = Some(self.gpu.submit(&mut self.encoder));
+    }
+
+    /// Set learning rate for SGD updates fused into the next `step()`.
+    ///
+    /// When set, `step()` appends all SGD parameter updates to the same
+    /// GPU submission as forward+backward — eliminating the submit/wait
+    /// overhead of a separate `sgd_step()` call.
+    pub fn set_learning_rate(&mut self, lr: f32) {
+        self.pending_lr = Some(lr);
     }
 
     /// CPU-fallback SGD update.

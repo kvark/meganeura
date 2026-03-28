@@ -198,15 +198,14 @@ fn main() {
 
     // --- Warmup ---
     eprintln!("warming up ({} runs)...", warmup);
+    train_session.set_learning_rate(1e-5);
     for _ in 0..warmup {
         set_inputs(&mut infer_session);
         infer_session.step();
         infer_session.wait();
 
         set_inputs(&mut train_session);
-        train_session.step();
-        train_session.wait();
-        train_session.sgd_step(1e-5);
+        train_session.step(); // includes fused SGD update
         train_session.wait();
     }
 
@@ -300,9 +299,7 @@ fn main() {
     for i in 0..runs {
         set_inputs(&mut train_session);
         let t0 = Instant::now();
-        train_session.step();
-        train_session.wait();
-        train_session.sgd_step(1e-5);
+        train_session.step(); // fwd + bwd + SGD in single submission
         train_session.wait();
         let elapsed = t0.elapsed().as_secs_f64();
         train_latencies.push(elapsed);
