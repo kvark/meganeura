@@ -350,6 +350,7 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         }
         ShaderEntry::BiasAdd => BiasAddData::layout(),
         ShaderEntry::SgdUpdate => SgdData::layout(),
+        ShaderEntry::SwiGLUConcat | ShaderEntry::SwiGLUConcatGrad => BinaryData::layout(),
         ShaderEntry::SumAll | ShaderEntry::MeanAll | ShaderEntry::SumRows => UnaryData::layout(),
         ShaderEntry::Softmax => SoftmaxData::layout(),
         ShaderEntry::CrossEntropyLoss => CrossEntropyData::layout(),
@@ -1012,7 +1013,12 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater | ShaderEntry::SwiGLU => {
+            ShaderEntry::Add
+            | ShaderEntry::Mul
+            | ShaderEntry::Greater
+            | ShaderEntry::SwiGLU
+            | ShaderEntry::SwiGLUConcat
+            | ShaderEntry::SwiGLUConcatGrad => {
                 pc.bind(
                     0,
                     &BinaryData {

@@ -293,8 +293,9 @@ fn main() {
         eprintln!("  fwd run {}: {:.2}ms", i + 1, elapsed * 1000.0);
     }
 
-    // --- Benchmark training step ---
+    // --- Benchmark training step (with fused SGD) ---
     eprintln!("benchmarking training step ({} runs)...", runs);
+    train_session.set_learning_rate(1e-5);
     let mut train_latencies = Vec::new();
     for i in 0..runs {
         set_inputs(&mut train_session);

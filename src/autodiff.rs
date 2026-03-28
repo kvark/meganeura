@@ -181,6 +181,15 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 accumulate_grad(&mut graph, &mut grads, gate, grad_gate);
                 accumulate_grad(&mut graph, &mut grads, up, grad_up);
             }
+            Op::SwiGLUConcat => {
+                // out[M,N] = silu(input[:,:N]) * input[:,N:]
+                // d/dinput = concat(d_gate, d_up) as [M, 2*N]
+                let input = node.inputs[0];
+                let input_ty = forward.nodes()[input as usize].ty.clone();
+                let grad_input =
+                    graph.add_raw_node(Op::SwiGLUConcatGrad, vec![grad_output, input], input_ty);
+                accumulate_grad(&mut graph, &mut grads, input, grad_input);
+            }
             Op::RmsNorm { eps } => {
                 let x = node.inputs[0];
                 let w = node.inputs[1];
@@ -254,6 +263,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::SwiGLUGradGate
             | Op::SwiGLUGradUp
             | Op::SiluGrad
+            | Op::SwiGLUConcatGrad
             | Op::RmsNormGradW { .. }
             | Op::RmsNormGradX { .. } => {}
             // Inference-only ops: should not appear in training graphs

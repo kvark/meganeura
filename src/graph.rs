@@ -118,6 +118,12 @@ pub enum Op {
     // SwiGLU: silu(gate) * up  (inputs: [gate, up])
     SwiGLU,
 
+    // SwiGLU on concatenated input: input[M, 2*N] → output[M, N]
+    // gate = input[:, :N], up = input[:, N:], out = silu(gate) * up
+    SwiGLUConcat,
+    // Backward for SwiGLUConcat: (grad_out[M,N], input[M,2*N]) → grad_input[M,2*N]
+    SwiGLUConcatGrad,
+
     // Fused backward gradient ops for SwiGLU and Silu
     // SwiGLUGradGate: (grad_out, gate, up) → grad_gate
     SwiGLUGradGate,
@@ -458,6 +464,16 @@ impl Graph {
     pub fn swiglu(&mut self, gate: NodeId, up: NodeId) -> NodeId {
         let ty = self.node(gate).ty.clone();
         self.add_node(Op::SwiGLU, vec![gate, up], ty)
+    }
+
+    /// SwiGLU on concatenated input: input[M, 2*N] → output[M, N].
+    /// Reads gate from first half, up from second half.
+    pub fn swiglu_concat(&mut self, input: NodeId) -> NodeId {
+        let in_shape = &self.node(input).ty.shape;
+        assert_eq!(in_shape.len(), 2);
+        assert_eq!(in_shape[1] % 2, 0, "SwiGLUConcat requires even N");
+        let ty = TensorType::f32(vec![in_shape[0], in_shape[1] / 2]);
+        self.add_raw_node(Op::SwiGLUConcat, vec![input], ty)
     }
 
     /// Fused SwiGLU backward: grad_gate = grad_out * up * dsilu(gate)

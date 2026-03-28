@@ -42,6 +42,8 @@ pub enum ShaderEntry {
     SwiGLUGradGate,
     SwiGLUGradUp,
     SiluGrad,
+    SwiGLUConcat,
+    SwiGLUConcatGrad,
     SumRows,
     RmsNormGradW,
     RmsNormGradX,
@@ -82,6 +84,7 @@ impl ShaderEntry {
             ShaderEntry::SwiGLUGradGate | ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => {
                 ShaderGroup::SwiGLUGrad
             }
+            ShaderEntry::SwiGLUConcat | ShaderEntry::SwiGLUConcatGrad => ShaderGroup::SwiGLUConcat,
             ShaderEntry::SumRows => ShaderGroup::SumRows,
             ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => ShaderGroup::RmsNormGrad,
         }
@@ -125,6 +128,8 @@ impl ShaderEntry {
             ShaderEntry::SwiGLUGradGate => "swiglu_grad_gate",
             ShaderEntry::SwiGLUGradUp => "swiglu_grad_up",
             ShaderEntry::SiluGrad => "silu_grad",
+            ShaderEntry::SwiGLUConcat => "swiglu_concat",
+            ShaderEntry::SwiGLUConcatGrad => "swiglu_concat_grad",
             ShaderEntry::SumRows => "sum_rows",
             ShaderEntry::RmsNormGradW => "rms_norm_grad_w",
             ShaderEntry::RmsNormGradX => "rms_norm_grad_x",
@@ -616,6 +621,41 @@ impl<'a> Compiler<'a> {
 
             Op::SwiGLU => {
                 self.emit_binary(ShaderEntry::SwiGLU, node, out_buf);
+            }
+
+            Op::SwiGLUConcat => {
+                // input[M, 2*N] → output[M, N]
+                let input = self.get_buffer(node.inputs[0]);
+                let out_len = node.ty.num_elements() as u32;
+                let half_n = node.ty.shape[1] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::SwiGLUConcat,
+                    workgroups: [ceil_div(out_len, 256), 1, 1],
+                    input_buffers: vec![input, input], // src_b unused in forward
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![out_len, half_n, 0, 0],
+                    use_coop: false,
+                    label: String::new(),
+                });
+            }
+
+            Op::SwiGLUConcatGrad => {
+                // (grad_out[M,N], input[M,2*N]) → grad_input[M,2*N]
+                let grad_out = self.get_buffer(node.inputs[0]);
+                let input = self.get_buffer(node.inputs[1]);
+                let grad_out_len = self.graph.node(node.inputs[0]).ty.num_elements() as u32;
+                let half_n = self.graph.node(node.inputs[0]).ty.shape[1] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::SwiGLUConcatGrad,
+                    workgroups: [ceil_div(grad_out_len, 256), 1, 1],
+                    input_buffers: vec![input, grad_out],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![grad_out_len, half_n, 0, 0],
+                    use_coop: false,
+                    label: String::new(),
+                });
             }
 
             Op::RmsNorm { eps } => {

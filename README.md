@@ -14,26 +14,30 @@ Instead of including the "batteries" - kernels for all kind of cases and hardwar
 
 ## Benchmarks
 
-SmolVLA action expert inference on AMD RDNA3 (chunk_size=50, vlm_seq_len=16, 10 denoise steps, float32):
-
-| Metric | meganeura | PyTorch ROCm |
-|---|---|---|
-| Avg latency (ms) | **148.3** | 277.5 |
-| ms / step | **14.8** | 27.8 |
-| Steps/second | **67.4** | 36.0 |
-
-SmolVLA action expert training on AMD RDNA3 (chunk_size=50, vlm_seq_len=16, float32, random weights).
+SmolVLA action expert training (chunk_size=50, vlm_seq_len=16, float32, random weights).
 Full GQA (15/5 heads, head_dim=64), exact backward through all ops including fused MHA and RmsNorm:
 
-| Metric | meganeura | PyTorch ROCm |
-|---|---|---|
-| Forward avg | **15.0 ms** | 28.4 ms |
-| Train step avg | **99.1 ms** | 97.3 ms |
-| Approx backward | 84.1 ms | 68.8 ms |
+| GPU | Framework | Rev | Forward | Backward | Train step |
+|---|---|---|---|---|---|
+| Radeon 890M | meganeura | `af2b956` | **17.0 ms** | 163.1 ms | 180.1 ms |
+| Radeon 890M | PyTorch 2.5 ROCm | — | 28.4 ms | 68.8 ms | 97.3 ms |
+| Radeon 780M | meganeura | `637c4b1` | **14.5 ms** | 82.7 ms | **97.2 ms** |
+| Radeon 780M | PyTorch ROCm | — | ✗ | ✗ | ✗ |
+
+SmolVLA action expert inference (chunk_size=50, vlm_seq_len=16, 10 denoise steps, float32):
+
+| GPU | Framework | Rev | ms / step | Steps/s |
+|---|---|---|---|---|
+| Radeon 890M | meganeura | `af2b956` | **18.1** | **55.1** |
+| Radeon 890M | PyTorch 2.5 ROCm | — | 27.8 | 36.0 |
+| Radeon 780M | meganeura | `637c4b1` | **14.5** | **69.0** |
+| Radeon 780M | PyTorch ROCm | — | ✗ | ✗ |
+
+PyTorch ROCm does not ship kernels for gfx1103 (780M). The 890M was tested with `HSA_OVERRIDE_GFX_VERSION`.
 
 Gradients verified against PyTorch: 152/152 parameters pass (cos_sim > 0.99, norm_err < 5%) on the full production config.
 
-Run `bash bench/compare.sh` to reproduce (runs inference + training + SmolLM2 benchmarks by default).
+Run `bash bench/compare.sh` to reproduce.
 
 ## System Requirements
 

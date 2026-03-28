@@ -73,6 +73,7 @@ pub enum ShaderGroup {
     MultiHeadAttnGradK,
     MultiHeadAttnGradV,
     SwiGLUGrad,
+    SwiGLUConcat,
     SumRows,
     RmsNormGrad,
 }
@@ -110,6 +111,7 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::MultiHeadAttnGradK => gen_mha_grad_k(),
         ShaderGroup::MultiHeadAttnGradV => gen_mha_grad_v(),
         ShaderGroup::SwiGLUGrad => gen_swiglu_grad(),
+        ShaderGroup::SwiGLUConcat => gen_swiglu_concat(),
         ShaderGroup::SumRows => gen_sum_rows(),
         ShaderGroup::RmsNormGrad => gen_rms_norm_grad(),
     }
@@ -166,6 +168,10 @@ fn gen_binary() -> ShaderModule {
 
 fn gen_swiglu_grad() -> ShaderModule {
     parse_wgsl(include_str!("shaders/swiglu_grad.wgsl"))
+}
+
+fn gen_swiglu_concat() -> ShaderModule {
+    parse_wgsl(include_str!("shaders/swiglu_concat.wgsl"))
 }
 
 // ---------------------------------------------------------------------------
@@ -752,6 +758,10 @@ mod tests {
                 naga::valid::Capabilities::empty(),
             ),
             (ShaderGroup::SwiGLUGrad, naga::valid::Capabilities::empty()),
+            (
+                ShaderGroup::SwiGLUConcat,
+                naga::valid::Capabilities::empty(),
+            ),
             (ShaderGroup::SumRows, naga::valid::Capabilities::empty()),
             (ShaderGroup::RmsNormGrad, naga::valid::Capabilities::empty()),
         ];
@@ -860,6 +870,7 @@ mod tests {
             (ShaderGroup::FullAttention, empty),
             (ShaderGroup::CrossAttention, empty),
             (ShaderGroup::SwiGLUGrad, empty),
+            (ShaderGroup::SwiGLUConcat, empty),
             (ShaderGroup::SumRows, empty),
             (ShaderGroup::RmsNormGrad, empty),
         ];
@@ -985,6 +996,9 @@ mod tests {
                 ShaderEntry::SwiGLUGradGate | ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => {
                     vec!["src_a", "src_b", "src_c", "dst", "params"]
                 }
+                ShaderEntry::SwiGLUConcat | ShaderEntry::SwiGLUConcatGrad => {
+                    vec!["src_a", "src_b", "dst", "params"]
+                }
                 ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => {
                     vec!["src_a", "src_b", "bias", "dst", "params"]
                 }
@@ -1026,6 +1040,8 @@ mod tests {
             ShaderEntry::MultiHeadAttnGradV,
             ShaderEntry::SwiGLUGradGate,
             ShaderEntry::SwiGLUGradUp,
+            ShaderEntry::SwiGLUConcat,
+            ShaderEntry::SwiGLUConcatGrad,
             ShaderEntry::SiluGrad,
             ShaderEntry::RmsNormGradW,
             ShaderEntry::RmsNormGradX,

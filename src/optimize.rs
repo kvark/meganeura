@@ -217,6 +217,8 @@ fn graph_to_egglog(graph: &Graph) -> String {
                 | Op::MultiHeadAttnGradV { .. }
                 | Op::MatMulAT
                 | Op::MatMulBT
+                | Op::SwiGLUConcat
+                | Op::SwiGLUConcatGrad
                 | Op::SwiGLUGradGate
                 | Op::SwiGLUGradUp
                 | Op::SiluGrad
@@ -239,6 +241,8 @@ fn graph_to_egglog(graph: &Graph) -> String {
                 | Op::MultiHeadAttnGradV { .. }
                 | Op::MatMulAT
                 | Op::MatMulBT
+                | Op::SwiGLUConcat
+                | Op::SwiGLUConcatGrad
                 | Op::SwiGLUGradGate
                 | Op::SwiGLUGradUp
                 | Op::SiluGrad
@@ -313,9 +317,13 @@ fn node_to_egglog_expr(node: &Node) -> String {
         | Op::SwiGLUGradGate
         | Op::SwiGLUGradUp
         | Op::SiluGrad
+        | Op::SwiGLUConcatGrad
         | Op::RmsNormGradW { .. }
         | Op::RmsNormGradX { .. } => {
             unreachable!("Grad ops are filtered before egglog encoding")
+        }
+        Op::SwiGLUConcat => {
+            format!("(Silu n{})", node.inputs[0]) // placeholder: egglog doesn't optimize this
         }
         Op::Nop | Op::FusedMatMulAdd | Op::FusedMatMulATAdd | Op::FusedMatMulBTAdd => {
             unreachable!("Nop/Fused nodes should not appear before optimization")
