@@ -509,3 +509,109 @@ fn multi_head_attn_gradient_check() {
         max_rel_err, checks
     );
 }
+
+#[test]
+fn swiglu_concat_gradient_check() {
+    if std::env::var("MEGANEURA_SKIP_BACKPROP").unwrap_or_default() == "1" {
+        return;
+    }
+    // Numerical gradient check for SwiGLUConcat backward.
+    // Graph: W_gate_up[d, 2*d] matmul → SwiGLUConcat → mean_all loss.
+    // Verifies the concatenated gate+up gradient computation.
+    let seq = 4;
+    let d = 16;
+
+    // --- Analytical gradients ---
+    let mut g_train = Graph::new();
+    let x = g_train.input("x", &[seq, d]);
+    let w = g_train.parameter("w", &[d, d * 2]);
+    let mm = g_train.matmul(x, w);
+    let swiglu = g_train.swiglu_concat(mm);
+    let loss = g_train.mean_all(swiglu);
+    g_train.set_outputs(vec![loss]);
+
+    let mut sess = build_session(&g_train);
+    let x_data: Vec<f32> = (0..seq * d)
+        .map(|i| (i as f32 * 0.13).sin() * 1.0)
+        .collect();
+    let w_data: Vec<f32> = (0..d * d * 2)
+        .map(|i| (i as f32 * 0.07 + 1.0).sin() * 0.5)
+        .collect();
+    sess.set_parameter("w", &w_data);
+    sess.set_input("x", &x_data);
+    sess.step();
+    sess.wait();
+
+    let loss_val = sess.read_loss();
+    eprintln!("loss = {:.8}", loss_val);
+    assert!(loss_val.is_finite(), "loss not finite: {}", loss_val);
+
+    let w_buf = sess
+        .plan()
+        .param_buffers
+        .iter()
+        .find(|(n, _)| n == "w")
+        .unwrap()
+        .1;
+    let grad_buf = sess
+        .plan()
+        .param_grad_pairs
+        .iter()
+        .find(|(p, _)| *p == w_buf)
+        .unwrap()
+        .1;
+    let mut grad_w = vec![0.0f32; d * d * 2];
+    sess.read_buffer(grad_buf, &mut grad_w);
+
+    // --- Numerical gradients via central differences ---
+    let mut g_infer = Graph::new();
+    let xi = g_infer.input("x", &[seq, d]);
+    let wi = g_infer.parameter("w", &[d, d * 2]);
+    let mmi = g_infer.matmul(xi, wi);
+    let swi = g_infer.swiglu_concat(mmi);
+    let li = g_infer.mean_all(swi);
+    g_infer.set_outputs(vec![li]);
+    let mut isess = build_inference_session(&g_infer);
+
+    let fwd = |s: &mut meganeura::Session, wd: &[f32]| -> f32 {
+        s.set_parameter("w", wd);
+        s.set_input("x", &x_data);
+        s.step();
+        s.wait();
+        s.read_loss()
+    };
+
+    let eps = 1e-3f32;
+    let check_idxs: Vec<usize> = (0..d * d * 2).step_by(7).collect();
+    let mut max_rel_err = 0.0f32;
+    let mut checks = 0;
+    for &idx in &check_idxs {
+        if idx >= d * d * 2 {
+            continue;
+        }
+        let mut wd = w_data.clone();
+        wd[idx] += eps;
+        let lp = fwd(&mut isess, &wd);
+        wd[idx] -= 2.0 * eps;
+        let lm = fwd(&mut isess, &wd);
+        let num = (lp - lm) / (2.0 * eps);
+        let ana = grad_w[idx];
+        let rel = (num - ana).abs() / (num.abs().max(ana.abs()).max(1e-6));
+        eprintln!("grad_w[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
+        if max_rel_err < rel {
+            max_rel_err = rel;
+        }
+        checks += 1;
+    }
+
+    assert!(checks > 0);
+    assert!(
+        max_rel_err < 0.05,
+        "SwiGLUConcat gradient check FAILED: max rel err {:.4} (>5%)",
+        max_rel_err,
+    );
+    eprintln!(
+        "SwiGLUConcat gradient check PASSED: max rel err {:.4} across {} elements",
+        max_rel_err, checks
+    );
+}

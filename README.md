@@ -35,7 +35,7 @@ SmolVLA action expert inference (chunk_size=50, vlm_seq_len=16, 10 denoise steps
 
 PyTorch ROCm does not ship kernels for gfx1103 (780M). The 890M was tested with `HSA_OVERRIDE_GFX_VERSION`.
 
-Gradients verified against PyTorch: 152/152 parameters pass (cos_sim > 0.99, norm_err < 5%) on the full production config.
+Gradients verified against PyTorch (CPU): 88/136 parameters pass strict threshold (cos_sim > 0.99, norm_err < 5%). All 136 have norm_err < 1.5%; remaining cos_sim failures are f32 precision compounding through 16 backward layers.
 
 Run `bash bench/compare.sh` to reproduce.
 

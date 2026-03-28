@@ -94,12 +94,15 @@ class ExpertLayer(torch.nn.Module):
 class SwiGLU(torch.nn.Module):
     def __init__(self, hidden, intermediate):
         super().__init__()
-        self.gate_proj = torch.nn.Linear(hidden, intermediate, bias=False)
-        self.up_proj = torch.nn.Linear(hidden, intermediate, bias=False)
+        # Merged gate+up weight: [hidden, intermediate*2] in meganeura layout
+        # → PyTorch Linear stores as [intermediate*2, hidden]
+        self.gate_up_proj = torch.nn.Linear(hidden, intermediate * 2, bias=False)
         self.down_proj = torch.nn.Linear(intermediate, hidden, bias=False)
 
     def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        gate_up = self.gate_up_proj(x)
+        gate, up = gate_up.chunk(2, dim=-1)
+        return self.down_proj(F.silu(gate) * up)
 
 
 class ActionExpert(torch.nn.Module):

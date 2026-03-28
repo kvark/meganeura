@@ -1013,12 +1013,23 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::Add
-            | ShaderEntry::Mul
-            | ShaderEntry::Greater
-            | ShaderEntry::SwiGLU
-            | ShaderEntry::SwiGLUConcat
-            | ShaderEntry::SwiGLUConcatGrad => {
+            ShaderEntry::SwiGLUConcat | ShaderEntry::SwiGLUConcatGrad => {
+                pc.bind(
+                    0,
+                    &BinaryData {
+                        src_a: buf(dispatch.input_buffers[0]),
+                        src_b: buf(dispatch.input_buffers[1]),
+                        dst: buf(dispatch.output_buffer),
+                        params: UnaryParams {
+                            len: dispatch.params[0],
+                            _pad0: dispatch.params[1], // half_n
+                            _pad1: 0,
+                            _pad2: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater | ShaderEntry::SwiGLU => {
                 pc.bind(
                     0,
                     &BinaryData {
