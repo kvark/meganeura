@@ -220,6 +220,12 @@ pub enum Op {
         is_cross: bool,
     },
 
+    // Fused RmsNorm + MatMul: C = RmsNorm(X, W_norm) × W_proj
+    // inputs: [x, w_norm, w_proj], output: [M, N] where x=[M,K], w_proj=[K,N]
+    FusedRmsNormMatMul {
+        eps: f32,
+    },
+
     // Exact RmsNorm backward: grad_w[j] = sum_i(dy[i,j] * x[i,j] * rsqrt_i)
     // inputs: [dy, x, w] → [cols]
     RmsNormGradW {

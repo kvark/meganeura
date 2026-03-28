@@ -80,6 +80,7 @@ pub enum ShaderGroup {
     SwiGLUConcat,
     SumRows,
     RmsNormGrad,
+    FusedRmsNormMatMul,
 }
 
 /// Generate a `naga::Module` for a shader group.
@@ -122,6 +123,7 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::SwiGLUConcat => gen_swiglu_concat(),
         ShaderGroup::SumRows => gen_sum_rows(),
         ShaderGroup::RmsNormGrad => gen_rms_norm_grad(),
+        ShaderGroup::FusedRmsNormMatMul => gen_fused_rms_norm_matmul(),
     }
 }
 
@@ -604,6 +606,15 @@ fn gen_rms_norm() -> ShaderModule {
 
 fn gen_rms_norm_grad() -> ShaderModule {
     parse_wgsl(include_str!("shaders/rms_norm_grad.wgsl"))
+}
+
+// ---------------------------------------------------------------------------
+// matmul_rms_norm.wgsl: Fused RmsNorm + MatMul
+// C = RmsNorm(X, W_norm) × W_proj
+// ---------------------------------------------------------------------------
+
+fn gen_fused_rms_norm_matmul() -> ShaderModule {
+    parse_wgsl(include_str!("shaders/matmul_rms_norm.wgsl"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1098,6 +1109,9 @@ mod tests {
                 ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => {
                     vec!["src_a", "src_b", "bias", "dst", "params"]
                 }
+                ShaderEntry::FusedRmsNormMatMul => {
+                    vec!["src_a", "src_b", "bias", "dst", "params"]
+                }
             }
         }
 
@@ -1141,6 +1155,7 @@ mod tests {
             ShaderEntry::SiluGrad,
             ShaderEntry::RmsNormGradW,
             ShaderEntry::RmsNormGradX,
+            ShaderEntry::FusedRmsNormMatMul,
         ];
 
         for entry in &entries {

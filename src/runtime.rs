@@ -408,6 +408,7 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::SwiGLUGradGate => TernaryData::layout(),
         ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => BinaryData::layout(),
         ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => CausalAttentionData::layout(),
+        ShaderEntry::FusedRmsNormMatMul => CausalAttentionData::layout(),
     }
 }
 
@@ -1449,6 +1450,25 @@ impl Session {
                             n: dispatch.params[1], // cols
                             k: dispatch.params[2], // eps_bits
                             _pad: dispatch.params[3],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::FusedRmsNormMatMul => {
+                // bindings: matrix_a=X, matrix_b=W_proj, bias=W_norm, matrix_c=output, params
+                // maps to CausalAttentionData: src_a, src_b, bias, dst, params
+                pc.bind(
+                    0,
+                    &CausalAttentionData {
+                        src_a: buf(dispatch.input_buffers[0]), // X
+                        src_b: buf(dispatch.input_buffers[2]), // W_proj
+                        bias: buf(dispatch.input_buffers[1]),  // W_norm
+                        dst: buf(dispatch.output_buffer),
+                        params: MatMulParams {
+                            m: dispatch.params[0],    // m
+                            n: dispatch.params[1],    // n
+                            k: dispatch.params[2],    // k
+                            _pad: dispatch.params[3], // eps_bits
                         },
                     },
                 );

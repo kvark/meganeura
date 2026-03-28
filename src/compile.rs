@@ -47,6 +47,7 @@ pub enum ShaderEntry {
     SumRows,
     RmsNormGradW,
     RmsNormGradX,
+    FusedRmsNormMatMul,
 }
 
 impl ShaderEntry {
@@ -87,6 +88,7 @@ impl ShaderEntry {
             ShaderEntry::SwiGLUConcat | ShaderEntry::SwiGLUConcatGrad => ShaderGroup::SwiGLUConcat,
             ShaderEntry::SumRows => ShaderGroup::SumRows,
             ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => ShaderGroup::RmsNormGrad,
+            ShaderEntry::FusedRmsNormMatMul => ShaderGroup::FusedRmsNormMatMul,
         }
     }
 
@@ -133,6 +135,7 @@ impl ShaderEntry {
             ShaderEntry::SumRows => "sum_rows",
             ShaderEntry::RmsNormGradW => "rms_norm_grad_w",
             ShaderEntry::RmsNormGradX => "rms_norm_grad_x",
+            ShaderEntry::FusedRmsNormMatMul => "main",
         }
     }
 }
@@ -315,6 +318,12 @@ impl<'a> Compiler<'a> {
                 }
                 ShaderEntry::RmsNorm | ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => {
                     format!("{:?}[{}x{}]", d.shader, d.params[0], d.params[1])
+                }
+                ShaderEntry::FusedRmsNormMatMul => {
+                    format!(
+                        "{:?}[{}x{}x{}]",
+                        d.shader, d.params[0], d.params[2], d.params[1]
+                    )
                 }
                 _ => {
                     if d.params[0] > 0 {
@@ -1013,6 +1022,30 @@ impl<'a> Compiler<'a> {
                 });
             }
 
+            Op::FusedRmsNormMatMul { eps } => {
+                // C = RmsNorm(X, W_norm) × W_proj
+                // inputs: [x, w_norm, w_proj]
+                let x = self.get_buffer(node.inputs[0]);
+                let w_norm = self.get_buffer(node.inputs[1]);
+                let w_proj = self.get_buffer(node.inputs[2]);
+                let x_shape = &self.graph.node(node.inputs[0]).ty.shape;
+                let w_proj_shape = &self.graph.node(node.inputs[2]).ty.shape;
+                let m = x_shape[0] as u32;
+                let k = x_shape[1] as u32;
+                let n = w_proj_shape[1] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::FusedRmsNormMatMul,
+                    workgroups: [ceil_div(n, 64), ceil_div(m, 64), 1],
+                    input_buffers: vec![x, w_norm, w_proj],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![m, n, k, eps.to_bits()],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    label: String::new(),
+                });
+            }
+
             Op::RmsNormGradW { eps } => {
                 let dy = self.get_buffer(node.inputs[0]);
                 let x = self.get_buffer(node.inputs[1]);
@@ -1359,6 +1392,7 @@ mod tests {
             ShaderEntry::SiluGrad,
             ShaderEntry::RmsNormGradW,
             ShaderEntry::RmsNormGradX,
+            ShaderEntry::FusedRmsNormMatMul,
         ];
         for entry in &entries {
             let _group = entry.shader_group();

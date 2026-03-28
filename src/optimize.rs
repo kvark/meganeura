@@ -248,6 +248,7 @@ fn graph_to_egglog(graph: &Graph) -> String {
   (SwiGLU Op Op)
   (SwiGLUConcat Op)
   (RmsNorm Op Op)
+  (FusedRmsNormMatMul Op Op Op)
   (Embedding Op Op)
   (RoPE Op)
   (CausalAttention Op Op Op)
@@ -287,6 +288,9 @@ fn graph_to_egglog(graph: &Graph) -> String {
 (rewrite (Add ?d (MatMulAT ?a ?b))  (FusedMatMulATAdd ?a ?b ?d))
 (rewrite (Add (MatMulBT ?a ?b) ?d)  (FusedMatMulBTAdd ?a ?b ?d))
 (rewrite (Add ?d (MatMulBT ?a ?b))  (FusedMatMulBTAdd ?a ?b ?d))
+
+; --- RmsNorm+MatMul fusion ---
+(rewrite (MatMul (RmsNorm ?x ?w_norm) ?w_proj) (FusedRmsNormMatMul ?x ?w_norm ?w_proj))
 
 ; --- SwiGLU fusion: two matmuls sharing input → single wide matmul ---
 ; SwiGLU(MatMul(h, w1), MatMul(h, w2)) can use SwiGLUConcat on a
@@ -383,6 +387,9 @@ fn node_to_egglog_expr(node: &Node) -> String {
         Op::FusedMatMulBTAdd => {
             format!("(FusedMatMulBTAdd n{} n{} n{})", i[0], i[1], i[2])
         }
+        Op::FusedRmsNormMatMul { .. } => {
+            format!("(FusedRmsNormMatMul n{} n{} n{})", i[0], i[1], i[2])
+        }
         Op::Nop => unreachable!("Nop nodes are filtered before encoding"),
     }
 }
@@ -427,6 +434,11 @@ fn rebuild_graph_from_extractions(
         let n = fusions.len();
         apply_matmul_add_fusions(&mut graph, &mut fusions);
         apply_swiglu_concat_fusions(&mut graph, &mut fusions);
+        // RmsNorm+MatMul fusion: disabled on iGPU — the fused kernel's
+        // per-element normalization (2 extra FMAs/element in tile loads)
+        // outweighs the saved intermediate write (144KB). Enable via cost
+        // model on discrete GPUs where bandwidth savings matter more.
+        // apply_rms_norm_matmul_fusions(&mut graph, &mut fusions);
         if fusions.len() == n {
             break;
         }
@@ -475,7 +487,7 @@ fn scan_fusions(
     _fusions: &mut Vec<(String, u32)>,
 ) {
     if let Term::App(name, children) = dag.get(term_id).clone() {
-        if name.starts_with("FusedMatMul") {
+        if name.starts_with("FusedMatMul") || name.starts_with("FusedRmsNorm") {
             log::debug!("egglog discovered fusion: {}", name);
         }
         for child in children {
@@ -631,6 +643,52 @@ fn apply_swiglu_concat_fusions(graph: &mut Graph, fusions: &mut Vec<(String, u32
             "SwiGLU(MatMul,MatMul)→SwiGLUConcat(MatMul)".to_string(),
             id as u32,
         ));
+    }
+}
+
+/// Fuse MatMul(RmsNorm(x, w_norm, eps), w_proj) → FusedRmsNormMatMul(x, w_norm, w_proj, eps)
+///
+/// Only fuses if the RmsNorm result is used exclusively by this MatMul.
+#[allow(dead_code)]
+fn apply_rms_norm_matmul_fusions(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
+    use crate::graph::TensorType;
+    let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
+    for &id in &node_ids {
+        let node = &graph.nodes()[id];
+        if !matches!(node.op, Op::MatMul) {
+            continue;
+        }
+        let (norm_id, w_proj_id) = (node.inputs[0], node.inputs[1]);
+        let norm_node = graph.node(norm_id);
+        let eps = match norm_node.op {
+            Op::RmsNorm { eps } => eps,
+            _ => continue,
+        };
+        // RmsNorm must be single-use (only feeding this MatMul)
+        let norm_use_count = graph
+            .nodes()
+            .iter()
+            .filter(|n| n.inputs.contains(&norm_id) && !matches!(n.op, Op::Nop))
+            .count();
+        if norm_use_count != 1 {
+            continue;
+        }
+
+        let x = norm_node.inputs[0];
+        let w_norm = norm_node.inputs[1];
+        let x_shape = &graph.node(x).ty.shape;
+        let w_proj_shape = &graph.node(w_proj_id).ty.shape;
+        let m = x_shape[0];
+        let n = w_proj_shape[1];
+
+        // Rewrite the MatMul node to FusedRmsNormMatMul
+        graph.nodes_mut()[id].op = Op::FusedRmsNormMatMul { eps };
+        graph.nodes_mut()[id].inputs = vec![x, w_norm, w_proj_id];
+        graph.nodes_mut()[id].ty = TensorType::f32(vec![m, n]);
+        // Mark old RmsNorm as Nop
+        graph.nodes_mut()[norm_id as usize].op = Op::Nop;
+
+        fusions.push(("RmsNorm+MatMul→FusedRmsNormMatMul".to_string(), id as u32));
     }
 }
 

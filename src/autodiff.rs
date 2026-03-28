@@ -308,6 +308,32 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 accumulate_grad(&mut graph, &mut grads, b, grad_b);
                 accumulate_grad(&mut graph, &mut grads, d, grad_output);
             }
+            Op::FusedRmsNormMatMul { eps } => {
+                // Equivalent to MatMul(RmsNorm(x, w_norm), w_proj)
+                // Recompute the normalized intermediate for backward.
+                let x = node.inputs[0];
+                let w_norm = node.inputs[1];
+                let w_proj = node.inputs[2];
+
+                // Recompute: norm = RmsNorm(x, w_norm, eps)
+                let norm_ty = forward.nodes()[x as usize].ty.clone();
+                let norm_recomputed =
+                    graph.add_raw_node(Op::RmsNorm { eps }, vec![x, w_norm], norm_ty);
+
+                // grad_w_proj = norm^T @ grad_output (MatMulAT)
+                let grad_w_proj = graph.matmul_at(norm_recomputed, grad_output);
+                accumulate_grad(&mut graph, &mut grads, w_proj, grad_w_proj);
+
+                // grad_norm = grad_output @ w_proj^T (MatMulBT)
+                let grad_norm = graph.matmul_bt(grad_output, w_proj);
+
+                // Propagate through RmsNorm: grad_x and grad_w_norm
+                let grad_w_norm = graph.rms_norm_grad_w(grad_norm, x, w_norm, eps);
+                let grad_x = graph.rms_norm_grad_x(grad_norm, x, w_norm, eps);
+                accumulate_grad(&mut graph, &mut grads, w_norm, grad_w_norm);
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
+
             // Leaf nodes
             Op::Input { .. } | Op::Parameter { .. } | Op::Constant { .. } | Op::Greater => {}
             Op::Nop => {}
