@@ -1,5 +1,11 @@
 // 4×4 register-tiled matmul: C = A × B (+ D if fused_add)
 // BM=64, BN=64, KTILE=16, TM=4, TN=4, workgroup [16,16,1]
+//
+// Template variables:
+//   $A_INDEX, $B_INDEX: global memory index expressions
+//   $A_ROW, $A_COL: thread-to-tile mapping for A load (row=M, col=K)
+//   $B_ROW, $B_COL: thread-to-tile mapping for B load (row=K, col=N)
+//   $FUSED_ADD_DECL, $FUSED_ADD_EXPR: optional addend for FusedMatMulAdd
 
 struct Params {
     m: u32,
@@ -35,25 +41,27 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         if t >= params.k { break; }
 
         // Load A tile into shared_a[64*16]: 4 elements per thread
+        // shared_a layout: [m_local * 16 + k_local]
         for (var e = 0u; e < 4u; e++) {
             let flat = tid + e * 256u;
-            let row_local = flat / 16u;
-            let col_local = flat % 16u;
+            let row_local = $A_ROW;
+            let col_local = $A_COL;
             let a_row = tile_row + row_local;
             let a_col = t + col_local;
             let in_bounds = (a_row < params.m) && (a_col < params.k);
-            shared_a[flat] = select(0.0, matrix_a[a_row * params.k + a_col], in_bounds);
+            shared_a[row_local * 16u + col_local] = select(0.0, matrix_a[$A_INDEX], in_bounds);
         }
 
         // Load B tile into shared_b[16*64]: 4 elements per thread
+        // shared_b layout: [k_local * 64 + n_local]
         for (var e = 0u; e < 4u; e++) {
             let flat = tid + e * 256u;
-            let row_local = flat / 64u;
-            let col_local = flat % 64u;
+            let row_local = $B_ROW;
+            let col_local = $B_COL;
             let b_row = t + row_local;
             let b_col = tile_col + col_local;
             let in_bounds = (b_row < params.k) && (b_col < params.n);
-            shared_b[flat] = select(0.0, matrix_b[b_row * params.n + b_col], in_bounds);
+            shared_b[row_local * 64u + col_local] = select(0.0, matrix_b[$B_INDEX], in_bounds);
         }
 
         workgroupBarrier();

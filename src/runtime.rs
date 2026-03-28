@@ -339,7 +339,9 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
     use blade_graphics::ShaderData;
     match *entry {
         ShaderEntry::MatMul | ShaderEntry::MatMulAT | ShaderEntry::MatMulBT => MatMulData::layout(),
-        ShaderEntry::FusedMatMulAdd => FusedMatMulAddData::layout(),
+        ShaderEntry::FusedMatMulAdd
+        | ShaderEntry::FusedMatMulATAdd
+        | ShaderEntry::FusedMatMulBTAdd => FusedMatMulAddData::layout(),
         ShaderEntry::Relu | ShaderEntry::Sigmoid | ShaderEntry::Neg | ShaderEntry::Silu => {
             UnaryData::layout()
         }
@@ -622,8 +624,9 @@ impl Session {
                     ShaderGroup::MatMul | ShaderGroup::MatMulAdd => {
                         (dispatch.params[0], dispatch.params[2], dispatch.params[1])
                     }
-                    // Coop AT/BT disabled: f16 staging precision compounds
-                    // through backward layers. Needs f32 path (WGSL rewrite).
+                    // Coop AT/BT disabled: backward matmul shapes (K=50 for
+                    // weight grads, M=50 for input grads) don't benefit from
+                    // coop, and f16 staging precision compounds through layers.
                     ShaderGroup::MatMulAT | ShaderGroup::MatMulBT => continue,
                     _ => continue,
                 };
@@ -938,6 +941,24 @@ impl Session {
                             m: dispatch.params[0],
                             n: dispatch.params[2],
                             k: dispatch.params[1],
+                            _pad: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::FusedMatMulATAdd | ShaderEntry::FusedMatMulBTAdd => {
+                // params layout: [m, n, k, 0] (same as AT/BT, no swizzle)
+                pc.bind(
+                    0,
+                    &FusedMatMulAddData {
+                        matrix_a: buf(dispatch.input_buffers[0]),
+                        matrix_b: buf(dispatch.input_buffers[1]),
+                        matrix_c: buf(dispatch.output_buffer),
+                        src: buf(dispatch.input_buffers[2]), // addend
+                        params: MatMulParams {
+                            m: dispatch.params[0],
+                            n: dispatch.params[1],
+                            k: dispatch.params[2],
                             _pad: 0,
                         },
                     },
@@ -1358,6 +1379,11 @@ impl Session {
 
     pub fn plan(&self) -> &ExecutionPlan {
         &self.plan
+    }
+
+    /// Number of barrier groups (compute passes) in the dispatch sequence.
+    pub fn num_groups(&self) -> usize {
+        self.groups.len()
     }
 }
 

@@ -244,7 +244,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
             }
             // Leaf nodes, fused ops don't appear in forward pass before optimization
             Op::Input { .. } | Op::Parameter { .. } | Op::Constant { .. } | Op::Greater => {}
-            Op::Nop | Op::FusedMatMulAdd => {}
+            Op::Nop | Op::FusedMatMulAdd | Op::FusedMatMulATAdd | Op::FusedMatMulBTAdd => {}
             // Backward grad ops: never appear in forward pass
             Op::MultiHeadAttnGradQ { .. }
             | Op::MultiHeadAttnGradK { .. }

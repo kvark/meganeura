@@ -52,6 +52,8 @@ pub enum ShaderGroup {
     MatMulAdd,
     MatMulAT,
     MatMulBT,
+    MatMulATAdd,
+    MatMulBTAdd,
     MatMulCoop,
     MatMulCoopAdd,
     MatMulCoopAT,
@@ -87,6 +89,8 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::MatMulAdd => gen_matmul_add(),
         ShaderGroup::MatMulAT => gen_matmul_at(),
         ShaderGroup::MatMulBT => gen_matmul_bt(),
+        ShaderGroup::MatMulATAdd => gen_matmul_at_add(),
+        ShaderGroup::MatMulBTAdd => gen_matmul_bt_add(),
         ShaderGroup::MatMulCoop => gen_matmul_coop(),
         ShaderGroup::MatMulCoopAdd => gen_matmul_coop_add(),
         ShaderGroup::MatMulCoopAT => gen_matmul_coop_at(),
@@ -200,44 +204,141 @@ fn gen_transpose() -> ShaderModule {
 ///
 /// BM=64, BN=64, KTILE=16, TM=4, TN=4.
 /// Workgroup [16, 16, 1], dispatched as [ceil(N/64), ceil(M/64), 1].
-fn gen_matmul() -> ShaderModule {
-    let src = include_str!("shaders/matmul.wgsl");
-    let src = preprocess(src, &[("$FUSED_ADD_DECL", ""), ("$FUSED_ADD_EXPR", "")]);
-    parse_wgsl(&src)
-}
+///
+/// Template variables for global memory indices:
+const MATMUL_A_FWD: &str = "a_row * params.k + a_col"; // A[m,k] row-major
+const MATMUL_B_FWD: &str = "b_row * params.n + b_col"; // B[k,n] row-major
+const MATMUL_A_AT: &str = "a_col * params.m + a_row"; // A^T[m,k] = A[k*M+m]
+const MATMUL_B_BT: &str = "b_col * params.k + b_row"; // B^T[k,n] = B[n*K+k]
 
-fn gen_matmul_add() -> ShaderModule {
+/// Thread-to-tile mapping for coalesced global memory access.
+///
+/// For row-major A[M,K]: K is the fast dimension → col = flat%16 (fast)
+/// For transposed A[K,M]: M is the fast dimension → row = flat%64 (fast)
+/// For row-major B[K,N]: N is the fast dimension → col = flat%64 (fast)
+/// For transposed B[N,K]: K is the fast dimension → row = flat%16 (fast)
+const A_ROW_FWD: &str = "flat / 16u"; // M varies slowly (good for [M,K])
+const A_COL_FWD: &str = "flat % 16u"; // K varies fast (coalesced in [M,K])
+const A_ROW_AT: &str = "flat % 64u"; // M varies fast (coalesced in [K,M])
+const A_COL_AT: &str = "flat / 64u"; // K varies slowly
+const B_ROW_FWD: &str = "flat / 64u"; // K varies slowly (good for [K,N])
+const B_COL_FWD: &str = "flat % 64u"; // N varies fast (coalesced in [K,N])
+const B_ROW_BT: &str = "flat % 16u"; // K varies fast (coalesced in [N,K])
+const B_COL_BT: &str = "flat / 16u"; // N varies slowly
+
+fn matmul_vars(
+    a_idx: &str,
+    b_idx: &str,
+    a_row: &str,
+    a_col: &str,
+    b_row: &str,
+    b_col: &str,
+    fused_decl: &str,
+    fused_expr: &str,
+) -> ShaderModule {
     let src = include_str!("shaders/matmul.wgsl");
     let src = preprocess(
         src,
         &[
-            ("$FUSED_ADD_DECL", "var<storage> src: array<f32>;"),
-            ("$FUSED_ADD_EXPR", " + src[idx]"),
+            ("$A_INDEX", a_idx),
+            ("$B_INDEX", b_idx),
+            ("$A_ROW", a_row),
+            ("$A_COL", a_col),
+            ("$B_ROW", b_row),
+            ("$B_COL", b_col),
+            ("$FUSED_ADD_DECL", fused_decl),
+            ("$FUSED_ADD_EXPR", fused_expr),
         ],
     );
     parse_wgsl(&src)
 }
 
+fn gen_matmul() -> ShaderModule {
+    matmul_vars(
+        MATMUL_A_FWD,
+        MATMUL_B_FWD,
+        A_ROW_FWD,
+        A_COL_FWD,
+        B_ROW_FWD,
+        B_COL_FWD,
+        "",
+        "",
+    )
+}
+
+fn gen_matmul_add() -> ShaderModule {
+    matmul_vars(
+        MATMUL_A_FWD,
+        MATMUL_B_FWD,
+        A_ROW_FWD,
+        A_COL_FWD,
+        B_ROW_FWD,
+        B_COL_FWD,
+        "var<storage> src: array<f32>;",
+        " + src[idx]",
+    )
+}
+
+/// FusedMatMulATAdd: C = A^T × B + D  (A=[K,M], B=[K,N], D=[M,N], C=[M,N])
+fn gen_matmul_at_add() -> ShaderModule {
+    matmul_vars(
+        MATMUL_A_AT,
+        MATMUL_B_FWD,
+        A_ROW_AT,
+        A_COL_AT,
+        B_ROW_FWD,
+        B_COL_FWD,
+        "var<storage> src: array<f32>;",
+        " + src[idx]",
+    )
+}
+
+/// FusedMatMulBTAdd: C = A × B^T + D  (A=[M,K], B=[N,K], D=[M,N], C=[M,N])
+fn gen_matmul_bt_add() -> ShaderModule {
+    matmul_vars(
+        MATMUL_A_FWD,
+        MATMUL_B_BT,
+        A_ROW_FWD,
+        A_COL_FWD,
+        B_ROW_BT,
+        B_COL_BT,
+        "var<storage> src: array<f32>;",
+        " + src[idx]",
+    )
+}
+
 /// MatMulBT: C = A @ B^T  (A=[M,K], B=[N,K], C=[M,N])
 ///
-/// Tiled 16×16 matmul where B is accessed transposed.
-/// sA loads: same as MatMul — sA[ly*16+lx] = A[(tile_row+ly)*K + (t+lx)]
-/// sB loads: transposed — sB[ly*16+lx] = B[(tile_col+ly)*K + (t+lx)]
-/// Inner product: sum += sA[ly*16+j] * sB[lx*16+j]
-/// Params: [m, n, k, _pad]
+/// Coalesced B load: consecutive threads read adjacent K values from B[N,K]
+/// (K is the row-major fast dimension), then store transposed into shared_b.
 fn gen_matmul_bt() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/matmul_bt.wgsl"))
+    matmul_vars(
+        MATMUL_A_FWD,
+        MATMUL_B_BT,
+        A_ROW_FWD,
+        A_COL_FWD,
+        B_ROW_BT,
+        B_COL_BT,
+        "",
+        "",
+    )
 }
 
 /// MatMulAT: C = A^T @ B  (A=[K,M], B=[K,N], C=[M,N])
 ///
-/// Tiled 16×16 matmul where A is accessed transposed.
-/// sA loads: transposed — sA[ly*16+lx] = A[(t+ly)*M + (tile_row+lx)]
-/// sB loads: same as MatMul — sB[ly*16+lx] = B[(t+ly)*N + (tile_col+lx)]
-/// Inner product: sum += sA[j*16+ly] * sB[j*16+lx]
-/// Params: [m, n, k, _pad]
+/// Coalesced A load: consecutive threads read adjacent M values from A[K,M]
+/// (M is the row-major fast dimension), then store transposed into shared_a.
 fn gen_matmul_at() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/matmul_at.wgsl"))
+    matmul_vars(
+        MATMUL_A_AT,
+        MATMUL_B_FWD,
+        A_ROW_AT,
+        A_COL_AT,
+        B_ROW_FWD,
+        B_COL_FWD,
+        "",
+        "",
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -590,6 +691,8 @@ mod tests {
             (ShaderGroup::MatMulAdd, naga::valid::Capabilities::empty()),
             (ShaderGroup::MatMulAT, naga::valid::Capabilities::empty()),
             (ShaderGroup::MatMulBT, naga::valid::Capabilities::empty()),
+            (ShaderGroup::MatMulATAdd, naga::valid::Capabilities::empty()),
+            (ShaderGroup::MatMulBTAdd, naga::valid::Capabilities::empty()),
             (
                 ShaderGroup::MatMulCoop,
                 naga::valid::Capabilities::COOPERATIVE_MATRIX
@@ -740,6 +843,8 @@ mod tests {
             (ShaderGroup::MatMulAdd, empty),
             (ShaderGroup::MatMulAT, empty),
             (ShaderGroup::MatMulBT, empty),
+            (ShaderGroup::MatMulATAdd, empty),
+            (ShaderGroup::MatMulBTAdd, empty),
             (ShaderGroup::MatMulCoop, coop),
             (ShaderGroup::MatMulCoopAdd, coop),
             (ShaderGroup::MatMulCoopAT, coop),
@@ -833,7 +938,9 @@ mod tests {
                 ShaderEntry::MatMul | ShaderEntry::MatMulAT | ShaderEntry::MatMulBT => {
                     vec!["matrix_a", "matrix_b", "matrix_c", "params"]
                 }
-                ShaderEntry::FusedMatMulAdd => {
+                ShaderEntry::FusedMatMulAdd
+                | ShaderEntry::FusedMatMulATAdd
+                | ShaderEntry::FusedMatMulBTAdd => {
                     vec!["matrix_a", "matrix_b", "matrix_c", "src", "params"]
                 }
                 ShaderEntry::Relu
@@ -889,6 +996,8 @@ mod tests {
             ShaderEntry::MatMulAT,
             ShaderEntry::MatMulBT,
             ShaderEntry::FusedMatMulAdd,
+            ShaderEntry::FusedMatMulATAdd,
+            ShaderEntry::FusedMatMulBTAdd,
             ShaderEntry::Relu,
             ShaderEntry::Sigmoid,
             ShaderEntry::Neg,

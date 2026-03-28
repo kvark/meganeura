@@ -143,17 +143,19 @@ fn main() {
     eprintln!("compiling inference session (forward only)...");
     let mut infer_session = build_inference_session(&training_g);
     eprintln!(
-        "  infer: {} buffers, {} dispatches",
+        "  infer: {} buffers, {} dispatches, {} barrier groups",
         infer_session.plan().buffers.len(),
-        infer_session.plan().dispatches.len()
+        infer_session.plan().dispatches.len(),
+        infer_session.num_groups()
     );
 
     eprintln!("compiling training session (fwd + bwd + SGD)...");
     let mut train_session = build_session(&training_g);
     eprintln!(
-        "  train: {} buffers, {} dispatches",
+        "  train: {} buffers, {} dispatches, {} barrier groups",
         train_session.plan().buffers.len(),
-        train_session.plan().dispatches.len()
+        train_session.plan().dispatches.len(),
+        train_session.num_groups()
     );
 
     // --- Initialize parameters with deterministic random values ---
@@ -263,20 +265,16 @@ fn main() {
             "\n=== Training step GPU timings (first 100 of {} dispatches) ===",
             train_session.plan().dispatches.len()
         );
+        // Skip sgd_step during profiling so the ring buffer captures
+        // forward+backward timings (not SGD update timings).
         set_inputs(&mut train_session);
         train_session.step();
-        train_session.wait();
-        train_session.sgd_step(1e-5);
-        train_session.wait(); // step A
+        train_session.wait(); // step A — profiling run
         set_inputs(&mut train_session);
         train_session.step();
-        train_session.wait();
-        train_session.sgd_step(1e-5);
-        train_session.wait(); // step B
+        train_session.wait(); // step B — advances ring buffer
         set_inputs(&mut train_session);
-        train_session.step();
-        train_session.wait();
-        train_session.sgd_step(1e-5); // step C — reads step A's timestamps
+        train_session.step(); // step C — start() reads step A's timestamps
         train_session.dump_gpu_timings();
         train_session.wait();
 

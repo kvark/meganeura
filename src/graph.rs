@@ -99,6 +99,10 @@ pub enum Op {
 
     // Fused MatMul + Add: C = A × B + D (inputs: [a, b, d])
     FusedMatMulAdd,
+    // Fused MatMulAT + Add: C = A^T × B + D (inputs: [a, b, d])
+    FusedMatMulATAdd,
+    // Fused MatMulBT + Add: C = A × B^T + D (inputs: [a, b, d])
+    FusedMatMulBTAdd,
 
     // Dead node (consumed by fusion, skip during compilation)
     Nop,

@@ -10,6 +10,8 @@ pub enum ShaderEntry {
     MatMulAT,
     MatMulBT,
     FusedMatMulAdd,
+    FusedMatMulATAdd,
+    FusedMatMulBTAdd,
     Relu,
     Sigmoid,
     Neg,
@@ -53,6 +55,8 @@ impl ShaderEntry {
             ShaderEntry::MatMulAT => ShaderGroup::MatMulAT,
             ShaderEntry::MatMulBT => ShaderGroup::MatMulBT,
             ShaderEntry::FusedMatMulAdd => ShaderGroup::MatMulAdd,
+            ShaderEntry::FusedMatMulATAdd => ShaderGroup::MatMulATAdd,
+            ShaderEntry::FusedMatMulBTAdd => ShaderGroup::MatMulBTAdd,
             ShaderEntry::Relu | ShaderEntry::Sigmoid | ShaderEntry::Neg => ShaderGroup::Unary,
             ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater => ShaderGroup::Binary,
             ShaderEntry::BiasAdd => ShaderGroup::BiasAdd,
@@ -89,6 +93,8 @@ impl ShaderEntry {
             | ShaderEntry::MatMulAT
             | ShaderEntry::MatMulBT
             | ShaderEntry::FusedMatMulAdd
+            | ShaderEntry::FusedMatMulATAdd
+            | ShaderEntry::FusedMatMulBTAdd
             | ShaderEntry::BiasAdd
             | ShaderEntry::SgdUpdate
             | ShaderEntry::Softmax
@@ -256,7 +262,10 @@ impl<'a> Compiler<'a> {
                         d.shader, d.params[0], d.params[2], d.params[1]
                     )
                 }
-                ShaderEntry::MatMulAT | ShaderEntry::MatMulBT => {
+                ShaderEntry::MatMulAT
+                | ShaderEntry::MatMulBT
+                | ShaderEntry::FusedMatMulATAdd
+                | ShaderEntry::FusedMatMulBTAdd => {
                     format!(
                         "{:?}[{}x{}x{}]",
                         d.shader, d.params[0], d.params[1], d.params[2]
@@ -349,7 +358,7 @@ impl<'a> Compiler<'a> {
                 let n = b_shape[1] as u32; // B is [K, N]
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::MatMulAT,
-                    workgroups: [ceil_div(n, 16), ceil_div(m, 16), 1],
+                    workgroups: [ceil_div(n, 64), ceil_div(m, 64), 1],
                     input_buffers: vec![a, b],
                     output_buffer: out_buf,
                     extra_output: None,
@@ -370,7 +379,7 @@ impl<'a> Compiler<'a> {
                 let n = b_shape[0] as u32; // B is [N, K]
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::MatMulBT,
-                    workgroups: [ceil_div(n, 16), ceil_div(m, 16), 1],
+                    workgroups: [ceil_div(n, 64), ceil_div(m, 64), 1],
                     input_buffers: vec![a, b],
                     output_buffer: out_buf,
                     extra_output: None,
@@ -397,6 +406,50 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![m, k, n, 0],
+                    use_coop: false,
+                    label: String::new(),
+                });
+            }
+
+            Op::FusedMatMulATAdd => {
+                // C = A^T × B + D (inputs: [a, b, d])
+                let a = self.get_buffer(node.inputs[0]);
+                let b = self.get_buffer(node.inputs[1]);
+                let d = self.get_buffer(node.inputs[2]);
+                let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
+                let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
+                let k = a_shape[0] as u32; // A is [K, M]
+                let m = a_shape[1] as u32;
+                let n = b_shape[1] as u32; // B is [K, N]
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::FusedMatMulATAdd,
+                    workgroups: [ceil_div(n, 64), ceil_div(m, 64), 1],
+                    input_buffers: vec![a, b, d],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![m, n, k, 0],
+                    use_coop: false,
+                    label: String::new(),
+                });
+            }
+
+            Op::FusedMatMulBTAdd => {
+                // C = A × B^T + D (inputs: [a, b, d])
+                let a = self.get_buffer(node.inputs[0]);
+                let b = self.get_buffer(node.inputs[1]);
+                let d = self.get_buffer(node.inputs[2]);
+                let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
+                let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
+                let m = a_shape[0] as u32; // A is [M, K]
+                let k = a_shape[1] as u32;
+                let n = b_shape[0] as u32; // B is [N, K]
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::FusedMatMulBTAdd,
+                    workgroups: [ceil_div(n, 64), ceil_div(m, 64), 1],
+                    input_buffers: vec![a, b, d],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![m, n, k, 0],
                     use_coop: false,
                     label: String::new(),
                 });

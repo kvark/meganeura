@@ -317,8 +317,8 @@ fn node_to_egglog_expr(node: &Node) -> String {
         | Op::RmsNormGradX { .. } => {
             unreachable!("Grad ops are filtered before egglog encoding")
         }
-        Op::Nop | Op::FusedMatMulAdd => {
-            unreachable!("Nop/FusedMatMulAdd nodes should not appear before optimization")
+        Op::Nop | Op::FusedMatMulAdd | Op::FusedMatMulATAdd | Op::FusedMatMulBTAdd => {
+            unreachable!("Nop/Fused nodes should not appear before optimization")
         }
     }
 }
@@ -336,7 +336,8 @@ fn extract_graph_with_fusions(
     let mut graph = clone_graph(original);
     let mut fusions = Vec::new();
 
-    // Fuse Add(MatMul(a, b), d) → FusedMatMulAdd(a, b, d)
+    // Fuse Add(MatMul*(a, b), d) → FusedMatMul*Add(a, b, d)
+    // Applies to MatMul, MatMulAT, and MatMulBT variants.
     let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
     for &id in &node_ids {
         let node = &graph.nodes()[id];
@@ -344,13 +345,14 @@ fn extract_graph_with_fusions(
             continue;
         }
         let (lhs, rhs) = (node.inputs[0], node.inputs[1]);
-        let (mm_id, addend_id) = if matches!(graph.node(lhs).op, Op::MatMul) {
-            (lhs, rhs)
-        } else if matches!(graph.node(rhs).op, Op::MatMul) {
-            (rhs, lhs)
-        } else {
-            continue;
-        };
+        let (mm_id, addend_id) =
+            if matches!(graph.node(lhs).op, Op::MatMul | Op::MatMulAT | Op::MatMulBT) {
+                (lhs, rhs)
+            } else if matches!(graph.node(rhs).op, Op::MatMul | Op::MatMulAT | Op::MatMulBT) {
+                (rhs, lhs)
+            } else {
+                continue;
+            };
         // Only fuse if the MatMul result is used exclusively by this Add.
         let mm_use_count = graph
             .nodes()
@@ -361,13 +363,19 @@ fn extract_graph_with_fusions(
             continue;
         }
 
-        // Rewrite: Add node becomes FusedMatMulAdd, MatMul becomes Nop
+        // Rewrite: Add node becomes Fused variant, MatMul becomes Nop
         let mm_node = graph.node(mm_id);
         let (a, b) = (mm_node.inputs[0], mm_node.inputs[1]);
-        graph.nodes_mut()[id].op = Op::FusedMatMulAdd;
+        let (fused_op, label) = match mm_node.op {
+            Op::MatMul => (Op::FusedMatMulAdd, "MatMul+Add→FusedMatMulAdd"),
+            Op::MatMulAT => (Op::FusedMatMulATAdd, "MatMulAT+Add→FusedMatMulATAdd"),
+            Op::MatMulBT => (Op::FusedMatMulBTAdd, "MatMulBT+Add→FusedMatMulBTAdd"),
+            _ => unreachable!(),
+        };
+        graph.nodes_mut()[id].op = fused_op;
         graph.nodes_mut()[id].inputs = vec![a, b, addend_id];
         graph.nodes_mut()[mm_id as usize].op = Op::Nop;
-        fusions.push(("MatMul+Add→FusedMatMulAdd".to_string(), id as u32));
+        fusions.push((label.to_string(), id as u32));
     }
 
     (graph, fusions)
