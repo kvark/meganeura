@@ -47,6 +47,7 @@ pub enum ShaderGroup {
     Binary,
     BiasAdd,
     Sgd,
+    Adam,
     Transpose,
     MatMul,
     MatMulAdd,
@@ -90,6 +91,7 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::Binary => gen_binary(),
         ShaderGroup::BiasAdd => gen_bias_add(),
         ShaderGroup::Sgd => gen_sgd(),
+        ShaderGroup::Adam => gen_adam(),
         ShaderGroup::Transpose => gen_transpose(),
         ShaderGroup::MatMul => gen_matmul(),
         ShaderGroup::MatMulAdd => gen_matmul_add(),
@@ -198,6 +200,14 @@ fn gen_bias_add() -> ShaderModule {
 
 fn gen_sgd() -> ShaderModule {
     parse_wgsl(include_str!("shaders/sgd.wgsl"))
+}
+
+// ---------------------------------------------------------------------------
+// adam.wgsl
+// ---------------------------------------------------------------------------
+
+fn gen_adam() -> ShaderModule {
+    parse_wgsl(include_str!("shaders/adam.wgsl"))
 }
 
 // ---------------------------------------------------------------------------
@@ -799,6 +809,7 @@ mod tests {
             (ShaderGroup::Binary, naga::valid::Capabilities::empty()),
             (ShaderGroup::BiasAdd, naga::valid::Capabilities::empty()),
             (ShaderGroup::Sgd, naga::valid::Capabilities::empty()),
+            (ShaderGroup::Adam, naga::valid::Capabilities::empty()),
             (ShaderGroup::Transpose, naga::valid::Capabilities::empty()),
             (ShaderGroup::MatMul, naga::valid::Capabilities::empty()),
             (ShaderGroup::MatMulAdd, naga::valid::Capabilities::empty()),
@@ -955,6 +966,7 @@ mod tests {
             (ShaderGroup::Binary, empty),
             (ShaderGroup::BiasAdd, empty),
             (ShaderGroup::Sgd, empty),
+            (ShaderGroup::Adam, empty),
             (ShaderGroup::Transpose, empty),
             (ShaderGroup::MatMul, empty),
             (ShaderGroup::MatMulAdd, empty),
@@ -1078,6 +1090,7 @@ mod tests {
                 }
                 ShaderEntry::BiasAdd => vec!["src", "bias", "dst", "params"],
                 ShaderEntry::SgdUpdate => vec!["param", "grad", "dst", "params"],
+                ShaderEntry::AdamUpdate => vec!["param", "grad", "m", "v", "params"],
                 ShaderEntry::Softmax => vec!["src", "dst", "params"],
                 ShaderEntry::CrossEntropyLoss => {
                     vec!["logits", "labels", "grad_out", "loss_out", "params"]

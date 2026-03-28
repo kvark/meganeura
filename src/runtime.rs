@@ -127,6 +127,29 @@ struct SgdParams {
     _pad1: u32,
 }
 
+// adam: var param (rw), grad (ro), m (rw), v (rw), params
+#[derive(blade_macros::ShaderData)]
+struct AdamData {
+    param: blade_graphics::BufferPiece,
+    grad: blade_graphics::BufferPiece,
+    m: blade_graphics::BufferPiece,
+    v: blade_graphics::BufferPiece,
+    params: AdamParams,
+}
+
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct AdamParams {
+    len: u32,
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    step: f32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
 // reduce: var src, dst, params (same layout as UnaryData)
 
 // rms_norm: var src, bias (weight), dst, params
@@ -389,6 +412,7 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         }
         ShaderEntry::BiasAdd => BiasAddData::layout(),
         ShaderEntry::SgdUpdate => SgdData::layout(),
+        ShaderEntry::AdamUpdate => AdamData::layout(),
         ShaderEntry::SwiGLUConcat | ShaderEntry::SwiGLUConcatGrad => BinaryData::layout(),
         ShaderEntry::SumAll | ShaderEntry::MeanAll | ShaderEntry::SumRows => UnaryData::layout(),
         ShaderEntry::Softmax => SoftmaxData::layout(),
@@ -502,6 +526,12 @@ pub struct Session {
     /// Pending SGD learning rate. When set, `step()` appends SGD updates
     /// to the same GPU submission (avoiding a separate submit/wait cycle).
     pending_lr: Option<f32>,
+    /// Per-parameter Adam state buffers: (m_buf, v_buf).
+    adam_state: Vec<(blade_graphics::Buffer, blade_graphics::Buffer)>,
+    /// Adam step counter.
+    adam_step: u32,
+    /// Pending Adam parameters. When set, `step()` appends Adam updates.
+    pending_adam: Option<(f32, f32, f32, f32)>, // (lr, beta1, beta2, eps)
 }
 
 impl Session {
@@ -736,6 +766,30 @@ impl Session {
             buffer_count: 2,
         });
 
+        let adam_state = plan
+            .param_grad_pairs
+            .iter()
+            .enumerate()
+            .map(|(i, &(param_buf, _))| {
+                let size = (plan.buffers[param_buf.0 as usize] as u64).max(4);
+                let m_buf = gpu.create_buffer(blade_graphics::BufferDesc {
+                    name: &format!("adam_m_{i}"),
+                    size,
+                    memory: blade_graphics::Memory::Shared,
+                });
+                let v_buf = gpu.create_buffer(blade_graphics::BufferDesc {
+                    name: &format!("adam_v_{i}"),
+                    size,
+                    memory: blade_graphics::Memory::Shared,
+                });
+                unsafe {
+                    std::ptr::write_bytes(m_buf.data(), 0, size as usize);
+                    std::ptr::write_bytes(v_buf.data(), 0, size as usize);
+                }
+                (m_buf, v_buf)
+            })
+            .collect();
+
         Self {
             gpu,
             buffers,
@@ -747,6 +801,9 @@ impl Session {
             last_submit_ns: 0,
             profiling: false,
             pending_lr: None,
+            adam_state,
+            adam_step: 0,
+            pending_adam: None,
         }
     }
 
@@ -999,6 +1056,35 @@ impl Session {
                             params: SgdParams {
                                 len,
                                 lr: learning_rate,
+                                _pad0: 0,
+                                _pad1: 0,
+                            },
+                        },
+                    );
+                    pc.dispatch([len.div_ceil(256), 1, 1]);
+                }
+            } else if let Some((lr, beta1, beta2, eps)) = self.pending_adam.take() {
+                self.adam_step += 1;
+                let pipeline = &self.pipelines.map[&ShaderEntry::AdamUpdate];
+                let mut pass = self.encoder.compute("adam_update");
+                for (idx, &(param_buf, grad_buf)) in self.plan.param_grad_pairs.iter().enumerate() {
+                    let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
+                    let (ref m_buf, ref v_buf) = self.adam_state[idx];
+                    let mut pc = pass.with(pipeline);
+                    pc.bind(
+                        0,
+                        &AdamData {
+                            param: self.buffers[param_buf.0 as usize].at(0),
+                            grad: self.buffers[grad_buf.0 as usize].at(0),
+                            m: m_buf.at(0),
+                            v: v_buf.at(0),
+                            params: AdamParams {
+                                len,
+                                lr,
+                                beta1,
+                                beta2,
+                                eps,
+                                step: self.adam_step as f32,
                                 _pad0: 0,
                                 _pad1: 0,
                             },
@@ -1473,6 +1559,9 @@ impl Session {
                     },
                 );
             }
+            ShaderEntry::AdamUpdate => {
+                unreachable!("AdamUpdate is dispatched via adam_step/set_adam, not bind_dispatch");
+            }
         }
     }
 
@@ -1546,6 +1635,54 @@ impl Session {
                 }
             }
         }
+    }
+
+    /// Apply Adam optimizer updates to all parameters on the GPU.
+    pub fn adam_step(&mut self, lr: f32, beta1: f32, beta2: f32, eps: f32) {
+        let _span = tracing::info_span!("adam_step").entered();
+        self.adam_step += 1;
+        self.wait();
+        self.encoder.start();
+        self.drain_gpu_timings();
+
+        let pipeline = &self.pipelines.map[&ShaderEntry::AdamUpdate];
+        let mut pass = self.encoder.compute("adam_update");
+        for (idx, &(param_buf, grad_buf)) in self.plan.param_grad_pairs.iter().enumerate() {
+            let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
+            let (ref m_buf, ref v_buf) = self.adam_state[idx];
+            let mut pc = pass.with(pipeline);
+            pc.bind(
+                0,
+                &AdamData {
+                    param: self.buffers[param_buf.0 as usize].at(0),
+                    grad: self.buffers[grad_buf.0 as usize].at(0),
+                    m: m_buf.at(0),
+                    v: v_buf.at(0),
+                    params: AdamParams {
+                        len,
+                        lr,
+                        beta1,
+                        beta2,
+                        eps,
+                        step: self.adam_step as f32,
+                        _pad0: 0,
+                        _pad1: 0,
+                    },
+                },
+            );
+            pc.dispatch([len.div_ceil(256), 1, 1]);
+        }
+        drop(pass);
+
+        self.last_submit_ns = crate::profiler::now_ns();
+        self.sync_point = Some(self.gpu.submit(&mut self.encoder));
+    }
+
+    /// Set Adam parameters for updates fused into the next `step()`.
+    ///
+    /// Analogous to [`set_learning_rate`](Self::set_learning_rate) for SGD.
+    pub fn set_adam(&mut self, lr: f32, beta1: f32, beta2: f32, eps: f32) {
+        self.pending_adam = Some((lr, beta1, beta2, eps));
     }
 
     pub fn plan(&self) -> &ExecutionPlan {

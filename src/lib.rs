@@ -26,6 +26,7 @@ pub mod compile;
 pub mod data;
 pub mod graph;
 pub mod models;
+pub mod nn;
 pub mod optimize;
 pub mod profiler;
 pub mod runtime;
@@ -36,6 +37,6 @@ pub use graph::{DType, Graph, NodeId, TensorType};
 pub use optimize::OptimizeReport;
 pub use runtime::Session;
 pub use train::{
-    EpochStats, TrainConfig, TrainHistory, Trainer, build_inference_session, build_session,
-    build_session_cached, build_session_with_report, compile_training_graph,
+    EpochStats, Optimizer, TrainConfig, TrainHistory, Trainer, build_inference_session,
+    build_session, build_session_cached, build_session_with_report, compile_training_graph,
 };
