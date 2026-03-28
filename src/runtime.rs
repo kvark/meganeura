@@ -1178,8 +1178,8 @@ impl Session {
                         dst: buf(dispatch.output_buffer),
                         params: MatMulParams {
                             m: dispatch.params[0],
-                            k: dispatch.params[1],
-                            n: dispatch.params[2],
+                            n: dispatch.params[1],
+                            k: dispatch.params[2],
                             _pad: dispatch.params[3],
                         },
                     },
