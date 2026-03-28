@@ -27,9 +27,9 @@ Full GQA (15/5 heads, head_dim=64), exact backward through all ops including fus
 
 | Metric | meganeura | PyTorch ROCm |
 |---|---|---|
-| Forward avg | **14.9 ms** | 28.4 ms |
-| Train step avg | 130.4 ms | 97.3 ms |
-| Approx backward | 115.5 ms | 68.8 ms |
+| Forward avg | **15.0 ms** | 28.4 ms |
+| Train step avg | **99.1 ms** | 97.3 ms |
+| Approx backward | 84.1 ms | 68.8 ms |
 
 Gradients verified against PyTorch: 152/152 parameters pass (cos_sim > 0.99, norm_err < 5%) on the full production config.
 
