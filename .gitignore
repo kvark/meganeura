@@ -1,7 +1,8 @@
-/target
-Cargo.lock
+/target/
+/Cargo.lock
 data/mnist-mlp.safetensors
 data/*.gz
-bench/results/
+/bench/results/
 *.trace
-.venv/
+/.venv/
+/.claude/

@@ -47,6 +47,7 @@ def main():
     }
     torch_dtype = dtype_map[args.dtype]
 
+    torch.set_float32_matmul_precision("high")
     print(f"device: {device}, dtype: {args.dtype}", file=sys.stderr)
 
     # --- Load model and tokenizer ---

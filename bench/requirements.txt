@@ -1,0 +1,5 @@
+# PyTorch benchmark dependencies.
+# torch is installed separately (CPU vs CUDA) — see compare.sh.
+transformers
+safetensors
+huggingface_hub

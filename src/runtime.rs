@@ -755,7 +755,6 @@ impl Session {
     /// When enabled, `step()` runs one compute pass per dispatch with
     /// individual GPU timestamps. Call `dump_gpu_timings()` after the
     /// *next* `step()` to see per-pass timings from the profiled run.
-    /// Note: blade limits timestamps to 100 passes per submission.
     pub fn set_profiling(&mut self, enabled: bool) {
         self.profiling = enabled;
     }
@@ -940,7 +939,6 @@ impl Session {
         if self.profiling {
             // Multi-pass mode: one compute pass per dispatch with per-pass barriers
             // and GPU timestamps. Enables dump_gpu_timings() after the next step().
-            // Note: blade caps timestamps at 100 passes per submission.
             for i in 0..self.plan.dispatches.len() {
                 let dispatch = &self.plan.dispatches[i];
                 let pipeline = self.pipelines.get(dispatch);
@@ -1555,6 +1553,11 @@ impl Session {
     /// Number of barrier groups (compute passes) in the dispatch sequence.
     pub fn num_groups(&self) -> usize {
         self.groups.len()
+    }
+
+    /// GPU device and driver name.
+    pub fn device_information(&self) -> &blade_graphics::DeviceInformation {
+        self.gpu.device_information()
     }
 }
 
