@@ -168,10 +168,11 @@ pub fn build_inference_session(forward_graph: &Graph) -> Session {
 /// Build a complete training session from a forward-pass graph.
 ///
 /// This is the main entry point. It:
-/// 1. Runs autodiff to build the backward pass
-/// 2. Runs egglog optimization on the combined graph
-/// 3. Compiles the optimized graph to an execution plan
-/// 4. Creates a GPU session with all resources allocated
+/// 1. Optimizes the forward graph (SwiGLU fusion, MatMul+Add, etc.)
+/// 2. Runs autodiff on the optimized forward graph
+/// 3. Optimizes the full graph (backward MatMul+Add fusions)
+/// 4. Compiles the optimized graph to an execution plan
+/// 5. Creates a GPU session with all resources allocated
 pub fn build_session(forward_graph: &Graph) -> Session {
     let (session, report) = build_session_with_report(forward_graph);
     log::info!("{}", report);
@@ -189,21 +190,43 @@ pub fn build_session_with_report(forward_graph: &Graph) -> (Session, OptimizeRep
     log::info!("building training session...");
     log::info!("forward graph:\n{}", forward_graph);
 
-    // Step 1: Autodiff
-    log::info!("running autodiff...");
+    // Step 1: Optimize forward graph (fuse SwiGLU, MatMul+Add, etc.)
+    // This runs BEFORE autodiff so the backward pass differentiates
+    // the optimized ops (e.g. SwiGLUConcat instead of separate SwiGLU).
+    log::info!("optimizing forward graph...");
+    let optimized_forward = {
+        let _span = tracing::info_span!("optimize_forward").entered();
+        optimize::optimize(forward_graph)
+    };
+    log::info!(
+        "optimized forward: {} nodes",
+        optimized_forward.nodes().len()
+    );
+
+    // Step 2: Toposort the optimized graph (optimizer may append nodes
+    // out of order) then run autodiff. Autodiff iterates in reverse node
+    // order, so topological ordering ensures gradients flow correctly.
+    let sorted_forward = optimized_forward.toposort();
+    eprintln!(
+        "pipeline: forward {} → optimized {} → sorted {} nodes, outputs={:?}",
+        forward_graph.nodes().len(),
+        optimized_forward.nodes().len(),
+        sorted_forward.nodes().len(),
+        sorted_forward.outputs()
+    );
     let full_graph = {
         let _span = tracing::info_span!("autodiff").entered();
-        autodiff::differentiate(forward_graph)
+        autodiff::differentiate(&sorted_forward)
     };
     log::info!(
         "full graph (forward + backward): {} nodes",
         full_graph.nodes().len()
     );
 
-    // Step 2: Optimize with egglog
-    log::info!("running egglog optimization...");
+    // Step 3: Optimize full graph (fuse backward MatMul+Add, etc.)
+    log::info!("optimizing full graph...");
     let (optimized, report) = {
-        let _span = tracing::info_span!("egglog_optimize").entered();
+        let _span = tracing::info_span!("optimize_full").entered();
         optimize::optimize_with_report(&full_graph)
     };
     log::info!("optimized graph: {} nodes", optimized.nodes().len());

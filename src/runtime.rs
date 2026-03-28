@@ -714,9 +714,51 @@ impl Session {
 
     /// Upload parameter data to GPU buffers.
     pub fn set_parameter(&mut self, name: &str, data: &[f32]) {
+        // Check regular parameters first
         for &(ref param_name, buf_ref) in &self.plan.param_buffers {
             if param_name == name {
                 self.upload_buffer(buf_ref, bytemuck::cast_slice(data));
+
+                // If this source param feeds a derived (concatenated) param,
+                // write this source's data into the correct offset of the
+                // derived buffer. Uses row-interleaved layout: for each row,
+                // source A's columns come first, then source B's columns.
+                for entry in &self.plan.derived_params {
+                    let derived_buf = &entry.0;
+                    let sources = &entry.1;
+                    let mut col_offset = 0usize;
+                    let total_cols: usize = sources.iter().map(|s| s.1).sum();
+                    let rows = if total_cols > 0 {
+                        self.plan.buffers[derived_buf.0 as usize] / 4 / total_cols
+                    } else {
+                        0
+                    };
+                    for src in sources {
+                        let src_name = &src.0;
+                        let src_elems = src.1;
+                        let src_cols = if rows > 0 { src_elems / rows } else { 0 };
+                        if src_name == name && rows > 0 {
+                            // Write row-interleaved: for row r, write data[r*src_cols .. (r+1)*src_cols]
+                            // to derived_buf at offset [r * total_cols/rows + col_offset]
+                            let total_cols_per_row = total_cols / rows;
+                            let derived_ptr =
+                                self.buffers[derived_buf.0 as usize].data() as *mut f32;
+                            for r in 0..rows {
+                                let src_start = r * src_cols;
+                                let dst_start = r * total_cols_per_row + col_offset;
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        data[src_start..].as_ptr(),
+                                        derived_ptr.add(dst_start),
+                                        src_cols,
+                                    );
+                                }
+                            }
+                        }
+                        col_offset += src_cols;
+                    }
+                }
+
                 return;
             }
         }

@@ -251,9 +251,66 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 accumulate_grad(&mut graph, &mut grads, k, grad_k);
                 accumulate_grad(&mut graph, &mut grads, v, grad_v);
             }
-            // Leaf nodes, fused ops don't appear in forward pass before optimization
+            // FusedMatMul*Add(a, b, d) = MatMul*(a, b) + d
+            // Backward: same as MatMul backward + Add backward (passthrough to d)
+            Op::FusedMatMulAdd => {
+                let (a, b, d) = (node.inputs[0], node.inputs[1], node.inputs[2]);
+                let grad_a = graph.matmul_bt(grad_output, b);
+                let grad_b = graph.matmul_at(a, grad_output);
+                accumulate_grad(&mut graph, &mut grads, a, grad_a);
+                accumulate_grad(&mut graph, &mut grads, b, grad_b);
+                accumulate_grad(&mut graph, &mut grads, d, grad_output);
+            }
+            Op::FusedMatMulATAdd => {
+                // C = A^T @ B + D  (A=[K,M], B=[K,N], D=[M,N])
+                // dA = B @ dC^T → MatMul(B, Transpose(dC))... actually:
+                // dA = dC @ B^T... no. For A^T @ B:
+                // dA_original = B @ grad^T, but A is [K,M] stored transposed.
+                // Simpler: treat as MatMulAT(a, b) + d
+                // d/da_col_j = sum_i(b[i,:] * grad[j,:]) = MatMul(grad_output^T, b)...
+                // Actually: for C = A^T @ B, dA = B @ C_grad^T and dB = A @ C_grad
+                // But A is the transposed operand. In our IR:
+                // MatMulAT has inputs [A, B] where A is [K, M] and B is [K, N]
+                // dL/dA = B @ (dL/dC)^T but in our convention...
+                // Just use the same pattern as MatMul backward for AT:
+                // C = A^T @ B: dA = MatMulBT(B, dC), dB = MatMul(A, dC)...
+                // Wait, need to think carefully.
+                // C[m,n] = sum_k A[k,m] * B[k,n]
+                // dA[k,m] = sum_n dC[m,n] * B[k,n] = (dC @ B^T)^T[k,m] = (B @ dC^T)[k,m]
+                //         = MatMulBT(B, Transpose(dC))? No...
+                // Actually: dA[k,m] = sum_n B[k,n] * dC[m,n] = B @ dC^T evaluated at [k,m]
+                //         = MatMul(B, dC^T) but that gives [K, M].
+                // Hmm, we have MatMulBT(X, Y) = X @ Y^T. So:
+                // dA = MatMulBT(B, dC) gives B[K,N] @ dC[M,N]^T = [K, M] ✓
+                // dB = MatMul(A, dC) gives A[K,M] @ dC[M,N] = [K, N] ✓
+                let (a, b, d) = (node.inputs[0], node.inputs[1], node.inputs[2]);
+                let grad_a = graph.matmul_bt(b, grad_output);
+                let grad_b = graph.add_raw_node(
+                    Op::MatMul,
+                    vec![a, grad_output],
+                    forward.nodes()[b as usize].ty.clone(),
+                );
+                accumulate_grad(&mut graph, &mut grads, a, grad_a);
+                accumulate_grad(&mut graph, &mut grads, b, grad_b);
+                accumulate_grad(&mut graph, &mut grads, d, grad_output);
+            }
+            Op::FusedMatMulBTAdd => {
+                // C = A @ B^T + D  (A=[M,K], B=[N,K], D=[M,N])
+                // Same as MatMulBT backward + passthrough to D
+                let (a, b, d) = (node.inputs[0], node.inputs[1], node.inputs[2]);
+                let grad_a = graph.add_raw_node(
+                    Op::MatMul,
+                    vec![grad_output, b],
+                    forward.nodes()[a as usize].ty.clone(),
+                );
+                let grad_b = graph.matmul_at(grad_output, a);
+                accumulate_grad(&mut graph, &mut grads, a, grad_a);
+                accumulate_grad(&mut graph, &mut grads, b, grad_b);
+                accumulate_grad(&mut graph, &mut grads, d, grad_output);
+            }
+            // Leaf nodes
             Op::Input { .. } | Op::Parameter { .. } | Op::Constant { .. } | Op::Greater => {}
-            Op::Nop | Op::FusedMatMulAdd | Op::FusedMatMulATAdd | Op::FusedMatMulBTAdd => {}
+            Op::Nop => {}
             // Backward grad ops: never appear in forward pass
             Op::MultiHeadAttnGradQ { .. }
             | Op::MultiHeadAttnGradK { .. }
@@ -282,20 +339,21 @@ pub fn differentiate(forward: &Graph) -> Graph {
         }
     }
 
-    // Collect parameter gradients as outputs
-    let mut param_grad_outputs = Vec::new();
-    for node in forward.nodes() {
-        if let Op::Parameter { .. } = node.op
-            && let Some(&grad_id) = grads.get(&node.id)
-        {
-            param_grad_outputs.push((node.id, grad_id));
-        }
-    }
-
-    // Outputs: [loss, (param_id, grad_id), ...]
+    // Collect parameter gradients as outputs.
+    // Every Parameter gets an output entry (even dead ones with no gradient)
+    // to maintain positional alignment with param_buffers in compile.rs.
     let mut outputs = vec![loss_node];
-    for &(_, grad_id) in &param_grad_outputs {
-        outputs.push(grad_id);
+    for node in forward.nodes() {
+        if let Op::Parameter { .. } = node.op {
+            if let Some(&grad_id) = grads.get(&node.id) {
+                outputs.push(grad_id);
+            } else {
+                // Dead parameter (optimizer Nop'd its consumer) — use a
+                // zero-sized constant as placeholder so positions align.
+                let zero = graph.scalar(0.0);
+                outputs.push(zero);
+            }
+        }
     }
     graph.set_outputs(outputs);
 

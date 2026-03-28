@@ -522,16 +522,23 @@ pub fn build_action_expert_training(
         );
         let h = g.rms_norm(x, ln2_w, eps);
 
-        let w_gate_up = g.parameter(
-            &format!("{}.mlp.gate_up_proj.weight", prefix),
-            &[expert_hidden, expert.intermediate_size * 2],
+        // Naive SwiGLU: separate gate and up projections.
+        // The optimizer fuses into SwiGLUConcat(MatMul(h, concat_w)).
+        let w_gate = g.parameter(
+            &format!("{}.mlp.gate_proj.weight", prefix),
+            &[expert_hidden, expert.intermediate_size],
+        );
+        let w_up = g.parameter(
+            &format!("{}.mlp.up_proj.weight", prefix),
+            &[expert_hidden, expert.intermediate_size],
         );
         let w_down = g.parameter(
             &format!("{}.mlp.down_proj.weight", prefix),
             &[expert.intermediate_size, expert_hidden],
         );
-        let gate_up_raw = g.matmul(h, w_gate_up);
-        let gate_up = g.swiglu_concat(gate_up_raw);
+        let gate = g.matmul(h, w_gate);
+        let up = g.matmul(h, w_up);
+        let gate_up = g.swiglu(gate, up);
         let ffn_out = g.matmul(gate_up, w_down);
         x = g.add(x, ffn_out);
     }

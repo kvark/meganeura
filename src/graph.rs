@@ -240,9 +240,23 @@ pub struct Node {
     pub ty: TensorType,
 }
 
+/// A derived parameter is created by the optimizer when fusing ops
+/// that require concatenating multiple weights (e.g. gate+up projections).
+#[derive(Clone, Debug)]
+pub struct DerivedParam {
+    /// Name of the new parameter (e.g. "gate_proj.weight+up_proj.weight")
+    pub name: String,
+    /// Source parameters to concatenate horizontally: (name, cols)
+    pub sources: Vec<(String, usize)>,
+    /// Total rows (shared across all sources)
+    pub rows: usize,
+}
+
 pub struct Graph {
     nodes: Vec<Node>,
     outputs: Vec<NodeId>,
+    /// Parameters created by the optimizer from concatenating original params.
+    pub derived_params: Vec<DerivedParam>,
 }
 
 impl Graph {
@@ -250,7 +264,80 @@ impl Graph {
         Self {
             nodes: Vec::new(),
             outputs: Vec::new(),
+            derived_params: Vec::new(),
         }
+    }
+
+    /// Rebuild the graph with nodes in topological order, removing Nop nodes.
+    /// Returns a new graph with consecutive IDs where every node's inputs
+    /// have lower IDs than the node itself.
+    pub fn toposort(&self) -> Graph {
+        // Build adjacency: for each node, which nodes depend on it
+        let n = self.nodes.len();
+        let mut in_degree = vec![0u32; n];
+        let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut is_nop = vec![false; n];
+
+        for (i, node) in self.nodes.iter().enumerate() {
+            if matches!(node.op, Op::Nop) {
+                is_nop[i] = true;
+                continue;
+            }
+            for &inp in &node.inputs {
+                let inp = inp as usize;
+                if !is_nop[inp] {
+                    in_degree[i] += 1;
+                    dependents[inp].push(i);
+                }
+            }
+        }
+
+        // Kahn's algorithm: process nodes with in_degree 0
+        let mut queue: Vec<usize> = Vec::new();
+        for i in 0..n {
+            if !is_nop[i] && in_degree[i] == 0 {
+                queue.push(i);
+            }
+        }
+
+        let mut order: Vec<usize> = Vec::new();
+        let mut old_to_new: Vec<Option<NodeId>> = vec![None; n];
+
+        while let Some(old_id) = queue.first().copied() {
+            queue.remove(0);
+            let new_id = order.len() as NodeId;
+            old_to_new[old_id] = Some(new_id);
+            order.push(old_id);
+
+            for &dep in &dependents[old_id] {
+                in_degree[dep] -= 1;
+                if in_degree[dep] == 0 {
+                    queue.push(dep);
+                }
+            }
+        }
+
+        // Build new graph with remapped IDs
+        let mut new_graph = Graph::new();
+        for &old_id in &order {
+            let node = &self.nodes[old_id];
+            let new_inputs: Vec<NodeId> = node
+                .inputs
+                .iter()
+                .filter_map(|&inp| old_to_new[inp as usize])
+                .collect();
+            new_graph.add_raw_node(node.op.clone(), new_inputs, node.ty.clone());
+        }
+
+        // Remap outputs
+        let new_outputs: Vec<NodeId> = self
+            .outputs
+            .iter()
+            .filter_map(|&out| old_to_new[out as usize])
+            .collect();
+        new_graph.set_outputs(new_outputs);
+        new_graph.derived_params = self.derived_params.clone();
+        new_graph
     }
 
     pub fn nodes(&self) -> &[Node] {

@@ -299,6 +299,19 @@ fn smolvla_training_backprop_smoke() {
     };
 
     // Diagnostic: check session structure
+    let grad_bufs: std::collections::HashSet<u32> = session
+        .plan()
+        .param_grad_pairs
+        .iter()
+        .map(|&(p, _)| p.0)
+        .collect();
+    for (name, buf_ref) in &session.plan().param_buffers {
+        let has_grad = grad_bufs.contains(&buf_ref.0);
+        eprintln!(
+            "  param {:>50}: buf={:>3} grad={}",
+            name, buf_ref.0, has_grad
+        );
+    }
     eprintln!(
         "param_buffers={}, param_grad_pairs={}",
         session.plan().param_buffers.len(),

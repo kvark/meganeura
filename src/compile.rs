@@ -182,12 +182,34 @@ pub struct ExecutionPlan {
     pub param_grad_pairs: Vec<(BufferRef, BufferRef)>,
     /// LSE buffers allocated for MultiHeadAttn forward nodes: (node_id, buffer).
     pub lse_buffers: Vec<(NodeId, BufferRef)>,
+    /// Derived parameters: buffer = horizontal concat of source parameters.
+    /// Created by the optimizer when fusing e.g. gate+up projections.
+    /// Format: (derived_buf, [(source_name, num_elements), ...])
+    pub derived_params: Vec<(BufferRef, Vec<(String, usize)>)>,
 }
 
 /// Compile a differentiated graph into an ExecutionPlan.
 pub fn compile(graph: &Graph) -> ExecutionPlan {
     let mut compiler = Compiler::new(graph);
     compiler.compile();
+
+    // Propagate derived parameter info from graph to plan
+    for dp in &graph.derived_params {
+        if let Some(&(_, buf_ref)) = compiler
+            .plan
+            .param_buffers
+            .iter()
+            .find(|entry| entry.0 == dp.name)
+        {
+            let sources: Vec<(String, usize)> = dp
+                .sources
+                .iter()
+                .map(|entry| (entry.0.clone(), dp.rows * entry.1))
+                .collect();
+            compiler.plan.derived_params.push((buf_ref, sources));
+        }
+    }
+
     compiler.plan
 }
 
@@ -211,6 +233,7 @@ impl<'a> Compiler<'a> {
                 loss_buffer: None,
                 param_grad_pairs: Vec::new(),
                 lse_buffers: Vec::new(),
+                derived_params: Vec::new(),
             },
             node_buffers: HashMap::new(),
         }
