@@ -889,7 +889,7 @@ impl Session {
     fn bind_dispatch(
         buffers: &[blade_graphics::Buffer],
         dispatch: &crate::compile::Dispatch,
-        pc: &mut blade_graphics::PipelineEncoder<'_, '_>,
+        pc: &mut impl blade_graphics::traits::PipelineEncoder,
     ) {
         let buf = |r: BufferRef| buffers[r.0 as usize].at(0);
         match dispatch.shader {

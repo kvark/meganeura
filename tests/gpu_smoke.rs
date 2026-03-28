@@ -260,7 +260,7 @@ fn smolvla_training_backprop_smoke() {
     // MHA backward shaders produce incorrect gradients on lavapipe (software Vulkan).
     // The workgroup shared memory reductions give wrong results when multiple reductions
     // reuse the same wg array in a single shader invocation. Works correctly on real GPUs.
-    if std::env::var("MEGANEURA_SKIP_BACKPROP").is_ok() {
+    if std::env::var("MEGANEURA_SKIP_BACKPROP").unwrap_or_default() == "1" {
         eprintln!("MEGANEURA_SKIP_BACKPROP set — skipping MHA backward test");
         return;
     }
@@ -346,7 +346,7 @@ fn smolvla_training_backprop_smoke() {
 
 #[test]
 fn multi_head_attn_gradient_check() {
-    if std::env::var("MEGANEURA_SKIP_BACKPROP").is_ok() {
+    if std::env::var("MEGANEURA_SKIP_BACKPROP").unwrap_or_default() == "1" {
         eprintln!("MEGANEURA_SKIP_BACKPROP set — skipping MHA gradient check");
         return;
     }

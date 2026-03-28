@@ -723,7 +723,9 @@ mod tests {
 
     /// Verify every shader group compiles to SPIR-V without panics.
     /// This catches "Expression [N] is not cached!" bugs in hand-built IR.
+    /// Skipped on Apple targets where naga's spv-out backend is not available.
     #[test]
+    #[cfg(not(target_vendor = "apple"))]
     fn all_shaders_compile_to_spirv() {
         let empty = naga::valid::Capabilities::empty();
         let coop = naga::valid::Capabilities::COOPERATIVE_MATRIX
