@@ -207,12 +207,11 @@ pub fn build_session_with_report(forward_graph: &Graph) -> (Session, OptimizeRep
     // out of order) then run autodiff. Autodiff iterates in reverse node
     // order, so topological ordering ensures gradients flow correctly.
     let sorted_forward = optimized_forward.toposort();
-    eprintln!(
-        "pipeline: forward {} → optimized {} → sorted {} nodes, outputs={:?}",
-        forward_graph.nodes().len(),
-        optimized_forward.nodes().len(),
+    log::info!(
+        "sorted forward: {} nodes (from {} optimized, {} original)",
         sorted_forward.nodes().len(),
-        sorted_forward.outputs()
+        optimized_forward.nodes().len(),
+        forward_graph.nodes().len(),
     );
     let full_graph = {
         let _span = tracing::info_span!("autodiff").entered();
@@ -346,8 +345,13 @@ mod tests {
         assert_eq!(plan.param_buffers.len(), 3);
         assert_eq!(plan.input_buffers.len(), 2); // x and labels
         assert!(plan.loss_buffer.is_some());
-        // With cooperative matrix, no matmul fusions are applied
-        assert!(report.fusions_applied.is_empty());
+        // MLP has no Add(MatMul, x) patterns (uses BiasAdd, not Add),
+        // so no matmul+add fusions fire.
+        assert!(
+            report.fusions_applied.is_empty(),
+            "unexpected fusions: {:?}",
+            report.fusions_applied
+        );
     }
 
     #[test]
