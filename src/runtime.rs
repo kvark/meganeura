@@ -617,9 +617,9 @@ impl Session {
                     ShaderGroup::MatMul | ShaderGroup::MatMulAdd => {
                         (dispatch.params[0], dispatch.params[2], dispatch.params[1])
                     }
-                    ShaderGroup::MatMulAT | ShaderGroup::MatMulBT => {
-                        (dispatch.params[0], dispatch.params[1], dispatch.params[2])
-                    }
+                    // Coop AT/BT disabled: f16 staging precision compounds
+                    // through backward layers. Needs f32 path (WGSL rewrite).
+                    ShaderGroup::MatMulAT | ShaderGroup::MatMulBT => continue,
                     _ => continue,
                 };
                 let coop_wgs = ceil_div(m, 32) * ceil_div(n, 32);
@@ -841,7 +841,7 @@ impl Session {
             for i in 0..self.plan.dispatches.len() {
                 let dispatch = &self.plan.dispatches[i];
                 let pipeline = self.pipelines.get(dispatch);
-                let mut pass = self.encoder.compute(&format!("{:?}", dispatch.shader));
+                let mut pass = self.encoder.compute(&dispatch.label);
                 let mut pc = pass.with(pipeline);
                 Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
                 pc.dispatch(dispatch.workgroups);
@@ -854,7 +854,19 @@ impl Session {
             // N barriers — far fewer than one per dispatch.
             for gi in 0..self.groups.len() {
                 let group = self.groups[gi].clone();
-                let mut pass = self.encoder.compute("step");
+                // Name the pass after its first + last dispatch labels
+                let pass_name = if group.len() <= 2 {
+                    self.plan.dispatches[group.clone()]
+                        .iter()
+                        .map(|d| d.label.as_str())
+                        .collect::<Vec<_>>()
+                        .join("+")
+                } else {
+                    let first = &self.plan.dispatches[group.start].label;
+                    let last = &self.plan.dispatches[group.end - 1].label;
+                    format!("{}..{}", first, last)
+                };
+                let mut pass = self.encoder.compute(&pass_name);
                 for i in group {
                     let dispatch = &self.plan.dispatches[i];
                     let pipeline = self.pipelines.get(dispatch);

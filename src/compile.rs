@@ -142,6 +142,9 @@ pub struct Dispatch {
     /// (set at runtime based on per-dispatch eligibility).
     #[serde(default)]
     pub use_coop: bool,
+    /// Human-readable label for profiling (e.g. "MatMul[50,720,960]").
+    #[serde(default)]
+    pub label: String,
 }
 
 /// Reference to a GPU buffer in the execution plan.
@@ -244,6 +247,45 @@ impl<'a> Compiler<'a> {
             self.compile_node(node);
         }
 
+        // Generate labels for profiling
+        for d in &mut self.plan.dispatches {
+            d.label = match d.shader {
+                ShaderEntry::MatMul | ShaderEntry::FusedMatMulAdd => {
+                    format!(
+                        "{:?}[{}x{}x{}]",
+                        d.shader, d.params[0], d.params[2], d.params[1]
+                    )
+                }
+                ShaderEntry::MatMulAT | ShaderEntry::MatMulBT => {
+                    format!(
+                        "{:?}[{}x{}x{}]",
+                        d.shader, d.params[0], d.params[1], d.params[2]
+                    )
+                }
+                ShaderEntry::MultiHeadAttn
+                | ShaderEntry::MultiHeadAttnGradQ
+                | ShaderEntry::MultiHeadAttnGradK
+                | ShaderEntry::MultiHeadAttnGradV => {
+                    let nh = d.params[2] >> 16;
+                    let nkv = d.params[2] & 0xFFFF;
+                    format!(
+                        "{:?}[q={},kv={},h={}/{}]",
+                        d.shader, d.params[0], d.params[1], nh, nkv
+                    )
+                }
+                ShaderEntry::RmsNorm | ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => {
+                    format!("{:?}[{}x{}]", d.shader, d.params[0], d.params[1])
+                }
+                _ => {
+                    if d.params[0] > 0 {
+                        format!("{:?}[{}]", d.shader, d.params[0])
+                    } else {
+                        format!("{:?}", d.shader)
+                    }
+                }
+            };
+        }
+
         // Set loss buffer (first output)
         if let Some(&loss_id) = self.graph.outputs().first() {
             self.plan.loss_buffer = Some(self.get_buffer(loss_id));
@@ -292,6 +334,7 @@ impl<'a> Compiler<'a> {
                     extra_output: None,
                     params: vec![m, k, n, 0],
                     use_coop: false,
+                    label: String::new(),
                 });
             }
 
@@ -312,6 +355,7 @@ impl<'a> Compiler<'a> {
                     extra_output: None,
                     params: vec![m, n, k, 0],
                     use_coop: false,
+                    label: String::new(),
                 });
             }
 
@@ -332,6 +376,7 @@ impl<'a> Compiler<'a> {
                     extra_output: None,
                     params: vec![m, n, k, 0],
                     use_coop: false,
+                    label: String::new(),
                 });
             }
 
@@ -353,6 +398,7 @@ impl<'a> Compiler<'a> {
                     extra_output: None,
                     params: vec![m, k, n, 0],
                     use_coop: false,
+                    label: String::new(),
                 });
             }
 
@@ -379,6 +425,7 @@ impl<'a> Compiler<'a> {
                     extra_output: None,
                     params: vec![len, bias_len, 0, 0],
                     use_coop: false,
+                    label: String::new(),
                 });
             }
 
@@ -403,6 +450,7 @@ impl<'a> Compiler<'a> {
                     extra_output: None,
                     params: vec![len, 0, 0, 0],
                     use_coop: false,
+                    label: String::new(),
                 });
             }
 
@@ -417,6 +465,7 @@ impl<'a> Compiler<'a> {
                     extra_output: None,
                     params: vec![len, 0, 0, 0],
                     use_coop: false,
+                    label: String::new(),
                 });
             }
 
@@ -434,6 +483,7 @@ impl<'a> Compiler<'a> {
                     extra_output: None,
                     params: vec![m, n, 0, 0],
                     use_coop: false,
+                    label: String::new(),
                 });
             }
 
@@ -450,6 +500,7 @@ impl<'a> Compiler<'a> {
                     extra_output: None,
                     params: vec![batch, features, 0, 0],
                     use_coop: false,
+                    label: String::new(),
                 });
             }
 
@@ -467,6 +518,7 @@ impl<'a> Compiler<'a> {
                     extra_output: None,
                     params: vec![batch, features, 0, 0],
                     use_coop: false,
+                    label: String::new(),
                 });
             }
 
@@ -484,6 +536,7 @@ impl<'a> Compiler<'a> {
                     extra_output: None,
                     params: vec![batch, features, 0, 0],
                     use_coop: false,
+                    label: String::new(),
                 });
             }
 
@@ -500,6 +553,7 @@ impl<'a> Compiler<'a> {
                     extra_output: None,
                     params: vec![m, n, 0, 0],
                     use_coop: false,
+                    label: String::new(),
                 });
             }
 
@@ -525,6 +579,7 @@ impl<'a> Compiler<'a> {
                     extra_output: None,
                     params: vec![rows, cols, eps.to_bits(), 0],
                     use_coop: false,
+                    label: String::new(),
                 });
             }
 
@@ -543,6 +598,7 @@ impl<'a> Compiler<'a> {
                     extra_output: None,
                     params: vec![seq, hidden, 0, 0],
                     use_coop: false,
+                    label: String::new(),
                 });
             }
 
@@ -559,6 +615,7 @@ impl<'a> Compiler<'a> {
                     extra_output: None,
                     params: vec![seq, dim, theta.to_bits(), 0],
                     use_coop: false,
+                    label: String::new(),
                 });
             }
 
@@ -579,6 +636,7 @@ impl<'a> Compiler<'a> {
                     extra_output: None,
                     params: vec![seq, num_heads, num_kv_heads, head_dim],
                     use_coop: false,
+                    label: String::new(),
                 });
             }
 
@@ -601,6 +659,7 @@ impl<'a> Compiler<'a> {
                     extra_output: None,
                     params: vec![rows, cols, eps.to_bits(), 0],
                     use_coop: false,
+                    label: String::new(),
                 });
             }
 
@@ -621,6 +680,7 @@ impl<'a> Compiler<'a> {
                     extra_output: None,
                     params: vec![seq, num_heads, num_kv_heads, head_dim],
                     use_coop: false,
+                    label: String::new(),
                 });
             }
 
@@ -643,6 +703,7 @@ impl<'a> Compiler<'a> {
                     // Pack both seq lengths: q_seq in first, kv_seq encoded via head_dim slot
                     params: vec![q_seq, kv_seq, (num_heads << 16) | num_kv_heads, head_dim],
                     use_coop: false,
+                    label: String::new(),
                 });
             }
 
@@ -666,6 +727,7 @@ impl<'a> Compiler<'a> {
                     extra_output: Some(lse_buf),
                     params: vec![q_seq, kv_seq, (num_heads << 16) | num_kv_heads, head_dim],
                     use_coop: false,
+                    label: String::new(),
                 });
             }
 
@@ -692,6 +754,7 @@ impl<'a> Compiler<'a> {
                     extra_output: None,
                     params: vec![q_seq, kv_seq, (num_heads << 16) | num_kv_heads, head_dim],
                     use_coop: false,
+                    label: String::new(),
                 });
             }
 
@@ -718,6 +781,7 @@ impl<'a> Compiler<'a> {
                     extra_output: None,
                     params: vec![q_seq, kv_seq, (num_heads << 16) | num_kv_heads, head_dim],
                     use_coop: false,
+                    label: String::new(),
                 });
             }
 
@@ -744,6 +808,7 @@ impl<'a> Compiler<'a> {
                     extra_output: None,
                     params: vec![q_seq, kv_seq, (num_heads << 16) | num_kv_heads, head_dim],
                     use_coop: false,
+                    label: String::new(),
                 });
             }
 
@@ -761,6 +826,7 @@ impl<'a> Compiler<'a> {
                     extra_output: None,
                     params: vec![len, 0, 0, 0],
                     use_coop: false,
+                    label: String::new(),
                 });
             }
 
@@ -777,6 +843,7 @@ impl<'a> Compiler<'a> {
                     extra_output: None,
                     params: vec![len, 0, 0, 0],
                     use_coop: false,
+                    label: String::new(),
                 });
             }
 
@@ -793,6 +860,7 @@ impl<'a> Compiler<'a> {
                     extra_output: None,
                     params: vec![len, 0, 0, 0],
                     use_coop: false,
+                    label: String::new(),
                 });
             }
 
@@ -811,6 +879,7 @@ impl<'a> Compiler<'a> {
                     extra_output: None,
                     params: vec![rows, cols, eps.to_bits(), 0],
                     use_coop: false,
+                    label: String::new(),
                 });
             }
 
@@ -829,6 +898,7 @@ impl<'a> Compiler<'a> {
                     extra_output: None,
                     params: vec![rows, cols, eps.to_bits(), 0],
                     use_coop: false,
+                    label: String::new(),
                 });
             }
         }
@@ -854,6 +924,7 @@ impl<'a> Compiler<'a> {
             extra_output: None,
             params: vec![len, 0, 0, 0],
             use_coop: false,
+            label: String::new(),
         });
     }
 
@@ -869,6 +940,7 @@ impl<'a> Compiler<'a> {
             extra_output: None,
             params: vec![len, 0, 0, 0],
             use_coop: false,
+            label: String::new(),
         });
     }
 }
