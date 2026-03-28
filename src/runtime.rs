@@ -245,6 +245,8 @@ struct Pipelines {
     map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
     /// Cooperative-matrix pipelines for dispatches with `use_coop = true`.
     coop_map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
+    /// Small-tile (32×32) pipelines for dispatches with `use_small_tiles = true`.
+    small_map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
 }
 
 impl Pipelines {
@@ -265,6 +267,20 @@ impl Pipelines {
                 .entry(group)
                 .or_default()
                 .insert(dispatch.shader.clone());
+            if dispatch.use_small_tiles {
+                let small_group = match group {
+                    ShaderGroup::MatMul => ShaderGroup::MatMulSmall,
+                    ShaderGroup::MatMulAdd => ShaderGroup::MatMulSmallAdd,
+                    ShaderGroup::MatMulAT => ShaderGroup::MatMulSmallAT,
+                    ShaderGroup::MatMulBT => ShaderGroup::MatMulSmallBT,
+                    _ => continue,
+                };
+                needed.insert(small_group);
+                entries_for_group
+                    .entry(small_group)
+                    .or_default()
+                    .insert(dispatch.shader.clone());
+            }
             if dispatch.use_coop {
                 let coop_group = match group {
                     ShaderGroup::MatMul => ShaderGroup::MatMulCoop,
@@ -292,6 +308,7 @@ impl Pipelines {
 
         let mut map = HashMap::new();
         let mut coop_map = HashMap::new();
+        let mut small_map = HashMap::new();
 
         let compile_group =
             |group: ShaderGroup,
@@ -314,19 +331,41 @@ impl Pipelines {
                 }
             };
 
+        let small_tile_groups: HashSet<ShaderGroup> = [
+            ShaderGroup::MatMulSmall,
+            ShaderGroup::MatMulSmallAdd,
+            ShaderGroup::MatMulSmallAT,
+            ShaderGroup::MatMulSmallBT,
+        ]
+        .into_iter()
+        .collect();
+
         for &group in &needed {
-            compile_group(group, &mut map);
+            if small_tile_groups.contains(&group) {
+                compile_group(group, &mut small_map);
+            } else {
+                compile_group(group, &mut map);
+            }
         }
         for &group in &needed_coop {
             compile_group(group, &mut coop_map);
         }
 
-        Self { map, coop_map }
+        Self {
+            map,
+            coop_map,
+            small_map,
+        }
     }
 
     fn get(&self, dispatch: &Dispatch) -> &blade_graphics::ComputePipeline {
         if dispatch.use_coop {
             if let Some(p) = self.coop_map.get(&dispatch.shader) {
+                return p;
+            }
+        }
+        if dispatch.use_small_tiles {
+            if let Some(p) = self.small_map.get(&dispatch.shader) {
                 return p;
             }
         }
@@ -648,6 +687,14 @@ impl Session {
                 }
             }
         }
+
+        // Small-tile selection: 32×32 tile matmul variant available via
+        // `use_small_tiles` flag. Currently disabled — 32×32 tiles have 4×
+        // less register reuse (2×2 vs 4×4 accumulators), which reduces
+        // arithmetic intensity. On bandwidth-bound iGPUs, the reduced reuse
+        // outweighs the occupancy gain from 4× more workgroups.
+        // TODO: add e-graph cost model that considers both occupancy and
+        // arithmetic intensity to select optimal tile size per shape.
 
         // Reorder dispatches by dependency level so parallel branches (e.g. Q/K/V
         // projections) cluster together, then partition into barrier groups.
@@ -1499,6 +1546,9 @@ impl Drop for Session {
             self.gpu.destroy_compute_pipeline(pipeline);
         }
         for (_, pipeline) in self.pipelines.coop_map.iter_mut() {
+            self.gpu.destroy_compute_pipeline(pipeline);
+        }
+        for (_, pipeline) in self.pipelines.small_map.iter_mut() {
             self.gpu.destroy_compute_pipeline(pipeline);
         }
         for buffer in &self.buffers {

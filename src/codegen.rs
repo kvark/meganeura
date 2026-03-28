@@ -54,6 +54,10 @@ pub enum ShaderGroup {
     MatMulBT,
     MatMulATAdd,
     MatMulBTAdd,
+    MatMulSmall,
+    MatMulSmallAdd,
+    MatMulSmallAT,
+    MatMulSmallBT,
     MatMulCoop,
     MatMulCoopAdd,
     MatMulCoopAT,
@@ -92,6 +96,10 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::MatMulBT => gen_matmul_bt(),
         ShaderGroup::MatMulATAdd => gen_matmul_at_add(),
         ShaderGroup::MatMulBTAdd => gen_matmul_bt_add(),
+        ShaderGroup::MatMulSmall => gen_matmul_small(),
+        ShaderGroup::MatMulSmallAdd => gen_matmul_small_add(),
+        ShaderGroup::MatMulSmallAT => gen_matmul_small_at(),
+        ShaderGroup::MatMulSmallBT => gen_matmul_small_bt(),
         ShaderGroup::MatMulCoop => gen_matmul_coop(),
         ShaderGroup::MatMulCoopAdd => gen_matmul_coop_add(),
         ShaderGroup::MatMulCoopAT => gen_matmul_coop_at(),
@@ -232,6 +240,18 @@ const B_COL_FWD: &str = "flat % 64u"; // N varies fast (coalesced in [K,N])
 const B_ROW_BT: &str = "flat % 16u"; // K varies fast (coalesced in [N,K])
 const B_COL_BT: &str = "flat / 16u"; // N varies slowly
 
+// Small-tile (32×32) load mappings — BM=32, BN=32, KTILE=16
+// A tile: [32, 16] = 512 elements, 2 per thread
+// B tile: [16, 32] = 512 elements, 2 per thread
+const A_ROW_FWD_S: &str = "flat / 16u"; // same as large (M slow, K fast)
+const A_COL_FWD_S: &str = "flat % 16u";
+const A_ROW_AT_S: &str = "flat % 32u"; // M fast (32 not 64)
+const A_COL_AT_S: &str = "flat / 32u";
+const B_ROW_FWD_S: &str = "flat / 32u"; // K slow (32 not 64)
+const B_COL_FWD_S: &str = "flat % 32u"; // N fast (32 not 64)
+const B_ROW_BT_S: &str = "flat % 16u"; // same as large
+const B_COL_BT_S: &str = "flat / 16u";
+
 fn matmul_vars(
     a_idx: &str,
     b_idx: &str,
@@ -257,6 +277,82 @@ fn matmul_vars(
         ],
     );
     parse_wgsl(&src)
+}
+
+fn matmul_small_vars(
+    a_idx: &str,
+    b_idx: &str,
+    a_row: &str,
+    a_col: &str,
+    b_row: &str,
+    b_col: &str,
+    fused_decl: &str,
+    fused_expr: &str,
+) -> ShaderModule {
+    let src = include_str!("shaders/matmul_small.wgsl");
+    let src = preprocess(
+        src,
+        &[
+            ("$A_INDEX", a_idx),
+            ("$B_INDEX", b_idx),
+            ("$A_ROW_S", a_row),
+            ("$A_COL_S", a_col),
+            ("$B_ROW_S", b_row),
+            ("$B_COL_S", b_col),
+            ("$FUSED_ADD_DECL", fused_decl),
+            ("$FUSED_ADD_EXPR", fused_expr),
+        ],
+    );
+    parse_wgsl(&src)
+}
+
+fn gen_matmul_small() -> ShaderModule {
+    matmul_small_vars(
+        MATMUL_A_FWD,
+        MATMUL_B_FWD,
+        A_ROW_FWD_S,
+        A_COL_FWD_S,
+        B_ROW_FWD_S,
+        B_COL_FWD_S,
+        "",
+        "",
+    )
+}
+fn gen_matmul_small_add() -> ShaderModule {
+    matmul_small_vars(
+        MATMUL_A_FWD,
+        MATMUL_B_FWD,
+        A_ROW_FWD_S,
+        A_COL_FWD_S,
+        B_ROW_FWD_S,
+        B_COL_FWD_S,
+        "var<storage> src: array<f32>;",
+        " + src[idx]",
+    )
+}
+fn gen_matmul_small_at() -> ShaderModule {
+    matmul_small_vars(
+        MATMUL_A_AT,
+        MATMUL_B_FWD,
+        A_ROW_AT_S,
+        A_COL_AT_S,
+        B_ROW_FWD_S,
+        B_COL_FWD_S,
+        "",
+        "",
+    )
+}
+fn gen_matmul_small_bt() -> ShaderModule {
+    matmul_small_vars(
+        MATMUL_A_FWD,
+        MATMUL_B_BT,
+        A_ROW_FWD_S,
+        A_COL_FWD_S,
+        B_ROW_BT_S,
+        B_COL_BT_S,
+        "",
+        "",
+    )
 }
 
 fn gen_matmul() -> ShaderModule {
