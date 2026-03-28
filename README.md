@@ -17,25 +17,20 @@ Instead of including the "batteries" - kernels for all kind of cases and hardwar
 SmolVLA action expert training (chunk_size=50, vlm_seq_len=16, float32, random weights).
 Full GQA (15/5 heads, head_dim=64), exact backward through all ops including fused MHA and RmsNorm:
 
-| GPU | Framework | Rev | Forward | Backward | Train step |
-|---|---|---|---|---|---|
-| Radeon 890M | meganeura | `af2b956` | **17.0 ms** | 163.1 ms | 180.1 ms |
-| Radeon 890M | PyTorch 2.5 ROCm | — | 28.4 ms | 68.8 ms | 97.3 ms |
-| Radeon 780M | meganeura | `637c4b1` | **14.5 ms** | 82.7 ms | **97.2 ms** |
-| Radeon 780M | PyTorch ROCm | — | ✗ | ✗ | ✗ |
-
-SmolVLA action expert inference (chunk_size=50, vlm_seq_len=16, 10 denoise steps, float32):
-
-| GPU | Framework | Rev | ms / step | Steps/s |
-|---|---|---|---|---|
-| Radeon 890M | meganeura | `af2b956` | **18.1** | **55.1** |
-| Radeon 890M | PyTorch 2.5 ROCm | — | 27.8 | 36.0 |
-| Radeon 780M | meganeura | `637c4b1` | **14.5** | **69.0** |
-| Radeon 780M | PyTorch ROCm | — | ✗ | ✗ |
+| GPU | Framework | Compile | Forward | Backward |
+|-----|-----------|---------|---------|----------|
+| Radeon 890M (RADV) | Meganeura 550bb6caf09c819f199084d2263794e14f683463 | 0 s | 19.4 ms | 85.6 ms |
+| Radeon 890M (RADV) | PyTorch 2.10.0 ROCm | 6.79 s | 21.14 ms | 54.3 ms |
+| Radeon 780M (RADV) | Meganeura 550bb6caf09c819f199084d2263794e14f683463 | 0 s | 14.5 ms | 82.7 ms |
+| Radeon 780M (RADV) | PyTorch 2.9.1 ROCm (eager) | :x: | :x: | :x: |
+| GeForce RTX 5080 (590/Linux) | Meganeura 550bb6caf09c819f199084d2263794e14f683463 | 0 s | 6.1 ms | 35.1 ms |
+| GeForce RTX 5080 (590/Linux) | PyTorch 2.11.0+cu128 | 3.41 s | 1.57 ms | 4.68 ms |
+| GeForce RTX 3050 (566.36/Windows) | Meganeura 550bb6caf09c819f199084d2263794e14f683463 | 0 s | 11.2 ms | 53.3 ms |
+| GeForce RTX 3050 (566.36/Windows) | PyTorch 2.11.0+cu128 | 0 s (unsupported) | 12.3 ms | 33.8 ms |
 
 PyTorch ROCm does not ship kernels for gfx1103 (780M). The 890M was tested with `HSA_OVERRIDE_GFX_VERSION`.
 
-Gradients verified against PyTorch (CPU): 88/136 parameters pass strict threshold (cos_sim > 0.99, norm_err < 5%). All 136 have norm_err < 1.5%; remaining cos_sim failures are f32 precision compounding through 16 backward layers.
+Gradients verified against PyTorch (CPU): 88/136 parameters pass strict threshold (cos_sim > 0.99, norm_err < 5%). Failures are in attention and layernorm weights of deeper layers where f32 precision differences compound; gradient magnitudes (norm_err) remain < 2% for all parameters.
 
 Run `bash bench/compare.sh` to reproduce.
 

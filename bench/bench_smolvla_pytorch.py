@@ -227,6 +227,7 @@ def main():
     dtype_map = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
     torch_dtype = dtype_map[args.dtype]
 
+    torch.set_float32_matmul_precision("high")
     print(f"device: {device}, dtype: {args.dtype}", file=sys.stderr)
 
     if device == "cpu":

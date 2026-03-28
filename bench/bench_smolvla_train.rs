@@ -11,7 +11,7 @@
 use std::time::Instant;
 
 use meganeura::{
-    build_inference_session, build_session,
+    build_inference_session, build_session, compile_training_graph,
     models::smolvla::{self, SmolVLAConfig},
 };
 
@@ -139,6 +139,13 @@ fn main() {
     eprintln!("building training graph...");
     let training_g = smolvla::build_action_expert_training(&config, action_seq_len, vlm_seq_len);
 
+    // --- Measure compile time (autodiff + e-graph + plan, no GPU init) ---
+    eprintln!("measuring compile time (autodiff + e-graph + compile)...");
+    let compile_t0 = Instant::now();
+    let _ = compile_training_graph(&training_g);
+    let compile_time = compile_t0.elapsed();
+    eprintln!("  compile time: {:.0}ms", compile_time.as_secs_f64() * 1000.0);
+
     // --- Build sessions ---
     eprintln!("compiling inference session (forward only)...");
     let mut infer_session = build_inference_session(&training_g);
@@ -157,6 +164,11 @@ fn main() {
         train_session.plan().dispatches.len(),
         train_session.num_groups()
     );
+
+    let dev_info = train_session.device_information();
+    let device_name = dev_info.device_name.clone();
+    let driver_name = dev_info.driver_name.clone();
+    eprintln!("  device: {} ({})", device_name, driver_name);
 
     // --- Initialize parameters with deterministic random values ---
     eprintln!("initializing parameters...");
@@ -236,8 +248,8 @@ fn main() {
             eprintln!("  {:>30}: {}", name, count);
         }
 
-        // GPU timing breakdown — blade caps at 100 timestamps per submission,
-        // so only the first 100 dispatches are timed.
+        // GPU timing breakdown — blade 0.8.1+ supports up to 1000 timestamps
+        // per submission.
         //
         // Blade's command encoder uses a 2-buffer ring: start() reads timestamps
         // from 2 submissions ago. So we need 3 steps to get step A's timings:
@@ -245,7 +257,7 @@ fn main() {
         //   reads A's data → dump_gpu_timings() shows A's per-shader breakdown.
         infer_session.set_profiling(true);
         eprintln!(
-            "\n=== Forward pass GPU timings (first 100 of {} dispatches) ===",
+            "\n=== Forward pass GPU timings ({} dispatches) ===",
             infer_session.plan().dispatches.len()
         );
         set_inputs(&mut infer_session);
@@ -261,7 +273,7 @@ fn main() {
 
         train_session.set_profiling(true);
         eprintln!(
-            "\n=== Training step GPU timings (first 100 of {} dispatches) ===",
+            "\n=== Training step GPU timings ({} dispatches) ===",
             train_session.plan().dispatches.len()
         );
         // Skip sgd_step during profiling so the ring buffer captures
@@ -324,10 +336,11 @@ fn main() {
     println!("{{");
     println!("  \"framework\": \"meganeura\",");
     println!("  \"model\": \"smolvla_action_expert\",");
-    println!("  \"device\": \"blade-gpu\",");
+    println!("  \"device\": \"{} ({})\",", device_name, driver_name);
     println!("  \"chunk_size\": {},", action_seq_len);
     println!("  \"vlm_seq_len\": {},", vlm_seq_len);
     println!("  \"num_layers\": {},", config.expert.num_layers);
+    println!("  \"compile_time_s\": {:.2},", compile_time.as_secs_f64());
     println!("  \"fwd_avg_ms\": {:.2},", fwd_avg * 1000.0);
     println!("  \"fwd_median_ms\": {:.2},", fwd_median * 1000.0);
     println!("  \"train_step_avg_ms\": {:.2},", train_avg * 1000.0);

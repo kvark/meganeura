@@ -7,17 +7,18 @@
 #   bash bench/compare.sh --model all         # both benchmarks
 #
 # Environment overrides:
-#   RUNS=5  WARMUP=3  PYTORCH_DTYPE=float32
+#   RUNS=5  WARMUP=3  PYTORCH_DTYPE=float32  --no-venv
 #   SmolLM2-specific:  MAX_TOKENS=32  PROMPT="The meaning of life is"
 #   SmolVLA-specific:  STEPS=10  CHUNK_SIZE=50  VLM_SEQ_LEN=16
 set -euo pipefail
 
-MODEL="${MODEL:-all}"
+MODEL="${MODEL:-smolvla_train}"
 TRAIN_LR="${TRAIN_LR:-0.00001}"
 RUNS="${RUNS:-5}"
 WARMUP="${WARMUP:-3}"
 PYTORCH_DTYPE="${PYTORCH_DTYPE:-float32}"
 FORCE=""
+NO_VENV=""
 
 # SmolLM2 defaults
 MAX_TOKENS="${MAX_TOKENS:-32}"
@@ -34,6 +35,7 @@ for arg in "$@"; do
         --model=*) MODEL="${arg#*=}" ;;
         --model) shift_next=model ;;
         --force) FORCE="--force" ;;
+        --no-venv) NO_VENV=1 ;;
         *)
             if [[ "${shift_next:-}" == "model" ]]; then
                 MODEL="$arg"
@@ -48,12 +50,121 @@ ROOT="$(dirname "$DIR")"
 OUT_DIR="$ROOT/bench/results"
 mkdir -p "$OUT_DIR"
 
+# ============================================================
+# Python venv setup — create .venv if missing, install deps,
+# and always use its python for benchmarks.
+# ============================================================
+VENV_DIR="$ROOT/.venv"
+
+# Cross-platform python binary inside the venv
+if [[ -f "$VENV_DIR/Scripts/python.exe" ]]; then
+    PYTHON="$VENV_DIR/Scripts/python"
+elif [[ -f "$VENV_DIR/bin/python" ]]; then
+    PYTHON="$VENV_DIR/bin/python"
+else
+    PYTHON=""
+fi
+
+# Find a system python3 to bootstrap the venv
+find_system_python() {
+    for cmd in python3 python; do
+        if command -v "$cmd" >/dev/null 2>&1; then
+            echo "$cmd"
+            return
+        fi
+    done
+    return 1
+}
+
+ensure_venv() {
+    if [[ -n "$PYTHON" ]]; then
+        # If we have an NVIDIA GPU, also verify torch has CUDA support
+        if command -v nvidia-smi >/dev/null 2>&1; then
+            if "$PYTHON" -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
+                return 0
+            fi
+        elif "$PYTHON" -c "import torch" 2>/dev/null; then
+            return 0
+        fi
+    fi
+
+    echo "--- Setting up Python venv for benchmarks ---"
+    local sys_python
+    sys_python="$(find_system_python)" || {
+        echo "ERROR: python3 not found — cannot create venv"
+        return 1
+    }
+
+    # Create venv if it doesn't exist
+    if [[ ! -d "$VENV_DIR" ]]; then
+        echo "  Creating venv at $VENV_DIR ..."
+        "$sys_python" -m venv "$VENV_DIR"
+    fi
+
+    # Resolve the venv python again after creation
+    if [[ -f "$VENV_DIR/Scripts/python.exe" ]]; then
+        PYTHON="$VENV_DIR/Scripts/python"
+    else
+        PYTHON="$VENV_DIR/bin/python"
+    fi
+
+    # Install PyTorch — pick CUDA build when nvidia-smi is available.
+    # --force-reinstall is needed when switching from a CPU-only build.
+    echo "  Installing PyTorch ..."
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        "$PYTHON" -m pip install --quiet --force-reinstall torch --index-url https://download.pytorch.org/whl/cu128
+    else
+        "$PYTHON" -m pip install --quiet torch
+    fi
+
+    # Install remaining bench dependencies
+    echo "  Installing bench dependencies ..."
+    "$PYTHON" -m pip install --quiet -r "$DIR/requirements.txt"
+
+    echo "  Done."
+    echo ""
+}
+
+is_nixos() {
+    [[ -f /etc/NIXOS ]] || grep -qi nixos /etc/os-release 2>/dev/null
+}
+
+if [[ -n "$NO_VENV" ]]; then
+    # Use system python directly (e.g. on NixOS where venvs are problematic)
+    if [[ -z "$PYTHON" ]]; then
+        PYTHON="$(find_system_python)" || { echo "ERROR: python3 not found"; exit 1; }
+    fi
+else
+    if is_nixos; then
+        echo "WARNING: NixOS detected. venv/pip may install incompatible binaries."
+        echo "  Consider: bash bench/compare.sh --no-venv"
+        echo ""
+    fi
+    ensure_venv
+fi
+
+# Enable experimental Flash Efficient attention on AMD GPUs (ROCm/aotriton).
+# Harmless on non-AMD systems; avoids detection issues (e.g. rocminfo not on PATH in nix-shell).
+export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
+
 # Helper: format and print a comparison table
+win_path() {
+    # Convert MSYS2 paths (/c/foo) to Windows paths (C:/foo) for Python
+    if [[ "${OSTYPE:-}" == msys* || "${OSTYPE:-}" == mingw* ]]; then
+        case "$1" in
+            /[a-zA-Z]/*) echo "$(echo "$1" | sed 's|^/\(.\)|\U\1:|')"; return ;;
+        esac
+    fi
+    echo "$1"
+}
+
 print_table() {
-    local mega_json="$1" pytorch_json="$2"
+    local mega_json pytorch_json
+    mega_json="$(win_path "$1")"
+    pytorch_json="$(win_path "$2")"
     shift 2
     # Remaining args are "key:label" pairs
-    python3 -c "
+    "$PYTHON" -c "
 import json, os, sys
 
 with open('$mega_json') as f:
@@ -74,7 +185,7 @@ def get(r, k):
 for pair in sys.argv[1:]:
     key, label = pair.split(':', 1)
     print(f'{label:<28} {get(mega, key):>14} {get(pytorch, key):>14}')
-" "$@" 2>/dev/null || echo "(install python3 for summary table)"
+" "$@" || echo "(summary table failed — is python3 working?)"
 }
 
 # ============================================================
@@ -103,8 +214,8 @@ run_smolvla() {
 
     # PyTorch
     echo ">>> PyTorch ($PYTORCH_DTYPE)"
-    if python3 -c "import torch, safetensors" 2>/dev/null; then
-        python3 "$DIR/bench_smolvla_pytorch.py" \
+    if "$PYTHON" -c "import torch, safetensors" 2>/dev/null; then
+        "$PYTHON" "$DIR/bench_smolvla_pytorch.py" \
             --steps "$STEPS" \
             --warmup "$WARMUP" \
             --runs "$RUNS" \
@@ -134,13 +245,16 @@ run_smolvla() {
     local mega_out="$OUT_DIR/smolvla_meganeura_output.json"
     local pytorch_out="$OUT_DIR/smolvla_pytorch_output.json"
     if [[ -f "$mega_out" && -f "$pytorch_out" ]]; then
+        local mega_out_py pytorch_out_py
+        mega_out_py="$(win_path "$mega_out")"
+        pytorch_out_py="$(win_path "$pytorch_out")"
         echo "=== Output Comparison ==="
-        python3 -c "
+        "$PYTHON" -c "
 import json, math, sys
 
-with open('$mega_out') as f:
+with open('$mega_out_py') as f:
     mega = json.load(f)
-with open('$pytorch_out') as f:
+with open('$pytorch_out_py') as f:
     pytorch = json.load(f)
 
 if len(mega) != len(pytorch):
@@ -179,7 +293,7 @@ elif max_err < 1e-1:
     print('  WARN: outputs differ (max error > 1e-3, likely floating-point divergence)')
 else:
     print('  FAIL: outputs diverge significantly')
-" 2>/dev/null || echo "(output comparison requires python3)"
+" || echo "(output comparison failed — is python3 working?)"
         echo ""
     fi
 }
@@ -206,8 +320,8 @@ run_smolvla_train() {
     echo ""
 
     echo ">>> PyTorch training ($PYTORCH_DTYPE, random weights)"
-    if python3 -c "import torch" 2>/dev/null; then
-        python3 "$DIR/bench_smolvla_train_pytorch.py" \
+    if "$PYTHON" -c "import torch" 2>/dev/null; then
+        "$PYTHON" "$DIR/bench_smolvla_train_pytorch.py" \
             --warmup "$WARMUP" \
             --runs "$RUNS" \
             --dtype "$PYTORCH_DTYPE" \
@@ -224,6 +338,7 @@ run_smolvla_train() {
     echo "=== SmolVLA Training Results ==="
     print_table "$OUT_DIR/smolvla_train_meganeura.json" "$OUT_DIR/smolvla_train_pytorch.json" \
         "device:Device" \
+        "compile_time_s:Compile time (s)" \
         "fwd_avg_ms:Fwd avg (ms)" \
         "fwd_median_ms:Fwd median (ms)" \
         "train_step_avg_ms:Train step avg (ms)" \
@@ -251,15 +366,14 @@ run_smollm2() {
         --max-tokens "$MAX_TOKENS" \
         --warmup "$WARMUP" \
         --runs "$RUNS" \
-        --force \
         > "$OUT_DIR/meganeura.json" 2>/dev/stderr
     echo "  -> $OUT_DIR/meganeura.json"
     echo ""
 
     # PyTorch
     echo ">>> PyTorch (transformers, $PYTORCH_DTYPE)"
-    if python3 -c "import torch, transformers" 2>/dev/null; then
-        python3 "$DIR/bench_pytorch.py" \
+    if "$PYTHON" -c "import torch, transformers" 2>/dev/null; then
+        "$PYTHON" "$DIR/bench_pytorch.py" \
             --prompt "$PROMPT" \
             --max-tokens "$MAX_TOKENS" \
             --warmup "$WARMUP" \

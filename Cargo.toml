@@ -10,7 +10,7 @@ description = "E-graph optimized neural network training on Blade"
 license = "MIT"
 
 [dependencies]
-blade-graphics = { version = "0.8" }
+blade-graphics = { version = "0.8.1" }
 blade-macros = { version = "0.3" }
 egglog = "2.0"
 bytemuck = { version = "1", features = ["derive"] }

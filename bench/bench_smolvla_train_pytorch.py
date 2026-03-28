@@ -15,6 +15,8 @@ Usage:
 import argparse
 import json
 import math
+import os
+import shutil
 import statistics
 import sys
 import time
@@ -167,8 +169,9 @@ def main():
     dtype_map = {"float32": torch.float32, "float16": torch.float16,
                  "bfloat16": torch.bfloat16}
     dtype = dtype_map[args.dtype]
+    torch.set_float32_matmul_precision("high")
 
-    print(f"device: {device}, dtype: {args.dtype}", file=sys.stderr)
+    print(f"device: {device}, dtype: {args.dtype}, torch: {torch.__version__}", file=sys.stderr)
     if device == "cpu":
         print("WARNING: CPU — not comparable to GPU meganeura", file=sys.stderr)
 
@@ -213,6 +216,34 @@ def main():
             p.copy_(
                 torch.sin(torch.arange(p.numel(), dtype=dtype) * 0.01 + i).view_as(p) * 0.1
             )
+
+    # torch.compile for fair comparison with meganeura's ahead-of-time compilation
+    # Clear cache to ensure we measure real compilation, not a cached result
+    torch._dynamo.reset()
+    # Clear inductor cache to measure real compilation time
+    for d in [
+        os.environ.get("TORCHINDUCTOR_CACHE_DIR"),
+        os.path.join(
+            os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+            "torch", "inductor",
+        ),
+    ]:
+        if d and os.path.isdir(d):
+            print(f"  clearing compile cache: {d}", file=sys.stderr)
+            shutil.rmtree(d, ignore_errors=True)
+
+    print("compiling with torch.compile()...", file=sys.stderr)
+    compile_t0 = time.perf_counter()
+    expert = torch.compile(expert)
+    # Force compilation by running a dummy forward pass
+    with torch.no_grad():
+        dummy_na = torch.zeros(1, chunk_size, action_dim, device=device, dtype=dtype)
+        dummy_ts = torch.zeros(1, 1, expert_hidden * 2, device=device, dtype=dtype)
+        dummy_vlm = torch.zeros(1, vlm_seq_len, kv_dim, device=device, dtype=dtype)
+        expert(dummy_na, dummy_ts, dummy_vlm)
+    sync(device)
+    compile_time = time.perf_counter() - compile_t0
+    print(f"  compile time: {compile_time:.2f}s", file=sys.stderr)
 
     optimizer = torch.optim.SGD(expert.parameters(), lr=1e-5)
 
@@ -267,7 +298,8 @@ def main():
     result = {
         "framework": "pytorch",
         "model": "smolvla_action_expert_gqa",
-        "device": device,
+        "device": torch.cuda.get_device_name(0) if device == "cuda" else device,
+        "torch_version": torch.__version__,
         "dtype": args.dtype,
         "chunk_size": chunk_size,
         "vlm_seq_len": vlm_seq_len,
@@ -275,6 +307,7 @@ def main():
         "num_heads": num_heads,
         "num_kv_heads": num_kv_heads,
         "head_dim": head_dim,
+        "compile_time_s": round(compile_time, 2),
         "fwd_avg_ms": round(fwd_avg * 1000, 2),
         "fwd_median_ms": round(fwd_median * 1000, 2),
         "train_step_avg_ms": round(train_avg * 1000, 2),
