@@ -286,7 +286,7 @@ impl<'a> Compiler<'a> {
                 let n = b_shape[1] as u32;
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::MatMul,
-                    workgroups: [ceil_div(n, 16), ceil_div(m, 16), 1],
+                    workgroups: [ceil_div(n, 64), ceil_div(m, 64), 1],
                     input_buffers: vec![a, b],
                     output_buffer: out_buf,
                     extra_output: None,
@@ -347,7 +347,7 @@ impl<'a> Compiler<'a> {
                 let n = b_shape[1] as u32;
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::FusedMatMulAdd,
-                    workgroups: [ceil_div(n, 16), ceil_div(m, 16), 1],
+                    workgroups: [ceil_div(n, 64), ceil_div(m, 64), 1],
                     input_buffers: vec![a, b, d],
                     output_buffer: out_buf,
                     extra_output: None,
@@ -1043,8 +1043,8 @@ mod tests {
 
         let plan = compile(&g);
         let d = &plan.dispatches[0];
-        // workgroups = [ceil(N/16), ceil(M/16), 1] = [ceil(17/16), ceil(33/16), 1] = [2, 3, 1]
-        assert_eq!(d.workgroups, [2, 3, 1]);
+        // workgroups = [ceil(N/64), ceil(M/64), 1] = [1, 1, 1] (4×4 register-tiled)
+        assert_eq!(d.workgroups, [1, 1, 1]);
         assert_eq!(d.params, vec![33, 64, 17, 0]);
     }
 
