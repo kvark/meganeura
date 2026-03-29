@@ -226,6 +226,48 @@ pub struct ExecutionPlan {
 }
 
 /// Compile a differentiated graph into an ExecutionPlan.
+/// Topological sort of graph nodes (Kahn's algorithm).
+/// Returns node IDs in dependency order: producers before consumers.
+fn topological_order(graph: &Graph) -> Vec<NodeId> {
+    let n = graph.nodes().len();
+    let mut in_degree = vec![0u32; n];
+    for node in graph.nodes() {
+        in_degree[node.id as usize] = node.inputs.len() as u32;
+    }
+
+    let mut queue: std::collections::VecDeque<NodeId> = std::collections::VecDeque::new();
+    for node in graph.nodes() {
+        if in_degree[node.id as usize] == 0 {
+            queue.push_back(node.id);
+        }
+    }
+
+    let mut order = Vec::with_capacity(n);
+    while let Some(id) = queue.pop_front() {
+        order.push(id);
+        // For each node that depends on `id`, decrement in-degree
+        for node in graph.nodes() {
+            if node.inputs.contains(&id) {
+                in_degree[node.id as usize] -= 1;
+                if in_degree[node.id as usize] == 0 {
+                    queue.push_back(node.id);
+                }
+            }
+        }
+    }
+
+    // Any unvisited nodes (cycles or disconnected) — append in ID order
+    if order.len() < n {
+        for node in graph.nodes() {
+            if !order.contains(&node.id) {
+                order.push(node.id);
+            }
+        }
+    }
+
+    order
+}
+
 pub fn compile(graph: &Graph) -> ExecutionPlan {
     let mut compiler = Compiler::new(graph);
     compiler.compile();
@@ -241,7 +283,7 @@ pub fn compile(graph: &Graph) -> ExecutionPlan {
             let sources: Vec<(String, usize)> = dp
                 .sources
                 .iter()
-                .map(|entry| (entry.0.clone(), dp.rows * entry.1))
+                .map(|entry| (entry.0.clone(), entry.1))
                 .collect();
             compiler.plan.derived_params.push((buf_ref, sources));
         }
@@ -314,9 +356,14 @@ impl<'a> Compiler<'a> {
             }
         }
 
-        // Second pass: emit dispatches for each non-leaf node
-        for node in self.graph.nodes() {
-            self.compile_node(node);
+        // Second pass: emit dispatches in topological order.
+        // The optimizer may create new nodes at high IDs that are referenced
+        // by existing nodes at lower IDs (e.g. SwiGLU concat fusion creates
+        // a new MatMul at the end, referenced by the original SwiGLU node).
+        // Processing in ID order would dispatch consumers before producers.
+        let topo = topological_order(self.graph);
+        for &node_id in &topo {
+            self.compile_node(&self.graph.nodes()[node_id as usize]);
         }
 
         // Generate labels for profiling

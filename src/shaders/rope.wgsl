@@ -28,8 +28,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let cos_val = cos(angle);
     let sin_val = sin(angle);
 
-    let idx0 = row * params.dim + pair_idx * 2u;
-    let idx1 = idx0 + 1u;
+    // HuggingFace "half-split" convention: pair (d, d + dim/2)
+    let idx0 = row * params.dim + pair_idx;
+    let idx1 = row * params.dim + pair_idx + half_dim;
     let v0 = src[idx0];
     let v1 = src[idx1];
 

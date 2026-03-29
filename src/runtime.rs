@@ -970,26 +970,26 @@ impl Session {
                 for entry in &self.plan.derived_params {
                     let derived_buf = &entry.0;
                     let sources = &entry.1;
-                    let mut col_offset = 0usize;
+                    // sources[i].1 = number of columns for that source
                     let total_cols: usize = sources.iter().map(|s| s.1).sum();
+                    let buf_f32 = self.plan.buffers[derived_buf.0 as usize] / 4;
                     let rows = if total_cols > 0 {
-                        self.plan.buffers[derived_buf.0 as usize] / 4 / total_cols
+                        buf_f32 / total_cols
                     } else {
                         0
                     };
+                    let mut col_offset = 0usize;
                     for src in sources {
                         let src_name = &src.0;
-                        let src_elems = src.1;
-                        let src_cols = if rows > 0 { src_elems / rows } else { 0 };
+                        let src_cols = src.1;
                         if src_name == name && rows > 0 {
                             // Write row-interleaved: for row r, write data[r*src_cols .. (r+1)*src_cols]
-                            // to derived_buf at offset [r * total_cols/rows + col_offset]
-                            let total_cols_per_row = total_cols / rows;
+                            // to derived_buf at offset [r * total_cols + col_offset]
                             let derived_ptr =
                                 self.buffers[derived_buf.0 as usize].data() as *mut f32;
                             for r in 0..rows {
                                 let src_start = r * src_cols;
-                                let dst_start = r * total_cols_per_row + col_offset;
+                                let dst_start = r * total_cols + col_offset;
                                 unsafe {
                                     std::ptr::copy_nonoverlapping(
                                         data[src_start..].as_ptr(),
