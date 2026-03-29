@@ -124,51 +124,98 @@ fn grad_input(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_
 }
 
 // GroupNorm backward w.r.t. weight and bias.
-// Dispatch: [C, 1, 1]  workgroup_size(1)
+// Dispatch: [C, 1, 1]  workgroup_size(256)
 // grad_weight[c] = sum_{n,hw} grad_out[n,c,hw] * xhat[n,c,hw]
 // grad_bias[c] = sum_{n,hw} grad_out[n,c,hw]
-// This is a simple serial accumulation per channel (can be parallelized later).
 // dst layout: [grad_weight[C], grad_bias[C]] = 2*C elements
+//
+// Each workgroup handles one channel c. For each batch item n, all 256 threads
+// cooperatively compute mean/var for the group via parallel reduction, then
+// cooperatively accumulate dw and db over spatial positions.
 
-@compute @workgroup_size(1)
-fn grad_weight_bias(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let c = gid.x;
+@compute @workgroup_size(256)
+fn grad_weight_bias(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let c = wgid.x;
     if c >= params.channels { return; }
 
+    let tid = lid.x;
     let eps = bitcast<f32>(params.eps_bits);
     let channels_per_group = params.channels / params.num_groups;
     let group = c / channels_per_group;
+    let c_start = group * channels_per_group;
+    let group_size = channels_per_group * params.spatial;
 
-    var sum_dw = 0.0;
-    var sum_db = 0.0;
+    var acc_dw = 0.0;
+    var acc_db = 0.0;
 
     for (var n = 0u; n < params.batch; n++) {
-        // Compute mean and variance for this (n, group)
-        let c_start = group * channels_per_group;
-        let group_size = channels_per_group * params.spatial;
-        var sum_x = 0.0;
-        var sum_x2 = 0.0;
-        for (var j = 0u; j < group_size; j++) {
+        // Cooperative mean/var: 256 threads stride over group_size elements
+        var local_sum = 0.0;
+        var local_sum2 = 0.0;
+        var j = tid;
+        loop {
+            if j >= group_size { break; }
             let cc = c_start + j / params.spatial;
             let hw = j % params.spatial;
             let idx = ((n * params.channels + cc) * params.spatial) + hw;
             let v = src_b[idx];
-            sum_x += v;
-            sum_x2 += v * v;
+            local_sum += v;
+            local_sum2 += v * v;
+            j += 256u;
         }
-        let mean = sum_x / f32(group_size);
-        let variance = sum_x2 / f32(group_size) - mean * mean;
+        wg_data[tid] = local_sum;
+        wg_data2[tid] = local_sum2;
+        workgroupBarrier();
+
+        // Tree reduction for mean and variance
+        var stride = 128u;
+        loop {
+            if stride == 0u { break; }
+            if tid < stride {
+                wg_data[tid] += wg_data[tid + stride];
+                wg_data2[tid] += wg_data2[tid + stride];
+            }
+            workgroupBarrier();
+            stride >>= 1u;
+        }
+        let mean = wg_data[0] / f32(group_size);
+        let variance = wg_data2[0] / f32(group_size) - mean * mean;
         let inv_std = inverseSqrt(variance + eps);
 
-        for (var hw = 0u; hw < params.spatial; hw++) {
-            let idx = ((n * params.channels + c) * params.spatial) + hw;
+        // Cooperative accumulation of dw and db over spatial for this channel
+        var local_dw = 0.0;
+        var local_db = 0.0;
+        j = tid;
+        loop {
+            if j >= params.spatial { break; }
+            let idx = ((n * params.channels + c) * params.spatial) + j;
             let dy = src_a[idx];
             let xhat = (src_b[idx] - mean) * inv_std;
-            sum_dw += dy * xhat;
-            sum_db += dy;
+            local_dw += dy * xhat;
+            local_db += dy;
+            j += 256u;
         }
+        wg_data[tid] = local_dw;
+        wg_data2[tid] = local_db;
+        workgroupBarrier();
+
+        stride = 128u;
+        loop {
+            if stride == 0u { break; }
+            if tid < stride {
+                wg_data[tid] += wg_data[tid + stride];
+                wg_data2[tid] += wg_data2[tid + stride];
+            }
+            workgroupBarrier();
+            stride >>= 1u;
+        }
+        acc_dw += wg_data[0];
+        acc_db += wg_data2[0];
+        workgroupBarrier();
     }
 
-    dst[c] = sum_dw;
-    dst[params.channels + c] = sum_db;
+    if tid == 0u {
+        dst[c] = acc_dw;
+        dst[params.channels + c] = acc_db;
+    }
 }

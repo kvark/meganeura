@@ -6,6 +6,9 @@
 #   bash bench/compare.sh --model smollm2     # SmolLM2-135M text generation
 #   bash bench/compare.sh --model all         # both benchmarks
 #
+# Prerequisites:
+#   bash bench/ensure_venv.sh           # one-time Python/venv setup
+#
 # Environment overrides:
 #   RUNS=5  WARMUP=3  PYTORCH_DTYPE=float32  --no-venv
 #   SmolLM2-specific:  MAX_TOKENS=32  PROMPT="The meaning of life is"
@@ -51,21 +54,9 @@ OUT_DIR="$ROOT/bench/results"
 mkdir -p "$OUT_DIR"
 
 # ============================================================
-# Python venv setup — create .venv if missing, install deps,
-# and always use its python for benchmarks.
+# Python setup — expect python to be configured already.
+# Run `bash bench/ensure_venv.sh` first to create a venv.
 # ============================================================
-VENV_DIR="$ROOT/.venv"
-
-# Cross-platform python binary inside the venv
-if [[ -f "$VENV_DIR/Scripts/python.exe" ]]; then
-    PYTHON="$VENV_DIR/Scripts/python"
-elif [[ -f "$VENV_DIR/bin/python" ]]; then
-    PYTHON="$VENV_DIR/bin/python"
-else
-    PYTHON=""
-fi
-
-# Find a system python3 to bootstrap the venv
 find_system_python() {
     for cmd in python3 python; do
         if command -v "$cmd" >/dev/null 2>&1; then
@@ -76,71 +67,18 @@ find_system_python() {
     return 1
 }
 
-ensure_venv() {
-    if [[ -n "$PYTHON" ]]; then
-        # If we have an NVIDIA GPU, also verify torch has CUDA support
-        if command -v nvidia-smi >/dev/null 2>&1; then
-            if "$PYTHON" -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
-                return 0
-            fi
-        elif "$PYTHON" -c "import torch" 2>/dev/null; then
-            return 0
-        fi
-    fi
-
-    echo "--- Setting up Python venv for benchmarks ---"
-    local sys_python
-    sys_python="$(find_system_python)" || {
-        echo "ERROR: python3 not found — cannot create venv"
-        return 1
-    }
-
-    # Create venv if it doesn't exist
-    if [[ ! -d "$VENV_DIR" ]]; then
-        echo "  Creating venv at $VENV_DIR ..."
-        "$sys_python" -m venv "$VENV_DIR"
-    fi
-
-    # Resolve the venv python again after creation
-    if [[ -f "$VENV_DIR/Scripts/python.exe" ]]; then
-        PYTHON="$VENV_DIR/Scripts/python"
-    else
-        PYTHON="$VENV_DIR/bin/python"
-    fi
-
-    # Install PyTorch — pick CUDA build when nvidia-smi is available.
-    # --force-reinstall is needed when switching from a CPU-only build.
-    echo "  Installing PyTorch ..."
-    if command -v nvidia-smi >/dev/null 2>&1; then
-        "$PYTHON" -m pip install --quiet --force-reinstall torch --index-url https://download.pytorch.org/whl/cu128
-    else
-        "$PYTHON" -m pip install --quiet torch
-    fi
-
-    # Install remaining bench dependencies
-    echo "  Installing bench dependencies ..."
-    "$PYTHON" -m pip install --quiet -r "$DIR/requirements.txt"
-
-    echo "  Done."
-    echo ""
-}
-
-is_nixos() {
-    [[ -f /etc/NIXOS ]] || grep -qi nixos /etc/os-release 2>/dev/null
-}
-
+VENV_DIR="$ROOT/.venv"
 if [[ -n "$NO_VENV" ]]; then
-    # Use system python directly (e.g. on NixOS where venvs are problematic)
-    if [[ -z "$PYTHON" ]]; then
-        PYTHON="$(find_system_python)" || { echo "ERROR: python3 not found"; exit 1; }
-    fi
+    PYTHON="$(find_system_python)" || { echo "ERROR: python3 not found"; exit 1; }
+elif [[ -f "$VENV_DIR/Scripts/python.exe" ]]; then
+    PYTHON="$VENV_DIR/Scripts/python"
+elif [[ -f "$VENV_DIR/bin/python" ]]; then
+    PYTHON="$VENV_DIR/bin/python"
 else
-    if is_nixos; then
-        echo "WARNING: NixOS detected. venv/pip may install incompatible binaries."
-        echo "  Consider: bash bench/compare.sh --no-venv"
-        echo ""
-    fi
-    ensure_venv
+    echo "ERROR: No venv found at $VENV_DIR"
+    echo "  Run: bash bench/ensure_venv.sh"
+    echo "  Or:  bash bench/compare.sh --no-venv"
+    exit 1
 fi
 
 # Enable experimental Flash Efficient attention on AMD GPUs (ROCm/aotriton).
