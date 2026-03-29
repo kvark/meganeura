@@ -27,8 +27,8 @@ Full GQA (15/5 heads, head_dim=64), exact backward through all ops including fus
 | GeForce RTX 5080 (590/Linux) | PyTorch 2.11.0+cu128 | 3.41 s | 1.57 ms | 4.68 ms |
 | GeForce RTX 3050 (566.36/Windows) | Meganeura 550bb6caf09c819f199084d2263794e14f683463 | 0 s | 11.2 ms | 53.3 ms |
 | GeForce RTX 3050 (566.36/Windows) | PyTorch 2.11.0+cu128 | 0 s (unsupported) | 12.3 ms | 33.8 ms |
-| Apple M3 | Meganeura 2bc4de61517375bfff01db859da586ece4da8124 | 0s | 27.6 ms | 176.9 ms |
-| Apple M3 | PyTorch 2.11.0 | 7.54s | 10.0 ms | 30.2 ms |
+| Apple M3 | Meganeura db9ae11f28189307c4384d75b0030336828aece8 | 0s | 45.5 ms | 87.0 ms |
+| Apple M3 | PyTorch 2.11.0 | 5.92s | 17.7 ms | 78.1 ms |
 
 PyTorch ROCm does not ship kernels for gfx1103 (780M). The 890M was tested with `HSA_OVERRIDE_GFX_VERSION`.
 
