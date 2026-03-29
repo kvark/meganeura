@@ -2426,5 +2426,9 @@ impl Drop for Session {
         for buffer in &self.buffers {
             self.gpu.destroy_buffer(*buffer);
         }
+        for &(m_buf, v_buf) in &self.adam_state {
+            self.gpu.destroy_buffer(m_buf);
+            self.gpu.destroy_buffer(v_buf);
+        }
     }
 }
