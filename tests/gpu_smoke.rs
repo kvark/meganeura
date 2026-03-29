@@ -628,3 +628,118 @@ fn swiglu_concat_gradient_check() {
         max_rel_err, checks
     );
 }
+
+#[test]
+fn abs_log_recip_ops() {
+    // Verify Abs, Log, Recip produce correct values on GPU.
+    let n = 8;
+    let mut g = Graph::new();
+    let x = g.input("x", &[1, n]);
+    let a = g.abs(x);
+    g.set_outputs(vec![a]);
+
+    let mut session = build_inference_session(&g);
+    let input: Vec<f32> = vec![-3.0, -2.0, -1.0, -0.5, 0.5, 1.0, 2.0, 3.0];
+    session.set_input("x", &input);
+    session.step();
+    session.wait();
+
+    let output = session.read_output(n);
+    let expected: Vec<f32> = input.iter().map(|x| x.abs()).collect();
+    for i in 0..n {
+        assert!(
+            (output[i] - expected[i]).abs() < 1e-4,
+            "abs[{}]: got {}, expected {}",
+            i,
+            output[i],
+            expected[i]
+        );
+    }
+
+    // Log
+    let mut g = Graph::new();
+    let x = g.input("x", &[1, n]);
+    let l = g.log(x);
+    g.set_outputs(vec![l]);
+
+    let mut session = build_inference_session(&g);
+    let input: Vec<f32> = vec![0.1, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 100.0];
+    session.set_input("x", &input);
+    session.step();
+    session.wait();
+
+    let output = session.read_output(n);
+    for i in 0..n {
+        let exp = input[i].ln();
+        assert!(
+            (output[i] - exp).abs() < 1e-3,
+            "log[{}]: got {}, expected {}",
+            i,
+            output[i],
+            exp
+        );
+    }
+
+    // Recip
+    let mut g = Graph::new();
+    let x = g.input("x", &[1, n]);
+    let r = g.recip(x);
+    g.set_outputs(vec![r]);
+
+    let mut session = build_inference_session(&g);
+    let input: Vec<f32> = vec![0.1, 0.5, 1.0, 2.0, 4.0, 5.0, 10.0, 100.0];
+    session.set_input("x", &input);
+    session.step();
+    session.wait();
+
+    let output = session.read_output(n);
+    for i in 0..n {
+        let exp = 1.0 / input[i];
+        assert!(
+            (output[i] - exp).abs() < 1e-3,
+            "recip[{}]: got {}, expected {}",
+            i,
+            output[i],
+            exp
+        );
+    }
+}
+
+#[test]
+fn mse_loss_training() {
+    // Verify MSE loss produces correct value and SGD decreases it.
+    let mut g = Graph::new();
+    let x = g.input("x", &[4, 4]);
+    let w = g.parameter("w", &[4, 4]);
+    let pred = g.matmul(x, w);
+    let target = g.input("target", &[4, 4]);
+    let loss = g.mse_loss(pred, target);
+    g.set_outputs(vec![loss]);
+
+    let mut session = build_session(&g);
+    session.set_parameter("w", &vec![0.1_f32; 16]);
+    session.set_input("x", &vec![1.0_f32; 16]);
+    session.set_input("target", &vec![0.0_f32; 16]);
+
+    session.step();
+    session.wait();
+    let loss0 = session.read_loss();
+    assert!(
+        loss0.is_finite() && loss0 > 0.0,
+        "initial MSE loss: {}",
+        loss0
+    );
+
+    session.sgd_step_cpu(0.01);
+    session.set_input("x", &vec![1.0_f32; 16]);
+    session.set_input("target", &vec![0.0_f32; 16]);
+    session.step();
+    session.wait();
+    let loss1 = session.read_loss();
+    assert!(
+        loss1 < loss0,
+        "SGD should decrease MSE loss: {} -> {}",
+        loss0,
+        loss1
+    );
+}

@@ -15,12 +15,16 @@ pub enum ShaderEntry {
     Relu,
     Sigmoid,
     Neg,
+    Abs,
+    Log,
+    Recip,
     Add,
     Mul,
     Greater,
     BiasAdd,
     SgdUpdate,
     AdamUpdate,
+    ScatterAdd,
     SumAll,
     MeanAll,
     Softmax,
@@ -61,11 +65,17 @@ impl ShaderEntry {
             ShaderEntry::FusedMatMulAdd => ShaderGroup::MatMulAdd,
             ShaderEntry::FusedMatMulATAdd => ShaderGroup::MatMulATAdd,
             ShaderEntry::FusedMatMulBTAdd => ShaderGroup::MatMulBTAdd,
-            ShaderEntry::Relu | ShaderEntry::Sigmoid | ShaderEntry::Neg => ShaderGroup::Unary,
+            ShaderEntry::Relu
+            | ShaderEntry::Sigmoid
+            | ShaderEntry::Neg
+            | ShaderEntry::Abs
+            | ShaderEntry::Log
+            | ShaderEntry::Recip => ShaderGroup::Unary,
             ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater => ShaderGroup::Binary,
             ShaderEntry::BiasAdd => ShaderGroup::BiasAdd,
             ShaderEntry::SgdUpdate => ShaderGroup::Sgd,
             ShaderEntry::AdamUpdate => ShaderGroup::Adam,
+            ShaderEntry::ScatterAdd => ShaderGroup::ScatterAdd,
             ShaderEntry::SumAll | ShaderEntry::MeanAll => ShaderGroup::Reduce,
             ShaderEntry::Softmax => ShaderGroup::Softmax,
             ShaderEntry::CrossEntropyLoss => ShaderGroup::CrossEntropy,
@@ -105,12 +115,16 @@ impl ShaderEntry {
             | ShaderEntry::BiasAdd
             | ShaderEntry::SgdUpdate
             | ShaderEntry::AdamUpdate
+            | ShaderEntry::ScatterAdd
             | ShaderEntry::Softmax
             | ShaderEntry::CrossEntropyLoss
             | ShaderEntry::Transpose => "main",
             ShaderEntry::Relu => "relu",
             ShaderEntry::Sigmoid => "sigmoid",
             ShaderEntry::Neg => "neg",
+            ShaderEntry::Abs => "abs_",
+            ShaderEntry::Log => "log_",
+            ShaderEntry::Recip => "recip",
             ShaderEntry::Add => "add",
             ShaderEntry::Mul => "mul",
             ShaderEntry::Greater => "greater",
@@ -541,6 +555,15 @@ impl<'a> Compiler<'a> {
             Op::Neg => {
                 self.emit_unary(ShaderEntry::Neg, node, out_buf);
             }
+            Op::Abs => {
+                self.emit_unary(ShaderEntry::Abs, node, out_buf);
+            }
+            Op::Log => {
+                self.emit_unary(ShaderEntry::Log, node, out_buf);
+            }
+            Op::Recip => {
+                self.emit_unary(ShaderEntry::Recip, node, out_buf);
+            }
 
             Op::SumAll => {
                 let input = self.get_buffer(node.inputs[0]);
@@ -745,6 +768,26 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![seq, hidden, 0, 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    label: String::new(),
+                });
+            }
+
+            Op::ScatterAdd { vocab_size } => {
+                let indices = self.get_buffer(node.inputs[0]);
+                let src = self.get_buffer(node.inputs[1]);
+                let src_shape = &self.graph.node(node.inputs[1]).ty.shape;
+                let seq_len = src_shape[0] as u32;
+                let embed_dim = src_shape[1] as u32;
+                let total = vocab_size as u32 * embed_dim;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::ScatterAdd,
+                    workgroups: [ceil_div(total, 256), 1, 1],
+                    input_buffers: vec![indices, src],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![total, seq_len, embed_dim, 0],
                     use_coop: false,
                     use_small_tiles: false,
                     label: String::new(),
@@ -1379,12 +1422,16 @@ mod tests {
             ShaderEntry::Relu,
             ShaderEntry::Sigmoid,
             ShaderEntry::Neg,
+            ShaderEntry::Abs,
+            ShaderEntry::Log,
+            ShaderEntry::Recip,
             ShaderEntry::Add,
             ShaderEntry::Mul,
             ShaderEntry::Greater,
             ShaderEntry::BiasAdd,
             ShaderEntry::SgdUpdate,
             ShaderEntry::AdamUpdate,
+            ShaderEntry::ScatterAdd,
             ShaderEntry::SumAll,
             ShaderEntry::MeanAll,
             ShaderEntry::SumRows,

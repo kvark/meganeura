@@ -145,6 +145,37 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let grad_x = graph.neg(grad_output);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
+            Op::Abs => {
+                // sign(x) = 2*(x > 0) - 1
+                let x = node.inputs[0];
+                let x_shape = &forward.nodes()[x as usize].ty.shape;
+                let n = x_shape.iter().product();
+                let zero = graph.constant(vec![0.0; n], x_shape);
+                let pos_mask = graph.greater(x, zero);
+                let two = graph.constant(vec![2.0; n], x_shape);
+                let sign = graph.mul(pos_mask, two);
+                let ones = graph.constant(vec![1.0; n], x_shape);
+                let neg_ones = graph.neg(ones);
+                let sign = graph.add(sign, neg_ones);
+                let grad_x = graph.mul(grad_output, sign);
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
+            Op::Log => {
+                // dL/dx = dL/dy / x
+                let x = node.inputs[0];
+                let recip_x = graph.recip(x);
+                let grad_x = graph.mul(grad_output, recip_x);
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
+            Op::Recip => {
+                // d/dx (1/x) = -1/x²
+                let x = node.inputs[0];
+                let recip_x = graph.recip(x);
+                let recip_sq = graph.mul(recip_x, recip_x);
+                let neg_recip_sq = graph.neg(recip_sq);
+                let grad_x = graph.mul(grad_output, neg_recip_sq);
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
             Op::Transpose => {
                 let x = node.inputs[0];
                 let grad_x = graph.transpose(grad_output);
@@ -368,9 +399,18 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let grad_x = graph.mul(grad_output, dgelu);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
+            Op::Embedding => {
+                let indices = node.inputs[0];
+                let table = node.inputs[1];
+                let vocab_size = forward.nodes()[table as usize].ty.shape[0];
+                let grad_table = graph.scatter_add(indices, grad_output, vocab_size);
+                accumulate_grad(&mut graph, &mut grads, table, grad_table);
+            }
+            Op::ScatterAdd { .. } => {
+                // ScatterAdd only appears in backward graphs; no further differentiation needed.
+            }
             // Inference-only ops: should not appear in training graphs
-            Op::Embedding
-            | Op::RoPE { .. }
+            Op::RoPE { .. }
             | Op::CausalAttention { .. }
             | Op::LayerNorm { .. }
             | Op::FullAttention { .. }

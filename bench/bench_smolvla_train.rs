@@ -144,7 +144,10 @@ fn main() {
     let compile_t0 = Instant::now();
     let _ = compile_training_graph(&training_g);
     let compile_time = compile_t0.elapsed();
-    eprintln!("  compile time: {:.0}ms", compile_time.as_secs_f64() * 1000.0);
+    eprintln!(
+        "  compile time: {:.0}ms",
+        compile_time.as_secs_f64() * 1000.0
+    );
 
     // --- Build sessions ---
     eprintln!("compiling inference session (forward only)...");

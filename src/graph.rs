@@ -77,6 +77,9 @@ pub enum Op {
     Relu,
     Sigmoid,
     Neg,
+    Abs,
+    Log,
+    Recip,
 
     // Reduction
     SumAll,
@@ -109,6 +112,11 @@ pub enum Op {
 
     // Log-softmax (for numerical stability)
     LogSoftmax,
+
+    /// Scatter-add: accumulate src rows into output indexed by indices.
+    ScatterAdd {
+        vocab_size: usize,
+    },
 
     // --- Transformer ops ---
 
@@ -517,6 +525,45 @@ impl Graph {
         self.add_node(Op::Neg, vec![x], ty)
     }
 
+    pub fn abs(&mut self, x: NodeId) -> NodeId {
+        let ty = self.node(x).ty.clone();
+        self.add_node(Op::Abs, vec![x], ty)
+    }
+
+    pub fn log(&mut self, x: NodeId) -> NodeId {
+        let ty = self.node(x).ty.clone();
+        self.add_node(Op::Log, vec![x], ty)
+    }
+
+    pub fn recip(&mut self, x: NodeId) -> NodeId {
+        let ty = self.node(x).ty.clone();
+        self.add_node(Op::Recip, vec![x], ty)
+    }
+
+    /// Element-wise division: `a / b` = `a * recip(b)`.
+    pub fn div(&mut self, a: NodeId, b: NodeId) -> NodeId {
+        let r = self.recip(b);
+        self.mul(a, r)
+    }
+
+    // --- Loss ---
+
+    /// Mean squared error: `mean((pred - target)²)`.
+    pub fn mse_loss(&mut self, pred: NodeId, target: NodeId) -> NodeId {
+        let diff = self.neg(target);
+        let diff = self.add(pred, diff);
+        let sq = self.mul(diff, diff);
+        self.mean_all(sq)
+    }
+
+    /// L1 / mean absolute error: `mean(|pred - target|)`.
+    pub fn l1_loss(&mut self, pred: NodeId, target: NodeId) -> NodeId {
+        let diff = self.neg(target);
+        let diff = self.add(pred, diff);
+        let a = self.abs(diff);
+        self.mean_all(a)
+    }
+
     pub fn transpose(&mut self, x: NodeId) -> NodeId {
         let x_shape = &self.node(x).ty.shape;
         assert_eq!(x_shape.len(), 2, "transpose requires 2D tensor");
@@ -635,6 +682,15 @@ impl Graph {
         let hidden = tbl_shape[1];
         let ty = TensorType::f32(vec![seq_len, hidden]);
         self.add_node(Op::Embedding, vec![indices, table], ty)
+    }
+
+    /// Scatter-add: accumulate `src[i]` rows into `output[indices[i]]`.
+    pub fn scatter_add(&mut self, indices: NodeId, src: NodeId, vocab_size: usize) -> NodeId {
+        let src_shape = &self.node(src).ty.shape;
+        assert_eq!(src_shape.len(), 2);
+        let embed_dim = src_shape[1];
+        let ty = TensorType::f32(vec![vocab_size, embed_dim]);
+        self.add_node(Op::ScatterAdd { vocab_size }, vec![indices, src], ty)
     }
 
     pub fn rope(&mut self, x: NodeId, theta: f32) -> NodeId {

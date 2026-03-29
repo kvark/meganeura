@@ -31,6 +31,27 @@ fn neg(@builtin(global_invocation_id) gid: vec3<u32>) {
     dst[i] = -src[i];
 }
 
+@compute @workgroup_size(256)
+fn abs_(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if i >= params.len { return; }
+    dst[i] = abs(src[i]);
+}
+
+@compute @workgroup_size(256)
+fn log_(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if i >= params.len { return; }
+    dst[i] = log(src[i]);
+}
+
+@compute @workgroup_size(256)
+fn recip(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if i >= params.len { return; }
+    dst[i] = 1.0 / src[i];
+}
+
 // silu: x * sigmoid(x) = x / (1 + exp(-x))
 @compute @workgroup_size(256)
 fn silu(@builtin(global_invocation_id) gid: vec3<u32>) {

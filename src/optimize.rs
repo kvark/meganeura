@@ -233,6 +233,10 @@ fn graph_to_egglog(graph: &Graph) -> String {
   (Relu Op)
   (Sigmoid Op)
   (Neg Op)
+  (Abs Op)
+  (Log Op)
+  (Recip Op)
+  (ScatterAdd i64 Op Op)
   (Silu Op)
   (Gelu Op)
   ; --- Shape / reduction ---
@@ -339,6 +343,12 @@ fn node_to_egglog_expr(node: &Node) -> String {
         Op::Relu => format!("(Relu n{})", i[0]),
         Op::Sigmoid => format!("(Sigmoid n{})", i[0]),
         Op::Neg => format!("(Neg n{})", i[0]),
+        Op::Abs => format!("(Abs n{})", i[0]),
+        Op::Log => format!("(Log n{})", i[0]),
+        Op::Recip => format!("(Recip n{})", i[0]),
+        Op::ScatterAdd { vocab_size } => {
+            format!("(ScatterAdd {} n{} n{})", vocab_size, i[0], i[1])
+        }
         Op::Transpose => format!("(Transpose n{})", i[0]),
         Op::Softmax => format!("(Softmax n{})", i[0]),
         Op::LogSoftmax => format!("(LogSoftmax n{})", i[0]),

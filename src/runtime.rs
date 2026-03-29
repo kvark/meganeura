@@ -3,6 +3,24 @@ use std::collections::{HashMap, HashSet};
 
 type Gpu = blade_graphics::Context;
 
+// scatter_add: var indices (u32), src, dst, params
+#[derive(blade_macros::ShaderData)]
+struct ScatterAddData {
+    indices: blade_graphics::BufferPiece,
+    src: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: ScatterAddParams,
+}
+
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct ScatterAddParams {
+    total: u32,
+    seq_len: u32,
+    embed_dim: u32,
+    _pad: u32,
+}
+
 /// Summary of GPU memory allocation for a session.
 #[derive(Clone, Debug)]
 pub struct MemorySummary {
@@ -426,15 +444,20 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::FusedMatMulAdd
         | ShaderEntry::FusedMatMulATAdd
         | ShaderEntry::FusedMatMulBTAdd => FusedMatMulAddData::layout(),
-        ShaderEntry::Relu | ShaderEntry::Sigmoid | ShaderEntry::Neg | ShaderEntry::Silu => {
-            UnaryData::layout()
-        }
+        ShaderEntry::Relu
+        | ShaderEntry::Sigmoid
+        | ShaderEntry::Neg
+        | ShaderEntry::Abs
+        | ShaderEntry::Log
+        | ShaderEntry::Recip
+        | ShaderEntry::Silu => UnaryData::layout(),
         ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater | ShaderEntry::SwiGLU => {
             BinaryData::layout()
         }
         ShaderEntry::BiasAdd => BiasAddData::layout(),
         ShaderEntry::SgdUpdate => SgdData::layout(),
         ShaderEntry::AdamUpdate => AdamData::layout(),
+        ShaderEntry::ScatterAdd => ScatterAddData::layout(),
         ShaderEntry::SwiGLUConcat | ShaderEntry::SwiGLUConcatGrad => BinaryData::layout(),
         ShaderEntry::SumAll | ShaderEntry::MeanAll | ShaderEntry::SumRows => UnaryData::layout(),
         ShaderEntry::Softmax => SoftmaxData::layout(),
@@ -1194,7 +1217,13 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::Relu | ShaderEntry::Sigmoid | ShaderEntry::Neg | ShaderEntry::Silu => {
+            ShaderEntry::Relu
+            | ShaderEntry::Sigmoid
+            | ShaderEntry::Neg
+            | ShaderEntry::Abs
+            | ShaderEntry::Log
+            | ShaderEntry::Recip
+            | ShaderEntry::Silu => {
                 pc.bind(
                     0,
                     &UnaryData {
@@ -1581,6 +1610,22 @@ impl Session {
             }
             ShaderEntry::AdamUpdate => {
                 unreachable!("AdamUpdate is dispatched via adam_step/set_adam, not bind_dispatch");
+            }
+            ShaderEntry::ScatterAdd => {
+                pc.bind(
+                    0,
+                    &ScatterAddData {
+                        indices: buf(dispatch.input_buffers[0]),
+                        src: buf(dispatch.input_buffers[1]),
+                        dst: buf(dispatch.output_buffer),
+                        params: ScatterAddParams {
+                            total: dispatch.params[0],
+                            seq_len: dispatch.params[1],
+                            embed_dim: dispatch.params[2],
+                            _pad: 0,
+                        },
+                    },
+                );
             }
         }
     }

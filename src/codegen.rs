@@ -81,6 +81,7 @@ pub enum ShaderGroup {
     SwiGLUConcat,
     SumRows,
     RmsNormGrad,
+    ScatterAdd,
     FusedRmsNormMatMul,
 }
 
@@ -126,6 +127,7 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::SumRows => gen_sum_rows(),
         ShaderGroup::RmsNormGrad => gen_rms_norm_grad(),
         ShaderGroup::FusedRmsNormMatMul => gen_fused_rms_norm_matmul(),
+        ShaderGroup::ScatterAdd => gen_scatter_add(),
     }
 }
 
@@ -208,6 +210,14 @@ fn gen_sgd() -> ShaderModule {
 
 fn gen_adam() -> ShaderModule {
     parse_wgsl(include_str!("shaders/adam.wgsl"))
+}
+
+// ---------------------------------------------------------------------------
+// scatter_add.wgsl — embedding gradient accumulation
+// ---------------------------------------------------------------------------
+
+fn gen_scatter_add() -> ShaderModule {
+    parse_wgsl(include_str!("shaders/scatter_add.wgsl"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1076,6 +1086,9 @@ mod tests {
                 ShaderEntry::Relu
                 | ShaderEntry::Sigmoid
                 | ShaderEntry::Neg
+                | ShaderEntry::Abs
+                | ShaderEntry::Log
+                | ShaderEntry::Recip
                 | ShaderEntry::Silu
                 | ShaderEntry::Gelu
                 | ShaderEntry::SumAll
@@ -1091,6 +1104,7 @@ mod tests {
                 ShaderEntry::BiasAdd => vec!["src", "bias", "dst", "params"],
                 ShaderEntry::SgdUpdate => vec!["param", "grad", "dst", "params"],
                 ShaderEntry::AdamUpdate => vec!["param", "grad", "m", "v", "params"],
+                ShaderEntry::ScatterAdd => vec!["indices", "src", "dst", "params"],
                 ShaderEntry::Softmax => vec!["src", "dst", "params"],
                 ShaderEntry::CrossEntropyLoss => {
                     vec!["logits", "labels", "grad_out", "loss_out", "params"]
@@ -1138,6 +1152,9 @@ mod tests {
             ShaderEntry::Relu,
             ShaderEntry::Sigmoid,
             ShaderEntry::Neg,
+            ShaderEntry::Abs,
+            ShaderEntry::Log,
+            ShaderEntry::Recip,
             ShaderEntry::Add,
             ShaderEntry::Mul,
             ShaderEntry::Greater,
@@ -1169,6 +1186,8 @@ mod tests {
             ShaderEntry::RmsNormGradW,
             ShaderEntry::RmsNormGradX,
             ShaderEntry::FusedRmsNormMatMul,
+            ShaderEntry::AdamUpdate,
+            ShaderEntry::ScatterAdd,
         ];
 
         for entry in &entries {
