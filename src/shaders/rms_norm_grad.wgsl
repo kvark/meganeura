@@ -18,27 +18,58 @@ var<uniform> params: Params;
 var<workgroup> wg_data: array<f32, 256>;
 
 // grad_w[col] = sum_i( dy[i*n+col] * x[i*n+col] * rsqrt_i )
+//
+// Dispatch: [ceil(cols/256), 1, 1]
+// Each thread handles one column. Workgroup cooperatively precomputes
+// rsqrt for each row via shared-memory reduction (O(rows × cols/256) per
+// thread), then accumulates grad_w in O(rows) per thread.
+// Total work: O(rows × cols) — down from the naive O(rows × cols²).
 @compute @workgroup_size(256)
-fn rms_norm_grad_w(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let col = gid.x;
+fn rms_norm_grad_w(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let col = wgid.x * 256u + lid.x;
+    let tid = lid.x;
     let rows = params.m;
     let cols = params.n;
     let eps = bitcast<f32>(params.k);
-    if col >= cols { return; }
 
+    // Process one row at a time: cooperative rsqrt then per-column accumulation
     var acc = 0.0;
     for (var i = 0u; i < rows; i++) {
         let offset = i * cols;
-        // Compute rsqrt for row i
+
+        // Cooperative rsqrt: each thread sums a stride of the row
         var ss = 0.0;
-        for (var j = 0u; j < cols; j++) {
+        var j = tid;
+        loop {
+            if j >= cols { break; }
             let v = src_b[offset + j];
             ss += v * v;
+            j += 256u;
         }
-        let rsqrt_i = inverseSqrt(ss / f32(cols) + eps);
-        acc += src_a[offset + col] * src_b[offset + col] * rsqrt_i;
+        wg_data[tid] = ss;
+        workgroupBarrier();
+
+        var stride = 128u;
+        loop {
+            if stride == 0u { break; }
+            if tid < stride {
+                wg_data[tid] += wg_data[tid + stride];
+            }
+            workgroupBarrier();
+            stride >>= 1u;
+        }
+        let rsqrt_i = inverseSqrt(wg_data[0] / f32(cols) + eps);
+
+        // Accumulate this row's contribution
+        if col < cols {
+            acc += src_a[offset + col] * src_b[offset + col] * rsqrt_i;
+        }
+        workgroupBarrier();
     }
-    dst[col] = acc;
+
+    if col < cols {
+        dst[col] = acc;
+    }
 }
 
 // grad_x[i,j] = rsqrt_i * (dy[i,j]*w[j] - x[i,j] * s_i)

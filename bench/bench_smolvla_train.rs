@@ -102,6 +102,10 @@ fn check_bench_preconditions(abort_on_warn: bool) {
 
 fn main() {
     env_logger::init();
+    let trace_path = std::env::var("MEGANEURA_TRACE").ok();
+    if trace_path.is_some() {
+        meganeura::profiler::init();
+    }
 
     let mut args = std::env::args().skip(1);
     let mut warmup: usize = 3;
@@ -350,4 +354,13 @@ fn main() {
     println!("  \"train_step_median_ms\": {:.2},", train_median * 1000.0);
     println!("  \"approx_bwd_ms\": {:.2}", approx_bwd_ms);
     println!("}}");
+
+    if let Some(path) = trace_path {
+        eprintln!("saving trace to {}...", path);
+        meganeura::profiler::save(&path).expect("failed to save trace");
+        eprintln!(
+            "trace saved ({} events)",
+            meganeura::profiler::event_count()
+        );
+    }
 }
