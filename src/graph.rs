@@ -250,6 +250,123 @@ pub enum Op {
         eps: f32,
     },
 
+    // --- Conv2d ops ---
+
+    // 2D convolution: input[N,C_in,H,W] * kernel[C_out,C_in,kH,kW] → output[N,C_out,oH,oW]
+    // inputs: [input, kernel]
+    // Tensor is stored as a flat 1D array in NCHW order.
+    // Shape is tracked as [N*C_out*oH*oW] in the graph (flat), with spatial
+    // metadata encoded in the op for dispatch.
+    Conv2d {
+        // Input spatial: channels, height, width
+        in_channels: u32,
+        in_h: u32,
+        in_w: u32,
+        // Kernel spatial
+        out_channels: u32,
+        kernel_h: u32,
+        kernel_w: u32,
+        stride: u32,
+        padding: u32,
+    },
+
+    // Conv2d backward w.r.t. input: given grad_output and kernel, produce grad_input.
+    // inputs: [grad_output, kernel]
+    Conv2dGradInput {
+        in_channels: u32,
+        in_h: u32,
+        in_w: u32,
+        out_channels: u32,
+        kernel_h: u32,
+        kernel_w: u32,
+        stride: u32,
+        padding: u32,
+    },
+
+    // Conv2d backward w.r.t. kernel: given grad_output and input, produce grad_kernel.
+    // inputs: [grad_output, input]
+    Conv2dGradWeight {
+        in_channels: u32,
+        in_h: u32,
+        in_w: u32,
+        out_channels: u32,
+        kernel_h: u32,
+        kernel_w: u32,
+        stride: u32,
+        padding: u32,
+    },
+
+    // --- GroupNorm ---
+
+    // Group normalization: input[N*C*H*W] with weight[C], bias[C]
+    // inputs: [x, weight, bias]
+    GroupNorm {
+        num_groups: u32,
+        eps: f32,
+        channels: u32,
+        spatial: u32, // H * W
+    },
+
+    // GroupNorm backward w.r.t. input
+    // inputs: [grad_output, input, weight]
+    GroupNormGradInput {
+        num_groups: u32,
+        eps: f32,
+        channels: u32,
+        spatial: u32,
+    },
+
+    // GroupNorm backward w.r.t. weight and bias (concatenated output [2*C])
+    // inputs: [grad_output, input]
+    GroupNormGradWeightBias {
+        num_groups: u32,
+        eps: f32,
+        channels: u32,
+        spatial: u32,
+    },
+
+    // --- Concat / Split ---
+
+    // Concatenate along channel dim: [N,Ca,H,W] ++ [N,Cb,H,W] → [N,Ca+Cb,H,W]
+    // inputs: [a, b]
+    Concat {
+        channels_a: u32,
+        channels_b: u32,
+        spatial: u32,
+    },
+
+    // Split (backward of Concat): extract first Ca channels
+    // inputs: [grad_output]  (from [N, Ca+Cb, H, W])
+    SplitA {
+        channels_a: u32,
+        channels_b: u32,
+        spatial: u32,
+    },
+
+    // Split: extract last Cb channels
+    SplitB {
+        channels_a: u32,
+        channels_b: u32,
+        spatial: u32,
+    },
+
+    // --- Upsample ---
+
+    // Nearest-neighbor 2x upsample: [N,C,H,W] → [N,C,2H,2W]
+    // inputs: [x]
+    Upsample2x {
+        channels: u32,
+        in_h: u32,
+        in_w: u32,
+    },
+
+    // Backward of Upsample2x: [N,C,2H,2W] → [N,C,H,W] (sum 2×2 blocks)
+    Upsample2xGrad {
+        channels: u32,
+        in_h: u32,
+        in_w: u32,
+    },
+
     // --- KV cache ops ---
 
     // Write [1, dim] into row kv_pos of [max_seq, dim] cache buffer.
@@ -789,7 +906,309 @@ impl Graph {
         )
     }
 
-    // --- KV cache ops ---
+    // --- GroupNorm ops ---
+
+    /// Group normalization. Input is flat `[N*C*H*W]`, weight `[C]`, bias `[C]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn group_norm(
+        &mut self,
+        x: NodeId,
+        weight: NodeId,
+        bias: NodeId,
+        _batch: u32,
+        channels: u32,
+        spatial: u32,
+        num_groups: u32,
+        eps: f32,
+    ) -> NodeId {
+        let ty = self.node(x).ty.clone();
+        self.add_node(
+            Op::GroupNorm {
+                num_groups,
+                eps,
+                channels,
+                spatial,
+            },
+            vec![x, weight, bias],
+            ty,
+        )
+    }
+
+    /// GroupNorm backward w.r.t. input.
+    #[allow(clippy::too_many_arguments)]
+    pub fn group_norm_grad_input(
+        &mut self,
+        grad_output: NodeId,
+        input: NodeId,
+        weight: NodeId,
+        batch: u32,
+        channels: u32,
+        spatial: u32,
+        num_groups: u32,
+        eps: f32,
+    ) -> NodeId {
+        let in_size = batch as usize * channels as usize * spatial as usize;
+        let ty = TensorType::f32(vec![in_size]);
+        self.add_raw_node(
+            Op::GroupNormGradInput {
+                num_groups,
+                eps,
+                channels,
+                spatial,
+            },
+            vec![grad_output, input, weight],
+            ty,
+        )
+    }
+
+    /// GroupNorm backward w.r.t. weight+bias (concatenated `[2*C]` output).
+    #[allow(clippy::too_many_arguments)]
+    pub fn group_norm_grad_weight_bias(
+        &mut self,
+        grad_output: NodeId,
+        input: NodeId,
+        channels: u32,
+        spatial: u32,
+        num_groups: u32,
+        eps: f32,
+    ) -> NodeId {
+        let ty = TensorType::f32(vec![2 * channels as usize]);
+        self.add_raw_node(
+            Op::GroupNormGradWeightBias {
+                num_groups,
+                eps,
+                channels,
+                spatial,
+            },
+            vec![grad_output, input],
+            ty,
+        )
+    }
+
+    // --- Concat / Split ops ---
+
+    /// Concatenate two tensors along the channel dimension (NCHW).
+    /// Both inputs must be flat 1D tensors. `spatial` = H * W.
+    pub fn concat(
+        &mut self,
+        a: NodeId,
+        b: NodeId,
+        batch: u32,
+        channels_a: u32,
+        channels_b: u32,
+        spatial: u32,
+    ) -> NodeId {
+        let total = batch as usize * (channels_a + channels_b) as usize * spatial as usize;
+        let ty = TensorType::f32(vec![total]);
+        self.add_node(
+            Op::Concat {
+                channels_a,
+                channels_b,
+                spatial,
+            },
+            vec![a, b],
+            ty,
+        )
+    }
+
+    /// Split first Ca channels from `[N, Ca+Cb, H, W]`.
+    pub fn split_a(
+        &mut self,
+        x: NodeId,
+        batch: u32,
+        channels_a: u32,
+        channels_b: u32,
+        spatial: u32,
+    ) -> NodeId {
+        let total = batch as usize * channels_a as usize * spatial as usize;
+        let ty = TensorType::f32(vec![total]);
+        self.add_raw_node(
+            Op::SplitA {
+                channels_a,
+                channels_b,
+                spatial,
+            },
+            vec![x],
+            ty,
+        )
+    }
+
+    /// Split last Cb channels from `[N, Ca+Cb, H, W]`.
+    pub fn split_b(
+        &mut self,
+        x: NodeId,
+        batch: u32,
+        channels_a: u32,
+        channels_b: u32,
+        spatial: u32,
+    ) -> NodeId {
+        let total = batch as usize * channels_b as usize * spatial as usize;
+        let ty = TensorType::f32(vec![total]);
+        self.add_raw_node(
+            Op::SplitB {
+                channels_a,
+                channels_b,
+                spatial,
+            },
+            vec![x],
+            ty,
+        )
+    }
+
+    // --- Upsample ops ---
+
+    /// Nearest-neighbor 2x upsampling: `[N,C,H,W]` → `[N,C,2H,2W]`.
+    pub fn upsample_2x(
+        &mut self,
+        x: NodeId,
+        batch: u32,
+        channels: u32,
+        in_h: u32,
+        in_w: u32,
+    ) -> NodeId {
+        let total = batch as usize * channels as usize * (in_h * 2) as usize * (in_w * 2) as usize;
+        let ty = TensorType::f32(vec![total]);
+        self.add_node(
+            Op::Upsample2x {
+                channels,
+                in_h,
+                in_w,
+            },
+            vec![x],
+            ty,
+        )
+    }
+
+    /// Backward of 2x upsample: `[N,C,2H,2W]` → `[N,C,H,W]`.
+    pub fn upsample_2x_grad(
+        &mut self,
+        grad_output: NodeId,
+        batch: u32,
+        channels: u32,
+        in_h: u32,
+        in_w: u32,
+    ) -> NodeId {
+        let total = batch as usize * channels as usize * in_h as usize * in_w as usize;
+        let ty = TensorType::f32(vec![total]);
+        self.add_raw_node(
+            Op::Upsample2xGrad {
+                channels,
+                in_h,
+                in_w,
+            },
+            vec![grad_output],
+            ty,
+        )
+    }
+
+    // --- Conv2d ops ---
+
+    /// 2D convolution: input[N, C_in, H, W] * kernel[C_out, C_in, kH, kW] → output[N, C_out, oH, oW].
+    ///
+    /// Tensors are flat 1D arrays in NCHW order. `input` shape must be `[N * C_in * H * W]`
+    /// and `kernel` shape `[C_out * C_in * kH * kW]` (both stored as single-dim in the graph).
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv2d(
+        &mut self,
+        input: NodeId,
+        kernel: NodeId,
+        batch: u32,
+        in_channels: u32,
+        in_h: u32,
+        in_w: u32,
+        out_channels: u32,
+        kernel_h: u32,
+        kernel_w: u32,
+        stride: u32,
+        padding: u32,
+    ) -> NodeId {
+        let out_h = (in_h + 2 * padding - kernel_h) / stride + 1;
+        let out_w = (in_w + 2 * padding - kernel_w) / stride + 1;
+        let out_size = batch as usize * out_channels as usize * out_h as usize * out_w as usize;
+        let ty = TensorType::f32(vec![out_size]);
+        self.add_node(
+            Op::Conv2d {
+                in_channels,
+                in_h,
+                in_w,
+                out_channels,
+                kernel_h,
+                kernel_w,
+                stride,
+                padding,
+            },
+            vec![input, kernel],
+            ty,
+        )
+    }
+
+    /// Conv2d backward w.r.t. input.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv2d_grad_input(
+        &mut self,
+        grad_output: NodeId,
+        kernel: NodeId,
+        batch: u32,
+        in_channels: u32,
+        in_h: u32,
+        in_w: u32,
+        out_channels: u32,
+        kernel_h: u32,
+        kernel_w: u32,
+        stride: u32,
+        padding: u32,
+    ) -> NodeId {
+        let in_size = batch as usize * in_channels as usize * in_h as usize * in_w as usize;
+        let ty = TensorType::f32(vec![in_size]);
+        self.add_raw_node(
+            Op::Conv2dGradInput {
+                in_channels,
+                in_h,
+                in_w,
+                out_channels,
+                kernel_h,
+                kernel_w,
+                stride,
+                padding,
+            },
+            vec![grad_output, kernel],
+            ty,
+        )
+    }
+
+    /// Conv2d backward w.r.t. kernel weights.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv2d_grad_weight(
+        &mut self,
+        grad_output: NodeId,
+        input: NodeId,
+        in_channels: u32,
+        in_h: u32,
+        in_w: u32,
+        out_channels: u32,
+        kernel_h: u32,
+        kernel_w: u32,
+        stride: u32,
+        padding: u32,
+    ) -> NodeId {
+        let kernel_size =
+            out_channels as usize * in_channels as usize * kernel_h as usize * kernel_w as usize;
+        let ty = TensorType::f32(vec![kernel_size]);
+        self.add_raw_node(
+            Op::Conv2dGradWeight {
+                in_channels,
+                in_h,
+                in_w,
+                out_channels,
+                kernel_h,
+                kernel_w,
+                stride,
+                padding,
+            },
+            vec![grad_output, input],
+            ty,
+        )
+    }
 
     /// Write `new_kv` [1, dim] into row `kv_pos` of `cache` [max_seq, dim].
     /// Returns a node representing the updated cache buffer.

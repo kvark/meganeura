@@ -167,6 +167,73 @@ impl Mlp {
     }
 }
 
+/// 2D convolution layer: `y = conv2d(x, weight) + bias`.
+///
+/// Input and output are flat 1D tensors in NCHW layout.
+pub struct Conv2d {
+    pub weight: NodeId,
+    pub bias: Option<NodeId>,
+    pub in_channels: u32,
+    pub in_h: u32,
+    pub in_w: u32,
+    pub out_channels: u32,
+    pub kernel_h: u32,
+    pub kernel_w: u32,
+    pub stride: u32,
+    pub padding: u32,
+}
+
+impl Conv2d {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        g: &mut Graph,
+        name: &str,
+        in_channels: u32,
+        out_channels: u32,
+        kernel_size: u32,
+        in_h: u32,
+        in_w: u32,
+        stride: u32,
+        padding: u32,
+    ) -> Self {
+        let weight = g.parameter(
+            &format!("{name}.weight"),
+            &[out_channels as usize
+                * in_channels as usize
+                * kernel_size as usize
+                * kernel_size as usize],
+        );
+        Self {
+            weight,
+            bias: None,
+            in_channels,
+            in_h,
+            in_w,
+            out_channels,
+            kernel_h: kernel_size,
+            kernel_w: kernel_size,
+            stride,
+            padding,
+        }
+    }
+
+    pub fn forward(&self, g: &mut Graph, x: NodeId, batch: u32) -> NodeId {
+        g.conv2d(
+            x,
+            self.weight,
+            batch,
+            self.in_channels,
+            self.in_h,
+            self.in_w,
+            self.out_channels,
+            self.kernel_h,
+            self.kernel_w,
+            self.stride,
+            self.padding,
+        )
+    }
+}
+
 /// Configuration for [`CausalSelfAttention`].
 pub struct AttentionConfig {
     pub hidden: usize,

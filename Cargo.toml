@@ -47,6 +47,14 @@ name = "smolvlm2"
 path = "examples/smolvlm2.rs"
 
 [[example]]
+name = "sd_unet_train"
+path = "examples/sd_unet_train.rs"
+
+[[example]]
+name = "bench_sd_unet_train"
+path = "bench/bench_sd_unet_train.rs"
+
+[[example]]
 name = "bench_meganeura"
 path = "bench/bench_meganeura.rs"
 

@@ -401,16 +401,68 @@ run_smollm2() {
 }
 
 # ============================================================
+# SD U-Net training benchmark
+# ============================================================
+run_sd_unet_train() {
+    local sd_flag=""
+    if [[ "${SD_CONFIG:-}" == "small" ]]; then
+        sd_flag="--small"
+    fi
+
+    echo "=== SD U-Net Training Benchmark ==="
+    echo "  config:  ${SD_CONFIG:-tiny}"
+    echo "  warmup:  $WARMUP"
+    echo "  runs:    $RUNS"
+    echo ""
+
+    echo ">>> meganeura training (blade-graphics, f32)"
+    cargo build --release --example bench_sd_unet_train --manifest-path "$ROOT/Cargo.toml" 2>&1 | tail -1
+    "$ROOT/target/release/examples/bench_sd_unet_train" \
+        --warmup "$WARMUP" \
+        --runs "$RUNS" \
+        $sd_flag \
+        > "$OUT_DIR/sd_unet_train_meganeura.json" 2>/dev/stderr
+    echo "  -> $OUT_DIR/sd_unet_train_meganeura.json"
+    echo ""
+
+    echo ">>> PyTorch training ($PYTORCH_DTYPE)"
+    if "$PYTHON" -c "import torch" 2>/dev/null; then
+        "$PYTHON" "$DIR/bench_sd_unet_train_pytorch.py" \
+            --warmup "$WARMUP" \
+            --runs "$RUNS" \
+            $sd_flag \
+            > "$OUT_DIR/sd_unet_train_pytorch.json" 2>/dev/stderr
+        echo "  -> $OUT_DIR/sd_unet_train_pytorch.json"
+    else
+        echo "  SKIPPED (torch not installed)"
+        echo '{"framework":"pytorch","error":"not installed"}' > "$OUT_DIR/sd_unet_train_pytorch.json"
+    fi
+    echo ""
+
+    echo "=== SD U-Net Training Results ==="
+    print_table "$OUT_DIR/sd_unet_train_meganeura.json" "$OUT_DIR/sd_unet_train_pytorch.json" \
+        "device:Device" \
+        "parameters:Parameters" \
+        "compile_time_s:Compile time (s)" \
+        "train_step_avg_ms:Train step avg (ms)" \
+        "train_step_median_ms:Train step median (ms)" \
+        "samples_per_sec:Samples/sec" \
+        "memory_mb:GPU memory (MB)"
+    echo ""
+}
+
+# ============================================================
 # Dispatch
 # ============================================================
 case "$MODEL" in
-    smolvla)        run_smolvla ;;
-    smolvla_train)  run_smolvla_train ;;
-    smollm2)        run_smollm2 ;;
-    all)            run_smolvla; run_smolvla_train; run_smollm2 ;;
+    smolvla)           run_smolvla ;;
+    smolvla_train)     run_smolvla_train ;;
+    smollm2)           run_smollm2 ;;
+    sd_unet_train)     run_sd_unet_train ;;
+    all)               run_smolvla; run_smolvla_train; run_smollm2; run_sd_unet_train ;;
     *)
         echo "Unknown model: $MODEL"
-        echo "Usage: bash bench/compare.sh [--model smolvla|smolvla_train|smollm2|all]"
+        echo "Usage: bash bench/compare.sh [--model smolvla|smolvla_train|smollm2|sd_unet_train|all]"
         exit 1
         ;;
 esac

@@ -103,6 +103,15 @@ pub enum ShaderGroup {
     ScatterAdd,
     BceLoss,
     FusedRmsNormMatMul,
+    GroupNorm,
+    GroupNormGrad,
+    Concat,
+    Split,
+    Upsample,
+    UpsampleGrad,
+    Conv2d,
+    Conv2dGradInput,
+    Conv2dGradWeight,
     CacheWrite,
     CachedAttention,
     RoPEDynamic,
@@ -152,6 +161,15 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::FusedRmsNormMatMul => gen_fused_rms_norm_matmul(),
         ShaderGroup::ScatterAdd => gen_scatter_add(),
         ShaderGroup::BceLoss => gen_bce_loss(),
+        ShaderGroup::GroupNorm => gen_group_norm(),
+        ShaderGroup::GroupNormGrad => gen_group_norm_grad(),
+        ShaderGroup::Concat => gen_concat(),
+        ShaderGroup::Split => gen_split(),
+        ShaderGroup::Upsample => gen_upsample(),
+        ShaderGroup::UpsampleGrad => gen_upsample_grad(),
+        ShaderGroup::Conv2d => gen_conv2d(),
+        ShaderGroup::Conv2dGradInput => gen_conv2d_grad_input(),
+        ShaderGroup::Conv2dGradWeight => gen_conv2d_grad_weight(),
         ShaderGroup::CacheWrite => gen_cache_write(),
         ShaderGroup::CachedAttention => gen_cached_attention(),
         ShaderGroup::RoPEDynamic => gen_rope_dynamic(),
@@ -869,6 +887,78 @@ fn gen_rope_dynamic() -> ShaderModule {
     parse_wgsl(include_str!("shaders/rope_dynamic.wgsl"))
 }
 
+// ---------------------------------------------------------------------------
+// group_norm.wgsl — Group normalization forward
+// ---------------------------------------------------------------------------
+
+fn gen_group_norm() -> ShaderModule {
+    parse_wgsl(include_str!("shaders/group_norm.wgsl"))
+}
+
+// ---------------------------------------------------------------------------
+// group_norm_grad.wgsl — GroupNorm backward
+// ---------------------------------------------------------------------------
+
+fn gen_group_norm_grad() -> ShaderModule {
+    parse_wgsl(include_str!("shaders/group_norm_grad.wgsl"))
+}
+
+// ---------------------------------------------------------------------------
+// concat.wgsl — Channel concatenation
+// ---------------------------------------------------------------------------
+
+fn gen_concat() -> ShaderModule {
+    parse_wgsl(include_str!("shaders/concat.wgsl"))
+}
+
+// ---------------------------------------------------------------------------
+// split.wgsl — Channel split (backward of concat)
+// ---------------------------------------------------------------------------
+
+fn gen_split() -> ShaderModule {
+    parse_wgsl(include_str!("shaders/split.wgsl"))
+}
+
+// ---------------------------------------------------------------------------
+// upsample.wgsl — Nearest-neighbor 2x upsample
+// ---------------------------------------------------------------------------
+
+fn gen_upsample() -> ShaderModule {
+    parse_wgsl(include_str!("shaders/upsample.wgsl"))
+}
+
+// ---------------------------------------------------------------------------
+// upsample_grad.wgsl — Backward of 2x upsample
+// ---------------------------------------------------------------------------
+
+fn gen_upsample_grad() -> ShaderModule {
+    parse_wgsl(include_str!("shaders/upsample_grad.wgsl"))
+}
+
+// ---------------------------------------------------------------------------
+// conv2d.wgsl — 2D convolution forward
+// ---------------------------------------------------------------------------
+
+fn gen_conv2d() -> ShaderModule {
+    parse_wgsl(include_str!("shaders/conv2d.wgsl"))
+}
+
+// ---------------------------------------------------------------------------
+// conv2d_grad_input.wgsl — Conv2d backward w.r.t. input
+// ---------------------------------------------------------------------------
+
+fn gen_conv2d_grad_input() -> ShaderModule {
+    parse_wgsl(include_str!("shaders/conv2d_grad_input.wgsl"))
+}
+
+// ---------------------------------------------------------------------------
+// conv2d_grad_weight.wgsl — Conv2d backward w.r.t. kernel weights
+// ---------------------------------------------------------------------------
+
+fn gen_conv2d_grad_weight() -> ShaderModule {
+    parse_wgsl(include_str!("shaders/conv2d_grad_weight.wgsl"))
+}
+
 fn gen_cache_write() -> ShaderModule {
     parse_wgsl(include_str!("shaders/cache_write.wgsl"))
 }
@@ -1269,6 +1359,19 @@ mod tests {
                 ShaderEntry::CachedAttention => {
                     vec!["src_a", "src_b", "bias", "kv_pos_buf", "dst", "params"]
                 }
+                ShaderEntry::GroupNorm => vec!["src", "src_b", "bias", "dst", "params"],
+                ShaderEntry::GroupNormGradInput => vec!["src_a", "src_b", "bias", "dst", "params"],
+                ShaderEntry::GroupNormGradWeightBias => {
+                    vec!["src_a", "src_b", "bias", "dst", "params"]
+                }
+                ShaderEntry::Concat => vec!["src_a", "src_b", "dst", "params"],
+                ShaderEntry::SplitA | ShaderEntry::SplitB => vec!["src", "dst", "params"],
+                ShaderEntry::Upsample2x | ShaderEntry::Upsample2xGrad => {
+                    vec!["src", "dst", "params"]
+                }
+                ShaderEntry::Conv2d => vec!["src", "weight", "dst", "params"],
+                ShaderEntry::Conv2dGradInput => vec!["grad_out", "weight", "dst", "params"],
+                ShaderEntry::Conv2dGradWeight => vec!["grad_out", "src", "dst", "params"],
                 ShaderEntry::RoPEDynamic => vec!["src", "dst", "pos_offset_buf", "params"],
             }
         }
@@ -1320,6 +1423,17 @@ mod tests {
             ShaderEntry::AdamUpdate,
             ShaderEntry::ScatterAdd,
             ShaderEntry::BceLoss,
+            ShaderEntry::GroupNorm,
+            ShaderEntry::GroupNormGradInput,
+            ShaderEntry::GroupNormGradWeightBias,
+            ShaderEntry::Concat,
+            ShaderEntry::SplitA,
+            ShaderEntry::SplitB,
+            ShaderEntry::Upsample2x,
+            ShaderEntry::Upsample2xGrad,
+            ShaderEntry::Conv2d,
+            ShaderEntry::Conv2dGradInput,
+            ShaderEntry::Conv2dGradWeight,
             ShaderEntry::CacheWrite,
             ShaderEntry::CachedAttention,
             ShaderEntry::RoPEDynamic,

@@ -54,6 +54,17 @@ pub enum ShaderEntry {
     RmsNormGradW,
     RmsNormGradX,
     FusedRmsNormMatMul,
+    GroupNorm,
+    GroupNormGradInput,
+    GroupNormGradWeightBias,
+    Concat,
+    SplitA,
+    SplitB,
+    Upsample2x,
+    Upsample2xGrad,
+    Conv2d,
+    Conv2dGradInput,
+    Conv2dGradWeight,
     CacheWrite,
     CachedAttention,
     RoPEDynamic,
@@ -106,6 +117,16 @@ impl ShaderEntry {
             ShaderEntry::SumRows => ShaderGroup::SumRows,
             ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => ShaderGroup::RmsNormGrad,
             ShaderEntry::FusedRmsNormMatMul => ShaderGroup::FusedRmsNormMatMul,
+            ShaderEntry::GroupNorm => ShaderGroup::GroupNorm,
+            ShaderEntry::GroupNormGradInput => ShaderGroup::GroupNormGrad,
+            ShaderEntry::GroupNormGradWeightBias => ShaderGroup::GroupNormGrad,
+            ShaderEntry::Concat => ShaderGroup::Concat,
+            ShaderEntry::SplitA | ShaderEntry::SplitB => ShaderGroup::Split,
+            ShaderEntry::Upsample2x => ShaderGroup::Upsample,
+            ShaderEntry::Upsample2xGrad => ShaderGroup::UpsampleGrad,
+            ShaderEntry::Conv2d => ShaderGroup::Conv2d,
+            ShaderEntry::Conv2dGradInput => ShaderGroup::Conv2dGradInput,
+            ShaderEntry::Conv2dGradWeight => ShaderGroup::Conv2dGradWeight,
             ShaderEntry::CacheWrite => ShaderGroup::CacheWrite,
             ShaderEntry::CachedAttention => ShaderGroup::CachedAttention,
             ShaderEntry::RoPEDynamic => ShaderGroup::RoPEDynamic,
@@ -162,6 +183,17 @@ impl ShaderEntry {
             ShaderEntry::RmsNormGradW => "rms_norm_grad_w",
             ShaderEntry::RmsNormGradX => "rms_norm_grad_x",
             ShaderEntry::FusedRmsNormMatMul => "main",
+            ShaderEntry::GroupNorm => "main",
+            ShaderEntry::GroupNormGradInput => "grad_input",
+            ShaderEntry::GroupNormGradWeightBias => "grad_weight_bias",
+            ShaderEntry::Concat => "main",
+            ShaderEntry::SplitA => "split_a",
+            ShaderEntry::SplitB => "split_b",
+            ShaderEntry::Upsample2x => "main",
+            ShaderEntry::Upsample2xGrad => "main",
+            ShaderEntry::Conv2d => "main",
+            ShaderEntry::Conv2dGradInput => "main",
+            ShaderEntry::Conv2dGradWeight => "main",
             ShaderEntry::CacheWrite => "main",
             ShaderEntry::CachedAttention => "main",
             ShaderEntry::RoPEDynamic => "main",
@@ -926,6 +958,317 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![seq, num_heads, num_kv_heads, head_dim],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    label: String::new(),
+                });
+            }
+
+            Op::GroupNorm {
+                num_groups,
+                eps,
+                channels,
+                spatial,
+            } => {
+                let x = self.get_buffer(node.inputs[0]);
+                let weight = self.get_buffer(node.inputs[1]);
+                let bias = self.get_buffer(node.inputs[2]);
+                let total = node.ty.shape[0] as u32;
+                let batch = total / (channels * spatial);
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::GroupNorm,
+                    workgroups: [batch * num_groups, 1, 1],
+                    input_buffers: vec![x, weight, bias],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![batch, channels, spatial, num_groups, eps.to_bits(), 0, 0, 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    label: String::new(),
+                });
+            }
+
+            Op::GroupNormGradInput {
+                num_groups,
+                eps,
+                channels,
+                spatial,
+            } => {
+                let grad_out = self.get_buffer(node.inputs[0]);
+                let input = self.get_buffer(node.inputs[1]);
+                let weight = self.get_buffer(node.inputs[2]);
+                let total = node.ty.shape[0] as u32;
+                let batch = total / (channels * spatial);
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::GroupNormGradInput,
+                    workgroups: [batch * num_groups, 1, 1],
+                    input_buffers: vec![grad_out, input, weight],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![batch, channels, spatial, num_groups, eps.to_bits(), 0, 0, 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    label: String::new(),
+                });
+            }
+
+            Op::GroupNormGradWeightBias {
+                num_groups,
+                eps,
+                channels,
+                spatial,
+            } => {
+                let grad_out = self.get_buffer(node.inputs[0]);
+                let input = self.get_buffer(node.inputs[1]);
+                let go_total = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
+                let batch = go_total / (channels * spatial);
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::GroupNormGradWeightBias,
+                    workgroups: [channels, 1, 1],
+                    input_buffers: vec![grad_out, input],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![batch, channels, spatial, num_groups, eps.to_bits(), 0, 0, 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    label: String::new(),
+                });
+            }
+
+            Op::Concat {
+                channels_a,
+                channels_b,
+                spatial,
+            } => {
+                let a = self.get_buffer(node.inputs[0]);
+                let b = self.get_buffer(node.inputs[1]);
+                let total = node.ty.shape[0] as u32;
+                let batch = total / ((channels_a + channels_b) * spatial);
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::Concat,
+                    workgroups: [ceil_div(total, 256), 1, 1],
+                    input_buffers: vec![a, b],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![batch, channels_a, channels_b, spatial],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    label: String::new(),
+                });
+            }
+
+            Op::SplitA {
+                channels_a,
+                channels_b,
+                spatial,
+            } => {
+                let x = self.get_buffer(node.inputs[0]);
+                let total = node.ty.shape[0] as u32;
+                let batch = total / (channels_a * spatial);
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::SplitA,
+                    workgroups: [ceil_div(total, 256), 1, 1],
+                    input_buffers: vec![x],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![batch, channels_a, channels_b, spatial],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    label: String::new(),
+                });
+            }
+
+            Op::SplitB {
+                channels_a,
+                channels_b,
+                spatial,
+            } => {
+                let x = self.get_buffer(node.inputs[0]);
+                let total = node.ty.shape[0] as u32;
+                let batch = total / (channels_b * spatial);
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::SplitB,
+                    workgroups: [ceil_div(total, 256), 1, 1],
+                    input_buffers: vec![x],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![batch, channels_a, channels_b, spatial],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    label: String::new(),
+                });
+            }
+
+            Op::Upsample2x {
+                channels,
+                in_h,
+                in_w,
+            } => {
+                let x = self.get_buffer(node.inputs[0]);
+                let total = node.ty.shape[0] as u32;
+                let batch = total / (channels * in_h * 2 * in_w * 2);
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::Upsample2x,
+                    workgroups: [ceil_div(total, 256), 1, 1],
+                    input_buffers: vec![x],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![batch, channels, in_h, in_w],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    label: String::new(),
+                });
+            }
+
+            Op::Upsample2xGrad {
+                channels,
+                in_h,
+                in_w,
+            } => {
+                let grad = self.get_buffer(node.inputs[0]);
+                let total = node.ty.shape[0] as u32;
+                let batch = total / (channels * in_h * in_w);
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::Upsample2xGrad,
+                    workgroups: [ceil_div(total, 256), 1, 1],
+                    input_buffers: vec![grad],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![batch, channels, in_h, in_w],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    label: String::new(),
+                });
+            }
+
+            Op::Conv2d {
+                in_channels,
+                in_h,
+                in_w,
+                out_channels,
+                kernel_h,
+                kernel_w,
+                stride,
+                padding,
+            } => {
+                let input = self.get_buffer(node.inputs[0]);
+                let kernel = self.get_buffer(node.inputs[1]);
+                let in_shape = &self.graph.node(node.inputs[0]).ty.shape;
+                let out_h = (in_h + 2 * padding - kernel_h) / stride + 1;
+                let out_w = (in_w + 2 * padding - kernel_w) / stride + 1;
+                let batch = in_shape[0] as u32 / (in_channels * in_h * in_w);
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::Conv2d,
+                    workgroups: [
+                        ceil_div(out_w, 16),
+                        ceil_div(out_h, 16),
+                        batch * out_channels,
+                    ],
+                    input_buffers: vec![input, kernel],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![
+                        batch,
+                        in_channels,
+                        in_h,
+                        in_w,
+                        out_channels,
+                        kernel_h,
+                        kernel_w,
+                        stride,
+                        padding,
+                        out_h,
+                        out_w,
+                        0,
+                    ],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    label: String::new(),
+                });
+            }
+
+            Op::Conv2dGradInput {
+                in_channels,
+                in_h,
+                in_w,
+                out_channels,
+                kernel_h,
+                kernel_w,
+                stride,
+                padding,
+            } => {
+                let grad_out = self.get_buffer(node.inputs[0]);
+                let kernel = self.get_buffer(node.inputs[1]);
+                let out_h = (in_h + 2 * padding - kernel_h) / stride + 1;
+                let out_w = (in_w + 2 * padding - kernel_w) / stride + 1;
+                let out_size = node.ty.shape[0] as u32;
+                let batch = out_size / (in_channels * in_h * in_w);
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::Conv2dGradInput,
+                    workgroups: [ceil_div(in_w, 16), ceil_div(in_h, 16), batch * in_channels],
+                    input_buffers: vec![grad_out, kernel],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![
+                        batch,
+                        in_channels,
+                        in_h,
+                        in_w,
+                        out_channels,
+                        kernel_h,
+                        kernel_w,
+                        stride,
+                        padding,
+                        out_h,
+                        out_w,
+                        0,
+                    ],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    label: String::new(),
+                });
+            }
+
+            Op::Conv2dGradWeight {
+                in_channels,
+                in_h,
+                in_w,
+                out_channels,
+                kernel_h,
+                kernel_w,
+                stride,
+                padding,
+            } => {
+                let grad_out = self.get_buffer(node.inputs[0]);
+                let input = self.get_buffer(node.inputs[1]);
+                let out_h = (in_h + 2 * padding - kernel_h) / stride + 1;
+                let out_w = (in_w + 2 * padding - kernel_w) / stride + 1;
+                let out_size = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
+                let batch = out_size / (out_channels * out_h * out_w);
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::Conv2dGradWeight,
+                    workgroups: [
+                        ceil_div(in_channels * kernel_w, 16),
+                        ceil_div(kernel_h, 16),
+                        out_channels,
+                    ],
+                    input_buffers: vec![grad_out, input],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![
+                        batch,
+                        in_channels,
+                        in_h,
+                        in_w,
+                        out_channels,
+                        kernel_h,
+                        kernel_w,
+                        stride,
+                        padding,
+                        out_h,
+                        out_w,
+                        0,
+                    ],
                     use_coop: false,
                     use_small_tiles: false,
                     label: String::new(),

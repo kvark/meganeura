@@ -427,9 +427,125 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let grad_table = graph.scatter_add(indices, grad_output, vocab_size);
                 accumulate_grad(&mut graph, &mut grads, table, grad_table);
             }
+            Op::Conv2d {
+                in_channels,
+                in_h,
+                in_w,
+                out_channels,
+                kernel_h,
+                kernel_w,
+                stride,
+                padding,
+            } => {
+                let input = node.inputs[0];
+                let kernel = node.inputs[1];
+                let in_size = forward.nodes()[input as usize].ty.shape[0] as u32;
+                let batch = in_size / (in_channels * in_h * in_w);
+                let grad_input = graph.conv2d_grad_input(
+                    grad_output,
+                    kernel,
+                    batch,
+                    in_channels,
+                    in_h,
+                    in_w,
+                    out_channels,
+                    kernel_h,
+                    kernel_w,
+                    stride,
+                    padding,
+                );
+                let grad_kernel = graph.conv2d_grad_weight(
+                    grad_output,
+                    input,
+                    in_channels,
+                    in_h,
+                    in_w,
+                    out_channels,
+                    kernel_h,
+                    kernel_w,
+                    stride,
+                    padding,
+                );
+                accumulate_grad(&mut graph, &mut grads, input, grad_input);
+                accumulate_grad(&mut graph, &mut grads, kernel, grad_kernel);
+            }
             Op::ScatterAdd { .. } => {
                 // ScatterAdd only appears in backward graphs; no further differentiation needed.
             }
+            Op::GroupNorm {
+                num_groups,
+                eps,
+                channels,
+                spatial,
+            } => {
+                let x = node.inputs[0];
+                let w = node.inputs[1];
+                let b = node.inputs[2];
+                let x_size = forward.nodes()[x as usize].ty.shape[0] as u32;
+                let batch = x_size / (channels * spatial);
+
+                let grad_x = graph.group_norm_grad_input(
+                    grad_output,
+                    x,
+                    w,
+                    batch,
+                    channels,
+                    spatial,
+                    num_groups,
+                    eps,
+                );
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
+
+                // grad_weight and grad_bias as concatenated [2*C]
+                let grad_wb = graph.group_norm_grad_weight_bias(
+                    grad_output,
+                    x,
+                    channels,
+                    spatial,
+                    num_groups,
+                    eps,
+                );
+                // Split into grad_weight[C] and grad_bias[C]
+                // We use SplitA/SplitB with channels_a=C, channels_b=C, spatial=1
+                // to slice the [2*C] flat output
+                let grad_w = graph.split_a(grad_wb, 1, channels, channels, 1);
+                let grad_b = graph.split_b(grad_wb, 1, channels, channels, 1);
+                accumulate_grad(&mut graph, &mut grads, w, grad_w);
+                accumulate_grad(&mut graph, &mut grads, b, grad_b);
+            }
+            Op::Concat {
+                channels_a,
+                channels_b,
+                spatial,
+            } => {
+                let a = node.inputs[0];
+                let b = node.inputs[1];
+                let a_size = forward.nodes()[a as usize].ty.shape[0] as u32;
+                let batch = a_size / (channels_a * spatial);
+                let grad_a = graph.split_a(grad_output, batch, channels_a, channels_b, spatial);
+                let grad_b = graph.split_b(grad_output, batch, channels_a, channels_b, spatial);
+                accumulate_grad(&mut graph, &mut grads, a, grad_a);
+                accumulate_grad(&mut graph, &mut grads, b, grad_b);
+            }
+            Op::Upsample2x {
+                channels,
+                in_h,
+                in_w,
+            } => {
+                let x = node.inputs[0];
+                let x_size = forward.nodes()[x as usize].ty.shape[0] as u32;
+                let batch = x_size / (channels * in_h * in_w);
+                let grad_x = graph.upsample_2x_grad(grad_output, batch, channels, in_h, in_w);
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
+            // Backward-only gradient ops: no further differentiation needed.
+            Op::Conv2dGradInput { .. }
+            | Op::Conv2dGradWeight { .. }
+            | Op::GroupNormGradInput { .. }
+            | Op::GroupNormGradWeightBias { .. }
+            | Op::SplitA { .. }
+            | Op::SplitB { .. }
+            | Op::Upsample2xGrad { .. } => {}
             // Inference-only ops: should not appear in training graphs
             Op::RoPE { .. }
             | Op::CausalAttention { .. }

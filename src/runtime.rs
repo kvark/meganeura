@@ -241,6 +241,102 @@ struct CacheWriteData {
     params: UnaryParams, // dim, _pad x3
 }
 
+// group_norm: var src, src_b (weight), bias, dst, params
+#[derive(blade_macros::ShaderData)]
+struct GroupNormData {
+    src: blade_graphics::BufferPiece,
+    src_b: blade_graphics::BufferPiece,
+    bias: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: GroupNormParams,
+}
+
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct GroupNormParams {
+    batch: u32,
+    channels: u32,
+    spatial: u32,
+    num_groups: u32,
+    eps_bits: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+// group_norm_grad: var src_a (grad_out), src_b (input), bias (weight), dst, params
+#[derive(blade_macros::ShaderData)]
+struct GroupNormGradInputData {
+    src_a: blade_graphics::BufferPiece,
+    src_b: blade_graphics::BufferPiece,
+    bias: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: GroupNormParams,
+}
+
+// group_norm_grad_weight_bias: var src_a (grad_out), src_b (input), bias (dummy), dst, params
+// The bias field is unused by the grad_weight_bias entry point but exists
+// in the shared GroupNormGrad module (used by grad_input). We bind a dummy buffer.
+#[derive(blade_macros::ShaderData)]
+struct GroupNormGradWeightBiasData {
+    src_a: blade_graphics::BufferPiece,
+    src_b: blade_graphics::BufferPiece,
+    bias: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: GroupNormParams,
+}
+
+// concat: var src_a, src_b, dst, params
+// (reuses BinaryData layout with UnaryParams → batch, ca, cb, spatial)
+
+// split: var src, dst, params (reuses UnaryData layout)
+
+// upsample: var src, dst, params (reuses UnaryData layout)
+
+// conv2d: var src, weight, dst, params (12 u32s = 3 uniform vec4s)
+#[derive(blade_macros::ShaderData)]
+struct Conv2dData {
+    src: blade_graphics::BufferPiece,
+    weight: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: Conv2dParams,
+}
+
+// conv2d_grad_input: var grad_out, weight, dst, params
+#[derive(blade_macros::ShaderData)]
+struct Conv2dGradInputData {
+    grad_out: blade_graphics::BufferPiece,
+    weight: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: Conv2dParams,
+}
+
+// conv2d_grad_weight: var grad_out, src, dst, params
+#[derive(blade_macros::ShaderData)]
+struct Conv2dGradWeightData {
+    grad_out: blade_graphics::BufferPiece,
+    src: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: Conv2dParams,
+}
+
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct Conv2dParams {
+    batch: u32,
+    in_channels: u32,
+    in_h: u32,
+    in_w: u32,
+    out_channels: u32,
+    kernel_h: u32,
+    kernel_w: u32,
+    stride: u32,
+    padding: u32,
+    out_h: u32,
+    out_w: u32,
+    _pad: u32,
+}
+
 // cached_attention: var src_a (q), src_b (k_cache), bias (v_cache), kv_pos_buf, dst, params
 #[derive(blade_macros::ShaderData)]
 struct CachedAttentionData {
@@ -547,6 +643,15 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => BinaryData::layout(),
         ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => CausalAttentionData::layout(),
         ShaderEntry::FusedRmsNormMatMul => CausalAttentionData::layout(),
+        ShaderEntry::GroupNorm => GroupNormData::layout(),
+        ShaderEntry::GroupNormGradInput => GroupNormGradInputData::layout(),
+        ShaderEntry::GroupNormGradWeightBias => GroupNormGradWeightBiasData::layout(),
+        ShaderEntry::Concat => BinaryData::layout(),
+        ShaderEntry::SplitA | ShaderEntry::SplitB => UnaryData::layout(),
+        ShaderEntry::Upsample2x | ShaderEntry::Upsample2xGrad => UnaryData::layout(),
+        ShaderEntry::Conv2d => Conv2dData::layout(),
+        ShaderEntry::Conv2dGradInput => Conv2dGradInputData::layout(),
+        ShaderEntry::Conv2dGradWeight => Conv2dGradWeightData::layout(),
         ShaderEntry::RoPEDynamic => RoPEDynamicData::layout(),
         ShaderEntry::CacheWrite => CacheWriteData::layout(),
         ShaderEntry::CachedAttention => CachedAttentionData::layout(),
@@ -1773,6 +1878,196 @@ impl Session {
                             total: dispatch.params[0],
                             seq_len: dispatch.params[1],
                             embed_dim: dispatch.params[2],
+                            _pad: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::GroupNorm => {
+                let p = &dispatch.params;
+                pc.bind(
+                    0,
+                    &GroupNormData {
+                        src: buf(dispatch.input_buffers[0]),
+                        src_b: buf(dispatch.input_buffers[1]),
+                        bias: buf(dispatch.input_buffers[2]),
+                        dst: buf(dispatch.output_buffer),
+                        params: GroupNormParams {
+                            batch: p[0],
+                            channels: p[1],
+                            spatial: p[2],
+                            num_groups: p[3],
+                            eps_bits: p[4],
+                            _pad0: 0,
+                            _pad1: 0,
+                            _pad2: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::GroupNormGradInput => {
+                let p = &dispatch.params;
+                pc.bind(
+                    0,
+                    &GroupNormGradInputData {
+                        src_a: buf(dispatch.input_buffers[0]),
+                        src_b: buf(dispatch.input_buffers[1]),
+                        bias: buf(dispatch.input_buffers[2]),
+                        dst: buf(dispatch.output_buffer),
+                        params: GroupNormParams {
+                            batch: p[0],
+                            channels: p[1],
+                            spatial: p[2],
+                            num_groups: p[3],
+                            eps_bits: p[4],
+                            _pad0: 0,
+                            _pad1: 0,
+                            _pad2: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::GroupNormGradWeightBias => {
+                let p = &dispatch.params;
+                pc.bind(
+                    0,
+                    &GroupNormGradWeightBiasData {
+                        src_a: buf(dispatch.input_buffers[0]),
+                        src_b: buf(dispatch.input_buffers[1]),
+                        bias: buf(dispatch.input_buffers[1]), // dummy, unused by this entry point
+                        dst: buf(dispatch.output_buffer),
+                        params: GroupNormParams {
+                            batch: p[0],
+                            channels: p[1],
+                            spatial: p[2],
+                            num_groups: p[3],
+                            eps_bits: p[4],
+                            _pad0: 0,
+                            _pad1: 0,
+                            _pad2: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::Concat => {
+                let p = &dispatch.params;
+                pc.bind(
+                    0,
+                    &BinaryData {
+                        src_a: buf(dispatch.input_buffers[0]),
+                        src_b: buf(dispatch.input_buffers[1]),
+                        dst: buf(dispatch.output_buffer),
+                        params: UnaryParams {
+                            len: p[0],
+                            _pad0: p[1],
+                            _pad1: p[2],
+                            _pad2: p[3],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::SplitA | ShaderEntry::SplitB => {
+                let p = &dispatch.params;
+                pc.bind(
+                    0,
+                    &UnaryData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: UnaryParams {
+                            len: p[0],
+                            _pad0: p[1],
+                            _pad1: p[2],
+                            _pad2: p[3],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::Upsample2x | ShaderEntry::Upsample2xGrad => {
+                let p = &dispatch.params;
+                pc.bind(
+                    0,
+                    &UnaryData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: UnaryParams {
+                            len: p[0],
+                            _pad0: p[1],
+                            _pad1: p[2],
+                            _pad2: p[3],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::Conv2d => {
+                let p = &dispatch.params;
+                pc.bind(
+                    0,
+                    &Conv2dData {
+                        src: buf(dispatch.input_buffers[0]),
+                        weight: buf(dispatch.input_buffers[1]),
+                        dst: buf(dispatch.output_buffer),
+                        params: Conv2dParams {
+                            batch: p[0],
+                            in_channels: p[1],
+                            in_h: p[2],
+                            in_w: p[3],
+                            out_channels: p[4],
+                            kernel_h: p[5],
+                            kernel_w: p[6],
+                            stride: p[7],
+                            padding: p[8],
+                            out_h: p[9],
+                            out_w: p[10],
+                            _pad: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::Conv2dGradInput => {
+                let p = &dispatch.params;
+                pc.bind(
+                    0,
+                    &Conv2dGradInputData {
+                        grad_out: buf(dispatch.input_buffers[0]),
+                        weight: buf(dispatch.input_buffers[1]),
+                        dst: buf(dispatch.output_buffer),
+                        params: Conv2dParams {
+                            batch: p[0],
+                            in_channels: p[1],
+                            in_h: p[2],
+                            in_w: p[3],
+                            out_channels: p[4],
+                            kernel_h: p[5],
+                            kernel_w: p[6],
+                            stride: p[7],
+                            padding: p[8],
+                            out_h: p[9],
+                            out_w: p[10],
+                            _pad: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::Conv2dGradWeight => {
+                let p = &dispatch.params;
+                pc.bind(
+                    0,
+                    &Conv2dGradWeightData {
+                        grad_out: buf(dispatch.input_buffers[0]),
+                        src: buf(dispatch.input_buffers[1]),
+                        dst: buf(dispatch.output_buffer),
+                        params: Conv2dParams {
+                            batch: p[0],
+                            in_channels: p[1],
+                            in_h: p[2],
+                            in_w: p[3],
+                            out_channels: p[4],
+                            kernel_h: p[5],
+                            kernel_w: p[6],
+                            stride: p[7],
+                            padding: p[8],
+                            out_h: p[9],
+                            out_w: p[10],
                             _pad: 0,
                         },
                     },

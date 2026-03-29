@@ -261,6 +261,18 @@ fn graph_to_egglog(graph: &Graph) -> String {
   (FullAttention Op Op Op)
   (CrossAttention Op Op Op)
   (MultiHeadAttn Op Op Op)
+  ; --- GroupNorm, Concat, Upsample, Conv2d ops ---
+  (GroupNorm Op Op Op)
+  (GroupNormGradInput Op Op Op)
+  (GroupNormGradWeightBias Op Op)
+  (Concat Op Op)
+  (SplitA Op)
+  (SplitB Op)
+  (Upsample2x Op)
+  (Upsample2xGrad Op)
+  (Conv2d Op Op)
+  (Conv2dGradInput Op Op)
+  (Conv2dGradWeight Op Op)
   ; --- KV cache ops ---
   (CacheWrite Op Op Op)
   (CachedAttention Op Op Op Op)
@@ -405,6 +417,21 @@ fn node_to_egglog_expr(node: &Node) -> String {
         Op::FusedRmsNormMatMul { .. } => {
             format!("(FusedRmsNormMatMul n{} n{} n{})", i[0], i[1], i[2])
         }
+        Op::GroupNorm { .. } => format!("(GroupNorm n{} n{} n{})", i[0], i[1], i[2]),
+        Op::GroupNormGradInput { .. } => {
+            format!("(GroupNormGradInput n{} n{} n{})", i[0], i[1], i[2])
+        }
+        Op::GroupNormGradWeightBias { .. } => {
+            format!("(GroupNormGradWeightBias n{} n{})", i[0], i[1])
+        }
+        Op::Concat { .. } => format!("(Concat n{} n{})", i[0], i[1]),
+        Op::SplitA { .. } => format!("(SplitA n{})", i[0]),
+        Op::SplitB { .. } => format!("(SplitB n{})", i[0]),
+        Op::Upsample2x { .. } => format!("(Upsample2x n{})", i[0]),
+        Op::Upsample2xGrad { .. } => format!("(Upsample2xGrad n{})", i[0]),
+        Op::Conv2d { .. } => format!("(Conv2d n{} n{})", i[0], i[1]),
+        Op::Conv2dGradInput { .. } => format!("(Conv2dGradInput n{} n{})", i[0], i[1]),
+        Op::Conv2dGradWeight { .. } => format!("(Conv2dGradWeight n{} n{})", i[0], i[1]),
         Op::CacheWrite => format!("(CacheWrite n{} n{} n{})", i[0], i[1], i[2]),
         Op::CachedAttention { .. } => {
             format!("(CachedAttention n{} n{} n{} n{})", i[0], i[1], i[2], i[3])

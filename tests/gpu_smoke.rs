@@ -921,3 +921,206 @@ fn kv_cache_ops_smoke() {
     let sum2: f32 = out2.iter().map(|x| x.abs()).sum();
     assert!(sum2 > 0.0, "second step output should be non-zero");
 }
+
+/// Smoke test: Conv2d forward compiles and produces correct output.
+#[test]
+fn conv2d_forward_smoke() {
+    // Tiny conv: 1 batch, 1 input channel, 4×4 image, 1 output channel, 3×3 kernel, stride=1, pad=0
+    let batch = 1u32;
+    let in_c = 1u32;
+    let h = 4u32;
+    let w = 4u32;
+    let out_c = 1u32;
+    let kh = 3u32;
+    let kw = 3u32;
+    let stride = 1u32;
+    let padding = 0u32;
+    let out_h = (h + 2 * padding - kh) / stride + 1; // 2
+    let out_w = (w + 2 * padding - kw) / stride + 1; // 2
+
+    let in_size = (batch * in_c * h * w) as usize;
+    let kernel_size = (out_c * in_c * kh * kw) as usize;
+    let out_size = (batch * out_c * out_h * out_w) as usize;
+
+    let mut g = Graph::new();
+    let input = g.input("input", &[in_size]);
+    let kernel = g.parameter("kernel", &[kernel_size]);
+    let output = g.conv2d(
+        input, kernel, batch, in_c, h, w, out_c, kh, kw, stride, padding,
+    );
+    g.set_outputs(vec![output]);
+
+    let mut session = build_inference_session(&g);
+
+    // All-ones input, all-ones kernel → each output = 9.0 (sum of 3×3 ones)
+    session.set_input("input", &vec![1.0f32; in_size]);
+    session.set_parameter("kernel", &vec![1.0f32; kernel_size]);
+
+    session.step();
+    session.wait();
+
+    let out = session.read_output(out_size);
+    assert_eq!(out.len(), out_size);
+    for (i, &v) in out.iter().enumerate() {
+        assert!(
+            (v - 9.0).abs() < 1e-4,
+            "output[{}] = {}, expected 9.0",
+            i,
+            v
+        );
+    }
+}
+
+/// Smoke test: Conv2d with padding.
+#[test]
+fn conv2d_padding_smoke() {
+    // 1 batch, 1 channel, 3×3 input, 1 output channel, 3×3 kernel, stride=1, padding=1
+    // Output should be 3×3 (same size as input)
+    let batch = 1u32;
+    let in_c = 1u32;
+    let h = 3u32;
+    let w = 3u32;
+    let out_c = 1u32;
+    let kh = 3u32;
+    let kw = 3u32;
+    let stride = 1u32;
+    let padding = 1u32;
+    let out_h = (h + 2 * padding - kh) / stride + 1; // 3
+    let out_w = (w + 2 * padding - kw) / stride + 1; // 3
+
+    let in_size = (batch * in_c * h * w) as usize;
+    let kernel_size = (out_c * in_c * kh * kw) as usize;
+    let out_size = (batch * out_c * out_h * out_w) as usize;
+
+    let mut g = Graph::new();
+    let input = g.input("input", &[in_size]);
+    let kernel = g.parameter("kernel", &[kernel_size]);
+    let output = g.conv2d(
+        input, kernel, batch, in_c, h, w, out_c, kh, kw, stride, padding,
+    );
+    g.set_outputs(vec![output]);
+
+    let mut session = build_inference_session(&g);
+    session.set_input("input", &vec![1.0f32; in_size]);
+    session.set_parameter("kernel", &vec![1.0f32; kernel_size]);
+
+    session.step();
+    session.wait();
+
+    let out = session.read_output(out_size);
+    assert_eq!(out.len(), out_size);
+    // Center pixel: full 3×3 overlap → 9.0
+    assert!(
+        (out[4] - 9.0).abs() < 1e-4,
+        "center = {}, expected 9.0",
+        out[4]
+    );
+    // Corner pixel: only 2×2 overlap → 4.0
+    assert!(
+        (out[0] - 4.0).abs() < 1e-4,
+        "corner = {}, expected 4.0",
+        out[0]
+    );
+    // Edge pixel: 2×3 or 3×2 overlap → 6.0
+    assert!(
+        (out[1] - 6.0).abs() < 1e-4,
+        "edge = {}, expected 6.0",
+        out[1]
+    );
+}
+
+/// Smoke test: Conv2d backward (gradient check via finite differences).
+#[test]
+fn conv2d_backward_smoke() {
+    use meganeura::autodiff;
+
+    let batch = 1u32;
+    let in_c = 1u32;
+    let h = 4u32;
+    let w = 4u32;
+    let out_c = 1u32;
+    let kh = 3u32;
+    let kw = 3u32;
+    let stride = 1u32;
+    let padding = 0u32;
+
+    let in_size = (batch * in_c * h * w) as usize;
+    let kernel_size = (out_c * in_c * kh * kw) as usize;
+    // Forward + loss = sum_all(conv2d(input, kernel))
+    let mut g = Graph::new();
+    let input = g.input("input", &[in_size]);
+    let kernel_node = g.parameter("kernel", &[kernel_size]);
+    let conv_out = g.conv2d(
+        input,
+        kernel_node,
+        batch,
+        in_c,
+        h,
+        w,
+        out_c,
+        kh,
+        kw,
+        stride,
+        padding,
+    );
+    let loss = g.sum_all(conv_out);
+    g.set_outputs(vec![loss]);
+
+    // Differentiate
+    let diff_graph = autodiff::differentiate(&g);
+    let plan = meganeura::compile::compile(&diff_graph);
+    let mut session = meganeura::Session::new(plan);
+
+    let input_data: Vec<f32> = (0..in_size).map(|i| (i as f32 + 1.0) * 0.1).collect();
+    let kernel_data: Vec<f32> = (0..kernel_size).map(|i| (i as f32 + 1.0) * 0.05).collect();
+
+    session.set_input("input", &input_data);
+    session.set_parameter("kernel", &kernel_data);
+
+    session.step();
+    session.wait();
+
+    // Read loss
+    let loss_val = session.read_output(1);
+    assert!(loss_val[0].abs() > 0.0, "loss should be non-zero");
+
+    // Read kernel gradient (output index 1 = first param gradient)
+    let mut grad_kernel = vec![0.0f32; kernel_size];
+    session.read_output_by_index(1, &mut grad_kernel);
+
+    // Finite difference check for kernel gradient
+    let eps = 1e-3;
+    for idx in 0..kernel_size.min(4) {
+        let mut k_plus = kernel_data.clone();
+        k_plus[idx] += eps;
+
+        // Re-run forward with perturbed kernel
+        let mut g2 = Graph::new();
+        let inp2 = g2.input("input", &[in_size]);
+        let kern2 = g2.parameter("kernel", &[kernel_size]);
+        let conv2 = g2.conv2d(
+            inp2, kern2, batch, in_c, h, w, out_c, kh, kw, stride, padding,
+        );
+        let loss2 = g2.sum_all(conv2);
+        g2.set_outputs(vec![loss2]);
+
+        let mut s2 = build_inference_session(&g2);
+        s2.set_input("input", &input_data);
+        s2.set_parameter("kernel", &k_plus);
+        s2.step();
+        s2.wait();
+        let loss_plus = s2.read_output(1)[0];
+
+        let numerical = (loss_plus - loss_val[0]) / eps;
+        let analytical = grad_kernel[idx];
+        let diff = (numerical - analytical).abs();
+        assert!(
+            diff < 0.1,
+            "kernel grad[{}]: numerical={:.4}, analytical={:.4}, diff={:.4}",
+            idx,
+            numerical,
+            analytical,
+            diff
+        );
+    }
+}
