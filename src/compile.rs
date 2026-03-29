@@ -64,8 +64,10 @@ pub enum ShaderEntry {
     Upsample2xGrad,
     Conv2d,
     Conv2dGemm,
+    Conv2dGemmSmall,
     Conv2dGradInput,
     Conv2dGradInputGemm,
+    Conv2dGradInputGemmSmall,
     Conv2dGradWeight,
     CacheWrite,
     CachedAttention,
@@ -128,8 +130,10 @@ impl ShaderEntry {
             ShaderEntry::Upsample2xGrad => ShaderGroup::UpsampleGrad,
             ShaderEntry::Conv2d => ShaderGroup::Conv2d,
             ShaderEntry::Conv2dGemm => ShaderGroup::Conv2dGemm,
+            ShaderEntry::Conv2dGemmSmall => ShaderGroup::Conv2dGemmSmall,
             ShaderEntry::Conv2dGradInput => ShaderGroup::Conv2dGradInput,
             ShaderEntry::Conv2dGradInputGemm => ShaderGroup::Conv2dGradInputGemm,
+            ShaderEntry::Conv2dGradInputGemmSmall => ShaderGroup::Conv2dGradInputGemmSmall,
             ShaderEntry::Conv2dGradWeight => ShaderGroup::Conv2dGradWeight,
             ShaderEntry::CacheWrite => ShaderGroup::CacheWrite,
             ShaderEntry::CachedAttention => ShaderGroup::CachedAttention,
@@ -196,9 +200,9 @@ impl ShaderEntry {
             ShaderEntry::Upsample2x => "main",
             ShaderEntry::Upsample2xGrad => "main",
             ShaderEntry::Conv2d => "main",
-            ShaderEntry::Conv2dGemm => "main",
+            ShaderEntry::Conv2dGemm | ShaderEntry::Conv2dGemmSmall => "main",
             ShaderEntry::Conv2dGradInput => "main",
-            ShaderEntry::Conv2dGradInputGemm => "main",
+            ShaderEntry::Conv2dGradInputGemm | ShaderEntry::Conv2dGradInputGemmSmall => "main",
             ShaderEntry::Conv2dGradWeight => "main",
             ShaderEntry::CacheWrite => "main",
             ShaderEntry::CachedAttention => "main",
@@ -1165,11 +1169,19 @@ impl<'a> Compiler<'a> {
                 let batch = in_shape[0] as u32 / (in_channels * in_h * in_w);
                 // Use implicit GEMM: output = weight @ im2col(input)^T
                 // M=Co, N=oH*oW, K=Ci*kH*kW, batched in z dimension
+                // Use small (32×32) tiles when workgroup count per batch is low.
+                let wgs_64 = ceil_div(out_h * out_w, 64) * ceil_div(out_channels, 64);
+                let use_small = wgs_64 < 16;
+                let tile = if use_small { 32 } else { 64 };
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Conv2dGemm,
+                    shader: if use_small {
+                        ShaderEntry::Conv2dGemmSmall
+                    } else {
+                        ShaderEntry::Conv2dGemm
+                    },
                     workgroups: [
-                        ceil_div(out_h * out_w, 64),
-                        ceil_div(out_channels, 64),
+                        ceil_div(out_h * out_w, tile),
+                        ceil_div(out_channels, tile),
                         batch,
                     ],
                     input_buffers: vec![input, kernel],
@@ -1213,9 +1225,20 @@ impl<'a> Compiler<'a> {
                 let batch = out_size / (in_channels * in_h * in_w);
                 // Use implicit GEMM: grad_input = weight_T @ im2col(grad_out)^T
                 // M=Ci, N=H*W, K=Co*kH*kW, batched in z dimension
+                let wgs_64 = ceil_div(in_h * in_w, 64) * ceil_div(in_channels, 64);
+                let use_small = wgs_64 < 16;
+                let tile = if use_small { 32 } else { 64 };
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Conv2dGradInputGemm,
-                    workgroups: [ceil_div(in_h * in_w, 64), ceil_div(in_channels, 64), batch],
+                    shader: if use_small {
+                        ShaderEntry::Conv2dGradInputGemmSmall
+                    } else {
+                        ShaderEntry::Conv2dGradInputGemm
+                    },
+                    workgroups: [
+                        ceil_div(in_h * in_w, tile),
+                        ceil_div(in_channels, tile),
+                        batch,
+                    ],
                     input_buffers: vec![grad_out, kernel],
                     output_buffer: out_buf,
                     extra_output: None,
