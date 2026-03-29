@@ -841,3 +841,83 @@ fn checkpoint_round_trip() {
 
     std::fs::remove_file(&tmp).ok();
 }
+
+/// Smoke test: KV cache ops (cache_write, cached_attention, rope_dynamic) compile and run.
+#[test]
+fn kv_cache_ops_smoke() {
+    let num_heads: u32 = 2;
+    let num_kv_heads: u32 = 2;
+    let head_dim: u32 = 64;
+    let kv_dim = (num_kv_heads * head_dim) as usize;
+    let q_dim = (num_heads * head_dim) as usize;
+    let max_seq: usize = 16;
+
+    let mut g = Graph::new();
+    let q_input = g.input("q", &[1, q_dim]);
+    let k_input = g.input("k", &[1, kv_dim]);
+    let v_input = g.input("v", &[1, kv_dim]);
+    let kv_pos = g.input_u32("kv_pos", &[1]);
+
+    // Pre-allocated cache buffers
+    let k_cache = g.parameter("k_cache", &[max_seq, kv_dim]);
+    let v_cache = g.parameter("v_cache", &[max_seq, kv_dim]);
+
+    // Write new K/V into cache
+    let _k_updated = g.cache_write(k_input, k_cache, kv_pos);
+    let _v_updated = g.cache_write(v_input, v_cache, kv_pos);
+
+    // RoPE with dynamic offset
+    let q_rope = g.rope_dynamic_offset(q_input, 10000.0, kv_pos);
+
+    // Cached attention
+    let attn = g.cached_attention(
+        q_rope,
+        k_cache,
+        v_cache,
+        kv_pos,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+    );
+
+    g.set_outputs(vec![attn]);
+
+    let mut session = build_inference_session(&g);
+
+    // Initialize caches to zero
+    session.set_parameter("k_cache", &vec![0.0f32; max_seq * kv_dim]);
+    session.set_parameter("v_cache", &vec![0.0f32; max_seq * kv_dim]);
+
+    // Step 0: write first K/V
+    let q_data: Vec<f32> = (0..q_dim).map(|i| (i as f32 * 0.01).sin()).collect();
+    let k_data: Vec<f32> = (0..kv_dim).map(|i| (i as f32 * 0.02).sin()).collect();
+    let v_data: Vec<f32> = (0..kv_dim).map(|i| (i as f32 * 0.03).sin()).collect();
+
+    session.set_input("q", &q_data);
+    session.set_input("k", &k_data);
+    session.set_input("v", &v_data);
+    session.set_input_u32("kv_pos", &[0]);
+
+    session.step();
+    session.wait();
+
+    let out = session.read_output(q_dim);
+    assert_eq!(out.len(), q_dim);
+    // With only 1 cached position, attention output should be non-zero
+    let sum: f32 = out.iter().map(|x| x.abs()).sum();
+    assert!(
+        sum > 0.0,
+        "attention output should be non-zero, got sum={}",
+        sum
+    );
+
+    // Step 1: add another K/V entry
+    session.set_input_u32("kv_pos", &[1]);
+    session.step();
+    session.wait();
+
+    let out2 = session.read_output(q_dim);
+    assert_eq!(out2.len(), q_dim);
+    let sum2: f32 = out2.iter().map(|x| x.abs()).sum();
+    assert!(sum2 > 0.0, "second step output should be non-zero");
+}

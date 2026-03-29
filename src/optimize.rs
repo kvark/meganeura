@@ -261,6 +261,9 @@ fn graph_to_egglog(graph: &Graph) -> String {
   (FullAttention Op Op Op)
   (CrossAttention Op Op Op)
   (MultiHeadAttn Op Op Op)
+  ; --- KV cache ops ---
+  (CacheWrite Op Op Op)
+  (CachedAttention Op Op Op Op)
   ; --- Backward / gradient ops ---
   (SiluGrad Op Op)
   (SwiGLUGradGate Op Op Op)
@@ -401,6 +404,10 @@ fn node_to_egglog_expr(node: &Node) -> String {
         }
         Op::FusedRmsNormMatMul { .. } => {
             format!("(FusedRmsNormMatMul n{} n{} n{})", i[0], i[1], i[2])
+        }
+        Op::CacheWrite => format!("(CacheWrite n{} n{} n{})", i[0], i[1], i[2]),
+        Op::CachedAttention { .. } => {
+            format!("(CachedAttention n{} n{} n{} n{})", i[0], i[1], i[2], i[3])
         }
         Op::Nop => unreachable!("Nop nodes are filtered before encoding"),
     }

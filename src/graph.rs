@@ -152,9 +152,13 @@ pub enum Op {
     Embedding,
 
     // Rotary position embeddings
-    // inputs: [x], params encode theta
+    // inputs: [x] or [x, pos_offset_input]
+    // pos_offset: static offset added to each row's position (0 for prefill)
+    // When inputs has 2 elements, the second is a u32 buffer whose value is
+    // added to position (for decode, this is kv_pos).
     RoPE {
         theta: f32,
+        pos_offset: u32,
     },
 
     // Fused causal multi-head attention with GQA
@@ -244,6 +248,23 @@ pub enum Op {
     // inputs: [dy, x, w] → [rows, cols]
     RmsNormGradX {
         eps: f32,
+    },
+
+    // --- KV cache ops ---
+
+    // Write [1, dim] into row kv_pos of [max_seq, dim] cache buffer.
+    // inputs: [new_kv, cache_buf], kv_pos read from a u32 input.
+    // output: cache_buf (in-place write at row kv_pos)
+    CacheWrite,
+
+    // Attention with Q from current token and K/V from pre-allocated cache.
+    // inputs: [q, k_cache, v_cache, kv_pos_input]
+    // q: [1, num_heads*head_dim], k_cache/v_cache: [max_seq, kv_dim]
+    // kv_pos_input: u32 scalar (number of valid cached positions)
+    CachedAttention {
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
     },
 }
 
@@ -695,11 +716,32 @@ impl Graph {
     }
 
     pub fn rope(&mut self, x: NodeId, theta: f32) -> NodeId {
+        self.rope_with_offset(x, theta, 0)
+    }
+
+    pub fn rope_with_offset(&mut self, x: NodeId, theta: f32, pos_offset: u32) -> NodeId {
         let x_shape = &self.node(x).ty.shape;
         assert_eq!(x_shape.len(), 2, "rope requires 2D input");
         assert_eq!(x_shape[1] % 2, 0, "rope requires even last dim");
         let ty = self.node(x).ty.clone();
-        self.add_node(Op::RoPE { theta }, vec![x], ty)
+        self.add_node(Op::RoPE { theta, pos_offset }, vec![x], ty)
+    }
+
+    /// RoPE with a dynamic position offset read from an input buffer.
+    /// The position for each row is `row_index + offset_buf[0]`.
+    pub fn rope_dynamic_offset(&mut self, x: NodeId, theta: f32, offset_input: NodeId) -> NodeId {
+        let x_shape = &self.node(x).ty.shape;
+        assert_eq!(x_shape.len(), 2, "rope requires 2D input");
+        assert_eq!(x_shape[1] % 2, 0, "rope requires even last dim");
+        let ty = self.node(x).ty.clone();
+        self.add_node(
+            Op::RoPE {
+                theta,
+                pos_offset: 0,
+            },
+            vec![x, offset_input],
+            ty,
+        )
     }
 
     pub fn causal_attention(
@@ -743,6 +785,54 @@ impl Graph {
                 head_dim,
             },
             vec![q, k, v],
+            ty,
+        )
+    }
+
+    // --- KV cache ops ---
+
+    /// Write `new_kv` [1, dim] into row `kv_pos` of `cache` [max_seq, dim].
+    /// Returns a node representing the updated cache buffer.
+    pub fn cache_write(&mut self, new_kv: NodeId, cache: NodeId, kv_pos: NodeId) -> NodeId {
+        let nk_shape = &self.node(new_kv).ty.shape;
+        let c_shape = &self.node(cache).ty.shape;
+        assert_eq!(nk_shape.len(), 2, "new_kv must be 2D");
+        assert_eq!(nk_shape[0], 1, "new_kv must have seq_len=1");
+        assert_eq!(c_shape.len(), 2, "cache must be 2D");
+        assert_eq!(nk_shape[1], c_shape[1], "dim must match");
+        let ty = self.node(cache).ty.clone();
+        self.add_node(Op::CacheWrite, vec![new_kv, cache, kv_pos], ty)
+    }
+
+    /// Cached attention: Q attends to K/V cache.
+    /// q: [1, num_heads*head_dim], k_cache/v_cache: [max_seq, kv_dim],
+    /// kv_pos: u32 scalar (number of valid positions in cache).
+    pub fn cached_attention(
+        &mut self,
+        q: NodeId,
+        k_cache: NodeId,
+        v_cache: NodeId,
+        kv_pos: NodeId,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+    ) -> NodeId {
+        let q_shape = &self.node(q).ty.shape;
+        assert_eq!(q_shape.len(), 2, "q must be 2D");
+        assert_eq!(q_shape[0], 1, "q must have seq_len=1 for cached attention");
+        assert_eq!(
+            q_shape[1],
+            (num_heads * head_dim) as usize,
+            "q dim mismatch"
+        );
+        let ty = TensorType::f32(vec![1, (num_heads * head_dim) as usize]);
+        self.add_node(
+            Op::CachedAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            },
+            vec![q, k_cache, v_cache, kv_pos],
             ty,
         )
     }

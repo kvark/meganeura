@@ -54,6 +54,9 @@ pub enum ShaderEntry {
     RmsNormGradW,
     RmsNormGradX,
     FusedRmsNormMatMul,
+    CacheWrite,
+    CachedAttention,
+    RoPEDynamic,
 }
 
 impl ShaderEntry {
@@ -103,6 +106,9 @@ impl ShaderEntry {
             ShaderEntry::SumRows => ShaderGroup::SumRows,
             ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => ShaderGroup::RmsNormGrad,
             ShaderEntry::FusedRmsNormMatMul => ShaderGroup::FusedRmsNormMatMul,
+            ShaderEntry::CacheWrite => ShaderGroup::CacheWrite,
+            ShaderEntry::CachedAttention => ShaderGroup::CachedAttention,
+            ShaderEntry::RoPEDynamic => ShaderGroup::RoPEDynamic,
         }
     }
 
@@ -156,6 +162,9 @@ impl ShaderEntry {
             ShaderEntry::RmsNormGradW => "rms_norm_grad_w",
             ShaderEntry::RmsNormGradX => "rms_norm_grad_x",
             ShaderEntry::FusedRmsNormMatMul => "main",
+            ShaderEntry::CacheWrite => "main",
+            ShaderEntry::CachedAttention => "main",
+            ShaderEntry::RoPEDynamic => "main",
         }
     }
 }
@@ -202,8 +211,10 @@ pub struct ExecutionPlan {
     /// The dispatch sequence. For a training graph, this includes
     /// forward, backward, and parameter update dispatches.
     pub dispatches: Vec<Dispatch>,
-    /// Index of the loss buffer (for reading back).
+    /// Index of the loss buffer (first graph output, for reading back).
     pub loss_buffer: Option<BufferRef>,
+    /// All graph output buffers (for reading back multiple outputs).
+    pub output_buffers: Vec<BufferRef>,
     /// Parameter buffer → gradient buffer mapping (for SGD).
     pub param_grad_pairs: Vec<(BufferRef, BufferRef)>,
     /// LSE buffers allocated for MultiHeadAttn forward nodes: (node_id, buffer).
@@ -257,6 +268,7 @@ impl<'a> Compiler<'a> {
                 constant_buffers: Vec::new(),
                 dispatches: Vec::new(),
                 loss_buffer: None,
+                output_buffers: Vec::new(),
                 param_grad_pairs: Vec::new(),
                 lse_buffers: Vec::new(),
                 derived_params: Vec::new(),
@@ -355,7 +367,10 @@ impl<'a> Compiler<'a> {
             };
         }
 
-        // Set loss buffer (first output)
+        // Set loss buffer (first output) and collect all output buffers
+        for &out_id in self.graph.outputs() {
+            self.plan.output_buffers.push(self.get_buffer(out_id));
+        }
         if let Some(&loss_id) = self.graph.outputs().first() {
             self.plan.loss_buffer = Some(self.get_buffer(loss_id));
         }
@@ -814,22 +829,38 @@ impl<'a> Compiler<'a> {
                 });
             }
 
-            Op::RoPE { theta } => {
+            Op::RoPE { theta, pos_offset } => {
                 let input = self.get_buffer(node.inputs[0]);
                 let shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let seq = shape[0] as u32;
                 let dim = shape[1] as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::RoPE,
-                    workgroups: [ceil_div(seq * dim / 2, 256), 1, 1],
-                    input_buffers: vec![input],
-                    output_buffer: out_buf,
-                    extra_output: None,
-                    params: vec![seq, dim, theta.to_bits(), 0],
-                    use_coop: false,
-                    use_small_tiles: false,
-                    label: String::new(),
-                });
+                if node.inputs.len() == 2 {
+                    // Dynamic offset: read pos_offset from input buffer
+                    let offset_buf = self.get_buffer(node.inputs[1]);
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::RoPEDynamic,
+                        workgroups: [ceil_div(seq * dim / 2, 256), 1, 1],
+                        input_buffers: vec![input, offset_buf],
+                        output_buffer: out_buf,
+                        extra_output: None,
+                        params: vec![seq, dim, theta.to_bits(), 0],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        label: String::new(),
+                    });
+                } else {
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::RoPE,
+                        workgroups: [ceil_div(seq * dim / 2, 256), 1, 1],
+                        input_buffers: vec![input],
+                        output_buffer: out_buf,
+                        extra_output: None,
+                        params: vec![seq, dim, theta.to_bits(), pos_offset],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        label: String::new(),
+                    });
+                }
             }
 
             Op::CausalAttention {
@@ -848,6 +879,48 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![seq, num_heads, num_kv_heads, head_dim],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    label: String::new(),
+                });
+            }
+
+            Op::CacheWrite => {
+                let new_kv = self.get_buffer(node.inputs[0]);
+                let cache = self.get_buffer(node.inputs[1]);
+                let kv_pos_input = self.get_buffer(node.inputs[2]);
+                let dim = self.graph.node(node.inputs[0]).ty.shape[1] as u32;
+                // Output aliases the cache buffer (in-place write)
+                self.node_buffers.insert(node.id, cache);
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::CacheWrite,
+                    workgroups: [ceil_div(dim, 256), 1, 1],
+                    input_buffers: vec![new_kv, cache, kv_pos_input],
+                    output_buffer: cache,
+                    extra_output: None,
+                    params: vec![dim, 0, 0, 0], // kv_pos read from input buffer at runtime
+                    use_coop: false,
+                    use_small_tiles: false,
+                    label: String::new(),
+                });
+            }
+
+            Op::CachedAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            } => {
+                let q = self.get_buffer(node.inputs[0]);
+                let k_cache = self.get_buffer(node.inputs[1]);
+                let v_cache = self.get_buffer(node.inputs[2]);
+                let kv_pos_input = self.get_buffer(node.inputs[3]);
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::CachedAttention,
+                    workgroups: [1, num_heads, 1],
+                    input_buffers: vec![q, k_cache, v_cache, kv_pos_input],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![0, num_heads, num_kv_heads, head_dim], // kv_len read from input buffer
                     use_coop: false,
                     use_small_tiles: false,
                     label: String::new(),

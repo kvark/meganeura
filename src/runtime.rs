@@ -223,6 +223,35 @@ struct CausalAttentionData {
     params: MatMulParams, // seq, num_heads, num_kv_heads, head_dim → reuse 4xu32
 }
 
+// rope_dynamic: var src, dst, pos_offset_buf, params
+#[derive(blade_macros::ShaderData)]
+struct RoPEDynamicData {
+    src: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    pos_offset_buf: blade_graphics::BufferPiece,
+    params: UnaryParams, // seq, dim, theta_bits, _pad
+}
+
+// cache_write: var src, dst (read_write), kv_pos_buf, params
+#[derive(blade_macros::ShaderData)]
+struct CacheWriteData {
+    src: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    kv_pos_buf: blade_graphics::BufferPiece,
+    params: UnaryParams, // dim, _pad x3
+}
+
+// cached_attention: var src_a (q), src_b (k_cache), bias (v_cache), kv_pos_buf, dst, params
+#[derive(blade_macros::ShaderData)]
+struct CachedAttentionData {
+    src_a: blade_graphics::BufferPiece,
+    src_b: blade_graphics::BufferPiece,
+    bias: blade_graphics::BufferPiece,
+    kv_pos_buf: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: MatMulParams, // _reserved, num_heads, num_kv_heads, head_dim
+}
+
 // layer_norm: var src, src_b (weight), bias, dst, params
 #[derive(blade_macros::ShaderData)]
 struct LayerNormData {
@@ -518,6 +547,9 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => BinaryData::layout(),
         ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => CausalAttentionData::layout(),
         ShaderEntry::FusedRmsNormMatMul => CausalAttentionData::layout(),
+        ShaderEntry::RoPEDynamic => RoPEDynamicData::layout(),
+        ShaderEntry::CacheWrite => CacheWriteData::layout(),
+        ShaderEntry::CachedAttention => CachedAttentionData::layout(),
     }
 }
 
@@ -1043,6 +1075,45 @@ impl Session {
         }
     }
 
+    /// Read back a graph output by index.
+    ///
+    /// Index 0 is the primary output (logits/loss). Higher indices are
+    /// additional outputs (e.g. KV tensors from prefill).
+    pub fn read_output_by_index(&self, index: usize, out: &mut [f32]) {
+        let buf_ref = self.plan.output_buffers[index];
+        self.read_buffer(buf_ref, out);
+    }
+
+    /// Number of graph outputs.
+    pub fn num_outputs(&self) -> usize {
+        self.plan.output_buffers.len()
+    }
+
+    /// Look up a parameter's buffer reference by name.
+    pub fn param_buffer(&self, name: &str) -> Option<BufferRef> {
+        self.plan
+            .param_buffers
+            .iter()
+            .find(|entry| entry.0 == name)
+            .map(|entry| entry.1)
+    }
+
+    /// Read a parameter buffer's contents by name.
+    pub fn read_param(&self, name: &str, out: &mut [f32]) {
+        let buf_ref = self
+            .param_buffer(name)
+            .unwrap_or_else(|| panic!("unknown param: {}", name));
+        self.read_buffer(buf_ref, out);
+    }
+
+    /// Upload data into a parameter buffer by name (for initializing KV caches etc.).
+    pub fn upload_param(&self, name: &str, data: &[f32]) {
+        let buf_ref = self
+            .param_buffer(name)
+            .unwrap_or_else(|| panic!("unknown param: {}", name));
+        self.upload_buffer(buf_ref, bytemuck::cast_slice(data));
+    }
+
     /// Print GPU pass timings from the last completed step.
     ///
     /// Must be called after `step()` + `wait()`, then another `step()`
@@ -1502,7 +1573,7 @@ impl Session {
                             len: dispatch.params[0],
                             _pad0: dispatch.params[1],
                             _pad1: dispatch.params[2],
-                            _pad2: 0,
+                            _pad2: dispatch.params[3], // pos_offset
                         },
                     },
                 );
@@ -1703,6 +1774,56 @@ impl Session {
                             seq_len: dispatch.params[1],
                             embed_dim: dispatch.params[2],
                             _pad: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::RoPEDynamic => {
+                pc.bind(
+                    0,
+                    &RoPEDynamicData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        pos_offset_buf: buf(dispatch.input_buffers[1]),
+                        params: UnaryParams {
+                            len: dispatch.params[0],
+                            _pad0: dispatch.params[1],
+                            _pad1: dispatch.params[2],
+                            _pad2: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::CacheWrite => {
+                pc.bind(
+                    0,
+                    &CacheWriteData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        kv_pos_buf: buf(dispatch.input_buffers[2]),
+                        params: UnaryParams {
+                            len: dispatch.params[0], // dim
+                            _pad0: 0,
+                            _pad1: 0,
+                            _pad2: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::CachedAttention => {
+                pc.bind(
+                    0,
+                    &CachedAttentionData {
+                        src_a: buf(dispatch.input_buffers[0]),      // Q
+                        src_b: buf(dispatch.input_buffers[1]),      // K cache
+                        bias: buf(dispatch.input_buffers[2]),       // V cache
+                        kv_pos_buf: buf(dispatch.input_buffers[3]), // kv_pos
+                        dst: buf(dispatch.output_buffer),
+                        params: MatMulParams {
+                            m: dispatch.params[0],
+                            n: dispatch.params[1],
+                            k: dispatch.params[2],
+                            _pad: dispatch.params[3],
                         },
                     },
                 );

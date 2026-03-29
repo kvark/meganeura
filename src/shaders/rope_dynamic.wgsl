@@ -1,12 +1,16 @@
+// RoPE with dynamic position offset read from a storage buffer.
+// Same as rope.wgsl but pos_offset comes from a u32 buffer instead of params.
+
 struct Params {
     seq: u32,
     dim: u32,
     theta_bits: u32,
-    pos_offset: u32,
+    _pad: u32,
 }
 
 var<storage> src: array<f32>;
 var<storage, read_write> dst: array<f32>;
+var<storage> pos_offset_buf: array<u32>;
 var<uniform> params: Params;
 
 @compute @workgroup_size(256)
@@ -17,11 +21,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if i >= total { return; }
 
     let row = i / half_dim;
-    let pos = row + params.pos_offset;
+    let pos = row + pos_offset_buf[0];
     let pair_idx = i % half_dim;
     let theta = bitcast<f32>(params.theta_bits);
 
-    // inv_freq = theta ^ (-2 * pair_idx / dim)
     let exponent = -2.0 * f32(pair_idx) / f32(params.dim);
     let inv_freq = pow(theta, exponent);
     let angle = f32(pos) * inv_freq;

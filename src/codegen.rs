@@ -103,6 +103,9 @@ pub enum ShaderGroup {
     ScatterAdd,
     BceLoss,
     FusedRmsNormMatMul,
+    CacheWrite,
+    CachedAttention,
+    RoPEDynamic,
 }
 
 /// Generate a `naga::Module` for a shader group.
@@ -149,6 +152,9 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::FusedRmsNormMatMul => gen_fused_rms_norm_matmul(),
         ShaderGroup::ScatterAdd => gen_scatter_add(),
         ShaderGroup::BceLoss => gen_bce_loss(),
+        ShaderGroup::CacheWrite => gen_cache_write(),
+        ShaderGroup::CachedAttention => gen_cached_attention(),
+        ShaderGroup::RoPEDynamic => gen_rope_dynamic(),
     }
 }
 
@@ -856,6 +862,26 @@ fn gen_cross_attention() -> ShaderModule {
 }
 
 // ---------------------------------------------------------------------------
+// cache_write.wgsl: write [1, dim] into row kv_pos of [max_seq, dim]
+// ---------------------------------------------------------------------------
+
+fn gen_rope_dynamic() -> ShaderModule {
+    parse_wgsl(include_str!("shaders/rope_dynamic.wgsl"))
+}
+
+fn gen_cache_write() -> ShaderModule {
+    parse_wgsl(include_str!("shaders/cache_write.wgsl"))
+}
+
+// ---------------------------------------------------------------------------
+// cached_attention.wgsl: single-token attention with KV cache
+// ---------------------------------------------------------------------------
+
+fn gen_cached_attention() -> ShaderModule {
+    parse_wgsl(include_str!("shaders/cached_attention.wgsl"))
+}
+
+// ---------------------------------------------------------------------------
 // multi_head_attn (forward, saves LSE for backward)
 // Same as gen_attention_parallel(false, true) but with an extra `lse` binding.
 // After normalization, thread 0 writes lse[pos * num_heads + head] = max + log(sum_exp).
@@ -1239,6 +1265,11 @@ mod tests {
                 ShaderEntry::FusedRmsNormMatMul => {
                     vec!["src_a", "src_b", "bias", "dst", "params"]
                 }
+                ShaderEntry::CacheWrite => vec!["src", "dst", "kv_pos_buf", "params"],
+                ShaderEntry::CachedAttention => {
+                    vec!["src_a", "src_b", "bias", "kv_pos_buf", "dst", "params"]
+                }
+                ShaderEntry::RoPEDynamic => vec!["src", "dst", "pos_offset_buf", "params"],
             }
         }
 
@@ -1289,6 +1320,9 @@ mod tests {
             ShaderEntry::AdamUpdate,
             ShaderEntry::ScatterAdd,
             ShaderEntry::BceLoss,
+            ShaderEntry::CacheWrite,
+            ShaderEntry::CachedAttention,
+            ShaderEntry::RoPEDynamic,
         ];
 
         for entry in &entries {
