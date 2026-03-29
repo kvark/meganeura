@@ -24,7 +24,7 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--runs", type=int, default=5)
-    parser.add_argument("--device", default=None, help="cuda / cpu / vulkan")
+    parser.add_argument("--device", default=None, help="cuda / mps / cpu")
     parser.add_argument("--dtype", default="float32", choices=["float32", "float16", "bfloat16"])
     args = parser.parse_args()
 
@@ -35,6 +35,8 @@ def main():
     if args.device is None:
         if torch.cuda.is_available():
             device = "cuda"
+        elif torch.backends.mps.is_available():
+            device = "mps"
         else:
             device = "cpu"
     else:
@@ -48,6 +50,13 @@ def main():
     torch_dtype = dtype_map[args.dtype]
 
     torch.set_float32_matmul_precision("high")
+
+    def gpu_sync():
+        if device == "cuda":
+            torch.cuda.synchronize()
+        elif device == "mps":
+            torch.mps.synchronize()
+
     print(f"device: {device}, dtype: {args.dtype}", file=sys.stderr)
 
     # --- Load model and tokenizer ---
@@ -62,8 +71,7 @@ def main():
 
     # --- Helper: run one generation and return (elapsed_s, tokens_generated, output_ids) ---
     def run_once():
-        if device == "cuda":
-            torch.cuda.synchronize()
+        gpu_sync()
         t0 = time.perf_counter()
         with torch.no_grad():
             out = model.generate(
@@ -72,16 +80,14 @@ def main():
                 do_sample=False,  # greedy
                 pad_token_id=tokenizer.eos_token_id,
             )
-        if device == "cuda":
-            torch.cuda.synchronize()
+        gpu_sync()
         elapsed = time.perf_counter() - t0
         n_gen = out.shape[1] - prompt_len
         return elapsed, n_gen, out[0]
 
     # --- Helper: measure TTFT (time to first token) ---
     def measure_ttft():
-        if device == "cuda":
-            torch.cuda.synchronize()
+        gpu_sync()
         t0 = time.perf_counter()
         with torch.no_grad():
             _ = model.generate(
@@ -90,8 +96,7 @@ def main():
                 do_sample=False,
                 pad_token_id=tokenizer.eos_token_id,
             )
-        if device == "cuda":
-            torch.cuda.synchronize()
+        gpu_sync()
         return time.perf_counter() - t0
 
     # --- Warmup ---
@@ -102,6 +107,8 @@ def main():
     # --- Reset peak memory ---
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
+    elif device == "mps":
+        torch.mps.reset_peak_memory_stats()
 
     # --- Benchmark ---
     print(f"benchmarking ({args.runs} runs, {args.max_tokens} tokens each)...", file=sys.stderr)
@@ -146,6 +153,8 @@ def main():
 
     if device == "cuda":
         result["peak_memory_mb"] = torch.cuda.max_memory_allocated() / (1024 ** 2)
+    elif device == "mps":
+        result["peak_memory_mb"] = torch.mps.current_allocated_memory() / (1024 ** 2)
 
     # --- Decode sample output for verification ---
     _, _, sample_out = run_once()

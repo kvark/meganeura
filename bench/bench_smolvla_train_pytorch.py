@@ -165,7 +165,7 @@ def main():
     parser.add_argument("--vlm-seq-len", type=int, default=16)
     args = parser.parse_args()
 
-    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    device = args.device or ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     dtype_map = {"float32": torch.float32, "float16": torch.float16,
                  "bfloat16": torch.bfloat16}
     dtype = dtype_map[args.dtype]
