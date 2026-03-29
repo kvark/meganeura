@@ -35,8 +35,9 @@ pub mod train;
 pub use data::{DataLoader, MnistDataset};
 pub use graph::{DType, Graph, NodeId, TensorType};
 pub use optimize::OptimizeReport;
-pub use runtime::Session;
+pub use runtime::{MemorySummary, Session};
 pub use train::{
-    EpochStats, Optimizer, TrainConfig, TrainHistory, Trainer, build_inference_session,
-    build_session, build_session_cached, build_session_with_report, compile_training_graph,
+    EpochStats, LossHistory, MetricCallback, Optimizer, StepMetrics, TrainConfig, TrainHistory,
+    Trainer, build_inference_session, build_session, build_session_cached,
+    build_session_with_report, compile_training_graph,
 };

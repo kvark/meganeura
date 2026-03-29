@@ -349,11 +349,29 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::SwiGLUConcatGrad
             | Op::RmsNormGradW { .. }
             | Op::RmsNormGradX { .. } => {}
+            Op::Gelu => {
+                // gelu(x) ≈ x * sigmoid(1.702 * x) (sigmoid approximation)
+                // gelu'(x) ≈ sigmoid(1.702x) * (1 + 1.702*x*(1 - sigmoid(1.702x)))
+                let x = node.inputs[0];
+                let x_shape = &forward.nodes()[x as usize].ty.shape;
+                let n = x_shape.iter().product();
+                let k_const = graph.constant(vec![1.702; n], x_shape);
+                let kx = graph.mul(k_const, x);
+                let sig_kx = graph.sigmoid(kx);
+                let ones = graph.constant(vec![1.0; n], x_shape);
+                let neg_sig = graph.neg(sig_kx);
+                let one_minus_sig = graph.add(ones, neg_sig);
+                let inner = graph.mul(kx, one_minus_sig);
+                let ones2 = graph.constant(vec![1.0; n], x_shape);
+                let bracket = graph.add(ones2, inner);
+                let dgelu = graph.mul(sig_kx, bracket);
+                let grad_x = graph.mul(grad_output, dgelu);
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
             // Inference-only ops: should not appear in training graphs
             Op::Embedding
             | Op::RoPE { .. }
             | Op::CausalAttention { .. }
-            | Op::Gelu
             | Op::LayerNorm { .. }
             | Op::FullAttention { .. }
             | Op::CrossAttention { .. } => {

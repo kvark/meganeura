@@ -73,6 +73,32 @@ impl Default for TrainConfig {
     }
 }
 
+/// Per-step training metrics passed to [`MetricCallback::on_step`].
+#[derive(Clone, Debug)]
+pub struct StepMetrics {
+    pub epoch: usize,
+    pub step: usize,
+    pub loss: f32,
+}
+
+/// Callback for training events.
+pub trait MetricCallback {
+    fn on_step(&mut self, _metrics: &StepMetrics) {}
+    fn on_epoch(&mut self, _stats: &EpochStats) {}
+}
+
+/// Collects per-step loss values for later analysis or plotting.
+#[derive(Default)]
+pub struct LossHistory {
+    pub losses: Vec<f32>,
+}
+
+impl MetricCallback for LossHistory {
+    fn on_step(&mut self, m: &StepMetrics) {
+        self.losses.push(m.loss);
+    }
+}
+
 /// Per-epoch training statistics.
 #[derive(Clone, Debug)]
 pub struct EpochStats {

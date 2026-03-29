@@ -3,6 +3,28 @@ use std::collections::{HashMap, HashSet};
 
 type Gpu = blade_graphics::Context;
 
+/// Summary of GPU memory allocation for a session.
+#[derive(Clone, Debug)]
+pub struct MemorySummary {
+    pub total_buffer_bytes: usize,
+    pub adam_state_bytes: usize,
+    pub num_buffers: usize,
+    pub largest_buffer_bytes: usize,
+}
+
+impl std::fmt::Display for MemorySummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} buffers, {:.1} MB total ({:.1} MB adam state), largest {:.1} MB",
+            self.num_buffers,
+            self.total_buffer_bytes as f64 / 1e6,
+            self.adam_state_bytes as f64 / 1e6,
+            self.largest_buffer_bytes as f64 / 1e6,
+        )
+    }
+}
+
 fn ceil_div(a: u32, b: u32) -> u32 {
     a.div_ceil(b)
 }
@@ -1683,6 +1705,23 @@ impl Session {
     /// Analogous to [`set_learning_rate`](Self::set_learning_rate) for SGD.
     pub fn set_adam(&mut self, lr: f32, beta1: f32, beta2: f32, eps: f32) {
         self.pending_adam = Some((lr, beta1, beta2, eps));
+    }
+
+    pub fn memory_summary(&self) -> MemorySummary {
+        let total: usize = self.plan.buffers.iter().sum();
+        let largest = self.plan.buffers.iter().copied().max().unwrap_or(0);
+        let adam_bytes: usize = self
+            .plan
+            .param_grad_pairs
+            .iter()
+            .map(|&(p, _)| self.plan.buffers[p.0 as usize] * 2)
+            .sum();
+        MemorySummary {
+            total_buffer_bytes: total,
+            adam_state_bytes: adam_bytes,
+            num_buffers: self.plan.buffers.len(),
+            largest_buffer_bytes: largest,
+        }
     }
 
     pub fn plan(&self) -> &ExecutionPlan {
