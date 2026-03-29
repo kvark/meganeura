@@ -65,6 +65,7 @@ pub enum ShaderEntry {
     Conv2d,
     Conv2dGemm,
     Conv2dGradInput,
+    Conv2dGradInputGemm,
     Conv2dGradWeight,
     CacheWrite,
     CachedAttention,
@@ -128,6 +129,7 @@ impl ShaderEntry {
             ShaderEntry::Conv2d => ShaderGroup::Conv2d,
             ShaderEntry::Conv2dGemm => ShaderGroup::Conv2dGemm,
             ShaderEntry::Conv2dGradInput => ShaderGroup::Conv2dGradInput,
+            ShaderEntry::Conv2dGradInputGemm => ShaderGroup::Conv2dGradInputGemm,
             ShaderEntry::Conv2dGradWeight => ShaderGroup::Conv2dGradWeight,
             ShaderEntry::CacheWrite => ShaderGroup::CacheWrite,
             ShaderEntry::CachedAttention => ShaderGroup::CachedAttention,
@@ -196,6 +198,7 @@ impl ShaderEntry {
             ShaderEntry::Conv2d => "main",
             ShaderEntry::Conv2dGemm => "main",
             ShaderEntry::Conv2dGradInput => "main",
+            ShaderEntry::Conv2dGradInputGemm => "main",
             ShaderEntry::Conv2dGradWeight => "main",
             ShaderEntry::CacheWrite => "main",
             ShaderEntry::CachedAttention => "main",
@@ -1208,9 +1211,11 @@ impl<'a> Compiler<'a> {
                 let out_w = (in_w + 2 * padding - kernel_w) / stride + 1;
                 let out_size = node.ty.shape[0] as u32;
                 let batch = out_size / (in_channels * in_h * in_w);
+                // Use implicit GEMM: grad_input = weight_T @ im2col(grad_out)^T
+                // M=Ci, N=H*W, K=Co*kH*kW, batched in z dimension
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Conv2dGradInput,
-                    workgroups: [ceil_div(in_w, 16), ceil_div(in_h, 16), batch * in_channels],
+                    shader: ShaderEntry::Conv2dGradInputGemm,
+                    workgroups: [ceil_div(in_h * in_w, 64), ceil_div(in_channels, 64), batch],
                     input_buffers: vec![grad_out, kernel],
                     output_buffer: out_buf,
                     extra_output: None,

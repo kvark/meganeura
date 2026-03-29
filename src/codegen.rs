@@ -112,6 +112,7 @@ pub enum ShaderGroup {
     Conv2d,
     Conv2dGemm,
     Conv2dGradInput,
+    Conv2dGradInputGemm,
     Conv2dGradWeight,
     CacheWrite,
     CachedAttention,
@@ -171,6 +172,7 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::Conv2d => gen_conv2d(),
         ShaderGroup::Conv2dGemm => gen_conv2d_gemm(),
         ShaderGroup::Conv2dGradInput => gen_conv2d_grad_input(),
+        ShaderGroup::Conv2dGradInputGemm => gen_conv2d_grad_input_gemm(),
         ShaderGroup::Conv2dGradWeight => gen_conv2d_grad_weight(),
         ShaderGroup::CacheWrite => gen_cache_write(),
         ShaderGroup::CachedAttention => gen_cached_attention(),
@@ -962,6 +964,14 @@ fn gen_conv2d_grad_input() -> ShaderModule {
 }
 
 // ---------------------------------------------------------------------------
+// conv2d_grad_input_gemm.wgsl — Conv2d backward w.r.t. input via implicit GEMM
+// ---------------------------------------------------------------------------
+
+fn gen_conv2d_grad_input_gemm() -> ShaderModule {
+    parse_wgsl(include_str!("shaders/conv2d_grad_input_gemm.wgsl"))
+}
+
+// ---------------------------------------------------------------------------
 // conv2d_grad_weight.wgsl — Conv2d backward w.r.t. kernel weights
 // ---------------------------------------------------------------------------
 
@@ -1382,6 +1392,7 @@ mod tests {
                 ShaderEntry::Conv2d => vec!["src", "weight", "dst", "params"],
                 ShaderEntry::Conv2dGemm => vec!["src", "weight", "dst", "params"],
                 ShaderEntry::Conv2dGradInput => vec!["grad_out", "weight", "dst", "params"],
+                ShaderEntry::Conv2dGradInputGemm => vec!["grad_out", "weight", "dst", "params"],
                 ShaderEntry::Conv2dGradWeight => vec!["grad_out", "src", "dst", "params"],
                 ShaderEntry::RoPEDynamic => vec!["src", "dst", "pos_offset_buf", "params"],
             }
@@ -1445,6 +1456,7 @@ mod tests {
             ShaderEntry::Conv2d,
             ShaderEntry::Conv2dGemm,
             ShaderEntry::Conv2dGradInput,
+            ShaderEntry::Conv2dGradInputGemm,
             ShaderEntry::Conv2dGradWeight,
             ShaderEntry::CacheWrite,
             ShaderEntry::CachedAttention,
