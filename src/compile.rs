@@ -1247,11 +1247,7 @@ impl<'a> Compiler<'a> {
                 let batch = out_size / (out_channels * out_h * out_w);
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::Conv2dGradWeight,
-                    workgroups: [
-                        ceil_div(in_channels * kernel_w, 16),
-                        ceil_div(kernel_h, 16),
-                        out_channels,
-                    ],
+                    workgroups: [in_channels * kernel_w, kernel_h, out_channels],
                     input_buffers: vec![grad_out, input],
                     output_buffer: out_buf,
                     extra_output: None,
