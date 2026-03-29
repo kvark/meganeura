@@ -90,6 +90,7 @@ pub enum Op {
 
     // Loss
     CrossEntropyLoss,
+    BceLoss,
 
     // Comparison (for autodiff)
     Greater,
@@ -919,6 +920,18 @@ impl Graph {
         assert_eq!(l_shape, t_shape, "logits and labels must match");
         let ty = TensorType::f32(vec![1]);
         self.add_node(Op::CrossEntropyLoss, vec![logits, labels], ty)
+    }
+
+    /// Binary cross-entropy loss: `-mean(t*log(p) + (1-t)*log(1-p))`.
+    ///
+    /// `pred` should be in (0, 1) (e.g. after sigmoid).
+    /// Both `pred` and `labels` must have the same shape; output is scalar `[1]`.
+    pub fn bce_loss(&mut self, pred: NodeId, labels: NodeId) -> NodeId {
+        let p_shape = &self.node(pred).ty.shape;
+        let l_shape = &self.node(labels).ty.shape;
+        assert_eq!(p_shape, l_shape, "pred and labels must match");
+        let ty = TensorType::f32(vec![1]);
+        self.add_node(Op::BceLoss, vec![pred, labels], ty)
     }
 }
 

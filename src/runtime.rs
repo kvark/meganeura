@@ -260,6 +260,16 @@ struct CrossEntropyData {
     params: SoftmaxParams,
 }
 
+// bce: var pred, labels, grad_out, loss_out, params
+#[derive(blade_macros::ShaderData)]
+struct BceData {
+    pred: blade_graphics::BufferPiece,
+    labels: blade_graphics::BufferPiece,
+    grad_out: blade_graphics::BufferPiece,
+    loss_out: blade_graphics::BufferPiece,
+    params: UnaryParams, // len, _pad x3
+}
+
 // transpose: var src, dst, params
 #[derive(blade_macros::ShaderData)]
 struct TransposeData {
@@ -360,13 +370,18 @@ impl Pipelines {
             }
         }
 
-        // Always compile SgdUpdate if the plan has trainable parameters.
+        // Always compile SGD and Adam if the plan has trainable parameters.
         if !plan.param_grad_pairs.is_empty() {
             needed.insert(ShaderGroup::Sgd);
             entries_for_group
                 .entry(ShaderGroup::Sgd)
                 .or_default()
                 .insert(ShaderEntry::SgdUpdate);
+            needed.insert(ShaderGroup::Adam);
+            entries_for_group
+                .entry(ShaderGroup::Adam)
+                .or_default()
+                .insert(ShaderEntry::AdamUpdate);
         }
 
         let mut map = HashMap::new();
@@ -462,6 +477,7 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::SumAll | ShaderEntry::MeanAll | ShaderEntry::SumRows => UnaryData::layout(),
         ShaderEntry::Softmax => SoftmaxData::layout(),
         ShaderEntry::CrossEntropyLoss => CrossEntropyData::layout(),
+        ShaderEntry::BceLoss => BceData::layout(),
         ShaderEntry::Transpose => TransposeData::layout(),
         ShaderEntry::RmsNorm => RmsNormData::layout(),
         ShaderEntry::Embedding => EmbeddingData::layout(),
@@ -1365,6 +1381,23 @@ impl Session {
                     },
                 );
             }
+            ShaderEntry::BceLoss => {
+                pc.bind(
+                    0,
+                    &BceData {
+                        pred: buf(dispatch.input_buffers[0]),
+                        labels: buf(dispatch.input_buffers[1]),
+                        grad_out: buf(dispatch.output_buffer),
+                        loss_out: buf(dispatch.output_buffer),
+                        params: UnaryParams {
+                            len: dispatch.params[0],
+                            _pad0: 0,
+                            _pad1: 0,
+                            _pad2: 0,
+                        },
+                    },
+                );
+            }
             ShaderEntry::Transpose => {
                 pc.bind(
                     0,
@@ -1779,6 +1812,138 @@ impl Session {
     /// GPU device and driver name.
     pub fn device_information(&self) -> &blade_graphics::DeviceInformation {
         self.gpu.device_information()
+    }
+
+    /// Save a training checkpoint (parameters + Adam state) to a safetensors file.
+    ///
+    /// Saves all parameter values, Adam first/second moment buffers (if any),
+    /// and the Adam step counter as metadata.
+    #[allow(clippy::pattern_type_mismatch)]
+    pub fn save_checkpoint(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        use safetensors::tensor::{Dtype, TensorView};
+
+        self.wait();
+        let mut owned_data: Vec<(String, Vec<u8>)> = Vec::new();
+
+        // Collect parameter data
+        for (name, buf_ref) in &self.plan.param_buffers {
+            let byte_len = self.plan.buffers[buf_ref.0 as usize];
+            let mut data = vec![0u8; byte_len];
+            unsafe {
+                let ptr = self.buffers[buf_ref.0 as usize].data() as *const u8;
+                std::ptr::copy_nonoverlapping(ptr, data.as_mut_ptr(), byte_len);
+            }
+            owned_data.push((name.clone(), data));
+        }
+
+        // Collect Adam moment buffers (parallel to param_grad_pairs)
+        for (idx, &(param_buf, _)) in self.plan.param_grad_pairs.iter().enumerate() {
+            if idx >= self.adam_state.len() {
+                break;
+            }
+            let name = self
+                .plan
+                .param_buffers
+                .iter()
+                .find(|(_, br)| *br == param_buf)
+                .map(|(n, _)| n.clone())
+                .unwrap_or_else(|| format!("param_{}", param_buf.0));
+            let byte_len = self.plan.buffers[param_buf.0 as usize];
+            for (suffix, buf) in [
+                ("adam_m", &self.adam_state[idx].0),
+                ("adam_v", &self.adam_state[idx].1),
+            ] {
+                let key = format!("{suffix}.{name}");
+                let mut data = vec![0u8; byte_len];
+                unsafe {
+                    let ptr = buf.data() as *const u8;
+                    std::ptr::copy_nonoverlapping(ptr, data.as_mut_ptr(), byte_len);
+                }
+                owned_data.push((key, data));
+            }
+        }
+
+        // Build tensor views
+        let views: Vec<(String, TensorView<'_>)> = owned_data
+            .iter()
+            .map(|(name, data)| {
+                let float_len = data.len() / 4;
+                (
+                    name.clone(),
+                    TensorView::new(Dtype::F32, vec![float_len], data).expect("tensor view"),
+                )
+            })
+            .collect();
+
+        // Metadata
+        let mut metadata = HashMap::new();
+        metadata.insert("adam_step".to_string(), self.adam_step.to_string());
+
+        let buf = safetensors::tensor::serialize(views, &Some(metadata))
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        std::fs::write(path, buf)
+    }
+
+    /// Load a training checkpoint from a safetensors file.
+    ///
+    /// Restores parameter values and Adam optimizer state. The session must
+    /// have been created from the same graph (same parameter names/sizes).
+    #[allow(clippy::pattern_type_mismatch)]
+    pub fn load_checkpoint(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        let file_data = std::fs::read(path)?;
+        let (header_size, metadata) = safetensors::SafeTensors::read_metadata(&file_data)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        let st = safetensors::SafeTensors::deserialize(&file_data)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        let _ = header_size;
+
+        // Restore parameters
+        for (name, buf_ref) in &self.plan.param_buffers {
+            if let Ok(tensor) = st.tensor(name) {
+                self.upload_buffer(*buf_ref, tensor.data());
+            } else {
+                log::warn!("checkpoint missing parameter: {name}");
+            }
+        }
+
+        // Restore Adam moment buffers
+        for (idx, &(param_buf, _)) in self.plan.param_grad_pairs.iter().enumerate() {
+            if idx >= self.adam_state.len() {
+                break;
+            }
+            let name = self
+                .plan
+                .param_buffers
+                .iter()
+                .find(|(_, br)| *br == param_buf)
+                .map(|(n, _)| n.as_str())
+                .unwrap_or("");
+            for (suffix, buf) in [
+                ("adam_m", &self.adam_state[idx].0),
+                ("adam_v", &self.adam_state[idx].1),
+            ] {
+                let key = format!("{suffix}.{name}");
+                if let Ok(tensor) = st.tensor(&key) {
+                    unsafe {
+                        let ptr = buf.data();
+                        std::ptr::copy_nonoverlapping(
+                            tensor.data().as_ptr(),
+                            ptr,
+                            tensor.data().len(),
+                        );
+                    }
+                }
+            }
+        }
+
+        // Restore adam_step from metadata
+        if let Some(ref meta) = *metadata.metadata() {
+            if let Some(step_str) = meta.get("adam_step") {
+                self.adam_step = step_str.parse::<u32>().unwrap_or(0);
+            }
+        }
+
+        Ok(())
     }
 }
 

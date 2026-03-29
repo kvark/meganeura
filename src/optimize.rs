@@ -247,6 +247,7 @@ fn graph_to_egglog(graph: &Graph) -> String {
   (MeanAll Op)
   (SumRows Op)
   (CrossEntropyLoss Op Op)
+  (BceLoss Op Op)
   (Greater Op Op)
   ; --- Transformer forward ---
   (SwiGLU Op Op)
@@ -356,6 +357,7 @@ fn node_to_egglog_expr(node: &Node) -> String {
         Op::MeanAll => format!("(MeanAll n{})", i[0]),
         Op::SumRows => format!("(SumRows n{})", i[0]),
         Op::CrossEntropyLoss => format!("(CrossEntropyLoss n{} n{})", i[0], i[1]),
+        Op::BceLoss => format!("(BceLoss n{} n{})", i[0], i[1]),
         Op::Greater => format!("(Greater n{} n{})", i[0], i[1]),
         Op::Silu => format!("(Silu n{})", i[0]),
         Op::SwiGLU => format!("(SwiGLU n{} n{})", i[0], i[1]),

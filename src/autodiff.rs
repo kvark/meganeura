@@ -107,6 +107,27 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 accumulate_grad(&mut graph, &mut grads, logits, grad_logits);
                 // No gradient for labels (they're targets)
             }
+            Op::BceLoss => {
+                // BCE gradient is computed by the shader and written to grad_out.
+                // dL/dpred = (pred - labels) / (pred * (1-pred) * N)
+                // For the graph-level autodiff, approximate:
+                let pred = node.inputs[0];
+                let labels = node.inputs[1];
+                let pred_shape = &forward.nodes()[pred as usize].ty.shape;
+                let n = pred_shape.iter().product::<usize>();
+                let neg_labels = graph.neg(labels);
+                let diff = graph.add(pred, neg_labels);
+                // pred * (1 - pred): compute the denominator
+                let ones = graph.constant(vec![1.0; n], pred_shape);
+                let neg_pred = graph.neg(pred);
+                let one_minus_pred = graph.add(ones, neg_pred);
+                let denom = graph.mul(pred, one_minus_pred);
+                let recip_denom = graph.recip(denom);
+                let inv_n = graph.constant(vec![1.0 / n as f32; n], pred_shape);
+                let grad_pred = graph.mul(diff, recip_denom);
+                let grad_pred = graph.mul(grad_pred, inv_n);
+                accumulate_grad(&mut graph, &mut grads, pred, grad_pred);
+            }
             Op::SumAll => {
                 // dL/dx = dL/dy broadcast to shape of x
                 // Since grad_output is scalar [1] and we need [shape of x],

@@ -743,3 +743,101 @@ fn mse_loss_training() {
         loss1
     );
 }
+
+#[test]
+fn bce_loss_forward() {
+    let n = 4;
+    let mut g = Graph::new();
+    let pred = g.input("pred", &[1, n]);
+    let labels = g.input("labels", &[1, n]);
+    let loss = g.bce_loss(pred, labels);
+    g.set_outputs(vec![loss]);
+
+    let mut session = build_inference_session(&g);
+    session.set_input("pred", &[0.9, 0.1, 0.8, 0.2]);
+    session.set_input("labels", &[1.0, 0.0, 1.0, 0.0]);
+
+    session.step();
+    session.wait();
+
+    let loss_val = session.read_output(1)[0];
+    assert!(
+        loss_val.is_finite() && loss_val > 0.0,
+        "BCE loss should be finite and positive, got {}",
+        loss_val
+    );
+    // Expected ≈ 0.164 for these well-calibrated predictions
+    assert!(
+        (loss_val - 0.164).abs() < 0.05,
+        "BCE loss expected ~0.164, got {}",
+        loss_val
+    );
+}
+
+#[test]
+fn checkpoint_round_trip() {
+    let mut g = Graph::new();
+    let x = g.input("x", &[4, 8]);
+    let w = g.parameter("w", &[8, 4]);
+    let y = g.matmul(x, w);
+    let loss = g.mean_all(y);
+    g.set_outputs(vec![loss]);
+
+    let mut session = build_session(&g);
+    session.set_parameter("w", &vec![0.1_f32; 8 * 4]);
+    session.set_input("x", &vec![1.0_f32; 4 * 8]);
+
+    // Train 3 steps with Adam
+    for _ in 0..3 {
+        session.set_input("x", &vec![1.0_f32; 4 * 8]);
+        session.adam_step(0.01, 0.9, 0.999, 1e-8);
+        session.step();
+        session.wait();
+    }
+    let loss_before = session.read_loss();
+
+    // Save checkpoint
+    let tmp = std::env::temp_dir().join("meganeura_test_ckpt.safetensors");
+    session.save_checkpoint(&tmp).expect("save checkpoint");
+
+    // Read back parameter
+    let w_buf = session
+        .plan()
+        .param_buffers
+        .iter()
+        .find(|(n, _)| n == "w")
+        .unwrap()
+        .1;
+    let mut w_saved = vec![0.0f32; 32];
+    session.read_buffer(w_buf, &mut w_saved);
+
+    // Fresh session, load checkpoint
+    let mut session2 = build_session(&g);
+    session2.load_checkpoint(&tmp).expect("load checkpoint");
+
+    let mut w_loaded = vec![0.0f32; 32];
+    session2.read_buffer(w_buf, &mut w_loaded);
+    for i in 0..32 {
+        assert!(
+            (w_saved[i] - w_loaded[i]).abs() < 1e-6,
+            "w[{}]: saved={} loaded={}",
+            i,
+            w_saved[i],
+            w_loaded[i]
+        );
+    }
+
+    // Same loss after restore
+    session2.set_input("x", &vec![1.0_f32; 4 * 8]);
+    session2.step();
+    session2.wait();
+    let loss_after = session2.read_loss();
+    assert!(
+        (loss_before - loss_after).abs() < 1e-4,
+        "loss mismatch: {} vs {}",
+        loss_before,
+        loss_after
+    );
+
+    std::fs::remove_file(&tmp).ok();
+}

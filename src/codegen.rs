@@ -82,6 +82,7 @@ pub enum ShaderGroup {
     SumRows,
     RmsNormGrad,
     ScatterAdd,
+    BceLoss,
     FusedRmsNormMatMul,
 }
 
@@ -128,6 +129,7 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::RmsNormGrad => gen_rms_norm_grad(),
         ShaderGroup::FusedRmsNormMatMul => gen_fused_rms_norm_matmul(),
         ShaderGroup::ScatterAdd => gen_scatter_add(),
+        ShaderGroup::BceLoss => gen_bce_loss(),
     }
 }
 
@@ -218,6 +220,14 @@ fn gen_adam() -> ShaderModule {
 
 fn gen_scatter_add() -> ShaderModule {
     parse_wgsl(include_str!("shaders/scatter_add.wgsl"))
+}
+
+// ---------------------------------------------------------------------------
+// bce.wgsl — binary cross-entropy loss with gradient
+// ---------------------------------------------------------------------------
+
+fn gen_bce_loss() -> ShaderModule {
+    parse_wgsl(include_str!("shaders/bce.wgsl"))
 }
 
 // ---------------------------------------------------------------------------
@@ -892,6 +902,12 @@ mod tests {
             ),
             (ShaderGroup::SumRows, naga::valid::Capabilities::empty()),
             (ShaderGroup::RmsNormGrad, naga::valid::Capabilities::empty()),
+            (ShaderGroup::ScatterAdd, naga::valid::Capabilities::empty()),
+            (ShaderGroup::BceLoss, naga::valid::Capabilities::empty()),
+            (
+                ShaderGroup::FusedRmsNormMatMul,
+                naga::valid::Capabilities::empty(),
+            ),
         ];
 
         let flags = naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
@@ -1002,6 +1018,9 @@ mod tests {
             (ShaderGroup::SwiGLUConcat, empty),
             (ShaderGroup::SumRows, empty),
             (ShaderGroup::RmsNormGrad, empty),
+            (ShaderGroup::ScatterAdd, empty),
+            (ShaderGroup::BceLoss, empty),
+            (ShaderGroup::FusedRmsNormMatMul, empty),
         ];
 
         let flags = naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
@@ -1105,6 +1124,7 @@ mod tests {
                 ShaderEntry::SgdUpdate => vec!["param", "grad", "dst", "params"],
                 ShaderEntry::AdamUpdate => vec!["param", "grad", "m", "v", "params"],
                 ShaderEntry::ScatterAdd => vec!["indices", "src", "dst", "params"],
+                ShaderEntry::BceLoss => vec!["pred", "labels", "grad_out", "loss_out", "params"],
                 ShaderEntry::Softmax => vec!["src", "dst", "params"],
                 ShaderEntry::CrossEntropyLoss => {
                     vec!["logits", "labels", "grad_out", "loss_out", "params"]
@@ -1188,6 +1208,7 @@ mod tests {
             ShaderEntry::FusedRmsNormMatMul,
             ShaderEntry::AdamUpdate,
             ShaderEntry::ScatterAdd,
+            ShaderEntry::BceLoss,
         ];
 
         for entry in &entries {

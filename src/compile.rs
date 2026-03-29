@@ -29,6 +29,7 @@ pub enum ShaderEntry {
     MeanAll,
     Softmax,
     CrossEntropyLoss,
+    BceLoss,
     Transpose,
     Silu,
     SwiGLU,
@@ -79,6 +80,7 @@ impl ShaderEntry {
             ShaderEntry::SumAll | ShaderEntry::MeanAll => ShaderGroup::Reduce,
             ShaderEntry::Softmax => ShaderGroup::Softmax,
             ShaderEntry::CrossEntropyLoss => ShaderGroup::CrossEntropy,
+            ShaderEntry::BceLoss => ShaderGroup::BceLoss,
             ShaderEntry::Transpose => ShaderGroup::Transpose,
             ShaderEntry::Silu => ShaderGroup::Unary,
             ShaderEntry::SwiGLU => ShaderGroup::Binary,
@@ -118,6 +120,7 @@ impl ShaderEntry {
             | ShaderEntry::ScatterAdd
             | ShaderEntry::Softmax
             | ShaderEntry::CrossEntropyLoss
+            | ShaderEntry::BceLoss
             | ShaderEntry::Transpose => "main",
             ShaderEntry::Relu => "relu",
             ShaderEntry::Sigmoid => "sigmoid",
@@ -666,6 +669,23 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![batch, features, 0, 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    label: String::new(),
+                });
+            }
+
+            Op::BceLoss => {
+                let pred = self.get_buffer(node.inputs[0]);
+                let labels = self.get_buffer(node.inputs[1]);
+                let len = self.graph.node(node.inputs[0]).ty.num_elements() as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::BceLoss,
+                    workgroups: [1, 1, 1],
+                    input_buffers: vec![pred, labels],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![len, 0, 0, 0],
                     use_coop: false,
                     use_small_tiles: false,
                     label: String::new(),
@@ -1437,6 +1457,7 @@ mod tests {
             ShaderEntry::SumRows,
             ShaderEntry::Softmax,
             ShaderEntry::CrossEntropyLoss,
+            ShaderEntry::BceLoss,
             ShaderEntry::Transpose,
             ShaderEntry::SwiGLUGradGate,
             ShaderEntry::SwiGLUGradUp,
