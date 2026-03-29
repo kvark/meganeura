@@ -650,6 +650,7 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::SplitA | ShaderEntry::SplitB => UnaryData::layout(),
         ShaderEntry::Upsample2x | ShaderEntry::Upsample2xGrad => UnaryData::layout(),
         ShaderEntry::Conv2d => Conv2dData::layout(),
+        ShaderEntry::Conv2dGemm => Conv2dData::layout(),
         ShaderEntry::Conv2dGradInput => Conv2dGradInputData::layout(),
         ShaderEntry::Conv2dGradWeight => Conv2dGradWeightData::layout(),
         ShaderEntry::RoPEDynamic => RoPEDynamicData::layout(),
@@ -2005,7 +2006,7 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::Conv2d => {
+            ShaderEntry::Conv2d | ShaderEntry::Conv2dGemm => {
                 let p = &dispatch.params;
                 pc.bind(
                     0,

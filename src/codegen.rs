@@ -110,6 +110,7 @@ pub enum ShaderGroup {
     Upsample,
     UpsampleGrad,
     Conv2d,
+    Conv2dGemm,
     Conv2dGradInput,
     Conv2dGradWeight,
     CacheWrite,
@@ -168,6 +169,7 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::Upsample => gen_upsample(),
         ShaderGroup::UpsampleGrad => gen_upsample_grad(),
         ShaderGroup::Conv2d => gen_conv2d(),
+        ShaderGroup::Conv2dGemm => gen_conv2d_gemm(),
         ShaderGroup::Conv2dGradInput => gen_conv2d_grad_input(),
         ShaderGroup::Conv2dGradWeight => gen_conv2d_grad_weight(),
         ShaderGroup::CacheWrite => gen_cache_write(),
@@ -944,6 +946,14 @@ fn gen_conv2d() -> ShaderModule {
 }
 
 // ---------------------------------------------------------------------------
+// conv2d_gemm.wgsl — Conv2d forward via implicit GEMM
+// ---------------------------------------------------------------------------
+
+fn gen_conv2d_gemm() -> ShaderModule {
+    parse_wgsl(include_str!("shaders/conv2d_gemm.wgsl"))
+}
+
+// ---------------------------------------------------------------------------
 // conv2d_grad_input.wgsl — Conv2d backward w.r.t. input
 // ---------------------------------------------------------------------------
 
@@ -1370,6 +1380,7 @@ mod tests {
                     vec!["src", "dst", "params"]
                 }
                 ShaderEntry::Conv2d => vec!["src", "weight", "dst", "params"],
+                ShaderEntry::Conv2dGemm => vec!["src", "weight", "dst", "params"],
                 ShaderEntry::Conv2dGradInput => vec!["grad_out", "weight", "dst", "params"],
                 ShaderEntry::Conv2dGradWeight => vec!["grad_out", "src", "dst", "params"],
                 ShaderEntry::RoPEDynamic => vec!["src", "dst", "pos_offset_buf", "params"],
@@ -1432,6 +1443,7 @@ mod tests {
             ShaderEntry::Upsample2x,
             ShaderEntry::Upsample2xGrad,
             ShaderEntry::Conv2d,
+            ShaderEntry::Conv2dGemm,
             ShaderEntry::Conv2dGradInput,
             ShaderEntry::Conv2dGradWeight,
             ShaderEntry::CacheWrite,

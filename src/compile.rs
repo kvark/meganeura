@@ -63,6 +63,7 @@ pub enum ShaderEntry {
     Upsample2x,
     Upsample2xGrad,
     Conv2d,
+    Conv2dGemm,
     Conv2dGradInput,
     Conv2dGradWeight,
     CacheWrite,
@@ -125,6 +126,7 @@ impl ShaderEntry {
             ShaderEntry::Upsample2x => ShaderGroup::Upsample,
             ShaderEntry::Upsample2xGrad => ShaderGroup::UpsampleGrad,
             ShaderEntry::Conv2d => ShaderGroup::Conv2d,
+            ShaderEntry::Conv2dGemm => ShaderGroup::Conv2dGemm,
             ShaderEntry::Conv2dGradInput => ShaderGroup::Conv2dGradInput,
             ShaderEntry::Conv2dGradWeight => ShaderGroup::Conv2dGradWeight,
             ShaderEntry::CacheWrite => ShaderGroup::CacheWrite,
@@ -192,6 +194,7 @@ impl ShaderEntry {
             ShaderEntry::Upsample2x => "main",
             ShaderEntry::Upsample2xGrad => "main",
             ShaderEntry::Conv2d => "main",
+            ShaderEntry::Conv2dGemm => "main",
             ShaderEntry::Conv2dGradInput => "main",
             ShaderEntry::Conv2dGradWeight => "main",
             ShaderEntry::CacheWrite => "main",
@@ -1157,12 +1160,14 @@ impl<'a> Compiler<'a> {
                 let out_h = (in_h + 2 * padding - kernel_h) / stride + 1;
                 let out_w = (in_w + 2 * padding - kernel_w) / stride + 1;
                 let batch = in_shape[0] as u32 / (in_channels * in_h * in_w);
+                // Use implicit GEMM: output = weight @ im2col(input)^T
+                // M=Co, N=oH*oW, K=Ci*kH*kW, batched in z dimension
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Conv2d,
+                    shader: ShaderEntry::Conv2dGemm,
                     workgroups: [
-                        ceil_div(out_w, 16),
-                        ceil_div(out_h, 16),
-                        batch * out_channels,
+                        ceil_div(out_h * out_w, 64),
+                        ceil_div(out_channels, 64),
+                        batch,
                     ],
                     input_buffers: vec![input, kernel],
                     output_buffer: out_buf,
