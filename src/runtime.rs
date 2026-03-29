@@ -737,6 +737,8 @@ pub struct Session {
     /// Pre-computed barrier groups: each range of dispatch indices shares one
     /// compute pass. Pass boundaries in blade emit ALL_COMMANDS barriers.
     groups: Vec<std::ops::Range<usize>>,
+    /// Pre-computed pass names for each barrier group (avoids per-step allocation).
+    group_names: Vec<String>,
     encoder: blade_graphics::CommandEncoder,
     sync_point: Option<blade_graphics::SyncPoint>,
     /// Nanosecond offset (in profiler time) of the most recent GPU submit,
@@ -976,6 +978,22 @@ impl Session {
         // projections) cluster together, then partition into barrier groups.
         reorder_by_level(&mut plan.dispatches);
         let groups = compute_groups(&plan.dispatches);
+        let group_names: Vec<String> = groups
+            .iter()
+            .map(|group| {
+                if group.len() <= 2 {
+                    plan.dispatches[group.clone()]
+                        .iter()
+                        .map(|d| d.label.as_str())
+                        .collect::<Vec<_>>()
+                        .join("+")
+                } else {
+                    let first = &plan.dispatches[group.start].label;
+                    let last = &plan.dispatches[group.end - 1].label;
+                    format!("{}..{}", first, last)
+                }
+            })
+            .collect();
         log::info!(
             "{} dispatches → {} barrier groups",
             plan.dispatches.len(),
@@ -1041,6 +1059,7 @@ impl Session {
             pipelines,
             plan,
             groups,
+            group_names,
             encoder,
             sync_point: None,
             last_submit_ns: 0,
@@ -1296,19 +1315,7 @@ impl Session {
             // N barriers — far fewer than one per dispatch.
             for gi in 0..self.groups.len() {
                 let group = self.groups[gi].clone();
-                // Name the pass after its first + last dispatch labels
-                let pass_name = if group.len() <= 2 {
-                    self.plan.dispatches[group.clone()]
-                        .iter()
-                        .map(|d| d.label.as_str())
-                        .collect::<Vec<_>>()
-                        .join("+")
-                } else {
-                    let first = &self.plan.dispatches[group.start].label;
-                    let last = &self.plan.dispatches[group.end - 1].label;
-                    format!("{}..{}", first, last)
-                };
-                let mut pass = self.encoder.compute(&pass_name);
+                let mut pass = self.encoder.compute(&self.group_names[gi]);
                 for i in group {
                     let dispatch = &self.plan.dispatches[i];
                     let pipeline = self.pipelines.get(dispatch);
