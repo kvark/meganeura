@@ -1,6 +1,10 @@
 // Conv2d backward w.r.t. input: grad_output[N,Co,oH,oW] × kernel[Co,Ci,kH,kW] → grad_input[N,Ci,H,W]
 // This is a "full convolution" of grad_output with flipped kernel.
 // Dispatch: [ceil(W/16), ceil(H/16), N*Ci]  workgroup_size(16,16,1)
+//
+// Optimizations:
+//   - Stride-1 fast path: eliminates modulo/division per iteration
+//   - Shared memory for weights: one cooperative load per (co, kernel) instead of 256 redundant reads
 
 struct Params {
     batch: u32,
@@ -22,42 +26,94 @@ var<storage> weight: array<f32>;      // kernel [Co,Ci,kH,kW]
 var<storage, read_write> dst: array<f32>;  // grad_input [N,Ci,H,W]
 var<uniform> params: Params;
 
+// Shared memory for kernel weights: up to 7×7 kernel (practically ≤ 3×3)
+var<workgroup> wg_weight: array<f32, 49>;
+
 @compute @workgroup_size(16, 16, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
     let iw = gid.x;
     let ih = gid.y;
     let nci = gid.z;  // n * in_channels + ci
 
-    if iw >= params.in_w || ih >= params.in_h { return; }
-
     let n = nci / params.in_channels;
     let ci = nci % params.in_channels;
-    if n >= params.batch { return; }
+    let in_bounds = iw < params.in_w && ih < params.in_h && n < params.batch;
+
+    let tid = lid.y * 16u + lid.x;
+    let kernel_size = params.kernel_h * params.kernel_w;
+    let i_padding = i32(params.padding);
 
     var sum = 0.0;
 
-    for (var co = 0u; co < params.out_channels; co++) {
-        for (var kh = 0u; kh < params.kernel_h; kh++) {
-            for (var kw = 0u; kw < params.kernel_w; kw++) {
-                // Which output position (oh, ow) used input (ih, iw) with kernel (kh, kw)?
-                // ih = oh * stride + kh - padding  =>  oh = (ih + padding - kh) / stride
-                let h_off = i32(ih) + i32(params.padding) - i32(kh);
-                let w_off = i32(iw) + i32(params.padding) - i32(kw);
+    if params.stride == 1u {
+        // Fast path for stride=1: no modulo/division, simplified bounds
+        for (var co = 0u; co < params.out_channels; co++) {
+            // Cooperative weight load into shared memory
+            if tid < kernel_size {
+                wg_weight[tid] = weight[(co * params.in_channels + ci) * kernel_size + tid];
+            }
+            workgroupBarrier();
 
-                if h_off >= 0 && w_off >= 0 && (h_off % i32(params.stride)) == 0 && (w_off % i32(params.stride)) == 0 {
-                    let oh = u32(h_off) / params.stride;
-                    let ow = u32(w_off) / params.stride;
+            if in_bounds {
+                let go_base = (n * params.out_channels + co) * params.out_h * params.out_w;
 
-                    if oh < params.out_h && ow < params.out_w {
-                        let go_idx = ((n * params.out_channels + co) * params.out_h + oh) * params.out_w + ow;
-                        let k_idx = ((co * params.in_channels + ci) * params.kernel_h + kh) * params.kernel_w + kw;
-                        sum += grad_out[go_idx] * weight[k_idx];
+                for (var kh = 0u; kh < params.kernel_h; kh++) {
+                    let oh = i32(ih) + i_padding - i32(kh);
+                    if oh >= 0 && u32(oh) < params.out_h {
+                        for (var kw = 0u; kw < params.kernel_w; kw++) {
+                            let ow = i32(iw) + i_padding - i32(kw);
+                            if ow >= 0 && u32(ow) < params.out_w {
+                                sum += grad_out[go_base + u32(oh) * params.out_w + u32(ow)]
+                                     * wg_weight[kh * params.kernel_w + kw];
+                            }
+                        }
                     }
                 }
             }
+
+            workgroupBarrier();
+        }
+    } else {
+        // General path for stride > 1
+        for (var co = 0u; co < params.out_channels; co++) {
+            if tid < kernel_size {
+                wg_weight[tid] = weight[(co * params.in_channels + ci) * kernel_size + tid];
+            }
+            workgroupBarrier();
+
+            if in_bounds {
+                let go_base = (n * params.out_channels + co) * params.out_h * params.out_w;
+                let i_stride = i32(params.stride);
+
+                for (var kh = 0u; kh < params.kernel_h; kh++) {
+                    let h_off = i32(ih) + i_padding - i32(kh);
+                    if h_off >= 0 && (h_off % i_stride) == 0 {
+                        let oh = u32(h_off) / params.stride;
+                        if oh < params.out_h {
+                            for (var kw = 0u; kw < params.kernel_w; kw++) {
+                                let w_off = i32(iw) + i_padding - i32(kw);
+                                if w_off >= 0 && (w_off % i_stride) == 0 {
+                                    let ow = u32(w_off) / params.stride;
+                                    if ow < params.out_w {
+                                        sum += grad_out[go_base + oh * params.out_w + ow]
+                                             * wg_weight[kh * params.kernel_w + kw];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            workgroupBarrier();
         }
     }
 
-    let in_idx = ((n * params.in_channels + ci) * params.in_h + ih) * params.in_w + iw;
-    dst[in_idx] = sum;
+    if in_bounds {
+        let in_idx = ((n * params.in_channels + ci) * params.in_h + ih) * params.in_w + iw;
+        dst[in_idx] = sum;
+    }
 }
