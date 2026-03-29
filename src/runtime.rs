@@ -323,7 +323,11 @@ struct Pipelines {
 }
 
 impl Pipelines {
-    fn new(gpu: &Gpu, plan: &ExecutionPlan) -> Self {
+    fn new(
+        gpu: &Gpu,
+        plan: &ExecutionPlan,
+        coop_config: Option<&crate::codegen::CoopConfig>,
+    ) -> Self {
         use crate::codegen::ShaderGroup;
         use blade_graphics as bg;
 
@@ -426,7 +430,27 @@ impl Pipelines {
             }
         }
         for &group in &needed_coop {
-            compile_group(group, &mut coop_map);
+            if let Some(config) = coop_config {
+                // Use the runtime-detected coop config for shader generation.
+                let sm = crate::codegen::generate_coop_module(group, config);
+                let shader = gpu.create_shader(bg::ShaderDesc {
+                    source: &sm.source,
+                    naga_module: Some(sm.module),
+                });
+                if let Some(entries) = entries_for_group.get(&group) {
+                    for entry in entries {
+                        let layout = shader_data_layout(entry);
+                        let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
+                            name: entry.entry_point(),
+                            data_layouts: &[&layout],
+                            compute: shader.at(entry.entry_point()),
+                        });
+                        coop_map.insert(entry.clone(), pipeline);
+                    }
+                }
+            } else {
+                compile_group(group, &mut coop_map);
+            }
         }
 
         Self {
@@ -596,15 +620,36 @@ pub struct Session {
 }
 
 impl Session {
+    /// Select the best cooperative matrix config from GPU capabilities.
+    /// Prefers f16 (more throughput) when available, falls back to f32.
+    fn select_coop_config(
+        caps: &blade_graphics::CooperativeMatrix,
+    ) -> Option<crate::codegen::CoopConfig> {
+        use crate::codegen::CoopConfig;
+        if caps.f16_tile > 0 {
+            Some(CoopConfig {
+                tile_size: caps.f16_tile,
+                use_f16_input: true,
+            })
+        } else if caps.f32_tile > 0 {
+            Some(CoopConfig {
+                tile_size: caps.f32_tile,
+                use_f16_input: false,
+            })
+        } else {
+            None
+        }
+    }
+
     /// Run a tiny cooperative matmul and check the result.
     /// Returns false if the GPU doesn't support the required cooperative
     /// matrix types (e.g. AMD RADV advertises the extension but rejects
     /// the specific f32 matrix shapes).
-    fn test_coop_matmul(gpu: &Gpu) -> bool {
+    fn test_coop_matmul(gpu: &Gpu, config: &crate::codegen::CoopConfig) -> bool {
         use crate::codegen::ShaderGroup;
         use blade_graphics as bg;
 
-        let sm = crate::codegen::generate_module(ShaderGroup::MatMulCoop);
+        let sm = crate::codegen::generate_coop_module(ShaderGroup::MatMulCoop, config);
         let shader = match gpu.try_create_shader(bg::ShaderDesc {
             source: &sm.source,
             naga_module: Some(sm.module),
@@ -622,39 +667,35 @@ impl Session {
             compute: shader.at("main"),
         });
 
-        // 32×32 test: A filled with 0.5, B = identity → C should equal A (all 0.5).
-        // Must use N=32 (not 16) so all 4 accumulators of the 2×2-tile coop kernel
-        // are within bounds: the second N-tile needs cc1 = tile_col+16+(tid&15) < N,
-        // which requires N ≥ 32. With N=16, acc_01 always stages zeros and stores
-        // them over valid positions of acc_00, causing the test to fail even on a
-        // working implementation.
-        const N: usize = 32;
-        const BUF_SIZE: u64 = (N * N * 4) as u64;
+        // Test matrix size = output_tile (2 × tile_size) so all 4 accumulators
+        // of the 2×2-tile coop kernel are within bounds.
+        let n = config.output_tile() as usize;
+        let buf_size = (n * n * 4) as u64;
         let a_buf = gpu.create_buffer(bg::BufferDesc {
             name: "test_a",
-            size: BUF_SIZE,
+            size: buf_size,
             memory: bg::Memory::Shared,
         });
         let b_buf = gpu.create_buffer(bg::BufferDesc {
             name: "test_b",
-            size: BUF_SIZE,
+            size: buf_size,
             memory: bg::Memory::Shared,
         });
         let c_buf = gpu.create_buffer(bg::BufferDesc {
             name: "test_c",
-            size: BUF_SIZE,
+            size: buf_size,
             memory: bg::Memory::Shared,
         });
         unsafe {
-            let a = std::slice::from_raw_parts_mut(a_buf.data() as *mut f32, N * N);
-            let b = std::slice::from_raw_parts_mut(b_buf.data() as *mut f32, N * N);
-            let c = std::slice::from_raw_parts_mut(c_buf.data() as *mut f32, N * N);
+            let a = std::slice::from_raw_parts_mut(a_buf.data() as *mut f32, n * n);
+            let b = std::slice::from_raw_parts_mut(b_buf.data() as *mut f32, n * n);
+            let c = std::slice::from_raw_parts_mut(c_buf.data() as *mut f32, n * n);
             // A = all 0.5
             a.fill(0.5);
             // B = identity
             b.fill(0.0);
-            for i in 0..N {
-                b[i * N + i] = 1.0;
+            for i in 0..n {
+                b[i * n + i] = 1.0;
             }
             // C = 0 (accumulator)
             c.fill(0.0);
@@ -675,9 +716,9 @@ impl Session {
                     matrix_b: b_buf.at(0),
                     matrix_c: c_buf.at(0),
                     params: MatMulParams {
-                        m: N as u32,
-                        n: N as u32,
-                        k: N as u32,
+                        m: n as u32,
+                        n: n as u32,
+                        k: n as u32,
                         _pad: 0,
                     },
                 },
@@ -688,7 +729,7 @@ impl Session {
         let _ = gpu.wait_for(&sp, !0);
 
         let result =
-            unsafe { std::slice::from_raw_parts(c_buf.data() as *const f32, N * N).to_vec() };
+            unsafe { std::slice::from_raw_parts(c_buf.data() as *const f32, n * n).to_vec() };
 
         gpu.destroy_command_encoder(&mut encoder);
         gpu.destroy_compute_pipeline(&mut pipeline);
@@ -726,22 +767,27 @@ impl Session {
         .expect("failed to initialize blade GPU context");
 
         let coop_caps = gpu.capabilities().cooperative_matrix;
-        // Our coop shader is hardcoded for 16×16 f16 tiles (RDNA3/Volta+).
-        // Skip if the device reports a different tile size (e.g. lavapipe 8×8).
-        let use_coop_matmul =
-            coop_caps.is_supported() && coop_caps.f16_tile == 16 && Self::test_coop_matmul(&gpu);
-        if !use_coop_matmul {
+        let coop_config = Self::select_coop_config(&coop_caps)
+            .filter(|config| Self::test_coop_matmul(&gpu, config));
+        if let Some(ref config) = coop_config {
+            log::info!(
+                "cooperative matrix enabled (tile={}×{}, {}, f32_tile={}, f16_tile={})",
+                config.tile_size,
+                config.tile_size,
+                if config.use_f16_input {
+                    "f16→f32"
+                } else {
+                    "f32"
+                },
+                coop_caps.f32_tile,
+                coop_caps.f16_tile,
+            );
+        } else {
             let info = gpu.device_information();
             log::warn!(
                 "cooperative matrix not available on {} ({}) (f32_tile={}, f16_tile={}); using naive matmul",
                 info.device_name,
                 info.driver_name,
-                coop_caps.f32_tile,
-                coop_caps.f16_tile,
-            );
-        } else {
-            log::info!(
-                "cooperative matrix enabled (f32_tile={}, f16_tile={})",
                 coop_caps.f32_tile,
                 coop_caps.f16_tile,
             );
@@ -751,31 +797,32 @@ impl Session {
         // Mark individual dispatches for coop and recompute their workgroups.
         // Unlike the old all-or-nothing policy, each dispatch is independently
         // evaluated. Pipelines now stores both scalar and coop variants.
-        if use_coop_matmul {
+        if let Some(ref config) = coop_config {
             use crate::codegen::ShaderGroup;
+            let output_tile = config.output_tile();
+            let half_tile = config.tile_size;
             for dispatch in &mut plan.dispatches {
                 let group = dispatch.shader.shader_group();
                 let (m, n, k) = match group {
                     ShaderGroup::MatMul | ShaderGroup::MatMulAdd => {
                         (dispatch.params[0], dispatch.params[2], dispatch.params[1])
                     }
-                    // Coop AT/BT disabled: backward matmul shapes (K=50 for
-                    // weight grads, M=50 for input grads) don't benefit from
-                    // coop, and f16 staging precision compounds through layers.
+                    // Coop AT/BT disabled for now.
+                    // TODO: safe to enable for f32 path (no f16 precision loss).
                     ShaderGroup::MatMulAT | ShaderGroup::MatMulBT => continue,
                     _ => continue,
                 };
-                let coop_wgs = ceil_div(m, 32) * ceil_div(n, 32);
+                let coop_wgs = ceil_div(m, output_tile) * ceil_div(n, output_tile);
                 let min_wgs = if k >= 1024 {
                     MIN_COOP_WORKGROUPS_HIGH_K
                 } else {
                     MIN_COOP_WORKGROUPS
                 };
-                let m_edge_safe = m % 32 <= 16;
-                let n_edge_safe = n % 32 <= 16;
+                let m_edge_safe = m % output_tile <= half_tile;
+                let n_edge_safe = n % output_tile <= half_tile;
                 if coop_wgs >= min_wgs && m_edge_safe && n_edge_safe {
                     dispatch.use_coop = true;
-                    dispatch.workgroups = [ceil_div(m, 32), ceil_div(n, 32), 1];
+                    dispatch.workgroups = [ceil_div(m, output_tile), ceil_div(n, output_tile), 1];
                 }
             }
         }
@@ -821,7 +868,7 @@ impl Session {
             }
         }
 
-        let pipelines = Pipelines::new(&gpu, &plan);
+        let pipelines = Pipelines::new(&gpu, &plan, coop_config.as_ref());
         let encoder = gpu.create_command_encoder(blade_graphics::CommandEncoderDesc {
             name: "meganeura",
             buffer_count: 2,

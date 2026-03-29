@@ -9,6 +9,25 @@
 
 use naga::Module;
 
+/// Configuration for cooperative matrix tile size and precision.
+///
+/// Derived from `blade_graphics::CooperativeMatrix` capabilities at runtime.
+/// Determines which shader variant is generated for coop matmul.
+#[derive(Clone, Copy, Debug)]
+pub struct CoopConfig {
+    /// Cooperative matrix tile dimension (8 for Apple Silicon, 16 for RDNA3/Volta+).
+    pub tile_size: u32,
+    /// Use f16 input with f32 accumulator (true for Vulkan), or all-f32 (true for Metal).
+    pub use_f16_input: bool,
+}
+
+impl CoopConfig {
+    /// Output tile per workgroup = 2 × tile_size (2×2 grid of coop tiles).
+    pub fn output_tile(&self) -> u32 {
+        2 * self.tile_size
+    }
+}
+
 /// Replace `$VAR` occurrences in `source` with the corresponding values.
 fn preprocess(source: &str, vars: &[(&str, &str)]) -> String {
     let mut s = source.to_string();
@@ -130,6 +149,17 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::FusedRmsNormMatMul => gen_fused_rms_norm_matmul(),
         ShaderGroup::ScatterAdd => gen_scatter_add(),
         ShaderGroup::BceLoss => gen_bce_loss(),
+    }
+}
+
+/// Generate a cooperative matrix shader module with the given tile config.
+pub fn generate_coop_module(group: ShaderGroup, config: &CoopConfig) -> ShaderModule {
+    match group {
+        ShaderGroup::MatMulCoop => gen_matmul_coop_wgsl(false, MatMulCoopVariant::Normal, config),
+        ShaderGroup::MatMulCoopAdd => gen_matmul_coop_wgsl(true, MatMulCoopVariant::Normal, config),
+        ShaderGroup::MatMulCoopBT => gen_matmul_coop_wgsl(false, MatMulCoopVariant::BT, config),
+        ShaderGroup::MatMulCoopAT => gen_matmul_coop_wgsl(false, MatMulCoopVariant::AT, config),
+        _ => panic!("not a coop shader group: {:?}", group),
     }
 }
 
@@ -487,43 +517,70 @@ fn gen_matmul_at() -> ShaderModule {
 // steps of 8.
 // ---------------------------------------------------------------------------
 
-/// Cooperative matrix matmul: C = A × B via Naga IR.
+/// Cooperative matrix matmul: C = A × B.
 ///
-/// Generates `CooperativeLoad` / `CooperativeMultiplyAdd` / `CooperativeStore`
-/// expressions. Hardware-accelerated on Vulkan (VK_KHR_cooperative_matrix)
-/// and Metal (simdgroup_matrix).
+/// Parameterized by `CoopConfig` to support different tile sizes and precisions:
+/// - 16×16 f16 tiles (RDNA3/Volta+): mixed-precision f16×f16+f32
+/// -  8×8  f32 tiles (Apple Silicon): all-f32 via simdgroup_matrix
 ///
-/// Workgroup [8, 8, 1], dispatched as [ceil(M/8), ceil(N/8), 1].
-/// Mixed-precision cooperative matmul: C(f32) = A(f16) × B(f16) + C(f32).
-///
-/// Uses 16×16×16 cooperative matrix tiles with f16 A/B and f32 C/Result,
-/// matching AMD RDNA's native MFMA instruction format.
-///
-/// Data flow per K-tile:
-///   1. Each of 64 threads loads 4 f32 elements from A and B
-///   2. Converts to f16, stores into workgroup shared memory
-///   3. workgroupBarrier
-///   4. CooperativeLoad f16 tiles from shared memory
-///   5. CooperativeMultiplyAdd (f16 × f16 + f32 → f32)
-///
-/// Workgroup [64, 1, 1], dispatched as [ceil(M/16), ceil(N/16), 1].
+/// The default `generate_module` path uses 16×16 f16 for backward compat.
+/// Use `generate_coop_module` with a `CoopConfig` for runtime-detected config.
 fn gen_matmul_coop() -> ShaderModule {
-    gen_matmul_coop_wgsl(false, MatMulCoopVariant::Normal)
+    let default_config = CoopConfig {
+        tile_size: 16,
+        use_f16_input: true,
+    };
+    gen_matmul_coop_wgsl(false, MatMulCoopVariant::Normal, &default_config)
 }
 
 fn gen_matmul_coop_add() -> ShaderModule {
-    gen_matmul_coop_wgsl(true, MatMulCoopVariant::Normal)
+    let default_config = CoopConfig {
+        tile_size: 16,
+        use_f16_input: true,
+    };
+    gen_matmul_coop_wgsl(true, MatMulCoopVariant::Normal, &default_config)
 }
 
 fn gen_matmul_coop_bt() -> ShaderModule {
-    gen_matmul_coop_wgsl(false, MatMulCoopVariant::BT)
+    let default_config = CoopConfig {
+        tile_size: 16,
+        use_f16_input: true,
+    };
+    gen_matmul_coop_wgsl(false, MatMulCoopVariant::BT, &default_config)
 }
 
 fn gen_matmul_coop_at() -> ShaderModule {
-    gen_matmul_coop_wgsl(false, MatMulCoopVariant::AT)
+    let default_config = CoopConfig {
+        tile_size: 16,
+        use_f16_input: true,
+    };
+    gen_matmul_coop_wgsl(false, MatMulCoopVariant::AT, &default_config)
 }
 
-fn gen_matmul_coop_wgsl(fused_add: bool, variant: MatMulCoopVariant) -> ShaderModule {
+fn gen_matmul_coop_wgsl(
+    fused_add: bool,
+    variant: MatMulCoopVariant,
+    config: &CoopConfig,
+) -> ShaderModule {
+    let tile = config.tile_size;
+    let output_tile = config.output_tile();
+    let shared_size = tile * tile;
+    let wg_size: u32 = 64;
+    let staging_iters = shared_size / wg_size;
+    let row_stride = wg_size / tile;
+    let tile_mask = tile - 1;
+    let tile_shift = tile.trailing_zeros();
+
+    let (elem_type, enable_f16, elem_zero, cast_open, cast_close) = if config.use_f16_input {
+        ("f16", "enable f16;", "f16(0.0)", "f16(", ")")
+    } else {
+        ("f32", "", "0.0", "", "")
+    };
+    let ab_type = if config.use_f16_input { "f16" } else { "f32" };
+    let coop_ab = format!("coop_mat{}x{}<{},A>", tile, tile, ab_type);
+    let coop_ba = format!("coop_mat{}x{}<{},B>", tile, tile, ab_type);
+    let coop_c = format!("coop_mat{}x{}<f32,C>", tile, tile);
+
     let (b_idx_0, b_idx_1) = match variant {
         MatMulCoopVariant::Normal | MatMulCoopVariant::AT => ("tr * n + cc", "tr * n + cc1"),
         MatMulCoopVariant::BT => ("cc * k + tr", "cc1 * k + tr"),
@@ -534,35 +591,58 @@ fn gen_matmul_coop_wgsl(fused_add: bool, variant: MatMulCoopVariant) -> ShaderMo
     };
     let (fused_decl, acc_init) = if fused_add {
         (
-            "var<storage> src: array<f32>;",
-            concat!(
-                "var acc00 = coopLoad<coop_mat16x16<f32,C>>(&src[c00], n);\n",
-                "    var acc01 = coopLoad<coop_mat16x16<f32,C>>(&src[c01], n);\n",
-                "    var acc10 = coopLoad<coop_mat16x16<f32,C>>(&src[c10], n);\n",
-                "    var acc11 = coopLoad<coop_mat16x16<f32,C>>(&src[c11], n);",
+            "var<storage> src: array<f32>;".to_string(),
+            format!(
+                "var acc00 = coopLoad<{coop_c}>(&src[c00], n);\n\
+                 \x20   var acc01 = coopLoad<{coop_c}>(&src[c01], n);\n\
+                 \x20   var acc10 = coopLoad<{coop_c}>(&src[c10], n);\n\
+                 \x20   var acc11 = coopLoad<{coop_c}>(&src[c11], n);"
             ),
         )
     } else {
         (
-            "",
-            concat!(
-                "var acc00 = coop_mat16x16<f32,C>();\n",
-                "    var acc01 = coop_mat16x16<f32,C>();\n",
-                "    var acc10 = coop_mat16x16<f32,C>();\n",
-                "    var acc11 = coop_mat16x16<f32,C>();",
+            String::new(),
+            format!(
+                "var acc00 = {coop_c}();\n\
+                 \x20   var acc01 = {coop_c}();\n\
+                 \x20   var acc10 = {coop_c}();\n\
+                 \x20   var acc11 = {coop_c}();"
             ),
         )
     };
+
+    let output_tile_u = format!("{}u", output_tile);
+    let tile_size_u = format!("{}u", tile);
+    let tile_mask_u = format!("{}u", tile_mask);
+    let tile_shift_u = format!("{}u", tile_shift);
+    let staging_iters_u = format!("{}u", staging_iters);
+    let row_stride_u = format!("{}u", row_stride);
+    let shared_size_s = format!("{}", shared_size);
+
     let src = include_str!("shaders/matmul_coop.wgsl");
     let src = preprocess(
         src,
         &[
+            ("$ENABLE_F16", enable_f16),
+            ("$ELEM_TYPE", elem_type),
+            ("$ELEM_ZERO", elem_zero),
+            ("$SHARED_SIZE", &shared_size_s),
+            ("$OUTPUT_TILE_U", &output_tile_u),
+            ("$TILE_SIZE_U", &tile_size_u),
+            ("$TILE_MASK_U", &tile_mask_u),
+            ("$TILE_SHIFT_U", &tile_shift_u),
+            ("$STAGING_ITERS_U", &staging_iters_u),
+            ("$ROW_STRIDE_U", &row_stride_u),
+            ("$CAST_OPEN", cast_open),
+            ("$CAST_CLOSE", cast_close),
+            ("$COOP_AB", &coop_ab),
+            ("$COOP_BA", &coop_ba),
             ("$B_INDEX_0", b_idx_0),
             ("$B_INDEX_1", b_idx_1),
             ("$A_INDEX_0", a_idx_0),
             ("$A_INDEX_1", a_idx_1),
-            ("$FUSED_ADD_DECL", fused_decl),
-            ("$ACC_INIT", acc_init),
+            ("$FUSED_ADD_DECL", &fused_decl),
+            ("$ACC_INIT", &acc_init),
         ],
     );
     parse_wgsl(&src)
