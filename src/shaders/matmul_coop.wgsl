@@ -110,14 +110,16 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
 
         workgroupBarrier();
 
-        // Cooperative matrix multiply-add
-        let a0 = coopLoad<$COOP_AB>(&shared_a0[0], $TILE_SIZE_U);
-        let a1 = coopLoad<$COOP_AB>(&shared_a1[0], $TILE_SIZE_U);
-        let b0 = coopLoad<$COOP_BA>(&shared_b0[0], $TILE_SIZE_U);
-        let b1 = coopLoad<$COOP_BA>(&shared_b1[0], $TILE_SIZE_U);
+        // Cooperative matrix multiply-add: C += A × B
+        // shared_b{0,1} hold A-matrix row tiles; shared_a{0,1} hold B-matrix column tiles.
+        // Load A data into role-A (left operand), B data into role-B (right operand).
+        let a0 = coopLoad<$COOP_AB>(&shared_b0[0], $TILE_SIZE_U);
+        let a1 = coopLoad<$COOP_AB>(&shared_b1[0], $TILE_SIZE_U);
+        let b0 = coopLoad<$COOP_BA>(&shared_a0[0], $TILE_SIZE_U);
+        let b1 = coopLoad<$COOP_BA>(&shared_a1[0], $TILE_SIZE_U);
         acc00 = coopMultiplyAdd(a0, b0, acc00);
-        acc01 = coopMultiplyAdd(a1, b0, acc01);
-        acc10 = coopMultiplyAdd(a0, b1, acc10);
+        acc01 = coopMultiplyAdd(a0, b1, acc01);
+        acc10 = coopMultiplyAdd(a1, b0, acc10);
         acc11 = coopMultiplyAdd(a1, b1, acc11);
 
         workgroupBarrier();

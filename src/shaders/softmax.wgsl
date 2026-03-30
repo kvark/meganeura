@@ -29,8 +29,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         sum_exp += exp_val;
     }
 
-    // Normalize
+    // Normalize (guard against division by zero when all inputs are -inf)
+    let safe_sum = select(sum_exp, 1.0, sum_exp == 0.0);
     for (var j = 0u; j < params.features; j++) {
-        dst[offset + j] /= sum_exp;
+        dst[offset + j] /= safe_sum;
     }
 }

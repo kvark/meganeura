@@ -71,10 +71,12 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         max_score = new_max;
     }
 
-    dst[q_base + tid] = my_out / sum_exp;
+    // Guard against division by zero (e.g. kv_seq=0 or all scores underflow)
+    let safe_sum = select(sum_exp, 1.0, sum_exp == 0.0);
+    dst[q_base + tid] = my_out / safe_sum;
 
     // Write LSE (thread 0 only)
     if tid == 0u {
-        lse[pos * num_heads + head] = max_score + log(sum_exp);
+        lse[pos * num_heads + head] = select(max_score + log(sum_exp), -1e30, sum_exp == 0.0);
     }
 }

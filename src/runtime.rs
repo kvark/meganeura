@@ -808,37 +808,44 @@ impl Session {
             compute: shader.at("main"),
         });
 
-        // Test matrix size = output_tile (2 × tile_size) so all 4 accumulators
-        // of the 2×2-tile coop kernel are within bounds.
-        let n = config.output_tile() as usize;
-        let buf_size = (n * n * 4) as u64;
+        // Test with output_tile-aligned dimensions (no padding needed).
+        let ot = config.output_tile() as usize;
+        let m: usize = ot; // exactly 1 row of tiles
+        let inner: usize = ot; // exactly 1 tile deep
+        let n_out: usize = ot * 2; // 2 column tiles
+        let a_size = (m * inner * 4) as u64;
+        let b_size = (inner * n_out * 4) as u64;
+        let c_size = (m * n_out * 4) as u64;
         let a_buf = gpu.create_buffer(bg::BufferDesc {
             name: "test_a",
-            size: buf_size,
+            size: a_size,
             memory: bg::Memory::Shared,
         });
         let b_buf = gpu.create_buffer(bg::BufferDesc {
             name: "test_b",
-            size: buf_size,
+            size: b_size,
             memory: bg::Memory::Shared,
         });
         let c_buf = gpu.create_buffer(bg::BufferDesc {
             name: "test_c",
-            size: buf_size,
+            size: c_size,
             memory: bg::Memory::Shared,
         });
         unsafe {
-            let a = std::slice::from_raw_parts_mut(a_buf.data() as *mut f32, n * n);
-            let b = std::slice::from_raw_parts_mut(b_buf.data() as *mut f32, n * n);
-            let c = std::slice::from_raw_parts_mut(c_buf.data() as *mut f32, n * n);
-            // A = all 0.5
-            a.fill(0.5);
-            // B = identity
-            b.fill(0.0);
-            for i in 0..n {
-                b[i * n + i] = 1.0;
+            let a = std::slice::from_raw_parts_mut(a_buf.data() as *mut f32, m * inner);
+            let b = std::slice::from_raw_parts_mut(b_buf.data() as *mut f32, inner * n_out);
+            let c = std::slice::from_raw_parts_mut(c_buf.data() as *mut f32, m * n_out);
+            // Non-commutative test: A[i,j] = i+1, B[i,j] = j+1
+            for i in 0..m {
+                for j in 0..inner {
+                    a[i * inner + j] = (i + 1) as f32;
+                }
             }
-            // C = 0 (accumulator)
+            for i in 0..inner {
+                for j in 0..n_out {
+                    b[i * n_out + j] = (j + 1) as f32;
+                }
+            }
             c.fill(0.0);
         }
 
@@ -850,6 +857,7 @@ impl Session {
         {
             let mut pass = encoder.compute("coop_test");
             let mut pc = pass.with(&pipeline);
+            let ot = config.output_tile();
             pc.bind(
                 0,
                 &MatMulData {
@@ -857,20 +865,20 @@ impl Session {
                     matrix_b: b_buf.at(0),
                     matrix_c: c_buf.at(0),
                     params: MatMulParams {
-                        m: n as u32,
-                        n: n as u32,
-                        k: n as u32,
+                        m: m as u32,
+                        n: n_out as u32,
+                        k: inner as u32,
                         _pad: 0,
                     },
                 },
             );
-            pc.dispatch([1, 1, 1]);
+            pc.dispatch([ceil_div(m as u32, ot), ceil_div(n_out as u32, ot), 1]);
         }
         let sp = gpu.submit(&mut encoder);
         let _ = gpu.wait_for(&sp, !0);
 
         let result =
-            unsafe { std::slice::from_raw_parts(c_buf.data() as *const f32, n * n).to_vec() };
+            unsafe { std::slice::from_raw_parts(c_buf.data() as *const f32, m * n_out).to_vec() };
 
         gpu.destroy_command_encoder(&mut encoder);
         gpu.destroy_compute_pipeline(&mut pipeline);
@@ -878,13 +886,35 @@ impl Session {
         gpu.destroy_buffer(b_buf);
         gpu.destroy_buffer(c_buf);
 
-        // A * I should equal A (all 0.5)
-        let ok = result.iter().all(|v| (*v - 0.5).abs() < 0.05);
-        if !ok {
-            log::warn!(
-                "cooperative matmul self-test failed: expected [1,1,1,1], got {:?}",
-                result
-            );
+        // C = A × B where A[m,k]=i+1, B[k,n]=j+1.
+        // C[i,j] = sum_k (i+1)*(j+1) = inner*(i+1)*(j+1)
+        let mut ok = true;
+        let mut first_mismatch = true;
+        for i in 0..m {
+            for j in 0..n_out {
+                let expected = (inner as f32) * (i + 1) as f32 * (j + 1) as f32;
+                let got = result[i * n_out + j];
+                if (got - expected).abs() > 0.5 {
+                    if first_mismatch {
+                        log::warn!(
+                            "coop self-test FAILED (m={m}, n={n_out}, k={inner}, tile={})",
+                            config.tile_size
+                        );
+                        log::warn!("  row 0: {:?}", &result[0..n_out]);
+                        if m > 1 {
+                            log::warn!("  row 1: {:?}", &result[n_out..2 * n_out]);
+                        }
+                        log::warn!(
+                            "  expected row 0: {:?}",
+                            (0..n_out)
+                                .map(|j| inner as f32 * 1.0 * (j + 1) as f32)
+                                .collect::<Vec<_>>()
+                        );
+                        first_mismatch = false;
+                    }
+                    ok = false;
+                }
+            }
         }
         ok
     }
@@ -964,6 +994,23 @@ impl Session {
                 if coop_wgs >= min_wgs && m_edge_safe && n_edge_safe {
                     dispatch.use_coop = true;
                     dispatch.workgroups = [ceil_div(m, output_tile), ceil_div(n, output_tile), 1];
+                    // coopStore/coopLoad operate on full tiles without per-element
+                    // bounds checking. Pad output and addend buffers so edge
+                    // tiles don't read/write past the end.
+                    let padded_m = ceil_div(m, output_tile) * output_tile;
+                    let padded_n = ceil_div(n, output_tile) * output_tile;
+                    let padded_bytes = (padded_m * padded_n * 4) as usize;
+                    let buf_idx = dispatch.output_buffer.0 as usize;
+                    if plan.buffers[buf_idx] < padded_bytes {
+                        plan.buffers[buf_idx] = padded_bytes;
+                    }
+                    // FusedMatMulAdd: also pad the addend (src) buffer.
+                    if dispatch.input_buffers.len() > 2 {
+                        let src_idx = dispatch.input_buffers[2].0 as usize;
+                        if plan.buffers[src_idx] < padded_bytes {
+                            plan.buffers[src_idx] = padded_bytes;
+                        }
+                    }
                 }
             }
         }
@@ -1008,11 +1055,17 @@ impl Session {
             .enumerate()
             .map(|(i, &size)| {
                 let size = size.max(4);
-                gpu.create_buffer(blade_graphics::BufferDesc {
+                let buf = gpu.create_buffer(blade_graphics::BufferDesc {
                     name: &format!("buf_{}", i),
                     size: size as u64,
                     memory: blade_graphics::Memory::Shared,
-                })
+                });
+                // Zero-fill to prevent NaN from uninitialized padding regions
+                // (coop tiles read/write full tiles beyond logical dimensions).
+                unsafe {
+                    std::ptr::write_bytes(buf.data(), 0, size);
+                }
+                buf
             })
             .collect();
 

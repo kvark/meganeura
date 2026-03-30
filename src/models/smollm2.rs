@@ -394,5 +394,6 @@ pub fn transposed_weight_names(config: &SmolLM2Config) -> Vec<String> {
         names.push(format!("{}.mlp.up_proj.weight", p));
         names.push(format!("{}.mlp.down_proj.weight", p));
     }
+    names.push("lm_head.weight".to_string());
     names
 }

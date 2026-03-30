@@ -64,5 +64,6 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         max_score = new_max;
     }
 
-    dst[q_base + tid] = my_out / sum_exp;
+    let safe_sum = select(sum_exp, 1.0, sum_exp == 0.0);
+    dst[q_base + tid] = my_out / safe_sum;
 }
