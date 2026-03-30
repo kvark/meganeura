@@ -867,7 +867,7 @@ fn kv_cache_ops_smoke() {
     let _v_updated = g.cache_write(v_input, v_cache, kv_pos);
 
     // RoPE with dynamic offset
-    let q_rope = g.rope_dynamic_offset(q_input, 10000.0, kv_pos);
+    let q_rope = g.rope_dynamic_offset(q_input, 10000.0, kv_pos, head_dim);
 
     // Cached attention
     let attn = g.cached_attention(

@@ -274,8 +274,8 @@ impl CausalSelfAttention {
         let q = self.q_proj.forward(g, x);
         let k = self.k_proj.forward(g, x);
         let v = self.v_proj.forward(g, x);
-        let q = g.rope(q, self.rope_theta);
-        let k = g.rope(k, self.rope_theta);
+        let q = g.rope(q, self.rope_theta, self.head_dim);
+        let k = g.rope(k, self.rope_theta, self.head_dim);
         let attn = g.causal_attention(q, k, v, self.num_heads, self.num_kv_heads, self.head_dim);
         self.o_proj.forward(g, attn)
     }

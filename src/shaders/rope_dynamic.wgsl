@@ -6,6 +6,10 @@ struct Params {
     dim: u32,
     theta_bits: u32,
     _pad: u32,
+    head_dim: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 var<storage> src: array<f32>;
@@ -22,18 +26,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let row = i / half_dim;
     let pos = row + pos_offset_buf[0];
-    let pair_idx = i % half_dim;
+    let pair_in_row = i % half_dim;
     let theta = bitcast<f32>(params.theta_bits);
 
-    let exponent = -2.0 * f32(pair_idx) / f32(params.dim);
+    // Apply RoPE per-head
+    let half_head = params.head_dim / 2u;
+    let head = pair_in_row / half_head;
+    let pair_in_head = pair_in_row % half_head;
+
+    let exponent = -2.0 * f32(pair_in_head) / f32(params.head_dim);
     let inv_freq = pow(theta, exponent);
     let angle = f32(pos) * inv_freq;
     let cos_val = cos(angle);
     let sin_val = sin(angle);
 
-    // HuggingFace "half-split" convention: pair (d, d + dim/2)
-    let idx0 = row * params.dim + pair_idx;
-    let idx1 = row * params.dim + pair_idx + half_dim;
+    // HuggingFace "half-split" convention within each head
+    let base = row * params.dim + head * params.head_dim;
+    let idx0 = base + pair_in_head;
+    let idx1 = base + pair_in_head + half_head;
     let v0 = src[idx0];
     let v1 = src[idx1];
 

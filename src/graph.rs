@@ -159,6 +159,10 @@ pub enum Op {
     RoPE {
         theta: f32,
         pos_offset: u32,
+        /// Dimension of each attention head. RoPE rotations are applied
+        /// independently within each head. When equal to the last dim of
+        /// the input tensor, the behavior is identical to "global" RoPE.
+        head_dim: u32,
     },
 
     // Fused causal multi-head attention with GQA
@@ -832,29 +836,56 @@ impl Graph {
         self.add_node(Op::ScatterAdd { vocab_size }, vec![indices, src], ty)
     }
 
-    pub fn rope(&mut self, x: NodeId, theta: f32) -> NodeId {
-        self.rope_with_offset(x, theta, 0)
+    pub fn rope(&mut self, x: NodeId, theta: f32, head_dim: u32) -> NodeId {
+        self.rope_with_offset(x, theta, 0, head_dim)
     }
 
-    pub fn rope_with_offset(&mut self, x: NodeId, theta: f32, pos_offset: u32) -> NodeId {
+    pub fn rope_with_offset(
+        &mut self,
+        x: NodeId,
+        theta: f32,
+        pos_offset: u32,
+        head_dim: u32,
+    ) -> NodeId {
         let x_shape = &self.node(x).ty.shape;
         assert_eq!(x_shape.len(), 2, "rope requires 2D input");
-        assert_eq!(x_shape[1] % 2, 0, "rope requires even last dim");
+        let dim = x_shape[1] as u32;
+        assert_eq!(dim % 2, 0, "rope requires even last dim");
+        assert_eq!(dim % head_dim, 0, "rope: dim must be divisible by head_dim");
+        assert_eq!(head_dim % 2, 0, "rope: head_dim must be even");
         let ty = self.node(x).ty.clone();
-        self.add_node(Op::RoPE { theta, pos_offset }, vec![x], ty)
+        self.add_node(
+            Op::RoPE {
+                theta,
+                pos_offset,
+                head_dim,
+            },
+            vec![x],
+            ty,
+        )
     }
 
     /// RoPE with a dynamic position offset read from an input buffer.
     /// The position for each row is `row_index + offset_buf[0]`.
-    pub fn rope_dynamic_offset(&mut self, x: NodeId, theta: f32, offset_input: NodeId) -> NodeId {
+    pub fn rope_dynamic_offset(
+        &mut self,
+        x: NodeId,
+        theta: f32,
+        offset_input: NodeId,
+        head_dim: u32,
+    ) -> NodeId {
         let x_shape = &self.node(x).ty.shape;
         assert_eq!(x_shape.len(), 2, "rope requires 2D input");
-        assert_eq!(x_shape[1] % 2, 0, "rope requires even last dim");
+        let dim = x_shape[1] as u32;
+        assert_eq!(dim % 2, 0, "rope requires even last dim");
+        assert_eq!(dim % head_dim, 0, "rope: dim must be divisible by head_dim");
+        assert_eq!(head_dim % 2, 0, "rope: head_dim must be even");
         let ty = self.node(x).ty.clone();
         self.add_node(
             Op::RoPE {
                 theta,
                 pos_offset: 0,
+                head_dim,
             },
             vec![x, offset_input],
             ty,
