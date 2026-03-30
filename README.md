@@ -8,11 +8,15 @@ Meganeura - a cross-platform Neural Network training and inference library in Ru
 
 ![logo](etc/logo.png)
 
-For GPU access, we use [blade-graphics](https://github.com/kvark/blade/tree/main/blade-graphics), which opens the doors to Linux, Windows, and MacOS systems. No vendor locking, althought expect lower performance than anything that targets NVidia/CUDA directly.
+## Why Meganeura?
 
-Instead of including the "batteries" - kernels for all kind of cases and hardware - we are going to explore the search space using [e-graph](https://egraphs-good.github.io/), similar to [Luminal](https://github.com/luminal-ai/luminal).
+- *Portable*. It's powered by [blade-graphics](https://github.com/kvark/blade/tree/main/blade-graphics) for accessing GPUs across the board: Linux, Windows, MacOS, even edge devices on iOS or Android. Not toasters though.
+- *Fast*. More of a promise than reality at this point. It doesn't beat production-optimized CUDA or MLX stacks yet, but it is faster than ROCm on laptop APUs.
+- *Lean*. It packs a bunch of kernels, but the real power comes from their auto-discovery. During the optimization pre-process, it explores the search space using [e-graph](https://egraphs-good.github.io/), similar to [Luminal](https://github.com/luminal-ai/luminal).
 
 ## Benchmarks
+
+See [Infermark](https://kvark.github.io/infermark/) for a comprehensive comparison between different frameworks.
 
 SmolVLA action expert training (chunk_size=50, vlm_seq_len=16, float32, random weights).
 Full GQA (15/5 heads, head_dim=64), exact backward through all ops including fused MHA and RmsNorm:
@@ -21,8 +25,6 @@ Full GQA (15/5 heads, head_dim=64), exact backward through all ops including fus
 |-----|-----------|---------|---------|----------|
 | Radeon 890M (RADV) | Meganeura 550bb6caf09c819f199084d2263794e14f683463 | 0 s | 19.4 ms | 85.6 ms |
 | Radeon 890M (RADV) | PyTorch 2.10.0 ROCm | 6.79 s | 21.14 ms | 54.3 ms |
-| Radeon 780M (RADV) | Meganeura 550bb6caf09c819f199084d2263794e14f683463 | 0 s | 14.5 ms | 82.7 ms |
-| Radeon 780M (RADV) | PyTorch 2.9.1 ROCm (eager) | :x: | :x: | :x: |
 | GeForce RTX 5080 (590/Linux) | Meganeura 550bb6caf09c819f199084d2263794e14f683463 | 0 s | 6.1 ms | 35.1 ms |
 | GeForce RTX 5080 (590/Linux) | PyTorch 2.11.0+cu128 | 3.41 s | 1.57 ms | 4.68 ms |
 | GeForce RTX 3050 (566.36/Windows) | Meganeura 550bb6caf09c819f199084d2263794e14f683463 | 0 s | 11.2 ms | 53.3 ms |
