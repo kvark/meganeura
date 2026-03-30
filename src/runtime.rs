@@ -211,7 +211,25 @@ struct EmbeddingData {
 }
 
 // rope: var src, dst, params
-// (same layout as UnaryData)
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct RoPEParams {
+    seq: u32,
+    dim: u32,
+    theta_bits: u32,
+    pos_offset: u32,
+    head_dim: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+#[derive(blade_macros::ShaderData)]
+struct RoPEData {
+    src: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: RoPEParams,
+}
 
 // causal_attention: var src_a (q), src_b (k), bias (v), dst, params
 #[derive(blade_macros::ShaderData)]
@@ -229,7 +247,7 @@ struct RoPEDynamicData {
     src: blade_graphics::BufferPiece,
     dst: blade_graphics::BufferPiece,
     pos_offset_buf: blade_graphics::BufferPiece,
-    params: UnaryParams, // seq, dim, theta_bits, _pad
+    params: RoPEParams,
 }
 
 // cache_write: var src, dst (read_write), kv_pos_buf, params
@@ -630,7 +648,7 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::Transpose => TransposeData::layout(),
         ShaderEntry::RmsNorm => RmsNormData::layout(),
         ShaderEntry::Embedding => EmbeddingData::layout(),
-        ShaderEntry::RoPE => UnaryData::layout(), // same layout: src, dst, params
+        ShaderEntry::RoPE => RoPEData::layout(),
         ShaderEntry::CausalAttention => CausalAttentionData::layout(),
         ShaderEntry::Gelu => UnaryData::layout(),
         ShaderEntry::LayerNorm => LayerNormData::layout(),
@@ -1735,14 +1753,18 @@ impl Session {
             ShaderEntry::RoPE => {
                 pc.bind(
                     0,
-                    &UnaryData {
+                    &RoPEData {
                         src: buf(dispatch.input_buffers[0]),
                         dst: buf(dispatch.output_buffer),
-                        params: UnaryParams {
-                            len: dispatch.params[0],
-                            _pad0: dispatch.params[1],
-                            _pad1: dispatch.params[2],
-                            _pad2: dispatch.params[3], // pos_offset
+                        params: RoPEParams {
+                            seq: dispatch.params[0],
+                            dim: dispatch.params[1],
+                            theta_bits: dispatch.params[2],
+                            pos_offset: dispatch.params[3],
+                            head_dim: dispatch.params[4],
+                            _pad0: 0,
+                            _pad1: 0,
+                            _pad2: 0,
                         },
                     },
                 );
@@ -2146,10 +2168,14 @@ impl Session {
                         src: buf(dispatch.input_buffers[0]),
                         dst: buf(dispatch.output_buffer),
                         pos_offset_buf: buf(dispatch.input_buffers[1]),
-                        params: UnaryParams {
-                            len: dispatch.params[0],
-                            _pad0: dispatch.params[1],
-                            _pad1: dispatch.params[2],
+                        params: RoPEParams {
+                            seq: dispatch.params[0],
+                            dim: dispatch.params[1],
+                            theta_bits: dispatch.params[2],
+                            pos_offset: 0,
+                            head_dim: dispatch.params[4],
+                            _pad0: 0,
+                            _pad1: 0,
                             _pad2: 0,
                         },
                     },

@@ -918,7 +918,11 @@ impl<'a> Compiler<'a> {
                 });
             }
 
-            Op::RoPE { theta, pos_offset } => {
+            Op::RoPE {
+                theta,
+                pos_offset,
+                head_dim,
+            } => {
                 let input = self.get_buffer(node.inputs[0]);
                 let shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let seq = shape[0] as u32;
@@ -932,7 +936,7 @@ impl<'a> Compiler<'a> {
                         input_buffers: vec![input, offset_buf],
                         output_buffer: out_buf,
                         extra_output: None,
-                        params: vec![seq, dim, theta.to_bits(), 0],
+                        params: vec![seq, dim, theta.to_bits(), 0, head_dim, 0, 0, 0],
                         use_coop: false,
                         use_small_tiles: false,
                         label: String::new(),
@@ -944,7 +948,7 @@ impl<'a> Compiler<'a> {
                         input_buffers: vec![input],
                         output_buffer: out_buf,
                         extra_output: None,
-                        params: vec![seq, dim, theta.to_bits(), pos_offset],
+                        params: vec![seq, dim, theta.to_bits(), pos_offset, head_dim, 0, 0, 0],
                         use_coop: false,
                         use_small_tiles: false,
                         label: String::new(),

@@ -279,8 +279,8 @@ pub fn build_text_decoder(
         let v = g.matmul(h, wv);
 
         // RoPE
-        let q = g.rope(q, theta);
-        let k = g.rope(k, theta);
+        let q = g.rope(q, theta, config.head_dim());
+        let k = g.rope(k, theta, config.head_dim());
 
         // Causal attention with GQA
         let attn = g.causal_attention(

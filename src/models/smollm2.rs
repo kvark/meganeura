@@ -97,8 +97,8 @@ pub fn build_graph(g: &mut Graph, config: &SmolLM2Config, seq_len: usize) -> Nod
         let v = g.matmul(h, wv); // [seq, kv_dim]
 
         // RoPE
-        let q = g.rope(q, theta);
-        let k = g.rope(k, theta);
+        let q = g.rope(q, theta, config.head_dim());
+        let k = g.rope(k, theta, config.head_dim());
 
         // Causal attention with GQA
         let attn = g.causal_attention(
@@ -197,8 +197,8 @@ pub fn build_prefill_graph(
         let k = g.matmul(h, wk);
         let v = g.matmul(h, wv);
 
-        let q = g.rope(q, theta);
-        let k = g.rope(k, theta);
+        let q = g.rope(q, theta, config.head_dim());
+        let k = g.rope(k, theta, config.head_dim());
 
         // Save K/V for cache initialization
         k_outputs.push(k);
@@ -300,8 +300,8 @@ pub fn build_decode_graph(
         let v = g.matmul(h, wv); // [1, kv_dim]
 
         // RoPE with dynamic position offset from kv_pos input
-        let q = g.rope_dynamic_offset(q, theta, kv_pos);
-        let k = g.rope_dynamic_offset(k, theta, kv_pos);
+        let q = g.rope_dynamic_offset(q, theta, kv_pos, config.head_dim());
+        let k = g.rope_dynamic_offset(k, theta, kv_pos, config.head_dim());
 
         // Pre-allocated KV cache buffers (treated as mutable parameters)
         let k_cache = g.parameter(&format!("kv_cache.layer.{}.k", i), &[max_seq_len, kv_dim]);

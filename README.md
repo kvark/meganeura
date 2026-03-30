@@ -36,6 +36,12 @@ Gradients verified against PyTorch (CPU): 88/136 parameters pass strict threshol
 
 Run `bash bench/compare.sh` to reproduce.
 
+## Profiling
+
+Examples accept `MEGANEURA_TRACE=<filename>` environment for saming binary Perfetto traces.
+You can open them with [Perfetto Trace Viewer](https://ui.perfetto.dev/#!/viewer):
+![perfetto trace](etc/example-trace.png)
+
 ## System Requirements
 
 It works on on anything with Vulkan, including LavaPipe, or MacOS devices.
