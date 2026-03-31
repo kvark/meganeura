@@ -507,6 +507,7 @@ impl Pipelines {
                     ShaderGroup::MatMulAdd => ShaderGroup::MatMulCoopAdd,
                     ShaderGroup::MatMulAT => ShaderGroup::MatMulCoopAT,
                     ShaderGroup::MatMulBT => ShaderGroup::MatMulCoopBT,
+                    ShaderGroup::Conv2dGradInputGemm => ShaderGroup::Conv2dGradInputGemmCoop,
                     _ => continue,
                 };
                 needed_coop.insert(coop_group);
@@ -670,10 +671,12 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::Conv2d => Conv2dData::layout(),
         ShaderEntry::Conv2dGemm | ShaderEntry::Conv2dGemmSmall => Conv2dData::layout(),
         ShaderEntry::Conv2dGradInput => Conv2dGradInputData::layout(),
-        ShaderEntry::Conv2dGradInputGemm | ShaderEntry::Conv2dGradInputGemmSmall => {
-            Conv2dGradInputData::layout()
+        ShaderEntry::Conv2dGradInputGemm
+        | ShaderEntry::Conv2dGradInputGemmSmall
+        | ShaderEntry::Conv2dGradInputGemmCoop => Conv2dGradInputData::layout(),
+        ShaderEntry::Conv2dGradWeight | ShaderEntry::Conv2dGradWeightGemm => {
+            Conv2dGradWeightData::layout()
         }
-        ShaderEntry::Conv2dGradWeight => Conv2dGradWeightData::layout(),
         ShaderEntry::RoPEDynamic => RoPEDynamicData::layout(),
         ShaderEntry::CacheWrite => CacheWriteData::layout(),
         ShaderEntry::CachedAttention => CachedAttentionData::layout(),
@@ -994,17 +997,37 @@ impl Session {
             let half_tile = config.tile_size;
             for dispatch in &mut plan.dispatches {
                 let group = dispatch.shader.shader_group();
-                let (m, n, k) = match group {
-                    ShaderGroup::MatMul | ShaderGroup::MatMulAdd => {
-                        (dispatch.params[0], dispatch.params[2], dispatch.params[1])
+                // Extract (m, n, k, batch) from dispatch params based on shader group.
+                let (m, n, k, batch) = match group {
+                    ShaderGroup::MatMul | ShaderGroup::MatMulAdd => (
+                        dispatch.params[0],
+                        dispatch.params[2],
+                        dispatch.params[1],
+                        1u32,
+                    ),
+                    ShaderGroup::Conv2dGradInputGemm => {
+                        // params: [batch, in_channels, in_h, in_w, out_channels, kernel_h, kernel_w, stride, padding, out_h, out_w, ...]
+                        let in_ch = dispatch.params[1];
+                        let in_h = dispatch.params[2];
+                        let in_w = dispatch.params[3];
+                        let out_ch = dispatch.params[4];
+                        let kh = dispatch.params[5];
+                        let kw = dispatch.params[6];
+                        (in_ch, in_h * in_w, out_ch * kh * kw, dispatch.params[0])
                     }
                     // Coop AT/BT disabled for now.
                     // TODO: safe to enable for f32 path (no f16 precision loss).
                     ShaderGroup::MatMulAT | ShaderGroup::MatMulBT => continue,
                     _ => continue,
                 };
-                let coop_wgs = ceil_div(m, output_tile) * ceil_div(n, output_tile);
-                let min_wgs = if k >= 1024 {
+                let coop_wgs = ceil_div(m, output_tile) * ceil_div(n, output_tile) * batch;
+                // Conv2d GEMM has heavier staging (im2col indexing with integer
+                // division per element), so require more workgroups to amortize
+                // the cooperative matrix overhead.
+                let is_conv = matches!(group, ShaderGroup::Conv2dGradInputGemm);
+                let min_wgs = if is_conv {
+                    512
+                } else if k >= 1024 {
                     MIN_COOP_WORKGROUPS_HIGH_K
                 } else {
                     MIN_COOP_WORKGROUPS
@@ -1013,13 +1036,14 @@ impl Session {
                 let n_edge_safe = n % output_tile <= half_tile;
                 if coop_wgs >= min_wgs && m_edge_safe && n_edge_safe {
                     dispatch.use_coop = true;
-                    dispatch.workgroups = [ceil_div(m, output_tile), ceil_div(n, output_tile), 1];
+                    dispatch.workgroups =
+                        [ceil_div(m, output_tile), ceil_div(n, output_tile), batch];
                     // coopStore/coopLoad operate on full tiles without per-element
                     // bounds checking. Pad output and addend buffers so edge
                     // tiles don't read/write past the end.
                     let padded_m = ceil_div(m, output_tile) * output_tile;
                     let padded_n = ceil_div(n, output_tile) * output_tile;
-                    let padded_bytes = (padded_m * padded_n * 4) as usize;
+                    let padded_bytes = (padded_m * padded_n * batch * 4) as usize;
                     let buf_idx = dispatch.output_buffer.0 as usize;
                     if plan.buffers[buf_idx] < padded_bytes {
                         plan.buffers[buf_idx] = padded_bytes;
@@ -2111,7 +2135,8 @@ impl Session {
             }
             ShaderEntry::Conv2dGradInput
             | ShaderEntry::Conv2dGradInputGemm
-            | ShaderEntry::Conv2dGradInputGemmSmall => {
+            | ShaderEntry::Conv2dGradInputGemmSmall
+            | ShaderEntry::Conv2dGradInputGemmCoop => {
                 let p = &dispatch.params;
                 pc.bind(
                     0,
@@ -2136,7 +2161,7 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::Conv2dGradWeight => {
+            ShaderEntry::Conv2dGradWeight | ShaderEntry::Conv2dGradWeightGemm => {
                 let p = &dispatch.params;
                 pc.bind(
                     0,

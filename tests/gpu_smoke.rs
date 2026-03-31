@@ -1124,3 +1124,92 @@ fn conv2d_backward_smoke() {
         );
     }
 }
+
+/// Verify RoPE applies per-head rotation correctly (not global-dim rotation).
+/// With 2 heads of head_dim=4, the rotation pairs within each head should use
+/// exponents based on head_dim=4, NOT the full dim=8.
+#[test]
+fn rope_per_head_correctness() {
+    let seq = 2usize;
+    let num_heads = 2u32;
+    let head_dim = 4u32;
+    let dim = (num_heads * head_dim) as usize; // 8
+    let theta: f32 = 10000.0;
+
+    // Build graph: just RoPE
+    let mut g = Graph::new();
+    let x = g.input("x", &[seq, dim]);
+    let y = g.rope(x, theta, head_dim);
+    g.set_outputs(vec![y]);
+    let mut session = build_inference_session(&g);
+
+    // Input: all ones — makes it easy to verify rotation
+    let input = vec![1.0f32; seq * dim];
+    session.set_input("x", &input);
+    session.step();
+    session.wait();
+    let output = session.read_output(seq * dim);
+
+    // Compute expected values on CPU
+    let half_head = (head_dim / 2) as usize;
+    let mut expected = vec![0.0f32; seq * dim];
+    for row in 0..seq {
+        let pos = row as f32;
+        for head in 0..num_heads as usize {
+            for pair in 0..half_head {
+                let exponent = -2.0 * pair as f32 / head_dim as f32;
+                let inv_freq = theta.powf(exponent);
+                let angle = pos * inv_freq;
+                let cos_val = angle.cos();
+                let sin_val = angle.sin();
+
+                let base = row * dim + head * head_dim as usize;
+                let v0 = 1.0f32; // input value
+                let v1 = 1.0f32;
+                expected[base + pair] = v0 * cos_val - v1 * sin_val;
+                expected[base + pair + half_head] = v0 * sin_val + v1 * cos_val;
+            }
+        }
+    }
+
+    // Compare
+    let mut max_err: f32 = 0.0;
+    for i in 0..output.len() {
+        let err = (output[i] - expected[i]).abs();
+        if err > max_err {
+            max_err = err;
+        }
+        assert!(
+            err < 1e-4,
+            "rope[{}]: got={:.6}, expected={:.6}, err={:.2e}",
+            i,
+            output[i],
+            expected[i],
+            err
+        );
+    }
+    eprintln!("rope_per_head_correctness: max_err={max_err:.2e}");
+
+    // Verify position 0 is identity-like (cos(0)=1, sin(0)=0)
+    // For pos=0: output should equal input (rotation by 0)
+    for i in 0..dim {
+        assert!(
+            (output[i] - 1.0).abs() < 1e-5,
+            "pos=0 should be identity: output[{}]={:.6}",
+            i,
+            output[i]
+        );
+    }
+
+    // Verify position 1, head 0 pair 0 uses exponent -2*0/4 = 0 → angle = 1*1 = 1.0
+    // cos(1)≈0.5403, sin(1)≈0.8415
+    // output[dim+0] = 1*cos(1) - 1*sin(1) ≈ -0.3012
+    // output[dim+2] = 1*sin(1) + 1*cos(1) ≈ 1.3818
+    let pos1_h0_pair0 = output[dim]; // first element of pos=1
+    assert!(
+        (pos1_h0_pair0 - (1.0f32.cos() - 1.0f32.sin())).abs() < 1e-4,
+        "pos=1 head=0 pair=0 first: got={:.6}, expected={:.6}",
+        pos1_h0_pair0,
+        1.0f32.cos() - 1.0f32.sin()
+    );
+}

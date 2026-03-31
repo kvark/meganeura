@@ -113,10 +113,10 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         // Cooperative matrix multiply-add: C += A × B
         // shared_b{0,1} hold A-matrix row tiles; shared_a{0,1} hold B-matrix column tiles.
         // Load A data into role-A (left operand), B data into role-B (right operand).
-        let a0 = coopLoad<$COOP_AB>(&shared_b0[0], $TILE_SIZE_U);
-        let a1 = coopLoad<$COOP_AB>(&shared_b1[0], $TILE_SIZE_U);
-        let b0 = coopLoad<$COOP_BA>(&shared_a0[0], $TILE_SIZE_U);
-        let b1 = coopLoad<$COOP_BA>(&shared_a1[0], $TILE_SIZE_U);
+        let a0 = coopLoadT<$COOP_AB>(&shared_b0[0], $TILE_SIZE_U);
+        let a1 = coopLoadT<$COOP_AB>(&shared_b1[0], $TILE_SIZE_U);
+        let b0 = coopLoadT<$COOP_BA>(&shared_a0[0], $TILE_SIZE_U);
+        let b1 = coopLoadT<$COOP_BA>(&shared_a1[0], $TILE_SIZE_U);
         acc00 = coopMultiplyAdd(a0, b0, acc00);
         acc01 = coopMultiplyAdd(a0, b1, acc01);
         acc10 = coopMultiplyAdd(a1, b0, acc10);
@@ -127,14 +127,14 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     }
 
     // Store results
-    coopStore(acc00, &matrix_c[c00], n);
+    coopStoreT(acc00, &matrix_c[c00], n);
     if n1_valid {
-        coopStore(acc01, &matrix_c[c01], n);
+        coopStoreT(acc01, &matrix_c[c01], n);
     }
     if m1_valid {
-        coopStore(acc10, &matrix_c[c10], n);
+        coopStoreT(acc10, &matrix_c[c10], n);
     }
     if n1_valid && m1_valid {
-        coopStore(acc11, &matrix_c[c11], n);
+        coopStoreT(acc11, &matrix_c[c11], n);
     }
 }

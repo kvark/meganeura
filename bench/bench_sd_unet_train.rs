@@ -17,6 +17,7 @@ fn main() {
     }
 
     let use_small = std::env::args().any(|a| a == "--small");
+    let profile = std::env::var("MEGANEURA_PROFILE").is_ok();
     let warmup: usize = parse_arg("--warmup").unwrap_or(2);
     let runs: usize = parse_arg("--runs").unwrap_or(5);
     let steps_per_run: usize = parse_arg("--steps").unwrap_or(20);
@@ -96,6 +97,41 @@ fn main() {
         session.set_input("noise_target", &noise);
         session.step();
         session.wait();
+    }
+
+    // --- GPU profiling (MEGANEURA_PROFILE=1) ---
+    if profile {
+        session.set_profiling(true);
+        eprintln!(
+            "\n=== GPU timings ({} dispatches) ===",
+            session.plan().dispatches.len()
+        );
+        // 3-step dance for blade's 2-buffer ring:
+        // step A (profiled) → step B (advance ring) → step C reads A's timestamps
+        let noisy: Vec<f32> = (0..in_size).map(|_| next_f32()).collect();
+        let noise: Vec<f32> = (0..in_size).map(|_| next_f32() * 0.5).collect();
+        session.set_input("noisy_latent", &noisy);
+        session.set_input("noise_target", &noise);
+        session.step();
+        session.wait();
+
+        let noisy: Vec<f32> = (0..in_size).map(|_| next_f32()).collect();
+        let noise: Vec<f32> = (0..in_size).map(|_| next_f32() * 0.5).collect();
+        session.set_input("noisy_latent", &noisy);
+        session.set_input("noise_target", &noise);
+        session.step();
+        session.wait();
+
+        let noisy: Vec<f32> = (0..in_size).map(|_| next_f32()).collect();
+        let noise: Vec<f32> = (0..in_size).map(|_| next_f32() * 0.5).collect();
+        session.set_input("noisy_latent", &noisy);
+        session.set_input("noise_target", &noise);
+        session.step();
+        session.dump_gpu_timings();
+        session.wait();
+
+        session.set_profiling(false);
+        return;
     }
 
     // --- Timed runs ---

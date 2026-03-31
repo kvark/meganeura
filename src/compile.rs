@@ -68,7 +68,9 @@ pub enum ShaderEntry {
     Conv2dGradInput,
     Conv2dGradInputGemm,
     Conv2dGradInputGemmSmall,
+    Conv2dGradInputGemmCoop,
     Conv2dGradWeight,
+    Conv2dGradWeightGemm,
     CacheWrite,
     CachedAttention,
     RoPEDynamic,
@@ -134,7 +136,9 @@ impl ShaderEntry {
             ShaderEntry::Conv2dGradInput => ShaderGroup::Conv2dGradInput,
             ShaderEntry::Conv2dGradInputGemm => ShaderGroup::Conv2dGradInputGemm,
             ShaderEntry::Conv2dGradInputGemmSmall => ShaderGroup::Conv2dGradInputGemmSmall,
+            ShaderEntry::Conv2dGradInputGemmCoop => ShaderGroup::Conv2dGradInputGemmCoop,
             ShaderEntry::Conv2dGradWeight => ShaderGroup::Conv2dGradWeight,
+            ShaderEntry::Conv2dGradWeightGemm => ShaderGroup::Conv2dGradWeightGemm,
             ShaderEntry::CacheWrite => ShaderGroup::CacheWrite,
             ShaderEntry::CachedAttention => ShaderGroup::CachedAttention,
             ShaderEntry::RoPEDynamic => ShaderGroup::RoPEDynamic,
@@ -202,8 +206,10 @@ impl ShaderEntry {
             ShaderEntry::Conv2d => "main",
             ShaderEntry::Conv2dGemm | ShaderEntry::Conv2dGemmSmall => "main",
             ShaderEntry::Conv2dGradInput => "main",
-            ShaderEntry::Conv2dGradInputGemm | ShaderEntry::Conv2dGradInputGemmSmall => "main",
-            ShaderEntry::Conv2dGradWeight => "main",
+            ShaderEntry::Conv2dGradInputGemm
+            | ShaderEntry::Conv2dGradInputGemmSmall
+            | ShaderEntry::Conv2dGradInputGemmCoop => "main",
+            ShaderEntry::Conv2dGradWeight | ShaderEntry::Conv2dGradWeightGemm => "main",
             ShaderEntry::CacheWrite => "main",
             ShaderEntry::CachedAttention => "main",
             ShaderEntry::RoPEDynamic => "main",
@@ -1282,9 +1288,12 @@ impl<'a> Compiler<'a> {
                 let out_w = (in_w + 2 * padding - kernel_w) / stride + 1;
                 let out_size = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let batch = out_size / (out_channels * out_h * out_w);
+                // Use GEMM formulation: grad_weight[Co, Ci*kH*kW] = grad_out_flat[Co, N*oH*oW] @ im2col(input)[N*oH*oW, Ci*kH*kW]
+                let n_total = in_channels * kernel_h * kernel_w; // Ci*kH*kW
+                let m_total = out_channels; // Co
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Conv2dGradWeight,
-                    workgroups: [in_channels * kernel_w, kernel_h, out_channels],
+                    shader: ShaderEntry::Conv2dGradWeightGemm,
+                    workgroups: [ceil_div(n_total, 64), ceil_div(m_total, 64), 1],
                     input_buffers: vec![grad_out, input],
                     output_buffer: out_buf,
                     extra_output: None,
