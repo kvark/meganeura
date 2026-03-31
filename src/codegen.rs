@@ -116,6 +116,7 @@ pub enum ShaderGroup {
     Conv2dGradInputGemm,
     Conv2dGradInputGemmSmall,
     Conv2dGradInputGemmCoop,
+    GroupNormSilu,
     Conv2dGradWeight,
     Conv2dGradWeightGemm,
     Conv2dGradWeightGemmSmall,
@@ -181,6 +182,7 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::Conv2dGradInputGemm => gen_conv2d_grad_input_gemm(),
         ShaderGroup::Conv2dGradInputGemmSmall => gen_conv2d_grad_input_gemm_small(),
         ShaderGroup::Conv2dGradInputGemmCoop => gen_conv2d_grad_input_gemm_coop(),
+        ShaderGroup::GroupNormSilu => gen_group_norm_silu(),
         ShaderGroup::Conv2dGradWeight => gen_conv2d_grad_weight(),
         ShaderGroup::Conv2dGradWeightGemm => gen_conv2d_grad_weight_gemm(),
         ShaderGroup::Conv2dGradWeightGemmSmall => gen_conv2d_grad_weight_gemm_small(),
@@ -919,6 +921,10 @@ fn gen_group_norm_grad() -> ShaderModule {
     parse_wgsl(include_str!("shaders/group_norm_grad.wgsl"))
 }
 
+fn gen_group_norm_silu() -> ShaderModule {
+    parse_wgsl(include_str!("shaders/group_norm_silu.wgsl"))
+}
+
 // ---------------------------------------------------------------------------
 // concat.wgsl — Channel concatenation
 // ---------------------------------------------------------------------------
@@ -1480,7 +1486,9 @@ mod tests {
                 ShaderEntry::CachedAttention => {
                     vec!["src_a", "src_b", "bias", "kv_pos_buf", "dst", "params"]
                 }
-                ShaderEntry::GroupNorm => vec!["src", "src_b", "bias", "dst", "params"],
+                ShaderEntry::GroupNorm | ShaderEntry::GroupNormSilu => {
+                    vec!["src", "src_b", "bias", "dst", "params"]
+                }
                 ShaderEntry::GroupNormGradInput => vec!["src_a", "src_b", "bias", "dst", "params"],
                 ShaderEntry::GroupNormGradWeightBias => {
                     vec!["src_a", "src_b", "bias", "dst", "params"]

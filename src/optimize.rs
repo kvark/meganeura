@@ -263,6 +263,7 @@ fn graph_to_egglog(graph: &Graph) -> String {
   (MultiHeadAttn Op Op Op)
   ; --- GroupNorm, Concat, Upsample, Conv2d ops ---
   (GroupNorm Op Op Op)
+  (GroupNormSilu Op Op Op)
   (GroupNormGradInput Op Op Op)
   (GroupNormGradWeightBias Op Op)
   (Concat Op Op)
@@ -418,6 +419,7 @@ fn node_to_egglog_expr(node: &Node) -> String {
             format!("(FusedRmsNormMatMul n{} n{} n{})", i[0], i[1], i[2])
         }
         Op::GroupNorm { .. } => format!("(GroupNorm n{} n{} n{})", i[0], i[1], i[2]),
+        Op::GroupNormSilu { .. } => format!("(GroupNormSilu n{} n{} n{})", i[0], i[1], i[2]),
         Op::GroupNormGradInput { .. } => {
             format!("(GroupNormGradInput n{} n{} n{})", i[0], i[1], i[2])
         }
@@ -689,6 +691,52 @@ fn apply_swiglu_concat_fusions(graph: &mut Graph, fusions: &mut Vec<(String, u32
             "SwiGLU(MatMul,MatMul)→SwiGLUConcat(MatMul)".to_string(),
             id as u32,
         ));
+    }
+}
+
+/// Fuse Silu(GroupNorm(x, w, b)) → GroupNormSilu(x, w, b)
+///
+/// Only fuses if the GroupNorm result is used exclusively by this Silu.
+/// This is inference-only (backward pass can't differentiate through the fused op).
+pub fn apply_group_norm_silu_fusions(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
+    let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
+    for &id in &node_ids {
+        let node = &graph.nodes()[id];
+        if !matches!(node.op, Op::Silu) {
+            continue;
+        }
+        let gn_id = node.inputs[0];
+        let gn_node = graph.node(gn_id);
+        let (num_groups, eps, channels, spatial) = match gn_node.op {
+            Op::GroupNorm {
+                num_groups,
+                eps,
+                channels,
+                spatial,
+            } => (num_groups, eps, channels, spatial),
+            _ => continue,
+        };
+        // Only fuse if GroupNorm has a single consumer
+        let gn_use_count = graph
+            .nodes()
+            .iter()
+            .filter(|n| n.inputs.contains(&gn_id) && !matches!(n.op, Op::Nop))
+            .count();
+        if gn_use_count != 1 {
+            continue;
+        }
+        let (x, w, b) = (gn_node.inputs[0], gn_node.inputs[1], gn_node.inputs[2]);
+        // Rewrite Silu node to GroupNormSilu
+        graph.nodes_mut()[id].op = Op::GroupNormSilu {
+            num_groups,
+            eps,
+            channels,
+            spatial,
+        };
+        graph.nodes_mut()[id].inputs = vec![x, w, b];
+        // Mark old GroupNorm as Nop
+        graph.nodes_mut()[gn_id as usize].op = Op::Nop;
+        fusions.push(("GroupNorm+Silu→GroupNormSilu".to_string(), id as u32));
     }
 }
 

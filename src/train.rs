@@ -231,8 +231,18 @@ pub fn build_inference_session(forward_graph: &Graph) -> Session {
 
     // Optimize with egglog (fusions still help for inference)
     log::info!("running egglog optimization...");
-    let optimized = optimize::optimize(forward_graph);
+    let mut optimized = optimize::optimize(forward_graph);
     log::info!("optimized graph: {} nodes", optimized.nodes().len());
+
+    // Inference-only fusions (no backward pass needed)
+    let mut inference_fusions = Vec::new();
+    optimize::apply_group_norm_silu_fusions(&mut optimized, &mut inference_fusions);
+    if !inference_fusions.is_empty() {
+        log::info!(
+            "inference fusions: {}x GroupNorm+Silu→GroupNormSilu",
+            inference_fusions.len()
+        );
+    }
 
     // Compile to execution plan
     log::info!("compiling execution plan...");

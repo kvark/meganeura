@@ -311,6 +311,15 @@ pub enum Op {
         spatial: u32, // H * W
     },
 
+    /// Fused GroupNorm + SiLU: normalize then apply SiLU activation.
+    /// inputs: [x, weight, bias], same shape as GroupNorm.
+    GroupNormSilu {
+        num_groups: u32,
+        eps: f32,
+        channels: u32,
+        spatial: u32,
+    },
+
     // GroupNorm backward w.r.t. input
     // inputs: [grad_output, input, weight]
     GroupNormGradInput {

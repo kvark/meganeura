@@ -553,7 +553,8 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::FullAttention { .. }
             | Op::CrossAttention { .. }
             | Op::CacheWrite
-            | Op::CachedAttention { .. } => {
+            | Op::CachedAttention { .. }
+            | Op::GroupNormSilu { .. } => {
                 log::warn!(
                     "autodiff not supported for {:?}, inference-only op",
                     node.op

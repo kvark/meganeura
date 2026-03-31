@@ -55,6 +55,7 @@ pub enum ShaderEntry {
     RmsNormGradX,
     FusedRmsNormMatMul,
     GroupNorm,
+    GroupNormSilu,
     GroupNormGradInput,
     GroupNormGradWeightBias,
     Concat,
@@ -125,6 +126,7 @@ impl ShaderEntry {
             ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => ShaderGroup::RmsNormGrad,
             ShaderEntry::FusedRmsNormMatMul => ShaderGroup::FusedRmsNormMatMul,
             ShaderEntry::GroupNorm => ShaderGroup::GroupNorm,
+            ShaderEntry::GroupNormSilu => ShaderGroup::GroupNormSilu,
             ShaderEntry::GroupNormGradInput => ShaderGroup::GroupNormGrad,
             ShaderEntry::GroupNormGradWeightBias => ShaderGroup::GroupNormGrad,
             ShaderEntry::Concat => ShaderGroup::Concat,
@@ -197,7 +199,7 @@ impl ShaderEntry {
             ShaderEntry::RmsNormGradW => "rms_norm_grad_w",
             ShaderEntry::RmsNormGradX => "rms_norm_grad_x",
             ShaderEntry::FusedRmsNormMatMul => "main",
-            ShaderEntry::GroupNorm => "main",
+            ShaderEntry::GroupNorm | ShaderEntry::GroupNormSilu => "main",
             ShaderEntry::GroupNormGradInput => "grad_input",
             ShaderEntry::GroupNormGradWeightBias => "grad_weight_bias",
             ShaderEntry::Concat => "main",
@@ -1001,6 +1003,30 @@ impl<'a> Compiler<'a> {
                 let batch = total / (channels * spatial);
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::GroupNorm,
+                    workgroups: [batch * num_groups, 1, 1],
+                    input_buffers: vec![x, weight, bias],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![batch, channels, spatial, num_groups, eps.to_bits(), 0, 0, 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    label: String::new(),
+                });
+            }
+
+            Op::GroupNormSilu {
+                num_groups,
+                eps,
+                channels,
+                spatial,
+            } => {
+                let x = self.get_buffer(node.inputs[0]);
+                let weight = self.get_buffer(node.inputs[1]);
+                let bias = self.get_buffer(node.inputs[2]);
+                let total = node.ty.shape[0] as u32;
+                let batch = total / (channels * spatial);
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::GroupNormSilu,
                     workgroups: [batch * num_groups, 1, 1],
                     input_buffers: vec![x, weight, bias],
                     output_buffer: out_buf,

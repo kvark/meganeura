@@ -662,7 +662,7 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => BinaryData::layout(),
         ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => CausalAttentionData::layout(),
         ShaderEntry::FusedRmsNormMatMul => CausalAttentionData::layout(),
-        ShaderEntry::GroupNorm => GroupNormData::layout(),
+        ShaderEntry::GroupNorm | ShaderEntry::GroupNormSilu => GroupNormData::layout(),
         ShaderEntry::GroupNormGradInput => GroupNormGradInputData::layout(),
         ShaderEntry::GroupNormGradWeightBias => GroupNormGradWeightBiasData::layout(),
         ShaderEntry::Concat => BinaryData::layout(),
@@ -1993,7 +1993,7 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::GroupNorm => {
+            ShaderEntry::GroupNorm | ShaderEntry::GroupNormSilu => {
                 let p = &dispatch.params;
                 pc.bind(
                     0,
