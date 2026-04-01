@@ -469,6 +469,46 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 accumulate_grad(&mut graph, &mut grads, input, grad_input);
                 accumulate_grad(&mut graph, &mut grads, kernel, grad_kernel);
             }
+            Op::WinogradConv2d {
+                in_channels,
+                in_h,
+                in_w,
+                out_channels,
+                padding,
+            } => {
+                // inputs: [input, winograd_weight, original_weight]
+                let input = node.inputs[0];
+                let original_kernel = node.inputs[2];
+                let in_size = forward.nodes()[input as usize].ty.shape[0] as u32;
+                let batch = in_size / (in_channels * in_h * in_w);
+                let grad_input = graph.conv2d_grad_input(
+                    grad_output,
+                    original_kernel,
+                    batch,
+                    in_channels,
+                    in_h,
+                    in_w,
+                    out_channels,
+                    3,
+                    3,
+                    1,
+                    padding,
+                );
+                let grad_kernel = graph.conv2d_grad_weight(
+                    grad_output,
+                    input,
+                    in_channels,
+                    in_h,
+                    in_w,
+                    out_channels,
+                    3,
+                    3,
+                    1,
+                    padding,
+                );
+                accumulate_grad(&mut graph, &mut grads, input, grad_input);
+                accumulate_grad(&mut graph, &mut grads, original_kernel, grad_kernel);
+            }
             Op::ScatterAdd { .. } => {
                 // ScatterAdd only appears in backward graphs; no further differentiation needed.
             }
@@ -554,8 +594,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::CrossAttention { .. }
             | Op::CacheWrite
             | Op::CachedAttention { .. }
-            | Op::GroupNormSilu { .. }
-            | Op::WinogradConv2d { .. } => {
+            | Op::GroupNormSilu { .. } => {
                 log::warn!(
                     "autodiff not supported for {:?}, inference-only op",
                     node.op

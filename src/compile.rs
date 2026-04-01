@@ -80,6 +80,7 @@ pub enum ShaderEntry {
     WinogradOutputTransform,
     WinogradBatchedMatMul,
     WinogradBatchedMatMulSmall,
+    WinogradWeightTransform,
 }
 
 impl ShaderEntry {
@@ -154,6 +155,7 @@ impl ShaderEntry {
             ShaderEntry::WinogradOutputTransform => ShaderGroup::WinogradOutputTransform,
             ShaderEntry::WinogradBatchedMatMul => ShaderGroup::WinogradBatchedMatMul,
             ShaderEntry::WinogradBatchedMatMulSmall => ShaderGroup::WinogradBatchedMatMulSmall,
+            ShaderEntry::WinogradWeightTransform => ShaderGroup::WinogradWeightTransform,
         }
     }
 
@@ -230,7 +232,8 @@ impl ShaderEntry {
             ShaderEntry::WinogradInputTransform
             | ShaderEntry::WinogradOutputTransform
             | ShaderEntry::WinogradBatchedMatMul
-            | ShaderEntry::WinogradBatchedMatMulSmall => "main",
+            | ShaderEntry::WinogradBatchedMatMulSmall
+            | ShaderEntry::WinogradWeightTransform => "main",
         }
     }
 }
@@ -1288,7 +1291,22 @@ impl<'a> Compiler<'a> {
                 let mm_out_buf = self.alloc_buffer(mm_out_size);
 
                 let input = self.get_buffer(node.inputs[0]);
-                let weight_xform = self.get_buffer(node.inputs[1]); // pre-transformed weights [16*Co*Ci]
+                let weight_xform = self.get_buffer(node.inputs[1]); // Winograd-transformed weights [16*Co*Ci]
+                // input[2] is the original weight [Co*Ci*9] (for backward, and for re-transform)
+                let original_weight = self.get_buffer(node.inputs[2]);
+
+                // Dispatch 0: Weight transform (re-transform every step for training)
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::WinogradWeightTransform,
+                    workgroups: [ceil_div(out_channels * in_channels, 256), 1, 1],
+                    input_buffers: vec![original_weight],
+                    output_buffer: weight_xform,
+                    extra_output: None,
+                    params: vec![out_channels, in_channels, 0, 0, 0, 0, 0, 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    label: String::new(),
+                });
 
                 // Dispatch 1: Input transform
                 self.plan.dispatches.push(Dispatch {

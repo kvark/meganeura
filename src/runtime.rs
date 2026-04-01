@@ -701,9 +701,9 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::RoPEDynamic => RoPEDynamicData::layout(),
         ShaderEntry::CacheWrite => CacheWriteData::layout(),
         ShaderEntry::CachedAttention => CachedAttentionData::layout(),
-        ShaderEntry::WinogradInputTransform | ShaderEntry::WinogradOutputTransform => {
-            WinogradTransformData::layout()
-        }
+        ShaderEntry::WinogradInputTransform
+        | ShaderEntry::WinogradOutputTransform
+        | ShaderEntry::WinogradWeightTransform => WinogradTransformData::layout(),
         ShaderEntry::WinogradBatchedMatMul | ShaderEntry::WinogradBatchedMatMulSmall => {
             MatMulData::layout()
         }
@@ -2329,7 +2329,9 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::WinogradInputTransform | ShaderEntry::WinogradOutputTransform => {
+            ShaderEntry::WinogradInputTransform
+            | ShaderEntry::WinogradOutputTransform
+            | ShaderEntry::WinogradWeightTransform => {
                 let p = &dispatch.params;
                 pc.bind(
                     0,

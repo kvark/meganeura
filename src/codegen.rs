@@ -121,6 +121,7 @@ pub enum ShaderGroup {
     WinogradOutputTransform,
     WinogradBatchedMatMul,
     WinogradBatchedMatMulSmall,
+    WinogradWeightTransform,
     Conv2dGradWeight,
     Conv2dGradWeightGemm,
     Conv2dGradWeightGemmSmall,
@@ -190,6 +191,7 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::WinogradInputTransform => gen_winograd_input_transform(),
         ShaderGroup::WinogradOutputTransform => gen_winograd_output_transform(),
         ShaderGroup::WinogradBatchedMatMul => gen_winograd_batched_matmul(),
+        ShaderGroup::WinogradWeightTransform => gen_winograd_weight_transform(),
         ShaderGroup::WinogradBatchedMatMulSmall => {
             // Placeholder — shader not yet written, reuse regular for now
             gen_winograd_batched_matmul()
@@ -952,6 +954,10 @@ fn gen_winograd_batched_matmul() -> ShaderModule {
     parse_wgsl(include_str!("shaders/winograd_matmul.wgsl"))
 }
 
+fn gen_winograd_weight_transform() -> ShaderModule {
+    parse_wgsl(include_str!("shaders/winograd_weight_transform.wgsl"))
+}
+
 // ---------------------------------------------------------------------------
 // concat.wgsl — Channel concatenation
 // ---------------------------------------------------------------------------
@@ -1548,6 +1554,7 @@ mod tests {
                 ShaderEntry::WinogradBatchedMatMul | ShaderEntry::WinogradBatchedMatMulSmall => {
                     vec!["matrix_a", "matrix_b", "matrix_c", "params"]
                 }
+                ShaderEntry::WinogradWeightTransform => vec!["src", "dst", "params"],
             }
         }
 

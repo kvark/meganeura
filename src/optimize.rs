@@ -484,6 +484,7 @@ fn rebuild_graph_from_extractions(
         let n = fusions.len();
         apply_matmul_add_fusions(&mut graph, &mut fusions);
         apply_swiglu_concat_fusions(&mut graph, &mut fusions);
+        // Winograd applied selectively via inference or with size threshold
         // RmsNorm+MatMul fusion: disabled on iGPU — the fused kernel's
         // per-element normalization (2 extra FMAs/element in tile loads)
         // outweighs the saved intermediate write (144KB). Enable via cost
@@ -775,9 +776,14 @@ pub fn apply_winograd_conv_fusions(graph: &mut Graph, fusions: &mut Vec<(String,
                 ),
                 _ => continue,
             };
-        // Only match 3×3 stride-1 convolutions
+        // Only match 3×3 stride-1 convolutions with enough channels to
+        // amortize transform overhead (input/output transforms are O(tiles)
+        // while matmul savings are O(tiles × Ci)).
         if kernel_h != 3 || kernel_w != 3 || stride != 1 {
             continue;
+        }
+        if (in_channels * out_channels) < 4096 {
+            continue; // too small, GEMM is faster
         }
 
         let weight_id = node.inputs[1];
