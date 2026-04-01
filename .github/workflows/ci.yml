@@ -59,3 +59,11 @@ jobs:
 
       - name: Vision ops smoke test
         run: cargo test --test vision_ops_smoke -- --skip vision_encoder_one_layer
+
+      - name: Latency benchmark
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p bench/results
+          cargo run --release --example bench_ci_latency > bench/results/ci_latency.json 2>/dev/null
+          cat bench/results/ci_latency.json
+          python3 bench/check_latency.py bench/results/ci_latency.json
