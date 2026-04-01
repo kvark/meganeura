@@ -1,0 +1,10 @@
+{
+  "benchmark": "ci_latency",
+  "forward_avg_ms": 3.15,
+  "forward_median_ms": 3.11,
+  "train_step_avg_ms": 6.83,
+  "train_step_median_ms": 6.62,
+  "loss": 2.302585,
+  "runs": 10,
+  "warmup": 3
+}

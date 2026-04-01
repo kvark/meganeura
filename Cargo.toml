@@ -74,5 +74,9 @@ name = "onnx_compare"
 path = "examples/onnx_compare.rs"
 
 [[example]]
+name = "bench_ci_latency"
+path = "bench/bench_ci_latency.rs"
+
+[[example]]
 name = "grad_check"
 path = "bench/grad_check.rs"
