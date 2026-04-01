@@ -16,7 +16,7 @@ Meganeura - a cross-platform Neural Network training and inference library in Ru
 
 ## Benchmarks
 
-See [Infermark](https://kvark.github.io/infermark/) for a comprehensive comparison between different frameworks.
+See [Inferena](https://kvark.github.io/inferena/) for a comprehensive comparison between different frameworks.
 
 SmolVLA action expert training (chunk_size=50, vlm_seq_len=16, float32, random weights).
 Full GQA (15/5 heads, head_dim=64), exact backward through all ops including fused MHA and RmsNorm:
@@ -48,3 +48,12 @@ It works on on anything with Vulkan, including LavaPipe, or MacOS devices.
 Runs best when [cooperative matrix operations](https://registry.khronos.org/vulkan/specs/latest/man/html/VK_KHR_cooperative_matrix.html) is hardware-accelerated for 8x8 tile math:
 - **Vulkan**: GPU and driver supporting `VK_KHR_cooperative_matrix` (NVIDIA Volta+, AMD RDNA3+, Intel Arc)
 - **Metal**: Apple GPU with simdgroup matrix support (Apple M1+)
+
+## Standard Model Loading
+
+Meganeura can load models from standard interchange formats and run them through the normal pipeline (e-graph optimization → compile → GPU execution) without any Rust codegen:
+
+- **ONNX** — via `load_onnx("model.onnx")`. Uses [oxionnx-proto](https://crates.io/crates/oxionnx-proto) for lightweight protobuf parsing. Supports Gemm, MatMul, activations, normalization, attention, convolution, and shape ops. Decomposed subgraphs (from `torch.onnx.export`) should be re-exported with compound ops preserved via `optimum-cli`.
+- **NNEF** — via `load_nnef("model_dir/")`. Hand-rolled parser for the Khronos [NNEF](https://www.khronos.org/nnef/) text format and binary tensor files. Supports matmul, linear, convolution, activations, normalization, and reshape ops.
+
+Both loaders translate the foreign graph into Meganeura's IR, where the e-graph optimizer discovers kernel fusions (e.g. `x * sigmoid(x)` → Silu, `Silu(gate) * up` → SwiGLU) before compilation.

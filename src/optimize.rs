@@ -319,6 +319,18 @@ fn graph_to_egglog(graph: &Graph) -> String {
 ; concatenation since egglog can't create new tensors.
 ; (documented here; applied by apply_swiglu_concat_fusions)
 
+; --- ONNX decomposed op recognition ---
+; PyTorch decomposes compound ops when exporting to ONNX.
+; These rules recognize the decomposed patterns and fuse them back
+; into our efficient compound kernels.
+
+; Silu: x * sigmoid(x) → Silu(x)
+(rewrite (Mul ?x (Sigmoid ?x)) (Silu ?x))
+(rewrite (Mul (Sigmoid ?x) ?x) (Silu ?x))
+
+; SwiGLU: silu(gate) * up → SwiGLU(gate, up)
+(rewrite (Mul (Silu ?gate) ?up) (SwiGLU ?gate ?up))
+
 ",
     );
 
@@ -481,6 +493,8 @@ fn rebuild_graph_from_extractions(
     loop {
         let n = fusions.len();
         apply_matmul_add_fusions(&mut graph, &mut fusions);
+        apply_silu_fusions(&mut graph, &mut fusions);
+        apply_swiglu_fusions(&mut graph, &mut fusions);
         apply_swiglu_concat_fusions(&mut graph, &mut fusions);
         // RmsNorm+MatMul fusion: disabled on iGPU — the fused kernel's
         // per-element normalization (2 extra FMAs/element in tile loads)
@@ -783,6 +797,76 @@ fn apply_rms_norm_matmul_fusions(graph: &mut Graph, fusions: &mut Vec<(String, u
         graph.nodes_mut()[norm_id as usize].op = Op::Nop;
 
         fusions.push(("RmsNorm+MatMul→FusedRmsNormMatMul".to_string(), id as u32));
+    }
+}
+
+/// Fuse Mul(x, Sigmoid(x)) → Silu(x) via direct pattern matching.
+///
+/// PyTorch decomposes Silu to x * sigmoid(x) in ONNX exports.
+fn apply_silu_fusions(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
+    let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
+    for &id in &node_ids {
+        let node = &graph.nodes()[id];
+        if !matches!(node.op, Op::Mul) {
+            continue;
+        }
+        let (a_id, b_id) = (node.inputs[0], node.inputs[1]);
+        // Check: Mul(x, Sigmoid(x)) or Mul(Sigmoid(x), x)
+        let (x, sig_id) = if matches!(graph.node(b_id).op, Op::Sigmoid)
+            && graph.node(b_id).inputs[0] == a_id
+        {
+            (a_id, b_id)
+        } else if matches!(graph.node(a_id).op, Op::Sigmoid) && graph.node(a_id).inputs[0] == b_id {
+            (b_id, a_id)
+        } else {
+            continue;
+        };
+        // Only fuse if Sigmoid has a single consumer (this Mul)
+        let sig_use_count = graph
+            .nodes()
+            .iter()
+            .filter(|n| n.inputs.contains(&sig_id) && !matches!(n.op, Op::Nop))
+            .count();
+        if sig_use_count != 1 {
+            continue;
+        }
+        graph.nodes_mut()[id].op = Op::Silu;
+        graph.nodes_mut()[id].inputs = vec![x];
+        graph.nodes_mut()[sig_id as usize].op = Op::Nop;
+        fusions.push(("Mul+Sigmoid→Silu".to_string(), id as u32));
+    }
+}
+
+/// Fuse Mul(Silu(gate), up) → SwiGLU(gate, up) via direct pattern matching.
+fn apply_swiglu_fusions(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
+    let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
+    for &id in &node_ids {
+        let node = &graph.nodes()[id];
+        if !matches!(node.op, Op::Mul) {
+            continue;
+        }
+        let (a_id, b_id) = (node.inputs[0], node.inputs[1]);
+        // Check: Mul(Silu(gate), up)
+        let (gate, up, silu_id) = if matches!(graph.node(a_id).op, Op::Silu) {
+            (graph.node(a_id).inputs[0], b_id, a_id)
+        } else if matches!(graph.node(b_id).op, Op::Silu) {
+            (graph.node(b_id).inputs[0], a_id, b_id)
+        } else {
+            continue;
+        };
+        // Only fuse if Silu has a single consumer
+        let silu_use_count = graph
+            .nodes()
+            .iter()
+            .filter(|n| n.inputs.contains(&silu_id) && !matches!(n.op, Op::Nop))
+            .count();
+        if silu_use_count != 1 {
+            continue;
+        }
+        graph.nodes_mut()[id].op = Op::SwiGLU;
+        graph.nodes_mut()[id].inputs = vec![gate, up];
+        graph.nodes_mut()[silu_id as usize].op = Op::Nop;
+        fusions.push(("Silu+Mul→SwiGLU".to_string(), id as u32));
     }
 }
 
@@ -1160,6 +1244,56 @@ mod tests {
                 .iter()
                 .any(|(name, _)| name.contains("BT")),
             "no BT fusion in report"
+        );
+    }
+
+    /// E-graph recognizes x * sigmoid(x) → Silu(x).
+    #[test]
+    fn test_silu_fusion() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 8]);
+        let sig = g.sigmoid(x);
+        let out = g.mul(x, sig);
+        g.set_outputs(vec![out]);
+
+        let (opt, report) = optimize_with_report(&g);
+        // The output should now be Silu
+        let has_silu = opt.nodes().iter().any(|n| matches!(n.op, Op::Silu));
+        assert!(
+            has_silu,
+            "expected Silu fusion, got nodes: {:?}",
+            opt.nodes()
+                .iter()
+                .map(|n| format!("{:?}", n.op))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !report.fusions_applied.is_empty() || has_silu,
+            "no Silu fusion detected"
+        );
+    }
+
+    /// Pattern matcher recognizes Silu+Mul → SwiGLU.
+    #[test]
+    fn test_swiglu_from_decomposed() {
+        let mut g = Graph::new();
+        let gate = g.input("gate", &[4, 8]);
+        let up = g.input("up", &[4, 8]);
+        // Decomposed SwiGLU: silu(gate) * up
+        let sig = g.sigmoid(gate);
+        let silu = g.mul(gate, sig);
+        let out = g.mul(silu, up);
+        g.set_outputs(vec![out]);
+
+        let (opt, _report) = optimize_with_report(&g);
+        let has_swiglu = opt.nodes().iter().any(|n| matches!(n.op, Op::SwiGLU));
+        assert!(
+            has_swiglu,
+            "expected SwiGLU fusion from decomposed silu*up, got nodes: {:?}",
+            opt.nodes()
+                .iter()
+                .map(|n| format!("{:?}", n.op))
+                .collect::<Vec<_>>()
         );
     }
 }

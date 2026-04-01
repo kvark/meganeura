@@ -25,6 +25,7 @@ pub mod codegen;
 pub mod compile;
 pub mod data;
 pub mod graph;
+pub mod load;
 pub mod models;
 pub mod nn;
 pub mod optimize;
@@ -34,6 +35,8 @@ pub mod train;
 
 pub use data::{DataLoader, MnistDataset};
 pub use graph::{DType, Graph, NodeId, TensorType};
+pub use load::nnef::{NnefError, NnefModel, load_nnef};
+pub use load::onnx::{OnnxError, OnnxModel, load_onnx, load_onnx_bytes};
 pub use optimize::OptimizeReport;
 pub use runtime::{MemorySummary, Session};
 pub use train::{
