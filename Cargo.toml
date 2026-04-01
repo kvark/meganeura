@@ -21,8 +21,11 @@ log = "0.4"
 env_logger = "0.11"
 flate2 = "1"
 safetensors = "0.4"
-hf-hub = { version = "0.4", default-features = false, features = ["ureq", "native-tls"] }
+hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"] }
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+oxionnx-core = "0.1"
+oxionnx-proto = "0.1"
+half = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["registry"] }
 
@@ -65,6 +68,10 @@ path = "bench/bench_smolvla_meganeura.rs"
 [[example]]
 name = "bench_smolvla_train"
 path = "bench/bench_smolvla_train.rs"
+
+[[example]]
+name = "onnx_compare"
+path = "examples/onnx_compare.rs"
 
 [[example]]
 name = "grad_check"
