@@ -74,6 +74,14 @@ name = "onnx_compare"
 path = "examples/onnx_compare.rs"
 
 [[example]]
+name = "resnet"
+path = "examples/resnet.rs"
+
+[[example]]
+name = "whisper"
+path = "examples/whisper.rs"
+
+[[example]]
 name = "bench_ci_latency"
 path = "bench/bench_ci_latency.rs"
 

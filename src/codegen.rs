@@ -123,6 +123,8 @@ pub enum ShaderGroup {
     CacheWrite,
     CachedAttention,
     RoPEDynamic,
+    MaxPool2d,
+    GlobalAvgPool,
 }
 
 /// Generate a `naga::Module` for a shader group.
@@ -189,6 +191,8 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::CacheWrite => gen_cache_write(),
         ShaderGroup::CachedAttention => gen_cached_attention(),
         ShaderGroup::RoPEDynamic => gen_rope_dynamic(),
+        ShaderGroup::MaxPool2d => gen_max_pool_2d(),
+        ShaderGroup::GlobalAvgPool => gen_global_avg_pool(),
     }
 }
 
@@ -1092,6 +1096,14 @@ fn gen_cached_attention() -> ShaderModule {
     parse_wgsl(include_str!("shaders/cached_attention.wgsl"))
 }
 
+fn gen_max_pool_2d() -> ShaderModule {
+    parse_wgsl(include_str!("shaders/max_pool_2d.wgsl"))
+}
+
+fn gen_global_avg_pool() -> ShaderModule {
+    parse_wgsl(include_str!("shaders/global_avg_pool.wgsl"))
+}
+
 // ---------------------------------------------------------------------------
 // multi_head_attn (forward, saves LSE for backward)
 // Same as gen_attention_parallel(false, true) but with an extra `lse` binding.
@@ -1515,6 +1527,9 @@ mod tests {
                     vec!["grad_out", "src", "dst", "params"]
                 }
                 ShaderEntry::RoPEDynamic => vec!["src", "dst", "pos_offset_buf", "params"],
+                ShaderEntry::MaxPool2d | ShaderEntry::GlobalAvgPool => {
+                    vec!["src", "dst", "params"]
+                }
             }
         }
 
@@ -1583,6 +1598,8 @@ mod tests {
             ShaderEntry::CacheWrite,
             ShaderEntry::CachedAttention,
             ShaderEntry::RoPEDynamic,
+            ShaderEntry::MaxPool2d,
+            ShaderEntry::GlobalAvgPool,
         ];
 
         for entry in &entries {
