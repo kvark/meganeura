@@ -1305,11 +1305,10 @@ impl Graph {
         channels: u32,
         spatial: u32,
     ) -> NodeId {
-        let out_size = batch as usize * channels as usize;
         self.add_node(
             Op::GlobalAvgPool { channels, spatial },
             vec![input],
-            TensorType::f32(vec![out_size]),
+            TensorType::f32(vec![batch as usize, channels as usize]),
         )
     }
 

@@ -50,13 +50,19 @@ pub fn build_encoder(g: &mut Graph, config: &WhisperConfig, batch: u32, mel_len:
 
     // --- Conv stem ---
     // Conv1: (n_mels → d_model, kernel=3, stride=1, padding=1)
-    // Treated as Conv2d with H=1: input [batch, 80, 1, mel_len]
+    // Treated as Conv2d with H=1: input [batch, n_mels, 1, mel_len]
     let mel = g.input("mel", &[(batch * config.n_mels as u32 * mel_len) as usize]);
     let conv1_w = g.parameter(
         &format!("{prefix}.conv1.weight"),
         &[d * config.n_mels * 3], // [d_model, n_mels, 3] flattened
     );
-    let conv1_b = g.parameter(&format!("{prefix}.conv1.bias"), &[d]);
+    // Conv bias is stored pre-expanded to [batch * d_model * 1 * mel_len] at load time
+    // (NCHW channel bias requires spatial broadcast, like BatchNorm fusion)
+    let conv1_out_spatial = mel_len; // stride=1, padding=1, kernel=3 → same length
+    let conv1_b = g.parameter(
+        &format!("{prefix}.conv1.fused_bias"),
+        &[(batch as usize * d * conv1_out_spatial as usize)],
+    );
     let x = g.conv2d(
         mel,
         conv1_w,
@@ -70,24 +76,21 @@ pub fn build_encoder(g: &mut Graph, config: &WhisperConfig, batch: u32, mel_len:
         1,
         1,
     );
-    let x = g.bias_add(x, conv1_b);
+    let x = g.add(x, conv1_b);
     let x = g.gelu(x);
-    // After conv1: [batch, d_model, 1, mel_len] → still mel_len temporal
 
     // Conv2: (d_model → d_model, kernel=3, stride=2, padding=1)
-    let conv2_w = g.parameter(
-        &format!("{prefix}.conv2.weight"),
-        &[d * d * 3], // [d_model, d_model, 3] flattened
+    let seq_len = (mel_len + 2 - 3) / 2 + 1; // after stride-2 conv with padding=1
+    let conv2_w = g.parameter(&format!("{prefix}.conv2.weight"), &[d * d * 3]);
+    let conv2_b = g.parameter(
+        &format!("{prefix}.conv2.fused_bias"),
+        &[(batch as usize * d * seq_len as usize)],
     );
-    let conv2_b = g.parameter(&format!("{prefix}.conv2.bias"), &[d]);
     let x = g.conv2d(
         x, conv2_w, batch, d as u32, 1, mel_len, d as u32, 1, 3, 2, 1,
     );
-    let x = g.bias_add(x, conv2_b);
+    let x = g.add(x, conv2_b);
     let x = g.gelu(x);
-    // After conv2: [batch, d_model, 1, seq_len] where seq_len = mel_len/2
-
-    let seq_len = (mel_len + 2 - 3) / 2 + 1; // after stride-2 conv with padding=1
 
     // The conv output is [batch * d_model * seq_len] in NCHW(flat).
     // We need it as [batch * seq_len, d_model] for the transformer.
@@ -96,27 +99,17 @@ pub fn build_encoder(g: &mut Graph, config: &WhisperConfig, batch: u32, mel_len:
     // the channel and spatial dims. For now, use a parameter-based
     // positional embedding that adds directly.
 
-    // Positional embedding: [max_source_positions, d_model]
-    // We slice to [seq_len, d_model] (or load the right amount)
+    // Conv output is [d_model, seq_len] (NCHW flat with batch=1, H=1).
+    // Transpose to [seq_len, d_model] for the transformer layers.
+    assert_eq!(batch, 1, "Whisper encoder currently supports batch=1 only");
+    let x = g.transpose(x); // [d_model, seq_len] → [seq_len, d_model]
+
+    // Add positional embedding
     let pos_embed = g.parameter(
         &format!("{prefix}.embed_positions.weight"),
         &[seq_len as usize, d],
     );
-
-    // The conv output needs to be reshaped from [batch, d, seq] to [batch*seq, d].
-    // Since we can't do general transpose in the IR, we add positional embeddings
-    // as a constant offset. The actual reshape from NCHW to seq-major would need
-    // a Transpose op that we don't have for >2D yet.
-    //
-    // For a functional encoder, the user would need to handle this reshape
-    // externally or we'd need general Transpose support.
-    // For now, we demonstrate the graph structure with the understood limitation.
-    let _ = pos_embed;
-
-    // --- Transformer layers ---
-    // Each layer: LayerNorm → FullAttention → residual → LayerNorm → FFN → residual
-    // Input/output: [batch * seq_len, d_model]
-    let mut x = x; // [batch * d_model * seq_len] — flat, needs reshape for attn
+    let mut x = g.add(x, pos_embed);
 
     for i in 0..config.n_layers {
         let lname = format!("{prefix}.layers.{i}");
