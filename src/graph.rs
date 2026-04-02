@@ -300,6 +300,24 @@ pub enum Op {
         padding: u32,
     },
 
+    /// 2D max pooling: input[N,C,H,W] → output[N,C,oH,oW]
+    MaxPool2d {
+        channels: u32,
+        in_h: u32,
+        in_w: u32,
+        kernel_h: u32,
+        kernel_w: u32,
+        stride: u32,
+        padding: u32,
+    },
+
+    /// Global average pooling: input[N*C*H*W] → output[N*C]
+    /// Averages over the spatial dimensions (H,W) for each channel.
+    GlobalAvgPool {
+        channels: u32,
+        spatial: u32, // H * W
+    },
+
     // --- GroupNorm ---
 
     // Group normalization: input[N*C*H*W] with weight[C], bias[C]
@@ -1247,6 +1265,51 @@ impl Graph {
             },
             vec![grad_output, input],
             ty,
+        )
+    }
+
+    pub fn max_pool_2d(
+        &mut self,
+        input: NodeId,
+        batch: u32,
+        channels: u32,
+        in_h: u32,
+        in_w: u32,
+        kernel_h: u32,
+        kernel_w: u32,
+        stride: u32,
+        padding: u32,
+    ) -> NodeId {
+        let out_h = (in_h + 2 * padding - kernel_h) / stride + 1;
+        let out_w = (in_w + 2 * padding - kernel_w) / stride + 1;
+        let out_size = batch as usize * channels as usize * out_h as usize * out_w as usize;
+        self.add_node(
+            Op::MaxPool2d {
+                channels,
+                in_h,
+                in_w,
+                kernel_h,
+                kernel_w,
+                stride,
+                padding,
+            },
+            vec![input],
+            TensorType::f32(vec![out_size]),
+        )
+    }
+
+    pub fn global_avg_pool(
+        &mut self,
+        input: NodeId,
+        batch: u32,
+        channels: u32,
+        spatial: u32,
+    ) -> NodeId {
+        let out_size = batch as usize * channels as usize;
+        self.add_node(
+            Op::GlobalAvgPool { channels, spatial },
+            vec![input],
+            TensorType::f32(vec![out_size]),
         )
     }
 

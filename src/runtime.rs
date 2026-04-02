@@ -355,6 +355,48 @@ struct Conv2dParams {
     _pad: u32,
 }
 
+// max_pool_2d: var src, dst, params
+#[derive(blade_macros::ShaderData)]
+struct MaxPool2dData {
+    src: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: MaxPool2dParams,
+}
+
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct MaxPool2dParams {
+    batch: u32,
+    channels: u32,
+    in_h: u32,
+    in_w: u32,
+    kernel_h: u32,
+    kernel_w: u32,
+    stride: u32,
+    padding: u32,
+    out_h: u32,
+    out_w: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+// global_avg_pool: var src, dst, params
+#[derive(blade_macros::ShaderData)]
+struct GlobalAvgPoolData {
+    src: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: GlobalAvgPoolParams,
+}
+
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct GlobalAvgPoolParams {
+    channels: u32,
+    spatial: u32,
+    total_out: u32,
+    _pad: u32,
+}
+
 // cached_attention: var src_a (q), src_b (k_cache), bias (v_cache), kv_pos_buf, dst, params
 #[derive(blade_macros::ShaderData)]
 struct CachedAttentionData {
@@ -680,6 +722,8 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::RoPEDynamic => RoPEDynamicData::layout(),
         ShaderEntry::CacheWrite => CacheWriteData::layout(),
         ShaderEntry::CachedAttention => CachedAttentionData::layout(),
+        ShaderEntry::MaxPool2d => MaxPool2dData::layout(),
+        ShaderEntry::GlobalAvgPool => GlobalAvgPoolData::layout(),
     }
 }
 
@@ -2237,6 +2281,44 @@ impl Session {
                             m: dispatch.params[0],
                             n: dispatch.params[1],
                             k: dispatch.params[2],
+                            _pad: dispatch.params[3],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::MaxPool2d => {
+                pc.bind(
+                    0,
+                    &MaxPool2dData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: MaxPool2dParams {
+                            batch: dispatch.params[0],
+                            channels: dispatch.params[1],
+                            in_h: dispatch.params[2],
+                            in_w: dispatch.params[3],
+                            kernel_h: dispatch.params[4],
+                            kernel_w: dispatch.params[5],
+                            stride: dispatch.params[6],
+                            padding: dispatch.params[7],
+                            out_h: dispatch.params[8],
+                            out_w: dispatch.params[9],
+                            _pad0: dispatch.params[10],
+                            _pad1: dispatch.params[11],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::GlobalAvgPool => {
+                pc.bind(
+                    0,
+                    &GlobalAvgPoolData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: GlobalAvgPoolParams {
+                            channels: dispatch.params[0],
+                            spatial: dispatch.params[1],
+                            total_out: dispatch.params[2],
                             _pad: dispatch.params[3],
                         },
                     },

@@ -809,28 +809,44 @@ fn translate_node(
             }
         }
 
-        // --- Conv2d ---
+        // --- Conv (1D or 2D) ---
+        // Conv1d [N,C,L] is treated as Conv2d with H=1: [N,C,1,L]
         OpKind::Conv => {
             let input = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
             let kernel = resolve_input(&node.inputs[1], name_to_id, &node.name)?;
             let input_shape = get_shape(&node.inputs[0], shapes);
             let kernel_shape = get_shape(&node.inputs[1], shapes);
 
-            if input_shape.len() != 4 || kernel_shape.len() != 4 {
-                return Err(OnnxError::UnsupportedOp(format!(
-                    "Conv: expected 4D input and kernel, got {}D and {}D",
-                    input_shape.len(),
-                    kernel_shape.len()
-                )));
-            }
-
-            let batch = input_shape[0] as u32;
-            let in_channels = input_shape[1] as u32;
-            let in_h = input_shape[2] as u32;
-            let in_w = input_shape[3] as u32;
-            let out_channels = kernel_shape[0] as u32;
-            let kernel_h = kernel_shape[2] as u32;
-            let kernel_w = kernel_shape[3] as u32;
+            let (batch, in_channels, in_h, in_w, out_channels, kernel_h, kernel_w) =
+                if input_shape.len() == 4 && kernel_shape.len() == 4 {
+                    // Standard Conv2d
+                    (
+                        input_shape[0] as u32,
+                        input_shape[1] as u32,
+                        input_shape[2] as u32,
+                        input_shape[3] as u32,
+                        kernel_shape[0] as u32,
+                        kernel_shape[2] as u32,
+                        kernel_shape[3] as u32,
+                    )
+                } else if input_shape.len() == 3 && kernel_shape.len() == 3 {
+                    // Conv1d: [N,C,L] → treat as [N,C,1,L]
+                    (
+                        input_shape[0] as u32,
+                        input_shape[1] as u32,
+                        1u32,
+                        input_shape[2] as u32,
+                        kernel_shape[0] as u32,
+                        1u32,
+                        kernel_shape[2] as u32,
+                    )
+                } else {
+                    return Err(OnnxError::UnsupportedOp(format!(
+                        "Conv: expected 3D or 4D input/kernel, got {}D and {}D",
+                        input_shape.len(),
+                        kernel_shape.len()
+                    )));
+                };
 
             let strides = attrs.ints("strides");
             let pads = attrs.ints("pads");
@@ -853,12 +869,17 @@ fn translate_node(
 
             let out_h = (in_h + 2 * padding - kernel_h) / stride + 1;
             let out_w = (in_w + 2 * padding - kernel_w) / stride + 1;
-            let out_shape = vec![
-                batch as usize,
-                out_channels as usize,
-                out_h as usize,
-                out_w as usize,
-            ];
+            let out_shape = if input_shape.len() == 3 {
+                // Conv1d output: [N, C_out, L_out]
+                vec![batch as usize, out_channels as usize, out_w as usize]
+            } else {
+                vec![
+                    batch as usize,
+                    out_channels as usize,
+                    out_h as usize,
+                    out_w as usize,
+                ]
+            };
 
             // Add bias if present
             let out = if node.inputs.len() > 2 && !node.inputs[2].is_empty() {
@@ -923,6 +944,129 @@ fn translate_node(
                     "GroupNorm: only 4D (NCHW) input supported".into(),
                 ));
             }
+        }
+
+        // --- BatchNormalization (inference mode) ---
+        // Decompose: output = scale * (x - mean) / sqrt(var + eps) + bias
+        // In inference mode, mean and var are running statistics (constants).
+        // We precompute: w = scale / sqrt(var + eps), b = bias - mean * w
+        // Then: output = x * w + b  (per-channel, broadcast over spatial dims)
+        OpKind::BatchNorm => {
+            let x = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
+            let x_shape = get_shape(&node.inputs[0], shapes);
+            let eps = attrs.f("epsilon", 1e-5);
+
+            if x_shape.len() != 4 {
+                return Err(OnnxError::UnsupportedOp(
+                    "BatchNormalization: only 4D (NCHW) supported".into(),
+                ));
+            }
+
+            // Get scale, bias, mean, var from weights (they're initializers)
+            let scale_data = weights
+                .get(&node.inputs[1])
+                .ok_or_else(|| OnnxError::ShapeError("BatchNorm: missing scale".into()))?;
+            let bias_data = weights
+                .get(&node.inputs[2])
+                .ok_or_else(|| OnnxError::ShapeError("BatchNorm: missing bias".into()))?;
+            let mean_data = weights
+                .get(&node.inputs[3])
+                .ok_or_else(|| OnnxError::ShapeError("BatchNorm: missing mean".into()))?;
+            let var_data = weights
+                .get(&node.inputs[4])
+                .ok_or_else(|| OnnxError::ShapeError("BatchNorm: missing var".into()))?;
+
+            let c = scale_data.len();
+            // Precompute fused weight and bias per channel
+            let mut fused_w = vec![0.0f32; c];
+            let mut fused_b = vec![0.0f32; c];
+            for i in 0..c {
+                let inv_std = 1.0 / (var_data[i] + eps).sqrt();
+                fused_w[i] = scale_data[i] * inv_std;
+                fused_b[i] = bias_data[i] - mean_data[i] * fused_w[i];
+            }
+
+            // x * fused_w + fused_b (broadcast over spatial dims)
+            // For NCHW: fused_w/fused_b are [C], need to broadcast over [N,C,H,W]
+            // Expand to full spatial: tile [C] → [N*C*H*W]
+            let n = x_shape[0];
+            let h = x_shape[2];
+            let w = x_shape[3];
+            let spatial = h * w;
+            let full_size = n * c * spatial;
+            let mut w_expanded = vec![0.0f32; full_size];
+            let mut b_expanded = vec![0.0f32; full_size];
+            for batch in 0..n {
+                for ch in 0..c {
+                    for s in 0..spatial {
+                        let idx = (batch * c + ch) * spatial + s;
+                        w_expanded[idx] = fused_w[ch];
+                        b_expanded[idx] = fused_b[ch];
+                    }
+                }
+            }
+
+            let w_node = graph.constant(w_expanded, &[full_size]);
+            let b_node = graph.constant(b_expanded, &[full_size]);
+            let scaled = graph.mul(x, w_node);
+            let out = graph.add(scaled, b_node);
+            register_output(node, 0, out, &x_shape, name_to_id, shapes);
+        }
+
+        // --- MaxPool ---
+        OpKind::MaxPool => {
+            let input = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
+            let input_shape = get_shape(&node.inputs[0], shapes);
+            if input_shape.len() != 4 {
+                return Err(OnnxError::UnsupportedOp(
+                    "MaxPool: only 4D (NCHW) supported".into(),
+                ));
+            }
+
+            let channels = input_shape[1] as u32;
+            let in_h = input_shape[2] as u32;
+            let in_w = input_shape[3] as u32;
+            let batch = input_shape[0] as u32;
+
+            let kernel_shape = attrs.ints("kernel_shape");
+            let strides = attrs.ints("strides");
+            let pads = attrs.ints("pads");
+            let kh = kernel_shape.first().copied().unwrap_or(2) as u32;
+            let kw = kernel_shape.get(1).copied().unwrap_or(kh as i64) as u32;
+            let stride = strides.first().copied().unwrap_or(kh as i64) as u32;
+            let padding = pads.first().copied().unwrap_or(0) as u32;
+
+            let out =
+                graph.max_pool_2d(input, batch, channels, in_h, in_w, kh, kw, stride, padding);
+
+            let out_h = (in_h + 2 * padding - kh) / stride + 1;
+            let out_w = (in_w + 2 * padding - kw) / stride + 1;
+            let out_shape = vec![
+                batch as usize,
+                channels as usize,
+                out_h as usize,
+                out_w as usize,
+            ];
+            register_output(node, 0, out, &out_shape, name_to_id, shapes);
+        }
+
+        // --- GlobalAveragePool ---
+        OpKind::GlobalAveragePool => {
+            let input = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
+            let input_shape = get_shape(&node.inputs[0], shapes);
+            if input_shape.len() != 4 {
+                return Err(OnnxError::UnsupportedOp(
+                    "GlobalAveragePool: only 4D (NCHW) supported".into(),
+                ));
+            }
+
+            let batch = input_shape[0] as u32;
+            let channels = input_shape[1] as u32;
+            let spatial = (input_shape[2] * input_shape[3]) as u32;
+
+            let out = graph.global_avg_pool(input, batch, channels, spatial);
+            let out_shape = vec![input_shape[0], input_shape[1], 1, 1];
+            register_output(node, 0, out, &out_shape, name_to_id, shapes);
         }
 
         // --- Unsupported ops produce a clear error ---

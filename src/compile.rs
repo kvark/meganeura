@@ -76,6 +76,8 @@ pub enum ShaderEntry {
     CacheWrite,
     CachedAttention,
     RoPEDynamic,
+    MaxPool2d,
+    GlobalAvgPool,
 }
 
 impl ShaderEntry {
@@ -146,6 +148,8 @@ impl ShaderEntry {
             ShaderEntry::CacheWrite => ShaderGroup::CacheWrite,
             ShaderEntry::CachedAttention => ShaderGroup::CachedAttention,
             ShaderEntry::RoPEDynamic => ShaderGroup::RoPEDynamic,
+            ShaderEntry::MaxPool2d => ShaderGroup::MaxPool2d,
+            ShaderEntry::GlobalAvgPool => ShaderGroup::GlobalAvgPool,
         }
     }
 
@@ -219,6 +223,8 @@ impl ShaderEntry {
             ShaderEntry::CacheWrite => "main",
             ShaderEntry::CachedAttention => "main",
             ShaderEntry::RoPEDynamic => "main",
+            ShaderEntry::MaxPool2d => "max_pool_2d",
+            ShaderEntry::GlobalAvgPool => "global_avg_pool",
         }
     }
 }
@@ -1390,6 +1396,53 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_output: None,
                     params: vec![0, num_heads, num_kv_heads, head_dim], // kv_len read from input buffer
+                    use_coop: false,
+                    use_small_tiles: false,
+                    label: String::new(),
+                });
+            }
+
+            Op::MaxPool2d {
+                channels,
+                in_h,
+                in_w,
+                kernel_h,
+                kernel_w,
+                stride,
+                padding,
+            } => {
+                let input = self.get_buffer(node.inputs[0]);
+                let in_shape = &self.graph.node(node.inputs[0]).ty.shape;
+                let batch = in_shape[0] as u32 / (channels * in_h * in_w);
+                let out_h = (in_h + 2 * padding - kernel_h) / stride + 1;
+                let out_w = (in_w + 2 * padding - kernel_w) / stride + 1;
+                let total = batch * channels * out_h * out_w;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::MaxPool2d,
+                    workgroups: [ceil_div(total, 256), 1, 1],
+                    input_buffers: vec![input],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![
+                        batch, channels, in_h, in_w, kernel_h, kernel_w, stride, padding, out_h,
+                        out_w, 0, 0,
+                    ],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    label: String::new(),
+                });
+            }
+
+            Op::GlobalAvgPool { channels, spatial } => {
+                let input = self.get_buffer(node.inputs[0]);
+                let total_out = node.ty.num_elements() as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::GlobalAvgPool,
+                    workgroups: [ceil_div(total_out, 256), 1, 1],
+                    input_buffers: vec![input],
+                    output_buffer: out_buf,
+                    extra_output: None,
+                    params: vec![channels, spatial, total_out, 0],
                     use_coop: false,
                     use_small_tiles: false,
                     label: String::new(),

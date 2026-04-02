@@ -554,7 +554,9 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::CrossAttention { .. }
             | Op::CacheWrite
             | Op::CachedAttention { .. }
-            | Op::GroupNormSilu { .. } => {
+            | Op::GroupNormSilu { .. }
+            | Op::MaxPool2d { .. }
+            | Op::GlobalAvgPool { .. } => {
                 log::warn!(
                     "autodiff not supported for {:?}, inference-only op",
                     node.op

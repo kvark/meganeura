@@ -274,6 +274,8 @@ fn graph_to_egglog(graph: &Graph) -> String {
   (Conv2d Op Op)
   (Conv2dGradInput Op Op)
   (Conv2dGradWeight Op Op)
+  (MaxPool2d Op)
+  (GlobalAvgPool Op)
   ; --- KV cache ops ---
   (CacheWrite Op Op Op)
   (CachedAttention Op Op Op Op)
@@ -446,6 +448,8 @@ fn node_to_egglog_expr(node: &Node) -> String {
         Op::Conv2d { .. } => format!("(Conv2d n{} n{})", i[0], i[1]),
         Op::Conv2dGradInput { .. } => format!("(Conv2dGradInput n{} n{})", i[0], i[1]),
         Op::Conv2dGradWeight { .. } => format!("(Conv2dGradWeight n{} n{})", i[0], i[1]),
+        Op::MaxPool2d { .. } => format!("(MaxPool2d n{})", i[0]),
+        Op::GlobalAvgPool { .. } => format!("(GlobalAvgPool n{})", i[0]),
         Op::CacheWrite => format!("(CacheWrite n{} n{} n{})", i[0], i[1], i[2]),
         Op::CachedAttention { .. } => {
             format!("(CachedAttention n{} n{} n{} n{})", i[0], i[1], i[2], i[3])
@@ -1295,5 +1299,27 @@ mod tests {
                 .map(|n| format!("{:?}", n.op))
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// MaxPool2d and GlobalAvgPool survive e-graph optimization unchanged.
+    #[test]
+    fn test_pool_ops_roundtrip() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[1 * 64 * 8 * 8]);
+        let pool = g.max_pool_2d(x, 1, 64, 8, 8, 2, 2, 2, 0);
+        let gap = g.global_avg_pool(pool, 1, 64, 16);
+        g.set_outputs(vec![gap]);
+
+        let (opt, _report) = optimize_with_report(&g);
+        let has_maxpool = opt
+            .nodes()
+            .iter()
+            .any(|n| matches!(n.op, Op::MaxPool2d { .. }));
+        let has_gap = opt
+            .nodes()
+            .iter()
+            .any(|n| matches!(n.op, Op::GlobalAvgPool { .. }));
+        assert!(has_maxpool, "MaxPool2d should survive optimization");
+        assert!(has_gap, "GlobalAvgPool should survive optimization");
     }
 }
