@@ -1,3 +1,4 @@
+#![allow(dead_code, clippy::too_many_arguments)]
 /// Load SmolVLM2-500M from HuggingFace and run forward passes on lavapipe.
 ///
 /// Tests the full pipeline: vision encoder → pixel shuffle → connector → text decoder.
@@ -6,14 +7,333 @@
 ///
 /// Usage:
 ///   cargo run --release --example smolvlm2
-use meganeura::{
-    Graph, build_inference_session,
-    data::safetensors::SafeTensorsModel,
-    models::smolvlm2::{self, SmolVLM2Config},
-};
+#[allow(dead_code, clippy::too_many_arguments)]
+use meganeura::{Graph, NodeId, build_inference_session, data::safetensors::SafeTensorsModel};
 use std::collections::HashSet;
 
 const REPO_ID: &str = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct";
+
+// ---------------------------------------------------------------------------
+// Model: SmolVLM2
+// ---------------------------------------------------------------------------
+
+struct VisionConfig {
+    image_size: usize,
+    patch_size: usize,
+    hidden_size: usize,
+    num_attention_heads: u32,
+    num_hidden_layers: usize,
+    intermediate_size: usize,
+    layer_norm_eps: f32,
+}
+
+impl VisionConfig {
+    fn num_patches(&self) -> usize {
+        let p = self.image_size / self.patch_size;
+        p * p
+    }
+
+    fn patch_dim(&self) -> usize {
+        3 * self.patch_size * self.patch_size
+    }
+
+    fn head_dim(&self) -> u32 {
+        self.hidden_size as u32 / self.num_attention_heads
+    }
+}
+
+struct TextConfig {
+    vocab_size: usize,
+    hidden_size: usize,
+    num_hidden_layers: usize,
+    num_attention_heads: u32,
+    num_key_value_heads: u32,
+    intermediate_size: usize,
+    rms_norm_eps: f32,
+    rope_theta: f32,
+}
+
+impl TextConfig {
+    fn head_dim(&self) -> u32 {
+        self.hidden_size as u32 / self.num_attention_heads
+    }
+
+    fn kv_dim(&self) -> usize {
+        self.num_key_value_heads as usize * self.head_dim() as usize
+    }
+}
+
+struct SmolVLM2Config {
+    vision: VisionConfig,
+    text: TextConfig,
+    scale_factor: usize,
+}
+
+impl SmolVLM2Config {
+    fn smolvlm2_500m() -> Self {
+        Self {
+            vision: VisionConfig {
+                image_size: 512,
+                patch_size: 16,
+                hidden_size: 768,
+                num_attention_heads: 12,
+                num_hidden_layers: 12,
+                intermediate_size: 3072,
+                layer_norm_eps: 1e-6,
+            },
+            text: TextConfig {
+                vocab_size: 49280,
+                hidden_size: 960,
+                num_hidden_layers: 32,
+                num_attention_heads: 15,
+                num_key_value_heads: 5,
+                intermediate_size: 2560,
+                rms_norm_eps: 1e-5,
+                rope_theta: 100000.0,
+            },
+            scale_factor: 4,
+        }
+    }
+
+    fn num_vision_tokens(&self) -> usize {
+        self.vision.num_patches() / (self.scale_factor * self.scale_factor)
+    }
+
+    fn connector_input_dim(&self) -> usize {
+        self.vision.hidden_size * self.scale_factor * self.scale_factor
+    }
+}
+
+fn build_vision_encoder(g: &mut Graph, config: &VisionConfig, num_patches: usize) -> NodeId {
+    let hidden = config.hidden_size;
+    let eps = config.layer_norm_eps;
+    let num_heads = config.num_attention_heads;
+    let head_dim = config.head_dim();
+
+    // Patch embedding: linear projection of flattened patches
+    let patches = g.input("image_patches", &[num_patches, config.patch_dim()]);
+    let patch_weight = g.parameter(
+        "model.vision_model.embeddings.patch_embedding.weight",
+        &[config.patch_dim(), hidden],
+    );
+    let patch_bias = g.parameter(
+        "model.vision_model.embeddings.patch_embedding.bias",
+        &[hidden],
+    );
+    let mut x = g.matmul(patches, patch_weight);
+    x = g.bias_add(x, patch_bias);
+
+    // Position embedding (learned, added to patch embeddings)
+    let pos_embed = g.parameter(
+        "model.vision_model.embeddings.position_embedding.weight",
+        &[num_patches, hidden],
+    );
+    x = g.add(x, pos_embed);
+
+    // Vision transformer layers
+    for i in 0..config.num_hidden_layers {
+        let prefix = format!("model.vision_model.encoder.layers.{}", i);
+
+        // Pre-attention LayerNorm
+        let ln1_w = g.parameter(&format!("{}.layer_norm1.weight", prefix), &[hidden]);
+        let ln1_b = g.parameter(&format!("{}.layer_norm1.bias", prefix), &[hidden]);
+        let h = g.layer_norm(x, ln1_w, ln1_b, eps);
+
+        // Self-attention
+        let wq = g.parameter(
+            &format!("{}.self_attn.q_proj.weight", prefix),
+            &[hidden, hidden],
+        );
+        let bq = g.parameter(&format!("{}.self_attn.q_proj.bias", prefix), &[hidden]);
+        let wk = g.parameter(
+            &format!("{}.self_attn.k_proj.weight", prefix),
+            &[hidden, hidden],
+        );
+        let bk = g.parameter(&format!("{}.self_attn.k_proj.bias", prefix), &[hidden]);
+        let wv = g.parameter(
+            &format!("{}.self_attn.v_proj.weight", prefix),
+            &[hidden, hidden],
+        );
+        let bv = g.parameter(&format!("{}.self_attn.v_proj.bias", prefix), &[hidden]);
+
+        let q = g.matmul(h, wq);
+        let q = g.bias_add(q, bq);
+        let k = g.matmul(h, wk);
+        let k = g.bias_add(k, bk);
+        let v = g.matmul(h, wv);
+        let v = g.bias_add(v, bv);
+
+        let attn = g.full_attention(q, k, v, num_heads, num_heads, head_dim);
+
+        // Output projection
+        let wo = g.parameter(
+            &format!("{}.self_attn.out_proj.weight", prefix),
+            &[hidden, hidden],
+        );
+        let bo = g.parameter(&format!("{}.self_attn.out_proj.bias", prefix), &[hidden]);
+        let attn_out = g.matmul(attn, wo);
+        let attn_out = g.bias_add(attn_out, bo);
+
+        x = g.add(x, attn_out);
+
+        // Post-attention LayerNorm + MLP
+        let ln2_w = g.parameter(&format!("{}.layer_norm2.weight", prefix), &[hidden]);
+        let ln2_b = g.parameter(&format!("{}.layer_norm2.bias", prefix), &[hidden]);
+        let h = g.layer_norm(x, ln2_w, ln2_b, eps);
+
+        // MLP: fc1 → GELU → fc2
+        let w1 = g.parameter(
+            &format!("{}.mlp.fc1.weight", prefix),
+            &[hidden, config.intermediate_size],
+        );
+        let b1 = g.parameter(
+            &format!("{}.mlp.fc1.bias", prefix),
+            &[config.intermediate_size],
+        );
+        let w2 = g.parameter(
+            &format!("{}.mlp.fc2.weight", prefix),
+            &[config.intermediate_size, hidden],
+        );
+        let b2 = g.parameter(&format!("{}.mlp.fc2.bias", prefix), &[hidden]);
+
+        let mlp = g.matmul(h, w1);
+        let mlp = g.bias_add(mlp, b1);
+        let mlp = g.gelu(mlp);
+        let mlp = g.matmul(mlp, w2);
+        let mlp = g.bias_add(mlp, b2);
+
+        x = g.add(x, mlp);
+    }
+
+    // Post-encoder layer norm
+    let post_ln_w = g.parameter("model.vision_model.post_layernorm.weight", &[hidden]);
+    let post_ln_b = g.parameter("model.vision_model.post_layernorm.bias", &[hidden]);
+    g.layer_norm(x, post_ln_w, post_ln_b, eps)
+}
+
+fn build_text_decoder(
+    g: &mut Graph,
+    config: &TextConfig,
+    mut x: NodeId,
+    _seq_len: usize,
+) -> NodeId {
+    let hidden = config.hidden_size;
+    let kv_dim = config.kv_dim();
+    let ffn = config.intermediate_size;
+    let eps = config.rms_norm_eps;
+    let theta = config.rope_theta;
+
+    for i in 0..config.num_hidden_layers {
+        let prefix = format!("model.text_model.layers.{}", i);
+
+        // Pre-attention RMSNorm
+        let ln1_w = g.parameter(&format!("{}.input_layernorm.weight", prefix), &[hidden]);
+        let h = g.rms_norm(x, ln1_w, eps);
+
+        // QKV projections
+        let wq = g.parameter(
+            &format!("{}.self_attn.q_proj.weight", prefix),
+            &[hidden, hidden],
+        );
+        let wk = g.parameter(
+            &format!("{}.self_attn.k_proj.weight", prefix),
+            &[hidden, kv_dim],
+        );
+        let wv = g.parameter(
+            &format!("{}.self_attn.v_proj.weight", prefix),
+            &[hidden, kv_dim],
+        );
+
+        let q = g.matmul(h, wq);
+        let k = g.matmul(h, wk);
+        let v = g.matmul(h, wv);
+
+        // RoPE
+        let q = g.rope(q, theta, config.head_dim());
+        let k = g.rope(k, theta, config.head_dim());
+
+        // Causal attention with GQA
+        let attn = g.causal_attention(
+            q,
+            k,
+            v,
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            config.head_dim(),
+        );
+
+        // Output projection
+        let wo = g.parameter(
+            &format!("{}.self_attn.o_proj.weight", prefix),
+            &[hidden, hidden],
+        );
+        let attn_out = g.matmul(attn, wo);
+
+        x = g.add(x, attn_out);
+
+        // Post-attention RMSNorm + SwiGLU FFN
+        let ln2_w = g.parameter(
+            &format!("{}.post_attention_layernorm.weight", prefix),
+            &[hidden],
+        );
+        let h = g.rms_norm(x, ln2_w, eps);
+
+        let w_gate = g.parameter(&format!("{}.mlp.gate_proj.weight", prefix), &[hidden, ffn]);
+        let w_up = g.parameter(&format!("{}.mlp.up_proj.weight", prefix), &[hidden, ffn]);
+        let w_down = g.parameter(&format!("{}.mlp.down_proj.weight", prefix), &[ffn, hidden]);
+
+        let gate = g.matmul(h, w_gate);
+        let up = g.matmul(h, w_up);
+        let gate_up = g.swiglu(gate, up);
+        let ffn_out = g.matmul(gate_up, w_down);
+
+        x = g.add(x, ffn_out);
+    }
+
+    // Final RMSNorm
+    let final_ln_w = g.parameter("model.text_model.norm.weight", &[hidden]);
+    x = g.rms_norm(x, final_ln_w, eps);
+
+    // LM head
+    let lm_head = g.parameter("lm_head.weight", &[hidden, config.vocab_size]);
+    g.matmul(x, lm_head)
+}
+
+fn transposed_weight_names(config: &SmolVLM2Config) -> Vec<String> {
+    let mut names = Vec::new();
+
+    // Vision encoder linear weights
+    for i in 0..config.vision.num_hidden_layers {
+        let p = format!("model.vision_model.encoder.layers.{}", i);
+        names.push(format!("{}.self_attn.q_proj.weight", p));
+        names.push(format!("{}.self_attn.k_proj.weight", p));
+        names.push(format!("{}.self_attn.v_proj.weight", p));
+        names.push(format!("{}.self_attn.out_proj.weight", p));
+        names.push(format!("{}.mlp.fc1.weight", p));
+        names.push(format!("{}.mlp.fc2.weight", p));
+    }
+
+    // Connector
+    names.push("model.connector.modality_projection.proj.weight".into());
+
+    // Text model linear weights
+    for i in 0..config.text.num_hidden_layers {
+        let p = format!("model.text_model.layers.{}", i);
+        names.push(format!("{}.self_attn.q_proj.weight", p));
+        names.push(format!("{}.self_attn.k_proj.weight", p));
+        names.push(format!("{}.self_attn.v_proj.weight", p));
+        names.push(format!("{}.self_attn.o_proj.weight", p));
+        names.push(format!("{}.mlp.gate_proj.weight", p));
+        names.push(format!("{}.mlp.up_proj.weight", p));
+        names.push(format!("{}.mlp.down_proj.weight", p));
+    }
+
+    names
+}
+
+// ---------------------------------------------------------------------------
+// Example main
+// ---------------------------------------------------------------------------
 
 /// Load a parameter, handling transposition and special cases.
 fn load_param(
@@ -53,7 +373,7 @@ fn main() {
     }
     println!("  ... and {} more", tensor_names.len() - 5);
 
-    let transposed = smolvlm2::transposed_weight_names(&config);
+    let transposed = transposed_weight_names(&config);
     let transposed_set: HashSet<&str> = transposed.iter().map(|s| s.as_str()).collect();
 
     // ======== Vision Encoder (reduced patch count for lavapipe) ========
@@ -65,7 +385,7 @@ fn main() {
     let hidden = config.vision.hidden_size; // 768
 
     let mut g = Graph::new();
-    let vision_out = smolvlm2::build_vision_encoder(&mut g, &config.vision, test_num_patches);
+    let vision_out = build_vision_encoder(&mut g, &config.vision, test_num_patches);
     g.set_outputs(vec![vision_out]);
 
     println!(
@@ -199,7 +519,7 @@ fn main() {
 
     let mut g = Graph::new();
     let combined_input = g.input("combined_embeds", &[total_seq_len, text_hidden]);
-    let logits = smolvlm2::build_text_decoder(&mut g, &config.text, combined_input, total_seq_len);
+    let logits = build_text_decoder(&mut g, &config.text, combined_input, total_seq_len);
     g.set_outputs(vec![logits]);
 
     println!(

@@ -26,7 +26,6 @@ pub mod compile;
 pub mod data;
 pub mod graph;
 pub mod load;
-pub mod models;
 pub mod nn;
 pub mod optimize;
 pub mod profiler;

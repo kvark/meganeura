@@ -1,3 +1,4 @@
+#![allow(dead_code, clippy::too_many_arguments)]
 /// Benchmark SmolLM2-135M inference with meganeura.
 ///
 /// Measures per-step latency, tokens/second, time-to-first-token, and
@@ -7,11 +8,143 @@
 ///   cargo run --release --example bench_meganeura [-- --max-tokens 32 --runs 5]
 use std::time::Instant;
 
-use meganeura::{
-    Graph, build_inference_session,
-    data::safetensors::SafeTensorsModel,
-    models::smollm2::{self, SmolLM2Config},
-};
+#[allow(dead_code, clippy::too_many_arguments)]
+use meganeura::{Graph, build_inference_session, data::safetensors::SafeTensorsModel};
+
+// ---------------------------------------------------------------------------
+// Inlined SmolLM2 model
+// ---------------------------------------------------------------------------
+mod smollm2 {
+    use meganeura::graph::{Graph, NodeId};
+
+    pub struct SmolLM2Config {
+        pub vocab_size: usize,
+        pub hidden_size: usize,
+        pub num_hidden_layers: usize,
+        pub num_attention_heads: u32,
+        pub num_key_value_heads: u32,
+        pub intermediate_size: usize,
+        pub rms_norm_eps: f32,
+        pub rope_theta: f32,
+    }
+
+    impl SmolLM2Config {
+        pub fn smollm2_135m() -> Self {
+            Self {
+                vocab_size: 49152,
+                hidden_size: 576,
+                num_hidden_layers: 30,
+                num_attention_heads: 9,
+                num_key_value_heads: 3,
+                intermediate_size: 1536,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+            }
+        }
+
+        pub fn head_dim(&self) -> u32 {
+            self.hidden_size as u32 / self.num_attention_heads
+        }
+
+        pub fn kv_dim(&self) -> usize {
+            self.num_key_value_heads as usize * self.head_dim() as usize
+        }
+    }
+
+    pub fn build_graph(g: &mut Graph, config: &SmolLM2Config, seq_len: usize) -> NodeId {
+        let hidden = config.hidden_size;
+        let kv_dim = config.kv_dim();
+        let ffn = config.intermediate_size;
+        let eps = config.rms_norm_eps;
+        let theta = config.rope_theta;
+
+        let token_ids = g.input_u32("token_ids", &[seq_len]);
+        let embed_weight = g.parameter("model.embed_tokens.weight", &[config.vocab_size, hidden]);
+        let mut x = g.embedding(token_ids, embed_weight);
+
+        for i in 0..config.num_hidden_layers {
+            let prefix = format!("model.layers.{}", i);
+
+            let ln1_w = g.parameter(&format!("{}.input_layernorm.weight", prefix), &[hidden]);
+            let h = g.rms_norm(x, ln1_w, eps);
+
+            let wq = g.parameter(
+                &format!("{}.self_attn.q_proj.weight", prefix),
+                &[hidden, hidden],
+            );
+            let wk = g.parameter(
+                &format!("{}.self_attn.k_proj.weight", prefix),
+                &[hidden, kv_dim],
+            );
+            let wv = g.parameter(
+                &format!("{}.self_attn.v_proj.weight", prefix),
+                &[hidden, kv_dim],
+            );
+
+            let q = g.matmul(h, wq);
+            let k = g.matmul(h, wk);
+            let v = g.matmul(h, wv);
+
+            let q = g.rope(q, theta, config.head_dim());
+            let k = g.rope(k, theta, config.head_dim());
+
+            let attn = g.causal_attention(
+                q,
+                k,
+                v,
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                config.head_dim(),
+            );
+
+            let wo = g.parameter(
+                &format!("{}.self_attn.o_proj.weight", prefix),
+                &[hidden, hidden],
+            );
+            let attn_out = g.matmul(attn, wo);
+            x = g.add(x, attn_out);
+
+            let ln2_w = g.parameter(
+                &format!("{}.post_attention_layernorm.weight", prefix),
+                &[hidden],
+            );
+            let h = g.rms_norm(x, ln2_w, eps);
+
+            let w_gate = g.parameter(&format!("{}.mlp.gate_proj.weight", prefix), &[hidden, ffn]);
+            let w_up = g.parameter(&format!("{}.mlp.up_proj.weight", prefix), &[hidden, ffn]);
+            let w_down = g.parameter(&format!("{}.mlp.down_proj.weight", prefix), &[ffn, hidden]);
+
+            let gate = g.matmul(h, w_gate);
+            let up = g.matmul(h, w_up);
+            let ffn_out = g.swiglu(gate, up);
+            let ffn_out = g.matmul(ffn_out, w_down);
+            x = g.add(x, ffn_out);
+        }
+
+        let final_ln_w = g.parameter("model.norm.weight", &[hidden]);
+        x = g.rms_norm(x, final_ln_w, eps);
+
+        let lm_head = g.parameter("lm_head.weight", &[hidden, config.vocab_size]);
+        g.matmul(x, lm_head)
+    }
+
+    pub fn transposed_weight_names(config: &SmolLM2Config) -> Vec<String> {
+        let mut names = Vec::new();
+        for i in 0..config.num_hidden_layers {
+            let p = format!("model.layers.{}", i);
+            names.push(format!("{}.self_attn.q_proj.weight", p));
+            names.push(format!("{}.self_attn.k_proj.weight", p));
+            names.push(format!("{}.self_attn.v_proj.weight", p));
+            names.push(format!("{}.self_attn.o_proj.weight", p));
+            names.push(format!("{}.mlp.gate_proj.weight", p));
+            names.push(format!("{}.mlp.up_proj.weight", p));
+            names.push(format!("{}.mlp.down_proj.weight", p));
+        }
+        names.push("lm_head.weight".to_string());
+        names
+    }
+}
+use smollm2::SmolLM2Config;
 
 const REPO_ID: &str = "HuggingFaceTB/SmolLM2-135M";
 
