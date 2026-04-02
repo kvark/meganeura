@@ -435,7 +435,8 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 kernel_h,
                 kernel_w,
                 stride,
-                padding,
+                padding_h,
+                padding_w,
             } => {
                 let input = node.inputs[0];
                 let kernel = node.inputs[1];
@@ -452,7 +453,8 @@ pub fn differentiate(forward: &Graph) -> Graph {
                     kernel_h,
                     kernel_w,
                     stride,
-                    padding,
+                    padding_h,
+                    padding_w,
                 );
                 let grad_kernel = graph.conv2d_grad_weight(
                     grad_output,
@@ -464,7 +466,8 @@ pub fn differentiate(forward: &Graph) -> Graph {
                     kernel_h,
                     kernel_w,
                     stride,
-                    padding,
+                    padding_h,
+                    padding_w,
                 );
                 accumulate_grad(&mut graph, &mut grads, input, grad_input);
                 accumulate_grad(&mut graph, &mut grads, kernel, grad_kernel);

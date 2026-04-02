@@ -18,10 +18,10 @@ struct Params {
     kernel_h: u32,
     kernel_w: u32,
     stride: u32,
-    padding: u32,
+    padding_h: u32,
     out_h: u32,
     out_w: u32,
-    _pad: u32,
+    padding_w: u32,
 }
 
 var<storage> grad_out: array<f32>;
@@ -45,8 +45,8 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let k_total = params.out_channels * kernel_hw;
     let go_spatial = params.out_h * params.out_w;
 
-    let pad_h = i32(params.kernel_h) - 1 - i32(params.padding);
-    let pad_w = i32(params.kernel_w) - 1 - i32(params.padding);
+    let pad_h = i32(params.kernel_h) - 1 - i32(params.padding_h);
+    let pad_w = i32(params.kernel_w) - 1 - i32(params.padding_w);
 
     // C offsets for the 4 output tiles (row-major in [Ci, H*W])
     let c00 = n * m_total * n_total + tile_row * n_total + tile_col;
@@ -91,8 +91,8 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
                         val = $CAST_OPEN grad_out[n * params.out_channels * go_spatial + co * go_spatial + u32(oh) * params.out_w + u32(ow)] $CAST_CLOSE;
                     }
                 } else {
-                    let h_off = i32(ih) + i32(params.padding) - i32(kh);
-                    let w_off = i32(iw) + i32(params.padding) - i32(kw);
+                    let h_off = i32(ih) + i32(params.padding_h) - i32(kh);
+                    let w_off = i32(iw) + i32(params.padding_w) - i32(kw);
                     let i_stride = i32(params.stride);
                     if h_off >= 0 && w_off >= 0 && (h_off % i_stride) == 0 && (w_off % i_stride) == 0 {
                         let oh = u32(h_off) / params.stride;
@@ -127,8 +127,8 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
                         val = $CAST_OPEN grad_out[n * params.out_channels * go_spatial + co * go_spatial + u32(oh) * params.out_w + u32(ow)] $CAST_CLOSE;
                     }
                 } else {
-                    let h_off = i32(ih) + i32(params.padding) - i32(kh);
-                    let w_off = i32(iw) + i32(params.padding) - i32(kw);
+                    let h_off = i32(ih) + i32(params.padding_h) - i32(kh);
+                    let w_off = i32(iw) + i32(params.padding_w) - i32(kw);
                     let i_stride = i32(params.stride);
                     if h_off >= 0 && w_off >= 0 && (h_off % i_stride) == 0 && (w_off % i_stride) == 0 {
                         let oh = u32(h_off) / params.stride;

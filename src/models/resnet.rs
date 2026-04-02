@@ -228,3 +228,125 @@ pub fn fuse_bn_into_conv(
 
     (w_fused, b_fused)
 }
+
+// ---------------------------------------------------------------------------
+// ResNet-50 (Bottleneck blocks)
+// ---------------------------------------------------------------------------
+
+/// Build the ResNet-50 inference graph.
+///
+/// Same stem as ResNet-18 but uses Bottleneck blocks (1x1 → 3x3 → 1x1)
+/// with 4x expansion. Output: `[batch, 1000]`.
+pub fn build_resnet50(g: &mut Graph, batch: u32) -> NodeId {
+    let s = Spatial { h: 224, w: 224 };
+
+    // Stem: identical to ResNet-18
+    let image = g.input("image", &[(batch * 3 * 224 * 224) as usize]);
+    let conv1_w = g.parameter("conv1.weight", &[64 * 3 * 7 * 7]);
+    let x = g.conv2d(image, conv1_w, batch, 3, s.h, s.w, 64, 7, 7, 2, 3);
+    let s = s.after_conv(7, 2, 3);
+    let bn1_bias = g.parameter("bn1.fused_bias", &[(batch * 64 * s.h * s.w) as usize]);
+    let x = g.add(x, bn1_bias);
+    let x = g.relu(x);
+    let x = g.max_pool_2d(x, batch, 64, s.h, s.w, 3, 3, 2, 1);
+    let s = s.after_conv(3, 2, 1);
+
+    // Layer 1: 3 Bottleneck blocks, 64→256 (stride 1, but needs downsample for expansion)
+    let (x, s) = bottleneck(g, x, &s, batch, 64, 64, 256, 1, "layer1.0");
+    let (x, s) = bottleneck(g, x, &s, batch, 256, 64, 256, 1, "layer1.1");
+    let (x, s) = bottleneck(g, x, &s, batch, 256, 64, 256, 1, "layer1.2");
+
+    // Layer 2: 4 Bottleneck blocks, 256→512 (first stride 2)
+    let (x, s) = bottleneck(g, x, &s, batch, 256, 128, 512, 2, "layer2.0");
+    let (x, s) = bottleneck(g, x, &s, batch, 512, 128, 512, 1, "layer2.1");
+    let (x, s) = bottleneck(g, x, &s, batch, 512, 128, 512, 1, "layer2.2");
+    let (x, s) = bottleneck(g, x, &s, batch, 512, 128, 512, 1, "layer2.3");
+
+    // Layer 3: 6 Bottleneck blocks, 512→1024 (first stride 2)
+    let (x, s) = bottleneck(g, x, &s, batch, 512, 256, 1024, 2, "layer3.0");
+    let (x, s) = bottleneck(g, x, &s, batch, 1024, 256, 1024, 1, "layer3.1");
+    let (x, s) = bottleneck(g, x, &s, batch, 1024, 256, 1024, 1, "layer3.2");
+    let (x, s) = bottleneck(g, x, &s, batch, 1024, 256, 1024, 1, "layer3.3");
+    let (x, s) = bottleneck(g, x, &s, batch, 1024, 256, 1024, 1, "layer3.4");
+    let (x, s) = bottleneck(g, x, &s, batch, 1024, 256, 1024, 1, "layer3.5");
+
+    // Layer 4: 3 Bottleneck blocks, 1024→2048 (first stride 2)
+    let (x, s) = bottleneck(g, x, &s, batch, 1024, 512, 2048, 2, "layer4.0");
+    let (x, s) = bottleneck(g, x, &s, batch, 2048, 512, 2048, 1, "layer4.1");
+    let (x, _) = bottleneck(g, x, &s, batch, 2048, 512, 2048, 1, "layer4.2");
+
+    // GAP → FC
+    let x = g.global_avg_pool(x, batch, 2048, 7 * 7);
+    let fc_w = g.parameter("fc.weight", &[2048, 1000]);
+    let fc_b = g.parameter("fc.bias", &[1000]);
+    let logits = g.matmul(x, fc_w);
+    g.bias_add(logits, fc_b)
+}
+
+/// Bottleneck block: conv1x1 → BN → ReLU → conv3x3 → BN → ReLU → conv1x1 → BN → residual → ReLU.
+///
+/// `mid_c` is the bottleneck width (e.g., 64 for layer1). `out_c` = `mid_c * 4`.
+fn bottleneck(
+    g: &mut Graph,
+    x: NodeId,
+    s: &Spatial,
+    batch: u32,
+    in_c: u32,
+    mid_c: u32,
+    out_c: u32,
+    stride: u32,
+    name: &str,
+) -> (NodeId, Spatial) {
+    // Conv1: 1x1, reduce channels
+    let w1 = g.parameter(&format!("{name}.conv1.weight"), &[(mid_c * in_c) as usize]);
+    let h = g.conv2d(x, w1, batch, in_c, s.h, s.w, mid_c, 1, 1, 1, 0);
+    let bn1_b = g.parameter(
+        &format!("{name}.bn1.fused_bias"),
+        &[(batch * mid_c * s.h * s.w) as usize],
+    );
+    let h = g.add(h, bn1_b);
+    let h = g.relu(h);
+
+    // Conv2: 3x3, may downsample
+    let s1 = s.after_conv(3, stride, 1);
+    let w2 = g.parameter(
+        &format!("{name}.conv2.weight"),
+        &[(mid_c * mid_c * 9) as usize],
+    );
+    let h = g.conv2d(h, w2, batch, mid_c, s.h, s.w, mid_c, 3, 3, stride, 1);
+    let bn2_b = g.parameter(
+        &format!("{name}.bn2.fused_bias"),
+        &[(batch * mid_c * s1.h * s1.w) as usize],
+    );
+    let h = g.add(h, bn2_b);
+    let h = g.relu(h);
+
+    // Conv3: 1x1, expand channels
+    let w3 = g.parameter(&format!("{name}.conv3.weight"), &[(out_c * mid_c) as usize]);
+    let h = g.conv2d(h, w3, batch, mid_c, s1.h, s1.w, out_c, 1, 1, 1, 0);
+    let bn3_b = g.parameter(
+        &format!("{name}.bn3.fused_bias"),
+        &[(batch * out_c * s1.h * s1.w) as usize],
+    );
+    let h = g.add(h, bn3_b);
+
+    // Shortcut: always downsample when in_c != out_c or stride > 1
+    let shortcut = if stride > 1 || in_c != out_c {
+        let ds_w = g.parameter(
+            &format!("{name}.downsample.0.weight"),
+            &[(out_c * in_c) as usize],
+        );
+        let ds = g.conv2d(x, ds_w, batch, in_c, s.h, s.w, out_c, 1, 1, stride, 0);
+        let ds_bn_b = g.parameter(
+            &format!("{name}.downsample.1.fused_bias"),
+            &[(batch * out_c * s1.h * s1.w) as usize],
+        );
+        g.add(ds, ds_bn_b)
+    } else {
+        x
+    };
+
+    let out = g.add(h, shortcut);
+    let out = g.relu(out);
+    (out, s1)
+}

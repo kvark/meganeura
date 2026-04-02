@@ -1205,13 +1205,14 @@ impl<'a> Compiler<'a> {
                 kernel_h,
                 kernel_w,
                 stride,
-                padding,
+                padding_h,
+                padding_w,
             } => {
                 let input = self.get_buffer(node.inputs[0]);
                 let kernel = self.get_buffer(node.inputs[1]);
                 let in_shape = &self.graph.node(node.inputs[0]).ty.shape;
-                let out_h = (in_h + 2 * padding - kernel_h) / stride + 1;
-                let out_w = (in_w + 2 * padding - kernel_w) / stride + 1;
+                let out_h = (in_h + 2 * padding_h - kernel_h) / stride + 1;
+                let out_w = (in_w + 2 * padding_w - kernel_w) / stride + 1;
                 let batch = in_shape[0] as u32 / (in_channels * in_h * in_w);
                 // Use implicit GEMM: output = weight @ im2col(input)^T
                 // M=Co, N=oH*oW, K=Ci*kH*kW, batched in z dimension
@@ -1242,10 +1243,10 @@ impl<'a> Compiler<'a> {
                         kernel_h,
                         kernel_w,
                         stride,
-                        padding,
+                        padding_h,
                         out_h,
                         out_w,
-                        0,
+                        padding_w,
                     ],
                     use_coop: false,
                     use_small_tiles: false,
@@ -1261,12 +1262,13 @@ impl<'a> Compiler<'a> {
                 kernel_h,
                 kernel_w,
                 stride,
-                padding,
+                padding_h,
+                padding_w,
             } => {
                 let grad_out = self.get_buffer(node.inputs[0]);
                 let kernel = self.get_buffer(node.inputs[1]);
-                let out_h = (in_h + 2 * padding - kernel_h) / stride + 1;
-                let out_w = (in_w + 2 * padding - kernel_w) / stride + 1;
+                let out_h = (in_h + 2 * padding_h - kernel_h) / stride + 1;
+                let out_w = (in_w + 2 * padding_w - kernel_w) / stride + 1;
                 let out_size = node.ty.shape[0] as u32;
                 let batch = out_size / (in_channels * in_h * in_w);
                 // Use implicit GEMM: grad_input = weight_T @ im2col(grad_out)^T
@@ -1297,10 +1299,10 @@ impl<'a> Compiler<'a> {
                         kernel_h,
                         kernel_w,
                         stride,
-                        padding,
+                        padding_h,
                         out_h,
                         out_w,
-                        0,
+                        padding_w,
                     ],
                     use_coop: false,
                     use_small_tiles: false,
@@ -1316,12 +1318,13 @@ impl<'a> Compiler<'a> {
                 kernel_h,
                 kernel_w,
                 stride,
-                padding,
+                padding_h,
+                padding_w,
             } => {
                 let grad_out = self.get_buffer(node.inputs[0]);
                 let input = self.get_buffer(node.inputs[1]);
-                let out_h = (in_h + 2 * padding - kernel_h) / stride + 1;
-                let out_w = (in_w + 2 * padding - kernel_w) / stride + 1;
+                let out_h = (in_h + 2 * padding_h - kernel_h) / stride + 1;
+                let out_w = (in_w + 2 * padding_w - kernel_w) / stride + 1;
                 let out_size = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let batch = out_size / (out_channels * out_h * out_w);
                 // Use GEMM formulation: grad_weight[Co, Ci*kH*kW] = grad_out_flat[Co, N*oH*oW] @ im2col(input)[N*oH*oW, Ci*kH*kW]
@@ -1349,10 +1352,10 @@ impl<'a> Compiler<'a> {
                         kernel_h,
                         kernel_w,
                         stride,
-                        padding,
+                        padding_h,
                         out_h,
                         out_w,
-                        0,
+                        padding_w,
                     ],
                     use_coop: false,
                     use_small_tiles: false,

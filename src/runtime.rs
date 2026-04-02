@@ -349,10 +349,10 @@ struct Conv2dParams {
     kernel_h: u32,
     kernel_w: u32,
     stride: u32,
-    padding: u32,
+    padding_h: u32,
     out_h: u32,
     out_w: u32,
-    _pad: u32,
+    padding_w: u32,
 }
 
 // max_pool_2d: var src, dst, params
@@ -2169,10 +2169,10 @@ impl Session {
                             kernel_h: p[5],
                             kernel_w: p[6],
                             stride: p[7],
-                            padding: p[8],
+                            padding_h: p[8],
                             out_h: p[9],
                             out_w: p[10],
-                            _pad: 0,
+                            padding_w: p[11],
                         },
                     },
                 );
@@ -2197,10 +2197,10 @@ impl Session {
                             kernel_h: p[5],
                             kernel_w: p[6],
                             stride: p[7],
-                            padding: p[8],
+                            padding_h: p[8],
                             out_h: p[9],
                             out_w: p[10],
-                            _pad: 0,
+                            padding_w: p[11],
                         },
                     },
                 );
@@ -2224,10 +2224,10 @@ impl Session {
                             kernel_h: p[5],
                             kernel_w: p[6],
                             stride: p[7],
-                            padding: p[8],
+                            padding_h: p[8],
                             out_h: p[9],
                             out_w: p[10],
-                            _pad: 0,
+                            padding_w: p[11],
                         },
                     },
                 );

@@ -851,9 +851,18 @@ fn translate_node(
             let strides = attrs.ints("strides");
             let pads = attrs.ints("pads");
             let stride = strides.first().copied().unwrap_or(1) as u32;
-            let padding = pads.first().copied().unwrap_or(0) as u32;
+            // For Conv2d pads=[pH_begin, pW_begin, pH_end, pW_end],
+            // for Conv1d pads=[p_begin, p_end] → padding_h=0, padding_w=p.
+            let (padding_h, padding_w) = if input_shape.len() == 3 {
+                // Conv1d: no height padding, width padding only
+                (0u32, pads.first().copied().unwrap_or(0) as u32)
+            } else {
+                let ph = pads.first().copied().unwrap_or(0) as u32;
+                let pw = if pads.len() >= 2 { pads[1] as u32 } else { ph };
+                (ph, pw)
+            };
 
-            let out = graph.conv2d(
+            let out = graph.conv2d_hw(
                 input,
                 kernel,
                 batch,
@@ -864,11 +873,12 @@ fn translate_node(
                 kernel_h,
                 kernel_w,
                 stride,
-                padding,
+                padding_h,
+                padding_w,
             );
 
-            let out_h = (in_h + 2 * padding - kernel_h) / stride + 1;
-            let out_w = (in_w + 2 * padding - kernel_w) / stride + 1;
+            let out_h = (in_h + 2 * padding_h - kernel_h) / stride + 1;
+            let out_w = (in_w + 2 * padding_w - kernel_w) / stride + 1;
             let out_shape = if input_shape.len() == 3 {
                 // Conv1d output: [N, C_out, L_out]
                 vec![batch as usize, out_channels as usize, out_w as usize]

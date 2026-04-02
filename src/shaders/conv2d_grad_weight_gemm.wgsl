@@ -15,10 +15,10 @@ struct Params {
     kernel_h: u32,
     kernel_w: u32,
     stride: u32,
-    padding: u32,
+    padding_h: u32,
     out_h: u32,
     out_w: u32,
-    _pad: u32,
+    padding_w: u32,
 }
 
 var<storage> grad_out: array<f32>;           // [N, Co, oH, oW]
@@ -96,8 +96,8 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
                 let kh = k_rem / params.kernel_w;
                 let kw = k_rem - kh * params.kernel_w;
                 // Input position
-                let ih = i32(oh * params.stride + kh) - i32(params.padding);
-                let iw = i32(ow * params.stride + kw) - i32(params.padding);
+                let ih = i32(oh * params.stride + kh) - i32(params.padding_h);
+                let iw = i32(ow * params.stride + kw) - i32(params.padding_w);
                 if ih >= 0 && u32(ih) < params.in_h && iw >= 0 && u32(iw) < params.in_w {
                     val = src[((n * params.in_channels + ci) * params.in_h + u32(ih)) * params.in_w + u32(iw)];
                 }

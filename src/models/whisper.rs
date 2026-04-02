@@ -49,45 +49,44 @@ pub fn build_encoder(g: &mut Graph, config: &WhisperConfig, batch: u32, mel_len:
     let prefix = "model.encoder";
 
     // --- Conv stem ---
-    // Conv1: (n_mels → d_model, kernel=3, stride=1, padding=1)
-    // Treated as Conv2d with H=1: input [batch, n_mels, 1, mel_len]
+    // Conv1d is emulated as Conv2d with W=1, temporal axis on H.
+    // Input layout: [batch, n_mels, mel_len, 1] (NCHW with W=1).
+    // kernel: [out_c, in_c, kernel_h=3, kernel_w=1], padding on H only.
     let mel = g.input("mel", &[(batch * config.n_mels as u32 * mel_len) as usize]);
-    let conv1_w = g.parameter(
-        &format!("{prefix}.conv1.weight"),
-        &[d * config.n_mels * 3], // [d_model, n_mels, 3] flattened
-    );
-    // Conv bias is stored pre-expanded to [batch * d_model * 1 * mel_len] at load time
-    // (NCHW channel bias requires spatial broadcast, like BatchNorm fusion)
-    let conv1_out_spatial = mel_len; // stride=1, padding=1, kernel=3 → same length
+
+    // Conv1: (n_mels → d_model, kernel=3, stride=1, padding=1)
+    let conv1_w = g.parameter(&format!("{prefix}.conv1.weight"), &[d * config.n_mels * 3]);
     let conv1_b = g.parameter(
         &format!("{prefix}.conv1.fused_bias"),
-        &[(batch as usize * d * conv1_out_spatial as usize)],
+        &[(batch as usize * d * mel_len as usize)],
     );
-    let x = g.conv2d(
+    // Conv1d as Conv2d with H=mel_len, W=1. Padding on H only (temporal axis).
+    let x = g.conv2d_hw(
         mel,
         conv1_w,
         batch,
         config.n_mels as u32,
-        1,
         mel_len,
-        d as u32,
         1,
+        d as u32,
         3,
         1,
         1,
+        1,
+        0,
     );
     let x = g.add(x, conv1_b);
     let x = g.gelu(x);
 
-    // Conv2: (d_model → d_model, kernel=3, stride=2, padding=1)
-    let seq_len = (mel_len + 2 - 3) / 2 + 1; // after stride-2 conv with padding=1
+    // Conv2: (d_model → d_model, kernel=3, stride=2, padding=1 on H only)
+    let seq_len = (mel_len + 2 - 3) / 2 + 1;
     let conv2_w = g.parameter(&format!("{prefix}.conv2.weight"), &[d * d * 3]);
     let conv2_b = g.parameter(
         &format!("{prefix}.conv2.fused_bias"),
         &[(batch as usize * d * seq_len as usize)],
     );
-    let x = g.conv2d(
-        x, conv2_w, batch, d as u32, 1, mel_len, d as u32, 1, 3, 2, 1,
+    let x = g.conv2d_hw(
+        x, conv2_w, batch, d as u32, mel_len, 1, d as u32, 3, 1, 2, 1, 0,
     );
     let x = g.add(x, conv2_b);
     let x = g.gelu(x);
@@ -99,10 +98,11 @@ pub fn build_encoder(g: &mut Graph, config: &WhisperConfig, batch: u32, mel_len:
     // the channel and spatial dims. For now, use a parameter-based
     // positional embedding that adds directly.
 
-    // Conv output is [d_model, seq_len] (NCHW flat with batch=1, H=1).
-    // Transpose to [seq_len, d_model] for the transformer layers.
+    // Conv output is [d * seq_len] (1D flat, NCHW with batch=1, W=1).
+    // Reshape to [d, seq_len] then transpose to [seq_len, d] for transformer.
     assert_eq!(batch, 1, "Whisper encoder currently supports batch=1 only");
-    let x = g.transpose(x); // [d_model, seq_len] → [seq_len, d_model]
+    let x = g.reshape(x, &[d, seq_len as usize]);
+    let x = g.transpose(x); // [d, seq_len] → [seq_len, d]
 
     // Add positional embedding
     let pos_embed = g.parameter(

@@ -271,7 +271,8 @@ pub enum Op {
         kernel_h: u32,
         kernel_w: u32,
         stride: u32,
-        padding: u32,
+        padding_h: u32,
+        padding_w: u32,
     },
 
     // Conv2d backward w.r.t. input: given grad_output and kernel, produce grad_input.
@@ -284,7 +285,8 @@ pub enum Op {
         kernel_h: u32,
         kernel_w: u32,
         stride: u32,
-        padding: u32,
+        padding_h: u32,
+        padding_w: u32,
     },
 
     // Conv2d backward w.r.t. kernel: given grad_output and input, produce grad_kernel.
@@ -297,7 +299,8 @@ pub enum Op {
         kernel_h: u32,
         kernel_w: u32,
         stride: u32,
-        padding: u32,
+        padding_h: u32,
+        padding_w: u32,
     },
 
     /// 2D max pooling: input[N,C,H,W] → output[N,C,oH,oW]
@@ -708,6 +711,22 @@ impl Graph {
     pub fn recip(&mut self, x: NodeId) -> NodeId {
         let ty = self.node(x).ty.clone();
         self.add_node(Op::Recip, vec![x], ty)
+    }
+
+    /// Reshape: reinterpret the tensor with a new shape (same element count).
+    ///
+    /// Implemented as `x + 0` with the target shape. The e-graph optimizer
+    /// or a future pass could eliminate this, but it's cheap (one element-wise
+    /// add of zeros).
+    pub fn reshape(&mut self, x: NodeId, new_shape: &[usize]) -> NodeId {
+        let old_elems = self.node(x).ty.num_elements();
+        let new_elems: usize = new_shape.iter().product();
+        assert_eq!(
+            old_elems, new_elems,
+            "reshape: element count mismatch ({old_elems} vs {new_elems})"
+        );
+        let zero = self.constant(vec![0.0; new_elems], new_shape);
+        self.add_raw_node(Op::Add, vec![x, zero], TensorType::f32(new_shape.to_vec()))
     }
 
     /// Element-wise division: `a / b` = `a * recip(b)`.
@@ -1180,8 +1199,41 @@ impl Graph {
         stride: u32,
         padding: u32,
     ) -> NodeId {
-        let out_h = (in_h + 2 * padding - kernel_h) / stride + 1;
-        let out_w = (in_w + 2 * padding - kernel_w) / stride + 1;
+        self.conv2d_hw(
+            input,
+            kernel,
+            batch,
+            in_channels,
+            in_h,
+            in_w,
+            out_channels,
+            kernel_h,
+            kernel_w,
+            stride,
+            padding,
+            padding,
+        )
+    }
+
+    /// Conv2d with separate height/width padding (for Conv1d emulation etc.).
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv2d_hw(
+        &mut self,
+        input: NodeId,
+        kernel: NodeId,
+        batch: u32,
+        in_channels: u32,
+        in_h: u32,
+        in_w: u32,
+        out_channels: u32,
+        kernel_h: u32,
+        kernel_w: u32,
+        stride: u32,
+        padding_h: u32,
+        padding_w: u32,
+    ) -> NodeId {
+        let out_h = (in_h + 2 * padding_h - kernel_h) / stride + 1;
+        let out_w = (in_w + 2 * padding_w - kernel_w) / stride + 1;
         let out_size = batch as usize * out_channels as usize * out_h as usize * out_w as usize;
         let ty = TensorType::f32(vec![out_size]);
         self.add_node(
@@ -1193,7 +1245,8 @@ impl Graph {
                 kernel_h,
                 kernel_w,
                 stride,
-                padding,
+                padding_h,
+                padding_w,
             },
             vec![input, kernel],
             ty,
@@ -1214,7 +1267,8 @@ impl Graph {
         kernel_h: u32,
         kernel_w: u32,
         stride: u32,
-        padding: u32,
+        padding_h: u32,
+        padding_w: u32,
     ) -> NodeId {
         let in_size = batch as usize * in_channels as usize * in_h as usize * in_w as usize;
         let ty = TensorType::f32(vec![in_size]);
@@ -1227,7 +1281,8 @@ impl Graph {
                 kernel_h,
                 kernel_w,
                 stride,
-                padding,
+                padding_h,
+                padding_w,
             },
             vec![grad_output, kernel],
             ty,
@@ -1247,7 +1302,8 @@ impl Graph {
         kernel_h: u32,
         kernel_w: u32,
         stride: u32,
-        padding: u32,
+        padding_h: u32,
+        padding_w: u32,
     ) -> NodeId {
         let kernel_size =
             out_channels as usize * in_channels as usize * kernel_h as usize * kernel_w as usize;
@@ -1261,7 +1317,8 @@ impl Graph {
                 kernel_h,
                 kernel_w,
                 stride,
-                padding,
+                padding_h,
+                padding_w,
             },
             vec![grad_output, input],
             ty,

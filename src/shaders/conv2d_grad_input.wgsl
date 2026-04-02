@@ -15,10 +15,10 @@ struct Params {
     kernel_h: u32,
     kernel_w: u32,
     stride: u32,
-    padding: u32,
+    padding_h: u32,
     out_h: u32,
     out_w: u32,
-    _pad: u32,
+    padding_w: u32,
 }
 
 var<storage> grad_out: array<f32>;    // grad_output [N,Co,oH,oW]
@@ -44,7 +44,8 @@ fn main(
 
     let tid = lid.y * 16u + lid.x;
     let kernel_size = params.kernel_h * params.kernel_w;
-    let i_padding = i32(params.padding);
+    let i_padding_h = i32(params.padding_h);
+    let i_padding_w = i32(params.padding_w);
 
     var sum = 0.0;
 
@@ -61,10 +62,10 @@ fn main(
                 let go_base = (n * params.out_channels + co) * params.out_h * params.out_w;
 
                 for (var kh = 0u; kh < params.kernel_h; kh++) {
-                    let oh = i32(ih) + i_padding - i32(kh);
+                    let oh = i32(ih) + i_padding_h - i32(kh);
                     if oh >= 0 && u32(oh) < params.out_h {
                         for (var kw = 0u; kw < params.kernel_w; kw++) {
-                            let ow = i32(iw) + i_padding - i32(kw);
+                            let ow = i32(iw) + i_padding_w - i32(kw);
                             if ow >= 0 && u32(ow) < params.out_w {
                                 sum += grad_out[go_base + u32(oh) * params.out_w + u32(ow)]
                                      * wg_weight[kh * params.kernel_w + kw];
@@ -89,12 +90,12 @@ fn main(
                 let i_stride = i32(params.stride);
 
                 for (var kh = 0u; kh < params.kernel_h; kh++) {
-                    let h_off = i32(ih) + i_padding - i32(kh);
+                    let h_off = i32(ih) + i_padding_h - i32(kh);
                     if h_off >= 0 && (h_off % i_stride) == 0 {
                         let oh = u32(h_off) / params.stride;
                         if oh < params.out_h {
                             for (var kw = 0u; kw < params.kernel_w; kw++) {
-                                let w_off = i32(iw) + i_padding - i32(kw);
+                                let w_off = i32(iw) + i_padding_w - i32(kw);
                                 if w_off >= 0 && (w_off % i_stride) == 0 {
                                     let ow = u32(w_off) / params.stride;
                                     if ow < params.out_w {

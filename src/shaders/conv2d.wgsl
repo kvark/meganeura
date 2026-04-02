@@ -13,10 +13,10 @@ struct Params {
     kernel_h: u32,
     kernel_w: u32,
     stride: u32,
-    padding: u32,
+    padding_h: u32,
     out_h: u32,
     out_w: u32,
-    _pad: u32,
+    padding_w: u32,
 }
 
 var<storage> src: array<f32>;       // input
@@ -42,7 +42,8 @@ fn main(
 
     let tid = lid.y * 16u + lid.x;
     let kernel_size = params.kernel_h * params.kernel_w;
-    let i_padding = i32(params.padding);
+    let i_padding_h = i32(params.padding_h);
+    let i_padding_w = i32(params.padding_w);
 
     var sum = 0.0;
 
@@ -56,8 +57,8 @@ fn main(
         if in_bounds {
             for (var kh = 0u; kh < params.kernel_h; kh++) {
                 for (var kw = 0u; kw < params.kernel_w; kw++) {
-                    let ih = i32(oh * params.stride + kh) - i_padding;
-                    let iw = i32(ow * params.stride + kw) - i_padding;
+                    let ih = i32(oh * params.stride + kh) - i_padding_h;
+                    let iw = i32(ow * params.stride + kw) - i_padding_w;
 
                     if ih >= 0 && u32(ih) < params.in_h && iw >= 0 && u32(iw) < params.in_w {
                         let in_idx = ((n * params.in_channels + ci) * params.in_h + u32(ih)) * params.in_w + u32(iw);
