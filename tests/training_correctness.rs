@@ -1,6 +1,6 @@
 /// Training correctness tests: verify that each model's training graph
 /// compiles, runs forward+backward, and loss decreases over SGD steps.
-use meganeura::{Graph, build_session};
+use meganeura::{Graph, build_inference_session, build_session};
 
 /// Helper: initialize all parameters with small deterministic values,
 /// run a few SGD steps, verify loss decreases.
@@ -107,6 +107,155 @@ fn smollm2_training_loss_decreases() {
         5,
         0.01,
     );
+}
+
+/// Test the inferena weight-loading pattern: build separate inference and training
+/// sessions, load weights into inference session, then copy into training session.
+/// This catches param name/size mismatches between the two sessions.
+#[test]
+fn smollm2_weight_sharing_inference_to_training() {
+    if std::env::var("MEGANEURA_SKIP_BACKPROP").unwrap_or_default() == "1" {
+        eprintln!("MEGANEURA_SKIP_BACKPROP set — skipping");
+        return;
+    }
+
+    use meganeura::models::smollm2::{self, SmolLM2Config};
+
+    let config = SmolLM2Config::small_test();
+    let seq_len = 8;
+    let vocab = config.vocab_size;
+
+    // Build inference session (forward only)
+    let mut infer_g = Graph::new();
+    let logits = smollm2::build_graph(&mut infer_g, &config, seq_len);
+    infer_g.set_outputs(vec![logits]);
+    let mut infer_session = build_inference_session(&infer_g);
+
+    // Build training session (forward + backward + loss)
+    let train_g = smollm2::build_training_graph(&config, seq_len);
+    let mut train_session = build_session(&train_g);
+
+    // Initialize inference session with deterministic weights
+    for (name, buf_ref) in infer_session.plan().param_buffers.clone() {
+        let size_bytes = infer_session.plan().buffers[buf_ref.0 as usize];
+        let n = size_bytes / 4;
+        let data: Vec<f32> = (0..n)
+            .map(|i| (i as f32 * 0.01 + 1.0).sin() * 0.1)
+            .collect();
+        infer_session.set_parameter(&name, &data);
+    }
+
+    // Copy weights from inference → training (the inferena pattern)
+    // This should NOT crash — all param names and sizes must match.
+    for (name, buf_ref) in infer_session.plan().param_buffers.clone() {
+        let size_bytes = infer_session.plan().buffers[buf_ref.0 as usize];
+        let n = size_bytes / 4;
+        let mut data = vec![0.0f32; n];
+        infer_session.read_param(&name, &mut data);
+        train_session.set_parameter(&name, &data);
+    }
+
+    // Run forward+backward on training session
+    let token_ids: Vec<u32> = (0..seq_len as u32).map(|i| i % vocab as u32).collect();
+    let mut labels = vec![0.0f32; seq_len * vocab];
+    for i in 0..seq_len {
+        labels[i * vocab + ((i + 1) % vocab)] = 1.0;
+    }
+
+    train_session.set_input_u32("token_ids", &token_ids);
+    train_session.set_input("labels", &labels);
+    train_session.step();
+    train_session.wait();
+
+    let loss = train_session.read_loss();
+    eprintln!("SmolLM2 weight-sharing test: loss = {:.6}", loss);
+    assert!(loss.is_finite() && loss > 0.0, "training loss: {}", loss);
+
+    // Verify gradients exist and are finite
+    assert!(
+        !train_session.plan().param_grad_pairs.is_empty(),
+        "no gradient pairs"
+    );
+    for &(_param_buf, grad_buf) in &train_session.plan().param_grad_pairs {
+        let size = train_session.plan().buffers[grad_buf.0 as usize] / 4;
+        let mut grad = vec![0.0f32; size];
+        train_session.read_buffer(grad_buf, &mut grad);
+        assert!(
+            grad.iter().all(|v| v.is_finite()),
+            "NaN/Inf in gradient buffer {}",
+            grad_buf.0
+        );
+    }
+}
+
+/// Same weight-sharing test for SmolVLA.
+#[test]
+fn smolvla_weight_sharing_inference_to_training() {
+    if std::env::var("MEGANEURA_SKIP_BACKPROP").unwrap_or_default() == "1" {
+        eprintln!("MEGANEURA_SKIP_BACKPROP set — skipping");
+        return;
+    }
+
+    use meganeura::models::smolvla::{self, SmolVLAConfig};
+
+    let config = SmolVLAConfig::small_test();
+    let action_seq_len = config.chunk_size;
+    let vlm_seq_len = 4;
+
+    // Build inference session
+    let mut infer_g = Graph::new();
+    let pred = smolvla::build_action_expert(&mut infer_g, &config, action_seq_len, vlm_seq_len);
+    infer_g.set_outputs(vec![pred]);
+    let mut infer_session = build_inference_session(&infer_g);
+
+    // Build training session
+    let train_g = smolvla::build_action_expert_training(&config, action_seq_len, vlm_seq_len);
+    let mut train_session = build_session(&train_g);
+
+    // Init inference params
+    for (name, buf_ref) in infer_session.plan().param_buffers.clone() {
+        let n = infer_session.plan().buffers[buf_ref.0 as usize] / 4;
+        let data: Vec<f32> = (0..n)
+            .map(|i| (i as f32 * 0.01 + 1.0).sin() * 0.1)
+            .collect();
+        infer_session.set_parameter(&name, &data);
+    }
+
+    // Copy inference → training
+    for (name, buf_ref) in infer_session.plan().param_buffers.clone() {
+        let n = infer_session.plan().buffers[buf_ref.0 as usize] / 4;
+        let mut data = vec![0.0f32; n];
+        infer_session.read_param(&name, &mut data);
+        train_session.set_parameter(&name, &data);
+    }
+
+    // Run training step
+    let expert_hidden = config.expert.hidden_size;
+    let kv_dim = config.expert.kv_dim();
+    train_session.set_input(
+        "noisy_actions",
+        &vec![0.5f32; action_seq_len * config.max_action_dim],
+    );
+    train_session.set_input("timestep", &vec![0.1f32; expert_hidden * 2]);
+    for i in 0..config.expert.num_layers {
+        if i % config.expert.self_attn_every_n_layers != 0 {
+            train_session.set_input(
+                &format!("vlm_kv_layer_{i}"),
+                &vec![0.1f32; vlm_seq_len * kv_dim],
+            );
+        }
+    }
+    train_session.set_input(
+        "target_actions",
+        &vec![0.0f32; action_seq_len * config.max_action_dim],
+    );
+
+    train_session.step();
+    train_session.wait();
+
+    let loss = train_session.read_loss();
+    eprintln!("SmolVLA weight-sharing test: loss = {:.6}", loss);
+    assert!(loss.is_finite() && loss > 0.0, "training loss: {}", loss);
 }
 
 // ---------------------------------------------------------------------------
