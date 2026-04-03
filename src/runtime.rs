@@ -1373,6 +1373,24 @@ impl Session {
         self.read_buffer(buf_ref, out);
     }
 
+    /// Read a parameter's gradient buffer by name.
+    ///
+    /// Returns the gradient computed during the last backward pass.
+    /// Panics if the parameter has no associated gradient (e.g. inference-only session).
+    pub fn read_param_grad(&self, name: &str, out: &mut [f32]) {
+        let param_buf = self
+            .param_buffer(name)
+            .unwrap_or_else(|| panic!("unknown param: {}", name));
+        let grad_buf = self
+            .plan
+            .param_grad_pairs
+            .iter()
+            .find(|&&(p, _)| p == param_buf)
+            .map(|&(_, g)| g)
+            .unwrap_or_else(|| panic!("no gradient for param: {}", name));
+        self.read_buffer(grad_buf, out);
+    }
+
     /// Upload data into a parameter buffer by name (for initializing KV caches etc.).
     pub fn upload_param(&self, name: &str, data: &[f32]) {
         let buf_ref = self

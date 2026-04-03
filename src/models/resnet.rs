@@ -283,6 +283,20 @@ pub fn build_resnet50(g: &mut Graph, batch: u32) -> NodeId {
     g.bias_add(logits, fc_b)
 }
 
+/// Build a ResNet-50 training graph (forward + cross-entropy loss).
+///
+/// Returns the complete graph with loss as output. Expects:
+/// - Input "image": `[batch * 3 * 224 * 224]` flat NCHW
+/// - Input "labels": `[batch, 1000]` one-hot
+pub fn build_resnet50_training(batch: u32) -> Graph {
+    let mut g = Graph::new();
+    let logits = build_resnet50(&mut g, batch);
+    let labels = g.input("labels", &[batch as usize, 1000]);
+    let loss = g.cross_entropy_loss(logits, labels);
+    g.set_outputs(vec![loss]);
+    g
+}
+
 /// Bottleneck block: conv1x1 → BN → ReLU → conv3x3 → BN → ReLU → conv1x1 → BN → residual → ReLU.
 ///
 /// `mid_c` is the bottleneck width (e.g., 64 for layer1). `out_c` = `mid_c * 4`.

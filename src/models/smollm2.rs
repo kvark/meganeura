@@ -43,6 +43,20 @@ impl SmolLM2Config {
         }
     }
 
+    /// Tiny configuration for unit tests (fast compilation and execution).
+    pub fn small_test() -> Self {
+        Self {
+            vocab_size: 64,
+            hidden_size: 32,
+            num_hidden_layers: 2,
+            num_attention_heads: 2,
+            num_key_value_heads: 2,
+            intermediate_size: 64,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+        }
+    }
+
     pub fn head_dim(&self) -> u32 {
         self.hidden_size as u32 / self.num_attention_heads
     }
@@ -148,6 +162,20 @@ pub fn build_graph(g: &mut Graph, config: &SmolLM2Config, seq_len: usize) -> Nod
     // LM head (often tied to embed_tokens, loaded separately)
     let lm_head = g.parameter("lm_head.weight", &[hidden, config.vocab_size]);
     g.matmul(x, lm_head) // [seq, vocab]
+}
+
+/// Build the SmolLM2 training graph (forward + cross-entropy loss).
+///
+/// Returns the loss node. The graph expects:
+/// - Input "token_ids": U32 tensor of shape `[seq_len]`
+/// - Input "labels": f32 one-hot tensor of shape `[seq_len, vocab_size]`
+pub fn build_training_graph(config: &SmolLM2Config, seq_len: usize) -> Graph {
+    let mut g = Graph::new();
+    let logits = build_graph(&mut g, config, seq_len);
+    let labels = g.input("labels", &[seq_len, config.vocab_size]);
+    let loss = g.cross_entropy_loss(logits, labels);
+    g.set_outputs(vec![loss]);
+    g
 }
 
 /// Build the SmolLM2 prefill graph.
