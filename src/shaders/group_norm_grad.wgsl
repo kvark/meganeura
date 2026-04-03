@@ -181,6 +181,7 @@ fn grad_weight_bias(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invoc
         let mean = wg_data[0] / f32(group_size);
         let variance = wg_data2[0] / f32(group_size) - mean * mean;
         let inv_std = inverseSqrt(variance + eps);
+        workgroupBarrier();
 
         // Cooperative accumulation of dw and db over spatial for this channel
         var local_dw = 0.0;
