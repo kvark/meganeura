@@ -64,7 +64,9 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
 
     var my_dq = 0.0;
 
-    for (var t = 0u; t < kv_seq; t++) {
+    // kv_seq == 0 signals causal: each position attends to t ∈ [0, pos].
+    let kv_len = select(kv_seq, pos + 1u, kv_seq == 0u);
+    for (var t = 0u; t < kv_len; t++) {
         let k_base = t * kv_dim + kv_head_off;
 
         // score = Q·K * scale
@@ -73,7 +75,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         let score = wg_dot[0] * scale;
 
         // P_t = exp(score - lse)
-        let p_t = exp(score - lse_val);
+        let p_t = exp(min(score - lse_val, 0.0));
 
         // dP_t = sum_d(dO[d] * V[d])
         wg_dot[tid] = do_val * bias[k_base + tid];

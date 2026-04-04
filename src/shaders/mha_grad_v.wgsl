@@ -46,7 +46,8 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let num_kv_heads = params.packed_heads & 0xFFFFu;
     let head_dim = params.head_dim;
 
-    if t >= kv_seq || kv_head >= num_kv_heads { return; }
+    let effective_kv_seq = select(kv_seq, q_seq, kv_seq == 0u);
+    if t >= effective_kv_seq || kv_head >= num_kv_heads { return; }
 
     let heads_per_kv = num_heads / num_kv_heads;
     let kv_dim = num_kv_heads * head_dim;
@@ -56,7 +57,9 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
 
     var my_dv = 0.0;
 
-    for (var pos = 0u; pos < q_seq; pos++) {
+    // kv_seq == 0 signals causal: only Q positions >= t contribute.
+    let start_pos = select(0u, t, kv_seq == 0u);
+    for (var pos = start_pos; pos < q_seq; pos++) {
         for (var head_rel = 0u; head_rel < heads_per_kv; head_rel++) {
             let head = kv_head * heads_per_kv + head_rel;
             let q_base = pos * q_dim + head * head_dim;
@@ -67,7 +70,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             let score = wg_dot[0] * scale;
 
             // P_t = exp(score - lse)
-            let p_t = exp(score - lse[pos * num_heads + head]);
+            let p_t = exp(min(score - lse[pos * num_heads + head], 0.0));
 
             // dV += P_t * dO
             my_dv += p_t * d_out[q_base + tid];
