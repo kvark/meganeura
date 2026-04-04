@@ -57,6 +57,21 @@ impl SmolLM2Config {
         }
     }
 
+    /// Medium configuration for gradient flow tests (enough layers to trigger
+    /// optimizer fusions, but fast enough for CI).
+    pub fn medium_test() -> Self {
+        Self {
+            vocab_size: 64,
+            hidden_size: 128,
+            num_hidden_layers: 8,
+            num_attention_heads: 2,
+            num_key_value_heads: 2,
+            intermediate_size: 256,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+        }
+    }
+
     pub fn head_dim(&self) -> u32 {
         self.hidden_size as u32 / self.num_attention_heads
     }

@@ -345,6 +345,22 @@ pub fn build_session_with_report(forward_graph: &Graph) -> (Session, OptimizeRep
     (session, report)
 }
 
+/// Build a training session without full-graph optimization (step 3).
+///
+/// Useful for debugging gradient flow issues, since the full-graph optimizer
+/// can fuse backward MatMul+Add ops in ways that break gradient propagation.
+pub fn build_session_unoptimized(forward_graph: &Graph) -> Session {
+    let _span = tracing::info_span!("build_session_unoptimized").entered();
+
+    let optimized_forward = optimize::optimize(forward_graph);
+    let sorted_forward = optimized_forward.toposort();
+    let full_graph = autodiff::differentiate(&sorted_forward);
+
+    // Skip step 3 (full-graph optimization) — compile directly
+    let plan = compile::compile(&full_graph);
+    Session::new(plan)
+}
+
 /// Build a session, using a cache file if available.
 ///
 /// If the cache exists and the graph hash matches, skip autodiff/optimize/compile.

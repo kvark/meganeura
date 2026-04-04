@@ -414,7 +414,8 @@ impl<'a> Compiler<'a> {
                 | Op::FullAttention { num_heads, .. }
                 | Op::CrossAttention { num_heads, .. } => {
                     let q_seq = node.ty.shape[0];
-                    let lse_size = q_seq * num_heads as usize * 4;
+                    // 2 floats per (pos, head): max_score and log(sum_exp)
+                    let lse_size = q_seq * num_heads as usize * 2 * 4;
                     let lse_buf = self.alloc_buffer(lse_size);
                     self.plan.lse_buffers.push((node.id, lse_buf));
                 }

@@ -75,8 +75,10 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let safe_sum = select(sum_exp, 1.0, sum_exp == 0.0);
     dst[q_base + tid] = my_out / safe_sum;
 
-    // Write LSE (thread 0 only)
+    // Write (max_score, log_sum_exp) for backward (thread 0 only)
     if tid == 0u {
-        lse[pos * num_heads + head] = select(max_score + log(sum_exp), -1e30, sum_exp == 0.0);
+        let idx = (pos * num_heads + head) * 2u;
+        lse[idx] = max_score;
+        lse[idx + 1u] = select(log(sum_exp), -1e30, sum_exp == 0.0);
     }
 }
