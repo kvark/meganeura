@@ -13,6 +13,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
     for node in forward.nodes() {
         graph.add_raw_node(node.op.clone(), node.inputs.clone(), node.ty.clone());
     }
+    graph.derived_params = forward.derived_params.clone();
 
     let loss_node = forward.outputs()[0];
 
@@ -849,5 +850,27 @@ mod tests {
         let diff = differentiate(&g);
         // Only loss + grad_w (not grad_x)
         assert_eq!(diff.outputs().len(), 2);
+    }
+
+    #[test]
+    fn test_differentiate_preserves_derived_params() {
+        use crate::graph::DerivedParam;
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 8]);
+        let w = g.parameter("w", &[8, 4]);
+        let y = g.matmul(x, w);
+        let loss = g.mean_all(y);
+        g.set_outputs(vec![loss]);
+
+        g.derived_params.push(DerivedParam {
+            name: "fused_ab".into(),
+            sources: vec![("a".into(), 4), ("b".into(), 4)],
+            rows: 8,
+        });
+
+        let diff = differentiate(&g);
+        assert_eq!(diff.derived_params.len(), 1);
+        assert_eq!(diff.derived_params[0].name, "fused_ab");
+        assert_eq!(diff.derived_params[0].sources.len(), 2);
     }
 }

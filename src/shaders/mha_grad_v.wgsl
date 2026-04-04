@@ -69,8 +69,9 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             tree_reduce(tid);
             let score = wg_dot[0] * scale;
 
-            // P_t = exp(score - lse)
-            let p_t = exp(min(score - lse[pos * num_heads + head], 0.0));
+            // P_t = exp(score - max_score) / sum_exp
+            let lse_idx = (pos * num_heads + head) * 2u;
+            let p_t = exp(min(score - lse[lse_idx], 0.0) - lse[lse_idx + 1u]);
 
             // dV += P_t * dO
             my_dv += p_t * d_out[q_base + tid];

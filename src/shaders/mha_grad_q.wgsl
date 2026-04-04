@@ -55,7 +55,9 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let q_base = pos * (num_heads * head_dim) + head * head_dim;
     let q_val = src_a[q_base + tid];
     let do_val = d_out[q_base + tid];
-    let lse_val = lse[pos * num_heads + head];
+    let lse_idx = (pos * num_heads + head) * 2u;
+    let max_s = lse[lse_idx];
+    let log_sum = lse[lse_idx + 1u];
 
     // Pre-compute row_sum = sum_d(dO[d] * O[d])
     wg_dot[tid] = do_val * fwd_dst[q_base + tid];
@@ -75,7 +77,9 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         let score = wg_dot[0] * scale;
 
         // P_t = exp(score - lse)
-        let p_t = exp(min(score - lse_val, 0.0));
+        // P_t = exp(score - max_score) / sum_exp
+        // Clamp to handle f32 rounding where recomputed score > max_score
+        let p_t = exp(min(score - max_s, 0.0) - log_sum);
 
         // dP_t = sum_d(dO[d] * V[d])
         wg_dot[tid] = do_val * bias[k_base + tid];

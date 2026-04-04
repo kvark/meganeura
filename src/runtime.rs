@@ -1325,6 +1325,39 @@ impl Session {
         }
     }
 
+    /// Diagnostic: print per-dispatch output buffer statistics.
+    ///
+    /// Scans all dispatches and reports any whose output contains NaN, Inf,
+    /// or values exceeding `threshold`. Useful for tracing where numerical
+    /// instability first appears in the forward/backward chain.
+    pub fn trace_dispatches(&self, threshold: f32) {
+        for (i, d) in self.plan.dispatches.iter().enumerate() {
+            let buf_size = self.plan.buffers[d.output_buffer.0 as usize];
+            let n = buf_size / 4;
+            if n == 0 {
+                continue;
+            }
+            let read_n = n.min(65536);
+            let mut data = vec![0.0f32; read_n];
+            self.read_buffer(d.output_buffer, &mut data);
+
+            let max_abs = data.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let has_nan = data.iter().any(|v| v.is_nan());
+            let has_inf = data.iter().any(|v| v.is_infinite());
+
+            if has_nan || has_inf || max_abs > threshold || (max_abs == 0.0 && n > 100) {
+                let label = if d.label.is_empty() {
+                    format!("{:?}", d.shader)
+                } else {
+                    d.label.clone()
+                };
+                log::warn!(
+                    "dispatch {i}: {label} max_abs={max_abs:.3e} nan={has_nan} inf={has_inf} n={n}"
+                );
+            }
+        }
+    }
+
     /// Read back the output tensor (first graph output).
     ///
     /// Returns the data as a `Vec<f32>`. For inference graphs this is the

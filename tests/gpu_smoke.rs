@@ -1,7 +1,7 @@
 /// GPU smoke test: validates that all shaders compile with blade + lavapipe
 /// and that a simple forward pass executes without errors.
 use meganeura::{
-    Graph, build_inference_session, build_session,
+    Graph, build_inference_session, build_session, build_session_unoptimized,
     compile::BufferRef,
     models::smolvla::{self, SmolVLAConfig},
 };
@@ -519,6 +519,284 @@ fn multi_head_attn_gradient_check() {
     );
     eprintln!(
         "MultiHeadAttn gradient check PASSED: max relative error {:.4} across {} elements",
+        max_rel_err, checks
+    );
+}
+
+/// Check that all non-fused parameters have non-zero gradients.
+/// Returns (total_params, zero_param_names).
+fn check_ffn_gradients(session: &meganeura::Session) -> (usize, Vec<String>) {
+    let param_buffers: std::collections::HashMap<String, BufferRef> =
+        session.plan().param_buffers.iter().cloned().collect();
+    let grad_map: std::collections::HashMap<BufferRef, BufferRef> =
+        session.plan().param_grad_pairs.iter().cloned().collect();
+
+    let mut zero_params = Vec::new();
+    let mut total = 0usize;
+    for (name, buf_ref) in &param_buffers {
+        if let Some(&grad_buf) = grad_map.get(buf_ref) {
+            let n = session.plan().buffers[buf_ref.0 as usize] / 4;
+            let grad_n = session.plan().buffers[grad_buf.0 as usize] / 4;
+            if n != grad_n {
+                continue;
+            } // skip fused/dead params
+            let mut grad = vec![0.0f32; n];
+            session.read_buffer(grad_buf, &mut grad);
+            let norm: f64 = grad.iter().map(|&v| (v as f64).powi(2)).sum::<f64>().sqrt();
+            total += 1;
+            if norm < 1e-12 {
+                zero_params.push(name.clone());
+            }
+        }
+    }
+    zero_params.sort();
+    (total, zero_params)
+}
+
+/// Run SmolLM2 training graph with given session builder and check gradients.
+fn run_smollm2_gradient_check(
+    config: &meganeura::models::smollm2::SmolLM2Config,
+    builder: fn(&Graph) -> meganeura::Session,
+) -> (usize, Vec<String>) {
+    let seq = 8;
+    let g = meganeura::models::smollm2::build_training_graph(config, seq);
+    let mut session = builder(&g);
+
+    for (name, buf_ref) in session.plan().param_buffers.clone() {
+        let n = session.plan().buffers[buf_ref.0 as usize] / 4;
+        let data: Vec<f32> = (0..n)
+            .map(|i| (i as f32 * 0.01 + 1.0).sin() * 0.1)
+            .collect();
+        session.set_parameter(&name, &data);
+    }
+
+    let input_ids: Vec<u32> = (0..seq as u32).collect();
+    let vocab = config.vocab_size;
+    let mut labels = vec![0.0f32; seq * vocab];
+    for pos in 0..seq {
+        labels[pos * vocab + ((pos + 1) % vocab)] = 1.0;
+    }
+    session.set_input_u32("token_ids", &input_ids);
+    session.set_input("labels", &labels);
+
+    session.step();
+    session.wait();
+
+    check_ffn_gradients(&session)
+}
+
+#[test]
+fn smollm2_ffn_gradients_nonzero() {
+    use meganeura::models::smollm2::SmolLM2Config;
+    let config = SmolLM2Config::small_test();
+    let (total, zeros) = run_smollm2_gradient_check(&config, build_session);
+    eprintln!("optimized: {total} params, {} zero", zeros.len());
+    assert!(
+        zeros.is_empty(),
+        "Zero gradients (optimized):\n  {}",
+        zeros.join("\n  ")
+    );
+}
+
+#[test]
+fn smollm2_ffn_gradients_unoptimized() {
+    use meganeura::models::smollm2::SmolLM2Config;
+    let config = SmolLM2Config::small_test();
+    let (total, zeros) = run_smollm2_gradient_check(&config, build_session_unoptimized);
+    eprintln!("unoptimized: {total} params, {} zero", zeros.len());
+    assert!(
+        zeros.is_empty(),
+        "Zero gradients (unoptimized):\n  {}",
+        zeros.join("\n  ")
+    );
+}
+
+#[test]
+#[ignore] // ~22 min in debug mode; run with --release --ignored
+fn smollm2_medium_ffn_gradients_optimized() {
+    use meganeura::models::smollm2::SmolLM2Config;
+    let config = SmolLM2Config::medium_test();
+    let (total, zeros) = run_smollm2_gradient_check(&config, build_session);
+    eprintln!("medium optimized: {total} params, {} zero", zeros.len());
+    assert!(
+        zeros.is_empty(),
+        "Zero gradients (medium optimized):\n  {}",
+        zeros.join("\n  ")
+    );
+}
+
+#[test]
+#[ignore] // ~22 min in debug mode; run with --release --ignored
+fn smollm2_medium_ffn_gradients_unoptimized() {
+    use meganeura::models::smollm2::SmolLM2Config;
+    let config = SmolLM2Config::medium_test();
+    let (total, zeros) = run_smollm2_gradient_check(&config, build_session_unoptimized);
+    eprintln!("medium unoptimized: {total} params, {} zero", zeros.len());
+    assert!(
+        zeros.is_empty(),
+        "Zero gradients (medium unoptimized):\n  {}",
+        zeros.join("\n  ")
+    );
+}
+
+#[test]
+fn causal_attention_gradient_check() {
+    if std::env::var("MEGANEURA_SKIP_BACKPROP").unwrap_or_default() == "1" {
+        eprintln!("MEGANEURA_SKIP_BACKPROP set — skipping causal attention gradient check");
+        return;
+    }
+    // Same structure as multi_head_attn_gradient_check but using causal_attention.
+    // This exercises the CausalAttention forward (online softmax + LSE) and
+    // the MHA grad shaders with the causal mask (kv_seq=0 sentinel).
+
+    let seq: usize = 4;
+    let num_heads: u32 = 1;
+    let num_kv_heads: u32 = 1;
+    let head_dim: u32 = 64;
+    let d = (num_heads * head_dim) as usize;
+    let d_kv = (num_kv_heads * head_dim) as usize;
+    let n_q = seq * d;
+    let n_kv = seq * d_kv;
+
+    // --- Analytical gradients via backprop ---
+    let mut g_train = Graph::new();
+    let qn = g_train.parameter("q", &[seq, d]);
+    let kn = g_train.parameter("k", &[seq, d_kv]);
+    let vn = g_train.parameter("v", &[seq, d_kv]);
+    let out = g_train.causal_attention(qn, kn, vn, num_heads, num_kv_heads, head_dim);
+    let loss_node = g_train.mean_all(out);
+    g_train.set_outputs(vec![loss_node]);
+
+    let mut train_sess = build_session(&g_train);
+
+    let q_data: Vec<f32> = (0..n_q).map(|i| (i as f32 * 0.01).sin() * 0.1).collect();
+    let k_data: Vec<f32> = (0..n_kv)
+        .map(|i| (i as f32 * 0.013 + 1.0).sin() * 0.1)
+        .collect();
+    let v_data: Vec<f32> = (0..n_kv)
+        .map(|i| (i as f32 * 0.017 + 2.0).sin() * 0.1)
+        .collect();
+
+    train_sess.set_parameter("q", &q_data);
+    train_sess.set_parameter("k", &k_data);
+    train_sess.set_parameter("v", &v_data);
+
+    train_sess.step();
+    train_sess.wait();
+
+    let loss_val = train_sess.read_loss();
+    assert!(
+        loss_val.is_finite(),
+        "CausalAttn loss is not finite: {}",
+        loss_val
+    );
+
+    let param_buffers: std::collections::HashMap<String, BufferRef> =
+        train_sess.plan().param_buffers.iter().cloned().collect();
+    let grad_map: std::collections::HashMap<BufferRef, BufferRef> =
+        train_sess.plan().param_grad_pairs.iter().cloned().collect();
+
+    let q_buf = param_buffers["q"];
+    let k_buf = param_buffers["k"];
+    let v_buf = param_buffers["v"];
+
+    let mut grad_q = vec![0.0f32; n_q];
+    let mut grad_k = vec![0.0f32; n_kv];
+    let mut grad_v = vec![0.0f32; n_kv];
+    train_sess.read_buffer(grad_map[&q_buf], &mut grad_q);
+    train_sess.read_buffer(grad_map[&k_buf], &mut grad_k);
+    train_sess.read_buffer(grad_map[&v_buf], &mut grad_v);
+
+    // --- Numerical gradients via central differences ---
+    let mut g_infer = Graph::new();
+    let qi = g_infer.parameter("q", &[seq, d]);
+    let ki = g_infer.parameter("k", &[seq, d_kv]);
+    let vi = g_infer.parameter("v", &[seq, d_kv]);
+    let out_i = g_infer.causal_attention(qi, ki, vi, num_heads, num_kv_heads, head_dim);
+    let loss_i = g_infer.mean_all(out_i);
+    g_infer.set_outputs(vec![loss_i]);
+    let mut infer_sess = build_inference_session(&g_infer);
+
+    let fwd = |sess: &mut meganeura::Session, qd: &[f32], kd: &[f32], vd: &[f32]| -> f32 {
+        sess.set_parameter("q", qd);
+        sess.set_parameter("k", kd);
+        sess.set_parameter("v", vd);
+        sess.step();
+        sess.wait();
+        sess.read_loss()
+    };
+
+    let eps = 1e-3_f32;
+    let check_idxs = [0usize, 8, 32, 63, 128, 200, 255];
+    let mut max_rel_err = 0.0f32;
+    let mut checks = 0usize;
+
+    for &idx in &check_idxs {
+        if idx >= n_q {
+            continue;
+        }
+        let mut qd = q_data.clone();
+        qd[idx] += eps;
+        let lp = fwd(&mut infer_sess, &qd, &k_data, &v_data);
+        qd[idx] -= 2.0 * eps;
+        let lm = fwd(&mut infer_sess, &qd, &k_data, &v_data);
+        let num = (lp - lm) / (2.0 * eps);
+        let ana = grad_q[idx];
+        let rel = (num - ana).abs() / (num.abs().max(ana.abs()).max(1e-6));
+        eprintln!("causal grad_q[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
+        if max_rel_err < rel {
+            max_rel_err = rel;
+        }
+        checks += 1;
+    }
+
+    for &idx in &check_idxs {
+        if idx >= n_kv {
+            continue;
+        }
+        let mut kd = k_data.clone();
+        kd[idx] += eps;
+        let lp = fwd(&mut infer_sess, &q_data, &kd, &v_data);
+        kd[idx] -= 2.0 * eps;
+        let lm = fwd(&mut infer_sess, &q_data, &kd, &v_data);
+        let num = (lp - lm) / (2.0 * eps);
+        let ana = grad_k[idx];
+        let rel = (num - ana).abs() / (num.abs().max(ana.abs()).max(1e-6));
+        eprintln!("causal grad_k[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
+        if max_rel_err < rel {
+            max_rel_err = rel;
+        }
+        checks += 1;
+    }
+
+    for &idx in &check_idxs {
+        if idx >= n_kv {
+            continue;
+        }
+        let mut vd = v_data.clone();
+        vd[idx] += eps;
+        let lp = fwd(&mut infer_sess, &q_data, &k_data, &vd);
+        vd[idx] -= 2.0 * eps;
+        let lm = fwd(&mut infer_sess, &q_data, &k_data, &vd);
+        let num = (lp - lm) / (2.0 * eps);
+        let ana = grad_v[idx];
+        let rel = (num - ana).abs() / (num.abs().max(ana.abs()).max(1e-6));
+        eprintln!("causal grad_v[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
+        if max_rel_err < rel {
+            max_rel_err = rel;
+        }
+        checks += 1;
+    }
+
+    assert!(checks > 0, "no gradient elements were checked");
+    assert!(
+        max_rel_err < 0.06,
+        "CausalAttention gradient check FAILED: max relative error {:.4} (>6%) across {} elements",
+        max_rel_err,
+        checks,
+    );
+    eprintln!(
+        "CausalAttention gradient check PASSED: max relative error {:.4} across {} elements",
         max_rel_err, checks
     );
 }

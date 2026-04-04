@@ -42,5 +42,5 @@ pub use runtime::{MemorySummary, Session};
 pub use train::{
     EpochStats, LossHistory, MetricCallback, Optimizer, StepMetrics, TrainConfig, TrainHistory,
     Trainer, build_inference_session, build_session, build_session_cached,
-    build_session_with_report, compile_training_graph,
+    build_session_unoptimized, build_session_with_report, compile_training_graph,
 };

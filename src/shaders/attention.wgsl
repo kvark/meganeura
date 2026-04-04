@@ -68,8 +68,12 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let safe_sum = select(sum_exp, 1.0, sum_exp == 0.0);
     dst[q_base + tid] = my_out / safe_sum;
 
-    // Store log-sum-exp for backward pass (one scalar per pos×head).
+    // Store (max_score, log_sum_exp) for backward pass (two scalars per pos×head).
+    // Backward computes P_t = exp(score - max_score) / sum_exp, which is safe
+    // because score <= max_score always holds in exact arithmetic.
     if tid == 0u {
-        lse[pos * num_heads + head] = select(max_score + log(sum_exp), -1e30, sum_exp == 0.0);
+        let idx = (pos * num_heads + head) * 2u;
+        lse[idx] = max_score;
+        lse[idx + 1u] = select(log(sum_exp), -1e30, sum_exp == 0.0);
     }
 }
