@@ -683,6 +683,7 @@ fn gen_causal_attention() -> ShaderModule {
                 "$PARSE_PARAMS",
                 "let q_seq = params.seq;\n    let num_heads = params.num_heads;\n    let num_kv_heads = params.num_kv_heads;\n    let head_dim = params.head_dim;\n    let kv_len = pos + 1u;",
             ),
+            ("$SCORE_STRIDE", "q_seq"),
         ],
     );
     parse_wgsl(&src)
@@ -717,6 +718,7 @@ fn gen_full_attention() -> ShaderModule {
                 "$PARSE_PARAMS",
                 "let q_seq = params.seq;\n    let num_heads = params.num_heads;\n    let num_kv_heads = params.num_kv_heads;\n    let head_dim = params.head_dim;\n    let kv_len = q_seq;",
             ),
+            ("$SCORE_STRIDE", "q_seq"),
         ],
     );
     parse_wgsl(&src)
@@ -740,6 +742,7 @@ fn gen_cross_attention() -> ShaderModule {
                 "$PARSE_PARAMS",
                 "let q_seq = params.q_seq;\n    let num_heads = params.packed_heads >> 16u;\n    let num_kv_heads = params.packed_heads & 0xFFFFu;\n    let head_dim = params.head_dim;\n    let kv_len = params.kv_seq;",
             ),
+            ("$SCORE_STRIDE", "kv_len"),
         ],
     );
     parse_wgsl(&src)
@@ -1148,17 +1151,18 @@ mod tests {
                 ShaderEntry::CausalAttention
                 | ShaderEntry::FullAttention
                 | ShaderEntry::CrossAttention => {
-                    vec!["src_a", "src_b", "bias", "dst", "lse", "params"]
+                    vec!["src_a", "src_b", "bias", "dst", "lse", "scores", "params"]
                 }
                 ShaderEntry::LayerNorm => vec!["src", "src_b", "bias", "dst", "params"],
                 ShaderEntry::MultiHeadAttn => {
-                    vec!["src_a", "src_b", "bias", "dst", "lse", "params"]
+                    vec!["src_a", "src_b", "bias", "dst", "lse", "scores", "params"]
                 }
                 ShaderEntry::MultiHeadAttnGradQ
                 | ShaderEntry::MultiHeadAttnGradK
                 | ShaderEntry::MultiHeadAttnGradV => {
                     vec![
-                        "d_out", "src_a", "src_b", "bias", "lse", "fwd_dst", "dst", "params",
+                        "d_out", "src_a", "src_b", "bias", "lse", "fwd_dst", "scores", "dst",
+                        "params",
                     ]
                 }
                 // All three SwiGLUGrad entries share the same module globals
