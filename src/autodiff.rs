@@ -97,13 +97,20 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 accumulate_grad(&mut graph, &mut grads, node.inputs[0], grad_x);
             }
             Op::CrossEntropyLoss => {
-                // L = -mean(labels * log(softmax(logits)))
-                // dL/dlogits = softmax(logits) - labels (simplified)
+                // L = -mean_over_batch(labels * log(softmax(logits)))
+                // dL/dlogits = (softmax(logits) - labels) / batch
                 let logits = node.inputs[0];
                 let labels = node.inputs[1];
+                let batch = forward.nodes()[logits as usize].ty.shape[0];
+                let n = forward.nodes()[logits as usize].ty.num_elements();
                 let softmax = graph.softmax(logits);
                 let neg_labels = graph.neg(labels);
-                let grad_logits = graph.add(softmax, neg_labels);
+                let diff = graph.add(softmax, neg_labels);
+                let inv_batch = graph.constant(
+                    vec![1.0 / batch as f32; n],
+                    &forward.nodes()[logits as usize].ty.shape,
+                );
+                let grad_logits = graph.mul(diff, inv_batch);
                 accumulate_grad(&mut graph, &mut grads, logits, grad_logits);
                 // No gradient for labels (they're targets)
             }
@@ -203,14 +210,26 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
             Op::Softmax => {
-                // dL/dx_i = s_i * (dL/ds_i - rowsum_i(dL/ds * s))
-                // Approximate: omit the rowsum normalization term.
-                // Exact backward requires per-row sum reduction (see SumRows TODO).
-                // This approximation gives the correct gradient direction for single-row
-                // softmax (per-head attention) and is sufficient for training convergence.
-                let s = node.id; // forward softmax output
-                let grad_x = graph.mul(s, grad_output);
-                accumulate_grad(&mut graph, &mut grads, node.inputs[0], grad_x);
+                // dL/dx_i = s_i * (dL/ds_i - sum_j(dL/ds_j * s_j))
+                let s = node.id; // forward softmax output [batch, features]
+                let x = node.inputs[0];
+                let x_shape = &forward.nodes()[x as usize].ty.shape;
+                let batch = x_shape[0];
+                let features = x_shape[1];
+
+                // grad_out ⊙ s
+                let grad_s_mul_s = graph.mul(grad_output, s);
+                // row-wise sum → [features] (SumRows reduces [M,N] → [N])
+                let rowsum = graph.sum_rows(grad_s_mul_s, &TensorType::f32(vec![features]));
+                // broadcast [features] → [batch, features] via bias_add
+                let zeros = graph.constant(vec![0.0; batch * features], &[batch, features]);
+                let rowsum_broadcast = graph.bias_add(zeros, rowsum);
+                // s ⊙ rowsum_broadcast
+                let correction = graph.mul(s, rowsum_broadcast);
+                // grad_x = (grad_out ⊙ s) - correction
+                let neg_correction = graph.neg(correction);
+                let grad_x = graph.add(grad_s_mul_s, neg_correction);
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
             Op::LogSoftmax => {
                 log::warn!("standalone log_softmax gradient not yet implemented");
@@ -400,7 +419,8 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::SiluGrad
             | Op::SwiGLUConcatGrad
             | Op::RmsNormGradW { .. }
-            | Op::RmsNormGradX { .. } => {}
+            | Op::RmsNormGradX { .. }
+            | Op::RoPEGrad { .. } => {}
             Op::Gelu => {
                 // gelu(x) ≈ x * sigmoid(1.702 * x) (sigmoid approximation)
                 // gelu'(x) ≈ sigmoid(1.702x) * (1 + 1.702*x*(1 - sigmoid(1.702x)))
@@ -549,10 +569,74 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::SplitA { .. }
             | Op::SplitB { .. }
             | Op::Upsample2xGrad { .. } => {}
+            Op::RoPE {
+                theta,
+                pos_offset,
+                head_dim,
+            } => {
+                // RoPE is a rotation: [x0, x1] → [x0*cos - x1*sin, x0*sin + x1*cos].
+                // Backward applies the inverse rotation (transpose of rotation matrix):
+                // grad_x0 = grad_y0 * cos + grad_y1 * sin
+                // grad_x1 = -grad_y0 * sin + grad_y1 * cos
+                let x = node.inputs[0];
+                let grad_x = graph.rope_grad(grad_output, theta, pos_offset, head_dim);
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
+            Op::CausalAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            } => {
+                // CausalAttention is MultiHeadAttn with is_cross=false and causal mask.
+                // Reuse the MultiHeadAttnGrad ops.
+                let q = node.inputs[0];
+                let k = node.inputs[1];
+                let v = node.inputs[2];
+                let fwd_node = node.id;
+
+                let q_ty = forward.nodes()[q as usize].ty.clone();
+                let k_ty = forward.nodes()[k as usize].ty.clone();
+                let v_ty = forward.nodes()[v as usize].ty.clone();
+
+                let grad_q = graph.add_raw_node(
+                    Op::MultiHeadAttnGradQ {
+                        fwd_node,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        is_cross: false,
+                    },
+                    vec![grad_output, q, k, v],
+                    q_ty,
+                );
+                let grad_k = graph.add_raw_node(
+                    Op::MultiHeadAttnGradK {
+                        fwd_node,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        is_cross: false,
+                    },
+                    vec![grad_output, q, k, v],
+                    k_ty,
+                );
+                let grad_v = graph.add_raw_node(
+                    Op::MultiHeadAttnGradV {
+                        fwd_node,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        is_cross: false,
+                    },
+                    vec![grad_output, q, k, v],
+                    v_ty,
+                );
+                accumulate_grad(&mut graph, &mut grads, q, grad_q);
+                accumulate_grad(&mut graph, &mut grads, k, grad_k);
+                accumulate_grad(&mut graph, &mut grads, v, grad_v);
+            }
             // Inference-only ops: should not appear in training graphs
-            Op::RoPE { .. }
-            | Op::CausalAttention { .. }
-            | Op::LayerNorm { .. }
+            Op::LayerNorm { .. }
             | Op::FullAttention { .. }
             | Op::CrossAttention { .. }
             | Op::CacheWrite
@@ -560,8 +644,9 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::GroupNormSilu { .. }
             | Op::MaxPool2d { .. }
             | Op::GlobalAvgPool { .. } => {
-                log::warn!(
-                    "autodiff not supported for {:?}, inference-only op",
+                panic!(
+                    "autodiff not supported for {:?} — this op cannot appear in training graphs. \
+                     Use the training-compatible variant instead.",
                     node.op
                 );
             }

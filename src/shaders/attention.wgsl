@@ -9,6 +9,7 @@ var<storage> src_a: array<f32>;  // Q
 var<storage> src_b: array<f32>;  // K
 var<storage> bias: array<f32>;   // V
 var<storage, read_write> dst: array<f32>;
+var<storage, read_write> lse: array<f32>;  // log-sum-exp for backward
 var<uniform> params: Params;
 var<workgroup> wg_dot: array<f32, 64>;
 
@@ -66,4 +67,9 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
 
     let safe_sum = select(sum_exp, 1.0, sum_exp == 0.0);
     dst[q_base + tid] = my_out / safe_sum;
+
+    // Store log-sum-exp for backward pass (one scalar per pos×head).
+    if tid == 0u {
+        lse[pos * num_heads + head] = select(max_score + log(sum_exp), -1e30, sum_exp == 0.0);
+    }
 }

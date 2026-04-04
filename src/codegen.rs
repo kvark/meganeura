@@ -88,6 +88,7 @@ pub enum ShaderGroup {
     RmsNorm,
     Embedding,
     RoPE,
+    RoPEGrad,
     CausalAttention,
     LayerNorm,
     FullAttention,
@@ -130,12 +131,12 @@ pub enum ShaderGroup {
 /// Generate a `naga::Module` for a shader group.
 pub fn generate_module(group: ShaderGroup) -> ShaderModule {
     match group {
-        ShaderGroup::Unary => gen_unary(),
-        ShaderGroup::Binary => gen_binary(),
-        ShaderGroup::BiasAdd => gen_bias_add(),
-        ShaderGroup::Sgd => gen_sgd(),
-        ShaderGroup::Adam => gen_adam(),
-        ShaderGroup::Transpose => gen_transpose(),
+        ShaderGroup::Unary => parse_wgsl(include_str!("shaders/unary.wgsl")),
+        ShaderGroup::Binary => parse_wgsl(include_str!("shaders/binary.wgsl")),
+        ShaderGroup::BiasAdd => parse_wgsl(include_str!("shaders/bias_add.wgsl")),
+        ShaderGroup::Sgd => parse_wgsl(include_str!("shaders/sgd.wgsl")),
+        ShaderGroup::Adam => parse_wgsl(include_str!("shaders/adam.wgsl")),
+        ShaderGroup::Transpose => parse_wgsl(include_str!("shaders/transpose.wgsl")),
         ShaderGroup::MatMul => gen_matmul(),
         ShaderGroup::MatMulAdd => gen_matmul_add(),
         ShaderGroup::MatMulAT => gen_matmul_at(),
@@ -150,49 +151,60 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::MatMulCoopAdd => gen_matmul_coop_add(),
         ShaderGroup::MatMulCoopAT => gen_matmul_coop_at(),
         ShaderGroup::MatMulCoopBT => gen_matmul_coop_bt(),
-        ShaderGroup::Reduce => gen_reduce(),
-        ShaderGroup::Softmax => gen_softmax(),
-        ShaderGroup::CrossEntropy => gen_cross_entropy(),
-        ShaderGroup::RmsNorm => gen_rms_norm(),
-        ShaderGroup::Embedding => gen_embedding(),
-        ShaderGroup::RoPE => gen_rope(),
+        ShaderGroup::Reduce => parse_wgsl(include_str!("shaders/reduce.wgsl")),
+        ShaderGroup::Softmax => parse_wgsl(include_str!("shaders/softmax.wgsl")),
+        ShaderGroup::CrossEntropy => parse_wgsl(include_str!("shaders/cross_entropy.wgsl")),
+        ShaderGroup::RmsNorm => parse_wgsl(include_str!("shaders/rms_norm.wgsl")),
+        ShaderGroup::Embedding => parse_wgsl(include_str!("shaders/embedding.wgsl")),
+        ShaderGroup::RoPE => parse_wgsl(include_str!("shaders/rope.wgsl")),
+        ShaderGroup::RoPEGrad => parse_wgsl(include_str!("shaders/rope_grad.wgsl")),
         ShaderGroup::CausalAttention => gen_causal_attention(),
-        ShaderGroup::LayerNorm => gen_layer_norm(),
+        ShaderGroup::LayerNorm => parse_wgsl(include_str!("shaders/layer_norm.wgsl")),
         ShaderGroup::FullAttention => gen_full_attention(),
         ShaderGroup::CrossAttention => gen_cross_attention(),
-        ShaderGroup::MultiHeadAttn => gen_mha_forward(),
-        ShaderGroup::MultiHeadAttnGradQ => gen_mha_grad_q(),
-        ShaderGroup::MultiHeadAttnGradK => gen_mha_grad_k(),
-        ShaderGroup::MultiHeadAttnGradV => gen_mha_grad_v(),
-        ShaderGroup::SwiGLUGrad => gen_swiglu_grad(),
-        ShaderGroup::SwiGLUConcat => gen_swiglu_concat(),
-        ShaderGroup::SumRows => gen_sum_rows(),
-        ShaderGroup::RmsNormGrad => gen_rms_norm_grad(),
-        ShaderGroup::FusedRmsNormMatMul => gen_fused_rms_norm_matmul(),
-        ShaderGroup::ScatterAdd => gen_scatter_add(),
-        ShaderGroup::BceLoss => gen_bce_loss(),
-        ShaderGroup::GroupNorm => gen_group_norm(),
-        ShaderGroup::GroupNormGrad => gen_group_norm_grad(),
-        ShaderGroup::Concat => gen_concat(),
-        ShaderGroup::Split => gen_split(),
-        ShaderGroup::Upsample => gen_upsample(),
-        ShaderGroup::UpsampleGrad => gen_upsample_grad(),
-        ShaderGroup::Conv2d => gen_conv2d(),
-        ShaderGroup::Conv2dGemm => gen_conv2d_gemm(),
-        ShaderGroup::Conv2dGemmSmall => gen_conv2d_gemm_small(),
-        ShaderGroup::Conv2dGradInput => gen_conv2d_grad_input(),
-        ShaderGroup::Conv2dGradInputGemm => gen_conv2d_grad_input_gemm(),
-        ShaderGroup::Conv2dGradInputGemmSmall => gen_conv2d_grad_input_gemm_small(),
+        ShaderGroup::MultiHeadAttn => parse_wgsl(include_str!("shaders/mha_forward.wgsl")),
+        ShaderGroup::MultiHeadAttnGradQ => parse_wgsl(include_str!("shaders/mha_grad_q.wgsl")),
+        ShaderGroup::MultiHeadAttnGradK => parse_wgsl(include_str!("shaders/mha_grad_k.wgsl")),
+        ShaderGroup::MultiHeadAttnGradV => parse_wgsl(include_str!("shaders/mha_grad_v.wgsl")),
+        ShaderGroup::SwiGLUGrad => parse_wgsl(include_str!("shaders/swiglu_grad.wgsl")),
+        ShaderGroup::SwiGLUConcat => parse_wgsl(include_str!("shaders/swiglu_concat.wgsl")),
+        ShaderGroup::SumRows => parse_wgsl(include_str!("shaders/sum_rows.wgsl")),
+        ShaderGroup::RmsNormGrad => parse_wgsl(include_str!("shaders/rms_norm_grad.wgsl")),
+        ShaderGroup::FusedRmsNormMatMul => parse_wgsl(include_str!("shaders/matmul_rms_norm.wgsl")),
+        ShaderGroup::ScatterAdd => parse_wgsl(include_str!("shaders/scatter_add.wgsl")),
+        ShaderGroup::BceLoss => parse_wgsl(include_str!("shaders/bce.wgsl")),
+        ShaderGroup::GroupNorm => parse_wgsl(include_str!("shaders/group_norm.wgsl")),
+        ShaderGroup::GroupNormGrad => parse_wgsl(include_str!("shaders/group_norm_grad.wgsl")),
+        ShaderGroup::Concat => parse_wgsl(include_str!("shaders/concat.wgsl")),
+        ShaderGroup::Split => parse_wgsl(include_str!("shaders/split.wgsl")),
+        ShaderGroup::Upsample => parse_wgsl(include_str!("shaders/upsample.wgsl")),
+        ShaderGroup::UpsampleGrad => parse_wgsl(include_str!("shaders/upsample_grad.wgsl")),
+        ShaderGroup::Conv2d => parse_wgsl(include_str!("shaders/conv2d.wgsl")),
+        ShaderGroup::Conv2dGemm => parse_wgsl(include_str!("shaders/conv2d_gemm.wgsl")),
+        ShaderGroup::Conv2dGemmSmall => parse_wgsl(include_str!("shaders/conv2d_gemm_small.wgsl")),
+        ShaderGroup::Conv2dGradInput => parse_wgsl(include_str!("shaders/conv2d_grad_input.wgsl")),
+        ShaderGroup::Conv2dGradInputGemm => {
+            parse_wgsl(include_str!("shaders/conv2d_grad_input_gemm.wgsl"))
+        }
+        ShaderGroup::Conv2dGradInputGemmSmall => {
+            parse_wgsl(include_str!("shaders/conv2d_grad_input_gemm_small.wgsl"))
+        }
         ShaderGroup::Conv2dGradInputGemmCoop => gen_conv2d_grad_input_gemm_coop(),
-        ShaderGroup::GroupNormSilu => gen_group_norm_silu(),
-        ShaderGroup::Conv2dGradWeight => gen_conv2d_grad_weight(),
-        ShaderGroup::Conv2dGradWeightGemm => gen_conv2d_grad_weight_gemm(),
-        ShaderGroup::Conv2dGradWeightGemmSmall => gen_conv2d_grad_weight_gemm_small(),
-        ShaderGroup::CacheWrite => gen_cache_write(),
-        ShaderGroup::CachedAttention => gen_cached_attention(),
-        ShaderGroup::RoPEDynamic => gen_rope_dynamic(),
-        ShaderGroup::MaxPool2d => gen_max_pool_2d(),
-        ShaderGroup::GlobalAvgPool => gen_global_avg_pool(),
+        ShaderGroup::GroupNormSilu => parse_wgsl(include_str!("shaders/group_norm_silu.wgsl")),
+        ShaderGroup::Conv2dGradWeight => {
+            parse_wgsl(include_str!("shaders/conv2d_grad_weight.wgsl"))
+        }
+        ShaderGroup::Conv2dGradWeightGemm => {
+            parse_wgsl(include_str!("shaders/conv2d_grad_weight_gemm.wgsl"))
+        }
+        ShaderGroup::Conv2dGradWeightGemmSmall => {
+            parse_wgsl(include_str!("shaders/conv2d_grad_weight_gemm_small.wgsl"))
+        }
+        ShaderGroup::CacheWrite => parse_wgsl(include_str!("shaders/cache_write.wgsl")),
+        ShaderGroup::CachedAttention => parse_wgsl(include_str!("shaders/cached_attention.wgsl")),
+        ShaderGroup::RoPEDynamic => parse_wgsl(include_str!("shaders/rope_dynamic.wgsl")),
+        ShaderGroup::MaxPool2d => parse_wgsl(include_str!("shaders/max_pool_2d.wgsl")),
+        ShaderGroup::GlobalAvgPool => parse_wgsl(include_str!("shaders/global_avg_pool.wgsl")),
     }
 }
 
@@ -238,81 +250,6 @@ pub fn module_to_wgsl(module: &Module, capabilities: naga::valid::Capabilities) 
 // ---------------------------------------------------------------------------
 // unary.wgsl: relu, sigmoid, neg
 // ---------------------------------------------------------------------------
-
-fn gen_unary() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/unary.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
-// binary.wgsl: add, mul, greater
-// ---------------------------------------------------------------------------
-
-fn gen_binary() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/binary.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
-// swiglu_grad: fused backward kernels for SwiGLU and Silu
-//   swiglu_grad_gate: (src_a=grad_out, src_b=gate, src_c=up) → dst
-//   swiglu_grad_up:   (src_a=grad_out, src_b=gate)            → dst
-//   silu_grad:        (src_a=grad_out, src_b=x)               → dst
-// ---------------------------------------------------------------------------
-
-fn gen_swiglu_grad() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/swiglu_grad.wgsl"))
-}
-
-fn gen_swiglu_concat() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/swiglu_concat.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
-// bias_add.wgsl
-// ---------------------------------------------------------------------------
-
-fn gen_bias_add() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/bias_add.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
-// sgd.wgsl
-// ---------------------------------------------------------------------------
-
-fn gen_sgd() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/sgd.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
-// adam.wgsl
-// ---------------------------------------------------------------------------
-
-fn gen_adam() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/adam.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
-// scatter_add.wgsl — embedding gradient accumulation
-// ---------------------------------------------------------------------------
-
-fn gen_scatter_add() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/scatter_add.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
-// bce.wgsl — binary cross-entropy loss with gradient
-// ---------------------------------------------------------------------------
-
-fn gen_bce_loss() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/bce.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
-// transpose.wgsl
-// ---------------------------------------------------------------------------
-
-fn gen_transpose() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/transpose.wgsl"))
-}
 
 // ---------------------------------------------------------------------------
 // matmul.wgsl — 4×4 register-tiled matrix multiply (64×64 output tiles)
@@ -709,91 +646,6 @@ enum MatMulCoopVariant {
 // reduce.wgsl: sum_all, mean_all
 // ---------------------------------------------------------------------------
 
-fn gen_reduce() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/reduce.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
-// sum_rows.wgsl: [M, N] → [N], column-wise sum
-// ---------------------------------------------------------------------------
-
-fn gen_sum_rows() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/sum_rows.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
-// softmax.wgsl
-// ---------------------------------------------------------------------------
-
-fn gen_softmax() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/softmax.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
-// cross_entropy.wgsl
-// ---------------------------------------------------------------------------
-
-fn gen_cross_entropy() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/cross_entropy.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
-// rms_norm.wgsl: y[i,j] = x[i,j] / sqrt(mean(x[i,:]²) + eps) * weight[j]
-// ---------------------------------------------------------------------------
-
-/// Parallel RMSNorm: one workgroup (256 threads) per row.
-///
-/// Each thread handles cols/256 elements, then tree-reduces the partial
-/// sums-of-squares in shared memory. Much faster than the serial version
-/// for wide rows (e.g. 720 columns in SmolVLA).
-///
-/// Dispatch: [rows, 1, 1].
-fn gen_rms_norm() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/rms_norm.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
-// rms_norm_grad: exact backward for RmsNorm
-// Two entry points: rms_norm_grad_w (dispatch [ceil(cols/256), 1, 1])
-//                   rms_norm_grad_x (dispatch [rows, 1, 1])
-// Bindings: src_a (dy, ro), src_b (x, ro), bias (w, ro), dst (rw), params (uniform)
-// Params: rows (field 0), cols (field 1), eps_bits (field 2), _pad (field 3)
-// ---------------------------------------------------------------------------
-
-fn gen_rms_norm_grad() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/rms_norm_grad.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
-// matmul_rms_norm.wgsl: Fused RmsNorm + MatMul
-// C = RmsNorm(X, W_norm) × W_proj
-// ---------------------------------------------------------------------------
-
-fn gen_fused_rms_norm_matmul() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/matmul_rms_norm.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
-// embedding.wgsl: dst[i*hidden+j] = table[indices[i]*hidden+j]
-// ---------------------------------------------------------------------------
-
-fn gen_embedding() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/embedding.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
-// rope.wgsl: Rotary position embeddings
-// For each position pos and pair (2i, 2i+1):
-//   cos_t = cos(pos * theta^(-2i/dim))
-//   sin_t = sin(pos * theta^(-2i/dim))
-//   out[2i]   = x[2i]*cos_t - x[2i+1]*sin_t
-//   out[2i+1] = x[2i]*sin_t + x[2i+1]*cos_t
-// ---------------------------------------------------------------------------
-
-fn gen_rope() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/rope.wgsl"))
-}
-
 // ---------------------------------------------------------------------------
 // causal_attention.wgsl: Fused multi-head causal attention with GQA
 // One workgroup per (position, head) pair.
@@ -848,14 +700,6 @@ fn gen_causal_attention() -> ShaderModule {
 /// - Output: dst[q_base + tid] = out[tid] / sum_exp
 
 // ---------------------------------------------------------------------------
-// layer_norm.wgsl: y[i,j] = (x[i,j] - mean) / sqrt(var + eps) * weight[j] + bias[j]
-// ---------------------------------------------------------------------------
-
-fn gen_layer_norm() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/layer_norm.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
 // full_attention.wgsl: non-causal multi-head attention with GQA
 // Same as causal_attention but attends to all positions (no mask).
 // ---------------------------------------------------------------------------
@@ -899,106 +743,6 @@ fn gen_cross_attention() -> ShaderModule {
         ],
     );
     parse_wgsl(&src)
-}
-
-// ---------------------------------------------------------------------------
-// cache_write.wgsl: write [1, dim] into row kv_pos of [max_seq, dim]
-// ---------------------------------------------------------------------------
-
-fn gen_rope_dynamic() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/rope_dynamic.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
-// group_norm.wgsl — Group normalization forward
-// ---------------------------------------------------------------------------
-
-fn gen_group_norm() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/group_norm.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
-// group_norm_grad.wgsl — GroupNorm backward
-// ---------------------------------------------------------------------------
-
-fn gen_group_norm_grad() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/group_norm_grad.wgsl"))
-}
-
-fn gen_group_norm_silu() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/group_norm_silu.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
-// concat.wgsl — Channel concatenation
-// ---------------------------------------------------------------------------
-
-fn gen_concat() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/concat.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
-// split.wgsl — Channel split (backward of concat)
-// ---------------------------------------------------------------------------
-
-fn gen_split() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/split.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
-// upsample.wgsl — Nearest-neighbor 2x upsample
-// ---------------------------------------------------------------------------
-
-fn gen_upsample() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/upsample.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
-// upsample_grad.wgsl — Backward of 2x upsample
-// ---------------------------------------------------------------------------
-
-fn gen_upsample_grad() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/upsample_grad.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
-// conv2d.wgsl — 2D convolution forward
-// ---------------------------------------------------------------------------
-
-fn gen_conv2d() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/conv2d.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
-// conv2d_gemm.wgsl — Conv2d forward via implicit GEMM
-// ---------------------------------------------------------------------------
-
-fn gen_conv2d_gemm() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/conv2d_gemm.wgsl"))
-}
-
-fn gen_conv2d_gemm_small() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/conv2d_gemm_small.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
-// conv2d_grad_input.wgsl — Conv2d backward w.r.t. input
-// ---------------------------------------------------------------------------
-
-fn gen_conv2d_grad_input() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/conv2d_grad_input.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
-// conv2d_grad_input_gemm.wgsl — Conv2d backward w.r.t. input via implicit GEMM
-// ---------------------------------------------------------------------------
-
-fn gen_conv2d_grad_input_gemm() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/conv2d_grad_input_gemm.wgsl"))
-}
-
-fn gen_conv2d_grad_input_gemm_small() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/conv2d_grad_input_gemm_small.wgsl"))
 }
 
 fn gen_conv2d_grad_input_gemm_coop() -> ShaderModule {
@@ -1069,80 +813,6 @@ fn gen_conv2d_grad_input_gemm_coop_wgsl(config: &CoopConfig) -> ShaderModule {
 }
 
 // ---------------------------------------------------------------------------
-// conv2d_grad_weight.wgsl — Conv2d backward w.r.t. kernel weights
-// ---------------------------------------------------------------------------
-
-fn gen_conv2d_grad_weight() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/conv2d_grad_weight.wgsl"))
-}
-
-fn gen_conv2d_grad_weight_gemm() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/conv2d_grad_weight_gemm.wgsl"))
-}
-
-fn gen_conv2d_grad_weight_gemm_small() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/conv2d_grad_weight_gemm_small.wgsl"))
-}
-
-fn gen_cache_write() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/cache_write.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
-// cached_attention.wgsl: single-token attention with KV cache
-// ---------------------------------------------------------------------------
-
-fn gen_cached_attention() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/cached_attention.wgsl"))
-}
-
-fn gen_max_pool_2d() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/max_pool_2d.wgsl"))
-}
-
-fn gen_global_avg_pool() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/global_avg_pool.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
-// multi_head_attn (forward, saves LSE for backward)
-// Same as gen_attention_parallel(false, true) but with an extra `lse` binding.
-// After normalization, thread 0 writes lse[pos * num_heads + head] = max + log(sum_exp).
-// ---------------------------------------------------------------------------
-
-fn gen_mha_forward() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/mha_forward.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
-// gen_mha_grad_q: dQ computation for MultiHeadAttn backward
-// dispatch [q_seq, num_heads, 1], WG=64
-// inputs: [dO, Q, K, V, LSE, O], output: dQ
-// ---------------------------------------------------------------------------
-
-fn gen_mha_grad_q() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/mha_grad_q.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
-// gen_mha_grad_k: dK computation for MultiHeadAttn backward
-// dispatch [kv_seq, num_kv_heads, 1], WG=64
-// ---------------------------------------------------------------------------
-
-fn gen_mha_grad_k() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/mha_grad_k.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
-// gen_mha_grad_v: dV computation for MultiHeadAttn backward
-// dispatch [kv_seq, num_kv_heads, 1], WG=64
-// ---------------------------------------------------------------------------
-
-fn gen_mha_grad_v() -> ShaderModule {
-    parse_wgsl(include_str!("shaders/mha_grad_v.wgsl"))
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1200,6 +870,7 @@ mod tests {
             (ShaderGroup::RmsNorm, naga::valid::Capabilities::empty()),
             (ShaderGroup::Embedding, naga::valid::Capabilities::empty()),
             (ShaderGroup::RoPE, naga::valid::Capabilities::empty()),
+            (ShaderGroup::RoPEGrad, naga::valid::Capabilities::empty()),
             (
                 ShaderGroup::CausalAttention,
                 naga::valid::Capabilities::empty(),
@@ -1308,6 +979,11 @@ mod tests {
     }
 
     #[test]
+    fn test_rope_grad_wgsl() {
+        let _ = generate_wgsl(ShaderGroup::RoPEGrad);
+    }
+
+    #[test]
     fn test_causal_attention_wgsl() {
         let _ = generate_wgsl(ShaderGroup::CausalAttention);
     }
@@ -1344,6 +1020,7 @@ mod tests {
             (ShaderGroup::RmsNorm, empty),
             (ShaderGroup::Embedding, empty),
             (ShaderGroup::RoPE, empty),
+            (ShaderGroup::RoPEGrad, empty),
             (ShaderGroup::CausalAttention, empty),
             (ShaderGroup::LayerNorm, empty),
             (ShaderGroup::FullAttention, empty),
@@ -1448,7 +1125,8 @@ mod tests {
                 | ShaderEntry::SumAll
                 | ShaderEntry::MeanAll
                 | ShaderEntry::SumRows
-                | ShaderEntry::RoPE => vec!["src", "dst", "params"],
+                | ShaderEntry::RoPE
+                | ShaderEntry::RoPEGrad => vec!["src", "dst", "params"],
                 ShaderEntry::Add
                 | ShaderEntry::Mul
                 | ShaderEntry::Greater
@@ -1469,7 +1147,9 @@ mod tests {
                 ShaderEntry::Embedding => vec!["indices", "src", "dst", "params"],
                 ShaderEntry::CausalAttention
                 | ShaderEntry::FullAttention
-                | ShaderEntry::CrossAttention => vec!["src_a", "src_b", "bias", "dst", "params"],
+                | ShaderEntry::CrossAttention => {
+                    vec!["src_a", "src_b", "bias", "dst", "lse", "params"]
+                }
                 ShaderEntry::LayerNorm => vec!["src", "src_b", "bias", "dst", "params"],
                 ShaderEntry::MultiHeadAttn => {
                     vec!["src_a", "src_b", "bias", "dst", "lse", "params"]
@@ -1560,6 +1240,7 @@ mod tests {
             ShaderEntry::RmsNorm,
             ShaderEntry::Embedding,
             ShaderEntry::RoPE,
+            ShaderEntry::RoPEGrad,
             ShaderEntry::CausalAttention,
             ShaderEntry::Gelu,
             ShaderEntry::LayerNorm,

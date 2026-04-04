@@ -43,10 +43,6 @@ impl std::fmt::Display for MemorySummary {
     }
 }
 
-fn ceil_div(a: u32, b: u32) -> u32 {
-    a.div_ceil(b)
-}
-
 /// Minimum workgroup count below which the cooperative-matrix (2×2-tile) path is
 /// skipped and the scalar tiled matmul is used instead.
 ///
@@ -231,14 +227,25 @@ struct RoPEData {
     params: RoPEParams,
 }
 
-// causal_attention: var src_a (q), src_b (k), bias (v), dst, params
+// 4-buffer ops: src_a, src_b, bias, dst, params (rms_norm_grad, fused_rms_norm_matmul, etc.)
 #[derive(blade_macros::ShaderData)]
-struct CausalAttentionData {
+struct FourBufData {
+    src_a: blade_graphics::BufferPiece,
+    src_b: blade_graphics::BufferPiece,
+    bias: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: MatMulParams,
+}
+
+// causal/full/cross attention: src_a (q), src_b (k), bias (v), dst, lse, params
+#[derive(blade_macros::ShaderData)]
+struct AttentionData {
     src_a: blade_graphics::BufferPiece,
     src_b: blade_graphics::BufferPiece,
     bias: blade_graphics::BufferPiece, // v, named "bias" to match binding
     dst: blade_graphics::BufferPiece,
-    params: MatMulParams, // seq, num_heads, num_kv_heads, head_dim → reuse 4xu32
+    lse: blade_graphics::BufferPiece, // log-sum-exp for backward pass
+    params: MatMulParams,
 }
 
 // rope_dynamic: var src, dst, pos_offset_buf, params
@@ -691,19 +698,19 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::Transpose => TransposeData::layout(),
         ShaderEntry::RmsNorm => RmsNormData::layout(),
         ShaderEntry::Embedding => EmbeddingData::layout(),
-        ShaderEntry::RoPE => RoPEData::layout(),
-        ShaderEntry::CausalAttention => CausalAttentionData::layout(),
+        ShaderEntry::RoPE | ShaderEntry::RoPEGrad => RoPEData::layout(),
+        ShaderEntry::CausalAttention => AttentionData::layout(),
         ShaderEntry::Gelu => UnaryData::layout(),
         ShaderEntry::LayerNorm => LayerNormData::layout(),
-        ShaderEntry::FullAttention | ShaderEntry::CrossAttention => CausalAttentionData::layout(),
+        ShaderEntry::FullAttention | ShaderEntry::CrossAttention => AttentionData::layout(),
         ShaderEntry::MultiHeadAttn => MultiHeadAttnData::layout(),
         ShaderEntry::MultiHeadAttnGradQ
         | ShaderEntry::MultiHeadAttnGradK
         | ShaderEntry::MultiHeadAttnGradV => MultiHeadAttnGradData::layout(),
         ShaderEntry::SwiGLUGradGate => TernaryData::layout(),
         ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => BinaryData::layout(),
-        ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => CausalAttentionData::layout(),
-        ShaderEntry::FusedRmsNormMatMul => CausalAttentionData::layout(),
+        ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => FourBufData::layout(),
+        ShaderEntry::FusedRmsNormMatMul => FourBufData::layout(),
         ShaderEntry::GroupNorm | ShaderEntry::GroupNormSilu => GroupNormData::layout(),
         ShaderEntry::GroupNormGradInput => GroupNormGradInputData::layout(),
         ShaderEntry::GroupNormGradWeightBias => GroupNormGradWeightBiasData::layout(),
@@ -939,7 +946,7 @@ impl Session {
                     },
                 },
             );
-            pc.dispatch([ceil_div(m as u32, ot), ceil_div(n_out as u32, ot), 1]);
+            pc.dispatch([(m as u32).div_ceil(ot), (n_out as u32).div_ceil(ot), 1]);
         }
         let sp = gpu.submit(&mut encoder);
         let _ = gpu.wait_for(&sp, !0);
@@ -1064,7 +1071,7 @@ impl Session {
                     ShaderGroup::MatMulAT | ShaderGroup::MatMulBT => continue,
                     _ => continue,
                 };
-                let coop_wgs = ceil_div(m, output_tile) * ceil_div(n, output_tile) * batch;
+                let coop_wgs = m.div_ceil(output_tile) * n.div_ceil(output_tile) * batch;
                 // Conv2d GEMM has heavier staging (im2col indexing with integer
                 // division per element), so require more workgroups to amortize
                 // the cooperative matrix overhead.
@@ -1080,13 +1087,12 @@ impl Session {
                 let n_edge_safe = n % output_tile <= half_tile;
                 if coop_wgs >= min_wgs && m_edge_safe && n_edge_safe {
                     dispatch.use_coop = true;
-                    dispatch.workgroups =
-                        [ceil_div(m, output_tile), ceil_div(n, output_tile), batch];
+                    dispatch.workgroups = [m.div_ceil(output_tile), n.div_ceil(output_tile), batch];
                     // coopStore/coopLoad operate on full tiles without per-element
                     // bounds checking. Pad output and addend buffers so edge
                     // tiles don't read/write past the end.
-                    let padded_m = ceil_div(m, output_tile) * output_tile;
-                    let padded_n = ceil_div(n, output_tile) * output_tile;
+                    let padded_m = m.div_ceil(output_tile) * output_tile;
+                    let padded_n = n.div_ceil(output_tile) * output_tile;
                     let padded_bytes = (padded_m * padded_n * batch * 4) as usize;
                     let buf_idx = dispatch.output_buffer.0 as usize;
                     if plan.buffers[buf_idx] < padded_bytes {
@@ -1756,13 +1762,14 @@ impl Session {
                 );
             }
             ShaderEntry::CrossEntropyLoss => {
+                let loss_buf = dispatch.extra_output.unwrap_or(dispatch.output_buffer);
                 pc.bind(
                     0,
                     &CrossEntropyData {
                         logits: buf(dispatch.input_buffers[0]),
                         labels: buf(dispatch.input_buffers[1]),
                         grad_out: buf(dispatch.output_buffer),
-                        loss_out: buf(dispatch.output_buffer),
+                        loss_out: buf(loss_buf),
                         params: SoftmaxParams {
                             batch: dispatch.params[0],
                             features: dispatch.params[1],
@@ -1836,7 +1843,7 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::RoPE => {
+            ShaderEntry::RoPE | ShaderEntry::RoPEGrad => {
                 pc.bind(
                     0,
                     &RoPEData {
@@ -1858,16 +1865,17 @@ impl Session {
             ShaderEntry::CausalAttention
             | ShaderEntry::FullAttention
             | ShaderEntry::CrossAttention => {
+                let lse_buf = dispatch
+                    .extra_output
+                    .expect("attention dispatch needs LSE buffer");
                 pc.bind(
                     0,
-                    &CausalAttentionData {
+                    &AttentionData {
                         src_a: buf(dispatch.input_buffers[0]),
                         src_b: buf(dispatch.input_buffers[1]),
                         bias: buf(dispatch.input_buffers[2]),
                         dst: buf(dispatch.output_buffer),
-                        // Attention params are sequential: [seq/q_seq, num_heads/kv_seq,
-                        // num_kv_heads/packed_heads, head_dim]. Use n/k in definition order
-                        // so memory layout matches the shader's u32x4 field reads.
+                        lse: buf(lse_buf),
                         params: MatMulParams {
                             m: dispatch.params[0],
                             n: dispatch.params[1],
@@ -2003,7 +2011,7 @@ impl Session {
             ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => {
                 pc.bind(
                     0,
-                    &CausalAttentionData {
+                    &FourBufData {
                         src_a: buf(dispatch.input_buffers[0]), // dy
                         src_b: buf(dispatch.input_buffers[1]), // x
                         bias: buf(dispatch.input_buffers[2]),  // w
@@ -2019,10 +2027,10 @@ impl Session {
             }
             ShaderEntry::FusedRmsNormMatMul => {
                 // bindings: matrix_a=X, matrix_b=W_proj, bias=W_norm, matrix_c=output, params
-                // maps to CausalAttentionData: src_a, src_b, bias, dst, params
+                // maps to FourBufData: src_a, src_b, bias, dst, params
                 pc.bind(
                     0,
-                    &CausalAttentionData {
+                    &FourBufData {
                         src_a: buf(dispatch.input_buffers[0]), // X
                         src_b: buf(dispatch.input_buffers[2]), // W_proj
                         bias: buf(dispatch.input_buffers[1]),  // W_norm

@@ -256,6 +256,7 @@ fn graph_to_egglog(graph: &Graph) -> String {
   (FusedRmsNormMatMul Op Op Op)
   (Embedding Op Op)
   (RoPE Op)
+  (RoPEGrad Op)
   (CausalAttention Op Op Op)
   (LayerNorm Op Op Op)
   (FullAttention Op Op Op)
@@ -396,6 +397,7 @@ fn node_to_egglog_expr(node: &Node) -> String {
         Op::RmsNorm { .. } => format!("(RmsNorm n{} n{})", i[0], i[1]),
         Op::Embedding => format!("(Embedding n{} n{})", i[0], i[1]),
         Op::RoPE { .. } => format!("(RoPE n{})", i[0]),
+        Op::RoPEGrad { .. } => format!("(RoPEGrad n{})", i[0]),
         Op::CausalAttention { .. } => {
             format!("(CausalAttention n{} n{} n{})", i[0], i[1], i[2])
         }

@@ -35,7 +35,7 @@ fn main() {
             let log_softmax = logits[offset + j] - log_sum_exp;
             let softmax = exp(log_softmax);
             total_loss -= labels[offset + j] * log_softmax;
-            grad_out[offset + j] = softmax - labels[offset + j];
+            grad_out[offset + j] = (softmax - labels[offset + j]) / f32(params.batch);
         }
     }
     loss_out[0] = total_loss / f32(params.batch);

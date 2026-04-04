@@ -164,6 +164,13 @@ pub enum Op {
         /// the input tensor, the behavior is identical to "global" RoPE.
         head_dim: u32,
     },
+    /// Backward gradient op for RoPE: applies inverse (transpose) rotation.
+    /// inputs: [grad_output]
+    RoPEGrad {
+        theta: f32,
+        pos_offset: u32,
+        head_dim: u32,
+    },
 
     // Fused causal multi-head attention with GQA
     // inputs: [q, k, v] as 2D: q=[seq, num_heads*head_dim], k/v=[seq, num_kv_heads*head_dim]
@@ -884,6 +891,25 @@ impl Graph {
 
     pub fn rope(&mut self, x: NodeId, theta: f32, head_dim: u32) -> NodeId {
         self.rope_with_offset(x, theta, 0, head_dim)
+    }
+
+    pub fn rope_grad(
+        &mut self,
+        grad_output: NodeId,
+        theta: f32,
+        pos_offset: u32,
+        head_dim: u32,
+    ) -> NodeId {
+        let ty = self.node(grad_output).ty.clone();
+        self.add_raw_node(
+            Op::RoPEGrad {
+                theta,
+                pos_offset,
+                head_dim,
+            },
+            vec![grad_output],
+            ty,
+        )
     }
 
     pub fn rope_with_offset(
