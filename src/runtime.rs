@@ -245,6 +245,7 @@ struct AttentionData {
     bias: blade_graphics::BufferPiece, // v, named "bias" to match binding
     dst: blade_graphics::BufferPiece,
     lse: blade_graphics::BufferPiece, // log-sum-exp for backward pass
+    scores: blade_graphics::BufferPiece,
     params: MatMulParams,
 }
 
@@ -487,6 +488,7 @@ struct MultiHeadAttnData {
     bias: blade_graphics::BufferPiece,
     dst: blade_graphics::BufferPiece,
     lse: blade_graphics::BufferPiece,
+    scores: blade_graphics::BufferPiece,
     params: MatMulParams,
 }
 
@@ -499,6 +501,7 @@ struct MultiHeadAttnGradData {
     bias: blade_graphics::BufferPiece,
     lse: blade_graphics::BufferPiece,
     fwd_dst: blade_graphics::BufferPiece,
+    scores: blade_graphics::BufferPiece,
     dst: blade_graphics::BufferPiece,
     params: MatMulParams,
 }
@@ -761,7 +764,7 @@ fn reorder_by_level(dispatches: &mut Vec<Dispatch>) {
             .unwrap_or(0);
         levels[i] = level;
         producer.insert(dispatch.output_buffer.0, i);
-        if let Some(extra) = dispatch.extra_output {
+        for &extra in &dispatch.extra_outputs {
             producer.insert(extra.0, i);
         }
     }
@@ -789,7 +792,7 @@ fn compute_groups(dispatches: &[Dispatch]) -> Vec<std::ops::Range<usize>> {
             dirty.clear();
         }
         dirty.insert(dispatch.output_buffer.0);
-        if let Some(extra) = dispatch.extra_output {
+        for &extra in &dispatch.extra_outputs {
             dirty.insert(extra.0);
         }
     }
@@ -1120,7 +1123,13 @@ impl Session {
         // Reorder dispatches by dependency level so parallel branches (e.g. Q/K/V
         // projections) cluster together, then partition into barrier groups.
         reorder_by_level(&mut plan.dispatches);
-        let groups = compute_groups(&plan.dispatches);
+        let groups = if std::env::var("MEGANEURA_SERIAL_DISPATCH").is_ok() {
+            // Debug: one dispatch per pass — guarantees serial execution.
+            log::info!("MEGANEURA_SERIAL_DISPATCH: forcing one dispatch per pass");
+            (0..plan.dispatches.len()).map(|i| i..i + 1).collect()
+        } else {
+            compute_groups(&plan.dispatches)
+        };
         let group_names: Vec<String> = groups
             .iter()
             .map(|group| {
@@ -1142,6 +1151,27 @@ impl Session {
             plan.dispatches.len(),
             groups.len()
         );
+        // Validate: no RAW hazard within a group (concurrent dispatch safety).
+        for group in &groups {
+            let mut written = HashSet::<u32>::new();
+            for i in group.clone() {
+                let d = &plan.dispatches[i];
+                for ib in &d.input_buffers {
+                    if written.contains(&ib.0) {
+                        log::warn!(
+                            "RAW hazard in group: dispatch {} ({:?}) reads buf {} written earlier in same group",
+                            i,
+                            d.shader,
+                            ib.0
+                        );
+                    }
+                }
+                written.insert(d.output_buffer.0);
+                for eo in &d.extra_outputs {
+                    written.insert(eo.0);
+                }
+            }
+        }
 
         let buffers: Vec<blade_graphics::Buffer> = plan
             .buffers
@@ -1795,7 +1825,11 @@ impl Session {
                 );
             }
             ShaderEntry::CrossEntropyLoss => {
-                let loss_buf = dispatch.extra_output.unwrap_or(dispatch.output_buffer);
+                let loss_buf = dispatch
+                    .extra_outputs
+                    .first()
+                    .copied()
+                    .unwrap_or(dispatch.output_buffer);
                 pc.bind(
                     0,
                     &CrossEntropyData {
@@ -1898,9 +1932,8 @@ impl Session {
             ShaderEntry::CausalAttention
             | ShaderEntry::FullAttention
             | ShaderEntry::CrossAttention => {
-                let lse_buf = dispatch
-                    .extra_output
-                    .expect("attention dispatch needs LSE buffer");
+                let lse_buf = dispatch.extra_outputs[0];
+                let score_buf = dispatch.extra_outputs[1];
                 pc.bind(
                     0,
                     &AttentionData {
@@ -1909,6 +1942,7 @@ impl Session {
                         bias: buf(dispatch.input_buffers[2]),
                         dst: buf(dispatch.output_buffer),
                         lse: buf(lse_buf),
+                        scores: buf(score_buf),
                         params: MatMulParams {
                             m: dispatch.params[0],
                             n: dispatch.params[1],
@@ -1958,9 +1992,8 @@ impl Session {
                         src_b: buf(dispatch.input_buffers[1]),
                         bias: buf(dispatch.input_buffers[2]),
                         dst: buf(dispatch.output_buffer),
-                        lse: buf(dispatch
-                            .extra_output
-                            .expect("MultiHeadAttn needs extra_output")),
+                        lse: buf(dispatch.extra_outputs[0]),
+                        scores: buf(dispatch.extra_outputs[1]),
                         params: MatMulParams {
                             m: dispatch.params[0],
                             n: dispatch.params[1],
@@ -1982,6 +2015,7 @@ impl Session {
                         bias: buf(dispatch.input_buffers[3]),
                         lse: buf(dispatch.input_buffers[4]),
                         fwd_dst: buf(dispatch.input_buffers[5]),
+                        scores: buf(dispatch.input_buffers[6]),
                         dst: buf(dispatch.output_buffer),
                         params: MatMulParams {
                             m: dispatch.params[0],

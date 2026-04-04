@@ -26,6 +26,8 @@ pub struct SmolLM2Config {
     pub rms_norm_eps: f32,
     /// Base frequency for Rotary Position Embeddings (RoPE).
     pub rope_theta: f32,
+    /// Whether lm_head shares weights with embed_tokens (default: true for Llama-style).
+    pub tie_word_embeddings: bool,
 }
 
 impl SmolLM2Config {
@@ -40,6 +42,7 @@ impl SmolLM2Config {
             intermediate_size: 1536,
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
+            tie_word_embeddings: true,
         }
     }
 
@@ -54,6 +57,7 @@ impl SmolLM2Config {
             intermediate_size: 64,
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
+            tie_word_embeddings: true,
         }
     }
 
@@ -69,6 +73,7 @@ impl SmolLM2Config {
             intermediate_size: 256,
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
+            tie_word_embeddings: true,
         }
     }
 
@@ -174,9 +179,15 @@ pub fn build_graph(g: &mut Graph, config: &SmolLM2Config, seq_len: usize) -> Nod
     let final_ln_w = g.parameter("model.norm.weight", &[hidden]);
     x = g.rms_norm(x, final_ln_w, eps);
 
-    // LM head (often tied to embed_tokens, loaded separately)
-    let lm_head = g.parameter("lm_head.weight", &[hidden, config.vocab_size]);
-    g.matmul(x, lm_head) // [seq, vocab]
+    // LM head
+    if config.tie_word_embeddings {
+        // Weight tying: reuse embed_tokens (shape [vocab, hidden]) via matmul_bt
+        // x @ embed_weight^T = [seq, hidden] @ [hidden, vocab] = [seq, vocab]
+        g.matmul_bt(x, embed_weight)
+    } else {
+        let lm_head = g.parameter("lm_head.weight", &[hidden, config.vocab_size]);
+        g.matmul(x, lm_head) // [seq, vocab]
+    }
 }
 
 /// Build the SmolLM2 training graph (forward + cross-entropy loss).
@@ -284,8 +295,12 @@ pub fn build_prefill_graph(
     let final_ln_w = g.parameter("model.norm.weight", &[hidden]);
     x = g.rms_norm(x, final_ln_w, eps);
 
-    let lm_head = g.parameter("lm_head.weight", &[hidden, config.vocab_size]);
-    let logits = g.matmul(x, lm_head);
+    let logits = if config.tie_word_embeddings {
+        g.matmul_bt(x, embed_weight)
+    } else {
+        let lm_head = g.parameter("lm_head.weight", &[hidden, config.vocab_size]);
+        g.matmul(x, lm_head)
+    };
 
     (logits, k_outputs, v_outputs)
 }
@@ -395,8 +410,12 @@ pub fn build_decode_graph(
     let final_ln_w = g.parameter("model.norm.weight", &[hidden]);
     x = g.rms_norm(x, final_ln_w, eps);
 
-    let lm_head = g.parameter("lm_head.weight", &[hidden, config.vocab_size]);
-    let logits = g.matmul(x, lm_head); // [1, vocab]
+    let logits = if config.tie_word_embeddings {
+        g.matmul_bt(x, embed_weight)
+    } else {
+        let lm_head = g.parameter("lm_head.weight", &[hidden, config.vocab_size]);
+        g.matmul(x, lm_head) // [1, vocab]
+    };
 
     (logits, k_cache_params, v_cache_params)
 }
@@ -420,7 +439,9 @@ pub fn weight_names(config: &SmolLM2Config) -> Vec<String> {
     }
 
     names.push("model.norm.weight".to_string());
-    names.push("lm_head.weight".to_string());
+    if !config.tie_word_embeddings {
+        names.push("lm_head.weight".to_string());
+    }
     names
 }
 
@@ -437,6 +458,8 @@ pub fn transposed_weight_names(config: &SmolLM2Config) -> Vec<String> {
         names.push(format!("{}.mlp.up_proj.weight", p));
         names.push(format!("{}.mlp.down_proj.weight", p));
     }
-    names.push("lm_head.weight".to_string());
+    if !config.tie_word_embeddings {
+        names.push("lm_head.weight".to_string());
+    }
     names
 }

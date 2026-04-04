@@ -45,6 +45,36 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 accumulate_grad(&mut graph, &mut grads, a, grad_a);
                 accumulate_grad(&mut graph, &mut grads, b, grad_b);
             }
+            Op::MatMulAT => {
+                // C = A^T @ B  (A=[K,M], B=[K,N], C=[M,N])
+                // dA[k,m] = sum_n B[k,n]*dC[m,n] = B @ dC^T → MatMulBT(B, dC)
+                // dB[k,n] = sum_m A[k,m]*dC[m,n] = A @ dC   → MatMul(A, dC)
+                let a = node.inputs[0];
+                let b = node.inputs[1];
+                let grad_a = graph.matmul_bt(b, grad_output);
+                let grad_b = graph.add_raw_node(
+                    Op::MatMul,
+                    vec![a, grad_output],
+                    forward.nodes()[b as usize].ty.clone(),
+                );
+                accumulate_grad(&mut graph, &mut grads, a, grad_a);
+                accumulate_grad(&mut graph, &mut grads, b, grad_b);
+            }
+            Op::MatMulBT => {
+                // C = A @ B^T  (A=[M,K], B=[N,K], C=[M,N])
+                // dA[m,k] = sum_n dC[m,n]*B[n,k] = dC @ B → MatMul(dC, B)
+                // dB[n,k] = sum_m dC[m,n]*A[m,k] = dC^T @ A → MatMulAT(dC, A)
+                let a = node.inputs[0];
+                let b = node.inputs[1];
+                let grad_a = graph.add_raw_node(
+                    Op::MatMul,
+                    vec![grad_output, b],
+                    forward.nodes()[a as usize].ty.clone(),
+                );
+                let grad_b = graph.matmul_at(grad_output, a);
+                accumulate_grad(&mut graph, &mut grads, a, grad_a);
+                accumulate_grad(&mut graph, &mut grads, b, grad_b);
+            }
             Op::Add => {
                 let a = node.inputs[0];
                 let b = node.inputs[1];
@@ -413,8 +443,6 @@ pub fn differentiate(forward: &Graph) -> Graph {
             Op::MultiHeadAttnGradQ { .. }
             | Op::MultiHeadAttnGradK { .. }
             | Op::MultiHeadAttnGradV { .. }
-            | Op::MatMulAT
-            | Op::MatMulBT
             | Op::SwiGLUGradGate
             | Op::SwiGLUGradUp
             | Op::SiluGrad

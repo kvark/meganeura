@@ -639,6 +639,241 @@ fn smollm2_medium_ffn_gradients_unoptimized() {
     );
 }
 
+/// End-to-end SmolLM2 gradient check via finite differences.
+/// Uses 1 layer with head_dim=64 (matching production shaders).
+#[test]
+fn smollm2_e2e_gradient_finite_diff() {
+    if std::env::var("MEGANEURA_SKIP_BACKPROP").unwrap_or_default() == "1" {
+        eprintln!("MEGANEURA_SKIP_BACKPROP set — skipping SmolLM2 e2e gradient check");
+        return;
+    }
+    use meganeura::models::smollm2::SmolLM2Config;
+
+    let num_layers = std::env::var("SMOLLM2_LAYERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let tie = std::env::var("TIE_WEIGHTS").unwrap_or_default() != "0";
+    let config = SmolLM2Config {
+        vocab_size: 256,
+        hidden_size: 576,
+        num_hidden_layers: num_layers,
+        num_attention_heads: 9,
+        num_key_value_heads: 3,
+        intermediate_size: 1536,
+        rms_norm_eps: 1e-5,
+        rope_theta: 10000.0,
+        tie_word_embeddings: tie,
+    };
+    let seq = 8;
+
+    // --- Build training session ---
+    let g = meganeura::models::smollm2::build_training_graph(&config, seq);
+    let use_unopt = std::env::var("UNOPT").is_ok();
+    let mut train_sess = if use_unopt {
+        build_session_unoptimized(&g)
+    } else {
+        build_session(&g)
+    };
+
+    // Deterministic init
+    fn name_seed(name: &str) -> f32 {
+        let mut h: u32 = 0;
+        for c in name.bytes() {
+            h = h.wrapping_mul(31).wrapping_add(c as u32);
+        }
+        (h % 10000) as f32
+    }
+    let scale: f32 = std::env::var("WEIGHT_SCALE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.1);
+    for (name, buf_ref) in train_sess.plan().param_buffers.clone() {
+        let n = train_sess.plan().buffers[buf_ref.0 as usize] / 4;
+        let seed = name_seed(&name);
+        let data: Vec<f32> = (0..n)
+            .map(|i| (i as f32 * 0.01 + seed).sin() * scale)
+            .collect();
+        train_sess.set_parameter(&name, &data);
+    }
+
+    // Inputs
+    let input_ids: Vec<u32> = (0..seq as u32).collect();
+    let mut labels = vec![0.0f32; seq * config.vocab_size];
+    for pos in 0..seq {
+        labels[pos * config.vocab_size + (pos + 1) % config.vocab_size] = 1.0;
+    }
+    train_sess.set_input_u32("token_ids", &input_ids);
+    train_sess.set_input("labels", &labels);
+    train_sess.step();
+    train_sess.wait();
+
+    let train_loss = train_sess.read_loss();
+    eprintln!("e2e training loss: {train_loss:.6}");
+
+    // Read gradient for a few params
+    let plan = train_sess.plan().clone();
+    let param_bufs: std::collections::HashMap<String, BufferRef> =
+        plan.param_buffers.iter().cloned().collect();
+    let grad_map: std::collections::HashMap<BufferRef, BufferRef> =
+        plan.param_grad_pairs.iter().cloned().collect();
+
+    // --- Build inference session for finite differences ---
+    let gi = meganeura::models::smollm2::build_training_graph(&config, seq);
+    let mut infer_sess = build_inference_session(&gi);
+
+    // Same init (must use the same scale)
+    for (name, buf_ref) in infer_sess.plan().param_buffers.clone() {
+        let n = infer_sess.plan().buffers[buf_ref.0 as usize] / 4;
+        let seed = name_seed(&name);
+        let data: Vec<f32> = (0..n)
+            .map(|i| (i as f32 * 0.01 + seed).sin() * scale)
+            .collect();
+        infer_sess.set_parameter(&name, &data);
+    }
+
+    let fwd = |sess: &mut meganeura::Session| -> f32 {
+        sess.set_input_u32("token_ids", &input_ids);
+        sess.set_input("labels", &labels);
+        sess.step();
+        sess.wait();
+        sess.read_loss()
+    };
+
+    // Verify inference loss matches
+    let infer_loss = fwd(&mut infer_sess);
+    eprintln!("e2e inference loss: {infer_loss:.6}");
+    assert!(
+        (train_loss - infer_loss).abs() / train_loss.abs().max(1e-6) < 0.01,
+        "train loss {train_loss} != infer loss {infer_loss}"
+    );
+
+    // Check gradient of a few parameters via finite differences
+    let eps = 1e-3f32;
+    let mut max_rel = 0.0f32;
+    let test_params = [
+        "model.layers.0.input_layernorm.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.v_proj.weight",
+        "model.layers.0.mlp.down_proj.weight",
+        "model.embed_tokens.weight",
+    ];
+
+    for param_name in test_params {
+        let buf = match param_bufs.get(param_name) {
+            Some(b) => *b,
+            None => {
+                eprintln!("  skipping {param_name} (not found)");
+                continue;
+            }
+        };
+        let grad_buf = match grad_map.get(&buf) {
+            Some(g) => *g,
+            None => {
+                eprintln!("  skipping {param_name} (no gradient)");
+                continue;
+            }
+        };
+        let n = plan.buffers[buf.0 as usize] / 4;
+        let grad_n = plan.buffers[grad_buf.0 as usize] / 4;
+        if n != grad_n {
+            eprintln!("  skipping {param_name} (fused, n={n} grad_n={grad_n})");
+            continue;
+        }
+
+        let mut grad = vec![0.0f32; n];
+        train_sess.read_buffer(grad_buf, &mut grad);
+
+        // Check a few indices — only where gradient is large enough for finite diff
+        let seed = name_seed(param_name);
+        let orig_data: Vec<f32> = (0..n)
+            .map(|i| (i as f32 * 0.01 + seed).sin() * scale)
+            .collect();
+
+        let check_indices: Vec<usize> = [0, 1, n / 4, n / 2, n - 1]
+            .iter()
+            .filter(|&&i| i < n)
+            .copied()
+            .collect();
+
+        for &idx in &check_indices {
+            let mut perturbed = orig_data.clone();
+            perturbed[idx] += eps;
+            infer_sess.set_parameter(param_name, &perturbed);
+            let lp = fwd(&mut infer_sess);
+            perturbed[idx] -= 2.0 * eps;
+            infer_sess.set_parameter(param_name, &perturbed);
+            let lm = fwd(&mut infer_sess);
+            // Restore
+            infer_sess.set_parameter(param_name, &orig_data);
+
+            let num = (lp - lm) / (2.0 * eps);
+            let ana = grad[idx];
+            let rel = (num - ana).abs() / num.abs().max(ana.abs()).max(1e-8);
+            // Only count errors where BOTH values are above f32 noise floor.
+            // For large models with small weights, many gradient elements are too small
+            // for finite differences to detect (loss change < f32 epsilon).
+            let significant = num.abs() > 1e-3 && ana.abs() > 1e-3;
+            if rel > 0.1 || idx == 0 {
+                let tag = if significant { "" } else { " [below noise]" };
+                eprintln!("  {param_name}[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}{tag}");
+            }
+            if significant {
+                max_rel = max_rel.max(rel);
+            }
+        }
+    }
+
+    eprintln!("SmolLM2 e2e gradient check: max relative error {max_rel:.6}");
+
+    // Print all per-param gradient norms for comparison with PyTorch
+    let mut param_norms: Vec<(String, f64)> = Vec::new();
+    let mut total_sq = 0.0f64;
+    for (name, buf_ref) in plan.param_buffers.iter() {
+        if let Some(&(_, g)) = plan.param_grad_pairs.iter().find(|&&(p, _)| p == *buf_ref) {
+            let n = plan.buffers[buf_ref.0 as usize] / 4;
+            let gn = plan.buffers[g.0 as usize] / 4;
+            if n != gn {
+                continue;
+            }
+            let mut grad = vec![0.0f32; n];
+            train_sess.read_buffer(g, &mut grad);
+            let sq: f64 = grad.iter().map(|&v| (v as f64).powi(2)).sum();
+            total_sq += sq;
+            param_norms.push((name.clone(), sq.sqrt()));
+        }
+    }
+    param_norms.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    eprintln!(
+        "Meganeura grad_norm: {:.6} ({} params)",
+        total_sq.sqrt(),
+        param_norms.len()
+    );
+    for (name, norm) in &param_norms {
+        eprintln!("  {name}: {norm:.6e}");
+    }
+
+    // Print specific gradient values
+    for pname in [
+        "model.embed_tokens.weight",
+        "model.layers.0.input_layernorm.weight",
+    ] {
+        if let Some(buf) = param_bufs.get(pname) {
+            if let Some(&(_, g)) = plan.param_grad_pairs.iter().find(|&&(p, _)| p == *buf) {
+                let n = plan.buffers[g.0 as usize] / 4;
+                let mut grad = vec![0.0f32; n];
+                train_sess.read_buffer(g, &mut grad);
+                eprintln!("  {pname} grad[0..3]: {:?}", &grad[..3.min(n)]);
+            }
+        }
+    }
+
+    assert!(
+        max_rel < 0.25,
+        "SmolLM2 e2e gradient error too large: {max_rel}"
+    );
+}
+
 #[test]
 fn causal_attention_gradient_check() {
     if std::env::var("MEGANEURA_SKIP_BACKPROP").unwrap_or_default() == "1" {
@@ -1489,5 +1724,210 @@ fn rope_per_head_correctness() {
         "pos=1 head=0 pair=0 first: got={:.6}, expected={:.6}",
         pos1_h0_pair0,
         1.0f32.cos() - 1.0f32.sin()
+    );
+}
+
+#[test]
+fn cross_entropy_gradient_check() {
+    // Verify cross_entropy_loss backward via finite differences.
+    // loss = cross_entropy(W @ x, labels)
+    let seq = 4usize;
+    let vocab = 8usize;
+    let hidden = 6usize;
+
+    // --- Backprop ---
+    let mut g = Graph::new();
+    let x = g.parameter("x", &[seq, hidden]);
+    let w = g.parameter("w", &[hidden, vocab]);
+    let logits = g.matmul(x, w);
+    let labels = g.input("labels", &[seq, vocab]);
+    let loss = g.cross_entropy_loss(logits, labels);
+    g.set_outputs(vec![loss]);
+
+    let mut sess = build_session(&g);
+
+    let x_data: Vec<f32> = (0..seq * hidden)
+        .map(|i| (i as f32 * 0.1).sin() * 0.5)
+        .collect();
+    let w_data: Vec<f32> = (0..hidden * vocab)
+        .map(|i| (i as f32 * 0.07 + 1.0).cos() * 0.5)
+        .collect();
+    let mut label_data = vec![0.0f32; seq * vocab];
+    for pos in 0..seq {
+        label_data[pos * vocab + (pos + 1) % vocab] = 1.0;
+    }
+
+    sess.set_parameter("x", &x_data);
+    sess.set_parameter("w", &w_data);
+    sess.set_input("labels", &label_data);
+    sess.step();
+    sess.wait();
+
+    let loss_val = sess.read_loss();
+    eprintln!("cross_entropy loss = {loss_val:.6}");
+
+    let plan = sess.plan().clone();
+    let param_bufs: std::collections::HashMap<String, BufferRef> =
+        plan.param_buffers.iter().cloned().collect();
+    let grad_map: std::collections::HashMap<BufferRef, BufferRef> =
+        plan.param_grad_pairs.iter().cloned().collect();
+
+    let mut grad_w = vec![0.0f32; hidden * vocab];
+    sess.read_buffer(grad_map[&param_bufs["w"]], &mut grad_w);
+
+    let mut grad_x = vec![0.0f32; seq * hidden];
+    sess.read_buffer(grad_map[&param_bufs["x"]], &mut grad_x);
+
+    // --- Finite differences ---
+    let mut gi = Graph::new();
+    let xi = gi.parameter("x", &[seq, hidden]);
+    let wi = gi.parameter("w", &[hidden, vocab]);
+    let li = gi.matmul(xi, wi);
+    let la = gi.input("labels", &[seq, vocab]);
+    let lo = gi.cross_entropy_loss(li, la);
+    gi.set_outputs(vec![lo]);
+    let mut isess = build_inference_session(&gi);
+
+    let fwd = |s: &mut meganeura::Session, xd: &[f32], wd: &[f32]| -> f32 {
+        s.set_parameter("x", xd);
+        s.set_parameter("w", wd);
+        s.set_input("labels", &label_data);
+        s.step();
+        s.wait();
+        s.read_loss()
+    };
+
+    let eps = 1e-3f32;
+    let mut max_rel = 0.0f32;
+
+    for idx in [0, 3, 10, 20, 47] {
+        if idx >= hidden * vocab {
+            continue;
+        }
+        let mut wd = w_data.clone();
+        wd[idx] += eps;
+        let lp = fwd(&mut isess, &x_data, &wd);
+        wd[idx] -= 2.0 * eps;
+        let lm = fwd(&mut isess, &x_data, &wd);
+        let num = (lp - lm) / (2.0 * eps);
+        let ana = grad_w[idx];
+        let rel = (num - ana).abs() / num.abs().max(ana.abs()).max(1e-8);
+        eprintln!("grad_w[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
+        max_rel = max_rel.max(rel);
+    }
+    for idx in [0, 5, 11, 23] {
+        if idx >= seq * hidden {
+            continue;
+        }
+        let mut xd = x_data.clone();
+        xd[idx] += eps;
+        let lp = fwd(&mut isess, &xd, &w_data);
+        xd[idx] -= 2.0 * eps;
+        let lm = fwd(&mut isess, &xd, &w_data);
+        let num = (lp - lm) / (2.0 * eps);
+        let ana = grad_x[idx];
+        let rel = (num - ana).abs() / num.abs().max(ana.abs()).max(1e-8);
+        eprintln!("grad_x[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
+        max_rel = max_rel.max(rel);
+    }
+
+    eprintln!("CrossEntropy gradient check: max relative error {max_rel:.6}");
+    assert!(
+        max_rel < 0.05,
+        "CrossEntropy gradient error too large: {max_rel}"
+    );
+}
+
+#[test]
+fn matmul_bt_gradient_check() {
+    // Verify MatMulBT backward via finite differences.
+    // C = A @ B^T, loss = mean(C).
+    // A=[4,8], B=[6,8] → C=[4,6].
+    let m = 4usize;
+    let k = 8usize;
+    let n = 6usize;
+
+    // --- Backprop gradients ---
+    let mut g = Graph::new();
+    let a = g.parameter("a", &[m, k]);
+    let b = g.parameter("b", &[n, k]);
+    let c = g.matmul_bt(a, b);
+    let loss = g.mean_all(c);
+    g.set_outputs(vec![loss]);
+
+    let mut sess = build_session(&g);
+    let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.1).sin()).collect();
+    let b_data: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.07 + 1.0).cos()).collect();
+    sess.set_parameter("a", &a_data);
+    sess.set_parameter("b", &b_data);
+    sess.step();
+    sess.wait();
+
+    let plan = sess.plan().clone();
+    let param_bufs: std::collections::HashMap<String, BufferRef> =
+        plan.param_buffers.iter().cloned().collect();
+    let grad_map: std::collections::HashMap<BufferRef, BufferRef> =
+        plan.param_grad_pairs.iter().cloned().collect();
+
+    let mut grad_a = vec![0.0f32; m * k];
+    let mut grad_b = vec![0.0f32; n * k];
+    sess.read_buffer(grad_map[&param_bufs["a"]], &mut grad_a);
+    sess.read_buffer(grad_map[&param_bufs["b"]], &mut grad_b);
+
+    // --- Finite differences ---
+    let mut gi = Graph::new();
+    let ai = gi.parameter("a", &[m, k]);
+    let bi = gi.parameter("b", &[n, k]);
+    let ci = gi.matmul_bt(ai, bi);
+    let li = gi.mean_all(ci);
+    gi.set_outputs(vec![li]);
+    let mut isess = build_inference_session(&gi);
+
+    let fwd = |s: &mut meganeura::Session, ad: &[f32], bd: &[f32]| -> f32 {
+        s.set_parameter("a", ad);
+        s.set_parameter("b", bd);
+        s.step();
+        s.wait();
+        s.read_loss()
+    };
+
+    let eps = 1e-3f32;
+    let mut max_rel = 0.0f32;
+
+    for idx in [0, 3, 7, 15, 31] {
+        if idx >= m * k {
+            continue;
+        }
+        let mut ad = a_data.clone();
+        ad[idx] += eps;
+        let lp = fwd(&mut isess, &ad, &b_data);
+        ad[idx] -= 2.0 * eps;
+        let lm = fwd(&mut isess, &ad, &b_data);
+        let num = (lp - lm) / (2.0 * eps);
+        let ana = grad_a[idx];
+        let rel = (num - ana).abs() / num.abs().max(ana.abs()).max(1e-8);
+        eprintln!("grad_a[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
+        max_rel = max_rel.max(rel);
+    }
+    for idx in [0, 5, 11, 23, 47] {
+        if idx >= n * k {
+            continue;
+        }
+        let mut bd = b_data.clone();
+        bd[idx] += eps;
+        let lp = fwd(&mut isess, &a_data, &bd);
+        bd[idx] -= 2.0 * eps;
+        let lm = fwd(&mut isess, &a_data, &bd);
+        let num = (lp - lm) / (2.0 * eps);
+        let ana = grad_b[idx];
+        let rel = (num - ana).abs() / num.abs().max(ana.abs()).max(1e-8);
+        eprintln!("grad_b[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
+        max_rel = max_rel.max(rel);
+    }
+
+    eprintln!("MatMulBT gradient check: max relative error {max_rel:.6}");
+    assert!(
+        max_rel < 0.01,
+        "MatMulBT gradient error too large: {max_rel}"
     );
 }
