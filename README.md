@@ -11,7 +11,7 @@ Meganeura - a cross-platform Neural Network training and inference library in Ru
 ## Why Meganeura?
 
 - **Portable**. It's powered by [blade-graphics](https://github.com/kvark/blade/tree/main/blade-graphics) for accessing GPUs across the board: Linux, Windows, MacOS, even edge devices on iOS or Android. Not toasters though.
-- **Fast**. Within 2x of ROCm and MLX for training workloads, and within 5x of optimized CUDA.
+- **Fast**. Within 2x of ROCm, and 5x of optimized CUDA or MLX for training workloads.
 - **Lean**. It packs a bunch of kernels, but the real power comes from their auto-discovery. During the optimization pre-process, it explores the search space using [e-graph](https://egraphs-good.github.io/), similar to [Luminal](https://github.com/luminal-ai/luminal).
 
 ## Benchmarks
@@ -26,8 +26,8 @@ SmolVLA action expert training (chunk_size=50, vlm_seq_len=16, float32, random w
 | Radeon 890M (RADV) | PyTorch 2.10.0 ROCm | 7.30 s | 20.9 ms | 48.0 ms |
 | GeForce RTX 5080 (590/Linux) | Meganeura 550bb6caf09c819f199084d2263794e14f683463 | 0 s | 6.1 ms | 35.1 ms |
 | GeForce RTX 5080 (590/Linux) | PyTorch 2.11.0+cu128 | 3.41 s | 1.57 ms | 4.68 ms |
-| Apple M3 | Meganeura db9ae11f28189307c4384d75b0030336828aece8 | 0s | 45.5 ms | 87.0 ms |
-| Apple M3 | PyTorch 2.11.0 | 5.92s | 17.7 ms | 78.1 ms |
+| Apple M3 | Meganeura 5ddf5e5c9b7b99ebb8d9d21e5c47110297ffeaa5 | 0s | 48.8 ms | 89.7 ms |
+| Apple M3 | PyTorch 2.11.0 | 6.0s | 10.2 ms | 31.6 ms |
 
 Full automatic differentiation through all ops including fused CausalAttention (with LSE-based backward), RoPE, Softmax, RmsNorm, and SwiGLU.
 Gradient norms verified against PyTorch via [Inferena](https://kvark.github.io/inferena/) correctness checking.

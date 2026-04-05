@@ -1,6 +1,6 @@
 [package]
 name = "meganeura"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Dzmitry Malyshau"]
 repository = "https://github.com/kvark/meganeura"
 categories = ["science"]
