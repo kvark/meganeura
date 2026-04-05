@@ -675,7 +675,8 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 accumulate_grad(&mut graph, &mut grads, v, grad_v);
             }
             // Inference-only ops: should not appear in training graphs
-            Op::LayerNorm { .. }
+            Op::SlidingWindowAttention { .. }
+            | Op::LayerNorm { .. }
             | Op::FullAttention { .. }
             | Op::CrossAttention { .. }
             | Op::CacheWrite

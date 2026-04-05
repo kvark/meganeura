@@ -259,6 +259,7 @@ fn graph_to_egglog(graph: &Graph) -> String {
   (RoPE Op)
   (RoPEGrad Op)
   (CausalAttention Op Op Op)
+  (SlidingWindowAttention Op Op Op)
   (LayerNorm Op Op Op)
   (FullAttention Op Op Op)
   (CrossAttention Op Op Op)
@@ -402,6 +403,9 @@ fn node_to_egglog_expr(node: &Node) -> String {
         Op::RoPEGrad { .. } => format!("(RoPEGrad n{})", i[0]),
         Op::CausalAttention { .. } => {
             format!("(CausalAttention n{} n{} n{})", i[0], i[1], i[2])
+        }
+        Op::SlidingWindowAttention { .. } => {
+            format!("(SlidingWindowAttention n{} n{} n{})", i[0], i[1], i[2])
         }
         Op::LayerNorm { .. } => format!("(LayerNorm n{} n{} n{})", i[0], i[1], i[2]),
         Op::FullAttention { .. } => format!("(FullAttention n{} n{} n{})", i[0], i[1], i[2]),
