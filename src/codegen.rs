@@ -1125,6 +1125,7 @@ mod tests {
                 | ShaderEntry::Recip
                 | ShaderEntry::Silu
                 | ShaderEntry::Gelu
+                | ShaderEntry::Tanh
                 | ShaderEntry::SumAll
                 | ShaderEntry::MeanAll
                 | ShaderEntry::SumRows
@@ -1247,6 +1248,7 @@ mod tests {
             ShaderEntry::RoPEGrad,
             ShaderEntry::CausalAttention,
             ShaderEntry::Gelu,
+            ShaderEntry::Tanh,
             ShaderEntry::LayerNorm,
             ShaderEntry::FullAttention,
             ShaderEntry::CrossAttention,

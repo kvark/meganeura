@@ -61,6 +61,13 @@ fn silu(@builtin(global_invocation_id) gid: vec3<u32>) {
     dst[i] = val / (1.0 + exp(-val));
 }
 
+@compute @workgroup_size(256)
+fn tanh_(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if i >= params.len { return; }
+    dst[i] = tanh(src[i]);
+}
+
 // gelu approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 @compute @workgroup_size(256)
 fn gelu(@builtin(global_invocation_id) gid: vec3<u32>) {
