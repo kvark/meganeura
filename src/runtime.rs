@@ -249,6 +249,30 @@ struct AttentionData {
     params: MatMulParams,
 }
 
+// sliding_window_attention: var src_a (q), src_b (k), bias (v), dst, params
+// params has 5 fields so needs its own struct (not MatMulParams which has 4)
+#[derive(blade_macros::ShaderData)]
+struct SlidingWindowAttentionData {
+    src_a: blade_graphics::BufferPiece,
+    src_b: blade_graphics::BufferPiece,
+    bias: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: SlidingWindowAttentionParams,
+}
+
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct SlidingWindowAttentionParams {
+    seq: u32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    window_size: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
 // rope_dynamic: var src, dst, pos_offset_buf, params
 #[derive(blade_macros::ShaderData)]
 struct RoPEDynamicData {
@@ -704,6 +728,7 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::Embedding => EmbeddingData::layout(),
         ShaderEntry::RoPE | ShaderEntry::RoPEGrad => RoPEData::layout(),
         ShaderEntry::CausalAttention => AttentionData::layout(),
+        ShaderEntry::SlidingWindowAttention => SlidingWindowAttentionData::layout(),
         ShaderEntry::Gelu => UnaryData::layout(),
         ShaderEntry::LayerNorm => LayerNormData::layout(),
         ShaderEntry::FullAttention | ShaderEntry::CrossAttention => AttentionData::layout(),
@@ -1950,6 +1975,27 @@ impl Session {
                             n: dispatch.params[1],
                             k: dispatch.params[2],
                             _pad: dispatch.params[3],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::SlidingWindowAttention => {
+                pc.bind(
+                    0,
+                    &SlidingWindowAttentionData {
+                        src_a: buf(dispatch.input_buffers[0]),
+                        src_b: buf(dispatch.input_buffers[1]),
+                        bias: buf(dispatch.input_buffers[2]),
+                        dst: buf(dispatch.output_buffer),
+                        params: SlidingWindowAttentionParams {
+                            seq: dispatch.params[0],
+                            num_heads: dispatch.params[1],
+                            num_kv_heads: dispatch.params[2],
+                            head_dim: dispatch.params[3],
+                            window_size: dispatch.params[4],
+                            _pad0: 0,
+                            _pad1: 0,
+                            _pad2: 0,
                         },
                     },
                 );

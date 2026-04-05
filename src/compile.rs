@@ -39,6 +39,7 @@ pub enum ShaderEntry {
     RoPE,
     RoPEGrad,
     CausalAttention,
+    SlidingWindowAttention,
     Gelu,
     LayerNorm,
     FullAttention,
@@ -116,6 +117,7 @@ impl ShaderEntry {
             ShaderEntry::RoPE => ShaderGroup::RoPE,
             ShaderEntry::RoPEGrad => ShaderGroup::RoPEGrad,
             ShaderEntry::CausalAttention => ShaderGroup::CausalAttention,
+            ShaderEntry::SlidingWindowAttention => ShaderGroup::SlidingWindowAttention,
             ShaderEntry::Gelu => ShaderGroup::Unary,
             ShaderEntry::LayerNorm => ShaderGroup::LayerNorm,
             ShaderEntry::FullAttention => ShaderGroup::FullAttention,
@@ -192,6 +194,7 @@ impl ShaderEntry {
             ShaderEntry::RoPE => "main",
             ShaderEntry::RoPEGrad => "main",
             ShaderEntry::CausalAttention => "main",
+            ShaderEntry::SlidingWindowAttention => "main",
             ShaderEntry::Gelu => "gelu",
             ShaderEntry::LayerNorm => "main",
             ShaderEntry::FullAttention => "main",
@@ -1023,6 +1026,29 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![lse_buf, score_buf],
                     params: vec![seq, num_heads, num_kv_heads, head_dim],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    label: String::new(),
+                });
+            }
+
+            Op::SlidingWindowAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                window_size,
+            } => {
+                let q = self.get_buffer(node.inputs[0]);
+                let k = self.get_buffer(node.inputs[1]);
+                let v = self.get_buffer(node.inputs[2]);
+                let seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::SlidingWindowAttention,
+                    workgroups: [seq.div_ceil(1), num_heads, 1],
+                    input_buffers: vec![q, k, v],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![seq, num_heads, num_kv_heads, head_dim, window_size],
                     use_coop: false,
                     use_small_tiles: false,
                     label: String::new(),

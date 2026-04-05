@@ -90,6 +90,7 @@ pub enum ShaderGroup {
     RoPE,
     RoPEGrad,
     CausalAttention,
+    SlidingWindowAttention,
     LayerNorm,
     FullAttention,
     CrossAttention,
@@ -159,6 +160,7 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::RoPE => parse_wgsl(include_str!("shaders/rope.wgsl")),
         ShaderGroup::RoPEGrad => parse_wgsl(include_str!("shaders/rope_grad.wgsl")),
         ShaderGroup::CausalAttention => gen_causal_attention(),
+        ShaderGroup::SlidingWindowAttention => gen_sliding_window_attention(),
         ShaderGroup::LayerNorm => parse_wgsl(include_str!("shaders/layer_norm.wgsl")),
         ShaderGroup::FullAttention => gen_full_attention(),
         ShaderGroup::CrossAttention => gen_cross_attention(),
@@ -689,6 +691,28 @@ fn gen_causal_attention() -> ShaderModule {
     parse_wgsl(&src)
 }
 
+// ---------------------------------------------------------------------------
+// sliding_window_attention: same as causal but with bounded window
+// ---------------------------------------------------------------------------
+
+fn gen_sliding_window_attention() -> ShaderModule {
+    let src = include_str!("shaders/sliding_window_attention.wgsl");
+    let src = preprocess(
+        src,
+        &[
+            (
+                "$PARAM_FIELDS",
+                "seq: u32, num_heads: u32, num_kv_heads: u32, head_dim: u32, window_size: u32,",
+            ),
+            (
+                "$PARSE_PARAMS",
+                "let q_seq = params.seq;\n    let num_heads = params.num_heads;\n    let num_kv_heads = params.num_kv_heads;\n    let head_dim = params.head_dim;\n    let window_size = params.window_size;\n    let kv_start = select(0u, pos + 1u - window_size, pos >= window_size);\n    let kv_len = pos + 1u;",
+            ),
+        ],
+    );
+    parse_wgsl(&src)
+}
+
 #[allow(clippy::empty_line_after_doc_comments)]
 /// Parallel attention kernel: 64 threads per workgroup, one per head_dim element.
 /// Dispatch [q_seq, num_heads, 1] workgroups; workgroup_id gives (pos, head), local_id.x is tid.
@@ -878,6 +902,10 @@ mod tests {
                 ShaderGroup::CausalAttention,
                 naga::valid::Capabilities::empty(),
             ),
+            (
+                ShaderGroup::SlidingWindowAttention,
+                naga::valid::Capabilities::empty(),
+            ),
             (ShaderGroup::LayerNorm, naga::valid::Capabilities::empty()),
             (
                 ShaderGroup::FullAttention,
@@ -1025,6 +1053,7 @@ mod tests {
             (ShaderGroup::RoPE, empty),
             (ShaderGroup::RoPEGrad, empty),
             (ShaderGroup::CausalAttention, empty),
+            (ShaderGroup::SlidingWindowAttention, empty),
             (ShaderGroup::LayerNorm, empty),
             (ShaderGroup::FullAttention, empty),
             (ShaderGroup::CrossAttention, empty),
@@ -1154,6 +1183,9 @@ mod tests {
                 | ShaderEntry::CrossAttention => {
                     vec!["src_a", "src_b", "bias", "dst", "lse", "scores", "params"]
                 }
+                ShaderEntry::SlidingWindowAttention => {
+                    vec!["src_a", "src_b", "bias", "dst", "params"]
+                }
                 ShaderEntry::LayerNorm => vec!["src", "src_b", "bias", "dst", "params"],
                 ShaderEntry::MultiHeadAttn => {
                     vec!["src_a", "src_b", "bias", "dst", "lse", "scores", "params"]
@@ -1247,6 +1279,7 @@ mod tests {
             ShaderEntry::RoPE,
             ShaderEntry::RoPEGrad,
             ShaderEntry::CausalAttention,
+            ShaderEntry::SlidingWindowAttention,
             ShaderEntry::Gelu,
             ShaderEntry::Tanh,
             ShaderEntry::LayerNorm,

@@ -411,6 +411,16 @@ pub enum Op {
 
     // --- KV cache ops ---
 
+    // Sliding-window causal attention with GQA.
+    // Same as CausalAttention but only attends to the last `window_size` positions.
+    // inputs: [q, k, v] as 2D: q=[seq, num_heads*head_dim], k/v=[seq, num_kv_heads*head_dim]
+    SlidingWindowAttention {
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        window_size: u32,
+    },
+
     // Write [1, dim] into row kv_pos of [max_seq, dim] cache buffer.
     // inputs: [new_kv, cache_buf], kv_pos read from a u32 input.
     // output: cache_buf (in-place write at row kv_pos)
@@ -1009,6 +1019,59 @@ impl Graph {
                 num_heads,
                 num_kv_heads,
                 head_dim,
+            },
+            vec![q, k, v],
+            ty,
+        )
+    }
+
+    /// Sliding-window causal attention with GQA.
+    ///
+    /// Same as `causal_attention` but each position only attends to the
+    /// last `window_size` positions (inclusive).
+    #[allow(clippy::too_many_arguments)]
+    pub fn sliding_window_attention(
+        &mut self,
+        q: NodeId,
+        k: NodeId,
+        v: NodeId,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        window_size: u32,
+    ) -> NodeId {
+        let q_shape = &self.node(q).ty.shape;
+        let k_shape = &self.node(k).ty.shape;
+        let v_shape = &self.node(v).ty.shape;
+        assert_eq!(q_shape.len(), 2, "q must be 2D");
+        assert_eq!(k_shape.len(), 2, "k must be 2D");
+        assert_eq!(v_shape.len(), 2, "v must be 2D");
+        let seq = q_shape[0];
+        assert_eq!(
+            q_shape[1],
+            (num_heads * head_dim) as usize,
+            "q dim mismatch"
+        );
+        assert_eq!(k_shape[0], seq, "k seq must match q seq");
+        assert_eq!(
+            k_shape[1],
+            (num_kv_heads * head_dim) as usize,
+            "k dim mismatch"
+        );
+        assert_eq!(v_shape[0], seq, "v seq must match q seq");
+        assert_eq!(
+            v_shape[1],
+            (num_kv_heads * head_dim) as usize,
+            "v dim mismatch"
+        );
+        assert!(window_size > 0, "window_size must be > 0");
+        let ty = TensorType::f32(vec![seq, (num_heads * head_dim) as usize]);
+        self.add_node(
+            Op::SlidingWindowAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                window_size,
             },
             vec![q, k, v],
             ty,
