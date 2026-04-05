@@ -702,12 +702,13 @@ fn gen_sliding_window_attention() -> ShaderModule {
         &[
             (
                 "$PARAM_FIELDS",
-                "seq: u32, num_heads: u32, num_kv_heads: u32, head_dim: u32, window_size: u32,",
+                "seq: u32, num_heads: u32, num_kv_heads: u32, head_dim: u32, window_size: u32, _pad0: u32, _pad1: u32, _pad2: u32,",
             ),
             (
                 "$PARSE_PARAMS",
                 "let q_seq = params.seq;\n    let num_heads = params.num_heads;\n    let num_kv_heads = params.num_kv_heads;\n    let head_dim = params.head_dim;\n    let window_size = params.window_size;\n    let kv_start = select(0u, pos + 1u - window_size, pos >= window_size);\n    let kv_len = pos + 1u;",
             ),
+            ("$SCORE_STRIDE", "q_seq"),
         ],
     );
     parse_wgsl(&src)
@@ -1184,7 +1185,7 @@ mod tests {
                     vec!["src_a", "src_b", "bias", "dst", "lse", "scores", "params"]
                 }
                 ShaderEntry::SlidingWindowAttention => {
-                    vec!["src_a", "src_b", "bias", "dst", "params"]
+                    vec!["src_a", "src_b", "bias", "dst", "lse", "scores", "params"]
                 }
                 ShaderEntry::LayerNorm => vec!["src", "src_b", "bias", "dst", "params"],
                 ShaderEntry::MultiHeadAttn => {

@@ -6,6 +6,10 @@ struct Params {
     kv_seq: u32,
     packed_heads: u32,
     head_dim: u32,
+    window_size: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 var<storage> d_out: array<f32>;   // dO
@@ -68,8 +72,11 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     var my_dq = 0.0;
 
     // kv_seq == 0 signals causal: each position attends to t ∈ [0, pos].
+    // window_size > 0 restricts to [max(0, pos+1-window), pos+1).
     let kv_len = select(kv_seq, pos + 1u, kv_seq == 0u);
-    for (var t = 0u; t < kv_len; t++) {
+    let window = params.window_size;
+    let kv_start = select(0u, select(0u, pos + 1u - window, pos >= window), window > 0u);
+    for (var t = kv_start; t < kv_len; t++) {
         let k_base = t * kv_dim + kv_head_off;
 
         // Read exact score from LSE buffer (stored after LSE data by forward pass)

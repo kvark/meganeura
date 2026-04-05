@@ -6,6 +6,10 @@ struct Params {
     kv_seq: u32,
     packed_heads: u32,
     head_dim: u32,
+    window_size: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 var<storage> d_out: array<f32>;   // dO
@@ -60,8 +64,11 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     var my_dk = 0.0;
 
     // kv_seq == 0 signals causal: only Q positions >= t contribute.
+    // window_size > 0 restricts to [t, min(q_seq, t+window)).
     let start_pos = select(0u, t, kv_seq == 0u);
-    for (var pos = start_pos; pos < q_seq; pos++) {
+    let window = params.window_size;
+    let end_pos = select(q_seq, min(q_seq, t + window), window > 0u);
+    for (var pos = start_pos; pos < end_pos; pos++) {
         for (var head_rel = 0u; head_rel < heads_per_kv; head_rel++) {
             let head = kv_head * heads_per_kv + head_rel;
             let q_base = pos * q_dim + head * head_dim;

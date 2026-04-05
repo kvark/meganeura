@@ -1,5 +1,4 @@
 // Sliding-window causal attention: online softmax single-pass with GQA.
-// Inference-only variant — no LSE/score storage (not differentiable).
 // Each position attends to [kv_start, kv_len) instead of [0, kv_len).
 
 struct Params {
@@ -10,6 +9,8 @@ var<storage> src_a: array<f32>;  // Q
 var<storage> src_b: array<f32>;  // K
 var<storage> bias: array<f32>;   // V
 var<storage, read_write> dst: array<f32>;
+var<storage, read_write> lse: array<f32>;  // log-sum-exp for backward
+var<storage, read_write> scores: array<f32>;  // reserved for score storage
 var<uniform> params: Params;
 var<workgroup> wg_dot: array<f32, 64>;
 
@@ -56,6 +57,12 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         tree_reduce(tid);
         let score = wg_dot[0] * scale;
 
+        // Store score for backward pass (same layout as causal attention)
+        if tid == 0u {
+            let score_off = q_seq * num_heads * 2u;
+            lse[score_off + (pos * num_heads + head) * $SCORE_STRIDE + t] = score;
+        }
+
         let new_max = max(max_score, score);
         let correction = exp(max_score - new_max);
         let weight = exp(score - new_max);
@@ -66,4 +73,11 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
 
     let safe_sum = select(sum_exp, 1.0, sum_exp == 0.0);
     dst[q_base + tid] = my_out / safe_sum;
+
+    // Store (max_score, log_sum_exp) for backward pass
+    if tid == 0u {
+        let idx = (pos * num_heads + head) * 2u;
+        lse[idx] = max_score;
+        lse[idx + 1u] = select(log(sum_exp), -1e30, sum_exp == 0.0);
+    }
 }

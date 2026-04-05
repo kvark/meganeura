@@ -257,6 +257,8 @@ struct SlidingWindowAttentionData {
     src_b: blade_graphics::BufferPiece,
     bias: blade_graphics::BufferPiece,
     dst: blade_graphics::BufferPiece,
+    lse: blade_graphics::BufferPiece,
+    scores: blade_graphics::BufferPiece,
     params: SlidingWindowAttentionParams,
 }
 
@@ -517,6 +519,19 @@ struct MultiHeadAttnData {
 }
 
 // multi_head_attn_grad: var d_out (dO), src_a (Q), src_b (K), bias (V), lse, fwd_dst (O), dst (dQ/dK/dV), params
+#[derive(blade_macros::ShaderData, Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct AttentionGradParams {
+    q_seq: u32,
+    kv_seq: u32,
+    packed_heads: u32,
+    head_dim: u32,
+    window_size: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
 #[derive(blade_macros::ShaderData)]
 struct MultiHeadAttnGradData {
     d_out: blade_graphics::BufferPiece,
@@ -527,7 +542,7 @@ struct MultiHeadAttnGradData {
     fwd_dst: blade_graphics::BufferPiece,
     scores: blade_graphics::BufferPiece,
     dst: blade_graphics::BufferPiece,
-    params: MatMulParams,
+    params: AttentionGradParams,
 }
 
 // ---- Pipeline collection ----
@@ -1987,6 +2002,8 @@ impl Session {
                         src_b: buf(dispatch.input_buffers[1]),
                         bias: buf(dispatch.input_buffers[2]),
                         dst: buf(dispatch.output_buffer),
+                        lse: buf(dispatch.extra_outputs[0]),
+                        scores: buf(dispatch.extra_outputs[1]),
                         params: SlidingWindowAttentionParams {
                             seq: dispatch.params[0],
                             num_heads: dispatch.params[1],
@@ -2065,11 +2082,15 @@ impl Session {
                         fwd_dst: buf(dispatch.input_buffers[5]),
                         scores: buf(dispatch.input_buffers[6]),
                         dst: buf(dispatch.output_buffer),
-                        params: MatMulParams {
-                            m: dispatch.params[0],
-                            n: dispatch.params[1],
-                            k: dispatch.params[2],
-                            _pad: dispatch.params[3],
+                        params: AttentionGradParams {
+                            q_seq: dispatch.params[0],
+                            kv_seq: dispatch.params[1],
+                            packed_heads: dispatch.params[2],
+                            head_dim: dispatch.params[3],
+                            window_size: dispatch.params[4],
+                            _pad0: 0,
+                            _pad1: 0,
+                            _pad2: 0,
                         },
                     },
                 );

@@ -674,9 +674,62 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 accumulate_grad(&mut graph, &mut grads, k, grad_k);
                 accumulate_grad(&mut graph, &mut grads, v, grad_v);
             }
+            Op::SlidingWindowAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                ..
+            } => {
+                // Same backward as CausalAttention — compile.rs extracts window_size
+                // from the forward node and passes it to the backward shaders.
+                let q = node.inputs[0];
+                let k = node.inputs[1];
+                let v = node.inputs[2];
+                let fwd_node = node.id;
+
+                let q_ty = forward.nodes()[q as usize].ty.clone();
+                let k_ty = forward.nodes()[k as usize].ty.clone();
+                let v_ty = forward.nodes()[v as usize].ty.clone();
+
+                let grad_q = graph.add_raw_node(
+                    Op::MultiHeadAttnGradQ {
+                        fwd_node,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        is_cross: false,
+                    },
+                    vec![grad_output, q, k, v],
+                    q_ty,
+                );
+                let grad_k = graph.add_raw_node(
+                    Op::MultiHeadAttnGradK {
+                        fwd_node,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        is_cross: false,
+                    },
+                    vec![grad_output, q, k, v],
+                    k_ty,
+                );
+                let grad_v = graph.add_raw_node(
+                    Op::MultiHeadAttnGradV {
+                        fwd_node,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        is_cross: false,
+                    },
+                    vec![grad_output, q, k, v],
+                    v_ty,
+                );
+                accumulate_grad(&mut graph, &mut grads, q, grad_q);
+                accumulate_grad(&mut graph, &mut grads, k, grad_k);
+                accumulate_grad(&mut graph, &mut grads, v, grad_v);
+            }
             // Inference-only ops: should not appear in training graphs
-            Op::SlidingWindowAttention { .. }
-            | Op::LayerNorm { .. }
+            Op::LayerNorm { .. }
             | Op::FullAttention { .. }
             | Op::CrossAttention { .. }
             | Op::CacheWrite

@@ -420,6 +420,7 @@ impl<'a> Compiler<'a> {
                 }
                 Op::MultiHeadAttn { num_heads, .. }
                 | Op::CausalAttention { num_heads, .. }
+                | Op::SlidingWindowAttention { num_heads, .. }
                 | Op::FullAttention { num_heads, .. }
                 | Op::CrossAttention { num_heads, .. } => {
                     let q_seq = node.ty.shape[0];
@@ -1042,12 +1043,14 @@ impl<'a> Compiler<'a> {
                 let k = self.get_buffer(node.inputs[1]);
                 let v = self.get_buffer(node.inputs[2]);
                 let seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
+                let lse_buf = self.find_lse_buffer(node.id);
+                let score_buf = self.find_score_buffer(node.id);
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::SlidingWindowAttention,
                     workgroups: [seq.div_ceil(1), num_heads, 1],
                     input_buffers: vec![q, k, v],
                     output_buffer: out_buf,
-                    extra_outputs: vec![],
+                    extra_outputs: vec![lse_buf, score_buf],
                     params: vec![seq, num_heads, num_kv_heads, head_dim, window_size],
                     use_coop: false,
                     use_small_tiles: false,
@@ -1647,11 +1650,19 @@ impl<'a> Compiler<'a> {
                 let lse_buf = self.find_lse_buffer(fwd_node);
                 let score_buf = self.find_score_buffer(fwd_node);
                 let q_seq = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
-                let is_causal = matches!(self.graph.node(fwd_node).op, Op::CausalAttention { .. });
+                let fwd_op = &self.graph.node(fwd_node).op;
+                let is_causal = matches!(
+                    fwd_op,
+                    Op::CausalAttention { .. } | Op::SlidingWindowAttention { .. }
+                );
                 let kv_seq = if is_causal {
                     0
                 } else {
                     self.graph.node(node.inputs[2]).ty.shape[0] as u32
+                };
+                let window_size = match *fwd_op {
+                    Op::SlidingWindowAttention { window_size, .. } => window_size,
+                    _ => 0,
                 };
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::MultiHeadAttnGradQ,
@@ -1659,7 +1670,13 @@ impl<'a> Compiler<'a> {
                     input_buffers: vec![d_out, q, k, v, lse_buf, fwd_o, score_buf],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
-                    params: vec![q_seq, kv_seq, (num_heads << 16) | num_kv_heads, head_dim],
+                    params: vec![
+                        q_seq,
+                        kv_seq,
+                        (num_heads << 16) | num_kv_heads,
+                        head_dim,
+                        window_size,
+                    ],
                     use_coop: false,
                     use_small_tiles: false,
                     label: String::new(),
@@ -1681,11 +1698,19 @@ impl<'a> Compiler<'a> {
                 let lse_buf = self.find_lse_buffer(fwd_node);
                 let score_buf = self.find_score_buffer(fwd_node);
                 let q_seq = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
-                let is_causal = matches!(self.graph.node(fwd_node).op, Op::CausalAttention { .. });
+                let fwd_op = &self.graph.node(fwd_node).op;
+                let is_causal = matches!(
+                    fwd_op,
+                    Op::CausalAttention { .. } | Op::SlidingWindowAttention { .. }
+                );
                 let kv_seq = if is_causal {
                     0
                 } else {
                     self.graph.node(node.inputs[2]).ty.shape[0] as u32
+                };
+                let window_size = match *fwd_op {
+                    Op::SlidingWindowAttention { window_size, .. } => window_size,
+                    _ => 0,
                 };
                 let dispatch_kv = if is_causal { q_seq } else { kv_seq };
                 self.plan.dispatches.push(Dispatch {
@@ -1694,7 +1719,13 @@ impl<'a> Compiler<'a> {
                     input_buffers: vec![d_out, q, k, v, lse_buf, fwd_o, score_buf],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
-                    params: vec![q_seq, kv_seq, (num_heads << 16) | num_kv_heads, head_dim],
+                    params: vec![
+                        q_seq,
+                        kv_seq,
+                        (num_heads << 16) | num_kv_heads,
+                        head_dim,
+                        window_size,
+                    ],
                     use_coop: false,
                     use_small_tiles: false,
                     label: String::new(),
@@ -1716,11 +1747,19 @@ impl<'a> Compiler<'a> {
                 let lse_buf = self.find_lse_buffer(fwd_node);
                 let score_buf = self.find_score_buffer(fwd_node);
                 let q_seq = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
-                let is_causal = matches!(self.graph.node(fwd_node).op, Op::CausalAttention { .. });
+                let fwd_op = &self.graph.node(fwd_node).op;
+                let is_causal = matches!(
+                    fwd_op,
+                    Op::CausalAttention { .. } | Op::SlidingWindowAttention { .. }
+                );
                 let kv_seq = if is_causal {
                     0
                 } else {
                     self.graph.node(node.inputs[2]).ty.shape[0] as u32
+                };
+                let window_size = match *fwd_op {
+                    Op::SlidingWindowAttention { window_size, .. } => window_size,
+                    _ => 0,
                 };
                 let dispatch_kv = if is_causal { q_seq } else { kv_seq };
                 self.plan.dispatches.push(Dispatch {
@@ -1729,7 +1768,13 @@ impl<'a> Compiler<'a> {
                     input_buffers: vec![d_out, q, k, v, lse_buf, fwd_o, score_buf],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
-                    params: vec![q_seq, kv_seq, (num_heads << 16) | num_kv_heads, head_dim],
+                    params: vec![
+                        q_seq,
+                        kv_seq,
+                        (num_heads << 16) | num_kv_heads,
+                        head_dim,
+                        window_size,
+                    ],
                     use_coop: false,
                     use_small_tiles: false,
                     label: String::new(),
