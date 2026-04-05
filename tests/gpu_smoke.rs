@@ -1931,3 +1931,237 @@ fn matmul_bt_gradient_check() {
         "MatMulBT gradient error too large: {max_rel}"
     );
 }
+
+#[test]
+fn tanh_gradient_check() {
+    if std::env::var("MEGANEURA_SKIP_BACKPROP").unwrap_or_default() == "1" {
+        eprintln!("MEGANEURA_SKIP_BACKPROP set — skipping tanh gradient check");
+        return;
+    }
+    let n = 256;
+
+    // Analytical gradient via backprop
+    let mut g_train = Graph::new();
+    let x = g_train.parameter("x", &[n]);
+    let y = g_train.tanh(x);
+    let loss = g_train.mean_all(y);
+    g_train.set_outputs(vec![loss]);
+
+    let mut train_sess = build_session(&g_train);
+    let x_data: Vec<f32> = (0..n).map(|i| i as f32 * 0.02 - 2.56).collect();
+    train_sess.set_parameter("x", &x_data);
+    train_sess.step();
+    train_sess.wait();
+
+    let param_buffers: std::collections::HashMap<String, BufferRef> =
+        train_sess.plan().param_buffers.iter().cloned().collect();
+    let grad_map: std::collections::HashMap<BufferRef, BufferRef> =
+        train_sess.plan().param_grad_pairs.iter().cloned().collect();
+    let mut grad_x = vec![0.0f32; n];
+    train_sess.read_buffer(grad_map[&param_buffers["x"]], &mut grad_x);
+
+    // Numerical gradient via central differences
+    let mut g_infer = Graph::new();
+    let xi = g_infer.parameter("x", &[n]);
+    let yi = g_infer.tanh(xi);
+    let li = g_infer.mean_all(yi);
+    g_infer.set_outputs(vec![li]);
+    let mut infer_sess = build_inference_session(&g_infer);
+
+    let eps = 1e-3_f32;
+    let check_idxs = [0, 10, 64, 128, 200, 255];
+    let mut max_rel_err = 0.0f32;
+    for &idx in &check_idxs {
+        let mut xd = x_data.clone();
+        xd[idx] += eps;
+        infer_sess.set_parameter("x", &xd);
+        infer_sess.step();
+        infer_sess.wait();
+        let lp = infer_sess.read_loss();
+        xd[idx] -= 2.0 * eps;
+        infer_sess.set_parameter("x", &xd);
+        infer_sess.step();
+        infer_sess.wait();
+        let lm = infer_sess.read_loss();
+        let num = (lp - lm) / (2.0 * eps);
+        let ana = grad_x[idx];
+        let rel = (num - ana).abs() / (num.abs().max(ana.abs()).max(1e-6));
+        eprintln!("tanh grad_x[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
+        max_rel_err = max_rel_err.max(rel);
+    }
+    assert!(
+        max_rel_err < 0.01,
+        "Tanh gradient check FAILED: max relative error {max_rel_err:.4}",
+    );
+    eprintln!("Tanh gradient check PASSED: max relative error {max_rel_err:.4}");
+}
+
+#[test]
+fn sliding_window_attention_gradient_check() {
+    if std::env::var("MEGANEURA_SKIP_BACKPROP").unwrap_or_default() == "1" {
+        eprintln!("MEGANEURA_SKIP_BACKPROP set — skipping sliding window attention gradient check");
+        return;
+    }
+
+    let seq: usize = 8;
+    let num_heads: u32 = 1;
+    let num_kv_heads: u32 = 1;
+    let head_dim: u32 = 64;
+    let window_size: u32 = 3;
+    let d = (num_heads * head_dim) as usize;
+    let d_kv = (num_kv_heads * head_dim) as usize;
+    let n_q = seq * d;
+    let n_kv = seq * d_kv;
+
+    // Analytical gradients via backprop
+    let mut g_train = Graph::new();
+    let qn = g_train.parameter("q", &[seq, d]);
+    let kn = g_train.parameter("k", &[seq, d_kv]);
+    let vn = g_train.parameter("v", &[seq, d_kv]);
+    let out = g_train.sliding_window_attention(
+        qn,
+        kn,
+        vn,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        window_size,
+    );
+    let loss_node = g_train.mean_all(out);
+    g_train.set_outputs(vec![loss_node]);
+
+    let mut train_sess = build_session(&g_train);
+
+    let q_data: Vec<f32> = (0..n_q).map(|i| (i as f32 * 0.01).sin() * 0.1).collect();
+    let k_data: Vec<f32> = (0..n_kv)
+        .map(|i| (i as f32 * 0.013 + 1.0).sin() * 0.1)
+        .collect();
+    let v_data: Vec<f32> = (0..n_kv)
+        .map(|i| (i as f32 * 0.017 + 2.0).sin() * 0.1)
+        .collect();
+
+    train_sess.set_parameter("q", &q_data);
+    train_sess.set_parameter("k", &k_data);
+    train_sess.set_parameter("v", &v_data);
+
+    train_sess.step();
+    train_sess.wait();
+
+    let loss_val = train_sess.read_loss();
+    assert!(
+        loss_val.is_finite(),
+        "SlidingWindowAttn loss is not finite: {}",
+        loss_val
+    );
+
+    let param_buffers: std::collections::HashMap<String, BufferRef> =
+        train_sess.plan().param_buffers.iter().cloned().collect();
+    let grad_map: std::collections::HashMap<BufferRef, BufferRef> =
+        train_sess.plan().param_grad_pairs.iter().cloned().collect();
+
+    let q_buf = param_buffers["q"];
+    let k_buf = param_buffers["k"];
+    let v_buf = param_buffers["v"];
+
+    let mut grad_q = vec![0.0f32; n_q];
+    let mut grad_k = vec![0.0f32; n_kv];
+    let mut grad_v = vec![0.0f32; n_kv];
+    train_sess.read_buffer(grad_map[&q_buf], &mut grad_q);
+    train_sess.read_buffer(grad_map[&k_buf], &mut grad_k);
+    train_sess.read_buffer(grad_map[&v_buf], &mut grad_v);
+
+    // Numerical gradients via central differences
+    let mut g_infer = Graph::new();
+    let qi = g_infer.parameter("q", &[seq, d]);
+    let ki = g_infer.parameter("k", &[seq, d_kv]);
+    let vi = g_infer.parameter("v", &[seq, d_kv]);
+    let out_i = g_infer.sliding_window_attention(
+        qi,
+        ki,
+        vi,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        window_size,
+    );
+    let loss_i = g_infer.mean_all(out_i);
+    g_infer.set_outputs(vec![loss_i]);
+    let mut infer_sess = build_inference_session(&g_infer);
+
+    let fwd = |sess: &mut meganeura::Session, qd: &[f32], kd: &[f32], vd: &[f32]| -> f32 {
+        sess.set_parameter("q", qd);
+        sess.set_parameter("k", kd);
+        sess.set_parameter("v", vd);
+        sess.step();
+        sess.wait();
+        sess.read_loss()
+    };
+
+    let eps = 1e-3_f32;
+    let check_idxs = [0usize, 8, 32, 63, 128, 200, 255, 400, 500];
+    let mut max_rel_err = 0.0f32;
+    let mut checks = 0usize;
+
+    for &idx in &check_idxs {
+        if idx >= n_q {
+            continue;
+        }
+        let mut qd = q_data.clone();
+        qd[idx] += eps;
+        let lp = fwd(&mut infer_sess, &qd, &k_data, &v_data);
+        qd[idx] -= 2.0 * eps;
+        let lm = fwd(&mut infer_sess, &qd, &k_data, &v_data);
+        let num = (lp - lm) / (2.0 * eps);
+        let ana = grad_q[idx];
+        let rel = (num - ana).abs() / (num.abs().max(ana.abs()).max(1e-6));
+        eprintln!("swa grad_q[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
+        max_rel_err = max_rel_err.max(rel);
+        checks += 1;
+    }
+
+    for &idx in &check_idxs {
+        if idx >= n_kv {
+            continue;
+        }
+        let mut kd = k_data.clone();
+        kd[idx] += eps;
+        let lp = fwd(&mut infer_sess, &q_data, &kd, &v_data);
+        kd[idx] -= 2.0 * eps;
+        let lm = fwd(&mut infer_sess, &q_data, &kd, &v_data);
+        let num = (lp - lm) / (2.0 * eps);
+        let ana = grad_k[idx];
+        let rel = (num - ana).abs() / (num.abs().max(ana.abs()).max(1e-6));
+        eprintln!("swa grad_k[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
+        max_rel_err = max_rel_err.max(rel);
+        checks += 1;
+    }
+
+    for &idx in &check_idxs {
+        if idx >= n_kv {
+            continue;
+        }
+        let mut vd = v_data.clone();
+        vd[idx] += eps;
+        let lp = fwd(&mut infer_sess, &q_data, &k_data, &vd);
+        vd[idx] -= 2.0 * eps;
+        let lm = fwd(&mut infer_sess, &q_data, &k_data, &vd);
+        let num = (lp - lm) / (2.0 * eps);
+        let ana = grad_v[idx];
+        let rel = (num - ana).abs() / (num.abs().max(ana.abs()).max(1e-6));
+        eprintln!("swa grad_v[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
+        max_rel_err = max_rel_err.max(rel);
+        checks += 1;
+    }
+
+    assert!(checks > 0, "no gradient elements were checked");
+    assert!(
+        max_rel_err < 0.06,
+        "SlidingWindowAttention gradient check FAILED: max relative error {:.4} (>6%) across {} elements",
+        max_rel_err,
+        checks,
+    );
+    eprintln!(
+        "SlidingWindowAttention gradient check PASSED: max relative error {:.4} across {} elements",
+        max_rel_err, checks
+    );
+}
