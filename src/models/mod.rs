@@ -1,3 +1,4 @@
+pub mod gemma4;
 pub mod resnet;
 pub mod sd_unet;
 pub mod smollm2;
