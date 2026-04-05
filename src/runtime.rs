@@ -681,6 +681,7 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         | ShaderEntry::FusedMatMulBTAdd => FusedMatMulAddData::layout(),
         ShaderEntry::Relu
         | ShaderEntry::Sigmoid
+        | ShaderEntry::Tanh
         | ShaderEntry::Neg
         | ShaderEntry::Abs
         | ShaderEntry::Log
@@ -1695,6 +1696,7 @@ impl Session {
             }
             ShaderEntry::Relu
             | ShaderEntry::Sigmoid
+            | ShaderEntry::Tanh
             | ShaderEntry::Neg
             | ShaderEntry::Abs
             | ShaderEntry::Log

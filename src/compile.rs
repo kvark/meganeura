@@ -14,6 +14,7 @@ pub enum ShaderEntry {
     FusedMatMulBTAdd,
     Relu,
     Sigmoid,
+    Tanh,
     Neg,
     Abs,
     Log,
@@ -93,6 +94,7 @@ impl ShaderEntry {
             ShaderEntry::FusedMatMulBTAdd => ShaderGroup::MatMulBTAdd,
             ShaderEntry::Relu
             | ShaderEntry::Sigmoid
+            | ShaderEntry::Tanh
             | ShaderEntry::Neg
             | ShaderEntry::Abs
             | ShaderEntry::Log
@@ -173,6 +175,7 @@ impl ShaderEntry {
             | ShaderEntry::Transpose => "main",
             ShaderEntry::Relu => "relu",
             ShaderEntry::Sigmoid => "sigmoid",
+            ShaderEntry::Tanh => "tanh_",
             ShaderEntry::Neg => "neg",
             ShaderEntry::Abs => "abs_",
             ShaderEntry::Log => "log_",
@@ -698,6 +701,9 @@ impl<'a> Compiler<'a> {
             }
             Op::Sigmoid => {
                 self.emit_unary(ShaderEntry::Sigmoid, node, out_buf);
+            }
+            Op::Tanh => {
+                self.emit_unary(ShaderEntry::Tanh, node, out_buf);
             }
             Op::Neg => {
                 self.emit_unary(ShaderEntry::Neg, node, out_buf);

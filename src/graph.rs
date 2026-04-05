@@ -76,6 +76,7 @@ pub enum Op {
     // Unary
     Relu,
     Sigmoid,
+    Tanh,
     Neg,
     Abs,
     Log,
@@ -698,6 +699,11 @@ impl Graph {
     pub fn sigmoid(&mut self, x: NodeId) -> NodeId {
         let ty = self.node(x).ty.clone();
         self.add_node(Op::Sigmoid, vec![x], ty)
+    }
+
+    pub fn tanh(&mut self, x: NodeId) -> NodeId {
+        let ty = self.node(x).ty.clone();
+        self.add_node(Op::Tanh, vec![x], ty)
     }
 
     pub fn neg(&mut self, x: NodeId) -> NodeId {

@@ -127,6 +127,16 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let grad_x = graph.mul(grad_output, dy);
                 accumulate_grad(&mut graph, &mut grads, node.inputs[0], grad_x);
             }
+            Op::Tanh => {
+                // dL/dx = dL/dy * (1 - y^2)
+                let y = node.id;
+                let one = graph.constant(vec![1.0; node.ty.num_elements()], &node.ty.shape);
+                let y_sq = graph.mul(y, y);
+                let neg_y_sq = graph.neg(y_sq);
+                let one_minus_y_sq = graph.add(one, neg_y_sq);
+                let grad_x = graph.mul(grad_output, one_minus_y_sq);
+                accumulate_grad(&mut graph, &mut grads, node.inputs[0], grad_x);
+            }
             Op::CrossEntropyLoss => {
                 // L = -mean_over_batch(labels * log(softmax(logits)))
                 // dL/dlogits = (softmax(logits) - labels) / batch

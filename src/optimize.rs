@@ -232,6 +232,7 @@ fn graph_to_egglog(graph: &Graph) -> String {
   (BiasAdd Op Op)
   (Relu Op)
   (Sigmoid Op)
+  (Tanh Op)
   (Neg Op)
   (Abs Op)
   (Log Op)
@@ -374,6 +375,7 @@ fn node_to_egglog_expr(node: &Node) -> String {
         Op::BiasAdd => format!("(BiasAdd n{} n{})", i[0], i[1]),
         Op::Relu => format!("(Relu n{})", i[0]),
         Op::Sigmoid => format!("(Sigmoid n{})", i[0]),
+        Op::Tanh => format!("(Tanh n{})", i[0]),
         Op::Neg => format!("(Neg n{})", i[0]),
         Op::Abs => format!("(Abs n{})", i[0]),
         Op::Log => format!("(Log n{})", i[0]),
