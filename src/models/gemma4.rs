@@ -140,7 +140,7 @@ impl Gemma4Config {
 
     fn is_global_layer(&self, layer: usize) -> bool {
         layer >= self.global_attn_offset
-            && (layer - self.global_attn_offset) % self.global_attn_period == 0
+            && (layer - self.global_attn_offset).is_multiple_of(self.global_attn_period)
     }
 }
 
