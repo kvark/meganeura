@@ -306,7 +306,10 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::SumRows => parse_wgsl(include_str!("shaders/sum_rows.wgsl")),
         ShaderGroup::RmsNormGrad => parse_wgsl(include_str!("shaders/rms_norm_grad.wgsl")),
         ShaderGroup::FusedRmsNormMatMul => parse_wgsl(include_str!("shaders/matmul_rms_norm.wgsl")),
-        ShaderGroup::FusedRmsNormMatMulCoop => gen_fused_rms_norm_matmul_coop(),
+        // Coop groups must use generate_coop_module(), not generate_module()
+        ShaderGroup::FusedRmsNormMatMulCoop => {
+            panic!("use generate_coop_module for FusedRmsNormMatMulCoop")
+        }
         ShaderGroup::ScatterAdd => parse_wgsl(include_str!("shaders/scatter_add.wgsl")),
         ShaderGroup::BceLoss => parse_wgsl(include_str!("shaders/bce.wgsl")),
         ShaderGroup::GroupNorm => parse_wgsl(include_str!("shaders/group_norm.wgsl")),
@@ -1012,6 +1015,7 @@ fn gen_conv2d_grad_input_gemm_coop_wgsl(config: &CoopConfig) -> ShaderModule {
     parse_wgsl(&src)
 }
 
+#[allow(dead_code)]
 fn gen_fused_rms_norm_matmul_coop() -> ShaderModule {
     let default_config = CoopConfig {
         tile_size: 16,

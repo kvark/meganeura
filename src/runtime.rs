@@ -1142,12 +1142,8 @@ impl Session {
                         dispatch.params[2],
                         1u32,
                     ),
-                    ShaderGroup::FusedRmsNormMatMul => (
-                        dispatch.params[0],
-                        dispatch.params[1],
-                        dispatch.params[2],
-                        1u32,
-                    ),
+                    // FusedRmsNormMatMul excluded: coop variant's 64-thread
+                    // rsqrt prologue is too slow vs the 256-thread scalar shader.
                     _ => continue,
                 };
                 let coop_wgs = m.div_ceil(output_tile) * n.div_ceil(output_tile) * batch;
