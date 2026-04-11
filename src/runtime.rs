@@ -68,6 +68,17 @@ struct MatMulData {
     params: MatMulParams,
 }
 
+// fused_rms_norm_matmul_coop: var matrix_a, matrix_b, rsqrt_buf, w_norm, matrix_c, params
+#[derive(blade_macros::ShaderData)]
+struct FusedRmsNormMatMulCoopData {
+    matrix_a: blade_graphics::BufferPiece,
+    matrix_b: blade_graphics::BufferPiece,
+    rsqrt_buf: blade_graphics::BufferPiece,
+    w_norm: blade_graphics::BufferPiece,
+    matrix_c: blade_graphics::BufferPiece,
+    params: MatMulParams,
+}
+
 // fused_matmul_add: var matrix_a, matrix_b, matrix_c, src (addend), params
 #[derive(blade_macros::ShaderData)]
 struct FusedMatMulAddData {
@@ -670,7 +681,13 @@ impl Pipelines {
                 });
                 if let Some(entries) = entries_for_group.get(&group) {
                     for entry in entries {
-                        let layout = shader_data_layout(entry);
+                        // Coop RmsNorm matmul uses a different data layout
+                        // (6 bindings: matrix_a, matrix_b, rsqrt_buf, w_norm, matrix_c, params)
+                        let layout = if group == ShaderGroup::FusedRmsNormMatMulCoop {
+                            <FusedRmsNormMatMulCoopData as blade_graphics::ShaderData>::layout()
+                        } else {
+                            shader_data_layout(entry)
+                        };
                         let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
                             name: entry.entry_point(),
                             data_layouts: &[&layout],
@@ -784,6 +801,7 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => BinaryData::layout(),
         ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => FourBufData::layout(),
         ShaderEntry::FusedRmsNormMatMul => FourBufData::layout(),
+        ShaderEntry::RmsNormRsqrt => UnaryData::layout(),
         ShaderEntry::GroupNorm | ShaderEntry::GroupNormSilu => GroupNormData::layout(),
         ShaderEntry::GroupNormGradInput => GroupNormGradInputData::layout(),
         ShaderEntry::GroupNormGradWeightBias => GroupNormGradWeightBiasData::layout(),
@@ -1137,6 +1155,12 @@ impl Session {
                         let kw = dispatch.params[6];
                         (in_ch, in_h * in_w, out_ch * kh * kw, dispatch.params[0])
                     }
+                    ShaderGroup::FusedRmsNormMatMul => (
+                        dispatch.params[0], // m
+                        dispatch.params[1], // n
+                        dispatch.params[2], // k
+                        1u32,
+                    ),
                     ShaderGroup::MatMulAT | ShaderGroup::MatMulBT => (
                         dispatch.params[0],
                         dispatch.params[1],
@@ -2173,20 +2197,57 @@ impl Session {
                 );
             }
             ShaderEntry::FusedRmsNormMatMul => {
-                // bindings: matrix_a=X, matrix_b=W_proj, bias=W_norm, matrix_c=output, params
-                // maps to FourBufData: src_a, src_b, bias, dst, params
+                if dispatch.use_coop {
+                    // Coop path: uses FusedRmsNormMatMulCoopData
+                    // input_buffers: [x, w_proj, rsqrt_buf, w_norm]
+                    pc.bind(
+                        0,
+                        &FusedRmsNormMatMulCoopData {
+                            matrix_a: buf(dispatch.input_buffers[0]),  // X
+                            matrix_b: buf(dispatch.input_buffers[1]),  // W_proj
+                            rsqrt_buf: buf(dispatch.input_buffers[2]), // rsqrt
+                            w_norm: buf(dispatch.input_buffers[3]),    // W_norm
+                            matrix_c: buf(dispatch.output_buffer),
+                            params: MatMulParams {
+                                m: dispatch.params[0],
+                                n: dispatch.params[1],
+                                k: dispatch.params[2],
+                                _pad: dispatch.params[3],
+                            },
+                        },
+                    );
+                } else {
+                    // Scalar path: uses FourBufData (matmul_rms_norm.wgsl)
+                    // input_buffers: [x, w_proj, rsqrt_buf, w_norm] — ignore rsqrt_buf
+                    pc.bind(
+                        0,
+                        &FourBufData {
+                            src_a: buf(dispatch.input_buffers[0]), // X
+                            src_b: buf(dispatch.input_buffers[1]), // W_proj
+                            bias: buf(dispatch.input_buffers[3]),  // W_norm
+                            dst: buf(dispatch.output_buffer),
+                            params: MatMulParams {
+                                m: dispatch.params[0],
+                                n: dispatch.params[1],
+                                k: dispatch.params[2],
+                                _pad: dispatch.params[3],
+                            },
+                        },
+                    );
+                }
+            }
+            ShaderEntry::RmsNormRsqrt => {
+                // bindings: src=X, dst=rsqrt, params=(rows, cols, eps_bits, _pad)
                 pc.bind(
                     0,
-                    &FourBufData {
-                        src_a: buf(dispatch.input_buffers[0]), // X
-                        src_b: buf(dispatch.input_buffers[2]), // W_proj
-                        bias: buf(dispatch.input_buffers[1]),  // W_norm
+                    &UnaryData {
+                        src: buf(dispatch.input_buffers[0]),
                         dst: buf(dispatch.output_buffer),
-                        params: MatMulParams {
-                            m: dispatch.params[0],    // m
-                            n: dispatch.params[1],    // n
-                            k: dispatch.params[2],    // k
-                            _pad: dispatch.params[3], // eps_bits
+                        params: UnaryParams {
+                            len: dispatch.params[0],
+                            _pad0: dispatch.params[1],
+                            _pad1: dispatch.params[2],
+                            _pad2: dispatch.params[3],
                         },
                     },
                 );

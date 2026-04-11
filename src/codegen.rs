@@ -239,6 +239,7 @@ pub enum ShaderGroup {
     BceLoss,
     FusedRmsNormMatMul,
     FusedRmsNormMatMulCoop,
+    RmsNormRsqrt,
     GroupNorm,
     GroupNormGrad,
     Concat,
@@ -308,6 +309,7 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::SumRows => parse_wgsl(include_str!("shaders/sum_rows.wgsl")),
         ShaderGroup::RmsNormGrad => parse_wgsl(include_str!("shaders/rms_norm_grad.wgsl")),
         ShaderGroup::FusedRmsNormMatMul => parse_wgsl(include_str!("shaders/matmul_rms_norm.wgsl")),
+        ShaderGroup::RmsNormRsqrt => parse_wgsl(include_str!("shaders/rms_norm_rsqrt.wgsl")),
         // Coop groups must use generate_coop_module(), not generate_module()
         ShaderGroup::FusedRmsNormMatMulCoop => {
             panic!("use generate_coop_module for FusedRmsNormMatMulCoop")
@@ -1466,6 +1468,7 @@ mod tests {
                 ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => {
                     vec!["src_a", "src_b", "bias", "dst", "params"]
                 }
+                ShaderEntry::RmsNormRsqrt => vec!["src", "dst", "params"],
                 ShaderEntry::FusedRmsNormMatMul => {
                     vec!["src_a", "src_b", "bias", "dst", "params"]
                 }
@@ -1555,6 +1558,7 @@ mod tests {
             ShaderEntry::SiluGrad,
             ShaderEntry::RmsNormGradW,
             ShaderEntry::RmsNormGradX,
+            ShaderEntry::RmsNormRsqrt,
             ShaderEntry::FusedRmsNormMatMul,
             ShaderEntry::AdamUpdate,
             ShaderEntry::ScatterAdd,

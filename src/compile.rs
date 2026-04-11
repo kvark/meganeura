@@ -58,6 +58,8 @@ pub enum ShaderEntry {
     RmsNormGradW,
     RmsNormGradX,
     FusedRmsNormMatMul,
+    /// Precompute rsqrt for RmsNorm (phase 1 of two-phase fusion)
+    RmsNormRsqrt,
     GroupNorm,
     GroupNormSilu,
     GroupNormGradInput,
@@ -135,6 +137,7 @@ impl ShaderEntry {
             ShaderEntry::SumRows => ShaderGroup::SumRows,
             ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => ShaderGroup::RmsNormGrad,
             ShaderEntry::FusedRmsNormMatMul => ShaderGroup::FusedRmsNormMatMul,
+            ShaderEntry::RmsNormRsqrt => ShaderGroup::RmsNormRsqrt,
             ShaderEntry::GroupNorm => ShaderGroup::GroupNorm,
             ShaderEntry::GroupNormSilu => ShaderGroup::GroupNormSilu,
             ShaderEntry::GroupNormGradInput => ShaderGroup::GroupNormGrad,
@@ -215,6 +218,7 @@ impl ShaderEntry {
             ShaderEntry::RmsNormGradW => "rms_norm_grad_w",
             ShaderEntry::RmsNormGradX => "rms_norm_grad_x",
             ShaderEntry::FusedRmsNormMatMul => "main",
+            ShaderEntry::RmsNormRsqrt => "main",
             ShaderEntry::GroupNorm | ShaderEntry::GroupNormSilu => "main",
             ShaderEntry::GroupNormGradInput => "grad_input",
             ShaderEntry::GroupNormGradWeightBias => "grad_weight_bias",
@@ -1979,8 +1983,9 @@ impl<'a> Compiler<'a> {
             }
 
             Op::FusedRmsNormMatMul { eps } => {
-                // C = RmsNorm(X, W_norm) × W_proj
-                // inputs: [x, w_norm, w_proj]
+                // Two-phase: rsqrt precompute + matmul with normalized A-staging.
+                // Phase 1: RmsNormRsqrt computes rsqrt[M] (fast, 256-thread cooperative)
+                // Phase 2: MatMul reads rsqrt during A-staging (eligible for coop)
                 let x = self.get_buffer(node.inputs[0]);
                 let w_norm = self.get_buffer(node.inputs[1]);
                 let w_proj = self.get_buffer(node.inputs[2]);
@@ -1989,10 +1994,31 @@ impl<'a> Compiler<'a> {
                 let m = x_shape[0] as u32;
                 let k = x_shape[1] as u32;
                 let n = w_proj_shape[1] as u32;
+
+                // Allocate rsqrt buffer: M floats
+                let rsqrt_buf = self.alloc_buffer((m as usize) * 4);
+
+                // Phase 1: rsqrt precompute
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::RmsNormRsqrt,
+                    workgroups: [m, 1, 1],
+                    input_buffers: vec![x],
+                    output_buffer: rsqrt_buf,
+                    extra_outputs: vec![],
+                    params: vec![m, k, eps.to_bits(), 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+
+                // Phase 2: matmul with normalization during A-staging.
+                // input_buffers: [x, w_proj, rsqrt_buf, w_norm]
+                // The coop selection pass will mark this for coop if eligible,
+                // using FusedRmsNormMatMulCoop shader group.
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::FusedRmsNormMatMul,
                     workgroups: [n.div_ceil(64), m.div_ceil(64), 1],
-                    input_buffers: vec![x, w_norm, w_proj],
+                    input_buffers: vec![x, w_proj, rsqrt_buf, w_norm],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![m, n, k, eps.to_bits()],
