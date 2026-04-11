@@ -1040,7 +1040,7 @@ impl Session {
         let gpu = unsafe {
             blade_graphics::Context::init(blade_graphics::ContextDesc {
                 validation: cfg!(debug_assertions),
-                timing: std::env::var("MEGANEURA_GPU_TIMING").is_ok(),
+                timing: true,
                 capture: false,
                 overlay: false,
                 compute_only: true,
@@ -1166,12 +1166,6 @@ impl Session {
             // Debug: one dispatch per pass — guarantees serial execution.
             log::info!("MEGANEURA_SERIAL_DISPATCH: forcing one dispatch per pass");
             (0..plan.dispatches.len()).map(|i| i..i + 1).collect()
-        } else if std::env::var("MEGANEURA_SINGLE_PASS").is_ok() {
-            // Experimental: all dispatches in one pass, zero barriers.
-            // Relies on hardware memory coherency (NVIDIA L2 cache).
-            // Results may be wrong on non-coherent hardware!
-            log::warn!("MEGANEURA_SINGLE_PASS: all dispatches in one pass — no barriers!");
-            vec![0..plan.dispatches.len()]
         } else {
             compute_groups(&plan.dispatches)
         };
