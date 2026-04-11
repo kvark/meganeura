@@ -508,11 +508,10 @@ fn rebuild_graph_from_extractions(
         apply_silu_fusions(&mut graph, &mut fusions);
         apply_swiglu_fusions(&mut graph, &mut fusions);
         apply_swiglu_concat_fusions(&mut graph, &mut fusions);
-        // RmsNorm+MatMul fusion: disabled — the fused kernel uses the scalar
-        // tiled matmul path (no cooperative matrix), so it's slower than separate
-        // RmsNorm + coop MatMul on discrete GPUs with tensor cores. Would need a
-        // coop variant of matmul_rms_norm.wgsl that normalizes during staging
-        // then uses coopMultiplyAdd, to make this worthwhile.
+        // RmsNorm+MatMul fusion: coop shader variant now exists
+        // (matmul_rms_norm_coop.wgsl) but causes SIGSEGV on NVIDIA for
+        // some backward shapes in small models. Disabled until debugged.
+        // apply_rms_norm_matmul_fusions(&mut graph, &mut fusions);
         // apply_rms_norm_matmul_fusions(&mut graph, &mut fusions);
         if fusions.len() == n {
             break;

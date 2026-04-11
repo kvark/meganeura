@@ -236,6 +236,7 @@ pub enum ShaderGroup {
     ScatterAdd,
     BceLoss,
     FusedRmsNormMatMul,
+    FusedRmsNormMatMulCoop,
     GroupNorm,
     GroupNormGrad,
     Concat,
@@ -304,6 +305,7 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::SumRows => parse_wgsl(include_str!("shaders/sum_rows.wgsl")),
         ShaderGroup::RmsNormGrad => parse_wgsl(include_str!("shaders/rms_norm_grad.wgsl")),
         ShaderGroup::FusedRmsNormMatMul => parse_wgsl(include_str!("shaders/matmul_rms_norm.wgsl")),
+        ShaderGroup::FusedRmsNormMatMulCoop => gen_fused_rms_norm_matmul_coop(),
         ShaderGroup::ScatterAdd => parse_wgsl(include_str!("shaders/scatter_add.wgsl")),
         ShaderGroup::BceLoss => parse_wgsl(include_str!("shaders/bce.wgsl")),
         ShaderGroup::GroupNorm => parse_wgsl(include_str!("shaders/group_norm.wgsl")),
@@ -349,6 +351,7 @@ pub fn generate_coop_module(group: ShaderGroup, config: &CoopConfig) -> ShaderMo
         ShaderGroup::MatMulCoopBT => gen_matmul_coop_wgsl(false, MatMulCoopVariant::BT, config),
         ShaderGroup::MatMulCoopAT => gen_matmul_coop_wgsl(false, MatMulCoopVariant::AT, config),
         ShaderGroup::Conv2dGradInputGemmCoop => gen_conv2d_grad_input_gemm_coop_wgsl(config),
+        ShaderGroup::FusedRmsNormMatMulCoop => gen_fused_rms_norm_matmul_coop_wgsl(config),
         _ => panic!("not a coop shader group: {:?}", group),
     }
 }
@@ -361,7 +364,8 @@ pub fn generate_wgsl(group: ShaderGroup) -> String {
         | ShaderGroup::MatMulCoopAdd
         | ShaderGroup::MatMulCoopAT
         | ShaderGroup::Conv2dGradInputGemmCoop
-        | ShaderGroup::MatMulCoopBT => {
+        | ShaderGroup::MatMulCoopBT
+        | ShaderGroup::FusedRmsNormMatMulCoop => {
             naga::valid::Capabilities::COOPERATIVE_MATRIX
                 | naga::valid::Capabilities::SHADER_FLOAT16
         }
@@ -1002,6 +1006,58 @@ fn gen_conv2d_grad_input_gemm_coop_wgsl(config: &CoopConfig) -> ShaderModule {
             ("$COOP_AB", &coop_ab),
             ("$COOP_BA", &coop_ba),
             ("$ACC_INIT", &acc_init),
+        ],
+    );
+    parse_wgsl(&src)
+}
+
+fn gen_fused_rms_norm_matmul_coop() -> ShaderModule {
+    let default_config = CoopConfig {
+        tile_size: 16,
+        use_f16_input: true,
+    };
+    gen_fused_rms_norm_matmul_coop_wgsl(&default_config)
+}
+
+fn gen_fused_rms_norm_matmul_coop_wgsl(config: &CoopConfig) -> ShaderModule {
+    let tile = config.tile_size;
+    let output_tile = config.output_tile();
+    let shared_size = tile * tile;
+    let wg_size: u32 = 64;
+    let staging_iters = shared_size / wg_size;
+    let row_stride = wg_size / tile;
+    let tile_mask = tile - 1;
+    let tile_shift = tile.trailing_zeros();
+
+    let (elem_type, enable_f16, elem_zero, cast_open, cast_close) = if config.use_f16_input {
+        ("f16", "enable f16;", "f16(0.0)", "f16(", ")")
+    } else {
+        ("f32", "", "0.0", "", "")
+    };
+    let ab_type = if config.use_f16_input { "f16" } else { "f32" };
+    let coop_ab = format!("coop_mat{}x{}<{},A>", tile, tile, ab_type);
+    let coop_ba = format!("coop_mat{}x{}<{},B>", tile, tile, ab_type);
+    let coop_c = format!("coop_mat{}x{}<f32,C>", tile, tile);
+
+    let src = include_str!("shaders/matmul_rms_norm_coop.wgsl");
+    let src = preprocess(
+        src,
+        &[
+            ("$ENABLE_F16", enable_f16),
+            ("$ELEM_TYPE", elem_type),
+            ("$ELEM_ZERO", elem_zero),
+            ("$SHARED_SIZE", &shared_size.to_string()),
+            ("$OUTPUT_TILE_U", &format!("{}u", output_tile)),
+            ("$TILE_SIZE_U", &format!("{}u", tile)),
+            ("$TILE_MASK_U", &format!("{}u", tile_mask)),
+            ("$TILE_SHIFT_U", &format!("{}u", tile_shift)),
+            ("$STAGING_ITERS_U", &format!("{}u", staging_iters)),
+            ("$ROW_STRIDE_U", &format!("{}u", row_stride)),
+            ("$CAST_OPEN", cast_open),
+            ("$CAST_CLOSE", cast_close),
+            ("$COOP_AB", &coop_ab),
+            ("$COOP_BA", &coop_ba),
+            ("$COOP_OUT", &coop_c),
         ],
     );
     parse_wgsl(&src)

@@ -594,6 +594,7 @@ impl Pipelines {
                     ShaderGroup::MatMulAT => ShaderGroup::MatMulCoopAT,
                     ShaderGroup::MatMulBT => ShaderGroup::MatMulCoopBT,
                     ShaderGroup::Conv2dGradInputGemm => ShaderGroup::Conv2dGradInputGemmCoop,
+                    ShaderGroup::FusedRmsNormMatMul => ShaderGroup::FusedRmsNormMatMulCoop,
                     _ => continue,
                 };
                 needed_coop.insert(coop_group);
@@ -1138,6 +1139,12 @@ impl Session {
                         (in_ch, in_h * in_w, out_ch * kh * kw, dispatch.params[0])
                     }
                     ShaderGroup::MatMulAT | ShaderGroup::MatMulBT => (
+                        dispatch.params[0],
+                        dispatch.params[1],
+                        dispatch.params[2],
+                        1u32,
+                    ),
+                    ShaderGroup::FusedRmsNormMatMul => (
                         dispatch.params[0],
                         dispatch.params[1],
                         dispatch.params[2],
