@@ -1089,7 +1089,7 @@ impl Session {
         if let Some(ref config) = coop_config {
             use crate::codegen::ShaderGroup;
             let output_tile = config.output_tile();
-            let half_tile = config.tile_size;
+            let _half_tile = config.tile_size;
             for dispatch in &mut plan.dispatches {
                 let group = dispatch.shader.shader_group();
                 // Extract (m, n, k, batch) from dispatch params based on shader group.
@@ -1130,9 +1130,7 @@ impl Session {
                 } else {
                     MIN_COOP_WORKGROUPS
                 };
-                let m_edge_safe = m % output_tile <= half_tile;
-                let n_edge_safe = n % output_tile <= half_tile;
-                if coop_wgs >= min_wgs && m_edge_safe && n_edge_safe {
+                if coop_wgs >= min_wgs {
                     dispatch.use_coop = true;
                     dispatch.workgroups = [m.div_ceil(output_tile), n.div_ceil(output_tile), batch];
                     // coopStore/coopLoad operate on full tiles without per-element
