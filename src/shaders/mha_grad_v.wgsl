@@ -16,9 +16,8 @@ var<storage> d_out: array<f32>;   // dO
 var<storage> src_a: array<f32>;   // Q
 var<storage> src_b: array<f32>;   // K
 var<storage> bias: array<f32>;    // V
-var<storage> lse: array<f32>;     // LSE from forward
+var<storage> lse: array<f32>;     // LSE from forward (max_score, log_sum only)
 var<storage> fwd_dst: array<f32>; // O from forward
-var<storage> scores: array<f32>; // reserved for score storage
 var<storage, read_write> dst: array<f32>;  // dV
 var<uniform> params: Params;
 var<workgroup> wg_dot: array<f32, 64>;
@@ -72,9 +71,10 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             let head = kv_head * heads_per_kv + head_rel;
             let q_base = pos * q_dim + head * head_dim;
 
-            // Read exact score from LSE buffer
-            let score_off = q_seq * num_heads * 2u;
-            let score = lse[score_off + (pos * num_heads + head) * effective_kv_seq + t];
+            // Recompute score = Q·K * scale
+            wg_dot[tid] = src_a[q_base + tid] * src_b[kv_base + tid];
+            tree_reduce(tid);
+            let score = wg_dot[0] * scale;
 
             // P_t = exp(score - max_score) / sum_exp
             let lse_idx = (pos * num_heads + head) * 2u;

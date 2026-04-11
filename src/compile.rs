@@ -319,8 +319,6 @@ pub struct ExecutionPlan {
     pub param_grad_pairs: Vec<(BufferRef, BufferRef)>,
     /// LSE buffers allocated for MultiHeadAttn forward nodes: (node_id, buffer).
     pub lse_buffers: Vec<(NodeId, BufferRef)>,
-    /// Score buffers allocated for attention forward nodes: (node_id, buffer).
-    pub score_buffers: Vec<(NodeId, BufferRef)>,
     /// Derived parameters: buffer = horizontal concat of source parameters.
     /// Created by the optimizer when fusing e.g. gate+up projections.
     /// Format: (derived_buf, [(source_name, num_elements), ...])
@@ -514,7 +512,6 @@ impl<'a> Compiler<'a> {
                 output_buffers: Vec::new(),
                 param_grad_pairs: Vec::new(),
                 lse_buffers: Vec::new(),
-                score_buffers: Vec::new(),
                 derived_params: Vec::new(),
             },
             node_buffers: HashMap::new(),
@@ -554,22 +551,10 @@ impl<'a> Compiler<'a> {
                 | Op::FullAttention { num_heads, .. }
                 | Op::CrossAttention { num_heads, .. } => {
                     let q_seq = node.ty.shape[0];
-                    let kv_stride = match node.op {
-                        Op::CrossAttention { .. } | Op::MultiHeadAttn { .. } => {
-                            self.graph.node(node.inputs[1]).ty.shape[0]
-                        }
-                        _ => q_seq, // CausalAttention, FullAttention: kv_stride == q_seq
-                    };
-                    // Combined LSE + scores buffer:
-                    // [0..q_seq*num_heads*2): LSE data (max_score, log_sum_exp per pos×head)
-                    // [q_seq*num_heads*2..): scores (q_seq * num_heads * kv_stride floats)
+                    // LSE buffer: [0..q_seq*num_heads*2): LSE data (max_score, log_sum_exp per pos×head)
                     let lse_part = q_seq * num_heads as usize * 2;
-                    let score_part = q_seq * num_heads as usize * kv_stride;
-                    let combined_size = (lse_part + score_part) * 4;
-                    let lse_buf = self.alloc_buffer(combined_size);
+                    let lse_buf = self.alloc_buffer(lse_part * 4);
                     self.plan.lse_buffers.push((node.id, lse_buf));
-                    // Score buffer aliases the same buffer (for dispatch tracking only).
-                    self.plan.score_buffers.push((node.id, lse_buf));
                 }
                 _ => {}
             }
@@ -1149,13 +1134,12 @@ impl<'a> Compiler<'a> {
                 let v = self.get_buffer(node.inputs[2]);
                 let seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let lse_buf = self.find_lse_buffer(node.id);
-                let score_buf = self.find_score_buffer(node.id);
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::CausalAttention,
                     workgroups: [seq.div_ceil(1), num_heads, 1],
                     input_buffers: vec![q, k, v],
                     output_buffer: out_buf,
-                    extra_outputs: vec![lse_buf, score_buf],
+                    extra_outputs: vec![lse_buf],
                     params: vec![seq, num_heads, num_kv_heads, head_dim],
                     use_coop: false,
                     use_small_tiles: false,
@@ -1174,13 +1158,12 @@ impl<'a> Compiler<'a> {
                 let v = self.get_buffer(node.inputs[2]);
                 let seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let lse_buf = self.find_lse_buffer(node.id);
-                let score_buf = self.find_score_buffer(node.id);
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::SlidingWindowAttention,
                     workgroups: [seq.div_ceil(1), num_heads, 1],
                     input_buffers: vec![q, k, v],
                     output_buffer: out_buf,
-                    extra_outputs: vec![lse_buf, score_buf],
+                    extra_outputs: vec![lse_buf],
                     params: vec![seq, num_heads, num_kv_heads, head_dim, window_size],
                     use_coop: false,
                     use_small_tiles: false,
@@ -1700,13 +1683,12 @@ impl<'a> Compiler<'a> {
                 let v = self.get_buffer(node.inputs[2]);
                 let seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let lse_buf = self.find_lse_buffer(node.id);
-                let score_buf = self.find_score_buffer(node.id);
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::FullAttention,
                     workgroups: [seq.div_ceil(1), num_heads, 1],
                     input_buffers: vec![q, k, v],
                     output_buffer: out_buf,
-                    extra_outputs: vec![lse_buf, score_buf],
+                    extra_outputs: vec![lse_buf],
                     params: vec![seq, num_heads, num_kv_heads, head_dim],
                     use_coop: false,
                     use_small_tiles: false,
@@ -1725,13 +1707,12 @@ impl<'a> Compiler<'a> {
                 let q_seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let kv_seq = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
                 let lse_buf = self.find_lse_buffer(node.id);
-                let score_buf = self.find_score_buffer(node.id);
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::CrossAttention,
                     workgroups: [q_seq.div_ceil(1), num_heads, 1],
                     input_buffers: vec![q, k, v],
                     output_buffer: out_buf,
-                    extra_outputs: vec![lse_buf, score_buf],
+                    extra_outputs: vec![lse_buf],
                     params: vec![q_seq, kv_seq, (num_heads << 16) | num_kv_heads, head_dim],
                     use_coop: false,
                     use_small_tiles: false,
@@ -1751,13 +1732,12 @@ impl<'a> Compiler<'a> {
                 let q_seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let kv_seq = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
                 let lse_buf = self.find_lse_buffer(node.id);
-                let score_buf = self.find_score_buffer(node.id);
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::MultiHeadAttn,
                     workgroups: [q_seq, num_heads, 1],
                     input_buffers: vec![q, k, v],
                     output_buffer: out_buf,
-                    extra_outputs: vec![lse_buf, score_buf],
+                    extra_outputs: vec![lse_buf],
                     params: vec![q_seq, kv_seq, (num_heads << 16) | num_kv_heads, head_dim],
                     use_coop: false,
                     use_small_tiles: false,
@@ -1778,7 +1758,6 @@ impl<'a> Compiler<'a> {
                 let v = self.get_buffer(node.inputs[3]);
                 let fwd_o = self.get_buffer(fwd_node);
                 let lse_buf = self.find_lse_buffer(fwd_node);
-                let score_buf = self.find_score_buffer(fwd_node);
                 let q_seq = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
                 let fwd_op = &self.graph.node(fwd_node).op;
                 let is_causal = matches!(
@@ -1797,7 +1776,7 @@ impl<'a> Compiler<'a> {
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::MultiHeadAttnGradQ,
                     workgroups: [q_seq, num_heads, 1],
-                    input_buffers: vec![d_out, q, k, v, lse_buf, fwd_o, score_buf],
+                    input_buffers: vec![d_out, q, k, v, lse_buf, fwd_o],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![
@@ -1826,7 +1805,6 @@ impl<'a> Compiler<'a> {
                 let v = self.get_buffer(node.inputs[3]);
                 let fwd_o = self.get_buffer(fwd_node);
                 let lse_buf = self.find_lse_buffer(fwd_node);
-                let score_buf = self.find_score_buffer(fwd_node);
                 let q_seq = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
                 let fwd_op = &self.graph.node(fwd_node).op;
                 let is_causal = matches!(
@@ -1846,7 +1824,7 @@ impl<'a> Compiler<'a> {
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::MultiHeadAttnGradK,
                     workgroups: [dispatch_kv, num_kv_heads, 1],
-                    input_buffers: vec![d_out, q, k, v, lse_buf, fwd_o, score_buf],
+                    input_buffers: vec![d_out, q, k, v, lse_buf, fwd_o],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![
@@ -1875,7 +1853,6 @@ impl<'a> Compiler<'a> {
                 let v = self.get_buffer(node.inputs[3]);
                 let fwd_o = self.get_buffer(fwd_node);
                 let lse_buf = self.find_lse_buffer(fwd_node);
-                let score_buf = self.find_score_buffer(fwd_node);
                 let q_seq = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
                 let fwd_op = &self.graph.node(fwd_node).op;
                 let is_causal = matches!(
@@ -1895,7 +1872,7 @@ impl<'a> Compiler<'a> {
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::MultiHeadAttnGradV,
                     workgroups: [dispatch_kv, num_kv_heads, 1],
-                    input_buffers: vec![d_out, q, k, v, lse_buf, fwd_o, score_buf],
+                    input_buffers: vec![d_out, q, k, v, lse_buf, fwd_o],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![
@@ -2038,15 +2015,6 @@ impl<'a> Compiler<'a> {
             .iter()
             .find(|item| item.0 == fwd_node)
             .expect("LSE buffer not found for MultiHeadAttn forward node")
-            .1
-    }
-
-    fn find_score_buffer(&self, fwd_node: NodeId) -> BufferRef {
-        self.plan
-            .score_buffers
-            .iter()
-            .find(|item| item.0 == fwd_node)
-            .expect("Score buffer not found for attention forward node")
             .1
     }
 

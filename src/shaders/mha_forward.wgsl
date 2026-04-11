@@ -13,7 +13,6 @@ var<storage> src_b: array<f32>;  // K
 var<storage> bias: array<f32>;   // V
 var<storage, read_write> dst: array<f32>;    // O
 var<storage, read_write> lse: array<f32>;    // log-sum-exp
-var<storage, read_write> scores: array<f32>; // reserved for score storage
 var<uniform> params: Params;
 var<workgroup> wg_dot: array<f32, 64>;
 
@@ -65,12 +64,6 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         wg_dot[tid] = q_val * src_b[k_base + tid];
         tree_reduce(tid);
         let score = wg_dot[0] * scale;
-
-        // Store score in LSE buffer (after LSE data region) for backward pass.
-        if tid == 0u {
-            let score_off = q_seq * num_heads * 2u;
-            lse[score_off + (pos * num_heads + head) * kv_seq + t] = score;
-        }
 
         // Online softmax update
         let new_max = max(max_score, score);

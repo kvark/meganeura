@@ -13,7 +13,6 @@ var<storage> src_b: array<f32>;  // K
 var<storage> bias: array<f32>;   // V
 var<storage, read_write> dst: array<f32>;
 var<storage, read_write> lse: array<f32>;  // log-sum-exp for backward
-var<storage, read_write> scores: array<f32>;  // reserved for score storage
 var<uniform> params: Params;
 // Shared memory for tiled score reduction: 8 scores × 64 partial sums
 var<workgroup> wg_scores: array<f32, 512>;
@@ -120,12 +119,6 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         for (var i = 0u; i < BKV; i++) {
             let score = wg_scores[i * 64u] * scale;
 
-            // Store score for backward pass
-            if tid == 0u {
-                let score_off = q_seq * num_heads * 2u;
-                lse[score_off + (pos * num_heads + head) * $SCORE_STRIDE + t + i] = score;
-            }
-
             let new_max = max(max_score, score);
             let correction = exp(max_score - new_max);
             let weight = exp(score - new_max);
@@ -142,11 +135,6 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         wg_dot[tid] = q_val * src_b[k_base + tid];
         tree_reduce(tid);
         let score = wg_dot[0] * scale;
-
-        if tid == 0u {
-            let score_off = q_seq * num_heads * 2u;
-            lse[score_off + (pos * num_heads + head) * $SCORE_STRIDE + t] = score;
-        }
 
         let new_max = max(max_score, score);
         let correction = exp(max_score - new_max);
