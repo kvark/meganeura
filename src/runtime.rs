@@ -46,20 +46,16 @@ impl std::fmt::Display for MemorySummary {
 /// Minimum workgroup count below which the cooperative-matrix (2×2-tile) path is
 /// skipped and the scalar tiled matmul is used instead.
 ///
-/// The 2×2-tile coop kernel launches ceil(m/32)×ceil(n/32) workgroups, each backed
-/// by a single wave64. For good occupancy a GPU with ~32 compute units needs ≈ 512
-/// concurrent wavefronts.  SmolVLA's chunk_size=50 never produces enough WGs even
-/// for its largest matmuls (e.g. m=50, n=2048 → 2×64=128 WGs), so the scalar path
-/// runs ≈50% faster for that workload.  Larger batch sizes or model widths that do
-/// exceed this threshold will automatically use the coop path.
+/// On discrete GPUs (NVIDIA, AMD dGPU), tensor core throughput is so much higher
+/// than scalar ALUs that the coop path wins even at moderate workgroup counts.
+/// A threshold of 8 allows coop for most practical matmul shapes while avoiding
+/// extremely small dispatches (e.g. 1×1 tile grids) where the overhead dominates.
 ///
-/// For dispatches with a large K (reduction dimension, K ≥ 1024), each coop workgroup
-/// does proportionally more arithmetic even when the tile count is low, so a lower
-/// threshold applies.  This primarily benefits backward-pass input-gradient matmuls like
-/// [50,720]×[2048,720]^T (k=2048) while leaving small-K dispatches (k=720) on the faster
-/// scalar path at low tile counts.
-const MIN_COOP_WORKGROUPS: u32 = 128;
-const MIN_COOP_WORKGROUPS_HIGH_K: u32 = 32; // used when K >= 1024
+/// On integrated GPUs with few CUs, the scalar path may still be faster at low
+/// workgroup counts due to limited parallelism, but the coop path self-selects
+/// out when the GPU doesn't advertise cooperative matrix support.
+const MIN_COOP_WORKGROUPS: u32 = 32;
+const MIN_COOP_WORKGROUPS_HIGH_K: u32 = 32;
 
 // ---- ShaderData structs matching codegen global variable names ----
 
