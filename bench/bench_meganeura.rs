@@ -120,71 +120,133 @@ fn main() {
         transposed.iter().map(|s| s.as_str()).collect();
 
     // --- Build sessions based on mode ---
-    let generate: Box<dyn Fn(&mut meganeura::Session, usize) -> (f64, Vec<u32>)>;
+    let mut generate: Box<dyn FnMut(&mut meganeura::Session, usize) -> (f64, Vec<u32>)>;
     let mut session: meganeura::Session;
 
     if use_kv_cache {
-        // KV-cache mode: single-token decode graph
-        eprintln!("building decode graph (KV-cache)...");
-        let mut g = Graph::new();
-        let (logits, _k_caches, _v_caches) = smollm2::build_decode_graph(&mut g, &config, seq_len);
-        g.set_outputs(vec![logits]);
+        // KV-cache mode: parallel prefill + single-token decode
+        let num_layers = config.num_hidden_layers;
+        let kv_dim = config.kv_dim();
 
-        eprintln!("compiling...");
-        session = build_inference_session(&g);
+        // Build prefill graph (full-sequence, outputs K/V per layer)
+        eprintln!("building prefill graph...");
+        let mut pg = Graph::new();
+        let (prefill_logits, k_outs, v_outs) =
+            smollm2::build_prefill_graph(&mut pg, &config, prompt_len);
+        let mut prefill_outputs = vec![prefill_logits];
+        prefill_outputs.extend_from_slice(&k_outs);
+        prefill_outputs.extend_from_slice(&v_outs);
+        pg.set_outputs(prefill_outputs);
+
+        eprintln!("compiling prefill...");
+        let mut prefill_session = build_inference_session(&pg);
         eprintln!(
-            "ready: {} buffers, {} dispatches",
+            "prefill: {} buffers, {} dispatches",
+            prefill_session.plan().buffers.len(),
+            prefill_session.plan().dispatches.len()
+        );
+
+        // Build decode graph (single-token with KV cache)
+        eprintln!("building decode graph...");
+        let mut dg = Graph::new();
+        let (decode_logits, _k_caches, _v_caches) =
+            smollm2::build_decode_graph(&mut dg, &config, seq_len);
+        dg.set_outputs(vec![decode_logits]);
+
+        eprintln!("compiling decode...");
+        session = build_inference_session(&dg);
+        eprintln!(
+            "decode: {} buffers, {} dispatches",
             session.plan().buffers.len(),
             session.plan().dispatches.len()
         );
 
+        // Load weights into both sessions
         eprintln!("loading weights...");
+        load_weights(&mut prefill_session, &model, &transposed_set);
         load_weights(&mut session, &model, &transposed_set);
         eprintln!("weights loaded.");
 
         let input_ids_clone = input_ids.clone();
-        generate = Box::new(move |session: &mut meganeura::Session, n_tokens: usize| {
-            let mut generated = input_ids_clone.clone();
+        generate = Box::new(
+            move |decode_session: &mut meganeura::Session, n_tokens: usize| {
+                let mut generated = input_ids_clone.clone();
 
-            // Reset KV caches to zero for each generation run
-            for (name, buf_ref) in session.plan().param_buffers.clone() {
-                if name.contains("kv_cache") {
-                    let size_bytes = session.plan().buffers[buf_ref.0 as usize];
-                    session.set_parameter(&name, &vec![0.0f32; size_bytes / 4]);
+                // Reset KV caches to zero
+                for (name, buf_ref) in decode_session.plan().param_buffers.clone() {
+                    if name.contains("kv_cache") {
+                        let size_bytes = decode_session.plan().buffers[buf_ref.0 as usize];
+                        decode_session.set_parameter(&name, &vec![0.0f32; size_bytes / 4]);
+                    }
                 }
-            }
 
-            let t0 = Instant::now();
+                let t0 = Instant::now();
 
-            // Prefill: run each prompt token through the decode graph
-            for pos in 0..prompt_len {
-                session.set_input_u32("token_ids", &[input_ids_clone[pos]]);
-                session.set_input_u32("kv_pos", &[pos as u32]);
-                session.step();
-                session.wait();
-            }
+                // Parallel prefill: process all prompt tokens at once
+                prefill_session.set_input_u32("token_ids", &input_ids_clone);
+                prefill_session.step();
+                prefill_session.wait();
 
-            // Decode: generate new tokens one at a time
-            for step in 0..n_tokens {
-                let cur_pos = prompt_len + step;
-                let prev_token = *generated.last().unwrap();
-                session.set_input_u32("token_ids", &[prev_token]);
-                session.set_input_u32("kv_pos", &[cur_pos as u32]);
-                session.step();
-                session.wait();
-
-                let logits_out = session.read_output(vocab);
-                let next = logits_out
+                // Read first token from prefill logits
+                let prefill_logits_data = {
+                    let mut buf = vec![0.0f32; prompt_len * vocab];
+                    prefill_session.read_output_by_index(0, &mut buf);
+                    buf
+                };
+                let last_pos_logits =
+                    &prefill_logits_data[(prompt_len - 1) * vocab..prompt_len * vocab];
+                let first_token = last_pos_logits
                     .iter()
                     .enumerate()
                     .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
                     .unwrap()
                     .0 as u32;
-                generated.push(next);
-            }
-            let elapsed = t0.elapsed().as_secs_f64();
-            (elapsed, generated)
-        });
+                generated.push(first_token);
+
+                // Copy K/V from prefill outputs into decode session's cache
+                for layer in 0..num_layers {
+                    let k_idx = 1 + layer; // output 0 = logits, 1..N = K, N+1..2N = V
+                    let v_idx = 1 + num_layers + layer;
+                    let kv_size = prompt_len * kv_dim;
+                    let mut k_data = vec![0.0f32; kv_size];
+                    let mut v_data = vec![0.0f32; kv_size];
+                    prefill_session.read_output_by_index(k_idx, &mut k_data);
+                    prefill_session.read_output_by_index(v_idx, &mut v_data);
+
+                    // Write into decode cache (padded to max_seq_len)
+                    let cache_k_name = format!("kv_cache.layer.{}.k", layer);
+                    let cache_v_name = format!("kv_cache.layer.{}.v", layer);
+                    let cache_size = seq_len * kv_dim;
+                    let mut k_cache = vec![0.0f32; cache_size];
+                    let mut v_cache = vec![0.0f32; cache_size];
+                    k_cache[..kv_size].copy_from_slice(&k_data);
+                    v_cache[..kv_size].copy_from_slice(&v_data);
+                    decode_session.set_parameter(&cache_k_name, &k_cache);
+                    decode_session.set_parameter(&cache_v_name, &v_cache);
+                }
+
+                // Decode: generate remaining tokens one at a time
+                for step in 1..n_tokens {
+                    let cur_pos = prompt_len + step;
+                    let prev_token = *generated.last().unwrap();
+                    decode_session.set_input_u32("token_ids", &[prev_token]);
+                    decode_session.set_input_u32("kv_pos", &[cur_pos as u32]);
+                    decode_session.step();
+                    decode_session.wait();
+
+                    let logits_out = decode_session.read_output(vocab);
+                    let next = logits_out
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                        .unwrap()
+                        .0 as u32;
+                    generated.push(next);
+                }
+                let elapsed = t0.elapsed().as_secs_f64();
+                (elapsed, generated)
+            },
+        );
     } else {
         // Full-sequence mode (original)
         eprintln!("building graph...");
