@@ -3,8 +3,11 @@
 // Eliminates the intermediate normalized tensor by computing
 // normalization on-the-fly during the matmul A-tile load phase.
 //
-// BM=64, BN=64, KTILE=16, TM=4, TN=4, workgroup [16,16,1]
+// BM=64, BN=64, KTILE=32, TM=4, TN=4, workgroup [16,16,1]
 // Dispatch: [ceil(N/64), ceil(M/64), 1]
+//
+// Shared memory uses padded strides (A: 33, B: 65) to eliminate bank
+// conflicts — same layout as matmul.wgsl.
 //
 // Inputs:
 //   matrix_a = X [M, K]           (raw, unnormalized)
@@ -27,8 +30,8 @@ var<storage> src_b: array<f32>;          // W_proj [K, N]
 var<storage> bias: array<f32>;           // W_norm [K]
 var<storage, read_write> dst: array<f32>;
 var<uniform> params: Params;
-var<workgroup> shared_a: array<f32, 1024>;
-var<workgroup> shared_b: array<f32, 1024>;
+var<workgroup> shared_a: array<f32, 2112>;  // 64 * 33 (padded stride)
+var<workgroup> shared_b: array<f32, 2080>;  // 32 * 65 (padded stride)
 var<workgroup> rsqrt_cache: array<f32, 64>;  // one per M-tile row
 
 @compute @workgroup_size(16, 16)
@@ -73,46 +76,46 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
 
         // Load A tile: apply RmsNorm on-the-fly
         // A_fused[i,j] = X[i,j] * rsqrt[i] * W_norm[j]
-        for (var e = 0u; e < 4u; e++) {
+        for (var e = 0u; e < 8u; e++) {
             let flat = tid + e * 256u;
-            let row_local = flat / 16u;
-            let col_local = flat % 16u;
+            let row_local = flat / 32u;
+            let col_local = flat % 32u;
             let a_row = tile_row + row_local;
             let a_col = t + col_local;
             if a_row < m && a_col < k {
                 let raw = src_a[a_row * k + a_col];
                 let norm = raw * rsqrt_cache[row_local] * bias[a_col];
-                shared_a[row_local * 16u + col_local] = norm;
+                shared_a[row_local * 33u + col_local] = norm;
             } else {
-                shared_a[row_local * 16u + col_local] = 0.0;
+                shared_a[row_local * 33u + col_local] = 0.0;
             }
         }
 
         // Load B tile (standard, no transformation)
-        for (var e = 0u; e < 4u; e++) {
+        for (var e = 0u; e < 8u; e++) {
             let flat = tid + e * 256u;
             let row_local = flat / 64u;
             let col_local = flat % 64u;
             let b_row = t + row_local;
             let b_col = tile_col + col_local;
             if b_row < k && b_col < n {
-                shared_b[row_local * 64u + col_local] = src_b[b_row * n + b_col];
+                shared_b[row_local * 65u + col_local] = src_b[b_row * n + b_col];
             } else {
-                shared_b[row_local * 64u + col_local] = 0.0;
+                shared_b[row_local * 65u + col_local] = 0.0;
             }
         }
 
         workgroupBarrier();
 
-        for (var kk = 0u; kk < 16u; kk++) {
-            let a0 = shared_a[(ty * 4u + 0u) * 16u + kk];
-            let a1 = shared_a[(ty * 4u + 1u) * 16u + kk];
-            let a2 = shared_a[(ty * 4u + 2u) * 16u + kk];
-            let a3 = shared_a[(ty * 4u + 3u) * 16u + kk];
-            let b0 = shared_b[kk * 64u + tx * 4u + 0u];
-            let b1 = shared_b[kk * 64u + tx * 4u + 1u];
-            let b2 = shared_b[kk * 64u + tx * 4u + 2u];
-            let b3 = shared_b[kk * 64u + tx * 4u + 3u];
+        for (var kk = 0u; kk < 32u; kk++) {
+            let a0 = shared_a[(ty * 4u + 0u) * 33u + kk];
+            let a1 = shared_a[(ty * 4u + 1u) * 33u + kk];
+            let a2 = shared_a[(ty * 4u + 2u) * 33u + kk];
+            let a3 = shared_a[(ty * 4u + 3u) * 33u + kk];
+            let b0 = shared_b[kk * 65u + tx * 4u + 0u];
+            let b1 = shared_b[kk * 65u + tx * 4u + 1u];
+            let b2 = shared_b[kk * 65u + tx * 4u + 2u];
+            let b3 = shared_b[kk * 65u + tx * 4u + 3u];
             s0_0 += a0 * b0; s0_1 += a0 * b1; s0_2 += a0 * b2; s0_3 += a0 * b3;
             s1_0 += a1 * b0; s1_1 += a1 * b1; s1_2 += a1 * b2; s1_3 += a1 * b3;
             s2_0 += a2 * b0; s2_1 += a2 * b1; s2_2 += a2 * b2; s2_3 += a2 * b3;
@@ -120,7 +123,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         }
 
         workgroupBarrier();
-        t += 16u;
+        t += 32u;
     }
 
     // Store

@@ -1110,9 +1110,12 @@ impl Session {
                         let kw = dispatch.params[6];
                         (in_ch, in_h * in_w, out_ch * kh * kw, dispatch.params[0])
                     }
-                    // Coop AT/BT disabled for now.
-                    // TODO: safe to enable for f32 path (no f16 precision loss).
-                    ShaderGroup::MatMulAT | ShaderGroup::MatMulBT => continue,
+                    ShaderGroup::MatMulAT | ShaderGroup::MatMulBT => (
+                        dispatch.params[0],
+                        dispatch.params[1],
+                        dispatch.params[2],
+                        1u32,
+                    ),
                     _ => continue,
                 };
                 let coop_wgs = m.div_ceil(output_tile) * n.div_ceil(output_tile) * batch;

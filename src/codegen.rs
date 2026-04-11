@@ -277,27 +277,30 @@ const MATMUL_B_BT: &str = "b_col * params.k + b_row"; // B^T[k,n] = B[n*K+k]
 /// For row-major A[M,K]: K is the fast dimension → col = flat%16 (fast)
 /// For transposed A[K,M]: M is the fast dimension → row = flat%64 (fast)
 /// For row-major B[K,N]: N is the fast dimension → col = flat%64 (fast)
-/// For transposed B[N,K]: K is the fast dimension → row = flat%16 (fast)
-const A_ROW_FWD: &str = "flat / 16u"; // M varies slowly (good for [M,K])
-const A_COL_FWD: &str = "flat % 16u"; // K varies fast (coalesced in [M,K])
+/// Large-tile (64×64) load mappings — BM=64, BN=64, KTILE=32
+/// A tile: [64, 32] = 2048 elements, 8 per thread
+/// B tile: [32, 64] = 2048 elements, 8 per thread
+/// For transposed B[N,K]: K is the fast dimension → row = flat%32 (fast)
+const A_ROW_FWD: &str = "flat / 32u"; // M varies slowly (good for [M,K])
+const A_COL_FWD: &str = "flat % 32u"; // K varies fast (coalesced in [M,K])
 const A_ROW_AT: &str = "flat % 64u"; // M varies fast (coalesced in [K,M])
 const A_COL_AT: &str = "flat / 64u"; // K varies slowly
 const B_ROW_FWD: &str = "flat / 64u"; // K varies slowly (good for [K,N])
 const B_COL_FWD: &str = "flat % 64u"; // N varies fast (coalesced in [K,N])
-const B_ROW_BT: &str = "flat % 16u"; // K varies fast (coalesced in [N,K])
-const B_COL_BT: &str = "flat / 16u"; // N varies slowly
+const B_ROW_BT: &str = "flat % 32u"; // K varies fast (coalesced in [N,K])
+const B_COL_BT: &str = "flat / 32u"; // N varies slowly
 
-// Small-tile (32×32) load mappings — BM=32, BN=32, KTILE=16
-// A tile: [32, 16] = 512 elements, 2 per thread
-// B tile: [16, 32] = 512 elements, 2 per thread
-const A_ROW_FWD_S: &str = "flat / 16u"; // same as large (M slow, K fast)
-const A_COL_FWD_S: &str = "flat % 16u";
-const A_ROW_AT_S: &str = "flat % 32u"; // M fast (32 not 64)
+// Small-tile (32×32) load mappings — BM=32, BN=32, KTILE=32
+// A tile: [32, 32] = 1024 elements, 4 per thread
+// B tile: [32, 32] = 1024 elements, 4 per thread
+const A_ROW_FWD_S: &str = "flat / 32u"; // M slow, K fast
+const A_COL_FWD_S: &str = "flat % 32u";
+const A_ROW_AT_S: &str = "flat % 32u"; // M fast (coalesced for [K,M])
 const A_COL_AT_S: &str = "flat / 32u";
-const B_ROW_FWD_S: &str = "flat / 32u"; // K slow (32 not 64)
-const B_COL_FWD_S: &str = "flat % 32u"; // N fast (32 not 64)
-const B_ROW_BT_S: &str = "flat % 16u"; // same as large
-const B_COL_BT_S: &str = "flat / 16u";
+const B_ROW_FWD_S: &str = "flat / 32u"; // K slow
+const B_COL_FWD_S: &str = "flat % 32u"; // N fast
+const B_ROW_BT_S: &str = "flat % 32u"; // K fast (coalesced for [N,K])
+const B_COL_BT_S: &str = "flat / 32u";
 
 fn matmul_vars(
     a_idx: &str,
