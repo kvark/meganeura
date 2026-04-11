@@ -241,7 +241,6 @@ struct AttentionData {
     bias: blade_graphics::BufferPiece, // v, named "bias" to match binding
     dst: blade_graphics::BufferPiece,
     lse: blade_graphics::BufferPiece, // log-sum-exp for backward pass
-    scores: blade_graphics::BufferPiece,
     params: MatMulParams,
 }
 
@@ -254,7 +253,6 @@ struct SlidingWindowAttentionData {
     bias: blade_graphics::BufferPiece,
     dst: blade_graphics::BufferPiece,
     lse: blade_graphics::BufferPiece,
-    scores: blade_graphics::BufferPiece,
     params: SlidingWindowAttentionParams,
 }
 
@@ -510,7 +508,6 @@ struct MultiHeadAttnData {
     bias: blade_graphics::BufferPiece,
     dst: blade_graphics::BufferPiece,
     lse: blade_graphics::BufferPiece,
-    scores: blade_graphics::BufferPiece,
     params: MatMulParams,
 }
 
@@ -536,7 +533,6 @@ struct MultiHeadAttnGradData {
     bias: blade_graphics::BufferPiece,
     lse: blade_graphics::BufferPiece,
     fwd_dst: blade_graphics::BufferPiece,
-    scores: blade_graphics::BufferPiece,
     dst: blade_graphics::BufferPiece,
     params: AttentionGradParams,
 }
@@ -2009,7 +2005,6 @@ impl Session {
             | ShaderEntry::FullAttention
             | ShaderEntry::CrossAttention => {
                 let lse_buf = dispatch.extra_outputs[0];
-                let score_buf = dispatch.extra_outputs[1];
                 pc.bind(
                     0,
                     &AttentionData {
@@ -2018,7 +2013,6 @@ impl Session {
                         bias: buf(dispatch.input_buffers[2]),
                         dst: buf(dispatch.output_buffer),
                         lse: buf(lse_buf),
-                        scores: buf(score_buf),
                         params: MatMulParams {
                             m: dispatch.params[0],
                             n: dispatch.params[1],
@@ -2037,7 +2031,6 @@ impl Session {
                         bias: buf(dispatch.input_buffers[2]),
                         dst: buf(dispatch.output_buffer),
                         lse: buf(dispatch.extra_outputs[0]),
-                        scores: buf(dispatch.extra_outputs[1]),
                         params: SlidingWindowAttentionParams {
                             seq: dispatch.params[0],
                             num_heads: dispatch.params[1],
@@ -2092,7 +2085,6 @@ impl Session {
                         bias: buf(dispatch.input_buffers[2]),
                         dst: buf(dispatch.output_buffer),
                         lse: buf(dispatch.extra_outputs[0]),
-                        scores: buf(dispatch.extra_outputs[1]),
                         params: MatMulParams {
                             m: dispatch.params[0],
                             n: dispatch.params[1],
@@ -2114,7 +2106,6 @@ impl Session {
                         bias: buf(dispatch.input_buffers[3]),
                         lse: buf(dispatch.input_buffers[4]),
                         fwd_dst: buf(dispatch.input_buffers[5]),
-                        scores: buf(dispatch.input_buffers[6]),
                         dst: buf(dispatch.output_buffer),
                         params: AttentionGradParams {
                             q_seq: dispatch.params[0],
