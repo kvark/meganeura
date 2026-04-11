@@ -112,11 +112,15 @@ fn main() {
     let mut runs: usize = 5;
     let mut force = false;
     let mut profile = false;
+    let mut chunk_override: Option<usize> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--warmup" => warmup = args.next().expect("--warmup value").parse().unwrap(),
             "--runs" => runs = args.next().expect("--runs value").parse().unwrap(),
+            "--chunk-size" => {
+                chunk_override = Some(args.next().expect("--chunk-size value").parse().unwrap())
+            }
             "--force" => force = true,
             "--profile" => profile = true,
             _ => {
@@ -129,8 +133,11 @@ fn main() {
     eprintln!("checking preconditions...");
     check_bench_preconditions(!force);
 
-    let config = SmolVLAConfig::smolvla_base();
-    let action_seq_len = config.chunk_size; // 50
+    let mut config = SmolVLAConfig::smolvla_base();
+    if let Some(cs) = chunk_override {
+        config.chunk_size = cs;
+    }
+    let action_seq_len = config.chunk_size;
     let vlm_seq_len = 16;
 
     eprintln!("SmolVLA action expert training benchmark (random weights)");
