@@ -222,6 +222,7 @@ pub enum ShaderGroup {
     RoPE,
     RoPEGrad,
     CausalAttention,
+    CausalAttentionRoPE,
     SlidingWindowAttention,
     LayerNorm,
     FullAttention,
@@ -293,6 +294,7 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::RoPE => parse_wgsl(include_str!("shaders/rope.wgsl")),
         ShaderGroup::RoPEGrad => parse_wgsl(include_str!("shaders/rope_grad.wgsl")),
         ShaderGroup::CausalAttention => gen_causal_attention(),
+        ShaderGroup::CausalAttentionRoPE => gen_causal_attention(), // TODO: generate RoPE-fused shader
         ShaderGroup::SlidingWindowAttention => gen_sliding_window_attention(),
         ShaderGroup::LayerNorm => parse_wgsl(include_str!("shaders/layer_norm.wgsl")),
         ShaderGroup::FullAttention => gen_full_attention(),
@@ -1435,6 +1437,7 @@ mod tests {
                 ShaderEntry::RmsNorm => vec!["src", "bias", "dst", "params"],
                 ShaderEntry::Embedding => vec!["indices", "src", "dst", "params"],
                 ShaderEntry::CausalAttention
+                | ShaderEntry::CausalAttentionRoPE
                 | ShaderEntry::FullAttention
                 | ShaderEntry::CrossAttention => {
                     vec!["src_a", "src_b", "bias", "dst", "lse", "params"]
@@ -1534,6 +1537,7 @@ mod tests {
             ShaderEntry::RoPE,
             ShaderEntry::RoPEGrad,
             ShaderEntry::CausalAttention,
+            ShaderEntry::CausalAttentionRoPE,
             ShaderEntry::SlidingWindowAttention,
             ShaderEntry::Gelu,
             ShaderEntry::Tanh,

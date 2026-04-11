@@ -401,7 +401,7 @@ fn node_to_egglog_expr(node: &Node) -> String {
         Op::Embedding => format!("(Embedding n{} n{})", i[0], i[1]),
         Op::RoPE { .. } => format!("(RoPE n{})", i[0]),
         Op::RoPEGrad { .. } => format!("(RoPEGrad n{})", i[0]),
-        Op::CausalAttention { .. } => {
+        Op::CausalAttention { .. } | Op::CausalAttentionRoPE { .. } => {
             format!("(CausalAttention n{} n{} n{})", i[0], i[1], i[2])
         }
         Op::SlidingWindowAttention { .. } => {
@@ -515,7 +515,7 @@ fn rebuild_graph_from_extractions(
         // Needs a 2-phase approach: precompute rsqrt in a separate dispatch,
         // then fuse the normalized staging into the coop matmul.
         // apply_rms_norm_matmul_fusions(&mut graph, &mut fusions);
-        // apply_rms_norm_matmul_fusions(&mut graph, &mut fusions);
+        // apply_rope_attention_fusions(&mut graph, &mut fusions);
         if fusions.len() == n {
             break;
         }
@@ -812,6 +812,81 @@ fn apply_rms_norm_matmul_fusions(graph: &mut Graph, fusions: &mut Vec<(String, u
         graph.nodes_mut()[norm_id as usize].op = Op::Nop;
 
         fusions.push(("RmsNorm+MatMul→FusedRmsNormMatMul".to_string(), id as u32));
+    }
+}
+
+/// Fuse CausalAttention(RoPE(Q), RoPE(K), V) → CausalAttentionRoPE(Q, K, V)
+///
+/// When both Q and K inputs to CausalAttention are single-use RoPE nodes
+/// with the same theta, replace with CausalAttentionRoPE which applies
+/// RoPE inside the attention kernel's dot product. Eliminates 2 dispatches
+/// + 1 barrier group per attention layer.
+#[allow(dead_code)]
+fn apply_rope_attention_fusions(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
+    let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
+    for &id in &node_ids {
+        let node = &graph.nodes()[id];
+        let (num_heads, num_kv_heads, head_dim) = match node.op {
+            Op::CausalAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            } => (num_heads, num_kv_heads, head_dim),
+            _ => continue,
+        };
+
+        let q_id = node.inputs[0];
+        let k_id = node.inputs[1];
+        let v_id = node.inputs[2];
+
+        // Both Q and K must be RoPE nodes
+        let q_node = graph.node(q_id);
+        let k_node = graph.node(k_id);
+        let (q_theta, q_raw) = match q_node.op {
+            Op::RoPE { theta, .. } => (theta, q_node.inputs[0]),
+            _ => continue,
+        };
+        let (k_theta, k_raw) = match k_node.op {
+            Op::RoPE { theta, .. } => (theta, k_node.inputs[0]),
+            _ => continue,
+        };
+
+        // Same theta
+        if q_theta != k_theta {
+            continue;
+        }
+
+        // Both RoPE nodes must be single-use (only feeding this attention)
+        let q_uses = graph
+            .nodes()
+            .iter()
+            .filter(|n| n.inputs.contains(&q_id) && !matches!(n.op, Op::Nop))
+            .count();
+        let k_uses = graph
+            .nodes()
+            .iter()
+            .filter(|n| n.inputs.contains(&k_id) && !matches!(n.op, Op::Nop))
+            .count();
+        if q_uses != 1 || k_uses != 1 {
+            continue;
+        }
+
+        // Replace CausalAttention with CausalAttentionRoPE using un-rotated Q, K
+        graph.nodes_mut()[id].op = Op::CausalAttentionRoPE {
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            rope_theta: q_theta,
+        };
+        graph.nodes_mut()[id].inputs = vec![q_raw, k_raw, v_id];
+        // Mark old RoPE nodes as Nop
+        graph.nodes_mut()[q_id as usize].op = Op::Nop;
+        graph.nodes_mut()[k_id as usize].op = Op::Nop;
+
+        fusions.push((
+            "CausalAttn(RoPE,RoPE)→CausalAttnRoPE".to_string(),
+            id as u32,
+        ));
     }
 }
 

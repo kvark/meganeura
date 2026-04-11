@@ -39,6 +39,7 @@ pub enum ShaderEntry {
     RoPE,
     RoPEGrad,
     CausalAttention,
+    CausalAttentionRoPE,
     SlidingWindowAttention,
     Gelu,
     LayerNorm,
@@ -117,6 +118,7 @@ impl ShaderEntry {
             ShaderEntry::RoPE => ShaderGroup::RoPE,
             ShaderEntry::RoPEGrad => ShaderGroup::RoPEGrad,
             ShaderEntry::CausalAttention => ShaderGroup::CausalAttention,
+            ShaderEntry::CausalAttentionRoPE => ShaderGroup::CausalAttentionRoPE,
             ShaderEntry::SlidingWindowAttention => ShaderGroup::SlidingWindowAttention,
             ShaderEntry::Gelu => ShaderGroup::Unary,
             ShaderEntry::LayerNorm => ShaderGroup::LayerNorm,
@@ -194,6 +196,7 @@ impl ShaderEntry {
             ShaderEntry::RoPE => "main",
             ShaderEntry::RoPEGrad => "main",
             ShaderEntry::CausalAttention => "main",
+            ShaderEntry::CausalAttentionRoPE => "main",
             ShaderEntry::SlidingWindowAttention => "main",
             ShaderEntry::Gelu => "gelu",
             ShaderEntry::LayerNorm => "main",
@@ -547,6 +550,7 @@ impl<'a> Compiler<'a> {
                 }
                 Op::MultiHeadAttn { num_heads, .. }
                 | Op::CausalAttention { num_heads, .. }
+                | Op::CausalAttentionRoPE { num_heads, .. }
                 | Op::SlidingWindowAttention { num_heads, .. }
                 | Op::FullAttention { num_heads, .. }
                 | Op::CrossAttention { num_heads, .. } => {
@@ -1140,6 +1144,31 @@ impl<'a> Compiler<'a> {
                     input_buffers: vec![q, k, v],
                     output_buffer: out_buf,
                     extra_outputs: vec![lse_buf],
+                    params: vec![seq, num_heads, num_kv_heads, head_dim],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
+            Op::CausalAttentionRoPE {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                rope_theta: _,
+            } => {
+                let q = self.get_buffer(node.inputs[0]);
+                let k = self.get_buffer(node.inputs[1]);
+                let v = self.get_buffer(node.inputs[2]);
+                let seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
+                let lse_buf = self.find_lse_buffer(node.id);
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::CausalAttentionRoPE,
+                    workgroups: [seq.div_ceil(1), num_heads, 1],
+                    input_buffers: vec![q, k, v],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![lse_buf],
+                    // TODO: pass rope_theta via params when the RoPE-fused shader is implemented
                     params: vec![seq, num_heads, num_kv_heads, head_dim],
                     use_coop: false,
                     use_small_tiles: false,
@@ -1762,7 +1791,9 @@ impl<'a> Compiler<'a> {
                 let fwd_op = &self.graph.node(fwd_node).op;
                 let is_causal = matches!(
                     fwd_op,
-                    Op::CausalAttention { .. } | Op::SlidingWindowAttention { .. }
+                    Op::CausalAttention { .. }
+                        | Op::CausalAttentionRoPE { .. }
+                        | Op::SlidingWindowAttention { .. }
                 );
                 let kv_seq = if is_causal {
                     0
@@ -1809,7 +1840,9 @@ impl<'a> Compiler<'a> {
                 let fwd_op = &self.graph.node(fwd_node).op;
                 let is_causal = matches!(
                     fwd_op,
-                    Op::CausalAttention { .. } | Op::SlidingWindowAttention { .. }
+                    Op::CausalAttention { .. }
+                        | Op::CausalAttentionRoPE { .. }
+                        | Op::SlidingWindowAttention { .. }
                 );
                 let kv_seq = if is_causal {
                     0
@@ -1857,7 +1890,9 @@ impl<'a> Compiler<'a> {
                 let fwd_op = &self.graph.node(fwd_node).op;
                 let is_causal = matches!(
                     fwd_op,
-                    Op::CausalAttention { .. } | Op::SlidingWindowAttention { .. }
+                    Op::CausalAttention { .. }
+                        | Op::CausalAttentionRoPE { .. }
+                        | Op::SlidingWindowAttention { .. }
                 );
                 let kv_seq = if is_causal {
                     0

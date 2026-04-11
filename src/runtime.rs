@@ -771,6 +771,7 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::Embedding => EmbeddingData::layout(),
         ShaderEntry::RoPE | ShaderEntry::RoPEGrad => RoPEData::layout(),
         ShaderEntry::CausalAttention => AttentionData::layout(),
+        ShaderEntry::CausalAttentionRoPE => AttentionData::layout(),
         ShaderEntry::SlidingWindowAttention => SlidingWindowAttentionData::layout(),
         ShaderEntry::Gelu => UnaryData::layout(),
         ShaderEntry::LayerNorm => LayerNormData::layout(),
@@ -1986,6 +1987,7 @@ impl Session {
                 );
             }
             ShaderEntry::CausalAttention
+            | ShaderEntry::CausalAttentionRoPE
             | ShaderEntry::FullAttention
             | ShaderEntry::CrossAttention => {
                 let lse_buf = dispatch.extra_outputs[0];
