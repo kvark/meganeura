@@ -850,22 +850,30 @@ enum MatMulCoopVariant {
 ///     for d: out[d] = out[d] * correction + exp(score - new_max) * V[t,d]
 ///     max_score = new_max
 ///   for d: dst[d] = out[d] / sum_exp
+/// Default attention template vars for no-RoPE variants.
+const ATTN_NO_ROPE: &[(&str, &str)] = &[
+    ("$ROPE_DECL", ""),
+    ("$ROPE_Q_APPLY", ""),
+    ("$Q_VAL_EXPR", "q_raw"),
+    ("$K_VAL_EXPR", "src_b[k_base + tid]"),
+    ("$K_VAL_TAIL_EXPR", "src_b[k_base + tid]"),
+];
+
 fn gen_causal_attention() -> ShaderModule {
     let src = include_str!("shaders/attention.wgsl");
-    let src = preprocess(
-        src,
-        &[
-            (
-                "$PARAM_FIELDS",
-                "seq: u32, num_heads: u32, num_kv_heads: u32, head_dim: u32,",
-            ),
-            (
-                "$PARSE_PARAMS",
-                "let q_seq = params.seq;\n    let num_heads = params.num_heads;\n    let num_kv_heads = params.num_kv_heads;\n    let head_dim = params.head_dim;\n    let kv_len = pos + 1u;",
-            ),
-            ("$KV_START", "0u"),
-        ],
-    );
+    let mut vars = vec![
+        (
+            "$PARAM_FIELDS",
+            "seq: u32, num_heads: u32, num_kv_heads: u32, head_dim: u32,",
+        ),
+        (
+            "$PARSE_PARAMS",
+            "let q_seq = params.seq;\n    let num_heads = params.num_heads;\n    let num_kv_heads = params.num_kv_heads;\n    let head_dim = params.head_dim;\n    let kv_len = pos + 1u;",
+        ),
+        ("$KV_START", "0u"),
+    ];
+    vars.extend_from_slice(ATTN_NO_ROPE);
+    let src = preprocess(src, &vars);
     parse_wgsl(&src)
 }
 
@@ -909,44 +917,37 @@ fn gen_sliding_window_attention() -> ShaderModule {
 
 fn gen_full_attention() -> ShaderModule {
     let src = include_str!("shaders/attention.wgsl");
-    let src = preprocess(
-        src,
-        &[
-            (
-                "$PARAM_FIELDS",
-                "seq: u32, num_heads: u32, num_kv_heads: u32, head_dim: u32,",
-            ),
-            (
-                "$PARSE_PARAMS",
-                "let q_seq = params.seq;\n    let num_heads = params.num_heads;\n    let num_kv_heads = params.num_kv_heads;\n    let head_dim = params.head_dim;\n    let kv_len = q_seq;",
-            ),
-            ("$KV_START", "0u"),
-        ],
-    );
+    let mut vars = vec![
+        (
+            "$PARAM_FIELDS",
+            "seq: u32, num_heads: u32, num_kv_heads: u32, head_dim: u32,",
+        ),
+        (
+            "$PARSE_PARAMS",
+            "let q_seq = params.seq;\n    let num_heads = params.num_heads;\n    let num_kv_heads = params.num_kv_heads;\n    let head_dim = params.head_dim;\n    let kv_len = q_seq;",
+        ),
+        ("$KV_START", "0u"),
+    ];
+    vars.extend_from_slice(ATTN_NO_ROPE);
+    let src = preprocess(src, &vars);
     parse_wgsl(&src)
 }
 
-// ---------------------------------------------------------------------------
-// cross_attention.wgsl: cross-attention where q and k/v have different seq lengths
-// params: q_seq, kv_seq, (num_heads<<16)|num_kv_heads, head_dim
-// ---------------------------------------------------------------------------
-
 fn gen_cross_attention() -> ShaderModule {
     let src = include_str!("shaders/attention.wgsl");
-    let src = preprocess(
-        src,
-        &[
-            (
-                "$PARAM_FIELDS",
-                "q_seq: u32, kv_seq: u32, packed_heads: u32, head_dim: u32,",
-            ),
-            (
-                "$PARSE_PARAMS",
-                "let q_seq = params.q_seq;\n    let num_heads = params.packed_heads >> 16u;\n    let num_kv_heads = params.packed_heads & 0xFFFFu;\n    let head_dim = params.head_dim;\n    let kv_len = params.kv_seq;",
-            ),
-            ("$KV_START", "0u"),
-        ],
-    );
+    let mut vars = vec![
+        (
+            "$PARAM_FIELDS",
+            "q_seq: u32, kv_seq: u32, packed_heads: u32, head_dim: u32,",
+        ),
+        (
+            "$PARSE_PARAMS",
+            "let q_seq = params.q_seq;\n    let num_heads = params.packed_heads >> 16u;\n    let num_kv_heads = params.packed_heads & 0xFFFFu;\n    let head_dim = params.head_dim;\n    let kv_len = params.kv_seq;",
+        ),
+        ("$KV_START", "0u"),
+    ];
+    vars.extend_from_slice(ATTN_NO_ROPE);
+    let src = preprocess(src, &vars);
     parse_wgsl(&src)
 }
 

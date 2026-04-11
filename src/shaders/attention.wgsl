@@ -16,6 +16,7 @@ var<storage, read_write> lse: array<f32>;  // log-sum-exp for backward
 var<uniform> params: Params;
 // Shared memory for tiled score reduction: 8 scores × 64 partial sums
 var<workgroup> wg_scores: array<f32, 512>;
+$ROPE_DECL
 
 const BKV: u32 = 8u;
 
@@ -96,7 +97,9 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let kv_dim = num_kv_heads * head_dim;
     let scale = inverseSqrt(f32(head_dim));
     let q_base = pos * (num_heads * head_dim) + head * head_dim;
-    let q_val = src_a[q_base + tid];
+    let q_raw = src_a[q_base + tid];
+    $ROPE_Q_APPLY
+    let q_val = $Q_VAL_EXPR;
 
     var my_out = 0.0;
     var max_score = -1e30;
@@ -110,7 +113,8 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         // Compute BKV partial dot products simultaneously
         for (var i = 0u; i < BKV; i++) {
             let k_base = (t + i) * kv_dim + kv_head_off;
-            wg_scores[i * 64u + tid] = q_val * src_b[k_base + tid];
+            let k_val = $K_VAL_EXPR;
+            wg_scores[i * 64u + tid] = q_val * k_val;
         }
         tree_reduce_8(tid);
         // wg_scores[i * 64] now holds score[i] (before scaling)
@@ -132,7 +136,8 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     // --- Tail: process remaining KV positions one at a time ---
     for (; t < kv_len; t++) {
         let k_base = t * kv_dim + kv_head_off;
-        wg_dot[tid] = q_val * src_b[k_base + tid];
+        let k_val_tail = $K_VAL_TAIL_EXPR;
+        wg_dot[tid] = q_val * k_val_tail;
         tree_reduce(tid);
         let score = wg_dot[0] * scale;
 
