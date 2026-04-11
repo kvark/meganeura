@@ -2069,7 +2069,7 @@ mod tests {
         let plan = compile(&g);
         assert_eq!(plan.input_buffers.len(), 1);
         assert_eq!(plan.param_buffers.len(), 1);
-        assert_eq!(plan.dispatches.len(), 2); // matmul + relu
+        assert_eq!(plan.dispatches.len(), 1); // matmul with fused relu epilogue
     }
 
     #[test]
@@ -2083,10 +2083,10 @@ mod tests {
 
         let optimized = crate::optimize::optimize(&g);
         let plan = compile(&optimized);
-        // MatMul + Relu are now separate dispatches (no fusion with cooperative matrix)
-        assert_eq!(plan.dispatches.len(), 2);
+        // MatMul with Relu fused into epilogue (epilogue fusion pass)
+        assert_eq!(plan.dispatches.len(), 1);
         assert_eq!(plan.dispatches[0].shader, ShaderEntry::MatMul);
-        assert_eq!(plan.dispatches[1].shader, ShaderEntry::Relu);
+        assert_eq!(plan.dispatches[0].epilogue, vec![EpilogueOp::Relu]);
     }
 
     #[test]

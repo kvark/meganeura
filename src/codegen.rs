@@ -66,6 +66,7 @@ pub fn epilogue_to_wgsl(epilogue: &[crate::compile::EpilogueOp]) -> (String, Str
     let mut declared = std::collections::HashSet::new();
 
     for op in epilogue {
+        #[allow(clippy::pattern_type_mismatch)]
         match op {
             EpilogueOp::Add(buf_idx) => {
                 let name = format!("epi_buf_{}", buf_idx);
