@@ -688,6 +688,7 @@ fn gen_causal_attention() -> ShaderModule {
                 "$PARSE_PARAMS",
                 "let q_seq = params.seq;\n    let num_heads = params.num_heads;\n    let num_kv_heads = params.num_kv_heads;\n    let head_dim = params.head_dim;\n    let kv_len = pos + 1u;",
             ),
+            ("$KV_START", "0u"),
             ("$SCORE_STRIDE", "q_seq"),
         ],
     );
@@ -746,6 +747,7 @@ fn gen_full_attention() -> ShaderModule {
                 "$PARSE_PARAMS",
                 "let q_seq = params.seq;\n    let num_heads = params.num_heads;\n    let num_kv_heads = params.num_kv_heads;\n    let head_dim = params.head_dim;\n    let kv_len = q_seq;",
             ),
+            ("$KV_START", "0u"),
             ("$SCORE_STRIDE", "q_seq"),
         ],
     );
@@ -770,6 +772,7 @@ fn gen_cross_attention() -> ShaderModule {
                 "$PARSE_PARAMS",
                 "let q_seq = params.q_seq;\n    let num_heads = params.packed_heads >> 16u;\n    let num_kv_heads = params.packed_heads & 0xFFFFu;\n    let head_dim = params.head_dim;\n    let kv_len = params.kv_seq;",
             ),
+            ("$KV_START", "0u"),
             ("$SCORE_STRIDE", "kv_len"),
         ],
     );

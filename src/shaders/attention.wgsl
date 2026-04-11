@@ -1,5 +1,8 @@
-// Parallel attention: online softmax single-pass with GQA
+// Tiled attention: online softmax with KV-tiling and GQA
+// BKV=8 KV positions per tile, reducing workgroup barriers by 8x.
 // Variants: causal (kv_len=pos+1), full (kv_len=q_seq), cross (kv_len=kv_seq)
+//
+// Dispatch: [q_seq, num_heads, 1], WG=64 (one thread per head_dim element)
 
 struct Params {
     $PARAM_FIELDS
@@ -12,6 +15,55 @@ var<storage, read_write> dst: array<f32>;
 var<storage, read_write> lse: array<f32>;  // log-sum-exp for backward
 var<storage, read_write> scores: array<f32>;  // reserved for score storage
 var<uniform> params: Params;
+// Shared memory for tiled score reduction: 8 scores × 64 partial sums
+var<workgroup> wg_scores: array<f32, 512>;
+
+const BKV: u32 = 8u;
+
+fn tree_reduce_8(tid: u32) {
+    // Reduce 8 independent dot products simultaneously.
+    // wg_scores layout: [8][64] — each row is a partial dot product.
+    workgroupBarrier();
+    if tid < 32u {
+        for (var i = 0u; i < BKV; i++) {
+            wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 32u];
+        }
+    }
+    workgroupBarrier();
+    if tid < 16u {
+        for (var i = 0u; i < BKV; i++) {
+            wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 16u];
+        }
+    }
+    workgroupBarrier();
+    if tid < 8u {
+        for (var i = 0u; i < BKV; i++) {
+            wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 8u];
+        }
+    }
+    workgroupBarrier();
+    if tid < 4u {
+        for (var i = 0u; i < BKV; i++) {
+            wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 4u];
+        }
+    }
+    workgroupBarrier();
+    if tid < 2u {
+        for (var i = 0u; i < BKV; i++) {
+            wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 2u];
+        }
+    }
+    workgroupBarrier();
+    if tid < 1u {
+        for (var i = 0u; i < BKV; i++) {
+            wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 1u];
+        }
+    }
+    workgroupBarrier();
+}
+
+// Single-score tree reduce for tail elements (when remaining < BKV).
+// Reuses slot 0 of wg_scores.
 var<workgroup> wg_dot: array<f32, 64>;
 
 fn tree_reduce(tid: u32) {
@@ -42,6 +94,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
 
     let kv_head = head / (num_heads / num_kv_heads);
     let kv_head_off = kv_head * head_dim;
+    let kv_dim = num_kv_heads * head_dim;
     let scale = inverseSqrt(f32(head_dim));
     let q_base = pos * (num_heads * head_dim) + head * head_dim;
     let q_val = src_a[q_base + tid];
@@ -50,24 +103,51 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     var max_score = -1e30;
     var sum_exp = 0.0;
 
-    for (var t = 0u; t < kv_len; t++) {
-        let k_base = t * (num_kv_heads * head_dim) + kv_head_off;
+    // --- Tiled KV loop: process BKV positions per reduction ---
+    let kv_start = $KV_START;
+    var t = kv_start;
+    let tile_end = kv_start + ((kv_len - kv_start) / BKV) * BKV;
+    for (; t < tile_end; t += BKV) {
+        // Compute BKV partial dot products simultaneously
+        for (var i = 0u; i < BKV; i++) {
+            let k_base = (t + i) * kv_dim + kv_head_off;
+            wg_scores[i * 64u + tid] = q_val * src_b[k_base + tid];
+        }
+        tree_reduce_8(tid);
+        // wg_scores[i * 64] now holds score[i] (before scaling)
 
-        // Parallel dot product Q·K with tree reduction
-        // Uses tree_reduce function (same as backward shaders) to ensure
-        // bit-exact score recomputation in the backward pass.
+        // Online softmax + output accumulation for BKV positions
+        for (var i = 0u; i < BKV; i++) {
+            let score = wg_scores[i * 64u] * scale;
+
+            // Store score for backward pass
+            if tid == 0u {
+                let score_off = q_seq * num_heads * 2u;
+                lse[score_off + (pos * num_heads + head) * $SCORE_STRIDE + t + i] = score;
+            }
+
+            let new_max = max(max_score, score);
+            let correction = exp(max_score - new_max);
+            let weight = exp(score - new_max);
+            sum_exp = sum_exp * correction + weight;
+            let v_base = (t + i) * kv_dim + kv_head_off;
+            my_out = my_out * correction + weight * bias[v_base + tid];
+            max_score = new_max;
+        }
+    }
+
+    // --- Tail: process remaining KV positions one at a time ---
+    for (; t < kv_len; t++) {
+        let k_base = t * kv_dim + kv_head_off;
         wg_dot[tid] = q_val * src_b[k_base + tid];
         tree_reduce(tid);
         let score = wg_dot[0] * scale;
 
-        // Store score in the LSE buffer (after the LSE data region) for backward pass.
-        // Offset: q_seq * num_heads * 2 (past the per-(pos,head) max_score + log_sum pairs).
         if tid == 0u {
             let score_off = q_seq * num_heads * 2u;
             lse[score_off + (pos * num_heads + head) * $SCORE_STRIDE + t] = score;
         }
 
-        // Online softmax update
         let new_max = max(max_score, score);
         let correction = exp(max_score - new_max);
         let weight = exp(score - new_max);
@@ -79,9 +159,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let safe_sum = select(sum_exp, 1.0, sum_exp == 0.0);
     dst[q_base + tid] = my_out / safe_sum;
 
-    // Store (max_score, log_sum_exp) for backward pass (two scalars per pos×head).
-    // Backward computes P_t = exp(score - max_score) / sum_exp, which is safe
-    // because score <= max_score always holds in exact arithmetic.
+    // Store (max_score, log_sum_exp) for backward pass.
     if tid == 0u {
         let idx = (pos * num_heads + head) * 2u;
         lse[idx] = max_score;
