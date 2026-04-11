@@ -92,7 +92,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             let col = tile_col + tx * 2u + j;
             if row < params.m && col < params.n {
                 let idx = row * params.n + col;
-                matrix_c[idx] = s[i][j]$FUSED_ADD_EXPR;
+                $STORE_BODY
             }
         }
     }

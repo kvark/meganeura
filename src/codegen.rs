@@ -54,6 +54,137 @@ fn parse_wgsl(source: &str) -> ShaderModule {
     }
 }
 
+/// Generate WGSL declarations and body for a fused epilogue chain.
+///
+/// Returns (declarations, body) where declarations are `var<storage>`
+/// lines for extra buffers, and body is a sequence of WGSL statements
+/// that transform `val` (the matmul result for one output element).
+pub fn epilogue_to_wgsl(epilogue: &[crate::compile::EpilogueOp]) -> (String, String) {
+    use crate::compile::EpilogueOp;
+    let mut decls = Vec::new();
+    let mut body = Vec::new();
+    let mut declared = std::collections::HashSet::new();
+
+    for op in epilogue {
+        match op {
+            EpilogueOp::Add(buf_idx) => {
+                let name = format!("epi_buf_{}", buf_idx);
+                if declared.insert(*buf_idx) {
+                    decls.push(format!("var<storage> {}: array<f32>;", name));
+                }
+                body.push(format!("val = val + {}[idx];", name));
+            }
+            EpilogueOp::BiasAdd(buf_idx) => {
+                let name = format!("epi_buf_{}", buf_idx);
+                if declared.insert(*buf_idx) {
+                    decls.push(format!("var<storage> {}: array<f32>;", name));
+                }
+                body.push(format!("val = val + {}[col];", name));
+            }
+            EpilogueOp::Relu => {
+                body.push("val = max(val, 0.0);".to_string());
+            }
+            EpilogueOp::Silu => {
+                body.push("val = val / (1.0 + exp(-val));".to_string());
+            }
+            EpilogueOp::Sigmoid => {
+                body.push("val = 1.0 / (1.0 + exp(-val));".to_string());
+            }
+            EpilogueOp::Neg => {
+                body.push("val = -val;".to_string());
+            }
+        }
+    }
+    (decls.join("\n"), body.join("\n                "))
+}
+
+/// Generate a matmul shader module with a fused epilogue chain.
+///
+/// Used by the runtime when a dispatch has a non-empty epilogue field.
+/// The epilogue ops are compiled into WGSL statements that transform
+/// each output element before storing it.
+pub fn generate_matmul_with_epilogue(
+    group: ShaderGroup,
+    epilogue: &[crate::compile::EpilogueOp],
+) -> ShaderModule {
+    let (epi_decl, epi_body) = epilogue_to_wgsl(epilogue);
+    match group {
+        ShaderGroup::MatMul => matmul_vars_epilogue(
+            MATMUL_A_FWD,
+            MATMUL_B_FWD,
+            A_ROW_FWD,
+            A_COL_FWD,
+            B_ROW_FWD,
+            B_COL_FWD,
+            "",
+            "",
+            &epi_decl,
+            &epi_body,
+        ),
+        ShaderGroup::MatMulAdd => matmul_vars_epilogue(
+            MATMUL_A_FWD,
+            MATMUL_B_FWD,
+            A_ROW_FWD,
+            A_COL_FWD,
+            B_ROW_FWD,
+            B_COL_FWD,
+            "var<storage> src: array<f32>;",
+            " + src[idx]",
+            &epi_decl,
+            &epi_body,
+        ),
+        ShaderGroup::MatMulAT => matmul_vars_epilogue(
+            MATMUL_A_AT,
+            MATMUL_B_FWD,
+            A_ROW_AT,
+            A_COL_AT,
+            B_ROW_FWD,
+            B_COL_FWD,
+            "",
+            "",
+            &epi_decl,
+            &epi_body,
+        ),
+        ShaderGroup::MatMulBT => matmul_vars_epilogue(
+            MATMUL_A_FWD,
+            MATMUL_B_BT,
+            A_ROW_FWD,
+            A_COL_FWD,
+            B_ROW_BT,
+            B_COL_BT,
+            "",
+            "",
+            &epi_decl,
+            &epi_body,
+        ),
+        ShaderGroup::MatMulATAdd => matmul_vars_epilogue(
+            MATMUL_A_AT,
+            MATMUL_B_FWD,
+            A_ROW_AT,
+            A_COL_AT,
+            B_ROW_FWD,
+            B_COL_FWD,
+            "var<storage> src: array<f32>;",
+            " + src[idx]",
+            &epi_decl,
+            &epi_body,
+        ),
+        ShaderGroup::MatMulBTAdd => matmul_vars_epilogue(
+            MATMUL_A_FWD,
+            MATMUL_B_BT,
+            A_ROW_FWD,
+            A_COL_FWD,
+            B_ROW_BT,
+            B_COL_BT,
+            "var<storage> src: array<f32>;",
+            " + src[idx]",
+            &epi_decl,
+            &epi_body,
+        ),
+        _ => panic!("epilogue fusion not supported for {:?}", group),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shader groups — each group is a naga::Module with one or more entry points
 // ---------------------------------------------------------------------------
@@ -312,7 +443,40 @@ fn matmul_vars(
     fused_decl: &str,
     fused_expr: &str,
 ) -> ShaderModule {
+    matmul_vars_epilogue(
+        a_idx, b_idx, a_row, a_col, b_row, b_col, fused_decl, fused_expr, "", "",
+    )
+}
+
+fn matmul_vars_epilogue(
+    a_idx: &str,
+    b_idx: &str,
+    a_row: &str,
+    a_col: &str,
+    b_row: &str,
+    b_col: &str,
+    fused_decl: &str,
+    fused_expr: &str,
+    epilogue_decl: &str,
+    epilogue_body: &str,
+) -> ShaderModule {
     let src = include_str!("shaders/matmul.wgsl");
+    let full_decl = if epilogue_decl.is_empty() {
+        fused_decl.to_string()
+    } else {
+        format!("{}\n{}", fused_decl, epilogue_decl)
+    };
+    // When there's an epilogue, use var val + epilogue + store.
+    // When there's no epilogue, use direct store (avoids SPIR-V regression
+    // from the extra variable assignment).
+    let store_body = if epilogue_body.is_empty() {
+        format!("matrix_c[idx] = s[i][j]{};", fused_expr)
+    } else {
+        format!(
+            "var val = s[i][j]{};\n                {}\n                matrix_c[idx] = val;",
+            fused_expr, epilogue_body
+        )
+    };
     let src = preprocess(
         src,
         &[
@@ -322,8 +486,8 @@ fn matmul_vars(
             ("$A_COL", a_col),
             ("$B_ROW", b_row),
             ("$B_COL", b_col),
-            ("$FUSED_ADD_DECL", fused_decl),
-            ("$FUSED_ADD_EXPR", fused_expr),
+            ("$FUSED_ADD_DECL", &full_decl),
+            ("$STORE_BODY", &store_body),
         ],
     );
     parse_wgsl(&src)
@@ -340,6 +504,7 @@ fn matmul_small_vars(
     fused_expr: &str,
 ) -> ShaderModule {
     let src = include_str!("shaders/matmul_small.wgsl");
+    let store_body = format!("matrix_c[idx] = s[i][j]{};", fused_expr);
     let src = preprocess(
         src,
         &[
@@ -350,7 +515,7 @@ fn matmul_small_vars(
             ("$B_ROW_S", b_row),
             ("$B_COL_S", b_col),
             ("$FUSED_ADD_DECL", fused_decl),
-            ("$FUSED_ADD_EXPR", fused_expr),
+            ("$STORE_BODY", &store_body),
         ],
     );
     parse_wgsl(&src)

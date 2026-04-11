@@ -5,11 +5,8 @@
 // conflicts. With stride 33, consecutive A rows map to consecutive banks
 // (33 mod 32 = 1), giving zero-conflict reads in the compute loop.
 //
-// Template variables:
-//   $A_INDEX, $B_INDEX: global memory index expressions
-//   $A_ROW, $A_COL: thread-to-tile mapping for A load (row=M, col=K)
-//   $B_ROW, $B_COL: thread-to-tile mapping for B load (row=K, col=N)
-//   $FUSED_ADD_DECL, $FUSED_ADD_EXPR: optional addend for FusedMatMulAdd
+// Template variables: A_INDEX, B_INDEX (global index), A_ROW/COL,
+// B_ROW/COL (tile mapping), FUSED_ADD_DECL/EXPR (addend), EPILOGUE_BODY
 
 struct Params {
     m: u32,
@@ -90,7 +87,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         t += 32u;
     }
 
-    // Store results with bounds check
+    // Store results with bounds check and optional fused epilogue
     let s = array<array<f32, 4>, 4>(
         array<f32, 4>(s0_0, s0_1, s0_2, s0_3),
         array<f32, 4>(s1_0, s1_1, s1_2, s1_3),
@@ -103,7 +100,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             let col = tile_col + tx * 4u + j;
             if row < params.m && col < params.n {
                 let idx = row * params.n + col;
-                matrix_c[idx] = s[i][j]$FUSED_ADD_EXPR;
+                $STORE_BODY
             }
         }
     }

@@ -238,6 +238,29 @@ impl ShaderEntry {
     }
 }
 
+/// An elementwise operation fused into a matmul's store loop.
+///
+/// Each step transforms `val` (the matmul result for one element):
+///   - Unary ops modify val in-place: `val = relu(val)`
+///   - Binary ops read from an extra buffer: `val = val + extra[idx]`
+///
+/// The extra buffer index refers to `epilogue_buffers` on the Dispatch.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EpilogueOp {
+    /// val = val + extra_buffer[row * N + col]
+    Add(u8),
+    /// val = val + extra_buffer[col]  (row-broadcast bias)
+    BiasAdd(u8),
+    /// val = max(val, 0)
+    Relu,
+    /// val = val * sigmoid(val)
+    Silu,
+    /// val = 1 / (1 + exp(-val))
+    Sigmoid,
+    /// val = -val
+    Neg,
+}
+
 /// A single GPU dispatch in the execution plan.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Dispatch {
@@ -257,6 +280,14 @@ pub struct Dispatch {
     /// When true, use the 32×32 small-tile matmul pipeline instead of 64×64.
     #[serde(default)]
     pub use_small_tiles: bool,
+    /// Fused elementwise epilogue chain applied in the matmul store loop.
+    /// Empty = no epilogue (default). Non-empty = one or more ops fused
+    /// into the matmul, each saving a dispatch + barrier.
+    #[serde(default)]
+    pub epilogue: Vec<EpilogueOp>,
+    /// Extra buffer refs for epilogue binary ops (Add, BiasAdd).
+    #[serde(default)]
+    pub epilogue_buffers: Vec<BufferRef>,
     /// Human-readable label for profiling (e.g. "MatMul[50,720,960]").
     #[serde(default)]
     pub label: String,
@@ -360,7 +391,106 @@ pub fn compile(graph: &Graph) -> ExecutionPlan {
         }
     }
 
+    fuse_epilogues(&mut compiler.plan.dispatches);
+
     compiler.plan
+}
+
+/// Post-compile pass: absorb single-use elementwise dispatches into
+/// the preceding matmul's epilogue. Each fused dispatch is replaced
+/// with a no-op (empty shader + zero workgroups) and removed later.
+///
+/// Only fuses into scalar matmul dispatches (not coop) because the
+/// coop store uses coopStoreT which doesn't support per-element epilogues.
+fn fuse_epilogues(dispatches: &mut Vec<Dispatch>) {
+    use std::collections::HashMap;
+    // Map: output buffer → dispatch index that writes it.
+    let mut producer: HashMap<BufferRef, usize> = HashMap::new();
+    for (i, d) in dispatches.iter().enumerate() {
+        producer.insert(d.output_buffer, i);
+    }
+
+    // Count how many dispatches read each buffer (consumers).
+    let mut read_count: HashMap<BufferRef, usize> = HashMap::new();
+    for d in dispatches.iter() {
+        for buf in &d.input_buffers {
+            *read_count.entry(*buf).or_default() += 1;
+        }
+    }
+
+    let mut to_remove = Vec::new();
+
+    for i in 0..dispatches.len() {
+        let d = &dispatches[i];
+        // Only consider single-input unary elementwise ops.
+        // Binary ops (BiasAdd, Add) would require extra buffer bindings in the
+        // shader data layout, which is a larger change. TODO: extend shader data
+        // layouts to support dynamic extra bindings for binary epilogues.
+        if d.input_buffers.len() != 1 {
+            continue;
+        }
+
+        let (epilogue_op, primary_buf, extra_buf) = match d.shader {
+            ShaderEntry::Relu => (EpilogueOp::Relu, d.input_buffers[0], None),
+            ShaderEntry::Sigmoid => (EpilogueOp::Sigmoid, d.input_buffers[0], None),
+            ShaderEntry::Neg => (EpilogueOp::Neg, d.input_buffers[0], None),
+            ShaderEntry::Silu => (EpilogueOp::Silu, d.input_buffers[0], None),
+            _ => continue,
+        };
+
+        // The elementwise op reads from primary_buf. Find the matmul that produced it.
+        let Some(&prod_idx) = producer.get(&primary_buf) else {
+            continue;
+        };
+        let prod = &dispatches[prod_idx];
+
+        // Only fuse into matmul dispatches (not coop — coop uses coopStoreT)
+        let is_matmul = matches!(
+            prod.shader,
+            ShaderEntry::MatMul
+                | ShaderEntry::MatMulAT
+                | ShaderEntry::MatMulBT
+                | ShaderEntry::FusedMatMulAdd
+                | ShaderEntry::FusedMatMulATAdd
+                | ShaderEntry::FusedMatMulBTAdd
+        );
+        if !is_matmul || prod.use_coop {
+            continue;
+        }
+
+        // The matmul output must be consumed by ONLY this elementwise op
+        // (otherwise we can't modify the output in-place).
+        if read_count.get(&primary_buf).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+
+        // The elementwise op must write to a different buffer (or same).
+        // We redirect the matmul to write directly to the elementwise output.
+        let elem_output = dispatches[i].output_buffer;
+
+        // Apply the fusion
+        let epi_buf_idx = dispatches[prod_idx].epilogue_buffers.len() as u8;
+        let op = match epilogue_op {
+            EpilogueOp::BiasAdd(_) => EpilogueOp::BiasAdd(epi_buf_idx),
+            EpilogueOp::Add(_) => EpilogueOp::Add(epi_buf_idx),
+            other => other,
+        };
+        dispatches[prod_idx].epilogue.push(op);
+        if let Some(buf) = extra_buf {
+            dispatches[prod_idx].epilogue_buffers.push(buf);
+        }
+        // Redirect matmul output to the elementwise op's output buffer
+        dispatches[prod_idx].output_buffer = elem_output;
+        // Update producer map
+        producer.insert(elem_output, prod_idx);
+
+        to_remove.push(i);
+    }
+
+    // Remove fused dispatches (iterate in reverse to preserve indices)
+    for &idx in to_remove.iter().rev() {
+        dispatches.remove(idx);
+    }
 }
 
 struct Compiler<'a> {
@@ -555,7 +685,7 @@ impl<'a> Compiler<'a> {
                     params: vec![m, k, n, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -577,7 +707,7 @@ impl<'a> Compiler<'a> {
                     params: vec![m, n, k, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -599,7 +729,7 @@ impl<'a> Compiler<'a> {
                     params: vec![m, n, k, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -622,7 +752,7 @@ impl<'a> Compiler<'a> {
                     params: vec![m, k, n, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -645,7 +775,7 @@ impl<'a> Compiler<'a> {
                     params: vec![m, n, k, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -668,7 +798,7 @@ impl<'a> Compiler<'a> {
                     params: vec![m, n, k, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -696,7 +826,7 @@ impl<'a> Compiler<'a> {
                     params: vec![len, bias_len, 0, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -734,7 +864,7 @@ impl<'a> Compiler<'a> {
                     params: vec![len, 0, 0, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -750,7 +880,7 @@ impl<'a> Compiler<'a> {
                     params: vec![len, 0, 0, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -769,7 +899,7 @@ impl<'a> Compiler<'a> {
                     params: vec![m, n, 0, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -787,7 +917,7 @@ impl<'a> Compiler<'a> {
                     params: vec![batch, features, 0, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -806,7 +936,7 @@ impl<'a> Compiler<'a> {
                     params: vec![batch, features, 0, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -828,7 +958,7 @@ impl<'a> Compiler<'a> {
                     params: vec![batch, features, 0, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -845,7 +975,7 @@ impl<'a> Compiler<'a> {
                     params: vec![len, 0, 0, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -863,7 +993,7 @@ impl<'a> Compiler<'a> {
                     params: vec![m, n, 0, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -889,7 +1019,7 @@ impl<'a> Compiler<'a> {
                     params: vec![out_len, half_n, 0, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -908,7 +1038,7 @@ impl<'a> Compiler<'a> {
                     params: vec![grad_out_len, half_n, 0, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -927,7 +1057,7 @@ impl<'a> Compiler<'a> {
                     params: vec![rows, cols, eps.to_bits(), 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -947,7 +1077,7 @@ impl<'a> Compiler<'a> {
                     params: vec![seq, hidden, 0, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -967,7 +1097,7 @@ impl<'a> Compiler<'a> {
                     params: vec![total, seq_len, embed_dim, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -992,7 +1122,7 @@ impl<'a> Compiler<'a> {
                         params: vec![seq, dim, theta.to_bits(), 0, head_dim, 0, 0, 0],
                         use_coop: false,
                         use_small_tiles: false,
-                        label: String::new(),
+                        ..Default::default()
                     });
                 } else {
                     self.plan.dispatches.push(Dispatch {
@@ -1004,7 +1134,7 @@ impl<'a> Compiler<'a> {
                         params: vec![seq, dim, theta.to_bits(), pos_offset, head_dim, 0, 0, 0],
                         use_coop: false,
                         use_small_tiles: false,
-                        label: String::new(),
+                        ..Default::default()
                     });
                 }
             }
@@ -1029,7 +1159,7 @@ impl<'a> Compiler<'a> {
                     params: vec![seq, num_heads, num_kv_heads, head_dim],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -1054,7 +1184,7 @@ impl<'a> Compiler<'a> {
                     params: vec![seq, num_heads, num_kv_heads, head_dim, window_size],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -1076,7 +1206,7 @@ impl<'a> Compiler<'a> {
                     params: vec![seq, dim, theta.to_bits(), pos_offset, head_dim, 0, 0, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -1100,7 +1230,7 @@ impl<'a> Compiler<'a> {
                     params: vec![batch, channels, spatial, num_groups, eps.to_bits(), 0, 0, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -1124,7 +1254,7 @@ impl<'a> Compiler<'a> {
                     params: vec![batch, channels, spatial, num_groups, eps.to_bits(), 0, 0, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -1148,7 +1278,7 @@ impl<'a> Compiler<'a> {
                     params: vec![batch, channels, spatial, num_groups, eps.to_bits(), 0, 0, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -1171,7 +1301,7 @@ impl<'a> Compiler<'a> {
                     params: vec![batch, channels, spatial, num_groups, eps.to_bits(), 0, 0, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -1193,7 +1323,7 @@ impl<'a> Compiler<'a> {
                     params: vec![batch, channels_a, channels_b, spatial],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -1214,7 +1344,7 @@ impl<'a> Compiler<'a> {
                     params: vec![batch, channels_a, channels_b, spatial],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -1235,7 +1365,7 @@ impl<'a> Compiler<'a> {
                     params: vec![batch, channels_a, channels_b, spatial],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -1256,7 +1386,7 @@ impl<'a> Compiler<'a> {
                     params: vec![batch, channels, in_h, in_w],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -1277,7 +1407,7 @@ impl<'a> Compiler<'a> {
                     params: vec![batch, channels, in_h, in_w],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -1334,7 +1464,7 @@ impl<'a> Compiler<'a> {
                     ],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -1390,7 +1520,7 @@ impl<'a> Compiler<'a> {
                     ],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -1443,7 +1573,7 @@ impl<'a> Compiler<'a> {
                     ],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -1463,7 +1593,7 @@ impl<'a> Compiler<'a> {
                     params: vec![dim, 0, 0, 0], // kv_pos read from input buffer at runtime
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -1485,7 +1615,7 @@ impl<'a> Compiler<'a> {
                     params: vec![0, num_heads, num_kv_heads, head_dim], // kv_len read from input buffer
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -1516,7 +1646,7 @@ impl<'a> Compiler<'a> {
                     ],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -1532,7 +1662,7 @@ impl<'a> Compiler<'a> {
                     params: vec![channels, spatial, total_out, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -1556,7 +1686,7 @@ impl<'a> Compiler<'a> {
                     params: vec![rows, cols, eps.to_bits(), 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -1580,7 +1710,7 @@ impl<'a> Compiler<'a> {
                     params: vec![seq, num_heads, num_kv_heads, head_dim],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -1605,7 +1735,7 @@ impl<'a> Compiler<'a> {
                     params: vec![q_seq, kv_seq, (num_heads << 16) | num_kv_heads, head_dim],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -1631,7 +1761,7 @@ impl<'a> Compiler<'a> {
                     params: vec![q_seq, kv_seq, (num_heads << 16) | num_kv_heads, head_dim],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -1679,7 +1809,7 @@ impl<'a> Compiler<'a> {
                     ],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -1728,7 +1858,7 @@ impl<'a> Compiler<'a> {
                     ],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -1777,7 +1907,7 @@ impl<'a> Compiler<'a> {
                     ],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -1796,7 +1926,7 @@ impl<'a> Compiler<'a> {
                     params: vec![len, 0, 0, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -1814,7 +1944,7 @@ impl<'a> Compiler<'a> {
                     params: vec![len, 0, 0, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -1832,7 +1962,7 @@ impl<'a> Compiler<'a> {
                     params: vec![len, 0, 0, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -1856,7 +1986,7 @@ impl<'a> Compiler<'a> {
                     params: vec![m, n, k, eps.to_bits()],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -1876,7 +2006,7 @@ impl<'a> Compiler<'a> {
                     params: vec![rows, cols, eps.to_bits(), 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
 
@@ -1896,7 +2026,7 @@ impl<'a> Compiler<'a> {
                     params: vec![rows, cols, eps.to_bits(), 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    label: String::new(),
+                    ..Default::default()
                 });
             }
         }
@@ -1932,7 +2062,7 @@ impl<'a> Compiler<'a> {
             params: vec![len, 0, 0, 0],
             use_coop: false,
             use_small_tiles: false,
-            label: String::new(),
+            ..Default::default()
         });
     }
 
@@ -1949,7 +2079,7 @@ impl<'a> Compiler<'a> {
             params: vec![len, 0, 0, 0],
             use_coop: false,
             use_small_tiles: false,
-            label: String::new(),
+            ..Default::default()
         });
     }
 }

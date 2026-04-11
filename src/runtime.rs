@@ -550,6 +550,9 @@ struct Pipelines {
     coop_map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
     /// Small-tile (32×32) pipelines for dispatches with `use_small_tiles = true`.
     small_map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
+    /// Epilogue-fused pipelines keyed by (shader, epilogue chain).
+    epilogue_map:
+        HashMap<(ShaderEntry, Vec<crate::compile::EpilogueOp>), blade_graphics::ComputePipeline>,
 }
 
 impl Pipelines {
@@ -684,14 +687,46 @@ impl Pipelines {
             }
         }
 
+        // Compile epilogue-fused pipelines for dispatches with non-empty epilogue.
+        let mut epilogue_map = HashMap::new();
+        for dispatch in &plan.dispatches {
+            if dispatch.epilogue.is_empty() {
+                continue;
+            }
+            let key = (dispatch.shader.clone(), dispatch.epilogue.clone());
+            if epilogue_map.contains_key(&key) {
+                continue;
+            }
+            let group = dispatch.shader.shader_group();
+            let sm = crate::codegen::generate_matmul_with_epilogue(group, &dispatch.epilogue);
+            let shader = gpu.create_shader(bg::ShaderDesc {
+                source: &sm.source,
+                naga_module: Some(sm.module),
+            });
+            let layout = shader_data_layout(&dispatch.shader);
+            let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
+                name: dispatch.shader.entry_point(),
+                data_layouts: &[&layout],
+                compute: shader.at(dispatch.shader.entry_point()),
+            });
+            epilogue_map.insert(key, pipeline);
+        }
+
         Self {
             map,
             coop_map,
             small_map,
+            epilogue_map,
         }
     }
 
     fn get(&self, dispatch: &Dispatch) -> &blade_graphics::ComputePipeline {
+        if !dispatch.epilogue.is_empty() {
+            let key = (dispatch.shader.clone(), dispatch.epilogue.clone());
+            if let Some(p) = self.epilogue_map.get(&key) {
+                return p;
+            }
+        }
         if dispatch.use_coop {
             if let Some(p) = self.coop_map.get(&dispatch.shader) {
                 return p;
