@@ -1,4 +1,4 @@
-// MHA gradient wrt Q
+// MHA gradient wrt Q — BKV=8 tiled KV loop
 // Dispatch: [q_seq, num_heads, 1], WG=64
 
 struct Params {
@@ -39,6 +39,25 @@ fn tree_reduce(tid: u32) {
     workgroupBarrier();
 }
 
+const BKV: u32 = 8u;
+var<workgroup> wg_scores: array<f32, 512>;  // BKV * 64
+
+fn tree_reduce_8(tid: u32) {
+    workgroupBarrier();
+    if tid < 32u { for (var i = 0u; i < BKV; i++) { wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 32u]; } }
+    workgroupBarrier();
+    if tid < 16u { for (var i = 0u; i < BKV; i++) { wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 16u]; } }
+    workgroupBarrier();
+    if tid < 8u { for (var i = 0u; i < BKV; i++) { wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 8u]; } }
+    workgroupBarrier();
+    if tid < 4u { for (var i = 0u; i < BKV; i++) { wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 4u]; } }
+    workgroupBarrier();
+    if tid < 2u { for (var i = 0u; i < BKV; i++) { wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 2u]; } }
+    workgroupBarrier();
+    if tid < 1u { for (var i = 0u; i < BKV; i++) { wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 1u]; } }
+    workgroupBarrier();
+}
+
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let pos = wgid.x;
@@ -71,33 +90,48 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
 
     var my_dq = 0.0;
 
-    // kv_seq == 0 signals causal: each position attends to t ∈ [0, pos].
+    // kv_seq == 0 signals causal: each position attends to t in [0, pos].
     // window_size > 0 restricts to [max(0, pos+1-window), pos+1).
     let kv_len = select(kv_seq, pos + 1u, kv_seq == 0u);
     let window = params.window_size;
     let kv_start = select(0u, select(0u, pos + 1u - window, pos >= window), window > 0u);
-    for (var t = kv_start; t < kv_len; t++) {
+    let score_stride = select(kv_seq, q_seq, kv_seq == 0u);
+    let score_off = q_seq * num_heads * 2u;
+
+    // --- Tiled KV loop: BKV positions per reduction ---
+    let tile_end = kv_start + ((kv_len - kv_start) / BKV) * BKV;
+    var t = kv_start;
+    for (; t < tile_end; t += BKV) {
+        // Compute BKV dP_t values simultaneously
+        for (var i = 0u; i < BKV; i++) {
+            let k_base = (t + i) * kv_dim + kv_head_off;
+            wg_scores[i * 64u + tid] = do_val * bias[k_base + tid];
+        }
+        tree_reduce_8(tid);
+
+        // Process BKV positions
+        for (var i = 0u; i < BKV; i++) {
+            let score = lse[score_off + (pos * num_heads + head) * score_stride + t + i];
+            let p_t = exp(min(score - max_s, 0.0) - log_sum);
+            let dp_t = wg_scores[i * 64u];
+            let ds_t = p_t * (dp_t - row_sum);
+            let k_base = (t + i) * kv_dim + kv_head_off;
+            my_dq += ds_t * scale * src_b[k_base + tid];
+        }
+    }
+
+    // --- Tail ---
+    for (; t < kv_len; t++) {
         let k_base = t * kv_dim + kv_head_off;
 
-        // Read exact score from LSE buffer (stored after LSE data by forward pass)
-        let score_stride = select(kv_seq, q_seq, kv_seq == 0u);
-        let score_off = q_seq * num_heads * 2u;
         let score = lse[score_off + (pos * num_heads + head) * score_stride + t];
-
-        // P_t = exp(score - lse)
-        // P_t = exp(score - max_score) / sum_exp
-        // Clamp to handle f32 rounding where recomputed score > max_score
         let p_t = exp(min(score - max_s, 0.0) - log_sum);
 
-        // dP_t = sum_d(dO[d] * V[d])
         wg_dot[tid] = do_val * bias[k_base + tid];
         tree_reduce(tid);
         let dp_t = wg_dot[0];
 
-        // dS_t = P_t * (dP_t - row_sum)
         let ds_t = p_t * (dp_t - row_sum);
-
-        // Accumulate dQ
         my_dq += ds_t * scale * src_b[k_base + tid];
     }
 

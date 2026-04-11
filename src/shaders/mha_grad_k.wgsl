@@ -1,4 +1,4 @@
-// MHA gradient wrt K
+// MHA gradient wrt K — BQ=8 tiled Q loop
 // Dispatch: [kv_seq, num_kv_heads, 1], WG=64
 
 struct Params {
