@@ -1043,7 +1043,6 @@ impl Session {
                 timing: true,
                 capture: false,
                 overlay: false,
-                compute_only: true,
                 device_id: std::env::var("MEGANEURA_DEVICE_ID")
                     .ok()
                     .and_then(|s| s.parse().ok()),
