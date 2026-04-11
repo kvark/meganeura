@@ -802,6 +802,8 @@ fn gen_matmul_coop_wgsl(
             ("$B_INDEX_1", b_idx_1),
             ("$A_INDEX_0", a_idx_0),
             ("$A_INDEX_1", a_idx_1),
+            ("$A_TRANSFORM_0", ""),
+            ("$A_TRANSFORM_1", ""),
             ("$FUSED_ADD_DECL", &fused_decl),
             ("$ACC_INIT", &acc_init),
         ],
@@ -1025,6 +1027,9 @@ fn gen_fused_rms_norm_matmul_coop() -> ShaderModule {
 }
 
 fn gen_fused_rms_norm_matmul_coop_wgsl(config: &CoopConfig) -> ShaderModule {
+    // Reuse the standard coop matmul template with A_TRANSFORM injecting
+    // on-the-fly normalization: a_val * rsqrt_buf[gr] * w_norm[tc]
+    // The rsqrt_buf is precomputed by a separate RmsNormRsqrt dispatch.
     let tile = config.tile_size;
     let output_tile = config.output_tile();
     let shared_size = tile * tile;
@@ -1044,7 +1049,20 @@ fn gen_fused_rms_norm_matmul_coop_wgsl(config: &CoopConfig) -> ShaderModule {
     let coop_ba = format!("coop_mat{}x{}<{},B>", tile, tile, ab_type);
     let coop_c = format!("coop_mat{}x{}<f32,C>", tile, tile);
 
-    let src = include_str!("shaders/matmul_rms_norm_coop.wgsl");
+    // Extra declarations for the rsqrt buffer and w_norm
+    let fused_decl =
+        "var<storage> rsqrt_buf: array<f32>;\nvar<storage> w_norm: array<f32>;".to_string();
+    let acc_init = format!(
+        "var acc00 = {coop_c}();\n\
+         \x20   var acc01 = {coop_c}();\n\
+         \x20   var acc10 = {coop_c}();\n\
+         \x20   var acc11 = {coop_c}();"
+    );
+    // A-staging transforms: multiply by precomputed rsqrt and w_norm
+    let a_transform_0 = "* rsqrt_buf[gr] * w_norm[tc]";
+    let a_transform_1 = "* rsqrt_buf[gr] * w_norm[tc]";
+
+    let src = include_str!("shaders/matmul_coop.wgsl");
     let src = preprocess(
         src,
         &[
@@ -1062,7 +1080,15 @@ fn gen_fused_rms_norm_matmul_coop_wgsl(config: &CoopConfig) -> ShaderModule {
             ("$CAST_CLOSE", cast_close),
             ("$COOP_AB", &coop_ab),
             ("$COOP_BA", &coop_ba),
-            ("$COOP_OUT", &coop_c),
+            // Standard normal variant A-indexing (A=[M,K] row-major)
+            ("$B_INDEX_0", "tr * n + cc"),
+            ("$B_INDEX_1", "tr * n + cc1"),
+            ("$A_INDEX_0", "gr * k + tc"),
+            ("$A_INDEX_1", "gr * k + tc"),
+            ("$A_TRANSFORM_0", a_transform_0),
+            ("$A_TRANSFORM_1", a_transform_1),
+            ("$FUSED_ADD_DECL", &fused_decl),
+            ("$ACC_INIT", &acc_init),
         ],
     );
     parse_wgsl(&src)

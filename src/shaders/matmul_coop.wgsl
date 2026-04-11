@@ -90,7 +90,8 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             let gr = tile_row + base_row + e * $ROW_STRIDE_U;
             let in_bounds = (gr < m) && in_k;
             if in_bounds {
-                shared_b0[flat] = $CAST_OPEN matrix_a[$A_INDEX_0] $CAST_CLOSE;
+                let a_val = matrix_a[$A_INDEX_0];
+                shared_b0[flat] = $CAST_OPEN a_val $A_TRANSFORM_0 $CAST_CLOSE;
             } else {
                 shared_b0[flat] = zero_val;
             }
@@ -102,7 +103,8 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             let gr = tile_row + $TILE_SIZE_U + base_row + e * $ROW_STRIDE_U;
             let in_bounds = (gr < m) && in_k;
             if in_bounds {
-                shared_b1[flat] = $CAST_OPEN matrix_a[$A_INDEX_1] $CAST_CLOSE;
+                let a_val = matrix_a[$A_INDEX_1];
+                shared_b1[flat] = $CAST_OPEN a_val $A_TRANSFORM_1 $CAST_CLOSE;
             } else {
                 shared_b1[flat] = zero_val;
             }
