@@ -10,6 +10,7 @@
 
 $ENABLE_F16
 enable wgpu_cooperative_matrix;
+enable subgroups;
 
 struct Params {
     m: u32,
@@ -39,22 +40,41 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let k = params.k;
     let eps = bitcast<f32>(params.eps_bits);
 
-    // --- Prologue: precompute rsqrt for rows in this M-tile ---
-    // Each of 64 threads handles one or more rows.
-    for (var row_off = lid.x; row_off < $OUTPUT_TILE_U; row_off += 64u) {
+    // --- Prologue: precompute rsqrt using subgroup cooperative reduction ---
+    // All 64 threads cooperate on each row. With 2 subgroups (NVIDIA: sg=32),
+    // each subgroup reduces via subgroupAdd, then we combine via shared memory.
+    // Temp storage: reuse shared_b0[0..1] for the 2 subgroup partial sums.
+    let sg_id = lid.x / 32u; // 0 or 1 for NVIDIA (64-thread WG, sg=32)
+    for (var row_off = 0u; row_off < $OUTPUT_TILE_U; row_off++) {
         let row = tile_row + row_off;
+        var ss = 0.0;
         if row < m {
-            var ss = 0.0;
-            for (var j = 0u; j < k; j++) {
+            var j = lid.x;
+            loop {
+                if j >= k { break; }
                 let v = src_a[row * k + j];
                 ss += v * v;
+                j += 64u;
             }
-            rsqrt_cache[row_off] = inverseSqrt(ss / f32(k) + eps);
-        } else {
-            rsqrt_cache[row_off] = 0.0;
         }
+        // Reduce within each subgroup
+        let sg_sum = subgroupAdd(ss);
+        // Each subgroup's first thread writes to a distinct slot
+        if lid.x % 32u == 0u {
+            shared_b0[sg_id] = $CAST_OPEN sg_sum $CAST_CLOSE;
+        }
+        workgroupBarrier();
+        // Thread 0 combines the subgroup sums
+        if lid.x == 0u {
+            let total = f32(shared_b0[0u]) + f32(shared_b0[1u]);
+            if row < m {
+                rsqrt_cache[row_off] = inverseSqrt(total / f32(k) + eps);
+            } else {
+                rsqrt_cache[row_off] = 0.0;
+            }
+        }
+        workgroupBarrier();
     }
-    workgroupBarrier();
 
     // C offsets for the 4 output tiles
     let c00 = tile_row * n + tile_col;
