@@ -5,7 +5,7 @@
 // normalized on-the-fly before being written to shared memory.
 //
 // Dispatch: [ceil(M/OUTPUT_TILE), ceil(N/OUTPUT_TILE), 1], WG=64
-// Inputs: matrix_a = X [M, K], matrix_b = W_proj [K, N], bias = W_norm [K]
+// Inputs: src_a = X [M, K], src_b = W_proj [K, N], bias = W_norm [K]
 // Params: m, n, k, eps_bits
 
 $ENABLE_F16
@@ -18,10 +18,10 @@ struct Params {
     eps_bits: u32,
 }
 
-var<storage> matrix_a: array<f32>;           // X [M, K]
-var<storage> matrix_b: array<f32>;           // W_proj [K, N]
+var<storage> src_a: array<f32>;              // X [M, K]
+var<storage> src_b: array<f32>;             // W_proj [K, N]
 var<storage> bias: array<f32>;               // W_norm [K]
-var<storage, read_write> matrix_c: array<f32>;
+var<storage, read_write> dst: array<f32>;
 var<uniform> params: Params;
 var<workgroup> shared_a0: array<$ELEM_TYPE, $SHARED_SIZE>;
 var<workgroup> shared_a1: array<$ELEM_TYPE, $SHARED_SIZE>;
@@ -46,7 +46,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         if row < m {
             var ss = 0.0;
             for (var j = 0u; j < k; j++) {
-                let v = matrix_a[row * k + j];
+                let v = src_a[row * k + j];
                 ss += v * v;
             }
             rsqrt_cache[row_off] = inverseSqrt(ss / f32(k) + eps);
@@ -66,10 +66,10 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let m1_valid = (tile_row + $TILE_SIZE_U) < m;
 
     // Initialize accumulators to zero
-    var acc00 = coopConstructT<$COOP_OUT>(0.0);
-    var acc01 = coopConstructT<$COOP_OUT>(0.0);
-    var acc10 = coopConstructT<$COOP_OUT>(0.0);
-    var acc11 = coopConstructT<$COOP_OUT>(0.0);
+    var acc00 = $COOP_OUT();
+    var acc01 = $COOP_OUT();
+    var acc10 = $COOP_OUT();
+    var acc11 = $COOP_OUT();
 
     // Hoisted staging index components
     let src_col = lid.x & $TILE_MASK_U;
@@ -90,7 +90,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             let tr = t + base_row + e * $ROW_STRIDE_U;
             let in_bounds = (tr < k) && in_n;
             if in_bounds {
-                shared_a0[flat] = $CAST_OPEN matrix_b[tr * n + cc] $CAST_CLOSE;
+                shared_a0[flat] = $CAST_OPEN src_b[tr * n + cc] $CAST_CLOSE;
             } else {
                 shared_a0[flat] = zero_val;
             }
@@ -102,7 +102,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             let tr = t + base_row + e * $ROW_STRIDE_U;
             let in_bounds = (tr < k) && in_n1;
             if in_bounds {
-                shared_a1[flat] = $CAST_OPEN matrix_b[tr * n + cc1] $CAST_CLOSE;
+                shared_a1[flat] = $CAST_OPEN src_b[tr * n + cc1] $CAST_CLOSE;
             } else {
                 shared_a1[flat] = zero_val;
             }
@@ -118,7 +118,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             let row_local = base_row + e * $ROW_STRIDE_U;
             let in_bounds = (gr < m) && in_k;
             if in_bounds {
-                let raw = matrix_a[gr * k + tc];
+                let raw = src_a[gr * k + tc];
                 let norm = raw * rsqrt_cache[row_local] * bias[tc];
                 shared_b0[flat] = $CAST_OPEN norm $CAST_CLOSE;
             } else {
@@ -133,7 +133,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             let row_local = $TILE_SIZE_U + base_row + e * $ROW_STRIDE_U;
             let in_bounds = (gr < m) && in_k;
             if in_bounds {
-                let raw = matrix_a[gr * k + tc];
+                let raw = src_a[gr * k + tc];
                 let norm = raw * rsqrt_cache[row_local] * bias[tc];
                 shared_b1[flat] = $CAST_OPEN norm $CAST_CLOSE;
             } else {
@@ -158,14 +158,14 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     }
 
     // Store results
-    coopStoreT(acc00, &matrix_c[c00], n);
+    coopStoreT(acc00, &dst[c00], n);
     if n1_valid {
-        coopStoreT(acc01, &matrix_c[c01], n);
+        coopStoreT(acc01, &dst[c01], n);
     }
     if m1_valid {
-        coopStoreT(acc10, &matrix_c[c10], n);
+        coopStoreT(acc10, &dst[c10], n);
     }
     if n1_valid && m1_valid {
-        coopStoreT(acc11, &matrix_c[c11], n);
+        coopStoreT(acc11, &dst[c11], n);
     }
 }

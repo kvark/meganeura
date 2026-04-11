@@ -508,9 +508,12 @@ fn rebuild_graph_from_extractions(
         apply_silu_fusions(&mut graph, &mut fusions);
         apply_swiglu_fusions(&mut graph, &mut fusions);
         apply_swiglu_concat_fusions(&mut graph, &mut fusions);
-        // RmsNorm+MatMul fusion: coop shader variant now exists
-        // (matmul_rms_norm_coop.wgsl) but causes SIGSEGV on NVIDIA for
-        // some backward shapes in small models. Disabled until debugged.
+        // RmsNorm+MatMul fusion: saves 24 barriers (~0.72ms) but the fused
+        // kernel loses cooperative matrix (tensor cores). The scalar fused
+        // path is ~0.9ms slower than coop on NVIDIA, netting a regression.
+        // The coop variant's 64-thread rsqrt prologue is also too slow.
+        // Needs a 2-phase approach: precompute rsqrt in a separate dispatch,
+        // then fuse the normalized staging into the coop matmul.
         // apply_rms_norm_matmul_fusions(&mut graph, &mut fusions);
         // apply_rms_norm_matmul_fusions(&mut graph, &mut fusions);
         if fusions.len() == n {
