@@ -1040,7 +1040,7 @@ impl Session {
         let gpu = unsafe {
             blade_graphics::Context::init(blade_graphics::ContextDesc {
                 validation: cfg!(debug_assertions),
-                timing: true,
+                timing: std::env::var("MEGANEURA_GPU_TIMING").is_ok(),
                 capture: false,
                 overlay: false,
                 compute_only: true,
@@ -1166,6 +1166,12 @@ impl Session {
             // Debug: one dispatch per pass — guarantees serial execution.
             log::info!("MEGANEURA_SERIAL_DISPATCH: forcing one dispatch per pass");
             (0..plan.dispatches.len()).map(|i| i..i + 1).collect()
+        } else if std::env::var("MEGANEURA_SINGLE_PASS").is_ok() {
+            // Experimental: all dispatches in one pass, zero barriers.
+            // Relies on hardware memory coherency (NVIDIA L2 cache).
+            // Results may be wrong on non-coherent hardware!
+            log::warn!("MEGANEURA_SINGLE_PASS: all dispatches in one pass — no barriers!");
+            vec![0..plan.dispatches.len()]
         } else {
             compute_groups(&plan.dispatches)
         };
@@ -1577,14 +1583,16 @@ impl Session {
                 pc.dispatch(dispatch.workgroups);
             }
         } else {
-            // Group mode (default): one compute pass per barrier group.
-            // Groups were pre-computed at session creation by reordering dispatches
-            // by dependency level and partitioning on RAW hazards. Each pass
-            // boundary in blade emits an ALL_COMMANDS barrier, so N groups =
-            // N barriers — far fewer than one per dispatch.
+            // Inline-barrier mode: all dispatches in a single compute pass
+            // with lightweight compute-to-compute barriers between groups.
+            // Avoids the per-pass overhead of begin_pass/end_pass (timestamps,
+            // debug labels) while maintaining correct memory ordering.
+            let mut pass = self.encoder.compute("step");
             for gi in 0..self.groups.len() {
+                if gi > 0 {
+                    pass.barrier();
+                }
                 let group = self.groups[gi].clone();
-                let mut pass = self.encoder.compute(&self.group_names[gi]);
                 for i in group {
                     let dispatch = &self.plan.dispatches[i];
                     let pipeline = self.pipelines.get(dispatch);
