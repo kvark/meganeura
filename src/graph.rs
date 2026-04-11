@@ -180,6 +180,15 @@ pub enum Op {
         num_kv_heads: u32,
         head_dim: u32,
     },
+    /// CausalAttention with on-the-fly RoPE: takes un-rotated Q, K, V.
+    /// Applies RoPE rotation inside the attention kernel's dot product,
+    /// eliminating separate RoPE dispatches. inputs: [Q, K, V]
+    CausalAttentionRoPE {
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        rope_theta: f32,
+    },
 
     // --- Vision / VLA ops ---
 

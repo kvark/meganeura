@@ -334,7 +334,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
                         is_cross,
                     },
                     vec![grad_output, q, k, v],
-                    q_ty,
+                    q_ty.clone(),
                 );
                 let grad_k = graph.add_raw_node(
                     Op::MultiHeadAttnGradK {
@@ -345,7 +345,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
                         is_cross,
                     },
                     vec![grad_output, q, k, v],
-                    k_ty,
+                    k_ty.clone(),
                 );
                 let grad_v = graph.add_raw_node(
                     Op::MultiHeadAttnGradV {
@@ -625,17 +625,50 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 num_heads,
                 num_kv_heads,
                 head_dim,
+            }
+            | Op::CausalAttentionRoPE {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                ..
             } => {
                 // CausalAttention is MultiHeadAttn with is_cross=false and causal mask.
                 // Reuse the MultiHeadAttnGrad ops.
-                let q = node.inputs[0];
-                let k = node.inputs[1];
+                let q_raw = node.inputs[0];
+                let k_raw = node.inputs[1];
                 let v = node.inputs[2];
                 let fwd_node = node.id;
 
-                let q_ty = forward.nodes()[q as usize].ty.clone();
-                let k_ty = forward.nodes()[k as usize].ty.clone();
+                // Get types from the forward graph (before any backward-graph nodes)
+                let q_ty = forward.nodes()[q_raw as usize].ty.clone();
+                let k_ty = forward.nodes()[k_raw as usize].ty.clone();
                 let v_ty = forward.nodes()[v as usize].ty.clone();
+
+                // For CausalAttentionRoPE: Q and K are un-rotated. The grad
+                // kernels recompute Q·K scores, so they need the rotated versions.
+                let (q, k) = if let Op::CausalAttentionRoPE { rope_theta, .. } = node.op {
+                    let q_rotated = graph.add_raw_node(
+                        Op::RoPE {
+                            theta: rope_theta,
+                            pos_offset: 0,
+                            head_dim,
+                        },
+                        vec![q_raw],
+                        q_ty.clone(),
+                    );
+                    let k_rotated = graph.add_raw_node(
+                        Op::RoPE {
+                            theta: rope_theta,
+                            pos_offset: 0,
+                            head_dim,
+                        },
+                        vec![k_raw],
+                        k_ty.clone(),
+                    );
+                    (q_rotated, k_rotated)
+                } else {
+                    (q_raw, k_raw)
+                };
 
                 let grad_q = graph.add_raw_node(
                     Op::MultiHeadAttnGradQ {
@@ -646,7 +679,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
                         is_cross: false,
                     },
                     vec![grad_output, q, k, v],
-                    q_ty,
+                    q_ty.clone(),
                 );
                 let grad_k = graph.add_raw_node(
                     Op::MultiHeadAttnGradK {
@@ -657,7 +690,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
                         is_cross: false,
                     },
                     vec![grad_output, q, k, v],
-                    k_ty,
+                    k_ty.clone(),
                 );
                 let grad_v = graph.add_raw_node(
                     Op::MultiHeadAttnGradV {
@@ -670,8 +703,33 @@ pub fn differentiate(forward: &Graph) -> Graph {
                     vec![grad_output, q, k, v],
                     v_ty,
                 );
-                accumulate_grad(&mut graph, &mut grads, q, grad_q);
-                accumulate_grad(&mut graph, &mut grads, k, grad_k);
+                // For CausalAttentionRoPE: grad flows through RoPE backward
+                // to the original un-rotated Q/K.
+                if let Op::CausalAttentionRoPE { rope_theta, .. } = node.op {
+                    let grad_q_unrotated = graph.add_raw_node(
+                        Op::RoPEGrad {
+                            theta: rope_theta,
+                            pos_offset: 0,
+                            head_dim,
+                        },
+                        vec![grad_q],
+                        q_ty.clone(),
+                    );
+                    let grad_k_unrotated = graph.add_raw_node(
+                        Op::RoPEGrad {
+                            theta: rope_theta,
+                            pos_offset: 0,
+                            head_dim,
+                        },
+                        vec![grad_k],
+                        k_ty.clone(),
+                    );
+                    accumulate_grad(&mut graph, &mut grads, q_raw, grad_q_unrotated);
+                    accumulate_grad(&mut graph, &mut grads, k_raw, grad_k_unrotated);
+                } else {
+                    accumulate_grad(&mut graph, &mut grads, q_raw, grad_q);
+                    accumulate_grad(&mut graph, &mut grads, k_raw, grad_k);
+                }
                 accumulate_grad(&mut graph, &mut grads, v, grad_v);
             }
             Op::SlidingWindowAttention {
@@ -700,7 +758,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
                         is_cross: false,
                     },
                     vec![grad_output, q, k, v],
-                    q_ty,
+                    q_ty.clone(),
                 );
                 let grad_k = graph.add_raw_node(
                     Op::MultiHeadAttnGradK {
@@ -711,7 +769,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
                         is_cross: false,
                     },
                     vec![grad_output, q, k, v],
-                    k_ty,
+                    k_ty.clone(),
                 );
                 let grad_v = graph.add_raw_node(
                     Op::MultiHeadAttnGradV {
