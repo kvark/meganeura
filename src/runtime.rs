@@ -681,13 +681,7 @@ impl Pipelines {
                 });
                 if let Some(entries) = entries_for_group.get(&group) {
                     for entry in entries {
-                        // Coop RmsNorm matmul uses a different data layout
-                        // (6 bindings: matrix_a, matrix_b, rsqrt_buf, w_norm, matrix_c, params)
-                        let layout = if group == ShaderGroup::FusedRmsNormMatMulCoop {
-                            <FusedRmsNormMatMulCoopData as blade_graphics::ShaderData>::layout()
-                        } else {
-                            shader_data_layout(entry)
-                        };
+                        let layout = shader_data_layout(entry);
                         let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
                             name: entry.entry_point(),
                             data_layouts: &[&layout],
@@ -2197,34 +2191,17 @@ impl Session {
                 );
             }
             ShaderEntry::FusedRmsNormMatMul => {
-                if dispatch.use_coop {
-                    // Coop path: uses FusedRmsNormMatMulCoopData
-                    // input_buffers: [x, w_proj, rsqrt_buf, w_norm]
-                    pc.bind(
-                        0,
-                        &FusedRmsNormMatMulCoopData {
-                            matrix_a: buf(dispatch.input_buffers[0]),  // X
-                            matrix_b: buf(dispatch.input_buffers[1]),  // W_proj
-                            rsqrt_buf: buf(dispatch.input_buffers[2]), // rsqrt
-                            w_norm: buf(dispatch.input_buffers[3]),    // W_norm
-                            matrix_c: buf(dispatch.output_buffer),
-                            params: MatMulParams {
-                                m: dispatch.params[0],
-                                n: dispatch.params[1],
-                                k: dispatch.params[2],
-                                _pad: dispatch.params[3],
-                            },
-                        },
-                    );
-                } else {
-                    // Scalar path: uses FourBufData (matmul_rms_norm.wgsl)
-                    // input_buffers: [x, w_proj, rsqrt_buf, w_norm] — ignore rsqrt_buf
+                {
+                    // Both scalar and coop paths use FourBufData layout:
+                    // src_a=X, src_b=W_proj, bias=W_norm, dst=output
+                    // Coop variant: rsqrt computed in shared memory via subgroupAdd
+                    // input_buffers: [x, w_norm, w_proj]
                     pc.bind(
                         0,
                         &FourBufData {
                             src_a: buf(dispatch.input_buffers[0]), // X
-                            src_b: buf(dispatch.input_buffers[1]), // W_proj
-                            bias: buf(dispatch.input_buffers[3]),  // W_norm
+                            src_b: buf(dispatch.input_buffers[2]), // W_proj
+                            bias: buf(dispatch.input_buffers[1]),  // W_norm
                             dst: buf(dispatch.output_buffer),
                             params: MatMulParams {
                                 m: dispatch.params[0],

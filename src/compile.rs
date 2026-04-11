@@ -1983,9 +1983,10 @@ impl<'a> Compiler<'a> {
             }
 
             Op::FusedRmsNormMatMul { eps } => {
-                // Two-phase: rsqrt precompute + matmul with normalized A-staging.
-                // Phase 1: RmsNormRsqrt computes rsqrt[M] (fast, 256-thread cooperative)
-                // Phase 2: MatMul reads rsqrt during A-staging (eligible for coop)
+                // Single dispatch: coop matmul with subgroup-cooperative rsqrt prologue.
+                // The coop shader (matmul_rms_norm_coop.wgsl) computes rsqrt using
+                // subgroupAdd in the prologue (no workgroup barriers needed), then
+                // applies normalization during the A-staging phase with tensor cores.
                 let x = self.get_buffer(node.inputs[0]);
                 let w_norm = self.get_buffer(node.inputs[1]);
                 let w_proj = self.get_buffer(node.inputs[2]);
@@ -1995,30 +1996,15 @@ impl<'a> Compiler<'a> {
                 let k = x_shape[1] as u32;
                 let n = w_proj_shape[1] as u32;
 
-                // Allocate rsqrt buffer: M floats
-                let rsqrt_buf = self.alloc_buffer((m as usize) * 4);
-
-                // Phase 1: rsqrt precompute
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::RmsNormRsqrt,
-                    workgroups: [m, 1, 1],
-                    input_buffers: vec![x],
-                    output_buffer: rsqrt_buf,
-                    extra_outputs: vec![],
-                    params: vec![m, k, eps.to_bits(), 0],
-                    use_coop: false,
-                    use_small_tiles: false,
-                    ..Default::default()
-                });
-
-                // Phase 2: matmul with normalization during A-staging.
-                // input_buffers: [x, w_proj, rsqrt_buf, w_norm]
-                // The coop selection pass will mark this for coop if eligible,
-                // using FusedRmsNormMatMulCoop shader group.
+                // Single fused dispatch: rsqrt prologue + coop matmul
+                // input_buffers: [x, w_proj, w_norm] for scalar path
+                //                [x, w_proj, (unused), w_norm] for coop path
+                // The coop selection will mark this for coop and the runtime
+                // binds FusedRmsNormMatMulCoopData with rsqrt_cache in shared mem.
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::FusedRmsNormMatMul,
                     workgroups: [n.div_ceil(64), m.div_ceil(64), 1],
-                    input_buffers: vec![x, w_proj, rsqrt_buf, w_norm],
+                    input_buffers: vec![x, w_norm, w_proj],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![m, n, k, eps.to_bits()],
