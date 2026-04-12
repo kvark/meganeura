@@ -70,6 +70,7 @@ struct MatMulData {
 
 // fused_rms_norm_matmul_coop: var matrix_a, matrix_b, rsqrt_buf, w_norm, matrix_c, params
 #[derive(blade_macros::ShaderData)]
+#[allow(unused)] // Coop path is currently disabled
 struct FusedRmsNormMatMulCoopData {
     matrix_a: blade_graphics::BufferPiece,
     matrix_b: blade_graphics::BufferPiece,
@@ -2194,7 +2195,7 @@ impl Session {
                 {
                     // Both scalar and coop paths use FourBufData layout:
                     // src_a=X, src_b=W_proj, bias=W_norm, dst=output
-                    // Coop variant: rsqrt computed in shared memory via subgroupAdd
+                    // Coop variant: rsqrt computed via workgroup tree reduction
                     // input_buffers: [x, w_norm, w_proj]
                     pc.bind(
                         0,

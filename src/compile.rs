@@ -1983,10 +1983,10 @@ impl<'a> Compiler<'a> {
             }
 
             Op::FusedRmsNormMatMul { eps } => {
-                // Single dispatch: coop matmul with subgroup-cooperative rsqrt prologue.
+                // Single dispatch: coop matmul with cooperative rsqrt prologue.
                 // The coop shader (matmul_rms_norm_coop.wgsl) computes rsqrt using
-                // subgroupAdd in the prologue (no workgroup barriers needed), then
-                // applies normalization during the A-staging phase with tensor cores.
+                // 64-thread tree reduction in the prologue, then applies normalization
+                // during the A-staging phase with tensor cores.
                 let x = self.get_buffer(node.inputs[0]);
                 let w_norm = self.get_buffer(node.inputs[1]);
                 let w_proj = self.get_buffer(node.inputs[2]);

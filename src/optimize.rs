@@ -508,12 +508,12 @@ fn rebuild_graph_from_extractions(
         apply_silu_fusions(&mut graph, &mut fusions);
         apply_swiglu_fusions(&mut graph, &mut fusions);
         apply_swiglu_concat_fusions(&mut graph, &mut fusions);
-        // RmsNorm+MatMul fusion: saves 24 barriers (~0.72ms) but the fused
-        // kernel loses cooperative matrix (tensor cores). The scalar fused
-        // path is ~0.9ms slower than coop on NVIDIA, netting a regression.
-        // The coop variant's 64-thread rsqrt prologue is also too slow.
-        // Needs a 2-phase approach: precompute rsqrt in a separate dispatch,
-        // then fuse the normalized staging into the coop matmul.
+        // RmsNorm+MatMul fusion: saves 24 barriers but the coop variant's
+        // 64-thread tree-reduction rsqrt prologue makes the fused kernel ~57%
+        // slower than separate RmsNorm + coop MatMul, roughly breaking even.
+        // Subgroup ops (subgroupAdd) would fix this but NVIDIA's driver
+        // crashes when combining subgroup + cooperative matrix capabilities
+        // in the same SPIR-V module: https://github.com/kvark/blade/issues/333
         // apply_rms_norm_matmul_fusions(&mut graph, &mut fusions);
         // apply_rope_attention_fusions(&mut graph, &mut fusions);
         if fusions.len() == n {

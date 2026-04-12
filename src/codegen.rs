@@ -1033,7 +1033,7 @@ fn gen_fused_rms_norm_matmul_coop() -> ShaderModule {
 
 fn gen_fused_rms_norm_matmul_coop_wgsl(config: &CoopConfig) -> ShaderModule {
     // Use the standalone matmul_rms_norm_coop.wgsl which has:
-    // - subgroup-cooperative rsqrt prologue (subgroupAdd)
+    // - 64-thread cooperative rsqrt prologue (tree reduction)
     // - on-the-fly normalization during A-staging
     // - FourBufData-compatible globals (src_a, src_b, bias, dst)
     let tile = config.tile_size;
