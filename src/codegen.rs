@@ -235,6 +235,7 @@ pub enum ShaderGroup {
     SwiGLUConcat,
     SumRows,
     RmsNormGrad,
+    LayerNormGrad,
     ScatterAdd,
     BceLoss,
     FusedRmsNormMatMul,
@@ -309,6 +310,7 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::SwiGLUConcat => parse_wgsl(include_str!("shaders/swiglu_concat.wgsl")),
         ShaderGroup::SumRows => parse_wgsl(include_str!("shaders/sum_rows.wgsl")),
         ShaderGroup::RmsNormGrad => parse_wgsl(include_str!("shaders/rms_norm_grad.wgsl")),
+        ShaderGroup::LayerNormGrad => parse_wgsl(include_str!("shaders/layer_norm_grad.wgsl")),
         ShaderGroup::FusedRmsNormMatMul => parse_wgsl(include_str!("shaders/matmul_rms_norm.wgsl")),
         ShaderGroup::RmsNormRsqrt => parse_wgsl(include_str!("shaders/rms_norm_rsqrt.wgsl")),
         // Coop groups must use generate_coop_module(), not generate_module()
@@ -1457,6 +1459,9 @@ mod tests {
                 ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => {
                     vec!["src_a", "src_b", "bias", "dst", "params"]
                 }
+                ShaderEntry::LayerNormGradWB | ShaderEntry::LayerNormGradX => {
+                    vec!["src_a", "src_b", "bias", "dst", "params"]
+                }
                 ShaderEntry::RmsNormRsqrt => vec!["src", "dst", "params"],
                 ShaderEntry::FusedRmsNormMatMul => {
                     vec!["src_a", "src_b", "bias", "dst", "params"]
@@ -1547,6 +1552,8 @@ mod tests {
             ShaderEntry::SiluGrad,
             ShaderEntry::RmsNormGradW,
             ShaderEntry::RmsNormGradX,
+            ShaderEntry::LayerNormGradWB,
+            ShaderEntry::LayerNormGradX,
             ShaderEntry::RmsNormRsqrt,
             ShaderEntry::FusedRmsNormMatMul,
             ShaderEntry::AdamUpdate,

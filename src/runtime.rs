@@ -795,6 +795,7 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::SwiGLUGradGate => TernaryData::layout(),
         ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => BinaryData::layout(),
         ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => FourBufData::layout(),
+        ShaderEntry::LayerNormGradWB | ShaderEntry::LayerNormGradX => FourBufData::layout(),
         ShaderEntry::FusedRmsNormMatMul => FourBufData::layout(),
         ShaderEntry::RmsNormRsqrt => UnaryData::layout(),
         ShaderEntry::GroupNorm | ShaderEntry::GroupNormSilu => GroupNormData::layout(),
@@ -2176,6 +2177,23 @@ impl Session {
                 );
             }
             ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => {
+                pc.bind(
+                    0,
+                    &FourBufData {
+                        src_a: buf(dispatch.input_buffers[0]), // dy
+                        src_b: buf(dispatch.input_buffers[1]), // x
+                        bias: buf(dispatch.input_buffers[2]),  // w
+                        dst: buf(dispatch.output_buffer),
+                        params: MatMulParams {
+                            m: dispatch.params[0], // rows
+                            n: dispatch.params[1], // cols
+                            k: dispatch.params[2], // eps_bits
+                            _pad: dispatch.params[3],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::LayerNormGradWB | ShaderEntry::LayerNormGradX => {
                 pc.bind(
                     0,
                     &FourBufData {

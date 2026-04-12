@@ -290,6 +290,8 @@ fn graph_to_egglog(graph: &Graph) -> String {
   (SwiGLUConcatGrad Op Op)
   (RmsNormGradW Op Op Op)
   (RmsNormGradX Op Op Op)
+  (LayerNormGradWB Op Op Op)
+  (LayerNormGradX Op Op Op)
   (MHAGradQ Op Op Op Op)
   (MHAGradK Op Op Op Op)
   (MHAGradV Op Op Op Op)
@@ -419,6 +421,8 @@ fn node_to_egglog_expr(node: &Node) -> String {
         Op::SwiGLUConcatGrad => format!("(SwiGLUConcatGrad n{} n{})", i[0], i[1]),
         Op::RmsNormGradW { .. } => format!("(RmsNormGradW n{} n{} n{})", i[0], i[1], i[2]),
         Op::RmsNormGradX { .. } => format!("(RmsNormGradX n{} n{} n{})", i[0], i[1], i[2]),
+        Op::LayerNormGradWB { .. } => format!("(LayerNormGradWB n{} n{} n{})", i[0], i[1], i[2]),
+        Op::LayerNormGradX { .. } => format!("(LayerNormGradX n{} n{} n{})", i[0], i[1], i[2]),
         Op::MultiHeadAttnGradQ { .. } => {
             format!("(MHAGradQ n{} n{} n{} n{})", i[0], i[1], i[2], i[3])
         }

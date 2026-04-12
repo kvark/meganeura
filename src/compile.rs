@@ -57,6 +57,8 @@ pub enum ShaderEntry {
     SumRows,
     RmsNormGradW,
     RmsNormGradX,
+    LayerNormGradWB,
+    LayerNormGradX,
     FusedRmsNormMatMul,
     /// Precompute rsqrt for RmsNorm (phase 1 of two-phase fusion)
     RmsNormRsqrt,
@@ -137,6 +139,9 @@ impl ShaderEntry {
             ShaderEntry::SwiGLUConcat | ShaderEntry::SwiGLUConcatGrad => ShaderGroup::SwiGLUConcat,
             ShaderEntry::SumRows => ShaderGroup::SumRows,
             ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => ShaderGroup::RmsNormGrad,
+            ShaderEntry::LayerNormGradWB | ShaderEntry::LayerNormGradX => {
+                ShaderGroup::LayerNormGrad
+            }
             ShaderEntry::FusedRmsNormMatMul => ShaderGroup::FusedRmsNormMatMul,
             ShaderEntry::RmsNormRsqrt => ShaderGroup::RmsNormRsqrt,
             ShaderEntry::GroupNorm => ShaderGroup::GroupNorm,
@@ -219,6 +224,8 @@ impl ShaderEntry {
             ShaderEntry::SumRows => "sum_rows",
             ShaderEntry::RmsNormGradW => "rms_norm_grad_w",
             ShaderEntry::RmsNormGradX => "rms_norm_grad_x",
+            ShaderEntry::LayerNormGradWB => "layer_norm_grad_wb",
+            ShaderEntry::LayerNormGradX => "layer_norm_grad_x",
             ShaderEntry::FusedRmsNormMatMul => "main",
             ShaderEntry::RmsNormRsqrt => "main",
             ShaderEntry::GroupNorm | ShaderEntry::GroupNormSilu => "main",
@@ -610,7 +617,11 @@ impl<'a> Compiler<'a> {
                         d.shader, d.params[0], d.params[1], nh, nkv
                     )
                 }
-                ShaderEntry::RmsNorm | ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => {
+                ShaderEntry::RmsNorm
+                | ShaderEntry::RmsNormGradW
+                | ShaderEntry::RmsNormGradX
+                | ShaderEntry::LayerNormGradWB
+                | ShaderEntry::LayerNormGradX => {
                     format!("{:?}[{}x{}]", d.shader, d.params[0], d.params[1])
                 }
                 ShaderEntry::FusedRmsNormMatMul => {
@@ -2075,6 +2086,46 @@ impl<'a> Compiler<'a> {
                     ..Default::default()
                 });
             }
+
+            Op::LayerNormGradWB { eps } => {
+                let dy = self.get_buffer(node.inputs[0]);
+                let x = self.get_buffer(node.inputs[1]);
+                let w = self.get_buffer(node.inputs[2]);
+                let x_shape = &self.graph.node(node.inputs[1]).ty.shape;
+                let rows = x_shape[0] as u32;
+                let cols = x_shape[1] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::LayerNormGradWB,
+                    workgroups: [cols, 1, 1],
+                    input_buffers: vec![dy, x, w],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![rows, cols, eps.to_bits(), 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
+            Op::LayerNormGradX { eps } => {
+                let dy = self.get_buffer(node.inputs[0]);
+                let x = self.get_buffer(node.inputs[1]);
+                let w = self.get_buffer(node.inputs[2]);
+                let x_shape = &self.graph.node(node.inputs[1]).ty.shape;
+                let rows = x_shape[0] as u32;
+                let cols = x_shape[1] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::LayerNormGradX,
+                    workgroups: [rows, 1, 1],
+                    input_buffers: vec![dy, x, w],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![rows, cols, eps.to_bits(), 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
         }
     }
 
@@ -2384,6 +2435,8 @@ mod tests {
             ShaderEntry::SiluGrad,
             ShaderEntry::RmsNormGradW,
             ShaderEntry::RmsNormGradX,
+            ShaderEntry::LayerNormGradWB,
+            ShaderEntry::LayerNormGradX,
             ShaderEntry::FusedRmsNormMatMul,
         ];
         for entry in &entries {
