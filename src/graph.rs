@@ -337,6 +337,12 @@ pub enum Op {
         channels: u32,
         spatial: u32, // H * W
     },
+    /// Backward of GlobalAvgPool: broadcast grad_output[batch*channels] → [batch*channels*spatial]
+    /// then divide by spatial.
+    GlobalAvgPoolGrad {
+        channels: u32,
+        spatial: u32,
+    },
 
     // --- GroupNorm ---
 

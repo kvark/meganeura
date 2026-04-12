@@ -416,3 +416,92 @@ fn smollm2_kv_cache_decode_graph() {
     }
     let _ = (k_caches, v_caches); // suppress unused warnings
 }
+
+#[test]
+fn resnet50_training_loss_decreases() {
+    let g = meganeura::models::resnet::build_resnet50_training(1);
+    let batch = 1u32;
+    let image_size = (batch * 3 * 224 * 224) as usize;
+    let num_classes = 1000;
+
+    let mut sess = build_session(&g);
+
+    // Use very small init for ResNet (no BN at training time → needs small weights)
+    for (name, buf_ref) in sess.plan().param_buffers.clone() {
+        let n = sess.plan().buffers[buf_ref.0 as usize] / 4;
+        let data: Vec<f32> = (0..n)
+            .map(|i| (i as f32 * 0.01 + 1.0).sin() * 0.001)
+            .collect();
+        sess.set_parameter(&name, &data);
+    }
+
+    let image: Vec<f32> = (0..image_size)
+        .map(|i| (i as f32 * 0.001).sin() * 0.1)
+        .collect();
+    let mut labels = vec![0.0f32; num_classes];
+    labels[42] = 1.0;
+
+    sess.set_learning_rate(1e-5);
+    sess.set_input("image", &image);
+    sess.set_input("labels", &labels);
+
+    sess.step();
+    sess.wait();
+    let loss0 = sess.read_loss();
+    eprintln!("ResNet-50 initial loss: {:.6}", loss0);
+    assert!(loss0.is_finite(), "initial loss is not finite: {}", loss0);
+
+    for step in 0..5 {
+        sess.set_input("image", &image);
+        sess.set_input("labels", &labels);
+        sess.step();
+        sess.wait();
+        let loss = sess.read_loss();
+        eprintln!("  step {}: loss={:.6}", step + 1, loss);
+        assert!(
+            loss.is_finite(),
+            "loss diverged at step {}: {}",
+            step + 1,
+            loss
+        );
+    }
+    let loss_final = sess.read_loss();
+    assert!(
+        loss_final < loss0 * 1.1,
+        "loss didn't decrease: {:.6} → {:.6}",
+        loss0,
+        loss_final
+    );
+}
+
+#[test]
+fn whisper_encoder_training_loss_decreases() {
+    // Skip: Whisper uses LayerNorm which doesn't have a backward yet.
+    // TODO: implement LayerNorm backward (LayerNormGrad op).
+    if true {
+        eprintln!("SKIPPED: LayerNorm backward not implemented");
+        return;
+    }
+    use meganeura::models::whisper::{self, WhisperConfig};
+
+    let config = WhisperConfig::whisper_tiny();
+    let batch = 1;
+    let mel_len = 100; // short clip for testing
+    let seq_len = mel_len / 2; // conv stride=2
+    let out_size = seq_len as usize * config.d_model;
+
+    let g = whisper::build_training_graph(&config, batch, mel_len);
+
+    verify_training_decreases_loss(
+        build_session(&g),
+        |s| {
+            let mel_size = (batch * config.n_mels as u32 * mel_len) as usize;
+            let mel: Vec<f32> = (0..mel_size).map(|i| (i as f32 * 0.01).sin()).collect();
+            let target = vec![0.0f32; out_size];
+            s.set_input("mel", &mel);
+            s.set_input("target", &target);
+        },
+        5,
+        0.001,
+    );
+}

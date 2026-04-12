@@ -817,6 +817,7 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::CachedAttention => CachedAttentionData::layout(),
         ShaderEntry::MaxPool2d => MaxPool2dData::layout(),
         ShaderEntry::GlobalAvgPool => GlobalAvgPoolData::layout(),
+        ShaderEntry::GlobalAvgPoolGrad => UnaryData::layout(),
     }
 }
 
@@ -2532,6 +2533,22 @@ impl Session {
                             spatial: dispatch.params[1],
                             total_out: dispatch.params[2],
                             _pad: dispatch.params[3],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::GlobalAvgPoolGrad => {
+                let p = &dispatch.params;
+                pc.bind(
+                    0,
+                    &UnaryData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: UnaryParams {
+                            len: p[0],
+                            _pad0: p[1],
+                            _pad1: p[2],
+                            _pad2: p[3],
                         },
                     },
                 );

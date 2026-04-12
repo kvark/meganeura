@@ -169,6 +169,27 @@ pub fn build_encoder(g: &mut Graph, config: &WhisperConfig, batch: u32, mel_len:
     g.layer_norm(x, final_ln_w, final_ln_b, config.layer_norm_eps)
 }
 
+/// Build a Whisper encoder training graph (forward + MSE loss on encoder output).
+///
+/// This is a simplified training setup: the encoder output is projected to a
+/// fixed dimension and compared against a target via MSE loss. Useful for
+/// fine-tuning or benchmarking training throughput.
+pub fn build_training_graph(config: &WhisperConfig, batch: u32, mel_len: u32) -> Graph {
+    let mut g = Graph::new();
+    let encoder_out = build_encoder(&mut g, config, batch, mel_len);
+    // MSE loss against zero target (simple benchmark loss)
+    let seq_len = mel_len / 2; // conv stride=2
+    let _out_size = (batch * seq_len) as usize * config.d_model;
+    let seq_len_usize = seq_len as usize;
+    let target = g.input("target", &[seq_len_usize, config.d_model]);
+    let neg_target = g.neg(target);
+    let diff = g.add(encoder_out, neg_target);
+    let sq = g.mul(diff, diff);
+    let loss = g.mean_all(sq);
+    g.set_outputs(vec![loss]);
+    g
+}
+
 /// Names of parameters that need transposing when loaded from HuggingFace.
 ///
 /// HuggingFace stores Linear weights as `[out, in]`; meganeura expects `[in, out]`.

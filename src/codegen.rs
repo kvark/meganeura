@@ -262,6 +262,7 @@ pub enum ShaderGroup {
     RoPEDynamic,
     MaxPool2d,
     GlobalAvgPool,
+    GlobalAvgPoolGrad,
 }
 
 /// Generate a `naga::Module` for a shader group.
@@ -348,6 +349,9 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::RoPEDynamic => parse_wgsl(include_str!("shaders/rope_dynamic.wgsl")),
         ShaderGroup::MaxPool2d => parse_wgsl(include_str!("shaders/max_pool_2d.wgsl")),
         ShaderGroup::GlobalAvgPool => parse_wgsl(include_str!("shaders/global_avg_pool.wgsl")),
+        ShaderGroup::GlobalAvgPoolGrad => {
+            parse_wgsl(include_str!("shaders/global_avg_pool_grad.wgsl"))
+        }
     }
 }
 
@@ -1184,6 +1188,10 @@ mod tests {
                 ShaderGroup::FusedRmsNormMatMul,
                 naga::valid::Capabilities::empty(),
             ),
+            (
+                ShaderGroup::GlobalAvgPoolGrad,
+                naga::valid::Capabilities::empty(),
+            ),
         ];
 
         let flags = naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
@@ -1304,6 +1312,7 @@ mod tests {
             (ShaderGroup::ScatterAdd, empty),
             (ShaderGroup::BceLoss, empty),
             (ShaderGroup::FusedRmsNormMatMul, empty),
+            (ShaderGroup::GlobalAvgPoolGrad, empty),
         ];
 
         let flags = naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
@@ -1485,9 +1494,9 @@ mod tests {
                     vec!["grad_out", "src", "dst", "params"]
                 }
                 ShaderEntry::RoPEDynamic => vec!["src", "dst", "pos_offset_buf", "params"],
-                ShaderEntry::MaxPool2d | ShaderEntry::GlobalAvgPool => {
-                    vec!["src", "dst", "params"]
-                }
+                ShaderEntry::MaxPool2d
+                | ShaderEntry::GlobalAvgPool
+                | ShaderEntry::GlobalAvgPoolGrad => vec!["src", "dst", "params"],
             }
         }
 
@@ -1563,6 +1572,7 @@ mod tests {
             ShaderEntry::RoPEDynamic,
             ShaderEntry::MaxPool2d,
             ShaderEntry::GlobalAvgPool,
+            ShaderEntry::GlobalAvgPoolGrad,
         ];
 
         for entry in &entries {

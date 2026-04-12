@@ -279,6 +279,7 @@ fn graph_to_egglog(graph: &Graph) -> String {
   (Conv2dGradWeight Op Op)
   (MaxPool2d Op)
   (GlobalAvgPool Op)
+  (GlobalAvgPoolGrad Op)
   ; --- KV cache ops ---
   (CacheWrite Op Op Op)
   (CachedAttention Op Op Op Op)
@@ -458,6 +459,7 @@ fn node_to_egglog_expr(node: &Node) -> String {
         Op::Conv2dGradWeight { .. } => format!("(Conv2dGradWeight n{} n{})", i[0], i[1]),
         Op::MaxPool2d { .. } => format!("(MaxPool2d n{})", i[0]),
         Op::GlobalAvgPool { .. } => format!("(GlobalAvgPool n{})", i[0]),
+        Op::GlobalAvgPoolGrad { .. } => format!("(GlobalAvgPoolGrad n{})", i[0]),
         Op::CacheWrite => format!("(CacheWrite n{} n{} n{})", i[0], i[1], i[2]),
         Op::CachedAttention { .. } => {
             format!("(CachedAttention n{} n{} n{} n{})", i[0], i[1], i[2], i[3])
