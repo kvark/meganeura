@@ -10,7 +10,6 @@
 
 $ENABLE_F16
 enable wgpu_cooperative_matrix;
-enable subgroups;
 
 struct Params {
     m: u32,
@@ -40,11 +39,9 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let k = params.k;
     let eps = bitcast<f32>(params.eps_bits);
 
-    // --- Prologue: precompute rsqrt using subgroup cooperative reduction ---
-    // All 64 threads cooperate on each row. With 2 subgroups (NVIDIA: sg=32),
-    // each subgroup reduces via subgroupAdd, then we combine via shared memory.
-    // Temp storage: reuse shared_b0[0..1] for the 2 subgroup partial sums.
-    let sg_id = lid.x / 32u; // 0 or 1 for NVIDIA (64-thread WG, sg=32)
+    // --- Prologue: precompute rsqrt using 64-thread cooperative reduction ---
+    // All 64 threads cooperate on each row: each sums a stride, then
+    // tree-reduce via shared_b0 (reused as temp). 6 barriers per row.
     for (var row_off = 0u; row_off < $OUTPUT_TILE_U; row_off++) {
         let row = tile_row + row_off;
         var ss = 0.0;
@@ -57,14 +54,19 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
                 j += 64u;
             }
         }
-        // Reduce within each subgroup
-        let sg_sum = subgroupAdd(ss);
-        // Each subgroup's first thread writes to a distinct slot
-        if lid.x % 32u == 0u {
-            shared_b0[sg_id] = $CAST_OPEN sg_sum $CAST_CLOSE;
-        }
+        // Tree reduction across 64 threads using shared_b0 as temp
+        shared_b0[lid.x] = $CAST_OPEN ss $CAST_CLOSE;
         workgroupBarrier();
-        // Thread 0 combines the subgroup sums
+        if lid.x < 32u { shared_b0[lid.x] = $CAST_OPEN f32(shared_b0[lid.x]) + f32(shared_b0[lid.x + 32u]) $CAST_CLOSE; }
+        workgroupBarrier();
+        if lid.x < 16u { shared_b0[lid.x] = $CAST_OPEN f32(shared_b0[lid.x]) + f32(shared_b0[lid.x + 16u]) $CAST_CLOSE; }
+        workgroupBarrier();
+        if lid.x < 8u { shared_b0[lid.x] = $CAST_OPEN f32(shared_b0[lid.x]) + f32(shared_b0[lid.x + 8u]) $CAST_CLOSE; }
+        workgroupBarrier();
+        if lid.x < 4u { shared_b0[lid.x] = $CAST_OPEN f32(shared_b0[lid.x]) + f32(shared_b0[lid.x + 4u]) $CAST_CLOSE; }
+        workgroupBarrier();
+        if lid.x < 2u { shared_b0[lid.x] = $CAST_OPEN f32(shared_b0[lid.x]) + f32(shared_b0[lid.x + 2u]) $CAST_CLOSE; }
+        workgroupBarrier();
         if lid.x == 0u {
             let total = f32(shared_b0[0u]) + f32(shared_b0[1u]);
             if row < m {
