@@ -84,6 +84,7 @@ pub enum ShaderEntry {
     RoPEDynamic,
     MaxPool2d,
     GlobalAvgPool,
+    GlobalAvgPoolGrad,
 }
 
 impl ShaderEntry {
@@ -161,6 +162,7 @@ impl ShaderEntry {
             ShaderEntry::RoPEDynamic => ShaderGroup::RoPEDynamic,
             ShaderEntry::MaxPool2d => ShaderGroup::MaxPool2d,
             ShaderEntry::GlobalAvgPool => ShaderGroup::GlobalAvgPool,
+            ShaderEntry::GlobalAvgPoolGrad => ShaderGroup::GlobalAvgPoolGrad,
         }
     }
 
@@ -241,6 +243,7 @@ impl ShaderEntry {
             ShaderEntry::RoPEDynamic => "main",
             ShaderEntry::MaxPool2d => "max_pool_2d",
             ShaderEntry::GlobalAvgPool => "global_avg_pool",
+            ShaderEntry::GlobalAvgPoolGrad => "main",
         }
     }
 }
@@ -1676,6 +1679,25 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![channels, spatial, total_out, 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
+            Op::GlobalAvgPoolGrad {
+                channels: _,
+                spatial,
+            } => {
+                let grad_output = self.get_buffer(node.inputs[0]);
+                let total = node.ty.num_elements() as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::GlobalAvgPoolGrad,
+                    workgroups: [total.div_ceil(256), 1, 1],
+                    input_buffers: vec![grad_output],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![total, spatial, 0, 0],
                     use_coop: false,
                     use_small_tiles: false,
                     ..Default::default()

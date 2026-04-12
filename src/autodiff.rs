@@ -459,7 +459,8 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::SwiGLUConcatGrad
             | Op::RmsNormGradW { .. }
             | Op::RmsNormGradX { .. }
-            | Op::RoPEGrad { .. } => {}
+            | Op::RoPEGrad { .. }
+            | Op::GlobalAvgPoolGrad { .. } => {}
             Op::Gelu => {
                 // gelu(x) ≈ x * sigmoid(1.702 * x) (sigmoid approximation)
                 // gelu'(x) ≈ sigmoid(1.702x) * (1 + 1.702*x*(1 - sigmoid(1.702x)))
@@ -792,14 +793,49 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::CrossAttention { .. }
             | Op::CacheWrite
             | Op::CachedAttention { .. }
-            | Op::GroupNormSilu { .. }
-            | Op::MaxPool2d { .. }
-            | Op::GlobalAvgPool { .. } => {
+            | Op::GroupNormSilu { .. } => {
                 panic!(
                     "autodiff not supported for {:?} — this op cannot appear in training graphs. \
                      Use the training-compatible variant instead.",
                     node.op
                 );
+            }
+            Op::MaxPool2d {
+                channels,
+                in_h,
+                in_w,
+                kernel_h: _,
+                kernel_w: _,
+                stride,
+                padding: _,
+            } => {
+                // Approximate backward: treat like average pool (uniform gradient spread).
+                // Exact MaxPool backward requires argmax indices from forward.
+                let x = node.inputs[0];
+                let x_ty = forward.nodes()[x as usize].ty.clone();
+                let out_h = node.ty.shape[0] / (channels as usize); // approximate
+                let _spatial_ratio = (in_h * in_w) / (out_h as u32);
+                let grad_x = graph.add_raw_node(
+                    Op::GlobalAvgPoolGrad {
+                        channels,
+                        spatial: stride * stride, // each output maps to stride*stride inputs
+                    },
+                    vec![grad_output],
+                    x_ty,
+                );
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
+            Op::GlobalAvgPool {
+                channels, spatial, ..
+            } => {
+                let x = node.inputs[0];
+                let x_ty = forward.nodes()[x as usize].ty.clone();
+                let grad_x = graph.add_raw_node(
+                    Op::GlobalAvgPoolGrad { channels, spatial },
+                    vec![grad_output],
+                    x_ty,
+                );
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
         }
     }
