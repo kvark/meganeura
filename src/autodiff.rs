@@ -459,6 +459,8 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::SwiGLUConcatGrad
             | Op::RmsNormGradW { .. }
             | Op::RmsNormGradX { .. }
+            | Op::LayerNormGradWB { .. }
+            | Op::LayerNormGradX { .. }
             | Op::RoPEGrad { .. }
             | Op::GlobalAvgPoolGrad { .. } => {}
             Op::Gelu => {
@@ -787,10 +789,78 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 accumulate_grad(&mut graph, &mut grads, k, grad_k);
                 accumulate_grad(&mut graph, &mut grads, v, grad_v);
             }
+            Op::LayerNorm { eps } => {
+                let x = node.inputs[0];
+                let w = node.inputs[1];
+                let b = node.inputs[2];
+                let cols = forward.nodes()[w as usize].ty.shape[0] as u32;
+                // grad_wb = LayerNormGradWB(dy, x, w) → [2*cols]
+                let grad_wb = graph.layer_norm_grad_wb(grad_output, x, w, eps);
+                // Split into grad_w [0..cols] and grad_b [cols..2*cols]
+                let grad_w = graph.split_a(grad_wb, 1, cols, cols, 1);
+                let grad_b = graph.split_b(grad_wb, 1, cols, cols, 1);
+                let grad_x = graph.layer_norm_grad_x(grad_output, x, w, eps);
+                accumulate_grad(&mut graph, &mut grads, w, grad_w);
+                accumulate_grad(&mut graph, &mut grads, b, grad_b);
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
+            Op::FullAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            } => {
+                // FullAttention is non-causal: attends to all positions.
+                // Backward is same as CausalAttention but kv_seq != 0.
+                let q_raw = node.inputs[0];
+                let k_raw = node.inputs[1];
+                let v = node.inputs[2];
+                let fwd_node = node.id;
+
+                let q_ty = forward.nodes()[q_raw as usize].ty.clone();
+                let k_ty = forward.nodes()[k_raw as usize].ty.clone();
+                let v_ty = forward.nodes()[v as usize].ty.clone();
+
+                let (q, k) = (q_raw, k_raw);
+
+                let grad_q = graph.add_raw_node(
+                    Op::MultiHeadAttnGradQ {
+                        fwd_node,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        is_cross: false,
+                    },
+                    vec![grad_output, q, k, v],
+                    q_ty.clone(),
+                );
+                let grad_k = graph.add_raw_node(
+                    Op::MultiHeadAttnGradK {
+                        fwd_node,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        is_cross: false,
+                    },
+                    vec![grad_output, q, k, v],
+                    k_ty.clone(),
+                );
+                let grad_v = graph.add_raw_node(
+                    Op::MultiHeadAttnGradV {
+                        fwd_node,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        is_cross: false,
+                    },
+                    vec![grad_output, q, k, v],
+                    v_ty,
+                );
+                accumulate_grad(&mut graph, &mut grads, q_raw, grad_q);
+                accumulate_grad(&mut graph, &mut grads, k_raw, grad_k);
+                accumulate_grad(&mut graph, &mut grads, v, grad_v);
+            }
             // Inference-only ops: should not appear in training graphs
-            Op::LayerNorm { .. }
-            | Op::FullAttention { .. }
-            | Op::CrossAttention { .. }
+            Op::CrossAttention { .. }
             | Op::CacheWrite
             | Op::CachedAttention { .. }
             | Op::GroupNormSilu { .. } => {

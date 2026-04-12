@@ -271,6 +271,17 @@ pub enum Op {
         eps: f32,
     },
 
+    // LayerNorm backward: grad_w and grad_bias (combined shader output [2*cols])
+    // inputs: [dy, x, w] → [2 * cols]  (first cols = grad_w, last cols = grad_b)
+    LayerNormGradWB {
+        eps: f32,
+    },
+    // LayerNorm backward: grad_x
+    // inputs: [dy, x, w] → [rows, cols]
+    LayerNormGradX {
+        eps: f32,
+    },
+
     // --- Conv2d ops ---
 
     // 2D convolution: input[N,C_in,H,W] * kernel[C_out,C_in,kH,kW] → output[N,C_out,oH,oW]
@@ -882,6 +893,17 @@ impl Graph {
     pub fn rms_norm_grad_x(&mut self, dy: NodeId, x: NodeId, w: NodeId, eps: f32) -> NodeId {
         let x_ty = self.node(x).ty.clone();
         self.add_raw_node(Op::RmsNormGradX { eps }, vec![dy, x, w], x_ty)
+    }
+
+    pub fn layer_norm_grad_wb(&mut self, dy: NodeId, x: NodeId, w: NodeId, eps: f32) -> NodeId {
+        let cols = self.node(w).ty.shape[0];
+        let ty = TensorType::f32(vec![2 * cols]);
+        self.add_raw_node(Op::LayerNormGradWB { eps }, vec![dy, x, w], ty)
+    }
+
+    pub fn layer_norm_grad_x(&mut self, dy: NodeId, x: NodeId, w: NodeId, eps: f32) -> NodeId {
+        let x_ty = self.node(x).ty.clone();
+        self.add_raw_node(Op::LayerNormGradX { eps }, vec![dy, x, w], x_ty)
     }
 
     pub fn input_u32(&mut self, name: &str, shape: &[usize]) -> NodeId {
