@@ -31,7 +31,6 @@ fn layer_norm_grad_wb(@builtin(global_invocation_id) gid: vec3<u32>) {
     if j >= cols { return; }
 
     var grad_w = 0.0;
-    var grad_b = 0.0;
 
     for (var i = 0u; i < rows; i++) {
         let offset = i * cols;
@@ -50,11 +49,9 @@ fn layer_norm_grad_wb(@builtin(global_invocation_id) gid: vec3<u32>) {
         let normed = (src_b[offset + j] - mean) * rstd;
 
         grad_w += src_a[offset + j] * normed;
-        grad_b += src_a[offset + j];
     }
 
     dst[j] = grad_w;
-    dst[cols + j] = grad_b;
 }
 
 // grad_x[i,j] = rstd * (dy[i,j]*w[j] - normed[i,j]*s_i - mean(dy*w)/cols)

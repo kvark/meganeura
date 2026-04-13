@@ -177,15 +177,14 @@ pub fn build_encoder(g: &mut Graph, config: &WhisperConfig, batch: u32, mel_len:
 pub fn build_training_graph(config: &WhisperConfig, batch: u32, mel_len: u32) -> Graph {
     let mut g = Graph::new();
     let encoder_out = build_encoder(&mut g, config, batch, mel_len);
-    // MSE loss against zero target (simple benchmark loss)
-    let seq_len = mel_len / 2; // conv stride=2
-    let _out_size = (batch * seq_len) as usize * config.d_model;
-    let seq_len_usize = seq_len as usize;
-    let target = g.input("target", &[seq_len_usize, config.d_model]);
-    let neg_target = g.neg(target);
-    let diff = g.add(encoder_out, neg_target);
-    let sq = g.mul(diff, diff);
-    let loss = g.mean_all(sq);
+    // Project encoder output to a small dimension, then cross-entropy loss.
+    // This exercises the full backward through attention + LayerNorm + GELU.
+    let seq_len = (mel_len / 2) as usize;
+    let num_classes = 64;
+    let proj_w = g.parameter("train_proj.weight", &[config.d_model, num_classes]);
+    let logits = g.matmul(encoder_out, proj_w); // [seq, num_classes]
+    let labels = g.input("labels", &[seq_len, num_classes]);
+    let loss = g.cross_entropy_loss(logits, labels);
     g.set_outputs(vec![loss]);
     g
 }

@@ -111,6 +111,9 @@ pub enum Op {
 
     // Dead node (consumed by fusion, skip during compilation)
     Nop,
+    /// Identity / reshape: zero-cost view with potentially different shape.
+    /// Compiled as buffer alias (no GPU dispatch). Backward reshapes grad back.
+    Identity,
 
     // Log-softmax (for numerical stability)
     LogSoftmax,
@@ -774,8 +777,9 @@ impl Graph {
             old_elems, new_elems,
             "reshape: element count mismatch ({old_elems} vs {new_elems})"
         );
-        let zero = self.constant(vec![0.0; new_elems], new_shape);
-        self.add_raw_node(Op::Add, vec![x, zero], TensorType::f32(new_shape.to_vec()))
+        // Reshape is a zero-cost view — just reinterprets the shape.
+        // Uses Identity op (compiled as buffer alias, no GPU dispatch).
+        self.add_raw_node(Op::Identity, vec![x], TensorType::f32(new_shape.to_vec()))
     }
 
     /// Element-wise division: `a / b` = `a * recip(b)`.
@@ -896,9 +900,8 @@ impl Graph {
     }
 
     pub fn layer_norm_grad_wb(&mut self, dy: NodeId, x: NodeId, w: NodeId, eps: f32) -> NodeId {
-        let cols = self.node(w).ty.shape[0];
-        let ty = TensorType::f32(vec![2 * cols]);
-        self.add_raw_node(Op::LayerNormGradWB { eps }, vec![dy, x, w], ty)
+        let w_ty = self.node(w).ty.clone();
+        self.add_raw_node(Op::LayerNormGradWB { eps }, vec![dy, x, w], w_ty)
     }
 
     pub fn layer_norm_grad_x(&mut self, dy: NodeId, x: NodeId, w: NodeId, eps: f32) -> NodeId {

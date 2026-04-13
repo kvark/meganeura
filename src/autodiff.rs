@@ -449,6 +449,13 @@ pub fn differentiate(forward: &Graph) -> Graph {
             // Leaf nodes
             Op::Input { .. } | Op::Parameter { .. } | Op::Constant { .. } | Op::Greater => {}
             Op::Nop => {}
+            Op::Identity => {
+                // Identity/reshape backward: reshape gradient back to input shape
+                let x = node.inputs[0];
+                let x_ty = forward.nodes()[x as usize].ty.clone();
+                let grad_x = graph.add_raw_node(Op::Identity, vec![grad_output], x_ty);
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
             // Backward grad ops: never appear in forward pass
             Op::MultiHeadAttnGradQ { .. }
             | Op::MultiHeadAttnGradK { .. }
@@ -464,6 +471,12 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::RoPEGrad { .. }
             | Op::GlobalAvgPoolGrad { .. } => {}
             Op::Gelu => {
+                eprintln!(
+                    "GELU backward: x={} x_shape={:?} grad_output_id={}",
+                    node.inputs[0],
+                    forward.nodes()[node.inputs[0] as usize].ty.shape,
+                    grad_output
+                );
                 // gelu(x) ≈ x * sigmoid(1.702 * x) (sigmoid approximation)
                 // gelu'(x) ≈ sigmoid(1.702x) * (1 + 1.702*x*(1 - sigmoid(1.702x)))
                 let x = node.inputs[0];
@@ -793,16 +806,18 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let x = node.inputs[0];
                 let w = node.inputs[1];
                 let b = node.inputs[2];
-                let cols = forward.nodes()[w as usize].ty.shape[0] as u32;
-                // grad_wb = LayerNormGradWB(dy, x, w) → [2*cols]
-                let grad_wb = graph.layer_norm_grad_wb(grad_output, x, w, eps);
-                // Split into grad_w [0..cols] and grad_b [cols..2*cols]
-                let grad_w = graph.split_a(grad_wb, 1, cols, cols, 1);
-                let grad_b = graph.split_b(grad_wb, 1, cols, cols, 1);
+                let w_ty = forward.nodes()[w as usize].ty.clone();
+                let b_ty = forward.nodes()[b as usize].ty.clone();
+                // grad_weight via dedicated LayerNormGradWB shader
+                let grad_w = graph.layer_norm_grad_wb(grad_output, x, w, eps);
+                // grad_bias = sum_rows(dy) — sum over the row (batch) dimension
+                let grad_b = graph.sum_rows(grad_output, &b_ty);
+                // grad_input via LayerNormGradX
                 let grad_x = graph.layer_norm_grad_x(grad_output, x, w, eps);
                 accumulate_grad(&mut graph, &mut grads, w, grad_w);
                 accumulate_grad(&mut graph, &mut grads, b, grad_b);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
+                let _ = w_ty; // keep for future use
             }
             Op::FullAttention {
                 num_heads,

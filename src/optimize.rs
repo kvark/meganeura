@@ -240,6 +240,7 @@ fn graph_to_egglog(graph: &Graph) -> String {
   (ScatterAdd i64 Op Op)
   (Silu Op)
   (Gelu Op)
+  (Identity Op)
   ; --- Shape / reduction ---
   (Transpose Op)
   (Softmax Op)
@@ -469,6 +470,7 @@ fn node_to_egglog_expr(node: &Node) -> String {
             format!("(CachedAttention n{} n{} n{} n{})", i[0], i[1], i[2], i[3])
         }
         Op::Nop => unreachable!("Nop nodes are filtered before encoding"),
+        Op::Identity => format!("(Identity n{})", i[0]),
     }
 }
 

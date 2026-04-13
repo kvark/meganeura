@@ -548,6 +548,13 @@ impl<'a> Compiler<'a> {
     fn compile(&mut self) {
         // First pass: allocate buffers for all nodes
         for node in self.graph.nodes() {
+            // Identity is a zero-cost reshape: alias the input buffer
+            if matches!(node.op, Op::Identity) && !node.inputs.is_empty() {
+                if let Some(&input_buf) = self.node_buffers.get(&node.inputs[0]) {
+                    self.node_buffers.insert(node.id, input_buf);
+                    continue;
+                }
+            }
             let size = node.ty.size_bytes();
             let buf = self.alloc_buffer(size);
             self.node_buffers.insert(node.id, buf);
@@ -673,7 +680,11 @@ impl<'a> Compiler<'a> {
 
         match node.op {
             // Leaf nodes and dead nodes: no dispatch needed
-            Op::Input { .. } | Op::Parameter { .. } | Op::Constant { .. } | Op::Nop => {}
+            Op::Input { .. }
+            | Op::Parameter { .. }
+            | Op::Constant { .. }
+            | Op::Nop
+            | Op::Identity => {}
 
             Op::MatMul => {
                 let a = self.get_buffer(node.inputs[0]);

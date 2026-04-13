@@ -476,20 +476,13 @@ fn resnet50_training_loss_decreases() {
 
 #[test]
 fn whisper_encoder_training_loss_decreases() {
-    // Skip: FullAttention backward + LayerNormGradWB shape issues need debugging
-    eprintln!("SKIPPED: Whisper training backward needs shape debugging");
-    return;
-}
-
-#[allow(dead_code)]
-fn _whisper_encoder_training_loss_decreases() {
     use meganeura::models::whisper::{self, WhisperConfig};
 
     let config = WhisperConfig::whisper_tiny();
     let batch = 1;
     let mel_len = 100; // short clip for testing
-    let seq_len = mel_len / 2; // conv stride=2
-    let out_size = seq_len as usize * config.d_model;
+    let seq_len = (mel_len / 2) as usize;
+    let num_classes = 64;
 
     let g = whisper::build_training_graph(&config, batch, mel_len);
 
@@ -498,9 +491,12 @@ fn _whisper_encoder_training_loss_decreases() {
         |s| {
             let mel_size = (batch * config.n_mels as u32 * mel_len) as usize;
             let mel: Vec<f32> = (0..mel_size).map(|i| (i as f32 * 0.01).sin()).collect();
-            let target = vec![0.0f32; out_size];
+            let mut labels = vec![0.0f32; seq_len * num_classes];
+            for i in 0..seq_len {
+                labels[i * num_classes + (i % num_classes)] = 1.0;
+            }
             s.set_input("mel", &mel);
-            s.set_input("target", &target);
+            s.set_input("labels", &labels);
         },
         5,
         0.001,
