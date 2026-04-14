@@ -1,4 +1,4 @@
-# v0.2 (4 Apr 2026)
+# v0.2 (14 Apr 2026)
 
 ## Inference & models
 - Conv2d forward/backward via implicit GEMM (im2col fused into matmul)
@@ -7,6 +7,10 @@
 - U-Net, ResNet-50, and Whisper example models
 - ONNX and NNEF model loaders
 - macOS / Metal support improvements
+- Sliding-window attention op for local attention patterns
+- Gemma-4 model configs (1B, 4B, 12B, 27B)
+- Mistral model configs (7B, Nemo 12B)
+- Phi-3 model configs (Mini, Small)
 
 ## Training
 - Differentiable MultiHeadAttn with GQA and CausalAttention backward
@@ -15,6 +19,11 @@
 - GELU backward, SumRows op for bias/RmsNorm weight gradients
 - Weight sharing and checkpointing support
 - Metrics callbacks and MemorySummary
+- LayerNorm backward (GradW, GradB, GradX)
+- FullAttention backward for Whisper training
+- Tanh op with backprop support
+- Identity op for zero-cost reshape in training graphs
+- Whisper encoder training graph helper
 
 ## Optimizations
 - 4×4 register-tiled matmul: 1.5× faster forward, beats PyTorch inference
@@ -24,11 +33,16 @@
 - Fuse SGD into step() submission (130ms → 99ms training)
 - SwiGLUConcat: merge gate+up into single matmul
 - Fused SwiGLU/Silu backward ops
-- Fused RmsNorm+MatMul kernel (disabled, needs cost model)
+- Fused RmsNorm+MatMul kernel with two-phase dispatch and rsqrt prologue
 - Parallelize Conv2dGradWeight and GroupNormGradW shaders
 - K-aware coop threshold for high-K backward matmuls
 - e-graph: encode full graph with SwiGLU fusion, optimize before autodiff
 - Pre-compute barrier group pass names at session creation
+- Epilogue fusion infrastructure for matmul dispatch
+- CausalAttentionRoPE: fuse RoPE into attention kernel
+- BKV=8 tiled attention KV loop and dQ backward kernel
+- Parallel prefill for KV-cache SmolLM2 benchmark
+- Lower coop workgroup threshold from 128 to 32
 
 ## Correctness fixes
 - Fix O(rows×cols²) complexity in RmsNormGradW shader
@@ -37,6 +51,9 @@
 - Fix GroupNorm grad race condition
 - Fix RoPE convention and dispatch ordering
 - Fix Adam buffer cleanup
+- Fix coop RmsNorm shader: use workgroup reduction, not subgroups
+- Eliminate O(N²) score buffer — recompute scores in backward
+- Remove coop edge safety check — buffer padding handles all edges
 - Various Metal execution fixes
 
 ## Infrastructure
@@ -44,7 +61,10 @@
 - CI latency benchmark with regression detection
 - Conv2d split padding into h/w dimensions
 - Windows compatibility, automated venv setup
-- SmolVLA training benchmark
+- SmolVLA and SmolLM2 training benchmarks
+- Subgroup reference cleanup, link NVIDIA driver bug tracker
+- KV-cache decode mode for SmolLM2 benchmark
+- Chunk-size flag for SmolVLA training benchmark
 
 # v0.1 (26 Mar 2026)
 
