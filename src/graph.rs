@@ -569,16 +569,25 @@ impl Graph {
             new_graph.add_raw_node(node.op.clone(), new_inputs, node.ty.clone());
         }
 
-        // Remap outputs
-        let new_outputs: Vec<NodeId> = self
-            .outputs
-            .iter()
-            .filter_map(|&out| old_to_new[out as usize])
-            .collect();
+        // Remap outputs. An output being Nop'd would silently drop it and
+        // shift downstream indices — assert loudly instead so fusion bugs
+        // surface at build time rather than as `read_output_by_index`
+        // panics at inference time.
+        let mut new_outputs: Vec<NodeId> = Vec::with_capacity(self.outputs.len());
+        for (i, &out) in self.outputs.iter().enumerate() {
+            match old_to_new[out as usize] {
+                Some(new_id) => new_outputs.push(new_id),
+                None => panic!(
+                    "toposort: output #{i} (node {out}, op {:?}) was removed as Nop. \
+                     A fusion pass Nop'd a node that's listed in `set_outputs`. \
+                     Add an `is_output(id)` guard to that fusion.",
+                    self.nodes[out as usize].op,
+                ),
+            }
+        }
         new_graph.set_outputs(new_outputs);
-        // Preserve the user/grad output boundary. set_outputs resets this,
-        // so we restore it after. Clamp in case some outputs were Nop'd.
-        new_graph.num_param_grad_outputs = self.num_param_grad_outputs.min(new_graph.outputs.len());
+        // Preserve the user/grad output boundary (set_outputs resets it).
+        new_graph.num_param_grad_outputs = self.num_param_grad_outputs;
         new_graph.derived_params = self.derived_params.clone();
         new_graph
     }
@@ -593,6 +602,13 @@ impl Graph {
 
     pub fn outputs(&self) -> &[NodeId] {
         &self.outputs
+    }
+
+    /// Returns true if `id` is a graph output (user-facing or param-grad).
+    /// Fusions must not Nop nodes that are outputs — their values are
+    /// read back by the user or consumed by the optimizer.
+    pub fn is_output(&self, id: NodeId) -> bool {
+        self.outputs.contains(&id)
     }
 
     /// Number of user-supplied outputs (those passed to `set_outputs`).
