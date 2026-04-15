@@ -992,11 +992,10 @@ impl<'a> Compiler<'a> {
                 let n = b_shape[1] as u32;
                 if m == 1 {
                     // GEMV specialization: one thread per output column,
-                    // workgroup size 256, shared A staging. 10-20×
-                    // faster than the tiled matmul for the M=1 case.
+                    // workgroup size 32 (one warp — no barriers needed).
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::MatMulGemv,
-                        workgroups: [n.div_ceil(256), 1, 1],
+                        workgroups: [n.div_ceil(32), 1, 1],
                         input_buffers: vec![a, b],
                         output_buffer: out_buf,
                         extra_outputs: vec![],
