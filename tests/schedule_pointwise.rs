@@ -118,6 +118,60 @@ fn swiglu_parity() {
     });
 }
 
+// ---- Fusion pass ----
+
+/// Confirm the fusion pass collapses a 3-op chain into 1 dispatch.
+#[test]
+fn fusion_reduces_dispatch_count() {
+    use meganeura::compile::{CompileOptions, compile_with};
+
+    let mut g = Graph::new();
+    let x = g.input("x", &[256]);
+    let a = g.relu(x);
+    let b = g.neg(a);
+    let c = g.silu(b);
+    g.set_outputs(vec![c]);
+
+    let default_plan = compile_with(&g, &CompileOptions::default());
+    let opts = CompileOptions {
+        use_schedule_pointwise: true,
+    };
+    let fused_plan = compile_with(&g, &opts);
+
+    // Default: 3 dispatches (relu, neg, silu).
+    assert_eq!(default_plan.dispatches.len(), 3);
+    // Fused: the three pointwise dispatches should collapse into 1.
+    assert_eq!(
+        fused_plan.dispatches.len(),
+        1,
+        "expected pointwise chain to collapse to one dispatch"
+    );
+    assert!(fused_plan.dispatches[0].pointwise.is_some());
+}
+
+/// Parity of a 3-op chain, once the fusion pass has run.
+#[test]
+fn fused_chain_runtime_parity() {
+    let input: Vec<f32> = (0..256).map(|i| (i as f32) * 0.1 - 12.0).collect();
+    assert_parity(&["x"], &[&input], 256, |g, xs| {
+        let a = g.relu(xs[0]);
+        let b = g.neg(a);
+        g.silu(b)
+    });
+}
+
+/// Mixed binary+unary fusion: add(relu(a), b) should become one dispatch
+/// with a 2-input fused DAG, and still match the hand-written path.
+#[test]
+fn fused_relu_into_add_runtime_parity() {
+    let a: Vec<f32> = (0..256).map(|i| (i as f32) * 0.05 - 6.0).collect();
+    let b: Vec<f32> = (0..256).map(|i| -(i as f32) * 0.02 + 2.0).collect();
+    assert_parity(&["a", "b"], &[&a, &b], 256, |g, xs| {
+        let r = g.relu(xs[0]);
+        g.add(r, xs[1])
+    });
+}
+
 #[test]
 fn chain_add_relu_parity() {
     // Mixes a binary op with a unary op — exercises both generated-pipeline
