@@ -489,6 +489,11 @@ pub struct DerivedParam {
 pub struct Graph {
     nodes: Vec<Node>,
     outputs: Vec<NodeId>,
+    /// Number of trailing entries in `outputs` that are parameter gradients
+    /// appended by autodiff (positionally aligned with `param_buffers` in the
+    /// compiled plan). The leading `outputs.len() - num_param_grad_outputs`
+    /// entries are user-facing outputs supplied via `set_outputs`.
+    num_param_grad_outputs: usize,
     /// Parameters created by the optimizer from concatenating original params.
     pub derived_params: Vec<DerivedParam>,
 }
@@ -498,6 +503,7 @@ impl Graph {
         Self {
             nodes: Vec::new(),
             outputs: Vec::new(),
+            num_param_grad_outputs: 0,
             derived_params: Vec::new(),
         }
     }
@@ -570,6 +576,9 @@ impl Graph {
             .filter_map(|&out| old_to_new[out as usize])
             .collect();
         new_graph.set_outputs(new_outputs);
+        // Preserve the user/grad output boundary. set_outputs resets this,
+        // so we restore it after. Clamp in case some outputs were Nop'd.
+        new_graph.num_param_grad_outputs = self.num_param_grad_outputs.min(new_graph.outputs.len());
         new_graph.derived_params = self.derived_params.clone();
         new_graph
     }
@@ -586,8 +595,28 @@ impl Graph {
         &self.outputs
     }
 
+    /// Number of user-supplied outputs (those passed to `set_outputs`).
+    /// The remaining `num_param_grad_outputs()` entries are parameter
+    /// gradients appended by autodiff.
+    pub fn num_user_outputs(&self) -> usize {
+        self.outputs.len() - self.num_param_grad_outputs
+    }
+
+    /// Number of trailing outputs that are param gradients (appended by autodiff).
+    pub fn num_param_grad_outputs(&self) -> usize {
+        self.num_param_grad_outputs
+    }
+
     pub fn set_outputs(&mut self, outputs: Vec<NodeId>) {
         self.outputs = outputs;
+        self.num_param_grad_outputs = 0;
+    }
+
+    /// Append parameter-gradient outputs after user outputs. Only called by
+    /// autodiff. `num_grads` must equal the number of entries appended.
+    pub fn append_param_grad_outputs(&mut self, grads: &[NodeId]) {
+        self.outputs.extend_from_slice(grads);
+        self.num_param_grad_outputs += grads.len();
     }
 
     pub fn add_raw_node(&mut self, op: Op, inputs: Vec<NodeId>, ty: TensorType) -> NodeId {

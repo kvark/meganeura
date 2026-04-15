@@ -647,30 +647,40 @@ impl<'a> Compiler<'a> {
             };
         }
 
-        // Set loss buffer (first output) and collect all output buffers
-        for &out_id in self.graph.outputs() {
+        // Outputs layout (from autodiff): [user_outputs..., param_grads...]
+        // Where `param_grads` is the last `num_param_grad_outputs()` entries
+        // (one per Parameter node, exactly aligned with param_buffers order).
+        // For inference (no autodiff), num_param_grad_outputs() == 0 and every
+        // output is user-facing.
+        let outputs = self.graph.outputs();
+        let num_grads = self.graph.num_param_grad_outputs();
+        let num_user = outputs.len() - num_grads;
+
+        // Collect user-facing output buffers (accessible via read_output_by_index).
+        for &out_id in &outputs[..num_user] {
             self.plan.output_buffers.push(self.get_buffer(out_id));
         }
-        if let Some(&loss_id) = self.graph.outputs().first() {
+        if let Some(&loss_id) = outputs.first() {
             self.plan.loss_buffer = Some(self.get_buffer(loss_id));
         }
 
-        // Build param→grad pairs from outputs
-        // Outputs are [loss, grad_param1, grad_param2, ...]
-        let outputs = self.graph.outputs();
-        if outputs.len() > 1 {
+        // Build param→grad pairs from the trailing grad outputs.
+        if num_grads > 0 {
             let param_names: Vec<String> = self
                 .plan
                 .param_buffers
                 .iter()
                 .map(|entry| entry.0.clone())
                 .collect();
-            for (i, _name) in param_names.iter().enumerate() {
-                if i + 1 < outputs.len() {
-                    let param_buf = self.plan.param_buffers[i].1;
-                    let grad_buf = self.get_buffer(outputs[i + 1]);
-                    self.plan.param_grad_pairs.push((param_buf, grad_buf));
-                }
+            assert_eq!(
+                param_names.len(),
+                num_grads,
+                "autodiff must emit one grad output per Parameter",
+            );
+            for i in 0..num_grads {
+                let param_buf = self.plan.param_buffers[i].1;
+                let grad_buf = self.get_buffer(outputs[num_user + i]);
+                self.plan.param_grad_pairs.push((param_buf, grad_buf));
             }
         }
     }
