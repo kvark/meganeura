@@ -64,7 +64,13 @@ fn approximate_fp16_tc_tflops(device_name: &str) -> Option<f64> {
     }
 }
 
-fn bench_shape(m: usize, n: usize, k: usize, warmup: usize, iters: usize) -> (f64, u32, u32, u32) {
+fn bench_shape(
+    m: usize,
+    n: usize,
+    k: usize,
+    warmup: usize,
+    iters: usize,
+) -> (f64, u32, u32, u32, &'static str) {
     let mut g = Graph::new();
     let a = g.input("a", &[m, k]);
     let b = g.parameter("b", &[k, n]);
@@ -77,20 +83,33 @@ fn bench_shape(m: usize, n: usize, k: usize, warmup: usize, iters: usize) -> (f6
     session.set_input("a", &a_data);
     session.set_parameter("b", &b_data);
 
-    // Inspect the compiled plan for coop / small-tile usage.
+    // Inspect the compiled plan for coop / small-tile / GEMV usage.
     let plan = session.plan();
-    let (use_coop, use_small, workgroups) = plan
+    let (use_coop, use_small, workgroups, kernel) = plan
         .dispatches
         .iter()
-        .find(|d| matches!(d.shader, meganeura::compile::ShaderEntry::MatMul))
+        .find(|d| {
+            matches!(
+                d.shader,
+                meganeura::compile::ShaderEntry::MatMul
+                    | meganeura::compile::ShaderEntry::MatMulGemv
+            )
+        })
         .map(|d| {
+            let kernel = match d.shader {
+                meganeura::compile::ShaderEntry::MatMulGemv => "gemv",
+                _ if d.use_coop => "coop",
+                _ if d.use_small_tiles => "small",
+                _ => "tile",
+            };
             (
                 if d.use_coop { 1 } else { 0 },
                 if d.use_small_tiles { 1 } else { 0 },
                 d.workgroups[0] * d.workgroups[1] * d.workgroups[2],
+                kernel,
             )
         })
-        .unwrap_or((0, 0, 0));
+        .unwrap_or((0, 0, 0, "?"));
 
     // Warmup.
     for _ in 0..warmup {
@@ -107,7 +126,7 @@ fn bench_shape(m: usize, n: usize, k: usize, warmup: usize, iters: usize) -> (f6
     let elapsed = t0.elapsed().as_secs_f64();
     let per_call = elapsed / iters as f64;
 
-    (per_call, use_coop, use_small, workgroups)
+    (per_call, use_coop, use_small, workgroups, kernel)
 }
 
 fn main() {
@@ -158,30 +177,27 @@ fn main() {
     ];
 
     println!(
-        "{:<42} {:>6} {:>7} {:>5} {:>5} {:>6} {:>10} {:>9} {:>9}",
-        "shape (M×N×K)", "ms", "GFlops", "coop", "small", "wgs", "label", "%fp32pk", "%fp16pk"
+        "{:<42} {:>6} {:>7} {:>6} {:>6} {:>9} {:>9}",
+        "shape (M×N×K)", "ms", "GFlops", "kernel", "wgs", "%fp32pk", "%fp16pk"
     );
     println!("{}", "-".repeat(120));
 
     for &(m, n, k, label) in shapes {
-        let (per_call, coop, small, wgs) = bench_shape(m, n, k, 20, 200);
+        let (per_call, _coop, _small, wgs, kernel) = bench_shape(m, n, k, 20, 200);
         let flops = 2.0 * (m * n * k) as f64;
         let gflops = flops / per_call / 1e9;
         let pct_fp32 = peak_fp32.map(|p| 100.0 * gflops / (p * 1000.0));
         let pct_fp16 = peak_fp16.map(|p| 100.0 * gflops / (p * 1000.0));
-        let coop_s = if coop == 1 { "yes" } else { "no" };
-        let small_s = if small == 1 { "yes" } else { "no" };
         println!(
-            "{:<42} {:>6.3} {:>7.0} {:>5} {:>5} {:>6} {:<24} {:>8} {:>8}",
+            "{:<42} {:>6.3} {:>7.0} {:>6} {:>6} {:>8} {:>8}  {}",
             format!("{}×{}×{}", m, n, k),
             per_call * 1000.0,
             gflops,
-            coop_s,
-            small_s,
+            kernel,
             wgs,
-            label,
             pct_fp32.map_or("n/a".to_string(), |p| format!("{:.1}%", p)),
             pct_fp16.map_or("n/a".to_string(), |p| format!("{:.1}%", p)),
+            label,
         );
     }
 }

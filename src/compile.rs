@@ -39,6 +39,9 @@ pub enum ShaderEntry {
     MatMul,
     MatMulAT,
     MatMulBT,
+    /// M=1 GEMV specialization of MatMul. Selected when `C = A × B` has
+    /// a single row on the output side (LM decode path).
+    MatMulGemv,
     FusedMatMulAdd,
     FusedMatMulATAdd,
     FusedMatMulBTAdd,
@@ -126,6 +129,7 @@ impl ShaderEntry {
             ShaderEntry::MatMul => ShaderGroup::MatMul,
             ShaderEntry::MatMulAT => ShaderGroup::MatMulAT,
             ShaderEntry::MatMulBT => ShaderGroup::MatMulBT,
+            ShaderEntry::MatMulGemv => ShaderGroup::MatMulGemv,
             ShaderEntry::FusedMatMulAdd => ShaderGroup::MatMulAdd,
             ShaderEntry::FusedMatMulATAdd => ShaderGroup::MatMulATAdd,
             ShaderEntry::FusedMatMulBTAdd => ShaderGroup::MatMulBTAdd,
@@ -206,6 +210,7 @@ impl ShaderEntry {
             ShaderEntry::MatMul
             | ShaderEntry::MatMulAT
             | ShaderEntry::MatMulBT
+            | ShaderEntry::MatMulGemv
             | ShaderEntry::FusedMatMulAdd
             | ShaderEntry::FusedMatMulATAdd
             | ShaderEntry::FusedMatMulBTAdd
@@ -879,7 +884,7 @@ impl<'a> Compiler<'a> {
         // Generate labels for profiling
         for d in &mut self.plan.dispatches {
             d.label = match d.shader {
-                ShaderEntry::MatMul | ShaderEntry::FusedMatMulAdd => {
+                ShaderEntry::MatMul | ShaderEntry::FusedMatMulAdd | ShaderEntry::MatMulGemv => {
                     format!(
                         "{:?}[{}x{}x{}]",
                         d.shader, d.params[0], d.params[2], d.params[1]
@@ -985,17 +990,34 @@ impl<'a> Compiler<'a> {
                 let m = a_shape[0] as u32;
                 let k = a_shape[1] as u32;
                 let n = b_shape[1] as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::MatMul,
-                    workgroups: [n.div_ceil(64), m.div_ceil(64), 1],
-                    input_buffers: vec![a, b],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![m, k, n, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
-                    ..Default::default()
-                });
+                if m == 1 {
+                    // GEMV specialization: one thread per output column,
+                    // workgroup size 256, shared A staging. 10-20×
+                    // faster than the tiled matmul for the M=1 case.
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::MatMulGemv,
+                        workgroups: [n.div_ceil(256), 1, 1],
+                        input_buffers: vec![a, b],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params: vec![m, k, n, 0],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
+                } else {
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::MatMul,
+                        workgroups: [n.div_ceil(64), m.div_ceil(64), 1],
+                        input_buffers: vec![a, b],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params: vec![m, k, n, 0],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
+                }
             }
 
             Op::MatMulAT => {
