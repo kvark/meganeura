@@ -141,9 +141,10 @@ fn main() {
         eprintln!("compiling prefill...");
         let mut prefill_session = build_inference_session(&pg);
         eprintln!(
-            "prefill: {} buffers, {} dispatches",
+            "prefill: {} buffers, {} dispatches, {} barrier groups",
             prefill_session.plan().buffers.len(),
-            prefill_session.plan().dispatches.len()
+            prefill_session.plan().dispatches.len(),
+            prefill_session.num_groups(),
         );
 
         // Build decode graph (single-token with KV cache)
@@ -156,9 +157,10 @@ fn main() {
         eprintln!("compiling decode...");
         session = build_inference_session(&dg);
         eprintln!(
-            "decode: {} buffers, {} dispatches",
+            "decode: {} buffers, {} dispatches, {} barrier groups",
             session.plan().buffers.len(),
-            session.plan().dispatches.len()
+            session.plan().dispatches.len(),
+            session.num_groups(),
         );
 
         // Load weights into both sessions
