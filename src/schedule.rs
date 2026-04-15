@@ -89,16 +89,19 @@ impl PointwiseDAG {
         h.finish()
     }
 
-    /// Emit the DAG body as WGSL statements. `input_name(idx)` produces the
-    /// expression used to load input stream `idx` at element index `i` (the
-    /// caller's element variable — hardcoded to `i` to keep this simple).
-    fn emit_body(&self, input_name: impl Fn(u8) -> String) -> String {
+    /// Emit the DAG body as WGSL statements. `load(idx)` returns the
+    /// complete WGSL expression that loads input stream `idx` at the
+    /// current element position — typically something like
+    /// `"src_a[i]"` for pointwise or `"src[row * inner + col]"` for
+    /// reduction prologues. The indent and `let v{k} = ` prefix are
+    /// emitted by this method.
+    fn emit_body(&self, load: impl Fn(u8) -> String) -> String {
         let mut out = String::new();
         for (k, op) in self.ops.iter().enumerate() {
             let _ = write!(out, "    let v{} = ", k);
             match *op {
                 Pw::LoadInput(idx) => {
-                    let _ = write!(out, "{}[i]", input_name(idx));
+                    let _ = write!(out, "{}", load(idx));
                 }
                 Pw::Const(bits) => {
                     // Reconstruct f32 and emit with a decimal point + `f` suffix
@@ -283,21 +286,76 @@ impl Default for GridShape {
     }
 }
 
+/// Associative reduction ops supported by [`KernelTemplate::Reduction`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ReduceOp {
+    /// Sum: identity 0, accumulator `acc + v`.
+    Sum,
+    /// Max: identity -inf, accumulator `max(acc, v)`.
+    Max,
+}
+
+impl ReduceOp {
+    fn identity_wgsl(self) -> &'static str {
+        match self {
+            ReduceOp::Sum => "0.0f",
+            ReduceOp::Max => "bitcast<f32>(0xff800000u)", // -inf
+        }
+    }
+
+    /// Emit WGSL for `acc = combine(acc, v)`.
+    fn combine_wgsl(self, acc: &str, v: &str) -> String {
+        match self {
+            ReduceOp::Sum => format!("{} = {} + {};", acc, acc, v),
+            ReduceOp::Max => format!("{} = max({}, {});", acc, acc, v),
+        }
+    }
+}
+
 /// A schedule template — to be lowered to a Naga [`naga::Module`].
 #[derive(Clone, Debug)]
 pub enum KernelTemplate {
-    Pointwise { dag: PointwiseDAG, grid: GridShape },
-    // Reduction, Matmul, Attention — added in later steps of the plan.
+    Pointwise {
+        dag: PointwiseDAG,
+        grid: GridShape,
+    },
+    /// Per-row reduction: one workgroup per outer row reduces along the
+    /// inner axis. For each element the per-element `prologue` DAG runs
+    /// first (producing the scalar contribution), then the reduction.
+    /// Output shape is `[outer]` (one scalar per row). No per-element
+    /// epilogue yet — that's a follow-up commit for RMSNorm/Softmax.
+    ///
+    /// Binding names in the generated module:
+    ///   - Prologue input streams: same as pointwise (`src`, `src_a`/`src_b`,
+    ///     or `src_a`/`src_b`/`src_c`), loaded at index `row * inner + col`.
+    ///   - `dst: array<f32>` of length `outer`.
+    ///   - Uniforms: `outer: u32, inner: u32, _pad0: u32, _pad1: u32`.
+    Reduction {
+        op: ReduceOp,
+        /// Per-element transform applied before accumulation. `n_inputs`
+        /// determines the number of input streams; `output` is the scalar
+        /// contribution to reduce.
+        prologue: PointwiseDAG,
+        /// Workgroup size (threads per row). Must be a power of 2 — the
+        /// tree reduction assumes it.
+        grid: GridShape,
+    },
 }
 
-/// Entry-point name emitted for a `KernelTemplate`. Always `"main"` for
-/// pointwise kernels (one entry point per generated module).
+/// Entry-point name emitted for any `KernelTemplate`. One entry point per
+/// generated module.
 pub const POINTWISE_ENTRY: &str = "main";
+pub const REDUCTION_ENTRY: &str = "main";
 
 /// Lower a [`KernelTemplate`] to WGSL + a parsed Naga module.
 pub fn lower(t: &KernelTemplate) -> ShaderModule {
     match *t {
         KernelTemplate::Pointwise { ref dag, grid } => lower_pointwise(dag, grid),
+        KernelTemplate::Reduction {
+            op,
+            ref prologue,
+            grid,
+        } => lower_reduction(op, prologue, grid),
     }
 }
 
@@ -312,7 +370,6 @@ fn lower_pointwise(dag: &PointwiseDAG, grid: GridShape) -> ShaderModule {
     );
 
     let input_names = PointwiseDAG::input_binding_names(dag.n_inputs);
-    let input_name = |idx: u8| input_names[idx as usize].clone();
 
     let mut src = String::new();
     src.push_str(
@@ -331,12 +388,96 @@ fn lower_pointwise(dag: &PointwiseDAG, grid: GridShape) -> ShaderModule {
     );
     src.push_str("    let i = gid.x;\n");
     src.push_str("    if i >= params.len { return; }\n");
-    src.push_str(&dag.emit_body(input_name));
+    src.push_str(&dag.emit_body(|idx| format!("{}[i]", input_names[idx as usize])));
     let _ = writeln!(src, "    dst[i] = v{};", dag.output);
     src.push_str("}\n");
 
     let module = naga::front::wgsl::parse_str(&src)
         .unwrap_or_else(|e| panic!("generated WGSL failed to parse:\n{}\n---\n{}", e, src));
+    ShaderModule {
+        module,
+        source: src,
+    }
+}
+
+fn lower_reduction(op: ReduceOp, prologue: &PointwiseDAG, grid: GridShape) -> ShaderModule {
+    assert!(
+        prologue.n_inputs >= 1,
+        "reduction prologue must have at least one input stream"
+    );
+    assert!(
+        (prologue.output as usize) < prologue.ops.len(),
+        "reduction prologue output index is out of range"
+    );
+    assert!(
+        grid.workgroup_size.is_power_of_two() && grid.workgroup_size >= 2,
+        "reduction workgroup_size must be a power of 2 ≥ 2"
+    );
+
+    let input_names = PointwiseDAG::input_binding_names(prologue.n_inputs);
+
+    let mut src = String::new();
+    src.push_str(
+        "struct Params {\n    outer: u32,\n    inner: u32,\n    _pad0: u32,\n    _pad1: u32,\n}\n\n",
+    );
+    for name in &input_names {
+        let _ = writeln!(src, "var<storage> {}: array<f32>;", name);
+    }
+    src.push_str("var<storage, read_write> dst: array<f32>;\n");
+    src.push_str("var<uniform> params: Params;\n");
+    let wg = grid.workgroup_size;
+    let _ = writeln!(src, "var<workgroup> wg_data: array<f32, {}>;\n", wg);
+    let _ = writeln!(src, "@compute @workgroup_size({})", wg);
+    let _ = writeln!(
+        src,
+        "fn {}(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{",
+        REDUCTION_ENTRY
+    );
+    src.push_str("    let row = wgid.x;\n");
+    src.push_str("    let tid = lid.x;\n");
+    src.push_str("    if row >= params.outer { return; }\n");
+    src.push_str("    let row_offset = row * params.inner;\n");
+    let _ = writeln!(src, "    var acc: f32 = {};", op.identity_wgsl());
+    src.push_str("    var col = tid;\n");
+    src.push_str("    loop {\n");
+    src.push_str("        if col >= params.inner { break; }\n");
+    // Prologue: per-element DAG; loads read from `src[row_offset + col]`.
+    let body = prologue.emit_body(|idx| format!("{}[row_offset + col]", input_names[idx as usize]));
+    // Indent each line of the prologue body by 4 extra spaces for the loop.
+    for line in body.lines() {
+        src.push_str("        ");
+        src.push_str(line.trim_start_matches(' '));
+        src.push('\n');
+    }
+    let _ = writeln!(
+        src,
+        "        {}",
+        op.combine_wgsl("acc", &format!("v{}", prologue.output))
+    );
+    let _ = writeln!(src, "        col += {}u;", wg);
+    src.push_str("    }\n");
+    src.push_str("    wg_data[tid] = acc;\n");
+    src.push_str("    workgroupBarrier();\n");
+    // Tree reduction.
+    let mut stride = wg / 2;
+    src.push_str("    // tree reduction\n");
+    while stride > 0 {
+        let _ = writeln!(src, "    if tid < {}u {{", stride);
+        let combined = op.combine_wgsl("wg_data[tid]", &format!("wg_data[tid + {}u]", stride));
+        let _ = writeln!(src, "        {}", combined);
+        src.push_str("    }\n");
+        src.push_str("    workgroupBarrier();\n");
+        stride /= 2;
+    }
+    src.push_str("    if tid == 0u { dst[row] = wg_data[0]; }\n");
+    src.push_str("}\n");
+
+    let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
+        panic!(
+            "generated reduction WGSL failed to parse:\n{}\n---\n{}",
+            e, src
+        )
+    });
     ShaderModule {
         module,
         source: src,
@@ -555,6 +696,105 @@ mod tests {
         Validator::new(flags, Capabilities::all())
             .validate(&sm.module)
             .unwrap_or_else(|e| panic!("fused DAG invalid: {:?}\n{}", e, sm.source));
+    }
+
+    // ---- Reduction archetype ----
+
+    /// Simplest reduction: sum over last axis. Prologue is identity
+    /// (pass-through of the one input).
+    fn identity_prologue() -> PointwiseDAG {
+        PointwiseDAG {
+            n_inputs: 1,
+            ops: vec![Pw::LoadInput(0)],
+            output: 0,
+        }
+    }
+
+    /// Prologue that squares the input — contribution for sum-of-squares.
+    fn square_prologue() -> PointwiseDAG {
+        PointwiseDAG {
+            n_inputs: 1,
+            ops: vec![Pw::LoadInput(0), Pw::Mul(0, 0)],
+            output: 1,
+        }
+    }
+
+    #[test]
+    fn reduction_lowers_to_valid_wgsl() {
+        let sm = lower(&KernelTemplate::Reduction {
+            op: ReduceOp::Sum,
+            prologue: identity_prologue(),
+            grid: GridShape::default(),
+        });
+        assert!(sm.source.contains("struct Params"));
+        assert!(sm.source.contains("outer: u32"));
+        assert!(sm.source.contains("var<workgroup> wg_data"));
+        assert!(sm.source.contains("workgroupBarrier"));
+        // Identity for sum is 0.
+        assert!(sm.source.contains("var acc: f32 = 0.0f"));
+        // Dst writes one scalar per row.
+        assert!(sm.source.contains("dst[row] = wg_data[0]"));
+    }
+
+    #[test]
+    fn max_reduction_uses_max_combiner() {
+        let sm = lower(&KernelTemplate::Reduction {
+            op: ReduceOp::Max,
+            prologue: identity_prologue(),
+            grid: GridShape::default(),
+        });
+        // Max identity is -inf via bitcast.
+        assert!(sm.source.contains("0xff800000u"));
+        // Combiner uses max().
+        assert!(sm.source.contains("max(acc,"));
+    }
+
+    #[test]
+    fn reduction_with_square_prologue_compiles() {
+        // Sum of squares — the reduction half of RMSNorm.
+        let sm = lower(&KernelTemplate::Reduction {
+            op: ReduceOp::Sum,
+            prologue: square_prologue(),
+            grid: GridShape::default(),
+        });
+        // Prologue emits the multiply.
+        assert!(sm.source.contains("v0 * v0"));
+        // And the per-row load expression should reference row_offset.
+        assert!(sm.source.contains("src[row_offset + col]"));
+    }
+
+    #[test]
+    fn reduction_naga_validates() {
+        use naga::valid::{Capabilities, ValidationFlags, Validator};
+        let flags = ValidationFlags::all() ^ ValidationFlags::BINDINGS;
+        let mut v = Validator::new(flags, Capabilities::all());
+
+        for (op, prologue) in [
+            (ReduceOp::Sum, identity_prologue()),
+            (ReduceOp::Sum, square_prologue()),
+            (ReduceOp::Max, identity_prologue()),
+        ] {
+            let sm = lower(&KernelTemplate::Reduction {
+                op,
+                prologue,
+                grid: GridShape::default(),
+            });
+            v.validate(&sm.module).unwrap_or_else(|e| {
+                panic!("reduction naga validation failed: {:?}\n{}", e, sm.source);
+            });
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "workgroup_size must be a power of 2")]
+    fn reduction_rejects_odd_workgroup_size() {
+        lower(&KernelTemplate::Reduction {
+            op: ReduceOp::Sum,
+            prologue: identity_prologue(),
+            grid: GridShape {
+                workgroup_size: 250, // not power of 2
+            },
+        });
     }
 
     #[test]
