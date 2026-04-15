@@ -362,10 +362,53 @@ pub enum KernelTemplate {
 
 /// Per-element write-back DAG for a reduce-then-map reduction. See
 /// `KernelTemplate::Reduction` for the complete input-index layout.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ReductionEpilogue {
     pub dag: PointwiseDAG,
     pub n_per_col_inputs: u8,
+}
+
+/// Serializable, stably-hashable description of a reduction kernel —
+/// stored on `compile::Dispatch::reduction` so the runtime can build
+/// and cache a pipeline from it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ReductionKernel {
+    pub op: ReduceOp,
+    pub prologue: PointwiseDAG,
+    pub epilogue: Option<ReductionEpilogue>,
+    pub n_per_elem: u8,
+    pub n_per_row: u8,
+    pub workgroup_size: u32,
+}
+
+impl ReductionKernel {
+    /// Stable content hash — suitable as a pipeline-cache key.
+    pub fn hash_key(&self) -> u64 {
+        let mut h = DefaultHasher::new();
+        self.hash(&mut h);
+        h.finish()
+    }
+
+    /// Lower to the template form consumed by `lower`.
+    pub fn to_template(&self) -> KernelTemplate {
+        KernelTemplate::Reduction {
+            op: self.op,
+            prologue: self.prologue.clone(),
+            epilogue: self.epilogue.clone(),
+            n_per_elem: self.n_per_elem,
+            n_per_row: self.n_per_row,
+            grid: GridShape {
+                workgroup_size: self.workgroup_size,
+            },
+        }
+    }
+
+    /// Total number of `var<storage> ... : array<f32>` input bindings
+    /// (per-elem + per-row + per-col), excluding `dst`. Used by the
+    /// runtime to pick the right ShaderData layout.
+    pub fn n_buffer_inputs(&self) -> u8 {
+        self.n_per_elem + self.n_per_row + self.epilogue.as_ref().map_or(0, |e| e.n_per_col_inputs)
+    }
 }
 
 /// Entry-point name emitted for any `KernelTemplate`. One entry point per

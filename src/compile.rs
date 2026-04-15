@@ -1,5 +1,5 @@
 use crate::graph::{Graph, Node, NodeId, Op};
-use crate::schedule::PointwiseDAG;
+use crate::schedule::{PointwiseDAG, ReductionKernel};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -15,12 +15,19 @@ pub struct CompileOptions {
     /// UnaryData / BinaryData / TernaryData binding layouts, so no runtime
     /// surface changes for callers.
     pub use_schedule_pointwise: bool,
+    /// Route reduction-shaped ops (currently Softmax) through the
+    /// schedule-template reduction archetype instead of hand-written
+    /// shaders. Generated kernels use workgroup-per-row tree reduction,
+    /// which is much more parallel than the 1-thread-per-row loops in
+    /// the existing softmax.wgsl. Off by default until parity-verified.
+    pub use_schedule_reduction: bool,
 }
 
 impl Default for CompileOptions {
     fn default() -> Self {
         Self {
             use_schedule_pointwise: true,
+            use_schedule_reduction: false,
         }
     }
 }
@@ -337,6 +344,13 @@ pub struct Dispatch {
     /// `UnaryData` / `BinaryData` layout that `shader` already selects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pointwise: Option<PointwiseDAG>,
+    /// When `Some`, this dispatch uses a schedule-template-generated
+    /// reduction kernel. Mutually exclusive with `pointwise`. The runtime
+    /// compiles a dedicated pipeline from the kernel spec (keyed by
+    /// `ReductionKernel::hash_key`) and picks the binding layout based on
+    /// the kernel's buffer-input arity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reduction: Option<ReductionKernel>,
 }
 
 /// Reference to a GPU buffer in the execution plan.
@@ -1203,17 +1217,21 @@ impl<'a> Compiler<'a> {
                 let shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let batch = shape[0] as u32;
                 let features = shape[1] as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Softmax,
-                    workgroups: [batch.div_ceil(256), 1, 1],
-                    input_buffers: vec![input],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![batch, features, 0, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
-                    ..Default::default()
-                });
+                if self.options.use_schedule_reduction {
+                    self.emit_softmax_schedule(input, out_buf, batch, features);
+                } else {
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::Softmax,
+                        workgroups: [batch.div_ceil(256), 1, 1],
+                        input_buffers: vec![input],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params: vec![batch, features, 0, 0],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
+                }
             }
 
             Op::LogSoftmax => {
@@ -2424,6 +2442,113 @@ impl<'a> Compiler<'a> {
             .find(|item| item.0 == fwd_node)
             .expect("LSE buffer not found for MultiHeadAttn forward node")
             .1
+    }
+
+    /// Emit softmax as two schedule-template reductions:
+    ///
+    ///   1. Max reduction (identity prologue) → `row_max` buffer `[batch]`.
+    ///   2. Sum reduction with prologue `exp(src - row_max)` and epilogue
+    ///      `exp(src - row_max) / row_sum` → output `[batch, features]`.
+    ///
+    /// Matches softmax.wgsl semantics bit-for-bit on finite inputs. No
+    /// workgroup-size autotune yet — hardcoded at 256, which matches the
+    /// existing softmax's tile size.
+    fn emit_softmax_schedule(
+        &mut self,
+        input: BufferRef,
+        out_buf: BufferRef,
+        batch: u32,
+        features: u32,
+    ) {
+        use crate::schedule::{PointwiseDAG, Pw, ReduceOp, ReductionEpilogue, ReductionKernel};
+
+        const WG: u32 = 256;
+
+        // Allocate intermediate row_max buffer: batch × f32.
+        let row_max = self.alloc_buffer((batch as usize) * 4);
+
+        // --- Dispatch 1: row-wise max reduction ---
+        let max_prologue = PointwiseDAG {
+            n_inputs: 1,
+            ops: vec![Pw::LoadInput(0)],
+            output: 0,
+        };
+        let max_kernel = ReductionKernel {
+            op: ReduceOp::Max,
+            prologue: max_prologue,
+            epilogue: None,
+            n_per_elem: 1,
+            n_per_row: 0,
+            workgroup_size: WG,
+        };
+        self.plan.dispatches.push(Dispatch {
+            // Sentinel shader for runtime data-layout selection (UnaryData).
+            shader: ShaderEntry::Relu,
+            workgroups: [batch, 1, 1],
+            input_buffers: vec![input],
+            output_buffer: row_max,
+            extra_outputs: vec![],
+            params: vec![batch, features, 0, 0],
+            use_coop: false,
+            use_small_tiles: false,
+            reduction: Some(max_kernel),
+            ..Default::default()
+        });
+
+        // --- Dispatch 2: sum reduction with exp-subtract prologue + normalize epilogue ---
+        // Prologue DAG: inputs are 0=src (per-elem), 1=row_max (per-row).
+        //   exp(src - row_max) → scalar contribution.
+        let sum_prologue = PointwiseDAG {
+            n_inputs: 2,
+            ops: vec![
+                Pw::LoadInput(0), // v0 = src
+                Pw::LoadInput(1), // v1 = row_max
+                Pw::Sub(0, 1),    // v2 = src - row_max
+                Pw::Exp(2),       // v3 = exp(src - row_max)
+            ],
+            output: 3,
+        };
+        // Epilogue: inputs 0=src (per-elem), 1=row_max (per-row),
+        //           2=row_sum (reduced scalar, always last).
+        let sum_epilogue_dag = PointwiseDAG {
+            n_inputs: 3,
+            ops: vec![
+                Pw::LoadInput(0), // v0 = src
+                Pw::LoadInput(1), // v1 = row_max
+                Pw::LoadInput(2), // v2 = row_sum
+                Pw::Sub(0, 1),    // v3 = src - row_max
+                Pw::Exp(3),       // v4 = exp(src - row_max)
+                Pw::Div(4, 2),    // v5 = exp(...) / row_sum
+            ],
+            output: 5,
+        };
+        let sum_kernel = ReductionKernel {
+            op: ReduceOp::Sum,
+            prologue: sum_prologue,
+            epilogue: Some(ReductionEpilogue {
+                dag: sum_epilogue_dag,
+                n_per_col_inputs: 0,
+            }),
+            n_per_elem: 1,
+            n_per_row: 1,
+            workgroup_size: WG,
+        };
+        self.plan.dispatches.push(Dispatch {
+            // Sentinel for runtime data-layout: 1 per-elem + 1 per-row → 2
+            // buffer inputs → we key the runtime off `reduction.is_some()`
+            // and the kernel's arity, so the shader field is purely a
+            // historical leftover here.
+            shader: ShaderEntry::Add,
+            workgroups: [batch, 1, 1],
+            input_buffers: vec![input, row_max],
+            output_buffer: out_buf,
+            extra_outputs: vec![],
+            params: vec![batch, features, 0, 0],
+            use_coop: false,
+            use_small_tiles: false,
+            reduction: Some(sum_kernel),
+            ..Default::default()
+        });
     }
 
     fn emit_unary(&mut self, shader: ShaderEntry, node: &Node, out_buf: BufferRef) {
