@@ -434,8 +434,179 @@ pub fn compile_with(graph: &Graph, options: &CompileOptions) -> ExecutionPlan {
     }
 
     fuse_epilogues(&mut compiler.plan.dispatches);
+    if options.use_schedule_pointwise {
+        fuse_pointwise_chains(&mut compiler.plan);
+    }
 
     compiler.plan
+}
+
+/// Post-compile pass: merge sequential single-use pointwise dispatches into
+/// a single deeper-DAG dispatch, eliminating the intermediate buffer and
+/// the barrier between them. Only runs when
+/// `CompileOptions::use_schedule_pointwise` is set (pointwise dispatches
+/// carry the DAG the pass needs).
+///
+/// Conservative criteria — a producer P is fused into consumer C only when:
+///   1. Both `P.pointwise` and `C.pointwise` are `Some`.
+///   2. P's output buffer is read by exactly one dispatch (C) and appears
+///      in no plan-level role (output/loss/param/input/constant/extra).
+///   3. C's workgroups match P's (same output length).
+///   4. Exactly one of C's input buffers equals P's output buffer (no
+///      diamond — the intermediate is consumed in one slot only).
+fn fuse_pointwise_chains(plan: &mut ExecutionPlan) {
+    use std::collections::{HashMap, HashSet};
+
+    // Buffers we must not eliminate. Anything here is preserved even if it
+    // looks single-use from the dispatch list alone.
+    let mut protected: HashSet<BufferRef> = HashSet::new();
+    protected.extend(plan.output_buffers.iter().copied());
+    if let Some(b) = plan.loss_buffer {
+        protected.insert(b);
+    }
+    for entry in &plan.param_buffers {
+        protected.insert(entry.1);
+    }
+    for entry in &plan.input_buffers {
+        protected.insert(entry.1);
+    }
+    for entry in &plan.constant_buffers {
+        protected.insert(entry.0);
+    }
+    for entry in &plan.lse_buffers {
+        protected.insert(entry.1);
+    }
+
+    // Iterate until no more fusions apply.
+    loop {
+        // Recompute indices each pass since dispatches shift.
+        let n = plan.dispatches.len();
+
+        // Producer: output_buffer -> dispatch index.
+        let mut producer: HashMap<BufferRef, usize> = HashMap::new();
+        for (i, d) in plan.dispatches.iter().enumerate() {
+            producer.insert(d.output_buffer, i);
+        }
+
+        // Reader counts.
+        let mut reads: HashMap<BufferRef, usize> = HashMap::new();
+        for d in &plan.dispatches {
+            for b in &d.input_buffers {
+                *reads.entry(*b).or_default() += 1;
+            }
+            // extra_outputs are also "referenced"; count them as protected.
+            for b in &d.extra_outputs {
+                protected.insert(*b);
+            }
+            for b in &d.epilogue_buffers {
+                *reads.entry(*b).or_default() += 1;
+            }
+        }
+
+        let mut fused_any = false;
+        for ci in 0..n {
+            let c = &plan.dispatches[ci];
+            if c.pointwise.is_none() {
+                continue;
+            }
+
+            // Find a fusion candidate: exactly one input slot that resolves
+            // to a pointwise producer satisfying the criteria.
+            let mut candidate: Option<(u8, usize)> = None; // (input_idx, producer_dispatch_idx)
+            for (slot_idx, buf) in c.input_buffers.iter().enumerate() {
+                if protected.contains(buf) {
+                    continue;
+                }
+                let Some(&pi) = producer.get(buf) else {
+                    continue;
+                };
+                if pi == ci {
+                    continue;
+                }
+                let p = &plan.dispatches[pi];
+                if p.pointwise.is_none() {
+                    continue;
+                }
+                if reads.get(buf).copied().unwrap_or(0) != 1 {
+                    continue;
+                }
+                // Same per-element workload (len).
+                if p.workgroups != c.workgroups {
+                    continue;
+                }
+                if p.params.first() != c.params.first() {
+                    continue;
+                }
+                // The consumer must read this buffer in exactly one slot.
+                let slot_count = c.input_buffers.iter().filter(|b| *b == buf).count();
+                if slot_count != 1 {
+                    continue;
+                }
+                // Arity cap: the runtime binds pointwise pipelines via
+                // UnaryData (n=1) or BinaryData (n=2). A higher-arity
+                // fused DAG would need a wider layout we don't plumb yet.
+                let new_arity = p.input_buffers.len() + c.input_buffers.len() - 1;
+                if new_arity > 2 {
+                    continue;
+                }
+                candidate = Some((slot_idx as u8, pi));
+                break;
+            }
+
+            let Some((input_idx, pi)) = candidate else {
+                continue;
+            };
+
+            // Perform the fusion.
+            let producer_d = plan.dispatches[pi].clone();
+            let consumer_d = &mut plan.dispatches[ci];
+
+            let p_dag = producer_d.pointwise.expect("checked above");
+            let c_dag = consumer_d
+                .pointwise
+                .as_ref()
+                .expect("checked above")
+                .clone();
+            let fused_dag = c_dag.fuse_input(input_idx, &p_dag);
+
+            // Rebuild consumer input_buffers: producer inputs, then
+            // consumer inputs with the fused slot removed, in order.
+            let mut new_inputs: Vec<BufferRef> = producer_d.input_buffers.clone();
+            for (idx, b) in consumer_d.input_buffers.iter().enumerate() {
+                if idx as u8 != input_idx {
+                    new_inputs.push(*b);
+                }
+            }
+            consumer_d.input_buffers = new_inputs;
+            consumer_d.pointwise = Some(fused_dag);
+            // The consumer now reads from more buffers; its ShaderEntry
+            // (used only to pick the data layout) must reflect the new
+            // arity. The runtime binds via UnaryData for n=1, BinaryData
+            // for n=2; arities >2 would need a wider layout we don't yet
+            // plumb. Guard against that.
+            let new_arity = consumer_d.input_buffers.len();
+            match new_arity {
+                1 => {
+                    // Keep whatever unary entry picks UnaryData layout.
+                    // The pipeline will be the generated one anyway.
+                    consumer_d.shader = ShaderEntry::Relu;
+                }
+                2 => {
+                    consumer_d.shader = ShaderEntry::Add;
+                }
+                _ => unreachable!("arity capped at 2 by candidate-selection guard"),
+            }
+
+            // Drop the producer dispatch.
+            plan.dispatches.remove(pi);
+            fused_any = true;
+            break;
+        }
+
+        if !fused_any {
+            break;
+        }
+    }
 }
 
 /// Post-compile pass: absorb single-use elementwise dispatches into

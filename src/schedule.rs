@@ -181,6 +181,78 @@ impl PointwiseDAG {
             n => (0..n).map(|i| format!("src_{}", i)).collect(),
         }
     }
+
+    /// Fuse a `producer` DAG into one of this DAG's input streams.
+    ///
+    /// Returns a new DAG equivalent to "whatever `self` does, but wherever
+    /// it loaded input `consumer_input_idx`, substitute the output of
+    /// `producer` instead". The new DAG's inputs are `producer`'s inputs
+    /// followed by `self`'s remaining inputs (all except the fused one),
+    /// in original order. Total inputs: `producer.n_inputs + self.n_inputs - 1`.
+    ///
+    /// Panics if `consumer_input_idx >= self.n_inputs`.
+    pub fn fuse_input(&self, consumer_input_idx: u8, producer: &PointwiseDAG) -> PointwiseDAG {
+        assert!(
+            consumer_input_idx < self.n_inputs,
+            "fuse_input: index {} out of range (n_inputs={})",
+            consumer_input_idx,
+            self.n_inputs
+        );
+
+        // Start the merged op list with producer's ops verbatim; their
+        // internal indices are already correct since they reference only
+        // earlier producer ops.
+        let mut ops = producer.ops.clone();
+
+        // Map each of self's op indices to its position in `ops` after
+        // remapping. A LoadInput matching the fused input isn't added as
+        // a new op — it aliases directly to `producer.output`.
+        let mut self_remap: Vec<u16> = Vec::with_capacity(self.ops.len());
+
+        for op in &self.ops {
+            if let Pw::LoadInput(j) = *op {
+                if j == consumer_input_idx {
+                    self_remap.push(producer.output);
+                    continue;
+                }
+            }
+            let remapped = match *op {
+                Pw::LoadInput(j) => {
+                    let new_j = if j < consumer_input_idx {
+                        producer.n_inputs + j
+                    } else {
+                        producer.n_inputs + j - 1
+                    };
+                    Pw::LoadInput(new_j)
+                }
+                Pw::Const(bits) => Pw::Const(bits),
+                Pw::Add(a, b) => Pw::Add(self_remap[a as usize], self_remap[b as usize]),
+                Pw::Mul(a, b) => Pw::Mul(self_remap[a as usize], self_remap[b as usize]),
+                Pw::Sub(a, b) => Pw::Sub(self_remap[a as usize], self_remap[b as usize]),
+                Pw::Div(a, b) => Pw::Div(self_remap[a as usize], self_remap[b as usize]),
+                Pw::Greater(a, b) => Pw::Greater(self_remap[a as usize], self_remap[b as usize]),
+                Pw::Neg(a) => Pw::Neg(self_remap[a as usize]),
+                Pw::Recip(a) => Pw::Recip(self_remap[a as usize]),
+                Pw::Exp(a) => Pw::Exp(self_remap[a as usize]),
+                Pw::Log(a) => Pw::Log(self_remap[a as usize]),
+                Pw::Abs(a) => Pw::Abs(self_remap[a as usize]),
+                Pw::Sqrt(a) => Pw::Sqrt(self_remap[a as usize]),
+                Pw::Rsqrt(a) => Pw::Rsqrt(self_remap[a as usize]),
+                Pw::Relu(a) => Pw::Relu(self_remap[a as usize]),
+                Pw::Sigmoid(a) => Pw::Sigmoid(self_remap[a as usize]),
+                Pw::Silu(a) => Pw::Silu(self_remap[a as usize]),
+                Pw::Tanh(a) => Pw::Tanh(self_remap[a as usize]),
+            };
+            self_remap.push(ops.len() as u16);
+            ops.push(remapped);
+        }
+
+        PointwiseDAG {
+            n_inputs: producer.n_inputs + self.n_inputs - 1,
+            output: self_remap[self.output as usize],
+            ops,
+        }
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -390,6 +462,89 @@ mod tests {
             grid: GridShape::default(),
         });
         assert!(sm.source.contains("0.5f"));
+    }
+
+    #[test]
+    fn fuse_relu_into_add_consumer_replaces_input_a() {
+        // consumer: dst = src_a + src_b          (Add)
+        // producer: src = relu(src)              (Relu)
+        // fused into consumer's input 0:
+        //   dst = relu(src_a_new) + src_b_new
+        // where src_a_new = original producer input, src_b_new = consumer's
+        // remaining input (original consumer input 1).
+        let consumer = add_dag();
+        let producer = relu_dag();
+        let fused = consumer.fuse_input(0, &producer);
+
+        assert_eq!(fused.n_inputs, 2); // 1 (producer) + 2 (consumer) - 1
+        let sm = lower(&KernelTemplate::Pointwise {
+            dag: fused.clone(),
+            grid: GridShape::default(),
+        });
+        // Binding names collapse back to src_a / src_b for n=2.
+        assert!(sm.source.contains("var<storage> src_a: array<f32>;"));
+        assert!(sm.source.contains("var<storage> src_b: array<f32>;"));
+        // The fused op list: producer's [LoadInput(0), Relu(0)] followed by
+        // consumer's [LoadInput(1 remapped), Add(relu_out, other)].
+        // Concretely: ops = [LoadInput(0), Relu(0), LoadInput(1), Add(1, 2)].
+        assert_eq!(
+            fused.ops,
+            vec![
+                Pw::LoadInput(0),
+                Pw::Relu(0),
+                Pw::LoadInput(1),
+                Pw::Add(1, 2),
+            ]
+        );
+        assert_eq!(fused.output, 3);
+    }
+
+    #[test]
+    fn fuse_relu_into_add_consumer_input_b() {
+        // Fuse relu into the *second* input of Add.
+        // Expected: ops = [LoadInput(0)_prod, Relu(0), LoadInput(1)_cons_a, Add(2, 1)]
+        // with consumer's input 0 remapped from idx 0 → LoadInput(1).
+        let consumer = add_dag();
+        let producer = relu_dag();
+        let fused = consumer.fuse_input(1, &producer);
+
+        assert_eq!(fused.n_inputs, 2);
+        assert_eq!(
+            fused.ops,
+            vec![
+                Pw::LoadInput(0),
+                Pw::Relu(0),
+                Pw::LoadInput(1),
+                Pw::Add(2, 1),
+            ]
+        );
+        assert_eq!(fused.output, 3);
+    }
+
+    #[test]
+    fn fuse_chain_produces_valid_wgsl() {
+        // (relu(x) fused into neg) -> neg(relu(x))
+        let producer = relu_dag();
+        let consumer = PointwiseDAG {
+            n_inputs: 1,
+            ops: vec![Pw::LoadInput(0), Pw::Neg(0)],
+            output: 1,
+        };
+        let fused = consumer.fuse_input(0, &producer);
+        assert_eq!(fused.n_inputs, 1);
+
+        let sm = lower(&KernelTemplate::Pointwise {
+            dag: fused,
+            grid: GridShape::default(),
+        });
+        assert!(sm.source.contains("max(v0, 0.0)"));
+        assert!(sm.source.contains("-v1"));
+
+        use naga::valid::{Capabilities, ValidationFlags, Validator};
+        let flags = ValidationFlags::all() ^ ValidationFlags::BINDINGS;
+        Validator::new(flags, Capabilities::all())
+            .validate(&sm.module)
+            .unwrap_or_else(|e| panic!("fused DAG invalid: {:?}\n{}", e, sm.source));
     }
 
     #[test]
