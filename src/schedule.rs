@@ -22,6 +22,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::fmt::Write;
 use std::hash::{Hash, Hasher};
 
+use serde::{Deserialize, Serialize};
+
 use crate::codegen::ShaderModule;
 
 // -------------------------------------------------------------------------
@@ -32,7 +34,7 @@ use crate::codegen::ShaderModule;
 ///
 /// `Hash` derived so that a `PointwiseDAG` can be used as a content-hashed
 /// cache key when looking up generated pipelines.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Pw {
     /// Load input stream `idx` at the current element position.
     LoadInput(u8),
@@ -71,7 +73,7 @@ impl Pw {
 
 /// A DAG of scalar elementwise ops with `n_inputs` input streams and one
 /// output. Value nodes reference earlier entries by index.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PointwiseDAG {
     pub n_inputs: u8,
     pub ops: Vec<Pw>,

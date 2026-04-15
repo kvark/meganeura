@@ -1,6 +1,23 @@
 use crate::graph::{Graph, Node, NodeId, Op};
+use crate::schedule::PointwiseDAG;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// Options controlling graph → execution-plan compilation.
+///
+/// Defaults preserve historical behavior. Opt-in fields let callers flip on
+/// experimental paths without changing the library's default output. Wire
+/// these to env vars or CLI flags in your own harness if you want — the
+/// library itself takes only this typed struct.
+#[derive(Clone, Debug, Default)]
+pub struct CompileOptions {
+    /// Route unary pointwise ops (Relu, Sigmoid, Tanh, Neg, Abs, Log, Recip,
+    /// Silu) through the schedule-template codegen path instead of the
+    /// hand-written unary.wgsl shader. The generated WGSL uses the same
+    /// `UnaryData` binding layout, so no runtime surface changes for callers.
+    /// Off by default until parity is verified on the bench suite.
+    pub use_schedule_pointwise: bool,
+}
 
 /// Identifies which shader and entry point to use.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -308,6 +325,12 @@ pub struct Dispatch {
     /// Human-readable label for profiling (e.g. "MatMul[50,720,960]").
     #[serde(default)]
     pub label: String,
+    /// When `Some`, this dispatch uses a schedule-template-generated
+    /// pointwise kernel. The runtime compiles a dedicated pipeline from the
+    /// DAG (keyed by `PointwiseDAG::hash_key`) and binds it using the same
+    /// `UnaryData` / `BinaryData` layout that `shader` already selects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pointwise: Option<PointwiseDAG>,
 }
 
 /// Reference to a GPU buffer in the execution plan.
@@ -386,7 +409,11 @@ fn topological_order(graph: &Graph) -> Vec<NodeId> {
 }
 
 pub fn compile(graph: &Graph) -> ExecutionPlan {
-    let mut compiler = Compiler::new(graph);
+    compile_with(graph, &CompileOptions::default())
+}
+
+pub fn compile_with(graph: &Graph, options: &CompileOptions) -> ExecutionPlan {
+    let mut compiler = Compiler::new_with_options(graph, options.clone());
     compiler.compile();
 
     // Propagate derived parameter info from graph to plan
@@ -442,6 +469,14 @@ fn fuse_epilogues(dispatches: &mut Vec<Dispatch>) {
         // shader data layout, which is a larger change. TODO: extend shader data
         // layouts to support dynamic extra bindings for binary epilogues.
         if d.input_buffers.len() != 1 {
+            continue;
+        }
+
+        // Dispatches that have opted into schedule-template pointwise codegen
+        // must not be absorbed into the legacy matmul epilogue path — they
+        // are generated separately at session creation and use a different
+        // pipeline.
+        if d.pointwise.is_some() {
             continue;
         }
 
@@ -508,15 +543,40 @@ fn fuse_epilogues(dispatches: &mut Vec<Dispatch>) {
     }
 }
 
+/// Build a 1-input pointwise DAG equivalent to `shader`, or `None` if the
+/// shader isn't a unary elementwise op. Used when
+/// `CompileOptions::use_schedule_pointwise` is set to route unary ops
+/// through the generated codegen path instead of the hand-written shader.
+fn unary_shader_to_pointwise(shader: &ShaderEntry) -> Option<PointwiseDAG> {
+    use crate::schedule::Pw;
+    let op = match *shader {
+        ShaderEntry::Relu => Pw::Relu(0),
+        ShaderEntry::Sigmoid => Pw::Sigmoid(0),
+        ShaderEntry::Tanh => Pw::Tanh(0),
+        ShaderEntry::Neg => Pw::Neg(0),
+        ShaderEntry::Abs => Pw::Abs(0),
+        ShaderEntry::Log => Pw::Log(0),
+        ShaderEntry::Recip => Pw::Recip(0),
+        ShaderEntry::Silu => Pw::Silu(0),
+        _ => return None,
+    };
+    Some(PointwiseDAG {
+        n_inputs: 1,
+        ops: vec![Pw::LoadInput(0), op],
+        output: 1,
+    })
+}
+
 struct Compiler<'a> {
     graph: &'a Graph,
     plan: ExecutionPlan,
     /// Map from NodeId → BufferRef for each node's output.
     node_buffers: HashMap<NodeId, BufferRef>,
+    options: CompileOptions,
 }
 
 impl<'a> Compiler<'a> {
-    fn new(graph: &'a Graph) -> Self {
+    fn new_with_options(graph: &'a Graph, options: CompileOptions) -> Self {
         Self {
             graph,
             plan: ExecutionPlan {
@@ -532,6 +592,7 @@ impl<'a> Compiler<'a> {
                 derived_params: Vec::new(),
             },
             node_buffers: HashMap::new(),
+            options,
         }
     }
 
@@ -2162,6 +2223,11 @@ impl<'a> Compiler<'a> {
     fn emit_unary(&mut self, shader: ShaderEntry, node: &Node, out_buf: BufferRef) {
         let input = self.get_buffer(node.inputs[0]);
         let len = node.ty.num_elements() as u32;
+        let pointwise = if self.options.use_schedule_pointwise {
+            unary_shader_to_pointwise(&shader)
+        } else {
+            None
+        };
         self.plan.dispatches.push(Dispatch {
             shader,
             workgroups: [len.div_ceil(256), 1, 1],
@@ -2171,6 +2237,7 @@ impl<'a> Compiler<'a> {
             params: vec![len, 0, 0, 0],
             use_coop: false,
             use_small_tiles: false,
+            pointwise,
             ..Default::default()
         });
     }

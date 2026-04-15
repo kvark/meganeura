@@ -226,6 +226,15 @@ impl Trainer {
 /// Skips autodiff (no backward pass). Runs egglog optimization and
 /// compiles the graph to a GPU session ready for forward evaluation.
 pub fn build_inference_session(forward_graph: &Graph) -> Session {
+    build_inference_session_with(forward_graph, &compile::CompileOptions::default())
+}
+
+/// Like [`build_inference_session`], but accepts [`compile::CompileOptions`]
+/// to toggle experimental paths (e.g. schedule-template codegen).
+pub fn build_inference_session_with(
+    forward_graph: &Graph,
+    options: &compile::CompileOptions,
+) -> Session {
     log::info!("building inference session...");
     log::info!("forward graph:\n{}", forward_graph);
 
@@ -246,7 +255,7 @@ pub fn build_inference_session(forward_graph: &Graph) -> Session {
 
     // Compile to execution plan
     log::info!("compiling execution plan...");
-    let plan = compile::compile(&optimized);
+    let plan = compile::compile_with(&optimized, options);
     log::info!(
         "execution plan: {} buffers, {} dispatches",
         plan.buffers.len(),
@@ -267,7 +276,13 @@ pub fn build_inference_session(forward_graph: &Graph) -> Session {
 /// 4. Compiles the optimized graph to an execution plan
 /// 5. Creates a GPU session with all resources allocated
 pub fn build_session(forward_graph: &Graph) -> Session {
-    let (session, report) = build_session_with_report(forward_graph);
+    build_session_with(forward_graph, &compile::CompileOptions::default())
+}
+
+/// Like [`build_session`], but accepts [`compile::CompileOptions`] to toggle
+/// experimental paths (e.g. schedule-template codegen).
+pub fn build_session_with(forward_graph: &Graph, options: &compile::CompileOptions) -> Session {
+    let (session, report) = build_session_with_report_and_options(forward_graph, options);
     log::info!("{}", report);
     session
 }
@@ -278,6 +293,14 @@ pub fn build_session(forward_graph: &Graph) -> Session {
 /// as tracing spans and will appear in Perfetto traces when profiling is
 /// active.
 pub fn build_session_with_report(forward_graph: &Graph) -> (Session, OptimizeReport) {
+    build_session_with_report_and_options(forward_graph, &compile::CompileOptions::default())
+}
+
+/// [`build_session_with_report`] + [`compile::CompileOptions`].
+pub fn build_session_with_report_and_options(
+    forward_graph: &Graph,
+    options: &compile::CompileOptions,
+) -> (Session, OptimizeReport) {
     let _span = tracing::info_span!("build_session").entered();
 
     log::info!("building training session...");
@@ -327,7 +350,7 @@ pub fn build_session_with_report(forward_graph: &Graph) -> (Session, OptimizeRep
     log::info!("compiling execution plan...");
     let plan = {
         let _span = tracing::info_span!("compile").entered();
-        compile::compile(&optimized)
+        compile::compile_with(&optimized, options)
     };
     log::info!(
         "execution plan: {} buffers, {} dispatches",
