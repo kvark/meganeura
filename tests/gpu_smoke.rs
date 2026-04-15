@@ -6,6 +6,28 @@ use meganeura::{
     models::smolvla::{self, SmolVLAConfig},
 };
 
+/// Noise-aware relative error for finite-difference gradient checks.
+///
+/// Central-difference numerical gradients with `eps=1e-3` have a truncation
+/// error floor of O(eps² · |f'''|/6) ≈ a few × 1e-6 for typical ML ops.
+/// Dividing that floor by a tiny analytical gradient (e.g. 3e-5) blows up
+/// the relative error into the 5–10% range even though the analytical
+/// gradient is correct.
+///
+/// Returns 0.0 when the absolute error is within the truncation floor
+/// (`abs_tol`, default 3e-6), so such elements don't poison `max_rel_err`.
+/// Otherwise returns the standard relative error. Callers keep their
+/// existing `max_rel_err < threshold` asserts unchanged.
+fn grad_rel_err(num: f32, ana: f32) -> f32 {
+    let abs_err = (num - ana).abs();
+    const ABS_TOL: f32 = 3e-6;
+    if abs_err < ABS_TOL {
+        0.0
+    } else {
+        abs_err / num.abs().max(ana.abs()).max(1e-6)
+    }
+}
+
 #[test]
 fn matmul_non_uniform_values() {
     // Non-uniform matmul: A (16×16) where A[i,j]=i+1, B (16×16) where B[i,j]=j+1.
@@ -462,7 +484,7 @@ fn multi_head_attn_gradient_check() {
         let lm = fwd(&mut infer_sess, &qd, &k_data, &v_data);
         let num = (lp - lm) / (2.0 * eps);
         let ana = grad_q[idx];
-        let rel = (num - ana).abs() / (num.abs().max(ana.abs()).max(1e-6));
+        let rel = grad_rel_err(num, ana);
         eprintln!("grad_q[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
         if max_rel_err < rel {
             max_rel_err = rel;
@@ -482,7 +504,7 @@ fn multi_head_attn_gradient_check() {
         let lm = fwd(&mut infer_sess, &q_data, &kd, &v_data);
         let num = (lp - lm) / (2.0 * eps);
         let ana = grad_k[idx];
-        let rel = (num - ana).abs() / (num.abs().max(ana.abs()).max(1e-6));
+        let rel = grad_rel_err(num, ana);
         eprintln!("grad_k[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
         if max_rel_err < rel {
             max_rel_err = rel;
@@ -502,7 +524,7 @@ fn multi_head_attn_gradient_check() {
         let lm = fwd(&mut infer_sess, &q_data, &k_data, &vd);
         let num = (lp - lm) / (2.0 * eps);
         let ana = grad_v[idx];
-        let rel = (num - ana).abs() / (num.abs().max(ana.abs()).max(1e-6));
+        let rel = grad_rel_err(num, ana);
         eprintln!("grad_v[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
         if max_rel_err < rel {
             max_rel_err = rel;
@@ -809,7 +831,7 @@ fn smollm2_e2e_gradient_finite_diff() {
 
             let num = (lp - lm) / (2.0 * eps);
             let ana = grad[idx];
-            let rel = (num - ana).abs() / num.abs().max(ana.abs()).max(1e-8);
+            let rel = grad_rel_err(num, ana);
             // Only count errors where BOTH values are above f32 noise floor.
             // For large models with small weights, many gradient elements are too small
             // for finite differences to detect (loss change < f32 epsilon).
@@ -977,7 +999,7 @@ fn causal_attention_gradient_check() {
         let lm = fwd(&mut infer_sess, &qd, &k_data, &v_data);
         let num = (lp - lm) / (2.0 * eps);
         let ana = grad_q[idx];
-        let rel = (num - ana).abs() / (num.abs().max(ana.abs()).max(1e-6));
+        let rel = grad_rel_err(num, ana);
         eprintln!("causal grad_q[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
         if max_rel_err < rel {
             max_rel_err = rel;
@@ -996,7 +1018,7 @@ fn causal_attention_gradient_check() {
         let lm = fwd(&mut infer_sess, &q_data, &kd, &v_data);
         let num = (lp - lm) / (2.0 * eps);
         let ana = grad_k[idx];
-        let rel = (num - ana).abs() / (num.abs().max(ana.abs()).max(1e-6));
+        let rel = grad_rel_err(num, ana);
         eprintln!("causal grad_k[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
         if max_rel_err < rel {
             max_rel_err = rel;
@@ -1015,7 +1037,7 @@ fn causal_attention_gradient_check() {
         let lm = fwd(&mut infer_sess, &q_data, &k_data, &vd);
         let num = (lp - lm) / (2.0 * eps);
         let ana = grad_v[idx];
-        let rel = (num - ana).abs() / (num.abs().max(ana.abs()).max(1e-6));
+        let rel = grad_rel_err(num, ana);
         eprintln!("causal grad_v[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
         if max_rel_err < rel {
             max_rel_err = rel;
@@ -1122,7 +1144,7 @@ fn swiglu_concat_gradient_check() {
         let lm = fwd(&mut isess, &wd);
         let num = (lp - lm) / (2.0 * eps);
         let ana = grad_w[idx];
-        let rel = (num - ana).abs() / (num.abs().max(ana.abs()).max(1e-6));
+        let rel = grad_rel_err(num, ana);
         eprintln!("grad_w[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
         if max_rel_err < rel {
             max_rel_err = rel;
@@ -1811,7 +1833,7 @@ fn cross_entropy_gradient_check() {
         let lm = fwd(&mut isess, &x_data, &wd);
         let num = (lp - lm) / (2.0 * eps);
         let ana = grad_w[idx];
-        let rel = (num - ana).abs() / num.abs().max(ana.abs()).max(1e-8);
+        let rel = grad_rel_err(num, ana);
         eprintln!("grad_w[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
         max_rel = max_rel.max(rel);
     }
@@ -1826,7 +1848,7 @@ fn cross_entropy_gradient_check() {
         let lm = fwd(&mut isess, &xd, &w_data);
         let num = (lp - lm) / (2.0 * eps);
         let ana = grad_x[idx];
-        let rel = (num - ana).abs() / num.abs().max(ana.abs()).max(1e-8);
+        let rel = grad_rel_err(num, ana);
         eprintln!("grad_x[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
         max_rel = max_rel.max(rel);
     }
@@ -1905,7 +1927,7 @@ fn matmul_bt_gradient_check() {
         let lm = fwd(&mut isess, &ad, &b_data);
         let num = (lp - lm) / (2.0 * eps);
         let ana = grad_a[idx];
-        let rel = (num - ana).abs() / num.abs().max(ana.abs()).max(1e-8);
+        let rel = grad_rel_err(num, ana);
         eprintln!("grad_a[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
         max_rel = max_rel.max(rel);
     }
@@ -1920,7 +1942,7 @@ fn matmul_bt_gradient_check() {
         let lm = fwd(&mut isess, &a_data, &bd);
         let num = (lp - lm) / (2.0 * eps);
         let ana = grad_b[idx];
-        let rel = (num - ana).abs() / num.abs().max(ana.abs()).max(1e-8);
+        let rel = grad_rel_err(num, ana);
         eprintln!("grad_b[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
         max_rel = max_rel.max(rel);
     }
@@ -1985,7 +2007,7 @@ fn tanh_gradient_check() {
         let lm = infer_sess.read_loss();
         let num = (lp - lm) / (2.0 * eps);
         let ana = grad_x[idx];
-        let rel = (num - ana).abs() / (num.abs().max(ana.abs()).max(1e-6));
+        let rel = grad_rel_err(num, ana);
         eprintln!("tanh grad_x[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
         max_rel_err = max_rel_err.max(rel);
     }
@@ -2113,7 +2135,7 @@ fn sliding_window_attention_gradient_check() {
         let lm = fwd(&mut infer_sess, &qd, &k_data, &v_data);
         let num = (lp - lm) / (2.0 * eps);
         let ana = grad_q[idx];
-        let rel = (num - ana).abs() / (num.abs().max(ana.abs()).max(1e-6));
+        let rel = grad_rel_err(num, ana);
         eprintln!("swa grad_q[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
         max_rel_err = max_rel_err.max(rel);
         checks += 1;
@@ -2130,7 +2152,7 @@ fn sliding_window_attention_gradient_check() {
         let lm = fwd(&mut infer_sess, &q_data, &kd, &v_data);
         let num = (lp - lm) / (2.0 * eps);
         let ana = grad_k[idx];
-        let rel = (num - ana).abs() / (num.abs().max(ana.abs()).max(1e-6));
+        let rel = grad_rel_err(num, ana);
         eprintln!("swa grad_k[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
         max_rel_err = max_rel_err.max(rel);
         checks += 1;
@@ -2147,7 +2169,7 @@ fn sliding_window_attention_gradient_check() {
         let lm = fwd(&mut infer_sess, &q_data, &k_data, &vd);
         let num = (lp - lm) / (2.0 * eps);
         let ana = grad_v[idx];
-        let rel = (num - ana).abs() / (num.abs().max(ana.abs()).max(1e-6));
+        let rel = grad_rel_err(num, ana);
         eprintln!("swa grad_v[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
         max_rel_err = max_rel_err.max(rel);
         checks += 1;
