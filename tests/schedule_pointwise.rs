@@ -172,6 +172,60 @@ fn fused_relu_into_add_runtime_parity() {
     });
 }
 
+/// Ternary fusion: `add(mul(a, b), c)` — a producer binary feeds into a
+/// consumer binary, producing an arity-3 fused DAG routed through
+/// TernaryData. Verifies both the dispatch-count collapse and runtime
+/// parity with the unfused path.
+#[test]
+fn ternary_fusion_add_of_mul() {
+    use meganeura::compile::{CompileOptions, compile_with};
+
+    let mut g = Graph::new();
+    let a = g.input("a", &[256]);
+    let b = g.input("b", &[256]);
+    let c = g.input("c", &[256]);
+    let ab = g.mul(a, b);
+    let out = g.add(ab, c);
+    g.set_outputs(vec![out]);
+
+    // Unfused: 2 dispatches (mul, add).
+    assert_eq!(
+        compile_with(&g, &CompileOptions::default())
+            .dispatches
+            .len(),
+        2
+    );
+    let fused = compile_with(
+        &g,
+        &CompileOptions {
+            use_schedule_pointwise: true,
+        },
+    );
+    assert_eq!(
+        fused.dispatches.len(),
+        1,
+        "expected mul+add to collapse into a single arity-3 dispatch"
+    );
+    let dag = fused.dispatches[0]
+        .pointwise
+        .as_ref()
+        .expect("fused dispatch should carry a DAG");
+    assert_eq!(dag.n_inputs, 3);
+
+    let a_data: Vec<f32> = (0..256).map(|i| (i as f32) * 0.1 - 12.0).collect();
+    let b_data: Vec<f32> = (0..256).map(|i| (i as f32) * 0.05 - 6.0).collect();
+    let c_data: Vec<f32> = (0..256).map(|i| -(i as f32) * 0.02 + 2.0).collect();
+    assert_parity(
+        &["a", "b", "c"],
+        &[&a_data, &b_data, &c_data],
+        256,
+        |g, xs| {
+            let ab = g.mul(xs[0], xs[1]);
+            g.add(ab, xs[2])
+        },
+    );
+}
+
 #[test]
 fn chain_add_relu_parity() {
     // Mixes a binary op with a unary op — exercises both generated-pipeline

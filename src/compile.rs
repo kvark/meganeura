@@ -543,10 +543,11 @@ fn fuse_pointwise_chains(plan: &mut ExecutionPlan) {
                     continue;
                 }
                 // Arity cap: the runtime binds pointwise pipelines via
-                // UnaryData (n=1) or BinaryData (n=2). A higher-arity
-                // fused DAG would need a wider layout we don't plumb yet.
+                // UnaryData (n=1), BinaryData (n=2), or TernaryData (n=3).
+                // A higher-arity fused DAG would need a wider layout we
+                // don't plumb yet.
                 let new_arity = p.input_buffers.len() + c.input_buffers.len() - 1;
-                if new_arity > 2 {
+                if new_arity > 3 {
                     continue;
                 }
                 candidate = Some((slot_idx as u8, pi));
@@ -584,18 +585,16 @@ fn fuse_pointwise_chains(plan: &mut ExecutionPlan) {
             // arity. The runtime binds via UnaryData for n=1, BinaryData
             // for n=2; arities >2 would need a wider layout we don't yet
             // plumb. Guard against that.
+            // Update the sentinel `shader` so the (legacy) pipeline-map
+            // lookup still resolves — actual binding/pipeline come from
+            // `pointwise`/`pointwise_map` via DAG arity.
             let new_arity = consumer_d.input_buffers.len();
-            match new_arity {
-                1 => {
-                    // Keep whatever unary entry picks UnaryData layout.
-                    // The pipeline will be the generated one anyway.
-                    consumer_d.shader = ShaderEntry::Relu;
-                }
-                2 => {
-                    consumer_d.shader = ShaderEntry::Add;
-                }
-                _ => unreachable!("arity capped at 2 by candidate-selection guard"),
-            }
+            consumer_d.shader = match new_arity {
+                1 => ShaderEntry::Relu,
+                2 => ShaderEntry::Add,
+                3 => ShaderEntry::SwiGLUGradGate, // dummy for TernaryData layout
+                _ => unreachable!("arity capped at 3 by candidate-selection guard"),
+            };
 
             // Drop the producer dispatch.
             plan.dispatches.remove(pi);
