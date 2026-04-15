@@ -1,21 +1,31 @@
 //! Parity tests: a graph's output must match within f32 round-off whether
-//! unary pointwise ops run through the hand-written `unary.wgsl` shader or
-//! the schedule-template codegen path. This is the gate that lets us retire
-//! hand-written unary entries one at a time.
+//! pointwise ops run through the hand-written `unary.wgsl` / `binary.wgsl`
+//! shaders or the schedule-template codegen path. This is the gate that
+//! lets us retire hand-written pointwise entries one at a time.
 
 use meganeura::{
     CompileOptions, Graph, NodeId, build_inference_session, build_inference_session_with,
 };
 
+/// Build+run a graph once, optionally with schedule-pointwise codegen on.
+///
+/// `build` receives the graph plus any input NodeIds it asked for via
+/// `input_names`, in order, and returns the output NodeId.
 fn run_once(
-    build: &dyn Fn(&mut Graph, NodeId) -> NodeId,
-    input: &[f32],
+    input_names: &[&str],
+    inputs: &[&[f32]],
+    n_out: usize,
+    build: &dyn Fn(&mut Graph, &[NodeId]) -> NodeId,
     opts_on: bool,
 ) -> Vec<f32> {
-    let n = input.len();
+    assert_eq!(input_names.len(), inputs.len());
     let mut g = Graph::new();
-    let x = g.input("x", &[n]);
-    let y = build(&mut g, x);
+    let ids: Vec<NodeId> = input_names
+        .iter()
+        .zip(inputs.iter())
+        .map(|(name, data)| g.input(name, &[data.len()]))
+        .collect();
+    let y = build(&mut g, &ids);
     g.set_outputs(vec![y]);
 
     let mut session = if opts_on {
@@ -26,15 +36,22 @@ fn run_once(
     } else {
         build_inference_session(&g)
     };
-    session.set_input("x", input);
+    for (name, data) in input_names.iter().zip(inputs.iter()) {
+        session.set_input(name, data);
+    }
     session.step();
     session.wait();
-    session.read_output(n)
+    session.read_output(n_out)
 }
 
-fn assert_parity(build: impl Fn(&mut Graph, NodeId) -> NodeId, input: &[f32]) {
-    let default = run_once(&build, input, false);
-    let schedule = run_once(&build, input, true);
+fn assert_parity(
+    input_names: &[&str],
+    inputs: &[&[f32]],
+    n_out: usize,
+    build: impl Fn(&mut Graph, &[NodeId]) -> NodeId,
+) {
+    let default = run_once(input_names, inputs, n_out, &build, false);
+    let schedule = run_once(input_names, inputs, n_out, &build, true);
     assert_eq!(default.len(), schedule.len());
     for (i, (a, b)) in default.iter().zip(schedule.iter()).enumerate() {
         assert!(
@@ -44,16 +61,18 @@ fn assert_parity(build: impl Fn(&mut Graph, NodeId) -> NodeId, input: &[f32]) {
     }
 }
 
+// ---- Unary ops ----
+
 #[test]
 fn relu_parity() {
     let input: Vec<f32> = (0..256).map(|i| (i as f32) * 0.1 - 12.0).collect();
-    assert_parity(|g, x| g.relu(x), &input);
+    assert_parity(&["x"], &[&input], 256, |g, xs| g.relu(xs[0]));
 }
 
 #[test]
 fn silu_parity() {
     let input: Vec<f32> = (0..256).map(|i| (i as f32) * 0.1 - 12.0).collect();
-    assert_parity(|g, x| g.silu(x), &input);
+    assert_parity(&["x"], &[&input], 256, |g, xs| g.silu(xs[0]));
 }
 
 #[test]
@@ -61,11 +80,52 @@ fn chain_relu_neg_parity() {
     // Two unary ops in sequence exercise two separately-generated
     // pointwise pipelines in the same plan.
     let input: Vec<f32> = (0..256).map(|i| (i as f32) * 0.1 - 12.0).collect();
-    assert_parity(
-        |g, x| {
-            let r = g.relu(x);
-            g.neg(r)
-        },
-        &input,
-    );
+    assert_parity(&["x"], &[&input], 256, |g, xs| {
+        let r = g.relu(xs[0]);
+        g.neg(r)
+    });
+}
+
+// ---- Binary ops ----
+
+#[test]
+fn add_parity() {
+    let a: Vec<f32> = (0..256).map(|i| (i as f32) * 0.05 - 6.0).collect();
+    let b: Vec<f32> = (0..256).map(|i| (i as f32) * 0.03 - 4.0).collect();
+    assert_parity(&["a", "b"], &[&a, &b], 256, |g, xs| g.add(xs[0], xs[1]));
+}
+
+#[test]
+fn mul_parity() {
+    let a: Vec<f32> = (0..256).map(|i| (i as f32) * 0.05 - 6.0).collect();
+    let b: Vec<f32> = (0..256).map(|i| (i as f32) * 0.03 - 4.0).collect();
+    assert_parity(&["a", "b"], &[&a, &b], 256, |g, xs| g.mul(xs[0], xs[1]));
+}
+
+#[test]
+fn greater_parity() {
+    let a: Vec<f32> = (0..256).map(|i| (i as f32) * 0.05 - 6.0).collect();
+    let b: Vec<f32> = (0..256).map(|i| -(i as f32) * 0.02 + 2.0).collect();
+    assert_parity(&["a", "b"], &[&a, &b], 256, |g, xs| g.greater(xs[0], xs[1]));
+}
+
+#[test]
+fn swiglu_parity() {
+    let gate: Vec<f32> = (0..256).map(|i| (i as f32) * 0.05 - 6.0).collect();
+    let up: Vec<f32> = (0..256).map(|i| (i as f32) * 0.02 - 2.0).collect();
+    assert_parity(&["gate", "up"], &[&gate, &up], 256, |g, xs| {
+        g.swiglu(xs[0], xs[1])
+    });
+}
+
+#[test]
+fn chain_add_relu_parity() {
+    // Mixes a binary op with a unary op — exercises both generated-pipeline
+    // kinds plus the BinaryData/UnaryData layout switching in one plan.
+    let a: Vec<f32> = (0..256).map(|i| (i as f32) * 0.05 - 6.0).collect();
+    let b: Vec<f32> = (0..256).map(|i| -(i as f32) * 0.02 + 2.0).collect();
+    assert_parity(&["a", "b"], &[&a, &b], 256, |g, xs| {
+        let s = g.add(xs[0], xs[1]);
+        g.relu(s)
+    });
 }

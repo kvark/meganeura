@@ -567,6 +567,39 @@ fn unary_shader_to_pointwise(shader: &ShaderEntry) -> Option<PointwiseDAG> {
     })
 }
 
+/// Build a 2-input pointwise DAG equivalent to `shader`, or `None` if the
+/// shader isn't a binary elementwise op using the shared `BinaryData`
+/// binding layout.
+fn binary_shader_to_pointwise(shader: &ShaderEntry) -> Option<PointwiseDAG> {
+    use crate::schedule::Pw;
+    // All binary shaders read two streams, named src_a/src_b by
+    // `schedule::PointwiseDAG::input_binding_names(2)` to match binary.wgsl.
+    let (ops, output) = match *shader {
+        ShaderEntry::Add => (vec![Pw::LoadInput(0), Pw::LoadInput(1), Pw::Add(0, 1)], 2),
+        ShaderEntry::Mul => (vec![Pw::LoadInput(0), Pw::LoadInput(1), Pw::Mul(0, 1)], 2),
+        ShaderEntry::Greater => (
+            vec![Pw::LoadInput(0), Pw::LoadInput(1), Pw::Greater(0, 1)],
+            2,
+        ),
+        ShaderEntry::SwiGLU => (
+            // swiglu(a, b) = silu(a) * b
+            vec![
+                Pw::LoadInput(0),
+                Pw::LoadInput(1),
+                Pw::Silu(0),
+                Pw::Mul(2, 1),
+            ],
+            3,
+        ),
+        _ => return None,
+    };
+    Some(PointwiseDAG {
+        n_inputs: 2,
+        ops,
+        output,
+    })
+}
+
 struct Compiler<'a> {
     graph: &'a Graph,
     plan: ExecutionPlan,
@@ -2246,6 +2279,11 @@ impl<'a> Compiler<'a> {
         let a = self.get_buffer(node.inputs[0]);
         let b = self.get_buffer(node.inputs[1]);
         let len = node.ty.num_elements() as u32;
+        let pointwise = if self.options.use_schedule_pointwise {
+            binary_shader_to_pointwise(&shader)
+        } else {
+            None
+        };
         self.plan.dispatches.push(Dispatch {
             shader,
             workgroups: [len.div_ceil(256), 1, 1],
@@ -2255,6 +2293,7 @@ impl<'a> Compiler<'a> {
             params: vec![len, 0, 0, 0],
             use_coop: false,
             use_small_tiles: false,
+            pointwise,
             ..Default::default()
         });
     }
