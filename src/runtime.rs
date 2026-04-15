@@ -561,6 +561,9 @@ struct Pipelines {
     /// Epilogue-fused pipelines keyed by (shader, epilogue chain).
     epilogue_map:
         HashMap<(ShaderEntry, Vec<crate::compile::EpilogueOp>), blade_graphics::ComputePipeline>,
+    /// Schedule-template-generated pointwise pipelines, keyed by DAG hash.
+    /// Populated for dispatches that carry a `pointwise` DAG.
+    pointwise_map: HashMap<u64, blade_graphics::ComputePipeline>,
 }
 
 impl Pipelines {
@@ -721,15 +724,54 @@ impl Pipelines {
             epilogue_map.insert(key, pipeline);
         }
 
+        // Compile schedule-template pointwise pipelines. Each unique DAG
+        // (keyed by its content hash) gets one pipeline; the dispatch's
+        // existing `shader` field is used only to pick the data layout
+        // (UnaryData for n=1 inputs, BinaryData for n=2), which already
+        // matches the generated WGSL's binding names.
+        let mut pointwise_map: HashMap<u64, blade_graphics::ComputePipeline> = HashMap::new();
+        for dispatch in &plan.dispatches {
+            let dag = match dispatch.pointwise {
+                Some(ref d) => d,
+                None => continue,
+            };
+            let key = dag.hash_key();
+            if pointwise_map.contains_key(&key) {
+                continue;
+            }
+            let template = crate::schedule::KernelTemplate::Pointwise {
+                dag: dag.clone(),
+                grid: crate::schedule::GridShape::default(),
+            };
+            let sm = crate::schedule::lower(&template);
+            let shader = gpu.create_shader(bg::ShaderDesc {
+                source: &sm.source,
+                naga_module: Some(sm.module),
+            });
+            let layout = shader_data_layout(&dispatch.shader);
+            let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
+                name: crate::schedule::POINTWISE_ENTRY,
+                data_layouts: &[&layout],
+                compute: shader.at(crate::schedule::POINTWISE_ENTRY),
+            });
+            pointwise_map.insert(key, pipeline);
+        }
+
         Self {
             map,
             coop_map,
             small_map,
             epilogue_map,
+            pointwise_map,
         }
     }
 
     fn get(&self, dispatch: &Dispatch) -> &blade_graphics::ComputePipeline {
+        if let Some(ref dag) = dispatch.pointwise {
+            if let Some(p) = self.pointwise_map.get(&dag.hash_key()) {
+                return p;
+            }
+        }
         if !dispatch.epilogue.is_empty() {
             let key = (dispatch.shader.clone(), dispatch.epilogue.clone());
             if let Some(p) = self.epilogue_map.get(&key) {
