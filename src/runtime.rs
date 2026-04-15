@@ -196,6 +196,36 @@ struct AdamParams {
 
 // reduce: var src, dst, params (same layout as UnaryData)
 
+// Schedule-template reduction params: { outer, inner, _pad0, _pad1 }.
+// 16 bytes; same layout as BiasAddParams with a different name for
+// clarity at the call site.
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct ReductionParams {
+    outer: u32,
+    inner: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+// Schedule-template reduction bindings — arity 1 (pure): var src, dst, params.
+#[derive(blade_macros::ShaderData)]
+struct ReductionPass1Data {
+    src: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: ReductionParams,
+}
+
+// Schedule-template reduction bindings — arity 2 with 1 per-elem + 1 per-row.
+// Used e.g. for softmax pass 2 (src + row_max).
+#[derive(blade_macros::ShaderData)]
+struct ReductionPass2RowData {
+    src: blade_graphics::BufferPiece,
+    per_row_src: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: ReductionParams,
+}
+
 // rms_norm: var src, bias (weight), dst, params
 #[derive(blade_macros::ShaderData)]
 struct RmsNormData {
@@ -564,6 +594,10 @@ struct Pipelines {
     /// Schedule-template-generated pointwise pipelines, keyed by DAG hash.
     /// Populated for dispatches that carry a `pointwise` DAG.
     pointwise_map: HashMap<u64, blade_graphics::ComputePipeline>,
+    /// Schedule-template-generated reduction pipelines, keyed by kernel
+    /// content hash. Populated for dispatches that carry a `reduction`
+    /// kernel spec.
+    reduction_map: HashMap<u64, blade_graphics::ComputePipeline>,
 }
 
 impl Pipelines {
@@ -757,16 +791,47 @@ impl Pipelines {
             pointwise_map.insert(key, pipeline);
         }
 
+        // Compile schedule-template reduction pipelines.
+        let mut reduction_map: HashMap<u64, blade_graphics::ComputePipeline> = HashMap::new();
+        for dispatch in &plan.dispatches {
+            let kernel = match dispatch.reduction {
+                Some(ref k) => k,
+                None => continue,
+            };
+            let key = kernel.hash_key();
+            if reduction_map.contains_key(&key) {
+                continue;
+            }
+            let sm = crate::schedule::lower(&kernel.to_template());
+            let shader = gpu.create_shader(bg::ShaderDesc {
+                source: &sm.source,
+                naga_module: Some(sm.module),
+            });
+            let layout = reduction_data_layout(kernel);
+            let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
+                name: crate::schedule::REDUCTION_ENTRY,
+                data_layouts: &[&layout],
+                compute: shader.at(crate::schedule::REDUCTION_ENTRY),
+            });
+            reduction_map.insert(key, pipeline);
+        }
+
         Self {
             map,
             coop_map,
             small_map,
             epilogue_map,
             pointwise_map,
+            reduction_map,
         }
     }
 
     fn get(&self, dispatch: &Dispatch) -> &blade_graphics::ComputePipeline {
+        if let Some(ref k) = dispatch.reduction {
+            if let Some(p) = self.reduction_map.get(&k.hash_key()) {
+                return p;
+            }
+        }
         if let Some(ref dag) = dispatch.pointwise {
             if let Some(p) = self.pointwise_map.get(&dag.hash_key()) {
                 return p;
@@ -789,6 +854,25 @@ impl Pipelines {
             }
         }
         &self.map[&dispatch.shader]
+    }
+}
+
+/// ShaderDataLayout for a schedule-template reduction pipeline, chosen
+/// by (n_per_elem, n_per_row, n_per_col). Names align with the bindings
+/// emitted by `schedule::lower` for reductions.
+fn reduction_data_layout(
+    kernel: &crate::schedule::ReductionKernel,
+) -> blade_graphics::ShaderDataLayout {
+    use blade_graphics::ShaderData;
+    let n_per_col = kernel.epilogue.as_ref().map_or(0, |e| e.n_per_col_inputs);
+    match (kernel.n_per_elem, kernel.n_per_row, n_per_col) {
+        (1, 0, 0) => ReductionPass1Data::layout(),
+        (1, 1, 0) => ReductionPass2RowData::layout(),
+        (1, 0, 1) => RmsNormData::layout(),
+        other => panic!(
+            "reduction kernel with (per_elem, per_row, per_col) = {:?} has no runtime layout",
+            other
+        ),
     }
 }
 
@@ -1756,6 +1840,63 @@ impl Session {
         pc: &mut impl blade_graphics::traits::PipelineEncoder,
     ) {
         let buf = |r: BufferRef| buffers[r.0 as usize].at(0);
+        // Schedule-template reduction dispatches have priority and route
+        // by kernel arity (n_per_elem, n_per_row, n_per_col).
+        if let Some(ref k) = dispatch.reduction {
+            let params = ReductionParams {
+                outer: dispatch.params[0],
+                inner: dispatch.params[1],
+                _pad0: 0,
+                _pad1: 0,
+            };
+            let n_per_col = k.epilogue.as_ref().map_or(0, |e| e.n_per_col_inputs);
+            match (k.n_per_elem, k.n_per_row, n_per_col) {
+                (1, 0, 0) => {
+                    pc.bind(
+                        0,
+                        &ReductionPass1Data {
+                            src: buf(dispatch.input_buffers[0]),
+                            dst: buf(dispatch.output_buffer),
+                            params,
+                        },
+                    );
+                }
+                (1, 1, 0) => {
+                    pc.bind(
+                        0,
+                        &ReductionPass2RowData {
+                            src: buf(dispatch.input_buffers[0]),
+                            per_row_src: buf(dispatch.input_buffers[1]),
+                            dst: buf(dispatch.output_buffer),
+                            params,
+                        },
+                    );
+                }
+                (1, 0, 1) => {
+                    pc.bind(
+                        0,
+                        &RmsNormData {
+                            src: buf(dispatch.input_buffers[0]),
+                            bias: buf(dispatch.input_buffers[1]),
+                            dst: buf(dispatch.output_buffer),
+                            params: BiasAddParams {
+                                len: params.outer,
+                                bias_len: params.inner,
+                                _pad0: 0,
+                                _pad1: 0,
+                            },
+                        },
+                    );
+                }
+                other => {
+                    panic!(
+                        "reduction kernel with arity {:?} has no runtime binding layout",
+                        other
+                    )
+                }
+            }
+            return;
+        }
         // Schedule-template pointwise dispatches route by DAG arity, not
         // by the dummy `shader` entry — arity may be 3 after fusion, which
         // no ShaderEntry variant represents.

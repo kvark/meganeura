@@ -17,6 +17,18 @@ fn run_once(
     build: &dyn Fn(&mut Graph, &[NodeId]) -> NodeId,
     opts_on: bool,
 ) -> Vec<f32> {
+    run_once_with(input_names, inputs, n_out, build, |o| {
+        o.use_schedule_pointwise = opts_on;
+    })
+}
+
+fn run_once_with(
+    input_names: &[&str],
+    inputs: &[&[f32]],
+    n_out: usize,
+    build: &dyn Fn(&mut Graph, &[NodeId]) -> NodeId,
+    configure: impl FnOnce(&mut CompileOptions),
+) -> Vec<f32> {
     assert_eq!(input_names.len(), inputs.len());
     let mut g = Graph::new();
     let ids: Vec<NodeId> = input_names
@@ -27,9 +39,8 @@ fn run_once(
     let y = build(&mut g, &ids);
     g.set_outputs(vec![y]);
 
-    let opts = CompileOptions {
-        use_schedule_pointwise: opts_on,
-    };
+    let mut opts = CompileOptions::default();
+    configure(&mut opts);
     let mut session = build_inference_session_with(&g, &opts);
     for (name, data) in input_names.iter().zip(inputs.iter()) {
         session.set_input(name, data);
@@ -131,12 +142,14 @@ fn fusion_reduces_dispatch_count() {
         &g,
         &CompileOptions {
             use_schedule_pointwise: false,
+            ..Default::default()
         },
     );
     let fused_plan = compile_with(
         &g,
         &CompileOptions {
             use_schedule_pointwise: true,
+            ..Default::default()
         },
     );
 
@@ -196,6 +209,7 @@ fn ternary_fusion_add_of_mul() {
             &g,
             &CompileOptions {
                 use_schedule_pointwise: false,
+                ..Default::default()
             },
         )
         .dispatches
@@ -206,6 +220,7 @@ fn ternary_fusion_add_of_mul() {
         &g,
         &CompileOptions {
             use_schedule_pointwise: true,
+            ..Default::default()
         },
     );
     assert_eq!(
@@ -231,6 +246,88 @@ fn ternary_fusion_add_of_mul() {
             g.add(ab, xs[2])
         },
     );
+}
+
+// ---- Reduction archetype: softmax ----
+
+/// Softmax through the schedule-template reduction archetype must match
+/// the hand-written softmax.wgsl within f32 round-off.
+#[test]
+fn softmax_parity() {
+    let batch = 4usize;
+    let features = 64usize;
+    let n = batch * features;
+    // Non-uniform input so per-row max varies and exp(x - max) is
+    // exercised across the subtraction axis.
+    let input: Vec<f32> = (0..n)
+        .map(|i| ((i as f32) * 0.017 - 3.0).sin() * 2.0)
+        .collect();
+
+    let run = |use_schedule: bool| -> Vec<f32> {
+        let mut g = Graph::new();
+        let x = g.input("x", &[batch, features]);
+        let y = g.softmax(x);
+        g.set_outputs(vec![y]);
+        let opts = CompileOptions {
+            use_schedule_reduction: use_schedule,
+            ..Default::default()
+        };
+        let mut s = build_inference_session_with(&g, &opts);
+        s.set_input("x", &input);
+        s.step();
+        s.wait();
+        s.read_output(n)
+    };
+
+    let baseline = run(false);
+    let schedule = run(true);
+
+    assert_eq!(baseline.len(), schedule.len());
+    for (i, (a, b)) in baseline.iter().zip(schedule.iter()).enumerate() {
+        assert!(
+            (a - b).abs() <= a.abs().max(b.abs()) * 1e-5 + 1e-7,
+            "softmax parity mismatch at [{i}]: baseline={a}, schedule={b}",
+        );
+    }
+    for row in 0..batch {
+        let sum: f32 = schedule[row * features..(row + 1) * features].iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-5,
+            "softmax row {} doesn't sum to 1: got {}",
+            row,
+            sum
+        );
+    }
+}
+
+/// With `use_schedule_reduction`, softmax should compile to two dispatches
+/// (max reduction + sum/normalize). Without, it's one.
+#[test]
+fn softmax_schedule_emits_two_dispatches() {
+    use meganeura::compile::{CompileOptions, compile_with};
+    let mut g = Graph::new();
+    let x = g.input("x", &[4, 64]);
+    let y = g.softmax(x);
+    g.set_outputs(vec![y]);
+
+    let baseline = compile_with(
+        &g,
+        &CompileOptions {
+            use_schedule_reduction: false,
+            ..Default::default()
+        },
+    );
+    let schedule = compile_with(
+        &g,
+        &CompileOptions {
+            use_schedule_reduction: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(baseline.dispatches.len(), 1);
+    assert_eq!(schedule.dispatches.len(), 2);
+    assert!(schedule.dispatches[0].reduction.is_some());
+    assert!(schedule.dispatches[1].reduction.is_some());
 }
 
 #[test]
