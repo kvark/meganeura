@@ -516,12 +516,15 @@ fn rebuild_graph_from_extractions(
         apply_silu_fusions(&mut graph, &mut fusions);
         apply_swiglu_fusions(&mut graph, &mut fusions);
         apply_swiglu_concat_fusions(&mut graph, &mut fusions);
-        // RmsNorm+MatMul fusion: saves 24 barriers but the coop variant's
-        // 64-thread tree-reduction rsqrt prologue makes the fused kernel ~57%
-        // slower than separate RmsNorm + coop MatMul, roughly breaking even.
-        // Subgroup ops (subgroupAdd) would fix this but NVIDIA's driver
-        // crashes when combining subgroup + cooperative matrix capabilities
-        // in the same SPIR-V module: https://github.com/kvark/blade/issues/333
+        // RmsNorm+MatMul fusion: eliminates ~30 dispatches on transformer
+        // prefill by folding the norm's rsqrt prologue into the matmul
+        // load, but the coop variant's 64-thread tree-reduction rsqrt is
+        // measurably slower than separate RmsNorm + coop MatMul — ~25%
+        // regression on SmolVLA fwd (9.66 → 12.09 ms, RTX 3050). Stays
+        // off until either (a) the prologue can use subgroupAdd without
+        // the NVIDIA coop+subgroup driver crash (kvark/blade#333), or
+        // (b) we add a two-phase variant that reads a pre-computed
+        // rsqrt cache so the matmul prologue is only a scalar multiply.
         // apply_rms_norm_matmul_fusions(&mut graph, &mut fusions);
         // apply_rope_attention_fusions(&mut graph, &mut fusions);
         if fusions.len() == n {
