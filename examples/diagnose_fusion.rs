@@ -316,6 +316,16 @@ fn main() {
                 let plan = meganeura::compile::compile(&optimized);
                 analyze("SmolLM2-135M prefill", &plan);
             }
+            "smollm2-decode" => {
+                let config = SmolLM2Config::smollm2_135m();
+                let max_seq = 256;
+                eprintln!("Building SmolLM2-135M decode (max_seq={})", max_seq);
+                let mut g = meganeura::Graph::new();
+                let _ = smollm2::build_decode_graph(&mut g, &config, max_seq);
+                let optimized = meganeura::optimize::optimize(&g);
+                let plan = meganeura::compile::compile(&optimized);
+                analyze("SmolLM2-135M decode", &plan);
+            }
             other => eprintln!("unknown model: {}", other),
         }
     };
