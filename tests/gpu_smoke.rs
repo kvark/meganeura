@@ -1597,9 +1597,9 @@ fn conv2d_backward_smoke() {
     let loss_val = session.read_output(1);
     assert!(loss_val[0].abs() > 0.0, "loss should be non-zero");
 
-    // Read kernel gradient (output index 1 = first param gradient)
+    // Read kernel gradient by parameter name.
     let mut grad_kernel = vec![0.0f32; kernel_size];
-    session.read_output_by_index(1, &mut grad_kernel);
+    session.read_param_grad("kernel", &mut grad_kernel);
 
     // Finite difference check for kernel gradient
     let eps = 1e-3;

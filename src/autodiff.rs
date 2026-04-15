@@ -925,23 +925,25 @@ pub fn differentiate(forward: &Graph) -> Graph {
         }
     }
 
-    // Collect parameter gradients as outputs.
+    // Preserve all user-supplied outputs (loss + any extras observed during
+    // training) and append one gradient-output entry per Parameter node.
     // Every Parameter gets an output entry (even dead ones with no gradient)
     // to maintain positional alignment with param_buffers in compile.rs.
-    let mut outputs = vec![loss_node];
+    graph.set_outputs(forward.outputs().to_vec());
+    let mut grad_outputs = Vec::new();
     for node in forward.nodes() {
         if let Op::Parameter { .. } = node.op {
             if let Some(&grad_id) = grads.get(&node.id) {
-                outputs.push(grad_id);
+                grad_outputs.push(grad_id);
             } else {
                 // Dead parameter (optimizer Nop'd its consumer) — use a
                 // zero-sized constant as placeholder so positions align.
                 let zero = graph.scalar(0.0);
-                outputs.push(zero);
+                grad_outputs.push(zero);
             }
         }
     }
-    graph.set_outputs(outputs);
+    graph.append_param_grad_outputs(&grad_outputs);
 
     graph
 }
