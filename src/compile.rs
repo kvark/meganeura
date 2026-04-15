@@ -990,12 +990,14 @@ impl<'a> Compiler<'a> {
                 let m = a_shape[0] as u32;
                 let k = a_shape[1] as u32;
                 let n = b_shape[1] as u32;
-                if m == 1 {
-                    // GEMV specialization: one thread per output column,
-                    // workgroup size 32 (one warp — no barriers needed).
+                if m == 1 && n % 4 == 0 {
+                    // GEMV specialization: vec4 B loads, 4 output cols
+                    // per thread, WG=32 (one warp, no barriers). Requires
+                    // N % 4 == 0 for the vec4 view of B/C to be safe;
+                    // non-aligned shapes fall through to the tile matmul.
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::MatMulGemv,
-                        workgroups: [n.div_ceil(32), 1, 1],
+                        workgroups: [(n / 4).div_ceil(32), 1, 1],
                         input_buffers: vec![a, b],
                         output_buffer: out_buf,
                         extra_outputs: vec![],
