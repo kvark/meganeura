@@ -210,6 +210,9 @@ pub enum ShaderGroup {
     MatMulSmallAdd,
     MatMulSmallAT,
     MatMulSmallBT,
+    /// M=1 matmul (GEMV): C[1,N] = A[1,K] × B[K,N]. One thread per
+    /// output column; dispatched for batch-1 decode on transformers.
+    MatMulGemv,
     MatMulCoop,
     MatMulCoopAdd,
     MatMulCoopAT,
@@ -285,6 +288,7 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::MatMulSmallAdd => gen_matmul_small_add(),
         ShaderGroup::MatMulSmallAT => gen_matmul_small_at(),
         ShaderGroup::MatMulSmallBT => gen_matmul_small_bt(),
+        ShaderGroup::MatMulGemv => parse_wgsl(include_str!("shaders/matmul_gemv.wgsl")),
         ShaderGroup::MatMulCoop => gen_matmul_coop(),
         ShaderGroup::MatMulCoopAdd => gen_matmul_coop_add(),
         ShaderGroup::MatMulCoopAT => gen_matmul_coop_at(),
@@ -1109,6 +1113,7 @@ mod tests {
             (ShaderGroup::MatMulBT, naga::valid::Capabilities::empty()),
             (ShaderGroup::MatMulATAdd, naga::valid::Capabilities::empty()),
             (ShaderGroup::MatMulBTAdd, naga::valid::Capabilities::empty()),
+            (ShaderGroup::MatMulGemv, naga::valid::Capabilities::empty()),
             (
                 ShaderGroup::MatMulCoop,
                 naga::valid::Capabilities::COOPERATIVE_MATRIX
@@ -1389,7 +1394,10 @@ mod tests {
         // builtin args are not bound by blade and can be ignored.
         fn expected_globals(entry: &ShaderEntry) -> Vec<&'static str> {
             match entry {
-                ShaderEntry::MatMul | ShaderEntry::MatMulAT | ShaderEntry::MatMulBT => {
+                ShaderEntry::MatMul
+                | ShaderEntry::MatMulAT
+                | ShaderEntry::MatMulBT
+                | ShaderEntry::MatMulGemv => {
                     vec!["matrix_a", "matrix_b", "matrix_c", "params"]
                 }
                 ShaderEntry::FusedMatMulAdd
@@ -1509,6 +1517,7 @@ mod tests {
             ShaderEntry::MatMul,
             ShaderEntry::MatMulAT,
             ShaderEntry::MatMulBT,
+            ShaderEntry::MatMulGemv,
             ShaderEntry::FusedMatMulAdd,
             ShaderEntry::FusedMatMulATAdd,
             ShaderEntry::FusedMatMulBTAdd,

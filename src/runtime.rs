@@ -893,7 +893,10 @@ fn pointwise_data_layout(n_inputs: u8) -> blade_graphics::ShaderDataLayout {
 fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
     use blade_graphics::ShaderData;
     match *entry {
-        ShaderEntry::MatMul | ShaderEntry::MatMulAT | ShaderEntry::MatMulBT => MatMulData::layout(),
+        ShaderEntry::MatMul
+        | ShaderEntry::MatMulAT
+        | ShaderEntry::MatMulBT
+        | ShaderEntry::MatMulGemv => MatMulData::layout(),
         ShaderEntry::FusedMatMulAdd
         | ShaderEntry::FusedMatMulATAdd
         | ShaderEntry::FusedMatMulBTAdd => FusedMatMulAddData::layout(),
@@ -1946,7 +1949,7 @@ impl Session {
             return;
         }
         match dispatch.shader {
-            ShaderEntry::MatMul => {
+            ShaderEntry::MatMul | ShaderEntry::MatMulGemv => {
                 pc.bind(
                     0,
                     &MatMulData {
