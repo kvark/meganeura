@@ -6,3 +6,4 @@ data/*.gz
 *.trace
 /.venv/
 /.claude/
+*.spv
