@@ -610,6 +610,11 @@ fn apply_matmul_add_fusions(graph: &mut Graph, fusions: &mut Vec<(String, u32)>)
         if mm_use_count != 1 {
             continue;
         }
+        // Don't fuse if the matmul is a graph output — its value is read
+        // back by the user or is a param gradient consumed by the trainer.
+        if graph.is_output(mm_id) {
+            continue;
+        }
 
         let mm_node = graph.node(mm_id);
         let (a, b) = (mm_node.inputs[0], mm_node.inputs[1]);
@@ -665,6 +670,10 @@ fn apply_swiglu_concat_fusions(graph: &mut Graph, fusions: &mut Vec<(String, u32
             .filter(|n| n.inputs.contains(&up_id) && !matches!(n.op, Op::Nop))
             .count();
         if gate_uses != 1 || up_uses != 1 {
+            continue;
+        }
+        // Don't fuse if either matmul is a graph output.
+        if graph.is_output(gate_id) || graph.is_output(up_id) {
             continue;
         }
 
@@ -762,6 +771,9 @@ pub fn apply_group_norm_silu_fusions(graph: &mut Graph, fusions: &mut Vec<(Strin
         if gn_use_count != 1 {
             continue;
         }
+        if graph.is_output(gn_id) {
+            continue;
+        }
         let (x, w, b) = (gn_node.inputs[0], gn_node.inputs[1], gn_node.inputs[2]);
         // Rewrite Silu node to GroupNormSilu
         graph.nodes_mut()[id].op = Op::GroupNormSilu {
@@ -802,6 +814,9 @@ fn apply_rms_norm_matmul_fusions(graph: &mut Graph, fusions: &mut Vec<(String, u
             .filter(|n| n.inputs.contains(&norm_id) && !matches!(n.op, Op::Nop))
             .count();
         if norm_use_count != 1 {
+            continue;
+        }
+        if graph.is_output(norm_id) {
             continue;
         }
 
@@ -878,6 +893,9 @@ fn apply_rope_attention_fusions(graph: &mut Graph, fusions: &mut Vec<(String, u3
         if q_uses != 1 || k_uses != 1 {
             continue;
         }
+        if graph.is_output(q_id) || graph.is_output(k_id) {
+            continue;
+        }
 
         // Replace CausalAttention with CausalAttentionRoPE using un-rotated Q, K
         graph.nodes_mut()[id].op = Op::CausalAttentionRoPE {
@@ -928,6 +946,9 @@ fn apply_silu_fusions(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
         if sig_use_count != 1 {
             continue;
         }
+        if graph.is_output(sig_id) {
+            continue;
+        }
         graph.nodes_mut()[id].op = Op::Silu;
         graph.nodes_mut()[id].inputs = vec![x];
         graph.nodes_mut()[sig_id as usize].op = Op::Nop;
@@ -959,6 +980,9 @@ fn apply_swiglu_fusions(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
             .filter(|n| n.inputs.contains(&silu_id) && !matches!(n.op, Op::Nop))
             .count();
         if silu_use_count != 1 {
+            continue;
+        }
+        if graph.is_output(silu_id) {
             continue;
         }
         graph.nodes_mut()[id].op = Op::SwiGLU;
