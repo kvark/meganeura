@@ -320,45 +320,48 @@ pub enum KernelTemplate {
         grid: GridShape,
     },
     /// Per-row reduction: one workgroup per outer row reduces along the
-    /// inner axis. The per-element `prologue` DAG runs first (producing
-    /// the scalar contribution to reduce); the tree reduction follows.
+    /// inner axis. Uniform input layout shared by the prologue (pre-
+    /// reduction per-element transform) and the optional epilogue (post-
+    /// reduction per-element map).
     ///
-    /// Without an epilogue (`epilogue = None`) the output shape is
-    /// `[outer]` — one scalar per row. With an epilogue, the kernel
-    /// writes back a transformed value for every element, producing
-    /// `[outer, inner]` (the RMSNorm / Softmax / LayerNorm shape).
+    /// **Input categories**, addressed by `LoadInput(idx)` in the DAGs:
+    ///   * **Per-element** `[row * inner + col]` — `n_per_elem` streams.
+    ///     Indices `0..n_per_elem`. Binding names match `PointwiseDAG`:
+    ///     `src` / `src_a`+`src_b` / `src_a`+`src_b`+`src_c`.
+    ///   * **Per-row** `[row]` — `n_per_row` streams. Indices
+    ///     `n_per_elem..n_per_elem+n_per_row`. Binding names:
+    ///     `per_row_src` (n=1) / `per_row_src_a`+`per_row_src_b` (n=2).
+    ///   * **Per-col** `[col]` — `n_per_col` streams, **epilogue only**.
+    ///     Indices `n_per_elem+n_per_row..n_per_elem+n_per_row+n_per_col`.
+    ///     Binding names: `bias` (n=1) / `bias_a`+`bias_b` (n=2).
+    ///   * **Reduced scalar** — the one value produced by the tree
+    ///     reduction. **Epilogue only**, at index
+    ///     `n_per_elem + n_per_row + n_per_col` (always last).
     ///
-    /// Binding names in the generated module:
-    ///   - Prologue input streams: same names as pointwise (`src`,
-    ///     `src_a`/`src_b`, or `src_a`/`src_b`/`src_c`). Loaded at
-    ///     `row * inner + col`.
-    ///   - Per-column broadcast inputs: `bias` (1), or `bias_a`/`bias_b`
-    ///     (2). Loaded at `col`.
-    ///   - `dst: array<f32>` of length `outer` (no epilogue) or
-    ///     `outer * inner` (with epilogue).
-    ///   - Uniforms: `outer: u32, inner: u32, _pad0: u32, _pad1: u32`.
+    /// Required prologue arity: `n_per_elem + n_per_row`.
+    /// Required epilogue arity: `n_per_elem + n_per_row + n_per_col + 1`.
+    ///
+    /// Without an epilogue the output shape is `[outer]` (one scalar per
+    /// row); with an epilogue it is `[outer, inner]`. Uniforms are
+    /// `outer: u32, inner: u32, _pad0: u32, _pad1: u32`.
     Reduction {
         op: ReduceOp,
-        /// Per-element transform applied before accumulation. `n_inputs`
-        /// determines the number of input streams; `output` is the scalar
-        /// contribution to reduce.
         prologue: PointwiseDAG,
-        /// Optional per-element map applied after the reduction.
         epilogue: Option<ReductionEpilogue>,
+        /// Number of per-element input streams. Used to split the
+        /// prologue/epilogue DAG input-index range into per-elem vs
+        /// per-row (see enum-level docs).
+        n_per_elem: u8,
+        /// Number of per-row broadcast input streams. Loaded at `[row]`.
+        n_per_row: u8,
         /// Workgroup size (threads per row). Must be a power of 2 — the
         /// tree reduction assumes it.
         grid: GridShape,
     },
 }
 
-/// Per-element write-back DAG for a reduce-then-map reduction.
-///
-/// The DAG's input layout (by `LoadInput(idx)`):
-///   * `0..prologue.n_inputs` — the same per-element streams the
-///     prologue sees, loaded at `[row * inner + col]`.
-///   * `prologue.n_inputs` — the reduced scalar for this row (broadcast).
-///   * `prologue.n_inputs + 1..` — per-column broadcast inputs loaded
-///     at `[col]`. `n_per_col_inputs` counts these.
+/// Per-element write-back DAG for a reduce-then-map reduction. See
+/// `KernelTemplate::Reduction` for the complete input-index layout.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReductionEpilogue {
     pub dag: PointwiseDAG,
@@ -378,8 +381,10 @@ pub fn lower(t: &KernelTemplate) -> ShaderModule {
             op,
             ref prologue,
             ref epilogue,
+            n_per_elem,
+            n_per_row,
             grid,
-        } => lower_reduction(op, prologue, epilogue.as_ref(), grid),
+        } => lower_reduction(op, prologue, epilogue.as_ref(), n_per_elem, n_per_row, grid),
     }
 }
 
@@ -428,11 +433,21 @@ fn lower_reduction(
     op: ReduceOp,
     prologue: &PointwiseDAG,
     epilogue: Option<&ReductionEpilogue>,
+    n_per_elem: u8,
+    n_per_row: u8,
     grid: GridShape,
 ) -> ShaderModule {
     assert!(
-        prologue.n_inputs >= 1,
-        "reduction prologue must have at least one input stream"
+        n_per_elem >= 1,
+        "reduction must have at least one per-element input stream"
+    );
+    assert_eq!(
+        prologue.n_inputs,
+        n_per_elem + n_per_row,
+        "prologue arity ({}) must equal n_per_elem + n_per_row ({} + {})",
+        prologue.n_inputs,
+        n_per_elem,
+        n_per_row,
     );
     assert!(
         (prologue.output as usize) < prologue.ops.len(),
@@ -443,11 +458,11 @@ fn lower_reduction(
         "reduction workgroup_size must be a power of 2 ≥ 2"
     );
     if let Some(epi) = epilogue {
-        let expected = prologue.n_inputs + 1 + epi.n_per_col_inputs;
+        let expected = n_per_elem + n_per_row + epi.n_per_col_inputs + 1;
         assert_eq!(
             epi.dag.n_inputs, expected,
-            "reduction epilogue expects {} inputs ({} per-elem + 1 reduced + {} per-col), got {}",
-            expected, prologue.n_inputs, epi.n_per_col_inputs, epi.dag.n_inputs,
+            "reduction epilogue expects {} inputs ({} per-elem + {} per-row + {} per-col + 1 reduced), got {}",
+            expected, n_per_elem, n_per_row, epi.n_per_col_inputs, epi.dag.n_inputs,
         );
         assert!(
             (epi.dag.output as usize) < epi.dag.ops.len(),
@@ -455,16 +470,43 @@ fn lower_reduction(
         );
     }
 
-    let input_names = PointwiseDAG::input_binding_names(prologue.n_inputs);
+    let per_elem_names = PointwiseDAG::input_binding_names(n_per_elem);
+    let per_row_names = per_row_binding_names(n_per_row);
     let per_col_names: Vec<String> = epilogue
         .map(|epi| per_col_binding_names(epi.n_per_col_inputs))
         .unwrap_or_default();
+
+    // Builds the `load(idx)` expression for a given DAG input index,
+    // respecting the documented per-elem / per-row / per-col / reduced
+    // ordering. `in_epilogue = false` disallows per-col and reduced.
+    let load_expr = |idx: u8, col_var: &str, in_epilogue: bool| -> String {
+        let i = idx as usize;
+        let per_elem_end = n_per_elem as usize;
+        let per_row_end = per_elem_end + n_per_row as usize;
+        if i < per_elem_end {
+            format!("{}[row_offset + {}]", per_elem_names[i], col_var)
+        } else if i < per_row_end {
+            format!("{}[row]", per_row_names[i - per_elem_end])
+        } else {
+            assert!(in_epilogue, "prologue cannot reference per-col or reduced");
+            let per_col_end = per_row_end + epilogue.map_or(0, |e| e.n_per_col_inputs as usize);
+            if i < per_col_end {
+                format!("{}[{}]", per_col_names[i - per_row_end], col_var)
+            } else {
+                // Reduced scalar — exactly one, at the final position.
+                "reduced_value".to_string()
+            }
+        }
+    };
 
     let mut src = String::new();
     src.push_str(
         "struct Params {\n    outer: u32,\n    inner: u32,\n    _pad0: u32,\n    _pad1: u32,\n}\n\n",
     );
-    for name in &input_names {
+    for name in &per_elem_names {
+        let _ = writeln!(src, "var<storage> {}: array<f32>;", name);
+    }
+    for name in &per_row_names {
         let _ = writeln!(src, "var<storage> {}: array<f32>;", name);
     }
     for name in &per_col_names {
@@ -488,8 +530,8 @@ fn lower_reduction(
     src.push_str("    var col = tid;\n");
     src.push_str("    loop {\n");
     src.push_str("        if col >= params.inner { break; }\n");
-    // Prologue: per-element DAG; loads read from `src[row_offset + col]`.
-    let body = prologue.emit_body(|idx| format!("{}[row_offset + col]", input_names[idx as usize]));
+    // Prologue body: `col` is the per-element index variable.
+    let body = prologue.emit_body(|idx| load_expr(idx, "col", false));
     // Indent each line of the prologue body by 4 extra spaces for the loop.
     for line in body.lines() {
         src.push_str("        ");
@@ -527,18 +569,7 @@ fn lower_reduction(
             src.push_str("    var wcol = tid;\n");
             src.push_str("    loop {\n");
             src.push_str("        if wcol >= params.inner { break; }\n");
-            let n_per_elem = prologue.n_inputs as usize;
-            let body = epi.dag.emit_body(|idx| {
-                let i = idx as usize;
-                if i < n_per_elem {
-                    format!("{}[row_offset + wcol]", input_names[i])
-                } else if i == n_per_elem {
-                    "reduced_value".to_string()
-                } else {
-                    let k = i - (n_per_elem + 1);
-                    format!("{}[wcol]", per_col_names[k])
-                }
-            });
+            let body = epi.dag.emit_body(|idx| load_expr(idx, "wcol", true));
             for line in body.lines() {
                 src.push_str("        ");
                 src.push_str(line.trim_start_matches(' '));
@@ -560,6 +591,22 @@ fn lower_reduction(
     ShaderModule {
         module,
         source: src,
+    }
+}
+
+/// Binding names for per-row broadcast inputs used by the reduction
+/// prologue and epilogue:
+///   * n=0 → `[]`
+///   * n=1 → `["row"]`
+///   * n=2 → `["row_a", "row_b"]`
+///
+/// Panics for n > 2 — wider layouts need additional runtime plumbing.
+fn per_row_binding_names(n: u8) -> Vec<String> {
+    match n {
+        0 => Vec::new(),
+        1 => vec!["per_row_src".to_string()],
+        2 => vec!["per_row_src_a".to_string(), "per_row_src_b".to_string()],
+        n => panic!("reduction n_per_row={} has no binding layout (max 2)", n),
     }
 }
 
@@ -823,6 +870,8 @@ mod tests {
             op: ReduceOp::Sum,
             prologue: identity_prologue(),
             epilogue: None,
+            n_per_elem: 1,
+            n_per_row: 0,
             grid: GridShape::default(),
         });
         assert!(sm.source.contains("struct Params"));
@@ -841,6 +890,8 @@ mod tests {
             op: ReduceOp::Max,
             prologue: identity_prologue(),
             epilogue: None,
+            n_per_elem: 1,
+            n_per_row: 0,
             grid: GridShape::default(),
         });
         // Max identity is -inf via bitcast.
@@ -856,6 +907,8 @@ mod tests {
             op: ReduceOp::Sum,
             prologue: square_prologue(),
             epilogue: None,
+            n_per_elem: 1,
+            n_per_row: 0,
             grid: GridShape::default(),
         });
         // Prologue emits the multiply.
@@ -879,6 +932,8 @@ mod tests {
                 op,
                 prologue,
                 epilogue: None,
+                n_per_elem: 1,
+                n_per_row: 0,
                 grid: GridShape::default(),
             });
             v.validate(&sm.module).unwrap_or_else(|e| {
@@ -887,29 +942,28 @@ mod tests {
         }
     }
 
-    /// Build the RMSNorm epilogue DAG. Inputs are:
-    ///   0 = src[row*inner + col]        (per-element)
-    ///   1 = sum_of_squares (broadcast scalar)
-    ///   2 = bias[col]                    (per-col)
+    /// Build the RMSNorm epilogue DAG under the canonical reduction
+    /// layout (per-elem, per-row, per-col, reduced). For RMSNorm:
+    ///   0 = src[row, col]           (per-elem)
+    ///   1 = bias[col]                (per-col)
+    ///   2 = sum_of_squares           (reduced — always last)
     /// Output: `src * rsqrt(sum_of_squares * inv_inner + eps) * bias`.
-    /// The inverse row length is baked as a Const — it's static at graph
-    /// compile time.
     fn rmsnorm_epilogue(inner: f32, eps: f32) -> ReductionEpilogue {
         let inv_inner = Pw::const_f32(1.0 / inner);
         let eps_c = Pw::const_f32(eps);
         let dag = PointwiseDAG {
             n_inputs: 3,
             ops: vec![
-                Pw::LoadInput(0), // v0 = src[row,col]
-                Pw::LoadInput(1), // v1 = sum_of_squares
-                Pw::LoadInput(2), // v2 = bias[col]
+                Pw::LoadInput(0), // v0 = src[row, col]
+                Pw::LoadInput(1), // v1 = bias[col]
+                Pw::LoadInput(2), // v2 = sum_of_squares
                 inv_inner,        // v3 = 1/inner
                 eps_c,            // v4 = eps
-                Pw::Mul(1, 3),    // v5 = mean_sq = sum_sq * inv_inner
+                Pw::Mul(2, 3),    // v5 = mean_sq = sum_sq * inv_inner
                 Pw::Add(5, 4),    // v6 = mean_sq + eps
-                Pw::Rsqrt(6),     // v7 = rsqrt(...)
+                Pw::Rsqrt(6),     // v7 = rsqrt(mean_sq + eps)
                 Pw::Mul(0, 7),    // v8 = src * rsqrt
-                Pw::Mul(8, 2),    // v9 = (src * rsqrt) * bias
+                Pw::Mul(8, 1),    // v9 = (src * rsqrt) * bias
             ],
             output: 9,
         };
@@ -926,6 +980,8 @@ mod tests {
             op: ReduceOp::Sum,
             prologue: square_prologue(),
             epilogue: Some(rmsnorm_epilogue(720.0, 1e-5)),
+            n_per_elem: 1,
+            n_per_row: 0,
             grid: GridShape::default(),
         });
         // Has the per-col bias binding.
@@ -940,6 +996,71 @@ mod tests {
         assert!(sm.source.contains("inverseSqrt"));
     }
 
+    /// Softmax composition:
+    ///   Dispatch 1: Reduction(Max, identity) → row_max[outer].
+    ///   Dispatch 2: Reduction(Sum, exp(src - row_max),
+    ///                          epilogue = exp(src - row_max) / row_sum)
+    ///               over inputs (src, row_max). Writes [outer, inner].
+    ///
+    /// This test constructs the dispatch-2 kernel and validates it.
+    #[test]
+    fn softmax_pass2_lowers() {
+        // Prologue: `exp(src - row_max)`. Input 0 = src (per-elem),
+        // input 1 = row_max (per-row). n_inputs = 2.
+        let prologue = PointwiseDAG {
+            n_inputs: 2,
+            ops: vec![
+                Pw::LoadInput(0), // v0 = src
+                Pw::LoadInput(1), // v1 = row_max
+                Pw::Sub(0, 1),    // v2 = src - row_max
+                Pw::Exp(2),       // v3 = exp(src - row_max)
+            ],
+            output: 3,
+        };
+        // Epilogue: `exp(src - row_max) / row_sum`. Inputs: 0=src
+        // (per-elem), 1=row_max (per-row), 2=row_sum (reduced, last).
+        let epi_dag = PointwiseDAG {
+            n_inputs: 3,
+            ops: vec![
+                Pw::LoadInput(0), // v0 = src
+                Pw::LoadInput(1), // v1 = row_max
+                Pw::LoadInput(2), // v2 = row_sum
+                Pw::Sub(0, 1),    // v3 = src - row_max
+                Pw::Exp(3),       // v4 = exp(src - row_max)
+                Pw::Div(4, 2),    // v5 = exp(...) / row_sum
+            ],
+            output: 5,
+        };
+        let sm = lower(&KernelTemplate::Reduction {
+            op: ReduceOp::Sum,
+            prologue,
+            epilogue: Some(ReductionEpilogue {
+                dag: epi_dag,
+                n_per_col_inputs: 0,
+            }),
+            n_per_elem: 1,
+            n_per_row: 1,
+            grid: GridShape::default(),
+        });
+        // Bindings: src + per_row_src (for row_max) + dst.
+        assert!(sm.source.contains("var<storage> src: array<f32>;"));
+        assert!(sm.source.contains("var<storage> per_row_src: array<f32>;"));
+        // Per-row load uses `[row]` (the workgroup id), not `[col]`.
+        assert!(sm.source.contains("per_row_src[row]"));
+        // Writeback shape is [outer, inner].
+        assert!(sm.source.contains("dst[row_offset + wcol]"));
+        // Prologue has the exp + sub.
+        assert!(sm.source.contains("exp(v2)"));
+        // Epilogue does the division by the reduced value.
+        assert!(sm.source.contains("v4 / v2") || sm.source.contains("/ v"));
+        // Naga-valid.
+        use naga::valid::{Capabilities, ValidationFlags, Validator};
+        let flags = ValidationFlags::all() ^ ValidationFlags::BINDINGS;
+        Validator::new(flags, Capabilities::all())
+            .validate(&sm.module)
+            .unwrap_or_else(|e| panic!("softmax pass-2 invalid: {:?}\n{}", e, sm.source));
+    }
+
     #[test]
     fn reduction_with_epilogue_naga_validates() {
         use naga::valid::{Capabilities, ValidationFlags, Validator};
@@ -948,6 +1069,8 @@ mod tests {
             op: ReduceOp::Sum,
             prologue: square_prologue(),
             epilogue: Some(rmsnorm_epilogue(720.0, 1e-5)),
+            n_per_elem: 1,
+            n_per_row: 0,
             grid: GridShape::default(),
         });
         Validator::new(flags, Capabilities::all())
@@ -973,6 +1096,8 @@ mod tests {
             op: ReduceOp::Sum,
             prologue: square_prologue(),
             epilogue: Some(bad),
+            n_per_elem: 1,
+            n_per_row: 0,
             grid: GridShape::default(),
         });
     }
@@ -984,6 +1109,8 @@ mod tests {
             op: ReduceOp::Sum,
             prologue: identity_prologue(),
             epilogue: None,
+            n_per_elem: 1,
+            n_per_row: 0,
             grid: GridShape {
                 workgroup_size: 250, // not power of 2
             },
