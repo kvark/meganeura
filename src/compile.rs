@@ -5,18 +5,24 @@ use std::collections::HashMap;
 
 /// Options controlling graph → execution-plan compilation.
 ///
-/// Defaults preserve historical behavior. Opt-in fields let callers flip on
-/// experimental paths without changing the library's default output. Wire
-/// these to env vars or CLI flags in your own harness if you want — the
-/// library itself takes only this typed struct.
-#[derive(Clone, Debug, Default)]
+/// Wire these to env vars or CLI flags in your own harness if you want —
+/// the library itself takes only this typed struct.
+#[derive(Clone, Debug)]
 pub struct CompileOptions {
-    /// Route unary pointwise ops (Relu, Sigmoid, Tanh, Neg, Abs, Log, Recip,
-    /// Silu) through the schedule-template codegen path instead of the
-    /// hand-written unary.wgsl shader. The generated WGSL uses the same
-    /// `UnaryData` binding layout, so no runtime surface changes for callers.
-    /// Off by default until parity is verified on the bench suite.
+    /// Route unary + binary pointwise ops through the schedule-template
+    /// codegen path (with chain fusion) instead of the hand-written
+    /// unary.wgsl / binary.wgsl shaders. The generated WGSL uses the same
+    /// UnaryData / BinaryData / TernaryData binding layouts, so no runtime
+    /// surface changes for callers.
     pub use_schedule_pointwise: bool,
+}
+
+impl Default for CompileOptions {
+    fn default() -> Self {
+        Self {
+            use_schedule_pointwise: true,
+        }
+    }
 }
 
 /// Identifies which shader and entry point to use.
@@ -642,14 +648,11 @@ fn fuse_epilogues(dispatches: &mut Vec<Dispatch>) {
             continue;
         }
 
-        // Dispatches that have opted into schedule-template pointwise codegen
-        // must not be absorbed into the legacy matmul epilogue path — they
-        // are generated separately at session creation and use a different
-        // pipeline.
-        if d.pointwise.is_some() {
-            continue;
-        }
-
+        // If this dispatch carries a schedule-template DAG, it can still be
+        // absorbed into a matmul epilogue as long as the DAG corresponds to
+        // an epilogue-supported op (Relu/Silu/Sigmoid/Neg — checked below
+        // via `d.shader`, which we preserve as the sentinel entry). The
+        // DAG field gets discarded along with the dispatch itself.
         let (epilogue_op, primary_buf, extra_buf) = match d.shader {
             ShaderEntry::Relu => (EpilogueOp::Relu, d.input_buffers[0], None),
             ShaderEntry::Sigmoid => (EpilogueOp::Sigmoid, d.input_buffers[0], None),

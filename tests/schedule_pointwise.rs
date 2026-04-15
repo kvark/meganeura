@@ -3,14 +3,13 @@
 //! shaders or the schedule-template codegen path. This is the gate that
 //! lets us retire hand-written pointwise entries one at a time.
 
-use meganeura::{
-    CompileOptions, Graph, NodeId, build_inference_session, build_inference_session_with,
-};
+use meganeura::{CompileOptions, Graph, NodeId, build_inference_session_with};
 
-/// Build+run a graph once, optionally with schedule-pointwise codegen on.
+/// Build+run a graph once with the given schedule-pointwise setting.
 ///
-/// `build` receives the graph plus any input NodeIds it asked for via
-/// `input_names`, in order, and returns the output NodeId.
+/// Baseline (`opts_on=false`) forces `use_schedule_pointwise=false` so we
+/// compare against the hand-written shader path regardless of the
+/// library's default.
 fn run_once(
     input_names: &[&str],
     inputs: &[&[f32]],
@@ -28,14 +27,10 @@ fn run_once(
     let y = build(&mut g, &ids);
     g.set_outputs(vec![y]);
 
-    let mut session = if opts_on {
-        let opts = CompileOptions {
-            use_schedule_pointwise: true,
-        };
-        build_inference_session_with(&g, &opts)
-    } else {
-        build_inference_session(&g)
+    let opts = CompileOptions {
+        use_schedule_pointwise: opts_on,
     };
+    let mut session = build_inference_session_with(&g, &opts);
     for (name, data) in input_names.iter().zip(inputs.iter()) {
         session.set_input(name, data);
     }
@@ -132,14 +127,21 @@ fn fusion_reduces_dispatch_count() {
     let c = g.silu(b);
     g.set_outputs(vec![c]);
 
-    let default_plan = compile_with(&g, &CompileOptions::default());
-    let opts = CompileOptions {
-        use_schedule_pointwise: true,
-    };
-    let fused_plan = compile_with(&g, &opts);
+    let baseline_plan = compile_with(
+        &g,
+        &CompileOptions {
+            use_schedule_pointwise: false,
+        },
+    );
+    let fused_plan = compile_with(
+        &g,
+        &CompileOptions {
+            use_schedule_pointwise: true,
+        },
+    );
 
-    // Default: 3 dispatches (relu, neg, silu).
-    assert_eq!(default_plan.dispatches.len(), 3);
+    // Baseline: 3 dispatches (relu, neg, silu).
+    assert_eq!(baseline_plan.dispatches.len(), 3);
     // Fused: the three pointwise dispatches should collapse into 1.
     assert_eq!(
         fused_plan.dispatches.len(),
@@ -190,9 +192,14 @@ fn ternary_fusion_add_of_mul() {
 
     // Unfused: 2 dispatches (mul, add).
     assert_eq!(
-        compile_with(&g, &CompileOptions::default())
-            .dispatches
-            .len(),
+        compile_with(
+            &g,
+            &CompileOptions {
+                use_schedule_pointwise: false,
+            },
+        )
+        .dispatches
+        .len(),
         2
     );
     let fused = compile_with(
