@@ -29,18 +29,27 @@ fn run_gpu_gemv(a_data: &[f32], b_data: &[f32], k: usize, n: usize) -> Vec<f32> 
 
     let mut session = build_inference_session(&g);
 
-    // Sanity: the compiled plan should use the GEMV kernel for M=1.
+    // Sanity: when N % 4 == 0 the plan should route through GEMV;
+    // otherwise it falls back to the tile matmul.
     let plan = session.plan();
     let gemv_count = plan
         .dispatches
         .iter()
         .filter(|d| matches!(d.shader, compile::ShaderEntry::MatMulGemv))
         .count();
-    assert_eq!(
-        gemv_count, 1,
-        "expected exactly one MatMulGemv dispatch, found {}",
-        gemv_count
-    );
+    if n.is_multiple_of(4) {
+        assert_eq!(
+            gemv_count, 1,
+            "expected one MatMulGemv dispatch for n%4==0, found {}",
+            gemv_count
+        );
+    } else {
+        assert_eq!(
+            gemv_count, 0,
+            "expected tile-matmul fallback for n%4!=0, got {} GEMV",
+            gemv_count
+        );
+    }
 
     session.set_input("a", a_data);
     session.set_parameter("b", b_data);
