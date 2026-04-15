@@ -1,19 +1,22 @@
-// GEMV kernel for M=1 matmul: C[1, N] = A[1, K] × B[K, N].
+// K-split GEMV for M=1: C[1, N] = A[1, K] × B[K, N].
 //
-// Requires N % 4 == 0. Each thread handles one 4-column vec4 of output.
-// B is viewed as `array<vec4<f32>>` so every B load is a vec4 (128-bit
-// storage load in SPIR-V → `buffer_load_dwordx4`-equivalent on the GPU),
-// quadrupling in-flight memory bandwidth per thread vs scalar f32 loads.
+// One workgroup handles 4 output columns (one vec4). The 32 threads in
+// the workgroup K-split the reduction: each thread accumulates a partial
+// vec4 over K/32 rows of B. A tree reduction across the 32 threads (in
+// shared memory) combines the partials. Final write: one vec4 to C.
 //
-// WG=32 (one subgroup/warp), no barriers. Within a warp, threads t=0..31
-// read vec4s at consecutive indices — one coalesced 512-byte transaction
-// per warp per k-iteration.
+// Compared to the previous N-parallel-only GEMV:
+//   Old: N/128 workgroups × 32 threads   e.g. N=576 → 5 WG × 32 = 160 threads
+//   New: N/4 workgroups   × 32 threads   e.g. N=576 → 144 WG × 32 = 4608 threads
+// ~28× more concurrent threads on RTX 3050. Memory-level parallelism
+// rises accordingly (the previous version was at ~10% of memory-BW
+// peak because occupancy was too low to hide DRAM latency).
 //
-// Inner K loop is unrolled by 4 so the compiler has 4 in-flight B loads
-// and 4 accumulators per thread, raising memory-level parallelism.
-//
-// Dispatch: [ceil((N/4)/32), 1, 1] = [ceil(N/128), 1, 1].
-// Binding layout matches matmul.wgsl / MatMulData.
+// Requires N % 4 == 0. Tradeoff vs old: within a warp, threads now
+// access the same col4 at different k rows (strided by N/4 vec4s), so
+// the per-warp coalescing is lost. L2 cache still captures reuse across
+// adjacent col4 workgroups (they share the same k rows of B), so the
+// net memory throughput is higher in aggregate.
 
 struct Params {
     m: u32,
@@ -23,49 +26,44 @@ struct Params {
 }
 
 var<storage> matrix_a: array<f32>;
-// N must be a multiple of 4 — compile::Op::MatMul gates on this before
-// selecting `ShaderEntry::MatMulGemv`.
 var<storage> matrix_b: array<vec4<f32>>;
 var<storage, read_write> matrix_c: array<vec4<f32>>;
 var<uniform> params: Params;
+var<workgroup> reduce_buf: array<vec4<f32>, 32>;
 
 @compute @workgroup_size(32)
 fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let col4 = wgid.x * 32u + lid.x;
+    let col4 = wgid.x;
+    let lane = lid.x;
     let n_v4 = params.n / 4u;
     if col4 >= n_v4 { return; }
     let k = params.k;
 
-    // 4 independent vec4 accumulators → 4 in-flight B loads per thread.
-    var acc0 = vec4<f32>(0.0);
-    var acc1 = vec4<f32>(0.0);
-    var acc2 = vec4<f32>(0.0);
-    var acc3 = vec4<f32>(0.0);
-    var kk = 0u;
-    loop {
-        if kk + 4u > k { break; }
-        let a0 = matrix_a[kk];
-        let a1 = matrix_a[kk + 1u];
-        let a2 = matrix_a[kk + 2u];
-        let a3 = matrix_a[kk + 3u];
-        let b0 = matrix_b[kk * n_v4 + col4];
-        let b1 = matrix_b[(kk + 1u) * n_v4 + col4];
-        let b2 = matrix_b[(kk + 2u) * n_v4 + col4];
-        let b3 = matrix_b[(kk + 3u) * n_v4 + col4];
-        acc0 = acc0 + vec4<f32>(a0) * b0;
-        acc1 = acc1 + vec4<f32>(a1) * b1;
-        acc2 = acc2 + vec4<f32>(a2) * b2;
-        acc3 = acc3 + vec4<f32>(a3) * b3;
-        kk += 4u;
-    }
-    // Tail for K not multiple of 4.
+    // Each thread accumulates a partial sum over its K-stride slice.
+    var acc = vec4<f32>(0.0);
+    var kk = lane;
     loop {
         if kk >= k { break; }
         let a = matrix_a[kk];
         let b = matrix_b[kk * n_v4 + col4];
-        acc0 = acc0 + vec4<f32>(a) * b;
-        kk += 1u;
+        acc = acc + vec4<f32>(a) * b;
+        kk += 32u;
     }
 
-    matrix_c[col4] = (acc0 + acc1) + (acc2 + acc3);
+    // Warp-wide reduction via shared memory. WG=32 means one warp; on
+    // NVIDIA the workgroupBarrier calls compile to near-free subgroup
+    // sync instructions.
+    reduce_buf[lane] = acc;
+    workgroupBarrier();
+    if lane < 16u { reduce_buf[lane] = reduce_buf[lane] + reduce_buf[lane + 16u]; }
+    workgroupBarrier();
+    if lane < 8u  { reduce_buf[lane] = reduce_buf[lane] + reduce_buf[lane + 8u];  }
+    workgroupBarrier();
+    if lane < 4u  { reduce_buf[lane] = reduce_buf[lane] + reduce_buf[lane + 4u];  }
+    workgroupBarrier();
+    if lane < 2u  { reduce_buf[lane] = reduce_buf[lane] + reduce_buf[lane + 2u];  }
+    workgroupBarrier();
+    if lane == 0u {
+        matrix_c[col4] = reduce_buf[0] + reduce_buf[1];
+    }
 }

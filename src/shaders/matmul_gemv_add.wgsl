@@ -1,10 +1,7 @@
-// GEMV with fused residual-add for M=1 matmul:
-//   C[1, N] = A[1, K] × B[K, N] + D[1, N]
-//
-// Identical structure to matmul_gemv.wgsl — same vec4 loads, unroll-by-4,
-// WG=32 — plus one extra vec4 load from D (residual) at the end.
-// Requires N % 4 == 0. Binding layout matches FusedMatMulAddData: the
-// addend `src` is bound as an additional storage input.
+// K-split GEMV with residual add: C[1, N] = A × B + D[1, N].
+// Structure mirrors matmul_gemv.wgsl; only difference is the final vec4
+// load from D and the add into the reduce result. Dispatch: N/4 WGs ×
+// 32 threads. Requires N % 4 == 0.
 
 struct Params {
     m: u32,
@@ -16,44 +13,39 @@ struct Params {
 var<storage> matrix_a: array<f32>;
 var<storage> matrix_b: array<vec4<f32>>;
 var<storage, read_write> matrix_c: array<vec4<f32>>;
-var<storage> src: array<vec4<f32>>;  // D: residual addend [1, N]
+var<storage> src: array<vec4<f32>>;
 var<uniform> params: Params;
+var<workgroup> reduce_buf: array<vec4<f32>, 32>;
 
 @compute @workgroup_size(32)
 fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let col4 = wgid.x * 32u + lid.x;
+    let col4 = wgid.x;
+    let lane = lid.x;
     let n_v4 = params.n / 4u;
     if col4 >= n_v4 { return; }
     let k = params.k;
 
-    var acc0 = vec4<f32>(0.0);
-    var acc1 = vec4<f32>(0.0);
-    var acc2 = vec4<f32>(0.0);
-    var acc3 = vec4<f32>(0.0);
-    var kk = 0u;
-    loop {
-        if kk + 4u > k { break; }
-        let a0 = matrix_a[kk];
-        let a1 = matrix_a[kk + 1u];
-        let a2 = matrix_a[kk + 2u];
-        let a3 = matrix_a[kk + 3u];
-        let b0 = matrix_b[kk * n_v4 + col4];
-        let b1 = matrix_b[(kk + 1u) * n_v4 + col4];
-        let b2 = matrix_b[(kk + 2u) * n_v4 + col4];
-        let b3 = matrix_b[(kk + 3u) * n_v4 + col4];
-        acc0 = acc0 + vec4<f32>(a0) * b0;
-        acc1 = acc1 + vec4<f32>(a1) * b1;
-        acc2 = acc2 + vec4<f32>(a2) * b2;
-        acc3 = acc3 + vec4<f32>(a3) * b3;
-        kk += 4u;
-    }
+    var acc = vec4<f32>(0.0);
+    var kk = lane;
     loop {
         if kk >= k { break; }
         let a = matrix_a[kk];
         let b = matrix_b[kk * n_v4 + col4];
-        acc0 = acc0 + vec4<f32>(a) * b;
-        kk += 1u;
+        acc = acc + vec4<f32>(a) * b;
+        kk += 32u;
     }
 
-    matrix_c[col4] = (acc0 + acc1) + (acc2 + acc3) + src[col4];
+    reduce_buf[lane] = acc;
+    workgroupBarrier();
+    if lane < 16u { reduce_buf[lane] = reduce_buf[lane] + reduce_buf[lane + 16u]; }
+    workgroupBarrier();
+    if lane < 8u  { reduce_buf[lane] = reduce_buf[lane] + reduce_buf[lane + 8u];  }
+    workgroupBarrier();
+    if lane < 4u  { reduce_buf[lane] = reduce_buf[lane] + reduce_buf[lane + 4u];  }
+    workgroupBarrier();
+    if lane < 2u  { reduce_buf[lane] = reduce_buf[lane] + reduce_buf[lane + 2u];  }
+    workgroupBarrier();
+    if lane == 0u {
+        matrix_c[col4] = reduce_buf[0] + reduce_buf[1] + src[col4];
+    }
 }
