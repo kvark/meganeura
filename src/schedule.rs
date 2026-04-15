@@ -1,22 +1,26 @@
 //! Schedule templates — generic kernel generators that lower to Naga IR.
 //!
-//! This module is the foundation of the generic-fusion plan (see
-//! `docs/plan-generic-fusion.md`). Instead of carrying a zoo of hand-written
-//! WGSL files, we define a handful of **schedule templates** (pointwise,
-//! reduction, matmul±prologue±epilogue, attention) and generate WGSL from
-//! parameterized specifications.
+//! Foundation of the generic-fusion plan (see `docs/plan-generic-fusion.md`).
+//! Instead of carrying a zoo of hand-written WGSL files, we define a handful
+//! of **schedule templates** (pointwise, reduction, matmul±prologue±epilogue,
+//! attention) and generate WGSL from parameterized specifications.
 //!
 //! Design:
 //!   - Keep Naga `Module` as our IR; emit WGSL source text, parse via
 //!     `naga::front::wgsl`. Parsing is ~100µs — specialization is cheap.
 //!   - `PointwiseDAG` is shared across all archetypes (used as prologue /
-//!     epilogue on heavy kernels).
+//!     epilogue on heavy kernels in later steps).
+//!   - Generated pointwise kernels for `n_inputs ∈ {1, 2}` use the same
+//!     binding names as the existing hand-written `unary.wgsl` / `binary.wgsl`
+//!     shaders (`src` / `src_a`+`src_b`), so they plug into the existing
+//!     `UnaryData` / `BinaryData` runtime layouts with zero extra plumbing.
 //!
-//! This initial commit lands only archetype 1 (pointwise) and is
-//! deliberately disconnected from the rest of the compiler — it proves
-//! the codegen pattern before we rewire call sites.
+//! This commit lands archetype 1 (pointwise) as a standalone lowerer.
+//! Wiring into `compile.rs` / `runtime.rs` happens in the next step.
 
+use std::collections::hash_map::DefaultHasher;
 use std::fmt::Write;
+use std::hash::{Hash, Hasher};
 
 use crate::codegen::ShaderModule;
 
@@ -25,19 +29,22 @@ use crate::codegen::ShaderModule;
 // -------------------------------------------------------------------------
 
 /// A scalar elementwise operation, executed per-element.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// `Hash` derived so that a `PointwiseDAG` can be used as a content-hashed
+/// cache key when looking up generated pipelines.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Pw {
-    /// Load input `idx` at the current element position.
+    /// Load input stream `idx` at the current element position.
     LoadInput(u8),
-    /// Literal f32 constant.
-    Const(f32),
-    /// Binary ops — operate on two value-node indices into [`PointwiseDAG::ops`].
+    /// Literal f32 constant. Stored as bit pattern so `Hash`/`Eq` are stable.
+    Const(u32),
+    // Binary ops — reference earlier value-node indices.
     Add(u16, u16),
     Mul(u16, u16),
     Sub(u16, u16),
     Div(u16, u16),
     Greater(u16, u16),
-    /// Unary ops.
+    // Unary ops.
     Neg(u16),
     Recip(u16),
     Exp(u16),
@@ -55,9 +62,16 @@ pub enum Pw {
     Tanh(u16),
 }
 
+impl Pw {
+    /// Construct a `Const` from an f32, encoding via bit pattern.
+    pub fn const_f32(v: f32) -> Self {
+        Pw::Const(v.to_bits())
+    }
+}
+
 /// A DAG of scalar elementwise ops with `n_inputs` input streams and one
 /// output. Value nodes reference earlier entries by index.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PointwiseDAG {
     pub n_inputs: u8,
     pub ops: Vec<Pw>,
@@ -66,20 +80,37 @@ pub struct PointwiseDAG {
 }
 
 impl PointwiseDAG {
-    /// Emit WGSL for the DAG body: assumes inputs are available as
-    /// `src_0[i]`, `src_1[i]`, … and assigns the result to `let out = ...;`.
-    /// Returns the body string. `i` is the element index variable name.
-    pub fn emit_body(&self, i: &str) -> String {
+    /// Stable content hash — suitable as a pipeline-cache key.
+    pub fn hash_key(&self) -> u64 {
+        let mut h = DefaultHasher::new();
+        self.hash(&mut h);
+        h.finish()
+    }
+
+    /// Emit the DAG body as WGSL statements. `input_name(idx)` produces the
+    /// expression used to load input stream `idx` at element index `i` (the
+    /// caller's element variable — hardcoded to `i` to keep this simple).
+    fn emit_body(&self, input_name: impl Fn(u8) -> String) -> String {
         let mut out = String::new();
         for (k, op) in self.ops.iter().enumerate() {
-            let _ = write!(out, "            let v{} = ", k);
+            let _ = write!(out, "    let v{} = ", k);
             match *op {
                 Pw::LoadInput(idx) => {
-                    let _ = write!(out, "src_{}[{}]", idx, i);
+                    let _ = write!(out, "{}[i]", input_name(idx));
                 }
-                Pw::Const(c) => {
-                    // f32 literal with decimal point, required by WGSL.
-                    let _ = write!(out, "{:?}", c);
+                Pw::Const(bits) => {
+                    // Reconstruct f32 and emit with a decimal point + `f` suffix
+                    // so WGSL parses it as f32 regardless of value.
+                    let v = f32::from_bits(bits);
+                    if v.is_finite() {
+                        let _ = write!(out, "{:?}f", v);
+                    } else if v.is_nan() {
+                        out.push_str("bitcast<f32>(0x7fc00000u)");
+                    } else if v.is_sign_positive() {
+                        out.push_str("bitcast<f32>(0x7f800000u)");
+                    } else {
+                        out.push_str("bitcast<f32>(0xff800000u)");
+                    }
                 }
                 Pw::Add(a, b) => {
                     let _ = write!(out, "v{} + v{}", a, b);
@@ -134,6 +165,20 @@ impl PointwiseDAG {
         }
         out
     }
+
+    /// Binding names for each input stream, chosen to match the existing
+    /// hand-written shaders so generated modules plug into the same
+    /// runtime data layouts:
+    ///   - n=1 → ["src"]           (matches `UnaryData`)
+    ///   - n=2 → ["src_a", "src_b"] (matches `BinaryData`)
+    ///   - n≥3 → ["src_0", "src_1", …]
+    fn input_binding_names(n: u8) -> Vec<String> {
+        match n {
+            1 => vec!["src".to_string()],
+            2 => vec!["src_a".to_string(), "src_b".to_string()],
+            n => (0..n).map(|i| format!("src_{}", i)).collect(),
+        }
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -141,9 +186,9 @@ impl PointwiseDAG {
 // -------------------------------------------------------------------------
 
 /// How threads are assigned to output elements.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct GridShape {
-    /// Elements per workgroup along the X axis. Fixed 256 for now.
+    /// Threads per workgroup along the X axis.
     pub workgroup_size: u32,
 }
 
@@ -155,12 +200,16 @@ impl Default for GridShape {
     }
 }
 
-/// A schedule template — to be lowered to a Naga [`Module`](naga::Module).
+/// A schedule template — to be lowered to a Naga [`naga::Module`].
 #[derive(Clone, Debug)]
 pub enum KernelTemplate {
     Pointwise { dag: PointwiseDAG, grid: GridShape },
     // Reduction, Matmul, Attention — added in later steps of the plan.
 }
+
+/// Entry-point name emitted for a `KernelTemplate`. Always `"main"` for
+/// pointwise kernels (one entry point per generated module).
+pub const POINTWISE_ENTRY: &str = "main";
 
 /// Lower a [`KernelTemplate`] to WGSL + a parsed Naga module.
 pub fn lower(t: &KernelTemplate) -> ShaderModule {
@@ -170,21 +219,37 @@ pub fn lower(t: &KernelTemplate) -> ShaderModule {
 }
 
 fn lower_pointwise(dag: &PointwiseDAG, grid: GridShape) -> ShaderModule {
+    assert!(
+        dag.n_inputs >= 1,
+        "PointwiseDAG must have at least one input stream"
+    );
+    assert!(
+        (dag.output as usize) < dag.ops.len(),
+        "PointwiseDAG.output is out of range"
+    );
+
+    let input_names = PointwiseDAG::input_binding_names(dag.n_inputs);
+    let input_name = |idx: u8| input_names[idx as usize].clone();
+
     let mut src = String::new();
     src.push_str(
         "struct Params {\n    len: u32,\n    _pad0: u32,\n    _pad1: u32,\n    _pad2: u32,\n}\n\n",
     );
-    for k in 0..dag.n_inputs {
-        let _ = writeln!(src, "var<storage> src_{}: array<f32>;", k);
+    for name in &input_names {
+        let _ = writeln!(src, "var<storage> {}: array<f32>;", name);
     }
     src.push_str("var<storage, read_write> dst: array<f32>;\n");
     src.push_str("var<uniform> params: Params;\n\n");
     let _ = writeln!(src, "@compute @workgroup_size({})", grid.workgroup_size);
-    src.push_str("fn main(@builtin(global_invocation_id) gid: vec3<u32>) {\n");
+    let _ = writeln!(
+        src,
+        "fn {}(@builtin(global_invocation_id) gid: vec3<u32>) {{",
+        POINTWISE_ENTRY
+    );
     src.push_str("    let i = gid.x;\n");
     src.push_str("    if i >= params.len { return; }\n");
-    src.push_str(&dag.emit_body("i"));
-    let _ = writeln!(src, "            dst[i] = v{};", dag.output);
+    src.push_str(&dag.emit_body(input_name));
+    let _ = writeln!(src, "    dst[i] = v{};", dag.output);
     src.push_str("}\n");
 
     let module = naga::front::wgsl::parse_str(&src)
@@ -203,73 +268,144 @@ fn lower_pointwise(dag: &PointwiseDAG, grid: GridShape) -> ShaderModule {
 mod tests {
     use super::*;
 
-    /// The equivalent of `binary.wgsl`'s `add` entry:
-    ///   dst[i] = src_a[i] + src_b[i]
+    /// Equivalent of `unary.wgsl`'s `relu`: dst[i] = max(src[i], 0).
+    fn relu_dag() -> PointwiseDAG {
+        PointwiseDAG {
+            n_inputs: 1,
+            ops: vec![Pw::LoadInput(0), Pw::Relu(0)],
+            output: 1,
+        }
+    }
+
+    /// Equivalent of `binary.wgsl`'s `add`: dst[i] = src_a[i] + src_b[i].
     fn add_dag() -> PointwiseDAG {
         PointwiseDAG {
             n_inputs: 2,
-            ops: vec![
-                Pw::LoadInput(0), // v0 = src_0[i]
-                Pw::LoadInput(1), // v1 = src_1[i]
-                Pw::Add(0, 1),    // v2 = v0 + v1
-            ],
+            ops: vec![Pw::LoadInput(0), Pw::LoadInput(1), Pw::Add(0, 1)],
             output: 2,
         }
     }
 
-    /// Equivalent of `binary.wgsl`'s `swiglu`:
-    ///   dst[i] = silu(src_a[i]) * src_b[i]
+    /// Equivalent of `binary.wgsl`'s `swiglu`: silu(src_a[i]) * src_b[i].
     fn swiglu_dag() -> PointwiseDAG {
         PointwiseDAG {
             n_inputs: 2,
             ops: vec![
-                Pw::LoadInput(0), // v0 = gate
-                Pw::LoadInput(1), // v1 = up
-                Pw::Silu(0),      // v2 = silu(gate)
-                Pw::Mul(2, 1),    // v3 = silu(gate) * up
+                Pw::LoadInput(0),
+                Pw::LoadInput(1),
+                Pw::Silu(0),
+                Pw::Mul(2, 1),
             ],
             output: 3,
         }
     }
 
     #[test]
-    fn lowers_add_to_valid_wgsl() {
+    fn unary_uses_existing_binding_names() {
+        let sm = lower(&KernelTemplate::Pointwise {
+            dag: relu_dag(),
+            grid: GridShape::default(),
+        });
+        // Match unary.wgsl so UnaryData layout can bind the generated shader.
+        assert!(sm.source.contains("var<storage> src: array<f32>;"));
+        assert!(
+            sm.source
+                .contains("var<storage, read_write> dst: array<f32>;")
+        );
+        assert!(sm.source.contains("fn main("));
+        assert!(sm.source.contains("dst[i] = v1;"));
+    }
+
+    #[test]
+    fn binary_uses_existing_binding_names() {
         let sm = lower(&KernelTemplate::Pointwise {
             dag: add_dag(),
             grid: GridShape::default(),
         });
-        // Sanity: has expected pieces.
-        assert!(sm.source.contains("var<storage> src_0: array<f32>;"));
-        assert!(sm.source.contains("var<storage> src_1: array<f32>;"));
+        // Match binary.wgsl so BinaryData layout can bind the generated shader.
+        assert!(sm.source.contains("var<storage> src_a: array<f32>;"));
+        assert!(sm.source.contains("var<storage> src_b: array<f32>;"));
         assert!(sm.source.contains("dst[i] = v2;"));
-        // Naga parse already validated in lower().
-        assert!(!sm.module.entry_points.is_empty());
     }
 
     #[test]
-    fn lowers_swiglu_to_valid_wgsl() {
+    fn swiglu_body_is_well_formed() {
         let sm = lower(&KernelTemplate::Pointwise {
             dag: swiglu_dag(),
             grid: GridShape::default(),
         });
-        // Silu expansion present, multiply present.
         assert!(sm.source.contains("1.0 + exp(-v0)"));
         assert!(sm.source.contains("v2 * v1"));
         assert!(sm.source.contains("dst[i] = v3;"));
     }
 
     #[test]
-    fn naga_validates_pointwise_module() {
-        use naga::valid::{Capabilities, ValidationFlags, Validator};
+    fn three_plus_inputs_use_numbered_bindings() {
+        // 3-input DAG: dst[i] = src_0 + src_1 + src_2
+        let dag = PointwiseDAG {
+            n_inputs: 3,
+            ops: vec![
+                Pw::LoadInput(0),
+                Pw::LoadInput(1),
+                Pw::LoadInput(2),
+                Pw::Add(0, 1),
+                Pw::Add(3, 2),
+            ],
+            output: 4,
+        };
         let sm = lower(&KernelTemplate::Pointwise {
-            dag: add_dag(),
+            dag,
             grid: GridShape::default(),
         });
+        assert!(sm.source.contains("var<storage> src_0: array<f32>;"));
+        assert!(sm.source.contains("var<storage> src_1: array<f32>;"));
+        assert!(sm.source.contains("var<storage> src_2: array<f32>;"));
+    }
+
+    #[test]
+    fn hash_is_stable_and_structural() {
+        // Same DAG → same hash.
+        assert_eq!(relu_dag().hash_key(), relu_dag().hash_key());
+        // Different DAGs → different hashes (not a perfect property, but
+        // true for these simple cases).
+        assert_ne!(relu_dag().hash_key(), add_dag().hash_key());
+        assert_ne!(add_dag().hash_key(), swiglu_dag().hash_key());
+    }
+
+    #[test]
+    fn const_encoding_roundtrips() {
+        let dag = PointwiseDAG {
+            n_inputs: 1,
+            ops: vec![
+                Pw::LoadInput(0),
+                Pw::const_f32(0.5),
+                Pw::Mul(0, 1), // x * 0.5
+            ],
+            output: 2,
+        };
+        let sm = lower(&KernelTemplate::Pointwise {
+            dag,
+            grid: GridShape::default(),
+        });
+        assert!(sm.source.contains("0.5f"));
+    }
+
+    #[test]
+    fn naga_validates_pointwise_module() {
+        use naga::valid::{Capabilities, ValidationFlags, Validator};
         // Blade injects bindings at pipeline creation — validate without them,
         // matching the convention used in codegen.rs.
         let flags = ValidationFlags::all() ^ ValidationFlags::BINDINGS;
         let mut v = Validator::new(flags, Capabilities::all());
-        v.validate(&sm.module)
-            .unwrap_or_else(|e| panic!("naga validation failed: {:?}\n{}", e, sm.source));
+
+        for dag in [relu_dag(), add_dag(), swiglu_dag()] {
+            let sm = lower(&KernelTemplate::Pointwise {
+                dag,
+                grid: GridShape::default(),
+            });
+            v.validate(&sm.module).unwrap_or_else(|e| {
+                panic!("naga validation failed: {:?}\n{}", e, sm.source);
+            });
+        }
     }
 }
