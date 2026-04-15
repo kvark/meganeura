@@ -748,7 +748,7 @@ impl Pipelines {
                 source: &sm.source,
                 naga_module: Some(sm.module),
             });
-            let layout = shader_data_layout(&dispatch.shader);
+            let layout = pointwise_data_layout(dag.n_inputs);
             let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
                 name: crate::schedule::POINTWISE_ENTRY,
                 data_layouts: &[&layout],
@@ -789,6 +789,19 @@ impl Pipelines {
             }
         }
         &self.map[&dispatch.shader]
+    }
+}
+
+/// ShaderDataLayout for a schedule-template pointwise pipeline, chosen by
+/// DAG input arity. Names align with the bindings emitted by
+/// `schedule::lower` for each arity.
+fn pointwise_data_layout(n_inputs: u8) -> blade_graphics::ShaderDataLayout {
+    use blade_graphics::ShaderData;
+    match n_inputs {
+        1 => UnaryData::layout(),
+        2 => BinaryData::layout(),
+        3 => TernaryData::layout(),
+        n => panic!("pointwise arity {} has no runtime data layout", n),
     }
 }
 
@@ -1743,6 +1756,54 @@ impl Session {
         pc: &mut impl blade_graphics::traits::PipelineEncoder,
     ) {
         let buf = |r: BufferRef| buffers[r.0 as usize].at(0);
+        // Schedule-template pointwise dispatches route by DAG arity, not
+        // by the dummy `shader` entry — arity may be 3 after fusion, which
+        // no ShaderEntry variant represents.
+        if let Some(ref dag) = dispatch.pointwise {
+            let params = UnaryParams {
+                len: dispatch.params[0],
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            };
+            match dag.n_inputs {
+                1 => {
+                    pc.bind(
+                        0,
+                        &UnaryData {
+                            src: buf(dispatch.input_buffers[0]),
+                            dst: buf(dispatch.output_buffer),
+                            params,
+                        },
+                    );
+                }
+                2 => {
+                    pc.bind(
+                        0,
+                        &BinaryData {
+                            src_a: buf(dispatch.input_buffers[0]),
+                            src_b: buf(dispatch.input_buffers[1]),
+                            dst: buf(dispatch.output_buffer),
+                            params,
+                        },
+                    );
+                }
+                3 => {
+                    pc.bind(
+                        0,
+                        &TernaryData {
+                            src_a: buf(dispatch.input_buffers[0]),
+                            src_b: buf(dispatch.input_buffers[1]),
+                            src_c: buf(dispatch.input_buffers[2]),
+                            dst: buf(dispatch.output_buffer),
+                            params,
+                        },
+                    );
+                }
+                n => panic!("pointwise arity {} has no runtime data layout", n),
+            }
+            return;
+        }
         match dispatch.shader {
             ShaderEntry::MatMul => {
                 pc.bind(

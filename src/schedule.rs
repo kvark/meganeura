@@ -171,14 +171,23 @@ impl PointwiseDAG {
     /// Binding names for each input stream, chosen to match the existing
     /// hand-written shaders so generated modules plug into the same
     /// runtime data layouts:
-    ///   - n=1 → ["src"]           (matches `UnaryData`)
-    ///   - n=2 → ["src_a", "src_b"] (matches `BinaryData`)
-    ///   - n≥3 → ["src_0", "src_1", …]
+    ///   - n=1 → ["src"]                        (matches `UnaryData`)
+    ///   - n=2 → ["src_a", "src_b"]             (matches `BinaryData`)
+    ///   - n=3 → ["src_a", "src_b", "src_c"]    (matches `TernaryData`)
+    ///
+    /// Panics for n>3 — the runtime does not currently plumb a wider
+    /// data layout (see `runtime::pointwise_data_layout`). The fusion
+    /// pass caps output arity at 3.
     fn input_binding_names(n: u8) -> Vec<String> {
         match n {
             1 => vec!["src".to_string()],
             2 => vec!["src_a".to_string(), "src_b".to_string()],
-            n => (0..n).map(|i| format!("src_{}", i)).collect(),
+            3 => vec![
+                "src_a".to_string(),
+                "src_b".to_string(),
+                "src_c".to_string(),
+            ],
+            n => panic!("PointwiseDAG arity {} has no binding layout", n),
         }
     }
 
@@ -414,8 +423,9 @@ mod tests {
     }
 
     #[test]
-    fn three_plus_inputs_use_numbered_bindings() {
-        // 3-input DAG: dst[i] = src_0 + src_1 + src_2
+    fn ternary_uses_abc_binding_names() {
+        // 3-input DAG: dst[i] = src_a + src_b + src_c — must use abc
+        // naming to match the runtime's TernaryData layout.
         let dag = PointwiseDAG {
             n_inputs: 3,
             ops: vec![
@@ -431,9 +441,9 @@ mod tests {
             dag,
             grid: GridShape::default(),
         });
-        assert!(sm.source.contains("var<storage> src_0: array<f32>;"));
-        assert!(sm.source.contains("var<storage> src_1: array<f32>;"));
-        assert!(sm.source.contains("var<storage> src_2: array<f32>;"));
+        assert!(sm.source.contains("var<storage> src_a: array<f32>;"));
+        assert!(sm.source.contains("var<storage> src_b: array<f32>;"));
+        assert!(sm.source.contains("var<storage> src_c: array<f32>;"));
     }
 
     #[test]
