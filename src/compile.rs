@@ -999,13 +999,13 @@ impl<'a> Compiler<'a> {
                 let k = a_shape[1] as u32;
                 let n = b_shape[1] as u32;
                 if m == 1 && n % 4 == 0 {
-                    // GEMV specialization: vec4 B loads, 4 output cols
-                    // per thread, WG=32 (one warp, no barriers). Requires
-                    // N % 4 == 0 for the vec4 view of B/C to be safe;
-                    // non-aligned shapes fall through to the tile matmul.
+                    // K-split GEMV: one WG per 4 output columns (vec4),
+                    // 32 threads cooperatively K-split with a shared-
+                    // memory tree reduction. Many more WGs than N/128,
+                    // giving occupancy to hide DRAM latency at M=1.
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::MatMulGemv,
-                        workgroups: [(n / 4).div_ceil(32), 1, 1],
+                        workgroups: [n / 4, 1, 1],
                         input_buffers: vec![a, b],
                         output_buffer: out_buf,
                         extra_outputs: vec![],
@@ -1084,10 +1084,10 @@ impl<'a> Compiler<'a> {
                 let k = a_shape[1] as u32;
                 let n = b_shape[1] as u32;
                 if m == 1 && n % 4 == 0 {
-                    // GEMV-with-residual-add specialization for decode.
+                    // K-split GEMV-with-residual-add: one WG per 4 cols.
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::MatMulGemvAdd,
-                        workgroups: [(n / 4).div_ceil(32), 1, 1],
+                        workgroups: [n / 4, 1, 1],
                         input_buffers: vec![a, b, d],
                         output_buffer: out_buf,
                         extra_outputs: vec![],
