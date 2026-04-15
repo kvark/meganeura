@@ -899,7 +899,8 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         | ShaderEntry::MatMulGemv => MatMulData::layout(),
         ShaderEntry::FusedMatMulAdd
         | ShaderEntry::FusedMatMulATAdd
-        | ShaderEntry::FusedMatMulBTAdd => FusedMatMulAddData::layout(),
+        | ShaderEntry::FusedMatMulBTAdd
+        | ShaderEntry::MatMulGemvAdd => FusedMatMulAddData::layout(),
         ShaderEntry::Relu
         | ShaderEntry::Sigmoid
         | ShaderEntry::Tanh
@@ -1982,7 +1983,7 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::FusedMatMulAdd => {
+            ShaderEntry::FusedMatMulAdd | ShaderEntry::MatMulGemvAdd => {
                 pc.bind(
                     0,
                     &FusedMatMulAddData {

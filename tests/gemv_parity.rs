@@ -123,6 +123,83 @@ fn gemv_non_multiple_of_256() {
     test_shape(128, 1, 9);
 }
 
+// ---- FusedMatMulAdd (GEMV + residual) ----
+
+/// CPU reference: 1×K × K×N + D[1,N].
+fn cpu_gemv_add(a: &[f32], b: &[f32], d: &[f32], k: usize, n: usize) -> Vec<f32> {
+    let mut out = cpu_gemv(a, b, k, n);
+    for (o, r) in out.iter_mut().zip(d.iter()) {
+        *o += *r;
+    }
+    out
+}
+
+fn test_gemv_add_shape(k: usize, n: usize, seed: u32) {
+    let a: Vec<f32> = (0..k)
+        .map(|i| ((i as u32 ^ seed) as f32 * 0.003).sin())
+        .collect();
+    let b: Vec<f32> = (0..k * n)
+        .map(|i| ((i as u32 ^ seed.wrapping_mul(31)) as f32 * 0.0007).cos())
+        .collect();
+    let d: Vec<f32> = (0..n)
+        .map(|i| ((i as u32 ^ seed.wrapping_mul(7)) as f32 * 0.01).sin() * 0.1)
+        .collect();
+
+    let mut g = Graph::new();
+    let a_n = g.input("a", &[1, k]);
+    let b_n = g.parameter("b", &[k, n]);
+    let d_n = g.parameter("d", &[1, n]);
+    let mm = g.matmul(a_n, b_n);
+    let out = g.add(mm, d_n);
+    g.set_outputs(vec![out]);
+
+    let mut session = build_inference_session(&g);
+    // Sanity: the optimizer should fuse MatMul+Add to FusedMatMulAdd, which
+    // at M=1 with N%4==0 routes through MatMulGemvAdd.
+    let plan = session.plan();
+    let gemv_add_count = plan
+        .dispatches
+        .iter()
+        .filter(|disp| matches!(disp.shader, compile::ShaderEntry::MatMulGemvAdd))
+        .count();
+    assert_eq!(
+        gemv_add_count,
+        1,
+        "expected one MatMulGemvAdd dispatch, got {}; plan:\n{:?}",
+        gemv_add_count,
+        plan.dispatches
+            .iter()
+            .map(|d| format!("{:?}", d.shader))
+            .collect::<Vec<_>>(),
+    );
+
+    session.set_input("a", &a);
+    session.set_parameter("b", &b);
+    session.set_parameter("d", &d);
+    session.step();
+    session.wait();
+    let gpu = session.read_output(n);
+    let cpu = cpu_gemv_add(&a, &b, &d, k, n);
+    assert_close(&gpu, &cpu, 1e-4, 1e-5);
+}
+
+#[test]
+fn gemv_add_smollm2_mlp_down() {
+    // MLP down + residual at decode: 1×1536 × 1536×576 + residual
+    test_gemv_add_shape(1536, 576, 100);
+}
+
+#[test]
+fn gemv_add_smollm2_o_proj() {
+    // Attention out-proj + residual: 1×576 × 576×576 + residual
+    test_gemv_add_shape(576, 576, 101);
+}
+
+#[test]
+fn gemv_add_smolvla_mlp_down() {
+    test_gemv_add_shape(2048, 720, 102);
+}
+
 #[test]
 fn gemv_non_multiple_k() {
     // K not a multiple of 256 — exercises the shared-memory chunk tail.

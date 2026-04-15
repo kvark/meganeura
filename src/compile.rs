@@ -42,6 +42,9 @@ pub enum ShaderEntry {
     /// M=1 GEMV specialization of MatMul. Selected when `C = A × B` has
     /// a single row on the output side (LM decode path).
     MatMulGemv,
+    /// M=1 GEMV with fused residual add: `C = A × B + D`.
+    /// Selected for FusedMatMulAdd when M=1.
+    MatMulGemvAdd,
     FusedMatMulAdd,
     FusedMatMulATAdd,
     FusedMatMulBTAdd,
@@ -130,6 +133,7 @@ impl ShaderEntry {
             ShaderEntry::MatMulAT => ShaderGroup::MatMulAT,
             ShaderEntry::MatMulBT => ShaderGroup::MatMulBT,
             ShaderEntry::MatMulGemv => ShaderGroup::MatMulGemv,
+            ShaderEntry::MatMulGemvAdd => ShaderGroup::MatMulGemvAdd,
             ShaderEntry::FusedMatMulAdd => ShaderGroup::MatMulAdd,
             ShaderEntry::FusedMatMulATAdd => ShaderGroup::MatMulATAdd,
             ShaderEntry::FusedMatMulBTAdd => ShaderGroup::MatMulBTAdd,
@@ -211,6 +215,7 @@ impl ShaderEntry {
             | ShaderEntry::MatMulAT
             | ShaderEntry::MatMulBT
             | ShaderEntry::MatMulGemv
+            | ShaderEntry::MatMulGemvAdd
             | ShaderEntry::FusedMatMulAdd
             | ShaderEntry::FusedMatMulATAdd
             | ShaderEntry::FusedMatMulBTAdd
@@ -884,7 +889,10 @@ impl<'a> Compiler<'a> {
         // Generate labels for profiling
         for d in &mut self.plan.dispatches {
             d.label = match d.shader {
-                ShaderEntry::MatMul | ShaderEntry::FusedMatMulAdd | ShaderEntry::MatMulGemv => {
+                ShaderEntry::MatMul
+                | ShaderEntry::FusedMatMulAdd
+                | ShaderEntry::MatMulGemv
+                | ShaderEntry::MatMulGemvAdd => {
                     format!(
                         "{:?}[{}x{}x{}]",
                         d.shader, d.params[0], d.params[2], d.params[1]
@@ -1075,17 +1083,32 @@ impl<'a> Compiler<'a> {
                 let m = a_shape[0] as u32;
                 let k = a_shape[1] as u32;
                 let n = b_shape[1] as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::FusedMatMulAdd,
-                    workgroups: [n.div_ceil(64), m.div_ceil(64), 1],
-                    input_buffers: vec![a, b, d],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![m, k, n, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
-                    ..Default::default()
-                });
+                if m == 1 && n % 4 == 0 {
+                    // GEMV-with-residual-add specialization for decode.
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::MatMulGemvAdd,
+                        workgroups: [(n / 4).div_ceil(32), 1, 1],
+                        input_buffers: vec![a, b, d],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params: vec![m, k, n, 0],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
+                } else {
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::FusedMatMulAdd,
+                        workgroups: [n.div_ceil(64), m.div_ceil(64), 1],
+                        input_buffers: vec![a, b, d],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params: vec![m, k, n, 0],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
+                }
             }
 
             Op::FusedMatMulATAdd => {
