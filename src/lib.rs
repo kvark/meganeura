@@ -31,6 +31,7 @@ pub mod nn;
 pub mod optimize;
 pub mod profiler;
 pub mod runtime;
+pub mod schedule;
 pub mod train;
 
 pub use data::{DataLoader, MnistDataset};
