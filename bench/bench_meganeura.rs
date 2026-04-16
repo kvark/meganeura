@@ -118,8 +118,8 @@ fn main() {
     let transposed = smollm2::transposed_weight_names(&config);
     let transposed_set: std::collections::HashSet<&str> =
         transposed.iter().map(|s| s.as_str()).collect();
-
     // --- Build sessions based on mode ---
+    #[allow(clippy::type_complexity)]
     let mut generate: Box<dyn FnMut(&mut meganeura::Session, usize) -> (f64, Vec<u32>)>;
     let mut session: meganeura::Session;
 

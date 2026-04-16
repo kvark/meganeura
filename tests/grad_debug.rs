@@ -9,7 +9,7 @@ fn name_seed(name: &str) -> f32 {
     }
     (h % 10000) as f32
 }
-
+#[allow(clippy::too_many_arguments)]
 fn check_grad(
     label: &str,
     build_train: impl Fn() -> Graph,

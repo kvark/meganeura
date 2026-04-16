@@ -30,8 +30,8 @@ fn output_matmul_survives_matmul_add_fusion() {
         "both loss and pred should survive optimization (got {})",
         s.num_outputs()
     );
-    s.set_parameter("fc.weight", &vec![0.2; 12]);
-    s.set_parameter("fc.bias", &vec![0.0; 3]);
+    s.set_parameter("fc.weight", &[0.2; 12]);
+    s.set_parameter("fc.bias", &[0.0; 3]);
     let input: Vec<f32> = (0..bs * 4).map(|i| (i as f32 + 1.0) * 0.1).collect();
     s.set_input("h", &input);
     s.set_input("target", &vec![0.0f32; bs * 3]);

@@ -218,15 +218,15 @@ fn simple_sgd_decreases_loss() {
     g.set_outputs(vec![loss]);
 
     let mut session = build_session(&g);
-    session.set_parameter("w", &vec![0.1_f32; 8 * 4]);
-    session.set_input("x", &vec![1.0_f32; 4 * 8]);
+    session.set_parameter("w", &[0.1_f32; 8 * 4]);
+    session.set_input("x", &[1.0_f32; 4 * 8]);
     session.step();
     session.wait();
     let initial_loss = session.read_loss();
     assert!(initial_loss.is_finite());
 
     session.sgd_step_cpu(0.1);
-    session.set_input("x", &vec![1.0_f32; 4 * 8]);
+    session.set_input("x", &[1.0_f32; 4 * 8]);
     session.step();
     session.wait();
     let final_loss = session.read_loss();
@@ -880,13 +880,13 @@ fn smollm2_e2e_gradient_finite_diff() {
         "model.embed_tokens.weight",
         "model.layers.0.input_layernorm.weight",
     ] {
-        if let Some(buf) = param_bufs.get(pname) {
-            if let Some(&(_, g)) = plan.param_grad_pairs.iter().find(|&&(p, _)| p == *buf) {
-                let n = plan.buffers[g.0 as usize] / 4;
-                let mut grad = vec![0.0f32; n];
-                train_sess.read_buffer(g, &mut grad);
-                eprintln!("  {pname} grad[0..3]: {:?}", &grad[..3.min(n)]);
-            }
+        if let Some(buf) = param_bufs.get(pname)
+            && let Some(&(_, g)) = plan.param_grad_pairs.iter().find(|&&(p, _)| p == *buf)
+        {
+            let n = plan.buffers[g.0 as usize] / 4;
+            let mut grad = vec![0.0f32; n];
+            train_sess.read_buffer(g, &mut grad);
+            eprintln!("  {pname} grad[0..3]: {:?}", &grad[..3.min(n)]);
         }
     }
 
@@ -1252,9 +1252,9 @@ fn mse_loss_training() {
     g.set_outputs(vec![loss]);
 
     let mut session = build_session(&g);
-    session.set_parameter("w", &vec![0.1_f32; 16]);
-    session.set_input("x", &vec![1.0_f32; 16]);
-    session.set_input("target", &vec![0.0_f32; 16]);
+    session.set_parameter("w", &[0.1_f32; 16]);
+    session.set_input("x", &[1.0_f32; 16]);
+    session.set_input("target", &[0.0_f32; 16]);
 
     session.step();
     session.wait();
@@ -1266,8 +1266,8 @@ fn mse_loss_training() {
     );
 
     session.sgd_step_cpu(0.01);
-    session.set_input("x", &vec![1.0_f32; 16]);
-    session.set_input("target", &vec![0.0_f32; 16]);
+    session.set_input("x", &[1.0_f32; 16]);
+    session.set_input("target", &[0.0_f32; 16]);
     session.step();
     session.wait();
     let loss1 = session.read_loss();
@@ -1319,12 +1319,12 @@ fn checkpoint_round_trip() {
     g.set_outputs(vec![loss]);
 
     let mut session = build_session(&g);
-    session.set_parameter("w", &vec![0.1_f32; 8 * 4]);
-    session.set_input("x", &vec![1.0_f32; 4 * 8]);
+    session.set_parameter("w", &[0.1_f32; 8 * 4]);
+    session.set_input("x", &[1.0_f32; 4 * 8]);
 
     // Train 3 steps with Adam
     for _ in 0..3 {
-        session.set_input("x", &vec![1.0_f32; 4 * 8]);
+        session.set_input("x", &[1.0_f32; 4 * 8]);
         session.adam_step(0.01, 0.9, 0.999, 1e-8);
         session.step();
         session.wait();
@@ -1363,7 +1363,7 @@ fn checkpoint_round_trip() {
     }
 
     // Same loss after restore
-    session2.set_input("x", &vec![1.0_f32; 4 * 8]);
+    session2.set_input("x", &[1.0_f32; 4 * 8]);
     session2.step();
     session2.wait();
     let loss_after = session2.read_loss();
@@ -1727,9 +1727,9 @@ fn rope_per_head_correctness() {
 
     // Verify position 0 is identity-like (cos(0)=1, sin(0)=0)
     // For pos=0: output should equal input (rotation by 0)
-    for i in 0..dim {
+    for (i, val) in output.iter().enumerate().take(dim) {
         assert!(
-            (output[i] - 1.0).abs() < 1e-5,
+            (*val - 1.0).abs() < 1e-5,
             "pos=0 should be identity: output[{}]={:.6}",
             i,
             output[i]

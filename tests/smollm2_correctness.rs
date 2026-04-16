@@ -105,7 +105,7 @@ fn smollm2_logits_match_pytorch() {
     let mut greedy_match = 0;
     let mut total_max_err = 0.0_f32;
 
-    for pos in 0..SEQ_LEN {
+    for (pos, &ref_greedy) in REF_GREEDY.iter().enumerate() {
         let offset = pos * VOCAB_SIZE;
         let mega_pos = &mega_logits[offset..offset + VOCAB_SIZE];
         let ref_pos = &ref_logits[offset..offset + VOCAB_SIZE];
@@ -123,14 +123,14 @@ fn smollm2_logits_match_pytorch() {
             .unwrap()
             .0 as u32;
 
-        if mega_argmax == REF_GREEDY[pos] {
+        if mega_argmax == ref_greedy {
             greedy_match += 1;
         }
 
         eprintln!(
             "pos {pos}: max_err={pos_max_err:.4e}, mega_argmax={mega_argmax}, ref={} [{}]",
-            REF_GREEDY[pos],
-            if mega_argmax == REF_GREEDY[pos] {
+            ref_greedy,
+            if mega_argmax == ref_greedy {
                 "MATCH"
             } else {
                 "MISMATCH"
