@@ -1004,7 +1004,7 @@ impl<'a> Compiler<'a> {
                 let m = a_shape[0] as u32;
                 let k = a_shape[1] as u32;
                 let n = b_shape[1] as u32;
-                if m == 1 && n % 4 == 0 {
+                if m == 1 && n.is_multiple_of(4) {
                     // K-split GEMV: one WG per 4 output columns (vec4),
                     // 32 threads cooperatively K-split with a shared-
                     // memory tree reduction. Many more WGs than N/128,
@@ -1066,7 +1066,7 @@ impl<'a> Compiler<'a> {
                 let m = a_shape[0] as u32; // A is [M, K]
                 let k = a_shape[1] as u32;
                 let n = b_shape[0] as u32; // B is [N, K]
-                if m == 1 && k % 4 == 0 {
+                if m == 1 && k.is_multiple_of(4) {
                     // K-split GEMV for MatMulBT. Per WG one output col;
                     // the 32 threads K-split with contiguous vec4 loads
                     // along the inner K axis of B. Coalesced by design.
@@ -1106,7 +1106,7 @@ impl<'a> Compiler<'a> {
                 let m = a_shape[0] as u32;
                 let k = a_shape[1] as u32;
                 let n = b_shape[1] as u32;
-                if m == 1 && n % 4 == 0 {
+                if m == 1 && n.is_multiple_of(4) {
                     // K-split GEMV-with-residual-add: one WG per 4 cols.
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::MatMulGemvAdd,
