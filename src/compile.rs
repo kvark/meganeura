@@ -1581,9 +1581,10 @@ impl<'a> Compiler<'a> {
                 let pred = self.get_buffer(node.inputs[0]);
                 let labels = self.get_buffer(node.inputs[1]);
                 let len = self.graph.node(node.inputs[0]).ty.num_elements() as u32;
+                let num_wgs = len.div_ceil(256);
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::BceLoss,
-                    workgroups: [1, 1, 1],
+                    workgroups: [num_wgs, 1, 1],
                     input_buffers: vec![pred, labels],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
@@ -2834,17 +2835,45 @@ impl<'a> Compiler<'a> {
                 let x_shape = &self.graph.node(node.inputs[1]).ty.shape;
                 let rows = x_shape[0] as u32;
                 let cols = x_shape[1] as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::LayerNormGradWB,
-                    workgroups: [cols, 1, 1],
-                    input_buffers: vec![dy, x, w],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![rows, cols, eps.to_bits(), 0],
-                    use_coop: false,
-                    use_small_tiles: false,
-                    ..Default::default()
-                });
+                if rows >= 4 {
+                    // Row-parallel: each WG handles one row, SumRows reduces.
+                    let temp_buf =
+                        self.alloc_buffer((rows as usize) * (cols as usize) * 4);
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::LayerNormGradWB,
+                        workgroups: [rows, 1, 1],
+                        input_buffers: vec![dy, x, w],
+                        output_buffer: temp_buf,
+                        extra_outputs: vec![],
+                        params: vec![rows, cols, eps.to_bits(), 0],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::SumRows,
+                        workgroups: [cols.div_ceil(256), 1, 1],
+                        input_buffers: vec![temp_buf],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params: vec![rows, cols, 0, 0],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
+                } else {
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::LayerNormGradWB,
+                        workgroups: [rows, 1, 1],
+                        input_buffers: vec![dy, x, w],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params: vec![rows, cols, eps.to_bits(), 0],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
+                }
             }
 
             Op::LayerNormGradX { eps } => {

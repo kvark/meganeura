@@ -1805,7 +1805,10 @@ impl Graph {
         let p_shape = &self.node(pred).ty.shape;
         let l_shape = &self.node(labels).ty.shape;
         assert_eq!(p_shape, l_shape, "pred and labels must match");
-        let ty = TensorType::f32(vec![1]);
+        // Per-workgroup partial losses, summed by read_loss() on CPU.
+        let num_elements: usize = p_shape.iter().product();
+        let num_wgs = num_elements.div_ceil(256);
+        let ty = TensorType::f32(vec![num_wgs]);
         self.add_node(Op::BceLoss, vec![pred, labels], ty)
     }
 }
