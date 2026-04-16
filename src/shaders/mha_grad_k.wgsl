@@ -1,4 +1,4 @@
-// MHA gradient wrt K — BQ=8 tiled Q loop
+// MHA gradient wrt K — fused triple reduction per Q position
 // Dispatch: [kv_seq, num_kv_heads, 1], WG=64
 
 struct Params {
@@ -20,21 +20,25 @@ var<storage> lse: array<f32>;     // LSE from forward (max_score, log_sum only)
 var<storage> fwd_dst: array<f32>; // O from forward
 var<storage, read_write> dst: array<f32>;  // dK
 var<uniform> params: Params;
-var<workgroup> wg_dot: array<f32, 64>;
+var<workgroup> wg_a: array<f32, 64>;
+var<workgroup> wg_b: array<f32, 64>;
+var<workgroup> wg_c: array<f32, 64>;
 
-fn tree_reduce(tid: u32) {
+// Fused triple tree_reduce: reduces wg_a, wg_b, wg_c simultaneously,
+// saving 14 barriers vs doing them sequentially.
+fn triple_tree_reduce(tid: u32) {
     workgroupBarrier();
-    if tid < 32u { wg_dot[tid] += wg_dot[tid + 32u]; }
+    if tid < 32u { wg_a[tid] += wg_a[tid + 32u]; wg_b[tid] += wg_b[tid + 32u]; wg_c[tid] += wg_c[tid + 32u]; }
     workgroupBarrier();
-    if tid < 16u { wg_dot[tid] += wg_dot[tid + 16u]; }
+    if tid < 16u { wg_a[tid] += wg_a[tid + 16u]; wg_b[tid] += wg_b[tid + 16u]; wg_c[tid] += wg_c[tid + 16u]; }
     workgroupBarrier();
-    if tid < 8u { wg_dot[tid] += wg_dot[tid + 8u]; }
+    if tid < 8u { wg_a[tid] += wg_a[tid + 8u]; wg_b[tid] += wg_b[tid + 8u]; wg_c[tid] += wg_c[tid + 8u]; }
     workgroupBarrier();
-    if tid < 4u { wg_dot[tid] += wg_dot[tid + 4u]; }
+    if tid < 4u { wg_a[tid] += wg_a[tid + 4u]; wg_b[tid] += wg_b[tid + 4u]; wg_c[tid] += wg_c[tid + 4u]; }
     workgroupBarrier();
-    if tid < 2u { wg_dot[tid] += wg_dot[tid + 2u]; }
+    if tid < 2u { wg_a[tid] += wg_a[tid + 2u]; wg_b[tid] += wg_b[tid + 2u]; wg_c[tid] += wg_c[tid + 2u]; }
     workgroupBarrier();
-    if tid < 1u { wg_dot[tid] += wg_dot[tid + 1u]; }
+    if tid < 1u { wg_a[tid] += wg_a[tid + 1u]; wg_b[tid] += wg_b[tid + 1u]; wg_c[tid] += wg_c[tid + 1u]; }
     workgroupBarrier();
 }
 
@@ -71,25 +75,20 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         for (var head_rel = 0u; head_rel < heads_per_kv; head_rel++) {
             let head = kv_head * heads_per_kv + head_rel;
             let q_base = pos * q_dim + head * head_dim;
+            let do_val = d_out[q_base + tid];
 
-            // Recompute score = Q·K * scale
-            wg_dot[tid] = src_a[q_base + tid] * src_b[kv_base + tid];
-            tree_reduce(tid);
-            let score = wg_dot[0] * scale;
+            // Fused triple reduction: Q·K, dO·O, dO·V in one pass
+            wg_a[tid] = src_a[q_base + tid] * src_b[kv_base + tid]; // Q·K
+            wg_b[tid] = do_val * fwd_dst[q_base + tid];             // dO·O (row_sum)
+            wg_c[tid] = do_val * bias[kv_base + tid];               // dO·V (dp_t)
+            triple_tree_reduce(tid);
+            let score = wg_a[0] * scale;
+            let row_sum = wg_b[0];
+            let dp_t = wg_c[0];
 
             // P_t = exp(score - max_score) / sum_exp
             let lse_idx = (pos * num_heads + head) * 2u;
             let p_t = exp(min(score - lse[lse_idx], 0.0) - lse[lse_idx + 1u]);
-
-            // row_sum = sum_d(dO[d] * O[d])
-            wg_dot[tid] = d_out[q_base + tid] * fwd_dst[q_base + tid];
-            tree_reduce(tid);
-            let row_sum = wg_dot[0];
-
-            // dP_t = sum_d(dO[d] * V[d])
-            wg_dot[tid] = d_out[q_base + tid] * bias[kv_base + tid];
-            tree_reduce(tid);
-            let dp_t = wg_dot[0];
 
             // dS_t = P_t * (dP_t - row_sum)
             let ds_t = p_t * (dp_t - row_sum);
