@@ -95,6 +95,7 @@ pub enum ShaderEntry {
     SwiGLUConcatGrad,
     SumRows,
     RmsNormGradW,
+    RmsNormGradWRowPar,
     RmsNormGradX,
     LayerNormGradWB,
     LayerNormGradX,
@@ -187,6 +188,7 @@ impl ShaderEntry {
             ShaderEntry::SwiGLUConcat | ShaderEntry::SwiGLUConcatGrad => ShaderGroup::SwiGLUConcat,
             ShaderEntry::SumRows => ShaderGroup::SumRows,
             ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => ShaderGroup::RmsNormGrad,
+            ShaderEntry::RmsNormGradWRowPar => ShaderGroup::RmsNormGradWRowPar,
             ShaderEntry::LayerNormGradWB | ShaderEntry::LayerNormGradX => {
                 ShaderGroup::LayerNormGrad
             }
@@ -280,6 +282,7 @@ impl ShaderEntry {
             ShaderEntry::SwiGLUConcatGrad => "swiglu_concat_grad",
             ShaderEntry::SumRows => "sum_rows",
             ShaderEntry::RmsNormGradW => "rms_norm_grad_w",
+            ShaderEntry::RmsNormGradWRowPar => "rms_norm_grad_w_rowpar",
             ShaderEntry::RmsNormGradX => "rms_norm_grad_x",
             ShaderEntry::LayerNormGradWB => "layer_norm_grad_wb",
             ShaderEntry::LayerNormGradX => "layer_norm_grad_x",
@@ -1154,6 +1157,7 @@ impl<'a> Compiler<'a> {
                 }
                 ShaderEntry::RmsNorm
                 | ShaderEntry::RmsNormGradW
+                | ShaderEntry::RmsNormGradWRowPar
                 | ShaderEntry::RmsNormGradX
                 | ShaderEntry::LayerNormGradWB
                 | ShaderEntry::LayerNormGradX => {
@@ -2759,17 +2763,48 @@ impl<'a> Compiler<'a> {
                 let x_shape = &self.graph.node(node.inputs[1]).ty.shape;
                 let rows = x_shape[0] as u32;
                 let cols = x_shape[1] as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::RmsNormGradW,
-                    workgroups: [cols.div_ceil(256), 1, 1],
-                    input_buffers: vec![dy, x, w],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![rows, cols, eps.to_bits(), 0],
-                    use_coop: false,
-                    use_small_tiles: false,
-                    ..Default::default()
-                });
+                if rows >= 4 {
+                    // Two-pass row-parallel approach for better GPU occupancy:
+                    // Pass 1: one WG per row computes partial[row,col] = dy*x*rsqrt
+                    // Pass 2: SumRows reduces partial → grad_w[col]
+                    let temp_buf =
+                        self.alloc_buffer((rows as usize) * (cols as usize) * 4);
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::RmsNormGradWRowPar,
+                        workgroups: [rows, 1, 1],
+                        input_buffers: vec![dy, x, w],
+                        output_buffer: temp_buf,
+                        extra_outputs: vec![],
+                        params: vec![rows, cols, eps.to_bits(), 0],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::SumRows,
+                        workgroups: [cols.div_ceil(256), 1, 1],
+                        input_buffers: vec![temp_buf],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params: vec![rows, cols, 0, 0],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
+                } else {
+                    // Small row count: single-pass is fine
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::RmsNormGradW,
+                        workgroups: [cols.div_ceil(256), 1, 1],
+                        input_buffers: vec![dy, x, w],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params: vec![rows, cols, eps.to_bits(), 0],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
+                }
             }
 
             Op::RmsNormGradX { eps } => {

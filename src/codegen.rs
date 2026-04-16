@@ -320,6 +320,7 @@ pub enum ShaderGroup {
     SwiGLUConcat,
     SumRows,
     RmsNormGrad,
+    RmsNormGradWRowPar,
     LayerNormGrad,
     ScatterAdd,
     BceLoss,
@@ -410,6 +411,9 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::SwiGLUConcat => parse_wgsl(include_str!("shaders/swiglu_concat.wgsl")),
         ShaderGroup::SumRows => parse_wgsl(include_str!("shaders/sum_rows.wgsl")),
         ShaderGroup::RmsNormGrad => parse_wgsl(include_str!("shaders/rms_norm_grad.wgsl")),
+        ShaderGroup::RmsNormGradWRowPar => {
+            parse_wgsl(include_str!("shaders/rms_norm_grad_w_rowpar.wgsl"))
+        }
         ShaderGroup::LayerNormGrad => parse_wgsl(include_str!("shaders/layer_norm_grad.wgsl")),
         ShaderGroup::FusedRmsNormMatMul => parse_wgsl(include_str!("shaders/matmul_rms_norm.wgsl")),
         ShaderGroup::RmsNormRsqrt => parse_wgsl(include_str!("shaders/rms_norm_rsqrt.wgsl")),
@@ -1564,6 +1568,10 @@ mod tests {
             ),
             (ShaderGroup::SumRows, naga::valid::Capabilities::empty()),
             (ShaderGroup::RmsNormGrad, naga::valid::Capabilities::empty()),
+            (
+                ShaderGroup::RmsNormGradWRowPar,
+                naga::valid::Capabilities::empty(),
+            ),
             (ShaderGroup::ScatterAdd, naga::valid::Capabilities::empty()),
             (ShaderGroup::BceLoss, naga::valid::Capabilities::empty()),
             (
@@ -1691,6 +1699,7 @@ mod tests {
             (ShaderGroup::SwiGLUConcat, empty),
             (ShaderGroup::SumRows, empty),
             (ShaderGroup::RmsNormGrad, empty),
+            (ShaderGroup::RmsNormGradWRowPar, empty),
             (ShaderGroup::ScatterAdd, empty),
             (ShaderGroup::BceLoss, empty),
             (ShaderGroup::FusedRmsNormMatMul, empty),
@@ -1844,7 +1853,9 @@ mod tests {
                 ShaderEntry::SwiGLUConcat | ShaderEntry::SwiGLUConcatGrad => {
                     vec!["src_a", "src_b", "dst", "params"]
                 }
-                ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => {
+                ShaderEntry::RmsNormGradW
+                | ShaderEntry::RmsNormGradWRowPar
+                | ShaderEntry::RmsNormGradX => {
                     vec!["src_a", "src_b", "bias", "dst", "params"]
                 }
                 ShaderEntry::LayerNormGradWB | ShaderEntry::LayerNormGradX => {
@@ -1949,6 +1960,7 @@ mod tests {
             ShaderEntry::SwiGLUConcatGrad,
             ShaderEntry::SiluGrad,
             ShaderEntry::RmsNormGradW,
+            ShaderEntry::RmsNormGradWRowPar,
             ShaderEntry::RmsNormGradX,
             ShaderEntry::LayerNormGradWB,
             ShaderEntry::LayerNormGradX,
