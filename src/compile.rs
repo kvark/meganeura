@@ -45,6 +45,9 @@ pub enum ShaderEntry {
     /// M=1 GEMV with fused residual add: `C = A × B + D`.
     /// Selected for FusedMatMulAdd when M=1.
     MatMulGemvAdd,
+    /// M=1 MatMulBT specialization (B stored [N,K]). K-split with
+    /// naturally coalesced vec4 reads along the contiguous K axis.
+    MatMulGemvBT,
     FusedMatMulAdd,
     FusedMatMulATAdd,
     FusedMatMulBTAdd,
@@ -134,6 +137,7 @@ impl ShaderEntry {
             ShaderEntry::MatMulBT => ShaderGroup::MatMulBT,
             ShaderEntry::MatMulGemv => ShaderGroup::MatMulGemv,
             ShaderEntry::MatMulGemvAdd => ShaderGroup::MatMulGemvAdd,
+            ShaderEntry::MatMulGemvBT => ShaderGroup::MatMulGemvBT,
             ShaderEntry::FusedMatMulAdd => ShaderGroup::MatMulAdd,
             ShaderEntry::FusedMatMulATAdd => ShaderGroup::MatMulATAdd,
             ShaderEntry::FusedMatMulBTAdd => ShaderGroup::MatMulBTAdd,
@@ -216,6 +220,7 @@ impl ShaderEntry {
             | ShaderEntry::MatMulBT
             | ShaderEntry::MatMulGemv
             | ShaderEntry::MatMulGemvAdd
+            | ShaderEntry::MatMulGemvBT
             | ShaderEntry::FusedMatMulAdd
             | ShaderEntry::FusedMatMulATAdd
             | ShaderEntry::FusedMatMulBTAdd
@@ -900,6 +905,7 @@ impl<'a> Compiler<'a> {
                 }
                 ShaderEntry::MatMulAT
                 | ShaderEntry::MatMulBT
+                | ShaderEntry::MatMulGemvBT
                 | ShaderEntry::FusedMatMulATAdd
                 | ShaderEntry::FusedMatMulBTAdd => {
                     format!(
@@ -1060,17 +1066,34 @@ impl<'a> Compiler<'a> {
                 let m = a_shape[0] as u32; // A is [M, K]
                 let k = a_shape[1] as u32;
                 let n = b_shape[0] as u32; // B is [N, K]
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::MatMulBT,
-                    workgroups: [n.div_ceil(64), m.div_ceil(64), 1],
-                    input_buffers: vec![a, b],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![m, n, k, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
-                    ..Default::default()
-                });
+                if m == 1 && k % 4 == 0 {
+                    // K-split GEMV for MatMulBT. Per WG one output col;
+                    // the 32 threads K-split with contiguous vec4 loads
+                    // along the inner K axis of B. Coalesced by design.
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::MatMulGemvBT,
+                        workgroups: [n, 1, 1],
+                        input_buffers: vec![a, b],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params: vec![m, n, k, 0],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
+                } else {
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::MatMulBT,
+                        workgroups: [n.div_ceil(64), m.div_ceil(64), 1],
+                        input_buffers: vec![a, b],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params: vec![m, n, k, 0],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
+                }
             }
 
             Op::FusedMatMulAdd => {
