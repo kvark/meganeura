@@ -330,6 +330,45 @@ fn softmax_schedule_emits_two_dispatches() {
     assert!(schedule.dispatches[1].reduction.is_some());
 }
 
+// ---- Reduction archetype: RmsNorm ----
+
+#[test]
+fn rmsnorm_parity() {
+    let rows = 4usize;
+    let cols = 64usize;
+    let n = rows * cols;
+    let input: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.013 - 2.0).sin()).collect();
+    let weight: Vec<f32> = (0..cols).map(|i| 0.5 + (i as f32) * 0.01).collect();
+
+    let run = |use_schedule: bool| -> Vec<f32> {
+        let mut g = Graph::new();
+        let x = g.input("x", &[rows, cols]);
+        let w = g.parameter("w", &[cols]);
+        let y = g.rms_norm(x, w, 1e-5);
+        g.set_outputs(vec![y]);
+        let opts = CompileOptions {
+            use_schedule_reduction: use_schedule,
+            ..Default::default()
+        };
+        let mut s = build_inference_session_with(&g, &opts);
+        s.set_input("x", &input);
+        s.set_parameter("w", &weight);
+        s.step();
+        s.wait();
+        s.read_output(n)
+    };
+
+    let baseline = run(false);
+    let schedule = run(true);
+    assert_eq!(baseline.len(), schedule.len());
+    for (i, (a, b)) in baseline.iter().zip(schedule.iter()).enumerate() {
+        assert!(
+            (a - b).abs() <= a.abs().max(b.abs()) * 1e-5 + 1e-7,
+            "rmsnorm parity mismatch at [{i}]: baseline={a}, schedule={b}",
+        );
+    }
+}
+
 #[test]
 fn chain_add_relu_parity() {
     // Mixes a binary op with a unary op — exercises both generated-pipeline
