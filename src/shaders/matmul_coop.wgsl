@@ -14,8 +14,8 @@ struct Params {
     _pad: u32,
 }
 
-var<storage> matrix_a: array<f32>;
-var<storage> matrix_b: array<f32>;
+var<storage> matrix_a: $A_STORAGE;
+var<storage> matrix_b: $B_STORAGE;
 var<storage, read_write> matrix_c: array<f32>;
 $FUSED_ADD_DECL
 $PROLOGUE_DECL
@@ -47,69 +47,23 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     $ACC_INIT
 
     // Hoisted staging index components
-    let src_col = lid.x & $TILE_MASK_U;
-    let base_row = lid.x >> $TILE_SHIFT_U;
-    let cc = tile_col + src_col;
-    let in_n = cc < n;
-    let cc1 = cc + $TILE_SIZE_U;
-    let in_n1 = cc1 < n;
+    $STAGING_VARS
 
     var t = 0u;
     loop {
         if t >= k { break; }
 
         // Stage sa0: B[t:t+tile, tile_col:tile_col+tile] → shared_a0
-        let zero_val = $ELEM_ZERO;
-        for (var e = 0u; e < $STAGING_ITERS_U; e++) {
-            let flat = lid.x + e * 64u;
-            let tr = t + base_row + e * $ROW_STRIDE_U;
-            let in_bounds = (tr < k) && in_n;
-            if in_bounds {
-                shared_a0[flat] = $CAST_OPEN matrix_b[$B_INDEX_0] $CAST_CLOSE;
-            } else {
-                shared_a0[flat] = zero_val;
-            }
-        }
+        $B_STAGE_0
 
         // Stage sa1: B[t:t+tile, tile_col+tile:tile_col+2*tile] → shared_a1
-        for (var e = 0u; e < $STAGING_ITERS_U; e++) {
-            let flat = lid.x + e * 64u;
-            let tr = t + base_row + e * $ROW_STRIDE_U;
-            let in_bounds = (tr < k) && in_n1;
-            if in_bounds {
-                shared_a1[flat] = $CAST_OPEN matrix_b[$B_INDEX_1] $CAST_CLOSE;
-            } else {
-                shared_a1[flat] = zero_val;
-            }
-        }
+        $B_STAGE_1
 
         // Stage sb0: A[tile_row:tile_row+tile, t:t+tile] → shared_b0
-        let tc = t + src_col;
-        let in_k = tc < k;
-        for (var e = 0u; e < $STAGING_ITERS_U; e++) {
-            let flat = lid.x + e * 64u;
-            let gr = tile_row + base_row + e * $ROW_STRIDE_U;
-            let in_bounds = (gr < m) && in_k;
-            if in_bounds {
-                let a_val = matrix_a[$A_INDEX_0];
-                shared_b0[flat] = $CAST_OPEN a_val $A_TRANSFORM_0 $CAST_CLOSE;
-            } else {
-                shared_b0[flat] = zero_val;
-            }
-        }
+        $A_STAGE_0
 
         // Stage sb1: A[tile_row+tile:tile_row+2*tile, t:t+tile] → shared_b1
-        for (var e = 0u; e < $STAGING_ITERS_U; e++) {
-            let flat = lid.x + e * 64u;
-            let gr = tile_row + $TILE_SIZE_U + base_row + e * $ROW_STRIDE_U;
-            let in_bounds = (gr < m) && in_k;
-            if in_bounds {
-                let a_val = matrix_a[$A_INDEX_1];
-                shared_b1[flat] = $CAST_OPEN a_val $A_TRANSFORM_1 $CAST_CLOSE;
-            } else {
-                shared_b1[flat] = zero_val;
-            }
-        }
+        $A_STAGE_1
 
         workgroupBarrier();
 
