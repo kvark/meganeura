@@ -1367,7 +1367,7 @@ impl Session {
                 // for the scalar shader. Require more workgroups to amortize.
                 let is_conv_bwd = matches!(group, ShaderGroup::Conv2dGradInputGemm);
                 let min_wgs = if is_conv_bwd {
-                    256
+                    64
                 } else if k >= 1024 {
                     MIN_COOP_WORKGROUPS_HIGH_K
                 } else {
