@@ -663,6 +663,7 @@ impl Pipelines {
                     ShaderGroup::MatMulAdd => ShaderGroup::MatMulCoopAdd,
                     ShaderGroup::MatMulAT => ShaderGroup::MatMulCoopAT,
                     ShaderGroup::MatMulBT => ShaderGroup::MatMulCoopBT,
+                    ShaderGroup::Conv2dGemm => ShaderGroup::Conv2dGemmCoop,
                     ShaderGroup::Conv2dGradInputGemm => ShaderGroup::Conv2dGradInputGemmCoop,
                     ShaderGroup::FusedRmsNormMatMul => ShaderGroup::FusedRmsNormMatMulCoop,
                     _ => continue,
@@ -976,7 +977,9 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::SplitA | ShaderEntry::SplitB => UnaryData::layout(),
         ShaderEntry::Upsample2x | ShaderEntry::Upsample2xGrad => UnaryData::layout(),
         ShaderEntry::Conv2d => Conv2dData::layout(),
-        ShaderEntry::Conv2dGemm | ShaderEntry::Conv2dGemmSmall => Conv2dData::layout(),
+        ShaderEntry::Conv2dGemm | ShaderEntry::Conv2dGemmSmall | ShaderEntry::Conv2dGemmCoop => {
+            Conv2dData::layout()
+        }
         ShaderEntry::Conv2dGradInput => Conv2dGradInputData::layout(),
         ShaderEntry::Conv2dGradInputGemm
         | ShaderEntry::Conv2dGradInputGemmSmall
@@ -1319,6 +1322,17 @@ impl Session {
                         dispatch.params[1],
                         1u32,
                     ),
+                    ShaderGroup::Conv2dGemm => {
+                        // Forward: C[Co, oH*oW] = W[Co, K] × im2col[K, oH*oW]
+                        // params: [batch, in_channels, in_h, in_w, out_channels, kernel_h, kernel_w, stride, padding_h, out_h, out_w, padding_w]
+                        let out_ch = dispatch.params[4];
+                        let kh = dispatch.params[5];
+                        let kw = dispatch.params[6];
+                        let in_ch = dispatch.params[1];
+                        let out_h = dispatch.params[9];
+                        let out_w = dispatch.params[10];
+                        (out_ch, out_h * out_w, in_ch * kh * kw, dispatch.params[0])
+                    }
                     ShaderGroup::Conv2dGradInputGemm => {
                         // params: [batch, in_channels, in_h, in_w, out_channels, kernel_h, kernel_w, stride, padding, out_h, out_w, ...]
                         let in_ch = dispatch.params[1];
@@ -1346,12 +1360,12 @@ impl Session {
                     _ => continue,
                 };
                 let coop_wgs = m.div_ceil(output_tile) * n.div_ceil(output_tile) * batch;
-                // Conv2d GEMM has heavier staging (im2col indexing with integer
-                // division per element), so require more workgroups to amortize
-                // the cooperative matrix overhead.
-                let is_conv = matches!(group, ShaderGroup::Conv2dGradInputGemm);
-                let min_wgs = if is_conv {
-                    512
+                // Conv2d backward GEMM has all-scalar staging with heavy im2col
+                // decomposition (integer division), and only 64 threads vs 256
+                // for the scalar shader. Require more workgroups to amortize.
+                let is_conv_bwd = matches!(group, ShaderGroup::Conv2dGradInputGemm);
+                let min_wgs = if is_conv_bwd {
+                    256
                 } else if k >= 1024 {
                     MIN_COOP_WORKGROUPS_HIGH_K
                 } else {
@@ -2721,7 +2735,10 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::Conv2d | ShaderEntry::Conv2dGemm | ShaderEntry::Conv2dGemmSmall => {
+            ShaderEntry::Conv2d
+            | ShaderEntry::Conv2dGemm
+            | ShaderEntry::Conv2dGemmSmall
+            | ShaderEntry::Conv2dGemmCoop => {
                 let p = &dispatch.params;
                 pc.bind(
                     0,

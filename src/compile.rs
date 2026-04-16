@@ -113,6 +113,7 @@ pub enum ShaderEntry {
     Conv2d,
     Conv2dGemm,
     Conv2dGemmSmall,
+    Conv2dGemmCoop,
     Conv2dGradInput,
     Conv2dGradInputGemm,
     Conv2dGradInputGemmSmall,
@@ -201,6 +202,7 @@ impl ShaderEntry {
             ShaderEntry::Upsample2xGrad => ShaderGroup::UpsampleGrad,
             ShaderEntry::Conv2d => ShaderGroup::Conv2d,
             ShaderEntry::Conv2dGemm => ShaderGroup::Conv2dGemm,
+            ShaderEntry::Conv2dGemmCoop => ShaderGroup::Conv2dGemmCoop,
             ShaderEntry::Conv2dGemmSmall => ShaderGroup::Conv2dGemmSmall,
             ShaderEntry::Conv2dGradInput => ShaderGroup::Conv2dGradInput,
             ShaderEntry::Conv2dGradInputGemm => ShaderGroup::Conv2dGradInputGemm,
@@ -292,7 +294,9 @@ impl ShaderEntry {
             ShaderEntry::Upsample2x => "main",
             ShaderEntry::Upsample2xGrad => "main",
             ShaderEntry::Conv2d => "main",
-            ShaderEntry::Conv2dGemm | ShaderEntry::Conv2dGemmSmall => "main",
+            ShaderEntry::Conv2dGemm | ShaderEntry::Conv2dGemmSmall | ShaderEntry::Conv2dGemmCoop => {
+                "main"
+            }
             ShaderEntry::Conv2dGradInput => "main",
             ShaderEntry::Conv2dGradInputGemm
             | ShaderEntry::Conv2dGradInputGemmSmall
