@@ -67,3 +67,19 @@ temp buffer allocation) exceeds the occupancy improvement on 20 SMs.
 more and the fixed per-dispatch overhead is amortized over more compute.
 Also beneficial with a persistent-kernel approach that avoids the
 reduction dispatch entirely.
+
+## Small-K coop fallback to scalar (K < 4 tiles)
+
+**Idea:** For shapes like MatMulAT[576×3072×32] with K=32 (only 2 tile
+iterations), fall back to the scalar register-tiled matmul. The coop
+kernel creates 1728 WGs that each do trivial compute (per-WG overhead
+dominates).
+
+**Result:** SmolLM2 training went from 32.5ms to 36.1ms — *slower*.
+Despite having more WGs than needed, the coop kernel's tensor cores
+(5× faster per FLOP) still outperform scalar, even with only 2
+K-tile iterations.
+
+**Root cause:** The bottleneck is memory staging, not compute. Both
+coop and scalar spend ~99% of time on staging. Tensor cores reduce the
+remaining 1% compute, which slightly helps overall throughput.
