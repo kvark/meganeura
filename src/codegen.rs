@@ -886,14 +886,184 @@ fn gen_matmul_coop_wgsl_prologue(
         None => (String::new(), String::new()),
     };
 
-    let (b_idx_0, b_idx_1) = match variant {
-        MatMulCoopVariant::Normal | MatMulCoopVariant::AT => ("tr * n + cc", "tr * n + cc1"),
-        MatMulCoopVariant::BT => ("cc * k + tr", "cc1 * k + tr"),
+    // Vec4 staging: use 128-bit loads when tile is 16+ (64 threads × 4 = 256 = 16×16).
+    // Vec4 B staging works for Normal/AT (B[K,N] row-major, load along N).
+    // Vec4 A staging works for Normal/BT (A[M,K] row-major, load along K), no prologue.
+    let use_vec4 = tile >= 16;
+    let vec4_b = use_vec4 && variant != MatMulCoopVariant::BT;
+    let vec4_a = use_vec4 && prologue.is_none() && variant != MatMulCoopVariant::AT;
+
+    let a_storage = if vec4_a { "array<vec4<f32>>" } else { "array<f32>" };
+    let b_storage = if vec4_b { "array<vec4<f32>>" } else { "array<f32>" };
+
+    // Generate hoisted staging index variables
+    let staging_vars = {
+        let mut s = String::new();
+        if use_vec4 {
+            s += "let v4_row = lid.x >> 2u;\n    let v4_col = (lid.x & 3u) << 2u;";
+        }
+        if !vec4_b || !vec4_a {
+            if !s.is_empty() {
+                s += "\n    ";
+            }
+            s += &format!(
+                "let src_col = lid.x & {}u;\n    let base_row = lid.x >> {}u;",
+                tile_mask, tile_shift
+            );
+        }
+        if !vec4_b {
+            s += &format!(
+                "\n    let cc = tile_col + src_col;\
+                 \n    let in_n = cc < n;\
+                 \n    let cc1 = cc + {}u;\
+                 \n    let in_n1 = cc1 < n;",
+                tile
+            );
+        }
+        s
     };
-    let (a_idx_0, a_idx_1) = match variant {
-        MatMulCoopVariant::Normal | MatMulCoopVariant::BT => ("gr * k + tc", "gr * k + tc"),
-        MatMulCoopVariant::AT => ("tc * m + gr", "tc * m + gr"),
-    };
+
+    // Generate B staging blocks (shared_a0, shared_a1)
+    let b_stage_0;
+    let b_stage_1;
+    if vec4_b {
+        let gen_vec4_b = |shared: &str, col_offset: &str| -> String {
+            format!(
+                "{{\
+               \n            let tr = t + v4_row;\
+               \n            let cc4 = {col} + v4_col;\
+               \n            let flat = v4_row * {t}u + v4_col;\
+               \n            if tr < k && (cc4 + 4u) <= n {{\
+               \n                let v = matrix_b[(tr * n + cc4) >> 2u];\
+               \n                {s}[flat] = {co}v.x{cc};\
+               \n                {s}[flat + 1u] = {co}v.y{cc};\
+               \n                {s}[flat + 2u] = {co}v.z{cc};\
+               \n                {s}[flat + 3u] = {co}v.w{cc};\
+               \n            }} else {{\
+               \n                let z = {z};\
+               \n                {s}[flat] = z;\
+               \n                {s}[flat + 1u] = z;\
+               \n                {s}[flat + 2u] = z;\
+               \n                {s}[flat + 3u] = z;\
+               \n            }}\
+               \n        }}",
+                col = col_offset,
+                t = tile,
+                s = shared,
+                co = cast_open,
+                cc = cast_close,
+                z = elem_zero,
+            )
+        };
+        b_stage_0 = gen_vec4_b("shared_a0", "tile_col");
+        b_stage_1 = gen_vec4_b("shared_a1", &format!("(tile_col + {}u)", tile));
+    } else {
+        // Scalar B staging (BT variant or tile_size < 16)
+        let (bi0, bi1) = match variant {
+            MatMulCoopVariant::Normal | MatMulCoopVariant::AT => ("tr * n + cc", "tr * n + cc1"),
+            MatMulCoopVariant::BT => ("cc * k + tr", "cc1 * k + tr"),
+        };
+        let gen_scalar_b = |shared: &str, in_col: &str, b_index: &str| -> String {
+            format!(
+                "{{\
+               \n            let zero_val = {z};\
+               \n            for (var e = 0u; e < {iters}u; e++) {{\
+               \n                let flat = lid.x + e * 64u;\
+               \n                let tr = t + base_row + e * {stride}u;\
+               \n                let in_bounds = (tr < k) && {ic};\
+               \n                if in_bounds {{\
+               \n                    {s}[flat] = {co}matrix_b[{bi}]{cc};\
+               \n                }} else {{\
+               \n                    {s}[flat] = zero_val;\
+               \n                }}\
+               \n            }}\
+               \n        }}",
+                z = elem_zero,
+                iters = staging_iters,
+                stride = row_stride,
+                ic = in_col,
+                s = shared,
+                co = cast_open,
+                cc = cast_close,
+                bi = b_index,
+            )
+        };
+        b_stage_0 = gen_scalar_b("shared_a0", "in_n", bi0);
+        b_stage_1 = gen_scalar_b("shared_a1", "in_n1", bi1);
+    }
+
+    // Generate A staging blocks (shared_b0, shared_b1)
+    let a_stage_0;
+    let a_stage_1;
+    if vec4_a {
+        let gen_vec4_a = |shared: &str, row_offset: &str| -> String {
+            format!(
+                "{{\
+               \n            let gr = {row} + v4_row;\
+               \n            let tc4 = t + v4_col;\
+               \n            let flat = v4_row * {t}u + v4_col;\
+               \n            if gr < m && (tc4 + 4u) <= k {{\
+               \n                let v = matrix_a[(gr * k + tc4) >> 2u];\
+               \n                {s}[flat] = {co}v.x{cc};\
+               \n                {s}[flat + 1u] = {co}v.y{cc};\
+               \n                {s}[flat + 2u] = {co}v.z{cc};\
+               \n                {s}[flat + 3u] = {co}v.w{cc};\
+               \n            }} else {{\
+               \n                let z = {z};\
+               \n                {s}[flat] = z;\
+               \n                {s}[flat + 1u] = z;\
+               \n                {s}[flat + 2u] = z;\
+               \n                {s}[flat + 3u] = z;\
+               \n            }}\
+               \n        }}",
+                row = row_offset,
+                t = tile,
+                s = shared,
+                co = cast_open,
+                cc = cast_close,
+                z = elem_zero,
+            )
+        };
+        a_stage_0 = gen_vec4_a("shared_b0", "tile_row");
+        a_stage_1 = gen_vec4_a("shared_b1", &format!("(tile_row + {}u)", tile));
+    } else {
+        // Scalar A staging (AT variant, prologue, or tile_size < 16)
+        let a_idx = match variant {
+            MatMulCoopVariant::Normal | MatMulCoopVariant::BT => "gr * k + tc",
+            MatMulCoopVariant::AT => "tc * m + gr",
+        };
+        let gen_scalar_a = |shared: &str, row_offset: &str| -> String {
+            format!(
+                "{{\
+               \n            let tc = t + src_col;\
+               \n            let in_k = tc < k;\
+               \n            for (var e = 0u; e < {iters}u; e++) {{\
+               \n                let flat = lid.x + e * 64u;\
+               \n                let gr = {row} + base_row + e * {stride}u;\
+               \n                let in_bounds = (gr < m) && in_k;\
+               \n                if in_bounds {{\
+               \n                    let a_val = matrix_a[{ai}];\
+               \n                    {s}[flat] = {co}a_val{xf}{cc};\
+               \n                }} else {{\
+               \n                    {s}[flat] = {z};\
+               \n                }}\
+               \n            }}\
+               \n        }}",
+                iters = staging_iters,
+                stride = row_stride,
+                row = row_offset,
+                ai = a_idx,
+                s = shared,
+                co = cast_open,
+                cc = cast_close,
+                z = elem_zero,
+                xf = a_transform,
+            )
+        };
+        a_stage_0 = gen_scalar_a("shared_b0", "tile_row");
+        a_stage_1 = gen_scalar_a("shared_b1", &format!("(tile_row + {}u)", tile));
+    }
+
     let (fused_decl, acc_init) = if fused_add {
         (
             "var<storage> src: array<f32>;".to_string(),
@@ -918,10 +1088,6 @@ fn gen_matmul_coop_wgsl_prologue(
 
     let output_tile_u = format!("{}u", output_tile);
     let tile_size_u = format!("{}u", tile);
-    let tile_mask_u = format!("{}u", tile_mask);
-    let tile_shift_u = format!("{}u", tile_shift);
-    let staging_iters_u = format!("{}u", staging_iters);
-    let row_stride_u = format!("{}u", row_stride);
     let shared_size_s = format!("{}", shared_size);
 
     let src = include_str!("shaders/matmul_coop.wgsl");
@@ -930,24 +1096,18 @@ fn gen_matmul_coop_wgsl_prologue(
         &[
             ("$ENABLE_F16", enable_f16),
             ("$ELEM_TYPE", elem_type),
-            ("$ELEM_ZERO", elem_zero),
             ("$SHARED_SIZE", &shared_size_s),
             ("$OUTPUT_TILE_U", &output_tile_u),
             ("$TILE_SIZE_U", &tile_size_u),
-            ("$TILE_MASK_U", &tile_mask_u),
-            ("$TILE_SHIFT_U", &tile_shift_u),
-            ("$STAGING_ITERS_U", &staging_iters_u),
-            ("$ROW_STRIDE_U", &row_stride_u),
-            ("$CAST_OPEN", cast_open),
-            ("$CAST_CLOSE", cast_close),
             ("$COOP_AB", &coop_ab),
             ("$COOP_BA", &coop_ba),
-            ("$B_INDEX_0", b_idx_0),
-            ("$B_INDEX_1", b_idx_1),
-            ("$A_INDEX_0", a_idx_0),
-            ("$A_INDEX_1", a_idx_1),
-            ("$A_TRANSFORM_0", &a_transform),
-            ("$A_TRANSFORM_1", &a_transform),
+            ("$A_STORAGE", a_storage),
+            ("$B_STORAGE", b_storage),
+            ("$STAGING_VARS", &staging_vars),
+            ("$B_STAGE_0", &b_stage_0),
+            ("$B_STAGE_1", &b_stage_1),
+            ("$A_STAGE_0", &a_stage_0),
+            ("$A_STAGE_1", &a_stage_1),
             ("$PROLOGUE_DECL", &prologue_decl),
             ("$FUSED_ADD_DECL", &fused_decl),
             ("$ACC_INIT", &acc_init),
