@@ -349,6 +349,27 @@ pub struct MatMulEpilogue {
     pub inputs: Vec<(BufferRef, EpilogueLoadKind)>,
 }
 
+/// How a prologue buffer is indexed during matmul A-tile staging.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PrologueLoadKind {
+    /// Load at `gr` (global row of the A matrix).
+    PerRow,
+    /// Load at `tc` (K-column within the current K-tile).
+    PerKCol,
+}
+
+/// Multiplicative prologue applied during matmul A-tile staging.
+///
+/// Each factor is multiplied into `a_val` before it enters shared memory:
+/// `a_staged = a_val * buf_0[idx] * buf_1[idx] * ...`
+///
+/// Generalizes the `$A_TRANSFORM` template in `matmul_coop.wgsl` so
+/// that fusions like RmsNorm+MatMul don't need a dedicated shader file.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MatMulPrologue {
+    pub factors: Vec<(BufferRef, PrologueLoadKind)>,
+}
+
 /// A single GPU dispatch in the execution plan.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Dispatch {
@@ -373,6 +394,11 @@ pub struct Dispatch {
     /// one dispatch + barrier per fused op.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matmul_epilogue: Option<MatMulEpilogue>,
+    /// Multiplicative prologue applied during matmul A-tile staging.
+    /// When present, the coop matmul fills `$A_TRANSFORM` and
+    /// `$PROLOGUE_DECL` template variables from the prologue's factors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matmul_prologue: Option<MatMulPrologue>,
     /// Legacy fields — kept for serde backward compat of cached plans.
     /// New code uses `matmul_epilogue` instead.
     #[serde(default)]
