@@ -966,7 +966,9 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         | ShaderEntry::MultiHeadAttnGradV => MultiHeadAttnGradData::layout(),
         ShaderEntry::SwiGLUGradGate => TernaryData::layout(),
         ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => BinaryData::layout(),
-        ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => FourBufData::layout(),
+        ShaderEntry::RmsNormGradW
+        | ShaderEntry::RmsNormGradWRowPar
+        | ShaderEntry::RmsNormGradX => FourBufData::layout(),
         ShaderEntry::LayerNormGradWB | ShaderEntry::LayerNormGradX => FourBufData::layout(),
         ShaderEntry::FusedRmsNormMatMul => FourBufData::layout(),
         ShaderEntry::RmsNormRsqrt => UnaryData::layout(),
@@ -2530,7 +2532,9 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => {
+            ShaderEntry::RmsNormGradW
+            | ShaderEntry::RmsNormGradWRowPar
+            | ShaderEntry::RmsNormGradX => {
                 pc.bind(
                     0,
                     &FourBufData {
