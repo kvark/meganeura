@@ -895,11 +895,20 @@ fn gen_matmul_coop_wgsl_prologue(
     };
 
     // Vec4 staging: use 128-bit loads when tile is 16+ (64 threads × 4 = 256 = 16×16).
-    // Vec4 B staging works for Normal/AT (B[K,N] row-major, load along N).
-    // Vec4 A staging works for Normal/BT (A[M,K] row-major, load along K), no prologue.
+    // Vec4 staging uses 128-bit loads when tile is 16+ (64 threads × 4 = 256 = 16×16).
+    // "Direct" vec4: load along the shared-memory column axis (consecutive writes).
+    //   B: Normal/AT (B[K,N], load along N)
+    //   A: Normal/BT (A[M,K], load along K)
+    // "Transposed" vec4: load along the contiguous global-memory axis, write strided.
+    //   B: BT (B[N,K], load along K, write rows-of-shared)
+    //   A: AT (A[K,M], load along M, write rows-of-shared)
     let use_vec4 = tile >= 16;
-    let vec4_b = use_vec4 && variant != MatMulCoopVariant::BT;
-    let vec4_a = use_vec4 && prologue.is_none() && variant != MatMulCoopVariant::AT;
+    // All variants use vec4 for both A and B (direct or transposed).
+    let vec4_b = use_vec4;
+    let vec4_a = use_vec4 && prologue.is_none();
+    // Transposed staging writes strided into shared (4 rows × 1 col per thread).
+    let vec4_b_transposed = vec4_b && variant == MatMulCoopVariant::BT;
+    let vec4_a_transposed = vec4_a && variant == MatMulCoopVariant::AT;
 
     let a_storage = if vec4_a { "array<vec4<f32>>" } else { "array<f32>" };
     let b_storage = if vec4_b { "array<vec4<f32>>" } else { "array<f32>" };
@@ -965,8 +974,41 @@ fn gen_matmul_coop_wgsl_prologue(
         };
         b_stage_0 = gen_vec4_b("shared_a0", "tile_col");
         b_stage_1 = gen_vec4_b("shared_a1", &format!("(tile_col + {}u)", tile));
+    } else if vec4_b_transposed {
+        // BT: B[N,K], load vec4 along K (consecutive in memory), write transposed to shared.
+        // v4_row → N (cc direction, shared col), v4_col → K (tr direction, shared rows).
+        // shared[row * tile + col] where row = K-offset, col = N-offset.
+        let gen_vec4_bt = |shared: &str, col_offset: &str| -> String {
+            format!(
+                "{{\
+               \n            let cc = {col} + v4_row;\
+               \n            let tr4 = t + v4_col;\
+               \n            if cc < n && (tr4 + 4u) <= k {{\
+               \n                let v = matrix_b[(cc * k + tr4) >> 2u];\
+               \n                {s}[v4_col * {t}u + v4_row] = {co}v.x{cc2};\
+               \n                {s}[(v4_col + 1u) * {t}u + v4_row] = {co}v.y{cc2};\
+               \n                {s}[(v4_col + 2u) * {t}u + v4_row] = {co}v.z{cc2};\
+               \n                {s}[(v4_col + 3u) * {t}u + v4_row] = {co}v.w{cc2};\
+               \n            }} else {{\
+               \n                let z = {z};\
+               \n                {s}[v4_col * {t}u + v4_row] = z;\
+               \n                {s}[(v4_col + 1u) * {t}u + v4_row] = z;\
+               \n                {s}[(v4_col + 2u) * {t}u + v4_row] = z;\
+               \n                {s}[(v4_col + 3u) * {t}u + v4_row] = z;\
+               \n            }}\
+               \n        }}",
+                col = col_offset,
+                t = tile,
+                s = shared,
+                co = cast_open,
+                cc2 = cast_close,
+                z = elem_zero,
+            )
+        };
+        b_stage_0 = gen_vec4_bt("shared_a0", "tile_col");
+        b_stage_1 = gen_vec4_bt("shared_a1", &format!("(tile_col + {}u)", tile));
     } else {
-        // Scalar B staging (BT variant or tile_size < 16)
+        // Scalar B staging (tile_size < 16 fallback)
         let (bi0, bi1) = match variant {
             MatMulCoopVariant::Normal | MatMulCoopVariant::AT => ("tr * n + cc", "tr * n + cc1"),
             MatMulCoopVariant::BT => ("cc * k + tr", "cc1 * k + tr"),
@@ -1034,8 +1076,41 @@ fn gen_matmul_coop_wgsl_prologue(
         };
         a_stage_0 = gen_vec4_a("shared_b0", "tile_row");
         a_stage_1 = gen_vec4_a("shared_b1", &format!("(tile_row + {}u)", tile));
+    } else if vec4_a_transposed {
+        // AT: A[K,M], load vec4 along M (consecutive in memory), write transposed to shared.
+        // v4_row → K (tc direction, shared col), v4_col → M (gr direction, shared rows).
+        // shared[row * tile + col] where row = M-offset, col = K-offset.
+        let gen_vec4_at = |shared: &str, row_offset: &str| -> String {
+            format!(
+                "{{\
+               \n            let tc = t + v4_row;\
+               \n            let gr4 = {row} + v4_col;\
+               \n            if tc < k && (gr4 + 4u) <= m {{\
+               \n                let v = matrix_a[(tc * m + gr4) >> 2u];\
+               \n                {s}[v4_col * {t}u + v4_row] = {co}v.x{cc};\
+               \n                {s}[(v4_col + 1u) * {t}u + v4_row] = {co}v.y{cc};\
+               \n                {s}[(v4_col + 2u) * {t}u + v4_row] = {co}v.z{cc};\
+               \n                {s}[(v4_col + 3u) * {t}u + v4_row] = {co}v.w{cc};\
+               \n            }} else {{\
+               \n                let z = {z};\
+               \n                {s}[v4_col * {t}u + v4_row] = z;\
+               \n                {s}[(v4_col + 1u) * {t}u + v4_row] = z;\
+               \n                {s}[(v4_col + 2u) * {t}u + v4_row] = z;\
+               \n                {s}[(v4_col + 3u) * {t}u + v4_row] = z;\
+               \n            }}\
+               \n        }}",
+                row = row_offset,
+                t = tile,
+                s = shared,
+                co = cast_open,
+                cc = cast_close,
+                z = elem_zero,
+            )
+        };
+        a_stage_0 = gen_vec4_at("shared_b0", "tile_row");
+        a_stage_1 = gen_vec4_at("shared_b1", &format!("(tile_row + {}u)", tile));
     } else {
-        // Scalar A staging (AT variant, prologue, or tile_size < 16)
+        // Scalar A staging (prologue or tile_size < 16)
         let a_idx = match variant {
             MatMulCoopVariant::Normal | MatMulCoopVariant::BT => "gr * k + tc",
             MatMulCoopVariant::AT => "tc * m + gr",
