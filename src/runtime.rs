@@ -1397,13 +1397,32 @@ impl Session {
             }
         }
 
-        // Small-tile selection: 32×32 tile matmul variant available via
-        // `use_small_tiles` flag. Currently disabled — 32×32 tiles have 4×
-        // less register reuse (2×2 vs 4×4 accumulators), which reduces
-        // arithmetic intensity. On bandwidth-bound iGPUs, the reduced reuse
-        // outweighs the occupancy gain from 4× more workgroups.
-        // TODO: add e-graph cost model that considers both occupancy and
-        // arithmetic intensity to select optimal tile size per shape.
+        // Small-tile selection: use 32×32 tiles when the 64×64 dispatch
+        // produces very few workgroups (< 16). The 4× more workgroups from
+        // smaller tiles improve occupancy on GPUs with many SMs.
+        {
+        use crate::codegen::ShaderGroup;
+        for dispatch in plan.dispatches.iter_mut() {
+            if dispatch.use_coop || dispatch.use_small_tiles {
+                continue;
+            }
+            let group = dispatch.shader.shader_group();
+            let wgs_64: u32 = dispatch.workgroups.iter().product();
+            let has_small = matches!(
+                group,
+                ShaderGroup::MatMul
+                    | ShaderGroup::MatMulAdd
+                    | ShaderGroup::MatMulAT
+                    | ShaderGroup::MatMulBT
+            );
+            if has_small && wgs_64 < 16 {
+                dispatch.use_small_tiles = true;
+                // 32×32 tiles → double the WG count in each spatial dimension
+                dispatch.workgroups[0] *= 2;
+                dispatch.workgroups[1] *= 2;
+            }
+        }
+        }
 
         // Reorder dispatches by dependency level so parallel branches (e.g. Q/K/V
         // projections) cluster together, then partition into barrier groups.
