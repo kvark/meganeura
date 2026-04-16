@@ -37,13 +37,13 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
 
     reduce_buf[lane] = acc;
     workgroupBarrier();
-    if lane < 16u { reduce_buf[lane] = reduce_buf[lane] + reduce_buf[lane + 16u]; }
+    if lane < 16u { reduce_buf[lane] += reduce_buf[lane + 16u]; }
     workgroupBarrier();
-    if lane < 8u  { reduce_buf[lane] = reduce_buf[lane] + reduce_buf[lane + 8u];  }
+    if lane < 8u  { reduce_buf[lane] += reduce_buf[lane + 8u];  }
     workgroupBarrier();
-    if lane < 4u  { reduce_buf[lane] = reduce_buf[lane] + reduce_buf[lane + 4u];  }
+    if lane < 4u  { reduce_buf[lane] += reduce_buf[lane + 4u];  }
     workgroupBarrier();
-    if lane < 2u  { reduce_buf[lane] = reduce_buf[lane] + reduce_buf[lane + 2u];  }
+    if lane < 2u  { reduce_buf[lane] += reduce_buf[lane + 2u];  }
     workgroupBarrier();
     if lane == 0u {
         matrix_c[col4] = reduce_buf[0] + reduce_buf[1] + src[col4];
