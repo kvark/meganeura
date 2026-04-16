@@ -535,6 +535,13 @@ pub fn compile_with(graph: &Graph, options: &CompileOptions) -> ExecutionPlan {
     if options.use_schedule_pointwise {
         fuse_pointwise_chains(&mut compiler.plan);
     }
+    // RmsNorm+MatMul prologue fusion: infrastructure works (30 pairs
+    // fused on SmolLM2 prefill, correct output verified), but the extra
+    // per-A-element reads in the coop staging loop regress TTFT by ~40%
+    // (27ms → 38ms). Disabled until the staging overhead is addressed —
+    // likely needs rsqrt to be cached in shared memory like
+    // matmul_rms_norm_coop.wgsl does (64-element rsqrt_cache[]).
+    // fuse_rmsnorm_prologues(&mut compiler.plan);
 
     compiler.plan
 }
@@ -712,6 +719,132 @@ fn fuse_pointwise_chains(plan: &mut ExecutionPlan) {
 ///
 /// Only fuses into scalar matmul dispatches (not coop) because the
 /// coop store uses coopStoreT which doesn't support per-element epilogues.
+/// Post-compile pass: fuse single-consumer `RmsNorm → MatMul` pairs into
+/// `RmsNormRsqrt + MatMul-with-prologue`. Instead of computing the full
+/// normalized output and writing it to DRAM, the matmul reads raw x and
+/// multiplies by pre-computed rsqrt and weight during A-tile staging.
+///
+/// Unlike the disabled `FusedRmsNormMatMul` (which computed rsqrt INSIDE
+/// the matmul via 64-thread tree reduction → 25% regression), this uses
+/// a separate lightweight `RmsNormRsqrt` dispatch, so the matmul prologue
+/// is only two scalar multiplies per A element — essentially free.
+#[allow(dead_code)]
+fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
+    use std::collections::HashMap;
+
+    let mut producer: HashMap<BufferRef, usize> = HashMap::new();
+    for (i, d) in plan.dispatches.iter().enumerate() {
+        producer.insert(d.output_buffer, i);
+    }
+
+    let mut read_count: HashMap<BufferRef, usize> = HashMap::new();
+    for d in &plan.dispatches {
+        for buf in &d.input_buffers {
+            *read_count.entry(*buf).or_default() += 1;
+        }
+    }
+
+    // Collect protected buffers (graph outputs, params, etc.)
+    let mut external: std::collections::HashSet<BufferRef> = Default::default();
+    external.extend(plan.output_buffers.iter().copied());
+    if let Some(b) = plan.loss_buffer {
+        external.insert(b);
+    }
+    for entry in &plan.param_buffers {
+        external.insert(entry.1);
+    }
+    for entry in &plan.input_buffers {
+        external.insert(entry.1);
+    }
+
+    let mut to_fuse: Vec<(usize, usize)> = Vec::new(); // (norm_idx, matmul_idx)
+
+    for (i, d) in plan.dispatches.iter().enumerate() {
+        // Find MatMul dispatches whose input_buffers[0] comes from a
+        // single-consumer RmsNorm.
+        if !matches!(
+            d.shader,
+            ShaderEntry::MatMul
+                | ShaderEntry::MatMulAT
+                | ShaderEntry::FusedMatMulAdd
+                | ShaderEntry::FusedMatMulATAdd
+        ) {
+            continue;
+        }
+        // Skip GEMV variants (M=1) — those use a different kernel path.
+        if matches!(
+            d.shader,
+            ShaderEntry::MatMulGemv | ShaderEntry::MatMulGemvAdd | ShaderEntry::MatMulGemvBT
+        ) {
+            continue;
+        }
+        if d.input_buffers.is_empty() {
+            continue;
+        }
+        let a_buf = d.input_buffers[0];
+        if external.contains(&a_buf) {
+            continue;
+        }
+        let Some(&norm_idx) = producer.get(&a_buf) else {
+            continue;
+        };
+        let norm = &plan.dispatches[norm_idx];
+        if norm.shader != ShaderEntry::RmsNorm {
+            continue;
+        }
+        // RmsNorm output must be single-consumer (only this matmul reads it).
+        if read_count.get(&a_buf).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+        to_fuse.push((norm_idx, i));
+    }
+
+    for &(norm_idx, matmul_idx) in &to_fuse {
+        let norm = &plan.dispatches[norm_idx];
+        let x_buf = norm.input_buffers[0]; // raw x
+        let w_norm_buf = norm.input_buffers[1]; // norm weight
+        let rows = norm.params[0];
+        let cols = norm.params[1];
+        let eps_bits = norm.params[2];
+
+        // Allocate rsqrt_cache buffer: one f32 per row.
+        let rsqrt_buf_idx = plan.buffers.len() as u32;
+        plan.buffers.push((rows as usize) * 4);
+        let rsqrt_buf = BufferRef(rsqrt_buf_idx);
+
+        // Replace the RmsNorm dispatch with RmsNormRsqrt.
+        plan.dispatches[norm_idx] = Dispatch {
+            shader: ShaderEntry::RmsNormRsqrt,
+            workgroups: [rows, 1, 1],
+            input_buffers: vec![x_buf],
+            output_buffer: rsqrt_buf,
+            extra_outputs: vec![],
+            params: vec![rows, cols, eps_bits, 0],
+            use_coop: false,
+            use_small_tiles: false,
+            ..Default::default()
+        };
+
+        // Modify the matmul: read raw x instead of normalized x.
+        plan.dispatches[matmul_idx].input_buffers[0] = x_buf;
+
+        // Attach the prologue: multiply A-elements by rsqrt[gr] and w_norm[tc].
+        plan.dispatches[matmul_idx].matmul_prologue = Some(MatMulPrologue {
+            factors: vec![
+                (rsqrt_buf, PrologueLoadKind::PerRow),
+                (w_norm_buf, PrologueLoadKind::PerKCol),
+            ],
+        });
+    }
+
+    if !to_fuse.is_empty() {
+        log::info!(
+            "fuse_rmsnorm_prologues: fused {} RmsNorm+MatMul pairs",
+            to_fuse.len()
+        );
+    }
+}
+
 fn fuse_epilogues(dispatches: &mut Vec<Dispatch>) {
     use std::collections::HashMap;
     // Map: output buffer → dispatch index that writes it.

@@ -395,6 +395,11 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::LayerNorm => parse_wgsl(include_str!("shaders/layer_norm.wgsl")),
         ShaderGroup::FullAttention => gen_full_attention(),
         ShaderGroup::CrossAttention => gen_cross_attention(),
+        // The Attention archetype (schedule::KernelTemplate::Attention)
+        // generates the same algorithm but produces ~8% slower SPIR-V
+        // on NVIDIA due to code-structure differences (generated tree
+        // reduce vs hand-written). Keep the hand-written shader until
+        // the generated version matches or beats it.
         ShaderGroup::MultiHeadAttn => parse_wgsl(include_str!("shaders/mha_forward.wgsl")),
         ShaderGroup::MultiHeadAttnGradQ => parse_wgsl(include_str!("shaders/mha_grad_q.wgsl")),
         ShaderGroup::MultiHeadAttnGradK => parse_wgsl(include_str!("shaders/mha_grad_k.wgsl")),
