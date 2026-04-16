@@ -1668,9 +1668,11 @@ impl Session {
     pub fn read_loss(&self) -> f32 {
         if let Some(buf_ref) = self.plan.loss_buffer {
             let buffer = &self.buffers[buf_ref.0 as usize];
+            let n = self.plan.buffers[buf_ref.0 as usize] / 4;
             unsafe {
                 let ptr = buffer.data() as *const f32;
-                *ptr
+                let slice = std::slice::from_raw_parts(ptr, n);
+                slice.iter().sum()
             }
         } else {
             0.0

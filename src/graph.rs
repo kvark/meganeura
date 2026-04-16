@@ -1791,7 +1791,9 @@ impl Graph {
         let l_shape = &self.node(logits).ty.shape;
         let t_shape = &self.node(labels).ty.shape;
         assert_eq!(l_shape, t_shape, "logits and labels must match");
-        let ty = TensorType::f32(vec![1]);
+        // Per-batch losses, summed by read_loss() on CPU.
+        let batch = l_shape[0];
+        let ty = TensorType::f32(vec![batch]);
         self.add_node(Op::CrossEntropyLoss, vec![logits, labels], ty)
     }
 
@@ -1925,7 +1927,7 @@ mod tests {
         let logits = g.input("logits", &[4, 10]);
         let labels = g.input("labels", &[4, 10]);
         let loss = g.cross_entropy_loss(logits, labels);
-        assert_eq!(g.node(loss).ty.shape, vec![1]);
+        assert_eq!(g.node(loss).ty.shape, vec![4]);
     }
 
     #[test]

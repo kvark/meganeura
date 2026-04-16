@@ -1557,11 +1557,12 @@ impl<'a> Compiler<'a> {
                 let batch = shape[0] as u32;
                 let features = shape[1] as u32;
                 // The cross_entropy shader writes both grad_out (batch*features f32s)
-                // and loss_out (scalar). Separate buffer for grad_out avoids OOB.
+                // and loss_out (per-batch losses, summed by read_loss on CPU).
                 let grad_buf = self.alloc_buffer(shape.iter().product::<usize>() * 4);
+                // One workgroup per batch item (256 threads each).
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::CrossEntropyLoss,
-                    workgroups: [1, 1, 1],
+                    workgroups: [batch, 1, 1],
                     input_buffers: vec![logits, labels],
                     output_buffer: grad_buf,
                     extra_outputs: vec![out_buf],
@@ -3211,7 +3212,7 @@ mod tests {
         let plan = compile(&g);
         assert_eq!(plan.dispatches.len(), 1);
         assert_eq!(plan.dispatches[0].shader, ShaderEntry::CrossEntropyLoss);
-        assert_eq!(plan.dispatches[0].workgroups, [1, 1, 1]);
+        assert_eq!(plan.dispatches[0].workgroups, [4, 1, 1]);
         assert_eq!(plan.dispatches[0].params[0], 4);
         assert_eq!(plan.dispatches[0].params[1], 10);
     }

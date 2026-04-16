@@ -59,4 +59,17 @@ fn main() {
     times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let median = times[runs / 2];
     eprintln!("  avg: {:.1}ms, median: {:.1}ms", avg, median);
+
+    // GPU profiling if MEGANEURA_PROFILE=1
+    if std::env::var("MEGANEURA_PROFILE").is_ok() {
+        sess.set_profiling(true);
+        sess.step();
+        sess.wait();
+        sess.step();
+        sess.wait();
+        sess.step();
+        sess.wait();
+        sess.dump_gpu_timings();
+        sess.set_profiling(false);
+    }
 }
