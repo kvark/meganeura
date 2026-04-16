@@ -381,6 +381,27 @@ struct GroupNormGradWeightBiasData {
 
 // upsample: var src, dst, params (reuses UnaryData layout)
 
+// winograd transform: var src, dst, params (8 u32s)
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct WinogradTransformParams {
+    p0: u32,
+    p1: u32,
+    p2: u32,
+    p3: u32,
+    p4: u32,
+    p5: u32,
+    p6: u32,
+    p7: u32,
+}
+
+#[derive(blade_macros::ShaderData)]
+struct WinogradTransformData {
+    src: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: WinogradTransformParams,
+}
+
 // conv2d: var src, weight, dst, params (12 u32s = 3 uniform vec4s)
 #[derive(blade_macros::ShaderData)]
 struct Conv2dData {
@@ -963,6 +984,12 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::MaxPool2d => MaxPool2dData::layout(),
         ShaderEntry::GlobalAvgPool => GlobalAvgPoolData::layout(),
         ShaderEntry::GlobalAvgPoolGrad => UnaryData::layout(),
+        ShaderEntry::WinogradInputTransform
+        | ShaderEntry::WinogradOutputTransform
+        | ShaderEntry::WinogradWeightTransform => WinogradTransformData::layout(),
+        ShaderEntry::WinogradBatchedMatMul | ShaderEntry::WinogradBatchedMatMulSmall => {
+            MatMulData::layout()
+        }
     }
 }
 
@@ -1485,43 +1512,103 @@ impl Session {
             if param_name == name {
                 self.upload_buffer(buf_ref, bytemuck::cast_slice(data));
 
-                // If this source param feeds a derived (concatenated) param,
-                // write this source's data into the correct offset of the
-                // derived buffer. Uses row-interleaved layout: for each row,
-                // source A's columns come first, then source B's columns.
+                // If this source param feeds a derived param, fill the
+                // derived buffer according to the transform type.
                 for entry in &self.plan.derived_params {
                     let derived_buf = &entry.0;
-                    let sources = &entry.1;
-                    // sources[i].1 = number of columns for that source
-                    let total_cols: usize = sources.iter().map(|s| s.1).sum();
-                    let buf_f32 = self.plan.buffers[derived_buf.0 as usize] / 4;
-                    let rows = if total_cols > 0 {
-                        buf_f32 / total_cols
-                    } else {
-                        0
-                    };
-                    let mut col_offset = 0usize;
-                    for src in sources {
-                        let src_name = &src.0;
-                        let src_cols = src.1;
-                        if src_name == name && rows > 0 {
-                            // Write row-interleaved: for row r, write data[r*src_cols .. (r+1)*src_cols]
-                            // to derived_buf at offset [r * total_cols + col_offset]
+                    let sources = entry.1.as_slice();
+
+                    // Check if this source name is referenced
+                    if !sources.iter().any(|s| s.0 == name) {
+                        continue;
+                    }
+
+                    match entry.2 {
+                        crate::graph::ParamTransform::HorizontalConcat => {
+                            // Row-interleaved layout: for each row, source A's
+                            // columns come first, then source B's columns.
+                            let total_cols: usize = sources.iter().map(|s| s.1).sum();
+                            let buf_f32 = self.plan.buffers[derived_buf.0 as usize] / 4;
+                            let rows = if total_cols > 0 {
+                                buf_f32 / total_cols
+                            } else {
+                                0
+                            };
+                            let mut col_offset = 0usize;
+                            for src in sources {
+                                let src_name = &src.0;
+                                let src_cols = src.1;
+                                if src_name == name && rows > 0 {
+                                    let derived_ptr =
+                                        self.buffers[derived_buf.0 as usize].data() as *mut f32;
+                                    for r in 0..rows {
+                                        let src_start = r * src_cols;
+                                        let dst_start = r * total_cols + col_offset;
+                                        unsafe {
+                                            std::ptr::copy_nonoverlapping(
+                                                data[src_start..].as_ptr(),
+                                                derived_ptr.add(dst_start),
+                                                src_cols,
+                                            );
+                                        }
+                                    }
+                                }
+                                col_offset += src_cols;
+                            }
+                        }
+                        crate::graph::ParamTransform::Winograd3x3 {
+                            out_channels,
+                            in_channels,
+                        } => {
+                            // G matrix for Winograd F(2,3)
+                            let g: [[f32; 3]; 4] = [
+                                [1.0, 0.0, 0.0],
+                                [0.5, 0.5, 0.5],
+                                [0.5, -0.5, 0.5],
+                                [0.0, 0.0, 1.0],
+                            ];
                             let derived_ptr =
                                 self.buffers[derived_buf.0 as usize].data() as *mut f32;
-                            for r in 0..rows {
-                                let src_start = r * src_cols;
-                                let dst_start = r * total_cols + col_offset;
-                                unsafe {
-                                    std::ptr::copy_nonoverlapping(
-                                        data[src_start..].as_ptr(),
-                                        derived_ptr.add(dst_start),
-                                        src_cols,
-                                    );
+                            for co in 0..out_channels {
+                                for ci in 0..in_channels {
+                                    // Extract 3x3 filter: [Co, Ci, 3, 3]
+                                    let base = (co * in_channels + ci) * 9;
+                                    let w = [
+                                        [data[base], data[base + 1], data[base + 2]],
+                                        [data[base + 3], data[base + 4], data[base + 5]],
+                                        [data[base + 6], data[base + 7], data[base + 8]],
+                                    ];
+                                    // u = G × w × G^T (4×4 result)
+                                    // First: tmp = G × w (4×3)
+                                    let mut tmp = [[0.0f32; 3]; 4];
+                                    for r in 0..4 {
+                                        for c in 0..3 {
+                                            for k in 0..3 {
+                                                tmp[r][c] += g[r][k] * w[k][c];
+                                            }
+                                        }
+                                    }
+                                    // Then: u = tmp × G^T (4×4)
+                                    #[allow(clippy::needless_range_loop)]
+                                    for r in 0..4 {
+                                        for c in 0..4 {
+                                            let mut val = 0.0f32;
+                                            for k in 0..3 {
+                                                val += tmp[r][k] * g[c][k];
+                                                // G^T[k][c] = G[c][k]
+                                            }
+                                            let alpha = r * 4 + c;
+                                            let idx = alpha * out_channels * in_channels
+                                                + co * in_channels
+                                                + ci;
+                                            unsafe {
+                                                *derived_ptr.add(idx) = val;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
-                        col_offset += src_cols;
                     }
                 }
 
@@ -2816,6 +2903,44 @@ impl Session {
                             _pad0: p[1],
                             _pad1: p[2],
                             _pad2: p[3],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::WinogradInputTransform
+            | ShaderEntry::WinogradOutputTransform
+            | ShaderEntry::WinogradWeightTransform => {
+                let p = &dispatch.params;
+                pc.bind(
+                    0,
+                    &WinogradTransformData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: WinogradTransformParams {
+                            p0: p[0],
+                            p1: p[1],
+                            p2: p[2],
+                            p3: p[3],
+                            p4: p[4],
+                            p5: p[5],
+                            p6: p[6],
+                            p7: p[7],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::WinogradBatchedMatMul | ShaderEntry::WinogradBatchedMatMulSmall => {
+                pc.bind(
+                    0,
+                    &MatMulData {
+                        matrix_a: buf(dispatch.input_buffers[0]),
+                        matrix_b: buf(dispatch.input_buffers[1]),
+                        matrix_c: buf(dispatch.output_buffer),
+                        params: MatMulParams {
+                            m: dispatch.params[0],
+                            n: dispatch.params[1],
+                            k: dispatch.params[2],
+                            _pad: dispatch.params[3],
                         },
                     },
                 );

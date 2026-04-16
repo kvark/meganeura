@@ -369,6 +369,17 @@ pub enum Op {
         spatial: u32, // H * W
     },
 
+    /// Winograd F(2,3) convolution for 3×3 stride-1 kernels.
+    /// inputs: [input, winograd_weight] where winograd_weight is [16*Co*Ci].
+    /// Compiler emits 3 dispatches: input transform, batched matmul, output transform.
+    WinogradConv2d {
+        in_channels: u32,
+        in_h: u32,
+        in_w: u32,
+        out_channels: u32,
+        padding: u32,
+    },
+
     /// Fused GroupNorm + SiLU: normalize then apply SiLU activation.
     /// inputs: [x, weight, bias], same shape as GroupNorm.
     GroupNormSilu {
@@ -474,6 +485,18 @@ pub struct Node {
     pub ty: TensorType,
 }
 
+/// How a derived parameter is computed from its source(s).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub enum ParamTransform {
+    /// Horizontal concatenation: interleave source columns per row.
+    HorizontalConcat,
+    /// Winograd F(2,3) weight transform: [Co, Ci, 3, 3] → [16, Co, Ci].
+    Winograd3x3 {
+        out_channels: usize,
+        in_channels: usize,
+    },
+}
+
 /// A derived parameter is created by the optimizer when fusing ops
 /// that require concatenating multiple weights (e.g. gate+up projections).
 #[derive(Clone, Debug)]
@@ -484,6 +507,8 @@ pub struct DerivedParam {
     pub sources: Vec<(String, usize)>,
     /// Total rows (shared across all sources)
     pub rows: usize,
+    /// How to compute this parameter from sources.
+    pub transform: ParamTransform,
 }
 
 pub struct Graph {

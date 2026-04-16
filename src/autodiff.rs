@@ -273,7 +273,25 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
             Op::LogSoftmax => {
-                log::warn!("standalone log_softmax gradient not yet implemented");
+                // y = log_softmax(x)
+                // dy/dx = grad_y - softmax(x) * sum_rows(grad_y)
+                let x = node.inputs[0];
+                let x_shape = &forward.nodes()[x as usize].ty.shape;
+                let batch = x_shape[0];
+                let features = x_shape[1];
+
+                // Recompute softmax(x) for the backward pass.
+                let s = graph.softmax(x);
+                // sum_rows(grad_y) → [features], broadcast → [batch, features]
+                let sum_grad = graph.sum_rows(grad_output, &TensorType::f32(vec![features]));
+                let zeros = graph.constant(vec![0.0; batch * features], &[batch, features]);
+                let sum_broadcast = graph.bias_add(zeros, sum_grad);
+                // s * sum_broadcast
+                let correction = graph.mul(s, sum_broadcast);
+                // grad_x = grad_y - correction
+                let neg_correction = graph.neg(correction);
+                let grad_x = graph.add(grad_output, neg_correction);
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
             Op::Silu => {
                 // silu(x) = x * sigmoid(x)
@@ -546,6 +564,48 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 );
                 accumulate_grad(&mut graph, &mut grads, input, grad_input);
                 accumulate_grad(&mut graph, &mut grads, kernel, grad_kernel);
+            }
+            Op::WinogradConv2d {
+                in_channels,
+                in_h,
+                in_w,
+                out_channels,
+                padding,
+            } => {
+                // inputs: [input, winograd_weight, original_weight]
+                let input = node.inputs[0];
+                let original_kernel = node.inputs[2];
+                let in_size = forward.nodes()[input as usize].ty.shape[0] as u32;
+                let batch = in_size / (in_channels * in_h * in_w);
+                let grad_input = graph.conv2d_grad_input(
+                    grad_output,
+                    original_kernel,
+                    batch,
+                    in_channels,
+                    in_h,
+                    in_w,
+                    out_channels,
+                    3,
+                    3,
+                    1,
+                    padding,
+                    padding,
+                );
+                let grad_kernel = graph.conv2d_grad_weight(
+                    grad_output,
+                    input,
+                    in_channels,
+                    in_h,
+                    in_w,
+                    out_channels,
+                    3,
+                    3,
+                    1,
+                    padding,
+                    padding,
+                );
+                accumulate_grad(&mut graph, &mut grads, input, grad_input);
+                accumulate_grad(&mut graph, &mut grads, original_kernel, grad_kernel);
             }
             Op::ScatterAdd { .. } => {
                 // ScatterAdd only appears in backward graphs; no further differentiation needed.
@@ -1139,6 +1199,7 @@ mod tests {
             name: "fused_ab".into(),
             sources: vec![("a".into(), 4), ("b".into(), 4)],
             rows: 8,
+            transform: crate::graph::ParamTransform::HorizontalConcat,
         });
 
         let diff = differentiate(&g);
