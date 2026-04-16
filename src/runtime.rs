@@ -755,9 +755,11 @@ impl Pipelines {
         }
 
         // Compile epilogue-fused pipelines for dispatches with non-empty epilogue.
+        // Prefer the new MatMulEpilogue (PointwiseDAG); fall back to legacy
+        // Vec<EpilogueOp> for cached plans that predate the DAG migration.
         let mut epilogue_map = HashMap::new();
         for dispatch in &plan.dispatches {
-            if dispatch.epilogue.is_empty() {
+            if dispatch.matmul_epilogue.is_none() && dispatch.epilogue.is_empty() {
                 continue;
             }
             let key = (dispatch.shader.clone(), dispatch.epilogue.clone());
@@ -765,7 +767,11 @@ impl Pipelines {
                 continue;
             }
             let group = dispatch.shader.shader_group();
-            let sm = crate::codegen::generate_matmul_with_epilogue(group, &dispatch.epilogue);
+            let sm = if let Some(ref epi) = dispatch.matmul_epilogue {
+                crate::codegen::generate_matmul_with_dag_epilogue(group, epi)
+            } else {
+                crate::codegen::generate_matmul_with_epilogue(group, &dispatch.epilogue)
+            };
             let shader = gpu.create_shader(bg::ShaderDesc {
                 source: &sm.source,
                 naga_module: Some(sm.module),
