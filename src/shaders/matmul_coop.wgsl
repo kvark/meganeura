@@ -18,6 +18,7 @@ var<storage> matrix_a: array<f32>;
 var<storage> matrix_b: array<f32>;
 var<storage, read_write> matrix_c: array<f32>;
 $FUSED_ADD_DECL
+$PROLOGUE_DECL
 var<uniform> params: Params;
 var<workgroup> shared_a0: array<$ELEM_TYPE, $SHARED_SIZE>;
 var<workgroup> shared_a1: array<$ELEM_TYPE, $SHARED_SIZE>;

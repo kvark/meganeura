@@ -134,6 +134,30 @@ pub fn matmul_epilogue_to_wgsl(epi: &crate::compile::MatMulEpilogue) -> (String,
     (decls.join("\n"), full_body)
 }
 
+/// Generate WGSL for a [`MatMulPrologue`] — the multiplicative factors
+/// applied during A-tile staging in the coop matmul.
+///
+/// Returns `(declarations, transform_expression)` where:
+///   - `declarations` = `var<storage>` lines for prologue buffers.
+///   - `transform_expression` = expression suffix like `* buf_0[gr] * buf_1[tc]`.
+pub fn matmul_prologue_to_wgsl(prologue: &crate::compile::MatMulPrologue) -> (String, String) {
+    use crate::compile::PrologueLoadKind;
+
+    let mut decls = Vec::new();
+    let mut expr = String::new();
+    #[allow(clippy::pattern_type_mismatch)]
+    for (i, (_, kind)) in prologue.factors.iter().enumerate() {
+        let name = format!("prologue_buf_{}", i);
+        decls.push(format!("var<storage> {}: array<f32>;", name));
+        let idx = match *kind {
+            PrologueLoadKind::PerRow => "gr",
+            PrologueLoadKind::PerKCol => "tc",
+        };
+        expr.push_str(&format!(" * {}[{}]", name, idx));
+    }
+    (decls.join("\n"), expr)
+}
+
 /// Generate a matmul shader module with a fused epilogue chain.
 ///
 /// Used by the runtime when a dispatch has a non-empty epilogue field.
@@ -813,6 +837,25 @@ fn gen_matmul_coop_wgsl(
     variant: MatMulCoopVariant,
     config: &CoopConfig,
 ) -> ShaderModule {
+    gen_matmul_coop_wgsl_prologue(fused_add, variant, config, None)
+}
+
+/// Generate coop matmul with an optional [`MatMulPrologue`].
+pub fn gen_matmul_coop_with_prologue(
+    fused_add: bool,
+    variant: MatMulCoopVariant,
+    config: &CoopConfig,
+    prologue: &crate::compile::MatMulPrologue,
+) -> ShaderModule {
+    gen_matmul_coop_wgsl_prologue(fused_add, variant, config, Some(prologue))
+}
+
+fn gen_matmul_coop_wgsl_prologue(
+    fused_add: bool,
+    variant: MatMulCoopVariant,
+    config: &CoopConfig,
+    prologue: Option<&crate::compile::MatMulPrologue>,
+) -> ShaderModule {
     let tile = config.tile_size;
     let output_tile = config.output_tile();
     let shared_size = tile * tile;
@@ -831,6 +874,11 @@ fn gen_matmul_coop_wgsl(
     let coop_ab = format!("coop_mat{}x{}<{},A>", tile, tile, ab_type);
     let coop_ba = format!("coop_mat{}x{}<{},B>", tile, tile, ab_type);
     let coop_c = format!("coop_mat{}x{}<f32,C>", tile, tile);
+
+    let (prologue_decl, a_transform) = match prologue {
+        Some(p) => matmul_prologue_to_wgsl(p),
+        None => (String::new(), String::new()),
+    };
 
     let (b_idx_0, b_idx_1) = match variant {
         MatMulCoopVariant::Normal | MatMulCoopVariant::AT => ("tr * n + cc", "tr * n + cc1"),
@@ -892,8 +940,9 @@ fn gen_matmul_coop_wgsl(
             ("$B_INDEX_1", b_idx_1),
             ("$A_INDEX_0", a_idx_0),
             ("$A_INDEX_1", a_idx_1),
-            ("$A_TRANSFORM_0", ""),
-            ("$A_TRANSFORM_1", ""),
+            ("$A_TRANSFORM_0", &a_transform),
+            ("$A_TRANSFORM_1", &a_transform),
+            ("$PROLOGUE_DECL", &prologue_decl),
             ("$FUSED_ADD_DECL", &fused_decl),
             ("$ACC_INIT", &acc_init),
         ],
@@ -903,7 +952,7 @@ fn gen_matmul_coop_wgsl(
 
 /// Variant selector for gen_matmul_coop_inner.
 #[derive(Clone, Copy, PartialEq)]
-enum MatMulCoopVariant {
+pub enum MatMulCoopVariant {
     /// C = A @ B  (standard)
     Normal,
     /// C = A @ B^T  (B is [N,K], accessed transposed)
