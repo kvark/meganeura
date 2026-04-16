@@ -1495,17 +1495,21 @@ impl<'a> Compiler<'a> {
                 let shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let rows = shape[0] as u32;
                 let cols = shape[1] as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::RmsNorm,
-                    workgroups: [rows, 1, 1], // one workgroup per row
-                    input_buffers: vec![x, w],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![rows, cols, eps.to_bits(), 0],
-                    use_coop: false,
-                    use_small_tiles: false,
-                    ..Default::default()
-                });
+                if self.options.use_schedule_reduction {
+                    self.emit_rmsnorm_schedule(x, w, out_buf, rows, cols, eps);
+                } else {
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::RmsNorm,
+                        workgroups: [rows, 1, 1],
+                        input_buffers: vec![x, w],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params: vec![rows, cols, eps.to_bits(), 0],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
+                }
             }
 
             Op::Embedding => {
@@ -2778,6 +2782,82 @@ impl<'a> Compiler<'a> {
             use_coop: false,
             use_small_tiles: false,
             reduction: Some(sum_kernel),
+            ..Default::default()
+        });
+    }
+
+    /// Emit RmsNorm as a single schedule-template reduction:
+    ///   prologue: v*v (sum-of-squares)
+    ///   op: Sum
+    ///   epilogue: src * rsqrt(sum_sq / cols + eps) * weight[col]
+    fn emit_rmsnorm_schedule(
+        &mut self,
+        x: BufferRef,
+        w: BufferRef,
+        out_buf: BufferRef,
+        rows: u32,
+        cols: u32,
+        eps: f32,
+    ) {
+        use crate::schedule::{PointwiseDAG, Pw, ReduceOp, ReductionEpilogue, ReductionKernel};
+
+        const WG: u32 = 256;
+
+        // Prologue: v*v → scalar contribution to sum-of-squares.
+        let prologue = PointwiseDAG {
+            n_inputs: 1,
+            ops: vec![Pw::LoadInput(0), Pw::Mul(0, 0)],
+            output: 1,
+        };
+
+        // Epilogue inputs (per the canonical layout):
+        //   0 = src[row, col]    (per-elem)
+        //   1 = weight[col]      (per-col)
+        //   2 = sum_of_squares   (reduced scalar, always last)
+        //
+        // Computes: src * rsqrt(sum_sq * inv_cols + eps) * weight
+        let inv_cols = Pw::const_f32(1.0 / cols as f32);
+        let eps_c = Pw::const_f32(eps);
+        let epilogue_dag = PointwiseDAG {
+            n_inputs: 3,
+            ops: vec![
+                Pw::LoadInput(0), // v0 = src[row, col]
+                Pw::LoadInput(1), // v1 = weight[col]
+                Pw::LoadInput(2), // v2 = sum_of_squares
+                inv_cols,         // v3 = 1/cols
+                eps_c,            // v4 = eps
+                Pw::Mul(2, 3),    // v5 = mean_sq
+                Pw::Add(5, 4),    // v6 = mean_sq + eps
+                Pw::Rsqrt(6),     // v7 = rsqrt(...)
+                Pw::Mul(0, 7),    // v8 = src * rsqrt
+                Pw::Mul(8, 1),    // v9 = (src * rsqrt) * weight
+            ],
+            output: 9,
+        };
+
+        let kernel = ReductionKernel {
+            op: ReduceOp::Sum,
+            prologue,
+            epilogue: Some(ReductionEpilogue {
+                dag: epilogue_dag,
+                n_per_col_inputs: 1,
+            }),
+            n_per_elem: 1,
+            n_per_row: 0,
+            workgroup_size: WG,
+        };
+
+        // Uses RmsNormData layout: src + bias (per-col weight) + dst + params.
+        self.plan.dispatches.push(Dispatch {
+            shader: ShaderEntry::RmsNorm, // sentinel for layout
+            workgroups: [rows, 1, 1],
+            input_buffers: vec![x, w],
+            output_buffer: out_buf,
+            extra_outputs: vec![],
+            params: vec![rows, cols, 0, 0],
+            use_coop: false,
+            use_small_tiles: false,
+            reduction: Some(kernel),
             ..Default::default()
         });
     }
