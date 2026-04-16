@@ -94,7 +94,7 @@ fn smollm2_training_loss_decreases() {
     let token_ids: Vec<u32> = (0..seq_len as u32).map(|i| i % vocab as u32).collect();
     let mut labels = vec![0.0f32; seq_len * vocab];
     for i in 0..seq_len {
-        let target = ((i + 1) % vocab) as usize;
+        let target = (i + 1) % vocab;
         labels[i * vocab + target] = 1.0;
     }
 

@@ -1535,11 +1535,7 @@ impl Session {
                             // columns come first, then source B's columns.
                             let total_cols: usize = sources.iter().map(|s| s.1).sum();
                             let buf_f32 = self.plan.buffers[derived_buf.0 as usize] / 4;
-                            let rows = if total_cols > 0 {
-                                buf_f32 / total_cols
-                            } else {
-                                0
-                            };
+                            let rows = buf_f32.checked_div(total_cols).unwrap_or(0);
                             let mut col_offset = 0usize;
                             for src in sources {
                                 let src_name = &src.0;
@@ -1807,7 +1803,7 @@ impl Session {
             entry.1 += dur;
         }
         let mut sorted: Vec<_> = by_type.into_iter().collect();
-        sorted.sort_by(|a, b| b.1.1.cmp(&a.1.1));
+        sorted.sort_by_key(|e| std::cmp::Reverse(e.1.1));
         for &(name, (count, dur)) in &sorted {
             let pct = dur.as_secs_f64() / total.as_secs_f64() * 100.0;
             eprintln!(

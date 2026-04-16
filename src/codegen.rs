@@ -1532,7 +1532,7 @@ mod tests {
         // the runtime ShaderData structs. Workgroup vars (tile_a, tile_b) and
         // builtin args are not bound by blade and can be ignored.
         fn expected_globals(entry: &ShaderEntry) -> Vec<&'static str> {
-            match entry {
+            match *entry {
                 ShaderEntry::MatMul
                 | ShaderEntry::MatMulAT
                 | ShaderEntry::MatMulBT

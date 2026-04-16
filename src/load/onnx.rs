@@ -1409,7 +1409,7 @@ mod tests {
     #[test]
     fn test_parse_input_shapes() {
         // Build a model with a known input shape and verify we parse it
-        let weight_init = build_tensor_proto("w", &[10, 5], &vec![0.0; 50]);
+        let weight_init = build_tensor_proto("w", &[10, 5], &[0.0; 50]);
         let matmul_node = build_node_proto("MatMul", &["x", "w"], &["y"], &[], &[]);
 
         let x_vi = build_value_info("x", &[2, 10]);

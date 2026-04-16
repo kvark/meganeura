@@ -11,8 +11,8 @@ Meganeura - a cross-platform Neural Network training and inference library in Ru
 ## Why Meganeura?
 
 - **Portable**. It's powered by [blade-graphics](https://github.com/kvark/blade/tree/main/blade-graphics) for accessing GPUs across the board: Linux, Windows, MacOS, even edge devices on iOS or Android. Not toasters though.
-- **Fast**. Within 2x of ROCm, and 5x of optimized CUDA or MLX for training workloads.
-- **Lean**. It packs a bunch of kernels, but the real power comes from their auto-discovery. During the optimization pre-process, it explores the search space using [e-graph](https://egraphs-good.github.io/), similar to [Luminal](https://github.com/luminal-ai/luminal).
+- **Fast**. Within 2× of ROCm, and 2–5× of optimized CUDA/MLX depending on model (see [Inferena](https://kvark.github.io/inferena/) benchmarks). LM decode on NVIDIA is ~2.5× faster than the unoptimized baseline thanks to K-split GEMV kernels.
+- **Lean**. It packs a handful of kernel archetypes (pointwise, reduction, matmul, attention) that compose into specialized GPU shaders at compile time. [E-graph](https://egraphs-good.github.io/) equality saturation discovers optimal kernel fusions — similar to [Luminal](https://github.com/luminal-ai/luminal) but with a cost-model-driven extractor.
 
 ## Benchmarks
 
@@ -39,6 +39,17 @@ Run `bash bench/compare.sh` to reproduce.
 Examples accept `MEGANEURA_TRACE=<filename>` environment for saming binary Perfetto traces.
 You can open them with [Perfetto Trace Viewer](https://ui.perfetto.dev/#!/viewer):
 ![perfetto trace](etc/example-trace.png)
+
+## Kernel Archetypes
+
+Instead of carrying hundreds of hand-written GPU shaders, meganeura generates specialized WGSL kernels from a small set of composable **schedule templates**:
+
+- **Pointwise** — arbitrary elementwise DAGs (`PointwiseDAG`) fused into a single dispatch. Chains like `relu → neg → silu` collapse automatically. Replaces `unary.wgsl`, `binary.wgsl`.
+- **Reduction** — per-row tree reduction with optional prologue (e.g., `v*v` for sum-of-squares) and epilogue (e.g., `x * rsqrt(mean+eps) * weight` for RMSNorm). Replaces `rms_norm.wgsl`, `softmax.wgsl`.
+- **Matmul** — tiled matmul with epilogue fusion (`MatMulEpilogue`) and prologue support (`MatMulPrologue`) for fusing norm-scale into A-tile staging. Includes K-split GEMV variants for batch-1 LM decode.
+- **Attention** — FlashAttention-1 forward with online softmax, parameterized by mask type (none/causal), head dimension, and GQA grouping. Replaces `mha_forward.wgsl`.
+
+The e-graph optimizer uses a `FusionCostModel` to pick the cheapest equivalent expression after equality saturation, preferring fused kernels that eliminate intermediate buffer writes.
 
 ## System Requirements
 

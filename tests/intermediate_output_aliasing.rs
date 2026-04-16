@@ -25,13 +25,13 @@ fn intermediate_node_output_is_stable_across_batch_sizes() {
         g.set_outputs(vec![loss, y]);
 
         let mut s = build_session(&g);
-        s.set_parameter("fc1.weight", &vec![0.1; 16]);
-        s.set_parameter("fc1.bias", &vec![0.1; 4]);
-        s.set_parameter("norm.weight", &vec![1.0; 4]);
-        s.set_parameter("fc_out.weight", &vec![0.2; 12]);
-        s.set_parameter("fc_out.bias", &vec![0.0; 3]);
-        s.set_parameter("fc2.weight", &vec![0.3; 9]);
-        s.set_parameter("fc2.bias", &vec![0.0; 3]);
+        s.set_parameter("fc1.weight", &[0.1; 16]);
+        s.set_parameter("fc1.bias", &[0.1; 4]);
+        s.set_parameter("norm.weight", &[1.0; 4]);
+        s.set_parameter("fc_out.weight", &[0.2; 12]);
+        s.set_parameter("fc_out.bias", &[0.0; 3]);
+        s.set_parameter("fc2.weight", &[0.3; 9]);
+        s.set_parameter("fc2.bias", &[0.0; 3]);
 
         let input: Vec<f32> = (0..bs * 4).map(|i| (i as f32 + 1.0) * 0.1).collect();
         s.set_input("x", &input);
@@ -59,11 +59,11 @@ fn intermediate_node_output_is_stable_across_batch_sizes() {
         let fy = ffc_out.forward(&mut fg, fh);
         fg.set_outputs(vec![fy]);
         let mut fs = meganeura::train::build_inference_session(&fg);
-        fs.set_parameter("fc1.weight", &vec![0.1; 16]);
-        fs.set_parameter("fc1.bias", &vec![0.1; 4]);
-        fs.set_parameter("norm.weight", &vec![1.0; 4]);
-        fs.set_parameter("fc_out.weight", &vec![0.2; 12]);
-        fs.set_parameter("fc_out.bias", &vec![0.0; 3]);
+        fs.set_parameter("fc1.weight", &[0.1; 16]);
+        fs.set_parameter("fc1.bias", &[0.1; 4]);
+        fs.set_parameter("norm.weight", &[1.0; 4]);
+        fs.set_parameter("fc_out.weight", &[0.2; 12]);
+        fs.set_parameter("fc_out.bias", &[0.0; 3]);
         fs.set_input("x", &input);
         fs.step();
         fs.wait();

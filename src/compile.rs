@@ -3191,7 +3191,7 @@ mod tests {
         // 2 Reduction dispatches (max + sum/normalize). With =false, it's
         // 1 Softmax dispatch. Check that it compiles and has the right
         // batch/features params.
-        assert!(plan.dispatches.len() >= 1);
+        assert!(!plan.dispatches.is_empty());
         assert_eq!(plan.dispatches[0].params[0], 4); // batch/outer
         assert_eq!(plan.dispatches[0].params[1], 10); // features/inner
     }

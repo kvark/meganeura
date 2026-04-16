@@ -20,7 +20,6 @@ fn check_bench_preconditions(abort_on_warn: bool) {
     {
         eprintln!("preconditions: skipped (not Linux)");
         let _ = abort_on_warn;
-        return;
     }
 
     #[cfg(target_os = "linux")]

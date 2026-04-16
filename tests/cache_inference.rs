@@ -92,10 +92,10 @@ fn infer_from_loaded_plan() {
     // Build a GPU session from the loaded plan and run inference
     let mut session = Session::new(loaded);
 
-    session.set_parameter("w1", &vec![0.1_f32; 8 * 5]);
-    session.set_parameter("b1", &vec![0.01_f32; 5]);
-    session.set_parameter("w2", &vec![0.2_f32; 5 * 3]);
-    session.set_parameter("b2", &vec![0.02_f32; 3]);
+    session.set_parameter("w1", &[0.1_f32; 8 * 5]);
+    session.set_parameter("b1", &[0.01_f32; 5]);
+    session.set_parameter("w2", &[0.2_f32; 5 * 3]);
+    session.set_parameter("b2", &[0.02_f32; 3]);
 
     let x_data: Vec<f32> = (0..2 * 8).map(|i| (i as f32) * 0.1).collect();
     session.set_input("x", &x_data);

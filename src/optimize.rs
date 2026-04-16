@@ -3,6 +3,71 @@ use egglog::{Term, TermDag, TermId};
 use std::collections::HashMap;
 use std::{fmt, time::Instant};
 
+// ---------------------------------------------------------------------------
+// HBM-traffic-aware cost model for e-graph extraction (step 6).
+//
+// Per-constructor costs reflect relative GPU execution cost. Fused ops
+// are cheaper than their unfused equivalents because they eliminate
+// intermediate buffer writes. The extractor uses these to pick the
+// minimum-cost equivalent expression after equality saturation.
+//
+// This is per-constructor (not per-instance / shape-aware). Shape-aware
+// costs would need shape annotations in the e-graph, which is a
+// follow-up. For now, relative per-constructor costs already make the
+// right call for all existing rewrite rules.
+// ---------------------------------------------------------------------------
+
+/// Cost model that prefers fused kernels over unfused sequences.
+struct FusionCostModel;
+
+impl egglog::extract::CostModel<u64> for FusionCostModel {
+    fn fold(&self, _head: &str, children_cost: &[u64], head_cost: u64) -> u64 {
+        children_cost.iter().sum::<u64>() + head_cost
+    }
+
+    fn enode_cost(
+        &self,
+        _egraph: &egglog::EGraph,
+        func: &egglog::Function,
+        _row: &egglog::FunctionRow,
+    ) -> u64 {
+        // Assign costs by constructor name. Higher = more expensive =
+        // less preferred by the extractor. Fused ops are cheaper than
+        // their unfused equivalents.
+        match func.name() {
+            // Leaf nodes are free — they exist regardless.
+            "Input" | "Parameter" | "Const" => 0,
+            // Identity / shape-only ops: near-free.
+            "Identity" | "Transpose" => 1,
+            // Pointwise unary: cheap (one buffer read + write).
+            "Relu" | "Sigmoid" | "Tanh" | "Neg" | "Abs" | "Log" | "Recip" | "Silu" | "Gelu" => 5,
+            // Pointwise binary: same cost envelope as unary.
+            "Add" | "Mul" | "Greater" | "BiasAdd" => 5,
+            // Reductions: moderate (read full input, write reduced output).
+            "SumAll" | "MeanAll" | "SumRows" | "Softmax" | "LogSoftmax" => 10,
+            // Norms: reduction + per-element write-back.
+            "RmsNorm" | "LayerNorm" | "GroupNorm" | "GroupNormSilu" => 15,
+            // MatMul: expensive (reads A+B, writes C).
+            "MatMul" | "MatMulAT" | "MatMulBT" => 50,
+            // Fused MatMul+Add: saves one Add dispatch + intermediate buffer.
+            "FusedMatMulAdd" | "FusedMatMulATAdd" | "FusedMatMulBTAdd" => 45,
+            // Fused RmsNorm+MatMul: saves one RmsNorm dispatch.
+            "FusedRmsNormMatMul" => 40,
+            // SwiGLU variants.
+            "SwiGLU" => 8,
+            "SwiGLUConcat" => 7, // fused gate+up → slightly cheaper
+            // Attention: expensive but self-contained.
+            "CausalAttention" | "FullAttention" | "CrossAttention" | "MultiHeadAttn" => 100,
+            // Conv2d variants.
+            "Conv2d" => 80,
+            "WinogradConv2d" => 60, // cheaper compute, more memory
+            // Gradient ops — cost doesn't matter for extraction since
+            // gradients aren't rewritten, but assign reasonable values.
+            _ => 20,
+        }
+    }
+}
+
 /// Report from the e-graph optimization pass.
 pub struct OptimizeReport {
     /// The egglog program text (for external inspection / replay).
@@ -139,10 +204,48 @@ pub fn optimize_with_report(graph: &Graph) -> (Graph, OptimizeReport) {
     match egglog_result {
         Ok(outputs) => {
             egglog_ok = true;
-            for out in &outputs {
-                if let egglog::CommandOutput::ExtractBest(ref dag, _cost, term_id) = *out {
-                    log::debug!("egglog extracted: {}", dag.to_string(term_id));
-                    extractions.push((dag.clone(), term_id));
+
+            // Step 6: programmatic extraction with FusionCostModel.
+            // Use egglog's extract_value_with_cost_model API to apply
+            // HBM-traffic-aware costs instead of default AST-size.
+            for &out_id in graph.outputs() {
+                if matches!(graph.node(out_id).op, Op::Nop) {
+                    continue;
+                }
+                let var_name = format!("n{}", out_id);
+                let eval_result =
+                    egraph.eval_expr(&egglog::ast::Expr::Var(egglog::ast::Span::Panic, var_name));
+                match eval_result {
+                    Ok((sort, value)) => {
+                        match egraph.extract_value_with_cost_model(&sort, value, FusionCostModel) {
+                            Ok((dag, term_id, cost)) => {
+                                log::debug!(
+                                    "extracted n{} (cost {}): {}",
+                                    out_id,
+                                    cost,
+                                    dag.to_string(term_id)
+                                );
+                                extractions.push((dag, term_id));
+                            }
+                            Err(e) => {
+                                log::warn!("extraction failed for n{}: {}", out_id, e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("failed to eval n{}: {}", out_id, e);
+                    }
+                }
+            }
+
+            // Fallback: if programmatic extraction didn't work, use the
+            // text-based outputs (legacy path).
+            if extractions.is_empty() {
+                for out in &outputs {
+                    if let egglog::CommandOutput::ExtractBest(ref dag, _cost, term_id) = *out {
+                        log::debug!("egglog legacy extracted: {}", dag.to_string(term_id));
+                        extractions.push((dag.clone(), term_id));
+                    }
                 }
             }
         }
@@ -357,7 +460,9 @@ fn graph_to_egglog(graph: &Graph) -> String {
     // The fusion rules only need one pass — they're not iterative.
     prog.push_str("(run 1)\n\n");
 
-    // Extract all output nodes (after saturation)
+    // Extraction is now done programmatically via the Extractor API
+    // (with FusionCostModel) in optimize_with_report. Legacy text-based
+    // extraction kept as fallback.
     for &out in graph.outputs() {
         if !matches!(graph.node(out).op, Op::Nop) {
             prog.push_str(&format!("(extract n{})\n", out));
@@ -1196,8 +1301,8 @@ mod tests {
         // Find the ExtractBest output
         let mut found_fused = false;
         for out in &outputs {
-            if let egglog::CommandOutput::ExtractBest(dag, _cost, term_id) = out {
-                let s = dag.to_string(*term_id);
+            if let egglog::CommandOutput::ExtractBest(ref dag, _cost, term_id) = *out {
+                let s = dag.to_string(term_id);
                 eprintln!("egglog extracted: {}", s);
                 assert!(
                     s.contains("FusedMatMulAdd"),
@@ -1205,7 +1310,7 @@ mod tests {
                     s
                 );
                 // Verify the term tree structure
-                match dag.get(*term_id) {
+                match dag.get(term_id).clone() {
                     Term::App(name, _children) => {
                         assert_eq!(name, "FusedMatMulAdd");
                     }
@@ -1402,7 +1507,7 @@ mod tests {
             report
                 .fusions_applied
                 .iter()
-                .any(|(name, _)| name.contains("SwiGLU")),
+                .any(|entry| entry.0.contains("SwiGLU")),
             "no SwiGLU fusion in report: {:?}",
             report.fusions_applied
         );
@@ -1467,7 +1572,7 @@ mod tests {
             report
                 .fusions_applied
                 .iter()
-                .any(|(name, _)| name.contains("BT")),
+                .any(|entry| entry.0.contains("BT")),
             "no BT fusion in report"
         );
     }
@@ -1526,7 +1631,7 @@ mod tests {
     #[test]
     fn test_pool_ops_roundtrip() {
         let mut g = Graph::new();
-        let x = g.input("x", &[1 * 64 * 8 * 8]);
+        let x = g.input("x", &[64 * 8 * 8]);
         let pool = g.max_pool_2d(x, 1, 64, 8, 8, 2, 2, 2, 0);
         let gap = g.global_avg_pool(pool, 1, 64, 16);
         g.set_outputs(vec![gap]);
