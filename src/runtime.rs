@@ -896,7 +896,8 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::MatMul
         | ShaderEntry::MatMulAT
         | ShaderEntry::MatMulBT
-        | ShaderEntry::MatMulGemv => MatMulData::layout(),
+        | ShaderEntry::MatMulGemv
+        | ShaderEntry::MatMulGemvBT => MatMulData::layout(),
         ShaderEntry::FusedMatMulAdd
         | ShaderEntry::FusedMatMulATAdd
         | ShaderEntry::FusedMatMulBTAdd
@@ -1966,7 +1967,7 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::MatMulAT | ShaderEntry::MatMulBT => {
+            ShaderEntry::MatMulAT | ShaderEntry::MatMulBT | ShaderEntry::MatMulGemvBT => {
                 // params layout: [m, n, k, 0]
                 pc.bind(
                     0,
