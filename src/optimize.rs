@@ -281,6 +281,7 @@ fn graph_to_egglog(graph: &Graph) -> String {
   (MaxPool2d Op)
   (GlobalAvgPool Op)
   (GlobalAvgPoolGrad Op)
+  (WinogradConv2d Op Op Op)
   ; --- KV cache ops ---
   (CacheWrite Op Op Op)
   (CachedAttention Op Op Op Op)
@@ -465,6 +466,7 @@ fn node_to_egglog_expr(node: &Node) -> String {
         Op::MaxPool2d { .. } => format!("(MaxPool2d n{})", i[0]),
         Op::GlobalAvgPool { .. } => format!("(GlobalAvgPool n{})", i[0]),
         Op::GlobalAvgPoolGrad { .. } => format!("(GlobalAvgPoolGrad n{})", i[0]),
+        Op::WinogradConv2d { .. } => format!("(WinogradConv2d n{} n{} n{})", i[0], i[1], i[2]),
         Op::CacheWrite => format!("(CacheWrite n{} n{} n{})", i[0], i[1], i[2]),
         Op::CachedAttention { .. } => {
             format!("(CachedAttention n{} n{} n{} n{})", i[0], i[1], i[2], i[3])
@@ -711,6 +713,7 @@ fn apply_swiglu_concat_fusions(graph: &mut Graph, fusions: &mut Vec<(String, u32
             name: concat_name.clone(),
             sources: vec![(gate_name, out_features), (up_name, out_features)],
             rows: in_features,
+            transform: crate::graph::ParamTransform::HorizontalConcat,
         });
         let concat_w = graph.add_raw_node(
             Op::Parameter { name: concat_name },
@@ -789,6 +792,101 @@ pub fn apply_group_norm_silu_fusions(graph: &mut Graph, fusions: &mut Vec<(Strin
         // Mark old GroupNorm as Nop
         graph.nodes_mut()[gn_id as usize].op = Op::Nop;
         fusions.push(("GroupNorm+Silu→GroupNormSilu".to_string(), id as u32));
+    }
+}
+
+/// Rewrite Conv2d(3×3, stride=1) → WinogradConv2d with pre-transformed weights.
+///
+/// For each matching Conv2d node, creates a derived parameter for the Winograd-transformed
+/// weights and rewrites the node to WinogradConv2d.
+pub fn apply_winograd_conv_fusions(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
+    use crate::graph::TensorType;
+    let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
+    for &id in &node_ids {
+        let node = &graph.nodes()[id];
+        let (in_channels, in_h, in_w, out_channels, kernel_h, kernel_w, stride, padding) =
+            match node.op {
+                Op::Conv2d {
+                    in_channels,
+                    in_h,
+                    in_w,
+                    out_channels,
+                    kernel_h,
+                    kernel_w,
+                    stride,
+                    padding_h,
+                    padding_w,
+                    ..
+                } => {
+                    // Winograd F(2,3) is a 3×3 stride-1 specialization. Only
+                    // applies when padding_h == padding_w (symmetric).
+                    if padding_h != padding_w {
+                        continue;
+                    }
+                    (
+                        in_channels,
+                        in_h,
+                        in_w,
+                        out_channels,
+                        kernel_h,
+                        kernel_w,
+                        stride,
+                        padding_h,
+                    )
+                }
+                _ => continue,
+            };
+        // Only match 3×3 stride-1 convolutions with enough channels to
+        // amortize transform overhead (input/output transforms are O(tiles)
+        // while matmul savings are O(tiles × Ci)).
+        if kernel_h != 3 || kernel_w != 3 || stride != 1 {
+            continue;
+        }
+        if (in_channels * out_channels) < 4096 {
+            continue; // too small, GEMM is faster
+        }
+
+        let weight_id = node.inputs[1];
+        let weight_name = match graph.node(weight_id).op {
+            Op::Parameter { ref name } => name.clone(),
+            _ => continue,
+        };
+        let input_id = node.inputs[0];
+
+        // Create Winograd weight parameter name
+        let wino_name = format!("{}:winograd", weight_name);
+
+        // Record derivation so runtime can fill this from original weights
+        graph.derived_params.push(crate::graph::DerivedParam {
+            name: wino_name.clone(),
+            sources: vec![(weight_name, (out_channels * in_channels * 9) as usize)],
+            rows: 1, // not used for Winograd
+            transform: crate::graph::ParamTransform::Winograd3x3 {
+                out_channels: out_channels as usize,
+                in_channels: in_channels as usize,
+            },
+        });
+
+        // Create new parameter node for Winograd-transformed weights [16 * Co * Ci]
+        let wino_size = 16 * out_channels as usize * in_channels as usize;
+        let wino_param = graph.add_raw_node(
+            Op::Parameter { name: wino_name },
+            vec![],
+            TensorType::f32(vec![wino_size]),
+        );
+
+        // Rewrite Conv2d → WinogradConv2d
+        // Keep original weight as 3rd input for backward pass (grad_input/grad_weight)
+        graph.nodes_mut()[id].op = Op::WinogradConv2d {
+            in_channels,
+            in_h,
+            in_w,
+            out_channels,
+            padding,
+        };
+        graph.nodes_mut()[id].inputs = vec![input_id, wino_param, weight_id];
+
+        fusions.push(("Conv2d(3x3)→WinogradConv2d".to_string(), id as u32));
     }
 }
 

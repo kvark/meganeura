@@ -126,6 +126,11 @@ pub enum ShaderEntry {
     MaxPool2d,
     GlobalAvgPool,
     GlobalAvgPoolGrad,
+    WinogradInputTransform,
+    WinogradOutputTransform,
+    WinogradBatchedMatMul,
+    WinogradBatchedMatMulSmall,
+    WinogradWeightTransform,
 }
 
 impl ShaderEntry {
@@ -210,6 +215,11 @@ impl ShaderEntry {
             ShaderEntry::MaxPool2d => ShaderGroup::MaxPool2d,
             ShaderEntry::GlobalAvgPool => ShaderGroup::GlobalAvgPool,
             ShaderEntry::GlobalAvgPoolGrad => ShaderGroup::GlobalAvgPoolGrad,
+            ShaderEntry::WinogradInputTransform => ShaderGroup::WinogradInputTransform,
+            ShaderEntry::WinogradOutputTransform => ShaderGroup::WinogradOutputTransform,
+            ShaderEntry::WinogradBatchedMatMul => ShaderGroup::WinogradBatchedMatMul,
+            ShaderEntry::WinogradBatchedMatMulSmall => ShaderGroup::WinogradBatchedMatMulSmall,
+            ShaderEntry::WinogradWeightTransform => ShaderGroup::WinogradWeightTransform,
         }
     }
 
@@ -296,31 +306,47 @@ impl ShaderEntry {
             ShaderEntry::MaxPool2d => "max_pool_2d",
             ShaderEntry::GlobalAvgPool => "global_avg_pool",
             ShaderEntry::GlobalAvgPoolGrad => "main",
+            ShaderEntry::WinogradInputTransform
+            | ShaderEntry::WinogradOutputTransform
+            | ShaderEntry::WinogradBatchedMatMul
+            | ShaderEntry::WinogradBatchedMatMulSmall
+            | ShaderEntry::WinogradWeightTransform => "main",
         }
     }
 }
 
-/// An elementwise operation fused into a matmul's store loop.
-///
-/// Each step transforms `val` (the matmul result for one element):
-///   - Unary ops modify val in-place: `val = relu(val)`
-///   - Binary ops read from an extra buffer: `val = val + extra[idx]`
-///
-/// The extra buffer index refers to `epilogue_buffers` on the Dispatch.
+/// Legacy enum — kept for serde backward compat of cached plans.
+/// New code should use `MatMulEpilogue` (a `PointwiseDAG`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EpilogueOp {
-    /// val = val + extra_buffer[row * N + col]
     Add(u8),
-    /// val = val + extra_buffer[col]  (row-broadcast bias)
     BiasAdd(u8),
-    /// val = max(val, 0)
     Relu,
-    /// val = val * sigmoid(val)
     Silu,
-    /// val = 1 / (1 + exp(-val))
     Sigmoid,
-    /// val = -val
     Neg,
+}
+
+/// How an epilogue buffer is indexed in the matmul store loop.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EpilogueLoadKind {
+    /// Load at `row * N + col` (per-element, same shape as output).
+    PerElement,
+    /// Load at `col` (per-column broadcast, e.g. bias).
+    PerCol,
+}
+
+/// A fused epilogue applied in the matmul store loop, expressed as a
+/// [`PointwiseDAG`]. Replaces the closed `EpilogueOp` enum so arbitrary
+/// per-element transforms can be fused without new enum variants.
+///
+/// `LoadInput(0)` in the DAG = `val` (the matmul accumulator result).
+/// `LoadInput(1+)` indexes into `inputs`, each with its own buffer +
+/// load-indexing kind (per-element or per-col broadcast).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MatMulEpilogue {
+    pub dag: PointwiseDAG,
+    pub inputs: Vec<(BufferRef, EpilogueLoadKind)>,
 }
 
 /// A single GPU dispatch in the execution plan.
@@ -342,12 +368,15 @@ pub struct Dispatch {
     /// When true, use the 32×32 small-tile matmul pipeline instead of 64×64.
     #[serde(default)]
     pub use_small_tiles: bool,
-    /// Fused elementwise epilogue chain applied in the matmul store loop.
-    /// Empty = no epilogue (default). Non-empty = one or more ops fused
-    /// into the matmul, each saving a dispatch + barrier.
+    /// Fused elementwise epilogue (PointwiseDAG) applied in the matmul
+    /// store loop. `None` = no epilogue (default). When present, saves
+    /// one dispatch + barrier per fused op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matmul_epilogue: Option<MatMulEpilogue>,
+    /// Legacy fields — kept for serde backward compat of cached plans.
+    /// New code uses `matmul_epilogue` instead.
     #[serde(default)]
     pub epilogue: Vec<EpilogueOp>,
-    /// Extra buffer refs for epilogue binary ops (Add, BiasAdd).
     #[serde(default)]
     pub epilogue_buffers: Vec<BufferRef>,
     /// Human-readable label for profiling (e.g. "MatMul[50,720,960]").
@@ -394,10 +423,15 @@ pub struct ExecutionPlan {
     pub param_grad_pairs: Vec<(BufferRef, BufferRef)>,
     /// LSE buffers allocated for MultiHeadAttn forward nodes: (node_id, buffer).
     pub lse_buffers: Vec<(NodeId, BufferRef)>,
-    /// Derived parameters: buffer = horizontal concat of source parameters.
-    /// Created by the optimizer when fusing e.g. gate+up projections.
-    /// Format: (derived_buf, [(source_name, num_elements), ...])
-    pub derived_params: Vec<(BufferRef, Vec<(String, usize)>)>,
+    /// Derived parameters: buffer computed from source parameters.
+    /// Created by the optimizer when fusing e.g. gate+up projections or Winograd weight transforms.
+    /// Format: (derived_buf, [(source_name, num_elements), ...], transform)
+    #[allow(clippy::type_complexity)] //TODO
+    pub derived_params: Vec<(
+        BufferRef,
+        Vec<(String, usize)>,
+        crate::graph::ParamTransform,
+    )>,
 }
 
 /// Compile a differentiated graph into an ExecutionPlan.
@@ -464,7 +498,10 @@ pub fn compile_with(graph: &Graph, options: &CompileOptions) -> ExecutionPlan {
                 .iter()
                 .map(|entry| (entry.0.clone(), entry.1))
                 .collect();
-            compiler.plan.derived_params.push((buf_ref, sources));
+            compiler
+                .plan
+                .derived_params
+                .push((buf_ref, sources, dp.transform.clone()));
         }
     }
 
@@ -1866,6 +1903,103 @@ impl<'a> Compiler<'a> {
                         out_h,
                         out_w,
                         padding_w,
+                    ],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
+            Op::WinogradConv2d {
+                in_channels,
+                in_h,
+                in_w,
+                out_channels,
+                padding,
+            } => {
+                let out_h = in_h + 2 * padding - 2; // 3x3 stride 1
+                let out_w = in_w + 2 * padding - 2;
+                let batch_size = node.ty.shape[0] as u32 / (out_channels * out_h * out_w);
+                let tiles_h = out_h.div_ceil(2);
+                let tiles_w = out_w.div_ceil(2);
+                let total_tiles = batch_size * tiles_h * tiles_w;
+
+                // Temp buffers
+                let input_xform_size = (16 * in_channels * total_tiles * 4) as usize;
+                let mm_out_size = (16 * out_channels * total_tiles * 4) as usize;
+                let input_xform_buf = self.alloc_buffer(input_xform_size);
+                let mm_out_buf = self.alloc_buffer(mm_out_size);
+
+                let input = self.get_buffer(node.inputs[0]);
+                let weight_xform = self.get_buffer(node.inputs[1]); // Winograd-transformed weights [16*Co*Ci]
+                // input[2] is the original weight [Co*Ci*9] (for backward, and for re-transform)
+                let original_weight = self.get_buffer(node.inputs[2]);
+
+                // Dispatch 0: Weight transform (re-transform every step for training)
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::WinogradWeightTransform,
+                    workgroups: [out_channels * in_channels.div_ceil(256), 1, 1],
+                    input_buffers: vec![original_weight],
+                    output_buffer: weight_xform,
+                    extra_outputs: vec![],
+                    params: vec![out_channels, in_channels, 0, 0, 0, 0, 0, 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+
+                // Dispatch 1: Input transform
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::WinogradInputTransform,
+                    workgroups: [(total_tiles * in_channels).div_ceil(256), 1, 1],
+                    input_buffers: vec![input],
+                    output_buffer: input_xform_buf,
+                    extra_outputs: vec![],
+                    params: vec![
+                        batch_size,
+                        in_channels,
+                        in_h,
+                        in_w,
+                        padding,
+                        tiles_h,
+                        tiles_w,
+                        total_tiles,
+                    ],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+
+                // Dispatch 2: Batched matmul
+                // weight_xform[16, Co, Ci] × input_xform[16, Ci, P] → mm_out[16, Co, P]
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::WinogradBatchedMatMul,
+                    workgroups: [total_tiles.div_ceil(64), out_channels.div_ceil(64), 16],
+                    input_buffers: vec![weight_xform, input_xform_buf],
+                    output_buffer: mm_out_buf,
+                    extra_outputs: vec![],
+                    params: vec![out_channels, total_tiles, in_channels, 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+
+                // Dispatch 3: Output transform
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::WinogradOutputTransform,
+                    workgroups: [(total_tiles * out_channels).div_ceil(256), 1, 1],
+                    input_buffers: vec![mm_out_buf],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![
+                        batch_size,
+                        out_channels,
+                        out_h,
+                        out_w,
+                        tiles_h,
+                        tiles_w,
+                        total_tiles,
+                        0,
                     ],
                     use_coop: false,
                     use_small_tiles: false,

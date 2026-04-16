@@ -264,6 +264,11 @@ pub enum ShaderGroup {
     Conv2dGradInputGemmSmall,
     Conv2dGradInputGemmCoop,
     GroupNormSilu,
+    WinogradInputTransform,
+    WinogradOutputTransform,
+    WinogradBatchedMatMul,
+    WinogradBatchedMatMulSmall,
+    WinogradWeightTransform,
     Conv2dGradWeight,
     Conv2dGradWeightGemm,
     Conv2dGradWeightGemmSmall,
@@ -325,7 +330,6 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::LayerNormGrad => parse_wgsl(include_str!("shaders/layer_norm_grad.wgsl")),
         ShaderGroup::FusedRmsNormMatMul => parse_wgsl(include_str!("shaders/matmul_rms_norm.wgsl")),
         ShaderGroup::RmsNormRsqrt => parse_wgsl(include_str!("shaders/rms_norm_rsqrt.wgsl")),
-        // Coop groups must use generate_coop_module(), not generate_module()
         ShaderGroup::FusedRmsNormMatMulCoop => {
             panic!("use generate_coop_module for FusedRmsNormMatMulCoop")
         }
@@ -349,6 +353,18 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         }
         ShaderGroup::Conv2dGradInputGemmCoop => gen_conv2d_grad_input_gemm_coop(),
         ShaderGroup::GroupNormSilu => parse_wgsl(include_str!("shaders/group_norm_silu.wgsl")),
+        ShaderGroup::WinogradInputTransform => {
+            parse_wgsl(include_str!("shaders/winograd_input_transform.wgsl"))
+        }
+        ShaderGroup::WinogradOutputTransform => {
+            parse_wgsl(include_str!("shaders/winograd_output_transform.wgsl"))
+        }
+        ShaderGroup::WinogradBatchedMatMul | ShaderGroup::WinogradBatchedMatMulSmall => {
+            parse_wgsl(include_str!("shaders/winograd_matmul.wgsl"))
+        }
+        ShaderGroup::WinogradWeightTransform => {
+            parse_wgsl(include_str!("shaders/winograd_weight_transform.wgsl"))
+        }
         ShaderGroup::Conv2dGradWeight => {
             parse_wgsl(include_str!("shaders/conv2d_grad_weight.wgsl"))
         }
@@ -1530,6 +1546,13 @@ mod tests {
                 ShaderEntry::MaxPool2d
                 | ShaderEntry::GlobalAvgPool
                 | ShaderEntry::GlobalAvgPoolGrad => vec!["src", "dst", "params"],
+                ShaderEntry::WinogradInputTransform | ShaderEntry::WinogradOutputTransform => {
+                    vec!["src", "dst", "params"]
+                }
+                ShaderEntry::WinogradBatchedMatMul | ShaderEntry::WinogradBatchedMatMulSmall => {
+                    vec!["matrix_a", "matrix_b", "matrix_c", "params"]
+                }
+                ShaderEntry::WinogradWeightTransform => vec!["src", "dst", "params"],
             }
         }
 
@@ -1605,6 +1628,9 @@ mod tests {
             ShaderEntry::Conv2dGradInputGemm,
             ShaderEntry::Conv2dGradInputGemmSmall,
             ShaderEntry::Conv2dGradWeight,
+            ShaderEntry::WinogradInputTransform,
+            ShaderEntry::WinogradOutputTransform,
+            ShaderEntry::WinogradBatchedMatMul,
             ShaderEntry::CacheWrite,
             ShaderEntry::CachedAttention,
             ShaderEntry::RoPEDynamic,

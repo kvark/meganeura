@@ -246,11 +246,17 @@ pub fn build_inference_session_with(
     // Inference-only fusions (no backward pass needed)
     let mut inference_fusions = Vec::new();
     optimize::apply_group_norm_silu_fusions(&mut optimized, &mut inference_fusions);
+    optimize::apply_winograd_conv_fusions(&mut optimized, &mut inference_fusions);
     if !inference_fusions.is_empty() {
-        log::info!(
-            "inference fusions: {}x GroupNorm+Silu→GroupNormSilu",
-            inference_fusions.len()
-        );
+        for (name, count) in inference_fusions.iter().fold(
+            std::collections::BTreeMap::<&str, usize>::new(),
+            |mut acc, entry| {
+                *acc.entry(entry.0.as_str()).or_default() += 1;
+                acc
+            },
+        ) {
+            log::info!("inference fusion: {}x {}", count, name);
+        }
     }
 
     // Compile to execution plan
