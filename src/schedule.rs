@@ -358,6 +358,21 @@ pub enum KernelTemplate {
         /// tree reduction assumes it.
         grid: GridShape,
     },
+    /// Multi-head attention forward with online softmax (FlashAttention-1).
+    ///
+    /// One workgroup per (query_position, head), threads = head_dim.
+    /// GQA via num_heads / num_kv_heads grouping. Serial loop over KV
+    /// positions with online softmax (running max + exp correction).
+    ///
+    /// Bindings match `MultiHeadAttnData`: src_a (Q), src_b (K),
+    /// bias (V), dst (O), lse (log-sum-exp for backward).
+    Attention {
+        mask: AttentionMask,
+        /// Workgroup size = head_dim. Must be a power of 2.
+        head_dim: u32,
+        /// Whether to output log-sum-exp for the backward pass.
+        output_lse: bool,
+    },
 }
 
 /// Per-element write-back DAG for a reduce-then-map reduction. See
@@ -411,10 +426,20 @@ impl ReductionKernel {
     }
 }
 
+/// Attention mask type for the attention archetype.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AttentionMask {
+    /// No mask — full attention over all KV positions.
+    None,
+    /// Causal mask — position i attends only to positions ≤ i.
+    Causal,
+}
+
 /// Entry-point name emitted for any `KernelTemplate`. One entry point per
 /// generated module.
 pub const POINTWISE_ENTRY: &str = "main";
 pub const REDUCTION_ENTRY: &str = "main";
+pub const ATTENTION_ENTRY: &str = "main";
 
 /// Lower a [`KernelTemplate`] to WGSL + a parsed Naga module.
 pub fn lower(t: &KernelTemplate) -> ShaderModule {
@@ -428,6 +453,11 @@ pub fn lower(t: &KernelTemplate) -> ShaderModule {
             n_per_row,
             grid,
         } => lower_reduction(op, prologue, epilogue.as_ref(), n_per_elem, n_per_row, grid),
+        KernelTemplate::Attention {
+            mask,
+            head_dim,
+            output_lse,
+        } => lower_attention(mask, head_dim, output_lse),
     }
 }
 
@@ -644,6 +674,123 @@ fn lower_reduction(
 ///   * n=2 → `["row_a", "row_b"]`
 ///
 /// Panics for n > 2 — wider layouts need additional runtime plumbing.
+fn lower_attention(mask: AttentionMask, head_dim: u32, output_lse: bool) -> ShaderModule {
+    assert!(
+        head_dim.is_power_of_two() && head_dim >= 2,
+        "attention head_dim must be a power of 2 ≥ 2"
+    );
+
+    let wg = head_dim;
+    let mut src = String::new();
+
+    // Struct + bindings (matches MultiHeadAttnData)
+    src.push_str(
+        "struct Params {\n    q_seq: u32,\n    kv_seq: u32,\n    packed_heads: u32,\n    head_dim: u32,\n}\n\n",
+    );
+    src.push_str("var<storage> src_a: array<f32>;\n"); // Q
+    src.push_str("var<storage> src_b: array<f32>;\n"); // K
+    src.push_str("var<storage> bias: array<f32>;\n"); // V
+    src.push_str("var<storage, read_write> dst: array<f32>;\n"); // O
+    if output_lse {
+        src.push_str("var<storage, read_write> lse: array<f32>;\n");
+    }
+    src.push_str("var<uniform> params: Params;\n");
+    let _ = writeln!(src, "var<workgroup> wg_dot: array<f32, {}>;\n", wg);
+
+    // Tree reduce helper
+    src.push_str("fn tree_reduce(tid: u32) {\n");
+    let mut stride = wg / 2;
+    while stride > 0 {
+        src.push_str("    workgroupBarrier();\n");
+        let _ = writeln!(
+            src,
+            "    if tid < {}u {{ wg_dot[tid] = wg_dot[tid] + wg_dot[tid + {}u]; }}",
+            stride, stride
+        );
+        stride /= 2;
+    }
+    src.push_str("    workgroupBarrier();\n");
+    src.push_str("}\n\n");
+
+    // Main kernel
+    let _ = writeln!(src, "@compute @workgroup_size({})", wg);
+    let _ = writeln!(
+        src,
+        "fn {}(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{",
+        ATTENTION_ENTRY
+    );
+    src.push_str("    let pos = wgid.x;\n");
+    src.push_str("    let head = wgid.y;\n");
+    src.push_str("    let tid = lid.x;\n");
+    src.push_str("    let q_seq = params.q_seq;\n");
+    src.push_str("    let kv_seq = params.kv_seq;\n");
+    src.push_str("    let num_heads = params.packed_heads >> 16u;\n");
+    src.push_str("    let num_kv_heads = params.packed_heads & 0xFFFFu;\n");
+    src.push_str("    let head_dim = params.head_dim;\n");
+    src.push_str("    if pos >= q_seq || head >= num_heads { return; }\n\n");
+
+    // GQA head mapping
+    src.push_str("    let kv_head = head / (num_heads / num_kv_heads);\n");
+    src.push_str("    let kv_head_off = kv_head * head_dim;\n");
+    src.push_str("    let kv_dim = num_kv_heads * head_dim;\n");
+    src.push_str("    let scale = inverseSqrt(f32(head_dim));\n");
+    src.push_str("    let q_base = pos * (num_heads * head_dim) + head * head_dim;\n");
+    src.push_str("    let q_val = src_a[q_base + tid];\n\n");
+
+    // Online softmax accumulators
+    src.push_str("    var my_out = 0.0;\n");
+    src.push_str("    var max_score = -1e30;\n");
+    src.push_str("    var sum_exp = 0.0;\n\n");
+
+    // KV loop
+    src.push_str("    for (var t = 0u; t < kv_seq; t++) {\n");
+
+    // Causal mask check
+    if mask == AttentionMask::Causal {
+        src.push_str("        if t > pos { break; }\n");
+    }
+
+    src.push_str("        let k_base = t * kv_dim + kv_head_off;\n");
+    src.push_str("        wg_dot[tid] = q_val * src_b[k_base + tid];\n");
+    src.push_str("        tree_reduce(tid);\n");
+    src.push_str("        let score = wg_dot[0] * scale;\n\n");
+
+    // Online softmax update
+    src.push_str("        let new_max = max(max_score, score);\n");
+    src.push_str("        let correction = exp(max_score - new_max);\n");
+    src.push_str("        let weight = exp(score - new_max);\n");
+    src.push_str("        sum_exp = sum_exp * correction + weight;\n");
+    src.push_str("        my_out = my_out * correction + weight * bias[k_base + tid];\n");
+    src.push_str("        max_score = new_max;\n");
+    src.push_str("    }\n\n");
+
+    // Final output
+    src.push_str("    let safe_sum = select(sum_exp, 1.0, sum_exp == 0.0);\n");
+    src.push_str("    dst[q_base + tid] = my_out / safe_sum;\n");
+
+    // LSE output
+    if output_lse {
+        src.push_str("    if tid == 0u {\n");
+        src.push_str("        let idx = (pos * num_heads + head) * 2u;\n");
+        src.push_str("        lse[idx] = max_score;\n");
+        src.push_str("        lse[idx + 1u] = select(log(sum_exp), -1e30, sum_exp == 0.0);\n");
+        src.push_str("    }\n");
+    }
+
+    src.push_str("}\n");
+
+    let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
+        panic!(
+            "generated attention WGSL failed to parse:\n{}\n---\n{}",
+            e, src
+        )
+    });
+    ShaderModule {
+        module,
+        source: src,
+    }
+}
+
 fn per_row_binding_names(n: u8) -> Vec<String> {
     match n {
         0 => Vec::new(),
@@ -1158,6 +1305,75 @@ mod tests {
                 workgroup_size: 250, // not power of 2
             },
         });
+    }
+
+    // ---- Attention archetype ----
+
+    #[test]
+    fn attention_full_lowers() {
+        let sm = lower(&KernelTemplate::Attention {
+            mask: AttentionMask::None,
+            head_dim: 64,
+            output_lse: true,
+        });
+        assert!(sm.source.contains("var<storage> src_a: array<f32>;"));
+        assert!(
+            sm.source
+                .contains("var<storage, read_write> lse: array<f32>;")
+        );
+        assert!(sm.source.contains("inverseSqrt"));
+        assert!(sm.source.contains("tree_reduce(tid)"));
+        assert!(!sm.source.contains("if t > pos")); // no causal mask
+    }
+
+    #[test]
+    fn attention_causal_has_mask() {
+        let sm = lower(&KernelTemplate::Attention {
+            mask: AttentionMask::Causal,
+            head_dim: 64,
+            output_lse: false,
+        });
+        assert!(sm.source.contains("if t > pos { break; }"));
+        assert!(!sm.source.contains("var<storage, read_write> lse"));
+    }
+
+    #[test]
+    fn attention_naga_validates() {
+        use naga::valid::{Capabilities, ValidationFlags, Validator};
+        let flags = ValidationFlags::all() ^ ValidationFlags::BINDINGS;
+        let mut v = Validator::new(flags, Capabilities::all());
+        for (mask, lse) in [
+            (AttentionMask::None, true),
+            (AttentionMask::None, false),
+            (AttentionMask::Causal, true),
+            (AttentionMask::Causal, false),
+        ] {
+            let sm = lower(&KernelTemplate::Attention {
+                mask,
+                head_dim: 64,
+                output_lse: lse,
+            });
+            v.validate(&sm.module).unwrap_or_else(|e| {
+                panic!("attention naga validation failed: {:?}\n{}", e, sm.source);
+            });
+        }
+    }
+
+    #[test]
+    fn attention_small_head_dim() {
+        // head_dim=16 — smaller tree reduce.
+        let sm = lower(&KernelTemplate::Attention {
+            mask: AttentionMask::None,
+            head_dim: 16,
+            output_lse: true,
+        });
+        assert!(sm.source.contains("@compute @workgroup_size(16)"));
+
+        use naga::valid::{Capabilities, ValidationFlags, Validator};
+        let flags = ValidationFlags::all() ^ ValidationFlags::BINDINGS;
+        Validator::new(flags, Capabilities::all())
+            .validate(&sm.module)
+            .unwrap_or_else(|e| panic!("small head_dim invalid: {:?}\n{}", e, sm.source));
     }
 
     #[test]
