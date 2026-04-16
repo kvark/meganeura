@@ -122,29 +122,24 @@ fn diagnose(plan: &ExecutionPlan) -> Vec<Finding> {
 
     for (i, d) in plan.dispatches.iter().enumerate() {
         // Pattern 1: absorb-into-matmul epilogue.
-        if let Some(reason) = absorbable_into_matmul(d) {
-            if d.input_buffers.len() >= 1 {
-                let primary = d.input_buffers[0];
-                if !external.contains(&primary) {
-                    if let Some(&prod_i) = producer.get(&primary) {
-                        let prod = &plan.dispatches[prod_i];
-                        if is_scalar_matmul(prod)
-                            && consumers.get(&primary).map_or(0, |v| v.len()) == 1
-                        {
-                            out.push(Finding {
-                                kind: "matmul+elementwise epilogue not fused",
-                                producer_idx: prod_i,
-                                consumer_idx: i,
-                                note: format!(
-                                    "{} → {} ({})",
-                                    shader_name(&prod.shader),
-                                    shader_name(&d.shader),
-                                    reason
-                                ),
-                            });
-                        }
-                    }
-                }
+        if let Some(reason) = absorbable_into_matmul(d)
+            && let Some(&primary) = d.input_buffers.first()
+            && !external.contains(&primary)
+            && let Some(&prod_i) = producer.get(&primary)
+        {
+            let prod = &plan.dispatches[prod_i];
+            if is_scalar_matmul(prod) && consumers.get(&primary).map_or(0, |v| v.len()) == 1 {
+                out.push(Finding {
+                    kind: "matmul+elementwise epilogue not fused",
+                    producer_idx: prod_i,
+                    consumer_idx: i,
+                    note: format!(
+                        "{} → {} ({})",
+                        shader_name(&prod.shader),
+                        shader_name(&d.shader),
+                        reason
+                    ),
+                });
             }
         }
 
@@ -157,22 +152,17 @@ fn diagnose(plan: &ExecutionPlan) -> Vec<Finding> {
             && d.input_buffers.len() >= 2
         {
             for (slot_idx, in_buf) in d.input_buffers[..2].iter().enumerate() {
-                if let Some(&prod_i) = producer.get(in_buf) {
-                    if is_rms_norm(&plan.dispatches[prod_i])
-                        && consumers.get(in_buf).map_or(0, |v| v.len()) == 1
-                        && !external.contains(in_buf)
-                    {
-                        out.push(Finding {
-                            kind: "RmsNorm+MatMul not fused",
-                            producer_idx: prod_i,
-                            consumer_idx: i,
-                            note: format!(
-                                "RmsNorm → {} (slot {})",
-                                shader_name(&d.shader),
-                                slot_idx
-                            ),
-                        });
-                    }
+                if let Some(&prod_i) = producer.get(in_buf)
+                    && is_rms_norm(&plan.dispatches[prod_i])
+                    && consumers.get(in_buf).map_or(0, |v| v.len()) == 1
+                    && !external.contains(in_buf)
+                {
+                    out.push(Finding {
+                        kind: "RmsNorm+MatMul not fused",
+                        producer_idx: prod_i,
+                        consumer_idx: i,
+                        note: format!("RmsNorm → {} (slot {})", shader_name(&d.shader), slot_idx),
+                    });
                 }
             }
         }
@@ -180,29 +170,25 @@ fn diagnose(plan: &ExecutionPlan) -> Vec<Finding> {
         // Pattern 3: MatMul → (single consumer) Add/BiasAdd with a matmul-fused variant
         // already existing (FusedMatMulAdd). Count cases where this is being done in
         // two dispatches.
-        if matches!(d.shader, ShaderEntry::Add | ShaderEntry::BiasAdd) && d.pointwise.is_none()
-        // only if not already pointwise-fused
-        {
+        if matches!(d.shader, ShaderEntry::Add | ShaderEntry::BiasAdd) && d.pointwise.is_none() {
             for (slot_idx, in_buf) in d.input_buffers.iter().enumerate() {
-                if !external.contains(in_buf) {
-                    if let Some(&prod_i) = producer.get(in_buf) {
-                        if is_scalar_matmul(&plan.dispatches[prod_i])
-                            && consumers.get(in_buf).map_or(0, |v| v.len()) == 1
-                        {
-                            out.push(Finding {
-                                kind: "MatMul+Add candidate for FusedMatMulAdd",
-                                producer_idx: prod_i,
-                                consumer_idx: i,
-                                note: format!(
-                                    "{} → {} (producer at input slot {})",
-                                    shader_name(&plan.dispatches[prod_i].shader),
-                                    shader_name(&d.shader),
-                                    slot_idx
-                                ),
-                            });
-                            break;
-                        }
-                    }
+                if !external.contains(in_buf)
+                    && let Some(&prod_i) = producer.get(in_buf)
+                    && is_scalar_matmul(&plan.dispatches[prod_i])
+                    && consumers.get(in_buf).map_or(0, |v| v.len()) == 1
+                {
+                    out.push(Finding {
+                        kind: "MatMul+Add candidate for FusedMatMulAdd",
+                        producer_idx: prod_i,
+                        consumer_idx: i,
+                        note: format!(
+                            "{} → {} (producer at input slot {})",
+                            shader_name(&plan.dispatches[prod_i].shader),
+                            shader_name(&d.shader),
+                            slot_idx
+                        ),
+                    });
+                    break;
                 }
             }
         }
