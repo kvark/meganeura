@@ -99,6 +99,41 @@ pub fn epilogue_to_wgsl(epilogue: &[crate::compile::EpilogueOp]) -> (String, Str
     (decls.join("\n"), body.join("\n                "))
 }
 
+/// Generate WGSL for a [`MatMulEpilogue`] — the PointwiseDAG-based
+/// replacement for `epilogue_to_wgsl`. Returns (declarations, body).
+///
+/// The DAG's `LoadInput(0)` maps to `val` (the matmul accumulator).
+/// `LoadInput(1+)` maps to `epi_buf_{n}` indexed by either `idx`
+/// (per-element) or `col` (per-column broadcast) based on `EpilogueLoadKind`.
+pub fn matmul_epilogue_to_wgsl(epi: &crate::compile::MatMulEpilogue) -> (String, String) {
+    use crate::compile::EpilogueLoadKind;
+
+    let mut decls = Vec::new();
+    for (i, _) in epi.inputs.iter().enumerate() {
+        decls.push(format!("var<storage> epi_buf_{}: array<f32>;", i));
+    }
+
+    let body = epi.dag.emit_body(|idx| {
+        if idx == 0 {
+            "val".to_string()
+        } else {
+            let (_, ref kind) = epi.inputs[(idx - 1) as usize];
+            let index_var = match *kind {
+                EpilogueLoadKind::PerElement => "idx",
+                EpilogueLoadKind::PerCol => "col",
+            };
+            format!("epi_buf_{}[{}]", idx - 1, index_var)
+        }
+    });
+
+    // The DAG body emits `let v0 = ...; let v1 = ...; ...`. We need to
+    // assign the final value back to `val`.
+    let assign = format!("val = v{};", epi.dag.output);
+    let full_body = format!("{}\n                {}", body.trim_end(), assign);
+
+    (decls.join("\n"), full_body)
+}
+
 /// Generate a matmul shader module with a fused epilogue chain.
 ///
 /// Used by the runtime when a dispatch has a non-empty epilogue field.
@@ -109,6 +144,23 @@ pub fn generate_matmul_with_epilogue(
     epilogue: &[crate::compile::EpilogueOp],
 ) -> ShaderModule {
     let (epi_decl, epi_body) = epilogue_to_wgsl(epilogue);
+    generate_matmul_with_epilogue_wgsl(group, &epi_decl, &epi_body)
+}
+
+/// Same as above but from a [`MatMulEpilogue`] (PointwiseDAG-based).
+pub fn generate_matmul_with_dag_epilogue(
+    group: ShaderGroup,
+    epilogue: &crate::compile::MatMulEpilogue,
+) -> ShaderModule {
+    let (epi_decl, epi_body) = matmul_epilogue_to_wgsl(epilogue);
+    generate_matmul_with_epilogue_wgsl(group, &epi_decl, &epi_body)
+}
+
+fn generate_matmul_with_epilogue_wgsl(
+    group: ShaderGroup,
+    epi_decl: &str,
+    epi_body: &str,
+) -> ShaderModule {
     match group {
         ShaderGroup::MatMul => matmul_vars_epilogue(
             MATMUL_A_FWD,
@@ -119,8 +171,8 @@ pub fn generate_matmul_with_epilogue(
             B_COL_FWD,
             "",
             "",
-            &epi_decl,
-            &epi_body,
+            epi_decl,
+            epi_body,
         ),
         ShaderGroup::MatMulAdd => matmul_vars_epilogue(
             MATMUL_A_FWD,
@@ -131,8 +183,8 @@ pub fn generate_matmul_with_epilogue(
             B_COL_FWD,
             "var<storage> src: array<f32>;",
             " + src[idx]",
-            &epi_decl,
-            &epi_body,
+            epi_decl,
+            epi_body,
         ),
         ShaderGroup::MatMulAT => matmul_vars_epilogue(
             MATMUL_A_AT,
@@ -143,8 +195,8 @@ pub fn generate_matmul_with_epilogue(
             B_COL_FWD,
             "",
             "",
-            &epi_decl,
-            &epi_body,
+            epi_decl,
+            epi_body,
         ),
         ShaderGroup::MatMulBT => matmul_vars_epilogue(
             MATMUL_A_FWD,
@@ -155,8 +207,8 @@ pub fn generate_matmul_with_epilogue(
             B_COL_BT,
             "",
             "",
-            &epi_decl,
-            &epi_body,
+            epi_decl,
+            epi_body,
         ),
         ShaderGroup::MatMulATAdd => matmul_vars_epilogue(
             MATMUL_A_AT,
@@ -167,8 +219,8 @@ pub fn generate_matmul_with_epilogue(
             B_COL_FWD,
             "var<storage> src: array<f32>;",
             " + src[idx]",
-            &epi_decl,
-            &epi_body,
+            epi_decl,
+            epi_body,
         ),
         ShaderGroup::MatMulBTAdd => matmul_vars_epilogue(
             MATMUL_A_FWD,
@@ -179,8 +231,8 @@ pub fn generate_matmul_with_epilogue(
             B_COL_BT,
             "var<storage> src: array<f32>;",
             " + src[idx]",
-            &epi_decl,
-            &epi_body,
+            epi_decl,
+            epi_body,
         ),
         _ => panic!("epilogue fusion not supported for {:?}", group),
     }

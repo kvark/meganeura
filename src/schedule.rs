@@ -95,7 +95,7 @@ impl PointwiseDAG {
     /// `"src_a[i]"` for pointwise or `"src[row * inner + col]"` for
     /// reduction prologues. The indent and `let v{k} = ` prefix are
     /// emitted by this method.
-    fn emit_body(&self, load: impl Fn(u8) -> String) -> String {
+    pub fn emit_body(&self, load: impl Fn(u8) -> String) -> String {
         let mut out = String::new();
         for (k, op) in self.ops.iter().enumerate() {
             let _ = write!(out, "    let v{} = ", k);

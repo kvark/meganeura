@@ -719,13 +719,18 @@ fn fuse_epilogues(dispatches: &mut Vec<Dispatch>) {
         // an epilogue-supported op (Relu/Silu/Sigmoid/Neg — checked below
         // via `d.shader`, which we preserve as the sentinel entry). The
         // DAG field gets discarded along with the dispatch itself.
-        let (epilogue_op, primary_buf, extra_buf) = match d.shader {
-            ShaderEntry::Relu => (EpilogueOp::Relu, d.input_buffers[0], None),
-            ShaderEntry::Sigmoid => (EpilogueOp::Sigmoid, d.input_buffers[0], None),
-            ShaderEntry::Neg => (EpilogueOp::Neg, d.input_buffers[0], None),
-            ShaderEntry::Silu => (EpilogueOp::Silu, d.input_buffers[0], None),
+        // Map the consumed op to a PointwiseDAG single-op applied to val.
+        use crate::schedule::Pw;
+        let d_shader = d.shader.clone();
+        let pw_op = match d_shader {
+            ShaderEntry::Relu => Pw::Relu(0),
+            ShaderEntry::Sigmoid => Pw::Sigmoid(0),
+            ShaderEntry::Neg => Pw::Neg(0),
+            ShaderEntry::Silu => Pw::Silu(0),
             _ => continue,
         };
+        let primary_buf = d.input_buffers[0];
+        let elem_output = d.output_buffer;
 
         // The elementwise op reads from primary_buf. Find the matmul that produced it.
         let Some(&prod_idx) = producer.get(&primary_buf) else {
@@ -753,24 +758,47 @@ fn fuse_epilogues(dispatches: &mut Vec<Dispatch>) {
             continue;
         }
 
-        // The elementwise op must write to a different buffer (or same).
-        // We redirect the matmul to write directly to the elementwise output.
-        let elem_output = dispatches[i].output_buffer;
-
-        // Apply the fusion
-        let epi_buf_idx = dispatches[prod_idx].epilogue_buffers.len() as u8;
-        let op = match epilogue_op {
-            EpilogueOp::BiasAdd(_) => EpilogueOp::BiasAdd(epi_buf_idx),
-            EpilogueOp::Add(_) => EpilogueOp::Add(epi_buf_idx),
-            other => other,
-        };
-        dispatches[prod_idx].epilogue.push(op);
-        if let Some(buf) = extra_buf {
-            dispatches[prod_idx].epilogue_buffers.push(buf);
+        // Build or extend the MatMulEpilogue DAG on the producer.
+        if let Some(ref mut epi) = dispatches[prod_idx].matmul_epilogue {
+            // Chain: append the new op referencing the current output.
+            let prev_out = epi.dag.output;
+            epi.dag.ops.push(pw_op.clone());
+            // The new op's input index (0 in the single-op) needs to
+            // reference prev_out. Since pw_op was built with Pw::Relu(0)
+            // etc., the "0" refers to LoadInput(0). But we want it to
+            // refer to the PREVIOUS output. Adjust: replace the inner
+            // index with prev_out.
+            let last = epi.dag.ops.len() - 1;
+            epi.dag.ops[last] = match pw_op {
+                Pw::Relu(_) => Pw::Relu(prev_out),
+                Pw::Sigmoid(_) => Pw::Sigmoid(prev_out),
+                Pw::Neg(_) => Pw::Neg(prev_out),
+                Pw::Silu(_) => Pw::Silu(prev_out),
+                _ => unreachable!(),
+            };
+            epi.dag.output = last as u16;
+        } else {
+            // First epilogue op: create DAG with LoadInput(0) = val.
+            dispatches[prod_idx].matmul_epilogue = Some(MatMulEpilogue {
+                dag: PointwiseDAG {
+                    n_inputs: 1,
+                    ops: vec![Pw::LoadInput(0), pw_op],
+                    output: 1,
+                },
+                inputs: vec![],
+            });
         }
-        // Redirect matmul output to the elementwise op's output buffer
+        // Also maintain the legacy fields for backward compat.
+        let legacy_op = match d_shader {
+            ShaderEntry::Relu => EpilogueOp::Relu,
+            ShaderEntry::Sigmoid => EpilogueOp::Sigmoid,
+            ShaderEntry::Neg => EpilogueOp::Neg,
+            ShaderEntry::Silu => EpilogueOp::Silu,
+            _ => unreachable!(),
+        };
+        dispatches[prod_idx].epilogue.push(legacy_op);
+
         dispatches[prod_idx].output_buffer = elem_output;
-        // Update producer map
         producer.insert(elem_output, prod_idx);
 
         to_remove.push(i);
