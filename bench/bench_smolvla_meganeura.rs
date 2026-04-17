@@ -252,7 +252,33 @@ fn main() {
         if name.starts_with("vlm_kv_layer_") {
             continue;
         }
-        if transposed_set.contains(name.as_str()) {
+        // Handle concatenated weight names from SwiGLU fusion (e.g.
+        // "gate_proj.weight+up_proj.weight" → load both and concat).
+        if name.contains('+') {
+            let parts: Vec<&str> = name.split('+').collect();
+            let needs_transpose = parts.iter().any(|p| transposed_set.contains(*p));
+            let mut combined = Vec::new();
+            for part in &parts {
+                let data = model
+                    .tensor_f32_auto(part)
+                    .unwrap_or_else(|e| panic!("{}: {}", part, e));
+                combined.extend_from_slice(&data);
+            }
+            if needs_transpose {
+                let info0 = &model.tensor_info()[parts[0]];
+                let in_dim = info0.shape.last().copied().unwrap_or(1);
+                let out_total = combined.len() / in_dim;
+                let mut transposed = vec![0.0f32; combined.len()];
+                for r in 0..out_total {
+                    for c in 0..in_dim {
+                        transposed[c * out_total + r] = combined[r * in_dim + c];
+                    }
+                }
+                session.set_parameter(&name, &transposed);
+            } else {
+                session.set_parameter(&name, &combined);
+            }
+        } else if transposed_set.contains(name.as_str()) {
             let data = model
                 .tensor_f32_auto_transposed(&name)
                 .unwrap_or_else(|e| panic!("{}: {}", name, e));

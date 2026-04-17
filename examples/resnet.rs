@@ -83,6 +83,59 @@ fn main() {
 ///
 /// Since our graph expects `conv1.weight` (pre-fused) and `bn1.fused_bias`,
 /// we fuse at load time: W_fused = W * scale/sqrt(var+eps), b_fused = b - mean*w.
+/// Map torchvision ResNet names to HuggingFace transformers names.
+fn hf_name(torchvision_name: &str) -> String {
+    // Stem: conv1 → resnet.embedder.embedder.convolution
+    //       bn1  → resnet.embedder.embedder.normalization
+    if torchvision_name == "conv1.weight" {
+        return "resnet.embedder.embedder.convolution.weight".to_string();
+    }
+    if let Some(suffix) = torchvision_name.strip_prefix("bn1.") {
+        return format!("resnet.embedder.embedder.normalization.{suffix}");
+    }
+    // FC: fc.weight/bias → classifier.1.weight/bias
+    if let Some(suffix) = torchvision_name.strip_prefix("fc.") {
+        return format!("classifier.1.{suffix}");
+    }
+    // Blocks: layer{s}.{b}.conv{i}.weight → resnet.encoder.stages.{s-1}.layers.{b}.layer.{i-1}.convolution.weight
+    //         layer{s}.{b}.bn{i}.X        → resnet.encoder.stages.{s-1}.layers.{b}.layer.{i-1}.normalization.X
+    //         layer{s}.{b}.downsample.0.weight → resnet.encoder.stages.{s-1}.layers.{b}.shortcut.convolution.weight
+    //         layer{s}.{b}.downsample.1.X      → resnet.encoder.stages.{s-1}.layers.{b}.shortcut.normalization.X
+    if let Some(rest) = torchvision_name.strip_prefix("layer") {
+        let parts: Vec<&str> = rest.splitn(2, '.').collect();
+        if parts.len() == 2 {
+            let stage = parts[0].parse::<usize>().unwrap_or(1) - 1;
+            let remainder = parts[1]; // e.g. "0.conv1.weight" or "0.downsample.0.weight"
+            let block_parts: Vec<&str> = remainder.splitn(2, '.').collect();
+            if block_parts.len() == 2 {
+                let block = block_parts[0];
+                let field = block_parts[1]; // e.g. "conv1.weight" or "downsample.0.weight"
+                if let Some(suffix) = field.strip_prefix("conv") {
+                    // conv1.weight → layer.0.convolution.weight, conv2.weight → layer.1.convolution.weight
+                    let idx_rest: Vec<&str> = suffix.splitn(2, '.').collect();
+                    let layer_idx = idx_rest[0].parse::<usize>().unwrap_or(1) - 1;
+                    let attr = idx_rest.get(1).unwrap_or(&"weight");
+                    return format!("resnet.encoder.stages.{stage}.layers.{block}.layer.{layer_idx}.convolution.{attr}");
+                }
+                if let Some(suffix) = field.strip_prefix("bn") {
+                    let idx_rest: Vec<&str> = suffix.splitn(2, '.').collect();
+                    let layer_idx = idx_rest[0].parse::<usize>().unwrap_or(1) - 1;
+                    let attr = idx_rest.get(1).unwrap_or(&"weight");
+                    return format!("resnet.encoder.stages.{stage}.layers.{block}.layer.{layer_idx}.normalization.{attr}");
+                }
+                if let Some(suffix) = field.strip_prefix("downsample.0.") {
+                    return format!("resnet.encoder.stages.{stage}.layers.{block}.shortcut.convolution.{suffix}");
+                }
+                if let Some(suffix) = field.strip_prefix("downsample.1.") {
+                    return format!("resnet.encoder.stages.{stage}.layers.{block}.shortcut.normalization.{suffix}");
+                }
+            }
+        }
+    }
+    // Fallback: return as-is
+    torchvision_name.to_string()
+}
+
 fn load_resnet_weights(session: &mut meganeura::Session, model: &SafeTensorsModel, batch: u32) {
     let eps = 1e-5f32;
 
@@ -93,19 +146,28 @@ fn load_resnet_weights(session: &mut meganeura::Session, model: &SafeTensorsMode
                          bn_name: &str,
                          out_c: usize,
                          spatial: usize| {
-        let w = model.tensor_f32_auto(conv_name).expect(conv_name);
+        let hf_conv = hf_name(conv_name);
+        let w = model.tensor_f32_auto(&hf_conv).expect(conv_name);
         let scale = model
-            .tensor_f32_auto(&format!("{bn_name}.weight"))
+            .tensor_f32_auto(&hf_name(&format!("{bn_name}.weight")))
             .expect("bn weight");
         let bias = model
-            .tensor_f32_auto(&format!("{bn_name}.bias"))
+            .tensor_f32_auto(&hf_name(&format!("{bn_name}.bias")))
             .expect("bn bias");
         let mean = model
-            .tensor_f32_auto(&format!("{bn_name}.running_mean"))
+            .tensor_f32_auto(&hf_name(&format!("{bn_name}.running_mean")))
             .expect("bn mean");
         let var = model
-            .tensor_f32_auto(&format!("{bn_name}.running_var"))
+            .tensor_f32_auto(&hf_name(&format!("{bn_name}.running_var")))
             .expect("bn var");
+
+        // Infer kernel spatial size from weight tensor shape (Co, Ci, kH, kW)
+        let info = &model.tensor_info()[&hf_conv];
+        let kernel_hw = if info.shape.len() == 4 {
+            info.shape[2] * info.shape[3]
+        } else {
+            1
+        };
 
         let (w_fused, b_fused) = resnet::fuse_bn_into_conv(
             &w,
@@ -115,7 +177,7 @@ fn load_resnet_weights(session: &mut meganeura::Session, model: &SafeTensorsMode
             &var,
             eps,
             out_c,
-            0,
+            kernel_hw,
             batch as usize,
             0,
             spatial,
@@ -173,9 +235,11 @@ fn load_resnet_weights(session: &mut meganeura::Session, model: &SafeTensorsMode
 
     // FC layer (needs transposing: HF stores [out, in])
     let fc_w = model
-        .tensor_f32_auto_transposed("fc.weight")
+        .tensor_f32_auto_transposed(&hf_name("fc.weight"))
         .expect("fc weight");
     session.set_parameter("fc.weight", &fc_w);
-    let fc_b = model.tensor_f32_auto("fc.bias").expect("fc bias");
+    let fc_b = model
+        .tensor_f32_auto(&hf_name("fc.bias"))
+        .expect("fc bias");
     session.set_parameter("fc.bias", &fc_b);
 }

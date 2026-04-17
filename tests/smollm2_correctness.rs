@@ -29,8 +29,38 @@ fn load_weights(
     let transposed_set: HashSet<&str> = transposed.iter().map(|s| s.as_str()).collect();
 
     for (name, _) in session.plan().param_buffers.clone() {
-        // Skip fused parameters — auto-populated when source params are loaded
-        if !model.tensor_info().contains_key(&name) && name != "lm_head.weight" {
+        // Skip derived parameters not in model (except lm_head and concat names)
+        if !model.tensor_info().contains_key(&name)
+            && name != "lm_head.weight"
+            && !name.contains('+')
+        {
+            continue;
+        }
+        if name.contains('+') {
+            // Concatenated weights from SwiGLU fusion
+            let parts: Vec<&str> = name.split('+').collect();
+            let needs_transpose = parts.iter().any(|p| transposed_set.contains(*p));
+            let mut combined = Vec::new();
+            for part in &parts {
+                let data = model
+                    .tensor_f32_auto(part)
+                    .unwrap_or_else(|e| panic!("{part}: {e}"));
+                combined.extend_from_slice(&data);
+            }
+            if needs_transpose {
+                let info0 = &model.tensor_info()[parts[0]];
+                let in_dim = info0.shape.last().copied().unwrap_or(1);
+                let out_total = combined.len() / in_dim;
+                let mut transposed = vec![0.0f32; combined.len()];
+                for r in 0..out_total {
+                    for c in 0..in_dim {
+                        transposed[c * out_total + r] = combined[r * in_dim + c];
+                    }
+                }
+                session.set_parameter(&name, &transposed);
+            } else {
+                session.set_parameter(&name, &combined);
+            }
             continue;
         }
         if name == "lm_head.weight" {
