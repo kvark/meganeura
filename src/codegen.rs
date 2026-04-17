@@ -315,6 +315,7 @@ pub enum ShaderGroup {
     MultiHeadAttn,
     MultiHeadAttnGradQ,
     MultiHeadAttnGradK,
+    MultiHeadAttnGradKV,
     MultiHeadAttnGradV,
     SwiGLUGrad,
     SwiGLUConcat,
@@ -406,6 +407,9 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         }
         ShaderGroup::MultiHeadAttnGradQ => parse_wgsl(include_str!("shaders/mha_grad_q.wgsl")),
         ShaderGroup::MultiHeadAttnGradK => parse_wgsl(include_str!("shaders/mha_grad_k.wgsl")),
+        ShaderGroup::MultiHeadAttnGradKV => {
+            parse_wgsl(include_str!("shaders/mha_grad_kv.wgsl"))
+        }
         ShaderGroup::MultiHeadAttnGradV => parse_wgsl(include_str!("shaders/mha_grad_v.wgsl")),
         ShaderGroup::SwiGLUGrad => parse_wgsl(include_str!("shaders/swiglu_grad.wgsl")),
         ShaderGroup::SwiGLUConcat => parse_wgsl(include_str!("shaders/swiglu_concat.wgsl")),
@@ -1633,6 +1637,10 @@ mod tests {
                 naga::valid::Capabilities::empty(),
             ),
             (
+                ShaderGroup::MultiHeadAttnGradKV,
+                naga::valid::Capabilities::empty(),
+            ),
+            (
                 ShaderGroup::MultiHeadAttnGradV,
                 naga::valid::Capabilities::empty(),
             ),
@@ -1921,6 +1929,12 @@ mod tests {
                         "d_out", "src_a", "src_b", "bias", "lse", "fwd_dst", "dst", "params",
                     ]
                 }
+                ShaderEntry::MultiHeadAttnGradKV => {
+                    vec![
+                        "d_out", "src_a", "src_b", "bias", "lse", "fwd_dst", "dst", "dst2",
+                        "params",
+                    ]
+                }
                 // All three SwiGLUGrad entries share the same module globals
                 ShaderEntry::SwiGLUGradGate | ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => {
                     vec!["src_a", "src_b", "src_c", "dst", "params"]
@@ -2028,6 +2042,7 @@ mod tests {
             ShaderEntry::MultiHeadAttn,
             ShaderEntry::MultiHeadAttnGradQ,
             ShaderEntry::MultiHeadAttnGradK,
+            ShaderEntry::MultiHeadAttnGradKV,
             ShaderEntry::MultiHeadAttnGradV,
             ShaderEntry::SwiGLUGradGate,
             ShaderEntry::SwiGLUGradUp,

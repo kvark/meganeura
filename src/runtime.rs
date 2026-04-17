@@ -600,6 +600,20 @@ struct MultiHeadAttnGradData {
     params: AttentionGradParams,
 }
 
+// Fused GradK+GradV: outputs dK (dst) and dV (dst2)
+#[derive(blade_macros::ShaderData)]
+struct MultiHeadAttnGradKVData {
+    d_out: blade_graphics::BufferPiece,
+    src_a: blade_graphics::BufferPiece,
+    src_b: blade_graphics::BufferPiece,
+    bias: blade_graphics::BufferPiece,
+    lse: blade_graphics::BufferPiece,
+    fwd_dst: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    dst2: blade_graphics::BufferPiece,
+    params: AttentionGradParams,
+}
+
 // ---- Pipeline collection ----
 
 struct Pipelines {
@@ -964,6 +978,7 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::MultiHeadAttnGradQ
         | ShaderEntry::MultiHeadAttnGradK
         | ShaderEntry::MultiHeadAttnGradV => MultiHeadAttnGradData::layout(),
+        ShaderEntry::MultiHeadAttnGradKV => MultiHeadAttnGradKVData::layout(),
         ShaderEntry::SwiGLUGradGate => TernaryData::layout(),
         ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => BinaryData::layout(),
         ShaderEntry::RmsNormGradW
@@ -2472,6 +2487,31 @@ impl Session {
                             n: dispatch.params[1],
                             k: dispatch.params[2],
                             _pad: dispatch.params[3],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::MultiHeadAttnGradKV => {
+                pc.bind(
+                    0,
+                    &MultiHeadAttnGradKVData {
+                        d_out: buf(dispatch.input_buffers[0]),
+                        src_a: buf(dispatch.input_buffers[1]),
+                        src_b: buf(dispatch.input_buffers[2]),
+                        bias: buf(dispatch.input_buffers[3]),
+                        lse: buf(dispatch.input_buffers[4]),
+                        fwd_dst: buf(dispatch.input_buffers[5]),
+                        dst: buf(dispatch.output_buffer),
+                        dst2: buf(dispatch.extra_outputs[0]),
+                        params: AttentionGradParams {
+                            q_seq: dispatch.params[0],
+                            kv_seq: dispatch.params[1],
+                            packed_heads: dispatch.params[2],
+                            head_dim: dispatch.params[3],
+                            window_size: dispatch.params[4],
+                            _pad0: 0,
+                            _pad1: 0,
+                            _pad2: 0,
                         },
                     },
                 );
