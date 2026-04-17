@@ -1076,7 +1076,20 @@ impl<'a> Compiler<'a> {
                     continue;
                 }
             }
-            let size = node.ty.size_bytes();
+            // Loss ops output scalar [1] but the shader writes per-batch
+            // or per-workgroup partial losses. Allocate enough space for
+            // the shader; read_loss() sums all elements on the CPU side.
+            let size = match node.op {
+                Op::CrossEntropyLoss => {
+                    let batch = self.graph.node(node.inputs[0]).ty.shape[0];
+                    batch * 4
+                }
+                Op::BceLoss => {
+                    let n: usize = self.graph.node(node.inputs[0]).ty.shape.iter().product();
+                    n.div_ceil(256) * 4
+                }
+                _ => node.ty.size_bytes(),
+            };
             let buf = self.alloc_buffer(size);
             self.node_buffers.insert(node.id, buf);
 
