@@ -90,6 +90,24 @@ pub struct OptimizeReport {
     pub extract_time: std::time::Duration,
 }
 
+impl OptimizeReport {
+    /// An empty report, for code paths that skip optimization (e.g. a
+    /// cache hit) but still need to return a report.
+    pub fn empty() -> Self {
+        Self {
+            egglog_program: String::new(),
+            num_eclasses: 0,
+            num_enodes: 0,
+            rules_fired: Vec::new(),
+            nodes_before: 0,
+            nodes_after: 0,
+            fusions_applied: Vec::new(),
+            egglog_time: std::time::Duration::ZERO,
+            extract_time: std::time::Duration::ZERO,
+        }
+    }
+}
+
 impl fmt::Display for OptimizeReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "=== Optimization Report ===")?;

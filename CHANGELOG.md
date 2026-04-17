@@ -1,11 +1,16 @@
 # Unreleased
 
-- `Session::with_context(plan, Arc<Context>)` and matching
-  `build_session_on` / `build_inference_session_on` / `*_with`
-  helpers. Lets a host application (renderer, game) share a
-  single `blade_graphics::Context` with meganeura's training
-  and inference sessions instead of each side opening its own
-  device.
+- `Session::with_context(plan, Arc<Context>)` lets a host application
+  (renderer, game) share a single `blade_graphics::Context` with
+  meganeura's training and inference sessions instead of each side
+  opening its own device.
+- New unified entry point `build(graph, SessionConfig)` plus `Mode`
+  enum. Replaces the `build_session` / `build_session_with` /
+  `build_session_with_report` / `build_session_with_report_and_options`
+  / `build_session_cached` / `build_inference_session_with` family
+  with a single struct-parameterised call. Sugar functions
+  `build_session`, `build_inference_session` and
+  `build_session_unoptimized` remain for the common cases.
 
 # v0.2 (14 Apr 2026)
 

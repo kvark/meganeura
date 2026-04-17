@@ -42,10 +42,7 @@ pub use load::onnx::{OnnxError, OnnxModel, load_onnx, load_onnx_bytes};
 pub use optimize::OptimizeReport;
 pub use runtime::{MemorySummary, Session};
 pub use train::{
-    EpochStats, LossHistory, MetricCallback, Optimizer, StepMetrics, TrainConfig, TrainHistory,
-    Trainer, build_inference_session, build_inference_session_on,
-    build_inference_session_on_with, build_inference_session_with, build_session,
-    build_session_cached, build_session_on, build_session_on_with, build_session_unoptimized,
-    build_session_with, build_session_with_report, build_session_with_report_and_options,
-    compile_training_graph,
+    EpochStats, LossHistory, MetricCallback, Mode, Optimizer, SessionConfig, StepMetrics,
+    TrainConfig, TrainHistory, Trainer, build, build_inference_session, build_session,
+    build_session_unoptimized, compile_training_graph,
 };
