@@ -1791,9 +1791,9 @@ impl Graph {
         let l_shape = &self.node(logits).ty.shape;
         let t_shape = &self.node(labels).ty.shape;
         assert_eq!(l_shape, t_shape, "logits and labels must match");
-        // Per-batch losses, summed by read_loss() on CPU.
-        let batch = l_shape[0];
-        let ty = TensorType::f32(vec![batch]);
+        // Scalar output. The shader writes per-batch partial losses into an
+        // oversized buffer; read_loss() sums them on the CPU side.
+        let ty = TensorType::f32(vec![1]);
         self.add_node(Op::CrossEntropyLoss, vec![logits, labels], ty)
     }
 
@@ -1805,10 +1805,9 @@ impl Graph {
         let p_shape = &self.node(pred).ty.shape;
         let l_shape = &self.node(labels).ty.shape;
         assert_eq!(p_shape, l_shape, "pred and labels must match");
-        // Per-workgroup partial losses, summed by read_loss() on CPU.
-        let num_elements: usize = p_shape.iter().product();
-        let num_wgs = num_elements.div_ceil(256);
-        let ty = TensorType::f32(vec![num_wgs]);
+        // Scalar output. The shader writes per-workgroup partial losses
+        // into an oversized buffer; read_loss() sums them on the CPU side.
+        let ty = TensorType::f32(vec![1]);
         self.add_node(Op::BceLoss, vec![pred, labels], ty)
     }
 }
@@ -1930,7 +1929,7 @@ mod tests {
         let logits = g.input("logits", &[4, 10]);
         let labels = g.input("labels", &[4, 10]);
         let loss = g.cross_entropy_loss(logits, labels);
-        assert_eq!(g.node(loss).ty.shape, vec![4]);
+        assert_eq!(g.node(loss).ty.shape, vec![1]);
     }
 
     #[test]
