@@ -311,8 +311,10 @@ pub enum ShaderGroup {
     /// Flash Attention 2 forward: BQ>1 multi-query tiling with shared K staging.
     FlashAttention,
     MultiHeadAttnGradQ,
+    FlashGradQ,
     MultiHeadAttnGradK,
     MultiHeadAttnGradKV,
+    FlashGradKV,
     MultiHeadAttnGradV,
     SwiGLUGrad,
     SwiGLUConcat,
@@ -401,10 +403,12 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
             generate_flash_attention_module(64)
         }
         ShaderGroup::MultiHeadAttnGradQ => parse_wgsl(include_str!("shaders/mha_grad_q.wgsl")),
+        ShaderGroup::FlashGradQ => generate_flash_grad_q_module(64),
         ShaderGroup::MultiHeadAttnGradK => parse_wgsl(include_str!("shaders/mha_grad_k.wgsl")),
         ShaderGroup::MultiHeadAttnGradKV => {
             parse_wgsl(include_str!("shaders/mha_grad_kv.wgsl"))
         }
+        ShaderGroup::FlashGradKV => generate_flash_grad_kv_module(64),
         ShaderGroup::MultiHeadAttnGradV => parse_wgsl(include_str!("shaders/mha_grad_v.wgsl")),
         ShaderGroup::SwiGLUGrad => parse_wgsl(include_str!("shaders/swiglu_grad.wgsl")),
         ShaderGroup::SwiGLUConcat => parse_wgsl(include_str!("shaders/swiglu_concat.wgsl")),
@@ -1690,6 +1694,280 @@ pub fn generate_flash_attention_module(head_dim: u32) -> ShaderModule {
     }
 }
 
+/// Generate a Flash Attention 2 backward dQ kernel with BQ>1 multi-query tiling.
+///
+/// Same BQ grouping as the forward kernel. K is staged in shared memory
+/// and reused across BQ query groups. Each group independently computes
+/// row_sum = sum(dO * O), then loops over KV positions accumulating dQ.
+pub fn generate_flash_grad_q_module(head_dim: u32) -> ShaderModule {
+    use std::fmt::Write;
+    assert!(head_dim.is_power_of_two() && head_dim >= 2);
+
+    let hd = head_dim;
+    let bq: u32 = (256 / hd).max(1);
+    if bq <= 1 {
+        // Fall back to hand-written shader
+        return parse_wgsl(include_str!("shaders/mha_grad_q.wgsl"));
+    }
+    let wg_size = bq * hd;
+    let mut src = String::new();
+
+    // Params + bindings (match MultiHeadAttnGradData)
+    src.push_str("struct Params {\n    q_seq: u32,\n    kv_seq: u32,\n    packed_heads: u32,\n    head_dim: u32,\n    window_size: u32,\n    _pad0: u32,\n    _pad1: u32,\n    _pad2: u32,\n}\n\n");
+    src.push_str("var<storage> d_out: array<f32>;\n");
+    src.push_str("var<storage> src_a: array<f32>;\n"); // Q
+    src.push_str("var<storage> src_b: array<f32>;\n"); // K
+    src.push_str("var<storage> bias: array<f32>;\n"); // V (unused in dQ, but binding exists)
+    src.push_str("var<storage> lse: array<f32>;\n");
+    src.push_str("var<storage> fwd_dst: array<f32>;\n"); // O
+    src.push_str("var<storage, read_write> dst: array<f32>;\n"); // dQ
+    src.push_str("var<uniform> params: Params;\n\n");
+
+    // Shared memory
+    let _ = writeln!(src, "var<workgroup> shared_k: array<f32, {hd}>;"); // single K position
+    let _ = writeln!(src, "var<workgroup> wg_a: array<f32, {}>;\n", bq * hd); // Q·K
+    let _ = writeln!(src, "var<workgroup> wg_b: array<f32, {}>;\n", bq * hd); // dO·V
+
+    // Grouped dual tree_reduce
+    src.push_str("fn grouped_dual_reduce(tid: u32) {\n");
+    let _ = writeln!(src, "    let local = tid % {hd}u;");
+    let _ = writeln!(src, "    let base = (tid / {hd}u) * {hd}u;");
+    let mut stride = hd / 2;
+    while stride > 0 {
+        src.push_str("    workgroupBarrier();\n");
+        let _ = writeln!(src, "    if local < {stride}u {{ wg_a[base + local] += wg_a[base + local + {stride}u]; wg_b[base + local] += wg_b[base + local + {stride}u]; }}");
+        stride /= 2;
+    }
+    src.push_str("    workgroupBarrier();\n}\n\n");
+
+    // Single tree_reduce on wg_a (for row_sum)
+    src.push_str("fn grouped_reduce_a(tid: u32) {\n");
+    let _ = writeln!(src, "    let local = tid % {hd}u;");
+    let _ = writeln!(src, "    let base = (tid / {hd}u) * {hd}u;");
+    stride = hd / 2;
+    while stride > 0 {
+        src.push_str("    workgroupBarrier();\n");
+        let _ = writeln!(src, "    if local < {stride}u {{ wg_a[base + local] += wg_a[base + local + {stride}u]; }}");
+        stride /= 2;
+    }
+    src.push_str("    workgroupBarrier();\n}\n\n");
+
+    // Main kernel
+    let _ = writeln!(src, "@compute @workgroup_size({wg_size})");
+    src.push_str("fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n");
+    let _ = writeln!(src, "    let qi = lid.x / {hd}u;");
+    let _ = writeln!(src, "    let d = lid.x % {hd}u;");
+    let _ = writeln!(src, "    let pos = wgid.x * {bq}u + qi;");
+    src.push_str("    let head = wgid.y;\n");
+    src.push_str("    let q_seq = params.q_seq;\n");
+    src.push_str("    let kv_seq = params.kv_seq;\n");
+    src.push_str("    let num_heads = params.packed_heads >> 16u;\n");
+    src.push_str("    let num_kv_heads = params.packed_heads & 0xFFFFu;\n");
+    src.push_str("    let head_dim = params.head_dim;\n");
+    src.push_str("    let valid = pos < q_seq && head < num_heads;\n\n");
+
+    src.push_str("    let kv_head = head / (num_heads / max(num_kv_heads, 1u));\n");
+    src.push_str("    let kv_head_off = kv_head * head_dim;\n");
+    src.push_str("    let kv_dim = num_kv_heads * head_dim;\n");
+    src.push_str("    let scale = inverseSqrt(f32(head_dim));\n");
+    src.push_str("    var q_val = 0.0;\n    var do_val = 0.0;\n    var max_s = 0.0;\n    var log_sum = 0.0;\n    var q_base = 0u;\n");
+    src.push_str("    if valid {\n");
+    src.push_str("        q_base = pos * (num_heads * head_dim) + head * head_dim;\n");
+    src.push_str("        q_val = src_a[q_base + d];\n");
+    src.push_str("        do_val = d_out[q_base + d];\n");
+    src.push_str("        let lse_idx = (pos * num_heads + head) * 2u;\n");
+    src.push_str("        max_s = lse[lse_idx];\n");
+    src.push_str("        log_sum = lse[lse_idx + 1u];\n");
+    src.push_str("    }\n\n");
+
+    // row_sum = sum(dO * O)
+    let _ = writeln!(src, "    let grp = qi * {hd}u;");
+    src.push_str("    wg_a[grp + d] = select(0.0, do_val * fwd_dst[q_base + d], valid);\n");
+    src.push_str("    grouped_reduce_a(lid.x);\n");
+    src.push_str("    let row_sum = wg_a[grp];\n\n");
+
+    // Per-position KV range
+    src.push_str("    let my_kv_len = select(kv_seq, select(pos + 1u, 0u, !valid), kv_seq == 0u);\n");
+    src.push_str("    let window = params.window_size;\n");
+    src.push_str("    let my_kv_start = select(0u, my_kv_len - min(my_kv_len, window), window > 0u);\n");
+    // Workgroup-wide bounds
+    let _ = writeln!(src, "    let last_pos = min(wgid.x * {bq}u + {bq}u - 1u, q_seq - 1u);");
+    let _ = writeln!(src, "    let first_pos = wgid.x * {bq}u;");
+    src.push_str("    let max_kv_len = select(kv_seq, last_pos + 1u, kv_seq == 0u);\n");
+    src.push_str("    let first_kv_len = select(kv_seq, first_pos + 1u, kv_seq == 0u);\n");
+    src.push_str("    let min_kv_start = select(0u, first_kv_len - min(first_kv_len, window), window > 0u);\n\n");
+
+    src.push_str("    var my_dq = 0.0;\n\n");
+
+    // KV loop with shared K staging
+    src.push_str("    for (var t = min_kv_start; t < max_kv_len; t++) {\n");
+    // Load K into shared memory
+    let _ = writeln!(src, "        if lid.x < {hd}u {{");
+    src.push_str("            shared_k[lid.x] = src_b[t * kv_dim + kv_head_off + lid.x];\n");
+    src.push_str("        }\n");
+    src.push_str("        workgroupBarrier();\n\n");
+
+    // Grouped dual reduction: Q·K and dO·V
+    src.push_str("        wg_a[grp + d] = q_val * shared_k[d];\n");
+    src.push_str("        wg_b[grp + d] = do_val * bias[t * kv_dim + kv_head_off + d];\n");
+    src.push_str("        grouped_dual_reduce(lid.x);\n");
+    src.push_str("        let score = wg_a[grp] * scale;\n");
+    src.push_str("        let dp_t = wg_b[grp];\n\n");
+
+    // Per-position mask + accumulate
+    src.push_str("        if valid && t >= my_kv_start && t < my_kv_len {\n");
+    src.push_str("            let p_t = exp(min(score - max_s, 0.0) - log_sum);\n");
+    src.push_str("            let ds_t = p_t * (dp_t - row_sum);\n");
+    src.push_str("            my_dq += ds_t * scale * shared_k[d];\n");
+    src.push_str("        }\n");
+    src.push_str("        workgroupBarrier();\n");
+    src.push_str("    }\n\n");
+
+    src.push_str("    if valid {\n");
+    src.push_str("        dst[q_base + d] = my_dq;\n");
+    src.push_str("    }\n");
+    src.push_str("}\n");
+
+    let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
+        panic!("generated flash grad_q WGSL failed to parse:\n{}\n---\n{}", e, src)
+    });
+    ShaderModule { module, source: src }
+}
+
+/// Generate a Flash Attention 2 backward dK/dV kernel with BKV>1 tiling.
+///
+/// BKV = 256/head_dim KV positions per workgroup. Each group of head_dim
+/// threads handles one KV position. Q/dO/O values are staged in shared
+/// memory from the inner loop and reused across all BKV groups.
+pub fn generate_flash_grad_kv_module(head_dim: u32) -> ShaderModule {
+    use std::fmt::Write;
+    assert!(head_dim.is_power_of_two() && head_dim >= 2);
+
+    let hd = head_dim;
+    let bkv: u32 = (256 / hd).max(1);
+    if bkv <= 1 {
+        return parse_wgsl(include_str!("shaders/mha_grad_kv.wgsl"));
+    }
+    let wg_size = bkv * hd;
+    let mut src = String::new();
+
+    // Params + bindings (match MultiHeadAttnGradKVData)
+    src.push_str("struct Params {\n    q_seq: u32,\n    kv_seq: u32,\n    packed_heads: u32,\n    head_dim: u32,\n    window_size: u32,\n    _pad0: u32,\n    _pad1: u32,\n    _pad2: u32,\n}\n\n");
+    src.push_str("var<storage> d_out: array<f32>;\n");
+    src.push_str("var<storage> src_a: array<f32>;\n"); // Q
+    src.push_str("var<storage> src_b: array<f32>;\n"); // K
+    src.push_str("var<storage> bias: array<f32>;\n"); // V
+    src.push_str("var<storage> lse: array<f32>;\n");
+    src.push_str("var<storage> fwd_dst: array<f32>;\n"); // O
+    src.push_str("var<storage, read_write> dst: array<f32>;\n"); // dK
+    src.push_str("var<storage, read_write> dst2: array<f32>;\n"); // dV
+    src.push_str("var<uniform> params: Params;\n\n");
+
+    // Shared memory: Q, dO, O staged per Q position (shared across BKV groups)
+    let _ = writeln!(src, "var<workgroup> shared_q: array<f32, {hd}>;");
+    let _ = writeln!(src, "var<workgroup> shared_do: array<f32, {hd}>;");
+    let _ = writeln!(src, "var<workgroup> shared_o: array<f32, {hd}>;");
+    let _ = writeln!(src, "var<workgroup> wg_a: array<f32, {}>;\n", bkv * hd); // Q·K
+    let _ = writeln!(src, "var<workgroup> wg_b: array<f32, {}>;\n", bkv * hd); // dO·O
+    let _ = writeln!(src, "var<workgroup> wg_c: array<f32, {}>;\n", bkv * hd); // dO·V
+
+    // Grouped triple tree_reduce
+    src.push_str("fn grouped_triple_reduce(tid: u32) {\n");
+    let _ = writeln!(src, "    let local = tid % {hd}u;");
+    let _ = writeln!(src, "    let base = (tid / {hd}u) * {hd}u;");
+    let mut stride = hd / 2;
+    while stride > 0 {
+        src.push_str("    workgroupBarrier();\n");
+        let _ = writeln!(src, "    if local < {stride}u {{ wg_a[base + local] += wg_a[base + local + {stride}u]; wg_b[base + local] += wg_b[base + local + {stride}u]; wg_c[base + local] += wg_c[base + local + {stride}u]; }}");
+        stride /= 2;
+    }
+    src.push_str("    workgroupBarrier();\n}\n\n");
+
+    // Main kernel
+    let _ = writeln!(src, "@compute @workgroup_size({wg_size})");
+    src.push_str("fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n");
+    let _ = writeln!(src, "    let ki = lid.x / {hd}u;"); // KV position within tile
+    let _ = writeln!(src, "    let d = lid.x % {hd}u;");
+    let _ = writeln!(src, "    let t = wgid.x * {bkv}u + ki;"); // global KV position
+    src.push_str("    let kv_head = wgid.y;\n");
+    src.push_str("    let q_seq = params.q_seq;\n");
+    src.push_str("    let kv_seq = params.kv_seq;\n");
+    src.push_str("    let num_heads = params.packed_heads >> 16u;\n");
+    src.push_str("    let num_kv_heads = params.packed_heads & 0xFFFFu;\n");
+    src.push_str("    let head_dim = params.head_dim;\n\n");
+
+    src.push_str("    let effective_kv_seq = select(kv_seq, q_seq, kv_seq == 0u);\n");
+    src.push_str("    let valid = t < effective_kv_seq && kv_head < num_kv_heads;\n");
+    src.push_str("    let heads_per_kv = num_heads / max(num_kv_heads, 1u);\n");
+    src.push_str("    let kv_dim = num_kv_heads * head_dim;\n");
+    src.push_str("    let q_dim = num_heads * head_dim;\n");
+    src.push_str("    let kv_base = t * kv_dim + kv_head * head_dim;\n");
+    src.push_str("    let scale = inverseSqrt(f32(head_dim));\n");
+    src.push_str("    let k_val = select(0.0, src_b[kv_base + d], valid);\n\n");
+
+    src.push_str("    var my_dk = 0.0;\n");
+    src.push_str("    var my_dv = 0.0;\n\n");
+
+    // Q loop range: for causal, only positions >= t attend to KV position t
+    src.push_str("    let start_pos = select(0u, t, kv_seq == 0u);\n");
+    src.push_str("    let window = params.window_size;\n");
+    // For sliding window, position pos attends to KV pos t only if t >= pos+1-window, i.e. pos <= t+window-1
+    src.push_str("    let end_pos = select(q_seq, min(q_seq, t + window), window > 0u);\n\n");
+
+    // All groups must agree on the loop range for barriers
+    // start_pos depends on t (per-group for causal). Use min across groups.
+    let _ = writeln!(src, "    let first_t = wgid.x * {bkv}u;");
+    let _ = writeln!(src, "    let last_t = min(wgid.x * {bkv}u + {bkv}u - 1u, effective_kv_seq - 1u);");
+    src.push_str("    let wg_start = select(0u, first_t, kv_seq == 0u);\n");
+    src.push_str("    let wg_end = select(q_seq, min(q_seq, last_t + window), window > 0u);\n\n");
+
+    src.push_str("    for (var pos = wg_start; pos < wg_end; pos++) {\n");
+    src.push_str("        for (var head_rel = 0u; head_rel < heads_per_kv; head_rel++) {\n");
+    src.push_str("            let head = kv_head * heads_per_kv + head_rel;\n");
+    src.push_str("            let q_base = pos * q_dim + head * head_dim;\n\n");
+
+    // Stage Q, dO, O into shared memory (first hd threads load)
+    let _ = writeln!(src, "            if lid.x < {hd}u {{");
+    src.push_str("                shared_q[lid.x] = src_a[q_base + lid.x];\n");
+    src.push_str("                shared_do[lid.x] = d_out[q_base + lid.x];\n");
+    src.push_str("                shared_o[lid.x] = fwd_dst[q_base + lid.x];\n");
+    src.push_str("            }\n");
+    src.push_str("            workgroupBarrier();\n\n");
+
+    // Grouped triple reduction: Q·K, dO·O, dO·V
+    let _ = writeln!(src, "            let grp = ki * {hd}u;");
+    src.push_str("            wg_a[grp + d] = shared_q[d] * k_val;\n");
+    src.push_str("            wg_b[grp + d] = shared_do[d] * shared_o[d];\n");
+    src.push_str("            wg_c[grp + d] = shared_do[d] * select(0.0, bias[kv_base + d], valid);\n");
+    src.push_str("            grouped_triple_reduce(lid.x);\n\n");
+
+    // Per-position mask: does Q position `pos` attend to KV position `t`?
+    src.push_str("            if valid && pos >= start_pos && pos < end_pos {\n");
+    src.push_str("                let score = wg_a[grp] * scale;\n");
+    src.push_str("                let row_sum = wg_b[grp];\n");
+    src.push_str("                let dp_t = wg_c[grp];\n");
+    src.push_str("                let lse_idx = (pos * num_heads + head) * 2u;\n");
+    src.push_str("                let p_t = exp(min(score - lse[lse_idx], 0.0) - lse[lse_idx + 1u]);\n");
+    src.push_str("                let ds_t = p_t * (dp_t - row_sum);\n");
+    src.push_str("                my_dk += ds_t * scale * shared_q[d];\n");
+    src.push_str("                my_dv += p_t * shared_do[d];\n");
+    src.push_str("            }\n");
+    src.push_str("            workgroupBarrier();\n");
+    src.push_str("        }\n");
+    src.push_str("    }\n\n");
+
+    src.push_str("    if valid {\n");
+    src.push_str("        dst[kv_base + d] = my_dk;\n");
+    src.push_str("        dst2[kv_base + d] = my_dv;\n");
+    src.push_str("    }\n");
+    src.push_str("}\n");
+
+    let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
+        panic!("generated flash grad_kv WGSL failed to parse:\n{}\n---\n{}", e, src)
+    });
+    ShaderModule { module, source: src }
+}
+
 fn gen_conv2d_gemm_coop() -> ShaderModule {
     let default_config = CoopConfig {
         tile_size: 16,
@@ -1968,11 +2246,19 @@ mod tests {
                 naga::valid::Capabilities::empty(),
             ),
             (
+                ShaderGroup::FlashGradQ,
+                naga::valid::Capabilities::empty(),
+            ),
+            (
                 ShaderGroup::MultiHeadAttnGradK,
                 naga::valid::Capabilities::empty(),
             ),
             (
                 ShaderGroup::MultiHeadAttnGradKV,
+                naga::valid::Capabilities::empty(),
+            ),
+            (
+                ShaderGroup::FlashGradKV,
                 naga::valid::Capabilities::empty(),
             ),
             (
@@ -2257,13 +2543,14 @@ mod tests {
                     vec!["src_a", "src_b", "bias", "dst", "lse", "params"]
                 }
                 ShaderEntry::MultiHeadAttnGradQ
+                | ShaderEntry::FlashGradQ
                 | ShaderEntry::MultiHeadAttnGradK
                 | ShaderEntry::MultiHeadAttnGradV => {
                     vec![
                         "d_out", "src_a", "src_b", "bias", "lse", "fwd_dst", "dst", "params",
                     ]
                 }
-                ShaderEntry::MultiHeadAttnGradKV => {
+                ShaderEntry::MultiHeadAttnGradKV | ShaderEntry::FlashGradKV => {
                     vec![
                         "d_out", "src_a", "src_b", "bias", "lse", "fwd_dst", "dst", "dst2",
                         "params",
@@ -2371,8 +2658,10 @@ mod tests {
             ShaderEntry::MultiHeadAttn,
             ShaderEntry::FlashAttention,
             ShaderEntry::MultiHeadAttnGradQ,
+            ShaderEntry::FlashGradQ,
             ShaderEntry::MultiHeadAttnGradK,
             ShaderEntry::MultiHeadAttnGradKV,
+            ShaderEntry::FlashGradKV,
             ShaderEntry::MultiHeadAttnGradV,
             ShaderEntry::SwiGLUGradGate,
             ShaderEntry::SwiGLUGradUp,

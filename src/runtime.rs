@@ -626,8 +626,13 @@ impl Pipelines {
                 .or_default()
                 .insert(dispatch.shader.clone());
             // Attention dispatches store head_dim at params[3].
-            if (group == ShaderGroup::MultiHeadAttn || group == ShaderGroup::FlashAttention)
-                && dispatch.params.len() >= 4
+            if matches!(
+                group,
+                ShaderGroup::MultiHeadAttn
+                    | ShaderGroup::FlashAttention
+                    | ShaderGroup::FlashGradQ
+                    | ShaderGroup::FlashGradKV
+            ) && dispatch.params.len() >= 4
             {
                 attention_head_dim = Some(dispatch.params[3]);
             }
@@ -715,15 +720,26 @@ impl Pipelines {
         for &group in &needed {
             if small_tile_groups.contains(&group) {
                 compile_group(group, &mut small_map);
-            } else if group == ShaderGroup::MultiHeadAttn
-                || group == ShaderGroup::FlashAttention
-            {
+            } else if matches!(
+                group,
+                ShaderGroup::MultiHeadAttn
+                    | ShaderGroup::FlashAttention
+                    | ShaderGroup::FlashGradQ
+                    | ShaderGroup::FlashGradKV
+            ) {
                 // Use parameterized attention generators with actual head_dim.
                 let hd = attention_head_dim.unwrap_or(64);
-                let sm = if group == ShaderGroup::FlashAttention {
-                    crate::codegen::generate_flash_attention_module(hd)
-                } else {
-                    crate::codegen::generate_attention_module(hd)
+                let sm = match group {
+                    ShaderGroup::FlashAttention => {
+                        crate::codegen::generate_flash_attention_module(hd)
+                    }
+                    ShaderGroup::FlashGradQ => {
+                        crate::codegen::generate_flash_grad_q_module(hd)
+                    }
+                    ShaderGroup::FlashGradKV => {
+                        crate::codegen::generate_flash_grad_kv_module(hd)
+                    }
+                    _ => crate::codegen::generate_attention_module(hd),
                 };
                 let shader = gpu.create_shader(bg::ShaderDesc {
                     source: &sm.source,
@@ -971,9 +987,12 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::LayerNorm => LayerNormData::layout(),
         ShaderEntry::MultiHeadAttn | ShaderEntry::FlashAttention => MultiHeadAttnData::layout(),
         ShaderEntry::MultiHeadAttnGradQ
+        | ShaderEntry::FlashGradQ
         | ShaderEntry::MultiHeadAttnGradK
         | ShaderEntry::MultiHeadAttnGradV => MultiHeadAttnGradData::layout(),
-        ShaderEntry::MultiHeadAttnGradKV => MultiHeadAttnGradKVData::layout(),
+        ShaderEntry::MultiHeadAttnGradKV | ShaderEntry::FlashGradKV => {
+            MultiHeadAttnGradKVData::layout()
+        }
         ShaderEntry::SwiGLUGradGate => TernaryData::layout(),
         ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => BinaryData::layout(),
         ShaderEntry::RmsNormGradW
@@ -2486,7 +2505,7 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::MultiHeadAttnGradKV => {
+            ShaderEntry::MultiHeadAttnGradKV | ShaderEntry::FlashGradKV => {
                 pc.bind(
                     0,
                     &MultiHeadAttnGradKVData {
@@ -2512,6 +2531,7 @@ impl Session {
                 );
             }
             ShaderEntry::MultiHeadAttnGradQ
+            | ShaderEntry::FlashGradQ
             | ShaderEntry::MultiHeadAttnGradK
             | ShaderEntry::MultiHeadAttnGradV => {
                 pc.bind(

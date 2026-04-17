@@ -83,9 +83,11 @@ pub enum ShaderEntry {
     /// Flash Attention 2 forward: BQ>1 multi-query tiling.
     FlashAttention,
     MultiHeadAttnGradQ,
+    FlashGradQ,
     MultiHeadAttnGradK,
     MultiHeadAttnGradV,
     MultiHeadAttnGradKV,
+    FlashGradKV,
     SwiGLUGradGate,
     SwiGLUGradUp,
     SiluGrad,
@@ -174,8 +176,10 @@ impl ShaderEntry {
             ShaderEntry::MultiHeadAttn => ShaderGroup::MultiHeadAttn,
             ShaderEntry::FlashAttention => ShaderGroup::FlashAttention,
             ShaderEntry::MultiHeadAttnGradQ => ShaderGroup::MultiHeadAttnGradQ,
+            ShaderEntry::FlashGradQ => ShaderGroup::FlashGradQ,
             ShaderEntry::MultiHeadAttnGradK => ShaderGroup::MultiHeadAttnGradK,
             ShaderEntry::MultiHeadAttnGradKV => ShaderGroup::MultiHeadAttnGradKV,
+            ShaderEntry::FlashGradKV => ShaderGroup::FlashGradKV,
             ShaderEntry::MultiHeadAttnGradV => ShaderGroup::MultiHeadAttnGradV,
             ShaderEntry::SwiGLUGradGate | ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => {
                 ShaderGroup::SwiGLUGrad
@@ -264,9 +268,11 @@ impl ShaderEntry {
             ShaderEntry::MultiHeadAttn
             | ShaderEntry::FlashAttention
             | ShaderEntry::MultiHeadAttnGradQ
+            | ShaderEntry::FlashGradQ
             | ShaderEntry::MultiHeadAttnGradK
             | ShaderEntry::MultiHeadAttnGradV
-            | ShaderEntry::MultiHeadAttnGradKV => "main",
+            | ShaderEntry::MultiHeadAttnGradKV
+            | ShaderEntry::FlashGradKV => "main",
             ShaderEntry::SwiGLUGradGate => "swiglu_grad_gate",
             ShaderEntry::SwiGLUGradUp => "swiglu_grad_up",
             ShaderEntry::SiluGrad => "silu_grad",
@@ -2566,9 +2572,15 @@ impl<'a> Compiler<'a> {
                     Op::SlidingWindowAttention { window_size, .. } => window_size,
                     _ => 0,
                 };
+                let (grad_q_shader, grad_q_wgs) =
+                    Self::attention_dispatch(q_seq, head_dim, num_heads);
+                let grad_q_shader = match grad_q_shader {
+                    ShaderEntry::FlashAttention => ShaderEntry::FlashGradQ,
+                    _ => ShaderEntry::MultiHeadAttnGradQ,
+                };
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::MultiHeadAttnGradQ,
-                    workgroups: [q_seq, num_heads, 1],
+                    shader: grad_q_shader,
+                    workgroups: grad_q_wgs,
                     input_buffers: vec![d_out, q, k, v, lse_buf, fwd_o],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
@@ -2623,9 +2635,15 @@ impl<'a> Compiler<'a> {
                     self.graph.node(node.inputs[3]).ty.size_bytes(),
                 );
                 self.fused_grad_kv_dv.insert(fwd_node, dv_buf);
+                let (grad_kv_shader, grad_kv_wgs) =
+                    Self::attention_dispatch(dispatch_kv, head_dim, num_kv_heads);
+                let grad_kv_shader = match grad_kv_shader {
+                    ShaderEntry::FlashAttention => ShaderEntry::FlashGradKV,
+                    _ => ShaderEntry::MultiHeadAttnGradKV,
+                };
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::MultiHeadAttnGradKV,
-                    workgroups: [dispatch_kv, num_kv_heads, 1],
+                    shader: grad_kv_shader,
+                    workgroups: grad_kv_wgs,
                     input_buffers: vec![d_out, q, k, v, lse_buf, fwd_o],
                     output_buffer: out_buf,
                     extra_outputs: vec![dv_buf],
