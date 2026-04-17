@@ -105,4 +105,4 @@ Open the trace in [Perfetto](https://ui.perfetto.dev):
 
 ## Contributing
 
-Early project, small API surface, small community — a good time to show up. Open an issue before starting anything sizeable so we can align on direction. See [`PLAN.md`](https://github.com/kvark/meganeura/blob/main/PLAN.md) for the short list of things needing attention.
+Early project, small API surface, small community — a good time to show up. Open an issue before starting anything sizeable so we can align on direction.
