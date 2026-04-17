@@ -43,7 +43,9 @@ pub use optimize::OptimizeReport;
 pub use runtime::{MemorySummary, Session};
 pub use train::{
     EpochStats, LossHistory, MetricCallback, Optimizer, StepMetrics, TrainConfig, TrainHistory,
-    Trainer, build_inference_session, build_inference_session_with, build_session,
-    build_session_cached, build_session_unoptimized, build_session_with, build_session_with_report,
-    build_session_with_report_and_options, compile_training_graph,
+    Trainer, build_inference_session, build_inference_session_on,
+    build_inference_session_on_with, build_inference_session_with, build_session,
+    build_session_cached, build_session_on, build_session_on_with, build_session_unoptimized,
+    build_session_with, build_session_with_report, build_session_with_report_and_options,
+    compile_training_graph,
 };

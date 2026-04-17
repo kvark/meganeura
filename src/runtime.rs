@@ -1,5 +1,6 @@
 use crate::compile::{BufferRef, Dispatch, ExecutionPlan, ShaderEntry};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 type Gpu = blade_graphics::Context;
 
@@ -1091,7 +1092,7 @@ fn compute_groups(dispatches: &[Dispatch]) -> Vec<std::ops::Range<usize>> {
 /// Holds all blade-graphics resources: context, buffers, pipelines.
 /// Calling `step()` replays the pre-compiled dispatch sequence.
 pub struct Session {
-    gpu: Gpu,
+    gpu: Arc<Gpu>,
     buffers: Vec<blade_graphics::Buffer>,
     pipelines: Pipelines,
     plan: ExecutionPlan,
@@ -1277,6 +1278,10 @@ impl Session {
     }
 
     /// Create a session from a compiled execution plan.
+    ///
+    /// Initializes a fresh `blade_graphics::Context` owned by this session.
+    /// Use [`Session::with_context`] to share a context with an existing
+    /// Blade-based renderer.
     pub fn new(plan: ExecutionPlan) -> Self {
         // Safety: we only create one GPU context per session, and the
         // context is used exclusively through this Session.
@@ -1294,6 +1299,18 @@ impl Session {
         }
         .expect("failed to initialize blade GPU context");
 
+        Self::with_context(plan, Arc::new(gpu))
+    }
+
+    /// Create a session that reuses an externally-owned Blade GPU context.
+    ///
+    /// Intended for embedding: a host application (renderer, game) creates
+    /// the `blade_graphics::Context`, wraps it in `Arc`, and hands a clone
+    /// to meganeura. Both sides share the same device and queue. The
+    /// session destroys only the resources it allocated — buffers,
+    /// pipelines, the command encoder — on drop; the context is released
+    /// once the last `Arc` clone is dropped.
+    pub fn with_context(plan: ExecutionPlan, gpu: Arc<Gpu>) -> Self {
         let coop_caps = gpu.capabilities().cooperative_matrix;
         let coop_config = Self::select_coop_config(&coop_caps)
             .filter(|config| Self::test_coop_matmul(&gpu, config));
@@ -1559,6 +1576,15 @@ impl Session {
     /// *next* `step()` to see per-pass timings from the profiled run.
     pub fn set_profiling(&mut self, enabled: bool) {
         self.profiling = enabled;
+    }
+
+    /// Shared handle to the underlying Blade GPU context.
+    ///
+    /// Cheap to clone — the context stays alive as long as any `Arc`
+    /// reference remains. Useful for wiring a renderer onto the same
+    /// device after meganeura has created the context via [`Session::new`].
+    pub fn context(&self) -> Arc<blade_graphics::Context> {
+        self.gpu.clone()
     }
 
     /// Upload parameter data to GPU buffers.
