@@ -18,6 +18,13 @@ use std::{fmt, time::Instant};
 // ---------------------------------------------------------------------------
 
 /// Cost model that prefers fused kernels over unfused sequences.
+///
+/// All non-leaf, non-fused ops have the same base cost (10). This ensures
+/// the extractor only changes its choice vs AST-size when there is an
+/// actual fusion opportunity (fused ops cost 9, saving 10+10=20 → 9).
+/// Equal base costs prevent false preferences between equivalent
+/// expressions that differ only in op ordering — avoiding FP rounding
+/// changes that don't improve performance.
 struct FusionCostModel;
 
 impl egglog::extract::CostModel<u64> for FusionCostModel {
@@ -31,39 +38,24 @@ impl egglog::extract::CostModel<u64> for FusionCostModel {
         func: &egglog::Function,
         _row: &egglog::FunctionRow,
     ) -> u64 {
-        // Assign costs by constructor name. Higher = more expensive =
-        // less preferred by the extractor. Fused ops are cheaper than
-        // their unfused equivalents.
         match func.name() {
             // Leaf nodes are free — they exist regardless.
             "Input" | "Parameter" | "Const" => 0,
-            // Identity / shape-only ops: near-free.
-            "Identity" | "Transpose" => 1,
-            // Pointwise unary: cheap (one buffer read + write).
-            "Relu" | "Sigmoid" | "Tanh" | "Neg" | "Abs" | "Log" | "Recip" | "Silu" | "Gelu" => 5,
-            // Pointwise binary: same cost envelope as unary.
-            "Add" | "Mul" | "Greater" | "BiasAdd" => 5,
-            // Reductions: moderate (read full input, write reduced output).
-            "SumAll" | "MeanAll" | "SumRows" | "Softmax" | "LogSoftmax" => 10,
-            // Norms: reduction + per-element write-back.
-            "RmsNorm" | "LayerNorm" | "GroupNorm" | "GroupNormSilu" => 15,
-            // MatMul: expensive (reads A+B, writes C).
-            "MatMul" | "MatMulAT" | "MatMulBT" => 50,
-            // Fused MatMul+Add: saves one Add dispatch + intermediate buffer.
-            "FusedMatMulAdd" | "FusedMatMulATAdd" | "FusedMatMulBTAdd" => 45,
-            // Fused RmsNorm+MatMul: saves one RmsNorm dispatch.
-            "FusedRmsNormMatMul" => 40,
-            // SwiGLU variants.
-            "SwiGLU" => 8,
-            "SwiGLUConcat" => 7, // fused gate+up → slightly cheaper
-            // Attention: expensive but self-contained.
-            "CausalAttention" | "FullAttention" | "CrossAttention" | "MultiHeadAttn" => 100,
-            // Conv2d variants.
-            "Conv2d" => 80,
-            "WinogradConv2d" => 60, // cheaper compute, more memory
-            // Gradient ops — cost doesn't matter for extraction since
-            // gradients aren't rewritten, but assign reasonable values.
-            _ => 20,
+            // Identity: no dispatch, just aliasing.
+            "Identity" => 0,
+            // Fused ops: cheaper than the sum of their unfused equivalents.
+            // FusedMatMulAdd replaces MatMul(10) + Add(10) = 20 with one op.
+            "FusedMatMulAdd" | "FusedMatMulATAdd" | "FusedMatMulBTAdd" => 9,
+            // FusedRmsNormMatMul replaces RmsNorm(10) + MatMul(10) = 20.
+            "FusedRmsNormMatMul" => 9,
+            // SwiGLUConcat replaces SwiGLU(10) with a fused variant.
+            "SwiGLUConcat" => 9,
+            // WinogradConv2d replaces Conv2d(10) with fewer FLOPs.
+            "WinogradConv2d" => 9,
+            // Everything else: uniform base cost. This matches AST-size
+            // tie-breaking for non-fused expressions, preventing spurious
+            // changes to gradient computation order.
+            _ => 10,
         }
     }
 }
@@ -224,8 +216,9 @@ pub fn optimize_with_report(graph: &Graph) -> (Graph, OptimizeReport) {
             egglog_ok = true;
 
             // Step 6: programmatic extraction with FusionCostModel.
-            // Use egglog's extract_value_with_cost_model API to apply
-            // HBM-traffic-aware costs instead of default AST-size.
+            // Fused ops cost 9 vs base cost 10 per op, so the extractor
+            // prefers fused kernels. All non-fused ops share the same
+            // base cost to avoid changing tie-breaking vs AST-size.
             for &out_id in graph.outputs() {
                 if matches!(graph.node(out_id).op, Op::Nop) {
                     continue;
