@@ -88,6 +88,7 @@ pub enum ShaderEntry {
     MultiHeadAttnGradQ,
     MultiHeadAttnGradK,
     MultiHeadAttnGradV,
+    MultiHeadAttnGradKV,
     SwiGLUGradGate,
     SwiGLUGradUp,
     SiluGrad,
@@ -181,6 +182,7 @@ impl ShaderEntry {
             ShaderEntry::MultiHeadAttn => ShaderGroup::MultiHeadAttn,
             ShaderEntry::MultiHeadAttnGradQ => ShaderGroup::MultiHeadAttnGradQ,
             ShaderEntry::MultiHeadAttnGradK => ShaderGroup::MultiHeadAttnGradK,
+            ShaderEntry::MultiHeadAttnGradKV => ShaderGroup::MultiHeadAttnGradKV,
             ShaderEntry::MultiHeadAttnGradV => ShaderGroup::MultiHeadAttnGradV,
             ShaderEntry::SwiGLUGradGate | ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => {
                 ShaderGroup::SwiGLUGrad
@@ -274,7 +276,8 @@ impl ShaderEntry {
             ShaderEntry::MultiHeadAttn
             | ShaderEntry::MultiHeadAttnGradQ
             | ShaderEntry::MultiHeadAttnGradK
-            | ShaderEntry::MultiHeadAttnGradV => "main",
+            | ShaderEntry::MultiHeadAttnGradV
+            | ShaderEntry::MultiHeadAttnGradKV => "main",
             ShaderEntry::SwiGLUGradGate => "swiglu_grad_gate",
             ShaderEntry::SwiGLUGradUp => "swiglu_grad_up",
             ShaderEntry::SiluGrad => "silu_grad",
@@ -1039,6 +1042,11 @@ struct Compiler<'a> {
     /// Map from NodeId → BufferRef for each node's output.
     node_buffers: HashMap<NodeId, BufferRef>,
     options: CompileOptions,
+    /// Fused GradKV: maps fwd_node → pre-allocated dV buffer.
+    /// When GradK is compiled, it emits a fused GradKV dispatch and
+    /// pre-allocates the dV buffer here. When GradV is later compiled
+    /// for the same fwd_node, it reuses this buffer and skips dispatching.
+    fused_grad_kv_dv: HashMap<NodeId, BufferRef>,
 }
 
 impl<'a> Compiler<'a> {
@@ -1046,8 +1054,8 @@ impl<'a> Compiler<'a> {
         Self {
             graph,
             plan: ExecutionPlan {
-                buffers: Vec::new(),
-                param_buffers: Vec::new(),
+                buffers: vec![],
+                param_buffers: vec![],
                 input_buffers: Vec::new(),
                 constant_buffers: Vec::new(),
                 dispatches: Vec::new(),
@@ -1059,6 +1067,7 @@ impl<'a> Compiler<'a> {
             },
             node_buffers: HashMap::new(),
             options,
+            fused_grad_kv_dv: HashMap::new(),
         }
     }
 
@@ -2601,12 +2610,19 @@ impl<'a> Compiler<'a> {
                     _ => 0,
                 };
                 let dispatch_kv = if is_causal { q_seq } else { kv_seq };
+
+                // Fused GradKV: pre-allocate dV buffer. When GradV is later
+                // compiled for the same fwd_node, it reuses this buffer.
+                let dv_buf = self.alloc_buffer(
+                    self.graph.node(node.inputs[3]).ty.size_bytes(),
+                );
+                self.fused_grad_kv_dv.insert(fwd_node, dv_buf);
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::MultiHeadAttnGradK,
+                    shader: ShaderEntry::MultiHeadAttnGradKV,
                     workgroups: [dispatch_kv, num_kv_heads, 1],
                     input_buffers: vec![d_out, q, k, v, lse_buf, fwd_o],
                     output_buffer: out_buf,
-                    extra_outputs: vec![],
+                    extra_outputs: vec![dv_buf],
                     params: vec![
                         q_seq,
                         kv_seq,
@@ -2627,6 +2643,14 @@ impl<'a> Compiler<'a> {
                 head_dim,
                 ..
             } => {
+                // If fused GradKV already computed dV, just reuse its buffer.
+                if let Some(&dv_buf) = self.fused_grad_kv_dv.get(&fwd_node) {
+                    // Point this node's output to the pre-allocated dV buffer.
+                    // No dispatch needed — dV was already written by GradKV.
+                    self.node_buffers.insert(node.id, dv_buf);
+                    return;
+                }
+                // Fallback: separate GradV dispatch (shouldn't happen normally).
                 let d_out = self.get_buffer(node.inputs[0]);
                 let q = self.get_buffer(node.inputs[1]);
                 let k = self.get_buffer(node.inputs[2]);

@@ -83,3 +83,23 @@ K-tile iterations.
 **Root cause:** The bottleneck is memory staging, not compute. Both
 coop and scalar spend ~99% of time on staging. Tensor cores reduce the
 remaining 1% compute, which slightly helps overall throughput.
+
+## Fused GradQ via atomic f32 CAS (FA2 full backward)
+
+**Idea:** Extend the fused GradKV kernel to also compute dQ by
+atomically accumulating dQ contributions across workgroups using
+`atomicCompareExchangeWeak` (emulated f32 atomic add via u32 CAS).
+
+**Result:** SmolVLA training went from 20ms to 23ms — *slower*.
+For causal attention with seq=50, up to 50 KV-position workgroups
+write to the same dQ element concurrently. The CAS loop retries
+~50 times per element on average, making the atomic accumulation
+much more expensive than a separate GradQ dispatch.
+
+**Root cause:** Vulkan/WGSL doesn't expose native f32 atomicAdd.
+The CAS-based emulation has O(contention²) cost. NVIDIA hardware
+supports native f32 atomicAdd, but it's only accessible via CUDA.
+
+**When it would help:** If naga adds subgroup operations (issue #5555),
+dQ could be accumulated within a warp first, reducing contention by 32×.
+Or with native f32 atomicAdd exposure through a Vulkan extension.
