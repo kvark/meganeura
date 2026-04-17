@@ -626,7 +626,9 @@ impl Pipelines {
                 .or_default()
                 .insert(dispatch.shader.clone());
             // Attention dispatches store head_dim at params[3].
-            if group == ShaderGroup::MultiHeadAttn && dispatch.params.len() >= 4 {
+            if (group == ShaderGroup::MultiHeadAttn || group == ShaderGroup::FlashAttention)
+                && dispatch.params.len() >= 4
+            {
                 attention_head_dim = Some(dispatch.params[3]);
             }
             if dispatch.use_small_tiles {
@@ -713,10 +715,16 @@ impl Pipelines {
         for &group in &needed {
             if small_tile_groups.contains(&group) {
                 compile_group(group, &mut small_map);
-            } else if group == ShaderGroup::MultiHeadAttn {
-                // Use parameterized attention generator with actual head_dim.
+            } else if group == ShaderGroup::MultiHeadAttn
+                || group == ShaderGroup::FlashAttention
+            {
+                // Use parameterized attention generators with actual head_dim.
                 let hd = attention_head_dim.unwrap_or(64);
-                let sm = crate::codegen::generate_attention_module(hd);
+                let sm = if group == ShaderGroup::FlashAttention {
+                    crate::codegen::generate_flash_attention_module(hd)
+                } else {
+                    crate::codegen::generate_attention_module(hd)
+                };
                 let shader = gpu.create_shader(bg::ShaderDesc {
                     source: &sm.source,
                     naga_module: Some(sm.module),
@@ -961,7 +969,7 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::RoPE | ShaderEntry::RoPEGrad => RoPEData::layout(),
         ShaderEntry::Gelu => UnaryData::layout(),
         ShaderEntry::LayerNorm => LayerNormData::layout(),
-        ShaderEntry::MultiHeadAttn => MultiHeadAttnData::layout(),
+        ShaderEntry::MultiHeadAttn | ShaderEntry::FlashAttention => MultiHeadAttnData::layout(),
         ShaderEntry::MultiHeadAttnGradQ
         | ShaderEntry::MultiHeadAttnGradK
         | ShaderEntry::MultiHeadAttnGradV => MultiHeadAttnGradData::layout(),
@@ -2456,7 +2464,7 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::MultiHeadAttn => {
+            ShaderEntry::MultiHeadAttn | ShaderEntry::FlashAttention => {
                 pc.bind(
                     0,
                     &MultiHeadAttnData {

@@ -308,6 +308,8 @@ pub enum ShaderGroup {
     RoPEGrad,
     LayerNorm,
     MultiHeadAttn,
+    /// Flash Attention 2 forward: BQ>1 multi-query tiling with shared K staging.
+    FlashAttention,
     MultiHeadAttnGradQ,
     MultiHeadAttnGradK,
     MultiHeadAttnGradKV,
@@ -392,6 +394,11 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
             // Default head_dim=64 fallback; runtime calls
             // generate_attention_module(head_dim) directly for the actual value.
             generate_attention_module(64)
+        }
+        ShaderGroup::FlashAttention => {
+            // Default head_dim=64 fallback; runtime calls
+            // generate_flash_attention_module(head_dim) directly.
+            generate_flash_attention_module(64)
         }
         ShaderGroup::MultiHeadAttnGradQ => parse_wgsl(include_str!("shaders/mha_grad_q.wgsl")),
         ShaderGroup::MultiHeadAttnGradK => parse_wgsl(include_str!("shaders/mha_grad_k.wgsl")),
@@ -1389,6 +1396,300 @@ pub fn generate_attention_module(head_dim: u32) -> ShaderModule {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Flash Attention 2 forward: multiple query positions per workgroup.
+//
+// BQ = 256 / head_dim query positions per workgroup (e.g. 4 for hd=64).
+// Each group of head_dim threads handles one query position. K tiles are
+// staged in shared memory and reused across all BQ groups, reducing
+// global memory reads by BQ×.
+//
+// Falls back to generate_attention_module (BQ=1) when head_dim > 128.
+// ---------------------------------------------------------------------------
+
+/// Generate a Flash Attention 2 forward kernel with BQ>1 multi-query tiling.
+///
+/// Workgroup size = BQ * head_dim (≤ 256). Each of BQ groups of head_dim
+/// threads processes one query position. K tiles are loaded once into
+/// shared memory and reused across all BQ groups.
+pub fn generate_flash_attention_module(head_dim: u32) -> ShaderModule {
+    use std::fmt::Write;
+    assert!(
+        head_dim.is_power_of_two() && head_dim >= 2,
+        "attention head_dim must be a power of 2 ≥ 2, got {head_dim}"
+    );
+
+    let hd = head_dim;
+    let bq: u32 = (256 / hd).max(1);
+    // Fall back to BQ=1 kernel when multi-query isn't beneficial
+    if bq <= 1 {
+        return generate_attention_module(head_dim);
+    }
+    let wg_size = bq * hd;
+    let bkv: u32 = 8;
+    let mut src = String::new();
+
+    // Params struct (matches AttentionParams: 8 u32 = 32 bytes)
+    src.push_str(
+        "struct Params {\n    q_seq: u32,\n    kv_seq: u32,\n    packed_heads: u32,\n    head_dim: u32,\n    window_size: u32,\n    _pad0: u32,\n    _pad1: u32,\n    _pad2: u32,\n}\n\n",
+    );
+    src.push_str("var<storage> src_a: array<f32>;\n"); // Q
+    src.push_str("var<storage> src_b: array<f32>;\n"); // K
+    src.push_str("var<storage> bias: array<f32>;\n"); // V
+    src.push_str("var<storage, read_write> dst: array<f32>;\n"); // O
+    src.push_str("var<storage, read_write> lse: array<f32>;\n"); // LSE
+    src.push_str("var<uniform> params: Params;\n\n");
+
+    // Shared memory:
+    //   shared_k: K tile [BKV, hd] loaded once, reused by BQ groups
+    //   wg_scores: [BQ][BKV][hd] partial dot products for grouped reduction
+    //   wg_dot: [BQ][hd] tail reduction
+    let _ = writeln!(src, "var<workgroup> shared_k: array<f32, {}>;\n", bkv * hd);
+    let _ = writeln!(
+        src,
+        "var<workgroup> wg_scores: array<f32, {}>;\n",
+        bq * bkv * hd
+    );
+    let _ = writeln!(src, "var<workgroup> wg_dot: array<f32, {}>;\n", bq * hd);
+
+    // Grouped tree_reduce_8: each group of hd threads reduces independently.
+    // All wg_size threads hit barriers together; each group operates on its
+    // own section of wg_scores.
+    src.push_str("fn tree_reduce_8_grouped(tid: u32) {\n");
+    let _ = writeln!(src, "    let qi = tid / {hd}u;");
+    let _ = writeln!(src, "    let local = tid % {hd}u;");
+    let _ = writeln!(src, "    let base = qi * {}u;", bkv * hd);
+    let mut stride = hd / 2;
+    while stride > 0 {
+        src.push_str("    workgroupBarrier();\n");
+        let _ = writeln!(src, "    if local < {stride}u {{");
+        let _ = writeln!(src, "        for (var i = 0u; i < {bkv}u; i++) {{");
+        let _ = writeln!(
+            src,
+            "            wg_scores[base + i * {hd}u + local] += wg_scores[base + i * {hd}u + local + {stride}u];"
+        );
+        src.push_str("        }\n    }\n");
+        stride /= 2;
+    }
+    src.push_str("    workgroupBarrier();\n}\n\n");
+
+    // Grouped tree_reduce for tail
+    src.push_str("fn tree_reduce_grouped(tid: u32) {\n");
+    let _ = writeln!(src, "    let qi = tid / {hd}u;");
+    let _ = writeln!(src, "    let local = tid % {hd}u;");
+    let _ = writeln!(src, "    let base = qi * {hd}u;");
+    stride = hd / 2;
+    while stride > 0 {
+        src.push_str("    workgroupBarrier();\n");
+        let _ = writeln!(
+            src,
+            "    if local < {stride}u {{ wg_dot[base + local] += wg_dot[base + local + {stride}u]; }}"
+        );
+        stride /= 2;
+    }
+    src.push_str("    workgroupBarrier();\n}\n\n");
+
+    // Main kernel
+    let _ = writeln!(src, "@compute @workgroup_size({wg_size})");
+    src.push_str(
+        "fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n",
+    );
+    let _ = writeln!(src, "    let qi = lid.x / {hd}u;"); // query within tile
+    let _ = writeln!(src, "    let d = lid.x % {hd}u;"); // head_dim element
+    let _ = writeln!(src, "    let pos = wgid.x * {bq}u + qi;"); // global query position
+    src.push_str("    let head = wgid.y;\n");
+    src.push_str("    let q_seq = params.q_seq;\n");
+    src.push_str("    let kv_seq = params.kv_seq;\n");
+    src.push_str("    let num_heads = params.packed_heads >> 16u;\n");
+    src.push_str("    let num_kv_heads = params.packed_heads & 0xFFFFu;\n");
+    src.push_str("    let head_dim = params.head_dim;\n");
+    src.push_str("    let valid = pos < q_seq && head < num_heads;\n\n");
+
+    // Per-position KV range (causal + sliding window)
+    src.push_str("    let my_kv_len = select(kv_seq, select(pos + 1u, 0u, !valid), kv_seq == 0u);\n");
+    src.push_str("    let window_size = params.window_size;\n");
+    src.push_str("    let my_kv_start = select(0u, my_kv_len - min(my_kv_len, window_size), window_size > 0u);\n\n");
+
+    // Workgroup-wide loop bounds: all BQ threads must agree on the same
+    // loop range so they hit identical barriers.
+    // max_kv_len: from the LAST valid position in the tile (largest range).
+    // min_kv_start: from the FIRST position in the tile (earliest start).
+    let _ = writeln!(src, "    let last_pos = min(wgid.x * {bq}u + {bq}u - 1u, q_seq - 1u);");
+    let _ = writeln!(src, "    let first_pos = wgid.x * {bq}u;");
+    src.push_str("    let max_kv_len = select(kv_seq, last_pos + 1u, kv_seq == 0u);\n");
+    src.push_str("    let first_kv_len = select(kv_seq, first_pos + 1u, kv_seq == 0u);\n");
+    src.push_str("    let min_kv_start = select(0u, first_kv_len - min(first_kv_len, window_size), window_size > 0u);\n\n");
+
+    // GQA head mapping
+    src.push_str("    let kv_head = head / (num_heads / max(num_kv_heads, 1u));\n");
+    src.push_str("    let kv_head_off = kv_head * head_dim;\n");
+    src.push_str("    let kv_dim = num_kv_heads * head_dim;\n");
+    src.push_str("    let scale = inverseSqrt(f32(head_dim));\n");
+
+    // Load Q value for this thread's query position
+    src.push_str("    var q_val = 0.0;\n");
+    src.push_str("    if valid {\n");
+    src.push_str("        let q_base = pos * (num_heads * head_dim) + head * head_dim;\n");
+    src.push_str("        q_val = src_a[q_base + d];\n");
+    src.push_str("    }\n\n");
+
+    // Online softmax accumulators (per-thread, per-query position)
+    src.push_str("    var my_out = 0.0;\n");
+    src.push_str("    var max_score = -1e30;\n");
+    src.push_str("    var sum_exp = 0.0;\n\n");
+
+    // --- Tiled KV loop with shared K staging ---
+    // Use workgroup-wide bounds so all threads hit the same barriers.
+    let _ = writeln!(src, "    let kv_range = max_kv_len - min_kv_start;");
+    let _ = writeln!(
+        src,
+        "    let tile_end = min_kv_start + (kv_range / {bkv}u) * {bkv}u;"
+    );
+    src.push_str("    var t = min_kv_start;\n");
+    let _ = writeln!(src, "    for (; t < tile_end; t += {bkv}u) {{");
+
+    // Cooperatively load K tile into shared memory
+    // wg_size threads load bkv*hd elements
+    let k_tile_size = bkv * hd;
+    let loads_per_thread = k_tile_size.div_ceil(wg_size);
+    for l in 0..loads_per_thread {
+        let offset = l * wg_size;
+        if offset == 0 {
+            let _ = writeln!(
+                src,
+                "        if lid.x < {k_tile_size}u {{"
+            );
+            let _ = writeln!(
+                src,
+                "            let ki = lid.x / {hd}u;"
+            );
+            src.push_str(
+                "            shared_k[lid.x] = src_b[(t + ki) * kv_dim + kv_head_off + (lid.x % head_dim)];\n",
+            );
+            src.push_str("        }\n");
+        } else {
+            let _ = writeln!(
+                src,
+                "        if lid.x + {offset}u < {k_tile_size}u {{"
+            );
+            let _ = writeln!(
+                src,
+                "            let ki2 = (lid.x + {offset}u) / {hd}u;"
+            );
+            let _ = writeln!(
+                src,
+                "            shared_k[lid.x + {offset}u] = src_b[(t + ki2) * kv_dim + kv_head_off + ((lid.x + {offset}u) % head_dim)];"
+            );
+            src.push_str("        }\n");
+        }
+    }
+    src.push_str("        workgroupBarrier();\n\n");
+
+    // Each group computes BKV dot products using shared K
+    let _ = writeln!(
+        src,
+        "        let grp_base = qi * {}u;",
+        bkv * hd
+    );
+    let _ = writeln!(src, "        for (var i = 0u; i < {bkv}u; i++) {{");
+    let _ = writeln!(
+        src,
+        "            wg_scores[grp_base + i * {hd}u + d] = q_val * shared_k[i * {hd}u + d];"
+    );
+    src.push_str("        }\n");
+    src.push_str("        tree_reduce_8_grouped(lid.x);\n\n");
+
+    // Online softmax + V accumulation for BKV positions
+    // Per-position causal mask: skip KV positions beyond this query's kv_len
+    let _ = writeln!(src, "        for (var i = 0u; i < {bkv}u; i++) {{");
+    src.push_str("            let kv_pos = t + i;\n");
+    src.push_str("            if valid && kv_pos >= my_kv_start && kv_pos < my_kv_len {\n");
+    let _ = writeln!(
+        src,
+        "                let score = wg_scores[grp_base + i * {hd}u] * scale;"
+    );
+    src.push_str("                let new_max = max(max_score, score);\n");
+    src.push_str("                let correction = exp(max_score - new_max);\n");
+    src.push_str("                let weight = exp(score - new_max);\n");
+    src.push_str("                sum_exp = sum_exp * correction + weight;\n");
+    src.push_str(
+        "                let v_base = kv_pos * kv_dim + kv_head_off;\n",
+    );
+    src.push_str(
+        "                my_out = my_out * correction + weight * bias[v_base + d];\n",
+    );
+    src.push_str("                max_score = new_max;\n");
+    src.push_str("            }\n");
+    src.push_str("        }\n");
+    // Barrier before next tile's K staging overwrites shared_k
+    src.push_str("        workgroupBarrier();\n");
+    src.push_str("    }\n\n");
+
+    // --- Tail: remaining KV positions one at a time ---
+    src.push_str("    for (; t < max_kv_len; t++) {\n");
+    // Load single K position into shared_k (first hd threads)
+    let _ = writeln!(src, "        if lid.x < {hd}u {{");
+    src.push_str(
+        "            shared_k[lid.x] = src_b[t * kv_dim + kv_head_off + lid.x];\n",
+    );
+    src.push_str("        }\n");
+    src.push_str("        workgroupBarrier();\n\n");
+
+    // Each group computes dot product using shared K
+    let _ = writeln!(src, "        let dot_base = qi * {hd}u;");
+    let _ = writeln!(
+        src,
+        "        wg_dot[dot_base + d] = q_val * shared_k[d];"
+    );
+    src.push_str("        tree_reduce_grouped(lid.x);\n");
+    let _ = writeln!(
+        src,
+        "        let score = wg_dot[qi * {hd}u] * scale;\n"
+    );
+
+    // Per-position causal mask
+    src.push_str("        if valid && t >= my_kv_start && t < my_kv_len {\n");
+    src.push_str("            let new_max = max(max_score, score);\n");
+    src.push_str("            let correction = exp(max_score - new_max);\n");
+    src.push_str("            let weight = exp(score - new_max);\n");
+    src.push_str("            sum_exp = sum_exp * correction + weight;\n");
+    src.push_str(
+        "            my_out = my_out * correction + weight * bias[t * kv_dim + kv_head_off + d];\n",
+    );
+    src.push_str("            max_score = new_max;\n");
+    src.push_str("        }\n");
+    src.push_str("        workgroupBarrier();\n");
+    src.push_str("    }\n\n");
+
+    // Final output + LSE
+    src.push_str("    if valid {\n");
+    src.push_str("        let q_base = pos * (num_heads * head_dim) + head * head_dim;\n");
+    src.push_str("        let safe_sum = select(sum_exp, 1.0, sum_exp == 0.0);\n");
+    src.push_str("        dst[q_base + d] = my_out / safe_sum;\n\n");
+
+    // LSE output: only thread with d==0 in each group
+    src.push_str("        if d == 0u {\n");
+    src.push_str("            let idx = (pos * num_heads + head) * 2u;\n");
+    src.push_str("            lse[idx] = max_score;\n");
+    src.push_str(
+        "            lse[idx + 1u] = select(log(sum_exp), -1e30, sum_exp == 0.0);\n",
+    );
+    src.push_str("        }\n");
+    src.push_str("    }\n");
+    src.push_str("}\n");
+
+    let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
+        panic!(
+            "generated flash attention WGSL failed to parse:\n{}\n---\n{}",
+            e, src
+        )
+    });
+    ShaderModule {
+        module,
+        source: src,
+    }
+}
+
 fn gen_conv2d_gemm_coop() -> ShaderModule {
     let default_config = CoopConfig {
         tile_size: 16,
@@ -1659,6 +1960,10 @@ mod tests {
                 naga::valid::Capabilities::empty(),
             ),
             (
+                ShaderGroup::FlashAttention,
+                naga::valid::Capabilities::empty(),
+            ),
+            (
                 ShaderGroup::MultiHeadAttnGradQ,
                 naga::valid::Capabilities::empty(),
             ),
@@ -1770,6 +2075,16 @@ mod tests {
         let _ = generate_attention_module(64);
         let _ = generate_attention_module(32);
         let _ = generate_attention_module(128);
+    }
+
+    #[test]
+    fn test_flash_attention_wgsl() {
+        // BQ=4 for hd=64, BQ=8 for hd=32, BQ=2 for hd=128
+        let _ = generate_flash_attention_module(64);
+        let _ = generate_flash_attention_module(32);
+        let _ = generate_flash_attention_module(128);
+        // hd=256 should fall back to BQ=1 (regular attention)
+        let _ = generate_flash_attention_module(256);
     }
 
     /// Verify every shader group compiles to SPIR-V without panics.
@@ -1938,7 +2253,7 @@ mod tests {
                 ShaderEntry::RmsNorm => vec!["src", "bias", "dst", "params"],
                 ShaderEntry::Embedding => vec!["indices", "src", "dst", "params"],
                 ShaderEntry::LayerNorm => vec!["src", "src_b", "bias", "dst", "params"],
-                ShaderEntry::MultiHeadAttn => {
+                ShaderEntry::MultiHeadAttn | ShaderEntry::FlashAttention => {
                     vec!["src_a", "src_b", "bias", "dst", "lse", "params"]
                 }
                 ShaderEntry::MultiHeadAttnGradQ
@@ -2054,6 +2369,7 @@ mod tests {
             ShaderEntry::Tanh,
             ShaderEntry::LayerNorm,
             ShaderEntry::MultiHeadAttn,
+            ShaderEntry::FlashAttention,
             ShaderEntry::MultiHeadAttnGradQ,
             ShaderEntry::MultiHeadAttnGradK,
             ShaderEntry::MultiHeadAttnGradKV,
