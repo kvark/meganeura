@@ -173,14 +173,17 @@ fn smollm2_logits_match_pytorch() {
     eprintln!("\nGreedy matches: {greedy_match}/{SEQ_LEN}");
     eprintln!("Overall max abs error: {total_max_err:.4e}");
 
-    // Position 0 should be nearly exact (RoPE is identity at pos 0)
+    // Position 0 has no RoPE rotation so the scalar f32 path should land
+    // under 1e-3; f16 coop-matrix paths (NVIDIA) accumulate more, so we
+    // allow up to 0.1 (enough to catch structural bugs but tolerant of
+    // f16 precision).
     let pos0_max_err: f32 = mega_logits[..VOCAB_SIZE]
         .iter()
         .zip(&ref_logits[..VOCAB_SIZE])
         .map(|(a, b)| (a - b).abs())
         .fold(0.0, f32::max);
     assert!(
-        pos0_max_err < 0.01,
+        pos0_max_err < 0.1,
         "Position 0 should be very precise, got max_err={pos0_max_err:.4e}"
     );
 

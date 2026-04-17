@@ -1124,6 +1124,11 @@ impl Session {
         caps: &blade_graphics::CooperativeMatrix,
     ) -> Option<crate::codegen::CoopConfig> {
         use crate::codegen::CoopConfig;
+        // Escape hatch for diagnosing coop-matrix numerical bugs.
+        if std::env::var("MEGANEURA_DISABLE_COOP").is_ok() {
+            log::warn!("MEGANEURA_DISABLE_COOP set — forcing scalar matmul");
+            return None;
+        }
         if caps.f16_tile > 0 {
             Some(CoopConfig {
                 tile_size: caps.f16_tile,
@@ -1165,10 +1170,13 @@ impl Session {
             compute: shader.at("main"),
         });
 
-        // Test with output_tile-aligned dimensions (no padding needed).
+        // Test with a multi-tile matmul using varying values. A uniform
+        // pattern like A[i,j]=i+1, B[i,j]=j+1 misses bugs where the shader
+        // loses index dependence (e.g. coop-load layout mismatches that
+        // only surface when neighboring K-indices carry different weights).
         let ot = config.output_tile() as usize;
-        let m: usize = ot; // exactly 1 row of tiles
-        let inner: usize = ot; // exactly 1 tile deep
+        let m: usize = ot * 2; // 2 row tiles
+        let inner: usize = ot * 2; // 2 K-tiles (exercises K-loop accumulation)
         let n_out: usize = ot * 2; // 2 column tiles
         let a_size = (m * inner * 4) as u64;
         let b_size = (inner * n_out * 4) as u64;
@@ -1188,22 +1196,36 @@ impl Session {
             size: c_size,
             memory: bg::Memory::Shared,
         });
+        let mut expected = vec![0.0f32; m * n_out];
         unsafe {
             let a = std::slice::from_raw_parts_mut(a_buf.data() as *mut f32, m * inner);
             let b = std::slice::from_raw_parts_mut(b_buf.data() as *mut f32, inner * n_out);
             let c = std::slice::from_raw_parts_mut(c_buf.data() as *mut f32, m * n_out);
-            // Non-commutative test: A[i,j] = i+1, B[i,j] = j+1
+            // Deterministic varying values that depend on both row and column.
+            // Keep magnitudes modest so f16 coop paths don't overflow.
+            let fill = |idx: usize, dim: usize| -> f32 {
+                (((idx * 31 + dim * 7) % 17) as f32 - 8.0) * 0.125
+            };
             for i in 0..m {
                 for j in 0..inner {
-                    a[i * inner + j] = (i + 1) as f32;
+                    a[i * inner + j] = fill(i, j);
                 }
             }
             for i in 0..inner {
                 for j in 0..n_out {
-                    b[i * n_out + j] = (j + 1) as f32;
+                    b[i * n_out + j] = fill(i + 100, j + 200);
                 }
             }
             c.fill(0.0);
+            for i in 0..m {
+                for j in 0..n_out {
+                    let mut acc = 0.0f32;
+                    for p in 0..inner {
+                        acc += a[i * inner + p] * b[p * n_out + j];
+                    }
+                    expected[i * n_out + j] = acc;
+                }
+            }
         }
 
         let mut encoder = gpu.create_command_encoder(bg::CommandEncoderDesc {
@@ -1243,30 +1265,23 @@ impl Session {
         gpu.destroy_buffer(b_buf);
         gpu.destroy_buffer(c_buf);
 
-        // C = A × B where A[m,k]=i+1, B[k,n]=j+1.
-        // C[i,j] = sum_k (i+1)*(j+1) = inner*(i+1)*(j+1)
+        // Compare against CPU-computed reference. f16 coop paths accumulate
+        // in f32 but the inputs are truncated, so leave ~5% slack per term.
+        let tol = 0.05 * (inner as f32);
         let mut ok = true;
         let mut first_mismatch = true;
         for i in 0..m {
             for j in 0..n_out {
-                let expected = (inner as f32) * (i + 1) as f32 * (j + 1) as f32;
                 let got = result[i * n_out + j];
-                if (got - expected).abs() > 0.5 {
+                let want = expected[i * n_out + j];
+                if (got - want).abs() > tol && (got - want).abs() > 1e-3 {
                     if first_mismatch {
                         log::warn!(
-                            "coop self-test FAILED (m={m}, n={n_out}, k={inner}, tile={})",
+                            "coop self-test FAILED (m={m}, n={n_out}, k={inner}, tile={}, tol={tol:.3})",
                             config.tile_size
                         );
-                        log::warn!("  row 0: {:?}", &result[0..n_out]);
-                        if m > 1 {
-                            log::warn!("  row 1: {:?}", &result[n_out..2 * n_out]);
-                        }
-                        log::warn!(
-                            "  expected row 0: {:?}",
-                            (0..n_out)
-                                .map(|j| inner as f32 * 1.0 * (j + 1) as f32)
-                                .collect::<Vec<_>>()
-                        );
+                        log::warn!("  got row 0: {:?}", &result[..n_out.min(8)]);
+                        log::warn!("  want row 0: {:?}", &expected[..n_out.min(8)]);
                         first_mismatch = false;
                     }
                     ok = false;

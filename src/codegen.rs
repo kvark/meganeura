@@ -908,14 +908,27 @@ fn gen_matmul_coop_wgsl_prologue(
     //   A: AT (A[K,M], load along M, write rows-of-shared)
     let use_vec4 = tile >= 16;
     // All variants use vec4 for both A and B (direct or transposed).
-    let vec4_b = use_vec4;
-    let vec4_a = use_vec4 && prologue.is_none();
     // Transposed staging writes strided into shared (4 rows × 1 col per thread).
-    let vec4_b_transposed = vec4_b && variant == MatMulCoopVariant::BT;
-    let vec4_a_transposed = vec4_a && variant == MatMulCoopVariant::AT;
+    // `vec4_b` is the "direct" staging that assumes B is [K,N]; it must be
+    // FALSE for BT so the `vec4_b_transposed` branch is taken. Same reasoning
+    // for `vec4_a` vs `vec4_a_transposed` on the AT variant.
+    let vec4_b_transposed = use_vec4 && variant == MatMulCoopVariant::BT;
+    let vec4_a_transposed = use_vec4 && variant == MatMulCoopVariant::AT && prologue.is_none();
+    let vec4_b = use_vec4 && !vec4_b_transposed;
+    let vec4_a = use_vec4 && prologue.is_none() && !vec4_a_transposed;
 
-    let a_storage = if vec4_a { "array<vec4<f32>>" } else { "array<f32>" };
-    let b_storage = if vec4_b { "array<vec4<f32>>" } else { "array<f32>" };
+    // Both "direct" vec4 (vec4_{a,b}) and "transposed" vec4 staging use 128-bit
+    // loads, so the backing storage must be `array<vec4<f32>>` in either case.
+    let a_storage = if vec4_a || vec4_a_transposed {
+        "array<vec4<f32>>"
+    } else {
+        "array<f32>"
+    };
+    let b_storage = if vec4_b || vec4_b_transposed {
+        "array<vec4<f32>>"
+    } else {
+        "array<f32>"
+    };
 
     // Generate hoisted staging index variables
     let staging_vars = {
