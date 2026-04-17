@@ -138,6 +138,14 @@ fn resblock(
     }
 }
 
+/// Build the SD U-Net forward graph (no loss).
+///
+/// Returns the noise prediction node. The graph expects:
+/// - Input "noisy_latent": flat `[batch * in_c * res * res]`
+pub fn build_unet(g: &mut Graph, cfg: &SDUNetConfig) -> NodeId {
+    build_unet_inner(g, cfg)
+}
+
 /// Build the SD U-Net training graph.
 ///
 /// Returns the MSE loss node. The graph expects:
@@ -148,11 +156,27 @@ pub fn build_training_graph(g: &mut Graph, cfg: &SDUNetConfig) -> NodeId {
     let res = cfg.resolution;
     let in_c = cfg.in_channels;
     let in_size = (batch * in_c * res * res) as usize;
+
+    let pred = build_unet_inner(g, cfg);
+    let target = g.input("noise_target", &[in_size]);
+
+    // MSE loss: mean((pred - target)²)
+    let neg_target = g.neg(target);
+    let diff = g.add(pred, neg_target);
+    let sq = g.mul(diff, diff);
+    g.mean_all(sq)
+}
+
+/// Inner U-Net forward pass that returns the noise prediction tensor.
+fn build_unet_inner(g: &mut Graph, cfg: &SDUNetConfig) -> NodeId {
+    let batch = cfg.batch_size;
+    let res = cfg.resolution;
+    let in_c = cfg.in_channels;
+    let in_size = (batch * in_c * res * res) as usize;
     let ch_mults = cfg.channel_mult();
 
     // Inputs
     let noisy = g.input("noisy_latent", &[in_size]);
-    let target = g.input("noise_target", &[in_size]);
 
     // Input conv: in_channels → base_channels
     let base_c = cfg.base_channels;
@@ -251,13 +275,7 @@ pub fn build_training_graph(g: &mut Graph, cfg: &SDUNetConfig) -> NodeId {
     );
     x = g.silu(x);
     let conv_out_w = g.parameter("conv_out.weight", &[(in_c * base_c * 3 * 3) as usize]);
-    let pred = g.conv2d(x, conv_out_w, batch, base_c, res, res, in_c, 3, 3, 1, 1);
-
-    // MSE loss: mean((pred - target)²)
-    let neg_target = g.neg(target);
-    let diff = g.add(pred, neg_target);
-    let sq = g.mul(diff, diff);
-    g.mean_all(sq)
+    g.conv2d(x, conv_out_w, batch, base_c, res, res, in_c, 3, 3, 1, 1)
 }
 
 /// Count the total number of parameters in the U-Net.
