@@ -306,12 +306,8 @@ pub enum ShaderGroup {
     Embedding,
     RoPE,
     RoPEGrad,
-    CausalAttention,
-    CausalAttentionRoPE,
     SlidingWindowAttention,
     LayerNorm,
-    FullAttention,
-    CrossAttention,
     MultiHeadAttn,
     MultiHeadAttnGradQ,
     MultiHeadAttnGradK,
@@ -392,18 +388,12 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::Embedding => parse_wgsl(include_str!("shaders/embedding.wgsl")),
         ShaderGroup::RoPE => parse_wgsl(include_str!("shaders/rope.wgsl")),
         ShaderGroup::RoPEGrad => parse_wgsl(include_str!("shaders/rope_grad.wgsl")),
-        ShaderGroup::CausalAttention => gen_causal_attention(),
-        ShaderGroup::CausalAttentionRoPE => gen_causal_attention(), // TODO: generate RoPE-fused shader
         ShaderGroup::SlidingWindowAttention => gen_sliding_window_attention(),
         ShaderGroup::LayerNorm => parse_wgsl(include_str!("shaders/layer_norm.wgsl")),
-        ShaderGroup::FullAttention => gen_full_attention(),
-        ShaderGroup::CrossAttention => gen_cross_attention(),
         ShaderGroup::MultiHeadAttn => {
-            crate::schedule::lower(&crate::schedule::KernelTemplate::Attention {
-                mask: crate::schedule::AttentionMask::None,
-                head_dim: 64,
-                output_lse: true,
-            })
+            // Default head_dim=64 fallback; runtime calls
+            // generate_attention_module(head_dim) directly for the actual value.
+            generate_attention_module(64)
         }
         ShaderGroup::MultiHeadAttnGradQ => parse_wgsl(include_str!("shaders/mha_grad_q.wgsl")),
         ShaderGroup::MultiHeadAttnGradK => parse_wgsl(include_str!("shaders/mha_grad_k.wgsl")),
@@ -1231,61 +1221,6 @@ pub enum MatMulCoopVariant {
 // reduce.wgsl: sum_all, mean_all
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// causal_attention.wgsl: Fused multi-head causal attention with GQA
-// One workgroup per (position, head) pair.
-// params: seq, num_heads, num_kv_heads, head_dim
-// inputs: q[seq, num_heads*head_dim], k[seq, num_kv_heads*head_dim], v[seq, ...]
-// output: [seq, num_heads*head_dim]
-// ---------------------------------------------------------------------------
-
-/// Single-pass causal attention with online softmax.
-///
-/// Computes multi-head causal attention in one pass over key positions,
-/// maintaining a running output accumulator. Compared to the 3-pass
-/// approach, this reduces compute from O(D²·N) to O(D·N) per (pos, head).
-///
-/// Algorithm per (pos, head):
-///   max_score = -inf, sum_exp = 0, out[d] = 0
-///   for t in 0..pos+1:
-///     score = Q[pos]·K[t] * scale
-///     new_max = max(max_score, score)
-///     correction = exp(max_score - new_max)
-///     sum_exp = sum_exp * correction + exp(score - new_max)
-///     for d: out[d] = out[d] * correction + exp(score - new_max) * V[t,d]
-///     max_score = new_max
-///   for d: dst[d] = out[d] / sum_exp
-/// Default attention template vars for no-RoPE variants.
-const ATTN_NO_ROPE: &[(&str, &str)] = &[
-    ("$ROPE_DECL", ""),
-    ("$ROPE_Q_APPLY", ""),
-    ("$Q_VAL_EXPR", "q_raw"),
-    ("$K_VAL_EXPR", "src_b[k_base + tid]"),
-    ("$K_VAL_TAIL_EXPR", "src_b[k_base + tid]"),
-];
-
-fn gen_causal_attention() -> ShaderModule {
-    let src = include_str!("shaders/attention.wgsl");
-    let mut vars = vec![
-        (
-            "$PARAM_FIELDS",
-            "seq: u32, num_heads: u32, num_kv_heads: u32, head_dim: u32,",
-        ),
-        (
-            "$PARSE_PARAMS",
-            "let q_seq = params.seq;\n    let num_heads = params.num_heads;\n    let num_kv_heads = params.num_kv_heads;\n    let head_dim = params.head_dim;\n    let kv_len = pos + 1u;",
-        ),
-        ("$KV_START", "0u"),
-    ];
-    vars.extend_from_slice(ATTN_NO_ROPE);
-    let src = preprocess(src, &vars);
-    parse_wgsl(&src)
-}
-
-// ---------------------------------------------------------------------------
-// sliding_window_attention: same as causal but with bounded window
-// ---------------------------------------------------------------------------
-
 fn gen_sliding_window_attention() -> ShaderModule {
     let src = include_str!("shaders/sliding_window_attention.wgsl");
     let src = preprocess(
@@ -1304,56 +1239,169 @@ fn gen_sliding_window_attention() -> ShaderModule {
     parse_wgsl(&src)
 }
 
-#[allow(clippy::empty_line_after_doc_comments)]
-/// Parallel attention kernel: 64 threads per workgroup, one per head_dim element.
-/// Dispatch [q_seq, num_heads, 1] workgroups; workgroup_id gives (pos, head), local_id.x is tid.
+// ---------------------------------------------------------------------------
+// Unified attention: BKV=8 tiled, runtime causal detection, parameterized head_dim.
+// Replaces gen_causal_attention, gen_full_attention, gen_cross_attention, and
+// the schedule-template `lower_attention` for MultiHeadAttn.
+//
+// Param layout matches MultiHeadAttnData:
+//   params = [q_seq, kv_seq, packed_heads, head_dim]
+//   kv_seq == 0 → causal (kv_len = pos + 1)
+//   kv_seq >  0 → non-causal (kv_len = kv_seq)
+// ---------------------------------------------------------------------------
+
+/// Generate a BKV=8 tiled attention shader parameterized by `head_dim`.
 ///
-/// Algorithm: single-pass online softmax across KV positions.
-/// - All 64 threads compute partial dot Q[tid]*K[t,tid] → store to wg_dot[tid]
-/// - 6-stage parallel reduction gives scalar score = sum_d Q[d]*K[t,d]
-/// - Online softmax update (same scalar ops for all threads)
-/// - Each thread accumulates its own V dimension: out[tid] += weight * V[t,tid]
-/// - Output: dst[q_base + tid] = out[tid] / sum_exp
+/// The shader uses online softmax with 8-way KV tiling to reduce
+/// workgroup barriers by 8× compared to the un-tiled archetype.
+/// Runtime causal detection via `kv_seq == 0` avoids separate shaders
+/// for causal vs non-causal masks.
+pub fn generate_attention_module(head_dim: u32) -> ShaderModule {
+    use std::fmt::Write;
+    assert!(
+        head_dim.is_power_of_two() && head_dim >= 2,
+        "attention head_dim must be a power of 2 ≥ 2, got {head_dim}"
+    );
 
-// ---------------------------------------------------------------------------
-// full_attention.wgsl: non-causal multi-head attention with GQA
-// Same as causal_attention but attends to all positions (no mask).
-// ---------------------------------------------------------------------------
+    let hd = head_dim;
+    let bkv: u32 = 8;
+    let mut src = String::new();
 
-fn gen_full_attention() -> ShaderModule {
-    let src = include_str!("shaders/attention.wgsl");
-    let mut vars = vec![
-        (
-            "$PARAM_FIELDS",
-            "seq: u32, num_heads: u32, num_kv_heads: u32, head_dim: u32,",
-        ),
-        (
-            "$PARSE_PARAMS",
-            "let q_seq = params.seq;\n    let num_heads = params.num_heads;\n    let num_kv_heads = params.num_kv_heads;\n    let head_dim = params.head_dim;\n    let kv_len = q_seq;",
-        ),
-        ("$KV_START", "0u"),
-    ];
-    vars.extend_from_slice(ATTN_NO_ROPE);
-    let src = preprocess(src, &vars);
-    parse_wgsl(&src)
-}
+    // Params struct (matches MultiHeadAttnData)
+    src.push_str(
+        "struct Params {\n    q_seq: u32,\n    kv_seq: u32,\n    packed_heads: u32,\n    head_dim: u32,\n}\n\n",
+    );
+    src.push_str("var<storage> src_a: array<f32>;\n"); // Q
+    src.push_str("var<storage> src_b: array<f32>;\n"); // K
+    src.push_str("var<storage> bias: array<f32>;\n"); // V
+    src.push_str("var<storage, read_write> dst: array<f32>;\n"); // O
+    src.push_str("var<storage, read_write> lse: array<f32>;\n"); // LSE
+    src.push_str("var<uniform> params: Params;\n\n");
 
-fn gen_cross_attention() -> ShaderModule {
-    let src = include_str!("shaders/attention.wgsl");
-    let mut vars = vec![
-        (
-            "$PARAM_FIELDS",
-            "q_seq: u32, kv_seq: u32, packed_heads: u32, head_dim: u32,",
-        ),
-        (
-            "$PARSE_PARAMS",
-            "let q_seq = params.q_seq;\n    let num_heads = params.packed_heads >> 16u;\n    let num_kv_heads = params.packed_heads & 0xFFFFu;\n    let head_dim = params.head_dim;\n    let kv_len = params.kv_seq;",
-        ),
-        ("$KV_START", "0u"),
-    ];
-    vars.extend_from_slice(ATTN_NO_ROPE);
-    let src = preprocess(src, &vars);
-    parse_wgsl(&src)
+    // Shared memory: BKV * head_dim for tiled scores, head_dim for tail
+    let _ = writeln!(src, "var<workgroup> wg_scores: array<f32, {}>;\n", bkv * hd);
+    let _ = writeln!(src, "var<workgroup> wg_dot: array<f32, {}>;\n", hd);
+
+    // tree_reduce_8: reduce BKV=8 dot products simultaneously
+    src.push_str("fn tree_reduce_8(tid: u32) {\n");
+    let mut stride = hd / 2;
+    while stride > 0 {
+        src.push_str("    workgroupBarrier();\n");
+        let _ = writeln!(src, "    if tid < {stride}u {{");
+        let _ = writeln!(src, "        for (var i = 0u; i < {bkv}u; i++) {{");
+        let _ = writeln!(
+            src,
+            "            wg_scores[i * {hd}u + tid] += wg_scores[i * {hd}u + tid + {stride}u];"
+        );
+        src.push_str("        }\n    }\n");
+        stride /= 2;
+    }
+    src.push_str("    workgroupBarrier();\n}\n\n");
+
+    // tree_reduce: single dot product for tail
+    src.push_str("fn tree_reduce(tid: u32) {\n");
+    stride = hd / 2;
+    while stride > 0 {
+        src.push_str("    workgroupBarrier();\n");
+        let _ = writeln!(
+            src,
+            "    if tid < {stride}u {{ wg_dot[tid] += wg_dot[tid + {stride}u]; }}"
+        );
+        stride /= 2;
+    }
+    src.push_str("    workgroupBarrier();\n}\n\n");
+
+    // Main kernel
+    let _ = writeln!(src, "@compute @workgroup_size({hd})");
+    src.push_str(
+        "fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n",
+    );
+    src.push_str("    let pos = wgid.x;\n");
+    src.push_str("    let head = wgid.y;\n");
+    src.push_str("    let tid = lid.x;\n");
+    src.push_str("    let q_seq = params.q_seq;\n");
+    src.push_str("    let kv_seq = params.kv_seq;\n");
+    src.push_str("    let num_heads = params.packed_heads >> 16u;\n");
+    src.push_str("    let num_kv_heads = params.packed_heads & 0xFFFFu;\n");
+    src.push_str("    let head_dim = params.head_dim;\n");
+    src.push_str("    if pos >= q_seq || head >= num_heads { return; }\n\n");
+
+    // Runtime causal detection: kv_seq=0 means causal (kv_len = pos + 1)
+    src.push_str("    let kv_len = select(kv_seq, pos + 1u, kv_seq == 0u);\n\n");
+
+    // GQA head mapping
+    src.push_str("    let kv_head = head / (num_heads / num_kv_heads);\n");
+    src.push_str("    let kv_head_off = kv_head * head_dim;\n");
+    src.push_str("    let kv_dim = num_kv_heads * head_dim;\n");
+    src.push_str("    let scale = inverseSqrt(f32(head_dim));\n");
+    src.push_str("    let q_base = pos * (num_heads * head_dim) + head * head_dim;\n");
+    src.push_str("    let q_val = src_a[q_base + tid];\n\n");
+
+    // Online softmax accumulators
+    src.push_str("    var my_out = 0.0;\n");
+    src.push_str("    var max_score = -1e30;\n");
+    src.push_str("    var sum_exp = 0.0;\n\n");
+
+    // --- Tiled KV loop: process BKV positions per reduction ---
+    let _ = writeln!(src, "    let tile_end = (kv_len / {bkv}u) * {bkv}u;");
+    src.push_str("    var t = 0u;\n");
+    let _ = writeln!(src, "    for (; t < tile_end; t += {bkv}u) {{");
+    let _ = writeln!(src, "        for (var i = 0u; i < {bkv}u; i++) {{");
+    src.push_str("            let k_base = (t + i) * kv_dim + kv_head_off;\n");
+    let _ = writeln!(
+        src,
+        "            wg_scores[i * {hd}u + tid] = q_val * src_b[k_base + tid];"
+    );
+    src.push_str("        }\n");
+    src.push_str("        tree_reduce_8(tid);\n\n");
+    let _ = writeln!(src, "        for (var i = 0u; i < {bkv}u; i++) {{");
+    let _ = writeln!(src, "            let score = wg_scores[i * {hd}u] * scale;");
+    src.push_str("            let new_max = max(max_score, score);\n");
+    src.push_str("            let correction = exp(max_score - new_max);\n");
+    src.push_str("            let weight = exp(score - new_max);\n");
+    src.push_str("            sum_exp = sum_exp * correction + weight;\n");
+    src.push_str("            let v_base = (t + i) * kv_dim + kv_head_off;\n");
+    src.push_str("            my_out = my_out * correction + weight * bias[v_base + tid];\n");
+    src.push_str("            max_score = new_max;\n");
+    src.push_str("        }\n");
+    src.push_str("    }\n\n");
+
+    // --- Tail: remaining KV positions one at a time ---
+    src.push_str("    for (; t < kv_len; t++) {\n");
+    src.push_str("        let k_base = t * kv_dim + kv_head_off;\n");
+    src.push_str("        wg_dot[tid] = q_val * src_b[k_base + tid];\n");
+    src.push_str("        tree_reduce(tid);\n");
+    src.push_str("        let score = wg_dot[0] * scale;\n\n");
+    src.push_str("        let new_max = max(max_score, score);\n");
+    src.push_str("        let correction = exp(max_score - new_max);\n");
+    src.push_str("        let weight = exp(score - new_max);\n");
+    src.push_str("        sum_exp = sum_exp * correction + weight;\n");
+    src.push_str("        my_out = my_out * correction + weight * bias[k_base + tid];\n");
+    src.push_str("        max_score = new_max;\n");
+    src.push_str("    }\n\n");
+
+    // Final output
+    src.push_str("    let safe_sum = select(sum_exp, 1.0, sum_exp == 0.0);\n");
+    src.push_str("    dst[q_base + tid] = my_out / safe_sum;\n\n");
+
+    // LSE output for backward pass
+    src.push_str("    if tid == 0u {\n");
+    src.push_str("        let idx = (pos * num_heads + head) * 2u;\n");
+    src.push_str("        lse[idx] = max_score;\n");
+    src.push_str("        lse[idx + 1u] = select(log(sum_exp), -1e30, sum_exp == 0.0);\n");
+    src.push_str("    }\n");
+    src.push_str("}\n");
+
+    let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
+        panic!(
+            "generated unified attention WGSL failed to parse:\n{}\n---\n{}",
+            e, src
+        )
+    });
+    ShaderModule {
+        module,
+        source: src,
+    }
 }
 
 fn gen_conv2d_gemm_coop() -> ShaderModule {
@@ -1621,22 +1669,10 @@ mod tests {
             (ShaderGroup::RoPE, naga::valid::Capabilities::empty()),
             (ShaderGroup::RoPEGrad, naga::valid::Capabilities::empty()),
             (
-                ShaderGroup::CausalAttention,
-                naga::valid::Capabilities::empty(),
-            ),
-            (
                 ShaderGroup::SlidingWindowAttention,
                 naga::valid::Capabilities::empty(),
             ),
             (ShaderGroup::LayerNorm, naga::valid::Capabilities::empty()),
-            (
-                ShaderGroup::FullAttention,
-                naga::valid::Capabilities::empty(),
-            ),
-            (
-                ShaderGroup::CrossAttention,
-                naga::valid::Capabilities::empty(),
-            ),
             (
                 ShaderGroup::MultiHeadAttn,
                 naga::valid::Capabilities::empty(),
@@ -1749,8 +1785,10 @@ mod tests {
     }
 
     #[test]
-    fn test_causal_attention_wgsl() {
-        let _ = generate_wgsl(ShaderGroup::CausalAttention);
+    fn test_unified_attention_wgsl() {
+        let _ = generate_attention_module(64);
+        let _ = generate_attention_module(32);
+        let _ = generate_attention_module(128);
     }
 
     /// Verify every shader group compiles to SPIR-V without panics.
@@ -1786,11 +1824,8 @@ mod tests {
             (ShaderGroup::Embedding, empty),
             (ShaderGroup::RoPE, empty),
             (ShaderGroup::RoPEGrad, empty),
-            (ShaderGroup::CausalAttention, empty),
             (ShaderGroup::SlidingWindowAttention, empty),
             (ShaderGroup::LayerNorm, empty),
-            (ShaderGroup::FullAttention, empty),
-            (ShaderGroup::CrossAttention, empty),
             (ShaderGroup::SwiGLUGrad, empty),
             (ShaderGroup::SwiGLUConcat, empty),
             (ShaderGroup::SumRows, empty),
@@ -1922,12 +1957,6 @@ mod tests {
                 ShaderEntry::Transpose => vec!["src", "dst", "params"],
                 ShaderEntry::RmsNorm => vec!["src", "bias", "dst", "params"],
                 ShaderEntry::Embedding => vec!["indices", "src", "dst", "params"],
-                ShaderEntry::CausalAttention
-                | ShaderEntry::CausalAttentionRoPE
-                | ShaderEntry::FullAttention
-                | ShaderEntry::CrossAttention => {
-                    vec!["src_a", "src_b", "bias", "dst", "lse", "params"]
-                }
                 ShaderEntry::SlidingWindowAttention => {
                     vec!["src_a", "src_b", "bias", "dst", "lse", "params"]
                 }
@@ -2044,14 +2073,10 @@ mod tests {
             ShaderEntry::Embedding,
             ShaderEntry::RoPE,
             ShaderEntry::RoPEGrad,
-            ShaderEntry::CausalAttention,
-            ShaderEntry::CausalAttentionRoPE,
             ShaderEntry::SlidingWindowAttention,
             ShaderEntry::Gelu,
             ShaderEntry::Tanh,
             ShaderEntry::LayerNorm,
-            ShaderEntry::FullAttention,
-            ShaderEntry::CrossAttention,
             ShaderEntry::MultiHeadAttn,
             ShaderEntry::MultiHeadAttnGradQ,
             ShaderEntry::MultiHeadAttnGradK,

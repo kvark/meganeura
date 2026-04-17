@@ -276,17 +276,6 @@ struct FourBufData {
     params: MatMulParams,
 }
 
-// causal/full/cross attention: src_a (q), src_b (k), bias (v), dst, lse, params
-#[derive(blade_macros::ShaderData)]
-struct AttentionData {
-    src_a: blade_graphics::BufferPiece,
-    src_b: blade_graphics::BufferPiece,
-    bias: blade_graphics::BufferPiece, // v, named "bias" to match binding
-    dst: blade_graphics::BufferPiece,
-    lse: blade_graphics::BufferPiece, // log-sum-exp for backward pass
-    params: MatMulParams,
-}
-
 // sliding_window_attention: var src_a (q), src_b (k), bias (v), dst, params
 // params has 5 fields so needs its own struct (not MatMulParams which has 4)
 #[derive(blade_macros::ShaderData)]
@@ -650,6 +639,8 @@ impl Pipelines {
         let mut needed: HashSet<ShaderGroup> = HashSet::new();
         let mut needed_coop: HashSet<ShaderGroup> = HashSet::new();
         let mut entries_for_group: HashMap<ShaderGroup, HashSet<ShaderEntry>> = HashMap::new();
+        // Extract head_dim from attention dispatches for parameterized shader generation.
+        let mut attention_head_dim: Option<u32> = None;
 
         for dispatch in &plan.dispatches {
             let group = dispatch.shader.shader_group();
@@ -658,6 +649,10 @@ impl Pipelines {
                 .entry(group)
                 .or_default()
                 .insert(dispatch.shader.clone());
+            // Attention dispatches store head_dim at params[3].
+            if group == ShaderGroup::MultiHeadAttn && dispatch.params.len() >= 4 {
+                attention_head_dim = Some(dispatch.params[3]);
+            }
             if dispatch.use_small_tiles {
                 let small_group = match group {
                     ShaderGroup::MatMul => ShaderGroup::MatMulSmall,
@@ -742,6 +737,25 @@ impl Pipelines {
         for &group in &needed {
             if small_tile_groups.contains(&group) {
                 compile_group(group, &mut small_map);
+            } else if group == ShaderGroup::MultiHeadAttn {
+                // Use parameterized attention generator with actual head_dim.
+                let hd = attention_head_dim.unwrap_or(64);
+                let sm = crate::codegen::generate_attention_module(hd);
+                let shader = gpu.create_shader(bg::ShaderDesc {
+                    source: &sm.source,
+                    naga_module: Some(sm.module),
+                });
+                if let Some(entries) = entries_for_group.get(&group) {
+                    for entry in entries {
+                        let layout = shader_data_layout(entry);
+                        let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
+                            name: entry.entry_point(),
+                            data_layouts: &[&layout],
+                            compute: shader.at(entry.entry_point()),
+                        });
+                        map.insert(entry.clone(), pipeline);
+                    }
+                }
             } else {
                 compile_group(group, &mut map);
             }
@@ -969,12 +983,9 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::RmsNorm => RmsNormData::layout(),
         ShaderEntry::Embedding => EmbeddingData::layout(),
         ShaderEntry::RoPE | ShaderEntry::RoPEGrad => RoPEData::layout(),
-        ShaderEntry::CausalAttention => AttentionData::layout(),
-        ShaderEntry::CausalAttentionRoPE => AttentionData::layout(),
         ShaderEntry::SlidingWindowAttention => SlidingWindowAttentionData::layout(),
         ShaderEntry::Gelu => UnaryData::layout(),
         ShaderEntry::LayerNorm => LayerNormData::layout(),
-        ShaderEntry::FullAttention | ShaderEntry::CrossAttention => AttentionData::layout(),
         ShaderEntry::MultiHeadAttn => MultiHeadAttnData::layout(),
         ShaderEntry::MultiHeadAttnGradQ
         | ShaderEntry::MultiHeadAttnGradK
@@ -2434,28 +2445,6 @@ impl Session {
                             _pad0: 0,
                             _pad1: 0,
                             _pad2: 0,
-                        },
-                    },
-                );
-            }
-            ShaderEntry::CausalAttention
-            | ShaderEntry::CausalAttentionRoPE
-            | ShaderEntry::FullAttention
-            | ShaderEntry::CrossAttention => {
-                let lse_buf = dispatch.extra_outputs[0];
-                pc.bind(
-                    0,
-                    &AttentionData {
-                        src_a: buf(dispatch.input_buffers[0]),
-                        src_b: buf(dispatch.input_buffers[1]),
-                        bias: buf(dispatch.input_buffers[2]),
-                        dst: buf(dispatch.output_buffer),
-                        lse: buf(lse_buf),
-                        params: MatMulParams {
-                            m: dispatch.params[0],
-                            n: dispatch.params[1],
-                            k: dispatch.params[2],
-                            _pad: dispatch.params[3],
                         },
                     },
                 );

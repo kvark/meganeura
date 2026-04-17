@@ -77,13 +77,9 @@ pub enum ShaderEntry {
     Embedding,
     RoPE,
     RoPEGrad,
-    CausalAttention,
-    CausalAttentionRoPE,
     SlidingWindowAttention,
     Gelu,
     LayerNorm,
-    FullAttention,
-    CrossAttention,
     MultiHeadAttn,
     MultiHeadAttnGradQ,
     MultiHeadAttnGradK,
@@ -172,13 +168,9 @@ impl ShaderEntry {
             ShaderEntry::Embedding => ShaderGroup::Embedding,
             ShaderEntry::RoPE => ShaderGroup::RoPE,
             ShaderEntry::RoPEGrad => ShaderGroup::RoPEGrad,
-            ShaderEntry::CausalAttention => ShaderGroup::CausalAttention,
-            ShaderEntry::CausalAttentionRoPE => ShaderGroup::CausalAttentionRoPE,
             ShaderEntry::SlidingWindowAttention => ShaderGroup::SlidingWindowAttention,
             ShaderEntry::Gelu => ShaderGroup::Unary,
             ShaderEntry::LayerNorm => ShaderGroup::LayerNorm,
-            ShaderEntry::FullAttention => ShaderGroup::FullAttention,
-            ShaderEntry::CrossAttention => ShaderGroup::CrossAttention,
             ShaderEntry::MultiHeadAttn => ShaderGroup::MultiHeadAttn,
             ShaderEntry::MultiHeadAttnGradQ => ShaderGroup::MultiHeadAttnGradQ,
             ShaderEntry::MultiHeadAttnGradK => ShaderGroup::MultiHeadAttnGradK,
@@ -266,13 +258,9 @@ impl ShaderEntry {
             ShaderEntry::Embedding => "main",
             ShaderEntry::RoPE => "main",
             ShaderEntry::RoPEGrad => "main",
-            ShaderEntry::CausalAttention => "main",
-            ShaderEntry::CausalAttentionRoPE => "main",
             ShaderEntry::SlidingWindowAttention => "main",
             ShaderEntry::Gelu => "gelu",
             ShaderEntry::LayerNorm => "main",
-            ShaderEntry::FullAttention => "main",
-            ShaderEntry::CrossAttention => "main",
             ShaderEntry::MultiHeadAttn
             | ShaderEntry::MultiHeadAttnGradQ
             | ShaderEntry::MultiHeadAttnGradK
@@ -1772,44 +1760,27 @@ impl<'a> Compiler<'a> {
                 num_heads,
                 num_kv_heads,
                 head_dim,
-            } => {
-                let q = self.get_buffer(node.inputs[0]);
-                let k = self.get_buffer(node.inputs[1]);
-                let v = self.get_buffer(node.inputs[2]);
-                let seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
-                let lse_buf = self.find_lse_buffer(node.id);
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::CausalAttention,
-                    workgroups: [seq.div_ceil(1), num_heads, 1],
-                    input_buffers: vec![q, k, v],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![lse_buf],
-                    params: vec![seq, num_heads, num_kv_heads, head_dim],
-                    use_coop: false,
-                    use_small_tiles: false,
-                    ..Default::default()
-                });
             }
-
-            Op::CausalAttentionRoPE {
+            | Op::CausalAttentionRoPE {
                 num_heads,
                 num_kv_heads,
                 head_dim,
-                rope_theta: _,
+                ..
             } => {
+                // Route through unified attention shader.
+                // kv_seq=0 signals causal mask at runtime.
                 let q = self.get_buffer(node.inputs[0]);
                 let k = self.get_buffer(node.inputs[1]);
                 let v = self.get_buffer(node.inputs[2]);
                 let seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let lse_buf = self.find_lse_buffer(node.id);
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::CausalAttentionRoPE,
-                    workgroups: [seq.div_ceil(1), num_heads, 1],
+                    shader: ShaderEntry::MultiHeadAttn,
+                    workgroups: [seq, num_heads, 1],
                     input_buffers: vec![q, k, v],
                     output_buffer: out_buf,
                     extra_outputs: vec![lse_buf],
-                    // TODO: pass rope_theta via params when the RoPE-fused shader is implemented
-                    params: vec![seq, num_heads, num_kv_heads, head_dim],
+                    params: vec![seq, 0, (num_heads << 16) | num_kv_heads, head_dim],
                     use_coop: false,
                     use_small_tiles: false,
                     ..Default::default()
@@ -2463,18 +2434,20 @@ impl<'a> Compiler<'a> {
                 num_kv_heads,
                 head_dim,
             } => {
+                // Route through unified attention shader.
+                // kv_seq=q_seq for full (non-causal) attention.
                 let q = self.get_buffer(node.inputs[0]);
                 let k = self.get_buffer(node.inputs[1]);
                 let v = self.get_buffer(node.inputs[2]);
                 let seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let lse_buf = self.find_lse_buffer(node.id);
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::FullAttention,
-                    workgroups: [seq.div_ceil(1), num_heads, 1],
+                    shader: ShaderEntry::MultiHeadAttn,
+                    workgroups: [seq, num_heads, 1],
                     input_buffers: vec![q, k, v],
                     output_buffer: out_buf,
                     extra_outputs: vec![lse_buf],
-                    params: vec![seq, num_heads, num_kv_heads, head_dim],
+                    params: vec![seq, seq, (num_heads << 16) | num_kv_heads, head_dim],
                     use_coop: false,
                     use_small_tiles: false,
                     ..Default::default()
@@ -2486,6 +2459,7 @@ impl<'a> Compiler<'a> {
                 num_kv_heads,
                 head_dim,
             } => {
+                // Route through unified attention shader.
                 let q = self.get_buffer(node.inputs[0]);
                 let k = self.get_buffer(node.inputs[1]);
                 let v = self.get_buffer(node.inputs[2]);
@@ -2493,8 +2467,8 @@ impl<'a> Compiler<'a> {
                 let kv_seq = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
                 let lse_buf = self.find_lse_buffer(node.id);
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::CrossAttention,
-                    workgroups: [q_seq.div_ceil(1), num_heads, 1],
+                    shader: ShaderEntry::MultiHeadAttn,
+                    workgroups: [q_seq, num_heads, 1],
                     input_buffers: vec![q, k, v],
                     output_buffer: out_buf,
                     extra_outputs: vec![lse_buf],

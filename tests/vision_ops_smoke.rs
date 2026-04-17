@@ -67,19 +67,20 @@ fn gelu_basic() {
 
 #[test]
 fn full_attention_basic() {
-    // seq=4, num_heads=2, head_dim=3 → q_dim = k_dim = v_dim = 6
+    // seq=4, num_heads=2, head_dim=4 → q_dim = k_dim = v_dim = 8
+    // head_dim must be a power of 2 (determines workgroup_size in the attention shader)
     let mut g = Graph::new();
-    let q = g.input("q", &[4, 6]);
-    let k = g.input("k", &[4, 6]);
-    let v = g.input("v", &[4, 6]);
-    let attn = g.full_attention(q, k, v, 2, 2, 3);
+    let q = g.input("q", &[4, 8]);
+    let k = g.input("k", &[4, 8]);
+    let v = g.input("v", &[4, 8]);
+    let attn = g.full_attention(q, k, v, 2, 2, 4);
     g.set_outputs(vec![attn]);
 
     let mut session = build_inference_session(&g);
 
     // Simple identity-like attention: q=k so attention is uniform
-    let qk_data: Vec<f32> = (0..24).map(|i| (i as f32) * 0.1).collect();
-    let v_data: Vec<f32> = (0..24).map(|i| (i as f32) * 0.01).collect();
+    let qk_data: Vec<f32> = (0..32).map(|i| (i as f32) * 0.1).collect();
+    let v_data: Vec<f32> = (0..32).map(|i| (i as f32) * 0.01).collect();
 
     session.set_input("q", &qk_data);
     session.set_input("k", &qk_data);
@@ -88,7 +89,7 @@ fn full_attention_basic() {
     session.step();
     session.wait();
 
-    let out = session.read_output(24);
+    let out = session.read_output(32);
     println!("full_attention output: {:?}", out);
     for (i, v) in out.iter().enumerate() {
         assert!(
