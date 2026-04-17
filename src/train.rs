@@ -6,6 +6,7 @@ use crate::{
     runtime::Session,
 };
 use std::path::Path;
+use std::sync::Arc;
 
 /// Optimizer selection.
 #[derive(Clone, Debug)]
@@ -273,6 +274,30 @@ pub fn build_inference_session_with(
     Session::new(plan)
 }
 
+/// Like [`build_inference_session`], but reuses an externally-owned
+/// Blade GPU context. See [`Session::with_context`] for the motivating
+/// use case (a host renderer sharing its device with meganeura).
+pub fn build_inference_session_on(
+    forward_graph: &Graph,
+    gpu: Arc<blade_graphics::Context>,
+) -> Session {
+    build_inference_session_on_with(forward_graph, gpu, &compile::CompileOptions::default())
+}
+
+/// Like [`build_inference_session_with`], but reuses an existing GPU context.
+pub fn build_inference_session_on_with(
+    forward_graph: &Graph,
+    gpu: Arc<blade_graphics::Context>,
+    options: &compile::CompileOptions,
+) -> Session {
+    let mut optimized = optimize::optimize(forward_graph);
+    let mut inference_fusions = Vec::new();
+    optimize::apply_group_norm_silu_fusions(&mut optimized, &mut inference_fusions);
+    optimize::apply_winograd_conv_fusions(&mut optimized, &mut inference_fusions);
+    let plan = compile::compile_with(&optimized, options);
+    Session::with_context(plan, gpu)
+}
+
 /// Build a complete training session from a forward-pass graph.
 ///
 /// This is the main entry point. It:
@@ -372,6 +397,26 @@ pub fn build_session_with_report_and_options(
     };
 
     (session, report)
+}
+
+/// Like [`build_session`], but reuses an externally-owned Blade GPU
+/// context. See [`Session::with_context`] for motivation.
+pub fn build_session_on(forward_graph: &Graph, gpu: Arc<blade_graphics::Context>) -> Session {
+    build_session_on_with(forward_graph, gpu, &compile::CompileOptions::default())
+}
+
+/// Like [`build_session_with`], but reuses an existing GPU context.
+pub fn build_session_on_with(
+    forward_graph: &Graph,
+    gpu: Arc<blade_graphics::Context>,
+    options: &compile::CompileOptions,
+) -> Session {
+    let optimized_forward = optimize::optimize(forward_graph);
+    let sorted_forward = optimized_forward.toposort();
+    let full_graph = autodiff::differentiate(&sorted_forward);
+    let (optimized, _report) = optimize::optimize_with_report(&full_graph);
+    let plan = compile::compile_with(&optimized, options);
+    Session::with_context(plan, gpu)
 }
 
 /// Build a training session without full-graph optimization (step 3).

@@ -1,3 +1,12 @@
+# Unreleased
+
+- `Session::with_context(plan, Arc<Context>)` and matching
+  `build_session_on` / `build_inference_session_on` / `*_with`
+  helpers. Lets a host application (renderer, game) share a
+  single `blade_graphics::Context` with meganeura's training
+  and inference sessions instead of each side opening its own
+  device.
+
 # v0.2 (14 Apr 2026)
 
 ## Inference & models
