@@ -3,7 +3,19 @@
 //! shaders or the schedule-template codegen path. This is the gate that
 //! lets us retire hand-written pointwise entries one at a time.
 
-use meganeura::{CompileOptions, Graph, NodeId, build_inference_session_with};
+use meganeura::{CompileOptions, Graph, Mode, NodeId, Session, SessionConfig};
+
+fn inference(g: &Graph, opts: CompileOptions) -> Session {
+    meganeura::build(
+        g,
+        SessionConfig {
+            mode: Mode::Inference,
+            options: opts,
+            ..SessionConfig::default()
+        },
+    )
+    .0
+}
 
 /// Build+run a graph once with the given schedule-pointwise setting.
 ///
@@ -41,7 +53,7 @@ fn run_once_with(
 
     let mut opts = CompileOptions::default();
     configure(&mut opts);
-    let mut session = build_inference_session_with(&g, &opts);
+    let mut session = inference(&g, opts);
     for (name, data) in input_names.iter().zip(inputs.iter()) {
         session.set_input(name, data);
     }
@@ -272,7 +284,7 @@ fn softmax_parity() {
             use_schedule_reduction: use_schedule,
             ..Default::default()
         };
-        let mut s = build_inference_session_with(&g, &opts);
+        let mut s = inference(&g, opts);
         s.set_input("x", &input);
         s.step();
         s.wait();
@@ -350,7 +362,7 @@ fn rmsnorm_parity() {
             use_schedule_reduction: use_schedule,
             ..Default::default()
         };
-        let mut s = build_inference_session_with(&g, &opts);
+        let mut s = inference(&g, opts);
         s.set_input("x", &input);
         s.set_parameter("w", &weight);
         s.step();

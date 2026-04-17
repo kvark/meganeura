@@ -222,166 +222,117 @@ impl Trainer {
     }
 }
 
-/// Build an inference-only session from a forward-pass graph.
-///
-/// Skips autodiff (no backward pass). Runs egglog optimization and
-/// compiles the graph to a GPU session ready for forward evaluation.
-pub fn build_inference_session(forward_graph: &Graph) -> Session {
-    build_inference_session_with(forward_graph, &compile::CompileOptions::default())
+/// Whether the compiled session runs forward-only or forward + backward
+/// + optimizer.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Forward + backward + parameter updates. Default.
+    #[default]
+    Training,
+    /// Forward only — skips autodiff.
+    Inference,
 }
 
-/// Like [`build_inference_session`], but accepts [`compile::CompileOptions`]
-/// to toggle experimental paths (e.g. schedule-template codegen).
-pub fn build_inference_session_with(
+/// Parameters for [`build`].
+///
+/// Replaces the `build_session` / `build_inference_session` /
+/// `build_session_with_report` / `build_session_on` / ... zoo with a
+/// single entry point. The defaults produce a training session on a
+/// fresh Blade GPU context with the default compile options and full
+/// optimization enabled.
+#[derive(Default)]
+pub struct SessionConfig<'a> {
+    pub mode: Mode,
+    /// Reuse an externally-owned Blade GPU context. `None` initialises
+    /// a fresh one inside [`Session`]. Sharing a context with a host
+    /// renderer is the motivating use case — see
+    /// [`Session::with_context`] for details.
+    pub gpu: Option<Arc<blade_graphics::Context>>,
+    pub options: compile::CompileOptions,
+    /// When set, load a previously-compiled plan from this path if it
+    /// matches the graph hash, or save it there after compiling.
+    /// Training mode only — the cache is keyed by the forward graph.
+    pub cache: Option<&'a Path>,
+    /// Skip the post-autodiff full-graph optimization pass. Useful for
+    /// debugging gradient flow through aggressively-fused ops. Training
+    /// mode only.
+    pub skip_full_optimize: bool,
+}
+
+/// Build a [`Session`] from a forward-pass graph.
+///
+/// Runs forward optimization, optional autodiff (training mode),
+/// optional full-graph optimization, plan compilation, and GPU session
+/// initialization — all the stages the old `build_session_*` family
+/// strung together, now driven by [`SessionConfig`].
+///
+/// Build stages (`optimize_forward`, `autodiff`, `optimize_full`,
+/// `compile`, `gpu_init`) are captured as tracing spans and appear in
+/// Perfetto traces when profiling is active.
+pub fn build(
     forward_graph: &Graph,
-    options: &compile::CompileOptions,
-) -> Session {
-    log::info!("building inference session...");
+    cfg: SessionConfig<'_>,
+) -> (Session, OptimizeReport) {
+    let _span = tracing::info_span!("build_session").entered();
+    log::info!("building {:?} session", cfg.mode);
     log::info!("forward graph:\n{}", forward_graph);
 
-    // Optimize with egglog (fusions still help for inference)
-    log::info!("running egglog optimization...");
-    let mut optimized = optimize::optimize(forward_graph);
-    log::info!("optimized graph: {} nodes", optimized.nodes().len());
-
-    // Inference-only fusions (no backward pass needed)
-    let mut inference_fusions = Vec::new();
-    optimize::apply_group_norm_silu_fusions(&mut optimized, &mut inference_fusions);
-    optimize::apply_winograd_conv_fusions(&mut optimized, &mut inference_fusions);
-    if !inference_fusions.is_empty() {
-        for (name, count) in inference_fusions.iter().fold(
-            std::collections::BTreeMap::<&str, usize>::new(),
-            |mut acc, entry| {
-                *acc.entry(entry.0.as_str()).or_default() += 1;
-                acc
-            },
-        ) {
-            log::info!("inference fusion: {}x {}", count, name);
+    if cfg.mode == Mode::Training
+        && let Some(path) = cfg.cache
+    {
+        match cache::load_plan(forward_graph, path) {
+            Ok(Some(plan)) => {
+                log::info!("loaded cached execution plan from {}", path.display());
+                let session = make_session(plan, cfg.gpu);
+                return (session, OptimizeReport::empty());
+            }
+            Ok(None) => log::info!("no valid cache found, recompiling"),
+            Err(e) => log::warn!("failed to load cache: {}, recompiling", e),
         }
     }
 
-    // Compile to execution plan
-    log::info!("compiling execution plan...");
-    let plan = compile::compile_with(&optimized, options);
-    log::info!(
-        "execution plan: {} buffers, {} dispatches",
-        plan.buffers.len(),
-        plan.dispatches.len()
-    );
-
-    // Create GPU session
-    log::info!("initializing GPU session...");
-    Session::new(plan)
-}
-
-/// Like [`build_inference_session`], but reuses an externally-owned
-/// Blade GPU context. See [`Session::with_context`] for the motivating
-/// use case (a host renderer sharing its device with meganeura).
-pub fn build_inference_session_on(
-    forward_graph: &Graph,
-    gpu: Arc<blade_graphics::Context>,
-) -> Session {
-    build_inference_session_on_with(forward_graph, gpu, &compile::CompileOptions::default())
-}
-
-/// Like [`build_inference_session_with`], but reuses an existing GPU context.
-pub fn build_inference_session_on_with(
-    forward_graph: &Graph,
-    gpu: Arc<blade_graphics::Context>,
-    options: &compile::CompileOptions,
-) -> Session {
-    let mut optimized = optimize::optimize(forward_graph);
-    let mut inference_fusions = Vec::new();
-    optimize::apply_group_norm_silu_fusions(&mut optimized, &mut inference_fusions);
-    optimize::apply_winograd_conv_fusions(&mut optimized, &mut inference_fusions);
-    let plan = compile::compile_with(&optimized, options);
-    Session::with_context(plan, gpu)
-}
-
-/// Build a complete training session from a forward-pass graph.
-///
-/// This is the main entry point. It:
-/// 1. Optimizes the forward graph (SwiGLU fusion, MatMul+Add, etc.)
-/// 2. Runs autodiff on the optimized forward graph
-/// 3. Optimizes the full graph (backward MatMul+Add fusions)
-/// 4. Compiles the optimized graph to an execution plan
-/// 5. Creates a GPU session with all resources allocated
-pub fn build_session(forward_graph: &Graph) -> Session {
-    build_session_with(forward_graph, &compile::CompileOptions::default())
-}
-
-/// Like [`build_session`], but accepts [`compile::CompileOptions`] to toggle
-/// experimental paths (e.g. schedule-template codegen).
-pub fn build_session_with(forward_graph: &Graph, options: &compile::CompileOptions) -> Session {
-    let (session, report) = build_session_with_report_and_options(forward_graph, options);
-    log::info!("{}", report);
-    session
-}
-
-/// Like `build_session`, but also returns the optimization report.
-///
-/// Build-phase stages (autodiff, egglog, compile, gpu_init) are captured
-/// as tracing spans and will appear in Perfetto traces when profiling is
-/// active.
-pub fn build_session_with_report(forward_graph: &Graph) -> (Session, OptimizeReport) {
-    build_session_with_report_and_options(forward_graph, &compile::CompileOptions::default())
-}
-
-/// [`build_session_with_report`] + [`compile::CompileOptions`].
-pub fn build_session_with_report_and_options(
-    forward_graph: &Graph,
-    options: &compile::CompileOptions,
-) -> (Session, OptimizeReport) {
-    let _span = tracing::info_span!("build_session").entered();
-
-    log::info!("building training session...");
-    log::info!("forward graph:\n{}", forward_graph);
-
-    // Step 1: Optimize forward graph (fuse SwiGLU, MatMul+Add, etc.)
-    // This runs BEFORE autodiff so the backward pass differentiates
-    // the optimized ops (e.g. SwiGLUConcat instead of separate SwiGLU).
-    log::info!("optimizing forward graph...");
-    let optimized_forward = {
+    let (optimized_forward, forward_report) = {
         let _span = tracing::info_span!("optimize_forward").entered();
-        optimize::optimize(forward_graph)
+        optimize::optimize_with_report(forward_graph)
     };
-    log::info!(
-        "optimized forward: {} nodes",
-        optimized_forward.nodes().len()
-    );
+    log::info!("optimized forward: {} nodes", optimized_forward.nodes().len());
 
-    // Step 2: Toposort the optimized graph (optimizer may append nodes
-    // out of order) then run autodiff. Autodiff iterates in reverse node
-    // order, so topological ordering ensures gradients flow correctly.
-    let sorted_forward = optimized_forward.toposort();
-    log::info!(
-        "sorted forward: {} nodes (from {} optimized, {} original)",
-        sorted_forward.nodes().len(),
-        optimized_forward.nodes().len(),
-        forward_graph.nodes().len(),
-    );
-    let full_graph = {
-        let _span = tracing::info_span!("autodiff").entered();
-        autodiff::differentiate(&sorted_forward)
+    let (final_graph, report) = match cfg.mode {
+        Mode::Inference => {
+            let mut g = optimized_forward;
+            let mut fusions = Vec::new();
+            optimize::apply_group_norm_silu_fusions(&mut g, &mut fusions);
+            optimize::apply_winograd_conv_fusions(&mut g, &mut fusions);
+            for (name, count) in fusions.iter().fold(
+                std::collections::BTreeMap::<&str, usize>::new(),
+                |mut acc, entry| {
+                    *acc.entry(entry.0.as_str()).or_default() += 1;
+                    acc
+                },
+            ) {
+                log::info!("inference fusion: {}x {}", count, name);
+            }
+            (g, forward_report)
+        }
+        Mode::Training => {
+            let sorted = optimized_forward.toposort();
+            let full = {
+                let _span = tracing::info_span!("autodiff").entered();
+                autodiff::differentiate(&sorted)
+            };
+            log::info!("full graph (forward + backward): {} nodes", full.nodes().len());
+            if cfg.skip_full_optimize {
+                (full, forward_report)
+            } else {
+                let _span = tracing::info_span!("optimize_full").entered();
+                optimize::optimize_with_report(&full)
+            }
+        }
     };
-    log::info!(
-        "full graph (forward + backward): {} nodes",
-        full_graph.nodes().len()
-    );
 
-    // Step 3: Optimize full graph (fuse backward MatMul+Add, etc.)
-    log::info!("optimizing full graph...");
-    let (optimized, report) = {
-        let _span = tracing::info_span!("optimize_full").entered();
-        optimize::optimize_with_report(&full_graph)
-    };
-    log::info!("optimized graph: {} nodes", optimized.nodes().len());
-
-    // Step 3: Compile to execution plan
-    log::info!("compiling execution plan...");
     let plan = {
         let _span = tracing::info_span!("compile").entered();
-        compile::compile_with(&optimized, options)
+        compile::compile_with(&final_graph, &cfg.options)
     };
     log::info!(
         "execution plan: {} buffers, {} dispatches",
@@ -389,59 +340,68 @@ pub fn build_session_with_report_and_options(
         plan.dispatches.len()
     );
 
-    // Step 4: Create GPU session
-    log::info!("initializing GPU session...");
+    if cfg.mode == Mode::Training
+        && let Some(path) = cfg.cache
+    {
+        if let Err(e) = cache::save_plan(&plan, forward_graph, path) {
+            log::warn!("failed to save cache: {}", e);
+        } else {
+            log::info!("saved execution plan cache to {}", path.display());
+        }
+    }
+
     let session = {
         let _span = tracing::info_span!("gpu_init").entered();
-        Session::new(plan)
+        make_session(plan, cfg.gpu)
     };
-
     (session, report)
 }
 
-/// Like [`build_session`], but reuses an externally-owned Blade GPU
-/// context. See [`Session::with_context`] for motivation.
-pub fn build_session_on(forward_graph: &Graph, gpu: Arc<blade_graphics::Context>) -> Session {
-    build_session_on_with(forward_graph, gpu, &compile::CompileOptions::default())
-}
-
-/// Like [`build_session_with`], but reuses an existing GPU context.
-pub fn build_session_on_with(
-    forward_graph: &Graph,
-    gpu: Arc<blade_graphics::Context>,
-    options: &compile::CompileOptions,
+fn make_session(
+    plan: compile::ExecutionPlan,
+    gpu: Option<Arc<blade_graphics::Context>>,
 ) -> Session {
-    let optimized_forward = optimize::optimize(forward_graph);
-    let sorted_forward = optimized_forward.toposort();
-    let full_graph = autodiff::differentiate(&sorted_forward);
-    let (optimized, _report) = optimize::optimize_with_report(&full_graph);
-    let plan = compile::compile_with(&optimized, options);
-    Session::with_context(plan, gpu)
+    match gpu {
+        Some(ctx) => Session::with_context(plan, ctx),
+        None => Session::new(plan),
+    }
 }
 
-/// Build a training session without full-graph optimization (step 3).
-///
-/// Useful for debugging gradient flow issues, since the full-graph optimizer
-/// can fuse backward MatMul+Add ops in ways that break gradient propagation.
+/// Sugar for `build(g, SessionConfig::default()).0` — the common
+/// training case.
+pub fn build_session(forward_graph: &Graph) -> Session {
+    build(forward_graph, SessionConfig::default()).0
+}
+
+/// Sugar for `build(g, SessionConfig { mode: Inference, .. })`.
+pub fn build_inference_session(forward_graph: &Graph) -> Session {
+    build(
+        forward_graph,
+        SessionConfig {
+            mode: Mode::Inference,
+            ..SessionConfig::default()
+        },
+    )
+    .0
+}
+
+/// Sugar for `build(g, SessionConfig { skip_full_optimize: true, .. })`.
+/// Useful for debugging gradient flow through ops the full-graph
+/// optimizer fuses.
 pub fn build_session_unoptimized(forward_graph: &Graph) -> Session {
-    let _span = tracing::info_span!("build_session_unoptimized").entered();
-
-    let optimized_forward = optimize::optimize(forward_graph);
-    let sorted_forward = optimized_forward.toposort();
-    let full_graph = autodiff::differentiate(&sorted_forward);
-
-    // Skip step 3 (full-graph optimization) — compile directly
-    let plan = compile::compile(&full_graph);
-    Session::new(plan)
+    build(
+        forward_graph,
+        SessionConfig {
+            skip_full_optimize: true,
+            ..SessionConfig::default()
+        },
+    )
+    .0
 }
 
-/// Build a session, using a cache file if available.
-///
-/// If the cache exists and the graph hash matches, skip autodiff/optimize/compile.
-/// Otherwise, run the full pipeline and save the result.
-/// Run the full pipeline (autodiff → optimize → compile) without creating a GPU session.
-///
-/// Useful for testing the compilation pipeline in environments without GPU access.
+/// Run the compile pipeline (autodiff → optimize → compile) without
+/// creating a GPU session. Useful for testing compilation in
+/// environments without GPU access.
 pub fn compile_training_graph(
     forward_graph: &Graph,
 ) -> (crate::compile::ExecutionPlan, OptimizeReport) {
@@ -449,39 +409,6 @@ pub fn compile_training_graph(
     let (optimized, report) = optimize::optimize_with_report(&full_graph);
     let plan = compile::compile(&optimized);
     (plan, report)
-}
-
-pub fn build_session_cached(forward_graph: &Graph, cache_path: &Path) -> Session {
-    match cache::load_plan(forward_graph, cache_path) {
-        Ok(Some(plan)) => {
-            log::info!("loaded cached execution plan from {}", cache_path.display());
-            return Session::new(plan);
-        }
-        Ok(None) => {
-            log::info!("no valid cache found, running full pipeline");
-        }
-        Err(e) => {
-            log::warn!("failed to load cache: {}, recompiling", e);
-        }
-    }
-
-    // Full pipeline — compile and cache the plan before creating the session
-    log::info!("building training session...");
-    log::info!("forward graph:\n{}", forward_graph);
-
-    let full_graph = autodiff::differentiate(forward_graph);
-    let (optimized, report) = optimize::optimize_with_report(&full_graph);
-    let plan = compile::compile(&optimized);
-
-    // Save cache before consuming the plan
-    if let Err(e) = cache::save_plan(&plan, forward_graph, cache_path) {
-        log::warn!("failed to save cache: {}", e);
-    } else {
-        log::info!("saved execution plan cache to {}", cache_path.display());
-    }
-
-    log::info!("{}", report);
-    Session::new(plan)
 }
 
 #[cfg(test)]

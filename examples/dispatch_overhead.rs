@@ -13,7 +13,9 @@
 
 use std::time::Instant;
 
-use meganeura::{CompileOptions, Graph, NodeId, build_inference_session_with};
+use meganeura::{
+    CompileOptions, Graph, Mode, NodeId, SessionConfig, Session, build,
+};
 
 fn raw_opts() -> CompileOptions {
     // Turn off the pointwise-fusion pass so a chain of unary ops stays as
@@ -22,6 +24,18 @@ fn raw_opts() -> CompileOptions {
         use_schedule_pointwise: false,
         ..Default::default()
     }
+}
+
+fn infer_raw(g: &Graph) -> Session {
+    build(
+        g,
+        SessionConfig {
+            mode: Mode::Inference,
+            options: raw_opts(),
+            ..SessionConfig::default()
+        },
+    )
+    .0
 }
 
 fn bench_chain(n_ops: usize, iters: usize) -> (f64, usize, usize) {
@@ -36,7 +50,7 @@ fn bench_chain(n_ops: usize, iters: usize) -> (f64, usize, usize) {
     }
     g.set_outputs(vec![cur]);
 
-    let mut s = build_inference_session_with(&g, &raw_opts());
+    let mut s = infer_raw(&g);
     let n_dispatches = s.plan().dispatches.len();
     let n_groups = s.num_groups();
 
@@ -69,7 +83,7 @@ fn bench_independent(n_ops: usize, iters: usize) -> (f64, usize, usize) {
     let outputs: Vec<NodeId> = (0..n_ops).map(|_| g.relu(x)).collect();
     g.set_outputs(outputs);
 
-    let mut s = build_inference_session_with(&g, &raw_opts());
+    let mut s = infer_raw(&g);
     let n_dispatches = s.plan().dispatches.len();
     let n_groups = s.num_groups();
 
@@ -99,7 +113,7 @@ fn main() {
     let x = g.input("x", &[4]);
     let y = g.relu(x);
     g.set_outputs(vec![y]);
-    let sanity = build_inference_session_with(&g, &raw_opts());
+    let sanity = infer_raw(&g);
     eprintln!("device: {}", sanity.device_information().device_name);
     drop(sanity);
 
