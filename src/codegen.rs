@@ -306,7 +306,6 @@ pub enum ShaderGroup {
     Embedding,
     RoPE,
     RoPEGrad,
-    SlidingWindowAttention,
     LayerNorm,
     MultiHeadAttn,
     MultiHeadAttnGradQ,
@@ -388,7 +387,6 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::Embedding => parse_wgsl(include_str!("shaders/embedding.wgsl")),
         ShaderGroup::RoPE => parse_wgsl(include_str!("shaders/rope.wgsl")),
         ShaderGroup::RoPEGrad => parse_wgsl(include_str!("shaders/rope_grad.wgsl")),
-        ShaderGroup::SlidingWindowAttention => gen_sliding_window_attention(),
         ShaderGroup::LayerNorm => parse_wgsl(include_str!("shaders/layer_norm.wgsl")),
         ShaderGroup::MultiHeadAttn => {
             // Default head_dim=64 fallback; runtime calls
@@ -1221,33 +1219,16 @@ pub enum MatMulCoopVariant {
 // reduce.wgsl: sum_all, mean_all
 // ---------------------------------------------------------------------------
 
-fn gen_sliding_window_attention() -> ShaderModule {
-    let src = include_str!("shaders/sliding_window_attention.wgsl");
-    let src = preprocess(
-        src,
-        &[
-            (
-                "$PARAM_FIELDS",
-                "seq: u32, num_heads: u32, num_kv_heads: u32, head_dim: u32, window_size: u32, _pad0: u32, _pad1: u32, _pad2: u32,",
-            ),
-            (
-                "$PARSE_PARAMS",
-                "let q_seq = params.seq;\n    let num_heads = params.num_heads;\n    let num_kv_heads = params.num_kv_heads;\n    let head_dim = params.head_dim;\n    let window_size = params.window_size;\n    let kv_start = select(0u, pos + 1u - window_size, pos >= window_size);\n    let kv_len = pos + 1u;",
-            ),
-        ],
-    );
-    parse_wgsl(&src)
-}
-
 // ---------------------------------------------------------------------------
 // Unified attention: BKV=8 tiled, runtime causal detection, parameterized head_dim.
 // Replaces gen_causal_attention, gen_full_attention, gen_cross_attention, and
 // the schedule-template `lower_attention` for MultiHeadAttn.
 //
-// Param layout matches MultiHeadAttnData:
-//   params = [q_seq, kv_seq, packed_heads, head_dim]
+// Param layout matches MultiHeadAttnData (AttentionParams):
+//   params = [q_seq, kv_seq, packed_heads, head_dim, window_size, ...]
 //   kv_seq == 0 → causal (kv_len = pos + 1)
 //   kv_seq >  0 → non-causal (kv_len = kv_seq)
+//   window_size > 0 → sliding window (kv_start = max(0, pos+1-window))
 // ---------------------------------------------------------------------------
 
 /// Generate a BKV=8 tiled attention shader parameterized by `head_dim`.
@@ -1267,9 +1248,9 @@ pub fn generate_attention_module(head_dim: u32) -> ShaderModule {
     let bkv: u32 = 8;
     let mut src = String::new();
 
-    // Params struct (matches MultiHeadAttnData)
+    // Params struct (matches AttentionParams, 8 u32 = 32 bytes)
     src.push_str(
-        "struct Params {\n    q_seq: u32,\n    kv_seq: u32,\n    packed_heads: u32,\n    head_dim: u32,\n}\n\n",
+        "struct Params {\n    q_seq: u32,\n    kv_seq: u32,\n    packed_heads: u32,\n    head_dim: u32,\n    window_size: u32,\n    _pad0: u32,\n    _pad1: u32,\n    _pad2: u32,\n}\n\n",
     );
     src.push_str("var<storage> src_a: array<f32>;\n"); // Q
     src.push_str("var<storage> src_b: array<f32>;\n"); // K
@@ -1327,7 +1308,10 @@ pub fn generate_attention_module(head_dim: u32) -> ShaderModule {
     src.push_str("    if pos >= q_seq || head >= num_heads { return; }\n\n");
 
     // Runtime causal detection: kv_seq=0 means causal (kv_len = pos + 1)
-    src.push_str("    let kv_len = select(kv_seq, pos + 1u, kv_seq == 0u);\n\n");
+    src.push_str("    let kv_len = select(kv_seq, pos + 1u, kv_seq == 0u);\n");
+    // Sliding window: window_size>0 limits how far back we attend
+    src.push_str("    let window_size = params.window_size;\n");
+    src.push_str("    let kv_start = select(0u, kv_len - min(kv_len, window_size), window_size > 0u);\n\n");
 
     // GQA head mapping
     src.push_str("    let kv_head = head / (num_heads / num_kv_heads);\n");
@@ -1343,8 +1327,9 @@ pub fn generate_attention_module(head_dim: u32) -> ShaderModule {
     src.push_str("    var sum_exp = 0.0;\n\n");
 
     // --- Tiled KV loop: process BKV positions per reduction ---
-    let _ = writeln!(src, "    let tile_end = (kv_len / {bkv}u) * {bkv}u;");
-    src.push_str("    var t = 0u;\n");
+    let _ = writeln!(src, "    let kv_range = kv_len - kv_start;");
+    let _ = writeln!(src, "    let tile_end = kv_start + (kv_range / {bkv}u) * {bkv}u;");
+    src.push_str("    var t = kv_start;\n");
     let _ = writeln!(src, "    for (; t < tile_end; t += {bkv}u) {{");
     let _ = writeln!(src, "        for (var i = 0u; i < {bkv}u; i++) {{");
     src.push_str("            let k_base = (t + i) * kv_dim + kv_head_off;\n");
@@ -1668,10 +1653,6 @@ mod tests {
             (ShaderGroup::Embedding, naga::valid::Capabilities::empty()),
             (ShaderGroup::RoPE, naga::valid::Capabilities::empty()),
             (ShaderGroup::RoPEGrad, naga::valid::Capabilities::empty()),
-            (
-                ShaderGroup::SlidingWindowAttention,
-                naga::valid::Capabilities::empty(),
-            ),
             (ShaderGroup::LayerNorm, naga::valid::Capabilities::empty()),
             (
                 ShaderGroup::MultiHeadAttn,
@@ -1824,7 +1805,6 @@ mod tests {
             (ShaderGroup::Embedding, empty),
             (ShaderGroup::RoPE, empty),
             (ShaderGroup::RoPEGrad, empty),
-            (ShaderGroup::SlidingWindowAttention, empty),
             (ShaderGroup::LayerNorm, empty),
             (ShaderGroup::SwiGLUGrad, empty),
             (ShaderGroup::SwiGLUConcat, empty),
@@ -1957,9 +1937,6 @@ mod tests {
                 ShaderEntry::Transpose => vec!["src", "dst", "params"],
                 ShaderEntry::RmsNorm => vec!["src", "bias", "dst", "params"],
                 ShaderEntry::Embedding => vec!["indices", "src", "dst", "params"],
-                ShaderEntry::SlidingWindowAttention => {
-                    vec!["src_a", "src_b", "bias", "dst", "lse", "params"]
-                }
                 ShaderEntry::LayerNorm => vec!["src", "src_b", "bias", "dst", "params"],
                 ShaderEntry::MultiHeadAttn => {
                     vec!["src_a", "src_b", "bias", "dst", "lse", "params"]
@@ -2073,7 +2050,6 @@ mod tests {
             ShaderEntry::Embedding,
             ShaderEntry::RoPE,
             ShaderEntry::RoPEGrad,
-            ShaderEntry::SlidingWindowAttention,
             ShaderEntry::Gelu,
             ShaderEntry::Tanh,
             ShaderEntry::LayerNorm,

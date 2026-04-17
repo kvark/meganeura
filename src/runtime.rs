@@ -276,30 +276,6 @@ struct FourBufData {
     params: MatMulParams,
 }
 
-// sliding_window_attention: var src_a (q), src_b (k), bias (v), dst, params
-// params has 5 fields so needs its own struct (not MatMulParams which has 4)
-#[derive(blade_macros::ShaderData)]
-struct SlidingWindowAttentionData {
-    src_a: blade_graphics::BufferPiece,
-    src_b: blade_graphics::BufferPiece,
-    bias: blade_graphics::BufferPiece,
-    dst: blade_graphics::BufferPiece,
-    lse: blade_graphics::BufferPiece,
-    params: SlidingWindowAttentionParams,
-}
-
-#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
-#[repr(C)]
-struct SlidingWindowAttentionParams {
-    seq: u32,
-    num_heads: u32,
-    num_kv_heads: u32,
-    head_dim: u32,
-    window_size: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
-}
 
 // rope_dynamic: var src, dst, pos_offset_buf, params
 #[derive(blade_macros::ShaderData)]
@@ -561,13 +537,13 @@ struct MultiHeadAttnData {
     bias: blade_graphics::BufferPiece,
     dst: blade_graphics::BufferPiece,
     lse: blade_graphics::BufferPiece,
-    params: MatMulParams,
+    params: AttentionParams,
 }
 
 // multi_head_attn_grad: var d_out (dO), src_a (Q), src_b (K), bias (V), lse, fwd_dst (O), dst (dQ/dK/dV), params
 #[derive(blade_macros::ShaderData, Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
 #[repr(C)]
-struct AttentionGradParams {
+struct AttentionParams {
     q_seq: u32,
     kv_seq: u32,
     packed_heads: u32,
@@ -587,7 +563,7 @@ struct MultiHeadAttnGradData {
     lse: blade_graphics::BufferPiece,
     fwd_dst: blade_graphics::BufferPiece,
     dst: blade_graphics::BufferPiece,
-    params: AttentionGradParams,
+    params: AttentionParams,
 }
 
 // Fused GradK+GradV: outputs dK (dst) and dV (dst2)
@@ -601,7 +577,7 @@ struct MultiHeadAttnGradKVData {
     fwd_dst: blade_graphics::BufferPiece,
     dst: blade_graphics::BufferPiece,
     dst2: blade_graphics::BufferPiece,
-    params: AttentionGradParams,
+    params: AttentionParams,
 }
 
 // ---- Pipeline collection ----
@@ -983,7 +959,6 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::RmsNorm => RmsNormData::layout(),
         ShaderEntry::Embedding => EmbeddingData::layout(),
         ShaderEntry::RoPE | ShaderEntry::RoPEGrad => RoPEData::layout(),
-        ShaderEntry::SlidingWindowAttention => SlidingWindowAttentionData::layout(),
         ShaderEntry::Gelu => UnaryData::layout(),
         ShaderEntry::LayerNorm => LayerNormData::layout(),
         ShaderEntry::MultiHeadAttn => MultiHeadAttnData::layout(),
@@ -2449,28 +2424,6 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::SlidingWindowAttention => {
-                pc.bind(
-                    0,
-                    &SlidingWindowAttentionData {
-                        src_a: buf(dispatch.input_buffers[0]),
-                        src_b: buf(dispatch.input_buffers[1]),
-                        bias: buf(dispatch.input_buffers[2]),
-                        dst: buf(dispatch.output_buffer),
-                        lse: buf(dispatch.extra_outputs[0]),
-                        params: SlidingWindowAttentionParams {
-                            seq: dispatch.params[0],
-                            num_heads: dispatch.params[1],
-                            num_kv_heads: dispatch.params[2],
-                            head_dim: dispatch.params[3],
-                            window_size: dispatch.params[4],
-                            _pad0: 0,
-                            _pad1: 0,
-                            _pad2: 0,
-                        },
-                    },
-                );
-            }
             ShaderEntry::Gelu => {
                 pc.bind(
                     0,
@@ -2512,11 +2465,15 @@ impl Session {
                         bias: buf(dispatch.input_buffers[2]),
                         dst: buf(dispatch.output_buffer),
                         lse: buf(dispatch.extra_outputs[0]),
-                        params: MatMulParams {
-                            m: dispatch.params[0],
-                            n: dispatch.params[1],
-                            k: dispatch.params[2],
-                            _pad: dispatch.params[3],
+                        params: AttentionParams {
+                            q_seq: dispatch.params[0],
+                            kv_seq: dispatch.params[1],
+                            packed_heads: dispatch.params[2],
+                            head_dim: dispatch.params[3],
+                            window_size: *dispatch.params.get(4).unwrap_or(&0),
+                            _pad0: 0,
+                            _pad1: 0,
+                            _pad2: 0,
                         },
                     },
                 );
@@ -2533,7 +2490,7 @@ impl Session {
                         fwd_dst: buf(dispatch.input_buffers[5]),
                         dst: buf(dispatch.output_buffer),
                         dst2: buf(dispatch.extra_outputs[0]),
-                        params: AttentionGradParams {
+                        params: AttentionParams {
                             q_seq: dispatch.params[0],
                             kv_seq: dispatch.params[1],
                             packed_heads: dispatch.params[2],
@@ -2559,7 +2516,7 @@ impl Session {
                         lse: buf(dispatch.input_buffers[4]),
                         fwd_dst: buf(dispatch.input_buffers[5]),
                         dst: buf(dispatch.output_buffer),
-                        params: AttentionGradParams {
+                        params: AttentionParams {
                             q_seq: dispatch.params[0],
                             kv_seq: dispatch.params[1],
                             packed_heads: dispatch.params[2],
