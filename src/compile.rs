@@ -77,7 +77,6 @@ pub enum ShaderEntry {
     Embedding,
     RoPE,
     RoPEGrad,
-    SlidingWindowAttention,
     Gelu,
     LayerNorm,
     MultiHeadAttn,
@@ -168,7 +167,6 @@ impl ShaderEntry {
             ShaderEntry::Embedding => ShaderGroup::Embedding,
             ShaderEntry::RoPE => ShaderGroup::RoPE,
             ShaderEntry::RoPEGrad => ShaderGroup::RoPEGrad,
-            ShaderEntry::SlidingWindowAttention => ShaderGroup::SlidingWindowAttention,
             ShaderEntry::Gelu => ShaderGroup::Unary,
             ShaderEntry::LayerNorm => ShaderGroup::LayerNorm,
             ShaderEntry::MultiHeadAttn => ShaderGroup::MultiHeadAttn,
@@ -258,7 +256,6 @@ impl ShaderEntry {
             ShaderEntry::Embedding => "main",
             ShaderEntry::RoPE => "main",
             ShaderEntry::RoPEGrad => "main",
-            ShaderEntry::SlidingWindowAttention => "main",
             ShaderEntry::Gelu => "gelu",
             ShaderEntry::LayerNorm => "main",
             ShaderEntry::MultiHeadAttn
@@ -1793,18 +1790,20 @@ impl<'a> Compiler<'a> {
                 head_dim,
                 window_size,
             } => {
+                // Route through unified attention shader.
+                // kv_seq=0 signals causal, window_size>0 limits the window.
                 let q = self.get_buffer(node.inputs[0]);
                 let k = self.get_buffer(node.inputs[1]);
                 let v = self.get_buffer(node.inputs[2]);
                 let seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let lse_buf = self.find_lse_buffer(node.id);
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::SlidingWindowAttention,
-                    workgroups: [seq.div_ceil(1), num_heads, 1],
+                    shader: ShaderEntry::MultiHeadAttn,
+                    workgroups: [seq, num_heads, 1],
                     input_buffers: vec![q, k, v],
                     output_buffer: out_buf,
                     extra_outputs: vec![lse_buf],
-                    params: vec![seq, num_heads, num_kv_heads, head_dim, window_size],
+                    params: vec![seq, 0, (num_heads << 16) | num_kv_heads, head_dim, window_size],
                     use_coop: false,
                     use_small_tiles: false,
                     ..Default::default()
