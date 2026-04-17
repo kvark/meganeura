@@ -80,6 +80,8 @@ pub enum ShaderEntry {
     Gelu,
     LayerNorm,
     MultiHeadAttn,
+    /// Flash Attention 2 forward: BQ>1 multi-query tiling.
+    FlashAttention,
     MultiHeadAttnGradQ,
     MultiHeadAttnGradK,
     MultiHeadAttnGradV,
@@ -170,6 +172,7 @@ impl ShaderEntry {
             ShaderEntry::Gelu => ShaderGroup::Unary,
             ShaderEntry::LayerNorm => ShaderGroup::LayerNorm,
             ShaderEntry::MultiHeadAttn => ShaderGroup::MultiHeadAttn,
+            ShaderEntry::FlashAttention => ShaderGroup::FlashAttention,
             ShaderEntry::MultiHeadAttnGradQ => ShaderGroup::MultiHeadAttnGradQ,
             ShaderEntry::MultiHeadAttnGradK => ShaderGroup::MultiHeadAttnGradK,
             ShaderEntry::MultiHeadAttnGradKV => ShaderGroup::MultiHeadAttnGradKV,
@@ -259,6 +262,7 @@ impl ShaderEntry {
             ShaderEntry::Gelu => "gelu",
             ShaderEntry::LayerNorm => "main",
             ShaderEntry::MultiHeadAttn
+            | ShaderEntry::FlashAttention
             | ShaderEntry::MultiHeadAttnGradQ
             | ShaderEntry::MultiHeadAttnGradK
             | ShaderEntry::MultiHeadAttnGradV
@@ -1062,6 +1066,17 @@ impl<'a> Compiler<'a> {
         BufferRef(idx)
     }
 
+    /// Choose between FlashAttention (BQ>1) and MultiHeadAttn (BQ=1) for
+    /// a forward attention dispatch. Returns (shader_entry, workgroups_x).
+    fn attention_dispatch(q_seq: u32, head_dim: u32, num_heads: u32) -> (ShaderEntry, [u32; 3]) {
+        let bq = (256 / head_dim).max(1);
+        if bq >= 2 && q_seq >= bq {
+            (ShaderEntry::FlashAttention, [q_seq.div_ceil(bq), num_heads, 1])
+        } else {
+            (ShaderEntry::MultiHeadAttn, [q_seq, num_heads, 1])
+        }
+    }
+
     fn get_buffer(&self, node: NodeId) -> BufferRef {
         self.node_buffers[&node]
     }
@@ -1784,9 +1799,10 @@ impl<'a> Compiler<'a> {
                 let v = self.get_buffer(node.inputs[2]);
                 let seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let lse_buf = self.find_lse_buffer(node.id);
+                let (shader, workgroups) = Self::attention_dispatch(seq, head_dim, num_heads);
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::MultiHeadAttn,
-                    workgroups: [seq, num_heads, 1],
+                    shader,
+                    workgroups,
                     input_buffers: vec![q, k, v],
                     output_buffer: out_buf,
                     extra_outputs: vec![lse_buf],
@@ -1810,9 +1826,10 @@ impl<'a> Compiler<'a> {
                 let v = self.get_buffer(node.inputs[2]);
                 let seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let lse_buf = self.find_lse_buffer(node.id);
+                let (shader, workgroups) = Self::attention_dispatch(seq, head_dim, num_heads);
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::MultiHeadAttn,
-                    workgroups: [seq, num_heads, 1],
+                    shader,
+                    workgroups,
                     input_buffers: vec![q, k, v],
                     output_buffer: out_buf,
                     extra_outputs: vec![lse_buf],
@@ -2453,9 +2470,10 @@ impl<'a> Compiler<'a> {
                 let v = self.get_buffer(node.inputs[2]);
                 let seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let lse_buf = self.find_lse_buffer(node.id);
+                let (shader, workgroups) = Self::attention_dispatch(seq, head_dim, num_heads);
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::MultiHeadAttn,
-                    workgroups: [seq, num_heads, 1],
+                    shader,
+                    workgroups,
                     input_buffers: vec![q, k, v],
                     output_buffer: out_buf,
                     extra_outputs: vec![lse_buf],
@@ -2478,9 +2496,10 @@ impl<'a> Compiler<'a> {
                 let q_seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let kv_seq = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
                 let lse_buf = self.find_lse_buffer(node.id);
+                let (shader, workgroups) = Self::attention_dispatch(q_seq, head_dim, num_heads);
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::MultiHeadAttn,
-                    workgroups: [q_seq, num_heads, 1],
+                    shader,
+                    workgroups,
                     input_buffers: vec![q, k, v],
                     output_buffer: out_buf,
                     extra_outputs: vec![lse_buf],
@@ -2503,9 +2522,10 @@ impl<'a> Compiler<'a> {
                 let q_seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let kv_seq = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
                 let lse_buf = self.find_lse_buffer(node.id);
+                let (shader, workgroups) = Self::attention_dispatch(q_seq, head_dim, num_heads);
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::MultiHeadAttn,
-                    workgroups: [q_seq, num_heads, 1],
+                    shader,
+                    workgroups,
                     input_buffers: vec![q, k, v],
                     output_buffer: out_buf,
                     extra_outputs: vec![lse_buf],
