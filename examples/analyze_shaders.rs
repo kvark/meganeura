@@ -6,12 +6,18 @@
 //!   - cooperative matrix ops
 //!   - total instruction count
 //!
+//! With `--gpu`, also compiles each pipeline on the actual GPU and queries
+//! driver-reported statistics (register counts, spill loads/stores, etc.).
+//!
 //! Usage:
 //!   cargo run --release --example analyze_shaders
 //!   cargo run --release --example analyze_shaders -- --dump   # also write .spv files
+//!   cargo run --release --example analyze_shaders -- --gpu    # query GPU pipeline stats
 
-use std::collections::HashMap;
 use std::process::Command;
+
+use meganeura::codegen::{CoopConfig, ShaderGroup, ShaderModule};
+use meganeura::compile::ShaderEntry;
 
 fn analyze_spirv(name: &str, module: &naga::Module, dump: bool) {
     let flags = naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
@@ -66,19 +72,12 @@ fn analyze_spirv(name: &str, module: &naga::Module, dump: bool) {
     };
 
     // Count instruction types
-    let mut counts: HashMap<&str, usize> = HashMap::new();
     let mut vec4_loads = 0usize;
     let mut scalar_loads = 0usize;
-    let mut vec4_type_defined = false;
     let mut coop_ops = 0usize;
 
     for line in disasm.lines() {
         let trimmed = line.trim();
-
-        // Track vec4<f32> type definitions
-        if trimmed.contains("OpTypeVector") && trimmed.contains("%float") && trimmed.contains("4") {
-            vec4_type_defined = true;
-        }
 
         // Count loads by type
         if trimmed.contains("OpLoad") {
@@ -95,18 +94,6 @@ fn analyze_spirv(name: &str, module: &naga::Module, dump: bool) {
         // Count cooperative matrix operations
         if trimmed.contains("OpCooperativeMatrix") {
             coop_ops += 1;
-            *counts.entry("coop_matrix_ops").or_default() += 1;
-        }
-
-        // Count key instruction categories
-        if trimmed.contains("OpFMul") || trimmed.contains("OpFAdd") {
-            *counts.entry("float_arith").or_default() += 1;
-        }
-        if trimmed.contains("OpStore") {
-            *counts.entry("stores").or_default() += 1;
-        }
-        if trimmed.contains("OpLoad") {
-            *counts.entry("loads").or_default() += 1;
         }
     }
 
@@ -126,113 +113,312 @@ fn analyze_spirv(name: &str, module: &naga::Module, dump: bool) {
         coop_ops,
         disasm.lines().count(),
     );
+}
 
-    let _ = vec4_type_defined; // suppress warning
+fn analyze_gpu(gpu: &blade_graphics::Context, name: &str, sm: &ShaderModule, entry: &ShaderEntry) {
+    use blade_graphics as bg;
+    let shader = gpu.create_shader(bg::ShaderDesc {
+        source: &sm.source,
+        naga_module: Some(sm.module.clone()),
+    });
+    let layout = meganeura::runtime::shader_data_layout(entry);
+    let mut pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
+        name: entry.entry_point(),
+        data_layouts: &[&layout],
+        compute: shader.at(entry.entry_point()),
+    });
+    let stats = gpu.get_pipeline_statistics(&pipeline);
+    if stats.is_empty() {
+        println!("  {:40} (no GPU statistics available)", name);
+    } else {
+        for exec in &stats {
+            print!("  {:40}", name);
+            for stat in &exec.statistics {
+                print!("  {}={}", stat.name, stat.value);
+            }
+            println!();
+        }
+    }
+    gpu.destroy_compute_pipeline(&mut pipeline);
+}
+
+fn analyze(
+    name: &str,
+    sm: &ShaderModule,
+    entry: &ShaderEntry,
+    dump: bool,
+    gpu: Option<&blade_graphics::Context>,
+) {
+    analyze_spirv(name, &sm.module, dump);
+    if let Some(g) = gpu {
+        analyze_gpu(g, name, sm, entry);
+    }
 }
 
 fn main() {
     let dump = std::env::args().any(|a| a == "--dump");
+    let gpu_mode = std::env::args().any(|a| a == "--gpu");
 
-    println!("=== Shader SPIR-V Analysis ===\n");
+    let gpu = if gpu_mode {
+        Some(
+            unsafe {
+                blade_graphics::Context::init(blade_graphics::ContextDesc {
+                    validation: false,
+                    timing: false,
+                    capture: false,
+                    overlay: false,
+                    ..Default::default()
+                })
+            }
+            .expect("failed to initialize GPU context"),
+        )
+    } else {
+        None
+    };
+    let gpu_ref = gpu.as_ref();
 
-    // 1. Coop matmul Normal (f16 path, tile=16) — the new vec4 version
+    println!("=== Shader Analysis ===\n");
+
+    // 1. Coop matmul (f16 path, tile=16)
     println!("Cooperative matmul (tile=16, f16 input, f32 accum):");
     {
-        let config = meganeura::codegen::CoopConfig {
+        let config = CoopConfig {
             tile_size: 16,
             use_f16_input: true,
         };
-        let sm = meganeura::codegen::generate_coop_module(
-            meganeura::codegen::ShaderGroup::MatMulCoop,
-            &config,
-        );
-        analyze_spirv("matmul_coop_16x16_f16", &sm.module, dump);
-
-        let sm_bt = meganeura::codegen::generate_coop_module(
-            meganeura::codegen::ShaderGroup::MatMulCoopBT,
-            &config,
-        );
-        analyze_spirv("matmul_coop_bt_16x16_f16", &sm_bt.module, dump);
-
-        let sm_at = meganeura::codegen::generate_coop_module(
-            meganeura::codegen::ShaderGroup::MatMulCoopAT,
-            &config,
-        );
-        analyze_spirv("matmul_coop_at_16x16_f16", &sm_at.module, dump);
-
-        let sm_add = meganeura::codegen::generate_coop_module(
-            meganeura::codegen::ShaderGroup::MatMulCoopAdd,
-            &config,
-        );
-        analyze_spirv("matmul_coop_add_16x16_f16", &sm_add.module, dump);
+        let cases: &[(&str, ShaderGroup, ShaderEntry)] = &[
+            (
+                "matmul_coop_16x16_f16",
+                ShaderGroup::MatMulCoop,
+                ShaderEntry::MatMul,
+            ),
+            (
+                "matmul_coop_bt_16x16_f16",
+                ShaderGroup::MatMulCoopBT,
+                ShaderEntry::MatMulBT,
+            ),
+            (
+                "matmul_coop_at_16x16_f16",
+                ShaderGroup::MatMulCoopAT,
+                ShaderEntry::MatMulAT,
+            ),
+            (
+                "matmul_coop_add_16x16_f16",
+                ShaderGroup::MatMulCoopAdd,
+                ShaderEntry::FusedMatMulAdd,
+            ),
+        ];
+        for (name, group, entry) in cases {
+            let sm = meganeura::codegen::generate_coop_module(*group, &config);
+            analyze(name, &sm, entry, dump, gpu_ref);
+        }
     }
 
     // 2. Coop matmul (f32 path, tile=8 — Apple Silicon)
     println!("\nCooperative matmul (tile=8, f32 — Apple path):");
     {
-        let config = meganeura::codegen::CoopConfig {
+        let config = CoopConfig {
             tile_size: 8,
             use_f16_input: false,
         };
-        let sm = meganeura::codegen::generate_coop_module(
-            meganeura::codegen::ShaderGroup::MatMulCoop,
-            &config,
+        let sm = meganeura::codegen::generate_coop_module(ShaderGroup::MatMulCoop, &config);
+        analyze(
+            "matmul_coop_8x8_f32",
+            &sm,
+            &ShaderEntry::MatMul,
+            dump,
+            gpu_ref,
         );
-        analyze_spirv("matmul_coop_8x8_f32", &sm.module, dump);
     }
 
     // 3. Non-coop matmul (register-tiled)
     println!("\nRegister-tiled matmul (no tensor cores):");
     {
-        let sm = meganeura::codegen::generate_module(meganeura::codegen::ShaderGroup::MatMul);
-        analyze_spirv("matmul_64x64_register", &sm.module, dump);
+        let sm = meganeura::codegen::generate_module(ShaderGroup::MatMul);
+        analyze(
+            "matmul_64x64_register",
+            &sm,
+            &ShaderEntry::MatMul,
+            dump,
+            gpu_ref,
+        );
     }
 
     // 4. GEMV kernels
     println!("\nGEMV kernels:");
     {
-        let sm = meganeura::codegen::generate_module(meganeura::codegen::ShaderGroup::MatMulGemv);
-        analyze_spirv("matmul_gemv", &sm.module, dump);
+        let sm = meganeura::codegen::generate_module(ShaderGroup::MatMulGemv);
+        analyze("matmul_gemv", &sm, &ShaderEntry::MatMulGemv, dump, gpu_ref);
 
-        let sm_bt =
-            meganeura::codegen::generate_module(meganeura::codegen::ShaderGroup::MatMulGemvBT);
-        analyze_spirv("matmul_gemv_bt", &sm_bt.module, dump);
+        let sm_bt = meganeura::codegen::generate_module(ShaderGroup::MatMulGemvBT);
+        analyze(
+            "matmul_gemv_bt",
+            &sm_bt,
+            &ShaderEntry::MatMulGemvBT,
+            dump,
+            gpu_ref,
+        );
     }
 
     // 5. Conv2d GEMM (forward)
     println!("\nConv2d GEMM:");
     {
-        let sm = meganeura::codegen::generate_module(meganeura::codegen::ShaderGroup::Conv2dGemm);
-        analyze_spirv("conv2d_gemm_64x64", &sm.module, dump);
+        let sm = meganeura::codegen::generate_module(ShaderGroup::Conv2dGemm);
+        analyze(
+            "conv2d_gemm_64x64",
+            &sm,
+            &ShaderEntry::Conv2dGemm,
+            dump,
+            gpu_ref,
+        );
 
-        let sm_small =
-            meganeura::codegen::generate_module(meganeura::codegen::ShaderGroup::Conv2dGemmSmall);
-        analyze_spirv("conv2d_gemm_32x32", &sm_small.module, dump);
+        let sm_small = meganeura::codegen::generate_module(ShaderGroup::Conv2dGemmSmall);
+        analyze(
+            "conv2d_gemm_32x32",
+            &sm_small,
+            &ShaderEntry::Conv2dGemmSmall,
+            dump,
+            gpu_ref,
+        );
     }
 
     // 6. Conv2d backward
     println!("\nConv2d backward:");
     {
-        let sm = meganeura::codegen::generate_module(
-            meganeura::codegen::ShaderGroup::Conv2dGradInputGemm,
+        let sm = meganeura::codegen::generate_module(ShaderGroup::Conv2dGradInputGemm);
+        analyze(
+            "conv2d_grad_input_gemm",
+            &sm,
+            &ShaderEntry::Conv2dGradInputGemm,
+            dump,
+            gpu_ref,
         );
-        analyze_spirv("conv2d_grad_input_gemm", &sm.module, dump);
 
-        let sm_wt = meganeura::codegen::generate_module(
-            meganeura::codegen::ShaderGroup::Conv2dGradWeightGemm,
+        let sm_wt = meganeura::codegen::generate_module(ShaderGroup::Conv2dGradWeightGemm);
+        analyze(
+            "conv2d_grad_weight_gemm",
+            &sm_wt,
+            &ShaderEntry::Conv2dGradWeightGemm,
+            dump,
+            gpu_ref,
         );
-        analyze_spirv("conv2d_grad_weight_gemm", &sm_wt.module, dump);
     }
 
     // 7. Attention
     println!("\nAttention:");
     {
-        let sm =
-            meganeura::codegen::generate_module(meganeura::codegen::ShaderGroup::CausalAttention);
-        analyze_spirv("causal_attention", &sm.module, dump);
+        let sm = meganeura::codegen::generate_module(ShaderGroup::MultiHeadAttn);
+        analyze(
+            "multi_head_attn",
+            &sm,
+            &ShaderEntry::MultiHeadAttn,
+            dump,
+            gpu_ref,
+        );
+    }
+
+    // 8. Flash Attention
+    println!("\nFlash Attention:");
+    {
+        let sm = meganeura::codegen::generate_flash_attention_module(64);
+        analyze(
+            "flash_attention_hd64",
+            &sm,
+            &ShaderEntry::FlashAttention,
+            dump,
+            gpu_ref,
+        );
+
+        let sm_gq = meganeura::codegen::generate_flash_grad_q_module(64);
+        analyze(
+            "flash_grad_q_hd64",
+            &sm_gq,
+            &ShaderEntry::FlashGradQ,
+            dump,
+            gpu_ref,
+        );
+
+        let sm_gkv = meganeura::codegen::generate_flash_grad_kv_module(64);
+        analyze(
+            "flash_grad_kv_hd64",
+            &sm_gkv,
+            &ShaderEntry::FlashGradKV,
+            dump,
+            gpu_ref,
+        );
+    }
+
+    // 9. Normalization backward
+    println!("\nNormalization backward:");
+    {
+        let sm = meganeura::codegen::generate_module(ShaderGroup::RmsNormGrad);
+        analyze(
+            "rms_norm_grad_w",
+            &sm,
+            &ShaderEntry::RmsNormGradW,
+            dump,
+            gpu_ref,
+        );
+        analyze(
+            "rms_norm_grad_x",
+            &sm,
+            &ShaderEntry::RmsNormGradX,
+            dump,
+            gpu_ref,
+        );
+
+        let sm_lnorm = meganeura::codegen::generate_module(ShaderGroup::LayerNormGrad);
+        analyze(
+            "layer_norm_grad_wb",
+            &sm_lnorm,
+            &ShaderEntry::LayerNormGradWB,
+            dump,
+            gpu_ref,
+        );
+        analyze(
+            "layer_norm_grad_x",
+            &sm_lnorm,
+            &ShaderEntry::LayerNormGradX,
+            dump,
+            gpu_ref,
+        );
+    }
+
+    // 10. Unary/Binary ops
+    println!("\nElementwise ops:");
+    {
+        let sm_unary = meganeura::codegen::generate_module(ShaderGroup::Unary);
+        analyze("relu", &sm_unary, &ShaderEntry::Relu, dump, gpu_ref);
+        analyze("silu", &sm_unary, &ShaderEntry::Silu, dump, gpu_ref);
+        analyze("gelu", &sm_unary, &ShaderEntry::Gelu, dump, gpu_ref);
+
+        let sm_binary = meganeura::codegen::generate_module(ShaderGroup::Binary);
+        analyze("add", &sm_binary, &ShaderEntry::Add, dump, gpu_ref);
+        analyze("mul", &sm_binary, &ShaderEntry::Mul, dump, gpu_ref);
+
+        let sm_reduce = meganeura::codegen::generate_module(ShaderGroup::Reduce);
+        analyze("sum_all", &sm_reduce, &ShaderEntry::SumAll, dump, gpu_ref);
+        analyze("mean_all", &sm_reduce, &ShaderEntry::MeanAll, dump, gpu_ref);
+    }
+
+    // 11. Softmax + losses
+    println!("\nSoftmax/Losses:");
+    {
+        let sm = meganeura::codegen::generate_module(ShaderGroup::Softmax);
+        analyze("softmax", &sm, &ShaderEntry::Softmax, dump, gpu_ref);
+
+        let sm_ce = meganeura::codegen::generate_module(ShaderGroup::CrossEntropy);
+        analyze(
+            "cross_entropy",
+            &sm_ce,
+            &ShaderEntry::CrossEntropyLoss,
+            dump,
+            gpu_ref,
+        );
     }
 
     println!("\nDone. Use --dump to write .spv files for manual inspection.");
+    println!("     Use --gpu to query real GPU pipeline statistics.");
     if dump {
         println!("Disassemble with: spirv-dis <name>.spv | grep -E 'OpLoad|OpStore|Cooperative'");
     }

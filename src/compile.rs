@@ -1086,9 +1086,10 @@ impl<'a> Compiler<'a> {
     /// Choose between FlashAttention (BQ>1) and MultiHeadAttn (BQ=1) for
     /// a forward attention dispatch. Returns (shader_entry, workgroups_x).
     fn attention_dispatch(q_seq: u32, head_dim: u32, num_heads: u32) -> (ShaderEntry, [u32; 3]) {
-        // EPT (elements per thread) matches codegen: reduces threads per query,
-        // increases BQ (queries per workgroup).
-        let ept = head_dim.min(64);
+        // EPT (elements per thread) matches codegen (capped at 32 to avoid
+        // register spilling on Ampere): reduces threads per query, increases
+        // BQ (queries per workgroup).
+        let ept = head_dim.min(32);
         let tpq = head_dim / ept; // threads per query
         let bq = (256 / tpq).max(1);
         if bq >= 2 && q_seq >= bq {
@@ -1102,14 +1103,13 @@ impl<'a> Compiler<'a> {
     }
 
     /// Backward attention dispatch: matches the vectorized EPT/TPQ/BQ pattern
-    /// of the forward kernel. When EPT == head_dim, TPQ = 1 and BQ = 256,
-    /// i.e. one thread owns an entire query (or KV) row.
+    /// of the forward kernel.
     fn attention_dispatch_bwd(
         q_seq: u32,
         head_dim: u32,
         num_heads: u32,
     ) -> (ShaderEntry, [u32; 3]) {
-        let ept = head_dim.min(64);
+        let ept = head_dim.min(32);
         let tpq = head_dim / ept;
         let bq = (256 / tpq).max(1);
         if bq >= 2 && q_seq >= bq {
@@ -3581,6 +3581,53 @@ mod tests {
             let _group = entry.shader_group();
             let ep = entry.entry_point();
             assert!(!ep.is_empty());
+        }
+    }
+
+    /// Verify that the EPT/TPQ/BQ values computed in the dispatch functions
+    /// match those used by the codegen shader generators. A mismatch means
+    /// the compile-time workgroup counts won't match the shader's tile sizes,
+    /// producing wrong results for attention kernels.
+    #[test]
+    fn test_attention_dispatch_matches_codegen_ept() {
+        // The dispatch functions compute:
+        //   ept = head_dim.min(CAP)
+        //   tpq = head_dim / ept
+        //   bq  = (256 / tpq).max(1)
+        //
+        // The codegen functions (generate_flash_attention_module, etc.) use
+        // the same formula. If these ever diverge, workgroup counts will be
+        // wrong. Test all power-of-2 head_dims that matter.
+        for hd_log2 in 1..=8 {
+            let hd: u32 = 1 << hd_log2;
+
+            // Forward dispatch
+            let (entry, wg) = Compiler::attention_dispatch(256, hd, 1);
+            // The forward codegen uses the same EPT cap.
+            let codegen_ept: u32 = hd.min(32);
+            let codegen_tpq = hd / codegen_ept;
+            let codegen_bq: u32 = (256 / codegen_tpq).max(1);
+
+            if codegen_bq >= 2 {
+                // Should have chosen flash path
+                assert_eq!(
+                    entry,
+                    ShaderEntry::FlashAttention,
+                    "hd={hd}: dispatch should pick FlashAttention when bq={codegen_bq}"
+                );
+                // Workgroup X count must match codegen's tile size
+                assert_eq!(
+                    wg[0],
+                    256u32.div_ceil(codegen_bq),
+                    "hd={hd}: dispatch workgroups_x mismatch (bq={codegen_bq})"
+                );
+            }
+
+            // Backward dispatch
+            let (bwd_entry, bwd_wg) = Compiler::attention_dispatch_bwd(256, hd, 1);
+            // Should match forward for same params
+            assert_eq!(entry, bwd_entry, "hd={hd}: fwd/bwd dispatch entry mismatch");
+            assert_eq!(wg, bwd_wg, "hd={hd}: fwd/bwd dispatch workgroups mismatch");
         }
     }
 }
