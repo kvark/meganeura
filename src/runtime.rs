@@ -620,7 +620,10 @@ impl Pipelines {
 
         for dispatch in &plan.dispatches {
             let group = dispatch.shader.shader_group();
-            needed.insert(group);
+            // Conv2dGradInputGemmCoop3x3 is coop-only; skip for non-coop map.
+            if group != ShaderGroup::Conv2dGradInputGemmCoop3x3 {
+                needed.insert(group);
+            }
             entries_for_group
                 .entry(group)
                 .or_default()
@@ -658,6 +661,9 @@ impl Pipelines {
                     ShaderGroup::MatMulBT => ShaderGroup::MatMulCoopBT,
                     ShaderGroup::Conv2dGemm => ShaderGroup::Conv2dGemmCoop,
                     ShaderGroup::Conv2dGradInputGemm => ShaderGroup::Conv2dGradInputGemmCoop,
+                    ShaderGroup::Conv2dGradInputGemmCoop3x3 => {
+                        ShaderGroup::Conv2dGradInputGemmCoop3x3
+                    }
                     ShaderGroup::FusedRmsNormMatMul => ShaderGroup::FusedRmsNormMatMulCoop,
                     _ => continue,
                 };
@@ -1010,7 +1016,8 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::Conv2dGradInput => Conv2dGradInputData::layout(),
         ShaderEntry::Conv2dGradInputGemm
         | ShaderEntry::Conv2dGradInputGemmSmall
-        | ShaderEntry::Conv2dGradInputGemmCoop => Conv2dGradInputData::layout(),
+        | ShaderEntry::Conv2dGradInputGemmCoop
+        | ShaderEntry::Conv2dGradInputGemmCoop3x3 => Conv2dGradInputData::layout(),
         ShaderEntry::Conv2dGradWeight
         | ShaderEntry::Conv2dGradWeightGemm
         | ShaderEntry::Conv2dGradWeightGemmSmall => Conv2dGradWeightData::layout(),
@@ -1464,6 +1471,15 @@ impl Session {
                 };
                 if coop_wgs >= min_wgs {
                     dispatch.use_coop = true;
+                    // Route 3×3 stride-1 conv2d grad_input to specialized coop kernel
+                    if is_conv_bwd {
+                        let kh = dispatch.params[5];
+                        let kw = dispatch.params[6];
+                        let stride = dispatch.params[7];
+                        if kh == 3 && kw == 3 && stride == 1 {
+                            dispatch.shader = ShaderEntry::Conv2dGradInputGemmCoop3x3;
+                        }
+                    }
                     dispatch.workgroups = [m.div_ceil(output_tile), n.div_ceil(output_tile), batch];
                     // coopStore/coopLoad operate on full tiles without per-element
                     // bounds checking. Pad output and addend buffers so edge
@@ -3025,7 +3041,8 @@ impl Session {
             ShaderEntry::Conv2dGradInput
             | ShaderEntry::Conv2dGradInputGemm
             | ShaderEntry::Conv2dGradInputGemmSmall
-            | ShaderEntry::Conv2dGradInputGemmCoop => {
+            | ShaderEntry::Conv2dGradInputGemmCoop
+            | ShaderEntry::Conv2dGradInputGemmCoop3x3 => {
                 let p = &dispatch.params;
                 let kernel_hw = p[5] * p[6];
                 pc.bind(
