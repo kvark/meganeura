@@ -76,6 +76,28 @@ fn main() {
     eprintln!("compiling session...");
     let mut session = build_session(&g);
 
+    // Fill shapes for derived params (e.g. SwiGLU concat "gate+up") from buffer sizes.
+    // These aren't in the original graph, so param_shapes doesn't have them.
+    for (name, buf_ref) in session.plan().param_buffers.iter() {
+        if !param_shapes.contains_key(name) {
+            let n = session.plan().buffers[buf_ref.0 as usize] / 4;
+            // Derived concat weights are 2D [in_dim, concat_out_dim]; infer shape
+            // from the first component's shape.
+            if name.contains('+') {
+                let first = name.split('+').next().unwrap();
+                if let Some(first_shape) = param_shapes.get(first) {
+                    if first_shape.len() == 2 {
+                        let in_dim = first_shape[0];
+                        let out_dim = n / in_dim;
+                        param_shapes.insert(name.clone(), vec![in_dim, out_dim]);
+                        continue;
+                    }
+                }
+            }
+            param_shapes.insert(name.clone(), vec![n]);
+        }
+    }
+
     // Initialize: sin(element_idx * 0.01 + 1.0) * 0.1, same as bench_smolvla_train
     for (name, buf_ref) in session.plan().param_buffers.clone() {
         let n = session.plan().buffers[buf_ref.0 as usize] / 4;

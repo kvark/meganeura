@@ -51,7 +51,7 @@ A two-layer MLP, trained end to end on the GPU, in one screen.
 
 Training shows the same shape on non-NVIDIA: on Radeon 890M, Meganeura trains SmolLM2-135M in 87 ms/step vs PyTorch ROCm’s 123 ms, and SmolVLA in 35 ms vs 41 ms. On NVIDIA, PyTorch CUDA still leads on training workloads.
 
-Meganeura also runs on GPUs PyTorch doesn’t target, including Intel integrated graphics (RPL-U).
+Meganeura also runs on GPUs PyTorch doesn’t target, including Radeon 780M and Intel integrated graphics (RPL-U).
 
 The wedge isn’t every workload: on ResNet-50 and Whisper-tiny, Meganeura currently trails. Full cross-framework tables — including the losses — at [inferena.tech](https://inferena.tech). Reproduce locally with `./run.sh -m <Model>`.
 
