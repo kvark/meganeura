@@ -1075,6 +1075,29 @@ impl<'a> Compiler<'a> {
     /// Choose between FlashAttention (BQ>1) and MultiHeadAttn (BQ=1) for
     /// a forward attention dispatch. Returns (shader_entry, workgroups_x).
     fn attention_dispatch(q_seq: u32, head_dim: u32, num_heads: u32) -> (ShaderEntry, [u32; 3]) {
+        // EPT (elements per thread) matches codegen: reduces threads per query,
+        // increases BQ (queries per workgroup).
+        let ept = head_dim.min(64);
+        let tpq = head_dim / ept; // threads per query
+        let bq = (256 / tpq).max(1);
+        if bq >= 2 && q_seq >= bq {
+            (
+                ShaderEntry::FlashAttention,
+                [q_seq.div_ceil(bq), num_heads, 1],
+            )
+        } else {
+            (ShaderEntry::MultiHeadAttn, [q_seq, num_heads, 1])
+        }
+    }
+
+    /// Backward attention dispatch: uses BQ = 256/head_dim (1 thread per
+    /// head_dim element) matching the grad kernels which haven't been
+    /// vectorized yet.
+    fn attention_dispatch_bwd(
+        q_seq: u32,
+        head_dim: u32,
+        num_heads: u32,
+    ) -> (ShaderEntry, [u32; 3]) {
         let bq = (256 / head_dim).max(1);
         if bq >= 2 && q_seq >= bq {
             (
@@ -2582,7 +2605,7 @@ impl<'a> Compiler<'a> {
                     _ => 0,
                 };
                 let (grad_q_shader, grad_q_wgs) =
-                    Self::attention_dispatch(q_seq, head_dim, num_heads);
+                    Self::attention_dispatch_bwd(q_seq, head_dim, num_heads);
                 let grad_q_shader = match grad_q_shader {
                     ShaderEntry::FlashAttention => ShaderEntry::FlashGradQ,
                     _ => ShaderEntry::MultiHeadAttnGradQ,
@@ -2643,7 +2666,7 @@ impl<'a> Compiler<'a> {
                 let dv_buf = self.alloc_buffer(self.graph.node(node.inputs[3]).ty.size_bytes());
                 self.fused_grad_kv_dv.insert(fwd_node, dv_buf);
                 let (grad_kv_shader, grad_kv_wgs) =
-                    Self::attention_dispatch(dispatch_kv, head_dim, num_kv_heads);
+                    Self::attention_dispatch_bwd(dispatch_kv, head_dim, num_kv_heads);
                 let grad_kv_shader = match grad_kv_shader {
                     ShaderEntry::FlashAttention => ShaderEntry::FlashGradKV,
                     _ => ShaderEntry::MultiHeadAttnGradKV,
