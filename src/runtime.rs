@@ -620,8 +620,14 @@ impl Pipelines {
 
         for dispatch in &plan.dispatches {
             let group = dispatch.shader.shader_group();
-            // Conv2dGradInputGemmCoop3x3 is coop-only; skip for non-coop map.
-            if group != ShaderGroup::Conv2dGradInputGemmCoop3x3 {
+            // Generated conv2d coop entries and Conv2dGradInputGemmCoop3x3
+            // are coop-only; skip for non-coop map.
+            let is_gen_coop = matches!(
+                dispatch.shader,
+                ShaderEntry::Conv2dGradInputGemmCoopGen(..)
+                    | ShaderEntry::Conv2dGemmCoopGen(..)
+            );
+            if group != ShaderGroup::Conv2dGradInputGemmCoop3x3 && !is_gen_coop {
                 needed.insert(group);
             }
             entries_for_group
@@ -659,8 +665,13 @@ impl Pipelines {
                     ShaderGroup::MatMulAdd => ShaderGroup::MatMulCoopAdd,
                     ShaderGroup::MatMulAT => ShaderGroup::MatMulCoopAT,
                     ShaderGroup::MatMulBT => ShaderGroup::MatMulCoopBT,
-                    ShaderGroup::Conv2dGemm => ShaderGroup::Conv2dGemmCoop,
-                    ShaderGroup::Conv2dGradInputGemm => ShaderGroup::Conv2dGradInputGemmCoop,
+                    ShaderGroup::Conv2dGemm | ShaderGroup::Conv2dGemmCoop => {
+                        ShaderGroup::Conv2dGemmCoop
+                    }
+                    ShaderGroup::Conv2dGradInputGemm
+                    | ShaderGroup::Conv2dGradInputGemmCoop => {
+                        ShaderGroup::Conv2dGradInputGemmCoop
+                    }
                     ShaderGroup::Conv2dGradInputGemmCoop3x3 => {
                         ShaderGroup::Conv2dGradInputGemmCoop3x3
                     }
@@ -762,27 +773,84 @@ impl Pipelines {
                 compile_group(group, &mut map);
             }
         }
+        // Collect generated conv2d coop entries that need individual compilation.
+        let mut conv2d_gen_entries: Vec<ShaderEntry> = Vec::new();
         for &group in &needed_coop {
             if let Some(config) = coop_config {
-                // Use the runtime-detected coop config for shader generation.
-                let sm = crate::codegen::generate_coop_module(group, config);
-                let shader = gpu.create_shader(bg::ShaderDesc {
-                    source: &sm.source,
-                    naga_module: Some(sm.module),
-                });
+                // Check if this group has generated conv2d entries that need
+                // per-kernel-config compilation.
+                let mut has_non_gen = false;
                 if let Some(entries) = entries_for_group.get(&group) {
                     for entry in entries {
-                        let layout = shader_data_layout(entry);
-                        let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                            name: entry.entry_point(),
-                            data_layouts: &[&layout],
-                            compute: shader.at(entry.entry_point()),
-                        });
-                        coop_map.insert(entry.clone(), pipeline);
+                        if matches!(
+                            entry,
+                            ShaderEntry::Conv2dGemmCoopGen(..)
+                                | ShaderEntry::Conv2dGradInputGemmCoopGen(..)
+                        ) {
+                            conv2d_gen_entries.push(entry.clone());
+                        } else {
+                            has_non_gen = true;
+                        }
+                    }
+                }
+                // Compile the non-generated entries with the template-based path.
+                if has_non_gen {
+                    let sm = crate::codegen::generate_coop_module(group, config);
+                    let shader = gpu.create_shader(bg::ShaderDesc {
+                        source: &sm.source,
+                        naga_module: Some(sm.module),
+                    });
+                    if let Some(entries) = entries_for_group.get(&group) {
+                        for entry in entries {
+                            if matches!(
+                                entry,
+                                ShaderEntry::Conv2dGemmCoopGen(..)
+                                    | ShaderEntry::Conv2dGradInputGemmCoopGen(..)
+                            ) {
+                                continue;
+                            }
+                            let layout = shader_data_layout(entry);
+                            let pipeline =
+                                gpu.create_compute_pipeline(bg::ComputePipelineDesc {
+                                    name: entry.entry_point(),
+                                    data_layouts: &[&layout],
+                                    compute: shader.at(entry.entry_point()),
+                                });
+                            coop_map.insert(entry.clone(), pipeline);
+                        }
                     }
                 }
             } else {
                 compile_group(group, &mut coop_map);
+            }
+        }
+        // Compile generated conv2d coop kernels individually.
+        if let Some(config) = coop_config {
+            use crate::codegen::Conv2dCoopDirection;
+            for entry in &conv2d_gen_entries {
+                let (kh, kw, stride, direction) = match *entry {
+                    ShaderEntry::Conv2dGemmCoopGen(kh, kw, s) => {
+                        (kh, kw, s, Conv2dCoopDirection::Forward)
+                    }
+                    ShaderEntry::Conv2dGradInputGemmCoopGen(kh, kw, s) => {
+                        (kh, kw, s, Conv2dCoopDirection::GradInput)
+                    }
+                    _ => unreachable!(),
+                };
+                let sm = crate::codegen::generate_conv2d_coop_module(
+                    kh, kw, stride, direction, config,
+                );
+                let shader = gpu.create_shader(bg::ShaderDesc {
+                    source: &sm.source,
+                    naga_module: Some(sm.module),
+                });
+                let layout = shader_data_layout(entry);
+                let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
+                    name: entry.entry_point(),
+                    data_layouts: &[&layout],
+                    compute: shader.at(entry.entry_point()),
+                });
+                coop_map.insert(entry.clone(), pipeline);
             }
         }
 
@@ -1010,14 +1078,16 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         ShaderEntry::SplitA | ShaderEntry::SplitB => UnaryData::layout(),
         ShaderEntry::Upsample2x | ShaderEntry::Upsample2xGrad => UnaryData::layout(),
         ShaderEntry::Conv2d => Conv2dData::layout(),
-        ShaderEntry::Conv2dGemm | ShaderEntry::Conv2dGemmSmall | ShaderEntry::Conv2dGemmCoop => {
-            Conv2dData::layout()
-        }
+        ShaderEntry::Conv2dGemm
+        | ShaderEntry::Conv2dGemmSmall
+        | ShaderEntry::Conv2dGemmCoop
+        | ShaderEntry::Conv2dGemmCoopGen(..) => Conv2dData::layout(),
         ShaderEntry::Conv2dGradInput => Conv2dGradInputData::layout(),
         ShaderEntry::Conv2dGradInputGemm
         | ShaderEntry::Conv2dGradInputGemmSmall
         | ShaderEntry::Conv2dGradInputGemmCoop
-        | ShaderEntry::Conv2dGradInputGemmCoop3x3 => Conv2dGradInputData::layout(),
+        | ShaderEntry::Conv2dGradInputGemmCoop3x3
+        | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => Conv2dGradInputData::layout(),
         ShaderEntry::Conv2dGradWeight
         | ShaderEntry::Conv2dGradWeightGemm
         | ShaderEntry::Conv2dGradWeightGemmSmall => Conv2dGradWeightData::layout(),
@@ -1471,14 +1541,19 @@ impl Session {
                 };
                 if coop_wgs >= min_wgs {
                     dispatch.use_coop = true;
-                    // Route 3×3 stride-1 conv2d grad_input to specialized coop kernel
+                    // Route conv2d coop dispatches to generated specialized kernels
                     if is_conv_bwd {
                         let kh = dispatch.params[5];
                         let kw = dispatch.params[6];
                         let stride = dispatch.params[7];
-                        if kh == 3 && kw == 3 && stride == 1 {
-                            dispatch.shader = ShaderEntry::Conv2dGradInputGemmCoop3x3;
-                        }
+                        dispatch.shader =
+                            ShaderEntry::Conv2dGradInputGemmCoopGen(kh, kw, stride);
+                    } else if matches!(group, ShaderGroup::Conv2dGemm) {
+                        let kh = dispatch.params[5];
+                        let kw = dispatch.params[6];
+                        let stride = dispatch.params[7];
+                        dispatch.shader =
+                            ShaderEntry::Conv2dGemmCoopGen(kh, kw, stride);
                     }
                     dispatch.workgroups = [m.div_ceil(output_tile), n.div_ceil(output_tile), batch];
                     // coopStore/coopLoad operate on full tiles without per-element
@@ -3008,7 +3083,8 @@ impl Session {
             ShaderEntry::Conv2d
             | ShaderEntry::Conv2dGemm
             | ShaderEntry::Conv2dGemmSmall
-            | ShaderEntry::Conv2dGemmCoop => {
+            | ShaderEntry::Conv2dGemmCoop
+            | ShaderEntry::Conv2dGemmCoopGen(..) => {
                 let p = &dispatch.params;
                 let kernel_hw = p[5] * p[6];
                 pc.bind(
@@ -3042,7 +3118,8 @@ impl Session {
             | ShaderEntry::Conv2dGradInputGemm
             | ShaderEntry::Conv2dGradInputGemmSmall
             | ShaderEntry::Conv2dGradInputGemmCoop
-            | ShaderEntry::Conv2dGradInputGemmCoop3x3 => {
+            | ShaderEntry::Conv2dGradInputGemmCoop3x3
+            | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => {
                 let p = &dispatch.params;
                 let kernel_hw = p[5] * p[6];
                 pc.bind(
