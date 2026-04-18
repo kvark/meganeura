@@ -1090,15 +1090,17 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    /// Backward attention dispatch: uses BQ = 256/head_dim (1 thread per
-    /// head_dim element) matching the grad kernels which haven't been
-    /// vectorized yet.
+    /// Backward attention dispatch: matches the vectorized EPT/TPQ/BQ pattern
+    /// of the forward kernel. When EPT == head_dim, TPQ = 1 and BQ = 256,
+    /// i.e. one thread owns an entire query (or KV) row.
     fn attention_dispatch_bwd(
         q_seq: u32,
         head_dim: u32,
         num_heads: u32,
     ) -> (ShaderEntry, [u32; 3]) {
-        let bq = (256 / head_dim).max(1);
+        let ept = head_dim.min(64);
+        let tpq = head_dim / ept;
+        let bq = (256 / tpq).max(1);
         if bq >= 2 && q_seq >= bq {
             (
                 ShaderEntry::FlashAttention,
