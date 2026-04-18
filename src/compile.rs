@@ -2127,9 +2127,9 @@ impl<'a> Compiler<'a> {
                 if kernel_h == 1 && kernel_w == 1 && stride == 1
                     && padding_h == 0 && padding_w == 0
                 {
-                    let m = (batch * in_h * in_w) as u32;
-                    let n = out_channels as u32;
-                    let k = in_channels as u32;
+                    let m = batch * in_h * in_w ;
+                    let n = out_channels;
+                    let k = in_channels;
                     let tile_size = 64u32;
                     let wgs_64 = m.div_ceil(tile_size) * n.div_ceil(tile_size);
                     let (shader, tile) = if wgs_64 < 16 {
@@ -2307,6 +2307,31 @@ impl<'a> Compiler<'a> {
                 let out_w = (in_w + 2 * padding_w - kernel_w) / stride + 1;
                 let out_size = node.ty.shape[0] as u32;
                 let batch = out_size / (in_channels * in_h * in_w);
+
+                // 1×1 stride-1 grad_input → MatMul: dInput = dOutput @ W
+                // dOutput is [batch*H*W, Co], W is [Co, Ci] → dInput = [batch*H*W, Ci]
+                if kernel_h == 1 && kernel_w == 1 && stride == 1
+                    && padding_h == 0 && padding_w == 0
+                {
+                    let m = batch * in_h * in_w ;
+                    let n = in_channels;
+                    let k = out_channels;
+                    let tile: u32 = 64;
+                    // MatMul: C = A @ B where A=[M,K], B=[K,N]
+                    // A = dOutput[batch*HW, Co], B = weight[Co, Ci] needs transpose to [Co, Ci] → already in right order!
+                    // Actually weight is [Co, Ci], so we need A @ B where B is [Co, Ci] → use MatMul (not BT)
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::MatMul,
+                        workgroups: [m.div_ceil(tile), n.div_ceil(tile), 1],
+                        input_buffers: vec![grad_out, kernel],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params: vec![m, k, n, 0],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
+                } else {
                 // Use implicit GEMM: grad_input = weight_T @ im2col(grad_out)^T
                 // M=Ci, N=H*W, K=Co*kH*kW, batched in z dimension
                 let wgs_64 = in_h * in_w.div_ceil(64) * in_channels.div_ceil(64);
@@ -2344,6 +2369,7 @@ impl<'a> Compiler<'a> {
                     use_small_tiles: false,
                     ..Default::default()
                 });
+                }
             }
 
             Op::Conv2dGradWeight {
@@ -2363,6 +2389,31 @@ impl<'a> Compiler<'a> {
                 let out_w = (in_w + 2 * padding_w - kernel_w) / stride + 1;
                 let out_size = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let batch = out_size / (out_channels * out_h * out_w);
+
+                // 1×1 stride-1 grad_weight → MatMulAT:
+                // dW[Co, Ci] = dOutput^T @ input where dOutput=[batch*HW, Co], input=[batch*HW, Ci]
+                // MatMulAT: C = A^T @ B where A=[K,M], B=[K,N]
+                // A = dOutput[batch*HW, Co], B = input[batch*HW, Ci]
+                // → C = dOutput^T[Co, batch*HW] @ input[batch*HW, Ci] = [Co, Ci]
+                if kernel_h == 1 && kernel_w == 1 && stride == 1
+                    && padding_h == 0 && padding_w == 0
+                {
+                    let m = out_channels; // Co
+                    let n = in_channels; // Ci
+                    let k = batch * in_h * in_w ; // batch*HW
+                    let tile: u32 = 64;
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::MatMulAT,
+                        workgroups: [m.div_ceil(tile), n.div_ceil(tile), 1],
+                        input_buffers: vec![grad_out, input],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params: vec![m, n, k, 0],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
+                } else {
                 // Use GEMM formulation: grad_weight[Co, Ci*kH*kW] = grad_out_flat[Co, N*oH*oW] @ im2col(input)[N*oH*oW, Ci*kH*kW]
                 let n_total = in_channels * kernel_h * kernel_w; // Ci*kH*kW
                 let m_total = out_channels; // Co
@@ -2397,6 +2448,7 @@ impl<'a> Compiler<'a> {
                     use_small_tiles: false,
                     ..Default::default()
                 });
+                }
             }
 
             Op::CacheWrite => {

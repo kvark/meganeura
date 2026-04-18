@@ -1864,7 +1864,7 @@ pub fn generate_flash_grad_q_module(head_dim: u32) -> ShaderModule {
     for e in 0..ept {
         let _ = writeln!(src, "    var dq{e} = 0.0;");
     }
-    src.push_str("\n");
+    src.push('\n');
 
     if tpq == 1 {
         // Tiled KV loop with BKV positions per barrier (only when tpq=1).
@@ -2112,7 +2112,7 @@ pub fn generate_flash_grad_kv_module(head_dim: u32) -> ShaderModule {
         let _ = writeln!(src, "    var dk{e} = 0.0;");
         let _ = writeln!(src, "    var dv{e} = 0.0;");
     }
-    src.push_str("\n");
+    src.push('\n');
 
     // Q loop range bounds
     src.push_str("    let start_pos = select(0u, t, kv_seq == 0u);\n");
