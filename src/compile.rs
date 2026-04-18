@@ -119,6 +119,7 @@ pub enum ShaderEntry {
     Conv2dGradInputGemm,
     Conv2dGradInputGemmSmall,
     Conv2dGradInputGemmCoop,
+    Conv2dGradInputGemmCoop3x3,
     Conv2dGradWeight,
     Conv2dGradWeightGemm,
     Conv2dGradWeightGemmSmall,
@@ -209,6 +210,7 @@ impl ShaderEntry {
             ShaderEntry::Conv2dGradInputGemm => ShaderGroup::Conv2dGradInputGemm,
             ShaderEntry::Conv2dGradInputGemmSmall => ShaderGroup::Conv2dGradInputGemmSmall,
             ShaderEntry::Conv2dGradInputGemmCoop => ShaderGroup::Conv2dGradInputGemmCoop,
+            ShaderEntry::Conv2dGradInputGemmCoop3x3 => ShaderGroup::Conv2dGradInputGemmCoop3x3,
             ShaderEntry::Conv2dGradWeight => ShaderGroup::Conv2dGradWeight,
             ShaderEntry::Conv2dGradWeightGemm => ShaderGroup::Conv2dGradWeightGemm,
             ShaderEntry::Conv2dGradWeightGemmSmall => ShaderGroup::Conv2dGradWeightGemmSmall,
@@ -301,7 +303,8 @@ impl ShaderEntry {
             ShaderEntry::Conv2dGradInput => "main",
             ShaderEntry::Conv2dGradInputGemm
             | ShaderEntry::Conv2dGradInputGemmSmall
-            | ShaderEntry::Conv2dGradInputGemmCoop => "main",
+            | ShaderEntry::Conv2dGradInputGemmCoop
+            | ShaderEntry::Conv2dGradInputGemmCoop3x3 => "main",
             ShaderEntry::Conv2dGradWeight
             | ShaderEntry::Conv2dGradWeightGemm
             | ShaderEntry::Conv2dGradWeightGemmSmall => "main",

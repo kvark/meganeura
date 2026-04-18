@@ -341,6 +341,7 @@ pub enum ShaderGroup {
     Conv2dGradInputGemm,
     Conv2dGradInputGemmSmall,
     Conv2dGradInputGemmCoop,
+    Conv2dGradInputGemmCoop3x3,
     GroupNormSilu,
     WinogradInputTransform,
     WinogradOutputTransform,
@@ -441,6 +442,7 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         }
         ShaderGroup::Conv2dGemmCoop => gen_conv2d_gemm_coop(),
         ShaderGroup::Conv2dGradInputGemmCoop => gen_conv2d_grad_input_gemm_coop(),
+        ShaderGroup::Conv2dGradInputGemmCoop3x3 => gen_conv2d_grad_input_gemm_coop_3x3(),
         ShaderGroup::GroupNormSilu => parse_wgsl(include_str!("shaders/group_norm_silu.wgsl")),
         ShaderGroup::WinogradInputTransform => {
             parse_wgsl(include_str!("shaders/winograd_input_transform.wgsl"))
@@ -483,6 +485,7 @@ pub fn generate_coop_module(group: ShaderGroup, config: &CoopConfig) -> ShaderMo
         ShaderGroup::MatMulCoopAT => gen_matmul_coop_wgsl(false, MatMulCoopVariant::AT, config),
         ShaderGroup::Conv2dGemmCoop => gen_conv2d_gemm_coop_wgsl(config),
         ShaderGroup::Conv2dGradInputGemmCoop => gen_conv2d_grad_input_gemm_coop_wgsl(config),
+        ShaderGroup::Conv2dGradInputGemmCoop3x3 => gen_conv2d_grad_input_gemm_coop_3x3_wgsl(config),
         ShaderGroup::FusedRmsNormMatMulCoop => gen_fused_rms_norm_matmul_coop_wgsl(config),
         _ => panic!("not a coop shader group: {:?}", group),
     }
@@ -497,6 +500,7 @@ pub fn generate_wgsl(group: ShaderGroup) -> String {
         | ShaderGroup::MatMulCoopAT
         | ShaderGroup::Conv2dGemmCoop
         | ShaderGroup::Conv2dGradInputGemmCoop
+        | ShaderGroup::Conv2dGradInputGemmCoop3x3
         | ShaderGroup::MatMulCoopBT
         | ShaderGroup::FusedRmsNormMatMulCoop => {
             naga::valid::Capabilities::COOPERATIVE_MATRIX
@@ -2343,6 +2347,73 @@ fn gen_conv2d_grad_input_gemm_coop_wgsl(config: &CoopConfig) -> ShaderModule {
     parse_wgsl(&src)
 }
 
+fn gen_conv2d_grad_input_gemm_coop_3x3() -> ShaderModule {
+    let default_config = CoopConfig {
+        tile_size: 16,
+        use_f16_input: true,
+    };
+    gen_conv2d_grad_input_gemm_coop_3x3_wgsl(&default_config)
+}
+
+fn gen_conv2d_grad_input_gemm_coop_3x3_wgsl(config: &CoopConfig) -> ShaderModule {
+    let tile = config.tile_size;
+    let output_tile = config.output_tile();
+    let shared_size = tile * tile;
+    let wg_size: u32 = 64;
+    let staging_iters = shared_size / wg_size;
+    let row_stride = wg_size / tile;
+    let tile_mask = tile - 1;
+    let tile_shift = tile.trailing_zeros();
+
+    let (elem_type, enable_f16, elem_zero, cast_open, cast_close) = if config.use_f16_input {
+        ("f16", "enable f16;", "f16(0.0)", "f16(", ")")
+    } else {
+        ("f32", "", "0.0", "", "")
+    };
+    let ab_type = if config.use_f16_input { "f16" } else { "f32" };
+    let coop_ab = format!("coop_mat{}x{}<{},A>", tile, tile, ab_type);
+    let coop_ba = format!("coop_mat{}x{}<{},B>", tile, tile, ab_type);
+    let coop_c = format!("coop_mat{}x{}<f32,C>", tile, tile);
+
+    let acc_init = format!(
+        "var acc00 = {coop_c}();\n\
+         \x20   var acc01 = {coop_c}();\n\
+         \x20   var acc10 = {coop_c}();\n\
+         \x20   var acc11 = {coop_c}();"
+    );
+
+    let output_tile_u = format!("{}u", output_tile);
+    let tile_size_u = format!("{}u", tile);
+    let tile_mask_u = format!("{}u", tile_mask);
+    let tile_shift_u = format!("{}u", tile_shift);
+    let staging_iters_u = format!("{}u", staging_iters);
+    let row_stride_u = format!("{}u", row_stride);
+    let shared_size_s = format!("{}", shared_size);
+
+    let src = include_str!("shaders/conv2d_grad_input_gemm_coop_3x3.wgsl");
+    let src = preprocess(
+        src,
+        &[
+            ("$ENABLE_F16", enable_f16),
+            ("$ELEM_TYPE", elem_type),
+            ("$ELEM_ZERO", elem_zero),
+            ("$SHARED_SIZE", &shared_size_s),
+            ("$OUTPUT_TILE_U", &output_tile_u),
+            ("$TILE_SIZE_U", &tile_size_u),
+            ("$TILE_MASK_U", &tile_mask_u),
+            ("$TILE_SHIFT_U", &tile_shift_u),
+            ("$STAGING_ITERS_U", &staging_iters_u),
+            ("$ROW_STRIDE_U", &row_stride_u),
+            ("$CAST_OPEN", cast_open),
+            ("$CAST_CLOSE", cast_close),
+            ("$COOP_AB", &coop_ab),
+            ("$COOP_BA", &coop_ba),
+            ("$ACC_INIT", &acc_init),
+        ],
+    );
+    parse_wgsl(&src)
+}
+
 #[allow(dead_code)]
 fn gen_fused_rms_norm_matmul_coop() -> ShaderModule {
     let default_config = CoopConfig {
@@ -2460,6 +2531,11 @@ mod tests {
             ),
             (
                 ShaderGroup::Conv2dGradInputGemmCoop,
+                naga::valid::Capabilities::COOPERATIVE_MATRIX
+                    | naga::valid::Capabilities::SHADER_FLOAT16,
+            ),
+            (
+                ShaderGroup::Conv2dGradInputGemmCoop3x3,
                 naga::valid::Capabilities::COOPERATIVE_MATRIX
                     | naga::valid::Capabilities::SHADER_FLOAT16,
             ),
@@ -2674,6 +2750,7 @@ mod tests {
                     | ShaderGroup::MatMulCoopBT
                     | ShaderGroup::Conv2dGemmCoop
                     | ShaderGroup::Conv2dGradInputGemmCoop
+                    | ShaderGroup::Conv2dGradInputGemmCoop3x3
             ) {
                 continue;
             }
@@ -2834,7 +2911,8 @@ mod tests {
                 ShaderEntry::Conv2dGradInputGemm | ShaderEntry::Conv2dGradInputGemmSmall => {
                     vec!["grad_out", "weight", "dst", "params"]
                 }
-                ShaderEntry::Conv2dGradInputGemmCoop => {
+                ShaderEntry::Conv2dGradInputGemmCoop
+                | ShaderEntry::Conv2dGradInputGemmCoop3x3 => {
                     vec!["grad_out", "weight", "dst", "params"]
                 }
                 ShaderEntry::Conv2dGradWeight
