@@ -2491,7 +2491,11 @@ pub fn generate_conv2d_coop_module(
     let mut src = String::with_capacity(8192);
 
     // Header
-    let dir_str = if backward { "backward (grad_input)" } else { "forward" };
+    let dir_str = if backward {
+        "backward (grad_input)"
+    } else {
+        "forward"
+    };
     let _ = writeln!(
         src,
         "// Conv2d {dir_str} via implicit GEMM — cooperative matrix variant."
@@ -2575,10 +2579,7 @@ pub fn generate_conv2d_coop_module(
         src.push_str("    let n = wgid.z;\n\n");
         src.push_str("    let m_total = params.in_channels;\n");
         src.push_str("    let n_total = params.in_h * params.in_w;\n");
-        let _ = writeln!(
-            src,
-            "    let k_total = params.out_channels * KERNEL_HW;"
-        );
+        let _ = writeln!(src, "    let k_total = params.out_channels * KERNEL_HW;");
         src.push_str("    let go_spatial = params.out_h * params.out_w;\n\n");
 
         // Padding computation for backward
@@ -2597,13 +2598,8 @@ pub fn generate_conv2d_coop_module(
         src.push_str("    let n = wgid.z;\n\n");
         src.push_str("    let m_total = params.out_channels;\n");
         src.push_str("    let n_total = params.out_h * params.out_w;\n");
-        let _ = writeln!(
-            src,
-            "    let k_total = params.in_channels * KERNEL_HW;"
-        );
-        src.push_str(
-            "    let input_stride = params.in_channels * params.in_h * params.in_w;\n\n",
-        );
+        let _ = writeln!(src, "    let k_total = params.in_channels * KERNEL_HW;");
+        src.push_str("    let input_stride = params.in_channels * params.in_h * params.in_w;\n\n");
     }
 
     // C offsets for the 4 output tiles
@@ -2621,14 +2617,8 @@ pub fn generate_conv2d_coop_module(
         "    let c11 = n * m_total * n_total + (tile_row + {tile}u) * n_total + (tile_col + {tile}u);"
     );
     src.push('\n');
-    let _ = writeln!(
-        src,
-        "    let n1_valid = (tile_col + {tile}u) < n_total;"
-    );
-    let _ = writeln!(
-        src,
-        "    let m1_valid = (tile_row + {tile}u) < m_total;"
-    );
+    let _ = writeln!(src, "    let n1_valid = (tile_col + {tile}u) < n_total;");
+    let _ = writeln!(src, "    let m1_valid = (tile_row + {tile}u) < m_total;");
     src.push('\n');
 
     // Accumulator init
@@ -2661,59 +2651,135 @@ pub fn generate_conv2d_coop_module(
         // === BACKWARD STAGING ===
         // Stage sa0: B-tile im2col(grad_out)^T
         emit_grad_input_im2col_stage(
-            &mut src, "shared_a0", "tile_col", "cc0", "in_n0", "ih0", "iw0",
-            tile, tile_mask, staging_iters, row_stride,
-            kernel_hw, stride, cast_open, cast_close, elem_zero,
+            &mut src,
+            "shared_a0",
+            "tile_col",
+            "cc0",
+            "in_n0",
+            "ih0",
+            "iw0",
+            tile,
+            tile_mask,
+            staging_iters,
+            row_stride,
+            kernel_hw,
+            stride,
+            cast_open,
+            cast_close,
+            elem_zero,
         );
 
         // Stage sa1: second column block
         let _ = writeln!(src, "        let cc1 = tile_col + {tile}u + src_col;");
         emit_grad_input_im2col_stage(
-            &mut src, "shared_a1", &format!("tile_col + {tile}u"), "cc1", "in_n1", "ih1", "iw1",
-            tile, tile_mask, staging_iters, row_stride,
-            kernel_hw, stride, cast_open, cast_close, elem_zero,
+            &mut src,
+            "shared_a1",
+            &format!("tile_col + {tile}u"),
+            "cc1",
+            "in_n1",
+            "ih1",
+            "iw1",
+            tile,
+            tile_mask,
+            staging_iters,
+            row_stride,
+            kernel_hw,
+            stride,
+            cast_open,
+            cast_close,
+            elem_zero,
         );
 
         // Stage sb0: A-tile weight_T
         emit_grad_input_weight_stage(
-            &mut src, "shared_b0", "tile_row", false,
-            tile, staging_iters, row_stride, kernel_hw,
-            cast_open, cast_close, elem_zero,
+            &mut src,
+            "shared_b0",
+            "tile_row",
+            false,
+            tile,
+            staging_iters,
+            row_stride,
+            kernel_hw,
+            cast_open,
+            cast_close,
+            elem_zero,
         );
 
         // Stage sb1: A-tile weight_T second row block
         emit_grad_input_weight_stage(
-            &mut src, "shared_b1", "tile_row", true,
-            tile, staging_iters, row_stride, kernel_hw,
-            cast_open, cast_close, elem_zero,
+            &mut src,
+            "shared_b1",
+            "tile_row",
+            true,
+            tile,
+            staging_iters,
+            row_stride,
+            kernel_hw,
+            cast_open,
+            cast_close,
+            elem_zero,
         );
     } else {
         // === FORWARD STAGING ===
         // Stage sb0: A-tile weight[Co, K] via vec4
         emit_forward_weight_stage(
-            &mut src, "shared_b0", "tile_row", false,
-            tile, cast_open, cast_close, elem_zero,
+            &mut src,
+            "shared_b0",
+            "tile_row",
+            false,
+            tile,
+            cast_open,
+            cast_close,
+            elem_zero,
         );
 
         // Stage sb1: A-tile weight second row block
         emit_forward_weight_stage(
-            &mut src, "shared_b1", "tile_row", true,
-            tile, cast_open, cast_close, elem_zero,
+            &mut src,
+            "shared_b1",
+            "tile_row",
+            true,
+            tile,
+            cast_open,
+            cast_close,
+            elem_zero,
         );
 
         // Stage sa0: B-tile im2col(input)
         emit_forward_im2col_stage(
-            &mut src, "shared_a0", "tile_col", "cc0", "in_n0",
-            tile, tile_mask, staging_iters, row_stride,
-            kernel_hw, stride, cast_open, cast_close, elem_zero,
+            &mut src,
+            "shared_a0",
+            "tile_col",
+            "cc0",
+            "in_n0",
+            tile,
+            tile_mask,
+            staging_iters,
+            row_stride,
+            kernel_hw,
+            stride,
+            cast_open,
+            cast_close,
+            elem_zero,
         );
 
         // Stage sa1: B-tile second column block
         let _ = writeln!(src, "        let cc1 = tile_col + {tile}u + src_col;");
         emit_forward_im2col_stage(
-            &mut src, "shared_a1", &format!("tile_col + {tile}u"), "cc1", "in_n1",
-            tile, tile_mask, staging_iters, row_stride,
-            kernel_hw, stride, cast_open, cast_close, elem_zero,
+            &mut src,
+            "shared_a1",
+            &format!("tile_col + {tile}u"),
+            "cc1",
+            "in_n1",
+            tile,
+            tile_mask,
+            staging_iters,
+            row_stride,
+            kernel_hw,
+            stride,
+            cast_open,
+            cast_close,
+            elem_zero,
         );
     }
 
@@ -2749,7 +2815,10 @@ pub fn generate_conv2d_coop_module(
     } else {
         "output [N, Co, oH, oW]"
     };
-    let _ = writeln!(src, "    // Store results to {store_comment} in NCHW layout");
+    let _ = writeln!(
+        src,
+        "    // Store results to {store_comment} in NCHW layout"
+    );
     src.push_str("    coopStoreT(acc00, &dst[c00], n_total);\n");
     src.push_str("    if n1_valid {\n");
     src.push_str("        coopStoreT(acc01, &dst[c01], n_total);\n");
@@ -2795,10 +2864,7 @@ fn emit_grad_input_im2col_stage(
     if is_first {
         let _ = writeln!(src, "        let {cc_var} = {tile_col_expr} + src_col;");
     }
-    let _ = writeln!(
-        src,
-        "        let {in_n_var} = {cc_var} < n_total;"
-    );
+    let _ = writeln!(src, "        let {in_n_var} = {cc_var} < n_total;");
 
     // Pre-decompose spatial position (invariant across e iterations)
     let _ = writeln!(
@@ -2820,10 +2886,7 @@ fn emit_grad_input_im2col_stage(
         "            let tr = t + base_row + e * {row_stride}u;"
     );
     src.push_str("            var val = zero_val;\n");
-    let _ = writeln!(
-        src,
-        "            if tr < k_total && {in_n_var} {{"
-    );
+    let _ = writeln!(src, "            if tr < k_total && {in_n_var} {{");
 
     // Decompose tr into (co, kh, kw) using compile-time constants
     let _ = writeln!(src, "                let co = tr / KERNEL_HW;");
@@ -2859,21 +2922,12 @@ fn emit_grad_input_im2col_stage(
             src,
             "                let w_off = i32({iw_var}) + i32(params.padding_w) - i32(kw);"
         );
-        let _ = writeln!(
-            src,
-            "                let i_stride = i32(STRIDE);"
-        );
+        let _ = writeln!(src, "                let i_stride = i32(STRIDE);");
         src.push_str(
             "                if h_off >= 0 && w_off >= 0 && (h_off % i_stride) == 0 && (w_off % i_stride) == 0 {\n",
         );
-        let _ = writeln!(
-            src,
-            "                    let oh = u32(h_off) / STRIDE;"
-        );
-        let _ = writeln!(
-            src,
-            "                    let ow = u32(w_off) / STRIDE;"
-        );
+        let _ = writeln!(src, "                    let oh = u32(h_off) / STRIDE;");
+        let _ = writeln!(src, "                    let ow = u32(w_off) / STRIDE;");
         src.push_str("                    if oh < params.out_h && ow < params.out_w {\n");
         let _ = writeln!(
             src,
@@ -2971,10 +3025,7 @@ fn emit_forward_weight_stage(
     };
     let _ = writeln!(src, "            let gr = {row_offset};");
     src.push_str("            let tc4 = t + v4_col;\n");
-    let _ = writeln!(
-        src,
-        "            let flat = v4_row * {tile}u + v4_col;"
-    );
+    let _ = writeln!(src, "            let flat = v4_row * {tile}u + v4_col;");
     src.push_str("            if gr < m_total && (tc4 + 4u) <= k_total {\n");
     src.push_str("                let v = weight[(gr * k_total + tc4) >> 2u];\n");
     let _ = writeln!(
@@ -2995,18 +3046,9 @@ fn emit_forward_weight_stage(
     );
     src.push_str("            } else {\n");
     let _ = writeln!(src, "                {shared_name}[flat] = zero_val;");
-    let _ = writeln!(
-        src,
-        "                {shared_name}[flat + 1u] = zero_val;"
-    );
-    let _ = writeln!(
-        src,
-        "                {shared_name}[flat + 2u] = zero_val;"
-    );
-    let _ = writeln!(
-        src,
-        "                {shared_name}[flat + 3u] = zero_val;"
-    );
+    let _ = writeln!(src, "                {shared_name}[flat + 1u] = zero_val;");
+    let _ = writeln!(src, "                {shared_name}[flat + 2u] = zero_val;");
+    let _ = writeln!(src, "                {shared_name}[flat + 3u] = zero_val;");
     src.push_str("            }\n");
     src.push_str("        }\n\n");
 }
@@ -3037,10 +3079,7 @@ fn emit_forward_im2col_stage(
     if is_first {
         let _ = writeln!(src, "        let {cc_var} = {tile_col_expr} + src_col;");
     }
-    let _ = writeln!(
-        src,
-        "        let {in_n_var} = {cc_var} < n_total;"
-    );
+    let _ = writeln!(src, "        let {in_n_var} = {cc_var} < n_total;");
 
     let _ = writeln!(
         src,
@@ -3052,21 +3091,12 @@ fn emit_forward_im2col_stage(
         "            let tr = t + base_row + e * {row_stride}u;"
     );
     src.push_str("            var val = zero_val;\n");
-    let _ = writeln!(
-        src,
-        "            if tr < k_total && {in_n_var} {{"
-    );
+    let _ = writeln!(src, "            if tr < k_total && {in_n_var} {{");
 
     // Decompose k_idx into (ci, kh, kw) using compile-time constants
-    let _ = writeln!(
-        src,
-        "                let ci = tr / KERNEL_HW;"
-    );
+    let _ = writeln!(src, "                let ci = tr / KERNEL_HW;");
     src.push_str("                let k_rem = tr - ci * KERNEL_HW;\n");
-    let _ = writeln!(
-        src,
-        "                let kh = k_rem / KERNEL_W;"
-    );
+    let _ = writeln!(src, "                let kh = k_rem / KERNEL_W;");
     src.push_str("                let kw = k_rem - kh * KERNEL_W;\n");
 
     // Decompose hw_idx -> (oh, ow) -> (ih, iw)
@@ -3740,8 +3770,7 @@ mod tests {
     fn generated_conv2d_coop_modules_are_valid() {
         use naga::valid::{Capabilities, ValidationFlags, Validator};
 
-        let coop_caps =
-            Capabilities::COOPERATIVE_MATRIX | Capabilities::SHADER_FLOAT16;
+        let coop_caps = Capabilities::COOPERATIVE_MATRIX | Capabilities::SHADER_FLOAT16;
         let flags = ValidationFlags::all() ^ ValidationFlags::BINDINGS;
         let config = CoopConfig {
             tile_size: 16,

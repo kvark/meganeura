@@ -408,7 +408,7 @@ struct Conv2dParams {
     // Reciprocals for strength-reduced integer division in im2col
     inv_kernel_w: f32,
     inv_kernel_hw: f32,
-    inv_col_w: f32,     // 1/out_w (forward, grad_weight) or 1/in_w (grad_input)
+    inv_col_w: f32,      // 1/out_w (forward, grad_weight) or 1/in_w (grad_input)
     inv_go_spatial: f32, // 1/(out_h*out_w) for grad_weight, unused otherwise
 }
 
@@ -624,8 +624,7 @@ impl Pipelines {
             // are coop-only; skip for non-coop map.
             let is_gen_coop = matches!(
                 dispatch.shader,
-                ShaderEntry::Conv2dGradInputGemmCoopGen(..)
-                    | ShaderEntry::Conv2dGemmCoopGen(..)
+                ShaderEntry::Conv2dGradInputGemmCoopGen(..) | ShaderEntry::Conv2dGemmCoopGen(..)
             );
             if group != ShaderGroup::Conv2dGradInputGemmCoop3x3 && !is_gen_coop {
                 needed.insert(group);
@@ -668,8 +667,7 @@ impl Pipelines {
                     ShaderGroup::Conv2dGemm | ShaderGroup::Conv2dGemmCoop => {
                         ShaderGroup::Conv2dGemmCoop
                     }
-                    ShaderGroup::Conv2dGradInputGemm
-                    | ShaderGroup::Conv2dGradInputGemmCoop => {
+                    ShaderGroup::Conv2dGradInputGemm | ShaderGroup::Conv2dGradInputGemmCoop => {
                         ShaderGroup::Conv2dGradInputGemmCoop
                     }
                     ShaderGroup::Conv2dGradInputGemmCoop3x3 => {
@@ -810,12 +808,11 @@ impl Pipelines {
                                 continue;
                             }
                             let layout = shader_data_layout(entry);
-                            let pipeline =
-                                gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                                    name: entry.entry_point(),
-                                    data_layouts: &[&layout],
-                                    compute: shader.at(entry.entry_point()),
-                                });
+                            let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
+                                name: entry.entry_point(),
+                                data_layouts: &[&layout],
+                                compute: shader.at(entry.entry_point()),
+                            });
                             coop_map.insert(entry.clone(), pipeline);
                         }
                     }
@@ -837,9 +834,8 @@ impl Pipelines {
                     }
                     _ => unreachable!(),
                 };
-                let sm = crate::codegen::generate_conv2d_coop_module(
-                    kh, kw, stride, direction, config,
-                );
+                let sm =
+                    crate::codegen::generate_conv2d_coop_module(kh, kw, stride, direction, config);
                 let shader = gpu.create_shader(bg::ShaderDesc {
                     source: &sm.source,
                     naga_module: Some(sm.module),
@@ -1546,14 +1542,12 @@ impl Session {
                         let kh = dispatch.params[5];
                         let kw = dispatch.params[6];
                         let stride = dispatch.params[7];
-                        dispatch.shader =
-                            ShaderEntry::Conv2dGradInputGemmCoopGen(kh, kw, stride);
+                        dispatch.shader = ShaderEntry::Conv2dGradInputGemmCoopGen(kh, kw, stride);
                     } else if matches!(group, ShaderGroup::Conv2dGemm) {
                         let kh = dispatch.params[5];
                         let kw = dispatch.params[6];
                         let stride = dispatch.params[7];
-                        dispatch.shader =
-                            ShaderEntry::Conv2dGemmCoopGen(kh, kw, stride);
+                        dispatch.shader = ShaderEntry::Conv2dGemmCoopGen(kh, kw, stride);
                     }
                     dispatch.workgroups = [m.div_ceil(output_tile), n.div_ceil(output_tile), batch];
                     // coopStore/coopLoad operate on full tiles without per-element
