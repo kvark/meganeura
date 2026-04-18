@@ -22,6 +22,10 @@ struct Params {
     out_h: u32,
     out_w: u32,
     padding_w: u32,
+    inv_kernel_w: f32,
+    inv_kernel_hw: f32,
+    inv_col_w: f32,
+    inv_go_spatial: f32,
 }
 
 var<storage> src: array<f32>;              // input [N, Ci, H, W]
@@ -116,13 +120,13 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             let tr = t + base_row + e * $ROW_STRIDE_U;
             var val = zero_val;
             if tr < k_total && in_n0 {
-                // Decompose k_idx → (ci, kh, kw)
-                let ci = tr / kernel_hw;
+                // Decompose k_idx → (ci, kh, kw) via reciprocal multiply
+                let ci = u32(f32(tr) * params.inv_kernel_hw);
                 let k_rem = tr - ci * kernel_hw;
-                let kh = k_rem / params.kernel_w;
+                let kh = u32(f32(k_rem) * params.inv_kernel_w);
                 let kw = k_rem - kh * params.kernel_w;
                 // Decompose hw_idx → (oh, ow) → (ih, iw)
-                let oh = cc0 / params.out_w;
+                let oh = u32(f32(cc0) * params.inv_col_w);
                 let ow = cc0 - oh * params.out_w;
                 let ih = i32(oh * params.stride + kh) - i32(params.padding_h);
                 let iw = i32(ow * params.stride + kw) - i32(params.padding_w);
@@ -141,11 +145,11 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             let tr = t + base_row + e * $ROW_STRIDE_U;
             var val = zero_val;
             if tr < k_total && in_n1 {
-                let ci = tr / kernel_hw;
+                let ci = u32(f32(tr) * params.inv_kernel_hw);
                 let k_rem = tr - ci * kernel_hw;
-                let kh = k_rem / params.kernel_w;
+                let kh = u32(f32(k_rem) * params.inv_kernel_w);
                 let kw = k_rem - kh * params.kernel_w;
-                let oh = cc1 / params.out_w;
+                let oh = u32(f32(cc1) * params.inv_col_w);
                 let ow = cc1 - oh * params.out_w;
                 let ih = i32(oh * params.stride + kh) - i32(params.padding_h);
                 let iw = i32(ow * params.stride + kw) - i32(params.padding_w);

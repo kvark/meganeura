@@ -16,6 +16,10 @@ struct Params {
     out_h: u32,
     out_w: u32,
     padding_w: u32,
+    inv_kernel_w: f32,
+    inv_kernel_hw: f32,
+    inv_col_w: f32,
+    inv_go_spatial: f32,
 }
 
 var<storage> grad_out: array<f32>;    // grad_output [N,Co,oH,oW]
@@ -30,8 +34,8 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let kh = wgid.y;
     let co = wgid.z;
 
-    let ci = cikw / params.kernel_w;
-    let kw = cikw % params.kernel_w;
+    let ci = u32(f32(cikw) * params.inv_kernel_w);
+    let kw = cikw - ci * params.kernel_w;
 
     if ci >= params.in_channels || kh >= params.kernel_h || co >= params.out_channels { return; }
 
@@ -44,10 +48,11 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     loop {
         if idx >= total { break; }
 
-        let n = idx / (params.out_h * params.out_w);
-        let rem = idx % (params.out_h * params.out_w);
-        let oh = rem / params.out_w;
-        let ow = rem % params.out_w;
+        let go_spatial = params.out_h * params.out_w;
+        let n = u32(f32(idx) * params.inv_go_spatial);
+        let rem = idx - n * go_spatial;
+        let oh = u32(f32(rem) * params.inv_col_w);
+        let ow = rem - oh * params.out_w;
 
         let ih = i32(oh * params.stride + kh) - i32(params.padding_h);
         let iw = i32(ow * params.stride + kw) - i32(params.padding_w);

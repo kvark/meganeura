@@ -22,6 +22,10 @@ struct Params {
     out_h: u32,
     out_w: u32,
     padding_w: u32,
+    inv_kernel_w: f32,
+    inv_kernel_hw: f32,
+    inv_col_w: f32,
+    inv_go_spatial: f32,
 }
 
 var<storage> grad_out: array<f32>;
@@ -78,11 +82,11 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             let tr = t + base_row + e * $ROW_STRIDE_U;
             var val = zero_val;
             if tr < k_total && in_n0 {
-                let co = tr / kernel_hw;
+                let co = u32(f32(tr) * params.inv_kernel_hw);
                 let k_rem = tr - co * kernel_hw;
-                let kh = k_rem / params.kernel_w;
+                let kh = u32(f32(k_rem) * params.inv_kernel_w);
                 let kw = k_rem - kh * params.kernel_w;
-                let ih = cc0 / params.in_w;
+                let ih = u32(f32(cc0) * params.inv_col_w);
                 let iw = cc0 - ih * params.in_w;
                 if params.stride == 1u {
                     let oh = i32(ih) + pad_h - i32(kh);
@@ -114,11 +118,11 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             let tr = t + base_row + e * $ROW_STRIDE_U;
             var val = zero_val;
             if tr < k_total && in_n1 {
-                let co = tr / kernel_hw;
+                let co = u32(f32(tr) * params.inv_kernel_hw);
                 let k_rem = tr - co * kernel_hw;
-                let kh = k_rem / params.kernel_w;
+                let kh = u32(f32(k_rem) * params.inv_kernel_w);
                 let kw = k_rem - kh * params.kernel_w;
-                let ih = cc1 / params.in_w;
+                let ih = u32(f32(cc1) * params.inv_col_w);
                 let iw = cc1 - ih * params.in_w;
                 if params.stride == 1u {
                     let oh = i32(ih) + pad_h - i32(kh);
@@ -146,16 +150,18 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         // sb0[flat] = weight_T[tile_row+row_local, t+col_local]
         let tc = t + src_col;
         let in_k = tc < k_total;
+        // Hoist k-index decomposition (tc is loop-invariant)
+        let tc_co = u32(f32(tc) * params.inv_kernel_hw);
+        let tc_k_rem = tc - tc_co * kernel_hw;
+        let tc_kh = u32(f32(tc_k_rem) * params.inv_kernel_w);
+        let tc_kw = tc_k_rem - tc_kh * params.kernel_w;
+        let tc_weight_offset = tc_kh * params.kernel_w + tc_kw;
         for (var e = 0u; e < $STAGING_ITERS_U; e++) {
             let flat = lid.x + e * 64u;
             let gr = tile_row + base_row + e * $ROW_STRIDE_U;
             var val = zero_val;
             if gr < m_total && in_k {
-                let co = tc / kernel_hw;
-                let k_rem = tc - co * kernel_hw;
-                let kh = k_rem / params.kernel_w;
-                let kw = k_rem - kh * params.kernel_w;
-                val = $CAST_OPEN weight[(co * m_total + gr) * kernel_hw + kh * params.kernel_w + kw] $CAST_CLOSE;
+                val = $CAST_OPEN weight[(tc_co * m_total + gr) * kernel_hw + tc_weight_offset] $CAST_CLOSE;
             }
             shared_b0[flat] = val;
         }
@@ -166,11 +172,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             let gr = tile_row + $TILE_SIZE_U + base_row + e * $ROW_STRIDE_U;
             var val = zero_val;
             if gr < m_total && in_k {
-                let co = tc / kernel_hw;
-                let k_rem = tc - co * kernel_hw;
-                let kh = k_rem / params.kernel_w;
-                let kw = k_rem - kh * params.kernel_w;
-                val = $CAST_OPEN weight[(co * m_total + gr) * kernel_hw + kh * params.kernel_w + kw] $CAST_CLOSE;
+                val = $CAST_OPEN weight[(tc_co * m_total + gr) * kernel_hw + tc_weight_offset] $CAST_CLOSE;
             }
             shared_b1[flat] = val;
         }

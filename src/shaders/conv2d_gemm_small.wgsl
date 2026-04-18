@@ -17,6 +17,10 @@ struct Params {
     out_h: u32,
     out_w: u32,
     padding_w: u32,
+    inv_kernel_w: f32,
+    inv_kernel_hw: f32,
+    inv_col_w: f32,
+    inv_go_spatial: f32,
 }
 
 var<storage> src: array<f32>;
@@ -69,11 +73,11 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
 
             var val = 0.0;
             if k_idx < k_total && hw_idx < n_total {
-                let ci = k_idx / kernel_hw;
+                let ci = u32(f32(k_idx) * params.inv_kernel_hw);
                 let k_rem = k_idx - ci * kernel_hw;
-                let kh = k_rem / params.kernel_w;
+                let kh = u32(f32(k_rem) * params.inv_kernel_w);
                 let kw = k_rem - kh * params.kernel_w;
-                let oh = hw_idx / params.out_w;
+                let oh = u32(f32(hw_idx) * params.inv_col_w);
                 let ow = hw_idx - oh * params.out_w;
                 let ih = i32(oh * params.stride + kh) - i32(params.padding_h);
                 let iw = i32(ow * params.stride + kw) - i32(params.padding_w);
