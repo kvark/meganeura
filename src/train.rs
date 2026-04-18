@@ -269,10 +269,7 @@ pub struct SessionConfig<'a> {
 /// Build stages (`optimize_forward`, `autodiff`, `optimize_full`,
 /// `compile`, `gpu_init`) are captured as tracing spans and appear in
 /// Perfetto traces when profiling is active.
-pub fn build(
-    forward_graph: &Graph,
-    cfg: SessionConfig<'_>,
-) -> (Session, OptimizeReport) {
+pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, OptimizeReport) {
     let _span = tracing::info_span!("build_session").entered();
     log::info!("building {:?} session", cfg.mode);
     log::info!("forward graph:\n{}", forward_graph);
@@ -295,7 +292,10 @@ pub fn build(
         let _span = tracing::info_span!("optimize_forward").entered();
         optimize::optimize_with_report(forward_graph)
     };
-    log::info!("optimized forward: {} nodes", optimized_forward.nodes().len());
+    log::info!(
+        "optimized forward: {} nodes",
+        optimized_forward.nodes().len()
+    );
 
     let (final_graph, report) = match cfg.mode {
         Mode::Inference => {
@@ -320,7 +320,10 @@ pub fn build(
                 let _span = tracing::info_span!("autodiff").entered();
                 autodiff::differentiate(&sorted)
             };
-            log::info!("full graph (forward + backward): {} nodes", full.nodes().len());
+            log::info!(
+                "full graph (forward + backward): {} nodes",
+                full.nodes().len()
+            );
             if cfg.skip_full_optimize {
                 (full, forward_report)
             } else {

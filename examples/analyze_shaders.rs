@@ -205,9 +205,8 @@ fn main() {
         let sm = meganeura::codegen::generate_module(meganeura::codegen::ShaderGroup::Conv2dGemm);
         analyze_spirv("conv2d_gemm_64x64", &sm.module, dump);
 
-        let sm_small = meganeura::codegen::generate_module(
-            meganeura::codegen::ShaderGroup::Conv2dGemmSmall,
-        );
+        let sm_small =
+            meganeura::codegen::generate_module(meganeura::codegen::ShaderGroup::Conv2dGemmSmall);
         analyze_spirv("conv2d_gemm_32x32", &sm_small.module, dump);
     }
 
@@ -228,9 +227,8 @@ fn main() {
     // 7. Attention
     println!("\nAttention:");
     {
-        let sm = meganeura::codegen::generate_module(
-            meganeura::codegen::ShaderGroup::CausalAttention,
-        );
+        let sm =
+            meganeura::codegen::generate_module(meganeura::codegen::ShaderGroup::CausalAttention);
         analyze_spirv("causal_attention", &sm.module, dump);
     }
 

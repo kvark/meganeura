@@ -49,14 +49,10 @@ impl std::fmt::Display for MemorySummary {
 ///
 /// On discrete GPUs (NVIDIA, AMD dGPU), tensor core throughput is so much higher
 /// than scalar ALUs that the coop path wins even at moderate workgroup counts.
-/// A threshold of 8 allows coop for most practical matmul shapes while avoiding
-/// extremely small dispatches (e.g. 1×1 tile grids) where the overhead dominates.
-///
-/// On integrated GPUs with few CUs, the scalar path may still be faster at low
-/// workgroup counts due to limited parallelism, but the coop path self-selects
-/// out when the GPU doesn't advertise cooperative matrix support.
-const MIN_COOP_WORKGROUPS: u32 = 32;
-const MIN_COOP_WORKGROUPS_HIGH_K: u32 = 32;
+/// Minimum cooperative matrix workgroups for conv2d backward GEMM.
+/// Conv2d backward has all-scalar staging with heavy im2col decomposition
+/// and only 64 threads vs 256 for the scalar shader.
+const MIN_COOP_WORKGROUPS_CONV_BWD: u32 = 64;
 
 // ---- ShaderData structs matching codegen global variable names ----
 
@@ -275,7 +271,6 @@ struct FourBufData {
     dst: blade_graphics::BufferPiece,
     params: MatMulParams,
 }
-
 
 // rope_dynamic: var src, dst, pos_offset_buf, params
 #[derive(blade_macros::ShaderData)]
@@ -733,12 +728,8 @@ impl Pipelines {
                     ShaderGroup::FlashAttention => {
                         crate::codegen::generate_flash_attention_module(hd)
                     }
-                    ShaderGroup::FlashGradQ => {
-                        crate::codegen::generate_flash_grad_q_module(hd)
-                    }
-                    ShaderGroup::FlashGradKV => {
-                        crate::codegen::generate_flash_grad_kv_module(hd)
-                    }
+                    ShaderGroup::FlashGradQ => crate::codegen::generate_flash_grad_q_module(hd),
+                    ShaderGroup::FlashGradKV => crate::codegen::generate_flash_grad_kv_module(hd),
                     _ => crate::codegen::generate_attention_module(hd),
                 };
                 let shader = gpu.create_shader(bg::ShaderDesc {
@@ -995,9 +986,9 @@ fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
         }
         ShaderEntry::SwiGLUGradGate => TernaryData::layout(),
         ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => BinaryData::layout(),
-        ShaderEntry::RmsNormGradW
-        | ShaderEntry::RmsNormGradWRowPar
-        | ShaderEntry::RmsNormGradX => FourBufData::layout(),
+        ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradWRowPar | ShaderEntry::RmsNormGradX => {
+            FourBufData::layout()
+        }
         ShaderEntry::LayerNormGradWB | ShaderEntry::LayerNormGradX => FourBufData::layout(),
         ShaderEntry::FusedRmsNormMatMul => FourBufData::layout(),
         ShaderEntry::RmsNormRsqrt => UnaryData::layout(),
@@ -1377,7 +1368,7 @@ impl Session {
             for dispatch in &mut plan.dispatches {
                 let group = dispatch.shader.shader_group();
                 // Extract (m, n, k, batch) from dispatch params based on shader group.
-                let (m, n, k, batch) = match group {
+                let (m, n, _k, batch) = match group {
                     ShaderGroup::MatMul | ShaderGroup::MatMulAdd => (
                         dispatch.params[0],
                         dispatch.params[2],
@@ -1427,11 +1418,9 @@ impl Session {
                 // for the scalar shader. Require more workgroups to amortize.
                 let is_conv_bwd = matches!(group, ShaderGroup::Conv2dGradInputGemm);
                 let min_wgs = if is_conv_bwd {
-                    64
-                } else if k >= 1024 {
-                    MIN_COOP_WORKGROUPS_HIGH_K
+                    MIN_COOP_WORKGROUPS_CONV_BWD
                 } else {
-                    MIN_COOP_WORKGROUPS
+                    16 // enables coop for attention K/V projections (N=320, 20 WGs)
                 };
                 if coop_wgs >= min_wgs {
                     dispatch.use_coop = true;
@@ -1461,27 +1450,27 @@ impl Session {
         // produces very few workgroups (< 16). The 4× more workgroups from
         // smaller tiles improve occupancy on GPUs with many SMs.
         {
-        use crate::codegen::ShaderGroup;
-        for dispatch in plan.dispatches.iter_mut() {
-            if dispatch.use_coop || dispatch.use_small_tiles {
-                continue;
+            use crate::codegen::ShaderGroup;
+            for dispatch in plan.dispatches.iter_mut() {
+                if dispatch.use_coop || dispatch.use_small_tiles {
+                    continue;
+                }
+                let group = dispatch.shader.shader_group();
+                let wgs_64: u32 = dispatch.workgroups.iter().product();
+                let has_small = matches!(
+                    group,
+                    ShaderGroup::MatMul
+                        | ShaderGroup::MatMulAdd
+                        | ShaderGroup::MatMulAT
+                        | ShaderGroup::MatMulBT
+                );
+                if has_small && wgs_64 < 16 {
+                    dispatch.use_small_tiles = true;
+                    // 32×32 tiles → double the WG count in each spatial dimension
+                    dispatch.workgroups[0] *= 2;
+                    dispatch.workgroups[1] *= 2;
+                }
             }
-            let group = dispatch.shader.shader_group();
-            let wgs_64: u32 = dispatch.workgroups.iter().product();
-            let has_small = matches!(
-                group,
-                ShaderGroup::MatMul
-                    | ShaderGroup::MatMulAdd
-                    | ShaderGroup::MatMulAT
-                    | ShaderGroup::MatMulBT
-            );
-            if has_small && wgs_64 < 16 {
-                dispatch.use_small_tiles = true;
-                // 32×32 tiles → double the WG count in each spatial dimension
-                dispatch.workgroups[0] *= 2;
-                dispatch.workgroups[1] *= 2;
-            }
-        }
         }
 
         // Reorder dispatches by dependency level so parallel branches (e.g. Q/K/V

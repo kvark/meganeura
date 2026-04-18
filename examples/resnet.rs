@@ -115,19 +115,27 @@ fn hf_name(torchvision_name: &str) -> String {
                     let idx_rest: Vec<&str> = suffix.splitn(2, '.').collect();
                     let layer_idx = idx_rest[0].parse::<usize>().unwrap_or(1) - 1;
                     let attr = idx_rest.get(1).unwrap_or(&"weight");
-                    return format!("resnet.encoder.stages.{stage}.layers.{block}.layer.{layer_idx}.convolution.{attr}");
+                    return format!(
+                        "resnet.encoder.stages.{stage}.layers.{block}.layer.{layer_idx}.convolution.{attr}"
+                    );
                 }
                 if let Some(suffix) = field.strip_prefix("bn") {
                     let idx_rest: Vec<&str> = suffix.splitn(2, '.').collect();
                     let layer_idx = idx_rest[0].parse::<usize>().unwrap_or(1) - 1;
                     let attr = idx_rest.get(1).unwrap_or(&"weight");
-                    return format!("resnet.encoder.stages.{stage}.layers.{block}.layer.{layer_idx}.normalization.{attr}");
+                    return format!(
+                        "resnet.encoder.stages.{stage}.layers.{block}.layer.{layer_idx}.normalization.{attr}"
+                    );
                 }
                 if let Some(suffix) = field.strip_prefix("downsample.0.") {
-                    return format!("resnet.encoder.stages.{stage}.layers.{block}.shortcut.convolution.{suffix}");
+                    return format!(
+                        "resnet.encoder.stages.{stage}.layers.{block}.shortcut.convolution.{suffix}"
+                    );
                 }
                 if let Some(suffix) = field.strip_prefix("downsample.1.") {
-                    return format!("resnet.encoder.stages.{stage}.layers.{block}.shortcut.normalization.{suffix}");
+                    return format!(
+                        "resnet.encoder.stages.{stage}.layers.{block}.shortcut.normalization.{suffix}"
+                    );
                 }
             }
         }
@@ -238,8 +246,6 @@ fn load_resnet_weights(session: &mut meganeura::Session, model: &SafeTensorsMode
         .tensor_f32_auto_transposed(&hf_name("fc.weight"))
         .expect("fc weight");
     session.set_parameter("fc.weight", &fc_w);
-    let fc_b = model
-        .tensor_f32_auto(&hf_name("fc.bias"))
-        .expect("fc bias");
+    let fc_b = model.tensor_f32_auto(&hf_name("fc.bias")).expect("fc bias");
     session.set_parameter("fc.bias", &fc_b);
 }
