@@ -2135,10 +2135,9 @@ impl<'a> Compiler<'a> {
                 // 1×1 stride-1 conv → pure MatMul (no im2col).
                 // output[b, Co, h, w] = sum_Ci(input[b, Ci, h, w] * W[Co, Ci])
                 // Reshape: input as [batch*H*W, Ci], weight as [Ci, Co] → matmul
-                if kernel_h == 1 && kernel_w == 1 && stride == 1
-                    && padding_h == 0 && padding_w == 0
+                if kernel_h == 1 && kernel_w == 1 && stride == 1 && padding_h == 0 && padding_w == 0
                 {
-                    let m = batch * in_h * in_w ;
+                    let m = batch * in_h * in_w;
                     let n = out_channels;
                     let k = in_channels;
                     let tile_size = 64u32;
@@ -2163,44 +2162,44 @@ impl<'a> Compiler<'a> {
                         ..Default::default()
                     });
                 } else {
-                // Use implicit GEMM: output = weight @ im2col(input)^T
-                // M=Co, N=oH*oW, K=Ci*kH*kW, batched in z dimension
-                // Use small (32×32) tiles when workgroup count per batch is low.
-                let wgs_64 = out_h * out_w.div_ceil(64) * out_channels.div_ceil(64);
-                let use_small = wgs_64 < 16;
-                let tile = if use_small { 32 } else { 64 };
-                self.plan.dispatches.push(Dispatch {
-                    shader: if use_small {
-                        ShaderEntry::Conv2dGemmSmall
-                    } else {
-                        ShaderEntry::Conv2dGemm
-                    },
-                    workgroups: [
-                        out_h * out_w.div_ceil(tile),
-                        out_channels.div_ceil(tile),
-                        batch,
-                    ],
-                    input_buffers: vec![input, kernel],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![
-                        batch,
-                        in_channels,
-                        in_h,
-                        in_w,
-                        out_channels,
-                        kernel_h,
-                        kernel_w,
-                        stride,
-                        padding_h,
-                        out_h,
-                        out_w,
-                        padding_w,
-                    ],
-                    use_coop: false,
-                    use_small_tiles: false,
-                    ..Default::default()
-                });
+                    // Use implicit GEMM: output = weight @ im2col(input)^T
+                    // M=Co, N=oH*oW, K=Ci*kH*kW, batched in z dimension
+                    // Use small (32×32) tiles when workgroup count per batch is low.
+                    let wgs_64 = out_h * out_w.div_ceil(64) * out_channels.div_ceil(64);
+                    let use_small = wgs_64 < 16;
+                    let tile = if use_small { 32 } else { 64 };
+                    self.plan.dispatches.push(Dispatch {
+                        shader: if use_small {
+                            ShaderEntry::Conv2dGemmSmall
+                        } else {
+                            ShaderEntry::Conv2dGemm
+                        },
+                        workgroups: [
+                            out_h * out_w.div_ceil(tile),
+                            out_channels.div_ceil(tile),
+                            batch,
+                        ],
+                        input_buffers: vec![input, kernel],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params: vec![
+                            batch,
+                            in_channels,
+                            in_h,
+                            in_w,
+                            out_channels,
+                            kernel_h,
+                            kernel_w,
+                            stride,
+                            padding_h,
+                            out_h,
+                            out_w,
+                            padding_w,
+                        ],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
                 } // else (non-1x1 conv)
             }
 
@@ -2321,10 +2320,9 @@ impl<'a> Compiler<'a> {
 
                 // 1×1 stride-1 grad_input → MatMul: dInput = dOutput @ W
                 // dOutput is [batch*H*W, Co], W is [Co, Ci] → dInput = [batch*H*W, Ci]
-                if kernel_h == 1 && kernel_w == 1 && stride == 1
-                    && padding_h == 0 && padding_w == 0
+                if kernel_h == 1 && kernel_w == 1 && stride == 1 && padding_h == 0 && padding_w == 0
                 {
-                    let m = batch * in_h * in_w ;
+                    let m = batch * in_h * in_w;
                     let n = in_channels;
                     let k = out_channels;
                     let tile: u32 = 64;
@@ -2343,43 +2341,43 @@ impl<'a> Compiler<'a> {
                         ..Default::default()
                     });
                 } else {
-                // Use implicit GEMM: grad_input = weight_T @ im2col(grad_out)^T
-                // M=Ci, N=H*W, K=Co*kH*kW, batched in z dimension
-                let wgs_64 = in_h * in_w.div_ceil(64) * in_channels.div_ceil(64);
-                let use_small = wgs_64 < 16;
-                let tile = if use_small { 32 } else { 64 };
-                self.plan.dispatches.push(Dispatch {
-                    shader: if use_small {
-                        ShaderEntry::Conv2dGradInputGemmSmall
-                    } else {
-                        ShaderEntry::Conv2dGradInputGemm
-                    },
-                    workgroups: [
-                        in_h * in_w.div_ceil(tile),
-                        in_channels.div_ceil(tile),
-                        batch,
-                    ],
-                    input_buffers: vec![grad_out, kernel],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![
-                        batch,
-                        in_channels,
-                        in_h,
-                        in_w,
-                        out_channels,
-                        kernel_h,
-                        kernel_w,
-                        stride,
-                        padding_h,
-                        out_h,
-                        out_w,
-                        padding_w,
-                    ],
-                    use_coop: false,
-                    use_small_tiles: false,
-                    ..Default::default()
-                });
+                    // Use implicit GEMM: grad_input = weight_T @ im2col(grad_out)^T
+                    // M=Ci, N=H*W, K=Co*kH*kW, batched in z dimension
+                    let wgs_64 = in_h * in_w.div_ceil(64) * in_channels.div_ceil(64);
+                    let use_small = wgs_64 < 16;
+                    let tile = if use_small { 32 } else { 64 };
+                    self.plan.dispatches.push(Dispatch {
+                        shader: if use_small {
+                            ShaderEntry::Conv2dGradInputGemmSmall
+                        } else {
+                            ShaderEntry::Conv2dGradInputGemm
+                        },
+                        workgroups: [
+                            in_h * in_w.div_ceil(tile),
+                            in_channels.div_ceil(tile),
+                            batch,
+                        ],
+                        input_buffers: vec![grad_out, kernel],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params: vec![
+                            batch,
+                            in_channels,
+                            in_h,
+                            in_w,
+                            out_channels,
+                            kernel_h,
+                            kernel_w,
+                            stride,
+                            padding_h,
+                            out_h,
+                            out_w,
+                            padding_w,
+                        ],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
                 }
             }
 
@@ -2406,12 +2404,11 @@ impl<'a> Compiler<'a> {
                 // MatMulAT: C = A^T @ B where A=[K,M], B=[K,N]
                 // A = dOutput[batch*HW, Co], B = input[batch*HW, Ci]
                 // → C = dOutput^T[Co, batch*HW] @ input[batch*HW, Ci] = [Co, Ci]
-                if kernel_h == 1 && kernel_w == 1 && stride == 1
-                    && padding_h == 0 && padding_w == 0
+                if kernel_h == 1 && kernel_w == 1 && stride == 1 && padding_h == 0 && padding_w == 0
                 {
                     let m = out_channels; // Co
                     let n = in_channels; // Ci
-                    let k = batch * in_h * in_w ; // batch*HW
+                    let k = batch * in_h * in_w; // batch*HW
                     let tile: u32 = 64;
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::MatMulAT,
@@ -2425,40 +2422,40 @@ impl<'a> Compiler<'a> {
                         ..Default::default()
                     });
                 } else {
-                // Use GEMM formulation: grad_weight[Co, Ci*kH*kW] = grad_out_flat[Co, N*oH*oW] @ im2col(input)[N*oH*oW, Ci*kH*kW]
-                let n_total = in_channels * kernel_h * kernel_w; // Ci*kH*kW
-                let m_total = out_channels; // Co
-                let wgs_64 = n_total.div_ceil(64) * m_total.div_ceil(64);
-                let use_small = wgs_64 < 16;
-                let tile = if use_small { 32 } else { 64 };
-                self.plan.dispatches.push(Dispatch {
-                    shader: if use_small {
-                        ShaderEntry::Conv2dGradWeightGemmSmall
-                    } else {
-                        ShaderEntry::Conv2dGradWeightGemm
-                    },
-                    workgroups: [n_total.div_ceil(tile), m_total.div_ceil(tile), 1],
-                    input_buffers: vec![grad_out, input],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![
-                        batch,
-                        in_channels,
-                        in_h,
-                        in_w,
-                        out_channels,
-                        kernel_h,
-                        kernel_w,
-                        stride,
-                        padding_h,
-                        out_h,
-                        out_w,
-                        padding_w,
-                    ],
-                    use_coop: false,
-                    use_small_tiles: false,
-                    ..Default::default()
-                });
+                    // Use GEMM formulation: grad_weight[Co, Ci*kH*kW] = grad_out_flat[Co, N*oH*oW] @ im2col(input)[N*oH*oW, Ci*kH*kW]
+                    let n_total = in_channels * kernel_h * kernel_w; // Ci*kH*kW
+                    let m_total = out_channels; // Co
+                    let wgs_64 = n_total.div_ceil(64) * m_total.div_ceil(64);
+                    let use_small = wgs_64 < 16;
+                    let tile = if use_small { 32 } else { 64 };
+                    self.plan.dispatches.push(Dispatch {
+                        shader: if use_small {
+                            ShaderEntry::Conv2dGradWeightGemmSmall
+                        } else {
+                            ShaderEntry::Conv2dGradWeightGemm
+                        },
+                        workgroups: [n_total.div_ceil(tile), m_total.div_ceil(tile), 1],
+                        input_buffers: vec![grad_out, input],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params: vec![
+                            batch,
+                            in_channels,
+                            in_h,
+                            in_w,
+                            out_channels,
+                            kernel_h,
+                            kernel_w,
+                            stride,
+                            padding_h,
+                            out_h,
+                            out_w,
+                            padding_w,
+                        ],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
                 }
             }
 
