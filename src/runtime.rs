@@ -1120,7 +1120,46 @@ pub struct Session {
     adam_step: u32,
     /// Pending Adam parameters. When set, `step()` appends Adam updates.
     pending_adam: Option<(f32, f32, f32, f32)>, // (lr, beta1, beta2, eps)
+    /// Buffer indices whose GPU allocation is owned by the caller (see
+    /// [`Session::bind_external_buffer`]). Drop skips `destroy_buffer` for
+    /// these — the owner is responsible for destruction.
+    external_buffers: HashSet<u32>,
 }
+
+/// Identifies a graph-facing slot that can be backed by a caller-owned
+/// buffer. See [`Session::bind_external_buffer`].
+#[derive(Clone, Copy, Debug)]
+pub enum ExternalSlot<'a> {
+    /// Graph input declared by `Graph::input(name, ...)`.
+    Input(&'a str),
+    /// Graph parameter declared by `Graph::parameter(name, ...)`.
+    Parameter(&'a str),
+    /// Graph output, by index. Index 0 is the primary output.
+    Output(usize),
+}
+
+/// Error returned by [`Session::bind_external_buffer`].
+#[derive(Debug)]
+pub enum ExternalBindError {
+    /// No input/parameter of that name, or output index out of range.
+    UnknownSlot,
+    /// The external buffer is smaller than the slot requires.
+    TooSmall { required: u64, got: u64 },
+}
+
+impl std::fmt::Display for ExternalBindError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::UnknownSlot => write!(f, "no graph slot with the given name/index"),
+            Self::TooSmall { required, got } => write!(
+                f,
+                "external buffer too small: got {got} bytes, need at least {required}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ExternalBindError {}
 
 impl Session {
     /// Select the best cooperative matrix config from GPU capabilities.
@@ -1583,6 +1622,123 @@ impl Session {
             adam_state,
             adam_step: 0,
             pending_adam: None,
+            external_buffers: HashSet::new(),
+        }
+    }
+
+    /// Replace a graph slot's GPU buffer with one allocated by the caller.
+    ///
+    /// Intended for interop with host applications (renderers, game
+    /// engines) that already have tensor data resident on the GPU.
+    /// Meganeura binds the caller's buffer in place of its internal
+    /// allocation, so forward/backward passes read from (or write into)
+    /// it directly — no CPU roundtrip.
+    ///
+    /// # Ownership
+    ///
+    /// The caller retains ownership of the buffer. The session does NOT
+    /// destroy it on drop; it's up to the caller to call
+    /// `context.destroy_buffer(buffer)` after dropping the session (or
+    /// when the buffer is otherwise no longer needed).
+    ///
+    /// # Requirements
+    ///
+    /// * The buffer must belong to the same Blade context passed to
+    ///   [`Session::with_context`]. Binding a buffer from a different
+    ///   context is undefined behaviour (different device / queue).
+    /// * The buffer must be at least as large as the slot requires — see
+    ///   [`Session::slot_size`]. Extra capacity is tolerated.
+    /// * For `Input`/`Parameter` slots meant to be written from the
+    ///   caller side, the buffer must be host-visible (`Memory::Shared`)
+    ///   if the caller uses `Buffer::data()` to upload. Purely device-
+    ///   local buffers work too as long as the caller populates them via
+    ///   their own compute/blit dispatches before `step()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExternalBindError::UnknownSlot`] if the slot name /
+    /// output index is not known to the graph. Returns
+    /// [`ExternalBindError::TooSmall`] if the buffer size is below the
+    /// slot's requirement.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use blade_graphics as bg;
+    /// # use meganeura::{ExternalSlot, Graph, build_inference_session};
+    /// # let gpu: Arc<bg::Context> = unimplemented!();
+    /// # let mut g = Graph::new();
+    /// # let _ = g.input("x", &[4, 3]);
+    /// # let mut session = build_inference_session(&g);
+    /// let buf = gpu.create_buffer(bg::BufferDesc {
+    ///     name: "external_x",
+    ///     size: 4 * 3 * 4,
+    ///     memory: bg::Memory::Shared,
+    /// });
+    /// session.bind_external_buffer(ExternalSlot::Input("x"), buf).unwrap();
+    /// // ... session.step() ...
+    /// drop(session);
+    /// gpu.destroy_buffer(buf);
+    /// ```
+    pub fn bind_external_buffer(
+        &mut self,
+        slot: ExternalSlot<'_>,
+        buffer: blade_graphics::Buffer,
+    ) -> Result<(), ExternalBindError> {
+        let buf_ref = self.resolve_slot(slot)?;
+        let required = self.plan.buffers[buf_ref.0 as usize] as u64;
+        let got = buffer.size();
+        if got < required {
+            return Err(ExternalBindError::TooSmall { required, got });
+        }
+
+        // Finish any outstanding GPU work that might still reference the
+        // old buffer, then release it before swapping.
+        self.wait();
+
+        let idx = buf_ref.0 as usize;
+        let was_external = self.external_buffers.contains(&buf_ref.0);
+        if !was_external {
+            self.gpu.destroy_buffer(self.buffers[idx]);
+        }
+        self.buffers[idx] = buffer;
+        self.external_buffers.insert(buf_ref.0);
+        Ok(())
+    }
+
+    /// Size in bytes of the GPU buffer backing the given slot.
+    ///
+    /// Useful for sizing a caller-owned buffer before passing it to
+    /// [`Session::bind_external_buffer`]. Returns `None` if the slot is
+    /// not known to the graph.
+    pub fn slot_size(&self, slot: ExternalSlot<'_>) -> Option<usize> {
+        let buf_ref = self.resolve_slot(slot).ok()?;
+        Some(self.plan.buffers[buf_ref.0 as usize])
+    }
+
+    fn resolve_slot(&self, slot: ExternalSlot<'_>) -> Result<BufferRef, ExternalBindError> {
+        match slot {
+            ExternalSlot::Input(name) => self
+                .plan
+                .input_buffers
+                .iter()
+                .find(|e| e.0 == name)
+                .map(|e| e.1)
+                .ok_or(ExternalBindError::UnknownSlot),
+            ExternalSlot::Parameter(name) => self
+                .plan
+                .param_buffers
+                .iter()
+                .find(|e| e.0 == name)
+                .map(|e| e.1)
+                .ok_or(ExternalBindError::UnknownSlot),
+            ExternalSlot::Output(idx) => self
+                .plan
+                .output_buffers
+                .get(idx)
+                .copied()
+                .ok_or(ExternalBindError::UnknownSlot),
         }
     }
 
@@ -3342,7 +3498,11 @@ impl Drop for Session {
         for (_, pipeline) in self.pipelines.reduction_map.iter_mut() {
             self.gpu.destroy_compute_pipeline(pipeline);
         }
-        for buffer in &self.buffers {
+        for (i, buffer) in self.buffers.iter().enumerate() {
+            if self.external_buffers.contains(&(i as u32)) {
+                // Caller-owned — caller is responsible for destruction.
+                continue;
+            }
             self.gpu.destroy_buffer(*buffer);
         }
         for &(m_buf, v_buf) in &self.adam_state {
