@@ -1120,14 +1120,10 @@ pub struct Session {
     adam_step: u32,
     /// Pending Adam parameters. When set, `step()` appends Adam updates.
     pending_adam: Option<(f32, f32, f32, f32)>, // (lr, beta1, beta2, eps)
-    /// Buffer indices whose GPU allocation is owned by the caller (see
-    /// [`Session::bind_external_buffer`]). Drop skips `destroy_buffer` for
-    /// these — the owner is responsible for destruction.
-    external_buffers: HashSet<u32>,
 }
 
-/// Identifies a graph-facing slot that can be backed by a caller-owned
-/// buffer. See [`Session::bind_external_buffer`].
+/// Identifies a graph-facing slot that can be backed by an imported
+/// external buffer. See [`Session::bind_external_buffer`].
 #[derive(Clone, Copy, Debug)]
 pub enum ExternalSlot<'a> {
     /// Graph input declared by `Graph::input(name, ...)`.
@@ -1143,7 +1139,7 @@ pub enum ExternalSlot<'a> {
 pub enum ExternalBindError {
     /// No input/parameter of that name, or output index out of range.
     UnknownSlot,
-    /// The external buffer is smaller than the slot requires.
+    /// The external handle's backing memory is smaller than the slot.
     TooSmall { required: u64, got: u64 },
 }
 
@@ -1622,96 +1618,124 @@ impl Session {
             adam_state,
             adam_step: 0,
             pending_adam: None,
-            external_buffers: HashSet::new(),
         }
     }
 
-    /// Replace a graph slot's GPU buffer with one allocated by the caller.
+    /// Import an externally-allocated buffer into a graph slot.
     ///
-    /// Intended for interop with host applications (renderers, game
-    /// engines) that already have tensor data resident on the GPU.
-    /// Meganeura binds the caller's buffer in place of its internal
-    /// allocation, so forward/backward passes read from (or write into)
-    /// it directly — no CPU roundtrip.
+    /// This is true cross-context interop: a producer — a game engine,
+    /// renderer, video decoder, other ML framework — allocates the
+    /// buffer in *its own* Blade context using `Memory::External(...)`,
+    /// then queries the OS handle via the producer context's
+    /// `get_external_buffer_source(...)`. Passing that
+    /// `ExternalMemorySource` here tells meganeura's context to
+    /// re-import the same underlying memory. Both contexts then see
+    /// identical bytes without any CPU roundtrip and without sharing a
+    /// `blade_graphics::Context`.
     ///
-    /// # Ownership
+    /// The import replaces the session's internal allocation for
+    /// `slot`. After this call, dispatches that read from / write to
+    /// that slot operate directly on the shared memory.
     ///
-    /// The caller retains ownership of the buffer. The session does NOT
-    /// destroy it on drop; it's up to the caller to call
-    /// `context.destroy_buffer(buffer)` after dropping the session (or
-    /// when the buffer is otherwise no longer needed).
+    /// # Handle types
     ///
-    /// # Requirements
+    /// See [`blade_graphics::ExternalMemorySource`]:
+    /// * `Fd(Some(fd))` — Linux/Unix opaque FD (VK_KHR_external_memory_fd).
+    /// * `Dma(Some(fd))` — Linux DMA-BUF (VK_EXT_external_memory_dma_buf),
+    ///   the usual channel to share with GStreamer / V4L2 / EGL / Wayland.
+    /// * `Win32(Some(handle))` / `Win32KMT(Some(handle))` — Windows
+    ///   (VK_KHR_external_memory_win32).
+    /// * `HostAllocation(ptr)` — a host malloc'd pointer imported by
+    ///   both contexts (VK_EXT_external_memory_host). Useful when the
+    ///   producer is a CPU-resident tensor, e.g. during a PyTorch
+    ///   migration: allocate page-aligned host memory, memcpy the
+    ///   tensor in, import on both sides.
     ///
-    /// * The buffer must belong to the same Blade context passed to
-    ///   [`Session::with_context`]. Binding a buffer from a different
-    ///   context is undefined behaviour (different device / queue).
-    /// * The buffer must be at least as large as the slot requires — see
-    ///   [`Session::slot_size`]. Extra capacity is tolerated.
-    /// * For `Input`/`Parameter` slots meant to be written from the
-    ///   caller side, the buffer must be host-visible (`Memory::Shared`)
-    ///   if the caller uses `Buffer::data()` to upload. Purely device-
-    ///   local buffers work too as long as the caller populates them via
-    ///   their own compute/blit dispatches before `step()`.
+    /// # Ownership & lifetime
+    ///
+    /// Once imported, the resulting buffer is owned by meganeura's
+    /// context — `Session::drop` will destroy it, releasing
+    /// meganeura's reference to the shared memory. The producer's
+    /// original buffer remains independently owned and must be
+    /// destroyed by the producer separately. The underlying allocation
+    /// is refcounted by the driver (Vulkan memory objects) or OS
+    /// (malloc'd page), so it stays live until both sides release.
+    ///
+    /// FD/HANDLE ownership follows Vulkan's rules: on a successful
+    /// import, the importing driver takes ownership of the handle and
+    /// the caller must not close it. On failure the handle is
+    /// untouched. For `HostAllocation(ptr)` the caller retains the
+    /// pointer and must keep the memory live for the lifetime of the
+    /// session.
     ///
     /// # Errors
     ///
-    /// Returns [`ExternalBindError::UnknownSlot`] if the slot name /
-    /// output index is not known to the graph. Returns
-    /// [`ExternalBindError::TooSmall`] if the buffer size is below the
-    /// slot's requirement.
+    /// * [`ExternalBindError::UnknownSlot`] — no slot with that
+    ///   name/index.
+    /// * [`ExternalBindError::TooSmall`] — the declared `size` is below
+    ///   the slot's requirement.
+    ///
+    /// # Platform support
+    ///
+    /// Vulkan only. Blade's Metal and GLES backends currently
+    /// `unimplemented!()` for external memory — on those backends the
+    /// import call will panic inside Blade.
     ///
     /// # Example
     ///
     /// ```no_run
-    /// # use std::sync::Arc;
     /// # use blade_graphics as bg;
     /// # use meganeura::{ExternalSlot, Graph, build_inference_session};
-    /// # let gpu: Arc<bg::Context> = unimplemented!();
+    /// # fn doc(producer: &bg::Context, shared_handle: bg::Buffer, size: u64) {
     /// # let mut g = Graph::new();
     /// # let _ = g.input("x", &[4, 3]);
-    /// # let mut session = build_inference_session(&g);
-    /// let buf = gpu.create_buffer(bg::BufferDesc {
-    ///     name: "external_x",
-    ///     size: 4 * 3 * 4,
-    ///     memory: bg::Memory::Shared,
-    /// });
-    /// session.bind_external_buffer(ExternalSlot::Input("x"), buf).unwrap();
-    /// // ... session.step() ...
-    /// drop(session);
-    /// gpu.destroy_buffer(buf);
+    /// let handle = producer
+    ///     .get_external_buffer_source(shared_handle)
+    ///     .expect("buffer was allocated with Memory::External");
+    ///
+    /// let mut session = build_inference_session(&g); // its own context
+    /// session
+    ///     .bind_external_buffer(ExternalSlot::Input("x"), handle, size)
+    ///     .unwrap();
+    /// // session.step() reads x from the shared memory
+    /// # }
     /// ```
     pub fn bind_external_buffer(
         &mut self,
         slot: ExternalSlot<'_>,
-        buffer: blade_graphics::Buffer,
+        source: blade_graphics::ExternalMemorySource,
+        size: u64,
     ) -> Result<(), ExternalBindError> {
         let buf_ref = self.resolve_slot(slot)?;
         let required = self.plan.buffers[buf_ref.0 as usize] as u64;
-        let got = buffer.size();
-        if got < required {
-            return Err(ExternalBindError::TooSmall { required, got });
+        if size < required {
+            return Err(ExternalBindError::TooSmall {
+                required,
+                got: size,
+            });
         }
 
         // Finish any outstanding GPU work that might still reference the
-        // old buffer, then release it before swapping.
+        // internal buffer, then release it before swapping in the import.
         self.wait();
 
+        let imported = self.gpu.create_buffer(blade_graphics::BufferDesc {
+            name: "meganeura_imported",
+            size,
+            memory: blade_graphics::Memory::External(source),
+        });
+
         let idx = buf_ref.0 as usize;
-        let was_external = self.external_buffers.contains(&buf_ref.0);
-        if !was_external {
-            self.gpu.destroy_buffer(self.buffers[idx]);
-        }
-        self.buffers[idx] = buffer;
-        self.external_buffers.insert(buf_ref.0);
+        self.gpu.destroy_buffer(self.buffers[idx]);
+        self.buffers[idx] = imported;
         Ok(())
     }
 
     /// Size in bytes of the GPU buffer backing the given slot.
     ///
-    /// Useful for sizing a caller-owned buffer before passing it to
-    /// [`Session::bind_external_buffer`]. Returns `None` if the slot is
-    /// not known to the graph.
+    /// Useful for sizing a shared allocation on the producer side
+    /// before calling [`Session::bind_external_buffer`]. Returns `None`
+    /// if the slot is not known to the graph.
     pub fn slot_size(&self, slot: ExternalSlot<'_>) -> Option<usize> {
         let buf_ref = self.resolve_slot(slot).ok()?;
         Some(self.plan.buffers[buf_ref.0 as usize])
@@ -3498,11 +3522,7 @@ impl Drop for Session {
         for (_, pipeline) in self.pipelines.reduction_map.iter_mut() {
             self.gpu.destroy_compute_pipeline(pipeline);
         }
-        for (i, buffer) in self.buffers.iter().enumerate() {
-            if self.external_buffers.contains(&(i as u32)) {
-                // Caller-owned — caller is responsible for destruction.
-                continue;
-            }
+        for buffer in &self.buffers {
             self.gpu.destroy_buffer(*buffer);
         }
         for &(m_buf, v_buf) in &self.adam_state {
