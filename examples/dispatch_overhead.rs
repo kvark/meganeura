@@ -13,9 +13,7 @@
 
 use std::time::Instant;
 
-use meganeura::{
-    CompileOptions, Graph, Mode, NodeId, SessionConfig, Session, build,
-};
+use meganeura::{CompileOptions, Graph, Mode, NodeId, Session, SessionConfig, build};
 
 fn raw_opts() -> CompileOptions {
     // Turn off the pointwise-fusion pass so a chain of unary ops stays as

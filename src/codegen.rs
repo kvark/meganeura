@@ -405,9 +405,7 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::MultiHeadAttnGradQ => parse_wgsl(include_str!("shaders/mha_grad_q.wgsl")),
         ShaderGroup::FlashGradQ => generate_flash_grad_q_module(64),
         ShaderGroup::MultiHeadAttnGradK => parse_wgsl(include_str!("shaders/mha_grad_k.wgsl")),
-        ShaderGroup::MultiHeadAttnGradKV => {
-            parse_wgsl(include_str!("shaders/mha_grad_kv.wgsl"))
-        }
+        ShaderGroup::MultiHeadAttnGradKV => parse_wgsl(include_str!("shaders/mha_grad_kv.wgsl")),
         ShaderGroup::FlashGradKV => generate_flash_grad_kv_module(64),
         ShaderGroup::MultiHeadAttnGradV => parse_wgsl(include_str!("shaders/mha_grad_v.wgsl")),
         ShaderGroup::SwiGLUGrad => parse_wgsl(include_str!("shaders/swiglu_grad.wgsl")),
@@ -1322,7 +1320,9 @@ pub fn generate_attention_module(head_dim: u32) -> ShaderModule {
     src.push_str("    let kv_len = select(kv_seq, pos + 1u, kv_seq == 0u);\n");
     // Sliding window: window_size>0 limits how far back we attend
     src.push_str("    let window_size = params.window_size;\n");
-    src.push_str("    let kv_start = select(0u, kv_len - min(kv_len, window_size), window_size > 0u);\n\n");
+    src.push_str(
+        "    let kv_start = select(0u, kv_len - min(kv_len, window_size), window_size > 0u);\n\n",
+    );
 
     // GQA head mapping
     src.push_str("    let kv_head = head / (num_heads / num_kv_heads);\n");
@@ -1339,7 +1339,10 @@ pub fn generate_attention_module(head_dim: u32) -> ShaderModule {
 
     // --- Tiled KV loop: process BKV positions per reduction ---
     let _ = writeln!(src, "    let kv_range = kv_len - kv_start;");
-    let _ = writeln!(src, "    let tile_end = kv_start + (kv_range / {bkv}u) * {bkv}u;");
+    let _ = writeln!(
+        src,
+        "    let tile_end = kv_start + (kv_range / {bkv}u) * {bkv}u;"
+    );
     src.push_str("    var t = kv_start;\n");
     let _ = writeln!(src, "    for (; t < tile_end; t += {bkv}u) {{");
     let _ = writeln!(src, "        for (var i = 0u; i < {bkv}u; i++) {{");
@@ -1510,7 +1513,9 @@ pub fn generate_flash_attention_module(head_dim: u32) -> ShaderModule {
     src.push_str("    let valid = pos < q_seq && head < num_heads;\n\n");
 
     // Per-position KV range (causal + sliding window)
-    src.push_str("    let my_kv_len = select(kv_seq, select(pos + 1u, 0u, !valid), kv_seq == 0u);\n");
+    src.push_str(
+        "    let my_kv_len = select(kv_seq, select(pos + 1u, 0u, !valid), kv_seq == 0u);\n",
+    );
     src.push_str("    let window_size = params.window_size;\n");
     src.push_str("    let my_kv_start = select(0u, my_kv_len - min(my_kv_len, window_size), window_size > 0u);\n\n");
 
@@ -1518,7 +1523,10 @@ pub fn generate_flash_attention_module(head_dim: u32) -> ShaderModule {
     // loop range so they hit identical barriers.
     // max_kv_len: from the LAST valid position in the tile (largest range).
     // min_kv_start: from the FIRST position in the tile (earliest start).
-    let _ = writeln!(src, "    let last_pos = min(wgid.x * {bq}u + {bq}u - 1u, q_seq - 1u);");
+    let _ = writeln!(
+        src,
+        "    let last_pos = min(wgid.x * {bq}u + {bq}u - 1u, q_seq - 1u);"
+    );
     let _ = writeln!(src, "    let first_pos = wgid.x * {bq}u;");
     src.push_str("    let max_kv_len = select(kv_seq, last_pos + 1u, kv_seq == 0u);\n");
     src.push_str("    let first_kv_len = select(kv_seq, first_pos + 1u, kv_seq == 0u);\n");
@@ -1559,27 +1567,15 @@ pub fn generate_flash_attention_module(head_dim: u32) -> ShaderModule {
     for l in 0..loads_per_thread {
         let offset = l * wg_size;
         if offset == 0 {
-            let _ = writeln!(
-                src,
-                "        if lid.x < {k_tile_size}u {{"
-            );
-            let _ = writeln!(
-                src,
-                "            let ki = lid.x / {hd}u;"
-            );
+            let _ = writeln!(src, "        if lid.x < {k_tile_size}u {{");
+            let _ = writeln!(src, "            let ki = lid.x / {hd}u;");
             src.push_str(
                 "            shared_k[lid.x] = src_b[(t + ki) * kv_dim + kv_head_off + (lid.x % head_dim)];\n",
             );
             src.push_str("        }\n");
         } else {
-            let _ = writeln!(
-                src,
-                "        if lid.x + {offset}u < {k_tile_size}u {{"
-            );
-            let _ = writeln!(
-                src,
-                "            let ki2 = (lid.x + {offset}u) / {hd}u;"
-            );
+            let _ = writeln!(src, "        if lid.x + {offset}u < {k_tile_size}u {{");
+            let _ = writeln!(src, "            let ki2 = (lid.x + {offset}u) / {hd}u;");
             let _ = writeln!(
                 src,
                 "            shared_k[lid.x + {offset}u] = src_b[(t + ki2) * kv_dim + kv_head_off + ((lid.x + {offset}u) % head_dim)];"
@@ -1590,11 +1586,7 @@ pub fn generate_flash_attention_module(head_dim: u32) -> ShaderModule {
     src.push_str("        workgroupBarrier();\n\n");
 
     // Each group computes BKV dot products using shared K
-    let _ = writeln!(
-        src,
-        "        let grp_base = qi * {}u;",
-        bkv * hd
-    );
+    let _ = writeln!(src, "        let grp_base = qi * {}u;", bkv * hd);
     let _ = writeln!(src, "        for (var i = 0u; i < {bkv}u; i++) {{");
     let _ = writeln!(
         src,
@@ -1616,12 +1608,8 @@ pub fn generate_flash_attention_module(head_dim: u32) -> ShaderModule {
     src.push_str("                let correction = exp(max_score - new_max);\n");
     src.push_str("                let weight = exp(score - new_max);\n");
     src.push_str("                sum_exp = sum_exp * correction + weight;\n");
-    src.push_str(
-        "                let v_base = kv_pos * kv_dim + kv_head_off;\n",
-    );
-    src.push_str(
-        "                my_out = my_out * correction + weight * bias[v_base + d];\n",
-    );
+    src.push_str("                let v_base = kv_pos * kv_dim + kv_head_off;\n");
+    src.push_str("                my_out = my_out * correction + weight * bias[v_base + d];\n");
     src.push_str("                max_score = new_max;\n");
     src.push_str("            }\n");
     src.push_str("        }\n");
@@ -1633,23 +1621,15 @@ pub fn generate_flash_attention_module(head_dim: u32) -> ShaderModule {
     src.push_str("    for (; t < max_kv_len; t++) {\n");
     // Load single K position into shared_k (first hd threads)
     let _ = writeln!(src, "        if lid.x < {hd}u {{");
-    src.push_str(
-        "            shared_k[lid.x] = src_b[t * kv_dim + kv_head_off + lid.x];\n",
-    );
+    src.push_str("            shared_k[lid.x] = src_b[t * kv_dim + kv_head_off + lid.x];\n");
     src.push_str("        }\n");
     src.push_str("        workgroupBarrier();\n\n");
 
     // Each group computes dot product using shared K
     let _ = writeln!(src, "        let dot_base = qi * {hd}u;");
-    let _ = writeln!(
-        src,
-        "        wg_dot[dot_base + d] = q_val * shared_k[d];"
-    );
+    let _ = writeln!(src, "        wg_dot[dot_base + d] = q_val * shared_k[d];");
     src.push_str("        tree_reduce_grouped(lid.x);\n");
-    let _ = writeln!(
-        src,
-        "        let score = wg_dot[qi * {hd}u] * scale;\n"
-    );
+    let _ = writeln!(src, "        let score = wg_dot[qi * {hd}u] * scale;\n");
 
     // Per-position causal mask
     src.push_str("        if valid && t >= my_kv_start && t < my_kv_len {\n");
@@ -1675,9 +1655,7 @@ pub fn generate_flash_attention_module(head_dim: u32) -> ShaderModule {
     src.push_str("        if d == 0u {\n");
     src.push_str("            let idx = (pos * num_heads + head) * 2u;\n");
     src.push_str("            lse[idx] = max_score;\n");
-    src.push_str(
-        "            lse[idx + 1u] = select(log(sum_exp), -1e30, sum_exp == 0.0);\n",
-    );
+    src.push_str("            lse[idx + 1u] = select(log(sum_exp), -1e30, sum_exp == 0.0);\n");
     src.push_str("        }\n");
     src.push_str("    }\n");
     src.push_str("}\n");
@@ -1735,7 +1713,10 @@ pub fn generate_flash_grad_q_module(head_dim: u32) -> ShaderModule {
     let mut stride = hd / 2;
     while stride > 0 {
         src.push_str("    workgroupBarrier();\n");
-        let _ = writeln!(src, "    if local < {stride}u {{ wg_a[base + local] += wg_a[base + local + {stride}u]; wg_b[base + local] += wg_b[base + local + {stride}u]; }}");
+        let _ = writeln!(
+            src,
+            "    if local < {stride}u {{ wg_a[base + local] += wg_a[base + local + {stride}u]; wg_b[base + local] += wg_b[base + local + {stride}u]; }}"
+        );
         stride /= 2;
     }
     src.push_str("    workgroupBarrier();\n}\n\n");
@@ -1747,7 +1728,10 @@ pub fn generate_flash_grad_q_module(head_dim: u32) -> ShaderModule {
     stride = hd / 2;
     while stride > 0 {
         src.push_str("    workgroupBarrier();\n");
-        let _ = writeln!(src, "    if local < {stride}u {{ wg_a[base + local] += wg_a[base + local + {stride}u]; }}");
+        let _ = writeln!(
+            src,
+            "    if local < {stride}u {{ wg_a[base + local] += wg_a[base + local + {stride}u]; }}"
+        );
         stride /= 2;
     }
     src.push_str("    workgroupBarrier();\n}\n\n");
@@ -1787,11 +1771,18 @@ pub fn generate_flash_grad_q_module(head_dim: u32) -> ShaderModule {
     src.push_str("    let row_sum = wg_a[grp];\n\n");
 
     // Per-position KV range
-    src.push_str("    let my_kv_len = select(kv_seq, select(pos + 1u, 0u, !valid), kv_seq == 0u);\n");
+    src.push_str(
+        "    let my_kv_len = select(kv_seq, select(pos + 1u, 0u, !valid), kv_seq == 0u);\n",
+    );
     src.push_str("    let window = params.window_size;\n");
-    src.push_str("    let my_kv_start = select(0u, my_kv_len - min(my_kv_len, window), window > 0u);\n");
+    src.push_str(
+        "    let my_kv_start = select(0u, my_kv_len - min(my_kv_len, window), window > 0u);\n",
+    );
     // Workgroup-wide bounds
-    let _ = writeln!(src, "    let last_pos = min(wgid.x * {bq}u + {bq}u - 1u, q_seq - 1u);");
+    let _ = writeln!(
+        src,
+        "    let last_pos = min(wgid.x * {bq}u + {bq}u - 1u, q_seq - 1u);"
+    );
     let _ = writeln!(src, "    let first_pos = wgid.x * {bq}u;");
     src.push_str("    let max_kv_len = select(kv_seq, last_pos + 1u, kv_seq == 0u);\n");
     src.push_str("    let first_kv_len = select(kv_seq, first_pos + 1u, kv_seq == 0u);\n");
@@ -1829,9 +1820,15 @@ pub fn generate_flash_grad_q_module(head_dim: u32) -> ShaderModule {
     src.push_str("}\n");
 
     let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
-        panic!("generated flash grad_q WGSL failed to parse:\n{}\n---\n{}", e, src)
+        panic!(
+            "generated flash grad_q WGSL failed to parse:\n{}\n---\n{}",
+            e, src
+        )
     });
-    ShaderModule { module, source: src }
+    ShaderModule {
+        module,
+        source: src,
+    }
 }
 
 /// Generate a Flash Attention 2 backward dK/dV kernel with BKV>1 tiling.
@@ -1878,7 +1875,10 @@ pub fn generate_flash_grad_kv_module(head_dim: u32) -> ShaderModule {
     let mut stride = hd / 2;
     while stride > 0 {
         src.push_str("    workgroupBarrier();\n");
-        let _ = writeln!(src, "    if local < {stride}u {{ wg_a[base + local] += wg_a[base + local + {stride}u]; wg_b[base + local] += wg_b[base + local + {stride}u]; wg_c[base + local] += wg_c[base + local + {stride}u]; }}");
+        let _ = writeln!(
+            src,
+            "    if local < {stride}u {{ wg_a[base + local] += wg_a[base + local + {stride}u]; wg_b[base + local] += wg_b[base + local + {stride}u]; wg_c[base + local] += wg_c[base + local + {stride}u]; }}"
+        );
         stride /= 2;
     }
     src.push_str("    workgroupBarrier();\n}\n\n");
@@ -1917,7 +1917,10 @@ pub fn generate_flash_grad_kv_module(head_dim: u32) -> ShaderModule {
     // All groups must agree on the loop range for barriers
     // start_pos depends on t (per-group for causal). Use min across groups.
     let _ = writeln!(src, "    let first_t = wgid.x * {bkv}u;");
-    let _ = writeln!(src, "    let last_t = min(wgid.x * {bkv}u + {bkv}u - 1u, effective_kv_seq - 1u);");
+    let _ = writeln!(
+        src,
+        "    let last_t = min(wgid.x * {bkv}u + {bkv}u - 1u, effective_kv_seq - 1u);"
+    );
     src.push_str("    let wg_start = select(0u, first_t, kv_seq == 0u);\n");
     src.push_str("    let wg_end = select(q_seq, min(q_seq, last_t + window), window > 0u);\n\n");
 
@@ -1938,7 +1941,9 @@ pub fn generate_flash_grad_kv_module(head_dim: u32) -> ShaderModule {
     let _ = writeln!(src, "            let grp = ki * {hd}u;");
     src.push_str("            wg_a[grp + d] = shared_q[d] * k_val;\n");
     src.push_str("            wg_b[grp + d] = shared_do[d] * shared_o[d];\n");
-    src.push_str("            wg_c[grp + d] = shared_do[d] * select(0.0, bias[kv_base + d], valid);\n");
+    src.push_str(
+        "            wg_c[grp + d] = shared_do[d] * select(0.0, bias[kv_base + d], valid);\n",
+    );
     src.push_str("            grouped_triple_reduce(lid.x);\n\n");
 
     // Per-position mask: does Q position `pos` attend to KV position `t`?
@@ -1947,7 +1952,9 @@ pub fn generate_flash_grad_kv_module(head_dim: u32) -> ShaderModule {
     src.push_str("                let row_sum = wg_b[grp];\n");
     src.push_str("                let dp_t = wg_c[grp];\n");
     src.push_str("                let lse_idx = (pos * num_heads + head) * 2u;\n");
-    src.push_str("                let p_t = exp(min(score - lse[lse_idx], 0.0) - lse[lse_idx + 1u]);\n");
+    src.push_str(
+        "                let p_t = exp(min(score - lse[lse_idx], 0.0) - lse[lse_idx + 1u]);\n",
+    );
     src.push_str("                let ds_t = p_t * (dp_t - row_sum);\n");
     src.push_str("                my_dk += ds_t * scale * shared_q[d];\n");
     src.push_str("                my_dv += p_t * shared_do[d];\n");
@@ -1963,9 +1970,15 @@ pub fn generate_flash_grad_kv_module(head_dim: u32) -> ShaderModule {
     src.push_str("}\n");
 
     let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
-        panic!("generated flash grad_kv WGSL failed to parse:\n{}\n---\n{}", e, src)
+        panic!(
+            "generated flash grad_kv WGSL failed to parse:\n{}\n---\n{}",
+            e, src
+        )
     });
-    ShaderModule { module, source: src }
+    ShaderModule {
+        module,
+        source: src,
+    }
 }
 
 fn gen_conv2d_gemm_coop() -> ShaderModule {
@@ -2245,10 +2258,7 @@ mod tests {
                 ShaderGroup::MultiHeadAttnGradQ,
                 naga::valid::Capabilities::empty(),
             ),
-            (
-                ShaderGroup::FlashGradQ,
-                naga::valid::Capabilities::empty(),
-            ),
+            (ShaderGroup::FlashGradQ, naga::valid::Capabilities::empty()),
             (
                 ShaderGroup::MultiHeadAttnGradK,
                 naga::valid::Capabilities::empty(),
@@ -2257,10 +2267,7 @@ mod tests {
                 ShaderGroup::MultiHeadAttnGradKV,
                 naga::valid::Capabilities::empty(),
             ),
-            (
-                ShaderGroup::FlashGradKV,
-                naga::valid::Capabilities::empty(),
-            ),
+            (ShaderGroup::FlashGradKV, naga::valid::Capabilities::empty()),
             (
                 ShaderGroup::MultiHeadAttnGradV,
                 naga::valid::Capabilities::empty(),

@@ -295,9 +295,9 @@ impl ShaderEntry {
             ShaderEntry::Upsample2x => "main",
             ShaderEntry::Upsample2xGrad => "main",
             ShaderEntry::Conv2d => "main",
-            ShaderEntry::Conv2dGemm | ShaderEntry::Conv2dGemmSmall | ShaderEntry::Conv2dGemmCoop => {
-                "main"
-            }
+            ShaderEntry::Conv2dGemm
+            | ShaderEntry::Conv2dGemmSmall
+            | ShaderEntry::Conv2dGemmCoop => "main",
             ShaderEntry::Conv2dGradInput => "main",
             ShaderEntry::Conv2dGradInputGemm
             | ShaderEntry::Conv2dGradInputGemmSmall
@@ -1077,7 +1077,10 @@ impl<'a> Compiler<'a> {
     fn attention_dispatch(q_seq: u32, head_dim: u32, num_heads: u32) -> (ShaderEntry, [u32; 3]) {
         let bq = (256 / head_dim).max(1);
         if bq >= 2 && q_seq >= bq {
-            (ShaderEntry::FlashAttention, [q_seq.div_ceil(bq), num_heads, 1])
+            (
+                ShaderEntry::FlashAttention,
+                [q_seq.div_ceil(bq), num_heads, 1],
+            )
         } else {
             (ShaderEntry::MultiHeadAttn, [q_seq, num_heads, 1])
         }
@@ -1839,7 +1842,13 @@ impl<'a> Compiler<'a> {
                     input_buffers: vec![q, k, v],
                     output_buffer: out_buf,
                     extra_outputs: vec![lse_buf],
-                    params: vec![seq, 0, (num_heads << 16) | num_kv_heads, head_dim, window_size],
+                    params: vec![
+                        seq,
+                        0,
+                        (num_heads << 16) | num_kv_heads,
+                        head_dim,
+                        window_size,
+                    ],
                     use_coop: false,
                     use_small_tiles: false,
                     ..Default::default()
@@ -2631,9 +2640,7 @@ impl<'a> Compiler<'a> {
 
                 // Fused GradKV: pre-allocate dV buffer. When GradV is later
                 // compiled for the same fwd_node, it reuses this buffer.
-                let dv_buf = self.alloc_buffer(
-                    self.graph.node(node.inputs[3]).ty.size_bytes(),
-                );
+                let dv_buf = self.alloc_buffer(self.graph.node(node.inputs[3]).ty.size_bytes());
                 self.fused_grad_kv_dv.insert(fwd_node, dv_buf);
                 let (grad_kv_shader, grad_kv_wgs) =
                     Self::attention_dispatch(dispatch_kv, head_dim, num_kv_heads);
@@ -2816,8 +2823,7 @@ impl<'a> Compiler<'a> {
                     // Two-pass row-parallel approach for better GPU occupancy:
                     // Pass 1: one WG per row computes partial[row,col] = dy*x*rsqrt
                     // Pass 2: SumRows reduces partial → grad_w[col]
-                    let temp_buf =
-                        self.alloc_buffer((rows as usize) * (cols as usize) * 4);
+                    let temp_buf = self.alloc_buffer((rows as usize) * (cols as usize) * 4);
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::RmsNormGradWRowPar,
                         workgroups: [rows, 1, 1],
@@ -2885,8 +2891,7 @@ impl<'a> Compiler<'a> {
                 let cols = x_shape[1] as u32;
                 if rows >= 4 {
                     // Row-parallel: each WG handles one row, SumRows reduces.
-                    let temp_buf =
-                        self.alloc_buffer((rows as usize) * (cols as usize) * 4);
+                    let temp_buf = self.alloc_buffer((rows as usize) * (cols as usize) * 4);
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::LayerNormGradWB,
                         workgroups: [rows, 1, 1],
