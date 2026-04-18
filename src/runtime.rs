@@ -52,7 +52,7 @@ impl std::fmt::Display for MemorySummary {
 /// Minimum cooperative matrix workgroups for conv2d backward GEMM.
 /// Conv2d backward has all-scalar staging with heavy im2col decomposition
 /// and only 64 threads vs 256 for the scalar shader.
-const MIN_COOP_WORKGROUPS_CONV_BWD: u32 = 64;
+const MIN_COOP_WORKGROUPS_CONV_BWD: u32 = 16;
 
 // ---- ShaderData structs matching codegen global variable names ----
 
