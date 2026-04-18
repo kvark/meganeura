@@ -1058,6 +1058,206 @@ fn causal_attention_gradient_check() {
     );
 }
 
+/// Flash attention correctness test at seq_len=128.
+///
+/// This catches mismatches between compile.rs dispatch (which computes
+/// workgroup counts) and codegen.rs (which generates the shader). With
+/// head_dim=64 and EPT capped at 32, BQ=128 — so seq=128 is the exact
+/// boundary where flash attention activates.
+///
+/// Compares forward output of the flash-attention path against a
+/// reference computed via the small-sequence (MultiHeadAttn) kernel.
+#[test]
+fn flash_attention_seq128_correctness() {
+    if std::env::var("MEGANEURA_SKIP_BACKPROP").unwrap_or_default() == "1" {
+        eprintln!("MEGANEURA_SKIP_BACKPROP set — skipping flash attention seq128 (requires real GPU)");
+        return;
+    }
+    let seq: usize = 128;
+    let num_heads: u32 = 2;
+    let num_kv_heads: u32 = 2;
+    let head_dim: u32 = 64;
+    let d = (num_heads * head_dim) as usize;
+    let n = seq * d;
+
+    // Reference: small sequence that uses MultiHeadAttn (non-flash) kernel
+    let ref_seq: usize = 4;
+    let ref_n = ref_seq * d;
+
+    // Build flash-attention graph (seq=128 triggers flash path)
+    let mut g_flash = Graph::new();
+    let q = g_flash.input("q", &[seq, d]);
+    let k = g_flash.input("k", &[seq, d]);
+    let v = g_flash.input("v", &[seq, d]);
+    let out = g_flash.causal_attention(q, k, v, num_heads, num_kv_heads, head_dim);
+    g_flash.set_outputs(vec![out]);
+    let mut flash_sess = build_inference_session(&g_flash);
+
+    // Build reference graph (seq=4 uses MultiHeadAttn kernel)
+    let mut g_ref = Graph::new();
+    let qr = g_ref.input("q", &[ref_seq, d]);
+    let kr = g_ref.input("k", &[ref_seq, d]);
+    let vr = g_ref.input("v", &[ref_seq, d]);
+    let out_ref = g_ref.causal_attention(qr, kr, vr, num_heads, num_kv_heads, head_dim);
+    g_ref.set_outputs(vec![out_ref]);
+    let mut ref_sess = build_inference_session(&g_ref);
+
+    // Shared data for the small prefix
+    let q_data: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin() * 0.1).collect();
+    let k_data: Vec<f32> = (0..n)
+        .map(|i| (i as f32 * 0.013 + 1.0).sin() * 0.1)
+        .collect();
+    let v_data: Vec<f32> = (0..n)
+        .map(|i| (i as f32 * 0.017 + 2.0).sin() * 0.1)
+        .collect();
+
+    // Run flash path
+    flash_sess.set_input("q", &q_data);
+    flash_sess.set_input("k", &k_data);
+    flash_sess.set_input("v", &v_data);
+    flash_sess.step();
+    flash_sess.wait();
+    let flash_out = flash_sess.read_output(seq * d);
+
+    // Run reference on first 4 positions (both kernels should agree on
+    // causal attention for positions 0..3 since they only attend to
+    // positions <= themselves)
+    ref_sess.set_input("q", &q_data[..ref_n]);
+    ref_sess.set_input("k", &k_data[..ref_n]);
+    ref_sess.set_input("v", &v_data[..ref_n]);
+    ref_sess.step();
+    ref_sess.wait();
+    let ref_out = ref_sess.read_output(ref_seq * d);
+
+    // Compare first ref_seq positions — causal mask means these are
+    // identical regardless of total sequence length.
+    let mut max_err: f32 = 0.0;
+    for i in 0..ref_n {
+        let err = (flash_out[i] - ref_out[i]).abs();
+        if err > max_err {
+            max_err = err;
+        }
+    }
+    assert!(
+        max_err < 1e-4,
+        "flash vs reference attention mismatch: max_err={max_err:.6e} (expected < 1e-4)"
+    );
+    eprintln!(
+        "flash_attention_seq128: max_err={max_err:.6e} across {} elements — PASSED",
+        ref_n
+    );
+
+    // Also verify the output is finite everywhere
+    for (i, &val) in flash_out.iter().enumerate() {
+        assert!(
+            val.is_finite(),
+            "flash attention output[{i}] is not finite: {val}"
+        );
+    }
+}
+
+/// Flash attention backward correctness at seq=128 (the flash threshold).
+/// Gradient-checks a small subset of Q elements to verify the flash
+/// backward kernels (FlashGradQ, FlashGradKV) produce correct gradients.
+#[test]
+fn flash_attention_seq128_gradient_check() {
+    if std::env::var("MEGANEURA_SKIP_BACKPROP").unwrap_or_default() == "1" {
+        eprintln!("MEGANEURA_SKIP_BACKPROP set — skipping flash attention grad check");
+        return;
+    }
+
+    let seq: usize = 128;
+    let num_heads: u32 = 1;
+    let num_kv_heads: u32 = 1;
+    let head_dim: u32 = 64;
+    let d = (num_heads * head_dim) as usize;
+    let n = seq * d;
+
+    // --- Analytical gradients via backprop ---
+    let mut g_train = Graph::new();
+    let qn = g_train.parameter("q", &[seq, d]);
+    let kn = g_train.parameter("k", &[seq, d]);
+    let vn = g_train.parameter("v", &[seq, d]);
+    let out = g_train.causal_attention(qn, kn, vn, num_heads, num_kv_heads, head_dim);
+    let loss_node = g_train.mean_all(out);
+    g_train.set_outputs(vec![loss_node]);
+
+    let mut train_sess = build_session(&g_train);
+
+    let q_data: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin() * 0.1).collect();
+    let k_data: Vec<f32> = (0..n)
+        .map(|i| (i as f32 * 0.013 + 1.0).sin() * 0.1)
+        .collect();
+    let v_data: Vec<f32> = (0..n)
+        .map(|i| (i as f32 * 0.017 + 2.0).sin() * 0.1)
+        .collect();
+
+    train_sess.set_parameter("q", &q_data);
+    train_sess.set_parameter("k", &k_data);
+    train_sess.set_parameter("v", &v_data);
+    train_sess.step();
+    train_sess.wait();
+
+    let loss_val = train_sess.read_loss();
+    assert!(
+        loss_val.is_finite(),
+        "flash attn loss not finite: {loss_val}"
+    );
+
+    let param_buffers: std::collections::HashMap<String, BufferRef> =
+        train_sess.plan().param_buffers.iter().cloned().collect();
+    let grad_map: std::collections::HashMap<BufferRef, BufferRef> =
+        train_sess.plan().param_grad_pairs.iter().cloned().collect();
+
+    let mut grad_q = vec![0.0f32; n];
+    train_sess.read_buffer(grad_map[&param_buffers["q"]], &mut grad_q);
+
+    // --- Numerical gradients via central differences ---
+    let mut g_infer = Graph::new();
+    let qi = g_infer.parameter("q", &[seq, d]);
+    let ki = g_infer.parameter("k", &[seq, d]);
+    let vi = g_infer.parameter("v", &[seq, d]);
+    let out_i = g_infer.causal_attention(qi, ki, vi, num_heads, num_kv_heads, head_dim);
+    let loss_i = g_infer.mean_all(out_i);
+    g_infer.set_outputs(vec![loss_i]);
+    let mut infer_sess = build_inference_session(&g_infer);
+
+    let fwd = |sess: &mut meganeura::Session, qd: &[f32]| -> f32 {
+        sess.set_parameter("q", qd);
+        sess.set_parameter("k", &k_data);
+        sess.set_parameter("v", &v_data);
+        sess.step();
+        sess.wait();
+        sess.read_loss()
+    };
+
+    let eps = 1e-3_f32;
+    // Check a few Q gradient elements spread across the sequence
+    let check_idxs: Vec<usize> = (0..8).map(|i| i * n / 8).collect();
+    let mut max_rel_err = 0.0f32;
+
+    for &idx in &check_idxs {
+        let mut qd = q_data.clone();
+        qd[idx] += eps;
+        let lp = fwd(&mut infer_sess, &qd);
+        qd[idx] -= 2.0 * eps;
+        let lm = fwd(&mut infer_sess, &qd);
+        let num = (lp - lm) / (2.0 * eps);
+        let ana = grad_q[idx];
+        let rel = grad_rel_err(num, ana);
+        eprintln!("flash grad_q[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
+        if max_rel_err < rel {
+            max_rel_err = rel;
+        }
+    }
+
+    assert!(
+        max_rel_err < 0.06,
+        "Flash attention grad check FAILED: max relative error {max_rel_err:.4} (>6%)"
+    );
+    eprintln!("flash_attention_seq128 gradient check PASSED: max_rel_err={max_rel_err:.4}");
+}
+
 #[test]
 fn swiglu_concat_gradient_check() {
     if std::env::var("MEGANEURA_SKIP_BACKPROP").unwrap_or_default() == "1" {

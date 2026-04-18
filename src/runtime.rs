@@ -978,6 +978,24 @@ impl Pipelines {
         }
         &self.map[&dispatch.shader]
     }
+
+    fn all_pipelines(&self) -> Vec<(&str, &blade_graphics::ComputePipeline)> {
+        let mut result = Vec::new();
+        for (entry, pipeline) in &self.map {
+            result.push((entry.entry_point(), pipeline));
+        }
+        for (entry, pipeline) in &self.coop_map {
+            result.push((entry.entry_point(), pipeline));
+        }
+        for (entry, pipeline) in &self.small_map {
+            result.push((entry.entry_point(), pipeline));
+        }
+        #[allow(clippy::needless_borrowed_reference)]
+        for (&(ref entry, _), pipeline) in &self.epilogue_map {
+            result.push((entry.entry_point(), pipeline));
+        }
+        result
+    }
 }
 
 /// ShaderDataLayout for a schedule-template reduction pipeline, chosen
@@ -1013,7 +1031,7 @@ fn pointwise_data_layout(n_inputs: u8) -> blade_graphics::ShaderDataLayout {
 }
 
 /// Get the ShaderDataLayout for a given shader entry.
-fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
+pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
     use blade_graphics::ShaderData;
     match *entry {
         ShaderEntry::MatMul
@@ -1872,6 +1890,27 @@ impl Session {
     /// device after meganeura has created the context via [`Session::new`].
     pub fn context(&self) -> Arc<blade_graphics::Context> {
         self.gpu.clone()
+    }
+
+    /// Query GPU pipeline statistics for all compiled compute pipelines.
+    ///
+    /// Returns driver-reported statistics (register counts, spill counts,
+    /// SIMD width, etc.) for each pipeline executable. The exact statistics
+    /// depend on the GPU vendor and backend:
+    /// - NVIDIA/Vulkan: register count, spill loads/stores, subgroup size
+    /// - Metal: max threads per threadgroup, SIMD width, shared memory
+    /// - Other/unsupported: empty Vec
+    pub fn get_pipeline_statistics(
+        &self,
+    ) -> Vec<(String, Vec<blade_graphics::PipelineExecutableInfo>)> {
+        let mut result = Vec::new();
+        for (name, pipeline) in self.pipelines.all_pipelines() {
+            let stats = self.gpu.get_pipeline_statistics(pipeline);
+            if !stats.is_empty() {
+                result.push((name.to_string(), stats));
+            }
+        }
+        result
     }
 
     /// Upload parameter data to GPU buffers.

@@ -1437,12 +1437,10 @@ pub fn generate_flash_attention_module(head_dim: u32) -> ShaderModule {
     );
 
     let hd = head_dim;
-    // Elements per thread: each thread handles EPT consecutive head_dim elements.
-    // Choose EPT so that threads_per_query (TPQ) fits well in 256-thread WGs.
-    // Each thread handles EPT consecutive head_dim elements, computing partial
-    // dot products in registers. Higher EPT = fewer tree-reduce barriers but
-    // more register pressure. EPT=hd eliminates all dot-product reductions.
-    let ept: u32 = hd.min(64);
+    // Cap EPT at 32 to keep register count ≤ ~66 (2 arrays × 32 + scalars).
+    // EPT=64 causes register spilling on Ampere (255 reg limit).
+    // TPQ=2 adds one cross-lane reduction per KV position (cheap vs spilling).
+    let ept: u32 = hd.min(32);
     let tpq = hd / ept; // threads per query
     let bq: u32 = (256 / tpq).max(1);
     // Fall back to BQ=1 kernel when multi-query isn't beneficial
@@ -1725,7 +1723,10 @@ pub fn generate_flash_grad_q_module(head_dim: u32) -> ShaderModule {
     assert!(head_dim.is_power_of_two() && head_dim >= 2);
 
     let hd = head_dim;
-    let ept: u32 = hd.min(64);
+    // Cap EPT at 32 to keep register count ≤ ~96 (3 arrays × 32).
+    // EPT=64 causes register spilling on Ampere (255 reg limit).
+    // TPQ=2 adds one cross-lane reduction per KV position (cheap vs spilling).
+    let ept: u32 = hd.min(32);
     let tpq = hd / ept; // threads per query
     let bq: u32 = (256 / tpq).max(1);
     if bq <= 1 {
