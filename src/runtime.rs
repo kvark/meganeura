@@ -405,6 +405,11 @@ struct Conv2dParams {
     out_h: u32,
     out_w: u32,
     padding_w: u32,
+    // Reciprocals for strength-reduced integer division in im2col
+    inv_kernel_w: f32,
+    inv_kernel_hw: f32,
+    inv_col_w: f32,     // 1/out_w (forward, grad_weight) or 1/in_w (grad_input)
+    inv_go_spatial: f32, // 1/(out_h*out_w) for grad_weight, unused otherwise
 }
 
 // max_pool_2d: var src, dst, params
@@ -2989,6 +2994,7 @@ impl Session {
             | ShaderEntry::Conv2dGemmSmall
             | ShaderEntry::Conv2dGemmCoop => {
                 let p = &dispatch.params;
+                let kernel_hw = p[5] * p[6];
                 pc.bind(
                     0,
                     &Conv2dData {
@@ -3008,6 +3014,10 @@ impl Session {
                             out_h: p[9],
                             out_w: p[10],
                             padding_w: p[11],
+                            inv_kernel_w: 1.0 / p[6] as f32,
+                            inv_kernel_hw: 1.0 / kernel_hw as f32,
+                            inv_col_w: 1.0 / p[10] as f32, // 1/out_w
+                            inv_go_spatial: 0.0,
                         },
                     },
                 );
@@ -3017,6 +3027,7 @@ impl Session {
             | ShaderEntry::Conv2dGradInputGemmSmall
             | ShaderEntry::Conv2dGradInputGemmCoop => {
                 let p = &dispatch.params;
+                let kernel_hw = p[5] * p[6];
                 pc.bind(
                     0,
                     &Conv2dGradInputData {
@@ -3036,6 +3047,10 @@ impl Session {
                             out_h: p[9],
                             out_w: p[10],
                             padding_w: p[11],
+                            inv_kernel_w: 1.0 / p[6] as f32,
+                            inv_kernel_hw: 1.0 / kernel_hw as f32,
+                            inv_col_w: 1.0 / p[3] as f32, // 1/in_w
+                            inv_go_spatial: 0.0,
                         },
                     },
                 );
@@ -3044,6 +3059,8 @@ impl Session {
             | ShaderEntry::Conv2dGradWeightGemm
             | ShaderEntry::Conv2dGradWeightGemmSmall => {
                 let p = &dispatch.params;
+                let kernel_hw = p[5] * p[6];
+                let go_spatial = p[9] * p[10]; // out_h * out_w
                 pc.bind(
                     0,
                     &Conv2dGradWeightData {
@@ -3063,6 +3080,10 @@ impl Session {
                             out_h: p[9],
                             out_w: p[10],
                             padding_w: p[11],
+                            inv_kernel_w: 1.0 / p[6] as f32,
+                            inv_kernel_hw: 1.0 / kernel_hw as f32,
+                            inv_col_w: 1.0 / p[10] as f32, // 1/out_w
+                            inv_go_spatial: 1.0 / go_spatial as f32,
                         },
                     },
                 );
