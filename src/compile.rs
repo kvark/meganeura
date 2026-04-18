@@ -2120,6 +2120,38 @@ impl<'a> Compiler<'a> {
                 let out_h = (in_h + 2 * padding_h - kernel_h) / stride + 1;
                 let out_w = (in_w + 2 * padding_w - kernel_w) / stride + 1;
                 let batch = in_shape[0] as u32 / (in_channels * in_h * in_w);
+
+                // 1×1 stride-1 conv → pure MatMul (no im2col).
+                // output[b, Co, h, w] = sum_Ci(input[b, Ci, h, w] * W[Co, Ci])
+                // Reshape: input as [batch*H*W, Ci], weight as [Ci, Co] → matmul
+                if kernel_h == 1 && kernel_w == 1 && stride == 1
+                    && padding_h == 0 && padding_w == 0
+                {
+                    let m = (batch * in_h * in_w) as u32;
+                    let n = out_channels as u32;
+                    let k = in_channels as u32;
+                    let tile_size = 64u32;
+                    let wgs_64 = m.div_ceil(tile_size) * n.div_ceil(tile_size);
+                    let (shader, tile) = if wgs_64 < 16 {
+                        (ShaderEntry::MatMulBT, 32u32)
+                    } else {
+                        (ShaderEntry::MatMulBT, 64u32)
+                    };
+                    // Weight is [Co, Ci] (stored row-major), input is [batch*HW, Ci].
+                    // MatMulBT: C = A @ B^T where A=[M,K], B=[N,K] → C=[M,N]
+                    // A = input[batch*HW, Ci], B = weight[Co, Ci], C = output[batch*HW, Co]
+                    self.plan.dispatches.push(Dispatch {
+                        shader,
+                        workgroups: [m.div_ceil(tile), n.div_ceil(tile), 1],
+                        input_buffers: vec![input, kernel],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params: vec![m, n, k, 0],
+                        use_coop: false,
+                        use_small_tiles: wgs_64 < 16,
+                        ..Default::default()
+                    });
+                } else {
                 // Use implicit GEMM: output = weight @ im2col(input)^T
                 // M=Co, N=oH*oW, K=Ci*kH*kW, batched in z dimension
                 // Use small (32×32) tiles when workgroup count per batch is low.
@@ -2158,6 +2190,7 @@ impl<'a> Compiler<'a> {
                     use_small_tiles: false,
                     ..Default::default()
                 });
+                } // else (non-1x1 conv)
             }
 
             Op::WinogradConv2d {
