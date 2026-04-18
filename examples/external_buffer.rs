@@ -146,7 +146,9 @@ fn main() {
     }
 
     // Cross-check against a CPU reference.
-    let x_ref: Vec<f32> = (0..(ROWS * COLS)).map(|i| (i as f32 - 10.0) * 0.25).collect();
+    let x_ref: Vec<f32> = (0..(ROWS * COLS))
+        .map(|i| (i as f32 - 10.0) * 0.25)
+        .collect();
     let mut cpu = [0.0_f32; ROWS * OUT];
     for r in 0..ROWS {
         for o in 0..OUT {
