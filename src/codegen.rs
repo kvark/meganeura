@@ -2030,7 +2030,11 @@ pub fn generate_flash_grad_kv_module(head_dim: u32) -> ShaderModule {
     assert!(head_dim.is_power_of_two() && head_dim >= 2);
 
     let hd = head_dim;
-    let ept: u32 = hd.min(64);
+    // Cap EPT at 32 to keep register count ≤ 128 (4 arrays × 32).
+    // EPT=64 causes register spilling on Ampere (255 reg limit),
+    // making the kernel memory-bound at ~60× below compute peak.
+    // TPQ=2 adds one cross-lane reduction per Q position (cheap vs spilling).
+    let ept: u32 = hd.min(32);
     let tpq = hd / ept; // threads per KV position
     let bkv: u32 = (256 / tpq).max(1);
     if bkv <= 1 {
