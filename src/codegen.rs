@@ -2051,11 +2051,15 @@ pub fn generate_flash_grad_kv_module(head_dim: u32) -> ShaderModule {
     src.push_str("var<storage, read_write> dst2: array<f32>;\n"); // dV
     src.push_str("var<uniform> params: Params;\n\n");
 
-    // Shared Q/dO/O staging: all BKV groups share the same q position `pos`
-    // in the inner loop, so staging once per WG amortizes global reads.
-    let _ = writeln!(src, "var<workgroup> shared_q: array<f32, {hd}>;");
-    let _ = writeln!(src, "var<workgroup> shared_do: array<f32, {hd}>;");
-    let _ = writeln!(src, "var<workgroup> shared_o: array<f32, {hd}>;\n");
+    // Shared Q/dO/O staging: only needed when TPQ > 1 (multiple threads
+    // per KV position need coordinated access). When TPQ == 1, each thread
+    // loads Q/dO/O directly from global memory — all threads read the same
+    // addresses, hitting L2 cache, and no barriers are needed.
+    if tpq > 1 {
+        let _ = writeln!(src, "var<workgroup> shared_q: array<f32, {hd}>;");
+        let _ = writeln!(src, "var<workgroup> shared_do: array<f32, {hd}>;");
+        let _ = writeln!(src, "var<workgroup> shared_o: array<f32, {hd}>;\n");
+    }
 
     // Shared memory only needed when TPQ > 1 (cross-lane reductions)
     if tpq > 1 {
@@ -2132,23 +2136,35 @@ pub fn generate_flash_grad_kv_module(head_dim: u32) -> ShaderModule {
     src.push_str("    let wg_start = select(0u, first_t, kv_seq == 0u);\n");
     src.push_str("    let wg_end = select(q_seq, min(q_seq, last_t + window), window > 0u);\n\n");
 
-    // Simple per-position cooperative load (fast path for BKV=4, hd=64).
+    // Inner Q loop: iterate all Q positions that attend to this KV position.
     src.push_str("    for (var pos = wg_start; pos < wg_end; pos++) {\n");
     src.push_str("        for (var head_rel = 0u; head_rel < heads_per_kv; head_rel++) {\n");
     src.push_str("            let head = kv_head * heads_per_kv + head_rel;\n");
     src.push_str("            let q_base = pos * q_dim + head * head_dim;\n\n");
 
-    let _ = writeln!(src, "            if lid.x < {hd}u {{");
-    src.push_str("                shared_q[lid.x] = src_a[q_base + lid.x];\n");
-    src.push_str("                shared_do[lid.x] = d_out[q_base + lid.x];\n");
-    src.push_str("                shared_o[lid.x] = fwd_dst[q_base + lid.x];\n");
-    src.push_str("            }\n");
-    src.push_str("            workgroupBarrier();\n\n");
+    if tpq == 1 {
+        // TPQ=1: each thread handles the full head_dim. Load Q/dO/O directly
+        // from global memory — all threads read the same addresses, hitting L2.
+        // This eliminates ALL barriers in the inner loop.
+        for e in 0..ept {
+            let _ = writeln!(src, "            let q{e} = src_a[q_base + {e}u];");
+            let _ = writeln!(src, "            let do{e} = d_out[q_base + {e}u];");
+            let _ = writeln!(src, "            let o{e} = fwd_dst[q_base + {e}u];");
+        }
+    } else {
+        // TPQ>1: cooperative staging into shared memory (needs barriers).
+        let _ = writeln!(src, "            if lid.x < {hd}u {{");
+        src.push_str("                shared_q[lid.x] = src_a[q_base + lid.x];\n");
+        src.push_str("                shared_do[lid.x] = d_out[q_base + lid.x];\n");
+        src.push_str("                shared_o[lid.x] = fwd_dst[q_base + lid.x];\n");
+        src.push_str("            }\n");
+        src.push_str("            workgroupBarrier();\n\n");
 
-    for e in 0..ept {
-        let _ = writeln!(src, "            let q{e} = shared_q[d_base + {e}u];");
-        let _ = writeln!(src, "            let do{e} = shared_do[d_base + {e}u];");
-        let _ = writeln!(src, "            let o{e} = shared_o[d_base + {e}u];");
+        for e in 0..ept {
+            let _ = writeln!(src, "            let q{e} = shared_q[d_base + {e}u];");
+            let _ = writeln!(src, "            let do{e} = shared_do[d_base + {e}u];");
+            let _ = writeln!(src, "            let o{e} = shared_o[d_base + {e}u];");
+        }
     }
     src.push_str("            var score_part = 0.0;\n");
     src.push_str("            var rs_part = 0.0;\n");
@@ -2189,7 +2205,9 @@ pub fn generate_flash_grad_kv_module(head_dim: u32) -> ShaderModule {
         let _ = writeln!(src, "                dv{e} += p_t * do{e};");
     }
     src.push_str("            }\n");
-    src.push_str("            workgroupBarrier();\n");
+    if tpq > 1 {
+        src.push_str("            workgroupBarrier();\n");
+    }
     src.push_str("        }\n");
     src.push_str("    }\n\n");
 
