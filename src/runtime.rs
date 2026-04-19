@@ -1920,7 +1920,46 @@ impl Session {
         }
         result
     }
+}
 
+/// Compile a single shader module on the given GPU and report its
+/// driver-reported register count, then destroy the pipeline.
+///
+/// Used by tuners that want to measure register pressure across kernel
+/// variants (e.g. different EPT caps) without committing to one in the
+/// final session. Returns `None` when the driver doesn't expose register
+/// counts (Metal, llvmpipe).
+///
+/// The kernel name searched in `PipelineStatistic::name` matches the
+/// NVIDIA/Vulkan convention ("Register Count") — adapt if you need
+/// AMD/Intel-style "numUsedVgprs" naming.
+pub fn measure_pipeline_register_count(
+    gpu: &blade_graphics::Context,
+    sm: &crate::codegen::ShaderModule,
+    entry: &crate::compile::ShaderEntry,
+) -> Option<u32> {
+    use blade_graphics as bg;
+    let shader = gpu.create_shader(bg::ShaderDesc {
+        source: &sm.source,
+        naga_module: Some(sm.module.clone()),
+    });
+    let layout = shader_data_layout(entry);
+    let mut pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
+        name: entry.entry_point(),
+        data_layouts: &[&layout],
+        compute: shader.at(entry.entry_point()),
+    });
+    let stats = gpu.get_pipeline_statistics(&pipeline);
+    gpu.destroy_compute_pipeline(&mut pipeline);
+
+    stats
+        .iter()
+        .flat_map(|exec| exec.statistics.iter())
+        .find(|s| s.name == "Register Count")
+        .map(|s| s.value as u32)
+}
+
+impl Session {
     /// Upload parameter data to GPU buffers.
     pub fn set_parameter(&mut self, name: &str, data: &[f32]) {
         // Check regular parameters first

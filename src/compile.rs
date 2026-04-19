@@ -1097,10 +1097,10 @@ impl<'a> Compiler<'a> {
     /// Choose between FlashAttention (BQ>1) and MultiHeadAttn (BQ=1) for
     /// a forward attention dispatch. Returns (shader_entry, workgroups_x).
     fn attention_dispatch(q_seq: u32, head_dim: u32, num_heads: u32) -> (ShaderEntry, [u32; 3]) {
-        // EPT (elements per thread) matches codegen (capped at 32 to avoid
-        // register spilling on Ampere): reduces threads per query, increases
-        // BQ (queries per workgroup).
-        let ept = head_dim.min(32);
+        // EPT (elements per thread) must match codegen — both call
+        // crate::codegen::flash_ept_cap() so the same env-var override
+        // is observed at compile and dispatch time.
+        let ept = head_dim.min(crate::codegen::flash_ept_cap());
         let tpq = head_dim / ept; // threads per query
         let bq = (256 / tpq).max(1);
         if bq >= 2 && q_seq >= bq {
@@ -1120,7 +1120,7 @@ impl<'a> Compiler<'a> {
         head_dim: u32,
         num_heads: u32,
     ) -> (ShaderEntry, [u32; 3]) {
-        let ept = head_dim.min(32);
+        let ept = head_dim.min(crate::codegen::flash_ept_cap());
         let tpq = head_dim / ept;
         let bq = (256 / tpq).max(1);
         if bq >= 2 && q_seq >= bq {
@@ -3651,7 +3651,7 @@ mod tests {
             // Forward dispatch
             let (entry, wg) = Compiler::attention_dispatch(256, hd, 1);
             // The forward codegen uses the same EPT cap.
-            let codegen_ept: u32 = hd.min(32);
+            let codegen_ept: u32 = hd.min(crate::codegen::flash_ept_cap());
             let codegen_tpq = hd / codegen_ept;
             let codegen_bq: u32 = (256 / codegen_tpq).max(1);
 

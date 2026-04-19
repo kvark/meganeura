@@ -1437,6 +1437,32 @@ pub fn generate_attention_module(head_dim: u32) -> ShaderModule {
 ///
 /// For head_dim=64, EPT=8: TPQ=8 threads/query, BQ=32 queries/WG,
 /// tree depth=3 (vs 6), workgroups reduced 8x.
+/// Tunable cap on elements-per-thread for flash-attention codegen.
+///
+/// EPT controls how many head_dim slots a single thread handles. Lower
+/// EPT means lower register pressure (better occupancy) but more threads
+/// per query and more cross-lane reductions per inner-loop iteration.
+/// Higher EPT means fewer reductions but more registers in flight.
+///
+/// The default cap (32) was tuned to avoid spilling on Ampere (255-reg
+/// limit). The override exists so analyze_shaders / benchmarks can sweep
+/// values like 8 or 16 to find the EPT that hits the right
+/// occupancy/parallelism tradeoff for a given GPU and dispatch shape.
+///
+/// **Important**: the same value must be observed by both codegen and
+/// `Compiler::attention_dispatch{,_bwd}`, otherwise generated tile sizes
+/// won't match the workgroup counts and kernels produce wrong results.
+/// Both sites call this function, so as long as the env var doesn't
+/// change between session creation and pipeline compilation the values
+/// stay consistent.
+pub fn flash_ept_cap() -> u32 {
+    std::env::var("MEGANEURA_FLASH_EPT_CAP")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|v| v.is_power_of_two() && *v >= 2)
+        .unwrap_or(32)
+}
+
 pub fn generate_flash_attention_module(head_dim: u32) -> ShaderModule {
     use std::fmt::Write;
     assert!(
@@ -1445,10 +1471,10 @@ pub fn generate_flash_attention_module(head_dim: u32) -> ShaderModule {
     );
 
     let hd = head_dim;
-    // Cap EPT at 32 to keep register count ≤ ~66 (2 arrays × 32 + scalars).
-    // EPT=64 causes register spilling on Ampere (255 reg limit).
-    // TPQ=2 adds one cross-lane reduction per KV position (cheap vs spilling).
-    let ept: u32 = hd.min(32);
+    // EPT cap is tunable via MEGANEURA_FLASH_EPT_CAP — see flash_ept_cap().
+    // Default 32 keeps register count ≤ ~66 on Ampere/Blackwell.
+    // TPQ>1 adds one cross-lane reduction per KV position.
+    let ept: u32 = hd.min(flash_ept_cap());
     let tpq = hd / ept; // threads per query
     let bq: u32 = (256 / tpq).max(1);
     // Fall back to BQ=1 kernel when multi-query isn't beneficial
@@ -1731,10 +1757,9 @@ pub fn generate_flash_grad_q_module(head_dim: u32) -> ShaderModule {
     assert!(head_dim.is_power_of_two() && head_dim >= 2);
 
     let hd = head_dim;
-    // Cap EPT at 32 to keep register count ≤ ~96 (3 arrays × 32).
-    // EPT=64 causes register spilling on Ampere (255 reg limit).
-    // TPQ=2 adds one cross-lane reduction per KV position (cheap vs spilling).
-    let ept: u32 = hd.min(32);
+    // EPT cap tunable via MEGANEURA_FLASH_EPT_CAP — see flash_ept_cap().
+    // Default 32; lower values trade reductions for occupancy.
+    let ept: u32 = hd.min(flash_ept_cap());
     let tpq = hd / ept; // threads per query
     let bq: u32 = (256 / tpq).max(1);
     if bq <= 1 {
@@ -2039,11 +2064,10 @@ pub fn generate_flash_grad_kv_module(head_dim: u32) -> ShaderModule {
     assert!(head_dim.is_power_of_two() && head_dim >= 2);
 
     let hd = head_dim;
-    // Cap EPT at 32 to keep register count ≤ 128 (4 arrays × 32).
-    // EPT=64 causes register spilling on Ampere (255 reg limit),
-    // making the kernel memory-bound at ~60× below compute peak.
-    // TPQ=2 adds one cross-lane reduction per Q position (cheap vs spilling).
-    let ept: u32 = hd.min(32);
+    // EPT cap tunable via MEGANEURA_FLASH_EPT_CAP — see flash_ept_cap().
+    // Default 32; the fused dK+dV kernel hits 210 regs at hd=64, so the
+    // override is the simplest way to test smaller EPTs.
+    let ept: u32 = hd.min(flash_ept_cap());
     let tpq = hd / ept; // threads per KV position
     let bkv: u32 = (256 / tpq).max(1);
     if bkv <= 1 {
@@ -2271,7 +2295,8 @@ fn gen_flash_grad_kv_split_impl(head_dim: u32, kind: FlashKvKind) -> ShaderModul
     assert!(head_dim.is_power_of_two() && head_dim >= 2);
 
     let hd = head_dim;
-    let ept: u32 = hd.min(32);
+    // EPT cap tunable via MEGANEURA_FLASH_EPT_CAP — see flash_ept_cap().
+    let ept: u32 = hd.min(flash_ept_cap());
     let tpq = hd / ept;
     let bkv: u32 = (256 / tpq).max(1);
     assert!(
