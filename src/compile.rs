@@ -2356,42 +2356,101 @@ impl<'a> Compiler<'a> {
                     });
                 } else {
                     // Use implicit GEMM: grad_input = weight_T @ im2col(grad_out)^T
-                    // M=Ci, N=H*W, K=Co*kH*kW, batched in z dimension
-                    let wgs_64 = in_h * in_w.div_ceil(64) * in_channels.div_ceil(64);
-                    let use_small = wgs_64 < 16;
-                    let tile = if use_small { 32 } else { 64 };
-                    self.plan.dispatches.push(Dispatch {
-                        shader: if use_small {
-                            ShaderEntry::Conv2dGradInputGemmSmall
-                        } else {
-                            ShaderEntry::Conv2dGradInputGemm
-                        },
-                        workgroups: [
-                            in_h * in_w.div_ceil(tile),
-                            in_channels.div_ceil(tile),
-                            batch,
-                        ],
-                        input_buffers: vec![grad_out, kernel],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![
-                            batch,
-                            in_channels,
-                            in_h,
-                            in_w,
-                            out_channels,
-                            kernel_h,
-                            kernel_w,
-                            stride,
-                            padding_h,
-                            out_h,
-                            out_w,
-                            padding_w,
-                        ],
-                        use_coop: false,
-                        use_small_tiles: false,
-                        ..Default::default()
-                    });
+                    // M=Ci, N=H*W, K=Co*kH*kW, batched in z dimension.
+                    //
+                    // For 3×3 stride-1 with cooperative_matrix support
+                    // (Blackwell / RDNA3 / Xe-HPG), the hand-written
+                    // coop kernel is available — opt-in via
+                    // MEGANEURA_CONV_COOP=1.
+                    //
+                    // On RTX 5080 (Blackwell, NVIDIA driver 580.105.08)
+                    // it is correctness-equivalent but not faster: the
+                    // SPIR-V emitted by naga for coop_mat doesn't
+                    // appear to reach the f16 tensor-core path — the
+                    // kernel reports 56 regs (vs 48 for the scalar
+                    // im2col GEMM) and a 3.7x larger binary, with
+                    // per-dispatch time within ±1% of the scalar
+                    // version. Re-evaluate once naga emits the
+                    // NV_cooperative_matrix2 intrinsics or on AMD/Xe
+                    // where the coop path goes through different
+                    // driver lowering.
+                    let coop_3x3 = kernel_h == 3
+                        && kernel_w == 3
+                        && stride == 1
+                        && crate::codegen::coop_matrix_available()
+                        && std::env::var("MEGANEURA_CONV_COOP").as_deref() == Ok("1");
+                    if coop_3x3 {
+                        // Coop3x3 dispatch: 2x2 16x16 tile grid per workgroup
+                        // → output_tile = 32 in both M and N dimensions.
+                        // `use_coop: true` routes runtime lookup to the
+                        // coop_map (the scalar map never gets a Coop3x3
+                        // pipeline, by design at runtime.rs:629).
+                        let coop_tile: u32 = 32;
+                        self.plan.dispatches.push(Dispatch {
+                            shader: ShaderEntry::Conv2dGradInputGemmCoop3x3,
+                            workgroups: [
+                                in_channels.div_ceil(coop_tile),
+                                (in_h * in_w).div_ceil(coop_tile),
+                                batch,
+                            ],
+                            input_buffers: vec![grad_out, kernel],
+                            output_buffer: out_buf,
+                            extra_outputs: vec![],
+                            params: vec![
+                                batch,
+                                in_channels,
+                                in_h,
+                                in_w,
+                                out_channels,
+                                kernel_h,
+                                kernel_w,
+                                stride,
+                                padding_h,
+                                out_h,
+                                out_w,
+                                padding_w,
+                            ],
+                            use_coop: true,
+                            use_small_tiles: false,
+                            ..Default::default()
+                        });
+                    } else {
+                        let wgs_64 = in_h * in_w.div_ceil(64) * in_channels.div_ceil(64);
+                        let use_small = wgs_64 < 16;
+                        let tile = if use_small { 32 } else { 64 };
+                        self.plan.dispatches.push(Dispatch {
+                            shader: if use_small {
+                                ShaderEntry::Conv2dGradInputGemmSmall
+                            } else {
+                                ShaderEntry::Conv2dGradInputGemm
+                            },
+                            workgroups: [
+                                in_h * in_w.div_ceil(tile),
+                                in_channels.div_ceil(tile),
+                                batch,
+                            ],
+                            input_buffers: vec![grad_out, kernel],
+                            output_buffer: out_buf,
+                            extra_outputs: vec![],
+                            params: vec![
+                                batch,
+                                in_channels,
+                                in_h,
+                                in_w,
+                                out_channels,
+                                kernel_h,
+                                kernel_w,
+                                stride,
+                                padding_h,
+                                out_h,
+                                out_w,
+                                padding_w,
+                            ],
+                            use_coop: false,
+                            use_small_tiles: false,
+                            ..Default::default()
+                        });
+                    }
                 }
             }
 

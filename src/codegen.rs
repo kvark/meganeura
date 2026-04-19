@@ -1490,6 +1490,25 @@ impl Default for FlashEptConfig {
 
 static FLASH_EPT_CONFIG: std::sync::OnceLock<FlashEptConfig> = std::sync::OnceLock::new();
 
+/// Whether the runtime GPU supports `cooperative_matrix` (KHR f16 tile
+/// path). Set by `runtime::install_auto_tune` from the Blade
+/// capabilities probe; defaults to `false` so anything that hasn't
+/// been auto-tuned stays on the scalar fallback.
+///
+/// Used by `Compiler` to decide whether to dispatch the coop-matrix
+/// variants of conv2d backward (and any future kernel pair where
+/// the coop variant has a different binding shape than its scalar
+/// twin).
+static COOP_MATRIX_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+pub fn set_coop_matrix_available(available: bool) {
+    let _ = COOP_MATRIX_AVAILABLE.set(available);
+}
+
+pub fn coop_matrix_available() -> bool {
+    *COOP_MATRIX_AVAILABLE.get().unwrap_or(&false)
+}
+
 /// Install a process-wide EPT config (typically the result of
 /// `runtime::auto_tune_flash_ept`). Has no effect after the first
 /// successful call — the config locks in for the rest of the process.
