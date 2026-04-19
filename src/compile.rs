@@ -88,6 +88,13 @@ pub enum ShaderEntry {
     MultiHeadAttnGradV,
     MultiHeadAttnGradKV,
     FlashGradKV,
+    /// Split flash-attention dK kernel. Dispatched alongside
+    /// [`ShaderEntry::FlashGradV`] as an alternative to the fused
+    /// [`ShaderEntry::FlashGradKV`] when the cost model prefers lower
+    /// per-kernel register pressure over duplicated score computation.
+    FlashGradK,
+    /// Split flash-attention dV kernel. See [`ShaderEntry::FlashGradK`].
+    FlashGradV,
     SwiGLUGradGate,
     SwiGLUGradUp,
     SiluGrad,
@@ -185,6 +192,8 @@ impl ShaderEntry {
             ShaderEntry::MultiHeadAttnGradK => ShaderGroup::MultiHeadAttnGradK,
             ShaderEntry::MultiHeadAttnGradKV => ShaderGroup::MultiHeadAttnGradKV,
             ShaderEntry::FlashGradKV => ShaderGroup::FlashGradKV,
+            ShaderEntry::FlashGradK => ShaderGroup::FlashGradK,
+            ShaderEntry::FlashGradV => ShaderGroup::FlashGradV,
             ShaderEntry::MultiHeadAttnGradV => ShaderGroup::MultiHeadAttnGradV,
             ShaderEntry::SwiGLUGradGate | ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => {
                 ShaderGroup::SwiGLUGrad
@@ -280,7 +289,9 @@ impl ShaderEntry {
             | ShaderEntry::MultiHeadAttnGradK
             | ShaderEntry::MultiHeadAttnGradV
             | ShaderEntry::MultiHeadAttnGradKV
-            | ShaderEntry::FlashGradKV => "main",
+            | ShaderEntry::FlashGradKV
+            | ShaderEntry::FlashGradK
+            | ShaderEntry::FlashGradV => "main",
             ShaderEntry::SwiGLUGradGate => "swiglu_grad_gate",
             ShaderEntry::SwiGLUGradUp => "swiglu_grad_up",
             ShaderEntry::SiluGrad => "silu_grad",
@@ -2756,33 +2767,69 @@ impl<'a> Compiler<'a> {
                 };
                 let dispatch_kv = if is_causal { q_seq } else { kv_seq };
 
-                // Fused GradKV: pre-allocate dV buffer. When GradV is later
+                // GradKV: pre-allocate dV buffer. When GradV is later
                 // compiled for the same fwd_node, it reuses this buffer.
                 let dv_buf = self.alloc_buffer(self.graph.node(node.inputs[3]).ty.size_bytes());
                 self.fused_grad_kv_dv.insert(fwd_node, dv_buf);
                 let (grad_kv_shader, grad_kv_wgs) =
                     Self::attention_dispatch_bwd(dispatch_kv, head_dim, num_kv_heads);
-                let grad_kv_shader = match grad_kv_shader {
-                    ShaderEntry::FlashAttention => ShaderEntry::FlashGradKV,
-                    _ => ShaderEntry::MultiHeadAttnGradKV,
-                };
-                self.plan.dispatches.push(Dispatch {
-                    shader: grad_kv_shader,
-                    workgroups: grad_kv_wgs,
-                    input_buffers: vec![d_out, q, k, v, lse_buf, fwd_o],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![dv_buf],
-                    params: vec![
-                        q_seq,
-                        kv_seq,
-                        (num_heads << 16) | num_kv_heads,
-                        head_dim,
-                        window_size,
-                    ],
-                    use_coop: false,
-                    use_small_tiles: false,
-                    ..Default::default()
-                });
+                let attention_params = vec![
+                    q_seq,
+                    kv_seq,
+                    (num_heads << 16) | num_kv_heads,
+                    head_dim,
+                    window_size,
+                ];
+                // `MEGANEURA_FLASH_GRAD_SPLIT=1` opts into the
+                // FlashGradK + FlashGradV dispatch pair. The split kernels
+                // each report lower register pressure than the fused
+                // FlashGradKV (158 / 109 vs 210 on Blackwell at hd=64),
+                // but each independently recomputes the Q·K score in its
+                // inner loop — a loss on work-bound shapes like Whisper's
+                // non-causal seq=1500 encoder. Dispatch-size-aware
+                // selection belongs in the e-graph cost model; the env
+                // var lets benchmarks A/B the two strategies today.
+                let split_requested =
+                    std::env::var("MEGANEURA_FLASH_GRAD_SPLIT").as_deref() == Ok("1");
+                let use_split = split_requested && grad_kv_shader == ShaderEntry::FlashAttention;
+                if use_split {
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::FlashGradK,
+                        workgroups: grad_kv_wgs,
+                        input_buffers: vec![d_out, q, k, v, lse_buf, fwd_o],
+                        output_buffer: out_buf,
+                        params: attention_params.clone(),
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::FlashGradV,
+                        workgroups: grad_kv_wgs,
+                        input_buffers: vec![d_out, q, k, v, lse_buf, fwd_o],
+                        output_buffer: dv_buf,
+                        params: attention_params,
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
+                } else {
+                    let shader = match grad_kv_shader {
+                        ShaderEntry::FlashAttention => ShaderEntry::FlashGradKV,
+                        _ => ShaderEntry::MultiHeadAttnGradKV,
+                    };
+                    self.plan.dispatches.push(Dispatch {
+                        shader,
+                        workgroups: grad_kv_wgs,
+                        input_buffers: vec![d_out, q, k, v, lse_buf, fwd_o],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![dv_buf],
+                        params: attention_params,
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
+                }
             }
 
             Op::MultiHeadAttnGradV {

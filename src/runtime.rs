@@ -640,6 +640,8 @@ impl Pipelines {
                     | ShaderGroup::FlashAttention
                     | ShaderGroup::FlashGradQ
                     | ShaderGroup::FlashGradKV
+                    | ShaderGroup::FlashGradK
+                    | ShaderGroup::FlashGradV
             ) && dispatch.params.len() >= 4
             {
                 attention_head_dim = Some(dispatch.params[3]);
@@ -741,6 +743,8 @@ impl Pipelines {
                     | ShaderGroup::FlashAttention
                     | ShaderGroup::FlashGradQ
                     | ShaderGroup::FlashGradKV
+                    | ShaderGroup::FlashGradK
+                    | ShaderGroup::FlashGradV
             ) {
                 // Use parameterized attention generators with actual head_dim.
                 let hd = attention_head_dim.unwrap_or(64);
@@ -750,6 +754,8 @@ impl Pipelines {
                     }
                     ShaderGroup::FlashGradQ => crate::codegen::generate_flash_grad_q_module(hd),
                     ShaderGroup::FlashGradKV => crate::codegen::generate_flash_grad_kv_module(hd),
+                    ShaderGroup::FlashGradK => crate::codegen::generate_flash_grad_k_module(hd),
+                    ShaderGroup::FlashGradV => crate::codegen::generate_flash_grad_v_module(hd),
                     _ => crate::codegen::generate_attention_module(hd),
                 };
                 let shader = gpu.create_shader(bg::ShaderDesc {
@@ -1073,7 +1079,9 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::MultiHeadAttnGradQ
         | ShaderEntry::FlashGradQ
         | ShaderEntry::MultiHeadAttnGradK
-        | ShaderEntry::MultiHeadAttnGradV => MultiHeadAttnGradData::layout(),
+        | ShaderEntry::FlashGradK
+        | ShaderEntry::MultiHeadAttnGradV
+        | ShaderEntry::FlashGradV => MultiHeadAttnGradData::layout(),
         ShaderEntry::MultiHeadAttnGradKV | ShaderEntry::FlashGradKV => {
             MultiHeadAttnGradKVData::layout()
         }
@@ -2831,7 +2839,9 @@ impl Session {
             ShaderEntry::MultiHeadAttnGradQ
             | ShaderEntry::FlashGradQ
             | ShaderEntry::MultiHeadAttnGradK
-            | ShaderEntry::MultiHeadAttnGradV => {
+            | ShaderEntry::FlashGradK
+            | ShaderEntry::MultiHeadAttnGradV
+            | ShaderEntry::FlashGradV => {
                 pc.bind(
                     0,
                     &MultiHeadAttnGradData {

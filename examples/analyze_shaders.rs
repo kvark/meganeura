@@ -355,6 +355,24 @@ fn main() {
             dump,
             gpu_ref,
         );
+
+        let sm_gk = meganeura::codegen::generate_flash_grad_k_module(64);
+        analyze(
+            "flash_grad_k_hd64",
+            &sm_gk,
+            &ShaderEntry::FlashGradK,
+            dump,
+            gpu_ref,
+        );
+
+        let sm_gv = meganeura::codegen::generate_flash_grad_v_module(64);
+        analyze(
+            "flash_grad_v_hd64",
+            &sm_gv,
+            &ShaderEntry::FlashGradV,
+            dump,
+            gpu_ref,
+        );
     }
 
     // 9. Normalization backward
