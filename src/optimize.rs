@@ -49,6 +49,22 @@ pub struct RegisterCostTable {
     pub regs_per_op: HashMap<String, u32>,
 }
 
+static FUSION_REGISTER_COSTS: std::sync::OnceLock<RegisterCostTable> = std::sync::OnceLock::new();
+
+/// Install a process-wide fusion register-cost table that
+/// [`optimize_with_report`] (and hence the default [`optimize`] entry
+/// point) will consume on every subsequent call. Only the first
+/// install wins — matches `set_flash_ept_config` lifetime semantics
+/// since both are populated by the same `runtime::auto_tune` pass.
+pub fn set_fusion_register_costs(table: RegisterCostTable) {
+    let _ = FUSION_REGISTER_COSTS.set(table);
+}
+
+/// Inspect the currently-installed fusion register table, if any.
+pub fn fusion_register_costs() -> Option<RegisterCostTable> {
+    FUSION_REGISTER_COSTS.get().cloned()
+}
+
 impl FusionCostModel {
     /// Cost-only model (no register awareness). Equivalent to the
     /// pre-pipeline-stats behavior.
@@ -202,8 +218,17 @@ pub fn optimize(graph: &Graph) -> Graph {
 }
 
 /// Like `optimize`, but also returns a detailed report for debugging.
+///
+/// If a process-wide [`RegisterCostTable`] has been installed via
+/// [`set_fusion_register_costs`] (typically by `runtime::auto_tune`),
+/// the cost model uses it automatically — fusions whose backing
+/// kernels overshoot the occupancy threshold get penalized.
 pub fn optimize_with_report(graph: &Graph) -> (Graph, OptimizeReport) {
-    optimize_with_cost_model(graph, FusionCostModel::new())
+    let cost_model = match fusion_register_costs() {
+        Some(table) => FusionCostModel::with_register_costs(table),
+        None => FusionCostModel::new(),
+    };
+    optimize_with_cost_model(graph, cost_model)
 }
 
 /// Like `optimize_with_report`, but lets the caller supply a
