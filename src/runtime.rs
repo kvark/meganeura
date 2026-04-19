@@ -1959,6 +1959,89 @@ pub fn measure_pipeline_register_count(
         .map(|s| s.value as u32)
 }
 
+/// Convenience: create a Blade GPU context with the same defaults
+/// `Session::new` uses, honoring the `MEGANEURA_DEVICE_ID` env var.
+///
+/// Use this when you need a context for [`auto_tune`] before any
+/// session exists. The returned context can be dropped after the tune
+/// or shared with sessions via `Session::with_context`.
+///
+/// # Safety
+/// Wraps `blade_graphics::Context::init`, which is `unsafe` because it
+/// loads the system Vulkan driver. The default `validation:false`
+/// matches Session's release-mode init.
+pub fn init_gpu_context() -> Result<blade_graphics::Context, blade_graphics::NotSupportedError> {
+    let dev_id = std::env::var("MEGANEURA_DEVICE_ID")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    unsafe {
+        blade_graphics::Context::init(blade_graphics::ContextDesc {
+            validation: cfg!(debug_assertions),
+            timing: false,
+            capture: false,
+            overlay: false,
+            device_id: dev_id,
+            ..Default::default()
+        })
+    }
+}
+
+/// Result of [`auto_tune`] — measurements from the connected GPU
+/// suitable for installing as global compilation defaults via
+/// [`install_auto_tune`].
+#[derive(Clone, Debug)]
+pub struct AutoTuneResult {
+    /// Per-flash-kernel EPT cap, see [`crate::codegen::FlashEptConfig`].
+    pub flash_ept: crate::codegen::FlashEptConfig,
+    /// Register counts for the fused ops the e-graph cost model
+    /// recognizes (FusedMatMulAdd, FusedRmsNormMatMul, …).
+    pub fusion_register_costs: crate::optimize::RegisterCostTable,
+}
+
+/// Run the full pipeline-stats-driven auto-tune on `gpu`:
+///   1. Measure register count for each flash kernel × candidate EPT
+///      and pick the largest cap that fits the occupancy threshold.
+///   2. Measure register count for each fused op the cost model
+///      recognizes so the e-graph can penalize register-pressured
+///      fusions.
+///
+/// `head_dim` should match the model's attention head dim (e.g. 64 for
+/// SmolLM2 / Whisper / SmolVLA). The tune is shape-blind across other
+/// dispatch parameters but matches PyTorch's compile-once-per-device
+/// pattern.
+///
+/// The returned [`AutoTuneResult`] does not change anything on its own
+/// — pass it to [`install_auto_tune`] before constructing any sessions
+/// that should benefit.
+pub fn auto_tune(gpu: &blade_graphics::Context, head_dim: u32) -> AutoTuneResult {
+    AutoTuneResult {
+        flash_ept: auto_tune_flash_ept(gpu, head_dim),
+        fusion_register_costs: measure_fused_op_register_costs(gpu),
+    }
+}
+
+/// Install the auto-tuned configuration into the process-wide globals.
+///
+/// Subsequent [`crate::optimize::optimize`] / `optimize_with_report`
+/// calls pick up the register-aware fusion cost model. The flash-EPT
+/// part is **opt-in** — it only installs when
+/// `MEGANEURA_FLASH_EPT_AUTOPICK=1` is set, because the
+/// register-pressure heuristic alone can mis-pick on shapes where the
+/// kernel is work-bound rather than occupancy-bound (e.g. a 25%
+/// regression on Whisper-tiny training was observed when EPT=16 was
+/// installed for the backward kernels). The fusion cost table is
+/// always installed since it's shape-blind by construction.
+///
+/// Only the first install per global wins (the underlying `OnceLock`s
+/// are write-once). Call this *before* building the first Session
+/// whose dispatches should be affected.
+pub fn install_auto_tune(result: AutoTuneResult) {
+    crate::optimize::set_fusion_register_costs(result.fusion_register_costs);
+    if std::env::var("MEGANEURA_FLASH_EPT_AUTOPICK").as_deref() == Ok("1") {
+        crate::codegen::set_flash_ept_config(result.flash_ept);
+    }
+}
+
 /// Auto-pick a [`crate::codegen::FlashEptConfig`] by measuring register
 /// counts for each flash-attention kernel at candidate EPT values.
 ///
