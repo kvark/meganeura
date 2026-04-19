@@ -640,6 +640,7 @@ impl Pipelines {
                     | ShaderGroup::FlashAttention
                     | ShaderGroup::FlashAttentionCoop
                     | ShaderGroup::FlashGradQ
+                    | ShaderGroup::FlashGradQCoop
                     | ShaderGroup::FlashGradKV
                     | ShaderGroup::FlashGradK
                     | ShaderGroup::FlashGradV
@@ -744,6 +745,7 @@ impl Pipelines {
                     | ShaderGroup::FlashAttention
                     | ShaderGroup::FlashAttentionCoop
                     | ShaderGroup::FlashGradQ
+                    | ShaderGroup::FlashGradQCoop
                     | ShaderGroup::FlashGradKV
                     | ShaderGroup::FlashGradK
                     | ShaderGroup::FlashGradV
@@ -758,6 +760,9 @@ impl Pipelines {
                         crate::codegen::generate_flash_attention_coop_module(hd)
                     }
                     ShaderGroup::FlashGradQ => crate::codegen::generate_flash_grad_q_module(hd),
+                    ShaderGroup::FlashGradQCoop => {
+                        crate::codegen::generate_flash_grad_q_coop_module(hd)
+                    }
                     ShaderGroup::FlashGradKV => crate::codegen::generate_flash_grad_kv_module(hd),
                     ShaderGroup::FlashGradK => crate::codegen::generate_flash_grad_k_module(hd),
                     ShaderGroup::FlashGradV => crate::codegen::generate_flash_grad_v_module(hd),
@@ -1085,6 +1090,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         | ShaderEntry::FlashAttentionCoop => MultiHeadAttnData::layout(),
         ShaderEntry::MultiHeadAttnGradQ
         | ShaderEntry::FlashGradQ
+        | ShaderEntry::FlashGradQCoop
         | ShaderEntry::MultiHeadAttnGradK
         | ShaderEntry::FlashGradK
         | ShaderEntry::MultiHeadAttnGradV
@@ -3158,6 +3164,7 @@ impl Session {
             }
             ShaderEntry::MultiHeadAttnGradQ
             | ShaderEntry::FlashGradQ
+            | ShaderEntry::FlashGradQCoop
             | ShaderEntry::MultiHeadAttnGradK
             | ShaderEntry::FlashGradK
             | ShaderEntry::MultiHeadAttnGradV
