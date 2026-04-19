@@ -638,6 +638,7 @@ impl Pipelines {
                 group,
                 ShaderGroup::MultiHeadAttn
                     | ShaderGroup::FlashAttention
+                    | ShaderGroup::FlashAttentionCoop
                     | ShaderGroup::FlashGradQ
                     | ShaderGroup::FlashGradKV
                     | ShaderGroup::FlashGradK
@@ -741,6 +742,7 @@ impl Pipelines {
                 group,
                 ShaderGroup::MultiHeadAttn
                     | ShaderGroup::FlashAttention
+                    | ShaderGroup::FlashAttentionCoop
                     | ShaderGroup::FlashGradQ
                     | ShaderGroup::FlashGradKV
                     | ShaderGroup::FlashGradK
@@ -751,6 +753,9 @@ impl Pipelines {
                 let sm = match group {
                     ShaderGroup::FlashAttention => {
                         crate::codegen::generate_flash_attention_module(hd)
+                    }
+                    ShaderGroup::FlashAttentionCoop => {
+                        crate::codegen::generate_flash_attention_coop_module(hd)
                     }
                     ShaderGroup::FlashGradQ => crate::codegen::generate_flash_grad_q_module(hd),
                     ShaderGroup::FlashGradKV => crate::codegen::generate_flash_grad_kv_module(hd),
@@ -1075,7 +1080,9 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::RoPE | ShaderEntry::RoPEGrad => RoPEData::layout(),
         ShaderEntry::Gelu => UnaryData::layout(),
         ShaderEntry::LayerNorm => LayerNormData::layout(),
-        ShaderEntry::MultiHeadAttn | ShaderEntry::FlashAttention => MultiHeadAttnData::layout(),
+        ShaderEntry::MultiHeadAttn
+        | ShaderEntry::FlashAttention
+        | ShaderEntry::FlashAttentionCoop => MultiHeadAttnData::layout(),
         ShaderEntry::MultiHeadAttnGradQ
         | ShaderEntry::FlashGradQ
         | ShaderEntry::MultiHeadAttnGradK
@@ -3096,7 +3103,9 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::MultiHeadAttn | ShaderEntry::FlashAttention => {
+            ShaderEntry::MultiHeadAttn
+            | ShaderEntry::FlashAttention
+            | ShaderEntry::FlashAttentionCoop => {
                 pc.bind(
                     0,
                     &MultiHeadAttnData {

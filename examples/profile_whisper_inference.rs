@@ -16,6 +16,15 @@ use meganeura::{
 fn main() {
     env_logger::init();
 
+    // Install coop_matrix_available global so the FlashAttentionCoop
+    // dispatch (gated additionally by MEGANEURA_FLASH_FWD_COOP=1) can
+    // fire on capable GPUs.
+    let gpu = meganeura::runtime::init_gpu_context().expect("gpu");
+    let result = meganeura::runtime::auto_tune(&gpu, 64);
+    eprintln!("coop_matrix_available={}", result.coop_matrix_available);
+    meganeura::runtime::install_auto_tune(result);
+    drop(gpu);
+
     let config = WhisperConfig::whisper_tiny();
     let batch = 1u32;
     let mel_len = 3000u32;

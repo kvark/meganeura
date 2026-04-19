@@ -82,6 +82,10 @@ pub enum ShaderEntry {
     MultiHeadAttn,
     /// Flash Attention 2 forward: BQ>1 multi-query tiling.
     FlashAttention,
+    /// Cooperative-matrix flash attention forward (Phase 1: coop QK^T,
+    /// scalar softmax + PV). Opt-in via `MEGANEURA_FLASH_FWD_COOP=1`.
+    /// BQ=BKV=16, dispatched as `[ceil(q_seq/16), num_heads, 1]`.
+    FlashAttentionCoop,
     MultiHeadAttnGradQ,
     FlashGradQ,
     MultiHeadAttnGradK,
@@ -187,6 +191,7 @@ impl ShaderEntry {
             ShaderEntry::LayerNorm => ShaderGroup::LayerNorm,
             ShaderEntry::MultiHeadAttn => ShaderGroup::MultiHeadAttn,
             ShaderEntry::FlashAttention => ShaderGroup::FlashAttention,
+            ShaderEntry::FlashAttentionCoop => ShaderGroup::FlashAttentionCoop,
             ShaderEntry::MultiHeadAttnGradQ => ShaderGroup::MultiHeadAttnGradQ,
             ShaderEntry::FlashGradQ => ShaderGroup::FlashGradQ,
             ShaderEntry::MultiHeadAttnGradK => ShaderGroup::MultiHeadAttnGradK,
@@ -284,6 +289,7 @@ impl ShaderEntry {
             ShaderEntry::LayerNorm => "main",
             ShaderEntry::MultiHeadAttn
             | ShaderEntry::FlashAttention
+            | ShaderEntry::FlashAttentionCoop
             | ShaderEntry::MultiHeadAttnGradQ
             | ShaderEntry::FlashGradQ
             | ShaderEntry::MultiHeadAttnGradK
@@ -1097,6 +1103,21 @@ impl<'a> Compiler<'a> {
     /// Choose between FlashAttention (BQ>1) and MultiHeadAttn (BQ=1) for
     /// a forward attention dispatch. Returns (shader_entry, workgroups_x).
     fn attention_dispatch(q_seq: u32, head_dim: u32, num_heads: u32) -> (ShaderEntry, [u32; 3]) {
+        // Opt into the coop-matrix flash forward when the env var is
+        // set, the GPU advertises cooperative_matrix, and the head_dim
+        // is compatible (multiple of 16). BQ is fixed at 16 to match
+        // the coop_mat tile size.
+        if std::env::var("MEGANEURA_FLASH_FWD_COOP").as_deref() == Ok("1")
+            && crate::codegen::coop_matrix_available()
+            && head_dim >= 16
+            && head_dim.is_multiple_of(16)
+            && q_seq >= 16
+        {
+            return (
+                ShaderEntry::FlashAttentionCoop,
+                [q_seq.div_ceil(16), num_heads, 1],
+            );
+        }
         // Per-kernel EPT — must match the codegen call in
         // generate_flash_attention_module, which uses
         // `flash_ept_for(FlashKernel::Forward, hd)`.

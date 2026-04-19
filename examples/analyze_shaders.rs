@@ -390,6 +390,15 @@ fn main() {
             dump,
             gpu_ref,
         );
+
+        let sm_coop = meganeura::codegen::generate_flash_attention_coop_module(64);
+        analyze(
+            "flash_attention_coop_hd64",
+            &sm_coop,
+            &ShaderEntry::FlashAttentionCoop,
+            dump,
+            gpu_ref,
+        );
     }
 
     // 9. Normalization backward
