@@ -160,18 +160,27 @@ fn main() {
     let gpu_mode = std::env::args().any(|a| a == "--gpu");
 
     let gpu = if gpu_mode {
-        Some(
-            unsafe {
-                blade_graphics::Context::init(blade_graphics::ContextDesc {
-                    validation: false,
-                    timing: false,
-                    capture: false,
-                    overlay: false,
-                    ..Default::default()
-                })
-            }
-            .expect("failed to initialize GPU context"),
-        )
+        let dev_id = std::env::var("MEGANEURA_DEVICE_ID")
+            .ok()
+            .and_then(|s| s.parse().ok());
+        let ctx = unsafe {
+            blade_graphics::Context::init(blade_graphics::ContextDesc {
+                validation: false,
+                timing: false,
+                capture: false,
+                overlay: false,
+                device_id: dev_id,
+                ..Default::default()
+            })
+        }
+        .expect("failed to initialize GPU context");
+        let info = ctx.device_information();
+        let caps = ctx.capabilities();
+        eprintln!(
+            "GPU: {:?} (driver={:?}, software={}) coop_matrix={:?}",
+            info.device_name, info.driver_name, info.is_software_emulated, caps.cooperative_matrix
+        );
+        Some(ctx)
     } else {
         None
     };

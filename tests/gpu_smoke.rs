@@ -1070,7 +1070,9 @@ fn causal_attention_gradient_check() {
 #[test]
 fn flash_attention_seq128_correctness() {
     if std::env::var("MEGANEURA_SKIP_BACKPROP").unwrap_or_default() == "1" {
-        eprintln!("MEGANEURA_SKIP_BACKPROP set — skipping flash attention seq128 (requires real GPU)");
+        eprintln!(
+            "MEGANEURA_SKIP_BACKPROP set — skipping flash attention seq128 (requires real GPU)"
+        );
         return;
     }
     let seq: usize = 128;
