@@ -1959,6 +1959,64 @@ pub fn measure_pipeline_register_count(
         .map(|s| s.value as u32)
 }
 
+/// Measure register counts for the kernels backing the fused ops that
+/// `optimize::FusionCostModel` recognizes. Returns a table the cost
+/// model can use to penalize fusions that overshoot the GPU's
+/// occupancy threshold.
+///
+/// On drivers that don't expose register counts (Metal, llvmpipe,
+/// software Vulkan) this returns an empty table — the cost model then
+/// falls back to its base costs and behaves identically to the
+/// pre-pipeline-stats version.
+///
+/// The kernels are codegen'd at sentinel shapes (head_dim=64 for
+/// FusedRmsNormMatMul) since the FusionCostModel is shape-blind today.
+pub fn measure_fused_op_register_costs(
+    gpu: &blade_graphics::Context,
+) -> crate::optimize::RegisterCostTable {
+    use crate::codegen::{ShaderGroup, generate_module};
+    use crate::compile::ShaderEntry;
+    use std::collections::HashMap;
+
+    let probes: &[(&str, ShaderGroup, ShaderEntry)] = &[
+        (
+            "FusedMatMulAdd",
+            ShaderGroup::MatMulAdd,
+            ShaderEntry::FusedMatMulAdd,
+        ),
+        (
+            "FusedMatMulATAdd",
+            ShaderGroup::MatMulATAdd,
+            ShaderEntry::FusedMatMulATAdd,
+        ),
+        (
+            "FusedMatMulBTAdd",
+            ShaderGroup::MatMulBTAdd,
+            ShaderEntry::FusedMatMulBTAdd,
+        ),
+        (
+            "FusedRmsNormMatMul",
+            ShaderGroup::FusedRmsNormMatMul,
+            ShaderEntry::FusedRmsNormMatMul,
+        ),
+        (
+            "SwiGLUConcat",
+            ShaderGroup::SwiGLUConcat,
+            ShaderEntry::SwiGLUConcat,
+        ),
+    ];
+
+    let mut regs_per_op: HashMap<String, u32> = HashMap::new();
+    for &(op_name, group, ref entry) in probes {
+        let sm = generate_module(group);
+        if let Some(count) = measure_pipeline_register_count(gpu, &sm, entry) {
+            regs_per_op.insert(op_name.to_string(), count);
+        }
+    }
+
+    crate::optimize::RegisterCostTable { regs_per_op }
+}
+
 impl Session {
     /// Upload parameter data to GPU buffers.
     pub fn set_parameter(&mut self, name: &str, data: &[f32]) {

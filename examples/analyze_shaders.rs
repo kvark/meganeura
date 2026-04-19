@@ -444,6 +444,66 @@ fn main() {
         );
     }
 
+    // 12. Fused ops the FusionCostModel cares about. With --gpu these
+    //     register counts feed `runtime::measure_fused_op_register_costs`,
+    //     which the cost model can consume to penalize register-pressured
+    //     fusions.
+    println!("\nFused ops (FusionCostModel inputs):");
+    {
+        let sm = meganeura::codegen::generate_module(ShaderGroup::MatMulAdd);
+        analyze(
+            "fused_matmul_add",
+            &sm,
+            &ShaderEntry::FusedMatMulAdd,
+            dump,
+            gpu_ref,
+        );
+        let sm_at = meganeura::codegen::generate_module(ShaderGroup::MatMulATAdd);
+        analyze(
+            "fused_matmul_at_add",
+            &sm_at,
+            &ShaderEntry::FusedMatMulATAdd,
+            dump,
+            gpu_ref,
+        );
+        let sm_bt = meganeura::codegen::generate_module(ShaderGroup::MatMulBTAdd);
+        analyze(
+            "fused_matmul_bt_add",
+            &sm_bt,
+            &ShaderEntry::FusedMatMulBTAdd,
+            dump,
+            gpu_ref,
+        );
+        let sm_rms = meganeura::codegen::generate_module(ShaderGroup::FusedRmsNormMatMul);
+        analyze(
+            "fused_rms_norm_matmul",
+            &sm_rms,
+            &ShaderEntry::FusedRmsNormMatMul,
+            dump,
+            gpu_ref,
+        );
+        let sm_swi = meganeura::codegen::generate_module(ShaderGroup::SwiGLUConcat);
+        analyze(
+            "swiglu_concat",
+            &sm_swi,
+            &ShaderEntry::SwiGLUConcat,
+            dump,
+            gpu_ref,
+        );
+    }
+
+    if let Some(g) = gpu_ref {
+        let table = meganeura::runtime::measure_fused_op_register_costs(g);
+        if !table.regs_per_op.is_empty() {
+            println!("\nFusionCostModel register table (op → regs/thread):");
+            let mut entries: Vec<_> = table.regs_per_op.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            for (op, regs) in entries {
+                println!("  {op:24} {regs}");
+            }
+        }
+    }
+
     println!("\nDone. Use --dump to write .spv files for manual inspection.");
     println!("     Use --gpu to query real GPU pipeline statistics.");
     if dump {
