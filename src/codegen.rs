@@ -315,6 +315,12 @@ pub enum ShaderGroup {
     MultiHeadAttnGradK,
     MultiHeadAttnGradKV,
     FlashGradKV,
+    /// Split flash-attention dK kernel — alternative to `FlashGradKV`
+    /// with lower register pressure, dispatched back-to-back with
+    /// `FlashGradV` when the cost model prefers the split.
+    FlashGradK,
+    /// Split flash-attention dV kernel — see [`ShaderGroup::FlashGradK`].
+    FlashGradV,
     MultiHeadAttnGradV,
     SwiGLUGrad,
     SwiGLUConcat,
@@ -408,6 +414,8 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::MultiHeadAttnGradK => parse_wgsl(include_str!("shaders/mha_grad_k.wgsl")),
         ShaderGroup::MultiHeadAttnGradKV => parse_wgsl(include_str!("shaders/mha_grad_kv.wgsl")),
         ShaderGroup::FlashGradKV => generate_flash_grad_kv_module(64),
+        ShaderGroup::FlashGradK => generate_flash_grad_k_module(64),
+        ShaderGroup::FlashGradV => generate_flash_grad_v_module(64),
         ShaderGroup::MultiHeadAttnGradV => parse_wgsl(include_str!("shaders/mha_grad_v.wgsl")),
         ShaderGroup::SwiGLUGrad => parse_wgsl(include_str!("shaders/swiglu_grad.wgsl")),
         ShaderGroup::SwiGLUConcat => parse_wgsl(include_str!("shaders/swiglu_concat.wgsl")),
@@ -2236,6 +2244,292 @@ pub fn generate_flash_grad_kv_module(head_dim: u32) -> ShaderModule {
     }
 }
 
+/// Which side of the KV gradient the split codegen produces.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FlashKvKind {
+    K,
+    V,
+}
+
+/// Shared codegen for the *split* flash-attention KV-gradient kernels.
+///
+/// The fused `generate_flash_grad_kv_module` reports 210 regs/thread on
+/// Blackwell (1 wg/SM). Splitting drops register pressure:
+///   * `K` variant: ~158 regs (drops per-thread dV accumulator).
+///   * `V` variant: ~109 regs (drops V/O loads and row_sum/dp_t reductions,
+///     getting 2 wg/SM).
+///
+/// The split is not a universal win: each kernel independently recomputes
+/// `score = Q·K · scale` in its inner loop, which doubles compute on
+/// work-bound shapes (e.g. Whisper's non-causal seq=1500 encoder, where
+/// the inner Q loop dominates). Dispatch-size-aware selection between
+/// split and fused belongs in the e-graph cost model.
+///
+/// Both split kernels use the `MultiHeadAttnGradData` binding layout.
+fn gen_flash_grad_kv_split_impl(head_dim: u32, kind: FlashKvKind) -> ShaderModule {
+    use std::fmt::Write;
+    assert!(head_dim.is_power_of_two() && head_dim >= 2);
+
+    let hd = head_dim;
+    let ept: u32 = hd.min(32);
+    let tpq = hd / ept;
+    let bkv: u32 = (256 / tpq).max(1);
+    assert!(
+        bkv > 1,
+        "flash grad kv split assumes bkv>1 (head_dim {hd} too large)",
+    );
+    let need_v = kind == FlashKvKind::K; // V only needed for dp_t in dK pass.
+    let need_o = kind == FlashKvKind::K; // O only needed for row_sum in dK pass.
+    let wg_size = bkv * tpq;
+    let mut src = String::new();
+
+    src.push_str("struct Params {\n    q_seq: u32,\n    kv_seq: u32,\n    packed_heads: u32,\n    head_dim: u32,\n    window_size: u32,\n    _pad0: u32,\n    _pad1: u32,\n    _pad2: u32,\n}\n\n");
+    src.push_str("var<storage> d_out: array<f32>;\n");
+    src.push_str("var<storage> src_a: array<f32>;\n"); // Q
+    src.push_str("var<storage> src_b: array<f32>;\n"); // K
+    src.push_str("var<storage> bias: array<f32>;\n"); // V (unused in V kind, but in binding)
+    src.push_str("var<storage> lse: array<f32>;\n");
+    src.push_str("var<storage> fwd_dst: array<f32>;\n"); // O (unused in V kind)
+    src.push_str("var<storage, read_write> dst: array<f32>;\n"); // dK or dV
+    src.push_str("var<uniform> params: Params;\n\n");
+
+    if tpq > 1 {
+        let _ = writeln!(src, "var<workgroup> shared_q: array<f32, {hd}>;");
+        let _ = writeln!(src, "var<workgroup> shared_do: array<f32, {hd}>;");
+        if need_o {
+            let _ = writeln!(src, "var<workgroup> shared_o: array<f32, {hd}>;");
+        }
+        src.push('\n');
+
+        let _ = writeln!(src, "var<workgroup> wg_score: array<f32, {}>;", bkv * tpq);
+        if kind == FlashKvKind::K {
+            let _ = writeln!(src, "var<workgroup> wg_rs: array<f32, {}>;", bkv * tpq);
+            let _ = writeln!(src, "var<workgroup> wg_dp: array<f32, {}>;", bkv * tpq);
+        }
+        src.push('\n');
+
+        match kind {
+            FlashKvKind::K => {
+                src.push_str("fn reduce_triple(tid: u32) {\n");
+                let _ = writeln!(src, "    let local = tid % {tpq}u;");
+                let _ = writeln!(src, "    let base = (tid / {tpq}u) * {tpq}u;");
+                let mut stride = tpq / 2;
+                while stride > 0 {
+                    src.push_str("    workgroupBarrier();\n");
+                    let _ = writeln!(
+                        src,
+                        "    if local < {stride}u {{ wg_score[base + local] += wg_score[base + local + {stride}u]; wg_rs[base + local] += wg_rs[base + local + {stride}u]; wg_dp[base + local] += wg_dp[base + local + {stride}u]; }}"
+                    );
+                    stride /= 2;
+                }
+                src.push_str("    workgroupBarrier();\n}\n\n");
+            }
+            FlashKvKind::V => {
+                src.push_str("fn reduce_score(tid: u32) {\n");
+                let _ = writeln!(src, "    let local = tid % {tpq}u;");
+                let _ = writeln!(src, "    let base = (tid / {tpq}u) * {tpq}u;");
+                let mut stride = tpq / 2;
+                while stride > 0 {
+                    src.push_str("    workgroupBarrier();\n");
+                    let _ = writeln!(
+                        src,
+                        "    if local < {stride}u {{ wg_score[base + local] += wg_score[base + local + {stride}u]; }}"
+                    );
+                    stride /= 2;
+                }
+                src.push_str("    workgroupBarrier();\n}\n\n");
+            }
+        }
+    }
+
+    let _ = writeln!(src, "@compute @workgroup_size({wg_size})");
+    src.push_str("fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n");
+    let _ = writeln!(src, "    let ki = lid.x / {tpq}u;");
+    let _ = writeln!(src, "    let lane = lid.x % {tpq}u;");
+    let _ = writeln!(src, "    let d_base = lane * {ept}u;");
+    let _ = writeln!(src, "    let t = wgid.x * {bkv}u + ki;");
+    src.push_str("    let kv_head = wgid.y;\n");
+    src.push_str("    let q_seq = params.q_seq;\n");
+    src.push_str("    let kv_seq = params.kv_seq;\n");
+    src.push_str("    let num_heads = params.packed_heads >> 16u;\n");
+    src.push_str("    let num_kv_heads = params.packed_heads & 0xFFFFu;\n");
+    src.push_str("    let head_dim = params.head_dim;\n\n");
+
+    src.push_str("    let effective_kv_seq = select(kv_seq, q_seq, kv_seq == 0u);\n");
+    src.push_str("    let valid = t < effective_kv_seq && kv_head < num_kv_heads;\n");
+    src.push_str("    let heads_per_kv = num_heads / max(num_kv_heads, 1u);\n");
+    src.push_str("    let kv_dim = num_kv_heads * head_dim;\n");
+    src.push_str("    let q_dim = num_heads * head_dim;\n");
+    src.push_str("    let kv_base = t * kv_dim + kv_head * head_dim;\n");
+    src.push_str("    let scale = inverseSqrt(f32(head_dim));\n\n");
+
+    for e in 0..ept {
+        let _ = writeln!(src, "    var k{e} = 0.0;");
+        if need_v {
+            let _ = writeln!(src, "    var v{e} = 0.0;");
+        }
+    }
+    src.push_str("    if valid {\n");
+    for e in 0..ept {
+        let _ = writeln!(src, "        k{e} = src_b[kv_base + d_base + {e}u];");
+        if need_v {
+            let _ = writeln!(src, "        v{e} = bias[kv_base + d_base + {e}u];");
+        }
+    }
+    src.push_str("    }\n\n");
+
+    let acc = match kind {
+        FlashKvKind::K => "dk",
+        FlashKvKind::V => "dv",
+    };
+    for e in 0..ept {
+        let _ = writeln!(src, "    var {acc}{e} = 0.0;");
+    }
+    src.push('\n');
+
+    src.push_str("    let start_pos = select(0u, t, kv_seq == 0u);\n");
+    src.push_str("    let window = params.window_size;\n");
+    src.push_str("    let end_pos = select(q_seq, min(q_seq, t + window), window > 0u);\n\n");
+
+    let _ = writeln!(src, "    let first_t = wgid.x * {bkv}u;");
+    let _ = writeln!(
+        src,
+        "    let last_t = min(wgid.x * {bkv}u + {bkv}u - 1u, effective_kv_seq - 1u);"
+    );
+    src.push_str("    let wg_start = select(0u, first_t, kv_seq == 0u);\n");
+    src.push_str("    let wg_end = select(q_seq, min(q_seq, last_t + window), window > 0u);\n\n");
+
+    src.push_str("    for (var pos = wg_start; pos < wg_end; pos++) {\n");
+    src.push_str("        for (var head_rel = 0u; head_rel < heads_per_kv; head_rel++) {\n");
+    src.push_str("            let head = kv_head * heads_per_kv + head_rel;\n");
+    src.push_str("            let q_base = pos * q_dim + head * head_dim;\n\n");
+
+    if tpq == 1 {
+        for e in 0..ept {
+            let _ = writeln!(src, "            let q{e} = src_a[q_base + {e}u];");
+            let _ = writeln!(src, "            let do{e} = d_out[q_base + {e}u];");
+            if need_o {
+                let _ = writeln!(src, "            let o{e} = fwd_dst[q_base + {e}u];");
+            }
+        }
+    } else {
+        let _ = writeln!(src, "            if lid.x < {hd}u {{");
+        src.push_str("                shared_q[lid.x] = src_a[q_base + lid.x];\n");
+        src.push_str("                shared_do[lid.x] = d_out[q_base + lid.x];\n");
+        if need_o {
+            src.push_str("                shared_o[lid.x] = fwd_dst[q_base + lid.x];\n");
+        }
+        src.push_str("            }\n");
+        src.push_str("            workgroupBarrier();\n\n");
+
+        for e in 0..ept {
+            let _ = writeln!(src, "            let q{e} = shared_q[d_base + {e}u];");
+            let _ = writeln!(src, "            let do{e} = shared_do[d_base + {e}u];");
+            if need_o {
+                let _ = writeln!(src, "            let o{e} = shared_o[d_base + {e}u];");
+            }
+        }
+    }
+    src.push_str("            var score_part = 0.0;\n");
+    if kind == FlashKvKind::K {
+        src.push_str("            var rs_part = 0.0;\n");
+        src.push_str("            var dp_part = 0.0;\n");
+    }
+    for e in 0..ept {
+        let _ = writeln!(src, "            score_part += q{e} * k{e};");
+        if kind == FlashKvKind::K {
+            let _ = writeln!(src, "            rs_part += do{e} * o{e};");
+            let _ = writeln!(src, "            dp_part += do{e} * v{e};");
+        }
+    }
+    if tpq > 1 {
+        let _ = writeln!(
+            src,
+            "            wg_score[ki * {tpq}u + lane] = score_part;"
+        );
+        if kind == FlashKvKind::K {
+            let _ = writeln!(src, "            wg_rs[ki * {tpq}u + lane] = rs_part;");
+            let _ = writeln!(src, "            wg_dp[ki * {tpq}u + lane] = dp_part;");
+            src.push_str("            reduce_triple(lid.x);\n");
+        } else {
+            src.push_str("            reduce_score(lid.x);\n");
+        }
+        let _ = writeln!(
+            src,
+            "            let score = wg_score[ki * {tpq}u] * scale;"
+        );
+        if kind == FlashKvKind::K {
+            let _ = writeln!(src, "            let row_sum = wg_rs[ki * {tpq}u];");
+            let _ = writeln!(src, "            let dp_t = wg_dp[ki * {tpq}u];");
+        }
+        src.push('\n');
+    } else {
+        src.push_str("            let score = score_part * scale;\n");
+        if kind == FlashKvKind::K {
+            src.push_str("            let row_sum = rs_part;\n");
+            src.push_str("            let dp_t = dp_part;\n");
+        }
+    }
+    src.push_str("            if valid && pos >= start_pos && pos < end_pos {\n");
+    src.push_str("                let lse_idx = (pos * num_heads + head) * 2u;\n");
+    src.push_str(
+        "                let p_t = exp(min(score - lse[lse_idx], 0.0) - lse[lse_idx + 1u]);\n",
+    );
+    match kind {
+        FlashKvKind::K => {
+            src.push_str("                let ds_t = p_t * (dp_t - row_sum);\n");
+            src.push_str("                let w_dk = ds_t * scale;\n");
+            for e in 0..ept {
+                let _ = writeln!(src, "                dk{e} += w_dk * q{e};");
+            }
+        }
+        FlashKvKind::V => {
+            for e in 0..ept {
+                let _ = writeln!(src, "                dv{e} += p_t * do{e};");
+            }
+        }
+    }
+    src.push_str("            }\n");
+    if tpq > 1 {
+        src.push_str("            workgroupBarrier();\n");
+    }
+    src.push_str("        }\n");
+    src.push_str("    }\n\n");
+
+    src.push_str("    if valid {\n");
+    for e in 0..ept {
+        let _ = writeln!(src, "        dst[kv_base + d_base + {e}u] = {acc}{e};");
+    }
+    src.push_str("    }\n");
+    src.push_str("}\n");
+
+    let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
+        panic!("generated flash grad_{acc} WGSL failed to parse:\n{e}\n---\n{src}")
+    });
+    ShaderModule {
+        module,
+        source: src,
+    }
+}
+
+/// Split flash-attention backward: dK-only kernel.
+///
+/// Loads K, V, Q, dO, O; writes dK. Register pressure ≈ 158 on Blackwell
+/// (RTX 5080, head_dim=64). See [`gen_flash_grad_kv_split_impl`] for the
+/// tradeoff vs the fused `generate_flash_grad_kv_module`.
+pub fn generate_flash_grad_k_module(head_dim: u32) -> ShaderModule {
+    gen_flash_grad_kv_split_impl(head_dim, FlashKvKind::K)
+}
+
+/// Split flash-attention backward: dV-only kernel.
+///
+/// Loads K, Q, dO; writes dV. Register pressure ≈ 109 on Blackwell
+/// (RTX 5080, head_dim=64), unlocking 2 wg/SM. Skips V/O loads and
+/// the row_sum/dp reductions since dV = p · dO needs neither.
+pub fn generate_flash_grad_v_module(head_dim: u32) -> ShaderModule {
+    gen_flash_grad_kv_split_impl(head_dim, FlashKvKind::V)
+}
+
 fn gen_conv2d_gemm_coop() -> ShaderModule {
     let default_config = CoopConfig {
         tile_size: 16,
@@ -3291,6 +3585,8 @@ mod tests {
                 naga::valid::Capabilities::empty(),
             ),
             (ShaderGroup::FlashGradKV, naga::valid::Capabilities::empty()),
+            (ShaderGroup::FlashGradK, naga::valid::Capabilities::empty()),
+            (ShaderGroup::FlashGradV, naga::valid::Capabilities::empty()),
             (
                 ShaderGroup::MultiHeadAttnGradV,
                 naga::valid::Capabilities::empty(),
@@ -3576,7 +3872,9 @@ mod tests {
                 ShaderEntry::MultiHeadAttnGradQ
                 | ShaderEntry::FlashGradQ
                 | ShaderEntry::MultiHeadAttnGradK
-                | ShaderEntry::MultiHeadAttnGradV => {
+                | ShaderEntry::FlashGradK
+                | ShaderEntry::MultiHeadAttnGradV
+                | ShaderEntry::FlashGradV => {
                     vec![
                         "d_out", "src_a", "src_b", "bias", "lse", "fwd_dst", "dst", "params",
                     ]
@@ -3696,6 +3994,8 @@ mod tests {
             ShaderEntry::MultiHeadAttnGradK,
             ShaderEntry::MultiHeadAttnGradKV,
             ShaderEntry::FlashGradKV,
+            ShaderEntry::FlashGradK,
+            ShaderEntry::FlashGradV,
             ShaderEntry::MultiHeadAttnGradV,
             ShaderEntry::SwiGLUGradGate,
             ShaderEntry::SwiGLUGradUp,
