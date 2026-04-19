@@ -1996,6 +1996,10 @@ pub struct AutoTuneResult {
     /// Register counts for the fused ops the e-graph cost model
     /// recognizes (FusedMatMulAdd, FusedRmsNormMatMul, …).
     pub fusion_register_costs: crate::optimize::RegisterCostTable,
+    /// `true` when the GPU exposes `KHR_cooperative_matrix` with
+    /// f16 tile support. Compile-time decisions (e.g. picking the
+    /// `Conv2dGradInputGemmCoop3x3` variant) gate on this.
+    pub coop_matrix_available: bool,
 }
 
 /// Run the full pipeline-stats-driven auto-tune on `gpu`:
@@ -2017,6 +2021,7 @@ pub fn auto_tune(gpu: &blade_graphics::Context, head_dim: u32) -> AutoTuneResult
     AutoTuneResult {
         flash_ept: auto_tune_flash_ept(gpu, head_dim),
         fusion_register_costs: measure_fused_op_register_costs(gpu),
+        coop_matrix_available: gpu.capabilities().cooperative_matrix.is_supported(),
     }
 }
 
@@ -2037,6 +2042,7 @@ pub fn auto_tune(gpu: &blade_graphics::Context, head_dim: u32) -> AutoTuneResult
 /// whose dispatches should be affected.
 pub fn install_auto_tune(result: AutoTuneResult) {
     crate::optimize::set_fusion_register_costs(result.fusion_register_costs);
+    crate::codegen::set_coop_matrix_available(result.coop_matrix_available);
     if std::env::var("MEGANEURA_FLASH_EPT_AUTOPICK").as_deref() == Ok("1") {
         crate::codegen::set_flash_ept_config(result.flash_ept);
     }

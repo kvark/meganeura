@@ -311,6 +311,23 @@ fn main() {
             dump,
             gpu_ref,
         );
+
+        // Coop variant — only valid on cooperative_matrix-capable GPUs.
+        let coop_config = meganeura::codegen::CoopConfig {
+            tile_size: 16,
+            use_f16_input: true,
+        };
+        let sm_coop_3x3 = meganeura::codegen::generate_coop_module(
+            ShaderGroup::Conv2dGradInputGemmCoop3x3,
+            &coop_config,
+        );
+        analyze(
+            "conv2d_grad_input_gemm_coop_3x3",
+            &sm_coop_3x3,
+            &ShaderEntry::Conv2dGradInputGemmCoop3x3,
+            dump,
+            gpu_ref,
+        );
     }
 
     // 7. Attention
