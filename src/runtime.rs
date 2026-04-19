@@ -2003,10 +2003,10 @@ pub struct AutoTuneResult {
     /// Register counts for the fused ops the e-graph cost model
     /// recognizes (FusedMatMulAdd, FusedRmsNormMatMul, …).
     pub fusion_register_costs: crate::optimize::RegisterCostTable,
-    /// `true` when the GPU exposes `KHR_cooperative_matrix` with
-    /// f16 tile support. Compile-time decisions (e.g. picking the
-    /// `Conv2dGradInputGemmCoop3x3` variant) gate on this.
-    pub coop_matrix_available: bool,
+    /// Cooperative-matrix capabilities. Compile-time decisions
+    /// (e.g. flash-attention-coop forward, Conv2dGradInputGemmCoop3x3)
+    /// gate on this — different kernels need different tile sizes.
+    pub coop_caps: crate::codegen::CoopCaps,
 }
 
 /// Run the full pipeline-stats-driven auto-tune on `gpu`:
@@ -2025,10 +2025,14 @@ pub struct AutoTuneResult {
 /// — pass it to [`install_auto_tune`] before constructing any sessions
 /// that should benefit.
 pub fn auto_tune(gpu: &blade_graphics::Context, head_dim: u32) -> AutoTuneResult {
+    let cm = gpu.capabilities().cooperative_matrix;
     AutoTuneResult {
         flash_ept: auto_tune_flash_ept(gpu, head_dim),
         fusion_register_costs: measure_fused_op_register_costs(gpu),
-        coop_matrix_available: gpu.capabilities().cooperative_matrix.is_supported(),
+        coop_caps: crate::codegen::CoopCaps {
+            f16_tile: cm.f16_tile,
+            f32_tile: cm.f32_tile,
+        },
     }
 }
 
@@ -2049,7 +2053,7 @@ pub fn auto_tune(gpu: &blade_graphics::Context, head_dim: u32) -> AutoTuneResult
 /// whose dispatches should be affected.
 pub fn install_auto_tune(result: AutoTuneResult) {
     crate::optimize::set_fusion_register_costs(result.fusion_register_costs);
-    crate::codegen::set_coop_matrix_available(result.coop_matrix_available);
+    crate::codegen::set_coop_caps(result.coop_caps);
     if std::env::var("MEGANEURA_FLASH_EPT_AUTOPICK").as_deref() == Ok("1") {
         crate::codegen::set_flash_ept_config(result.flash_ept);
     }

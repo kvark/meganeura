@@ -60,7 +60,10 @@ fn main() {
         // Coop path.
         let gpu = meganeura::runtime::init_gpu_context().expect("gpu");
         let result = meganeura::runtime::auto_tune(&gpu, hd);
-        eprintln!("  coop_matrix_available={}", result.coop_matrix_available);
+        eprintln!(
+            "  coop_matrix_available={}",
+            result.coop_caps.is_supported()
+        );
         meganeura::runtime::install_auto_tune(result);
         drop(gpu);
         unsafe {
