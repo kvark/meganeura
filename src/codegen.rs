@@ -321,6 +321,10 @@ pub enum ShaderGroup {
     FlashGradK,
     /// Split flash-attention dV kernel — see [`ShaderGroup::FlashGradK`].
     FlashGradV,
+    /// Cooperative-matrix flash attention forward.
+    /// Phase 1: coop_mat for QK^T, scalar softmax + PV. Opt-in via
+    /// `MEGANEURA_FLASH_FWD_COOP=1`.
+    FlashAttentionCoop,
     MultiHeadAttnGradV,
     SwiGLUGrad,
     SwiGLUConcat,
@@ -409,6 +413,7 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
             // generate_flash_attention_module(head_dim) directly.
             generate_flash_attention_module(64)
         }
+        ShaderGroup::FlashAttentionCoop => generate_flash_attention_coop_module(64),
         ShaderGroup::MultiHeadAttnGradQ => parse_wgsl(include_str!("shaders/mha_grad_q.wgsl")),
         ShaderGroup::FlashGradQ => generate_flash_grad_q_module(64),
         ShaderGroup::MultiHeadAttnGradK => parse_wgsl(include_str!("shaders/mha_grad_k.wgsl")),
@@ -1841,6 +1846,282 @@ pub fn generate_flash_attention_module(head_dim: u32) -> ShaderModule {
             e, src
         )
     });
+    ShaderModule {
+        module,
+        source: src,
+    }
+}
+
+/// Cooperative-matrix flash attention forward (Phase 1).
+///
+/// Replaces only the QK^T product with a `coop_mat` MMA — softmax and
+/// PV stay scalar — to keep the change tractable and validate the
+/// coop path before tackling PV. Critical design point: the O
+/// accumulator is held in *registers* across the entire KV loop (not
+/// re-staged through shared memory each iteration), and the per-row
+/// rescale runs INSIDE the same thread that owns the accumulator.
+/// Each row's softmax math is duplicated 4× (once per d-chunk) but
+/// that's a small constant (16 ops/row) vs the cost of the shared-mem
+/// roundtrip.
+///
+/// Workgroup layout (64 threads = 16 rows × 4 d-chunks):
+///   * `BQ = 16`, `BKV = 16` — match the coop_mat tile size.
+///   * Each thread owns one (row, d_chunk) pair: holds
+///     `O_acc[chunk_hd]` and `local_max` / `local_sum` in registers.
+///   * Q is staged once per workgroup into shared as f16 [BQ × hd].
+///   * K is staged per KV tile, **transposed** into shared as f16
+///     [hd × BKV] so the MMA reads it as the B operand for Q @ K^T.
+///   * V is staged per KV tile as f16 [BKV × hd] for the scalar PV.
+///   * The score tile (after MMA) goes to shared_score[BQ × BKV];
+///     each thread reads its row's BKV scores and runs softmax
+///     locally.
+///
+/// Caller dispatch must use workgroups = `[ceil(q_seq/16), num_heads, 1]`.
+/// `head_dim` must be a multiple of 16.
+pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
+    use std::fmt::Write;
+    assert!(
+        head_dim >= 16 && head_dim.is_multiple_of(16),
+        "coop flash attention requires head_dim multiple of 16, got {head_dim}"
+    );
+    let hd = head_dim;
+    let hd_tiles = hd / 16;
+    let bq: u32 = 16;
+    let bkv: u32 = 16;
+    let wg_size: u32 = 64;
+    assert!(
+        wg_size == bq * 4,
+        "coop flash assumes wg_size=64 / BQ=16 / 4 hd-chunks per row"
+    );
+    let chunks_per_row: u32 = 4;
+    let chunk_hd: u32 = hd / chunks_per_row;
+
+    let mut src = String::new();
+    src.push_str("enable f16;\n");
+    src.push_str("enable wgpu_cooperative_matrix;\n\n");
+    src.push_str("struct Params {\n    q_seq: u32,\n    kv_seq: u32,\n    packed_heads: u32,\n    head_dim: u32,\n    window_size: u32,\n    _pad0: u32,\n    _pad1: u32,\n    _pad2: u32,\n}\n\n");
+    src.push_str("var<storage> src_a: array<f32>;\n"); // Q
+    src.push_str("var<storage> src_b: array<f32>;\n"); // K
+    src.push_str("var<storage> bias: array<f32>;\n"); // V
+    src.push_str("var<storage, read_write> dst: array<f32>;\n"); // O
+    src.push_str("var<storage, read_write> lse: array<f32>;\n");
+    src.push_str("var<uniform> params: Params;\n\n");
+
+    let _ = writeln!(src, "var<workgroup> shared_q: array<f16, {}>;", bq * hd);
+    let _ = writeln!(src, "var<workgroup> shared_k_t: array<f16, {}>;", hd * bkv);
+    let _ = writeln!(src, "var<workgroup> shared_v: array<f16, {}>;", bkv * hd);
+    let _ = writeln!(
+        src,
+        "var<workgroup> shared_score: array<f32, {}>;",
+        bq * bkv
+    );
+    src.push('\n');
+
+    let _ = writeln!(src, "@compute @workgroup_size({wg_size})");
+    src.push_str("fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n");
+    let _ = writeln!(src, "    let pos_base = wgid.x * {bq}u;");
+    src.push_str("    let head = wgid.y;\n");
+    src.push_str("    let q_seq = params.q_seq;\n");
+    src.push_str("    let kv_seq = params.kv_seq;\n");
+    src.push_str("    let num_heads = params.packed_heads >> 16u;\n");
+    src.push_str("    let num_kv_heads = params.packed_heads & 0xFFFFu;\n");
+    src.push_str("    let head_dim = params.head_dim;\n");
+    src.push_str("    let window_size = params.window_size;\n");
+    src.push_str("    let kv_head = head / (num_heads / max(num_kv_heads, 1u));\n");
+    src.push_str("    let kv_head_off = kv_head * head_dim;\n");
+    src.push_str("    let kv_dim = num_kv_heads * head_dim;\n");
+    src.push_str("    let scale = inverseSqrt(f32(head_dim));\n\n");
+
+    // Per-thread (row, chunk) — index hoisted to top.
+    let _ = writeln!(src, "    let row = lid.x / {chunks_per_row}u;");
+    let _ = writeln!(src, "    let chunk = lid.x % {chunks_per_row}u;");
+    let _ = writeln!(src, "    let d_off = chunk * {chunk_hd}u;");
+    src.push_str("    let qpos = pos_base + row;\n");
+    src.push_str("    let q_valid = qpos < q_seq && head < num_heads;\n\n");
+
+    // Per-row valid KV range (causal + sliding window).
+    src.push_str("    let row_kv_len = select(kv_seq, qpos + 1u, kv_seq == 0u);\n");
+    src.push_str(
+        "    let row_kv_start = select(0u, row_kv_len - min(row_kv_len, window_size), window_size > 0u);\n\n",
+    );
+
+    // Workgroup-wide bounds (drives all threads through the same
+    // outer KV loop).
+    src.push_str("    let last_pos = min(pos_base + 15u, q_seq - 1u);\n");
+    src.push_str("    let max_kv_len = select(kv_seq, last_pos + 1u, kv_seq == 0u);\n");
+    src.push_str(
+        "    let min_kv_start = select(0u, max_kv_len - min(max_kv_len, window_size), window_size > 0u);\n\n",
+    );
+
+    // Per-thread O accumulator and softmax state — REGISTERS.
+    let _ = writeln!(src, "    var local_o: array<f32, {chunk_hd}>;");
+    let _ = writeln!(src, "    for (var e = 0u; e < {chunk_hd}u; e = e + 1u) {{");
+    src.push_str("        local_o[e] = 0.0;\n");
+    src.push_str("    }\n");
+    src.push_str("    var local_max: f32 = -1e30;\n");
+    src.push_str("    var local_sum: f32 = 0.0;\n\n");
+
+    // ---- Stage Q once per workgroup ----
+    let q_total = bq * hd;
+    let _ = writeln!(
+        src,
+        "    for (var i = lid.x; i < {q_total}u; i = i + {wg_size}u) {{"
+    );
+    let _ = writeln!(src, "        let r = i / {hd}u;");
+    let _ = writeln!(src, "        let col = i % {hd}u;");
+    src.push_str("        let qp = pos_base + r;\n");
+    src.push_str(
+        "        if qp < q_seq { shared_q[i] = f16(src_a[qp * (num_heads * head_dim) + head * head_dim + col]); } else { shared_q[i] = f16(0.0); }\n",
+    );
+    src.push_str("    }\n");
+    src.push_str("    workgroupBarrier();\n\n");
+
+    // ---- KV tile loop ----
+    let _ = writeln!(
+        src,
+        "    let tile_end = min_kv_start + ((max_kv_len - min_kv_start) / {bkv}u) * {bkv}u;"
+    );
+    src.push_str("    var t = min_kv_start;\n");
+    let _ = writeln!(src, "    for (; t < tile_end; t = t + {bkv}u) {{");
+
+    // Stage K transposed [hd × bkv] and V natural [bkv × hd] into shared.
+    let kv_total = bkv * hd;
+    let _ = writeln!(
+        src,
+        "        for (var i = lid.x; i < {kv_total}u; i = i + {wg_size}u) {{"
+    );
+    let _ = writeln!(src, "            let ki = i / {hd}u;");
+    let _ = writeln!(src, "            let d  = i % {hd}u;");
+    src.push_str("            let kv_pos = t + ki;\n");
+    src.push_str(
+        "            shared_k_t[d * 16u + ki] = f16(src_b[kv_pos * kv_dim + kv_head_off + d]);\n",
+    );
+    src.push_str(
+        "            shared_v[ki * head_dim + d] = f16(bias[kv_pos * kv_dim + kv_head_off + d]);\n",
+    );
+    src.push_str("        }\n");
+    src.push_str("        workgroupBarrier();\n\n");
+
+    // Cooperative QK^T → shared_score.
+    src.push_str("        var score_acc = coop_mat16x16<f32,C>();\n");
+    let _ = writeln!(
+        src,
+        "        for (var ht = 0u; ht < {hd_tiles}u; ht = ht + 1u) {{"
+    );
+    let _ = writeln!(
+        src,
+        "            let a = coopLoadT<coop_mat16x16<f16,A>>(&shared_q[ht * 16u], {hd}u);"
+    );
+    let _ = writeln!(
+        src,
+        "            let b = coopLoadT<coop_mat16x16<f16,B>>(&shared_k_t[ht * 16u * {bkv}u], {bkv}u);"
+    );
+    src.push_str("            score_acc = coopMultiplyAdd(a, b, score_acc);\n");
+    src.push_str("        }\n");
+    let _ = writeln!(
+        src,
+        "        coopStoreT(score_acc, &shared_score[0], {bkv}u);"
+    );
+    src.push_str("        workgroupBarrier();\n\n");
+
+    // Per-thread row softmax + PV. Each thread owns one (row, chunk).
+    // The 4 chunks of a row redundantly compute the same row max/sum
+    // (16 mul/add/exp ops per row — small constant).
+    src.push_str("        var rowmax = -1e30;\n");
+    let _ = writeln!(src, "        for (var j = 0u; j < {bkv}u; j = j + 1u) {{");
+    src.push_str("            let kv_pos = t + j;\n");
+    src.push_str("            if q_valid && kv_pos >= row_kv_start && kv_pos < row_kv_len {\n");
+    let _ = writeln!(
+        src,
+        "                rowmax = max(rowmax, shared_score[row * {bkv}u + j] * scale);"
+    );
+    src.push_str("            }\n");
+    src.push_str("        }\n");
+    src.push_str("        let new_max = max(local_max, rowmax);\n");
+    src.push_str("        let correction = select(exp(local_max - new_max), 0.0, !q_valid);\n");
+
+    // Apply correction to the O accumulator (registers).
+    let _ = writeln!(
+        src,
+        "        for (var e = 0u; e < {chunk_hd}u; e = e + 1u) {{"
+    );
+    src.push_str("            local_o[e] = local_o[e] * correction;\n");
+    src.push_str("        }\n");
+
+    // PV: for each j compute p_j = exp(score-new_max), accumulate into local_o.
+    src.push_str("        var rowsum = 0.0;\n");
+    let _ = writeln!(src, "        for (var j = 0u; j < {bkv}u; j = j + 1u) {{");
+    src.push_str("            let kv_pos = t + j;\n");
+    src.push_str(
+        "            let masked = !(q_valid && kv_pos >= row_kv_start && kv_pos < row_kv_len);\n",
+    );
+    let _ = writeln!(
+        src,
+        "            let score = shared_score[row * {bkv}u + j] * scale;"
+    );
+    src.push_str("            let p = select(exp(score - new_max), 0.0, masked);\n");
+    src.push_str("            rowsum = rowsum + p;\n");
+    let _ = writeln!(
+        src,
+        "            for (var e = 0u; e < {chunk_hd}u; e = e + 1u) {{"
+    );
+    let _ = writeln!(
+        src,
+        "                local_o[e] = local_o[e] + p * f32(shared_v[j * {hd}u + d_off + e]);"
+    );
+    src.push_str("            }\n");
+    src.push_str("        }\n");
+    src.push_str("        local_sum = local_sum * correction + rowsum;\n");
+    src.push_str("        local_max = select(local_max, new_max, q_valid);\n");
+    src.push_str("        workgroupBarrier();\n");
+    src.push_str("    }\n\n");
+
+    // ---- Tail KV (positions not in a full BKV tile) ----
+    src.push_str("    for (; t < max_kv_len; t = t + 1u) {\n");
+    src.push_str("        let masked = !(q_valid && t >= row_kv_start && t < row_kv_len);\n");
+    // Compute QK for this single position from shared_q (everyone reads the same Q, ok).
+    src.push_str("        var dot = 0.0;\n");
+    let _ = writeln!(src, "        for (var d = 0u; d < {hd}u; d = d + 1u) {{");
+    let _ = writeln!(src, "            let qv = f32(shared_q[row * {hd}u + d]);");
+    src.push_str("            let kv = src_b[t * kv_dim + kv_head_off + d];\n");
+    src.push_str("            dot = dot + qv * kv;\n");
+    src.push_str("        }\n");
+    src.push_str("        let score = dot * scale;\n");
+    src.push_str("        let new_max = select(local_max, max(local_max, score), !masked);\n");
+    src.push_str("        let correction = exp(local_max - new_max);\n");
+    src.push_str("        let p = select(exp(score - new_max), 0.0, masked);\n");
+    let _ = writeln!(
+        src,
+        "        for (var e = 0u; e < {chunk_hd}u; e = e + 1u) {{"
+    );
+    src.push_str("            let v = bias[t * kv_dim + kv_head_off + d_off + e];\n");
+    src.push_str("            local_o[e] = local_o[e] * correction + p * v;\n");
+    src.push_str("        }\n");
+    src.push_str("        local_sum = local_sum * correction + p;\n");
+    src.push_str("        local_max = select(local_max, new_max, q_valid);\n");
+    src.push_str("    }\n\n");
+
+    // ---- Final write: divide by sum_exp, write output + LSE ----
+    src.push_str("    if q_valid {\n");
+    src.push_str("        let safe_sum = select(local_sum, 1.0, local_sum == 0.0);\n");
+    src.push_str("        let q_base = qpos * (num_heads * head_dim) + head * head_dim;\n");
+    let _ = writeln!(
+        src,
+        "        for (var e = 0u; e < {chunk_hd}u; e = e + 1u) {{"
+    );
+    src.push_str("            dst[q_base + d_off + e] = local_o[e] / safe_sum;\n");
+    src.push_str("        }\n");
+    // LSE: only the first chunk-thread per row writes (avoids 4-way duplicate write).
+    src.push_str("        if chunk == 0u {\n");
+    src.push_str("            let idx = (qpos * num_heads + head) * 2u;\n");
+    src.push_str("            lse[idx] = local_max;\n");
+    src.push_str("            lse[idx + 1u] = select(log(local_sum), -1e30, local_sum == 0.0);\n");
+    src.push_str("        }\n");
+    src.push_str("    }\n");
+    src.push_str("}\n");
+
+    let module = naga::front::wgsl::parse_str(&src)
+        .unwrap_or_else(|e| panic!("generated coop flash WGSL failed to parse:\n{e}\n---\n{src}"));
     ShaderModule {
         module,
         source: src,
@@ -3702,6 +3983,11 @@ mod tests {
                 naga::valid::Capabilities::empty(),
             ),
             (
+                ShaderGroup::FlashAttentionCoop,
+                naga::valid::Capabilities::COOPERATIVE_MATRIX
+                    | naga::valid::Capabilities::SHADER_FLOAT16,
+            ),
+            (
                 ShaderGroup::MultiHeadAttnGradQ,
                 naga::valid::Capabilities::empty(),
             ),
@@ -3996,7 +4282,9 @@ mod tests {
                 ShaderEntry::RmsNorm => vec!["src", "bias", "dst", "params"],
                 ShaderEntry::Embedding => vec!["indices", "src", "dst", "params"],
                 ShaderEntry::LayerNorm => vec!["src", "src_b", "bias", "dst", "params"],
-                ShaderEntry::MultiHeadAttn | ShaderEntry::FlashAttention => {
+                ShaderEntry::MultiHeadAttn
+                | ShaderEntry::FlashAttention
+                | ShaderEntry::FlashAttentionCoop => {
                     vec!["src_a", "src_b", "bias", "dst", "lse", "params"]
                 }
                 ShaderEntry::MultiHeadAttnGradQ
@@ -4119,6 +4407,7 @@ mod tests {
             ShaderEntry::LayerNorm,
             ShaderEntry::MultiHeadAttn,
             ShaderEntry::FlashAttention,
+            ShaderEntry::FlashAttentionCoop,
             ShaderEntry::MultiHeadAttnGradQ,
             ShaderEntry::FlashGradQ,
             ShaderEntry::MultiHeadAttnGradK,
