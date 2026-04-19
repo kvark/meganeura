@@ -1103,12 +1103,15 @@ impl<'a> Compiler<'a> {
     /// Choose between FlashAttention (BQ>1) and MultiHeadAttn (BQ=1) for
     /// a forward attention dispatch. Returns (shader_entry, workgroups_x).
     fn attention_dispatch(q_seq: u32, head_dim: u32, num_heads: u32) -> (ShaderEntry, [u32; 3]) {
-        // Opt into the coop-matrix flash forward when the env var is
-        // set, the GPU advertises cooperative_matrix, and the head_dim
-        // is compatible (multiple of 16). BQ is fixed at 16 to match
-        // the coop_mat tile size.
-        if std::env::var("MEGANEURA_FLASH_FWD_COOP").as_deref() == Ok("1")
-            && crate::codegen::coop_matrix_available()
+        // Pick the coop-matrix flash forward when the GPU has the
+        // 16x16 f16 cooperative_matrix path (NVIDIA, RDNA3, Xe-HPG)
+        // and the shape is compatible. ~3.2x faster per dispatch than
+        // the scalar kernel on Blackwell. The env var
+        // `MEGANEURA_FLASH_FWD_COOP=0` opts back to scalar (regression
+        // escape hatch).
+        let coop_disabled = std::env::var("MEGANEURA_FLASH_FWD_COOP").as_deref() == Ok("0");
+        if !coop_disabled
+            && crate::codegen::coop_caps().supports_16x16_f16()
             && head_dim >= 16
             && head_dim.is_multiple_of(16)
             && q_seq >= 16
@@ -2398,7 +2401,7 @@ impl<'a> Compiler<'a> {
                     let coop_3x3 = kernel_h == 3
                         && kernel_w == 3
                         && stride == 1
-                        && crate::codegen::coop_matrix_available()
+                        && crate::codegen::coop_caps().supports_16x16_f16()
                         && std::env::var("MEGANEURA_CONV_COOP").as_deref() == Ok("1");
                     if coop_3x3 {
                         // Coop3x3 dispatch: 2x2 16x16 tile grid per workgroup

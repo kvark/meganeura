@@ -1495,23 +1495,58 @@ impl Default for FlashEptConfig {
 
 static FLASH_EPT_CONFIG: std::sync::OnceLock<FlashEptConfig> = std::sync::OnceLock::new();
 
-/// Whether the runtime GPU supports `cooperative_matrix` (KHR f16 tile
-/// path). Set by `runtime::install_auto_tune` from the Blade
-/// capabilities probe; defaults to `false` so anything that hasn't
-/// been auto-tuned stays on the scalar fallback.
-///
-/// Used by `Compiler` to decide whether to dispatch the coop-matrix
-/// variants of conv2d backward (and any future kernel pair where
-/// the coop variant has a different binding shape than its scalar
-/// twin).
-static COOP_MATRIX_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-
-pub fn set_coop_matrix_available(available: bool) {
-    let _ = COOP_MATRIX_AVAILABLE.set(available);
+/// Cooperative-matrix capabilities snapshot the compiler consults
+/// when choosing between scalar and coop kernel variants. Mirrors
+/// Blade's `CooperativeMatrix` struct minus the methods. Compile-time
+/// dispatch can't ask the GPU directly (no Blade context), so we
+/// cache what we need here. Set by `runtime::install_auto_tune`,
+/// defaults to all-zero (= no coop, scalar everywhere).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CoopCaps {
+    pub f16_tile: u32,
+    pub f32_tile: u32,
 }
 
+impl CoopCaps {
+    pub fn is_supported(&self) -> bool {
+        self.f16_tile > 0 || self.f32_tile > 0
+    }
+    /// True when the kernels that hardcode `coop_mat16x16<f16,...>`
+    /// can run (NVIDIA, RDNA3, Xe-HPG). False on Apple (8x8 f32) or
+    /// any GPU without KHR_cooperative_matrix at the right tile size.
+    pub fn supports_16x16_f16(&self) -> bool {
+        self.f16_tile >= 16
+    }
+}
+
+static COOP_CAPS: std::sync::OnceLock<CoopCaps> = std::sync::OnceLock::new();
+
+pub fn set_coop_caps(caps: CoopCaps) {
+    let _ = COOP_CAPS.set(caps);
+}
+
+pub fn coop_caps() -> CoopCaps {
+    *COOP_CAPS.get().unwrap_or(&CoopCaps::default())
+}
+
+/// Backwards-compatible — true when the GPU supports any
+/// cooperative_matrix path (f16 or f32).
 pub fn coop_matrix_available() -> bool {
-    *COOP_MATRIX_AVAILABLE.get().unwrap_or(&false)
+    coop_caps().is_supported()
+}
+
+/// Backwards-compatible setter. Conservatively assumes f16 16x16
+/// (the common case the old boolean gate implied).
+pub fn set_coop_matrix_available(available: bool) {
+    let caps = if available {
+        CoopCaps {
+            f16_tile: 16,
+            f32_tile: 0,
+        }
+    } else {
+        CoopCaps::default()
+    };
+    let _ = COOP_CAPS.set(caps);
 }
 
 /// Install a process-wide EPT config (typically the result of

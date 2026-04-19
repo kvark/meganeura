@@ -74,7 +74,10 @@ fn main() {
         // installed coop_matrix_available global.
         let gpu = meganeura::runtime::init_gpu_context().expect("gpu");
         let result = meganeura::runtime::auto_tune(&gpu, 64);
-        eprintln!("  coop_matrix_available={}", result.coop_matrix_available);
+        eprintln!(
+            "  coop_matrix_available={}",
+            result.coop_caps.is_supported()
+        );
         meganeura::runtime::install_auto_tune(result);
         drop(gpu);
         unsafe {
