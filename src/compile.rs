@@ -86,6 +86,11 @@ pub enum ShaderEntry {
     /// scalar softmax + PV). Opt-in via `MEGANEURA_FLASH_FWD_COOP=1`.
     /// BQ=BKV=16, dispatched as `[ceil(q_seq/16), num_heads, 1]`.
     FlashAttentionCoop,
+    /// Cooperative-matrix flash backward dQ kernel. Three coop matmuls
+    /// per KV tile: score=Q·K^T, dp=dO·V^T, dQ+=ds·K. Opt-in via
+    /// `MEGANEURA_FLASH_BWD_COOP=1`. BQ=BKV=16,
+    /// dispatched as `[ceil(q_seq/16), num_heads, 1]`.
+    FlashGradQCoop,
     MultiHeadAttnGradQ,
     FlashGradQ,
     MultiHeadAttnGradK,
@@ -192,6 +197,7 @@ impl ShaderEntry {
             ShaderEntry::MultiHeadAttn => ShaderGroup::MultiHeadAttn,
             ShaderEntry::FlashAttention => ShaderGroup::FlashAttention,
             ShaderEntry::FlashAttentionCoop => ShaderGroup::FlashAttentionCoop,
+            ShaderEntry::FlashGradQCoop => ShaderGroup::FlashGradQCoop,
             ShaderEntry::MultiHeadAttnGradQ => ShaderGroup::MultiHeadAttnGradQ,
             ShaderEntry::FlashGradQ => ShaderGroup::FlashGradQ,
             ShaderEntry::MultiHeadAttnGradK => ShaderGroup::MultiHeadAttnGradK,
@@ -292,6 +298,7 @@ impl ShaderEntry {
             | ShaderEntry::FlashAttentionCoop
             | ShaderEntry::MultiHeadAttnGradQ
             | ShaderEntry::FlashGradQ
+            | ShaderEntry::FlashGradQCoop
             | ShaderEntry::MultiHeadAttnGradK
             | ShaderEntry::MultiHeadAttnGradV
             | ShaderEntry::MultiHeadAttnGradKV
@@ -2799,15 +2806,32 @@ impl<'a> Compiler<'a> {
                     Op::SlidingWindowAttention { window_size, .. } => window_size,
                     _ => 0,
                 };
-                let (grad_q_shader, grad_q_wgs) = Self::attention_dispatch_bwd(
-                    q_seq,
-                    head_dim,
-                    num_heads,
-                    crate::codegen::FlashKernel::GradQ,
-                );
-                let grad_q_shader = match grad_q_shader {
-                    ShaderEntry::FlashAttention => ShaderEntry::FlashGradQ,
-                    _ => ShaderEntry::MultiHeadAttnGradQ,
+                // Pick coop GradQ when the env var is set, the GPU
+                // has 16x16 f16 coop_matrix, and the shape is
+                // compatible. Same gating pattern as the forward.
+                let bwd_coop_enabled = std::env::var("MEGANEURA_FLASH_BWD_COOP").as_deref()
+                    == Ok("1")
+                    && crate::codegen::coop_caps().supports_16x16_f16()
+                    && head_dim >= 16
+                    && head_dim.is_multiple_of(16)
+                    && q_seq >= 16;
+                let (grad_q_shader, grad_q_wgs) = if bwd_coop_enabled {
+                    (
+                        ShaderEntry::FlashGradQCoop,
+                        [q_seq.div_ceil(16), num_heads, 1],
+                    )
+                } else {
+                    let (raw_shader, wgs) = Self::attention_dispatch_bwd(
+                        q_seq,
+                        head_dim,
+                        num_heads,
+                        crate::codegen::FlashKernel::GradQ,
+                    );
+                    let mapped = match raw_shader {
+                        ShaderEntry::FlashAttention => ShaderEntry::FlashGradQ,
+                        _ => ShaderEntry::MultiHeadAttnGradQ,
+                    };
+                    (mapped, wgs)
                 };
                 self.plan.dispatches.push(Dispatch {
                     shader: grad_q_shader,
