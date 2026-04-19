@@ -1097,10 +1097,10 @@ impl<'a> Compiler<'a> {
     /// Choose between FlashAttention (BQ>1) and MultiHeadAttn (BQ=1) for
     /// a forward attention dispatch. Returns (shader_entry, workgroups_x).
     fn attention_dispatch(q_seq: u32, head_dim: u32, num_heads: u32) -> (ShaderEntry, [u32; 3]) {
-        // EPT (elements per thread) must match codegen — both call
-        // crate::codegen::flash_ept_cap() so the same env-var override
-        // is observed at compile and dispatch time.
-        let ept = head_dim.min(crate::codegen::flash_ept_cap());
+        // Per-kernel EPT — must match the codegen call in
+        // generate_flash_attention_module, which uses
+        // `flash_ept_for(FlashKernel::Forward, hd)`.
+        let ept = crate::codegen::flash_ept_for(crate::codegen::FlashKernel::Forward, head_dim);
         let tpq = head_dim / ept; // threads per query
         let bq = (256 / tpq).max(1);
         if bq >= 2 && q_seq >= bq {
@@ -1113,14 +1113,17 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    /// Backward attention dispatch: matches the vectorized EPT/TPQ/BQ pattern
-    /// of the forward kernel.
+    /// Backward attention dispatch. Caller passes the [`FlashKernel`] so
+    /// the EPT (and hence workgroup tiling) matches the codegen for
+    /// that specific backward pass — different kernels have different
+    /// register pressure and can want different EPT/TPQ/BQ pairs.
     fn attention_dispatch_bwd(
         q_seq: u32,
         head_dim: u32,
         num_heads: u32,
+        kernel: crate::codegen::FlashKernel,
     ) -> (ShaderEntry, [u32; 3]) {
-        let ept = head_dim.min(crate::codegen::flash_ept_cap());
+        let ept = crate::codegen::flash_ept_for(kernel, head_dim);
         let tpq = head_dim / ept;
         let bq = (256 / tpq).max(1);
         if bq >= 2 && q_seq >= bq {
@@ -2713,8 +2716,12 @@ impl<'a> Compiler<'a> {
                     Op::SlidingWindowAttention { window_size, .. } => window_size,
                     _ => 0,
                 };
-                let (grad_q_shader, grad_q_wgs) =
-                    Self::attention_dispatch_bwd(q_seq, head_dim, num_heads);
+                let (grad_q_shader, grad_q_wgs) = Self::attention_dispatch_bwd(
+                    q_seq,
+                    head_dim,
+                    num_heads,
+                    crate::codegen::FlashKernel::GradQ,
+                );
                 let grad_q_shader = match grad_q_shader {
                     ShaderEntry::FlashAttention => ShaderEntry::FlashGradQ,
                     _ => ShaderEntry::MultiHeadAttnGradQ,
@@ -2774,8 +2781,6 @@ impl<'a> Compiler<'a> {
                 // compiled for the same fwd_node, it reuses this buffer.
                 let dv_buf = self.alloc_buffer(self.graph.node(node.inputs[3]).ty.size_bytes());
                 self.fused_grad_kv_dv.insert(fwd_node, dv_buf);
-                let (grad_kv_shader, grad_kv_wgs) =
-                    Self::attention_dispatch_bwd(dispatch_kv, head_dim, num_kv_heads);
                 let attention_params = vec![
                     q_seq,
                     kv_seq,
@@ -2784,21 +2789,35 @@ impl<'a> Compiler<'a> {
                     window_size,
                 ];
                 // `MEGANEURA_FLASH_GRAD_SPLIT=1` opts into the
-                // FlashGradK + FlashGradV dispatch pair. The split kernels
-                // each report lower register pressure than the fused
-                // FlashGradKV (158 / 109 vs 210 on Blackwell at hd=64),
-                // but each independently recomputes the Q·K score in its
-                // inner loop — a loss on work-bound shapes like Whisper's
-                // non-causal seq=1500 encoder. Dispatch-size-aware
-                // selection belongs in the e-graph cost model; the env
-                // var lets benchmarks A/B the two strategies today.
+                // FlashGradK + FlashGradV dispatch pair. Each split
+                // kernel has its own EPT slot in FlashEptConfig so they
+                // can use different tile sizes — recompute workgroups
+                // per kernel.
                 let split_requested =
                     std::env::var("MEGANEURA_FLASH_GRAD_SPLIT").as_deref() == Ok("1");
-                let use_split = split_requested && grad_kv_shader == ShaderEntry::FlashAttention;
+                let (grad_k_shader, grad_k_wgs) = Self::attention_dispatch_bwd(
+                    dispatch_kv,
+                    head_dim,
+                    num_kv_heads,
+                    crate::codegen::FlashKernel::GradK,
+                );
+                let (_grad_v_shader, grad_v_wgs) = Self::attention_dispatch_bwd(
+                    dispatch_kv,
+                    head_dim,
+                    num_kv_heads,
+                    crate::codegen::FlashKernel::GradV,
+                );
+                let (grad_kv_shader, grad_kv_wgs) = Self::attention_dispatch_bwd(
+                    dispatch_kv,
+                    head_dim,
+                    num_kv_heads,
+                    crate::codegen::FlashKernel::GradKv,
+                );
+                let use_split = split_requested && grad_k_shader == ShaderEntry::FlashAttention;
                 if use_split {
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::FlashGradK,
-                        workgroups: grad_kv_wgs,
+                        workgroups: grad_k_wgs,
                         input_buffers: vec![d_out, q, k, v, lse_buf, fwd_o],
                         output_buffer: out_buf,
                         params: attention_params.clone(),
@@ -2808,7 +2827,7 @@ impl<'a> Compiler<'a> {
                     });
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::FlashGradV,
-                        workgroups: grad_kv_wgs,
+                        workgroups: grad_v_wgs,
                         input_buffers: vec![d_out, q, k, v, lse_buf, fwd_o],
                         output_buffer: dv_buf,
                         params: attention_params,
@@ -3640,44 +3659,55 @@ mod tests {
     /// producing wrong results for attention kernels.
     #[test]
     fn test_attention_dispatch_matches_codegen_ept() {
-        // The dispatch functions compute:
-        //   ept = head_dim.min(CAP)
-        //   tpq = head_dim / ept
-        //   bq  = (256 / tpq).max(1)
-        //
-        // The codegen functions (generate_flash_attention_module, etc.) use
-        // the same formula. If these ever diverge, workgroup counts will be
-        // wrong. Test all power-of-2 head_dims that matter.
+        use crate::codegen::FlashKernel;
+
+        // Both dispatch and codegen call `flash_ept_for(kernel, hd)`,
+        // so as long as we pass the same FlashKernel they must agree.
         for hd_log2 in 1..=8 {
             let hd: u32 = 1 << hd_log2;
 
-            // Forward dispatch
+            // Forward
             let (entry, wg) = Compiler::attention_dispatch(256, hd, 1);
-            // The forward codegen uses the same EPT cap.
-            let codegen_ept: u32 = hd.min(crate::codegen::flash_ept_cap());
+            let codegen_ept = crate::codegen::flash_ept_for(FlashKernel::Forward, hd);
             let codegen_tpq = hd / codegen_ept;
             let codegen_bq: u32 = (256 / codegen_tpq).max(1);
-
             if codegen_bq >= 2 {
-                // Should have chosen flash path
                 assert_eq!(
                     entry,
                     ShaderEntry::FlashAttention,
-                    "hd={hd}: dispatch should pick FlashAttention when bq={codegen_bq}"
+                    "hd={hd}: forward should pick FlashAttention when bq={codegen_bq}"
                 );
-                // Workgroup X count must match codegen's tile size
                 assert_eq!(
                     wg[0],
                     256u32.div_ceil(codegen_bq),
-                    "hd={hd}: dispatch workgroups_x mismatch (bq={codegen_bq})"
+                    "hd={hd}: forward workgroups_x mismatch (bq={codegen_bq})"
                 );
             }
 
-            // Backward dispatch
-            let (bwd_entry, bwd_wg) = Compiler::attention_dispatch_bwd(256, hd, 1);
-            // Should match forward for same params
-            assert_eq!(entry, bwd_entry, "hd={hd}: fwd/bwd dispatch entry mismatch");
-            assert_eq!(wg, bwd_wg, "hd={hd}: fwd/bwd dispatch workgroups mismatch");
+            // Backward — every kernel kind uses its own EPT slot.
+            for kernel in [
+                FlashKernel::GradQ,
+                FlashKernel::GradKv,
+                FlashKernel::GradK,
+                FlashKernel::GradV,
+            ] {
+                let (bwd_entry, bwd_wg) = Compiler::attention_dispatch_bwd(256, hd, 1, kernel);
+                let bwd_ept = crate::codegen::flash_ept_for(kernel, hd);
+                let bwd_tpq = hd / bwd_ept;
+                let bwd_bq: u32 = (256 / bwd_tpq).max(1);
+                if bwd_bq >= 2 {
+                    assert_eq!(
+                        bwd_entry,
+                        ShaderEntry::FlashAttention,
+                        "hd={hd} {kernel:?}: should pick FlashAttention"
+                    );
+                    assert_eq!(
+                        bwd_wg[0],
+                        256u32.div_ceil(bwd_bq),
+                        "hd={hd} {kernel:?}: workgroups_x mismatch (bq={bwd_bq})"
+                    );
+                }
+            }
         }
     }
 }

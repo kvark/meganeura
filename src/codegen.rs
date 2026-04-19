@@ -1437,30 +1437,114 @@ pub fn generate_attention_module(head_dim: u32) -> ShaderModule {
 ///
 /// For head_dim=64, EPT=8: TPQ=8 threads/query, BQ=32 queries/WG,
 /// tree depth=3 (vs 6), workgroups reduced 8x.
-/// Tunable cap on elements-per-thread for flash-attention codegen.
+/// Identifies which flash-attention kernel an EPT decision applies to.
 ///
-/// EPT controls how many head_dim slots a single thread handles. Lower
-/// EPT means lower register pressure (better occupancy) but more threads
-/// per query and more cross-lane reductions per inner-loop iteration.
-/// Higher EPT means fewer reductions but more registers in flight.
+/// Each kernel has different register pressure (the backward `GradKv`
+/// kernel hits 210 regs/thread at EPT=32 on Blackwell, while forward
+/// only sees 80) so different optimal EPTs. The `flash_ept_for()`
+/// lookup picks the right cap per kernel.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum FlashKernel {
+    /// Forward attention (`generate_flash_attention_module`).
+    Forward,
+    /// Backward dQ (`generate_flash_grad_q_module`).
+    GradQ,
+    /// Fused backward dK+dV (`generate_flash_grad_kv_module`).
+    GradKv,
+    /// Split backward dK (`generate_flash_grad_k_module`).
+    GradK,
+    /// Split backward dV (`generate_flash_grad_v_module`).
+    GradV,
+}
+
+/// Per-kernel EPT cap selection, populated by
+/// [`crate::runtime::auto_tune_flash_ept`] at session creation.
 ///
-/// The default cap (32) was tuned to avoid spilling on Ampere (255-reg
-/// limit). The override exists so analyze_shaders / benchmarks can sweep
-/// values like 8 or 16 to find the EPT that hits the right
-/// occupancy/parallelism tradeoff for a given GPU and dispatch shape.
+/// Each cap is the largest power-of-two EPT whose measured register
+/// count keeps the kernel under the occupancy threshold (~128 regs →
+/// 2 wg/SM on a 64K-reg Blackwell SM with 256-thread workgroups).
+/// `head_dim.min(cap)` is the EPT actually used by codegen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlashEptConfig {
+    pub forward_cap: u32,
+    pub grad_q_cap: u32,
+    pub grad_kv_cap: u32,
+    pub grad_k_cap: u32,
+    pub grad_v_cap: u32,
+}
+
+impl Default for FlashEptConfig {
+    fn default() -> Self {
+        // Pre-pipeline-stats default: cap everything at 32 (same value
+        // the legacy code used for all kernels). Auto-tune overrides
+        // this with measured per-kernel optima.
+        Self {
+            forward_cap: 32,
+            grad_q_cap: 32,
+            grad_kv_cap: 32,
+            grad_k_cap: 32,
+            grad_v_cap: 32,
+        }
+    }
+}
+
+static FLASH_EPT_CONFIG: std::sync::OnceLock<FlashEptConfig> = std::sync::OnceLock::new();
+
+/// Install a process-wide EPT config (typically the result of
+/// `runtime::auto_tune_flash_ept`). Has no effect after the first
+/// successful call — the config locks in for the rest of the process.
+pub fn set_flash_ept_config(cfg: FlashEptConfig) {
+    let _ = FLASH_EPT_CONFIG.set(cfg);
+}
+
+/// Retrieve the active EPT config.
+pub fn flash_ept_config() -> FlashEptConfig {
+    *FLASH_EPT_CONFIG.get().unwrap_or(&FlashEptConfig::default())
+}
+
+/// Per-kernel EPT actually used in codegen and dispatch.
+///
+/// Resolution order:
+///   1. `MEGANEURA_FLASH_EPT_CAP` env var (overrides everything,
+///      applied uniformly to all kernels — for benchmarking sweeps).
+///   2. The installed `FlashEptConfig` (typically from auto-tune).
+///   3. Default cap of 32.
 ///
 /// **Important**: the same value must be observed by both codegen and
-/// `Compiler::attention_dispatch{,_bwd}`, otherwise generated tile sizes
+/// `Compiler::attention_dispatch*`, otherwise generated tile sizes
 /// won't match the workgroup counts and kernels produce wrong results.
-/// Both sites call this function, so as long as the env var doesn't
-/// change between session creation and pipeline compilation the values
-/// stay consistent.
-pub fn flash_ept_cap() -> u32 {
-    std::env::var("MEGANEURA_FLASH_EPT_CAP")
+/// Both sites call this function with the same `FlashKernel` argument.
+pub fn flash_ept_for(kernel: FlashKernel, head_dim: u32) -> u32 {
+    if let Some(cap) = std::env::var("MEGANEURA_FLASH_EPT_CAP")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .filter(|v| v.is_power_of_two() && *v >= 2)
-        .unwrap_or(32)
+    {
+        return head_dim.min(cap);
+    }
+    let cfg = flash_ept_config();
+    let cap = match kernel {
+        FlashKernel::Forward => cfg.forward_cap,
+        FlashKernel::GradQ => cfg.grad_q_cap,
+        FlashKernel::GradKv => cfg.grad_kv_cap,
+        FlashKernel::GradK => cfg.grad_k_cap,
+        FlashKernel::GradV => cfg.grad_v_cap,
+    };
+    head_dim.min(cap)
+}
+
+/// Legacy global-cap accessor, retained for callers that don't have a
+/// `FlashKernel` context (e.g. analyze_shaders default sweep).
+/// New code should prefer [`flash_ept_for`].
+pub fn flash_ept_cap() -> u32 {
+    if let Some(cap) = std::env::var("MEGANEURA_FLASH_EPT_CAP")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|v| v.is_power_of_two() && *v >= 2)
+    {
+        return cap;
+    }
+    flash_ept_config().forward_cap
 }
 
 pub fn generate_flash_attention_module(head_dim: u32) -> ShaderModule {
@@ -1471,10 +1555,9 @@ pub fn generate_flash_attention_module(head_dim: u32) -> ShaderModule {
     );
 
     let hd = head_dim;
-    // EPT cap is tunable via MEGANEURA_FLASH_EPT_CAP — see flash_ept_cap().
-    // Default 32 keeps register count ≤ ~66 on Ampere/Blackwell.
-    // TPQ>1 adds one cross-lane reduction per KV position.
-    let ept: u32 = hd.min(flash_ept_cap());
+    // Per-kernel EPT picked by `flash_ept_for(FlashKernel::Forward, ..)`,
+    // which honors MEGANEURA_FLASH_EPT_CAP overrides.
+    let ept: u32 = flash_ept_for(FlashKernel::Forward, hd);
     let tpq = hd / ept; // threads per query
     let bq: u32 = (256 / tpq).max(1);
     // Fall back to BQ=1 kernel when multi-query isn't beneficial
@@ -1757,9 +1840,8 @@ pub fn generate_flash_grad_q_module(head_dim: u32) -> ShaderModule {
     assert!(head_dim.is_power_of_two() && head_dim >= 2);
 
     let hd = head_dim;
-    // EPT cap tunable via MEGANEURA_FLASH_EPT_CAP — see flash_ept_cap().
-    // Default 32; lower values trade reductions for occupancy.
-    let ept: u32 = hd.min(flash_ept_cap());
+    // Per-kernel EPT picked by `flash_ept_for(FlashKernel::GradQ, ..)`.
+    let ept: u32 = flash_ept_for(FlashKernel::GradQ, hd);
     let tpq = hd / ept; // threads per query
     let bq: u32 = (256 / tpq).max(1);
     if bq <= 1 {
@@ -2064,10 +2146,10 @@ pub fn generate_flash_grad_kv_module(head_dim: u32) -> ShaderModule {
     assert!(head_dim.is_power_of_two() && head_dim >= 2);
 
     let hd = head_dim;
-    // EPT cap tunable via MEGANEURA_FLASH_EPT_CAP — see flash_ept_cap().
-    // Default 32; the fused dK+dV kernel hits 210 regs at hd=64, so the
-    // override is the simplest way to test smaller EPTs.
-    let ept: u32 = hd.min(flash_ept_cap());
+    // Per-kernel EPT picked by `flash_ept_for(FlashKernel::GradKv, ..)`.
+    // The fused dK+dV kernel reports 210 regs at EPT=32 on Blackwell,
+    // so the auto-tune typically chooses a smaller value here.
+    let ept: u32 = flash_ept_for(FlashKernel::GradKv, hd);
     let tpq = hd / ept; // threads per KV position
     let bkv: u32 = (256 / tpq).max(1);
     if bkv <= 1 {
@@ -2295,8 +2377,12 @@ fn gen_flash_grad_kv_split_impl(head_dim: u32, kind: FlashKvKind) -> ShaderModul
     assert!(head_dim.is_power_of_two() && head_dim >= 2);
 
     let hd = head_dim;
-    // EPT cap tunable via MEGANEURA_FLASH_EPT_CAP — see flash_ept_cap().
-    let ept: u32 = hd.min(flash_ept_cap());
+    // Per-kernel EPT — split kernels each have their own slot.
+    let kernel = match kind {
+        FlashKvKind::K => FlashKernel::GradK,
+        FlashKvKind::V => FlashKernel::GradV,
+    };
+    let ept: u32 = flash_ept_for(kernel, hd);
     let tpq = hd / ept;
     let bkv: u32 = (256 / tpq).max(1);
     assert!(

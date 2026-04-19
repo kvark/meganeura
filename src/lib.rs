@@ -34,6 +34,7 @@ pub mod runtime;
 pub mod schedule;
 pub mod train;
 
+pub use codegen::{FlashEptConfig, FlashKernel, flash_ept_for, set_flash_ept_config};
 pub use compile::CompileOptions;
 pub use data::{DataLoader, MnistDataset};
 pub use graph::{DType, Graph, NodeId, TensorType};

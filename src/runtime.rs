@@ -1959,6 +1959,127 @@ pub fn measure_pipeline_register_count(
         .map(|s| s.value as u32)
 }
 
+/// Auto-pick a [`crate::codegen::FlashEptConfig`] by measuring register
+/// counts for each flash-attention kernel at candidate EPT values.
+///
+/// For each `(kernel, ept_cap)` combination, codegen the kernel,
+/// compile it on `gpu`, query the driver-reported register count, and
+/// keep the largest cap whose count fits the occupancy threshold
+/// (default 128 regs/thread → 2 wgs per Blackwell SM at 256-thread
+/// workgroups). Returns the default cap (32) for kernels the driver
+/// won't profile.
+///
+/// `head_dim` should be the actual model's head_dim — the auto-pick is
+/// shape-blind across head_dims for now (assumes one transformer per
+/// session). If the session compiles attention at multiple head_dims,
+/// pass the dominant one and accept that the smaller dims may not be
+/// optimally tuned.
+///
+/// Install the result with [`crate::codegen::set_flash_ept_config`]
+/// before building any sessions whose dispatches should use it. The
+/// config is process-global and only the first install wins.
+pub fn auto_tune_flash_ept(
+    gpu: &blade_graphics::Context,
+    head_dim: u32,
+) -> crate::codegen::FlashEptConfig {
+    use crate::codegen::{
+        FlashEptConfig, FlashKernel, generate_flash_attention_module, generate_flash_grad_k_module,
+        generate_flash_grad_kv_module, generate_flash_grad_q_module, generate_flash_grad_v_module,
+    };
+    use crate::compile::ShaderEntry;
+
+    /// Below this many registers/thread, the kernel can fit 2 wgs/SM
+    /// on a 64K-reg Blackwell SM with 256-thread workgroups
+    /// (128 × 256 = 32K). The threshold is conservative: AMD GCN and
+    /// older NVIDIA cards have similar sweet spots in the 128–160 range.
+    const REG_BUDGET: u32 = 128;
+
+    fn pick<F>(
+        gpu: &blade_graphics::Context,
+        head_dim: u32,
+        entry: &ShaderEntry,
+        gen_fn: F,
+        kernel_name: &str,
+    ) -> u32
+    where
+        F: Fn(u32) -> crate::codegen::ShaderModule,
+    {
+        // Caller is responsible for setting MEGANEURA_FLASH_EPT_CAP to
+        // the candidate value before calling generator. We can't *clean*
+        // generator vs. an explicit-EPT API yet, so use the env-var
+        // override path the existing code already honors.
+        let prev = std::env::var("MEGANEURA_FLASH_EPT_CAP").ok();
+        let mut best = 8u32; // fall-back if nothing else fits
+        for &cap in &[32u32, 16, 8] {
+            // Skip caps the head_dim doesn't expose.
+            if head_dim < cap {
+                continue;
+            }
+            // SAFETY: env var mutation is process-global; we restore
+            // afterwards. Auto-tuning must not race with other sessions.
+            unsafe {
+                std::env::set_var("MEGANEURA_FLASH_EPT_CAP", cap.to_string());
+            }
+            let sm = gen_fn(head_dim);
+            let regs = measure_pipeline_register_count(gpu, &sm, entry);
+            log::debug!("auto-tune {kernel_name} hd={head_dim} ept_cap={cap} regs={regs:?}");
+            if let Some(r) = regs
+                && r <= REG_BUDGET
+            {
+                best = cap;
+                break; // 32, 16, 8 sorted high→low — first hit is best
+            }
+        }
+        // Restore env var so this side-effect doesn't leak.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("MEGANEURA_FLASH_EPT_CAP", v),
+                None => std::env::remove_var("MEGANEURA_FLASH_EPT_CAP"),
+            }
+        }
+        best
+    }
+
+    let _ = FlashKernel::Forward; // ensure the enum is in scope visually
+    FlashEptConfig {
+        forward_cap: pick(
+            gpu,
+            head_dim,
+            &ShaderEntry::FlashAttention,
+            generate_flash_attention_module,
+            "forward",
+        ),
+        grad_q_cap: pick(
+            gpu,
+            head_dim,
+            &ShaderEntry::FlashGradQ,
+            generate_flash_grad_q_module,
+            "grad_q",
+        ),
+        grad_kv_cap: pick(
+            gpu,
+            head_dim,
+            &ShaderEntry::FlashGradKV,
+            generate_flash_grad_kv_module,
+            "grad_kv",
+        ),
+        grad_k_cap: pick(
+            gpu,
+            head_dim,
+            &ShaderEntry::FlashGradK,
+            generate_flash_grad_k_module,
+            "grad_k",
+        ),
+        grad_v_cap: pick(
+            gpu,
+            head_dim,
+            &ShaderEntry::FlashGradV,
+            generate_flash_grad_v_module,
+            "grad_v",
+        ),
+    }
+}
+
 /// Measure register counts for the kernels backing the fused ops that
 /// `optimize::FusionCostModel` recognizes. Returns a table the cost
 /// model can use to penalize fusions that overshoot the GPU's
