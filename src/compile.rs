@@ -2589,9 +2589,12 @@ impl<'a> Compiler<'a> {
                 let shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let rows = shape[0] as u32;
                 let cols = shape[1] as u32;
+                // One workgroup per row — threads inside cooperate on the
+                // mean/variance reduction. Matches the new shader's
+                // workgroup-cooperative layout.
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::LayerNorm,
-                    workgroups: [rows.div_ceil(256), 1, 1],
+                    workgroups: [rows, 1, 1],
                     input_buffers: vec![x, w, bias],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
