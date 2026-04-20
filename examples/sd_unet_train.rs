@@ -32,8 +32,8 @@ fn main() {
 
     let batch = cfg.batch_size;
     let in_c = cfg.in_channels;
-    let res = cfg.resolution;
-    let in_size = (batch * in_c * res * res) as usize;
+    let (h, w) = (cfg.height, cfg.width);
+    let in_size = (batch * in_c * h * w) as usize;
     let epochs = 3;
     let steps_per_epoch = 50;
     let lr = 1e-3_f32;
@@ -43,8 +43,8 @@ fn main() {
     println!(
         "config:     {} ({}×{} latent, batch {}, {} levels, base_ch={})",
         if use_small { "small" } else { "tiny" },
-        res,
-        res,
+        h,
+        w,
         batch,
         cfg.num_levels,
         cfg.base_channels,

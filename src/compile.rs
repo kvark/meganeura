@@ -571,13 +571,9 @@ pub fn compile_with(graph: &Graph, options: &CompileOptions) -> ExecutionPlan {
     if options.use_schedule_pointwise {
         fuse_pointwise_chains(&mut compiler.plan);
     }
-    // RmsNorm+MatMul prologue fusion: infrastructure works (30 pairs
-    // fused on SmolLM2 prefill, correct output verified), but the extra
-    // per-A-element reads in the coop staging loop regress TTFT by ~40%
-    // (27ms → 38ms). Disabled until the staging overhead is addressed —
-    // likely needs rsqrt to be cached in shared memory like
-    // matmul_rms_norm_coop.wgsl does (64-element rsqrt_cache[]).
-    // fuse_rmsnorm_prologues(&mut compiler.plan);
+    // RmsNorm+MatMul prologue fusion is applied later in the runtime,
+    // after coop availability is known — the prologue path currently only
+    // has a coop-matmul implementation. See Session::with_context.
 
     compiler.plan
 }
@@ -764,8 +760,7 @@ fn fuse_pointwise_chains(plan: &mut ExecutionPlan) {
 /// the matmul via 64-thread tree reduction → 25% regression), this uses
 /// a separate lightweight `RmsNormRsqrt` dispatch, so the matmul prologue
 /// is only two scalar multiplies per A element — essentially free.
-#[allow(dead_code)]
-fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
+pub fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
     use std::collections::HashMap;
 
     let mut producer: HashMap<BufferRef, usize> = HashMap::new();

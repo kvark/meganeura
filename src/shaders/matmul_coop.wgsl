@@ -24,6 +24,7 @@ var<workgroup> shared_a0: array<$ELEM_TYPE, $SHARED_SIZE>;
 var<workgroup> shared_a1: array<$ELEM_TYPE, $SHARED_SIZE>;
 var<workgroup> shared_b0: array<$ELEM_TYPE, $SHARED_SIZE>;
 var<workgroup> shared_b1: array<$ELEM_TYPE, $SHARED_SIZE>;
+$PROLOGUE_CACHE_DECL
 
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
@@ -48,6 +49,10 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
 
     // Hoisted staging index components
     $STAGING_VARS
+
+    // Prologue cache init (e.g. per-row rsqrt). Loaded once per workgroup
+    // from global into shared memory so the K-loop staging reads are cheap.
+    $PROLOGUE_CACHE_INIT
 
     var t = 0u;
     loop {
