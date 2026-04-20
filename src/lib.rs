@@ -34,16 +34,13 @@ pub mod runtime;
 pub mod schedule;
 pub mod train;
 
-pub use codegen::{
-    CoopCaps, FlashEptConfig, FlashKernel, coop_caps, flash_ept_for, set_coop_caps,
-    set_flash_ept_config,
-};
+pub use codegen::{CoopCaps, coop_caps, set_coop_caps};
 pub use compile::CompileOptions;
 pub use data::{DataLoader, MnistDataset};
 pub use graph::{DType, Graph, NodeId, TensorType};
 pub use load::nnef::{NnefError, NnefModel, load_nnef};
 pub use load::onnx::{OnnxError, OnnxModel, load_onnx, load_onnx_bytes};
-pub use optimize::{FusionCostModel, OptimizeReport, RegisterCostTable};
+pub use optimize::OptimizeReport;
 pub use runtime::{ExternalBindError, ExternalSlot, MemorySummary, Session};
 pub use train::{
     EpochStats, LossHistory, MetricCallback, Mode, Optimizer, SessionConfig, StepMetrics,

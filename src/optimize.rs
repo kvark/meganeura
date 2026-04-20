@@ -24,76 +24,12 @@ use std::{fmt, time::Instant};
 /// one (9) is preferred. Equal base costs prevent the extractor from
 /// shuffling op order in ways that change FP rounding without improving
 /// throughput.
-///
-/// **Register-aware penalty**: when a `RegisterCostTable` is attached,
-/// fused ops whose driver-reported register count exceeds 80 (the
-/// threshold below which Blackwell can fit ≥3 wgs/SM) get a penalty
-/// proportional to the regs/thread overshoot. A fusion that pushes a
-/// kernel to 210 regs/thread (1 wg/SM) is no longer cheaper than two
-/// unfused ops, so the extractor will prefer the unfused form. Without
-/// a table the model behaves exactly as before.
 #[derive(Default, Debug, Clone)]
-pub struct FusionCostModel {
-    register_costs: Option<RegisterCostTable>,
-}
-
-/// Per-fused-op register count table. Populated by measuring kernels on
-/// a real GPU (see `runtime::measure_pipeline_register_count`).
-///
-/// Keys are the egglog constructor names (`"FusedMatMulAdd"`,
-/// `"FusedRmsNormMatMul"`, …). Values are the driver-reported register
-/// count for the kernel that backs the constructor. The mapping is
-/// shape-blind for now — refining it per dispatch shape is a follow-up.
-#[derive(Default, Debug, Clone)]
-pub struct RegisterCostTable {
-    pub regs_per_op: HashMap<String, u32>,
-}
-
-static FUSION_REGISTER_COSTS: std::sync::OnceLock<RegisterCostTable> = std::sync::OnceLock::new();
-
-/// Install a process-wide fusion register-cost table that
-/// [`optimize_with_report`] (and hence the default [`optimize`] entry
-/// point) will consume on every subsequent call. Only the first
-/// install wins — matches `set_flash_ept_config` lifetime semantics
-/// since both are populated by the same `runtime::auto_tune` pass.
-pub fn set_fusion_register_costs(table: RegisterCostTable) {
-    let _ = FUSION_REGISTER_COSTS.set(table);
-}
-
-/// Inspect the currently-installed fusion register table, if any.
-pub fn fusion_register_costs() -> Option<RegisterCostTable> {
-    FUSION_REGISTER_COSTS.get().cloned()
-}
+pub struct FusionCostModel;
 
 impl FusionCostModel {
-    /// Cost-only model (no register awareness). Equivalent to the
-    /// pre-pipeline-stats behavior.
     pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Build a cost model that penalizes register-pressured fusions.
-    pub fn with_register_costs(table: RegisterCostTable) -> Self {
-        Self {
-            register_costs: Some(table),
-        }
-    }
-
-    /// Compute the per-op register-pressure penalty.
-    ///
-    /// Threshold (80 regs) corresponds to the Blackwell occupancy cliff
-    /// for 256-thread workgroups: below that, ≥3 wgs/SM. Above 128 regs
-    /// the kernel drops to 1 wg/SM.
-    fn register_penalty(&self, op_name: &str) -> u64 {
-        const THRESHOLD: u32 = 80;
-        const SCALE: u32 = 10;
-        let Some(table) = self.register_costs.as_ref() else {
-            return 0;
-        };
-        let Some(&regs) = table.regs_per_op.get(op_name) else {
-            return 0;
-        };
-        regs.saturating_sub(THRESHOLD).div_ceil(SCALE) as u64
+        Self
     }
 }
 
@@ -122,10 +58,8 @@ impl egglog::extract::CostModel<u64> for FusionCostModel {
             "WinogradConv2d" => 9,
             _ => 10,
         };
-        // Leaves and unfused ops never get a penalty (no measurement to
-        // look up). Fused ops add a register-pressure surcharge if the
-        // table says they overshoot the occupancy threshold.
-        base + self.register_penalty(name)
+        let _ = name;
+        base
     }
 }
 
@@ -218,23 +152,12 @@ pub fn optimize(graph: &Graph) -> Graph {
 }
 
 /// Like `optimize`, but also returns a detailed report for debugging.
-///
-/// If a process-wide [`RegisterCostTable`] has been installed via
-/// [`set_fusion_register_costs`] (typically by `runtime::auto_tune`),
-/// the cost model uses it automatically — fusions whose backing
-/// kernels overshoot the occupancy threshold get penalized.
 pub fn optimize_with_report(graph: &Graph) -> (Graph, OptimizeReport) {
-    let cost_model = match fusion_register_costs() {
-        Some(table) => FusionCostModel::with_register_costs(table),
-        None => FusionCostModel::new(),
-    };
-    optimize_with_cost_model(graph, cost_model)
+    optimize_with_cost_model(graph, FusionCostModel::new())
 }
 
-/// Like `optimize_with_report`, but lets the caller supply a
-/// custom cost model — typically built via
-/// `FusionCostModel::with_register_costs` so that fusions which would
-/// blow past the GPU's occupancy threshold are penalized.
+/// Like `optimize_with_report`, but lets the caller supply a custom
+/// cost model.
 pub fn optimize_with_cost_model(
     graph: &Graph,
     cost_model: FusionCostModel,
@@ -1314,35 +1237,6 @@ fn clone_graph(graph: &Graph) -> Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Direct unit test on the cost model: with no register table the
-    /// fused kernel beats the unfused pair (9 < 10+10 = 20). With a
-    /// register table that says the fused kernel uses 200 regs/thread,
-    /// the penalty (200-80=120, /10 = 12) pushes its cost to 21 — the
-    /// extractor would then prefer the unfused form.
-    #[test]
-    fn fusion_cost_model_register_penalty() {
-        use egglog::extract::CostModel;
-
-        let cheap = FusionCostModel::new();
-        // Penalty=0 always when table is absent.
-        assert_eq!(cheap.register_penalty("FusedMatMulAdd"), 0);
-        assert_eq!(cheap.register_penalty("FusedRmsNormMatMul"), 0);
-
-        let mut regs = std::collections::HashMap::new();
-        regs.insert("FusedRmsNormMatMul".to_string(), 200u32);
-        regs.insert("FusedMatMulAdd".to_string(), 60u32);
-        let aware = FusionCostModel::with_register_costs(RegisterCostTable { regs_per_op: regs });
-        // 60 < threshold(80) → no penalty
-        assert_eq!(aware.register_penalty("FusedMatMulAdd"), 0);
-        // 200 - 80 = 120, ceil(120/10) = 12
-        assert_eq!(aware.register_penalty("FusedRmsNormMatMul"), 12);
-        // Unknown op → no penalty
-        assert_eq!(aware.register_penalty("MatMul"), 0);
-
-        // Sanity check fold: head_cost + sum(children).
-        assert_eq!(aware.fold("anything", &[1, 2, 3], 9), 15);
-    }
 
     #[test]
     fn test_no_fusion_cooperative_matrix() {

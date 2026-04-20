@@ -373,24 +373,6 @@ fn main() {
             gpu_ref,
         );
 
-        let sm_gk = meganeura::codegen::generate_flash_grad_k_module(64);
-        analyze(
-            "flash_grad_k_hd64",
-            &sm_gk,
-            &ShaderEntry::FlashGradK,
-            dump,
-            gpu_ref,
-        );
-
-        let sm_gv = meganeura::codegen::generate_flash_grad_v_module(64);
-        analyze(
-            "flash_grad_v_hd64",
-            &sm_gv,
-            &ShaderEntry::FlashGradV,
-            dump,
-            gpu_ref,
-        );
-
         let sm_coop = meganeura::codegen::generate_flash_attention_coop_module(64);
         analyze(
             "flash_attention_coop_hd64",
@@ -518,17 +500,7 @@ fn main() {
         );
     }
 
-    if let Some(g) = gpu_ref {
-        let table = meganeura::runtime::measure_fused_op_register_costs(g);
-        if !table.regs_per_op.is_empty() {
-            println!("\nFusionCostModel register table (op → regs/thread):");
-            let mut entries: Vec<_> = table.regs_per_op.iter().collect();
-            entries.sort_by(|a, b| a.0.cmp(b.0));
-            for (op, regs) in entries {
-                println!("  {op:24} {regs}");
-            }
-        }
-    }
+    let _ = gpu_ref;
 
     println!("\nDone. Use --dump to write .spv files for manual inspection.");
     println!("     Use --gpu to query real GPU pipeline statistics.");

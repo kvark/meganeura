@@ -626,11 +626,7 @@ impl Pipelines {
                 dispatch.shader,
                 ShaderEntry::Conv2dGradInputGemmCoopGen(..) | ShaderEntry::Conv2dGemmCoopGen(..)
             );
-            if !matches!(
-                group,
-                ShaderGroup::Conv2dGradInputGemmCoop3x3 | ShaderGroup::Conv2dGradInputGemmCoopV2
-            ) && !is_gen_coop
-            {
+            if group != ShaderGroup::Conv2dGradInputGemmCoop3x3 && !is_gen_coop {
                 needed.insert(group);
             }
             entries_for_group
@@ -647,8 +643,6 @@ impl Pipelines {
                     | ShaderGroup::FlashGradQCoop
                     | ShaderGroup::FlashGradKV
                     | ShaderGroup::FlashGradKVCoop
-                    | ShaderGroup::FlashGradK
-                    | ShaderGroup::FlashGradV
             ) && dispatch.params.len() >= 4
             {
                 attention_head_dim = Some(dispatch.params[3]);
@@ -681,9 +675,6 @@ impl Pipelines {
                     }
                     ShaderGroup::Conv2dGradInputGemmCoop3x3 => {
                         ShaderGroup::Conv2dGradInputGemmCoop3x3
-                    }
-                    ShaderGroup::Conv2dGradInputGemmCoopV2 => {
-                        ShaderGroup::Conv2dGradInputGemmCoopV2
                     }
                     ShaderGroup::FusedRmsNormMatMul => ShaderGroup::FusedRmsNormMatMulCoop,
                     _ => continue,
@@ -756,8 +747,6 @@ impl Pipelines {
                     | ShaderGroup::FlashGradQCoop
                     | ShaderGroup::FlashGradKV
                     | ShaderGroup::FlashGradKVCoop
-                    | ShaderGroup::FlashGradK
-                    | ShaderGroup::FlashGradV
             ) {
                 // Use parameterized attention generators with actual head_dim.
                 let hd = attention_head_dim.unwrap_or(64);
@@ -776,8 +765,6 @@ impl Pipelines {
                     ShaderGroup::FlashGradKVCoop => {
                         crate::codegen::generate_flash_grad_kv_coop_module(hd)
                     }
-                    ShaderGroup::FlashGradK => crate::codegen::generate_flash_grad_k_module(hd),
-                    ShaderGroup::FlashGradV => crate::codegen::generate_flash_grad_v_module(hd),
                     _ => crate::codegen::generate_attention_module(hd),
                 };
                 let shader = gpu.create_shader(bg::ShaderDesc {
@@ -1104,9 +1091,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         | ShaderEntry::FlashGradQ
         | ShaderEntry::FlashGradQCoop
         | ShaderEntry::MultiHeadAttnGradK
-        | ShaderEntry::FlashGradK
-        | ShaderEntry::MultiHeadAttnGradV
-        | ShaderEntry::FlashGradV => MultiHeadAttnGradData::layout(),
+        | ShaderEntry::MultiHeadAttnGradV => MultiHeadAttnGradData::layout(),
         ShaderEntry::MultiHeadAttnGradKV
         | ShaderEntry::FlashGradKV
         | ShaderEntry::FlashGradKVCoop => MultiHeadAttnGradKVData::layout(),
@@ -1134,7 +1119,6 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         | ShaderEntry::Conv2dGradInputGemmSmall
         | ShaderEntry::Conv2dGradInputGemmCoop
         | ShaderEntry::Conv2dGradInputGemmCoop3x3
-        | ShaderEntry::Conv2dGradInputGemmCoopV2
         | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => Conv2dGradInputData::layout(),
         ShaderEntry::Conv2dGradWeight
         | ShaderEntry::Conv2dGradWeightGemm
@@ -1948,43 +1932,6 @@ impl Session {
     }
 }
 
-/// Compile a single shader module on the given GPU and report its
-/// driver-reported register count, then destroy the pipeline.
-///
-/// Used by tuners that want to measure register pressure across kernel
-/// variants (e.g. different EPT caps) without committing to one in the
-/// final session. Returns `None` when the driver doesn't expose register
-/// counts (Metal, llvmpipe).
-///
-/// The kernel name searched in `PipelineStatistic::name` matches the
-/// NVIDIA/Vulkan convention ("Register Count") — adapt if you need
-/// AMD/Intel-style "numUsedVgprs" naming.
-pub fn measure_pipeline_register_count(
-    gpu: &blade_graphics::Context,
-    sm: &crate::codegen::ShaderModule,
-    entry: &crate::compile::ShaderEntry,
-) -> Option<u32> {
-    use blade_graphics as bg;
-    let shader = gpu.create_shader(bg::ShaderDesc {
-        source: &sm.source,
-        naga_module: Some(sm.module.clone()),
-    });
-    let layout = shader_data_layout(entry);
-    let mut pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-        name: entry.entry_point(),
-        data_layouts: &[&layout],
-        compute: shader.at(entry.entry_point()),
-    });
-    let stats = gpu.get_pipeline_statistics(&pipeline);
-    gpu.destroy_compute_pipeline(&mut pipeline);
-
-    stats
-        .iter()
-        .flat_map(|exec| exec.statistics.iter())
-        .find(|s| s.name == "Register Count")
-        .map(|s| s.value as u32)
-}
-
 /// Convenience: create a Blade GPU context with the same defaults
 /// `Session::new` uses, honoring the `MEGANEURA_DEVICE_ID` env var.
 ///
@@ -2012,42 +1959,23 @@ pub fn init_gpu_context() -> Result<blade_graphics::Context, blade_graphics::Not
     }
 }
 
-/// Result of [`auto_tune`] — measurements from the connected GPU
+/// Result of [`auto_tune`] — capability snapshot from the connected GPU
 /// suitable for installing as global compilation defaults via
 /// [`install_auto_tune`].
 #[derive(Clone, Debug)]
 pub struct AutoTuneResult {
-    /// Per-flash-kernel EPT cap, see [`crate::codegen::FlashEptConfig`].
-    pub flash_ept: crate::codegen::FlashEptConfig,
-    /// Register counts for the fused ops the e-graph cost model
-    /// recognizes (FusedMatMulAdd, FusedRmsNormMatMul, …).
-    pub fusion_register_costs: crate::optimize::RegisterCostTable,
     /// Cooperative-matrix capabilities. Compile-time decisions
-    /// (e.g. flash-attention-coop forward, Conv2dGradInputGemmCoop3x3)
-    /// gate on this — different kernels need different tile sizes.
+    /// (e.g. flash-attention-coop forward) gate on this.
     pub coop_caps: crate::codegen::CoopCaps,
 }
 
-/// Run the full pipeline-stats-driven auto-tune on `gpu`:
-///   1. Measure register count for each flash kernel × candidate EPT
-///      and pick the largest cap that fits the occupancy threshold.
-///   2. Measure register count for each fused op the cost model
-///      recognizes so the e-graph can penalize register-pressured
-///      fusions.
-///
-/// `head_dim` should match the model's attention head dim (e.g. 64 for
-/// SmolLM2 / Whisper / SmolVLA). The tune is shape-blind across other
-/// dispatch parameters but matches PyTorch's compile-once-per-device
-/// pattern.
-///
-/// The returned [`AutoTuneResult`] does not change anything on its own
-/// — pass it to [`install_auto_tune`] before constructing any sessions
-/// that should benefit.
-pub fn auto_tune(gpu: &blade_graphics::Context, head_dim: u32) -> AutoTuneResult {
+/// Probe the GPU for cooperative_matrix capabilities. The returned
+/// [`AutoTuneResult`] is consumed by [`install_auto_tune`] before any
+/// sessions are built, so the compiler can pick the coop kernel
+/// variants where supported.
+pub fn auto_tune(gpu: &blade_graphics::Context, _head_dim: u32) -> AutoTuneResult {
     let cm = gpu.capabilities().cooperative_matrix;
     AutoTuneResult {
-        flash_ept: auto_tune_flash_ept(gpu, head_dim),
-        fusion_register_costs: measure_fused_op_register_costs(gpu),
         coop_caps: crate::codegen::CoopCaps {
             f16_tile: cm.f16_tile,
             f32_tile: cm.f32_tile,
@@ -2055,206 +1983,12 @@ pub fn auto_tune(gpu: &blade_graphics::Context, head_dim: u32) -> AutoTuneResult
     }
 }
 
-/// Install the auto-tuned configuration into the process-wide globals.
-///
-/// Subsequent [`crate::optimize::optimize`] / `optimize_with_report`
-/// calls pick up the register-aware fusion cost model. The flash-EPT
-/// part is **opt-in** — it only installs when
-/// `MEGANEURA_FLASH_EPT_AUTOPICK=1` is set, because the
-/// register-pressure heuristic alone can mis-pick on shapes where the
-/// kernel is work-bound rather than occupancy-bound (e.g. a 25%
-/// regression on Whisper-tiny training was observed when EPT=16 was
-/// installed for the backward kernels). The fusion cost table is
-/// always installed since it's shape-blind by construction.
-///
-/// Only the first install per global wins (the underlying `OnceLock`s
-/// are write-once). Call this *before* building the first Session
-/// whose dispatches should be affected.
+/// Install the auto-tuned configuration into process-wide globals.
+/// Only the first install wins (the underlying `OnceLock` is
+/// write-once). Call before constructing any Session whose dispatches
+/// should pick up the coop kernel variants.
 pub fn install_auto_tune(result: AutoTuneResult) {
-    crate::optimize::set_fusion_register_costs(result.fusion_register_costs);
     crate::codegen::set_coop_caps(result.coop_caps);
-    if std::env::var("MEGANEURA_FLASH_EPT_AUTOPICK").as_deref() == Ok("1") {
-        crate::codegen::set_flash_ept_config(result.flash_ept);
-    }
-}
-
-/// Auto-pick a [`crate::codegen::FlashEptConfig`] by measuring register
-/// counts for each flash-attention kernel at candidate EPT values.
-///
-/// For each `(kernel, ept_cap)` combination, codegen the kernel,
-/// compile it on `gpu`, query the driver-reported register count, and
-/// keep the largest cap whose count fits the occupancy threshold
-/// (default 128 regs/thread → 2 wgs per Blackwell SM at 256-thread
-/// workgroups). Returns the default cap (32) for kernels the driver
-/// won't profile.
-///
-/// `head_dim` should be the actual model's head_dim — the auto-pick is
-/// shape-blind across head_dims for now (assumes one transformer per
-/// session). If the session compiles attention at multiple head_dims,
-/// pass the dominant one and accept that the smaller dims may not be
-/// optimally tuned.
-///
-/// Install the result with [`crate::codegen::set_flash_ept_config`]
-/// before building any sessions whose dispatches should use it. The
-/// config is process-global and only the first install wins.
-pub fn auto_tune_flash_ept(
-    gpu: &blade_graphics::Context,
-    head_dim: u32,
-) -> crate::codegen::FlashEptConfig {
-    use crate::codegen::{
-        FlashEptConfig, FlashKernel, generate_flash_attention_module, generate_flash_grad_k_module,
-        generate_flash_grad_kv_module, generate_flash_grad_q_module, generate_flash_grad_v_module,
-    };
-    use crate::compile::ShaderEntry;
-
-    /// Below this many registers/thread, the kernel can fit 2 wgs/SM
-    /// on a 64K-reg Blackwell SM with 256-thread workgroups
-    /// (128 × 256 = 32K). The threshold is conservative: AMD GCN and
-    /// older NVIDIA cards have similar sweet spots in the 128–160 range.
-    const REG_BUDGET: u32 = 128;
-
-    fn pick<F>(
-        gpu: &blade_graphics::Context,
-        head_dim: u32,
-        entry: &ShaderEntry,
-        gen_fn: F,
-        kernel_name: &str,
-    ) -> u32
-    where
-        F: Fn(u32) -> crate::codegen::ShaderModule,
-    {
-        // Caller is responsible for setting MEGANEURA_FLASH_EPT_CAP to
-        // the candidate value before calling generator. We can't *clean*
-        // generator vs. an explicit-EPT API yet, so use the env-var
-        // override path the existing code already honors.
-        let prev = std::env::var("MEGANEURA_FLASH_EPT_CAP").ok();
-        let mut best = 8u32; // fall-back if nothing else fits
-        for &cap in &[32u32, 16, 8] {
-            // Skip caps the head_dim doesn't expose.
-            if head_dim < cap {
-                continue;
-            }
-            // SAFETY: env var mutation is process-global; we restore
-            // afterwards. Auto-tuning must not race with other sessions.
-            unsafe {
-                std::env::set_var("MEGANEURA_FLASH_EPT_CAP", cap.to_string());
-            }
-            let sm = gen_fn(head_dim);
-            let regs = measure_pipeline_register_count(gpu, &sm, entry);
-            log::debug!("auto-tune {kernel_name} hd={head_dim} ept_cap={cap} regs={regs:?}");
-            if let Some(r) = regs
-                && r <= REG_BUDGET
-            {
-                best = cap;
-                break; // 32, 16, 8 sorted high→low — first hit is best
-            }
-        }
-        // Restore env var so this side-effect doesn't leak.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("MEGANEURA_FLASH_EPT_CAP", v),
-                None => std::env::remove_var("MEGANEURA_FLASH_EPT_CAP"),
-            }
-        }
-        best
-    }
-
-    let _ = FlashKernel::Forward; // ensure the enum is in scope visually
-    FlashEptConfig {
-        forward_cap: pick(
-            gpu,
-            head_dim,
-            &ShaderEntry::FlashAttention,
-            generate_flash_attention_module,
-            "forward",
-        ),
-        grad_q_cap: pick(
-            gpu,
-            head_dim,
-            &ShaderEntry::FlashGradQ,
-            generate_flash_grad_q_module,
-            "grad_q",
-        ),
-        grad_kv_cap: pick(
-            gpu,
-            head_dim,
-            &ShaderEntry::FlashGradKV,
-            generate_flash_grad_kv_module,
-            "grad_kv",
-        ),
-        grad_k_cap: pick(
-            gpu,
-            head_dim,
-            &ShaderEntry::FlashGradK,
-            generate_flash_grad_k_module,
-            "grad_k",
-        ),
-        grad_v_cap: pick(
-            gpu,
-            head_dim,
-            &ShaderEntry::FlashGradV,
-            generate_flash_grad_v_module,
-            "grad_v",
-        ),
-    }
-}
-
-/// Measure register counts for the kernels backing the fused ops that
-/// `optimize::FusionCostModel` recognizes. Returns a table the cost
-/// model can use to penalize fusions that overshoot the GPU's
-/// occupancy threshold.
-///
-/// On drivers that don't expose register counts (Metal, llvmpipe,
-/// software Vulkan) this returns an empty table — the cost model then
-/// falls back to its base costs and behaves identically to the
-/// pre-pipeline-stats version.
-///
-/// The kernels are codegen'd at sentinel shapes (head_dim=64 for
-/// FusedRmsNormMatMul) since the FusionCostModel is shape-blind today.
-pub fn measure_fused_op_register_costs(
-    gpu: &blade_graphics::Context,
-) -> crate::optimize::RegisterCostTable {
-    use crate::codegen::{ShaderGroup, generate_module};
-    use crate::compile::ShaderEntry;
-    use std::collections::HashMap;
-
-    let probes: &[(&str, ShaderGroup, ShaderEntry)] = &[
-        (
-            "FusedMatMulAdd",
-            ShaderGroup::MatMulAdd,
-            ShaderEntry::FusedMatMulAdd,
-        ),
-        (
-            "FusedMatMulATAdd",
-            ShaderGroup::MatMulATAdd,
-            ShaderEntry::FusedMatMulATAdd,
-        ),
-        (
-            "FusedMatMulBTAdd",
-            ShaderGroup::MatMulBTAdd,
-            ShaderEntry::FusedMatMulBTAdd,
-        ),
-        (
-            "FusedRmsNormMatMul",
-            ShaderGroup::FusedRmsNormMatMul,
-            ShaderEntry::FusedRmsNormMatMul,
-        ),
-        (
-            "SwiGLUConcat",
-            ShaderGroup::SwiGLUConcat,
-            ShaderEntry::SwiGLUConcat,
-        ),
-    ];
-
-    let mut regs_per_op: HashMap<String, u32> = HashMap::new();
-    for &(op_name, group, ref entry) in probes {
-        let sm = generate_module(group);
-        if let Some(count) = measure_pipeline_register_count(gpu, &sm, entry) {
-            regs_per_op.insert(op_name.to_string(), count);
-        }
-    }
-
-    crate::optimize::RegisterCostTable { regs_per_op }
 }
 
 impl Session {
@@ -3181,9 +2915,7 @@ impl Session {
             | ShaderEntry::FlashGradQ
             | ShaderEntry::FlashGradQCoop
             | ShaderEntry::MultiHeadAttnGradK
-            | ShaderEntry::FlashGradK
-            | ShaderEntry::MultiHeadAttnGradV
-            | ShaderEntry::FlashGradV => {
+            | ShaderEntry::MultiHeadAttnGradV => {
                 pc.bind(
                     0,
                     &MultiHeadAttnGradData {
@@ -3504,7 +3236,6 @@ impl Session {
             | ShaderEntry::Conv2dGradInputGemmSmall
             | ShaderEntry::Conv2dGradInputGemmCoop
             | ShaderEntry::Conv2dGradInputGemmCoop3x3
-            | ShaderEntry::Conv2dGradInputGemmCoopV2
             | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => {
                 let p = &dispatch.params;
                 let kernel_hw = p[5] * p[6];
