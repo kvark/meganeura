@@ -102,13 +102,6 @@ pub enum ShaderEntry {
     MultiHeadAttnGradV,
     MultiHeadAttnGradKV,
     FlashGradKV,
-    /// Split flash-attention dK kernel. Dispatched alongside
-    /// [`ShaderEntry::FlashGradV`] as an alternative to the fused
-    /// [`ShaderEntry::FlashGradKV`] when the cost model prefers lower
-    /// per-kernel register pressure over duplicated score computation.
-    FlashGradK,
-    /// Split flash-attention dV kernel. See [`ShaderEntry::FlashGradK`].
-    FlashGradV,
     SwiGLUGradGate,
     SwiGLUGradUp,
     SiluGrad,
@@ -143,11 +136,6 @@ pub enum ShaderEntry {
     Conv2dGradInputGemmSmall,
     Conv2dGradInputGemmCoop,
     Conv2dGradInputGemmCoop3x3,
-    /// Cooperative-matrix conv2d backward grad_input — flash-coop
-    /// pattern (16x16 tile, per-thread register accumulator).
-    /// Default-on for 3x3 stride-1 when GPU supports 16x16 f16
-    /// coop_matrix; opt-out via `MEGANEURA_CONV_COOP_V2=0`.
-    Conv2dGradInputGemmCoopV2,
     /// Generated conv2d grad_input coop kernel specialized for (kernel_h, kernel_w, stride).
     Conv2dGradInputGemmCoopGen(u32, u32, u32),
     Conv2dGradWeight,
@@ -214,8 +202,6 @@ impl ShaderEntry {
             ShaderEntry::MultiHeadAttnGradK => ShaderGroup::MultiHeadAttnGradK,
             ShaderEntry::MultiHeadAttnGradKV => ShaderGroup::MultiHeadAttnGradKV,
             ShaderEntry::FlashGradKV => ShaderGroup::FlashGradKV,
-            ShaderEntry::FlashGradK => ShaderGroup::FlashGradK,
-            ShaderEntry::FlashGradV => ShaderGroup::FlashGradV,
             ShaderEntry::MultiHeadAttnGradV => ShaderGroup::MultiHeadAttnGradV,
             ShaderEntry::SwiGLUGradGate | ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => {
                 ShaderGroup::SwiGLUGrad
@@ -247,7 +233,6 @@ impl ShaderEntry {
             ShaderEntry::Conv2dGradInputGemmSmall => ShaderGroup::Conv2dGradInputGemmSmall,
             ShaderEntry::Conv2dGradInputGemmCoop => ShaderGroup::Conv2dGradInputGemmCoop,
             ShaderEntry::Conv2dGradInputGemmCoop3x3 => ShaderGroup::Conv2dGradInputGemmCoop3x3,
-            ShaderEntry::Conv2dGradInputGemmCoopV2 => ShaderGroup::Conv2dGradInputGemmCoopV2,
             ShaderEntry::Conv2dGradInputGemmCoopGen(..) => ShaderGroup::Conv2dGradInputGemmCoop,
             ShaderEntry::Conv2dGradWeight => ShaderGroup::Conv2dGradWeight,
             ShaderEntry::Conv2dGradWeightGemm => ShaderGroup::Conv2dGradWeightGemm,
@@ -315,9 +300,7 @@ impl ShaderEntry {
             | ShaderEntry::MultiHeadAttnGradV
             | ShaderEntry::MultiHeadAttnGradKV
             | ShaderEntry::FlashGradKV
-            | ShaderEntry::FlashGradKVCoop
-            | ShaderEntry::FlashGradK
-            | ShaderEntry::FlashGradV => "main",
+            | ShaderEntry::FlashGradKVCoop => "main",
             ShaderEntry::SwiGLUGradGate => "swiglu_grad_gate",
             ShaderEntry::SwiGLUGradUp => "swiglu_grad_up",
             ShaderEntry::SiluGrad => "silu_grad",
@@ -349,7 +332,6 @@ impl ShaderEntry {
             | ShaderEntry::Conv2dGradInputGemmSmall
             | ShaderEntry::Conv2dGradInputGemmCoop
             | ShaderEntry::Conv2dGradInputGemmCoop3x3
-            | ShaderEntry::Conv2dGradInputGemmCoopV2
             | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => "main",
             ShaderEntry::Conv2dGradWeight
             | ShaderEntry::Conv2dGradWeightGemm
@@ -1142,10 +1124,10 @@ impl<'a> Compiler<'a> {
                 [q_seq.div_ceil(16), num_heads, 1],
             );
         }
-        // Per-kernel EPT — must match the codegen call in
-        // generate_flash_attention_module, which uses
-        // `flash_ept_for(FlashKernel::Forward, hd)`.
-        let ept = crate::codegen::flash_ept_for(crate::codegen::FlashKernel::Forward, head_dim);
+        // EPT (elements per thread) must match codegen — both
+        // `attention_dispatch{,_bwd}` and the codegen functions read
+        // `crate::codegen::flash_ept_cap()` (env-var override or default).
+        let ept = head_dim.min(crate::codegen::flash_ept_cap());
         let tpq = head_dim / ept; // threads per query
         let bq = (256 / tpq).max(1);
         if bq >= 2 && q_seq >= bq {
@@ -1158,17 +1140,14 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    /// Backward attention dispatch. Caller passes the [`FlashKernel`] so
-    /// the EPT (and hence workgroup tiling) matches the codegen for
-    /// that specific backward pass — different kernels have different
-    /// register pressure and can want different EPT/TPQ/BQ pairs.
+    /// Backward attention dispatch — same EPT/TPQ/BQ pattern as the
+    /// forward kernel.
     fn attention_dispatch_bwd(
         q_seq: u32,
         head_dim: u32,
         num_heads: u32,
-        kernel: crate::codegen::FlashKernel,
     ) -> (ShaderEntry, [u32; 3]) {
-        let ept = crate::codegen::flash_ept_for(kernel, head_dim);
+        let ept = head_dim.min(crate::codegen::flash_ept_cap());
         let tpq = head_dim / ept;
         let bq = (256 / tpq).max(1);
         if bq >= 2 && q_seq >= bq {
@@ -2402,107 +2381,7 @@ impl<'a> Compiler<'a> {
                 } else {
                     // Use implicit GEMM: grad_input = weight_T @ im2col(grad_out)^T
                     // M=Ci, N=H*W, K=Co*kH*kW, batched in z dimension.
-                    //
-                    // For 3×3 stride-1 with cooperative_matrix support
-                    // (Blackwell / RDNA3 / Xe-HPG), the hand-written
-                    // coop kernel is available — opt-in via
-                    // MEGANEURA_CONV_COOP=1.
-                    //
-                    // On RTX 5080 (Blackwell, NVIDIA driver 580.105.08)
-                    // it is correctness-equivalent but not faster: the
-                    // SPIR-V emitted by naga for coop_mat doesn't
-                    // appear to reach the f16 tensor-core path — the
-                    // kernel reports 56 regs (vs 48 for the scalar
-                    // im2col GEMM) and a 3.7x larger binary, with
-                    // per-dispatch time within ±1% of the scalar
-                    // version. Re-evaluate once naga emits the
-                    // NV_cooperative_matrix2 intrinsics or on AMD/Xe
-                    // where the coop path goes through different
-                    // driver lowering.
-                    // V2 (flash-coop pattern: 16×16 tile, per-thread
-                    // register accumulator) is correctness-equivalent
-                    // and ~44% faster per dispatch in the GPU profile,
-                    // but ~0.3 ms slower in wall-clock ResNet-50
-                    // training on RTX 5080 (consistently across 5 runs).
-                    // The wall-clock regression is not understood —
-                    // possibly per-dispatch driver overhead with the 14×
-                    // higher workgroup count. Opt-in via
-                    // `MEGANEURA_CONV_COOP_V2=1` until that's resolved.
-                    //
-                    // Original 32×32 Coop3x3 is also opt-in via
-                    // `MEGANEURA_CONV_COOP=1` (perf-neutral, kept for
-                    // A/B comparison).
-                    let coop_v2 = std::env::var("MEGANEURA_CONV_COOP_V2").as_deref() == Ok("1")
-                        && kernel_h == 3
-                        && kernel_w == 3
-                        && stride == 1
-                        && crate::codegen::coop_caps().supports_16x16_f16();
-                    let coop_3x3_legacy = kernel_h == 3
-                        && kernel_w == 3
-                        && stride == 1
-                        && crate::codegen::coop_caps().supports_16x16_f16()
-                        && std::env::var("MEGANEURA_CONV_COOP").as_deref() == Ok("1");
-                    if coop_v2 {
-                        let coop_tile: u32 = 16;
-                        self.plan.dispatches.push(Dispatch {
-                            shader: ShaderEntry::Conv2dGradInputGemmCoopV2,
-                            workgroups: [
-                                in_channels.div_ceil(coop_tile),
-                                (in_h * in_w).div_ceil(coop_tile),
-                                batch,
-                            ],
-                            input_buffers: vec![grad_out, kernel],
-                            output_buffer: out_buf,
-                            extra_outputs: vec![],
-                            params: vec![
-                                batch,
-                                in_channels,
-                                in_h,
-                                in_w,
-                                out_channels,
-                                kernel_h,
-                                kernel_w,
-                                stride,
-                                padding_h,
-                                out_h,
-                                out_w,
-                                padding_w,
-                            ],
-                            use_coop: true,
-                            use_small_tiles: false,
-                            ..Default::default()
-                        });
-                    } else if coop_3x3_legacy {
-                        let coop_tile: u32 = 32;
-                        self.plan.dispatches.push(Dispatch {
-                            shader: ShaderEntry::Conv2dGradInputGemmCoop3x3,
-                            workgroups: [
-                                in_channels.div_ceil(coop_tile),
-                                (in_h * in_w).div_ceil(coop_tile),
-                                batch,
-                            ],
-                            input_buffers: vec![grad_out, kernel],
-                            output_buffer: out_buf,
-                            extra_outputs: vec![],
-                            params: vec![
-                                batch,
-                                in_channels,
-                                in_h,
-                                in_w,
-                                out_channels,
-                                kernel_h,
-                                kernel_w,
-                                stride,
-                                padding_h,
-                                out_h,
-                                out_w,
-                                padding_w,
-                            ],
-                            use_coop: true,
-                            use_small_tiles: false,
-                            ..Default::default()
-                        });
-                    } else {
+                    {
                         let wgs_64 = in_h * in_w.div_ceil(64) * in_channels.div_ceil(64);
                         let use_small = wgs_64 < 16;
                         let tile = if use_small { 32 } else { 64 };
@@ -2880,12 +2759,8 @@ impl<'a> Compiler<'a> {
                         [q_seq.div_ceil(16), num_heads, 1],
                     )
                 } else {
-                    let (raw_shader, wgs) = Self::attention_dispatch_bwd(
-                        q_seq,
-                        head_dim,
-                        num_heads,
-                        crate::codegen::FlashKernel::GradQ,
-                    );
+                    let (raw_shader, wgs) =
+                        Self::attention_dispatch_bwd(q_seq, head_dim, num_heads);
                     let mapped = match raw_shader {
                         ShaderEntry::FlashAttention => ShaderEntry::FlashGradQ,
                         _ => ShaderEntry::MultiHeadAttnGradQ,
@@ -2954,78 +2829,32 @@ impl<'a> Compiler<'a> {
                     head_dim,
                     window_size,
                 ];
-                // `MEGANEURA_FLASH_GRAD_SPLIT=1` opts into the
-                // FlashGradK + FlashGradV dispatch pair. Each split
-                // kernel has its own EPT slot in FlashEptConfig so they
-                // can use different tile sizes — recompute workgroups
-                // per kernel.
-                let split_requested =
-                    std::env::var("MEGANEURA_FLASH_GRAD_SPLIT").as_deref() == Ok("1");
-                let (grad_k_shader, grad_k_wgs) = Self::attention_dispatch_bwd(
-                    dispatch_kv,
-                    head_dim,
-                    num_kv_heads,
-                    crate::codegen::FlashKernel::GradK,
-                );
-                let (_grad_v_shader, grad_v_wgs) = Self::attention_dispatch_bwd(
-                    dispatch_kv,
-                    head_dim,
-                    num_kv_heads,
-                    crate::codegen::FlashKernel::GradV,
-                );
-                let (grad_kv_shader, grad_kv_wgs) = Self::attention_dispatch_bwd(
-                    dispatch_kv,
-                    head_dim,
-                    num_kv_heads,
-                    crate::codegen::FlashKernel::GradKv,
-                );
-                let use_split = split_requested && grad_k_shader == ShaderEntry::FlashAttention;
-                if use_split {
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::FlashGradK,
-                        workgroups: grad_k_wgs,
-                        input_buffers: vec![d_out, q, k, v, lse_buf, fwd_o],
-                        output_buffer: out_buf,
-                        params: attention_params.clone(),
-                        use_coop: false,
-                        use_small_tiles: false,
-                        ..Default::default()
-                    });
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::FlashGradV,
-                        workgroups: grad_v_wgs,
-                        input_buffers: vec![d_out, q, k, v, lse_buf, fwd_o],
-                        output_buffer: dv_buf,
-                        params: attention_params,
-                        use_coop: false,
-                        use_small_tiles: false,
-                        ..Default::default()
-                    });
+                let (grad_kv_shader, grad_kv_wgs) =
+                    Self::attention_dispatch_bwd(dispatch_kv, head_dim, num_kv_heads);
+                // Pick coop GradKV when the GPU has 16x16 f16
+                // coop_matrix and shape is compatible. Default-on;
+                // opt-out via `MEGANEURA_FLASH_BWD_COOP=0`.
+                let bwd_coop_disabled =
+                    std::env::var("MEGANEURA_FLASH_BWD_COOP").as_deref() == Ok("0");
+                let bwd_coop_enabled = !bwd_coop_disabled
+                    && grad_kv_shader == ShaderEntry::FlashAttention
+                    && crate::codegen::coop_caps().supports_16x16_f16()
+                    && head_dim >= 16
+                    && head_dim.is_multiple_of(16)
+                    && dispatch_kv >= 16;
+                let (shader, workgroups) = if bwd_coop_enabled {
+                    (
+                        ShaderEntry::FlashGradKVCoop,
+                        [dispatch_kv.div_ceil(16), num_kv_heads, 1],
+                    )
                 } else {
-                    // Pick coop GradKV when GPU has 16x16 f16 coop_matrix
-                    // and shape is compatible (head_dim multiple of 16,
-                    // dispatch_kv >= 16). Default-on; opt-out via
-                    // `MEGANEURA_FLASH_BWD_COOP=0`.
-                    let bwd_coop_disabled =
-                        std::env::var("MEGANEURA_FLASH_BWD_COOP").as_deref() == Ok("0");
-                    let bwd_coop_enabled = !bwd_coop_disabled
-                        && grad_kv_shader == ShaderEntry::FlashAttention
-                        && crate::codegen::coop_caps().supports_16x16_f16()
-                        && head_dim >= 16
-                        && head_dim.is_multiple_of(16)
-                        && dispatch_kv >= 16;
-                    let (shader, workgroups) = if bwd_coop_enabled {
-                        (
-                            ShaderEntry::FlashGradKVCoop,
-                            [dispatch_kv.div_ceil(16), num_kv_heads, 1],
-                        )
-                    } else {
-                        let s = match grad_kv_shader {
-                            ShaderEntry::FlashAttention => ShaderEntry::FlashGradKV,
-                            _ => ShaderEntry::MultiHeadAttnGradKV,
-                        };
-                        (s, grad_kv_wgs)
+                    let s = match grad_kv_shader {
+                        ShaderEntry::FlashAttention => ShaderEntry::FlashGradKV,
+                        _ => ShaderEntry::MultiHeadAttnGradKV,
                     };
+                    (s, grad_kv_wgs)
+                };
+                {
                     self.plan.dispatches.push(Dispatch {
                         shader,
                         workgroups,
@@ -3845,54 +3674,22 @@ mod tests {
     /// producing wrong results for attention kernels.
     #[test]
     fn test_attention_dispatch_matches_codegen_ept() {
-        use crate::codegen::FlashKernel;
-
-        // Both dispatch and codegen call `flash_ept_for(kernel, hd)`,
-        // so as long as we pass the same FlashKernel they must agree.
+        // Both dispatch and codegen call `crate::codegen::flash_ept_cap()`
+        // so they must agree on EPT/TPQ/BQ. If they ever diverge, the
+        // workgroup count won't match the shader's tile size.
         for hd_log2 in 1..=8 {
             let hd: u32 = 1 << hd_log2;
-
-            // Forward
-            let (entry, wg) = Compiler::attention_dispatch(256, hd, 1);
-            let codegen_ept = crate::codegen::flash_ept_for(FlashKernel::Forward, hd);
+            let codegen_ept = hd.min(crate::codegen::flash_ept_cap());
             let codegen_tpq = hd / codegen_ept;
             let codegen_bq: u32 = (256 / codegen_tpq).max(1);
-            if codegen_bq >= 2 {
-                assert_eq!(
-                    entry,
-                    ShaderEntry::FlashAttention,
-                    "hd={hd}: forward should pick FlashAttention when bq={codegen_bq}"
-                );
-                assert_eq!(
-                    wg[0],
-                    256u32.div_ceil(codegen_bq),
-                    "hd={hd}: forward workgroups_x mismatch (bq={codegen_bq})"
-                );
-            }
 
-            // Backward — every kernel kind uses its own EPT slot.
-            for kernel in [
-                FlashKernel::GradQ,
-                FlashKernel::GradKv,
-                FlashKernel::GradK,
-                FlashKernel::GradV,
-            ] {
-                let (bwd_entry, bwd_wg) = Compiler::attention_dispatch_bwd(256, hd, 1, kernel);
-                let bwd_ept = crate::codegen::flash_ept_for(kernel, hd);
-                let bwd_tpq = hd / bwd_ept;
-                let bwd_bq: u32 = (256 / bwd_tpq).max(1);
-                if bwd_bq >= 2 {
-                    assert_eq!(
-                        bwd_entry,
-                        ShaderEntry::FlashAttention,
-                        "hd={hd} {kernel:?}: should pick FlashAttention"
-                    );
-                    assert_eq!(
-                        bwd_wg[0],
-                        256u32.div_ceil(bwd_bq),
-                        "hd={hd} {kernel:?}: workgroups_x mismatch (bq={bwd_bq})"
-                    );
-                }
+            let (fwd_entry, fwd_wg) = Compiler::attention_dispatch(256, hd, 1);
+            let (bwd_entry, bwd_wg) = Compiler::attention_dispatch_bwd(256, hd, 1);
+            assert_eq!(fwd_entry, bwd_entry, "hd={hd}: fwd/bwd entry mismatch");
+            assert_eq!(fwd_wg, bwd_wg, "hd={hd}: fwd/bwd workgroups mismatch");
+            if codegen_bq >= 2 {
+                assert_eq!(fwd_entry, ShaderEntry::FlashAttention);
+                assert_eq!(fwd_wg[0], 256u32.div_ceil(codegen_bq));
             }
         }
     }

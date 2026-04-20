@@ -315,12 +315,6 @@ pub enum ShaderGroup {
     MultiHeadAttnGradK,
     MultiHeadAttnGradKV,
     FlashGradKV,
-    /// Split flash-attention dK kernel — alternative to `FlashGradKV`
-    /// with lower register pressure, dispatched back-to-back with
-    /// `FlashGradV` when the cost model prefers the split.
-    FlashGradK,
-    /// Split flash-attention dV kernel — see [`ShaderGroup::FlashGradK`].
-    FlashGradV,
     /// Cooperative-matrix flash attention forward.
     /// Phase 1: coop_mat for QK^T, scalar softmax + PV. Opt-in via
     /// `MEGANEURA_FLASH_FWD_COOP=1`.
@@ -360,10 +354,6 @@ pub enum ShaderGroup {
     Conv2dGradInputGemmSmall,
     Conv2dGradInputGemmCoop,
     Conv2dGradInputGemmCoop3x3,
-    /// Cooperative-matrix conv2d backward grad_input — flash-coop
-    /// pattern (16x16 tile, per-thread register accumulator). Opt-in
-    /// via `MEGANEURA_CONV_COOP_V2=1`.
-    Conv2dGradInputGemmCoopV2,
     GroupNormSilu,
     WinogradInputTransform,
     WinogradOutputTransform,
@@ -433,8 +423,6 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::MultiHeadAttnGradK => parse_wgsl(include_str!("shaders/mha_grad_k.wgsl")),
         ShaderGroup::MultiHeadAttnGradKV => parse_wgsl(include_str!("shaders/mha_grad_kv.wgsl")),
         ShaderGroup::FlashGradKV => generate_flash_grad_kv_module(64),
-        ShaderGroup::FlashGradK => generate_flash_grad_k_module(64),
-        ShaderGroup::FlashGradV => generate_flash_grad_v_module(64),
         ShaderGroup::MultiHeadAttnGradV => parse_wgsl(include_str!("shaders/mha_grad_v.wgsl")),
         ShaderGroup::SwiGLUGrad => parse_wgsl(include_str!("shaders/swiglu_grad.wgsl")),
         ShaderGroup::SwiGLUConcat => parse_wgsl(include_str!("shaders/swiglu_concat.wgsl")),
@@ -470,7 +458,6 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::Conv2dGemmCoop => gen_conv2d_gemm_coop(),
         ShaderGroup::Conv2dGradInputGemmCoop => gen_conv2d_grad_input_gemm_coop(),
         ShaderGroup::Conv2dGradInputGemmCoop3x3 => gen_conv2d_grad_input_gemm_coop_3x3(),
-        ShaderGroup::Conv2dGradInputGemmCoopV2 => generate_conv2d_grad_input_gemm_coop_v2(),
         ShaderGroup::GroupNormSilu => parse_wgsl(include_str!("shaders/group_norm_silu.wgsl")),
         ShaderGroup::WinogradInputTransform => {
             parse_wgsl(include_str!("shaders/winograd_input_transform.wgsl"))
@@ -514,7 +501,6 @@ pub fn generate_coop_module(group: ShaderGroup, config: &CoopConfig) -> ShaderMo
         ShaderGroup::Conv2dGemmCoop => gen_conv2d_gemm_coop_wgsl(config),
         ShaderGroup::Conv2dGradInputGemmCoop => gen_conv2d_grad_input_gemm_coop_wgsl(config),
         ShaderGroup::Conv2dGradInputGemmCoop3x3 => gen_conv2d_grad_input_gemm_coop_3x3_wgsl(config),
-        ShaderGroup::Conv2dGradInputGemmCoopV2 => generate_conv2d_grad_input_gemm_coop_v2(),
         ShaderGroup::FusedRmsNormMatMulCoop => gen_fused_rms_norm_matmul_coop_wgsl(config),
         _ => panic!("not a coop shader group: {:?}", group),
     }
@@ -530,7 +516,6 @@ pub fn generate_wgsl(group: ShaderGroup) -> String {
         | ShaderGroup::Conv2dGemmCoop
         | ShaderGroup::Conv2dGradInputGemmCoop
         | ShaderGroup::Conv2dGradInputGemmCoop3x3
-        | ShaderGroup::Conv2dGradInputGemmCoopV2
         | ShaderGroup::MatMulCoopBT
         | ShaderGroup::FusedRmsNormMatMulCoop => {
             naga::valid::Capabilities::COOPERATIVE_MATRIX
@@ -1459,65 +1444,10 @@ pub fn generate_attention_module(head_dim: u32) -> ShaderModule {
 ///
 /// For head_dim=64, EPT=8: TPQ=8 threads/query, BQ=32 queries/WG,
 /// tree depth=3 (vs 6), workgroups reduced 8x.
-/// Identifies which flash-attention kernel an EPT decision applies to.
-///
-/// Each kernel has different register pressure (the backward `GradKv`
-/// kernel hits 210 regs/thread at EPT=32 on Blackwell, while forward
-/// only sees 80) so different optimal EPTs. The `flash_ept_for()`
-/// lookup picks the right cap per kernel.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum FlashKernel {
-    /// Forward attention (`generate_flash_attention_module`).
-    Forward,
-    /// Backward dQ (`generate_flash_grad_q_module`).
-    GradQ,
-    /// Fused backward dK+dV (`generate_flash_grad_kv_module`).
-    GradKv,
-    /// Split backward dK (`generate_flash_grad_k_module`).
-    GradK,
-    /// Split backward dV (`generate_flash_grad_v_module`).
-    GradV,
-}
-
-/// Per-kernel EPT cap selection, populated by
-/// [`crate::runtime::auto_tune_flash_ept`] at session creation.
-///
-/// Each cap is the largest power-of-two EPT whose measured register
-/// count keeps the kernel under the occupancy threshold (~128 regs →
-/// 2 wg/SM on a 64K-reg Blackwell SM with 256-thread workgroups).
-/// `head_dim.min(cap)` is the EPT actually used by codegen.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FlashEptConfig {
-    pub forward_cap: u32,
-    pub grad_q_cap: u32,
-    pub grad_kv_cap: u32,
-    pub grad_k_cap: u32,
-    pub grad_v_cap: u32,
-}
-
-impl Default for FlashEptConfig {
-    fn default() -> Self {
-        // Pre-pipeline-stats default: cap everything at 32 (same value
-        // the legacy code used for all kernels). Auto-tune overrides
-        // this with measured per-kernel optima.
-        Self {
-            forward_cap: 32,
-            grad_q_cap: 32,
-            grad_kv_cap: 32,
-            grad_k_cap: 32,
-            grad_v_cap: 32,
-        }
-    }
-}
-
-static FLASH_EPT_CONFIG: std::sync::OnceLock<FlashEptConfig> = std::sync::OnceLock::new();
-
-/// Cooperative-matrix capabilities snapshot the compiler consults
-/// when choosing between scalar and coop kernel variants. Mirrors
-/// Blade's `CooperativeMatrix` struct minus the methods. Compile-time
-/// dispatch can't ask the GPU directly (no Blade context), so we
-/// cache what we need here. Set by `runtime::install_auto_tune`,
-/// defaults to all-zero (= no coop, scalar everywhere).
+/// Cooperative-matrix capability snapshot the compiler consults to
+/// pick between scalar and coop kernel variants. Set once by
+/// `runtime::install_auto_tune` from the Blade probe; defaults to
+/// all-zero (no coop available → scalar everywhere).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CoopCaps {
     pub f16_tile: u32,
@@ -1528,9 +1458,9 @@ impl CoopCaps {
     pub fn is_supported(&self) -> bool {
         self.f16_tile > 0 || self.f32_tile > 0
     }
-    /// True when the kernels that hardcode `coop_mat16x16<f16,...>`
-    /// can run (NVIDIA, RDNA3, Xe-HPG). False on Apple (8x8 f32) or
-    /// any GPU without KHR_cooperative_matrix at the right tile size.
+    /// True when the kernels that hardcode `coop_mat16x16<f16, ...>`
+    /// can run (NVIDIA, RDNA3, Xe-HPG). False on Apple's 8x8 f32 path
+    /// or any GPU without KHR_cooperative_matrix at the right tile size.
     pub fn supports_16x16_f16(&self) -> bool {
         self.f16_tile >= 16
     }
@@ -1546,81 +1476,17 @@ pub fn coop_caps() -> CoopCaps {
     *COOP_CAPS.get().unwrap_or(&CoopCaps::default())
 }
 
-/// Backwards-compatible — true when the GPU supports any
-/// cooperative_matrix path (f16 or f32).
-pub fn coop_matrix_available() -> bool {
-    coop_caps().is_supported()
-}
-
-/// Backwards-compatible setter. Conservatively assumes f16 16x16
-/// (the common case the old boolean gate implied).
-pub fn set_coop_matrix_available(available: bool) {
-    let caps = if available {
-        CoopCaps {
-            f16_tile: 16,
-            f32_tile: 0,
-        }
-    } else {
-        CoopCaps::default()
-    };
-    let _ = COOP_CAPS.set(caps);
-}
-
-/// Install a process-wide EPT config (typically the result of
-/// `runtime::auto_tune_flash_ept`). Has no effect after the first
-/// successful call — the config locks in for the rest of the process.
-pub fn set_flash_ept_config(cfg: FlashEptConfig) {
-    let _ = FLASH_EPT_CONFIG.set(cfg);
-}
-
-/// Retrieve the active EPT config.
-pub fn flash_ept_config() -> FlashEptConfig {
-    *FLASH_EPT_CONFIG.get().unwrap_or(&FlashEptConfig::default())
-}
-
-/// Per-kernel EPT actually used in codegen and dispatch.
-///
-/// Resolution order:
-///   1. `MEGANEURA_FLASH_EPT_CAP` env var (overrides everything,
-///      applied uniformly to all kernels — for benchmarking sweeps).
-///   2. The installed `FlashEptConfig` (typically from auto-tune).
-///   3. Default cap of 32.
-///
-/// **Important**: the same value must be observed by both codegen and
-/// `Compiler::attention_dispatch*`, otherwise generated tile sizes
-/// won't match the workgroup counts and kernels produce wrong results.
-/// Both sites call this function with the same `FlashKernel` argument.
-pub fn flash_ept_for(kernel: FlashKernel, head_dim: u32) -> u32 {
-    if let Some(cap) = std::env::var("MEGANEURA_FLASH_EPT_CAP")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .filter(|v| v.is_power_of_two() && *v >= 2)
-    {
-        return head_dim.min(cap);
-    }
-    let cfg = flash_ept_config();
-    let cap = match kernel {
-        FlashKernel::Forward => cfg.forward_cap,
-        FlashKernel::GradQ => cfg.grad_q_cap,
-        FlashKernel::GradKv => cfg.grad_kv_cap,
-        FlashKernel::GradK => cfg.grad_k_cap,
-        FlashKernel::GradV => cfg.grad_v_cap,
-    };
-    head_dim.min(cap)
-}
-
-/// Legacy global-cap accessor, retained for callers that don't have a
-/// `FlashKernel` context (e.g. analyze_shaders default sweep).
-/// New code should prefer [`flash_ept_for`].
+/// Single tunable cap on elements-per-thread for flash codegen.
+/// Default 32 keeps register count below the spilling cliff on
+/// Ampere/Blackwell. `MEGANEURA_FLASH_EPT_CAP` overrides for
+/// benchmarking sweeps. Codegen and dispatch both read this so they
+/// agree on tile size.
 pub fn flash_ept_cap() -> u32 {
-    if let Some(cap) = std::env::var("MEGANEURA_FLASH_EPT_CAP")
+    std::env::var("MEGANEURA_FLASH_EPT_CAP")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .filter(|v| v.is_power_of_two() && *v >= 2)
-    {
-        return cap;
-    }
-    flash_ept_config().forward_cap
+        .unwrap_or(32)
 }
 
 pub fn generate_flash_attention_module(head_dim: u32) -> ShaderModule {
@@ -1631,9 +1497,9 @@ pub fn generate_flash_attention_module(head_dim: u32) -> ShaderModule {
     );
 
     let hd = head_dim;
-    // Per-kernel EPT picked by `flash_ept_for(FlashKernel::Forward, ..)`,
+    // EPT cap via flash_ept_cap() (env-var override + default).,
     // which honors MEGANEURA_FLASH_EPT_CAP overrides.
-    let ept: u32 = flash_ept_for(FlashKernel::Forward, hd);
+    let ept: u32 = hd.min(flash_ept_cap());
     let tpq = hd / ept; // threads per query
     let bq: u32 = (256 / tpq).max(1);
     // Fall back to BQ=1 kernel when multi-query isn't beneficial
@@ -2919,8 +2785,8 @@ pub fn generate_flash_grad_q_module(head_dim: u32) -> ShaderModule {
     assert!(head_dim.is_power_of_two() && head_dim >= 2);
 
     let hd = head_dim;
-    // Per-kernel EPT picked by `flash_ept_for(FlashKernel::GradQ, ..)`.
-    let ept: u32 = flash_ept_for(FlashKernel::GradQ, hd);
+    // EPT cap via flash_ept_cap() (env-var override + default).
+    let ept: u32 = hd.min(flash_ept_cap());
     let tpq = hd / ept; // threads per query
     let bq: u32 = (256 / tpq).max(1);
     if bq <= 1 {
@@ -3225,10 +3091,10 @@ pub fn generate_flash_grad_kv_module(head_dim: u32) -> ShaderModule {
     assert!(head_dim.is_power_of_two() && head_dim >= 2);
 
     let hd = head_dim;
-    // Per-kernel EPT picked by `flash_ept_for(FlashKernel::GradKv, ..)`.
+    // EPT cap via flash_ept_cap() (env-var override + default).
     // The fused dK+dV kernel reports 210 regs at EPT=32 on Blackwell,
     // so the auto-tune typically chooses a smaller value here.
-    let ept: u32 = flash_ept_for(FlashKernel::GradKv, hd);
+    let ept: u32 = hd.min(flash_ept_cap());
     let tpq = hd / ept; // threads per KV position
     let bkv: u32 = (256 / tpq).max(1);
     if bkv <= 1 {
@@ -3429,297 +3295,6 @@ pub fn generate_flash_grad_kv_module(head_dim: u32) -> ShaderModule {
     }
 }
 
-/// Which side of the KV gradient the split codegen produces.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum FlashKvKind {
-    K,
-    V,
-}
-
-/// Shared codegen for the *split* flash-attention KV-gradient kernels.
-///
-/// The fused `generate_flash_grad_kv_module` reports 210 regs/thread on
-/// Blackwell (1 wg/SM). Splitting drops register pressure:
-///   * `K` variant: ~158 regs (drops per-thread dV accumulator).
-///   * `V` variant: ~109 regs (drops V/O loads and row_sum/dp_t reductions,
-///     getting 2 wg/SM).
-///
-/// The split is not a universal win: each kernel independently recomputes
-/// `score = Q·K · scale` in its inner loop, which doubles compute on
-/// work-bound shapes (e.g. Whisper's non-causal seq=1500 encoder, where
-/// the inner Q loop dominates). Dispatch-size-aware selection between
-/// split and fused belongs in the e-graph cost model.
-///
-/// Both split kernels use the `MultiHeadAttnGradData` binding layout.
-fn gen_flash_grad_kv_split_impl(head_dim: u32, kind: FlashKvKind) -> ShaderModule {
-    use std::fmt::Write;
-    assert!(head_dim.is_power_of_two() && head_dim >= 2);
-
-    let hd = head_dim;
-    // Per-kernel EPT — split kernels each have their own slot.
-    let kernel = match kind {
-        FlashKvKind::K => FlashKernel::GradK,
-        FlashKvKind::V => FlashKernel::GradV,
-    };
-    let ept: u32 = flash_ept_for(kernel, hd);
-    let tpq = hd / ept;
-    let bkv: u32 = (256 / tpq).max(1);
-    assert!(
-        bkv > 1,
-        "flash grad kv split assumes bkv>1 (head_dim {hd} too large)",
-    );
-    let need_v = kind == FlashKvKind::K; // V only needed for dp_t in dK pass.
-    let need_o = kind == FlashKvKind::K; // O only needed for row_sum in dK pass.
-    let wg_size = bkv * tpq;
-    let mut src = String::new();
-
-    src.push_str("struct Params {\n    q_seq: u32,\n    kv_seq: u32,\n    packed_heads: u32,\n    head_dim: u32,\n    window_size: u32,\n    _pad0: u32,\n    _pad1: u32,\n    _pad2: u32,\n}\n\n");
-    src.push_str("var<storage> d_out: array<f32>;\n");
-    src.push_str("var<storage> src_a: array<f32>;\n"); // Q
-    src.push_str("var<storage> src_b: array<f32>;\n"); // K
-    src.push_str("var<storage> bias: array<f32>;\n"); // V (unused in V kind, but in binding)
-    src.push_str("var<storage> lse: array<f32>;\n");
-    src.push_str("var<storage> fwd_dst: array<f32>;\n"); // O (unused in V kind)
-    src.push_str("var<storage, read_write> dst: array<f32>;\n"); // dK or dV
-    src.push_str("var<uniform> params: Params;\n\n");
-
-    if tpq > 1 {
-        let _ = writeln!(src, "var<workgroup> shared_q: array<f32, {hd}>;");
-        let _ = writeln!(src, "var<workgroup> shared_do: array<f32, {hd}>;");
-        if need_o {
-            let _ = writeln!(src, "var<workgroup> shared_o: array<f32, {hd}>;");
-        }
-        src.push('\n');
-
-        let _ = writeln!(src, "var<workgroup> wg_score: array<f32, {}>;", bkv * tpq);
-        if kind == FlashKvKind::K {
-            let _ = writeln!(src, "var<workgroup> wg_rs: array<f32, {}>;", bkv * tpq);
-            let _ = writeln!(src, "var<workgroup> wg_dp: array<f32, {}>;", bkv * tpq);
-        }
-        src.push('\n');
-
-        match kind {
-            FlashKvKind::K => {
-                src.push_str("fn reduce_triple(tid: u32) {\n");
-                let _ = writeln!(src, "    let local = tid % {tpq}u;");
-                let _ = writeln!(src, "    let base = (tid / {tpq}u) * {tpq}u;");
-                let mut stride = tpq / 2;
-                while stride > 0 {
-                    src.push_str("    workgroupBarrier();\n");
-                    let _ = writeln!(
-                        src,
-                        "    if local < {stride}u {{ wg_score[base + local] += wg_score[base + local + {stride}u]; wg_rs[base + local] += wg_rs[base + local + {stride}u]; wg_dp[base + local] += wg_dp[base + local + {stride}u]; }}"
-                    );
-                    stride /= 2;
-                }
-                src.push_str("    workgroupBarrier();\n}\n\n");
-            }
-            FlashKvKind::V => {
-                src.push_str("fn reduce_score(tid: u32) {\n");
-                let _ = writeln!(src, "    let local = tid % {tpq}u;");
-                let _ = writeln!(src, "    let base = (tid / {tpq}u) * {tpq}u;");
-                let mut stride = tpq / 2;
-                while stride > 0 {
-                    src.push_str("    workgroupBarrier();\n");
-                    let _ = writeln!(
-                        src,
-                        "    if local < {stride}u {{ wg_score[base + local] += wg_score[base + local + {stride}u]; }}"
-                    );
-                    stride /= 2;
-                }
-                src.push_str("    workgroupBarrier();\n}\n\n");
-            }
-        }
-    }
-
-    let _ = writeln!(src, "@compute @workgroup_size({wg_size})");
-    src.push_str("fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n");
-    let _ = writeln!(src, "    let ki = lid.x / {tpq}u;");
-    let _ = writeln!(src, "    let lane = lid.x % {tpq}u;");
-    let _ = writeln!(src, "    let d_base = lane * {ept}u;");
-    let _ = writeln!(src, "    let t = wgid.x * {bkv}u + ki;");
-    src.push_str("    let kv_head = wgid.y;\n");
-    src.push_str("    let q_seq = params.q_seq;\n");
-    src.push_str("    let kv_seq = params.kv_seq;\n");
-    src.push_str("    let num_heads = params.packed_heads >> 16u;\n");
-    src.push_str("    let num_kv_heads = params.packed_heads & 0xFFFFu;\n");
-    src.push_str("    let head_dim = params.head_dim;\n\n");
-
-    src.push_str("    let effective_kv_seq = select(kv_seq, q_seq, kv_seq == 0u);\n");
-    src.push_str("    let valid = t < effective_kv_seq && kv_head < num_kv_heads;\n");
-    src.push_str("    let heads_per_kv = num_heads / max(num_kv_heads, 1u);\n");
-    src.push_str("    let kv_dim = num_kv_heads * head_dim;\n");
-    src.push_str("    let q_dim = num_heads * head_dim;\n");
-    src.push_str("    let kv_base = t * kv_dim + kv_head * head_dim;\n");
-    src.push_str("    let scale = inverseSqrt(f32(head_dim));\n\n");
-
-    for e in 0..ept {
-        let _ = writeln!(src, "    var k{e} = 0.0;");
-        if need_v {
-            let _ = writeln!(src, "    var v{e} = 0.0;");
-        }
-    }
-    src.push_str("    if valid {\n");
-    for e in 0..ept {
-        let _ = writeln!(src, "        k{e} = src_b[kv_base + d_base + {e}u];");
-        if need_v {
-            let _ = writeln!(src, "        v{e} = bias[kv_base + d_base + {e}u];");
-        }
-    }
-    src.push_str("    }\n\n");
-
-    let acc = match kind {
-        FlashKvKind::K => "dk",
-        FlashKvKind::V => "dv",
-    };
-    for e in 0..ept {
-        let _ = writeln!(src, "    var {acc}{e} = 0.0;");
-    }
-    src.push('\n');
-
-    src.push_str("    let start_pos = select(0u, t, kv_seq == 0u);\n");
-    src.push_str("    let window = params.window_size;\n");
-    src.push_str("    let end_pos = select(q_seq, min(q_seq, t + window), window > 0u);\n\n");
-
-    let _ = writeln!(src, "    let first_t = wgid.x * {bkv}u;");
-    let _ = writeln!(
-        src,
-        "    let last_t = min(wgid.x * {bkv}u + {bkv}u - 1u, effective_kv_seq - 1u);"
-    );
-    src.push_str("    let wg_start = select(0u, first_t, kv_seq == 0u);\n");
-    src.push_str("    let wg_end = select(q_seq, min(q_seq, last_t + window), window > 0u);\n\n");
-
-    src.push_str("    for (var pos = wg_start; pos < wg_end; pos++) {\n");
-    src.push_str("        for (var head_rel = 0u; head_rel < heads_per_kv; head_rel++) {\n");
-    src.push_str("            let head = kv_head * heads_per_kv + head_rel;\n");
-    src.push_str("            let q_base = pos * q_dim + head * head_dim;\n\n");
-
-    if tpq == 1 {
-        for e in 0..ept {
-            let _ = writeln!(src, "            let q{e} = src_a[q_base + {e}u];");
-            let _ = writeln!(src, "            let do{e} = d_out[q_base + {e}u];");
-            if need_o {
-                let _ = writeln!(src, "            let o{e} = fwd_dst[q_base + {e}u];");
-            }
-        }
-    } else {
-        let _ = writeln!(src, "            if lid.x < {hd}u {{");
-        src.push_str("                shared_q[lid.x] = src_a[q_base + lid.x];\n");
-        src.push_str("                shared_do[lid.x] = d_out[q_base + lid.x];\n");
-        if need_o {
-            src.push_str("                shared_o[lid.x] = fwd_dst[q_base + lid.x];\n");
-        }
-        src.push_str("            }\n");
-        src.push_str("            workgroupBarrier();\n\n");
-
-        for e in 0..ept {
-            let _ = writeln!(src, "            let q{e} = shared_q[d_base + {e}u];");
-            let _ = writeln!(src, "            let do{e} = shared_do[d_base + {e}u];");
-            if need_o {
-                let _ = writeln!(src, "            let o{e} = shared_o[d_base + {e}u];");
-            }
-        }
-    }
-    src.push_str("            var score_part = 0.0;\n");
-    if kind == FlashKvKind::K {
-        src.push_str("            var rs_part = 0.0;\n");
-        src.push_str("            var dp_part = 0.0;\n");
-    }
-    for e in 0..ept {
-        let _ = writeln!(src, "            score_part += q{e} * k{e};");
-        if kind == FlashKvKind::K {
-            let _ = writeln!(src, "            rs_part += do{e} * o{e};");
-            let _ = writeln!(src, "            dp_part += do{e} * v{e};");
-        }
-    }
-    if tpq > 1 {
-        let _ = writeln!(
-            src,
-            "            wg_score[ki * {tpq}u + lane] = score_part;"
-        );
-        if kind == FlashKvKind::K {
-            let _ = writeln!(src, "            wg_rs[ki * {tpq}u + lane] = rs_part;");
-            let _ = writeln!(src, "            wg_dp[ki * {tpq}u + lane] = dp_part;");
-            src.push_str("            reduce_triple(lid.x);\n");
-        } else {
-            src.push_str("            reduce_score(lid.x);\n");
-        }
-        let _ = writeln!(
-            src,
-            "            let score = wg_score[ki * {tpq}u] * scale;"
-        );
-        if kind == FlashKvKind::K {
-            let _ = writeln!(src, "            let row_sum = wg_rs[ki * {tpq}u];");
-            let _ = writeln!(src, "            let dp_t = wg_dp[ki * {tpq}u];");
-        }
-        src.push('\n');
-    } else {
-        src.push_str("            let score = score_part * scale;\n");
-        if kind == FlashKvKind::K {
-            src.push_str("            let row_sum = rs_part;\n");
-            src.push_str("            let dp_t = dp_part;\n");
-        }
-    }
-    src.push_str("            if valid && pos >= start_pos && pos < end_pos {\n");
-    src.push_str("                let lse_idx = (pos * num_heads + head) * 2u;\n");
-    src.push_str(
-        "                let p_t = exp(min(score - lse[lse_idx], 0.0) - lse[lse_idx + 1u]);\n",
-    );
-    match kind {
-        FlashKvKind::K => {
-            src.push_str("                let ds_t = p_t * (dp_t - row_sum);\n");
-            src.push_str("                let w_dk = ds_t * scale;\n");
-            for e in 0..ept {
-                let _ = writeln!(src, "                dk{e} += w_dk * q{e};");
-            }
-        }
-        FlashKvKind::V => {
-            for e in 0..ept {
-                let _ = writeln!(src, "                dv{e} += p_t * do{e};");
-            }
-        }
-    }
-    src.push_str("            }\n");
-    if tpq > 1 {
-        src.push_str("            workgroupBarrier();\n");
-    }
-    src.push_str("        }\n");
-    src.push_str("    }\n\n");
-
-    src.push_str("    if valid {\n");
-    for e in 0..ept {
-        let _ = writeln!(src, "        dst[kv_base + d_base + {e}u] = {acc}{e};");
-    }
-    src.push_str("    }\n");
-    src.push_str("}\n");
-
-    let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
-        panic!("generated flash grad_{acc} WGSL failed to parse:\n{e}\n---\n{src}")
-    });
-    ShaderModule {
-        module,
-        source: src,
-    }
-}
-
-/// Split flash-attention backward: dK-only kernel.
-///
-/// Loads K, V, Q, dO, O; writes dK. Register pressure ≈ 158 on Blackwell
-/// (RTX 5080, head_dim=64). See [`gen_flash_grad_kv_split_impl`] for the
-/// tradeoff vs the fused `generate_flash_grad_kv_module`.
-pub fn generate_flash_grad_k_module(head_dim: u32) -> ShaderModule {
-    gen_flash_grad_kv_split_impl(head_dim, FlashKvKind::K)
-}
-
-/// Split flash-attention backward: dV-only kernel.
-///
-/// Loads K, Q, dO; writes dV. Register pressure ≈ 109 on Blackwell
-/// (RTX 5080, head_dim=64), unlocking 2 wg/SM. Skips V/O loads and
-/// the row_sum/dp reductions since dV = p · dO needs neither.
-pub fn generate_flash_grad_v_module(head_dim: u32) -> ShaderModule {
-    gen_flash_grad_kv_split_impl(head_dim, FlashKvKind::V)
-}
-
 fn gen_conv2d_gemm_coop() -> ShaderModule {
     let default_config = CoopConfig {
         tile_size: 16,
@@ -3860,199 +3435,6 @@ fn gen_conv2d_grad_input_gemm_coop_3x3() -> ShaderModule {
         use_f16_input: true,
     };
     gen_conv2d_grad_input_gemm_coop_3x3_wgsl(&default_config)
-}
-
-/// Cooperative-matrix conv2d backward grad_input kernel for 3×3
-/// stride-1 convolutions, written in the flash-coop pattern that
-/// delivered the matching 3× wins on attention.
-///
-/// Implicit GEMM: grad_input[Ci, H·W] = weight^T[Ci, K] @ B[K, H·W]
-/// where K = Co · 9 and B is the im2col view of grad_out (computed
-/// inline with the natural 3×3 stride-1 padding-1 index transform).
-///
-/// Workgroup layout (64 threads = 16 Ci-rows × 4 HW-col-blocks):
-///   * One 16×16 output tile per workgroup; tile = (Ci_block, HW_block).
-///   * Each thread owns 4 contiguous output elements in registers
-///     (`local_c[4]` f32) — same per-thread-accumulator pattern that
-///     unblocked the flash backward kernels (a `coop_mat<f32, C>`
-///     accumulator that spans the K-loop hits the naga / shared-mem
-///     race that produces 2× wrong values).
-///   * Per K-tile of 16: cooperatively stage A and B into f16 shared,
-///     run one `coopMultiplyAdd` (A and B operands loaded inside the
-///     loop iteration), `coopStoreT` the C tile to shared, then each
-///     thread accumulates its 4 elements into its register slice.
-///
-/// Caller dispatch must use
-///   `[ceil(in_channels/16), ceil(in_h*in_w/16), batch]`.
-/// Bound to `Conv2dGradInputData` (same as the scalar gemm path).
-pub fn generate_conv2d_grad_input_gemm_coop_v2() -> ShaderModule {
-    use std::fmt::Write;
-    let wg_size: u32 = 64;
-    let tile: u32 = 16;
-    let cols_per_thread: u32 = 4;
-    let rows: u32 = wg_size / cols_per_thread; // 16
-    assert!(rows == tile, "wg=64 / cols_per_thread=4 must give rows=16");
-
-    let mut src = String::new();
-    src.push_str("enable f16;\n");
-    src.push_str("enable wgpu_cooperative_matrix;\n\n");
-    // Same params as Conv2dParams (binding compatible with the scalar
-    // Conv2dGradInputGemm dispatch — runtime fills the inv_* fields).
-    src.push_str(
-        "struct Params {\n    \
-         batch: u32,\n    in_channels: u32,\n    in_h: u32,\n    in_w: u32,\n    \
-         out_channels: u32,\n    kernel_h: u32,\n    kernel_w: u32,\n    stride: u32,\n    \
-         padding_h: u32,\n    out_h: u32,\n    out_w: u32,\n    padding_w: u32,\n    \
-         inv_kernel_w: f32,\n    inv_kernel_hw: f32,\n    inv_col_w: f32,\n    \
-         inv_go_spatial: f32,\n}\n\n",
-    );
-    src.push_str("var<storage> grad_out: array<f32>;\n");
-    src.push_str("var<storage> weight: array<f32>;\n");
-    src.push_str("var<storage, read_write> dst: array<f32>;\n");
-    src.push_str("var<uniform> params: Params;\n\n");
-
-    let _ = writeln!(src, "var<workgroup> shared_a: array<f16, {}>;", tile * tile);
-    let _ = writeln!(src, "var<workgroup> shared_b: array<f16, {}>;", tile * tile);
-    let _ = writeln!(src, "var<workgroup> shared_c: array<f32, {}>;", tile * tile);
-    src.push('\n');
-
-    // Hardcoded 3×3 LUTs — same as the existing Coop3x3 kernel.
-    src.push_str("const KH_LUT = array<u32, 9>(0u, 0u, 0u, 1u, 1u, 1u, 2u, 2u, 2u);\n");
-    src.push_str("const KW_LUT = array<u32, 9>(0u, 1u, 2u, 0u, 1u, 2u, 0u, 1u, 2u);\n\n");
-
-    let _ = writeln!(src, "@compute @workgroup_size({wg_size})");
-    src.push_str("fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n");
-    let _ = writeln!(src, "    let ci_base = wgid.x * {tile}u;");
-    let _ = writeln!(src, "    let hw_base = wgid.y * {tile}u;");
-    src.push_str("    let n = wgid.z;\n");
-    src.push_str("    let m_total = params.in_channels;\n");
-    src.push_str("    let n_total = params.in_h * params.in_w;\n");
-    src.push_str("    let k_total = params.out_channels * 9u;\n");
-    src.push_str("    let go_spatial = params.out_h * params.out_w;\n");
-    // For 3×3 stride-1: pad = kernel_size - 1 - padding = 2 - padding.
-    src.push_str("    let pad_h = 2 - i32(params.padding_h);\n");
-    src.push_str("    let pad_w = 2 - i32(params.padding_w);\n\n");
-
-    // Per-thread (row, col_block) hoisted indices.
-    let _ = writeln!(src, "    let row = lid.x / {cols_per_thread}u;");
-    let _ = writeln!(src, "    let col_block = lid.x % {cols_per_thread}u;");
-    let _ = writeln!(src, "    let col_off = col_block * {cols_per_thread}u;");
-    src.push_str("    let ci = ci_base + row;\n");
-    src.push_str("    let ci_valid = ci < m_total;\n\n");
-
-    // Per-thread C accumulator (registers).
-    let _ = writeln!(src, "    var local_c: array<f32, {cols_per_thread}>;");
-    let _ = writeln!(
-        src,
-        "    for (var e = 0u; e < {cols_per_thread}u; e = e + 1u) {{"
-    );
-    src.push_str("        local_c[e] = 0.0;\n");
-    src.push_str("    }\n\n");
-
-    // K-tile loop. Each thread stages 4 A elements + 4 B elements (256/64 = 4).
-    let _ = writeln!(
-        src,
-        "    for (var k_tile = 0u; k_tile < k_total; k_tile = k_tile + {tile}u) {{"
-    );
-    let _ = writeln!(
-        src,
-        "        for (var e = 0u; e < {cols_per_thread}u; e = e + 1u) {{"
-    );
-    let _ = writeln!(src, "            let idx = lid.x * {cols_per_thread}u + e;");
-    let _ = writeln!(src, "            let r = idx / {tile}u;");
-    let _ = writeln!(src, "            let c = idx % {tile}u;");
-    // ---- Stage A[r, c] = weight^T[ci_base+r, k_tile+c]
-    //                    = weight[(k_tile+c)/9, ci_base+r, kh, kw]
-    src.push_str("            let k_idx = k_tile + c;\n");
-    src.push_str("            let a_ci = ci_base + r;\n");
-    src.push_str("            var a_val = f16(0.0);\n");
-    src.push_str("            if k_idx < k_total && a_ci < m_total {\n");
-    src.push_str("                let co = k_idx / 9u;\n");
-    src.push_str("                let pos = k_idx - co * 9u;\n");
-    src.push_str("                let kh = KH_LUT[pos];\n");
-    src.push_str("                let kw = KW_LUT[pos];\n");
-    src.push_str("                let w_off = (co * m_total + a_ci) * 9u + kh * 3u + kw;\n");
-    src.push_str("                a_val = f16(weight[w_off]);\n");
-    src.push_str("            }\n");
-    let _ = writeln!(src, "            shared_a[idx] = a_val;");
-    // ---- Stage B[r, c] = im2col(grad_out)[k_tile+r, hw_base+c]
-    //   r is K-dim (decompose to co, kh, kw), c is HW-dim.
-    src.push_str("            let kk = k_tile + r;\n");
-    src.push_str("            let hw_idx = hw_base + c;\n");
-    src.push_str("            var b_val = f16(0.0);\n");
-    src.push_str("            if kk < k_total && hw_idx < n_total {\n");
-    src.push_str("                let co = kk / 9u;\n");
-    src.push_str("                let pos = kk - co * 9u;\n");
-    src.push_str("                let kh = KH_LUT[pos];\n");
-    src.push_str("                let kw = KW_LUT[pos];\n");
-    src.push_str("                let ih = u32(f32(hw_idx) * params.inv_col_w);\n");
-    src.push_str("                let iw = hw_idx - ih * params.in_w;\n");
-    src.push_str("                let oh = i32(ih) + pad_h - i32(kh);\n");
-    src.push_str("                let ow = i32(iw) + pad_w - i32(kw);\n");
-    src.push_str(
-        "                if oh >= 0 && u32(oh) < params.out_h && ow >= 0 && u32(ow) < params.out_w {\n",
-    );
-    src.push_str(
-        "                    let g_off = n * params.out_channels * go_spatial + co * go_spatial + u32(oh) * params.out_w + u32(ow);\n",
-    );
-    src.push_str("                    b_val = f16(grad_out[g_off]);\n");
-    src.push_str("                }\n");
-    src.push_str("            }\n");
-    let _ = writeln!(src, "            shared_b[idx] = b_val;");
-    src.push_str("        }\n");
-    src.push_str("        workgroupBarrier();\n\n");
-
-    // Coop MMA — accumulator declared inside the loop iter so it
-    // doesn't span the loop.
-    src.push_str("        var c_acc = coop_mat16x16<f32,C>();\n");
-    let _ = writeln!(
-        src,
-        "        let a_op = coopLoadT<coop_mat16x16<f16,A>>(&shared_a[0], {tile}u);"
-    );
-    let _ = writeln!(
-        src,
-        "        let b_op = coopLoadT<coop_mat16x16<f16,B>>(&shared_b[0], {tile}u);"
-    );
-    src.push_str("        c_acc = coopMultiplyAdd(a_op, b_op, c_acc);\n");
-    let _ = writeln!(src, "        coopStoreT(c_acc, &shared_c[0], {tile}u);");
-    src.push_str("        workgroupBarrier();\n\n");
-
-    // Per-thread scalar accumulate of 4 elements from shared_c.
-    let _ = writeln!(
-        src,
-        "        for (var e = 0u; e < {cols_per_thread}u; e = e + 1u) {{"
-    );
-    let _ = writeln!(
-        src,
-        "            local_c[e] = local_c[e] + shared_c[row * {tile}u + col_off + e];"
-    );
-    src.push_str("        }\n");
-    src.push_str("        workgroupBarrier();\n");
-    src.push_str("    }\n\n");
-
-    // Final write — guard both ci and hw bounds.
-    src.push_str("    if ci_valid {\n");
-    src.push_str(
-        "        let dst_base = n * m_total * n_total + ci * n_total + hw_base + col_off;\n",
-    );
-    let _ = writeln!(
-        src,
-        "        for (var e = 0u; e < {cols_per_thread}u; e = e + 1u) {{"
-    );
-    src.push_str("            if hw_base + col_off + e < n_total {\n");
-    src.push_str("                dst[dst_base + e] = local_c[e];\n");
-    src.push_str("            }\n");
-    src.push_str("        }\n");
-    src.push_str("    }\n");
-    src.push_str("}\n");
-
-    let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
-        panic!("generated conv2d grad_input coop_v2 WGSL failed to parse:\n{e}\n---\n{src}")
-    });
-    ShaderModule {
-        module,
-        source: src,
-    }
 }
 
 fn gen_conv2d_grad_input_gemm_coop_3x3_wgsl(config: &CoopConfig) -> ShaderModule {
@@ -4935,11 +4317,6 @@ mod tests {
                 naga::valid::Capabilities::COOPERATIVE_MATRIX
                     | naga::valid::Capabilities::SHADER_FLOAT16,
             ),
-            (
-                ShaderGroup::Conv2dGradInputGemmCoopV2,
-                naga::valid::Capabilities::COOPERATIVE_MATRIX
-                    | naga::valid::Capabilities::SHADER_FLOAT16,
-            ),
             (ShaderGroup::Reduce, naga::valid::Capabilities::empty()),
             (ShaderGroup::Softmax, naga::valid::Capabilities::empty()),
             (
@@ -4988,8 +4365,6 @@ mod tests {
                 naga::valid::Capabilities::empty(),
             ),
             (ShaderGroup::FlashGradKV, naga::valid::Capabilities::empty()),
-            (ShaderGroup::FlashGradK, naga::valid::Capabilities::empty()),
-            (ShaderGroup::FlashGradV, naga::valid::Capabilities::empty()),
             (
                 ShaderGroup::MultiHeadAttnGradV,
                 naga::valid::Capabilities::empty(),
@@ -5169,7 +4544,6 @@ mod tests {
                     | ShaderGroup::Conv2dGemmCoop
                     | ShaderGroup::Conv2dGradInputGemmCoop
                     | ShaderGroup::Conv2dGradInputGemmCoop3x3
-                    | ShaderGroup::Conv2dGradInputGemmCoopV2
             ) {
                 continue;
             }
@@ -5279,9 +4653,7 @@ mod tests {
                 | ShaderEntry::FlashGradQ
                 | ShaderEntry::FlashGradQCoop
                 | ShaderEntry::MultiHeadAttnGradK
-                | ShaderEntry::FlashGradK
-                | ShaderEntry::MultiHeadAttnGradV
-                | ShaderEntry::FlashGradV => {
+                | ShaderEntry::MultiHeadAttnGradV => {
                     vec![
                         "d_out", "src_a", "src_b", "bias", "lse", "fwd_dst", "dst", "params",
                     ]
@@ -5340,7 +4712,6 @@ mod tests {
                 }
                 ShaderEntry::Conv2dGradInputGemmCoop
                 | ShaderEntry::Conv2dGradInputGemmCoop3x3
-                | ShaderEntry::Conv2dGradInputGemmCoopV2
                 | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => {
                     vec!["grad_out", "weight", "dst", "params"]
                 }
@@ -5407,8 +4778,6 @@ mod tests {
             ShaderEntry::MultiHeadAttnGradK,
             ShaderEntry::MultiHeadAttnGradKV,
             ShaderEntry::FlashGradKV,
-            ShaderEntry::FlashGradK,
-            ShaderEntry::FlashGradV,
             ShaderEntry::MultiHeadAttnGradV,
             ShaderEntry::SwiGLUGradGate,
             ShaderEntry::SwiGLUGradUp,
@@ -5439,7 +4808,6 @@ mod tests {
             ShaderEntry::Conv2dGradInput,
             ShaderEntry::Conv2dGradInputGemm,
             ShaderEntry::Conv2dGradInputGemmSmall,
-            ShaderEntry::Conv2dGradInputGemmCoopV2,
             ShaderEntry::Conv2dGradWeight,
             ShaderEntry::WinogradInputTransform,
             ShaderEntry::WinogradOutputTransform,
