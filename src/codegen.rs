@@ -360,6 +360,10 @@ pub enum ShaderGroup {
     Conv2dGradInputGemmSmall,
     Conv2dGradInputGemmCoop,
     Conv2dGradInputGemmCoop3x3,
+    /// Cooperative-matrix conv2d backward grad_input — flash-coop
+    /// pattern (16x16 tile, per-thread register accumulator). Opt-in
+    /// via `MEGANEURA_CONV_COOP_V2=1`.
+    Conv2dGradInputGemmCoopV2,
     GroupNormSilu,
     WinogradInputTransform,
     WinogradOutputTransform,
@@ -466,6 +470,7 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::Conv2dGemmCoop => gen_conv2d_gemm_coop(),
         ShaderGroup::Conv2dGradInputGemmCoop => gen_conv2d_grad_input_gemm_coop(),
         ShaderGroup::Conv2dGradInputGemmCoop3x3 => gen_conv2d_grad_input_gemm_coop_3x3(),
+        ShaderGroup::Conv2dGradInputGemmCoopV2 => generate_conv2d_grad_input_gemm_coop_v2(),
         ShaderGroup::GroupNormSilu => parse_wgsl(include_str!("shaders/group_norm_silu.wgsl")),
         ShaderGroup::WinogradInputTransform => {
             parse_wgsl(include_str!("shaders/winograd_input_transform.wgsl"))
@@ -509,6 +514,7 @@ pub fn generate_coop_module(group: ShaderGroup, config: &CoopConfig) -> ShaderMo
         ShaderGroup::Conv2dGemmCoop => gen_conv2d_gemm_coop_wgsl(config),
         ShaderGroup::Conv2dGradInputGemmCoop => gen_conv2d_grad_input_gemm_coop_wgsl(config),
         ShaderGroup::Conv2dGradInputGemmCoop3x3 => gen_conv2d_grad_input_gemm_coop_3x3_wgsl(config),
+        ShaderGroup::Conv2dGradInputGemmCoopV2 => generate_conv2d_grad_input_gemm_coop_v2(),
         ShaderGroup::FusedRmsNormMatMulCoop => gen_fused_rms_norm_matmul_coop_wgsl(config),
         _ => panic!("not a coop shader group: {:?}", group),
     }
@@ -524,6 +530,7 @@ pub fn generate_wgsl(group: ShaderGroup) -> String {
         | ShaderGroup::Conv2dGemmCoop
         | ShaderGroup::Conv2dGradInputGemmCoop
         | ShaderGroup::Conv2dGradInputGemmCoop3x3
+        | ShaderGroup::Conv2dGradInputGemmCoopV2
         | ShaderGroup::MatMulCoopBT
         | ShaderGroup::FusedRmsNormMatMulCoop => {
             naga::valid::Capabilities::COOPERATIVE_MATRIX
@@ -3855,6 +3862,199 @@ fn gen_conv2d_grad_input_gemm_coop_3x3() -> ShaderModule {
     gen_conv2d_grad_input_gemm_coop_3x3_wgsl(&default_config)
 }
 
+/// Cooperative-matrix conv2d backward grad_input kernel for 3×3
+/// stride-1 convolutions, written in the flash-coop pattern that
+/// delivered the matching 3× wins on attention.
+///
+/// Implicit GEMM: grad_input[Ci, H·W] = weight^T[Ci, K] @ B[K, H·W]
+/// where K = Co · 9 and B is the im2col view of grad_out (computed
+/// inline with the natural 3×3 stride-1 padding-1 index transform).
+///
+/// Workgroup layout (64 threads = 16 Ci-rows × 4 HW-col-blocks):
+///   * One 16×16 output tile per workgroup; tile = (Ci_block, HW_block).
+///   * Each thread owns 4 contiguous output elements in registers
+///     (`local_c[4]` f32) — same per-thread-accumulator pattern that
+///     unblocked the flash backward kernels (a `coop_mat<f32, C>`
+///     accumulator that spans the K-loop hits the naga / shared-mem
+///     race that produces 2× wrong values).
+///   * Per K-tile of 16: cooperatively stage A and B into f16 shared,
+///     run one `coopMultiplyAdd` (A and B operands loaded inside the
+///     loop iteration), `coopStoreT` the C tile to shared, then each
+///     thread accumulates its 4 elements into its register slice.
+///
+/// Caller dispatch must use
+///   `[ceil(in_channels/16), ceil(in_h*in_w/16), batch]`.
+/// Bound to `Conv2dGradInputData` (same as the scalar gemm path).
+pub fn generate_conv2d_grad_input_gemm_coop_v2() -> ShaderModule {
+    use std::fmt::Write;
+    let wg_size: u32 = 64;
+    let tile: u32 = 16;
+    let cols_per_thread: u32 = 4;
+    let rows: u32 = wg_size / cols_per_thread; // 16
+    assert!(rows == tile, "wg=64 / cols_per_thread=4 must give rows=16");
+
+    let mut src = String::new();
+    src.push_str("enable f16;\n");
+    src.push_str("enable wgpu_cooperative_matrix;\n\n");
+    // Same params as Conv2dParams (binding compatible with the scalar
+    // Conv2dGradInputGemm dispatch — runtime fills the inv_* fields).
+    src.push_str(
+        "struct Params {\n    \
+         batch: u32,\n    in_channels: u32,\n    in_h: u32,\n    in_w: u32,\n    \
+         out_channels: u32,\n    kernel_h: u32,\n    kernel_w: u32,\n    stride: u32,\n    \
+         padding_h: u32,\n    out_h: u32,\n    out_w: u32,\n    padding_w: u32,\n    \
+         inv_kernel_w: f32,\n    inv_kernel_hw: f32,\n    inv_col_w: f32,\n    \
+         inv_go_spatial: f32,\n}\n\n",
+    );
+    src.push_str("var<storage> grad_out: array<f32>;\n");
+    src.push_str("var<storage> weight: array<f32>;\n");
+    src.push_str("var<storage, read_write> dst: array<f32>;\n");
+    src.push_str("var<uniform> params: Params;\n\n");
+
+    let _ = writeln!(src, "var<workgroup> shared_a: array<f16, {}>;", tile * tile);
+    let _ = writeln!(src, "var<workgroup> shared_b: array<f16, {}>;", tile * tile);
+    let _ = writeln!(src, "var<workgroup> shared_c: array<f32, {}>;", tile * tile);
+    src.push('\n');
+
+    // Hardcoded 3×3 LUTs — same as the existing Coop3x3 kernel.
+    src.push_str("const KH_LUT = array<u32, 9>(0u, 0u, 0u, 1u, 1u, 1u, 2u, 2u, 2u);\n");
+    src.push_str("const KW_LUT = array<u32, 9>(0u, 1u, 2u, 0u, 1u, 2u, 0u, 1u, 2u);\n\n");
+
+    let _ = writeln!(src, "@compute @workgroup_size({wg_size})");
+    src.push_str("fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n");
+    let _ = writeln!(src, "    let ci_base = wgid.x * {tile}u;");
+    let _ = writeln!(src, "    let hw_base = wgid.y * {tile}u;");
+    src.push_str("    let n = wgid.z;\n");
+    src.push_str("    let m_total = params.in_channels;\n");
+    src.push_str("    let n_total = params.in_h * params.in_w;\n");
+    src.push_str("    let k_total = params.out_channels * 9u;\n");
+    src.push_str("    let go_spatial = params.out_h * params.out_w;\n");
+    // For 3×3 stride-1: pad = kernel_size - 1 - padding = 2 - padding.
+    src.push_str("    let pad_h = 2 - i32(params.padding_h);\n");
+    src.push_str("    let pad_w = 2 - i32(params.padding_w);\n\n");
+
+    // Per-thread (row, col_block) hoisted indices.
+    let _ = writeln!(src, "    let row = lid.x / {cols_per_thread}u;");
+    let _ = writeln!(src, "    let col_block = lid.x % {cols_per_thread}u;");
+    let _ = writeln!(src, "    let col_off = col_block * {cols_per_thread}u;");
+    src.push_str("    let ci = ci_base + row;\n");
+    src.push_str("    let ci_valid = ci < m_total;\n\n");
+
+    // Per-thread C accumulator (registers).
+    let _ = writeln!(src, "    var local_c: array<f32, {cols_per_thread}>;");
+    let _ = writeln!(
+        src,
+        "    for (var e = 0u; e < {cols_per_thread}u; e = e + 1u) {{"
+    );
+    src.push_str("        local_c[e] = 0.0;\n");
+    src.push_str("    }\n\n");
+
+    // K-tile loop. Each thread stages 4 A elements + 4 B elements (256/64 = 4).
+    let _ = writeln!(
+        src,
+        "    for (var k_tile = 0u; k_tile < k_total; k_tile = k_tile + {tile}u) {{"
+    );
+    let _ = writeln!(
+        src,
+        "        for (var e = 0u; e < {cols_per_thread}u; e = e + 1u) {{"
+    );
+    let _ = writeln!(src, "            let idx = lid.x * {cols_per_thread}u + e;");
+    let _ = writeln!(src, "            let r = idx / {tile}u;");
+    let _ = writeln!(src, "            let c = idx % {tile}u;");
+    // ---- Stage A[r, c] = weight^T[ci_base+r, k_tile+c]
+    //                    = weight[(k_tile+c)/9, ci_base+r, kh, kw]
+    src.push_str("            let k_idx = k_tile + c;\n");
+    src.push_str("            let a_ci = ci_base + r;\n");
+    src.push_str("            var a_val = f16(0.0);\n");
+    src.push_str("            if k_idx < k_total && a_ci < m_total {\n");
+    src.push_str("                let co = k_idx / 9u;\n");
+    src.push_str("                let pos = k_idx - co * 9u;\n");
+    src.push_str("                let kh = KH_LUT[pos];\n");
+    src.push_str("                let kw = KW_LUT[pos];\n");
+    src.push_str("                let w_off = (co * m_total + a_ci) * 9u + kh * 3u + kw;\n");
+    src.push_str("                a_val = f16(weight[w_off]);\n");
+    src.push_str("            }\n");
+    let _ = writeln!(src, "            shared_a[idx] = a_val;");
+    // ---- Stage B[r, c] = im2col(grad_out)[k_tile+r, hw_base+c]
+    //   r is K-dim (decompose to co, kh, kw), c is HW-dim.
+    src.push_str("            let kk = k_tile + r;\n");
+    src.push_str("            let hw_idx = hw_base + c;\n");
+    src.push_str("            var b_val = f16(0.0);\n");
+    src.push_str("            if kk < k_total && hw_idx < n_total {\n");
+    src.push_str("                let co = kk / 9u;\n");
+    src.push_str("                let pos = kk - co * 9u;\n");
+    src.push_str("                let kh = KH_LUT[pos];\n");
+    src.push_str("                let kw = KW_LUT[pos];\n");
+    src.push_str("                let ih = u32(f32(hw_idx) * params.inv_col_w);\n");
+    src.push_str("                let iw = hw_idx - ih * params.in_w;\n");
+    src.push_str("                let oh = i32(ih) + pad_h - i32(kh);\n");
+    src.push_str("                let ow = i32(iw) + pad_w - i32(kw);\n");
+    src.push_str(
+        "                if oh >= 0 && u32(oh) < params.out_h && ow >= 0 && u32(ow) < params.out_w {\n",
+    );
+    src.push_str(
+        "                    let g_off = n * params.out_channels * go_spatial + co * go_spatial + u32(oh) * params.out_w + u32(ow);\n",
+    );
+    src.push_str("                    b_val = f16(grad_out[g_off]);\n");
+    src.push_str("                }\n");
+    src.push_str("            }\n");
+    let _ = writeln!(src, "            shared_b[idx] = b_val;");
+    src.push_str("        }\n");
+    src.push_str("        workgroupBarrier();\n\n");
+
+    // Coop MMA — accumulator declared inside the loop iter so it
+    // doesn't span the loop.
+    src.push_str("        var c_acc = coop_mat16x16<f32,C>();\n");
+    let _ = writeln!(
+        src,
+        "        let a_op = coopLoadT<coop_mat16x16<f16,A>>(&shared_a[0], {tile}u);"
+    );
+    let _ = writeln!(
+        src,
+        "        let b_op = coopLoadT<coop_mat16x16<f16,B>>(&shared_b[0], {tile}u);"
+    );
+    src.push_str("        c_acc = coopMultiplyAdd(a_op, b_op, c_acc);\n");
+    let _ = writeln!(src, "        coopStoreT(c_acc, &shared_c[0], {tile}u);");
+    src.push_str("        workgroupBarrier();\n\n");
+
+    // Per-thread scalar accumulate of 4 elements from shared_c.
+    let _ = writeln!(
+        src,
+        "        for (var e = 0u; e < {cols_per_thread}u; e = e + 1u) {{"
+    );
+    let _ = writeln!(
+        src,
+        "            local_c[e] = local_c[e] + shared_c[row * {tile}u + col_off + e];"
+    );
+    src.push_str("        }\n");
+    src.push_str("        workgroupBarrier();\n");
+    src.push_str("    }\n\n");
+
+    // Final write — guard both ci and hw bounds.
+    src.push_str("    if ci_valid {\n");
+    src.push_str(
+        "        let dst_base = n * m_total * n_total + ci * n_total + hw_base + col_off;\n",
+    );
+    let _ = writeln!(
+        src,
+        "        for (var e = 0u; e < {cols_per_thread}u; e = e + 1u) {{"
+    );
+    src.push_str("            if hw_base + col_off + e < n_total {\n");
+    src.push_str("                dst[dst_base + e] = local_c[e];\n");
+    src.push_str("            }\n");
+    src.push_str("        }\n");
+    src.push_str("    }\n");
+    src.push_str("}\n");
+
+    let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
+        panic!("generated conv2d grad_input coop_v2 WGSL failed to parse:\n{e}\n---\n{src}")
+    });
+    ShaderModule {
+        module,
+        source: src,
+    }
+}
+
 fn gen_conv2d_grad_input_gemm_coop_3x3_wgsl(config: &CoopConfig) -> ShaderModule {
     let tile = config.tile_size;
     let output_tile = config.output_tile();
@@ -4735,6 +4935,11 @@ mod tests {
                 naga::valid::Capabilities::COOPERATIVE_MATRIX
                     | naga::valid::Capabilities::SHADER_FLOAT16,
             ),
+            (
+                ShaderGroup::Conv2dGradInputGemmCoopV2,
+                naga::valid::Capabilities::COOPERATIVE_MATRIX
+                    | naga::valid::Capabilities::SHADER_FLOAT16,
+            ),
             (ShaderGroup::Reduce, naga::valid::Capabilities::empty()),
             (ShaderGroup::Softmax, naga::valid::Capabilities::empty()),
             (
@@ -4964,6 +5169,7 @@ mod tests {
                     | ShaderGroup::Conv2dGemmCoop
                     | ShaderGroup::Conv2dGradInputGemmCoop
                     | ShaderGroup::Conv2dGradInputGemmCoop3x3
+                    | ShaderGroup::Conv2dGradInputGemmCoopV2
             ) {
                 continue;
             }
@@ -5134,6 +5340,7 @@ mod tests {
                 }
                 ShaderEntry::Conv2dGradInputGemmCoop
                 | ShaderEntry::Conv2dGradInputGemmCoop3x3
+                | ShaderEntry::Conv2dGradInputGemmCoopV2
                 | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => {
                     vec!["grad_out", "weight", "dst", "params"]
                 }
@@ -5232,6 +5439,7 @@ mod tests {
             ShaderEntry::Conv2dGradInput,
             ShaderEntry::Conv2dGradInputGemm,
             ShaderEntry::Conv2dGradInputGemmSmall,
+            ShaderEntry::Conv2dGradInputGemmCoopV2,
             ShaderEntry::Conv2dGradWeight,
             ShaderEntry::WinogradInputTransform,
             ShaderEntry::WinogradOutputTransform,
