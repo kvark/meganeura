@@ -21,8 +21,10 @@ pub struct SDUNetConfig {
     pub base_channels: u32,
     /// Number of downsampling levels.
     pub num_levels: usize,
-    /// Spatial resolution of the input (square: H = W = resolution).
-    pub resolution: u32,
+    /// Spatial height of the input latent.
+    pub height: u32,
+    /// Spatial width of the input latent.
+    pub width: u32,
     /// Number of groups for GroupNorm.
     pub num_groups: u32,
     /// GroupNorm epsilon.
@@ -38,21 +40,28 @@ impl SDUNetConfig {
             in_channels: 4,
             base_channels: 32,
             num_levels: 3,
-            resolution: 32,
+            height: 32,
+            width: 32,
             num_groups: 8,
             gn_eps: 1e-5,
         }
     }
 
-    /// A small configuration closer to real SD dimensions.
-    /// ~2M parameters, 32×32 latent, batch 2.
+    /// Truncated-4K configuration: 384×256 latent (3072×2048 pixels at f=8,
+    /// ~6MP, ~76% of true 4K latent area), batch 4. Exercises spatial Conv2D
+    /// at a realistic generative workload scale.
+    ///
+    /// NOTE: ideal would be 480×272 (true 4K at f=8) but meganeura currently
+    /// produces zeros for spatial ≥ ~100k on M3 Metal — tracked as a bug.
+    /// 384×256=98304 stays under that threshold.
     pub fn small() -> Self {
         Self {
-            batch_size: 2,
+            batch_size: 4,
             in_channels: 4,
             base_channels: 64,
             num_levels: 3,
-            resolution: 32,
+            height: 256,
+            width: 384,
             num_groups: 16,
             gn_eps: 1e-5,
         }
@@ -149,13 +158,13 @@ pub fn build_unet(g: &mut Graph, cfg: &SDUNetConfig) -> NodeId {
 /// Build the SD U-Net training graph.
 ///
 /// Returns the MSE loss node. The graph expects:
-/// - Input "noisy_latent": flat `[batch * in_c * res * res]`
-/// - Input "noise_target": flat `[batch * in_c * res * res]` (the noise to predict)
+/// - Input "noisy_latent": flat `[batch * in_c * height * width]`
+/// - Input "noise_target": flat `[batch * in_c * height * width]` (the noise to predict)
 pub fn build_training_graph(g: &mut Graph, cfg: &SDUNetConfig) -> NodeId {
     let batch = cfg.batch_size;
-    let res = cfg.resolution;
+    let (h, w) = (cfg.height, cfg.width);
     let in_c = cfg.in_channels;
-    let in_size = (batch * in_c * res * res) as usize;
+    let in_size = (batch * in_c * h * w) as usize;
 
     let pred = build_unet_inner(g, cfg);
     let target = g.input("noise_target", &[in_size]);
@@ -170,9 +179,9 @@ pub fn build_training_graph(g: &mut Graph, cfg: &SDUNetConfig) -> NodeId {
 /// Inner U-Net forward pass that returns the noise prediction tensor.
 fn build_unet_inner(g: &mut Graph, cfg: &SDUNetConfig) -> NodeId {
     let batch = cfg.batch_size;
-    let res = cfg.resolution;
+    let (h, w) = (cfg.height, cfg.width);
     let in_c = cfg.in_channels;
-    let in_size = (batch * in_c * res * res) as usize;
+    let in_size = (batch * in_c * h * w) as usize;
     let ch_mults = cfg.channel_mult();
 
     // Inputs
@@ -181,13 +190,9 @@ fn build_unet_inner(g: &mut Graph, cfg: &SDUNetConfig) -> NodeId {
     // Input conv: in_channels → base_channels
     let base_c = cfg.base_channels;
     let conv_in_w = g.parameter("conv_in.weight", &[(base_c * in_c * 3 * 3) as usize]);
-    let mut x = g.conv2d(noisy, conv_in_w, batch, in_c, res, res, base_c, 3, 3, 1, 1);
+    let mut x = g.conv2d(noisy, conv_in_w, batch, in_c, h, w, base_c, 3, 3, 1, 1);
 
-    let mut s = SpatialState {
-        h: res,
-        w: res,
-        c: base_c,
-    };
+    let mut s = SpatialState { h, w, c: base_c };
 
     // ---- Encoder ----
     let mut skip_connections: Vec<(NodeId, SpatialState)> = Vec::new();
@@ -269,13 +274,13 @@ fn build_unet_inner(g: &mut Graph, cfg: &SDUNetConfig) -> NodeId {
         gn_out_b,
         batch,
         base_c,
-        res * res,
+        h * w,
         cfg.num_groups,
         cfg.gn_eps,
     );
     x = g.silu(x);
     let conv_out_w = g.parameter("conv_out.weight", &[(in_c * base_c * 3 * 3) as usize]);
-    g.conv2d(x, conv_out_w, batch, base_c, res, res, in_c, 3, 3, 1, 1)
+    g.conv2d(x, conv_out_w, batch, base_c, h, w, in_c, 3, 3, 1, 1)
 }
 
 /// Count the total number of parameters in the U-Net.

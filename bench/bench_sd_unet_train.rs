@@ -30,8 +30,8 @@ fn main() {
 
     let batch = cfg.batch_size;
     let in_c = cfg.in_channels;
-    let res = cfg.resolution;
-    let in_size = (batch * in_c * res * res) as usize;
+    let (h, w) = (cfg.height, cfg.width);
+    let in_size = (batch * in_c * h * w) as usize;
     let lr = 1e-3_f32;
 
     let num_params = sd_unet::count_params(&cfg);
@@ -39,7 +39,7 @@ fn main() {
     eprintln!("=== SD U-Net Training Benchmark ===");
     eprintln!(
         "config:     {} ({}x{} latent, batch {}, {} levels, base_ch={})",
-        config_name, res, res, batch, cfg.num_levels, cfg.base_channels,
+        config_name, h, w, batch, cfg.num_levels, cfg.base_channels,
     );
     eprintln!(
         "parameters: {} ({:.2} MB)",
@@ -180,7 +180,7 @@ fn main() {
     println!("  \"device\": \"{} ({})\",", device_name, driver_name);
     println!("  \"parameters\": {},", num_params);
     println!("  \"batch_size\": {},", batch);
-    println!("  \"resolution\": {},", res);
+    println!("  \"resolution\": \"{}x{}\",", h, w);
     println!("  \"compile_time_s\": {:.2},", compile_time.as_secs_f64());
     println!("  \"train_step_avg_ms\": {:.2},", step_avg_ms);
     println!("  \"train_step_median_ms\": {:.2},", step_median_ms);

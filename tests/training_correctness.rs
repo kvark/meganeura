@@ -324,12 +324,12 @@ fn sd_unet_training_loss_decreases() {
     let config = SDUNetConfig::tiny();
     let batch = config.batch_size;
     let in_c = config.in_channels;
-    let res = config.resolution;
-    let in_size = (batch * in_c * res * res) as usize;
+    let (h, w) = (config.height, config.width);
+    let in_size = (batch * in_c * h * w) as usize;
 
     eprintln!(
-        "SD U-Net training test: batch={}, res={}, in_c={}",
-        batch, res, in_c
+        "SD U-Net training test: batch={}, {}x{}, in_c={}",
+        batch, h, w, in_c
     );
     let mut g = Graph::new();
     let loss = sd_unet::build_training_graph(&mut g, &config);

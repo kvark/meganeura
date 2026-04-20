@@ -45,9 +45,27 @@ pub struct ShaderModule {
     pub source: String,
 }
 
+/// Dump WGSL source to `$MEGANEURA_DUMP_WGSL` if set (for debugging/inspection).
+fn maybe_dump_wgsl(source: &str, hint: &str) {
+    if let Ok(dir) = std::env::var("MEGANEURA_DUMP_WGSL") {
+        let _ = std::fs::create_dir_all(&dir);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(source, &mut hasher);
+        let h = std::hash::Hasher::finish(&hasher);
+        let path = std::path::Path::new(&dir).join(format!("{hint}_{h:x}.wgsl"));
+        let _ = std::fs::write(path, source);
+    }
+}
+
 /// Parse a WGSL source string into a [`ShaderModule`].
 fn parse_wgsl(source: &str) -> ShaderModule {
     let module = naga::front::wgsl::parse_str(source).expect("WGSL parse failed");
+    let entry = module
+        .entry_points
+        .first()
+        .map(|e| e.name.as_str())
+        .unwrap_or("shader");
+    maybe_dump_wgsl(source, entry);
     ShaderModule {
         module,
         source: source.to_string(),
@@ -137,25 +155,60 @@ pub fn matmul_epilogue_to_wgsl(epi: &crate::compile::MatMulEpilogue) -> (String,
 /// Generate WGSL for a [`MatMulPrologue`] — the multiplicative factors
 /// applied during A-tile staging in the coop matmul.
 ///
-/// Returns `(declarations, transform_expression)` where:
-///   - `declarations` = `var<storage>` lines for prologue buffers.
-///   - `transform_expression` = expression suffix like `* buf_0[gr] * buf_1[tc]`.
-pub fn matmul_prologue_to_wgsl(prologue: &crate::compile::MatMulPrologue) -> (String, String) {
+/// Returns `(declarations, cache_decl, cache_init, transform_expression)`:
+///   - `declarations` — `var<storage>` lines for prologue buffers (global).
+///   - `cache_decl` — `var<workgroup>` lines for per-row caches (if any).
+///   - `cache_init` — WG-entry code that reads PerRow factors into shared
+///     memory, ending with a barrier. Empty when no PerRow factor exists.
+///   - `transform_expression` — expression suffix. PerRow factors read from
+///     shared cache (cheap); PerKCol stay global.
+///
+/// Caching PerRow factors eliminates the per-A-element global read that
+/// caused the previous fused-prologue attempt to regress TTFT ~40%.
+pub fn matmul_prologue_to_wgsl(
+    prologue: &crate::compile::MatMulPrologue,
+    output_tile: u32,
+) -> (String, String, String, String) {
     use crate::compile::PrologueLoadKind;
 
     let mut decls = Vec::new();
+    let mut cache_decls = Vec::new();
+    let mut cache_inits = Vec::new();
     let mut expr = String::new();
+    let mut has_per_row = false;
     #[allow(clippy::pattern_type_mismatch)]
     for (i, (_, kind)) in prologue.factors.iter().enumerate() {
-        let name = format!("prologue_buf_{}", i);
-        decls.push(format!("var<storage> {}: array<f32>;", name));
-        let idx = match *kind {
-            PrologueLoadKind::PerRow => "gr",
-            PrologueLoadKind::PerKCol => "tc",
-        };
-        expr.push_str(&format!(" * {}[{}]", name, idx));
+        let buf_name = format!("prologue_buf_{}", i);
+        decls.push(format!("var<storage> {}: array<f32>;", buf_name));
+        match *kind {
+            PrologueLoadKind::PerRow => {
+                has_per_row = true;
+                let cache_name = format!("prologue_cache_{}", i);
+                cache_decls.push(format!(
+                    "var<workgroup> {cache_name}: array<f32, {output_tile}>;"
+                ));
+                // Each thread in 0..output_tile loads one entry. For output_tile
+                // ≤ 64 (wg_size), this is one load per thread max.
+                cache_inits.push(format!(
+                    "    if lid.x < {output_tile}u {{\n\
+                     \x20       let gr = tile_row + lid.x;\n\
+                     \x20       {cache_name}[lid.x] = select(0.0, {buf_name}[gr], gr < m);\n\
+                     \x20   }}"
+                ));
+                // Access: use shared cache with row index relative to tile_row.
+                expr.push_str(&format!(" * {cache_name}[gr - tile_row]"));
+            }
+            PrologueLoadKind::PerKCol => {
+                expr.push_str(&format!(" * {buf_name}[tc]"));
+            }
+        }
     }
-    (decls.join("\n"), expr)
+    let cache_init = if has_per_row {
+        format!("{}\n    workgroupBarrier();", cache_inits.join("\n"))
+    } else {
+        String::new()
+    };
+    (decls.join("\n"), cache_decls.join("\n"), cache_init, expr)
 }
 
 /// Generate a matmul shader module with a fused epilogue chain.
@@ -909,9 +962,9 @@ fn gen_matmul_coop_wgsl_prologue(
     let coop_ba = format!("coop_mat{}x{}<{},B>", tile, tile, ab_type);
     let coop_c = format!("coop_mat{}x{}<f32,C>", tile, tile);
 
-    let (prologue_decl, a_transform) = match prologue {
-        Some(p) => matmul_prologue_to_wgsl(p),
-        None => (String::new(), String::new()),
+    let (prologue_decl, prologue_cache_decl, prologue_cache_init, a_transform) = match prologue {
+        Some(p) => matmul_prologue_to_wgsl(p, output_tile),
+        None => (String::new(), String::new(), String::new(), String::new()),
     };
 
     // Vec4 staging: use 128-bit loads when tile is 16+ (64 threads × 4 = 256 = 16×16).
@@ -1225,6 +1278,8 @@ fn gen_matmul_coop_wgsl_prologue(
             ("$A_STAGE_0", &a_stage_0),
             ("$A_STAGE_1", &a_stage_1),
             ("$PROLOGUE_DECL", &prologue_decl),
+            ("$PROLOGUE_CACHE_DECL", &prologue_cache_decl),
+            ("$PROLOGUE_CACHE_INIT", &prologue_cache_init),
             ("$FUSED_ADD_DECL", &fused_decl),
             ("$ACC_INIT", &acc_init),
         ],
@@ -1410,6 +1465,7 @@ pub fn generate_attention_module(head_dim: u32) -> ShaderModule {
     src.push_str("    }\n");
     src.push_str("}\n");
 
+    maybe_dump_wgsl(&src, "attention");
     let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
         panic!(
             "generated unified attention WGSL failed to parse:\n{}\n---\n{}",
@@ -1758,6 +1814,7 @@ pub fn generate_flash_attention_module(head_dim: u32) -> ShaderModule {
     src.push_str("    }\n");
     src.push_str("}\n");
 
+    maybe_dump_wgsl(&src, "flash_attention");
     let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
         panic!(
             "generated flash attention WGSL failed to parse:\n{}\n---\n{}",
@@ -3066,6 +3123,7 @@ pub fn generate_flash_grad_q_module(head_dim: u32) -> ShaderModule {
     src.push_str("    }\n");
     src.push_str("}\n");
 
+    maybe_dump_wgsl(&src, "flash_grad_q");
     let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
         panic!(
             "generated flash grad_q WGSL failed to parse:\n{}\n---\n{}",
@@ -3283,6 +3341,7 @@ pub fn generate_flash_grad_kv_module(head_dim: u32) -> ShaderModule {
     src.push_str("    }\n");
     src.push_str("}\n");
 
+    maybe_dump_wgsl(&src, "flash_grad_kv");
     let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
         panic!(
             "generated flash grad_kv WGSL failed to parse:\n{}\n---\n{}",
