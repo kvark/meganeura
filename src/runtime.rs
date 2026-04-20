@@ -108,6 +108,18 @@ struct FusedRmsNormMatMulCoopData {
     params: MatMulParams,
 }
 
+// MatMul coop with 2-factor prologue — bindings match `matmul_prologue_to_wgsl`
+// generated names (`prologue_buf_0`, `prologue_buf_1`).
+#[derive(blade_macros::ShaderData)]
+struct MatMulPrologue2Data {
+    matrix_a: blade_graphics::BufferPiece,
+    matrix_b: blade_graphics::BufferPiece,
+    matrix_c: blade_graphics::BufferPiece,
+    prologue_buf_0: blade_graphics::BufferPiece,
+    prologue_buf_1: blade_graphics::BufferPiece,
+    params: MatMulParams,
+}
+
 // fused_matmul_add: var matrix_a, matrix_b, matrix_c, src (addend), params
 #[derive(blade_macros::ShaderData)]
 struct FusedMatMulAddData {
@@ -770,6 +782,13 @@ struct Pipelines {
     /// Cooperative-matrix equivalents. These use workgroup memory to expose
     /// matrix accumulator lanes to the scalar epilogue.
     coop_epilogue_map: HashMap<(ShaderEntry, EpiloguePipelineKey), blade_graphics::ComputePipeline>,
+    /// Prologue-fused coop-matmul pipelines keyed by (shader, prologue kinds).
+    /// Prologues only apply when `use_coop = true`; the kind sequence alone
+    /// determines the shader (buffer IDs are resolved at dispatch time).
+    prologue_map: HashMap<
+        (ShaderEntry, Vec<crate::compile::PrologueLoadKind>),
+        blade_graphics::ComputePipeline,
+    >,
     /// Schedule-template-generated pointwise pipelines, keyed by DAG hash.
     /// Populated for dispatches that carry a `pointwise` DAG.
     pointwise_map: HashMap<u64, blade_graphics::ComputePipeline>,
@@ -1161,6 +1180,66 @@ impl Pipelines {
             }
         }
 
+        // Compile prologue-fused coop-matmul pipelines. One pipeline per
+        // (shader, prologue kind sequence); buffer IDs are bound at dispatch
+        // time via the existing matmul data layout extended with prologue
+        // factor buffers.
+        let mut prologue_map = HashMap::new();
+        if let Some(coop_cfg) = coop_config {
+            for dispatch in &plan.dispatches {
+                let Some(ref prologue) = dispatch.matmul_prologue else {
+                    continue;
+                };
+                if !dispatch.use_coop {
+                    continue;
+                }
+                let kinds: Vec<_> = prologue.factors.iter().map(|f| f.1.clone()).collect();
+                let key = (dispatch.shader.clone(), kinds);
+                if prologue_map.contains_key(&key) {
+                    continue;
+                }
+                let group = dispatch.shader.shader_group();
+                let variant = match group {
+                    ShaderGroup::MatMul | ShaderGroup::MatMulCoop => {
+                        crate::codegen::MatMulCoopVariant::Normal
+                    }
+                    ShaderGroup::MatMulAdd | ShaderGroup::MatMulCoopAdd => {
+                        crate::codegen::MatMulCoopVariant::Normal
+                    }
+                    ShaderGroup::MatMulAT | ShaderGroup::MatMulCoopAT => {
+                        crate::codegen::MatMulCoopVariant::AT
+                    }
+                    ShaderGroup::MatMulATAdd => crate::codegen::MatMulCoopVariant::AT,
+                    ShaderGroup::MatMulBT | ShaderGroup::MatMulCoopBT => {
+                        crate::codegen::MatMulCoopVariant::BT
+                    }
+                    ShaderGroup::MatMulBTAdd => crate::codegen::MatMulCoopVariant::BT,
+                    _ => continue,
+                };
+                let fused_add = matches!(
+                    group,
+                    ShaderGroup::MatMulAdd
+                        | ShaderGroup::MatMulCoopAdd
+                        | ShaderGroup::MatMulATAdd
+                        | ShaderGroup::MatMulBTAdd
+                );
+                let sm = crate::codegen::gen_matmul_coop_with_prologue(
+                    fused_add, variant, coop_cfg, prologue,
+                );
+                let shader = gpu.create_shader(bg::ShaderDesc {
+                    source: &sm.source,
+                    naga_module: Some(sm.module),
+                });
+                let layout = matmul_with_prologue_layout(prologue.factors.len());
+                let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
+                    name: dispatch.shader.entry_point(),
+                    data_layouts: &[&layout],
+                    compute: shader.at(dispatch.shader.entry_point()),
+                });
+                prologue_map.insert(key, pipeline);
+            }
+        }
+
         // Compile schedule-template pointwise pipelines. Each unique DAG
         // (keyed by its content hash) gets one pipeline; the dispatch's
         // existing `shader` field is used only to pick the data layout
@@ -1227,6 +1306,7 @@ impl Pipelines {
             attention_map,
             epilogue_map,
             coop_epilogue_map,
+            prologue_map,
             pointwise_map,
             reduction_map,
         }
@@ -1261,6 +1341,15 @@ impl Pipelines {
             let key = (dispatch.shader.clone(), dispatch.weight_format);
             if let Some(p) = self.weight_map.get(&key) {
                 return p;
+            }
+        }
+        if let Some(ref prologue) = dispatch.matmul_prologue {
+            if dispatch.use_coop {
+                let kinds: Vec<_> = prologue.factors.iter().map(|f| f.1.clone()).collect();
+                let key = (dispatch.shader.clone(), kinds);
+                if let Some(p) = self.prologue_map.get(&key) {
+                    return p;
+                }
             }
         }
         if dispatch.use_coop {
@@ -1333,6 +1422,10 @@ impl Pipelines {
         for (&(ref entry, _), pipeline) in &self.coop_epilogue_map {
             result.push((entry.entry_point(), pipeline));
         }
+        #[allow(clippy::needless_borrowed_reference)]
+        for (&(ref entry, _), pipeline) in &self.prologue_map {
+            result.push((entry.entry_point(), pipeline));
+        }
         result
     }
 
@@ -1367,6 +1460,13 @@ impl Pipelines {
         }
         for (hash, pipeline) in &self.reduction_map {
             result.push((format!("generated-reduction:{hash:016x}"), pipeline));
+        }
+        #[allow(clippy::needless_borrowed_reference)]
+        for (&(ref entry, ref kinds), pipeline) in &self.prologue_map {
+            result.push((
+                format!("{entry:?}:cooperative-prologue:{kinds:?}"),
+                pipeline,
+            ));
         }
         result
     }
@@ -1515,6 +1615,15 @@ fn pointwise_data_layout(n_inputs: u8) -> blade_graphics::ShaderDataLayout {
         2 => BinaryData::layout(),
         3 => TernaryData::layout(),
         n => panic!("pointwise arity {} has no runtime data layout", n),
+    }
+}
+
+/// Get the ShaderDataLayout for a coop matmul with an N-factor prologue.
+pub fn matmul_with_prologue_layout(n_factors: usize) -> blade_graphics::ShaderDataLayout {
+    use blade_graphics::ShaderData;
+    match n_factors {
+        2 => MatMulPrologue2Data::layout(),
+        n => panic!("matmul prologue arity {} has no runtime data layout", n),
     }
 }
 
@@ -2050,6 +2159,16 @@ impl Session {
         }
 
         let mut plan = plan;
+
+        // RmsNorm+MatMul prologue fusion: only safe when coop matmuls are
+        // available, since the prologue path (global reads + shared cache
+        // of PerRow factors) is currently only wired up in the coop
+        // shader (see matmul_prologue_to_wgsl + prologue_map). Without
+        // coop, fusing would silently drop the rsqrt×w_norm multiplies.
+        if coop_config.is_some() {
+            crate::compile::fuse_rmsnorm_prologues(&mut plan);
+        }
+
         // Mark individual dispatches for coop and recompute their workgroups.
         // Unlike the old all-or-nothing policy, each dispatch is independently
         // evaluated. Pipelines now stores both scalar and coop variants.
@@ -4212,6 +4331,31 @@ impl Session {
             }
             return;
         }
+        // Prologue-fused coop matmul: 2-factor prologue (RmsNorm rsqrt + w_norm).
+        // Only applies when use_coop is set AND a prologue is attached.
+        if let Some(ref prologue) = dispatch.matmul_prologue {
+            if dispatch.use_coop && prologue.factors.len() == 2 {
+                let (m, n, k) = match dispatch.shader {
+                    ShaderEntry::MatMul | ShaderEntry::FusedMatMulAdd => {
+                        (dispatch.params[0], dispatch.params[2], dispatch.params[1])
+                    }
+                    _ => (dispatch.params[0], dispatch.params[1], dispatch.params[2]),
+                };
+                pc.bind(
+                    0,
+                    &MatMulPrologue2Data {
+                        matrix_a: buf(dispatch.input_buffers[0]),
+                        matrix_b: buf(dispatch.input_buffers[1]),
+                        matrix_c: buf(dispatch.output_buffer),
+                        prologue_buf_0: buf(prologue.factors[0].0),
+                        prologue_buf_1: buf(prologue.factors[1].0),
+                        params: MatMulParams { m, n, k, _pad: 0 },
+                    },
+                );
+                return;
+            }
+        }
+
         match dispatch.shader {
             ShaderEntry::MatMul | ShaderEntry::MatMulGemv => {
                 pc.bind(
@@ -5839,6 +5983,9 @@ impl Drop for Session {
             self.gpu.destroy_compute_pipeline(pipeline);
         }
         for pipeline in self.pipelines.coop_epilogue_map.values_mut() {
+            self.gpu.destroy_compute_pipeline(pipeline);
+        }
+        for pipeline in self.pipelines.prologue_map.values_mut() {
             self.gpu.destroy_compute_pipeline(pipeline);
         }
         for pipeline in self.pipelines.pointwise_map.values_mut() {
