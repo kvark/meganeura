@@ -2806,11 +2806,13 @@ impl<'a> Compiler<'a> {
                     Op::SlidingWindowAttention { window_size, .. } => window_size,
                     _ => 0,
                 };
-                // Pick coop GradQ when the env var is set, the GPU
-                // has 16x16 f16 coop_matrix, and the shape is
-                // compatible. Same gating pattern as the forward.
-                let bwd_coop_enabled = std::env::var("MEGANEURA_FLASH_BWD_COOP").as_deref()
-                    == Ok("1")
+                // Pick coop GradQ when the GPU has 16x16 f16
+                // coop_matrix and the shape is compatible. Default-on;
+                // `MEGANEURA_FLASH_BWD_COOP=0` is the regression
+                // escape hatch.
+                let bwd_coop_disabled =
+                    std::env::var("MEGANEURA_FLASH_BWD_COOP").as_deref() == Ok("0");
+                let bwd_coop_enabled = !bwd_coop_disabled
                     && crate::codegen::coop_caps().supports_16x16_f16()
                     && head_dim >= 16
                     && head_dim.is_multiple_of(16)
