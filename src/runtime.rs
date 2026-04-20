@@ -626,7 +626,11 @@ impl Pipelines {
                 dispatch.shader,
                 ShaderEntry::Conv2dGradInputGemmCoopGen(..) | ShaderEntry::Conv2dGemmCoopGen(..)
             );
-            if group != ShaderGroup::Conv2dGradInputGemmCoop3x3 && !is_gen_coop {
+            if !matches!(
+                group,
+                ShaderGroup::Conv2dGradInputGemmCoop3x3 | ShaderGroup::Conv2dGradInputGemmCoopV2
+            ) && !is_gen_coop
+            {
                 needed.insert(group);
             }
             entries_for_group
@@ -677,6 +681,9 @@ impl Pipelines {
                     }
                     ShaderGroup::Conv2dGradInputGemmCoop3x3 => {
                         ShaderGroup::Conv2dGradInputGemmCoop3x3
+                    }
+                    ShaderGroup::Conv2dGradInputGemmCoopV2 => {
+                        ShaderGroup::Conv2dGradInputGemmCoopV2
                     }
                     ShaderGroup::FusedRmsNormMatMul => ShaderGroup::FusedRmsNormMatMulCoop,
                     _ => continue,
@@ -1127,6 +1134,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         | ShaderEntry::Conv2dGradInputGemmSmall
         | ShaderEntry::Conv2dGradInputGemmCoop
         | ShaderEntry::Conv2dGradInputGemmCoop3x3
+        | ShaderEntry::Conv2dGradInputGemmCoopV2
         | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => Conv2dGradInputData::layout(),
         ShaderEntry::Conv2dGradWeight
         | ShaderEntry::Conv2dGradWeightGemm
@@ -3496,6 +3504,7 @@ impl Session {
             | ShaderEntry::Conv2dGradInputGemmSmall
             | ShaderEntry::Conv2dGradInputGemmCoop
             | ShaderEntry::Conv2dGradInputGemmCoop3x3
+            | ShaderEntry::Conv2dGradInputGemmCoopV2
             | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => {
                 let p = &dispatch.params;
                 let kernel_hw = p[5] * p[6];

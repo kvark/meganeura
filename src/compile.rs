@@ -143,6 +143,11 @@ pub enum ShaderEntry {
     Conv2dGradInputGemmSmall,
     Conv2dGradInputGemmCoop,
     Conv2dGradInputGemmCoop3x3,
+    /// Cooperative-matrix conv2d backward grad_input — flash-coop
+    /// pattern (16x16 tile, per-thread register accumulator).
+    /// Default-on for 3x3 stride-1 when GPU supports 16x16 f16
+    /// coop_matrix; opt-out via `MEGANEURA_CONV_COOP_V2=0`.
+    Conv2dGradInputGemmCoopV2,
     /// Generated conv2d grad_input coop kernel specialized for (kernel_h, kernel_w, stride).
     Conv2dGradInputGemmCoopGen(u32, u32, u32),
     Conv2dGradWeight,
@@ -242,6 +247,7 @@ impl ShaderEntry {
             ShaderEntry::Conv2dGradInputGemmSmall => ShaderGroup::Conv2dGradInputGemmSmall,
             ShaderEntry::Conv2dGradInputGemmCoop => ShaderGroup::Conv2dGradInputGemmCoop,
             ShaderEntry::Conv2dGradInputGemmCoop3x3 => ShaderGroup::Conv2dGradInputGemmCoop3x3,
+            ShaderEntry::Conv2dGradInputGemmCoopV2 => ShaderGroup::Conv2dGradInputGemmCoopV2,
             ShaderEntry::Conv2dGradInputGemmCoopGen(..) => ShaderGroup::Conv2dGradInputGemmCoop,
             ShaderEntry::Conv2dGradWeight => ShaderGroup::Conv2dGradWeight,
             ShaderEntry::Conv2dGradWeightGemm => ShaderGroup::Conv2dGradWeightGemm,
@@ -343,6 +349,7 @@ impl ShaderEntry {
             | ShaderEntry::Conv2dGradInputGemmSmall
             | ShaderEntry::Conv2dGradInputGemmCoop
             | ShaderEntry::Conv2dGradInputGemmCoop3x3
+            | ShaderEntry::Conv2dGradInputGemmCoopV2
             | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => "main",
             ShaderEntry::Conv2dGradWeight
             | ShaderEntry::Conv2dGradWeightGemm
@@ -2412,17 +2419,60 @@ impl<'a> Compiler<'a> {
                     // NV_cooperative_matrix2 intrinsics or on AMD/Xe
                     // where the coop path goes through different
                     // driver lowering.
-                    let coop_3x3 = kernel_h == 3
+                    // V2 (flash-coop pattern: 16×16 tile, per-thread
+                    // register accumulator) is correctness-equivalent
+                    // and ~44% faster per dispatch in the GPU profile,
+                    // but ~0.3 ms slower in wall-clock ResNet-50
+                    // training on RTX 5080 (consistently across 5 runs).
+                    // The wall-clock regression is not understood —
+                    // possibly per-dispatch driver overhead with the 14×
+                    // higher workgroup count. Opt-in via
+                    // `MEGANEURA_CONV_COOP_V2=1` until that's resolved.
+                    //
+                    // Original 32×32 Coop3x3 is also opt-in via
+                    // `MEGANEURA_CONV_COOP=1` (perf-neutral, kept for
+                    // A/B comparison).
+                    let coop_v2 = std::env::var("MEGANEURA_CONV_COOP_V2").as_deref() == Ok("1")
+                        && kernel_h == 3
+                        && kernel_w == 3
+                        && stride == 1
+                        && crate::codegen::coop_caps().supports_16x16_f16();
+                    let coop_3x3_legacy = kernel_h == 3
                         && kernel_w == 3
                         && stride == 1
                         && crate::codegen::coop_caps().supports_16x16_f16()
                         && std::env::var("MEGANEURA_CONV_COOP").as_deref() == Ok("1");
-                    if coop_3x3 {
-                        // Coop3x3 dispatch: 2x2 16x16 tile grid per workgroup
-                        // → output_tile = 32 in both M and N dimensions.
-                        // `use_coop: true` routes runtime lookup to the
-                        // coop_map (the scalar map never gets a Coop3x3
-                        // pipeline, by design at runtime.rs:629).
+                    if coop_v2 {
+                        let coop_tile: u32 = 16;
+                        self.plan.dispatches.push(Dispatch {
+                            shader: ShaderEntry::Conv2dGradInputGemmCoopV2,
+                            workgroups: [
+                                in_channels.div_ceil(coop_tile),
+                                (in_h * in_w).div_ceil(coop_tile),
+                                batch,
+                            ],
+                            input_buffers: vec![grad_out, kernel],
+                            output_buffer: out_buf,
+                            extra_outputs: vec![],
+                            params: vec![
+                                batch,
+                                in_channels,
+                                in_h,
+                                in_w,
+                                out_channels,
+                                kernel_h,
+                                kernel_w,
+                                stride,
+                                padding_h,
+                                out_h,
+                                out_w,
+                                padding_w,
+                            ],
+                            use_coop: true,
+                            use_small_tiles: false,
+                            ..Default::default()
+                        });
+                    } else if coop_3x3_legacy {
                         let coop_tile: u32 = 32;
                         self.plan.dispatches.push(Dispatch {
                             shader: ShaderEntry::Conv2dGradInputGemmCoop3x3,

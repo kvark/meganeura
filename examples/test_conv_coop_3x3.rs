@@ -61,48 +61,67 @@ fn main() {
         ("ResNet stage3", 1, 256, 256, 14, 14),
     ];
 
+    // Install coop caps once.
+    let gpu = meganeura::runtime::init_gpu_context().expect("gpu");
+    let result = meganeura::runtime::auto_tune(&gpu, 64);
+    eprintln!("coop_matrix_available={}", result.coop_caps.is_supported());
+    meganeura::runtime::install_auto_tune(result);
+    drop(gpu);
+
     for (label, batch, in_c, out_c, h, w) in cases {
         eprintln!("\n=== {label}: batch={batch} {in_c}->{out_c} @ {h}x{w} ===");
 
-        // Run scalar baseline first (MEGANEURA_CONV_COOP not set).
+        // Run scalar baseline (both coop variants disabled).
         unsafe {
             std::env::remove_var("MEGANEURA_CONV_COOP");
+            std::env::set_var("MEGANEURA_CONV_COOP_V2", "0");
         }
-        let scalar = build_and_run("scalar", batch, in_c, out_c, h, w);
+        let scalar = build_and_run("scalar      ", batch, in_c, out_c, h, w);
 
-        // Run with coop enabled — needs both the env var and the
-        // installed coop_matrix_available global.
-        let gpu = meganeura::runtime::init_gpu_context().expect("gpu");
-        let result = meganeura::runtime::auto_tune(&gpu, 64);
-        eprintln!(
-            "  coop_matrix_available={}",
-            result.coop_caps.is_supported()
-        );
-        meganeura::runtime::install_auto_tune(result);
-        drop(gpu);
+        // Run V2 (default-on; just unset the disable flag).
         unsafe {
+            std::env::remove_var("MEGANEURA_CONV_COOP_V2");
+        }
+        let coop_v2 = build_and_run("coop V2     ", batch, in_c, out_c, h, w);
+
+        // Run legacy Coop3x3 (opt-in), V2 disabled.
+        unsafe {
+            std::env::set_var("MEGANEURA_CONV_COOP_V2", "0");
             std::env::set_var("MEGANEURA_CONV_COOP", "1");
         }
-        let coop = build_and_run("coop  ", batch, in_c, out_c, h, w);
+        let coop_3x3 = build_and_run("coop 3x3    ", batch, in_c, out_c, h, w);
 
-        // Compare.
-        assert_eq!(scalar.len(), coop.len(), "{label}: shape mismatch");
-        let mut max_abs = 0f32;
-        let mut max_rel = 0f32;
-        for (s, c) in scalar.iter().zip(coop.iter()) {
+        // Compare V2 against scalar.
+        assert_eq!(scalar.len(), coop_v2.len(), "{label}: V2 shape mismatch");
+        let (mut max_abs_v2, mut max_rel_v2) = (0f32, 0f32);
+        for (s, c) in scalar.iter().zip(coop_v2.iter()) {
             let abs = (s - c).abs();
             let rel = abs / s.abs().max(1e-6);
-            max_abs = max_abs.max(abs);
-            max_rel = max_rel.max(rel);
+            max_abs_v2 = max_abs_v2.max(abs);
+            max_rel_v2 = max_rel_v2.max(rel);
         }
-        eprintln!("  max_abs_err={max_abs:.6e}, max_rel_err={max_rel:.6e}");
-        // Coop uses f16 input × f16 weight → f32 accum, so tolerance
-        // is larger than pure-f32 scalar.
+        eprintln!("  V2 vs scalar:  max_abs={max_abs_v2:.6e}, max_rel={max_rel_v2:.6e}");
+
+        // Compare 3x3 against scalar.
+        let (mut max_abs_3x3, mut max_rel_3x3) = (0f32, 0f32);
+        for (s, c) in scalar.iter().zip(coop_3x3.iter()) {
+            let abs = (s - c).abs();
+            let rel = abs / s.abs().max(1e-6);
+            max_abs_3x3 = max_abs_3x3.max(abs);
+            max_rel_3x3 = max_rel_3x3.max(rel);
+        }
+        eprintln!("  3x3 vs scalar: max_abs={max_abs_3x3:.6e}, max_rel={max_rel_3x3:.6e}");
+
+        // Coop uses f16 input × f16 weight → f32 accum, larger tolerance.
         assert!(
-            max_abs < 1e-2,
-            "{label}: coop diverges from scalar (max_abs={max_abs})"
+            max_abs_v2 < 1e-2,
+            "{label}: V2 diverges from scalar (max_abs={max_abs_v2})"
+        );
+        assert!(
+            max_abs_3x3 < 1e-2,
+            "{label}: 3x3 diverges from scalar (max_abs={max_abs_3x3})"
         );
     }
 
-    eprintln!("\nALL OK — coop conv-backward matches scalar within tolerance");
+    eprintln!("\nALL OK — coop conv-backward variants match scalar within tolerance");
 }
