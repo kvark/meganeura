@@ -91,6 +91,11 @@ pub enum ShaderEntry {
     /// `MEGANEURA_FLASH_BWD_COOP=1`. BQ=BKV=16,
     /// dispatched as `[ceil(q_seq/16), num_heads, 1]`.
     FlashGradQCoop,
+    /// Cooperative-matrix flash backward dK + dV kernel (fused).
+    /// Two coop matmuls per Q-tile: score = K·Q^T, dp = V·dO^T.
+    /// dV/dK accumulate per-thread. Dispatched as
+    /// `[ceil(dispatch_kv/16), num_kv_heads, 1]`.
+    FlashGradKVCoop,
     MultiHeadAttnGradQ,
     FlashGradQ,
     MultiHeadAttnGradK,
@@ -198,6 +203,7 @@ impl ShaderEntry {
             ShaderEntry::FlashAttention => ShaderGroup::FlashAttention,
             ShaderEntry::FlashAttentionCoop => ShaderGroup::FlashAttentionCoop,
             ShaderEntry::FlashGradQCoop => ShaderGroup::FlashGradQCoop,
+            ShaderEntry::FlashGradKVCoop => ShaderGroup::FlashGradKVCoop,
             ShaderEntry::MultiHeadAttnGradQ => ShaderGroup::MultiHeadAttnGradQ,
             ShaderEntry::FlashGradQ => ShaderGroup::FlashGradQ,
             ShaderEntry::MultiHeadAttnGradK => ShaderGroup::MultiHeadAttnGradK,
@@ -303,6 +309,7 @@ impl ShaderEntry {
             | ShaderEntry::MultiHeadAttnGradV
             | ShaderEntry::MultiHeadAttnGradKV
             | ShaderEntry::FlashGradKV
+            | ShaderEntry::FlashGradKVCoop
             | ShaderEntry::FlashGradK
             | ShaderEntry::FlashGradV => "main",
             ShaderEntry::SwiGLUGradGate => "swiglu_grad_gate",
@@ -2945,13 +2952,33 @@ impl<'a> Compiler<'a> {
                         ..Default::default()
                     });
                 } else {
-                    let shader = match grad_kv_shader {
-                        ShaderEntry::FlashAttention => ShaderEntry::FlashGradKV,
-                        _ => ShaderEntry::MultiHeadAttnGradKV,
+                    // Pick coop GradKV when GPU has 16x16 f16 coop_matrix
+                    // and shape is compatible (head_dim multiple of 16,
+                    // dispatch_kv >= 16). Default-on; opt-out via
+                    // `MEGANEURA_FLASH_BWD_COOP=0`.
+                    let bwd_coop_disabled =
+                        std::env::var("MEGANEURA_FLASH_BWD_COOP").as_deref() == Ok("0");
+                    let bwd_coop_enabled = !bwd_coop_disabled
+                        && grad_kv_shader == ShaderEntry::FlashAttention
+                        && crate::codegen::coop_caps().supports_16x16_f16()
+                        && head_dim >= 16
+                        && head_dim.is_multiple_of(16)
+                        && dispatch_kv >= 16;
+                    let (shader, workgroups) = if bwd_coop_enabled {
+                        (
+                            ShaderEntry::FlashGradKVCoop,
+                            [dispatch_kv.div_ceil(16), num_kv_heads, 1],
+                        )
+                    } else {
+                        let s = match grad_kv_shader {
+                            ShaderEntry::FlashAttention => ShaderEntry::FlashGradKV,
+                            _ => ShaderEntry::MultiHeadAttnGradKV,
+                        };
+                        (s, grad_kv_wgs)
                     };
                     self.plan.dispatches.push(Dispatch {
                         shader,
-                        workgroups: grad_kv_wgs,
+                        workgroups,
                         input_buffers: vec![d_out, q, k, v, lse_buf, fwd_o],
                         output_buffer: out_buf,
                         extra_outputs: vec![dv_buf],

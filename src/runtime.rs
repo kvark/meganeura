@@ -642,6 +642,7 @@ impl Pipelines {
                     | ShaderGroup::FlashGradQ
                     | ShaderGroup::FlashGradQCoop
                     | ShaderGroup::FlashGradKV
+                    | ShaderGroup::FlashGradKVCoop
                     | ShaderGroup::FlashGradK
                     | ShaderGroup::FlashGradV
             ) && dispatch.params.len() >= 4
@@ -747,6 +748,7 @@ impl Pipelines {
                     | ShaderGroup::FlashGradQ
                     | ShaderGroup::FlashGradQCoop
                     | ShaderGroup::FlashGradKV
+                    | ShaderGroup::FlashGradKVCoop
                     | ShaderGroup::FlashGradK
                     | ShaderGroup::FlashGradV
             ) {
@@ -764,6 +766,9 @@ impl Pipelines {
                         crate::codegen::generate_flash_grad_q_coop_module(hd)
                     }
                     ShaderGroup::FlashGradKV => crate::codegen::generate_flash_grad_kv_module(hd),
+                    ShaderGroup::FlashGradKVCoop => {
+                        crate::codegen::generate_flash_grad_kv_coop_module(hd)
+                    }
                     ShaderGroup::FlashGradK => crate::codegen::generate_flash_grad_k_module(hd),
                     ShaderGroup::FlashGradV => crate::codegen::generate_flash_grad_v_module(hd),
                     _ => crate::codegen::generate_attention_module(hd),
@@ -1095,9 +1100,9 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         | ShaderEntry::FlashGradK
         | ShaderEntry::MultiHeadAttnGradV
         | ShaderEntry::FlashGradV => MultiHeadAttnGradData::layout(),
-        ShaderEntry::MultiHeadAttnGradKV | ShaderEntry::FlashGradKV => {
-            MultiHeadAttnGradKVData::layout()
-        }
+        ShaderEntry::MultiHeadAttnGradKV
+        | ShaderEntry::FlashGradKV
+        | ShaderEntry::FlashGradKVCoop => MultiHeadAttnGradKVData::layout(),
         ShaderEntry::SwiGLUGradGate => TernaryData::layout(),
         ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => BinaryData::layout(),
         ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradWRowPar | ShaderEntry::RmsNormGradX => {
@@ -3137,7 +3142,9 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::MultiHeadAttnGradKV | ShaderEntry::FlashGradKV => {
+            ShaderEntry::MultiHeadAttnGradKV
+            | ShaderEntry::FlashGradKV
+            | ShaderEntry::FlashGradKVCoop => {
                 pc.bind(
                     0,
                     &MultiHeadAttnGradKVData {
