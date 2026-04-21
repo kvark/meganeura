@@ -152,6 +152,16 @@ fn main() {
 
     let use_q4 = args.iter().any(|a| a == "--q4");
     let use_f16 = args.iter().any(|a| a == "--f16") && !use_q4;
+    let max_layers: usize = args
+        .iter()
+        .position(|a| a == "--layers")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(config.num_layers);
+    // NOTE: --q4 compiles and runs but full-model Q4 produces NaN.
+    // The Q4 dequant shader is correct (verified by GPU test at model scale),
+    // but something in the multi-layer chain causes NaN propagation.
+    // The isolated matmul test (q4_matmul_correctness) passes with zero error.
     if use_q4 {
         println!("Q4_0 weight storage enabled (~8x VRAM reduction for weights)");
     } else if use_f16 {
@@ -225,7 +235,11 @@ fn main() {
     let mut x = g.embedding(token_ids, embed_weight);
 
     // Transformer layers
-    for i in 0..config.num_layers {
+    let num_layers = max_layers.min(config.num_layers);
+    if num_layers < config.num_layers {
+        println!("using {} of {} layers", num_layers, config.num_layers);
+    }
+    for i in 0..num_layers {
         let p = format!("model.layers.{}", i);
 
         // Pre-attention RMSNorm (tiny weights, keep f32)
@@ -326,7 +340,7 @@ fn main() {
     // meganeura matmul expects (in, out), so all projection weights
     // need transposing.
     let mut transposed_names = Vec::new();
-    for i in 0..config.num_layers {
+    for i in 0..num_layers {
         let p = format!("model.layers.{}", i);
         transposed_names.push(format!("{}.self_attn.q_proj.weight", p));
         transposed_names.push(format!("{}.self_attn.k_proj.weight", p));
