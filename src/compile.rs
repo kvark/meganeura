@@ -3,6 +3,31 @@ use crate::schedule::{PointwiseDAG, ReductionKernel};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Weight storage format for matmul B operands.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum WeightFormat {
+    #[default]
+    F32,
+    F16,
+    Q4,
+    Q8,
+}
+
+impl WeightFormat {
+    pub fn is_quantized(self) -> bool {
+        !matches!(self, Self::F32)
+    }
+
+    pub fn from_dtype(dtype: DType) -> Self {
+        match dtype {
+            DType::F16 => Self::F16,
+            DType::Q4_0 => Self::Q4,
+            DType::Q8_0 => Self::Q8,
+            _ => Self::F32,
+        }
+    }
+}
+
 /// Options controlling graph → execution-plan compilation.
 ///
 /// Wire these to env vars or CLI flags in your own harness if you want —
@@ -457,15 +482,9 @@ pub struct Dispatch {
     /// the kernel's buffer-input arity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reduction: Option<ReductionKernel>,
-    /// When true, the B (weight) input buffer stores f16 data.
+    /// Storage format of the B (weight) input buffer.
     #[serde(default)]
-    pub b_is_f16: bool,
-    /// When true, the B (weight) input buffer stores Q4 quantized data.
-    #[serde(default)]
-    pub b_is_q4: bool,
-    /// When true, the B (weight) input buffer stores Q8_0 quantized data.
-    #[serde(default)]
-    pub b_is_q8: bool,
+    pub weight_format: WeightFormat,
 }
 
 /// Reference to a GPU buffer in the execution plan.
@@ -503,15 +522,9 @@ pub struct ExecutionPlan {
         Vec<(String, usize)>,
         crate::graph::ParamTransform,
     )>,
-    /// Set of BufferRefs that store f16 data (half-precision weights).
+    /// Quantized weight buffers: format + matrix dimensions (rows, cols).
     #[serde(default)]
-    pub f16_buffers: std::collections::HashSet<BufferRef>,
-    /// Q4 quantized buffers with their matrix dimensions (rows, cols).
-    #[serde(default)]
-    pub q4_buffers: std::collections::HashMap<BufferRef, (usize, usize)>,
-    /// Q8_0 quantized buffers with their matrix dimensions (rows, cols).
-    #[serde(default)]
-    pub q8_buffers: std::collections::HashMap<BufferRef, (usize, usize)>,
+    pub weight_buffers: HashMap<BufferRef, (WeightFormat, usize, usize)>,
 }
 
 /// Compile a differentiated graph into an ExecutionPlan.
@@ -1108,9 +1121,7 @@ impl<'a> Compiler<'a> {
                 param_grad_pairs: Vec::new(),
                 lse_buffers: Vec::new(),
                 derived_params: Vec::new(),
-                f16_buffers: std::collections::HashSet::new(),
-                q4_buffers: std::collections::HashMap::new(),
-                q8_buffers: std::collections::HashMap::new(),
+                weight_buffers: HashMap::new(),
             },
             node_buffers: HashMap::new(),
             options,
@@ -1215,24 +1226,15 @@ impl<'a> Compiler<'a> {
             match node.op {
                 Op::Parameter { ref name } => {
                     self.plan.param_buffers.push((name.clone(), buf));
-                    match node.ty.dtype {
-                        DType::F16 => {
-                            self.plan.f16_buffers.insert(buf);
-                        }
-                        DType::Q4_0 | DType::Q8_0 => {
-                            let shape = &node.ty.shape;
-                            let (rows, cols) = if shape.len() >= 2 {
-                                (shape[0], shape[1])
-                            } else {
-                                (shape[0], 1)
-                            };
-                            if node.ty.dtype == DType::Q4_0 {
-                                self.plan.q4_buffers.insert(buf, (rows, cols));
-                            } else {
-                                self.plan.q8_buffers.insert(buf, (rows, cols));
-                            }
-                        }
-                        _ => {}
+                    let wf = WeightFormat::from_dtype(node.ty.dtype);
+                    if wf.is_quantized() {
+                        let shape = &node.ty.shape;
+                        let (rows, cols) = if shape.len() >= 2 {
+                            (shape[0], shape[1])
+                        } else {
+                            (shape[0], 1)
+                        };
+                        self.plan.weight_buffers.insert(buf, (wf, rows, cols));
                     }
                 }
                 Op::Input { ref name } => {
@@ -1378,10 +1380,7 @@ impl<'a> Compiler<'a> {
                 let b = self.get_buffer(node.inputs[1]);
                 let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
-                let b_dtype = self.graph.node(node.inputs[1]).ty.dtype;
-                let b_f16 = b_dtype == DType::F16;
-                let b_q4 = b_dtype == DType::Q4_0;
-                let b_q8 = b_dtype == DType::Q8_0;
+                let wf = WeightFormat::from_dtype(self.graph.node(node.inputs[1]).ty.dtype);
                 let m = a_shape[0] as u32;
                 let k = a_shape[1] as u32;
                 let n = b_shape[1] as u32;
@@ -1399,9 +1398,7 @@ impl<'a> Compiler<'a> {
                         params: vec![m, k, n, 0],
                         use_coop: false,
                         use_small_tiles: false,
-                        b_is_f16: b_f16,
-                        b_is_q4: b_q4,
-                        b_is_q8: b_q8,
+                        weight_format: wf,
                         ..Default::default()
                     });
                 } else {
@@ -1414,9 +1411,7 @@ impl<'a> Compiler<'a> {
                         params: vec![m, k, n, 0],
                         use_coop: false,
                         use_small_tiles: false,
-                        b_is_f16: b_f16,
-                        b_is_q4: b_q4,
-                        b_is_q8: b_q8,
+                        weight_format: wf,
                         ..Default::default()
                     });
                 }
@@ -1428,10 +1423,7 @@ impl<'a> Compiler<'a> {
                 let b = self.get_buffer(node.inputs[1]);
                 let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
-                let b_dtype = self.graph.node(node.inputs[1]).ty.dtype;
-                let b_f16 = b_dtype == DType::F16;
-                let b_q4 = b_dtype == DType::Q4_0;
-                let b_q8 = b_dtype == DType::Q8_0;
+                let wf = WeightFormat::from_dtype(self.graph.node(node.inputs[1]).ty.dtype);
                 let k = a_shape[0] as u32; // A is [K, M]
                 let m = a_shape[1] as u32;
                 let n = b_shape[1] as u32; // B is [K, N]
@@ -1444,9 +1436,7 @@ impl<'a> Compiler<'a> {
                     params: vec![m, n, k, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    b_is_f16: b_f16,
-                    b_is_q4: b_q4,
-                    b_is_q8: b_q8,
+                    weight_format: wf,
                     ..Default::default()
                 });
             }
@@ -1457,10 +1447,7 @@ impl<'a> Compiler<'a> {
                 let b = self.get_buffer(node.inputs[1]);
                 let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
-                let b_dtype = self.graph.node(node.inputs[1]).ty.dtype;
-                let b_f16 = b_dtype == DType::F16;
-                let b_q4 = b_dtype == DType::Q4_0;
-                let b_q8 = b_dtype == DType::Q8_0;
+                let wf = WeightFormat::from_dtype(self.graph.node(node.inputs[1]).ty.dtype);
                 let m = a_shape[0] as u32; // A is [M, K]
                 let k = a_shape[1] as u32;
                 let n = b_shape[0] as u32; // B is [N, K]
@@ -1474,9 +1461,7 @@ impl<'a> Compiler<'a> {
                         params: vec![m, n, k, 0],
                         use_coop: false,
                         use_small_tiles: false,
-                        b_is_f16: b_f16,
-                        b_is_q4: b_q4,
-                        b_is_q8: b_q8,
+                        weight_format: wf,
                         ..Default::default()
                     });
                 } else {
@@ -1489,9 +1474,7 @@ impl<'a> Compiler<'a> {
                         params: vec![m, n, k, 0],
                         use_coop: false,
                         use_small_tiles: false,
-                        b_is_f16: b_f16,
-                        b_is_q4: b_q4,
-                        b_is_q8: b_q8,
+                        weight_format: wf,
                         ..Default::default()
                     });
                 }
@@ -1504,10 +1487,7 @@ impl<'a> Compiler<'a> {
                 let d = self.get_buffer(node.inputs[2]);
                 let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
-                let b_dtype = self.graph.node(node.inputs[1]).ty.dtype;
-                let b_f16 = b_dtype == DType::F16;
-                let b_q4 = b_dtype == DType::Q4_0;
-                let b_q8 = b_dtype == DType::Q8_0;
+                let wf = WeightFormat::from_dtype(self.graph.node(node.inputs[1]).ty.dtype);
                 let m = a_shape[0] as u32;
                 let k = a_shape[1] as u32;
                 let n = b_shape[1] as u32;
@@ -1521,9 +1501,7 @@ impl<'a> Compiler<'a> {
                         params: vec![m, k, n, 0],
                         use_coop: false,
                         use_small_tiles: false,
-                        b_is_f16: b_f16,
-                        b_is_q4: b_q4,
-                        b_is_q8: b_q8,
+                        weight_format: wf,
                         ..Default::default()
                     });
                 } else {
@@ -1536,9 +1514,7 @@ impl<'a> Compiler<'a> {
                         params: vec![m, k, n, 0],
                         use_coop: false,
                         use_small_tiles: false,
-                        b_is_f16: b_f16,
-                        b_is_q4: b_q4,
-                        b_is_q8: b_q8,
+                        weight_format: wf,
                         ..Default::default()
                     });
                 }
@@ -1551,10 +1527,7 @@ impl<'a> Compiler<'a> {
                 let d = self.get_buffer(node.inputs[2]);
                 let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
-                let b_dtype = self.graph.node(node.inputs[1]).ty.dtype;
-                let b_f16 = b_dtype == DType::F16;
-                let b_q4 = b_dtype == DType::Q4_0;
-                let b_q8 = b_dtype == DType::Q8_0;
+                let wf = WeightFormat::from_dtype(self.graph.node(node.inputs[1]).ty.dtype);
                 let k = a_shape[0] as u32;
                 let m = a_shape[1] as u32;
                 let n = b_shape[1] as u32;
@@ -1567,9 +1540,7 @@ impl<'a> Compiler<'a> {
                     params: vec![m, n, k, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    b_is_f16: b_f16,
-                    b_is_q4: b_q4,
-                    b_is_q8: b_q8,
+                    weight_format: wf,
                     ..Default::default()
                 });
             }
@@ -1581,10 +1552,7 @@ impl<'a> Compiler<'a> {
                 let d = self.get_buffer(node.inputs[2]);
                 let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
-                let b_dtype = self.graph.node(node.inputs[1]).ty.dtype;
-                let b_f16 = b_dtype == DType::F16;
-                let b_q4 = b_dtype == DType::Q4_0;
-                let b_q8 = b_dtype == DType::Q8_0;
+                let wf = WeightFormat::from_dtype(self.graph.node(node.inputs[1]).ty.dtype);
                 let m = a_shape[0] as u32;
                 let k = a_shape[1] as u32;
                 let n = b_shape[0] as u32;
@@ -1597,9 +1565,7 @@ impl<'a> Compiler<'a> {
                     params: vec![m, n, k, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    b_is_f16: b_f16,
-                    b_is_q4: b_q4,
-                    b_is_q8: b_q8,
+                    weight_format: wf,
                     ..Default::default()
                 });
             }
