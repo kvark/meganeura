@@ -2392,8 +2392,7 @@ fn sliding_window_attention_gradient_check() {
 
 #[test]
 fn q4_matmul_correctness() {
-    // Test Q4 matmul: A[6,1024] (f32 input) × B[1024,2048] (Q4 weight) = C[6,2048]
-    // Model-scale dimensions (Qwen3 q_proj: hidden=1024 → q_dim=2048).
+    // Q4 matmul correctness: compare GPU Q4 against CPU Q4 reference.
     let m = 6;
     let k = 1024;
     let n = 2048;
@@ -2415,9 +2414,15 @@ fn q4_matmul_correctness() {
     let mut sess_ref = build_inference_session(&g_ref);
     let mut sess_q4 = build_inference_session(&g_q4);
 
-    // Non-trivial data
-    let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 7) as f32 - 3.0) * 0.1).collect();
-    let b_data: Vec<f32> = (0..k * n).map(|i| ((i % 11) as f32 - 5.0) * 0.05).collect();
+    // Use values closer to real model scale
+    let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 7) as f32 - 3.0) * 0.5).collect();
+    let b_data: Vec<f32> = (0..k * n)
+        .map(|i| {
+            let v = ((i % 11) as f32 - 5.0) * 0.3;
+            // Add some outliers like real weights
+            if i % 1000 == 0 { v * 5.0 } else { v }
+        })
+        .collect();
 
     sess_ref.set_input("a", &a_data);
     sess_ref.set_parameter("b", &b_data);
@@ -2431,28 +2436,49 @@ fn q4_matmul_correctness() {
     sess_q4.wait();
     let q4_output = sess_q4.read_output(m * n);
 
-    eprintln!("Q4 matmul test ({}x{}x{}):", m, k, n);
+    // CPU Q4 reference: quantize then dequantize on CPU, multiply manually
+    let b_dequant = meganeura::runtime::dequantize_q4_0(
+        &meganeura::runtime::quantize_q4_0(&b_data, k, n),
+        k,
+        n,
+    );
+    let mut cpu_q4_output = vec![0.0f32; m * n];
+    for row in 0..m {
+        for col in 0..n {
+            let mut sum = 0.0;
+            for kk in 0..k {
+                sum += a_data[row * k + kk] * b_dequant[kk * n + col];
+            }
+            cpu_q4_output[row * n + col] = sum;
+        }
+    }
+
+    let nans = q4_output.iter().filter(|v| v.is_nan()).count();
+    eprintln!("Q4 matmul test ({}x{}x{}): nans={}", m, k, n, nans);
     let mut max_err = 0.0f32;
     for i in 0..m * n {
-        let err = (ref_output[i] - q4_output[i]).abs();
+        // Compare GPU Q4 output against CPU Q4 reference (not f32 ref)
+        let err = (cpu_q4_output[i] - q4_output[i]).abs();
         if err > max_err {
             max_err = err;
         }
-        eprintln!(
-            "  [{},{}]: ref={:.4}, q4={:.4}, err={:.4}",
-            i / n,
-            i % n,
-            ref_output[i],
-            q4_output[i],
-            err,
-        );
+        if i < 16 || err > 0.1 {
+            eprintln!(
+                "  [{},{}]: cpu_q4={:.4}, gpu_q4={:.4}, f32_ref={:.4}, err={:.4}",
+                i / n,
+                i % n,
+                cpu_q4_output[i],
+                q4_output[i],
+                ref_output[i],
+                err,
+            );
+        }
     }
-    // Q4 quantization error: each weight has ~0.15 error, accumulated over K=32
-    // So output error can be up to ~1.0 for small values
+    // GPU should match CPU Q4 to within f32 precision + GPU rounding
     assert!(
-        max_err < 2.0,
-        "Q4 matmul max error {:.4} exceeds tolerance",
+        max_err < 0.1,
+        "Q4 GPU vs CPU max error {:.4} exceeds tolerance",
         max_err,
     );
-    eprintln!("Q4 matmul PASSED: max error {:.4}", max_err);
+    eprintln!("Q4 matmul PASSED: GPU-CPU max error {:.4}", max_err);
 }

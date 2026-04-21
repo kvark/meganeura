@@ -769,8 +769,7 @@ fn dequant_q4(k_idx: u32, n_idx: u32) -> f32 {
     let shift = (byte_in_block % 4u) * 8u + select(0u, 4u, (in_block & 1u) != 0u);
     let nibble = (data_u32 >> shift) & 0xFu;
 
-    //return (f32(nibble) - 8.0) * scale;
-    return 0.1; // DEBUG constant
+    return (f32(nibble) - 8.0) * scale;
 }
 ";
 
