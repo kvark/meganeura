@@ -600,7 +600,17 @@ fn matmul_vars(
     fused_expr: &str,
 ) -> ShaderModule {
     matmul_vars_full(
-        a_idx, b_idx, a_row, a_col, b_row, b_col, fused_decl, fused_expr, "", "", false,
+        a_idx,
+        b_idx,
+        a_row,
+        a_col,
+        b_row,
+        b_col,
+        fused_decl,
+        fused_expr,
+        "",
+        "",
+        BStorageMode::F32,
     )
 }
 
@@ -627,11 +637,11 @@ fn matmul_vars_epilogue(
         fused_expr,
         epilogue_decl,
         epilogue_body,
-        false,
+        BStorageMode::F32,
     )
 }
 
-fn matmul_vars_f16(
+fn matmul_vars_with_mode(
     a_idx: &str,
     b_idx: &str,
     a_row: &str,
@@ -640,10 +650,19 @@ fn matmul_vars_f16(
     b_col: &str,
     fused_decl: &str,
     fused_expr: &str,
+    mode: BStorageMode,
 ) -> ShaderModule {
     matmul_vars_full(
-        a_idx, b_idx, a_row, a_col, b_row, b_col, fused_decl, fused_expr, "", "", true,
+        a_idx, b_idx, a_row, a_col, b_row, b_col, fused_decl, fused_expr, "", "", mode,
     )
+}
+
+/// B-weight storage mode for matmul codegen.
+#[derive(Clone, Copy, PartialEq)]
+enum BStorageMode {
+    F32,
+    F16,
+    Q4,
 }
 
 fn matmul_vars_full(
@@ -657,7 +676,7 @@ fn matmul_vars_full(
     fused_expr: &str,
     epilogue_decl: &str,
     epilogue_body: &str,
-    b_is_f16: bool,
+    b_mode: BStorageMode,
 ) -> ShaderModule {
     let src = include_str!("shaders/matmul.wgsl");
     let full_decl = if epilogue_decl.is_empty() {
@@ -673,18 +692,33 @@ fn matmul_vars_full(
             fused_expr, epilogue_body
         )
     };
-    let (enable_f16, b_storage, b_cast_open, b_cast_close) = if b_is_f16 {
-        ("enable f16;", "array<f16>", "f32(", ")")
-    } else {
-        ("", "array<f32>", "", "")
+    let (enable_f16, b_storage, b_load_expr, b_dequant_fn) = match b_mode {
+        BStorageMode::F32 => (
+            "",
+            "array<f32>",
+            format!("matrix_b[{}]", b_idx),
+            String::new(),
+        ),
+        BStorageMode::F16 => (
+            "enable f16;",
+            "array<f16>",
+            format!("f32(matrix_b[{}])", b_idx),
+            String::new(),
+        ),
+        BStorageMode::Q4 => (
+            "",
+            "array<u32>",
+            "dequant_q4(b_row, b_col)".to_string(),
+            Q4_DEQUANT_FN.to_string(),
+        ),
     };
     let src = preprocess(
         src,
         &[
             ("$ENABLE_F16", enable_f16),
             ("$B_STORAGE_TYPE", b_storage),
-            ("$B_CAST_OPEN", b_cast_open),
-            ("$B_CAST_CLOSE", b_cast_close),
+            ("$B_LOAD_EXPR", &b_load_expr),
+            ("$B_DEQUANT_FN", &b_dequant_fn),
             ("$A_INDEX", a_idx),
             ("$B_INDEX", b_idx),
             ("$A_ROW", a_row),
@@ -697,6 +731,46 @@ fn matmul_vars_full(
     );
     parse_wgsl(&src)
 }
+
+/// Q4_0 dequantization helper function for WGSL shaders.
+/// Buffer layout: [scales as packed f16 pairs (u32)][packed nibble data (u32)].
+/// Column-wise blocking: blocks of 32 elements along the K dimension per column.
+const Q4_DEQUANT_FN: &str = "
+fn q4_decode_f16(bits: u32) -> f32 {
+    // Decode IEEE 754 half-precision (f16) from 16-bit unsigned to f32.
+    let sign = (bits >> 15u) & 1u;
+    let expo = (bits >> 10u) & 0x1Fu;
+    let mant = bits & 0x3FFu;
+    // Construct f32 bits: shift sign to bit 31, exponent bias adjust (127-15=112),
+    // mantissa to f32 position (shift left 13).
+    var f32_bits = (sign << 31u) | ((expo + 112u) << 23u) | (mant << 13u);
+    // Handle zero exponent (subnormals become zero for our purposes)
+    if expo == 0u { f32_bits = sign << 31u; }
+    return bitcast<f32>(f32_bits);
+}
+
+fn dequant_q4(k_idx: u32, n_idx: u32) -> f32 {
+    let blocks_per_col = params.k / 32u;
+    let num_blocks = blocks_per_col * params.n;
+    let block = n_idx * blocks_per_col + k_idx / 32u;
+    let in_block = k_idx % 32u;
+
+    // Scale: two f16 scales packed per u32.
+    let scale_u32 = matrix_b[block / 2u];
+    let scale_bits = select(scale_u32 & 0xFFFFu, scale_u32 >> 16u, (block & 1u) != 0u);
+    let scale = q4_decode_f16(scale_bits);
+
+    // Packed nibbles start after the scales region
+    let scales_u32s = (num_blocks + 1u) / 2u;
+    let byte_in_block = in_block / 2u;
+    let u32_in_block = byte_in_block / 4u;
+    let data_u32 = matrix_b[scales_u32s + block * 4u + u32_in_block];
+    let shift = (byte_in_block % 4u) * 8u + select(0u, 4u, (in_block & 1u) != 0u);
+    let nibble = (data_u32 >> shift) & 0xFu;
+
+    return (f32(nibble) - 8.0) * scale;
+}
+";
 
 fn matmul_small_vars(
     a_idx: &str,
@@ -886,9 +960,19 @@ fn gen_matmul_at() -> ShaderModule {
 /// Generate a matmul module with f16 weight (B) storage.
 /// Returns a module containing all matmul variants (Normal, AT, BT)
 /// that read matrix_b as `array<f16>`.
+/// Generate a matmul module with f16 weight (B) storage.
 pub fn generate_module_f16(group: ShaderGroup) -> ShaderModule {
+    generate_module_with_b_mode(group, BStorageMode::F16)
+}
+
+/// Generate a matmul module with Q4_0 weight (B) storage.
+pub fn generate_module_q4(group: ShaderGroup) -> ShaderModule {
+    generate_module_with_b_mode(group, BStorageMode::Q4)
+}
+
+fn generate_module_with_b_mode(group: ShaderGroup, mode: BStorageMode) -> ShaderModule {
     match group {
-        ShaderGroup::MatMul => matmul_vars_f16(
+        ShaderGroup::MatMul => matmul_vars_with_mode(
             MATMUL_A_FWD,
             MATMUL_B_FWD,
             A_ROW_FWD,
@@ -897,8 +981,9 @@ pub fn generate_module_f16(group: ShaderGroup) -> ShaderModule {
             B_COL_FWD,
             "",
             "",
+            mode,
         ),
-        ShaderGroup::MatMulAT => matmul_vars_f16(
+        ShaderGroup::MatMulAT => matmul_vars_with_mode(
             MATMUL_A_AT,
             MATMUL_B_FWD,
             A_ROW_AT,
@@ -907,8 +992,9 @@ pub fn generate_module_f16(group: ShaderGroup) -> ShaderModule {
             B_COL_FWD,
             "",
             "",
+            mode,
         ),
-        ShaderGroup::MatMulBT => matmul_vars_f16(
+        ShaderGroup::MatMulBT => matmul_vars_with_mode(
             MATMUL_A_FWD,
             MATMUL_B_BT,
             A_ROW_FWD,
@@ -917,10 +1003,17 @@ pub fn generate_module_f16(group: ShaderGroup) -> ShaderModule {
             B_COL_BT,
             "",
             "",
+            mode,
         ),
-        ShaderGroup::MatMulGemv => gen_matmul_gemv_f16(),
-        ShaderGroup::MatMulGemvBT => gen_matmul_gemv_bt_f16(),
-        _ => generate_module(group), // fallback for unhandled groups
+        ShaderGroup::MatMulGemv | ShaderGroup::MatMulGemvBT if mode == BStorageMode::F16 => {
+            if group == ShaderGroup::MatMulGemv {
+                gen_matmul_gemv_f16()
+            } else {
+                gen_matmul_gemv_bt_f16()
+            }
+        }
+        // Q4 GEMV not yet implemented — fall back to standard pipeline
+        _ => generate_module(group),
     }
 }
 

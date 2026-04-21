@@ -14,6 +14,7 @@
 ///   cargo run --release --example qwen3 -- --prompt "Hello world" # custom prompt
 ///   cargo run --release --example qwen3 -- --tokens 128           # generate 128 tokens
 ///   cargo run --release --example qwen3 -- --f16                  # half-precision weights
+///   cargo run --release --example qwen3 -- --q4                   # 4-bit quantized weights
 use meganeura::{Graph, build_inference_session, data::safetensors::SafeTensorsModel};
 
 struct Qwen3Config {
@@ -149,8 +150,11 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(64);
 
-    let use_f16 = args.iter().any(|a| a == "--f16");
-    if use_f16 {
+    let use_q4 = args.iter().any(|a| a == "--q4");
+    let use_f16 = args.iter().any(|a| a == "--f16") && !use_q4;
+    if use_q4 {
+        println!("Q4_0 weight storage enabled (~8x VRAM reduction for weights)");
+    } else if use_f16 {
         println!("f16 weight storage enabled (halving VRAM for weights)");
     }
 
@@ -206,7 +210,9 @@ fn main() {
 
     // Helper: matmul weight parameters use f16 storage when --f16 is set
     let weight = |g: &mut Graph, name: &str, shape: &[usize]| -> meganeura::graph::NodeId {
-        if use_f16 {
+        if use_q4 {
+            g.parameter_q4(name, shape)
+        } else if use_f16 {
             g.parameter_f16(name, shape)
         } else {
             g.parameter(name, shape)
@@ -416,7 +422,7 @@ fn main() {
         let next_token = pos_logits
             .iter()
             .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .unwrap()
             .0 as u32;
 
