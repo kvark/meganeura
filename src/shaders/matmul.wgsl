@@ -23,6 +23,7 @@ $FUSED_ADD_DECL
 var<uniform> params: Params;
 var<workgroup> shared_a: array<f32, 2112>;  // 64 * 33 (padded stride)
 var<workgroup> shared_b: array<f32, 2080>;  // 32 * 65 (padded stride)
+$B_DEQUANT_FN
 
 @compute @workgroup_size(16, 16)
 fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
@@ -63,7 +64,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             let b_row = t + row_local;
             let b_col = tile_col + col_local;
             let in_bounds = (b_row < params.k) && (b_col < params.n);
-            shared_b[row_local * 65u + col_local] = select(0.0, $B_CAST_OPEN matrix_b[$B_INDEX] $B_CAST_CLOSE, in_bounds);
+            shared_b[row_local * 65u + col_local] = select(0.0, $B_LOAD_EXPR, in_bounds);
         }
 
         workgroupBarrier();

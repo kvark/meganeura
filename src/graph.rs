@@ -7,6 +7,9 @@ pub enum DType {
     F32,
     F16,
     U32,
+    /// Q4_0: symmetric 4-bit quantization, 32-element blocks.
+    /// Each block: 1 f16 scale (2 bytes) + 16 packed nibble bytes = 18 bytes.
+    Q4_0,
 }
 
 impl DType {
@@ -15,6 +18,7 @@ impl DType {
             DType::F32 => 4,
             DType::F16 => 2,
             DType::U32 => 4,
+            DType::Q4_0 => panic!("Q4_0 uses block-level sizing, not per-element"),
         }
     }
 }
@@ -43,7 +47,18 @@ impl TensorType {
     }
 
     pub fn size_bytes(&self) -> usize {
-        self.num_elements() * self.dtype.size_bytes()
+        match self.dtype {
+            DType::Q4_0 => {
+                // Q4_0: 32-element blocks, 18 bytes each (2B scale + 16B nibbles).
+                // GPU buffer is array<u32>, so round up to 4-byte alignment.
+                let n = self.num_elements();
+                let blocks = n.div_ceil(32);
+                let scales_u32s = blocks.div_ceil(2); // 2 f16 scales per u32
+                let data_u32s = blocks * 4; // 16 bytes = 4 u32s per block
+                (scales_u32s + data_u32s) * 4
+            }
+            _ => self.num_elements() * self.dtype.size_bytes(),
+        }
     }
 
     pub fn rank(&self) -> usize {
@@ -711,6 +726,19 @@ impl Graph {
     /// Shaders read f16 and cast to f32 for computation.
     pub fn parameter_f16(&mut self, name: &str, shape: &[usize]) -> NodeId {
         let ty = TensorType::f16(shape.to_vec());
+        self.add_node(
+            Op::Parameter {
+                name: name.to_string(),
+            },
+            vec![],
+            ty,
+        )
+    }
+
+    /// Create a parameter stored as Q4_0 on GPU (~4.5 bits/element).
+    /// Weights are quantized from f32 to 4-bit symmetric blocks during upload.
+    pub fn parameter_q4(&mut self, name: &str, shape: &[usize]) -> NodeId {
+        let ty = TensorType::new(shape.to_vec(), DType::Q4_0);
         self.add_node(
             Op::Parameter {
                 name: name.to_string(),

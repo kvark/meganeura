@@ -591,6 +591,8 @@ struct Pipelines {
     small_map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
     /// Pipelines reading f16 weight storage (dispatches with `b_is_f16 = true`).
     f16_map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
+    /// Pipelines reading Q4_0 weight storage (dispatches with `b_is_q4 = true`).
+    q4_map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
     /// Epilogue-fused pipelines keyed by (shader, epilogue chain).
     epilogue_map:
         HashMap<(ShaderEntry, Vec<crate::compile::EpilogueOp>), blade_graphics::ComputePipeline>,
@@ -617,6 +619,7 @@ impl Pipelines {
         let mut needed: HashSet<ShaderGroup> = HashSet::new();
         let mut needed_coop: HashSet<ShaderGroup> = HashSet::new();
         let mut needed_f16: HashSet<ShaderGroup> = HashSet::new();
+        let mut needed_q4: HashSet<ShaderGroup> = HashSet::new();
         let mut entries_for_group: HashMap<ShaderGroup, HashSet<ShaderEntry>> = HashMap::new();
         // Extract head_dim from attention dispatches for parameterized shader generation.
         let mut attention_head_dim: Option<u32> = None;
@@ -690,6 +693,13 @@ impl Pipelines {
             }
             if dispatch.b_is_f16 {
                 needed_f16.insert(group);
+                entries_for_group
+                    .entry(group)
+                    .or_default()
+                    .insert(dispatch.shader.clone());
+            }
+            if dispatch.b_is_q4 {
+                needed_q4.insert(group);
                 entries_for_group
                     .entry(group)
                     .or_default()
@@ -896,6 +906,27 @@ impl Pipelines {
             }
         }
 
+        // Compile Q4 weight storage pipelines.
+        let mut q4_map = HashMap::new();
+        for &group in &needed_q4 {
+            let sm = crate::codegen::generate_module_q4(group);
+            let shader = gpu.create_shader(bg::ShaderDesc {
+                source: &sm.source,
+                naga_module: Some(sm.module),
+            });
+            if let Some(entries) = entries_for_group.get(&group) {
+                for entry in entries {
+                    let layout = shader_data_layout(entry);
+                    let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
+                        name: entry.entry_point(),
+                        data_layouts: &[&layout],
+                        compute: shader.at(entry.entry_point()),
+                    });
+                    q4_map.insert(entry.clone(), pipeline);
+                }
+            }
+        }
+
         // Compile epilogue-fused pipelines for dispatches with non-empty epilogue.
         // Prefer the new MatMulEpilogue (PointwiseDAG); fall back to legacy
         // Vec<EpilogueOp> for cached plans that predate the DAG migration.
@@ -990,6 +1021,7 @@ impl Pipelines {
             coop_map,
             small_map,
             f16_map,
+            q4_map,
             epilogue_map,
             pointwise_map,
             reduction_map,
@@ -1023,6 +1055,11 @@ impl Pipelines {
                 return p;
             }
         }
+        if dispatch.b_is_q4 {
+            if let Some(p) = self.q4_map.get(&dispatch.shader) {
+                return p;
+            }
+        }
         if dispatch.b_is_f16 {
             if let Some(p) = self.f16_map.get(&dispatch.shader) {
                 return p;
@@ -1043,6 +1080,9 @@ impl Pipelines {
             result.push((entry.entry_point(), pipeline));
         }
         for (entry, pipeline) in &self.f16_map {
+            result.push((entry.entry_point(), pipeline));
+        }
+        for (entry, pipeline) in &self.q4_map {
             result.push((entry.entry_point(), pipeline));
         }
         #[allow(clippy::needless_borrowed_reference)]
@@ -1999,6 +2039,74 @@ pub fn init_gpu_context() -> Result<blade_graphics::Context, blade_graphics::Not
     }
 }
 
+/// Quantize f32 data to Q4_0 format (symmetric 4-bit, 32-element blocks).
+///
+/// The data represents a matrix of shape `[rows, cols]` stored row-major.
+/// Q4 blocks are formed column-wise: 32 consecutive elements along the row
+/// dimension within each column, matching the matmul KTILE=32.
+///
+/// Returns a packed buffer: `[scales as u32 (2 f16 per u32)][nibble data as u32]`.
+fn quantize_q4_0(data: &[f32], rows: usize, cols: usize) -> Vec<u8> {
+    assert_eq!(data.len(), rows * cols);
+    assert!(
+        rows.is_multiple_of(32),
+        "Q4_0 requires rows (K dim) to be a multiple of 32"
+    );
+
+    let blocks_per_col = rows / 32;
+    let num_blocks = blocks_per_col * cols;
+    let scales_u32s = num_blocks.div_ceil(2);
+    let data_u32s = num_blocks * 4; // 16 bytes = 4 u32s per block
+    let total_bytes = (scales_u32s + data_u32s) * 4;
+
+    let mut buf = vec![0u8; total_bytes];
+
+    // Process each block: column-major order (col, then block within col)
+    for col in 0..cols {
+        for blk in 0..blocks_per_col {
+            let block_idx = col * blocks_per_col + blk;
+
+            // Find absmax for this block of 32 elements
+            let mut absmax = 0.0f32;
+            for i in 0..32 {
+                let row = blk * 32 + i;
+                let val = data[row * cols + col].abs();
+                if val > absmax {
+                    absmax = val;
+                }
+            }
+
+            // Scale: map [-absmax, absmax] to [-8, 7] via symmetric quant
+            // nibble = round(val / scale) + 8, clamped to [0, 15]
+            let scale = if absmax > 0.0 { absmax / 7.0 } else { 1.0 };
+            let scale_f16 = half::f16::from_f32(scale);
+
+            // Write scale into the scales region (2 f16 packed per u32)
+            let scale_byte_offset = (block_idx / 2) * 4 + (block_idx % 2) * 2;
+            buf[scale_byte_offset..scale_byte_offset + 2].copy_from_slice(&scale_f16.to_le_bytes());
+
+            // Write nibbles into the data region
+            let data_byte_base = scales_u32s * 4 + block_idx * 16;
+            for i in 0..32 {
+                let row = blk * 32 + i;
+                let val = data[row * cols + col];
+                let quantized = (val / scale).round() as i32 + 8;
+                let nibble = quantized.clamp(0, 15) as u8;
+
+                let byte_in_block = i / 2;
+                let byte_offset = data_byte_base + byte_in_block;
+                if i % 2 == 0 {
+                    buf[byte_offset] |= nibble; // low nibble
+                } else {
+                    buf[byte_offset] |= nibble << 4; // high nibble
+                }
+            }
+        }
+    }
+
+    buf
+}
+
 /// Result of [`auto_tune`] — capability snapshot from the connected GPU
 /// suitable for installing as global compilation defaults via
 /// [`install_auto_tune`].
@@ -2037,7 +2145,11 @@ impl Session {
         // Check regular parameters first
         for &(ref param_name, buf_ref) in &self.plan.param_buffers {
             if param_name == name {
-                if self.plan.f16_buffers.contains(&buf_ref) {
+                if let Some(&(rows, cols)) = self.plan.q4_buffers.get(&buf_ref) {
+                    // Convert f32 → Q4_0 packed format
+                    let q4_data = quantize_q4_0(data, rows, cols);
+                    self.upload_buffer(buf_ref, &q4_data);
+                } else if self.plan.f16_buffers.contains(&buf_ref) {
                     // Convert f32 → f16 and upload half-precision data
                     let f16_data: Vec<u16> = data
                         .iter()
