@@ -2482,3 +2482,167 @@ fn q4_matmul_correctness() {
     );
     eprintln!("Q4 matmul PASSED: GPU-CPU max error {:.4}", max_err);
 }
+
+/// Incrementally build a 1-layer transformer with Q4 weights.
+/// Output each intermediate result to find where NaN first appears.
+#[test]
+fn q4_layer_nan_hunt() {
+    let seq = 6;
+    let hidden = 1024;
+    let qd = 2048; // 16 heads * 128 head_dim
+    let kv = 1024; // 8 kv_heads * 128 head_dim
+    let ffn = 3072;
+    let head_dim = 128u32;
+    let num_heads = 16u32;
+    let num_kv_heads = 8u32;
+
+    // Random-ish weight data (deterministic, larger range like real weights)
+    let make_weights = |n: usize| -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let x = (i as f64 * 0.618033988) % 1.0; // golden ratio hash
+                (x * 2.0 - 1.0) as f32 * 0.5
+            })
+            .collect()
+    };
+
+    // Test stages: each adds one more operation
+    let stages: &[&str] = &["embed+rmsnorm+qkv+rope+attn+o_proj+residual", "full_layer"];
+
+    for &stage in stages {
+        let mut g = Graph::new();
+        let token_ids = g.input_u32("token_ids", &[seq]);
+        let embed = g.parameter("embed", &[4096, hidden]); // small vocab for test
+        let mut x = g.embedding(token_ids, embed);
+
+        let ln1_w = g.parameter("ln1", &[hidden]);
+        let h = g.rms_norm(x, ln1_w, 1e-6);
+
+        let wq = g.parameter_q4("wq", &[hidden, qd]);
+        let q = g.matmul(h, wq);
+
+        let wk = g.parameter_q4("wk", &[hidden, kv]);
+        let wv = g.parameter_q4("wv", &[hidden, kv]);
+        let k = g.matmul(h, wk);
+        let v = g.matmul(h, wv);
+        let q_rope = g.rope(q, 1e6, head_dim);
+        let k_rope = g.rope(k, 1e6, head_dim);
+
+        match stage {
+            "embed+rmsnorm+q_matmul" => {
+                g.set_outputs(vec![q]);
+            }
+            "embed+rmsnorm+qkv_matmuls" => {
+                g.set_outputs(vec![q, k, v]);
+            }
+            "embed+rmsnorm+qkv+rope" => {
+                g.set_outputs(vec![q_rope, k_rope]);
+            }
+            _ => {
+                let attn = g.causal_attention(q_rope, k_rope, v, num_heads, num_kv_heads, head_dim);
+                let wo = g.parameter_q4("wo", &[qd, hidden]);
+                let attn_out = g.matmul(attn, wo);
+
+                match stage {
+                    "embed+rmsnorm+qkv+rope+attn" => {
+                        g.set_outputs(vec![attn]);
+                    }
+                    "embed+rmsnorm+qkv+rope+attn+o_proj" => {
+                        g.set_outputs(vec![attn_out]);
+                    }
+                    "embed+rmsnorm+qkv+rope+attn+o_proj+check_x" => {
+                        // Output both x (embedding) and attn_out to check if x is still valid
+                        g.set_outputs(vec![x, attn_out]);
+                    }
+                    "embed+rmsnorm+qkv+rope+attn+o_proj+residual" => {
+                        x = g.add(x, attn_out);
+                        g.set_outputs(vec![x]);
+                    }
+                    _ => {
+                        x = g.add(x, attn_out);
+                        let ln2_w = g.parameter("ln2", &[hidden]);
+                        let h2 = g.rms_norm(x, ln2_w, 1e-6);
+                        let wg = g.parameter_q4("wg", &[hidden, ffn]);
+                        let wu = g.parameter_q4("wu", &[hidden, ffn]);
+                        let wd = g.parameter_q4("wd", &[ffn, hidden]);
+                        let gate = g.matmul(h2, wg);
+                        let up = g.matmul(h2, wu);
+                        let ffn_out = g.swiglu(gate, up);
+                        let ffn_out = g.matmul(ffn_out, wd);
+                        x = g.add(x, ffn_out);
+                        g.set_outputs(vec![x]);
+                    }
+                }
+            }
+        }
+
+        let mut session = build_inference_session(&g);
+
+        // Set dummy inputs
+        session.set_input_u32("token_ids", &[10, 20, 30, 40, 50, 60]);
+        session.set_parameter("embed", &make_weights(4096 * hidden));
+        session.set_parameter("ln1", &vec![1.0f32; hidden]);
+        session.set_parameter("wq", &make_weights(hidden * qd));
+        session.set_parameter("wk", &make_weights(hidden * kv));
+        session.set_parameter("wv", &make_weights(hidden * kv));
+        if stage.contains("attn") || stage == "full_layer" {
+            session.set_parameter("wo", &make_weights(qd * hidden));
+        }
+        if stage == "full_layer" {
+            session.set_parameter("ln2", &vec![1.0f32; hidden]);
+            session.set_parameter("wg", &make_weights(hidden * ffn));
+            session.set_parameter("wu", &make_weights(hidden * ffn));
+            session.set_parameter("wd", &make_weights(ffn * hidden));
+        }
+
+        session.step();
+        session.wait();
+
+        // Read only the logically valid output elements
+        let out_buf = session.plan().output_buffers[0];
+        let buf_size = session.plan().buffers[out_buf.0 as usize] / 4;
+        let all_output = session.read_output(buf_size);
+        // For multi-output, just check first output. Logical size depends on stage.
+        let logical_size = seq * hidden; // first output is always [seq, hidden] or [seq, qd]
+        let logical_size = if stage.contains("check_x") {
+            seq * hidden // x is first output
+        } else if stage.contains("rope") && !stage.contains("attn") {
+            seq * qd
+        } else if stage.contains("qkv") && !stage.contains("rope") {
+            seq * qd
+        } else if stage.contains("q_matmul") {
+            seq * qd
+        } else if stage.contains("attn") && !stage.contains("o_proj") {
+            seq * qd
+        } else {
+            seq * hidden
+        };
+        let output = &all_output[..logical_size.min(all_output.len())];
+        let nans = output.iter().filter(|v| v.is_nan()).count();
+        let infs = output.iter().filter(|v| v.is_infinite()).count();
+        let finite: Vec<f32> = output.iter().copied().filter(|v| v.is_finite()).collect();
+        let (min_v, max_v) = if finite.is_empty() {
+            (f32::NAN, f32::NAN)
+        } else {
+            (
+                finite.iter().copied().fold(f32::INFINITY, f32::min),
+                finite.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+            )
+        };
+
+        eprintln!(
+            "  {:<50} nans={}/{}, infs={}, range=[{:.2}, {:.2}]",
+            stage,
+            nans,
+            output.len(),
+            infs,
+            min_v,
+            max_v,
+        );
+
+        if nans > 0 {
+            eprintln!("  FOUND NaN at stage: {}", stage);
+            // Don't break — continue to see all stages
+        }
+    }
+}

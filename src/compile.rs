@@ -1485,11 +1485,13 @@ impl<'a> Compiler<'a> {
                 let d = self.get_buffer(node.inputs[2]);
                 let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
+                let b_dtype = self.graph.node(node.inputs[1]).ty.dtype;
+                let b_f16 = b_dtype == DType::F16;
+                let b_q4 = b_dtype == DType::Q4_0;
                 let m = a_shape[0] as u32;
                 let k = a_shape[1] as u32;
                 let n = b_shape[1] as u32;
                 if m == 1 && n.is_multiple_of(4) {
-                    // K-split GEMV-with-residual-add: one WG per 4 cols.
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::MatMulGemvAdd,
                         workgroups: [n / 4, 1, 1],
@@ -1499,6 +1501,8 @@ impl<'a> Compiler<'a> {
                         params: vec![m, k, n, 0],
                         use_coop: false,
                         use_small_tiles: false,
+                        b_is_f16: b_f16,
+                        b_is_q4: b_q4,
                         ..Default::default()
                     });
                 } else {
@@ -1511,6 +1515,8 @@ impl<'a> Compiler<'a> {
                         params: vec![m, k, n, 0],
                         use_coop: false,
                         use_small_tiles: false,
+                        b_is_f16: b_f16,
+                        b_is_q4: b_q4,
                         ..Default::default()
                     });
                 }
@@ -1523,9 +1529,12 @@ impl<'a> Compiler<'a> {
                 let d = self.get_buffer(node.inputs[2]);
                 let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
-                let k = a_shape[0] as u32; // A is [K, M]
+                let b_dtype = self.graph.node(node.inputs[1]).ty.dtype;
+                let b_f16 = b_dtype == DType::F16;
+                let b_q4 = b_dtype == DType::Q4_0;
+                let k = a_shape[0] as u32;
                 let m = a_shape[1] as u32;
-                let n = b_shape[1] as u32; // B is [K, N]
+                let n = b_shape[1] as u32;
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::FusedMatMulATAdd,
                     workgroups: [n.div_ceil(64), m.div_ceil(64), 1],
@@ -1535,6 +1544,8 @@ impl<'a> Compiler<'a> {
                     params: vec![m, n, k, 0],
                     use_coop: false,
                     use_small_tiles: false,
+                    b_is_f16: b_f16,
+                    b_is_q4: b_q4,
                     ..Default::default()
                 });
             }
@@ -1546,9 +1557,12 @@ impl<'a> Compiler<'a> {
                 let d = self.get_buffer(node.inputs[2]);
                 let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
-                let m = a_shape[0] as u32; // A is [M, K]
+                let b_dtype = self.graph.node(node.inputs[1]).ty.dtype;
+                let b_f16 = b_dtype == DType::F16;
+                let b_q4 = b_dtype == DType::Q4_0;
+                let m = a_shape[0] as u32;
                 let k = a_shape[1] as u32;
-                let n = b_shape[0] as u32; // B is [N, K]
+                let n = b_shape[0] as u32;
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::FusedMatMulBTAdd,
                     workgroups: [n.div_ceil(64), m.div_ceil(64), 1],
@@ -1558,6 +1572,8 @@ impl<'a> Compiler<'a> {
                     params: vec![m, n, k, 0],
                     use_coop: false,
                     use_small_tiles: false,
+                    b_is_f16: b_f16,
+                    b_is_q4: b_q4,
                     ..Default::default()
                 });
             }
