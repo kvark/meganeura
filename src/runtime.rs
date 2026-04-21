@@ -3316,6 +3316,15 @@ impl Drop for Session {
         for (_, pipeline) in self.pipelines.small_map.iter_mut() {
             self.gpu.destroy_compute_pipeline(pipeline);
         }
+        for (_, pipeline) in self.pipelines.epilogue_map.iter_mut() {
+            self.gpu.destroy_compute_pipeline(pipeline);
+        }
+        for (_, pipeline) in self.pipelines.pointwise_map.iter_mut() {
+            self.gpu.destroy_compute_pipeline(pipeline);
+        }
+        for (_, pipeline) in self.pipelines.reduction_map.iter_mut() {
+            self.gpu.destroy_compute_pipeline(pipeline);
+        }
         for buffer in &self.buffers {
             self.gpu.destroy_buffer(*buffer);
         }
