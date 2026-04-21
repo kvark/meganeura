@@ -2528,52 +2528,26 @@ fn q4_layer_nan_hunt() {
         let q_rope = g.rope(q, 1e6, head_dim);
         let k_rope = g.rope(k, 1e6, head_dim);
 
-        match stage {
-            "embed+rmsnorm+q_matmul" => {
-                g.set_outputs(vec![q]);
-            }
-            "embed+rmsnorm+qkv_matmuls" => {
-                g.set_outputs(vec![q, k, v]);
-            }
-            "embed+rmsnorm+qkv+rope" => {
-                g.set_outputs(vec![q_rope, k_rope]);
-            }
-            _ => {
-                let attn = g.causal_attention(q_rope, k_rope, v, num_heads, num_kv_heads, head_dim);
-                let wo = g.parameter_q4("wo", &[qd, hidden]);
-                let attn_out = g.matmul(attn, wo);
+        {
+            let attn =
+                g.causal_attention(q_rope, k_rope, v, num_heads, num_kv_heads, head_dim);
+            let wo = g.parameter_q4("wo", &[qd, hidden]);
+            let attn_out = g.matmul(attn, wo);
+            x = g.add(x, attn_out);
 
-                match stage {
-                    "embed+rmsnorm+qkv+rope+attn" => {
-                        g.set_outputs(vec![attn]);
-                    }
-                    "embed+rmsnorm+qkv+rope+attn+o_proj" => {
-                        g.set_outputs(vec![attn_out]);
-                    }
-                    "embed+rmsnorm+qkv+rope+attn+o_proj+check_x" => {
-                        // Output both x (embedding) and attn_out to check if x is still valid
-                        g.set_outputs(vec![x, attn_out]);
-                    }
-                    "embed+rmsnorm+qkv+rope+attn+o_proj+residual" => {
-                        x = g.add(x, attn_out);
-                        g.set_outputs(vec![x]);
-                    }
-                    _ => {
-                        x = g.add(x, attn_out);
-                        let ln2_w = g.parameter("ln2", &[hidden]);
-                        let h2 = g.rms_norm(x, ln2_w, 1e-6);
-                        let wg = g.parameter_q4("wg", &[hidden, ffn]);
-                        let wu = g.parameter_q4("wu", &[hidden, ffn]);
-                        let wd = g.parameter_q4("wd", &[ffn, hidden]);
-                        let gate = g.matmul(h2, wg);
-                        let up = g.matmul(h2, wu);
-                        let ffn_out = g.swiglu(gate, up);
-                        let ffn_out = g.matmul(ffn_out, wd);
-                        x = g.add(x, ffn_out);
-                        g.set_outputs(vec![x]);
-                    }
-                }
+            if stage == "full_layer" {
+                let ln2_w = g.parameter("ln2", &[hidden]);
+                let h2 = g.rms_norm(x, ln2_w, 1e-6);
+                let wg = g.parameter_q4("wg", &[hidden, ffn]);
+                let wu = g.parameter_q4("wu", &[hidden, ffn]);
+                let wd = g.parameter_q4("wd", &[ffn, hidden]);
+                let gate = g.matmul(h2, wg);
+                let up = g.matmul(h2, wu);
+                let ffn_out = g.swiglu(gate, up);
+                let ffn_out = g.matmul(ffn_out, wd);
+                x = g.add(x, ffn_out);
             }
+            g.set_outputs(vec![x]);
         }
 
         let mut session = build_inference_session(&g);
@@ -2602,21 +2576,7 @@ fn q4_layer_nan_hunt() {
         let out_buf = session.plan().output_buffers[0];
         let buf_size = session.plan().buffers[out_buf.0 as usize] / 4;
         let all_output = session.read_output(buf_size);
-        // For multi-output, just check first output. Logical size depends on stage.
-        let logical_size = seq * hidden; // first output is always [seq, hidden] or [seq, qd]
-        let logical_size = if stage.contains("check_x") {
-            seq * hidden // x is first output
-        } else if stage.contains("rope") && !stage.contains("attn") {
-            seq * qd
-        } else if stage.contains("qkv") && !stage.contains("rope") {
-            seq * qd
-        } else if stage.contains("q_matmul") {
-            seq * qd
-        } else if stage.contains("attn") && !stage.contains("o_proj") {
-            seq * qd
-        } else {
-            seq * hidden
-        };
+        let logical_size = seq * hidden;
         let output = &all_output[..logical_size.min(all_output.len())];
         let nans = output.iter().filter(|v| v.is_nan()).count();
         let infs = output.iter().filter(|v| v.is_infinite()).count();
