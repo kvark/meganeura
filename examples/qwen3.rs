@@ -151,7 +151,8 @@ fn main() {
         .unwrap_or(64);
 
     let use_q4 = args.iter().any(|a| a == "--q4");
-    let use_f16 = args.iter().any(|a| a == "--f16") && !use_q4;
+    let use_q8 = args.iter().any(|a| a == "--q8");
+    let use_f16 = args.iter().any(|a| a == "--f16") && !use_q4 && !use_q8;
     let max_layers: usize = args
         .iter()
         .position(|a| a == "--layers")
@@ -159,7 +160,9 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(config.num_layers);
     if use_q4 {
-        println!("Q4_0 weight storage enabled (~8x VRAM reduction for weights)");
+        println!("Q4 weight storage enabled (~8x VRAM reduction for weights)");
+    } else if use_q8 {
+        println!("Q8 weight storage enabled (~4x VRAM reduction for weights)");
     } else if use_f16 {
         println!("f16 weight storage enabled (halving VRAM for weights)");
     }
@@ -218,6 +221,8 @@ fn main() {
     let weight = |g: &mut Graph, name: &str, shape: &[usize]| -> meganeura::graph::NodeId {
         if use_q4 {
             g.parameter_q4(name, shape)
+        } else if use_q8 {
+            g.parameter_q8(name, shape)
         } else if use_f16 {
             g.parameter_f16(name, shape)
         } else {

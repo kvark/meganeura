@@ -663,6 +663,7 @@ enum BStorageMode {
     F32,
     F16,
     Q4,
+    Q8,
 }
 
 fn matmul_vars_full(
@@ -710,6 +711,12 @@ fn matmul_vars_full(
             "array<u32>",
             "dequant_q4(b_row, b_col)".to_string(),
             Q4_DEQUANT_FN.to_string(),
+        ),
+        BStorageMode::Q8 => (
+            "",
+            "array<u32>",
+            "dequant_q8(b_row, b_col)".to_string(),
+            Q8_DEQUANT_FN.to_string(),
         ),
     };
     let src = preprocess(
@@ -766,6 +773,42 @@ fn dequant_q4(k_idx: u32, n_idx: u32) -> f32 {
     let nibble = (data_u32 >> shift) & 0xFu;
 
     return f32(nibble) * d + m;
+}
+";
+
+/// Q8_0 dequantization: symmetric 8-bit, 32-element blocks.
+/// Layout: [9 u32s per block: 1 scale_u32 + 8 data_u32s].
+/// Block i starts at matrix_b[i * 9]. scale_f16 in low 16 bits of first u32.
+const Q8_DEQUANT_FN: &str = "
+fn q8_decode_f16(bits: u32) -> f32 {
+    let sign = (bits >> 15u) & 1u;
+    let expo = (bits >> 10u) & 0x1Fu;
+    let mant = bits & 0x3FFu;
+    var f32_bits = (sign << 31u) | ((expo + 112u) << 23u) | (mant << 13u);
+    if expo == 0u { f32_bits = sign << 31u; }
+    return bitcast<f32>(f32_bits);
+}
+
+fn dequant_q8(k_idx: u32, n_idx: u32) -> f32 {
+    // Q8_0: value = int8 * scale
+    let blocks_per_col = params.k / 32u;
+    let block = n_idx * blocks_per_col + k_idx / 32u;
+    let in_block = k_idx % 32u;
+
+    // Each block is 9 u32s: [scale_u32, data0..data7]
+    let block_base = block * 9u;
+    let scale = q8_decode_f16(matrix_b[block_base] & 0xFFFFu);
+
+    // Extract int8 from data u32s (4 bytes per u32)
+    let byte_idx = in_block;
+    let u32_idx = byte_idx / 4u;
+    let byte_in_u32 = byte_idx % 4u;
+    let data_u32 = matrix_b[block_base + 1u + u32_idx];
+    let raw_byte = (data_u32 >> (byte_in_u32 * 8u)) & 0xFFu;
+
+    // Sign-extend: if bit 7 is set, the value is negative
+    let signed = i32(raw_byte) - select(0, 256, raw_byte >= 128u);
+    return f32(signed) * scale;
 }
 ";
 
@@ -962,9 +1005,14 @@ pub fn generate_module_f16(group: ShaderGroup) -> ShaderModule {
     generate_module_with_b_mode(group, BStorageMode::F16)
 }
 
-/// Generate a matmul module with Q4_0 weight (B) storage.
+/// Generate a matmul module with Q4 weight (B) storage.
 pub fn generate_module_q4(group: ShaderGroup) -> ShaderModule {
     generate_module_with_b_mode(group, BStorageMode::Q4)
+}
+
+/// Generate a matmul module with Q8_0 weight (B) storage.
+pub fn generate_module_q8(group: ShaderGroup) -> ShaderModule {
+    generate_module_with_b_mode(group, BStorageMode::Q8)
 }
 
 fn generate_module_with_b_mode(group: ShaderGroup, mode: BStorageMode) -> ShaderModule {

@@ -591,8 +591,10 @@ struct Pipelines {
     small_map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
     /// Pipelines reading f16 weight storage (dispatches with `b_is_f16 = true`).
     f16_map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
-    /// Pipelines reading Q4_0 weight storage (dispatches with `b_is_q4 = true`).
+    /// Pipelines reading Q4 weight storage.
     q4_map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
+    /// Pipelines reading Q8_0 weight storage.
+    q8_map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
     /// Epilogue-fused pipelines keyed by (shader, epilogue chain).
     epilogue_map:
         HashMap<(ShaderEntry, Vec<crate::compile::EpilogueOp>), blade_graphics::ComputePipeline>,
@@ -620,6 +622,7 @@ impl Pipelines {
         let mut needed_coop: HashSet<ShaderGroup> = HashSet::new();
         let mut needed_f16: HashSet<ShaderGroup> = HashSet::new();
         let mut needed_q4: HashSet<ShaderGroup> = HashSet::new();
+        let mut needed_q8: HashSet<ShaderGroup> = HashSet::new();
         let mut entries_for_group: HashMap<ShaderGroup, HashSet<ShaderEntry>> = HashMap::new();
         // Extract head_dim from attention dispatches for parameterized shader generation.
         let mut attention_head_dim: Option<u32> = None;
@@ -700,6 +703,13 @@ impl Pipelines {
             }
             if dispatch.b_is_q4 {
                 needed_q4.insert(group);
+                entries_for_group
+                    .entry(group)
+                    .or_default()
+                    .insert(dispatch.shader.clone());
+            }
+            if dispatch.b_is_q8 {
+                needed_q8.insert(group);
                 entries_for_group
                     .entry(group)
                     .or_default()
@@ -927,6 +937,27 @@ impl Pipelines {
             }
         }
 
+        // Compile Q8 weight storage pipelines.
+        let mut q8_map = HashMap::new();
+        for &group in &needed_q8 {
+            let sm = crate::codegen::generate_module_q8(group);
+            let shader = gpu.create_shader(bg::ShaderDesc {
+                source: &sm.source,
+                naga_module: Some(sm.module),
+            });
+            if let Some(entries) = entries_for_group.get(&group) {
+                for entry in entries {
+                    let layout = shader_data_layout(entry);
+                    let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
+                        name: entry.entry_point(),
+                        data_layouts: &[&layout],
+                        compute: shader.at(entry.entry_point()),
+                    });
+                    q8_map.insert(entry.clone(), pipeline);
+                }
+            }
+        }
+
         // Compile epilogue-fused pipelines for dispatches with non-empty epilogue.
         // Prefer the new MatMulEpilogue (PointwiseDAG); fall back to legacy
         // Vec<EpilogueOp> for cached plans that predate the DAG migration.
@@ -1022,6 +1053,7 @@ impl Pipelines {
             small_map,
             f16_map,
             q4_map,
+            q8_map,
             epilogue_map,
             pointwise_map,
             reduction_map,
@@ -1047,6 +1079,11 @@ impl Pipelines {
         }
         if dispatch.b_is_q4 {
             if let Some(p) = self.q4_map.get(&dispatch.shader) {
+                return p;
+            }
+        }
+        if dispatch.b_is_q8 {
+            if let Some(p) = self.q8_map.get(&dispatch.shader) {
                 return p;
             }
         }
@@ -1083,6 +1120,9 @@ impl Pipelines {
             result.push((entry.entry_point(), pipeline));
         }
         for (entry, pipeline) in &self.q4_map {
+            result.push((entry.entry_point(), pipeline));
+        }
+        for (entry, pipeline) in &self.q8_map {
             result.push((entry.entry_point(), pipeline));
         }
         #[allow(clippy::needless_borrowed_reference)]
@@ -1653,7 +1693,11 @@ impl Session {
                 } else {
                     16 // enables coop for attention K/V projections (N=320, 20 WGs)
                 };
-                if coop_wgs >= min_wgs && !dispatch.b_is_q4 && !dispatch.b_is_f16 {
+                if coop_wgs >= min_wgs
+                    && !dispatch.b_is_q4
+                    && !dispatch.b_is_q8
+                    && !dispatch.b_is_f16
+                {
                     dispatch.use_coop = true;
                     // Route conv2d coop dispatches to generated specialized kernels
                     if is_conv_bwd {
@@ -1698,6 +1742,7 @@ impl Session {
                 if dispatch.use_coop
                     || dispatch.use_small_tiles
                     || dispatch.b_is_q4
+                    || dispatch.b_is_q8
                     || dispatch.b_is_f16
                 {
                     continue;
@@ -2159,6 +2204,83 @@ pub fn dequantize_q4_0(buf: &[u8], rows: usize, cols: usize) -> Vec<f32> {
     out
 }
 
+/// Quantize f32 data to Q8_0 format (symmetric 8-bit, 32-element blocks).
+/// Per block: scale = absmax / 127, int8 = round(val / scale), clamped to [-128, 127].
+/// Layout: `[scale_u32 per block][8 data_u32s per block]` = 9 u32s per block.
+pub fn quantize_q8_0(data: &[f32], rows: usize, cols: usize) -> Vec<u8> {
+    assert_eq!(data.len(), rows * cols);
+    assert!(
+        rows.is_multiple_of(32),
+        "Q8 requires rows (K dim) to be a multiple of 32"
+    );
+
+    let blocks_per_col = rows / 32;
+    let num_blocks = blocks_per_col * cols;
+    let total_bytes = num_blocks * 9 * 4; // 9 u32s per block
+
+    let mut buf = vec![0u8; total_bytes];
+
+    for col in 0..cols {
+        for blk in 0..blocks_per_col {
+            let block_idx = col * blocks_per_col + blk;
+            let block_base = block_idx * 36; // 9 u32s = 36 bytes
+
+            // Find absmax
+            let mut absmax = 0.0f32;
+            for i in 0..32 {
+                let row = blk * 32 + i;
+                let val = data[row * cols + col].abs();
+                if val > absmax {
+                    absmax = val;
+                }
+            }
+
+            let scale = if absmax > 0.0 { absmax / 127.0 } else { 1.0 };
+            let scale_f16 = half::f16::from_f32(scale);
+
+            // Write scale as f16 in low 16 bits of first u32
+            buf[block_base..block_base + 2].copy_from_slice(&scale_f16.to_le_bytes());
+
+            // Write int8 values
+            let inv_scale = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+            for i in 0..32 {
+                let row = blk * 32 + i;
+                let val = data[row * cols + col];
+                let q = (val * inv_scale).round().clamp(-128.0, 127.0) as i8;
+                buf[block_base + 4 + i] = q as u8;
+            }
+        }
+    }
+    buf
+}
+
+/// Dequantize Q8_0 buffer back to f32 (CPU reference).
+pub fn dequantize_q8_0(buf: &[u8], rows: usize, cols: usize) -> Vec<f32> {
+    let blocks_per_col = rows / 32;
+    let num_blocks = blocks_per_col * cols;
+    let _ = num_blocks;
+
+    let mut out = vec![0.0f32; rows * cols];
+
+    for col in 0..cols {
+        for blk in 0..blocks_per_col {
+            let block_idx = col * blocks_per_col + blk;
+            let block_base = block_idx * 36;
+
+            let scale_bits = u16::from_le_bytes([buf[block_base], buf[block_base + 1]]);
+            let scale = half::f16::from_bits(scale_bits).to_f32();
+
+            for i in 0..32 {
+                let q = buf[block_base + 4 + i] as i8;
+                let val = q as f32 * scale;
+                let row = blk * 32 + i;
+                out[row * cols + col] = val;
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod q4_tests {
     use super::*;
@@ -2276,6 +2398,9 @@ impl Session {
                 if let Some(&(rows, cols)) = self.plan.q4_buffers.get(&buf_ref) {
                     let q4_data = quantize_q4_0(data, rows, cols);
                     self.upload_buffer(buf_ref, &q4_data);
+                } else if let Some(&(rows, cols)) = self.plan.q8_buffers.get(&buf_ref) {
+                    let q8_data = quantize_q8_0(data, rows, cols);
+                    self.upload_buffer(buf_ref, &q8_data);
                 } else if self.plan.f16_buffers.contains(&buf_ref) {
                     // Convert f32 → f16 and upload half-precision data
                     let f16_data: Vec<u16> = data
@@ -2303,11 +2428,16 @@ impl Session {
                             let total_cols: usize = sources.iter().map(|s| s.1).sum();
                             let derived_is_f16 = self.plan.f16_buffers.contains(derived_buf);
                             let derived_is_q4 = self.plan.q4_buffers.contains_key(derived_buf);
+                            let derived_is_q8 = self.plan.q8_buffers.contains_key(derived_buf);
 
-                            if derived_is_q4 {
-                                // Q4: accumulate sources into an f32 staging buffer,
+                            if derived_is_q4 || derived_is_q8 {
+                                // Quantized: accumulate sources into f32 staging,
                                 // then quantize the full interleaved matrix.
-                                let &(rows, _cols) = self.plan.q4_buffers.get(derived_buf).unwrap();
+                                let &(rows, _cols) = if derived_is_q4 {
+                                    self.plan.q4_buffers.get(derived_buf).unwrap()
+                                } else {
+                                    self.plan.q8_buffers.get(derived_buf).unwrap()
+                                };
                                 let staging = self
                                     .q4_staging
                                     .entry(*derived_buf)
@@ -2328,10 +2458,13 @@ impl Session {
                                     }
                                     col_offset += src_cols;
                                 }
-                                // Check if all sources have been written (nonzero check)
-                                // by attempting quantize every time — last source wins.
-                                let q4_data = quantize_q4_0(staging, rows, total_cols);
-                                self.upload_buffer(*derived_buf, &q4_data);
+                                if derived_is_q4 {
+                                    let packed = quantize_q4_0(staging, rows, total_cols);
+                                    self.upload_buffer(*derived_buf, &packed);
+                                } else {
+                                    let packed = quantize_q8_0(staging, rows, total_cols);
+                                    self.upload_buffer(*derived_buf, &packed);
+                                }
                             } else {
                                 let elem_size = if derived_is_f16 { 2usize } else { 4usize };
                                 let buf_elems =
