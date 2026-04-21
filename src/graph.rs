@@ -9,8 +9,10 @@ pub enum DType {
     U32,
     /// Q4_1: asymmetric 4-bit quantization, 32-element blocks.
     /// Each block: 1 f16 scale + 1 f16 min (4 bytes) + 16 packed nibble bytes = 20 bytes.
-    /// Dequant: value = nibble * scale + min (unsigned nibbles 0-15).
     Q4_0,
+    /// Q8_0: symmetric 8-bit quantization, 32-element blocks.
+    /// Each block: 1 f16 scale (padded to u32) + 32 int8 values (8 u32s) = 36 bytes.
+    Q8_0,
 }
 
 impl DType {
@@ -19,7 +21,7 @@ impl DType {
             DType::F32 => 4,
             DType::F16 => 2,
             DType::U32 => 4,
-            DType::Q4_0 => panic!("Q4_0 uses block-level sizing, not per-element"),
+            DType::Q4_0 | DType::Q8_0 => panic!("quantized types use block-level sizing"),
         }
     }
 }
@@ -52,9 +54,14 @@ impl TensorType {
             DType::Q4_0 => {
                 // Q4_1: 32-element blocks, 20 bytes each.
                 // Per block: 1 u32 (d_f16 | m_f16) + 4 u32s (16 bytes nibbles) = 5 u32s.
-                let n = self.num_elements();
-                let blocks = n.div_ceil(32);
-                blocks * 5 * 4 // 5 u32s per block, 4 bytes per u32
+                let blocks = self.num_elements().div_ceil(32);
+                blocks * 5 * 4
+            }
+            DType::Q8_0 => {
+                // Q8_0: 32-element blocks, 36 bytes each.
+                // Per block: 1 u32 (scale_f16 padded) + 8 u32s (32 int8s) = 9 u32s.
+                let blocks = self.num_elements().div_ceil(32);
+                blocks * 9 * 4
             }
             _ => self.num_elements() * self.dtype.size_bytes(),
         }
@@ -738,6 +745,18 @@ impl Graph {
     /// Weights are quantized from f32 to 4-bit symmetric blocks during upload.
     pub fn parameter_q4(&mut self, name: &str, shape: &[usize]) -> NodeId {
         let ty = TensorType::new(shape.to_vec(), DType::Q4_0);
+        self.add_node(
+            Op::Parameter {
+                name: name.to_string(),
+            },
+            vec![],
+            ty,
+        )
+    }
+
+    /// Create a parameter stored as Q8_0 on GPU (8-bit symmetric, ~9 bits/element).
+    pub fn parameter_q8(&mut self, name: &str, shape: &[usize]) -> NodeId {
+        let ty = TensorType::new(shape.to_vec(), DType::Q8_0);
         self.add_node(
             Op::Parameter {
                 name: name.to_string(),
