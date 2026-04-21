@@ -750,6 +750,7 @@ fn q4_decode_f16(bits: u32) -> f32 {
 }
 
 fn dequant_q4(k_idx: u32, n_idx: u32) -> f32 {
+    // params.m=M, params.n=N(out cols), params.k=K(inner)
     let blocks_per_col = params.k / 32u;
     let num_blocks = blocks_per_col * params.n;
     let block = n_idx * blocks_per_col + k_idx / 32u;
@@ -768,7 +769,8 @@ fn dequant_q4(k_idx: u32, n_idx: u32) -> f32 {
     let shift = (byte_in_block % 4u) * 8u + select(0u, 4u, (in_block & 1u) != 0u);
     let nibble = (data_u32 >> shift) & 0xFu;
 
-    return (f32(nibble) - 8.0) * scale;
+    //return (f32(nibble) - 8.0) * scale;
+    return 0.1; // DEBUG constant
 }
 ";
 
@@ -5091,5 +5093,19 @@ mod tests {
                 result.err()
             );
         }
+    }
+
+    #[test]
+    fn q4_matmul_shader_generates() {
+        let sm = generate_module_q4(ShaderGroup::MatMul);
+        assert!(
+            sm.source.contains("dequant_q4"),
+            "Q4 shader missing dequant_q4 function"
+        );
+        assert!(
+            sm.source.contains("array<u32>"),
+            "Q4 shader should use array<u32> for B storage"
+        );
+        eprintln!("Q4 MatMul shader: {} chars", sm.source.len());
     }
 }

@@ -844,10 +844,12 @@ fn apply_swiglu_concat_fusions(graph: &mut Graph, fusions: &mut Vec<(String, u32
             rows: in_features,
             transform: crate::graph::ParamTransform::HorizontalConcat,
         });
+        // Preserve the dtype from the source parameters (e.g. Q4_0, F16).
+        let concat_dtype = graph.node(w_gate).ty.dtype;
         let concat_w = graph.add_raw_node(
             Op::Parameter { name: concat_name },
             vec![],
-            TensorType::f32(concat_shape.clone()),
+            TensorType::new(concat_shape.clone(), concat_dtype),
         );
 
         // MatMul(h, concat_w) → [M, 2*out_features]

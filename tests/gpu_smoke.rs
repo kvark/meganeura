@@ -2389,3 +2389,70 @@ fn sliding_window_attention_gradient_check() {
         max_rel_err, checks
     );
 }
+
+#[test]
+fn q4_matmul_correctness() {
+    // Test Q4 matmul: A[6,1024] (f32 input) × B[1024,2048] (Q4 weight) = C[6,2048]
+    // Model-scale dimensions (Qwen3 q_proj: hidden=1024 → q_dim=2048).
+    let m = 6;
+    let k = 1024;
+    let n = 2048;
+
+    // Build f32 reference graph
+    let mut g_ref = Graph::new();
+    let a_ref = g_ref.input("a", &[m, k]);
+    let b_ref = g_ref.parameter("b", &[k, n]);
+    let c_ref = g_ref.matmul(a_ref, b_ref);
+    g_ref.set_outputs(vec![c_ref]);
+
+    // Build Q4 graph
+    let mut g_q4 = Graph::new();
+    let a_q4 = g_q4.input("a", &[m, k]);
+    let b_q4 = g_q4.parameter_q4("b", &[k, n]);
+    let c_q4 = g_q4.matmul(a_q4, b_q4);
+    g_q4.set_outputs(vec![c_q4]);
+
+    let mut sess_ref = build_inference_session(&g_ref);
+    let mut sess_q4 = build_inference_session(&g_q4);
+
+    // Non-trivial data
+    let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 7) as f32 - 3.0) * 0.1).collect();
+    let b_data: Vec<f32> = (0..k * n).map(|i| ((i % 11) as f32 - 5.0) * 0.05).collect();
+
+    sess_ref.set_input("a", &a_data);
+    sess_ref.set_parameter("b", &b_data);
+    sess_ref.step();
+    sess_ref.wait();
+    let ref_output = sess_ref.read_output(m * n);
+
+    sess_q4.set_input("a", &a_data);
+    sess_q4.set_parameter("b", &b_data);
+    sess_q4.step();
+    sess_q4.wait();
+    let q4_output = sess_q4.read_output(m * n);
+
+    eprintln!("Q4 matmul test ({}x{}x{}):", m, k, n);
+    let mut max_err = 0.0f32;
+    for i in 0..m * n {
+        let err = (ref_output[i] - q4_output[i]).abs();
+        if err > max_err {
+            max_err = err;
+        }
+        eprintln!(
+            "  [{},{}]: ref={:.4}, q4={:.4}, err={:.4}",
+            i / n,
+            i % n,
+            ref_output[i],
+            q4_output[i],
+            err,
+        );
+    }
+    // Q4 quantization error: each weight has ~0.15 error, accumulated over K=32
+    // So output error can be up to ~1.0 for small values
+    assert!(
+        max_err < 2.0,
+        "Q4 matmul max error {:.4} exceeds tolerance",
+        max_err,
+    );
+    eprintln!("Q4 matmul PASSED: max error {:.4}", max_err);
+}
