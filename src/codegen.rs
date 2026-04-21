@@ -737,39 +737,35 @@ fn matmul_vars_full(
 /// Column-wise blocking: blocks of 32 elements along the K dimension per column.
 const Q4_DEQUANT_FN: &str = "
 fn q4_decode_f16(bits: u32) -> f32 {
-    // Decode IEEE 754 half-precision (f16) from 16-bit unsigned to f32.
     let sign = (bits >> 15u) & 1u;
     let expo = (bits >> 10u) & 0x1Fu;
     let mant = bits & 0x3FFu;
-    // Construct f32 bits: shift sign to bit 31, exponent bias adjust (127-15=112),
-    // mantissa to f32 position (shift left 13).
     var f32_bits = (sign << 31u) | ((expo + 112u) << 23u) | (mant << 13u);
-    // Handle zero exponent (subnormals become zero for our purposes)
     if expo == 0u { f32_bits = sign << 31u; }
     return bitcast<f32>(f32_bits);
 }
 
 fn dequant_q4(k_idx: u32, n_idx: u32) -> f32 {
-    // params.m=M, params.n=N(out cols), params.k=K(inner)
+    // Q4_1 asymmetric: value = nibble * d + m
+    // Layout: [num_blocks u32s: (d_f16|m_f16)][num_blocks*4 u32s: nibble data]
     let blocks_per_col = params.k / 32u;
     let num_blocks = blocks_per_col * params.n;
     let block = n_idx * blocks_per_col + k_idx / 32u;
     let in_block = k_idx % 32u;
 
-    // Scale: two f16 scales packed per u32.
-    let scale_u32 = matrix_b[block / 2u];
-    let scale_bits = select(scale_u32 & 0xFFFFu, scale_u32 >> 16u, (block & 1u) != 0u);
-    let scale = q4_decode_f16(scale_bits);
+    // d and m packed in one u32 per block (d=low16, m=high16)
+    let dm = matrix_b[block];
+    let d = q4_decode_f16(dm & 0xFFFFu);
+    let m = q4_decode_f16(dm >> 16u);
 
-    // Packed nibbles start after the scales region
-    let scales_u32s = (num_blocks + 1u) / 2u;
+    // Nibble data starts after the metadata region
     let byte_in_block = in_block / 2u;
     let u32_in_block = byte_in_block / 4u;
-    let data_u32 = matrix_b[scales_u32s + block * 4u + u32_in_block];
+    let data_u32 = matrix_b[num_blocks + block * 4u + u32_in_block];
     let shift = (byte_in_block % 4u) * 8u + select(0u, 4u, (in_block & 1u) != 0u);
     let nibble = (data_u32 >> shift) & 0xFu;
 
-    return (f32(nibble) - 8.0) * scale;
+    return f32(nibble) * d + m;
 }
 ";
 

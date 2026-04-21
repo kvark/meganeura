@@ -2046,68 +2046,75 @@ pub fn init_gpu_context() -> Result<blade_graphics::Context, blade_graphics::Not
     }
 }
 
-/// Quantize f32 data to Q4_0 format (symmetric 4-bit, 32-element blocks).
+/// Quantize f32 data to Q4_1 format (asymmetric 4-bit, 32-element blocks).
 ///
 /// The data represents a matrix of shape `[rows, cols]` stored row-major.
 /// Q4 blocks are formed column-wise: 32 consecutive elements along the row
 /// dimension within each column, matching the matmul KTILE=32.
 ///
-/// Returns a packed buffer: `[scales as u32 (2 f16 per u32)][nibble data as u32]`.
-/// Quantize f32 data to Q4_0 and return packed buffer.
-/// Public for testing.
+/// Per block: d = (max - min) / 15, m = min. Nibble = round((val - m) / d).
+/// Returns packed buffer: `[d_f16|m_f16 per block][nibble data]`.
 pub fn quantize_q4_0(data: &[f32], rows: usize, cols: usize) -> Vec<u8> {
     assert_eq!(data.len(), rows * cols);
     assert!(
         rows.is_multiple_of(32),
-        "Q4_0 requires rows (K dim) to be a multiple of 32"
+        "Q4 requires rows (K dim) to be a multiple of 32"
     );
 
     let blocks_per_col = rows / 32;
     let num_blocks = blocks_per_col * cols;
-    let scales_u32s = num_blocks.div_ceil(2);
-    let data_u32s = num_blocks * 4; // 16 bytes = 4 u32s per block
-    let total_bytes = (scales_u32s + data_u32s) * 4;
+    // Layout: [num_blocks u32s for (d|m)][num_blocks * 4 u32s for nibbles]
+    let total_bytes = num_blocks * 5 * 4; // 5 u32s per block
 
     let mut buf = vec![0u8; total_bytes];
 
-    // Process each block: column-major order (col, then block within col)
     for col in 0..cols {
         for blk in 0..blocks_per_col {
             let block_idx = col * blocks_per_col + blk;
 
-            // Find absmax for this block of 32 elements
-            let mut absmax = 0.0f32;
-            for i in 0..32 {
-                let row = blk * 32 + i;
-                let val = data[row * cols + col].abs();
-                if val > absmax {
-                    absmax = val;
-                }
-            }
-
-            // Scale: map [-absmax, absmax] to [-8, 7] via symmetric quant
-            // nibble = round(val / scale) + 8, clamped to [0, 15]
-            let scale = if absmax > 0.0 { absmax / 7.0 } else { 1.0 };
-            let scale_f16 = half::f16::from_f32(scale);
-
-            // Write scale into the scales region (2 f16 packed per u32)
-            let scale_byte_offset = (block_idx / 2) * 4 + (block_idx % 2) * 2;
-            buf[scale_byte_offset..scale_byte_offset + 2].copy_from_slice(&scale_f16.to_le_bytes());
-
-            // Write nibbles into the data region
-            let data_byte_base = scales_u32s * 4 + block_idx * 16;
+            // Find min and max for this block
+            let mut bmin = f32::INFINITY;
+            let mut bmax = f32::NEG_INFINITY;
             for i in 0..32 {
                 let row = blk * 32 + i;
                 let val = data[row * cols + col];
-                let quantized = (val / scale).round() as i32 + 8;
-                let nibble = quantized.clamp(0, 15) as u8;
+                if val < bmin {
+                    bmin = val;
+                }
+                if val > bmax {
+                    bmax = val;
+                }
+            }
+
+            // Asymmetric: d = (max - min) / 15, m = min
+            let d = if bmax > bmin {
+                (bmax - bmin) / 15.0
+            } else {
+                1.0
+            };
+            let m = bmin;
+            let d_f16 = half::f16::from_f32(d);
+            let m_f16 = half::f16::from_f32(m);
+
+            // Pack d and m into one u32 (d in low 16, m in high 16)
+            let dm_u32 = d_f16.to_bits() as u32 | ((m_f16.to_bits() as u32) << 16);
+            let dm_offset = block_idx * 4;
+            buf[dm_offset..dm_offset + 4].copy_from_slice(&dm_u32.to_le_bytes());
+
+            // Write nibbles into the data region
+            let data_byte_base = num_blocks * 4 + block_idx * 16;
+            let d_inv = if d > 0.0 { 1.0 / d } else { 0.0 };
+            for i in 0..32 {
+                let row = blk * 32 + i;
+                let val = data[row * cols + col];
+                let nibble = ((val - m) * d_inv).round().clamp(0.0, 15.0) as u8;
 
                 let byte_in_block = i / 2;
                 let byte_offset = data_byte_base + byte_in_block;
                 if i % 2 == 0 {
-                    buf[byte_offset] |= nibble; // low nibble
+                    buf[byte_offset] |= nibble;
                 } else {
-                    buf[byte_offset] |= nibble << 4; // high nibble
+                    buf[byte_offset] |= nibble << 4;
                 }
             }
         }
@@ -2116,12 +2123,10 @@ pub fn quantize_q4_0(data: &[f32], rows: usize, cols: usize) -> Vec<u8> {
     buf
 }
 
-/// Dequantize Q4_0 buffer back to f32 (CPU reference, mirrors shader logic).
-/// Used for testing the quantization roundtrip.
+/// Dequantize Q4_1 buffer back to f32 (CPU reference, mirrors shader logic).
 pub fn dequantize_q4_0(buf: &[u8], rows: usize, cols: usize) -> Vec<f32> {
     let blocks_per_col = rows / 32;
     let num_blocks = blocks_per_col * cols;
-    let scales_u32s = num_blocks.div_ceil(2);
 
     let buf_u32: Vec<u32> = buf
         .chunks(4)
@@ -2134,22 +2139,18 @@ pub fn dequantize_q4_0(buf: &[u8], rows: usize, cols: usize) -> Vec<f32> {
         for blk in 0..blocks_per_col {
             let block = col * blocks_per_col + blk;
 
-            // Decode scale (same as shader q4_decode_f16)
-            let scale_u32 = buf_u32[block / 2];
-            let scale_bits = if block & 1 == 0 {
-                scale_u32 & 0xFFFF
-            } else {
-                scale_u32 >> 16
-            };
-            let scale = half::f16::from_bits(scale_bits as u16).to_f32();
+            // Decode d and m from packed u32
+            let dm = buf_u32[block];
+            let d = half::f16::from_bits((dm & 0xFFFF) as u16).to_f32();
+            let m = half::f16::from_bits((dm >> 16) as u16).to_f32();
 
             for i in 0..32 {
                 let byte_in_block = i / 2;
                 let u32_in_block = byte_in_block / 4;
-                let data_u32 = buf_u32[scales_u32s + block * 4 + u32_in_block];
+                let data_u32 = buf_u32[num_blocks + block * 4 + u32_in_block];
                 let shift = (byte_in_block % 4) * 8 + if i % 2 != 0 { 4 } else { 0 };
                 let nibble = (data_u32 >> shift) & 0xF;
-                let val = (nibble as f32 - 8.0) * scale;
+                let val = nibble as f32 * d + m;
                 let row = blk * 32 + i;
                 out[row * cols + col] = val;
             }

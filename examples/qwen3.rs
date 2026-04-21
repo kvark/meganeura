@@ -65,7 +65,7 @@ fn qwen3_1_7b() -> Qwen3Config {
         num_heads: 16,
         num_kv_heads: 8,
         head_dim: 128,
-        intermediate_size: 8960,
+        intermediate_size: 6144,
         rms_norm_eps: 1e-6,
         rope_theta: 1_000_000.0,
         tie_word_embeddings: true,

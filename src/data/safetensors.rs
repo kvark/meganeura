@@ -27,12 +27,14 @@ pub struct TensorInfo {
 }
 
 /// Parsed safetensors weights, loaded from a local file or downloaded
-/// from the HuggingFace Hub.
+/// from the HuggingFace Hub. Supports both single-file and sharded models.
 pub struct SafeTensorsModel {
-    /// Raw bytes of the safetensors file (kept alive for zero-copy access).
-    data: Vec<u8>,
+    /// Raw bytes of shard files (kept alive for zero-copy access).
+    shards: Vec<Vec<u8>>,
     /// Cached tensor metadata.
     info: HashMap<String, TensorInfo>,
+    /// Maps tensor name → shard index.
+    tensor_shard: HashMap<String, usize>,
 }
 
 impl SafeTensorsModel {
@@ -40,7 +42,66 @@ impl SafeTensorsModel {
     ///
     /// Downloads `model.safetensors` from the given repo (e.g. `"dacorvo/mnist-mlp"`).
     pub fn download(repo_id: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::download_file(repo_id, "model.safetensors")
+        let api = hf_hub::api::sync::Api::new()?;
+        let repo = api.model(repo_id.to_string());
+
+        // Try single file first, then sharded
+        match repo.get("model.safetensors") {
+            Ok(path) => Self::load(path),
+            Err(_) => {
+                // Try sharded: download index, then each shard
+                log::info!("{}: trying sharded safetensors", repo_id);
+                let index_path = repo.get("model.safetensors.index.json")?;
+                let index_str = std::fs::read_to_string(&index_path)?;
+                let index: serde_json::Value = serde_json::from_str(&index_str)?;
+                let weight_map = index["weight_map"]
+                    .as_object()
+                    .ok_or("missing weight_map in index")?;
+
+                // Collect unique shard filenames
+                let mut shard_files: Vec<String> = weight_map
+                    .values()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
+                shard_files.sort();
+                shard_files.dedup();
+                log::info!("{} shards to download", shard_files.len());
+
+                let mut shards = Vec::new();
+                let mut info = HashMap::new();
+                let mut tensor_shard = HashMap::new();
+
+                for (shard_idx, filename) in shard_files.iter().enumerate() {
+                    log::info!(
+                        "downloading shard {}/{}: {}",
+                        shard_idx + 1,
+                        shard_files.len(),
+                        filename
+                    );
+                    let path = repo.get(filename)?;
+                    let data = std::fs::read(&path)?;
+                    let tensors = SafeTensors::deserialize(&data)?;
+                    for (name, view) in tensors.iter() {
+                        info.insert(
+                            name.to_string(),
+                            TensorInfo {
+                                shape: view.shape().to_vec(),
+                                dtype: view.dtype(),
+                            },
+                        );
+                        tensor_shard.insert(name.to_string(), shard_idx);
+                    }
+                    shards.push(data);
+                }
+
+                log::info!("loaded {} tensors from {} shards", info.len(), shards.len());
+                Ok(Self {
+                    shards,
+                    info,
+                    tensor_shard,
+                })
+            }
+        }
     }
 
     /// Download a specific safetensors file from a HuggingFace Hub repo.
@@ -56,7 +117,6 @@ impl SafeTensorsModel {
         let api = hf_hub::api::sync::Api::new()?;
         let repo = api.model(repo_id.to_string());
         let path = repo.get(filename)?;
-        log::info!("cached at: {}", path.display());
         Self::load(path)
     }
 
@@ -66,6 +126,7 @@ impl SafeTensorsModel {
         let tensors = SafeTensors::deserialize(&data)?;
 
         let mut info = HashMap::new();
+        let mut tensor_shard = HashMap::new();
         for (name, view) in tensors.iter() {
             info.insert(
                 name.to_string(),
@@ -74,10 +135,15 @@ impl SafeTensorsModel {
                     dtype: view.dtype(),
                 },
             );
+            tensor_shard.insert(name.to_string(), 0);
         }
 
         log::info!("loaded {} tensors from {}", info.len(), path.display());
-        Ok(Self { data, info })
+        Ok(Self {
+            shards: vec![data],
+            info,
+            tensor_shard,
+        })
     }
 
     /// List all tensor names and their metadata.
@@ -85,12 +151,21 @@ impl SafeTensorsModel {
         &self.info
     }
 
+    /// Get the shard data for a given tensor name.
+    fn shard_for(&self, name: &str) -> Result<&[u8], Box<dyn std::error::Error>> {
+        let idx = self
+            .tensor_shard
+            .get(name)
+            .ok_or_else(|| format!("tensor '{}' not found", name))?;
+        Ok(&self.shards[*idx])
+    }
+
     /// Read a tensor as f32 data.
     ///
     /// For F32 tensors this is a direct reinterpretation. Other dtypes
     /// are not currently supported and will return an error.
     pub fn tensor_f32(&self, name: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-        let tensors = SafeTensors::deserialize(&self.data)?;
+        let tensors = SafeTensors::deserialize(self.shard_for(name)?)?;
         let view = tensors
             .tensor(name)
             .map_err(|e| format!("tensor '{}': {}", name, e))?;
@@ -118,7 +193,7 @@ impl SafeTensorsModel {
     ///
     /// Supports F32 (direct) and BF16 (converted). Other dtypes return an error.
     pub fn tensor_f32_auto(&self, name: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-        let tensors = SafeTensors::deserialize(&self.data)?;
+        let tensors = SafeTensors::deserialize(self.shard_for(name)?)?;
         let view = tensors
             .tensor(name)
             .map_err(|e| format!("tensor '{}': {}", name, e))?;

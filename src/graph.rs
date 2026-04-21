@@ -7,8 +7,9 @@ pub enum DType {
     F32,
     F16,
     U32,
-    /// Q4_0: symmetric 4-bit quantization, 32-element blocks.
-    /// Each block: 1 f16 scale (2 bytes) + 16 packed nibble bytes = 18 bytes.
+    /// Q4_1: asymmetric 4-bit quantization, 32-element blocks.
+    /// Each block: 1 f16 scale + 1 f16 min (4 bytes) + 16 packed nibble bytes = 20 bytes.
+    /// Dequant: value = nibble * scale + min (unsigned nibbles 0-15).
     Q4_0,
 }
 
@@ -49,13 +50,11 @@ impl TensorType {
     pub fn size_bytes(&self) -> usize {
         match self.dtype {
             DType::Q4_0 => {
-                // Q4_0: 32-element blocks, 18 bytes each (2B scale + 16B nibbles).
-                // GPU buffer is array<u32>, so round up to 4-byte alignment.
+                // Q4_1: 32-element blocks, 20 bytes each.
+                // Per block: 1 u32 (d_f16 | m_f16) + 4 u32s (16 bytes nibbles) = 5 u32s.
                 let n = self.num_elements();
                 let blocks = n.div_ceil(32);
-                let scales_u32s = blocks.div_ceil(2); // 2 f16 scales per u32
-                let data_u32s = blocks * 4; // 16 bytes = 4 u32s per block
-                (scales_u32s + data_u32s) * 4
+                blocks * 5 * 4 // 5 u32s per block, 4 bytes per u32
             }
             _ => self.num_elements() * self.dtype.size_bytes(),
         }
