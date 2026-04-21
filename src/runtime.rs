@@ -1045,16 +1045,6 @@ impl Pipelines {
                 return p;
             }
         }
-        if dispatch.use_coop {
-            if let Some(p) = self.coop_map.get(&dispatch.shader) {
-                return p;
-            }
-        }
-        if dispatch.use_small_tiles {
-            if let Some(p) = self.small_map.get(&dispatch.shader) {
-                return p;
-            }
-        }
         if dispatch.b_is_q4 {
             if let Some(p) = self.q4_map.get(&dispatch.shader) {
                 return p;
@@ -1062,6 +1052,16 @@ impl Pipelines {
         }
         if dispatch.b_is_f16 {
             if let Some(p) = self.f16_map.get(&dispatch.shader) {
+                return p;
+            }
+        }
+        if dispatch.use_coop {
+            if let Some(p) = self.coop_map.get(&dispatch.shader) {
+                return p;
+            }
+        }
+        if dispatch.use_small_tiles {
+            if let Some(p) = self.small_map.get(&dispatch.shader) {
                 return p;
             }
         }
@@ -1314,6 +1314,8 @@ pub struct Session {
     adam_step: u32,
     /// Pending Adam parameters. When set, `step()` appends Adam updates.
     pending_adam: Option<(f32, f32, f32, f32)>, // (lr, beta1, beta2, eps)
+    /// Staging buffers for Q4 HorizontalConcat derived params.
+    q4_staging: HashMap<crate::compile::BufferRef, Vec<f32>>,
 }
 
 /// Identifies a graph-facing slot that can be backed by an imported
@@ -1651,7 +1653,7 @@ impl Session {
                 } else {
                     16 // enables coop for attention K/V projections (N=320, 20 WGs)
                 };
-                if coop_wgs >= min_wgs {
+                if coop_wgs >= min_wgs && !dispatch.b_is_q4 && !dispatch.b_is_f16 {
                     dispatch.use_coop = true;
                     // Route conv2d coop dispatches to generated specialized kernels
                     if is_conv_bwd {
@@ -1693,7 +1695,11 @@ impl Session {
         {
             use crate::codegen::ShaderGroup;
             for dispatch in plan.dispatches.iter_mut() {
-                if dispatch.use_coop || dispatch.use_small_tiles {
+                if dispatch.use_coop
+                    || dispatch.use_small_tiles
+                    || dispatch.b_is_q4
+                    || dispatch.b_is_f16
+                {
                     continue;
                 }
                 let group = dispatch.shader.shader_group();
@@ -1824,6 +1830,7 @@ impl Session {
             adam_state,
             adam_step: 0,
             pending_adam: None,
+            q4_staging: HashMap::new(),
         }
     }
 
@@ -2046,7 +2053,9 @@ pub fn init_gpu_context() -> Result<blade_graphics::Context, blade_graphics::Not
 /// dimension within each column, matching the matmul KTILE=32.
 ///
 /// Returns a packed buffer: `[scales as u32 (2 f16 per u32)][nibble data as u32]`.
-fn quantize_q4_0(data: &[f32], rows: usize, cols: usize) -> Vec<u8> {
+/// Quantize f32 data to Q4_0 and return packed buffer.
+/// Public for testing.
+pub fn quantize_q4_0(data: &[f32], rows: usize, cols: usize) -> Vec<u8> {
     assert_eq!(data.len(), rows * cols);
     assert!(
         rows.is_multiple_of(32),
@@ -2107,6 +2116,124 @@ fn quantize_q4_0(data: &[f32], rows: usize, cols: usize) -> Vec<u8> {
     buf
 }
 
+/// Dequantize Q4_0 buffer back to f32 (CPU reference, mirrors shader logic).
+/// Used for testing the quantization roundtrip.
+pub fn dequantize_q4_0(buf: &[u8], rows: usize, cols: usize) -> Vec<f32> {
+    let blocks_per_col = rows / 32;
+    let num_blocks = blocks_per_col * cols;
+    let scales_u32s = num_blocks.div_ceil(2);
+
+    let buf_u32: Vec<u32> = buf
+        .chunks(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    let mut out = vec![0.0f32; rows * cols];
+
+    for col in 0..cols {
+        for blk in 0..blocks_per_col {
+            let block = col * blocks_per_col + blk;
+
+            // Decode scale (same as shader q4_decode_f16)
+            let scale_u32 = buf_u32[block / 2];
+            let scale_bits = if block & 1 == 0 {
+                scale_u32 & 0xFFFF
+            } else {
+                scale_u32 >> 16
+            };
+            let scale = half::f16::from_bits(scale_bits as u16).to_f32();
+
+            for i in 0..32 {
+                let byte_in_block = i / 2;
+                let u32_in_block = byte_in_block / 4;
+                let data_u32 = buf_u32[scales_u32s + block * 4 + u32_in_block];
+                let shift = (byte_in_block % 4) * 8 + if i % 2 != 0 { 4 } else { 0 };
+                let nibble = (data_u32 >> shift) & 0xF;
+                let val = (nibble as f32 - 8.0) * scale;
+                let row = blk * 32 + i;
+                out[row * cols + col] = val;
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod q4_tests {
+    use super::*;
+
+    #[test]
+    fn q4_roundtrip_identity() {
+        // 32x1 column: values from -1.6 to 1.5 in steps of 0.1
+        let rows = 32;
+        let cols = 1;
+        let data: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) * 0.1).collect();
+
+        let packed = quantize_q4_0(&data, rows, cols);
+        let decoded = dequantize_q4_0(&packed, rows, cols);
+
+        for i in 0..32 {
+            let err = (data[i] - decoded[i]).abs();
+            assert!(
+                err < 0.3,
+                "Q4 roundtrip elem[{}]: orig={:.3}, decoded={:.3}, err={:.3}",
+                i,
+                data[i],
+                decoded[i],
+                err,
+            );
+        }
+    }
+
+    #[test]
+    fn q4_roundtrip_matrix() {
+        // 32x4 matrix
+        let rows = 32;
+        let cols = 4;
+        let data: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.05)
+            .collect();
+
+        let packed = quantize_q4_0(&data, rows, cols);
+        let decoded = dequantize_q4_0(&packed, rows, cols);
+
+        let max_err = data
+            .iter()
+            .zip(decoded.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_err < 0.3,
+            "Q4 roundtrip max error {:.4} exceeds 0.3",
+            max_err,
+        );
+    }
+
+    #[test]
+    fn q4_decode_f16_matches_half_crate() {
+        // Verify our manual f16 decode matches the half crate
+        for bits in [0x3C00u16, 0x4000, 0x3800, 0xBC00, 0x0000, 0x7BFF] {
+            let expected = half::f16::from_bits(bits).to_f32();
+            let sign = ((bits as u32) >> 15) & 1;
+            let expo = ((bits as u32) >> 10) & 0x1F;
+            let mant = (bits as u32) & 0x3FF;
+            let f32_bits = if expo == 0 {
+                sign << 31
+            } else {
+                (sign << 31) | ((expo + 112) << 23) | (mant << 13)
+            };
+            let decoded = f32::from_bits(f32_bits);
+            assert!(
+                (expected - decoded).abs() < 1e-6,
+                "f16 decode mismatch for 0x{:04x}: expected={}, decoded={}",
+                bits,
+                expected,
+                decoded,
+            );
+        }
+    }
+}
+
 /// Result of [`auto_tune`] — capability snapshot from the connected GPU
 /// suitable for installing as global compilation defaults via
 /// [`install_auto_tune`].
@@ -2146,7 +2273,6 @@ impl Session {
         for &(ref param_name, buf_ref) in &self.plan.param_buffers {
             if param_name == name {
                 if let Some(&(rows, cols)) = self.plan.q4_buffers.get(&buf_ref) {
-                    // Convert f32 → Q4_0 packed format
                     let q4_data = quantize_q4_0(data, rows, cols);
                     self.upload_buffer(buf_ref, &q4_data);
                 } else if self.plan.f16_buffers.contains(&buf_ref) {
@@ -2173,50 +2299,84 @@ impl Session {
 
                     match entry.2 {
                         crate::graph::ParamTransform::HorizontalConcat => {
-                            // Row-interleaved layout: for each row, source A's
-                            // columns come first, then source B's columns.
                             let total_cols: usize = sources.iter().map(|s| s.1).sum();
                             let derived_is_f16 = self.plan.f16_buffers.contains(derived_buf);
-                            let elem_size = if derived_is_f16 { 2usize } else { 4usize };
-                            let buf_elems = self.plan.buffers[derived_buf.0 as usize] / elem_size;
-                            let rows = buf_elems.checked_div(total_cols).unwrap_or(0);
-                            let mut col_offset = 0usize;
-                            for src in sources {
-                                let src_name = &src.0;
-                                let src_cols = src.1;
-                                if src_name == name && rows > 0 {
-                                    if derived_is_f16 {
-                                        let derived_ptr = self.buffers[derived_buf.0 as usize]
-                                            .data()
-                                            as *mut half::f16;
+                            let derived_is_q4 = self.plan.q4_buffers.contains_key(derived_buf);
+
+                            if derived_is_q4 {
+                                // Q4: accumulate sources into an f32 staging buffer,
+                                // then quantize the full interleaved matrix.
+                                let &(rows, _cols) = self.plan.q4_buffers.get(derived_buf).unwrap();
+                                let staging = self
+                                    .q4_staging
+                                    .entry(*derived_buf)
+                                    .or_insert_with(|| vec![0.0f32; rows * total_cols]);
+                                let mut col_offset = 0usize;
+                                for src in sources {
+                                    let src_name = &src.0;
+                                    let src_cols = src.1;
+                                    if src_name == name && rows > 0 {
                                         for r in 0..rows {
                                             let src_start = r * src_cols;
                                             let dst_start = r * total_cols + col_offset;
-                                            for c in 0..src_cols {
+                                            staging[dst_start..dst_start + src_cols]
+                                                .copy_from_slice(
+                                                    &data[src_start..src_start + src_cols],
+                                                );
+                                        }
+                                    }
+                                    col_offset += src_cols;
+                                }
+                                // Check if all sources have been written (nonzero check)
+                                // by attempting quantize every time — last source wins.
+                                let q4_data = quantize_q4_0(staging, rows, total_cols);
+                                self.upload_buffer(*derived_buf, &q4_data);
+                            } else {
+                                let elem_size = if derived_is_f16 { 2usize } else { 4usize };
+                                let buf_elems =
+                                    self.plan.buffers[derived_buf.0 as usize] / elem_size;
+                                let rows = buf_elems.checked_div(total_cols).unwrap_or(0);
+                                let mut col_offset = 0usize;
+                                for src in sources {
+                                    let src_name = &src.0;
+                                    let src_cols = src.1;
+                                    if src_name == name && rows > 0 {
+                                        if derived_is_f16 {
+                                            let derived_ptr = self.buffers[derived_buf.0 as usize]
+                                                .data()
+                                                as *mut half::f16;
+                                            for r in 0..rows {
+                                                let src_start = r * src_cols;
+                                                let dst_start = r * total_cols + col_offset;
+                                                for c in 0..src_cols {
+                                                    unsafe {
+                                                        *derived_ptr.add(dst_start + c) =
+                                                            half::f16::from_f32(
+                                                                data[src_start + c],
+                                                            );
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            let derived_ptr = self.buffers[derived_buf.0 as usize]
+                                                .data()
+                                                as *mut f32;
+                                            for r in 0..rows {
+                                                let src_start = r * src_cols;
+                                                let dst_start = r * total_cols + col_offset;
                                                 unsafe {
-                                                    *derived_ptr.add(dst_start + c) =
-                                                        half::f16::from_f32(data[src_start + c]);
+                                                    std::ptr::copy_nonoverlapping(
+                                                        data[src_start..].as_ptr(),
+                                                        derived_ptr.add(dst_start),
+                                                        src_cols,
+                                                    );
                                                 }
                                             }
                                         }
-                                    } else {
-                                        let derived_ptr =
-                                            self.buffers[derived_buf.0 as usize].data() as *mut f32;
-                                        for r in 0..rows {
-                                            let src_start = r * src_cols;
-                                            let dst_start = r * total_cols + col_offset;
-                                            unsafe {
-                                                std::ptr::copy_nonoverlapping(
-                                                    data[src_start..].as_ptr(),
-                                                    derived_ptr.add(dst_start),
-                                                    src_cols,
-                                                );
-                                            }
-                                        }
                                     }
+                                    col_offset += src_cols;
                                 }
-                                col_offset += src_cols;
-                            }
+                            } // end !q4
                         }
                         crate::graph::ParamTransform::Winograd3x3 {
                             out_channels,
