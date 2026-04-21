@@ -589,12 +589,9 @@ struct Pipelines {
     coop_map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
     /// Small-tile (32×32) pipelines for dispatches with `use_small_tiles = true`.
     small_map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
-    /// Pipelines reading f16 weight storage (dispatches with `b_is_f16 = true`).
-    f16_map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
-    /// Pipelines reading Q4 weight storage.
-    q4_map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
-    /// Pipelines reading Q8_0 weight storage.
-    q8_map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
+    /// Pipelines for non-f32 weight formats (f16, Q4, Q8).
+    weight_map:
+        HashMap<(ShaderEntry, crate::compile::WeightFormat), blade_graphics::ComputePipeline>,
     /// Epilogue-fused pipelines keyed by (shader, epilogue chain).
     epilogue_map:
         HashMap<(ShaderEntry, Vec<crate::compile::EpilogueOp>), blade_graphics::ComputePipeline>,
@@ -620,9 +617,8 @@ impl Pipelines {
         // For matmul entries, compile BOTH scalar and coop if any dispatch uses coop.
         let mut needed: HashSet<ShaderGroup> = HashSet::new();
         let mut needed_coop: HashSet<ShaderGroup> = HashSet::new();
-        let mut needed_f16: HashSet<ShaderGroup> = HashSet::new();
-        let mut needed_q4: HashSet<ShaderGroup> = HashSet::new();
-        let mut needed_q8: HashSet<ShaderGroup> = HashSet::new();
+        let mut needed_weighted: HashMap<crate::compile::WeightFormat, HashSet<ShaderGroup>> =
+            HashMap::new();
         let mut entries_for_group: HashMap<ShaderGroup, HashSet<ShaderEntry>> = HashMap::new();
         // Extract head_dim from attention dispatches for parameterized shader generation.
         let mut attention_head_dim: Option<u32> = None;
@@ -694,22 +690,11 @@ impl Pipelines {
                     .or_default()
                     .insert(dispatch.shader.clone());
             }
-            if dispatch.b_is_f16 {
-                needed_f16.insert(group);
-                entries_for_group
-                    .entry(group)
+            if dispatch.weight_format.is_quantized() {
+                needed_weighted
+                    .entry(dispatch.weight_format)
                     .or_default()
-                    .insert(dispatch.shader.clone());
-            }
-            if dispatch.b_is_q4 {
-                needed_q4.insert(group);
-                entries_for_group
-                    .entry(group)
-                    .or_default()
-                    .insert(dispatch.shader.clone());
-            }
-            if dispatch.b_is_q8 {
-                needed_q8.insert(group);
+                    .insert(group);
                 entries_for_group
                     .entry(group)
                     .or_default()
@@ -895,65 +880,28 @@ impl Pipelines {
             }
         }
 
-        // Compile f16 weight storage pipelines.
-        let mut f16_map = HashMap::new();
-        for &group in &needed_f16 {
-            let sm = crate::codegen::generate_module_f16(group);
-            let shader = gpu.create_shader(bg::ShaderDesc {
-                source: &sm.source,
-                naga_module: Some(sm.module),
-            });
-            if let Some(entries) = entries_for_group.get(&group) {
-                for entry in entries {
-                    let layout = shader_data_layout(entry);
-                    let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                        name: entry.entry_point(),
-                        data_layouts: &[&layout],
-                        compute: shader.at(entry.entry_point()),
-                    });
-                    f16_map.insert(entry.clone(), pipeline);
-                }
-            }
-        }
-
-        // Compile Q4 weight storage pipelines.
-        let mut q4_map = HashMap::new();
-        for &group in &needed_q4 {
-            let sm = crate::codegen::generate_module_q4(group);
-            let shader = gpu.create_shader(bg::ShaderDesc {
-                source: &sm.source,
-                naga_module: Some(sm.module),
-            });
-            if let Some(entries) = entries_for_group.get(&group) {
-                for entry in entries {
-                    let layout = shader_data_layout(entry);
-                    let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                        name: entry.entry_point(),
-                        data_layouts: &[&layout],
-                        compute: shader.at(entry.entry_point()),
-                    });
-                    q4_map.insert(entry.clone(), pipeline);
-                }
-            }
-        }
-
-        // Compile Q8 weight storage pipelines.
-        let mut q8_map = HashMap::new();
-        for &group in &needed_q8 {
-            let sm = crate::codegen::generate_module_q8(group);
-            let shader = gpu.create_shader(bg::ShaderDesc {
-                source: &sm.source,
-                naga_module: Some(sm.module),
-            });
-            if let Some(entries) = entries_for_group.get(&group) {
-                for entry in entries {
-                    let layout = shader_data_layout(entry);
-                    let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                        name: entry.entry_point(),
-                        data_layouts: &[&layout],
-                        compute: shader.at(entry.entry_point()),
-                    });
-                    q8_map.insert(entry.clone(), pipeline);
+        // Compile weight-format-specific pipelines (f16, Q4, Q8).
+        let mut weight_map: HashMap<
+            (ShaderEntry, crate::compile::WeightFormat),
+            blade_graphics::ComputePipeline,
+        > = HashMap::new();
+        for (&format, groups) in &needed_weighted {
+            for &group in groups {
+                let sm = crate::codegen::generate_module_weighted(group, format);
+                let shader = gpu.create_shader(bg::ShaderDesc {
+                    source: &sm.source,
+                    naga_module: Some(sm.module),
+                });
+                if let Some(entries) = entries_for_group.get(&group) {
+                    for entry in entries {
+                        let layout = shader_data_layout(entry);
+                        let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
+                            name: entry.entry_point(),
+                            data_layouts: &[&layout],
+                            compute: shader.at(entry.entry_point()),
+                        });
+                        weight_map.insert((entry.clone(), format), pipeline);
+                    }
                 }
             }
         }
@@ -1051,9 +999,7 @@ impl Pipelines {
             map,
             coop_map,
             small_map,
-            f16_map,
-            q4_map,
-            q8_map,
+            weight_map,
             epilogue_map,
             pointwise_map,
             reduction_map,
@@ -1077,18 +1023,9 @@ impl Pipelines {
                 return p;
             }
         }
-        if dispatch.b_is_q4 {
-            if let Some(p) = self.q4_map.get(&dispatch.shader) {
-                return p;
-            }
-        }
-        if dispatch.b_is_q8 {
-            if let Some(p) = self.q8_map.get(&dispatch.shader) {
-                return p;
-            }
-        }
-        if dispatch.b_is_f16 {
-            if let Some(p) = self.f16_map.get(&dispatch.shader) {
+        if dispatch.weight_format.is_quantized() {
+            let key = (dispatch.shader.clone(), dispatch.weight_format);
+            if let Some(p) = self.weight_map.get(&key) {
                 return p;
             }
         }
@@ -1116,13 +1053,8 @@ impl Pipelines {
         for (entry, pipeline) in &self.small_map {
             result.push((entry.entry_point(), pipeline));
         }
-        for (entry, pipeline) in &self.f16_map {
-            result.push((entry.entry_point(), pipeline));
-        }
-        for (entry, pipeline) in &self.q4_map {
-            result.push((entry.entry_point(), pipeline));
-        }
-        for (entry, pipeline) in &self.q8_map {
+        #[allow(clippy::pattern_type_mismatch)]
+        for ((entry, _), pipeline) in &self.weight_map {
             result.push((entry.entry_point(), pipeline));
         }
         #[allow(clippy::needless_borrowed_reference)]
@@ -1355,7 +1287,7 @@ pub struct Session {
     /// Pending Adam parameters. When set, `step()` appends Adam updates.
     pending_adam: Option<(f32, f32, f32, f32)>, // (lr, beta1, beta2, eps)
     /// Staging buffers for Q4 HorizontalConcat derived params.
-    q4_staging: HashMap<crate::compile::BufferRef, Vec<f32>>,
+    weight_staging: HashMap<crate::compile::BufferRef, Vec<f32>>,
 }
 
 /// Identifies a graph-facing slot that can be backed by an imported
@@ -1693,11 +1625,7 @@ impl Session {
                 } else {
                     16 // enables coop for attention K/V projections (N=320, 20 WGs)
                 };
-                if coop_wgs >= min_wgs
-                    && !dispatch.b_is_q4
-                    && !dispatch.b_is_q8
-                    && !dispatch.b_is_f16
-                {
+                if coop_wgs >= min_wgs && !dispatch.weight_format.is_quantized() {
                     dispatch.use_coop = true;
                     // Route conv2d coop dispatches to generated specialized kernels
                     if is_conv_bwd {
@@ -1741,9 +1669,7 @@ impl Session {
             for dispatch in plan.dispatches.iter_mut() {
                 if dispatch.use_coop
                     || dispatch.use_small_tiles
-                    || dispatch.b_is_q4
-                    || dispatch.b_is_q8
-                    || dispatch.b_is_f16
+                    || dispatch.weight_format.is_quantized()
                 {
                     continue;
                 }
@@ -1875,7 +1801,7 @@ impl Session {
             adam_state,
             adam_step: 0,
             pending_adam: None,
-            q4_staging: HashMap::new(),
+            weight_staging: HashMap::new(),
         }
     }
 
@@ -2395,19 +2321,18 @@ impl Session {
         // Check regular parameters first
         for &(ref param_name, buf_ref) in &self.plan.param_buffers {
             if param_name == name {
-                if let Some(&(rows, cols)) = self.plan.q4_buffers.get(&buf_ref) {
-                    let q4_data = quantize_q4_0(data, rows, cols);
-                    self.upload_buffer(buf_ref, &q4_data);
-                } else if let Some(&(rows, cols)) = self.plan.q8_buffers.get(&buf_ref) {
-                    let q8_data = quantize_q8_0(data, rows, cols);
-                    self.upload_buffer(buf_ref, &q8_data);
-                } else if self.plan.f16_buffers.contains(&buf_ref) {
-                    // Convert f32 → f16 and upload half-precision data
-                    let f16_data: Vec<u16> = data
-                        .iter()
-                        .map(|&v| half::f16::from_f32(v).to_bits())
-                        .collect();
-                    self.upload_buffer(buf_ref, bytemuck::cast_slice(&f16_data));
+                if let Some(&(fmt, rows, cols)) = self.plan.weight_buffers.get(&buf_ref) {
+                    let packed = match fmt {
+                        crate::compile::WeightFormat::Q4 => quantize_q4_0(data, rows, cols),
+                        crate::compile::WeightFormat::Q8 => quantize_q8_0(data, rows, cols),
+                        crate::compile::WeightFormat::F16 => data
+                            .iter()
+                            .map(|&v| half::f16::from_f32(v).to_bits())
+                            .flat_map(|b| b.to_le_bytes())
+                            .collect(),
+                        crate::compile::WeightFormat::F32 => unreachable!(),
+                    };
+                    self.upload_buffer(buf_ref, &packed);
                 } else {
                     self.upload_buffer(buf_ref, bytemuck::cast_slice(data));
                 }
@@ -2426,27 +2351,26 @@ impl Session {
                     match entry.2 {
                         crate::graph::ParamTransform::HorizontalConcat => {
                             let total_cols: usize = sources.iter().map(|s| s.1).sum();
-                            let derived_is_f16 = self.plan.f16_buffers.contains(derived_buf);
-                            let derived_is_q4 = self.plan.q4_buffers.contains_key(derived_buf);
-                            let derived_is_q8 = self.plan.q8_buffers.contains_key(derived_buf);
+                            let derived_fmt = self
+                                .plan
+                                .weight_buffers
+                                .get(derived_buf)
+                                .map(|&(f, _, _)| f)
+                                .unwrap_or(crate::compile::WeightFormat::F32);
 
-                            if derived_is_q4 || derived_is_q8 {
+                            if derived_fmt.is_quantized() {
                                 // Quantized: accumulate sources into f32 staging,
                                 // then quantize the full interleaved matrix.
-                                let &(rows, _cols) = if derived_is_q4 {
-                                    self.plan.q4_buffers.get(derived_buf).unwrap()
-                                } else {
-                                    self.plan.q8_buffers.get(derived_buf).unwrap()
-                                };
+                                let &(_, rows, _) =
+                                    self.plan.weight_buffers.get(derived_buf).unwrap();
                                 let staging = self
-                                    .q4_staging
+                                    .weight_staging
                                     .entry(*derived_buf)
                                     .or_insert_with(|| vec![0.0f32; rows * total_cols]);
                                 let mut col_offset = 0usize;
                                 for src in sources {
-                                    let src_name = &src.0;
-                                    let src_cols = src.1;
-                                    if src_name == name && rows > 0 {
+                                    if src.0 == name && rows > 0 {
+                                        let src_cols = src.1;
                                         for r in 0..rows {
                                             let src_start = r * src_cols;
                                             let dst_start = r * total_cols + col_offset;
@@ -2456,61 +2380,48 @@ impl Session {
                                                 );
                                         }
                                     }
-                                    col_offset += src_cols;
+                                    col_offset += src.1;
                                 }
-                                if derived_is_q4 {
-                                    let packed = quantize_q4_0(staging, rows, total_cols);
-                                    self.upload_buffer(*derived_buf, &packed);
-                                } else {
-                                    let packed = quantize_q8_0(staging, rows, total_cols);
-                                    self.upload_buffer(*derived_buf, &packed);
-                                }
+                                let packed = match derived_fmt {
+                                    crate::compile::WeightFormat::Q4 => {
+                                        quantize_q4_0(staging, rows, total_cols)
+                                    }
+                                    crate::compile::WeightFormat::Q8 => {
+                                        quantize_q8_0(staging, rows, total_cols)
+                                    }
+                                    crate::compile::WeightFormat::F16 => staging
+                                        .iter()
+                                        .map(|&v| half::f16::from_f32(v).to_bits())
+                                        .flat_map(|b| b.to_le_bytes())
+                                        .collect(),
+                                    _ => unreachable!(),
+                                };
+                                self.upload_buffer(*derived_buf, &packed);
                             } else {
-                                let elem_size = if derived_is_f16 { 2usize } else { 4usize };
-                                let buf_elems =
-                                    self.plan.buffers[derived_buf.0 as usize] / elem_size;
-                                let rows = buf_elems.checked_div(total_cols).unwrap_or(0);
+                                // f32: direct copy into GPU buffer
+                                let buf_f32 = self.plan.buffers[derived_buf.0 as usize] / 4;
+                                let rows = buf_f32.checked_div(total_cols).unwrap_or(0);
                                 let mut col_offset = 0usize;
                                 for src in sources {
-                                    let src_name = &src.0;
-                                    let src_cols = src.1;
-                                    if src_name == name && rows > 0 {
-                                        if derived_is_f16 {
-                                            let derived_ptr = self.buffers[derived_buf.0 as usize]
-                                                .data()
-                                                as *mut half::f16;
-                                            for r in 0..rows {
-                                                let src_start = r * src_cols;
-                                                let dst_start = r * total_cols + col_offset;
-                                                for c in 0..src_cols {
-                                                    unsafe {
-                                                        *derived_ptr.add(dst_start + c) =
-                                                            half::f16::from_f32(
-                                                                data[src_start + c],
-                                                            );
-                                                    }
-                                                }
-                                            }
-                                        } else {
-                                            let derived_ptr = self.buffers[derived_buf.0 as usize]
-                                                .data()
-                                                as *mut f32;
-                                            for r in 0..rows {
-                                                let src_start = r * src_cols;
-                                                let dst_start = r * total_cols + col_offset;
-                                                unsafe {
-                                                    std::ptr::copy_nonoverlapping(
-                                                        data[src_start..].as_ptr(),
-                                                        derived_ptr.add(dst_start),
-                                                        src_cols,
-                                                    );
-                                                }
+                                    if src.0 == name && rows > 0 {
+                                        let src_cols = src.1;
+                                        let derived_ptr =
+                                            self.buffers[derived_buf.0 as usize].data() as *mut f32;
+                                        for r in 0..rows {
+                                            let src_start = r * src_cols;
+                                            let dst_start = r * total_cols + col_offset;
+                                            unsafe {
+                                                std::ptr::copy_nonoverlapping(
+                                                    data[src_start..].as_ptr(),
+                                                    derived_ptr.add(dst_start),
+                                                    src_cols,
+                                                );
                                             }
                                         }
                                     }
-                                    col_offset += src_cols;
+                                    col_offset += src.1;
                                 }
-                            } // end !q4
+                            }
                         }
                         crate::graph::ParamTransform::Winograd3x3 {
                             out_channels,

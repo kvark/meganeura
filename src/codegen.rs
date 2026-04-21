@@ -610,7 +610,7 @@ fn matmul_vars(
         fused_expr,
         "",
         "",
-        BStorageMode::F32,
+        WeightFormat::F32,
     )
 }
 
@@ -637,7 +637,7 @@ fn matmul_vars_epilogue(
         fused_expr,
         epilogue_decl,
         epilogue_body,
-        BStorageMode::F32,
+        WeightFormat::F32,
     )
 }
 
@@ -650,21 +650,14 @@ fn matmul_vars_with_mode(
     b_col: &str,
     fused_decl: &str,
     fused_expr: &str,
-    mode: BStorageMode,
+    mode: WeightFormat,
 ) -> ShaderModule {
     matmul_vars_full(
         a_idx, b_idx, a_row, a_col, b_row, b_col, fused_decl, fused_expr, "", "", mode,
     )
 }
 
-/// B-weight storage mode for matmul codegen.
-#[derive(Clone, Copy, PartialEq)]
-enum BStorageMode {
-    F32,
-    F16,
-    Q4,
-    Q8,
-}
+use crate::compile::WeightFormat;
 
 fn matmul_vars_full(
     a_idx: &str,
@@ -677,7 +670,7 @@ fn matmul_vars_full(
     fused_expr: &str,
     epilogue_decl: &str,
     epilogue_body: &str,
-    b_mode: BStorageMode,
+    b_mode: WeightFormat,
 ) -> ShaderModule {
     let src = include_str!("shaders/matmul.wgsl");
     let full_decl = if epilogue_decl.is_empty() {
@@ -694,25 +687,25 @@ fn matmul_vars_full(
         )
     };
     let (enable_f16, b_storage, b_load_expr, b_dequant_fn) = match b_mode {
-        BStorageMode::F32 => (
+        WeightFormat::F32 => (
             "",
             "array<f32>",
             format!("matrix_b[{}]", b_idx),
             String::new(),
         ),
-        BStorageMode::F16 => (
+        WeightFormat::F16 => (
             "enable f16;",
             "array<f16>",
             format!("f32(matrix_b[{}])", b_idx),
             String::new(),
         ),
-        BStorageMode::Q4 => (
+        WeightFormat::Q4 => (
             "",
             "array<u32>",
             "dequant_q4(b_row, b_col)".to_string(),
             Q4_DEQUANT_FN.to_string(),
         ),
-        BStorageMode::Q8 => (
+        WeightFormat::Q8 => (
             "",
             "array<u32>",
             "dequant_q8(b_row, b_col)".to_string(),
@@ -999,23 +992,9 @@ fn gen_matmul_at() -> ShaderModule {
 /// Use `generate_coop_module` with a `CoopConfig` for runtime-detected config.
 /// Generate a matmul module with f16 weight (B) storage.
 /// Returns a module containing all matmul variants (Normal, AT, BT)
-/// that read matrix_b as `array<f16>`.
-/// Generate a matmul module with f16 weight (B) storage.
-pub fn generate_module_f16(group: ShaderGroup) -> ShaderModule {
-    generate_module_with_b_mode(group, BStorageMode::F16)
-}
-
-/// Generate a matmul module with Q4 weight (B) storage.
-pub fn generate_module_q4(group: ShaderGroup) -> ShaderModule {
-    generate_module_with_b_mode(group, BStorageMode::Q4)
-}
-
-/// Generate a matmul module with Q8_0 weight (B) storage.
-pub fn generate_module_q8(group: ShaderGroup) -> ShaderModule {
-    generate_module_with_b_mode(group, BStorageMode::Q8)
-}
-
-fn generate_module_with_b_mode(group: ShaderGroup, mode: BStorageMode) -> ShaderModule {
+/// Generate a matmul module for the given weight storage format.
+pub fn generate_module_weighted(group: ShaderGroup, format: WeightFormat) -> ShaderModule {
+    let mode = format;
     match group {
         ShaderGroup::MatMul => matmul_vars_with_mode(
             MATMUL_A_FWD,
@@ -1083,7 +1062,7 @@ fn generate_module_with_b_mode(group: ShaderGroup, mode: BStorageMode) -> Shader
             " + src[idx]",
             mode,
         ),
-        ShaderGroup::MatMulGemv | ShaderGroup::MatMulGemvBT if mode == BStorageMode::F16 => {
+        ShaderGroup::MatMulGemv | ShaderGroup::MatMulGemvBT if mode == WeightFormat::F16 => {
             if group == ShaderGroup::MatMulGemv {
                 gen_matmul_gemv_f16()
             } else {
@@ -5181,7 +5160,7 @@ mod tests {
             ShaderGroup::MatMulBT,
             ShaderGroup::MatMulBTAdd,
         ] {
-            let sm = generate_module_q4(group);
+            let sm = generate_module_weighted(group, WeightFormat::Q4);
             assert!(
                 sm.source.contains("dequant_q4"),
                 "Q4 {group:?}: missing dequant_q4"
