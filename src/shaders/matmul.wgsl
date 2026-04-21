@@ -8,6 +8,7 @@
 // Template variables: A_INDEX, B_INDEX (global index), A_ROW/COL,
 // B_ROW/COL (tile mapping), FUSED_ADD_DECL/EXPR (addend), EPILOGUE_BODY
 
+$ENABLE_F16
 struct Params {
     m: u32,
     n: u32,
@@ -16,7 +17,7 @@ struct Params {
 }
 
 var<storage> matrix_a: array<f32>;
-var<storage> matrix_b: array<f32>;
+var<storage> matrix_b: $B_STORAGE_TYPE;
 var<storage, read_write> matrix_c: array<f32>;
 $FUSED_ADD_DECL
 var<uniform> params: Params;
@@ -62,7 +63,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             let b_row = t + row_local;
             let b_col = tile_col + col_local;
             let in_bounds = (b_row < params.k) && (b_col < params.n);
-            shared_b[row_local * 65u + col_local] = select(0.0, matrix_b[$B_INDEX], in_bounds);
+            shared_b[row_local * 65u + col_local] = select(0.0, $B_CAST_OPEN matrix_b[$B_INDEX] $B_CAST_CLOSE, in_bounds);
         }
 
         workgroupBarrier();

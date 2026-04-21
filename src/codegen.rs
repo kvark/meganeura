@@ -599,8 +599,8 @@ fn matmul_vars(
     fused_decl: &str,
     fused_expr: &str,
 ) -> ShaderModule {
-    matmul_vars_epilogue(
-        a_idx, b_idx, a_row, a_col, b_row, b_col, fused_decl, fused_expr, "", "",
+    matmul_vars_full(
+        a_idx, b_idx, a_row, a_col, b_row, b_col, fused_decl, fused_expr, "", "", false,
     )
 }
 
@@ -616,15 +616,55 @@ fn matmul_vars_epilogue(
     epilogue_decl: &str,
     epilogue_body: &str,
 ) -> ShaderModule {
+    matmul_vars_full(
+        a_idx,
+        b_idx,
+        a_row,
+        a_col,
+        b_row,
+        b_col,
+        fused_decl,
+        fused_expr,
+        epilogue_decl,
+        epilogue_body,
+        false,
+    )
+}
+
+fn matmul_vars_f16(
+    a_idx: &str,
+    b_idx: &str,
+    a_row: &str,
+    a_col: &str,
+    b_row: &str,
+    b_col: &str,
+    fused_decl: &str,
+    fused_expr: &str,
+) -> ShaderModule {
+    matmul_vars_full(
+        a_idx, b_idx, a_row, a_col, b_row, b_col, fused_decl, fused_expr, "", "", true,
+    )
+}
+
+fn matmul_vars_full(
+    a_idx: &str,
+    b_idx: &str,
+    a_row: &str,
+    a_col: &str,
+    b_row: &str,
+    b_col: &str,
+    fused_decl: &str,
+    fused_expr: &str,
+    epilogue_decl: &str,
+    epilogue_body: &str,
+    b_is_f16: bool,
+) -> ShaderModule {
     let src = include_str!("shaders/matmul.wgsl");
     let full_decl = if epilogue_decl.is_empty() {
         fused_decl.to_string()
     } else {
         format!("{}\n{}", fused_decl, epilogue_decl)
     };
-    // When there's an epilogue, use var val + epilogue + store.
-    // When there's no epilogue, use direct store (avoids SPIR-V regression
-    // from the extra variable assignment).
     let store_body = if epilogue_body.is_empty() {
         format!("matrix_c[idx] = s[i][j]{};", fused_expr)
     } else {
@@ -633,9 +673,18 @@ fn matmul_vars_epilogue(
             fused_expr, epilogue_body
         )
     };
+    let (enable_f16, b_storage, b_cast_open, b_cast_close) = if b_is_f16 {
+        ("enable f16;", "array<f16>", "f32(", ")")
+    } else {
+        ("", "array<f32>", "", "")
+    };
     let src = preprocess(
         src,
         &[
+            ("$ENABLE_F16", enable_f16),
+            ("$B_STORAGE_TYPE", b_storage),
+            ("$B_CAST_OPEN", b_cast_open),
+            ("$B_CAST_CLOSE", b_cast_close),
             ("$A_INDEX", a_idx),
             ("$B_INDEX", b_idx),
             ("$A_ROW", a_row),
@@ -834,6 +883,73 @@ fn gen_matmul_at() -> ShaderModule {
 ///
 /// The default `generate_module` path uses 16×16 f16 for backward compat.
 /// Use `generate_coop_module` with a `CoopConfig` for runtime-detected config.
+/// Generate a matmul module with f16 weight (B) storage.
+/// Returns a module containing all matmul variants (Normal, AT, BT)
+/// that read matrix_b as `array<f16>`.
+pub fn generate_module_f16(group: ShaderGroup) -> ShaderModule {
+    match group {
+        ShaderGroup::MatMul => matmul_vars_f16(
+            MATMUL_A_FWD,
+            MATMUL_B_FWD,
+            A_ROW_FWD,
+            A_COL_FWD,
+            B_ROW_FWD,
+            B_COL_FWD,
+            "",
+            "",
+        ),
+        ShaderGroup::MatMulAT => matmul_vars_f16(
+            MATMUL_A_AT,
+            MATMUL_B_FWD,
+            A_ROW_AT,
+            A_COL_AT,
+            B_ROW_FWD,
+            B_COL_FWD,
+            "",
+            "",
+        ),
+        ShaderGroup::MatMulBT => matmul_vars_f16(
+            MATMUL_A_FWD,
+            MATMUL_B_BT,
+            A_ROW_FWD,
+            A_COL_FWD,
+            B_ROW_BT,
+            B_COL_BT,
+            "",
+            "",
+        ),
+        ShaderGroup::MatMulGemv => gen_matmul_gemv_f16(),
+        ShaderGroup::MatMulGemvBT => gen_matmul_gemv_bt_f16(),
+        _ => generate_module(group), // fallback for unhandled groups
+    }
+}
+
+fn gen_matmul_gemv_f16() -> ShaderModule {
+    let src = include_str!("shaders/matmul_gemv.wgsl")
+        .replace(
+            "var<storage> matrix_b: array<vec4<f32>>;",
+            "enable f16;\nvar<storage> matrix_b: array<vec4<f16>>;",
+        )
+        .replace(
+            "let b = matrix_b[kk * n_v4 + col4];",
+            "let b = vec4<f32>(matrix_b[kk * n_v4 + col4]);",
+        );
+    parse_wgsl(&src)
+}
+
+fn gen_matmul_gemv_bt_f16() -> ShaderModule {
+    let src = include_str!("shaders/matmul_gemv_bt.wgsl")
+        .replace(
+            "var<storage> matrix_b: array<vec4<f32>>;",
+            "enable f16;\nvar<storage> matrix_b: array<vec4<f16>>;",
+        )
+        .replace(
+            "let b = matrix_b[(col * k_v4) + kk4];",
+            "let b = vec4<f32>(matrix_b[(col * k_v4) + kk4]);",
+        );
+    parse_wgsl(&src)
+}
+
 fn gen_matmul_coop() -> ShaderModule {
     let default_config = CoopConfig {
         tile_size: 16,
