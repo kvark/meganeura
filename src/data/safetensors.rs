@@ -53,16 +53,15 @@ impl SafeTensorsModel {
                 log::info!("{}: trying sharded safetensors", repo_id);
                 let index_path = repo.get("model.safetensors.index.json")?;
                 let index_str = std::fs::read_to_string(&index_path)?;
-                let index: serde_json::Value = serde_json::from_str(&index_str)?;
-                let weight_map = index["weight_map"]
-                    .as_object()
-                    .ok_or("missing weight_map in index")?;
+
+                #[derive(serde::Deserialize)]
+                struct ShardIndex {
+                    weight_map: HashMap<String, String>,
+                }
+                let index: ShardIndex = serde_json::from_str(&index_str)?;
 
                 // Collect unique shard filenames
-                let mut shard_files: Vec<String> = weight_map
-                    .values()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect();
+                let mut shard_files: Vec<String> = index.weight_map.values().cloned().collect();
                 shard_files.sort();
                 shard_files.dedup();
                 log::info!("{} shards to download", shard_files.len());
