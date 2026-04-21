@@ -589,6 +589,8 @@ struct Pipelines {
     coop_map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
     /// Small-tile (32×32) pipelines for dispatches with `use_small_tiles = true`.
     small_map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
+    /// Pipelines reading f16 weight storage (dispatches with `b_is_f16 = true`).
+    f16_map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
     /// Epilogue-fused pipelines keyed by (shader, epilogue chain).
     epilogue_map:
         HashMap<(ShaderEntry, Vec<crate::compile::EpilogueOp>), blade_graphics::ComputePipeline>,
@@ -614,6 +616,7 @@ impl Pipelines {
         // For matmul entries, compile BOTH scalar and coop if any dispatch uses coop.
         let mut needed: HashSet<ShaderGroup> = HashSet::new();
         let mut needed_coop: HashSet<ShaderGroup> = HashSet::new();
+        let mut needed_f16: HashSet<ShaderGroup> = HashSet::new();
         let mut entries_for_group: HashMap<ShaderGroup, HashSet<ShaderEntry>> = HashMap::new();
         // Extract head_dim from attention dispatches for parameterized shader generation.
         let mut attention_head_dim: Option<u32> = None;
@@ -682,6 +685,13 @@ impl Pipelines {
                 needed_coop.insert(coop_group);
                 entries_for_group
                     .entry(coop_group)
+                    .or_default()
+                    .insert(dispatch.shader.clone());
+            }
+            if dispatch.b_is_f16 {
+                needed_f16.insert(group);
+                entries_for_group
+                    .entry(group)
                     .or_default()
                     .insert(dispatch.shader.clone());
             }
@@ -865,6 +875,27 @@ impl Pipelines {
             }
         }
 
+        // Compile f16 weight storage pipelines.
+        let mut f16_map = HashMap::new();
+        for &group in &needed_f16 {
+            let sm = crate::codegen::generate_module_f16(group);
+            let shader = gpu.create_shader(bg::ShaderDesc {
+                source: &sm.source,
+                naga_module: Some(sm.module),
+            });
+            if let Some(entries) = entries_for_group.get(&group) {
+                for entry in entries {
+                    let layout = shader_data_layout(entry);
+                    let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
+                        name: entry.entry_point(),
+                        data_layouts: &[&layout],
+                        compute: shader.at(entry.entry_point()),
+                    });
+                    f16_map.insert(entry.clone(), pipeline);
+                }
+            }
+        }
+
         // Compile epilogue-fused pipelines for dispatches with non-empty epilogue.
         // Prefer the new MatMulEpilogue (PointwiseDAG); fall back to legacy
         // Vec<EpilogueOp> for cached plans that predate the DAG migration.
@@ -958,6 +989,7 @@ impl Pipelines {
             map,
             coop_map,
             small_map,
+            f16_map,
             epilogue_map,
             pointwise_map,
             reduction_map,
@@ -991,6 +1023,11 @@ impl Pipelines {
                 return p;
             }
         }
+        if dispatch.b_is_f16 {
+            if let Some(p) = self.f16_map.get(&dispatch.shader) {
+                return p;
+            }
+        }
         &self.map[&dispatch.shader]
     }
 
@@ -1003,6 +1040,9 @@ impl Pipelines {
             result.push((entry.entry_point(), pipeline));
         }
         for (entry, pipeline) in &self.small_map {
+            result.push((entry.entry_point(), pipeline));
+        }
+        for (entry, pipeline) in &self.f16_map {
             result.push((entry.entry_point(), pipeline));
         }
         #[allow(clippy::needless_borrowed_reference)]
@@ -1997,7 +2037,16 @@ impl Session {
         // Check regular parameters first
         for &(ref param_name, buf_ref) in &self.plan.param_buffers {
             if param_name == name {
-                self.upload_buffer(buf_ref, bytemuck::cast_slice(data));
+                if self.plan.f16_buffers.contains(&buf_ref) {
+                    // Convert f32 → f16 and upload half-precision data
+                    let f16_data: Vec<u16> = data
+                        .iter()
+                        .map(|&v| half::f16::from_f32(v).to_bits())
+                        .collect();
+                    self.upload_buffer(buf_ref, bytemuck::cast_slice(&f16_data));
+                } else {
+                    self.upload_buffer(buf_ref, bytemuck::cast_slice(data));
+                }
 
                 // If this source param feeds a derived param, fill the
                 // derived buffer according to the transform type.
@@ -2015,24 +2064,42 @@ impl Session {
                             // Row-interleaved layout: for each row, source A's
                             // columns come first, then source B's columns.
                             let total_cols: usize = sources.iter().map(|s| s.1).sum();
-                            let buf_f32 = self.plan.buffers[derived_buf.0 as usize] / 4;
-                            let rows = buf_f32.checked_div(total_cols).unwrap_or(0);
+                            let derived_is_f16 = self.plan.f16_buffers.contains(derived_buf);
+                            let elem_size = if derived_is_f16 { 2usize } else { 4usize };
+                            let buf_elems = self.plan.buffers[derived_buf.0 as usize] / elem_size;
+                            let rows = buf_elems.checked_div(total_cols).unwrap_or(0);
                             let mut col_offset = 0usize;
                             for src in sources {
                                 let src_name = &src.0;
                                 let src_cols = src.1;
                                 if src_name == name && rows > 0 {
-                                    let derived_ptr =
-                                        self.buffers[derived_buf.0 as usize].data() as *mut f32;
-                                    for r in 0..rows {
-                                        let src_start = r * src_cols;
-                                        let dst_start = r * total_cols + col_offset;
-                                        unsafe {
-                                            std::ptr::copy_nonoverlapping(
-                                                data[src_start..].as_ptr(),
-                                                derived_ptr.add(dst_start),
-                                                src_cols,
-                                            );
+                                    if derived_is_f16 {
+                                        let derived_ptr = self.buffers[derived_buf.0 as usize]
+                                            .data()
+                                            as *mut half::f16;
+                                        for r in 0..rows {
+                                            let src_start = r * src_cols;
+                                            let dst_start = r * total_cols + col_offset;
+                                            for c in 0..src_cols {
+                                                unsafe {
+                                                    *derived_ptr.add(dst_start + c) =
+                                                        half::f16::from_f32(data[src_start + c]);
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        let derived_ptr =
+                                            self.buffers[derived_buf.0 as usize].data() as *mut f32;
+                                        for r in 0..rows {
+                                            let src_start = r * src_cols;
+                                            let dst_start = r * total_cols + col_offset;
+                                            unsafe {
+                                                std::ptr::copy_nonoverlapping(
+                                                    data[src_start..].as_ptr(),
+                                                    derived_ptr.add(dst_start),
+                                                    src_cols,
+                                                );
+                                            }
                                         }
                                     }
                                 }

@@ -5,6 +5,7 @@ pub type NodeId = u32;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DType {
     F32,
+    F16,
     U32,
 }
 
@@ -12,6 +13,7 @@ impl DType {
     pub fn size_bytes(self) -> usize {
         match self {
             DType::F32 => 4,
+            DType::F16 => 2,
             DType::U32 => 4,
         }
     }
@@ -30,6 +32,10 @@ impl TensorType {
 
     pub fn f32(shape: Vec<usize>) -> Self {
         Self::new(shape, DType::F32)
+    }
+
+    pub fn f16(shape: Vec<usize>) -> Self {
+        Self::new(shape, DType::F16)
     }
 
     pub fn num_elements(&self) -> usize {
@@ -691,6 +697,20 @@ impl Graph {
 
     pub fn parameter(&mut self, name: &str, shape: &[usize]) -> NodeId {
         let ty = TensorType::f32(shape.to_vec());
+        self.add_node(
+            Op::Parameter {
+                name: name.to_string(),
+            },
+            vec![],
+            ty,
+        )
+    }
+
+    /// Create a parameter stored as f16 on GPU (half the VRAM of f32).
+    /// Weights are converted from f32 to f16 during upload.
+    /// Shaders read f16 and cast to f32 for computation.
+    pub fn parameter_f16(&mut self, name: &str, shape: &[usize]) -> NodeId {
+        let ty = TensorType::f16(shape.to_vec());
         self.add_node(
             Op::Parameter {
                 name: name.to_string(),

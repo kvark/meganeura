@@ -1,4 +1,4 @@
-use crate::graph::{Graph, Node, NodeId, Op};
+use crate::graph::{DType, Graph, Node, NodeId, Op};
 use crate::schedule::{PointwiseDAG, ReductionKernel};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -457,6 +457,10 @@ pub struct Dispatch {
     /// the kernel's buffer-input arity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reduction: Option<ReductionKernel>,
+    /// When true, the B (weight) input buffer stores f16 data.
+    /// Shaders read f16 and cast to f32 for computation.
+    #[serde(default)]
+    pub b_is_f16: bool,
 }
 
 /// Reference to a GPU buffer in the execution plan.
@@ -494,6 +498,9 @@ pub struct ExecutionPlan {
         Vec<(String, usize)>,
         crate::graph::ParamTransform,
     )>,
+    /// Set of BufferRefs that store f16 data (half-precision weights).
+    #[serde(default)]
+    pub f16_buffers: std::collections::HashSet<BufferRef>,
 }
 
 /// Compile a differentiated graph into an ExecutionPlan.
@@ -1090,6 +1097,7 @@ impl<'a> Compiler<'a> {
                 param_grad_pairs: Vec::new(),
                 lse_buffers: Vec::new(),
                 derived_params: Vec::new(),
+                f16_buffers: std::collections::HashSet::new(),
             },
             node_buffers: HashMap::new(),
             options,
@@ -1194,6 +1202,9 @@ impl<'a> Compiler<'a> {
             match node.op {
                 Op::Parameter { ref name } => {
                     self.plan.param_buffers.push((name.clone(), buf));
+                    if node.ty.dtype == DType::F16 {
+                        self.plan.f16_buffers.insert(buf);
+                    }
                 }
                 Op::Input { ref name } => {
                     self.plan.input_buffers.push((name.clone(), buf));
@@ -1338,6 +1349,7 @@ impl<'a> Compiler<'a> {
                 let b = self.get_buffer(node.inputs[1]);
                 let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
+                let b_f16 = self.graph.node(node.inputs[1]).ty.dtype == DType::F16;
                 let m = a_shape[0] as u32;
                 let k = a_shape[1] as u32;
                 let n = b_shape[1] as u32;
@@ -1355,6 +1367,7 @@ impl<'a> Compiler<'a> {
                         params: vec![m, k, n, 0],
                         use_coop: false,
                         use_small_tiles: false,
+                        b_is_f16: b_f16,
                         ..Default::default()
                     });
                 } else {
@@ -1367,6 +1380,7 @@ impl<'a> Compiler<'a> {
                         params: vec![m, k, n, 0],
                         use_coop: false,
                         use_small_tiles: false,
+                        b_is_f16: b_f16,
                         ..Default::default()
                     });
                 }
@@ -1378,6 +1392,7 @@ impl<'a> Compiler<'a> {
                 let b = self.get_buffer(node.inputs[1]);
                 let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
+                let b_f16 = self.graph.node(node.inputs[1]).ty.dtype == DType::F16;
                 let k = a_shape[0] as u32; // A is [K, M]
                 let m = a_shape[1] as u32;
                 let n = b_shape[1] as u32; // B is [K, N]
@@ -1390,6 +1405,7 @@ impl<'a> Compiler<'a> {
                     params: vec![m, n, k, 0],
                     use_coop: false,
                     use_small_tiles: false,
+                    b_is_f16: b_f16,
                     ..Default::default()
                 });
             }
@@ -1400,13 +1416,11 @@ impl<'a> Compiler<'a> {
                 let b = self.get_buffer(node.inputs[1]);
                 let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
+                let b_f16 = self.graph.node(node.inputs[1]).ty.dtype == DType::F16;
                 let m = a_shape[0] as u32; // A is [M, K]
                 let k = a_shape[1] as u32;
                 let n = b_shape[0] as u32; // B is [N, K]
                 if m == 1 && k.is_multiple_of(4) {
-                    // K-split GEMV for MatMulBT. Per WG one output col;
-                    // the 32 threads K-split with contiguous vec4 loads
-                    // along the inner K axis of B. Coalesced by design.
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::MatMulGemvBT,
                         workgroups: [n, 1, 1],
@@ -1416,6 +1430,7 @@ impl<'a> Compiler<'a> {
                         params: vec![m, n, k, 0],
                         use_coop: false,
                         use_small_tiles: false,
+                        b_is_f16: b_f16,
                         ..Default::default()
                     });
                 } else {
@@ -1428,6 +1443,7 @@ impl<'a> Compiler<'a> {
                         params: vec![m, n, k, 0],
                         use_coop: false,
                         use_small_tiles: false,
+                        b_is_f16: b_f16,
                         ..Default::default()
                     });
                 }
