@@ -5129,15 +5129,24 @@ mod tests {
 
     #[test]
     fn q4_matmul_shader_generates() {
-        let sm = generate_module_q4(ShaderGroup::MatMul);
-        assert!(
-            sm.source.contains("dequant_q4"),
-            "Q4 shader missing dequant_q4 function"
-        );
-        assert!(
-            sm.source.contains("array<u32>"),
-            "Q4 shader should use array<u32> for B storage"
-        );
-        eprintln!("Q4 MatMul shader: {} chars", sm.source.len());
+        for group in [
+            ShaderGroup::MatMul,
+            ShaderGroup::MatMulAdd,
+            ShaderGroup::MatMulAT,
+            ShaderGroup::MatMulATAdd,
+            ShaderGroup::MatMulBT,
+            ShaderGroup::MatMulBTAdd,
+        ] {
+            let sm = generate_module_q4(group);
+            assert!(
+                sm.source.contains("dequant_q4"),
+                "Q4 {group:?}: missing dequant_q4"
+            );
+            assert!(
+                sm.source.contains("array<u32>"),
+                "Q4 {group:?}: missing array<u32>"
+            );
+            eprintln!("Q4 {group:?} shader: {} chars", sm.source.len());
+        }
     }
 }
