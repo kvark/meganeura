@@ -2496,6 +2496,41 @@ impl Session {
         panic!("unknown input: {}", name);
     }
 
+    /// Raw host pointer and byte size for the named input slot's
+    /// backing buffer. All graph buffers are allocated as
+    /// `Memory::Shared` (device-local + host-visible + host-coherent),
+    /// so writes through this pointer go straight into the GPU-side
+    /// buffer — no staging, no explicit upload, no
+    /// `VK_EXT_external_memory_host` import needed.
+    ///
+    /// Returns `None` if no input with that name exists.
+    ///
+    /// # Ordering
+    ///
+    /// Host writes to host-coherent memory are made visible to a
+    /// subsequent `step()` via Vulkan's implicit host-memory-domain
+    /// barrier on queue submit — no explicit flush required. A
+    /// `wait()` from the previous `step()` must have completed
+    /// before the host begins writing, otherwise the next frame
+    /// races the GPU's in-flight read of the previous frame.
+    ///
+    /// # Safety
+    ///
+    /// The returned pointer is valid as long as the `Session`
+    /// lives. The caller must not write beyond `size_bytes` and
+    /// must respect the alignment of whatever type they interpret
+    /// the memory as.
+    pub fn input_host_ptr(&self, name: &str) -> Option<(*mut u8, usize)> {
+        for &(ref input_name, buf_ref) in &self.plan.input_buffers {
+            if input_name == name {
+                let buffer = &self.buffers[buf_ref.0 as usize];
+                let size = self.plan.buffers[buf_ref.0 as usize];
+                return Some((buffer.data(), size));
+            }
+        }
+        None
+    }
+
     /// Upload u32 input data (e.g. token IDs for embedding lookup).
     pub fn set_input_u32(&mut self, name: &str, data: &[u32]) {
         for &(ref input_name, buf_ref) in &self.plan.input_buffers {
