@@ -3,7 +3,18 @@
 // For each batch item:
 //   1. Parallel max reduction over features (numerical stability)
 //   2. Parallel sum-exp reduction
-//   3. Parallel gradient output + serial loss accumulation
+//   3. Parallel Σ(labels) reduction  ← generalizes to arbitrary label weights
+//   4. Parallel gradient output + serial loss accumulation
+//
+// Forward:  L = -Σ labels · log_softmax(logits)
+// Gradient: ∂L/∂logits_j = softmax_j · S − labels_j,  where S = Σ_i labels_i.
+//
+// Most users feed labels that sum to 1 (a probability distribution), for which
+// S = 1 and the gradient reduces to the familiar `softmax − labels`. But users
+// that feed per-class *weights* that do NOT sum to 1 (e.g. advantage-scaled
+// one-hot policy-gradient targets) get the correct general derivative here
+// rather than a silent S=1 assumption that produces anti-learning when
+// |S| < softmax_j (the small-weight regime).
 //
 // Dispatch: [batch, 1, 1], workgroup_size(256)
 
@@ -72,7 +83,30 @@ fn main(
     let log_sum_exp = log(wg_buf[0]) + max_val;
     workgroupBarrier();
 
-    // === Pass 3: parallel gradient + partial loss ===
+    // === Pass 3: parallel Σ(labels) reduction ===
+    // Needed for the generalized gradient `softmax·S − labels`, which reduces
+    // to the standard form `softmax − labels` when labels is a probability
+    // distribution (S=1) and to the correct policy-gradient magnitudes when
+    // labels carry per-class weights (S≠1).
+    var local_label_sum = 0.0;
+    j = tid;
+    loop {
+        if j >= features { break; }
+        local_label_sum += labels[offset + j];
+        j += 256u;
+    }
+    wg_buf[tid] = local_label_sum;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s >>= 1u) {
+        if tid < s {
+            wg_buf[tid] += wg_buf[tid + s];
+        }
+        workgroupBarrier();
+    }
+    let label_sum = wg_buf[0];
+    workgroupBarrier();
+
+    // === Pass 4: parallel gradient + partial loss ===
     let inv_batch = 1.0 / f32(params.batch);
     var local_loss = 0.0;
     j = tid;
@@ -81,7 +115,7 @@ fn main(
         let log_softmax = logits[offset + j] - log_sum_exp;
         let softmax = exp(log_softmax);
         local_loss -= labels[offset + j] * log_softmax;
-        grad_out[offset + j] = (softmax - labels[offset + j]) * inv_batch;
+        grad_out[offset + j] = (softmax * label_sum - labels[offset + j]) * inv_batch;
         j += 256u;
     }
 
