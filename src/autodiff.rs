@@ -138,19 +138,34 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 accumulate_grad(&mut graph, &mut grads, node.inputs[0], grad_x);
             }
             Op::CrossEntropyLoss => {
-                // L = -mean_over_batch(labels * log(softmax(logits)))
-                // dL/dlogits = (softmax(logits) - labels) / batch
+                // L = -mean_over_batch(Σ_j labels_j · log_softmax_j)
+                // ∂L/∂logits_j = (softmax_j · S − labels_j) / batch
+                //   where S = Σ_i labels_i (per-batch-row sum).
+                //
+                // The familiar textbook gradient `softmax − labels` assumes
+                // labels is a probability distribution (S = 1). When labels
+                // is a non-normalized weighting — e.g. kindle's
+                // `advantage · one_hot_action` for policy-gradient training
+                // — the S factor on the softmax term is needed; without it
+                // the gradient has wrong magnitude and can have wrong sign
+                // when |S| < softmax_j on the taken class.
                 let logits = node.inputs[0];
                 let labels = node.inputs[1];
-                let batch = forward.nodes()[logits as usize].ty.shape[0];
-                let n = forward.nodes()[logits as usize].ty.num_elements();
+                let shape = forward.nodes()[logits as usize].ty.shape.clone();
+                let batch = shape[0];
+                let features = shape[1];
+                let n = batch * features;
                 let softmax = graph.softmax(logits);
+                // Build per-row label sum broadcast to [batch, features]:
+                // matmul([batch, features], [features, features]=ones)
+                // yields a [batch, features] tensor whose row b is S[b]
+                // replicated `features` times.
+                let ones_ff = graph.constant(vec![1.0; features * features], &[features, features]);
+                let label_sum_bf = graph.matmul(labels, ones_ff);
+                let softmax_scaled = graph.mul(softmax, label_sum_bf);
                 let neg_labels = graph.neg(labels);
-                let diff = graph.add(softmax, neg_labels);
-                let inv_batch = graph.constant(
-                    vec![1.0 / batch as f32; n],
-                    &forward.nodes()[logits as usize].ty.shape,
-                );
+                let diff = graph.add(softmax_scaled, neg_labels);
+                let inv_batch = graph.constant(vec![1.0 / batch as f32; n], &shape);
                 let grad_logits = graph.mul(diff, inv_batch);
                 accumulate_grad(&mut graph, &mut grads, logits, grad_logits);
                 // No gradient for labels (they're targets)

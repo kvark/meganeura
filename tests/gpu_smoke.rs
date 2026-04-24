@@ -2062,6 +2062,116 @@ fn cross_entropy_gradient_check() {
     );
 }
 
+/// Same backward-vs-finite-differences check, but with labels that do NOT sum
+/// to 1 — per-class weights, like kindle feeds for advantage-weighted policy
+/// gradients. The correct gradient is `softmax·Σlabels − labels`; the old
+/// shader assumed `Σlabels = 1` and returned `softmax − labels` (wrong sign
+/// for small positive weights on the taken class).
+#[test]
+fn cross_entropy_gradient_check_weighted_labels() {
+    let seq = 4usize;
+    let vocab = 6usize;
+    let hidden = 5usize;
+
+    let mut g = Graph::new();
+    let x = g.parameter("x", &[seq, hidden]);
+    let w = g.parameter("w", &[hidden, vocab]);
+    let logits = g.matmul(x, w);
+    let labels = g.input("labels", &[seq, vocab]);
+    let loss = g.cross_entropy_loss(logits, labels);
+    g.set_outputs(vec![loss]);
+
+    let mut sess = build_session(&g);
+
+    let x_data: Vec<f32> = (0..seq * hidden)
+        .map(|i| (i as f32 * 0.13).sin() * 0.4)
+        .collect();
+    let w_data: Vec<f32> = (0..hidden * vocab)
+        .map(|i| (i as f32 * 0.11 + 0.5).cos() * 0.4)
+        .collect();
+    // Per-row label weights with varying magnitudes, both signs, and
+    // sums ≠ 1. Exercises the general-case gradient `softmax·S − labels`.
+    let mut label_data = vec![0.0f32; seq * vocab];
+    let row_weights = [2.0f32, 0.2, -1.5, 0.05];
+    for pos in 0..seq {
+        label_data[pos * vocab + (pos + 1) % vocab] = row_weights[pos];
+    }
+
+    sess.set_parameter("x", &x_data);
+    sess.set_parameter("w", &w_data);
+    sess.set_input("labels", &label_data);
+    sess.step();
+    sess.wait();
+
+    let plan = sess.plan().clone();
+    let param_bufs: std::collections::HashMap<String, BufferRef> =
+        plan.param_buffers.iter().cloned().collect();
+    let grad_map: std::collections::HashMap<BufferRef, BufferRef> =
+        plan.param_grad_pairs.iter().cloned().collect();
+
+    let mut grad_w = vec![0.0f32; hidden * vocab];
+    sess.read_buffer(grad_map[&param_bufs["w"]], &mut grad_w);
+    let mut grad_x = vec![0.0f32; seq * hidden];
+    sess.read_buffer(grad_map[&param_bufs["x"]], &mut grad_x);
+
+    // Finite differences
+    let mut gi = Graph::new();
+    let xi = gi.parameter("x", &[seq, hidden]);
+    let wi = gi.parameter("w", &[hidden, vocab]);
+    let li = gi.matmul(xi, wi);
+    let la = gi.input("labels", &[seq, vocab]);
+    let lo = gi.cross_entropy_loss(li, la);
+    gi.set_outputs(vec![lo]);
+    let mut isess = build_inference_session(&gi);
+
+    let fwd = |s: &mut meganeura::Session, xd: &[f32], wd: &[f32]| -> f32 {
+        s.set_parameter("x", xd);
+        s.set_parameter("w", wd);
+        s.set_input("labels", &label_data);
+        s.step();
+        s.wait();
+        s.read_loss()
+    };
+
+    let eps = 1e-3f32;
+    let mut max_rel = 0.0f32;
+    for idx in [0, 4, 9, 17, 23] {
+        if idx >= hidden * vocab {
+            continue;
+        }
+        let mut wd = w_data.clone();
+        wd[idx] += eps;
+        let lp = fwd(&mut isess, &x_data, &wd);
+        wd[idx] -= 2.0 * eps;
+        let lm = fwd(&mut isess, &x_data, &wd);
+        let num = (lp - lm) / (2.0 * eps);
+        let ana = grad_w[idx];
+        let rel = grad_rel_err(num, ana);
+        eprintln!("weighted grad_w[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
+        max_rel = max_rel.max(rel);
+    }
+    for idx in [0, 4, 10, 17] {
+        if idx >= seq * hidden {
+            continue;
+        }
+        let mut xd = x_data.clone();
+        xd[idx] += eps;
+        let lp = fwd(&mut isess, &xd, &w_data);
+        xd[idx] -= 2.0 * eps;
+        let lm = fwd(&mut isess, &xd, &w_data);
+        let num = (lp - lm) / (2.0 * eps);
+        let ana = grad_x[idx];
+        let rel = grad_rel_err(num, ana);
+        eprintln!("weighted grad_x[{idx}]: ana={ana:.6e} num={num:.6e} rel={rel:.4}");
+        max_rel = max_rel.max(rel);
+    }
+    eprintln!("CrossEntropy weighted-label gradient check: max relative error {max_rel:.6}");
+    assert!(
+        max_rel < 0.05,
+        "CrossEntropy weighted-label gradient error too large: {max_rel}"
+    );
+}
+
 #[test]
 fn matmul_bt_gradient_check() {
     // Verify MatMulBT backward via finite differences.
