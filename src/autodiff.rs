@@ -480,7 +480,11 @@ pub fn differentiate(forward: &Graph) -> Graph {
             }
 
             // Leaf nodes
-            Op::Input { .. } | Op::Parameter { .. } | Op::Constant { .. } | Op::Greater => {}
+            Op::Input { .. }
+            | Op::Parameter { .. }
+            | Op::Constant { .. }
+            | Op::Greater
+            | Op::StopGradient => {}
             Op::Nop => {}
             Op::Identity => {
                 // Identity/reshape backward: reshape gradient back to input shape

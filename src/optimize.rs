@@ -602,6 +602,7 @@ fn node_to_egglog_expr(node: &Node) -> String {
         }
         Op::Nop => unreachable!("Nop nodes are filtered before encoding"),
         Op::Identity => format!("(Identity n{})", i[0]),
+        Op::StopGradient => format!("(Identity n{})", i[0]),
     }
 }
 

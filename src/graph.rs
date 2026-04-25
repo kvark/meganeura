@@ -141,6 +141,12 @@ pub enum Op {
     /// Identity / reshape: zero-cost view with potentially different shape.
     /// Compiled as buffer alias (no GPU dispatch). Backward reshapes grad back.
     Identity,
+    /// Forward identity, backward zero. Lets a graph use a value in two
+    /// places where one branch's gradient should not flow back to the
+    /// shared producer (the standard "detach" / "stop_gradient" op in
+    /// other frameworks). Compiled as a buffer alias, so zero forward
+    /// cost; in autodiff, no gradient is accumulated for the input.
+    StopGradient,
 
     // Log-softmax (for numerical stability)
     LogSoftmax,
@@ -916,6 +922,14 @@ impl Graph {
         // Reshape is a zero-cost view — just reinterprets the shape.
         // Uses Identity op (compiled as buffer alias, no GPU dispatch).
         self.add_raw_node(Op::Identity, vec![x], TensorType::f32(new_shape.to_vec()))
+    }
+
+    /// Forward identity, backward zero — the "detach" / `stop_gradient`
+    /// op. Use when a value is consumed by two branches and only one
+    /// should send gradient back to the producer.
+    pub fn stop_gradient(&mut self, x: NodeId) -> NodeId {
+        let ty = self.node(x).ty.clone();
+        self.add_node(Op::StopGradient, vec![x], ty)
     }
 
     /// Element-wise division: `a / b` = `a * recip(b)`.
