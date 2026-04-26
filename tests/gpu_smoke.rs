@@ -1862,6 +1862,76 @@ fn conv2d_backward_smoke() {
     }
 }
 
+/// Verify the bulk gradient-inspection API: param_names enumerates,
+/// has_param_grad reports correctly, read_all_param_grad_norms returns
+/// finite norms in compile order matching individual read_param_grad.
+#[test]
+fn grad_inspection_api_basic() {
+    use meganeura::{Graph, build_session};
+    let mut g = Graph::new();
+    let x = g.input("x", &[2, 3]);
+    let w = g.parameter("weights", &[3, 2]);
+    let b = g.parameter("bias", &[2]);
+    let h = g.matmul(x, w);
+    let h = g.bias_add(h, b);
+    let target = g.input("target", &[2, 2]);
+    let loss = g.mse_loss(h, target);
+    g.set_outputs(vec![loss]);
+    let mut session = build_session(&g);
+
+    session.set_input("x", &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    session.set_input("target", &[0.5, 0.5, 0.5, 0.5]);
+    session.set_parameter("weights", &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6]);
+    session.set_parameter("bias", &[0.1, -0.1]);
+    session.step();
+    session.wait();
+
+    // param_names enumerates both params.
+    let names = session.param_names();
+    assert!(names.contains(&"weights"), "weights in param_names");
+    assert!(names.contains(&"bias"), "bias in param_names");
+
+    // has_param_grad true for both since loss flows through both.
+    assert!(session.has_param_grad("weights"), "weights has grad");
+    assert!(session.has_param_grad("bias"), "bias has grad");
+    assert!(!session.has_param_grad("nonexistent"), "missing → false");
+
+    // param_size matches buffer size in f32 elements.
+    assert_eq!(session.param_size("weights"), Some(6));
+    assert_eq!(session.param_size("bias"), Some(2));
+    assert_eq!(session.param_size("missing"), None);
+
+    // Bulk grad norms should agree with individual read_param_grad
+    // computations (modulo float rounding).
+    let bulk = session.read_all_param_grad_norms();
+    assert_eq!(bulk.len(), 2, "two params with grads");
+    for (name, bulk_norm) in &bulk {
+        let n = session.param_size(name).unwrap();
+        let mut grad = vec![0.0f32; n];
+        session.read_param_grad(name, &mut grad);
+        let manual: f32 = grad.iter().map(|&v| v * v).sum::<f32>().sqrt();
+        let diff = (bulk_norm - manual).abs();
+        assert!(
+            diff < 1e-5 || diff < manual * 1e-4,
+            "bulk norm for {} ({}) should match manual ({})",
+            name,
+            bulk_norm,
+            manual
+        );
+        assert!(bulk_norm.is_finite(), "norm finite for {}", name);
+    }
+
+    // Bulk weight norms cover all params (including any without grads).
+    let weights = session.read_all_param_norms();
+    assert_eq!(weights.len(), 2);
+    for (name, n) in &weights {
+        assert!(n.is_finite() && *n > 0.0, "{} weight norm > 0", name);
+    }
+
+    // dump_grad_summary doesn't panic.
+    session.dump_grad_summary(2);
+}
+
 /// Verify RoPE applies per-head rotation correctly (not global-dim rotation).
 /// With 2 heads of head_dim=4, the rotation pairs within each head should use
 /// exponents based on head_dim=4, NOT the full dim=8.

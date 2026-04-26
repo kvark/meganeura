@@ -2670,6 +2670,112 @@ impl Session {
         self.read_buffer(grad_buf, out);
     }
 
+    /// Enumerate all parameter names in this session.
+    ///
+    /// Useful for diagnostic loops that want to inspect every parameter
+    /// without hardcoding names. Order matches the underlying
+    /// `ExecutionPlan::param_buffers` (compile-order, stable across runs
+    /// of the same graph).
+    pub fn param_names(&self) -> Vec<&str> {
+        self.plan
+            .param_buffers
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
+
+    /// Element count for a parameter (in `f32` elements). Returns
+    /// `None` if the name doesn't exist.
+    pub fn param_size(&self, name: &str) -> Option<usize> {
+        let buf_ref = self.param_buffer(name)?;
+        // BufferRef indexes into self.plan.buffers; entry is byte size.
+        let bytes = self.plan.buffers[buf_ref.0 as usize] as usize;
+        Some(bytes / std::mem::size_of::<f32>())
+    }
+
+    /// Returns true iff the parameter has an associated gradient buffer
+    /// (i.e. was reached by the backward pass and isn't inference-only).
+    pub fn has_param_grad(&self, name: &str) -> bool {
+        let Some(param_buf) = self.param_buffer(name) else {
+            return false;
+        };
+        self.plan
+            .param_grad_pairs
+            .iter()
+            .any(|&(p, _)| p == param_buf)
+    }
+
+    /// Bulk read of per-parameter gradient L2 norms (Frobenius for
+    /// matrices). Returns `(name, ‖grad‖₂)` pairs, in compile order,
+    /// for every parameter that has a gradient buffer.
+    ///
+    /// The dominant diagnostic for "which parameter is exploding /
+    /// vanishing under the current loss". Cost is one buffer copy +
+    /// one sum-of-squares pass per parameter; meant for periodic
+    /// inspection (every N steps), not per-step.
+    pub fn read_all_param_grad_norms(&self) -> Vec<(String, f32)> {
+        let mut out = Vec::with_capacity(self.plan.param_buffers.len());
+        let mut scratch: Vec<f32> = Vec::new();
+        for (name, _) in &self.plan.param_buffers {
+            if !self.has_param_grad(name) {
+                continue;
+            }
+            let n = self
+                .param_size(name)
+                .expect("param exists; size known");
+            scratch.resize(n, 0.0);
+            self.read_param_grad(name, &mut scratch);
+            let sum_sq: f32 = scratch.iter().map(|&v| v * v).sum();
+            out.push((name.clone(), sum_sq.sqrt()));
+        }
+        out
+    }
+
+    /// Bulk read of per-parameter weight L2 norms. Same shape as
+    /// `read_all_param_grad_norms`. Useful for computing
+    /// gradient-to-weight ratios as a stability indicator.
+    pub fn read_all_param_norms(&self) -> Vec<(String, f32)> {
+        let mut out = Vec::with_capacity(self.plan.param_buffers.len());
+        let mut scratch: Vec<f32> = Vec::new();
+        for (name, _) in &self.plan.param_buffers {
+            let n = self
+                .param_size(name)
+                .expect("param exists; size known");
+            scratch.resize(n, 0.0);
+            self.read_param(name, &mut scratch);
+            let sum_sq: f32 = scratch.iter().map(|&v| v * v).sum();
+            out.push((name.clone(), sum_sq.sqrt()));
+        }
+        out
+    }
+
+    /// Print a summary of the largest gradient norms (descending).
+    /// Intended for occasional diagnostic dumps when training is
+    /// behaving unexpectedly. Includes the gradient/weight ratio
+    /// (if the weight is nonzero) so divergent updates are visible.
+    pub fn dump_grad_summary(&self, top_n: usize) {
+        let grads = self.read_all_param_grad_norms();
+        let weights = self.read_all_param_norms();
+        let weights_lookup: std::collections::HashMap<&str, f32> =
+            weights.iter().map(|(n, w)| (n.as_str(), *w)).collect();
+        let mut sorted: Vec<&(String, f32)> = grads.iter().collect();
+        sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let n = sorted.len().min(top_n.max(1));
+        eprintln!(
+            "--- top {} param grads (out of {} with grads) ---",
+            n,
+            sorted.len()
+        );
+        for (name, g) in sorted.iter().take(n) {
+            let w = weights_lookup.get(name.as_str()).copied().unwrap_or(0.0);
+            let ratio = if w > 0.0 { g / w } else { f32::NAN };
+            eprintln!(
+                "  {:>40}  ‖g‖={:.3e}  ‖w‖={:.3e}  g/w={:.3e}",
+                name, g, w, ratio
+            );
+        }
+    }
+
     /// Upload data into a parameter buffer by name (for initializing KV caches etc.).
     pub fn upload_param(&self, name: &str, data: &[f32]) {
         let buf_ref = self
