@@ -1932,6 +1932,113 @@ fn grad_inspection_api_basic() {
     session.dump_grad_summary(2);
 }
 
+/// Verify per-parameter LR multipliers actually scale the SGD update.
+/// Two parameters; multiplier on one of them; after one SGD step the
+/// scaled param should have moved that-many-times-more.
+#[test]
+fn lr_multipliers_apply_to_sgd_update() {
+    use meganeura::{Graph, build_session};
+    let mut g = Graph::new();
+    let x = g.input("x", &[2, 2]);
+    let w_a = g.parameter("a.weight", &[2, 2]);
+    let w_b = g.parameter("b.weight", &[2, 2]);
+    let h = g.matmul(x, w_a);
+    let h = g.matmul(h, w_b);
+    let target = g.input("target", &[2, 2]);
+    let loss = g.mse_loss(h, target);
+    g.set_outputs(vec![loss]);
+    let mut session = build_session(&g);
+
+    let init = vec![1.0, 0.1, 0.1, 1.0];
+
+    // Pass 1: default LR (no multipliers). Observe per-param updates.
+    session.set_parameter("a.weight", &init);
+    session.set_parameter("b.weight", &init);
+    session.set_input("x", &[1.0, 0.0, 0.0, 1.0]);
+    session.set_input("target", &[0.0, 0.0, 0.0, 0.0]);
+    let base_lr = 0.01;
+    session.set_learning_rate(base_lr);
+    session.step();
+    session.wait();
+
+    let mut a_after = vec![0.0; 4];
+    let mut b_after = vec![0.0; 4];
+    session.read_param("a.weight", &mut a_after);
+    session.read_param("b.weight", &mut b_after);
+    let delta_a_default: f32 = a_after
+        .iter()
+        .zip(init.iter())
+        .map(|(p, i)| (p - i).abs())
+        .sum();
+    let delta_b_default: f32 = b_after
+        .iter()
+        .zip(init.iter())
+        .map(|(p, i)| (p - i).abs())
+        .sum();
+
+    // Pass 2: reset, apply 5x multiplier to b.weight only, observe.
+    session.set_parameter("a.weight", &init);
+    session.set_parameter("b.weight", &init);
+    session.set_lr_multiplier("b.", 5.0);
+    session.set_learning_rate(base_lr);
+    session.step();
+    session.wait();
+
+    let mut a_after2 = vec![0.0; 4];
+    let mut b_after2 = vec![0.0; 4];
+    session.read_param("a.weight", &mut a_after2);
+    session.read_param("b.weight", &mut b_after2);
+    let delta_a_scaled: f32 = a_after2
+        .iter()
+        .zip(init.iter())
+        .map(|(p, i)| (p - i).abs())
+        .sum();
+    let delta_b_scaled: f32 = b_after2
+        .iter()
+        .zip(init.iter())
+        .map(|(p, i)| (p - i).abs())
+        .sum();
+
+    // a.weight's update should be unchanged (no multiplier applies).
+    let a_diff = (delta_a_scaled - delta_a_default).abs();
+    assert!(
+        a_diff < delta_a_default * 0.05 + 1e-6,
+        "a.weight update should be unaffected: default={} scaled={}",
+        delta_a_default,
+        delta_a_scaled
+    );
+    // b.weight's update should be ~5x its default.
+    let b_ratio = delta_b_scaled / delta_b_default;
+    assert!(
+        (b_ratio - 5.0).abs() < 0.5,
+        "b.weight update should scale by ~5x: default={} scaled={} ratio={}",
+        delta_b_default,
+        delta_b_scaled,
+        b_ratio
+    );
+
+    // Pass 3: clear multipliers, verify both params back to default.
+    session.set_parameter("a.weight", &init);
+    session.set_parameter("b.weight", &init);
+    session.clear_lr_multipliers();
+    session.set_learning_rate(base_lr);
+    session.step();
+    session.wait();
+    let mut b_after3 = vec![0.0; 4];
+    session.read_param("b.weight", &mut b_after3);
+    let delta_b_cleared: f32 = b_after3
+        .iter()
+        .zip(init.iter())
+        .map(|(p, i)| (p - i).abs())
+        .sum();
+    assert!(
+        (delta_b_cleared - delta_b_default).abs() < delta_b_default * 0.05 + 1e-6,
+        "b.weight update should return to default after clear: default={} cleared={}",
+        delta_b_default,
+        delta_b_cleared
+    );
+}
+
 /// Verify RoPE applies per-head rotation correctly (not global-dim rotation).
 /// With 2 heads of head_dim=4, the rotation pairs within each head should use
 /// exponents based on head_dim=4, NOT the full dim=8.

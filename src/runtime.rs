@@ -1286,6 +1286,12 @@ pub struct Session {
     adam_step: u32,
     /// Pending Adam parameters. When set, `step()` appends Adam updates.
     pending_adam: Option<(f32, f32, f32, f32)>, // (lr, beta1, beta2, eps)
+    /// Per-parameter learning rate multipliers, keyed by name prefix.
+    /// When the SGD/Adam update applies to a parameter whose name starts
+    /// with one of these prefixes, the effective LR is `base_lr * mul`.
+    /// Longest-prefix-match wins; default multiplier is 1.0. Empty by
+    /// default (preserves base LR for all params).
+    lr_multipliers: Vec<(String, f32)>,
     /// Staging buffers for Q4 HorizontalConcat derived params.
     weight_staging: HashMap<crate::compile::BufferRef, Vec<f32>>,
 }
@@ -1798,6 +1804,7 @@ impl Session {
             last_submit_ns: 0,
             profiling: false,
             pending_lr: None,
+            lr_multipliers: Vec::new(),
             adam_state,
             adam_step: 0,
             pending_adam: None,
@@ -2876,6 +2883,10 @@ impl Session {
 
         // If training, append SGD updates as a final barrier group (all
         // independent, so one pass). This avoids a second submit/wait cycle.
+        // Per-parameter LR multipliers are applied here: the effective LR
+        // for a given param is `base_lr * longest_matching_prefix_multiplier`
+        // (default 1.0). Param-name lookup uses the plan's param_buffers
+        // table; the cost is negligible (small N at session-build time).
         if !self.plan.param_grad_pairs.is_empty() {
             let lr = self.pending_lr.take();
             if let Some(learning_rate) = lr {
@@ -2883,6 +2894,12 @@ impl Session {
                 let mut pass = self.encoder.compute("sgd_update");
                 for &(param_buf, grad_buf) in &self.plan.param_grad_pairs {
                     let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
+                    let effective_lr =
+                        learning_rate * Self::lr_multiplier_for_buf(
+                            &self.plan.param_buffers,
+                            &self.lr_multipliers,
+                            param_buf,
+                        );
                     let mut pc = pass.with(pipeline);
                     pc.bind(
                         0,
@@ -2892,7 +2909,7 @@ impl Session {
                             dst: self.buffers[param_buf.0 as usize].at(0),
                             params: SgdParams {
                                 len,
-                                lr: learning_rate,
+                                lr: effective_lr,
                                 _pad0: 0,
                                 _pad1: 0,
                             },
@@ -2906,6 +2923,12 @@ impl Session {
                 let mut pass = self.encoder.compute("adam_update");
                 for (idx, &(param_buf, grad_buf)) in self.plan.param_grad_pairs.iter().enumerate() {
                     let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
+                    let effective_lr =
+                        lr * Self::lr_multiplier_for_buf(
+                            &self.plan.param_buffers,
+                            &self.lr_multipliers,
+                            param_buf,
+                        );
                     let (ref m_buf, ref v_buf) = self.adam_state[idx];
                     let mut pc = pass.with(pipeline);
                     pc.bind(
@@ -2917,7 +2940,7 @@ impl Session {
                             v: v_buf.at(0),
                             params: AdamParams {
                                 len,
-                                lr,
+                                lr: effective_lr,
                                 beta1,
                                 beta2,
                                 eps,
@@ -4025,6 +4048,61 @@ impl Session {
     /// overhead of a separate `sgd_step()` call.
     pub fn set_learning_rate(&mut self, lr: f32) {
         self.pending_lr = Some(lr);
+    }
+
+    /// Set a per-parameter learning rate multiplier, keyed by name
+    /// prefix. The effective LR for a parameter is `base_lr * mul`
+    /// where `mul` is the multiplier of the LONGEST matching prefix
+    /// (default 1.0 if no prefix matches). Applies to both SGD and
+    /// Adam updates. Persists across calls; pass `1.0` to clear.
+    ///
+    /// Use case: a single shared session with mixed-rate training,
+    /// e.g. boost the policy head's LR relative to the encoder when
+    /// the encoder receives more gradient flow than is healthy. From
+    /// kindle's gradient-inspection findings on LunarLander, the
+    /// encoder's obs_proj receives 50-100× the gradient of the
+    /// policy.fc layers; setting `set_lr_multiplier("policy.", 5.0)`
+    /// rebalances this without splitting the session.
+    pub fn set_lr_multiplier(&mut self, name_prefix: &str, mul: f32) {
+        // Replace existing entry for this prefix, or push new.
+        if let Some(pos) = self
+            .lr_multipliers
+            .iter()
+            .position(|(p, _)| p == name_prefix)
+        {
+            self.lr_multipliers[pos].1 = mul;
+        } else {
+            self.lr_multipliers.push((name_prefix.to_string(), mul));
+        }
+    }
+
+    /// Clear all per-parameter LR multipliers (returns all params to
+    /// the base learning rate).
+    pub fn clear_lr_multipliers(&mut self) {
+        self.lr_multipliers.clear();
+    }
+
+    /// Internal: longest-prefix-match lookup. Static helper so it can
+    /// be called from inside the SGD/Adam loops without holding `&self`
+    /// across the buffer borrow.
+    fn lr_multiplier_for_buf(
+        param_buffers: &[(String, BufferRef)],
+        multipliers: &[(String, f32)],
+        buf: BufferRef,
+    ) -> f32 {
+        if multipliers.is_empty() {
+            return 1.0;
+        }
+        let Some((name, _)) = param_buffers.iter().find(|(_, b)| *b == buf) else {
+            return 1.0;
+        };
+        let mut best: (usize, f32) = (0, 1.0);
+        for (prefix, mul) in multipliers {
+            if name.starts_with(prefix.as_str()) && prefix.len() >= best.0 {
+                best = (prefix.len(), *mul);
+            }
+        }
+        best.1
     }
 
     /// CPU-fallback SGD update.
