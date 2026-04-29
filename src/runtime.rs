@@ -2687,7 +2687,7 @@ impl Session {
         self.plan
             .param_buffers
             .iter()
-            .map(|(name, _)| name.as_str())
+            .map(|entry| entry.0.as_str())
             .collect()
     }
 
@@ -2696,7 +2696,7 @@ impl Session {
     pub fn param_size(&self, name: &str) -> Option<usize> {
         let buf_ref = self.param_buffer(name)?;
         // BufferRef indexes into self.plan.buffers; entry is byte size.
-        let bytes = self.plan.buffers[buf_ref.0 as usize] as usize;
+        let bytes = self.plan.buffers[buf_ref.0 as usize];
         Some(bytes / std::mem::size_of::<f32>())
     }
 
@@ -2723,7 +2723,8 @@ impl Session {
     pub fn read_all_param_grad_norms(&self) -> Vec<(String, f32)> {
         let mut out = Vec::with_capacity(self.plan.param_buffers.len());
         let mut scratch: Vec<f32> = Vec::new();
-        for (name, _) in &self.plan.param_buffers {
+        for entry in &self.plan.param_buffers {
+            let name = &entry.0;
             if !self.has_param_grad(name) {
                 continue;
             }
@@ -2742,7 +2743,8 @@ impl Session {
     pub fn read_all_param_norms(&self) -> Vec<(String, f32)> {
         let mut out = Vec::with_capacity(self.plan.param_buffers.len());
         let mut scratch: Vec<f32> = Vec::new();
-        for (name, _) in &self.plan.param_buffers {
+        for entry in &self.plan.param_buffers {
+            let name = &entry.0;
             let n = self.param_size(name).expect("param exists; size known");
             scratch.resize(n, 0.0);
             self.read_param(name, &mut scratch);
@@ -2760,7 +2762,7 @@ impl Session {
         let grads = self.read_all_param_grad_norms();
         let weights = self.read_all_param_norms();
         let weights_lookup: std::collections::HashMap<&str, f32> =
-            weights.iter().map(|(n, w)| (n.as_str(), *w)).collect();
+            weights.iter().map(|entry| (entry.0.as_str(), entry.1)).collect();
         let mut sorted: Vec<&(String, f32)> = grads.iter().collect();
         sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let n = sorted.len().min(top_n.max(1));
@@ -2769,7 +2771,8 @@ impl Session {
             n,
             sorted.len()
         );
-        for (name, g) in sorted.iter().take(n) {
+        for entry in sorted.iter().take(n) {
+            let (name, g) = (&entry.0, entry.1);
             let w = weights_lookup.get(name.as_str()).copied().unwrap_or(0.0);
             let ratio = if w > 0.0 { g / w } else { f32::NAN };
             eprintln!(
@@ -4064,7 +4067,7 @@ impl Session {
         if let Some(pos) = self
             .lr_multipliers
             .iter()
-            .position(|(p, _)| p == name_prefix)
+            .position(|entry| entry.0 == name_prefix)
         {
             self.lr_multipliers[pos].1 = mul;
         } else {
@@ -4089,13 +4092,15 @@ impl Session {
         if multipliers.is_empty() {
             return 1.0;
         }
-        let Some((name, _)) = param_buffers.iter().find(|(_, b)| *b == buf) else {
+        let Some(entry) = param_buffers.iter().find(|e| e.1 == buf) else {
             return 1.0;
         };
+        let name = &entry.0;
         let mut best: (usize, f32) = (0, 1.0);
-        for (prefix, mul) in multipliers {
+        for m in multipliers {
+            let (prefix, mul) = (&m.0, m.1);
             if name.starts_with(prefix.as_str()) && prefix.len() >= best.0 {
-                best = (prefix.len(), *mul);
+                best = (prefix.len(), mul);
             }
         }
         best.1
