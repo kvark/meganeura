@@ -2727,9 +2727,7 @@ impl Session {
             if !self.has_param_grad(name) {
                 continue;
             }
-            let n = self
-                .param_size(name)
-                .expect("param exists; size known");
+            let n = self.param_size(name).expect("param exists; size known");
             scratch.resize(n, 0.0);
             self.read_param_grad(name, &mut scratch);
             let sum_sq: f32 = scratch.iter().map(|&v| v * v).sum();
@@ -2745,9 +2743,7 @@ impl Session {
         let mut out = Vec::with_capacity(self.plan.param_buffers.len());
         let mut scratch: Vec<f32> = Vec::new();
         for (name, _) in &self.plan.param_buffers {
-            let n = self
-                .param_size(name)
-                .expect("param exists; size known");
+            let n = self.param_size(name).expect("param exists; size known");
             scratch.resize(n, 0.0);
             self.read_param(name, &mut scratch);
             let sum_sq: f32 = scratch.iter().map(|&v| v * v).sum();
@@ -2894,8 +2890,8 @@ impl Session {
                 let mut pass = self.encoder.compute("sgd_update");
                 for &(param_buf, grad_buf) in &self.plan.param_grad_pairs {
                     let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
-                    let effective_lr =
-                        learning_rate * Self::lr_multiplier_for_buf(
+                    let effective_lr = learning_rate
+                        * Self::lr_multiplier_for_buf(
                             &self.plan.param_buffers,
                             &self.lr_multipliers,
                             param_buf,
@@ -2923,8 +2919,8 @@ impl Session {
                 let mut pass = self.encoder.compute("adam_update");
                 for (idx, &(param_buf, grad_buf)) in self.plan.param_grad_pairs.iter().enumerate() {
                     let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
-                    let effective_lr =
-                        lr * Self::lr_multiplier_for_buf(
+                    let effective_lr = lr
+                        * Self::lr_multiplier_for_buf(
                             &self.plan.param_buffers,
                             &self.lr_multipliers,
                             param_buf,
