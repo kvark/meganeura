@@ -2816,8 +2816,7 @@ fn q4_layer_nan_hunt() {
         let k_rope = g.rope(k, 1e6, head_dim);
 
         {
-            let attn =
-                g.causal_attention(q_rope, k_rope, v, num_heads, num_kv_heads, head_dim);
+            let attn = g.causal_attention(q_rope, k_rope, v, num_heads, num_kv_heads, head_dim);
             let wo = g.parameter_q4("wo", &[qd, hidden]);
             let attn_out = g.matmul(attn, wo);
             x = g.add(x, attn_out);
