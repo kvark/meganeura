@@ -33,6 +33,35 @@ pub fn differentiate(forward: &Graph) -> Graph {
             None => continue, // no gradient flows to this node
         };
 
+        // ───────────────────────────────────────────────────────────────
+        // CONTRACT for every backward arm below:
+        //
+        //   The arm MUST consume `grad_output` to chain the upstream
+        //   gradient. A backward that emits a constant local Jacobian
+        //   (e.g. `(1/N)` broadcast for a mean reduction) WITHOUT
+        //   multiplying by `grad_output` is a bug — it works only when
+        //   this op happens to be the final loss (where grad_output IS
+        //   1.0). When the op is mid-graph (followed by `mul(coef)`,
+        //   `add(other_loss)`, etc.), the upstream gradient — including
+        //   any coefficients composed onto this op's output — is silently
+        //   discarded.
+        //
+        //   Historical bugs of this exact pattern (fixed 2026-04-28):
+        //   `Op::SumAll`, `Op::MeanAll`, `Op::CrossEntropyLoss`,
+        //   `Op::BceLoss`. All hardcoded `grad_output = 1`. Symptom:
+        //   loss-coefficient knobs (value_loss_coef, recon_loss_coef,
+        //   entropy_beta, etc.) had no effect on the gradient because
+        //   their factor was discarded at the reduction.
+        //
+        //   Verification: every Op family is exercised by `tests/gradcheck.rs`
+        //   in a mid-graph context (followed by `mul(coef)`); analytical
+        //   vs finite-difference must agree across coef ≠ 1.
+        //
+        //   When adding a new Op: write the chain rule as `dL/dx = J^T ·
+        //   grad_output` (broadcast scalar grad_output to x's shape via
+        //   the `broadcast_scalar` helper if needed). Then add a gradcheck
+        //   test before merging.
+        // ───────────────────────────────────────────────────────────────
         match node.op {
             Op::MatMul => {
                 // C = A @ B
@@ -139,7 +168,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
             }
             Op::CrossEntropyLoss => {
                 // L = -mean_over_batch(Σ_j labels_j · log_softmax_j)
-                // ∂L/∂logits_j = (softmax_j · S − labels_j) / batch
+                // ∂L/∂logits_j = grad_output · (softmax_j · S − labels_j) / batch
                 //   where S = Σ_i labels_i (per-batch-row sum).
                 //
                 // The familiar textbook gradient `softmax − labels` assumes
@@ -166,50 +195,56 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let neg_labels = graph.neg(labels);
                 let diff = graph.add(softmax_scaled, neg_labels);
                 let inv_batch = graph.constant(vec![1.0 / batch as f32; n], &shape);
-                let grad_logits = graph.mul(diff, inv_batch);
+                let local_grad = graph.mul(diff, inv_batch);
+                // Chain with upstream grad_output (broadcast scalar to
+                // [batch, features]). Without this, any coef or downstream
+                // op multiplied onto policy_loss is silently dropped from
+                // logits' gradient.
+                let go_broadcast = broadcast_scalar(&mut graph, grad_output, &shape);
+                let grad_logits = graph.mul(local_grad, go_broadcast);
                 accumulate_grad(&mut graph, &mut grads, logits, grad_logits);
                 // No gradient for labels (they're targets)
             }
             Op::BceLoss => {
-                // BCE gradient is computed by the shader and written to grad_out.
-                // dL/dpred = (pred - labels) / (pred * (1-pred) * N)
-                // For the graph-level autodiff, approximate:
+                // dL/dpred = grad_output · (pred - labels) / (pred * (1-pred) * N)
                 let pred = node.inputs[0];
                 let labels = node.inputs[1];
-                let pred_shape = &forward.nodes()[pred as usize].ty.shape;
+                let pred_shape = forward.nodes()[pred as usize].ty.shape.clone();
                 let n = pred_shape.iter().product::<usize>();
                 let neg_labels = graph.neg(labels);
                 let diff = graph.add(pred, neg_labels);
-                // pred * (1 - pred): compute the denominator
-                let ones = graph.constant(vec![1.0; n], pred_shape);
+                let ones = graph.constant(vec![1.0; n], &pred_shape);
                 let neg_pred = graph.neg(pred);
                 let one_minus_pred = graph.add(ones, neg_pred);
                 let denom = graph.mul(pred, one_minus_pred);
                 let recip_denom = graph.recip(denom);
-                let inv_n = graph.constant(vec![1.0 / n as f32; n], pred_shape);
+                let inv_n = graph.constant(vec![1.0 / n as f32; n], &pred_shape);
                 let grad_pred = graph.mul(diff, recip_denom);
                 let grad_pred = graph.mul(grad_pred, inv_n);
+                // Chain with upstream grad_output.
+                let go_broadcast = broadcast_scalar(&mut graph, grad_output, &pred_shape);
+                let grad_pred = graph.mul(grad_pred, go_broadcast);
                 accumulate_grad(&mut graph, &mut grads, pred, grad_pred);
             }
             Op::SumAll => {
-                // dL/dx = dL/dy broadcast to shape of x
-                // Since grad_output is scalar [1] and we need [shape of x],
-                // we create a constant filled with 1.0 (representing the
-                // broadcast of the scalar gradient).
+                // dL/dx[i] = dL/dy[0]  (unit Jacobian per element).
+                // We MUST chain with grad_output — a hardcoded 1.0 broke
+                // every graph using SumAll mid-chain.
                 let x = node.inputs[0];
-                let x_shape = &forward.nodes()[x as usize].ty.shape;
-                let ones = graph.constant(vec![1.0; x_shape.iter().product()], x_shape);
-                // grad_output is scalar — just use the constant directly
-                accumulate_grad(&mut graph, &mut grads, x, ones);
+                let x_shape = forward.nodes()[x as usize].ty.shape.clone();
+                let grad_x = broadcast_scalar(&mut graph, grad_output, &x_shape);
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
             Op::MeanAll => {
-                // dL/dx = (1/N) broadcast to shape of x
+                // dL/dx[i] = (1/N) · dL/dy[0]. Chain with grad_output.
                 let x = node.inputs[0];
-                let x_shape = &forward.nodes()[x as usize].ty.shape;
-                let n = x_shape.iter().product::<usize>() as f32;
-                let scale = 1.0 / n;
-                let scaled_ones = graph.constant(vec![scale; x_shape.iter().product()], x_shape);
-                accumulate_grad(&mut graph, &mut grads, x, scaled_ones);
+                let x_shape = forward.nodes()[x as usize].ty.shape.clone();
+                let n = x_shape.iter().product::<usize>();
+                let scale = 1.0 / n as f32;
+                let go_broadcast = broadcast_scalar(&mut graph, grad_output, &x_shape);
+                let scale_const = graph.constant(vec![scale; n], &x_shape);
+                let grad_x = graph.mul(go_broadcast, scale_const);
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
             Op::SumRows => {
                 // SumRows: [M, N] → [N]. Backward broadcasts [N] gradient back to [M, N].
@@ -270,40 +305,38 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let s = node.id; // forward softmax output [batch, features]
                 let x = node.inputs[0];
                 let x_shape = &forward.nodes()[x as usize].ty.shape;
-                let batch = x_shape[0];
                 let features = x_shape[1];
 
-                // grad_out ⊙ s
+                // dL/dx[b,j] = s[b,j] · (grad[b,j] − Σ_k grad[b,k] · s[b,k])
+                // The inner reduction is over **features** (axis 1), one
+                // sum per batch row. Previously we used `SumRows`, which
+                // reduces axis 0 (across batches) — wrong axis. Bug only
+                // manifested at batch>1; my softmax_mid_chain test missed
+                // it because mean(softmax) is the constant 1/K (gradient
+                // identically zero). Fixed via the matmul-with-ones trick
+                // already used in CrossEntropyLoss backward:
+                //   matmul(grad ⊙ s, ones[features × features]) gives a
+                //   [batch, features] tensor whose row b is filled with
+                //   Σ_k (grad ⊙ s)[b, k].
                 let grad_s_mul_s = graph.mul(grad_output, s);
-                // row-wise sum → [features] (SumRows reduces [M,N] → [N])
-                let rowsum = graph.sum_rows(grad_s_mul_s, &TensorType::f32(vec![features]));
-                // broadcast [features] → [batch, features] via bias_add
-                let zeros = graph.constant(vec![0.0; batch * features], &[batch, features]);
-                let rowsum_broadcast = graph.bias_add(zeros, rowsum);
-                // s ⊙ rowsum_broadcast
-                let correction = graph.mul(s, rowsum_broadcast);
-                // grad_x = (grad_out ⊙ s) - correction
+                let ones_ff = graph.constant(vec![1.0; features * features], &[features, features]);
+                let row_sum_broadcast = graph.matmul(grad_s_mul_s, ones_ff);
+                let correction = graph.mul(s, row_sum_broadcast);
                 let neg_correction = graph.neg(correction);
                 let grad_x = graph.add(grad_s_mul_s, neg_correction);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
             Op::LogSoftmax => {
-                // y = log_softmax(x)
-                // dy/dx = grad_y - softmax(x) * sum_rows(grad_y)
+                // dL/dx[b,j] = grad[b,j] − softmax[b,j] · Σ_k grad[b,k]
+                // Same axis-1 reduction issue as Softmax above.
                 let x = node.inputs[0];
                 let x_shape = &forward.nodes()[x as usize].ty.shape;
-                let batch = x_shape[0];
                 let features = x_shape[1];
 
-                // Recompute softmax(x) for the backward pass.
                 let s = graph.softmax(x);
-                // sum_rows(grad_y) → [features], broadcast → [batch, features]
-                let sum_grad = graph.sum_rows(grad_output, &TensorType::f32(vec![features]));
-                let zeros = graph.constant(vec![0.0; batch * features], &[batch, features]);
-                let sum_broadcast = graph.bias_add(zeros, sum_grad);
-                // s * sum_broadcast
+                let ones_ff = graph.constant(vec![1.0; features * features], &[features, features]);
+                let sum_broadcast = graph.matmul(grad_output, ones_ff);
                 let correction = graph.mul(s, sum_broadcast);
-                // grad_x = grad_y - correction
                 let neg_correction = graph.neg(correction);
                 let grad_x = graph.add(grad_output, neg_correction);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
@@ -1051,6 +1084,21 @@ fn accumulate_grad(
             grads.insert(node, grad);
         }
     }
+}
+
+/// Broadcast a scalar gradient (shape `[1]`) to an arbitrary `target_shape`
+/// using reshape→matmul→reshape. Required by reduction-to-scalar backwards
+/// (SumAll, MeanAll) and by losses whose backward emits a per-element
+/// gradient that must still be chained with the upstream `dL/dy` from the
+/// rest of the graph (CrossEntropyLoss, BceLoss). Without this multiplier,
+/// any coefficient or downstream op multiplied onto a reduction-to-scalar
+/// output is silently dropped from the parameter gradient.
+fn broadcast_scalar(graph: &mut Graph, scalar: NodeId, target_shape: &[usize]) -> NodeId {
+    let n = target_shape.iter().product::<usize>();
+    let go_2d = graph.reshape(scalar, &[1, 1]);
+    let ones_row = graph.constant(vec![1.0; n], &[1, n]);
+    let broadcast_2d = graph.matmul(go_2d, ones_row);
+    graph.reshape(broadcast_2d, target_shape)
 }
 
 #[cfg(test)]
