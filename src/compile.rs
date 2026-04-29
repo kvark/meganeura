@@ -1697,18 +1697,47 @@ impl<'a> Compiler<'a> {
             }
 
             Op::LogSoftmax => {
-                // Same as softmax for now, log applied in place
+                // Two-pass: Softmax → temp_buf, then elementwise Log →
+                // out_buf. The previous implementation dispatched only
+                // the Softmax shader and labeled the output as
+                // log_softmax, producing softmax(x) values where the
+                // backward (correctly) assumed log_softmax(x). Result:
+                // forward and backward computed gradients for different
+                // mathematical functions. Caught by `gradcheck.rs::
+                // log_softmax_mid_chain` after the autodiff fix exposed
+                // the disagreement.
+                //
+                // TODO: replace with a single dedicated log_softmax
+                // shader (computes `x - log_sum_exp(x)` in one pass —
+                // also more numerically stable than `log(softmax(x))`
+                // for very negative log_softmax values). The two-pass
+                // version is correct but allocates an extra batch*features
+                // f32 buffer per LogSoftmax node.
                 let input = self.get_buffer(node.inputs[0]);
                 let shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let batch = shape[0] as u32;
                 let features = shape[1] as u32;
+                let n_bytes = (batch as usize) * (features as usize) * 4;
+                let softmax_buf = self.alloc_buffer(n_bytes);
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::Softmax,
                     workgroups: [batch.div_ceil(256), 1, 1],
                     input_buffers: vec![input],
-                    output_buffer: out_buf,
+                    output_buffer: softmax_buf,
                     extra_outputs: vec![],
                     params: vec![batch, features, 0, 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+                let len = batch * features;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::Log,
+                    workgroups: [len.div_ceil(256), 1, 1],
+                    input_buffers: vec![softmax_buf],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![len, 0, 0, 0],
                     use_coop: false,
                     use_small_tiles: false,
                     ..Default::default()
