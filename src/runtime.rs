@@ -3000,7 +3000,7 @@ impl Session {
         // when grad_clip_every > 1. Default 1 = every step.
         let do_clip_now = needs_clip && {
             self.grad_clip_tick = self.grad_clip_tick.wrapping_add(1);
-            self.grad_clip_tick % self.grad_clip_every == 0
+            self.grad_clip_tick.is_multiple_of(self.grad_clip_every)
         };
         if do_clip_now {
             // GPU-side gradient clipping in three passes (all in the
