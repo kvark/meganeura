@@ -369,6 +369,9 @@ pub enum ShaderGroup {
     MaxPool2d,
     GlobalAvgPool,
     GlobalAvgPoolGrad,
+    GradClipZero,
+    GradClipNormSq,
+    GradClipScale,
 }
 
 /// Generate a `naga::Module` for a shader group.
@@ -488,6 +491,9 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::GlobalAvgPoolGrad => {
             parse_wgsl(include_str!("shaders/global_avg_pool_grad.wgsl"))
         }
+        ShaderGroup::GradClipZero => parse_wgsl(include_str!("shaders/grad_clip_zero.wgsl")),
+        ShaderGroup::GradClipNormSq => parse_wgsl(include_str!("shaders/grad_clip_norm_sq.wgsl")),
+        ShaderGroup::GradClipScale => parse_wgsl(include_str!("shaders/grad_clip_scale.wgsl")),
     }
 }
 
@@ -4997,6 +5003,9 @@ mod tests {
                     vec!["matrix_a", "matrix_b", "matrix_c", "params"]
                 }
                 ShaderEntry::WinogradWeightTransform => vec!["src", "dst", "params"],
+                ShaderEntry::GradClipZero => vec!["acc"],
+                ShaderEntry::GradClipNormSq => vec!["grad", "acc", "params"],
+                ShaderEntry::GradClipScale => vec!["grad", "acc", "params"],
             }
         }
 
@@ -5021,6 +5030,9 @@ mod tests {
             ShaderEntry::Greater,
             ShaderEntry::BiasAdd,
             ShaderEntry::SgdUpdate,
+            ShaderEntry::GradClipZero,
+            ShaderEntry::GradClipNormSq,
+            ShaderEntry::GradClipScale,
             ShaderEntry::SumAll,
             ShaderEntry::MeanAll,
             ShaderEntry::Softmax,

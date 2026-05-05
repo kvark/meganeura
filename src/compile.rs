@@ -177,6 +177,18 @@ pub enum ShaderEntry {
     WinogradBatchedMatMul,
     WinogradBatchedMatMulSmall,
     WinogradWeightTransform,
+    /// Zero a 1-element scalar accumulator buffer (gradient-clip pre-pass).
+    GradClipZero,
+    /// Sum-of-squares of a gradient buffer, atomically added (via f32 CAS
+    /// loop on a u32 accumulator) to a shared 1-element scalar buffer.
+    /// One workgroup of 256 threads per dispatch; tree-reduces in shared
+    /// memory before the atomic. Pair with `GradClipZero` (pre-pass)
+    /// and `GradClipScale` (post-pass).
+    GradClipNormSq,
+    /// In-place scale a gradient buffer by `min(1, max_norm / norm)`,
+    /// where `norm = sqrt(bitcast<f32>(acc[0]))` from the accumulator
+    /// produced by `GradClipNormSq`.
+    GradClipScale,
 }
 
 impl ShaderEntry {
@@ -273,6 +285,9 @@ impl ShaderEntry {
             ShaderEntry::WinogradBatchedMatMul => ShaderGroup::WinogradBatchedMatMul,
             ShaderEntry::WinogradBatchedMatMulSmall => ShaderGroup::WinogradBatchedMatMulSmall,
             ShaderEntry::WinogradWeightTransform => ShaderGroup::WinogradWeightTransform,
+            ShaderEntry::GradClipZero => ShaderGroup::GradClipZero,
+            ShaderEntry::GradClipNormSq => ShaderGroup::GradClipNormSq,
+            ShaderEntry::GradClipScale => ShaderGroup::GradClipScale,
         }
     }
 
@@ -372,6 +387,9 @@ impl ShaderEntry {
             | ShaderEntry::WinogradBatchedMatMul
             | ShaderEntry::WinogradBatchedMatMulSmall
             | ShaderEntry::WinogradWeightTransform => "main",
+            ShaderEntry::GradClipZero
+            | ShaderEntry::GradClipNormSq
+            | ShaderEntry::GradClipScale => "main",
         }
     }
 }
