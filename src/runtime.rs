@@ -1286,6 +1286,13 @@ pub struct Session {
     adam_step: u32,
     /// Pending Adam parameters. When set, `step()` appends Adam updates.
     pending_adam: Option<(f32, f32, f32, f32)>, // (lr, beta1, beta2, eps)
+    /// Maximum L2 norm of the per-step concatenated gradient. When set,
+    /// `step()` splits its submission so it can read all gradient buffers
+    /// to CPU between backward and optimizer, scale them by
+    /// `min(1, max_norm / total_norm)`, and submit the optimizer pass
+    /// with bounded gradients. Persists across calls (set once at agent
+    /// build, not per-step). `None` (default) is the unclipped fast path.
+    pending_grad_clip: Option<f32>,
     /// Per-parameter learning rate multipliers, keyed by name prefix.
     /// When the SGD/Adam update applies to a parameter whose name starts
     /// with one of these prefixes, the effective LR is `base_lr * mul`.
@@ -1804,6 +1811,7 @@ impl Session {
             last_submit_ns: 0,
             profiling: false,
             pending_lr: None,
+            pending_grad_clip: None,
             lr_multipliers: Vec::new(),
             adam_state,
             adam_step: 0,
@@ -2878,6 +2886,27 @@ impl Session {
                     pc.dispatch(dispatch.workgroups);
                 }
             }
+        }
+
+        // Gradient clipping (if requested) needs to happen between
+        // backward and optimizer. We split the submission: submit the
+        // forward+backward pass we just encoded, wait, do CPU readback
+        // + scale + upload of every gradient buffer, then start a new
+        // encoder for the optimizer pass. This costs one extra submit
+        // + wait per `step()` (~1-10ms typical) but bounds the
+        // per-step parameter update so Adam's variance estimate
+        // doesn't drive sparse-reward visual training to NaN.
+        let needs_clip = self.pending_grad_clip.is_some()
+            && !self.plan.param_grad_pairs.is_empty()
+            && (self.pending_lr.is_some() || self.pending_adam.is_some());
+        if needs_clip {
+            self.last_submit_ns = crate::profiler::now_ns();
+            self.sync_point = Some(self.gpu.submit(&mut self.encoder));
+            self.wait();
+            let max_norm = self.pending_grad_clip.unwrap();
+            let _ = self.clip_grad_norm_cpu(max_norm);
+            // Start a fresh encoder for the optimizer pass.
+            self.encoder.start();
         }
 
         // If training, append SGD updates as a final barrier group (all
@@ -4047,6 +4076,71 @@ impl Session {
     /// overhead of a separate `sgd_step()` call.
     pub fn set_learning_rate(&mut self, lr: f32) {
         self.pending_lr = Some(lr);
+    }
+
+    /// Enable global gradient-norm clipping for `step()`. When set,
+    /// `step()` reads all `param_grad_pairs` to CPU after backward,
+    /// computes the concatenated L2 norm, and scales every gradient
+    /// buffer by `min(1, max_norm / total_norm)` before the SGD/Adam
+    /// optimizer pass runs. Mirrors PyTorch's
+    /// `clip_grad_norm_(parameters, max_norm)`.
+    ///
+    /// Cost: one extra CPU readback + upload of all gradient buffers
+    /// per `step()` (~1-10 ms typical, depending on parameter count).
+    /// Use this on tasks where Adam's per-parameter variance estimate
+    /// drives the per-step update unbounded — sparse-reward visual
+    /// training (Atari) without it eventually NaN-collapses.
+    ///
+    /// Pass `0.0` or call `disable_grad_clip()` to disable.
+    /// Persistent: stays on across `step()` calls until cleared.
+    pub fn set_grad_clip_norm(&mut self, max_norm: f32) {
+        self.pending_grad_clip = if max_norm > 0.0 { Some(max_norm) } else { None };
+    }
+
+    /// Disable gradient clipping for subsequent `step()` calls.
+    pub fn disable_grad_clip(&mut self) {
+        self.pending_grad_clip = None;
+    }
+
+    /// CPU-side gradient clipping helper. Reads all grad buffers,
+    /// computes the L2 norm of the concatenation, and if it exceeds
+    /// `max_norm`, scales every buffer in place by `max_norm / norm`.
+    /// Returns `(pre_clip_norm, did_clip)`.
+    ///
+    /// Used internally by `step()` when `pending_grad_clip` is set.
+    /// Public for diagnostic / unit-test use.
+    pub fn clip_grad_norm_cpu(&mut self, max_norm: f32) -> (f32, bool) {
+        if max_norm <= 0.0 {
+            return (0.0, false);
+        }
+        // Sum of squares across all gradient buffers.
+        let mut total_sq: f64 = 0.0;
+        let mut buffers: Vec<(BufferRef, Vec<f32>)> =
+            Vec::with_capacity(self.plan.param_grad_pairs.len());
+        for &(_param_buf, grad_buf) in &self.plan.param_grad_pairs {
+            let bytes = self.plan.buffers[grad_buf.0 as usize];
+            let n = bytes / 4;
+            let mut data = vec![0.0f32; n];
+            self.read_buffer(grad_buf, &mut data);
+            for &v in &data {
+                if v.is_finite() {
+                    total_sq += (v as f64) * (v as f64);
+                }
+            }
+            buffers.push((grad_buf, data));
+        }
+        let total_norm = (total_sq as f32).sqrt();
+        if !total_norm.is_finite() || total_norm <= max_norm {
+            return (total_norm, false);
+        }
+        let scale = max_norm / total_norm;
+        for (grad_buf, mut data) in buffers {
+            for v in &mut data {
+                *v *= scale;
+            }
+            self.upload_buffer(grad_buf, bytemuck::cast_slice(&data));
+        }
+        (total_norm, true)
     }
 
     /// Set a per-parameter learning rate multiplier, keyed by name
