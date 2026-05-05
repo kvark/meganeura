@@ -1293,6 +1293,14 @@ pub struct Session {
     /// with bounded gradients. Persists across calls (set once at agent
     /// build, not per-step). `None` (default) is the unclipped fast path.
     pending_grad_clip: Option<f32>,
+    /// Clip cadence: when grad clipping is enabled, only compute the clip
+    /// every N `step()` calls. N=1 (default) clips every step (PyTorch
+    /// semantics). N>1 amortizes the extra submit/readback cost — the
+    /// NaN-collapse failure mode accumulates over thousands of steps so
+    /// clipping every ~5-10 steps still bounds the runaway. Internal
+    /// counter `grad_clip_tick` advances each step.
+    grad_clip_every: u32,
+    grad_clip_tick: u32,
     /// Per-parameter learning rate multipliers, keyed by name prefix.
     /// When the SGD/Adam update applies to a parameter whose name starts
     /// with one of these prefixes, the effective LR is `base_lr * mul`.
@@ -1812,6 +1820,8 @@ impl Session {
             profiling: false,
             pending_lr: None,
             pending_grad_clip: None,
+            grad_clip_every: 1,
+            grad_clip_tick: 0,
             lr_multipliers: Vec::new(),
             adam_state,
             adam_step: 0,
@@ -2899,7 +2909,13 @@ impl Session {
         let needs_clip = self.pending_grad_clip.is_some()
             && !self.plan.param_grad_pairs.is_empty()
             && (self.pending_lr.is_some() || self.pending_adam.is_some());
-        if needs_clip {
+        // Cadence: skip the clip on (every-1)/every fraction of steps
+        // when grad_clip_every > 1. Default 1 = every step.
+        let do_clip_now = needs_clip && {
+            self.grad_clip_tick = self.grad_clip_tick.wrapping_add(1);
+            self.grad_clip_tick % self.grad_clip_every == 0
+        };
+        if do_clip_now {
             self.last_submit_ns = crate::profiler::now_ns();
             self.sync_point = Some(self.gpu.submit(&mut self.encoder));
             self.wait();
@@ -4100,6 +4116,16 @@ impl Session {
     /// Disable gradient clipping for subsequent `step()` calls.
     pub fn disable_grad_clip(&mut self) {
         self.pending_grad_clip = None;
+    }
+
+    /// Set clip cadence. `every=1` clips every step (PyTorch default).
+    /// `every=5` clips every 5th step and amortizes the extra
+    /// submit/readback overhead 5x. The NaN-collapse failure mode
+    /// accumulates over thousands of steps, so values up to ~10 are
+    /// usually fine; higher cadences trade away clipping precision.
+    pub fn set_grad_clip_every(&mut self, every: u32) {
+        self.grad_clip_every = every.max(1);
+        self.grad_clip_tick = 0;
     }
 
     /// CPU-side gradient clipping helper. Reads all grad buffers,
