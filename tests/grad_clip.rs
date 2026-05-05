@@ -95,3 +95,42 @@ fn grad_clip_zero_disables() {
         .all(|(a, b)| (a - b).abs() < 1e-6);
     assert!(same, "grad_clip=0.0 must be a no-op");
 }
+
+/// `grad_clip_every` skips the clip on `every-1` of every `every` steps.
+/// With `every=10` and a single step, the clip should be skipped, so the
+/// param change should match the unclipped run.
+#[test]
+fn grad_clip_every_skips_clip() {
+    let g = build_linreg(4, 3, 2);
+    let mut s = build_session(&g);
+    let w_init: Vec<f32> = (0..6).map(|i| (i as f32 * 0.1).sin()).collect();
+    s.set_parameter("w.weight", &w_init);
+    s.set_parameter("w.bias", &vec![0.0; 2]);
+    let x: Vec<f32> = (0..12).map(|i| (i as f32 * 0.3).cos()).collect();
+    let t: Vec<f32> = vec![10.0; 8];
+    s.set_input("x", &x);
+    s.set_input("target", &t);
+    s.set_grad_clip_norm(0.001); // very tight clip — would massively shrink update
+    s.set_grad_clip_every(10); // but skip 9 of every 10 steps
+    s.set_learning_rate(0.1);
+    s.step();
+    s.wait();
+    let mut p1 = vec![0.0; 6];
+    s.read_param("w.weight", &mut p1);
+
+    // Compare to unclipped run with same setup
+    let p_unclipped = run_one_step(None);
+
+    // Step 1 with `every=10` should NOT clip (1 % 10 = 1 != 0), so the
+    // result matches unclipped.
+    let max_diff: f32 = p1
+        .iter()
+        .zip(p_unclipped.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_diff < 1e-5,
+        "step 1 with every=10 should match unclipped exactly; max diff {}",
+        max_diff
+    );
+}
