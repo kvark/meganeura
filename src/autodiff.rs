@@ -630,6 +630,12 @@ pub fn differentiate(forward: &Graph) -> Graph {
                      EfficientNet SE in the frozen-weights inference path."
                 );
             }
+            Op::AddPerChannel { .. } => {
+                panic!(
+                    "AddPerChannel autodiff not implemented — used only for \
+                     BN-fused biases in the frozen-weights inference path."
+                );
+            }
             Op::WinogradConv2d {
                 in_channels,
                 in_h,

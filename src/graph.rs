@@ -347,6 +347,14 @@ pub enum Op {
         spatial: u32,
     },
 
+    /// Per-channel broadcast add: `dst[n,c,h,w] = src[n,c,h,w] + bias[c]`.
+    /// inputs: [src, bias] where src is `[N*C*H*W]` and bias is `[C]`.
+    /// Used by BN-fused biases in EfficientNet (constant across batch).
+    AddPerChannel {
+        channels: u32,
+        spatial: u32,
+    },
+
     /// Depthwise 2D convolution (groups == channels).
     /// inputs: [input, kernel] where input is `[N*C*H*W]` and kernel is `[C*kH*kW]`.
     /// Each output channel `c` reads input channel `c` only.  Used by
@@ -1568,6 +1576,15 @@ impl Graph {
     pub fn mul_per_channel(&mut self, src: NodeId, gate: NodeId, channels: u32, spatial: u32) -> NodeId {
         let ty = self.node(src).ty.clone();
         self.add_node(Op::MulPerChannel { channels, spatial }, vec![src, gate], ty)
+    }
+
+    /// Per-channel broadcast add: `dst[n,c,h,w] = src[n,c,h,w] + bias[c]`.
+    ///
+    /// `src` shape `[N*C*H*W]`; `bias` shape `[C]`.  Output matches `src`.
+    /// Used by BN-fused biases in EfficientNet (constant across batch).
+    pub fn add_per_channel(&mut self, src: NodeId, bias: NodeId, channels: u32, spatial: u32) -> NodeId {
+        let ty = self.node(src).ty.clone();
+        self.add_node(Op::AddPerChannel { channels, spatial }, vec![src, bias], ty)
     }
 
     /// Depthwise Conv2d (groups == channels).

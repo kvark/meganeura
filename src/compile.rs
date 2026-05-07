@@ -158,6 +158,10 @@ pub enum ShaderEntry {
     /// Per-channel broadcast multiply: `dst[n,c,h,w] = src[n,c,h,w] * gate[n,c]`.
     /// Used by EfficientNet Squeeze-and-Excitation.
     MulPerChannel,
+    /// Per-channel broadcast add: `dst[n,c,h,w] = src[n,c,h,w] + bias[c]`.
+    /// Used by BN-fused biases in EfficientNet — the bias is constant
+    /// across batch and spatial, so we store `[C]` and broadcast at use.
+    AddPerChannel,
     Conv2dGemm,
     Conv2dGemmSmall,
     Conv2dGemmCoop,
@@ -270,6 +274,7 @@ impl ShaderEntry {
             ShaderEntry::Conv2d => ShaderGroup::Conv2d,
             ShaderEntry::Conv2dDw => ShaderGroup::Conv2dDw,
             ShaderEntry::MulPerChannel => ShaderGroup::MulPerChannel,
+            ShaderEntry::AddPerChannel => ShaderGroup::AddPerChannel,
             ShaderEntry::Conv2dGemm => ShaderGroup::Conv2dGemm,
             ShaderEntry::Conv2dGemmCoop => ShaderGroup::Conv2dGemmCoop,
             ShaderEntry::Conv2dGemmCoopGen(..) => ShaderGroup::Conv2dGemmCoop,
@@ -374,6 +379,7 @@ impl ShaderEntry {
             ShaderEntry::Conv2d => "main",
             ShaderEntry::Conv2dDw => "main",
             ShaderEntry::MulPerChannel => "main",
+            ShaderEntry::AddPerChannel => "main",
             ShaderEntry::Conv2dGemm
             | ShaderEntry::Conv2dGemmSmall
             | ShaderEntry::Conv2dGemmCoop
@@ -2286,8 +2292,25 @@ impl<'a> Compiler<'a> {
 
                 // 1×1 stride-1 conv → pure MatMul (no im2col).
                 // output[b, Co, h, w] = sum_Ci(input[b, Ci, h, w] * W[Co, Ci])
-                // Reshape: input as [batch*H*W, Ci], weight as [Ci, Co] → matmul
-                if kernel_h == 1 && kernel_w == 1 && stride == 1 && padding_h == 0 && padding_w == 0
+                //
+                // Reshape: input as [batch*H*W, Ci], weight as [Ci, Co] → matmul.
+                // This reshape is only valid when the input's NCHW layout
+                // collapses cleanly to [M, K] = [B*HW, Ci]. That requires
+                // either H*W == 1 (post-GAP / SE-fc path, the natural
+                // application) or B*Ci == 1 (so the [Ci] axis has stride
+                // matching the row stride). In all other cases the [B*HW,Ci]
+                // view requires an NHWC permutation we can't do here, and
+                // we fall through to the im2col path which handles NCHW
+                // correctly. Without this guard, EfficientNet-style
+                // MBConv-project-1x1 over spatial > 1 silently scrambles
+                // its output (see PR #107 bisection).
+                let one_by_one_safe = kernel_h == 1
+                    && kernel_w == 1
+                    && stride == 1
+                    && padding_h == 0
+                    && padding_w == 0
+                    && (in_h * in_w == 1 || batch * in_channels == 1);
+                if one_by_one_safe
                 {
                     let m = batch * in_h * in_w;
                     let n = out_channels;
@@ -2363,6 +2386,23 @@ impl<'a> Compiler<'a> {
                     shader: ShaderEntry::MulPerChannel,
                     workgroups: [len.div_ceil(256), 1, 1],
                     input_buffers: vec![src, gate],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![len, spatial, channels, 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
+            Op::AddPerChannel { channels, spatial } => {
+                let src = self.get_buffer(node.inputs[0]);
+                let bias = self.get_buffer(node.inputs[1]);
+                let len = node.ty.shape[0] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::AddPerChannel,
+                    workgroups: [len.div_ceil(256), 1, 1],
+                    input_buffers: vec![src, bias],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![len, spatial, channels, 0],

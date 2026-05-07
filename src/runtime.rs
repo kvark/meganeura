@@ -168,6 +168,24 @@ struct MulPerChannelParams {
     _pad1: u32,
 }
 
+// add_per_channel: var src, bias, dst, params
+#[derive(blade_macros::ShaderData)]
+struct AddPerChannelData {
+    src: blade_graphics::BufferPiece,
+    bias: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: AddPerChannelParams,
+}
+
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct AddPerChannelParams {
+    len: u32,
+    spatial: u32,
+    channels: u32,
+    _pad: u32,
+}
+
 // sgd: var param, grad, dst, params
 #[derive(blade_macros::ShaderData)]
 struct SgdData {
@@ -1267,6 +1285,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::Conv2d => Conv2dData::layout(),
         ShaderEntry::Conv2dDw => Conv2dDwData::layout(),
         ShaderEntry::MulPerChannel => MulPerChannelData::layout(),
+        ShaderEntry::AddPerChannel => AddPerChannelData::layout(),
         ShaderEntry::Conv2dGemm
         | ShaderEntry::Conv2dGemmSmall
         | ShaderEntry::Conv2dGemmCoop
@@ -4012,6 +4031,23 @@ impl Session {
                             spatial: p[1],
                             _pad0: 0,
                             _pad1: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::AddPerChannel => {
+                let p = &dispatch.params;
+                pc.bind(
+                    0,
+                    &AddPerChannelData {
+                        src: buf(dispatch.input_buffers[0]),
+                        bias: buf(dispatch.input_buffers[1]),
+                        dst: buf(dispatch.output_buffer),
+                        params: AddPerChannelParams {
+                            len: p[0],
+                            spatial: p[1],
+                            channels: p[2],
+                            _pad: 0,
                         },
                     },
                 );
