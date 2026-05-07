@@ -61,8 +61,8 @@ pub fn build_graph(g: &mut Graph, batch: u32) -> NodeId {
     let w0 = g.parameter("features.0.0.weight", &[24 * 3 * 3 * 3]);
     let x = g.conv2d_hw(image, w0, batch, 3, s.h, s.w, 24, 3, 3, 2, 1, 1);
     let s = s.after_conv(3, 2, 1); // 96
-    let bn0 = g.parameter("features.0.bn.fused_bias", &[(batch * 24 * s.area()) as usize]);
-    let x = g.add(x, bn0);
+    let bn0 = g.parameter("features.0.bn.fused_bias", &[24]);
+    let x = g.add_per_channel(x, bn0, 24, s.area());
     let x = g.silu(x);
 
     // -------- features.1 — 2× FusedMBConv e=1, 24→24, s=1 --------
@@ -104,6 +104,58 @@ pub fn build_graph(g: &mut Graph, batch: u32) -> NodeId {
     mbconv(g, x, &s, batch, 160, 160, 6, 3, 1, "features.5.8")
 }
 
+/// Build the same graph as [`build_graph`] but return one `NodeId` per
+/// stage (stage 0 = stem post-SiLU; stages 1..=5 = feature stage outputs).
+/// Used by the bisection correctness test to compare each stage against
+/// torchvision separately. Don't ship downstream code calling this —
+/// it's strictly a debugging hook.
+pub fn build_graph_stage_outputs(g: &mut Graph, batch: u32) -> [NodeId; 6] {
+    let s = Spatial { h: 192, w: 192 };
+
+    let image = g.input("image", &[(batch * 3 * 192 * 192) as usize]);
+    let w0 = g.parameter("features.0.0.weight", &[24 * 3 * 3 * 3]);
+    let x = g.conv2d_hw(image, w0, batch, 3, s.h, s.w, 24, 3, 3, 2, 1, 1);
+    let s = s.after_conv(3, 2, 1);
+    let bn0 = g.parameter("features.0.bn.fused_bias", &[24]);
+    let x = g.add_per_channel(x, bn0, 24, s.area());
+    let stage0 = g.silu(x);
+
+    let x = fused_mbconv(g, stage0, &s, batch, 24, 24, 1, 3, 1, "features.1.0");
+    let stage1 = fused_mbconv(g, x, &s, batch, 24, 24, 1, 3, 1, "features.1.1");
+
+    let x = fused_mbconv(g, stage1, &s, batch, 24, 48, 4, 3, 2, "features.2.0");
+    let s = s.after_conv(3, 2, 1);
+    let x = fused_mbconv(g, x, &s, batch, 48, 48, 4, 3, 1, "features.2.1");
+    let x = fused_mbconv(g, x, &s, batch, 48, 48, 4, 3, 1, "features.2.2");
+    let stage2 = fused_mbconv(g, x, &s, batch, 48, 48, 4, 3, 1, "features.2.3");
+
+    let x = fused_mbconv(g, stage2, &s, batch, 48, 64, 4, 3, 2, "features.3.0");
+    let s = s.after_conv(3, 2, 1);
+    let x = fused_mbconv(g, x, &s, batch, 64, 64, 4, 3, 1, "features.3.1");
+    let x = fused_mbconv(g, x, &s, batch, 64, 64, 4, 3, 1, "features.3.2");
+    let stage3 = fused_mbconv(g, x, &s, batch, 64, 64, 4, 3, 1, "features.3.3");
+
+    let x = mbconv(g, stage3, &s, batch, 64, 128, 4, 3, 2, "features.4.0");
+    let s = s.after_conv(3, 2, 1);
+    let x = mbconv(g, x, &s, batch, 128, 128, 4, 3, 1, "features.4.1");
+    let x = mbconv(g, x, &s, batch, 128, 128, 4, 3, 1, "features.4.2");
+    let x = mbconv(g, x, &s, batch, 128, 128, 4, 3, 1, "features.4.3");
+    let x = mbconv(g, x, &s, batch, 128, 128, 4, 3, 1, "features.4.4");
+    let stage4 = mbconv(g, x, &s, batch, 128, 128, 4, 3, 1, "features.4.5");
+
+    let x = mbconv(g, stage4, &s, batch, 128, 160, 6, 3, 1, "features.5.0");
+    let x = mbconv(g, x, &s, batch, 160, 160, 6, 3, 1, "features.5.1");
+    let x = mbconv(g, x, &s, batch, 160, 160, 6, 3, 1, "features.5.2");
+    let x = mbconv(g, x, &s, batch, 160, 160, 6, 3, 1, "features.5.3");
+    let x = mbconv(g, x, &s, batch, 160, 160, 6, 3, 1, "features.5.4");
+    let x = mbconv(g, x, &s, batch, 160, 160, 6, 3, 1, "features.5.5");
+    let x = mbconv(g, x, &s, batch, 160, 160, 6, 3, 1, "features.5.6");
+    let x = mbconv(g, x, &s, batch, 160, 160, 6, 3, 1, "features.5.7");
+    let stage5 = mbconv(g, x, &s, batch, 160, 160, 6, 3, 1, "features.5.8");
+
+    [stage0, stage1, stage2, stage3, stage4, stage5]
+}
+
 /// Fused-MBConv block (V2 early stages — replaces V1's expand+DW combo
 /// with a single 3×3 conv).  Two layouts:
 /// - `expand_ratio == 1`: single `block.0` 3×3 conv (no project step).
@@ -133,11 +185,8 @@ fn fused_mbconv(
             &[(out_c * in_c * kernel * kernel) as usize],
         );
         let h = g.conv2d_hw(x, w, batch, in_c, s.h, s.w, out_c, kernel, kernel, stride, padding, padding);
-        let bn = g.parameter(
-            &format!("{name}.block.0.bn.fused_bias"),
-            &[(batch * out_c * s1.area()) as usize],
-        );
-        let h = g.add(h, bn);
+        let bn = g.parameter(&format!("{name}.block.0.bn.fused_bias"), &[out_c as usize]);
+        let h = g.add_per_channel(h, bn, out_c, s1.area());
         g.silu(h)
     } else {
         // Expand 3×3 (in_c → expanded), then project 1×1 (expanded → out_c).
@@ -149,9 +198,9 @@ fn fused_mbconv(
         let h = g.conv2d_hw(x, w_e, batch, in_c, s.h, s.w, expanded_c, kernel, kernel, stride, padding, padding);
         let bn_e = g.parameter(
             &format!("{name}.block.0.bn.fused_bias"),
-            &[(batch * expanded_c * s1.area()) as usize],
+            &[expanded_c as usize],
         );
-        let h = g.add(h, bn_e);
+        let h = g.add_per_channel(h, bn_e, expanded_c, s1.area());
         let h = g.silu(h);
 
         let w_p = g.parameter(
@@ -159,11 +208,8 @@ fn fused_mbconv(
             &[(out_c * expanded_c) as usize],
         );
         let h = g.conv2d(h, w_p, batch, expanded_c, s1.h, s1.w, out_c, 1, 1, 1, 0);
-        let bn_p = g.parameter(
-            &format!("{name}.block.1.bn.fused_bias"),
-            &[(batch * out_c * s1.area()) as usize],
-        );
-        g.add(h, bn_p)
+        let bn_p = g.parameter(&format!("{name}.block.1.bn.fused_bias"), &[out_c as usize]);
+        g.add_per_channel(h, bn_p, out_c, s1.area())
     };
 
     if stride == 1 && in_c == out_c {
@@ -207,9 +253,9 @@ fn mbconv(
     let h = g.conv2d(x, w_e, batch, in_c, s.h, s.w, expanded_c, 1, 1, 1, 0);
     let bn_e = g.parameter(
         &format!("{name}.block.0.bn.fused_bias"),
-        &[(batch * expanded_c * s.area()) as usize],
+        &[expanded_c as usize],
     );
-    let h = g.add(h, bn_e);
+    let h = g.add_per_channel(h, bn_e, expanded_c, s.area());
     let h = g.silu(h);
 
     // -------- Depthwise k×k --------
@@ -222,9 +268,9 @@ fn mbconv(
     );
     let bn_d = g.parameter(
         &format!("{name}.block.1.bn.fused_bias"),
-        &[(batch * expanded_c * s_dw.area()) as usize],
+        &[expanded_c as usize],
     );
-    let h = g.add(h, bn_d);
+    let h = g.add_per_channel(h, bn_d, expanded_c, s_dw.area());
     let h = g.silu(h);
 
     // -------- Squeeze-and-Excitation --------
@@ -260,11 +306,8 @@ fn mbconv(
         &[(out_c * expanded_c) as usize],
     );
     let h = g.conv2d(h, proj_w, batch, expanded_c, s_dw.h, s_dw.w, out_c, 1, 1, 1, 0);
-    let bn_p = g.parameter(
-        &format!("{name}.block.3.bn.fused_bias"),
-        &[(batch * out_c * s_dw.area()) as usize],
-    );
-    let h = g.add(h, bn_p);
+    let bn_p = g.parameter(&format!("{name}.block.3.bn.fused_bias"), &[out_c as usize]);
+    let h = g.add_per_channel(h, bn_p, out_c, s_dw.area());
 
     if stride == 1 && in_c == out_c {
         g.add(h, x)
