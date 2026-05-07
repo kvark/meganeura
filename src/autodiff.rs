@@ -617,6 +617,19 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 accumulate_grad(&mut graph, &mut grads, input, grad_input);
                 accumulate_grad(&mut graph, &mut grads, kernel, grad_kernel);
             }
+            Op::Conv2dDw { .. } => {
+                panic!(
+                    "Conv2dDw autodiff not implemented — depthwise conv is \
+                     frozen-weights only (e.g. EfficientNet inference path). \
+                     Add a depthwise grad kernel before training through it."
+                );
+            }
+            Op::MulPerChannel { .. } => {
+                panic!(
+                    "MulPerChannel autodiff not implemented — used only for \
+                     EfficientNet SE in the frozen-weights inference path."
+                );
+            }
             Op::WinogradConv2d {
                 in_channels,
                 in_h,

@@ -339,6 +339,29 @@ pub enum Op {
         padding_w: u32,
     },
 
+    /// Per-channel broadcast multiply: `dst[n,c,h,w] = src[n,c,h,w] * gate[n,c]`.
+    /// inputs: [src, gate] where src is `[N*C*H*W]` and gate is `[N*C]`.
+    /// Used by Squeeze-and-Excitation in EfficientNet MBConv blocks.
+    MulPerChannel {
+        channels: u32,
+        spatial: u32,
+    },
+
+    /// Depthwise 2D convolution (groups == channels).
+    /// inputs: [input, kernel] where input is `[N*C*H*W]` and kernel is `[C*kH*kW]`.
+    /// Each output channel `c` reads input channel `c` only.  Used by
+    /// EfficientNet MBConv blocks.  No autodiff path — frozen-weights only.
+    Conv2dDw {
+        channels: u32,
+        in_h: u32,
+        in_w: u32,
+        kernel_h: u32,
+        kernel_w: u32,
+        stride: u32,
+        padding_h: u32,
+        padding_w: u32,
+    },
+
     // Conv2d backward w.r.t. input: given grad_output and kernel, produce grad_input.
     // inputs: [grad_output, kernel]
     Conv2dGradInput {
@@ -1527,6 +1550,56 @@ impl Graph {
                 in_h,
                 in_w,
                 out_channels,
+                kernel_h,
+                kernel_w,
+                stride,
+                padding_h,
+                padding_w,
+            },
+            vec![input, kernel],
+            ty,
+        )
+    }
+
+    /// Per-channel broadcast multiply: `dst[n,c,h,w] = src[n,c,h,w] * gate[n,c]`.
+    ///
+    /// `src` shape `[N*C*H*W]`; `gate` shape `[N*C]`.  Output matches `src`.
+    /// Used by EfficientNet's Squeeze-and-Excitation block.
+    pub fn mul_per_channel(&mut self, src: NodeId, gate: NodeId, channels: u32, spatial: u32) -> NodeId {
+        let ty = self.node(src).ty.clone();
+        self.add_node(Op::MulPerChannel { channels, spatial }, vec![src, gate], ty)
+    }
+
+    /// Depthwise Conv2d (groups == channels).
+    ///
+    /// `kernel` shape is `[C * kH * kW]`. Output shape is
+    /// `[N, C, oH, oW]` flattened (same NCHW layout convention as
+    /// [`Self::conv2d`]). No autodiff support — used only with frozen
+    /// pretrained weights (e.g. P2P-fine-tuned EfficientNet).
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv2d_dw(
+        &mut self,
+        input: NodeId,
+        kernel: NodeId,
+        batch: u32,
+        channels: u32,
+        in_h: u32,
+        in_w: u32,
+        kernel_h: u32,
+        kernel_w: u32,
+        stride: u32,
+        padding_h: u32,
+        padding_w: u32,
+    ) -> NodeId {
+        let out_h = (in_h + 2 * padding_h - kernel_h) / stride + 1;
+        let out_w = (in_w + 2 * padding_w - kernel_w) / stride + 1;
+        let out_size = batch as usize * channels as usize * out_h as usize * out_w as usize;
+        let ty = TensorType::f32(vec![out_size]);
+        self.add_node(
+            Op::Conv2dDw {
+                channels,
+                in_h,
+                in_w,
                 kernel_h,
                 kernel_w,
                 stride,

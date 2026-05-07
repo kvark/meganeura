@@ -590,6 +590,8 @@ fn node_to_egglog_expr(node: &Node) -> String {
         Op::Upsample2x { .. } => format!("(Upsample2x n{})", i[0]),
         Op::Upsample2xGrad { .. } => format!("(Upsample2xGrad n{})", i[0]),
         Op::Conv2d { .. } => format!("(Conv2d n{} n{})", i[0], i[1]),
+        Op::Conv2dDw { .. } => format!("(Conv2dDw n{} n{})", i[0], i[1]),
+        Op::MulPerChannel { .. } => format!("(MulPerChannel n{} n{})", i[0], i[1]),
         Op::Conv2dGradInput { .. } => format!("(Conv2dGradInput n{} n{})", i[0], i[1]),
         Op::Conv2dGradWeight { .. } => format!("(Conv2dGradWeight n{} n{})", i[0], i[1]),
         Op::MaxPool2d { .. } => format!("(MaxPool2d n{})", i[0]),

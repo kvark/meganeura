@@ -150,6 +150,24 @@ struct BiasAddParams {
     _pad1: u32,
 }
 
+// mul_per_channel: var src, gate, dst, params
+#[derive(blade_macros::ShaderData)]
+struct MulPerChannelData {
+    src: blade_graphics::BufferPiece,
+    gate: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: MulPerChannelParams,
+}
+
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct MulPerChannelParams {
+    len: u32,
+    spatial: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
 // sgd: var param, grad, dst, params
 #[derive(blade_macros::ShaderData)]
 struct SgdData {
@@ -451,6 +469,32 @@ struct Conv2dParams {
     inv_kernel_hw: f32,
     inv_col_w: f32,      // 1/out_w (forward, grad_weight) or 1/in_w (grad_input)
     inv_go_spatial: f32, // 1/(out_h*out_w) for grad_weight, unused otherwise
+}
+
+// conv2d_dw: var src, weight, dst, params (depthwise, no in/out channels split)
+#[derive(blade_macros::ShaderData)]
+struct Conv2dDwData {
+    src: blade_graphics::BufferPiece,
+    weight: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: Conv2dDwParams,
+}
+
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct Conv2dDwParams {
+    batch: u32,
+    channels: u32,
+    in_h: u32,
+    in_w: u32,
+    kernel_h: u32,
+    kernel_w: u32,
+    stride: u32,
+    padding_h: u32,
+    out_h: u32,
+    out_w: u32,
+    padding_w: u32,
+    _pad: u32,
 }
 
 // max_pool_2d: var src, dst, params
@@ -1221,6 +1265,8 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::SplitA | ShaderEntry::SplitB => UnaryData::layout(),
         ShaderEntry::Upsample2x | ShaderEntry::Upsample2xGrad => UnaryData::layout(),
         ShaderEntry::Conv2d => Conv2dData::layout(),
+        ShaderEntry::Conv2dDw => Conv2dDwData::layout(),
+        ShaderEntry::MulPerChannel => MulPerChannelData::layout(),
         ShaderEntry::Conv2dGemm
         | ShaderEntry::Conv2dGemmSmall
         | ShaderEntry::Conv2dGemmCoop
@@ -3949,6 +3995,48 @@ impl Session {
                             _pad0: p[1],
                             _pad1: p[2],
                             _pad2: p[3],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::MulPerChannel => {
+                let p = &dispatch.params;
+                pc.bind(
+                    0,
+                    &MulPerChannelData {
+                        src: buf(dispatch.input_buffers[0]),
+                        gate: buf(dispatch.input_buffers[1]),
+                        dst: buf(dispatch.output_buffer),
+                        params: MulPerChannelParams {
+                            len: p[0],
+                            spatial: p[1],
+                            _pad0: 0,
+                            _pad1: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::Conv2dDw => {
+                let p = &dispatch.params;
+                pc.bind(
+                    0,
+                    &Conv2dDwData {
+                        src: buf(dispatch.input_buffers[0]),
+                        weight: buf(dispatch.input_buffers[1]),
+                        dst: buf(dispatch.output_buffer),
+                        params: Conv2dDwParams {
+                            batch: p[0],
+                            channels: p[1],
+                            in_h: p[2],
+                            in_w: p[3],
+                            kernel_h: p[4],
+                            kernel_w: p[5],
+                            stride: p[6],
+                            padding_h: p[7],
+                            out_h: p[8],
+                            out_w: p[9],
+                            padding_w: p[10],
+                            _pad: 0,
                         },
                     },
                 );
