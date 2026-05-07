@@ -346,6 +346,11 @@ pub enum ShaderGroup {
     Upsample,
     UpsampleGrad,
     Conv2d,
+    /// Depthwise Conv2d (groups == channels). Used by EfficientNet MBConv.
+    Conv2dDw,
+    /// Per-channel broadcast mul: `dst[n,c,h,w] = src[n,c,h,w] * gate[n,c]`.
+    /// Used by EfficientNet Squeeze-and-Excitation.
+    MulPerChannel,
     Conv2dGemm,
     Conv2dGemmSmall,
     Conv2dGemmCoop,
@@ -449,6 +454,8 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::Upsample => parse_wgsl(include_str!("shaders/upsample.wgsl")),
         ShaderGroup::UpsampleGrad => parse_wgsl(include_str!("shaders/upsample_grad.wgsl")),
         ShaderGroup::Conv2d => parse_wgsl(include_str!("shaders/conv2d.wgsl")),
+        ShaderGroup::Conv2dDw => parse_wgsl(include_str!("shaders/conv2d_dw.wgsl")),
+        ShaderGroup::MulPerChannel => parse_wgsl(include_str!("shaders/mul_per_channel.wgsl")),
         ShaderGroup::Conv2dGemm => parse_wgsl(include_str!("shaders/conv2d_gemm.wgsl")),
         ShaderGroup::Conv2dGemmSmall => parse_wgsl(include_str!("shaders/conv2d_gemm_small.wgsl")),
         ShaderGroup::Conv2dGradInput => parse_wgsl(include_str!("shaders/conv2d_grad_input.wgsl")),
@@ -4973,7 +4980,10 @@ mod tests {
                 ShaderEntry::Upsample2x | ShaderEntry::Upsample2xGrad => {
                     vec!["src", "dst", "params"]
                 }
-                ShaderEntry::Conv2d => vec!["src", "weight", "dst", "params"],
+                ShaderEntry::Conv2d | ShaderEntry::Conv2dDw => {
+                    vec!["src", "weight", "dst", "params"]
+                }
+                ShaderEntry::MulPerChannel => vec!["src", "gate", "dst", "params"],
                 ShaderEntry::Conv2dGemm
                 | ShaderEntry::Conv2dGemmSmall
                 | ShaderEntry::Conv2dGemmCoop
@@ -5081,6 +5091,8 @@ mod tests {
             ShaderEntry::Upsample2x,
             ShaderEntry::Upsample2xGrad,
             ShaderEntry::Conv2d,
+            ShaderEntry::Conv2dDw,
+            ShaderEntry::MulPerChannel,
             ShaderEntry::Conv2dGemm,
             ShaderEntry::Conv2dGemmSmall,
             ShaderEntry::Conv2dGradInput,

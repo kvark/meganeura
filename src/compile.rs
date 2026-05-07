@@ -151,6 +151,13 @@ pub enum ShaderEntry {
     Upsample2x,
     Upsample2xGrad,
     Conv2d,
+    /// Depthwise Conv2d forward (groups == channels). Weight shape
+    /// `[C, 1, kH, kW]`; each output channel reads one input channel.
+    /// Used by EfficientNet MBConv blocks.
+    Conv2dDw,
+    /// Per-channel broadcast multiply: `dst[n,c,h,w] = src[n,c,h,w] * gate[n,c]`.
+    /// Used by EfficientNet Squeeze-and-Excitation.
+    MulPerChannel,
     Conv2dGemm,
     Conv2dGemmSmall,
     Conv2dGemmCoop,
@@ -261,6 +268,8 @@ impl ShaderEntry {
             ShaderEntry::Upsample2x => ShaderGroup::Upsample,
             ShaderEntry::Upsample2xGrad => ShaderGroup::UpsampleGrad,
             ShaderEntry::Conv2d => ShaderGroup::Conv2d,
+            ShaderEntry::Conv2dDw => ShaderGroup::Conv2dDw,
+            ShaderEntry::MulPerChannel => ShaderGroup::MulPerChannel,
             ShaderEntry::Conv2dGemm => ShaderGroup::Conv2dGemm,
             ShaderEntry::Conv2dGemmCoop => ShaderGroup::Conv2dGemmCoop,
             ShaderEntry::Conv2dGemmCoopGen(..) => ShaderGroup::Conv2dGemmCoop,
@@ -363,6 +372,8 @@ impl ShaderEntry {
             ShaderEntry::Upsample2x => "main",
             ShaderEntry::Upsample2xGrad => "main",
             ShaderEntry::Conv2d => "main",
+            ShaderEntry::Conv2dDw => "main",
+            ShaderEntry::MulPerChannel => "main",
             ShaderEntry::Conv2dGemm
             | ShaderEntry::Conv2dGemmSmall
             | ShaderEntry::Conv2dGemmCoop
@@ -2342,6 +2353,55 @@ impl<'a> Compiler<'a> {
                         ..Default::default()
                     });
                 } // else (non-1x1 conv)
+            }
+
+            Op::MulPerChannel { channels, spatial } => {
+                let src = self.get_buffer(node.inputs[0]);
+                let gate = self.get_buffer(node.inputs[1]);
+                let len = node.ty.shape[0] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::MulPerChannel,
+                    workgroups: [len.div_ceil(256), 1, 1],
+                    input_buffers: vec![src, gate],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![len, spatial, channels, 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
+            Op::Conv2dDw {
+                channels,
+                in_h,
+                in_w,
+                kernel_h,
+                kernel_w,
+                stride,
+                padding_h,
+                padding_w,
+            } => {
+                let input = self.get_buffer(node.inputs[0]);
+                let kernel = self.get_buffer(node.inputs[1]);
+                let in_shape = &self.graph.node(node.inputs[0]).ty.shape;
+                let out_h = (in_h + 2 * padding_h - kernel_h) / stride + 1;
+                let out_w = (in_w + 2 * padding_w - kernel_w) / stride + 1;
+                let batch = in_shape[0] as u32 / (channels * in_h * in_w);
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::Conv2dDw,
+                    workgroups: [out_w.div_ceil(16), out_h.div_ceil(16), batch * channels],
+                    input_buffers: vec![input, kernel],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![
+                        batch, channels, in_h, in_w, kernel_h, kernel_w, stride, padding_h, out_h,
+                        out_w, padding_w,
+                    ],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
             }
 
             Op::WinogradConv2d {

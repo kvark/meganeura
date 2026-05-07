@@ -1766,6 +1766,220 @@ fn conv2d_padding_smoke() {
     );
 }
 
+/// Smoke test: depthwise Conv2d (groups == channels).
+///
+/// Each output channel reads only one input channel, so cross-channel
+/// summation is skipped. We verify by feeding distinct constant inputs
+/// per channel and a per-channel filter, and checking the output equals
+/// `(constant_input * filter_sum) per channel`.
+#[test]
+fn conv2d_dw_smoke() {
+    // 1 batch, 3 channels, 4×4 image, 3×3 kernel, stride=1, padding=1.
+    let batch = 1u32;
+    let channels = 3u32;
+    let h = 4u32;
+    let w = 4u32;
+    let kh = 3u32;
+    let kw = 3u32;
+    let stride = 1u32;
+    let padding = 1u32;
+    let out_h = (h + 2 * padding - kh) / stride + 1;
+    let out_w = (w + 2 * padding - kw) / stride + 1;
+
+    let in_size = (batch * channels * h * w) as usize;
+    let kernel_size = (channels * kh * kw) as usize;
+    let out_size = (batch * channels * out_h * out_w) as usize;
+
+    let mut g = Graph::new();
+    let input = g.input("input", &[in_size]);
+    let kernel = g.parameter("kernel", &[kernel_size]);
+    let output = g.conv2d_dw(
+        input, kernel, batch, channels, h, w, kh, kw, stride, padding, padding,
+    );
+    g.set_outputs(vec![output]);
+
+    let mut session = build_inference_session(&g);
+
+    // Fill input channel c with constant (c+1): channel 0 = 1.0, channel 1 = 2.0, channel 2 = 3.0.
+    let mut x = vec![0.0f32; in_size];
+    let hw = (h * w) as usize;
+    for c in 0..channels as usize {
+        let v = (c + 1) as f32;
+        for i in 0..hw {
+            x[c * hw + i] = v;
+        }
+    }
+    session.set_input("input", &x);
+
+    // Per-channel filter sums: channel 0 → 1.0, channel 1 → 2.0, channel 2 → 3.0.
+    let mut k = vec![0.0f32; kernel_size];
+    let khw = (kh * kw) as usize;
+    for c in 0..channels as usize {
+        let v = (c + 1) as f32 / khw as f32;
+        for i in 0..khw {
+            k[c * khw + i] = v;
+        }
+    }
+    session.set_parameter("kernel", &k);
+
+    session.step();
+    session.wait();
+
+    let out = session.read_output(out_size);
+    assert_eq!(out.len(), out_size);
+
+    // For each channel c: center pixel sees full 3×3 = sum_kernel * input_value
+    //   = (c+1) * filter_sum(c) = (c+1) * (c+1) = (c+1)^2
+    // Corner: 2×2 overlap → expected = (c+1) * (c+1) * 4/9
+    let oh = out_h as usize;
+    let ow = out_w as usize;
+    for c in 0..channels as usize {
+        let v_in = (c + 1) as f32;
+        let v_filt = (c + 1) as f32; // sum of filter for channel c
+        let center_idx = c * oh * ow + ow + 1;
+        let expected_center = v_in * v_filt;
+        assert!(
+            (out[center_idx] - expected_center).abs() < 1e-3,
+            "channel {} center = {}, expected {}",
+            c,
+            out[center_idx],
+            expected_center
+        );
+        let corner_idx = c * oh * ow;
+        let expected_corner = v_in * v_filt * 4.0 / 9.0;
+        assert!(
+            (out[corner_idx] - expected_corner).abs() < 1e-3,
+            "channel {} corner = {}, expected {}",
+            c,
+            out[corner_idx],
+            expected_corner
+        );
+    }
+}
+
+/// Smoke test: depthwise Conv2d cross-channel isolation.
+///
+/// Channel 1 has all zeros; channels 0/2 are non-zero. The depthwise
+/// output channel 1 must remain entirely zero — this is the property
+/// that distinguishes depthwise from regular conv (which would mix
+/// channels via Σ_ci).
+#[test]
+fn conv2d_dw_channel_isolation() {
+    let batch = 1u32;
+    let channels = 3u32;
+    let h = 4u32;
+    let w = 4u32;
+    let kh = 3u32;
+    let kw = 3u32;
+    let stride = 1u32;
+    let padding = 1u32;
+    let out_h = (h + 2 * padding - kh) / stride + 1;
+    let out_w = (w + 2 * padding - kw) / stride + 1;
+
+    let in_size = (batch * channels * h * w) as usize;
+    let kernel_size = (channels * kh * kw) as usize;
+    let out_size = (batch * channels * out_h * out_w) as usize;
+
+    let mut g = Graph::new();
+    let input = g.input("input", &[in_size]);
+    let kernel = g.parameter("kernel", &[kernel_size]);
+    let output = g.conv2d_dw(
+        input, kernel, batch, channels, h, w, kh, kw, stride, padding, padding,
+    );
+    g.set_outputs(vec![output]);
+
+    let mut session = build_inference_session(&g);
+
+    let hw = (h * w) as usize;
+    let mut x = vec![1.0f32; in_size];
+    // Zero out channel 1.
+    for i in 0..hw {
+        x[hw + i] = 0.0;
+    }
+    session.set_input("input", &x);
+    // All-ones kernel.
+    session.set_parameter("kernel", &vec![1.0f32; kernel_size]);
+
+    session.step();
+    session.wait();
+
+    let out = session.read_output(out_size);
+    let oh = out_h as usize;
+    let ow = out_w as usize;
+    // Channel 1 entirely zero — proves no cross-channel leak.
+    for i in 0..oh * ow {
+        let idx = oh * ow + i;
+        assert_eq!(
+            out[idx], 0.0,
+            "depthwise leaked into zero-input channel at idx {}: {}",
+            idx, out[idx]
+        );
+    }
+    // Channel 0 center pixel = 9.0 (full 3×3 overlap of ones).
+    let c0_center = ow + 1;
+    assert!(
+        (out[c0_center] - 9.0).abs() < 1e-4,
+        "channel 0 center = {}, expected 9.0",
+        out[c0_center]
+    );
+}
+
+/// Smoke test: MulPerChannel — `dst[n,c,h,w] = src[n,c,h,w] * gate[n,c]`.
+#[test]
+fn mul_per_channel_smoke() {
+    let batch = 2u32;
+    let channels = 3u32;
+    let h = 4u32;
+    let w = 5u32;
+    let spatial = h * w;
+    let total = (batch * channels * spatial) as usize;
+
+    let mut g = Graph::new();
+    let src = g.input("src", &[total]);
+    let gate = g.input("gate", &[(batch * channels) as usize]);
+    let out = g.mul_per_channel(src, gate, channels, spatial);
+    g.set_outputs(vec![out]);
+
+    let mut session = build_inference_session(&g);
+
+    // src = i (linear ramp), gate[n,c] = 10 + n*100 + c*10
+    let mut src_data = vec![0.0f32; total];
+    for (i, v) in src_data.iter_mut().enumerate() {
+        *v = i as f32;
+    }
+    session.set_input("src", &src_data);
+
+    let mut gate_data = vec![0.0f32; (batch * channels) as usize];
+    for n in 0..batch as usize {
+        for c in 0..channels as usize {
+            gate_data[n * channels as usize + c] = 10.0 + n as f32 * 100.0 + c as f32 * 10.0;
+        }
+    }
+    session.set_input("gate", &gate_data);
+
+    session.step();
+    session.wait();
+
+    let out = session.read_output(total);
+    for n in 0..batch as usize {
+        for c in 0..channels as usize {
+            for s in 0..spatial as usize {
+                let i = (n * channels as usize + c) * spatial as usize + s;
+                let expected = src_data[i] * gate_data[n * channels as usize + c];
+                assert!(
+                    (out[i] - expected).abs() < 1e-4,
+                    "n={} c={} s={}: got {}, expected {}",
+                    n,
+                    c,
+                    s,
+                    out[i],
+                    expected
+                );
+            }
+        }
+    }
+}
+
 /// Smoke test: Conv2d backward (gradient check via finite differences).
 #[test]
 fn conv2d_backward_smoke() {
