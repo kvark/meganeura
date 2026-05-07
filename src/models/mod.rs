@@ -1,3 +1,4 @@
+pub mod efficientnet;
 pub mod gemma4;
 pub mod mistral;
 pub mod phi3;
