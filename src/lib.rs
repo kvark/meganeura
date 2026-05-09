@@ -41,7 +41,7 @@ pub use graph::{DType, Graph, NodeId, TensorType};
 pub use load::nnef::{NnefError, NnefModel, load_nnef};
 pub use load::onnx::{OnnxError, OnnxModel, load_onnx, load_onnx_bytes};
 pub use optimize::OptimizeReport;
-pub use runtime::{ExternalBindError, ExternalSlot, MemorySummary, Session};
+pub use runtime::{ExternalBindError, ExternalSlot, MemorySummary, Session, init_gpu_context};
 pub use train::{
     EpochStats, LossHistory, MetricCallback, Mode, Optimizer, SessionConfig, StepMetrics,
     TrainConfig, TrainHistory, Trainer, build, build_inference_session, build_session,

@@ -2688,6 +2688,30 @@ impl Session {
         None
     }
 
+    /// Return the underlying blade `BufferPiece` for the named input
+    /// slot, so a sibling compute pipeline running on the *same* shared
+    /// `blade_graphics::Context` (see [`Session::with_context`]) can
+    /// dispatch directly into it — no fd/dmabuf interop, no
+    /// `bind_external_buffer` round-trip.
+    ///
+    /// Returns `None` if no input with that name exists.  The returned
+    /// `BufferPiece` is a lightweight `Copy` handle into the
+    /// session-owned buffer; it remains valid for the lifetime of the
+    /// `Session`.  Writes through it must respect the same ordering
+    /// rules as [`Session::input_host_ptr`] (the previous `step()`'s
+    /// `wait()` must have completed before the producer begins
+    /// writing).
+    pub fn input_buffer(&self, name: &str) -> Option<blade_graphics::BufferPiece> {
+        for &(ref input_name, buf_ref) in &self.plan.input_buffers {
+            if input_name == name {
+                return Some(blade_graphics::BufferPiece::from(
+                    self.buffers[buf_ref.0 as usize],
+                ));
+            }
+        }
+        None
+    }
+
     /// Upload u32 input data (e.g. token IDs for embedding lookup).
     pub fn set_input_u32(&mut self, name: &str, data: &[u32]) {
         for &(ref input_name, buf_ref) in &self.plan.input_buffers {
