@@ -3107,6 +3107,57 @@ fn q4_layer_nan_hunt() {
     }
 }
 
+/// Smoke test: AddPerChannel — `dst[n,c,h,w] = src[n,c,h,w] + bias[c]`.
+#[test]
+fn add_per_channel_smoke() {
+    let batch = 2u32;
+    let channels = 3u32;
+    let h = 4u32;
+    let w = 5u32;
+    let spatial = h * w;
+    let total = (batch * channels * spatial) as usize;
+
+    let mut g = Graph::new();
+    let src = g.input("src", &[total]);
+    let bias = g.input("bias", &[channels as usize]);
+    let out = g.add_per_channel(src, bias, channels, spatial);
+    g.set_outputs(vec![out]);
+
+    let mut session = build_inference_session(&g);
+
+    let mut src_data = vec![0.0f32; total];
+    for (i, v) in src_data.iter_mut().enumerate() {
+        *v = i as f32;
+    }
+    session.set_input("src", &src_data);
+
+    // Per-channel bias deliberately distinct so misalignment shows up.
+    let bias_data: Vec<f32> = (0..channels).map(|c| 100.0 + c as f32 * 10.0).collect();
+    session.set_input("bias", &bias_data);
+
+    session.step();
+    session.wait();
+
+    let out = session.read_output(total);
+    for n in 0..batch as usize {
+        for c in 0..channels as usize {
+            for s in 0..spatial as usize {
+                let i = (n * channels as usize + c) * spatial as usize + s;
+                let expected = src_data[i] + bias_data[c];
+                assert!(
+                    (out[i] - expected).abs() < 1e-4,
+                    "n={} c={} s={}: got {}, expected {}",
+                    n,
+                    c,
+                    s,
+                    out[i],
+                    expected,
+                );
+            }
+        }
+    }
+}
+
 /// Regression test for the kindle batch>1 silent-zero-gradient bug.
 ///
 /// Models the canonical failure mode: graph declares a parameter buffer
