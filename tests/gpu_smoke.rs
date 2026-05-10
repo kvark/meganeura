@@ -3106,3 +3106,38 @@ fn q4_layer_nan_hunt() {
         }
     }
 }
+
+/// Regression test for the kindle batch>1 silent-zero-gradient bug.
+///
+/// Models the canonical failure mode: graph declares a parameter buffer
+/// of size `[batch * channels]` (e.g. a per-batch broadcast bias), but
+/// `set_parameter` is called with only the per-channel `[channels]`
+/// slice from a safetensors file.  Before the `upload_buffer`
+/// size-check, the GPU buffer's tail past the supplied data stayed at
+/// whatever it was initialized to (zero on first allocation), and the
+/// kernel reading the buffer silently produced garbage for the
+/// unwritten portion.  The repro in mind-games was kindle's
+/// EfficientNet V2-S BN bias at `batch_size=4`: lane 0 trained, lanes
+/// 1-3 silently saw zero features for 50k steps.
+///
+/// Now `upload_buffer` asserts data byte-length equals the buffer's
+/// declared byte size.  This test must panic with the new message.
+#[test]
+#[should_panic(expected = "byte-size mismatch")]
+fn upload_buffer_rejects_undersized_parameter_upload() {
+    // Build a graph that declares a `[48]`-element bias (mimicking a
+    // per-batch broadcast: 2 batches × 24 channels), used as a 1D bias
+    // over a `[1, 48]` input.  Then upload only `[24]` floats — the
+    // shape a per-channel safetensors slice would supply.
+    let mut g = Graph::new();
+    let x = g.input("x", &[1, 48]);
+    let bias = g.parameter("bias", &[48]);
+    let y = g.bias_add(x, bias);
+    g.set_outputs(vec![y]);
+
+    let mut session = build_inference_session(&g);
+    let undersized = vec![0.5_f32; 24]; // 24 floats == 96 bytes
+    // Buffer is 48 floats == 192 bytes.  upload_buffer must panic with
+    // "byte-size mismatch ... got 96, slot expects 192".
+    session.set_parameter("bias", &undersized);
+}
