@@ -2725,6 +2725,26 @@ impl Session {
 
     fn upload_buffer(&self, buf_ref: BufferRef, data: &[u8]) {
         let buffer = &self.buffers[buf_ref.0 as usize];
+        let expected = self.plan.buffers[buf_ref.0 as usize];
+        // All upload paths (set_parameter, set_input, set_input_u32,
+        // upload_param, gradient clip rewrite, checkpoint restore) are
+        // *full-buffer* writes — partial uploads silently leave the
+        // tail of the GPU buffer at whatever its previous contents were
+        // (zero on first allocation, stale data afterwards) and propagate
+        // as garbage through every kernel that reads the slot. The
+        // canonical instance was kindle's V2-S BN bias parameter, declared
+        // as `[batch * channels * area]` in the graph but loaded from a
+        // `[channels]` safetensor — at batch=1 the conv kernel's per-area
+        // broadcast covered the gap, but at batch>1 lane slices 1..N
+        // were uninitialized and the agent silently failed to learn for
+        // 50 000 steps. Asserting here catches the class.
+        assert_eq!(
+            data.len(), expected,
+            "upload_buffer: byte-size mismatch for buffer {} — got {} bytes, slot expects {}. \
+             Likely a parameter shape mismatch between the graph declaration and the source data \
+             (e.g. graph says [batch * channels * area], safetensor says [channels]).",
+            buf_ref.0, data.len(), expected,
+        );
         unsafe {
             let ptr = buffer.data();
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
