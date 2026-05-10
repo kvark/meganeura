@@ -351,6 +351,9 @@ pub enum ShaderGroup {
     /// Per-channel broadcast mul: `dst[n,c,h,w] = src[n,c,h,w] * gate[n,c]`.
     /// Used by EfficientNet Squeeze-and-Excitation.
     MulPerChannel,
+    /// Per-channel broadcast add: `dst[n,c,h,w] = src[n,c,h,w] + bias[c]`.
+    /// Used to apply a fused-BN per-channel bias to a conv output.
+    AddPerChannel,
     Conv2dGemm,
     Conv2dGemmSmall,
     Conv2dGemmCoop,
@@ -456,6 +459,7 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::Conv2d => parse_wgsl(include_str!("shaders/conv2d.wgsl")),
         ShaderGroup::Conv2dDw => parse_wgsl(include_str!("shaders/conv2d_dw.wgsl")),
         ShaderGroup::MulPerChannel => parse_wgsl(include_str!("shaders/mul_per_channel.wgsl")),
+        ShaderGroup::AddPerChannel => parse_wgsl(include_str!("shaders/add_per_channel.wgsl")),
         ShaderGroup::Conv2dGemm => parse_wgsl(include_str!("shaders/conv2d_gemm.wgsl")),
         ShaderGroup::Conv2dGemmSmall => parse_wgsl(include_str!("shaders/conv2d_gemm_small.wgsl")),
         ShaderGroup::Conv2dGradInput => parse_wgsl(include_str!("shaders/conv2d_grad_input.wgsl")),
@@ -4984,6 +4988,7 @@ mod tests {
                     vec!["src", "weight", "dst", "params"]
                 }
                 ShaderEntry::MulPerChannel => vec!["src", "gate", "dst", "params"],
+                ShaderEntry::AddPerChannel => vec!["src", "bias", "dst", "params"],
                 ShaderEntry::Conv2dGemm
                 | ShaderEntry::Conv2dGemmSmall
                 | ShaderEntry::Conv2dGemmCoop
@@ -5093,6 +5098,7 @@ mod tests {
             ShaderEntry::Conv2d,
             ShaderEntry::Conv2dDw,
             ShaderEntry::MulPerChannel,
+            ShaderEntry::AddPerChannel,
             ShaderEntry::Conv2dGemm,
             ShaderEntry::Conv2dGemmSmall,
             ShaderEntry::Conv2dGradInput,

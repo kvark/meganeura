@@ -347,6 +347,15 @@ pub enum Op {
         spatial: u32,
     },
 
+    /// Per-channel broadcast add: `dst[n,c,h,w] = src[n,c,h,w] + bias[c]`.
+    /// inputs: [src, bias] where src is `[N*C*H*W]` and bias is `[C]`.
+    /// Used to apply a fused-BN per-channel bias to a conv output without
+    /// pre-replicating the `[C]` parameter into a `[N*C*H*W]` buffer.
+    AddPerChannel {
+        channels: u32,
+        spatial: u32,
+    },
+
     /// Depthwise 2D convolution (groups == channels).
     /// inputs: [input, kernel] where input is `[N*C*H*W]` and kernel is `[C*kH*kW]`.
     /// Each output channel `c` reads input channel `c` only.  Used by
@@ -1568,6 +1577,18 @@ impl Graph {
     pub fn mul_per_channel(&mut self, src: NodeId, gate: NodeId, channels: u32, spatial: u32) -> NodeId {
         let ty = self.node(src).ty.clone();
         self.add_node(Op::MulPerChannel { channels, spatial }, vec![src, gate], ty)
+    }
+
+    /// Per-channel broadcast add: `dst[n,c,h,w] = src[n,c,h,w] + bias[c]`.
+    ///
+    /// `src` shape `[N*C*H*W]`; `bias` shape `[C]`.  Output matches `src`.
+    /// Lets a fused-BN per-channel bias term be applied to a conv output
+    /// without pre-replicating the safetensor's `[C]` data into a
+    /// `[N*C*H*W]`-sized parameter buffer.  Compare `mul_per_channel`,
+    /// whose gate is `[N*C]` (per-batch-and-channel) for the SE pathway.
+    pub fn add_per_channel(&mut self, src: NodeId, bias: NodeId, channels: u32, spatial: u32) -> NodeId {
+        let ty = self.node(src).ty.clone();
+        self.add_node(Op::AddPerChannel { channels, spatial }, vec![src, bias], ty)
     }
 
     /// Depthwise Conv2d (groups == channels).
