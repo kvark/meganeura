@@ -32,19 +32,20 @@ use crate::graph::{Graph, NodeId};
 
 /// Spatial dims tracked through the network.
 #[derive(Clone, Copy)]
-struct Spatial {
-    h: u32,
-    w: u32,
+#[doc(hidden)]
+pub struct Spatial {
+    pub h: u32,
+    pub w: u32,
 }
 
 impl Spatial {
-    fn after_conv(&self, kernel: u32, stride: u32, padding: u32) -> Self {
+    pub fn after_conv(&self, kernel: u32, stride: u32, padding: u32) -> Self {
         Self {
             h: (self.h + 2 * padding - kernel) / stride + 1,
             w: (self.w + 2 * padding - kernel) / stride + 1,
         }
     }
-    fn area(&self) -> u32 {
+    pub fn area(&self) -> u32 {
         self.h * self.w
     }
 }
@@ -110,8 +111,9 @@ pub fn build_graph(g: &mut Graph, batch: u32) -> NodeId {
 /// - `expand_ratio  > 1`: `block.0` 3×3 expand + `block.1` 1×1 project.
 ///
 /// SE is intentionally absent — V2's design moves SE into MBConv only.
+#[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
-fn fused_mbconv(
+pub fn fused_mbconv(
     g: &mut Graph,
     x: NodeId,
     s: &Spatial,
@@ -181,8 +183,9 @@ fn fused_mbconv(
 /// V2-S always uses expansion ratio > 1 in its MBConv stages, so this
 /// helper assumes `expand_ratio > 1` (V1's MBConv1-style is handled
 /// by `fused_mbconv` instead in the V2 architecture).
+#[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
-fn mbconv(
+pub fn mbconv(
     g: &mut Graph,
     x: NodeId,
     s: &Spatial,

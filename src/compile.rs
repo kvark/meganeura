@@ -2307,9 +2307,17 @@ impl<'a> Compiler<'a> {
                     // Weight is [Co, Ci] (stored row-major), input is [batch*HW, Ci].
                     // MatMulBT: C = A @ B^T where A=[M,K], B=[N,K] → C=[M,N]
                     // A = input[batch*HW, Ci], B = weight[Co, Ci], C = output[batch*HW, Co]
+                    //
+                    // Dispatch axes match matmul.wgsl's convention: wgid.x → N
+                    // tiles (tile_col), wgid.y → M tiles (tile_row).  Every
+                    // other matmul dispatch in this file uses this ordering;
+                    // the 1×1 conv shortcut briefly didn't, which silently
+                    // dropped all output rows past the first workgroup-column
+                    // for any out_channels < tile size (= every 1×1 conv in
+                    // V2-S, since Co ∈ {24, 48, 64, 128, 160} all < 64).
                     self.plan.dispatches.push(Dispatch {
                         shader,
-                        workgroups: [m.div_ceil(tile), n.div_ceil(tile), 1],
+                        workgroups: [n.div_ceil(tile), m.div_ceil(tile), 1],
                         input_buffers: vec![input, kernel],
                         output_buffer: out_buf,
                         extra_outputs: vec![],

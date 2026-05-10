@@ -3107,6 +3107,89 @@ fn q4_layer_nan_hunt() {
     }
 }
 
+/// Regression test for the 1×1-conv dispatch-axes bug.
+///
+/// The 1×1 stride-1 conv path in `compile.rs` reinterprets `conv2d` as a
+/// MatMulBT with `M = batch*HW` rows and `N = out_channels` columns.  The
+/// shader's convention is `wgid.x → N tiles`, `wgid.y → M tiles`, matching
+/// every other matmul dispatch in the file.  An earlier version of the
+/// 1×1 shortcut accidentally swapped them — `[m.div_ceil, n.div_ceil, 1]`
+/// instead of `[n.div_ceil, m.div_ceil, 1]` — which silently dropped every
+/// output row past the first workgroup column whenever `out_channels <
+/// tile_size` (= every 1×1 conv in EfficientNet-V2, since Co ∈ {24, 48,
+/// 64, 128, 160} are all < 64).  For batch=N>1 lanes 1..N got all zeros.
+///
+/// This test triggers the path with the same shape conditions:
+/// `batch=4, in_ch=96, H=W=48, out_ch=48` (the features.2.0 project conv)
+/// and verifies all four batches produce identical, non-zero output for
+/// bit-identical input.
+#[test]
+fn conv2d_1x1_batch_replicated_input_is_uniform() {
+    let batch = 4u32;
+    let in_ch = 96u32;
+    let out_ch = 48u32;
+    let h = 48u32;
+    let w = 48u32;
+    let in_size = (batch * in_ch * h * w) as usize;
+    let out_size = (batch * out_ch * h * w) as usize;
+
+    let mut g = Graph::new();
+    let input = g.input("x", &[in_size]);
+    let kernel = g.parameter("w", &[(out_ch * in_ch) as usize]);
+    let y = g.conv2d(input, kernel, batch, in_ch, h, w, out_ch, 1, 1, 1, 0);
+    g.set_outputs(vec![y]);
+
+    let mut session = build_inference_session(&g);
+
+    // Deterministic kernel weights so every conv output is nonzero.
+    let kernel_data: Vec<f32> = (0..(out_ch * in_ch))
+        .map(|i| ((i as f32 * 0.0173).sin()))
+        .collect();
+    session.set_parameter("w", &kernel_data);
+
+    // Replicate identical [in_ch, H, W] across all batches.
+    let single: Vec<f32> = (0..(in_ch * h * w))
+        .map(|i| (((i as f32) * 0.0237).cos()))
+        .collect();
+    let mut input_data = Vec::with_capacity(in_size);
+    for _ in 0..batch {
+        input_data.extend_from_slice(&single);
+    }
+    session.set_input("x", &input_data);
+
+    session.step();
+    session.wait();
+
+    let out = session.read_output(out_size);
+    let per_batch = (out_ch * h * w) as usize;
+    let lane0 = &out[..per_batch];
+
+    // Every batch slice must match lane 0.
+    for b in 1..batch as usize {
+        let slice = &out[b * per_batch..(b + 1) * per_batch];
+        let mut max_diff = 0.0f32;
+        for i in 0..per_batch {
+            let d = (slice[i] - lane0[i]).abs();
+            if d > max_diff {
+                max_diff = d;
+            }
+        }
+        assert!(
+            max_diff < 1e-4,
+            "lane {b}: max abs diff vs lane 0 = {max_diff} (input was bit-identical \
+             across batches — divergence here is the 1×1-conv dispatch-axes regression)"
+        );
+    }
+
+    // Lane 0 must actually contain real conv output (not all zeros — that's
+    // the failure mode this bug produced).
+    let lane0_max_abs = lane0.iter().map(|v| v.abs()).fold(0.0, f32::max);
+    assert!(
+        lane0_max_abs > 0.1,
+        "lane 0 max-abs = {lane0_max_abs} — buffer is essentially zero, conv didn't compute"
+    );
+}
+
 /// Smoke test: AddPerChannel — `dst[n,c,h,w] = src[n,c,h,w] + bias[c]`.
 #[test]
 fn add_per_channel_smoke() {
