@@ -1261,18 +1261,44 @@ fn gen_matmul_coop_wgsl_prologue(
     let b_stage_1;
     if vec4_b {
         // Normal/AT: B[K,N], load vec4 along N (consecutive in memory).
+        //
+        // The fast vec4 packs the 4 lanes as four consecutive N-elements
+        // for the same K-row, valid when `n % 4 == 0` and the tile fits.
+        // Per-lane fallback handles non-multiple-of-4 N, but note that the
+        // *output store* (`coopStoreT` with stride `n` for a 16-wide tile)
+        // can still corrupt adjacent rows when N is not a multiple of 16.
+        // The runtime auto-switch in runtime.rs refuses coop for non-16-
+        // aligned N to keep the store safe — the slow-staging path here
+        // is only exercised when N >= 16 but N % 4 != 0 (e.g., N=20).
         let gen_vec4_b = |shared: &str, col_offset: &str| -> String {
             format!(
                 "{{\
                \n            let tr = t + v4_row;\
                \n            let cc4 = {col} + v4_col;\
                \n            let flat = v4_row * {t}u + v4_col;\
-               \n            if tr < k && (cc4 + 4u) <= n {{\
+               \n            if tr < k && (cc4 + 4u) <= n && (n & 3u) == 0u {{\
                \n                let v = matrix_b[(tr * n + cc4) >> 2u];\
                \n                {s}[flat] = {co}v.x{cc};\
                \n                {s}[flat + 1u] = {co}v.y{cc};\
                \n                {s}[flat + 2u] = {co}v.z{cc};\
                \n                {s}[flat + 3u] = {co}v.w{cc};\
+               \n            }} else if tr < k {{\
+               \n                let m0 = (cc4 + 0u) < n;\
+               \n                let m1 = (cc4 + 1u) < n;\
+               \n                let m2 = (cc4 + 2u) < n;\
+               \n                let m3 = (cc4 + 3u) < n;\
+               \n                let a0 = tr * n + cc4 + 0u;\
+               \n                let a1 = tr * n + cc4 + 1u;\
+               \n                let a2 = tr * n + cc4 + 2u;\
+               \n                let a3 = tr * n + cc4 + 3u;\
+               \n                let v0 = matrix_b[a0 >> 2u][a0 & 3u];\
+               \n                let v1 = matrix_b[a1 >> 2u][a1 & 3u];\
+               \n                let v2 = matrix_b[a2 >> 2u][a2 & 3u];\
+               \n                let v3 = matrix_b[a3 >> 2u][a3 & 3u];\
+               \n                {s}[flat] = select({z}, {co}v0{cc}, m0);\
+               \n                {s}[flat + 1u] = select({z}, {co}v1{cc}, m1);\
+               \n                {s}[flat + 2u] = select({z}, {co}v2{cc}, m2);\
+               \n                {s}[flat + 3u] = select({z}, {co}v3{cc}, m3);\
                \n            }} else {{\
                \n                let z = {z};\
                \n                {s}[flat] = z;\

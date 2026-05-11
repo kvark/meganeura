@@ -1791,18 +1791,36 @@ impl Session {
                 //   * MatMul / MatMulAdd:  A vec4 along K, B vec4 along N.
                 //   * MatMulAT:            A vec4-T along M, B vec4 along N.
                 //   * MatMulBT:            A vec4 along K, B vec4-T along K.
+                // matmul_coop.wgsl correctness conditions:
+                //
+                //   * Vec4 STAGING along the K direction (vec4_a for
+                //     Normal/BT, vec4_b_transposed for BT) now has a
+                //     per-lane fallback (codegen.rs), so any K is fine for
+                //     those variants.
+                //
+                //   * The OUTPUT STORE uses `coopStoreT(acc, &c[row*n+col],
+                //     n)` which writes a 16×16 sub-tile with row stride
+                //     `n`. When N (or M for the analogous AT/BT cases) is
+                //     not a multiple of 16, the right-edge / bottom-edge
+                //     sub-tile straddles the matrix boundary and the store
+                //     corrupts the next row's leading columns. Refuse coop
+                //     unless both output dimensions are multiples of 16.
+                //
+                // (Conv2d / FusedRmsNormMatMul also store via coopStoreT
+                // and need the same check; their `m`/`n` come from the
+                // params destructure above.)
+                let store_ok = m.is_multiple_of(16) && n.is_multiple_of(16);
                 let vec4_ok = match group {
-                    // MatMulBT staging now has a per-lane fallback for K%4!=0
-                    // (codegen.rs vec4_b_transposed path), so any K is fine.
-                    ShaderGroup::MatMulBT => true,
-                    ShaderGroup::MatMulAT => m >= 4 && n >= 4,
+                    ShaderGroup::MatMulBT => store_ok,
+                    ShaderGroup::MatMulAT => store_ok,
                     ShaderGroup::MatMul
                     | ShaderGroup::MatMulAdd
                     | ShaderGroup::Conv2dGemm
                     | ShaderGroup::Conv2dGradInputGemm
-                    | ShaderGroup::FusedRmsNormMatMul => k >= 4 && n >= 4,
+                    | ShaderGroup::FusedRmsNormMatMul => store_ok && k >= 4,
                     _ => true,
                 };
+                let _ = k;
                 if coop_wgs >= min_wgs && !dispatch.weight_format.is_quantized() && vec4_ok {
                     dispatch.use_coop = true;
                     // Route conv2d coop dispatches to generated specialized kernels
