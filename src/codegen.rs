@@ -1260,6 +1260,7 @@ fn gen_matmul_coop_wgsl_prologue(
     let b_stage_0;
     let b_stage_1;
     if vec4_b {
+        // Normal/AT: B[K,N], load vec4 along N (consecutive in memory).
         let gen_vec4_b = |shared: &str, col_offset: &str| -> String {
             format!(
                 "{{\
@@ -1291,20 +1292,50 @@ fn gen_matmul_coop_wgsl_prologue(
         b_stage_0 = gen_vec4_b("shared_a0", "tile_col");
         b_stage_1 = gen_vec4_b("shared_a1", &format!("(tile_col + {}u)", tile));
     } else if vec4_b_transposed {
-        // BT: B[N,K], load vec4 along K (consecutive in memory), write transposed to shared.
-        // v4_row → N (cc direction, shared col), v4_col → K (tr direction, shared rows).
-        // shared[row * tile + col] where row = K-offset, col = N-offset.
+        // BT: B[N,K], load vec4 along K (consecutive in memory), write
+        // transposed to shared.
+        //
+        // v4_row → N (cc direction, shared col), v4_col → K (tr direction,
+        // shared rows). shared[row * tile + col] where row = K-offset,
+        // col = N-offset.
+        //
+        // The fast vec4 load `matrix_b[(cc * k + tr4) >> 2u]` packs the
+        // 4 lanes as four consecutive K-elements for the same N-row. That
+        // packing is only correct when `k % 4 == 0` (else the lanes pull
+        // from the next N-row and the kernel misinterprets memory) *and*
+        // the tile fully fits in K (`tr4 + 4 <= k`). For backward passes
+        // where K is small (e.g. K=1 in MatMulBT(d_loss/d_pred [N,1],
+        // w_out [hidden,1])) or non-multiple-of-4, take the slow path: a
+        // per-lane scalar load through `array<vec4<f32>>` indexed by
+        // `(addr >> 2u)[addr & 3u]` with K-bounds masking.
         let gen_vec4_bt = |shared: &str, col_offset: &str| -> String {
             format!(
                 "{{\
                \n            let cc = {col} + v4_row;\
                \n            let tr4 = t + v4_col;\
-               \n            if cc < n && (tr4 + 4u) <= k {{\
+               \n            if cc < n && (tr4 + 4u) <= k && (k & 3u) == 0u {{\
                \n                let v = matrix_b[(cc * k + tr4) >> 2u];\
                \n                {s}[v4_col * {t}u + v4_row] = {co}v.x{cc2};\
                \n                {s}[(v4_col + 1u) * {t}u + v4_row] = {co}v.y{cc2};\
                \n                {s}[(v4_col + 2u) * {t}u + v4_row] = {co}v.z{cc2};\
                \n                {s}[(v4_col + 3u) * {t}u + v4_row] = {co}v.w{cc2};\
+               \n            }} else if cc < n {{\
+               \n                let m0 = (tr4 + 0u) < k;\
+               \n                let m1 = (tr4 + 1u) < k;\
+               \n                let m2 = (tr4 + 2u) < k;\
+               \n                let m3 = (tr4 + 3u) < k;\
+               \n                let a0 = cc * k + tr4 + 0u;\
+               \n                let a1 = cc * k + tr4 + 1u;\
+               \n                let a2 = cc * k + tr4 + 2u;\
+               \n                let a3 = cc * k + tr4 + 3u;\
+               \n                let v0 = matrix_b[a0 >> 2u][a0 & 3u];\
+               \n                let v1 = matrix_b[a1 >> 2u][a1 & 3u];\
+               \n                let v2 = matrix_b[a2 >> 2u][a2 & 3u];\
+               \n                let v3 = matrix_b[a3 >> 2u][a3 & 3u];\
+               \n                {s}[v4_col * {t}u + v4_row] = select({z}, {co}v0{cc2}, m0);\
+               \n                {s}[(v4_col + 1u) * {t}u + v4_row] = select({z}, {co}v1{cc2}, m1);\
+               \n                {s}[(v4_col + 2u) * {t}u + v4_row] = select({z}, {co}v2{cc2}, m2);\
+               \n                {s}[(v4_col + 3u) * {t}u + v4_row] = select({z}, {co}v3{cc2}, m3);\
                \n            }} else {{\
                \n                let z = {z};\
                \n                {s}[v4_col * {t}u + v4_row] = z;\
@@ -1362,18 +1393,43 @@ fn gen_matmul_coop_wgsl_prologue(
     let a_stage_0;
     let a_stage_1;
     if vec4_a {
+        // Normal/BT: A[M,K], load vec4 along K (consecutive in memory).
+        //
+        // The fast vec4 path packs 4 lanes as 4 consecutive K-elements for
+        // the same M-row, which is only correct when `k % 4 == 0` and the
+        // full vec4 lies within bounds. Otherwise fall back to per-lane
+        // scalar loads via `(addr >> 2u)[addr & 3u]` with K-bounds masking.
+        // Required for backward passes whose effective K is small (e.g.
+        // d_loss/d_pred has shape [N, 1] in the BT of an MLP output head).
         let gen_vec4_a = |shared: &str, row_offset: &str| -> String {
             format!(
                 "{{\
                \n            let gr = {row} + v4_row;\
                \n            let tc4 = t + v4_col;\
                \n            let flat = v4_row * {t}u + v4_col;\
-               \n            if gr < m && (tc4 + 4u) <= k {{\
+               \n            if gr < m && (tc4 + 4u) <= k && (k & 3u) == 0u {{\
                \n                let v = matrix_a[(gr * k + tc4) >> 2u];\
                \n                {s}[flat] = {co}v.x{cc};\
                \n                {s}[flat + 1u] = {co}v.y{cc};\
                \n                {s}[flat + 2u] = {co}v.z{cc};\
                \n                {s}[flat + 3u] = {co}v.w{cc};\
+               \n            }} else if gr < m {{\
+               \n                let m0 = (tc4 + 0u) < k;\
+               \n                let m1 = (tc4 + 1u) < k;\
+               \n                let m2 = (tc4 + 2u) < k;\
+               \n                let m3 = (tc4 + 3u) < k;\
+               \n                let a0 = gr * k + tc4 + 0u;\
+               \n                let a1 = gr * k + tc4 + 1u;\
+               \n                let a2 = gr * k + tc4 + 2u;\
+               \n                let a3 = gr * k + tc4 + 3u;\
+               \n                let v0 = matrix_a[a0 >> 2u][a0 & 3u];\
+               \n                let v1 = matrix_a[a1 >> 2u][a1 & 3u];\
+               \n                let v2 = matrix_a[a2 >> 2u][a2 & 3u];\
+               \n                let v3 = matrix_a[a3 >> 2u][a3 & 3u];\
+               \n                {s}[flat] = select({z}, {co}v0{cc}, m0);\
+               \n                {s}[flat + 1u] = select({z}, {co}v1{cc}, m1);\
+               \n                {s}[flat + 2u] = select({z}, {co}v2{cc}, m2);\
+               \n                {s}[flat + 3u] = select({z}, {co}v3{cc}, m3);\
                \n            }} else {{\
                \n                let z = {z};\
                \n                {s}[flat] = z;\
@@ -1393,9 +1449,8 @@ fn gen_matmul_coop_wgsl_prologue(
         a_stage_0 = gen_vec4_a("shared_b0", "tile_row");
         a_stage_1 = gen_vec4_a("shared_b1", &format!("(tile_row + {}u)", tile));
     } else if vec4_a_transposed {
-        // AT: A[K,M], load vec4 along M (consecutive in memory), write transposed to shared.
-        // v4_row → K (tc direction, shared col), v4_col → M (gr direction, shared rows).
-        // shared[row * tile + col] where row = M-offset, col = K-offset.
+        // AT: A[K,M], load vec4 along M (consecutive in memory), write
+        // transposed to shared.
         let gen_vec4_at = |shared: &str, row_offset: &str| -> String {
             format!(
                 "{{\
