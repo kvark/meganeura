@@ -1781,23 +1781,20 @@ impl Session {
                 };
                 // matmul_coop.wgsl's vec4 staging packs 4 consecutive elements
                 // from the contiguous axis into a single 128-bit load. The
-                // gating expression in the staging code (`(tr4 + 4u) <= k` /
-                // `(v4_col + 4u) <= n`) skips the load entirely whenever the
-                // relevant dimension is < 4, zero-padding the whole tile and
-                // silently producing zero output. Refuse to enable coop in
-                // those cases — the scalar/small fallbacks handle them
-                // correctly.
+                // gating expression `(tr4 + 4u) <= k` / `(v4_col + 4u) <= n`
+                // skips the load whenever the relevant dimension is < 4,
+                // zero-padding the whole tile and silently producing zero
+                // output. Refuse to enable coop in those cases — the scalar
+                // / small-tile fallbacks handle them correctly.
                 //
                 // Required vec4 dimensions per variant:
-                //   * MatMul / MatMulAdd / FusedMatMulAdd: A vec4 along K
-                //     (need K ≥ 4) AND B vec4 along N (need N ≥ 4).
-                //   * MatMulAT:  A vec4-transposed along M (need M ≥ 4) AND
-                //     B vec4 along N (need N ≥ 4).
-                //   * MatMulBT:  A vec4 along K AND B vec4-transposed along K
-                //     (need K ≥ 4).
-                //   * Conv2d / FusedRmsNormMatMul: same as MatMul.
+                //   * MatMul / MatMulAdd:  A vec4 along K, B vec4 along N.
+                //   * MatMulAT:            A vec4-T along M, B vec4 along N.
+                //   * MatMulBT:            A vec4 along K, B vec4-T along K.
                 let vec4_ok = match group {
-                    ShaderGroup::MatMulBT => k >= 4,
+                    // MatMulBT staging now has a per-lane fallback for K%4!=0
+                    // (codegen.rs vec4_b_transposed path), so any K is fine.
+                    ShaderGroup::MatMulBT => true,
                     ShaderGroup::MatMulAT => m >= 4 && n >= 4,
                     ShaderGroup::MatMul
                     | ShaderGroup::MatMulAdd
