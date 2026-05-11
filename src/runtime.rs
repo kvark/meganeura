@@ -1725,7 +1725,7 @@ impl Session {
             for dispatch in &mut plan.dispatches {
                 let group = dispatch.shader.shader_group();
                 // Extract (m, n, k, batch) from dispatch params based on shader group.
-                let (m, n, _k, batch) = match group {
+                let (m, n, k, batch) = match group {
                     ShaderGroup::MatMul | ShaderGroup::MatMulAdd => (
                         dispatch.params[0],
                         dispatch.params[2],
@@ -1779,7 +1779,34 @@ impl Session {
                 } else {
                     16 // enables coop for attention K/V projections (N=320, 20 WGs)
                 };
-                if coop_wgs >= min_wgs && !dispatch.weight_format.is_quantized() {
+                // matmul_coop.wgsl's vec4 staging packs 4 consecutive elements
+                // from the contiguous axis into a single 128-bit load. The
+                // gating expression in the staging code (`(tr4 + 4u) <= k` /
+                // `(v4_col + 4u) <= n`) skips the load entirely whenever the
+                // relevant dimension is < 4, zero-padding the whole tile and
+                // silently producing zero output. Refuse to enable coop in
+                // those cases — the scalar/small fallbacks handle them
+                // correctly.
+                //
+                // Required vec4 dimensions per variant:
+                //   * MatMul / MatMulAdd / FusedMatMulAdd: A vec4 along K
+                //     (need K ≥ 4) AND B vec4 along N (need N ≥ 4).
+                //   * MatMulAT:  A vec4-transposed along M (need M ≥ 4) AND
+                //     B vec4 along N (need N ≥ 4).
+                //   * MatMulBT:  A vec4 along K AND B vec4-transposed along K
+                //     (need K ≥ 4).
+                //   * Conv2d / FusedRmsNormMatMul: same as MatMul.
+                let vec4_ok = match group {
+                    ShaderGroup::MatMulBT => k >= 4,
+                    ShaderGroup::MatMulAT => m >= 4 && n >= 4,
+                    ShaderGroup::MatMul
+                    | ShaderGroup::MatMulAdd
+                    | ShaderGroup::Conv2dGemm
+                    | ShaderGroup::Conv2dGradInputGemm
+                    | ShaderGroup::FusedRmsNormMatMul => k >= 4 && n >= 4,
+                    _ => true,
+                };
+                if coop_wgs >= min_wgs && !dispatch.weight_format.is_quantized() && vec4_ok {
                     dispatch.use_coop = true;
                     // Route conv2d coop dispatches to generated specialized kernels
                     if is_conv_bwd {
