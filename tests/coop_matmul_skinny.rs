@@ -93,12 +93,17 @@ fn assert_close(gpu: &[f32], cpu: &[f32], label: &str) {
     let max_cpu = cpu.iter().map(|v| v.abs()).fold(0.0_f32, f32::max).max(1e-6);
     let rel = max_abs / max_cpu;
     // f16 inputs in the coop path lose ~10 mantissa bits; allow 2%.
+    let first_bad = gpu
+        .iter()
+        .zip(cpu)
+        .position(|(g, c)| (g - c).abs() / max_cpu > 0.02);
     assert!(
         rel < 0.02,
-        "{label}: rel err {:.3}% (max|gpu-cpu|={:.3e}, max|cpu|={:.3e})\n  gpu[..8]={:?}\n  cpu[..8]={:?}",
+        "{label}: rel err {:.3}% (max|gpu-cpu|={:.3e}, max|cpu|={:.3e}), first bad idx {:?}\n  gpu[..8]={:?}\n  cpu[..8]={:?}",
         rel * 100.0,
         max_abs,
         max_cpu,
+        first_bad,
         &gpu[..8.min(gpu.len())],
         &cpu[..8.min(cpu.len())],
     );
@@ -280,4 +285,81 @@ fn matmul_at_m16_aligned() {
 #[test]
 fn matmul_at_m33_non_aligned() {
     run_matmul_at(33, 4096, 32);
+}
+
+// ---------- Shapes seen in blade-volume-train's volumetric forward ----------
+//
+// The differentiable trainer needs `[P, L] @ [L, L] = [P, L]` where P is the
+// number of pixels per Adam step and L is the maximum traversal-path length.
+// `[1024, 16] @ [16, 16]` was reported producing NaN output despite valid
+// non-NaN inputs.
+
+#[test]
+fn matmul_pl_at_ll_p1024_l16() {
+    run_matmul(1024, 16, 16);
+}
+
+#[test]
+fn matmul_pl_at_ll_p1024_l24() {
+    run_matmul(1024, 24, 24);
+}
+
+#[test]
+fn matmul_pl_at_ll_p784_l16() {
+    // Boundary: P=784 is the smallest P that reproduced the NaN in
+    // blade-volume-train.
+    run_matmul(784, 16, 16);
+}
+
+/// Build `sigmoid(matmul(a, b))` and compare to the CPU reference.
+///
+/// Hits `fuse_epilogues` which folds the sigmoid into the matmul as an
+/// epilogue, replacing the matmul output buffer with the sigmoid buffer.
+/// The shader path is `matmul.wgsl` with `$STORE_BODY` rewritten to apply
+/// the epilogue before storing.
+fn run_matmul_sigmoid(m: usize, k: usize, n: usize) -> Vec<f32> {
+    let mut g = Graph::new();
+    let a = g.input("a", &[m, k]);
+    let b = g.input("b", &[k, n]);
+    let c = g.matmul(a, b);
+    let s = g.sigmoid(c);
+    g.set_outputs(vec![s]);
+    let (mut session, _) = build(
+        &g,
+        SessionConfig {
+            mode: Mode::Inference,
+            ..Default::default()
+        },
+    );
+    let a_data = pcg_inputs(m * k, 1);
+    let b_data = pcg_inputs(k * n, 2);
+    session.set_input("a", &a_data);
+    session.set_input("b", &b_data);
+    session.step();
+    session.wait();
+    let mut gpu = vec![0.0_f32; m * n];
+    session.read_output_by_index(0, &mut gpu);
+    let cpu_mm = cpu_matmul(&a_data, &b_data, m, k, n);
+    let cpu: Vec<f32> = cpu_mm.iter().map(|x| 1.0 / (1.0 + (-x).exp())).collect();
+    assert_close(&gpu, &cpu, &format!("matmul+sigmoid m={m} k={k} n={n}"));
+    gpu
+}
+
+#[test]
+fn matmul_sigmoid_p1024_l16() {
+    // Regression test: fuse_epilogues was producing wrong output past the
+    // first 64 rows for [M=1024, K=16] @ [K=16, N=16], leaving the rest
+    // of the [M, N]=[1024, 16] result as zero. Downstream `recip(sig)`
+    // then surfaced inf in blade-volume-train.
+    run_matmul_sigmoid(1024, 16, 16);
+}
+
+#[test]
+fn matmul_sigmoid_p1024_l24() {
+    run_matmul_sigmoid(1024, 24, 24);
+}
+
+#[test]
+fn matmul_sigmoid_p784_l16() {
+    run_matmul_sigmoid(784, 16, 16);
 }

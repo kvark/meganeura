@@ -632,7 +632,7 @@ pub fn compile_with(graph: &Graph, options: &CompileOptions) -> ExecutionPlan {
         }
     }
 
-    fuse_epilogues(&mut compiler.plan.dispatches);
+    fuse_epilogues(&mut compiler.plan);
     if options.use_schedule_pointwise {
         fuse_pointwise_chains(&mut compiler.plan);
     }
@@ -946,8 +946,29 @@ fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
     }
 }
 
-fn fuse_epilogues(dispatches: &mut Vec<Dispatch>) {
-    use std::collections::HashMap;
+fn fuse_epilogues(plan: &mut ExecutionPlan) {
+    use std::collections::{HashMap, HashSet};
+    // Buffers that must keep their producer unchanged: anything the rest
+    // of the plan references by buffer ref (user outputs, loss, params,
+    // inputs, constants, …). If the matmul's output_buffer is one of
+    // these, remapping it to the elementwise op's output buffer would
+    // leave the protected buffer unwritten.
+    let mut protected: HashSet<BufferRef> = HashSet::new();
+    protected.extend(plan.output_buffers.iter().copied());
+    if let Some(b) = plan.loss_buffer {
+        protected.insert(b);
+    }
+    for entry in &plan.param_buffers {
+        protected.insert(entry.1);
+    }
+    for entry in &plan.input_buffers {
+        protected.insert(entry.1);
+    }
+    for entry in &plan.constant_buffers {
+        protected.insert(entry.0);
+    }
+
+    let dispatches = &mut plan.dispatches;
     // Map: output buffer → dispatch index that writes it.
     let mut producer: HashMap<BufferRef, usize> = HashMap::new();
     for (i, d) in dispatches.iter().enumerate() {
@@ -1015,6 +1036,12 @@ fn fuse_epilogues(dispatches: &mut Vec<Dispatch>) {
         // The matmul output must be consumed by ONLY this elementwise op
         // (otherwise we can't modify the output in-place).
         if read_count.get(&primary_buf).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+
+        // The matmul's output buffer cannot be remapped if downstream code
+        // reads it by buffer-ref (user output, loss, param, input, constant).
+        if protected.contains(&primary_buf) {
             continue;
         }
 
