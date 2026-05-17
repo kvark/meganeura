@@ -1723,6 +1723,16 @@ impl Session {
             let output_tile = config.output_tile();
             let _half_tile = config.tile_size;
             for dispatch in &mut plan.dispatches {
+                // Skip dispatches that carry a matmul epilogue chain: the
+                // pipeline lookup in `Pipelines::get` returns the scalar
+                // `epilogue_map` entry *before* checking `use_coop`, but the
+                // coop block below would rewrite `dispatch.workgroups` to the
+                // coop geometry. That mismatch silently zeros every tile past
+                // the first M=64 rows. Coop+epilogue isn't a supported
+                // pipeline variant, so stay on scalar geometry.
+                if !dispatch.epilogue.is_empty() || dispatch.matmul_epilogue.is_some() {
+                    continue;
+                }
                 let group = dispatch.shader.shader_group();
                 // Extract (m, n, k, batch) from dispatch params based on shader group.
                 let (m, n, k, batch) = match group {
