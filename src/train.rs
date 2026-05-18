@@ -48,6 +48,11 @@ impl Default for Optimizer {
 }
 
 /// Configuration for training.
+///
+/// Per-step input binding is driven entirely by the [`DataLoader`]:
+/// every named stream returned by `Batch::tensors` is forwarded to
+/// `Session::set_input(name, …)`. The graph must declare an input of
+/// the same name (and matching shape) for each stream.
 pub struct TrainConfig {
     /// Optimizer to use (SGD or Adam).
     pub optimizer: Optimizer,
@@ -56,10 +61,6 @@ pub struct TrainConfig {
     pub learning_rate: f32,
     /// Print loss every `log_interval` steps. 0 disables step logging.
     pub log_interval: usize,
-    /// Name of the graph input that receives sample data (e.g. `"x"`).
-    pub data_input: String,
-    /// Name of the graph input that receives labels (e.g. `"labels"`).
-    pub label_input: String,
 }
 
 impl Default for TrainConfig {
@@ -68,8 +69,6 @@ impl Default for TrainConfig {
             optimizer: Optimizer::default(),
             learning_rate: 0.01,
             log_interval: 100,
-            data_input: "x".into(),
-            label_input: "labels".into(),
         }
     }
 }
@@ -157,31 +156,35 @@ impl Trainer {
         loader.shuffle(epoch as u64);
         loader.reset();
 
+        // Optimizer config is persistent — set once at the top of the
+        // epoch rather than re-arming each step. Subclasses that want a
+        // per-step LR schedule can override via `set_learning_rate` /
+        // `set_adam` mid-loop.
+        match self.config.optimizer {
+            Optimizer::Sgd { learning_rate } => {
+                self.session.set_learning_rate(learning_rate);
+            }
+            Optimizer::Adam {
+                learning_rate,
+                beta1,
+                beta2,
+                epsilon,
+            } => {
+                self.session.set_adam(learning_rate, beta1, beta2, epsilon);
+            }
+        }
+
         let mut total_loss = 0.0_f32;
         let mut steps = 0usize;
 
         while let Some(batch) = loader.next_batch() {
             {
                 let _span = tracing::info_span!("set_input").entered();
-                self.session.set_input(&self.config.data_input, batch.data);
-                self.session
-                    .set_input(&self.config.label_input, batch.labels);
+                for &(name, data) in &batch.tensors {
+                    self.session.set_input(name, data);
+                }
             }
 
-            // Set optimizer for fused step
-            match self.config.optimizer {
-                Optimizer::Sgd { learning_rate } => {
-                    self.session.set_learning_rate(learning_rate);
-                }
-                Optimizer::Adam {
-                    learning_rate,
-                    beta1,
-                    beta2,
-                    epsilon,
-                } => {
-                    self.session.set_adam(learning_rate, beta1, beta2, epsilon);
-                }
-            }
             self.session.step();
             self.session.wait();
 
@@ -472,8 +475,6 @@ mod tests {
         let config = TrainConfig::default();
         assert_eq!(config.learning_rate, 0.01);
         assert_eq!(config.log_interval, 100);
-        assert_eq!(config.data_input, "x");
-        assert_eq!(config.label_input, "labels");
     }
 
     #[test]
