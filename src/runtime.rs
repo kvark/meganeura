@@ -1404,8 +1404,11 @@ pub struct Session {
     /// When true, run in multi-pass mode: one compute pass per dispatch
     /// with individual GPU timestamps. Enables `dump_gpu_timings()`.
     profiling: bool,
-    /// Pending SGD learning rate. When set, `step()` appends SGD updates
-    /// to the same GPU submission (avoiding a separate submit/wait cycle).
+    /// Active SGD learning rate. When set, every `step()` appends SGD
+    /// updates to the same GPU submission (avoiding a separate submit/wait
+    /// cycle). Persistent: stays in effect across `step()` calls until
+    /// overridden by another `set_learning_rate` / `set_adam` call or
+    /// cleared via `clear_optimizer()`.
     pending_lr: Option<f32>,
     /// Per-parameter Adam state buffers: (m_buf, v_buf).
     adam_state: Vec<(blade_graphics::Buffer, blade_graphics::Buffer)>,
@@ -1417,7 +1420,10 @@ pub struct Session {
     grad_clip_acc: Option<blade_graphics::Buffer>,
     /// Adam step counter.
     adam_step: u32,
-    /// Pending Adam parameters. When set, `step()` appends Adam updates.
+    /// Active Adam parameters. When set, every `step()` appends Adam updates
+    /// to the same GPU submission. Persistent: stays in effect across
+    /// `step()` calls until overridden by another `set_adam` /
+    /// `set_learning_rate` call or cleared via `clear_optimizer()`.
     pending_adam: Option<(f32, f32, f32, f32)>, // (lr, beta1, beta2, eps)
     /// Maximum L2 norm of the per-step concatenated gradient. When set,
     /// `step()` splits its submission so it can read all gradient buffers
@@ -3249,7 +3255,7 @@ impl Session {
         // (default 1.0). Param-name lookup uses the plan's param_buffers
         // table; the cost is negligible (small N at session-build time).
         if !self.plan.param_grad_pairs.is_empty() {
-            let lr = self.pending_lr.take();
+            let lr = self.pending_lr;
             if let Some(learning_rate) = lr {
                 let pipeline = &self.pipelines.map[&ShaderEntry::SgdUpdate];
                 let mut pass = self.encoder.compute("sgd_update");
@@ -3278,7 +3284,7 @@ impl Session {
                     );
                     pc.dispatch([len.div_ceil(256), 1, 1]);
                 }
-            } else if let Some((lr, beta1, beta2, eps)) = self.pending_adam.take() {
+            } else if let Some((lr, beta1, beta2, eps)) = self.pending_adam {
                 self.adam_step += 1;
                 let pipeline = &self.pipelines.map[&ShaderEntry::AdamUpdate];
                 let mut pass = self.encoder.compute("adam_update");
@@ -4469,13 +4475,19 @@ impl Session {
         self.sync_point = Some(self.gpu.submit(&mut self.encoder));
     }
 
-    /// Set learning rate for SGD updates fused into the next `step()`.
+    /// Configure SGD updates to run after each `step()`.
     ///
-    /// When set, `step()` appends all SGD parameter updates to the same
-    /// GPU submission as forward+backward — eliminating the submit/wait
-    /// overhead of a separate `sgd_step()` call.
+    /// `step()` appends all SGD parameter updates to the same GPU
+    /// submission as forward+backward — eliminating the submit/wait
+    /// overhead of a separate `sgd_step()` call. Persistent: once set,
+    /// every subsequent `step()` runs the SGD update at the current
+    /// learning rate. Call again to change the rate, switch to Adam via
+    /// [`set_adam`](Self::set_adam), or stop optimizer updates via
+    /// [`clear_optimizer`](Self::clear_optimizer).
     pub fn set_learning_rate(&mut self, lr: f32) {
         self.pending_lr = Some(lr);
+        // Switching optimizers: SGD wins, Adam state stops applying.
+        self.pending_adam = None;
     }
 
     /// Enable global gradient-norm clipping for `step()`. When set,
@@ -4669,11 +4681,27 @@ impl Session {
         self.sync_point = Some(self.gpu.submit(&mut self.encoder));
     }
 
-    /// Set Adam parameters for updates fused into the next `step()`.
+    /// Configure Adam updates to run after each `step()`.
     ///
-    /// Analogous to [`set_learning_rate`](Self::set_learning_rate) for SGD.
+    /// Analogous to [`set_learning_rate`](Self::set_learning_rate) for
+    /// SGD: persistent until reconfigured or cleared. Call again to
+    /// change hyperparameters (LR schedule, warmup), switch to SGD via
+    /// [`set_learning_rate`](Self::set_learning_rate), or stop optimizer
+    /// updates via [`clear_optimizer`](Self::clear_optimizer).
     pub fn set_adam(&mut self, lr: f32, beta1: f32, beta2: f32, eps: f32) {
         self.pending_adam = Some((lr, beta1, beta2, eps));
+        // Switching optimizers: Adam wins, SGD stops applying.
+        self.pending_lr = None;
+    }
+
+    /// Stop running optimizer updates after `step()`.
+    ///
+    /// Forward+backward still runs (gradients are computed) but no SGD
+    /// or Adam pass is appended. Useful when freezing parameters for
+    /// evaluation or pinning the model after a warmup phase.
+    pub fn clear_optimizer(&mut self) {
+        self.pending_lr = None;
+        self.pending_adam = None;
     }
 
     pub fn memory_summary(&self) -> MemorySummary {
