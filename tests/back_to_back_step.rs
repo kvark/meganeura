@@ -110,6 +110,86 @@ fn back_to_back_step_applies_two_distinct_updates() {
 }
 
 #[test]
+fn set_adam_persists_across_steps_without_re_arming() {
+    // Calling `set_adam` once should keep Adam updates running on every
+    // subsequent `step()`. Previously the config was one-shot, silently
+    // stopping after the first step.
+    let batch = 4;
+    let in_d = 3;
+    let out_d = 2;
+    let g = build_linear_regression(batch, in_d, out_d);
+    let mut s = build_session(&g);
+
+    let n_w = in_d * out_d;
+    let w_init: Vec<f32> = (0..n_w).map(|i| (i as f32 * 0.1).sin()).collect();
+    s.set_parameter("w.weight", &w_init);
+    s.set_parameter("w.bias", &vec![0.0; out_d]);
+
+    let x: Vec<f32> = (0..batch * in_d).map(|i| (i as f32 * 0.3).cos()).collect();
+    let t: Vec<f32> = (0..batch * out_d).map(|i| (i as f32 * 0.5).sin()).collect();
+    s.set_input("x", &x);
+    s.set_input("target", &t);
+
+    // Configure Adam ONCE.
+    s.set_adam(0.1, 0.9, 0.999, 1e-8);
+
+    let mut last = w_init.clone();
+    for step_idx in 0..3 {
+        s.step();
+        s.wait();
+        let now = snapshot_params(&s, "w.weight", n_w);
+        let diff: f32 = now.iter().zip(last.iter()).map(|(a, b)| (a - b).abs()).sum();
+        assert!(
+            diff > 1e-6,
+            "step {step_idx} (Adam configured once, called repeatedly) must keep updating params; saw L1 diff {diff}",
+        );
+        last = now;
+    }
+}
+
+#[test]
+fn clear_optimizer_stops_updates() {
+    // After `clear_optimizer`, `step()` runs forward+backward but no
+    // parameter update — params stay frozen even with non-zero LR
+    // previously set.
+    let batch = 4;
+    let in_d = 3;
+    let out_d = 2;
+    let g = build_linear_regression(batch, in_d, out_d);
+    let mut s = build_session(&g);
+
+    let n_w = in_d * out_d;
+    let w_init: Vec<f32> = (0..n_w).map(|i| (i as f32 * 0.1).sin()).collect();
+    s.set_parameter("w.weight", &w_init);
+    s.set_parameter("w.bias", &vec![0.0; out_d]);
+
+    let x: Vec<f32> = (0..batch * in_d).map(|i| (i as f32 * 0.3).cos()).collect();
+    let t: Vec<f32> = (0..batch * out_d).map(|i| (i as f32 * 0.5).sin()).collect();
+    s.set_input("x", &x);
+    s.set_input("target", &t);
+
+    s.set_learning_rate(0.1);
+    s.step();
+    s.wait();
+    let after_train = snapshot_params(&s, "w.weight", n_w);
+
+    s.clear_optimizer();
+    s.step();
+    s.wait();
+    let after_freeze = snapshot_params(&s, "w.weight", n_w);
+
+    let diff: f32 = after_train
+        .iter()
+        .zip(after_freeze.iter())
+        .map(|(a, b)| (a - b).abs())
+        .sum();
+    assert!(
+        diff < 1e-6,
+        "post-clear_optimizer step must not change params; saw L1 diff {diff}",
+    );
+}
+
+#[test]
 fn back_to_back_with_zero_lr_in_between_does_not_compound() {
     // Confirms set_learning_rate(0) in a step is a no-op for params.
     let batch = 4;
