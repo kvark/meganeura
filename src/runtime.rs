@@ -2983,6 +2983,116 @@ impl Session {
             .any(|&(p, _)| p == param_buf)
     }
 
+    /// Read the Adam first-moment buffer (`m`) for a parameter into
+    /// `out`. `out.len()` must equal the parameter's element count.
+    /// Panics if the parameter has no Adam state (no gradient, or
+    /// optimizer wasn't initialised). Used together with
+    /// [`Session::write_adam_m`] / [`Session::write_adam_v`] /
+    /// [`Session::set_adam_step_count`] to carry optimizer state
+    /// across a session rebuild — e.g. when the parameter table
+    /// reshaped due to a topology change like RadFoam densification.
+    pub fn read_adam_m(&self, name: &str, out: &mut [f32]) {
+        let idx = self
+            .adam_state_index(name)
+            .unwrap_or_else(|| panic!("no Adam state for param: {name}"));
+        let buf = &self.adam_state[idx].0;
+        let n = self.param_size(name).expect("param exists; size known");
+        assert_eq!(
+            out.len(),
+            n,
+            "read_adam_m: out.len()={} but param '{name}' has {n} elements",
+            out.len()
+        );
+        unsafe {
+            let ptr = buf.data() as *const f32;
+            std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), n);
+        }
+    }
+
+    /// Read the Adam second-moment buffer (`v`) for a parameter. See
+    /// [`Session::read_adam_m`].
+    pub fn read_adam_v(&self, name: &str, out: &mut [f32]) {
+        let idx = self
+            .adam_state_index(name)
+            .unwrap_or_else(|| panic!("no Adam state for param: {name}"));
+        let buf = &self.adam_state[idx].1;
+        let n = self.param_size(name).expect("param exists; size known");
+        assert_eq!(
+            out.len(),
+            n,
+            "read_adam_v: out.len()={} but param '{name}' has {n} elements",
+            out.len()
+        );
+        unsafe {
+            let ptr = buf.data() as *const f32;
+            std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), n);
+        }
+    }
+
+    /// Write the Adam first-moment buffer for a parameter. `data.len()`
+    /// must equal the parameter's element count. See
+    /// [`Session::read_adam_m`] for the carry-over use case.
+    pub fn write_adam_m(&self, name: &str, data: &[f32]) {
+        let idx = self
+            .adam_state_index(name)
+            .unwrap_or_else(|| panic!("no Adam state for param: {name}"));
+        let buf = &self.adam_state[idx].0;
+        let n = self.param_size(name).expect("param exists; size known");
+        assert_eq!(
+            data.len(),
+            n,
+            "write_adam_m: data.len()={} but param '{name}' has {n} elements",
+            data.len()
+        );
+        unsafe {
+            let ptr = buf.data() as *mut f32;
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, n);
+        }
+    }
+
+    /// Write the Adam second-moment buffer for a parameter. See
+    /// [`Session::write_adam_m`].
+    pub fn write_adam_v(&self, name: &str, data: &[f32]) {
+        let idx = self
+            .adam_state_index(name)
+            .unwrap_or_else(|| panic!("no Adam state for param: {name}"));
+        let buf = &self.adam_state[idx].1;
+        let n = self.param_size(name).expect("param exists; size known");
+        assert_eq!(
+            data.len(),
+            n,
+            "write_adam_v: data.len()={} but param '{name}' has {n} elements",
+            data.len()
+        );
+        unsafe {
+            let ptr = buf.data() as *mut f32;
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, n);
+        }
+    }
+
+    /// Current Adam step counter (`t`). Adam's bias correction uses
+    /// `1 - β₁ᵗ` / `1 - β₂ᵗ`, so this number is part of the optimizer
+    /// state that must round-trip across a session rebuild for
+    /// [`read_adam_m`](Session::read_adam_m) carry-over to be exact.
+    pub fn adam_step_count(&self) -> u32 {
+        self.adam_step
+    }
+
+    /// Set the Adam step counter. Pair with [`Session::write_adam_m`] /
+    /// [`Session::write_adam_v`] when restoring optimizer state into a
+    /// freshly built session.
+    pub fn set_adam_step_count(&mut self, t: u32) {
+        self.adam_step = t;
+    }
+
+    fn adam_state_index(&self, name: &str) -> Option<usize> {
+        let param_buf = self.param_buffer(name)?;
+        self.plan
+            .param_grad_pairs
+            .iter()
+            .position(|&(p, _)| p == param_buf)
+    }
+
     /// Bulk read of per-parameter gradient L2 norms (Frobenius for
     /// matrices). Returns `(name, ‖grad‖₂)` pairs, in compile order,
     /// for every parameter that has a gradient buffer.
