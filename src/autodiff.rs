@@ -747,13 +747,56 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let grad_x = graph.upsample_2x_grad(grad_output, batch, channels, in_h, in_w);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
+            Op::SplitA {
+                channels_a,
+                channels_b,
+                spatial,
+            } => {
+                // Forward: take first Ca channels of `[N, Ca+Cb, spatial]` → `[N, Ca, spatial]`.
+                // Backward: scatter `grad_output` into the first Ca channels
+                // and zero-fill the last Cb channels — `concat(grad_output, zeros_b)`.
+                //
+                // Until 2026-05-23 this arm was empty. SplitA/B were the
+                // only ops that emitted user-callable forward nodes but
+                // had no autodiff backward; any `Parameter → … → SplitA → loss`
+                // path silently produced zero gradients. The first bug bite
+                // was the 2026-05-22 bonsai per-view exposure A/B: an
+                // `embedding(view_idx, exposure_rgb)` then split into per-
+                // channel scalars left `exposure_*` parameters frozen at
+                // their init values for every Adam step (init-to-2.0 sanity
+                // test stayed at 2.0 after 400 updates). Same trap fires
+                // for any user split off a parameter subtree.
+                let x = node.inputs[0];
+                let grad_out_size = forward.nodes()[node.id as usize].ty.shape[0] as u32;
+                let batch = grad_out_size / (channels_a * spatial);
+                let zeros_b_size = batch as usize * channels_b as usize * spatial as usize;
+                let zeros_b = graph.constant(vec![0.0; zeros_b_size], &[zeros_b_size]);
+                let grad_x =
+                    graph.concat(grad_output, zeros_b, batch, channels_a, channels_b, spatial);
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
+            Op::SplitB {
+                channels_a,
+                channels_b,
+                spatial,
+            } => {
+                // Forward: take last Cb channels of `[N, Ca+Cb, spatial]` → `[N, Cb, spatial]`.
+                // Backward: zero-fill the first Ca channels, scatter
+                // `grad_output` into the last Cb channels.
+                let x = node.inputs[0];
+                let grad_out_size = forward.nodes()[node.id as usize].ty.shape[0] as u32;
+                let batch = grad_out_size / (channels_b * spatial);
+                let zeros_a_size = batch as usize * channels_a as usize * spatial as usize;
+                let zeros_a = graph.constant(vec![0.0; zeros_a_size], &[zeros_a_size]);
+                let grad_x =
+                    graph.concat(zeros_a, grad_output, batch, channels_a, channels_b, spatial);
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
             // Backward-only gradient ops: no further differentiation needed.
             Op::Conv2dGradInput { .. }
             | Op::Conv2dGradWeight { .. }
             | Op::GroupNormGradInput { .. }
             | Op::GroupNormGradWeightBias { .. }
-            | Op::SplitA { .. }
-            | Op::SplitB { .. }
             | Op::Upsample2xGrad { .. } => {}
             Op::RoPE {
                 theta,
