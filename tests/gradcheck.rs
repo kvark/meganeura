@@ -437,6 +437,51 @@ fn recip_mid_chain() {
 /// a manual `coef · sum(partial_losses)` or the autodiff backward
 /// (which uses the FULL gradient (sm·S − labels)/B) computes. Test is
 /// `#[ignore]`d — it documents a known meganeura design issue, not a fix
+/// `split_a` mid-graph on a parameter subtree. Before the 2026-05-23
+/// fix this arm of autodiff was empty, so the gradient w.r.t. `w` was
+/// always zero — analytical ≠ numerical by orders of magnitude.
+///
+/// Layout: `w[1, 4, 1]` (think `[N=1, C=4, spatial=1]`); take the first
+/// Ca=2 channels, mul by a scalar coef, mean-reduce to a loss. The
+/// first two `w` entries should pull the gradient, the last two
+/// should be zero — both checked by gradcheck.
+#[test]
+fn split_a_mid_chain_backprops_to_parameter() {
+    let mut g = Graph::new();
+    let w = g.parameter("w", &[4]);
+    let split = g.split_a(w, 1, 2, 2, 1); // [2]
+    let mean = g.mean_all(split);
+    let coef = g.scalar(0.7);
+    let loss = g.mul(mean, coef);
+    g.set_outputs(vec![loss]);
+
+    let mut session = build_session(&g);
+    let w_init: Vec<f32> = vec![0.5, -0.3, 1.2, -0.8];
+    session.set_parameter("w", &w_init);
+    let set_inputs = |_: &mut meganeura::Session| {};
+    gradcheck_param(&mut session, "w", 4, &set_inputs);
+}
+
+/// Symmetric test for `split_b`: take the last Cb=2 channels of a
+/// `[4]` parameter, scale by a coef, reduce. The last two entries of
+/// `w` should pull the gradient, the first two should be zero.
+#[test]
+fn split_b_mid_chain_backprops_to_parameter() {
+    let mut g = Graph::new();
+    let w = g.parameter("w", &[4]);
+    let split = g.split_b(w, 1, 2, 2, 1); // [2]
+    let mean = g.mean_all(split);
+    let coef = g.scalar(-0.5);
+    let loss = g.mul(mean, coef);
+    g.set_outputs(vec![loss]);
+
+    let mut session = build_session(&g);
+    let w_init: Vec<f32> = vec![0.2, -0.6, 0.9, 0.3];
+    session.set_parameter("w", &w_init);
+    let set_inputs = |_: &mut meganeura::Session| {};
+    gradcheck_param(&mut session, "w", 4, &set_inputs);
+}
+
 /// the autodiff side can address. Remove the ignore once the buffer/IR
 /// shape mismatch is resolved at the compile/runtime layer.
 #[test]
