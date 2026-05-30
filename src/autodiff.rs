@@ -359,6 +359,36 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let grad_x = graph.silu_grad(grad_output, x);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
+            Op::Elu => {
+                panic!(
+                    "Elu autodiff not implemented — inference-only \
+                     (used by SpectroStream). Add gradients before training through it."
+                );
+            }
+            Op::UpsampleNearest { .. } => {
+                panic!(
+                    "UpsampleNearest autodiff not implemented — inference-only \
+                     (used by SpectroStream's shortcut path)."
+                );
+            }
+            Op::Slice2d { .. } => {
+                panic!(
+                    "Slice2d autodiff not implemented — inference-only \
+                     (used by SpectroStream crops)."
+                );
+            }
+            Op::Conv2dGradInputHW { .. } => {
+                panic!(
+                    "Conv2dGradInputHW autodiff not implemented — inference-only \
+                     (used by SpectroStream's asymmetric-stride conv-transpose)."
+                );
+            }
+            Op::PixelShuffleW { .. } => {
+                panic!(
+                    "PixelShuffleW autodiff not implemented — inference-only \
+                     (used by SpectroStream's inter-block reshape)."
+                );
+            }
             Op::SwiGLU => {
                 // out = silu(gate) * up
                 // d/dup   = dL * silu(gate)
@@ -369,6 +399,25 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let grad_up = graph.swiglu_grad_up(grad_output, gate);
                 accumulate_grad(&mut graph, &mut grads, gate, grad_gate);
                 accumulate_grad(&mut graph, &mut grads, up, grad_up);
+            }
+            Op::GeGLU => {
+                panic!(
+                    "GeGLU autodiff not implemented — inference-only \
+                     (used by Magenta-RT). Add gradients before training through it."
+                );
+            }
+            Op::T5RelPosBias { .. } => {
+                panic!(
+                    "T5RelPosBias autodiff not implemented — inference-only \
+                     (used by Magenta-RT). Bias-table param would need a scatter-add \
+                     reduction over (q, k) cells sharing the same bucket."
+                );
+            }
+            Op::FullAttentionRelPosBias { .. } => {
+                panic!(
+                    "FullAttentionRelPosBias autodiff not implemented — inference-only \
+                     (used by Magenta-RT)."
+                );
             }
             Op::SwiGLUConcat => {
                 // out[M,N] = silu(input[:,:N]) * input[:,N:]

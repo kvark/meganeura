@@ -166,8 +166,42 @@ pub enum Op {
     // SiLU activation: x * sigmoid(x)
     Silu,
 
+    // Elu activation: x if x >= 0 else exp(x) - 1 (alpha = 1)
+    Elu,
+
     // SwiGLU: silu(gate) * up  (inputs: [gate, up])
     SwiGLU,
+
+    // GeGLU: gelu(gate) * up  (inputs: [gate, up]). Same shape contract as SwiGLU.
+    GeGLU,
+
+    // T5-style relative position bias: materialize [num_heads, q_len, kv_len]
+    // from a learned [num_heads, num_buckets] table using log-bucketed |q-k|.
+    // inputs: [bias_table]
+    T5RelPosBias {
+        num_heads: u32,
+        num_buckets: u32,
+        max_distance: u32,
+        bidirectional: bool,
+        q_len: u32,
+        kv_len: u32,
+    },
+
+    // Fused full attention + T5 relative position bias: extends FullAttention
+    // with an inline bucket lookup from a learned [num_heads, num_buckets] table.
+    // Bias is added to QK^T before softmax. kv_seq=0 selects causal masking
+    // (matches the unified attention shader convention).
+    // inputs: [q, k, v, rel_pos_table]
+    FullAttentionRelPosBias {
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        num_buckets: u32,
+        max_distance: u32,
+        bidirectional: bool,
+        /// If true, decoder-style causal: kv_seq is forced to 0 in the dispatch.
+        causal: bool,
+    },
 
     // SwiGLU on concatenated input: input[M, 2*N] → output[M, N]
     // gate = input[:, :N], up = input[:, N:], out = silu(gate) * up
@@ -394,6 +428,22 @@ pub enum Op {
         padding_w: u32,
     },
 
+    // Same as Conv2dGradInput but with separate stride_h, stride_w. Used by
+    // SpectroStream's conv-transpose blocks where stride_h=1 and stride_w
+    // varies per block. inputs: [grad_output, kernel]
+    Conv2dGradInputHW {
+        in_channels: u32,
+        in_h: u32,
+        in_w: u32,
+        out_channels: u32,
+        kernel_h: u32,
+        kernel_w: u32,
+        stride_h: u32,
+        stride_w: u32,
+        padding_h: u32,
+        padding_w: u32,
+    },
+
     // Conv2d backward w.r.t. kernel: given grad_output and input, produce grad_kernel.
     // inputs: [grad_output, input]
     Conv2dGradWeight {
@@ -514,6 +564,40 @@ pub enum Op {
         channels: u32,
         in_h: u32,
         in_w: u32,
+    },
+
+    // Nearest-neighbor upsample with separate H/W scale factors.
+    // [N,C,H,W] → [N,C,H*scale_h, W*scale_w].  inputs: [x]
+    UpsampleNearest {
+        channels: u32,
+        in_h: u32,
+        in_w: u32,
+        scale_h: u32,
+        scale_w: u32,
+    },
+
+    // Channel-to-width pixel shuffle: [B,C,H,W] → [B,C/factor,H,W*factor].
+    // Inverse interleaves channel pairs into the W dimension. Used by
+    // SpectroStream's inter-block transition between decoder_0 and decoder_1
+    // (1024 ch → 512 ch with W doubled). inputs: [x]
+    PixelShuffleW {
+        channels: u32,
+        in_h: u32,
+        in_w: u32,
+        factor: u32,
+    },
+
+    // Spatial crop on NCHW: [B,C,H,W] → [B,C,H-start_h-end_h, W-start_w-end_w].
+    // Used by SpectroStream for crop_freq_dim, temporal_cropping, and the
+    // input_layer residual H-slice. inputs: [x]
+    Slice2d {
+        channels: u32,
+        in_h: u32,
+        in_w: u32,
+        start_h: u32,
+        end_h: u32, // amount to crop from the bottom (not the slice's end index)
+        start_w: u32,
+        end_w: u32,
     },
 
     // Backward of Upsample2x: [N,C,2H,2W] → [N,C,H,W] (sum 2×2 blocks)
@@ -1048,10 +1132,110 @@ impl Graph {
         self.add_node(Op::Silu, vec![x], ty)
     }
 
+    /// ELU activation: `x if x >= 0 else exp(x) - 1`. Used by SpectroStream.
+    pub fn elu(&mut self, x: NodeId) -> NodeId {
+        let ty = self.node(x).ty.clone();
+        self.add_node(Op::Elu, vec![x], ty)
+    }
+
     /// Fused SwiGLU: silu(gate) * up. gate and up must have the same shape.
     pub fn swiglu(&mut self, gate: NodeId, up: NodeId) -> NodeId {
         let ty = self.node(gate).ty.clone();
         self.add_node(Op::SwiGLU, vec![gate, up], ty)
+    }
+
+    /// Fused GeGLU: gelu(gate) * up. gate and up must have the same shape.
+    pub fn geglu(&mut self, gate: NodeId, up: NodeId) -> NodeId {
+        let ty = self.node(gate).ty.clone();
+        self.add_node(Op::GeGLU, vec![gate, up], ty)
+    }
+
+    /// Fused full attention with T5 relative position bias. Replaces the
+    /// pattern `scale(q@k^T) + t5_rel_pos_bias → softmax → @v` with a single
+    /// shader that looks up the bias from the `[num_heads * num_buckets]` table
+    /// per (q, k) pair inline (no `[H, Q, K]` materialization).
+    ///
+    /// `q`, `k`, `v` are 2D `[seq, num_heads*head_dim]` / `[seq, num_kv_heads*head_dim]`.
+    /// Set `causal=true` for T5 decoder self-attention (kv_seq becomes pos+1 per query).
+    #[allow(clippy::too_many_arguments)]
+    pub fn full_attention_with_rel_pos_bias(
+        &mut self,
+        q: NodeId,
+        k: NodeId,
+        v: NodeId,
+        rel_pos_table: NodeId,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        num_buckets: u32,
+        max_distance: u32,
+        bidirectional: bool,
+        causal: bool,
+    ) -> NodeId {
+        let q_shape = &self.node(q).ty.shape;
+        let k_shape = &self.node(k).ty.shape;
+        let v_shape = &self.node(v).ty.shape;
+        assert_eq!(q_shape.len(), 2);
+        assert_eq!(k_shape.len(), 2);
+        assert_eq!(v_shape.len(), 2);
+        let q_seq = q_shape[0];
+        assert_eq!(q_shape[1], (num_heads * head_dim) as usize, "q dim mismatch");
+        assert_eq!(k_shape[0], v_shape[0], "k/v must share kv_seq");
+        assert_eq!(k_shape[1], (num_kv_heads * head_dim) as usize, "k dim mismatch");
+        assert_eq!(v_shape[1], (num_kv_heads * head_dim) as usize, "v dim mismatch");
+        let table_shape = &self.node(rel_pos_table).ty.shape;
+        assert_eq!(
+            table_shape[0],
+            (num_heads * num_buckets) as usize,
+            "rel_pos_table must be [num_heads * num_buckets] = {} entries",
+            num_heads * num_buckets
+        );
+        let ty = TensorType::f32(vec![q_seq, (num_heads * head_dim) as usize]);
+        self.add_node(
+            Op::FullAttentionRelPosBias {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_buckets,
+                max_distance,
+                bidirectional,
+                causal,
+            },
+            vec![q, k, v, rel_pos_table],
+            ty,
+        )
+    }
+
+    /// T5 relative position bias materialization. `bias_table` is a learned
+    /// `[num_heads * num_buckets]` parameter; output is `[num_heads * q_len * kv_len]`,
+    /// computed by looking up `table[head, bucket(q-k)]`. The bucket function is
+    /// log-spaced (matches flaxformer's RelativePositionBiases). Result is added to
+    /// QK^T before softmax in T5-style attention.
+    #[allow(clippy::too_many_arguments)]
+    pub fn t5_rel_pos_bias(
+        &mut self,
+        bias_table: NodeId,
+        num_heads: u32,
+        num_buckets: u32,
+        max_distance: u32,
+        bidirectional: bool,
+        q_len: u32,
+        kv_len: u32,
+    ) -> NodeId {
+        let out_size = (num_heads * q_len * kv_len) as usize;
+        let ty = TensorType::f32(vec![out_size]);
+        self.add_node(
+            Op::T5RelPosBias {
+                num_heads,
+                num_buckets,
+                max_distance,
+                bidirectional,
+                q_len,
+                kv_len,
+            },
+            vec![bias_table],
+            ty,
+        )
     }
 
     /// SwiGLU on concatenated input: input[M, 2*N] → output[M, N].
@@ -1534,6 +1718,98 @@ impl Graph {
         )
     }
 
+    /// Channel-to-width pixel shuffle. `[B, C, H, W]` → `[B, C/factor, H, W*factor]`.
+    /// Mapping: `out[b, c, h, factor*w + k] = in[b, k*(C/factor) + c, h, w]`,
+    /// which mirrors a TF `reshape [..., W, factor, C/factor]` then channel-last
+    /// merge of `W` and `factor` axes.
+    pub fn pixel_shuffle_w(
+        &mut self,
+        x: NodeId,
+        batch: u32,
+        channels: u32,
+        in_h: u32,
+        in_w: u32,
+        factor: u32,
+    ) -> NodeId {
+        assert!(channels % factor == 0, "pixel_shuffle_w: channels {channels} must be divisible by factor {factor}");
+        let out_c = channels / factor;
+        let out_w = in_w * factor;
+        let total = batch as usize * out_c as usize * in_h as usize * out_w as usize;
+        let ty = TensorType::f32(vec![total]);
+        self.add_node(
+            Op::PixelShuffleW { channels, in_h, in_w, factor },
+            vec![x],
+            ty,
+        )
+    }
+
+    /// Spatial crop on NCHW: drop `start_h` rows from the top, `end_h` rows
+    /// from the bottom, `start_w` columns from the left, `end_w` from the right.
+    /// Output shape `[B, C, in_h - start_h - end_h, in_w - start_w - end_w]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn slice_2d(
+        &mut self,
+        x: NodeId,
+        batch: u32,
+        channels: u32,
+        in_h: u32,
+        in_w: u32,
+        start_h: u32,
+        end_h: u32,
+        start_w: u32,
+        end_w: u32,
+    ) -> NodeId {
+        let out_h = in_h - start_h - end_h;
+        let out_w = in_w - start_w - end_w;
+        let total = batch as usize * channels as usize * out_h as usize * out_w as usize;
+        let ty = TensorType::f32(vec![total]);
+        self.add_node(
+            Op::Slice2d {
+                channels,
+                in_h,
+                in_w,
+                start_h,
+                end_h,
+                start_w,
+                end_w,
+            },
+            vec![x],
+            ty,
+        )
+    }
+
+    /// Nearest-neighbor upsampling with separate H/W scale factors.
+    /// `[N,C,H,W]` → `[N,C,H*scale_h, W*scale_w]`. Used by SpectroStream's
+    /// shortcut path where the upsample matches the conv-transpose's stride
+    /// (stride is 1 in H, varies in W per block).
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsample_nearest(
+        &mut self,
+        x: NodeId,
+        batch: u32,
+        channels: u32,
+        in_h: u32,
+        in_w: u32,
+        scale_h: u32,
+        scale_w: u32,
+    ) -> NodeId {
+        let out_h = in_h * scale_h;
+        let out_w = in_w * scale_w;
+        let total = batch as usize * channels as usize * out_h as usize * out_w as usize;
+        let ty = TensorType::f32(vec![total]);
+        self.add_node(
+            Op::UpsampleNearest {
+                channels,
+                in_h,
+                in_w,
+                scale_h,
+                scale_w,
+            },
+            vec![x],
+            ty,
+        )
+    }
+
     /// Backward of 2x upsample: `[N,C,2H,2W]` → `[N,C,H,W]`.
     pub fn upsample_2x_grad(
         &mut self,
@@ -1690,6 +1966,93 @@ impl Graph {
             },
             vec![input, kernel],
             ty,
+        )
+    }
+
+    /// 2D transposed convolution with separate stride_h, stride_w. Output
+    /// spatial: `(in - 1) * stride - 2 * pad + kernel` per dimension. Required
+    /// by SpectroStream where stride_h=1, stride_w varies per block.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv_transpose_2d_hw(
+        &mut self,
+        input: NodeId,
+        kernel: NodeId,
+        batch: u32,
+        in_channels: u32,
+        in_h: u32,
+        in_w: u32,
+        out_channels: u32,
+        kernel_h: u32,
+        kernel_w: u32,
+        stride_h: u32,
+        stride_w: u32,
+        padding_h: u32,
+        padding_w: u32,
+    ) -> NodeId {
+        let out_h = (in_h - 1) * stride_h + kernel_h - 2 * padding_h;
+        let out_w = (in_w - 1) * stride_w + kernel_w - 2 * padding_w;
+        let out_size = batch as usize * out_channels as usize * out_h as usize * out_w as usize;
+        let ty = TensorType::f32(vec![out_size]);
+        // Conv2dGradInputHW's view: in_channels/in_h/in_w refer to the forward conv's
+        // input — i.e. our ConvT output dimensions. out_channels = forward conv's
+        // out_channels = our ConvT input channels.
+        self.add_node(
+            Op::Conv2dGradInputHW {
+                in_channels: out_channels,
+                in_h: out_h,
+                in_w: out_w,
+                out_channels: in_channels,
+                kernel_h,
+                kernel_w,
+                stride_h,
+                stride_w,
+                padding_h,
+                padding_w,
+            },
+            vec![input, kernel],
+            ty,
+        )
+    }
+
+    /// 2D transposed (fractionally-strided) convolution. Output spatial is
+    /// `(in - 1) * stride - 2 * pad + kernel`. Used by SoundStream/SpectroStream-style
+    /// audio codec decoders to upsample from frame rate to sample rate.
+    ///
+    /// `input` shape: `[N * C_in * H_in * W_in]` flat (NCHW).
+    /// `kernel` shape: `[C_in * C_out * kH * kW]` flat (PyTorch ConvTranspose layout).
+    /// Internally this is `Conv2dGradInput`, whose forward math IS transposed convolution
+    /// and whose kernel layout `[fwd_C_out, fwd_C_in, kH, kW]` equals our `[ConvT_in, ConvT_out, kH, kW]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv_transpose_2d(
+        &mut self,
+        input: NodeId,
+        kernel: NodeId,
+        batch: u32,
+        in_channels: u32,
+        in_h: u32,
+        in_w: u32,
+        out_channels: u32,
+        kernel_h: u32,
+        kernel_w: u32,
+        stride: u32,
+        padding_h: u32,
+        padding_w: u32,
+    ) -> NodeId {
+        let out_h = (in_h - 1) * stride + kernel_h - 2 * padding_h;
+        let out_w = (in_w - 1) * stride + kernel_w - 2 * padding_w;
+        self.conv2d_grad_input(
+            input,
+            kernel,
+            batch,
+            out_channels,
+            out_h,
+            out_w,
+            in_channels,
+            kernel_h,
+            kernel_w,
+            stride,
+            padding_h,
+            padding_w,
         )
     }
 

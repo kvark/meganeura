@@ -62,6 +62,10 @@ pub enum Pw {
     Silu(u16),
     /// `tanh(v)`.
     Tanh(u16),
+    /// Gelu (tanh approximation, matches `shaders/unary.wgsl::gelu`).
+    Gelu(u16),
+    /// Elu: `x if x >= 0 else exp(x) - 1`. Standard ELU with alpha=1.
+    Elu(u16),
 }
 
 impl Pw {
@@ -165,6 +169,16 @@ impl PointwiseDAG {
                 Pw::Tanh(a) => {
                     let _ = write!(out, "tanh(v{})", a);
                 }
+                Pw::Gelu(a) => {
+                    let _ = write!(
+                        out,
+                        "0.5 * v{a} * (1.0 + tanh(0.7978845608f * (v{a} + 0.044715f * v{a} * v{a} * v{a})))",
+                        a = a
+                    );
+                }
+                Pw::Elu(a) => {
+                    let _ = write!(out, "select(exp(v{a}) - 1.0, v{a}, v{a} >= 0.0)", a = a);
+                }
             }
             out.push_str(";\n");
         }
@@ -254,6 +268,8 @@ impl PointwiseDAG {
                 Pw::Sigmoid(a) => Pw::Sigmoid(self_remap[a as usize]),
                 Pw::Silu(a) => Pw::Silu(self_remap[a as usize]),
                 Pw::Tanh(a) => Pw::Tanh(self_remap[a as usize]),
+                Pw::Gelu(a) => Pw::Gelu(self_remap[a as usize]),
+                Pw::Elu(a) => Pw::Elu(self_remap[a as usize]),
             };
             self_remap.push(ops.len() as u16);
             ops.push(remapped);

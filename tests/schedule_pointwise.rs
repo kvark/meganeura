@@ -94,6 +94,24 @@ fn silu_parity() {
 }
 
 #[test]
+fn elu_parity() {
+    let input: Vec<f32> = (0..256).map(|i| (i as f32) * 0.1 - 12.0).collect();
+    assert_parity(&["x"], &[&input], 256, |g, xs| g.elu(xs[0]));
+}
+
+#[test]
+fn elu_matches_reference_formula() {
+    let input: Vec<f32> = (0..256).map(|i| (i as f32) * 0.05 - 6.0).collect();
+    let got = run_once(&["x"], &[&input], 256, &|g, xs| g.elu(xs[0]), false);
+    for (i, &x) in input.iter().enumerate() {
+        let expected = if x >= 0.0 { x } else { x.exp() - 1.0 };
+        let err = (got[i] - expected).abs();
+        let tol = expected.abs() * 1e-5 + 1e-6;
+        assert!(err <= tol, "elu[{i}] x={x}: got {} expected {}", got[i], expected);
+    }
+}
+
+#[test]
 fn chain_relu_neg_parity() {
     // Two unary ops in sequence exercise two separately-generated
     // pointwise pipelines in the same plan.
@@ -134,6 +152,35 @@ fn swiglu_parity() {
     assert_parity(&["gate", "up"], &[&gate, &up], 256, |g, xs| {
         g.swiglu(xs[0], xs[1])
     });
+}
+
+#[test]
+fn geglu_parity() {
+    let gate: Vec<f32> = (0..256).map(|i| (i as f32) * 0.05 - 6.0).collect();
+    let up: Vec<f32> = (0..256).map(|i| (i as f32) * 0.02 - 2.0).collect();
+    assert_parity(&["gate", "up"], &[&gate, &up], 256, |g, xs| {
+        g.geglu(xs[0], xs[1])
+    });
+}
+
+#[test]
+fn geglu_matches_reference_formula() {
+    // gelu(x) tanh-approx: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    fn gelu(x: f32) -> f32 {
+        let g3 = x * x * x;
+        let inner = 0.7978845608_f32 * (x + 0.044715_f32 * g3);
+        0.5 * x * (1.0 + inner.tanh())
+    }
+    let gate: Vec<f32> = (0..256).map(|i| (i as f32) * 0.05 - 6.0).collect();
+    let up: Vec<f32> = (0..256).map(|i| (i as f32) * 0.02 - 2.0).collect();
+    let got = run_once(&["gate", "up"], &[&gate, &up], 256, &|g, xs| g.geglu(xs[0], xs[1]), false);
+    for i in 0..256 {
+        let expected = gelu(gate[i]) * up[i];
+        let err = (got[i] - expected).abs();
+        let tol = expected.abs() * 1e-5 + 1e-6;
+        assert!(err <= tol, "geglu[{i}] gate={} up={}: got {} expected {} (err {})",
+                gate[i], up[i], got[i], expected, err);
+    }
 }
 
 // ---- Fusion pass ----

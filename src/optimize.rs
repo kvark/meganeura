@@ -776,7 +776,13 @@ fn node_to_egglog_expr(node: &Node) -> String {
         Op::BceLoss => format!("(BceLoss n{} n{})", i[0], i[1]),
         Op::Greater => format!("(Greater n{} n{})", i[0], i[1]),
         Op::Silu => format!("(Silu n{})", i[0]),
+        Op::Elu => format!("(Elu n{})", i[0]),
         Op::SwiGLU => format!("(SwiGLU n{} n{})", i[0], i[1]),
+        Op::GeGLU => format!("(GeGLU n{} n{})", i[0], i[1]),
+        Op::T5RelPosBias { .. } => format!("(T5RelPosBias n{})", i[0]),
+        Op::FullAttentionRelPosBias { .. } => {
+            format!("(FullAttentionRelPosBias n{} n{} n{} n{})", i[0], i[1], i[2], i[3])
+        }
         Op::SwiGLUConcat => format!("(SwiGLUConcat n{})", i[0]),
         Op::Gelu => format!("(Gelu n{})", i[0]),
         Op::RmsNorm { .. } => format!("(RmsNorm n{} n{})", i[0], i[1]),
@@ -839,6 +845,10 @@ fn node_to_egglog_expr(node: &Node) -> String {
         Op::SplitB { .. } => format!("(SplitB n{})", i[0]),
         Op::Upsample2x { .. } => format!("(Upsample2x n{})", i[0]),
         Op::Upsample2xGrad { .. } => format!("(Upsample2xGrad n{})", i[0]),
+        Op::UpsampleNearest { .. } => format!("(UpsampleNearest n{})", i[0]),
+        Op::Slice2d { .. } => format!("(Slice2d n{})", i[0]),
+        Op::Conv2dGradInputHW { .. } => format!("(Conv2dGradInputHW n{} n{})", i[0], i[1]),
+        Op::PixelShuffleW { .. } => format!("(PixelShuffleW n{})", i[0]),
         Op::Conv2d { .. } => format!("(Conv2d n{} n{})", i[0], i[1]),
         Op::Conv2dDw { .. } => format!("(Conv2dDw n{} n{})", i[0], i[1]),
         Op::MulPerChannel { .. } => format!("(MulPerChannel n{} n{})", i[0], i[1]),

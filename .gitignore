@@ -7,3 +7,4 @@ data/*.gz
 /.venv/
 /.claude/
 *.spv
+magenta_rt_codec_dump/

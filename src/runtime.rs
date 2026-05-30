@@ -337,6 +337,69 @@ struct RmsNormData {
     params: BiasAddParams, // reuse: rows=len, cols=bias_len, _pad x2
 }
 
+// upsample_nearest: var src, dst, params with separate H/W scale factors.
+#[derive(blade_macros::ShaderData)]
+struct UpsampleNearestData {
+    src: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: UpsampleNearestParams,
+}
+
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct UpsampleNearestParams {
+    batch: u32,
+    channels: u32,
+    in_h: u32,
+    in_w: u32,
+    scale_h: u32,
+    scale_w: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+// pixel_shuffle_w: channel-to-width pixel-shuffle.
+#[derive(blade_macros::ShaderData)]
+struct PixelShuffleWData {
+    src: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: PixelShuffleWParams,
+}
+
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct PixelShuffleWParams {
+    batch: u32,
+    channels: u32,
+    in_h: u32,
+    in_w: u32,
+    factor: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+// slice2d: spatial crop on NCHW.
+#[derive(blade_macros::ShaderData)]
+struct Slice2dData {
+    src: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: Slice2dParams,
+}
+
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct Slice2dParams {
+    batch: u32,
+    channels: u32,
+    in_h: u32,
+    in_w: u32,
+    start_h: u32,
+    end_h: u32,
+    start_w: u32,
+    end_w: u32,
+}
+
 // embedding: var indices (u32), src (table), dst, params
 #[derive(blade_macros::ShaderData)]
 struct EmbeddingData {
@@ -344,6 +407,27 @@ struct EmbeddingData {
     src: blade_graphics::BufferPiece,
     dst: blade_graphics::BufferPiece,
     params: UnaryParams, // seq in len field
+}
+
+// t5_rel_pos: var src (bias_table), dst (out), params
+#[derive(blade_macros::ShaderData)]
+struct T5RelPosBiasData {
+    src: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: T5RelPosBiasParams,
+}
+
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct T5RelPosBiasParams {
+    q_len: u32,
+    kv_len: u32,
+    num_heads: u32,
+    num_buckets: u32,
+    max_distance: u32,
+    bidirectional: u32,
+    _pad0: u32,
+    _pad1: u32,
 }
 
 // rope: var src, dst, params
@@ -484,6 +568,36 @@ struct Conv2dGradInputData {
     weight: blade_graphics::BufferPiece,
     dst: blade_graphics::BufferPiece,
     params: Conv2dParams,
+}
+
+// conv2d_grad_input_hw: same buffers but with separate stride_h/stride_w.
+#[derive(blade_macros::ShaderData)]
+struct Conv2dGradInputHWData {
+    grad_out: blade_graphics::BufferPiece,
+    weight: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: Conv2dHWParams,
+}
+
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct Conv2dHWParams {
+    batch: u32,
+    in_channels: u32,
+    in_h: u32,
+    in_w: u32,
+    out_channels: u32,
+    kernel_h: u32,
+    kernel_w: u32,
+    stride_h: u32,
+    padding_h: u32,
+    out_h: u32,
+    out_w: u32,
+    padding_w: u32,
+    stride_w: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 // conv2d_grad_weight: var grad_out, src, dst, params
@@ -671,6 +785,19 @@ struct MultiHeadAttnData {
     params: AttentionParams,
 }
 
+// full_attention_rel_pos: var src_a (Q), src_b (K), bias (V), src_d (rel_pos_table), dst, lse, params
+// Repurposes AttentionParams's trailing pads as (num_buckets, max_distance, bidirectional).
+#[derive(blade_macros::ShaderData)]
+struct FullAttentionRelPosData {
+    src_a: blade_graphics::BufferPiece,
+    src_b: blade_graphics::BufferPiece,
+    bias: blade_graphics::BufferPiece,
+    src_d: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    lse: blade_graphics::BufferPiece,
+    params: AttentionParams,
+}
+
 // multi_head_attn_grad: var d_out (dO), src_a (Q), src_b (K), bias (V), lse, fwd_dst (O), dst (dQ/dK/dV), params
 #[derive(blade_macros::ShaderData, Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
 #[repr(C)]
@@ -779,6 +906,7 @@ impl Pipelines {
                     | ShaderGroup::FlashGradQCoop
                     | ShaderGroup::FlashGradKV
                     | ShaderGroup::FlashGradKVCoop
+                    | ShaderGroup::FullAttentionRelPosBias
             ) && dispatch.params.len() >= 4
             {
                 attention_head_dim = Some(dispatch.params[3]);
@@ -918,6 +1046,7 @@ impl Pipelines {
                     | ShaderGroup::FlashGradQCoop
                     | ShaderGroup::FlashGradKV
                     | ShaderGroup::FlashGradKVCoop
+                    | ShaderGroup::FullAttentionRelPosBias
             ) {
                 // Use parameterized attention generators with actual head_dim.
                 let hd = attention_head_dim.unwrap_or(64);
@@ -935,6 +1064,9 @@ impl Pipelines {
                     ShaderGroup::FlashGradKV => crate::codegen::generate_flash_grad_kv_module(hd),
                     ShaderGroup::FlashGradKVCoop => {
                         crate::codegen::generate_flash_grad_kv_coop_module(hd)
+                    }
+                    ShaderGroup::FullAttentionRelPosBias => {
+                        crate::codegen::generate_attention_with_rel_pos_module(hd)
                     }
                     _ => crate::codegen::generate_attention_module(hd),
                 };
@@ -1370,10 +1502,13 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         | ShaderEntry::Abs
         | ShaderEntry::Log
         | ShaderEntry::Recip
-        | ShaderEntry::Silu => UnaryData::layout(),
-        ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater | ShaderEntry::SwiGLU => {
-            BinaryData::layout()
-        }
+        | ShaderEntry::Silu
+        | ShaderEntry::Elu => UnaryData::layout(),
+        ShaderEntry::Add
+        | ShaderEntry::Mul
+        | ShaderEntry::Greater
+        | ShaderEntry::SwiGLU
+        | ShaderEntry::GeGLU => BinaryData::layout(),
         ShaderEntry::BiasAdd => BiasAddData::layout(),
         ShaderEntry::SgdUpdate => SgdData::layout(),
         ShaderEntry::AdamUpdate => AdamData::layout(),
@@ -1388,12 +1523,14 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::Embedding => EmbeddingData::layout(),
         ShaderEntry::EmbeddingF16 => EmbeddingData::layout(),
         ShaderEntry::ToF16 => UnaryData::layout(),
+        ShaderEntry::T5RelPosBias => T5RelPosBiasData::layout(),
         ShaderEntry::RoPE | ShaderEntry::RoPEGrad => RoPEData::layout(),
         ShaderEntry::Gelu => UnaryData::layout(),
         ShaderEntry::LayerNorm => LayerNormData::layout(),
         ShaderEntry::MultiHeadAttn
         | ShaderEntry::FlashAttention
         | ShaderEntry::FlashAttentionCoop => MultiHeadAttnData::layout(),
+        ShaderEntry::FullAttentionRelPosBias => FullAttentionRelPosData::layout(),
         ShaderEntry::MultiHeadAttnGradQ
         | ShaderEntry::FlashGradQ
         | ShaderEntry::FlashGradQCoop
@@ -1416,6 +1553,10 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::Concat => BinaryData::layout(),
         ShaderEntry::SplitA | ShaderEntry::SplitB => UnaryData::layout(),
         ShaderEntry::Upsample2x | ShaderEntry::Upsample2xGrad => UnaryData::layout(),
+        ShaderEntry::UpsampleNearest => UpsampleNearestData::layout(),
+        ShaderEntry::Slice2d => Slice2dData::layout(),
+        ShaderEntry::Conv2dGradInputHW => Conv2dGradInputHWData::layout(),
+        ShaderEntry::PixelShuffleW => PixelShuffleWData::layout(),
         ShaderEntry::Conv2d => Conv2dData::layout(),
         ShaderEntry::Conv2dDw => Conv2dDwData::layout(),
         ShaderEntry::MulPerChannel => MulPerChannelData::layout(),
@@ -4028,7 +4169,8 @@ impl Session {
             | ShaderEntry::Log
             | ShaderEntry::Recip
             | ShaderEntry::ToF16
-            | ShaderEntry::Silu => {
+            | ShaderEntry::Silu
+            | ShaderEntry::Elu => {
                 pc.bind(
                     0,
                     &UnaryData {
@@ -4059,7 +4201,11 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater | ShaderEntry::SwiGLU => {
+            ShaderEntry::Add
+            | ShaderEntry::Mul
+            | ShaderEntry::Greater
+            | ShaderEntry::SwiGLU
+            | ShaderEntry::GeGLU => {
                 pc.bind(
                     0,
                     &BinaryData {
@@ -4239,6 +4385,25 @@ impl Session {
                     },
                 );
             }
+            ShaderEntry::T5RelPosBias => {
+                pc.bind(
+                    0,
+                    &T5RelPosBiasData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: T5RelPosBiasParams {
+                            q_len: dispatch.params[0],
+                            kv_len: dispatch.params[1],
+                            num_heads: dispatch.params[2],
+                            num_buckets: dispatch.params[3],
+                            max_distance: dispatch.params[4],
+                            bidirectional: dispatch.params[5],
+                            _pad0: 0,
+                            _pad1: 0,
+                        },
+                    },
+                );
+            }
             ShaderEntry::RoPE | ShaderEntry::RoPEGrad => {
                 pc.bind(
                     0,
@@ -4310,6 +4475,29 @@ impl Session {
                             _pad0: 0,
                             _pad1: 0,
                             _pad2: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::FullAttentionRelPosBias => {
+                pc.bind(
+                    0,
+                    &FullAttentionRelPosData {
+                        src_a: buf(dispatch.input_buffers[0]),
+                        src_b: buf(dispatch.input_buffers[1]),
+                        bias: buf(dispatch.input_buffers[2]),
+                        src_d: buf(dispatch.input_buffers[3]),
+                        dst: buf(dispatch.output_buffer),
+                        lse: buf(dispatch.extra_outputs[0]),
+                        params: AttentionParams {
+                            q_seq: dispatch.params[0],
+                            kv_seq: dispatch.params[1],
+                            packed_heads: dispatch.params[2],
+                            head_dim: dispatch.params[3],
+                            window_size: dispatch.params[4],
+                            _pad0: dispatch.params[5], // num_buckets
+                            _pad1: dispatch.params[6], // max_distance
+                            _pad2: dispatch.params[7], // bidirectional
                         },
                     },
                 );
@@ -4632,6 +4820,95 @@ impl Session {
                             _pad0: p[1],
                             _pad1: p[2],
                             _pad2: p[3],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::UpsampleNearest => {
+                let p = &dispatch.params;
+                pc.bind(
+                    0,
+                    &UpsampleNearestData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: UpsampleNearestParams {
+                            batch: p[0],
+                            channels: p[1],
+                            in_h: p[2],
+                            in_w: p[3],
+                            scale_h: p[4],
+                            scale_w: p[5],
+                            _pad0: 0,
+                            _pad1: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::Slice2d => {
+                let p = &dispatch.params;
+                pc.bind(
+                    0,
+                    &Slice2dData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: Slice2dParams {
+                            batch: p[0],
+                            channels: p[1],
+                            in_h: p[2],
+                            in_w: p[3],
+                            start_h: p[4],
+                            end_h: p[5],
+                            start_w: p[6],
+                            end_w: p[7],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::PixelShuffleW => {
+                let p = &dispatch.params;
+                pc.bind(
+                    0,
+                    &PixelShuffleWData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: PixelShuffleWParams {
+                            batch: p[0],
+                            channels: p[1],
+                            in_h: p[2],
+                            in_w: p[3],
+                            factor: p[4],
+                            _pad0: 0,
+                            _pad1: 0,
+                            _pad2: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::Conv2dGradInputHW => {
+                let p = &dispatch.params;
+                pc.bind(
+                    0,
+                    &Conv2dGradInputHWData {
+                        grad_out: buf(dispatch.input_buffers[0]),
+                        weight: buf(dispatch.input_buffers[1]),
+                        dst: buf(dispatch.output_buffer),
+                        params: Conv2dHWParams {
+                            batch: p[0],
+                            in_channels: p[1],
+                            in_h: p[2],
+                            in_w: p[3],
+                            out_channels: p[4],
+                            kernel_h: p[5],
+                            kernel_w: p[6],
+                            stride_h: p[7],
+                            padding_h: p[8],
+                            out_h: p[9],
+                            out_w: p[10],
+                            padding_w: p[11],
+                            stride_w: p[12],
+                            _pad0: 0,
+                            _pad1: 0,
+                            _pad2: 0,
                         },
                     },
                 );

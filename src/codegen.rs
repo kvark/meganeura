@@ -306,6 +306,11 @@ pub enum ShaderGroup {
     Embedding,
     EmbeddingF16,
     ToF16,
+    /// T5 relative position bias materialization (small one-shot kernel).
+    T5RelPosBias,
+    /// Fused full attention + T5 rel-pos bias (extends MultiHeadAttn with a
+    /// per-head bias table looked up by `bucket(q_pos - k_pos)`).
+    FullAttentionRelPosBias,
     RoPE,
     RoPEGrad,
     LayerNorm,
@@ -347,6 +352,15 @@ pub enum ShaderGroup {
     Split,
     Upsample,
     UpsampleGrad,
+    /// Nearest-neighbor upsample with configurable H/W scale factors.
+    UpsampleNearest,
+    /// 2D spatial crop on NCHW.
+    Slice2d,
+    /// Conv2d backward w.r.t. input with separate stride_h / stride_w.
+    /// Used by SpectroStream's conv-transpose blocks where stride_h=1.
+    Conv2dGradInputHW,
+    /// Channel-to-width pixel shuffle (NCHW).
+    PixelShuffleW,
     Conv2d,
     /// Depthwise Conv2d (groups == channels). Used by EfficientNet MBConv.
     Conv2dDw,
@@ -418,6 +432,12 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::Embedding => parse_wgsl(include_str!("shaders/embedding.wgsl")),
         ShaderGroup::EmbeddingF16 => parse_wgsl(include_str!("shaders/embedding_f16.wgsl")),
         ShaderGroup::ToF16 => parse_wgsl(include_str!("shaders/to_f16.wgsl")),
+        ShaderGroup::T5RelPosBias => parse_wgsl(include_str!("shaders/t5_rel_pos.wgsl")),
+        ShaderGroup::FullAttentionRelPosBias => {
+            // Default head_dim=64 fallback; runtime calls
+            // generate_attention_with_rel_pos_module(head_dim) directly.
+            generate_attention_with_rel_pos_module(64)
+        }
         ShaderGroup::RoPE => parse_wgsl(include_str!("shaders/rope.wgsl")),
         ShaderGroup::RoPEGrad => parse_wgsl(include_str!("shaders/rope_grad.wgsl")),
         ShaderGroup::LayerNorm => parse_wgsl(include_str!("shaders/layer_norm.wgsl")),
@@ -461,6 +481,10 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::Split => parse_wgsl(include_str!("shaders/split.wgsl")),
         ShaderGroup::Upsample => parse_wgsl(include_str!("shaders/upsample.wgsl")),
         ShaderGroup::UpsampleGrad => parse_wgsl(include_str!("shaders/upsample_grad.wgsl")),
+        ShaderGroup::UpsampleNearest => parse_wgsl(include_str!("shaders/upsample_nearest.wgsl")),
+        ShaderGroup::Slice2d => parse_wgsl(include_str!("shaders/slice2d.wgsl")),
+        ShaderGroup::Conv2dGradInputHW => parse_wgsl(include_str!("shaders/conv2d_grad_input_hw.wgsl")),
+        ShaderGroup::PixelShuffleW => parse_wgsl(include_str!("shaders/pixel_shuffle_w.wgsl")),
         ShaderGroup::Conv2d => parse_wgsl(include_str!("shaders/conv2d.wgsl")),
         ShaderGroup::Conv2dDw => parse_wgsl(include_str!("shaders/conv2d_dw.wgsl")),
         ShaderGroup::MulPerChannel => parse_wgsl(include_str!("shaders/mul_per_channel.wgsl")),
@@ -1786,6 +1810,211 @@ pub fn generate_attention_module(head_dim: u32) -> ShaderModule {
     let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
         panic!(
             "generated unified attention WGSL failed to parse:\n{}\n---\n{}",
+            e, src
+        )
+    });
+    ShaderModule {
+        module,
+        source: src,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unified attention + T5 relative position bias.
+//
+// Variant of `generate_attention_module` that adds a per-head learned bias
+// (from a [num_heads, num_buckets] table) to QK^T before softmax. The bucket
+// is computed inline from `bucket(q_pos - k_pos)` so the table stays small
+// (typically 16*32 = 512 floats per layer) and no [H,Q,K] tensor is materialized.
+//
+// Bidirectional vs causal: `bidirectional` is a runtime param, allowing one
+// shader to serve T5 encoder (bidir) and decoder self-attn (causal kv_seq=0).
+//
+// Params (repurposes the 3 trailing pads of AttentionParams):
+//   window_size: kept at 0 (no sliding window yet for this variant)
+//   _pad0     → num_buckets
+//   _pad1     → max_distance
+//   _pad2     → bidirectional (0 or 1)
+// ---------------------------------------------------------------------------
+
+/// Generate a BKV=8 tiled attention shader with T5 relative position bias.
+///
+/// Inputs (storage bindings in order):
+///   src_a = Q [q_seq, num_heads*head_dim]
+///   src_b = K [kv_seq, num_kv_heads*head_dim]
+///   bias  = V [kv_seq, num_kv_heads*head_dim]  (named "bias" for historical reasons)
+///   src_d = rel_pos_table [num_heads, num_buckets]
+///   dst   = output O
+///   lse   = LSE
+pub fn generate_attention_with_rel_pos_module(head_dim: u32) -> ShaderModule {
+    use std::fmt::Write;
+    assert!(
+        head_dim.is_power_of_two() && head_dim >= 2,
+        "attention head_dim must be a power of 2 ≥ 2, got {head_dim}"
+    );
+
+    let hd = head_dim;
+    let bkv: u32 = 8;
+    let mut src = String::new();
+
+    src.push_str(
+        "struct Params {\n    q_seq: u32,\n    kv_seq: u32,\n    packed_heads: u32,\n    head_dim: u32,\n    window_size: u32,\n    num_buckets: u32,\n    max_distance: u32,\n    bidirectional: u32,\n}\n\n",
+    );
+    src.push_str("var<storage> src_a: array<f32>;\n");
+    src.push_str("var<storage> src_b: array<f32>;\n");
+    src.push_str("var<storage> bias: array<f32>;\n");
+    src.push_str("var<storage> src_d: array<f32>;\n"); // rel_pos_table
+    src.push_str("var<storage, read_write> dst: array<f32>;\n");
+    src.push_str("var<storage, read_write> lse: array<f32>;\n");
+    src.push_str("var<uniform> params: Params;\n\n");
+
+    let _ = writeln!(src, "var<workgroup> wg_scores: array<f32, {}>;\n", bkv * hd);
+    let _ = writeln!(src, "var<workgroup> wg_dot: array<f32, {}>;\n", hd);
+
+    // tree_reduce_8 + tree_reduce: identical to base attention.
+    src.push_str("fn tree_reduce_8(tid: u32) {\n");
+    let mut stride = hd / 2;
+    while stride > 0 {
+        src.push_str("    workgroupBarrier();\n");
+        let _ = writeln!(src, "    if tid < {stride}u {{");
+        let _ = writeln!(src, "        for (var i = 0u; i < {bkv}u; i++) {{");
+        let _ = writeln!(
+            src,
+            "            wg_scores[i * {hd}u + tid] += wg_scores[i * {hd}u + tid + {stride}u];"
+        );
+        src.push_str("        }\n    }\n");
+        stride /= 2;
+    }
+    src.push_str("    workgroupBarrier();\n}\n\n");
+
+    src.push_str("fn tree_reduce(tid: u32) {\n");
+    stride = hd / 2;
+    while stride > 0 {
+        src.push_str("    workgroupBarrier();\n");
+        let _ = writeln!(
+            src,
+            "    if tid < {stride}u {{ wg_dot[tid] += wg_dot[tid + {stride}u]; }}"
+        );
+        stride /= 2;
+    }
+    src.push_str("    workgroupBarrier();\n}\n\n");
+
+    // T5 relative position bucket — mirrors flaxformer reference and our
+    // standalone shaders/t5_rel_pos.wgsl. Inputs: q-k as signed delta.
+    src.push_str(
+        "fn rel_pos_bucket(q_minus_k: i32, num_buckets: u32, max_distance: u32, bidirectional: u32) -> u32 {\n",
+    );
+    src.push_str("    var n: i32 = q_minus_k;\n");
+    src.push_str("    var ret: u32 = 0u;\n");
+    src.push_str("    var nb: u32 = num_buckets;\n");
+    src.push_str("    if bidirectional != 0u {\n");
+    src.push_str("        nb = nb / 2u;\n");
+    src.push_str("        if n < 0 { ret = nb; n = -n; }\n");
+    src.push_str("    } else {\n");
+    src.push_str("        if n < 0 { n = 0; }\n");
+    src.push_str("    }\n");
+    src.push_str("    let max_exact: u32 = nb / 2u;\n");
+    src.push_str("    let n_u: u32 = u32(n);\n");
+    src.push_str("    if n_u < max_exact { return ret + n_u; }\n");
+    src.push_str("    let log_n = log(f32(n_u) / f32(max_exact));\n");
+    src.push_str("    let log_max = log(f32(max_distance) / f32(max_exact));\n");
+    src.push_str("    let val_large = u32(f32(max_exact) + log_n / log_max * f32(nb - max_exact));\n");
+    src.push_str("    return ret + min(val_large, nb - 1u);\n");
+    src.push_str("}\n\n");
+
+    let _ = writeln!(src, "@compute @workgroup_size({hd})");
+    src.push_str(
+        "fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n",
+    );
+    src.push_str("    let pos = wgid.x;\n");
+    src.push_str("    let head = wgid.y;\n");
+    src.push_str("    let tid = lid.x;\n");
+    src.push_str("    let q_seq = params.q_seq;\n");
+    src.push_str("    let kv_seq = params.kv_seq;\n");
+    src.push_str("    let num_heads = params.packed_heads >> 16u;\n");
+    src.push_str("    let num_kv_heads = params.packed_heads & 0xFFFFu;\n");
+    src.push_str("    let head_dim = params.head_dim;\n");
+    src.push_str("    let num_buckets = params.num_buckets;\n");
+    src.push_str("    let max_distance = params.max_distance;\n");
+    src.push_str("    let bidirectional = params.bidirectional;\n");
+    src.push_str("    if pos >= q_seq || head >= num_heads { return; }\n\n");
+
+    src.push_str("    let kv_len = select(kv_seq, pos + 1u, kv_seq == 0u);\n");
+    src.push_str("    let window_size = params.window_size;\n");
+    src.push_str(
+        "    let kv_start = select(0u, kv_len - min(kv_len, window_size), window_size > 0u);\n\n",
+    );
+
+    src.push_str("    let kv_head = head / (num_heads / num_kv_heads);\n");
+    src.push_str("    let kv_head_off = kv_head * head_dim;\n");
+    src.push_str("    let kv_dim = num_kv_heads * head_dim;\n");
+    src.push_str("    let scale = inverseSqrt(f32(head_dim));\n");
+    src.push_str("    let q_base = pos * (num_heads * head_dim) + head * head_dim;\n");
+    src.push_str("    let q_val = src_a[q_base + tid];\n");
+    src.push_str("    let bias_row_off = head * num_buckets;\n\n");
+
+    src.push_str("    var my_out = 0.0;\n");
+    src.push_str("    var max_score = -1e30;\n");
+    src.push_str("    var sum_exp = 0.0;\n\n");
+
+    let _ = writeln!(src, "    let kv_range = kv_len - kv_start;");
+    let _ = writeln!(
+        src,
+        "    let tile_end = kv_start + (kv_range / {bkv}u) * {bkv}u;"
+    );
+    src.push_str("    var t = kv_start;\n");
+    let _ = writeln!(src, "    for (; t < tile_end; t += {bkv}u) {{");
+    let _ = writeln!(src, "        for (var i = 0u; i < {bkv}u; i++) {{");
+    src.push_str("            let k_base = (t + i) * kv_dim + kv_head_off;\n");
+    let _ = writeln!(
+        src,
+        "            wg_scores[i * {hd}u + tid] = q_val * src_b[k_base + tid];"
+    );
+    src.push_str("        }\n");
+    src.push_str("        tree_reduce_8(tid);\n\n");
+    let _ = writeln!(src, "        for (var i = 0u; i < {bkv}u; i++) {{");
+    let _ = writeln!(src, "            let k_pos = t + i;");
+    let _ = writeln!(src, "            let bucket = rel_pos_bucket(i32(pos) - i32(k_pos), num_buckets, max_distance, bidirectional);");
+    let _ = writeln!(src, "            let bias_val = src_d[bias_row_off + bucket];");
+    let _ = writeln!(src, "            let score = wg_scores[i * {hd}u] * scale + bias_val;");
+    src.push_str("            let new_max = max(max_score, score);\n");
+    src.push_str("            let correction = exp(max_score - new_max);\n");
+    src.push_str("            let weight = exp(score - new_max);\n");
+    src.push_str("            sum_exp = sum_exp * correction + weight;\n");
+    src.push_str("            let v_base = k_pos * kv_dim + kv_head_off;\n");
+    src.push_str("            my_out = my_out * correction + weight * bias[v_base + tid];\n");
+    src.push_str("            max_score = new_max;\n");
+    src.push_str("        }\n");
+    src.push_str("    }\n\n");
+
+    src.push_str("    for (; t < kv_len; t++) {\n");
+    src.push_str("        let k_base = t * kv_dim + kv_head_off;\n");
+    src.push_str("        wg_dot[tid] = q_val * src_b[k_base + tid];\n");
+    src.push_str("        tree_reduce(tid);\n");
+    src.push_str("        let bucket = rel_pos_bucket(i32(pos) - i32(t), num_buckets, max_distance, bidirectional);\n");
+    src.push_str("        let bias_val = src_d[bias_row_off + bucket];\n");
+    src.push_str("        let score = wg_dot[0] * scale + bias_val;\n\n");
+    src.push_str("        let new_max = max(max_score, score);\n");
+    src.push_str("        let correction = exp(max_score - new_max);\n");
+    src.push_str("        let weight = exp(score - new_max);\n");
+    src.push_str("        sum_exp = sum_exp * correction + weight;\n");
+    src.push_str("        my_out = my_out * correction + weight * bias[k_base + tid];\n");
+    src.push_str("        max_score = new_max;\n");
+    src.push_str("    }\n\n");
+
+    src.push_str("    let safe_sum = select(sum_exp, 1.0, sum_exp == 0.0);\n");
+    src.push_str("    dst[q_base + tid] = my_out / safe_sum;\n\n");
+
+    src.push_str("    if tid == 0u {\n");
+    src.push_str("        let idx = (pos * num_heads + head) * 2u;\n");
+    src.push_str("        lse[idx] = max_score;\n");
+    src.push_str("        lse[idx + 1u] = select(log(sum_exp), -1e30, sum_exp == 0.0);\n");
+    src.push_str("    }\n");
+    src.push_str("}\n");
+
+    let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
+        panic!(
+            "generated rel-pos attention WGSL failed to parse:\n{}\n---\n{}",
             e, src
         )
     });
@@ -4721,6 +4950,11 @@ mod tests {
                 ShaderGroup::ToF16,
                 naga::valid::Capabilities::SHADER_FLOAT16,
             ),
+            (ShaderGroup::T5RelPosBias, naga::valid::Capabilities::empty()),
+            (
+                ShaderGroup::FullAttentionRelPosBias,
+                naga::valid::Capabilities::empty(),
+            ),
             (ShaderGroup::RoPE, naga::valid::Capabilities::empty()),
             (ShaderGroup::RoPEGrad, naga::valid::Capabilities::empty()),
             (ShaderGroup::LayerNorm, naga::valid::Capabilities::empty()),
@@ -4907,6 +5141,8 @@ mod tests {
             (ShaderGroup::Embedding, empty),
             (ShaderGroup::EmbeddingF16, f16),
             (ShaderGroup::ToF16, f16),
+            (ShaderGroup::T5RelPosBias, empty),
+            (ShaderGroup::FullAttentionRelPosBias, empty),
             (ShaderGroup::RoPE, empty),
             (ShaderGroup::RoPEGrad, empty),
             (ShaderGroup::LayerNorm, empty),
@@ -5017,17 +5253,20 @@ mod tests {
                 | ShaderEntry::Log
                 | ShaderEntry::Recip
                 | ShaderEntry::Silu
+                | ShaderEntry::Elu
                 | ShaderEntry::Gelu
                 | ShaderEntry::Tanh
                 | ShaderEntry::SumAll
                 | ShaderEntry::MeanAll
                 | ShaderEntry::SumRows
                 | ShaderEntry::RoPE
-                | ShaderEntry::RoPEGrad => vec!["src", "dst", "params"],
+                | ShaderEntry::RoPEGrad
+                | ShaderEntry::T5RelPosBias => vec!["src", "dst", "params"],
                 ShaderEntry::Add
                 | ShaderEntry::Mul
                 | ShaderEntry::Greater
-                | ShaderEntry::SwiGLU => {
+                | ShaderEntry::SwiGLU
+                | ShaderEntry::GeGLU => {
                     vec!["src_a", "src_b", "dst", "params"]
                 }
                 ShaderEntry::BiasAdd => vec!["src", "bias", "dst", "params"],
@@ -5049,6 +5288,9 @@ mod tests {
                 | ShaderEntry::FlashAttention
                 | ShaderEntry::FlashAttentionCoop => {
                     vec!["src_a", "src_b", "bias", "dst", "lse", "params"]
+                }
+                ShaderEntry::FullAttentionRelPosBias => {
+                    vec!["src_a", "src_b", "bias", "src_d", "dst", "lse", "params"]
                 }
                 ShaderEntry::MultiHeadAttnGradQ
                 | ShaderEntry::FlashGradQ
@@ -5099,9 +5341,13 @@ mod tests {
                 }
                 ShaderEntry::Concat => vec!["src_a", "src_b", "dst", "params"],
                 ShaderEntry::SplitA | ShaderEntry::SplitB => vec!["src", "dst", "params"],
-                ShaderEntry::Upsample2x | ShaderEntry::Upsample2xGrad => {
+                ShaderEntry::Upsample2x | ShaderEntry::Upsample2xGrad | ShaderEntry::UpsampleNearest | ShaderEntry::Slice2d => {
                     vec!["src", "dst", "params"]
                 }
+                ShaderEntry::Conv2dGradInputHW => {
+                    vec!["grad_out", "weight", "dst", "params"]
+                }
+                ShaderEntry::PixelShuffleW => vec!["src", "dst", "params"],
                 ShaderEntry::Conv2d | ShaderEntry::Conv2dDw => {
                     vec!["src", "weight", "dst", "params"]
                 }
@@ -5174,8 +5420,11 @@ mod tests {
             ShaderEntry::CrossEntropyLoss,
             ShaderEntry::Transpose,
             ShaderEntry::Silu,
+            ShaderEntry::Elu,
             ShaderEntry::RmsNorm,
             ShaderEntry::Embedding,
+            ShaderEntry::T5RelPosBias,
+            ShaderEntry::FullAttentionRelPosBias,
             ShaderEntry::RoPE,
             ShaderEntry::RoPEGrad,
             ShaderEntry::Gelu,
@@ -5215,6 +5464,10 @@ mod tests {
             ShaderEntry::SplitB,
             ShaderEntry::Upsample2x,
             ShaderEntry::Upsample2xGrad,
+            ShaderEntry::UpsampleNearest,
+            ShaderEntry::Slice2d,
+            ShaderEntry::Conv2dGradInputHW,
+            ShaderEntry::PixelShuffleW,
             ShaderEntry::Conv2d,
             ShaderEntry::Conv2dDw,
             ShaderEntry::MulPerChannel,
