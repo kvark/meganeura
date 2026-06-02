@@ -304,6 +304,8 @@ pub enum ShaderGroup {
     CrossEntropy,
     RmsNorm,
     Embedding,
+    EmbeddingF16,
+    ToF16,
     RoPE,
     RoPEGrad,
     LayerNorm,
@@ -413,6 +415,8 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::CrossEntropy => parse_wgsl(include_str!("shaders/cross_entropy.wgsl")),
         ShaderGroup::RmsNorm => parse_wgsl(include_str!("shaders/rms_norm.wgsl")),
         ShaderGroup::Embedding => parse_wgsl(include_str!("shaders/embedding.wgsl")),
+        ShaderGroup::EmbeddingF16 => parse_wgsl(include_str!("shaders/embedding_f16.wgsl")),
+        ShaderGroup::ToF16 => parse_wgsl(include_str!("shaders/to_f16.wgsl")),
         ShaderGroup::RoPE => parse_wgsl(include_str!("shaders/rope.wgsl")),
         ShaderGroup::RoPEGrad => parse_wgsl(include_str!("shaders/rope_grad.wgsl")),
         ShaderGroup::LayerNorm => parse_wgsl(include_str!("shaders/layer_norm.wgsl")),
@@ -537,6 +541,9 @@ pub fn generate_wgsl(group: ShaderGroup) -> String {
         | ShaderGroup::FusedRmsNormMatMulCoop => {
             naga::valid::Capabilities::COOPERATIVE_MATRIX
                 | naga::valid::Capabilities::SHADER_FLOAT16
+        }
+        ShaderGroup::EmbeddingF16 | ShaderGroup::ToF16 => {
+            naga::valid::Capabilities::SHADER_FLOAT16
         }
         _ => naga::valid::Capabilities::empty(),
     };
@@ -4689,6 +4696,14 @@ mod tests {
             ),
             (ShaderGroup::RmsNorm, naga::valid::Capabilities::empty()),
             (ShaderGroup::Embedding, naga::valid::Capabilities::empty()),
+            (
+                ShaderGroup::EmbeddingF16,
+                naga::valid::Capabilities::SHADER_FLOAT16,
+            ),
+            (
+                ShaderGroup::ToF16,
+                naga::valid::Capabilities::SHADER_FLOAT16,
+            ),
             (ShaderGroup::RoPE, naga::valid::Capabilities::empty()),
             (ShaderGroup::RoPEGrad, naga::valid::Capabilities::empty()),
             (ShaderGroup::LayerNorm, naga::valid::Capabilities::empty()),
@@ -4848,6 +4863,7 @@ mod tests {
     #[cfg(not(target_vendor = "apple"))]
     fn all_shaders_compile_to_spirv() {
         let empty = naga::valid::Capabilities::empty();
+        let f16 = naga::valid::Capabilities::SHADER_FLOAT16;
         let coop = naga::valid::Capabilities::COOPERATIVE_MATRIX
             | naga::valid::Capabilities::SHADER_FLOAT16;
         let groups: &[(ShaderGroup, naga::valid::Capabilities)] = &[
@@ -4872,6 +4888,8 @@ mod tests {
             (ShaderGroup::CrossEntropy, empty),
             (ShaderGroup::RmsNorm, empty),
             (ShaderGroup::Embedding, empty),
+            (ShaderGroup::EmbeddingF16, f16),
+            (ShaderGroup::ToF16, f16),
             (ShaderGroup::RoPE, empty),
             (ShaderGroup::RoPEGrad, empty),
             (ShaderGroup::LayerNorm, empty),
@@ -5007,6 +5025,8 @@ mod tests {
                 ShaderEntry::Transpose => vec!["src", "dst", "params"],
                 ShaderEntry::RmsNorm => vec!["src", "bias", "dst", "params"],
                 ShaderEntry::Embedding => vec!["indices", "src", "dst", "params"],
+                ShaderEntry::EmbeddingF16 => vec!["indices", "src", "dst", "params"],
+                ShaderEntry::ToF16 => vec!["src", "dst", "params"],
                 ShaderEntry::LayerNorm => vec!["src", "src_b", "bias", "dst", "params"],
                 ShaderEntry::MultiHeadAttn
                 | ShaderEntry::FlashAttention

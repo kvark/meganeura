@@ -187,6 +187,10 @@ pub enum Op {
     // Embedding lookup: indices → table rows
     // inputs: [indices (U32), table (F32)]
     Embedding,
+    // inputs: [indices (U32), table (F16)] → f32 output. f16-table gather.
+    EmbeddingF16,
+    // input: [x (F32)] → f16. Cast f32→f16; backward = identity.
+    ToF16,
 
     // Rotary position embeddings
     // inputs: [x] or [x, pos_offset_input]
@@ -1116,6 +1120,43 @@ impl Graph {
         let hidden = tbl_shape[1];
         let ty = TensorType::f32(vec![seq_len, hidden]);
         self.add_node(Op::Embedding, vec![indices, table], ty)
+    }
+
+    /// Cast an f32 tensor to f16 (same shape, `DType::F16`). Forward
+    /// rounds to half precision; backward is the identity (the standard
+    /// mixed-precision "straight-through" — f32 master weights, f16 copy
+    /// for a bandwidth-bound forward read). Pair with [`Self::embedding_f16`]
+    /// to halve the bytes read by a scattered gather.
+    pub fn to_f16(&mut self, x: NodeId) -> NodeId {
+        let shape = self.node(x).ty.shape.clone();
+        let ty = TensorType::new(shape, DType::F16);
+        self.add_node(Op::ToF16, vec![x], ty)
+    }
+
+    /// Embedding gather from an **f16** table → f32 output. Same as
+    /// [`Self::embedding`] but the table is `DType::F16` (half the bytes
+    /// read per gathered element). Backward scatter-adds f32 gradients
+    /// into the table's grad (so it composes with `to_f16` → the f32
+    /// parameter).
+    pub fn embedding_f16(&mut self, indices: NodeId, table: NodeId) -> NodeId {
+        let idx_shape = &self.node(indices).ty.shape;
+        let tbl = self.node(table);
+        assert_eq!(
+            self.node(indices).ty.dtype,
+            DType::U32,
+            "embedding_f16 indices must be U32"
+        );
+        assert_eq!(
+            tbl.ty.dtype,
+            DType::F16,
+            "embedding_f16 table must be F16 (use to_f16)"
+        );
+        assert_eq!(idx_shape.len(), 1, "embedding_f16 indices must be 1D");
+        assert_eq!(tbl.ty.shape.len(), 2, "embedding_f16 table must be 2D");
+        let seq_len = idx_shape[0];
+        let hidden = tbl.ty.shape[1];
+        let ty = TensorType::f32(vec![seq_len, hidden]);
+        self.add_node(Op::EmbeddingF16, vec![indices, table], ty)
     }
 
     /// Scatter-add: accumulate `src[i]` rows into `output[indices[i]]`.

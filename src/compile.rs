@@ -100,6 +100,8 @@ pub enum ShaderEntry {
     SwiGLU,
     RmsNorm,
     Embedding,
+    EmbeddingF16,
+    ToF16,
     RoPE,
     RoPEGrad,
     Gelu,
@@ -235,6 +237,8 @@ impl ShaderEntry {
             ShaderEntry::SwiGLU => ShaderGroup::Binary,
             ShaderEntry::RmsNorm => ShaderGroup::RmsNorm,
             ShaderEntry::Embedding => ShaderGroup::Embedding,
+            ShaderEntry::EmbeddingF16 => ShaderGroup::EmbeddingF16,
+            ShaderEntry::ToF16 => ShaderGroup::ToF16,
             ShaderEntry::RoPE => ShaderGroup::RoPE,
             ShaderEntry::RoPEGrad => ShaderGroup::RoPEGrad,
             ShaderEntry::Gelu => ShaderGroup::Unary,
@@ -339,6 +343,8 @@ impl ShaderEntry {
             ShaderEntry::SwiGLU => "swiglu",
             ShaderEntry::RmsNorm => "main",
             ShaderEntry::Embedding => "main",
+            ShaderEntry::EmbeddingF16 => "main",
+            ShaderEntry::ToF16 => "main",
             ShaderEntry::RoPE => "main",
             ShaderEntry::RoPEGrad => "main",
             ShaderEntry::Gelu => "gelu",
@@ -1946,6 +1952,45 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![seq, hidden, 0, 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
+            Op::EmbeddingF16 => {
+                // Same as Embedding but the table buffer is f16.
+                let indices = self.get_buffer(node.inputs[0]);
+                let table = self.get_buffer(node.inputs[1]);
+                let idx_shape = &self.graph.node(node.inputs[0]).ty.shape;
+                let tbl_shape = &self.graph.node(node.inputs[1]).ty.shape;
+                let seq = idx_shape[0] as u32;
+                let hidden = tbl_shape[1] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::EmbeddingF16,
+                    workgroups: [seq * hidden.div_ceil(256), 1, 1],
+                    input_buffers: vec![indices, table],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![seq, hidden, 0, 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
+            Op::ToF16 => {
+                // Elementwise f32 → f16 cast. UnaryData layout (src, dst,
+                // params); dst is an f16 buffer.
+                let src = self.get_buffer(node.inputs[0]);
+                let len = node.ty.num_elements() as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::ToF16,
+                    workgroups: [len.div_ceil(256), 1, 1],
+                    input_buffers: vec![src],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![len, 0, 0, 0],
                     use_coop: false,
                     use_small_tiles: false,
                     ..Default::default()

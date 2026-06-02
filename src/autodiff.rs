@@ -572,6 +572,22 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let grad_table = graph.scatter_add(indices, grad_output, vocab_size);
                 accumulate_grad(&mut graph, &mut grads, table, grad_table);
             }
+            Op::EmbeddingF16 => {
+                // Same scatter-add as Embedding; gradients are f32 (they
+                // flow back through ToF16 to the f32 master parameter).
+                let indices = node.inputs[0];
+                let table = node.inputs[1];
+                let vocab_size = forward.nodes()[table as usize].ty.shape[0];
+                let grad_table = graph.scatter_add(indices, grad_output, vocab_size);
+                accumulate_grad(&mut graph, &mut grads, table, grad_table);
+            }
+            Op::ToF16 => {
+                // Straight-through: the f16 round is treated as identity for
+                // the backward, so the f32 master parameter receives the
+                // full f32 gradient (standard mixed-precision).
+                let x = node.inputs[0];
+                accumulate_grad(&mut graph, &mut grads, x, grad_output);
+            }
             Op::Conv2d {
                 in_channels,
                 in_h,
