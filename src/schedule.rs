@@ -356,6 +356,9 @@ pub enum KernelTemplate {
         n_per_elem: u8,
         /// Number of per-row broadcast input streams. Loaded at `[row]`.
         n_per_row: u8,
+        /// Per-element gather flags (see [`ReductionKernel::gather_elem`]).
+        /// Empty = all direct.
+        gather_elem: Vec<bool>,
         /// Workgroup size (threads per row). Must be a power of 2 — the
         /// tree reduction assumes it.
         grid: GridShape,
@@ -396,6 +399,17 @@ pub struct ReductionKernel {
     pub n_per_elem: u8,
     pub n_per_row: u8,
     pub workgroup_size: u32,
+    /// Which per-element streams are **gathers**: stream `i` loads
+    /// `name[name_idx[row] * inner + col]` (the row is indirected through
+    /// a `u32` indices buffer `{name}_idx`) instead of the direct
+    /// `name[row * inner + col]`. Empty = no gathers (all direct). When
+    /// non-empty, length must equal `n_per_elem`. Lets a fused reduction
+    /// absorb an `Embedding`-style indexed load of its reduced axis (e.g.
+    /// SH `sum_k coeff[cell[row]*K+k]·basis[pix[row]*K+k]`). Gather is only
+    /// valid for per-element streams whose gathered axis IS the reduced
+    /// axis (table row-stride == inner).
+    #[serde(default)]
+    pub gather_elem: Vec<bool>,
 }
 
 impl ReductionKernel {
@@ -414,6 +428,7 @@ impl ReductionKernel {
             epilogue: self.epilogue.clone(),
             n_per_elem: self.n_per_elem,
             n_per_row: self.n_per_row,
+            gather_elem: self.gather_elem.clone(),
             grid: GridShape {
                 workgroup_size: self.workgroup_size,
             },
@@ -453,8 +468,17 @@ pub fn lower(t: &KernelTemplate) -> ShaderModule {
             ref epilogue,
             n_per_elem,
             n_per_row,
+            ref gather_elem,
             grid,
-        } => lower_reduction(op, prologue, epilogue.as_ref(), n_per_elem, n_per_row, grid),
+        } => lower_reduction(
+            op,
+            prologue,
+            epilogue.as_ref(),
+            n_per_elem,
+            n_per_row,
+            gather_elem,
+            grid,
+        ),
         KernelTemplate::Attention {
             mask,
             head_dim,
@@ -510,12 +534,20 @@ fn lower_reduction(
     epilogue: Option<&ReductionEpilogue>,
     n_per_elem: u8,
     n_per_row: u8,
+    gather_elem: &[bool],
     grid: GridShape,
 ) -> ShaderModule {
     assert!(
         n_per_elem >= 1,
         "reduction must have at least one per-element input stream"
     );
+    assert!(
+        gather_elem.is_empty() || gather_elem.len() == n_per_elem as usize,
+        "gather_elem must be empty or length n_per_elem ({}), got {}",
+        n_per_elem,
+        gather_elem.len(),
+    );
+    let is_gather = |i: usize| gather_elem.get(i).copied().unwrap_or(false);
     assert_eq!(
         prologue.n_inputs,
         n_per_elem + n_per_row,
@@ -559,7 +591,18 @@ fn lower_reduction(
         let per_elem_end = n_per_elem as usize;
         let per_row_end = per_elem_end + n_per_row as usize;
         if i < per_elem_end {
-            format!("{}[row_offset + {}]", per_elem_names[i], col_var)
+            if is_gather(i) {
+                // Gather: the row is indirected through a u32 indices
+                // buffer, then the gathered row's `inner`-stride slice is
+                // indexed by the reduction column. Valid only when the
+                // gathered axis IS the reduced axis (table stride == inner).
+                format!(
+                    "{0}[{0}_idx[row] * params.inner + {1}]",
+                    per_elem_names[i], col_var
+                )
+            } else {
+                format!("{}[row_offset + {}]", per_elem_names[i], col_var)
+            }
         } else if i < per_row_end {
             format!("{}[row]", per_row_names[i - per_elem_end])
         } else {
@@ -578,8 +621,12 @@ fn lower_reduction(
     src.push_str(
         "struct Params {\n    outer: u32,\n    inner: u32,\n    _pad0: u32,\n    _pad1: u32,\n}\n\n",
     );
-    for name in &per_elem_names {
+    for (i, name) in per_elem_names.iter().enumerate() {
         let _ = writeln!(src, "var<storage> {}: array<f32>;", name);
+        if is_gather(i) {
+            // u32 indices buffer for this gather stream.
+            let _ = writeln!(src, "var<storage> {}_idx: array<u32>;", name);
+        }
     }
     for name in &per_row_names {
         let _ = writeln!(src, "var<storage> {}: array<f32>;", name);
@@ -1064,6 +1111,7 @@ mod tests {
             epilogue: None,
             n_per_elem: 1,
             n_per_row: 0,
+            gather_elem: Vec::new(),
             grid: GridShape::default(),
         });
         assert!(sm.source.contains("struct Params"));
@@ -1084,6 +1132,7 @@ mod tests {
             epilogue: None,
             n_per_elem: 1,
             n_per_row: 0,
+            gather_elem: Vec::new(),
             grid: GridShape::default(),
         });
         // Max identity is -inf via bitcast.
@@ -1101,12 +1150,67 @@ mod tests {
             epilogue: None,
             n_per_elem: 1,
             n_per_row: 0,
+            gather_elem: Vec::new(),
             grid: GridShape::default(),
         });
         // Prologue emits the multiply.
         assert!(sm.source.contains("v0 * v0"));
         // And the per-row load expression should reference row_offset.
         assert!(sm.source.contains("src[row_offset + col]"));
+    }
+
+    #[test]
+    fn reduction_with_gather_streams_emits_indirect_load() {
+        // SH sum-over-K: color[row] = sum_col(coeff[cell_idx[row]*K+col]
+        //                                      * basis[pix_idx[row]*K+col]).
+        // Two per-element GATHER streams, Mul prologue, Sum reduce.
+        let prologue = PointwiseDAG {
+            n_inputs: 2,
+            ops: vec![Pw::LoadInput(0), Pw::LoadInput(1), Pw::Mul(0, 1)],
+            output: 2,
+        };
+        let sm = lower(&KernelTemplate::Reduction {
+            op: ReduceOp::Sum,
+            prologue,
+            epilogue: None,
+            n_per_elem: 2,
+            n_per_row: 0,
+            gather_elem: vec![true, true],
+            grid: GridShape::default(),
+        });
+        // Indices buffers declared for both gather streams.
+        assert!(sm.source.contains("var<storage> src_a_idx: array<u32>;"));
+        assert!(sm.source.contains("var<storage> src_b_idx: array<u32>;"));
+        // Indirect (gathered) loads, not the direct row_offset form.
+        assert!(sm.source.contains("src_a[src_a_idx[row] * params.inner + col]"));
+        assert!(sm.source.contains("src_b[src_b_idx[row] * params.inner + col]"));
+        assert!(!sm.source.contains("src_a[row_offset"));
+        // The prologue multiply still fuses in.
+        assert!(sm.source.contains("v0 * v1"));
+    }
+
+    #[test]
+    fn reduction_with_partial_gather_compiles() {
+        // One gather stream + one direct stream (mixed).
+        let prologue = PointwiseDAG {
+            n_inputs: 2,
+            ops: vec![Pw::LoadInput(0), Pw::LoadInput(1), Pw::Mul(0, 1)],
+            output: 2,
+        };
+        let sm = lower(&KernelTemplate::Reduction {
+            op: ReduceOp::Sum,
+            prologue,
+            epilogue: None,
+            n_per_elem: 2,
+            n_per_row: 0,
+            gather_elem: vec![true, false],
+            grid: GridShape::default(),
+        });
+        // Stream 0 gathered, stream 1 direct.
+        assert!(sm.source.contains("src_a[src_a_idx[row] * params.inner + col]"));
+        assert!(sm.source.contains("src_b[row_offset + col]"));
+        assert!(sm.source.contains("var<storage> src_a_idx: array<u32>;"));
+        assert!(!sm.source.contains("src_b_idx"));
     }
 
     #[test]
@@ -1126,6 +1230,7 @@ mod tests {
                 epilogue: None,
                 n_per_elem: 1,
                 n_per_row: 0,
+                gather_elem: Vec::new(),
                 grid: GridShape::default(),
             });
             v.validate(&sm.module).unwrap_or_else(|e| {
@@ -1174,6 +1279,7 @@ mod tests {
             epilogue: Some(rmsnorm_epilogue(720.0, 1e-5)),
             n_per_elem: 1,
             n_per_row: 0,
+            gather_elem: Vec::new(),
             grid: GridShape::default(),
         });
         // Has the per-col bias binding.
@@ -1232,6 +1338,7 @@ mod tests {
             }),
             n_per_elem: 1,
             n_per_row: 1,
+            gather_elem: Vec::new(),
             grid: GridShape::default(),
         });
         // Bindings: src + per_row_src (for row_max) + dst.
@@ -1263,6 +1370,7 @@ mod tests {
             epilogue: Some(rmsnorm_epilogue(720.0, 1e-5)),
             n_per_elem: 1,
             n_per_row: 0,
+            gather_elem: Vec::new(),
             grid: GridShape::default(),
         });
         Validator::new(flags, Capabilities::all())
@@ -1290,6 +1398,7 @@ mod tests {
             epilogue: Some(bad),
             n_per_elem: 1,
             n_per_row: 0,
+            gather_elem: Vec::new(),
             grid: GridShape::default(),
         });
     }
@@ -1303,6 +1412,7 @@ mod tests {
             epilogue: None,
             n_per_elem: 1,
             n_per_row: 0,
+            gather_elem: Vec::new(),
             grid: GridShape {
                 workgroup_size: 250, // not power of 2
             },
