@@ -1741,6 +1741,44 @@ impl<'a> Compiler<'a> {
                 });
             }
 
+            Op::SumInner => {
+                // [M, N] → [M, 1]: per-row reduction over the inner axis,
+                // one workgroup per row. Lowers to a schedule-template
+                // reduction with an identity prologue, so the fusion pass
+                // can later fold a pointwise/gather producer into it.
+                use crate::schedule::{PointwiseDAG, Pw, ReduceOp, ReductionKernel};
+                const WG: u32 = 256;
+                let input = self.get_buffer(node.inputs[0]);
+                let in_shape = &self.graph.node(node.inputs[0]).ty.shape;
+                let m = in_shape[0] as u32;
+                let n = in_shape[1] as u32;
+                let kernel = ReductionKernel {
+                    op: ReduceOp::Sum,
+                    prologue: PointwiseDAG {
+                        n_inputs: 1,
+                        ops: vec![Pw::LoadInput(0)],
+                        output: 0,
+                    },
+                    epilogue: None,
+                    n_per_elem: 1,
+                    n_per_row: 0,
+                    workgroup_size: WG,
+                    gather_elem: Vec::new(),
+                };
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::Relu, // sentinel; routing is via `reduction`
+                    workgroups: [m, 1, 1],
+                    input_buffers: vec![input],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![m, n, 0, 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    reduction: Some(kernel),
+                    ..Default::default()
+                });
+            }
+
             Op::Softmax => {
                 let input = self.get_buffer(node.inputs[0]);
                 let shape = &self.graph.node(node.inputs[0]).ty.shape;
@@ -3463,6 +3501,7 @@ impl<'a> Compiler<'a> {
             n_per_elem: 1,
             n_per_row: 0,
             workgroup_size: WG,
+            gather_elem: Vec::new(),
         };
         self.plan.dispatches.push(Dispatch {
             // Sentinel shader for runtime data-layout selection (UnaryData).
@@ -3515,6 +3554,7 @@ impl<'a> Compiler<'a> {
             n_per_elem: 1,
             n_per_row: 1,
             workgroup_size: WG,
+            gather_elem: Vec::new(),
         };
         self.plan.dispatches.push(Dispatch {
             // Sentinel for runtime data-layout: 1 per-elem + 1 per-row → 2
@@ -3593,6 +3633,7 @@ impl<'a> Compiler<'a> {
             n_per_elem: 1,
             n_per_row: 0,
             workgroup_size: WG,
+            gather_elem: Vec::new(),
         };
 
         // Uses RmsNormData layout: src + bias (per-col weight) + dst + params.

@@ -139,6 +139,31 @@ fn sum_all_mid_chain_respects_upstream_coef() {
     gradcheck_param(&mut session, "w", 6, &set_inputs);
 }
 
+/// `sum_all(sum_inner(x*w) * coef)`: puts the new `sum_inner` reduction
+/// mid-graph (followed by a scalar mul and a final sum) so the backward
+/// must propagate the upstream gradient through the row-wise reduction.
+#[test]
+fn sum_inner_mid_chain_respects_upstream_coef() {
+    let mut g = Graph::new();
+    let x = g.input("x", &[2, 3]);
+    let w = g.parameter("w", &[2, 3]);
+    let prod = g.mul(x, w);
+    let si = g.sum_inner(prod); // [2, 1]
+    let s = g.sum_all(si); // [1]
+    let coef = g.scalar(0.9);
+    let loss = g.mul(s, coef); // [1]; grad_output reaches sum_inner via sum_all
+    g.set_outputs(vec![loss]);
+
+    let mut session = build_session(&g);
+    let x_data: Vec<f32> = (0..6).map(|i| (i as f32) * 0.5 - 1.0).collect();
+    let w_init: Vec<f32> = (0..6).map(|i| (i as f32) * 0.2 + 0.05).collect();
+    session.set_parameter("w", &w_init);
+    let set_inputs = |s: &mut meganeura::Session| {
+        s.set_input("x", &x_data);
+    };
+    gradcheck_param(&mut session, "w", 6, &set_inputs);
+}
+
 /// `mse_loss(pred, target) * coef`: real-world pattern from kindle's
 /// value head. mse_loss is `mean_all(sq)` internally; multiplying by a
 /// coef triggers the same path.

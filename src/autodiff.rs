@@ -259,6 +259,17 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let grad_broadcast = graph.bias_add(zeros, grad_output);
                 accumulate_grad(&mut graph, &mut grads, x, grad_broadcast);
             }
+            Op::SumInner => {
+                // SumInner: [M, N] → [M, 1]. Backward broadcasts the
+                // [M, 1] gradient across the N inner columns:
+                //   dL/dx[i,j] = dL/dy[i]   =  grad_output @ ones[1, N].
+                let x = node.inputs[0];
+                let x_ty = &forward.nodes()[x as usize].ty;
+                let n = x_ty.shape[1];
+                let ones_1n = graph.constant(vec![1.0; n], &[1, n]);
+                let grad_broadcast = graph.matmul(grad_output, ones_1n);
+                accumulate_grad(&mut graph, &mut grads, x, grad_broadcast);
+            }
             Op::Neg => {
                 let x = node.inputs[0];
                 let grad_x = graph.neg(grad_output);

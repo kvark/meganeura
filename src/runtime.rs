@@ -1196,10 +1196,107 @@ impl Pipelines {
 /// ShaderDataLayout for a schedule-template reduction pipeline, chosen
 /// by (n_per_elem, n_per_row, n_per_col). Names align with the bindings
 /// emitted by `schedule::lower` for reductions.
+/// Ordered storage-buffer binding names for a reduction kernel's input
+/// streams: each per-element stream, with its `_idx` indices buffer right
+/// after it when that stream is a gather; then per-row; then per-col.
+/// Excludes `dst` / `params`. Names are `'static` (bounded vocabulary) and
+/// match the globals emitted by `schedule::lower_reduction`, so they slot
+/// directly into a dynamically-built `ShaderDataLayout` and the matching
+/// `DynReductionData::fill` order.
+fn reduction_input_binding_names(k: &crate::schedule::ReductionKernel) -> Vec<&'static str> {
+    let per_elem: &[&str] = match k.n_per_elem {
+        1 => &["src"],
+        2 => &["src_a", "src_b"],
+        3 => &["src_a", "src_b", "src_c"],
+        n => panic!("reduction n_per_elem {n} unsupported"),
+    };
+    let idx: &[&str] = match k.n_per_elem {
+        1 => &["src_idx"],
+        2 => &["src_a_idx", "src_b_idx"],
+        3 => &["src_a_idx", "src_b_idx", "src_c_idx"],
+        _ => &[],
+    };
+    let per_row: &[&str] = match k.n_per_row {
+        0 => &[],
+        1 => &["per_row_src"],
+        2 => &["per_row_src_a", "per_row_src_b"],
+        n => panic!("reduction n_per_row {n} unsupported"),
+    };
+    let n_per_col = k.epilogue.as_ref().map_or(0, |e| e.n_per_col_inputs);
+    let per_col: &[&str] = match n_per_col {
+        0 => &[],
+        1 => &["bias"],
+        2 => &["bias_a", "bias_b"],
+        n => panic!("reduction n_per_col {n} unsupported"),
+    };
+    let mut names = Vec::new();
+    for i in 0..k.n_per_elem as usize {
+        names.push(per_elem[i]);
+        if k.gather_elem.get(i).copied().unwrap_or(false) {
+            names.push(idx[i]);
+        }
+    }
+    names.extend_from_slice(per_row);
+    names.extend_from_slice(per_col);
+    names
+}
+
+/// Whether a reduction kernel needs the dynamic binding path (gather
+/// streams, or an arity not covered by the three fixed layout structs).
+fn reduction_is_dynamic(k: &crate::schedule::ReductionKernel) -> bool {
+    let n_per_col = k.epilogue.as_ref().map_or(0, |e| e.n_per_col_inputs);
+    let known = matches!(
+        (k.n_per_elem, k.n_per_row, n_per_col),
+        (1, 0, 0) | (1, 1, 0) | (1, 0, 1)
+    );
+    !k.gather_elem.iter().all(|&g| !g) || !known
+}
+
+/// Dynamically-built reduction bind data: storage buffers (per the
+/// `reduction_input_binding_names` order, plus `dst`) followed by the
+/// `params` uniform. Used for gather reductions and any arity outside the
+/// three fixed layout structs — avoids a per-combination `ShaderData`
+/// struct. `bind<D>` ignores `D::layout()` (uses the pipeline's layout),
+/// so the static `layout()` here is a harmless placeholder.
+struct DynReductionData {
+    buffers: Vec<blade_graphics::BufferPiece>,
+    params: ReductionParams,
+}
+
+impl blade_graphics::ShaderData for DynReductionData {
+    fn layout() -> blade_graphics::ShaderDataLayout {
+        blade_graphics::ShaderDataLayout::default()
+    }
+    fn fill(&self, mut context: blade_graphics::PipelineContext) {
+        use blade_graphics::ShaderBindable;
+        let mut index = 0u32;
+        for b in &self.buffers {
+            b.bind_to(&mut context, index);
+            index += 1;
+        }
+        self.params.bind_to(&mut context, index);
+    }
+}
+
 fn reduction_data_layout(
     kernel: &crate::schedule::ReductionKernel,
 ) -> blade_graphics::ShaderDataLayout {
     use blade_graphics::ShaderData;
+    if reduction_is_dynamic(kernel) {
+        let mut bindings: Vec<(&'static str, blade_graphics::ShaderBinding)> =
+            reduction_input_binding_names(kernel)
+                .into_iter()
+                .map(|n| (n, blade_graphics::ShaderBinding::Buffer))
+                .collect();
+        bindings.push(("dst", blade_graphics::ShaderBinding::Buffer));
+        bindings.push((
+            "params",
+            blade_graphics::ShaderBinding::Plain {
+                size: std::mem::size_of::<ReductionParams>() as u32,
+            },
+        ));
+        return blade_graphics::ShaderDataLayout { bindings };
+    }
     let n_per_col = kernel.epilogue.as_ref().map_or(0, |e| e.n_per_col_inputs);
     match (kernel.n_per_elem, kernel.n_per_row, n_per_col) {
         (1, 0, 0) => ReductionPass1Data::layout(),
@@ -3499,6 +3596,20 @@ impl Session {
                 _pad0: 0,
                 _pad1: 0,
             };
+            if reduction_is_dynamic(k) {
+                // Buffers in binding order: each input stream (gather idx
+                // buffers are already interleaved into `input_buffers` by
+                // the fusion pass, right after their table stream), then
+                // `dst`. `params` is bound last by `fill`.
+                let mut buffers: Vec<blade_graphics::BufferPiece> = dispatch
+                    .input_buffers
+                    .iter()
+                    .map(|&r| buf(r))
+                    .collect();
+                buffers.push(buf(dispatch.output_buffer));
+                pc.bind(0, &DynReductionData { buffers, params });
+                return;
+            }
             let n_per_col = k.epilogue.as_ref().map_or(0, |e| e.n_per_col_inputs);
             match (k.n_per_elem, k.n_per_row, n_per_col) {
                 (1, 0, 0) => {
