@@ -642,6 +642,9 @@ pub fn compile_with(graph: &Graph, options: &CompileOptions) -> ExecutionPlan {
     if options.use_schedule_pointwise {
         fuse_pointwise_chains(&mut compiler.plan);
     }
+    if options.use_schedule_reduction {
+        fuse_reduction_chains(&mut compiler.plan);
+    }
     // RmsNorm+MatMul prologue fusion: infrastructure works (30 pairs
     // fused on SmolLM2 prefill, correct output verified), but the extra
     // per-A-element reads in the coop staging loop regress TTFT by ~40%
@@ -815,6 +818,224 @@ fn fuse_pointwise_chains(plan: &mut ExecutionPlan) {
         }
 
         if !fused_any {
+            break;
+        }
+    }
+}
+
+/// Post-compile pass: fold single-use producers into a reduction
+/// dispatch's prologue, eliminating intermediate buffers. Two phases:
+///
+///   Phase 1 (pointwise → prologue): a per-element input of the reduction
+///   produced by a single-use pointwise dispatch is folded into the
+///   prologue DAG via `PointwiseDAG::fuse_input` (grows `n_per_elem`).
+///   Runs while the reduction has no gather streams, so `input_buffers`
+///   stays 1:1 with prologue inputs (no gather expansion to track).
+///
+///   Phase 2 (gather → prologue): a per-element input produced by a
+///   single-use `Embedding` (indexed load) is marked a gather stream —
+///   `gather_elem[s] = true`, and the stream's buffer is replaced by the
+///   table with the indices buffer spliced in right after. Valid because
+///   the gathered axis is the reduced (inner) axis: `embedding` params
+///   `[seq, hidden] = [outer, inner]`.
+///
+/// Together these let `sum_inner(mul(embedding(idx,tbl), x))` collapse to
+/// one fused reduction kernel — the SH colour path — discovered from
+/// primitive ops, not hand-written.
+fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
+    use std::collections::{HashMap, HashSet};
+
+    let protected = |plan: &ExecutionPlan| -> HashSet<BufferRef> {
+        let mut p: HashSet<BufferRef> = HashSet::new();
+        p.extend(plan.output_buffers.iter().copied());
+        if let Some(b) = plan.loss_buffer {
+            p.insert(b);
+        }
+        for e in &plan.param_buffers {
+            p.insert(e.1);
+        }
+        for e in &plan.input_buffers {
+            p.insert(e.1);
+        }
+        for e in &plan.constant_buffers {
+            p.insert(e.0);
+        }
+        for e in &plan.lse_buffers {
+            p.insert(e.1);
+        }
+        for d in &plan.dispatches {
+            for b in &d.extra_outputs {
+                p.insert(*b);
+            }
+        }
+        p
+    };
+
+    // Helper: producer map + read counts for the current plan.
+    let scan = |plan: &ExecutionPlan| -> (HashMap<BufferRef, usize>, HashMap<BufferRef, usize>) {
+        let mut producer = HashMap::new();
+        for (i, d) in plan.dispatches.iter().enumerate() {
+            producer.insert(d.output_buffer, i);
+        }
+        let mut reads: HashMap<BufferRef, usize> = HashMap::new();
+        for d in &plan.dispatches {
+            for b in &d.input_buffers {
+                *reads.entry(*b).or_default() += 1;
+            }
+            for b in &d.epilogue_buffers {
+                *reads.entry(*b).or_default() += 1;
+            }
+        }
+        (producer, reads)
+    };
+
+    // --- Phase 1: fold pointwise producers into reduction prologues. ---
+    loop {
+        let prot = protected(plan);
+        let (producer, reads) = scan(plan);
+        let mut fused = false;
+
+        'outer: for ci in 0..plan.dispatches.len() {
+            let c = &plan.dispatches[ci];
+            let Some(kernel) = c.reduction.as_ref() else {
+                continue;
+            };
+            // Phase 1 invariant: no gather streams yet, so input_buffers
+            // is 1:1 with prologue inputs (per-elem first, then per-row).
+            if kernel.gather_elem.iter().any(|&g| g) {
+                continue;
+            }
+            let outer = c.params[0];
+            let inner = c.params[1];
+            let per_elem = kernel.n_per_elem as usize;
+
+            for s in 0..per_elem {
+                let buf = c.input_buffers[s];
+                if prot.contains(&buf) {
+                    continue;
+                }
+                let Some(&pi) = producer.get(&buf) else {
+                    continue;
+                };
+                if pi == ci || reads.get(&buf).copied().unwrap_or(0) != 1 {
+                    continue;
+                }
+                let p = &plan.dispatches[pi];
+                if p.pointwise.is_none() || p.reduction.is_some() {
+                    continue;
+                }
+                // Producer must cover the per-element domain (outer*inner).
+                if p.params.first().copied() != Some(outer.saturating_mul(inner)) {
+                    continue;
+                }
+                // Arity cap (binding vocab supports ≤3 per-elem streams).
+                let new_n_per_elem = per_elem - 1 + p.input_buffers.len();
+                if new_n_per_elem > 3 || kernel.n_per_row != 0 {
+                    continue;
+                }
+
+                let producer_d = plan.dispatches[pi].clone();
+                let p_dag = producer_d.pointwise.clone().expect("checked");
+                let c = &mut plan.dispatches[ci];
+                let kernel = c.reduction.as_mut().expect("checked");
+                kernel.prologue = kernel.prologue.fuse_input(s as u8, &p_dag);
+                kernel.n_per_elem = new_n_per_elem as u8;
+                kernel.gather_elem = Vec::new();
+                // Rebuild input_buffers: producer inputs first (matching
+                // fuse_input's ordering), then consumer's others.
+                let mut new_inputs = producer_d.input_buffers.clone();
+                for (idx, b) in c.input_buffers.iter().enumerate() {
+                    if idx != s {
+                        new_inputs.push(*b);
+                    }
+                }
+                c.input_buffers = new_inputs;
+                plan.dispatches.remove(pi);
+                fused = true;
+                break 'outer;
+            }
+        }
+        if !fused {
+            break;
+        }
+    }
+
+    // --- Phase 2: fold Embedding producers as gather streams. ---
+    loop {
+        let prot = protected(plan);
+        let (producer, reads) = scan(plan);
+        let mut fused = false;
+
+        'outer2: for ci in 0..plan.dispatches.len() {
+            let c = &plan.dispatches[ci];
+            let Some(kernel) = c.reduction.as_ref() else {
+                continue;
+            };
+            let outer = c.params[0];
+            let inner = c.params[1];
+            let per_elem = kernel.n_per_elem as usize;
+
+            // Flat position of each per-element stream in input_buffers,
+            // accounting for earlier gather streams (which occupy 2 slots).
+            let mut flat = vec![0usize; per_elem];
+            let mut pos = 0usize;
+            for s in 0..per_elem {
+                flat[s] = pos;
+                pos += if kernel.gather_elem.get(s).copied().unwrap_or(false) {
+                    2
+                } else {
+                    1
+                };
+            }
+
+            for s in 0..per_elem {
+                if kernel.gather_elem.get(s).copied().unwrap_or(false) {
+                    continue; // already a gather leaf
+                }
+                let buf = c.input_buffers[flat[s]];
+                if prot.contains(&buf) {
+                    continue;
+                }
+                let Some(&pi) = producer.get(&buf) else {
+                    continue;
+                };
+                if pi == ci || reads.get(&buf).copied().unwrap_or(0) != 1 {
+                    continue;
+                }
+                let p = &plan.dispatches[pi];
+                // Plain Embedding dispatch: indexed load, gathered axis ==
+                // reduced axis (params [seq, hidden] = [outer, inner]).
+                let is_embedding = p.shader == ShaderEntry::Embedding
+                    && p.reduction.is_none()
+                    && p.pointwise.is_none()
+                    && p.params.first().copied() == Some(outer)
+                    && p.params.get(1).copied() == Some(inner)
+                    && p.input_buffers.len() == 2;
+                if !is_embedding {
+                    continue;
+                }
+                let idx_buf = p.input_buffers[0]; // Embedding inputs[0] = indices
+                let table_buf = p.input_buffers[1]; // inputs[1] = table
+
+                let c = &mut plan.dispatches[ci];
+                let kernel = c.reduction.as_mut().expect("checked");
+                if kernel.gather_elem.is_empty() {
+                    kernel.gather_elem = vec![false; per_elem];
+                }
+                kernel.gather_elem[s] = true;
+                // Replace stream s's buffer (the embedding output) with the
+                // table, and splice the indices buffer right after it.
+                c.input_buffers[flat[s]] = table_buf;
+                c.input_buffers.insert(flat[s] + 1, idx_buf);
+                // Drop the embedding dispatch if it's now unused.
+                if reads.get(&buf).copied().unwrap_or(0) == 1 {
+                    plan.dispatches.remove(pi);
+                }
+                fused = true;
+                break 'outer2;
+            }
+        }
+        if !fused {
             break;
         }
     }
