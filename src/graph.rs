@@ -114,6 +114,11 @@ pub enum Op {
     MeanAll,
     /// Column-wise sum: [M, N] → [N]  (sum over rows)
     SumRows,
+    /// Row-wise sum over the inner axis: [M, N] → [M, 1]  (sum over cols).
+    /// Lowers to a schedule-template `ReductionKernel` (per-row reduction),
+    /// so the fusion pass can fold a pointwise/gather producer into its
+    /// prologue. The differentiable equivalent of `matmul(x, ones[N,1])`.
+    SumInner,
     Softmax,
 
     // Loss
@@ -1009,6 +1014,21 @@ impl Graph {
     pub fn mean_all(&mut self, x: NodeId) -> NodeId {
         let ty = TensorType::f32(vec![1]);
         self.add_node(Op::MeanAll, vec![x], ty)
+    }
+
+    /// Row-wise sum over the inner axis: `x: [M, N] → [M, 1]`. Equivalent
+    /// to `matmul(x, ones[N, 1])` but lowers to a fused-able reduction
+    /// kernel.
+    pub fn sum_inner(&mut self, x: NodeId) -> NodeId {
+        let shape = &self.node(x).ty.shape;
+        assert_eq!(
+            shape.len(),
+            2,
+            "sum_inner expects a 2D [M, N] input, got shape {shape:?}"
+        );
+        let m = shape[0];
+        let ty = TensorType::f32(vec![m, 1]);
+        self.add_node(Op::SumInner, vec![x], ty)
     }
 
     pub fn softmax(&mut self, x: NodeId) -> NodeId {
