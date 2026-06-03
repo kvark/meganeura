@@ -30,6 +30,18 @@ half = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["registry"] }
 
+# Optional NPU backends. Each is gated behind its own feature flag so
+# the default build pulls in no vendor SDKs. See `src/device.rs` for the
+# discovery surface that these enable.
+openvino = { version = "0.7", optional = true }
+
+[features]
+default = []
+# Intel NPU enumeration via the OpenVINO runtime. Requires the OpenVINO
+# C library to be installed on the host (`libopenvino`). Adds Intel NPU
+# devices to `meganeura::list_devices`.
+openvino = ["dep:openvino"]
+
 [[example]]
 name = "mnist"
 path = "examples/mnist.rs"
@@ -37,6 +49,10 @@ path = "examples/mnist.rs"
 [[example]]
 name = "external_buffer"
 path = "examples/external_buffer.rs"
+
+[[example]]
+name = "list_devices"
+path = "examples/list_devices.rs"
 
 [[example]]
 name = "diffusion"
