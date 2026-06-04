@@ -39,6 +39,12 @@ impl DeviceKind {
     }
 }
 
+impl std::fmt::Display for DeviceKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Description of a single addressable compute device.
 #[derive(Clone, Debug)]
 pub struct DeviceInfo {
@@ -54,6 +60,15 @@ pub struct DeviceInfo {
     /// Currently only the GPU backend qualifies; every NPU surface
     /// available on shipped silicon today is inference-only.
     pub supports_training: bool,
+}
+
+impl std::fmt::Display for DeviceInfo {
+    /// One-line summary suitable for log output:
+    /// `"gpu/default: Intel UHD Graphics"` or
+    /// `"intel-npu/NPU.0: Intel(R) AI Boost"`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}: {}", self.kind, self.backend_id, self.name)
+    }
 }
 
 /// Enumerate every compute device that meganeura can address from this
@@ -161,5 +176,19 @@ mod tests {
     #[test]
     fn device_kind_tags_are_distinct() {
         assert_ne!(DeviceKind::Gpu.as_str(), DeviceKind::IntelNpu.as_str());
+    }
+
+    #[test]
+    fn device_info_display_carries_all_fields() {
+        let info = DeviceInfo {
+            kind: DeviceKind::IntelNpu,
+            name: "Intel(R) AI Boost".to_string(),
+            backend_id: "NPU.0".to_string(),
+            supports_training: false,
+        };
+        let s = format!("{}", info);
+        assert!(s.contains("intel-npu"), "{s}");
+        assert!(s.contains("NPU.0"), "{s}");
+        assert!(s.contains("Intel(R) AI Boost"), "{s}");
     }
 }

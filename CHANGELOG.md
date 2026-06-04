@@ -1,5 +1,17 @@
 # Unreleased
 
+- `device::list_devices()` enumerates every compute device meganeura can
+  address — Blade GPU always, plus Intel NPU via the OpenVINO runtime
+  when built with `--features openvino`. Each entry carries a kind,
+  human-readable name, backend-native selector, and a `supports_training`
+  flag. Discovery only; execution still routes exclusively through the
+  Blade GPU backend. See `examples/list_devices.rs`. Adds `DeviceKind`,
+  `DeviceInfo` and the `openvino` cargo feature (which pulls
+  `openvino = 0.7` with `runtime-linking`, so `libopenvino.so` is
+  dlopened at probe time rather than required at build time).
+- `Session::with_context` now logs the device it bound to at startup
+  (`session running on <device> (<driver>)`), regardless of cooperative
+  matrix availability.
 - `Session::with_context(plan, Arc<Context>)` lets a host application
   (renderer, game) share a single `blade_graphics::Context` with
   meganeura's training and inference sessions instead of each side

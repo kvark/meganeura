@@ -1695,6 +1695,12 @@ impl Session {
     /// pipelines, the command encoder — on drop; the context is released
     /// once the last `Arc` clone is dropped.
     pub fn with_context(plan: ExecutionPlan, gpu: Arc<Gpu>) -> Self {
+        let dev_info = gpu.device_information();
+        log::info!(
+            "session running on {} ({})",
+            dev_info.device_name,
+            dev_info.driver_name,
+        );
         let coop_caps = gpu.capabilities().cooperative_matrix;
         let coop_config = Self::select_coop_config(&coop_caps)
             .filter(|config| Self::test_coop_matmul(&gpu, config));
