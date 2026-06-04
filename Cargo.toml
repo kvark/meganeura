@@ -33,7 +33,12 @@ tracing-subscriber = { version = "0.3", features = ["registry"] }
 # Optional NPU backends. Each is gated behind its own feature flag so
 # the default build pulls in no vendor SDKs. See `src/device.rs` for the
 # discovery surface that these enable.
-openvino = { version = "0.7", optional = true }
+#
+# `runtime-linking` defers the `libopenvino.so` lookup to `dlopen` at
+# probe time — this lets the crate compile on hosts without OpenVINO
+# installed, with `list_devices` just logging a warning and returning
+# no NPU entries instead of failing the build.
+openvino = { version = "0.7", optional = true, default-features = false, features = ["runtime-linking"] }
 
 [features]
 default = []

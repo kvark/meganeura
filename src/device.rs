@@ -100,14 +100,15 @@ fn probe_gpu() -> Option<DeviceInfo> {
 #[cfg(feature = "openvino")]
 mod openvino_probe {
     use super::{DeviceInfo, DeviceKind};
+    use openvino::{Core, DeviceType, PropertyKey};
 
-    // API surface assumed for the `openvino` crate ~0.7. If the
-    // installed version differs (older 0.4–0.6 split `Core` differently;
-    // newer revisions may take a cache-directory argument to
-    // `Core::new`), adjust the three call sites below — the rest of the
-    // module is API-agnostic.
+    /// Verified against the `openvino` crate v0.7.3 ABI: `Core::new()`,
+    /// `available_devices() -> Vec<DeviceType>`, and `get_property(
+    /// &DeviceType, &PropertyKey) -> String`. The `runtime-linking`
+    /// feature on `openvino-sys` defers the `libopenvino` dlopen until
+    /// `Core::new` runs, so this compiles on hosts without the runtime.
     pub fn list_intel_npu_devices() -> Vec<DeviceInfo> {
-        let mut core = match openvino::Core::new() {
+        let core = match Core::new() {
             Ok(c) => c,
             Err(e) => {
                 log::warn!("OpenVINO Core::new failed: {:?}; skipping Intel NPU probe", e);
@@ -123,14 +124,17 @@ mod openvino_probe {
             }
         };
 
+        // Accept both the canonical `NPU` enum variant and any
+        // `Other("NPU.0" | "NPU.1" | ...)` instances OpenVINO returns
+        // on multi-NPU hosts. CPU/GPU/GNA are filtered out — Blade owns
+        // the GPU side and CPU/GNA aren't useful inference targets here.
         devices
             .into_iter()
-            .map(|d| d.to_string())
-            .filter(|d| d.starts_with("NPU"))
-            .map(|backend_id| {
+            .filter(|d| matches!(d, DeviceType::NPU) || d.as_ref().starts_with("NPU"))
+            .map(|dev| {
+                let backend_id = dev.as_ref().to_string();
                 let name = core
-                    .get_property(&backend_id, "FULL_DEVICE_NAME")
-                    .map(|v| v.to_string())
+                    .get_property(&dev, &PropertyKey::DeviceFullName)
                     .unwrap_or_else(|_| backend_id.clone());
                 DeviceInfo {
                     kind: DeviceKind::IntelNpu,
