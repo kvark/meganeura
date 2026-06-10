@@ -5010,5 +5010,8 @@ impl Drop for Session {
             self.gpu.destroy_buffer(m_buf);
             self.gpu.destroy_buffer(v_buf);
         }
+        if let Some(buf) = self.grad_clip_acc.take() {
+            self.gpu.destroy_buffer(buf);
+        }
     }
 }
