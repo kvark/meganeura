@@ -103,8 +103,8 @@ pub fn plan_buffer_aliasing(plan: &ExecutionPlan, groups: &[Range<usize>]) -> Al
         pin(p, &mut pinned);
         pin(g, &mut pinned);
     }
-    for (b, _, _) in &plan.derived_params {
-        pin(*b, &mut pinned);
+    for entry in &plan.derived_params {
+        pin(entry.0, &mut pinned);
     }
     for &b in plan.weight_buffers.keys() {
         pin(b, &mut pinned);
@@ -127,12 +127,12 @@ pub fn plan_buffer_aliasing(plan: &ExecutionPlan, groups: &[Range<usize>]) -> Al
         for b in &d.epilogue_buffers {
             uses[b.0 as usize].read(g);
         }
-        if let Some(epi) = &d.matmul_epilogue {
+        if let Some(epi) = d.matmul_epilogue.as_ref() {
             for &(b, _) in &epi.inputs {
                 uses[b.0 as usize].read(g);
             }
         }
-        if let Some(pro) = &d.matmul_prologue {
+        if let Some(pro) = d.matmul_prologue.as_ref() {
             for &(b, _) in &pro.factors {
                 uses[b.0 as usize].read(g);
             }
