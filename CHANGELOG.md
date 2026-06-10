@@ -1,5 +1,14 @@
 # Unreleased
 
+- Lifetime-based buffer aliasing: step-local intermediates with
+  disjoint live ranges (at barrier-group granularity) now share one
+  physical GPU allocation. Parameters, inputs, outputs, gradients,
+  KV caches, and other persistent buffers are never aliased. Opt out
+  with `MEGANEURA_NO_ALIAS=1`. `MemorySummary` reports allocated vs
+  logical bytes.
+- `docs/roadmap.md`: strategic plan across compiler, memory,
+  precision, latency, conv, autotuning, and quantized fine-tuning
+  tracks.
 - `Session::with_context(plan, Arc<Context>)` lets a host application
   (renderer, game) share a single `blade_graphics::Context` with
   meganeura's training and inference sessions instead of each side

@@ -29,14 +29,21 @@ pub struct MemorySummary {
     pub adam_state_bytes: usize,
     pub num_buffers: usize,
     pub largest_buffer_bytes: usize,
+    /// Bytes actually allocated on the GPU after lifetime-based buffer
+    /// aliasing (≤ `total_buffer_bytes`, which counts logical buffers).
+    pub allocated_buffer_bytes: usize,
+    /// Number of physical allocations backing the logical buffers.
+    pub num_allocations: usize,
 }
 
 impl std::fmt::Display for MemorySummary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} buffers, {:.1} MB total ({:.1} MB adam state), largest {:.1} MB",
+            "{} buffers in {} allocations, {:.1} MB allocated ({:.1} MB logical, {:.1} MB adam state), largest {:.1} MB",
             self.num_buffers,
+            self.num_allocations,
+            self.allocated_buffer_bytes as f64 / 1e6,
             self.total_buffer_bytes as f64 / 1e6,
             self.adam_state_bytes as f64 / 1e6,
             self.largest_buffer_bytes as f64 / 1e6,
@@ -1392,7 +1399,14 @@ fn compute_groups(dispatches: &[Dispatch]) -> Vec<std::ops::Range<usize>> {
 /// Calling `step()` replays the pre-compiled dispatch sequence.
 pub struct Session {
     gpu: Arc<Gpu>,
+    /// Per-logical-buffer view: `buffers[i]` backs `BufferRef(i)`. Aliased
+    /// logical buffers hold copies of the same handle; the deduplicated
+    /// owning handles live in `physical_buffers`.
     buffers: Vec<blade_graphics::Buffer>,
+    /// One handle per physical allocation (what actually gets destroyed).
+    physical_buffers: Vec<blade_graphics::Buffer>,
+    /// Logical-to-physical mapping and allocation sizes.
+    alias: crate::memplan::AliasPlan,
     pipelines: Pipelines,
     plan: ExecutionPlan,
     /// Pre-computed barrier groups: each range of dispatch indices shares one
@@ -1942,8 +1956,24 @@ impl Session {
             }
         }
 
-        let buffers: Vec<blade_graphics::Buffer> = plan
-            .buffers
+        // Lifetime-based buffer aliasing: step-local intermediates with
+        // disjoint live ranges (at barrier-group granularity) share one
+        // physical allocation. See `memplan` for the safety argument.
+        let alias = if std::env::var("MEGANEURA_NO_ALIAS").is_ok() {
+            log::info!("MEGANEURA_NO_ALIAS: buffer aliasing disabled");
+            crate::memplan::AliasPlan::identity(&plan.buffers)
+        } else {
+            crate::memplan::plan_buffer_aliasing(&plan, &groups)
+        };
+        log::info!(
+            "buffer aliasing: {} logical buffers ({:.1} MB) -> {} allocations ({:.1} MB)",
+            plan.buffers.len(),
+            alias.logical_bytes(&plan.buffers) as f64 / 1e6,
+            alias.sizes.len(),
+            alias.physical_bytes() as f64 / 1e6,
+        );
+        let physical_buffers: Vec<blade_graphics::Buffer> = alias
+            .sizes
             .iter()
             .enumerate()
             .map(|(i, &size)| {
@@ -1961,6 +1991,8 @@ impl Session {
                 buf
             })
             .collect();
+        let buffers: Vec<blade_graphics::Buffer> =
+            alias.map.iter().map(|&p| physical_buffers[p]).collect();
 
         // Upload constant buffer data (gradient constants, scale factors, etc.)
         for &(buf_ref, ref data) in &plan.constant_buffers {
@@ -2021,6 +2053,8 @@ impl Session {
         Self {
             gpu,
             buffers,
+            physical_buffers,
+            alias,
             pipelines,
             plan,
             groups,
@@ -2146,7 +2180,19 @@ impl Session {
         });
 
         let idx = buf_ref.0 as usize;
-        self.gpu.destroy_buffer(self.buffers[idx]);
+        let pidx = self.alias.map[idx];
+        // Externally bindable slots (inputs/params/outputs) are pinned by
+        // the aliasing pass, so this physical allocation has one tenant.
+        debug_assert!(
+            self.alias
+                .map
+                .iter()
+                .enumerate()
+                .all(|(j, &p)| p != pidx || j == idx),
+            "external slot shares a physical allocation"
+        );
+        self.gpu.destroy_buffer(self.physical_buffers[pidx]);
+        self.physical_buffers[pidx] = imported;
         self.buffers[idx] = imported;
         Ok(())
     }
@@ -4831,6 +4877,8 @@ impl Session {
             adam_state_bytes: adam_bytes,
             num_buffers: self.plan.buffers.len(),
             largest_buffer_bytes: largest,
+            allocated_buffer_bytes: self.alias.physical_bytes(),
+            num_allocations: self.alias.sizes.len(),
         }
     }
 
@@ -5003,7 +5051,9 @@ impl Drop for Session {
         for (_, pipeline) in self.pipelines.reduction_map.iter_mut() {
             self.gpu.destroy_compute_pipeline(pipeline);
         }
-        for buffer in &self.buffers {
+        // `buffers` holds aliased copies of these handles; destroy each
+        // physical allocation exactly once.
+        for buffer in &self.physical_buffers {
             self.gpu.destroy_buffer(*buffer);
         }
         for &(m_buf, v_buf) in &self.adam_state {
