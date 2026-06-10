@@ -294,7 +294,6 @@ fn compute_pinned(plan: &ExecutionPlan, groups: &[Range<usize>]) -> (Vec<bool>, 
             pinned[i] = true;
         }
     }
-
     (pinned, uses)
 }
 

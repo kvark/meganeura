@@ -1,5 +1,10 @@
 # Unreleased
 
+- Opt-in device-local intermediates (`MEGANEURA_DEVICE_LOCAL=1`):
+  allocations holding only step-local intermediates move to
+  `Memory::Device` (GPU-zeroed at session build), keeping user-visible
+  buffers host-visible. For benchmarking the host-visible-heap cost on
+  discrete GPUs.
 - Repeated-region outlining: graphs over the egglog saturation cutoff
   (300 nodes — every real training graph) no longer skip the e-graph.
   Structurally repeated blocks (transformer layers, forward and

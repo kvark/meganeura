@@ -1531,7 +1531,8 @@ pub struct Session {
     buffers: Vec<blade_graphics::Buffer>,
     /// One handle per physical allocation (what actually gets destroyed).
     physical_buffers: Vec<blade_graphics::Buffer>,
-    /// Logical-to-physical mapping and allocation sizes.
+    /// Logical-to-physical mapping, allocation sizes, and per-allocation
+    /// device-local placement.
     alias: crate::memplan::AliasPlan,
     pipelines: Pipelines,
     plan: ExecutionPlan,

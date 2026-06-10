@@ -200,7 +200,13 @@ pinning, max-sizing); full GPU suite (gradcheck, training_correctness,
 smollm2/whisper/resnet correctness) with aliasing on vs off; memory
 summary deltas on the bench models.
 
-### B2. Device-local memory for intermediates
+### B2. Device-local memory for intermediates  ← *implemented, opt-in pending bench*
+
+*Landed:* `MEGANEURA_DEVICE_LOCAL=1` places allocations whose tenants
+are all step-local intermediates (the non-pinned set from B1's
+analysis) in `Memory::Device`, zeroed by one GPU transfer pass at
+session build. Default-off until the dGPU bench numbers are in; flips
+to default (or is removed) based on RTX 5080 / Radeon measurements.
 
 **Problem.** Every buffer is `Memory::Shared` (host-visible,
 host-coherent — `runtime.rs:1954`). Free on UMA (Apple, iGPUs). On
