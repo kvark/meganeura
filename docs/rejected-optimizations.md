@@ -100,6 +100,8 @@ much more expensive than a separate GradQ dispatch.
 The CAS-based emulation has O(contention²) cost. NVIDIA hardware
 supports native f32 atomicAdd, but it's only accessible via CUDA.
 
-**When it would help:** If naga adds subgroup operations (issue #5555),
-dQ could be accumulated within a warp first, reducing contention by 32×.
-Or with native f32 atomicAdd exposure through a Vulkan extension.
+**When it would help:** Naga's subgroup operations (which the coop
+kernels already use) could accumulate dQ within a subgroup first,
+reducing contention by 32× — worth re-testing once the NVIDIA
+coop+subgroup driver crash (kvark/blade#333) is resolved. Or with
+native f32 atomicAdd exposure through a Vulkan extension.
