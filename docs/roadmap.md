@@ -48,7 +48,15 @@ new hardware or new data — see `rejected-optimizations.md` and
 
 ## Track A — Compiler: make the e-graph earn its keep
 
-### A1. Repeated-block outlining (hierarchical IR)
+### A1. Repeated-block outlining (hierarchical IR)  ← *first stage landed*
+
+*Landed:* signature-periodicity detection + edge-isomorphism
+verification (`src/outline.rs`), per-block saturation with extraction
+on block outputs, `OptimizeReport.outlined_regions`. *Still open:*
+applying rewrites by stamping extracted terms per instance (today the
+global pattern appliers do the rewriting, so per-block extractor
+decisions can't yet disable a fusion for out-of-region patterns), and
+cross-block boundary fusions.
 
 **Problem.** Graphs over 300 nodes skip egglog entirely
 (`optimize.rs:186`) and fall back to direct pattern matching — every
@@ -113,7 +121,12 @@ epilogue dispatches take the coop path when caps allow; benchmark
 SmolVLA / SmolLM2 train (every transformer MLP has a fused bias/act
 epilogue).
 
-### A3. Bytes-moved cost model for extraction
+### A3. Bytes-moved cost model for extraction  ← *landed*
+
+*Landed:* e-class sizes are mapped after saturation (every node
+binding's value → tensor bytes) and `FusionCostModel` charges each
+e-node its read+write traffic; on under-cutoff graphs the extracted
+terms gate the appliers. `MEGANEURA_NO_TRAFFIC_COST=1` reverts.
 
 **Problem.** `FusionCostModel` is constant (fused = 9, everything
 else = 10) — `kernel-archetypes.md` *describes* an HBM-traffic cost
@@ -143,7 +156,7 @@ remat) all need a real cost signal to be selected per-shape.
 
 ## Track B — Memory: plan it, then spend it on speed
 
-### B1. Buffer lifetime analysis + aliasing  ← *in progress*
+### B1. Buffer lifetime analysis + aliasing  ← *landed*
 
 **Problem.** Every logical buffer — activations, gradients, LSE
 buffers — gets a dedicated allocation that lives for the whole

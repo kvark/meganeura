@@ -1,55 +1,83 @@
 use crate::graph::{Graph, Node, Op};
 use egglog::{Term, TermDag, TermId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::{fmt, time::Instant};
 
 // ---------------------------------------------------------------------------
 // HBM-traffic-aware cost model for e-graph extraction (step 6).
 //
-// Per-constructor costs reflect relative GPU execution cost. Fused ops
-// are cheaper than their unfused equivalents because they eliminate
-// intermediate buffer writes. The extractor uses these to pick the
-// minimum-cost equivalent expression after equality saturation.
+// When per-e-class tensor sizes are available (built after saturation by
+// evaluating each graph node's binding), the cost of an e-node is the
+// HBM traffic it causes: bytes read (inputs) + bytes written (output).
+// A fusion then wins by exactly the intermediate traffic it eliminates —
+// FusedMatMulAdd(a,b,d) saves the write and re-read of the matmul's
+// result tensor — with no hand-tuned constants, and unprofitable
+// rewrites (future: Winograd vs implicit GEMM, layout conversions,
+// rematerialization) can lose on real numbers.
 //
-// This is per-constructor (not per-instance / shape-aware). Shape-aware
-// costs would need shape annotations in the e-graph, which is a
-// follow-up. For now, relative per-constructor costs already make the
-// right call for all existing rewrite rules.
+// Without sizes, the constant per-constructor scheme applies: all
+// non-leaf, non-fused ops cost 10, fused ops cost 9 (so one fused op
+// beats the two ops it replaces), leaves are free. Equal base costs
+// prevent the extractor from shuffling op order in ways that change FP
+// rounding without improving throughput — a property the traffic model
+// shares, since equivalent orderings move the same bytes.
 // ---------------------------------------------------------------------------
 
-/// Cost model that prefers fused kernels over unfused sequences.
-///
-/// All non-leaf, non-fused ops have the same base cost (10). The default
-/// fused-op cost is 9, so a fusion that replaces two ops (10+10=20) with
-/// one (9) is preferred. Equal base costs prevent the extractor from
-/// shuffling op order in ways that change FP rounding without improving
-/// throughput.
+/// Cost model that prefers the expression with the least HBM traffic
+/// (shape-aware mode) or fused kernels over unfused sequences
+/// (constant-cost fallback).
 #[derive(Default, Debug, Clone)]
-pub struct FusionCostModel;
+pub struct FusionCostModel {
+    /// e-class value → tensor size in bytes. Empty = constant-cost mode.
+    sizes: std::sync::Arc<HashMap<egglog::Value, u64>>,
+}
 
 impl FusionCostModel {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Shape-aware mode: extraction cost is bytes read + bytes written,
+    /// looked up per e-class from `sizes`.
+    pub fn with_sizes(sizes: HashMap<egglog::Value, u64>) -> Self {
+        Self {
+            sizes: std::sync::Arc::new(sizes),
+        }
     }
 }
 
 impl egglog::extract::CostModel<u64> for FusionCostModel {
     fn fold(&self, _head: &str, children_cost: &[u64], head_cost: u64) -> u64 {
-        children_cost.iter().sum::<u64>() + head_cost
+        children_cost
+            .iter()
+            .fold(head_cost, |acc, c| acc.saturating_add(*c))
     }
 
     fn enode_cost(
         &self,
         _egraph: &egglog::EGraph,
         func: &egglog::Function,
-        _row: &egglog::FunctionRow,
+        row: &egglog::FunctionRow,
     ) -> u64 {
         let name = func.name();
-        let base: u64 = match name {
-            // Leaf nodes are free — they exist regardless.
-            "Input" | "Parameter" | "Const" => 0,
-            // Identity: no dispatch, just aliasing.
-            "Identity" => 0,
+        // Leaf nodes exist regardless; Identity is buffer aliasing.
+        // Their tensors' bytes are charged to the ops that read them.
+        if matches!(name, "Input" | "Parameter" | "Const" | "Identity") {
+            return 0;
+        }
+        if !self.sizes.is_empty() {
+            // row.vals = [args.., output]. Args missing from the map are
+            // non-tensor primitives (strings, ints) and read no HBM.
+            if let Some((out, args)) = row.vals.split_last() {
+                if let Some(&out_bytes) = self.sizes.get(out) {
+                    let read: u64 = args.iter().filter_map(|v| self.sizes.get(v)).sum();
+                    return read.saturating_add(out_bytes);
+                }
+            }
+            // Unknown output e-class (shouldn't happen for tensor sorts):
+            // fall through to the constant scheme.
+        }
+        match name {
             // Fused ops: cheaper than the sum of their unfused equivalents
             // before any register-pressure penalty.
             "FusedMatMulAdd" | "FusedMatMulATAdd" | "FusedMatMulBTAdd" => 9,
@@ -57,9 +85,17 @@ impl egglog::extract::CostModel<u64> for FusionCostModel {
             "SwiGLUConcat" => 9,
             "WinogradConv2d" => 9,
             _ => 10,
-        };
-        let _ = name;
-        base
+        }
+    }
+
+    fn base_value_cost(
+        &self,
+        _egraph: &egglog::EGraph,
+        _sort: &egglog::ArcSort,
+        _value: egglog::Value,
+    ) -> u64 {
+        // Strings / ints embedded in constructors are not tensors.
+        0
     }
 }
 
@@ -83,6 +119,9 @@ pub struct OptimizeReport {
     pub egglog_time: std::time::Duration,
     /// Wall-clock time for graph extraction + fusion rewrites.
     pub extract_time: std::time::Duration,
+    /// Repeated regions outlined for per-block saturation (0 when the
+    /// whole graph fit under the saturation cutoff).
+    pub outlined_regions: usize,
 }
 
 impl OptimizeReport {
@@ -99,6 +138,7 @@ impl OptimizeReport {
             fusions_applied: Vec::new(),
             egglog_time: std::time::Duration::ZERO,
             extract_time: std::time::Duration::ZERO,
+            outlined_regions: 0,
         }
     }
 }
@@ -108,10 +148,15 @@ impl fmt::Display for OptimizeReport {
         writeln!(f, "=== Optimization Report ===")?;
         writeln!(
             f,
-            "Egglog saturation: {:.1}ms ({} e-classes, {} e-nodes)",
+            "Egglog saturation: {:.1}ms ({} e-classes, {} e-nodes{})",
             self.egglog_time.as_secs_f64() * 1000.0,
             self.num_eclasses,
             self.num_enodes,
+            if self.outlined_regions > 0 {
+                format!(", {} outlined region(s)", self.outlined_regions)
+            } else {
+                String::new()
+            },
         )?;
         if !self.rules_fired.is_empty() {
             writeln!(f, "Rules fired:")?;
@@ -174,29 +219,102 @@ pub fn optimize_with_cost_model(
         .iter()
         .filter(|n| !matches!(n.op, Op::Nop))
         .count();
-    // egglog saturation time grows superlinearly with node count.
-    // For the SmolVLA training graph (~750 nodes), saturation takes
-    // minutes. Fall back to direct pattern matching for large graphs.
-    // TODO: investigate egglog performance or use incremental matching.
+    // Shape-aware extraction cost (bytes read + written per e-node).
+    // The env var reverts to the constant per-constructor scheme.
+    let traffic_cost = std::env::var("MEGANEURA_NO_TRAFFIC_COST").is_err();
     let egglog_start = Instant::now();
-    // egglog saturation with shared-parameter graphs (like transformers
-    // where the same weight is used by many MatMul nodes) creates large
-    // e-classes that make pattern matching slow. 300 nodes handles most
-    // small models; larger models fall back to direct pattern matching.
+    // Full-graph egglog saturation grows superlinearly with node count
+    // (shared-parameter graphs create large e-classes that make pattern
+    // matching slow): the SmolVLA training graph (~750 nodes) takes
+    // minutes. Above the cutoff, detect repeated regions (transformer
+    // layers, forward and backward) and saturate ONE instance of each —
+    // the extractor's per-block decisions are logged and reported; the
+    // graph rewrite itself still goes through the pattern appliers below,
+    // which visit every instance.
     if node_count > 300 {
-        log::debug!(
-            "egglog: {} nodes, falling back to pattern matching",
-            node_count
-        );
+        let regions = crate::outline::detect_repeated_regions(graph);
+        let mut chosen: HashSet<String> = HashSet::new();
+        let mut region_program = String::new();
+        for region in &regions {
+            let (block_program, externals) = region_egglog_program(graph, region);
+            let mut egraph = egglog::EGraph::default();
+            if let Err(e) = egraph.parse_and_run_program(None, &block_program) {
+                log::warn!("egglog failed on outlined region {:?}: {}", region, e);
+                continue;
+            }
+            let ids = externals
+                .into_iter()
+                .chain(region.start..region.start + region.period);
+            let cm = if traffic_cost {
+                FusionCostModel::with_sizes(eclass_sizes(graph, &mut egraph, ids))
+            } else {
+                cost_model.clone()
+            };
+            for out_id in region_outputs(graph, region) {
+                let var = format!("n{}", out_id);
+                let eval =
+                    egraph.eval_expr(&egglog::ast::Expr::Var(egglog::ast::Span::Panic, var));
+                if let Ok((sort, value)) = eval {
+                    match egraph.extract_value_with_cost_model(&sort, value, cm.clone()) {
+                        Ok((dag, term_id, cost)) => {
+                            log::debug!(
+                                "region {:?}: extracted n{} (cost {}): {}",
+                                region,
+                                out_id,
+                                cost,
+                                dag.to_string(term_id)
+                            );
+                            collect_chosen_kinds(&dag, term_id, &mut chosen);
+                        }
+                        Err(e) => log::warn!("region extraction failed for n{}: {}", out_id, e),
+                    }
+                }
+            }
+            let serialized = egraph.serialize(egglog::SerializeConfig::default());
+            num_eclasses += serialized.egraph.class_data.len();
+            num_enodes += serialized.egraph.nodes.len();
+            if region_program.is_empty() {
+                region_program = block_program;
+            }
+        }
+        let egglog_time = egglog_start.elapsed();
+        if regions.is_empty() {
+            log::debug!(
+                "egglog: {} nodes, no repeated regions — pattern matching only",
+                node_count
+            );
+        } else {
+            log::info!(
+                "egglog: {} nodes outlined into {} region(s) {:?}; extractor chose {:?}",
+                node_count,
+                regions.len(),
+                regions,
+                chosen,
+            );
+        }
         let extract_start = Instant::now();
-        let (optimized, fusions_applied) = rebuild_graph_from_extractions(graph, &[]);
+        // The outlined blocks don't cover the whole graph, so the
+        // extractor's choices can't soundly *disable* a fusion kind for
+        // out-of-region patterns — run all appliers. Per-site gating
+        // becomes possible once rewrites are stamped from extracted
+        // terms instead of re-matched globally.
+        let (optimized, fusions_applied) = rebuild_graph_from_extractions(graph, None);
         let extract_time = extract_start.elapsed();
+        let nodes_after = optimized
+            .nodes()
+            .iter()
+            .filter(|n| !matches!(n.op, Op::Nop))
+            .count();
         return (
             optimized,
             OptimizeReport {
-                egglog_program: program,
-                num_eclasses: 0,
-                num_enodes: 0,
+                egglog_program: if region_program.is_empty() {
+                    program
+                } else {
+                    region_program
+                },
+                num_eclasses,
+                num_enodes,
                 rules_fired: fusions_applied.iter().fold(Vec::new(), |mut acc, entry| {
                     let name = &entry.0;
                     if let Some(e) = acc.iter_mut().find(|e: &&mut (String, usize)| e.0 == *name) {
@@ -207,10 +325,11 @@ pub fn optimize_with_cost_model(
                     acc
                 }),
                 nodes_before,
-                nodes_after: 0,
+                nodes_after,
                 fusions_applied,
-                egglog_time: std::time::Duration::ZERO,
+                egglog_time,
                 extract_time,
+                outlined_regions: regions.len(),
             },
         );
     }
@@ -222,15 +341,23 @@ pub fn optimize_with_cost_model(
     );
     let egglog_ok;
     let mut extractions: Vec<(TermDag, TermId)> = Vec::new();
+    let mut extraction_complete = false;
 
     match egglog_result {
         Ok(outputs) => {
             egglog_ok = true;
 
-            // Step 6: programmatic extraction with FusionCostModel.
-            // Fused ops cost 9 vs base cost 10 per op, so the extractor
-            // prefers fused kernels. All non-fused ops share the same
-            // base cost to avoid changing tie-breaking vs AST-size.
+            // Step 6: programmatic extraction with FusionCostModel — in
+            // traffic mode the e-node cost is the HBM bytes it moves, so
+            // a fusion wins by the intermediate traffic it eliminates;
+            // in constant mode fused ops cost 9 vs base 10.
+            let cm = if traffic_cost {
+                let ids = 0..graph.nodes().len();
+                FusionCostModel::with_sizes(eclass_sizes(graph, &mut egraph, ids))
+            } else {
+                cost_model.clone()
+            };
+            extraction_complete = true;
             for &out_id in graph.outputs() {
                 if matches!(graph.node(out_id).op, Op::Nop) {
                     continue;
@@ -240,8 +367,7 @@ pub fn optimize_with_cost_model(
                     egraph.eval_expr(&egglog::ast::Expr::Var(egglog::ast::Span::Panic, var_name));
                 match eval_result {
                     Ok((sort, value)) => {
-                        match egraph.extract_value_with_cost_model(&sort, value, cost_model.clone())
-                        {
+                        match egraph.extract_value_with_cost_model(&sort, value, cm.clone()) {
                             Ok((dag, term_id, cost)) => {
                                 log::debug!(
                                     "extracted n{} (cost {}): {}",
@@ -253,11 +379,13 @@ pub fn optimize_with_cost_model(
                             }
                             Err(e) => {
                                 log::warn!("extraction failed for n{}: {}", out_id, e);
+                                extraction_complete = false;
                             }
                         }
                     }
                     Err(e) => {
                         log::warn!("failed to eval n{}: {}", out_id, e);
+                        extraction_complete = false;
                     }
                 }
             }
@@ -265,6 +393,7 @@ pub fn optimize_with_cost_model(
             // Fallback: if programmatic extraction didn't work, use the
             // text-based outputs (legacy path).
             if extractions.is_empty() {
+                extraction_complete = false;
                 for out in &outputs {
                     if let egglog::CommandOutput::ExtractBest(ref dag, _cost, term_id) = *out {
                         log::debug!("egglog legacy extracted: {}", dag.to_string(term_id));
@@ -289,8 +418,21 @@ pub fn optimize_with_cost_model(
         num_enodes = serialized.egraph.nodes.len();
     }
 
+    // When extraction covered every output, the extracted terms are the
+    // optimizer's decision: only the fusion kinds it chose are applied.
+    // Otherwise (egglog failure, partial extraction) all appliers run.
+    let chosen = if extraction_complete {
+        let mut kinds = HashSet::new();
+        for &(ref dag, term_id) in &extractions {
+            collect_chosen_kinds(dag, term_id, &mut kinds);
+        }
+        Some(kinds)
+    } else {
+        None
+    };
+
     let extract_start = Instant::now();
-    let (optimized, fusions_applied) = rebuild_graph_from_extractions(graph, &extractions);
+    let (optimized, fusions_applied) = rebuild_graph_from_extractions(graph, chosen.as_ref());
     let extract_time = extract_start.elapsed();
 
     let nodes_after = optimized
@@ -318,9 +460,37 @@ pub fn optimize_with_cost_model(
         fusions_applied,
         egglog_time,
         extract_time,
+        outlined_regions: 0,
     };
 
     (optimized, report)
+}
+
+/// Map every node binding (`n{id}`) to its e-class value and record the
+/// tensor's size in bytes — the lookup table for traffic-aware
+/// extraction. Nodes sharing an e-class denote the same tensor, so the
+/// insert is idempotent; rewrite-created terms (e.g. FusedMatMulAdd)
+/// join the e-class of the expression they replaced and need no entry
+/// of their own.
+fn eclass_sizes(
+    graph: &Graph,
+    egraph: &mut egglog::EGraph,
+    ids: impl Iterator<Item = usize>,
+) -> HashMap<egglog::Value, u64> {
+    let mut sizes = HashMap::new();
+    for id in ids {
+        let node = &graph.nodes()[id];
+        if matches!(node.op, Op::Nop) {
+            continue;
+        }
+        let var = format!("n{}", node.id);
+        if let Ok((_sort, value)) =
+            egraph.eval_expr(&egglog::ast::Expr::Var(egglog::ast::Span::Panic, var))
+        {
+            sizes.insert(value, node.ty.size_bytes() as u64);
+        }
+    }
+    sizes
 }
 
 /// Dump the egglog program for a graph (for standalone debugging).
@@ -336,7 +506,105 @@ pub fn dump_egglog_program(graph: &Graph) -> String {
 /// equality saturation.
 fn graph_to_egglog(graph: &Graph) -> String {
     let mut prog = String::new();
+    egglog_prelude(&mut prog);
 
+    // Encode every node (forward AND backward)
+    for node in graph.nodes() {
+        if matches!(node.op, Op::Nop) {
+            continue;
+        }
+        let expr = node_to_egglog_expr(node);
+        prog.push_str(&format!("(let n{} {})\n", node.id, expr));
+    }
+
+    // Run equality saturation with a bounded iteration count to keep it
+    // fast. The deepest current rewrite chain is two rules
+    // (Mul(x, Sigmoid(x)) → Silu, then Mul(Silu, up) → SwiGLU), so two
+    // iterations reach a fixpoint; the third is margin for future rules.
+    prog.push_str("(run 3)\n\n");
+
+    // Extraction is now done programmatically via the Extractor API
+    // (with FusionCostModel) in optimize_with_report. Legacy text-based
+    // extraction kept as fallback.
+    for &out in graph.outputs() {
+        if !matches!(graph.node(out).op, Op::Nop) {
+            prog.push_str(&format!("(extract n{})\n", out));
+        }
+    }
+
+    prog
+}
+
+/// Egglog program for a single instance of a repeated region: external
+/// dependencies become opaque `Input` leaves, region nodes are encoded
+/// as usual, and saturation runs on just this block. Block outputs
+/// (nodes consumed outside the instance, plus graph outputs) are what
+/// the caller extracts. Returns the program and the external node ids
+/// (needed to size their e-classes for traffic-aware extraction).
+fn region_egglog_program(graph: &Graph, region: &crate::outline::Region) -> (String, Vec<usize>) {
+    let lo = region.start;
+    let hi = region.start + region.period;
+    let mut prog = String::new();
+    egglog_prelude(&mut prog);
+
+    let mut externals: Vec<usize> = Vec::new();
+    for node in &graph.nodes()[lo..hi] {
+        if matches!(node.op, Op::Nop) {
+            continue;
+        }
+        for &input in &node.inputs {
+            let input = input as usize;
+            if !(lo..hi).contains(&input) && !externals.contains(&input) {
+                externals.push(input);
+            }
+        }
+    }
+    externals.sort_unstable();
+    for &e in &externals {
+        prog.push_str(&format!("(let n{} (Input \"ext{}\"))\n", e, e));
+    }
+    for node in &graph.nodes()[lo..hi] {
+        if matches!(node.op, Op::Nop) {
+            continue;
+        }
+        let expr = node_to_egglog_expr(node);
+        prog.push_str(&format!("(let n{} {})\n", node.id, expr));
+    }
+    // Same iteration bound as the full-graph program (see graph_to_egglog).
+    prog.push_str("(run 3)\n\n");
+    (prog, externals)
+}
+
+/// Nodes of a region instance that are consumed outside it (chain edges
+/// into the next instance, residual taps, …) plus any graph outputs —
+/// the extraction roots for the outlined program.
+fn region_outputs(graph: &Graph, region: &crate::outline::Region) -> Vec<u32> {
+    let lo = region.start;
+    let hi = region.start + region.period;
+    let mut outs: Vec<u32> = Vec::new();
+    for node in graph.nodes() {
+        let id = node.id as usize;
+        if (lo..hi).contains(&id) || matches!(node.op, Op::Nop) {
+            continue;
+        }
+        for &input in &node.inputs {
+            if (lo..hi).contains(&(input as usize)) && !outs.contains(&input) {
+                outs.push(input);
+            }
+        }
+    }
+    for &out in graph.outputs() {
+        if (lo..hi).contains(&(out as usize)) && !outs.contains(&out) {
+            outs.push(out);
+        }
+    }
+    outs.sort_unstable();
+    outs
+}
+
+/// The egglog sort/constructor declarations and rewrite rules shared by
+/// the full-graph and outlined-region programs.
+fn egglog_prelude(prog: &mut String) {
     // Sort and constructors — covers forward, backward, and fused ops
     prog.push_str(
         "\
@@ -473,30 +741,6 @@ fn graph_to_egglog(graph: &Graph) -> String {
 
 ",
     );
-
-    // Encode every node (forward AND backward)
-    for node in graph.nodes() {
-        if matches!(node.op, Op::Nop) {
-            continue;
-        }
-        let expr = node_to_egglog_expr(node);
-        prog.push_str(&format!("(let n{} {})\n", node.id, expr));
-    }
-
-    // Run equality saturation with a node limit to keep saturation fast.
-    // The fusion rules only need one pass — they're not iterative.
-    prog.push_str("(run 1)\n\n");
-
-    // Extraction is now done programmatically via the Extractor API
-    // (with FusionCostModel) in optimize_with_report. Legacy text-based
-    // extraction kept as fallback.
-    for &out in graph.outputs() {
-        if !matches!(graph.node(out).op, Op::Nop) {
-            prog.push_str(&format!("(extract n{})\n", out));
-        }
-    }
-
-    prog
 }
 
 fn node_to_egglog_expr(node: &Node) -> String {
@@ -615,47 +859,41 @@ fn node_to_egglog_expr(node: &Node) -> String {
     }
 }
 
-/// Rebuild the graph using egglog extraction results.
+/// Rebuild the graph, applying the fusions the extractor chose.
 ///
-/// Each extraction is a `(TermDag, TermId)` from egglog's `(extract ...)`.
-/// We walk the term trees, matching them back to original graph nodes.
-/// Where egglog chose a fused variant (e.g. FusedMatMulAdd instead of
-/// Add(MatMul, x)), we apply the fusion in the graph.
-///
-/// Falls back to manual pattern matching if no extractions are available
-/// (e.g. egglog failed or the graph has no extract commands).
+/// `chosen` is the set of fusion-relevant constructor names found in the
+/// extracted terms (`None` = no extraction information; apply everything,
+/// matching the e-graph's cost model by construction since every current
+/// rewrite strictly reduces traffic). The concrete rewriting still goes
+/// through pattern appliers — they enforce graph-level constraints the
+/// e-graph doesn't see (single-use producers, output pinning) and visit
+/// every instance of a repeated region.
 fn rebuild_graph_from_extractions(
     original: &Graph,
-    extractions: &[(TermDag, TermId)],
+    chosen: Option<&HashSet<String>>,
 ) -> (Graph, Vec<(String, u32)>) {
     let mut graph = clone_graph(original);
     let mut fusions = Vec::new();
-
-    if !extractions.is_empty() {
-        // Build a lookup: (op_name, input_node_ids) → graph node id.
-        // This lets us match extracted terms back to original graph nodes.
-        let mut node_lookup: HashMap<String, Vec<usize>> = HashMap::new();
-        for node in graph.nodes() {
-            let key = egglog_key(node);
-            node_lookup.entry(key).or_default().push(node.id as usize);
-        }
-
-        // Walk each extracted term tree looking for fused ops that differ
-        // from the original graph. When we find a FusedMatMul*Add that
-        // corresponds to an original Add(MatMul*(...), d), apply the fusion.
-        for &(ref dag, root) in extractions {
-            scan_fusions(dag, root, &graph, &node_lookup, &mut fusions);
-        }
-    }
+    let enabled = |kinds: &[&str]| {
+        chosen.is_none_or(|chosen| kinds.iter().any(|k| chosen.contains(*k)))
+    };
 
     // Apply fusion rules iteratively until fixpoint.
     // Each rule fires on matching patterns, potentially exposing new patterns
     // for subsequent rules (like e-graph saturation, but on the graph IR).
     loop {
         let n = fusions.len();
-        apply_matmul_add_fusions(&mut graph, &mut fusions);
-        apply_silu_fusions(&mut graph, &mut fusions);
-        apply_swiglu_fusions(&mut graph, &mut fusions);
+        if enabled(&["FusedMatMulAdd", "FusedMatMulATAdd", "FusedMatMulBTAdd"]) {
+            apply_matmul_add_fusions(&mut graph, &mut fusions);
+        }
+        if enabled(&["Silu"]) {
+            apply_silu_fusions(&mut graph, &mut fusions);
+        }
+        if enabled(&["SwiGLU"]) {
+            apply_swiglu_fusions(&mut graph, &mut fusions);
+        }
+        // SwiGLUConcat isn't expressible as an egglog rewrite (it creates
+        // a concatenated weight tensor), so it's never gated.
         apply_swiglu_concat_fusions(&mut graph, &mut fusions);
         // RmsNorm+MatMul fusion: eliminates ~30 dispatches on transformer
         // prefill by folding the norm's rsqrt prologue into the matmul
@@ -696,31 +934,31 @@ fn rebuild_graph_from_extractions(
     (graph, fusions)
 }
 
-/// Generate a lookup key for a graph node (op name + input IDs).
-fn egglog_key(node: &Node) -> String {
-    let op_name = match node.op {
-        Op::Input { ref name } => format!("Input:{}", name),
-        Op::Parameter { ref name } => format!("Parameter:{}", name),
-        Op::Constant { .. } => format!("Const:{}", node.id),
-        _ => format!("{:?}", std::mem::discriminant(&node.op)),
-    };
-    format!("{}:{:?}", op_name, node.inputs)
-}
-
-/// Walk an extracted term tree looking for fused ops.
-fn scan_fusions(
-    dag: &TermDag,
-    term_id: TermId,
-    _graph: &Graph,
-    _lookup: &HashMap<String, Vec<usize>>,
-    _fusions: &mut Vec<(String, u32)>,
-) {
+/// Walk an extracted term tree and record the fusion-relevant
+/// constructors the extractor chose. These gate which pattern appliers
+/// run in [`rebuild_graph_from_extractions`].
+fn collect_chosen_kinds(dag: &TermDag, term_id: TermId, kinds: &mut HashSet<String>) {
     if let Term::App(name, children) = dag.get(term_id).clone() {
-        if name.starts_with("FusedMatMul") || name.starts_with("FusedRmsNorm") {
-            log::debug!("egglog discovered fusion: {}", name);
+        if matches!(
+            &*name,
+            "FusedMatMulAdd"
+                | "FusedMatMulATAdd"
+                | "FusedMatMulBTAdd"
+                | "FusedRmsNormMatMul"
+                | "Silu"
+                | "SwiGLU"
+        ) {
+            kinds.insert(name.to_string());
+        }
+        // The graph-level appliers rewrite step by step, so a chosen
+        // end state implies its stepping stones: an extracted SwiGLU
+        // term contains no Silu node, but reaching SwiGLU in the graph
+        // goes through Mul(x, Sigmoid(x)) → Silu first.
+        if &*name == "SwiGLU" {
+            kinds.insert("Silu".to_string());
         }
         for child in children {
-            scan_fusions(dag, child, _graph, _lookup, _fusions);
+            collect_chosen_kinds(dag, child, kinds);
         }
     }
 }

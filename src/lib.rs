@@ -30,6 +30,7 @@ pub mod memplan;
 pub mod models;
 pub mod nn;
 pub mod optimize;
+pub mod outline;
 pub mod profiler;
 pub mod runtime;
 pub mod schedule;
