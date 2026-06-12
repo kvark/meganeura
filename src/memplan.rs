@@ -16,6 +16,13 @@
 //! bounds-guarded and never read past the logical extent. Addend
 //! padding garbage can only land in the discarded output padding.
 //! Re-check this reasoning if a kernel ever gains unguarded reads.
+//!
+//! The same pinning analysis also decides memory placement: pinned
+//! buffers are host-accessed (uploads, readbacks, external binding)
+//! and must stay `Memory::Shared`; everything else is only ever
+//! touched by GPU dispatches and goes in `Memory::Device`, which on
+//! discrete boards avoids routing intermediate traffic through the
+//! host-visible (ReBAR) heap.
 
 use crate::compile::{BufferRef, ExecutionPlan, ShaderEntry};
 use std::ops::Range;
@@ -26,14 +33,22 @@ pub struct AliasPlan {
     pub map: Vec<usize>,
     /// Size in bytes of each physical allocation (max over its tenants).
     pub sizes: Vec<usize>,
+    /// Per physical allocation: every tenant is a step-local
+    /// intermediate that no host path ever touches, so the allocation
+    /// may live in `Memory::Device` (device-local, not host-visible).
+    /// Pinned buffers — anything uploaded, read back, or externally
+    /// bindable — must stay host-visible.
+    pub device_local: Vec<bool>,
 }
 
 impl AliasPlan {
-    /// One physical allocation per logical buffer (aliasing disabled).
+    /// One physical allocation per logical buffer, all host-visible
+    /// (both aliasing and device-local placement disabled).
     pub fn identity(buffer_sizes: &[usize]) -> Self {
         Self {
             map: (0..buffer_sizes.len()).collect(),
             sizes: buffer_sizes.to_vec(),
+            device_local: vec![false; buffer_sizes.len()],
         }
     }
 
@@ -43,6 +58,15 @@ impl AliasPlan {
 
     pub fn physical_bytes(&self) -> usize {
         self.sizes.iter().sum()
+    }
+
+    /// Bytes placed in device-local (non-host-visible) memory.
+    pub fn device_local_bytes(&self) -> usize {
+        self.sizes
+            .iter()
+            .zip(&self.device_local)
+            .filter_map(|(&s, &d)| d.then_some(s))
+            .sum()
     }
 }
 
@@ -79,6 +103,91 @@ impl BufferUse {
 /// - any buffer whose first use is a read (live-in from a prior step),
 ///   and any buffer no dispatch touches.
 pub fn plan_buffer_aliasing(plan: &ExecutionPlan, groups: &[Range<usize>]) -> AliasPlan {
+    let (pinned, uses) = compute_pinned(plan, groups);
+    let n = plan.buffers.len();
+
+    let mut map = vec![usize::MAX; n];
+    let mut sizes = Vec::new();
+    let mut device_local = Vec::new();
+    for i in 0..n {
+        if pinned[i] {
+            map[i] = sizes.len();
+            sizes.push(plan.buffers[i]);
+            device_local.push(false);
+        }
+    }
+
+    // Greedy best-fit over live intervals [first_write, last_use].
+    let mut order: Vec<usize> = (0..n).filter(|&i| !pinned[i]).collect();
+    order.sort_by_key(|&i| (uses[i].first_write.unwrap(), std::cmp::Reverse(plan.buffers[i])));
+    // Allocations open for reuse: (last group used, physical index).
+    let mut pool: Vec<(usize, usize)> = Vec::new();
+    for i in order {
+        let start = uses[i].first_write.unwrap();
+        let end = uses[i].last_use.unwrap();
+        let need = plan.buffers[i];
+        // Among allocations free strictly before `start`, prefer the
+        // smallest that already fits; otherwise the largest (grows least).
+        let mut best: Option<usize> = None; // index into pool
+        for (pi, &(free_after, phys)) in pool.iter().enumerate() {
+            if free_after >= start {
+                continue;
+            }
+            best = Some(match best {
+                None => pi,
+                Some(bi) => {
+                    let (bs, cs) = (sizes[pool[bi].1], sizes[phys]);
+                    let better = if bs >= need && cs >= need {
+                        cs < bs
+                    } else {
+                        cs > bs
+                    };
+                    if better { pi } else { bi }
+                }
+            });
+        }
+        match best {
+            Some(pi) => {
+                let phys = pool[pi].1;
+                sizes[phys] = sizes[phys].max(need);
+                pool[pi].0 = end;
+                map[i] = phys;
+            }
+            None => {
+                map[i] = sizes.len();
+                sizes.push(need);
+                device_local.push(true);
+                pool.push((end, map[i]));
+            }
+        }
+    }
+
+    AliasPlan {
+        map,
+        sizes,
+        device_local,
+    }
+}
+
+/// One physical allocation per logical buffer (no aliasing), but with
+/// the same host-visibility classification as [`plan_buffer_aliasing`]
+/// — step-local intermediates are still marked for `Memory::Device`.
+/// Used when `MEGANEURA_NO_ALIAS` disables reuse, so the aliasing and
+/// device-local decisions can be toggled independently.
+pub fn plan_no_alias(plan: &ExecutionPlan, groups: &[Range<usize>]) -> AliasPlan {
+    let (pinned, _) = compute_pinned(plan, groups);
+    AliasPlan {
+        map: (0..plan.buffers.len()).collect(),
+        sizes: plan.buffers.clone(),
+        device_local: pinned.iter().map(|&p| !p).collect(),
+    }
+}
+
+/// The pinning analysis shared by aliasing and memory-class decisions:
+/// which buffers must keep a dedicated, host-visible allocation (see
+/// [`plan_buffer_aliasing`] for the full list), plus the per-buffer
+/// barrier-group use intervals.
+fn compute_pinned(plan: &ExecutionPlan, groups: &[Range<usize>]) -> (Vec<bool>, Vec<BufferUse>) {
     let n = plan.buffers.len();
     let mut pinned = vec![false; n];
     let pin = |b: BufferRef, pinned: &mut Vec<bool>| {
@@ -149,6 +258,25 @@ pub fn plan_buffer_aliasing(plan: &ExecutionPlan, groups: &[Range<usize>]) -> Al
             _ => {}
         }
     }
+    // Debug aid: MEGANEURA_PIN_BUFS="3,17,25-40" force-pins logical
+    // buffers, excluding them from aliasing. Used to bisect aliasing
+    // corruption down to a single buffer.
+    if let Ok(spec) = std::env::var("MEGANEURA_PIN_BUFS") {
+        for part in spec.split(',').filter(|s| !s.is_empty()) {
+            if let Some((a, b)) = part.split_once('-') {
+                let (a, b): (usize, usize) = (a.parse().unwrap(), b.parse().unwrap());
+                for i in a..=b.min(n - 1) {
+                    pinned[i] = true;
+                }
+            } else {
+                let i: usize = part.parse().unwrap();
+                if i < n {
+                    pinned[i] = true;
+                }
+            }
+        }
+    }
+
     for (i, u) in uses.iter().enumerate() {
         let live_in = match (u.first_read, u.first_write) {
             // Read at or before the first write: contents carry over
@@ -166,60 +294,7 @@ pub fn plan_buffer_aliasing(plan: &ExecutionPlan, groups: &[Range<usize>]) -> Al
         }
     }
 
-    let mut map = vec![usize::MAX; n];
-    let mut sizes = Vec::new();
-    for i in 0..n {
-        if pinned[i] {
-            map[i] = sizes.len();
-            sizes.push(plan.buffers[i]);
-        }
-    }
-
-    // Greedy best-fit over live intervals [first_write, last_use].
-    let mut order: Vec<usize> = (0..n).filter(|&i| !pinned[i]).collect();
-    order.sort_by_key(|&i| (uses[i].first_write.unwrap(), std::cmp::Reverse(plan.buffers[i])));
-    // Allocations open for reuse: (last group used, physical index).
-    let mut pool: Vec<(usize, usize)> = Vec::new();
-    for i in order {
-        let start = uses[i].first_write.unwrap();
-        let end = uses[i].last_use.unwrap();
-        let need = plan.buffers[i];
-        // Among allocations free strictly before `start`, prefer the
-        // smallest that already fits; otherwise the largest (grows least).
-        let mut best: Option<usize> = None; // index into pool
-        for (pi, &(free_after, phys)) in pool.iter().enumerate() {
-            if free_after >= start {
-                continue;
-            }
-            best = Some(match best {
-                None => pi,
-                Some(bi) => {
-                    let (bs, cs) = (sizes[pool[bi].1], sizes[phys]);
-                    let better = if bs >= need && cs >= need {
-                        cs < bs
-                    } else {
-                        cs > bs
-                    };
-                    if better { pi } else { bi }
-                }
-            });
-        }
-        match best {
-            Some(pi) => {
-                let phys = pool[pi].1;
-                sizes[phys] = sizes[phys].max(need);
-                pool[pi].0 = end;
-                map[i] = phys;
-            }
-            None => {
-                map[i] = sizes.len();
-                sizes.push(need);
-                pool.push((end, map[i]));
-            }
-        }
-    }
-
-    AliasPlan { map, sizes }
+    (pinned, uses)
 }
 
 #[cfg(test)]
@@ -315,6 +390,35 @@ mod tests {
         assert_eq!(alias.sizes[alias.map[1]], 200);
         assert!(alias.physical_bytes() < alias.logical_bytes(&p.buffers));
         check_disjoint(&p, &groups, &alias);
+        // Memory classes: intermediates device-local, pinned host-visible.
+        assert!(alias.device_local[alias.map[1]]);
+        assert!(alias.device_local[alias.map[2]]);
+        assert!(!alias.device_local[alias.map[0]], "input stays host-visible");
+        assert!(!alias.device_local[alias.map[4]], "output stays host-visible");
+        assert_eq!(alias.device_local.len(), alias.sizes.len());
+    }
+
+    #[test]
+    fn no_alias_keeps_memory_classes() {
+        // MEGANEURA_NO_ALIAS path: identity mapping, but intermediates
+        // are still classified for device-local placement.
+        let mut p = plan(
+            vec![16, 100, 16, 200, 16],
+            vec![
+                dispatch(&[0], 1),
+                dispatch(&[1], 2),
+                dispatch(&[2], 3),
+                dispatch(&[3], 4),
+            ],
+        );
+        p.input_buffers.push(("x".into(), BufferRef(0)));
+        p.output_buffers.push(BufferRef(4));
+        let groups: Vec<Range<usize>> = (0..4).map(|i| i..i + 1).collect();
+        let alias = plan_no_alias(&p, &groups);
+        assert_eq!(alias.map, vec![0, 1, 2, 3, 4]);
+        assert_eq!(alias.sizes, p.buffers);
+        assert_eq!(alias.device_local, vec![false, true, true, true, false]);
+        assert_eq!(alias.device_local_bytes(), 316);
     }
 
     #[test]

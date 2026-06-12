@@ -2891,9 +2891,16 @@ impl<'a> Compiler<'a> {
                     // MatMul: C = A @ B where A=[M,K], B=[K,N]
                     // A = dOutput[batch*HW, Co], B = weight[Co, Ci] needs transpose to [Co, Ci] → already in right order!
                     // Actually weight is [Co, Ci], so we need A @ B where B is [Co, Ci] → use MatMul (not BT)
+                    //
+                    // Dispatch axes follow matmul.wgsl's convention:
+                    // wgid.x → N tiles, wgid.y → M tiles (same as the
+                    // Op::MatMul arm). This arm had them swapped, so for
+                    // batch*H*W > tile the M tail of grad_input was never
+                    // written and read back stale/aliased memory — the
+                    // van-world res≥16 training-gradient corruption.
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::MatMul,
-                        workgroups: [m.div_ceil(tile), n.div_ceil(tile), 1],
+                        workgroups: [n.div_ceil(tile), m.div_ceil(tile), 1],
                         input_buffers: vec![grad_out, kernel],
                         output_buffer: out_buf,
                         extra_outputs: vec![],
@@ -2976,7 +2983,10 @@ impl<'a> Compiler<'a> {
                     let tile: u32 = 64;
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::MatMulAT,
-                        workgroups: [m.div_ceil(tile), n.div_ceil(tile), 1],
+                        // wgid.x → N tiles, wgid.y → M tiles, matching the
+                        // Op::MatMulAT arm (was swapped; latent until
+                        // Co or Ci exceeds one tile).
+                        workgroups: [n.div_ceil(tile), m.div_ceil(tile), 1],
                         input_buffers: vec![grad_out, input],
                         output_buffer: out_buf,
                         extra_outputs: vec![],

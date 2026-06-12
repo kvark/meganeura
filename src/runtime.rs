@@ -34,16 +34,20 @@ pub struct MemorySummary {
     pub allocated_buffer_bytes: usize,
     /// Number of physical allocations backing the logical buffers.
     pub num_allocations: usize,
+    /// Bytes placed in device-local (non-host-visible) memory —
+    /// step-local intermediates on discrete GPUs.
+    pub device_local_bytes: usize,
 }
 
 impl std::fmt::Display for MemorySummary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} buffers in {} allocations, {:.1} MB allocated ({:.1} MB logical, {:.1} MB adam state), largest {:.1} MB",
+            "{} buffers in {} allocations, {:.1} MB allocated ({:.1} MB device-local, {:.1} MB logical, {:.1} MB adam state), largest {:.1} MB",
             self.num_buffers,
             self.num_allocations,
             self.allocated_buffer_bytes as f64 / 1e6,
+            self.device_local_bytes as f64 / 1e6,
             self.total_buffer_bytes as f64 / 1e6,
             self.adam_state_bytes as f64 / 1e6,
             self.largest_buffer_bytes as f64 / 1e6,
@@ -2056,18 +2060,50 @@ impl Session {
         // Lifetime-based buffer aliasing: step-local intermediates with
         // disjoint live ranges (at barrier-group granularity) share one
         // physical allocation. See `memplan` for the safety argument.
-        let alias = if std::env::var("MEGANEURA_NO_ALIAS").is_ok() {
+        let mut alias = if std::env::var("MEGANEURA_NO_ALIAS").is_ok() {
             log::info!("MEGANEURA_NO_ALIAS: buffer aliasing disabled");
-            crate::memplan::AliasPlan::identity(&plan.buffers)
+            crate::memplan::plan_no_alias(&plan, &groups)
         } else {
             crate::memplan::plan_buffer_aliasing(&plan, &groups)
         };
+        // Step-local intermediates default to device-local memory on the
+        // theory that host-visible (ReBAR) traffic is slower on discrete
+        // boards; kill switch for measurement and UMA debugging.
+        if std::env::var("MEGANEURA_NO_DEVICE_LOCAL").is_ok() {
+            log::info!("MEGANEURA_NO_DEVICE_LOCAL: all buffers host-visible");
+            alias.device_local.fill(false);
+        }
+        let alias = alias;
+        // Debug aid: dump dispatch order, declared accesses, and the
+        // alias map for corruption bisection (see MEGANEURA_PIN_BUFS).
+        if std::env::var("MEGANEURA_DUMP_PLAN").is_ok() {
+            for (gi, range) in groups.iter().enumerate() {
+                for i in range.clone() {
+                    let d = &plan.dispatches[i];
+                    eprintln!(
+                        "g{gi:03} d{i:03} {:?} in={:?} out={} wg={:?} params={:?}",
+                        d.shader,
+                        d.input_buffers.iter().map(|b| b.0).collect::<Vec<_>>(),
+                        d.output_buffer.0,
+                        d.workgroups,
+                        d.params
+                    );
+                }
+            }
+            for (i, &phys) in alias.map.iter().enumerate() {
+                eprintln!(
+                    "buf {i:03} ({} B) -> phys {phys} ({} B)",
+                    plan.buffers[i], alias.sizes[phys]
+                );
+            }
+        }
         log::info!(
-            "buffer aliasing: {} logical buffers ({:.1} MB) -> {} allocations ({:.1} MB)",
+            "buffer aliasing: {} logical buffers ({:.1} MB) -> {} allocations ({:.1} MB, {:.1} MB device-local)",
             plan.buffers.len(),
             alias.logical_bytes(&plan.buffers) as f64 / 1e6,
             alias.sizes.len(),
             alias.physical_bytes() as f64 / 1e6,
+            alias.device_local_bytes() as f64 / 1e6,
         );
         let physical_buffers: Vec<blade_graphics::Buffer> = alias
             .sizes
@@ -2075,15 +2111,24 @@ impl Session {
             .enumerate()
             .map(|(i, &size)| {
                 let size = size.max(4);
+                let device_local = alias.device_local[i];
                 let buf = gpu.create_buffer(blade_graphics::BufferDesc {
                     name: &format!("buf_{}", i),
                     size: size as u64,
-                    memory: blade_graphics::Memory::Shared,
+                    memory: if device_local {
+                        blade_graphics::Memory::Device
+                    } else {
+                        blade_graphics::Memory::Shared
+                    },
                 });
                 // Zero-fill to prevent NaN from uninitialized padding regions
                 // (coop tiles read/write full tiles beyond logical dimensions).
-                unsafe {
-                    std::ptr::write_bytes(buf.data(), 0, size);
+                // Device-local buffers have no host pointer; they are
+                // zero-filled on the GPU below, before the first step().
+                if !device_local {
+                    unsafe {
+                        std::ptr::write_bytes(buf.data(), 0, size);
+                    }
                 }
                 buf
             })
@@ -2101,10 +2146,28 @@ impl Session {
         }
 
         let pipelines = Pipelines::new(&gpu, &plan, coop_config.as_ref());
-        let encoder = gpu.create_command_encoder(blade_graphics::CommandEncoderDesc {
+        let mut encoder = gpu.create_command_encoder(blade_graphics::CommandEncoderDesc {
             name: "meganeura",
             buffer_count: 2,
         });
+
+        // Zero-fill device-local allocations on the GPU (no host pointer).
+        // One submission at build time; the wait below orders it before
+        // the first step()'s reads.
+        if alias.device_local.iter().any(|&d| d) {
+            encoder.start();
+            {
+                let mut transfer = encoder.transfer("zero_device_local");
+                for (i, &device_local) in alias.device_local.iter().enumerate() {
+                    if device_local {
+                        let size = alias.sizes[i].max(4) as u64;
+                        transfer.fill_buffer(physical_buffers[i].at(0), size, 0);
+                    }
+                }
+            }
+            let sp = gpu.submit(&mut encoder);
+            let _ = gpu.wait_for(&sp, !0);
+        }
 
         let adam_state = plan
             .param_grad_pairs
@@ -2876,11 +2939,13 @@ impl Session {
     }
 
     /// Raw host pointer and byte size for the named input slot's
-    /// backing buffer. All graph buffers are allocated as
-    /// `Memory::Shared` (device-local + host-visible + host-coherent),
-    /// so writes through this pointer go straight into the GPU-side
-    /// buffer — no staging, no explicit upload, no
-    /// `VK_EXT_external_memory_host` import needed.
+    /// backing buffer. Input buffers are pinned by the memory plan and
+    /// allocated as `Memory::Shared` (device-local + host-visible +
+    /// host-coherent), so writes through this pointer go straight into
+    /// the GPU-side buffer — no staging, no explicit upload, no
+    /// `VK_EXT_external_memory_host` import needed. (Step-local
+    /// intermediates may live in `Memory::Device` instead, but those
+    /// are never exposed through this API.)
     ///
     /// Returns `None` if no input with that name exists.
     ///
@@ -2967,6 +3032,14 @@ impl Session {
              (e.g. graph says [batch * channels * area], safetensor says [channels]).",
             buf_ref.0, data.len(), expected,
         );
+        // All upload targets (params, inputs) are pinned by the memory
+        // plan and therefore host-visible; a null pointer here means a
+        // buffer class regression, not a user error.
+        assert!(
+            !buffer.data().is_null(),
+            "upload_buffer: buffer {} is device-local (not host-visible)",
+            buf_ref.0
+        );
         unsafe {
             let ptr = buffer.data();
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
@@ -3036,12 +3109,44 @@ impl Session {
     }
 
     /// Read back a buffer's contents.
+    ///
+    /// Host-visible buffers (params, grads, inputs, outputs, loss) read
+    /// directly through the mapped pointer. Device-local intermediates
+    /// take a staging round-trip with its own submit + wait — fine for
+    /// tests and diagnostics, not for a hot path.
     pub fn read_buffer(&self, buf_ref: BufferRef, out: &mut [f32]) {
         let buffer = &self.buffers[buf_ref.0 as usize];
+        if !buffer.data().is_null() {
+            unsafe {
+                let ptr = buffer.data() as *const f32;
+                std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), out.len());
+            }
+            return;
+        }
+        let bytes = std::mem::size_of_val(out) as u64;
+        let staging = self.gpu.create_buffer(blade_graphics::BufferDesc {
+            name: "readback_staging",
+            size: bytes.max(4),
+            memory: blade_graphics::Memory::Shared,
+        });
+        let mut encoder = self
+            .gpu
+            .create_command_encoder(blade_graphics::CommandEncoderDesc {
+                name: "readback",
+                buffer_count: 1,
+            });
+        encoder.start();
+        encoder
+            .transfer("readback_copy")
+            .copy_buffer_to_buffer(buffer.at(0), staging.at(0), bytes);
+        let sp = self.gpu.submit(&mut encoder);
+        let _ = self.gpu.wait_for(&sp, !0);
         unsafe {
-            let ptr = buffer.data() as *const f32;
+            let ptr = staging.data() as *const f32;
             std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), out.len());
         }
+        self.gpu.destroy_command_encoder(&mut encoder);
+        self.gpu.destroy_buffer(staging);
     }
 
     /// Read back a graph output by index.
@@ -4990,6 +5095,7 @@ impl Session {
             largest_buffer_bytes: largest,
             allocated_buffer_bytes: self.alias.physical_bytes(),
             num_allocations: self.alias.sizes.len(),
+            device_local_bytes: self.alias.device_local_bytes(),
         }
     }
 
