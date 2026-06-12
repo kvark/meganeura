@@ -2620,44 +2620,17 @@ impl<'a> Compiler<'a> {
                 let out_w = (in_w + 2 * padding_w - kernel_w) / stride + 1;
                 let batch = in_shape[0] as u32 / (in_channels * in_h * in_w);
 
-                // 1×1 stride-1 conv → pure MatMul (no im2col).
-                // output[b, Co, h, w] = sum_Ci(input[b, Ci, h, w] * W[Co, Ci])
-                // Reshape: input as [batch*H*W, Ci], weight as [Ci, Co] → matmul
-                if kernel_h == 1 && kernel_w == 1 && stride == 1 && padding_h == 0 && padding_w == 0
+                // No 1×1 MatMul shortcut: the previous one viewed NCHW
+                // input as [batch*H*W, Ci] row-major, which is a transposed
+                // (pixel-scrambling) read of the actual [Ci, H*W] layout —
+                // and its output was [HW, Co] while every consumer expects
+                // [Co, HW]. Matching transposed views in the backward
+                // shortcuts made training self-consistent, so gradchecks
+                // passed while the network fought a fixed scrambler on
+                // every residual projection. The general GEMM path is
+                // CPU-parity-verified (tests/inference_parity_large.rs)
+                // and handles kernel 1×1 as a degenerate im2col.
                 {
-                    let m = batch * in_h * in_w;
-                    let n = out_channels;
-                    let k = in_channels;
-                    let tile_size = 64u32;
-                    let wgs_64 = m.div_ceil(tile_size) * n.div_ceil(tile_size);
-                    let (shader, tile) = if wgs_64 < 16 {
-                        (ShaderEntry::MatMulBT, 32u32)
-                    } else {
-                        (ShaderEntry::MatMulBT, 64u32)
-                    };
-                    // Weight is [Co, Ci] (stored row-major), input is [batch*HW, Ci].
-                    // MatMulBT: C = A @ B^T where A=[M,K], B=[N,K] → C=[M,N]
-                    // A = input[batch*HW, Ci], B = weight[Co, Ci], C = output[batch*HW, Co]
-                    //
-                    // Dispatch axes match matmul.wgsl's convention: wgid.x → N
-                    // tiles (tile_col), wgid.y → M tiles (tile_row).  Every
-                    // other matmul dispatch in this file uses this ordering;
-                    // the 1×1 conv shortcut briefly didn't, which silently
-                    // dropped all output rows past the first workgroup-column
-                    // for any out_channels < tile size (= every 1×1 conv in
-                    // V2-S, since Co ∈ {24, 48, 64, 128, 160} all < 64).
-                    self.plan.dispatches.push(Dispatch {
-                        shader,
-                        workgroups: [n.div_ceil(tile), m.div_ceil(tile), 1],
-                        input_buffers: vec![input, kernel],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![m, n, k, 0],
-                        use_coop: false,
-                        use_small_tiles: wgs_64 < 16,
-                        ..Default::default()
-                    });
-                } else {
                     // Use implicit GEMM: output = weight @ im2col(input)^T
                     // M=Co, N=oH*oW, K=Ci*kH*kW, batched in z dimension
                     // Use small (32×32) tiles when workgroup count per batch is low.
@@ -2880,36 +2853,10 @@ impl<'a> Compiler<'a> {
                 let out_size = node.ty.shape[0] as u32;
                 let batch = out_size / (in_channels * in_h * in_w);
 
-                // 1×1 stride-1 grad_input → MatMul: dInput = dOutput @ W
-                // dOutput is [batch*H*W, Co], W is [Co, Ci] → dInput = [batch*H*W, Ci]
-                if kernel_h == 1 && kernel_w == 1 && stride == 1 && padding_h == 0 && padding_w == 0
+                // No 1×1 MatMul shortcut — see the Op::Conv2d arm: the
+                // shortcut family used a transposed (NHWC-ish) view of
+                // NCHW data. The GEMM path handles kernel 1×1 correctly.
                 {
-                    let m = batch * in_h * in_w;
-                    let n = in_channels;
-                    let k = out_channels;
-                    let tile: u32 = 64;
-                    // MatMul: C = A @ B where A=[M,K], B=[K,N]
-                    // A = dOutput[batch*HW, Co], B = weight[Co, Ci] needs transpose to [Co, Ci] → already in right order!
-                    // Actually weight is [Co, Ci], so we need A @ B where B is [Co, Ci] → use MatMul (not BT)
-                    //
-                    // Dispatch axes follow matmul.wgsl's convention:
-                    // wgid.x → N tiles, wgid.y → M tiles (same as the
-                    // Op::MatMul arm). This arm had them swapped, so for
-                    // batch*H*W > tile the M tail of grad_input was never
-                    // written and read back stale/aliased memory — the
-                    // van-world res≥16 training-gradient corruption.
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::MatMul,
-                        workgroups: [n.div_ceil(tile), m.div_ceil(tile), 1],
-                        input_buffers: vec![grad_out, kernel],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![m, k, n, 0],
-                        use_coop: false,
-                        use_small_tiles: false,
-                        ..Default::default()
-                    });
-                } else {
                     // Use implicit GEMM: grad_input = weight_T @ im2col(grad_out)^T
                     // M=Ci, N=H*W, K=Co*kH*kW, batched in z dimension.
                     {
@@ -2970,32 +2917,10 @@ impl<'a> Compiler<'a> {
                 let out_size = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let batch = out_size / (out_channels * out_h * out_w);
 
-                // 1×1 stride-1 grad_weight → MatMulAT:
-                // dW[Co, Ci] = dOutput^T @ input where dOutput=[batch*HW, Co], input=[batch*HW, Ci]
-                // MatMulAT: C = A^T @ B where A=[K,M], B=[K,N]
-                // A = dOutput[batch*HW, Co], B = input[batch*HW, Ci]
-                // → C = dOutput^T[Co, batch*HW] @ input[batch*HW, Ci] = [Co, Ci]
-                if kernel_h == 1 && kernel_w == 1 && stride == 1 && padding_h == 0 && padding_w == 0
+                // No 1×1 MatMulAT shortcut — see the Op::Conv2d arm: the
+                // shortcut family used a transposed (NHWC-ish) view of
+                // NCHW data. The GEMM path handles kernel 1×1 correctly.
                 {
-                    let m = out_channels; // Co
-                    let n = in_channels; // Ci
-                    let k = batch * in_h * in_w; // batch*HW
-                    let tile: u32 = 64;
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::MatMulAT,
-                        // wgid.x → N tiles, wgid.y → M tiles, matching the
-                        // Op::MatMulAT arm (was swapped; latent until
-                        // Co or Ci exceeds one tile).
-                        workgroups: [n.div_ceil(tile), m.div_ceil(tile), 1],
-                        input_buffers: vec![grad_out, input],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![m, n, k, 0],
-                        use_coop: false,
-                        use_small_tiles: false,
-                        ..Default::default()
-                    });
-                } else {
                     // Use GEMM formulation: grad_weight[Co, Ci*kH*kW] = grad_out_flat[Co, N*oH*oW] @ im2col(input)[N*oH*oW, Ci*kH*kW]
                     let n_total = in_channels * kernel_h * kernel_w; // Ci*kH*kW
                     let m_total = out_channels; // Co
