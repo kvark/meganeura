@@ -977,10 +977,10 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
 
             // Flat position of each per-element stream in input_buffers,
             // accounting for earlier gather streams (which occupy 2 slots).
-            let mut flat = vec![0usize; per_elem];
+            let mut flat = Vec::with_capacity(per_elem);
             let mut pos = 0usize;
             for s in 0..per_elem {
-                flat[s] = pos;
+                flat.push(pos);
                 pos += if kernel.gather_elem.get(s).copied().unwrap_or(false) {
                     2
                 } else {
@@ -988,11 +988,11 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                 };
             }
 
-            for s in 0..per_elem {
+            for (s, &flat_pos) in flat.iter().enumerate() {
                 if kernel.gather_elem.get(s).copied().unwrap_or(false) {
                     continue; // already a gather leaf
                 }
-                let buf = c.input_buffers[flat[s]];
+                let buf = c.input_buffers[flat_pos];
                 if prot.contains(&buf) {
                     continue;
                 }
@@ -1025,8 +1025,8 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                 kernel.gather_elem[s] = true;
                 // Replace stream s's buffer (the embedding output) with the
                 // table, and splice the indices buffer right after it.
-                c.input_buffers[flat[s]] = table_buf;
-                c.input_buffers.insert(flat[s] + 1, idx_buf);
+                c.input_buffers[flat_pos] = table_buf;
+                c.input_buffers.insert(flat_pos + 1, idx_buf);
                 // Drop the embedding dispatch if it's now unused.
                 if reads.get(&buf).copied().unwrap_or(0) == 1 {
                     plan.dispatches.remove(pi);
