@@ -96,7 +96,7 @@ fn group_norm_silu_parity_sr_scale() {
     let x = g.input("x", &[n]);
     let w = g.parameter("w", &[c as usize]);
     let b = g.parameter("b", &[c as usize]);
-    let y = g.group_norm(x, w, b, 1, c, (hw * hw) as u32, groups, 1e-5);
+    let y = g.group_norm(x, w, b, 1, c, hw * hw, groups, 1e-5);
     let y = g.silu(y);
     g.set_outputs(vec![y]);
 

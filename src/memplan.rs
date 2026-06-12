@@ -265,8 +265,9 @@ fn compute_pinned(plan: &ExecutionPlan, groups: &[Range<usize>]) -> (Vec<bool>, 
         for part in spec.split(',').filter(|s| !s.is_empty()) {
             if let Some((a, b)) = part.split_once('-') {
                 let (a, b): (usize, usize) = (a.parse().unwrap(), b.parse().unwrap());
-                for i in a..=b.min(n - 1) {
-                    pinned[i] = true;
+                let end = b.min(n - 1);
+                if a <= end {
+                    pinned[a..=end].fill(true);
                 }
             } else {
                 let i: usize = part.parse().unwrap();
