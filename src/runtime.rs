@@ -1787,7 +1787,14 @@ impl Session {
         let gpu = unsafe {
             blade_graphics::Context::init(blade_graphics::ContextDesc {
                 validation: cfg!(debug_assertions),
-                timing: true,
+                // Opt-in: GPU pass timestamps feed dump_gpu_timings() only.
+                // Blade's timing collection reads the query pool without
+                // waiting when a command buffer is re-begun; on slow GPUs
+                // (multi-second steps) the previous submission may still
+                // be in flight and get_query_pool_results panics with
+                // NOT_READY. Off by default — set MEGANEURA_GPU_TIMING=1
+                // when profiling.
+                timing: std::env::var("MEGANEURA_GPU_TIMING").is_ok(),
                 capture: false,
                 overlay: false,
                 device_id: std::env::var("MEGANEURA_DEVICE_ID")
