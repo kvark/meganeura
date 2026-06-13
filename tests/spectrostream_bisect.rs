@@ -554,6 +554,418 @@ fn s15_chained_add_after_main_and_shortcut() {
 
 #[test]
 #[ignore]
+fn s17_block_5_in_isolation() {
+    // Build only decoder_5: in shape [128, 60, 480] (same as Block 4 output).
+    // Use synthetic input, no chaining. If output is nonzero, the chain
+    // was breaking it. If still zero, it's Block 5 itself.
+    if !Path::new(DUMP).exists() { return; }
+    let model = SafeTensorsModel::load(DUMP.into()).unwrap();
+
+    let mut g = Graph::new();
+    let in_h = 60u32; let in_w = 480u32;
+    let in_c = 128u32; let mid_c = 128u32; let out_c = 128u32;
+    let in_size = (in_c * in_h * in_w) as usize;
+    let x = g.input("x", &[in_size]);
+
+    // Mirror decoder_block(decoder_5): no shortcut conv (in_c == out_c).
+    let kt = g.parameter("decoder.decoder_5.conv2dtranspose_3x4.weight_norm.rescaled.kernel", &[3 * 4 * mid_c as usize * in_c as usize]);
+    let kt_b = g.parameter("decoder.decoder_5.conv2dtranspose_3x4.weight_norm.bias", &[mid_c as usize]);
+    let k3 = g.parameter("decoder.decoder_5.conv2d_3x3.weight_norm.rescaled.kernel", &[3 * 3 * mid_c as usize * out_c as usize]);
+    let k3_b = g.parameter("decoder.decoder_5.conv2d_3x3.weight_norm.bias", &[out_c as usize]);
+
+    let main_h = g.elu(x);
+    let main_conv = g.conv_transpose_2d_hw(main_h, kt, 1, in_c, in_h, in_w, mid_c, 3, 4, 1, 2, 0, 0);
+    // ConvT output: (1, 128, 62, 962)
+    let main_b = g.add_per_channel(main_conv, kt_b, mid_c, 62 * 962);
+    // Slice (1, 1, 1, 1): -> (128, 60, 960)
+    let main_sl = g.slice_2d(main_b, 1, mid_c, 62, 962, 1, 1, 1, 1);
+    let main_act = g.elu(main_sl);
+    let main_c3 = g.conv2d_hw(main_act, k3, 1, mid_c, 60, 960, out_c, 3, 3, 1, 0, 1);
+    let main = g.add_per_channel(main_c3, k3_b, out_c, 58 * 960);
+
+    // Shortcut: upsample_w(2), then slice2d (1, 1, 0, 0).
+    let sc_up = g.upsample_nearest(x, 1, in_c, in_h, in_w, 1, 2);
+    let sc_sliced = g.slice_2d(sc_up, 1, in_c, in_h, in_w * 2, 1, 1, 0, 0);
+
+    let out = g.add(main, sc_sliced);
+    g.set_outputs(vec![out]);
+
+    let mut s = build_inference_session(&g);
+    for (name, dims) in [
+        ("decoder.decoder_5.conv2dtranspose_3x4.weight_norm.rescaled.kernel", Some([3, 4, 128, 128])),
+        ("decoder.decoder_5.conv2d_3x3.weight_norm.rescaled.kernel", Some([3, 3, 128, 128])),
+        ("decoder.decoder_5.conv2dtranspose_3x4.weight_norm.bias", None),
+        ("decoder.decoder_5.conv2d_3x3.weight_norm.bias", None),
+    ] {
+        let raw = model.tensor_f32_auto(name).unwrap();
+        let data = if let Some(d) = dims { permute_3201(&raw, d) } else { raw };
+        s.set_parameter(name, &data);
+    }
+    // Test with multiple input scales to see if value range matters.
+    for scale in [1.0_f32, 100.0, 1000.0, 5000.0] {
+        let inp: Vec<f32> = (0..in_size).map(|i| (i as f32 * 1e-3).sin() * scale).collect();
+        s.set_input("x", &inp);
+        s.step();
+        s.wait();
+        let out_size = (out_c * 58 * 960) as usize;
+        let out = s.read_output(out_size);
+        let (nz, max_abs, mean_abs) = nonzero_count(&out);
+        println!("[s17] scale={scale:7.1} nz={nz}/{} max_abs={max_abs:.4e} mean_abs={mean_abs:.4e}", out.len());
+    }
+}
+
+#[test]
+#[ignore]
+fn s18_block_4_output_then_block_5_separate() {
+    // Run input_layer + Block 0..4 in one session, capture Block 4's output.
+    // Then create a SEPARATE session with just Block 5 and feed it that output.
+    // If Block 5 then produces non-zero, the chain-issue is in compile/schedule.
+    use meganeura::models::magenta_rt::spectrostream::{
+        build_decoder_graph_through, load_decoder_weights, DecoderStage, SpectroStreamConfig,
+    };
+    if !Path::new(DUMP).exists() { return; }
+    let model = SafeTensorsModel::load(DUMP.into()).unwrap();
+    let cfg = SpectroStreamConfig::default();
+    let num_frames = 50;
+
+    // Phase 1: run input_layer + Block 0..4
+    let mut g = Graph::new();
+    let out_b4 = build_decoder_graph_through(&mut g, &cfg, num_frames, DecoderStage::Block(4));
+    g.set_outputs(vec![out_b4]);
+    let mut s = build_inference_session(&g);
+    load_decoder_weights(&model, &mut s).unwrap();
+    let h_padded = num_frames + cfg.temporal_pad;
+    let in_size = (cfg.initial_channels * h_padded * cfg.initial_freq_bins) as usize;
+    let input: Vec<f32> = (0..in_size).map(|i| (i as f32 * 1e-7).sin()).collect();
+    s.set_input("decoder_input_preprocessed", &input);
+    s.step();
+    s.wait();
+    let b4_shape = g.node(out_b4).ty.shape.clone();
+    let b4_size: usize = b4_shape.iter().product();
+    let b4_data = s.read_output(b4_size);
+    let (nz, max_abs, mean_abs) = nonzero_count(&b4_data);
+    println!("[s18] Block(4) capture: nz={nz}/{} max_abs={max_abs:.4e} mean_abs={mean_abs:.4e}", b4_data.len());
+
+    // Phase 2: feed b4_data to Block 5 (isolated as in s17).
+    let in_h = 60u32; let in_w = 480u32;
+    let in_c = 128u32; let mid_c = 128u32; let out_c = 128u32;
+    let in_size_b5 = (in_c * in_h * in_w) as usize;
+    assert_eq!(in_size_b5, b4_data.len(), "block 4 output size mismatch");
+
+    let mut g2 = Graph::new();
+    let x = g2.input("x", &[in_size_b5]);
+    let kt = g2.parameter("decoder.decoder_5.conv2dtranspose_3x4.weight_norm.rescaled.kernel", &[3 * 4 * mid_c as usize * in_c as usize]);
+    let kt_b = g2.parameter("decoder.decoder_5.conv2dtranspose_3x4.weight_norm.bias", &[mid_c as usize]);
+    let k3 = g2.parameter("decoder.decoder_5.conv2d_3x3.weight_norm.rescaled.kernel", &[3 * 3 * mid_c as usize * out_c as usize]);
+    let k3_b = g2.parameter("decoder.decoder_5.conv2d_3x3.weight_norm.bias", &[out_c as usize]);
+    let main_h = g2.elu(x);
+    let main_conv = g2.conv_transpose_2d_hw(main_h, kt, 1, in_c, in_h, in_w, mid_c, 3, 4, 1, 2, 0, 0);
+    let main_b = g2.add_per_channel(main_conv, kt_b, mid_c, 62 * 962);
+    let main_sl = g2.slice_2d(main_b, 1, mid_c, 62, 962, 1, 1, 1, 1);
+    let main_act = g2.elu(main_sl);
+    let main_c3 = g2.conv2d_hw(main_act, k3, 1, mid_c, 60, 960, out_c, 3, 3, 1, 0, 1);
+    let main = g2.add_per_channel(main_c3, k3_b, out_c, 58 * 960);
+    let sc_up = g2.upsample_nearest(x, 1, in_c, in_h, in_w, 1, 2);
+    let sc_sliced = g2.slice_2d(sc_up, 1, in_c, in_h, in_w * 2, 1, 1, 0, 0);
+    let out_b5 = g2.add(main, sc_sliced);
+    g2.set_outputs(vec![out_b5]);
+
+    let mut s2 = build_inference_session(&g2);
+    for (name, dims) in [
+        ("decoder.decoder_5.conv2dtranspose_3x4.weight_norm.rescaled.kernel", Some([3, 4, 128, 128])),
+        ("decoder.decoder_5.conv2d_3x3.weight_norm.rescaled.kernel", Some([3, 3, 128, 128])),
+        ("decoder.decoder_5.conv2dtranspose_3x4.weight_norm.bias", None),
+        ("decoder.decoder_5.conv2d_3x3.weight_norm.bias", None),
+    ] {
+        let raw = model.tensor_f32_auto(name).unwrap();
+        let data = if let Some(d) = dims { permute_3201(&raw, d) } else { raw };
+        s2.set_parameter(name, &data);
+    }
+    s2.set_input("x", &b4_data);
+    s2.step();
+    s2.wait();
+    let out_size = (out_c * 58 * 960) as usize;
+    let out = s2.read_output(out_size);
+    let (nz, max_abs, mean_abs) = nonzero_count(&out);
+    println!("[s18] Block 5 fed with real B4 data: nz={nz}/{} max_abs={max_abs:.4e} mean_abs={mean_abs:.4e}", out.len());
+}
+
+#[test]
+#[ignore]
+fn s19_stage_sweep_unoptimized() {
+    // Same as s10 but with skip_full_optimize=true. If the optimizer is
+    // pruning Block 5+ dispatches, this should make them work.
+    use meganeura::models::magenta_rt::spectrostream::{
+        build_decoder_graph_through, load_decoder_weights, DecoderStage, SpectroStreamConfig,
+    };
+    use meganeura::{build, Mode, SessionConfig};
+    if !Path::new(DUMP).exists() { return; }
+    let model = SafeTensorsModel::load(DUMP.into()).unwrap();
+    let cfg = SpectroStreamConfig::default();
+    let num_frames = 50;
+
+    let stages = [
+        ("Block(3)",  DecoderStage::Block(3)),
+        ("Block(4)",  DecoderStage::Block(4)),
+        ("Block(5)",  DecoderStage::Block(5)),
+        ("Block(6)",  DecoderStage::Block(6)),
+        ("Output",    DecoderStage::Output),
+    ];
+    for (name, stage) in stages {
+        let mut g = Graph::new();
+        let out = build_decoder_graph_through(&mut g, &cfg, num_frames, stage);
+        g.set_outputs(vec![out]);
+        let (mut s, _) = build(&g, SessionConfig {
+            mode: Mode::Inference,
+            skip_full_optimize: true,
+            ..SessionConfig::default()
+        });
+        load_decoder_weights(&model, &mut s).unwrap();
+        let h_padded = num_frames + cfg.temporal_pad;
+        let in_size = (cfg.initial_channels * h_padded * cfg.initial_freq_bins) as usize;
+        // Use tiny input — eliminates value overflow as a possibility.
+        let input: Vec<f32> = (0..in_size).map(|i| (i as f32 * 1e-10).sin()).collect();
+        s.set_input("decoder_input_preprocessed", &input);
+        s.step();
+        s.wait();
+        let out_shape = g.node(out).ty.shape.clone();
+        let expected = out_shape.iter().product::<usize>();
+        let data = s.read_output(expected);
+        let (nz, max_abs, mean_abs) = nonzero_count(&data);
+        println!("[s19] {name:12} shape={out_shape:?} nz={nz}/{} max_abs={max_abs:.4e} mean_abs={mean_abs:.4e}", data.len());
+    }
+}
+
+#[test]
+#[ignore]
+fn s20_compare_plans() {
+    // Compare s10 (build_inference_session) and s19 (skip_full_optimize=true)
+    // plan structure for the same graph. They should be identical per source code,
+    // but produce different results.
+    use meganeura::models::magenta_rt::spectrostream::{
+        build_decoder_graph_through, DecoderStage, SpectroStreamConfig,
+    };
+    use meganeura::{build, Mode, SessionConfig};
+    let cfg = SpectroStreamConfig::default();
+
+    for stage in [DecoderStage::Block(4), DecoderStage::Block(5), DecoderStage::Block(6)] {
+        let mut g = Graph::new();
+        let out = build_decoder_graph_through(&mut g, &cfg, 50, stage);
+        g.set_outputs(vec![out]);
+        let g_nodes = g.nodes().len();
+
+        // Path A: build_inference_session
+        let s_a = meganeura::build_inference_session(&g);
+        let buffers_a = s_a.plan().buffers.len();
+        let dispatches_a = s_a.plan().dispatches.len();
+
+        // Path B: skip_full_optimize=true
+        let (s_b, _) = build(&g, SessionConfig {
+            mode: Mode::Inference,
+            skip_full_optimize: true,
+            ..SessionConfig::default()
+        });
+        let buffers_b = s_b.plan().buffers.len();
+        let dispatches_b = s_b.plan().dispatches.len();
+
+        println!("[s20] stage {stage:?}: graph={g_nodes} nodes; \
+                  A: bufs={buffers_a} dispatches={dispatches_a}; \
+                  B: bufs={buffers_b} dispatches={dispatches_b}");
+    }
+}
+
+#[test]
+#[ignore]
+fn s21_repeat_block5_multiple_times() {
+    // Run Block 5 multiple times to check if the failure is deterministic or
+    // a Vulkan dispatch race.
+    use meganeura::models::magenta_rt::spectrostream::{
+        build_decoder_graph_through, load_decoder_weights, DecoderStage, SpectroStreamConfig,
+    };
+    if !Path::new(DUMP).exists() { return; }
+    let model = SafeTensorsModel::load(DUMP.into()).unwrap();
+    let cfg = SpectroStreamConfig::default();
+    let num_frames = 50;
+
+    for iter in 0..5 {
+        let mut g = Graph::new();
+        let out = build_decoder_graph_through(&mut g, &cfg, num_frames, DecoderStage::Block(5));
+        g.set_outputs(vec![out]);
+        let mut s = meganeura::build_inference_session(&g);
+        load_decoder_weights(&model, &mut s).unwrap();
+        let h_padded = num_frames + cfg.temporal_pad;
+        let in_size = (cfg.initial_channels * h_padded * cfg.initial_freq_bins) as usize;
+        let input: Vec<f32> = (0..in_size).map(|i| (i as f32 * 1e-7).sin()).collect();
+        s.set_input("decoder_input_preprocessed", &input);
+        s.step();
+        s.wait();
+        let data = s.read_output(7127040);
+        let (nz, max_abs, _) = nonzero_count(&data);
+        println!("[s21] iter {iter}: nz={nz}/7127040 max_abs={max_abs:.4e}");
+    }
+}
+
+#[test]
+#[ignore]
+fn s22_same_session_two_results() {
+    // Run the EXACT SAME session twice — once via build_inference_session,
+    // once via explicit build(). If they produce different results, the
+    // nondeterminism is in build itself, not the graph or runtime.
+    use meganeura::models::magenta_rt::spectrostream::{
+        build_decoder_graph_through, load_decoder_weights, DecoderStage, SpectroStreamConfig,
+    };
+    use meganeura::{build, Mode, SessionConfig};
+    if !Path::new(DUMP).exists() { return; }
+    let model = SafeTensorsModel::load(DUMP.into()).unwrap();
+    let cfg = SpectroStreamConfig::default();
+    let num_frames = 50;
+    let h_padded = num_frames + cfg.temporal_pad;
+    let in_size = (cfg.initial_channels * h_padded * cfg.initial_freq_bins) as usize;
+    let input: Vec<f32> = (0..in_size).map(|i| (i as f32 * 1e-7).sin()).collect();
+
+    for variant in ["build_inference_session", "build(Inference, skip=false)", "build(Inference, skip=true)"] {
+        let mut g = Graph::new();
+        let out = build_decoder_graph_through(&mut g, &cfg, num_frames, DecoderStage::Block(5));
+        g.set_outputs(vec![out]);
+
+        let mut s = match variant {
+            "build_inference_session" => meganeura::build_inference_session(&g),
+            "build(Inference, skip=false)" => {
+                build(&g, SessionConfig {
+                    mode: Mode::Inference,
+                    skip_full_optimize: false,
+                    ..SessionConfig::default()
+                }).0
+            }
+            "build(Inference, skip=true)" => {
+                build(&g, SessionConfig {
+                    mode: Mode::Inference,
+                    skip_full_optimize: true,
+                    ..SessionConfig::default()
+                }).0
+            }
+            _ => unreachable!(),
+        };
+        load_decoder_weights(&model, &mut s).unwrap();
+        s.set_input("decoder_input_preprocessed", &input);
+        s.step();
+        s.wait();
+        let data = s.read_output(7127040);
+        let (nz, max_abs, _) = nonzero_count(&data);
+        println!("[s22] {variant:35} nz={nz}/7127040 max_abs={max_abs:.4e}");
+    }
+}
+
+#[test]
+#[ignore]
+fn s23_smaller_num_frames() {
+    use meganeura::models::magenta_rt::spectrostream::{
+        build_decoder_graph_through, load_decoder_weights, DecoderStage, SpectroStreamConfig,
+    };
+    if !Path::new(DUMP).exists() { return; }
+    let model = SafeTensorsModel::load(DUMP.into()).unwrap();
+    let cfg = SpectroStreamConfig::default();
+
+    for num_frames in [10, 25, 50] {
+        let mut g = Graph::new();
+        let out = build_decoder_graph_through(&mut g, &cfg, num_frames, DecoderStage::Block(5));
+        g.set_outputs(vec![out]);
+        let mut s = meganeura::build_inference_session(&g);
+        let n_bufs = s.plan().buffers.len();
+        let total_bytes: usize = s.plan().buffers.iter().sum();
+        load_decoder_weights(&model, &mut s).unwrap();
+        let h_padded = num_frames + cfg.temporal_pad;
+        let in_size = (cfg.initial_channels * h_padded * cfg.initial_freq_bins) as usize;
+        let input: Vec<f32> = (0..in_size).map(|i| (i as f32 * 1e-7).sin()).collect();
+        s.set_input("decoder_input_preprocessed", &input);
+        s.step();
+        s.wait();
+        let out_shape = g.node(out).ty.shape.clone();
+        let expected: usize = out_shape.iter().product();
+        let data = s.read_output(expected);
+        let (nz, max_abs, _) = nonzero_count(&data);
+        println!("[s23] num_frames={num_frames}: bufs={n_bufs} totalMB={:.1} expected={expected} nz={nz} max_abs={max_abs:.4e}",
+                 total_bytes as f32 / 1e6);
+    }
+}
+
+#[test]
+#[ignore]
+fn s24_step_with_profiling_mode() {
+    // Force profiling=true to run one compute pass per dispatch (full per-pass
+    // barriers). If Block 5+ becomes non-zero with this, the issue is
+    // insufficient barriers in the inline-barrier mode.
+    use meganeura::models::magenta_rt::spectrostream::{
+        build_decoder_graph_through, load_decoder_weights, DecoderStage, SpectroStreamConfig,
+    };
+    if !Path::new(DUMP).exists() { return; }
+    let model = SafeTensorsModel::load(DUMP.into()).unwrap();
+    let cfg = SpectroStreamConfig::default();
+    let num_frames = 50;
+
+    let stages = [
+        ("Block(4)", DecoderStage::Block(4)),
+        ("Block(5)", DecoderStage::Block(5)),
+        ("Block(6)", DecoderStage::Block(6)),
+        ("Output",   DecoderStage::Output),
+    ];
+    for (name, stage) in stages {
+        let mut g = Graph::new();
+        let out = build_decoder_graph_through(&mut g, &cfg, num_frames, stage);
+        g.set_outputs(vec![out]);
+        let mut s = meganeura::build_inference_session(&g);
+        s.set_profiling(true);
+        load_decoder_weights(&model, &mut s).unwrap();
+        let h_padded = num_frames + cfg.temporal_pad;
+        let in_size = (cfg.initial_channels * h_padded * cfg.initial_freq_bins) as usize;
+        let input: Vec<f32> = (0..in_size).map(|i| (i as f32 * 1e-7).sin()).collect();
+        s.set_input("decoder_input_preprocessed", &input);
+        s.step();
+        s.wait();
+        let out_shape = g.node(out).ty.shape.clone();
+        let expected: usize = out_shape.iter().product();
+        let data = s.read_output(expected);
+        let (nz, max_abs, _) = nonzero_count(&data);
+        println!("[s24] profiling=true {name:12} nz={nz}/{} max_abs={max_abs:.4e}", data.len());
+    }
+}
+
+#[test]
+#[ignore]
+fn s25_no_pointwise_fusion() {
+    use meganeura::models::magenta_rt::spectrostream::{
+        build_decoder_graph_through, load_decoder_weights, DecoderStage, SpectroStreamConfig,
+    };
+    use meganeura::{build, CompileOptions, Mode, SessionConfig};
+    if !Path::new(DUMP).exists() { return; }
+    let model = SafeTensorsModel::load(DUMP.into()).unwrap();
+    let cfg = SpectroStreamConfig::default();
+
+    for stage in [DecoderStage::Block(5), DecoderStage::Block(6), DecoderStage::Output] {
+        let mut g = Graph::new();
+        let out = build_decoder_graph_through(&mut g, &cfg, 50, stage);
+        g.set_outputs(vec![out]);
+        let (mut s, _) = build(&g, SessionConfig {
+            mode: Mode::Inference,
+            options: CompileOptions { use_schedule_pointwise: false, ..CompileOptions::default() },
+            ..SessionConfig::default()
+        });
+        load_decoder_weights(&model, &mut s).unwrap();
+        let h_padded = 50 + cfg.temporal_pad;
+        let in_size = (cfg.initial_channels * h_padded * cfg.initial_freq_bins) as usize;
+        let input: Vec<f32> = (0..in_size).map(|i| (i as f32 * 1e-7).sin()).collect();
+        s.set_input("decoder_input_preprocessed", &input);
+        s.step();
+        s.wait();
+        let expected: usize = g.node(out).ty.shape.iter().product();
+        let data = s.read_output(expected);
+        let (nz, max_abs, _) = nonzero_count(&data);
+        println!("[s25] no_pointwise {stage:?} nz={nz}/{} max_abs={max_abs:.4e}", data.len());
+    }
+}
+
+#[test]
+#[ignore]
 fn s04_one_conv2d_with_loaded_weights() {
     use meganeura::models::magenta_rt::spectrostream::SpectroStreamConfig;
     if !Path::new(DUMP).exists() {
