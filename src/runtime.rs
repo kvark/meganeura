@@ -279,6 +279,23 @@ struct GradClipScaleParams {
     _pad1: u32,
 }
 
+// Temporal grad accumulation: acc[i] += grad[i] * scale.
+#[derive(blade_macros::ShaderData)]
+struct GradAccumData {
+    grad: blade_graphics::BufferPiece,
+    acc: blade_graphics::BufferPiece,
+    params: GradAccumParams,
+}
+
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct GradAccumParams {
+    len: u32,
+    scale: f32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
 // reduce: var src, dst, params (same layout as UnaryData)
 
 // Schedule-template reduction params: { outer, inner, _pad0, _pad1 }.
@@ -846,6 +863,13 @@ impl Pipelines {
                 .entry(ShaderGroup::GradClipScale)
                 .or_default()
                 .insert(ShaderEntry::GradClipScale);
+            // Temporal grad accumulator pass, compiled unconditionally so
+            // `set_grad_accumulate` works without a session rebuild.
+            needed.insert(ShaderGroup::GradAccum);
+            entries_for_group
+                .entry(ShaderGroup::GradAccum)
+                .or_default()
+                .insert(ShaderEntry::GradAccum);
         }
 
         let mut map = HashMap::new();
@@ -1424,6 +1448,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::GradClipZero => GradClipZeroData::layout(),
         ShaderEntry::GradClipNormSq => GradClipNormSqData::layout(),
         ShaderEntry::GradClipScale => GradClipScaleData::layout(),
+        ShaderEntry::GradAccum => GradAccumData::layout(),
     }
 }
 
@@ -1535,6 +1560,17 @@ pub struct Session {
     /// GradClipScale, zeroed by GradClipZero. `None` when the plan
     /// has no trainable parameters.
     grad_clip_acc: Option<blade_graphics::Buffer>,
+    /// Persistent per-parameter gradient accumulators (parallel to
+    /// `plan.param_grad_pairs`). When `grad_accum_scale` is `Some`, each
+    /// `step()` adds `grad * scale` into these instead of letting the
+    /// optimizer read the single-step grad — giving PyTorch-style
+    /// temporal accumulation. Allocated lazily on first
+    /// `set_grad_accumulate`; cleared by `zero_grad`.
+    grad_accum_bufs: Vec<blade_graphics::Buffer>,
+    /// `Some(scale)` enables temporal accumulation (`scale` = 1/micro so
+    /// the accumulator holds the mean grad); `None` = direct optimizer
+    /// reads of the per-step grad (default).
+    grad_accum_scale: Option<f32>,
     /// Adam step counter.
     adam_step: u32,
     /// Active Adam parameters. When set, every `step()` appends Adam updates
@@ -2234,6 +2270,8 @@ impl Session {
             grad_clip_every: 1,
             grad_clip_tick: 0,
             grad_clip_acc,
+            grad_accum_bufs: Vec::new(),
+            grad_accum_scale: None,
             lr_multipliers: Vec::new(),
             adam_state,
             adam_step: 0,
@@ -3518,6 +3556,37 @@ impl Session {
             }
         }
 
+        // Temporal grad accumulation: add this step's (overwritten) grads
+        // into the persistent accumulators that the clip/optimizer below
+        // will read. Runs in its own pass after backward (it reads grad
+        // buffers the backward just wrote).
+        if let Some(scale) = self.grad_accum_scale {
+            {
+                let pipeline = &self.pipelines.map[&ShaderEntry::GradAccum];
+                let mut pass = self.encoder.compute("grad_accum");
+                for (idx, &(_, grad_buf)) in self.plan.param_grad_pairs.iter().enumerate() {
+                    let len = (self.plan.buffers[grad_buf.0 as usize] / 4) as u32;
+                    let mut pc = pass.with(pipeline);
+                    pc.bind(
+                        0,
+                        &GradAccumData {
+                            grad: self.buffers[grad_buf.0 as usize].at(0),
+                            acc: self.grad_accum_bufs[idx].at(0),
+                            params: GradAccumParams { len, scale, _pad0: 0, _pad1: 0 },
+                        },
+                    );
+                    pc.dispatch([len.div_ceil(256), 1, 1]);
+                }
+            }
+            // Submit + wait so the accumulator this pass wrote is fully
+            // durable before the optimizer's separate passes read it.
+            // Sharing one submission left a write/read hazard that
+            // corrupted the accumulator on the apply step.
+            self.sync_point = Some(self.gpu.submit(&mut self.encoder));
+            self.wait();
+            self.encoder.start();
+        }
+
         // Gradient clipping (if requested) needs to happen between
         // backward and optimizer. We split the submission: submit the
         // forward+backward pass we just encoded, wait, do CPU readback
@@ -3565,16 +3634,23 @@ impl Session {
                 pc.dispatch([1, 1, 1]);
             }
             // Pass 2: sum of squares per gradient buffer.
+            let accumulating = self.grad_accum_scale.is_some();
             {
                 let pipeline = &self.pipelines.map[&ShaderEntry::GradClipNormSq];
                 let mut pass = self.encoder.compute("grad_clip_norm_sq");
-                for &(param_buf, grad_buf) in &self.plan.param_grad_pairs {
+                for (idx, &(param_buf, grad_buf)) in self.plan.param_grad_pairs.iter().enumerate() {
                     let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
                     let mut pc = pass.with(pipeline);
                     pc.bind(
                         0,
                         &GradClipNormSqData {
-                            grad: self.buffers[grad_buf.0 as usize].at(0),
+                            grad: Self::grad_source(
+                                &self.buffers,
+                                &self.grad_accum_bufs,
+                                accumulating,
+                                idx,
+                                grad_buf,
+                            ),
                             acc: acc_buf.at(0),
                             params: GradClipNormSqParams {
                                 len,
@@ -3594,13 +3670,19 @@ impl Session {
             {
                 let pipeline = &self.pipelines.map[&ShaderEntry::GradClipScale];
                 let mut pass = self.encoder.compute("grad_clip_scale");
-                for &(param_buf, grad_buf) in &self.plan.param_grad_pairs {
+                for (idx, &(param_buf, grad_buf)) in self.plan.param_grad_pairs.iter().enumerate() {
                     let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
                     let mut pc = pass.with(pipeline);
                     pc.bind(
                         0,
                         &GradClipScaleData {
-                            grad: self.buffers[grad_buf.0 as usize].at(0),
+                            grad: Self::grad_source(
+                                &self.buffers,
+                                &self.grad_accum_bufs,
+                                accumulating,
+                                idx,
+                                grad_buf,
+                            ),
                             acc: acc_buf.at(0),
                             params: GradClipScaleParams {
                                 len,
@@ -3622,11 +3704,12 @@ impl Session {
         // (default 1.0). Param-name lookup uses the plan's param_buffers
         // table; the cost is negligible (small N at session-build time).
         if !self.plan.param_grad_pairs.is_empty() {
+            let accumulating = self.grad_accum_scale.is_some();
             let lr = self.pending_lr;
             if let Some(learning_rate) = lr {
                 let pipeline = &self.pipelines.map[&ShaderEntry::SgdUpdate];
                 let mut pass = self.encoder.compute("sgd_update");
-                for &(param_buf, grad_buf) in &self.plan.param_grad_pairs {
+                for (idx, &(param_buf, grad_buf)) in self.plan.param_grad_pairs.iter().enumerate() {
                     let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
                     let effective_lr = learning_rate
                         * Self::lr_multiplier_for_buf(
@@ -3639,7 +3722,13 @@ impl Session {
                         0,
                         &SgdData {
                             param: self.buffers[param_buf.0 as usize].at(0),
-                            grad: self.buffers[grad_buf.0 as usize].at(0),
+                            grad: Self::grad_source(
+                                &self.buffers,
+                                &self.grad_accum_bufs,
+                                accumulating,
+                                idx,
+                                grad_buf,
+                            ),
                             dst: self.buffers[param_buf.0 as usize].at(0),
                             params: SgdParams {
                                 len,
@@ -3669,7 +3758,13 @@ impl Session {
                         0,
                         &AdamData {
                             param: self.buffers[param_buf.0 as usize].at(0),
-                            grad: self.buffers[grad_buf.0 as usize].at(0),
+                            grad: Self::grad_source(
+                                &self.buffers,
+                                &self.grad_accum_bufs,
+                                accumulating,
+                                idx,
+                                grad_buf,
+                            ),
                             m: m_buf.at(0),
                             v: v_buf.at(0),
                             params: AdamParams {
@@ -3691,6 +3786,23 @@ impl Session {
 
         self.last_submit_ns = crate::profiler::now_ns();
         self.sync_point = Some(self.gpu.submit(&mut self.encoder));
+    }
+
+    /// The buffer the optimizer/clip should read for param `idx`'s
+    /// gradient: the persistent accumulator when temporal accumulation is
+    /// active, else the per-step grad buffer the backward just wrote.
+    fn grad_source(
+        buffers: &[blade_graphics::Buffer],
+        accum_bufs: &[blade_graphics::Buffer],
+        accumulating: bool,
+        idx: usize,
+        grad_buf: BufferRef,
+    ) -> blade_graphics::BufferPiece {
+        if accumulating {
+            accum_bufs[idx].at(0)
+        } else {
+            buffers[grad_buf.0 as usize].at(0)
+        }
     }
 
     fn bind_dispatch(
@@ -4365,10 +4477,11 @@ impl Session {
             }
             ShaderEntry::GradClipZero
             | ShaderEntry::GradClipNormSq
-            | ShaderEntry::GradClipScale => {
+            | ShaderEntry::GradClipScale
+            | ShaderEntry::GradAccum => {
                 unreachable!(
-                    "Grad-clip shaders are dispatched directly from step() when \
-                     `pending_grad_clip` is set, not via bind_dispatch"
+                    "Grad-clip/accum shaders are dispatched directly from step(), \
+                     not via bind_dispatch"
                 );
             }
             ShaderEntry::ScatterAdd => {
@@ -5084,6 +5197,68 @@ impl Session {
     pub fn clear_optimizer(&mut self) {
         self.pending_lr = None;
         self.pending_adam = None;
+    }
+
+    /// Enable temporal gradient accumulation over `micro_batches` steps.
+    ///
+    /// meganeura's static-graph backward *overwrites* each param's grad
+    /// buffer every `step()` (it sums contributions within one backward,
+    /// not across calls). With accumulation enabled, each `step()`
+    /// instead adds `grad / micro_batches` into a persistent accumulator,
+    /// and the optimizer (clip + Adam/SGD) reads that accumulator — so
+    /// `step()` K times then one optimizer-bearing step trains on the
+    /// mean gradient of K micro-batches at single-batch GPU memory.
+    ///
+    /// Call [`Session::zero_grad`] before each K-step window. Pass
+    /// `micro_batches = 1` (or [`Session::clear_grad_accumulate`]) to
+    /// restore direct single-step optimizer reads.
+    pub fn set_grad_accumulate(&mut self, micro_batches: u32) {
+        assert!(micro_batches >= 1);
+        if micro_batches == 1 {
+            self.grad_accum_scale = None;
+            return;
+        }
+        if self.grad_accum_bufs.is_empty() {
+            self.grad_accum_bufs = self
+                .plan
+                .param_grad_pairs
+                .iter()
+                .enumerate()
+                .map(|(i, &(_, grad_buf))| {
+                    let size = (self.plan.buffers[grad_buf.0 as usize] as u64).max(4);
+                    let buf = self.gpu.create_buffer(blade_graphics::BufferDesc {
+                        name: &format!("grad_accum_{i}"),
+                        size,
+                        memory: blade_graphics::Memory::Shared,
+                    });
+                    unsafe {
+                        std::ptr::write_bytes(buf.data(), 0, size as usize);
+                    }
+                    buf
+                })
+                .collect();
+        }
+        self.grad_accum_scale = Some(1.0 / micro_batches as f32);
+    }
+
+    pub fn clear_grad_accumulate(&mut self) {
+        self.grad_accum_scale = None;
+    }
+
+    /// Zero the gradient accumulators (PyTorch `optimizer.zero_grad()`).
+    /// No-op unless [`Session::set_grad_accumulate`] is active.
+    pub fn zero_grad(&mut self) {
+        if self.grad_accum_bufs.is_empty() {
+            return;
+        }
+        self.wait();
+        // Accumulators are host-visible (Shared); zero in place.
+        for (buf, &(_, grad_buf)) in self.grad_accum_bufs.iter().zip(&self.plan.param_grad_pairs) {
+            let size = self.plan.buffers[grad_buf.0 as usize].max(4);
+            unsafe {
+                std::ptr::write_bytes(buf.data(), 0, size);
+            }
+        }
     }
 
     pub fn memory_summary(&self) -> MemorySummary {
