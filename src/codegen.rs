@@ -382,6 +382,7 @@ pub enum ShaderGroup {
     GradClipZero,
     GradClipNormSq,
     GradClipScale,
+    GradAccum,
 }
 
 /// Generate a `naga::Module` for a shader group.
@@ -509,6 +510,7 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::GradClipZero => parse_wgsl(include_str!("shaders/grad_clip_zero.wgsl")),
         ShaderGroup::GradClipNormSq => parse_wgsl(include_str!("shaders/grad_clip_norm_sq.wgsl")),
         ShaderGroup::GradClipScale => parse_wgsl(include_str!("shaders/grad_clip_scale.wgsl")),
+        ShaderGroup::GradAccum => parse_wgsl(include_str!("shaders/grad_accum.wgsl")),
     }
 }
 
@@ -5122,6 +5124,7 @@ mod tests {
                 ShaderEntry::GradClipZero => vec!["acc"],
                 ShaderEntry::GradClipNormSq => vec!["grad", "acc", "params"],
                 ShaderEntry::GradClipScale => vec!["grad", "acc", "params"],
+                ShaderEntry::GradAccum => vec!["grad", "acc", "params"],
             }
         }
 
@@ -5149,6 +5152,7 @@ mod tests {
             ShaderEntry::GradClipZero,
             ShaderEntry::GradClipNormSq,
             ShaderEntry::GradClipScale,
+            ShaderEntry::GradAccum,
             ShaderEntry::SumAll,
             ShaderEntry::MeanAll,
             ShaderEntry::Softmax,

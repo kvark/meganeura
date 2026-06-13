@@ -201,6 +201,10 @@ pub enum ShaderEntry {
     /// where `norm = sqrt(bitcast<f32>(acc[0]))` from the accumulator
     /// produced by `GradClipNormSq`.
     GradClipScale,
+    /// Temporal gradient accumulation: `acc[i] += grad[i] * scale`. Adds
+    /// each step's fresh (overwritten) grad into a persistent accumulator
+    /// so gradients sum across `step()` calls. Cleared by `zero_grad`.
+    GradAccum,
 }
 
 impl ShaderEntry {
@@ -305,6 +309,7 @@ impl ShaderEntry {
             ShaderEntry::GradClipZero => ShaderGroup::GradClipZero,
             ShaderEntry::GradClipNormSq => ShaderGroup::GradClipNormSq,
             ShaderEntry::GradClipScale => ShaderGroup::GradClipScale,
+            ShaderEntry::GradAccum => ShaderGroup::GradAccum,
         }
     }
 
@@ -411,7 +416,8 @@ impl ShaderEntry {
             | ShaderEntry::WinogradWeightTransform => "main",
             ShaderEntry::GradClipZero
             | ShaderEntry::GradClipNormSq
-            | ShaderEntry::GradClipScale => "main",
+            | ShaderEntry::GradClipScale
+            | ShaderEntry::GradAccum => "main",
         }
     }
 }
