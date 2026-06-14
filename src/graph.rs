@@ -576,6 +576,29 @@ pub enum Op {
         scale_w: u32,
     },
 
+    // Dilate the W axis by inserting `stride_w - 1` zeros between each
+    // input element. [N,C,H,W] → [N,C,H, W*stride_w - (stride_w - 1)].
+    //
+    // This is the upsample-with-zeros step that turns ConvTranspose2D into an
+    // equivalent forward Conv2D (`dilate → pad → forward conv`), letting us
+    // route conv-T through the fast cooperative-matrix `Conv2dGemm` path
+    // instead of the bandwidth-bound `Conv2dGradInputHW` shader. inputs: [x]
+    DilateZerosW {
+        channels: u32,
+        in_h: u32,
+        in_w: u32,
+        stride_w: u32,
+    },
+
+    // Same as `DilateZerosW` but along the H axis. Used for conv-T with
+    // stride_h > 1 (SpectroStream's decoder_0/decoder_1).
+    DilateZerosH {
+        channels: u32,
+        in_h: u32,
+        in_w: u32,
+        stride_h: u32,
+    },
+
     // Channel-to-width pixel shuffle: [B,C,H,W] → [B,C/factor,H,W*factor].
     // Inverse interleaves channel pairs into the W dimension. Used by
     // SpectroStream's inter-block transition between decoder_0 and decoder_1
@@ -1783,6 +1806,68 @@ impl Graph {
     /// shortcut path where the upsample matches the conv-transpose's stride
     /// (stride is 1 in H, varies in W per block).
     #[allow(clippy::too_many_arguments)]
+    /// Dilate the W axis by inserting `stride_w - 1` zeros between each
+    /// input element. Output shape: `[N, C, H, W*stride_w - (stride_w - 1)]`.
+    pub fn dilate_zeros_w(
+        &mut self,
+        x: NodeId,
+        batch: u32,
+        channels: u32,
+        in_h: u32,
+        in_w: u32,
+        stride_w: u32,
+    ) -> NodeId {
+        assert!(stride_w >= 1);
+        let out_w = if stride_w == 1 {
+            in_w
+        } else {
+            in_w * stride_w - (stride_w - 1)
+        };
+        let total = batch as usize * channels as usize * in_h as usize * out_w as usize;
+        let ty = TensorType::f32(vec![total]);
+        self.add_node(
+            Op::DilateZerosW {
+                channels,
+                in_h,
+                in_w,
+                stride_w,
+            },
+            vec![x],
+            ty,
+        )
+    }
+
+    /// Dilate the H axis by inserting `stride_h - 1` zeros between each
+    /// input element. Output shape: `[N, C, H*stride_h - (stride_h - 1), W]`.
+    pub fn dilate_zeros_h(
+        &mut self,
+        x: NodeId,
+        batch: u32,
+        channels: u32,
+        in_h: u32,
+        in_w: u32,
+        stride_h: u32,
+    ) -> NodeId {
+        assert!(stride_h >= 1);
+        let out_h = if stride_h == 1 {
+            in_h
+        } else {
+            in_h * stride_h - (stride_h - 1)
+        };
+        let total = batch as usize * channels as usize * out_h as usize * in_w as usize;
+        let ty = TensorType::f32(vec![total]);
+        self.add_node(
+            Op::DilateZerosH {
+                channels,
+                in_h,
+                in_w,
+                stride_h,
+            },
+            vec![x],
+            ty,
+        )
+    }
+
     pub fn upsample_nearest(
         &mut self,
         x: NodeId,

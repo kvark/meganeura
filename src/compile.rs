@@ -161,6 +161,8 @@ pub enum ShaderEntry {
     Slice2d,
     Conv2dGradInputHW,
     PixelShuffleW,
+    DilateZerosW,
+    DilateZerosH,
     Conv2d,
     /// Depthwise Conv2d forward (groups == channels). Weight shape
     /// `[C, 1, kH, kW]`; each output channel reads one input channel.
@@ -295,6 +297,8 @@ impl ShaderEntry {
             ShaderEntry::Slice2d => ShaderGroup::Slice2d,
             ShaderEntry::Conv2dGradInputHW => ShaderGroup::Conv2dGradInputHW,
             ShaderEntry::PixelShuffleW => ShaderGroup::PixelShuffleW,
+            ShaderEntry::DilateZerosW => ShaderGroup::DilateZerosW,
+            ShaderEntry::DilateZerosH => ShaderGroup::DilateZerosH,
             ShaderEntry::Conv2d => ShaderGroup::Conv2d,
             ShaderEntry::Conv2dDw => ShaderGroup::Conv2dDw,
             ShaderEntry::MulPerChannel => ShaderGroup::MulPerChannel,
@@ -411,6 +415,8 @@ impl ShaderEntry {
             ShaderEntry::Slice2d => "main",
             ShaderEntry::Conv2dGradInputHW => "main",
             ShaderEntry::PixelShuffleW => "main",
+            ShaderEntry::DilateZerosW => "main",
+            ShaderEntry::DilateZerosH => "main",
             ShaderEntry::Conv2d => "main",
             ShaderEntry::Conv2dDw => "main",
             ShaderEntry::MulPerChannel => "main",
@@ -2753,6 +2759,50 @@ impl<'a> Compiler<'a> {
                 });
             }
 
+            Op::DilateZerosW { channels, in_h, in_w, stride_w } => {
+                let x = self.get_buffer(node.inputs[0]);
+                let total = node.ty.shape[0] as u32;
+                let out_w = if stride_w == 1 {
+                    in_w
+                } else {
+                    in_w * stride_w - (stride_w - 1)
+                };
+                let batch = total / (channels * in_h * out_w);
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::DilateZerosW,
+                    workgroups: [total.div_ceil(256), 1, 1],
+                    input_buffers: vec![x],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![batch, channels, in_h, in_w, stride_w, out_w],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
+            Op::DilateZerosH { channels, in_h, in_w, stride_h } => {
+                let x = self.get_buffer(node.inputs[0]);
+                let total = node.ty.shape[0] as u32;
+                let out_h = if stride_h == 1 {
+                    in_h
+                } else {
+                    in_h * stride_h - (stride_h - 1)
+                };
+                let batch = total / (channels * out_h * in_w);
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::DilateZerosH,
+                    workgroups: [total.div_ceil(256), 1, 1],
+                    input_buffers: vec![x],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![batch, channels, in_h, in_w, stride_h, out_h],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
             Op::PixelShuffleW { channels, in_h, in_w, factor } => {
                 let x = self.get_buffer(node.inputs[0]);
                 let total = node.ty.shape[0] as u32;
@@ -2866,6 +2916,8 @@ impl<'a> Compiler<'a> {
                 // every residual projection. The general GEMM path is
                 // CPU-parity-verified (tests/inference_parity_large.rs)
                 // and handles kernel 1×1 as a degenerate im2col.
+                // (SpectroStream's decoder_0 shortcut hit the same symptom
+                // from the music-gen branch; same root cause as above.)
                 {
                     // Use implicit GEMM: output = weight @ im2col(input)^T
                     // M=Co, N=oH*oW, K=Ci*kH*kW, batched in z dimension

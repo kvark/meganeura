@@ -389,6 +389,18 @@ pub fn differentiate(forward: &Graph) -> Graph {
                      (used by SpectroStream's inter-block reshape)."
                 );
             }
+            Op::DilateZerosW { .. } => {
+                panic!(
+                    "DilateZerosW autodiff not implemented — inference-only \
+                     (used by SpectroStream's conv-transpose → forward-conv rewrite)."
+                );
+            }
+            Op::DilateZerosH { .. } => {
+                panic!(
+                    "DilateZerosH autodiff not implemented — inference-only \
+                     (used by SpectroStream's conv-transpose → forward-conv rewrite)."
+                );
+            }
             Op::SwiGLU => {
                 // out = silu(gate) * up
                 // d/dup   = dL * silu(gate)

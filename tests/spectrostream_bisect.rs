@@ -247,6 +247,137 @@ fn s07_full_input_layer_block() {
 
 #[test]
 #[ignore]
+fn s27_chained_heavy_convt() {
+    // Chain N copies of the d67-equivalent conv-T to test cumulative pressure.
+    use meganeura::Graph;
+    let n_repeat = std::env::var("N_REPEAT").ok().and_then(|s| s.parse().ok()).unwrap_or(20usize);
+    let mut g = Graph::new();
+    let in_size = 1 * 128 * 60 * 480;
+    let out_size = 1 * 128 * 62 * 962;
+    let mut x = g.input("x", &[in_size]);
+    let mut param_names = Vec::new();
+    for i in 0..n_repeat {
+        let k = g.parameter(&format!("k{i}"), &[128 * 128 * 3 * 4]);
+        param_names.push(format!("k{i}"));
+        // conv-T x → 7.6M, then a slice2d to bring back to 3.6M for chaining.
+        let big = g.conv_transpose_2d_hw(x, k, 1, 128, 60, 480, 128, 3, 4, 1, 2, 0, 0);
+        // Slice to take only a portion that maps back to 60x480 spatial: skip H 1..61, W 1..481.
+        let cropped = g.slice_2d(big, 1, 128, 62, 962, 1, 1, 1, 481);
+        x = cropped;
+    }
+    g.set_outputs(vec![x]);
+    let mut s = build_inference_session(&g);
+    let input: Vec<f32> = (0..in_size).map(|i| ((i as f32 * 0.001).sin() + 1.0)).collect();
+    s.set_input("x", &input);
+    let kernel: Vec<f32> = (0..128*128*3*4).map(|i| ((i as f32 * 0.01).cos() * 0.05)).collect();
+    for name in &param_names { s.set_parameter(name, &kernel); }
+    s.step();
+    s.wait();
+    // The final output should be 1*128*60*480 = 3.6M (slice2d output dims).
+    let final_size = 1 * 128 * 60 * 480;
+    let out = s.read_output(final_size);
+    let (nz, max_abs, mean_abs) = nonzero_count(&out);
+    println!("[s27] {n_repeat}-chain conv-T: out_len={final_size} nz={nz} ({:.1}%) max={max_abs:.3e} mean={mean_abs:.3e}",
+             100.0 * nz as f32 / final_size as f32);
+    let _ = out_size;
+}
+
+#[test]
+#[ignore]
+fn s26_conv_grad_input_hw_isolated() {
+    // Reproduce d67's exact dispatch (1×128×60×480 → 1×128×62×962 conv-T)
+    // in isolation. If output has >>0% zeros, the shader/dispatch is buggy.
+    use meganeura::Graph;
+    let mut g = Graph::new();
+    let in_size = 1 * 128 * 60 * 480;
+    let in_x = g.input("x", &[in_size]);
+    // Kernel: 128 out_c × 128 in_c × 3 kh × 4 kw
+    let k = g.parameter("k", &[128 * 128 * 3 * 4]);
+    // conv_transpose_2d_hw signature: (input, kernel, batch, in_c, in_h, in_w, out_c, kh, kw, stride_h, stride_w, pad_h, pad_w)
+    let y = g.conv_transpose_2d_hw(in_x, k, 1, 128, 60, 480, 128, 3, 4, 1, 2, 0, 0);
+    g.set_outputs(vec![y]);
+    let mut s = build_inference_session(&g);
+    // Random-ish positive input (like ELU output).
+    let input: Vec<f32> = (0..in_size).map(|i| ((i as f32 * 0.001).sin() + 1.0)).collect();
+    s.set_input("x", &input);
+    let kernel: Vec<f32> = (0..128*128*3*4).map(|i| ((i as f32 * 0.01).cos() * 0.05)).collect();
+    s.set_parameter("k", &kernel);
+    s.step();
+    s.wait();
+    let out = s.read_output(7634432);
+    let (nz, max_abs, mean_abs) = nonzero_count(&out);
+    println!("[s26] isolated conv-T: nz={nz}/{} ({:.1}%) max={max_abs:.3e} mean={mean_abs:.3e}",
+             out.len(), 100.0 * nz as f32 / out.len() as f32);
+}
+
+#[test]
+#[ignore]
+fn s25_block5_per_dispatch_dump() {
+    // Build Block(5) and read every intermediate to find the first dispatch
+    // whose output goes to zero. Requires MEGANEURA_DEBUG_HOST_ALL=1.
+    use meganeura::models::magenta_rt::spectrostream::{
+        build_decoder_graph_through, load_decoder_weights, DecoderStage, SpectroStreamConfig,
+    };
+    if !Path::new(DUMP).exists() {
+        eprintln!("skipping: {DUMP} not found");
+        return;
+    }
+    if std::env::var("MEGANEURA_DEBUG_HOST_ALL").is_err() {
+        eprintln!("skipping: set MEGANEURA_DEBUG_HOST_ALL=1 to enable");
+        return;
+    }
+    let model = SafeTensorsModel::load(DUMP.into()).unwrap();
+    let cfg = SpectroStreamConfig::default();
+    let mut g = Graph::new();
+    let _out = build_decoder_graph_through(&mut g, &cfg, 50, DecoderStage::Block(5));
+    g.set_outputs(vec![_out]);
+    let mut s = build_inference_session(&g);
+    load_decoder_weights(&model, &mut s).unwrap();
+    let h_padded = 50 + cfg.temporal_pad;
+    let in_size = (cfg.initial_channels * h_padded * cfg.initial_freq_bins) as usize;
+    let input: Vec<f32> = (0..in_size).map(|i| (i as f32 * 1e-7).sin()).collect();
+    s.set_input("decoder_input_preprocessed", &input);
+    s.step();
+    s.wait();
+
+    let plan = s.plan();
+    let n_disp = plan.dispatches.len();
+    let groups = s.groups();
+    println!("[s25] {n_disp} dispatches in {} groups", groups.len());
+    for (gi, r) in groups.iter().enumerate() {
+        if r.contains(&65) || r.contains(&68) || r.contains(&69) || r.contains(&67) {
+            println!("  group {gi}: dispatches {}..{}", r.start, r.end);
+        }
+    }
+    for (i, d) in plan.dispatches.iter().enumerate() {
+        let out_buf = d.output_buffer;
+        let buf_bytes = plan.buffers[out_buf.0 as usize];
+        let n_elems = buf_bytes / 4;
+        let mut data = vec![0.0_f32; n_elems];
+        s.read_buffer(out_buf, &mut data);
+        let (nz, max_abs, mean_abs) = nonzero_count(&data);
+        let nan = data.iter().filter(|x| x.is_nan()).count();
+        let zero_pct = 100.0 * (n_elems - nz) as f32 / n_elems as f32;
+        let flag = if nz == 0 { " ← ZERO" } else if zero_pct > 50.0 { " ← mostly zero" } else { "" };
+        let inputs: Vec<u32> = d.input_buffers.iter().map(|b| b.0).collect();
+        println!("  d{i:2} {:?} ins={inputs:?} out_buf={} n={n_elems} nz={nz} max={max_abs:.3e} mean={mean_abs:.3e} nan={nan}{flag}", d.shader, out_buf.0);
+        // For d67 specifically, dump the zero distribution by quartile.
+        if i == 67 {
+            let q = n_elems / 4;
+            for qi in 0..4 {
+                let s_idx = qi * q;
+                let e_idx = if qi == 3 { n_elems } else { (qi + 1) * q };
+                let chunk = &data[s_idx..e_idx];
+                let chunk_nz = chunk.iter().filter(|&&x| x != 0.0).count();
+                println!("    d67 quartile {qi} [{s_idx}..{e_idx}] nz={chunk_nz}/{} ({:.1}%)",
+                    chunk.len(), 100.0 * chunk_nz as f32 / chunk.len() as f32);
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore]
 fn s10_decoder_stage_sweep() {
     use meganeura::models::magenta_rt::spectrostream::{
         build_decoder_graph_through, load_decoder_weights, DecoderStage, SpectroStreamConfig,
@@ -257,7 +388,7 @@ fn s10_decoder_stage_sweep() {
     }
     let model = SafeTensorsModel::load(DUMP.into()).unwrap();
     let cfg = SpectroStreamConfig::default();
-    let num_frames = 50;
+    let num_frames = std::env::var("NUM_FRAMES").ok().and_then(|s| s.parse().ok()).unwrap_or(50);
 
     let stages = [
         ("InputLayer", DecoderStage::InputLayer),
@@ -275,6 +406,9 @@ fn s10_decoder_stage_sweep() {
         let out = build_decoder_graph_through(&mut g, &cfg, num_frames, stage);
         g.set_outputs(vec![out]);
         let mut s = build_inference_session(&g);
+        if std::env::var("MEGANEURA_PROFILING").is_ok() {
+            s.set_profiling(true);
+        }
         load_decoder_weights(&model, &mut s).unwrap();
         let h_padded = num_frames + cfg.temporal_pad;
         let in_size = (cfg.initial_channels * h_padded * cfg.initial_freq_bins) as usize;

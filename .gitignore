@@ -1,5 +1,5 @@
-/target/
-/Cargo.lock
+target/
+Cargo.lock
 data/mnist-mlp.safetensors
 data/*.gz
 /bench/results/

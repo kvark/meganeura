@@ -379,6 +379,48 @@ struct PixelShuffleWParams {
     _pad2: u32,
 }
 
+// dilate_zeros_w: insert (stride_w-1) zeros between W elements.
+#[derive(blade_macros::ShaderData)]
+struct DilateZerosWData {
+    src: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: DilateZerosWParams,
+}
+
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct DilateZerosWParams {
+    batch: u32,
+    channels: u32,
+    in_h: u32,
+    in_w: u32,
+    stride_w: u32,
+    out_w: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+// dilate_zeros_h: same but along H.
+#[derive(blade_macros::ShaderData)]
+struct DilateZerosHData {
+    src: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: DilateZerosHParams,
+}
+
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct DilateZerosHParams {
+    batch: u32,
+    channels: u32,
+    in_h: u32,
+    in_w: u32,
+    stride_h: u32,
+    out_h: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
 // slice2d: spatial crop on NCHW.
 #[derive(blade_macros::ShaderData)]
 struct Slice2dData {
@@ -1557,6 +1599,8 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::Slice2d => Slice2dData::layout(),
         ShaderEntry::Conv2dGradInputHW => Conv2dGradInputHWData::layout(),
         ShaderEntry::PixelShuffleW => PixelShuffleWData::layout(),
+        ShaderEntry::DilateZerosW => DilateZerosWData::layout(),
+        ShaderEntry::DilateZerosH => DilateZerosHData::layout(),
         ShaderEntry::Conv2d => Conv2dData::layout(),
         ShaderEntry::Conv2dDw => Conv2dDwData::layout(),
         ShaderEntry::MulPerChannel => MulPerChannelData::layout(),
@@ -1642,7 +1686,14 @@ fn compute_groups(dispatches: &[Dispatch]) -> Vec<std::ops::Range<usize>> {
     let mut dirty = HashSet::<u32>::new();
     let mut start = 0;
     for (i, dispatch) in dispatches.iter().enumerate() {
-        if dispatch.input_buffers.iter().any(|b| dirty.contains(&b.0)) {
+        let reads_dirty = dispatch.input_buffers.iter().any(|b| dirty.contains(&b.0))
+            || dispatch.epilogue_buffers.iter().any(|b| dirty.contains(&b.0))
+            || dispatch
+                .matmul_epilogue
+                .as_ref()
+                .map(|e| e.inputs.iter().any(|(b, _)| dirty.contains(&b.0)))
+                .unwrap_or(false);
+        if reads_dirty {
             groups.push(start..i);
             start = i;
             dirty.clear();
@@ -2272,6 +2323,13 @@ impl Session {
         // boards; kill switch for measurement and UMA debugging.
         if std::env::var("MEGANEURA_NO_DEVICE_LOCAL").is_ok() {
             log::info!("MEGANEURA_NO_DEVICE_LOCAL: all buffers host-visible");
+            alias.device_local.fill(false);
+        }
+        // music-gen branch: MEGANEURA_DEBUG_HOST_ALL=1 forces every buffer
+        // (including aliased intermediates) onto host-visible memory, mirroring
+        // the original SpectroStream debug knob.
+        if std::env::var("MEGANEURA_DEBUG_HOST_ALL").is_ok() {
+            log::info!("MEGANEURA_DEBUG_HOST_ALL: all buffers host-visible");
             alias.device_local.fill(false);
         }
         let alias = alias;
@@ -4884,6 +4942,46 @@ impl Session {
                     },
                 );
             }
+            ShaderEntry::DilateZerosW => {
+                let p = &dispatch.params;
+                pc.bind(
+                    0,
+                    &DilateZerosWData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: DilateZerosWParams {
+                            batch: p[0],
+                            channels: p[1],
+                            in_h: p[2],
+                            in_w: p[3],
+                            stride_w: p[4],
+                            out_w: p[5],
+                            _pad0: 0,
+                            _pad1: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::DilateZerosH => {
+                let p = &dispatch.params;
+                pc.bind(
+                    0,
+                    &DilateZerosHData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: DilateZerosHParams {
+                            batch: p[0],
+                            channels: p[1],
+                            in_h: p[2],
+                            in_w: p[3],
+                            stride_h: p[4],
+                            out_h: p[5],
+                            _pad0: 0,
+                            _pad1: 0,
+                        },
+                    },
+                );
+            }
             ShaderEntry::Conv2dGradInputHW => {
                 let p = &dispatch.params;
                 pc.bind(
@@ -5594,6 +5692,11 @@ impl Session {
     /// Number of barrier groups (compute passes) in the dispatch sequence.
     pub fn num_groups(&self) -> usize {
         self.groups.len()
+    }
+
+    /// All barrier groups (ranges of dispatch indices that share a pass).
+    pub fn groups(&self) -> &[std::ops::Range<usize>] {
+        &self.groups
     }
 
     /// GPU device and driver name.

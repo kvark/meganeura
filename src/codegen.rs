@@ -361,6 +361,10 @@ pub enum ShaderGroup {
     Conv2dGradInputHW,
     /// Channel-to-width pixel shuffle (NCHW).
     PixelShuffleW,
+    /// W-axis zero-dilation for conv-T → forward conv2d rewrite.
+    DilateZerosW,
+    /// H-axis zero-dilation (mirror of DilateZerosW for stride_h > 1).
+    DilateZerosH,
     Conv2d,
     /// Depthwise Conv2d (groups == channels). Used by EfficientNet MBConv.
     Conv2dDw,
@@ -485,6 +489,8 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::Slice2d => parse_wgsl(include_str!("shaders/slice2d.wgsl")),
         ShaderGroup::Conv2dGradInputHW => parse_wgsl(include_str!("shaders/conv2d_grad_input_hw.wgsl")),
         ShaderGroup::PixelShuffleW => parse_wgsl(include_str!("shaders/pixel_shuffle_w.wgsl")),
+        ShaderGroup::DilateZerosW => parse_wgsl(include_str!("shaders/dilate_zeros_w.wgsl")),
+        ShaderGroup::DilateZerosH => parse_wgsl(include_str!("shaders/dilate_zeros_h.wgsl")),
         ShaderGroup::Conv2d => parse_wgsl(include_str!("shaders/conv2d.wgsl")),
         ShaderGroup::Conv2dDw => parse_wgsl(include_str!("shaders/conv2d_dw.wgsl")),
         ShaderGroup::MulPerChannel => parse_wgsl(include_str!("shaders/mul_per_channel.wgsl")),
@@ -5348,6 +5354,8 @@ mod tests {
                     vec!["grad_out", "weight", "dst", "params"]
                 }
                 ShaderEntry::PixelShuffleW => vec!["src", "dst", "params"],
+                ShaderEntry::DilateZerosW => vec!["src", "dst", "params"],
+                ShaderEntry::DilateZerosH => vec!["src", "dst", "params"],
                 ShaderEntry::Conv2d | ShaderEntry::Conv2dDw => {
                     vec!["src", "weight", "dst", "params"]
                 }
@@ -5468,6 +5476,8 @@ mod tests {
             ShaderEntry::Slice2d,
             ShaderEntry::Conv2dGradInputHW,
             ShaderEntry::PixelShuffleW,
+            ShaderEntry::DilateZerosW,
+            ShaderEntry::DilateZerosH,
             ShaderEntry::Conv2d,
             ShaderEntry::Conv2dDw,
             ShaderEntry::MulPerChannel,

@@ -849,6 +849,8 @@ fn node_to_egglog_expr(node: &Node) -> String {
         Op::Slice2d { .. } => format!("(Slice2d n{})", i[0]),
         Op::Conv2dGradInputHW { .. } => format!("(Conv2dGradInputHW n{} n{})", i[0], i[1]),
         Op::PixelShuffleW { .. } => format!("(PixelShuffleW n{})", i[0]),
+        Op::DilateZerosW { .. } => format!("(DilateZerosW n{})", i[0]),
+        Op::DilateZerosH { .. } => format!("(DilateZerosH n{})", i[0]),
         Op::Conv2d { .. } => format!("(Conv2d n{} n{})", i[0], i[1]),
         Op::Conv2dDw { .. } => format!("(Conv2dDw n{} n{})", i[0], i[1]),
         Op::MulPerChannel { .. } => format!("(MulPerChannel n{} n{})", i[0], i[1]),
