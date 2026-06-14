@@ -1650,17 +1650,30 @@ impl Session {
             log::warn!("MEGANEURA_DISABLE_COOP set — forcing scalar matmul");
             return None;
         }
-        if caps.f16_tile > 0 {
-            Some(CoopConfig {
-                tile_size: caps.f16_tile,
-                use_f16_input: true,
-            })
-        } else if caps.f32_tile > 0 {
-            Some(CoopConfig {
-                tile_size: caps.f32_tile,
-                use_f16_input: false,
-            })
+        log::info!(
+            "coop caps: f16_tile={}, f32_tile={}",
+            caps.f16_tile,
+            caps.f32_tile
+        );
+        // f16 coop operands (max 65504, ~3 decimal digits) silently
+        // overflow to NaN / lose precision on f32 models whose activations
+        // exceed f16 range — which the scalar f32 path handles fine. So
+        // prefer f32 coop tiles; treat f16 as opt-in (MEGANEURA_COOP_F16)
+        // for throughput when the model is known to fit f16. With only f16
+        // tiles and no opt-in, fall back to scalar f32 (correct).
+        let want_f16 = std::env::var("MEGANEURA_COOP_F16").is_ok();
+        if caps.f32_tile > 0 {
+            Some(CoopConfig { tile_size: caps.f32_tile, use_f16_input: false })
+        } else if caps.f16_tile > 0 && want_f16 {
+            Some(CoopConfig { tile_size: caps.f16_tile, use_f16_input: true })
         } else {
+            if caps.f16_tile > 0 {
+                log::warn!(
+                    "only f16 cooperative-matrix tiles available; using scalar \
+                     matmul (f16 coop overflows f32 models with large \
+                     activations). Set MEGANEURA_COOP_F16=1 to force f16 coop."
+                );
+            }
             None
         }
     }
