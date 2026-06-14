@@ -4459,7 +4459,10 @@ fn emit_forward_weight_stage(
     let _ = writeln!(src, "            let gr = {row_offset};");
     src.push_str("            let tc4 = t + v4_col;\n");
     let _ = writeln!(src, "            let flat = v4_row * {tile}u + v4_col;");
-    src.push_str("            if gr < m_total && (tc4 + 4u) <= k_total {\n");
+    // Fast path: vec4 load, valid only when each weight row [Co, K] starts
+    // on a vec4 boundary, i.e. k_total % 4 == 0. The branch is on a
+    // uniform value so there is no warp divergence.
+    src.push_str("            if (k_total & 3u) == 0u && gr < m_total && (tc4 + 4u) <= k_total {\n");
     src.push_str("                let v = weight[(gr * k_total + tc4) >> 2u];\n");
     let _ = writeln!(
         src,
@@ -4478,10 +4481,22 @@ fn emit_forward_weight_stage(
         "                {shared_name}[flat + 3u] = {cast_open}v.w{cast_close};"
     );
     src.push_str("            } else {\n");
-    let _ = writeln!(src, "                {shared_name}[flat] = zero_val;");
-    let _ = writeln!(src, "                {shared_name}[flat + 1u] = zero_val;");
-    let _ = writeln!(src, "                {shared_name}[flat + 2u] = zero_val;");
-    let _ = writeln!(src, "                {shared_name}[flat + 3u] = zero_val;");
+    // Fallback for K not a multiple of 4: rows are not vec4-aligned, so
+    // `weight[(gr*k_total+tc4)>>2]` would read across the row boundary.
+    // Index each element individually (alignment-independent). Conv2d
+    // with Ci*kH*kW not divisible by 4 (e.g. Ci=14 → K=126) hits this.
+    src.push_str("                for (var i = 0u; i < 4u; i = i + 1u) {\n");
+    src.push_str("                    let kc = tc4 + i;\n");
+    src.push_str("                    if gr < m_total && kc < k_total {\n");
+    src.push_str("                        let idx = gr * k_total + kc;\n");
+    let _ = writeln!(
+        src,
+        "                        {shared_name}[flat + i] = {cast_open}weight[idx >> 2u][idx & 3u]{cast_close};"
+    );
+    src.push_str("                    } else {\n");
+    let _ = writeln!(src, "                        {shared_name}[flat + i] = zero_val;");
+    src.push_str("                    }\n");
+    src.push_str("                }\n");
     src.push_str("            }\n");
     src.push_str("        }\n\n");
 }
