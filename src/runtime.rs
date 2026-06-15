@@ -1766,6 +1766,7 @@ impl Session {
         let mut encoder = gpu.create_command_encoder(bg::CommandEncoderDesc {
             name: "coop_test",
             buffer_count: 2,
+            manual_barriers: false,
         });
         encoder.start();
         {
@@ -2206,6 +2207,7 @@ impl Session {
         let mut encoder = gpu.create_command_encoder(blade_graphics::CommandEncoderDesc {
             name: "meganeura",
             buffer_count: 2,
+            manual_barriers: false,
         });
 
         // Zero-fill device-local allocations on the GPU (no host pointer).
@@ -3193,6 +3195,7 @@ impl Session {
             .create_command_encoder(blade_graphics::CommandEncoderDesc {
                 name: "readback",
                 buffer_count: 1,
+                manual_barriers: false,
             });
         encoder.start();
         encoder
