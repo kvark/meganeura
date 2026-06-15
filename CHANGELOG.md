@@ -1,9 +1,18 @@
 # Unreleased
 
-- Opt-in device-local intermediates (`MEGANEURA_DEVICE_LOCAL=1`):
-  allocations holding only step-local intermediates move to
-  `Memory::Device` (GPU-zeroed at session build), keeping user-visible
-  buffers host-visible. For benchmarking the host-visible-heap cost on
+- Bump `naga` to the wgpu git rev carrying
+  `spv::Options::emit_int_div_checks`, pinned to the same rev as
+  `blade-graphics` so the `naga::Module` we build unifies with blade's
+  SPIR-V backend. Blade (rev `ba0fb5a`) sets the flag to `false`,
+  eliding the divide-by-zero / `INT_MIN/-1` guard wrappers naga
+  otherwise emits around integer division and modulo — a win for the
+  index-heavy conv2d im2col and reduction shaders. Adds the new
+  `CommandEncoderDesc::manual_barriers` field (kept `false`).
+- Device-local intermediates (default on, kill switch
+  `MEGANEURA_NO_DEVICE_LOCAL=1`): allocations holding only step-local
+  intermediates live in `Memory::Device` (GPU-zeroed at session build),
+  keeping user-visible buffers host-visible. Avoids routing
+  intermediate traffic through the host-visible (ReBAR) heap on
   discrete GPUs.
 - Repeated-region outlining: graphs over the egglog saturation cutoff
   (300 nodes — every real training graph) no longer skip the e-graph.
