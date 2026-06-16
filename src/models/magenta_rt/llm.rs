@@ -84,8 +84,11 @@ impl LlmConfig {
         }
     }
 
-    /// Base checkpoint (~325M params). Layer counts and dims inferred from the
-    /// gin `size_base.gin` overrides; verify against the actual manifest.
+    /// Base checkpoint (~325M params). Config confirmed against the actual
+    /// HuggingFace checkpoint `llm_base_x4286_c1860k`:
+    ///   embed=768, heads=12, head_dim=64, mlp=2048, vocab=29824
+    ///   encoder=12, temporal_decoder=20, depth_decoder=4
+    /// Despite the "base" label, the decoder is the LARGE variant's 20 layers.
     pub fn base() -> Self {
         Self {
             embed_dim: 768,
@@ -93,10 +96,10 @@ impl LlmConfig {
             num_heads: 12,
             mlp_dim: 2048,
             num_encoder_layers: 12,
-            num_temporal_decoder_layers: 10,
+            num_temporal_decoder_layers: 20,
             num_depth_decoder_layers: 4,
             num_levels: 16,
-            vocab_size: 29698,
+            vocab_size: 29824,
             encoder_seq_len: 1006,
             decoder_seq_len: 800,
             rel_pos_num_buckets: 32,
@@ -239,6 +242,18 @@ mod tests {
         assert_eq!(c.num_temporal_decoder_layers + c.num_depth_decoder_layers, 24);
         assert_eq!(c.encoder_seq_len, 1006);
         assert_eq!(c.decoder_seq_len, c.num_levels * 50);
+    }
+
+    #[test]
+    fn config_base_matches_checkpoint() {
+        let c = LlmConfig::base();
+        // Verified against weights_llm_base.safetensors manifest.
+        assert_eq!(c.embed_dim, 768);
+        assert_eq!(c.num_heads * c.head_dim, c.embed_dim);
+        assert_eq!(c.num_encoder_layers, 12);
+        assert_eq!(c.num_temporal_decoder_layers, 20);
+        assert_eq!(c.num_depth_decoder_layers, 4);
+        assert_eq!(c.vocab_size, 29824);
     }
 
     #[test]
