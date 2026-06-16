@@ -220,11 +220,94 @@ pub fn build_encoder_graph(g: &mut Graph, cfg: &LlmConfig, batch: usize) -> Node
     g.rms_norm(x, final_ln_w, cfg.layer_norm_eps)
 }
 
-// TODO(decoder): build_decoder_layer (with cross-attention to encoder + causal
-// self-attn with rel_pos_bias), then build_depth_decoder_layer (per-frame inner
-// transformer over 16 RVQ levels), then build_decoder_graph that combines them.
-// Decoder is autoregressive; needs KV cache for inference. Defer until weights
-// are in place so we can validate against the Colab reference at each layer.
+/// Build one Depthformer *temporal* decoder layer — a standard T5 1.1 decoder
+/// layer: pre-norm causal self-attention (with rel-pos bias), pre-norm
+/// cross-attention to the encoder output, and a pre-norm GeGLU MLP, each with a
+/// residual. T5 uses RMSNorm and no projection biases (DenseGeneral
+/// `use_bias=False`). Cross-attention carries no rel-pos bias (T5 encoder-
+/// decoder attention is plain scaled-dot-product).
+///
+/// `self_rel_pos_table` is this layer's learned `[num_heads * num_buckets]`
+/// causal-self-attention bias table (registered per-layer, like the encoder).
+///
+/// Param names: `{prefix}.pre_self_attn_norm`, `.self_attn.{q,k,v,o}`,
+/// `.pre_cross_attn_norm`, `.cross_attn.{q,k,v,o}`, `.pre_mlp_norm`,
+/// `.mlp.{w_gate,w_up,w_down}`.
+pub fn build_decoder_layer(
+    g: &mut Graph,
+    cfg: &LlmConfig,
+    x: NodeId,
+    encoder_out: NodeId,
+    self_rel_pos_table: NodeId,
+    prefix: &str,
+) -> NodeId {
+    let embed = cfg.embed_dim as usize;
+    let attn_dim = (cfg.num_heads * cfg.head_dim) as usize;
+    let mlp_dim = cfg.mlp_dim as usize;
+
+    // --- 1. Causal self-attention ---
+    let ln1 = g.parameter(&format!("{prefix}.pre_self_attn_norm"), &[embed]);
+    let h = g.rms_norm(x, ln1, cfg.layer_norm_eps);
+    let wq = g.parameter(&format!("{prefix}.self_attn.q"), &[embed, attn_dim]);
+    let wk = g.parameter(&format!("{prefix}.self_attn.k"), &[embed, attn_dim]);
+    let wv = g.parameter(&format!("{prefix}.self_attn.v"), &[embed, attn_dim]);
+    let q = g.matmul(h, wq);
+    let k = g.matmul(h, wk);
+    let v = g.matmul(h, wv);
+    let sa = g.full_attention_with_rel_pos_bias(
+        q,
+        k,
+        v,
+        self_rel_pos_table,
+        cfg.num_heads,
+        cfg.num_heads,
+        cfg.head_dim,
+        cfg.rel_pos_num_buckets,
+        cfg.rel_pos_max_distance,
+        false, // not bidirectional
+        true,  // causal
+    );
+    let wo = g.parameter(&format!("{prefix}.self_attn.o"), &[attn_dim, embed]);
+    let sa_out = g.matmul(sa, wo);
+    let x = g.add(x, sa_out);
+
+    // --- 2. Cross-attention to encoder output (no rel-pos bias) ---
+    let ln2 = g.parameter(&format!("{prefix}.pre_cross_attn_norm"), &[embed]);
+    let h = g.rms_norm(x, ln2, cfg.layer_norm_eps);
+    let wcq = g.parameter(&format!("{prefix}.cross_attn.q"), &[embed, attn_dim]);
+    let wck = g.parameter(&format!("{prefix}.cross_attn.k"), &[embed, attn_dim]);
+    let wcv = g.parameter(&format!("{prefix}.cross_attn.v"), &[embed, attn_dim]);
+    let cq = g.matmul(h, wcq);
+    let ck = g.matmul(encoder_out, wck);
+    let cv = g.matmul(encoder_out, wcv);
+    let ca = g.cross_attention(cq, ck, cv, cfg.num_heads, cfg.num_heads, cfg.head_dim);
+    let wco = g.parameter(&format!("{prefix}.cross_attn.o"), &[attn_dim, embed]);
+    let ca_out = g.matmul(ca, wco);
+    let x = g.add(x, ca_out);
+
+    // --- 3. GeGLU MLP ---
+    let ln3 = g.parameter(&format!("{prefix}.pre_mlp_norm"), &[embed]);
+    let h = g.rms_norm(x, ln3, cfg.layer_norm_eps);
+    let w_gate = g.parameter(&format!("{prefix}.mlp.w_gate"), &[embed, mlp_dim]);
+    let w_up = g.parameter(&format!("{prefix}.mlp.w_up"), &[embed, mlp_dim]);
+    let w_down = g.parameter(&format!("{prefix}.mlp.w_down"), &[mlp_dim, embed]);
+    let gate = g.matmul(h, w_gate);
+    let up = g.matmul(h, w_up);
+    let ffn = g.geglu(gate, up);
+    let ffn_out = g.matmul(ffn, w_down);
+    g.add(x, ffn_out)
+}
+
+// TODO(decoder): the temporal decoder layer above is the verifiable core. Still
+// to reverse-engineer + build (see tools/magenta_rt/LLM_FINDINGS.md):
+//   - build_depth_decoder_layer: the per-frame inner transformer over the 16
+//     RVQ levels (no cross-attention; conditioned on the temporal output).
+//   - build_decoder_graph: token-embed + position encoding + the temporal
+//     stack + the depth module + the weight-tied logits head.
+//   - KV cache for autoregressive decode, and the generation loop wiring in
+//     `super::sampling`. The exact position-encoding scheme (T5 rel-pos vs the
+//     absolute sinusoidal PE the numpy ref assumes) is unresolved and needs the
+//     checkpoint tensor names to settle.
 
 #[cfg(test)]
 mod tests {
