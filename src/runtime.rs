@@ -234,7 +234,7 @@ struct AdamParams {
     beta2: f32,
     eps: f32,
     step: f32,
-    _pad0: u32,
+    wd: f32,
     _pad1: u32,
 }
 
@@ -1579,6 +1579,8 @@ pub struct Session {
     /// `step()` calls until overridden by another `set_adam` /
     /// `set_learning_rate` call or cleared via `clear_optimizer()`.
     pending_adam: Option<(f32, f32, f32, f32)>, // (lr, beta1, beta2, eps)
+    /// Decoupled weight-decay coefficient (AdamW). 0.0 = plain Adam.
+    adam_wd: f32,
     /// Maximum L2 norm of the per-step concatenated gradient. When set,
     /// `step()` splits its submission so it can read all gradient buffers
     /// to CPU between backward and optimizer, scale them by
@@ -2292,6 +2294,7 @@ impl Session {
             adam_state,
             adam_step: 0,
             pending_adam: None,
+            adam_wd: 0.0,
             weight_staging: HashMap::new(),
         }
     }
@@ -3759,6 +3762,7 @@ impl Session {
                 }
             } else if let Some((lr, beta1, beta2, eps)) = self.pending_adam {
                 self.adam_step += 1;
+                let wd = self.adam_wd;
                 let pipeline = &self.pipelines.map[&ShaderEntry::AdamUpdate];
                 let mut pass = self.encoder.compute("adam_update");
                 for (idx, &(param_buf, grad_buf)) in self.plan.param_grad_pairs.iter().enumerate() {
@@ -3791,7 +3795,7 @@ impl Session {
                                 beta2,
                                 eps,
                                 step: self.adam_step as f32,
-                                _pad0: 0,
+                                wd,
                                 _pad1: 0,
                             },
                         },
@@ -5180,7 +5184,7 @@ impl Session {
                         beta2,
                         eps,
                         step: self.adam_step as f32,
-                        _pad0: 0,
+                        wd: self.adam_wd,
                         _pad1: 0,
                     },
                 },
@@ -5204,6 +5208,14 @@ impl Session {
         self.pending_adam = Some((lr, beta1, beta2, eps));
         // Switching optimizers: Adam wins, SGD stops applying.
         self.pending_lr = None;
+    }
+
+    /// Set the decoupled weight-decay coefficient for the Adam update,
+    /// turning it into AdamW: each step also applies `param -= lr * wd * param`,
+    /// independent of the gradient. 0.0 (the default) is plain Adam. Persists
+    /// across steps until changed; unaffected by [`set_adam`].
+    pub fn set_weight_decay(&mut self, wd: f32) {
+        self.adam_wd = wd;
     }
 
     /// Stop running optimizer updates after `step()`.

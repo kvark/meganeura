@@ -5,7 +5,7 @@ struct Params {
     beta2: f32,
     eps: f32,
     step: f32,
-    _pad0: u32,
+    wd: f32,
     _pad1: u32,
 }
 
@@ -34,6 +34,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let m_hat = m_new / (1.0 - pow(params.beta1, params.step));
     let v_hat = v_new / (1.0 - pow(params.beta2, params.step));
 
-    // Update parameter
-    param[i] = param[i] - params.lr * m_hat / (sqrt(v_hat) + params.eps);
+    // Update parameter. Decoupled weight decay (AdamW): the wd*param term is
+    // applied directly to the weight, NOT routed through the Adam moments, so
+    // it is independent of the gradient's adaptive scaling.
+    param[i] = param[i] - params.lr * (m_hat / (sqrt(v_hat) + params.eps) + params.wd * param[i]);
 }
