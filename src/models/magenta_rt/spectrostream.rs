@@ -7,13 +7,13 @@
 //! tokens [50 frames, 16 RVQ levels]
 //!   → dequantize via 16 of 64 codebooks → embed [50, 256]
 //!   → reshape [1, 50, 1, 256] NHWC
-//!   → temporal_padding (pad T by ~18 to absorb VALID-conv shrinkage)
+//!   → temporal_padding (pad 1 zero frame at the END of T → 51 frames)
 //!   → input_layer:
 //!       conv1x1_first (gated 1×1 expand 256 → 2560)
 //!       reshape [B, T, 1, 2560] → [B, T, 5, 512]
 //!       residual block: ELU → freq_pad → conv2d_3x3 → ELU → freq_pad → conv2d_3x3 → + identity
 //!   → 7 decoder blocks (decoder_0 … decoder_6):
-//!       ELU → conv2dtranspose (stride (1, stride_w)) → crop_freq_dim
+//!       ELU → conv2dtranspose (stride (stride_h, stride_w)) → crop_freq_dim
 //!       ELU → freq_pad → conv2d_3x3
 //!       shortcut: conv1x1 if channels differ, then nearest-upsample W by stride_w, +
 //!   → final ELU → freq_pad (3, 3) → base_conv_last (7×7, → 2 channels)
@@ -22,20 +22,25 @@
 //!   → audio [B, 96000, 2 stereo]
 //! ```
 //!
-//! Per-block stride_w pattern: 2, 2, 2, 2, 3, 2, 2 → total W upsample = 192×.
+//! Per-block (stride_h, stride_w): (2,1) (2,2) (1,2) (1,2) (1,3) (1,2) (1,2).
 //! Per-block kernel shape: 4×3, 4×4, 3×4, 3×4, 3×6, 3×4, 3×4 (kH × kW).
 //! Per-block has_shortcut_conv: true, true, false, false, true, false, true.
-//! All conv padding = VALID; SpectroStream emulates SAME via explicit Pad/Crop ops.
-//! Activation = ELU everywhere. Weight norm precomputed in `.rescaled.kernel`.
+//! All conv padding = VALID; SpectroStream emulates SAME/causal via explicit
+//! Pad/Crop ops. Activation = ELU. Weight norm precomputed in `.rescaled.kernel`.
 //!
-//! Status: skeleton only. Builds the graph structure with correct ops but
-//! shapes have several TODOs:
-//! - exact temporal_padding amount (assumed 18 = sum of conv2d_3x3 H-shrinkages)
-//! - inter-block reshape between decoder_0 and decoder_1 (StridedSlice+Reshape+
-//!   Transpose mystery — looks like PixelShuffle-2 to halve channels 1024 → 512)
-//! - final reshape between decoder_6 and base_conv_last (similar transform)
-//! - stereo handling in the spectrogram domain (2 output channels are likely
-//!   real+imag of a single complex spectrogram representing folded stereo)
+//! Status: the decoder body graph is implemented end-to-end (input residual
+//! block → 7 decoder blocks → causal `base_conv_last` → temporal crop), with
+//! the six architectural fixes from `tools/magenta_rt/ARCH_FINDINGS.md`
+//! applied (causal conv padding, per-block conv-T strides, causal conv-T crop,
+//! 4-fold reinterpret between decoder_0/1). The input_layer's gated conv1x1
+//! and the iSTFT are done host-side in `examples/magenta_rt_demo.rs`.
+//!
+//! Not yet verified bit-exact against TF (see `tests/spectrostream_vs_tf_body.rs`
+//! and the bisection tests). Open questions concentrated in three "free
+//! reinterpret" claims that still need a TF body_out comparison:
+//! - the decoder_0→1 batch-fold (assumed == TF reshape/transpose PixelShuffle),
+//! - the final batch/channel merge to [re_L, im_L, re_R, im_R],
+//! - `base_conv_last` keeps W=SAME (pad 3) where ARCH_FINDINGS expects W VALID.
 
 use crate::graph::{Graph, NodeId};
 
@@ -135,11 +140,6 @@ struct Feat {
     w: u32,
 }
 
-impl Feat {
-    #[allow(dead_code)]
-    fn total(&self) -> u32 { self.b * self.c * self.h * self.w }
-}
-
 /// ELU activation (shape preserved).
 fn elu(g: &mut Graph, x: Feat) -> Feat {
     Feat { node: g.elu(x.node), ..x }
@@ -232,11 +232,6 @@ fn slice2d(g: &mut Graph, x: Feat, start_h: u32, end_h: u32, start_w: u32, end_w
     Feat { node, b: x.b, c: x.c, h: out_h, w: out_w }
 }
 
-fn upsample_w(g: &mut Graph, x: Feat, scale_w: u32) -> Feat {
-    let node = g.upsample_nearest(x.node, x.b, x.c, x.h, x.w, 1, scale_w);
-    Feat { node, b: x.b, c: x.c, h: x.h, w: x.w * scale_w }
-}
-
 fn add_feat(g: &mut Graph, a: Feat, b: Feat) -> Feat {
     assert_eq!((a.b, a.c, a.h, a.w), (b.b, b.c, b.h, b.w), "add_feat shape mismatch");
     Feat { node: g.add(a.node, b.node), ..a }
@@ -254,9 +249,9 @@ fn wn_bias(prefix: &str) -> String {
 /// conv2d_3x3 as TF SpectroStream implements it: causal H pad [2, 0] +
 /// SAME W pad [1, 1] + VALID 3×3. Net effect: H and W preserved.
 ///
-/// Emulated via symmetric padding (2, 1) + VALID conv (output is H_in+2 in H)
-/// + slice strip last 2 of H. Matches causal pad bit-exactly because the
-/// 2 future-looking outputs are simply discarded.
+/// Emulated via symmetric padding (2, 1) + VALID conv (output is H_in+2 in H),
+/// then slicing off the last 2 rows of H. Matches causal pad bit-exactly
+/// because the 2 future-looking outputs are simply discarded.
 #[allow(clippy::too_many_arguments)]
 fn causal_conv2d_3x3(
     g: &mut Graph,
@@ -306,9 +301,10 @@ fn causal_conv2d_3x3(
 /// NCHW this means `[B, 1024, T, 5]` → `[B, 512, T, 10]`. The current
 /// implementation builds this via a reshape + transpose chain (see code).
 ///
-/// TODO: this is still partial — does not include input_layer's residual
-/// block, the inter-block reshape, or the temporal_cropping at the end.
-/// Returns a placeholder NodeId for now so the graph compiles.
+/// Builds the full decoder body: input_layer residual block → 7 decoder
+/// blocks (with the decoder_0→1 fold) → causal `base_conv_last` → temporal
+/// crop. The host supplies the input_layer's gated-conv1x1 output as the
+/// `decoder_input_preprocessed` input (see `examples/magenta_rt_demo.rs`).
 pub fn build_decoder_graph(g: &mut Graph, cfg: &SpectroStreamConfig, num_frames: u32) -> NodeId {
     build_decoder_graph_through(g, cfg, num_frames, DecoderStage::Output)
 }
@@ -336,7 +332,7 @@ pub fn build_decoder_graph_through(
     let params = declare_all_params(g, cfg);
 
     let h_padded = num_frames + cfg.temporal_pad;
-    let in_size = (1 * cfg.initial_channels * h_padded * cfg.initial_freq_bins) as usize;
+    let in_size = (cfg.initial_channels * h_padded * cfg.initial_freq_bins) as usize;
     let x_input = g.input("decoder_input_preprocessed", &[in_size]);
     let mut x = Feat {
         node: x_input,
@@ -416,7 +412,7 @@ pub fn build_decoder_graph_through(
 /// them; they're unused by the GPU graph.
 fn declare_all_params(g: &mut Graph, cfg: &SpectroStreamConfig) -> std::collections::HashMap<String, NodeId> {
     let mut params = std::collections::HashMap::new();
-    let mut decl = |g: &mut Graph, name: String, shape: Vec<usize>, params: &mut std::collections::HashMap<String, NodeId>| {
+    let decl = |g: &mut Graph, name: String, shape: Vec<usize>, params: &mut std::collections::HashMap<String, NodeId>| {
         let node = g.parameter(&name, &shape);
         params.insert(name, node);
     };
@@ -435,7 +431,8 @@ fn declare_all_params(g: &mut Graph, cfg: &SpectroStreamConfig) -> std::collecti
             "conv1x1_first.conv1x1_b" => (2560, 2560),
             _ => unreachable!(),
         };
-        decl(g, wn_kernel(&prefix), vec![1 * 1 * in_c * out_c], &mut params);
+        // 1×1 conv kernel [out_c, in_c, 1, 1] flat.
+        decl(g, wn_kernel(&prefix), vec![in_c * out_c], &mut params);
         decl(g, wn_bias(&prefix), vec![out_c], &mut params);
     }
     for sub in &["conv2d_3x3", "conv2d_3x3_a"] {
@@ -455,7 +452,8 @@ fn declare_all_params(g: &mut Graph, cfg: &SpectroStreamConfig) -> std::collecti
         decl(g, wn_bias(&c3_name), vec![blk.out_c as usize], &mut params);
         if blk.has_shortcut_conv {
             let sc_name = format!("decoder.{}.shortcut.conv1x1", blk.name);
-            decl(g, wn_kernel(&sc_name), vec![1 * 1 * blk.in_c as usize * blk.out_c as usize], &mut params);
+            // 1×1 shortcut conv kernel [out_c, in_c, 1, 1] flat.
+            decl(g, wn_kernel(&sc_name), vec![blk.in_c as usize * blk.out_c as usize], &mut params);
             decl(g, wn_bias(&sc_name), vec![blk.out_c as usize], &mut params);
         }
     }
@@ -532,13 +530,14 @@ pub fn load_decoder_weights(
         .plan()
         .param_buffers
         .iter()
-        .map(|(name, _)| name.clone())
+        .map(|entry| entry.0.clone())
         .collect();
     let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
     for name in &param_names {
-        // Skip derived parameters (e.g. winograd-transformed kernels); they're
-        // computed at runtime from their source param.
-        if name.contains(":winograd") || name.contains(":") && name != "quantizer.rvq_codebooks" {
+        // Skip derived parameters (their names carry a ':' tag, e.g.
+        // ":winograd"); they're computed at runtime from their source param.
+        // The codebooks have no ':' and must be loaded as-is.
+        if name.contains(':') && name != "quantizer.rvq_codebooks" {
             continue;
         }
         let info = model

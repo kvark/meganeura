@@ -184,27 +184,24 @@ pub fn build_encoder_layer(
 /// (weight tying), so this graph also produces it as a side-channel via the
 /// `shared_token_embedder` parameter name.
 ///
-/// TODO: actually implement once the weight manifest is available — current
-/// placeholder builds only one layer to validate the loop structure and shape
-/// contracts.
+/// Builds all `num_encoder_layers` and the final norm. Structurally complete
+/// and wired to real ops, but not yet verified against a weight dump, and
+/// batch=1 only (see the broadcast TODO inside).
 pub fn build_encoder_graph(g: &mut Graph, cfg: &LlmConfig, batch: usize) -> NodeId {
-    // For CFG, batch=2 (pos + neg). Encoder runs both rows in parallel; we
-    // currently emulate that by concatenating batched inputs along seq, but
-    // proper batched attention would be cleaner — TODO.
-    assert!(batch == 1 || batch == 2, "encoder batch is 1 or 2 (CFG)");
+    // CFG ultimately needs batch=2 (positive + negative style), but adding the
+    // shared pos_embed to both rows requires a broadcast-add op that isn't in
+    // place yet — so the encoder is batch=1 only for now.
+    // TODO(broadcast): add a broadcast-add and lift this to batch ∈ {1, 2}.
+    assert_eq!(batch, 1, "encoder is batch=1 until a broadcast-add op lands (CFG batch=2 TODO)");
     let seq = cfg.encoder_seq_len as usize;
     let embed = cfg.embed_dim as usize;
 
-    // Token IDs: [batch * seq] flat (with batch=2 stacked on the seq dim)
     let token_ids = g.input_u32("encoder_input_tokens", &[batch * seq]);
     let embed_w = g.parameter("shared_token_embedder", &[cfg.vocab_size as usize, embed]);
     let mut x = g.embedding(token_ids, embed_w);
 
     // Sinusoidal absolute position embeddings (loaded as a constant, not learned).
     let pos_embed = g.parameter("encoder.pos_embed", &[seq, embed]);
-    // TODO(broadcast): when batch=2 we need to add the same pos_embed to both
-    // rows. Once a broadcast-add op is in place, do that. For now, panic if batch != 1.
-    assert_eq!(batch, 1, "TODO: broadcast pos_embed across CFG batch");
     x = g.add(x, pos_embed);
 
     for i in 0..cfg.num_encoder_layers {

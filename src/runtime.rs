@@ -1691,7 +1691,7 @@ fn compute_groups(dispatches: &[Dispatch]) -> Vec<std::ops::Range<usize>> {
             || dispatch
                 .matmul_epilogue
                 .as_ref()
-                .map(|e| e.inputs.iter().any(|(b, _)| dirty.contains(&b.0)))
+                .map(|e| e.inputs.iter().any(|entry| dirty.contains(&entry.0.0)))
                 .unwrap_or(false);
         if reads_dirty {
             groups.push(start..i);

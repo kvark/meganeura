@@ -1754,7 +1754,7 @@ impl Graph {
         in_w: u32,
         factor: u32,
     ) -> NodeId {
-        assert!(channels % factor == 0, "pixel_shuffle_w: channels {channels} must be divisible by factor {factor}");
+        assert!(channels.is_multiple_of(factor), "pixel_shuffle_w: channels {channels} must be divisible by factor {factor}");
         let out_c = channels / factor;
         let out_w = in_w * factor;
         let total = batch as usize * out_c as usize * in_h as usize * out_w as usize;
