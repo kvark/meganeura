@@ -297,6 +297,122 @@ pub fn l2_normalize(v: &[f32]) -> Vec<f32> {
     v.iter().map(|x| x / norm).collect()
 }
 
+/// Transpose a row-major `[rows, cols]` matrix to `[cols, rows]`.
+fn transpose_2d(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    assert_eq!(data.len(), rows * cols, "transpose_2d size mismatch");
+    let mut out = vec![0.0_f32; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            out[c * rows + r] = data[r * cols + c];
+        }
+    }
+    out
+}
+
+/// Load MusicCoCa text-encoder weights from a dumped safetensors model into a
+/// session built by [`build_text_encoder_graph`].
+///
+/// The dump stores opaque `musiccoca.tf_var_leaves.{N}.*` tensors (per-layer
+/// args are `[12, …]` stacked); this applies the documented arg→param mapping
+/// plus the three load-time transforms (sqrt-d into the embed table, +1 into
+/// LayerNorm scales, and — for the attention/pool **output** projections —
+/// the `[d, n·h] → [n·h, d]` transpose that the einsum `…nh,dnh->…d` implies;
+/// Q/K/V and MLP kernels contract over `d` first and need no transpose).
+///
+/// Note: verified piecewise (the transforms are unit-tested and the graph is
+/// GPU-checked against a CPU reference), but not yet run against the real
+/// weight dump end-to-end — the dump isn't in-tree. Mismatched tensor lengths
+/// surface as `set_parameter` panics, which is the intended tripwire.
+pub fn load_text_encoder_weights(
+    model: &crate::data::safetensors::SafeTensorsModel,
+    session: &mut crate::Session,
+    cfg: &MusicCoCaConfig,
+) -> Result<(), String> {
+    // Map tf_var_leaves index → full tensor name.
+    let mut arg_names: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+    for name in model.tensor_info().keys() {
+        if let Some(rest) = name.strip_prefix("musiccoca.tf_var_leaves.") {
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(n) = digits.parse::<usize>() {
+                arg_names.insert(n, name.clone());
+            }
+        }
+    }
+    let get = |n: usize| -> Result<Vec<f32>, String> {
+        let name = arg_names
+            .get(&n)
+            .ok_or_else(|| format!("missing musiccoca.tf_var_leaves.{n}.*"))?;
+        model.tensor_f32_auto(name).map_err(|e| format!("{name}: {e}"))
+    };
+
+    let embed = cfg.embed_dim as usize;
+    let attn_dim = (cfg.num_heads * cfg.head_dim) as usize;
+    let mlp = cfg.mlp_dim as usize;
+    let pool_dim = (cfg.num_heads * cfg.pool_head_dim) as usize;
+    let vocab = cfg.vocab_size as usize;
+    let layers = cfg.num_layers as usize;
+
+    // Token embedding: arg27 [embed, vocab] → transpose [vocab, embed] × sqrt(d).
+    let mut table = transpose_2d(&get(27)?, embed, vocab);
+    let scale = (embed as f32).sqrt();
+    for v in table.iter_mut() {
+        *v *= scale;
+    }
+    session.set_parameter("text_encoder.embed_table", &table);
+
+    for i in 0..layers {
+        let p = format!("text_encoder.layers.{i}");
+        // Slice layer `i` out of a `[layers, ..]` stacked arg.
+        let slice = |arg: usize, per: usize| -> Result<Vec<f32>, String> {
+            let a = get(arg)?;
+            Ok(a[i * per..(i + 1) * per].to_vec())
+        };
+        // LayerNorm scale carries the flaxformer +1 offset; bias as-is.
+        let ln_scale = |arg: usize| -> Result<Vec<f32>, String> {
+            Ok(slice(arg, embed)?.iter().map(|x| x + 1.0).collect())
+        };
+        session.set_parameter(&format!("{p}.pre_attn_norm.scale"), &ln_scale(71)?);
+        session.set_parameter(&format!("{p}.pre_attn_norm.bias"), &slice(70, embed)?);
+        // Q/K/V kernels [d, n, h] flatten to [d, n·h] (no transpose); biases [n·h].
+        session.set_parameter(&format!("{p}.attn.q.kernel"), &slice(77, embed * attn_dim)?);
+        session.set_parameter(&format!("{p}.attn.k.kernel"), &slice(73, embed * attn_dim)?);
+        session.set_parameter(&format!("{p}.attn.v.kernel"), &slice(79, embed * attn_dim)?);
+        session.set_parameter(&format!("{p}.attn.q.bias"), &slice(76, attn_dim)?);
+        session.set_parameter(&format!("{p}.attn.k.bias"), &slice(72, attn_dim)?);
+        session.set_parameter(&format!("{p}.attn.v.bias"), &slice(78, attn_dim)?);
+        // Output kernel [d, n·h] → transpose [n·h, d]; bias [d].
+        let o = transpose_2d(&slice(75, embed * attn_dim)?, embed, attn_dim);
+        session.set_parameter(&format!("{p}.attn.o.kernel"), &o);
+        session.set_parameter(&format!("{p}.attn.o.bias"), &slice(74, embed)?);
+        session.set_parameter(&format!("{p}.pre_mlp_norm.scale"), &ln_scale(69)?);
+        session.set_parameter(&format!("{p}.pre_mlp_norm.bias"), &slice(68, embed)?);
+        // MLP kernels contract over the first axis — no transpose.
+        session.set_parameter(&format!("{p}.mlp.wi.kernel"), &slice(65, embed * mlp)?);
+        session.set_parameter(&format!("{p}.mlp.wi.bias"), &slice(64, mlp)?);
+        session.set_parameter(&format!("{p}.mlp.wo.kernel"), &slice(67, mlp * embed)?);
+        session.set_parameter(&format!("{p}.mlp.wo.bias"), &slice(66, embed)?);
+    }
+
+    // Attention pool (single query, 12 heads × 256). Q/K/V flatten; O transposes.
+    session.set_parameter("text_encoder.pool.query", &get(24)?);
+    session.set_parameter("text_encoder.pool.q.kernel", &get(19)?);
+    session.set_parameter("text_encoder.pool.q.bias", &get(18)?);
+    session.set_parameter("text_encoder.pool.k.kernel", &get(14)?);
+    session.set_parameter("text_encoder.pool.k.bias", &get(13)?);
+    session.set_parameter("text_encoder.pool.v.kernel", &get(21)?);
+    session.set_parameter("text_encoder.pool.v.bias", &get(20)?);
+    let pool_o = transpose_2d(&get(17)?, embed, pool_dim);
+    session.set_parameter("text_encoder.pool.o.kernel", &pool_o);
+    session.set_parameter("text_encoder.pool.o.bias", &get(16)?);
+
+    // Final LayerNorm (scale +1).
+    let final_scale: Vec<f32> = get(23)?.iter().map(|x| x + 1.0).collect();
+    session.set_parameter("text_encoder.final_norm.scale", &final_scale);
+    session.set_parameter("text_encoder.final_norm.bias", &get(22)?);
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,6 +479,15 @@ mod tests {
         let out = l2_normalize(&[3.0, 4.0]);
         assert!((out[0] - 0.6).abs() < 1e-6);
         assert!((out[1] - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn transpose_2d_swaps_axes() {
+        // [2,3] row-major → [3,2]. The O-projection load relies on this:
+        // arg [d, n·h] must become [n·h, d].
+        let a = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // rows=2, cols=3
+        let t = transpose_2d(&a, 2, 3);
+        assert_eq!(t, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]); // [3,2]
     }
 
     #[test]
