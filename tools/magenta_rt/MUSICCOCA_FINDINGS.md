@@ -341,6 +341,18 @@ Now that the architecture is known, three concrete paths:
    `tf_var_leaves.N` ordering can be guessed by matching shapes to layer
    positions; mistakes show up as obviously wrong activations.
 
+   **STARTED**: `src/models/magenta_rt/musiccoca.rs` now implements the
+   text-encoder graph builder (mirroring `musiccoca_numpy_ref.py`), the
+   sinusoidal PE, the RVQ quantizer, and the `tf_var_leaves.N` → param-name
+   mapping (in the module doc). It runs each prompt *unpadded* (seq = real
+   token count), which is mathematically identical to the padded+masked
+   SavedModel for the pooled embedding and avoids needing a masked-attention
+   op. Compiles to an execution plan and is unit-tested for the deterministic
+   pieces. Remaining to verify end-to-end: a weight loader that slices the
+   stacked `[12, …]` tensors + applies the three load-time transforms
+   (sqrt-d into the embed table, +1 into LN scales, numeric codebook
+   reorder), then a GPU run vs the 26 testdata embeddings.
+
 2. **Convert SavedModel → TFLite locally** (Python ≤3.12 + tensorflow-text),
    then read the flatbuffer to get the exact node-level graph. Cleanest.
 
