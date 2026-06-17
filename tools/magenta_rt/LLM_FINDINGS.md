@@ -35,6 +35,13 @@ decoder-only 2.4B model — *not* this checkpoint.)
     down the layer wiring (causal mask, cross-attention to a different-length
     encoder sequence, GeGLU) and meganeura's op composition — independent of
     the real weights.
+- `build_temporal_decoder_stack` (**new**) — the full parallel temporal
+  forward: token embed → N temporal layers → final RMSNorm → transpose-
+  weight-tied logits `[seq, vocab]`. No absolute PE (standard T5; see the
+  open question below).
+  - **Verified** by `tests/llm_decoder_stack_correctness.rs` (2-layer stack,
+    GPU vs CPU within 1e-3): layer chaining, the embedding lookup, the final
+    norm, and the weight-tied logits projection.
 - `sampling.rs` — CFG + temperature + top-k, host-side, complete (unwired).
 
 ## UNRESOLVED: position encoding (blocks encoder *and* decoder correctness)
@@ -71,9 +78,9 @@ checkpoint:
    The depth module itself is a small causal transformer over 16 positions
    with its own rel-pos buckets (16/16 per the gin config) and **no**
    cross-attention.
-3. **Weight-tied logits head** (shared token embedder), and the
-   **temporal-stack graph** (token embed + position encoding + 20 layers +
-   final norm), analogous to `build_encoder_graph`.
+3. ~~**Weight-tied logits head** + **temporal-stack graph**~~ — **done**
+   (`build_temporal_decoder_stack`). Once the position-encoding question is
+   settled, add/remove the absolute-PE step here to match the checkpoint.
 4. **KV cache + autoregressive generation loop**: 800-step decode that runs
    the encoder once, decodes frame-by-frame (temporal) and level-by-level
    (depth), reads `[2, vocab]` logits per step, and calls

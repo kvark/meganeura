@@ -298,12 +298,47 @@ pub fn build_decoder_layer(
     g.add(x, ffn_out)
 }
 
-// TODO(decoder): the temporal decoder layer above is the verifiable core. Still
-// to reverse-engineer + build (see tools/magenta_rt/LLM_FINDINGS.md):
+/// Build the full-sequence temporal decoder forward pass: token embed → N
+/// temporal decoder layers (each cross-attending to `encoder_out`) → final
+/// RMSNorm → weight-tied logits.
+///
+/// This is the parallel (teacher-forcing / prefix-scoring) form; autoregressive
+/// inference reuses the same layers with a KV cache (TODO — see
+/// `tools/magenta_rt/LLM_FINDINGS.md`). No absolute position embedding is added:
+/// standard T5 1.1 relies on the per-layer rel-pos bias, and the absolute-PE
+/// question is unresolved (LLM_FINDINGS.md). Logits are weight-tied to the
+/// shared token embedder via a transpose.
+///
+/// Inputs:  `decoder_input_tokens` u32 `[seq_len]`, `encoder_out` `[enc_seq, embed]`.
+/// Output:  logits `[seq_len, vocab_size]`.
+pub fn build_temporal_decoder_stack(
+    g: &mut Graph,
+    cfg: &LlmConfig,
+    decoder_input_tokens: NodeId,
+    encoder_out: NodeId,
+) -> NodeId {
+    let embed = cfg.embed_dim as usize;
+    let table = g.parameter("shared_token_embedder", &[cfg.vocab_size as usize, embed]);
+    let mut x = g.embedding(decoder_input_tokens, table);
+    for i in 0..cfg.num_temporal_decoder_layers {
+        let prefix = format!("decoder.temporal_layers.{i}");
+        let rel = g.parameter(
+            &format!("{prefix}.self_attn.rel_pos_bias_table"),
+            &[(cfg.num_heads * cfg.rel_pos_num_buckets) as usize],
+        );
+        x = build_decoder_layer(g, cfg, x, encoder_out, rel, &prefix);
+    }
+    let final_norm = g.parameter("decoder.decoder_norm", &[embed]);
+    let x = g.rms_norm(x, final_norm, cfg.layer_norm_eps);
+    // Weight-tied logits: x @ token_embedder^T → [seq_len, vocab].
+    let logits_w = g.transpose(table);
+    g.matmul(x, logits_w)
+}
+
+// TODO(decoder): the temporal layer + stack above are the verifiable core. Still
 //   - build_depth_decoder_layer: the per-frame inner transformer over the 16
 //     RVQ levels (no cross-attention; conditioned on the temporal output).
-//   - build_decoder_graph: token-embed + position encoding + the temporal
-//     stack + the depth module + the weight-tied logits head.
+//   - combine the temporal stack with the depth module into the full decoder.
 //   - KV cache for autoregressive decode, and the generation loop wiring in
 //     `super::sampling`. The exact position-encoding scheme (T5 rel-pos vs the
 //     absolute sinusoidal PE the numpy ref assumes) is unresolved and needs the
