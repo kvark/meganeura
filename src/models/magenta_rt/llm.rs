@@ -28,6 +28,7 @@
 //! style), temperature 1.1, top-k 40. See [`super::sampling`].
 
 use crate::graph::{Graph, NodeId};
+use crate::runtime::Session;
 
 /// Hyperparameters for the Depthformer encoder-decoder LLM.
 ///
@@ -824,6 +825,75 @@ pub fn build_temporal_decode_step(
         x = g.add(x2, ffn_out);
     }
     x
+}
+
+/// Host-driven greedy autoregressive decode (batch=1, no CFG): drives the
+/// incremental temporal decode and the per-frame depth decode, feeding sampled
+/// tokens back, and returns the generated `[num_frames * num_levels]` RVQ grid.
+///
+/// Sessions (built once by the caller, weights + caches already set):
+/// - `temporal`: a [`build_temporal_decode_step`] graph — inputs `step_tokens`
+///   u32 `[num_levels]`, `enc_out` `[enc_seq, embed]` (set before calling),
+///   `kv_pos` u32 `[1]`; output the temporal state `[1, embed]`. Its KV caches
+///   must be zero-initialised.
+/// - `depth`: a [`build_depth_decoder_stack`] graph — input `depth_inputs`
+///   `[num_levels, embed]`; output logits `[num_levels, vocab]`.
+///
+/// `embed_table` is a CPU copy of the `[vocab, embed]` shared token embedder,
+/// used to embed sampled tokens into the depth input (level `q+1`'s slot).
+///
+/// The depth stack is re-run per level over the partially-filled `[num_levels,
+/// embed]` input; since its self-attention is causal, row `q` depends only on
+/// positions `0..=q`, so reading row `q` each step is correct (a depth KV cache
+/// would avoid the redundant rows — a later optimisation). CFG (batch=2) and
+/// temperature/top-k sampling are not wired here; this is the greedy core.
+pub fn decode_greedy(
+    cfg: &LlmConfig,
+    temporal: &mut Session,
+    depth: &mut Session,
+    embed_table: &[f32],
+    num_frames: usize,
+    sos_id: u32,
+) -> Vec<u32> {
+    let embed = cfg.embed_dim as usize;
+    let levels = cfg.num_levels as usize;
+    let vocab = cfg.vocab_size as usize;
+
+    let mut out = Vec::with_capacity(num_frames * levels);
+    // The temporal input for frame 0 is the SOS frame (all levels = sos_id);
+    // thereafter it is the previous decoded frame.
+    let mut prev_frame = vec![sos_id; levels];
+
+    for t in 0..num_frames {
+        temporal.set_input_u32("step_tokens", &prev_frame);
+        temporal.set_input_u32("kv_pos", &[t as u32]);
+        temporal.step();
+        temporal.wait();
+        let state = temporal.read_output(embed); // [embed]
+
+        // Depth decode the `levels` RVQ tokens for this frame. Position 0 of the
+        // depth input is the temporal state; position q+1 is the embedding of the
+        // just-decoded level q.
+        let mut depth_in = vec![0.0_f32; levels * embed];
+        depth_in[0..embed].copy_from_slice(&state);
+        let mut frame = Vec::with_capacity(levels);
+        for q in 0..levels {
+            depth.set_input("depth_inputs", &depth_in);
+            depth.step();
+            depth.wait();
+            let logits = depth.read_output(levels * vocab);
+            let tok = super::sampling::argmax(&logits[q * vocab..(q + 1) * vocab]);
+            frame.push(tok);
+            if q + 1 < levels {
+                let e = tok as usize * embed;
+                depth_in[(q + 1) * embed..(q + 2) * embed]
+                    .copy_from_slice(&embed_table[e..e + embed]);
+            }
+        }
+        out.extend_from_slice(&frame);
+        prev_frame = frame;
+    }
+    out
 }
 
 #[cfg(test)]

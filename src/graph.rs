@@ -2346,10 +2346,10 @@ impl Graph {
     }
 
     /// Cached attention with a T5 relative-position bias on the scores.
-    /// Like [`Self::cached_attention`] but adds `rel_pos_table[head, bucket(q_pos
-    /// - key_pos)]` to each score before softmax, where `q_pos = kv_pos`. The
-    /// table is `[num_heads * num_buckets]`. Used by the autoregressive temporal
-    /// decode (the temporal self-attention carries a learned rel-pos bias).
+    /// Like [`Self::cached_attention`] but adds `rel_pos_table[head,
+    /// bucket(q_pos - key_pos)]` to each score before softmax, where `q_pos =
+    /// kv_pos`. The table is `[num_heads * num_buckets]`. Used by the
+    /// autoregressive temporal decode (whose self-attention has a learned bias).
     #[allow(clippy::too_many_arguments)]
     pub fn cached_attention_rel_pos(
         &mut self,
