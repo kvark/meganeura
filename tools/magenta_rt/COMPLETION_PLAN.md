@@ -20,9 +20,9 @@ text prompt ─► MusicCoCa ─► 6 style tokens ┐
 |-----------|---------------|---------------|----------|------|
 | **MusicCoCa** text encoder | ✅ `build_text_encoder_graph` | ✅ `load_text_encoder_weights` | ✅ GPU-vs-CPU (random weights, 1e-3) | real-weight check vs the 26 testdata embeddings |
 | **SpectroStream** decoder body | ✅ `build_decoder_graph` | ✅ `load_decoder_weights` | ⚠️ only structurally; demo runs tokens→WAV | 3 unverified "free reinterpret" claims; RADV NaN bug |
-| **LLM** encoder | ✅ `build_encoder_graph` | ❌ | ❌ | position-encoding discrepancy unresolved |
-| **LLM** temporal decoder | ✅ `build_decoder_layer` + `build_temporal_decoder_stack` | ❌ | ✅ GPU-vs-CPU (random weights, 1e-3) | — |
-| **LLM** depth decoder | ❌ | ❌ | ❌ | topology not reverse-engineered |
+| **LLM** encoder | ✅ `build_encoder_graph` | ❌ | ❌ | drop spurious `pos_embed`, add `Scale(√d)`; encoder position scheme is the one open question |
+| **LLM** temporal decoder | ✅ `build_decoder_layer` + `build_temporal_decoder_stack` | ❌ | ✅ GPU-vs-CPU (random weights, 1e-3) | rel-pos table should be shared per sub-decoder, buckets=128 |
+| **LLM** depth decoder | ✅ `build_depth_decoder_layer` + `build_depth_decoder_stack` (**new**) | ❌ | ⚠️ graph smoke test only (no Vulkan ICD here) | topology now resolved; GPU-vs-CPU test TODO |
 | **LLM** generation | host sampler ✅ (`sampling.rs`) | — | sampler unit-tested | KV-cache + decode loop unwired |
 
 The verification pattern that works without real weights: build the graph with
@@ -32,35 +32,29 @@ forward pass (`tests/musiccoca_correctness.rs`,
 This validates op composition; it does **not** validate that param layouts match
 the real checkpoints — that needs the weight dumps.
 
-## The blocker: weight/manifest access
+## The blocker: weight/manifest access — LIFTED
 
-Everything left that needs *correctness against the real models* is gated on the
-HuggingFace checkpoints, and this container's **network egress allowlist blocks
-`huggingface.co`** (verified: both `curl` and `huggingface_hub.list_repo_files`
-return *"Host not in allowlist"*; the model is ungated CC-BY-4.0, so it's purely
-the egress policy). The HF MCP connector returns repo metadata but has no
-file-listing/download tool. `cargo clean` frees disk but disk isn't the blocker.
+`huggingface.co` egress now works (verified `200` from the model API). The LLM
+**architecture is fully settled without any weight download**:
 
-**Unblock (environment-config, owner action):**
-- Add `huggingface.co` and `cdn-lfs.huggingface.co` to the egress allowlist; then
-  `python3 tools/magenta_rt/dump_llm.py` (after `cargo clean` for the ~3 GB), and
-  the existing MusicCoCa/SpectroStream dumpers, produce the safetensors + manifests.
-- *Or* commit the manifests (just the JSON tensor name+shape lists — tiny, no
-  weights) produced wherever HF access exists. For the LLM:
-  `list_repo_files('google/magenta-realtime')` filtered to
-  `llm_base_x4286_c1860k/**/.zarray` is enough to settle the architecture.
-- *Possible third path (untried):* the newly-connected **arXiv MCP** may be able
-  to read the architecture from the paper (arXiv 2508.04651) or the
-  magenta-realtime GitHub source without container egress — worth trying for the
-  position-encoding and depth-module questions specifically.
+- `tools/magenta_rt/fetch_llm_manifest.py` lists all 430 `target.*` tensors of
+  `llm_base_x4286_c1860k` with shapes → committed `llm_base_manifest.json`.
+- The reference model code (pip `magenta-rt`, `magenta_rt/jax/depthformer.py`)
+  settles the depth-module wiring, the no-absolute-PE question, and the untied
+  `logits_dense` head. See `LLM_FINDINGS.md` (RESOLVED sections).
+
+What still needs the **weights + a GPU** (not architecture): real-weight
+correctness checks. This container has no Vulkan ICD, so the GPU-vs-CPU tests
+can't run here — verification is now environment-gated, not knowledge-gated.
+For the full weight dump: `python3 tools/magenta_rt/dump_llm.py` (after
+`cargo clean` for the ~3 GB), plus the MusicCoCa/SpectroStream dumpers.
 
 ## Plan
 
 ### Phase 0 — get the data in (unblocks everything below)
-0.1 Allowlist HF (or commit manifests). For the LLM, the `llm_base_manifest.json`
-    alone unblocks Phase 2.1–2.2 without any weight download.
+0.1 ✅ **DONE** — HF egress works; `llm_base_manifest.json` committed (430 tensors).
 0.2 Dump LLM weights (`dump_llm.py`), confirm MusicCoCa + SpectroStream dumps are
-    present (`magenta_rt_codec_dump/`).
+    present (`magenta_rt_codec_dump/`). *Needs ~3 GB + a Vulkan device to verify.*
 
 ### Phase 1 — verify what's already built against real weights
 1.1 **MusicCoCa**: load `weights_musiccoca.safetensors`, run the encoder on the 26
@@ -81,13 +75,14 @@ file-listing/download tool. `cargo clean` frees disk but disk isn't the blocker.
     the encoder; fix its rel-pos/PE assumptions first).
 
 ### Phase 2 — finish the LLM decoder
-2.1 **Resolve depth-module topology** from the manifest tensor names: how the
-    temporal per-frame output conditions the 4-layer depth transformer over the
-    16 RVQ levels (input prefix vs added embedding), the level-embedding table,
-    and the depth logits head. Document in `LLM_FINDINGS.md`.
-2.2 **`build_depth_decoder_layer`** + the temporal→depth wiring, verified the same
-    way (random weights, CPU reference). Depth self-attn is causal over 16
-    positions, no cross-attention, its own rel-pos buckets (16/16).
+2.1 ✅ **DONE** — depth-module topology resolved (manifest + `depthformer.py`):
+    temporal output is the depth module's **level-0 input** (concat prefix, not
+    added embedding / not cross-attn); shared token embedder + shared
+    `decoder_norm` + non-tied `logits_dense`. Documented in `LLM_FINDINGS.md`.
+2.2 ✅ **`build_depth_decoder_layer` + `build_depth_decoder_stack`** built (causal
+    self-attn over 16 levels, no cross-attn, depth rel-pos 16/16). Graph smoke
+    test passes; GPU-vs-CPU correctness test is TODO (no Vulkan ICD here). The
+    full temporal→depth wiring (mean-pool + level-axis concat) is the next step.
 2.3 **CFG batch=2**: add a broadcast-add op (or batched attention) so the encoder
     and decoder can run positive+negative style rows; lift the `batch==1` assert.
 2.4 **KV cache + autoregressive decode loop**: encoder runs once; decode 50 frames

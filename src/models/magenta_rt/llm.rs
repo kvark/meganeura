@@ -8,11 +8,18 @@
 //!   - 20 *temporal* layers operating over 50 frames (sees cross-attention to encoder).
 //!   - 4 *depth* layers operating over 16 RVQ levels per frame (no cross-attention).
 //!   - The decoded sequence is `50 frames × 16 RVQ = 800 tokens`.
-//! - **Embeddings**: shared token embedder (29698 × 1024), added to non-learned
-//!   sinusoidal absolute position embeddings (FixedEmbed, max_length=1006).
-//! - **Rel-pos bias**: per-layer learned T5 buckets — encoder/temporal use
-//!   (32 buckets, max 128), depth uses (16, 16). All bidirectional except
-//!   causal decoder self-attn.
+//! - **Embeddings**: shared token embedder (`vocab × embed`). The reference
+//!   `depthformer.py` encoder embedder applies `Scale(sqrt(embed))` and adds
+//!   **no** position embedding (the position-embed slot is a no-op by default),
+//!   and the `llm_base` checkpoint carries no learned PE tensor.
+//! - **Rel-pos bias**: learned T5 buckets, shared across each sub-decoder's
+//!   layers — `temporal_decoder.relpos_bias` `[heads, 128]` and
+//!   `depth_decoder.relpos_bias_depth` `[heads, 16]`. The **encoder** has no
+//!   rel-pos tensor in the checkpoint (open question — see
+//!   `tools/magenta_rt/LLM_FINDINGS.md`). Decoder self-attn is causal.
+//! - **Logits**: a dedicated `decoder.logits_dense.kernel` `[embed, vocab]`
+//!   (NOT weight-tied to the token embedder), applied after the shared
+//!   `decoder_norm` to the depth-decoder output.
 //! - **T5LayerNorm** = RMSNorm without subtract-mean; use [`Graph::rms_norm`].
 //! - **DenseGeneral with `use_bias=False`** throughout — every projection
 //!   is a bare matmul with no bias term.
@@ -335,14 +342,122 @@ pub fn build_temporal_decoder_stack(
     g.matmul(x, logits_w)
 }
 
-// TODO(decoder): the temporal layer + stack above are the verifiable core. Still
-//   - build_depth_decoder_layer: the per-frame inner transformer over the 16
-//     RVQ levels (no cross-attention; conditioned on the temporal output).
-//   - combine the temporal stack with the depth module into the full decoder.
+/// Build one Depthformer *depth* decoder layer — the per-frame inner transformer
+/// over the 16 RVQ levels. Topology resolved from the checkpoint manifest
+/// (`tools/magenta_rt/llm_base_manifest.json`) and the reference
+/// `magenta_rt/jax/depthformer.py`: it is a standard T5 1.1 decoder layer
+/// **without** cross-attention — pre-norm causal self-attention (its own,
+/// depth-specific rel-pos buckets) → pre-norm GeGLU MLP, each residual. The
+/// checkpoint's `depth_layers_*` carry exactly `self_attention.{q,k,v,out}`,
+/// `mlp.{wi_0,wi_1,wo}`, `pre_self_attention_layer_norm`, `pre_mlp_layer_norm`
+/// — no `encoder_decoder_attention`, confirming the absence of cross-attention.
+///
+/// The depth module conditions on the temporal output via its *input* (the
+/// temporal per-frame vector is prepended as level 0; see
+/// [`build_depth_decoder_stack`]), not via cross-attention.
+///
+/// Param names: `{prefix}.pre_self_attn_norm`, `.self_attn.{q,k,v,o}`,
+/// `.pre_mlp_norm`, `.mlp.{w_gate,w_up,w_down}`.
+pub fn build_depth_decoder_layer(
+    g: &mut Graph,
+    cfg: &LlmConfig,
+    x: NodeId,
+    self_rel_pos_table: NodeId,
+    prefix: &str,
+) -> NodeId {
+    let embed = cfg.embed_dim as usize;
+    let attn_dim = (cfg.num_heads * cfg.head_dim) as usize;
+    let mlp_dim = cfg.mlp_dim as usize;
+
+    // --- 1. Causal self-attention over the 16 RVQ levels (own rel-pos buckets) ---
+    let ln1 = g.parameter(&format!("{prefix}.pre_self_attn_norm"), &[embed]);
+    let h = g.rms_norm(x, ln1, cfg.layer_norm_eps);
+    let wq = g.parameter(&format!("{prefix}.self_attn.q"), &[embed, attn_dim]);
+    let wk = g.parameter(&format!("{prefix}.self_attn.k"), &[embed, attn_dim]);
+    let wv = g.parameter(&format!("{prefix}.self_attn.v"), &[embed, attn_dim]);
+    let q = g.matmul(h, wq);
+    let k = g.matmul(h, wk);
+    let v = g.matmul(h, wv);
+    let sa = g.full_attention_with_rel_pos_bias(
+        q,
+        k,
+        v,
+        self_rel_pos_table,
+        cfg.num_heads,
+        cfg.num_heads,
+        cfg.head_dim,
+        cfg.depth_rel_pos_num_buckets,
+        cfg.depth_rel_pos_max_distance,
+        false, // not bidirectional
+        true,  // causal: levels decoded low → high
+    );
+    let wo = g.parameter(&format!("{prefix}.self_attn.o"), &[attn_dim, embed]);
+    let sa_out = g.matmul(sa, wo);
+    let x = g.add(x, sa_out);
+
+    // --- 2. GeGLU MLP (no cross-attention in the depth module) ---
+    let ln2 = g.parameter(&format!("{prefix}.pre_mlp_norm"), &[embed]);
+    let h = g.rms_norm(x, ln2, cfg.layer_norm_eps);
+    let w_gate = g.parameter(&format!("{prefix}.mlp.w_gate"), &[embed, mlp_dim]);
+    let w_up = g.parameter(&format!("{prefix}.mlp.w_up"), &[embed, mlp_dim]);
+    let w_down = g.parameter(&format!("{prefix}.mlp.w_down"), &[mlp_dim, embed]);
+    let gate = g.matmul(h, w_gate);
+    let up = g.matmul(h, w_up);
+    let ffn = g.geglu(gate, up);
+    let ffn_out = g.matmul(ffn, w_down);
+    g.add(x, ffn_out)
+}
+
+/// Build the per-frame depth decoder forward: the `[num_levels, embed]` depth
+/// input sequence → 4 depth layers → final `decoder_norm` → `logits_dense`
+/// projection → `[num_levels, vocab]` logits.
+///
+/// `depth_inputs` is the assembled `[num_levels, embed]` sequence for one frame.
+/// Per `depthformer.py`'s `MultivariateDecoder`, it is
+/// `concat([temporal_output[None], embed(levels 0..num_levels-2)], axis=levels)`
+/// — i.e. the temporal per-frame vector at position 0, then the embeddings of
+/// the already-decoded RVQ levels 0..14 (the RQ-Transformer prefix). Assembling
+/// it (mean-pooling the level embeddings for the temporal input, the concat, and
+/// the batch×time flatten) is the integration step in the full-decoder wiring;
+/// this builder is the verifiable per-frame core.
+///
+/// **Logits are NOT weight-tied.** The checkpoint carries a dedicated
+/// `decoder.logits_dense.kernel` `[embed, vocab]` alongside
+/// `token_embedder.embedding` `[vocab, embed]` (two distinct tensors), and the
+/// final `decoder_norm` is shared (it sits at `target.decoder.*`, above both the
+/// temporal and depth sub-decoders, and is applied to the depth output before
+/// the logits projection).
+///
+/// Output: logits `[num_levels, vocab_size]`.
+pub fn build_depth_decoder_stack(g: &mut Graph, cfg: &LlmConfig, depth_inputs: NodeId) -> NodeId {
+    let embed = cfg.embed_dim as usize;
+    let mut x = depth_inputs;
+    for i in 0..cfg.num_depth_decoder_layers {
+        let prefix = format!("decoder.depth_layers.{i}");
+        let rel = g.parameter(
+            &format!("{prefix}.self_attn.rel_pos_bias_table"),
+            &[(cfg.num_heads * cfg.depth_rel_pos_num_buckets) as usize],
+        );
+        x = build_depth_decoder_layer(g, cfg, x, rel, &prefix);
+    }
+    // Shared final norm (target.decoder.decoder_norm) then the dedicated,
+    // non-tied logits projection (target.decoder.logits_dense.kernel).
+    let final_norm = g.parameter("decoder.decoder_norm", &[embed]);
+    let x = g.rms_norm(x, final_norm, cfg.layer_norm_eps);
+    let logits_w = g.parameter("decoder.logits_dense", &[embed, cfg.vocab_size as usize]);
+    g.matmul(x, logits_w)
+}
+
+// TODO(decoder): with the depth layer + stack above, the remaining decoder work is
+//   - full-decoder wiring: embed the 16 levels per frame, mean-pool → temporal
+//     input; run the temporal stack; assemble depth inputs (concat temporal
+//     output with the level-embedding prefix) and run the depth stack per frame.
 //   - KV cache for autoregressive decode, and the generation loop wiring in
-//     `super::sampling`. The exact position-encoding scheme (T5 rel-pos vs the
-//     absolute sinusoidal PE the numpy ref assumes) is unresolved and needs the
-//     checkpoint tensor names to settle.
+//     `super::sampling` (CFG batch=2 broadcast still TODO).
+//   - encoder position scheme: the checkpoint has no learned PE and no encoder
+//     rel-pos table (only the temporal/depth decoders do); see
+//     `tools/magenta_rt/LLM_FINDINGS.md` for the open RoPE-vs-none question and
+//     the `Scale(sqrt(embed))` the encoder embedder applies.
 
 #[cfg(test)]
 mod tests {
@@ -369,6 +484,27 @@ mod tests {
         assert_eq!(c.num_temporal_decoder_layers, 20);
         assert_eq!(c.num_depth_decoder_layers, 4);
         assert_eq!(c.vocab_size, 29824);
+    }
+
+    #[test]
+    fn depth_decoder_stack_builds() {
+        // Smoke test: the per-frame depth stack constructs without panicking.
+        // GPU-vs-CPU correctness (à la tests/llm_decoder_stack_correctness.rs)
+        // needs a Vulkan device; this only checks graph composition.
+        let cfg = LlmConfig::base();
+        let mut g = Graph::new();
+        let depth_in = g.input(
+            "depth_inputs",
+            &[cfg.num_levels as usize, cfg.embed_dim as usize],
+        );
+        let _logits = build_depth_decoder_stack(&mut g, &cfg, depth_in);
+        // 4 depth layers × (4 self-attn matmuls + 3 mlp matmuls + 2 norms +
+        // 1 rel-pos table) = 40, plus decoder_norm + logits_dense = 42 params.
+        assert!(
+            g.nodes().len() > cfg.num_depth_decoder_layers as usize * 10,
+            "depth stack should have ≥ ~42 parameter nodes plus ops, got {} nodes",
+            g.nodes().len()
+        );
     }
 
     #[test]

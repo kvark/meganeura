@@ -1,0 +1,2924 @@
+{
+ "checkpoint": "checkpoints/llm_base_x4286_c1860k",
+ "format": "t5x/flaxformer tensorstore (zarr)",
+ "num_tensors": 430,
+ "repo": "google/magenta-realtime",
+ "tensors": {
+  "target.decoder.decoder.depth_decoder.depth_layers_0.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_0.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_0.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_0.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_0.pre_self_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_0.self_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_0.self_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_0.self_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_0.self_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_1.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_1.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_1.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_1.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_1.pre_self_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_1.self_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_1.self_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_1.self_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_1.self_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_2.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_2.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_2.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_2.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_2.pre_self_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_2.self_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_2.self_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_2.self_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_2.self_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_3.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_3.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_3.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_3.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_3.pre_self_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_3.self_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_3.self_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_3.self_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.depth_layers_3.self_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.depth_decoder.relpos_bias_depth.rel_embedding": {
+   "dtype": "<f4",
+   "shape": [
+    12,
+    16
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_0.encoder_decoder_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_0.encoder_decoder_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_0.encoder_decoder_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_0.encoder_decoder_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_0.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_0.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_0.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_0.pre_cross_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_0.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_0.pre_self_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_0.self_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_0.self_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_0.self_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_0.self_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_1.encoder_decoder_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_1.encoder_decoder_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_1.encoder_decoder_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_1.encoder_decoder_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_1.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_1.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_1.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_1.pre_cross_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_1.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_1.pre_self_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_1.self_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_1.self_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_1.self_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_1.self_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_10.encoder_decoder_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_10.encoder_decoder_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_10.encoder_decoder_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_10.encoder_decoder_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_10.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_10.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_10.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_10.pre_cross_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_10.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_10.pre_self_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_10.self_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_10.self_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_10.self_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_10.self_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_11.encoder_decoder_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_11.encoder_decoder_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_11.encoder_decoder_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_11.encoder_decoder_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_11.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_11.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_11.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_11.pre_cross_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_11.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_11.pre_self_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_11.self_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_11.self_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_11.self_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_11.self_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_12.encoder_decoder_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_12.encoder_decoder_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_12.encoder_decoder_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_12.encoder_decoder_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_12.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_12.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_12.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_12.pre_cross_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_12.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_12.pre_self_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_12.self_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_12.self_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_12.self_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_12.self_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_13.encoder_decoder_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_13.encoder_decoder_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_13.encoder_decoder_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_13.encoder_decoder_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_13.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_13.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_13.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_13.pre_cross_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_13.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_13.pre_self_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_13.self_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_13.self_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_13.self_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_13.self_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_14.encoder_decoder_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_14.encoder_decoder_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_14.encoder_decoder_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_14.encoder_decoder_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_14.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_14.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_14.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_14.pre_cross_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_14.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_14.pre_self_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_14.self_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_14.self_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_14.self_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_14.self_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_15.encoder_decoder_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_15.encoder_decoder_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_15.encoder_decoder_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_15.encoder_decoder_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_15.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_15.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_15.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_15.pre_cross_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_15.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_15.pre_self_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_15.self_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_15.self_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_15.self_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_15.self_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_16.encoder_decoder_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_16.encoder_decoder_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_16.encoder_decoder_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_16.encoder_decoder_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_16.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_16.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_16.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_16.pre_cross_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_16.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_16.pre_self_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_16.self_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_16.self_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_16.self_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_16.self_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_17.encoder_decoder_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_17.encoder_decoder_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_17.encoder_decoder_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_17.encoder_decoder_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_17.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_17.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_17.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_17.pre_cross_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_17.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_17.pre_self_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_17.self_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_17.self_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_17.self_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_17.self_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_18.encoder_decoder_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_18.encoder_decoder_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_18.encoder_decoder_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_18.encoder_decoder_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_18.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_18.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_18.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_18.pre_cross_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_18.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_18.pre_self_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_18.self_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_18.self_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_18.self_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_18.self_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_19.encoder_decoder_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_19.encoder_decoder_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_19.encoder_decoder_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_19.encoder_decoder_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_19.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_19.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_19.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_19.pre_cross_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_19.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_19.pre_self_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_19.self_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_19.self_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_19.self_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_19.self_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_2.encoder_decoder_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_2.encoder_decoder_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_2.encoder_decoder_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_2.encoder_decoder_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_2.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_2.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_2.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_2.pre_cross_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_2.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_2.pre_self_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_2.self_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_2.self_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_2.self_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_2.self_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_3.encoder_decoder_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_3.encoder_decoder_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_3.encoder_decoder_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_3.encoder_decoder_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_3.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_3.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_3.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_3.pre_cross_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_3.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_3.pre_self_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_3.self_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_3.self_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_3.self_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_3.self_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_4.encoder_decoder_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_4.encoder_decoder_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_4.encoder_decoder_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_4.encoder_decoder_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_4.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_4.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_4.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_4.pre_cross_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_4.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_4.pre_self_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_4.self_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_4.self_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_4.self_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_4.self_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_5.encoder_decoder_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_5.encoder_decoder_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_5.encoder_decoder_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_5.encoder_decoder_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_5.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_5.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_5.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_5.pre_cross_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_5.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_5.pre_self_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_5.self_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_5.self_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_5.self_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_5.self_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_6.encoder_decoder_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_6.encoder_decoder_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_6.encoder_decoder_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_6.encoder_decoder_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_6.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_6.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_6.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_6.pre_cross_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_6.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_6.pre_self_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_6.self_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_6.self_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_6.self_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_6.self_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_7.encoder_decoder_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_7.encoder_decoder_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_7.encoder_decoder_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_7.encoder_decoder_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_7.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_7.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_7.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_7.pre_cross_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_7.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_7.pre_self_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_7.self_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_7.self_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_7.self_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_7.self_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_8.encoder_decoder_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_8.encoder_decoder_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_8.encoder_decoder_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_8.encoder_decoder_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_8.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_8.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_8.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_8.pre_cross_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_8.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_8.pre_self_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_8.self_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_8.self_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_8.self_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_8.self_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_9.encoder_decoder_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_9.encoder_decoder_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_9.encoder_decoder_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_9.encoder_decoder_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_9.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_9.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_9.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_9.pre_cross_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_9.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_9.pre_self_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_9.self_attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_9.self_attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_9.self_attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.layers_9.self_attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.decoder.decoder.temporal_decoder.relpos_bias.rel_embedding": {
+   "dtype": "<f4",
+   "shape": [
+    12,
+    128
+   ]
+  },
+  "target.decoder.decoder_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.decoder.logits_dense.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    29824
+   ]
+  },
+  "target.encoder.encoder_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.encoder.layers_0.attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_0.attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_0.attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_0.attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_0.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.encoder.layers_0.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.encoder.layers_0.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.encoder.layers_0.pre_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.encoder.layers_0.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.encoder.layers_1.attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_1.attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_1.attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_1.attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_1.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.encoder.layers_1.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.encoder.layers_1.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.encoder.layers_1.pre_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.encoder.layers_1.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.encoder.layers_10.attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_10.attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_10.attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_10.attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_10.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.encoder.layers_10.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.encoder.layers_10.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.encoder.layers_10.pre_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.encoder.layers_10.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.encoder.layers_11.attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_11.attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_11.attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_11.attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_11.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.encoder.layers_11.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.encoder.layers_11.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.encoder.layers_11.pre_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.encoder.layers_11.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.encoder.layers_2.attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_2.attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_2.attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_2.attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_2.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.encoder.layers_2.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.encoder.layers_2.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.encoder.layers_2.pre_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.encoder.layers_2.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.encoder.layers_3.attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_3.attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_3.attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_3.attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_3.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.encoder.layers_3.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.encoder.layers_3.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.encoder.layers_3.pre_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.encoder.layers_3.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.encoder.layers_4.attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_4.attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_4.attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_4.attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_4.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.encoder.layers_4.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.encoder.layers_4.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.encoder.layers_4.pre_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.encoder.layers_4.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.encoder.layers_5.attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_5.attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_5.attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_5.attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_5.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.encoder.layers_5.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.encoder.layers_5.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.encoder.layers_5.pre_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.encoder.layers_5.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.encoder.layers_6.attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_6.attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_6.attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_6.attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_6.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.encoder.layers_6.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.encoder.layers_6.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.encoder.layers_6.pre_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.encoder.layers_6.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.encoder.layers_7.attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_7.attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_7.attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_7.attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_7.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.encoder.layers_7.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.encoder.layers_7.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.encoder.layers_7.pre_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.encoder.layers_7.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.encoder.layers_8.attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_8.attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_8.attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_8.attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_8.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.encoder.layers_8.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.encoder.layers_8.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.encoder.layers_8.pre_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.encoder.layers_8.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.encoder.layers_9.attention.key.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_9.attention.out.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_9.attention.query.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_9.attention.value.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    768
+   ]
+  },
+  "target.encoder.layers_9.mlp.wi_0.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.encoder.layers_9.mlp.wi_1.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    768,
+    2048
+   ]
+  },
+  "target.encoder.layers_9.mlp.wo.kernel": {
+   "dtype": "<f4",
+   "shape": [
+    2048,
+    768
+   ]
+  },
+  "target.encoder.layers_9.pre_attention_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.encoder.layers_9.pre_mlp_layer_norm.scale": {
+   "dtype": "<f4",
+   "shape": [
+    768
+   ]
+  },
+  "target.token_embedder.embedding": {
+   "dtype": "<f4",
+   "shape": [
+    29824,
+    768
+   ]
+  }
+ }
+}
