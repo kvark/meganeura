@@ -25,6 +25,7 @@
 //! convention.
 
 pub mod llm;
+pub mod llm_weights;
 pub mod musiccoca;
 pub mod sampling;
 pub mod spectrostream;

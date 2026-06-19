@@ -84,7 +84,7 @@ impl LlmConfig {
             vocab_size: 29698,
             encoder_seq_len: 1006,
             decoder_seq_len: 800,
-            rel_pos_num_buckets: 32,
+            rel_pos_num_buckets: 128,
             rel_pos_max_distance: 128,
             depth_rel_pos_num_buckets: 16,
             depth_rel_pos_max_distance: 16,
@@ -110,7 +110,9 @@ impl LlmConfig {
             vocab_size: 29824,
             encoder_seq_len: 1006,
             decoder_seq_len: 800,
-            rel_pos_num_buckets: 32,
+            // 128 temporal rel-pos buckets — confirmed by the checkpoint manifest
+            // (`temporal_decoder.relpos_bias.rel_embedding` is `[12, 128]`).
+            rel_pos_num_buckets: 128,
             rel_pos_max_distance: 128,
             depth_rel_pos_num_buckets: 16,
             depth_rel_pos_max_distance: 16,

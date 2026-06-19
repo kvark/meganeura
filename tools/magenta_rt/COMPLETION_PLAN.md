@@ -20,10 +20,10 @@ text prompt ─► MusicCoCa ─► 6 style tokens ┐
 |-----------|---------------|---------------|----------|------|
 | **MusicCoCa** text encoder | ✅ `build_text_encoder_graph` | ✅ `load_text_encoder_weights` | ✅ GPU-vs-CPU (random weights, 1e-3) | real-weight check vs the 26 testdata embeddings |
 | **SpectroStream** decoder body | ✅ `build_decoder_graph` | ✅ `load_decoder_weights` | ⚠️ only structurally; demo runs tokens→WAV | 3 unverified "free reinterpret" claims; RADV NaN bug |
-| **LLM** encoder | ✅ `build_encoder_graph` | ❌ | ❌ | drop spurious `pos_embed`, add `Scale(√d)`; encoder position scheme is the one open question |
-| **LLM** temporal decoder | ✅ `build_temporal_decoder` (mean-pool input, shared rel-pos) + `build_decoder_layer` | ❌ | ✅ GPU-vs-CPU on lavapipe (random weights, 1e-3) | buckets=128 for real weights |
-| **LLM** depth decoder | ✅ `build_depth_decoder_layer` + `build_depth_decoder_stack` (shared rel-pos) | ❌ | ✅ GPU-vs-CPU on lavapipe (random weights, 1e-3) | topology resolved |
-| **LLM** full decoder | ✅ `build_decoder` (temporal→depth, parallel/teacher-forcing) | ❌ | ✅ GPU-vs-CPU on lavapipe (random weights, 1e-3) | autoregressive KV-cache form next |
+| **LLM** encoder | ✅ `build_encoder_graph` | ⚠️ body only (`llm_weights`) | ❌ | drop spurious `pos_embed`, add `Scale(√d)`; encoder position scheme is the one open question |
+| **LLM** temporal decoder | ✅ `build_temporal_decoder` + `build_decoder_layer` | ✅ `llm_weights` (shared) | ✅ GPU-vs-CPU on lavapipe (random weights, 1e-3) | — |
+| **LLM** depth decoder | ✅ `build_depth_decoder_layer` + `build_depth_decoder_stack` | ✅ `llm_weights` (shared) | ✅ GPU-vs-CPU on lavapipe (random weights, 1e-3) | — |
+| **LLM** full decoder | ✅ `build_decoder` (temporal→depth) | ✅ `llm_weights::load_llm_weights` | ✅ map = 100% of checkpoint (`llm_weight_map`); GPU-vs-CPU random-weight | real-weight numeric gate needs JAX ref |
 | **LLM** generation | ✅ `decode` (CFG + temperature/top-k) / `decode_greedy`: temporal KV-cache step + per-frame depth + sampler | — | ✅ greedy + CFG match parallel argmax; top-k within parallel top-k; reproducible (lavapipe) | depth recomputed per level (KV-cache later); encoder still needed for real enc output |
 
 The verification pattern that works without real weights: build the graph with
@@ -99,9 +99,11 @@ checks. For the full weight dump: `python3 tools/magenta_rt/dump_llm.py` (after
     `sampling::{cfg_combine, top_k_sample}` (already implemented), feeding tokens
     back. Reuse the temporal layers with cached K/V (see `runtime` KV-cache ops:
     `CacheWrite`/`CachedAttention`).
-2.5 **LLM weight loader**: map T5X `target.*` flaxformer names → graph params
-    (like `musiccoca`/`spectrostream`). Real-weight gate: greedy-decode logits
-    match the Colab reference for a fixed seed.
+2.5 ✅ **LLM weight loader** — `llm_weights::{checkpoint_param_map,
+    load_llm_weights}` maps `target.*` → graph params (flat copy, no transpose);
+    `tests/llm_weight_map.rs` verifies 100% checkpoint coverage vs the manifest;
+    `dump_llm.py` writes the compatible safetensors. Real-weight numeric gate
+    (greedy logits vs the Colab reference) still needs JAX + reference outputs.
 
 ### Phase 3 — end-to-end wiring
 3.1 Tokenizer + MusicCoCa text→6 style tokens (SentencePiece via the `tokenizers`

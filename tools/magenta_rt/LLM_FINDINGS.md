@@ -197,9 +197,23 @@ fine for Magenta-RT, but a constraint to remember.
    samples within the parallel top-k; reproducible from a seed).
    **Remaining:** a depth KV-cache to drop the per-level O(levels²) recompute
    (optimisation only).
-4. **Weight loader**: map `target.*` (flaxformer) → graph params using
-   `llm_base_manifest.json`, like `musiccoca`/`spectrostream`. Real-weight gate:
-   greedy-decode logits match the Colab reference for a fixed seed.
+4. ✅ **Weight loader** — `llm_weights::{checkpoint_param_map, load_llm_weights}`
+   maps the flaxformer `target.*` names → graph params. **No transposes**: T5X
+   `DenseGeneral` stores `[in, out]` row-major (matches `matmul(x, W)`), and
+   `rel_embedding [heads, buckets]` flattens to the `[heads*buckets]` table — so
+   every param is a flat copy. Verified against the committed manifest by
+   `tests/llm_weight_map.rs`: **100% of the 430 checkpoint tensors** map to a
+   graph param with matching element count. `dump_llm.py` already writes the
+   safetensors keyed by these `target.*` names; an `#[ignore]`d real-load test
+   (`MEGANEURA_LLM_WEIGHTS=…`) loads them into a `build_decoder` session and
+   asserts full coverage. (Manifest fix: temporal rel-pos is **128 buckets**, not
+   32 — `LlmConfig::base/large` updated.)
+   **Encoder gap stands**: the checkpoint has no encoder PE/rel-pos tensor, so
+   `encoder.pos_embed` + the encoder rel-pos tables are left unmapped (skipped) —
+   the decoder + embeddings + heads load fully; the encoder needs its position
+   scheme resolved + the `Scale(√d)` fix before a real-weight forward.
+   **Real-weight numeric gate** (greedy logits vs the Colab reference) still
+   needs JAX + the reference outputs; the loader + mapping are in place for it.
 
 ## Status
 
