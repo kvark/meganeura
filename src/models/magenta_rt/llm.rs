@@ -444,19 +444,59 @@ pub fn build_depth_decoder_layer(
     self_rel_pos_table: NodeId,
     prefix: &str,
 ) -> NodeId {
+    let p = register_depth_layer_params(g, cfg, prefix);
+    depth_layer_forward(g, cfg, x, self_rel_pos_table, &p)
+}
+
+/// Pre-created parameter node handles for one depth layer. Hoisting the params
+/// lets the parallel decoder reuse a single set of nodes across all frames (the
+/// runtime binds each parameter buffer to exactly one node, so a param name must
+/// map to a single graph node — duplicating the nodes would leave all but the
+/// first unbound).
+struct DepthLayerParams {
+    ln1: NodeId,
+    q: NodeId,
+    k: NodeId,
+    v: NodeId,
+    o: NodeId,
+    ln2: NodeId,
+    w_gate: NodeId,
+    w_up: NodeId,
+    w_down: NodeId,
+}
+
+fn register_depth_layer_params(g: &mut Graph, cfg: &LlmConfig, prefix: &str) -> DepthLayerParams {
     let embed = cfg.embed_dim as usize;
     let attn_dim = (cfg.num_heads * cfg.head_dim) as usize;
     let mlp_dim = cfg.mlp_dim as usize;
+    DepthLayerParams {
+        ln1: g.parameter(&format!("{prefix}.pre_self_attn_norm"), &[embed]),
+        q: g.parameter(&format!("{prefix}.self_attn.q"), &[embed, attn_dim]),
+        k: g.parameter(&format!("{prefix}.self_attn.k"), &[embed, attn_dim]),
+        v: g.parameter(&format!("{prefix}.self_attn.v"), &[embed, attn_dim]),
+        o: g.parameter(&format!("{prefix}.self_attn.o"), &[attn_dim, embed]),
+        ln2: g.parameter(&format!("{prefix}.pre_mlp_norm"), &[embed]),
+        w_gate: g.parameter(&format!("{prefix}.mlp.w_gate"), &[embed, mlp_dim]),
+        w_up: g.parameter(&format!("{prefix}.mlp.w_up"), &[embed, mlp_dim]),
+        w_down: g.parameter(&format!("{prefix}.mlp.w_down"), &[mlp_dim, embed]),
+    }
+}
 
-    // --- 1. Causal self-attention over the 16 RVQ levels (own rel-pos buckets) ---
-    let ln1 = g.parameter(&format!("{prefix}.pre_self_attn_norm"), &[embed]);
-    let h = g.rms_norm(x, ln1, cfg.layer_norm_eps);
-    let wq = g.parameter(&format!("{prefix}.self_attn.q"), &[embed, attn_dim]);
-    let wk = g.parameter(&format!("{prefix}.self_attn.k"), &[embed, attn_dim]);
-    let wv = g.parameter(&format!("{prefix}.self_attn.v"), &[embed, attn_dim]);
-    let q = g.matmul(h, wq);
-    let k = g.matmul(h, wk);
-    let v = g.matmul(h, wv);
+/// One depth layer's compute, given pre-registered params: pre-norm causal
+/// self-attention (depth rel-pos buckets, no cross-attention) → pre-norm GeGLU
+/// MLP, each residual.
+fn depth_layer_forward(
+    g: &mut Graph,
+    cfg: &LlmConfig,
+    x: NodeId,
+    self_rel_pos_table: NodeId,
+    p: &DepthLayerParams,
+) -> NodeId {
+    // --- 1. Causal self-attention over the RVQ levels (own rel-pos buckets) ---
+    let h = g.rms_norm(x, p.ln1, cfg.layer_norm_eps);
+    let q = g.matmul(h, p.q);
+    let k = g.matmul(h, p.k);
+    let v = g.matmul(h, p.v);
     let sa = g.full_attention_with_rel_pos_bias(
         q,
         k,
@@ -470,21 +510,60 @@ pub fn build_depth_decoder_layer(
         false, // not bidirectional
         true,  // causal: levels decoded low → high
     );
-    let wo = g.parameter(&format!("{prefix}.self_attn.o"), &[attn_dim, embed]);
-    let sa_out = g.matmul(sa, wo);
+    let sa_out = g.matmul(sa, p.o);
     let x = g.add(x, sa_out);
 
     // --- 2. GeGLU MLP (no cross-attention in the depth module) ---
-    let ln2 = g.parameter(&format!("{prefix}.pre_mlp_norm"), &[embed]);
-    let h = g.rms_norm(x, ln2, cfg.layer_norm_eps);
-    let w_gate = g.parameter(&format!("{prefix}.mlp.w_gate"), &[embed, mlp_dim]);
-    let w_up = g.parameter(&format!("{prefix}.mlp.w_up"), &[embed, mlp_dim]);
-    let w_down = g.parameter(&format!("{prefix}.mlp.w_down"), &[mlp_dim, embed]);
-    let gate = g.matmul(h, w_gate);
-    let up = g.matmul(h, w_up);
+    let h = g.rms_norm(x, p.ln2, cfg.layer_norm_eps);
+    let gate = g.matmul(h, p.w_gate);
+    let up = g.matmul(h, p.w_up);
     let ffn = g.geglu(gate, up);
-    let ffn_out = g.matmul(ffn, w_down);
+    let ffn_out = g.matmul(ffn, p.w_down);
     g.add(x, ffn_out)
+}
+
+/// Pre-created handles for the whole depth sub-decoder (shared rel-pos table,
+/// the depth layers, the shared final norm, and the logits projection).
+struct DepthParams {
+    rel: NodeId,
+    layers: Vec<DepthLayerParams>,
+    decoder_norm: NodeId,
+    logits: NodeId,
+}
+
+fn register_depth_params(g: &mut Graph, cfg: &LlmConfig) -> DepthParams {
+    let embed = cfg.embed_dim as usize;
+    // One shared rel-pos table for the whole depth sub-decoder — the checkpoint
+    // stores a single `depth_decoder.relpos_bias_depth.rel_embedding` `[heads,
+    // 16]`, not one table per depth layer.
+    let rel = g.parameter(
+        "decoder.depth_decoder.rel_pos_bias_table",
+        &[(cfg.num_heads * cfg.depth_rel_pos_num_buckets) as usize],
+    );
+    let layers = (0..cfg.num_depth_decoder_layers)
+        .map(|i| register_depth_layer_params(g, cfg, &format!("decoder.depth_layers.{i}")))
+        .collect();
+    // Shared final norm (target.decoder.decoder_norm) then the dedicated,
+    // non-tied logits projection (target.decoder.logits_dense.kernel).
+    let decoder_norm = g.parameter("decoder.decoder_norm", &[embed]);
+    let logits = g.parameter("decoder.logits_dense", &[embed, cfg.vocab_size as usize]);
+    DepthParams {
+        rel,
+        layers,
+        decoder_norm,
+        logits,
+    }
+}
+
+/// Depth-decoder forward for one frame, given pre-registered params: depth
+/// layers → shared `decoder_norm` → non-tied `logits_dense` → `[levels, vocab]`.
+fn depth_forward(g: &mut Graph, cfg: &LlmConfig, depth_inputs: NodeId, dp: &DepthParams) -> NodeId {
+    let mut x = depth_inputs;
+    for p in &dp.layers {
+        x = depth_layer_forward(g, cfg, x, dp.rel, p);
+    }
+    let x = g.rms_norm(x, dp.decoder_norm, cfg.layer_norm_eps);
+    g.matmul(x, dp.logits)
 }
 
 /// Build the per-frame depth decoder forward: the `[num_levels, embed]` depth
@@ -495,10 +574,9 @@ pub fn build_depth_decoder_layer(
 /// Per `depthformer.py`'s `MultivariateDecoder`, it is
 /// `concat([temporal_output[None], embed(levels 0..num_levels-2)], axis=levels)`
 /// — i.e. the temporal per-frame vector at position 0, then the embeddings of
-/// the already-decoded RVQ levels 0..14 (the RQ-Transformer prefix). Assembling
-/// it (mean-pooling the level embeddings for the temporal input, the concat, and
-/// the batch×time flatten) is the integration step in the full-decoder wiring;
-/// this builder is the verifiable per-frame core.
+/// the already-decoded RVQ levels 0..14 (the RQ-Transformer prefix). The full
+/// decoder ([`build_decoder`]) assembles this and runs the stack per frame; this
+/// builder is the verifiable per-frame core.
 ///
 /// **Logits are NOT weight-tied.** The checkpoint carries a dedicated
 /// `decoder.logits_dense.kernel` `[embed, vocab]` alongside
@@ -509,37 +587,120 @@ pub fn build_depth_decoder_layer(
 ///
 /// Output: logits `[num_levels, vocab_size]`.
 pub fn build_depth_decoder_stack(g: &mut Graph, cfg: &LlmConfig, depth_inputs: NodeId) -> NodeId {
-    let embed = cfg.embed_dim as usize;
-    let mut x = depth_inputs;
-    // One shared rel-pos table for the whole depth sub-decoder — the checkpoint
-    // stores a single `depth_decoder.relpos_bias_depth.rel_embedding` `[heads,
-    // 16]`, not one table per depth layer.
-    let rel = g.parameter(
-        "decoder.depth_decoder.rel_pos_bias_table",
-        &[(cfg.num_heads * cfg.depth_rel_pos_num_buckets) as usize],
-    );
-    for i in 0..cfg.num_depth_decoder_layers {
-        let prefix = format!("decoder.depth_layers.{i}");
-        x = build_depth_decoder_layer(g, cfg, x, rel, &prefix);
-    }
-    // Shared final norm (target.decoder.decoder_norm) then the dedicated,
-    // non-tied logits projection (target.decoder.logits_dense.kernel).
-    let final_norm = g.parameter("decoder.decoder_norm", &[embed]);
-    let x = g.rms_norm(x, final_norm, cfg.layer_norm_eps);
-    let logits_w = g.parameter("decoder.logits_dense", &[embed, cfg.vocab_size as usize]);
-    g.matmul(x, logits_w)
+    let dp = register_depth_params(g, cfg);
+    depth_forward(g, cfg, depth_inputs, &dp)
 }
 
-// TODO(decoder): with the depth layer + stack above, the remaining decoder work is
-//   - full-decoder wiring: embed the 16 levels per frame, mean-pool → temporal
-//     input; run the temporal stack; assemble depth inputs (concat temporal
-//     output with the level-embedding prefix) and run the depth stack per frame.
-//   - KV cache for autoregressive decode, and the generation loop wiring in
-//     `super::sampling` (CFG batch=2 broadcast still TODO).
-//   - encoder position scheme: the checkpoint has no learned PE and no encoder
-//     rel-pos table (only the temporal/depth decoders do); see
-//     `tools/magenta_rt/LLM_FINDINGS.md` for the open RoPE-vs-none question and
-//     the `Scale(sqrt(embed))` the encoder embedder applies.
+/// Slice rows `[start, start+len)` of a row-major `[rows, dim]` tensor →
+/// `[len, dim]` (a contiguous row range; `slice_2d` over the H axis).
+fn slice_rows(
+    g: &mut Graph,
+    x: NodeId,
+    rows: usize,
+    dim: usize,
+    start: usize,
+    len: usize,
+) -> NodeId {
+    let out = g.slice_2d(
+        x,
+        1,
+        1,
+        rows as u32,
+        dim as u32,
+        start as u32,
+        (rows - start - len) as u32,
+        0,
+        0,
+    );
+    g.reshape(out, &[len, dim])
+}
+
+/// Concatenate two row-major tensors `[ra, dim]` and `[rb, dim]` along rows →
+/// `[ra + rb, dim]` (channel-axis concat with `spatial = dim`).
+fn concat_rows(g: &mut Graph, a: NodeId, b: NodeId, ra: usize, rb: usize, dim: usize) -> NodeId {
+    let out = g.concat(a, b, 1, ra as u32, rb as u32, dim as u32);
+    g.reshape(out, &[ra + rb, dim])
+}
+
+/// Build the full parallel ("teacher-forcing") Depthformer decoder forward:
+/// SOS-padded RVQ token grid → per-frame logits `[num_frames * num_levels,
+/// vocab]`. This joins [`build_temporal_decoder`]'s temporal path with the
+/// per-frame depth stack, exactly per `depthformer.py`'s `MultivariateDecoder`:
+///
+/// 1. embed the padded grid once → `[(num_frames+1) * num_levels, embed]`;
+/// 2. mean-pool the levels of padded frames `0..num_frames-1` → temporal input
+///    `[num_frames, embed]`; run the temporal layers (shared rel-pos table,
+///    cross-attending to `encoder_out`) → temporal states `[num_frames, embed]`;
+/// 3. for each output frame `t`, assemble the depth input
+///    `concat([temporal_state[t], embed(target-frame-t levels 0..num_levels-2)])`
+///    `→ [num_levels, embed]` and run the depth stack → `[num_levels, vocab]`;
+/// 4. concatenate the per-frame logits → `[num_frames * num_levels, vocab]`.
+///
+/// The depth stack is run **per frame** because its self-attention is causal
+/// *within* a frame's levels (a flattened `[num_frames*num_levels, embed]` pass
+/// would leak across frames); the depth params are registered once and shared
+/// across frames. This parallel form is for teacher-forcing / verification —
+/// production inference is the autoregressive step loop (KV-cache; future work).
+///
+/// `decoder_input_tokens` is the SOS-padded grid `[(num_frames+1) * num_levels]`
+/// u32: frame 0 is the SOS frame, frames `1..=num_frames` are the targets.
+///
+/// Inputs:  `decoder_input_tokens` u32 `[(num_frames+1) * num_levels]`,
+///          `encoder_out` `[enc_seq, embed]`.
+/// Output:  logits `[num_frames * num_levels, vocab_size]`.
+pub fn build_decoder(
+    g: &mut Graph,
+    cfg: &LlmConfig,
+    decoder_input_tokens: NodeId,
+    encoder_out: NodeId,
+    num_frames: usize,
+) -> NodeId {
+    let embed = cfg.embed_dim as usize;
+    let levels = cfg.num_levels as usize;
+    let vocab = cfg.vocab_size as usize;
+    let padded_rows = (num_frames + 1) * levels;
+
+    let table = g.parameter("shared_token_embedder", &[vocab, embed]);
+    let embedded = g.embedding(decoder_input_tokens, table); // [(F+1)*L, embed]
+
+    // --- Temporal path: mean-pool padded frames 0..F-1 → [F, embed] ---
+    let temporal_src = slice_rows(g, embedded, padded_rows, embed, 0, num_frames * levels);
+    let mut x = build_level_mean_pool(g, cfg, temporal_src, num_frames);
+    let trel = g.parameter(
+        "decoder.temporal_decoder.rel_pos_bias_table",
+        &[(cfg.num_heads * cfg.rel_pos_num_buckets) as usize],
+    );
+    for i in 0..cfg.num_temporal_decoder_layers {
+        let prefix = format!("decoder.temporal_layers.{i}");
+        x = build_decoder_layer(g, cfg, x, encoder_out, trel, &prefix);
+    }
+    let temporal_out = x; // [F, embed]
+
+    // --- Depth path: per-frame, sharing one set of registered params ---
+    let dp = register_depth_params(g, cfg);
+    let mut logits: Option<NodeId> = None;
+    for t in 0..num_frames {
+        // Level 0: this frame's temporal state.
+        let trow = slice_rows(g, temporal_out, num_frames, embed, t, 1); // [1, embed]
+                                                                         // Levels 1..L-1: embeddings of target-frame-t levels 0..L-2 — i.e. padded
+                                                                         // frame t+1's first L-1 rows (the RQ-Transformer teacher-forcing prefix).
+        let prefix = slice_rows(
+            g,
+            embedded,
+            padded_rows,
+            embed,
+            (t + 1) * levels,
+            levels - 1,
+        );
+        let depth_in = concat_rows(g, trow, prefix, 1, levels - 1, embed); // [L, embed]
+        let frame_logits = depth_forward(g, cfg, depth_in, &dp); // [L, vocab]
+        logits = Some(match logits {
+            None => frame_logits,
+            Some(acc) => concat_rows(g, acc, frame_logits, t * levels, levels, vocab),
+        });
+    }
+    logits.expect("num_frames must be ≥ 1")
+}
 
 #[cfg(test)]
 mod tests {

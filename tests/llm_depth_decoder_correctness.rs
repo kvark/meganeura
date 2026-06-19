@@ -196,7 +196,7 @@ fn depth_decoder_stack_matches_cpu_reference() {
     let vocab = cfg.vocab_size as usize;
     let levels = cfg.num_levels as usize;
 
-    let mut r = Rng(0xD3F7_0FFE_11);
+    let mut r = Rng(0x00D3_F70F_FE11);
     let mut weights: HashMap<String, Vec<f32>> = HashMap::new();
     weights.insert(
         "decoder.decoder_norm".into(),

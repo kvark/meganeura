@@ -134,6 +134,14 @@ tests:
   (one shared rel-pos table) → `[num_frames, embed]` states, **no** final norm /
   logits (those belong after the depth module). Verified by
   `tests/llm_temporal_decoder_correctness.rs`.
+- `build_decoder` (**new**) — the *full* parallel (teacher-forcing) decoder:
+  SOS-padded grid → embed → mean-pool → temporal layers (cross-attn) →
+  per-frame `concat([temporal_state, embed(prev levels)])` → depth stack (run
+  per frame, since its attention is causal *within* a frame's levels; depth
+  params registered once and shared) → `[num_frames*num_levels, vocab]`. The
+  slice/concat use `slice_2d`/`concat`. Verified end-to-end by
+  `tests/llm_full_decoder_correctness.rs`. This parallel form is for
+  training/verification; production inference is the autoregressive step loop.
 
 ## Remaining to reach text→tokens (in dependency order)
 
@@ -141,24 +149,24 @@ tests:
    `Scale(sqrt(embed))`; make the temporal rel-pos table shared per sub-decoder
    with bucket count 128. Settle the encoder position sub-question (above), then
    a real-weight encoder GPU-vs-reference check (mirrors MusicCoCa's).
-2. **Full-decoder wiring**: the temporal half is done (`build_temporal_decoder`,
-   mean-pool included). Remaining: assemble the depth inputs per frame —
-   `concat([temporal_out[frame], embed(levels 0..14)])` over the level axis —
-   and run `build_depth_decoder_stack` per frame. Needs a level-axis concat /
-   per-frame slice in the graph.
+2. ✅ **Full-decoder wiring** — done (`build_decoder`, GPU-verified). The
+   per-frame depth-input assembly (slice temporal state + level-prefix embeds,
+   concat) and the block-per-frame depth pass are in place.
 3. **KV cache + autoregressive loop**: 50 frames × 16 levels; run the encoder
    once; read `[2, vocab]` logits per step; call
    `super::sampling::{cfg_combine, top_k_sample}`. Needs the CFG batch=2
-   broadcast-add the encoder currently asserts against.
+   broadcast-add the encoder currently asserts against. The per-frame depth
+   forward in `build_decoder` is the shape this loop calls each step.
 4. **Weight loader**: map `target.*` (flaxformer) → graph params using
    `llm_base_manifest.json`, like `musiccoca`/`spectrostream`. Real-weight gate:
    greedy-decode logits match the Colab reference for a fixed seed.
 
 ## Status
 
-The depth-module topology and the absolute-PE / untied-logits questions are now
-**settled** from the checkpoint manifest + the reference `depthformer.py`. The
-remaining unknown is narrow (the encoder's *position* scheme, which is
-non-parametric and so invisible in the checkpoint) and is flagged, not guessed.
-Everything correctness-real is now gated only on a Vulkan device + the weight
-download, not on missing architecture knowledge.
+The depth-module topology, the temporal→depth wiring, and the absolute-PE /
+untied-logits questions are now **settled** from the checkpoint manifest + the
+reference `depthformer.py`, and the parallel decoder forward is GPU-verified on
+lavapipe. The remaining unknown is narrow (the encoder's *position* scheme,
+which is non-parametric and so invisible in the checkpoint) and is flagged, not
+guessed. What's left to text→tokens is the autoregressive KV-cache loop, the
+encoder fixes, and the real-weight loader — all unblocked.

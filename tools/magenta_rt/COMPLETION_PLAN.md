@@ -23,6 +23,7 @@ text prompt ─► MusicCoCa ─► 6 style tokens ┐
 | **LLM** encoder | ✅ `build_encoder_graph` | ❌ | ❌ | drop spurious `pos_embed`, add `Scale(√d)`; encoder position scheme is the one open question |
 | **LLM** temporal decoder | ✅ `build_temporal_decoder` (mean-pool input, shared rel-pos) + `build_decoder_layer` | ❌ | ✅ GPU-vs-CPU on lavapipe (random weights, 1e-3) | buckets=128 for real weights |
 | **LLM** depth decoder | ✅ `build_depth_decoder_layer` + `build_depth_decoder_stack` (shared rel-pos) | ❌ | ✅ GPU-vs-CPU on lavapipe (random weights, 1e-3) | topology resolved |
+| **LLM** full decoder | ✅ `build_decoder` (temporal→depth, parallel/teacher-forcing) | ❌ | ✅ GPU-vs-CPU on lavapipe (random weights, 1e-3) | autoregressive KV-cache form next |
 | **LLM** generation | host sampler ✅ (`sampling.rs`) | — | sampler unit-tested | KV-cache + decode loop unwired |
 
 The verification pattern that works without real weights: build the graph with
@@ -80,11 +81,11 @@ checks. For the full weight dump: `python3 tools/magenta_rt/dump_llm.py` (after
     temporal output is the depth module's **level-0 input** (concat prefix, not
     added embedding / not cross-attn); shared token embedder + shared
     `decoder_norm` + non-tied `logits_dense`. Documented in `LLM_FINDINGS.md`.
-2.2 ✅ **`build_depth_decoder_layer` + `build_depth_decoder_stack`** and ✅
-    **`build_temporal_decoder`** (full temporal forward with mean-pooled level
-    embeddings) built and **GPU-verified on lavapipe** (random weights, 1e-3).
-    Remaining wiring: assemble per-frame depth inputs (concat temporal output
-    with the level-embedding prefix) to join the temporal and depth stacks.
+2.2 ✅ **`build_depth_decoder_layer`/`build_depth_decoder_stack`**,
+    **`build_temporal_decoder`** (mean-pooled input), and **`build_decoder`**
+    (the full parallel temporal→depth forward: per-frame depth-input assembly via
+    slice+concat, block-per-frame depth pass, shared head) — all **GPU-verified
+    on lavapipe** (random weights, 1e-3): `tests/llm_{depth,temporal,full}_decoder_correctness.rs`.
 2.3 **CFG batch=2**: add a broadcast-add op (or batched attention) so the encoder
     and decoder can run positive+negative style rows; lift the `batch==1` assert.
 2.4 **KV cache + autoregressive decode loop**: encoder runs once; decode 50 frames
