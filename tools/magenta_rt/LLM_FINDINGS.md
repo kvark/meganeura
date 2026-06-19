@@ -182,18 +182,21 @@ fine for Magenta-RT, but a constraint to remember.
 2. ✅ **Full-decoder wiring** — done (`build_decoder`, GPU-verified). The
    per-frame depth-input assembly (slice temporal state + level-prefix embeds,
    concat) and the block-per-frame depth pass are in place.
-3. ✅ **KV cache + autoregressive loop** — done. The temporal step
-   (`build_temporal_decode_step`) is KV-cached and rel-pos-correct via the new
-   `cached_attention_rel_pos` op (bucket from `q_pos - key_pos`, `q_pos =
-   kv_pos`; verified vs CPU SDPA in `tests/cached_attention_probe.rs`). The host
-   driver `decode_greedy` loops frames × levels: temporal step → per-frame depth
-   decode (sample each level via `sampling::argmax`, feed the embedding back) →
-   the frame's tokens drive the next temporal step. Verified end-to-end on
-   lavapipe by `tests/llm_decode_loop.rs` (greedy output matches the parallel
-   `build_decoder` argmax at every position). **Remaining:** CFG (batch=2, needs
-   the encoder broadcast-add) + temperature/top-k sampling (`cfg_combine` /
-   `top_k_sample` exist, just unwired); the per-level depth pass recomputes the
-   stack (a depth KV-cache would remove the O(levels²) redundancy).
+3. ✅ **KV cache + autoregressive loop, CFG, and sampling** — done. The temporal
+   step (`build_temporal_decode_step`) is KV-cached and rel-pos-correct via the
+   new `cached_attention_rel_pos` op (verified vs CPU SDPA in
+   `tests/cached_attention_probe.rs`). The host driver `decode` (with
+   `decode_greedy` as a thin wrapper) loops frames × levels: temporal step →
+   per-frame depth decode → sample → feed back. **CFG is host-side** — two
+   batch=1 passes (positive/negative encoder output) combined per level with
+   `cfg_combine` before sampling, so **no graph batch=2 / encoder broadcast-add
+   is needed**. Sampling is `argmax` (greedy, `temperature<=0`) or
+   `top_k_sample` (temperature + top-k, seeded). Verified on lavapipe:
+   `tests/llm_decode_loop.rs` (greedy = parallel argmax) and
+   `tests/llm_decode_cfg.rs` (CFG-greedy = parallel combined argmax; top-k
+   samples within the parallel top-k; reproducible from a seed).
+   **Remaining:** a depth KV-cache to drop the per-level O(levels²) recompute
+   (optimisation only).
 4. **Weight loader**: map `target.*` (flaxformer) → graph params using
    `llm_base_manifest.json`, like `musiccoca`/`spectrostream`. Real-weight gate:
    greedy-decode logits match the Colab reference for a fixed seed.

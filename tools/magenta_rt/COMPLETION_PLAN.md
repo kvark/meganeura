@@ -24,7 +24,7 @@ text prompt ─► MusicCoCa ─► 6 style tokens ┐
 | **LLM** temporal decoder | ✅ `build_temporal_decoder` (mean-pool input, shared rel-pos) + `build_decoder_layer` | ❌ | ✅ GPU-vs-CPU on lavapipe (random weights, 1e-3) | buckets=128 for real weights |
 | **LLM** depth decoder | ✅ `build_depth_decoder_layer` + `build_depth_decoder_stack` (shared rel-pos) | ❌ | ✅ GPU-vs-CPU on lavapipe (random weights, 1e-3) | topology resolved |
 | **LLM** full decoder | ✅ `build_decoder` (temporal→depth, parallel/teacher-forcing) | ❌ | ✅ GPU-vs-CPU on lavapipe (random weights, 1e-3) | autoregressive KV-cache form next |
-| **LLM** generation | ✅ greedy loop (`decode_greedy`): temporal KV-cache step (rel-pos) + per-frame depth decode + sampler | — | ✅ greedy decode matches parallel argmax on lavapipe | CFG batch=2 + temperature/top-k unwired; depth recomputed per level (KV-cache later) |
+| **LLM** generation | ✅ `decode` (CFG + temperature/top-k) / `decode_greedy`: temporal KV-cache step + per-frame depth + sampler | — | ✅ greedy + CFG match parallel argmax; top-k within parallel top-k; reproducible (lavapipe) | depth recomputed per level (KV-cache later); encoder still needed for real enc output |
 
 The verification pattern that works without real weights: build the graph with
 small random weights, run on Lavapipe, compare to an independent CPU reference

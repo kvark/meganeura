@@ -827,26 +827,155 @@ pub fn build_temporal_decode_step(
     x
 }
 
-/// Host-driven greedy autoregressive decode (batch=1, no CFG): drives the
-/// incremental temporal decode and the per-frame depth decode, feeding sampled
-/// tokens back, and returns the generated `[num_frames * num_levels]` RVQ grid.
+/// Options for [`decode`]: sequence length, sampling, and classifier-free
+/// guidance.
+#[derive(Clone, Debug)]
+pub struct DecodeOptions {
+    /// Number of frames to generate (each yields `num_levels` RVQ tokens).
+    pub num_frames: usize,
+    /// Start-of-sequence token id (the frame-0 temporal input is all `sos_id`).
+    pub sos_id: u32,
+    /// CFG guidance weight `w`; the guided logits are `neg + w*(pos - neg)`.
+    /// Only used when a negative temporal session is supplied.
+    pub guidance_weight: f32,
+    /// Sampling temperature; `<= 0` selects greedy argmax (deterministic).
+    pub temperature: f32,
+    /// Top-k for temperature sampling (ignored when greedy).
+    pub top_k: usize,
+    /// PRNG seed for temperature sampling.
+    pub seed: u64,
+}
+
+impl DecodeOptions {
+    /// Greedy (argmax) decode, no CFG.
+    pub fn greedy(num_frames: usize, sos_id: u32) -> Self {
+        Self {
+            num_frames,
+            sos_id,
+            guidance_weight: 0.0,
+            temperature: 0.0,
+            top_k: 0,
+            seed: 0,
+        }
+    }
+}
+
+/// Run one incremental temporal decode step → the frame's temporal state `[embed]`.
+fn temporal_step(s: &mut Session, prev_frame: &[u32], t: usize, embed: usize) -> Vec<f32> {
+    s.set_input_u32("step_tokens", prev_frame);
+    s.set_input_u32("kv_pos", &[t as u32]);
+    s.step();
+    s.wait();
+    s.read_output(embed)
+}
+
+/// Run the depth stack over a depth input → logits `[num_levels * vocab]`.
+fn depth_logits(s: &mut Session, depth_in: &[f32], levels: usize, vocab: usize) -> Vec<f32> {
+    s.set_input("depth_inputs", depth_in);
+    s.step();
+    s.wait();
+    s.read_output(levels * vocab)
+}
+
+/// Host-driven autoregressive decode with optional classifier-free guidance and
+/// temperature/top-k sampling. Returns the generated `[num_frames * num_levels]`
+/// RVQ token grid.
 ///
 /// Sessions (built once by the caller, weights + caches already set):
-/// - `temporal`: a [`build_temporal_decode_step`] graph — inputs `step_tokens`
-///   u32 `[num_levels]`, `enc_out` `[enc_seq, embed]` (set before calling),
-///   `kv_pos` u32 `[1]`; output the temporal state `[1, embed]`. Its KV caches
-///   must be zero-initialised.
-/// - `depth`: a [`build_depth_decoder_stack`] graph — input `depth_inputs`
-///   `[num_levels, embed]`; output logits `[num_levels, vocab]`.
+/// - `temporal_pos`: a [`build_temporal_decode_step`] graph conditioned on the
+///   positive encoder output (set its `enc_out` and zero its KV caches first).
+/// - `temporal_neg`: an optional second temporal session conditioned on the
+///   negative (mask-style) encoder output, for CFG. `None` ⇒ no guidance.
+/// - `depth`: a [`build_depth_decoder_stack`] graph (no persistent state, reused
+///   for both the positive and negative depth passes).
+///
+/// CFG is done entirely host-side: the positive and negative passes are run as
+/// two independent batch=1 decodes whose per-level logits are combined with
+/// [`super::sampling::cfg_combine`] before sampling — so no graph-level batch=2
+/// (or encoder broadcast-add) is required. The sampled token is fed back into
+/// both passes so they stay in lock-step.
 ///
 /// `embed_table` is a CPU copy of the `[vocab, embed]` shared token embedder,
 /// used to embed sampled tokens into the depth input (level `q+1`'s slot).
-///
-/// The depth stack is re-run per level over the partially-filled `[num_levels,
-/// embed]` input; since its self-attention is causal, row `q` depends only on
-/// positions `0..=q`, so reading row `q` each step is correct (a depth KV cache
-/// would avoid the redundant rows — a later optimisation). CFG (batch=2) and
-/// temperature/top-k sampling are not wired here; this is the greedy core.
+pub fn decode(
+    cfg: &LlmConfig,
+    temporal_pos: &mut Session,
+    mut temporal_neg: Option<&mut Session>,
+    depth: &mut Session,
+    embed_table: &[f32],
+    opts: &DecodeOptions,
+) -> Vec<u32> {
+    let embed = cfg.embed_dim as usize;
+    let levels = cfg.num_levels as usize;
+    let vocab = cfg.vocab_size as usize;
+
+    let mut rng = super::sampling::Xorshift64::new(opts.seed);
+    let sample = |logits: &[f32], rng: &mut super::sampling::Xorshift64| -> u32 {
+        if opts.temperature <= 0.0 {
+            super::sampling::argmax(logits)
+        } else {
+            super::sampling::top_k_sample(logits, opts.temperature, opts.top_k, rng)
+        }
+    };
+
+    let mut out = Vec::with_capacity(opts.num_frames * levels);
+    // The temporal input for frame 0 is the SOS frame; thereafter the previous
+    // decoded frame.
+    let mut prev_frame = vec![opts.sos_id; levels];
+
+    for t in 0..opts.num_frames {
+        let pos_state = temporal_step(temporal_pos, &prev_frame, t, embed);
+        let neg_state = temporal_neg
+            .as_deref_mut()
+            .map(|s| temporal_step(s, &prev_frame, t, embed));
+
+        // Depth input position 0 is the temporal state; position q+1 is the
+        // embedding of the just-decoded level q (shared across pos/neg).
+        let mut depth_pos = vec![0.0_f32; levels * embed];
+        depth_pos[0..embed].copy_from_slice(&pos_state);
+        let mut depth_neg = neg_state.map(|st| {
+            let mut d = vec![0.0_f32; levels * embed];
+            d[0..embed].copy_from_slice(&st);
+            d
+        });
+
+        let mut frame = Vec::with_capacity(levels);
+        for q in 0..levels {
+            let pos = depth_logits(depth, &depth_pos, levels, vocab);
+            let pos_row = &pos[q * vocab..(q + 1) * vocab];
+            let tok = match depth_neg.as_ref() {
+                Some(dn) => {
+                    let neg = depth_logits(depth, dn, levels, vocab);
+                    let neg_row = &neg[q * vocab..(q + 1) * vocab];
+                    let mut combined = vec![0.0_f32; vocab];
+                    super::sampling::cfg_combine(
+                        pos_row,
+                        neg_row,
+                        opts.guidance_weight,
+                        &mut combined,
+                    );
+                    sample(&combined, &mut rng)
+                }
+                None => sample(pos_row, &mut rng),
+            };
+            frame.push(tok);
+            if q + 1 < levels {
+                let e = tok as usize * embed;
+                let slot = (q + 1) * embed..(q + 2) * embed;
+                depth_pos[slot.clone()].copy_from_slice(&embed_table[e..e + embed]);
+                if let Some(dn) = depth_neg.as_mut() {
+                    dn[slot].copy_from_slice(&embed_table[e..e + embed]);
+                }
+            }
+        }
+        out.extend_from_slice(&frame);
+        prev_frame = frame;
+    }
+    out
+}
+
+/// Greedy (argmax) autoregressive decode, batch=1, no CFG — a thin wrapper over
+/// [`decode`]. See [`decode`] for the session contract.
 pub fn decode_greedy(
     cfg: &LlmConfig,
     temporal: &mut Session,
@@ -855,45 +984,14 @@ pub fn decode_greedy(
     num_frames: usize,
     sos_id: u32,
 ) -> Vec<u32> {
-    let embed = cfg.embed_dim as usize;
-    let levels = cfg.num_levels as usize;
-    let vocab = cfg.vocab_size as usize;
-
-    let mut out = Vec::with_capacity(num_frames * levels);
-    // The temporal input for frame 0 is the SOS frame (all levels = sos_id);
-    // thereafter it is the previous decoded frame.
-    let mut prev_frame = vec![sos_id; levels];
-
-    for t in 0..num_frames {
-        temporal.set_input_u32("step_tokens", &prev_frame);
-        temporal.set_input_u32("kv_pos", &[t as u32]);
-        temporal.step();
-        temporal.wait();
-        let state = temporal.read_output(embed); // [embed]
-
-        // Depth decode the `levels` RVQ tokens for this frame. Position 0 of the
-        // depth input is the temporal state; position q+1 is the embedding of the
-        // just-decoded level q.
-        let mut depth_in = vec![0.0_f32; levels * embed];
-        depth_in[0..embed].copy_from_slice(&state);
-        let mut frame = Vec::with_capacity(levels);
-        for q in 0..levels {
-            depth.set_input("depth_inputs", &depth_in);
-            depth.step();
-            depth.wait();
-            let logits = depth.read_output(levels * vocab);
-            let tok = super::sampling::argmax(&logits[q * vocab..(q + 1) * vocab]);
-            frame.push(tok);
-            if q + 1 < levels {
-                let e = tok as usize * embed;
-                depth_in[(q + 1) * embed..(q + 2) * embed]
-                    .copy_from_slice(&embed_table[e..e + embed]);
-            }
-        }
-        out.extend_from_slice(&frame);
-        prev_frame = frame;
-    }
-    out
+    decode(
+        cfg,
+        temporal,
+        None,
+        depth,
+        embed_table,
+        &DecodeOptions::greedy(num_frames, sos_id),
+    )
 }
 
 #[cfg(test)]
