@@ -393,6 +393,7 @@ pub enum ShaderGroup {
     Conv2dGradWeightGemmSmall,
     CacheWrite,
     CachedAttention,
+    CachedAttentionRelPos,
     RoPEDynamic,
     MaxPool2d,
     GlobalAvgPool,
@@ -487,7 +488,9 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::UpsampleGrad => parse_wgsl(include_str!("shaders/upsample_grad.wgsl")),
         ShaderGroup::UpsampleNearest => parse_wgsl(include_str!("shaders/upsample_nearest.wgsl")),
         ShaderGroup::Slice2d => parse_wgsl(include_str!("shaders/slice2d.wgsl")),
-        ShaderGroup::Conv2dGradInputHW => parse_wgsl(include_str!("shaders/conv2d_grad_input_hw.wgsl")),
+        ShaderGroup::Conv2dGradInputHW => {
+            parse_wgsl(include_str!("shaders/conv2d_grad_input_hw.wgsl"))
+        }
         ShaderGroup::PixelShuffleW => parse_wgsl(include_str!("shaders/pixel_shuffle_w.wgsl")),
         ShaderGroup::DilateZerosW => parse_wgsl(include_str!("shaders/dilate_zeros_w.wgsl")),
         ShaderGroup::DilateZerosH => parse_wgsl(include_str!("shaders/dilate_zeros_h.wgsl")),
@@ -531,6 +534,9 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         }
         ShaderGroup::CacheWrite => parse_wgsl(include_str!("shaders/cache_write.wgsl")),
         ShaderGroup::CachedAttention => parse_wgsl(include_str!("shaders/cached_attention.wgsl")),
+        ShaderGroup::CachedAttentionRelPos => {
+            parse_wgsl(include_str!("shaders/cached_attention_rel_pos.wgsl"))
+        }
         ShaderGroup::RoPEDynamic => parse_wgsl(include_str!("shaders/rope_dynamic.wgsl")),
         ShaderGroup::MaxPool2d => parse_wgsl(include_str!("shaders/max_pool_2d.wgsl")),
         ShaderGroup::GlobalAvgPool => parse_wgsl(include_str!("shaders/global_avg_pool.wgsl")),
@@ -574,9 +580,7 @@ pub fn generate_wgsl(group: ShaderGroup) -> String {
             naga::valid::Capabilities::COOPERATIVE_MATRIX
                 | naga::valid::Capabilities::SHADER_FLOAT16
         }
-        ShaderGroup::EmbeddingF16 | ShaderGroup::ToF16 => {
-            naga::valid::Capabilities::SHADER_FLOAT16
-        }
+        ShaderGroup::EmbeddingF16 | ShaderGroup::ToF16 => naga::valid::Capabilities::SHADER_FLOAT16,
         _ => naga::valid::Capabilities::empty(),
     };
     module_to_wgsl(&sm.module, capabilities)
@@ -1928,7 +1932,9 @@ pub fn generate_attention_with_rel_pos_module(head_dim: u32) -> ShaderModule {
     src.push_str("    if n_u < max_exact { return ret + n_u; }\n");
     src.push_str("    let log_n = log(f32(n_u) / f32(max_exact));\n");
     src.push_str("    let log_max = log(f32(max_distance) / f32(max_exact));\n");
-    src.push_str("    let val_large = u32(f32(max_exact) + log_n / log_max * f32(nb - max_exact));\n");
+    src.push_str(
+        "    let val_large = u32(f32(max_exact) + log_n / log_max * f32(nb - max_exact));\n",
+    );
     src.push_str("    return ret + min(val_large, nb - 1u);\n");
     src.push_str("}\n\n");
 
@@ -1985,8 +1991,14 @@ pub fn generate_attention_with_rel_pos_module(head_dim: u32) -> ShaderModule {
     let _ = writeln!(src, "        for (var i = 0u; i < {bkv}u; i++) {{");
     let _ = writeln!(src, "            let k_pos = t + i;");
     let _ = writeln!(src, "            let bucket = rel_pos_bucket(i32(pos) - i32(k_pos), num_buckets, max_distance, bidirectional);");
-    let _ = writeln!(src, "            let bias_val = src_d[bias_row_off + bucket];");
-    let _ = writeln!(src, "            let score = wg_scores[i * {hd}u] * scale + bias_val;");
+    let _ = writeln!(
+        src,
+        "            let bias_val = src_d[bias_row_off + bucket];"
+    );
+    let _ = writeln!(
+        src,
+        "            let score = wg_scores[i * {hd}u] * scale + bias_val;"
+    );
     src.push_str("            let new_max = max(max_score, score);\n");
     src.push_str("            let correction = exp(max_score - new_max);\n");
     src.push_str("            let weight = exp(score - new_max);\n");
@@ -4705,7 +4717,9 @@ fn emit_forward_weight_stage(
     // Fast path: vec4 load, valid only when each weight row [Co, K] starts
     // on a vec4 boundary, i.e. k_total % 4 == 0. The branch is on a
     // uniform value so there is no warp divergence.
-    src.push_str("            if (k_total & 3u) == 0u && gr < m_total && (tc4 + 4u) <= k_total {\n");
+    src.push_str(
+        "            if (k_total & 3u) == 0u && gr < m_total && (tc4 + 4u) <= k_total {\n",
+    );
     src.push_str("                let v = weight[(gr * k_total + tc4) >> 2u];\n");
     let _ = writeln!(
         src,
@@ -4737,7 +4751,10 @@ fn emit_forward_weight_stage(
         "                        {shared_name}[flat + i] = {cast_open}weight[idx >> 2u][idx & 3u]{cast_close};"
     );
     src.push_str("                    } else {\n");
-    let _ = writeln!(src, "                        {shared_name}[flat + i] = zero_val;");
+    let _ = writeln!(
+        src,
+        "                        {shared_name}[flat + i] = zero_val;"
+    );
     src.push_str("                    }\n");
     src.push_str("                }\n");
     src.push_str("            }\n");
@@ -5346,6 +5363,17 @@ mod tests {
                 ShaderEntry::CachedAttention => {
                     vec!["src_a", "src_b", "bias", "kv_pos_buf", "dst", "params"]
                 }
+                ShaderEntry::CachedAttentionRelPos => {
+                    vec![
+                        "src_a",
+                        "src_b",
+                        "bias",
+                        "src_d",
+                        "kv_pos_buf",
+                        "dst",
+                        "params",
+                    ]
+                }
                 ShaderEntry::GroupNorm | ShaderEntry::GroupNormSilu => {
                     vec!["src", "src_b", "bias", "dst", "params"]
                 }
@@ -5355,7 +5383,10 @@ mod tests {
                 }
                 ShaderEntry::Concat => vec!["src_a", "src_b", "dst", "params"],
                 ShaderEntry::SplitA | ShaderEntry::SplitB => vec!["src", "dst", "params"],
-                ShaderEntry::Upsample2x | ShaderEntry::Upsample2xGrad | ShaderEntry::UpsampleNearest | ShaderEntry::Slice2d => {
+                ShaderEntry::Upsample2x
+                | ShaderEntry::Upsample2xGrad
+                | ShaderEntry::UpsampleNearest
+                | ShaderEntry::Slice2d => {
                     vec!["src", "dst", "params"]
                 }
                 ShaderEntry::Conv2dGradInputHW => {
@@ -5501,6 +5532,7 @@ mod tests {
             ShaderEntry::WinogradBatchedMatMul,
             ShaderEntry::CacheWrite,
             ShaderEntry::CachedAttention,
+            ShaderEntry::CachedAttentionRelPos,
             ShaderEntry::RoPEDynamic,
             ShaderEntry::MaxPool2d,
             ShaderEntry::GlobalAvgPool,

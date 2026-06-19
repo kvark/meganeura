@@ -191,6 +191,7 @@ pub enum ShaderEntry {
     Conv2dGradWeightGemmSmall,
     CacheWrite,
     CachedAttention,
+    CachedAttentionRelPos,
     RoPEDynamic,
     MaxPool2d,
     GlobalAvgPool,
@@ -318,6 +319,7 @@ impl ShaderEntry {
             ShaderEntry::Conv2dGradWeightGemmSmall => ShaderGroup::Conv2dGradWeightGemmSmall,
             ShaderEntry::CacheWrite => ShaderGroup::CacheWrite,
             ShaderEntry::CachedAttention => ShaderGroup::CachedAttention,
+            ShaderEntry::CachedAttentionRelPos => ShaderGroup::CachedAttentionRelPos,
             ShaderEntry::RoPEDynamic => ShaderGroup::RoPEDynamic,
             ShaderEntry::MaxPool2d => ShaderGroup::MaxPool2d,
             ShaderEntry::GlobalAvgPool => ShaderGroup::GlobalAvgPool,
@@ -436,6 +438,7 @@ impl ShaderEntry {
             | ShaderEntry::Conv2dGradWeightGemmSmall => "main",
             ShaderEntry::CacheWrite => "main",
             ShaderEntry::CachedAttention => "main",
+            ShaderEntry::CachedAttentionRelPos => "main",
             ShaderEntry::RoPEDynamic => "main",
             ShaderEntry::MaxPool2d => "max_pool_2d",
             ShaderEntry::GlobalAvgPool => "global_avg_pool",
@@ -2759,7 +2762,12 @@ impl<'a> Compiler<'a> {
                 });
             }
 
-            Op::DilateZerosW { channels, in_h, in_w, stride_w } => {
+            Op::DilateZerosW {
+                channels,
+                in_h,
+                in_w,
+                stride_w,
+            } => {
                 let x = self.get_buffer(node.inputs[0]);
                 let total = node.ty.shape[0] as u32;
                 let out_w = if stride_w == 1 {
@@ -2781,7 +2789,12 @@ impl<'a> Compiler<'a> {
                 });
             }
 
-            Op::DilateZerosH { channels, in_h, in_w, stride_h } => {
+            Op::DilateZerosH {
+                channels,
+                in_h,
+                in_w,
+                stride_h,
+            } => {
                 let x = self.get_buffer(node.inputs[0]);
                 let total = node.ty.shape[0] as u32;
                 let out_h = if stride_h == 1 {
@@ -2803,7 +2816,12 @@ impl<'a> Compiler<'a> {
                 });
             }
 
-            Op::PixelShuffleW { channels, in_h, in_w, factor } => {
+            Op::PixelShuffleW {
+                channels,
+                in_h,
+                in_w,
+                factor,
+            } => {
                 let x = self.get_buffer(node.inputs[0]);
                 let total = node.ty.shape[0] as u32;
                 let out_c = channels / factor;
@@ -3048,7 +3066,7 @@ impl<'a> Compiler<'a> {
 
                 let input = self.get_buffer(node.inputs[0]);
                 let weight_xform = self.get_buffer(node.inputs[1]); // Winograd-transformed weights [16*Co*Ci]
-                // input[2] is the original weight [Co*Ci*9] (for backward, and for re-transform)
+                                                                    // input[2] is the original weight [Co*Ci*9] (for backward, and for re-transform)
                 let original_weight = self.get_buffer(node.inputs[2]);
 
                 // Dispatch 0: Weight transform (re-transform every step for training)
@@ -3282,6 +3300,41 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![0, num_heads, num_kv_heads, head_dim], // kv_len read from input buffer
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
+            Op::CachedAttentionRelPos {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_buckets,
+                max_distance,
+                bidirectional,
+            } => {
+                let q = self.get_buffer(node.inputs[0]);
+                let k_cache = self.get_buffer(node.inputs[1]);
+                let v_cache = self.get_buffer(node.inputs[2]);
+                let kv_pos_input = self.get_buffer(node.inputs[3]);
+                let rel_pos_table = self.get_buffer(node.inputs[4]);
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::CachedAttentionRelPos,
+                    workgroups: [1, num_heads, 1],
+                    input_buffers: vec![q, k_cache, v_cache, rel_pos_table, kv_pos_input],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        num_buckets,
+                        max_distance,
+                        bidirectional as u32,
+                        0,
+                        0,
+                    ],
                     use_coop: false,
                     use_small_tiles: false,
                     ..Default::default()

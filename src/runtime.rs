@@ -752,6 +752,32 @@ struct CachedAttentionData {
     params: MatMulParams, // _reserved, num_heads, num_kv_heads, head_dim
 }
 
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct CachedAttnRelPosParams {
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    num_buckets: u32,
+    max_distance: u32,
+    bidirectional: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+// cached_attention_rel_pos: src_a (q), src_b (k_cache), bias (v_cache),
+// src_d (rel-pos table), kv_pos_buf, dst, params
+#[derive(blade_macros::ShaderData)]
+struct CachedAttentionRelPosData {
+    src_a: blade_graphics::BufferPiece,
+    src_b: blade_graphics::BufferPiece,
+    bias: blade_graphics::BufferPiece,
+    src_d: blade_graphics::BufferPiece,
+    kv_pos_buf: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: CachedAttnRelPosParams,
+}
+
 // layer_norm: var src, src_b (weight), bias, dst, params
 #[derive(blade_macros::ShaderData)]
 struct LayerNormData {
@@ -1621,6 +1647,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::RoPEDynamic => RoPEDynamicData::layout(),
         ShaderEntry::CacheWrite => CacheWriteData::layout(),
         ShaderEntry::CachedAttention => CachedAttentionData::layout(),
+        ShaderEntry::CachedAttentionRelPos => CachedAttentionRelPosData::layout(),
         ShaderEntry::MaxPool2d => MaxPool2dData::layout(),
         ShaderEntry::GlobalAvgPool => GlobalAvgPoolData::layout(),
         ShaderEntry::GlobalAvgPoolGrad => UnaryData::layout(),
@@ -1687,11 +1714,14 @@ fn compute_groups(dispatches: &[Dispatch]) -> Vec<std::ops::Range<usize>> {
     let mut start = 0;
     for (i, dispatch) in dispatches.iter().enumerate() {
         let reads_dirty = dispatch.input_buffers.iter().any(|b| dirty.contains(&b.0))
-            || dispatch.epilogue_buffers.iter().any(|b| dirty.contains(&b.0))
+            || dispatch
+                .epilogue_buffers
+                .iter()
+                .any(|b| dirty.contains(&b.0))
             || dispatch
                 .matmul_epilogue
                 .as_ref()
-                .map(|e| e.inputs.iter().any(|entry| dirty.contains(&entry.0.0)))
+                .map(|e| e.inputs.iter().any(|entry| dirty.contains(&entry.0 .0)))
                 .unwrap_or(false);
         if reads_dirty {
             groups.push(start..i);
@@ -1858,9 +1888,15 @@ impl Session {
         // tiles and no opt-in, fall back to scalar f32 (correct).
         let want_f16 = std::env::var("MEGANEURA_COOP_F16").is_ok();
         if caps.f32_tile > 0 {
-            Some(CoopConfig { tile_size: caps.f32_tile, use_f16_input: false })
+            Some(CoopConfig {
+                tile_size: caps.f32_tile,
+                use_f16_input: false,
+            })
         } else if caps.f16_tile > 0 && want_f16 {
-            Some(CoopConfig { tile_size: caps.f16_tile, use_f16_input: true })
+            Some(CoopConfig {
+                tile_size: caps.f16_tile,
+                use_f16_input: true,
+            })
         } else {
             if caps.f16_tile > 0 {
                 log::warn!(
@@ -3289,11 +3325,14 @@ impl Session {
         // were uninitialized and the agent silently failed to learn for
         // 50 000 steps. Asserting here catches the class.
         assert_eq!(
-            data.len(), expected,
+            data.len(),
+            expected,
             "upload_buffer: byte-size mismatch for buffer {} — got {} bytes, slot expects {}. \
              Likely a parameter shape mismatch between the graph declaration and the source data \
              (e.g. graph says [batch * channels * area], safetensor says [channels]).",
-            buf_ref.0, data.len(), expected,
+            buf_ref.0,
+            data.len(),
+            expected,
         );
         // All upload targets (params, inputs) are pinned by the memory
         // plan and therefore host-visible; a null pointer here means a
@@ -3656,8 +3695,10 @@ impl Session {
     pub fn dump_grad_summary(&self, top_n: usize) {
         let grads = self.read_all_param_grad_norms();
         let weights = self.read_all_param_norms();
-        let weights_lookup: std::collections::HashMap<&str, f32> =
-            weights.iter().map(|entry| (entry.0.as_str(), entry.1)).collect();
+        let weights_lookup: std::collections::HashMap<&str, f32> = weights
+            .iter()
+            .map(|entry| (entry.0.as_str(), entry.1))
+            .collect();
         let mut sorted: Vec<&(String, f32)> = grads.iter().collect();
         sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let n = sorted.len().min(top_n.max(1));
@@ -3712,7 +3753,7 @@ impl Session {
             entry.1 += dur;
         }
         let mut sorted: Vec<_> = by_type.into_iter().collect();
-        sorted.sort_by_key(|e| std::cmp::Reverse(e.1.1));
+        sorted.sort_by_key(|e| std::cmp::Reverse(e.1 .1));
         for &(name, (count, dur)) in &sorted {
             let pct = dur.as_secs_f64() / total.as_secs_f64() * 100.0;
             eprintln!(
@@ -3791,7 +3832,12 @@ impl Session {
                         &GradAccumData {
                             grad: self.buffers[grad_buf.0 as usize].at(0),
                             acc: self.grad_accum_bufs[idx].at(0),
-                            params: GradAccumParams { len, scale, _pad0: 0, _pad1: 0 },
+                            params: GradAccumParams {
+                                len,
+                                scale,
+                                _pad0: 0,
+                                _pad1: 0,
+                            },
                         },
                     );
                     pc.dispatch([len.div_ceil(256), 1, 1]);
@@ -3844,12 +3890,7 @@ impl Session {
                 let pipeline = &self.pipelines.map[&ShaderEntry::GradClipZero];
                 let mut pass = self.encoder.compute("grad_clip_zero");
                 let mut pc = pass.with(pipeline);
-                pc.bind(
-                    0,
-                    &GradClipZeroData {
-                        acc: acc_buf.at(0),
-                    },
-                );
+                pc.bind(0, &GradClipZeroData { acc: acc_buf.at(0) });
                 pc.dispatch([1, 1, 1]);
             }
             // Pass 2: sum of squares per gradient buffer.
@@ -4045,11 +4086,8 @@ impl Session {
                 // buffers are already interleaved into `input_buffers` by
                 // the fusion pass, right after their table stream), then
                 // `dst`. `params` is bound last by `fill`.
-                let mut buffers: Vec<blade_graphics::BufferPiece> = dispatch
-                    .input_buffers
-                    .iter()
-                    .map(|&r| buf(r))
-                    .collect();
+                let mut buffers: Vec<blade_graphics::BufferPiece> =
+                    dispatch.input_buffers.iter().map(|&r| buf(r)).collect();
                 buffers.push(buf(dispatch.output_buffer));
                 pc.bind(0, &DynReductionData { buffers, params });
                 return;
@@ -5222,6 +5260,29 @@ impl Session {
                             n: dispatch.params[1],
                             k: dispatch.params[2],
                             _pad: dispatch.params[3],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::CachedAttentionRelPos => {
+                pc.bind(
+                    0,
+                    &CachedAttentionRelPosData {
+                        src_a: buf(dispatch.input_buffers[0]),      // Q
+                        src_b: buf(dispatch.input_buffers[1]),      // K cache
+                        bias: buf(dispatch.input_buffers[2]),       // V cache
+                        src_d: buf(dispatch.input_buffers[3]),      // rel-pos table
+                        kv_pos_buf: buf(dispatch.input_buffers[4]), // kv_pos
+                        dst: buf(dispatch.output_buffer),
+                        params: CachedAttnRelPosParams {
+                            num_heads: dispatch.params[0],
+                            num_kv_heads: dispatch.params[1],
+                            head_dim: dispatch.params[2],
+                            num_buckets: dispatch.params[3],
+                            max_distance: dispatch.params[4],
+                            bidirectional: dispatch.params[5],
+                            _pad0: 0,
+                            _pad1: 0,
                         },
                     },
                 );

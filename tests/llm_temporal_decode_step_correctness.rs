@@ -4,15 +4,14 @@
 //! Drives the single-frame decode step F times (the per-layer K/V caches persist
 //! across `step()` calls as mutable parameter buffers, the smollm2 pattern), and
 //! compares the per-frame temporal states against an independent CPU reference
-//! forward, on the GPU (lavapipe), within 1e-3. Rel-pos tables are zero —
-//! `cached_attention` has no rel-pos bias, so this is the regime where the
-//! cached and full attention paths coincide (the regime the rest of the LLM
-//! suite verifies in).
+//! forward, on the GPU (lavapipe), within 1e-3. A **non-zero** shared rel-pos
+//! table is used, exercising `cached_attention_rel_pos` (the cached self-attn
+//! applies the learned T5 rel-pos bias just like the parallel full attention).
 //!
 //! This validates the autoregressive machinery — `cache_write` + repeated
-//! `cached_attention` against a growing cache, the per-step mean-pool, the
-//! cross-attention, and layer chaining — against ground truth, and (implicitly)
-//! that it agrees with the parallel `build_temporal_decoder` it mirrors.
+//! rel-pos cached attention against a growing cache, the per-step mean-pool, the
+//! cross-attention, and layer chaining — against ground truth, and that it
+//! agrees with the parallel `build_temporal_decoder` it mirrors.
 
 use std::collections::HashMap;
 
@@ -141,14 +140,91 @@ fn sdpa(
     out
 }
 
-/// CPU reference for the parallel temporal forward over all FRAMES (zero
-/// rel-pos), returning per-frame states `[FRAMES, embed]`. The incremental GPU
-/// decode must reproduce these frame by frame.
+/// T5 relative-position bucket — ports the WGSL `rel_pos_bucket` helper exactly.
+fn rel_pos_bucket(
+    q_minus_k: i32,
+    num_buckets: u32,
+    max_distance: u32,
+    bidirectional: bool,
+) -> usize {
+    let mut n = q_minus_k;
+    let mut ret = 0u32;
+    let mut nb = num_buckets;
+    if bidirectional {
+        nb /= 2;
+        if n < 0 {
+            ret = nb;
+            n = -n;
+        }
+    } else if n < 0 {
+        n = 0;
+    }
+    let max_exact = nb / 2;
+    let n_u = n as u32;
+    if n_u < max_exact {
+        return (ret + n_u) as usize;
+    }
+    let log_n = ((n_u as f32) / (max_exact as f32)).ln();
+    let log_max = ((max_distance as f32) / (max_exact as f32)).ln();
+    let val_large = (max_exact as f32 + log_n / log_max * (nb - max_exact) as f32) as u32;
+    (ret + val_large.min(nb - 1)) as usize
+}
+
+/// Causal self-attention with a per-head T5 rel-pos bias on the scores.
+#[allow(clippy::too_many_arguments)]
+fn self_attn_relpos(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq: usize,
+    heads: usize,
+    hd: usize,
+    rel: &[f32],
+    num_buckets: u32,
+    max_distance: u32,
+) -> Vec<f32> {
+    let dim = heads * hd;
+    let scale = 1.0 / (hd as f32).sqrt();
+    let mut out = vec![0.0_f32; seq * dim];
+    for h in 0..heads {
+        let off = h * hd;
+        for i in 0..seq {
+            let mut scores = vec![0.0_f32; i + 1];
+            for (j, sc) in scores.iter_mut().enumerate() {
+                let mut s = 0.0;
+                for d in 0..hd {
+                    s += q[i * dim + off + d] * k[j * dim + off + d];
+                }
+                let b = rel_pos_bucket(i as i32 - j as i32, num_buckets, max_distance, false);
+                *sc = s * scale + rel[h * num_buckets as usize + b];
+            }
+            let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0;
+            for s in scores.iter_mut() {
+                *s = (*s - mx).exp();
+                sum += *s;
+            }
+            for d in 0..hd {
+                let mut acc = 0.0;
+                for (j, &sc) in scores.iter().enumerate() {
+                    acc += (sc / sum) * v[j * dim + off + d];
+                }
+                out[i * dim + off + d] = acc;
+            }
+        }
+    }
+    out
+}
+
+/// CPU reference for the parallel temporal forward over all FRAMES, returning
+/// per-frame states `[FRAMES, embed]`. The incremental GPU decode must reproduce
+/// these frame by frame. `rel` is the shared temporal rel-pos bias table.
 fn temporal_ref(
     cfg: &LlmConfig,
     w: &HashMap<String, Vec<f32>>,
     tokens: &[u32],
     enc: &[f32],
+    rel: &[f32],
 ) -> Vec<f32> {
     let embed = cfg.embed_dim as usize;
     let attn_dim = (cfg.num_heads * cfg.head_dim) as usize;
@@ -179,7 +255,17 @@ fn temporal_ref(
         let q = matmul(&h, g("self_attn.q"), FRAMES, embed, attn_dim);
         let k = matmul(&h, g("self_attn.k"), FRAMES, embed, attn_dim);
         let v = matmul(&h, g("self_attn.v"), FRAMES, embed, attn_dim);
-        let sa = sdpa(&q, &k, &v, FRAMES, FRAMES, heads, hd, true);
+        let sa = self_attn_relpos(
+            &q,
+            &k,
+            &v,
+            FRAMES,
+            heads,
+            hd,
+            rel,
+            cfg.rel_pos_num_buckets,
+            cfg.rel_pos_max_distance,
+        );
         let sa_out = matmul(&sa, g("self_attn.o"), FRAMES, attn_dim, embed);
         for j in 0..FRAMES * embed {
             x[j] += sa_out[j];
@@ -255,6 +341,8 @@ fn incremental_temporal_decode_matches_cpu_reference() {
     }
     let tokens: Vec<u32> = (0..grid).map(|i| ((i * 3 + 2) % vocab) as u32).collect();
     let enc = r.vec(enc_seq * embed);
+    // Non-zero shared temporal rel-pos table, to exercise the rel-pos path.
+    let rel = r.vec((cfg.num_heads * cfg.rel_pos_num_buckets) as usize);
 
     // Incremental decode: one frame per step, caches persist across steps.
     let mut g = Graph::new();
@@ -277,6 +365,7 @@ fn incremental_temporal_decode_matches_cpu_reference() {
             &vec![0.0_f32; FRAMES * attn_dim],
         );
     }
+    s.set_parameter("decoder.temporal_decoder.rel_pos_bias_table", &rel);
     s.set_input("enc_out", &enc);
 
     let mut incremental = vec![0.0_f32; FRAMES * embed];
@@ -301,10 +390,7 @@ fn incremental_temporal_decode_matches_cpu_reference() {
         for (n, d) in &weights {
             s.set_parameter(n, d);
         }
-        s.set_parameter(
-            "decoder.temporal_decoder.rel_pos_bias_table",
-            &vec![0.0_f32; (cfg.num_heads * cfg.rel_pos_num_buckets) as usize],
-        );
+        s.set_parameter("decoder.temporal_decoder.rel_pos_bias_table", &rel);
         s.set_input_u32("dec_tokens", &tokens);
         s.set_input("enc_out", &enc);
         s.step();
@@ -312,7 +398,7 @@ fn incremental_temporal_decode_matches_cpu_reference() {
         s.read_output(FRAMES * embed)
     };
 
-    let cpu = temporal_ref(&cfg, &weights, &tokens, &enc);
+    let cpu = temporal_ref(&cfg, &weights, &tokens, &enc, &rel);
     let diff = |a: &[f32], b: &[f32]| {
         a.iter()
             .zip(b)

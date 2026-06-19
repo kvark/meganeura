@@ -252,8 +252,7 @@ pub fn optimize_with_cost_model(
             };
             for out_id in region_outputs(graph, region) {
                 let var = format!("n{}", out_id);
-                let eval =
-                    egraph.eval_expr(&egglog::ast::Expr::Var(egglog::ast::Span::Panic, var));
+                let eval = egraph.eval_expr(&egglog::ast::Expr::Var(egglog::ast::Span::Panic, var));
                 if let Ok((sort, value)) = eval {
                     match egraph.extract_value_with_cost_model(&sort, value, cm.clone()) {
                         Ok((dag, term_id, cost)) => {
@@ -683,6 +682,7 @@ fn egglog_prelude(prog: &mut String) {
   ; --- KV cache ops ---
   (CacheWrite Op Op Op)
   (CachedAttention Op Op Op Op)
+  (CachedAttentionRelPos Op Op Op Op Op)
   ; --- Backward / gradient ops ---
   (SiluGrad Op Op)
   (SwiGLUGradGate Op Op Op)
@@ -781,7 +781,10 @@ fn node_to_egglog_expr(node: &Node) -> String {
         Op::GeGLU => format!("(GeGLU n{} n{})", i[0], i[1]),
         Op::T5RelPosBias { .. } => format!("(T5RelPosBias n{})", i[0]),
         Op::FullAttentionRelPosBias { .. } => {
-            format!("(FullAttentionRelPosBias n{} n{} n{} n{})", i[0], i[1], i[2], i[3])
+            format!(
+                "(FullAttentionRelPosBias n{} n{} n{} n{})",
+                i[0], i[1], i[2], i[3]
+            )
         }
         Op::SwiGLUConcat => format!("(SwiGLUConcat n{})", i[0]),
         Op::Gelu => format!("(Gelu n{})", i[0]),
@@ -865,6 +868,12 @@ fn node_to_egglog_expr(node: &Node) -> String {
         Op::CachedAttention { .. } => {
             format!("(CachedAttention n{} n{} n{} n{})", i[0], i[1], i[2], i[3])
         }
+        Op::CachedAttentionRelPos { .. } => {
+            format!(
+                "(CachedAttentionRelPos n{} n{} n{} n{} n{})",
+                i[0], i[1], i[2], i[3], i[4]
+            )
+        }
         Op::Nop => unreachable!("Nop nodes are filtered before encoding"),
         Op::Identity => format!("(Identity n{})", i[0]),
         Op::StopGradient => format!("(Identity n{})", i[0]),
@@ -886,9 +895,8 @@ fn rebuild_graph_from_extractions(
 ) -> (Graph, Vec<(String, u32)>) {
     let mut graph = clone_graph(original);
     let mut fusions = Vec::new();
-    let enabled = |kinds: &[&str]| {
-        chosen.is_none_or(|chosen| kinds.iter().any(|k| chosen.contains(*k)))
-    };
+    let enabled =
+        |kinds: &[&str]| chosen.is_none_or(|chosen| kinds.iter().any(|k| chosen.contains(*k)));
 
     // Apply fusion rules iteratively until fixpoint.
     // Each rule fires on matching patterns, potentially exposing new patterns

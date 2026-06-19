@@ -711,20 +711,19 @@ pub fn build_decoder(
 /// run once per frame, with the per-layer K/V caches persisting across `step()`
 /// calls as mutable `parameter` buffers (the smollm2 decode pattern). The
 /// self-attention reads the growing cache via [`Graph::cached_attention`];
-/// cross-attention to the (fixed) encoder output is recomputed each step.
+/// cross-attention to the (fixed) encoder output is recomputed each step. The
+/// self-attention applies the learned T5 rel-pos bias via
+/// [`Graph::cached_attention_rel_pos`] (shared
+/// `decoder.temporal_decoder.rel_pos_bias_table`), so the incremental step
+/// matches the parallel forward bit-for-bit (not just at zero rel-pos).
 ///
 /// Caches are named `decoder.temporal_kv_cache.{layer}.{k,v}` `[max_frames,
 /// attn_dim]` — zero-initialise them before the first step. The layer weights
 /// reuse the same names as [`build_decoder_layer`]
 /// (`decoder.temporal_layers.{i}.*`), so one weight set drives both paths.
 ///
-/// **Limitation:** [`Graph::cached_attention`] is plain causal SDPA with **no
-/// relative-position bias** (like smollm2, which folds position into RoPE). The
-/// temporal self-attention's learned T5 rel-pos bias (`[heads, 128]`) is
-/// therefore **not** applied here — so this step matches the parallel forward
-/// only in the zero-rel-pos regime the test suite uses. Real-weight decode needs
-/// rel-pos bias added to the cached-attention path (tracked in
-/// `tools/magenta_rt/LLM_FINDINGS.md`).
+/// `head_dim` must be 64 (`cached_attention` reduces the dot over its 64-lane
+/// workgroup) — the real Magenta-RT value.
 ///
 /// Inputs:  `step_tokens` u32 `[num_levels]` (the input frame's RVQ tokens —
 ///          the SOS frame for the first step, else the previous decoded frame),
@@ -747,6 +746,13 @@ pub fn build_temporal_decode_step(
     let table = g.parameter("shared_token_embedder", &[cfg.vocab_size as usize, embed]);
     let embedded = g.embedding(step_tokens, table);
     let mut x = build_level_mean_pool(g, cfg, embedded, 1);
+
+    // Shared temporal rel-pos table (same as the parallel path), applied inside
+    // the cached self-attention so incremental decode matches the full forward.
+    let rel = g.parameter(
+        "decoder.temporal_decoder.rel_pos_bias_table",
+        &[(cfg.num_heads * cfg.rel_pos_num_buckets) as usize],
+    );
 
     for i in 0..cfg.num_temporal_decoder_layers {
         let prefix = format!("decoder.temporal_layers.{i}");
@@ -774,14 +780,18 @@ pub fn build_temporal_decode_step(
         // than relying on emit order).
         let k_cache = g.cache_write(k, k_cache, kv_pos);
         let v_cache = g.cache_write(v, v_cache, kv_pos);
-        let sa = g.cached_attention(
+        let sa = g.cached_attention_rel_pos(
             q,
             k_cache,
             v_cache,
             kv_pos,
+            rel,
             cfg.num_heads,
             cfg.num_heads,
             cfg.head_dim,
+            cfg.rel_pos_num_buckets,
+            cfg.rel_pos_max_distance,
+            false, // causal temporal self-attention
         );
         let wo = g.parameter(&format!("{prefix}.self_attn.o"), &[attn_dim, embed]);
         let sa_out = g.matmul(sa, wo);

@@ -183,15 +183,17 @@ fine for Magenta-RT, but a constraint to remember.
    per-frame depth-input assembly (slice temporal state + level-prefix embeds,
    concat) and the block-per-frame depth pass are in place.
 3. **KV cache + autoregressive loop**: the temporal step is done
-   (`build_temporal_decode_step`, KV-cached). Remaining: the host driver that
-   loops 50 frames × 16 levels — temporal step → per-frame depth decode (sample
-   each level, feed back) → mean-pool the frame's tokens for the next temporal
-   step — reading `[2, vocab]` logits per step into
+   (`build_temporal_decode_step`, KV-cached) and now **rel-pos-correct** — a new
+   `cached_attention_rel_pos` op/shader (`Graph::cached_attention_rel_pos`) adds
+   the learned T5 rel-pos bias inside the cached softmax (bucket from `q_pos -
+   key_pos`, `q_pos = kv_pos`), verified vs CPU SDPA
+   (`tests/cached_attention_probe.rs`) and end-to-end with a non-zero table
+   (`tests/llm_temporal_decode_step_correctness.rs`). Remaining: the host driver
+   that loops 50 frames × 16 levels — temporal step → per-frame depth decode
+   (sample each level, feed back) → mean-pool the frame's tokens for the next
+   temporal step — reading `[2, vocab]` logits per step into
    `super::sampling::{cfg_combine, top_k_sample}`. Needs the CFG batch=2
-   broadcast-add the encoder asserts against. **Gap:** `cached_attention` has no
-   rel-pos bias, so the temporal self-attn's learned T5 rel-pos `[12,128]` is not
-   yet applied in the incremental path — real-weight temporal decode needs
-   rel-pos added to the cached-attention kernel (or an equivalent).
+   broadcast-add the encoder asserts against.
 4. **Weight loader**: map `target.*` (flaxformer) → graph params using
    `llm_base_manifest.json`, like `musiccoca`/`spectrostream`. Real-weight gate:
    greedy-decode logits match the Colab reference for a fixed seed.

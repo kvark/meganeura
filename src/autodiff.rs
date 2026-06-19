@@ -1140,6 +1140,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
             Op::CrossAttention { .. }
             | Op::CacheWrite
             | Op::CachedAttention { .. }
+            | Op::CachedAttentionRelPos { .. }
             | Op::GroupNormSilu { .. } => {
                 panic!(
                     "autodiff not supported for {:?} — this op cannot appear in training graphs. \

@@ -656,6 +656,16 @@ pub enum Op {
         num_kv_heads: u32,
         head_dim: u32,
     },
+    /// Cached attention with a T5 relative-position bias added to the scores.
+    /// Inputs: [q, k_cache, v_cache, kv_pos, rel_pos_table].
+    CachedAttentionRelPos {
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        num_buckets: u32,
+        max_distance: u32,
+        bidirectional: bool,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -1202,10 +1212,22 @@ impl Graph {
         assert_eq!(k_shape.len(), 2);
         assert_eq!(v_shape.len(), 2);
         let q_seq = q_shape[0];
-        assert_eq!(q_shape[1], (num_heads * head_dim) as usize, "q dim mismatch");
+        assert_eq!(
+            q_shape[1],
+            (num_heads * head_dim) as usize,
+            "q dim mismatch"
+        );
         assert_eq!(k_shape[0], v_shape[0], "k/v must share kv_seq");
-        assert_eq!(k_shape[1], (num_kv_heads * head_dim) as usize, "k dim mismatch");
-        assert_eq!(v_shape[1], (num_kv_heads * head_dim) as usize, "v dim mismatch");
+        assert_eq!(
+            k_shape[1],
+            (num_kv_heads * head_dim) as usize,
+            "k dim mismatch"
+        );
+        assert_eq!(
+            v_shape[1],
+            (num_kv_heads * head_dim) as usize,
+            "v dim mismatch"
+        );
         let table_shape = &self.node(rel_pos_table).ty.shape;
         assert_eq!(
             table_shape[0],
@@ -1754,13 +1776,21 @@ impl Graph {
         in_w: u32,
         factor: u32,
     ) -> NodeId {
-        assert!(channels.is_multiple_of(factor), "pixel_shuffle_w: channels {channels} must be divisible by factor {factor}");
+        assert!(
+            channels.is_multiple_of(factor),
+            "pixel_shuffle_w: channels {channels} must be divisible by factor {factor}"
+        );
         let out_c = channels / factor;
         let out_w = in_w * factor;
         let total = batch as usize * out_c as usize * in_h as usize * out_w as usize;
         let ty = TensorType::f32(vec![total]);
         self.add_node(
-            Op::PixelShuffleW { channels, in_h, in_w, factor },
+            Op::PixelShuffleW {
+                channels,
+                in_h,
+                in_w,
+                factor,
+            },
             vec![x],
             ty,
         )
@@ -1996,7 +2026,13 @@ impl Graph {
     ///
     /// `src` shape `[N*C*H*W]`; `gate` shape `[N*C]`.  Output matches `src`.
     /// Used by EfficientNet's Squeeze-and-Excitation block.
-    pub fn mul_per_channel(&mut self, src: NodeId, gate: NodeId, channels: u32, spatial: u32) -> NodeId {
+    pub fn mul_per_channel(
+        &mut self,
+        src: NodeId,
+        gate: NodeId,
+        channels: u32,
+        spatial: u32,
+    ) -> NodeId {
         let ty = self.node(src).ty.clone();
         self.add_node(Op::MulPerChannel { channels, spatial }, vec![src, gate], ty)
     }
@@ -2008,7 +2044,13 @@ impl Graph {
     /// without pre-replicating the safetensor's `[C]` data into a
     /// `[N*C*H*W]`-sized parameter buffer.  Compare `mul_per_channel`,
     /// whose gate is `[N*C]` (per-batch-and-channel) for the SE pathway.
-    pub fn add_per_channel(&mut self, src: NodeId, bias: NodeId, channels: u32, spatial: u32) -> NodeId {
+    pub fn add_per_channel(
+        &mut self,
+        src: NodeId,
+        bias: NodeId,
+        channels: u32,
+        spatial: u32,
+    ) -> NodeId {
         let ty = self.node(src).ty.clone();
         self.add_node(Op::AddPerChannel { channels, spatial }, vec![src, bias], ty)
     }
@@ -2299,6 +2341,49 @@ impl Graph {
                 head_dim,
             },
             vec![q, k_cache, v_cache, kv_pos],
+            ty,
+        )
+    }
+
+    /// Cached attention with a T5 relative-position bias on the scores.
+    /// Like [`Self::cached_attention`] but adds `rel_pos_table[head, bucket(q_pos
+    /// - key_pos)]` to each score before softmax, where `q_pos = kv_pos`. The
+    /// table is `[num_heads * num_buckets]`. Used by the autoregressive temporal
+    /// decode (the temporal self-attention carries a learned rel-pos bias).
+    #[allow(clippy::too_many_arguments)]
+    pub fn cached_attention_rel_pos(
+        &mut self,
+        q: NodeId,
+        k_cache: NodeId,
+        v_cache: NodeId,
+        kv_pos: NodeId,
+        rel_pos_table: NodeId,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        num_buckets: u32,
+        max_distance: u32,
+        bidirectional: bool,
+    ) -> NodeId {
+        let q_shape = &self.node(q).ty.shape;
+        assert_eq!(q_shape.len(), 2, "q must be 2D");
+        assert_eq!(q_shape[0], 1, "q must have seq_len=1 for cached attention");
+        assert_eq!(
+            q_shape[1],
+            (num_heads * head_dim) as usize,
+            "q dim mismatch"
+        );
+        let ty = TensorType::f32(vec![1, (num_heads * head_dim) as usize]);
+        self.add_node(
+            Op::CachedAttentionRelPos {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_buckets,
+                max_distance,
+                bidirectional,
+            },
+            vec![q, k_cache, v_cache, kv_pos, rel_pos_table],
             ty,
         )
     }
