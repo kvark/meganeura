@@ -1785,6 +1785,8 @@ pub fn generate_attention_module(head_dim: u32) -> ShaderModule {
     src.push_str("            my_out = my_out * correction + weight * bias[v_base + tid];\n");
     src.push_str("            max_score = new_max;\n");
     src.push_str("        }\n");
+    // All lanes have read wg_scores; barrier before the next tile overwrites it.
+    src.push_str("        workgroupBarrier();\n");
     src.push_str("    }\n\n");
 
     // --- Tail: remaining KV positions one at a time ---
@@ -1799,6 +1801,8 @@ pub fn generate_attention_module(head_dim: u32) -> ShaderModule {
     src.push_str("        sum_exp = sum_exp * correction + weight;\n");
     src.push_str("        my_out = my_out * correction + weight * bias[k_base + tid];\n");
     src.push_str("        max_score = new_max;\n");
+    // All lanes have read wg_dot[0]; barrier before the next iter overwrites it.
+    src.push_str("        workgroupBarrier();\n");
     src.push_str("    }\n\n");
 
     // Final output
@@ -1991,6 +1995,8 @@ pub fn generate_attention_with_rel_pos_module(head_dim: u32) -> ShaderModule {
     src.push_str("            my_out = my_out * correction + weight * bias[v_base + tid];\n");
     src.push_str("            max_score = new_max;\n");
     src.push_str("        }\n");
+    // All lanes have read wg_scores; barrier before the next tile overwrites it.
+    src.push_str("        workgroupBarrier();\n");
     src.push_str("    }\n\n");
 
     src.push_str("    for (; t < kv_len; t++) {\n");
@@ -2006,6 +2012,8 @@ pub fn generate_attention_with_rel_pos_module(head_dim: u32) -> ShaderModule {
     src.push_str("        sum_exp = sum_exp * correction + weight;\n");
     src.push_str("        my_out = my_out * correction + weight * bias[k_base + tid];\n");
     src.push_str("        max_score = new_max;\n");
+    // All lanes have read wg_dot[0]; barrier before the next iter overwrites it.
+    src.push_str("        workgroupBarrier();\n");
     src.push_str("    }\n\n");
 
     src.push_str("    let safe_sum = select(sum_exp, 1.0, sum_exp == 0.0);\n");

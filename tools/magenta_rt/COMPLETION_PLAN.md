@@ -24,7 +24,7 @@ text prompt ─► MusicCoCa ─► 6 style tokens ┐
 | **LLM** temporal decoder | ✅ `build_temporal_decoder` (mean-pool input, shared rel-pos) + `build_decoder_layer` | ❌ | ✅ GPU-vs-CPU on lavapipe (random weights, 1e-3) | buckets=128 for real weights |
 | **LLM** depth decoder | ✅ `build_depth_decoder_layer` + `build_depth_decoder_stack` (shared rel-pos) | ❌ | ✅ GPU-vs-CPU on lavapipe (random weights, 1e-3) | topology resolved |
 | **LLM** full decoder | ✅ `build_decoder` (temporal→depth, parallel/teacher-forcing) | ❌ | ✅ GPU-vs-CPU on lavapipe (random weights, 1e-3) | autoregressive KV-cache form next |
-| **LLM** generation | host sampler ✅ (`sampling.rs`) | — | sampler unit-tested | KV-cache + decode loop unwired |
+| **LLM** generation | ✅ temporal KV-cache step (`build_temporal_decode_step`) + host sampler (`sampling.rs`) | — | ✅ incremental temporal decode GPU-vs-CPU on lavapipe; sampler unit-tested | host decode-loop driver + depth-AR + CFG batch=2 unwired; cached-attn lacks rel-pos |
 
 The verification pattern that works without real weights: build the graph with
 small random weights, run on Lavapipe, compare to an independent CPU reference
@@ -32,6 +32,12 @@ forward pass (`tests/musiccoca_correctness.rs`,
 `tests/llm_decoder_correctness.rs`, `tests/llm_decoder_stack_correctness.rs`).
 This validates op composition; it does **not** validate that param layouts match
 the real checkpoints — that needs the weight dumps.
+
+> **Caveat the head_dim:** these random-weight tests historically used
+> head_dim≤8, which hid two attention-kernel subgroup-race bugs that only bite at
+> **head_dim=64 (the real value)** — now fixed, with regression tests at
+> head_dim=64 (`tests/{full,cached}_attention_probe.rs`). Keep new attention
+> verification at head_dim=64. See `LLM_FINDINGS.md`.
 
 ## The blocker: weight/manifest access — LIFTED
 

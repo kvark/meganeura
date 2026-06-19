@@ -142,6 +142,36 @@ tests:
   slice/concat use `slice_2d`/`concat`. Verified end-to-end by
   `tests/llm_full_decoder_correctness.rs`. This parallel form is for
   training/verification; production inference is the autoregressive step loop.
+- `build_temporal_decode_step` (**new**) — the incremental (autoregressive)
+  temporal decode: one frame per `step()`, KV cache persisting across steps as
+  mutable `parameter` buffers (`cache_write` + `cached_attention`, the smollm2
+  pattern), cross-attending to the fixed encoder output. Verified frame-by-frame
+  against the CPU reference (and the parallel forward) by
+  `tests/llm_temporal_decode_step_correctness.rs`. This is the temporal half of
+  the generation loop; the depth half reuses `build_depth_decoder_stack` per
+  frame (16 positions, cheap, rel-pos-correct).
+
+## Two head_dim=64 attention kernel bugs found + fixed
+
+Building the incremental decode surfaced two real GPU bugs, both the same race:
+the online-softmax loops read the reduced score from shared memory, then the
+next iteration overwrote that shared buffer with **no `workgroupBarrier`
+between**. This is benign when the workgroup is a single subgroup but corrupts
+results across subgroups.
+
+- `cached_attention.wgsl` (workgroup = 64 lanes ⇒ always multi-subgroup): wrong
+  for any kv_len≥2. Only prior coverage was a finiteness smoke test.
+- generated attention (`generate_attention_module` +
+  `generate_attention_with_rel_pos_module`, workgroup = `head_dim`): correct at
+  head_dim≤8 (one subgroup) but wrong at **head_dim=64 — the real model's
+  value**. Every prior LLM/MusicCoCa test used head_dim≤8, so this was invisible;
+  on real weights the whole port would have been broken.
+
+Fixed by adding the missing barriers. New regression tests pin head_dim=64:
+`tests/full_attention_probe.rs`, `tests/cached_attention_probe.rs` (both exact
+to <1e-6 vs CPU SDPA). **`cached_attention` requires head_dim==64** (it reduces
+the dot product over its full 64-lane workgroup with no `tid<head_dim` mask) —
+fine for Magenta-RT, but a constraint to remember.
 
 ## Remaining to reach text→tokens (in dependency order)
 
@@ -152,11 +182,16 @@ tests:
 2. ✅ **Full-decoder wiring** — done (`build_decoder`, GPU-verified). The
    per-frame depth-input assembly (slice temporal state + level-prefix embeds,
    concat) and the block-per-frame depth pass are in place.
-3. **KV cache + autoregressive loop**: 50 frames × 16 levels; run the encoder
-   once; read `[2, vocab]` logits per step; call
+3. **KV cache + autoregressive loop**: the temporal step is done
+   (`build_temporal_decode_step`, KV-cached). Remaining: the host driver that
+   loops 50 frames × 16 levels — temporal step → per-frame depth decode (sample
+   each level, feed back) → mean-pool the frame's tokens for the next temporal
+   step — reading `[2, vocab]` logits per step into
    `super::sampling::{cfg_combine, top_k_sample}`. Needs the CFG batch=2
-   broadcast-add the encoder currently asserts against. The per-frame depth
-   forward in `build_decoder` is the shape this loop calls each step.
+   broadcast-add the encoder asserts against. **Gap:** `cached_attention` has no
+   rel-pos bias, so the temporal self-attn's learned T5 rel-pos `[12,128]` is not
+   yet applied in the incremental path — real-weight temporal decode needs
+   rel-pos added to the cached-attention kernel (or an equivalent).
 4. **Weight loader**: map `target.*` (flaxformer) → graph params using
    `llm_base_manifest.json`, like `musiccoca`/`spectrostream`. Real-weight gate:
    greedy-decode logits match the Colab reference for a fixed seed.

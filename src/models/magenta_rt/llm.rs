@@ -702,6 +702,120 @@ pub fn build_decoder(
     logits.expect("num_frames must be ≥ 1")
 }
 
+/// Build one **incremental** (autoregressive) temporal decode step: given the
+/// just-decoded frame's RVQ tokens, advance the temporal decoder by one frame
+/// using a KV cache, returning that frame's temporal state `[1, embed]`.
+///
+/// This is the efficient inference counterpart to [`build_temporal_decoder`]'s
+/// parallel forward: the graph is built once (fixed, single-frame shape) and
+/// run once per frame, with the per-layer K/V caches persisting across `step()`
+/// calls as mutable `parameter` buffers (the smollm2 decode pattern). The
+/// self-attention reads the growing cache via [`Graph::cached_attention`];
+/// cross-attention to the (fixed) encoder output is recomputed each step.
+///
+/// Caches are named `decoder.temporal_kv_cache.{layer}.{k,v}` `[max_frames,
+/// attn_dim]` — zero-initialise them before the first step. The layer weights
+/// reuse the same names as [`build_decoder_layer`]
+/// (`decoder.temporal_layers.{i}.*`), so one weight set drives both paths.
+///
+/// **Limitation:** [`Graph::cached_attention`] is plain causal SDPA with **no
+/// relative-position bias** (like smollm2, which folds position into RoPE). The
+/// temporal self-attention's learned T5 rel-pos bias (`[heads, 128]`) is
+/// therefore **not** applied here — so this step matches the parallel forward
+/// only in the zero-rel-pos regime the test suite uses. Real-weight decode needs
+/// rel-pos bias added to the cached-attention path (tracked in
+/// `tools/magenta_rt/LLM_FINDINGS.md`).
+///
+/// Inputs:  `step_tokens` u32 `[num_levels]` (the input frame's RVQ tokens —
+///          the SOS frame for the first step, else the previous decoded frame),
+///          `encoder_out` `[enc_seq, embed]`, `kv_pos` u32 scalar (the frame
+///          index / number of valid cache rows).
+/// Output:  temporal state `[1, embed]` for this frame.
+pub fn build_temporal_decode_step(
+    g: &mut Graph,
+    cfg: &LlmConfig,
+    step_tokens: NodeId,
+    encoder_out: NodeId,
+    kv_pos: NodeId,
+    max_frames: usize,
+) -> NodeId {
+    let embed = cfg.embed_dim as usize;
+    let attn_dim = (cfg.num_heads * cfg.head_dim) as usize;
+    let mlp_dim = cfg.mlp_dim as usize;
+
+    // Mean-pool this frame's level embeddings → the temporal input [1, embed].
+    let table = g.parameter("shared_token_embedder", &[cfg.vocab_size as usize, embed]);
+    let embedded = g.embedding(step_tokens, table);
+    let mut x = build_level_mean_pool(g, cfg, embedded, 1);
+
+    for i in 0..cfg.num_temporal_decoder_layers {
+        let prefix = format!("decoder.temporal_layers.{i}");
+
+        // --- 1. Cached causal self-attention over frames ---
+        let ln1 = g.parameter(&format!("{prefix}.pre_self_attn_norm"), &[embed]);
+        let h = g.rms_norm(x, ln1, cfg.layer_norm_eps);
+        let wq = g.parameter(&format!("{prefix}.self_attn.q"), &[embed, attn_dim]);
+        let wk = g.parameter(&format!("{prefix}.self_attn.k"), &[embed, attn_dim]);
+        let wv = g.parameter(&format!("{prefix}.self_attn.v"), &[embed, attn_dim]);
+        let q = g.matmul(h, wq);
+        let k = g.matmul(h, wk);
+        let v = g.matmul(h, wv);
+        let k_cache = g.parameter(
+            &format!("decoder.temporal_kv_cache.{i}.k"),
+            &[max_frames, attn_dim],
+        );
+        let v_cache = g.parameter(
+            &format!("decoder.temporal_kv_cache.{i}.v"),
+            &[max_frames, attn_dim],
+        );
+        // Write this frame's K/V into the cache at `kv_pos`, then attend to the
+        // valid rows. Thread the updated-cache nodes into `cached_attention` so
+        // the writes are scheduled before the read (a data dependency, rather
+        // than relying on emit order).
+        let k_cache = g.cache_write(k, k_cache, kv_pos);
+        let v_cache = g.cache_write(v, v_cache, kv_pos);
+        let sa = g.cached_attention(
+            q,
+            k_cache,
+            v_cache,
+            kv_pos,
+            cfg.num_heads,
+            cfg.num_heads,
+            cfg.head_dim,
+        );
+        let wo = g.parameter(&format!("{prefix}.self_attn.o"), &[attn_dim, embed]);
+        let sa_out = g.matmul(sa, wo);
+        let x1 = g.add(x, sa_out);
+
+        // --- 2. Cross-attention to the (fixed) encoder output ---
+        let ln2 = g.parameter(&format!("{prefix}.pre_cross_attn_norm"), &[embed]);
+        let h = g.rms_norm(x1, ln2, cfg.layer_norm_eps);
+        let wcq = g.parameter(&format!("{prefix}.cross_attn.q"), &[embed, attn_dim]);
+        let wck = g.parameter(&format!("{prefix}.cross_attn.k"), &[embed, attn_dim]);
+        let wcv = g.parameter(&format!("{prefix}.cross_attn.v"), &[embed, attn_dim]);
+        let cq = g.matmul(h, wcq);
+        let ck = g.matmul(encoder_out, wck);
+        let cv = g.matmul(encoder_out, wcv);
+        let ca = g.cross_attention(cq, ck, cv, cfg.num_heads, cfg.num_heads, cfg.head_dim);
+        let wco = g.parameter(&format!("{prefix}.cross_attn.o"), &[attn_dim, embed]);
+        let ca_out = g.matmul(ca, wco);
+        let x2 = g.add(x1, ca_out);
+
+        // --- 3. GeGLU MLP ---
+        let ln3 = g.parameter(&format!("{prefix}.pre_mlp_norm"), &[embed]);
+        let h = g.rms_norm(x2, ln3, cfg.layer_norm_eps);
+        let w_gate = g.parameter(&format!("{prefix}.mlp.w_gate"), &[embed, mlp_dim]);
+        let w_up = g.parameter(&format!("{prefix}.mlp.w_up"), &[embed, mlp_dim]);
+        let w_down = g.parameter(&format!("{prefix}.mlp.w_down"), &[mlp_dim, embed]);
+        let gate = g.matmul(h, w_gate);
+        let up = g.matmul(h, w_up);
+        let ffn = g.geglu(gate, up);
+        let ffn_out = g.matmul(ffn, w_down);
+        x = g.add(x2, ffn_out);
+    }
+    x
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
