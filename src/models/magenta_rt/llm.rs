@@ -199,7 +199,10 @@ pub fn build_encoder_graph(g: &mut Graph, cfg: &LlmConfig, batch: usize) -> Node
     // shared pos_embed to both rows requires a broadcast-add op that isn't in
     // place yet — so the encoder is batch=1 only for now.
     // TODO(broadcast): add a broadcast-add and lift this to batch ∈ {1, 2}.
-    assert_eq!(batch, 1, "encoder is batch=1 until a broadcast-add op lands (CFG batch=2 TODO)");
+    assert_eq!(
+        batch, 1,
+        "encoder is batch=1 until a broadcast-add op lands (CFG batch=2 TODO)"
+    );
     let seq = cfg.encoder_seq_len as usize;
     let embed = cfg.embed_dim as usize;
 
@@ -342,6 +345,82 @@ pub fn build_temporal_decoder_stack(
     g.matmul(x, logits_w)
 }
 
+/// Mean-pool a frame's RVQ level embeddings down to one vector per frame:
+/// `embedded [num_frames*num_levels, embed] → [num_frames, embed]`.
+///
+/// This is `embedded.mean(axis=levels)` from `depthformer.py`'s
+/// `MultivariateDecoder` — the temporal body sees the average of a frame's 16
+/// level embeddings. Implemented as a single matmul by a constant pooling
+/// matrix `P [num_frames, num_frames*num_levels]` carrying `1/num_levels` on
+/// each frame's contiguous level block; this folds the per-frame grouping and
+/// the average into one op (meganeura reductions are scalar/inner-axis only and
+/// `mul` has no scalar broadcast, so a pooling matmul is the clean primitive).
+fn build_level_mean_pool(
+    g: &mut Graph,
+    cfg: &LlmConfig,
+    embedded: NodeId,
+    num_frames: usize,
+) -> NodeId {
+    let levels = cfg.num_levels as usize;
+    let cols = num_frames * levels;
+    let inv = 1.0 / levels as f32;
+    let mut pool = vec![0.0_f32; num_frames * cols];
+    for f in 0..num_frames {
+        for l in 0..levels {
+            pool[f * cols + f * levels + l] = inv;
+        }
+    }
+    let p = g.constant(pool, &[num_frames, cols]);
+    g.matmul(p, embedded)
+}
+
+/// Build the full Depthformer *temporal* decoder forward: the per-frame RVQ
+/// token grid → shared token embed → mean-pool over the `num_levels` RVQ levels
+/// → `num_temporal_decoder_layers` temporal layers (each causal self-attention +
+/// cross-attention to `encoder_out`) → the per-frame temporal states
+/// `[num_frames, embed]`.
+///
+/// This is the real temporal input construction (mean-pooled level embeddings,
+/// per `depthformer.py`'s `MultivariateDecoder`), unlike
+/// [`build_temporal_decoder_stack`], which embeds a flat token sequence directly
+/// and appends a placeholder weight-tied logits head. The temporal output here
+/// is **not** normalized and carries **no** logits: per the checkpoint the
+/// single `decoder_norm` + `logits_dense` head sits after the *depth* module,
+/// and these raw temporal states feed the depth module as its level-0 input
+/// (see [`build_depth_decoder_stack`]).
+///
+/// `decoder_input_tokens` is the SOS-shifted grid `[num_frames * num_levels]`
+/// (the caller prepends the SOS frame and drops the last per the teacher-forcing
+/// shift). The rel-pos bias table is **shared across the temporal layers** — the
+/// checkpoint stores one `temporal_decoder.relpos_bias.rel_embedding` (`[heads,
+/// 128]`) for the whole sub-decoder, not one per layer.
+///
+/// Inputs:  `decoder_input_tokens` u32 `[num_frames * num_levels]`,
+///          `encoder_out` `[enc_seq, embed]`.
+/// Output:  temporal states `[num_frames, embed]`.
+pub fn build_temporal_decoder(
+    g: &mut Graph,
+    cfg: &LlmConfig,
+    decoder_input_tokens: NodeId,
+    encoder_out: NodeId,
+    num_frames: usize,
+) -> NodeId {
+    let embed = cfg.embed_dim as usize;
+    let table = g.parameter("shared_token_embedder", &[cfg.vocab_size as usize, embed]);
+    let embedded = g.embedding(decoder_input_tokens, table);
+    let mut x = build_level_mean_pool(g, cfg, embedded, num_frames);
+    // One shared rel-pos bias table for the whole temporal sub-decoder.
+    let rel = g.parameter(
+        "decoder.temporal_decoder.rel_pos_bias_table",
+        &[(cfg.num_heads * cfg.rel_pos_num_buckets) as usize],
+    );
+    for i in 0..cfg.num_temporal_decoder_layers {
+        let prefix = format!("decoder.temporal_layers.{i}");
+        x = build_decoder_layer(g, cfg, x, encoder_out, rel, &prefix);
+    }
+    x
+}
+
 /// Build one Depthformer *depth* decoder layer — the per-frame inner transformer
 /// over the 16 RVQ levels. Topology resolved from the checkpoint manifest
 /// (`tools/magenta_rt/llm_base_manifest.json`) and the reference
@@ -432,12 +511,15 @@ pub fn build_depth_decoder_layer(
 pub fn build_depth_decoder_stack(g: &mut Graph, cfg: &LlmConfig, depth_inputs: NodeId) -> NodeId {
     let embed = cfg.embed_dim as usize;
     let mut x = depth_inputs;
+    // One shared rel-pos table for the whole depth sub-decoder — the checkpoint
+    // stores a single `depth_decoder.relpos_bias_depth.rel_embedding` `[heads,
+    // 16]`, not one table per depth layer.
+    let rel = g.parameter(
+        "decoder.depth_decoder.rel_pos_bias_table",
+        &[(cfg.num_heads * cfg.depth_rel_pos_num_buckets) as usize],
+    );
     for i in 0..cfg.num_depth_decoder_layers {
         let prefix = format!("decoder.depth_layers.{i}");
-        let rel = g.parameter(
-            &format!("{prefix}.self_attn.rel_pos_bias_table"),
-            &[(cfg.num_heads * cfg.depth_rel_pos_num_buckets) as usize],
-        );
         x = build_depth_decoder_layer(g, cfg, x, rel, &prefix);
     }
     // Shared final norm (target.decoder.decoder_norm) then the dedicated,
@@ -469,7 +551,10 @@ mod tests {
         assert_eq!(c.embed_dim, 1024);
         assert_eq!(c.num_heads * c.head_dim, c.embed_dim);
         assert_eq!(c.num_encoder_layers, 24);
-        assert_eq!(c.num_temporal_decoder_layers + c.num_depth_decoder_layers, 24);
+        assert_eq!(
+            c.num_temporal_decoder_layers + c.num_depth_decoder_layers,
+            24
+        );
         assert_eq!(c.encoder_seq_len, 1006);
         assert_eq!(c.decoder_seq_len, c.num_levels * 50);
     }
@@ -498,8 +583,8 @@ mod tests {
             &[cfg.num_levels as usize, cfg.embed_dim as usize],
         );
         let _logits = build_depth_decoder_stack(&mut g, &cfg, depth_in);
-        // 4 depth layers × (4 self-attn matmuls + 3 mlp matmuls + 2 norms +
-        // 1 rel-pos table) = 40, plus decoder_norm + logits_dense = 42 params.
+        // 4 depth layers × (4 self-attn matmuls + 3 mlp matmuls + 2 norms) plus
+        // 1 shared rel-pos table + decoder_norm + logits_dense params, and ops.
         assert!(
             g.nodes().len() > cfg.num_depth_decoder_layers as usize * 10,
             "depth stack should have ≥ ~42 parameter nodes plus ops, got {} nodes",

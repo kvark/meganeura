@@ -116,14 +116,24 @@ There is **no** separate depth level-embedding table and **no** depth-specific
 logits head — both are shared with the temporal path (the manifest shows only
 `token_embedder.embedding`, one `decoder_norm`, one `logits_dense`).
 
-## What's now implemented (this session)
+## What's now implemented + GPU-verified (lavapipe)
+
+All three new builders are checked GPU-vs-CPU on Mesa **lavapipe** (software
+Vulkan; `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`), random weights,
+zero rel-pos tables, 1e-3 tolerance — the same harness as the prior temporal
+tests:
 
 - `build_depth_decoder_layer` + `build_depth_decoder_stack` (**new**) — the
-  per-frame depth core: 4 causal-self-attn-only T5 layers (depth rel-pos buckets
-  16/16) → shared `decoder_norm` → non-tied `logits_dense` → `[16, vocab]`.
-  Smoke-tested (`depth_decoder_stack_builds`); a GPU-vs-CPU correctness test
-  mirroring `llm_decoder_stack_correctness.rs` is TODO (no Vulkan device in this
-  container — verification is environment-gated, not knowledge-gated now).
+  per-frame depth core: 4 causal-self-attn-only T5 layers (one *shared* depth
+  rel-pos table, matching the checkpoint's single `relpos_bias_depth`) →
+  shared `decoder_norm` → non-tied `logits_dense` → `[16, vocab]`.
+  Verified by `tests/llm_depth_decoder_correctness.rs`.
+- `build_temporal_decoder` (**new**) — the *full* temporal forward: per-frame
+  RVQ token grid → shared token embed → **mean-pool over the levels** (the real
+  temporal input, via a constant pooling-matrix matmul) → 20 temporal layers
+  (one shared rel-pos table) → `[num_frames, embed]` states, **no** final norm /
+  logits (those belong after the depth module). Verified by
+  `tests/llm_temporal_decoder_correctness.rs`.
 
 ## Remaining to reach text→tokens (in dependency order)
 
@@ -131,9 +141,11 @@ logits head — both are shared with the temporal path (the manifest shows only
    `Scale(sqrt(embed))`; make the temporal rel-pos table shared per sub-decoder
    with bucket count 128. Settle the encoder position sub-question (above), then
    a real-weight encoder GPU-vs-reference check (mirrors MusicCoCa's).
-2. **Full-decoder wiring**: embed levels → mean-pool temporal input → temporal
-   stack → assemble depth inputs (concat) → depth stack, per the 6 steps above.
-   Needs an axis-mean and a level-axis concat in the graph.
+2. **Full-decoder wiring**: the temporal half is done (`build_temporal_decoder`,
+   mean-pool included). Remaining: assemble the depth inputs per frame —
+   `concat([temporal_out[frame], embed(levels 0..14)])` over the level axis —
+   and run `build_depth_decoder_stack` per frame. Needs a level-axis concat /
+   per-frame slice in the graph.
 3. **KV cache + autoregressive loop**: 50 frames × 16 levels; run the encoder
    once; read `[2, vocab]` logits per step; call
    `super::sampling::{cfg_combine, top_k_sample}`. Needs the CFG batch=2
