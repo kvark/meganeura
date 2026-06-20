@@ -108,8 +108,14 @@ checks. For the full weight dump: `python3 tools/magenta_rt/dump_llm.py` (after
 ### Phase 3 — end-to-end wiring
 3.1 Tokenizer + MusicCoCa text→6 style tokens (SentencePiece via the `tokenizers`
     crate; `musiccoca_vocab.model`).
-3.2 SpectroStream **encoder** (audio context → 4-RVQ tokens) — currently only the
-    decoder exists; the encoder is needed for audio-conditioned continuation.
+3.2 SpectroStream **encoder** (audio context → 4-RVQ tokens). ⚙️ **STFT
+    front-end done** — `spectrostream_encoder::stft_features` (audio → `[frames,
+    480, 4]` features, 960/480/960 Hann, keep_dc, `[re,im]`-per-channel layout),
+    verified vs a naive DFT (`tests/spectrostream_stft.rs`, ~5e-7). Remaining:
+    the strided conv-residual stack (`ratios=((1,2),(1,2),(1,3),(1,2),(1,2),
+    (2,2),(2,1))`) + RVQ quantizer — **blocked on the encoder weight manifest**
+    (per-block channel counts), like the decoder was. Also: confirm the STFT
+    `semicausal` alignment against real audio.
 3.3 Driver: text+context → LLM generate 800 tokens → SpectroStream decode → 2 s
     audio, with the 40 ms crossfade between chunks (`MagentaRtConfig`).
 

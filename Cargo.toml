@@ -32,11 +32,11 @@ oxionnx-proto = "0.1"
 half = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["registry"] }
+# STFT/iSTFT for the SpectroStream codec front-end (encoder `stft_features`) and
+# the magenta_rt_demo iSTFT.
+rustfft = "6"
 
 [dev-dependencies]
-# Host-side iSTFT for SpectroStream body-out → audio in the magenta_rt_demo
-# example. Not needed by the meganeura library itself.
-rustfft = "6"
 
 [[example]]
 name = "mnist"

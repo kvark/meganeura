@@ -29,6 +29,7 @@ pub mod llm_weights;
 pub mod musiccoca;
 pub mod sampling;
 pub mod spectrostream;
+pub mod spectrostream_encoder;
 
 /// Top-level configuration mirroring `system.MagentaRTConfiguration` in
 /// the official magenta_rt python library.
