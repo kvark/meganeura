@@ -20,7 +20,7 @@ text prompt ─► MusicCoCa ─► 6 style tokens ┐
 |-----------|---------------|---------------|----------|------|
 | **MusicCoCa** text encoder | ✅ `build_text_encoder_graph` | ✅ `load_text_encoder_weights` | ✅ GPU-vs-CPU (random weights, 1e-3) | real-weight check vs the 26 testdata embeddings |
 | **SpectroStream** decoder body | ✅ `build_decoder_graph` | ✅ `load_decoder_weights` | ⚠️ only structurally; demo runs tokens→WAV | 3 unverified "free reinterpret" claims; RADV NaN bug |
-| **LLM** encoder | ✅ `build_encoder_graph` | ⚠️ body only (`llm_weights`) | ❌ | drop spurious `pos_embed`, add `Scale(√d)`; encoder position scheme is the one open question |
+| **LLM** encoder | ✅ `build_encoder_graph` (sinusoidal PE, bidirectional, no rel-pos) | ✅ `llm_weights` (fully loadable) | ✅ GPU-vs-CPU op-composition (lavapipe, 1e-6) | `Scale(√d)?` + real-weight numeric check unverified |
 | **LLM** temporal decoder | ✅ `build_temporal_decoder` + `build_decoder_layer` | ✅ `llm_weights` (shared) | ✅ GPU-vs-CPU on lavapipe (random weights, 1e-3) | — |
 | **LLM** depth decoder | ✅ `build_depth_decoder_layer` + `build_depth_decoder_stack` | ✅ `llm_weights` (shared) | ✅ GPU-vs-CPU on lavapipe (random weights, 1e-3) | — |
 | **LLM** full decoder | ✅ `build_decoder` (temporal→depth) | ✅ `llm_weights::load_llm_weights` | ✅ map = 100% of checkpoint (`llm_weight_map`); GPU-vs-CPU random-weight | real-weight numeric gate needs JAX ref |

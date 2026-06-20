@@ -72,14 +72,19 @@ Settled from the manifest + the reference `magenta_rt/jax/depthformer.py`
 - **Encoder embedder applies `Scale(sqrt(embed))`** after the lookup
   (`scale_sqrt_depth`, PAX-compat) — `build_encoder_graph` is currently missing
   this multiply.
-- **Open sub-question (encoder position):** the encoder carries **no** rel-pos
-  tensor in the checkpoint (unlike both decoders) **and** no PE. Either the
-  encoder uses a non-parametric scheme (the v2 `transformer.py` is RoPE-based,
-  which leaves no checkpoint trace) or genuinely no position signal. This is the
-  one thing the manifest can't settle (non-parametric ⇒ invisible). To pin down:
-  read the v1 `mrt_merged_*.gin` body config, or a real-weight encoder check.
-  **Until settled, leave the encoder's position handling untouched** beyond
-  removing the clearly-spurious learned `pos_embed`.
+- **Encoder position — IMPLEMENTED (per the numpy ref), one detail unverified.**
+  The encoder carries no rel-pos tensor (unlike both decoders) and no PE tensor,
+  so the scheme is non-parametric. The cloned GitHub repo is the **v2** model
+  (RoPE, decoder-only — its `load_weights.py` doesn't even load relpos), so it
+  doesn't dictate v1. The in-repo `llm_numpy_ref.py` (written to reverse-engineer
+  *this* v1 checkpoint) uses **fixed sinusoidal absolute PE + no rel-pos**, and
+  that's now what `build_encoder_graph` does: embed → +`sinusoidal_pos_embed`
+  (computed constant) → bidirectional self-attention (plain SDPA, no rel-pos) →
+  final RMSNorm. Verified op-composition GPU-vs-CPU
+  (`tests/llm_encoder_correctness.rs`, 1e-6). **Remaining unverified detail:** the
+  v2 `depthformer.py` embedder also applies `Scale(sqrt(embed))`, which the numpy
+  ref omits — settle against real-weight encoder outputs. (The encoder is now
+  fully checkpoint-loadable: the PE is computed, not stored.)
 
 ## RESOLVED: logits are NOT weight-tied
 
@@ -175,10 +180,11 @@ fine for Magenta-RT, but a constraint to remember.
 
 ## Remaining to reach text→tokens (in dependency order)
 
-1. **Encoder fixes**: drop the spurious learned `pos_embed`; add
-   `Scale(sqrt(embed))`; make the temporal rel-pos table shared per sub-decoder
-   with bucket count 128. Settle the encoder position sub-question (above), then
-   a real-weight encoder GPU-vs-reference check (mirrors MusicCoCa's).
+1. ✅ **Encoder fixes** — done: dropped the spurious learned `pos_embed` (now a
+   computed sinusoidal PE), dropped the encoder rel-pos (plain bidirectional
+   SDPA), temporal bucket count → 128. Op-composition GPU-verified
+   (`tests/llm_encoder_correctness.rs`). Open: `Scale(sqrt(embed))?` and the
+   real-weight encoder numeric check (both need real weights / a JAX reference).
 2. ✅ **Full-decoder wiring** — done (`build_decoder`, GPU-verified). The
    per-frame depth-input assembly (slice temporal state + level-prefix embeds,
    concat) and the block-per-frame depth pass are in place.

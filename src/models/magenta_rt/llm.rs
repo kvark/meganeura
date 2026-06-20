@@ -121,53 +121,36 @@ impl LlmConfig {
     }
 }
 
-/// Build one T5 1.1 encoder layer: pre-norm self-attn + pre-norm GeGLU MLP, both with residual.
+/// Build one encoder layer: pre-norm **bidirectional** self-attention + pre-norm
+/// GeGLU MLP, both residual. T5 1.1 RMSNorm, no projection biases.
 ///
-/// `rel_pos_bias_table` is the learned `[num_heads * num_buckets]` parameter
-/// for this layer's attention (T5 does NOT share the rel-pos table across
-/// layers per the gin config, so callers register a fresh table per layer).
+/// The `llm_base` checkpoint carries **no encoder rel-pos tensor** (only the two
+/// decoders do), so the encoder self-attention here is plain scaled-dot-product
+/// (no rel-pos bias) — position enters via the sinusoidal PE added once in
+/// [`build_encoder_graph`] (per the in-repo `llm_numpy_ref.py`). This is the one
+/// LLM piece not yet checked against real weights; see `LLM_FINDINGS.md`.
 ///
-/// Parameter names follow this convention (chosen for clarity; the Colab dumper's
-/// manifest will use flaxformer's naming and we'll remap during weight loading):
-///   `{prefix}.pre_attn_norm`, `{prefix}.attn.q`, `{prefix}.attn.k`,
-///   `{prefix}.attn.v`, `{prefix}.attn.o`, `{prefix}.attn.rel_pos_bias_table`,
-///   `{prefix}.pre_mlp_norm`, `{prefix}.mlp.w_gate`, `{prefix}.mlp.w_up`,
-///   `{prefix}.mlp.w_down`.
-pub fn build_encoder_layer(
-    g: &mut Graph,
-    cfg: &LlmConfig,
-    x: NodeId,
-    rel_pos_bias_table: NodeId,
-    prefix: &str,
-) -> NodeId {
+/// Param names: `{prefix}.pre_attn_norm`, `.attn.{q,k,v,o}`, `.pre_mlp_norm`,
+/// `.mlp.{w_gate,w_up,w_down}` — all backed by checkpoint tensors.
+pub fn build_encoder_layer(g: &mut Graph, cfg: &LlmConfig, x: NodeId, prefix: &str) -> NodeId {
     let embed = cfg.embed_dim as usize;
     let mlp_dim = cfg.mlp_dim as usize;
     let attn_dim = (cfg.num_heads * cfg.head_dim) as usize;
 
-    // --- Pre-attention RMSNorm (T5LayerNorm has weight only, no bias, no centering) ---
+    // --- Pre-attention RMSNorm (T5LayerNorm: weight only, no bias/centering) ---
     let ln1_w = g.parameter(&format!("{prefix}.pre_attn_norm"), &[embed]);
     let h = g.rms_norm(x, ln1_w, cfg.layer_norm_eps);
 
-    // --- Self-attention (no biases anywhere in T5 1.1, but rel-pos bias is in QK^T) ---
+    // --- Bidirectional self-attention (no rel-pos bias; plain SDPA) ---
     let wq = g.parameter(&format!("{prefix}.attn.q"), &[embed, attn_dim]);
     let wk = g.parameter(&format!("{prefix}.attn.k"), &[embed, attn_dim]);
     let wv = g.parameter(&format!("{prefix}.attn.v"), &[embed, attn_dim]);
     let q = g.matmul(h, wq);
     let k = g.matmul(h, wk);
     let v = g.matmul(h, wv);
-    let attn = g.full_attention_with_rel_pos_bias(
-        q,
-        k,
-        v,
-        rel_pos_bias_table,
-        cfg.num_heads,
-        cfg.num_heads,
-        cfg.head_dim,
-        cfg.rel_pos_num_buckets,
-        cfg.rel_pos_max_distance,
-        true,  // bidirectional encoder
-        false, // not causal
-    );
+    // `cross_attention` is non-causal scaled-dot-product with no rel-pos bias —
+    // exactly bidirectional self-attention when Q/K/V come from the same input.
+    let attn = g.cross_attention(q, k, v, cfg.num_heads, cfg.num_heads, cfg.head_dim);
 
     let wo = g.parameter(&format!("{prefix}.attn.o"), &[attn_dim, embed]);
     let attn_out = g.matmul(attn, wo);
@@ -186,6 +169,22 @@ pub fn build_encoder_layer(
     g.add(x, ffn_out)
 }
 
+/// Fixed sinusoidal absolute position embedding `[seq, embed]` (standard
+/// Transformer convention, `10000` timescale; matches `llm_numpy_ref.py`):
+/// `pe[p, 2i] = sin(p / 10000^(2i/embed))`, `pe[p, 2i+1] = cos(...)`.
+fn sinusoidal_pos_embed(seq: usize, embed: usize) -> Vec<f32> {
+    let mut pe = vec![0.0_f32; seq * embed];
+    for p in 0..seq {
+        for i in 0..embed / 2 {
+            let inv_freq = 1.0_f64 / 10000.0_f64.powf(2.0 * i as f64 / embed as f64);
+            let angle = p as f64 * inv_freq;
+            pe[p * embed + 2 * i] = angle.sin() as f32;
+            pe[p * embed + 2 * i + 1] = angle.cos() as f32;
+        }
+    }
+    pe
+}
+
 /// Build the encoder forward pass: token-embed → +sinusoidal pos → 24 layers → final norm.
 ///
 /// Returns the encoder output `[seq_len, embed_dim]` for cross-attention into the decoder.
@@ -194,39 +193,28 @@ pub fn build_encoder_layer(
 /// (weight tying), so this graph also produces it as a side-channel via the
 /// `shared_token_embedder` parameter name.
 ///
-/// Builds all `num_encoder_layers` and the final norm. Structurally complete
-/// and wired to real ops, but not yet verified against a weight dump, and
-/// batch=1 only (see the broadcast TODO inside).
-pub fn build_encoder_graph(g: &mut Graph, cfg: &LlmConfig, batch: usize) -> NodeId {
-    // CFG ultimately needs batch=2 (positive + negative style), but adding the
-    // shared pos_embed to both rows requires a broadcast-add op that isn't in
-    // place yet — so the encoder is batch=1 only for now.
-    // TODO(broadcast): add a broadcast-add and lift this to batch ∈ {1, 2}.
-    assert_eq!(
-        batch, 1,
-        "encoder is batch=1 until a broadcast-add op lands (CFG batch=2 TODO)"
-    );
-    let seq = cfg.encoder_seq_len as usize;
+/// Builds all `num_encoder_layers` and the final norm. Every parameter is backed
+/// by a checkpoint tensor (the sinusoidal PE is computed, not stored); only the
+/// position scheme itself is unverified against real weights (`LLM_FINDINGS.md`).
+/// `seq` lets the caller use a length other than `cfg.encoder_seq_len` (e.g. for
+/// tests); pass `cfg.encoder_seq_len` for the real model. Batch=1 only.
+pub fn build_encoder_graph(g: &mut Graph, cfg: &LlmConfig, seq: usize) -> NodeId {
     let embed = cfg.embed_dim as usize;
 
-    let token_ids = g.input_u32("encoder_input_tokens", &[batch * seq]);
+    let token_ids = g.input_u32("encoder_input_tokens", &[seq]);
     let embed_w = g.parameter("shared_token_embedder", &[cfg.vocab_size as usize, embed]);
     let mut x = g.embedding(token_ids, embed_w);
 
-    // Sinusoidal absolute position embeddings (loaded as a constant, not learned).
-    let pos_embed = g.parameter("encoder.pos_embed", &[seq, embed]);
-    x = g.add(x, pos_embed);
+    // Fixed sinusoidal absolute position embedding (computed, not a checkpoint
+    // tensor — the encoder has no learned PE; per `llm_numpy_ref.py`). NOTE: the
+    // v2 `depthformer.py` embedder also applies `Scale(sqrt(embed))`, which the
+    // numpy ref omits — an open detail to settle against real weights.
+    let pe = g.constant(sinusoidal_pos_embed(seq, embed), &[seq, embed]);
+    x = g.add(x, pe);
 
     for i in 0..cfg.num_encoder_layers {
         let prefix = format!("encoder.layers.{i}");
-        // Rel-pos bias table for this layer (per gin: not shared across layers).
-        // The fused FullAttentionRelPosBias kernel does the bucket lookup inline,
-        // so we pass the small [num_heads, num_buckets] table directly.
-        let bias_table = g.parameter(
-            &format!("{prefix}.attn.rel_pos_bias_table"),
-            &[(cfg.num_heads * cfg.rel_pos_num_buckets) as usize],
-        );
-        x = build_encoder_layer(g, cfg, x, bias_table, &prefix);
+        x = build_encoder_layer(g, cfg, x, &prefix);
     }
 
     let final_ln_w = g.parameter("encoder.final_norm", &[embed]);
@@ -1053,14 +1041,12 @@ mod tests {
         // and registers a sensible number of parameters.
         let cfg = LlmConfig::large();
         let mut g = Graph::new();
-        let _logits = build_encoder_graph(&mut g, &cfg, 1);
-        // Per-layer: 4 attn matmuls + 3 mlp matmuls + 2 layer norms + 1 rel-pos
-        // table = 10 params per layer × 24 layers = 240
-        // Plus shared: token embed + pos embed + final norm = 243.
-        // Allow a small fudge for graph internals.
+        let _out = build_encoder_graph(&mut g, &cfg, cfg.encoder_seq_len as usize);
+        // Per-layer: 4 attn matmuls + 3 mlp matmuls + 2 layer norms = 9 params
+        // × 24 layers, plus shared token embed + final norm (PE is a constant).
         assert!(
-            g.nodes().len() > 24 * 10,
-            "encoder graph should have ≥ ~240 parameter nodes plus ops, got {} nodes",
+            g.nodes().len() > 24 * 9,
+            "encoder graph should have ≥ ~218 parameter nodes plus ops, got {} nodes",
             g.nodes().len()
         );
     }

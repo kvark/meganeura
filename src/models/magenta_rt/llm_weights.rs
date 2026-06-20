@@ -16,12 +16,12 @@
 //! the `[heads*buckets]` table the attention kernels index as
 //! `table[head*buckets + bucket]`. So every parameter is a flat copy.
 //!
-//! **Encoder gap.** The checkpoint has no encoder positional tensor (neither a
-//! learned PE nor a rel-pos table), so the encoder's `encoder.pos_embed` and
-//! per-layer `attn.rel_pos_bias_table` graph params are intentionally *not*
-//! mapped — they are left unset and reported as skipped. Resolving the encoder
-//! position scheme (see `LLM_FINDINGS.md`) is required before an encoder forward
-//! on real weights; the decoder + embeddings + heads load fully.
+//! **Encoder.** Now fully loadable: [`super::llm::build_encoder_graph`] takes its
+//! position from a *computed* sinusoidal PE (no checkpoint tensor) and uses
+//! plain bidirectional self-attention (no rel-pos), so every encoder graph param
+//! maps to a checkpoint tensor. The remaining caveat is the position *scheme*
+//! itself (sinusoidal PE, and whether a `Scale(sqrt(embed))` is applied) — that
+//! is unverified against real weights; see `LLM_FINDINGS.md`.
 
 use super::llm::LlmConfig;
 
