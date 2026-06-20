@@ -30,6 +30,7 @@ pub mod musiccoca;
 pub mod sampling;
 pub mod spectrostream;
 pub mod spectrostream_encoder;
+pub mod tokenizer;
 
 /// Top-level configuration mirroring `system.MagentaRTConfiguration` in
 /// the official magenta_rt python library.

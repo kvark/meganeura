@@ -106,8 +106,14 @@ checks. For the full weight dump: `python3 tools/magenta_rt/dump_llm.py` (after
     (greedy logits vs the Colab reference) still needs JAX + reference outputs.
 
 ### Phase 3 — end-to-end wiring
-3.1 Tokenizer + MusicCoCa text→6 style tokens (SentencePiece via the `tokenizers`
-    crate; `musiccoca_vocab.model`).
+3.1 Tokenizer + MusicCoCa text→6 style tokens. ✅ **Tokenizer done** —
+    `tokenizer::SpmModel` is a pure-Rust SentencePiece Unigram tokenizer
+    (`.model` protobuf parse + whitespace normalization + Viterbi + unknown-run
+    merging), verified bit-exact vs the reference `sentencepiece` library
+    (`tests/spm_tokenizer.rs`). `musiccoca_token_ids` applies MusicCoCa's recipe
+    (lowercase, truncate 127, prepend SOS=1). Remaining: feed the ids through the
+    (existing) MusicCoCa text encoder + RVQ quantizer → 6 style tokens — gated on
+    the MusicCoCa weights + the real `spm.model` (not in the public HF release).
 3.2 SpectroStream **encoder** (audio context → 4-RVQ tokens). ⚙️ **STFT
     front-end done** — `spectrostream_encoder::stft_features` (audio → `[frames,
     480, 4]` features, 960/480/960 Hann, keep_dc, `[re,im]`-per-channel layout),
