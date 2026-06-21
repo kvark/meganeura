@@ -13,15 +13,41 @@ Embed dim 768, heads 12 × head_dim 64, MLP dim 2048.
 
 Status: encoder forward pass only. Decoder (temporal + depth + sampling)
 is TODO.
+
+This doubles as the **real-weight numeric reference** for the Rust encoder:
+run with `MEGANEURA_LLM_WEIGHTS=<weights_llm_base.safetensors>` (and optionally
+`MEGANEURA_ENC_REF_OUT=<out.bin>` to write the encoder output as raw little-
+endian f32 for `tests/llm_encoder_real_weight.rs`). The deterministic input is
+`ids[i] = (i*101 + 7) % vocab`, seq from `MEGANEURA_ENC_REF_SEQ` (default 32) —
+the Rust test uses the identical formula. A match cross-validates the weight
+mapping (flat copy, no transpose) and the encoder op composition at real weight
+magnitudes; it does **not** settle the position *scheme* (both sides add the
+same sinusoidal PE — see LLM_FINDINGS.md).
 """
 import json
+import os
 import struct
 import re
 from pathlib import Path
 import numpy as np
 
 
-DUMP = Path('/x/Code/meganeura/magenta_rt_codec_dump')
+# Weights path: env override, else the conventional dump location.
+DUMP = Path(
+    os.environ.get(
+        "MEGANEURA_LLM_WEIGHTS",
+        str(Path(__file__).resolve().parents[2] / "magenta_rt_codec_dump" / "weights_llm_base.safetensors"),
+    )
+)
+
+# Deterministic reference input — must match tests/llm_encoder_real_weight.rs.
+REF_SEQ = int(os.environ.get("MEGANEURA_ENC_REF_SEQ", "32"))
+REF_VOCAB = 29824
+
+
+def ref_input_ids(seq, vocab=REF_VOCAB):
+    """The deterministic encoder input shared with the Rust gate."""
+    return np.array([(i * 101 + 7) % vocab for i in range(seq)], dtype=np.int32)
 
 
 def load_safetensors(p):
@@ -140,23 +166,24 @@ def encoder_forward(ids, weights, num_layers=12, embed_dim=768, num_heads=12,
 
 
 def main():
-    print("Loading LLM weights...")
-    weights = load_safetensors(DUMP / 'weights_llm_base.safetensors')
+    print(f"Loading LLM weights from {DUMP} ...")
+    weights = load_safetensors(DUMP)
     print(f"  {len(weights)} tensors")
 
-    # Quick test: encoder with a dummy 16-token input.
-    # The LLM vocab is unified across SpectroStream codec tokens + MusicCoCa
-    # style tokens, so any int in [0, 29824) is a valid token id.
-    ids = np.zeros((1, 16), dtype=np.int32)
-    ids[0, 0] = 1   # SOS-like
-    ids[0, 1] = 12345  # arbitrary
-    ids[0, 15] = 7    # arbitrary
-    print(f"\nTest input: ids={ids[0].tolist()}")
+    # Deterministic reference input (matches the Rust gate). The LLM vocab is
+    # unified across SpectroStream codec tokens + MusicCoCa style tokens, so any
+    # int in [0, 29824) is a valid token id.
+    ids = ref_input_ids(REF_SEQ)[None]  # [1, seq]
+    print(f"\nReference input: seq={REF_SEQ}, ids[:8]={ids[0, :8].tolist()}")
 
-    out = encoder_forward(ids, weights)
+    out = encoder_forward(ids, weights)  # [1, seq, embed]
     print(f"Encoder output: shape={out.shape}  range=[{out.min():.4f}, {out.max():.4f}]")
     print(f"  rms={np.sqrt((out ** 2).mean()):.4f}")
-    print("\nTODO: decoder (temporal + depth) + autoregressive sampling")
+
+    ref_out = os.environ.get("MEGANEURA_ENC_REF_OUT")
+    if ref_out:
+        out[0].astype("<f4").tofile(ref_out)
+        print(f"Wrote encoder reference ({out[0].size} f32) to {ref_out}")
 
 
 if __name__ == '__main__':

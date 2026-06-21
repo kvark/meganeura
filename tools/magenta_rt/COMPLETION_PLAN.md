@@ -20,7 +20,7 @@ text prompt ─► MusicCoCa ─► 6 style tokens ┐
 |-----------|---------------|---------------|----------|------|
 | **MusicCoCa** text encoder | ✅ `build_text_encoder_graph` | ✅ `load_text_encoder_weights` | ✅ GPU-vs-CPU (random weights, 1e-3) | real-weight check vs the 26 testdata embeddings |
 | **SpectroStream** decoder body | ✅ `build_decoder_graph` | ✅ `load_decoder_weights` | ⚠️ only structurally; demo runs tokens→WAV | 3 unverified "free reinterpret" claims; RADV NaN bug |
-| **LLM** encoder | ✅ `build_encoder_graph` (sinusoidal PE, bidirectional, no rel-pos) | ✅ `llm_weights` (fully loadable) | ✅ GPU-vs-CPU op-composition (lavapipe, 1e-6) | `Scale(√d)?` + real-weight numeric check unverified |
+| **LLM** encoder | ✅ `build_encoder_graph` (sinusoidal PE, bidirectional, no rel-pos) | ✅ `llm_weights` (fully loadable, 0 skips) | ✅ GPU-vs-CPU op-composition (1e-6) **+ real-weight numeric gate vs NumPy ref (4.2e-6, lavapipe)** | PE *scheme* (sinusoidal-vs-none) + `Scale(√d)?` still unsettleable from weights alone |
 | **LLM** temporal decoder | ✅ `build_temporal_decoder` + `build_decoder_layer` | ✅ `llm_weights` (shared) | ✅ GPU-vs-CPU on lavapipe (random weights, 1e-3) | — |
 | **LLM** depth decoder | ✅ `build_depth_decoder_layer` + `build_depth_decoder_stack` | ✅ `llm_weights` (shared) | ✅ GPU-vs-CPU on lavapipe (random weights, 1e-3) | — |
 | **LLM** full decoder | ✅ `build_decoder` (temporal→depth) | ✅ `llm_weights::load_llm_weights` (real 1.3 GB dump loads, 0 skips) | ✅ map = 100% of checkpoint (`llm_weight_map`); GPU-vs-CPU random-weight; **real-weight forward runs finite on lavapipe** | real-weight numeric gate needs JAX ref |
@@ -87,12 +87,16 @@ MusicCoCa + SpectroStream-encoder weights (their dumpers exist).
     the decoder_0→1 batch-fold pixel-shuffle, the final batch/channel merge, and
     the `base_conv_last` W-padding (code keeps SAME; `ARCH_FINDINGS.md` expects
     VALID). Use the `DecoderStage` bisection to localise the first divergent block.
-1.3 **LLM encoder**: settle the position-encoding discrepancy from the manifest
-    (is there a `relpos_bias`/`relative_attention` tensor and/or a
-    `position_embed`?). Standard T5 1.1 ⇒ rel-pos bias, no absolute PE; if
-    confirmed, drop the `encoder.pos_embed` add from `build_encoder_graph`. Then
-    a real-weight encoder check against a reference forward (numpy ref exists for
-    the encoder; fix its rel-pos/PE assumptions first).
+1.3 ⚙️ **LLM encoder** — real-weight numeric gate **done**, PE scheme still open.
+    The manifest question is settled: the encoder has **no** position tensor at
+    all (no relpos, no `pos_embed`; only the two *decoder* relpos tables exist).
+    `tests/llm_encoder_real_weight.rs` loads the real weights and matches the
+    NumPy reference (`llm_numpy_ref.py`, same weights) to **4.2e-6** on lavapipe —
+    cross-validating the no-transpose mapping + op composition. **Still open** (not
+    settleable from weights; needs the v1 source or reference outputs): whether the
+    encoder uses the computed sinusoidal PE (current choice) or no position, and
+    the `Scale(√d)` embedder detail — both are shared assumptions between the Rust
+    encoder and the numpy ref, so the gate can't distinguish them.
 
 ### Phase 2 — finish the LLM decoder
 2.1 ✅ **DONE** — depth-module topology resolved (manifest + `depthformer.py`):
