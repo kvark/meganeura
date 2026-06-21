@@ -87,13 +87,17 @@ fn mapping_matches_base_checkpoint_manifest() {
     );
 }
 
-/// Real-weight load smoke test — runs only when `MEGANEURA_LLM_WEIGHTS` points
-/// at a `weights_llm_base.safetensors` dumped by `tools/magenta_rt/dump_llm.py`
-/// (the ~1.3 GB checkpoint isn't downloaded by the CI harness). Builds a full
-/// parallel decoder, loads the real weights, and asserts nothing was skipped
-/// (the decoder graph's params are 100% covered by the checkpoint).
+/// Real-weight load + forward smoke test — runs only when `MEGANEURA_LLM_WEIGHTS`
+/// points at a `weights_llm_base.safetensors` dumped by
+/// `tools/magenta_rt/dump_llm.py` (the ~1.3 GB checkpoint isn't downloaded by the
+/// CI harness). Builds a full parallel decoder, loads the real weights, asserts
+/// nothing was skipped (the decoder graph's params are 100% covered by the
+/// checkpoint), then runs a forward pass on the GPU and checks the logits are
+/// finite and in range. This is a *smoke* test (load + run + sanity), **not** a
+/// numeric correctness gate — that needs a trusted reference forward to diff
+/// against (see `LLM_FINDINGS.md`).
 #[test]
-#[ignore = "requires MEGANEURA_LLM_WEIGHTS=<weights_llm_base.safetensors>"]
+#[ignore = "requires MEGANEURA_LLM_WEIGHTS=<weights_llm_base.safetensors> + a Vulkan device"]
 fn load_real_weights_into_decoder() {
     use meganeura::data::safetensors::SafeTensorsModel;
     use meganeura::models::magenta_rt::llm::build_decoder;
@@ -105,8 +109,12 @@ fn load_real_weights_into_decoder() {
     let cfg = LlmConfig::base();
     let embed = cfg.embed_dim as usize;
     let enc_seq = cfg.encoder_seq_len as usize;
+    let vocab = cfg.vocab_size as usize;
     let levels = cfg.num_levels as usize;
-    let frames = cfg.decoder_seq_len as usize / levels;
+    // Smoke test over a short generation window (keeps the temporal self-attention
+    // small); the real decode runs 50 frames. Any positive frame count exercises
+    // the full param set (temporal + depth + shared head).
+    let frames = 4usize;
 
     let mut g = Graph::new();
     let tok = g.input_u32("dec_tokens", &[(frames + 1) * levels]);
@@ -120,5 +128,40 @@ fn load_real_weights_into_decoder() {
         skipped.is_empty(),
         "decoder graph should be fully covered, skipped: {skipped:?}"
     );
-    eprintln!("loaded all decoder weights from {path}");
+    eprintln!("loaded all {} decoder weights from {path}", {
+        use meganeura::models::magenta_rt::llm_weights::checkpoint_param_map;
+        checkpoint_param_map(&cfg).len()
+    });
+
+    // Forward pass with a benign input: SOS-padded codec tokens + a zero encoder
+    // output. The token ids must lie in the codec band so the embedding lookup is
+    // valid; the SOS/pad token id is the codec offset 0 row.
+    let sos = 0u32;
+    let tokens: Vec<u32> = (0..(frames + 1) * levels)
+        .map(|i| (sos as usize + i % 16) as u32)
+        .collect();
+    s.set_input_u32("dec_tokens", &tokens);
+    s.set_input("enc_out", &vec![0.0_f32; enc_seq * embed]);
+    s.step();
+    s.wait();
+    let out = s.read_output(frames * levels * vocab);
+
+    assert_eq!(out.len(), frames * levels * vocab);
+    let mut max_abs = 0.0_f32;
+    for (i, &v) in out.iter().enumerate() {
+        assert!(v.is_finite(), "non-finite logit at {i}: {v}");
+        max_abs = max_abs.max(v.abs());
+    }
+    // Report the argmax of the first level (a plausibility check, not a gate).
+    let row0 = &out[0..vocab];
+    let arg0 = row0
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .map(|(i, _)| i)
+        .unwrap();
+    eprintln!(
+        "real-weight forward OK: {} finite logits, max|logit|={max_abs:.2e}, frame0/level0 argmax token={arg0}",
+        out.len()
+    );
 }

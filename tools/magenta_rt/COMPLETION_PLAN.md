@@ -23,7 +23,7 @@ text prompt ─► MusicCoCa ─► 6 style tokens ┐
 | **LLM** encoder | ✅ `build_encoder_graph` (sinusoidal PE, bidirectional, no rel-pos) | ✅ `llm_weights` (fully loadable) | ✅ GPU-vs-CPU op-composition (lavapipe, 1e-6) | `Scale(√d)?` + real-weight numeric check unverified |
 | **LLM** temporal decoder | ✅ `build_temporal_decoder` + `build_decoder_layer` | ✅ `llm_weights` (shared) | ✅ GPU-vs-CPU on lavapipe (random weights, 1e-3) | — |
 | **LLM** depth decoder | ✅ `build_depth_decoder_layer` + `build_depth_decoder_stack` | ✅ `llm_weights` (shared) | ✅ GPU-vs-CPU on lavapipe (random weights, 1e-3) | — |
-| **LLM** full decoder | ✅ `build_decoder` (temporal→depth) | ✅ `llm_weights::load_llm_weights` | ✅ map = 100% of checkpoint (`llm_weight_map`); GPU-vs-CPU random-weight | real-weight numeric gate needs JAX ref |
+| **LLM** full decoder | ✅ `build_decoder` (temporal→depth) | ✅ `llm_weights::load_llm_weights` (real 1.3 GB dump loads, 0 skips) | ✅ map = 100% of checkpoint (`llm_weight_map`); GPU-vs-CPU random-weight; **real-weight forward runs finite on lavapipe** | real-weight numeric gate needs JAX ref |
 | **LLM** generation | ✅ `decode` (CFG + temperature/top-k) / `decode_greedy`: temporal KV-cache step + per-frame depth + sampler | — | ✅ greedy + CFG match parallel argmax; top-k within parallel top-k; reproducible (lavapipe) | depth recomputed per level (KV-cache later); encoder still needed for real enc output |
 
 The verification pattern that works without real weights: build the graph with
@@ -39,10 +39,18 @@ the real checkpoints — that needs the weight dumps.
 > head_dim=64 (`tests/{full,cached}_attention_probe.rs`). Keep new attention
 > verification at head_dim=64. See `LLM_FINDINGS.md`.
 
-## The blocker: weight/manifest access — LIFTED
+## The blocker: weight/manifest access — LIFTED (LLM weights now dumped)
 
-`huggingface.co` egress now works (verified `200` from the model API). The LLM
-**architecture is fully settled without any weight download**:
+`huggingface.co` egress works — and not just the metadata API: the **file CDN**
+serves real checkpoint bytes (verified `200` on a `target.*` `.zarray`+chunk
+through CloudFront), the model is **ungated** (`gated: false`), and PyPI egress
+installs `huggingface_hub`/`safetensors`. So the LLM weight dump runs here:
+`python3 tools/magenta_rt/dump_llm.py` pulled the 1.3 GB `target.*` checkpoint
+and wrote `weights_llm_base.safetensors` (430 tensors; emitted manifest ==
+committed manifest). Loading all 430 into a `build_decoder` session and running a
+forward on lavapipe gives 1,908,736 **finite** logits (`load_real_weights_into_decoder`).
+
+The LLM **architecture was already settled without any weight download**:
 
 - `tools/magenta_rt/fetch_llm_manifest.py` lists all 430 `target.*` tensors of
   `llm_base_x4286_c1860k` with shapes → committed `llm_base_manifest.json`.
@@ -52,17 +60,21 @@ the real checkpoints — that needs the weight dumps.
 
 GPU-vs-CPU tests run locally on Mesa **lavapipe** (software Vulkan):
 `apt-get install -y mesa-vulkan-drivers`, then
-`VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json cargo test`. What still
-needs the **weights** (not architecture, not a HW GPU): real-weight correctness
-checks. For the full weight dump: `python3 tools/magenta_rt/dump_llm.py` (after
-`cargo clean` for the ~3 GB), plus the MusicCoCa/SpectroStream dumpers.
+`VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json cargo test`. What the dump
+does **not** give you is a numeric *correctness* gate — that needs a trusted
+reference forward (JAX/T5X) to diff the real-weight logits against; the dump
+provides the weights, not the expected activations. Still to dump: the
+MusicCoCa + SpectroStream-encoder weights (their dumpers exist).
 
 ## Plan
 
 ### Phase 0 — get the data in (unblocks everything below)
 0.1 ✅ **DONE** — HF egress works; `llm_base_manifest.json` committed (430 tensors).
-0.2 Dump LLM weights (`dump_llm.py`), confirm MusicCoCa + SpectroStream dumps are
-    present (`magenta_rt_codec_dump/`). *Needs ~3 GB + a Vulkan device to verify.*
+0.2 ✅ **LLM weights dumped + loaded + forward-run.** `dump_llm.py` → 1.3 GB
+    `weights_llm_base.safetensors` (430 tensors; emitted manifest == committed).
+    `load_real_weights_into_decoder` loads all 430 and runs a forward on lavapipe
+    (1,908,736 finite logits) — a load+run smoke test, not a numeric gate (2.5).
+    Still TODO: the MusicCoCa + SpectroStream-encoder weight dumps.
 
 ### Phase 1 — verify what's already built against real weights
 1.1 **MusicCoCa**: load `weights_musiccoca.safetensors`, run the encoder on the 26
@@ -102,8 +114,11 @@ checks. For the full weight dump: `python3 tools/magenta_rt/dump_llm.py` (after
 2.5 ✅ **LLM weight loader** — `llm_weights::{checkpoint_param_map,
     load_llm_weights}` maps `target.*` → graph params (flat copy, no transpose);
     `tests/llm_weight_map.rs` verifies 100% checkpoint coverage vs the manifest;
-    `dump_llm.py` writes the compatible safetensors. Real-weight numeric gate
-    (greedy logits vs the Colab reference) still needs JAX + reference outputs.
+    `dump_llm.py` writes the compatible safetensors. The real 1.3 GB dump now
+    **loads with 0 skips and runs a finite forward on lavapipe**
+    (`load_real_weights_into_decoder`, `#[ignore]`d). Real-weight *numeric* gate
+    (greedy logits vs a Colab/JAX reference) still needs the reference outputs —
+    the loader + a runnable real-weight session are in place for it.
 
 ### Phase 3 — end-to-end wiring
 3.1 Tokenizer + MusicCoCa text→6 style tokens. ✅ **Tokenizer done** —
