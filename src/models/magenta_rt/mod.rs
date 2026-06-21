@@ -24,6 +24,7 @@
 //! companion `manifest.json`. See [`llm::LlmConfig`] for the parameter naming
 //! convention.
 
+pub mod driver;
 pub mod llm;
 pub mod llm_weights;
 pub mod musiccoca;

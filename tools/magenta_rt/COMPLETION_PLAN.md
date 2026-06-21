@@ -124,6 +124,19 @@ checks. For the full weight dump: `python3 tools/magenta_rt/dump_llm.py` (after
     `semicausal` alignment against real audio.
 3.3 Driver: text+context → LLM generate 800 tokens → SpectroStream decode → 2 s
     audio, with the 40 ms crossfade between chunks (`MagentaRtConfig`).
+    ✅ **Deterministic glue done** — `magenta_rt::driver`:
+    - `assemble_encoder_input` packs 250 context frames × 4 codec RVQ + 6 style
+      RVQ into the unified vocab (per-level offsets, context-then-style order,
+      masked-style negative for CFG); unit-tested against the `MagentaRtConfig`
+      layout (`driver::tests`).
+    - `crossfade_ramp` / `crossfade_chunks` — 40 ms (1920-sample) overlap-add,
+      linear (DC-preserving) and eqpower (power-preserving); verified by
+      constant-reconstruction, power, and seam-length tests.
+    - `generate_token_grid` — the weight-independent LLM orchestration (encoder
+      pos+neg → CFG decode), **GPU-verified on lavapipe**
+      (`tests/llm_end_to_end_driver.rs`): CFG(w=1) ≡ greedy(positive).
+    Remaining (weight-gated): feed real SpectroStream codec tokens + MusicCoCa
+    style tokens in, and run the SpectroStream decoder on the 800-token grid.
 
 ### Phase 4 — correctness & performance
 4.1 **RADV NaN bug** (`tools/blade_radv_repro/`): a cross-pass cache-visibility

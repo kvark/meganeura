@@ -162,14 +162,14 @@ impl SpmModel {
         }
         let max_piece_chars = pieces
             .iter()
-            .map(|(p, _)| p.chars().count())
+            .map(|p| p.0.chars().count())
             .max()
             .unwrap_or(1);
-        let min_score = pieces.iter().map(|(_, s)| *s).fold(f32::INFINITY, f32::min);
+        let min_score = pieces.iter().map(|p| p.1).fold(f32::INFINITY, f32::min);
         let lookup = pieces
             .iter()
             .enumerate()
-            .map(|(i, (p, s))| (p.clone(), (i as u32, *s)))
+            .map(|(i, p)| (p.0.clone(), (i as u32, p.1)))
             .collect();
 
         Ok(Self {
