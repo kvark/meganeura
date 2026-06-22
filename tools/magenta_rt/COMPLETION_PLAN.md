@@ -124,16 +124,19 @@ MusicCoCa + SpectroStream-encoder weights (their dumpers exist).
     (`load_real_weights_into_decoder`, `#[ignore]`d). Real-weight *numeric* gate
     (greedy logits vs a Colab/JAX reference) still needs the reference outputs —
     the loader + a runnable real-weight session are in place for it.
-2.6 ⚠️ **OPEN: decoder absolute PE.** The recovered v1 gin wires `FixedEmbed`
-    (sinusoidal) onto the decoder too, and `DepthformerDecoder` inherits the base
-    `t5_architecture.Decoder` embed path, so the model adds absolute PE to the
-    per-level token embeddings (over the `T*Q` grid) *before* the level mean-pool
-    — meaning temporal frame `t` gains `mean_q PE[t*Q+q]` and the depth level
-    prefix embeddings carry `PE[t*Q+q]`. `build_decoder` /
-    `build_temporal_decode_step` add no absolute PE today. Likely a real bug;
-    fixing it needs the decode-time position semantics + a decoder reference
-    (extend `llm_numpy_ref.py` to the decoder using the v1 code, or run t5x) to
-    verify. See `LLM_FINDINGS.md`.
+2.6 ✅ **Decoder absolute PE — RESOLVED + real-weight gated.** The recovered v1
+    gin wires `FixedEmbed` (sinusoidal) onto the decoder too, and
+    `DepthformerDecoder` inherits the base `t5_architecture.Decoder` embed path —
+    so the model adds absolute PE to the per-level token embeddings over the `T*Q`
+    grid before the level mean-pool. `build_decoder_faithful` (new) reproduces
+    this exactly (flat `[T*Q]` input, FixedEmbed PE, the edge-pad/mean +
+    edge-pad/concat helpers). `tests/llm_decoder_real_weight.rs` gates it vs the
+    faithful NumPy decoder reference on the real weights: **1.1e-4** max abs diff,
+    0/48 argmax mismatches — the decoder's **first real-weight numeric gate**
+    (also the first check of nonzero T5 rel-pos bucketing + cross-attn at real
+    magnitudes). The PE matters: toggling it flips 7/48 greedy tokens.
+    **Remaining:** migrate the generation path (`build_decoder` + the incremental
+    `build_temporal_decode_step` KV-cache loop) onto this verified behavior.
 
 ### Phase 3 — end-to-end wiring
 3.1 Tokenizer + MusicCoCa text→6 style tokens. ✅ **Tokenizer done** —

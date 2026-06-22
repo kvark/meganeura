@@ -102,19 +102,25 @@ The model is a **standard flaxformer T5 1.1 encoder-decoder** wired by
   because both sides shared the bug. The recovered gin/flaxformer source caught
   it.*
 
-- ⚠️ **OPEN — temporal/depth decoder is missing the FixedEmbed PE.** `posembed.gin`
+- ✅ **Decoder FixedEmbed PE — RESOLVED + real-weight gated.** `posembed.gin`
   wires `FixedEmbed` onto the **decoder** too, and `DepthformerDecoder` does
-  **not** override the base `t5_architecture.Decoder` embed path (confirmed: it
-  has `setup`/`_setup_layer_sequence` but no `__call__`), so the base Decoder
-  adds the sinusoidal PE to the **per-level** token embeddings over the `T*Q`
-  grid *before* `DepthformerDecoderStack` mean-pools the levels into the temporal
-  input — i.e. temporal frame `t` effectively gains `mean_q PE[t*Q + q]`, and the
-  depth-module level prefix embeddings (`embedded[:, 1:, :Q-1]`) carry their
-  `PE[t*Q+q]` too. Our `build_decoder` / `build_temporal_decode_step` add **no**
-  absolute PE (they rely on the rel-pos bias alone). This is a likely real
-  discrepancy; it needs the decode-time position semantics worked out and a
-  decoder reference (extend `llm_numpy_ref.py` to the decoder using the v1 code,
-  or run t5x) to verify a fix. Not yet fixed.
+  **not** override the base `t5_architecture.Decoder` embed path (it has
+  `setup`/`_setup_layer_sequence` but no `__call__`), so the base Decoder adds the
+  sinusoidal PE to the **per-level** token embeddings over the `T*Q` grid *before*
+  `DepthformerDecoderStack` mean-pools the levels — temporal frame `t` gains
+  `mean_q PE[…]` and the depth level-prefix embeddings carry their `PE` too.
+  - `build_decoder_faithful` (new) reproduces the real path exactly: flat `[T*Q]`
+    `decoder_input_tokens`, FixedEmbed PE added, then the `_to_temporal_embedded_inputs`
+    edge-pad/mean and `_to_depth_embedded_inputs` edge-pad/concat helpers.
+  - **Gate:** `tests/llm_decoder_real_weight.rs` vs the faithful NumPy decoder
+    reference (`llm_numpy_ref.py::decoder_forward`) on the real weights —
+    **1.1e-4** max abs diff, 0/48 greedy-argmax mismatches (3 frames × 16 levels).
+    First real-weight check of the decoder: PE + nonzero T5 rel-pos bucketing
+    (temporal 128 / depth 16) + cross-attn to a real encoder + the full
+    temporal→depth→head wiring. The PE is material (toggling it flips 7/48 tokens).
+  - **Remaining:** the older `build_decoder` (SOS-frame contract, no PE) and the
+    generation path (`build_temporal_decode_step` KV-cache loop + `decode`) still
+    lack the PE — migrate them onto `build_decoder_faithful`'s verified behavior.
 
 ## RESOLVED: logits are NOT weight-tied
 
