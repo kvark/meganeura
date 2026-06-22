@@ -118,9 +118,23 @@ The model is a **standard flaxformer T5 1.1 encoder-decoder** wired by
     First real-weight check of the decoder: PE + nonzero T5 rel-pos bucketing
     (temporal 128 / depth 16) + cross-attn to a real encoder + the full
     temporal→depth→head wiring. The PE is material (toggling it flips 7/48 tokens).
-  - **Remaining:** the older `build_decoder` (SOS-frame contract, no PE) and the
-    generation path (`build_temporal_decode_step` KV-cache loop + `decode`) still
-    lack the PE — migrate them onto `build_decoder_faithful`'s verified behavior.
+  - ✅ **Generation path migrated.** The decode-mode semantics (from the v1
+    `PeriodicCallableTemporalDecoder`): the temporal input at frame `t` is the
+    mean over a sliding window of the last `Q` token-embeddings (each with its
+    FixedEmbed PE), and depth level `j` carries `PE[t*Q+j]`. Confirmed
+    numerically that the existing token feeding is already correct (the
+    `shift_right` maps a frame-aligned previous frame onto the shifted window) —
+    only the PE was missing. `build_temporal_decode_step` now takes a `step_pe`
+    window input; `decode()` feeds the temporal-window PE (positions
+    `(t-1)*Q+1+level`, or `PE[0]` for frame 0) and the depth-prefix PE
+    (`PE[t*Q+j]`). `tests/llm_decode_loop.rs` + `llm_decode_cfg.rs` now cross-check
+    the incremental decode against `build_decoder_faithful` (PE, `shift_right`
+    alignment) and pass — so the generation path reproduces the faithful,
+    real-weight-gated decoder.
+  - **Remaining (cleanup):** the older `build_decoder` (SOS-frame contract, no
+    PE) is retained only for its random-weight op-composition test; the generation
+    path no longer depends on it. It can be removed or re-pointed at
+    `build_decoder_faithful` in a later pass.
 
 ## RESOLVED: logits are NOT weight-tied
 

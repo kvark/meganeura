@@ -135,8 +135,13 @@ MusicCoCa + SpectroStream-encoder weights (their dumpers exist).
     0/48 argmax mismatches — the decoder's **first real-weight numeric gate**
     (also the first check of nonzero T5 rel-pos bucketing + cross-attn at real
     magnitudes). The PE matters: toggling it flips 7/48 greedy tokens.
-    **Remaining:** migrate the generation path (`build_decoder` + the incremental
-    `build_temporal_decode_step` KV-cache loop) onto this verified behavior.
+    ✅ **Generation path migrated:** `build_temporal_decode_step` takes a `step_pe`
+    window input and `decode()` feeds the temporal/depth FixedEmbed PE;
+    `llm_decode_loop` + `llm_decode_cfg` cross-check the incremental decode against
+    `build_decoder_faithful` (shift_right alignment) and pass — so the KV-cache
+    generation path reproduces the faithful, real-weight-gated decoder.
+    **Cleanup left:** the old no-PE `build_decoder` is retained only for its
+    random-weight op-composition test.
 
 ### Phase 3 — end-to-end wiring
 3.1 Tokenizer + MusicCoCa text→6 style tokens. ✅ **Tokenizer done** —
