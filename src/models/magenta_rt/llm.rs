@@ -169,17 +169,30 @@ pub fn build_encoder_layer(g: &mut Graph, cfg: &LlmConfig, x: NodeId, prefix: &s
     g.add(x, ffn_out)
 }
 
-/// Fixed sinusoidal absolute position embedding `[seq, embed]` (standard
-/// Transformer convention, `10000` timescale; matches `llm_numpy_ref.py`):
-/// `pe[p, 2i] = sin(p / 10000^(2i/embed))`, `pe[p, 2i+1] = cos(...)`.
+/// Fixed sinusoidal absolute position embedding `[seq, embed]`, matching
+/// flaxformer's `embedding.FixedEmbed` with `initializers.sinusoidal()`
+/// (`min_scale=1.0`, `max_scale=10000.0`) — the position embedder the v1 model's
+/// gin config (`mrt_merged_base.gin` → `posembed.gin`) wires onto the encoder.
+///
+/// **Split-half layout** (NOT interleaved): the first `embed/2` columns are
+/// sines and the next `embed/2` are cosines, sharing
+/// `div_term[i] = exp(i * -ln(10000) / (embed/2 - 1))`:
+/// `pe[p, i] = sin(p·div_term[i])`, `pe[p, embed/2 + i] = cos(p·div_term[i])`.
 fn sinusoidal_pos_embed(seq: usize, embed: usize) -> Vec<f32> {
+    let half = embed / 2;
     let mut pe = vec![0.0_f32; seq * embed];
+    // -ln(max_scale/min_scale) / (half - 1); guard the degenerate half<=1 case.
+    let scale_factor = if half > 1 {
+        -(10000.0_f64.ln()) / (half as f64 - 1.0)
+    } else {
+        0.0
+    };
     for p in 0..seq {
-        for i in 0..embed / 2 {
-            let inv_freq = 1.0_f64 / 10000.0_f64.powf(2.0 * i as f64 / embed as f64);
-            let angle = p as f64 * inv_freq;
-            pe[p * embed + 2 * i] = angle.sin() as f32;
-            pe[p * embed + 2 * i + 1] = angle.cos() as f32;
+        for i in 0..half {
+            let div_term = (i as f64 * scale_factor).exp();
+            let angle = p as f64 * div_term;
+            pe[p * embed + i] = angle.sin() as f32;
+            pe[p * embed + half + i] = angle.cos() as f32;
         }
     }
     pe

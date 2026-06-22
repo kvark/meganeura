@@ -84,16 +84,18 @@ def geglu(gate, up):
     return gelu_tanh(gate) * up
 
 
-def sinusoidal_pos_embed(seq_len, embed_dim):
-    """Fixed sinusoidal absolute position embedding, standard T5 convention.
-    Returns [seq_len, embed_dim] with interleaved sin/cos."""
-    pos = np.arange(seq_len)
-    inv_freq = 1.0 / np.power(10000.0, np.arange(0, embed_dim, 2) / embed_dim)
-    sin_pos = np.sin(pos[:, None] * inv_freq[None, :])
-    cos_pos = np.cos(pos[:, None] * inv_freq[None, :])
+def sinusoidal_pos_embed(seq_len, embed_dim, min_scale=1.0, max_scale=10000.0):
+    """Fixed sinusoidal absolute PE — a faithful port of flaxformer's
+    `components.initializers.sinusoidal()` (what `embedding.FixedEmbed` uses, and
+    what the v1 gin config wires onto the encoder). **Split-half** layout: first
+    `embed_dim//2` columns are sines, next `embed_dim//2` are cosines."""
     pe = np.zeros((seq_len, embed_dim), dtype=np.float32)
-    pe[:, 0::2] = sin_pos
-    pe[:, 1::2] = cos_pos
+    position = np.arange(0, seq_len)[:, None]
+    half = embed_dim // 2
+    scale_factor = -np.log(max_scale / min_scale) / (half - 1)
+    div_term = min_scale * np.exp(np.arange(0, half) * scale_factor)
+    pe[:, :half] = np.sin(position * div_term)
+    pe[:, half:2 * half] = np.cos(position * div_term)
     return pe
 
 

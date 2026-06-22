@@ -120,15 +120,23 @@ fn sdpa(q: &[f32], k: &[f32], v: &[f32], seq: usize, heads: usize, hd: usize) ->
     out
 }
 
-/// Same sinusoidal PE the encoder builds internally.
+/// Same sinusoidal PE the encoder builds internally (flaxformer `FixedEmbed` /
+/// `initializers.sinusoidal()`: split-half sin|cos, `div_term[i] = exp(i *
+/// -ln(10000)/(embed/2 - 1))`).
 fn sinusoidal(seq: usize, embed: usize) -> Vec<f32> {
+    let half = embed / 2;
     let mut pe = vec![0.0_f32; seq * embed];
+    let scale_factor = if half > 1 {
+        -(10000.0_f64.ln()) / (half as f64 - 1.0)
+    } else {
+        0.0
+    };
     for p in 0..seq {
-        for i in 0..embed / 2 {
-            let inv = 1.0_f64 / 10000.0_f64.powf(2.0 * i as f64 / embed as f64);
-            let a = p as f64 * inv;
-            pe[p * embed + 2 * i] = a.sin() as f32;
-            pe[p * embed + 2 * i + 1] = a.cos() as f32;
+        for i in 0..half {
+            let div_term = (i as f64 * scale_factor).exp();
+            let a = p as f64 * div_term;
+            pe[p * embed + i] = a.sin() as f32;
+            pe[p * embed + half + i] = a.cos() as f32;
         }
     }
     pe
