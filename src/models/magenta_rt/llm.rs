@@ -8,15 +8,16 @@
 //!   - 20 *temporal* layers operating over 50 frames (sees cross-attention to encoder).
 //!   - 4 *depth* layers operating over 16 RVQ levels per frame (no cross-attention).
 //!   - The decoded sequence is `50 frames × 16 RVQ = 800 tokens`.
-//! - **Embeddings**: shared token embedder (`vocab × embed`). The reference
-//!   `depthformer.py` encoder embedder applies `Scale(sqrt(embed))` and adds
-//!   **no** position embedding (the position-embed slot is a no-op by default),
-//!   and the `llm_base` checkpoint carries no learned PE tensor.
+//! - **Embeddings**: shared token embedder (`vocab × embed`), with **no**
+//!   `Scale(sqrt(embed))`. Absolute position = flaxformer `embedding.FixedEmbed`
+//!   (fixed sinusoidal, split-half), added to the token embeddings on **both**
+//!   the encoder and the decoder (`posembed.gin`), not a learned/stored tensor.
+//!   Settled from the recovered v1 gin config; see `tools/magenta_rt/LLM_FINDINGS.md`.
 //! - **Rel-pos bias**: learned T5 buckets, shared across each sub-decoder's
 //!   layers — `temporal_decoder.relpos_bias` `[heads, 128]` and
 //!   `depth_decoder.relpos_bias_depth` `[heads, 16]`. The **encoder** has no
-//!   rel-pos tensor in the checkpoint (open question — see
-//!   `tools/magenta_rt/LLM_FINDINGS.md`). Decoder self-attn is causal.
+//!   rel-pos (`SHARED_RELATIVE_POSITION_BIAS_FACTORY = None`). Decoder self-attn
+//!   is causal.
 //! - **Logits**: a dedicated `decoder.logits_dense.kernel` `[embed, vocab]`
 //!   (NOT weight-tied to the token embedder), applied after the shared
 //!   `decoder_norm` to the depth-decoder output.
@@ -834,8 +835,14 @@ pub fn build_temporal_decode_step(
     let mlp_dim = cfg.mlp_dim as usize;
 
     // Mean-pool this frame's level embeddings → the temporal input [1, embed].
+    // `step_pe [num_levels, embed]` is the FixedEmbed absolute PE for this
+    // frame's sliding window (host-supplied; positions `(t-1)*Q+1+level`, or all
+    // `PE[0]` for frame 0), added before the mean-pool so the incremental decode
+    // matches the parallel `build_decoder_faithful`. Pass zeros to disable PE.
     let table = g.parameter("shared_token_embedder", &[cfg.vocab_size as usize, embed]);
     let embedded = g.embedding(step_tokens, table);
+    let step_pe = g.input("step_pe", &[cfg.num_levels as usize, embed]);
+    let embedded = g.add(embedded, step_pe);
     let mut x = build_level_mean_pool(g, cfg, embedded, 1);
 
     // Shared temporal rel-pos table (same as the parallel path), applied inside
@@ -951,9 +958,17 @@ impl DecodeOptions {
 }
 
 /// Run one incremental temporal decode step → the frame's temporal state `[embed]`.
-fn temporal_step(s: &mut Session, prev_frame: &[u32], t: usize, embed: usize) -> Vec<f32> {
+/// `step_pe` is the `[num_levels, embed]` FixedEmbed PE window for this frame.
+fn temporal_step(
+    s: &mut Session,
+    prev_frame: &[u32],
+    step_pe: &[f32],
+    t: usize,
+    embed: usize,
+) -> Vec<f32> {
     s.set_input_u32("step_tokens", prev_frame);
     s.set_input_u32("kv_pos", &[t as u32]);
+    s.set_input("step_pe", step_pe);
     s.step();
     s.wait();
     s.read_output(embed)
@@ -1008,19 +1023,40 @@ pub fn decode(
         }
     };
 
+    // FixedEmbed absolute PE table for all decoder positions (positions
+    // `0..num_frames*num_levels`), matching `build_decoder_faithful`. The
+    // incremental decode adds it both to the temporal sliding window and to the
+    // depth level prefix (see `LLM_FINDINGS.md` §2.6 — verified against the
+    // faithful parallel decoder).
+    let pe = sinusoidal_pos_embed(opts.num_frames * levels, embed);
+    let pe_row = |pos: usize| &pe[pos * embed..(pos + 1) * embed];
+
     let mut out = Vec::with_capacity(opts.num_frames * levels);
     // The temporal input for frame 0 is the SOS frame; thereafter the previous
     // decoded frame.
     let mut prev_frame = vec![opts.sos_id; levels];
 
     for t in 0..opts.num_frames {
-        let pos_state = temporal_step(temporal_pos, &prev_frame, t, embed);
+        // Temporal sliding-window PE: frame 0 uses PE[0] for every level (the
+        // duplicated BOS), frame t≥1 uses positions (t-1)*Q+1+level.
+        let mut step_pe = vec![0.0_f32; levels * embed];
+        for (level, dst) in step_pe.chunks_mut(embed).enumerate() {
+            let pos = if t == 0 {
+                0
+            } else {
+                (t - 1) * levels + 1 + level
+            };
+            dst.copy_from_slice(pe_row(pos));
+        }
+
+        let pos_state = temporal_step(temporal_pos, &prev_frame, &step_pe, t, embed);
         let neg_state = temporal_neg
             .as_deref_mut()
-            .map(|s| temporal_step(s, &prev_frame, t, embed));
+            .map(|s| temporal_step(s, &prev_frame, &step_pe, t, embed));
 
-        // Depth input position 0 is the temporal state; position q+1 is the
-        // embedding of the just-decoded level q (shared across pos/neg).
+        // Depth input position 0 is the temporal state (no extra PE); position
+        // q+1 is the embedding of the just-decoded level q plus PE[t*Q + q+1]
+        // (shared across pos/neg).
         let mut depth_pos = vec![0.0_f32; levels * embed];
         depth_pos[0..embed].copy_from_slice(&pos_state);
         let mut depth_neg = neg_state.map(|st| {
@@ -1052,9 +1088,17 @@ pub fn decode(
             if q + 1 < levels {
                 let e = tok as usize * embed;
                 let slot = (q + 1) * embed..(q + 2) * embed;
-                depth_pos[slot.clone()].copy_from_slice(&embed_table[e..e + embed]);
+                // embed(decoded level q) + FixedEmbed PE at depth position
+                // t*Q + (q+1).
+                let dpe = pe_row(t * levels + q + 1);
+                let emb_pe: Vec<f32> = embed_table[e..e + embed]
+                    .iter()
+                    .zip(dpe)
+                    .map(|(a, b)| a + b)
+                    .collect();
+                depth_pos[slot.clone()].copy_from_slice(&emb_pe);
                 if let Some(dn) = depth_neg.as_mut() {
-                    dn[slot].copy_from_slice(&embed_table[e..e + embed]);
+                    dn[slot].copy_from_slice(&emb_pe);
                 }
             }
         }

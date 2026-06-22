@@ -369,10 +369,15 @@ fn incremental_temporal_decode_matches_cpu_reference() {
     s.set_input("enc_out", &enc);
 
     let mut incremental = vec![0.0_f32; FRAMES * embed];
+    // Zero PE here: this test isolates the KV-cache temporal mechanics against
+    // the (no-PE) parallel `build_temporal_decoder`. The PE-correct path is
+    // gated separately in `llm_decode_loop` vs `build_decoder_faithful`.
+    let zero_pe = vec![0.0_f32; levels * embed];
     for t in 0..FRAMES {
         let frame: Vec<u32> = tokens[t * levels..(t + 1) * levels].to_vec();
         s.set_input_u32("step_tokens", &frame);
         s.set_input_u32("kv_pos", &[t as u32]);
+        s.set_input("step_pe", &zero_pe);
         s.step();
         s.wait();
         let out = s.read_output(embed);

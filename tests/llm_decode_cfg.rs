@@ -10,8 +10,8 @@
 use std::collections::HashMap;
 
 use meganeura::models::magenta_rt::llm::{
-    build_decoder, build_depth_decoder_stack, build_temporal_decode_step, decode, DecodeOptions,
-    LlmConfig,
+    build_decoder_faithful, build_depth_decoder_stack, build_temporal_decode_step, decode,
+    DecodeOptions, LlmConfig,
 };
 use meganeura::models::magenta_rt::sampling::{argmax, cfg_combine};
 use meganeura::Graph;
@@ -201,12 +201,13 @@ fn build_depth(c: &LlmConfig, w: &HashMap<String, Vec<f32>>) -> meganeura::Sessi
     s
 }
 
-/// Teacher-force `padded` through `build_decoder` with encoder `enc`, returning
-/// per-position logits `[FRAMES*LEVELS, vocab]`.
+/// Teacher-force `dit` (the flat shift_right(decoded) grid `[FRAMES*LEVELS]`)
+/// through `build_decoder_faithful` with encoder `enc`, returning per-position
+/// logits `[FRAMES*LEVELS, vocab]`.
 fn parallel_logits(
     c: &LlmConfig,
     w: &HashMap<String, Vec<f32>>,
-    padded: &[u32],
+    dit: &[u32],
     enc: &[f32],
 ) -> Vec<f32> {
     let embed = c.embed_dim as usize;
@@ -214,17 +215,24 @@ fn parallel_logits(
     let levels = c.num_levels as usize;
     let vocab = c.vocab_size as usize;
     let mut g = Graph::new();
-    let tok = g.input_u32("dec_tokens", &[(FRAMES + 1) * levels]);
+    let tok = g.input_u32("dec_tokens", &[FRAMES * levels]);
     let enc_node = g.input("enc_out", &[enc_seq, embed]);
-    let logits = build_decoder(&mut g, c, tok, enc_node, FRAMES);
+    let logits = build_decoder_faithful(&mut g, c, tok, enc_node, FRAMES);
     g.set_outputs(vec![logits]);
     let mut s = meganeura::build_inference_session(&g);
     load(&mut s, w);
-    s.set_input_u32("dec_tokens", padded);
+    s.set_input_u32("dec_tokens", dit);
     s.set_input("enc_out", enc);
     s.step();
     s.wait();
     s.read_output(FRAMES * levels * vocab)
+}
+
+/// shift_right: prepend SOS, drop the last token → the decoder input grid.
+fn shift_right(tokens: &[u32], sos: u32) -> Vec<u32> {
+    let mut dit = vec![sos];
+    dit.extend_from_slice(&tokens[..tokens.len() - 1]);
+    dit
 }
 
 #[test]
@@ -258,10 +266,9 @@ fn cfg_greedy_matches_parallel_combined_argmax() {
     eprintln!("CFG-greedy grid: {tokens:?}");
 
     // Cross-check: two-pass parallel logits, combined the same way, argmax.
-    let mut padded = vec![SOS_ID; levels];
-    padded.extend_from_slice(&tokens);
-    let pos = parallel_logits(&c, &w, &padded, &enc_pos);
-    let neg = parallel_logits(&c, &w, &padded, &enc_neg);
+    let dit = shift_right(&tokens, SOS_ID);
+    let pos = parallel_logits(&c, &w, &dit, &enc_pos);
+    let neg = parallel_logits(&c, &w, &dit, &enc_neg);
     for p in 0..FRAMES * levels {
         let mut combined = vec![0.0_f32; vocab];
         cfg_combine(
@@ -318,10 +325,9 @@ fn cfg_topk_sampling_reproducible_and_within_topk() {
     eprintln!("CFG top-k grid: {t1:?}");
 
     // Every sampled token must be within the top-k of the parallel combined logits.
-    let mut padded = vec![SOS_ID; levels];
-    padded.extend_from_slice(&t1);
-    let pos = parallel_logits(&c, &w, &padded, &enc_pos);
-    let neg = parallel_logits(&c, &w, &padded, &enc_neg);
+    let dit = shift_right(&t1, SOS_ID);
+    let pos = parallel_logits(&c, &w, &dit, &enc_pos);
+    let neg = parallel_logits(&c, &w, &dit, &enc_neg);
     for p in 0..FRAMES * levels {
         let mut combined = vec![0.0_f32; vocab];
         cfg_combine(

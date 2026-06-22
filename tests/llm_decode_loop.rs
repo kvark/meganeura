@@ -12,7 +12,8 @@
 use std::collections::HashMap;
 
 use meganeura::models::magenta_rt::llm::{
-    build_decoder, build_depth_decoder_stack, build_temporal_decode_step, decode_greedy, LlmConfig,
+    build_decoder_faithful, build_depth_decoder_stack, build_temporal_decode_step, decode_greedy,
+    LlmConfig,
 };
 use meganeura::models::magenta_rt::sampling::argmax;
 use meganeura::Graph;
@@ -192,17 +193,22 @@ fn greedy_decode_consistent_with_parallel() {
     assert!(tokens.iter().all(|&t| (t as usize) < vocab));
     eprintln!("decoded grid: {tokens:?}");
 
-    // --- Parallel cross-check: teacher-force the decoded grid, argmax must match ---
-    let mut padded = vec![SOS_ID; levels]; // SOS frame
-    padded.extend_from_slice(&tokens);
+    // --- Parallel cross-check against the faithful decoder (PE + edge-pad) ---
+    // The faithful decoder consumes the flat `decoder_input_tokens` the model
+    // actually receives = shift_right(decoded grid): a BOS/SOS at position 0,
+    // then the decoded tokens (drop the last). Teacher-forcing it must reproduce
+    // the greedy argmax at every output position (the incremental decode now adds
+    // the same FixedEmbed PE the faithful path does — LLM_FINDINGS §2.6).
+    let mut dit = vec![SOS_ID; 1];
+    dit.extend_from_slice(&tokens[..FRAMES * levels - 1]);
     let mut pg = Graph::new();
-    let ptok = pg.input_u32("dec_tokens", &[(FRAMES + 1) * levels]);
+    let ptok = pg.input_u32("dec_tokens", &[FRAMES * levels]);
     let penc = pg.input("enc_out", &[enc_seq, embed]);
-    let plogits = build_decoder(&mut pg, &c, ptok, penc, FRAMES);
+    let plogits = build_decoder_faithful(&mut pg, &c, ptok, penc, FRAMES);
     pg.set_outputs(vec![plogits]);
     let mut parallel = meganeura::build_inference_session(&pg);
     load(&mut parallel, &w);
-    parallel.set_input_u32("dec_tokens", &padded);
+    parallel.set_input_u32("dec_tokens", &dit);
     parallel.set_input("enc_out", &enc);
     parallel.step();
     parallel.wait();
