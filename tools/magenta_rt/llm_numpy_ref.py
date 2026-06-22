@@ -167,6 +167,183 @@ def encoder_forward(ids, weights, num_layers=12, embed_dim=768, num_heads=12,
     return x
 
 
+# ============================ DECODER REFERENCE ============================
+#
+# Faithful NumPy port of the v1 Depthformer decoder, mirroring
+# `magenta_rt/depthformer/modules.py` (initial commit b35a850) and the
+# flaxformer T5 components it composes. The gate interface is the flat
+# `decoder_input_tokens` [T*Q] sequence the decoder actually receives (the
+# upstream shift_right / feature conversion is identical for any consumer, so
+# comparing at this interface isolates the decoder forward itself).
+
+
+def relative_position_bucket(relative_position, bidirectional, num_buckets,
+                             max_distance):
+    """Port of flaxformer `RelativePositionBiases._relative_position_bucket`."""
+    ret = np.zeros_like(relative_position)
+    n = -relative_position
+    if bidirectional:
+        num_buckets //= 2
+        ret += (n < 0).astype(np.int32) * num_buckets
+        n = np.abs(n)
+    else:
+        n = np.maximum(n, 0)
+    max_exact = num_buckets // 2
+    is_small = n < max_exact
+    val_if_large = max_exact + (
+        np.log(n.astype(np.float32) / max_exact + np.finfo(np.float32).eps)
+        / np.log(max_distance / max_exact) * (num_buckets - max_exact)
+    ).astype(np.int32)
+    val_if_large = np.minimum(val_if_large, num_buckets - 1)
+    ret += np.where(is_small, n, val_if_large)
+    return ret
+
+
+def relpos_bias(table, qlen, klen, bidirectional, max_distance):
+    """Build the [heads, qlen, klen] additive bias from a [heads, buckets] table.
+
+    relative_position = memory(k) - context(q); bucket then gather (flaxformer
+    `RelativePositionBiases.__call__`)."""
+    num_heads, num_buckets = table.shape
+    context = np.arange(qlen)[:, None]
+    memory = np.arange(klen)[None, :]
+    rp = memory - context  # (qlen, klen)
+    bucket = relative_position_bucket(rp, bidirectional, num_buckets, max_distance)
+    # table[h, bucket[q,k]] -> [heads, qlen, klen]
+    return table[:, bucket]
+
+
+def attention(x_q, x_kv, wq, wk, wv, wo, num_heads, head_dim, causal,
+              bias=None):
+    """Multi-head attention. x_q [Sq, D], x_kv [Sk, D]. Scores scaled by
+    1/sqrt(head_dim) — matching flaxformer's dot_product_attention and the
+    encoder reference (which validated against real weights to 9.6e-7)."""
+    sq = x_q.shape[0]
+    sk = x_kv.shape[0]
+    embed = num_heads * head_dim
+    scale = 1.0 / np.sqrt(head_dim)
+    q = (x_q @ wq).reshape(sq, num_heads, head_dim)
+    k = (x_kv @ wk).reshape(sk, num_heads, head_dim)
+    v = (x_kv @ wv).reshape(sk, num_heads, head_dim)
+    scores = np.einsum('qhd,khd->hqk', q, k) * scale
+    if bias is not None:
+        scores = scores + bias  # [heads, qlen, klen]
+    if causal:
+        mask = np.tril(np.ones((sq, sk), dtype=bool))
+        scores = np.where(mask[None], scores, -1e10)
+    scores = scores - scores.max(axis=-1, keepdims=True)
+    attn = np.exp(scores)
+    attn = attn / attn.sum(axis=-1, keepdims=True)
+    out = np.einsum('hqk,khd->qhd', attn, v).reshape(sq, embed)
+    return out @ wo
+
+
+def temporal_layer(x, enc, w, prefix, tbias, cfg):
+    """One temporal decoder layer: causal self-attn (+rel-pos) + cross-attn + MLP."""
+    nh, hd, eps = cfg['heads'], cfg['head_dim'], cfg['eps']
+    g = lambda n: w[f'{prefix}.{n}']
+    h = rms_norm(x, g('pre_self_attention_layer_norm.scale'), eps)
+    x = x + attention(h, h, g('self_attention.query.kernel'),
+                      g('self_attention.key.kernel'), g('self_attention.value.kernel'),
+                      g('self_attention.out.kernel'), nh, hd, causal=True, bias=tbias)
+    h = rms_norm(x, g('pre_cross_attention_layer_norm.scale'), eps)
+    x = x + attention(h, enc, g('encoder_decoder_attention.query.kernel'),
+                      g('encoder_decoder_attention.key.kernel'),
+                      g('encoder_decoder_attention.value.kernel'),
+                      g('encoder_decoder_attention.out.kernel'), nh, hd, causal=False)
+    h = rms_norm(x, g('pre_mlp_layer_norm.scale'), eps)
+    x = x + geglu(h @ g('mlp.wi_0.kernel'), h @ g('mlp.wi_1.kernel')) @ g('mlp.wo.kernel')
+    return x
+
+
+def depth_layer(x, w, prefix, dbias, cfg):
+    """One depth decoder layer: causal self-attn (+rel-pos) + MLP, no cross-attn."""
+    nh, hd, eps = cfg['heads'], cfg['head_dim'], cfg['eps']
+    g = lambda n: w[f'{prefix}.{n}']
+    h = rms_norm(x, g('pre_self_attention_layer_norm.scale'), eps)
+    x = x + attention(h, h, g('self_attention.query.kernel'),
+                      g('self_attention.key.kernel'), g('self_attention.value.kernel'),
+                      g('self_attention.out.kernel'), nh, hd, causal=True, bias=dbias)
+    h = rms_norm(x, g('pre_mlp_layer_norm.scale'), eps)
+    x = x + geglu(h @ g('mlp.wi_0.kernel'), h @ g('mlp.wi_1.kernel')) @ g('mlp.wo.kernel')
+    return x
+
+
+def decoder_forward(decoder_input_tokens, encoder_out, weights, cfg,
+                    add_position=True):
+    """Faithful Depthformer decoder: decoder_input_tokens [T*Q] + encoder_out
+    [enc_seq, D] -> logits [T*Q, vocab]. `add_position` toggles the FixedEmbed
+    absolute PE (to quantify its effect)."""
+    Q = cfg['num_levels']
+    embed = cfg['embed']
+    eps = cfg['eps']
+    tq = decoder_input_tokens.shape[0]
+    T = tq // Q
+
+    # Base Decoder embed: token embedding + FixedEmbed sinusoidal PE (added).
+    table = weights['target.token_embedder.embedding']
+    embedded = table[decoder_input_tokens]  # [T*Q, D]
+    if add_position:
+        embedded = embedded + sinusoidal_pos_embed(tq, embed)
+
+    # --- Temporal: _to_temporal_embedded_inputs (edge-pad (Q-1,1), reshape,
+    #     drop last frame) then mean over Q. ---
+    padded = np.pad(embedded, ((Q - 1, 1), (0, 0)), mode='edge')  # [(T+1)*Q, D]
+    temporal_in = padded.reshape(T + 1, Q, embed)[:-1].mean(axis=1)  # [T, D]
+
+    tbias = relpos_bias(
+        weights['target.decoder.decoder.temporal_decoder.relpos_bias.rel_embedding'],
+        T, T, bidirectional=False, max_distance=cfg['temp_max_dist'])
+    x = temporal_in
+    for i in range(cfg['num_temporal_layers']):
+        x = temporal_layer(
+            x, encoder_out, weights,
+            f'target.decoder.decoder.temporal_decoder.layers_{i}', tbias, cfg)
+    temporal_context = x  # [T, D]
+
+    # --- Depth: _to_depth_embedded_inputs (concat temporal level-0 with the
+    #     first Q-1 level embeddings of each frame). ---
+    depth_in = np.concatenate(
+        [temporal_context[:, None, :], padded.reshape(T + 1, Q, embed)[1:, :-1, :]],
+        axis=1)  # [T, Q, D]
+
+    dbias = relpos_bias(
+        weights['target.decoder.decoder.depth_decoder.relpos_bias_depth.rel_embedding'],
+        Q, Q, bidirectional=False, max_distance=cfg['depth_max_dist'])
+
+    norm_scale = weights['target.decoder.decoder_norm.scale']
+    logits_w = weights['target.decoder.logits_dense.kernel']
+    logits = np.zeros((T, Q, logits_w.shape[1]), dtype=np.float32)
+    for t in range(T):
+        xd = depth_in[t]  # [Q, D]
+        for i in range(cfg['num_depth_layers']):
+            xd = depth_layer(
+                xd, weights,
+                f'target.decoder.decoder.depth_decoder.depth_layers_{i}', dbias, cfg)
+        xd = rms_norm(xd, norm_scale, eps)
+        logits[t] = xd @ logits_w
+    return logits.reshape(T * Q, logits_w.shape[1])
+
+
+BASE_CFG = dict(embed=768, heads=12, head_dim=64, mlp=2048, eps=1e-6,
+                num_levels=16, num_temporal_layers=20, num_depth_layers=4,
+                temp_max_dist=128, depth_max_dist=16)
+
+
+def ref_decoder_input_tokens(tq, vocab=REF_VOCAB):
+    """Deterministic decoder input grid — must match the Rust decoder gate."""
+    return np.array([(i * 53 + 11) % vocab for i in range(tq)], dtype=np.int32)
+
+
+def ref_encoder_out(enc_seq, embed):
+    """Deterministic encoder output — must match the Rust decoder gate."""
+    out = np.zeros((enc_seq, embed), dtype=np.float32)
+    for i in range(enc_seq):
+        for j in range(embed):
+            out[i, j] = 0.1 * np.sin(0.7 * i + 0.013 * j)
+    return out
+
+
 def main():
     print(f"Loading LLM weights from {DUMP} ...")
     weights = load_safetensors(DUMP)
@@ -186,6 +363,26 @@ def main():
     if ref_out:
         out[0].astype("<f4").tofile(ref_out)
         print(f"Wrote encoder reference ({out[0].size} f32) to {ref_out}")
+
+    # Decoder reference (small grid for a tractable Rust GPU gate).
+    dec_frames = int(os.environ.get("MEGANEURA_DEC_REF_FRAMES", "3"))
+    Q = BASE_CFG['num_levels']
+    enc_seq = int(os.environ.get("MEGANEURA_DEC_REF_ENCSEQ", "5"))
+    dec_in = ref_decoder_input_tokens(dec_frames * Q)
+    enc = ref_encoder_out(enc_seq, BASE_CFG['embed'])
+    logits = decoder_forward(dec_in, enc, weights, BASE_CFG, add_position=True)
+    print(f"\nDecoder ref: frames={dec_frames} Q={Q} -> logits {logits.shape}, "
+          f"range=[{logits.min():.3f}, {logits.max():.3f}]")
+    # Quantify the absolute-PE effect.
+    no_pe = decoder_forward(dec_in, enc, weights, BASE_CFG, add_position=False)
+    print(f"  abs-PE effect on logits: max|with-without| = "
+          f"{np.abs(logits - no_pe).max():.3f}, argmax changes = "
+          f"{int((logits.argmax(-1) != no_pe.argmax(-1)).sum())}/{logits.shape[0]}")
+    dec_ref = os.environ.get("MEGANEURA_DEC_REF_OUT")
+    if dec_ref:
+        logits.astype("<f4").tofile(dec_ref)
+        enc.astype("<f4").tofile(dec_ref + ".enc")
+        print(f"Wrote decoder reference ({logits.size} f32) to {dec_ref}")
 
 
 if __name__ == '__main__':
