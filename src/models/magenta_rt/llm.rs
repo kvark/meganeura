@@ -710,6 +710,89 @@ pub fn build_decoder(
     logits.expect("num_frames must be ≥ 1")
 }
 
+/// Build the **faithful** parallel Depthformer decoder — a direct port of the v1
+/// `DepthformerDecoderStack` (`magenta_rt/depthformer/modules.py`, initial commit
+/// `b35a850`), gated against the NumPy reference (`tools/magenta_rt/llm_numpy_ref.py`).
+///
+/// Differs from [`build_decoder`] in three ways that the recovered v1 source
+/// settled (see `LLM_FINDINGS.md` §2.6):
+/// 1. **Input contract** = the flat `decoder_input_tokens` `[num_frames * num_levels]`
+///    the decoder actually receives (no caller-prepended SOS frame).
+/// 2. **Absolute position** = the FixedEmbed sinusoidal PE is added to the token
+///    embeddings (the base `t5_architecture.Decoder` embed path the
+///    `DepthformerDecoder` inherits), which [`build_decoder`] omits.
+/// 3. **Edge padding** = `_to_temporal_embedded_inputs` / `_to_depth_embedded_inputs`
+///    pad the embedded grid by `(num_levels-1, 1)` in `mode='edge'` (replicate the
+///    first/last row), reshape to `[T+1, Q, D]`, then drop the last frame.
+///
+/// Temporal frame `t` = mean over levels of padded frame `t`; depth input for
+/// frame `t` = `concat([temporal_state[t]], padded[(t+1)*Q .. (t+1)*Q + Q-2])`.
+///
+/// Inputs:  `decoder_input_tokens` u32 `[num_frames * num_levels]`,
+///          `encoder_out` `[enc_seq, embed]`.
+/// Output:  logits `[num_frames * num_levels, vocab_size]`.
+pub fn build_decoder_faithful(
+    g: &mut Graph,
+    cfg: &LlmConfig,
+    decoder_input_tokens: NodeId,
+    encoder_out: NodeId,
+    num_frames: usize,
+) -> NodeId {
+    let embed = cfg.embed_dim as usize;
+    let levels = cfg.num_levels as usize;
+    let vocab = cfg.vocab_size as usize;
+    let tq = num_frames * levels;
+
+    // Embed the flat grid and add the FixedEmbed sinusoidal absolute PE.
+    let table = g.parameter("shared_token_embedder", &[vocab, embed]);
+    let embedded = g.embedding(decoder_input_tokens, table); // [T*Q, embed]
+    let pe = g.constant(sinusoidal_pos_embed(tq, embed), &[tq, embed]);
+    let embedded = g.add(embedded, pe);
+
+    // Edge-pad by (levels-1, 1): replicate row 0 (levels-1)× at the front and the
+    // last row 1× at the back → [(T+1)*Q, embed].
+    let row0 = slice_rows(g, embedded, tq, embed, 0, 1);
+    let mut front = row0;
+    for n in 1..(levels - 1) {
+        // `front` currently has `n` rows; append one more copy of row 0.
+        front = concat_rows(g, front, row0, n, 1, embed);
+    }
+    // `front` now has (levels-1) rows; prepend it, append the last row.
+    let last = slice_rows(g, embedded, tq, embed, tq - 1, 1);
+    let padded = concat_rows(g, front, embedded, levels - 1, tq, embed);
+    let padded = concat_rows(g, padded, last, levels - 1 + tq, 1, embed);
+    let padded_rows = (num_frames + 1) * levels;
+
+    // --- Temporal: mean-pool padded frames 0..T-1 → [T, embed]. ---
+    let temporal_src = slice_rows(g, padded, padded_rows, embed, 0, num_frames * levels);
+    let mut x = build_level_mean_pool(g, cfg, temporal_src, num_frames);
+    let trel = g.parameter(
+        "decoder.temporal_decoder.rel_pos_bias_table",
+        &[(cfg.num_heads * cfg.rel_pos_num_buckets) as usize],
+    );
+    for i in 0..cfg.num_temporal_decoder_layers {
+        let prefix = format!("decoder.temporal_layers.{i}");
+        x = build_decoder_layer(g, cfg, x, encoder_out, trel, &prefix);
+    }
+    let temporal_out = x;
+
+    // --- Depth: per frame, level 0 = temporal state, levels 1..Q-1 = padded
+    //     rows (t+1)*Q .. (t+1)*Q + Q-2 (the already-decoded level embeddings). ---
+    let dp = register_depth_params(g, cfg);
+    let mut logits: Option<NodeId> = None;
+    for t in 0..num_frames {
+        let trow = slice_rows(g, temporal_out, num_frames, embed, t, 1);
+        let prefix = slice_rows(g, padded, padded_rows, embed, (t + 1) * levels, levels - 1);
+        let depth_in = concat_rows(g, trow, prefix, 1, levels - 1, embed);
+        let frame_logits = depth_forward(g, cfg, depth_in, &dp);
+        logits = Some(match logits {
+            None => frame_logits,
+            Some(acc) => concat_rows(g, acc, frame_logits, t * levels, levels, vocab),
+        });
+    }
+    logits.expect("num_frames must be ≥ 1")
+}
+
 /// Build one **incremental** (autoregressive) temporal decode step: given the
 /// just-decoded frame's RVQ tokens, advance the temporal decoder by one frame
 /// using a KV cache, returning that frame's temporal state `[1, embed]`.
