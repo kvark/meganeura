@@ -20,7 +20,7 @@ text prompt ─► MusicCoCa ─► 6 style tokens ┐
 |-----------|---------------|---------------|----------|------|
 | **MusicCoCa** text encoder | ✅ `build_text_encoder_graph` | ✅ `load_text_encoder_weights` | ✅ GPU-vs-CPU (random weights, 1e-3) | real-weight check vs the 26 testdata embeddings |
 | **SpectroStream** decoder body | ✅ `build_decoder_graph` | ✅ `load_decoder_weights` | ⚠️ only structurally; demo runs tokens→WAV | 3 unverified "free reinterpret" claims; RADV NaN bug |
-| **LLM** encoder | ✅ `build_encoder_graph` (sinusoidal PE, bidirectional, no rel-pos) | ✅ `llm_weights` (fully loadable, 0 skips) | ✅ GPU-vs-CPU op-composition (1e-6) **+ real-weight numeric gate vs NumPy ref (4.2e-6, lavapipe)** | PE *scheme* (sinusoidal-vs-none) + `Scale(√d)?` still unsettleable from weights alone |
+| **LLM** encoder | ✅ `build_encoder_graph` (FixedEmbed sinusoidal PE, bidirectional, no rel-pos) | ✅ `llm_weights` (fully loadable, 0 skips) | ✅ GPU-vs-CPU op-composition + real-weight numeric gate vs NumPy ref (**9.6e-7**, lavapipe) | PE scheme RESOLVED from recovered v1 gin (FixedEmbed, no scale); formula fixed (split-half) |
 | **LLM** temporal decoder | ✅ `build_temporal_decoder` + `build_decoder_layer` | ✅ `llm_weights` (shared) | ✅ GPU-vs-CPU on lavapipe (random weights, 1e-3) | — |
 | **LLM** depth decoder | ✅ `build_depth_decoder_layer` + `build_depth_decoder_stack` | ✅ `llm_weights` (shared) | ✅ GPU-vs-CPU on lavapipe (random weights, 1e-3) | — |
 | **LLM** full decoder | ✅ `build_decoder` (temporal→depth) | ✅ `llm_weights::load_llm_weights` (real 1.3 GB dump loads, 0 skips) | ✅ map = 100% of checkpoint (`llm_weight_map`); GPU-vs-CPU random-weight; **real-weight forward runs finite on lavapipe** | real-weight numeric gate needs JAX ref |
@@ -87,16 +87,17 @@ MusicCoCa + SpectroStream-encoder weights (their dumpers exist).
     the decoder_0→1 batch-fold pixel-shuffle, the final batch/channel merge, and
     the `base_conv_last` W-padding (code keeps SAME; `ARCH_FINDINGS.md` expects
     VALID). Use the `DecoderStage` bisection to localise the first divergent block.
-1.3 ⚙️ **LLM encoder** — real-weight numeric gate **done**, PE scheme still open.
-    The manifest question is settled: the encoder has **no** position tensor at
-    all (no relpos, no `pos_embed`; only the two *decoder* relpos tables exist).
-    `tests/llm_encoder_real_weight.rs` loads the real weights and matches the
-    NumPy reference (`llm_numpy_ref.py`, same weights) to **4.2e-6** on lavapipe —
-    cross-validating the no-transpose mapping + op composition. **Still open** (not
-    settleable from weights; needs the v1 source or reference outputs): whether the
-    encoder uses the computed sinusoidal PE (current choice) or no position, and
-    the `Scale(√d)` embedder detail — both are shared assumptions between the Rust
-    encoder and the numpy ref, so the gate can't distinguish them.
+1.3 ✅ **LLM encoder — RESOLVED + real-weight gated.** The v1 source recovered
+    from git history (`magenta/magenta-realtime` initial commit `b35a850`) settles
+    the position scheme from its gin config: encoder = `t5_architecture.Encoder`
+    with `embedding.FixedEmbed` (fixed sinusoidal PE), no encoder rel-pos, no
+    embedding scale. Fixed our PE formula to flaxformer's exact split-half
+    `sinusoidal()` (was interleaved — a real bug the prior gate couldn't see, as
+    Rust + numpy ref shared it). `tests/llm_encoder_real_weight.rs` now matches the
+    NumPy reference to **9.6e-7** on lavapipe (no-transpose mapping + op
+    composition + correct PE). **NEW open item** surfaced from the same source: the
+    *decoder* is also wired with `FixedEmbed` PE, but `build_decoder` adds none —
+    see Phase 2.6.
 
 ### Phase 2 — finish the LLM decoder
 2.1 ✅ **DONE** — depth-module topology resolved (manifest + `depthformer.py`):
@@ -123,6 +124,16 @@ MusicCoCa + SpectroStream-encoder weights (their dumpers exist).
     (`load_real_weights_into_decoder`, `#[ignore]`d). Real-weight *numeric* gate
     (greedy logits vs a Colab/JAX reference) still needs the reference outputs —
     the loader + a runnable real-weight session are in place for it.
+2.6 ⚠️ **OPEN: decoder absolute PE.** The recovered v1 gin wires `FixedEmbed`
+    (sinusoidal) onto the decoder too, and `DepthformerDecoder` inherits the base
+    `t5_architecture.Decoder` embed path, so the model adds absolute PE to the
+    per-level token embeddings (over the `T*Q` grid) *before* the level mean-pool
+    — meaning temporal frame `t` gains `mean_q PE[t*Q+q]` and the depth level
+    prefix embeddings carry `PE[t*Q+q]`. `build_decoder` /
+    `build_temporal_decode_step` add no absolute PE today. Likely a real bug;
+    fixing it needs the decode-time position semantics + a decoder reference
+    (extend `llm_numpy_ref.py` to the decoder using the v1 code, or run t5x) to
+    verify. See `LLM_FINDINGS.md`.
 
 ### Phase 3 — end-to-end wiring
 3.1 Tokenizer + MusicCoCa text→6 style tokens. ✅ **Tokenizer done** —

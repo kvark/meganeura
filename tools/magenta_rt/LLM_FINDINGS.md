@@ -55,53 +55,66 @@ encoder=12 layers, temporal=20, depth=4. Flaxformer naming → graph remap for t
 weight loader (`self_attention.{query,key,value,out}.kernel`,
 `mlp.{wi_0,wi_1,wo}.kernel`, `pre_*_layer_norm.scale`, `relpos_bias.rel_embedding`).
 
-## Position encoding — decoders RESOLVED, encoder scheme is the one open item
+## Position encoding — RESOLVED from the recovered v1 source (gin config)
 
-The two **decoders** are fully settled from the manifest; the **encoder**
-position scheme is *not* determinable from the weights and is the single
-remaining unsettleable question (flagged below, not guessed).
+> 🔑 **The v1 reference code is available after all** — in the **git history** of
+> `magenta/magenta-realtime`. The current `main` is the **v2** model; the **v1**
+> encoder-decoder lives at the *initial commit* `b35a850` (`magenta_rt/
+> depthformer/{model,modules,decode}.py`, `system.py`, and the gin configs under
+> `depthformer/configs/`). A shallow depth-1 clone of `main` (what we had) hides
+> it; `git clone` (full) exposes it. This supersedes the earlier "no v1 source /
+> can't settle PE from the weights" caveat — we can read the architecture
+> directly. (An even earlier draft claiming "drop the PE" cited the v2
+> `depthformer.py` and was wrong.)
 
-> ⚠️ An earlier draft of this section asserted "no absolute PE anywhere — drop
-> the sinusoidal PE," citing `magenta_rt/jax/depthformer.py`. That reasoning was
-> **wrong**: the cloned `depthformer.py` is the **v2** model (decoder-only, RoPE),
-> not this v1 encoder-decoder checkpoint, so it doesn't dictate v1's encoder. The
-> encoder currently *keeps* the computed sinusoidal PE (see the encoder bullet).
+The model is a **standard flaxformer T5 1.1 encoder-decoder** wired by
+`configs/mrt_merged_base.gin` (+ `posembed.gin`, `t5_1_1_flaxformer.gin`):
 
-- **Decoders use learned T5 rel-pos bias**, shared per sub-decoder:
-  `temporal_decoder.relpos_bias.rel_embedding` `[12, 128]` and
-  `depth_decoder.relpos_bias_depth.rel_embedding` `[12, 16]`. So `build_decoder_layer`'s
-  rel-pos bias is right; the per-layer registration should become per-sub-decoder
-  (one shared table), and the temporal bucket count is **128**, not 32.
-- **Encoder embedder applies `Scale(sqrt(embed))`** after the lookup
-  (`scale_sqrt_depth`, PAX-compat) — `build_encoder_graph` is currently missing
-  this multiply.
-- **Encoder position — IMPLEMENTED; mapping + ops now real-weight gated; the
-  *scheme* is the one genuinely open item.** The encoder carries **no** position
-  tensor of any kind — confirmed against the full manifest: the only position
-  tensors are the two *decoder* relpos tables (`temporal_decoder.relpos_bias` and
-  `depth_decoder.relpos_bias_depth`); there is no `target.encoder.relpos_bias` and
-  no `pos_embed`. So the scheme is non-parametric and **cannot** be read off the
-  weights — it's either (a) a computed absolute PE added to the embeddings, or
-  (b) no position at all. The cloned GitHub repo is the **v2** model (RoPE,
-  decoder-only), so it doesn't settle v1, and there's no v1 gin/config in the HF
-  release (only README + testdata). The in-repo `llm_numpy_ref.py` (written to
-  reverse-engineer *this* v1 checkpoint) chose **fixed sinusoidal absolute PE +
-  no rel-pos**, and that's what `build_encoder_graph` does: embed →
-  +`sinusoidal_pos_embed` (computed constant) → bidirectional self-attention
-  (plain SDPA, no rel-pos) → final RMSNorm.
-  - **Real-weight numeric gate (NEW):** `tests/llm_encoder_real_weight.rs` loads
-    the real 1.3 GB weights into this encoder, runs it on lavapipe, and matches
-    the independent NumPy reference (same weights) to **4.2e-6** max abs diff.
-    This cross-validates the **flat-copy weight mapping (no transpose)** at real
-    asymmetric magnitudes — a transpose bug in any Q/K/V/O or MLP kernel would
-    diverge by O(1) — and the full encoder op composition.
-  - **Still unsettled (needs the v1 source or reference outputs, neither
-    available here):** (a) sinusoidal-PE-vs-no-position, and (b) whether the
-    embedder applies `Scale(sqrt(embed))` (the v2 embedder does; the numpy ref
-    omits it, so the gate above shares that omission and can't catch it). These
-    two are *shared assumptions* between the Rust encoder and the numpy ref, so
-    the gate can't distinguish them — it validates everything *except* the
-    position choice.
+- **Encoder = `t5_architecture.Encoder`** (NOT the `DepthformerEncoder` in the
+  same file — `encoder_factory = @t5_architecture.Encoder`), so it's a plain
+  bidirectional stack over the 1006-token input (no mean-pool).
+- **Absolute position = `embedding.FixedEmbed` (fixed sinusoidal), on BOTH the
+  encoder and the decoder** (`posembed.gin`:
+  `POSITION_EMBEDDER_FACTORY = @embedding.FixedEmbed`, set on
+  `t5_architecture.{Encoder,Decoder}.position_embedder_factory`). The PE is
+  **added** to the token embeddings. There is **no embedding `Scale(sqrt(embed))`**
+  (the token `embedding.Embed` sets no scaling; `SCALE=1.0` in the gin is only the
+  kernel-initializer scale — irrelevant at inference). So the earlier
+  `Scale(sqrt(embed))` worry is **resolved: no scale**.
+- **Encoder rel-pos = None** (`SHARED_RELATIVE_POSITION_BIAS_FACTORY = None`),
+  matching the manifest (no `target.encoder.relpos_bias`). The two **decoders**
+  use learned rel-pos: `temporal_decoder.relpos_bias.rel_embedding` `[12, 128]`
+  and `depth_decoder.relpos_bias_depth.rel_embedding` `[12, 16]` — so the
+  temporal bucket count is **128**, not 32 (already fixed).
+- **`FixedEmbed`'s exact formula** = flaxformer `initializers.sinusoidal()`
+  (`min_scale=1.0`, `max_scale=10000`): **split-half** layout — first `embed/2`
+  columns are sines, next `embed/2` cosines — with
+  `div_term[i] = exp(i * -ln(10000)/(embed/2 - 1))`. **NOT** interleaved.
+
+- ✅ **Encoder PE — FIXED + real-weight gated.** `sinusoidal_pos_embed` (and the
+  numpy ref + the op-composition test) now use the exact flaxformer split-half
+  formula. `tests/llm_encoder_real_weight.rs` loads the real 1.3 GB weights and
+  matches the NumPy reference (both flaxformer-formula now) to **9.6e-7** on
+  lavapipe — cross-validating the flat-copy weight mapping (no transpose; a
+  transpose bug diverges by O(1)) and the full encoder op composition. *Prior to
+  this, the Rust + numpy ref shared an **interleaved** formula with a slightly
+  different frequency base — wrong vs flaxformer; the old gate couldn't catch it
+  because both sides shared the bug. The recovered gin/flaxformer source caught
+  it.*
+
+- ⚠️ **OPEN — temporal/depth decoder is missing the FixedEmbed PE.** `posembed.gin`
+  wires `FixedEmbed` onto the **decoder** too, and `DepthformerDecoder` does
+  **not** override the base `t5_architecture.Decoder` embed path (confirmed: it
+  has `setup`/`_setup_layer_sequence` but no `__call__`), so the base Decoder
+  adds the sinusoidal PE to the **per-level** token embeddings over the `T*Q`
+  grid *before* `DepthformerDecoderStack` mean-pools the levels into the temporal
+  input — i.e. temporal frame `t` effectively gains `mean_q PE[t*Q + q]`, and the
+  depth-module level prefix embeddings (`embedded[:, 1:, :Q-1]`) carry their
+  `PE[t*Q+q]` too. Our `build_decoder` / `build_temporal_decode_step` add **no**
+  absolute PE (they rely on the rel-pos bias alone). This is a likely real
+  discrepancy; it needs the decode-time position semantics worked out and a
+  decoder reference (extend `llm_numpy_ref.py` to the decoder using the v1 code,
+  or run t5x) to verify a fix. Not yet fixed.
 
 ## RESOLVED: logits are NOT weight-tied
 

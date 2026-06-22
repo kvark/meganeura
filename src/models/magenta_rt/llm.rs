@@ -127,8 +127,10 @@ impl LlmConfig {
 /// The `llm_base` checkpoint carries **no encoder rel-pos tensor** (only the two
 /// decoders do), so the encoder self-attention here is plain scaled-dot-product
 /// (no rel-pos bias) — position enters via the sinusoidal PE added once in
-/// [`build_encoder_graph`] (per the in-repo `llm_numpy_ref.py`). This is the one
-/// LLM piece not yet checked against real weights; see `LLM_FINDINGS.md`.
+/// [`build_encoder_graph`]. The v1 gin config (recovered from the
+/// magenta-realtime git history) confirms this: `t5_architecture.Encoder` with
+/// `embedding.FixedEmbed` and `SHARED_RELATIVE_POSITION_BIAS_FACTORY = None`.
+/// Real-weight gated to 9.6e-7 vs the NumPy reference; see `LLM_FINDINGS.md`.
 ///
 /// Param names: `{prefix}.pre_attn_norm`, `.attn.{q,k,v,o}`, `.pre_mlp_norm`,
 /// `.mlp.{w_gate,w_up,w_down}` — all backed by checkpoint tensors.
@@ -207,10 +209,12 @@ fn sinusoidal_pos_embed(seq: usize, embed: usize) -> Vec<f32> {
 /// `shared_token_embedder` parameter name.
 ///
 /// Builds all `num_encoder_layers` and the final norm. Every parameter is backed
-/// by a checkpoint tensor (the sinusoidal PE is computed, not stored); only the
-/// position scheme itself is unverified against real weights (`LLM_FINDINGS.md`).
-/// `seq` lets the caller use a length other than `cfg.encoder_seq_len` (e.g. for
-/// tests); pass `cfg.encoder_seq_len` for the real model. Batch=1 only.
+/// by a checkpoint tensor (the sinusoidal PE is computed, not stored). The
+/// position scheme is confirmed from the v1 gin config (FixedEmbed sinusoidal, no
+/// rel-pos, no embedding scale) and real-weight gated to 9.6e-7 vs the NumPy
+/// reference (`tests/llm_encoder_real_weight.rs`). `seq` lets the caller use a
+/// length other than `cfg.encoder_seq_len` (e.g. for tests); pass
+/// `cfg.encoder_seq_len` for the real model. Batch=1 only.
 pub fn build_encoder_graph(g: &mut Graph, cfg: &LlmConfig, seq: usize) -> NodeId {
     let embed = cfg.embed_dim as usize;
 
@@ -218,10 +222,10 @@ pub fn build_encoder_graph(g: &mut Graph, cfg: &LlmConfig, seq: usize) -> NodeId
     let embed_w = g.parameter("shared_token_embedder", &[cfg.vocab_size as usize, embed]);
     let mut x = g.embedding(token_ids, embed_w);
 
-    // Fixed sinusoidal absolute position embedding (computed, not a checkpoint
-    // tensor — the encoder has no learned PE; per `llm_numpy_ref.py`). NOTE: the
-    // v2 `depthformer.py` embedder also applies `Scale(sqrt(embed))`, which the
-    // numpy ref omits — an open detail to settle against real weights.
+    // Fixed sinusoidal absolute position embedding (flaxformer `FixedEmbed`,
+    // computed not stored), added to the token embeddings. The v1 gin config
+    // confirms FixedEmbed with no embedding `Scale(sqrt(embed))` — so no scale
+    // here (see `LLM_FINDINGS.md`).
     let pe = g.constant(sinusoidal_pos_embed(seq, embed), &[seq, embed]);
     x = g.add(x, pe);
 
