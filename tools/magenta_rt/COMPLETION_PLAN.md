@@ -18,7 +18,7 @@ text prompt ─► MusicCoCa ─► 6 style tokens ┐
 
 | component | graph builder | weight loader | verified | gaps |
 |-----------|---------------|---------------|----------|------|
-| **MusicCoCa** text encoder | ✅ `build_text_encoder_graph` | ✅ `load_text_encoder_weights` | ✅ GPU-vs-CPU (random weights, 1e-3) | real-weight check vs the 26 testdata embeddings |
+| **MusicCoCa** text encoder | ✅ `build_text_encoder_graph` | ✅ `load_text_encoder_weights` | ✅ **real-weight gate: 0.9993 mean cosine / 93.3% RVQ token match** vs the 26 testdata prompts (`musiccoca_real_weight`, lavapipe) | — (uncovered + fixed a mixed-head_dim runtime bug) |
 | **SpectroStream** decoder body | ✅ `build_decoder_graph` | ✅ `load_decoder_weights` | ⚠️ only structurally; demo runs tokens→WAV | 3 unverified "free reinterpret" claims; RADV NaN bug |
 | **LLM** encoder | ✅ `build_encoder_graph` (FixedEmbed sinusoidal PE, bidirectional, no rel-pos) | ✅ `llm_weights` (fully loadable, 0 skips) | ✅ GPU-vs-CPU op-composition + real-weight numeric gate vs NumPy ref (**9.6e-7**, lavapipe) | PE scheme RESOLVED from recovered v1 gin (FixedEmbed, no scale); formula fixed (split-half) |
 | **LLM** temporal decoder | ✅ `build_temporal_decoder` + `build_decoder_layer` | ✅ `llm_weights` (shared) | ✅ GPU-vs-CPU on lavapipe (random weights, 1e-3) | — |
@@ -77,11 +77,20 @@ MusicCoCa + SpectroStream-encoder weights (their dumpers exist).
     Still TODO: the MusicCoCa + SpectroStream-encoder weight dumps.
 
 ### Phase 1 — verify what's already built against real weights
-1.1 **MusicCoCa**: load `weights_musiccoca.safetensors`, run the encoder on the 26
-    testdata prompts, assert ≥0.999 cosine vs `musiccoca_testdata.safetensors`
-    embeddings and ≥90% RVQ token match (the numpy ref hits 0.9993 / 93.3%). This
-    is the first real-weight gate; the loader + `transpose_2d` O-projection
-    handling are the likely failure points.
+1.1 ✅ **MusicCoCa — DONE (real-weight gate green).** `tests/musiccoca_real_weight.rs`
+    loads `weights_musiccoca.safetensors`, runs the encoder on the 26 testdata
+    prompts, and matches the reference at **mean cosine 0.9993 / min 0.9965** and
+    **93.3% RVQ token match** — exactly the numpy ref's numbers. `dump_musiccoca.py`
+    dumps the weights; `make_musiccoca_gate.py` builds the gate bundle (verified
+    tokenization: lowercase + SOS=1, cosine 1.0000 vs the SavedModel oracle; RVQ
+    codebooks in `numeric_codebook_order` = [0,1,4,5,6,7,8,9,10,11,2,3], 100% token
+    match — raw numeric order gives ~17%). **This surfaced + fixed a runtime bug:**
+    a graph that mixes attention head_dims (encoder 64 + attention-pool 256) shared
+    one compiled attention shader (head_dim baked into `@workgroup_size`), corrupting
+    the non-matching ops. Fixed by keying attention pipelines per `(entry, head_dim)`
+    (`runtime.rs`); regression: `musiccoca_correctness::text_encoder_full_dims_*`
+    (self-contained, no weights — was 1.0 off, now 6.6e-6). head_dim=64 shaders are
+    byte-identical, so the LLM gates are unaffected.
 1.2 **SpectroStream**: settle the three unverified reinterprets against a TF
     `body_out` dump (`tests/spectrostream_vs_tf_body.rs`, already scaffolded):
     the decoder_0→1 batch-fold pixel-shuffle, the final batch/channel merge, and

@@ -104,12 +104,7 @@ impl Default for MusicCoCaConfig {
 /// One pre-norm transformer encoder layer: LayerNorm → MHA → residual →
 /// LayerNorm → GeLU MLP → residual. Projection biases are added explicitly
 /// (`bias_add`) since meganeura's matmul has no fused bias.
-fn text_encoder_layer(
-    g: &mut Graph,
-    cfg: &MusicCoCaConfig,
-    x: NodeId,
-    prefix: &str,
-) -> NodeId {
+fn text_encoder_layer(g: &mut Graph, cfg: &MusicCoCaConfig, x: NodeId, prefix: &str) -> NodeId {
     let embed = cfg.embed_dim as usize;
     let attn_dim = (cfg.num_heads * cfg.head_dim) as usize;
     let mlp = cfg.mlp_dim as usize;
@@ -166,7 +161,10 @@ pub fn build_text_encoder_graph(g: &mut Graph, cfg: &MusicCoCaConfig, seq_len: u
     let ids = g.input_u32("text_tokens", &[seq_len]);
     // Embedding table [vocab, embed]; the sqrt(embed) CoCa scale is folded in
     // at load, so the lookup output is already scaled.
-    let table = g.parameter("text_encoder.embed_table", &[cfg.vocab_size as usize, embed]);
+    let table = g.parameter(
+        "text_encoder.embed_table",
+        &[cfg.vocab_size as usize, embed],
+    );
     let mut x = g.embedding(ids, table); // [seq_len, embed]
 
     // Add concatenated sin/cos positional encoding (deterministic constant).
@@ -185,7 +183,10 @@ pub fn build_text_encoder_graph(g: &mut Graph, cfg: &MusicCoCaConfig, seq_len: u
     let pool_dim = (cfg.num_heads * cfg.pool_head_dim) as usize;
     let query = g.parameter("text_encoder.pool.query", &[1, embed]);
     let pool_proj = |g: &mut Graph, src: NodeId, name: &str| -> NodeId {
-        let w = g.parameter(&format!("text_encoder.pool.{name}.kernel"), &[embed, pool_dim]);
+        let w = g.parameter(
+            &format!("text_encoder.pool.{name}.kernel"),
+            &[embed, pool_dim],
+        );
         let b = g.parameter(&format!("text_encoder.pool.{name}.bias"), &[pool_dim]);
         let m = g.matmul(src, w);
         g.bias_add(m, b)
@@ -342,7 +343,9 @@ pub fn load_text_encoder_weights(
         let name = arg_names
             .get(&n)
             .ok_or_else(|| format!("missing musiccoca.tf_var_leaves.{n}.*"))?;
-        model.tensor_f32_auto(name).map_err(|e| format!("{name}: {e}"))
+        model
+            .tensor_f32_auto(name)
+            .map_err(|e| format!("{name}: {e}"))
     };
 
     let embed = cfg.embed_dim as usize;
@@ -424,7 +427,10 @@ mod tests {
         // pos 0: sin(0)=0 for the first half, cos(0)=1 for the second half.
         for i in 0..dim / 2 {
             assert!(pe[i].abs() < 1e-6, "sin half at pos0 should be 0");
-            assert!((pe[dim / 2 + i] - 1.0).abs() < 1e-6, "cos half at pos0 should be 1");
+            assert!(
+                (pe[dim / 2 + i] - 1.0).abs() < 1e-6,
+                "cos half at pos0 should be 1"
+            );
         }
         // pos 1, channel 0: sin(1*1)=sin(1); cos half channel 0: cos(1).
         assert!((pe[dim + 0] - 1.0_f32.sin()).abs() < 1e-6);
