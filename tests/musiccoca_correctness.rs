@@ -10,10 +10,10 @@
 
 use std::collections::HashMap;
 
-use meganeura::Graph;
 use meganeura::models::magenta_rt::musiccoca::{
-    MusicCoCaConfig, build_text_encoder_graph, sinusoidal_pos_embedding,
+    build_text_encoder_graph, sinusoidal_pos_embedding, MusicCoCaConfig,
 };
+use meganeura::Graph;
 
 /// Tiny deterministic config so the CPU reference stays cheap.
 fn tiny_cfg() -> MusicCoCaConfig {
@@ -63,7 +63,12 @@ fn make_weights(cfg: &MusicCoCaConfig) -> HashMap<String, Vec<f32>> {
         w.insert(name, r.vec(n));
     };
 
-    put(&mut w, "text_encoder.embed_table".into(), cfg.vocab_size as usize * embed, &mut r);
+    put(
+        &mut w,
+        "text_encoder.embed_table".into(),
+        cfg.vocab_size as usize * embed,
+        &mut r,
+    );
     for i in 0..cfg.num_layers {
         let p = format!("text_encoder.layers.{i}");
         // LayerNorm scale near 1 (graph applies it as a plain weight).
@@ -74,10 +79,20 @@ fn make_weights(cfg: &MusicCoCaConfig) -> HashMap<String, Vec<f32>> {
         ln_scale(&mut w, format!("{p}.pre_attn_norm.scale"), &mut r);
         put(&mut w, format!("{p}.pre_attn_norm.bias"), embed, &mut r);
         for n in ["q", "k", "v"] {
-            put(&mut w, format!("{p}.attn.{n}.kernel"), embed * attn_dim, &mut r);
+            put(
+                &mut w,
+                format!("{p}.attn.{n}.kernel"),
+                embed * attn_dim,
+                &mut r,
+            );
             put(&mut w, format!("{p}.attn.{n}.bias"), attn_dim, &mut r);
         }
-        put(&mut w, format!("{p}.attn.o.kernel"), attn_dim * embed, &mut r);
+        put(
+            &mut w,
+            format!("{p}.attn.o.kernel"),
+            attn_dim * embed,
+            &mut r,
+        );
         put(&mut w, format!("{p}.attn.o.bias"), embed, &mut r);
         ln_scale(&mut w, format!("{p}.pre_mlp_norm.scale"), &mut r);
         put(&mut w, format!("{p}.pre_mlp_norm.bias"), embed, &mut r);
@@ -88,12 +103,32 @@ fn make_weights(cfg: &MusicCoCaConfig) -> HashMap<String, Vec<f32>> {
     }
     put(&mut w, "text_encoder.pool.query".into(), embed, &mut r);
     for n in ["q", "k", "v"] {
-        put(&mut w, format!("text_encoder.pool.{n}.kernel"), embed * pool_dim, &mut r);
-        put(&mut w, format!("text_encoder.pool.{n}.bias"), pool_dim, &mut r);
+        put(
+            &mut w,
+            format!("text_encoder.pool.{n}.kernel"),
+            embed * pool_dim,
+            &mut r,
+        );
+        put(
+            &mut w,
+            format!("text_encoder.pool.{n}.bias"),
+            pool_dim,
+            &mut r,
+        );
     }
-    put(&mut w, "text_encoder.pool.o.kernel".into(), pool_dim * embed, &mut r);
+    put(
+        &mut w,
+        "text_encoder.pool.o.kernel".into(),
+        pool_dim * embed,
+        &mut r,
+    );
     put(&mut w, "text_encoder.pool.o.bias".into(), embed, &mut r);
-    ln_scale_final(&mut w, "text_encoder.final_norm.scale".into(), embed, &mut r);
+    ln_scale_final(
+        &mut w,
+        "text_encoder.final_norm.scale".into(),
+        embed,
+        &mut r,
+    );
     put(&mut w, "text_encoder.final_norm.bias".into(), embed, &mut r);
     w
 }
@@ -217,9 +252,22 @@ fn reference(cfg: &MusicCoCaConfig, w: &HashMap<String, Vec<f32>>, ids: &[u32]) 
 
     for li in 0..cfg.num_layers {
         let p = format!("text_encoder.layers.{li}");
-        let h = layer_norm(&x, g(&format!("{p}.pre_attn_norm.scale")), g(&format!("{p}.pre_attn_norm.bias")), seq, embed, eps);
+        let h = layer_norm(
+            &x,
+            g(&format!("{p}.pre_attn_norm.scale")),
+            g(&format!("{p}.pre_attn_norm.bias")),
+            seq,
+            embed,
+            eps,
+        );
         let proj = |name: &str| {
-            let mut m = matmul(&h, g(&format!("{p}.attn.{name}.kernel")), seq, embed, attn_dim);
+            let mut m = matmul(
+                &h,
+                g(&format!("{p}.attn.{name}.kernel")),
+                seq,
+                embed,
+                attn_dim,
+            );
             bias_add(&mut m, g(&format!("{p}.attn.{name}.bias")), seq, attn_dim);
             m
         };
@@ -227,12 +275,25 @@ fn reference(cfg: &MusicCoCaConfig, w: &HashMap<String, Vec<f32>>, ids: &[u32]) 
         let k = proj("k");
         let v = proj("v");
         let attn = mha(&q, &k, &v, seq, seq, heads, cfg.head_dim as usize);
-        let mut o = matmul(&attn, g(&format!("{p}.attn.o.kernel")), seq, attn_dim, embed);
+        let mut o = matmul(
+            &attn,
+            g(&format!("{p}.attn.o.kernel")),
+            seq,
+            attn_dim,
+            embed,
+        );
         bias_add(&mut o, g(&format!("{p}.attn.o.bias")), seq, embed);
         for i in 0..seq * embed {
             x[i] += o[i];
         }
-        let h = layer_norm(&x, g(&format!("{p}.pre_mlp_norm.scale")), g(&format!("{p}.pre_mlp_norm.bias")), seq, embed, eps);
+        let h = layer_norm(
+            &x,
+            g(&format!("{p}.pre_mlp_norm.scale")),
+            g(&format!("{p}.pre_mlp_norm.bias")),
+            seq,
+            embed,
+            eps,
+        );
         let mut up = matmul(&h, g(&format!("{p}.mlp.wi.kernel")), seq, embed, mlp);
         bias_add(&mut up, g(&format!("{p}.mlp.wi.bias")), seq, mlp);
         let act = gelu(&up);
@@ -245,22 +306,54 @@ fn reference(cfg: &MusicCoCaConfig, w: &HashMap<String, Vec<f32>>, ids: &[u32]) 
 
     // Attention pool: single learned query over encoder positions.
     let pool_proj_q = {
-        let mut m = matmul(g("text_encoder.pool.query"), g("text_encoder.pool.q.kernel"), 1, embed, pool_dim);
+        let mut m = matmul(
+            g("text_encoder.pool.query"),
+            g("text_encoder.pool.q.kernel"),
+            1,
+            embed,
+            pool_dim,
+        );
         bias_add(&mut m, g("text_encoder.pool.q.bias"), 1, pool_dim);
         m
     };
     let pool_proj = |name: &str| {
-        let mut m = matmul(&x, g(&format!("text_encoder.pool.{name}.kernel")), seq, embed, pool_dim);
-        bias_add(&mut m, g(&format!("text_encoder.pool.{name}.bias")), seq, pool_dim);
+        let mut m = matmul(
+            &x,
+            g(&format!("text_encoder.pool.{name}.kernel")),
+            seq,
+            embed,
+            pool_dim,
+        );
+        bias_add(
+            &mut m,
+            g(&format!("text_encoder.pool.{name}.bias")),
+            seq,
+            pool_dim,
+        );
         m
     };
     let pool_k = pool_proj("k");
     let pool_v = pool_proj("v");
-    let pooled = mha(&pool_proj_q, &pool_k, &pool_v, 1, seq, heads, cfg.pool_head_dim as usize);
+    let pooled = mha(
+        &pool_proj_q,
+        &pool_k,
+        &pool_v,
+        1,
+        seq,
+        heads,
+        cfg.pool_head_dim as usize,
+    );
     let mut pool_out = matmul(&pooled, g("text_encoder.pool.o.kernel"), 1, pool_dim, embed);
     bias_add(&mut pool_out, g("text_encoder.pool.o.bias"), 1, embed);
 
-    layer_norm(&pool_out, g("text_encoder.final_norm.scale"), g("text_encoder.final_norm.bias"), 1, embed, eps)
+    layer_norm(
+        &pool_out,
+        g("text_encoder.final_norm.scale"),
+        g("text_encoder.final_norm.bias"),
+        1,
+        embed,
+        eps,
+    )
 }
 
 #[test]
@@ -298,4 +391,53 @@ fn text_encoder_matches_cpu_reference() {
         );
     }
     eprintln!("max abs diff GPU vs CPU reference: {max_abs:.2e}");
+}
+
+/// Full-dimension config (real embed/head/pool/layer counts, tiny vocab) — used
+/// to surface allocation-pressure-dependent runtime bugs that the tiny config
+/// (embed=16) hides. See `MUSICCOCA_FINDINGS.md`: the real-weight gate exposed a
+/// pool-after-encoder corruption that only appears at the real dimensions.
+fn full_cfg() -> MusicCoCaConfig {
+    MusicCoCaConfig {
+        embed_dim: 768,
+        num_heads: 12,
+        head_dim: 64,
+        mlp_dim: 3072,
+        num_layers: 12,
+        pool_head_dim: 256,
+        vocab_size: 64,
+        rvq_depth: 12,
+        codebook_size: 1024,
+        layer_norm_eps: 1e-6,
+    }
+}
+
+#[test]
+fn text_encoder_full_dims_matches_cpu_reference() {
+    let cfg = full_cfg();
+    let ids: Vec<u32> = vec![1, 5];
+    let weights = make_weights(&cfg);
+
+    let mut g = Graph::new();
+    let out = build_text_encoder_graph(&mut g, &cfg, ids.len());
+    g.set_outputs(vec![out]);
+    let mut s = meganeura::build_inference_session(&g);
+    for (name, data) in &weights {
+        s.set_parameter(name, data);
+    }
+    s.set_input_u32("text_tokens", &ids);
+    s.step();
+    s.wait();
+    let gpu = s.read_output(cfg.embed_dim as usize);
+    let cpu = reference(&cfg, &weights, &ids);
+
+    let mut max_abs = 0.0_f32;
+    for (&a, &b) in gpu.iter().zip(cpu.iter()) {
+        max_abs = max_abs.max((a - b).abs());
+    }
+    eprintln!("full-dim max abs diff GPU vs CPU: {max_abs:.3e}");
+    assert!(
+        max_abs <= 1e-2,
+        "full-dim encoder diverges from CPU by {max_abs}"
+    );
 }

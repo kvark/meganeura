@@ -915,6 +915,12 @@ struct Pipelines {
     coop_map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
     /// Small-tile (32×32) pipelines for dispatches with `use_small_tiles = true`.
     small_map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
+    /// Attention pipelines keyed by `(entry, head_dim)`. Attention shaders bake
+    /// the head_dim into their `@workgroup_size`, so a graph that mixes head_dims
+    /// (e.g. an encoder at 64 and an attention-pool at 256) needs a distinct
+    /// pipeline per head_dim — keying by entry alone would make every attention
+    /// op share one head_dim's shader and corrupt the rest.
+    attention_map: HashMap<(ShaderEntry, u32), blade_graphics::ComputePipeline>,
     /// Pipelines for non-f32 weight formats (f16, Q4, Q8).
     weight_map:
         HashMap<(ShaderEntry, crate::compile::WeightFormat), blade_graphics::ComputePipeline>,
@@ -948,6 +954,9 @@ impl Pipelines {
         let mut entries_for_group: HashMap<ShaderGroup, HashSet<ShaderEntry>> = HashMap::new();
         // Extract head_dim from attention dispatches for parameterized shader generation.
         let mut attention_head_dim: Option<u32> = None;
+        // All distinct head_dims used per attention group — one pipeline is
+        // generated per (group, head_dim) so a graph can mix head_dims.
+        let mut attention_head_dims: HashMap<ShaderGroup, HashSet<u32>> = HashMap::new();
 
         for dispatch in &plan.dispatches {
             let group = dispatch.shader.shader_group();
@@ -978,6 +987,10 @@ impl Pipelines {
             ) && dispatch.params.len() >= 4
             {
                 attention_head_dim = Some(dispatch.params[3]);
+                attention_head_dims
+                    .entry(group)
+                    .or_default()
+                    .insert(dispatch.params[3]);
             }
             if dispatch.use_small_tiles {
                 let small_group = match group {
@@ -1071,6 +1084,8 @@ impl Pipelines {
         let mut map = HashMap::new();
         let mut coop_map = HashMap::new();
         let mut small_map = HashMap::new();
+        let mut attention_map: HashMap<(ShaderEntry, u32), blade_graphics::ComputePipeline> =
+            HashMap::new();
 
         let compile_group =
             |group: ShaderGroup,
@@ -1116,41 +1131,54 @@ impl Pipelines {
                     | ShaderGroup::FlashGradKVCoop
                     | ShaderGroup::FullAttentionRelPosBias
             ) {
-                // Use parameterized attention generators with actual head_dim.
-                let hd = attention_head_dim.unwrap_or(64);
-                let sm = match group {
-                    ShaderGroup::FlashAttention => {
-                        crate::codegen::generate_flash_attention_module(hd)
-                    }
-                    ShaderGroup::FlashAttentionCoop => {
-                        crate::codegen::generate_flash_attention_coop_module(hd)
-                    }
-                    ShaderGroup::FlashGradQ => crate::codegen::generate_flash_grad_q_module(hd),
-                    ShaderGroup::FlashGradQCoop => {
-                        crate::codegen::generate_flash_grad_q_coop_module(hd)
-                    }
-                    ShaderGroup::FlashGradKV => crate::codegen::generate_flash_grad_kv_module(hd),
-                    ShaderGroup::FlashGradKVCoop => {
-                        crate::codegen::generate_flash_grad_kv_coop_module(hd)
-                    }
-                    ShaderGroup::FullAttentionRelPosBias => {
-                        crate::codegen::generate_attention_with_rel_pos_module(hd)
-                    }
-                    _ => crate::codegen::generate_attention_module(hd),
-                };
-                let shader = gpu.create_shader(bg::ShaderDesc {
-                    source: &sm.source,
-                    naga_module: Some(sm.module),
-                });
-                if let Some(entries) = entries_for_group.get(&group) {
-                    for entry in entries {
-                        let layout = shader_data_layout(entry);
-                        let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                            name: entry.entry_point(),
-                            data_layouts: &[&layout],
-                            compute: shader.at(entry.entry_point()),
-                        });
-                        map.insert(entry.clone(), pipeline);
+                // Use parameterized attention generators with the actual
+                // head_dim(s). A graph can use several head_dims for the same
+                // group (e.g. encoder self-attention at 64 + an attention-pool at
+                // 256); generate and key a pipeline per (entry, head_dim) so each
+                // dispatch gets the shader whose `@workgroup_size` matches its
+                // head_dim. The head_dim is baked into the shader, so this keeps
+                // each head_dim's kernel byte-identical to before.
+                let hds: Vec<u32> = attention_head_dims
+                    .get(&group)
+                    .map(|s| s.iter().copied().collect())
+                    .unwrap_or_else(|| vec![attention_head_dim.unwrap_or(64)]);
+                for hd in hds {
+                    let sm = match group {
+                        ShaderGroup::FlashAttention => {
+                            crate::codegen::generate_flash_attention_module(hd)
+                        }
+                        ShaderGroup::FlashAttentionCoop => {
+                            crate::codegen::generate_flash_attention_coop_module(hd)
+                        }
+                        ShaderGroup::FlashGradQ => crate::codegen::generate_flash_grad_q_module(hd),
+                        ShaderGroup::FlashGradQCoop => {
+                            crate::codegen::generate_flash_grad_q_coop_module(hd)
+                        }
+                        ShaderGroup::FlashGradKV => {
+                            crate::codegen::generate_flash_grad_kv_module(hd)
+                        }
+                        ShaderGroup::FlashGradKVCoop => {
+                            crate::codegen::generate_flash_grad_kv_coop_module(hd)
+                        }
+                        ShaderGroup::FullAttentionRelPosBias => {
+                            crate::codegen::generate_attention_with_rel_pos_module(hd)
+                        }
+                        _ => crate::codegen::generate_attention_module(hd),
+                    };
+                    let shader = gpu.create_shader(bg::ShaderDesc {
+                        source: &sm.source,
+                        naga_module: Some(sm.module),
+                    });
+                    if let Some(entries) = entries_for_group.get(&group) {
+                        for entry in entries {
+                            let layout = shader_data_layout(entry);
+                            let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
+                                name: entry.entry_point(),
+                                data_layouts: &[&layout],
+                                compute: shader.at(entry.entry_point()),
+                            });
+                            attention_map.insert((entry.clone(), hd), pipeline);
+                        }
                     }
                 }
             } else {
@@ -1355,6 +1383,7 @@ impl Pipelines {
             map,
             coop_map,
             small_map,
+            attention_map,
             weight_map,
             epilogue_map,
             pointwise_map,
@@ -1363,6 +1392,30 @@ impl Pipelines {
     }
 
     fn get(&self, dispatch: &Dispatch) -> &blade_graphics::ComputePipeline {
+        // Attention dispatches select a per-head_dim pipeline (head_dim is
+        // baked into the shader's workgroup size). params[3] is the head_dim.
+        {
+            use crate::codegen::ShaderGroup;
+            if matches!(
+                dispatch.shader.shader_group(),
+                ShaderGroup::MultiHeadAttn
+                    | ShaderGroup::FlashAttention
+                    | ShaderGroup::FlashAttentionCoop
+                    | ShaderGroup::FlashGradQ
+                    | ShaderGroup::FlashGradQCoop
+                    | ShaderGroup::FlashGradKV
+                    | ShaderGroup::FlashGradKVCoop
+                    | ShaderGroup::FullAttentionRelPosBias
+            ) && dispatch.params.len() >= 4
+            {
+                if let Some(p) = self
+                    .attention_map
+                    .get(&(dispatch.shader.clone(), dispatch.params[3]))
+                {
+                    return p;
+                }
+            }
+        }
         if let Some(ref k) = dispatch.reduction {
             if let Some(p) = self.reduction_map.get(&k.hash_key()) {
                 return p;
