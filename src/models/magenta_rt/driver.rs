@@ -26,11 +26,12 @@
 //!   temporal decoder cross-attends to.
 //!
 //! The heavy model stages it orchestrates — MusicCoCa text→style tokens, the
-//! SpectroStream encoder (audio→codec tokens) and decoder (tokens→audio) — are
-//! implemented in their own modules but gated on the real weight dumps; see
-//! `COMPLETION_PLAN.md`. [`generate_token_grid`] is the weight-independent LLM
-//! orchestration (encoder + CFG decode) that the end-to-end test drives on
-//! lavapipe.
+//! SpectroStream encoder (audio→codec tokens) and decoder (tokens→audio) — live
+//! in their own modules, each with its own real-weight gate. [`generate_token_
+//! grid`] is the weight-independent LLM orchestration (encoder + CFG decode) that
+//! `tests/llm_end_to_end_driver.rs` drives on lavapipe. The full assembled
+//! pipeline (text prompt → 2 s audio, all real weights) runs in
+//! `examples/magenta_rt_generate.rs`.
 
 use crate::runtime::Session;
 
