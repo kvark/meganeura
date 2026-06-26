@@ -21,7 +21,7 @@ fn ref_stft(audio: &[f32], cfg: &StftConfig) -> (Vec<f32>, usize) {
     let c = cfg.num_audio_channels;
     let num_samples = audio.len() / c;
     let num_bins = cfg.fft_length / 2;
-    let pad_left = cfg.frame_length - cfg.frame_step;
+    let pad_left = cfg.pad_left;
     let num_frames = num_samples / cfg.frame_step;
     let out_channels = 2 * c;
     let window = hann_periodic(cfg.frame_length);
@@ -65,6 +65,7 @@ fn stft_matches_naive_dft() {
         fft_length: 64,
         num_audio_channels: 2,
         keep_dc: true,
+        pad_left: 64 - 32, // causal alignment (frame_length - frame_step) for this check
     };
     // 8 frames of stereo audio: num_samples = 8 * frame_step = 256.
     let num_samples = 8 * cfg.frame_step;
@@ -104,6 +105,7 @@ fn keep_dc_false_drops_dc_bin() {
         fft_length: 32,
         num_audio_channels: 1,
         keep_dc: false,
+        pad_left: 32 - 16,
     };
     let audio: Vec<f32> = (0..16 * 4).map(|i| (i as f32 * 0.1).sin()).collect();
     let got = stft_features(&audio, &cfg);
