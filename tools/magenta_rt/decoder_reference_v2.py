@@ -17,7 +17,7 @@ import struct
 from pathlib import Path
 import numpy as np
 
-DUMP_DIR = Path('/x/Code/meganeura/magenta_rt_codec_dump')
+DUMP_DIR = Path(os.environ.get('MAGENTA_RT_DUMP', 'magenta_rt_codec_dump'))
 
 NUM_FRAMES = int(os.environ.get('NUM_FRAMES', 50))
 TEMPORAL_PAD = 1   # pad [0, 1] on T (added at END)

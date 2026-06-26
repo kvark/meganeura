@@ -78,7 +78,15 @@ def dump_variables(module, prefix: str) -> dict[str, np.ndarray]:
     for v in module.variables:
         raw = v.name.split(":", 1)[0]
         name = raw.replace("/", ".")
-        out[f"{prefix}.{name}"] = v.numpy()
+        arr = np.asarray(v.numpy())
+        # Skip non-weight scalars (e.g. bool training flags) that safetensors
+        # can't serialize; weights are all float arrays.
+        if arr.dtype == np.bool_ or arr.ndim == 0:
+            print(f"      skip non-weight var: {prefix}.{name} ({arr.dtype}, shape {arr.shape})")
+            continue
+        if arr.dtype == np.float64:
+            arr = arr.astype(np.float32)
+        out[f"{prefix}.{name}"] = np.ascontiguousarray(arr)
     return out
 
 

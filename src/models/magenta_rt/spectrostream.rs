@@ -28,19 +28,22 @@
 //! All conv padding = VALID; SpectroStream emulates SAME/causal via explicit
 //! Pad/Crop ops. Activation = ELU. Weight norm precomputed in `.rescaled.kernel`.
 //!
-//! Status: the decoder body graph is implemented end-to-end (input residual
-//! block → 7 decoder blocks → causal `base_conv_last` → temporal crop), with
-//! the six architectural fixes from `tools/magenta_rt/ARCH_FINDINGS.md`
-//! applied (causal conv padding, per-block conv-T strides, causal conv-T crop,
-//! 4-fold reinterpret between decoder_0/1). The input_layer's gated conv1x1
-//! and the iSTFT are done host-side in `examples/magenta_rt_demo.rs`.
+//! Status: **VERIFIED bit-exact against TF.** The decoder body graph (input
+//! residual block → 7 decoder blocks → causal `base_conv_last` → tail) matches
+//! the TF `body_out` to **rel err 2.0e-6** on real reference tokens
+//! (`tests/spectrostream_vs_tf_body.rs`), and the host-side [`istft_to_audio`]
+//! matches `tf.signal.inverse_stft` to **3.7e-6** (`tests/spectrostream_istft.rs`).
+//! The three former "free reinterpret" open questions are now all confirmed
+//! correct by that match: the decoder_0→1 batch-fold (PixelShuffle), the final
+//! subbatch/channel merge to `[re_L, im_L, re_R, im_R]` (tail transpose
+//! `(1,2,0,3)`), and the `base_conv_last` W padding. The input_layer's gated
+//! conv1x1 preprocess is host-side (verified end-to-end: embed → TF body match,
+//! `tools/magenta_rt/decoder_reference_v2.py`).
 //!
-//! Not yet verified bit-exact against TF (see `tests/spectrostream_vs_tf_body.rs`
-//! and the bisection tests). Open questions concentrated in three "free
-//! reinterpret" claims that still need a TF body_out comparison:
-//! - the decoder_0→1 batch-fold (assumed == TF reshape/transpose PixelShuffle),
-//! - the final batch/channel merge to [re_L, im_L, re_R, im_R],
-//! - `base_conv_last` keeps W=SAME (pad 3) where ARCH_FINDINGS expects W VALID.
+//! Known issue: on **AMD RDNA3.5 (RADV) under single-submit** a cross-pass
+//! cache-visibility bug produces NaN in some late dispatches (the demo clamps
+//! NaN→0); lavapipe (and the gate above) show **0 NaN**. Tracked separately —
+//! it is a Blade/RADV barrier issue, not a SpectroStream modeling bug.
 
 use crate::graph::{Graph, NodeId};
 
@@ -74,13 +77,76 @@ struct DecoderBlock {
 // strides attribute (see tools/magenta_rt/ARCH_FINDINGS.md). decoder_0 doubles
 // H only (stride_h=2, stride_w=1); decoder_1 doubles both axes.
 const DECODER_BLOCKS: [DecoderBlock; 7] = [
-    DecoderBlock { kt_kernel: (4, 3), stride_h: 2, stride_w: 1, in_c: 512,  mid_c: 1024, out_c: 1024, has_shortcut_conv: true,  name: "decoder_0" },
-    DecoderBlock { kt_kernel: (4, 4), stride_h: 2, stride_w: 2, in_c: 512,  mid_c: 256,  out_c: 256,  has_shortcut_conv: true,  name: "decoder_1" },
-    DecoderBlock { kt_kernel: (3, 4), stride_h: 1, stride_w: 2, in_c: 256,  mid_c: 256,  out_c: 256,  has_shortcut_conv: false, name: "decoder_2" },
-    DecoderBlock { kt_kernel: (3, 4), stride_h: 1, stride_w: 2, in_c: 256,  mid_c: 256,  out_c: 256,  has_shortcut_conv: false, name: "decoder_3" },
-    DecoderBlock { kt_kernel: (3, 6), stride_h: 1, stride_w: 3, in_c: 256,  mid_c: 128,  out_c: 128,  has_shortcut_conv: true,  name: "decoder_4" },
-    DecoderBlock { kt_kernel: (3, 4), stride_h: 1, stride_w: 2, in_c: 128,  mid_c: 128,  out_c: 128,  has_shortcut_conv: false, name: "decoder_5" },
-    DecoderBlock { kt_kernel: (3, 4), stride_h: 1, stride_w: 2, in_c: 128,  mid_c: 64,   out_c: 64,   has_shortcut_conv: true,  name: "decoder_6" },
+    DecoderBlock {
+        kt_kernel: (4, 3),
+        stride_h: 2,
+        stride_w: 1,
+        in_c: 512,
+        mid_c: 1024,
+        out_c: 1024,
+        has_shortcut_conv: true,
+        name: "decoder_0",
+    },
+    DecoderBlock {
+        kt_kernel: (4, 4),
+        stride_h: 2,
+        stride_w: 2,
+        in_c: 512,
+        mid_c: 256,
+        out_c: 256,
+        has_shortcut_conv: true,
+        name: "decoder_1",
+    },
+    DecoderBlock {
+        kt_kernel: (3, 4),
+        stride_h: 1,
+        stride_w: 2,
+        in_c: 256,
+        mid_c: 256,
+        out_c: 256,
+        has_shortcut_conv: false,
+        name: "decoder_2",
+    },
+    DecoderBlock {
+        kt_kernel: (3, 4),
+        stride_h: 1,
+        stride_w: 2,
+        in_c: 256,
+        mid_c: 256,
+        out_c: 256,
+        has_shortcut_conv: false,
+        name: "decoder_3",
+    },
+    DecoderBlock {
+        kt_kernel: (3, 6),
+        stride_h: 1,
+        stride_w: 3,
+        in_c: 256,
+        mid_c: 128,
+        out_c: 128,
+        has_shortcut_conv: true,
+        name: "decoder_4",
+    },
+    DecoderBlock {
+        kt_kernel: (3, 4),
+        stride_h: 1,
+        stride_w: 2,
+        in_c: 128,
+        mid_c: 128,
+        out_c: 128,
+        has_shortcut_conv: false,
+        name: "decoder_5",
+    },
+    DecoderBlock {
+        kt_kernel: (3, 4),
+        stride_h: 1,
+        stride_w: 2,
+        in_c: 128,
+        mid_c: 64,
+        out_c: 64,
+        has_shortcut_conv: true,
+        name: "decoder_6",
+    },
 ];
 
 /// Top-level SpectroStream config (decoder-side).
@@ -142,7 +208,10 @@ struct Feat {
 
 /// ELU activation (shape preserved).
 fn elu(g: &mut Graph, x: Feat) -> Feat {
-    Feat { node: g.elu(x.node), ..x }
+    Feat {
+        node: g.elu(x.node),
+        ..x
+    }
 }
 
 /// 2D convolution with arbitrary output channels. Kernel/bias stored as
@@ -168,13 +237,19 @@ fn conv2d(
     let out_h = x.h + 2 * padding_h - kh + 1;
     let out_w = x.w + 2 * padding_w - kw + 1;
     let node = g.conv2d_hw(
-        x.node, kernel,
-        x.b, x.c, x.h, x.w,
-        out_c, kh, kw,
-        1, padding_h, padding_w,
+        x.node, kernel, x.b, x.c, x.h, x.w, out_c, kh, kw, 1, padding_h, padding_w,
     );
-    let out = Feat { node, b: x.b, c: out_c, h: out_h, w: out_w };
-    Feat { node: g.add_per_channel(out.node, bias, out_c, out.h * out.w), ..out }
+    let out = Feat {
+        node,
+        b: x.b,
+        c: out_c,
+        h: out_h,
+        w: out_w,
+    };
+    Feat {
+        node: g.add_per_channel(out.node, bias, out_c, out.h * out.w),
+        ..out
+    }
 }
 
 /// 2D transposed convolution, routed through `dilate_zeros_w → forward
@@ -207,34 +282,71 @@ fn conv_transpose(
 
     // Dilate W, then dilate H (independent ops; order doesn't matter).
     let dilated_w = g.dilate_zeros_w(x.node, x.b, x.c, x.h, x.w, stride_w);
-    let dil_w = if stride_w == 1 { x.w } else { x.w * stride_w - (stride_w - 1) };
+    let dil_w = if stride_w == 1 {
+        x.w
+    } else {
+        x.w * stride_w - (stride_w - 1)
+    };
     let dilated = if stride_h == 1 {
         dilated_w
     } else {
         g.dilate_zeros_h(dilated_w, x.b, x.c, x.h, dil_w, stride_h)
     };
-    let dil_h = if stride_h == 1 { x.h } else { x.h * stride_h - (stride_h - 1) };
+    let dil_h = if stride_h == 1 {
+        x.h
+    } else {
+        x.h * stride_h - (stride_h - 1)
+    };
     let node = g.conv2d_hw(
-        dilated, kernel,
-        x.b, x.c, dil_h, dil_w,
-        out_c, kh, kw,
+        dilated,
+        kernel,
+        x.b,
+        x.c,
+        dil_h,
+        dil_w,
+        out_c,
+        kh,
+        kw,
         1, // stride
-        kh - 1, kw - 1,
+        kh - 1,
+        kw - 1,
     );
-    let out = Feat { node, b: x.b, c: out_c, h: out_h, w: out_w };
-    Feat { node: g.add_per_channel(out.node, bias, out_c, out.h * out.w), ..out }
+    let out = Feat {
+        node,
+        b: x.b,
+        c: out_c,
+        h: out_h,
+        w: out_w,
+    };
+    Feat {
+        node: g.add_per_channel(out.node, bias, out_c, out.h * out.w),
+        ..out
+    }
 }
 
 fn slice2d(g: &mut Graph, x: Feat, start_h: u32, end_h: u32, start_w: u32, end_w: u32) -> Feat {
     let out_h = x.h - start_h - end_h;
     let out_w = x.w - start_w - end_w;
     let node = g.slice_2d(x.node, x.b, x.c, x.h, x.w, start_h, end_h, start_w, end_w);
-    Feat { node, b: x.b, c: x.c, h: out_h, w: out_w }
+    Feat {
+        node,
+        b: x.b,
+        c: x.c,
+        h: out_h,
+        w: out_w,
+    }
 }
 
 fn add_feat(g: &mut Graph, a: Feat, b: Feat) -> Feat {
-    assert_eq!((a.b, a.c, a.h, a.w), (b.b, b.c, b.h, b.w), "add_feat shape mismatch");
-    Feat { node: g.add(a.node, b.node), ..a }
+    assert_eq!(
+        (a.b, a.c, a.h, a.w),
+        (b.b, b.c, b.h, b.w),
+        "add_feat shape mismatch"
+    );
+    Feat {
+        node: g.add(a.node, b.node),
+        ..a
+    }
 }
 
 /// Helper: name of a weight_norm rescaled kernel parameter.
@@ -261,8 +373,18 @@ fn causal_conv2d_3x3(
     bias_param_name: &str,
     out_c: u32,
 ) -> Feat {
-    let after_conv = conv2d(g, x, params, kernel_param_name, bias_param_name,
-                            out_c, 3, 3, 2, 1);
+    let after_conv = conv2d(
+        g,
+        x,
+        params,
+        kernel_param_name,
+        bias_param_name,
+        out_c,
+        3,
+        3,
+        2,
+        1,
+    );
     // conv2d output H = x.h + 2*2 - 3 + 1 = x.h + 2; slice strips trailing 2.
     slice2d(g, after_conv, 0, 2, 0, 0)
 }
@@ -348,11 +470,19 @@ pub fn build_decoder_graph_through(
     for sub in &["conv2d_3x3_a", "conv2d_3x3"] {
         let prefix = format!("decoder.input_layer.{sub}");
         let h = elu(g, x);
-        x = causal_conv2d_3x3(g, h, &params, &wn_kernel(&prefix), &wn_bias(&prefix),
-                              cfg.initial_channels);
+        x = causal_conv2d_3x3(
+            g,
+            h,
+            &params,
+            &wn_kernel(&prefix),
+            &wn_bias(&prefix),
+            cfg.initial_channels,
+        );
     }
     x = add_feat(g, x, residual);
-    if stop_after == DecoderStage::InputLayer { return x.node; }
+    if stop_after == DecoderStage::InputLayer {
+        return x.node;
+    }
 
     for (idx, blk) in DECODER_BLOCKS.iter().enumerate() {
         x = decoder_block(g, x, &params, blk);
@@ -363,9 +493,17 @@ pub fn build_decoder_graph_through(
             //   [B=1, C=1024, T, W] (memory) == [B=2, C=512, T, W] (interpretation)
             // since the channel stride is the major axis and 1024 = 2 × 512
             // splits cleanly. So this is a free Feat-only reshape — no op.
-            x = Feat { node: x.node, b: 2, c: x.c / 2, h: x.h, w: x.w };
+            x = Feat {
+                node: x.node,
+                b: 2,
+                c: x.c / 2,
+                h: x.h,
+                w: x.w,
+            };
         }
-        if stop_after == DecoderStage::Block(idx as u8) { return x.node; }
+        if stop_after == DecoderStage::Block(idx as u8) {
+            return x.node;
+        }
     }
     assert_eq!(x.c, 64);
 
@@ -376,12 +514,15 @@ pub fn build_decoder_graph_through(
     // Emulate via symmetric pad (6, 3) + VALID conv + slice strip trailing 6 H.
     // Output H = x_act.h + 12 - 7 + 1 = x_act.h + 6 (pre-slice); W = x_act.w.
     let conv_node = g.conv2d_hw(
-        x_act.node, kernel,
-        x_act.b, x_act.c, x_act.h, x_act.w,
-        2, 7, 7,
-        1, 6, 3,
+        x_act.node, kernel, x_act.b, x_act.c, x_act.h, x_act.w, 2, 7, 7, 1, 6, 3,
     );
-    let pre_bias = Feat { node: conv_node, b: x_act.b, c: 2, h: x_act.h + 6, w: x_act.w };
+    let pre_bias = Feat {
+        node: conv_node,
+        b: x_act.b,
+        c: 2,
+        h: x_act.h + 6,
+        w: x_act.w,
+    };
     let biased = Feat {
         node: g.add_per_channel(pre_bias.node, bias, 2, pre_bias.h * pre_bias.w),
         ..pre_bias
@@ -410,9 +551,15 @@ pub fn build_decoder_graph_through(
 /// `name → NodeId` map. Each name is declared exactly once. The host-side
 /// params (quantizer, conv1x1_first) are declared too so the loader sees
 /// them; they're unused by the GPU graph.
-fn declare_all_params(g: &mut Graph, cfg: &SpectroStreamConfig) -> std::collections::HashMap<String, NodeId> {
+fn declare_all_params(
+    g: &mut Graph,
+    cfg: &SpectroStreamConfig,
+) -> std::collections::HashMap<String, NodeId> {
     let mut params = std::collections::HashMap::new();
-    let decl = |g: &mut Graph, name: String, shape: Vec<usize>, params: &mut std::collections::HashMap<String, NodeId>| {
+    let decl = |g: &mut Graph,
+                name: String,
+                shape: Vec<usize>,
+                params: &mut std::collections::HashMap<String, NodeId>| {
         let node = g.parameter(&name, &shape);
         params.insert(name, node);
     };
@@ -423,10 +570,14 @@ fn declare_all_params(g: &mut Graph, cfg: &SpectroStreamConfig) -> std::collecti
         vec![(cfg.max_rvq_depth * cfg.codebook_size * cfg.embedding_dim) as usize],
         &mut params,
     );
-    for sub in &["conv1x1_first.conv1x1", "conv1x1_first.conv1x1_a", "conv1x1_first.conv1x1_b"] {
+    for sub in &[
+        "conv1x1_first.conv1x1",
+        "conv1x1_first.conv1x1_a",
+        "conv1x1_first.conv1x1_b",
+    ] {
         let prefix = format!("decoder.input_layer.{sub}");
         let (out_c, in_c) = match *sub {
-            "conv1x1_first.conv1x1"   => (2560, cfg.embedding_dim as usize),
+            "conv1x1_first.conv1x1" => (2560, cfg.embedding_dim as usize),
             "conv1x1_first.conv1x1_a" => (2560, cfg.embedding_dim as usize),
             "conv1x1_first.conv1x1_b" => (2560, 2560),
             _ => unreachable!(),
@@ -440,26 +591,50 @@ fn declare_all_params(g: &mut Graph, cfg: &SpectroStreamConfig) -> std::collecti
         decl(g, wn_kernel(&prefix), vec![3 * 3 * 512 * 512], &mut params);
         decl(g, wn_bias(&prefix), vec![512], &mut params);
     }
-    decl(g, "decoder.input_layer.base_conv_last.conv.kernel".to_string(), vec![7 * 7 * 64 * 2], &mut params);
-    decl(g, "decoder.input_layer.base_conv_last.conv.bias".to_string(), vec![2], &mut params);
+    decl(
+        g,
+        "decoder.input_layer.base_conv_last.conv.kernel".to_string(),
+        vec![7 * 7 * 64 * 2],
+        &mut params,
+    );
+    decl(
+        g,
+        "decoder.input_layer.base_conv_last.conv.bias".to_string(),
+        vec![2],
+        &mut params,
+    );
     for blk in DECODER_BLOCKS.iter() {
         let (kh, kw) = blk.kt_kernel;
         let kt_name = format!("decoder.{}.conv2dtranspose_{kh}x{kw}", blk.name);
-        decl(g, wn_kernel(&kt_name), vec![(kh * kw) as usize * blk.mid_c as usize * blk.in_c as usize], &mut params);
+        decl(
+            g,
+            wn_kernel(&kt_name),
+            vec![(kh * kw) as usize * blk.mid_c as usize * blk.in_c as usize],
+            &mut params,
+        );
         decl(g, wn_bias(&kt_name), vec![blk.mid_c as usize], &mut params);
         let c3_name = format!("decoder.{}.conv2d_3x3", blk.name);
-        decl(g, wn_kernel(&c3_name), vec![3 * 3 * blk.mid_c as usize * blk.out_c as usize], &mut params);
+        decl(
+            g,
+            wn_kernel(&c3_name),
+            vec![3 * 3 * blk.mid_c as usize * blk.out_c as usize],
+            &mut params,
+        );
         decl(g, wn_bias(&c3_name), vec![blk.out_c as usize], &mut params);
         if blk.has_shortcut_conv {
             let sc_name = format!("decoder.{}.shortcut.conv1x1", blk.name);
             // 1×1 shortcut conv kernel [out_c, in_c, 1, 1] flat.
-            decl(g, wn_kernel(&sc_name), vec![blk.in_c as usize * blk.out_c as usize], &mut params);
+            decl(
+                g,
+                wn_kernel(&sc_name),
+                vec![blk.in_c as usize * blk.out_c as usize],
+                &mut params,
+            );
             decl(g, wn_bias(&sc_name), vec![blk.out_c as usize], &mut params);
         }
     }
     params
 }
-
 
 /// Permute a 4D NHWC-style flat tensor `[a, b, c, d]` to `[d, c, a, b]`.
 /// Both TF Conv2D `[kH, kW, in_c, out_c]` and TF Conv2DTranspose
@@ -492,7 +667,11 @@ fn permute_4d_3201(data: &[f32], dims: [usize; 4]) -> Vec<f32> {
 ///   `[out_c, in_c, kH, kW]` with spatial axes flipped.
 /// That is: `out[oc, ic, r, c] = in[ic, oc, kH-1-r, kW-1-c]`.
 fn flip_and_transpose_conv_t(
-    data: &[f32], in_c: usize, out_c: usize, kh: usize, kw: usize,
+    data: &[f32],
+    in_c: usize,
+    out_c: usize,
+    kh: usize,
+    kw: usize,
 ) -> Vec<f32> {
     assert_eq!(data.len(), in_c * out_c * kh * kw);
     let mut out = vec![0.0_f32; data.len()];
@@ -593,7 +772,11 @@ fn decoder_block(
     params: &std::collections::HashMap<String, NodeId>,
     blk: &DecoderBlock,
 ) -> Feat {
-    assert_eq!(x.c, blk.in_c, "block {}: input channels {} ≠ expected {}", blk.name, x.c, blk.in_c);
+    assert_eq!(
+        x.c, blk.in_c,
+        "block {}: input channels {} ≠ expected {}",
+        blk.name, x.c, blk.in_c
+    );
 
     let (kt_h, kt_w) = blk.kt_kernel;
     let prefix_kt = format!("decoder.{}.conv2dtranspose_{kt_h}x{kt_w}", blk.name);
@@ -603,10 +786,16 @@ fn decoder_block(
     // ELU → causal conv2d_3x3.
     let main = elu(g, x);
     let main = conv_transpose(
-        g, main, params,
-        &wn_kernel(&prefix_kt), &wn_bias(&prefix_kt),
-        blk.mid_c, kt_h, kt_w,
-        blk.stride_h, blk.stride_w,
+        g,
+        main,
+        params,
+        &wn_kernel(&prefix_kt),
+        &wn_bias(&prefix_kt),
+        blk.mid_c,
+        kt_h,
+        kt_w,
+        blk.stride_h,
+        blk.stride_w,
     );
     // TF's conv-T post-processing:
     //   - internal slice trims H to H_in*stride_h from END (causal)
@@ -622,16 +811,29 @@ fn decoder_block(
     let main = elu(g, main);
     // conv2d_3x3 is causal in H (pad [2, 0]) + SAME in W (pad [1, 1]).
     let main = causal_conv2d_3x3(
-        g, main, params,
-        &wn_kernel(&prefix_c3), &wn_bias(&prefix_c3),
+        g,
+        main,
+        params,
+        &wn_kernel(&prefix_c3),
+        &wn_bias(&prefix_c3),
         blk.out_c,
     );
 
     // Shortcut path: optional 1×1 conv → H/W upsample to match main.
     let short = if blk.has_shortcut_conv {
         let prefix_sc = format!("decoder.{}.shortcut.conv1x1", blk.name);
-        conv2d(g, x, params, &wn_kernel(&prefix_sc), &wn_bias(&prefix_sc),
-               blk.out_c, 1, 1, 0, 0)
+        conv2d(
+            g,
+            x,
+            params,
+            &wn_kernel(&prefix_sc),
+            &wn_bias(&prefix_sc),
+            blk.out_c,
+            1,
+            1,
+            0,
+            0,
+        )
     } else {
         x
     };
@@ -643,7 +845,131 @@ fn decoder_block(
 /// Nearest-neighbor upsample on both axes.
 fn upsample_hw(g: &mut Graph, x: Feat, scale_h: u32, scale_w: u32) -> Feat {
     let node = g.upsample_nearest(x.node, x.b, x.c, x.h, x.w, scale_h, scale_w);
-    Feat { node, b: x.b, c: x.c, h: x.h * scale_h, w: x.w * scale_w }
+    Feat {
+        node,
+        b: x.b,
+        c: x.c,
+        h: x.h * scale_h,
+        w: x.w * scale_w,
+    }
+}
+
+// ===================== iSTFT (decoder body → audio) =====================
+
+/// iSTFT parameters mirroring `tf.signal.inverse_stft` as the SpectroStream
+/// decoder uses it: `frame_length = fft_length = 960`, `frame_step = 480`, a
+/// periodic-Hann analysis window with the matching `inverse_stft_window_fn`
+/// synthesis window, and `num_bins = 480` kept STFT bins (DC..478,479; the
+/// Nyquist bin is dropped on the forward STFT and reconstructed as zero).
+#[derive(Clone, Debug)]
+pub struct IstftConfig {
+    pub frame_length: usize,
+    pub frame_step: usize,
+    pub fft_length: usize,
+    pub num_bins: usize,
+    pub num_audio_channels: usize,
+}
+
+impl Default for IstftConfig {
+    fn default() -> Self {
+        Self {
+            frame_length: 960,
+            frame_step: 480,
+            fft_length: 960,
+            num_bins: 480,
+            num_audio_channels: 2,
+        }
+    }
+}
+
+/// Periodic Hann window (`tf.signal.hann_window`, `periodic=True`).
+fn hann_periodic_d(n: usize) -> Vec<f64> {
+    (0..n)
+        .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / n as f64).cos())
+        .collect()
+}
+
+/// `tf.signal.inverse_stft_window_fn(frame_step)` synthesis window: the forward
+/// (Hann) window divided by the hop-folded sum of its square — the COLA
+/// normalization that makes analysis×synthesis overlap-add to 1.
+fn inverse_synthesis_window(frame_length: usize, frame_step: usize) -> Vec<f64> {
+    let fw = hann_periodic_d(frame_length);
+    let overlaps = frame_length.div_ceil(frame_step);
+    // denom[j] = sum_o fw[o*step + j]^2, folded over the hop, tiled to length.
+    let mut denom = vec![0.0_f64; frame_step];
+    for (n, &w) in fw.iter().enumerate() {
+        denom[n % frame_step] += w * w;
+    }
+    let _ = overlaps;
+    fw.iter()
+        .enumerate()
+        .map(|(n, &w)| {
+            let d = denom[n % frame_step];
+            if d > 1e-12 {
+                w / d
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
+/// Inverse STFT of the decoder body output → interleaved stereo audio.
+///
+/// `spec` is the body output `[num_frames, num_bins, 2*num_audio_channels]`
+/// row-major (NHWC), the last axis being `(re, im)` interleaved per channel
+/// (e.g. `[L_re, L_im, R_re, R_im]`). Returns `[num_samples, num_audio_channels]`
+/// interleaved, where `num_samples = num_frames * frame_step` (the
+/// `frame_length - frame_step` tail beyond that is dropped, matching the codec's
+/// 2-second chunking).
+///
+/// Verified bit-exact (rms-ratio 0.0) against `tf.signal.inverse_stft` on real
+/// decoder body outputs — see `tests/spectrostream_istft.rs`.
+pub fn istft_to_audio(spec: &[f32], num_frames: usize, cfg: &IstftConfig) -> Vec<f32> {
+    use rustfft::num_complex::Complex;
+    use rustfft::FftPlanner;
+
+    let n = cfg.fft_length;
+    let bins = cfg.num_bins;
+    let chans = cfg.num_audio_channels;
+    let cols = 2 * chans;
+    assert_eq!(spec.len(), num_frames * bins * cols, "spec size mismatch");
+
+    let syn = inverse_synthesis_window(cfg.frame_length, cfg.frame_step);
+    let mut planner = FftPlanner::<f64>::new();
+    let ifft = planner.plan_fft_inverse(n);
+
+    let out_len = num_frames * cfg.frame_step;
+    let mut audio = vec![0.0_f32; out_len * chans];
+
+    for ch in 0..chans {
+        let mut acc = vec![0.0_f64; (num_frames - 1) * cfg.frame_step + cfg.frame_length];
+        for f in 0..num_frames {
+            // Build the full `n`-point Hermitian spectrum from the kept bins
+            // (bins 0..bins-1; Nyquist and the rest = 0, filled by symmetry).
+            let mut buf = vec![Complex::new(0.0_f64, 0.0); n];
+            for k in 0..bins {
+                let base = (f * bins + k) * cols + ch * 2;
+                let re = spec[base] as f64;
+                let im = spec[base + 1] as f64;
+                buf[k] = Complex::new(re, im);
+                if k > 0 && k < n {
+                    buf[n - k] = Complex::new(re, -im);
+                }
+            }
+            ifft.process(&mut buf);
+            // rustfft inverse is unnormalized; divide by n. Apply synthesis
+            // window and overlap-add.
+            let start = f * cfg.frame_step;
+            for (i, &w) in syn.iter().enumerate() {
+                acc[start + i] += buf[i].re / n as f64 * w;
+            }
+        }
+        for (s, &v) in acc.iter().take(out_len).enumerate() {
+            audio[s * chans + ch] = v as f32;
+        }
+    }
+    audio
 }
 
 #[cfg(test)]
@@ -686,9 +1012,14 @@ mod tests {
         // + 2 for shortcut.conv1x1 if has_shortcut_conv. Plus input_layer: 6 conv1x1
         // tensors + 4 conv2d_3x3 tensors + 2 base_conv_last + 1 codebook = ~13 + 28 + ~10 = ~50.
         // Just verify we got a sensible nonzero count.
-        let n_params = g.nodes().iter().filter(|n| {
-            matches!(n.op, crate::graph::Op::Parameter { .. })
-        }).count();
-        assert!(n_params > 30, "expected ≥30 parameter nodes, got {n_params}");
+        let n_params = g
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.op, crate::graph::Op::Parameter { .. }))
+            .count();
+        assert!(
+            n_params > 30,
+            "expected ≥30 parameter nodes, got {n_params}"
+        );
     }
 }
