@@ -972,6 +972,156 @@ pub fn istft_to_audio(spec: &[f32], num_frames: usize, cfg: &IstftConfig) -> Vec
     audio
 }
 
+// ============== Decoder host-side token → graph-input preprocessing ==============
+//
+// The decoder GPU graph ([`build_decoder_graph`]) starts from the input_layer's
+// expanded NCHW feature map, so the host must turn RVQ token indices into that
+// feature map first. Two steps, both cheap (matmuls + a gather):
+//   1. [`dequantize_tokens`] — RVQ indices `[frames, depth]` → embedding
+//      `[frames, 256]` (sum of the chosen codebook centroids).
+//   2. [`input_layer_preprocess`] — embedding → the gated `conv1x1_first`
+//      expansion, reshaped/transposed to the NCHW `decoder_input_preprocessed`
+//      the graph consumes.
+// These were previously inlined in `examples/magenta_rt_demo.rs`; factoring them
+// here lets the demo, the full-pipeline example, and tests share one code path.
+
+/// Dequantize RVQ token indices into the codec's continuous embedding.
+///
+/// `tokens` is `[num_frames, depth]` row-major (frame-major, level-minor); each
+/// entry indexes its level's codebook. `codebooks` is `[K, codebook_size,
+/// embed_dim]` (the dumped `quantizer.rvq_codebooks`, `K ≥ depth`); only the
+/// first `depth` levels are used. Returns the embedding `[num_frames *
+/// embed_dim]` with `embed[f] = Σ_{k<depth} codebooks[k, tokens[f,k]]`.
+///
+/// The LLM generates `depth = 16` levels per frame; a full codec round-trip uses
+/// all 64. Both are just a different `depth`.
+pub fn dequantize_tokens(
+    tokens: &[u32],
+    num_frames: usize,
+    codebooks: &[f32],
+    depth: usize,
+    codebook_size: usize,
+    embed_dim: usize,
+) -> Vec<f32> {
+    assert_eq!(tokens.len(), num_frames * depth, "tokens must be frames × depth");
+    assert!(
+        codebooks.len() >= depth * codebook_size * embed_dim,
+        "codebooks too small for depth {depth}",
+    );
+    let mut embed = vec![0.0_f32; num_frames * embed_dim];
+    for f in 0..num_frames {
+        for k in 0..depth {
+            let tok = tokens[f * depth + k] as usize;
+            debug_assert!(tok < codebook_size, "token {tok} ≥ codebook {codebook_size}");
+            let cb = (k * codebook_size + tok) * embed_dim;
+            let dst = f * embed_dim;
+            for d in 0..embed_dim {
+                embed[dst + d] += codebooks[cb + d];
+            }
+        }
+    }
+    embed
+}
+
+/// out[t, n] = Σ_d in[t, d] · kernel[d, n] + bias[n].
+fn matmul_add(input: &[f32], kernel: &[f32], bias: &[f32], rows: usize, in_dim: usize, out_dim: usize) -> Vec<f32> {
+    assert_eq!(kernel.len(), in_dim * out_dim);
+    assert_eq!(bias.len(), out_dim);
+    let mut out = vec![0.0_f32; rows * out_dim];
+    for t in 0..rows {
+        let row = &input[t * in_dim..(t + 1) * in_dim];
+        for n in 0..out_dim {
+            let mut acc = bias[n];
+            for d in 0..in_dim {
+                acc += row[d] * kernel[d * out_dim + n];
+            }
+            out[t * out_dim + n] = acc;
+        }
+    }
+    out
+}
+
+/// Apply the decoder's `input_layer.conv1x1_first` gated expansion to the codec
+/// embedding and lay the result out as the `decoder_input_preprocessed` input
+/// that [`build_decoder_graph`] consumes.
+///
+/// Steps (mirroring the TF `input_layer`, host-side because it is just matmuls):
+///   1. append `cfg.temporal_pad` zero frames at the end → `[T+pad, 256]`;
+///   2. gated conv1x1: `out = conv1x1_b(elu(conv1x1_a(x))) + conv1x1(x)` →
+///      `[T+pad, 2560]`;
+///   3. reshape `[T+pad, 2560]` → NHWC `[1, T+pad, 5, 512]` then transpose to
+///      NCHW `[1, 512, T+pad, 5]`.
+///
+/// `weights` must contain the `decoder.input_layer.conv1x1_first.*` kernels and
+/// biases. Returns the flat NCHW buffer of length `512 · (T+pad) · 5`.
+pub fn input_layer_preprocess(
+    embed: &[f32],
+    num_frames: usize,
+    weights: &crate::data::safetensors::SafeTensorsModel,
+    cfg: &SpectroStreamConfig,
+) -> Vec<f32> {
+    let embed_dim = cfg.embedding_dim as usize;
+    let init_freq = cfg.initial_freq_bins as usize;
+    let init_chan = cfg.initial_channels as usize;
+    let out_2560 = init_freq * init_chan;
+    assert_eq!(embed.len(), num_frames * embed_dim, "embed must be frames × {embed_dim}");
+
+    // 1. Temporal pad: append `temporal_pad` zero frames at the end.
+    let t_padded = num_frames + cfg.temporal_pad as usize;
+    let mut x = vec![0.0_f32; t_padded * embed_dim];
+    x[..num_frames * embed_dim].copy_from_slice(embed);
+
+    // 2. Gated conv1x1_first.
+    let pfx = "decoder.input_layer.conv1x1_first";
+    let g = |n: &str| weights.tensor_f32_auto(n).unwrap_or_else(|e| panic!("{n}: {e}"));
+    let k_a = g(&format!("{pfx}.conv1x1_a.weight_norm.rescaled.kernel"));
+    let b_a = g(&format!("{pfx}.conv1x1_a.weight_norm.bias"));
+    let k_b = g(&format!("{pfx}.conv1x1_b.weight_norm.rescaled.kernel"));
+    let b_b = g(&format!("{pfx}.conv1x1_b.weight_norm.bias"));
+    let k_p = g(&format!("{pfx}.conv1x1.weight_norm.rescaled.kernel"));
+    let b_p = g(&format!("{pfx}.conv1x1.weight_norm.bias"));
+
+    let main_a = matmul_add(&x, &k_a, &b_a, t_padded, embed_dim, out_2560);
+    let main_a_elu: Vec<f32> = main_a.iter().map(|&v| if v > 0.0 { v } else { v.exp() - 1.0 }).collect();
+    let main_b = matmul_add(&main_a_elu, &k_b, &b_b, t_padded, out_2560, out_2560);
+    let parallel = matmul_add(&x, &k_p, &b_p, t_padded, embed_dim, out_2560);
+
+    // 3. (main_b + parallel) reshape [T,5,512] → transpose to NCHW [1,512,T,5].
+    let mut nchw = vec![0.0_f32; init_chan * t_padded * init_freq];
+    for t in 0..t_padded {
+        for fbin in 0..init_freq {
+            for c in 0..init_chan {
+                let v = main_b[t * out_2560 + fbin * init_chan + c]
+                    + parallel[t * out_2560 + fbin * init_chan + c];
+                nchw[(c * t_padded + t) * init_freq + fbin] = v;
+            }
+        }
+    }
+    nchw
+}
+
+/// Convert the decoder body output (NCHW `[1, 2*chan, out_frames, num_bins]`, the
+/// real/imag channels per stereo channel) to interleaved stereo audio via
+/// [`istft_to_audio`]. `out_frames` is the body's time dim (e.g. 200 for a 2 s
+/// chunk). Non-finite body samples are zeroed (RADV GPU bug; see the demo).
+pub fn decoder_body_to_audio(body_nchw: &[f32], out_frames: usize, cfg: &IstftConfig) -> Vec<f32> {
+    let chans = cfg.num_audio_channels;
+    let bins = cfg.num_bins;
+    let cols = 2 * chans;
+    assert_eq!(body_nchw.len(), out_frames * bins * cols, "body size mismatch");
+    // NCHW [1, cols, out_frames, bins] → NHWC [out_frames, bins, cols].
+    let mut nhwc = vec![0.0_f32; out_frames * bins * cols];
+    for c in 0..cols {
+        for h in 0..out_frames {
+            for w in 0..bins {
+                let v = body_nchw[(c * out_frames + h) * bins + w];
+                nhwc[(h * bins + w) * cols + c] = if v.is_finite() { v } else { 0.0 };
+            }
+        }
+    }
+    istft_to_audio(&nhwc, out_frames, cfg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -984,6 +1134,30 @@ mod tests {
         assert_eq!(c.sample_rate / c.frame_rate, 1920);
         assert_eq!(c.embedding_dim, 256);
         assert_eq!(c.initial_freq_bins * c.initial_channels, 2560);
+    }
+
+    #[test]
+    fn dequantize_tokens_sums_selected_centroids() {
+        // 2 frames, depth 3, codebook_size 4, embed_dim 2. codebooks[k,e,d].
+        let (frames, depth, cbsz, dim) = (2usize, 3usize, 4usize, 2usize);
+        let mut cb = vec![0.0_f32; depth * cbsz * dim];
+        for k in 0..depth {
+            for e in 0..cbsz {
+                for d in 0..dim {
+                    cb[(k * cbsz + e) * dim + d] = (k * 100 + e * 10 + d) as f32;
+                }
+            }
+        }
+        // frame0 picks (1,2,3); frame1 picks (0,0,0).
+        let tokens = [1u32, 2, 3, 0, 0, 0];
+        let embed = dequantize_tokens(&tokens, frames, &cb, depth, cbsz, dim);
+        // frame0,d0 = cb[0,1,0]+cb[1,2,0]+cb[2,3,0] = 10 + 120 + 230 = 360.
+        assert_eq!(embed[0], 360.0);
+        // frame0,d1 = 11 + 121 + 231 = 363.
+        assert_eq!(embed[1], 363.0);
+        // frame1,d0 = cb[0,0,0]+cb[1,0,0]+cb[2,0,0] = 0 + 100 + 200 = 300.
+        assert_eq!(embed[2], 300.0);
+        assert_eq!(embed[3], 303.0); // +1 each for d1
     }
 
     #[test]
