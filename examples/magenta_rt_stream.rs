@@ -128,7 +128,16 @@ fn main() {
             let mut dec_in = Vec::with_capacity((frames + 1) * 16);
             dec_in.extend_from_slice(state.boundary_frame());
             dec_in.extend_from_slice(&grid);
-            let audio = codec.decode(&dec_in, frames + 1);
+            let mut audio = codec.decode(&dec_in, frames + 1);
+
+            // Chunk 0 has no previous chunk to seam with: its boundary is the
+            // cold-start frame (not real music), so drop that leading frame for a
+            // clean onset. Later chunks keep it — that frame is the overlap the
+            // crossfade consumes.
+            let frame_samples = mrt.frame_length_samples() as usize * mrt.codec_num_channels as usize;
+            if ci == 0 {
+                audio.drain(..frame_samples.min(audio.len()));
+            }
 
             // 4. Slide the token window for the next chunk.
             state.push_chunk(&grid);

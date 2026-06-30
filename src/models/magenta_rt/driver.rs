@@ -18,6 +18,12 @@
 //!   levels + 6 style RVQ levels into the LLM's unified vocabulary (the exact
 //!   per-level offset arithmetic and the context-then-style ordering), including
 //!   the masked-style negative branch used for classifier-free guidance.
+//! - [`llm_grid_to_rvq`] — the inverse map for the decoder's output: unified-
+//!   vocab grid tokens → raw RVQ codebook indices (what the codec and the next
+//!   chunk's context consume).
+//! - [`StreamState`] — the rolling 10 s context window for **continuous**
+//!   generation: each chunk conditions on the previous chunk's generated tokens
+//!   (token-domain continuation), sliding the window after each step.
 //! - [`crossfade_ramp`] / [`crossfade_chunks`] — the 40 ms (1 codec frame, 1920
 //!   sample) overlap-add that stitches consecutive 2 s chunks into a continuous
 //!   stream.
@@ -30,8 +36,9 @@
 //! in their own modules, each with its own real-weight gate. [`generate_token_
 //! grid`] is the weight-independent LLM orchestration (encoder + CFG decode) that
 //! `tests/llm_end_to_end_driver.rs` drives on lavapipe. The full assembled
-//! pipeline (text prompt → 2 s audio, all real weights) runs in
-//! `examples/magenta_rt_generate.rs`.
+//! pipeline runs on real weights in two examples: `magenta_rt_generate.rs` (one
+//! 2 s chunk from a text prompt) and `magenta_rt_stream.rs` (continuous multi-
+//! chunk generation via [`StreamState`]).
 
 use crate::runtime::Session;
 
