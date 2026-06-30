@@ -38,6 +38,92 @@ use crate::runtime::Session;
 use super::llm::{decode, DecodeOptions, LlmConfig};
 use super::MagentaRtConfig;
 
+/// Rolling state for continuous (streaming) generation.
+///
+/// Magenta-RT generates audio 2 s at a time, each chunk conditioned on the
+/// previous 10 s of **generated codec tokens** — token-domain continuation, with
+/// no audio re-encoding in the hot loop (mirrors `MagentaRTState` /
+/// `MagentaRTT5X.generate_chunk` in magenta-realtime v1). This holds that rolling
+/// 10 s window so the driver can feed each chunk's context into
+/// [`assemble_encoder_input`] and slide the window after each generation.
+///
+/// The buffer keeps the full [`MagentaRtConfig::decoder_codec_rvq_depth`] (16)
+/// levels per frame (what the LLM produces and the decoder consumes); the encoder
+/// context conditioning takes only the first
+/// [`MagentaRtConfig::encoder_codec_rvq_depth`] (4) of them — see
+/// [`StreamState::context_codec`].
+#[derive(Clone, Debug)]
+pub struct StreamState {
+    /// `context_length_frames` (250) × `decoder_codec_rvq_depth` (16) raw codebook
+    /// indices, frame-major (frame 0's 16 levels, then frame 1's, …).
+    context_tokens: Vec<u32>,
+    ctx_frames: usize,
+    full_depth: usize,
+    enc_depth: usize,
+}
+
+impl StreamState {
+    /// A cold start: 10 s of silent context (codebook index 0 at every level).
+    ///
+    /// The reference seeds the context with a `-1` "no history" sentinel that the
+    /// LLM vocab maps to its pad token; we seed with codec index 0 instead (the
+    /// convention the verified single-chunk pipeline already cold-starts from).
+    /// This only affects the very first chunk — every later chunk's context is
+    /// real generated tokens, identical to the reference.
+    pub fn cold_start(cfg: &MagentaRtConfig) -> Self {
+        let ctx_frames = cfg.context_length_frames() as usize;
+        let full_depth = cfg.decoder_codec_rvq_depth as usize;
+        StreamState {
+            context_tokens: vec![0u32; ctx_frames * full_depth],
+            ctx_frames,
+            full_depth,
+            enc_depth: cfg.encoder_codec_rvq_depth as usize,
+        }
+    }
+
+    /// The `context_length_frames * encoder_codec_rvq_depth` (250 × 4 = 1000)
+    /// context tokens [`assemble_encoder_input`] consumes: the first `enc_depth`
+    /// levels of every context frame, frame-major.
+    pub fn context_codec(&self) -> Vec<u32> {
+        let mut out = Vec::with_capacity(self.ctx_frames * self.enc_depth);
+        for frame in self.context_tokens.chunks_exact(self.full_depth) {
+            out.extend_from_slice(&frame[..self.enc_depth]);
+        }
+        out
+    }
+
+    /// The last context frame (all `full_depth` = 16 levels): the boundary frame a
+    /// streaming decoder prepends to the next chunk's grid so consecutive decoded
+    /// audio chunks share exactly one overlap frame to crossfade over.
+    pub fn boundary_frame(&self) -> &[u32] {
+        &self.context_tokens[(self.ctx_frames - 1) * self.full_depth..]
+    }
+
+    /// Slide the window after generating a chunk: drop the oldest `grid_frames`
+    /// and append the freshly generated grid (`grid_frames * full_depth` raw
+    /// indices, frame-major; 50 × 16 = 800 in production). The chunk size is
+    /// inferred from the grid, so a shorter grid (e.g. a reduced-frame smoke run)
+    /// just slides the window by fewer frames.
+    pub fn push_chunk(&mut self, grid: &[u32]) {
+        assert_eq!(
+            grid.len() % self.full_depth,
+            0,
+            "grid length {} must be a multiple of {} levels",
+            grid.len(),
+            self.full_depth,
+        );
+        let grid_frames = grid.len() / self.full_depth;
+        assert!(
+            grid_frames <= self.ctx_frames,
+            "chunk ({grid_frames} frames) larger than the {} -frame context window",
+            self.ctx_frames,
+        );
+        self.context_tokens.drain(..grid_frames * self.full_depth);
+        self.context_tokens.extend_from_slice(grid);
+        debug_assert_eq!(self.context_tokens.len(), self.ctx_frames * self.full_depth);
+    }
+}
+
 /// Assemble the LLM encoder input sequence (length
 /// [`MagentaRtConfig::encoder_input_length`] = 1006) from raw codec + style RVQ
 /// tokens, mapping each into the model's unified vocabulary.
@@ -109,6 +195,53 @@ pub fn assemble_encoder_input(
 
     debug_assert_eq!(out.len(), cfg.encoder_input_length() as usize);
     out
+}
+
+/// Convert the LLM decoder's grid of **unified-vocab** tokens into raw RVQ
+/// codebook indices (mirrors `utils.llm_to_rvq` in magenta-realtime).
+///
+/// The decoder samples over the full model vocabulary; a codec token for level
+/// `q` is laid out as `vocab_codec_offset + q * codec_rvq_codebook_size + raw`
+/// (the same per-level slotting [`assemble_encoder_input`] re-applies). This
+/// recovers `raw ∈ [0, codec_rvq_codebook_size)` for each of the
+/// `decoder_codec_rvq_depth` (16) levels per frame, so the grid can drive
+/// [`super::spectrostream::dequantize_tokens`] (raw codebook indices) and feed
+/// the next chunk's context via [`StreamState::push_chunk`].
+///
+/// `grid.len()` must be a multiple of `decoder_codec_rvq_depth`. A token outside
+/// its level's nominal range (the model very occasionally samples across a level
+/// boundary, especially under strong classifier-free guidance) is clamped into
+/// `[0, codec_rvq_codebook_size)`; `out_of_range` counts how many were clamped so
+/// callers can surface it.
+pub fn llm_grid_to_rvq(grid: &[u32], cfg: &MagentaRtConfig) -> (Vec<u32>, usize) {
+    let depth = cfg.decoder_codec_rvq_depth as usize;
+    let cb = cfg.codec_rvq_codebook_size;
+    let off = cfg.vocab_codec_offset();
+    assert_eq!(
+        grid.len() % depth,
+        0,
+        "grid length {} must be a multiple of {depth} levels",
+        grid.len(),
+    );
+    let mut out_of_range = 0usize;
+    let raw = grid
+        .iter()
+        .enumerate()
+        .map(|(i, &t)| {
+            let q = (i % depth) as u32;
+            let base = off + q * cb;
+            if t < base {
+                out_of_range += 1;
+                0
+            } else if t - base >= cb {
+                out_of_range += 1;
+                cb - 1
+            } else {
+                t - base
+            }
+        })
+        .collect();
+    (raw, out_of_range)
 }
 
 /// Crossfade style for [`crossfade_ramp`] (mirrors `audio.crossfade_ramp` in the
@@ -295,6 +428,120 @@ mod tests {
         for &t in &neg[style_start..] {
             assert_eq!(t, cfg.vocab_mask_token());
         }
+    }
+
+    #[test]
+    fn llm_grid_to_rvq_roundtrips_assembled_layout() {
+        let cfg = MagentaRtConfig::default();
+        let depth = cfg.decoder_codec_rvq_depth as usize; // 16
+        let cb = cfg.codec_rvq_codebook_size;
+        // Build a 2-frame grid of known raws, encode to vocab tokens exactly the
+        // way the model's vocab is laid out, then recover the raws.
+        let raws: Vec<u32> = (0..2 * depth).map(|i| (i as u32 * 37) % cb).collect();
+        let grid: Vec<u32> = raws
+            .iter()
+            .enumerate()
+            .map(|(i, &r)| cfg.vocab_codec_offset() + (i % depth) as u32 * cb + r)
+            .collect();
+        let (got, oor) = llm_grid_to_rvq(&grid, &cfg);
+        assert_eq!(oor, 0);
+        assert_eq!(got, raws);
+        assert!(got.iter().all(|&t| t < cb));
+    }
+
+    #[test]
+    fn llm_grid_to_rvq_clamps_out_of_range() {
+        let cfg = MagentaRtConfig::default();
+        let depth = cfg.decoder_codec_rvq_depth as usize;
+        let cb = cfg.codec_rvq_codebook_size;
+        // A valid one-frame grid (level q's raw 0), then corrupt two entries:
+        // level 0 token below the codec range (a stray pad/mask) → 0; level 1
+        // token above its range → cb-1.
+        let mut grid: Vec<u32> =
+            (0..depth).map(|q| cfg.vocab_codec_offset() + q as u32 * cb).collect();
+        grid[0] = 0; // level 0, below base → underflow
+        grid[1] = cfg.vocab_codec_offset() + cb + cb + 5; // level 1, raw cb+5 → clamp
+        let (got, oor) = llm_grid_to_rvq(&grid, &cfg);
+        assert_eq!(oor, 2);
+        assert_eq!(got[0], 0);
+        assert_eq!(got[1], cb - 1);
+        assert!(got.iter().all(|&t| t < cb));
+    }
+
+    #[test]
+    fn streamstate_cold_start_shapes() {
+        let cfg = MagentaRtConfig::default();
+        let st = StreamState::cold_start(&cfg);
+        // context_codec is exactly the 1000-token context assemble_encoder_input wants.
+        let ctx = st.context_codec();
+        assert_eq!(
+            ctx.len(),
+            (cfg.context_length_frames() * cfg.encoder_codec_rvq_depth) as usize
+        );
+        assert!(ctx.iter().all(|&t| t == 0));
+        // A cold-start assembled input is well-formed.
+        let seq = assemble_encoder_input(&ctx, Some(&[0, 0, 0, 0, 0, 0]), &cfg);
+        assert_eq!(seq.len(), cfg.encoder_input_length() as usize);
+        // boundary frame is one full-depth (16-level) frame.
+        assert_eq!(st.boundary_frame().len(), cfg.decoder_codec_rvq_depth as usize);
+    }
+
+    #[test]
+    fn streamstate_push_slides_window_and_keeps_first_levels() {
+        let cfg = MagentaRtConfig::default();
+        let frames = cfg.chunk_length_frames() as usize; // 50
+        let depth = cfg.decoder_codec_rvq_depth as usize; // 16
+        let enc = cfg.encoder_codec_rvq_depth as usize; // 4
+        let mut st = StreamState::cold_start(&cfg);
+
+        // A grid whose every level value encodes its frame index (mod codebook).
+        let grid: Vec<u32> = (0..frames * depth)
+            .map(|i| ((i / depth) as u32 + 1) % cfg.codec_rvq_codebook_size)
+            .collect();
+        st.push_chunk(&grid);
+
+        // The last 50 context frames are now the pushed grid; the boundary frame
+        // is the grid's final frame.
+        let ctx_frames = cfg.context_length_frames() as usize; // 250
+        let bf = st.boundary_frame();
+        assert_eq!(bf, &grid[(frames - 1) * depth..]);
+
+        // context_codec keeps the first `enc` levels of every frame, frame-major,
+        // and the newest 50 frames mirror the pushed grid's first `enc` levels.
+        let ctx = st.context_codec();
+        assert_eq!(ctx.len(), ctx_frames * enc);
+        let tail_start = (ctx_frames - frames) * enc;
+        for f in 0..frames {
+            for l in 0..enc {
+                assert_eq!(ctx[tail_start + f * enc + l], grid[f * depth + l]);
+            }
+        }
+        // The oldest frames slid out: with a single push onto an all-zero cold
+        // start, the pre-tail context is still all zeros.
+        assert!(ctx[..tail_start].iter().all(|&t| t == 0));
+    }
+
+    #[test]
+    fn streamstate_two_pushes_drop_oldest() {
+        let cfg = MagentaRtConfig::default();
+        let frames = cfg.chunk_length_frames() as usize;
+        let depth = cfg.decoder_codec_rvq_depth as usize;
+        let mut st = StreamState::cold_start(&cfg);
+        let grid_a = vec![7u32; frames * depth];
+        let grid_b = vec![9u32; frames * depth];
+        st.push_chunk(&grid_a);
+        st.push_chunk(&grid_b);
+        // After two pushes the 250-frame window holds 150 cold-start zeros, then
+        // grid_a's 50 frames, then grid_b's 50 frames.
+        let ctx_frames = cfg.context_length_frames() as usize;
+        let enc = cfg.encoder_codec_rvq_depth as usize;
+        let ctx = st.context_codec();
+        let a_start = (ctx_frames - 2 * frames) * enc;
+        let b_start = (ctx_frames - frames) * enc;
+        assert!(ctx[..a_start].iter().all(|&t| t == 0));
+        assert!(ctx[a_start..b_start].iter().all(|&t| t == 7));
+        assert!(ctx[b_start..].iter().all(|&t| t == 9));
+        assert_eq!(st.boundary_frame(), &grid_b[(frames - 1) * depth..]);
     }
 
     #[test]

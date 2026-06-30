@@ -30,7 +30,9 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use meganeura::data::safetensors::SafeTensorsModel;
-use meganeura::models::magenta_rt::driver::{assemble_encoder_input, generate_token_grid};
+use meganeura::models::magenta_rt::driver::{
+    assemble_encoder_input, generate_token_grid, llm_grid_to_rvq,
+};
 use meganeura::models::magenta_rt::llm::{
     build_depth_decoder_stack, build_encoder_graph, build_temporal_decode_step, DecodeOptions,
     LlmConfig,
@@ -89,8 +91,15 @@ fn main() {
     println!("encoder input length: {} (pos/neg)", pos_tokens.len());
 
     // ===================== 4. LLM encode + CFG decode → 50×16 grid =====================
-    let grid = run_llm(&pos_tokens, &neg_tokens, num_frames);
-    println!("decoded grid: {} tokens ({num_frames} frames × 16 levels)", grid.len());
+    let vocab_grid = run_llm(&pos_tokens, &neg_tokens, num_frames);
+    // The decoder samples unified-vocab tokens; recover raw RVQ codebook indices
+    // (vocab_codec_offset + level*1024 + raw) for the codec.
+    let (grid, oor) = llm_grid_to_rvq(&vocab_grid, &mrt);
+    println!(
+        "decoded grid: {} tokens ({num_frames} frames × 16 levels){}",
+        grid.len(),
+        if oor > 0 { format!(", {oor} out-of-range clamped") } else { String::new() },
+    );
 
     // ===================== 5. SpectroStream: tokens → 2 s audio =====================
     let audio = decode_audio(&grid, num_frames);
