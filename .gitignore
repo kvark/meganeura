@@ -9,3 +9,4 @@ data/*.gz
 *.spv
 magenta_rt_codec_dump/
 magenta_rt_codec_dump
+scratch_runs/
