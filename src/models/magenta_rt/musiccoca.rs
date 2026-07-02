@@ -320,10 +320,12 @@ fn transpose_2d(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
 /// the `[d, n·h] → [n·h, d]` transpose that the einsum `…nh,dnh->…d` implies;
 /// Q/K/V and MLP kernels contract over `d` first and need no transpose).
 ///
-/// Note: verified piecewise (the transforms are unit-tested and the graph is
-/// GPU-checked against a CPU reference), but not yet run against the real
-/// weight dump end-to-end — the dump isn't in-tree. Mismatched tensor lengths
-/// surface as `set_parameter` panics, which is the intended tripwire.
+/// Verified piecewise (the transforms are unit-tested and the graph is
+/// GPU-checked against a CPU reference) **and** end-to-end on the real weight
+/// dump: `tests/musiccoca_real_weight.rs` gates the loaded text tower against
+/// the 26 testdata prompts at 0.9993 mean cosine / 93.3% RVQ token match.
+/// Mismatched tensor lengths surface as `set_parameter` panics, which is the
+/// intended tripwire.
 pub fn load_text_encoder_weights(
     model: &crate::data::safetensors::SafeTensorsModel,
     session: &mut crate::Session,

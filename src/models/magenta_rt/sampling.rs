@@ -105,13 +105,18 @@ pub fn top_k_sample(logits: &[f32], temperature: f32, k: usize, rng: &mut Xorshi
 }
 
 /// Greedy argmax — deterministic, useful for bit-matching reference runs.
+/// Ties break to the **first** (lowest) index, matching `np.argmax`/`jnp.argmax`
+/// (`Iterator::max_by` would keep the last).
 pub fn argmax(logits: &[f32]) -> u32 {
-    logits
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(i, _)| i as u32)
-        .unwrap_or(0)
+    let mut best = 0usize;
+    let mut best_v = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > best_v {
+            best_v = v;
+            best = i;
+        }
+    }
+    best as u32
 }
 
 #[cfg(test)]

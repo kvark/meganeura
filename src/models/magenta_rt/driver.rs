@@ -45,6 +45,12 @@ use crate::runtime::Session;
 use super::llm::{decode, DecodeOptions, LlmConfig};
 use super::MagentaRtConfig;
 
+/// "No history" sentinel for context codec tokens (the reference's `-1`):
+/// [`assemble_encoder_input`] maps context positions holding this value to
+/// [`MagentaRtConfig::vocab_mask_token`], mirroring magenta-realtime v1's
+/// `np.where(context_tokens >= 0, rvq_to_llm(...), vocab_mask_token)`.
+pub const NO_HISTORY: u32 = u32::MAX;
+
 /// Rolling state for continuous (streaming) generation.
 ///
 /// Magenta-RT generates audio 2 s at a time, each chunk conditioned on the
@@ -70,18 +76,19 @@ pub struct StreamState {
 }
 
 impl StreamState {
-    /// A cold start: 10 s of silent context (codebook index 0 at every level).
+    /// A cold start: no audio history. Every context frame is seeded with
+    /// [`NO_HISTORY`], which [`assemble_encoder_input`] maps to the mask token —
+    /// exactly the reference's `np.full(context_tokens_shape, -1)` seeding.
     ///
-    /// The reference seeds the context with a `-1` "no history" sentinel that the
-    /// LLM vocab maps to its pad token; we seed with codec index 0 instead (the
-    /// convention the verified single-chunk pipeline already cold-starts from).
-    /// This only affects the very first chunk — every later chunk's context is
-    /// real generated tokens, identical to the reference.
+    /// The cold-start frames wash out of the 250-frame window gradually: with
+    /// 50-frame chunks they survive the first `250/50 = 5` chunks (the first
+    /// 10 s condition partly on masked "no history" context), after which the
+    /// window is entirely generated tokens.
     pub fn cold_start(cfg: &MagentaRtConfig) -> Self {
         let ctx_frames = cfg.context_length_frames() as usize;
         let full_depth = cfg.decoder_codec_rvq_depth as usize;
         StreamState {
-            context_tokens: vec![0u32; ctx_frames * full_depth],
+            context_tokens: vec![NO_HISTORY; ctx_frames * full_depth],
             ctx_frames,
             full_depth,
             enc_depth: cfg.encoder_codec_rvq_depth as usize,
@@ -102,8 +109,19 @@ impl StreamState {
     /// The last context frame (all `full_depth` = 16 levels): the boundary frame a
     /// streaming decoder prepends to the next chunk's grid so consecutive decoded
     /// audio chunks share exactly one overlap frame to crossfade over.
+    ///
+    /// On a fresh [`StreamState::cold_start`] (before any [`Self::push_chunk`])
+    /// this is all [`NO_HISTORY`] — there is no previous chunk to seam with, so a
+    /// streaming decoder must decode chunk 0's grid *without* a boundary prefix
+    /// (check [`Self::has_history`]).
     pub fn boundary_frame(&self) -> &[u32] {
         &self.context_tokens[(self.ctx_frames - 1) * self.full_depth..]
+    }
+
+    /// Whether any chunk has been pushed (i.e. [`Self::boundary_frame`] holds
+    /// real generated tokens rather than the cold-start [`NO_HISTORY`] fill).
+    pub fn has_history(&self) -> bool {
+        self.boundary_frame().iter().all(|&t| t != NO_HISTORY)
     }
 
     /// Slide the window after generating a chunk: drop the oldest `grid_frames`
@@ -179,10 +197,15 @@ pub fn assemble_encoder_input(
 
     let mut out = Vec::with_capacity(cfg.encoder_input_length() as usize);
 
-    // --- Context: frame-major, per-level codec offsets ---
+    // --- Context: frame-major, per-level codec offsets. NO_HISTORY positions
+    // (the reference's -1 "no audio yet" sentinel) become the mask token. ---
     let codec_base = cfg.vocab_codec_offset();
     for frame in context_codec.chunks_exact(ctx_depth) {
         for (level, &raw) in frame.iter().enumerate() {
+            if raw == NO_HISTORY {
+                out.push(cfg.vocab_mask_token());
+                continue;
+            }
             assert!(raw < codec_cb, "codec token {raw} ≥ codebook {codec_cb}");
             out.push(codec_base + level as u32 * codec_cb + raw);
         }
@@ -215,11 +238,14 @@ pub fn assemble_encoder_input(
 /// [`super::spectrostream::dequantize_tokens`] (raw codebook indices) and feed
 /// the next chunk's context via [`StreamState::push_chunk`].
 ///
-/// `grid.len()` must be a multiple of `decoder_codec_rvq_depth`. A token outside
-/// its level's nominal range (the model very occasionally samples across a level
-/// boundary, especially under strong classifier-free guidance) is clamped into
-/// `[0, codec_rvq_codebook_size)`; `out_of_range` counts how many were clamped so
-/// callers can surface it.
+/// `grid.len()` must be a multiple of `decoder_codec_rvq_depth`. The recovery is
+/// **value-based**, exactly the reference's `llm_to_rvq(safe=False)`:
+/// `max(t - offset, 0) % codebook_size` — a token the model sampled into the
+/// *wrong level's* range (rare, but the decoder samples the full vocabulary)
+/// still recovers its in-codebook index rather than being clamped to an extreme
+/// entry. `out_of_range` counts tokens whose value-derived level disagreed with
+/// their grid position (the condition the reference warns on), so callers can
+/// surface it.
 pub fn llm_grid_to_rvq(grid: &[u32], cfg: &MagentaRtConfig) -> (Vec<u32>, usize) {
     let depth = cfg.decoder_codec_rvq_depth as usize;
     let cb = cfg.codec_rvq_codebook_size;
@@ -236,16 +262,11 @@ pub fn llm_grid_to_rvq(grid: &[u32], cfg: &MagentaRtConfig) -> (Vec<u32>, usize)
         .enumerate()
         .map(|(i, &t)| {
             let q = (i % depth) as u32;
-            let base = off + q * cb;
-            if t < base {
+            let r = t.saturating_sub(off); // np.maximum(t - offset, 0)
+            if t < off || r / cb != q {
                 out_of_range += 1;
-                0
-            } else if t - base >= cb {
-                out_of_range += 1;
-                cb - 1
-            } else {
-                t - base
             }
+            r % cb
         })
         .collect();
     (raw, out_of_range)
@@ -457,26 +478,28 @@ mod tests {
     }
 
     #[test]
-    fn llm_grid_to_rvq_clamps_out_of_range() {
+    fn llm_grid_to_rvq_recovers_out_of_range_by_value() {
         let cfg = MagentaRtConfig::default();
         let depth = cfg.decoder_codec_rvq_depth as usize;
         let cb = cfg.codec_rvq_codebook_size;
         // A valid one-frame grid (level q's raw 0), then corrupt two entries:
-        // level 0 token below the codec range (a stray pad/mask) → 0; level 1
-        // token above its range → cb-1.
+        // level 0 gets a stray pad token (below the codec range); level 1 gets a
+        // token from level 2's range. Both are counted, and the value-based
+        // `max(t-off, 0) % cb` recovery (reference `llm_to_rvq(safe=False)`)
+        // still yields the encoded in-codebook index.
         let mut grid: Vec<u32> =
             (0..depth).map(|q| cfg.vocab_codec_offset() + q as u32 * cb).collect();
-        grid[0] = 0; // level 0, below base → underflow
-        grid[1] = cfg.vocab_codec_offset() + cb + cb + 5; // level 1, raw cb+5 → clamp
+        grid[0] = 0; // pad, below offset → max(t-off,0) = 0
+        grid[1] = cfg.vocab_codec_offset() + 2 * cb + 5; // level 2's raw 5, in level 1's slot
         let (got, oor) = llm_grid_to_rvq(&grid, &cfg);
         assert_eq!(oor, 2);
         assert_eq!(got[0], 0);
-        assert_eq!(got[1], cb - 1);
+        assert_eq!(got[1], 5); // modulo recovers raw 5, not a clamped extreme
         assert!(got.iter().all(|&t| t < cb));
     }
 
     #[test]
-    fn streamstate_cold_start_shapes() {
+    fn streamstate_cold_start_is_masked_no_history() {
         let cfg = MagentaRtConfig::default();
         let st = StreamState::cold_start(&cfg);
         // context_codec is exactly the 1000-token context assemble_encoder_input wants.
@@ -485,10 +508,14 @@ mod tests {
             ctx.len(),
             (cfg.context_length_frames() * cfg.encoder_codec_rvq_depth) as usize
         );
-        assert!(ctx.iter().all(|&t| t == 0));
-        // A cold-start assembled input is well-formed.
+        assert!(ctx.iter().all(|&t| t == NO_HISTORY));
+        assert!(!st.has_history());
+        // Assembling a cold-start context maps every context slot to the mask
+        // token (the reference's np.where(context >= 0, ..., mask)).
         let seq = assemble_encoder_input(&ctx, Some(&[0, 0, 0, 0, 0, 0]), &cfg);
         assert_eq!(seq.len(), cfg.encoder_input_length() as usize);
+        let style_start = seq.len() - cfg.encoder_style_rvq_depth as usize;
+        assert!(seq[..style_start].iter().all(|&t| t == cfg.vocab_mask_token()));
         // boundary frame is one full-depth (16-level) frame.
         assert_eq!(st.boundary_frame().len(), cfg.decoder_codec_rvq_depth as usize);
     }
@@ -523,9 +550,11 @@ mod tests {
                 assert_eq!(ctx[tail_start + f * enc + l], grid[f * depth + l]);
             }
         }
-        // The oldest frames slid out: with a single push onto an all-zero cold
-        // start, the pre-tail context is still all zeros.
-        assert!(ctx[..tail_start].iter().all(|&t| t == 0));
+        // The oldest frames slid out: with a single push onto a cold start, the
+        // pre-tail context is still the NO_HISTORY fill (but the boundary frame
+        // is now real, so has_history is true).
+        assert!(ctx[..tail_start].iter().all(|&t| t == NO_HISTORY));
+        assert!(st.has_history());
     }
 
     #[test]
@@ -538,14 +567,14 @@ mod tests {
         let grid_b = vec![9u32; frames * depth];
         st.push_chunk(&grid_a);
         st.push_chunk(&grid_b);
-        // After two pushes the 250-frame window holds 150 cold-start zeros, then
-        // grid_a's 50 frames, then grid_b's 50 frames.
+        // After two pushes the 250-frame window holds 150 cold-start NO_HISTORY
+        // frames, then grid_a's 50 frames, then grid_b's 50 frames.
         let ctx_frames = cfg.context_length_frames() as usize;
         let enc = cfg.encoder_codec_rvq_depth as usize;
         let ctx = st.context_codec();
         let a_start = (ctx_frames - 2 * frames) * enc;
         let b_start = (ctx_frames - frames) * enc;
-        assert!(ctx[..a_start].iter().all(|&t| t == 0));
+        assert!(ctx[..a_start].iter().all(|&t| t == NO_HISTORY));
         assert!(ctx[a_start..b_start].iter().all(|&t| t == 7));
         assert!(ctx[b_start..].iter().all(|&t| t == 9));
         assert_eq!(st.boundary_frame(), &grid_b[(frames - 1) * depth..]);

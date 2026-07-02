@@ -98,9 +98,12 @@ fn main() {
         SpmModel::from_bytes(&bytes).unwrap_or_else(|e| panic!("parse spm: {e}"))
     };
 
-    // Build the (prompt-independent) LLM + SpectroStream machinery once.
+    // Build the (prompt-independent) LLM + SpectroStream machinery once. Two
+    // codec sessions: chunk 0 decodes exactly its own frames (no history to seam
+    // with); later chunks decode [boundary ++ grid] = frames + 1.
     let mut llm = Llm::build(frames);
-    let mut codec = Codec::build(frames + 1); // decode boundary-frame + chunk
+    let mut codec_first = Codec::build(frames);
+    let mut codec_cont = Codec::build(frames + 1);
 
     for (pi, prompt) in prompts.iter().enumerate() {
         println!("\n=== prompt {pi}: {prompt:?} ({chunks} chunks × {frames} frames) ===");
@@ -117,27 +120,27 @@ fn main() {
             let neg = assemble_encoder_input(&ctx, None, &mrt);
 
             // 2. LLM CFG decode → 50×16 grid (unified-vocab tokens) → raw RVQ.
-            let vocab_grid = llm.generate(&pos, &neg, frames);
+            //    Vary the sampling seed per chunk so consecutive chunks don't
+            //    share correlated random draws.
+            let vocab_grid = llm.generate(&pos, &neg, frames, ci as u64);
             let (grid, oor) = llm_grid_to_rvq(&vocab_grid, &mrt);
             if oor > 0 {
-                println!("  chunk {ci}: {oor} out-of-range tokens clamped");
+                println!("  chunk {ci}: {oor} out-of-range tokens recovered by value");
             }
 
-            // 3. Decode [boundary ++ grid] so the chunk's first frame re-decodes
-            //    the previous chunk's last frame — the 1-frame crossfade seam.
-            let mut dec_in = Vec::with_capacity((frames + 1) * 16);
-            dec_in.extend_from_slice(state.boundary_frame());
-            dec_in.extend_from_slice(&grid);
-            let mut audio = codec.decode(&dec_in, frames + 1);
-
-            // Chunk 0 has no previous chunk to seam with: its boundary is the
-            // cold-start frame (not real music), so drop that leading frame for a
-            // clean onset. Later chunks keep it — that frame is the overlap the
-            // crossfade consumes.
-            let frame_samples = mrt.frame_length_samples() as usize * mrt.codec_num_channels as usize;
-            if ci == 0 {
-                audio.drain(..frame_samples.min(audio.len()));
-            }
+            // 3. Decode. Chunks with history prepend the previous chunk's last
+            //    (boundary) frame so consecutive chunks share exactly one overlap
+            //    frame — the 40 ms crossfade seam. Chunk 0 has no history (the
+            //    cold-start boundary is NO_HISTORY, not decodable) and decodes
+            //    its own frames only.
+            let audio = if state.has_history() {
+                let mut dec_in = Vec::with_capacity((frames + 1) * 16);
+                dec_in.extend_from_slice(state.boundary_frame());
+                dec_in.extend_from_slice(&grid);
+                codec_cont.decode(&dec_in, frames + 1)
+            } else {
+                codec_first.decode(&grid, frames)
+            };
 
             // 4. Slide the token window for the next chunk.
             state.push_chunk(&grid);
@@ -274,7 +277,7 @@ impl Llm {
         }
     }
 
-    fn generate(&mut self, pos: &[u32], neg: &[u32], num_frames: usize) -> Vec<u32> {
+    fn generate(&mut self, pos: &[u32], neg: &[u32], num_frames: usize, chunk_index: u64) -> Vec<u32> {
         // Each chunk is an independent 50-frame autoregressive decode; clear the
         // temporal KV caches so no state leaks across chunk boundaries.
         let attn = (self.cfg.num_heads * self.cfg.head_dim) as usize;
@@ -290,7 +293,8 @@ impl Llm {
             guidance_weight: 4.0,
             temperature: 1.1,
             top_k: 40,
-            seed: self.opts_seed,
+            // Distinct RNG stream per chunk (splitmix-style spread of the index).
+            seed: self.opts_seed ^ chunk_index.wrapping_mul(0x9E37_79B9_7F4A_7C15),
         };
         generate_token_grid(
             &self.cfg,
@@ -327,9 +331,9 @@ impl Codec {
         Codec { cfg, session, codebooks, weights }
     }
 
-    /// Decode a `[num_frames × 16]` token grid → interleaved stereo, trimmed to
-    /// exactly `num_frames` frames (drops the decoder's trailing temporal-pad
-    /// frame so chunks tile cleanly).
+    /// Decode a `[num_frames × 16]` token grid → interleaved stereo, exactly
+    /// `num_frames` codec frames (the graph crops the temporal pad, so chunks
+    /// tile cleanly).
     fn decode(&mut self, grid: &[u32], num_frames: usize) -> Vec<f32> {
         let depth = 16usize;
         let embed = dequantize_tokens(
@@ -344,13 +348,12 @@ impl Codec {
         self.session.set_input("decoder_input_preprocessed", &preprocessed);
         self.session.step();
         self.session.wait();
-        let out_frames = (num_frames + self.cfg.temporal_pad as usize) * 4;
+        // The graph's temporal_cropping already trims the pre-crop body down to
+        // num_frames × 4 STFT frames, so the iSTFT yields exactly num_frames
+        // codec frames (× 1920 samples × 2 channels) — no host-side trim needed.
+        let out_frames = num_frames * 4;
         let body = self.session.read_output(out_frames * 480 * 4);
-        let audio = decoder_body_to_audio(&body, out_frames, &IstftConfig::default());
-        // istft yields (num_frames + temporal_pad) audio frames; keep the first
-        // num_frames (× 1920 samples × 2 channels).
-        let keep = num_frames * 1920 * 2;
-        audio[..keep.min(audio.len())].to_vec()
+        decoder_body_to_audio(&body, out_frames, &IstftConfig::default())
     }
 }
 

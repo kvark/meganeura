@@ -253,8 +253,10 @@ fn decode_audio(grid: &[u32], num_frames: usize) -> Vec<f32> {
     s.set_input("decoder_input_preprocessed", &preprocessed);
     s.step();
     s.wait();
-    // Body output T = (num_frames + temporal_pad) × 4.
-    let out_frames = (num_frames + cfg.temporal_pad as usize) * 4;
+    // The graph's temporal_cropping already trims the pre-crop
+    // (num_frames + temporal_pad) × 4 body down to num_frames × 4 STFT frames
+    // (what the bit-exact demo and the TF-body gate read).
+    let out_frames = num_frames * 4;
     let body = s.read_output(out_frames * 480 * 4);
     decoder_body_to_audio(&body, out_frames, &IstftConfig::default())
 }

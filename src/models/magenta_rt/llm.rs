@@ -648,8 +648,16 @@ fn concat_rows(g: &mut Graph, a: NodeId, b: NodeId, ra: usize, rb: usize, dim: u
 /// The depth stack is run **per frame** because its self-attention is causal
 /// *within* a frame's levels (a flattened `[num_frames*num_levels, embed]` pass
 /// would leak across frames); the depth params are registered once and shared
-/// across frames. This parallel form is for teacher-forcing / verification —
-/// production inference is the autoregressive step loop (KV-cache; future work).
+/// across frames.
+///
+/// **Wiring-check path only — numerically incomplete.** This graph omits the
+/// FixedEmbed absolute PE (which [`build_decoder_faithful`] adds and which
+/// flips ~15% of greedy tokens) and uses a transpose-tied logits head instead
+/// of the real `logits_dense`. It exists to exercise the temporal→depth wiring
+/// and weight loading; do **not** treat a forward through it (e.g. the
+/// real-weight load smoke test's finite-logits check) as numeric validation —
+/// that's what [`build_decoder_faithful`]'s real-weight gate is for. The
+/// production path is the autoregressive step loop ([`decode`]).
 ///
 /// `decoder_input_tokens` is the SOS-padded grid `[(num_frames+1) * num_levels]`
 /// u32: frame 0 is the SOS frame, frames `1..=num_frames` are the targets.

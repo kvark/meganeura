@@ -72,3 +72,36 @@ fn musiccoca_prepends_sos_and_truncates() {
     assert!(ids.len() <= 128);
     assert_eq!(&ids[1..], spm.encode("jazz piano").as_slice());
 }
+
+/// Byte-fallback gate against the **real** MusicCoCa vocab (64000 pieces,
+/// trained with `byte_fallback`, so it carries the 256 `<0xNN>` BYTE pieces).
+/// Expected ids are the reference `sentencepiece` package's `encode()` on the
+/// same lowercase strings with this exact vocab. Skips when the out-of-tree
+/// dump isn't present.
+#[test]
+fn real_vocab_byte_fallback_matches_sentencepiece() {
+    let path = "magenta_rt_codec_dump/musiccoca_vocab.model";
+    let Ok(bytes) = std::fs::read(path) else {
+        eprintln!("skipping: {path} not present");
+        return;
+    };
+    let spm = SpmModel::from_bytes(&bytes).expect("parse real vocab");
+    assert_eq!(spm.vocab_size(), 64000);
+
+    let cases: &[(&str, &[u32])] = &[
+        // Pure-ASCII baseline (also the magenta_rt_generate PROMPT_IDS source).
+        ("funky upbeat jazz", &[534, 354, 397]),
+        // é is OOV → its UTF-8 bytes' <0xC3><0xA9> pieces (ids 198, 172).
+        ("café techno", &[12069, 198, 172, 1387]),
+        // CJK char = 3 byte pieces; note the standalone ▁ (272) before it.
+        ("lo-fi 曲 beats", &[946, 263, 416, 272, 233, 158, 181, 639]),
+        // Emoji = 4 byte pieces.
+        ("ambient 🎵 waves", &[320, 272, 243, 162, 145, 184, 1986]),
+        // Consecutive OOV chars each expand separately (ñ and ú).
+        ("ñandú groove", &[272, 198, 180, 2100, 198, 189, 585]),
+    ];
+    for (text, want) in cases {
+        let got = spm.encode(text);
+        assert_eq!(&got, want, "encode({text:?})");
+    }
+}

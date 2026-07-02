@@ -18,11 +18,13 @@
 //! (2,1))` — ÷4 in time, ÷96 in freq: 200→50 frames, 480→5 bins) → gated
 //! bottleneck → `embed [50,256]`, then RVQ quantize → tokens. The architecture,
 //! per-block strides/paddings, and the STFT frame alignment were reverse-
-//! engineered from the TF SavedModel graph and verified bit-exact against it
-//! (`embed` rel ~1e-4; RVQ logic reproduces the TF tokens exactly on the TF
-//! embedding, and the first 4 RVQ levels — the ones the LLM consumes — match TF
-//! exactly end-to-end). See `tools/magenta_rt/encoder_reference.py` (NumPy
-//! reference) and `tests/spectrostream_encoder_vs_tf.rs` (real-weight gate).
+//! engineered from the TF SavedModel graph and verified against it: `embed` rel
+//! ~1.6e-4 (f32 accumulation-order noise, **not** bit-exact); the RVQ logic
+//! reproduces the TF tokens 100% *when run on the TF embedding*; and end-to-end
+//! the first 4 RVQ levels — the ones the LLM consumes — match TF exactly (deep
+//! levels quantize a shrinking residual and are sensitive to the embed noise).
+//! See `tools/magenta_rt/encoder_reference.py` (NumPy reference) and
+//! `tests/spectrostream_encoder_vs_tf.rs` (real-weight gate).
 //!
 //! Frame alignment (resolved): the encoder STFT uses `tf.signal.stft` with
 //! `pad_end=True` and **no** left padding — frame `f` covers samples
@@ -152,9 +154,10 @@ pub fn stft_features(audio: &[f32], cfg: &StftConfig) -> StftFeatures {
 
 // ===================== Encoder conv stack (host / CPU) =====================
 //
-// A faithful CPU port of the SpectroStream encoder, verified bit-exact against
-// the TF SavedModel (embed rel 1.6e-4, RVQ tokens 100% — see
-// `tools/magenta_rt/encoder_reference.py` and `tests/spectrostream_encoder_vs_tf.rs`).
+// A faithful CPU port of the SpectroStream encoder, verified against the TF
+// SavedModel: embed rel 1.6e-4, RVQ 100% on the TF embedding, first 4 levels
+// exact end-to-end — see `tools/magenta_rt/encoder_reference.py` and
+// `tests/spectrostream_encoder_vs_tf.rs`.
 // The encoder runs once per ~10 s audio context (not the generation hot path),
 // so it lives on the CPU; a GPU graph port would need new ops (avg-pool,
 // asymmetric strided/causal conv) and is a follow-up.
@@ -382,7 +385,8 @@ fn causal_3x3(x: &T4, k: &[f32], co: usize, b: &[f32]) -> T4 {
 }
 
 /// SpectroStream encoder forward: interleaved stereo `audio` → continuous
-/// embedding `[num_frames * 256]`. Verified bit-exact against the TF encoder.
+/// embedding `[num_frames * 256]`. Verified vs the TF encoder at rel ~1.6e-4
+/// (accumulation-order noise; see the module doc for what is exact).
 pub fn encode(audio: &[f32], model: &SafeTensorsModel) -> Vec<f32> {
     let cfg = StftConfig::default();
     let feats = stft_features(audio, &cfg);
@@ -478,7 +482,9 @@ pub fn encode(audio: &[f32], model: &SafeTensorsModel) -> Vec<f32> {
 
 /// RVQ-encode an embedding grid `[num_frames, dim]` → `[num_frames, depth]`
 /// tokens (per frame/level: nearest codebook centroid, emit index, subtract).
-/// `codebooks` is `[depth, codebook_size, dim]`. Verified 100% vs the TF quantizer.
+/// `codebooks` is `[depth, codebook_size, dim]`. Verified 100% vs the TF
+/// quantizer *on the TF embedding*; end-to-end (on this port's embedding) the
+/// first 4 levels are exact and deep levels are embed-noise-sensitive.
 pub fn rvq_encode(
     embed: &[f32],
     num_frames: usize,

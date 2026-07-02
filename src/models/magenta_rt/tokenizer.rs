@@ -3,11 +3,19 @@
 //! MusicCoCa tokenizes text with a SentencePiece Unigram model (`spm.model`,
 //! vocab 64000) before the text encoder. This implements that tokenizer with no
 //! external dependency: a minimal `.model` protobuf parser + the Unigram Viterbi
-//! encode + the SentencePiece whitespace normalization.
+//! encode + the SentencePiece whitespace normalization + byte fallback (the real
+//! vocab carries the 256 `<0xNN>` BYTE pieces, so OOV characters encode to their
+//! UTF-8 bytes rather than `unk`).
 //!
-//! Verified against the reference `sentencepiece` library on a trained model in
-//! `tests/spm_tokenizer.rs`. (The real MusicCoCa `spm.model` is not bundled in
-//! the public HF release; this loads whatever `.model` is provided.)
+//! Verified against the reference `sentencepiece` library in
+//! `tests/spm_tokenizer.rs`: on a small in-tree model (parse/normalize/Viterbi/
+//! unk-merge) and on the real MusicCoCa vocab (byte fallback, incl. accented/
+//! CJK/emoji prompts).
+//!
+//! Known limitation: the NFKC `precompiled_charsmap` normalization is **not**
+//! applied (identity for ASCII). Prompts containing NFKC-normalizable input
+//! (full-width forms, ligatures like `ﬁ`, curly quotes…) can tokenize
+//! differently from the reference; plain non-ASCII letters/CJK/emoji are fine.
 //!
 //! MusicCoCa's recipe (`magenta_rt/musiccoca.py`): lowercase the prompt, encode,
 //! truncate to `max_len-1 = 127`, and prepend `target_sos_id = 1`. The text
@@ -33,6 +41,10 @@ pub struct SpmModel {
     add_dummy_prefix: bool,
     remove_extra_whitespaces: bool,
     escape_whitespaces: bool,
+    /// `byte value → piece id` for the 256 `<0xNN>` BYTE pieces, when the model
+    /// was trained with `byte_fallback` (the real MusicCoCa vocab was): an OOV
+    /// character encodes to its UTF-8 bytes' ids instead of `unk`.
+    byte_pieces: Option<Box<[u32; 256]>>,
 }
 
 // --- minimal protobuf wire reader ---
@@ -118,6 +130,7 @@ impl SpmModel {
         let mut pos = 0;
         let mut pieces: Vec<(String, f32)> = Vec::new();
         let mut unk_id = 0u32;
+        let mut byte_pieces: Option<Box<[u32; 256]>> = None;
         // SentencePiece normalizer defaults.
         let mut add_dummy_prefix = true;
         let mut remove_extra_whitespaces = true;
@@ -130,9 +143,20 @@ impl SpmModel {
             match (field, wire) {
                 (1, 2) => {
                     let (piece, score, ptype) = parse_piece(read_bytes(data, &mut pos)?)?;
-                    if ptype == 2 {
-                        // UNKNOWN
-                        unk_id = pieces.len() as u32;
+                    match ptype {
+                        2 => unk_id = pieces.len() as u32, // UNKNOWN
+                        6 => {
+                            // BYTE piece "<0xNN>" (byte_fallback vocab).
+                            if let Some(b) = piece
+                                .strip_prefix("<0x")
+                                .and_then(|s| s.strip_suffix('>'))
+                                .and_then(|h| u8::from_str_radix(h, 16).ok())
+                            {
+                                byte_pieces.get_or_insert_with(|| Box::new([0u32; 256]))
+                                    [b as usize] = pieces.len() as u32;
+                            }
+                        }
+                        _ => {}
                     }
                     pieces.push((piece, score));
                 }
@@ -181,6 +205,7 @@ impl SpmModel {
             add_dummy_prefix,
             remove_extra_whitespaces,
             escape_whitespaces,
+            byte_pieces,
         })
     }
 
@@ -209,7 +234,9 @@ impl SpmModel {
         s
     }
 
-    /// Encode text to token ids via the Unigram Viterbi best-path. Runs of
+    /// Encode text to token ids via the Unigram Viterbi best-path. An uncovered
+    /// character becomes its UTF-8 bytes' `<0xNN>` piece ids when the model has
+    /// byte-fallback pieces (the real MusicCoCa vocab does); otherwise runs of
     /// uncovered characters collapse to a single `unk` id.
     pub fn encode(&self, text: &str) -> Vec<u32> {
         let norm = self.normalize(text);
@@ -248,29 +275,40 @@ impl SpmModel {
             }
         }
 
-        // Backtrack, then merge consecutive unknown segments into one unk id.
-        let mut segs: Vec<Option<u32>> = Vec::new();
+        // Backtrack; unk edges span exactly one char, so record their position.
+        let mut segs: Vec<(usize, Option<u32>)> = Vec::new();
         let mut pos = n;
         while pos > 0 {
             let (prev, id) = back[pos];
-            segs.push(id);
+            segs.push((prev, id));
             pos = prev;
         }
         segs.reverse();
         let mut out = Vec::with_capacity(segs.len());
         let mut prev_unk = false;
-        for id in segs {
+        for (start, id) in segs {
             match id {
                 Some(x) => {
                     out.push(x);
                     prev_unk = false;
                 }
-                None => {
-                    if !prev_unk {
-                        out.push(self.unk_id);
-                        prev_unk = true;
+                // Uncovered char: byte-fallback to its UTF-8 bytes' piece ids
+                // (each OOV char expands separately, matching `sentencepiece`),
+                // or merge consecutive unknowns into one unk id without it.
+                None => match &self.byte_pieces {
+                    Some(bp) => {
+                        let mut buf = [0u8; 4];
+                        for &b in chars[start].encode_utf8(&mut buf).as_bytes() {
+                            out.push(bp[b as usize]);
+                        }
                     }
-                }
+                    None => {
+                        if !prev_unk {
+                            out.push(self.unk_id);
+                            prev_unk = true;
+                        }
+                    }
+                },
             }
         }
         out

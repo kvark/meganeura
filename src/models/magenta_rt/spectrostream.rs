@@ -169,14 +169,14 @@ pub struct SpectroStreamConfig {
     pub initial_freq_bins: u32,
     /// 512 — channels per freq bin after input_layer reshape.
     pub initial_channels: u32,
-    /// Temporal padding to add at decoder input (symmetric, half each side).
-    /// TF SpectroStream uses SAME padding on H throughout (no shrinkage), with
-    /// decoder_0/decoder_1 each doubling T (stride_h=2). The resulting decoder
-    /// output T = (num_frames + temporal_pad) × 4. TF then `temporal_cropping`
-    /// trims this back to the actual output time dim.
-    ///
-    /// Empirically TF body produces pre-crop T=224 from S=50 frames → 56×4=224
-    /// ⇒ temporal_pad = 6 (3 each side).
+    /// Temporal padding (zero frames) appended at the **end** of the decoder
+    /// input (TF `temporal_padding = [[0,0],[0,temporal_pad],[0,0]]`; see
+    /// [`input_layer_preprocess`]). Default **1**. decoder_0/decoder_1 each
+    /// double T (stride_h=2), so the pre-crop body T is
+    /// `(num_frames + temporal_pad) × 4`; the in-graph `temporal_cropping`
+    /// (front-4 slice, [`build_decoder_graph`]) then trims it to exactly
+    /// `num_frames × 4` STFT frames — which is what the graph outputs and what
+    /// callers must size their reads by.
     pub temporal_pad: u32,
 }
 
@@ -1012,7 +1012,11 @@ pub fn dequantize_tokens(
     for f in 0..num_frames {
         for k in 0..depth {
             let tok = tokens[f * depth + k] as usize;
-            debug_assert!(tok < codebook_size, "token {tok} ≥ codebook {codebook_size}");
+            // Hard assert (not debug_assert): an out-of-range token indexes a
+            // *neighboring level's* codebook and silently corrupts the embedding
+            // in release — callers must pass raw RVQ indices (for LLM output, via
+            // `driver::llm_grid_to_rvq`).
+            assert!(tok < codebook_size, "token {tok} ≥ codebook {codebook_size}");
             let cb = (k * codebook_size + tok) * embed_dim;
             let dst = f * embed_dim;
             for d in 0..embed_dim {
