@@ -192,8 +192,11 @@ fn run_llm(pos_tokens: &[u32], neg_tokens: &[u32], num_frames: usize) -> Vec<u32
     // Classifier-free guidance with the production sampling knobs.
     let opts = DecodeOptions {
         num_frames,
-        sos_id: MagentaRtConfig::default().vocab_mask_token(),
-        guidance_weight: 4.0,
+        // T5X zero-initializes decoder_input_tokens: the decode BOS is the pad
+        // token (0), not the mask token. Production knobs per MagentaRTT5X
+        // defaults: guidance 5.0, temperature 1.1, top-k 40.
+        sos_id: MagentaRtConfig::default().vocab_pad_token(),
+        guidance_weight: 5.0,
         temperature: 1.1,
         top_k: 40,
         seed: 0x4D52_5447,

@@ -289,8 +289,11 @@ impl Llm {
 
         let opts = DecodeOptions {
             num_frames,
-            sos_id: MagentaRtConfig::default().vocab_mask_token(),
-            guidance_weight: 4.0,
+            // T5X zero-initializes decoder_input_tokens: the decode BOS is the
+            // pad token (0), not the mask token. Guidance 5.0 = the
+            // MagentaRTT5X default (with temperature 1.1, top-k 40).
+            sos_id: MagentaRtConfig::default().vocab_pad_token(),
+            guidance_weight: 5.0,
             temperature: 1.1,
             top_k: 40,
             // Distinct RNG stream per chunk (splitmix-style spread of the index).
