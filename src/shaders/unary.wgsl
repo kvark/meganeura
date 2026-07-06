@@ -78,3 +78,12 @@ fn gelu(@builtin(global_invocation_id) gid: vec3<u32>) {
     let inner = 0.7978845608 * (x + 0.044715 * x3);
     dst[i] = 0.5 * x * (1.0 + tanh(inner));
 }
+
+// elu: x if x >= 0 else exp(x) - 1 (alpha = 1)
+@compute @workgroup_size(256)
+fn elu(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if i >= params.len { return; }
+    let x = src[i];
+    dst[i] = select(exp(x) - 1.0, x, x >= 0.0);
+}

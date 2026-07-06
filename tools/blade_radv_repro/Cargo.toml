@@ -1,0 +1,17 @@
+[package]
+name = "blade_radv_repro"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+blade-graphics = { git = "https://github.com/kvark/blade", rev = "72c30c1" }
+blade-macros = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
+env_logger = "0.11"
+
+[patch."https://github.com/kvark/blade"]
+blade-graphics = { path = "/x/Code/blade/blade-graphics" }
+
+[[bin]]
+name = "blade_radv_repro"
+path = "src/main.rs"

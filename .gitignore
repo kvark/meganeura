@@ -1,5 +1,5 @@
-/target/
-/Cargo.lock
+target/
+Cargo.lock
 data/mnist-mlp.safetensors
 data/*.gz
 /bench/results/
@@ -7,3 +7,6 @@ data/*.gz
 /.venv/
 /.claude/
 *.spv
+magenta_rt_codec_dump/
+magenta_rt_codec_dump
+scratch_runs/

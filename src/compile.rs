@@ -97,7 +97,12 @@ pub enum ShaderEntry {
     BceLoss,
     Transpose,
     Silu,
+    Elu,
     SwiGLU,
+    GeGLU,
+    T5RelPosBias,
+    /// Fused attention + T5 rel-pos bias (one shader, head_dim-parameterized).
+    FullAttentionRelPosBias,
     RmsNorm,
     Embedding,
     EmbeddingF16,
@@ -152,6 +157,12 @@ pub enum ShaderEntry {
     SplitB,
     Upsample2x,
     Upsample2xGrad,
+    UpsampleNearest,
+    Slice2d,
+    Conv2dGradInputHW,
+    PixelShuffleW,
+    DilateZerosW,
+    DilateZerosH,
     Conv2d,
     /// Depthwise Conv2d forward (groups == channels). Weight shape
     /// `[C, 1, kH, kW]`; each output channel reads one input channel.
@@ -180,6 +191,7 @@ pub enum ShaderEntry {
     Conv2dGradWeightGemmSmall,
     CacheWrite,
     CachedAttention,
+    CachedAttentionRelPos,
     RoPEDynamic,
     MaxPool2d,
     GlobalAvgPool,
@@ -238,7 +250,11 @@ impl ShaderEntry {
             ShaderEntry::BceLoss => ShaderGroup::BceLoss,
             ShaderEntry::Transpose => ShaderGroup::Transpose,
             ShaderEntry::Silu => ShaderGroup::Unary,
+            ShaderEntry::Elu => ShaderGroup::Unary,
             ShaderEntry::SwiGLU => ShaderGroup::Binary,
+            ShaderEntry::GeGLU => ShaderGroup::Binary,
+            ShaderEntry::T5RelPosBias => ShaderGroup::T5RelPosBias,
+            ShaderEntry::FullAttentionRelPosBias => ShaderGroup::FullAttentionRelPosBias,
             ShaderEntry::RmsNorm => ShaderGroup::RmsNorm,
             ShaderEntry::Embedding => ShaderGroup::Embedding,
             ShaderEntry::EmbeddingF16 => ShaderGroup::EmbeddingF16,
@@ -278,6 +294,12 @@ impl ShaderEntry {
             ShaderEntry::SplitA | ShaderEntry::SplitB => ShaderGroup::Split,
             ShaderEntry::Upsample2x => ShaderGroup::Upsample,
             ShaderEntry::Upsample2xGrad => ShaderGroup::UpsampleGrad,
+            ShaderEntry::UpsampleNearest => ShaderGroup::UpsampleNearest,
+            ShaderEntry::Slice2d => ShaderGroup::Slice2d,
+            ShaderEntry::Conv2dGradInputHW => ShaderGroup::Conv2dGradInputHW,
+            ShaderEntry::PixelShuffleW => ShaderGroup::PixelShuffleW,
+            ShaderEntry::DilateZerosW => ShaderGroup::DilateZerosW,
+            ShaderEntry::DilateZerosH => ShaderGroup::DilateZerosH,
             ShaderEntry::Conv2d => ShaderGroup::Conv2d,
             ShaderEntry::Conv2dDw => ShaderGroup::Conv2dDw,
             ShaderEntry::MulPerChannel => ShaderGroup::MulPerChannel,
@@ -297,6 +319,7 @@ impl ShaderEntry {
             ShaderEntry::Conv2dGradWeightGemmSmall => ShaderGroup::Conv2dGradWeightGemmSmall,
             ShaderEntry::CacheWrite => ShaderGroup::CacheWrite,
             ShaderEntry::CachedAttention => ShaderGroup::CachedAttention,
+            ShaderEntry::CachedAttentionRelPos => ShaderGroup::CachedAttentionRelPos,
             ShaderEntry::RoPEDynamic => ShaderGroup::RoPEDynamic,
             ShaderEntry::MaxPool2d => ShaderGroup::MaxPool2d,
             ShaderEntry::GlobalAvgPool => ShaderGroup::GlobalAvgPool,
@@ -345,7 +368,11 @@ impl ShaderEntry {
             ShaderEntry::SumAll => "sum_all",
             ShaderEntry::MeanAll => "mean_all",
             ShaderEntry::Silu => "silu",
+            ShaderEntry::Elu => "elu",
             ShaderEntry::SwiGLU => "swiglu",
+            ShaderEntry::GeGLU => "geglu",
+            ShaderEntry::T5RelPosBias => "main",
+            ShaderEntry::FullAttentionRelPosBias => "main",
             ShaderEntry::RmsNorm => "main",
             ShaderEntry::Embedding => "main",
             ShaderEntry::EmbeddingF16 => "main",
@@ -386,6 +413,12 @@ impl ShaderEntry {
             ShaderEntry::SplitB => "split_b",
             ShaderEntry::Upsample2x => "main",
             ShaderEntry::Upsample2xGrad => "main",
+            ShaderEntry::UpsampleNearest => "main",
+            ShaderEntry::Slice2d => "main",
+            ShaderEntry::Conv2dGradInputHW => "main",
+            ShaderEntry::PixelShuffleW => "main",
+            ShaderEntry::DilateZerosW => "main",
+            ShaderEntry::DilateZerosH => "main",
             ShaderEntry::Conv2d => "main",
             ShaderEntry::Conv2dDw => "main",
             ShaderEntry::MulPerChannel => "main",
@@ -405,6 +438,7 @@ impl ShaderEntry {
             | ShaderEntry::Conv2dGradWeightGemmSmall => "main",
             ShaderEntry::CacheWrite => "main",
             ShaderEntry::CachedAttention => "main",
+            ShaderEntry::CachedAttentionRelPos => "main",
             ShaderEntry::RoPEDynamic => "main",
             ShaderEntry::MaxPool2d => "max_pool_2d",
             ShaderEntry::GlobalAvgPool => "global_avg_pool",
@@ -1345,6 +1379,7 @@ fn unary_shader_to_pointwise(shader: &ShaderEntry) -> Option<PointwiseDAG> {
         ShaderEntry::Log => Pw::Log(0),
         ShaderEntry::Recip => Pw::Recip(0),
         ShaderEntry::Silu => Pw::Silu(0),
+        ShaderEntry::Elu => Pw::Elu(0),
         _ => return None,
     };
     Some(PointwiseDAG {
@@ -1374,6 +1409,16 @@ fn binary_shader_to_pointwise(shader: &ShaderEntry) -> Option<PointwiseDAG> {
                 Pw::LoadInput(0),
                 Pw::LoadInput(1),
                 Pw::Silu(0),
+                Pw::Mul(2, 1),
+            ],
+            3,
+        ),
+        ShaderEntry::GeGLU => (
+            // geglu(a, b) = gelu(a) * b
+            vec![
+                Pw::LoadInput(0),
+                Pw::LoadInput(1),
+                Pw::Gelu(0),
                 Pw::Mul(2, 1),
             ],
             3,
@@ -1544,7 +1589,8 @@ impl<'a> Compiler<'a> {
                 | Op::CausalAttentionRoPE { num_heads, .. }
                 | Op::SlidingWindowAttention { num_heads, .. }
                 | Op::FullAttention { num_heads, .. }
-                | Op::CrossAttention { num_heads, .. } => {
+                | Op::CrossAttention { num_heads, .. }
+                | Op::FullAttentionRelPosBias { num_heads, .. } => {
                     let q_seq = node.ty.shape[0];
                     // LSE buffer: [0..q_seq*num_heads*2): LSE data (max_score, log_sum_exp per pos×head)
                     let lse_part = q_seq * num_heads as usize * 2;
@@ -2139,8 +2185,16 @@ impl<'a> Compiler<'a> {
                 self.emit_unary(ShaderEntry::Silu, node, out_buf);
             }
 
+            Op::Elu => {
+                self.emit_unary(ShaderEntry::Elu, node, out_buf);
+            }
+
             Op::SwiGLU => {
                 self.emit_binary(ShaderEntry::SwiGLU, node, out_buf);
+            }
+
+            Op::GeGLU => {
+                self.emit_binary(ShaderEntry::GeGLU, node, out_buf);
             }
 
             Op::SwiGLUConcat => {
@@ -2244,6 +2298,46 @@ impl<'a> Compiler<'a> {
                 });
             }
 
+            Op::FullAttentionRelPosBias {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_buckets,
+                max_distance,
+                bidirectional,
+                causal,
+            } => {
+                let q = self.get_buffer(node.inputs[0]);
+                let k = self.get_buffer(node.inputs[1]);
+                let v = self.get_buffer(node.inputs[2]);
+                let table = self.get_buffer(node.inputs[3]);
+                let q_seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
+                let kv_seq_raw = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
+                // kv_seq=0 in the shader = causal (kv_len = pos + 1 per row).
+                let kv_seq_param = if causal { 0 } else { kv_seq_raw };
+                let lse_buf = self.find_lse_buffer(node.id);
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::FullAttentionRelPosBias,
+                    workgroups: [q_seq, num_heads, 1],
+                    input_buffers: vec![q, k, v, table],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![lse_buf],
+                    params: vec![
+                        q_seq,
+                        kv_seq_param,
+                        (num_heads << 16) | num_kv_heads,
+                        head_dim,
+                        0, // window_size — unused for now
+                        num_buckets,
+                        max_distance,
+                        if bidirectional { 1 } else { 0 },
+                    ],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
             Op::ToF16 => {
                 // Elementwise f32 → f16 cast. UnaryData layout (src, dst,
                 // params); dst is an f16 buffer.
@@ -2261,6 +2355,37 @@ impl<'a> Compiler<'a> {
                     ..Default::default()
                 });
             }
+
+            Op::T5RelPosBias {
+                num_heads,
+                num_buckets,
+                max_distance,
+                bidirectional,
+                q_len,
+                kv_len,
+            } => {
+                let table = self.get_buffer(node.inputs[0]);
+                let total = num_heads * q_len * kv_len;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::T5RelPosBias,
+                    workgroups: [total.div_ceil(256), 1, 1],
+                    input_buffers: vec![table],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![
+                        q_len,
+                        kv_len,
+                        num_heads,
+                        num_buckets,
+                        max_distance,
+                        if bidirectional { 1 } else { 0 },
+                    ],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
 
             Op::ScatterAdd { vocab_size } => {
                 let indices = self.get_buffer(node.inputs[0]);
@@ -2587,6 +2712,179 @@ impl<'a> Compiler<'a> {
                 });
             }
 
+            Op::UpsampleNearest {
+                channels,
+                in_h,
+                in_w,
+                scale_h,
+                scale_w,
+            } => {
+                let x = self.get_buffer(node.inputs[0]);
+                let total = node.ty.shape[0] as u32;
+                let batch = total / (channels * in_h * scale_h * in_w * scale_w);
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::UpsampleNearest,
+                    workgroups: [total.div_ceil(256), 1, 1],
+                    input_buffers: vec![x],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![batch, channels, in_h, in_w, scale_h, scale_w],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
+            Op::Slice2d {
+                channels,
+                in_h,
+                in_w,
+                start_h,
+                end_h,
+                start_w,
+                end_w,
+            } => {
+                let x = self.get_buffer(node.inputs[0]);
+                let total = node.ty.shape[0] as u32;
+                let out_h = in_h - start_h - end_h;
+                let out_w = in_w - start_w - end_w;
+                let batch = total / (channels * out_h * out_w);
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::Slice2d,
+                    workgroups: [total.div_ceil(256), 1, 1],
+                    input_buffers: vec![x],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![batch, channels, in_h, in_w, start_h, end_h, start_w, end_w],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
+            Op::DilateZerosW {
+                channels,
+                in_h,
+                in_w,
+                stride_w,
+            } => {
+                let x = self.get_buffer(node.inputs[0]);
+                let total = node.ty.shape[0] as u32;
+                let out_w = if stride_w == 1 {
+                    in_w
+                } else {
+                    in_w * stride_w - (stride_w - 1)
+                };
+                let batch = total / (channels * in_h * out_w);
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::DilateZerosW,
+                    workgroups: [total.div_ceil(256), 1, 1],
+                    input_buffers: vec![x],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![batch, channels, in_h, in_w, stride_w, out_w],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
+            Op::DilateZerosH {
+                channels,
+                in_h,
+                in_w,
+                stride_h,
+            } => {
+                let x = self.get_buffer(node.inputs[0]);
+                let total = node.ty.shape[0] as u32;
+                let out_h = if stride_h == 1 {
+                    in_h
+                } else {
+                    in_h * stride_h - (stride_h - 1)
+                };
+                let batch = total / (channels * out_h * in_w);
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::DilateZerosH,
+                    workgroups: [total.div_ceil(256), 1, 1],
+                    input_buffers: vec![x],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![batch, channels, in_h, in_w, stride_h, out_h],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
+            Op::PixelShuffleW {
+                channels,
+                in_h,
+                in_w,
+                factor,
+            } => {
+                let x = self.get_buffer(node.inputs[0]);
+                let total = node.ty.shape[0] as u32;
+                let out_c = channels / factor;
+                let out_w = in_w * factor;
+                let batch = total / (out_c * in_h * out_w);
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::PixelShuffleW,
+                    workgroups: [total.div_ceil(256), 1, 1],
+                    input_buffers: vec![x],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![batch, channels, in_h, in_w, factor],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
+            Op::Conv2dGradInputHW {
+                in_channels,
+                in_h,
+                in_w,
+                out_channels,
+                kernel_h,
+                kernel_w,
+                stride_h,
+                stride_w,
+                padding_h,
+                padding_w,
+            } => {
+                let grad_out = self.get_buffer(node.inputs[0]);
+                let kernel = self.get_buffer(node.inputs[1]);
+                let out_h = (in_h + 2 * padding_h - kernel_h) / stride_h + 1;
+                let out_w = (in_w + 2 * padding_w - kernel_w) / stride_w + 1;
+                let out_size = node.ty.shape[0] as u32;
+                let batch = out_size / (in_channels * in_h * in_w);
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::Conv2dGradInputHW,
+                    workgroups: [in_w.div_ceil(16), in_h.div_ceil(16), batch * in_channels],
+                    input_buffers: vec![grad_out, kernel],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![
+                        batch,
+                        in_channels,
+                        in_h,
+                        in_w,
+                        out_channels,
+                        kernel_h,
+                        kernel_w,
+                        stride_h,
+                        padding_h,
+                        out_h,
+                        out_w,
+                        padding_w,
+                        stride_w,
+                    ],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
             Op::Upsample2xGrad {
                 channels,
                 in_h,
@@ -2636,6 +2934,8 @@ impl<'a> Compiler<'a> {
                 // every residual projection. The general GEMM path is
                 // CPU-parity-verified (tests/inference_parity_large.rs)
                 // and handles kernel 1×1 as a degenerate im2col.
+                // (SpectroStream's decoder_0 shortcut hit the same symptom
+                // from the music-gen branch; same root cause as above.)
                 {
                     // Use implicit GEMM: output = weight @ im2col(input)^T
                     // M=Co, N=oH*oW, K=Ci*kH*kW, batched in z dimension
@@ -2766,7 +3066,7 @@ impl<'a> Compiler<'a> {
 
                 let input = self.get_buffer(node.inputs[0]);
                 let weight_xform = self.get_buffer(node.inputs[1]); // Winograd-transformed weights [16*Co*Ci]
-                // input[2] is the original weight [Co*Ci*9] (for backward, and for re-transform)
+                                                                    // input[2] is the original weight [Co*Ci*9] (for backward, and for re-transform)
                 let original_weight = self.get_buffer(node.inputs[2]);
 
                 // Dispatch 0: Weight transform (re-transform every step for training)
@@ -3000,6 +3300,41 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![0, num_heads, num_kv_heads, head_dim], // kv_len read from input buffer
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
+            Op::CachedAttentionRelPos {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_buckets,
+                max_distance,
+                bidirectional,
+            } => {
+                let q = self.get_buffer(node.inputs[0]);
+                let k_cache = self.get_buffer(node.inputs[1]);
+                let v_cache = self.get_buffer(node.inputs[2]);
+                let kv_pos_input = self.get_buffer(node.inputs[3]);
+                let rel_pos_table = self.get_buffer(node.inputs[4]);
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::CachedAttentionRelPos,
+                    workgroups: [1, num_heads, 1],
+                    input_buffers: vec![q, k_cache, v_cache, rel_pos_table, kv_pos_input],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        num_buckets,
+                        max_distance,
+                        bidirectional as u32,
+                        0,
+                        0,
+                    ],
                     use_coop: false,
                     use_small_tiles: false,
                     ..Default::default()

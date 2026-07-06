@@ -1,5 +1,6 @@
 pub mod efficientnet;
 pub mod gemma4;
+pub mod magenta_rt;
 pub mod mistral;
 pub mod phi3;
 pub mod resnet;

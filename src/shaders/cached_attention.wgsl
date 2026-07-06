@@ -97,6 +97,8 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             my_out = my_out * correction + weight * bias[v_base + tid];
             max_score = new_max;
         }
+        // All lanes have read wg_scores; barrier before the next tile overwrites it.
+        workgroupBarrier();
     }
 
     // Tail
@@ -111,6 +113,8 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         sum_exp = sum_exp * correction + weight;
         my_out = my_out * correction + weight * bias[k_base + tid];
         max_score = new_max;
+        // All lanes have read wg_dot[0]; barrier before the next iter overwrites it.
+        workgroupBarrier();
     }
 
     let safe_sum = select(sum_exp, 1.0, sum_exp == 0.0);
