@@ -295,7 +295,7 @@ impl SpmModel {
                 // Uncovered char: byte-fallback to its UTF-8 bytes' piece ids
                 // (each OOV char expands separately, matching `sentencepiece`),
                 // or merge consecutive unknowns into one unk id without it.
-                None => match &self.byte_pieces {
+                None => match self.byte_pieces.as_ref() {
                     Some(bp) => {
                         let mut buf = [0u8; 4];
                         for &b in chars[start].encode_utf8(&mut buf).as_bytes() {
