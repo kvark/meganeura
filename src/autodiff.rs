@@ -186,11 +186,13 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let n = batch * features;
                 let softmax = graph.softmax(logits);
                 // Build per-row label sum broadcast to [batch, features]:
-                // matmul([batch, features], [features, features]=ones)
-                // yields a [batch, features] tensor whose row b is S[b]
-                // replicated `features` times.
-                let ones_ff = graph.constant(vec![1.0; features * features], &[features, features]);
-                let label_sum_bf = graph.matmul(labels, ones_ff);
+                // SumInner gives S[b] as [batch, 1]; matmul with
+                // ones[1, features] replicates it across the row. Must
+                // stay O(batch·features) — a ones[features, features]
+                // matmul is quadratic in vocab size for LM heads.
+                let label_sum_b1 = graph.sum_inner(labels);
+                let ones_1f = graph.constant(vec![1.0; features], &[1, features]);
+                let label_sum_bf = graph.matmul(label_sum_b1, ones_1f);
                 let softmax_scaled = graph.mul(softmax, label_sum_bf);
                 let neg_labels = graph.neg(labels);
                 let diff = graph.add(softmax_scaled, neg_labels);
@@ -324,14 +326,13 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 // reduces axis 0 (across batches) — wrong axis. Bug only
                 // manifested at batch>1; my softmax_mid_chain test missed
                 // it because mean(softmax) is the constant 1/K (gradient
-                // identically zero). Fixed via the matmul-with-ones trick
-                // already used in CrossEntropyLoss backward:
-                //   matmul(grad ⊙ s, ones[features × features]) gives a
-                //   [batch, features] tensor whose row b is filled with
-                //   Σ_k (grad ⊙ s)[b, k].
+                // identically zero). SumInner reduces axis 1 (the right
+                // one); matmul with ones[1, features] broadcasts the
+                // [batch, 1] sums back to [batch, features].
                 let grad_s_mul_s = graph.mul(grad_output, s);
-                let ones_ff = graph.constant(vec![1.0; features * features], &[features, features]);
-                let row_sum_broadcast = graph.matmul(grad_s_mul_s, ones_ff);
+                let row_sum_b1 = graph.sum_inner(grad_s_mul_s);
+                let ones_1f = graph.constant(vec![1.0; features], &[1, features]);
+                let row_sum_broadcast = graph.matmul(row_sum_b1, ones_1f);
                 let correction = graph.mul(s, row_sum_broadcast);
                 let neg_correction = graph.neg(correction);
                 let grad_x = graph.add(grad_s_mul_s, neg_correction);
@@ -345,8 +346,9 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let features = x_shape[1];
 
                 let s = graph.softmax(x);
-                let ones_ff = graph.constant(vec![1.0; features * features], &[features, features]);
-                let sum_broadcast = graph.matmul(grad_output, ones_ff);
+                let sum_b1 = graph.sum_inner(grad_output);
+                let ones_1f = graph.constant(vec![1.0; features], &[1, features]);
+                let sum_broadcast = graph.matmul(sum_b1, ones_1f);
                 let correction = graph.mul(s, sum_broadcast);
                 let neg_correction = graph.neg(correction);
                 let grad_x = graph.add(grad_output, neg_correction);
