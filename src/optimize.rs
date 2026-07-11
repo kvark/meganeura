@@ -1,44 +1,57 @@
-use crate::graph::{Graph, Node, Op};
-use egglog::{Term, TermDag, TermId};
+//! E-graph optimization pass: the graph is encoded into egglog, rewrite
+//! rules discover fusions under equality saturation, a traffic-aware
+//! cost model extracts the cheapest equivalent term per output, and the
+//! extracted terms are stamped back into the graph IR. The e-graph is
+//! the single owner of every rewrite decision — there is no parallel
+//! pattern-matching path.
+//!
+//! Scaling: saturation cost is superlinear in node count, so graphs over
+//! [`SATURATION_CUTOFF`] are split into segments — repeated regions
+//! (transformer layers, detected by `outline`) saturate one instance and
+//! stamp the result into every instance; the remaining nodes are chunked
+//! into windows under the cutoff. Every node therefore passes through
+//! the e-graph exactly once. Cross-segment fusions are not discovered
+//! (segment boundaries are opaque leaves) — the same limitation the
+//! roadmap notes for block-boundary fusions.
+//!
+//! Node ids must be topologically ordered (inputs before consumers) for
+//! the egglog encoding; graph builders and autodiff maintain this, and
+//! `Graph::toposort` restores it after passes that append nodes.
+
+use crate::graph::{Graph, Node, NodeId, Op, TensorType};
+use egglog::{Term, TermDag, TermId, ast::Literal};
 use std::collections::{HashMap, HashSet};
 use std::{fmt, time::Instant};
 
+/// Node-count ceiling for a single egglog saturation. Above this, the
+/// graph is segmented (see module docs). Shared-parameter graphs create
+/// large e-classes that make pattern matching superlinear: the SmolVLA
+/// training graph (~750 nodes) takes minutes unsegmented.
+const SATURATION_CUTOFF: usize = 300;
+
 // ---------------------------------------------------------------------------
-// HBM-traffic-aware cost model for e-graph extraction (step 6).
+// HBM-traffic-aware cost model for e-graph extraction.
 //
-// When per-e-class tensor sizes are available (built after saturation by
-// evaluating each graph node's binding), the cost of an e-node is the
-// HBM traffic it causes: bytes read (inputs) + bytes written (output).
-// A fusion then wins by exactly the intermediate traffic it eliminates —
-// FusedMatMulAdd(a,b,d) saves the write and re-read of the matmul's
-// result tensor — with no hand-tuned constants, and unprofitable
-// rewrites (future: Winograd vs implicit GEMM, layout conversions,
-// rematerialization) can lose on real numbers.
-//
-// Without sizes, the constant per-constructor scheme applies: all
-// non-leaf, non-fused ops cost 10, fused ops cost 9 (so one fused op
-// beats the two ops it replaces), leaves are free. Equal base costs
-// prevent the extractor from shuffling op order in ways that change FP
-// rounding without improving throughput — a property the traffic model
-// shares, since equivalent orderings move the same bytes.
+// Per-e-class tensor sizes are built after saturation by evaluating each
+// graph node's binding; the cost of an e-node is then the HBM traffic it
+// causes: bytes read (inputs) + bytes written (output). A fusion wins by
+// exactly the intermediate traffic it eliminates — FusedMatMulAdd(a,b,d)
+// saves the write and re-read of the matmul's result tensor — with no
+// hand-tuned constants, and unprofitable rewrites (future: Winograd vs
+// implicit GEMM, layout conversions, rematerialization) can lose on real
+// numbers.
 // ---------------------------------------------------------------------------
 
-/// Cost model that prefers the expression with the least HBM traffic
-/// (shape-aware mode) or fused kernels over unfused sequences
-/// (constant-cost fallback).
+/// Cost model that prefers the expression with the least HBM traffic.
 #[derive(Default, Debug, Clone)]
 pub struct FusionCostModel {
-    /// e-class value → tensor size in bytes. Empty = constant-cost mode.
+    /// e-class value → tensor size in bytes.
     sizes: std::sync::Arc<HashMap<egglog::Value, u64>>,
 }
 
 impl FusionCostModel {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Shape-aware mode: extraction cost is bytes read + bytes written,
-    /// looked up per e-class from `sizes`.
+    /// Extraction cost is bytes read + bytes written, looked up per
+    /// e-class from `sizes`.
     pub fn with_sizes(sizes: HashMap<egglog::Value, u64>) -> Self {
         Self {
             sizes: std::sync::Arc::new(sizes),
@@ -60,30 +73,24 @@ impl egglog::extract::CostModel<u64> for FusionCostModel {
         row: &egglog::FunctionRow,
     ) -> u64 {
         let name = func.name();
-        // Leaf nodes exist regardless; Identity is buffer aliasing.
-        // Their tensors' bytes are charged to the ops that read them.
-        if matches!(name, "Input" | "Parameter" | "Const" | "Identity") {
+        // Leaves exist regardless; their bytes are charged to the ops
+        // that read them.
+        if name == "Leaf" {
             return 0;
         }
-        if !self.sizes.is_empty() {
-            // row.vals = [args.., output]. Args missing from the map are
-            // non-tensor primitives (strings, ints) and read no HBM.
-            if let Some((out, args)) = row.vals.split_last() {
-                if let Some(&out_bytes) = self.sizes.get(out) {
-                    let read: u64 = args.iter().filter_map(|v| self.sizes.get(v)).sum();
-                    return read.saturating_add(out_bytes);
-                }
-            }
-            // Unknown output e-class (shouldn't happen for tensor sorts):
-            // fall through to the constant scheme.
+        // row.vals = [args.., output]. Args missing from the map are
+        // non-tensor primitives (the node-id ints) and read no HBM.
+        if let Some((out, args)) = row.vals.split_last()
+            && let Some(&out_bytes) = self.sizes.get(out)
+        {
+            let read: u64 = args.iter().filter_map(|v| self.sizes.get(v)).sum();
+            return read.saturating_add(out_bytes);
         }
+        // Unknown output e-class (a rewrite-created tensor that no graph
+        // node binds, e.g. the packed matmul inside SwiGLUPacked): fall
+        // back to constants that keep fused ops preferred.
         match name {
-            // Fused ops: cheaper than the sum of their unfused equivalents
-            // before any register-pressure penalty.
-            "FusedMatMulAdd" | "FusedMatMulATAdd" | "FusedMatMulBTAdd" => 9,
-            "FusedRmsNormMatMul" => 9,
-            "SwiGLUConcat" => 9,
-            "WinogradConv2d" => 9,
+            "FusedMatMulAdd" | "FusedMatMulATAdd" | "FusedMatMulBTAdd" | "SwiGLUPacked" => 9,
             _ => 10,
         }
     }
@@ -94,18 +101,18 @@ impl egglog::extract::CostModel<u64> for FusionCostModel {
         _sort: &egglog::ArcSort,
         _value: egglog::Value,
     ) -> u64 {
-        // Strings / ints embedded in constructors are not tensors.
+        // Ints embedded in constructors are not tensors.
         0
     }
 }
 
 /// Report from the e-graph optimization pass.
 pub struct OptimizeReport {
-    /// The egglog program text (for external inspection / replay).
+    /// The egglog program text of the first segment (for inspection).
     pub egglog_program: String,
-    /// Number of e-classes after saturation.
+    /// Number of e-classes after saturation (summed over segments).
     pub num_eclasses: usize,
-    /// Number of e-nodes after saturation.
+    /// Number of e-nodes after saturation (summed over segments).
     pub num_enodes: usize,
     /// Which rewrite rules fired and how many times.
     pub rules_fired: Vec<(String, usize)>,
@@ -117,7 +124,7 @@ pub struct OptimizeReport {
     pub fusions_applied: Vec<(String, u32)>,
     /// Wall-clock time for egglog saturation.
     pub egglog_time: std::time::Duration,
-    /// Wall-clock time for graph extraction + fusion rewrites.
+    /// Wall-clock time for extraction + term stamping.
     pub extract_time: std::time::Duration,
     /// Repeated regions outlined for per-block saturation (0 when the
     /// whole graph fit under the saturation cutoff).
@@ -189,8 +196,7 @@ impl fmt::Display for OptimizeReport {
     }
 }
 
-/// Convert a Graph to an egglog program string, run equality saturation
-/// with rewrite rules, and extract the optimized graph back.
+/// Run e-graph optimization and return the rewritten graph.
 pub fn optimize(graph: &Graph) -> Graph {
     let (graph, _report) = optimize_with_report(graph);
     graph
@@ -198,275 +204,310 @@ pub fn optimize(graph: &Graph) -> Graph {
 
 /// Like `optimize`, but also returns a detailed report for debugging.
 pub fn optimize_with_report(graph: &Graph) -> (Graph, OptimizeReport) {
-    optimize_with_cost_model(graph, FusionCostModel::new())
-}
-
-/// Like `optimize_with_report`, but lets the caller supply a custom
-/// cost model.
-pub fn optimize_with_cost_model(
-    graph: &Graph,
-    cost_model: FusionCostModel,
-) -> (Graph, OptimizeReport) {
-    let program = graph_to_egglog(graph);
-    log::debug!("egglog program:\n{}", program);
-
     let nodes_before = graph.nodes().len();
+    let mut g = clone_graph(graph);
+
+    let segments = plan_segments(&g);
+    let outlined_regions = segments.iter().filter(|s| s.shifts.len() > 1).count();
+
+    let mut fusions: Vec<(String, u32)> = Vec::new();
+    let mut index = build_structural_index(&g);
+    let mut first_program = String::new();
     let mut num_eclasses = 0;
     let mut num_enodes = 0;
+    let mut egglog_time = std::time::Duration::ZERO;
+    let mut extract_time = std::time::Duration::ZERO;
 
-    let node_count = graph
-        .nodes()
-        .iter()
-        .filter(|n| !matches!(n.op, Op::Nop))
-        .count();
-    // Shape-aware extraction cost (bytes read + written per e-node).
-    // The env var reverts to the constant per-constructor scheme.
-    let traffic_cost = std::env::var("MEGANEURA_NO_TRAFFIC_COST").is_err();
-    let egglog_start = Instant::now();
-    // Full-graph egglog saturation grows superlinearly with node count
-    // (shared-parameter graphs create large e-classes that make pattern
-    // matching slow): the SmolVLA training graph (~750 nodes) takes
-    // minutes. Above the cutoff, detect repeated regions (transformer
-    // layers, forward and backward) and saturate ONE instance of each —
-    // the extractor's per-block decisions are logged and reported; the
-    // graph rewrite itself still goes through the pattern appliers below,
-    // which visit every instance.
-    if node_count > 300 {
-        let regions = crate::outline::detect_repeated_regions(graph);
-        let mut chosen: HashSet<String> = HashSet::new();
-        let mut region_program = String::new();
-        for region in &regions {
-            let (block_program, externals) = region_egglog_program(graph, region);
-            let mut egraph = egglog::EGraph::default();
-            if let Err(e) = egraph.parse_and_run_program(None, &block_program) {
-                log::warn!("egglog failed on outlined region {:?}: {}", region, e);
-                continue;
-            }
-            let ids = externals
-                .into_iter()
-                .chain(region.start..region.start + region.period);
-            let cm = if traffic_cost {
-                FusionCostModel::with_sizes(eclass_sizes(graph, &mut egraph, ids))
-            } else {
-                cost_model.clone()
-            };
-            for out_id in region_outputs(graph, region) {
-                let var = format!("n{}", out_id);
-                let eval =
-                    egraph.eval_expr(&egglog::ast::Expr::Var(egglog::ast::Span::Panic, var));
-                if let Ok((sort, value)) = eval {
-                    match egraph.extract_value_with_cost_model(&sort, value, cm.clone()) {
-                        Ok((dag, term_id, cost)) => {
-                            log::debug!(
-                                "region {:?}: extracted n{} (cost {}): {}",
-                                region,
-                                out_id,
-                                cost,
-                                dag.to_string(term_id)
-                            );
-                            collect_chosen_kinds(&dag, term_id, &mut chosen);
-                        }
-                        Err(e) => log::warn!("region extraction failed for n{}: {}", out_id, e),
-                    }
-                }
-            }
-            let serialized = egraph.serialize(egglog::SerializeConfig::default());
-            num_eclasses += serialized.egraph.class_data.len();
-            num_enodes += serialized.egraph.nodes.len();
-            if region_program.is_empty() {
-                region_program = block_program;
-            }
-        }
-        let egglog_time = egglog_start.elapsed();
-        if regions.is_empty() {
-            log::debug!(
-                "egglog: {} nodes, no repeated regions — pattern matching only",
-                node_count
-            );
-        } else {
-            log::info!(
-                "egglog: {} nodes outlined into {} region(s) {:?}; extractor chose {:?}",
-                node_count,
-                regions.len(),
-                regions,
-                chosen,
-            );
-        }
-        let extract_start = Instant::now();
-        // The outlined blocks don't cover the whole graph, so the
-        // extractor's choices can't soundly *disable* a fusion kind for
-        // out-of-region patterns — run all appliers. Per-site gating
-        // becomes possible once rewrites are stamped from extracted
-        // terms instead of re-matched globally.
-        let (optimized, fusions_applied) = rebuild_graph_from_extractions(graph, None);
-        let extract_time = extract_start.elapsed();
-        let nodes_after = optimized
-            .nodes()
-            .iter()
-            .filter(|n| !matches!(n.op, Op::Nop))
-            .count();
-        return (
-            optimized,
-            OptimizeReport {
-                egglog_program: if region_program.is_empty() {
-                    program
-                } else {
-                    region_program
-                },
-                num_eclasses,
-                num_enodes,
-                rules_fired: fusions_applied.iter().fold(Vec::new(), |mut acc, entry| {
-                    let name = &entry.0;
-                    if let Some(e) = acc.iter_mut().find(|e: &&mut (String, usize)| e.0 == *name) {
-                        e.1 += 1;
-                    } else {
-                        acc.push((name.clone(), 1));
-                    }
-                    acc
-                }),
-                nodes_before,
-                nodes_after,
-                fusions_applied,
-                egglog_time,
-                extract_time,
-                outlined_regions: regions.len(),
-            },
+    for seg in &segments {
+        process_segment(
+            &mut g,
+            seg,
+            &mut index,
+            &mut fusions,
+            &mut first_program,
+            &mut num_eclasses,
+            &mut num_enodes,
+            &mut egglog_time,
+            &mut extract_time,
         );
     }
-    let mut egraph = egglog::EGraph::default();
-    let egglog_result = egraph.parse_and_run_program(None, &program);
-    log::debug!(
-        "egglog: saturation took {:.1}ms",
-        egglog_start.elapsed().as_secs_f64() * 1000.0
-    );
-    let egglog_ok;
-    let mut extractions: Vec<(TermDag, TermId)> = Vec::new();
-    let mut extraction_complete = false;
 
-    match egglog_result {
-        Ok(outputs) => {
-            egglog_ok = true;
+    let dce_start = Instant::now();
+    sweep_dead_nodes(&mut g);
+    extract_time += dce_start.elapsed();
 
-            // Step 6: programmatic extraction with FusionCostModel — in
-            // traffic mode the e-node cost is the HBM bytes it moves, so
-            // a fusion wins by the intermediate traffic it eliminates;
-            // in constant mode fused ops cost 9 vs base 10.
-            let cm = if traffic_cost {
-                let ids = 0..graph.nodes().len();
-                FusionCostModel::with_sizes(eclass_sizes(graph, &mut egraph, ids))
-            } else {
-                cost_model.clone()
-            };
-            extraction_complete = true;
-            for &out_id in graph.outputs() {
-                if matches!(graph.node(out_id).op, Op::Nop) {
-                    continue;
-                }
-                let var_name = format!("n{}", out_id);
-                let eval_result =
-                    egraph.eval_expr(&egglog::ast::Expr::Var(egglog::ast::Span::Panic, var_name));
-                match eval_result {
-                    Ok((sort, value)) => {
-                        match egraph.extract_value_with_cost_model(&sort, value, cm.clone()) {
-                            Ok((dag, term_id, cost)) => {
-                                log::debug!(
-                                    "extracted n{} (cost {}): {}",
-                                    out_id,
-                                    cost,
-                                    dag.to_string(term_id)
-                                );
-                                extractions.push((dag, term_id));
-                            }
-                            Err(e) => {
-                                log::warn!("extraction failed for n{}: {}", out_id, e);
-                                extraction_complete = false;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!("failed to eval n{}: {}", out_id, e);
-                        extraction_complete = false;
-                    }
-                }
-            }
-
-            // Fallback: if programmatic extraction didn't work, use the
-            // text-based outputs (legacy path).
-            if extractions.is_empty() {
-                extraction_complete = false;
-                for out in &outputs {
-                    if let egglog::CommandOutput::ExtractBest(ref dag, _cost, term_id) = *out {
-                        log::debug!("egglog legacy extracted: {}", dag.to_string(term_id));
-                        extractions.push((dag.clone(), term_id));
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            log::warn!(
-                "egglog optimization failed: {}, returning original graph",
-                e
-            );
-            egglog_ok = false;
-        }
-    };
-    let egglog_time = egglog_start.elapsed();
-
-    if egglog_ok {
-        let serialized = egraph.serialize(egglog::SerializeConfig::default());
-        num_eclasses = serialized.egraph.class_data.len();
-        num_enodes = serialized.egraph.nodes.len();
-    }
-
-    // When extraction covered every output, the extracted terms are the
-    // optimizer's decision: only the fusion kinds it chose are applied.
-    // Otherwise (egglog failure, partial extraction) all appliers run.
-    let chosen = if extraction_complete {
-        let mut kinds = HashSet::new();
-        for &(ref dag, term_id) in &extractions {
-            collect_chosen_kinds(dag, term_id, &mut kinds);
-        }
-        Some(kinds)
-    } else {
-        None
-    };
-
-    let extract_start = Instant::now();
-    let (optimized, fusions_applied) = rebuild_graph_from_extractions(graph, chosen.as_ref());
-    let extract_time = extract_start.elapsed();
-
-    let nodes_after = optimized
+    let nodes_after = g
         .nodes()
         .iter()
         .filter(|n| !matches!(n.op, Op::Nop))
         .count();
 
+    log::info!("optimizer: {} fusions on {} nodes", fusions.len(), nodes_after);
     let mut rules_fired: Vec<(String, usize)> = Vec::new();
-    for fusion in &fusions_applied {
+    for fusion in &fusions {
         if let Some(entry) = rules_fired.iter_mut().find(|e| e.0 == fusion.0) {
             entry.1 += 1;
         } else {
             rules_fired.push((fusion.0.clone(), 1));
         }
     }
+    for (name, count) in &rules_fired {
+        log::info!("  {}x {}", count, name);
+    }
 
     let report = OptimizeReport {
-        egglog_program: program,
+        egglog_program: first_program,
         num_eclasses,
         num_enodes,
         rules_fired,
         nodes_before,
         nodes_after,
-        fusions_applied,
+        fusions_applied: fusions,
         egglog_time,
         extract_time,
-        outlined_regions: 0,
+        outlined_regions,
     };
-
-    (optimized, report)
+    (g, report)
 }
 
-/// Map every node binding (`n{id}`) to its e-class value and record the
+/// Dump the whole-graph egglog program (for standalone debugging).
+/// Requires topologically-ordered node ids, like `optimize` itself.
+pub fn dump_egglog_program(graph: &Graph) -> String {
+    let ids: Vec<usize> = graph
+        .nodes()
+        .iter()
+        .filter(|n| !matches!(n.op, Op::Nop))
+        .map(|n| n.id as usize)
+        .collect();
+    let seg = Segment {
+        ids,
+        shifts: vec![0],
+    };
+    segment_program(graph, &seg).0
+}
+
+// ---------------------------------------------------------------------------
+// Segmentation
+// ---------------------------------------------------------------------------
+
+/// A unit of saturation: the node ids of one encoded instance, plus the
+/// id shift of every instance the extracted terms are stamped into.
+/// Repeated regions have `shifts = [0, period, 2*period, ...]`; windows
+/// (including a small whole graph) have `shifts = [0]`.
+struct Segment {
+    ids: Vec<usize>,
+    shifts: Vec<usize>,
+}
+
+fn plan_segments(g: &Graph) -> Vec<Segment> {
+    let n = g.nodes().len();
+    let active = g
+        .nodes()
+        .iter()
+        .filter(|n| !matches!(n.op, Op::Nop))
+        .count();
+    let mut segments = Vec::new();
+    let mut covered = vec![false; n];
+    if active > SATURATION_CUTOFF {
+        for r in crate::outline::detect_repeated_regions(g) {
+            for c in covered.iter_mut().skip(r.start).take(r.len()) {
+                *c = true;
+            }
+            segments.push(Segment {
+                ids: (r.start..r.start + r.period).collect(),
+                shifts: (0..r.count).map(|k| k * r.period).collect(),
+            });
+        }
+    }
+    // Chunk everything not covered by a region into windows under the
+    // cutoff. Fusion patterns are 2-3 nodes deep, so the coverage lost
+    // at window boundaries is small; repetition-less graphs over the
+    // cutoff (e.g. large ONNX imports) still get saturated this way.
+    let mut window: Vec<usize> = Vec::new();
+    for id in 0..n {
+        if covered[id] || matches!(g.nodes()[id].op, Op::Nop) {
+            continue;
+        }
+        window.push(id);
+        if window.len() == SATURATION_CUTOFF {
+            segments.push(Segment {
+                ids: std::mem::take(&mut window),
+                shifts: vec![0],
+            });
+        }
+    }
+    if !window.is_empty() {
+        segments.push(Segment {
+            ids: window,
+            shifts: vec![0],
+        });
+    }
+    segments
+}
+
+// ---------------------------------------------------------------------------
+// Egglog encoding
+// ---------------------------------------------------------------------------
+
+/// The egglog sort and rewrite rules. Named constructors exist only for
+/// ops that rewrite rules pattern-match on; every other op — including
+/// ones added later — encodes through the arity-generic `Op1..Op6`
+/// constructors, tagged with the node id so ops with different
+/// attributes (eps, strides, head counts) never unify.
+fn egglog_prelude(prog: &mut String) {
+    prog.push_str(
+        "\
+(datatype Op
+  (Leaf i64)
+  (MatMul Op Op)
+  (MatMulAT Op Op)
+  (MatMulBT Op Op)
+  (FusedMatMulAdd Op Op Op)
+  (FusedMatMulATAdd Op Op Op)
+  (FusedMatMulBTAdd Op Op Op)
+  (Add Op Op)
+  (Mul Op Op)
+  (Relu Op)
+  (Sigmoid Op)
+  (Neg Op)
+  (Transpose Op)
+  (Silu Op)
+  (SwiGLU Op Op)
+  (SwiGLUPacked Op Op Op)
+  (Op1 i64 Op)
+  (Op2 i64 Op Op)
+  (Op3 i64 Op Op Op)
+  (Op4 i64 Op Op Op Op)
+  (Op5 i64 Op Op Op Op Op)
+  (Op6 i64 Op Op Op Op Op Op)
+)
+
+; --- Algebraic simplifications ---
+(rewrite (Neg (Neg ?x)) ?x)
+(rewrite (Transpose (Transpose ?x)) ?x)
+(rewrite (Relu (Relu ?x)) (Relu ?x))
+
+; --- Kernel fusion: Add(MatMul*(a,b), d) -> FusedMatMul*Add(a,b,d) ---
+; Both argument orders handled explicitly (no general Add commutativity
+; rule, which causes exponential blowup on large graphs).
+(rewrite (Add (MatMul ?a ?b) ?d)    (FusedMatMulAdd ?a ?b ?d))
+(rewrite (Add ?d (MatMul ?a ?b))    (FusedMatMulAdd ?a ?b ?d))
+(rewrite (Add (MatMulAT ?a ?b) ?d)  (FusedMatMulATAdd ?a ?b ?d))
+(rewrite (Add ?d (MatMulAT ?a ?b))  (FusedMatMulATAdd ?a ?b ?d))
+(rewrite (Add (MatMulBT ?a ?b) ?d)  (FusedMatMulBTAdd ?a ?b ?d))
+(rewrite (Add ?d (MatMulBT ?a ?b))  (FusedMatMulBTAdd ?a ?b ?d))
+
+; --- ONNX decomposed op recognition ---
+; PyTorch decomposes compound ops when exporting to ONNX. These rules
+; recognize the decomposed patterns and fuse them back into compound
+; kernels.
+
+; Silu: x * sigmoid(x)
+(rewrite (Mul ?x (Sigmoid ?x)) (Silu ?x))
+(rewrite (Mul (Sigmoid ?x) ?x) (Silu ?x))
+
+; SwiGLU: silu(gate) * up
+(rewrite (Mul (Silu ?gate) ?up) (SwiGLU ?gate ?up))
+
+; Packed SwiGLU: gate and up projections sharing the input become one
+; wide matmul over a concatenated weight (the derived parameter is
+; created at stamp time; stamping falls back to the unpacked form when
+; the weights are not plain 2D parameters).
+(rewrite (SwiGLU (MatMul ?h ?wg) (MatMul ?h ?wu)) (SwiGLUPacked ?h ?wg ?wu))
+
+",
+    );
+    // Saturation is bounded: the deepest rewrite chain is three rules
+    // (Mul(x, Sigmoid(x)) -> Silu, Mul(Silu, up) -> SwiGLU, then
+    // SwiGLU(MatMul, MatMul) -> SwiGLUPacked), so three iterations reach
+    // a fixpoint; the fourth is margin for future rules.
+}
+
+/// Returns the named egglog constructor for ops that rewrite rules
+/// match on, or `None` for generically-encoded ops.
+fn named_constructor(op: &Op) -> Option<&'static str> {
+    Some(match op {
+        Op::MatMul => "MatMul",
+        Op::MatMulAT => "MatMulAT",
+        Op::MatMulBT => "MatMulBT",
+        Op::FusedMatMulAdd => "FusedMatMulAdd",
+        Op::FusedMatMulATAdd => "FusedMatMulATAdd",
+        Op::FusedMatMulBTAdd => "FusedMatMulBTAdd",
+        Op::Add => "Add",
+        Op::Mul => "Mul",
+        Op::Relu => "Relu",
+        Op::Sigmoid => "Sigmoid",
+        Op::Neg => "Neg",
+        Op::Transpose => "Transpose",
+        Op::Silu => "Silu",
+        Op::SwiGLU => "SwiGLU",
+        _ => return None,
+    })
+}
+
+fn node_to_egglog_expr(node: &Node) -> String {
+    match node.op {
+        Op::Input { .. } | Op::Parameter { .. } | Op::Constant { .. } => {
+            format!("(Leaf {})", node.id)
+        }
+        Op::Nop => unreachable!("Nop nodes are filtered before encoding"),
+        ref op => {
+            let args: Vec<String> = node.inputs.iter().map(|i| format!("$n{}", i)).collect();
+            if let Some(name) = named_constructor(op) {
+                format!("({} {})", name, args.join(" "))
+            } else {
+                assert!(
+                    !node.inputs.is_empty() && node.inputs.len() <= 6,
+                    "op {:?} with {} inputs exceeds the generic egglog encoding",
+                    op,
+                    node.inputs.len()
+                );
+                format!("(Op{} {} {})", node.inputs.len(), node.id, args.join(" "))
+            }
+        }
+    }
+}
+
+/// Egglog program for one segment instance: external dependencies become
+/// opaque `Leaf` terms, segment nodes are encoded in id order. Returns
+/// the program and the external node ids (needed to size their e-classes
+/// for traffic-aware extraction).
+fn segment_program(g: &Graph, seg: &Segment) -> (String, Vec<usize>) {
+    let idset: HashSet<usize> = seg.ids.iter().copied().collect();
+    let mut externals: Vec<usize> = Vec::new();
+    let mut seen = HashSet::new();
+    for &id in &seg.ids {
+        let node = &g.nodes()[id];
+        if matches!(node.op, Op::Nop) {
+            continue;
+        }
+        for &input in &node.inputs {
+            let input = input as usize;
+            if !idset.contains(&input) && seen.insert(input) {
+                externals.push(input);
+            }
+        }
+    }
+    externals.sort_unstable();
+
+    let mut prog = String::new();
+    egglog_prelude(&mut prog);
+    for &e in &externals {
+        prog.push_str(&format!("(let $n{} (Leaf {}))\n", e, e));
+    }
+    for &id in &seg.ids {
+        let node = &g.nodes()[id];
+        if matches!(node.op, Op::Nop) {
+            continue;
+        }
+        prog.push_str(&format!("(let $n{} {})\n", id, node_to_egglog_expr(node)));
+    }
+    // See the comment at the end of `egglog_prelude` for the bound.
+    prog.push_str("(run 4)\n");
+    (prog, externals)
+}
+
+/// Map every node binding (`$n{id}`) to its e-class value and record the
 /// tensor's size in bytes — the lookup table for traffic-aware
 /// extraction. Nodes sharing an e-class denote the same tensor, so the
 /// insert is idempotent; rewrite-created terms (e.g. FusedMatMulAdd)
@@ -483,7 +524,7 @@ fn eclass_sizes(
         if matches!(node.op, Op::Nop) {
             continue;
         }
-        let var = format!("n{}", node.id);
+        let var = format!("$n{}", node.id);
         if let Ok((_sort, value)) =
             egraph.eval_expr(&egglog::ast::Expr::Var(egglog::ast::Span::Panic, var))
         {
@@ -493,637 +534,514 @@ fn eclass_sizes(
     sizes
 }
 
-/// Dump the egglog program for a graph (for standalone debugging).
-pub fn dump_egglog_program(graph: &Graph) -> String {
-    graph_to_egglog(graph)
-}
+// ---------------------------------------------------------------------------
+// Extraction + stamping
+// ---------------------------------------------------------------------------
 
-/// Generate egglog program text from a Graph.
-///
-/// Encodes the FULL graph (forward + backward) into egglog. Every node
-/// becomes an expression. Rewrite rules express algebraic simplifications
-/// and kernel fusions — egglog discovers which fusions are applicable via
-/// equality saturation.
-fn graph_to_egglog(graph: &Graph) -> String {
-    let mut prog = String::new();
-    egglog_prelude(&mut prog);
-
-    // Encode every node (forward AND backward)
-    for node in graph.nodes() {
-        if matches!(node.op, Op::Nop) {
-            continue;
-        }
-        let expr = node_to_egglog_expr(node);
-        prog.push_str(&format!("(let n{} {})\n", node.id, expr));
-    }
-
-    // Run equality saturation with a bounded iteration count to keep it
-    // fast. The deepest current rewrite chain is two rules
-    // (Mul(x, Sigmoid(x)) → Silu, then Mul(Silu, up) → SwiGLU), so two
-    // iterations reach a fixpoint; the third is margin for future rules.
-    prog.push_str("(run 3)\n\n");
-
-    // Extraction is now done programmatically via the Extractor API
-    // (with FusionCostModel) in optimize_with_report. Legacy text-based
-    // extraction kept as fallback.
-    for &out in graph.outputs() {
-        if !matches!(graph.node(out).op, Op::Nop) {
-            prog.push_str(&format!("(extract n{})\n", out));
-        }
-    }
-
-    prog
-}
-
-/// Egglog program for a single instance of a repeated region: external
-/// dependencies become opaque `Input` leaves, region nodes are encoded
-/// as usual, and saturation runs on just this block. Block outputs
-/// (nodes consumed outside the instance, plus graph outputs) are what
-/// the caller extracts. Returns the program and the external node ids
-/// (needed to size their e-classes for traffic-aware extraction).
-fn region_egglog_program(graph: &Graph, region: &crate::outline::Region) -> (String, Vec<usize>) {
-    let lo = region.start;
-    let hi = region.start + region.period;
-    let mut prog = String::new();
-    egglog_prelude(&mut prog);
-
-    let mut externals: Vec<usize> = Vec::new();
-    for node in &graph.nodes()[lo..hi] {
-        if matches!(node.op, Op::Nop) {
-            continue;
-        }
-        for &input in &node.inputs {
-            let input = input as usize;
-            if !(lo..hi).contains(&input) && !externals.contains(&input) {
-                externals.push(input);
-            }
-        }
-    }
-    externals.sort_unstable();
-    for &e in &externals {
-        prog.push_str(&format!("(let n{} (Input \"ext{}\"))\n", e, e));
-    }
-    for node in &graph.nodes()[lo..hi] {
-        if matches!(node.op, Op::Nop) {
-            continue;
-        }
-        let expr = node_to_egglog_expr(node);
-        prog.push_str(&format!("(let n{} {})\n", node.id, expr));
-    }
-    // Same iteration bound as the full-graph program (see graph_to_egglog).
-    prog.push_str("(run 3)\n\n");
-    (prog, externals)
-}
-
-/// Nodes of a region instance that are consumed outside it (chain edges
-/// into the next instance, residual taps, …) plus any graph outputs —
-/// the extraction roots for the outlined program.
-fn region_outputs(graph: &Graph, region: &crate::outline::Region) -> Vec<u32> {
-    let lo = region.start;
-    let hi = region.start + region.period;
-    let mut outs: Vec<u32> = Vec::new();
-    for node in graph.nodes() {
-        let id = node.id as usize;
-        if (lo..hi).contains(&id) || matches!(node.op, Op::Nop) {
-            continue;
-        }
-        for &input in &node.inputs {
-            if (lo..hi).contains(&(input as usize)) && !outs.contains(&input) {
-                outs.push(input);
-            }
-        }
-    }
-    for &out in graph.outputs() {
-        if (lo..hi).contains(&(out as usize)) && !outs.contains(&out) {
-            outs.push(out);
-        }
-    }
-    outs.sort_unstable();
-    outs
-}
-
-/// The egglog sort/constructor declarations and rewrite rules shared by
-/// the full-graph and outlined-region programs.
-fn egglog_prelude(prog: &mut String) {
-    // Sort and constructors — covers forward, backward, and fused ops
-    prog.push_str(
-        "\
-(datatype Op
-  ; --- Leaf nodes ---
-  (Input String)
-  (Parameter String)
-  (Const i64)
-  ; --- Forward matmul variants ---
-  (MatMul Op Op)
-  (MatMulAT Op Op)
-  (MatMulBT Op Op)
-  ; --- Fused matmul+add (targets for fusion rules) ---
-  (FusedMatMulAdd Op Op Op)
-  (FusedMatMulATAdd Op Op Op)
-  (FusedMatMulBTAdd Op Op Op)
-  ; --- Element-wise ---
-  (Add Op Op)
-  (Mul Op Op)
-  (BiasAdd Op Op)
-  (Relu Op)
-  (Sigmoid Op)
-  (Tanh Op)
-  (Neg Op)
-  (Abs Op)
-  (Log Op)
-  (Recip Op)
-  (ScatterAdd i64 Op Op)
-  (Silu Op)
-  (Gelu Op)
-  (Identity Op)
-  ; --- Shape / reduction ---
-  (Transpose Op)
-  (Softmax Op)
-  (LogSoftmax Op)
-  (SumAll Op)
-  (MeanAll Op)
-  (SumRows Op)
-  (SumInner Op)
-  (CrossEntropyLoss Op Op)
-  (BceLoss Op Op)
-  (Greater Op Op)
-  ; --- Transformer forward ---
-  (SwiGLU Op Op)
-  (SwiGLUConcat Op)
-  (RmsNorm Op Op)
-  (FusedRmsNormMatMul Op Op Op)
-  (Embedding Op Op)
-  (EmbeddingF16 Op Op)
-  (ToF16 Op)
-  (RoPE Op)
-  (RoPEGrad Op)
-  (CausalAttention Op Op Op)
-  (SlidingWindowAttention Op Op Op)
-  (LayerNorm Op Op Op)
-  (FullAttention Op Op Op)
-  (CrossAttention Op Op Op)
-  (MultiHeadAttn Op Op Op)
-  ; --- GroupNorm, Concat, Upsample, Conv2d ops ---
-  (GroupNorm Op Op Op)
-  (GroupNormSilu Op Op Op)
-  (GroupNormGradInput Op Op Op)
-  (GroupNormGradWeightBias Op Op)
-  (Concat Op Op)
-  (SplitA Op)
-  (SplitB Op)
-  (Upsample2x Op)
-  (Upsample2xGrad Op)
-  (Conv2d Op Op)
-  (Conv2dGradInput Op Op)
-  (Conv2dGradWeight Op Op)
-  (MaxPool2d Op)
-  (GlobalAvgPool Op)
-  (GlobalAvgPoolGrad Op)
-  (WinogradConv2d Op Op Op)
-  ; --- KV cache ops ---
-  (CacheWrite Op Op Op)
-  (CachedAttention Op Op Op Op)
-  ; --- Backward / gradient ops ---
-  (SiluGrad Op Op)
-  (SwiGLUGradGate Op Op Op)
-  (SwiGLUGradUp Op Op)
-  (SwiGLUConcatGrad Op Op)
-  (RmsNormGradW Op Op Op)
-  (RmsNormGradX Op Op Op)
-  (LayerNormGradWB Op Op Op)
-  (LayerNormGradX Op Op Op)
-  (MHAGradQ Op Op Op Op)
-  (MHAGradK Op Op Op Op)
-  (MHAGradV Op Op Op Op)
-)
-
-",
-    );
-
-    // Rewrite rules — these are the optimizations egglog discovers
-    prog.push_str(
-        "\
-; --- Algebraic simplifications ---
-(rewrite (Neg (Neg ?x)) ?x)
-(rewrite (Transpose (Transpose ?x)) ?x)
-(rewrite (Relu (Relu ?x)) (Relu ?x))
-
-; --- Kernel fusion: Add(MatMul*(a,b), d) → FusedMatMul*Add(a,b,d) ---
-; Both argument orders handled explicitly (no general Add commutativity
-; rule, which causes exponential blowup on large graphs).
-(rewrite (Add (MatMul ?a ?b) ?d)    (FusedMatMulAdd ?a ?b ?d))
-(rewrite (Add ?d (MatMul ?a ?b))    (FusedMatMulAdd ?a ?b ?d))
-(rewrite (Add (MatMulAT ?a ?b) ?d)  (FusedMatMulATAdd ?a ?b ?d))
-(rewrite (Add ?d (MatMulAT ?a ?b))  (FusedMatMulATAdd ?a ?b ?d))
-(rewrite (Add (MatMulBT ?a ?b) ?d)  (FusedMatMulBTAdd ?a ?b ?d))
-(rewrite (Add ?d (MatMulBT ?a ?b))  (FusedMatMulBTAdd ?a ?b ?d))
-
-; --- RmsNorm+MatMul fusion ---
-(rewrite (MatMul (RmsNorm ?x ?w_norm) ?w_proj) (FusedRmsNormMatMul ?x ?w_norm ?w_proj))
-
-; --- SwiGLU fusion: two matmuls sharing input → single wide matmul ---
-; SwiGLU(MatMul(h, w1), MatMul(h, w2)) can use SwiGLUConcat on a
-; concatenated [h, w1|w2] matmul. Pattern matcher handles weight
-; concatenation since egglog can't create new tensors.
-; (documented here; applied by apply_swiglu_concat_fusions)
-
-; --- ONNX decomposed op recognition ---
-; PyTorch decomposes compound ops when exporting to ONNX.
-; These rules recognize the decomposed patterns and fuse them back
-; into our efficient compound kernels.
-
-; Silu: x * sigmoid(x) → Silu(x)
-(rewrite (Mul ?x (Sigmoid ?x)) (Silu ?x))
-(rewrite (Mul (Sigmoid ?x) ?x) (Silu ?x))
-
-; SwiGLU: silu(gate) * up → SwiGLU(gate, up)
-(rewrite (Mul (Silu ?gate) ?up) (SwiGLU ?gate ?up))
-
-",
-    );
-}
-
-fn node_to_egglog_expr(node: &Node) -> String {
-    let i = &node.inputs;
-    match node.op {
-        Op::Input { ref name } => format!("(Input \"{}\")", name),
-        Op::Parameter { ref name } => format!("(Parameter \"{}\")", name),
-        Op::Constant { .. } => format!("(Const {})", node.id),
-        Op::MatMul => format!("(MatMul n{} n{})", i[0], i[1]),
-        Op::MatMulAT => format!("(MatMulAT n{} n{})", i[0], i[1]),
-        Op::MatMulBT => format!("(MatMulBT n{} n{})", i[0], i[1]),
-        Op::Add => format!("(Add n{} n{})", i[0], i[1]),
-        Op::Mul => format!("(Mul n{} n{})", i[0], i[1]),
-        Op::BiasAdd => format!("(BiasAdd n{} n{})", i[0], i[1]),
-        Op::Relu => format!("(Relu n{})", i[0]),
-        Op::Sigmoid => format!("(Sigmoid n{})", i[0]),
-        Op::Tanh => format!("(Tanh n{})", i[0]),
-        Op::Neg => format!("(Neg n{})", i[0]),
-        Op::Abs => format!("(Abs n{})", i[0]),
-        Op::Log => format!("(Log n{})", i[0]),
-        Op::Recip => format!("(Recip n{})", i[0]),
-        Op::ScatterAdd { vocab_size } => {
-            format!("(ScatterAdd {} n{} n{})", vocab_size, i[0], i[1])
-        }
-        Op::Transpose => format!("(Transpose n{})", i[0]),
-        Op::Softmax => format!("(Softmax n{})", i[0]),
-        Op::LogSoftmax => format!("(LogSoftmax n{})", i[0]),
-        Op::SumAll => format!("(SumAll n{})", i[0]),
-        Op::MeanAll => format!("(MeanAll n{})", i[0]),
-        Op::SumRows => format!("(SumRows n{})", i[0]),
-        Op::SumInner => format!("(SumInner n{})", i[0]),
-        Op::CrossEntropyLoss => format!("(CrossEntropyLoss n{} n{})", i[0], i[1]),
-        Op::BceLoss => format!("(BceLoss n{} n{})", i[0], i[1]),
-        Op::Greater => format!("(Greater n{} n{})", i[0], i[1]),
-        Op::Silu => format!("(Silu n{})", i[0]),
-        Op::SwiGLU => format!("(SwiGLU n{} n{})", i[0], i[1]),
-        Op::SwiGLUConcat => format!("(SwiGLUConcat n{})", i[0]),
-        Op::Gelu => format!("(Gelu n{})", i[0]),
-        Op::RmsNorm { .. } => format!("(RmsNorm n{} n{})", i[0], i[1]),
-        Op::Embedding => format!("(Embedding n{} n{})", i[0], i[1]),
-        Op::EmbeddingF16 => format!("(EmbeddingF16 n{} n{})", i[0], i[1]),
-        Op::ToF16 => format!("(ToF16 n{})", i[0]),
-        Op::RoPE { .. } => format!("(RoPE n{})", i[0]),
-        Op::RoPEGrad { .. } => format!("(RoPEGrad n{})", i[0]),
-        Op::CausalAttention { .. } | Op::CausalAttentionRoPE { .. } => {
-            format!("(CausalAttention n{} n{} n{})", i[0], i[1], i[2])
-        }
-        Op::SlidingWindowAttention { .. } => {
-            format!("(SlidingWindowAttention n{} n{} n{})", i[0], i[1], i[2])
-        }
-        Op::LayerNorm { .. } => format!("(LayerNorm n{} n{} n{})", i[0], i[1], i[2]),
-        Op::FullAttention { .. } => format!("(FullAttention n{} n{} n{})", i[0], i[1], i[2]),
-        Op::CrossAttention { .. } => format!("(CrossAttention n{} n{} n{})", i[0], i[1], i[2]),
-        Op::MultiHeadAttn { .. } => format!("(MultiHeadAttn n{} n{} n{})", i[0], i[1], i[2]),
-        // Backward ops
-        Op::SiluGrad => format!("(SiluGrad n{} n{})", i[0], i[1]),
-        Op::SwiGLUGradGate => format!("(SwiGLUGradGate n{} n{} n{})", i[0], i[1], i[2]),
-        Op::SwiGLUGradUp => format!("(SwiGLUGradUp n{} n{})", i[0], i[1]),
-        Op::SwiGLUConcatGrad => format!("(SwiGLUConcatGrad n{} n{})", i[0], i[1]),
-        Op::RmsNormGradW { .. } => format!("(RmsNormGradW n{} n{} n{})", i[0], i[1], i[2]),
-        Op::RmsNormGradX { .. } => format!("(RmsNormGradX n{} n{} n{})", i[0], i[1], i[2]),
-        Op::LayerNormGradWB { .. } => format!("(LayerNormGradWB n{} n{} n{})", i[0], i[1], i[2]),
-        Op::LayerNormGradX { .. } => format!("(LayerNormGradX n{} n{} n{})", i[0], i[1], i[2]),
-        Op::MultiHeadAttnGradQ { .. } => {
-            format!("(MHAGradQ n{} n{} n{} n{})", i[0], i[1], i[2], i[3])
-        }
-        Op::MultiHeadAttnGradK { .. } => {
-            format!("(MHAGradK n{} n{} n{} n{})", i[0], i[1], i[2], i[3])
-        }
-        Op::MultiHeadAttnGradV { .. } => {
-            format!("(MHAGradV n{} n{} n{} n{})", i[0], i[1], i[2], i[3])
-        }
-        // Fused ops from a previous optimization pass — encode as-is
-        Op::FusedMatMulAdd => {
-            format!("(FusedMatMulAdd n{} n{} n{})", i[0], i[1], i[2])
-        }
-        Op::FusedMatMulATAdd => {
-            format!("(FusedMatMulATAdd n{} n{} n{})", i[0], i[1], i[2])
-        }
-        Op::FusedMatMulBTAdd => {
-            format!("(FusedMatMulBTAdd n{} n{} n{})", i[0], i[1], i[2])
-        }
-        Op::FusedRmsNormMatMul { .. } => {
-            format!("(FusedRmsNormMatMul n{} n{} n{})", i[0], i[1], i[2])
-        }
-        Op::GroupNorm { .. } => format!("(GroupNorm n{} n{} n{})", i[0], i[1], i[2]),
-        Op::GroupNormSilu { .. } => format!("(GroupNormSilu n{} n{} n{})", i[0], i[1], i[2]),
-        Op::GroupNormGradInput { .. } => {
-            format!("(GroupNormGradInput n{} n{} n{})", i[0], i[1], i[2])
-        }
-        Op::GroupNormGradWeightBias { .. } => {
-            format!("(GroupNormGradWeightBias n{} n{})", i[0], i[1])
-        }
-        Op::Concat { .. } => format!("(Concat n{} n{})", i[0], i[1]),
-        Op::SplitA { .. } => format!("(SplitA n{})", i[0]),
-        Op::SplitB { .. } => format!("(SplitB n{})", i[0]),
-        Op::Upsample2x { .. } => format!("(Upsample2x n{})", i[0]),
-        Op::Upsample2xGrad { .. } => format!("(Upsample2xGrad n{})", i[0]),
-        Op::Conv2d { .. } => format!("(Conv2d n{} n{})", i[0], i[1]),
-        Op::Conv2dDw { .. } => format!("(Conv2dDw n{} n{})", i[0], i[1]),
-        Op::MulPerChannel { .. } => format!("(MulPerChannel n{} n{})", i[0], i[1]),
-        Op::AddPerChannel { .. } => format!("(AddPerChannel n{} n{})", i[0], i[1]),
-        Op::Conv2dGradInput { .. } => format!("(Conv2dGradInput n{} n{})", i[0], i[1]),
-        Op::Conv2dGradWeight { .. } => format!("(Conv2dGradWeight n{} n{})", i[0], i[1]),
-        Op::MaxPool2d { .. } => format!("(MaxPool2d n{})", i[0]),
-        Op::GlobalAvgPool { .. } => format!("(GlobalAvgPool n{})", i[0]),
-        Op::GlobalAvgPoolGrad { .. } => format!("(GlobalAvgPoolGrad n{})", i[0]),
-        Op::WinogradConv2d { .. } => format!("(WinogradConv2d n{} n{} n{})", i[0], i[1], i[2]),
-        Op::CacheWrite => format!("(CacheWrite n{} n{} n{})", i[0], i[1], i[2]),
-        Op::CachedAttention { .. } => {
-            format!("(CachedAttention n{} n{} n{} n{})", i[0], i[1], i[2], i[3])
-        }
-        Op::Nop => unreachable!("Nop nodes are filtered before encoding"),
-        Op::Identity => format!("(Identity n{})", i[0]),
-        Op::StopGradient => format!("(Identity n{})", i[0]),
-    }
-}
-
-/// Rebuild the graph, applying the fusions the extractor chose.
-///
-/// `chosen` is the set of fusion-relevant constructor names found in the
-/// extracted terms (`None` = no extraction information; apply everything,
-/// matching the e-graph's cost model by construction since every current
-/// rewrite strictly reduces traffic). The concrete rewriting still goes
-/// through pattern appliers — they enforce graph-level constraints the
-/// e-graph doesn't see (single-use producers, output pinning) and visit
-/// every instance of a repeated region.
-fn rebuild_graph_from_extractions(
-    original: &Graph,
-    chosen: Option<&HashSet<String>>,
-) -> (Graph, Vec<(String, u32)>) {
-    let mut graph = clone_graph(original);
-    let mut fusions = Vec::new();
-    let enabled = |kinds: &[&str]| {
-        chosen.is_none_or(|chosen| kinds.iter().any(|k| chosen.contains(*k)))
-    };
-
-    // Apply fusion rules iteratively until fixpoint.
-    // Each rule fires on matching patterns, potentially exposing new patterns
-    // for subsequent rules (like e-graph saturation, but on the graph IR).
-    loop {
-        let n = fusions.len();
-        if enabled(&["FusedMatMulAdd", "FusedMatMulATAdd", "FusedMatMulBTAdd"]) {
-            apply_matmul_add_fusions(&mut graph, &mut fusions);
-        }
-        if enabled(&["Silu"]) {
-            apply_silu_fusions(&mut graph, &mut fusions);
-        }
-        if enabled(&["SwiGLU"]) {
-            apply_swiglu_fusions(&mut graph, &mut fusions);
-        }
-        // SwiGLUConcat isn't expressible as an egglog rewrite (it creates
-        // a concatenated weight tensor), so it's never gated.
-        apply_swiglu_concat_fusions(&mut graph, &mut fusions);
-        // RmsNorm+MatMul fusion: eliminates ~30 dispatches on transformer
-        // prefill by folding the norm's rsqrt prologue into the matmul
-        // load, but the coop variant's 64-thread tree-reduction rsqrt is
-        // measurably slower than separate RmsNorm + coop MatMul — ~25%
-        // regression on SmolVLA fwd (9.66 → 12.09 ms, RTX 3050). Stays
-        // off until either (a) the prologue can use subgroupAdd without
-        // the NVIDIA coop+subgroup driver crash (kvark/blade#333), or
-        // (b) we add a two-phase variant that reads a pre-computed
-        // rsqrt cache so the matmul prologue is only a scalar multiply.
-        // apply_rms_norm_matmul_fusions(&mut graph, &mut fusions);
-        // apply_rope_attention_fusions(&mut graph, &mut fusions);
-        if fusions.len() == n {
-            break;
-        }
-    }
-    let active_nodes = graph
-        .nodes()
-        .iter()
-        .filter(|n| !matches!(n.op, Op::Nop))
-        .count();
-    log::info!(
-        "optimizer: {} fusions on {} nodes",
-        fusions.len(),
-        active_nodes
-    );
-    for (name, count) in fusions.iter().fold(
-        std::collections::BTreeMap::<&str, usize>::new(),
-        |mut acc, entry| {
-            let name = &entry.0;
-            *acc.entry(name.as_str()).or_default() += 1;
-            acc
-        },
-    ) {
-        log::info!("  {}x {}", count, name);
-    }
-
-    (graph, fusions)
-}
-
-/// Walk an extracted term tree and record the fusion-relevant
-/// constructors the extractor chose. These gate which pattern appliers
-/// run in [`rebuild_graph_from_extractions`].
-fn collect_chosen_kinds(dag: &TermDag, term_id: TermId, kinds: &mut HashSet<String>) {
-    if let Term::App(name, children) = dag.get(term_id).clone() {
-        if matches!(
-            &*name,
-            "FusedMatMulAdd"
-                | "FusedMatMulATAdd"
-                | "FusedMatMulBTAdd"
-                | "FusedRmsNormMatMul"
-                | "Silu"
-                | "SwiGLU"
-        ) {
-            kinds.insert(name.to_string());
-        }
-        // The graph-level appliers rewrite step by step, so a chosen
-        // end state implies its stepping stones: an extracted SwiGLU
-        // term contains no Silu node, but reaching SwiGLU in the graph
-        // goes through Mul(x, Sigmoid(x)) → Silu first.
-        if &*name == "SwiGLU" {
-            kinds.insert("Silu".to_string());
-        }
-        for child in children {
-            collect_chosen_kinds(dag, child, kinds);
-        }
-    }
-}
-
-/// Apply Add(MatMul*(a, b), d) → FusedMatMul*Add(a, b, d) fusions.
-///
-/// This is the concrete graph mutation. It matches the patterns that
-/// egglog's rewrite rules express, applying them with the additional
-/// single-use constraint (the MatMul must feed only this Add).
-fn apply_matmul_add_fusions(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
-    let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
-    for &id in &node_ids {
-        let node = &graph.nodes()[id];
-        if !matches!(node.op, Op::Add) {
-            continue;
-        }
-        let (lhs, rhs) = (node.inputs[0], node.inputs[1]);
-        let (mm_id, addend_id) =
-            if matches!(graph.node(lhs).op, Op::MatMul | Op::MatMulAT | Op::MatMulBT) {
-                (lhs, rhs)
-            } else if matches!(graph.node(rhs).op, Op::MatMul | Op::MatMulAT | Op::MatMulBT) {
-                (rhs, lhs)
-            } else {
+/// Extraction roots of a segment, as encoded-instance node ids: any node
+/// whose value escapes its own instance (consumed outside it, or a graph
+/// output), unioned across all instances.
+fn segment_roots(g: &Graph, seg: &Segment) -> Vec<usize> {
+    let base: HashSet<usize> = seg.ids.iter().copied().collect();
+    let mut roots: HashSet<usize> = HashSet::new();
+    for &shift in &seg.shifts {
+        let inst: HashSet<usize> = base.iter().map(|&i| i + shift).collect();
+        for node in g.nodes() {
+            if matches!(node.op, Op::Nop) {
                 continue;
-            };
-        let mm_use_count = graph
-            .nodes()
-            .iter()
-            .filter(|n| n.inputs.contains(&mm_id) && !matches!(n.op, Op::Nop))
-            .count();
-        if mm_use_count != 1 {
-            continue;
+            }
+            if !inst.contains(&(node.id as usize)) {
+                for &input in &node.inputs {
+                    let input = input as usize;
+                    if inst.contains(&input) {
+                        roots.insert(input - shift);
+                    }
+                }
+            }
         }
-        // Don't fuse if the matmul is a graph output — its value is read
-        // back by the user or is a param gradient consumed by the trainer.
-        if graph.is_output(mm_id) {
-            continue;
+        for &out in g.outputs() {
+            let out = out as usize;
+            if inst.contains(&out) {
+                roots.insert(out - shift);
+            }
         }
+    }
+    let mut v: Vec<usize> = roots.into_iter().collect();
+    v.sort_unstable();
+    v
+}
 
-        let mm_node = graph.node(mm_id);
-        let (a, b) = (mm_node.inputs[0], mm_node.inputs[1]);
-        let (fused_op, label) = match mm_node.op {
-            Op::MatMul => (Op::FusedMatMulAdd, "MatMul+Add→FusedMatMulAdd"),
-            Op::MatMulAT => (Op::FusedMatMulATAdd, "MatMulAT+Add→FusedMatMulATAdd"),
-            Op::MatMulBT => (Op::FusedMatMulBTAdd, "MatMulBT+Add→FusedMatMulBTAdd"),
+/// Where each external leaf is read by the encoded instance:
+/// ext id → list of (position in `seg.ids`, input slot). Used to
+/// translate externals per instance via the instance's actual edges.
+fn external_uses(g: &Graph, seg: &Segment) -> HashMap<usize, Vec<(usize, usize)>> {
+    let idset: HashSet<usize> = seg.ids.iter().copied().collect();
+    let mut uses: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+    for (pos, &id) in seg.ids.iter().enumerate() {
+        let node = &g.nodes()[id];
+        if matches!(node.op, Op::Nop) {
+            continue;
+        }
+        for (slot, &input) in node.inputs.iter().enumerate() {
+            let input = input as usize;
+            if !idset.contains(&input) {
+                uses.entry(input).or_default().push((pos, slot));
+            }
+        }
+    }
+    uses
+}
+
+/// External-leaf translation for one instance: read the instance's own
+/// edges at the recorded use sites. Returns `None` (skip the instance)
+/// if the sites disagree — a node used both as a shifting chain edge and
+/// a shared global, which edge isomorphism allows in principle.
+fn instance_ext_map(
+    g: &Graph,
+    seg: &Segment,
+    uses: &HashMap<usize, Vec<(usize, usize)>>,
+    shift: usize,
+) -> Option<HashMap<usize, NodeId>> {
+    let mut map = HashMap::new();
+    for (&ext, sites) in uses {
+        let mut val: Option<NodeId> = None;
+        for &(pos, slot) in sites {
+            let v = g.nodes()[seg.ids[pos] + shift].inputs[slot];
+            match val {
+                Some(prev) if prev != v => return None,
+                _ => val = Some(v),
+            }
+        }
+        map.insert(ext, val.unwrap());
+    }
+    Some(map)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_segment(
+    g: &mut Graph,
+    seg: &Segment,
+    index: &mut HashMap<(&'static str, Vec<NodeId>), NodeId>,
+    fusions: &mut Vec<(String, u32)>,
+    first_program: &mut String,
+    num_eclasses: &mut usize,
+    num_enodes: &mut usize,
+    egglog_time: &mut std::time::Duration,
+    extract_time: &mut std::time::Duration,
+) {
+    let egglog_start = Instant::now();
+    let (program, externals) = segment_program(g, seg);
+    if first_program.is_empty() {
+        first_program.clone_from(&program);
+    }
+    let mut egraph = egglog::EGraph::default();
+    if let Err(e) = egraph.parse_and_run_program(None, &program) {
+        log::warn!(
+            "egglog failed on segment of {} nodes: {} — leaving it unoptimized",
+            seg.ids.len(),
+            e
+        );
+        *egglog_time += egglog_start.elapsed();
+        return;
+    }
+    let size_ids = externals.iter().copied().chain(seg.ids.iter().copied());
+    let cm = FusionCostModel::with_sizes(eclass_sizes(g, &mut egraph, size_ids));
+
+    let roots = segment_roots(g, seg);
+    let mut terms: Vec<(usize, TermDag, TermId)> = Vec::new();
+    for &root in &roots {
+        let var = format!("$n{}", root);
+        match egraph.eval_expr(&egglog::ast::Expr::Var(egglog::ast::Span::Panic, var)) {
+            Ok((sort, value)) => {
+                match egraph.extract_value_with_cost_model(&sort, value, cm.clone()) {
+                    Ok((dag, term_id, cost)) => {
+                        log::debug!(
+                            "extracted $n{} (cost {}): {}",
+                            root,
+                            cost,
+                            dag.to_string(term_id)
+                        );
+                        terms.push((root, dag, term_id));
+                    }
+                    Err(e) => log::warn!("extraction failed for $n{}: {}", root, e),
+                }
+            }
+            Err(e) => log::warn!("failed to eval $n{}: {}", root, e),
+        }
+    }
+    let serialized = egraph.serialize(egglog::SerializeConfig::default());
+    *num_eclasses += serialized.egraph.class_data.len();
+    *num_enodes += serialized.egraph.nodes.len();
+    *egglog_time += egglog_start.elapsed();
+
+    // Stamping. All instance translations are computed before any
+    // mutation: stamping overwrites root inputs, which may be the very
+    // edges the translation reads.
+    let stamp_start = Instant::now();
+    let uses = external_uses(g, seg);
+    let ext_maps: Vec<Option<HashMap<usize, NodeId>>> = seg
+        .shifts
+        .iter()
+        .map(|&shift| instance_ext_map(g, seg, &uses, shift))
+        .collect();
+    let idset: HashSet<usize> = seg.ids.iter().copied().collect();
+    for (&shift, ext_map) in seg.shifts.iter().zip(&ext_maps) {
+        let Some(ext_map) = ext_map else {
+            log::warn!(
+                "segment instance at +{} has ambiguous external edges — left unoptimized",
+                shift
+            );
+            continue;
+        };
+        for (root, dag, term_id) in &terms {
+            let mut stamper = Stamper {
+                g,
+                index,
+                seg_ids: &idset,
+                shift,
+                ext_map,
+                fusions,
+                memo: HashMap::new(),
+            };
+            if let Err(e) = stamper.stamp_root(root + shift, dag, *term_id) {
+                log::warn!("stamping $n{} (+{}) failed: {}", root, shift, e);
+            }
+        }
+    }
+    *extract_time += stamp_start.elapsed();
+}
+
+/// Rebuilds extracted terms in the graph IR. Interior nodes whose
+/// children were rewritten are mutated in place (the new inputs are
+/// value-equivalent, so every consumer — and every id-carrying attribute
+/// like `fwd_node` — stays valid); new fused nodes are appended; roots
+/// are overwritten in place so their node ids, types, and output status
+/// survive.
+struct Stamper<'a> {
+    g: &'a mut Graph,
+    /// Structural memo for named constructors: (name, children) → node.
+    index: &'a mut HashMap<(&'static str, Vec<NodeId>), NodeId>,
+    /// Node ids of the encoded instance (terms only reference these).
+    seg_ids: &'a HashSet<usize>,
+    /// Id shift of the instance being stamped.
+    shift: usize,
+    /// External-leaf translation for this instance.
+    ext_map: &'a HashMap<usize, NodeId>,
+    fusions: &'a mut Vec<(String, u32)>,
+    /// Per-(dag, instance) term resolution cache.
+    memo: HashMap<TermId, NodeId>,
+}
+
+impl Stamper<'_> {
+    /// Overwrite the root node in place with the extracted term.
+    fn stamp_root(&mut self, root: usize, dag: &TermDag, term_id: TermId) -> Result<(), String> {
+        match dag.get(term_id).clone() {
+            Term::App(ref name, ref children) if named_constructor_exists(name) => {
+                let inputs = self.resolve_children(dag, children)?;
+                // Unchanged term → nothing to do.
+                if named_constructor(&self.g.node(root as u32).op) == Some(name.as_str())
+                    && self.g.node(root as u32).inputs == inputs
+                {
+                    return Ok(());
+                }
+                self.build_named(name, inputs, Some(root as u32))?;
+                Ok(())
+            }
+            _ => {
+                // Generic op (in-place child rewrite), or a leaf/other
+                // node the root's e-class collapsed into (Neg∘Neg → x):
+                // alias the root to it. The resolved node always has a
+                // smaller id (leaves and pristine nodes precede the
+                // root topologically), so compile's Identity buffer
+                // aliasing sees its input already allocated.
+                let resolved = self.resolve(dag, term_id)?;
+                if resolved as usize != root {
+                    self.g.nodes_mut()[root].op = Op::Identity;
+                    self.g.nodes_mut()[root].inputs = vec![resolved];
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn resolve_children(&mut self, dag: &TermDag, children: &[TermId]) -> Result<Vec<NodeId>, String> {
+        children.iter().map(|&c| self.resolve(dag, c)).collect()
+    }
+
+    fn resolve(&mut self, dag: &TermDag, term_id: TermId) -> Result<NodeId, String> {
+        if let Some(&id) = self.memo.get(&term_id) {
+            return Ok(id);
+        }
+        let id = match dag.get(term_id).clone() {
+            Term::App(ref name, ref children) if name == "Leaf" => {
+                self.translate(lit_node_id(dag, children[0])?)?
+            }
+            Term::App(ref name, ref children) if name.starts_with("Op") => {
+                let orig = self.translate(lit_node_id(dag, children[0])?)?;
+                let inputs = self.resolve_children(dag, &children[1..])?;
+                if self.g.node(orig).inputs != inputs {
+                    // Children were rewritten: point this node at the
+                    // equivalent producers. Op, attributes, and type are
+                    // untouched.
+                    self.g.nodes_mut()[orig as usize].inputs = inputs;
+                }
+                orig
+            }
+            Term::App(ref name, ref children) => {
+                let inputs = self.resolve_children(dag, children)?;
+                match self.index.get(&(static_constructor(name)?, inputs.clone())) {
+                    Some(&hit) => hit,
+                    None => self.build_named(name, inputs, None)?,
+                }
+            }
+            other => return Err(format!("unexpected term {:?}", other)),
+        };
+        self.memo.insert(term_id, id);
+        Ok(id)
+    }
+
+    /// Translate an encoded-instance node id to this instance.
+    fn translate(&self, raw: usize) -> Result<NodeId, String> {
+        if self.seg_ids.contains(&raw) {
+            Ok((raw + self.shift) as NodeId)
+        } else {
+            self.ext_map
+                .get(&raw)
+                .copied()
+                .ok_or_else(|| format!("no translation for external node {}", raw))
+        }
+    }
+
+    /// Create (or overwrite `target` with) a named-constructor node.
+    fn build_named(
+        &mut self,
+        name: &str,
+        inputs: Vec<NodeId>,
+        target: Option<NodeId>,
+    ) -> Result<NodeId, String> {
+        if name == "SwiGLUPacked" {
+            return self.build_swiglu_packed(&inputs, target);
+        }
+        let shape = |id: NodeId| self.g.node(id).ty.shape.clone();
+        let ty_of = |id: NodeId| self.g.node(id).ty.clone();
+        let rank2 = |id: NodeId| {
+            let s = shape(id);
+            if s.len() == 2 {
+                Ok(s)
+            } else {
+                Err(format!("{} needs rank-2 operands, got {:?}", name, s))
+            }
+        };
+        let (op, ty, label) = match name {
+            "MatMul" => {
+                let (a, b) = (rank2(inputs[0])?, rank2(inputs[1])?);
+                (Op::MatMul, TensorType::f32(vec![a[0], b[1]]), None)
+            }
+            "MatMulAT" => {
+                let (a, b) = (rank2(inputs[0])?, rank2(inputs[1])?);
+                (Op::MatMulAT, TensorType::f32(vec![a[1], b[1]]), None)
+            }
+            "MatMulBT" => {
+                let (a, b) = (rank2(inputs[0])?, rank2(inputs[1])?);
+                (Op::MatMulBT, TensorType::f32(vec![a[0], b[0]]), None)
+            }
+            // The addend has the result shape by Add's own typing.
+            "FusedMatMulAdd" => (Op::FusedMatMulAdd, ty_of(inputs[2]), Some("MatMul+Add→FusedMatMulAdd")),
+            "FusedMatMulATAdd" => (Op::FusedMatMulATAdd, ty_of(inputs[2]), Some("MatMulAT+Add→FusedMatMulATAdd")),
+            "FusedMatMulBTAdd" => (Op::FusedMatMulBTAdd, ty_of(inputs[2]), Some("MatMulBT+Add→FusedMatMulBTAdd")),
+            "Add" => (Op::Add, ty_of(inputs[0]), None),
+            "Mul" => (Op::Mul, ty_of(inputs[0]), None),
+            "Relu" => (Op::Relu, ty_of(inputs[0]), None),
+            "Sigmoid" => (Op::Sigmoid, ty_of(inputs[0]), None),
+            "Neg" => (Op::Neg, ty_of(inputs[0]), None),
+            "Transpose" => {
+                let mut s = shape(inputs[0]);
+                s.reverse();
+                (Op::Transpose, TensorType::f32(s), None)
+            }
+            "Silu" => (Op::Silu, ty_of(inputs[0]), Some("Mul+Sigmoid→Silu")),
+            "SwiGLU" => (Op::SwiGLU, ty_of(inputs[0]), Some("Silu+Mul→SwiGLU")),
+            other => return Err(format!("unknown constructor {}", other)),
+        };
+        let id = self.place(op, inputs.clone(), ty, target);
+        self.index.insert((static_constructor(name)?, inputs), id);
+        if let Some(label) = label {
+            self.fusions.push((label.to_string(), id));
+        }
+        Ok(id)
+    }
+
+    /// SwiGLU(MatMul(h, wg), MatMul(h, wu)) → SwiGLUConcat(MatMul(h, wg|wu))
+    /// with a derived concatenated-weight parameter. Falls back to the
+    /// equivalent unpacked form when the weights are not plain same-shape
+    /// 2D parameters (e.g. ONNX constants).
+    fn build_swiglu_packed(
+        &mut self,
+        inputs: &[NodeId],
+        target: Option<NodeId>,
+    ) -> Result<NodeId, String> {
+        let (h, wg, wu) = (inputs[0], inputs[1], inputs[2]);
+        let packable = {
+            let (g_node, u_node) = (self.g.node(wg), self.g.node(wu));
+            matches!(g_node.op, Op::Parameter { .. })
+                && matches!(u_node.op, Op::Parameter { .. })
+                && g_node.ty.shape.len() == 2
+                && g_node.ty.shape == u_node.ty.shape
+                && g_node.ty.dtype == u_node.ty.dtype
+                && self.g.node(h).ty.shape.len() == 2
+        };
+        if !packable {
+            let gate = self.lookup_or_build("MatMul", vec![h, wg])?;
+            let up = self.lookup_or_build("MatMul", vec![h, wu])?;
+            return self.build_named("SwiGLU", vec![gate, up], target);
+        }
+        let param_name = |id: NodeId| match self.g.node(id).op {
+            Op::Parameter { ref name } => name.clone(),
             _ => unreachable!(),
         };
-        graph.nodes_mut()[id].op = fused_op;
-        graph.nodes_mut()[id].inputs = vec![a, b, addend_id];
-        graph.nodes_mut()[mm_id as usize].op = Op::Nop;
-        fusions.push((label.to_string(), id as u32));
-    }
-}
-
-/// Fuse SwiGLU(MatMul(h, w_gate), MatMul(h, w_up)) → SwiGLUConcat(MatMul(h, w_gate_up))
-///
-/// When both gate and up projections share the same input `h`, merge
-/// them into a single wide matmul [hidden, 2*intermediate] followed by
-/// SwiGLUConcat. This halves the number of matmul dispatches for the
-/// MLP gate+up path. The optimizer creates a new `concat_weight` parameter
-/// node so model code can use the naive two-matmul pattern.
-fn apply_swiglu_concat_fusions(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
-    use crate::graph::TensorType;
-    let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
-    for &id in &node_ids {
-        let node = &graph.nodes()[id];
-        if !matches!(node.op, Op::SwiGLU) {
-            continue;
-        }
-        let (gate_id, up_id) = (node.inputs[0], node.inputs[1]);
-        let gate_node = graph.node(gate_id);
-        let up_node = graph.node(up_id);
-
-        // Both must be MatMul
-        if !matches!(gate_node.op, Op::MatMul) || !matches!(up_node.op, Op::MatMul) {
-            continue;
-        }
-        // Both must share the same input (first operand)
-        if gate_node.inputs[0] != up_node.inputs[0] {
-            continue;
-        }
-        // Both matmuls must be single-use (only feeding this SwiGLU)
-        let gate_uses = graph
-            .nodes()
-            .iter()
-            .filter(|n| n.inputs.contains(&gate_id) && !matches!(n.op, Op::Nop))
-            .count();
-        let up_uses = graph
-            .nodes()
-            .iter()
-            .filter(|n| n.inputs.contains(&up_id) && !matches!(n.op, Op::Nop))
-            .count();
-        if gate_uses != 1 || up_uses != 1 {
-            continue;
-        }
-        // Don't fuse if either matmul is a graph output.
-        if graph.is_output(gate_id) || graph.is_output(up_id) {
-            continue;
-        }
-
-        let h = gate_node.inputs[0];
-        let w_gate = gate_node.inputs[1];
-        let w_up = up_node.inputs[1];
-
-        // Create concatenated weight parameter: [in_features, 2 * out_features]
-        let gate_shape = &graph.node(w_gate).ty.shape;
-        let up_shape = &graph.node(w_up).ty.shape;
-        if gate_shape.len() != 2 || up_shape.len() != 2 {
-            continue;
-        }
-        if gate_shape[0] != up_shape[0] || gate_shape[1] != up_shape[1] {
-            continue;
-        }
-        let in_features = gate_shape[0];
-        let out_features = gate_shape[1];
-        let concat_shape = vec![in_features, 2 * out_features];
-        let gate_name = match graph.node(w_gate).op {
-            Op::Parameter { ref name } => name.clone(),
-            _ => "w_gate".to_string(),
-        };
-        let up_name = match graph.node(w_up).op {
-            Op::Parameter { ref name } => name.clone(),
-            _ => "w_up".to_string(),
-        };
+        let (gate_name, up_name) = (param_name(wg), param_name(wu));
+        let in_features = self.g.node(wg).ty.shape[0];
+        let out_features = self.g.node(wg).ty.shape[1];
+        let m = self.g.node(h).ty.shape[0];
         let concat_name = format!("{}+{}", gate_name, up_name);
-
-        // Record derivation so runtime can fill this from original params
-        graph.derived_params.push(crate::graph::DerivedParam {
+        // Record the derivation so the runtime fills the packed buffer
+        // from the original parameters.
+        self.g.derived_params.push(crate::graph::DerivedParam {
             name: concat_name.clone(),
             sources: vec![(gate_name, out_features), (up_name, out_features)],
             rows: in_features,
             transform: crate::graph::ParamTransform::HorizontalConcat,
         });
-        // Preserve the dtype from the source parameters (e.g. Q4_0, F16).
-        let concat_dtype = graph.node(w_gate).ty.dtype;
-        let concat_w = graph.add_raw_node(
+        let concat_dtype = self.g.node(wg).ty.dtype;
+        let concat_w = self.g.add_raw_node(
             Op::Parameter { name: concat_name },
             vec![],
-            TensorType::new(concat_shape.clone(), concat_dtype),
+            TensorType::new(vec![in_features, 2 * out_features], concat_dtype),
         );
-
-        // MatMul(h, concat_w) → [M, 2*out_features]
-        let m = graph.node(h).ty.shape[0];
-        let wide_mm = graph.add_raw_node(
+        let wide_mm = self.g.add_raw_node(
             Op::MatMul,
             vec![h, concat_w],
             TensorType::f32(vec![m, 2 * out_features]),
         );
-
-        // SwiGLUConcat(wide_mm) → [M, out_features]
-        let swiglu_ty = TensorType::f32(vec![m, out_features]);
-        graph.nodes_mut()[id].op = Op::SwiGLUConcat;
-        graph.nodes_mut()[id].inputs = vec![wide_mm];
-        graph.nodes_mut()[id].ty = swiglu_ty;
-
-        // Mark old matmuls as Nop
-        graph.nodes_mut()[gate_id as usize].op = Op::Nop;
-        graph.nodes_mut()[up_id as usize].op = Op::Nop;
-
-        fusions.push((
+        let id = self.place(
+            Op::SwiGLUConcat,
+            vec![wide_mm],
+            TensorType::f32(vec![m, out_features]),
+            target,
+        );
+        self.index.insert(("SwiGLUPacked", inputs.to_vec()), id);
+        self.fusions.push((
             "SwiGLU(MatMul,MatMul)→SwiGLUConcat(MatMul)".to_string(),
-            id as u32,
+            id,
         ));
+        Ok(id)
+    }
+
+    fn lookup_or_build(&mut self, name: &str, inputs: Vec<NodeId>) -> Result<NodeId, String> {
+        match self.index.get(&(static_constructor(name)?, inputs.clone())) {
+            Some(&hit) => Ok(hit),
+            None => self.build_named(name, inputs, None),
+        }
+    }
+
+    /// Write the node into `target` (root stamping keeps the root's id
+    /// and type) or append a new node.
+    fn place(&mut self, op: Op, inputs: Vec<NodeId>, ty: TensorType, target: Option<NodeId>) -> NodeId {
+        match target {
+            Some(id) => {
+                let node = &mut self.g.nodes_mut()[id as usize];
+                node.op = op;
+                node.inputs = inputs;
+                // ty deliberately untouched: same e-class, same tensor.
+                id
+            }
+            None => self.g.add_raw_node(op, inputs, ty),
+        }
     }
 }
+
+fn named_constructor_exists(name: &str) -> bool {
+    static_constructor(name).is_ok()
+}
+
+/// Interns a constructor name to the `'static` string used as the
+/// structural-index key.
+fn static_constructor(name: &str) -> Result<&'static str, String> {
+    Ok(match name {
+        "MatMul" => "MatMul",
+        "MatMulAT" => "MatMulAT",
+        "MatMulBT" => "MatMulBT",
+        "FusedMatMulAdd" => "FusedMatMulAdd",
+        "FusedMatMulATAdd" => "FusedMatMulATAdd",
+        "FusedMatMulBTAdd" => "FusedMatMulBTAdd",
+        "Add" => "Add",
+        "Mul" => "Mul",
+        "Relu" => "Relu",
+        "Sigmoid" => "Sigmoid",
+        "Neg" => "Neg",
+        "Transpose" => "Transpose",
+        "Silu" => "Silu",
+        "SwiGLU" => "SwiGLU",
+        "SwiGLUPacked" => "SwiGLUPacked",
+        other => return Err(format!("unknown constructor {}", other)),
+    })
+}
+
+fn lit_node_id(dag: &TermDag, term_id: TermId) -> Result<usize, String> {
+    match dag.get(term_id) {
+        Term::Lit(Literal::Int(v)) => Ok(*v as usize),
+        other => Err(format!("expected node-id literal, got {:?}", other)),
+    }
+}
+
+/// Structural memo of the existing graph for named constructors, so
+/// term resolution finds each instance's own nodes (and never duplicates
+/// an existing equivalent node).
+fn build_structural_index(g: &Graph) -> HashMap<(&'static str, Vec<NodeId>), NodeId> {
+    let mut index = HashMap::new();
+    for node in g.nodes() {
+        if let Some(name) = named_constructor(&node.op) {
+            index.insert((name, node.inputs.clone()), node.id);
+        }
+    }
+    index
+}
+
+/// Nop out nodes no longer reachable from any output. Parameters and
+/// inputs are kept even when dead — `set_parameter`/`set_input` address
+/// them by name (e.g. the packed-SwiGLU sources feed derived params).
+/// CacheWrite executes for its side effect (it mutates the cache buffer
+/// in place; decode graphs never read its result), so it is a root.
+fn sweep_dead_nodes(g: &mut Graph) {
+    let n = g.nodes().len();
+    let mut live = vec![false; n];
+    let mut stack: Vec<usize> = g.outputs().iter().map(|&o| o as usize).collect();
+    stack.extend(
+        g.nodes()
+            .iter()
+            .filter(|node| matches!(node.op, Op::CacheWrite))
+            .map(|node| node.id as usize),
+    );
+    while let Some(id) = stack.pop() {
+        if live[id] {
+            continue;
+        }
+        live[id] = true;
+        stack.extend(g.nodes()[id].inputs.iter().map(|&i| i as usize));
+    }
+    for id in 0..n {
+        let node = &mut g.nodes_mut()[id];
+        if !live[id] && !matches!(node.op, Op::Nop | Op::Parameter { .. } | Op::Input { .. }) {
+            node.op = Op::Nop;
+            node.inputs.clear();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Direct graph passes outside the e-graph (inference-only rewrites that
+// the training path cannot differentiate through).
+// ---------------------------------------------------------------------------
 
 /// Fuse Silu(GroupNorm(x, w, b)) → GroupNormSilu(x, w, b)
 ///
@@ -1179,7 +1097,6 @@ pub fn apply_group_norm_silu_fusions(graph: &mut Graph, fusions: &mut Vec<(Strin
 /// For each matching Conv2d node, creates a derived parameter for the Winograd-transformed
 /// weights and rewrites the node to WinogradConv2d.
 pub fn apply_winograd_conv_fusions(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
-    use crate::graph::TensorType;
     let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
     for &id in &node_ids {
         let node = &graph.nodes()[id];
@@ -1269,209 +1186,6 @@ pub fn apply_winograd_conv_fusions(graph: &mut Graph, fusions: &mut Vec<(String,
     }
 }
 
-/// Fuse MatMul(RmsNorm(x, w_norm, eps), w_proj) → FusedRmsNormMatMul(x, w_norm, w_proj, eps)
-///
-/// Only fuses if the RmsNorm result is used exclusively by this MatMul.
-#[allow(dead_code)]
-fn apply_rms_norm_matmul_fusions(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
-    use crate::graph::TensorType;
-    let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
-    for &id in &node_ids {
-        let node = &graph.nodes()[id];
-        if !matches!(node.op, Op::MatMul) {
-            continue;
-        }
-        let (norm_id, w_proj_id) = (node.inputs[0], node.inputs[1]);
-        let norm_node = graph.node(norm_id);
-        let eps = match norm_node.op {
-            Op::RmsNorm { eps } => eps,
-            _ => continue,
-        };
-        // RmsNorm must be single-use (only feeding this MatMul)
-        let norm_use_count = graph
-            .nodes()
-            .iter()
-            .filter(|n| n.inputs.contains(&norm_id) && !matches!(n.op, Op::Nop))
-            .count();
-        if norm_use_count != 1 {
-            continue;
-        }
-        if graph.is_output(norm_id) {
-            continue;
-        }
-
-        let x = norm_node.inputs[0];
-        let w_norm = norm_node.inputs[1];
-        let x_shape = &graph.node(x).ty.shape;
-        let w_proj_shape = &graph.node(w_proj_id).ty.shape;
-        let m = x_shape[0];
-        let n = w_proj_shape[1];
-
-        // Rewrite the MatMul node to FusedRmsNormMatMul
-        graph.nodes_mut()[id].op = Op::FusedRmsNormMatMul { eps };
-        graph.nodes_mut()[id].inputs = vec![x, w_norm, w_proj_id];
-        graph.nodes_mut()[id].ty = TensorType::f32(vec![m, n]);
-        // Mark old RmsNorm as Nop
-        graph.nodes_mut()[norm_id as usize].op = Op::Nop;
-
-        fusions.push(("RmsNorm+MatMul→FusedRmsNormMatMul".to_string(), id as u32));
-    }
-}
-
-/// Fuse CausalAttention(RoPE(Q), RoPE(K), V) → CausalAttentionRoPE(Q, K, V)
-///
-/// When both Q and K inputs to CausalAttention are single-use RoPE nodes
-/// with the same theta, replace with CausalAttentionRoPE which applies
-/// RoPE inside the attention kernel's dot product. Eliminates 2 dispatches
-/// + 1 barrier group per attention layer.
-#[allow(dead_code)]
-fn apply_rope_attention_fusions(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
-    let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
-    for &id in &node_ids {
-        let node = &graph.nodes()[id];
-        let (num_heads, num_kv_heads, head_dim) = match node.op {
-            Op::CausalAttention {
-                num_heads,
-                num_kv_heads,
-                head_dim,
-            } => (num_heads, num_kv_heads, head_dim),
-            _ => continue,
-        };
-
-        let q_id = node.inputs[0];
-        let k_id = node.inputs[1];
-        let v_id = node.inputs[2];
-
-        // Both Q and K must be RoPE nodes
-        let q_node = graph.node(q_id);
-        let k_node = graph.node(k_id);
-        let (q_theta, q_raw) = match q_node.op {
-            Op::RoPE { theta, .. } => (theta, q_node.inputs[0]),
-            _ => continue,
-        };
-        let (k_theta, k_raw) = match k_node.op {
-            Op::RoPE { theta, .. } => (theta, k_node.inputs[0]),
-            _ => continue,
-        };
-
-        // Same theta
-        if q_theta != k_theta {
-            continue;
-        }
-
-        // Both RoPE nodes must be single-use (only feeding this attention)
-        let q_uses = graph
-            .nodes()
-            .iter()
-            .filter(|n| n.inputs.contains(&q_id) && !matches!(n.op, Op::Nop))
-            .count();
-        let k_uses = graph
-            .nodes()
-            .iter()
-            .filter(|n| n.inputs.contains(&k_id) && !matches!(n.op, Op::Nop))
-            .count();
-        if q_uses != 1 || k_uses != 1 {
-            continue;
-        }
-        if graph.is_output(q_id) || graph.is_output(k_id) {
-            continue;
-        }
-
-        // Replace CausalAttention with CausalAttentionRoPE using un-rotated Q, K
-        graph.nodes_mut()[id].op = Op::CausalAttentionRoPE {
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            rope_theta: q_theta,
-        };
-        graph.nodes_mut()[id].inputs = vec![q_raw, k_raw, v_id];
-        // Mark old RoPE nodes as Nop
-        graph.nodes_mut()[q_id as usize].op = Op::Nop;
-        graph.nodes_mut()[k_id as usize].op = Op::Nop;
-
-        fusions.push((
-            "CausalAttn(RoPE,RoPE)→CausalAttnRoPE".to_string(),
-            id as u32,
-        ));
-    }
-}
-
-/// Fuse Mul(x, Sigmoid(x)) → Silu(x) via direct pattern matching.
-///
-/// PyTorch decomposes Silu to x * sigmoid(x) in ONNX exports.
-fn apply_silu_fusions(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
-    let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
-    for &id in &node_ids {
-        let node = &graph.nodes()[id];
-        if !matches!(node.op, Op::Mul) {
-            continue;
-        }
-        let (a_id, b_id) = (node.inputs[0], node.inputs[1]);
-        // Check: Mul(x, Sigmoid(x)) or Mul(Sigmoid(x), x)
-        let (x, sig_id) = if matches!(graph.node(b_id).op, Op::Sigmoid)
-            && graph.node(b_id).inputs[0] == a_id
-        {
-            (a_id, b_id)
-        } else if matches!(graph.node(a_id).op, Op::Sigmoid) && graph.node(a_id).inputs[0] == b_id {
-            (b_id, a_id)
-        } else {
-            continue;
-        };
-        // Only fuse if Sigmoid has a single consumer (this Mul)
-        let sig_use_count = graph
-            .nodes()
-            .iter()
-            .filter(|n| n.inputs.contains(&sig_id) && !matches!(n.op, Op::Nop))
-            .count();
-        if sig_use_count != 1 {
-            continue;
-        }
-        if graph.is_output(sig_id) {
-            continue;
-        }
-        graph.nodes_mut()[id].op = Op::Silu;
-        graph.nodes_mut()[id].inputs = vec![x];
-        graph.nodes_mut()[sig_id as usize].op = Op::Nop;
-        fusions.push(("Mul+Sigmoid→Silu".to_string(), id as u32));
-    }
-}
-
-/// Fuse Mul(Silu(gate), up) → SwiGLU(gate, up) via direct pattern matching.
-fn apply_swiglu_fusions(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
-    let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
-    for &id in &node_ids {
-        let node = &graph.nodes()[id];
-        if !matches!(node.op, Op::Mul) {
-            continue;
-        }
-        let (a_id, b_id) = (node.inputs[0], node.inputs[1]);
-        // Check: Mul(Silu(gate), up)
-        let (gate, up, silu_id) = if matches!(graph.node(a_id).op, Op::Silu) {
-            (graph.node(a_id).inputs[0], b_id, a_id)
-        } else if matches!(graph.node(b_id).op, Op::Silu) {
-            (graph.node(b_id).inputs[0], a_id, b_id)
-        } else {
-            continue;
-        };
-        // Only fuse if Silu has a single consumer
-        let silu_use_count = graph
-            .nodes()
-            .iter()
-            .filter(|n| n.inputs.contains(&silu_id) && !matches!(n.op, Op::Nop))
-            .count();
-        if silu_use_count != 1 {
-            continue;
-        }
-        if graph.is_output(silu_id) {
-            continue;
-        }
-        graph.nodes_mut()[id].op = Op::SwiGLU;
-        graph.nodes_mut()[id].inputs = vec![gate, up];
-        graph.nodes_mut()[silu_id as usize].op = Op::Nop;
-        fusions.push(("Silu+Mul→SwiGLU".to_string(), id as u32));
-    }
-}
-
 fn clone_graph(graph: &Graph) -> Graph {
     let mut new_graph = Graph::new();
     for node in graph.nodes() {
@@ -1533,9 +1247,9 @@ mod tests {
         let y = g.matmul(x, w);
         g.set_outputs(vec![y]);
 
-        let program = graph_to_egglog(&g);
+        let program = dump_egglog_program(&g);
         assert!(program.contains("(MatMul"));
-        assert!(program.contains("(Input \"x\")"));
+        assert!(program.contains("(Leaf 0)"));
 
         let mut egraph = egglog::EGraph::default();
         egraph.parse_and_run_program(None, &program).unwrap();
@@ -1611,6 +1325,31 @@ mod tests {
         assert!(matches!(out.op, Op::Neg));
     }
 
+    /// Neg(Neg(x)) at the output collapses to an alias of x.
+    #[test]
+    fn test_double_neg_collapses() {
+        let mut g = Graph::new();
+        let a = g.input("a", &[4, 8]);
+        let b = g.input("b", &[4, 8]);
+        let sum = g.add(a, b);
+        let n1 = g.neg(sum);
+        let n2 = g.neg(n1);
+        g.set_outputs(vec![n2]);
+
+        let opt = optimize(&g);
+        // The root is rewritten in place to the collapsed expression
+        // (either directly as the Add or as an alias of it).
+        let out = opt.node(opt.outputs()[0]);
+        assert!(
+            matches!(out.op, Op::Add | Op::Identity),
+            "expected collapsed root, got {:?}",
+            out.op
+        );
+        // The Neg pair is dead.
+        let negs = opt.nodes().iter().filter(|n| matches!(n.op, Op::Neg)).count();
+        assert_eq!(negs, 0, "dead Neg nodes should be swept");
+    }
+
     #[test]
     fn test_dump_egglog_program() {
         let mut g = Graph::new();
@@ -1622,7 +1361,7 @@ mod tests {
 
         let program = dump_egglog_program(&g);
         assert!(program.contains("(datatype Op"));
-        assert!(program.contains("(extract n"));
+        assert!(program.contains("(run 4)"));
     }
 
     #[test]
@@ -1648,7 +1387,7 @@ mod tests {
         let _cel = g.cross_entropy_loss(mm, mm);
         g.set_outputs(vec![sa]);
 
-        let program = graph_to_egglog(&g);
+        let program = dump_egglog_program(&g);
         let mut egraph = egglog::EGraph::default();
         egraph.parse_and_run_program(None, &program).unwrap();
     }
@@ -1790,6 +1529,7 @@ mod tests {
         let mm_node = opt.node(mm_id);
         assert!(matches!(mm_node.op, Op::MatMul));
         assert_eq!(mm_node.ty.shape, vec![50, 4096]);
+        assert_eq!(opt.derived_params.len(), 1);
     }
 
     /// Backward ops are encoded into egglog (not skipped).
@@ -1810,7 +1550,7 @@ mod tests {
         );
         g.set_outputs(vec![at, bt]);
 
-        let program = graph_to_egglog(&g);
+        let program = dump_egglog_program(&g);
         assert!(program.contains("MatMulAT"), "MatMulAT not encoded");
         assert!(program.contains("MatMulBT"), "MatMulBT not encoded");
 
@@ -1877,7 +1617,7 @@ mod tests {
         );
     }
 
-    /// Pattern matcher recognizes Silu+Mul → SwiGLU.
+    /// Pattern recognition of decomposed Silu+Mul → SwiGLU.
     #[test]
     fn test_swiglu_from_decomposed() {
         let mut g = Graph::new();
@@ -1922,4 +1662,28 @@ mod tests {
         assert!(has_maxpool, "MaxPool2d should survive optimization");
         assert!(has_gap, "GlobalAvgPool should survive optimization");
     }
+
+    /// Fusion fires even when the fused-away producer has a second
+    /// consumer: the producer stays alive for that consumer and the
+    /// fused node feeds the rest. Both paths must survive DCE.
+    #[test]
+    fn test_shared_producer_keeps_both_paths() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 8]);
+        let w = g.parameter("w", &[8, 8]);
+        let d = g.input("d", &[4, 8]);
+        let mm = g.matmul(x, w);
+        let fused_path = g.add(mm, d);
+        let other_path = g.relu(mm);
+        g.set_outputs(vec![fused_path, other_path]);
+
+        let opt = optimize(&g);
+        let out0 = opt.node(opt.outputs()[0]);
+        assert!(matches!(out0.op, Op::FusedMatMulAdd));
+        let out1 = opt.node(opt.outputs()[1]);
+        assert!(matches!(out1.op, Op::Relu));
+        // The shared MatMul must still be live for the Relu path.
+        assert!(matches!(opt.node(out1.inputs[0]).op, Op::MatMul));
+    }
 }
+
