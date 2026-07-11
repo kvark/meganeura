@@ -1,5 +1,45 @@
 # Unreleased
 
+- E-graph extraction is now the rewrite mechanism: extracted terms are
+  stamped back into the graph IR (roots and interior nodes rewritten in
+  place so node ids, id-carrying attributes, and output bindings stay
+  valid; fused nodes appended; dead nodes swept). The hand-written
+  pattern appliers, the kind-level applier gating, the legacy text
+  `(extract …)` path, and `MEGANEURA_NO_TRAFFIC_COST` are gone —
+  egglog's cost-model decision is what runs, per site.
+- Generic egglog encoding: only ops that rewrite rules mention keep
+  named constructors; everything else encodes through arity-generic
+  `Op1..Op6` constructors tagged with the node id. Ops with different
+  attributes can no longer be wrongly unified, any op (present or
+  future, e.g. from ONNX import) encodes without prelude changes, and
+  parameter/input names no longer appear in program text (no escaping
+  hazards). `StopGradient` is no longer conflated with `Identity`.
+- Unified segmentation: repeated regions saturate one instance and
+  stamp every instance (per-instance parameter substitution included —
+  packed-SwiGLU derived params are created per layer at stamp time);
+  all remaining nodes are chunked into under-cutoff windows and
+  saturated too. Every node now passes through the e-graph exactly
+  once — previously >300-node graphs bypassed it for everything
+  outside detected regions, and graphs with encoding gaps silently
+  fell back to pattern matching.
+- The packed-SwiGLU rewrite (`SwiGLU(MatMul(h,wg), MatMul(h,wu))` →
+  one wide matmul over a concatenated derived weight) is now an egglog
+  rule (`SwiGLUPacked`) chosen by the cost model, with a stamp-time
+  fallback to the unpacked form when weights aren't plain parameters.
+  The `FusedRmsNormMatMul` rewrite rule is removed (its applier was
+  disabled for a documented ~25% regression; the kernels remain).
+- `compile::topological_order` rebuilt on an adjacency list: nodes
+  listing the same input twice (`Mul(x,x)`, grad-sum `Add(g,g)`) used
+  to under-decrement and fall into an append-in-id-order fallback,
+  which silently mis-ordered dispatches once the optimizer created
+  nodes referenced by earlier ids — reads of never-written buffers,
+  i.e. zero gradients. Also removes two O(n²) scans.
+- autodiff: CrossEntropyLoss/Softmax/LogSoftmax backward now broadcast
+  per-row sums via `SumInner` + `ones[1, F]` instead of a dense
+  `ones[F, F]` matmul — the old form materialized a 9.66 GB constant
+  for a 49k vocab and was 76% of the SmolLM2-135M train step
+  (RTX 5070: 106.8 → 22.0 ms/step; Radeon 610M: 1774 → 325 ms/step;
+  session buffers 11.3 GB → 1.69 GB).
 - Bump `naga` to the wgpu git rev carrying
   `spv::Options::emit_int_div_checks`, pinned to the same rev as
   `blade-graphics` so the `naga::Module` we build unifies with blade's

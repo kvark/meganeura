@@ -48,15 +48,16 @@ new hardware or new data — see `rejected-optimizations.md` and
 
 ## Track A — Compiler: make the e-graph earn its keep
 
-### A1. Repeated-block outlining (hierarchical IR)  ← *first stage landed*
+### A1. Repeated-block outlining (hierarchical IR)  ← *landed*
 
 *Landed:* signature-periodicity detection + edge-isomorphism
 verification (`src/outline.rs`), per-block saturation with extraction
-on block outputs, `OptimizeReport.outlined_regions`. *Still open:*
-applying rewrites by stamping extracted terms per instance (today the
-global pattern appliers do the rewriting, so per-block extractor
-decisions can't yet disable a fusion for out-of-region patterns), and
-cross-block boundary fusions.
+on block outputs, `OptimizeReport.outlined_regions`, and extracted
+terms stamped per instance — the e-graph's per-site decision is what
+runs; the global pattern appliers are gone. Nodes outside regions are
+chunked into under-cutoff windows and saturated too, so every node
+passes through the e-graph. *Still open:* cross-block boundary
+fusions (segment edges are opaque leaves).
 
 **Problem.** Graphs over 300 nodes skip egglog entirely
 (`optimize.rs:186`) and fall back to direct pattern matching — every
@@ -125,8 +126,9 @@ epilogue).
 
 *Landed:* e-class sizes are mapped after saturation (every node
 binding's value → tensor bytes) and `FusionCostModel` charges each
-e-node its read+write traffic; on under-cutoff graphs the extracted
-terms gate the appliers. `MEGANEURA_NO_TRAFFIC_COST=1` reverts.
+e-node its read+write traffic; extraction decides every rewrite and
+its terms are stamped into the graph (the constant-cost fallback and
+`MEGANEURA_NO_TRAFFIC_COST` are gone).
 
 **Problem.** `FusionCostModel` is constant (fused = 9, everything
 else = 10) — `kernel-archetypes.md` *describes* an HBM-traffic cost

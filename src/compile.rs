@@ -579,8 +579,15 @@ pub struct ExecutionPlan {
 fn topological_order(graph: &Graph) -> Vec<NodeId> {
     let n = graph.nodes().len();
     let mut in_degree = vec![0u32; n];
+    // Consumer edges with multiplicity: a node listing the same input
+    // twice (Mul(x, x), grad-sum Add(g, g)) contributes two edges and
+    // needs two decrements to activate.
+    let mut consumers: Vec<Vec<NodeId>> = vec![Vec::new(); n];
     for node in graph.nodes() {
         in_degree[node.id as usize] = node.inputs.len() as u32;
+        for &input in &node.inputs {
+            consumers[input as usize].push(node.id);
+        }
     }
 
     let mut queue: std::collections::VecDeque<NodeId> = std::collections::VecDeque::new();
@@ -593,21 +600,22 @@ fn topological_order(graph: &Graph) -> Vec<NodeId> {
     let mut order = Vec::with_capacity(n);
     while let Some(id) = queue.pop_front() {
         order.push(id);
-        // For each node that depends on `id`, decrement in-degree
-        for node in graph.nodes() {
-            if node.inputs.contains(&id) {
-                in_degree[node.id as usize] -= 1;
-                if in_degree[node.id as usize] == 0 {
-                    queue.push_back(node.id);
-                }
+        for &c in &consumers[id as usize] {
+            in_degree[c as usize] -= 1;
+            if in_degree[c as usize] == 0 {
+                queue.push_back(c);
             }
         }
     }
 
     // Any unvisited nodes (cycles or disconnected) — append in ID order
     if order.len() < n {
+        let mut visited = vec![false; n];
+        for &id in &order {
+            visited[id as usize] = true;
+        }
         for node in graph.nodes() {
-            if !order.contains(&node.id) {
+            if !visited[node.id as usize] {
                 order.push(node.id);
             }
         }
