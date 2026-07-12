@@ -6,7 +6,7 @@
 //! pattern-matching path.
 //!
 //! Scaling: saturation cost is superlinear in node count, so graphs over
-//! [`SATURATION_CUTOFF`] are split into segments — repeated regions
+//! `SATURATION_CUTOFF` are split into segments — repeated regions
 //! (transformer layers, detected by `outline`) saturate one instance and
 //! stamp the result into every instance; the remaining nodes are chunked
 //! into windows under the cutoff. Every node therefore passes through
