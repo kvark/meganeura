@@ -34,16 +34,16 @@ fn efficientnet_v2s_weight_names_cover_torchvision_keys() {
     // `efficientnet_v2_s().state_dict()`.
     let expected_present = [
         "features.0.0.weight",
-        "features.1.0.block.0.0.weight",   // FusedMBConv e=1: single 3×3 (24, 24, 3, 3)
+        "features.1.0.block.0.0.weight", // FusedMBConv e=1: single 3×3 (24, 24, 3, 3)
         "features.1.1.block.0.0.weight",
-        "features.2.0.block.0.0.weight",   // FusedMBConv e=4 expand (96, 24, 3, 3)
-        "features.2.0.block.1.0.weight",   // FusedMBConv e=4 project (48, 96, 1, 1)
-        "features.3.0.block.0.0.weight",   // FusedMBConv e=4 (192, 48, 3, 3)
-        "features.4.0.block.0.0.weight",   // MBConv expand 1×1 (256, 64, 1, 1)
-        "features.4.0.block.1.0.weight",   // MBConv depthwise (256, 1, 3, 3)
+        "features.2.0.block.0.0.weight", // FusedMBConv e=4 expand (96, 24, 3, 3)
+        "features.2.0.block.1.0.weight", // FusedMBConv e=4 project (48, 96, 1, 1)
+        "features.3.0.block.0.0.weight", // FusedMBConv e=4 (192, 48, 3, 3)
+        "features.4.0.block.0.0.weight", // MBConv expand 1×1 (256, 64, 1, 1)
+        "features.4.0.block.1.0.weight", // MBConv depthwise (256, 1, 3, 3)
         "features.4.0.block.2.fc1.weight", // MBConv SE squeeze 256→16
-        "features.4.0.block.3.0.weight",   // MBConv project (128, 256, 1, 1)
-        "features.5.8.block.3.0.weight",   // last block project (160, 960, 1, 1)
+        "features.4.0.block.3.0.weight", // MBConv project (128, 256, 1, 1)
+        "features.5.8.block.3.0.weight", // last block project (160, 960, 1, 1)
     ];
     for needle in expected_present {
         assert!(

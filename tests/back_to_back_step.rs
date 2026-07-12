@@ -6,7 +6,6 @@
 /// Empirically the SIL pattern has zero downstream effect; this test
 /// isolates whether the meganeura session correctly applies a second
 /// optimizer step in this pattern.
-
 use meganeura::{Graph, build_session};
 
 fn build_linear_regression(batch_size: usize, in_dim: usize, out_dim: usize) -> Graph {
@@ -45,8 +44,12 @@ fn back_to_back_step_applies_two_distinct_updates() {
     // Two distinct (input, target) batches.
     let x_a: Vec<f32> = (0..batch * in_d).map(|i| (i as f32 * 0.3).cos()).collect();
     let t_a: Vec<f32> = (0..batch * out_d).map(|i| (i as f32 * 0.5).sin()).collect();
-    let x_b: Vec<f32> = (0..batch * in_d).map(|i| (i as f32 * 0.7 + 1.0).cos()).collect();
-    let t_b: Vec<f32> = (0..batch * out_d).map(|i| (i as f32 * 0.4 + 2.0).sin()).collect();
+    let x_b: Vec<f32> = (0..batch * in_d)
+        .map(|i| (i as f32 * 0.7 + 1.0).cos())
+        .collect();
+    let t_b: Vec<f32> = (0..batch * out_d)
+        .map(|i| (i as f32 * 0.4 + 2.0).sin())
+        .collect();
 
     // ============= Step 1: input A =============
     s.set_input("x", &x_a);
@@ -138,7 +141,11 @@ fn set_adam_persists_across_steps_without_re_arming() {
         s.step();
         s.wait();
         let now = snapshot_params(&s, "w.weight", n_w);
-        let diff: f32 = now.iter().zip(last.iter()).map(|(a, b)| (a - b).abs()).sum();
+        let diff: f32 = now
+            .iter()
+            .zip(last.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
         assert!(
             diff > 1e-6,
             "step {step_idx} (Adam configured once, called repeatedly) must keep updating params; saw L1 diff {diff}",

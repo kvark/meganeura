@@ -119,7 +119,12 @@ pub fn plan_buffer_aliasing(plan: &ExecutionPlan, groups: &[Range<usize>]) -> Al
 
     // Greedy best-fit over live intervals [first_write, last_use].
     let mut order: Vec<usize> = (0..n).filter(|&i| !pinned[i]).collect();
-    order.sort_by_key(|&i| (uses[i].first_write.unwrap(), std::cmp::Reverse(plan.buffers[i])));
+    order.sort_by_key(|&i| {
+        (
+            uses[i].first_write.unwrap(),
+            std::cmp::Reverse(plan.buffers[i]),
+        )
+    });
     // Allocations open for reuse: (last group used, physical index).
     let mut pool: Vec<(usize, usize)> = Vec::new();
     for i in order {
@@ -393,8 +398,14 @@ mod tests {
         // Memory classes: intermediates device-local, pinned host-visible.
         assert!(alias.device_local[alias.map[1]]);
         assert!(alias.device_local[alias.map[2]]);
-        assert!(!alias.device_local[alias.map[0]], "input stays host-visible");
-        assert!(!alias.device_local[alias.map[4]], "output stays host-visible");
+        assert!(
+            !alias.device_local[alias.map[0]],
+            "input stays host-visible"
+        );
+        assert!(
+            !alias.device_local[alias.map[4]],
+            "output stays host-visible"
+        );
         assert_eq!(alias.device_local.len(), alias.sizes.len());
     }
 
@@ -427,11 +438,7 @@ mod tests {
         // their outputs must not share even though dispatch indices differ.
         let mut p = plan(
             vec![16, 64, 64, 16],
-            vec![
-                dispatch(&[0], 1),
-                dispatch(&[0], 2),
-                dispatch(&[1, 2], 3),
-            ],
+            vec![dispatch(&[0], 1), dispatch(&[0], 2), dispatch(&[1, 2], 3)],
         );
         p.input_buffers.push(("x".into(), BufferRef(0)));
         p.output_buffers.push(BufferRef(3));
@@ -447,11 +454,7 @@ mod tests {
         // contents carry over from the previous step (cache-like).
         let mut p = plan(
             vec![16, 64, 16, 64],
-            vec![
-                dispatch(&[1], 2),
-                dispatch(&[0], 1),
-                dispatch(&[2], 3),
-            ],
+            vec![dispatch(&[1], 2), dispatch(&[0], 1), dispatch(&[2], 3)],
         );
         p.input_buffers.push(("x".into(), BufferRef(0)));
         p.output_buffers.push(BufferRef(3));
@@ -481,11 +484,7 @@ mod tests {
     fn params_and_grads_are_pinned() {
         let mut p = plan(
             vec![64, 64, 64, 64, 64],
-            vec![
-                dispatch(&[0, 1], 2),
-                dispatch(&[2], 3),
-                dispatch(&[3], 4),
-            ],
+            vec![dispatch(&[0, 1], 2), dispatch(&[2], 3), dispatch(&[3], 4)],
         );
         p.input_buffers.push(("x".into(), BufferRef(0)));
         p.param_buffers.push(("w".into(), BufferRef(1)));
@@ -495,7 +494,12 @@ mod tests {
         let alias = plan_buffer_aliasing(&p, &groups);
         for pinned in [0usize, 1, 3, 4] {
             assert!(
-                alias.map.iter().filter(|&&m| m == alias.map[pinned]).count() == 1,
+                alias
+                    .map
+                    .iter()
+                    .filter(|&&m| m == alias.map[pinned])
+                    .count()
+                    == 1,
                 "buffer {pinned} must keep a dedicated allocation"
             );
         }

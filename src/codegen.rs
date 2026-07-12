@@ -544,9 +544,7 @@ pub fn generate_wgsl(group: ShaderGroup) -> String {
             naga::valid::Capabilities::COOPERATIVE_MATRIX
                 | naga::valid::Capabilities::SHADER_FLOAT16
         }
-        ShaderGroup::EmbeddingF16 | ShaderGroup::ToF16 => {
-            naga::valid::Capabilities::SHADER_FLOAT16
-        }
+        ShaderGroup::EmbeddingF16 | ShaderGroup::ToF16 => naga::valid::Capabilities::SHADER_FLOAT16,
         _ => naga::valid::Capabilities::empty(),
     };
     module_to_wgsl(&sm.module, capabilities)
@@ -4462,7 +4460,9 @@ fn emit_forward_weight_stage(
     // Fast path: vec4 load, valid only when each weight row [Co, K] starts
     // on a vec4 boundary, i.e. k_total % 4 == 0. The branch is on a
     // uniform value so there is no warp divergence.
-    src.push_str("            if (k_total & 3u) == 0u && gr < m_total && (tc4 + 4u) <= k_total {\n");
+    src.push_str(
+        "            if (k_total & 3u) == 0u && gr < m_total && (tc4 + 4u) <= k_total {\n",
+    );
     src.push_str("                let v = weight[(gr * k_total + tc4) >> 2u];\n");
     let _ = writeln!(
         src,
@@ -4494,7 +4494,10 @@ fn emit_forward_weight_stage(
         "                        {shared_name}[flat + i] = {cast_open}weight[idx >> 2u][idx & 3u]{cast_close};"
     );
     src.push_str("                    } else {\n");
-    let _ = writeln!(src, "                        {shared_name}[flat + i] = zero_val;");
+    let _ = writeln!(
+        src,
+        "                        {shared_name}[flat + i] = zero_val;"
+    );
     src.push_str("                    }\n");
     src.push_str("                }\n");
     src.push_str("            }\n");

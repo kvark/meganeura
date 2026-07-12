@@ -1666,9 +1666,15 @@ impl Session {
         // tiles and no opt-in, fall back to scalar f32 (correct).
         let want_f16 = std::env::var("MEGANEURA_COOP_F16").is_ok();
         if caps.f32_tile > 0 {
-            Some(CoopConfig { tile_size: caps.f32_tile, use_f16_input: false })
+            Some(CoopConfig {
+                tile_size: caps.f32_tile,
+                use_f16_input: false,
+            })
         } else if caps.f16_tile > 0 && want_f16 {
-            Some(CoopConfig { tile_size: caps.f16_tile, use_f16_input: true })
+            Some(CoopConfig {
+                tile_size: caps.f16_tile,
+                use_f16_input: true,
+            })
         } else {
             if caps.f16_tile > 0 {
                 log::warn!(
@@ -3090,11 +3096,14 @@ impl Session {
         // were uninitialized and the agent silently failed to learn for
         // 50 000 steps. Asserting here catches the class.
         assert_eq!(
-            data.len(), expected,
+            data.len(),
+            expected,
             "upload_buffer: byte-size mismatch for buffer {} — got {} bytes, slot expects {}. \
              Likely a parameter shape mismatch between the graph declaration and the source data \
              (e.g. graph says [batch * channels * area], safetensor says [channels]).",
-            buf_ref.0, data.len(), expected,
+            buf_ref.0,
+            data.len(),
+            expected,
         );
         // All upload targets (params, inputs) are pinned by the memory
         // plan and therefore host-visible; a null pointer here means a
@@ -3457,8 +3466,10 @@ impl Session {
     pub fn dump_grad_summary(&self, top_n: usize) {
         let grads = self.read_all_param_grad_norms();
         let weights = self.read_all_param_norms();
-        let weights_lookup: std::collections::HashMap<&str, f32> =
-            weights.iter().map(|entry| (entry.0.as_str(), entry.1)).collect();
+        let weights_lookup: std::collections::HashMap<&str, f32> = weights
+            .iter()
+            .map(|entry| (entry.0.as_str(), entry.1))
+            .collect();
         let mut sorted: Vec<&(String, f32)> = grads.iter().collect();
         sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let n = sorted.len().min(top_n.max(1));
@@ -3592,7 +3603,12 @@ impl Session {
                         &GradAccumData {
                             grad: self.buffers[grad_buf.0 as usize].at(0),
                             acc: self.grad_accum_bufs[idx].at(0),
-                            params: GradAccumParams { len, scale, _pad0: 0, _pad1: 0 },
+                            params: GradAccumParams {
+                                len,
+                                scale,
+                                _pad0: 0,
+                                _pad1: 0,
+                            },
                         },
                     );
                     pc.dispatch([len.div_ceil(256), 1, 1]);
@@ -3645,12 +3661,7 @@ impl Session {
                 let pipeline = &self.pipelines.map[&ShaderEntry::GradClipZero];
                 let mut pass = self.encoder.compute("grad_clip_zero");
                 let mut pc = pass.with(pipeline);
-                pc.bind(
-                    0,
-                    &GradClipZeroData {
-                        acc: acc_buf.at(0),
-                    },
-                );
+                pc.bind(0, &GradClipZeroData { acc: acc_buf.at(0) });
                 pc.dispatch([1, 1, 1]);
             }
             // Pass 2: sum of squares per gradient buffer.
@@ -3846,11 +3857,8 @@ impl Session {
                 // buffers are already interleaved into `input_buffers` by
                 // the fusion pass, right after their table stream), then
                 // `dst`. `params` is bound last by `fill`.
-                let mut buffers: Vec<blade_graphics::BufferPiece> = dispatch
-                    .input_buffers
-                    .iter()
-                    .map(|&r| buf(r))
-                    .collect();
+                let mut buffers: Vec<blade_graphics::BufferPiece> =
+                    dispatch.input_buffers.iter().map(|&r| buf(r)).collect();
                 buffers.push(buf(dispatch.output_buffer));
                 pc.bind(0, &DynReductionData { buffers, params });
                 return;
@@ -5461,22 +5469,22 @@ impl Drop for Session {
     fn drop(&mut self) {
         self.wait();
         self.gpu.destroy_command_encoder(&mut self.encoder);
-        for (_, pipeline) in self.pipelines.map.iter_mut() {
+        for pipeline in self.pipelines.map.values_mut() {
             self.gpu.destroy_compute_pipeline(pipeline);
         }
-        for (_, pipeline) in self.pipelines.coop_map.iter_mut() {
+        for pipeline in self.pipelines.coop_map.values_mut() {
             self.gpu.destroy_compute_pipeline(pipeline);
         }
-        for (_, pipeline) in self.pipelines.small_map.iter_mut() {
+        for pipeline in self.pipelines.small_map.values_mut() {
             self.gpu.destroy_compute_pipeline(pipeline);
         }
-        for (_, pipeline) in self.pipelines.epilogue_map.iter_mut() {
+        for pipeline in self.pipelines.epilogue_map.values_mut() {
             self.gpu.destroy_compute_pipeline(pipeline);
         }
-        for (_, pipeline) in self.pipelines.pointwise_map.iter_mut() {
+        for pipeline in self.pipelines.pointwise_map.values_mut() {
             self.gpu.destroy_compute_pipeline(pipeline);
         }
-        for (_, pipeline) in self.pipelines.reduction_map.iter_mut() {
+        for pipeline in self.pipelines.reduction_map.values_mut() {
             self.gpu.destroy_compute_pipeline(pipeline);
         }
         // `buffers` holds aliased copies of these handles; destroy each

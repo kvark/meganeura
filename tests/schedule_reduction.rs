@@ -8,11 +8,17 @@
 //! binding (runtime.rs) that only fire for fused reductions with
 //! n_per_elem > 1 and/or gather streams.
 
-use meganeura::compile::{compile_with, ShaderEntry};
+use meganeura::compile::{ShaderEntry, compile_with};
 use meganeura::{CompileOptions, Graph, Mode, NodeId, Session, SessionConfig};
 
 fn run(
-    build: &dyn Fn(&mut Graph) -> (NodeId, Vec<(&'static str, Vec<f32>)>, Vec<(&'static str, Vec<u32>)>),
+    build: &dyn Fn(
+        &mut Graph,
+    ) -> (
+        NodeId,
+        Vec<(&'static str, Vec<f32>)>,
+        Vec<(&'static str, Vec<u32>)>,
+    ),
     n_out: usize,
     fuse: bool,
 ) -> Vec<f32> {
@@ -45,7 +51,13 @@ fn run(
 }
 
 fn assert_parity(
-    build: impl Fn(&mut Graph) -> (NodeId, Vec<(&'static str, Vec<f32>)>, Vec<(&'static str, Vec<u32>)>),
+    build: impl Fn(
+        &mut Graph,
+    ) -> (
+        NodeId,
+        Vec<(&'static str, Vec<f32>)>,
+        Vec<(&'static str, Vec<u32>)>,
+    ),
     n_out: usize,
 ) {
     let unfused = run(&build, n_out, false);
@@ -140,7 +152,10 @@ fn two_gather_reduction_actually_fuses() {
         .collect();
     assert_eq!(reductions.len(), 1, "expected exactly one fused reduction");
     let k = reductions[0].reduction.as_ref().unwrap();
-    assert_eq!(k.n_per_elem, 2, "mul producer should fold to 2 per-elem streams");
+    assert_eq!(
+        k.n_per_elem, 2,
+        "mul producer should fold to 2 per-elem streams"
+    );
     assert_eq!(
         k.gather_elem,
         vec![true, true],

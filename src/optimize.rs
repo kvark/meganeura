@@ -242,7 +242,11 @@ pub fn optimize_with_report(graph: &Graph) -> (Graph, OptimizeReport) {
         .filter(|n| !matches!(n.op, Op::Nop))
         .count();
 
-    log::info!("optimizer: {} fusions on {} nodes", fusions.len(), nodes_after);
+    log::info!(
+        "optimizer: {} fusions on {} nodes",
+        fusions.len(),
+        nodes_after
+    );
     let mut rules_fired: Vec<(String, usize)> = Vec::new();
     for fusion in &fusions {
         if let Some(entry) = rules_fired.iter_mut().find(|e| e.0 == fusion.0) {
@@ -251,7 +255,7 @@ pub fn optimize_with_report(graph: &Graph) -> (Graph, OptimizeReport) {
             rules_fired.push((fusion.0.clone(), 1));
         }
     }
-    for (name, count) in &rules_fired {
+    for &(ref name, count) in &rules_fired {
         log::info!("  {}x {}", count, name);
     }
 
@@ -426,7 +430,7 @@ fn egglog_prelude(prog: &mut String) {
 /// Returns the named egglog constructor for ops that rewrite rules
 /// match on, or `None` for generically-encoded ops.
 fn named_constructor(op: &Op) -> Option<&'static str> {
-    Some(match op {
+    Some(match *op {
         Op::MatMul => "MatMul",
         Op::MatMulAT => "MatMulAT",
         Op::MatMulBT => "MatMulBT",
@@ -686,14 +690,14 @@ fn process_segment(
         .collect();
     let idset: HashSet<usize> = seg.ids.iter().copied().collect();
     for (&shift, ext_map) in seg.shifts.iter().zip(&ext_maps) {
-        let Some(ext_map) = ext_map else {
+        let Some(ref ext_map) = *ext_map else {
             log::warn!(
                 "segment instance at +{} has ambiguous external edges — left unoptimized",
                 shift
             );
             continue;
         };
-        for (root, dag, term_id) in &terms {
+        for &(root, ref dag, term_id) in &terms {
             let mut stamper = Stamper {
                 g,
                 index,
@@ -703,7 +707,7 @@ fn process_segment(
                 fusions,
                 memo: HashMap::new(),
             };
-            if let Err(e) = stamper.stamp_root(root + shift, dag, *term_id) {
+            if let Err(e) = stamper.stamp_root(root + shift, dag, term_id) {
                 log::warn!("stamping $n{} (+{}) failed: {}", root, shift, e);
             }
         }
@@ -764,7 +768,11 @@ impl Stamper<'_> {
         }
     }
 
-    fn resolve_children(&mut self, dag: &TermDag, children: &[TermId]) -> Result<Vec<NodeId>, String> {
+    fn resolve_children(
+        &mut self,
+        dag: &TermDag,
+        children: &[TermId],
+    ) -> Result<Vec<NodeId>, String> {
         children.iter().map(|&c| self.resolve(dag, c)).collect()
     }
 
@@ -846,9 +854,21 @@ impl Stamper<'_> {
                 (Op::MatMulBT, TensorType::f32(vec![a[0], b[0]]), None)
             }
             // The addend has the result shape by Add's own typing.
-            "FusedMatMulAdd" => (Op::FusedMatMulAdd, ty_of(inputs[2]), Some("MatMul+Add→FusedMatMulAdd")),
-            "FusedMatMulATAdd" => (Op::FusedMatMulATAdd, ty_of(inputs[2]), Some("MatMulAT+Add→FusedMatMulATAdd")),
-            "FusedMatMulBTAdd" => (Op::FusedMatMulBTAdd, ty_of(inputs[2]), Some("MatMulBT+Add→FusedMatMulBTAdd")),
+            "FusedMatMulAdd" => (
+                Op::FusedMatMulAdd,
+                ty_of(inputs[2]),
+                Some("MatMul+Add→FusedMatMulAdd"),
+            ),
+            "FusedMatMulATAdd" => (
+                Op::FusedMatMulATAdd,
+                ty_of(inputs[2]),
+                Some("MatMulAT+Add→FusedMatMulATAdd"),
+            ),
+            "FusedMatMulBTAdd" => (
+                Op::FusedMatMulBTAdd,
+                ty_of(inputs[2]),
+                Some("MatMulBT+Add→FusedMatMulBTAdd"),
+            ),
             "Add" => (Op::Add, ty_of(inputs[0]), None),
             "Mul" => (Op::Mul, ty_of(inputs[0]), None),
             "Relu" => (Op::Relu, ty_of(inputs[0]), None),
@@ -930,10 +950,8 @@ impl Stamper<'_> {
             target,
         );
         self.index.insert(("SwiGLUPacked", inputs.to_vec()), id);
-        self.fusions.push((
-            "SwiGLU(MatMul,MatMul)→SwiGLUConcat(MatMul)".to_string(),
-            id,
-        ));
+        self.fusions
+            .push(("SwiGLU(MatMul,MatMul)→SwiGLUConcat(MatMul)".to_string(), id));
         Ok(id)
     }
 
@@ -946,7 +964,13 @@ impl Stamper<'_> {
 
     /// Write the node into `target` (root stamping keeps the root's id
     /// and type) or append a new node.
-    fn place(&mut self, op: Op, inputs: Vec<NodeId>, ty: TensorType, target: Option<NodeId>) -> NodeId {
+    fn place(
+        &mut self,
+        op: Op,
+        inputs: Vec<NodeId>,
+        ty: TensorType,
+        target: Option<NodeId>,
+    ) -> NodeId {
         match target {
             Some(id) => {
                 let node = &mut self.g.nodes_mut()[id as usize];
@@ -988,9 +1012,9 @@ fn static_constructor(name: &str) -> Result<&'static str, String> {
 }
 
 fn lit_node_id(dag: &TermDag, term_id: TermId) -> Result<usize, String> {
-    match dag.get(term_id) {
-        Term::Lit(Literal::Int(v)) => Ok(*v as usize),
-        other => Err(format!("expected node-id literal, got {:?}", other)),
+    match *dag.get(term_id) {
+        Term::Lit(Literal::Int(v)) => Ok(v as usize),
+        ref other => Err(format!("expected node-id literal, got {:?}", other)),
     }
 }
 
@@ -1346,7 +1370,11 @@ mod tests {
             out.op
         );
         // The Neg pair is dead.
-        let negs = opt.nodes().iter().filter(|n| matches!(n.op, Op::Neg)).count();
+        let negs = opt
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.op, Op::Neg))
+            .count();
         assert_eq!(negs, 0, "dead Neg nodes should be swept");
     }
 
@@ -1686,4 +1714,3 @@ mod tests {
         assert!(matches!(opt.node(out1.inputs[0]).op, Op::MatMul));
     }
 }
-

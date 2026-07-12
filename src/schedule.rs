@@ -1182,8 +1182,14 @@ mod tests {
         assert!(sm.source.contains("var<storage> src_a_idx: array<u32>;"));
         assert!(sm.source.contains("var<storage> src_b_idx: array<u32>;"));
         // Indirect (gathered) loads, not the direct row_offset form.
-        assert!(sm.source.contains("src_a[src_a_idx[row] * params.inner + col]"));
-        assert!(sm.source.contains("src_b[src_b_idx[row] * params.inner + col]"));
+        assert!(
+            sm.source
+                .contains("src_a[src_a_idx[row] * params.inner + col]")
+        );
+        assert!(
+            sm.source
+                .contains("src_b[src_b_idx[row] * params.inner + col]")
+        );
         assert!(!sm.source.contains("src_a[row_offset"));
         // The prologue multiply still fuses in.
         assert!(sm.source.contains("v0 * v1"));
@@ -1207,7 +1213,10 @@ mod tests {
             grid: GridShape::default(),
         });
         // Stream 0 gathered, stream 1 direct.
-        assert!(sm.source.contains("src_a[src_a_idx[row] * params.inner + col]"));
+        assert!(
+            sm.source
+                .contains("src_a[src_a_idx[row] * params.inner + col]")
+        );
         assert!(sm.source.contains("src_b[row_offset + col]"));
         assert!(sm.source.contains("var<storage> src_a_idx: array<u32>;"));
         assert!(!sm.source.contains("src_b_idx"));

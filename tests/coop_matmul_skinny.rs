@@ -90,7 +90,11 @@ fn assert_close(gpu: &[f32], cpu: &[f32], label: &str) {
         .zip(cpu)
         .map(|(a, b)| (a - b).abs())
         .fold(0.0_f32, f32::max);
-    let max_cpu = cpu.iter().map(|v| v.abs()).fold(0.0_f32, f32::max).max(1e-6);
+    let max_cpu = cpu
+        .iter()
+        .map(|v| v.abs())
+        .fold(0.0_f32, f32::max)
+        .max(1e-6);
     let rel = max_abs / max_cpu;
     // f16 inputs in the coop path lose ~10 mantissa bits; allow 2%.
     let first_bad = gpu

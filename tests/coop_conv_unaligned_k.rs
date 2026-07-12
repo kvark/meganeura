@@ -36,8 +36,12 @@ fn conv_out(in_c: u32, coop: bool) -> Vec<f32> {
     g.set_outputs(vec![y]);
     let mut s = build_inference_session(&g);
     // Small bounded values so f16 coop precision is not the issue.
-    let xd: Vec<f32> = (0..in_size).map(|i| ((i * 31 % 17) as f32 / 16.0 - 0.5) * 0.2).collect();
-    let kd: Vec<f32> = (0..k_size).map(|i| ((i * 13 % 19) as f32 / 18.0 - 0.5) * 0.2).collect();
+    let xd: Vec<f32> = (0..in_size)
+        .map(|i| ((i * 31 % 17) as f32 / 16.0 - 0.5) * 0.2)
+        .collect();
+    let kd: Vec<f32> = (0..k_size)
+        .map(|i| ((i * 13 % 19) as f32 / 18.0 - 0.5) * 0.2)
+        .collect();
     s.set_parameter("k", &kd);
     s.set_input("x", &xd);
     s.step();
@@ -76,5 +80,8 @@ fn coop_conv_aligned_k_matches_scalar() {
         .zip(&coop)
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
-    assert!(max_abs < 0.05, "coop conv wrong at K=144: max_abs_diff={max_abs}");
+    assert!(
+        max_abs < 0.05,
+        "coop conv wrong at K=144: max_abs_diff={max_abs}"
+    );
 }

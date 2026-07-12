@@ -1635,7 +1635,13 @@ impl Graph {
     ///
     /// `src` shape `[N*C*H*W]`; `gate` shape `[N*C]`.  Output matches `src`.
     /// Used by EfficientNet's Squeeze-and-Excitation block.
-    pub fn mul_per_channel(&mut self, src: NodeId, gate: NodeId, channels: u32, spatial: u32) -> NodeId {
+    pub fn mul_per_channel(
+        &mut self,
+        src: NodeId,
+        gate: NodeId,
+        channels: u32,
+        spatial: u32,
+    ) -> NodeId {
         let ty = self.node(src).ty.clone();
         self.add_node(Op::MulPerChannel { channels, spatial }, vec![src, gate], ty)
     }
@@ -1647,7 +1653,13 @@ impl Graph {
     /// without pre-replicating the safetensor's `[C]` data into a
     /// `[N*C*H*W]`-sized parameter buffer.  Compare `mul_per_channel`,
     /// whose gate is `[N*C]` (per-batch-and-channel) for the SE pathway.
-    pub fn add_per_channel(&mut self, src: NodeId, bias: NodeId, channels: u32, spatial: u32) -> NodeId {
+    pub fn add_per_channel(
+        &mut self,
+        src: NodeId,
+        bias: NodeId,
+        channels: u32,
+        spatial: u32,
+    ) -> NodeId {
         let ty = self.node(src).ty.clone();
         self.add_node(Op::AddPerChannel { channels, spatial }, vec![src, bias], ty)
     }
