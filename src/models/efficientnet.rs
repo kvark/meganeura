@@ -1,4 +1,4 @@
-//! EfficientNetV2-S features[0:6] model definition for meganeura.
+//! EfficientNetV2-S `features[0:6]` model definition for meganeura.
 //!
 //! V2-S is the visual frontend used by the kindle agent's
 //! `KindleVisualActor`. We deliberately use V2 (not V1) because:
@@ -16,8 +16,8 @@
 //! - `1` — 2× FusedMBConv, e=1, k=3, stride 1                  (24 → 24)
 //! - `2` — 4× FusedMBConv, e=4, k=3, strides (2,1,1,1)         (24 → 48)
 //! - `3` — 4× FusedMBConv, e=4, k=3, strides (2,1,1,1)         (48 → 64)
-//! - `4` — 6× MBConv,      e=4, k=3, strides (2,1,1,1,1,1)     (64 → 128) [SE]
-//! - `5` — 9× MBConv,      e=6, k=3, strides (1×9)             (128 → 160) [SE]
+//! - `4` — 6× MBConv,      e=4, k=3, strides (2,1,1,1,1,1)     (64 → 128), SE
+//! - `5` — 9× MBConv,      e=6, k=3, strides (1×9)             (128 → 160), SE
 //!
 //! BatchNorm is fused into the preceding conv's weight + a per-channel
 //! bias at load time (mirrors the resnet pattern). The SE branch is a
@@ -50,7 +50,7 @@ impl Spatial {
     }
 }
 
-/// Build the EfficientNetV2-S features[0:6] graph.
+/// Build the EfficientNetV2-S `features[0:6]` graph.
 ///
 /// Input is `"image"` with shape `[batch * 3 * 192 * 192]` in NCHW.
 /// Returns the feature map node `[batch * 160 * 12 * 12]`.

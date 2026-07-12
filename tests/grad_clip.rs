@@ -24,7 +24,7 @@ fn run_one_step(grad_clip: Option<f32>) -> Vec<f32> {
     // Same init for every run so we can compare.
     let w_init: Vec<f32> = (0..6).map(|i| (i as f32 * 0.1).sin()).collect();
     s.set_parameter("w.weight", &w_init);
-    s.set_parameter("w.bias", &vec![0.0; 2]);
+    s.set_parameter("w.bias", &[0.0; 2]);
 
     // Inputs designed to give a large, easy-to-reason-about gradient.
     let x: Vec<f32> = (0..12).map(|i| (i as f32 * 0.3).cos()).collect();
@@ -108,7 +108,7 @@ fn grad_clip_every_skips_clip() {
     let mut s = build_session(&g);
     let w_init: Vec<f32> = (0..6).map(|i| (i as f32 * 0.1).sin()).collect();
     s.set_parameter("w.weight", &w_init);
-    s.set_parameter("w.bias", &vec![0.0; 2]);
+    s.set_parameter("w.bias", &[0.0; 2]);
     let x: Vec<f32> = (0..12).map(|i| (i as f32 * 0.3).cos()).collect();
     let t: Vec<f32> = vec![10.0; 8];
     s.set_input("x", &x);

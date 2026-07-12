@@ -3,7 +3,7 @@ use crate::{
     data::DataLoader,
     graph::Graph,
     optimize::{self, OptimizeReport},
-    runtime::Session,
+    runtime::{self, Session},
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -253,8 +253,8 @@ pub struct SessionConfig<'a> {
     pub gpu: Option<Arc<blade_graphics::Context>>,
     pub options: compile::CompileOptions,
     /// When set, load a previously-compiled plan from this path if it
-    /// matches the graph hash, or save it there after compiling.
-    /// Training mode only — the cache is keyed by the forward graph.
+    /// matches the semantic graph, mode, compiler configuration, and target
+    /// GPU capabilities, or save it there after compiling.
     pub cache: Option<&'a Path>,
     /// Skip the post-autodiff full-graph optimization pass. Useful for
     /// debugging gradient flow through aggressively-fused ops. Training
@@ -274,16 +274,39 @@ pub struct SessionConfig<'a> {
 /// Perfetto traces when profiling is active.
 pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, OptimizeReport) {
     let _span = tracing::info_span!("build_session").entered();
-    log::info!("building {:?} session", cfg.mode);
+    let mode = cfg.mode;
+    let options = cfg.options;
+    let cache_path = cfg.cache;
+    let skip_full_optimize = cfg.skip_full_optimize;
+    log::info!("building {:?} session", mode);
     log::info!("forward graph:\n{}", forward_graph);
 
-    if cfg.mode == Mode::Training
-        && let Some(path) = cfg.cache
-    {
-        match cache::load_plan(forward_graph, path) {
+    // Flash-attention variants and their dispatch geometry are selected while
+    // compiling the plan. Probe the context that will actually execute it so
+    // the default build path does not silently compile scalar kernels, and so
+    // applications with multiple adapters do not inherit a process-global
+    // first-device capability snapshot.
+    let gpu = match cfg.gpu {
+        Some(gpu) => gpu,
+        None => {
+            Arc::new(runtime::init_gpu_context().expect("failed to initialize blade GPU context"))
+        }
+    };
+    let mut coop_caps = runtime::auto_tune(&gpu, 0).coop_caps;
+    if std::env::var("MEGANEURA_DISABLE_COOP").is_ok() {
+        coop_caps = crate::codegen::CoopCaps::default();
+    }
+    let mode_tag = match mode {
+        Mode::Training => 0,
+        Mode::Inference => 1,
+    };
+    let build_hash = cache::hash_build_config(&options, mode_tag, skip_full_optimize, coop_caps);
+
+    if let Some(path) = cache_path {
+        match cache::load_build_plan(forward_graph, build_hash, path) {
             Ok(Some(plan)) => {
                 log::info!("loaded cached execution plan from {}", path.display());
-                let session = make_session(plan, cfg.gpu);
+                let session = make_session(plan, gpu);
                 return (session, OptimizeReport::empty());
             }
             Ok(None) => log::info!("no valid cache found, recompiling"),
@@ -300,7 +323,7 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, Optimiz
         optimized_forward.nodes().len()
     );
 
-    let (final_graph, report) = match cfg.mode {
+    let (final_graph, report) = match mode {
         Mode::Inference => {
             let mut g = optimized_forward;
             let mut fusions = Vec::new();
@@ -327,7 +350,7 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, Optimiz
                 "full graph (forward + backward): {} nodes",
                 full.nodes().len()
             );
-            if cfg.skip_full_optimize {
+            if skip_full_optimize {
                 (full, forward_report)
             } else {
                 let _span = tracing::info_span!("optimize_full").entered();
@@ -338,7 +361,7 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, Optimiz
 
     let plan = {
         let _span = tracing::info_span!("compile").entered();
-        compile::compile_with(&final_graph, &cfg.options)
+        compile::compile_with_caps(&final_graph, &options, coop_caps)
     };
     log::info!(
         "execution plan: {} buffers, {} dispatches",
@@ -346,10 +369,8 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, Optimiz
         plan.dispatches.len()
     );
 
-    if cfg.mode == Mode::Training
-        && let Some(path) = cfg.cache
-    {
-        if let Err(e) = cache::save_plan(&plan, forward_graph, path) {
+    if let Some(path) = cache_path {
+        if let Err(e) = cache::save_build_plan(&plan, forward_graph, build_hash, path) {
             log::warn!("failed to save cache: {}", e);
         } else {
             log::info!("saved execution plan cache to {}", path.display());
@@ -358,19 +379,13 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, Optimiz
 
     let session = {
         let _span = tracing::info_span!("gpu_init").entered();
-        make_session(plan, cfg.gpu)
+        make_session(plan, gpu)
     };
     (session, report)
 }
 
-fn make_session(
-    plan: compile::ExecutionPlan,
-    gpu: Option<Arc<blade_graphics::Context>>,
-) -> Session {
-    match gpu {
-        Some(ctx) => Session::with_context(plan, ctx),
-        None => Session::new(plan),
-    }
+fn make_session(plan: compile::ExecutionPlan, gpu: Arc<blade_graphics::Context>) -> Session {
+    Session::with_context(plan, gpu)
 }
 
 /// Sugar for `build(g, SessionConfig::default()).0` — the common

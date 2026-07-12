@@ -278,7 +278,7 @@ fn multi_loss_with_independent_coefs() {
         "w_pol",
         &(0..12).map(|i| (i as f32) * 0.1 - 0.5).collect::<Vec<_>>(),
     );
-    session.set_parameter("w_val", &vec![0.2, -0.1, 0.3]);
+    session.set_parameter("w_val", &[0.2, -0.1, 0.3]);
     let set_inputs = |s: &mut meganeura::Session| {
         s.set_input("x", &x_data);
         s.set_input("labels", &labels_data);

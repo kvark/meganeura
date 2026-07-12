@@ -2,13 +2,15 @@ use std::fmt;
 
 pub type NodeId = u32;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum DType {
     F32,
     F16,
     U32,
-    /// Q4_1: asymmetric 4-bit quantization, 32-element blocks.
+    /// Asymmetric 4-bit quantization (Q4_1-style), 32-element blocks.
     /// Each block: 1 f16 scale + 1 f16 min (4 bytes) + 16 packed nibble bytes = 20 bytes.
+    /// The `Q4_0` variant name is retained for API compatibility; unlike the
+    /// GGML Q4_0 format, this representation stores a per-block minimum.
     Q4_0,
     /// Q8_0: symmetric 8-bit quantization, 32-element blocks.
     /// Each block: 1 f16 scale (padded to u32) + 32 int8 values (8 u32s) = 36 bytes.
@@ -26,7 +28,7 @@ impl DType {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TensorType {
     pub shape: Vec<usize>,
     pub dtype: DType,
@@ -78,7 +80,7 @@ impl fmt::Display for TensorType {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Op {
     // Leaf nodes
     Parameter {
@@ -112,7 +114,7 @@ pub enum Op {
     // Reduction
     SumAll,
     MeanAll,
-    /// Column-wise sum: [M, N] → [N]  (sum over rows)
+    /// Column-wise sum: `[M, N]` → `[N]` (sum over rows)
     SumRows,
     /// Row-wise sum over the inner axis: [M, N] → [M, 1]  (sum over cols).
     /// Lowers to a schedule-template `ReductionKernel` (per-row reduction),
@@ -211,7 +213,7 @@ pub enum Op {
         head_dim: u32,
     },
     /// Backward gradient op for RoPE: applies inverse (transpose) rotation.
-    /// inputs: [grad_output]
+    /// Inputs: `[grad_output]`.
     RoPEGrad {
         theta: f32,
         pos_offset: u32,
@@ -408,7 +410,7 @@ pub enum Op {
         padding_w: u32,
     },
 
-    /// 2D max pooling: input[N,C,H,W] → output[N,C,oH,oW]
+    /// 2D max pooling: `input[N,C,H,W]` → `output[N,C,oH,oW]`
     MaxPool2d {
         channels: u32,
         in_h: u32,
@@ -419,13 +421,14 @@ pub enum Op {
         padding: u32,
     },
 
-    /// Global average pooling: input[N*C*H*W] → output[N*C]
+    /// Global average pooling: `input[N*C*H*W]` → `output[N*C]`
     /// Averages over the spatial dimensions (H,W) for each channel.
     GlobalAvgPool {
         channels: u32,
         spatial: u32, // H * W
     },
-    /// Backward of GlobalAvgPool: broadcast grad_output[batch*channels] → [batch*channels*spatial]
+    /// Backward of GlobalAvgPool: broadcast `grad_output[batch*channels]` →
+    /// `[batch*channels*spatial]`
     /// then divide by spatial.
     GlobalAvgPoolGrad {
         channels: u32,
@@ -444,7 +447,7 @@ pub enum Op {
     },
 
     /// Winograd F(2,3) convolution for 3×3 stride-1 kernels.
-    /// inputs: [input, winograd_weight] where winograd_weight is [16*Co*Ci].
+    /// Inputs: `[input, winograd_weight]` where `winograd_weight` is `[16*Co*Ci]`.
     /// Compiler emits 3 dispatches: input transform, batched matmul, output transform.
     WinogradConv2d {
         in_channels: u32,
@@ -551,7 +554,7 @@ pub enum Op {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Node {
     pub id: NodeId,
     pub op: Op,
@@ -573,7 +576,7 @@ pub enum ParamTransform {
 
 /// A derived parameter is created by the optimizer when fusing ops
 /// that require concatenating multiple weights (e.g. gate+up projections).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct DerivedParam {
     /// Name of the new parameter (e.g. "gate_proj.weight+up_proj.weight")
     pub name: String,
@@ -788,8 +791,11 @@ impl Graph {
         )
     }
 
-    /// Create a parameter stored as Q4_0 on GPU (~4.5 bits/element).
-    /// Weights are quantized from f32 to 4-bit symmetric blocks during upload.
+    /// Create a parameter stored in Meganeura's asymmetric Q4 format
+    /// (~5 bits/element, Q4_1-style scale + minimum metadata).
+    ///
+    /// The underlying [`DType::Q4_0`] name is historical; this is not the
+    /// symmetric GGML Q4_0 wire format.
     pub fn parameter_q4(&mut self, name: &str, shape: &[usize]) -> NodeId {
         let ty = TensorType::new(shape.to_vec(), DType::Q4_0);
         self.add_node(

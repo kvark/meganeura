@@ -11,25 +11,21 @@
 use meganeura::compile::{ShaderEntry, compile_with};
 use meganeura::{CompileOptions, Graph, Mode, NodeId, Session, SessionConfig};
 
-fn run(
-    build: &dyn Fn(
-        &mut Graph,
-    ) -> (
-        NodeId,
-        Vec<(&'static str, Vec<f32>)>,
-        Vec<(&'static str, Vec<u32>)>,
-    ),
-    n_out: usize,
-    fuse: bool,
-) -> Vec<f32> {
+type F32Inputs = Vec<(&'static str, Vec<f32>)>;
+type U32Inputs = Vec<(&'static str, Vec<u32>)>;
+type BuildResult = (NodeId, F32Inputs, U32Inputs);
+
+fn run(build: &dyn Fn(&mut Graph) -> BuildResult, n_out: usize, fuse: bool) -> Vec<f32> {
     let mut g = Graph::new();
     let (out, f_inputs, u_inputs) = build(&mut g);
     g.set_outputs(vec![out]);
 
-    let mut opts = CompileOptions::default();
     // Isolate the reduction-fusion pass; keep pointwise fusion on both
     // sides so only the reduction folding differs.
-    opts.use_schedule_reduction = fuse;
+    let opts = CompileOptions {
+        use_schedule_reduction: fuse,
+        ..CompileOptions::default()
+    };
     let mut session: Session = meganeura::build(
         &g,
         SessionConfig {
@@ -50,16 +46,7 @@ fn run(
     session.read_output(n_out)
 }
 
-fn assert_parity(
-    build: impl Fn(
-        &mut Graph,
-    ) -> (
-        NodeId,
-        Vec<(&'static str, Vec<f32>)>,
-        Vec<(&'static str, Vec<u32>)>,
-    ),
-    n_out: usize,
-) {
+fn assert_parity(build: impl Fn(&mut Graph) -> BuildResult, n_out: usize) {
     let unfused = run(&build, n_out, false);
     let fused = run(&build, n_out, true);
     assert_eq!(unfused.len(), fused.len());
@@ -141,8 +128,10 @@ fn two_gather_reduction_actually_fuses() {
     let y = g.sum_inner(prod);
     g.set_outputs(vec![y]);
 
-    let mut opts = CompileOptions::default();
-    opts.use_schedule_reduction = true;
+    let opts = CompileOptions {
+        use_schedule_reduction: true,
+        ..CompileOptions::default()
+    };
     let plan = compile_with(&g, &opts);
 
     let reductions: Vec<_> = plan

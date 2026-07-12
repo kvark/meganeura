@@ -99,7 +99,7 @@ pub fn epilogue_to_wgsl(epilogue: &[crate::compile::EpilogueOp]) -> (String, Str
     (decls.join("\n"), body.join("\n                "))
 }
 
-/// Generate WGSL for a [`MatMulEpilogue`] — the PointwiseDAG-based
+/// Generate WGSL for a [`crate::compile::MatMulEpilogue`] — the PointwiseDAG-based
 /// replacement for `epilogue_to_wgsl`. Returns (declarations, body).
 ///
 /// The DAG's `LoadInput(0)` maps to `val` (the matmul accumulator).
@@ -134,7 +134,7 @@ pub fn matmul_epilogue_to_wgsl(epi: &crate::compile::MatMulEpilogue) -> (String,
     (decls.join("\n"), full_body)
 }
 
-/// Generate WGSL for a [`MatMulPrologue`] — the multiplicative factors
+/// Generate WGSL for a [`crate::compile::MatMulPrologue`] — the multiplicative factors
 /// applied during A-tile staging in the coop matmul.
 ///
 /// Returns `(declarations, transform_expression)` where:
@@ -171,7 +171,7 @@ pub fn generate_matmul_with_epilogue(
     generate_matmul_with_epilogue_wgsl(group, &epi_decl, &epi_body)
 }
 
-/// Same as above but from a [`MatMulEpilogue`] (PointwiseDAG-based).
+/// Same as above but from a [`crate::compile::MatMulEpilogue`] (PointwiseDAG-based).
 pub fn generate_matmul_with_dag_epilogue(
     group: ShaderGroup,
     epilogue: &crate::compile::MatMulEpilogue,
@@ -286,13 +286,13 @@ pub enum ShaderGroup {
     MatMulSmallAdd,
     MatMulSmallAT,
     MatMulSmallBT,
-    /// M=1 matmul (GEMV): C[1,N] = A[1,K] × B[K,N]. One thread per
+    /// M=1 matmul (GEMV): `C[1,N] = A[1,K] × B[K,N]`. One thread per
     /// output column; dispatched for batch-1 decode on transformers.
     MatMulGemv,
-    /// M=1 matmul with fused residual add: C[1,N] = A×B + D[1,N].
+    /// M=1 matmul with fused residual add: `C[1,N] = A×B + D[1,N]`.
     /// Same shape as MatMulGemv plus one extra storage input.
     MatMulGemvAdd,
-    /// M=1 MatMulBT (B stored [N,K]): C[1,N] = A × Bᵀ. K-split with
+    /// M=1 MatMulBT (`B` stored `[N,K]`): `C[1,N] = A × Bᵀ`. K-split with
     /// coalesced contiguous-K vec4 loads.
     MatMulGemvBT,
     MatMulCoop,
@@ -756,7 +756,7 @@ fn matmul_vars_full(
     parse_wgsl(&src)
 }
 
-/// Q4_0 dequantization helper function for WGSL shaders.
+/// Meganeura asymmetric Q4 (Q4_1-style) dequantization helper for WGSL.
 /// Buffer layout: [scales as packed f16 pairs (u32)][packed nibble data (u32)].
 /// Column-wise blocking: blocks of 32 elements along the K dimension per column.
 const Q4_DEQUANT_FN: &str = "
@@ -1164,7 +1164,7 @@ fn gen_matmul_coop_wgsl(
     gen_matmul_coop_wgsl_prologue(fused_add, variant, config, None)
 }
 
-/// Generate coop matmul with an optional [`MatMulPrologue`].
+/// Generate coop matmul with an optional [`crate::compile::MatMulPrologue`].
 pub fn gen_matmul_coop_with_prologue(
     fused_add: bool,
     variant: MatMulCoopVariant,
@@ -1608,9 +1608,9 @@ fn gen_matmul_coop_wgsl_prologue(
 pub enum MatMulCoopVariant {
     /// C = A @ B  (standard)
     Normal,
-    /// C = A @ B^T  (B is [N,K], accessed transposed)
+    /// `C = A @ B^T` (`B` is `[N,K]`, accessed transposed)
     BT,
-    /// C = A^T @ B  (A is [K,M], accessed transposed)
+    /// `C = A^T @ B` (`A` is `[K,M]`, accessed transposed)
     AT,
 }
 
@@ -1819,7 +1819,7 @@ pub fn generate_attention_module(head_dim: u32) -> ShaderModule {
 /// pick between scalar and coop kernel variants. Set once by
 /// `runtime::install_auto_tune` from the Blade probe; defaults to
 /// all-zero (no coop available → scalar everywhere).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CoopCaps {
     pub f16_tile: u32,
     pub f32_tile: u32,
@@ -1833,7 +1833,33 @@ impl CoopCaps {
     /// can run (NVIDIA, RDNA3, Xe-HPG). False on Apple's 8x8 f32 path
     /// or any GPU without KHR_cooperative_matrix at the right tile size.
     pub fn supports_16x16_f16(&self) -> bool {
-        self.f16_tile >= 16
+        self.f16_tile == 16
+    }
+}
+
+#[cfg(test)]
+mod coop_caps_tests {
+    use super::CoopCaps;
+
+    #[test]
+    fn flash_16x16_requires_exact_tile_size() {
+        assert!(
+            CoopCaps {
+                f16_tile: 16,
+                f32_tile: 0,
+            }
+            .supports_16x16_f16()
+        );
+        for tile in [0, 8, 32] {
+            assert!(
+                !CoopCaps {
+                    f16_tile: tile,
+                    f32_tile: 0,
+                }
+                .supports_16x16_f16(),
+                "hard-coded 16x16 shaders must reject tile {tile}",
+            );
+        }
     }
 }
 
@@ -2420,14 +2446,14 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
 /// Cooperative-matrix flash backward dQ kernel.
 ///
 /// Three matmuls per KV tile, all coop_mat:
-///   1. score = Q @ K^T          (BQxBKV from Q[BQ,hd], K^T[hd,BKV])
-///   2. dp    = dO @ V^T         (BQxBKV from dO[BQ,hd], V^T[hd,BKV])
-///   3. dQ   += ds @ K * scale   (BQxhd_chunk from ds[BQ,BKV], K[BKV,hd_chunk]),
+///   1. `score = Q @ K^T` (`BQxBKV` from `Q[BQ,hd]`, `K^T[hd,BKV]`)
+///   2. `dp = dO @ V^T` (`BQxBKV` from `dO[BQ,hd]`, `V^T[hd,BKV]`)
+///   3. `dQ += ds @ K * scale` (`BQxhd_chunk` from `ds[BQ,BKV]`, `K[BKV,hd_chunk]`),
 ///      one MMA per hd_chunk → 4 separate `coop_mat<f32,C>` accumulators
 ///      that live across the entire KV loop.
 ///
-/// Per-row row_sum is precomputed once at the top (sum_d dO[i,d]·O[i,d]).
-/// ds = p · (dp − row_sum) where p = exp(score·scale − lse[row]) is
+/// Per-row `row_sum` is precomputed once at the top (`sum_d dO[i,d]·O[i,d]`).
+/// `ds = p · (dp − row_sum)` where `p = exp(score·scale − lse[row])` is
 /// computed elementwise in scalar code (1 thread per (row,col) of the
 /// 16×16 ds tile = 64 threads · 4 elements/thread).
 ///
@@ -2755,13 +2781,13 @@ pub fn generate_flash_grad_q_coop_module(head_dim: u32) -> ShaderModule {
 ///
 /// Workgroup processes one head and 16 KV positions, iterating through
 /// all queries in tiles of 16. Per Q-tile:
-///   1. row_sum[q] = sum_d(dO[q,d]·O[q,d]) precomputed (16 threads).
-///   2. score = K @ Q^T  via coop_mat → shared_score[BKV, BQ]
-///   3. dp    = V @ dO^T via coop_mat → shared_dp   [BKV, BQ]
-///   4. p[kv,q]  = exp(score·scale − lse[q]),
-///      ds[kv,q] = p · (dp − row_sum[q])             scalar elementwise
-///   5. dV[kv,d] += sum_q(p[kv,q]  · dO[q,d])         scalar per-thread
-///   6. dK[kv,d] += sum_q(ds[kv,q] · Q[q,d]) · scale  scalar per-thread
+///   1. `row_sum[q] = sum_d(dO[q,d]·O[q,d])` precomputed (16 threads).
+///   2. `score = K @ Q^T` via `coop_mat` → `shared_score[BKV, BQ]`
+///   3. `dp = V @ dO^T` via `coop_mat` → `shared_dp[BKV, BQ]`
+///   4. `p[kv,q] = exp(score·scale − lse[q])`,
+///      `ds[kv,q] = p · (dp − row_sum[q])` scalar elementwise
+///   5. `dV[kv,d] += sum_q(p[kv,q] · dO[q,d])` scalar per-thread
+///   6. `dK[kv,d] += sum_q(ds[kv,q] · Q[q,d]) · scale` scalar per-thread
 ///
 /// dV and dK accumulate in per-thread registers (chunk_hd=16 each)
 /// across the entire query loop — same design as the forward and
@@ -4789,6 +4815,19 @@ mod tests {
                 ShaderGroup::GlobalAvgPoolGrad,
                 naga::valid::Capabilities::empty(),
             ),
+            (
+                ShaderGroup::GradClipZero,
+                naga::valid::Capabilities::empty(),
+            ),
+            (
+                ShaderGroup::GradClipNormSq,
+                naga::valid::Capabilities::empty(),
+            ),
+            (
+                ShaderGroup::GradClipScale,
+                naga::valid::Capabilities::empty(),
+            ),
+            (ShaderGroup::GradAccum, naga::valid::Capabilities::empty()),
         ];
 
         let flags = naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
@@ -4876,6 +4915,13 @@ mod tests {
         let _ = generate_flash_attention_module(256);
     }
 
+    #[test]
+    fn grad_clip_norm_avoids_device_scope_storage_atomics() {
+        let module = generate_module(ShaderGroup::GradClipNormSq);
+        assert!(!module.source.contains("array<atomic"));
+        assert!(!module.source.contains("atomicLoad"));
+    }
+
     /// Verify every shader group compiles to SPIR-V without panics.
     /// This catches "Expression [N] is not cached!" bugs in hand-built IR.
     /// Skipped on Apple targets where naga's spv-out backend is not available.
@@ -4913,6 +4959,17 @@ mod tests {
             (ShaderGroup::RoPE, empty),
             (ShaderGroup::RoPEGrad, empty),
             (ShaderGroup::LayerNorm, empty),
+            (ShaderGroup::MultiHeadAttn, empty),
+            (ShaderGroup::FlashAttention, empty),
+            (ShaderGroup::FlashAttentionCoop, coop),
+            (ShaderGroup::MultiHeadAttnGradQ, empty),
+            (ShaderGroup::FlashGradQ, empty),
+            (ShaderGroup::FlashGradQCoop, coop),
+            (ShaderGroup::MultiHeadAttnGradK, empty),
+            (ShaderGroup::MultiHeadAttnGradKV, empty),
+            (ShaderGroup::FlashGradKV, empty),
+            (ShaderGroup::FlashGradKVCoop, coop),
+            (ShaderGroup::MultiHeadAttnGradV, empty),
             (ShaderGroup::SwiGLUGrad, empty),
             (ShaderGroup::SwiGLUConcat, empty),
             (ShaderGroup::SumRows, empty),
@@ -4922,6 +4979,10 @@ mod tests {
             (ShaderGroup::BceLoss, empty),
             (ShaderGroup::FusedRmsNormMatMul, empty),
             (ShaderGroup::GlobalAvgPoolGrad, empty),
+            (ShaderGroup::GradClipZero, empty),
+            (ShaderGroup::GradClipNormSq, empty),
+            (ShaderGroup::GradClipScale, empty),
+            (ShaderGroup::GradAccum, empty),
         ];
 
         let flags = naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
@@ -5291,8 +5352,8 @@ mod tests {
             (7, 7, 2, Conv2dCoopDirection::Forward),
         ];
 
-        for (kh, kw, stride, direction) in &cases {
-            let sm = generate_conv2d_coop_module(*kh, *kw, *stride, *direction, &config);
+        for &(kh, kw, stride, direction) in &cases {
+            let sm = generate_conv2d_coop_module(kh, kw, stride, direction, &config);
             let mut validator = Validator::new(flags, coop_caps);
             let result = validator.validate(&sm.module);
             assert!(

@@ -1,7 +1,7 @@
 //! Safetensors model weight loading.
 //!
 //! Loads named tensors from `.safetensors` files (local or downloaded from
-//! the HuggingFace Hub) into f32 data that can be uploaded to a [`Session`].
+//! the HuggingFace Hub) into f32 data that can be uploaded to a [`crate::Session`].
 //!
 //! # Example
 //!

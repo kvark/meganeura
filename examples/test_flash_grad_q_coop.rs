@@ -58,19 +58,11 @@ fn main() {
         // forward and backward errors.
         unsafe {
             std::env::set_var("MEGANEURA_FLASH_FWD_COOP", "0");
-            std::env::remove_var("MEGANEURA_FLASH_BWD_COOP");
+            std::env::set_var("MEGANEURA_FLASH_BWD_COOP", "0");
         }
         eprintln!("  scalar:");
         let scalar = build_and_run(seq, heads, hd, causal);
 
-        let gpu = meganeura::runtime::init_gpu_context().expect("gpu");
-        let result = meganeura::runtime::auto_tune(&gpu, hd);
-        eprintln!(
-            "  coop_matrix_available={}",
-            result.coop_caps.is_supported()
-        );
-        meganeura::runtime::install_auto_tune(result);
-        drop(gpu);
         unsafe {
             std::env::set_var("MEGANEURA_FLASH_BWD_COOP", "1");
         }

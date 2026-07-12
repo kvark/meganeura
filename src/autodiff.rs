@@ -1151,7 +1151,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
     graph
 }
 
-/// Helper to implement sum_rows: reduce [M,N] → [N] by summing rows
+/// Helper to implement sum_rows: reduce `[M, N]` → `[N]` by summing rows.
 impl Graph {
     pub fn sum_rows(&mut self, x: NodeId, target_ty: &TensorType) -> NodeId {
         let ty = target_ty.clone();

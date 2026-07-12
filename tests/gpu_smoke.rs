@@ -3143,13 +3143,13 @@ fn conv2d_1x1_batch_replicated_input_is_uniform() {
 
     // Deterministic kernel weights so every conv output is nonzero.
     let kernel_data: Vec<f32> = (0..(out_ch * in_ch))
-        .map(|i| ((i as f32 * 0.0173).sin()))
+        .map(|i| (i as f32 * 0.0173).sin())
         .collect();
     session.set_parameter("w", &kernel_data);
 
     // Replicate identical [in_ch, H, W] across all batches.
     let single: Vec<f32> = (0..(in_ch * h * w))
-        .map(|i| (((i as f32) * 0.0237).cos()))
+        .map(|i| ((i as f32) * 0.0237).cos())
         .collect();
     let mut input_data = Vec::with_capacity(in_size);
     for _ in 0..batch {
@@ -3223,10 +3223,10 @@ fn add_per_channel_smoke() {
 
     let out = session.read_output(total);
     for n in 0..batch as usize {
-        for c in 0..channels as usize {
+        for (c, &bias) in bias_data.iter().enumerate() {
             for s in 0..spatial as usize {
                 let i = (n * channels as usize + c) * spatial as usize + s;
-                let expected = src_data[i] + bias_data[c];
+                let expected = src_data[i] + bias;
                 assert!(
                     (out[i] - expected).abs() < 1e-4,
                     "n={} c={} s={}: got {}, expected {}",

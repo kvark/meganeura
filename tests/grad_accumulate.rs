@@ -85,10 +85,9 @@ fn zero_grad_clears_accumulator() {
     let g = build();
     let mut s = build_session(&g);
     s.set_parameter("w", &W_INIT);
-    s.set_grad_accumulate(1.max(1)); // enable accumulator buffers
     s.set_grad_accumulate(2);
 
-    let mut step_once = |s: &mut meganeura::Session| -> [f32; 6] {
+    let step_once = |s: &mut meganeura::Session| -> [f32; 6] {
         s.set_parameter("w", &W_INIT);
         s.zero_grad();
         s.clear_optimizer();
