@@ -4,7 +4,7 @@
 [![Docs](https://docs.rs/meganeura/badge.svg)](https://docs.rs/meganeura)
 [![Crates.io](https://img.shields.io/crates/v/meganeura.svg?label=meganeura)](https://crates.io/crates/meganeura)
 
-**Neural network training and inference in Rust, on portable GPU APIs.** Vulkan and Metal — Linux, Windows, macOS, iOS, Android. No CUDA, no Python in the loop, routinely faster than PyTorch on AMD and Apple GPUs.
+**Neural network training and inference in Rust, on any GPU.** Vulkan and Metal — Linux, Windows, macOS, iOS, Android. No CUDA, no Python in the loop, routinely faster than PyTorch on AMD and Apple GPUs.
 
 [![logo](https://github.com/kvark/meganeura/raw/main/etc/logo.png)](/kvark/meganeura/blob/main/etc/logo.png)
 
