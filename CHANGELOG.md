@@ -85,21 +85,6 @@
   keeping user-visible buffers host-visible. Avoids routing
   intermediate traffic through the host-visible (ReBAR) heap on
   discrete GPUs.
-- Repeated-region outlining: graphs over the egglog saturation cutoff
-  (300 nodes — every real training graph) no longer skip the e-graph.
-  Structurally repeated blocks (transformer layers, forward and
-  backward) are detected by signature periodicity + edge-isomorphism
-  verification, and equality saturation runs on one instance per
-  region. `OptimizeReport` gains `outlined_regions`.
-- Traffic-aware extraction cost: when shapes are known, an e-node's
-  cost is the HBM bytes it moves (inputs read + output written), so a
-  fusion wins by exactly the intermediate traffic it eliminates — no
-  hand-tuned constants. `MEGANEURA_NO_TRAFFIC_COST=1` reverts to the
-  constant per-constructor scheme.
-- On graphs under the cutoff, the extractor's term choices now gate
-  which fusion appliers run (previously extraction results were only
-  logged); egglog saturation deepened from 1 to 3 iterations so
-  chained rewrites (Silu → SwiGLU) reach fixpoint inside the e-graph.
 - Lifetime-based buffer aliasing: step-local intermediates with
   disjoint live ranges (at barrier-group granularity) now share one
   physical GPU allocation. Parameters, inputs, outputs, gradients,
