@@ -4,7 +4,7 @@
 [![Docs](https://docs.rs/meganeura/badge.svg)](https://docs.rs/meganeura)
 [![Crates.io](https://img.shields.io/crates/v/meganeura.svg?label=meganeura)](https://crates.io/crates/meganeura)
 
-**Neural network training and inference in Rust, on any GPU.** Vulkan, Metal, DX12 — Linux, Windows, macOS, iOS, Android. No CUDA, no Python in the loop, routinely faster than PyTorch on AMD and Apple GPUs.
+**Neural network training and inference in Rust, on portable GPU APIs.** Vulkan and Metal — Linux, Windows, macOS, iOS, Android. No CUDA, no Python in the loop, routinely faster than PyTorch on AMD and Apple GPUs.
 
 [![logo](https://github.com/kvark/meganeura/raw/main/etc/logo.png)](/kvark/meganeura/blob/main/etc/logo.png)
 
@@ -55,7 +55,7 @@ Meganeura also runs on GPUs PyTorch doesn’t target, including Radeon 780M and 
 
 The wedge isn’t every workload: on ResNet-50 and Whisper-tiny, Meganeura currently trails. Full cross-framework tables — including the losses — at [inferena.tech](https://inferena.tech). Reproduce locally with `./run.sh -m <Model>`.
 
-**Portable.** GPU access via [blade-graphics](https://github.com/kvark/blade/tree/main/blade-graphics) — one backend, five platforms. Works on anything with Vulkan (including Mesa’s [Lavapipe](https://www.phoronix.com/news/Lavapipe-CPU-Vulkan-Windows) for headless CI), Metal on Apple silicon, and DX12 on Windows. No CUDA, no ROCm, no vendor lock-in at any layer of the stack.
+**Portable.** GPU access via [blade-graphics](https://github.com/kvark/blade/tree/main/blade-graphics) — Vulkan on Linux, Windows, and Android, and Metal on Apple platforms. Vulkan includes Mesa’s [Lavapipe](https://www.phoronix.com/news/Lavapipe-CPU-Vulkan-Windows) for headless CI. No CUDA, no ROCm, no vendor lock-in at any layer of the stack.
 
 **Lean.** A handful of [kernel archetypes](https://github.com/kvark/meganeura/blob/main/docs/kernel-archetypes.md) — pointwise, reduction, matmul, attention — compose into specialized GPU shaders at compile time. An e-graph equality-saturation pass discovers fusions (e.g. `x * sigmoid(x)` → Silu, `Silu(gate) * up` → SwiGLU) with a cost-model-driven extractor, rather than relying on hand-written fused kernels for every pattern. The codebase is small enough to read end to end.
 
@@ -63,7 +63,7 @@ The wedge isn’t every workload: on ResNet-50 and Whisper-tiny, Meganeura curre
 
 |                                                 |GPU backends                        |Training      |Approach                                |
 |-------------------------------------------------|------------------------------------|--------------|----------------------------------------|
-|**Meganeura**                                    |blade-graphics (Vulkan, Metal, DX12)|yes           |graph IR + e-graph fusion + Naga codegen|
+|**Meganeura**                                    |blade-graphics (Vulkan, Metal)      |yes           |graph IR + e-graph fusion + Naga codegen|
 |[Candle](https://github.com/huggingface/candle)  |CUDA, Metal, CPU                    |limited       |eager tensors, hand-written kernels     |
 |[Burn](https://github.com/tracel-ai/burn)        |CUDA, wgpu, NDArray, LibTorch       |yes           |modular multi-backend                   |
 |[tch-rs](https://github.com/LaurentMazare/tch-rs)|CUDA, CPU (via libtorch)            |yes           |PyTorch FFI bindings                    |
@@ -92,6 +92,26 @@ Meganeura runs best where cooperative matrix operations are hardware-accelerated
 - **Metal** — simdgroup matrix (Apple M1+).
 
 Falls back to scalar matmul on older hardware. Headless Lavapipe works for CI.
+
+When several adapters are present, select one with its backend-reported numeric
+device ID (on Vulkan this is normally the PCI device ID, not an adapter ordinal):
+
+```sh
+MEGANEURA_DEVICE_ID=0x744c cargo run --release --example mnist
+```
+
+Decimal IDs are accepted too. `MEGANEURA_DISABLE_COOP=1` forces the portable
+scalar path for regression diagnosis; `MEGANEURA_FLASH_FWD_COOP=0` and
+`MEGANEURA_FLASH_BWD_COOP=0` disable only cooperative flash attention.
+Device-local intermediate storage and lifetime aliasing are default-on, with
+`MEGANEURA_NO_DEVICE_LOCAL=1` and `MEGANEURA_NO_ALIAS=1` as diagnostic escape
+hatches.
+
+Hosted CI executes Linux Vulkan (Lavapipe) and macOS Metal tests and compile-checks
+Windows. Generated Vulkan shaders, including the f16 cooperative-matrix path used
+on supported NVIDIA and AMD adapters, are also validated and translated to SPIR-V
+offline. Real AMD and NVIDIA hardware testing remains part of release
+qualification because software drivers cannot reproduce vendor-driver behavior.
 
 ## Profiling
 
