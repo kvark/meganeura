@@ -25,8 +25,12 @@ fn run(use_f16: bool) -> (f32, Vec<f32>) {
     g.set_outputs(vec![loss]);
 
     let mut s = build_session(&g);
-    let w_init: Vec<f32> = (0..vocab * hidden).map(|i| (i as f32 % 7.0 - 3.0) * 0.3).collect();
-    let x_data: Vec<f32> = (0..seq * hidden).map(|i| (i as f32 % 5.0 - 2.0) * 0.4).collect();
+    let w_init: Vec<f32> = (0..vocab * hidden)
+        .map(|i| (i as f32 % 7.0 - 3.0) * 0.3)
+        .collect();
+    let x_data: Vec<f32> = (0..seq * hidden)
+        .map(|i| (i as f32 % 5.0 - 2.0) * 0.4)
+        .collect();
     let idx_data: Vec<u32> = (0..seq).map(|i| (i * 2 % vocab) as u32).collect();
     s.set_parameter("w", &w_init);
     s.set_input_u32("idx", &idx_data);

@@ -25,7 +25,15 @@ fn bench_matmul(n: usize, warmup: usize, iters: usize) -> (f64, &'static str) {
         .dispatches
         .iter()
         .find(|d| matches!(d.shader, meganeura::compile::ShaderEntry::MatMul))
-        .map(|d| if d.use_coop { "coop" } else if d.use_small_tiles { "small" } else { "tile" })
+        .map(|d| {
+            if d.use_coop {
+                "coop"
+            } else if d.use_small_tiles {
+                "small"
+            } else {
+                "tile"
+            }
+        })
         .unwrap_or("?");
 
     s.set_input("a", &vec![0.01_f32; n * n]);
@@ -73,7 +81,10 @@ fn main() {
         let w = g.parameter("w", &[4, 4]);
         let y = g.matmul(x, w);
         g.set_outputs(vec![y]);
-        build_inference_session(&g).device_information().device_name.clone()
+        build_inference_session(&g)
+            .device_information()
+            .device_name
+            .clone()
     };
     println!("device: {device_name}\n");
 
@@ -83,7 +94,10 @@ fn main() {
         let iters = if n >= 2048 { 30 } else { 100 };
         let (per_call, kernel) = bench_matmul(n, 10, iters);
         let gflops = 2.0 * (n as f64).powi(3) / per_call / 1e9;
-        println!("{n:>6} {:>10.3} {gflops:>9.0} {kernel:>7}", per_call * 1000.0);
+        println!(
+            "{n:>6} {:>10.3} {gflops:>9.0} {kernel:>7}",
+            per_call * 1000.0
+        );
     }
 
     println!("\n== memory: elementwise add (12 bytes/elem) ==");
@@ -91,6 +105,10 @@ fn main() {
     for &n in &[1usize << 22, 1 << 24, 1 << 26] {
         let per_call = bench_bandwidth(n, 10, 100);
         let gbs = 12.0 * n as f64 / per_call / 1e9;
-        println!("{:>10} {:>10.3} {gbs:>9.0}", n / (1 << 20), per_call * 1000.0);
+        println!(
+            "{:>10} {:>10.3} {gbs:>9.0}",
+            n / (1 << 20),
+            per_call * 1000.0
+        );
     }
 }

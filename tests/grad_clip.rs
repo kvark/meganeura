@@ -4,7 +4,6 @@
 /// gradient is large enough to push the parameter past the target
 /// in one update; with `set_grad_clip_norm(small)` the update should
 /// become much smaller.
-
 use meganeura::{Graph, build_session};
 
 fn build_linreg(batch: usize, in_d: usize, out_d: usize) -> Graph {
@@ -53,7 +52,11 @@ fn grad_clip_reduces_param_change() {
     let p_clipped = run_one_step(Some(0.01)); // tight clip
 
     let l1 = |after: &[f32]| -> f32 {
-        after.iter().zip(init.iter()).map(|(a, b)| (a - b).abs()).sum()
+        after
+            .iter()
+            .zip(init.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum()
     };
 
     let unclipped_change = l1(&p_unclipped);

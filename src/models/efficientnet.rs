@@ -134,11 +134,10 @@ pub fn fused_mbconv(
             &format!("{name}.block.0.0.weight"),
             &[(out_c * in_c * kernel * kernel) as usize],
         );
-        let h = g.conv2d_hw(x, w, batch, in_c, s.h, s.w, out_c, kernel, kernel, stride, padding, padding);
-        let bn = g.parameter(
-            &format!("{name}.block.0.bn.fused_bias"),
-            &[out_c as usize],
+        let h = g.conv2d_hw(
+            x, w, batch, in_c, s.h, s.w, out_c, kernel, kernel, stride, padding, padding,
         );
+        let bn = g.parameter(&format!("{name}.block.0.bn.fused_bias"), &[out_c as usize]);
         let h = g.add_per_channel(h, bn, out_c, s1.area());
         g.silu(h)
     } else {
@@ -148,7 +147,9 @@ pub fn fused_mbconv(
             &format!("{name}.block.0.0.weight"),
             &[(expanded_c * in_c * kernel * kernel) as usize],
         );
-        let h = g.conv2d_hw(x, w_e, batch, in_c, s.h, s.w, expanded_c, kernel, kernel, stride, padding, padding);
+        let h = g.conv2d_hw(
+            x, w_e, batch, in_c, s.h, s.w, expanded_c, kernel, kernel, stride, padding, padding,
+        );
         let bn_e = g.parameter(
             &format!("{name}.block.0.bn.fused_bias"),
             &[expanded_c as usize],
@@ -161,10 +162,7 @@ pub fn fused_mbconv(
             &[(out_c * expanded_c) as usize],
         );
         let h = g.conv2d(h, w_p, batch, expanded_c, s1.h, s1.w, out_c, 1, 1, 1, 0);
-        let bn_p = g.parameter(
-            &format!("{name}.block.1.bn.fused_bias"),
-            &[out_c as usize],
-        );
+        let bn_p = g.parameter(&format!("{name}.block.1.bn.fused_bias"), &[out_c as usize]);
         g.add_per_channel(h, bn_p, out_c, s1.area())
     };
 
@@ -247,10 +245,7 @@ pub fn mbconv(
         &format!("{name}.block.2.fc2.weight"),
         &[expanded_c as usize, sq as usize],
     );
-    let fc2_b = g.parameter(
-        &format!("{name}.block.2.fc2.bias"),
-        &[expanded_c as usize],
-    );
+    let fc2_b = g.parameter(&format!("{name}.block.2.fc2.bias"), &[expanded_c as usize]);
     let g_ate = g.matmul_bt(z, fc2_w);
     let g_ate = g.bias_add(g_ate, fc2_b);
     let g_ate = g.sigmoid(g_ate);
@@ -262,11 +257,10 @@ pub fn mbconv(
         &format!("{name}.block.3.0.weight"),
         &[(out_c * expanded_c) as usize],
     );
-    let h = g.conv2d(h, proj_w, batch, expanded_c, s_dw.h, s_dw.w, out_c, 1, 1, 1, 0);
-    let bn_p = g.parameter(
-        &format!("{name}.block.3.bn.fused_bias"),
-        &[out_c as usize],
+    let h = g.conv2d(
+        h, proj_w, batch, expanded_c, s_dw.h, s_dw.w, out_c, 1, 1, 1, 0,
     );
+    let bn_p = g.parameter(&format!("{name}.block.3.bn.fused_bias"), &[out_c as usize]);
     let h = g.add_per_channel(h, bn_p, out_c, s_dw.area());
 
     if stride == 1 && in_c == out_c {

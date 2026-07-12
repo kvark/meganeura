@@ -8,7 +8,7 @@
 //! input rework, the loader declares N named streams and the trainer
 //! binds them by name.
 
-use meganeura::{build_session, data::InputStream, nn, DataLoader, Graph, TrainConfig, Trainer};
+use meganeura::{DataLoader, Graph, TrainConfig, Trainer, build_session, data::InputStream, nn};
 
 fn build_xy_plus_bias_regressor(batch: usize, in_d: usize, out_d: usize) -> Graph {
     let mut g = Graph::new();
@@ -69,4 +69,3 @@ fn trainer_drives_three_named_streams() {
     );
     assert!(last.is_finite(), "loss must stay finite; got {last}");
 }
-
