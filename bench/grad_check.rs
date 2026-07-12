@@ -85,13 +85,13 @@ fn main() {
             // from the first component's shape.
             if name.contains('+') {
                 let first = name.split('+').next().unwrap();
-                if let Some(first_shape) = param_shapes.get(first) {
-                    if first_shape.len() == 2 {
-                        let in_dim = first_shape[0];
-                        let out_dim = n / in_dim;
-                        param_shapes.insert(name.clone(), vec![in_dim, out_dim]);
-                        continue;
-                    }
+                if let Some(first_shape) = param_shapes.get(first)
+                    && first_shape.len() == 2
+                {
+                    let in_dim = first_shape[0];
+                    let out_dim = n / in_dim;
+                    param_shapes.insert(name.clone(), vec![in_dim, out_dim]);
+                    continue;
                 }
             }
             param_shapes.insert(name.clone(), vec![n]);

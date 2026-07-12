@@ -238,7 +238,7 @@ fn dispatch_histogram(plan: &ExecutionPlan) -> Vec<(String, usize)> {
         *counts.entry(shader_name(&d.shader)).or_default() += 1;
     }
     let mut v: Vec<_> = counts.into_iter().collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     v
 }
 

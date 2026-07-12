@@ -52,23 +52,11 @@ fn main() {
         eprintln!("\n=== {label} ===");
 
         // Scalar baseline.
-        unsafe {
-            std::env::remove_var("MEGANEURA_FLASH_FWD_COOP");
-        }
+        unsafe { std::env::set_var("MEGANEURA_FLASH_FWD_COOP", "0") };
         let scalar = build_and_run("scalar", seq, heads, hd, causal);
 
         // Coop path.
-        let gpu = meganeura::runtime::init_gpu_context().expect("gpu");
-        let result = meganeura::runtime::auto_tune(&gpu, hd);
-        eprintln!(
-            "  coop_matrix_available={}",
-            result.coop_caps.is_supported()
-        );
-        meganeura::runtime::install_auto_tune(result);
-        drop(gpu);
-        unsafe {
-            std::env::set_var("MEGANEURA_FLASH_FWD_COOP", "1");
-        }
+        unsafe { std::env::set_var("MEGANEURA_FLASH_FWD_COOP", "1") };
         let coop = build_and_run("coop  ", seq, heads, hd, causal);
 
         assert_eq!(scalar.len(), coop.len(), "{label}: length mismatch");

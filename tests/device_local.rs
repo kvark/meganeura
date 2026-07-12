@@ -29,10 +29,10 @@ fn run(bs: usize) -> (f32, Vec<f32>) {
     let g = model(bs);
     let mut s = build_session(&g);
     s.set_parameter("fc1.weight", &vec![0.05; 8 * 16]);
-    s.set_parameter("fc1.bias", &vec![0.1; 16]);
-    s.set_parameter("norm.weight", &vec![1.0; 16]);
+    s.set_parameter("fc1.bias", &[0.1; 16]);
+    s.set_parameter("norm.weight", &[1.0; 16]);
     s.set_parameter("fc2.weight", &vec![0.1; 16 * 4]);
-    s.set_parameter("fc2.bias", &vec![0.0; 4]);
+    s.set_parameter("fc2.bias", &[0.0; 4]);
     let x: Vec<f32> = (0..bs * 8).map(|i| 0.1 * (i % 7) as f32).collect();
     s.set_input("x", &x);
     s.set_input("target", &vec![0.5; bs * 4]);

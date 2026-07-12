@@ -32,7 +32,7 @@ impl WeightFormat {
 ///
 /// Wire these to env vars or CLI flags in your own harness if you want —
 /// the library itself takes only this typed struct.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CompileOptions {
     /// Route unary + binary pointwise ops through the schedule-template
     /// codegen path (with chain fusion) instead of the hand-written
@@ -70,7 +70,7 @@ pub enum ShaderEntry {
     /// M=1 GEMV with fused residual add: `C = A × B + D`.
     /// Selected for FusedMatMulAdd when M=1.
     MatMulGemvAdd,
-    /// M=1 MatMulBT specialization (B stored [N,K]). K-split with
+    /// M=1 MatMulBT specialization (`B` stored `[N,K]`). K-split with
     /// naturally coalesced vec4 reads along the contiguous K axis.
     MatMulGemvBT,
     FusedMatMulAdd,
@@ -191,14 +191,13 @@ pub enum ShaderEntry {
     WinogradWeightTransform,
     /// Zero a 1-element scalar accumulator buffer (gradient-clip pre-pass).
     GradClipZero,
-    /// Sum-of-squares of a gradient buffer, atomically added (via f32 CAS
-    /// loop on a u32 accumulator) to a shared 1-element scalar buffer.
-    /// One workgroup of 256 threads per dispatch; tree-reduces in shared
-    /// memory before the atomic. Pair with `GradClipZero` (pre-pass)
-    /// and `GradClipScale` (post-pass).
+    /// Sum-of-squares of a gradient buffer, added to a shared 1-element
+    /// scalar buffer. One workgroup of 256 threads per dispatch tree-reduces
+    /// in shared memory; the runtime barriers parameter dispatches. Pair with
+    /// `GradClipZero` (pre-pass) and `GradClipScale` (post-pass).
     GradClipNormSq,
     /// In-place scale a gradient buffer by `min(1, max_norm / norm)`,
-    /// where `norm = sqrt(bitcast<f32>(acc[0]))` from the accumulator
+    /// where `norm = sqrt(acc[0])` from the accumulator
     /// produced by `GradClipNormSq`.
     GradClipScale,
     /// Temporal gradient accumulation: `acc[i] += grad[i] * scale`. Adds
@@ -512,7 +511,7 @@ pub struct Dispatch {
     pub epilogue: Vec<EpilogueOp>,
     #[serde(default)]
     pub epilogue_buffers: Vec<BufferRef>,
-    /// Human-readable label for profiling (e.g. "MatMul[50,720,960]").
+    /// Human-readable label for profiling (e.g. `"MatMul[50,720,960]"`).
     #[serde(default)]
     pub label: String,
     /// When `Some`, this dispatch uses a schedule-template-generated
@@ -629,7 +628,25 @@ pub fn compile(graph: &Graph) -> ExecutionPlan {
 }
 
 pub fn compile_with(graph: &Graph, options: &CompileOptions) -> ExecutionPlan {
-    let mut compiler = Compiler::new_with_options(graph, options.clone());
+    compile_with_caps(graph, options, crate::codegen::coop_caps())
+}
+
+/// Compile for a concrete cooperative-matrix capability set.
+///
+/// `build()` uses this path after probing the context it will attach to the
+/// session. Keeping the target explicit avoids a process-global "first GPU
+/// wins" decision when an application owns multiple adapters. The public
+/// [`compile_with`] entry point retains the installed global capabilities for
+/// callers that intentionally compile a plan before constructing a session.
+pub(crate) fn compile_with_caps(
+    graph: &Graph,
+    options: &CompileOptions,
+    mut coop_caps: crate::codegen::CoopCaps,
+) -> ExecutionPlan {
+    if std::env::var("MEGANEURA_DISABLE_COOP").is_ok() {
+        coop_caps = crate::codegen::CoopCaps::default();
+    }
+    let mut compiler = Compiler::new_with_options(graph, options.clone(), coop_caps);
     compiler.compile();
 
     // Propagate derived parameter info from graph to plan
@@ -1401,6 +1418,10 @@ struct Compiler<'a> {
     /// Map from NodeId → BufferRef for each node's output.
     node_buffers: HashMap<NodeId, BufferRef>,
     options: CompileOptions,
+    /// Capabilities of the GPU this plan is being compiled for. Flash
+    /// attention selection is plan-time (unlike ordinary matmul selection),
+    /// so this must be the eventual session's target rather than global state.
+    coop_caps: crate::codegen::CoopCaps,
     /// Fused GradKV: maps fwd_node → pre-allocated dV buffer.
     /// When GradK is compiled, it emits a fused GradKV dispatch and
     /// pre-allocates the dV buffer here. When GradV is later compiled
@@ -1409,7 +1430,11 @@ struct Compiler<'a> {
 }
 
 impl<'a> Compiler<'a> {
-    fn new_with_options(graph: &'a Graph, options: CompileOptions) -> Self {
+    fn new_with_options(
+        graph: &'a Graph,
+        options: CompileOptions,
+        coop_caps: crate::codegen::CoopCaps,
+    ) -> Self {
         Self {
             graph,
             plan: ExecutionPlan {
@@ -1427,6 +1452,7 @@ impl<'a> Compiler<'a> {
             },
             node_buffers: HashMap::new(),
             options,
+            coop_caps,
             fused_grad_kv_dv: HashMap::new(),
         }
     }
@@ -1439,7 +1465,12 @@ impl<'a> Compiler<'a> {
 
     /// Choose between FlashAttention (BQ>1) and MultiHeadAttn (BQ=1) for
     /// a forward attention dispatch. Returns (shader_entry, workgroups_x).
-    fn attention_dispatch(q_seq: u32, head_dim: u32, num_heads: u32) -> (ShaderEntry, [u32; 3]) {
+    fn attention_dispatch(
+        &self,
+        q_seq: u32,
+        head_dim: u32,
+        num_heads: u32,
+    ) -> (ShaderEntry, [u32; 3]) {
         // Pick the coop-matrix flash forward when the GPU has the
         // 16x16 f16 cooperative_matrix path (NVIDIA, RDNA3, Xe-HPG)
         // and the shape is compatible. ~3.2x faster per dispatch than
@@ -1448,7 +1479,7 @@ impl<'a> Compiler<'a> {
         // escape hatch).
         let coop_disabled = std::env::var("MEGANEURA_FLASH_FWD_COOP").as_deref() == Ok("0");
         if !coop_disabled
-            && crate::codegen::coop_caps().supports_16x16_f16()
+            && self.coop_caps.supports_16x16_f16()
             && head_dim >= 16
             && head_dim.is_multiple_of(16)
             && q_seq >= 16
@@ -2346,7 +2377,7 @@ impl<'a> Compiler<'a> {
                 let v = self.get_buffer(node.inputs[2]);
                 let seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let lse_buf = self.find_lse_buffer(node.id);
-                let (shader, workgroups) = Self::attention_dispatch(seq, head_dim, num_heads);
+                let (shader, workgroups) = self.attention_dispatch(seq, head_dim, num_heads);
                 self.plan.dispatches.push(Dispatch {
                     shader,
                     workgroups,
@@ -2373,7 +2404,7 @@ impl<'a> Compiler<'a> {
                 let v = self.get_buffer(node.inputs[2]);
                 let seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let lse_buf = self.find_lse_buffer(node.id);
-                let (shader, workgroups) = Self::attention_dispatch(seq, head_dim, num_heads);
+                let (shader, workgroups) = self.attention_dispatch(seq, head_dim, num_heads);
                 self.plan.dispatches.push(Dispatch {
                     shader,
                     workgroups,
@@ -3119,7 +3150,7 @@ impl<'a> Compiler<'a> {
                 let v = self.get_buffer(node.inputs[2]);
                 let seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let lse_buf = self.find_lse_buffer(node.id);
-                let (shader, workgroups) = Self::attention_dispatch(seq, head_dim, num_heads);
+                let (shader, workgroups) = self.attention_dispatch(seq, head_dim, num_heads);
                 self.plan.dispatches.push(Dispatch {
                     shader,
                     workgroups,
@@ -3145,7 +3176,7 @@ impl<'a> Compiler<'a> {
                 let q_seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let kv_seq = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
                 let lse_buf = self.find_lse_buffer(node.id);
-                let (shader, workgroups) = Self::attention_dispatch(q_seq, head_dim, num_heads);
+                let (shader, workgroups) = self.attention_dispatch(q_seq, head_dim, num_heads);
                 self.plan.dispatches.push(Dispatch {
                     shader,
                     workgroups,
@@ -3171,7 +3202,7 @@ impl<'a> Compiler<'a> {
                 let q_seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let kv_seq = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
                 let lse_buf = self.find_lse_buffer(node.id);
-                let (shader, workgroups) = Self::attention_dispatch(q_seq, head_dim, num_heads);
+                let (shader, workgroups) = self.attention_dispatch(q_seq, head_dim, num_heads);
                 self.plan.dispatches.push(Dispatch {
                     shader,
                     workgroups,
@@ -3222,7 +3253,7 @@ impl<'a> Compiler<'a> {
                 let bwd_coop_disabled =
                     std::env::var("MEGANEURA_FLASH_BWD_COOP").as_deref() == Ok("0");
                 let bwd_coop_enabled = !bwd_coop_disabled
-                    && crate::codegen::coop_caps().supports_16x16_f16()
+                    && self.coop_caps.supports_16x16_f16()
                     && head_dim >= 16
                     && head_dim.is_multiple_of(16)
                     && q_seq >= 16;
@@ -3311,7 +3342,7 @@ impl<'a> Compiler<'a> {
                     std::env::var("MEGANEURA_FLASH_BWD_COOP").as_deref() == Ok("0");
                 let bwd_coop_enabled = !bwd_coop_disabled
                     && grad_kv_shader == ShaderEntry::FlashAttention
-                    && crate::codegen::coop_caps().supports_16x16_f16()
+                    && self.coop_caps.supports_16x16_f16()
                     && head_dim >= 16
                     && head_dim.is_multiple_of(16)
                     && dispatch_kv >= 16;
@@ -4153,13 +4184,19 @@ mod tests {
         // Both dispatch and codegen call `crate::codegen::flash_ept_cap()`
         // so they must agree on EPT/TPQ/BQ. If they ever diverge, the
         // workgroup count won't match the shader's tile size.
+        let graph = Graph::new();
+        let compiler = Compiler::new_with_options(
+            &graph,
+            CompileOptions::default(),
+            crate::codegen::CoopCaps::default(),
+        );
         for hd_log2 in 1..=8 {
             let hd: u32 = 1 << hd_log2;
             let codegen_ept = hd.min(crate::codegen::flash_ept_cap());
             let codegen_tpq = hd / codegen_ept;
             let codegen_bq: u32 = (256 / codegen_tpq).max(1);
 
-            let (fwd_entry, fwd_wg) = Compiler::attention_dispatch(256, hd, 1);
+            let (fwd_entry, fwd_wg) = compiler.attention_dispatch(256, hd, 1);
             let (bwd_entry, bwd_wg) = Compiler::attention_dispatch_bwd(256, hd, 1);
             assert_eq!(fwd_entry, bwd_entry, "hd={hd}: fwd/bwd entry mismatch");
             assert_eq!(fwd_wg, bwd_wg, "hd={hd}: fwd/bwd workgroups mismatch");
@@ -4168,5 +4205,46 @@ mod tests {
                 assert_eq!(fwd_wg[0], 256u32.div_ceil(codegen_bq));
             }
         }
+    }
+
+    /// A 16×16 f16-only capability set is what several NVIDIA Vulkan
+    /// drivers expose (and is also used by RDNA3). Keep this plan-time path
+    /// covered even when CI has no matching physical adapter.
+    #[test]
+    fn f16_only_target_selects_coop_attention_forward_and_backward() {
+        let mut g = Graph::new();
+        let q = g.parameter("q", &[256, 64]);
+        let k = g.parameter("k", &[256, 64]);
+        let v = g.parameter("v", &[256, 64]);
+        let attention = g.causal_attention(q, k, v, 1, 1, 64);
+        let loss = g.sum_all(attention);
+        g.set_outputs(vec![loss]);
+        let differentiated = crate::autodiff::differentiate(&g);
+
+        let f16_only = crate::codegen::CoopCaps {
+            f16_tile: 16,
+            f32_tile: 0,
+        };
+        let coop = compile_with_caps(&differentiated, &CompileOptions::default(), f16_only);
+        let coop_entries: Vec<_> = coop
+            .dispatches
+            .iter()
+            .map(|dispatch| dispatch.shader.clone())
+            .collect();
+        assert!(coop_entries.contains(&ShaderEntry::FlashAttentionCoop));
+        assert!(coop_entries.contains(&ShaderEntry::FlashGradQCoop));
+        assert!(coop_entries.contains(&ShaderEntry::FlashGradKVCoop));
+
+        let scalar = compile_with_caps(
+            &differentiated,
+            &CompileOptions::default(),
+            crate::codegen::CoopCaps::default(),
+        );
+        assert!(scalar.dispatches.iter().all(|dispatch| !matches!(
+            &dispatch.shader,
+            ShaderEntry::FlashAttentionCoop
+                | ShaderEntry::FlashGradQCoop
+                | ShaderEntry::FlashGradKVCoop
+        )));
     }
 }

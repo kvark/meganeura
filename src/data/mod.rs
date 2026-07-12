@@ -112,6 +112,17 @@ impl DataLoader {
     /// graph-input names.
     pub fn with_streams(streams: Vec<InputStream>, batch_size: usize) -> Self {
         assert!(!streams.is_empty(), "DataLoader needs at least one stream");
+        assert!(
+            batch_size > 0,
+            "DataLoader batch_size must be greater than zero"
+        );
+        for stream in &streams {
+            assert!(
+                stream.sample_size > 0,
+                "stream '{}' sample_size must be greater than zero",
+                stream.name,
+            );
+        }
         let n0 = streams[0].data.len() / streams[0].sample_size;
         assert_eq!(
             streams[0].data.len(),
@@ -340,5 +351,17 @@ mod tests {
         let data = vec![0.0; 6]; // 2 samples
         let labels = vec![0.0; 2];
         DataLoader::new(data, labels, 3, 1, 5); // batch_size > n
+    }
+
+    #[test]
+    #[should_panic(expected = "batch_size must be greater than zero")]
+    fn test_dataloader_zero_batch_rejected() {
+        DataLoader::with_streams(vec![InputStream::new("x", vec![1.0], 1)], 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "sample_size must be greater than zero")]
+    fn test_dataloader_zero_sample_size_rejected() {
+        DataLoader::with_streams(vec![InputStream::new("x", Vec::new(), 0)], 1);
     }
 }

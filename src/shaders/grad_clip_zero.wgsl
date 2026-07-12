@@ -2,12 +2,11 @@
 // gradient-norm-squared accumulator for grad clipping.
 // Run once per step() before any GradClipNormSq dispatches.
 //
-// `acc[0]` holds f32 sum-of-squares stored as u32 bits; writing 0u is
-// equivalent to writing 0.0f (positive-zero).
+// `acc[0]` holds the f32 sum-of-squares.
 
-var<storage, read_write> acc: array<u32>;
+var<storage, read_write> acc: array<f32>;
 
 @compute @workgroup_size(1)
 fn main() {
-    acc[0] = 0u;
+    acc[0] = 0.0;
 }

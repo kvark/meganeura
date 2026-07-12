@@ -1,10 +1,13 @@
-// Sum-of-squares of a single gradient buffer, atomically added to a
-// shared 1-element accumulator. The accumulator stores f32 bits in a
-// u32 atomic; we accumulate via compareExchangeWeak in a CAS loop.
+// Sum-of-squares of a single gradient buffer, added to a shared
+// 1-element f32 accumulator.
 //
 // Dispatched once per gradient buffer (one workgroup of 256 threads).
 // Strided per-thread accumulation followed by tree reduction in
-// shared memory; the workgroup root performs the atomic add.
+// shared memory. The runtime inserts a compute memory barrier between
+// dispatches, so the workgroup root can perform an ordinary read/add/write.
+// Avoiding a device-scope storage atomic also keeps the shader valid on
+// Vulkan cooperative-matrix contexts where Blade currently enables
+// `vulkanMemoryModel` without `vulkanMemoryModelDeviceScope`.
 //
 // Pair with `grad_clip_zero` (pre-pass, once per step) and
 // `grad_clip_scale` (post-pass, one dispatch per gradient buffer).
@@ -17,7 +20,7 @@ struct Params {
 }
 
 var<storage> grad: array<f32>;
-var<storage, read_write> acc: array<atomic<u32>>;
+var<storage, read_write> acc: array<f32>;
 var<uniform> params: Params;
 
 var<workgroup> wg_data: array<f32, 256>;
@@ -49,16 +52,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     if tid == 0u {
         let delta = wg_data[0];
         if delta != 0.0 {
-            // f32-via-u32 atomicAdd: load current value, compute new
-            // value, CAS. Loop until we win the race.
-            loop {
-                let old_u = atomicLoad(&acc[0]);
-                let old_f = bitcast<f32>(old_u);
-                let new_f = old_f + delta;
-                let new_u = bitcast<u32>(new_f);
-                let r = atomicCompareExchangeWeak(&acc[0], old_u, new_u);
-                if r.exchanged { break; }
-            }
+            acc[0] = acc[0] + delta;
         }
     }
 }

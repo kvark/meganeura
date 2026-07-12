@@ -2,8 +2,6 @@
 // reading `acc` (the global gradient-norm-squared accumulator filled
 // by `grad_clip_norm_sq`).
 //
-// `bitcast<f32>(u32)` recovers the f32 sum-of-squares.
-
 struct Params {
     len: u32,
     max_norm: f32,
@@ -12,7 +10,7 @@ struct Params {
 }
 
 var<storage, read_write> grad: array<f32>;
-var<storage> acc: array<u32>;
+var<storage> acc: array<f32>;
 var<uniform> params: Params;
 
 @compute @workgroup_size(256)
@@ -20,7 +18,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if i >= params.len { return; }
 
-    let norm_sq = bitcast<f32>(acc[0]);
+    let norm_sq = acc[0];
     // norm_sq could be negative due to f32 rounding edge cases or
     // partial NaN if a prior backward overflowed; guard with max(0).
     let norm = sqrt(max(norm_sq, 0.0));

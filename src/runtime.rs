@@ -244,8 +244,8 @@ struct GradClipZeroData {
     acc: blade_graphics::BufferPiece,
 }
 
-// Grad-clip mid-pass: sum-of-squares of `grad` accumulated to `acc`
-// (treated as f32-via-u32 atomic via CAS loop in the shader).
+// Grad-clip mid-pass: sum-of-squares of `grad` accumulated to `acc`.
+// Parameter dispatches are separated by explicit compute barriers.
 #[derive(blade_macros::ShaderData)]
 struct GradClipNormSqData {
     grad: blade_graphics::BufferPiece,
@@ -723,6 +723,11 @@ struct Pipelines {
     /// Pipelines for non-f32 weight formats (f16, Q4, Q8).
     weight_map:
         HashMap<(ShaderEntry, crate::compile::WeightFormat), blade_graphics::ComputePipeline>,
+    /// Attention kernels specialize their workgroup layout and generated WGSL
+    /// for `head_dim`. Keying only by `ShaderEntry` made a graph containing
+    /// different attention widths run every dispatch through whichever width
+    /// happened to be encountered last.
+    attention_map: HashMap<(ShaderEntry, u32), blade_graphics::ComputePipeline>,
     /// Epilogue-fused pipelines keyed by (shader, epilogue chain).
     epilogue_map:
         HashMap<(ShaderEntry, Vec<crate::compile::EpilogueOp>), blade_graphics::ComputePipeline>,
@@ -751,8 +756,7 @@ impl Pipelines {
         let mut needed_weighted: HashMap<crate::compile::WeightFormat, HashSet<ShaderGroup>> =
             HashMap::new();
         let mut entries_for_group: HashMap<ShaderGroup, HashSet<ShaderEntry>> = HashMap::new();
-        // Extract head_dim from attention dispatches for parameterized shader generation.
-        let mut attention_head_dim: Option<u32> = None;
+        let mut attention_entries: HashSet<(ShaderEntry, u32)> = HashSet::new();
 
         for dispatch in &plan.dispatches {
             let group = dispatch.shader.shader_group();
@@ -781,7 +785,7 @@ impl Pipelines {
                     | ShaderGroup::FlashGradKVCoop
             ) && dispatch.params.len() >= 4
             {
-                attention_head_dim = Some(dispatch.params[3]);
+                attention_entries.insert((dispatch.shader.clone(), dispatch.params[3]));
             }
             if dispatch.use_small_tiles {
                 let small_group = match group {
@@ -919,43 +923,43 @@ impl Pipelines {
                     | ShaderGroup::FlashGradKV
                     | ShaderGroup::FlashGradKVCoop
             ) {
-                // Use parameterized attention generators with actual head_dim.
-                let hd = attention_head_dim.unwrap_or(64);
-                let sm = match group {
-                    ShaderGroup::FlashAttention => {
-                        crate::codegen::generate_flash_attention_module(hd)
-                    }
-                    ShaderGroup::FlashAttentionCoop => {
-                        crate::codegen::generate_flash_attention_coop_module(hd)
-                    }
-                    ShaderGroup::FlashGradQ => crate::codegen::generate_flash_grad_q_module(hd),
-                    ShaderGroup::FlashGradQCoop => {
-                        crate::codegen::generate_flash_grad_q_coop_module(hd)
-                    }
-                    ShaderGroup::FlashGradKV => crate::codegen::generate_flash_grad_kv_module(hd),
-                    ShaderGroup::FlashGradKVCoop => {
-                        crate::codegen::generate_flash_grad_kv_coop_module(hd)
-                    }
-                    _ => crate::codegen::generate_attention_module(hd),
-                };
-                let shader = gpu.create_shader(bg::ShaderDesc {
-                    source: &sm.source,
-                    naga_module: Some(sm.module),
-                });
-                if let Some(entries) = entries_for_group.get(&group) {
-                    for entry in entries {
-                        let layout = shader_data_layout(entry);
-                        let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                            name: entry.entry_point(),
-                            data_layouts: &[&layout],
-                            compute: shader.at(entry.entry_point()),
-                        });
-                        map.insert(entry.clone(), pipeline);
-                    }
-                }
+                // Compiled below per (entry, head_dim), not once per group.
+                continue;
             } else {
                 compile_group(group, &mut map);
             }
+        }
+
+        let mut attention_map = HashMap::new();
+        for (entry, hd) in attention_entries {
+            let group = entry.shader_group();
+            let sm = match group {
+                ShaderGroup::FlashAttention => crate::codegen::generate_flash_attention_module(hd),
+                ShaderGroup::FlashAttentionCoop => {
+                    crate::codegen::generate_flash_attention_coop_module(hd)
+                }
+                ShaderGroup::FlashGradQ => crate::codegen::generate_flash_grad_q_module(hd),
+                ShaderGroup::FlashGradQCoop => {
+                    crate::codegen::generate_flash_grad_q_coop_module(hd)
+                }
+                ShaderGroup::FlashGradKV => crate::codegen::generate_flash_grad_kv_module(hd),
+                ShaderGroup::FlashGradKVCoop => {
+                    crate::codegen::generate_flash_grad_kv_coop_module(hd)
+                }
+                ShaderGroup::MultiHeadAttn => crate::codegen::generate_attention_module(hd),
+                _ => unreachable!("non-parameterized attention group {group:?}"),
+            };
+            let shader = gpu.create_shader(bg::ShaderDesc {
+                source: &sm.source,
+                naga_module: Some(sm.module),
+            });
+            let layout = shader_data_layout(&entry);
+            let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
+                name: entry.entry_point(),
+                data_layouts: &[&layout],
+                compute: shader.at(entry.entry_point()),
+            });
+            attention_map.insert((entry, hd), pipeline);
         }
         // Collect generated conv2d coop entries that need individual compilation.
         let mut conv2d_gen_entries: Vec<ShaderEntry> = Vec::new();
@@ -1156,6 +1160,7 @@ impl Pipelines {
             coop_map,
             small_map,
             weight_map,
+            attention_map,
             epilogue_map,
             pointwise_map,
             reduction_map,
@@ -1170,6 +1175,12 @@ impl Pipelines {
         }
         if let Some(ref dag) = dispatch.pointwise {
             if let Some(p) = self.pointwise_map.get(&dag.hash_key()) {
+                return p;
+            }
+        }
+        if dispatch.params.len() >= 4 {
+            let key = (dispatch.shader.clone(), dispatch.params[3]);
+            if let Some(p) = self.attention_map.get(&key) {
                 return p;
             }
         }
@@ -1208,6 +1219,9 @@ impl Pipelines {
         }
         for (entry, pipeline) in &self.small_map {
             result.push((entry.entry_point(), pipeline));
+        }
+        for (key, pipeline) in &self.attention_map {
+            result.push((key.0.entry_point(), pipeline));
         }
         #[allow(clippy::pattern_type_mismatch)]
         for ((entry, _), pipeline) in &self.weight_map {
@@ -1642,8 +1656,9 @@ impl std::fmt::Display for ExternalBindError {
 impl std::error::Error for ExternalBindError {}
 
 impl Session {
-    /// Select the best cooperative matrix config from GPU capabilities.
-    /// Prefers f16 (more throughput) when available, falls back to f32.
+    /// Select the safest cooperative matrix config from GPU capabilities.
+    /// Prefers native f32 for training correctness. The faster f16-input path
+    /// remains opt-in because rounding compounds across deep training graphs.
     fn select_coop_config(
         caps: &blade_graphics::CooperativeMatrix,
     ) -> Option<crate::codegen::CoopConfig> {
@@ -1841,28 +1856,7 @@ impl Session {
     /// Use [`Session::with_context`] to share a context with an existing
     /// Blade-based renderer.
     pub fn new(plan: ExecutionPlan) -> Self {
-        // Safety: we only create one GPU context per session, and the
-        // context is used exclusively through this Session.
-        let gpu = unsafe {
-            blade_graphics::Context::init(blade_graphics::ContextDesc {
-                validation: cfg!(debug_assertions),
-                // Opt-in: GPU pass timestamps feed dump_gpu_timings() only.
-                // Blade's timing collection reads the query pool without
-                // waiting when a command buffer is re-begun; on slow GPUs
-                // (multi-second steps) the previous submission may still
-                // be in flight and get_query_pool_results panics with
-                // NOT_READY. Off by default — set MEGANEURA_GPU_TIMING=1
-                // when profiling.
-                timing: std::env::var("MEGANEURA_GPU_TIMING").is_ok(),
-                capture: false,
-                overlay: false,
-                device_id: std::env::var("MEGANEURA_DEVICE_ID")
-                    .ok()
-                    .and_then(|s| s.parse().ok()),
-                ..Default::default()
-            })
-        }
-        .expect("failed to initialize blade GPU context");
+        let gpu = init_gpu_context().expect("failed to initialize blade GPU context");
 
         Self::with_context(plan, Arc::new(gpu))
     }
@@ -2511,21 +2505,55 @@ impl Session {
 ///
 /// # Safety
 /// Wraps `blade_graphics::Context::init`, which is `unsafe` because it
-/// loads the system Vulkan driver. The default `validation:false`
-/// matches Session's release-mode init.
+/// loads the system graphics driver.
 pub fn init_gpu_context() -> Result<blade_graphics::Context, blade_graphics::NotSupportedError> {
-    let dev_id = std::env::var("MEGANEURA_DEVICE_ID")
-        .ok()
-        .and_then(|s| s.parse().ok());
+    let dev_id = std::env::var("MEGANEURA_DEVICE_ID").ok().and_then(|value| {
+        let parsed = parse_device_id(&value);
+        if parsed.is_none() {
+            log::warn!(
+                "ignoring invalid MEGANEURA_DEVICE_ID={value:?}; expected decimal or 0x-prefixed u32"
+            );
+        }
+        parsed
+    });
     unsafe {
         blade_graphics::Context::init(blade_graphics::ContextDesc {
             validation: cfg!(debug_assertions),
-            timing: false,
+            // Opt-in: GPU pass timestamps feed dump_gpu_timings() only.
+            // Blade's timing collection reads the query pool without waiting
+            // when a command buffer is re-begun; on slow GPUs the previous
+            // submission may still be in flight. Keep this off by default.
+            timing: std::env::var("MEGANEURA_GPU_TIMING").is_ok(),
             capture: false,
             overlay: false,
             device_id: dev_id,
             ..Default::default()
         })
+    }
+}
+
+fn parse_device_id(value: &str) -> Option<u32> {
+    let value = value.trim();
+    value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .map_or_else(
+            || value.parse().ok(),
+            |hex| u32::from_str_radix(hex, 16).ok(),
+        )
+}
+
+#[cfg(test)]
+mod device_id_tests {
+    use super::parse_device_id;
+
+    #[test]
+    fn parses_decimal_and_hex_device_ids() {
+        assert_eq!(parse_device_id("29772"), Some(0x744c));
+        assert_eq!(parse_device_id("0x744c"), Some(0x744c));
+        assert_eq!(parse_device_id("  0X744C  "), Some(0x744c));
+        assert_eq!(parse_device_id("not-a-device"), None);
+        assert_eq!(parse_device_id("0x"), None);
     }
 }
 
@@ -2830,6 +2858,10 @@ pub fn install_auto_tune(result: AutoTuneResult) {
 impl Session {
     /// Upload parameter data to GPU buffers.
     pub fn set_parameter(&mut self, name: &str, data: &[f32]) {
+        // Host writes target the same host-coherent allocation read by GPU
+        // dispatches. Finish the previous submission before overwriting it;
+        // callers should not need a hidden `wait()` correctness precondition.
+        self.wait();
         // Check regular parameters first
         for &(ref param_name, buf_ref) in &self.plan.param_buffers {
             if param_name == name {
@@ -2999,6 +3031,7 @@ impl Session {
 
     /// Upload input data.
     pub fn set_input(&mut self, name: &str, data: &[f32]) {
+        self.wait();
         for &(ref input_name, buf_ref) in &self.plan.input_buffers {
             if input_name == name {
                 self.upload_buffer(buf_ref, bytemuck::cast_slice(data));
@@ -3071,6 +3104,7 @@ impl Session {
 
     /// Upload u32 input data (e.g. token IDs for embedding lookup).
     pub fn set_input_u32(&mut self, name: &str, data: &[u32]) {
+        self.wait();
         for &(ref input_name, buf_ref) in &self.plan.input_buffers {
             if input_name == name {
                 self.upload_buffer(buf_ref, bytemuck::cast_slice(data));
@@ -3356,7 +3390,8 @@ impl Session {
     /// Write the Adam first-moment buffer for a parameter. `data.len()`
     /// must equal the parameter's element count. See
     /// [`Session::read_adam_m`] for the carry-over use case.
-    pub fn write_adam_m(&self, name: &str, data: &[f32]) {
+    pub fn write_adam_m(&mut self, name: &str, data: &[f32]) {
+        self.wait();
         let idx = self
             .adam_state_index(name)
             .unwrap_or_else(|| panic!("no Adam state for param: {name}"));
@@ -3376,7 +3411,8 @@ impl Session {
 
     /// Write the Adam second-moment buffer for a parameter. See
     /// [`Session::write_adam_m`].
-    pub fn write_adam_v(&self, name: &str, data: &[f32]) {
+    pub fn write_adam_v(&mut self, name: &str, data: &[f32]) {
+        self.wait();
         let idx = self
             .adam_state_index(name)
             .unwrap_or_else(|| panic!("no Adam state for param: {name}"));
@@ -3490,7 +3526,8 @@ impl Session {
     }
 
     /// Upload data into a parameter buffer by name (for initializing KV caches etc.).
-    pub fn upload_param(&self, name: &str, data: &[f32]) {
+    pub fn upload_param(&mut self, name: &str, data: &[f32]) {
+        self.wait();
         let buf_ref = self
             .param_buffer(name)
             .unwrap_or_else(|| panic!("unknown param: {}", name));
@@ -3644,9 +3681,9 @@ impl Session {
         if do_clip_now {
             // GPU-side gradient clipping in three passes (all in the
             // same submission as forward+backward and the optimizer):
-            //   1. GradClipZero — atomic-store 0 into the accumulator
-            //   2. GradClipNormSq — for each grad, atomic-add its
-            //      sum-of-squares to the accumulator
+            //   1. GradClipZero — store 0 into the accumulator
+            //   2. GradClipNormSq — for each grad, add its sum-of-squares
+            //      to the accumulator, with barriers between dispatches
             //   3. GradClipScale — for each grad, multiply in place by
             //      min(1, max_norm / sqrt(acc))
             // Barriers between passes keep the dispatches ordered.
@@ -3671,30 +3708,34 @@ impl Session {
                 let mut pass = self.encoder.compute("grad_clip_norm_sq");
                 for (idx, &(param_buf, grad_buf)) in self.plan.param_grad_pairs.iter().enumerate() {
                     let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
-                    let mut pc = pass.with(pipeline);
-                    pc.bind(
-                        0,
-                        &GradClipNormSqData {
-                            grad: Self::grad_source(
-                                &self.buffers,
-                                &self.grad_accum_bufs,
-                                accumulating,
-                                idx,
-                                grad_buf,
-                            ),
-                            acc: acc_buf.at(0),
-                            params: GradClipNormSqParams {
-                                len,
-                                _pad0: 0,
-                                _pad1: 0,
-                                _pad2: 0,
+                    {
+                        let mut pc = pass.with(pipeline);
+                        pc.bind(
+                            0,
+                            &GradClipNormSqData {
+                                grad: Self::grad_source(
+                                    &self.buffers,
+                                    &self.grad_accum_bufs,
+                                    accumulating,
+                                    idx,
+                                    grad_buf,
+                                ),
+                                acc: acc_buf.at(0),
+                                params: GradClipNormSqParams {
+                                    len,
+                                    _pad0: 0,
+                                    _pad1: 0,
+                                    _pad2: 0,
+                                },
                             },
-                        },
-                    );
-                    // One workgroup of 256 threads strides over `len`
-                    // elements; the workgroup root atomic-adds its
-                    // partial sum to `acc`.
-                    pc.dispatch([1, 1, 1]);
+                        );
+                        // One workgroup of 256 threads strides over `len`
+                        // elements and adds its partial sum to `acc`.
+                        pc.dispatch([1, 1, 1]);
+                    }
+                    if idx + 1 < self.plan.param_grad_pairs.len() {
+                        pass.barrier();
+                    }
                 }
             }
             // Pass 3: scale each gradient by min(1, max_norm/sqrt(acc)).
@@ -5221,7 +5262,7 @@ impl Session {
     /// Set the decoupled weight-decay coefficient for the Adam update,
     /// turning it into AdamW: each step also applies `param -= lr * wd * param`,
     /// independent of the gradient. 0.0 (the default) is plain Adam. Persists
-    /// across steps until changed; unaffected by [`set_adam`].
+    /// across steps until changed; unaffected by [`Self::set_adam`].
     pub fn set_weight_decay(&mut self, wd: f32) {
         self.adam_wd = wd;
     }
@@ -5341,7 +5382,7 @@ impl Session {
         use safetensors::tensor::{Dtype, TensorView};
 
         self.wait();
-        let mut owned_data: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut owned_data: Vec<(String, Vec<u8>, Dtype, Vec<usize>)> = Vec::new();
 
         // Collect parameter data
         for (name, buf_ref) in &self.plan.param_buffers {
@@ -5351,7 +5392,17 @@ impl Session {
                 let ptr = self.buffers[buf_ref.0 as usize].data() as *const u8;
                 std::ptr::copy_nonoverlapping(ptr, data.as_mut_ptr(), byte_len);
             }
-            owned_data.push((name.clone(), data));
+            let (dtype, shape) = match self.plan.weight_buffers.get(buf_ref).map(|entry| entry.0) {
+                Some(crate::compile::WeightFormat::F16) => (Dtype::F16, vec![byte_len / 2]),
+                Some(crate::compile::WeightFormat::Q4 | crate::compile::WeightFormat::Q8) => {
+                    // Safetensors has no standard Q4/Q8 block dtype. Preserve
+                    // the exact packed representation as bytes rather than
+                    // falsely labelling it F32.
+                    (Dtype::U8, vec![byte_len])
+                }
+                Some(crate::compile::WeightFormat::F32) | None => (Dtype::F32, vec![byte_len / 4]),
+            };
+            owned_data.push((name.clone(), data, dtype, shape));
         }
 
         // Collect Adam moment buffers (parallel to param_grad_pairs)
@@ -5377,24 +5428,24 @@ impl Session {
                     let ptr = buf.data() as *const u8;
                     std::ptr::copy_nonoverlapping(ptr, data.as_mut_ptr(), byte_len);
                 }
-                owned_data.push((key, data));
+                owned_data.push((key, data, Dtype::F32, vec![byte_len / 4]));
             }
         }
 
         // Build tensor views
         let views: Vec<(String, TensorView<'_>)> = owned_data
             .iter()
-            .map(|(name, data)| {
-                let float_len = data.len() / 4;
+            .map(|(name, data, dtype, shape)| {
                 (
                     name.clone(),
-                    TensorView::new(Dtype::F32, vec![float_len], data).expect("tensor view"),
+                    TensorView::new(*dtype, shape.clone(), data).expect("tensor view"),
                 )
             })
             .collect();
 
         // Metadata
         let mut metadata = HashMap::new();
+        metadata.insert("meganeura_checkpoint_format".to_string(), "2".to_string());
         metadata.insert("adam_step".to_string(), self.adam_step.to_string());
 
         let buf = safetensors::tensor::serialize(views, &Some(metadata))
@@ -5408,16 +5459,63 @@ impl Session {
     /// have been created from the same graph (same parameter names/sizes).
     #[allow(clippy::pattern_type_mismatch)]
     pub fn load_checkpoint(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        use safetensors::tensor::Dtype;
+
+        self.wait();
         let file_data = std::fs::read(path)?;
         let (header_size, metadata) = safetensors::SafeTensors::read_metadata(&file_data)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         let st = safetensors::SafeTensors::deserialize(&file_data)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         let _ = header_size;
+        let checkpoint_format = metadata
+            .metadata()
+            .as_ref()
+            .and_then(|meta| meta.get("meganeura_checkpoint_format"))
+            .map(|value| {
+                value.parse::<u32>().map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid meganeura_checkpoint_format {value:?}"),
+                    )
+                })
+            })
+            .transpose()?
+            .unwrap_or(1);
 
         // Restore parameters
         for (name, buf_ref) in &self.plan.param_buffers {
             if let Ok(tensor) = st.tensor(name) {
+                let expected_len = self.plan.buffers[buf_ref.0 as usize];
+                if tensor.data().len() != expected_len {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "checkpoint tensor {name:?} has {} bytes, expected {expected_len}",
+                            tensor.data().len(),
+                        ),
+                    ));
+                }
+                if checkpoint_format >= 2 {
+                    let expected_dtype =
+                        match self.plan.weight_buffers.get(buf_ref).map(|entry| entry.0) {
+                            Some(crate::compile::WeightFormat::F16) => Dtype::F16,
+                            Some(
+                                crate::compile::WeightFormat::Q4 | crate::compile::WeightFormat::Q8,
+                            ) => Dtype::U8,
+                            Some(crate::compile::WeightFormat::F32) | None => Dtype::F32,
+                        };
+                    if tensor.dtype() != expected_dtype {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "checkpoint tensor {name:?} has dtype {:?}, expected {:?}",
+                                tensor.dtype(),
+                                expected_dtype,
+                            ),
+                        ));
+                    }
+                }
                 self.upload_buffer(*buf_ref, tensor.data());
             } else {
                 log::warn!("checkpoint missing parameter: {name}");
@@ -5442,6 +5540,25 @@ impl Session {
             ] {
                 let key = format!("{suffix}.{name}");
                 if let Ok(tensor) = st.tensor(&key) {
+                    let expected_len = self.plan.buffers[param_buf.0 as usize];
+                    if tensor.data().len() != expected_len {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "checkpoint tensor {key:?} has {} bytes, expected {expected_len}",
+                                tensor.data().len(),
+                            ),
+                        ));
+                    }
+                    if checkpoint_format >= 2 && tensor.dtype() != Dtype::F32 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "checkpoint tensor {key:?} has dtype {:?}, expected F32",
+                                tensor.dtype(),
+                            ),
+                        ));
+                    }
                     unsafe {
                         let ptr = buf.data();
                         std::ptr::copy_nonoverlapping(
@@ -5457,7 +5574,12 @@ impl Session {
         // Restore adam_step from metadata
         if let Some(ref meta) = *metadata.metadata() {
             if let Some(step_str) = meta.get("adam_step") {
-                self.adam_step = step_str.parse::<u32>().unwrap_or(0);
+                self.adam_step = step_str.parse::<u32>().map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid adam_step {step_str:?}"),
+                    )
+                })?;
             }
         }
 
@@ -5478,6 +5600,12 @@ impl Drop for Session {
         for pipeline in self.pipelines.small_map.values_mut() {
             self.gpu.destroy_compute_pipeline(pipeline);
         }
+        for pipeline in self.pipelines.weight_map.values_mut() {
+            self.gpu.destroy_compute_pipeline(pipeline);
+        }
+        for pipeline in self.pipelines.attention_map.values_mut() {
+            self.gpu.destroy_compute_pipeline(pipeline);
+        }
         for pipeline in self.pipelines.epilogue_map.values_mut() {
             self.gpu.destroy_compute_pipeline(pipeline);
         }
@@ -5495,6 +5623,12 @@ impl Drop for Session {
         for &(m_buf, v_buf) in &self.adam_state {
             self.gpu.destroy_buffer(m_buf);
             self.gpu.destroy_buffer(v_buf);
+        }
+        if let Some(buffer) = self.grad_clip_acc {
+            self.gpu.destroy_buffer(buffer);
+        }
+        for &buffer in &self.grad_accum_bufs {
+            self.gpu.destroy_buffer(buffer);
         }
     }
 }
