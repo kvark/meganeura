@@ -202,13 +202,14 @@ pinning, max-sizing); full GPU suite (gradcheck, training_correctness,
 smollm2/whisper/resnet correctness) with aliasing on vs off; memory
 summary deltas on the bench models.
 
-### B2. Device-local memory for intermediates  ← *implemented, opt-in pending bench*
+### B2. Device-local memory for intermediates  ← *landed, default-on*
 
-*Landed:* `MEGANEURA_DEVICE_LOCAL=1` places allocations whose tenants
-are all step-local intermediates (the non-pinned set from B1's
-analysis) in `Memory::Device`, zeroed by one GPU transfer pass at
-session build. Default-off until the dGPU bench numbers are in; flips
-to default (or is removed) based on RTX 5080 / Radeon measurements.
+*Landed:* allocations whose tenants are all step-local intermediates
+(the non-pinned set from B1's analysis) use `Memory::Device`, zeroed by
+one GPU transfer pass at session build. This is default-on;
+`MEGANEURA_NO_DEVICE_LOCAL=1` restores host-visible allocations for
+diagnosis. Continue tracking the effect on both RTX and Radeon release
+benchmarks because ReBAR and cache behavior remain driver-dependent.
 
 **Problem.** Every buffer is `Memory::Shared` (host-visible,
 host-coherent — `runtime.rs:1954`). Free on UMA (Apple, iGPUs). On

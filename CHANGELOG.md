@@ -40,6 +40,37 @@
   for a 49k vocab and was 76% of the SmolLM2-135M train step
   (RTX 5070: 106.8 → 22.0 ms/step; Radeon 610M: 1774 → 325 ms/step;
   session buffers 11.3 GB → 1.69 GB).
+- Audit hardening: execution-plan cache format v2 now fingerprints the complete
+  typed graph, constant data, compilation options, runtime mode, optimization
+  switches, and cooperative-matrix target. Stale, partial, or cross-device
+  plans are rejected instead of being executed.
+- Session construction now probes the selected GPU before compilation and
+  compiles against that context's capabilities. This removes process-global
+  first-device coupling and lets f16 cooperative attention be selected safely
+  on both f16-only and scalar-only adapters.
+- Attention pipelines are keyed by `(entry point, head dimension)`, fixing
+  mixed-width attention graphs that previously reused the last width seen.
+- Checkpoint format v2 records truthful tensor dtypes and shapes and validates
+  every parameter and Adam-state byte length before upload. Invalid metadata is
+  reported as `InvalidData` instead of silently resetting state; the old
+  unbounded Adam copy could overwrite mapped memory.
+- Session teardown now releases weight-specialized and attention pipelines,
+  gradient-clipping storage, and accumulation buffers. Host uploads wait for
+  prior GPU submissions before modifying shared allocations.
+- Gradient clipping now uses an f32 accumulator with explicit barriers between
+  parameter dispatches instead of a device-scope storage atomic. This removes
+  Vulkan VUID 06265 on cooperative-matrix contexts where Blade enables the
+  Vulkan memory model without enabling device scope.
+- `DataLoader` rejects zero batch and sample sizes; cooperative 16×16 paths now
+  require an exact advertised tile size; decimal and hexadecimal device IDs are
+  accepted.
+- Portability documentation now matches the pinned Blade implementation:
+  Vulkan on Linux/Windows/Android and Metal on Apple platforms; DX12 is not
+  currently a backend.
+- CI now enforces formatting, all-target Clippy, strict rustdoc, MSRV, package
+  assembly, security, and Windows compile checks. Offline SPIR-V coverage
+  includes the f16 cooperative attention path used by NVIDIA and AMD, while
+  hardware-driver coverage remains an explicit release requirement.
 - Bump `naga` to the wgpu git rev carrying
   `spv::Options::emit_int_div_checks`, pinned to the same rev as
   `blade-graphics` so the `naga::Module` we build unifies with blade's
