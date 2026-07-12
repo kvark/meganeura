@@ -8,6 +8,38 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  quality:
+    name: Quality gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Check every target
+        run: cargo check --all-targets
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Documentation
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      # Full verification substitutes crates.io dependencies for the pinned
+      # git revisions. Re-enable it after Blade publishes the APIs used here.
+      - name: Package assembly
+        run: cargo package --no-verify
+
   check:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -26,8 +58,6 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
 
       - name: Install lavapipe and Vulkan
         if: runner.os == 'Linux'
@@ -37,12 +67,6 @@ jobs:
           vulkaninfo --summary 2>&1 | head -30
 
       - uses: Swatinem/rust-cache@v2
-
-      - name: Check
-        run: cargo check
-
-      - name: Clippy
-        run: cargo clippy -- -D warnings
 
       - name: Unit tests
         run: cargo test --lib
@@ -66,6 +90,9 @@ jobs:
       - name: Cache + inference roundtrip test
         run: cargo test --test cache_inference
 
+      - name: Audit regression tests
+        run: cargo test --test checkpoint_validation --test mixed_attention_widths -- --test-threads=1
+
       - name: Vision ops smoke test
         run: cargo test --test vision_ops_smoke -- --skip vision_encoder_one_layer
 
@@ -76,3 +103,35 @@ jobs:
           cargo run --release --example bench_ci_latency > bench/results/ci_latency.json 2>/dev/null
           cat bench/results/ci_latency.json
           python3 bench/check_latency.py bench/results/ci_latency.json
+
+  windows:
+    name: Windows compile (Vulkan)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --lib --tests
+
+  msrv:
+    name: Rust 1.88 MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --lib
+
+  security:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit latest compatible resolution
+        run: |
+          cargo generate-lockfile
+          cargo audit
