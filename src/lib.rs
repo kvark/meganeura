@@ -6,7 +6,8 @@
     clippy::single_match,
     clippy::too_many_arguments,
     clippy::collapsible_if,
-    clippy::needless_range_loop
+    clippy::needless_range_loop,
+    clippy::needless_borrowed_reference
 )]
 #![warn(
     trivial_numeric_casts,

@@ -2679,7 +2679,8 @@ impl<'a> Compiler<'a> {
                     // Use implicit GEMM: output = weight @ im2col(input)^T
                     // M=Co, N=oH*oW, K=Ci*kH*kW, batched in z dimension
                     // Use small (32×32) tiles when workgroup count per batch is low.
-                    let wgs_64 = out_h * out_w.div_ceil(64) * out_channels.div_ceil(64);
+                    let spatial = out_h * out_w;
+                    let wgs_64 = spatial.div_ceil(64) * out_channels.div_ceil(64);
                     let use_small = wgs_64 < 16;
                     let tile = if use_small { 32 } else { 64 };
                     self.plan.dispatches.push(Dispatch {
@@ -2688,11 +2689,7 @@ impl<'a> Compiler<'a> {
                         } else {
                             ShaderEntry::Conv2dGemm
                         },
-                        workgroups: [
-                            out_h * out_w.div_ceil(tile),
-                            out_channels.div_ceil(tile),
-                            batch,
-                        ],
+                        workgroups: [spatial.div_ceil(tile), out_channels.div_ceil(tile), batch],
                         input_buffers: vec![input, kernel],
                         output_buffer: out_buf,
                         extra_outputs: vec![],
@@ -2905,7 +2902,8 @@ impl<'a> Compiler<'a> {
                     // Use implicit GEMM: grad_input = weight_T @ im2col(grad_out)^T
                     // M=Ci, N=H*W, K=Co*kH*kW, batched in z dimension.
                     {
-                        let wgs_64 = in_h * in_w.div_ceil(64) * in_channels.div_ceil(64);
+                        let spatial = in_h * in_w;
+                        let wgs_64 = spatial.div_ceil(64) * in_channels.div_ceil(64);
                         let use_small = wgs_64 < 16;
                         let tile = if use_small { 32 } else { 64 };
                         self.plan.dispatches.push(Dispatch {
@@ -2914,11 +2912,7 @@ impl<'a> Compiler<'a> {
                             } else {
                                 ShaderEntry::Conv2dGradInputGemm
                             },
-                            workgroups: [
-                                in_h * in_w.div_ceil(tile),
-                                in_channels.div_ceil(tile),
-                                batch,
-                            ],
+                            workgroups: [spatial.div_ceil(tile), in_channels.div_ceil(tile), batch],
                             input_buffers: vec![grad_out, kernel],
                             output_buffer: out_buf,
                             extra_outputs: vec![],
@@ -3341,7 +3335,6 @@ impl<'a> Compiler<'a> {
                 let bwd_coop_disabled =
                     std::env::var("MEGANEURA_FLASH_BWD_COOP").as_deref() == Ok("0");
                 let bwd_coop_enabled = !bwd_coop_disabled
-                    && grad_kv_shader == ShaderEntry::FlashAttention
                     && self.coop_caps.supports_16x16_f16()
                     && head_dim >= 16
                     && head_dim.is_multiple_of(16)
@@ -4073,6 +4066,35 @@ mod tests {
     }
 
     #[test]
+    fn conv1d_emulation_dispatches_flat_spatial_tiles() {
+        // Whisper represents its temporal convolutions as H×1 Conv2d. The
+        // spatial workgroup axis tiles H*W, rather than tiling W once per H.
+        let mut g = Graph::new();
+        let x = g.parameter("x", &[80 * 3000]);
+        let w = g.parameter("w", &[512 * 80 * 3]);
+        let y = g.conv2d_hw(x, w, 1, 80, 3000, 1, 512, 3, 1, 1, 1, 0);
+        let loss = g.sum_all(y);
+        g.set_outputs(vec![loss]);
+
+        let plan = compile(&g);
+        let forward = plan
+            .dispatches
+            .iter()
+            .find(|dispatch| dispatch.shader == ShaderEntry::Conv2dGemm)
+            .unwrap();
+        assert_eq!(forward.workgroups, [3000u32.div_ceil(64), 8, 1]);
+
+        let differentiated = crate::autodiff::differentiate(&g);
+        let training = compile(&differentiated);
+        let grad_input = training
+            .dispatches
+            .iter()
+            .find(|dispatch| dispatch.shader == ShaderEntry::Conv2dGradInputGemm)
+            .unwrap();
+        assert_eq!(grad_input.workgroups, [3000u32.div_ceil(64), 2, 1]);
+    }
+
+    #[test]
     fn test_compile_loss_buffer() {
         let mut g = Graph::new();
         let x = g.input("x", &[4, 8]);
@@ -4246,5 +4268,41 @@ mod tests {
                 | ShaderEntry::FlashGradQCoop
                 | ShaderEntry::FlashGradKVCoop
         )));
+    }
+
+    #[test]
+    fn short_cross_attention_selects_coop_grad_kv() {
+        // The scalar flash heuristic uses BQ=128 at head_dim=64, so a
+        // SmolVLA-shaped 16-position KV span selects MultiHeadAttn. The
+        // cooperative GradKV kernel has its own BKV=16 geometry and must not
+        // inherit that unrelated scalar decision.
+        let mut g = Graph::new();
+        let q = g.parameter("q", &[50, 15 * 64]);
+        let k = g.parameter("k", &[16, 5 * 64]);
+        let v = g.parameter("v", &[16, 5 * 64]);
+        let attention = g.multi_head_attn(q, k, v, 15, 5, 64, true);
+        let loss = g.sum_all(attention);
+        g.set_outputs(vec![loss]);
+        let differentiated = crate::autodiff::differentiate(&g);
+
+        let plan = compile_with_caps(
+            &differentiated,
+            &CompileOptions::default(),
+            crate::codegen::CoopCaps {
+                f16_tile: 16,
+                f32_tile: 0,
+            },
+        );
+
+        assert!(
+            plan.dispatches
+                .iter()
+                .any(|dispatch| dispatch.shader == ShaderEntry::FlashGradKVCoop)
+        );
+        assert!(
+            plan.dispatches
+                .iter()
+                .all(|dispatch| { dispatch.shader != ShaderEntry::MultiHeadAttnGradKV })
+        );
     }
 }

@@ -268,8 +268,29 @@ fn matmul_bt_n33_non_aligned() {
     run_matmul_bt(4096, 32, 33);
 }
 
-// ---------- M direction (vec4_a_transposed + output store) ----------
-// MatMulAT with M small / non-aligned.
+// ---------- M direction (vec4_a_transposed + padded output store) ----------
+// A partial final row tile is safe when N is tile-aligned: the runtime pads
+// the output allocation through the next complete M tile, and consumers keep
+// using the logical M extent. These exercise enough workgroups to ensure the
+// f16 cooperative path is selected on supported hardware.
+
+#[test]
+fn matmul_m50_n256() {
+    run_matmul(50, 128, 256);
+}
+
+#[test]
+fn matmul_bt_m50_n256() {
+    run_matmul_bt(50, 128, 256);
+}
+
+#[test]
+fn matmul_at_m50_n256() {
+    run_matmul_at(50, 128, 256);
+}
+
+// Smaller MatMulAT shapes remain useful coverage for transposed staging,
+// although they may stay below the cooperative workgroup threshold.
 
 #[test]
 fn matmul_at_m1() {
