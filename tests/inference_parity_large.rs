@@ -181,3 +181,60 @@ fn conv1x1_layout_parity() {
         &want[..6]
     );
 }
+
+/// Whisper's Conv1d emulation uses H×1 tensors. Cover a spatial length
+/// larger than one GEMM tile so reducing the dispatch from H workgroups to
+/// ceil(H/tile) cannot accidentally drop valid output rows.
+#[test]
+fn conv3x1_flat_spatial_dispatch_parity() {
+    let (c_in, c_out, h) = (3usize, 5usize, 129usize);
+    let in_size = c_in * h;
+    let out_size = c_out * h;
+
+    let mut g = Graph::new();
+    let x = g.input("x", &[in_size]);
+    let k = g.parameter("k", &[c_out * c_in * 3]);
+    let y = g.conv2d_hw(
+        x,
+        k,
+        1,
+        c_in as u32,
+        h as u32,
+        1,
+        c_out as u32,
+        3,
+        1,
+        1,
+        1,
+        0,
+    );
+    g.set_outputs(vec![y]);
+
+    let mut session = build_inference_session(&g);
+    let x_data = ramp(in_size, 0.7, 0.1);
+    let k_data = ramp(c_out * c_in * 3, 0.2, 0.0);
+    session.set_parameter("k", &k_data);
+    session.set_input("x", &x_data);
+    session.step();
+    session.wait();
+    let got = session.read_output(out_size);
+
+    let mut want = vec![0.0; out_size];
+    for co in 0..c_out {
+        for oh in 0..h {
+            let mut sum = 0.0;
+            for ci in 0..c_in {
+                for kh in 0..3 {
+                    let ih = oh as isize + kh as isize - 1;
+                    if (0..h as isize).contains(&ih) {
+                        sum += x_data[ci * h + ih as usize] * k_data[(co * c_in + ci) * 3 + kh];
+                    }
+                }
+            }
+            want[co * h + oh] = sum;
+        }
+    }
+
+    let d = max_diff(&got, &want);
+    assert!(d < 1e-3, "conv3x1 H×1 parity mismatch: max_diff={d:.4}");
+}

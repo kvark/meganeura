@@ -420,13 +420,19 @@ pub fn build_session_unoptimized(forward_graph: &Graph) -> Session {
     .0
 }
 
-/// Run the compile pipeline (autodiff → optimize → compile) without
-/// creating a GPU session. Useful for testing compilation in
-/// environments without GPU access.
+/// Run the training compile pipeline without creating a GPU session.
+///
+/// This deliberately mirrors [`build`]: optimize and topologically sort the
+/// forward graph before autodiff, then optimize the combined forward/backward
+/// graph. Optimizing only after autodiff can pack two source parameters into
+/// one derived parameter while leaving the original two gradient outputs in
+/// place, breaking the positional parameter/gradient contract in the plan.
+/// Useful for testing compilation in environments without GPU access.
 pub fn compile_training_graph(
     forward_graph: &Graph,
 ) -> (crate::compile::ExecutionPlan, OptimizeReport) {
-    let full_graph = autodiff::differentiate(forward_graph);
+    let optimized_forward = optimize::optimize(forward_graph).toposort();
+    let full_graph = autodiff::differentiate(&optimized_forward);
     let (optimized, report) = optimize::optimize_with_report(&full_graph);
     let plan = compile::compile(&optimized);
     (plan, report)
@@ -482,6 +488,30 @@ mod tests {
             report.fusions_applied.is_empty(),
             "unexpected fusions: {:?}",
             report.fusions_applied
+        );
+    }
+
+    #[test]
+    fn compile_training_graph_packs_swiglu_before_autodiff() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[16, 32]);
+        let gate = g.parameter("gate", &[32, 64]);
+        let up = g.parameter("up", &[32, 64]);
+        let down = g.parameter("down", &[64, 32]);
+        let gate_proj = g.matmul(x, gate);
+        let up_proj = g.matmul(x, up);
+        let hidden = g.swiglu(gate_proj, up_proj);
+        let output = g.matmul(hidden, down);
+        let loss = g.mean_all(output);
+        g.set_outputs(vec![loss]);
+
+        let (plan, _) = compile_training_graph(&g);
+
+        assert_eq!(plan.param_buffers.len(), plan.param_grad_pairs.len());
+        assert!(
+            plan.param_buffers
+                .iter()
+                .any(|&(ref name, _)| name == "gate+up")
         );
     }
 

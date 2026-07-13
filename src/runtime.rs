@@ -1969,6 +1969,14 @@ impl Session {
                 let is_conv_bwd = matches!(group, ShaderGroup::Conv2dGradInputGemm);
                 let min_wgs = if is_conv_bwd {
                     MIN_COOP_WORKGROUPS_CONV_BWD
+                } else if config.use_f16_input {
+                    // On discrete NVIDIA GPUs the f16 cooperative kernel's
+                    // shared-memory staging costs more than the scalar tile
+                    // kernel at low occupancy. Representative transformer
+                    // projections with 20--72 output workgroups regress,
+                    // while the wider backward/MLP shapes win once there are
+                    // enough independent tiles to fill the device.
+                    128
                 } else {
                     16 // enables coop for attention K/V projections (N=320, 20 WGs)
                 };
@@ -1993,16 +2001,18 @@ impl Session {
                 //
                 //   * The OUTPUT STORE uses `coopStoreT(acc, &c[row*n+col],
                 //     n)` which writes a 16×16 sub-tile with row stride
-                //     `n`. When N (or M for the analogous AT/BT cases) is
-                //     not a multiple of 16, the right-edge / bottom-edge
-                //     sub-tile straddles the matrix boundary and the store
-                //     corrupts the next row's leading columns. Refuse coop
-                //     unless both output dimensions are multiples of 16.
+                //     `n`. A right-edge tile with N not divisible by 16
+                //     straddles logical rows, so it remains unsupported. A
+                //     bottom-edge tile is safe: session construction pads the
+                //     allocation to `ceil(M/16) * N`, and consumers retain the
+                //     logical M extent, so the extra rows are never observed.
+                //     Allowing partial M tiles is important for sequence
+                //     lengths such as 50, which dominate transformer training.
                 //
                 // (Conv2d / FusedRmsNormMatMul also store via coopStoreT
                 // and need the same check; their `m`/`n` come from the
                 // params destructure above.)
-                let store_ok = m.is_multiple_of(16) && n.is_multiple_of(16);
+                let store_ok = n.is_multiple_of(16);
                 let vec4_ok = match group {
                     ShaderGroup::MatMulBT => store_ok,
                     ShaderGroup::MatMulAT => store_ok,

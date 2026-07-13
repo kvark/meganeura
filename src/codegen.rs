@@ -1483,18 +1483,39 @@ fn gen_matmul_coop_wgsl_prologue(
         a_stage_1 = gen_vec4_a("shared_b1", &format!("(tile_row + {}u)", tile));
     } else if vec4_a_transposed {
         // AT: A[K,M], load vec4 along M (consecutive in memory), write
-        // transposed to shared.
+        // transposed to shared. The packed vec4 load is valid only when M is
+        // divisible by four: otherwise successive K rows start at different
+        // lanes of the storage vec4. Partial rows and unaligned row strides
+        // use scalar lane extraction, mirroring the Normal/BT staging paths.
         let gen_vec4_at = |shared: &str, row_offset: &str| -> String {
             format!(
                 "{{\
                \n            let tc = t + v4_row;\
                \n            let gr4 = {row} + v4_col;\
-               \n            if tc < k && (gr4 + 4u) <= m {{\
+               \n            if tc < k && (gr4 + 4u) <= m && (m & 3u) == 0u {{\
                \n                let v = matrix_a[(tc * m + gr4) >> 2u];\
                \n                {s}[v4_col * {t}u + v4_row] = {co}v.x{cc};\
                \n                {s}[(v4_col + 1u) * {t}u + v4_row] = {co}v.y{cc};\
                \n                {s}[(v4_col + 2u) * {t}u + v4_row] = {co}v.z{cc};\
                \n                {s}[(v4_col + 3u) * {t}u + v4_row] = {co}v.w{cc};\
+               \n            }} else if tc < k {{\
+               \n                let m0 = (gr4 + 0u) < m;\
+               \n                let m1 = (gr4 + 1u) < m;\
+               \n                let m2 = (gr4 + 2u) < m;\
+               \n                let m3 = (gr4 + 3u) < m;\
+               \n                let last = m - 1u;\
+               \n                let a0 = tc * m + min(gr4 + 0u, last);\
+               \n                let a1 = tc * m + min(gr4 + 1u, last);\
+               \n                let a2 = tc * m + min(gr4 + 2u, last);\
+               \n                let a3 = tc * m + min(gr4 + 3u, last);\
+               \n                let v0 = matrix_a[a0 >> 2u][a0 & 3u];\
+               \n                let v1 = matrix_a[a1 >> 2u][a1 & 3u];\
+               \n                let v2 = matrix_a[a2 >> 2u][a2 & 3u];\
+               \n                let v3 = matrix_a[a3 >> 2u][a3 & 3u];\
+               \n                {s}[v4_col * {t}u + v4_row] = select({z}, {co}v0{cc}, m0);\
+               \n                {s}[(v4_col + 1u) * {t}u + v4_row] = select({z}, {co}v1{cc}, m1);\
+               \n                {s}[(v4_col + 2u) * {t}u + v4_row] = select({z}, {co}v2{cc}, m2);\
+               \n                {s}[(v4_col + 3u) * {t}u + v4_row] = select({z}, {co}v3{cc}, m3);\
                \n            }} else {{\
                \n                let z = {z};\
                \n                {s}[v4_col * {t}u + v4_row] = z;\
@@ -2840,6 +2861,10 @@ pub fn generate_flash_grad_kv_coop_module(head_dim: u32) -> ShaderModule {
     let _ = writeln!(src, "var<workgroup> shared_p: array<f32, {}>;", bkv * bq);
     let _ = writeln!(src, "var<workgroup> shared_ds: array<f32, {}>;", bkv * bq);
     let _ = writeln!(src, "var<workgroup> wg_row_sum: array<f32, {bq}>;");
+    let _ = writeln!(
+        src,
+        "var<workgroup> wg_row_sum_partial: array<f32, {wg_size}>;"
+    );
     let _ = writeln!(src, "var<workgroup> wg_lse_max: array<f32, {bq}>;");
     let _ = writeln!(src, "var<workgroup> wg_lse_log: array<f32, {bq}>;");
     src.push('\n');
@@ -2953,27 +2978,37 @@ pub fn generate_flash_grad_kv_coop_module(head_dim: u32) -> ShaderModule {
     src.push_str("            }\n");
     src.push_str("            workgroupBarrier();\n\n");
 
-    // Precompute row_sum[qi] and lse cache (16 threads).
-    let _ = writeln!(src, "            if lid.x < {bq}u {{");
-    src.push_str("                let qi = lid.x;\n");
-    src.push_str("                let qp = t + qi;\n");
-    src.push_str("                if qp < q_seq && q_head < num_heads {\n");
-    src.push_str("                    var s = 0.0;\n");
-    src.push_str("                    let q_base = qp * q_dim + q_head * head_dim;\n");
+    // Precompute row_sum[qi] = dot(dO[qi], O[qi]). Map four threads to
+    // contiguous chunks of each Q row, matching the workgroup's existing
+    // (row, chunk) layout. The old one-thread-per-row loop left 48/64
+    // threads idle and issued strided loads across 16 distant Q rows.
+    src.push_str("            let row_qp = t + kv_row;\n");
+    src.push_str("            var row_part = 0.0;\n");
+    src.push_str("            if row_qp < q_seq && q_head < num_heads {\n");
+    src.push_str("                let q_base = row_qp * q_dim + q_head * head_dim + d_off;\n");
     let _ = writeln!(
         src,
-        "                    for (var d = 0u; d < {hd}u; d = d + 1u) {{"
+        "                for (var e = 0u; e < {chunk_hd}u; e = e + 1u) {{"
     );
-    src.push_str("                        s = s + d_out[q_base + d] * fwd_dst[q_base + d];\n");
-    src.push_str("                    }\n");
-    src.push_str("                    wg_row_sum[qi] = s;\n");
+    let _ = writeln!(
+        src,
+        "                    row_part = row_part + f32(shared_do[kv_row * {hd}u + d_off + e]) * fwd_dst[q_base + e];"
+    );
+    src.push_str("                }\n");
+    src.push_str("            }\n");
+    src.push_str("            wg_row_sum_partial[lid.x] = row_part;\n");
+    src.push_str("            workgroupBarrier();\n");
+    let _ = writeln!(src, "            if lid.x < {bq}u {{");
+    let _ = writeln!(src, "                let base = lid.x * {chunks_per_row}u;");
+    src.push_str("                wg_row_sum[lid.x] = wg_row_sum_partial[base] + wg_row_sum_partial[base + 1u] + wg_row_sum_partial[base + 2u] + wg_row_sum_partial[base + 3u];\n");
+    src.push_str("                let qp = t + lid.x;\n");
+    src.push_str("                if qp < q_seq && q_head < num_heads {\n");
     src.push_str("                    let li = (qp * num_heads + q_head) * 2u;\n");
-    src.push_str("                    wg_lse_max[qi] = lse[li];\n");
-    src.push_str("                    wg_lse_log[qi] = lse[li + 1u];\n");
+    src.push_str("                    wg_lse_max[lid.x] = lse[li];\n");
+    src.push_str("                    wg_lse_log[lid.x] = lse[li + 1u];\n");
     src.push_str("                } else {\n");
-    src.push_str("                    wg_row_sum[qi] = 0.0;\n");
-    src.push_str("                    wg_lse_max[qi] = 0.0;\n");
-    src.push_str("                    wg_lse_log[qi] = 0.0;\n");
+    src.push_str("                    wg_lse_max[lid.x] = 0.0;\n");
+    src.push_str("                    wg_lse_log[lid.x] = 0.0;\n");
     src.push_str("                }\n");
     src.push_str("            }\n");
     src.push_str("            workgroupBarrier();\n\n");
