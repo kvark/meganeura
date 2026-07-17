@@ -511,7 +511,7 @@ mod tests {
         assert!(
             plan.param_buffers
                 .iter()
-                .any(|&(ref name, _)| name == "gate+up")
+                .any(|buffer| buffer.0 == "gate+up")
         );
     }
 

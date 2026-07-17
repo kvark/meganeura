@@ -663,12 +663,28 @@ impl Graph {
         let mut new_graph = Graph::new();
         for &old_id in &order {
             let node = &self.nodes[old_id];
+            let mut op = node.op.clone();
+            match op {
+                Op::MultiHeadAttnGradQ {
+                    ref mut fwd_node, ..
+                }
+                | Op::MultiHeadAttnGradK {
+                    ref mut fwd_node, ..
+                }
+                | Op::MultiHeadAttnGradV {
+                    ref mut fwd_node, ..
+                } => {
+                    *fwd_node = old_to_new[*fwd_node as usize]
+                        .expect("toposort: attention gradient refers to removed forward node");
+                }
+                _ => {}
+            }
             let new_inputs: Vec<NodeId> = node
                 .inputs
                 .iter()
                 .filter_map(|&inp| old_to_new[inp as usize])
                 .collect();
-            new_graph.add_raw_node(node.op.clone(), new_inputs, node.ty.clone());
+            new_graph.add_raw_node(op, new_inputs, node.ty.clone());
         }
 
         // Remap outputs. An output being Nop'd would silently drop it and
@@ -2224,6 +2240,50 @@ mod tests {
         );
         assert_eq!(id, 0);
         assert_eq!(g.nodes().len(), 1);
+    }
+
+    #[test]
+    fn toposort_remaps_attention_forward_node() {
+        let mut g = Graph::new();
+        let q = g.input("q", &[2, 4]);
+        g.add_raw_node(Op::Nop, Vec::new(), TensorType::f32(Vec::new()));
+        let k = g.input("k", &[2, 4]);
+        let v = g.input("v", &[2, 4]);
+        let grad = g.input("grad", &[2, 4]);
+        let forward = g.add_raw_node(
+            Op::MultiHeadAttn {
+                num_heads: 1,
+                num_kv_heads: 1,
+                head_dim: 4,
+                is_cross: false,
+            },
+            vec![q, k, v],
+            TensorType::f32(vec![2, 4]),
+        );
+        let backward = g.add_raw_node(
+            Op::MultiHeadAttnGradQ {
+                fwd_node: forward,
+                num_heads: 1,
+                num_kv_heads: 1,
+                head_dim: 4,
+                is_cross: false,
+            },
+            vec![grad, q, k, v],
+            TensorType::f32(vec![2, 4]),
+        );
+        g.set_outputs(vec![backward]);
+
+        let sorted = g.toposort();
+        let forward = sorted
+            .nodes()
+            .iter()
+            .find(|node| matches!(node.op, Op::MultiHeadAttn { .. }))
+            .expect("forward attention node not found");
+        let backward = sorted.node(sorted.outputs()[0]);
+        let Op::MultiHeadAttnGradQ { ref fwd_node, .. } = backward.op else {
+            panic!("expected attention gradient output");
+        };
+        assert_eq!(*fwd_node, forward.id);
     }
 
     #[test]
