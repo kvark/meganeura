@@ -271,7 +271,7 @@ pub fn optimize_with_report(graph: &Graph) -> (Graph, OptimizeReport) {
         extract_time,
         outlined_regions,
     };
-    (g, report)
+    (g.toposort(), report)
 }
 
 /// Dump the whole-graph egglog program (for standalone debugging).
@@ -1617,6 +1617,57 @@ mod tests {
                 .any(|entry| entry.0.contains("BT")),
             "no BT fusion in report"
         );
+    }
+
+    /// Extracting a fusion below a generic root appends the fused node. The
+    /// optimizer must restore topological order before downstream lifetime
+    /// planning sees the rewritten graph.
+    #[test]
+    fn test_extracted_interior_fusion_is_topologically_ordered() {
+        let mut g = Graph::new();
+        let grad = g.input("grad", &[4, 8]);
+        let w = g.parameter("w", &[4, 8]);
+        let previous = g.input("previous", &[4, 4]);
+        let bt = g.add_raw_node(
+            Op::MatMulBT,
+            vec![grad, w],
+            crate::graph::TensorType::f32(vec![4, 4]),
+        );
+        let accumulated = g.add(bt, previous);
+        let loss = g.mean_all(accumulated);
+        g.set_outputs(vec![loss]);
+
+        let (opt, report) = optimize_with_report(&g);
+        assert!(
+            report
+                .fusions_applied
+                .iter()
+                .any(|entry| entry.0.contains("BT")),
+            "no BT fusion in report"
+        );
+
+        let output = opt.node(opt.outputs()[0]);
+        assert!(matches!(output.op, Op::MeanAll));
+        let fused = opt.node(output.inputs[0]);
+        assert!(matches!(fused.op, Op::FusedMatMulBTAdd));
+        assert!(
+            fused.id < output.id,
+            "interior fusion {} must precede consumer {}",
+            fused.id,
+            output.id,
+        );
+        for node in opt
+            .nodes()
+            .iter()
+            .filter(|node| !matches!(node.op, Op::Nop))
+        {
+            assert!(
+                node.inputs.iter().all(|&input| input < node.id),
+                "node {} has non-topological inputs {:?}",
+                node.id,
+                node.inputs,
+            );
+        }
     }
 
     /// E-graph recognizes x * sigmoid(x) → Silu(x).
