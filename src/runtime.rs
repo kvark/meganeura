@@ -5481,9 +5481,8 @@ impl Session {
         metadata.insert("meganeura_checkpoint_format".to_string(), "2".to_string());
         metadata.insert("adam_step".to_string(), self.adam_step.to_string());
 
-        let buf = safetensors::tensor::serialize(views, &Some(metadata))
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        std::fs::write(path, buf)
+        safetensors::tensor::serialize_to_file(views, &Some(metadata), path)
+            .map_err(|e| std::io::Error::other(e.to_string()))
     }
 
     /// Load a training checkpoint from a safetensors file.
