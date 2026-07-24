@@ -4,13 +4,22 @@
 [![Docs](https://docs.rs/meganeura/badge.svg)](https://docs.rs/meganeura)
 [![Crates.io](https://img.shields.io/crates/v/meganeura.svg?label=meganeura)](https://crates.io/crates/meganeura)
 
-**Neural network training and inference in Rust, on any GPU.** Vulkan and Metal — Linux, Windows, macOS, iOS, Android. No CUDA, no Python in the loop, routinely faster than PyTorch on AMD and Apple GPUs.
+**Portable neural-network training and inference in Rust.** Meganeura uses
+Vulkan on Linux, Windows, and Android and Metal on Apple platforms. It does
+not require CUDA, ROCm, or Python at runtime.
 
 [![logo](https://github.com/kvark/meganeura/raw/main/etc/logo.png)](/kvark/meganeura/blob/main/etc/logo.png)
 
-> **Status:** actively developed, APIs still in motion, but already running real workloads (SmolLM2, SmolVLA, ResNet-50, Whisper-tiny, Stable Diffusion U-Net). Issues and pull requests welcome.
+> **Status:** actively developed; APIs and benchmark methodology are still in
+> motion. Current workloads include SmolLM2, a SmolVLA action expert,
+> ResNet-50, the Whisper-tiny encoder, and a scaled, timestep- and
+> text-conditioned latent-diffusion U-Net. Issues and pull requests are
+> welcome.
 
-Define a graph, call `build_session`, train. Meganeura handles autodiff, kernel fusion via [e-graph](https://egraphs-good.github.io/) equality saturation, [Naga IR](https://docs.rs/naga/latest/naga/) shader codegen, and GPU dispatch automatically.
+Define a graph, call `build_session`, train. Meganeura handles autodiff,
+graph rewrites, WGSL specialization, Naga parsing and validation, and GPU
+dispatch automatically. The rewrite engine supports a fast deterministic
+greedy mode and experimental equality-saturation modes.
 
 ```rust
 use meganeura::{Graph, Trainer, TrainConfig, build_session};
@@ -27,7 +36,7 @@ let logits = g.matmul(h, w2);
 let loss = g.cross_entropy_loss(logits, labels);
 g.set_outputs(vec![loss]);
 
-// autodiff + e-graph optimize + compile + GPU init
+// autodiff + graph rewrite + compile + GPU init
 let session = build_session(&g);
 let mut trainer = Trainer::new(session, TrainConfig::default());
 trainer.train(&mut data, /* epochs = */ 10); // data loader: see examples/mnist.rs
@@ -37,39 +46,52 @@ A two-layer MLP, trained end to end on the GPU, in one screen.
 
 ## Why Meganeura
 
-**Fast.** Inference against PyTorch on matching model configs, from the cross-framework benchmark at [Inferena](https://inferena.tech):
+**Fast.** Meganeura is competitive with vendor-native ML stacks on selected
+workloads while retaining one Vulkan/Metal implementation. Results vary
+substantially by model, device, precision policy, and driver. The historical
+[Inferena](https://inferena.tech) tables are useful exploratory data, but they
+predate the audited paper protocol and should not be treated as
+publication-grade comparisons. The new protocol reports raw samples, uses
+matched workloads and full forward-plus-backward timing, and separates strict
+f32 from reduced-input accelerated modes.
 
-|Platform   |Workload              |Meganeura|PyTorch         |              |
-|-----------|----------------------|---------|----------------|--------------|
-|Apple M3   |Stable Diffusion U-Net|**10 ms**|534 ms (MPS)    |**53× faster**|
-|Apple M3   |SmolVLA               |37 ms    |172 ms (MPS)    |4.6× faster   |
-|Apple M3   |SmolLM2-135M          |62 ms    |247 ms (MPS)    |4× faster     |
-|Radeon 890M|SmolLM2-135M          |34 ms    |67 ms (ROCm)    |2× faster     |
-|Radeon 890M|SmolVLA               |15 ms    |25 ms (ROCm)    |1.7× faster   |
-|RTX 5080   |SmolVLA               |3 ms     |3 ms (CUDA 13.0)|parity        |
-|RTX 5080   |SmolLM2-135M          |7 ms     |4 ms (CUDA 13.0)|within 1.75×  |
+PyTorch CUDA currently leads several RTX 5080 workloads, especially training.
+Meganeura's strongest result is therefore not universal speed superiority; it
+is how much of that performance can be reached through a portable execution
+stack that also runs on AMD, Intel, and Apple GPUs.
 
-Training shows the same shape on non-NVIDIA: on Radeon 890M, Meganeura trains SmolLM2-135M in 87 ms/step vs PyTorch ROCm’s 123 ms, and SmolVLA in 35 ms vs 41 ms. On NVIDIA, PyTorch CUDA still leads on training workloads.
+**Portable.** GPU access is provided by
+[blade-graphics](https://github.com/kvark/blade/tree/main/blade-graphics):
+Vulkan on Linux, Windows, and Android, and Metal on Apple platforms. Mesa's
+Lavapipe provides a software Vulkan target for headless CI. The compute stack
+does not require CUDA or ROCm, although performance and feature availability
+still depend on each vendor's driver.
 
-Meganeura also runs on GPUs PyTorch doesn’t target, including Radeon 780M and Intel integrated graphics (RPL-U).
-
-The wedge isn’t every workload: on ResNet-50 and Whisper-tiny, Meganeura currently trails. Full cross-framework tables — including the losses — at [inferena.tech](https://inferena.tech). Reproduce locally with `./run.sh -m <Model>`.
-
-**Portable.** GPU access via [blade-graphics](https://github.com/kvark/blade/tree/main/blade-graphics) — Vulkan on Linux, Windows, and Android, and Metal on Apple platforms. Vulkan includes Mesa’s [Lavapipe](https://www.phoronix.com/news/Lavapipe-CPU-Vulkan-Windows) for headless CI. No CUDA, no ROCm, no vendor lock-in at any layer of the stack.
-
-**Lean.** A handful of [kernel archetypes](https://github.com/kvark/meganeura/blob/main/docs/kernel-archetypes.md) — pointwise, reduction, matmul, attention — compose into specialized GPU shaders at compile time. An e-graph equality-saturation pass discovers fusions (e.g. `x * sigmoid(x)` → Silu, `Silu(gate) * up` → SwiGLU) with a cost-model-driven extractor, rather than relying on hand-written fused kernels for every pattern. The codebase is small enough to read end to end.
+**Composable.** A small set of
+[kernel archetypes](https://github.com/kvark/meganeura/blob/main/docs/kernel-archetypes.md)
+— pointwise, reduction, matmul, convolution, and attention — compose into
+specialized GPU shaders at compile time. The rewrite set recognizes
+equivalent fused forms (for example, `x * sigmoid(x)` → SiLU and
+`SiLU(gate) * up` → SwiGLU).
+It can run either as a deterministic greedy pass or through equality
+saturation with a traffic-aware extraction cost. Current ablations find the
+same selected graph for the benchmark rewrite set, so equality saturation is
+research infrastructure rather than a claimed source of runtime speedup.
+Consolidating the remaining hand-written WGSL variants into parameterized
+generators is active work.
 
 ## How it compares
 
 |                                                 |GPU backends                        |Training      |Approach                                |
 |-------------------------------------------------|------------------------------------|--------------|----------------------------------------|
-|**Meganeura**                                    |blade-graphics (Vulkan, Metal)      |yes           |graph IR + e-graph fusion + Naga codegen|
+|**Meganeura**                                    |blade-graphics (Vulkan, Metal)      |yes           |graph IR + rewrites + specialized WGSL         |
 |[Candle](https://github.com/huggingface/candle)  |CUDA, Metal, CPU                    |limited       |eager tensors, hand-written kernels     |
 |[Burn](https://github.com/tracel-ai/burn)        |CUDA, wgpu, NDArray, LibTorch       |yes           |modular multi-backend                   |
 |[tch-rs](https://github.com/LaurentMazare/tch-rs)|CUDA, CPU (via libtorch)            |yes           |PyTorch FFI bindings                    |
-|[Luminal](https://github.com/luminal-ai/luminal) |CUDA, Metal                         |inference-only|e-graph IR                              |
 
-Meganeura’s wedge: **training, on non-NVIDIA hardware, without writing the kernels by hand.**
+Meganeura's wedge is a uniform graph, autodiff, compiler, and runtime stack for
+both training and inference across desktop and edge-class Vulkan/Metal
+devices.
 
 ## Install
 
@@ -82,14 +104,16 @@ Worked examples live in [`examples/`](https://github.com/kvark/meganeura/tree/ma
 - [`mnist.rs`](https://github.com/kvark/meganeura/blob/main/examples/mnist.rs) — MNIST training end to end.
 - [`smollm2.rs`](https://github.com/kvark/meganeura/blob/main/examples/smollm2.rs) — LLM inference with HuggingFace weights.
 
-Pretrained models can be loaded from ONNX or NNEF via `meganeura::load_onnx(...)` / `meganeura::load_nnef(...)`. Both lower through Meganeura’s IR, so e-graph fusions apply to imported graphs as well as hand-built ones.
+Pretrained models can be loaded from ONNX or NNEF via `meganeura::load_onnx(...)` / `meganeura::load_nnef(...)`. Both lower through Meganeura’s IR, so the same graph rewrites apply to imported graphs and hand-built ones.
 
 ## System requirements
 
-Meganeura runs best where cooperative matrix operations are hardware-accelerated:
+Meganeura runs best when the selected driver exposes hardware-accelerated
+cooperative matrix operations:
 
-- **Vulkan** — [`VK_KHR_cooperative_matrix`](https://registry.khronos.org/vulkan/specs/latest/man/html/VK_KHR_cooperative_matrix.html) (NVIDIA Volta+, AMD RDNA3+, Intel Arc).
-- **Metal** — simdgroup matrix (Apple M1+).
+- **Vulkan** —
+  [`VK_KHR_cooperative_matrix`](https://registry.khronos.org/vulkan/specs/latest/man/html/VK_KHR_cooperative_matrix.html).
+- **Metal** — simdgroup matrix support.
 
 Falls back to scalar matmul on older hardware. Headless Lavapipe works for CI.
 

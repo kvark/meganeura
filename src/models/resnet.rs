@@ -40,8 +40,8 @@ pub fn build_graph(g: &mut Graph, batch: u32) -> NodeId {
     let s = s.after_conv(7, 2, 3); // 112x112
 
     // BN1 is fused at load time — we just store the fused bias
-    let bn1_bias = g.parameter("bn1.fused_bias", &[(batch * 64 * s.h * s.w) as usize]);
-    let x = g.add(x, bn1_bias);
+    let bn1_bias = g.parameter("bn1.fused_bias", &[64]);
+    let x = g.add_per_channel(x, bn1_bias, 64, s.h * s.w);
     let x = g.relu(x);
 
     let x = g.max_pool_2d(x, batch, 64, s.h, s.w, 3, 3, 2, 1);
@@ -98,11 +98,8 @@ fn basic_block(
     );
     let h = g.conv2d(x, w1, batch, in_c, s.h, s.w, out_c, 3, 3, stride, 1);
     // BN1 fused
-    let bn1_b = g.parameter(
-        &format!("{name}.bn1.fused_bias"),
-        &[(batch * out_c * s1.h * s1.w) as usize],
-    );
-    let h = g.add(h, bn1_b);
+    let bn1_b = g.parameter(&format!("{name}.bn1.fused_bias"), &[out_c as usize]);
+    let h = g.add_per_channel(h, bn1_b, out_c, s1.h * s1.w);
     let h = g.relu(h);
 
     // Conv2: 3x3, no stride
@@ -112,11 +109,8 @@ fn basic_block(
     );
     let h = g.conv2d(h, w2, batch, out_c, s1.h, s1.w, out_c, 3, 3, 1, 1);
     // BN2 fused
-    let bn2_b = g.parameter(
-        &format!("{name}.bn2.fused_bias"),
-        &[(batch * out_c * s1.h * s1.w) as usize],
-    );
-    let h = g.add(h, bn2_b);
+    let bn2_b = g.parameter(&format!("{name}.bn2.fused_bias"), &[out_c as usize]);
+    let h = g.add_per_channel(h, bn2_b, out_c, s1.h * s1.w);
 
     // Shortcut: identity or 1x1 conv
     let shortcut = if stride > 1 || in_c != out_c {
@@ -127,9 +121,9 @@ fn basic_block(
         let ds = g.conv2d(x, ds_w, batch, in_c, s.h, s.w, out_c, 1, 1, stride, 0);
         let ds_bn_b = g.parameter(
             &format!("{name}.downsample.1.fused_bias"),
-            &[(batch * out_c * s1.h * s1.w) as usize],
+            &[out_c as usize],
         );
-        g.add(ds, ds_bn_b)
+        g.add_per_channel(ds, ds_bn_b, out_c, s1.h * s1.w)
     } else {
         x
     };
@@ -179,7 +173,38 @@ pub fn weight_names(batch: u32) -> Vec<String> {
     names
 }
 
-/// Fuse BatchNorm parameters into the preceding conv's weight and a bias tensor.
+/// Fuse BatchNorm parameters into the preceding conv's weight and a
+/// per-channel bias tensor.
+///
+/// This is the compact representation consumed by [`Graph::add_per_channel`].
+pub fn fuse_bn_into_conv_per_channel(
+    conv_weight: &[f32],
+    scale: &[f32],
+    bias: &[f32],
+    mean: &[f32],
+    var: &[f32],
+    eps: f32,
+    out_channels: usize,
+    kernel_size: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let in_channels = conv_weight.len() / (out_channels * kernel_size);
+
+    let mut w_fused = conv_weight.to_vec();
+    let mut b_fused = vec![0.0f32; out_channels];
+    for co in 0..out_channels {
+        let inv_std = scale[co] / (var[co] + eps).sqrt();
+        let start = co * in_channels * kernel_size;
+        let end = start + in_channels * kernel_size;
+        for value in &mut w_fused[start..end] {
+            *value *= inv_std;
+        }
+        b_fused[co] = bias[co] - mean[co] * inv_std;
+    }
+    (w_fused, b_fused)
+}
+
+/// Fuse BatchNorm parameters into the preceding conv's weight and an expanded
+/// bias tensor.
 ///
 /// Given conv weight `W [Co, Ci, kH, kW]` and BN params
 /// `(scale, bias, mean, var, eps)`, returns `(W_fused, bias_fused)` where:
@@ -199,29 +224,24 @@ pub fn fuse_bn_into_conv(
     out_h: usize,
     out_w: usize,
 ) -> (Vec<f32>, Vec<f32>) {
-    let in_channels = conv_weight.len() / (out_channels * kernel_size);
+    let (w_fused, channel_bias) = fuse_bn_into_conv_per_channel(
+        conv_weight,
+        scale,
+        bias,
+        mean,
+        var,
+        eps,
+        out_channels,
+        kernel_size,
+    );
 
-    // Fuse conv weight
-    let mut w_fused = conv_weight.to_vec();
-    for co in 0..out_channels {
-        let inv_std = scale[co] / (var[co] + eps).sqrt();
-        let start = co * in_channels * kernel_size;
-        let end = start + in_channels * kernel_size;
-        for v in &mut w_fused[start..end] {
-            *v *= inv_std;
-        }
-    }
-
-    // Fuse bias (broadcast to full spatial)
     let spatial = out_h * out_w;
     let full_size = batch * out_channels * spatial;
     let mut b_fused = vec![0.0f32; full_size];
     for n in 0..batch {
         for co in 0..out_channels {
-            let inv_std = scale[co] / (var[co] + eps).sqrt();
-            let b = bias[co] - mean[co] * inv_std;
             for s in 0..spatial {
-                b_fused[(n * out_channels + co) * spatial + s] = b;
+                b_fused[(n * out_channels + co) * spatial + s] = channel_bias[co];
             }
         }
     }
@@ -245,8 +265,8 @@ pub fn build_resnet50(g: &mut Graph, batch: u32) -> NodeId {
     let conv1_w = g.parameter("conv1.weight", &[64 * 3 * 7 * 7]);
     let x = g.conv2d(image, conv1_w, batch, 3, s.h, s.w, 64, 7, 7, 2, 3);
     let s = s.after_conv(7, 2, 3);
-    let bn1_bias = g.parameter("bn1.fused_bias", &[(batch * 64 * s.h * s.w) as usize]);
-    let x = g.add(x, bn1_bias);
+    let bn1_bias = g.parameter("bn1.fused_bias", &[64]);
+    let x = g.add_per_channel(x, bn1_bias, 64, s.h * s.w);
     let x = g.relu(x);
     let x = g.max_pool_2d(x, batch, 64, s.h, s.w, 3, 3, 2, 1);
     let s = s.after_conv(3, 2, 1);
@@ -314,11 +334,8 @@ fn bottleneck(
     // Conv1: 1x1, reduce channels
     let w1 = g.parameter(&format!("{name}.conv1.weight"), &[(mid_c * in_c) as usize]);
     let h = g.conv2d(x, w1, batch, in_c, s.h, s.w, mid_c, 1, 1, 1, 0);
-    let bn1_b = g.parameter(
-        &format!("{name}.bn1.fused_bias"),
-        &[(batch * mid_c * s.h * s.w) as usize],
-    );
-    let h = g.add(h, bn1_b);
+    let bn1_b = g.parameter(&format!("{name}.bn1.fused_bias"), &[mid_c as usize]);
+    let h = g.add_per_channel(h, bn1_b, mid_c, s.h * s.w);
     let h = g.relu(h);
 
     // Conv2: 3x3, may downsample
@@ -328,21 +345,15 @@ fn bottleneck(
         &[(mid_c * mid_c * 9) as usize],
     );
     let h = g.conv2d(h, w2, batch, mid_c, s.h, s.w, mid_c, 3, 3, stride, 1);
-    let bn2_b = g.parameter(
-        &format!("{name}.bn2.fused_bias"),
-        &[(batch * mid_c * s1.h * s1.w) as usize],
-    );
-    let h = g.add(h, bn2_b);
+    let bn2_b = g.parameter(&format!("{name}.bn2.fused_bias"), &[mid_c as usize]);
+    let h = g.add_per_channel(h, bn2_b, mid_c, s1.h * s1.w);
     let h = g.relu(h);
 
     // Conv3: 1x1, expand channels
     let w3 = g.parameter(&format!("{name}.conv3.weight"), &[(out_c * mid_c) as usize]);
     let h = g.conv2d(h, w3, batch, mid_c, s1.h, s1.w, out_c, 1, 1, 1, 0);
-    let bn3_b = g.parameter(
-        &format!("{name}.bn3.fused_bias"),
-        &[(batch * out_c * s1.h * s1.w) as usize],
-    );
-    let h = g.add(h, bn3_b);
+    let bn3_b = g.parameter(&format!("{name}.bn3.fused_bias"), &[out_c as usize]);
+    let h = g.add_per_channel(h, bn3_b, out_c, s1.h * s1.w);
 
     // Shortcut: always downsample when in_c != out_c or stride > 1
     let shortcut = if stride > 1 || in_c != out_c {
@@ -353,9 +364,9 @@ fn bottleneck(
         let ds = g.conv2d(x, ds_w, batch, in_c, s.h, s.w, out_c, 1, 1, stride, 0);
         let ds_bn_b = g.parameter(
             &format!("{name}.downsample.1.fused_bias"),
-            &[(batch * out_c * s1.h * s1.w) as usize],
+            &[out_c as usize],
         );
-        g.add(ds, ds_bn_b)
+        g.add_per_channel(ds, ds_bn_b, out_c, s1.h * s1.w)
     } else {
         x
     };

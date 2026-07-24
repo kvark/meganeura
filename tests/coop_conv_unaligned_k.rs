@@ -14,9 +14,13 @@
 //! trivially passes.
 
 use meganeura::{Graph, build_inference_session};
+use std::sync::Mutex;
+
+static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn conv_out(in_c: u32, coop: bool) -> Vec<f32> {
-    // SAFETY: tests run single-threaded (--test-threads=1 for GPU tests).
+    // SAFETY: both tests hold GPU_TEST_LOCK while mutating these
+    // process-global feature switches.
     unsafe {
         if coop {
             std::env::set_var("MEGANEURA_COOP_F16", "1");
@@ -51,6 +55,7 @@ fn conv_out(in_c: u32, coop: bool) -> Vec<f32> {
 
 #[test]
 fn coop_conv_unaligned_k_matches_scalar() {
+    let _guard = GPU_TEST_LOCK.lock().expect("GPU test lock poisoned");
     // K = 14*9 = 126, not a multiple of 4 — the failing case.
     let scalar = conv_out(14, false);
     let coop = conv_out(14, true);
@@ -72,6 +77,7 @@ fn coop_conv_unaligned_k_matches_scalar() {
 
 #[test]
 fn coop_conv_aligned_k_matches_scalar() {
+    let _guard = GPU_TEST_LOCK.lock().expect("GPU test lock poisoned");
     // K = 16*9 = 144, a multiple of 4 — the already-working case (guard).
     let scalar = conv_out(16, false);
     let coop = conv_out(16, true);

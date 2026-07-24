@@ -15,6 +15,15 @@ pub enum WeightFormat {
 
 impl WeightFormat {
     pub fn is_quantized(self) -> bool {
+        matches!(self, Self::Q4 | Self::Q8)
+    }
+
+    /// Uses a B-buffer representation other than ordinary IEEE f32.
+    ///
+    /// This deliberately includes f16 as well as block-quantized formats;
+    /// these formats share the weighted-shader codegen path even though f16
+    /// is not quantization.
+    pub fn uses_reduced_storage(self) -> bool {
         !matches!(self, Self::F32)
     }
 
@@ -44,7 +53,7 @@ pub struct CompileOptions {
     /// schedule-template reduction archetype instead of hand-written
     /// shaders. Generated kernels use workgroup-per-row tree reduction,
     /// which is much more parallel than the 1-thread-per-row loops in
-    /// the existing softmax.wgsl. Off by default until parity-verified.
+    /// the existing softmax.wgsl. Enabled by default after parity validation.
     pub use_schedule_reduction: bool,
 }
 
@@ -110,7 +119,8 @@ pub enum ShaderEntry {
     /// Flash Attention 2 forward: BQ>1 multi-query tiling.
     FlashAttention,
     /// Cooperative-matrix flash attention forward (Phase 1: coop QK^T,
-    /// scalar softmax + PV). Opt-in via `MEGANEURA_FLASH_FWD_COOP=1`.
+    /// scalar softmax + PV). Enabled on compatible devices unless
+    /// `MEGANEURA_FLASH_FWD_COOP=0`.
     /// BQ=BKV=16, dispatched as `[ceil(q_seq/16), num_heads, 1]`.
     FlashAttentionCoop,
     /// Cooperative-matrix flash backward dQ kernel. Three coop matmuls
@@ -125,8 +135,6 @@ pub enum ShaderEntry {
     FlashGradKVCoop,
     MultiHeadAttnGradQ,
     FlashGradQ,
-    MultiHeadAttnGradK,
-    MultiHeadAttnGradV,
     MultiHeadAttnGradKV,
     FlashGradKV,
     SwiGLUGradGate,
@@ -253,10 +261,8 @@ impl ShaderEntry {
             ShaderEntry::FlashGradKVCoop => ShaderGroup::FlashGradKVCoop,
             ShaderEntry::MultiHeadAttnGradQ => ShaderGroup::MultiHeadAttnGradQ,
             ShaderEntry::FlashGradQ => ShaderGroup::FlashGradQ,
-            ShaderEntry::MultiHeadAttnGradK => ShaderGroup::MultiHeadAttnGradK,
             ShaderEntry::MultiHeadAttnGradKV => ShaderGroup::MultiHeadAttnGradKV,
             ShaderEntry::FlashGradKV => ShaderGroup::FlashGradKV,
-            ShaderEntry::MultiHeadAttnGradV => ShaderGroup::MultiHeadAttnGradV,
             ShaderEntry::SwiGLUGradGate | ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => {
                 ShaderGroup::SwiGLUGrad
             }
@@ -359,8 +365,6 @@ impl ShaderEntry {
             | ShaderEntry::MultiHeadAttnGradQ
             | ShaderEntry::FlashGradQ
             | ShaderEntry::FlashGradQCoop
-            | ShaderEntry::MultiHeadAttnGradK
-            | ShaderEntry::MultiHeadAttnGradV
             | ShaderEntry::MultiHeadAttnGradKV
             | ShaderEntry::FlashGradKV
             | ShaderEntry::FlashGradKVCoop => "main",
@@ -495,6 +499,11 @@ pub struct Dispatch {
     /// When true, use the 32×32 small-tile matmul pipeline instead of 64×64.
     #[serde(default)]
     pub use_small_tiles: bool,
+    /// The dispatch belongs to numerically sensitive derivative work and may
+    /// not be promoted to a reduced-input-precision implementation. Native
+    /// f32 cooperative kernels remain eligible.
+    #[serde(default)]
+    pub requires_full_precision: bool,
     /// Fused elementwise epilogue (PointwiseDAG) applied in the matmul
     /// store loop. `None` = no epilogue (default). When present, saves
     /// one dispatch + barrier per fused op.
@@ -641,12 +650,33 @@ pub fn compile_with(graph: &Graph, options: &CompileOptions) -> ExecutionPlan {
 pub(crate) fn compile_with_caps(
     graph: &Graph,
     options: &CompileOptions,
+    coop_caps: crate::codegen::CoopCaps,
+) -> ExecutionPlan {
+    let allow_reduced_precision_attention_backward =
+        std::env::var("MEGANEURA_FLASH_BWD_COOP").as_deref() == Ok("1");
+    compile_with_caps_policy(
+        graph,
+        options,
+        coop_caps,
+        allow_reduced_precision_attention_backward,
+    )
+}
+
+fn compile_with_caps_policy(
+    graph: &Graph,
+    options: &CompileOptions,
     mut coop_caps: crate::codegen::CoopCaps,
+    allow_reduced_precision_attention_backward: bool,
 ) -> ExecutionPlan {
     if std::env::var("MEGANEURA_DISABLE_COOP").is_ok() {
         coop_caps = crate::codegen::CoopCaps::default();
     }
-    let mut compiler = Compiler::new_with_options(graph, options.clone(), coop_caps);
+    let mut compiler = Compiler::new_with_options(
+        graph,
+        options.clone(),
+        coop_caps,
+        allow_reduced_precision_attention_backward,
+    );
     compiler.compile();
 
     // Propagate derived parameter info from graph to plan
@@ -970,6 +1000,14 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                 let c = &mut plan.dispatches[ci];
                 let kernel = c.reduction.as_mut().expect("checked");
                 kernel.prologue = kernel.prologue.fuse_input(s as u8, &p_dag);
+                // The reduction epilogue sees the same per-element streams
+                // before its per-column and reduced-value inputs. If it
+                // references the folded stream, expand that input there as
+                // well; otherwise its declared arity no longer matches
+                // n_per_elem and lowering aborts.
+                if let Some(epilogue) = kernel.epilogue.as_mut() {
+                    epilogue.dag = epilogue.dag.fuse_input(s as u8, &p_dag);
+                }
                 kernel.n_per_elem = new_n_per_elem as u8;
                 kernel.gather_elem = Vec::new();
                 // Rebuild input_buffers: producer inputs first (matching
@@ -1072,12 +1110,6 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
     }
 }
 
-/// Post-compile pass: absorb single-use elementwise dispatches into
-/// the preceding matmul's epilogue. Each fused dispatch is replaced
-/// with a no-op (empty shader + zero workgroups) and removed later.
-///
-/// Only fuses into scalar matmul dispatches (not coop) because the
-/// coop store uses coopStoreT which doesn't support per-element epilogues.
 /// Post-compile pass: fuse single-consumer `RmsNorm → MatMul` pairs into
 /// `RmsNormRsqrt + MatMul-with-prologue`. Instead of computing the full
 /// normalized output and writing it to DRAM, the matmul reads raw x and
@@ -1204,6 +1236,9 @@ fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
     }
 }
 
+/// Absorb unary, single-consumer pointwise dispatches into a preceding f32
+/// matmul. Runtime selection may subsequently use either the scalar or
+/// cooperative epilogue implementation.
 fn fuse_epilogues(plan: &mut ExecutionPlan) {
     use std::collections::{HashMap, HashSet};
     // Buffers that must keep their producer unchanged: anything the rest
@@ -1270,6 +1305,7 @@ fn fuse_epilogues(plan: &mut ExecutionPlan) {
         };
         let primary_buf = d.input_buffers[0];
         let elem_output = d.output_buffer;
+        let consumer_requires_full_precision = d.requires_full_precision;
 
         // The elementwise op reads from primary_buf. Find the matmul that produced it.
         let Some(&prod_idx) = producer.get(&primary_buf) else {
@@ -1277,7 +1313,10 @@ fn fuse_epilogues(plan: &mut ExecutionPlan) {
         };
         let prod = &dispatches[prod_idx];
 
-        // Only fuse into matmul dispatches (not coop — coop uses coopStoreT)
+        // Weighted kernels have a different B-buffer declaration and are
+        // compiled through `generate_module_weighted`. The epilogue generator
+        // currently emits only the f32 layout, so keep f16/Q4/Q8 matmuls
+        // separate until those two codegen paths are composed explicitly.
         let is_matmul = matches!(
             prod.shader,
             ShaderEntry::MatMul
@@ -1287,7 +1326,7 @@ fn fuse_epilogues(plan: &mut ExecutionPlan) {
                 | ShaderEntry::FusedMatMulATAdd
                 | ShaderEntry::FusedMatMulBTAdd
         );
-        if !is_matmul || prod.use_coop {
+        if !is_matmul || prod.use_coop || prod.weight_format != WeightFormat::F32 {
             continue;
         }
 
@@ -1343,6 +1382,7 @@ fn fuse_epilogues(plan: &mut ExecutionPlan) {
         };
         dispatches[prod_idx].epilogue.push(legacy_op);
 
+        dispatches[prod_idx].requires_full_precision |= consumer_requires_full_precision;
         dispatches[prod_idx].output_buffer = elem_output;
         producer.insert(elem_output, prod_idx);
 
@@ -1422,6 +1462,10 @@ struct Compiler<'a> {
     /// attention selection is plan-time (unlike ordinary matmul selection),
     /// so this must be the eventual session's target rather than global state.
     coop_caps: crate::codegen::CoopCaps,
+    /// Experimental f16-input attention backward is deliberately separate
+    /// from device capability: availability does not imply adequate gradient
+    /// accuracy.
+    allow_reduced_precision_attention_backward: bool,
     /// Fused GradKV: maps fwd_node → pre-allocated dV buffer.
     /// When GradK is compiled, it emits a fused GradKV dispatch and
     /// pre-allocates the dV buffer here. When GradV is later compiled
@@ -1434,6 +1478,7 @@ impl<'a> Compiler<'a> {
         graph: &'a Graph,
         options: CompileOptions,
         coop_caps: crate::codegen::CoopCaps,
+        allow_reduced_precision_attention_backward: bool,
     ) -> Self {
         Self {
             graph,
@@ -1453,6 +1498,7 @@ impl<'a> Compiler<'a> {
             node_buffers: HashMap::new(),
             options,
             coop_caps,
+            allow_reduced_precision_attention_backward,
             fused_grad_kv_dv: HashMap::new(),
         }
     }
@@ -1562,7 +1608,7 @@ impl<'a> Compiler<'a> {
                 Op::Parameter { ref name } => {
                     self.plan.param_buffers.push((name.clone(), buf));
                     let wf = WeightFormat::from_dtype(node.ty.dtype);
-                    if wf.is_quantized() {
+                    if wf.uses_reduced_storage() {
                         let shape = &node.ty.shape;
                         let (rows, cols) = if shape.len() >= 2 {
                             (shape[0], shape[1])
@@ -1628,8 +1674,7 @@ impl<'a> Compiler<'a> {
                 }
                 ShaderEntry::MultiHeadAttn
                 | ShaderEntry::MultiHeadAttnGradQ
-                | ShaderEntry::MultiHeadAttnGradK
-                | ShaderEntry::MultiHeadAttnGradV => {
+                | ShaderEntry::MultiHeadAttnGradKV => {
                     let nh = d.params[2] >> 16;
                     let nkv = d.params[2] & 0xFFFF;
                     format!(
@@ -1701,6 +1746,7 @@ impl<'a> Compiler<'a> {
 
     fn compile_node(&mut self, node: &Node) {
         let out_buf = self.get_buffer(node.id);
+        let dispatch_start = self.plan.dispatches.len();
 
         match node.op {
             // Leaf nodes and dead nodes: no dispatch needed
@@ -3240,13 +3286,12 @@ impl<'a> Compiler<'a> {
                     Op::SlidingWindowAttention { window_size, .. } => window_size,
                     _ => 0,
                 };
-                // Pick coop GradQ when the GPU has 16x16 f16
-                // coop_matrix and the shape is compatible. Default-on;
-                // `MEGANEURA_FLASH_BWD_COOP=0` is the regression
-                // escape hatch.
-                let bwd_coop_disabled =
-                    std::env::var("MEGANEURA_FLASH_BWD_COOP").as_deref() == Ok("0");
-                let bwd_coop_enabled = !bwd_coop_disabled
+                // The cooperative backward path rounds dO to f16 before its
+                // matrix products. Unlike forward activations, small
+                // derivatives can lose material information there, so keep
+                // this experimental path explicit rather than enabling it
+                // merely because the device advertises f16 matrices.
+                let bwd_coop_enabled = self.allow_reduced_precision_attention_backward
                     && self.coop_caps.supports_16x16_f16()
                     && head_dim >= 16
                     && head_dim.is_multiple_of(16)
@@ -3329,12 +3374,10 @@ impl<'a> Compiler<'a> {
                 ];
                 let (grad_kv_shader, grad_kv_wgs) =
                     Self::attention_dispatch_bwd(dispatch_kv, head_dim, num_kv_heads);
-                // Pick coop GradKV when the GPU has 16x16 f16
-                // coop_matrix and shape is compatible. Default-on;
-                // opt-out via `MEGANEURA_FLASH_BWD_COOP=0`.
-                let bwd_coop_disabled =
-                    std::env::var("MEGANEURA_FLASH_BWD_COOP").as_deref() == Ok("0");
-                let bwd_coop_enabled = !bwd_coop_disabled
+                // See GradQ above: reduced-input precision in backward is an
+                // experimental opt-in until its error is bounded (or loss
+                // scaling keeps the derivative operands representable).
+                let bwd_coop_enabled = self.allow_reduced_precision_attention_backward
                     && self.coop_caps.supports_16x16_f16()
                     && head_dim >= 16
                     && head_dim.is_multiple_of(16)
@@ -3366,62 +3409,17 @@ impl<'a> Compiler<'a> {
                 }
             }
 
-            Op::MultiHeadAttnGradV {
-                fwd_node,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                ..
-            } => {
-                // If fused GradKV already computed dV, just reuse its buffer.
-                if let Some(&dv_buf) = self.fused_grad_kv_dv.get(&fwd_node) {
-                    // Point this node's output to the pre-allocated dV buffer.
-                    // No dispatch needed — dV was already written by GradKV.
-                    self.node_buffers.insert(node.id, dv_buf);
-                    return;
-                }
-                // Fallback: separate GradV dispatch (shouldn't happen normally).
-                let d_out = self.get_buffer(node.inputs[0]);
-                let q = self.get_buffer(node.inputs[1]);
-                let k = self.get_buffer(node.inputs[2]);
-                let v = self.get_buffer(node.inputs[3]);
-                let fwd_o = self.get_buffer(fwd_node);
-                let lse_buf = self.find_lse_buffer(fwd_node);
-                let q_seq = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
-                let fwd_op = &self.graph.node(fwd_node).op;
-                let is_causal = matches!(
-                    fwd_op,
-                    Op::CausalAttention { .. }
-                        | Op::CausalAttentionRoPE { .. }
-                        | Op::SlidingWindowAttention { .. }
-                );
-                let kv_seq = if is_causal {
-                    0
-                } else {
-                    self.graph.node(node.inputs[2]).ty.shape[0] as u32
-                };
-                let window_size = match *fwd_op {
-                    Op::SlidingWindowAttention { window_size, .. } => window_size,
-                    _ => 0,
-                };
-                let dispatch_kv = if is_causal { q_seq } else { kv_seq };
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::MultiHeadAttnGradV,
-                    workgroups: [dispatch_kv, num_kv_heads, 1],
-                    input_buffers: vec![d_out, q, k, v, lse_buf, fwd_o],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![
-                        q_seq,
-                        kv_seq,
-                        (num_heads << 16) | num_kv_heads,
-                        head_dim,
-                        window_size,
-                    ],
-                    use_coop: false,
-                    use_small_tiles: false,
-                    ..Default::default()
+            Op::MultiHeadAttnGradV { fwd_node, .. } => {
+                // GradK is deliberately compiled as a fused dK+dV dispatch.
+                // Autodiff appends GradK before GradV, and topological sorting
+                // preserves that dependency-equivalent ID order.
+                let dv_buf = *self.fused_grad_kv_dv.get(&fwd_node).unwrap_or_else(|| {
+                    panic!(
+                        "attention GradV for forward node {fwd_node} compiled before fused GradKV"
+                    )
                 });
+                self.node_buffers.insert(node.id, dv_buf);
+                return;
             }
 
             Op::SwiGLUGradGate => {
@@ -3647,6 +3645,14 @@ impl<'a> Compiler<'a> {
                     ..Default::default()
                 });
             }
+        }
+
+        // A single graph node can lower to multiple dispatches (for example,
+        // row-parallel normalization gradients). Preserve the node's numeric
+        // policy on every emitted dispatch so runtime kernel selection cannot
+        // silently turn f32 autodiff math into f16-input math.
+        for dispatch in &mut self.plan.dispatches[dispatch_start..] {
+            dispatch.requires_full_precision = node.requires_full_precision;
         }
     }
 
@@ -4021,6 +4027,28 @@ mod tests {
     }
 
     #[test]
+    fn pointwise_into_softmax_updates_reduction_epilogue_arity() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 10]);
+        let shifted = g.neg(x);
+        let sm = g.softmax(shifted);
+        g.set_outputs(vec![sm]);
+
+        let plan = compile(&g);
+        assert!(!plan.dispatches.is_empty());
+        for dispatch in &plan.dispatches {
+            if let Some(reduction) = dispatch.reduction.as_ref()
+                && let Some(epilogue) = reduction.epilogue.as_ref()
+            {
+                assert_eq!(
+                    epilogue.dag.n_inputs,
+                    reduction.n_per_elem + reduction.n_per_row + epilogue.n_per_col_inputs + 1
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_compile_cross_entropy() {
         let mut g = Graph::new();
         let logits = g.input("logits", &[4, 10]);
@@ -4157,6 +4185,23 @@ mod tests {
     }
 
     #[test]
+    fn weighted_matmul_keeps_pointwise_epilogue_separate() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 32]);
+        let w = g.parameter_q4("w", &[32, 64]);
+        let mm = g.matmul(x, w);
+        let output = g.sigmoid(mm);
+        g.set_outputs(vec![output]);
+
+        let plan = compile(&g);
+        assert_eq!(plan.dispatches.len(), 2);
+        assert_eq!(plan.dispatches[0].weight_format, WeightFormat::Q4);
+        assert!(plan.dispatches[0].matmul_epilogue.is_none());
+        assert!(plan.dispatches[0].epilogue.is_empty());
+        assert_eq!(plan.dispatches[1].shader, ShaderEntry::Sigmoid);
+    }
+
+    #[test]
     fn test_shader_entry_mappings() {
         // Verify all shader entries have valid group and entry_point
         let entries = [
@@ -4211,6 +4256,7 @@ mod tests {
             &graph,
             CompileOptions::default(),
             crate::codegen::CoopCaps::default(),
+            false,
         );
         for hd_log2 in 1..=8 {
             let hd: u32 = 1 << hd_log2;
@@ -4233,7 +4279,7 @@ mod tests {
     /// drivers expose (and is also used by RDNA3). Keep this plan-time path
     /// covered even when CI has no matching physical adapter.
     #[test]
-    fn f16_only_target_selects_coop_attention_forward_and_backward() {
+    fn f16_only_target_keeps_attention_backward_safe_by_default() {
         let mut g = Graph::new();
         let q = g.parameter("q", &[256, 64]);
         let k = g.parameter("k", &[256, 64]);
@@ -4247,20 +4293,32 @@ mod tests {
             f16_tile: 16,
             f32_tile: 0,
         };
-        let coop = compile_with_caps(&differentiated, &CompileOptions::default(), f16_only);
-        let coop_entries: Vec<_> = coop
+        let safe =
+            compile_with_caps_policy(&differentiated, &CompileOptions::default(), f16_only, false);
+        let safe_entries: Vec<_> = safe
             .dispatches
             .iter()
             .map(|dispatch| dispatch.shader.clone())
             .collect();
-        assert!(coop_entries.contains(&ShaderEntry::FlashAttentionCoop));
-        assert!(coop_entries.contains(&ShaderEntry::FlashGradQCoop));
-        assert!(coop_entries.contains(&ShaderEntry::FlashGradKVCoop));
+        assert!(safe_entries.contains(&ShaderEntry::FlashAttentionCoop));
+        assert!(!safe_entries.contains(&ShaderEntry::FlashGradQCoop));
+        assert!(!safe_entries.contains(&ShaderEntry::FlashGradKVCoop));
 
-        let scalar = compile_with_caps(
+        let experimental =
+            compile_with_caps_policy(&differentiated, &CompileOptions::default(), f16_only, true);
+        let experimental_entries: Vec<_> = experimental
+            .dispatches
+            .iter()
+            .map(|dispatch| dispatch.shader.clone())
+            .collect();
+        assert!(experimental_entries.contains(&ShaderEntry::FlashGradQCoop));
+        assert!(experimental_entries.contains(&ShaderEntry::FlashGradKVCoop));
+
+        let scalar = compile_with_caps_policy(
             &differentiated,
             &CompileOptions::default(),
             crate::codegen::CoopCaps::default(),
+            false,
         );
         assert!(scalar.dispatches.iter().all(|dispatch| !matches!(
             &dispatch.shader,
@@ -4285,13 +4343,14 @@ mod tests {
         g.set_outputs(vec![loss]);
         let differentiated = crate::autodiff::differentiate(&g);
 
-        let plan = compile_with_caps(
+        let plan = compile_with_caps_policy(
             &differentiated,
             &CompileOptions::default(),
             crate::codegen::CoopCaps {
                 f16_tile: 16,
                 f32_tile: 0,
             },
+            true,
         );
 
         assert!(

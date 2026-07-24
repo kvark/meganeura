@@ -314,7 +314,6 @@ pub enum ShaderGroup {
     FlashAttention,
     MultiHeadAttnGradQ,
     FlashGradQ,
-    MultiHeadAttnGradK,
     MultiHeadAttnGradKV,
     FlashGradKV,
     /// Cooperative-matrix flash attention forward.
@@ -329,7 +328,6 @@ pub enum ShaderGroup {
     /// Two coop matmuls per Q-tile: score = K·Q^T, dp = V·dO^T.
     /// dV/dK accumulate in per-thread registers across the Q loop.
     FlashGradKVCoop,
-    MultiHeadAttnGradV,
     SwiGLUGrad,
     SwiGLUConcat,
     SumRows,
@@ -436,10 +434,8 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::FlashGradKVCoop => generate_flash_grad_kv_coop_module(64),
         ShaderGroup::MultiHeadAttnGradQ => parse_wgsl(include_str!("shaders/mha_grad_q.wgsl")),
         ShaderGroup::FlashGradQ => generate_flash_grad_q_module(64),
-        ShaderGroup::MultiHeadAttnGradK => parse_wgsl(include_str!("shaders/mha_grad_k.wgsl")),
         ShaderGroup::MultiHeadAttnGradKV => parse_wgsl(include_str!("shaders/mha_grad_kv.wgsl")),
         ShaderGroup::FlashGradKV => generate_flash_grad_kv_module(64),
-        ShaderGroup::MultiHeadAttnGradV => parse_wgsl(include_str!("shaders/mha_grad_v.wgsl")),
         ShaderGroup::SwiGLUGrad => parse_wgsl(include_str!("shaders/swiglu_grad.wgsl")),
         ShaderGroup::SwiGLUConcat => parse_wgsl(include_str!("shaders/swiglu_concat.wgsl")),
         ShaderGroup::SumRows => parse_wgsl(include_str!("shaders/sum_rows.wgsl")),
@@ -1161,7 +1157,7 @@ fn gen_matmul_coop_wgsl(
     variant: MatMulCoopVariant,
     config: &CoopConfig,
 ) -> ShaderModule {
-    gen_matmul_coop_wgsl_prologue(fused_add, variant, config, None)
+    gen_matmul_coop_wgsl_full(fused_add, variant, config, None, None)
 }
 
 /// Generate coop matmul with an optional [`crate::compile::MatMulPrologue`].
@@ -1171,14 +1167,42 @@ pub fn gen_matmul_coop_with_prologue(
     config: &CoopConfig,
     prologue: &crate::compile::MatMulPrologue,
 ) -> ShaderModule {
-    gen_matmul_coop_wgsl_prologue(fused_add, variant, config, Some(prologue))
+    gen_matmul_coop_wgsl_full(fused_add, variant, config, Some(prologue), None)
 }
 
-fn gen_matmul_coop_wgsl_prologue(
+/// Generate a cooperative matmul that stages its f32 accumulators through
+/// workgroup memory before applying a scalar PointwiseDAG epilogue.
+///
+/// Cooperative matrix stores do not expose individual accumulator lanes.
+/// The workgroup staging step is therefore the portable bridge between the
+/// matrix operation and arbitrary per-element WGSL. Extra epilogue buffers
+/// are intentionally rejected until the runtime has a dynamic binding layout;
+/// unary chains (the current compiler fusion set) need no extra bindings.
+pub fn generate_coop_matmul_with_dag_epilogue(
+    group: ShaderGroup,
+    config: &CoopConfig,
+    epilogue: &crate::compile::MatMulEpilogue,
+) -> ShaderModule {
+    assert!(
+        epilogue.inputs.is_empty(),
+        "cooperative matmul epilogues with extra buffers are not supported"
+    );
+    let (fused_add, variant) = match group {
+        ShaderGroup::MatMul => (false, MatMulCoopVariant::Normal),
+        ShaderGroup::MatMulAdd => (true, MatMulCoopVariant::Normal),
+        ShaderGroup::MatMulAT => (false, MatMulCoopVariant::AT),
+        ShaderGroup::MatMulBT => (false, MatMulCoopVariant::BT),
+        _ => panic!("cooperative epilogue not supported for {group:?}"),
+    };
+    gen_matmul_coop_wgsl_full(fused_add, variant, config, None, Some(epilogue))
+}
+
+fn gen_matmul_coop_wgsl_full(
     fused_add: bool,
     variant: MatMulCoopVariant,
     config: &CoopConfig,
     prologue: Option<&crate::compile::MatMulPrologue>,
+    epilogue: Option<&crate::compile::MatMulEpilogue>,
 ) -> ShaderModule {
     let tile = config.tile_size;
     let output_tile = config.output_tile();
@@ -1203,8 +1227,11 @@ fn gen_matmul_coop_wgsl_prologue(
         Some(p) => matmul_prologue_to_wgsl(p),
         None => (String::new(), String::new()),
     };
+    let (epilogue_decl, epilogue_body) = match epilogue {
+        Some(e) => matmul_epilogue_to_wgsl(e),
+        None => (String::new(), String::new()),
+    };
 
-    // Vec4 staging: use 128-bit loads when tile is 16+ (64 threads × 4 = 256 = 16×16).
     // Vec4 staging uses 128-bit loads when tile is 16+ (64 threads × 4 = 256 = 16×16).
     // "Direct" vec4: load along the shared-memory column axis (consecutive writes).
     //   B: Normal/AT (B[K,N], load along N)
@@ -1597,6 +1624,56 @@ fn gen_matmul_coop_wgsl_prologue(
     let output_tile_u = format!("{}u", output_tile);
     let tile_size_u = format!("{}u", tile);
     let shared_size_s = format!("{}", shared_size);
+    let result_shared_size = output_tile * output_tile;
+    let (result_shared_decl, result_store) = if epilogue.is_some() {
+        let store_iters = result_shared_size.div_ceil(wg_size);
+        (
+            format!(
+                "var<workgroup> shared_c: array<f32, {}>;",
+                result_shared_size
+            ),
+            format!(
+                "coopStoreT(acc00, &shared_c[0], {output_tile}u);\n\
+                 \x20   coopStoreT(acc01, &shared_c[{tile}u], {output_tile}u);\n\
+                 \x20   coopStoreT(acc10, &shared_c[{}u], {output_tile}u);\n\
+                 \x20   coopStoreT(acc11, &shared_c[{}u], {output_tile}u);\n\
+                 \x20   workgroupBarrier();\n\
+                 \n\
+                 \x20   for (var e = 0u; e < {store_iters}u; e++) {{\n\
+                 \x20       let local_idx = lid.x + e * {wg_size}u;\n\
+                 \x20       if local_idx < {result_shared_size}u {{\n\
+                 \x20           let local_row = local_idx / {output_tile}u;\n\
+                 \x20           let local_col = local_idx - local_row * {output_tile}u;\n\
+                 \x20           let row = tile_row + local_row;\n\
+                 \x20           let col = tile_col + local_col;\n\
+                 \x20           if row < m && col < n {{\n\
+                 \x20               let idx = row * n + col;\n\
+                 \x20               var val = shared_c[local_idx];\n\
+                 \x20               {epilogue_body}\n\
+                 \x20               matrix_c[idx] = val;\n\
+                 \x20           }}\n\
+                 \x20       }}\n\
+                 \x20   }}",
+                tile * output_tile,
+                tile * output_tile + tile,
+            ),
+        )
+    } else {
+        (
+            String::new(),
+            "coopStoreT(acc00, &matrix_c[c00], n);\n\
+             \x20   if n1_valid {\n\
+             \x20       coopStoreT(acc01, &matrix_c[c01], n);\n\
+             \x20   }\n\
+             \x20   if m1_valid {\n\
+             \x20       coopStoreT(acc10, &matrix_c[c10], n);\n\
+             \x20   }\n\
+             \x20   if n1_valid && m1_valid {\n\
+             \x20       coopStoreT(acc11, &matrix_c[c11], n);\n\
+             \x20   }"
+                .to_string(),
+        )
+    };
 
     let src = include_str!("shaders/matmul_coop.wgsl");
     let src = preprocess(
@@ -1617,8 +1694,11 @@ fn gen_matmul_coop_wgsl_prologue(
             ("$A_STAGE_0", &a_stage_0),
             ("$A_STAGE_1", &a_stage_1),
             ("$PROLOGUE_DECL", &prologue_decl),
+            ("$EPILOGUE_DECL", &epilogue_decl),
             ("$FUSED_ADD_DECL", &fused_decl),
             ("$ACC_INIT", &acc_init),
+            ("$RESULT_SHARED_DECL", &result_shared_decl),
+            ("$RESULT_STORE", &result_store),
         ],
     );
     parse_wgsl(&src)
@@ -4817,18 +4897,10 @@ mod tests {
             ),
             (ShaderGroup::FlashGradQ, naga::valid::Capabilities::empty()),
             (
-                ShaderGroup::MultiHeadAttnGradK,
-                naga::valid::Capabilities::empty(),
-            ),
-            (
                 ShaderGroup::MultiHeadAttnGradKV,
                 naga::valid::Capabilities::empty(),
             ),
             (ShaderGroup::FlashGradKV, naga::valid::Capabilities::empty()),
-            (
-                ShaderGroup::MultiHeadAttnGradV,
-                naga::valid::Capabilities::empty(),
-            ),
             (ShaderGroup::SwiGLUGrad, naga::valid::Capabilities::empty()),
             (
                 ShaderGroup::SwiGLUConcat,
@@ -4957,6 +5029,44 @@ mod tests {
         assert!(!module.source.contains("atomicLoad"));
     }
 
+    #[test]
+    fn cooperative_matmul_epilogue_stages_and_validates() {
+        use crate::compile::MatMulEpilogue;
+        use crate::schedule::{PointwiseDAG, Pw};
+        use naga::valid::{Capabilities, ValidationFlags, Validator};
+
+        let epilogue = MatMulEpilogue {
+            dag: PointwiseDAG {
+                n_inputs: 1,
+                ops: vec![Pw::LoadInput(0), Pw::Silu(0), Pw::Relu(1)],
+                output: 2,
+            },
+            inputs: Vec::new(),
+        };
+        let config = CoopConfig {
+            tile_size: 16,
+            use_f16_input: true,
+        };
+        let capabilities = Capabilities::COOPERATIVE_MATRIX | Capabilities::SHADER_FLOAT16;
+        let flags = ValidationFlags::all() ^ ValidationFlags::BINDINGS;
+
+        for group in [
+            ShaderGroup::MatMul,
+            ShaderGroup::MatMulAdd,
+            ShaderGroup::MatMulAT,
+            ShaderGroup::MatMulBT,
+        ] {
+            let module = generate_coop_matmul_with_dag_epilogue(group, &config, &epilogue);
+            assert!(module.source.contains("shared_c"));
+            assert!(module.source.contains("var val = shared_c[local_idx]"));
+            Validator::new(flags, capabilities)
+                .validate(&module.module)
+                .unwrap_or_else(|error| {
+                    panic!("{group:?} cooperative epilogue failed validation: {error:#?}")
+                });
+        }
+    }
+
     /// Verify every shader group compiles to SPIR-V without panics.
     /// This catches "Expression [N] is not cached!" bugs in hand-built IR.
     /// Skipped on Apple targets where naga's spv-out backend is not available.
@@ -5000,11 +5110,9 @@ mod tests {
             (ShaderGroup::MultiHeadAttnGradQ, empty),
             (ShaderGroup::FlashGradQ, empty),
             (ShaderGroup::FlashGradQCoop, coop),
-            (ShaderGroup::MultiHeadAttnGradK, empty),
             (ShaderGroup::MultiHeadAttnGradKV, empty),
             (ShaderGroup::FlashGradKV, empty),
             (ShaderGroup::FlashGradKVCoop, coop),
-            (ShaderGroup::MultiHeadAttnGradV, empty),
             (ShaderGroup::SwiGLUGrad, empty),
             (ShaderGroup::SwiGLUConcat, empty),
             (ShaderGroup::SumRows, empty),
@@ -5151,9 +5259,7 @@ mod tests {
                 }
                 ShaderEntry::MultiHeadAttnGradQ
                 | ShaderEntry::FlashGradQ
-                | ShaderEntry::FlashGradQCoop
-                | ShaderEntry::MultiHeadAttnGradK
-                | ShaderEntry::MultiHeadAttnGradV => {
+                | ShaderEntry::FlashGradQCoop => {
                     vec![
                         "d_out", "src_a", "src_b", "bias", "lse", "fwd_dst", "dst", "params",
                     ]
@@ -5287,10 +5393,8 @@ mod tests {
             ShaderEntry::FlashGradKVCoop,
             ShaderEntry::MultiHeadAttnGradQ,
             ShaderEntry::FlashGradQ,
-            ShaderEntry::MultiHeadAttnGradK,
             ShaderEntry::MultiHeadAttnGradKV,
             ShaderEntry::FlashGradKV,
-            ShaderEntry::MultiHeadAttnGradV,
             ShaderEntry::SwiGLUGradGate,
             ShaderEntry::SwiGLUGradUp,
             ShaderEntry::SwiGLUConcat,

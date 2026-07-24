@@ -56,10 +56,7 @@ pub fn build_encoder(g: &mut Graph, config: &WhisperConfig, batch: u32, mel_len:
 
     // Conv1: (n_mels → d_model, kernel=3, stride=1, padding=1)
     let conv1_w = g.parameter(&format!("{prefix}.conv1.weight"), &[d * config.n_mels * 3]);
-    let conv1_b = g.parameter(
-        &format!("{prefix}.conv1.fused_bias"),
-        &[(batch as usize * d * mel_len as usize)],
-    );
+    let conv1_b = g.parameter(&format!("{prefix}.conv1.fused_bias"), &[d]);
     // Conv1d as Conv2d with H=mel_len, W=1. Padding on H only (temporal axis).
     let x = g.conv2d_hw(
         mel,
@@ -75,20 +72,17 @@ pub fn build_encoder(g: &mut Graph, config: &WhisperConfig, batch: u32, mel_len:
         1,
         0,
     );
-    let x = g.add(x, conv1_b);
+    let x = g.add_per_channel(x, conv1_b, d as u32, mel_len);
     let x = g.gelu(x);
 
     // Conv2: (d_model → d_model, kernel=3, stride=2, padding=1 on H only)
     let seq_len = (mel_len + 2 - 3) / 2 + 1;
     let conv2_w = g.parameter(&format!("{prefix}.conv2.weight"), &[d * d * 3]);
-    let conv2_b = g.parameter(
-        &format!("{prefix}.conv2.fused_bias"),
-        &[(batch as usize * d * seq_len as usize)],
-    );
+    let conv2_b = g.parameter(&format!("{prefix}.conv2.fused_bias"), &[d]);
     let x = g.conv2d_hw(
         x, conv2_w, batch, d as u32, mel_len, 1, d as u32, 3, 1, 2, 1, 0,
     );
-    let x = g.add(x, conv2_b);
+    let x = g.add_per_channel(x, conv2_b, d as u32, seq_len);
     let x = g.gelu(x);
 
     // The conv output is [batch * d_model * seq_len] in NCHW(flat).
@@ -109,6 +103,8 @@ pub fn build_encoder(g: &mut Graph, config: &WhisperConfig, batch: u32, mel_len:
         &format!("{prefix}.embed_positions.weight"),
         &[seq_len as usize, d],
     );
+    // Hugging Face Whisper keeps its sinusoidal positional table frozen.
+    let pos_embed = g.stop_gradient(pos_embed);
     let mut x = g.add(x, pos_embed);
 
     for i in 0..config.n_layers {
@@ -171,20 +167,13 @@ pub fn build_encoder(g: &mut Graph, config: &WhisperConfig, batch: u32, mel_len:
 
 /// Build a Whisper encoder training graph (forward + MSE loss on encoder output).
 ///
-/// This is a simplified training setup: the encoder output is projected to a
-/// fixed dimension and compared against a target via MSE loss. Useful for
-/// fine-tuning or benchmarking training throughput.
+/// This synthetic objective keeps the timed work focused on the encoder and
+/// matches the reference benchmark's `mean(encoder_output²)` objective.
 pub fn build_training_graph(config: &WhisperConfig, batch: u32, mel_len: u32) -> Graph {
     let mut g = Graph::new();
     let encoder_out = build_encoder(&mut g, config, batch, mel_len);
-    // Project encoder output to a small dimension, then cross-entropy loss.
-    // This exercises the full backward through attention + LayerNorm + GELU.
-    let seq_len = (mel_len / 2) as usize;
-    let num_classes = 64;
-    let proj_w = g.parameter("train_proj.weight", &[config.d_model, num_classes]);
-    let logits = g.matmul(encoder_out, proj_w); // [seq, num_classes]
-    let labels = g.input("labels", &[seq_len, num_classes]);
-    let loss = g.cross_entropy_loss(logits, labels);
+    let squared = g.mul(encoder_out, encoder_out);
+    let loss = g.mean_all(squared);
     g.set_outputs(vec![loss]);
     g
 }

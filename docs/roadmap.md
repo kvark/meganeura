@@ -3,7 +3,7 @@
 Strategic plan for making meganeura faster while preserving its core
 property: **no hand-written kernel per model pattern** — everything
 composes from the four archetypes (pointwise, reduction, matmul,
-attention) plus e-graph fusion.
+attention) plus graph fusion.
 
 ## Positioning
 
@@ -94,33 +94,36 @@ identical fusion counts per block.
 superlinearly; smaller pipeline population (identical blocks share
 pipelines — they mostly already do via shape-keyed caches).
 
-### A2. Single owner for kernel-variant selection
+### A2. Single owner for kernel-variant selection  ← *partially landed*
 
-**Problem.** Geometry is chosen in `compile.rs` (dispatch emission),
-then *rewritten* at session build (`runtime.rs:1796-1906` coop and
-small-tile selection), while pipeline lookup (`Pipelines::get`,
-`runtime.rs:1130`) makes its own independent decision. The
-disagreements are documented hazards: epilogue+coop is disabled
-because the lookup returns the scalar epilogue pipeline before
-checking `use_coop` while the geometry was already rewritten for coop
-(`runtime.rs:1734-1742`) — so every fused-epilogue matmul is stuck on
-scalar geometry.
+**Original problem.** Geometry was chosen in `compile.rs`, rewritten
+again during session construction, and independently interpreted by
+pipeline lookup. The historical epilogue+coop path could therefore
+run a scalar epilogue pipeline with cooperative geometry and leave
+output rows unwritten.
 
-**Plan.** Make session build produce, per dispatch, an atomic
+**Landed.** Cooperative matmul now has a guarded PointwiseDAG
+store-phase epilogue. Pipeline maps are keyed by the actual DAG, and
+runtime promotion requires an epilogue form the cooperative generator
+supports. Accumulator tiles are staged through workgroup memory before
+guarded scalar lanes evaluate the DAG. A 1024×16 by 16×128 GPU
+regression test verifies both cooperative selection and output parity.
+
+**Remaining plan.** Make session build produce, per dispatch, an atomic
 `(pipeline key, geometry, buffer padding requirement)` in one pass
 that has access to GPU caps. `Pipelines::get` becomes a pure map
-lookup with no fallback hierarchy. Then enable the blocked variant:
-coop matmul with PointwiseDAG store-phase epilogue (the codegen
-already supports emitting the DAG body; it's the selection layering
-that blocks it).
+lookup with no fallback hierarchy. Extend cooperative epilogues beyond
+the current unary/no-extra-binding subset only when an active graph
+and profile justify each form.
 
 **Touchpoints.** `runtime.rs` (variant selection pass, `Pipelines`),
 `codegen.rs` (coop store epilogue emission).
 
-**Validation.** Existing correctness suite; new test asserting
-epilogue dispatches take the coop path when caps allow; benchmark
-SmolVLA / SmolLM2 train (every transformer MLP has a fused bias/act
-epilogue).
+**Validation.** The existing correctness suite and the new cooperative
+epilogue test pass. Current SmolLM uses packed SwiGLU and has no
+epilogue-bearing matmul at the relevant sites, so the specialization
+does not recover the historical result. Profile the current graph
+before broadening the path.
 
 ### A3. Bytes-moved cost model for extraction  ← *landed*
 
@@ -405,7 +408,8 @@ milestone after B1/C1.
 ```
 Now        B1 aliasing ──→ B2 device-local ──→ B3 remat [research]
            A1 outlining ──→ A3 bytes-moved cost ─┘
-Next       A2 variant-selection unification (unlocks coop+epilogue)
+Next       A2 remaining variant-selection unification
+              (safe unary coop+epilogue landed)
            C1 split-f16 coop ──→ C3 MP recipe ──→ C2 bf16 (after naga/blade)
 Parallel   E2 re-measures (1 day, hardware exists)
            D1 horizontal fusion

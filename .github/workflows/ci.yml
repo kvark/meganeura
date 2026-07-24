@@ -91,7 +91,13 @@ jobs:
         run: cargo test --test cache_inference
 
       - name: Audit regression tests
-        run: cargo test --test checkpoint_validation --test mixed_attention_widths -- --test-threads=1
+        run: >-
+          cargo test
+          --test checkpoint_validation
+          --test coop_matmul_skinny
+          --test mha_head_dim32
+          --test mixed_attention_widths
+          -- --test-threads=1
 
       - name: Vision ops smoke test
         run: cargo test --test vision_ops_smoke -- --skip vision_encoder_one_layer

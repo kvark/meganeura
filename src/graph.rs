@@ -560,6 +560,12 @@ pub struct Node {
     pub op: Op,
     pub inputs: Vec<NodeId>,
     pub ty: TensorType,
+    /// Prevent reduced-precision kernel promotion for numerically sensitive
+    /// work derived by autodiff. Forward tensors remain logically f32 too;
+    /// this flag only constrains optional runtime accelerations such as
+    /// f16-input cooperative matrices.
+    #[serde(default)]
+    pub requires_full_precision: bool,
 }
 
 /// How a derived parameter is computed from its source(s).
@@ -591,6 +597,10 @@ pub struct DerivedParam {
 pub struct Graph {
     nodes: Vec<Node>,
     outputs: Vec<NodeId>,
+    /// Precision policy inherited by newly appended nodes. Autodiff switches
+    /// this on after copying the forward graph so all derivative work is
+    /// marked without giving gradient ops a parallel set of IR variants.
+    new_nodes_require_full_precision: bool,
     /// Number of trailing entries in `outputs` that are parameter gradients
     /// appended by autodiff (positionally aligned with `param_buffers` in the
     /// compiled plan). The leading `outputs.len() - num_param_grad_outputs`
@@ -605,6 +615,7 @@ impl Graph {
         Self {
             nodes: Vec::new(),
             outputs: Vec::new(),
+            new_nodes_require_full_precision: false,
             num_param_grad_outputs: 0,
             derived_params: Vec::new(),
         }
@@ -684,7 +695,12 @@ impl Graph {
                 .iter()
                 .filter_map(|&inp| old_to_new[inp as usize])
                 .collect();
-            new_graph.add_raw_node(op, new_inputs, node.ty.clone());
+            new_graph.add_raw_node_with_precision(
+                op,
+                new_inputs,
+                node.ty.clone(),
+                node.requires_full_precision,
+            );
         }
 
         // Remap outputs. An output being Nop'd would silently drop it and
@@ -754,9 +770,32 @@ impl Graph {
     }
 
     pub fn add_raw_node(&mut self, op: Op, inputs: Vec<NodeId>, ty: TensorType) -> NodeId {
+        self.add_raw_node_with_precision(op, inputs, ty, self.new_nodes_require_full_precision)
+    }
+
+    pub(crate) fn add_raw_node_with_precision(
+        &mut self,
+        op: Op,
+        inputs: Vec<NodeId>,
+        ty: TensorType,
+        requires_full_precision: bool,
+    ) -> NodeId {
         let id = self.nodes.len() as NodeId;
-        self.nodes.push(Node { id, op, inputs, ty });
+        self.nodes.push(Node {
+            id,
+            op,
+            inputs,
+            ty,
+            requires_full_precision,
+        });
         id
+    }
+
+    /// Mark subsequently appended nodes as numerically sensitive derivative
+    /// work. This is intentionally crate-private: graph authors express f32
+    /// tensors as usual, while autodiff owns the forward/backward boundary.
+    pub(crate) fn begin_full_precision_region(&mut self) {
+        self.new_nodes_require_full_precision = true;
     }
 
     pub fn nodes_mut(&mut self) -> &mut Vec<Node> {
@@ -764,9 +803,7 @@ impl Graph {
     }
 
     fn add_node(&mut self, op: Op, inputs: Vec<NodeId>, ty: TensorType) -> NodeId {
-        let id = self.nodes.len() as NodeId;
-        self.nodes.push(Node { id, op, inputs, ty });
-        id
+        self.add_raw_node(op, inputs, ty)
     }
 
     // --- Leaf nodes ---

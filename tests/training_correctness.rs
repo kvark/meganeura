@@ -309,7 +309,7 @@ fn smolvla_training_loss_decreases() {
 }
 
 // ---------------------------------------------------------------------------
-// SD U-Net
+// Conditioned diffusion U-Net
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -328,7 +328,7 @@ fn sd_unet_training_loss_decreases() {
     let in_size = (batch * in_c * res * res) as usize;
 
     eprintln!(
-        "SD U-Net training test: batch={}, res={}, in_c={}",
+        "Conditioned diffusion U-Net training test: batch={}, res={}, in_c={}",
         batch, res, in_c
     );
     let mut g = Graph::new();
@@ -338,11 +338,19 @@ fn sd_unet_training_loss_decreases() {
 
     let noisy_latent: Vec<f32> = (0..in_size).map(|i| (i as f32 * 0.01).sin()).collect();
     let noise_target: Vec<f32> = (0..in_size).map(|i| (i as f32 * 0.007).cos()).collect();
+    let timestep_embedding: Vec<f32> = (0..config.time_input_dim as usize)
+        .map(|i| (i as f32 * 0.03).sin())
+        .collect();
+    let text_context: Vec<f32> = (0..(config.context_len * config.context_dim) as usize)
+        .map(|i| (i as f32 * 0.001).cos() * 0.1)
+        .collect();
 
     verify_training_decreases_loss(
         session,
         move |s| {
             s.set_input("noisy_latent", &noisy_latent);
+            s.set_input("timestep_embedding", &timestep_embedding);
+            s.set_input("text_context", &text_context);
             s.set_input("noise_target", &noise_target);
         },
         5,
@@ -481,8 +489,6 @@ fn whisper_encoder_training_loss_decreases() {
     let config = WhisperConfig::whisper_tiny();
     let batch = 1;
     let mel_len = 100; // short clip for testing
-    let seq_len = (mel_len / 2) as usize;
-    let num_classes = 64;
 
     let g = whisper::build_training_graph(&config, batch, mel_len);
 
@@ -491,12 +497,7 @@ fn whisper_encoder_training_loss_decreases() {
         |s| {
             let mel_size = (batch * config.n_mels as u32 * mel_len) as usize;
             let mel: Vec<f32> = (0..mel_size).map(|i| (i as f32 * 0.01).sin()).collect();
-            let mut labels = vec![0.0f32; seq_len * num_classes];
-            for i in 0..seq_len {
-                labels[i * num_classes + (i % num_classes)] = 1.0;
-            }
             s.set_input("mel", &mel);
-            s.set_input("labels", &labels);
         },
         5,
         0.001,

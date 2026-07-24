@@ -1,0 +1,693 @@
+\documentclass[10pt,twocolumn]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=0.72in]{geometry}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{microtype}
+\usepackage{tabularx}
+\usepackage{tikz}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{url}
+\usetikzlibrary{arrows.meta,positioning}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!55!black,
+  citecolor=blue!55!black,
+  urlcolor=blue!55!black
+}
+
+\newcommand{\system}{Meganeura}
+\newcommand{\inferena}{Inferena}
+\newcommand{\tbd}[1]{\textcolor{red}{[TBD: #1]}}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{\system{}: How Close Can Portable Graphics APIs Get to\\
+Vendor-Native Machine Learning?}
+\author{Dzmitry Malyshau\\[-0.15em]
+{\small Project and artifact: \url{https://github.com/kvark/meganeura}}}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Machine-learning training is concentrated in feature-rich vendor-native
+stacks, while deployed inference is commonly rebuilt for a collection of
+platform-specific runtimes. We ask how close a single portable implementation
+can come to those stacks while supporting both training and inference.
+We present \system{}, a Rust system that lowers a typed static graph and its
+automatically differentiated training graph to specialized GPU programs
+executed through Vulkan and Metal. Its compiler combines graph rewriting,
+composable kernel archetypes for pointwise, reduction, matrix, convolution,
+and attention operations, target-aware specialization, and lifetime-based
+memory planning.
+
+We evaluate five matched transformer, robotics, diffusion, vision, and speech
+workloads against PyTorch on \tbd{the frozen device set}. Our primary results
+use a strict-f32 arithmetic contract; a separate accelerated class permits
+documented reduced-input, f32-accumulate hardware paths. We report forward and
+backward correctness independently, retain raw timing distributions, and
+analyze both competitive cases and substantial remaining gaps. We further
+report negative results from direct backend-IR authoring and from applying
+equality saturation to a rewrite space whose useful choices are currently
+local. The results show that a uniform portable training-and-inference stack
+is practical and competitive on selected workloads, while identifying the
+kernel coverage, launch structure, and arithmetic constraints required to
+make that result general.
+\end{abstract}
+
+\section{Introduction}
+
+The software path used to train a model is often not the path used to deploy
+it. Training commonly relies on PyTorch~\cite{paszke2019pytorch} and vendor
+libraries; deployment may use TensorRT, Core ML, a mobile runtime, a browser
+engine, or a bespoke application stack. Each boundary duplicates model
+conversion, operator coverage, numerical policy, profiling, and correctness
+work. It also makes training or adaptation on the deployed device unusually
+difficult.
+
+Consumer graphics APIs offer a tempting common substrate. Vulkan covers
+desktop, mobile, and embedded GPUs across vendors, while Metal exposes Apple
+GPUs. Both offer general compute and increasingly expose matrix hardware.
+They do not, however, provide the complete compiler, kernel library, graph
+capture, and debugging ecosystem available to CUDA applications. A portable
+system must decide which layers of that ecosystem it can replace, which
+hardware features it can use safely, and how much performance it loses.
+
+This paper studies that tradeoff through \system{}. The same typed graph,
+automatic differentiation, compiler, shader generator, memory planner, and
+runtime execute inference and forward--loss--backward training. The runtime
+uses Vulkan on Linux, Windows, and Android, and Metal on Apple platforms. It
+does not require CUDA, ROCm, or Python in the deployed application.
+
+Our goal is not to show that graphics APIs universally beat mature native
+libraries. Instead, we ask six concrete questions:
+\begin{enumerate}
+  \item What fraction of PyTorch performance does a compact portable stack
+        recover for inference, minimal-shape latency, and training?
+  \item Does the same implementation remain competitive across GPU vendors
+        and device classes?
+  \item How do strict f32 and documented hardware-fast arithmetic change both
+        speed and numerical agreement?
+  \item Which gains come from rewrites, kernel specialization, cooperative
+        matrices, and memory planning?
+  \item Which kernels and launch patterns explain the remaining gap?
+  \item Which compiler representations made the system easier or harder to
+        build?
+\end{enumerate}
+
+This work makes the following contributions:
+\begin{itemize}
+  \item A compact, executable Vulkan/Metal system whose shared graph and
+        compiler path supports both inference and automatically
+        differentiated training.
+  \item A controlled performance-portability methodology with matched
+        workloads, explicit arithmetic contracts, raw timing samples, and
+        separate forward and backward correctness gates.
+  \item An empirical decomposition of portable versus vendor-native
+        performance across five model families and
+        \tbd{number and classes of frozen devices}.
+  \item Negative and mixed engineering results: direct Naga-IR authoring was
+        substantially more verbose than generated WGSL, and equality
+        saturation did not outperform greedy rewriting for the current rule
+        set.
+\end{itemize}
+
+\section{Scope and Design Goals}
+
+\paragraph{One stack for two phases.}
+Inference and training are modes of one compiler rather than separate
+products. Training differentiates the optimized forward graph, preserves the
+forward outputs, and appends one gradient output per parameter. Inference
+omits derivative nodes and may apply inference-only fusions.
+
+\paragraph{Portable execution, specialized programs.}
+Portability does not imply one untuned kernel. \system{} generates specialized
+programs for matrix shape, transpose mode, tile geometry, input format,
+prologue, and epilogue. The invariant is that specialization remains behind
+the same graph/runtime interface and lowers through the graphics stack.
+
+\paragraph{Correctness before peak numbers.}
+Every reported cell is conditional on a numerical contract. Inference and
+training are validated independently because an accelerated forward pass can
+remain accurate while small derivative operands underflow in a reduced input
+format.
+
+\paragraph{Non-goals.}
+\system{} is not a complete replacement for PyTorch, does not cover arbitrary
+dynamic Python programs, and does not claim the breadth of CUDA, cuDNN, or
+large production compilers. The evaluation asks what this deliberately
+compact system achieves and where it stops.
+
+\section{\system{} Architecture}
+
+\begin{figure}[t]
+\centering
+\resizebox{\columnwidth}{!}{%
+\begin{tikzpicture}[
+  font=\sffamily\scriptsize,
+  node distance=3.5mm,
+  box/.style={
+    draw=black!55,
+    rounded corners=2pt,
+    minimum height=7mm,
+    align=center,
+    inner xsep=4pt,
+    inner ysep=2pt
+  },
+  input/.style={box, fill=gray!10},
+  graph/.style={box, fill=blue!11},
+  train/.style={box, fill=orange!15},
+  compile/.style={box, fill=violet!11},
+  runtime/.style={box, fill=green!13},
+  backend/.style={box, fill=teal!13},
+  arrow/.style={-{Latex[length=1.8mm]}, semithick, draw=black!65}
+]
+  \node[input, text width=31mm] (source)
+    {Native builder\\or ONNX / NNEF importer};
+  \node[graph, text width=26mm, below=of source] (typed)
+    {Typed static graph};
+  \node[graph, text width=26mm, below=of typed] (rewrite)
+    {Graph rewrites and ordering};
+  \node[graph, text width=23mm, below left=5mm and 3mm of rewrite] (infer)
+    {Inference\\forward graph};
+  \node[train, text width=27mm, below right=5mm and 3mm of rewrite] (training)
+    {Autodiff\\forward + backward};
+  \node[compile, text width=42mm, below=13mm of rewrite] (specialize)
+    {Kernel archetypes + target specialization\\
+     device capabilities + precision policy};
+  \node[compile, text width=34mm, below=of specialize] (naga)
+    {Generated WGSL\\validated Naga IR};
+  \node[runtime, text width=34mm, below=of naga] (plan)
+    {Static dispatch\\+ memory plan};
+  \node[backend, text width=15mm, below left=4mm and 2mm of plan] (vulkan)
+    {Vulkan};
+  \node[backend, text width=15mm, below right=4mm and 2mm of plan] (metal)
+    {Metal};
+
+  \draw[arrow] (source) -- (typed);
+  \draw[arrow] (typed) -- (rewrite);
+  \draw[arrow] (rewrite.south) -- ++(0,-2mm) -| (infer.north);
+  \draw[arrow] (rewrite.south) -- ++(0,-2mm) -| (training.north);
+  \draw[arrow] (infer.south) |- (specialize.west);
+  \draw[arrow] (training.south) |- (specialize.east);
+  \draw[arrow] (specialize) -- (naga);
+  \draw[arrow] (naga) -- (plan);
+  \draw[arrow] (plan.south) -- ++(0,-2mm) -| (vulkan.north);
+  \draw[arrow] (plan.south) -- ++(0,-2mm) -| (metal.north);
+
+\end{tikzpicture}%
+}
+\caption{The shared training and inference compilation pipeline. Training adds
+autodiff to the optimized forward graph; both modes then use the same
+specialization, validation, scheduling, memory-planning, and backend path.}
+\label{fig:pipeline}
+\end{figure}
+
+\subsection{Typed graph and automatic differentiation}
+
+Graph nodes carry an operation, typed tensor shape, inputs, and a precision
+policy. Builders cover dense and quantized parameters, pointwise operations,
+reductions, normalization, matrix multiplication variants, convolution,
+attention, indexing, and losses. ONNX and NNEF importers lower to the same
+graph used by native model builders.
+
+Training first optimizes and topologically sorts the forward graph, then
+applies reverse-mode automatic differentiation. Multiple derivative paths are
+combined explicitly in the graph. Backward-only nodes include transposed
+matrix products, normalization derivatives, attention derivatives,
+convolution input/weight derivatives, scatters, and shape-routing operations.
+
+A precision bit is attached to derivative regions. It prevents an optional
+f16-input cooperative-matrix promotion from rounding small gradient operands,
+while still allowing a native f32 cooperative path where a device exposes
+one. This policy was added after the Whisper workload showed that forward
+agreement alone did not bound training error (Section~\ref{sec:precision}).
+
+\subsection{Graph rewriting}
+
+\system{} recognizes algebraic and implementation-level forms such as
+$x\,\sigma(x)\rightarrow\mathrm{SiLU}(x)$, decomposed
+SiLU-gating $\rightarrow$ SwiGLU, matrix-product plus residual, and packed
+projection forms. A tensor-traffic cost estimates bytes read and written by an
+extracted graph.
+
+The compiler supports deterministic greedy rewriting and several
+equality-saturation modes built with egglog~\cite{zhang2023egglog}. The latter
+include fixed windows, repeated-region outlining, and whole-graph saturation.
+Equality saturation is established prior art~\cite{willsey2021egg,
+yang2021tensat}; our contribution is the measured result that it is not the
+right production default for the current rewrite space. Section
+\ref{sec:ablation} compares the modes.
+
+\subsection{Kernel archetypes and specialization}
+
+Rather than treating every operation as an unrelated shader, the code
+generator uses a small conceptual set of archetypes:
+\begin{itemize}
+  \item pointwise DAGs with unary/binary inputs and chain fusion;
+  \item workgroup reductions with composable per-element and output logic;
+  \item matrix products with transpose modes, storage formats, prologues,
+        epilogues, scalar tiles, GEMV, and cooperative tiles;
+  \item implicit-GEMM and spatial convolution kernels and their derivatives;
+  \item tiled attention forward, dQ, and fused dK+dV kernels.
+\end{itemize}
+
+Specialization is shape- and capability-aware. For example, a matrix
+epilogue is part of the same pipeline/geometry key as its matrix kernel. A
+cooperative implementation stages accumulator tiles through workgroup memory
+before applying a scalar pointwise DAG. Weighted f16/Q4/Q8 kernels remain on
+their own code-generation path until that path can compose with epilogues
+without changing the B-buffer interpretation.
+
+\subsection{WGSL, Naga, and graphics backends}
+
+Generated or templated WGSL is parsed and validated by Naga, then consumed by
+Blade for SPIR-V/Vulkan or Metal execution. WGSL is an authoring and
+diagnostic boundary, not a runtime requirement: the backend consumes the
+validated Naga module.
+
+\system{} previously constructed Naga modules directly. This exposed arena
+handles, expression-emission ranges, and errors such as ``Expression is not
+cached'' without a useful source location. Immediately before retreating from
+that design, the direct-IR code generator had reached 6,359 Rust lines.
+Generated WGSL replaced it with 949 Rust lines and 1,402 WGSL lines, a roughly
+63\% reduction for the corresponding implementation. Section
+\ref{sec:naga} discusses this negative result.
+
+\subsection{Static execution and memory planning}
+
+Compilation emits a fixed dispatch sequence with explicit logical buffers.
+The runtime groups dispatches at dependency barriers, computes buffer
+lifetimes, and aliases step-local intermediates with disjoint live ranges.
+Parameters, graph outputs, gradients, and stateful buffers remain pinned.
+Device-local storage is preferred on discrete GPUs; host-visible storage
+remains available for unified-memory devices and diagnostics.
+
+Capabilities select scalar, small-tile, cooperative-matrix, generated
+attention, and storage-format-specific pipelines. This selection also fixes
+workgroup geometry and padding. Keeping these decisions atomic prevents a
+failure mode in which a scalar epilogue pipeline is dispatched with
+cooperative geometry.
+
+\section{Evaluation Methodology}
+\label{sec:method}
+
+\subsection{Matched workloads}
+
+Table~\ref{tab:workloads} summarizes the audited graphs. PyTorch and
+\system{} use matching shapes, objectives, canonical parameter names, and
+deterministic inputs. Physical matrix layouts are transposed during
+initialization where required.
+
+\begin{table*}[t]
+\centering
+\small
+\begin{tabularx}{\textwidth}{l r X X}
+\toprule
+Workload & Parameters & Full shape & Objective and scope \\
+\midrule
+SmolLM2-135M & 135M &
+batch 1, sequence 128 &
+30-layer decoder-only transformer; token cross entropy \\
+SmolVLA action expert~\cite{shukor2025smolvla} & 99.85M &
+batch 1, 50 action tokens, 16 VLM tokens &
+16-layer action expert; output MSE \\
+Conditioned diffusion U-Net~\cite{rombach2022ldm} & 10.93M &
+batch 1, $4\times32\times32$ latent; context $77\times768$ &
+timestep-conditioned convolutional U-Net with self/cross-attention; noise MSE \\
+ResNet-50~\cite{he2016resnet} & 25.53M &
+batch 4, $3\times224\times224$ &
+inference-folded normalization representation; class cross entropy \\
+Whisper-tiny encoder~\cite{radford2022whisper} & 8.21M &
+batch 1, $80\times3000$ mel input &
+four encoder layers, 1,500 output positions; output MSE \\
+\bottomrule
+\end{tabularx}
+\caption{Audited workloads. CLI names are retained for compatibility, but the
+diffusion workload is not an SD~1.5 checkpoint and Whisper omits the decoder.}
+\label{tab:workloads}
+\end{table*}
+
+\subsection{Arithmetic contracts}
+\label{sec:precision}
+
+Strict f32 is the primary comparison. Accelerated mode answers a separate
+question: how fast is each engine's documented, quality-validated hardware
+path? It is not a matched-format experiment.
+
+\begin{table*}[t]
+\centering
+\small
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+Property & Strict f32 & Accelerated f32 \\
+\midrule
+Persistent tensors & f32 & f32 \\
+PyTorch & TF32 disabled & TF32/high permitted \\
+\system{} scalar path & f32 & f32 \\
+\system{} eligible forward matrices & f32 & f16 input, f32 accumulate \\
+\system{} backward matrices & f32 & f32 \\
+Output & f32 & f32 \\
+\bottomrule
+\end{tabularx}
+\caption{Arithmetic permissions. TF32 and IEEE f16 have different exponent
+ranges; accelerated results are therefore reported separately.}
+\label{tab:precision}
+\end{table*}
+
+PyTorch strict mode requests its highest float32 matmul precision and disables
+CUDA matmul and cuDNN TF32. Accelerated mode permits TF32. \system{} strict mode
+disables f16 cooperative matrix and cooperative f16 attention. Accelerated
+mode permits eligible forward matrix, convolution, and attention inputs to be
+rounded locally to f16, accumulates in f32, and stores f32. Backward remains
+f32 unless a future experimental path passes the same gradient gate.
+
+This distinction repaired a concrete error. An earlier Whisper accelerated
+run had small forward error but large gradient disagreement because derivative
+operands were rounded before cooperative matrix multiplication. Marking the
+automatically differentiated region full precision reduced the development
+run's total-gradient relative error from approximately 22\% to 0.023\%.
+Final numbers will be rerun from the frozen revision.
+
+\subsection{Timing and validity}
+
+Each series uses five untimed warmups and at least 20 retained samples.
+We report median, interquartile range, minimum, maximum, and raw samples.
+GPU execution is synchronized at timing boundaries.
+
+\textit{Inference} is one complete no-gradient forward pass.
+\textit{Latency} is an agreed minimal shape, not an engine-specific shortcut.
+\textit{Training} includes forward, scalar loss, and backward, but no optimizer
+update. \textit{Compile} includes graph construction, optimization, and GPU
+pipeline construction for the measured sessions; model download and
+parameter upload are excluded or reported separately.
+
+PyTorch is the numerical reference. Forward validity requires matching output
+shape, relative output L2 error below 1\%, and symmetric relative loss error
+below 1\%. Training additionally requires matching canonical trainable
+parameter sets, total-gradient-norm error below 5\%, and relative L2 error
+below 5\% over the vector of per-parameter gradient norms. A backward failure
+invalidates training without discarding a valid inference cell.
+
+\subsection{Device and revision controls}
+
+Every final artifact records clean \system{} and \inferena{} revisions, GPU and
+driver identifiers, OS, API/backend, toolchain versions, precision switches,
+optimizer mode, input metadata, timing samples, output fingerprints, and
+validation diagnostics. We will freeze
+\tbd{NVIDIA desktop, AMD desktop, integrated/edge-class, and Apple devices}
+before computing any aggregate portability metric. Historical table cells are
+not mixed with frozen results.
+
+\section{Results}
+\label{sec:results}
+
+\subsection{End-to-end performance}
+
+\begin{table*}[t]
+\centering
+\small
+\begin{tabularx}{\textwidth}{llrrrrX}
+\toprule
+Device / workload & Engine & Compile (s) & Inference (ms) & Latency (ms) &
+Training (ms) & Validity \\
+\midrule
+\tbd{rows} & PyTorch & -- & -- & -- & -- & reference \\
+ & \system{} & -- & -- & -- & -- & forward / backward \\
+\bottomrule
+\end{tabularx}
+\caption{Primary strict-f32 results. Values will be populated only from clean,
+pinned revisions using the protocol in Section~\ref{sec:method}.}
+\label{tab:strict-results}
+\end{table*}
+
+Table~\ref{tab:strict-results} will answer RQ1 with raw per-device values rather
+than a universal-win claim. We expect the final results to include cases close
+to the native stack and cases where training remains several times slower.
+For each large gap we report the dominant dispatch families and launch counts,
+not merely the ratio.
+
+\subsection{Accelerated arithmetic}
+
+\tbd{Insert a separate accelerated table and compare only cells passing the
+same correctness gates. State explicitly that PyTorch may use TF32 while
+\system{} uses local f16-input/f32-accumulate matrix paths.}
+
+As a pre-freeze implementation checkpoint, the conditioned diffusion workload
+passed the full 5-warmup/20-sample protocol on an RTX~5080. In strict f32,
+median inference was 2.152\,ms for \system{} and 1.941\,ms for PyTorch; training
+was 8.569\,ms and 4.493\,ms. In accelerated mode, inference was 1.859\,ms and
+1.166\,ms, while training was 8.104\,ms and 4.471\,ms. Accelerated forward
+relative L2 error was 0.471\%, and the per-parameter
+gradient-norm-vector error was 1.73\%. Accelerated Whisper training also
+passed after the precision repair, with 0.0228\% total-gradient error. These
+numbers demonstrate that the paths are viable; they are not included in the
+final table because both source revisions were dirty.
+
+\subsection{Deployment footprint}
+
+The uniform stack also changes what an application must ship. Table
+\ref{tab:footprint} reports a development measurement on Linux x86-64. The
+\system{} entry is the stripped \inferena{} runner, which embeds the graph
+compiler, autodiff, runtime, model builders, and shader sources in one
+executable. It dynamically links ordinary OS libraries and relies on the
+installed GPU driver, but has no Python, CUDA, or ROCm userspace dependency.
+The PyTorch closure was computed recursively from active Python package
+metadata rather than from the complete development virtual environment.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabularx}{\columnwidth}{Xr}
+\toprule
+Linux x86-64 artifact & Installed size \\
+\midrule
+\system{} benchmark executable, stripped & 12.8 MiB \\
+PyTorch + Triton packages only & 1.75 GiB \\
+PyTorch CUDA runtime dependency closure & 4.66 GiB \\
+\bottomrule
+\end{tabularx}
+\caption{Pre-freeze deployment-footprint measurement. Model weights, Python
+itself, ordinary OS libraries, and the GPU driver are excluded from both
+sides. PyTorch is a much broader framework, so this is a deployment-cost
+comparison rather than a feature-equivalence claim.}
+\label{tab:footprint}
+\end{table}
+
+The roughly two-orders-of-magnitude difference is relevant to edge and
+application embedding, but it is not a substitute for model coverage or
+performance. We will reproduce the measurement from the frozen release
+artifacts and report the exact binary/linkage manifest. TinyIREE similarly
+treats runtime and artifact size as first-class deployment results, although
+it studies embedded inference rather than portable GPU training
+\cite{liu2022tinyiree}.
+
+\subsection{Performance portability}
+
+\tbd{Insert the per-device normalized plot after AMD, Apple, and edge-class
+runs. Report raw values next to any aggregate. Define unsupported devices as
+zero if using the Pennycook performance-portability metric
+\cite{pennycook2016metric}.}
+
+\section{Ablations and Gap Analysis}
+\label{sec:ablation}
+
+\subsection{Greedy rewriting versus equality saturation}
+
+The current rewrite set is small and mostly locally profitable. In CPU-only
+ablation runs, greedy rewriting reaches essentially the same active node
+counts as windowed or outlined egglog. Representative SmolLM inference
+optimization took 0.089\,ms with greedy rewriting, 32.6\,ms with windowed
+egglog, and 2.94\,ms with repeated-region outlining. Whole-graph saturation
+took 56.2\,ms for inference and 7.43\,s for the differentiated graph.
+End-to-end GPU time for the e-graph modes was within run-to-run variation of
+greedy.
+
+This is a negative result for a strong ``e-graphs make \system{} fast'' claim.
+The rewrite rules provide small benefits, but equality saturation has no
+demonstrated runtime advantage over their deterministic fixed point. We
+therefore use greedy rewriting as the production default and retain egglog as
+research infrastructure for future non-local alternatives. This complements
+TENSAT and Glenside~\cite{yang2021tensat,smith2021glenside}: equality
+saturation becomes compelling when the representation and rewrite set create
+meaningful global choices, not merely because a graph is a tensor graph.
+
+\subsection{Cooperative matrices and epilogues}
+
+A historical checkpoint achieved an approximately 1.9$\times$ NVIDIA
+inference gap on SmolLM, compared with about 3.1$\times$ after a later
+correctness fix under an adapted development protocol. The discontinuity
+occurred when \system{} stopped promoting matmuls with fused epilogues to
+cooperative geometry. The old path combined cooperative workgroup counts with
+a scalar epilogue pipeline and could leave rows unwritten.
+
+We implemented a safe cooperative epilogue that treats kernel variant,
+geometry, padding, and pointwise DAG as one selection. Accumulator tiles are
+staged through workgroup memory, then consumed by scalar lanes with logical
+bounds checks. This restores the missing capability, but it does not by itself
+recover the SmolLM result: the current packed SwiGLU graph no longer contains
+epilogue-bearing matmuls at the relevant sites. Lowering the promotion
+threshold also regressed performance. The case study illustrates why a
+correct architectural fix need not be an end-to-end speedup and why historical
+numbers require graph-level inspection.
+
+\subsection{Where the remaining time goes}
+
+\tbd{Insert per-dispatch profiles for the two largest final gaps. Break down
+matrix, attention, convolution, normalization/reduction, pointwise, and
+barrier/launch contributions. Include dispatch counts and bytes where
+available.}
+
+Likely improvement paths must be phrased as measured hypotheses: fewer
+launches through broader fusion, better small-matrix occupancy, wider
+cooperative coverage, and more unified convolution derivatives. The final
+paper will distinguish an absent specialization from an API limitation.
+
+\section{Lessons from Direct Naga-IR Authoring}
+\label{sec:naga}
+
+Naga is an effective validation and portability boundary, but we found it a
+poor human authoring boundary for this project. Direct construction required
+explicit types, globals, bindings, arenas, expression handles, statements,
+and emission ranges. A missing range could surface during a later backend
+transformation with no source-located diagnostic.
+
+The temporary Naga-IR$\rightarrow$WGSL$\rightarrow$Naga-IR round trip was a
+normalization workaround, not an architectural requirement. We eventually
+fixed direct module submission, yet retained WGSL authoring because:
+\begin{itemize}
+  \item generated kernels remain recognizable and independently inspectable;
+  \item Naga's parser owns expression-arena and emission invariants;
+  \item diagnostics identify source locations;
+  \item templates still express target constants, prologues, epilogues, and
+        cooperative variants.
+\end{itemize}
+
+The current system still has 75 WGSL files and 6.1 KLOC, so retreating from
+direct IR did not solve shader-family proliferation. During this work we
+removed separate dK and dV shaders after making fused dK+dV the compiler
+invariant. The longer-term target is one typed generator per major archetype,
+with specialized kernels retained only when profiles justify them. The
+broader lesson is that the best interchange IR and the best authoring IR need
+not be the same representation.
+
+\section{Related Work}
+
+\paragraph{Portable ML compilation and runtimes.}
+TVM established graph/operator optimization and learned scheduling for
+heterogeneous targets~\cite{chen2018tvm}. Glow and MLIR demonstrate typed,
+multi-level compiler architectures and static planning
+\cite{rotem2018glow,lattner2021mlir}; Triton exposes a tile-level language for
+high-performance deep-learning kernels~\cite{tillet2019triton}. \system{} is
+narrower in framework breadth and execution substrate: it asks how far a
+compact native Vulkan/Metal stack can take a shared inference and backward
+path. TinyIREE makes compiled-artifact and runtime footprint a first-class
+result for embedded inference~\cite{liu2022tinyiree}; \system{} measures the
+same deployment concern for a graphics-API executable that also includes
+training.
+
+WebLLM demonstrates that WebGPU can retain a substantial fraction of native
+LLM inference performance~\cite{ruan2024webllm}. LlamaWeb is the closest
+recent broad graphics-API performance-portability study: it implements
+memory-efficient, multi-precision browser inference and evaluates 10 models
+on 16 devices from eight vendors~\cite{levine2026llamaweb}. A complementary
+WebGPU dispatch study separates API, framework, and shader overhead across
+Vulkan and Metal implementations~\cite{maczan2026dispatch}. \system{} instead
+studies native Vulkan/Metal, several model families, and automatically
+differentiated training as well as inference. We do not claim graphics-API
+inference itself as novel.
+
+\paragraph{Tensor graph search.}
+TASO searches verified graph substitutions~\cite{jia2019taso}. egg and egglog
+provide reusable equality-saturation and fixpoint-reasoning infrastructure
+\cite{willsey2021egg,zhang2023egglog}. TENSAT applies equality saturation and
+global extraction to tensor graphs~\cite{yang2021tensat}, while Glenside uses
+access patterns for low-level tensor rewriting~\cite{smith2021glenside}.
+\system{} contributes neither a new e-graph data structure nor a pure tensor IR;
+its useful result here is the production ablation against greedy rewriting.
+
+\paragraph{Performance portability.}
+Pennycook et al.\ argue that portability must be measured over an explicit
+platform set and propose an aggregate that becomes zero when a platform is
+unsupported~\cite{pennycook2016metric}. We follow that discipline by freezing
+the device set, reporting per-device results, and separating arithmetic
+contracts before considering an aggregate.
+
+\section{Limitations and Threats to Validity}
+
+Five workloads do not establish complete operator or model coverage. The
+diffusion U-Net is scaled and not checkpoint-compatible with SD~1.5; Whisper
+omits the decoder; ResNet represents folded inference normalization rather
+than training-time batch statistics. Synthetic deterministic inputs test
+computation but not task quality.
+
+PyTorch is a moving reference whose compiler and libraries vary by version,
+driver, and platform. Conversely, graphics drivers may optimize SPIR-V or
+Metal differently. Exact revisions, raw samples, and environment metadata
+make the experiment reproducible but do not eliminate this external validity
+threat.
+
+Strict f32 controls arithmetic permissions, not operation order or bitwise
+identity. Accelerated mode intentionally compares different fast formats and
+must not be interpreted as format equivalence. Gradient-norm gates can miss
+elementwise cancellation; the artifact should add sampled or full gradient
+vector comparisons where memory permits.
+
+The implementation has been optimized most heavily on NVIDIA hardware.
+Results on AMD, Apple, and integrated devices are therefore both a portability
+test and a maturity test. We will not describe Android as evaluated unless an
+actual device is included in the frozen matrix.
+
+Naga's internal IR validation and Vulkan's validation of emitted SPIR-V are
+distinct boundaries. The currently pinned backend triggers
+\code{VUID-StandaloneSpirv-None-10684}, an open upstream Naga/wgpu
+explicit-layout issue that wgpu suppresses but Blade reports.\footnote{
+\url{https://github.com/gfx-rs/wgpu/issues/7696}} Execution and numerical
+checks pass, but the frozen artifact will record the validation-layer version
+and diagnostic rather than treating those checks as proof of fully valid
+SPIR-V. We will either consume a verified upstream correction or retain this
+as an explicit artifact limitation.
+
+\section{Conclusion}
+
+\system{} explores a deliberately demanding portability target: one
+graphics-API-based system for both training and inference. Its architecture
+shows that typed graphs, autodiff, specialization, static memory planning, and
+matrix hardware can be assembled into a compact Vulkan/Metal stack. The
+evaluation is designed to show where that stack approaches a mature native
+engine and where it does not, under explicit numerical contracts.
+
+The engineering results also narrow future work. Correctness requires
+precision policy to propagate into autodiff, pipeline geometry and epilogues
+to be selected together, and backward kernels to be tested at realistic
+shapes. Greedy rewriting is currently more practical than equality
+saturation, and generated WGSL is more maintainable than direct Naga-IR
+authoring. These negative results are part of the answer: performance
+portability depends as much on choosing tractable compiler boundaries as on
+accessing the hardware.
+
+\section*{Artifact Availability}
+
+Source code is available at
+\url{https://github.com/kvark/meganeura}. The final artifact will include
+\inferena{} harness source, pinned revisions, environment manifests, raw JSON
+samples, correctness diagnostics, profiles, and figure-generation scripts at
+\tbd{archival artifact URL}.
+
+\section*{AI-Assistance Disclosure}
+
+Generative AI tools were used for code review, benchmark-harness development,
+experimental debugging, and editorial assistance. The author designed the
+study, reviewed generated changes, executed the experiments, verified the
+reported claims and references, and accepts responsibility for the
+manuscript. This disclosure will be updated if the final workflow changes.
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}
