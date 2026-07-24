@@ -1716,7 +1716,9 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::BiasAdd => BiasAddData::layout(),
         ShaderEntry::SgdUpdate => SgdData::layout(),
         ShaderEntry::AdamUpdate => AdamData::layout(),
-        ShaderEntry::ScatterAdd => ScatterAddData::layout(),
+        ShaderEntry::ScatterAdd
+        | ShaderEntry::ScatterAddAtomicZero
+        | ShaderEntry::ScatterAddAtomic => ScatterAddData::layout(),
         ShaderEntry::SwiGLUConcat | ShaderEntry::SwiGLUConcatGrad => BinaryData::layout(),
         ShaderEntry::SumAll
         | ShaderEntry::MeanAll
@@ -5538,7 +5540,9 @@ impl Session {
                      not via bind_dispatch"
                 );
             }
-            ShaderEntry::ScatterAdd => {
+            ShaderEntry::ScatterAdd
+            | ShaderEntry::ScatterAddAtomicZero
+            | ShaderEntry::ScatterAddAtomic => {
                 pc.bind(
                     0,
                     &ScatterAddData {

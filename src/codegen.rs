@@ -396,6 +396,7 @@ pub enum ShaderGroup {
     RmsNormGradWRowPar,
     LayerNormGrad,
     ScatterAdd,
+    ScatterAddAtomic,
     BceLoss,
     RmsNormRsqrt,
     GroupNorm,
@@ -508,6 +509,9 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::LayerNormGrad => parse_wgsl(include_str!("shaders/layer_norm_grad.wgsl")),
         ShaderGroup::RmsNormRsqrt => parse_wgsl(include_str!("shaders/rms_norm_rsqrt.wgsl")),
         ShaderGroup::ScatterAdd => parse_wgsl(include_str!("shaders/scatter_add.wgsl")),
+        ShaderGroup::ScatterAddAtomic => {
+            parse_wgsl(include_str!("shaders/scatter_add_atomic.wgsl"))
+        }
         ShaderGroup::BceLoss => parse_wgsl(include_str!("shaders/bce.wgsl")),
         ShaderGroup::GroupNorm => parse_wgsl(include_str!("shaders/group_norm.wgsl")),
         ShaderGroup::GroupNormGrad => parse_wgsl(include_str!("shaders/group_norm_grad.wgsl")),
@@ -5015,6 +5019,10 @@ mod tests {
                 naga::valid::Capabilities::empty(),
             ),
             (ShaderGroup::ScatterAdd, naga::valid::Capabilities::empty()),
+            (
+                ShaderGroup::ScatterAddAtomic,
+                naga::valid::Capabilities::empty(),
+            ),
             (ShaderGroup::BceLoss, naga::valid::Capabilities::empty()),
             (
                 ShaderGroup::GlobalAvgPoolGrad,
@@ -5239,6 +5247,7 @@ mod tests {
             (ShaderGroup::RmsNormGrad, empty),
             (ShaderGroup::RmsNormGradWRowPar, empty),
             (ShaderGroup::ScatterAdd, empty),
+            (ShaderGroup::ScatterAddAtomic, empty),
             (ShaderGroup::BceLoss, empty),
             (ShaderGroup::GlobalAvgPoolGrad, empty),
             (ShaderGroup::GradClipZero, empty),
@@ -5360,7 +5369,11 @@ mod tests {
                 ShaderEntry::BiasAdd => vec!["src", "bias", "dst", "params"],
                 ShaderEntry::SgdUpdate => vec!["param", "grad", "dst", "params"],
                 ShaderEntry::AdamUpdate => vec!["param", "grad", "m", "v", "params"],
-                ShaderEntry::ScatterAdd => vec!["indices", "src", "dst", "params"],
+                ShaderEntry::ScatterAdd
+                | ShaderEntry::ScatterAddAtomicZero
+                | ShaderEntry::ScatterAddAtomic => {
+                    vec!["indices", "src", "dst", "params"]
+                }
                 ShaderEntry::BceLoss => vec!["pred", "labels", "grad_out", "loss_out", "params"],
                 ShaderEntry::Softmax => vec!["src", "dst", "params"],
                 ShaderEntry::CrossEntropyLoss => {
@@ -5522,6 +5535,8 @@ mod tests {
             ShaderEntry::RmsNormRsqrt,
             ShaderEntry::AdamUpdate,
             ShaderEntry::ScatterAdd,
+            ShaderEntry::ScatterAddAtomicZero,
+            ShaderEntry::ScatterAddAtomic,
             ShaderEntry::BceLoss,
             ShaderEntry::GroupNorm,
             ShaderEntry::GroupNormSilu,
