@@ -6544,31 +6544,26 @@ impl Session {
         metadata.insert("meganeura_checkpoint_format".to_string(), "2".to_string());
         metadata.insert("adam_step".to_string(), self.adam_step.to_string());
 
-        let serialization_start = std::time::Instant::now();
-        let serialized = safetensors::tensor::serialize(views, &Some(metadata))
+        let persist_start = std::time::Instant::now();
+        let result = safetensors::tensor::serialize_to_file(views, &Some(metadata), path)
             .map_err(|e| std::io::Error::other(e.to_string()));
-        let serialization_duration = serialization_start.elapsed();
-        let write_start = std::time::Instant::now();
-        let (bytes, result) = match serialized {
-            Ok(buf) => {
-                let bytes = buf.len();
-                (bytes, std::fs::write(path, buf))
-            }
-            Err(err) => (0, Err(err)),
+        let persist_duration = persist_start.elapsed();
+        let bytes = if result.is_ok() {
+            std::fs::metadata(path).map_or(0, |file| file.len())
+        } else {
+            0
         };
-        let write_duration = write_start.elapsed();
         self.gpu.destroy_command_encoder(&mut encoder);
         self.gpu.destroy_buffer(staging);
         log::info!(
             "checkpoint timing: wall={:.3}s wait={:.3}s collect={:.3}s \
-             readback={:.3}s views={:.3}s serialize={:.3}s write={:.3}s bytes={bytes}",
+             readback={:.3}s views={:.3}s persist={:.3}s bytes={bytes}",
             wall_start.elapsed().as_secs_f64(),
             wait_duration.as_secs_f64(),
             collection_duration.as_secs_f64(),
             readback_duration.as_secs_f64(),
             view_duration.as_secs_f64(),
-            serialization_duration.as_secs_f64(),
-            write_duration.as_secs_f64(),
+            persist_duration.as_secs_f64(),
         );
         result
     }
