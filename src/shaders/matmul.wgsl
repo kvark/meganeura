@@ -29,7 +29,7 @@ $B_DEQUANT_FN
 fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let tx = lid.x;
     let ty = lid.y;
-    let tile_row = wgid.y * 64u;
+    let tile_row = (wgid.y + wgid.z * params._pad) * 64u;
     let tile_col = wgid.x * 64u;
     let tid = ty * 16u + tx;
 

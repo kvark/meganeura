@@ -29,7 +29,7 @@ var<workgroup> shared_b: array<f32, 1056>;  // 32 * 33 (padded stride)
 fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let tx = lid.x;
     let ty = lid.y;
-    let tile_row = wgid.y * 32u;
+    let tile_row = (wgid.y + wgid.z * params._pad) * 32u;
     let tile_col = wgid.x * 32u;
     let tid = ty * 16u + tx;
 

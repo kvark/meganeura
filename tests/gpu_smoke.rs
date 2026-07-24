@@ -73,6 +73,28 @@ fn matmul_non_uniform_values() {
 }
 
 #[test]
+fn tall_matmul_splits_dispatch_across_z() {
+    const ROWS: usize = 65_536 * 64;
+
+    let mut graph = Graph::new();
+    let input = graph.input("input", &[ROWS, 1]);
+    let weight = graph.parameter("weight", &[1, 1]);
+    let output = graph.matmul(input, weight);
+    graph.set_outputs(vec![output]);
+
+    let mut session = build_inference_session(&graph);
+    session.set_input("input", &vec![1.25_f32; ROWS]);
+    session.set_parameter("weight", &[2.0]);
+    session.step();
+    session.wait();
+
+    let actual = session.read_output(ROWS);
+    for index in [0, ROWS / 2, ROWS - 1] {
+        assert!((actual[index] - 2.5).abs() < 1.0e-6);
+    }
+}
+
+#[test]
 fn shader_compilation_and_forward_pass() {
     // Build a small MLP graph
     let batch = 4;
