@@ -5008,7 +5008,7 @@ impl Session {
                             m: dispatch.params[0],
                             n: dispatch.params[2],
                             k: dispatch.params[1],
-                            _pad: 0,
+                            _pad: dispatch.workgroups[1],
                         },
                     },
                 );
@@ -5025,7 +5025,7 @@ impl Session {
                             m: dispatch.params[0],
                             n: dispatch.params[1],
                             k: dispatch.params[2],
-                            _pad: 0,
+                            _pad: dispatch.workgroups[1],
                         },
                     },
                 );
@@ -5042,7 +5042,7 @@ impl Session {
                             m: dispatch.params[0],
                             n: dispatch.params[2],
                             k: dispatch.params[1],
-                            _pad: 0,
+                            _pad: dispatch.workgroups[1],
                         },
                     },
                 );
@@ -5060,7 +5060,7 @@ impl Session {
                             m: dispatch.params[0],
                             n: dispatch.params[1],
                             k: dispatch.params[2],
-                            _pad: 0,
+                            _pad: dispatch.workgroups[1],
                         },
                     },
                 );

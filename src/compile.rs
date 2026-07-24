@@ -1831,6 +1831,27 @@ fn binary_shader_to_pointwise(shader: &ShaderEntry) -> Option<PointwiseDAG> {
     })
 }
 
+const MAX_COMPUTE_WORKGROUPS_PER_DIMENSION: u32 = 65_535;
+
+/// Tile a scalar matmul across Y and Z without exceeding the portable
+/// per-dimension compute-dispatch limit.
+fn matmul_workgroups(m: u32, n: u32, tile: u32) -> [u32; 3] {
+    let columns = n.div_ceil(tile);
+    assert!(
+        columns <= MAX_COMPUTE_WORKGROUPS_PER_DIMENSION,
+        "matmul needs {columns} workgroups on X, exceeding the portable limit"
+    );
+    let rows = m.div_ceil(tile);
+    let depth = rows.div_ceil(MAX_COMPUTE_WORKGROUPS_PER_DIMENSION).max(1);
+    assert!(
+        depth <= MAX_COMPUTE_WORKGROUPS_PER_DIMENSION,
+        "matmul needs {depth} workgroup layers, exceeding the portable limit"
+    );
+    let height = rows.div_ceil(depth);
+    debug_assert!(height <= MAX_COMPUTE_WORKGROUPS_PER_DIMENSION);
+    [columns, height, depth]
+}
+
 struct Compiler<'a> {
     graph: &'a Graph,
     plan: ExecutionPlan,
@@ -2197,7 +2218,7 @@ impl<'a> Compiler<'a> {
                 } else {
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::MatMul,
-                        workgroups: [n.div_ceil(64), m.div_ceil(64), 1],
+                        workgroups: matmul_workgroups(m, n, 64),
                         input_buffers: vec![a, b],
                         output_buffer: out_buf,
                         extra_outputs: vec![],
@@ -2222,7 +2243,7 @@ impl<'a> Compiler<'a> {
                 let n = b_shape[1] as u32; // B is [K, N]
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::MatMulAT,
-                    workgroups: [n.div_ceil(64), m.div_ceil(64), 1],
+                    workgroups: matmul_workgroups(m, n, 64),
                     input_buffers: vec![a, b],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
@@ -2260,7 +2281,7 @@ impl<'a> Compiler<'a> {
                 } else {
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::MatMulBT,
-                        workgroups: [n.div_ceil(64), m.div_ceil(64), 1],
+                        workgroups: matmul_workgroups(m, n, 64),
                         input_buffers: vec![a, b],
                         output_buffer: out_buf,
                         extra_outputs: vec![],
@@ -2300,7 +2321,7 @@ impl<'a> Compiler<'a> {
                 } else {
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::FusedMatMulAdd,
-                        workgroups: [n.div_ceil(64), m.div_ceil(64), 1],
+                        workgroups: matmul_workgroups(m, n, 64),
                         input_buffers: vec![a, b, d],
                         output_buffer: out_buf,
                         extra_outputs: vec![],
@@ -2326,7 +2347,7 @@ impl<'a> Compiler<'a> {
                 let n = b_shape[1] as u32;
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::FusedMatMulATAdd,
-                    workgroups: [n.div_ceil(64), m.div_ceil(64), 1],
+                    workgroups: matmul_workgroups(m, n, 64),
                     input_buffers: vec![a, b, d],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
@@ -2351,7 +2372,7 @@ impl<'a> Compiler<'a> {
                 let n = b_shape[0] as u32;
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::FusedMatMulBTAdd,
-                    workgroups: [n.div_ceil(64), m.div_ceil(64), 1],
+                    workgroups: matmul_workgroups(m, n, 64),
                     input_buffers: vec![a, b, d],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
@@ -4758,6 +4779,27 @@ mod tests {
         // workgroups = [ceil(N/64), ceil(M/64), 1] = [1, 1, 1] (4×4 register-tiled)
         assert_eq!(d.workgroups, [1, 1, 1]);
         assert_eq!(d.params, vec![33, 64, 17, 0]);
+    }
+
+    #[test]
+    fn tall_matmul_splits_portable_dispatch_limit_across_z() {
+        let mut graph = Graph::new();
+        let rows = 65_536 * 64;
+        let a = graph.input("a", &[rows, 1]);
+        let b = graph.input("b", &[1, 1]);
+        let output = graph.matmul(a, b);
+        graph.set_outputs(vec![output]);
+
+        let plan = compile(&graph);
+        let dispatch = &plan.dispatches[0];
+        assert_eq!(dispatch.shader, ShaderEntry::MatMul);
+        assert_eq!(dispatch.workgroups, [1, 32_768, 2]);
+        assert!(
+            dispatch
+                .workgroups
+                .iter()
+                .all(|&count| count <= MAX_COMPUTE_WORKGROUPS_PER_DIMENSION)
+        );
     }
 
     #[test]
