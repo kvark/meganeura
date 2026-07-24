@@ -192,6 +192,8 @@ pub enum ShaderEntry {
     SwiGLUConcat,
     SwiGLUConcatGrad,
     SumRows,
+    ExclusiveCumsum,
+    ShiftInner,
     RmsNormGradW,
     RmsNormGradWRowPar,
     RmsNormGradX,
@@ -418,7 +420,9 @@ impl ShaderEntry {
                 ShaderGroup::SwiGLUGrad
             }
             ShaderEntry::SwiGLUConcat | ShaderEntry::SwiGLUConcatGrad => ShaderGroup::SwiGLUConcat,
-            ShaderEntry::SumRows => ShaderGroup::SumRows,
+            ShaderEntry::SumRows | ShaderEntry::ExclusiveCumsum | ShaderEntry::ShiftInner => {
+                ShaderGroup::SumRows
+            }
             ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => ShaderGroup::RmsNormGrad,
             ShaderEntry::RmsNormGradWRowPar => ShaderGroup::RmsNormGradWRowPar,
             ShaderEntry::LayerNormGradWB | ShaderEntry::LayerNormGradX => {
@@ -517,6 +521,8 @@ impl ShaderEntry {
             ShaderEntry::SwiGLUConcat => "swiglu_concat",
             ShaderEntry::SwiGLUConcatGrad => "swiglu_concat_grad",
             ShaderEntry::SumRows => "sum_rows",
+            ShaderEntry::ExclusiveCumsum => "exclusive_cumsum",
+            ShaderEntry::ShiftInner => "shift_inner",
             ShaderEntry::RmsNormGradW => "rms_norm_grad_w",
             ShaderEntry::RmsNormGradWRowPar => "rms_norm_grad_w_rowpar",
             ShaderEntry::RmsNormGradX => "rms_norm_grad_x",
@@ -2446,6 +2452,47 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![m, n, 0, 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
+            Op::ExclusiveCumsum { reverse } => {
+                // One invocation handles one row. This is deliberately
+                // linear in N; the dense-matmul spelling is quadratic.
+                let input = self.get_buffer(node.inputs[0]);
+                let in_shape = &self.graph.node(node.inputs[0]).ty.shape;
+                let m = in_shape[0] as u32;
+                let n = in_shape[1] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::ExclusiveCumsum,
+                    workgroups: [m.div_ceil(64), 1, 1],
+                    input_buffers: vec![input],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![m, n, u32::from(reverse), 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
+            Op::ShiftInner { offset } => {
+                let input = self.get_buffer(node.inputs[0]);
+                let in_shape = &self.graph.node(node.inputs[0]).ty.shape;
+                let m = in_shape[0] as u32;
+                let n = in_shape[1] as u32;
+                let len = m
+                    .checked_mul(n)
+                    .expect("shift_inner element count exceeds u32");
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::ShiftInner,
+                    workgroups: [len.div_ceil(256), 1, 1],
+                    input_buffers: vec![input],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![m, n, offset as u32, 0],
                     use_coop: false,
                     use_small_tiles: false,
                     ..Default::default()
@@ -4839,6 +4886,8 @@ mod tests {
             ShaderEntry::SumAll,
             ShaderEntry::MeanAll,
             ShaderEntry::SumRows,
+            ShaderEntry::ExclusiveCumsum,
+            ShaderEntry::ShiftInner,
             ShaderEntry::Softmax,
             ShaderEntry::CrossEntropyLoss,
             ShaderEntry::BceLoss,

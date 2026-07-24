@@ -42,3 +42,38 @@ fn sum_rows(
         dst[col] = partials[lid.x] + partials[32u + lid.x];
     }
 }
+
+// Exclusive cumulative sum along each row. `_pad0 != 0` selects reverse
+// order, which is the transpose operation used by autodiff.
+@compute @workgroup_size(64)
+fn exclusive_cumsum(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let row = gid.x;
+    if row >= params.m { return; }
+
+    let base = row * params.n;
+    var acc = 0.0;
+    for (var offset = 0u; offset < params.n; offset++) {
+        let col = select(offset, params.n - 1u - offset, params._pad0 != 0u);
+        let index = base + col;
+        let value = src[index];
+        dst[index] = acc;
+        acc += value;
+    }
+}
+
+// Shift each row by the signed offset encoded in `_pad0`.
+@compute @workgroup_size(256)
+fn shift_inner(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let index = gid.x;
+    let len = params.m * params.n;
+    if index >= len { return; }
+
+    let row = index / params.n;
+    let col = i32(index % params.n);
+    let source_col = col - bitcast<i32>(params._pad0);
+    if source_col >= 0 && source_col < i32(params.n) {
+        dst[index] = src[row * params.n + u32(source_col)];
+    } else {
+        dst[index] = 0.0;
+    }
+}
