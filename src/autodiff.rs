@@ -285,6 +285,18 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let grad_broadcast = graph.matmul(grad_output, ones_1n);
                 accumulate_grad(&mut graph, &mut grads, x, grad_broadcast);
             }
+            Op::ExclusiveCumsum { reverse } => {
+                // The transpose of a left-to-right exclusive prefix sum is a
+                // right-to-left exclusive suffix sum, and vice versa.
+                let x = node.inputs[0];
+                let grad_x = graph.exclusive_cumsum(grad_output, !reverse);
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
+            Op::ShiftInner { offset } => {
+                let x = node.inputs[0];
+                let grad_x = graph.shift_inner(grad_output, -offset);
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
             Op::Neg => {
                 let x = node.inputs[0];
                 let grad_x = graph.neg(grad_output);
