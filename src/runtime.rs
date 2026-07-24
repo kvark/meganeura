@@ -713,6 +713,22 @@ struct MultiHeadAttnGradKVData {
 
 // ---- Pipeline collection ----
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum EpiloguePipelineKey {
+    Dag(crate::compile::MatMulEpilogue),
+    Legacy(Vec<crate::compile::EpilogueOp>),
+}
+
+fn epilogue_pipeline_key(dispatch: &Dispatch) -> Option<EpiloguePipelineKey> {
+    if let Some(ref epilogue) = dispatch.matmul_epilogue {
+        Some(EpiloguePipelineKey::Dag(epilogue.clone()))
+    } else if !dispatch.epilogue.is_empty() {
+        Some(EpiloguePipelineKey::Legacy(dispatch.epilogue.clone()))
+    } else {
+        None
+    }
+}
+
 struct Pipelines {
     /// Scalar (default) pipelines.
     map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
@@ -728,9 +744,12 @@ struct Pipelines {
     /// different attention widths run every dispatch through whichever width
     /// happened to be encountered last.
     attention_map: HashMap<(ShaderEntry, u32), blade_graphics::ComputePipeline>,
-    /// Epilogue-fused pipelines keyed by (shader, epilogue chain).
-    epilogue_map:
-        HashMap<(ShaderEntry, Vec<crate::compile::EpilogueOp>), blade_graphics::ComputePipeline>,
+    /// Scalar epilogue-fused pipelines keyed by their actual DAG (or the
+    /// legacy closed op list for deserialized old plans).
+    epilogue_map: HashMap<(ShaderEntry, EpiloguePipelineKey), blade_graphics::ComputePipeline>,
+    /// Cooperative-matrix equivalents. These use workgroup memory to expose
+    /// matrix accumulator lanes to the scalar epilogue.
+    coop_epilogue_map: HashMap<(ShaderEntry, EpiloguePipelineKey), blade_graphics::ComputePipeline>,
     /// Schedule-template-generated pointwise pipelines, keyed by DAG hash.
     /// Populated for dispatches that carry a `pointwise` DAG.
     pointwise_map: HashMap<u64, blade_graphics::ComputePipeline>,
@@ -825,7 +844,7 @@ impl Pipelines {
                     .or_default()
                     .insert(dispatch.shader.clone());
             }
-            if dispatch.weight_format.is_quantized() {
+            if dispatch.weight_format.uses_reduced_storage() {
                 needed_weighted
                     .entry(dispatch.weight_format)
                     .or_default()
@@ -1070,31 +1089,56 @@ impl Pipelines {
         // Prefer the new MatMulEpilogue (PointwiseDAG); fall back to legacy
         // Vec<EpilogueOp> for cached plans that predate the DAG migration.
         let mut epilogue_map = HashMap::new();
+        let mut coop_epilogue_map = HashMap::new();
         for dispatch in &plan.dispatches {
-            if dispatch.matmul_epilogue.is_none() && dispatch.epilogue.is_empty() {
+            let Some(epilogue_key) = epilogue_pipeline_key(dispatch) else {
                 continue;
-            }
-            let key = (dispatch.shader.clone(), dispatch.epilogue.clone());
-            if epilogue_map.contains_key(&key) {
-                continue;
-            }
-            let group = dispatch.shader.shader_group();
-            let sm = if let Some(ref epi) = dispatch.matmul_epilogue {
-                crate::codegen::generate_matmul_with_dag_epilogue(group, epi)
-            } else {
-                crate::codegen::generate_matmul_with_epilogue(group, &dispatch.epilogue)
             };
-            let shader = gpu.create_shader(bg::ShaderDesc {
-                source: &sm.source,
-                naga_module: Some(sm.module),
-            });
-            let layout = shader_data_layout(&dispatch.shader);
-            let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                name: dispatch.shader.entry_point(),
-                data_layouts: &[&layout],
-                compute: shader.at(dispatch.shader.entry_point()),
-            });
-            epilogue_map.insert(key, pipeline);
+            let key = (dispatch.shader.clone(), epilogue_key);
+            if !epilogue_map.contains_key(&key) {
+                let group = dispatch.shader.shader_group();
+                let sm = if let Some(ref epi) = dispatch.matmul_epilogue {
+                    crate::codegen::generate_matmul_with_dag_epilogue(group, epi)
+                } else {
+                    crate::codegen::generate_matmul_with_epilogue(group, &dispatch.epilogue)
+                };
+                let shader = gpu.create_shader(bg::ShaderDesc {
+                    source: &sm.source,
+                    naga_module: Some(sm.module),
+                });
+                let layout = shader_data_layout(&dispatch.shader);
+                let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
+                    name: dispatch.shader.entry_point(),
+                    data_layouts: &[&layout],
+                    compute: shader.at(dispatch.shader.entry_point()),
+                });
+                epilogue_map.insert(key.clone(), pipeline);
+            }
+
+            if dispatch.use_coop && !coop_epilogue_map.contains_key(&key) {
+                let config = coop_config
+                    .expect("dispatch selected cooperative epilogue without a coop config");
+                let epi = dispatch
+                    .matmul_epilogue
+                    .as_ref()
+                    .expect("cooperative epilogues require the PointwiseDAG representation");
+                let sm = crate::codegen::generate_coop_matmul_with_dag_epilogue(
+                    dispatch.shader.shader_group(),
+                    config,
+                    epi,
+                );
+                let shader = gpu.create_shader(bg::ShaderDesc {
+                    source: &sm.source,
+                    naga_module: Some(sm.module),
+                });
+                let layout = shader_data_layout(&dispatch.shader);
+                let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
+                    name: dispatch.shader.entry_point(),
+                    data_layouts: &[&layout],
+                    compute: shader.at(dispatch.shader.entry_point()),
+                });
+                coop_epilogue_map.insert(key, pipeline);
+            }
         }
 
         // Compile schedule-template pointwise pipelines. Each unique DAG
@@ -1162,6 +1206,7 @@ impl Pipelines {
             weight_map,
             attention_map,
             epilogue_map,
+            coop_epilogue_map,
             pointwise_map,
             reduction_map,
         }
@@ -1184,13 +1229,15 @@ impl Pipelines {
                 return p;
             }
         }
-        if !dispatch.epilogue.is_empty() {
-            let key = (dispatch.shader.clone(), dispatch.epilogue.clone());
-            if let Some(p) = self.epilogue_map.get(&key) {
-                return p;
-            }
+        if let Some(epilogue) = epilogue_pipeline_key(dispatch) {
+            let key = (dispatch.shader.clone(), epilogue);
+            return if dispatch.use_coop {
+                &self.coop_epilogue_map[&key]
+            } else {
+                &self.epilogue_map[&key]
+            };
         }
-        if dispatch.weight_format.is_quantized() {
+        if dispatch.weight_format.uses_reduced_storage() {
             let key = (dispatch.shader.clone(), dispatch.weight_format);
             if let Some(p) = self.weight_map.get(&key) {
                 return p;
@@ -1229,6 +1276,10 @@ impl Pipelines {
         }
         #[allow(clippy::needless_borrowed_reference)]
         for (&(ref entry, _), pipeline) in &self.epilogue_map {
+            result.push((entry.entry_point(), pipeline));
+        }
+        #[allow(clippy::needless_borrowed_reference)]
+        for (&(ref entry, _), pipeline) in &self.coop_epilogue_map {
             result.push((entry.entry_point(), pipeline));
         }
         result
@@ -1408,11 +1459,9 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::MultiHeadAttn
         | ShaderEntry::FlashAttention
         | ShaderEntry::FlashAttentionCoop => MultiHeadAttnData::layout(),
-        ShaderEntry::MultiHeadAttnGradQ
-        | ShaderEntry::FlashGradQ
-        | ShaderEntry::FlashGradQCoop
-        | ShaderEntry::MultiHeadAttnGradK
-        | ShaderEntry::MultiHeadAttnGradV => MultiHeadAttnGradData::layout(),
+        ShaderEntry::MultiHeadAttnGradQ | ShaderEntry::FlashGradQ | ShaderEntry::FlashGradQCoop => {
+            MultiHeadAttnGradData::layout()
+        }
         ShaderEntry::MultiHeadAttnGradKV
         | ShaderEntry::FlashGradKV
         | ShaderEntry::FlashGradKVCoop => MultiHeadAttnGradKVData::layout(),
@@ -1906,15 +1955,24 @@ impl Session {
             let output_tile = config.output_tile();
             let _half_tile = config.tile_size;
             for dispatch in &mut plan.dispatches {
-                // Skip dispatches that carry a matmul epilogue chain: the
-                // pipeline lookup in `Pipelines::get` returns the scalar
-                // `epilogue_map` entry *before* checking `use_coop`, but the
-                // coop block below would rewrite `dispatch.workgroups` to the
-                // coop geometry. That mismatch silently zeros every tile past
-                // the first M=64 rows. Coop+epilogue isn't a supported
-                // pipeline variant, so stay on scalar geometry.
-                if !dispatch.epilogue.is_empty() || dispatch.matmul_epilogue.is_some() {
+                // Autodiff marks derivative work as f32-sensitive. NVIDIA's
+                // TF32 keeps the f32 exponent range, but our portable f16
+                // cooperative path does not: tiny gradient operands can
+                // underflow before accumulation. A native f32 cooperative
+                // implementation is still safe and remains eligible.
+                if config.use_f16_input && dispatch.requires_full_precision {
                     continue;
+                }
+                // Cooperative epilogues are supported for the compiler's
+                // current unary PointwiseDAG chains. They stage matrix
+                // accumulators through workgroup memory, then apply scalar
+                // WGSL with bounds checks. Legacy-only plans and DAGs needing
+                // extra storage bindings stay on scalar geometry.
+                if !dispatch.epilogue.is_empty() || dispatch.matmul_epilogue.is_some() {
+                    match dispatch.matmul_epilogue {
+                        Some(ref epilogue) if epilogue.inputs.is_empty() => {}
+                        _ => continue,
+                    }
                 }
                 let group = dispatch.shader.shader_group();
                 // Extract (m, n, k, batch) from dispatch params based on shader group.
@@ -2024,7 +2082,8 @@ impl Session {
                     _ => true,
                 };
                 let _ = k;
-                if coop_wgs >= min_wgs && !dispatch.weight_format.is_quantized() && vec4_ok {
+                if coop_wgs >= min_wgs && !dispatch.weight_format.uses_reduced_storage() && vec4_ok
+                {
                     dispatch.use_coop = true;
                     // Route conv2d coop dispatches to generated specialized kernels
                     if is_conv_bwd {
@@ -2068,7 +2127,7 @@ impl Session {
             for dispatch in plan.dispatches.iter_mut() {
                 if dispatch.use_coop
                     || dispatch.use_small_tiles
-                    || dispatch.weight_format.is_quantized()
+                    || dispatch.weight_format.uses_reduced_storage()
                 {
                     continue;
                 }
@@ -2151,8 +2210,10 @@ impl Session {
                 for i in range.clone() {
                     let d = &plan.dispatches[i];
                     eprintln!(
-                        "g{gi:03} d{i:03} {:?} in={:?} out={} wg={:?} params={:?}",
+                        "g{gi:03} d{i:03} {:?} coop={} epilogue={} in={:?} out={} wg={:?} params={:?}",
                         d.shader,
+                        d.use_coop,
+                        d.matmul_epilogue.is_some() || !d.epilogue.is_empty(),
                         d.input_buffers.iter().map(|b| b.0).collect::<Vec<_>>(),
                         d.output_buffer.0,
                         d.workgroups,
@@ -2912,7 +2973,7 @@ impl Session {
                                 .map(|&(f, _, _)| f)
                                 .unwrap_or(crate::compile::WeightFormat::F32);
 
-                            if derived_fmt.is_quantized() {
+                            if derived_fmt.uses_reduced_storage() {
                                 // Quantized: accumulate sources into f32 staging,
                                 // then quantize the full interleaved matrix.
                                 let &(_, rows, _) =
@@ -4402,9 +4463,7 @@ impl Session {
             }
             ShaderEntry::MultiHeadAttnGradQ
             | ShaderEntry::FlashGradQ
-            | ShaderEntry::FlashGradQCoop
-            | ShaderEntry::MultiHeadAttnGradK
-            | ShaderEntry::MultiHeadAttnGradV => {
+            | ShaderEntry::FlashGradQCoop => {
                 pc.bind(
                     0,
                     &MultiHeadAttnGradData {
@@ -5617,6 +5676,9 @@ impl Drop for Session {
             self.gpu.destroy_compute_pipeline(pipeline);
         }
         for pipeline in self.pipelines.epilogue_map.values_mut() {
+            self.gpu.destroy_compute_pipeline(pipeline);
+        }
+        for pipeline in self.pipelines.coop_epilogue_map.values_mut() {
             self.gpu.destroy_compute_pipeline(pipeline);
         }
         for pipeline in self.pipelines.pointwise_map.values_mut() {

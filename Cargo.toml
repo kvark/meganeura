@@ -100,3 +100,7 @@ path = "examples/qwen3.rs"
 [[example]]
 name = "grad_check"
 path = "bench/grad_check.rs"
+
+[[example]]
+name = "optimizer_ablation"
+path = "bench/optimizer_ablation.rs"

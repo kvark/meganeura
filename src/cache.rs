@@ -137,7 +137,7 @@ pub(crate) fn hash_build_config(
         skip_full_optimize,
         coop_caps,
         flash_forward_coop: std::env::var("MEGANEURA_FLASH_FWD_COOP").as_deref() != Ok("0"),
-        flash_backward_coop: std::env::var("MEGANEURA_FLASH_BWD_COOP").as_deref() != Ok("0"),
+        flash_backward_coop: std::env::var("MEGANEURA_FLASH_BWD_COOP").as_deref() == Ok("1"),
         flash_ept_cap: crate::codegen::flash_ept_cap(),
     };
     hash_serializable(&fingerprint)

@@ -1,5 +1,6 @@
-// MHA gradient wrt Q — recomputes Q·K scores (no score buffer)
-// Dispatch: [q_seq, num_heads, 1], WG=64
+// MHA gradient wrt Q — recomputes Q·K scores (no score buffer).
+// Dispatch: [q_seq, num_heads, 1], WG=64. Head dimensions below 64 use
+// zero-padded lanes; every storage access must therefore be lane-guarded.
 
 struct Params {
     q_seq: u32,
@@ -76,14 +77,21 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let kv_dim = num_kv_heads * head_dim;
     let scale = inverseSqrt(f32(head_dim));
     let q_base = pos * (num_heads * head_dim) + head * head_dim;
-    let q_val = src_a[q_base + tid];
-    let do_val = d_out[q_base + tid];
+    let lane_active = tid < head_dim;
+    var q_val = 0.0;
+    var do_val = 0.0;
+    var out_val = 0.0;
+    if lane_active {
+        q_val = src_a[q_base + tid];
+        do_val = d_out[q_base + tid];
+        out_val = fwd_dst[q_base + tid];
+    }
     let lse_idx = (pos * num_heads + head) * 2u;
     let max_s = lse[lse_idx];
     let log_sum = lse[lse_idx + 1u];
 
     // Pre-compute row_sum = sum_d(dO[d] * O[d])
-    wg_a[tid] = do_val * fwd_dst[q_base + tid];
+    wg_a[tid] = do_val * out_val;
     tree_reduce_a(tid);
     let row_sum = wg_a[0];
 
@@ -97,8 +105,14 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         let k_base = t * kv_dim + kv_head_off;
 
         // Fused: compute Q·K score AND dO·V in one reduction pass
-        wg_a[tid] = q_val * src_b[k_base + tid];
-        wg_b[tid] = do_val * bias[k_base + tid];
+        var k_val = 0.0;
+        var v_val = 0.0;
+        if lane_active {
+            k_val = src_b[k_base + tid];
+            v_val = bias[k_base + tid];
+        }
+        wg_a[tid] = q_val * k_val;
+        wg_b[tid] = do_val * v_val;
         dual_tree_reduce(tid);
         let score = wg_a[0] * scale;
         let dp_t = wg_b[0];
@@ -110,8 +124,10 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         let ds_t = p_t * (dp_t - row_sum);
 
         // Accumulate dQ
-        my_dq += ds_t * scale * src_b[k_base + tid];
+        my_dq += ds_t * scale * k_val;
     }
 
-    dst[q_base + tid] = my_dq;
+    if lane_active {
+        dst[q_base + tid] = my_dq;
+    }
 }

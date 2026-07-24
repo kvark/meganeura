@@ -5,7 +5,10 @@
 //! numbers as a completely unoptimized one.
 
 use meganeura::graph::Op;
-use meganeura::{Graph, autodiff, build_session, compile, optimize, runtime::Session};
+use meganeura::{
+    Graph, OptimizeConfig, OptimizeMode, autodiff, build_session, compile, optimize,
+    runtime::Session,
+};
 
 /// Residual MLP with a decomposed-Silu activation. Each layer carries
 /// two fusible patterns: Add(MatMul(h, w), h) → FusedMatMulAdd and
@@ -33,7 +36,13 @@ fn outlined_regions_get_egglog_saturation() {
     let active = g.nodes().len();
     assert!(active > 300, "test graph must exceed the cutoff: {active}");
 
-    let (opt, report) = optimize::optimize_with_report(&g);
+    let (opt, report) = optimize::optimize_with_config(
+        &g,
+        OptimizeConfig {
+            mode: OptimizeMode::EgglogOutlined,
+            ..OptimizeConfig::default()
+        },
+    );
 
     assert!(
         report.outlined_regions >= 1,
@@ -69,7 +78,13 @@ fn small_graph_extraction_gates_appliers() {
     let g = deep_residual_model(4, 8, 2);
     assert!(g.nodes().len() <= 300);
 
-    let (opt, report) = optimize::optimize_with_report(&g);
+    let (opt, report) = optimize::optimize_with_config(
+        &g,
+        OptimizeConfig {
+            mode: OptimizeMode::EgglogOutlined,
+            ..OptimizeConfig::default()
+        },
+    );
     assert_eq!(report.outlined_regions, 0);
     assert!(report.num_enodes > 0);
 
@@ -88,14 +103,15 @@ fn small_graph_extraction_gates_appliers() {
 }
 
 #[test]
-fn outlined_optimization_preserves_outputs() {
+fn production_optimization_preserves_outputs() {
     let layers = 64;
     let dim = 8;
     let batch = 2;
     let g = deep_residual_model(layers, dim, batch);
 
-    // Fully optimized training session (forward optimize → autodiff →
-    // full-graph optimize, both passes over the 300-node cutoff).
+    // Fully optimized production training session (forward optimize →
+    // autodiff → full-graph optimize). Greedy is the production default;
+    // the two tests above exercise outlined egglog explicitly.
     let mut opt_session = build_session(&g);
 
     // Baseline: autodiff + compile with no optimization at all.

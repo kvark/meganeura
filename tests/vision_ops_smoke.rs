@@ -102,6 +102,84 @@ fn full_attention_basic() {
 }
 
 #[test]
+fn full_attention_matches_cpu_reference() {
+    let seq = 32usize;
+    let num_heads = 2usize;
+    let head_dim = 64usize;
+    let hidden = num_heads * head_dim;
+
+    let mut g = Graph::new();
+    let q_node = g.input("q", &[seq, hidden]);
+    let k_node = g.input("k", &[seq, hidden]);
+    let v_node = g.input("v", &[seq, hidden]);
+    let attention = g.full_attention(
+        q_node,
+        k_node,
+        v_node,
+        num_heads as u32,
+        num_heads as u32,
+        head_dim as u32,
+    );
+    g.set_outputs(vec![attention]);
+
+    let q: Vec<f32> = (0..seq * hidden)
+        .map(|i| (i as f32 * 0.013).sin() * 0.2)
+        .collect();
+    let k: Vec<f32> = (0..seq * hidden)
+        .map(|i| (i as f32 * 0.017 + 0.3).cos() * 0.2)
+        .collect();
+    let v: Vec<f32> = (0..seq * hidden)
+        .map(|i| (i as f32 * 0.019 - 0.2).sin() * 0.2)
+        .collect();
+
+    let mut expected = vec![0.0f32; seq * hidden];
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    for query in 0..seq {
+        for head in 0..num_heads {
+            let head_offset = head * head_dim;
+            let mut scores = vec![0.0f32; seq];
+            for key in 0..seq {
+                let mut dot = 0.0f32;
+                for dim in 0..head_dim {
+                    dot +=
+                        q[query * hidden + head_offset + dim] * k[key * hidden + head_offset + dim];
+                }
+                scores[key] = dot * scale;
+            }
+            let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let denominator: f32 = scores.iter().map(|score| (*score - max_score).exp()).sum();
+            for dim in 0..head_dim {
+                let numerator: f32 = scores
+                    .iter()
+                    .enumerate()
+                    .map(|(key, score)| {
+                        (*score - max_score).exp() * v[key * hidden + head_offset + dim]
+                    })
+                    .sum();
+                expected[query * hidden + head_offset + dim] = numerator / denominator;
+            }
+        }
+    }
+
+    let mut session = build_inference_session(&g);
+    session.set_input("q", &q);
+    session.set_input("k", &k);
+    session.set_input("v", &v);
+    session.step();
+    session.wait();
+    let output = session.read_output(expected.len());
+    let max_error = output
+        .iter()
+        .zip(&expected)
+        .map(|(actual, reference)| (actual - reference).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_error < 2e-4,
+        "full attention differs from CPU reference: max_error={max_error}"
+    );
+}
+
+#[test]
 fn vision_encoder_one_layer() {
     // Minimal vision encoder: 4 patches, 1 layer, 8 hidden, 2 heads
     let num_patches = 4;

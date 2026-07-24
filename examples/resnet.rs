@@ -144,7 +144,7 @@ fn hf_name(torchvision_name: &str) -> String {
     torchvision_name.to_string()
 }
 
-fn load_resnet_weights(session: &mut meganeura::Session, model: &SafeTensorsModel, batch: u32) {
+fn load_resnet_weights(session: &mut meganeura::Session, model: &SafeTensorsModel, _batch: u32) {
     let eps = 1e-5f32;
 
     // Helper: load, fuse, and set conv+bn parameters
@@ -153,7 +153,7 @@ fn load_resnet_weights(session: &mut meganeura::Session, model: &SafeTensorsMode
                          conv_name: &str,
                          bn_name: &str,
                          out_c: usize,
-                         spatial: usize| {
+                         _spatial: usize| {
         let hf_conv = hf_name(conv_name);
         let w = model.tensor_f32_auto(&hf_conv).expect(conv_name);
         let scale = model
@@ -177,18 +177,8 @@ fn load_resnet_weights(session: &mut meganeura::Session, model: &SafeTensorsMode
             1
         };
 
-        let (w_fused, b_fused) = resnet::fuse_bn_into_conv(
-            &w,
-            &scale,
-            &bias,
-            &mean,
-            &var,
-            eps,
-            out_c,
-            kernel_hw,
-            batch as usize,
-            0,
-            spatial,
+        let (w_fused, b_fused) = resnet::fuse_bn_into_conv_per_channel(
+            &w, &scale, &bias, &mean, &var, eps, out_c, kernel_hw,
         );
 
         session.set_parameter(conv_name, &w_fused);

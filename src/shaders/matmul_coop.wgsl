@@ -19,11 +19,13 @@ var<storage> matrix_b: $B_STORAGE;
 var<storage, read_write> matrix_c: array<f32>;
 $FUSED_ADD_DECL
 $PROLOGUE_DECL
+$EPILOGUE_DECL
 var<uniform> params: Params;
 var<workgroup> shared_a0: array<$ELEM_TYPE, $SHARED_SIZE>;
 var<workgroup> shared_a1: array<$ELEM_TYPE, $SHARED_SIZE>;
 var<workgroup> shared_b0: array<$ELEM_TYPE, $SHARED_SIZE>;
 var<workgroup> shared_b1: array<$ELEM_TYPE, $SHARED_SIZE>;
+$RESULT_SHARED_DECL
 
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
@@ -83,15 +85,5 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         t += $TILE_SIZE_U;
     }
 
-    // Store results
-    coopStoreT(acc00, &matrix_c[c00], n);
-    if n1_valid {
-        coopStoreT(acc01, &matrix_c[c01], n);
-    }
-    if m1_valid {
-        coopStoreT(acc10, &matrix_c[c10], n);
-    }
-    if n1_valid && m1_valid {
-        coopStoreT(acc11, &matrix_c[c11], n);
-    }
+    $RESULT_STORE
 }

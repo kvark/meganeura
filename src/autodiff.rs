@@ -11,11 +11,23 @@ pub fn differentiate(forward: &Graph) -> Graph {
     let mut graph = Graph::new();
     // Copy forward graph nodes
     for node in forward.nodes() {
-        graph.add_raw_node(node.op.clone(), node.inputs.clone(), node.ty.clone());
+        graph.add_raw_node_with_precision(
+            node.op.clone(),
+            node.inputs.clone(),
+            node.ty.clone(),
+            node.requires_full_precision,
+        );
     }
     graph.derived_params = forward.derived_params.clone();
 
     let loss_node = forward.outputs()[0];
+
+    // Derivative operands are often orders of magnitude smaller than forward
+    // activations. In particular, directly rounding them to IEEE f16 before a
+    // cooperative matmul can underflow whole parameter-gradient projections.
+    // Keep the logical graph f32 and mark every node appended below as
+    // ineligible for optional reduced-precision promotion.
+    graph.begin_full_precision_region();
 
     // Map from forward node id → gradient node id
     let mut grads: HashMap<NodeId, NodeId> = HashMap::new();
@@ -554,12 +566,6 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::RoPEGrad { .. }
             | Op::GlobalAvgPoolGrad { .. } => {}
             Op::Gelu => {
-                eprintln!(
-                    "GELU backward: x={} x_shape={:?} grad_output_id={}",
-                    node.inputs[0],
-                    forward.nodes()[node.inputs[0] as usize].ty.shape,
-                    grad_output
-                );
                 // gelu(x) ≈ x * sigmoid(1.702 * x) (sigmoid approximation)
                 // gelu'(x) ≈ sigmoid(1.702x) * (1 + 1.702*x*(1 - sigmoid(1.702x)))
                 let x = node.inputs[0];
@@ -659,11 +665,31 @@ pub fn differentiate(forward: &Graph) -> Graph {
                      EfficientNet SE in the frozen-weights inference path."
                 );
             }
-            Op::AddPerChannel { .. } => {
-                panic!(
-                    "AddPerChannel autodiff not implemented — used only for \
-                     fused-BN bias in the frozen-weights inference path."
-                );
+            Op::AddPerChannel { channels, spatial } => {
+                // y[n,c,s] = x[n,c,s] + bias[c]
+                //
+                // dL/dx is the upstream gradient. dL/dbias reduces over
+                // both batch and spatial dimensions. Express the reduction
+                // with existing transpose + SumRows primitives so the
+                // portable backend needs no one-off gradient shader.
+                let input = node.inputs[0];
+                let bias = node.inputs[1];
+                accumulate_grad(&mut graph, &mut grads, input, grad_output);
+
+                let total: usize = forward.nodes()[input as usize].ty.shape.iter().product();
+                let channels = channels as usize;
+                let spatial = spatial as usize;
+                assert_eq!(total % (channels * spatial), 0);
+                let batch = total / (channels * spatial);
+
+                let by_channel_spatial = graph.reshape(grad_output, &[batch * channels, spatial]);
+                let spatial_major = graph.transpose(by_channel_spatial);
+                let batch_channel_ty = TensorType::f32(vec![batch * channels]);
+                let batch_channel = graph.sum_rows(spatial_major, &batch_channel_ty);
+                let batch_by_channel = graph.reshape(batch_channel, &[batch, channels]);
+                let bias_ty = forward.nodes()[bias as usize].ty.clone();
+                let grad_bias = graph.sum_rows(batch_by_channel, &bias_ty);
+                accumulate_grad(&mut graph, &mut grads, bias, grad_bias);
             }
             Op::WinogradConv2d {
                 in_channels,
@@ -1210,6 +1236,29 @@ mod tests {
         assert!(diff.nodes().len() > g.nodes().len());
         // Outputs should be [loss, grad_w]
         assert_eq!(diff.outputs().len(), 2);
+    }
+
+    #[test]
+    fn autodiff_marks_only_derivative_nodes_full_precision() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 3]);
+        let w = g.parameter("w", &[3, 2]);
+        let y = g.matmul(x, w);
+        let loss = g.mean_all(y);
+        g.set_outputs(vec![loss]);
+
+        let forward_len = g.nodes().len();
+        let diff = differentiate(&g);
+        assert!(
+            diff.nodes()[..forward_len]
+                .iter()
+                .all(|node| !node.requires_full_precision)
+        );
+        assert!(
+            diff.nodes()[forward_len..]
+                .iter()
+                .all(|node| node.requires_full_precision)
+        );
     }
 
     #[test]

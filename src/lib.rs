@@ -14,11 +14,12 @@
     clippy::pattern_type_mismatch
 )]
 
-//! Meganeura: E-graph optimized neural network framework on blade-graphics.
+//! Meganeura: graph-optimized neural network framework on blade-graphics.
 //!
-//! Models are defined as declarative computation graphs, optimized via
-//! equality saturation (egglog), and compiled to static GPU dispatch
-//! sequences — no manual CUDA-graphing needed.
+//! Models are defined as declarative computation graphs, optimized with
+//! greedy rewrites by default (or optional equality saturation via egglog),
+//! and compiled to static GPU dispatch sequences — no manual CUDA-graphing
+//! needed.
 
 pub mod autodiff;
 pub mod cache;
@@ -43,7 +44,7 @@ pub use data::{DataLoader, MnistDataset};
 pub use graph::{DType, Graph, NodeId, TensorType};
 pub use load::nnef::{NnefError, NnefModel, load_nnef};
 pub use load::onnx::{OnnxError, OnnxModel, load_onnx, load_onnx_bytes};
-pub use optimize::OptimizeReport;
+pub use optimize::{ExtractionCost, OptimizeConfig, OptimizeMode, OptimizeReport};
 pub use runtime::{ExternalBindError, ExternalSlot, MemorySummary, Session, init_gpu_context};
 pub use train::{
     EpochStats, LossHistory, MetricCallback, Mode, Optimizer, SessionConfig, StepMetrics,

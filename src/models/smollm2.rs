@@ -41,7 +41,9 @@ impl SmolLM2Config {
             num_key_value_heads: 3,
             intermediate_size: 1536,
             rms_norm_eps: 1e-5,
-            rope_theta: 10000.0,
+            // SmolLM2 publishes this under rope_scaling.rope_theta rather
+            // than the legacy top-level rope_theta field.
+            rope_theta: 100000.0,
             tie_word_embeddings: true,
         }
     }

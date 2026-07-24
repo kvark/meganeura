@@ -388,3 +388,12 @@ fn matmul_sigmoid_p1024_l24() {
 fn matmul_sigmoid_p784_l16() {
     run_matmul_sigmoid(784, 16, 16);
 }
+
+#[test]
+fn matmul_sigmoid_coop_eligible_grid() {
+    // 32×4 = 128 cooperative workgroups with a 32×32 output tile. This
+    // crosses the f16 cooperative-selection threshold on wide discrete GPUs,
+    // exercising the shared-memory accumulator-to-epilogue bridge rather
+    // than merely validating the scalar fallback.
+    run_matmul_sigmoid(1024, 16, 128);
+}

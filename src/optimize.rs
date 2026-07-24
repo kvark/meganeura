@@ -29,6 +29,118 @@ use std::{fmt, time::Instant};
 /// training graph (~750 nodes) takes minutes unsegmented.
 const SATURATION_CUTOFF: usize = 300;
 
+/// Rewrite strategy used by the graph optimizer.
+///
+/// Equality-saturation variants are primarily useful for controlled compiler
+/// ablations and future global rewrites. `Greedy` is the production strategy:
+/// for the current local rewrite set it extracts the same useful forms with
+/// far less compile-time overhead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OptimizeMode {
+    /// Preserve the graph as written (apart from dead-code elimination).
+    Off,
+    /// Apply the same rewrite patterns deterministically to a fixed point.
+    Greedy,
+    /// Run equality saturation in fixed-size windows, without outlining.
+    EgglogWindowed,
+    /// Outline repeated regions, then saturate regions and residual windows.
+    EgglogOutlined,
+    /// Saturate the complete graph in one e-graph. This can scale poorly.
+    EgglogWhole,
+}
+
+impl OptimizeMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Greedy => "greedy",
+            Self::EgglogWindowed => "egglog-windowed",
+            Self::EgglogOutlined => "egglog-outlined",
+            Self::EgglogWhole => "egglog-whole",
+        }
+    }
+}
+
+/// Objective used when extracting a representative from each e-class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtractionCost {
+    /// Minimize expression-tree nodes.
+    AstSize,
+    /// Minimize estimated tensor bytes read and written.
+    TensorTraffic,
+}
+
+impl ExtractionCost {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AstSize => "ast-size",
+            Self::TensorTraffic => "tensor-traffic",
+        }
+    }
+}
+
+/// Configuration for graph-rewrite ablations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OptimizeConfig {
+    pub mode: OptimizeMode,
+    pub extraction_cost: ExtractionCost,
+    /// Maximum nodes in an outlined region or residual window.
+    pub saturation_cutoff: usize,
+}
+
+impl Default for OptimizeConfig {
+    fn default() -> Self {
+        Self {
+            mode: OptimizeMode::Greedy,
+            extraction_cost: ExtractionCost::TensorTraffic,
+            saturation_cutoff: SATURATION_CUTOFF,
+        }
+    }
+}
+
+impl OptimizeConfig {
+    /// Read benchmark-oriented overrides while retaining production defaults.
+    ///
+    /// - `MEGANEURA_OPTIMIZER=off|greedy|egglog-windowed|egglog-outlined|egglog-whole`
+    /// - `MEGANEURA_EGRAPH_COST=ast-size|tensor-traffic`
+    /// - `MEGANEURA_EGRAPH_CUTOFF=<positive integer>`
+    pub fn from_env() -> Self {
+        let mut config = Self::default();
+        if let Ok(value) = std::env::var("MEGANEURA_OPTIMIZER") {
+            config.mode = match value.as_str() {
+                "off" => OptimizeMode::Off,
+                "greedy" => OptimizeMode::Greedy,
+                "egglog-windowed" | "windowed" => OptimizeMode::EgglogWindowed,
+                "egglog-outlined" | "outlined" => OptimizeMode::EgglogOutlined,
+                "egglog-whole" | "whole" => OptimizeMode::EgglogWhole,
+                _ => {
+                    log::warn!("unknown MEGANEURA_OPTIMIZER={value:?}; using greedy");
+                    OptimizeMode::Greedy
+                }
+            };
+        }
+        if let Ok(value) = std::env::var("MEGANEURA_EGRAPH_COST") {
+            config.extraction_cost = match value.as_str() {
+                "ast-size" | "ast" | "unit" => ExtractionCost::AstSize,
+                "tensor-traffic" | "traffic" => ExtractionCost::TensorTraffic,
+                _ => {
+                    log::warn!("unknown MEGANEURA_EGRAPH_COST={value:?}; using tensor-traffic");
+                    ExtractionCost::TensorTraffic
+                }
+            };
+        }
+        if let Ok(value) = std::env::var("MEGANEURA_EGRAPH_CUTOFF") {
+            match value.parse::<usize>() {
+                Ok(value) if value > 0 => config.saturation_cutoff = value,
+                _ => log::warn!(
+                    "invalid MEGANEURA_EGRAPH_CUTOFF={value:?}; using {SATURATION_CUTOFF}"
+                ),
+            }
+        }
+        config
+    }
+}
+
 // ---------------------------------------------------------------------------
 // HBM-traffic-aware cost model for e-graph extraction.
 //
@@ -46,15 +158,21 @@ const SATURATION_CUTOFF: usize = 300;
 #[derive(Default, Debug, Clone)]
 pub struct FusionCostModel {
     /// e-class value → tensor size in bytes.
-    sizes: std::sync::Arc<HashMap<egglog::Value, u64>>,
+    sizes: Option<std::sync::Arc<HashMap<egglog::Value, u64>>>,
 }
 
 impl FusionCostModel {
+    /// Every non-leaf e-node costs one. Recursive folding therefore
+    /// minimizes the extracted expression-tree size.
+    pub fn ast_size() -> Self {
+        Self { sizes: None }
+    }
+
     /// Extraction cost is bytes read + bytes written, looked up per
     /// e-class from `sizes`.
     pub fn with_sizes(sizes: HashMap<egglog::Value, u64>) -> Self {
         Self {
-            sizes: std::sync::Arc::new(sizes),
+            sizes: Some(std::sync::Arc::new(sizes)),
         }
     }
 }
@@ -78,12 +196,15 @@ impl egglog::extract::CostModel<u64> for FusionCostModel {
         if name == "Leaf" {
             return 0;
         }
+        let Some(sizes) = self.sizes.as_ref() else {
+            return 1;
+        };
         // row.vals = [args.., output]. Args missing from the map are
         // non-tensor primitives (the node-id ints) and read no HBM.
         if let Some((out, args)) = row.vals.split_last()
-            && let Some(&out_bytes) = self.sizes.get(out)
+            && let Some(&out_bytes) = sizes.get(out)
         {
-            let read: u64 = args.iter().filter_map(|v| self.sizes.get(v)).sum();
+            let read: u64 = args.iter().filter_map(|v| sizes.get(v)).sum();
             return read.saturating_add(out_bytes);
         }
         // Unknown output e-class (a rewrite-created tensor that no graph
@@ -108,6 +229,10 @@ impl egglog::extract::CostModel<u64> for FusionCostModel {
 
 /// Report from the e-graph optimization pass.
 pub struct OptimizeReport {
+    /// Rewrite strategy used for this pass.
+    pub mode: OptimizeMode,
+    /// Extraction objective used for this pass.
+    pub extraction_cost: ExtractionCost,
     /// The egglog program text of the first segment (for inspection).
     pub egglog_program: String,
     /// Number of e-classes after saturation (summed over segments).
@@ -129,6 +254,12 @@ pub struct OptimizeReport {
     /// Repeated regions outlined for per-block saturation (0 when the
     /// whole graph fit under the saturation cutoff).
     pub outlined_regions: usize,
+    /// Number of independent e-graph saturations.
+    pub segments: usize,
+    /// Largest segment passed to egglog.
+    pub max_segment_nodes: usize,
+    /// Roots or segments left unchanged because parsing/extraction failed.
+    pub extraction_failures: usize,
 }
 
 impl OptimizeReport {
@@ -136,6 +267,8 @@ impl OptimizeReport {
     /// cache hit) but still need to return a report.
     pub fn empty() -> Self {
         Self {
+            mode: OptimizeMode::Off,
+            extraction_cost: ExtractionCost::TensorTraffic,
             egglog_program: String::new(),
             num_eclasses: 0,
             num_enodes: 0,
@@ -146,6 +279,9 @@ impl OptimizeReport {
             egglog_time: std::time::Duration::ZERO,
             extract_time: std::time::Duration::ZERO,
             outlined_regions: 0,
+            segments: 0,
+            max_segment_nodes: 0,
+            extraction_failures: 0,
         }
     }
 }
@@ -153,6 +289,14 @@ impl OptimizeReport {
 impl fmt::Display for OptimizeReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "=== Optimization Report ===")?;
+        writeln!(
+            f,
+            "Mode: {} (cost: {}, segments: {}, max segment: {} nodes)",
+            self.mode.as_str(),
+            self.extraction_cost.as_str(),
+            self.segments,
+            self.max_segment_nodes,
+        )?;
         writeln!(
             f,
             "Egglog saturation: {:.1}ms ({} e-classes, {} e-nodes{})",
@@ -178,6 +322,13 @@ impl fmt::Display for OptimizeReport {
             self.nodes_after,
             self.nodes_before.saturating_sub(self.nodes_after),
         )?;
+        if self.extraction_failures > 0 {
+            writeln!(
+                f,
+                "Extraction failures: {} (affected roots left unchanged)",
+                self.extraction_failures
+            )?;
+        }
         if !self.fusions_applied.is_empty() {
             write!(f, "Fusions:")?;
             for (i, &(ref name, node_idx)) in self.fusions_applied.iter().enumerate() {
@@ -204,11 +355,28 @@ pub fn optimize(graph: &Graph) -> Graph {
 
 /// Like `optimize`, but also returns a detailed report for debugging.
 pub fn optimize_with_report(graph: &Graph) -> (Graph, OptimizeReport) {
+    optimize_with_config(graph, OptimizeConfig::from_env())
+}
+
+/// Optimize with an explicit strategy and extraction objective.
+pub fn optimize_with_config(graph: &Graph, config: OptimizeConfig) -> (Graph, OptimizeReport) {
+    match config.mode {
+        OptimizeMode::Off => optimize_off(graph, config),
+        OptimizeMode::Greedy => optimize_greedy(graph, config),
+        OptimizeMode::EgglogWindowed | OptimizeMode::EgglogOutlined | OptimizeMode::EgglogWhole => {
+            optimize_egglog(graph, config)
+        }
+    }
+}
+
+fn optimize_egglog(graph: &Graph, config: OptimizeConfig) -> (Graph, OptimizeReport) {
     let nodes_before = graph.nodes().len();
     let mut g = clone_graph(graph);
 
-    let segments = plan_segments(&g);
+    let segments = plan_segments(&g, config.mode, config.saturation_cutoff);
     let outlined_regions = segments.iter().filter(|s| s.shifts.len() > 1).count();
+    let segment_count = segments.len();
+    let max_segment_nodes = segments.iter().map(|s| s.ids.len()).max().unwrap_or(0);
 
     let mut fusions: Vec<(String, u32)> = Vec::new();
     let mut index = build_structural_index(&g);
@@ -217,6 +385,7 @@ pub fn optimize_with_report(graph: &Graph) -> (Graph, OptimizeReport) {
     let mut num_enodes = 0;
     let mut egglog_time = std::time::Duration::ZERO;
     let mut extract_time = std::time::Duration::ZERO;
+    let mut extraction_failures = 0;
 
     for seg in &segments {
         process_segment(
@@ -229,6 +398,8 @@ pub fn optimize_with_report(graph: &Graph) -> (Graph, OptimizeReport) {
             &mut num_enodes,
             &mut egglog_time,
             &mut extract_time,
+            &mut extraction_failures,
+            config.extraction_cost,
         );
     }
 
@@ -260,6 +431,8 @@ pub fn optimize_with_report(graph: &Graph) -> (Graph, OptimizeReport) {
     }
 
     let report = OptimizeReport {
+        mode: config.mode,
+        extraction_cost: config.extraction_cost,
         egglog_program: first_program,
         num_eclasses,
         num_enodes,
@@ -270,8 +443,283 @@ pub fn optimize_with_report(graph: &Graph) -> (Graph, OptimizeReport) {
         egglog_time,
         extract_time,
         outlined_regions,
+        segments: segment_count,
+        max_segment_nodes,
+        extraction_failures,
     };
     (g.toposort(), report)
+}
+
+fn optimize_off(graph: &Graph, config: OptimizeConfig) -> (Graph, OptimizeReport) {
+    let nodes_before = graph.nodes().len();
+    let start = Instant::now();
+    let mut g = clone_graph(graph);
+    sweep_dead_nodes(&mut g);
+    let extract_time = start.elapsed();
+    let nodes_after = g
+        .nodes()
+        .iter()
+        .filter(|node| !matches!(node.op, Op::Nop))
+        .count();
+    (
+        g.toposort(),
+        OptimizeReport {
+            mode: config.mode,
+            extraction_cost: config.extraction_cost,
+            egglog_program: String::new(),
+            num_eclasses: 0,
+            num_enodes: 0,
+            rules_fired: Vec::new(),
+            nodes_before,
+            nodes_after,
+            fusions_applied: Vec::new(),
+            egglog_time: std::time::Duration::ZERO,
+            extract_time,
+            outlined_regions: 0,
+            segments: 0,
+            max_segment_nodes: 0,
+            extraction_failures: 0,
+        },
+    )
+}
+
+fn optimize_greedy(graph: &Graph, config: OptimizeConfig) -> (Graph, OptimizeReport) {
+    let nodes_before = graph.nodes().len();
+    let start = Instant::now();
+    let mut g = clone_graph(graph);
+    let mut fusions = Vec::new();
+
+    loop {
+        let before = fusions.len();
+        apply_greedy_unary_simplifications(&mut g, &mut fusions);
+        apply_greedy_matmul_add(&mut g, &mut fusions);
+        apply_greedy_silu(&mut g, &mut fusions);
+        apply_greedy_swiglu(&mut g, &mut fusions);
+        apply_greedy_swiglu_packed(&mut g, &mut fusions);
+        if fusions.len() == before {
+            break;
+        }
+    }
+    sweep_dead_nodes(&mut g);
+    let extract_time = start.elapsed();
+    let nodes_after = g
+        .nodes()
+        .iter()
+        .filter(|node| !matches!(node.op, Op::Nop))
+        .count();
+    let rules_fired = summarize_fusions(&fusions);
+
+    (
+        g.toposort(),
+        OptimizeReport {
+            mode: config.mode,
+            extraction_cost: config.extraction_cost,
+            egglog_program: String::new(),
+            num_eclasses: 0,
+            num_enodes: 0,
+            rules_fired,
+            nodes_before,
+            nodes_after,
+            fusions_applied: fusions,
+            egglog_time: std::time::Duration::ZERO,
+            extract_time,
+            outlined_regions: 0,
+            segments: 0,
+            max_segment_nodes: 0,
+            extraction_failures: 0,
+        },
+    )
+}
+
+fn summarize_fusions(fusions: &[(String, u32)]) -> Vec<(String, usize)> {
+    let mut summary = Vec::new();
+    for fusion in fusions {
+        let name = &fusion.0;
+        if let Some(entry) = summary
+            .iter_mut()
+            .find(|entry: &&mut (String, usize)| entry.0 == *name)
+        {
+            entry.1 += 1;
+        } else {
+            summary.push((name.clone(), 1));
+        }
+    }
+    summary
+}
+
+fn apply_greedy_unary_simplifications(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
+    let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
+    for id in node_ids {
+        let (outer, inner_id) = {
+            let node = &graph.nodes()[id];
+            if node.inputs.len() != 1 {
+                continue;
+            }
+            (node.op.clone(), node.inputs[0])
+        };
+        let inner = graph.node(inner_id);
+        let (replacement, label) = match (outer, inner.op.clone()) {
+            (Op::Neg, Op::Neg) => (inner.inputs[0], "Neg(Neg(x))→x"),
+            (Op::Transpose, Op::Transpose) => (inner.inputs[0], "Transpose(Transpose(x))→x"),
+            (Op::Relu, Op::Relu) => (inner_id, "Relu(Relu(x))→Relu(x)"),
+            _ => continue,
+        };
+        graph.nodes_mut()[id].op = Op::Identity;
+        graph.nodes_mut()[id].inputs = vec![replacement];
+        fusions.push((label.to_string(), id as u32));
+    }
+}
+
+fn apply_greedy_matmul_add(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
+    let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
+    for id in node_ids {
+        let (lhs, rhs) = {
+            let node = &graph.nodes()[id];
+            if !matches!(node.op, Op::Add) {
+                continue;
+            }
+            (node.inputs[0], node.inputs[1])
+        };
+        let (mm_id, addend) =
+            if matches!(graph.node(lhs).op, Op::MatMul | Op::MatMulAT | Op::MatMulBT) {
+                (lhs, rhs)
+            } else if matches!(graph.node(rhs).op, Op::MatMul | Op::MatMulAT | Op::MatMulBT) {
+                (rhs, lhs)
+            } else {
+                continue;
+            };
+        let mm = graph.node(mm_id);
+        let (op, label) = match mm.op {
+            Op::MatMul => (Op::FusedMatMulAdd, "MatMul+Add→FusedMatMulAdd"),
+            Op::MatMulAT => (Op::FusedMatMulATAdd, "MatMulAT+Add→FusedMatMulATAdd"),
+            Op::MatMulBT => (Op::FusedMatMulBTAdd, "MatMulBT+Add→FusedMatMulBTAdd"),
+            _ => unreachable!(),
+        };
+        let inputs = vec![mm.inputs[0], mm.inputs[1], addend];
+        graph.nodes_mut()[id].op = op;
+        graph.nodes_mut()[id].inputs = inputs;
+        fusions.push((label.to_string(), id as u32));
+    }
+}
+
+fn apply_greedy_silu(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
+    let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
+    for id in node_ids {
+        let (a, b) = {
+            let node = &graph.nodes()[id];
+            if !matches!(node.op, Op::Mul) {
+                continue;
+            }
+            (node.inputs[0], node.inputs[1])
+        };
+        let x = if matches!(graph.node(b).op, Op::Sigmoid) && graph.node(b).inputs[0] == a {
+            a
+        } else if matches!(graph.node(a).op, Op::Sigmoid) && graph.node(a).inputs[0] == b {
+            b
+        } else {
+            continue;
+        };
+        graph.nodes_mut()[id].op = Op::Silu;
+        graph.nodes_mut()[id].inputs = vec![x];
+        fusions.push(("Mul+Sigmoid→Silu".to_string(), id as u32));
+    }
+}
+
+fn apply_greedy_swiglu(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
+    let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
+    for id in node_ids {
+        let (a, b) = {
+            let node = &graph.nodes()[id];
+            if !matches!(node.op, Op::Mul) {
+                continue;
+            }
+            (node.inputs[0], node.inputs[1])
+        };
+        let (gate, up) = if matches!(graph.node(a).op, Op::Silu) {
+            (graph.node(a).inputs[0], b)
+        } else if matches!(graph.node(b).op, Op::Silu) {
+            (graph.node(b).inputs[0], a)
+        } else {
+            continue;
+        };
+        graph.nodes_mut()[id].op = Op::SwiGLU;
+        graph.nodes_mut()[id].inputs = vec![gate, up];
+        fusions.push(("Silu+Mul→SwiGLU".to_string(), id as u32));
+    }
+}
+
+fn apply_greedy_swiglu_packed(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
+    let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
+    for id in node_ids {
+        let (gate_id, up_id) = {
+            let node = &graph.nodes()[id];
+            if !matches!(node.op, Op::SwiGLU) {
+                continue;
+            }
+            (node.inputs[0], node.inputs[1])
+        };
+        let (h, wg, wu) = {
+            let gate = graph.node(gate_id);
+            let up = graph.node(up_id);
+            if !matches!(gate.op, Op::MatMul)
+                || !matches!(up.op, Op::MatMul)
+                || gate.inputs[0] != up.inputs[0]
+            {
+                continue;
+            }
+            (gate.inputs[0], gate.inputs[1], up.inputs[1])
+        };
+        let (gate_name, up_name, in_features, out_features, dtype) = {
+            let gate_weight = graph.node(wg);
+            let up_weight = graph.node(wu);
+            let (gate_name, up_name) = match (gate_weight.op.clone(), up_weight.op.clone()) {
+                (Op::Parameter { name: gate }, Op::Parameter { name: up }) => (gate, up),
+                _ => continue,
+            };
+            if gate_weight.ty.shape.len() != 2
+                || gate_weight.ty.shape != up_weight.ty.shape
+                || gate_weight.ty.dtype != up_weight.ty.dtype
+                || graph.node(h).ty.shape.len() != 2
+            {
+                continue;
+            }
+            (
+                gate_name,
+                up_name,
+                gate_weight.ty.shape[0],
+                gate_weight.ty.shape[1],
+                gate_weight.ty.dtype,
+            )
+        };
+
+        let concat_name = format!("{gate_name}+{up_name}");
+        graph.derived_params.push(crate::graph::DerivedParam {
+            name: concat_name.clone(),
+            sources: vec![(gate_name, out_features), (up_name, out_features)],
+            rows: in_features,
+            transform: crate::graph::ParamTransform::HorizontalConcat,
+        });
+        let requires_full_precision = graph.node(id as NodeId).requires_full_precision;
+        let concat_w = graph.add_raw_node_with_precision(
+            Op::Parameter { name: concat_name },
+            vec![],
+            TensorType::new(vec![in_features, 2 * out_features], dtype),
+            requires_full_precision,
+        );
+        let m = graph.node(h).ty.shape[0];
+        let wide_mm = graph.add_raw_node_with_precision(
+            Op::MatMul,
+            vec![h, concat_w],
+            TensorType::f32(vec![m, 2 * out_features]),
+            requires_full_precision,
+        );
+        graph.nodes_mut()[id].op = Op::SwiGLUConcat;
+        graph.nodes_mut()[id].inputs = vec![wide_mm];
+        fusions.push((
+            "SwiGLU(MatMul,MatMul)→SwiGLUConcat(MatMul)".to_string(),
+            id as u32,
+        ));
+    }
 }
 
 /// Dump the whole-graph egglog program (for standalone debugging).
@@ -303,17 +751,33 @@ struct Segment {
     shifts: Vec<usize>,
 }
 
-fn plan_segments(g: &Graph) -> Vec<Segment> {
+fn plan_segments(g: &Graph, mode: OptimizeMode, saturation_cutoff: usize) -> Vec<Segment> {
     let n = g.nodes().len();
     let active = g
         .nodes()
         .iter()
         .filter(|n| !matches!(n.op, Op::Nop))
         .count();
+    if mode == OptimizeMode::EgglogWhole {
+        return vec![Segment {
+            ids: g
+                .nodes()
+                .iter()
+                .filter(|node| !matches!(node.op, Op::Nop))
+                .map(|node| node.id as usize)
+                .collect(),
+            shifts: vec![0],
+        }];
+    }
+
+    let saturation_cutoff = saturation_cutoff.max(1);
     let mut segments = Vec::new();
     let mut covered = vec![false; n];
-    if active > SATURATION_CUTOFF {
+    if mode == OptimizeMode::EgglogOutlined && active > saturation_cutoff {
         for r in crate::outline::detect_repeated_regions(g) {
+            if r.period > saturation_cutoff {
+                continue;
+            }
             for c in covered.iter_mut().skip(r.start).take(r.len()) {
                 *c = true;
             }
@@ -333,7 +797,7 @@ fn plan_segments(g: &Graph) -> Vec<Segment> {
             continue;
         }
         window.push(id);
-        if window.len() == SATURATION_CUTOFF {
+        if window.len() == saturation_cutoff {
             segments.push(Segment {
                 ids: std::mem::take(&mut window),
                 shifts: vec![0],
@@ -625,13 +1089,15 @@ fn instance_ext_map(
 fn process_segment(
     g: &mut Graph,
     seg: &Segment,
-    index: &mut HashMap<(&'static str, Vec<NodeId>), NodeId>,
+    index: &mut HashMap<(&'static str, Vec<NodeId>, bool), NodeId>,
     fusions: &mut Vec<(String, u32)>,
     first_program: &mut String,
     num_eclasses: &mut usize,
     num_enodes: &mut usize,
     egglog_time: &mut std::time::Duration,
     extract_time: &mut std::time::Duration,
+    extraction_failures: &mut usize,
+    extraction_cost: ExtractionCost,
 ) {
     let egglog_start = Instant::now();
     let (program, externals) = segment_program(g, seg);
@@ -645,11 +1111,17 @@ fn process_segment(
             seg.ids.len(),
             e
         );
+        *extraction_failures += 1;
         *egglog_time += egglog_start.elapsed();
         return;
     }
-    let size_ids = externals.iter().copied().chain(seg.ids.iter().copied());
-    let cm = FusionCostModel::with_sizes(eclass_sizes(g, &mut egraph, size_ids));
+    let cm = match extraction_cost {
+        ExtractionCost::AstSize => FusionCostModel::ast_size(),
+        ExtractionCost::TensorTraffic => {
+            let size_ids = externals.iter().copied().chain(seg.ids.iter().copied());
+            FusionCostModel::with_sizes(eclass_sizes(g, &mut egraph, size_ids))
+        }
+    };
 
     let roots = segment_roots(g, seg);
     let mut terms: Vec<(usize, TermDag, TermId)> = Vec::new();
@@ -657,8 +1129,11 @@ fn process_segment(
         let var = format!("$n{}", root);
         match egraph.eval_expr(&egglog::ast::Expr::Var(egglog::ast::Span::Panic, var)) {
             Ok((sort, value)) => {
-                match egraph.extract_value_with_cost_model(&sort, value, cm.clone()) {
-                    Ok((dag, term_id, cost)) => {
+                let extraction = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    egraph.extract_value_with_cost_model(&sort, value, cm.clone())
+                }));
+                match extraction {
+                    Ok(Ok((dag, term_id, cost))) => {
                         log::debug!(
                             "extracted $n{} (cost {}): {}",
                             root,
@@ -667,10 +1142,23 @@ fn process_segment(
                         );
                         terms.push((root, dag, term_id));
                     }
-                    Err(e) => log::warn!("extraction failed for $n{}: {}", root, e),
+                    Ok(Err(e)) => {
+                        *extraction_failures += 1;
+                        log::warn!("extraction failed for $n{}: {}", root, e);
+                    }
+                    Err(_) => {
+                        *extraction_failures += 1;
+                        log::warn!(
+                            "egglog panicked while reconstructing $n{} — root left unchanged",
+                            root
+                        );
+                    }
                 }
             }
-            Err(e) => log::warn!("failed to eval $n{}: {}", root, e),
+            Err(e) => {
+                *extraction_failures += 1;
+                log::warn!("failed to eval $n{}: {}", root, e);
+            }
         }
     }
     let serialized = egraph.serialize(egglog::SerializeConfig::default());
@@ -698,6 +1186,7 @@ fn process_segment(
             continue;
         };
         for &(root, ref dag, term_id) in &terms {
+            let requires_full_precision = g.node((root + shift) as NodeId).requires_full_precision;
             let mut stamper = Stamper {
                 g,
                 index,
@@ -706,6 +1195,7 @@ fn process_segment(
                 ext_map,
                 fusions,
                 memo: HashMap::new(),
+                requires_full_precision,
             };
             if let Err(e) = stamper.stamp_root(root + shift, dag, term_id) {
                 log::warn!("stamping $n{} (+{}) failed: {}", root, shift, e);
@@ -723,8 +1213,9 @@ fn process_segment(
 /// survive.
 struct Stamper<'a> {
     g: &'a mut Graph,
-    /// Structural memo for named constructors: (name, children) → node.
-    index: &'a mut HashMap<(&'static str, Vec<NodeId>), NodeId>,
+    /// Structural memo for named constructors:
+    /// (name, children, precision policy) → node.
+    index: &'a mut HashMap<(&'static str, Vec<NodeId>, bool), NodeId>,
     /// Node ids of the encoded instance (terms only reference these).
     seg_ids: &'a HashSet<usize>,
     /// Id shift of the instance being stamped.
@@ -734,6 +1225,10 @@ struct Stamper<'a> {
     fusions: &'a mut Vec<(String, u32)>,
     /// Per-(dag, instance) term resolution cache.
     memo: HashMap<TermId, NodeId>,
+    /// Precision policy of the root currently being reconstructed. Newly
+    /// materialized interior nodes must not cross the forward/backward
+    /// reduced-precision boundary.
+    requires_full_precision: bool,
 }
 
 impl Stamper<'_> {
@@ -797,7 +1292,11 @@ impl Stamper<'_> {
             }
             Term::App(ref name, ref children) => {
                 let inputs = self.resolve_children(dag, children)?;
-                match self.index.get(&(static_constructor(name)?, inputs.clone())) {
+                match self.index.get(&(
+                    static_constructor(name)?,
+                    inputs.clone(),
+                    self.requires_full_precision,
+                )) {
                     Some(&hit) => hit,
                     None => self.build_named(name, inputs, None)?,
                 }
@@ -884,7 +1383,14 @@ impl Stamper<'_> {
             other => return Err(format!("unknown constructor {}", other)),
         };
         let id = self.place(op, inputs.clone(), ty, target);
-        self.index.insert((static_constructor(name)?, inputs), id);
+        self.index.insert(
+            (
+                static_constructor(name)?,
+                inputs,
+                self.requires_full_precision,
+            ),
+            id,
+        );
         if let Some(label) = label {
             self.fusions.push((label.to_string(), id));
         }
@@ -933,15 +1439,17 @@ impl Stamper<'_> {
             transform: crate::graph::ParamTransform::HorizontalConcat,
         });
         let concat_dtype = self.g.node(wg).ty.dtype;
-        let concat_w = self.g.add_raw_node(
+        let concat_w = self.g.add_raw_node_with_precision(
             Op::Parameter { name: concat_name },
             vec![],
             TensorType::new(vec![in_features, 2 * out_features], concat_dtype),
+            self.requires_full_precision,
         );
-        let wide_mm = self.g.add_raw_node(
+        let wide_mm = self.g.add_raw_node_with_precision(
             Op::MatMul,
             vec![h, concat_w],
             TensorType::f32(vec![m, 2 * out_features]),
+            self.requires_full_precision,
         );
         let id = self.place(
             Op::SwiGLUConcat,
@@ -949,14 +1457,25 @@ impl Stamper<'_> {
             TensorType::f32(vec![m, out_features]),
             target,
         );
-        self.index.insert(("SwiGLUPacked", inputs.to_vec()), id);
+        self.index.insert(
+            (
+                "SwiGLUPacked",
+                inputs.to_vec(),
+                self.requires_full_precision,
+            ),
+            id,
+        );
         self.fusions
             .push(("SwiGLU(MatMul,MatMul)→SwiGLUConcat(MatMul)".to_string(), id));
         Ok(id)
     }
 
     fn lookup_or_build(&mut self, name: &str, inputs: Vec<NodeId>) -> Result<NodeId, String> {
-        match self.index.get(&(static_constructor(name)?, inputs.clone())) {
+        match self.index.get(&(
+            static_constructor(name)?,
+            inputs.clone(),
+            self.requires_full_precision,
+        )) {
             Some(&hit) => Ok(hit),
             None => self.build_named(name, inputs, None),
         }
@@ -979,7 +1498,10 @@ impl Stamper<'_> {
                 // ty deliberately untouched: same e-class, same tensor.
                 id
             }
-            None => self.g.add_raw_node(op, inputs, ty),
+            None => {
+                self.g
+                    .add_raw_node_with_precision(op, inputs, ty, self.requires_full_precision)
+            }
         }
     }
 }
@@ -1021,11 +1543,14 @@ fn lit_node_id(dag: &TermDag, term_id: TermId) -> Result<usize, String> {
 /// Structural memo of the existing graph for named constructors, so
 /// term resolution finds each instance's own nodes (and never duplicates
 /// an existing equivalent node).
-fn build_structural_index(g: &Graph) -> HashMap<(&'static str, Vec<NodeId>), NodeId> {
+fn build_structural_index(g: &Graph) -> HashMap<(&'static str, Vec<NodeId>, bool), NodeId> {
     let mut index = HashMap::new();
     for node in g.nodes() {
         if let Some(name) = named_constructor(&node.op) {
-            index.insert((name, node.inputs.clone()), node.id);
+            index.insert(
+                (name, node.inputs.clone(), node.requires_full_precision),
+                node.id,
+            );
         }
     }
     index
@@ -1167,6 +1692,7 @@ pub fn apply_winograd_conv_fusions(graph: &mut Graph, fusions: &mut Vec<(String,
         }
 
         let weight_id = node.inputs[1];
+        let requires_full_precision = node.requires_full_precision;
         let weight_name = match graph.node(weight_id).op {
             Op::Parameter { ref name } => name.clone(),
             _ => continue,
@@ -1189,10 +1715,11 @@ pub fn apply_winograd_conv_fusions(graph: &mut Graph, fusions: &mut Vec<(String,
 
         // Create new parameter node for Winograd-transformed weights [16 * Co * Ci]
         let wino_size = 16 * out_channels as usize * in_channels as usize;
-        let wino_param = graph.add_raw_node(
+        let wino_param = graph.add_raw_node_with_precision(
             Op::Parameter { name: wino_name },
             vec![],
             TensorType::f32(vec![wino_size]),
+            requires_full_precision,
         );
 
         // Rewrite Conv2d → WinogradConv2d
@@ -1213,7 +1740,12 @@ pub fn apply_winograd_conv_fusions(graph: &mut Graph, fusions: &mut Vec<(String,
 fn clone_graph(graph: &Graph) -> Graph {
     let mut new_graph = Graph::new();
     for node in graph.nodes() {
-        new_graph.add_raw_node(node.op.clone(), node.inputs.clone(), node.ty.clone());
+        new_graph.add_raw_node_with_precision(
+            node.op.clone(),
+            node.inputs.clone(),
+            node.ty.clone(),
+            node.requires_full_precision,
+        );
     }
     let num_user = graph.num_user_outputs();
     new_graph.set_outputs(graph.outputs()[..num_user].to_vec());
@@ -1225,6 +1757,11 @@ fn clone_graph(graph: &Graph) -> Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn greedy_is_the_production_default() {
+        assert_eq!(OptimizeConfig::default().mode, OptimizeMode::Greedy);
+    }
 
     #[test]
     fn test_no_fusion_cooperative_matrix() {
@@ -1523,6 +2060,54 @@ mod tests {
             output_node.op
         );
         assert!(!report.fusions_applied.is_empty());
+    }
+
+    #[test]
+    fn test_optimizer_ablation_modes_share_rewrite_semantics() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 8]);
+        let w = g.parameter("w", &[8, 4]);
+        let bias = g.input("bias", &[4, 4]);
+        let mm = g.matmul(x, w);
+        let out = g.add(mm, bias);
+        g.set_outputs(vec![out]);
+
+        let (off, off_report) = optimize_with_config(
+            &g,
+            OptimizeConfig {
+                mode: OptimizeMode::Off,
+                ..OptimizeConfig::default()
+            },
+        );
+        assert!(matches!(off.node(off.outputs()[0]).op, Op::Add));
+        assert_eq!(off_report.mode, OptimizeMode::Off);
+
+        for mode in [
+            OptimizeMode::Greedy,
+            OptimizeMode::EgglogWindowed,
+            OptimizeMode::EgglogOutlined,
+            OptimizeMode::EgglogWhole,
+        ] {
+            for extraction_cost in [ExtractionCost::AstSize, ExtractionCost::TensorTraffic] {
+                let (optimized, report) = optimize_with_config(
+                    &g,
+                    OptimizeConfig {
+                        mode,
+                        extraction_cost,
+                        saturation_cutoff: 3,
+                    },
+                );
+                assert!(
+                    matches!(
+                        optimized.node(optimized.outputs()[0]).op,
+                        Op::FusedMatMulAdd
+                    ),
+                    "{mode:?}/{extraction_cost:?} did not select the fusion"
+                );
+                assert_eq!(report.mode, mode);
+                assert_eq!(report.extraction_cost, extraction_cost);
+            }
+        }
     }
 
     /// SwiGLU(MatMul, MatMul) → SwiGLUConcat(MatMul) fusion.
