@@ -121,6 +121,18 @@ pub enum Op {
     /// so the fusion pass can fold a pointwise/gather producer into its
     /// prologue. The differentiable equivalent of `matmul(x, ones[N,1])`.
     SumInner,
+    /// Exclusive cumulative sum over the inner axis of a 2D tensor.
+    ///
+    /// Forward order emits `y[m, n] = sum(x[m, 0..n])`; reverse order emits
+    /// `y[m, n] = sum(x[m, n+1..N])`. The two directions are transposes of
+    /// one another, so the reverse form is also the forward form's backward.
+    ExclusiveCumsum {
+        reverse: bool,
+    },
+    /// Shift rows along the inner axis, filling uncovered elements with zero.
+    ShiftInner {
+        offset: i32,
+    },
     Softmax,
 
     // Loss
@@ -1051,6 +1063,47 @@ impl Graph {
         let m = shape[0];
         let ty = TensorType::f32(vec![m, 1]);
         self.add_node(Op::SumInner, vec![x], ty)
+    }
+
+    /// Exclusive cumulative sum over the inner axis of a 2D tensor.
+    ///
+    /// With `reverse = false`, each output contains the sum of values before
+    /// it in the row. With `reverse = true`, it contains the sum after it.
+    pub fn exclusive_cumsum(&mut self, x: NodeId, reverse: bool) -> NodeId {
+        let ty = self.node(x).ty.clone();
+        assert_eq!(
+            ty.shape.len(),
+            2,
+            "exclusive_cumsum expects a 2D [M, N] input, got shape {:?}",
+            ty.shape
+        );
+        assert_eq!(
+            ty.dtype,
+            DType::F32,
+            "exclusive_cumsum expects an f32 input"
+        );
+        self.add_node(Op::ExclusiveCumsum { reverse }, vec![x], ty)
+    }
+
+    /// Shift each row by `offset` elements along its inner axis.
+    ///
+    /// Positive offsets move values toward larger indices; negative offsets
+    /// move them toward smaller indices. Newly uncovered elements are zero.
+    pub fn shift_inner(&mut self, x: NodeId, offset: i32) -> NodeId {
+        let ty = self.node(x).ty.clone();
+        assert_eq!(
+            ty.shape.len(),
+            2,
+            "shift_inner expects a 2D [M, N] input, got shape {:?}",
+            ty.shape
+        );
+        assert_eq!(ty.dtype, DType::F32, "shift_inner expects an f32 input");
+        assert_ne!(
+            offset,
+            i32::MIN,
+            "shift_inner offset must be safely negatable"
+        );
+        self.add_node(Op::ShiftInner { offset }, vec![x], ty)
     }
 
     pub fn softmax(&mut self, x: NodeId) -> NodeId {

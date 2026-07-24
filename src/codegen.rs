@@ -4911,6 +4911,17 @@ mod tests {
             .collect();
         assert!(names.contains(&"sum_all"));
         assert!(names.contains(&"mean_all"));
+
+        let m = generate_module(ShaderGroup::SumRows);
+        let names: Vec<&str> = m
+            .module
+            .entry_points
+            .iter()
+            .map(|ep| ep.name.as_str())
+            .collect();
+        assert!(names.contains(&"sum_rows"));
+        assert!(names.contains(&"exclusive_cumsum"));
+        assert!(names.contains(&"shift_inner"));
     }
 
     #[test]
@@ -5121,6 +5132,8 @@ mod tests {
                 | ShaderEntry::SumAll
                 | ShaderEntry::MeanAll
                 | ShaderEntry::SumRows
+                | ShaderEntry::ExclusiveCumsum
+                | ShaderEntry::ShiftInner
                 | ShaderEntry::RoPE
                 | ShaderEntry::RoPEGrad => vec!["src", "dst", "params"],
                 ShaderEntry::Add
@@ -5269,6 +5282,8 @@ mod tests {
             ShaderEntry::GradAccum,
             ShaderEntry::SumAll,
             ShaderEntry::MeanAll,
+            ShaderEntry::ExclusiveCumsum,
+            ShaderEntry::ShiftInner,
             ShaderEntry::Softmax,
             ShaderEntry::CrossEntropyLoss,
             ShaderEntry::Transpose,

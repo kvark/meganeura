@@ -1393,7 +1393,11 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::AdamUpdate => AdamData::layout(),
         ShaderEntry::ScatterAdd => ScatterAddData::layout(),
         ShaderEntry::SwiGLUConcat | ShaderEntry::SwiGLUConcatGrad => BinaryData::layout(),
-        ShaderEntry::SumAll | ShaderEntry::MeanAll | ShaderEntry::SumRows => UnaryData::layout(),
+        ShaderEntry::SumAll
+        | ShaderEntry::MeanAll
+        | ShaderEntry::SumRows
+        | ShaderEntry::ExclusiveCumsum
+        | ShaderEntry::ShiftInner => UnaryData::layout(),
         ShaderEntry::Softmax => SoftmaxData::layout(),
         ShaderEntry::CrossEntropyLoss => CrossEntropyData::layout(),
         ShaderEntry::BceLoss => BceData::layout(),
@@ -4097,6 +4101,21 @@ impl Session {
                             len: dispatch.params[0],
                             _pad0: 0,
                             _pad1: 0,
+                            _pad2: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::ExclusiveCumsum | ShaderEntry::ShiftInner => {
+                pc.bind(
+                    0,
+                    &UnaryData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: UnaryParams {
+                            len: dispatch.params[0],
+                            _pad0: dispatch.params[1],
+                            _pad1: dispatch.params[2],
                             _pad2: 0,
                         },
                     },
