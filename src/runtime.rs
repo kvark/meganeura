@@ -6404,17 +6404,26 @@ impl Session {
     pub fn save_checkpoint(&mut self, path: &std::path::Path) -> std::io::Result<()> {
         use safetensors::tensor::{Dtype, TensorView};
 
+        struct CheckpointTensor {
+            name: String,
+            buffer: blade_graphics::Buffer,
+            offset: usize,
+            byte_len: usize,
+            dtype: Dtype,
+            shape: Vec<usize>,
+        }
+
+        let wall_start = std::time::Instant::now();
+        let wait_start = std::time::Instant::now();
         self.wait();
-        let mut owned_data: Vec<(String, Vec<u8>, Dtype, Vec<usize>)> = Vec::new();
+        let wait_duration = wait_start.elapsed();
+        let collection_start = std::time::Instant::now();
+        let mut tensors = Vec::new();
+        let mut total_bytes = 0_usize;
 
         // Collect parameter data
         for (name, buf_ref) in &self.plan.param_buffers {
             let byte_len = self.plan.buffers[buf_ref.0 as usize];
-            let mut data = vec![0u8; byte_len];
-            unsafe {
-                let ptr = self.buffers[buf_ref.0 as usize].data() as *const u8;
-                std::ptr::copy_nonoverlapping(ptr, data.as_mut_ptr(), byte_len);
-            }
             let (dtype, shape) = match self.plan.weight_buffers.get(buf_ref).map(|entry| entry.0) {
                 Some(crate::compile::WeightFormat::F16) => (Dtype::F16, vec![byte_len / 2]),
                 Some(crate::compile::WeightFormat::Q4 | crate::compile::WeightFormat::Q8) => {
@@ -6425,7 +6434,16 @@ impl Session {
                 }
                 Some(crate::compile::WeightFormat::F32) | None => (Dtype::F32, vec![byte_len / 4]),
             };
-            owned_data.push((name.clone(), data, dtype, shape));
+            let offset = total_bytes.next_multiple_of(4);
+            tensors.push(CheckpointTensor {
+                name: name.clone(),
+                buffer: self.buffers[buf_ref.0 as usize],
+                offset,
+                byte_len,
+                dtype,
+                shape,
+            });
+            total_bytes = offset + byte_len;
         }
 
         // Collect Adam moment buffers (parallel to param_grad_pairs)
@@ -6445,35 +6463,114 @@ impl Session {
                 ("adam_m", &self.adam_state[idx].0),
                 ("adam_v", &self.adam_state[idx].1),
             ] {
-                let key = format!("{suffix}.{name}");
-                let mut data = vec![0u8; byte_len];
-                unsafe {
-                    let ptr = buf.data() as *const u8;
-                    std::ptr::copy_nonoverlapping(ptr, data.as_mut_ptr(), byte_len);
-                }
-                owned_data.push((key, data, Dtype::F32, vec![byte_len / 4]));
+                let offset = total_bytes.next_multiple_of(4);
+                tensors.push(CheckpointTensor {
+                    name: format!("{suffix}.{name}"),
+                    buffer: *buf,
+                    offset,
+                    byte_len,
+                    dtype: Dtype::F32,
+                    shape: vec![byte_len / 4],
+                });
+                total_bytes = offset + byte_len;
             }
         }
+        let collection_duration = collection_start.elapsed();
+
+        // Host-visible parameter allocations are optimized for GPU access and
+        // CPU writes; reading them directly is extremely slow on a discrete
+        // GPU. Snapshot every tensor through one GPU transfer instead.
+        let readback_start = std::time::Instant::now();
+        let staging = self.gpu.create_buffer(blade_graphics::BufferDesc {
+            name: "checkpoint_readback",
+            size: (total_bytes as u64).max(4),
+            memory: blade_graphics::Memory::Shared,
+        });
+        let mut encoder = self
+            .gpu
+            .create_command_encoder(blade_graphics::CommandEncoderDesc {
+                name: "checkpoint_readback",
+                buffer_count: 1,
+                manual_barriers: false,
+            });
+        encoder.start();
+        {
+            let mut transfer = encoder.transfer("checkpoint_readback");
+            for tensor in &tensors {
+                let aligned_len = tensor.byte_len / 4 * 4;
+                if aligned_len != 0 {
+                    transfer.copy_buffer_to_buffer(
+                        tensor.buffer.at(0),
+                        staging.at(tensor.offset as u64),
+                        aligned_len as u64,
+                    );
+                }
+            }
+        }
+        let sync = self.gpu.submit(&mut encoder);
+        let _ = self.gpu.wait_for(&sync, !0);
+        for tensor in &tensors {
+            let aligned_len = tensor.byte_len / 4 * 4;
+            let tail_len = tensor.byte_len - aligned_len;
+            if tail_len != 0 {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        tensor.buffer.data().add(aligned_len),
+                        staging.data().add(tensor.offset + aligned_len),
+                        tail_len,
+                    );
+                }
+            }
+        }
+        let readback_duration = readback_start.elapsed();
 
         // Build tensor views
-        let views: Vec<(String, TensorView<'_>)> = owned_data
+        let view_start = std::time::Instant::now();
+        let staging_data = unsafe { std::slice::from_raw_parts(staging.data(), total_bytes) };
+        let views: Vec<(String, TensorView<'_>)> = tensors
             .iter()
-            .map(|(name, data, dtype, shape)| {
+            .map(|tensor| {
+                let data = &staging_data[tensor.offset..tensor.offset + tensor.byte_len];
                 (
-                    name.clone(),
-                    TensorView::new(*dtype, shape.clone(), data).expect("tensor view"),
+                    tensor.name.clone(),
+                    TensorView::new(tensor.dtype, tensor.shape.clone(), data).expect("tensor view"),
                 )
             })
             .collect();
+        let view_duration = view_start.elapsed();
 
         // Metadata
         let mut metadata = HashMap::new();
         metadata.insert("meganeura_checkpoint_format".to_string(), "2".to_string());
         metadata.insert("adam_step".to_string(), self.adam_step.to_string());
 
-        let buf = safetensors::tensor::serialize(views, &Some(metadata))
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        std::fs::write(path, buf)
+        let serialization_start = std::time::Instant::now();
+        let serialized = safetensors::tensor::serialize(views, &Some(metadata))
+            .map_err(|e| std::io::Error::other(e.to_string()));
+        let serialization_duration = serialization_start.elapsed();
+        let write_start = std::time::Instant::now();
+        let (bytes, result) = match serialized {
+            Ok(buf) => {
+                let bytes = buf.len();
+                (bytes, std::fs::write(path, buf))
+            }
+            Err(err) => (0, Err(err)),
+        };
+        let write_duration = write_start.elapsed();
+        self.gpu.destroy_command_encoder(&mut encoder);
+        self.gpu.destroy_buffer(staging);
+        log::info!(
+            "checkpoint timing: wall={:.3}s wait={:.3}s collect={:.3}s \
+             readback={:.3}s views={:.3}s serialize={:.3}s write={:.3}s bytes={bytes}",
+            wall_start.elapsed().as_secs_f64(),
+            wait_duration.as_secs_f64(),
+            collection_duration.as_secs_f64(),
+            readback_duration.as_secs_f64(),
+            view_duration.as_secs_f64(),
+            serialization_duration.as_secs_f64(),
+            write_duration.as_secs_f64(),
+        );
+        result
     }
 
     /// Load a training checkpoint from a safetensors file.
