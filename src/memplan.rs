@@ -259,7 +259,9 @@ fn compute_pinned(plan: &ExecutionPlan, groups: &[Range<usize>]) -> (Vec<bool>, 
             // KV caches persist across steps.
             ShaderEntry::CacheWrite => pinned[d.output_buffer.0 as usize] = true,
             // Read-modify-write accumulation into the output.
-            ShaderEntry::ScatterAdd => uses[d.output_buffer.0 as usize].read(g),
+            ShaderEntry::ScatterAdd | ShaderEntry::ScatterAddAtomic => {
+                uses[d.output_buffer.0 as usize].read(g);
+            }
             _ => {}
         }
     }
