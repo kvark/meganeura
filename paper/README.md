@@ -29,12 +29,14 @@ podman run --rm -v "$PWD:/paper:Z" -w /paper \
 
 Before submission:
 
-1. replace every `\tbd{...}` marker;
+1. populate the strict and practical-default result tables from the frozen
+   device matrix;
 2. generate figures from immutable Inferena JSON artifacts;
-3. record clean Meganeura and Inferena revisions in the artifact appendix;
-4. verify every bibliography entry against its primary source;
-5. update the AI-assistance disclosure to match the final workflow;
-6. run arXiv's TeX source checker and inspect the rendered PDF.
+3. add per-dispatch analysis for the two largest frozen gaps;
+4. record clean Meganeura and Inferena revisions in the artifact appendix;
+5. verify every bibliography entry against its primary source;
+6. update the AI-assistance disclosure to match the final workflow;
+7. run arXiv's TeX source checker and inspect the rendered PDF.
 
 The intended initial submission is a technical preprint, not an anonymous
 conference manuscript. A later systems-conference version can use the same

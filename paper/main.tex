@@ -22,7 +22,6 @@
 
 \newcommand{\system}{Meganeura}
 \newcommand{\inferena}{Inferena}
-\newcommand{\tbd}[1]{\textcolor{red}{[TBD: #1]}}
 \newcommand{\code}[1]{\texttt{#1}}
 
 \title{\system{}: How Close Can Portable Graphics APIs Get to\\
@@ -46,18 +45,17 @@ composable kernel archetypes for pointwise, reduction, matrix, convolution,
 and attention operations, target-aware specialization, and lifetime-based
 memory planning.
 
-We evaluate five matched transformer, robotics, diffusion, vision, and speech
-workloads against PyTorch on \tbd{the frozen device set}. Our primary results
-use a strict-f32 arithmetic contract; a separate accelerated class permits
-documented reduced-input, f32-accumulate hardware paths. We report forward and
-backward correctness independently, retain raw timing distributions, and
-analyze both competitive cases and substantial remaining gaps. We further
+The evaluation uses five matched transformer, robotics, diffusion, vision,
+and speech workloads and a frozen multi-vendor device set. We report both the
+practical hardware-accelerated configuration and a strict-f32 control that
+disables reduced-input matrix paths. Forward and backward correctness are
+checked independently, raw timing distributions are retained, and both
+competitive cases and substantial remaining gaps are analyzed. We further
 report negative results from direct backend-IR authoring and from applying
 equality saturation to a rewrite space whose useful choices are currently
-local. The results show that a uniform portable training-and-inference stack
-is practical and competitive on selected workloads, while identifying the
-kernel coverage, launch structure, and arithmetic constraints required to
-make that result general.
+local. The study asks when a uniform portable training-and-inference stack is
+competitive and identifies the kernel coverage, launch structure, and
+arithmetic constraints required to make that result general.
 \end{abstract}
 
 \section{Introduction}
@@ -109,8 +107,8 @@ This work makes the following contributions:
         workloads, explicit arithmetic contracts, raw timing samples, and
         separate forward and backward correctness gates.
   \item An empirical decomposition of portable versus vendor-native
-        performance across five model families and
-        \tbd{number and classes of frozen devices}.
+        performance across five model families and multiple GPU vendors and
+        device classes.
   \item Negative and mixed engineering results: direct Naga-IR authoring was
         substantially more verbose than generated WGSL, and equality
         saturation did not outperform greedy rewriting for the current rule
@@ -131,11 +129,33 @@ programs for matrix shape, transpose mode, tile geometry, input format,
 prologue, and epilogue. The invariant is that specialization remains behind
 the same graph/runtime interface and lowers through the graphics stack.
 
+\paragraph{No user-visible graph capture.}
+Reducing host launch overhead in PyTorch can involve compiler integration or
+CUDA Graph capture, whose warmup, static-shape, memory-address, and mutation
+constraints are a recurring integration concern.\footnote{\href{
+https://docs.pytorch.org/docs/stable/notes/cuda.html\#cuda-graphs}{
+PyTorch CUDA Graphs documentation}.}
+\system{} starts from a static graph: session construction fixes the dispatch
+order, buffer ownership, pipelines, and synchronization, and each
+\code{step()} executes that plan. There is no separate capture API or
+application-managed graph-safe input buffer. This is an automation and
+usability distinction, not a claim that Blade pre-records a native command
+buffer or eliminates all host submission overhead.
+
 \paragraph{Correctness before peak numbers.}
 Every reported cell is conditional on a numerical contract. Inference and
 training are validated independently because an accelerated forward pass can
 remain accurate while small derivative operands underflow in a reduced input
 format.
+
+\paragraph{Debuggability remains weaker.}
+PyTorch provides a mature eager mode, operator-level inspection, autograd
+diagnostics, and integrated profilers. \system{} currently provides graph and
+dispatch-plan dumps, WGSL source-located parser errors, API validation,
+per-dispatch GPU timings, gradient summaries, and Perfetto traces, but a
+failure that crosses generated WGSL, Naga, Blade, and a vendor driver is still
+hard to localize. Source mapping, automatic graph bisection, captured
+intermediates, and a single operator replay tool are future work.
 
 \paragraph{Non-goals.}
 \system{} is not a complete replacement for PyTorch, does not cover arbitrary
@@ -266,10 +286,21 @@ without changing the B-buffer interpretation.
 
 \subsection{WGSL, Naga, and graphics backends}
 
-Generated or templated WGSL is parsed and validated by Naga, then consumed by
-Blade for SPIR-V/Vulkan or Metal execution. WGSL is an authoring and
-diagnostic boundary, not a runtime requirement: the backend consumes the
-validated Naga module.
+WebGPU is a standardized, safety-oriented graphics and compute API exposed by
+browsers and native implementations. \code{wgpu} is a Rust implementation of
+that API; Naga is its shader translation and validation library.\footnote{
+\url{https://github.com/gfx-rs/wgpu/tree/trunk/naga}}
+\system{} does not execute through a browser or \code{wgpu}. It uses Blade, a
+smaller native graphics abstraction, to submit compute through Vulkan on
+Linux, Windows, and Android and Metal on Apple platforms.\footnote{
+\url{https://github.com/kvark/blade}}
+Blade and \code{wgpu} nevertheless share Naga as a shader boundary.
+
+Generated or templated WGSL---the WebGPU shading language---is parsed and
+validated by Naga, then consumed by Blade as a Naga module for SPIR-V/Vulkan
+or Metal execution. WGSL is therefore an authoring and diagnostic boundary,
+not evidence that the runtime itself is WebGPU and not a required source
+round trip at execution time.
 
 \system{} previously constructed Naga modules directly. This exposed arena
 handles, expression-emission ranges, and errors such as ``Expression is not
@@ -288,6 +319,12 @@ Parameters, graph outputs, gradients, and stateful buffers remain pinned.
 Device-local storage is preferred on discrete GPUs; host-visible storage
 remains available for unified-memory devices and diagnostics.
 
+Calling \code{step()} walks this precompiled sequence without rediscovering
+the graph or asking the application to capture it. Blade still creates an
+encoder, records the selected compute passes, and submits work for the step;
+the current implementation is therefore graph-static but not equivalent to
+native CUDA Graph command-buffer replay.
+
 Capabilities select scalar, small-tile, cooperative-matrix, generated
 attention, and storage-format-specific pipelines. This selection also fixes
 workgroup geometry and padding. Keeping these decisions atomic prevents a
@@ -296,6 +333,14 @@ cooperative geometry.
 
 \section{Evaluation Methodology}
 \label{sec:method}
+
+\inferena{} is the open-source cross-framework harness used for the
+evaluation.\footnote{\url{https://github.com/kvark/inferena}} It constructs
+matched inputs and objectives, invokes each framework runner, synchronizes
+timing boundaries, retains raw samples, and records precision, environment,
+revision, output, and gradient metadata. The harness does not supply kernels
+to either engine. Final artifacts identify its exact Git revision alongside
+the \system{} revision.
 
 \subsection{Matched workloads}
 
@@ -317,7 +362,7 @@ batch 1, sequence 128 &
 SmolVLA action expert~\cite{shukor2025smolvla} & 99.85M &
 batch 1, 50 action tokens, 16 VLM tokens &
 16-layer action expert; output MSE \\
-Conditioned diffusion U-Net~\cite{rombach2022ldm} & 10.93M &
+Scaled Stable Diffusion 1.x U-Net~\cite{rombach2022ldm} & 10.93M &
 batch 1, $4\times32\times32$ latent; context $77\times768$ &
 timestep-conditioned convolutional U-Net with self/cross-attention; noise MSE \\
 ResNet-50~\cite{he2016resnet} & 25.53M &
@@ -328,29 +373,33 @@ batch 1, $80\times3000$ mel input &
 four encoder layers, 1,500 output positions; output MSE \\
 \bottomrule
 \end{tabularx}
-\caption{Audited workloads. CLI names are retained for compatibility, but the
-diffusion workload is not an SD~1.5 checkpoint and Whisper omits the decoder.}
+\caption{Audited workloads. The diffusion graph preserves the characteristic
+latent, timestep, and text-conditioning paths, but reduces width, depth, and
+block count and is not checkpoint-compatible with SD~1.5. Whisper omits the
+decoder.}
 \label{tab:workloads}
 \end{table*}
 
 \subsection{Arithmetic contracts}
 \label{sec:precision}
 
-Strict f32 is the primary comparison. Accelerated mode answers a separate
-question: how fast is each engine's documented, quality-validated hardware
-path? It is not a matched-format experiment.
+\inferena{} defaults to the practical accelerated configuration; passing
+\code{--strict} disables documented reduced-input matrix paths. The paper
+reports both. Accelerated mode asks how fast each engine's normal
+quality-validated hardware path is, while strict f32 is the controlled
+arithmetic comparison. Accelerated mode is not a matched-format experiment.
 
 \begin{table*}[t]
 \centering
 \small
 \begin{tabularx}{\textwidth}{lXX}
 \toprule
-Property & Strict f32 & Accelerated f32 \\
+Property & Practical default & \code{--strict} \\
 \midrule
 Persistent tensors & f32 & f32 \\
-PyTorch & TF32 disabled & TF32/high permitted \\
+PyTorch & TF32/high permitted & TF32 disabled \\
 \system{} scalar path & f32 & f32 \\
-\system{} eligible forward matrices & f32 & f16 input, f32 accumulate \\
+\system{} eligible forward matrices & f16 input, f32 accumulate & f32 \\
 \system{} backward matrices & f32 & f32 \\
 Output & f32 & f32 \\
 \bottomrule
@@ -361,11 +410,12 @@ ranges; accelerated results are therefore reported separately.}
 \end{table*}
 
 PyTorch strict mode requests its highest float32 matmul precision and disables
-CUDA matmul and cuDNN TF32. Accelerated mode permits TF32. \system{} strict mode
-disables f16 cooperative matrix and cooperative f16 attention. Accelerated
-mode permits eligible forward matrix, convolution, and attention inputs to be
-rounded locally to f16, accumulates in f32, and stores f32. Backward remains
-f32 unless a future experimental path passes the same gradient gate.
+CUDA matmul and cuDNN TF32. The practical default permits TF32.
+\system{} strict mode disables f16 cooperative matrix and cooperative f16
+attention. Its practical default permits eligible forward matrix,
+convolution, and attention inputs to be rounded locally to f16, accumulates in
+f32, and stores f32. Backward remains f32 unless a future experimental path
+passes the same gradient gate.
 
 This distinction repaired a concrete error. An earlier Whisper accelerated
 run had small forward error but large gradient disagreement because derivative
@@ -387,6 +437,12 @@ update. \textit{Compile} includes graph construction, optimization, and GPU
 pipeline construction for the measured sessions; model download and
 parameter upload are excluded or reported separately.
 
+For SmolLM, the 128-token full forward is reported explicitly as
+\textit{prefill}. The current one-token graph does not carry a KV cache and is
+therefore labeled \textit{stateless one-token latency}, not decode latency.
+A decode result will be added only after both engines use a matched cache
+layout and cache length; otherwise the final paper will make no decode claim.
+
 PyTorch is the numerical reference. Forward validity requires matching output
 shape, relative output L2 error below 1\%, and symmetric relative loss error
 below 1\%. Training additionally requires matching canonical trainable
@@ -399,10 +455,11 @@ invalidates training without discarding a valid inference cell.
 Every final artifact records clean \system{} and \inferena{} revisions, GPU and
 driver identifiers, OS, API/backend, toolchain versions, precision switches,
 optimizer mode, input metadata, timing samples, output fingerprints, and
-validation diagnostics. We will freeze
-\tbd{NVIDIA desktop, AMD desktop, integrated/edge-class, and Apple devices}
-before computing any aggregate portability metric. Historical table cells are
-not mixed with frozen results.
+validation diagnostics. The device matrix will span NVIDIA, AMD, and Apple
+hardware and will be frozen before computing any aggregate portability
+metric; an integrated or edge-class device is included only if both runners
+complete the audited workload. Historical table cells are not mixed with
+frozen results.
 
 \section{Results}
 \label{sec:results}
@@ -411,17 +468,25 @@ not mixed with frozen results.
 
 \begin{table*}[t]
 \centering
-\small
-\begin{tabularx}{\textwidth}{llrrrrX}
+\scriptsize
+\setlength{\tabcolsep}{4pt}
+\begin{tabularx}{\textwidth}{
+  >{\raggedright\arraybackslash}X
+  l
+  >{\raggedleft\arraybackslash}p{0.065\textwidth}
+  >{\raggedleft\arraybackslash}p{0.105\textwidth}
+  >{\raggedleft\arraybackslash}p{0.12\textwidth}
+  >{\raggedleft\arraybackslash}p{0.09\textwidth}
+  >{\raggedright\arraybackslash}p{0.13\textwidth}}
 \toprule
-Device / workload & Engine & Compile (s) & Inference (ms) & Latency (ms) &
-Training (ms) & Validity \\
+Device / workload & Engine & Compile (s) & Full / prefill (ms) &
+Minimal / stateless (ms) & Training (ms) & Validity \\
 \midrule
-\tbd{rows} & PyTorch & -- & -- & -- & -- & reference \\
+Frozen matrix pending & PyTorch & -- & -- & -- & -- & reference \\
  & \system{} & -- & -- & -- & -- & forward / backward \\
 \bottomrule
 \end{tabularx}
-\caption{Primary strict-f32 results. Values will be populated only from clean,
+\caption{Strict-f32 control results. Values will be populated only from clean,
 pinned revisions using the protocol in Section~\ref{sec:method}.}
 \label{tab:strict-results}
 \end{table*}
@@ -434,12 +499,14 @@ not merely the ratio.
 
 \subsection{Accelerated arithmetic}
 
-\tbd{Insert a separate accelerated table and compare only cells passing the
-same correctness gates. State explicitly that PyTorch may use TF32 while
-\system{} uses local f16-input/f32-accumulate matrix paths.}
+The final results retain a separate practical-default table and compare only
+cells passing the same correctness gates. PyTorch may use TF32 in this table,
+whereas \system{} uses local f16-input/f32-accumulate matrix paths; the table
+therefore reports two quality-validated fast paths rather than claiming
+format equivalence.
 
-As a pre-freeze implementation checkpoint, the conditioned diffusion workload
-passed the full 5-warmup/20-sample protocol on an RTX~5080. In strict f32,
+As a pre-freeze implementation checkpoint, the scaled Stable Diffusion 1.x
+U-Net passed the full 5-warmup/20-sample protocol on an RTX~5080. In strict f32,
 median inference was 2.152\,ms for \system{} and 1.941\,ms for PyTorch; training
 was 8.569\,ms and 4.493\,ms. In accelerated mode, inference was 1.859\,ms and
 1.166\,ms, while training was 8.104\,ms and 4.471\,ms. Accelerated forward
@@ -489,10 +556,11 @@ it studies embedded inference rather than portable GPU training
 
 \subsection{Performance portability}
 
-\tbd{Insert the per-device normalized plot after AMD, Apple, and edge-class
-runs. Report raw values next to any aggregate. Define unsupported devices as
-zero if using the Pennycook performance-portability metric
-\cite{pennycook2016metric}.}
+After the frozen NVIDIA, AMD, and Apple runs, a per-device normalized plot
+will accompany the raw values. Any aggregate uses the Pennycook
+performance-portability metric and assigns zero to an unsupported device
+\cite{pennycook2016metric}; it will not conceal individual devices or mix
+historical revisions.
 
 \section{Ablations and Gap Analysis}
 \label{sec:ablation}
@@ -538,10 +606,11 @@ numbers require graph-level inspection.
 
 \subsection{Where the remaining time goes}
 
-\tbd{Insert per-dispatch profiles for the two largest final gaps. Break down
-matrix, attention, convolution, normalization/reduction, pointwise, and
-barrier/launch contributions. Include dispatch counts and bytes where
-available.}
+The two largest gaps in the frozen results will receive per-dispatch profiles
+split into matrix, attention, convolution, normalization/reduction,
+pointwise, and barrier/launch contributions, including dispatch counts and
+bytes where available. This analysis is deliberately selected from the
+frozen table rather than from the current development checkpoints.
 
 Likely improvement paths must be phrased as measured hypotheses: fewer
 launches through broader fusion, better small-matrix occupancy, wider
@@ -621,10 +690,13 @@ contracts before considering an aggregate.
 \section{Limitations and Threats to Validity}
 
 Five workloads do not establish complete operator or model coverage. The
-diffusion U-Net is scaled and not checkpoint-compatible with SD~1.5; Whisper
-omits the decoder; ResNet represents folded inference normalization rather
-than training-time batch statistics. Synthetic deterministic inputs test
-computation but not task quality.
+diffusion workload has the latent, timestep-conditioning, self-attention, and
+77-token text cross-attention structure of Stable Diffusion 1.x, but uses
+three reduced-width levels, one residual block per stage, and GELU in place of
+GEGLU. It is not an SD~1.5 topology or checkpoint and excludes the text
+encoder, VAE, and sampler. Whisper omits the decoder; ResNet represents folded
+inference normalization rather than training-time batch statistics.
+Synthetic deterministic inputs test computation but not task quality.
 
 PyTorch is a moving reference whose compiler and libraries vary by version,
 driver, and platform. Conversely, graphics drivers may optimize SPIR-V or
@@ -673,11 +745,13 @@ accessing the hardware.
 
 \section*{Artifact Availability}
 
-Source code is available at
-\url{https://github.com/kvark/meganeura}. The final artifact will include
-\inferena{} harness source, pinned revisions, environment manifests, raw JSON
-samples, correctness diagnostics, profiles, and figure-generation scripts at
-\tbd{archival artifact URL}.
+Source code is available in the public \system{} and \inferena{}
+repositories.\footnote{\url{https://github.com/kvark/meganeura}}\footnote{
+\url{https://github.com/kvark/inferena}} The artifact will refer to immutable
+tags or full revisions rather than duplicating either repository's source.
+It will include the command and revision manifest, lockfiles and environment
+metadata, raw JSON samples, correctness diagnostics, selected profiles, and
+figure-generation scripts.
 
 \section*{AI-Assistance Disclosure}
 
