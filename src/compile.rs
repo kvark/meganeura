@@ -149,6 +149,8 @@ pub enum ShaderEntry {
     SgdUpdate,
     AdamUpdate,
     ScatterAdd,
+    ScatterAddAtomicZero,
+    ScatterAddAtomic,
     SumAll,
     MeanAll,
     Softmax,
@@ -393,6 +395,9 @@ impl ShaderEntry {
             ShaderEntry::SgdUpdate => ShaderGroup::Sgd,
             ShaderEntry::AdamUpdate => ShaderGroup::Adam,
             ShaderEntry::ScatterAdd => ShaderGroup::ScatterAdd,
+            ShaderEntry::ScatterAddAtomicZero | ShaderEntry::ScatterAddAtomic => {
+                ShaderGroup::ScatterAddAtomic
+            }
             ShaderEntry::SumAll | ShaderEntry::MeanAll => ShaderGroup::Reduce,
             ShaderEntry::Softmax => ShaderGroup::Softmax,
             ShaderEntry::CrossEntropyLoss => ShaderGroup::CrossEntropy,
@@ -481,10 +486,12 @@ impl ShaderEntry {
             | ShaderEntry::SgdUpdate
             | ShaderEntry::AdamUpdate
             | ShaderEntry::ScatterAdd
+            | ShaderEntry::ScatterAddAtomic
             | ShaderEntry::Softmax
             | ShaderEntry::CrossEntropyLoss
             | ShaderEntry::BceLoss
             | ShaderEntry::Transpose => "main",
+            ShaderEntry::ScatterAddAtomicZero => "zero",
             ShaderEntry::Relu => "relu",
             ShaderEntry::Sigmoid => "sigmoid",
             ShaderEntry::Tanh => "tanh_",
@@ -2785,17 +2792,45 @@ impl<'a> Compiler<'a> {
                 let seq_len = src_shape[0] as u32;
                 let embed_dim = src_shape[1] as u32;
                 let total = vocab_size as u32 * embed_dim;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::ScatterAdd,
-                    workgroups: [total.div_ceil(256), 1, 1],
-                    input_buffers: vec![indices, src],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![total, seq_len, embed_dim, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
-                    ..Default::default()
-                });
+                let params = vec![total, seq_len, embed_dim, 0];
+                if u64::from(vocab_size as u32) * u64::from(seq_len) > 1_000_000 {
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::ScatterAddAtomicZero,
+                        workgroups: [total.div_ceil(256), 1, 1],
+                        input_buffers: vec![indices, src],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params: params.clone(),
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::ScatterAddAtomic,
+                        workgroups: [(seq_len * embed_dim).div_ceil(256), 1, 1],
+                        // The output is also an input so scheduling inserts a
+                        // global barrier after the zeroing dispatch.
+                        input_buffers: vec![indices, src, out_buf],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params,
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
+                } else {
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::ScatterAdd,
+                        workgroups: [total.div_ceil(256), 1, 1],
+                        input_buffers: vec![indices, src],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params,
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
+                }
             }
 
             Op::RoPE {
@@ -4609,6 +4644,39 @@ mod tests {
     }
 
     #[test]
+    fn scatter_add_uses_atomic_path_only_for_large_workloads() {
+        let mut small = Graph::new();
+        let small_indices = small.input_u32("indices", &[2]);
+        let small_src = small.input("src", &[2, 3]);
+        let small_output = small.scatter_add(small_indices, small_src, 4);
+        small.set_outputs(vec![small_output]);
+        let small_plan = compile(&small);
+        assert_eq!(small_plan.dispatches.len(), 1);
+        assert_eq!(small_plan.dispatches[0].shader, ShaderEntry::ScatterAdd);
+
+        let mut large = Graph::new();
+        let large_indices = large.input_u32("indices", &[256]);
+        let large_src = large.input("src", &[256, 3]);
+        let large_output = large.scatter_add(large_indices, large_src, 4097);
+        large.set_outputs(vec![large_output]);
+        let large_plan = compile(&large);
+        assert_eq!(large_plan.dispatches.len(), 2);
+        assert_eq!(
+            large_plan.dispatches[0].shader,
+            ShaderEntry::ScatterAddAtomicZero
+        );
+        assert_eq!(
+            large_plan.dispatches[1].shader,
+            ShaderEntry::ScatterAddAtomic
+        );
+        assert!(
+            large_plan.dispatches[1]
+                .input_buffers
+                .contains(&large_plan.dispatches[1].output_buffer)
+        );
+    }
+
+    #[test]
     fn test_compile_softmax() {
         let mut g = Graph::new();
         let x = g.input("x", &[4, 10]);
@@ -4883,6 +4951,8 @@ mod tests {
             ShaderEntry::SgdUpdate,
             ShaderEntry::AdamUpdate,
             ShaderEntry::ScatterAdd,
+            ShaderEntry::ScatterAddAtomicZero,
+            ShaderEntry::ScatterAddAtomic,
             ShaderEntry::SumAll,
             ShaderEntry::MeanAll,
             ShaderEntry::SumRows,
