@@ -4166,7 +4166,7 @@ impl Session {
         let staging = self.gpu.create_buffer(blade_graphics::BufferDesc {
             name: "readback_staging",
             size: bytes.max(4),
-            memory: blade_graphics::Memory::Shared,
+            memory: blade_graphics::Memory::Download,
         });
         let mut encoder = self
             .gpu
@@ -6484,7 +6484,7 @@ impl Session {
         let staging = self.gpu.create_buffer(blade_graphics::BufferDesc {
             name: "checkpoint_readback",
             size: (total_bytes as u64).max(4),
-            memory: blade_graphics::Memory::Shared,
+            memory: blade_graphics::Memory::Download,
         });
         let mut encoder = self
             .gpu
