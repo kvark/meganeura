@@ -1583,6 +1583,37 @@ fn checkpoint_round_trip() {
     std::fs::remove_file(&tmp).ok();
 }
 
+#[test]
+fn checkpoint_round_trip_preserves_odd_f16_tail() {
+    let mut g = Graph::new();
+    let x = g.input("x", &[1, 3]);
+    let w = g.parameter_f16("w", &[3, 1]);
+    let y = g.matmul(x, w);
+    g.set_outputs(vec![y]);
+
+    let values = [0.25_f32, -0.5, 0.75];
+    let input = [1.0_f32, 2.0, 3.0];
+    let tmp = std::env::temp_dir().join("meganeura_test_odd_f16_ckpt.safetensors");
+    let mut session = build_inference_session(&g);
+    session.set_parameter("w", &values);
+    session.save_checkpoint(&tmp).expect("save checkpoint");
+
+    let mut restored = build_inference_session(&g);
+    restored.load_checkpoint(&tmp).expect("load checkpoint");
+    restored.set_input("x", &input);
+    restored.step();
+    restored.wait();
+
+    let actual = restored.read_output(1)[0];
+    let expected = values
+        .iter()
+        .zip(input)
+        .map(|(&weight, value)| weight * value)
+        .sum::<f32>();
+    assert!((actual - expected).abs() < 1.0e-3, "{actual} != {expected}");
+    std::fs::remove_file(tmp).unwrap();
+}
+
 /// Smoke test: KV cache ops (cache_write, cached_attention, rope_dynamic) compile and run.
 #[test]
 fn kv_cache_ops_smoke() {
