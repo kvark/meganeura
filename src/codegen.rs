@@ -1854,6 +1854,10 @@ pub fn generate_attention_module(head_dim: u32) -> ShaderModule {
     src.push_str("            my_out = my_out * correction + weight * bias[v_base + tid];\n");
     src.push_str("            max_score = new_max;\n");
     src.push_str("        }\n");
+    // Every lane reads the reduced scores from lane zero. Do not let faster
+    // lanes overwrite wg_scores for the next tile until all lanes have
+    // consumed the current tile.
+    src.push_str("        workgroupBarrier();\n");
     src.push_str("    }\n\n");
 
     // --- Tail: remaining KV positions one at a time ---
@@ -1868,6 +1872,9 @@ pub fn generate_attention_module(head_dim: u32) -> ShaderModule {
     src.push_str("        sum_exp = sum_exp * correction + weight;\n");
     src.push_str("        my_out = my_out * correction + weight * bias[k_base + tid];\n");
     src.push_str("        max_score = new_max;\n");
+    // wg_dot is reused on the next iteration and its reduced element is read
+    // by every lane, so scratch reuse needs the same synchronization.
+    src.push_str("        workgroupBarrier();\n");
     src.push_str("    }\n\n");
 
     // Final output
