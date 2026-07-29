@@ -24,9 +24,13 @@
 \newcommand{\inferena}{Inferena}
 \newcommand{\code}[1]{\texttt{#1}}
 
-\title{\system{}: How Close Can Portable Graphics APIs Get to\\
-Vendor-Native Machine Learning?}
-\author{Dzmitry Malyshau\\[-0.15em]
+\title{\system{}: Portable GPU Training and Inference\\
+through Vulkan and Metal}
+\author{Dzmitry Malyshau\\[-0.1em]
+{\small Independent Researcher}\\[-0.1em]
+{\small \href{mailto:kvark@fastmail.com}{kvark@fastmail.com}
+\quad
+\href{https://orcid.org/0009-0005-6410-4276}{ORCID: 0009-0005-6410-4276}}\\[-0.1em]
 {\small Project and artifact: \url{https://github.com/kvark/meganeura}}}
 \date{}
 
@@ -34,28 +38,26 @@ Vendor-Native Machine Learning?}
 \maketitle
 
 \begin{abstract}
-Machine-learning training is concentrated in feature-rich vendor-native
-stacks, while deployed inference is commonly rebuilt for a collection of
-platform-specific runtimes. We ask how close a single portable implementation
-can come to those stacks while supporting both training and inference.
-We present \system{}, a Rust system that lowers a typed static graph and its
-automatically differentiated training graph to specialized GPU programs
-executed through Vulkan and Metal. Its compiler combines graph rewriting,
-composable kernel archetypes for pointwise, reduction, matrix, convolution,
-and attention operations, target-aware specialization, and lifetime-based
-memory planning.
+Model development and model deployment are commonly separated by export,
+conversion, and platform-specific runtime boundaries. We investigate whether
+one compact native compiler can instead support optimizer-backed training and
+deployed inference on consumer GPUs. \system{} is a Rust system that lowers a
+typed static graph and its automatically differentiated training graph to
+specialized GPU programs. The same graph API, compiler, checkpoint format,
+memory planner, and runtime execute through Vulkan on Linux, Windows, and
+Android and through Metal on Apple platforms.
 
-The evaluation uses five matched transformer, robotics, diffusion, vision,
-and speech workloads and a frozen multi-vendor device set. We report both the
-practical hardware-accelerated configuration and a strict-f32 control that
-disables reduced-input matrix paths. Forward and backward correctness are
-checked independently, raw timing distributions are retained, and both
-competitive cases and substantial remaining gaps are analyzed. We further
-report negative results from direct backend-IR authoring and from applying
-equality saturation to a rewrite space whose useful choices are currently
-local. The study asks when a uniform portable training-and-inference stack is
-competitive and identifies the kernel coverage, launch structure, and
-arithmetic constraints required to make that result general.
+We compare five matched transformer, robotics, diffusion, vision, and speech
+workloads with PyTorch on a multi-vendor device set. The protocol separates a
+strict-f32 control from each engine's documented practical fast path, checks
+forward and backward correctness independently, retains raw timing
+distributions, and profiles the largest gaps. The evidence supports a
+conditional conclusion: portable graphics APIs can approach vendor-native
+execution for covered static graphs, but the result is not uniform. Kernel
+coverage, launch structure, and arithmetic policy determine the remaining
+distance. We also evaluate the deployment closure and report engineering
+lessons from the compiler representations and optimization strategies that
+did and did not prove practical.
 \end{abstract}
 
 \section{Introduction}
@@ -65,54 +67,133 @@ it. Training commonly relies on PyTorch~\cite{paszke2019pytorch} and vendor
 libraries; deployment may use TensorRT, Core ML, a mobile runtime, a browser
 engine, or a bespoke application stack. Each boundary duplicates model
 conversion, operator coverage, numerical policy, profiling, and correctness
-work. It also makes training or adaptation on the deployed device unusually
-difficult.
+work. It also makes adaptation on the deployed device unusually difficult.
 
-Consumer graphics APIs offer a tempting common substrate. Vulkan covers
-desktop, mobile, and embedded GPUs across vendors, while Metal exposes Apple
-GPUs. Both offer general compute and increasingly expose matrix hardware.
-They do not, however, provide the complete compiler, kernel library, graph
-capture, and debugging ecosystem available to CUDA applications. A portable
-system must decide which layers of that ecosystem it can replace, which
-hardware features it can use safely, and how much performance it loses.
+\begin{figure*}[t]
+\centering
+\resizebox{0.97\textwidth}{!}{%
+\begin{tikzpicture}[
+  font=\sffamily\small,
+  box/.style={
+    draw=black!55,
+    rounded corners=2pt,
+    minimum height=9mm,
+    align=center,
+    inner xsep=6pt,
+    inner ysep=3pt
+  },
+  lane/.style={font=\sffamily\bfseries\small, align=right},
+  train/.style={box, fill=orange!16},
+  boundary/.style={box, fill=red!9, dashed},
+  shared/.style={box, fill=blue!12},
+  runtime/.style={box, fill=green!14},
+  target/.style={box, fill=teal!13},
+  arrow/.style={-{Latex[length=2mm]}, semithick, draw=black!65},
+  split/.style={-{Latex[length=2mm]}, semithick, draw=red!60!black}
+]
+  \node[lane, text width=23mm] (split-label) at (0,1.2)
+    {Common\\split stack};
+  \node[train, text width=35mm] (pytorch) at (3.4,1.2)
+    {Training graph\\PyTorch + vendor libraries};
+  \node[boundary, text width=31mm] (convert) at (7.7,1.2)
+    {Export, convert,\\recapture, revalidate};
+  \node[target, text width=29mm] (tensorrt) at (12.2,2.35)
+    {CUDA / TensorRT\\deployment};
+  \node[target, text width=29mm] (coreml) at (12.2,1.2)
+    {Core ML / Metal\\deployment};
+  \node[target, text width=29mm] (mobile) at (12.2,0.05)
+    {Mobile / browser\\deployment};
+  \node[align=center, text=red!60!black, font=\sffamily\scriptsize]
+    at (16.0,1.2)
+    {separate operator, precision,\\profiling, and debug policies};
 
-This paper studies that tradeoff through \system{}. The same typed graph,
-automatic differentiation, compiler, shader generator, memory planner, and
-runtime execute inference and forward--loss--backward training. The runtime
-uses Vulkan on Linux, Windows, and Android, and Metal on Apple platforms. It
-does not require CUDA, ROCm, or Python in the deployed application.
+  \draw[arrow] (pytorch) -- (convert);
+  \draw[split] (convert.east) -- ++(5mm,0) |- (tensorrt.west);
+  \draw[split] (convert.east) -- (coreml.west);
+  \draw[split] (convert.east) -- ++(5mm,0) |- (mobile.west);
 
-Our goal is not to show that graphics APIs universally beat mature native
-libraries. Instead, we ask six concrete questions:
+  \draw[black!20, thick] (-1.4,-0.75) -- (18.0,-0.75);
+
+  \node[lane, text width=23mm] (one-label) at (0,-2.7)
+    {\system{}\\shared stack};
+  \node[shared, text width=35mm] (graph) at (3.4,-2.7)
+    {One graph representation\\+ one checkpoint};
+  \node[shared, text width=38mm] (compiler) at (8.0,-2.7)
+    {Shared compiler\\autodiff + specialization + plan};
+  \node[runtime, text width=18mm] (blade) at (11.7,-2.7)
+    {Blade\\runtime};
+  \node[target, text width=38mm] (vulkan) at (15.3,-2.05)
+    {Vulkan\\NVIDIA, AMD, Intel, Android};
+  \node[target, text width=38mm] (metal) at (15.3,-3.35)
+    {Metal\\Apple};
+
+  \draw[arrow] (graph) -- (compiler);
+  \draw[arrow] (compiler) -- (blade);
+  \draw[arrow] (blade.east) -- ++(5mm,0) |- (vulkan.west);
+  \draw[arrow] (blade.east) -- ++(5mm,0) |- (metal.west);
+\end{tikzpicture}%
+}
+\caption{The systems question. A conventional train/deploy boundary can split
+one model into several runtime-specific paths. \system{} studies the
+alternative: keep graph semantics, automatic differentiation, specialization,
+checkpointing, and execution in one native stack while changing only the
+graphics backend. The top lane is illustrative, not a feature-equivalence
+claim about the named products.}
+\label{fig:fragmentation}
+\end{figure*}
+
+Consumer graphics APIs offer a tempting common substrate for the alternative
+in Figure~\ref{fig:fragmentation}. Vulkan covers desktop, mobile, and embedded
+GPUs across vendors, while Metal exposes Apple GPUs. Both offer general
+compute and increasingly expose matrix hardware. They do not, however,
+provide the complete compiler, kernel library, graph-capture, and debugging
+ecosystem available to CUDA applications. A portable system must decide which
+layers it can replace, which hardware features it can use safely, and how much
+performance it loses.
+
+This paper studies that tradeoff through \system{}. The same typed graph
+representation, automatic differentiation, compiler, shader generator, memory
+planner, checkpoint format, and runtime support inference and
+optimizer-backed training. Vulkan is used on Linux, Windows, and Android, and
+Metal on Apple platforms. The deployed application requires neither CUDA nor
+ROCm nor a Python runtime.
+
+The intended setting is a native application, robot, creative tool, or edge
+device with mostly static tensor shapes and a reason to keep inference,
+fine-tuning, or personalization in one codebase. \system{} is not positioned
+as a replacement for dynamic Python research workflows, distributed
+cloud-scale training, or the full operator breadth of mature frameworks. The
+answer is correspondingly conditional: covered static graphs can approach a
+vendor-native reference, but missing kernel variants and excess launches
+still produce substantial gaps. The paper reports both outcomes.
+
+We ask three research questions:
 \begin{enumerate}
-  \item What fraction of PyTorch performance does a compact portable stack
-        recover for inference, minimal-shape latency, and training?
-  \item Does the same implementation remain competitive across GPU vendors
-        and device classes?
-  \item How do strict f32 and documented hardware-fast arithmetic change both
-        speed and numerical agreement?
-  \item Which gains come from rewrites, kernel specialization, cooperative
-        matrices, and memory planning?
-  \item Which kernels and launch patterns explain the remaining gap?
-  \item Which compiler representations made the system easier or harder to
-        build?
+  \item \textbf{Performance portability:} how close does one implementation
+        come to PyTorch for inference and forward--loss--backward execution
+        across workloads, arithmetic policies, vendors, and device classes?
+  \item \textbf{Causes:} which specializations recover performance, and which
+        kernels, launches, or arithmetic constraints explain the remaining
+        gaps?
+  \item \textbf{Systems cost:} what does a shared training/deployment stack
+        change about the artifact, application integration, correctness work,
+        optimization strategy, and compiler authoring experience?
 \end{enumerate}
 
-This work makes the following contributions:
+This work makes four contributions:
 \begin{itemize}
-  \item A compact, executable Vulkan/Metal system whose shared graph and
-        compiler path supports both inference and automatically
-        differentiated training.
-  \item A controlled performance-portability methodology with matched
-        workloads, explicit arithmetic contracts, raw timing samples, and
-        separate forward and backward correctness gates.
-  \item An empirical decomposition of portable versus vendor-native
-        performance across five model families and multiple GPU vendors and
-        device classes.
-  \item Negative and mixed engineering results: direct Naga-IR authoring was
-        substantially more verbose than generated WGSL, and equality
-        saturation did not outperform greedy rewriting for the current rule
-        set.
+  \item A compact executable system whose shared graph/compiler path supports
+        inference, reverse-mode differentiation, SGD and Adam updates, and
+        checkpoint transfer into a fresh inference session.
+  \item A controlled comparison with five matched model families, explicit
+        arithmetic contracts, raw timing samples, and independent forward and
+        backward correctness gates across Vulkan and Metal devices.
+  \item A decomposition of performance into the kernel coverage, dispatch
+        structure, cooperative-matrix use, and precision policy that produce
+        both near-reference cases and the largest remaining gaps.
+  \item Measured engineering results for deployment closure, automatic static
+        execution, rewrite strategies, shader authoring boundaries, and their
+        present debugging tradeoffs.
 \end{itemize}
 
 \section{Scope and Design Goals}
@@ -120,8 +201,14 @@ This work makes the following contributions:
 \paragraph{One stack for two phases.}
 Inference and training are modes of one compiler rather than separate
 products. Training differentiates the optimized forward graph, preserves the
-forward outputs, and appends one gradient output per parameter. Inference
-omits derivative nodes and may apply inference-only fusions.
+forward outputs, appends one gradient output per parameter, and applies an SGD
+or Adam update in the same static session. Parameters and optimizer state can
+be stored in a safetensors checkpoint. A separately compiled inference session
+with the same named parameters can load that checkpoint; it omits derivative
+and optimizer nodes and may apply inference-only fusions. The performance
+tables time forward--loss--backward separately from the optimizer so that
+kernel/compiler cost is comparable, while Section~\ref{sec:train-deploy}
+tests the complete workflow.
 
 \paragraph{Portable execution, specialized programs.}
 Portability does not imply one untuned kernel. \system{} generates specialized
@@ -129,7 +216,13 @@ programs for matrix shape, transpose mode, tile geometry, input format,
 prologue, and epilogue. The invariant is that specialization remains behind
 the same graph/runtime interface and lowers through the graphics stack.
 
-\paragraph{No user-visible graph capture.}
+\paragraph{Correctness before peak numbers.}
+Every reported cell is conditional on a numerical contract. Inference and
+backward execution are validated independently because an accelerated forward
+pass can remain accurate while small derivative operands underflow in a
+reduced input format.
+
+\paragraph{Operational model and observability.}
 Reducing host launch overhead in PyTorch can involve compiler integration or
 CUDA Graph capture, whose warmup, static-shape, memory-address, and mutation
 constraints are a recurring integration concern.\footnote{\href{
@@ -141,15 +234,8 @@ order, buffer ownership, pipelines, and synchronization, and each
 application-managed graph-safe input buffer. This is an automation and
 usability distinction, not a claim that Blade pre-records a native command
 buffer or eliminates all host submission overhead.
-
-\paragraph{Correctness before peak numbers.}
-Every reported cell is conditional on a numerical contract. Inference and
-training are validated independently because an accelerated forward pass can
-remain accurate while small derivative operands underflow in a reduced input
-format.
-
-\paragraph{Debuggability remains weaker.}
-PyTorch provides a mature eager mode, operator-level inspection, autograd
+The tradeoff is observability. PyTorch provides a mature eager mode,
+operator-level inspection, autograd
 diagnostics, and integrated profilers. \system{} currently provides graph and
 dispatch-plan dumps, WGSL source-located parser errors, API validation,
 per-dispatch GPU timings, gradient summaries, and Perfetto traces, but a
@@ -159,9 +245,9 @@ intermediates, and a single operator replay tool are future work.
 
 \paragraph{Non-goals.}
 \system{} is not a complete replacement for PyTorch, does not cover arbitrary
-dynamic Python programs, and does not claim the breadth of CUDA, cuDNN, or
-large production compilers. The evaluation asks what this deliberately
-compact system achieves and where it stops.
+dynamic Python programs or distributed training, and does not claim the
+breadth of CUDA, cuDNN, or large production compilers. The evaluation asks
+what this deliberately compact system achieves and where it stops.
 
 \section{\system{} Architecture}
 
@@ -295,6 +381,10 @@ smaller native graphics abstraction, to submit compute through Vulkan on
 Linux, Windows, and Android and Metal on Apple platforms.\footnote{
 \url{https://github.com/kvark/blade}}
 Blade and \code{wgpu} nevertheless share Naga as a shader boundary.
+This paper treats Blade as the device, resource, command, and presentation
+substrate. \system{} owns the ML graph, autodiff, rewrites, kernel generation,
+precision policy, dispatch/memory plan, optimizer, and evaluation studied
+here; Blade's general graphics architecture is outside the paper's scope.
 
 Generated or templated WGSL---the WebGPU shading language---is parsed and
 validated by Naga, then consumed by Blade as a Naga module for SPIR-V/Vulkan
@@ -341,6 +431,16 @@ timing boundaries, retains raw samples, and records precision, environment,
 revision, output, and gradient metadata. The harness does not supply kernels
 to either engine. Final artifacts identify its exact Git revision alongside
 the \system{} revision.
+
+\paragraph{Reference system.}
+PyTorch is the primary reference because the central experiment needs matched
+forward, loss, and backward execution for every workload, in addition to
+accelerated vendor backends. It is a much broader framework, and the
+comparison does not imply feature equivalence. An inference-only runtime would
+be informative for a different question but could not serve as the common
+reference for the shared training/inference claim. Likewise, the footprint
+comparison in Section~\ref{sec:footprint} measures deployment closure, not
+equal functionality.
 
 \subsection{Matched workloads}
 
@@ -432,10 +532,18 @@ GPU execution is synchronized at timing boundaries.
 
 \textit{Inference} is one complete no-gradient forward pass.
 \textit{Latency} is an agreed minimal shape, not an engine-specific shortcut.
-\textit{Training} includes forward, scalar loss, and backward, but no optimizer
-update. \textit{Compile} includes graph construction, optimization, and GPU
-pipeline construction for the measured sessions; model download and
-parameter upload are excluded or reported separately.
+\textit{Forward--loss--backward} includes those three phases but no optimizer
+update. This isolates graph/compiler and kernel work from a choice of SGD or
+Adam; Section~\ref{sec:train-deploy} separately verifies a real update and
+checkpoint handoff. \textit{Compile} includes graph construction,
+optimization, and GPU pipeline construction for the measured sessions; model
+download and parameter upload are excluded or reported separately.
+
+To keep qualitative language falsifiable, a valid result is called
+\textit{competitive} only when its median is no more than $2\times$ the
+PyTorch median in the same device, workload, shape, and arithmetic mode.
+Exact ratios are always reported; the threshold does not enter an aggregate
+metric.
 
 For SmolLM, the 128-token full forward is reported explicitly as
 \textit{prefill}. The current one-token graph does not carry a KV cache and is
@@ -445,10 +553,11 @@ layout and cache length; otherwise the final paper will make no decode claim.
 
 PyTorch is the numerical reference. Forward validity requires matching output
 shape, relative output L2 error below 1\%, and symmetric relative loss error
-below 1\%. Training additionally requires matching canonical trainable
-parameter sets, total-gradient-norm error below 5\%, and relative L2 error
-below 5\% over the vector of per-parameter gradient norms. A backward failure
-invalidates training without discarding a valid inference cell.
+below 1\%. A forward--loss--backward cell additionally requires matching
+canonical trainable parameter sets, total-gradient-norm error below 5\%, and
+relative L2 error below 5\% over the vector of per-parameter gradient norms. A
+backward failure invalidates that cell without discarding a valid inference
+cell.
 
 \subsection{Device and revision controls}
 
@@ -461,12 +570,7 @@ metric; an integrated or edge-class device is included only if both runners
 complete the audited workload. Historical table cells are not mixed with
 frozen results.
 
-\section{Results}
-\label{sec:results}
-
-\subsection{End-to-end performance}
-
-\begin{table*}[t]
+\begin{table*}[!t]
 \centering
 \scriptsize
 \setlength{\tabcolsep}{4pt}
@@ -480,20 +584,47 @@ frozen results.
   >{\raggedright\arraybackslash}p{0.13\textwidth}}
 \toprule
 Device / workload & Engine & Compile (s) & Full / prefill (ms) &
-Minimal / stateless (ms) & Training (ms) & Validity \\
+Minimal / stateless (ms) & F+L+B (ms) & Validity \\
 \midrule
 Frozen matrix pending & PyTorch & -- & -- & -- & -- & reference \\
  & \system{} & -- & -- & -- & -- & forward / backward \\
 \bottomrule
 \end{tabularx}
-\caption{Strict-f32 control results. Values will be populated only from clean,
-pinned revisions using the protocol in Section~\ref{sec:method}.}
+\caption{Strict-f32 control results. F+L+B is forward, scalar loss, and
+backward; it excludes the optimizer update. Values will be populated only
+from clean, pinned revisions using the protocol in
+Section~\ref{sec:method}.}
 \label{tab:strict-results}
 \end{table*}
 
+\section{Results}
+\label{sec:results}
+
+\subsection{Functional train-to-deploy check}
+\label{sec:train-deploy}
+
+The performance protocol deliberately stops before an optimizer update. To
+verify the broader systems claim, the artifact also contains a deterministic
+executable check in \code{examples/train\_deploy.rs}. It compiles a two-class
+linear model, performs 40 GPU SGD steps over eight separable points, saves the
+parameters as a safetensors checkpoint, constructs a fresh inference-only
+session, loads that checkpoint, and runs the same inputs without autodiff or
+optimizer dispatches.
+
+On the development RTX~5080, cross-entropy fell from 0.693147 to 0.026063 and
+the reloaded inference session classified 8/8 points correctly. This is a
+capability and checkpoint-compatibility test, not evidence of model quality or
+generalization. Its value is that it exercises the complete
+graph$\rightarrow$autodiff$\rightarrow$update$\rightarrow$checkpoint
+$\rightarrow$fresh-inference path that the timing columns intentionally
+decompose.
+
+\subsection{End-to-end performance}
+
 Table~\ref{tab:strict-results} will answer RQ1 with raw per-device values rather
 than a universal-win claim. We expect the final results to include cases close
-to the native stack and cases where training remains several times slower.
+to the native stack and cases where backward execution remains several times
+slower.
 For each large gap we report the dominant dispatch families and launch counts,
 not merely the ratio.
 
@@ -507,16 +638,18 @@ format equivalence.
 
 As a pre-freeze implementation checkpoint, the scaled Stable Diffusion 1.x
 U-Net passed the full 5-warmup/20-sample protocol on an RTX~5080. In strict f32,
-median inference was 2.152\,ms for \system{} and 1.941\,ms for PyTorch; training
-was 8.569\,ms and 4.493\,ms. In accelerated mode, inference was 1.859\,ms and
-1.166\,ms, while training was 8.104\,ms and 4.471\,ms. Accelerated forward
-relative L2 error was 0.471\%, and the per-parameter
-gradient-norm-vector error was 1.73\%. Accelerated Whisper training also
-passed after the precision repair, with 0.0228\% total-gradient error. These
-numbers demonstrate that the paths are viable; they are not included in the
-final table because both source revisions were dirty.
+median inference was 2.152\,ms for \system{} and 1.941\,ms for PyTorch;
+forward--loss--backward was 8.569\,ms and 4.493\,ms. In accelerated mode,
+inference was 1.859\,ms and 1.166\,ms, while forward--loss--backward was
+8.104\,ms and 4.471\,ms. Accelerated forward relative L2 error was 0.471\%,
+and the per-parameter gradient-norm-vector error was 1.73\%. Accelerated
+Whisper backward execution also passed after the precision repair, with
+0.0228\% total-gradient error. These numbers demonstrate that the paths are
+viable; they are not included in the final table because both source revisions
+were dirty.
 
 \subsection{Deployment footprint}
+\label{sec:footprint}
 
 The uniform stack also changes what an application must ship. Table
 \ref{tab:footprint} reports a development measurement on Linux x86-64. The
@@ -561,6 +694,42 @@ will accompany the raw values. Any aggregate uses the Pennycook
 performance-portability metric and assigns zero to an unsupported device
 \cite{pennycook2016metric}; it will not conceal individual devices or mix
 historical revisions.
+
+\section{Implications for Systems and Products}
+\label{sec:implications}
+
+\paragraph{The API is only one layer of the result.}
+A strong result on one workload would not prove that Vulkan or Metal is
+intrinsically as fast as CUDA, and a slow result would not prove the opposite.
+The measured unit is the complete stack: graph representation, fusion and
+specialization coverage, generated kernels, dispatch structure, driver
+compiler, and arithmetic policy. The useful systems conclusion is more
+specific. General consumer GPU APIs expose enough compute and matrix
+capability for a compact compiler to be competitive on covered graphs; the
+remaining distance can then be attributed to concrete missing work rather
+than to ``portability'' as an indivisible tax.
+
+\paragraph{A shared stack changes the product boundary.}
+A native application can construct or import a graph, train or adapt it, save
+the resulting parameters, and run an inference-only plan without introducing
+a Python service or converting to a second model representation. That is
+particularly relevant to robotics, creative applications, games, and private
+on-device personalization, where the ML runtime must coexist with rendering,
+sensors, and application logic. The compact artifact and Blade context-sharing
+path make \system{} a plausible embeddable component, but productization still
+depends on broader import/operator coverage, versioned checkpoints, stronger
+diagnostics, and sustained-device profiling.
+
+\paragraph{What an edge demonstration should prove.}
+For a device such as Meta Quest, a more informative artifact than a standalone
+kernel benchmark would collect a small amount of user-specific data, update a
+compact model head on-device, checkpoint it, and immediately use it for
+inference in the same application. A personalized hand/controller gesture
+classifier is a bounded example: it exercises Android/Vulkan deployment and
+the train-to-infer handoff without requiring a large generative model. Such a
+result should report memory, sustained latency, thermal behavior, and
+interference with the render loop. We do not count this scenario as evaluated
+until it runs on a physical device.
 
 \section{Ablations and Gap Analysis}
 \label{sec:ablation}
@@ -727,21 +896,25 @@ as an explicit artifact limitation.
 
 \section{Conclusion}
 
-\system{} explores a deliberately demanding portability target: one
-graphics-API-based system for both training and inference. Its architecture
-shows that typed graphs, autodiff, specialization, static memory planning, and
-matrix hardware can be assembled into a compact Vulkan/Metal stack. The
-evaluation is designed to show where that stack approaches a mature native
-engine and where it does not, under explicit numerical contracts.
+Can one portable GPU stack span training and deployment at useful performance?
+\system{} gives a conditional yes. A typed graph, automatic differentiation,
+specialized kernels, static execution, checkpointing, and lifetime-based
+memory planning fit in one compact Rust/Vulkan/Metal system. When its kernel
+coverage matches a workload, the graphics-API path can approach a mature
+vendor-native reference. It does not do so uniformly: backward kernels,
+small-matrix occupancy, fusion and launch structure, and safe use of reduced
+precision remain visible limits.
 
-The engineering results also narrow future work. Correctness requires
-precision policy to propagate into autodiff, pipeline geometry and epilogues
-to be selected together, and backward kernels to be tested at realistic
-shapes. Greedy rewriting is currently more practical than equality
-saturation, and generated WGSL is more maintainable than direct Naga-IR
-authoring. These negative results are part of the answer: performance
-portability depends as much on choosing tractable compiler boundaries as on
-accessing the hardware.
+The shared stack does not eliminate systems work; it moves that work from
+several conversion/runtime boundaries into one inspectable compiler and
+artifact. The experience identifies the boundaries that currently scale:
+precision policy must propagate through autodiff, pipeline geometry and
+epilogues must be selected together, static execution can hide graph capture
+from the application, greedy rewriting is more practical than equality
+saturation for the present local rule set, and generated WGSL is more
+maintainable than direct Naga-IR authoring. The result is therefore both a
+usable implementation and a map of the remaining work required for portable
+training and inference to become routine.
 
 \section*{Artifact Availability}
 
@@ -751,7 +924,14 @@ repositories.\footnote{\url{https://github.com/kvark/meganeura}}\footnote{
 tags or full revisions rather than duplicating either repository's source.
 It will include the command and revision manifest, lockfiles and environment
 metadata, raw JSON samples, correctness diagnostics, selected profiles, and
-figure-generation scripts.
+figure-generation scripts. The repository includes machine-readable citation
+metadata; the submitted artifact will add a versioned release and archival
+identifier without changing the source revisions used for the tables.
+
+\section*{Acknowledgments}
+
+The author thanks the open-source contributors and hardware testers whose
+reports exercised \system{} across graphics backends and GPU vendors.
 
 \section*{AI-Assistance Disclosure}
 

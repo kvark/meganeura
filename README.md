@@ -102,6 +102,7 @@ cargo add meganeura
 Worked examples live in [`examples/`](https://github.com/kvark/meganeura/tree/main/examples):
 
 - [`mnist.rs`](https://github.com/kvark/meganeura/blob/main/examples/mnist.rs) — MNIST training end to end.
+- [`train_deploy.rs`](https://github.com/kvark/meganeura/blob/main/examples/train_deploy.rs) — optimizer-backed training, checkpoint save, and reload into a fresh inference session.
 - [`smollm2.rs`](https://github.com/kvark/meganeura/blob/main/examples/smollm2.rs) — LLM inference with HuggingFace weights.
 
 Pretrained models can be loaded from ONNX or NNEF via `meganeura::load_onnx(...)` / `meganeura::load_nnef(...)`. Both lower through Meganeura’s IR, so the same graph rewrites apply to imported graphs and hand-built ones.
@@ -146,6 +147,12 @@ MEGANEURA_TRACE=trace.pftrace cargo run --example mnist
 Open the trace in [Perfetto](https://ui.perfetto.dev):
 
 [![perfetto trace](https://github.com/kvark/meganeura/raw/main/etc/example-trace.png)](/kvark/meganeura/blob/main/etc/example-trace.png)
+
+## Citation
+
+Machine-readable author and project metadata is available in
+[`CITATION.cff`](https://github.com/kvark/meganeura/blob/main/CITATION.cff).
+The paper citation and archival identifier will be added after publication.
 
 ## Contributing
 
