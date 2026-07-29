@@ -38,6 +38,10 @@ name = "mnist"
 path = "examples/mnist.rs"
 
 [[example]]
+name = "train_deploy"
+path = "examples/train_deploy.rs"
+
+[[example]]
 name = "external_buffer"
 path = "examples/external_buffer.rs"
 

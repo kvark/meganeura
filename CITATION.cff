@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use Meganeura in published work, please cite this software. Paper metadata will be added after publication."
+type: software
+title: Meganeura
+version: 0.2.0
+authors:
+  - given-names: Dzmitry
+    family-names: Malyshau
+    email: kvark@fastmail.com
+    orcid: "https://orcid.org/0009-0005-6410-4276"
+repository-code: "https://github.com/kvark/meganeura"
+url: "https://github.com/kvark/meganeura"
+license: MIT
+keywords:
+  - machine learning
+  - GPU
+  - Vulkan
+  - Metal
+  - Rust
