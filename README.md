@@ -140,6 +140,21 @@ qualification because software drivers cannot reproduce vendor-driver behavior.
 
 ## Profiling
 
+For a repeatable per-dispatch JSON profile:
+
+```sh
+MEGANEURA_GPU_TIMING=1 \
+  cargo run --release --example profile_session -- gap-profile.json
+```
+
+The report retains raw hardware-timestamp samples, selected pipeline variants,
+workgroup geometry, forward/backward and kernel-family aggregates, device and
+memory metadata, and the instrumentation overhead relative to normal grouped
+execution. See [structured performance profiling](docs/performance-profiling.md)
+for the Inferena harness and interpretation rules.
+
+For a CPU/GPU timeline:
+
 ```
 MEGANEURA_TRACE=trace.pftrace cargo run --example mnist
 ```
