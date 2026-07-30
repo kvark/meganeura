@@ -1815,6 +1815,9 @@ pub struct Session {
     /// compute pass. Pass boundaries in blade emit ALL_COMMANDS barriers.
     groups: Vec<std::ops::Range<usize>>,
     encoder: blade_graphics::CommandEncoder,
+    /// How many submissions `step()` splits its dispatches across.
+    /// See [`Session::set_submission_chunks`]. Always at least 1.
+    submission_chunks: usize,
     sync_point: Option<blade_graphics::SyncPoint>,
     /// Nanosecond offset (in profiler time) of the most recent GPU submit,
     /// used to place GPU pass timings on the GPU track.
@@ -2598,6 +2601,7 @@ impl Session {
             plan,
             groups,
             encoder,
+            submission_chunks: 1,
             sync_point: None,
             last_submit_ns: 0,
             profiling: false,
@@ -2772,6 +2776,48 @@ impl Session {
                 .copied()
                 .ok_or(ExternalBindError::UnknownSlot),
         }
+    }
+
+    /// Split `step()`'s dispatches across several submissions instead of one.
+    ///
+    /// By default the whole plan goes into a single command buffer, which
+    /// occupies the queue for its entire duration. That is ideal when
+    /// meganeura owns the GPU, and poor when it does not: sharing a device
+    /// with a renderer means every frame queues behind the whole inference.
+    /// On a Quest 3S a 135 ms encoder drops a 90 Hz render loop to 15 Hz.
+    /// Splitting into chunks lets the other work interleave.
+    ///
+    /// Correctness across the resulting submission boundaries does not need
+    /// extra synchronization. Blade ends every command buffer with a
+    /// conservative global memory barrier and opens each new one assuming an
+    /// unknown prior producer, and a Vulkan pipeline barrier's scopes cover
+    /// commands submitted to the same queue before and after it — not merely
+    /// those in the same command buffer.
+    ///
+    /// Costs one extra submit per chunk, and reallocates the command encoder
+    /// so that no command buffer is re-recorded while still in flight. Call
+    /// it once during setup rather than per step. `chunks` is clamped to at
+    /// least 1; 1 restores the single-submission default.
+    pub fn set_submission_chunks(&mut self, chunks: usize) {
+        let chunks = chunks.max(1);
+        if chunks == self.submission_chunks {
+            return;
+        }
+        // The encoder rotates through a fixed ring of command buffers with no
+        // internal wait, so recording chunk N+1 while chunk N-1 is still
+        // executing would re-record a live buffer. One spare beyond the
+        // number in flight keeps that from happening.
+        self.wait();
+        self.gpu.destroy_command_encoder(&mut self.encoder);
+        self.encoder = self
+            .gpu
+            .create_command_encoder(blade_graphics::CommandEncoderDesc {
+                name: "meganeura",
+                buffer_count: chunks as u32 + 1,
+                manual_barriers: false,
+            });
+        self.submission_chunks = chunks;
+        log::info!("submission chunks: {chunks}");
     }
 
     /// Enable or disable per-dispatch GPU profiling.
@@ -3960,22 +4006,41 @@ impl Session {
                 pc.dispatch(dispatch.workgroups);
             }
         } else {
-            // Inline-barrier mode: all dispatches in a single compute pass
-            // with lightweight compute-to-compute barriers between groups.
-            // Avoids the per-pass overhead of begin_pass/end_pass (timestamps,
-            // debug labels) while maintaining correct memory ordering.
-            let mut pass = self.encoder.compute("step");
-            for gi in 0..self.groups.len() {
-                if gi > 0 {
-                    pass.barrier();
+            // Inline-barrier mode: dispatches share one compute pass with
+            // lightweight compute-to-compute barriers between groups. Avoids
+            // the per-pass overhead of begin_pass/end_pass (timestamps, debug
+            // labels) while maintaining correct memory ordering.
+            //
+            // With `set_submission_chunks`, the groups are spread over
+            // several submissions so a co-tenant on the queue (a renderer,
+            // typically) can slot its own work between them. The chunk
+            // boundary needs no explicit barrier: blade closes each command
+            // buffer with a conservative global one.
+            let total = self.groups.len();
+            let per_chunk = total.div_ceil(self.submission_chunks.min(total).max(1));
+            let mut start = 0;
+            while start < total {
+                let end = (start + per_chunk).min(total);
+                {
+                    let mut pass = self.encoder.compute("step");
+                    for gi in start..end {
+                        if gi > start {
+                            pass.barrier();
+                        }
+                        let group = self.groups[gi].clone();
+                        for i in group {
+                            let dispatch = &self.plan.dispatches[i];
+                            let pipeline = self.pipelines.get(dispatch);
+                            let mut pc = pass.with(pipeline);
+                            Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
+                            pc.dispatch(dispatch.workgroups);
+                        }
+                    }
                 }
-                let group = self.groups[gi].clone();
-                for i in group {
-                    let dispatch = &self.plan.dispatches[i];
-                    let pipeline = self.pipelines.get(dispatch);
-                    let mut pc = pass.with(pipeline);
-                    Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
-                    pc.dispatch(dispatch.workgroups);
+                start = end;
+                if start < total {
+                    self.sync_point = Some(self.gpu.submit(&mut self.encoder));
+                    self.encoder.start();
                 }
             }
         }
