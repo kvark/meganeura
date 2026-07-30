@@ -9,6 +9,15 @@ rust-version = "1.88"
 description = "E-graph optimized neural network training on Blade"
 license = "MIT"
 
+[features]
+default = ["hub"]
+# Downloading weights from the HuggingFace Hub
+# (`SafeTensorsModel::download` / `download_file`). Turn this off on
+# targets where there is no ambient HTTP/TLS stack or writable cache
+# directory — Android, for instance, ships weights as app assets and
+# loads them through `SafeTensorsModel::load`.
+hub = ["dep:hf-hub"]
+
 [dependencies]
 blade-graphics = { version = "0.8.4", git = "https://github.com/kvark/blade", rev = "60c2eeb8d6180ff2db5167e304d55b78a18dfee2" }
 blade-macros = "0.3"
@@ -22,16 +31,22 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ron = "0.8"
 log = "0.4"
-env_logger = "0.11"
 flate2 = "1"
 safetensors = "0.4"
-hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"] }
-tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"], optional = true }
 oxionnx-core = "0.1"
 oxionnx-proto = "0.1"
 half = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["registry"] }
+
+# Only the examples, benches, and tests need these. Keeping them out of
+# `[dependencies]` matters for cross-compilation: `tokenizers`/`onig`
+# pulls in a C library, which is a needless build-script burden for
+# downstream crates that just want the inference runtime.
+[dev-dependencies]
+env_logger = "0.11"
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 
 [[example]]
 name = "mnist"
