@@ -2121,7 +2121,17 @@ impl Graph {
 impl fmt::Display for Graph {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for node in &self.nodes {
-            write!(f, "%{} = {:?}(", node.id, node.op)?;
+            match &node.op {
+                // Constants carry their whole payload, and some are large:
+                // a ViT's precomputed RoPE tables run to hundreds of
+                // thousands of floats. Printing them buries the graph and,
+                // on Android, floods logcat badly enough to slow startup.
+                // The shape is already on the right-hand side.
+                Op::Constant { data } => {
+                    write!(f, "%{} = Constant {{ {} values }}(", node.id, data.len())?
+                }
+                op => write!(f, "%{} = {:?}(", node.id, op)?,
+            }
             for (i, input) in node.inputs.iter().enumerate() {
                 if i > 0 {
                     write!(f, ", ")?;
