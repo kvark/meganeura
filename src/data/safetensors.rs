@@ -8,7 +8,9 @@
 //! ```no_run
 //! use meganeura::data::safetensors::SafeTensorsModel;
 //!
-//! let model = SafeTensorsModel::download("dacorvo/mnist-mlp").unwrap();
+//! // `SafeTensorsModel::download("dacorvo/mnist-mlp")` fetches from the
+//! // Hub instead, when the `hub` feature is enabled.
+//! let model = SafeTensorsModel::load("model.safetensors".into()).unwrap();
 //! for (name, info) in model.tensor_info() {
 //!     println!("{}: shape={:?}", name, info.shape);
 //! }
@@ -41,6 +43,10 @@ impl SafeTensorsModel {
     /// Download a model from HuggingFace Hub by repository ID.
     ///
     /// Downloads `model.safetensors` from the given repo (e.g. `"dacorvo/mnist-mlp"`).
+    ///
+    /// Requires the `hub` feature. Without it, fetch the weights ahead of
+    /// time and use [`SafeTensorsModel::load`].
+    #[cfg(feature = "hub")]
     pub fn download(repo_id: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let api = hf_hub::api::sync::Api::new()?;
         let repo = api.model(repo_id.to_string());
@@ -104,6 +110,10 @@ impl SafeTensorsModel {
     }
 
     /// Download a specific safetensors file from a HuggingFace Hub repo.
+    ///
+    /// Requires the `hub` feature. Without it, fetch the weights ahead of
+    /// time and use [`SafeTensorsModel::load`].
+    #[cfg(feature = "hub")]
     pub fn download_file(
         repo_id: &str,
         filename: &str,
