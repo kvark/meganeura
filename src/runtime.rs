@@ -1256,6 +1256,37 @@ impl Pipelines {
         &self.map[&dispatch.shader]
     }
 
+    fn profile_key(&self, dispatch: &Dispatch) -> String {
+        if let Some(ref kernel) = dispatch.reduction {
+            return format!("generated-reduction:{:016x}", kernel.hash_key());
+        }
+        if let Some(ref dag) = dispatch.pointwise {
+            return format!("generated-pointwise:{:016x}", dag.hash_key());
+        }
+        if dispatch.params.len() >= 4 {
+            let key = (dispatch.shader.clone(), dispatch.params[3]);
+            if self.attention_map.contains_key(&key) {
+                return format!("{:?}:head-dim-{}", dispatch.shader, dispatch.params[3]);
+            }
+        }
+        if let Some(epilogue) = epilogue_pipeline_key(dispatch) {
+            return epilogue_profile_key(&dispatch.shader, &epilogue, dispatch.use_coop);
+        }
+        if dispatch.weight_format.uses_reduced_storage() {
+            let key = (dispatch.shader.clone(), dispatch.weight_format);
+            if self.weight_map.contains_key(&key) {
+                return format!("{:?}:weight-{:?}", dispatch.shader, dispatch.weight_format);
+            }
+        }
+        if dispatch.use_coop && self.coop_map.contains_key(&dispatch.shader) {
+            return format!("{:?}:cooperative", dispatch.shader);
+        }
+        if dispatch.use_small_tiles && self.small_map.contains_key(&dispatch.shader) {
+            return format!("{:?}:small-tile", dispatch.shader);
+        }
+        format!("{:?}:scalar", dispatch.shader)
+    }
+
     fn all_pipelines(&self) -> Vec<(&str, &blade_graphics::ComputePipeline)> {
         let mut result = Vec::new();
         for (entry, pipeline) in &self.map {
@@ -1284,6 +1315,58 @@ impl Pipelines {
         }
         result
     }
+
+    fn all_profile_pipelines(&self) -> Vec<(String, &blade_graphics::ComputePipeline)> {
+        let mut result = Vec::new();
+        for (entry, pipeline) in &self.map {
+            result.push((format!("{entry:?}:scalar"), pipeline));
+        }
+        for (entry, pipeline) in &self.coop_map {
+            result.push((format!("{entry:?}:cooperative"), pipeline));
+        }
+        for (entry, pipeline) in &self.small_map {
+            result.push((format!("{entry:?}:small-tile"), pipeline));
+        }
+        for (key, pipeline) in &self.attention_map {
+            result.push((format!("{:?}:head-dim-{}", key.0, key.1), pipeline));
+        }
+        #[allow(clippy::pattern_type_mismatch)]
+        for ((entry, format), pipeline) in &self.weight_map {
+            result.push((format!("{entry:?}:weight-{format:?}"), pipeline));
+        }
+        #[allow(clippy::needless_borrowed_reference)]
+        for (&(ref entry, ref epilogue), pipeline) in &self.epilogue_map {
+            result.push((epilogue_profile_key(entry, epilogue, false), pipeline));
+        }
+        #[allow(clippy::needless_borrowed_reference)]
+        for (&(ref entry, ref epilogue), pipeline) in &self.coop_epilogue_map {
+            result.push((epilogue_profile_key(entry, epilogue, true), pipeline));
+        }
+        for (hash, pipeline) in &self.pointwise_map {
+            result.push((format!("generated-pointwise:{hash:016x}"), pipeline));
+        }
+        for (hash, pipeline) in &self.reduction_map {
+            result.push((format!("generated-reduction:{hash:016x}"), pipeline));
+        }
+        result
+    }
+}
+
+fn epilogue_profile_key(
+    entry: &ShaderEntry,
+    epilogue: &EpiloguePipelineKey,
+    cooperative: bool,
+) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::hash::DefaultHasher::new();
+    epilogue.hash(&mut hasher);
+    let variant = if cooperative {
+        "cooperative-epilogue"
+    } else {
+        "scalar-epilogue"
+    };
+    format!("{entry:?}:{variant}:{:016x}", hasher.finish())
 }
 
 /// ShaderDataLayout for a schedule-template reduction pipeline, chosen
@@ -2536,6 +2619,30 @@ impl Session {
         self.profiling = enabled;
     }
 
+    /// Copy the GPU pass timings most recently resolved by Blade.
+    ///
+    /// Blade keeps a two-command-buffer timing ring. The values become
+    /// available when `step()` next reuses the command buffer that recorded
+    /// them; callers should normally use
+    /// [`crate::profiler::capture_session_profile`] instead of managing that
+    /// ring directly.
+    pub fn gpu_timings(&self) -> Vec<(String, std::time::Duration)> {
+        self.encoder.timings().to_vec()
+    }
+
+    /// Stable descriptive key for the pipeline selected by each plan
+    /// dispatch, in dispatch order.
+    ///
+    /// Keys distinguish scalar, cooperative, small-tile, reduced-weight,
+    /// generated pointwise/reduction, attention-width, and epilogue variants.
+    pub fn dispatch_pipeline_keys(&self) -> Vec<String> {
+        self.plan
+            .dispatches
+            .iter()
+            .map(|dispatch| self.pipelines.profile_key(dispatch))
+            .collect()
+    }
+
     /// Shared handle to the underlying Blade GPU context.
     ///
     /// Cheap to clone — the context stays alive as long as any `Arc`
@@ -2563,6 +2670,20 @@ impl Session {
                 result.push((name.to_string(), stats));
             }
         }
+        result
+    }
+
+    pub(crate) fn get_profile_pipeline_statistics(
+        &self,
+    ) -> Vec<(String, Vec<blade_graphics::PipelineExecutableInfo>)> {
+        let mut result = Vec::new();
+        for (name, pipeline) in self.pipelines.all_profile_pipelines() {
+            let stats = self.gpu.get_pipeline_statistics(pipeline);
+            if !stats.is_empty() {
+                result.push((name, stats));
+            }
+        }
+        result.sort_by(|a, b| a.0.cmp(&b.0));
         result
     }
 }

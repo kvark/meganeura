@@ -42,6 +42,10 @@ name = "train_deploy"
 path = "examples/train_deploy.rs"
 
 [[example]]
+name = "profile_session"
+path = "examples/profile_session.rs"
+
+[[example]]
 name = "external_buffer"
 path = "examples/external_buffer.rs"
 

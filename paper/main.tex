@@ -530,6 +530,17 @@ Each series uses five untimed warmups and at least 20 retained samples.
 We report median, interquartile range, minimum, maximum, and raw samples.
 GPU execution is synchronized at timing boundaries.
 
+Gap profiles are collected only after the ordinary series and never replace
+its latency. Blade hardware timestamps are retained for repeated executions
+with one compute pass per plan dispatch, together with the selected pipeline,
+workgroup geometry, logical input/output bytes, and driver-reported executable
+statistics where available. The artifact records the profiled wall time,
+timestamped GPU sum, and their ratio to the ordinary grouped-pass median,
+because pass-level instrumentation itself can be expensive. Vulkan intervals
+include the inter-pass barrier before the following dispatch; Metal uses
+compute-encoder boundary counter samples. We therefore use these profiles to
+rank end-to-end dispatch costs, not as instruction-level kernel timings.
+
 \textit{Inference} is one complete no-gradient forward pass.
 \textit{Latency} is an agreed minimal shape, not an engine-specific shortcut.
 \textit{Forward--loss--backward} includes those three phases but no optimizer
@@ -626,7 +637,10 @@ than a universal-win claim. We expect the final results to include cases close
 to the native stack and cases where backward execution remains several times
 slower.
 For each large gap we report the dominant dispatch families and launch counts,
-not merely the ratio.
+not merely the ratio. Profiles split forward and backward work into matrix,
+attention, convolution/spatial, normalization/reduction, pointwise, and data
+movement families, and retain the full dispatch table rather than only the
+aggregate.
 
 \subsection{Accelerated arithmetic}
 
@@ -777,9 +791,12 @@ numbers require graph-level inspection.
 
 The two largest gaps in the frozen results will receive per-dispatch profiles
 split into matrix, attention, convolution, normalization/reduction,
-pointwise, and barrier/launch contributions, including dispatch counts and
-bytes where available. This analysis is deliberately selected from the
-frozen table rather than from the current development checkpoints.
+pointwise, and data-movement work, including dispatch counts and logical
+buffer bytes. Normal grouped-pass time, instrumented wall time, and
+timestamped GPU time are reported separately; the current mechanism does not
+pretend to isolate barrier and launch cost from each backend's pass-boundary
+semantics. This analysis is deliberately selected from the frozen table
+rather than from the current development checkpoints.
 
 Likely improvement paths must be phrased as measured hypotheses: fewer
 launches through broader fusion, better small-matrix occupancy, wider

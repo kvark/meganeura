@@ -215,6 +215,124 @@ pub enum ShaderEntry {
 }
 
 impl ShaderEntry {
+    /// Coarse workload family used by structured performance profiles.
+    ///
+    /// These categories intentionally match the paper-level decomposition:
+    /// they are stable enough to compare profiles across revisions while the
+    /// individual shader variants continue to evolve.
+    pub fn profile_family(&self) -> &'static str {
+        match *self {
+            ShaderEntry::MatMul
+            | ShaderEntry::MatMulAT
+            | ShaderEntry::MatMulBT
+            | ShaderEntry::MatMulGemv
+            | ShaderEntry::MatMulGemvAdd
+            | ShaderEntry::MatMulGemvBT
+            | ShaderEntry::FusedMatMulAdd
+            | ShaderEntry::FusedMatMulATAdd
+            | ShaderEntry::FusedMatMulBTAdd
+            | ShaderEntry::FusedRmsNormMatMul => "matrix",
+
+            ShaderEntry::MultiHeadAttn
+            | ShaderEntry::FlashAttention
+            | ShaderEntry::FlashAttentionCoop
+            | ShaderEntry::FlashGradQCoop
+            | ShaderEntry::FlashGradKVCoop
+            | ShaderEntry::MultiHeadAttnGradQ
+            | ShaderEntry::FlashGradQ
+            | ShaderEntry::MultiHeadAttnGradKV
+            | ShaderEntry::FlashGradKV
+            | ShaderEntry::CachedAttention => "attention",
+
+            ShaderEntry::Conv2d
+            | ShaderEntry::Conv2dDw
+            | ShaderEntry::Conv2dGemm
+            | ShaderEntry::Conv2dGemmSmall
+            | ShaderEntry::Conv2dGemmCoop
+            | ShaderEntry::Conv2dGemmCoopGen(..)
+            | ShaderEntry::Conv2dGradInput
+            | ShaderEntry::Conv2dGradInputGemm
+            | ShaderEntry::Conv2dGradInputGemmSmall
+            | ShaderEntry::Conv2dGradInputGemmCoop
+            | ShaderEntry::Conv2dGradInputGemmCoop3x3
+            | ShaderEntry::Conv2dGradInputGemmCoopGen(..)
+            | ShaderEntry::Conv2dGradWeight
+            | ShaderEntry::Conv2dGradWeightGemm
+            | ShaderEntry::Conv2dGradWeightGemmSmall
+            | ShaderEntry::Upsample2x
+            | ShaderEntry::Upsample2xGrad
+            | ShaderEntry::MaxPool2d
+            | ShaderEntry::WinogradInputTransform
+            | ShaderEntry::WinogradOutputTransform
+            | ShaderEntry::WinogradBatchedMatMul
+            | ShaderEntry::WinogradBatchedMatMulSmall
+            | ShaderEntry::WinogradWeightTransform => "convolution_spatial",
+
+            ShaderEntry::SumAll
+            | ShaderEntry::MeanAll
+            | ShaderEntry::Softmax
+            | ShaderEntry::CrossEntropyLoss
+            | ShaderEntry::BceLoss
+            | ShaderEntry::RmsNorm
+            | ShaderEntry::LayerNorm
+            | ShaderEntry::SumRows
+            | ShaderEntry::RmsNormGradW
+            | ShaderEntry::RmsNormGradWRowPar
+            | ShaderEntry::RmsNormGradX
+            | ShaderEntry::LayerNormGradWB
+            | ShaderEntry::LayerNormGradX
+            | ShaderEntry::RmsNormRsqrt
+            | ShaderEntry::GroupNorm
+            | ShaderEntry::GroupNormSilu
+            | ShaderEntry::GroupNormGradInput
+            | ShaderEntry::GroupNormGradWeightBias
+            | ShaderEntry::GlobalAvgPool
+            | ShaderEntry::GlobalAvgPoolGrad => "normalization_reduction",
+
+            ShaderEntry::SgdUpdate
+            | ShaderEntry::AdamUpdate
+            | ShaderEntry::GradClipZero
+            | ShaderEntry::GradClipNormSq
+            | ShaderEntry::GradClipScale
+            | ShaderEntry::GradAccum => "optimizer",
+
+            ShaderEntry::ScatterAdd
+            | ShaderEntry::Transpose
+            | ShaderEntry::Embedding
+            | ShaderEntry::EmbeddingF16
+            | ShaderEntry::ToF16
+            | ShaderEntry::Concat
+            | ShaderEntry::SplitA
+            | ShaderEntry::SplitB
+            | ShaderEntry::CacheWrite => "data_movement",
+
+            ShaderEntry::Relu
+            | ShaderEntry::Sigmoid
+            | ShaderEntry::Tanh
+            | ShaderEntry::Neg
+            | ShaderEntry::Abs
+            | ShaderEntry::Log
+            | ShaderEntry::Recip
+            | ShaderEntry::Add
+            | ShaderEntry::Mul
+            | ShaderEntry::Greater
+            | ShaderEntry::BiasAdd
+            | ShaderEntry::Silu
+            | ShaderEntry::SwiGLU
+            | ShaderEntry::RoPE
+            | ShaderEntry::RoPEGrad
+            | ShaderEntry::Gelu
+            | ShaderEntry::SwiGLUGradGate
+            | ShaderEntry::SwiGLUGradUp
+            | ShaderEntry::SiluGrad
+            | ShaderEntry::SwiGLUConcat
+            | ShaderEntry::SwiGLUConcatGrad
+            | ShaderEntry::MulPerChannel
+            | ShaderEntry::AddPerChannel
+            | ShaderEntry::RoPEDynamic => "pointwise",
+        }
+    }
+
     pub fn shader_group(&self) -> crate::codegen::ShaderGroup {
         use crate::codegen::ShaderGroup;
         match *self {
@@ -421,6 +539,23 @@ impl ShaderEntry {
             | ShaderEntry::GradClipNormSq
             | ShaderEntry::GradClipScale
             | ShaderEntry::GradAccum => "main",
+        }
+    }
+}
+
+impl Dispatch {
+    /// Coarse workload family for this concrete dispatch.
+    ///
+    /// Generated schedule kernels retain a legacy `shader` entry for binding
+    /// layout compatibility, so their schedule kind takes precedence over
+    /// that placeholder when profiling.
+    pub fn profile_family(&self) -> &'static str {
+        if self.reduction.is_some() {
+            "normalization_reduction"
+        } else if self.pointwise.is_some() {
+            "pointwise"
+        } else {
+            self.shader.profile_family()
         }
     }
 }
@@ -4362,6 +4497,40 @@ mod tests {
             plan.dispatches
                 .iter()
                 .all(|dispatch| { dispatch.shader != ShaderEntry::MultiHeadAttnGradKV })
+        );
+    }
+
+    #[test]
+    fn profile_families_cover_representative_kernel_shapes() {
+        assert_eq!(ShaderEntry::MatMul.profile_family(), "matrix");
+        assert_eq!(ShaderEntry::FlashAttention.profile_family(), "attention");
+        assert_eq!(
+            ShaderEntry::Conv2dGemmCoopGen(3, 3, 1).profile_family(),
+            "convolution_spatial"
+        );
+        assert_eq!(
+            ShaderEntry::LayerNormGradX.profile_family(),
+            "normalization_reduction"
+        );
+        assert_eq!(ShaderEntry::SwiGLU.profile_family(), "pointwise");
+        assert_eq!(ShaderEntry::Transpose.profile_family(), "data_movement");
+        assert_eq!(ShaderEntry::AdamUpdate.profile_family(), "optimizer");
+
+        let mut graph = Graph::new();
+        let input = graph.input("input", &[4, 8]);
+        let output = graph.softmax(input);
+        graph.set_outputs(vec![output]);
+        let plan = compile(&graph);
+        assert!(
+            plan.dispatches
+                .iter()
+                .any(|dispatch| dispatch.reduction.is_some())
+        );
+        assert!(
+            plan.dispatches
+                .iter()
+                .filter(|dispatch| dispatch.reduction.is_some())
+                .all(|dispatch| dispatch.profile_family() == "normalization_reduction")
         );
     }
 }

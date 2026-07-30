@@ -13,7 +13,10 @@
 //! meganeura::profiler::save("trace.pftrace").unwrap();
 //! ```
 
+use serde::Serialize;
 use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
     path::Path,
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
@@ -146,6 +149,497 @@ pub fn save(path: impl AsRef<Path>) -> std::io::Result<()> {
         .ok_or_else(|| std::io::Error::other("profiler not initialized"))?;
     let guard = inner.lock().unwrap();
     write_pftrace(path.as_ref(), &guard.events)
+}
+
+// ---- Structured gap profiles ----
+
+/// Options for [`capture_session_profile`].
+#[derive(Clone, Debug)]
+pub struct CaptureOptions {
+    /// Number of separately timestamped executions to retain.
+    pub samples: usize,
+    /// Median wall time from the normal, uninstrumented benchmark protocol.
+    ///
+    /// When provided, the artifact reports how much one-pass-per-dispatch
+    /// profiling perturbed the workload.
+    pub unprofiled_median_ms: Option<f64>,
+    /// Query driver-reported pipeline statistics such as register and spill
+    /// counts where the backend exposes them.
+    pub include_pipeline_statistics: bool,
+}
+
+impl Default for CaptureOptions {
+    fn default() -> Self {
+        Self {
+            samples: 3,
+            unprofiled_median_ms: None,
+            include_pipeline_statistics: true,
+        }
+    }
+}
+
+/// Machine-readable profile of one compiled session and execution shape.
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionProfile {
+    pub schema_version: u32,
+    pub timing_contract: String,
+    pub device: ProfileDevice,
+    pub plan: ProfilePlan,
+    pub measurement: ProfileMeasurement,
+    pub families: Vec<FamilyProfile>,
+    pub dispatches: Vec<DispatchProfile>,
+    pub pipeline_statistics: Vec<PipelineProfile>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProfileDevice {
+    pub backend: String,
+    pub device_name: String,
+    pub driver_name: String,
+    pub driver_info: String,
+    pub software_emulated: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProfilePlan {
+    pub dispatch_count: usize,
+    pub forward_dispatch_count: usize,
+    pub backward_dispatch_count: usize,
+    pub barrier_group_count: usize,
+    pub logical_buffer_bytes: usize,
+    pub allocated_buffer_bytes: usize,
+    pub device_local_bytes: usize,
+    pub physical_allocation_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProfileMeasurement {
+    pub sample_count: usize,
+    pub unprofiled_median_ms: Option<f64>,
+    pub profiled_wall_samples_ms: Vec<f64>,
+    pub profiled_wall_median_ms: f64,
+    pub gpu_total_samples_ms: Vec<f64>,
+    pub gpu_total_median_ms: f64,
+    /// Profiled wall median divided by the unprofiled benchmark median.
+    pub instrumentation_wall_ratio: Option<f64>,
+    /// Timestamped GPU total divided by profiled wall time.
+    pub timestamped_gpu_share_of_profiled_wall_pct: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct FamilyProfile {
+    pub phase: String,
+    pub family: String,
+    pub dispatch_count: usize,
+    pub timing_samples_ms: Vec<f64>,
+    pub median_ms: f64,
+    /// Sum of each member dispatch's median. Shares use this additive value
+    /// so the family percentages sum to 100%.
+    pub dispatch_median_sum_ms: f64,
+    pub share_of_dispatch_median_sum_pct: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DispatchProfile {
+    pub index: usize,
+    pub phase: String,
+    pub family: String,
+    pub shader: String,
+    pub label: String,
+    pub timestamp_label: String,
+    pub pipeline: String,
+    pub workgroups: [u32; 3],
+    pub workgroup_count: u64,
+    pub input_buffer_bytes: usize,
+    pub output_buffer_bytes: usize,
+    pub cooperative: bool,
+    pub small_tile: bool,
+    pub requires_full_precision: bool,
+    pub weight_format: String,
+    pub has_prologue: bool,
+    pub has_epilogue: bool,
+    pub timing_samples_ms: Vec<f64>,
+    pub median_ms: f64,
+    pub p25_ms: f64,
+    pub p75_ms: f64,
+    pub share_of_dispatch_median_sum_pct: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PipelineProfile {
+    pub pipeline: String,
+    pub executables: Vec<PipelineExecutableProfile>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PipelineExecutableProfile {
+    pub name: String,
+    pub statistics: Vec<PipelineStatisticProfile>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PipelineStatisticProfile {
+    pub name: String,
+    pub description: String,
+    pub value: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProfileError {
+    ZeroSamples,
+    TooManyDispatches {
+        count: usize,
+        limit: usize,
+    },
+    MissingGpuTimings {
+        sample: usize,
+    },
+    TimingCount {
+        sample: usize,
+        expected: usize,
+        actual: usize,
+    },
+}
+
+impl fmt::Display for ProfileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::ZeroSamples => f.write_str("profile sample count must be positive"),
+            Self::TooManyDispatches { count, limit } => write!(
+                f,
+                "session has {count} dispatches, exceeding Blade's {limit}-pass timestamp limit"
+            ),
+            Self::MissingGpuTimings { sample } => write!(
+                f,
+                "no GPU timings resolved for profile sample {sample}; set \
+                 MEGANEURA_GPU_TIMING=1 before constructing the session"
+            ),
+            Self::TimingCount {
+                sample,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "profile sample {sample} resolved {actual} timed passes, expected {expected}; \
+                 disable runtime-appended optimizer, gradient-accumulation, and \
+                 gradient-clipping passes before capture"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProfileError {}
+
+/// Capture repeated, structured per-dispatch GPU timings for a session.
+///
+/// Set `MEGANEURA_GPU_TIMING=1` before the session creates its Blade context.
+/// Each retained execution runs in one-compute-pass-per-dispatch mode. Two
+/// normal executions then advance Blade's command-buffer ring so the hardware
+/// timestamps can be read. The returned artifact retains raw samples, reports
+/// instrumentation overhead against an optional normal benchmark median, and
+/// aggregates dispatches by forward/backward phase and coarse kernel family.
+///
+/// `prepare` is called immediately before every execution, including the two
+/// ring-advance executions. It should restore inputs and any state that the
+/// workload mutates.
+///
+/// The structured dispatch table describes the compiled execution plan.
+/// Capture with optimizer, gradient-accumulation, and gradient-clipping passes
+/// disabled: those runtime-appended passes do not have plan metadata, and the
+/// collector rejects their additional timestamps instead of misattributing
+/// them to plan dispatches.
+pub fn capture_session_profile(
+    session: &mut crate::runtime::Session,
+    mut prepare: impl FnMut(&mut crate::runtime::Session),
+    options: CaptureOptions,
+) -> Result<SessionProfile, ProfileError> {
+    if options.samples == 0 {
+        return Err(ProfileError::ZeroSamples);
+    }
+
+    let dispatch_count = session.plan().dispatches.len();
+    let pass_limit = blade_graphics::limits::PASS_COUNT;
+    if dispatch_count > pass_limit {
+        return Err(ProfileError::TooManyDispatches {
+            count: dispatch_count,
+            limit: pass_limit,
+        });
+    }
+
+    let mut timing_samples = vec![Vec::with_capacity(options.samples); dispatch_count];
+    let mut timestamp_labels = vec![String::new(); dispatch_count];
+    let mut profiled_wall_samples_ms = Vec::with_capacity(options.samples);
+    let mut gpu_total_samples_ms = Vec::with_capacity(options.samples);
+
+    for sample in 0..options.samples {
+        session.set_profiling(true);
+        prepare(session);
+        let wall_start = Instant::now();
+        session.step();
+        session.wait();
+        profiled_wall_samples_ms.push(wall_start.elapsed().as_secs_f64() * 1000.0);
+
+        // Blade command encoders retain two command buffers. Reuse the
+        // profiled command buffer after two ordinary submissions to resolve
+        // its query pool without timing two more instrumented executions.
+        session.set_profiling(false);
+        for _ in 0..2 {
+            prepare(session);
+            session.step();
+            session.wait();
+        }
+
+        let timings = session.gpu_timings();
+        if timings.is_empty() {
+            return Err(ProfileError::MissingGpuTimings { sample });
+        }
+        if timings.len() != dispatch_count {
+            return Err(ProfileError::TimingCount {
+                sample,
+                expected: dispatch_count,
+                actual: timings.len(),
+            });
+        }
+
+        let mut total_ms = 0.0;
+        for (index, (name, duration)) in timings.into_iter().enumerate() {
+            let duration_ms = duration.as_secs_f64() * 1000.0;
+            total_ms += duration_ms;
+            timing_samples[index].push(duration_ms);
+            if sample == 0 {
+                timestamp_labels[index] = name;
+            }
+        }
+        gpu_total_samples_ms.push(total_ms);
+    }
+    session.set_profiling(false);
+
+    let plan = session.plan();
+    let pipeline_keys = session.dispatch_pipeline_keys();
+    let loss_dispatch = plan.loss_buffer.and_then(|loss| {
+        plan.dispatches.iter().rposition(|dispatch| {
+            dispatch.output_buffer == loss || dispatch.extra_outputs.contains(&loss)
+        })
+    });
+    let has_backward = !plan.param_grad_pairs.is_empty();
+
+    let phases: Vec<&'static str> = (0..dispatch_count)
+        .map(|index| {
+            if !has_backward
+                || loss_dispatch
+                    .map(|last| index <= last)
+                    // A differentiated plan should always identify its loss.
+                    // If it does not, avoid inventing a backward boundary.
+                    .unwrap_or(true)
+            {
+                "forward"
+            } else {
+                "backward"
+            }
+        })
+        .collect();
+
+    let dispatch_medians: Vec<f64> = timing_samples
+        .iter()
+        .map(|samples| quantile(samples, 0.5))
+        .collect();
+    let dispatch_median_total: f64 = dispatch_medians.iter().sum();
+
+    let mut dispatches = Vec::with_capacity(dispatch_count);
+    for (index, dispatch) in plan.dispatches.iter().enumerate() {
+        let input_buffer_bytes = dispatch
+            .input_buffers
+            .iter()
+            .map(|buffer| plan.buffers[buffer.0 as usize])
+            .sum();
+        let output_buffer_bytes = plan.buffers[dispatch.output_buffer.0 as usize]
+            + dispatch
+                .extra_outputs
+                .iter()
+                .map(|buffer| plan.buffers[buffer.0 as usize])
+                .sum::<usize>();
+        let median_ms = dispatch_medians[index];
+        dispatches.push(DispatchProfile {
+            index,
+            phase: phases[index].to_string(),
+            family: dispatch.profile_family().to_string(),
+            shader: format!("{:?}", dispatch.shader),
+            label: dispatch.label.clone(),
+            timestamp_label: timestamp_labels[index].clone(),
+            pipeline: pipeline_keys[index].clone(),
+            workgroups: dispatch.workgroups,
+            workgroup_count: dispatch
+                .workgroups
+                .iter()
+                .map(|&value| u64::from(value))
+                .product(),
+            input_buffer_bytes,
+            output_buffer_bytes,
+            cooperative: dispatch.use_coop,
+            small_tile: dispatch.use_small_tiles,
+            requires_full_precision: dispatch.requires_full_precision,
+            weight_format: format!("{:?}", dispatch.weight_format),
+            has_prologue: dispatch.matmul_prologue.is_some(),
+            has_epilogue: dispatch.matmul_epilogue.is_some() || !dispatch.epilogue.is_empty(),
+            timing_samples_ms: timing_samples[index].clone(),
+            median_ms,
+            p25_ms: quantile(&timing_samples[index], 0.25),
+            p75_ms: quantile(&timing_samples[index], 0.75),
+            share_of_dispatch_median_sum_pct: percentage(median_ms, dispatch_median_total),
+        });
+    }
+
+    let mut family_indices: BTreeMap<(&str, &str), Vec<usize>> = BTreeMap::new();
+    for dispatch in &dispatches {
+        family_indices
+            .entry((&dispatch.phase, &dispatch.family))
+            .or_default()
+            .push(dispatch.index);
+    }
+    let families = family_indices
+        .into_iter()
+        .map(|((phase, family), indices)| {
+            let timing_samples_ms: Vec<f64> = (0..options.samples)
+                .map(|sample| {
+                    indices
+                        .iter()
+                        .map(|&index| timing_samples[index][sample])
+                        .sum()
+                })
+                .collect();
+            let dispatch_median_sum_ms = indices.iter().map(|&index| dispatch_medians[index]).sum();
+            FamilyProfile {
+                phase: phase.to_string(),
+                family: family.to_string(),
+                dispatch_count: indices.len(),
+                median_ms: quantile(&timing_samples_ms, 0.5),
+                timing_samples_ms,
+                dispatch_median_sum_ms,
+                share_of_dispatch_median_sum_pct: percentage(
+                    dispatch_median_sum_ms,
+                    dispatch_median_total,
+                ),
+            }
+        })
+        .collect();
+
+    let pipeline_statistics = if options.include_pipeline_statistics {
+        let selected_pipelines: BTreeSet<&str> = pipeline_keys.iter().map(String::as_str).collect();
+        session
+            .get_profile_pipeline_statistics()
+            .into_iter()
+            .filter(|entry| selected_pipelines.contains(entry.0.as_str()))
+            .map(|(pipeline, executables)| PipelineProfile {
+                pipeline,
+                executables: executables
+                    .into_iter()
+                    .map(|executable| PipelineExecutableProfile {
+                        name: executable.name,
+                        statistics: executable
+                            .statistics
+                            .into_iter()
+                            .map(|statistic| PipelineStatisticProfile {
+                                name: statistic.name,
+                                description: statistic.description,
+                                value: statistic.value,
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let device = session.device_information();
+    let memory = session.memory_summary();
+    let forward_dispatch_count = phases.iter().filter(|&&phase| phase == "forward").count();
+    let backward_dispatch_count = dispatch_count - forward_dispatch_count;
+    let profiled_wall_median_ms = quantile(&profiled_wall_samples_ms, 0.5);
+    let gpu_total_median_ms = quantile(&gpu_total_samples_ms, 0.5);
+    let timing_contract = if device.driver_name == "Metal" {
+        "Blade hardware counter samples at compute-encoder boundaries; one compute pass per plan dispatch"
+    } else {
+        "Blade hardware timestamp intervals at pass boundaries; one compute pass per plan dispatch; Vulkan top-of-pipe intervals include the inter-pass barrier before the following dispatch"
+    };
+
+    Ok(SessionProfile {
+        schema_version: 1,
+        timing_contract: timing_contract.to_string(),
+        device: ProfileDevice {
+            backend: if device.driver_name == "Metal" {
+                "Metal".to_string()
+            } else {
+                "Vulkan".to_string()
+            },
+            device_name: device.device_name.clone(),
+            driver_name: device.driver_name.clone(),
+            driver_info: device.driver_info.clone(),
+            software_emulated: device.is_software_emulated,
+        },
+        plan: ProfilePlan {
+            dispatch_count,
+            forward_dispatch_count,
+            backward_dispatch_count,
+            barrier_group_count: session.num_groups(),
+            logical_buffer_bytes: memory.total_buffer_bytes,
+            allocated_buffer_bytes: memory.allocated_buffer_bytes,
+            device_local_bytes: memory.device_local_bytes,
+            physical_allocation_count: memory.num_allocations,
+        },
+        measurement: ProfileMeasurement {
+            sample_count: options.samples,
+            unprofiled_median_ms: options.unprofiled_median_ms,
+            profiled_wall_samples_ms,
+            profiled_wall_median_ms,
+            gpu_total_samples_ms,
+            gpu_total_median_ms,
+            instrumentation_wall_ratio: options
+                .unprofiled_median_ms
+                .filter(|&baseline| baseline > 0.0)
+                .map(|baseline| profiled_wall_median_ms / baseline),
+            timestamped_gpu_share_of_profiled_wall_pct: percentage(
+                gpu_total_median_ms,
+                profiled_wall_median_ms,
+            ),
+        },
+        families,
+        dispatches,
+        pipeline_statistics,
+    })
+}
+
+/// Save a structured session profile as pretty-printed JSON.
+pub fn save_session_profile_json(
+    path: impl AsRef<Path>,
+    profile: &SessionProfile,
+) -> std::io::Result<()> {
+    let file = std::fs::File::create(path)?;
+    serde_json::to_writer_pretty(std::io::BufWriter::new(file), profile)
+        .map_err(std::io::Error::other)
+}
+
+fn percentage(part: f64, total: f64) -> f64 {
+    if total > 0.0 {
+        part / total * 100.0
+    } else {
+        0.0
+    }
+}
+
+fn quantile(values: &[f64], q: f64) -> f64 {
+    debug_assert!(!values.is_empty());
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    if sorted.len() == 1 {
+        return sorted[0];
+    }
+    let position = (sorted.len() - 1) as f64 * q;
+    let low = position.floor() as usize;
+    let high = (low + 1).min(sorted.len() - 1);
+    let fraction = position - low as f64;
+    sorted[low] * (1.0 - fraction) + sorted[high] * fraction
 }
 
 // ---- Tracing Layer ----
@@ -436,5 +930,21 @@ mod tests {
         }
         let t2 = now_ns();
         assert!(t2 >= t1);
+    }
+
+    #[test]
+    fn structured_profile_quantiles_interpolate() {
+        let values = [4.0, 1.0, 3.0, 2.0];
+        assert_eq!(quantile(&values, 0.25), 1.75);
+        assert_eq!(quantile(&values, 0.5), 2.5);
+        assert_eq!(quantile(&values, 0.75), 3.25);
+    }
+
+    #[test]
+    fn structured_profile_zero_sample_error_is_actionable() {
+        assert_eq!(
+            ProfileError::ZeroSamples.to_string(),
+            "profile sample count must be positive"
+        );
     }
 }
