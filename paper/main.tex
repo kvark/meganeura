@@ -243,6 +243,18 @@ failure that crosses generated WGSL, Naga, Blade, and a vendor driver is still
 hard to localize. Source mapping, automatic graph bisection, captured
 intermediates, and a single operator replay tool are future work.
 
+\paragraph{Scale of the implementation.}
+``Compact'' is meant as a measurable property rather than a stylistic one.
+The system is 34.0 KLOC of Rust spanning the typed graph, automatic
+differentiation, rewrites, compiler, code generation, memory planner,
+runtime, optimizer, ONNX/NNEF importers, and model builders, plus 6.1 KLOC
+of WGSL across 75 shader files; tests and examples add a further 14.5 KLOC.
+That is the budget within which every result below was produced. It is also
+part of the explanation for them: a kernel library of this size cannot cover
+what a vendor stack covers, so the gaps reported in
+Section~\ref{sec:ablation} are better read as a consequence of scope than as
+a property of the graphics APIs.
+
 \paragraph{Non-goals.}
 \system{} is not a complete replacement for PyTorch, does not cover arbitrary
 dynamic Python programs or distributed training, and does not claim the
@@ -401,6 +413,7 @@ Generated WGSL replaced it with 949 Rust lines and 1,402 WGSL lines, a roughly
 \ref{sec:naga} discusses this negative result.
 
 \subsection{Static execution and memory planning}
+\label{sec:memplan}
 
 Compilation emits a fixed dispatch sequence with explicit logical buffers.
 The runtime groups dispatches at dependency barriers, computes buffer
@@ -550,6 +563,28 @@ checkpoint handoff. \textit{Compile} includes graph construction,
 optimization, and GPU pipeline construction for the measured sessions; model
 download and parameter upload are excluded or reported separately.
 
+\paragraph{Memory.}
+Each result also records GPU memory, and the two engines account for it
+differently enough that every per-phase figure carries an explicit basis
+label. \system{} reports what its execution plan physically allocates after
+lifetime-based aliasing, together with the same plan's logical buffer total;
+PyTorch reports its caching allocator's peak allocated and peak reserved
+bytes. Those quantities are not interchangeable and are never placed in one
+column. The cross-engine figure is per-process device memory, taken from
+\code{VK\_EXT\_memory\_budget} or Metal's current allocated size for
+\system{} and from NVML for PyTorch. It is the comparable one because it is
+reported by the driver rather than by either engine: it includes context,
+pipeline, and staging overhead that neither internal accounting observes,
+and being per-process it is unaffected by an unrelated workload sharing the
+device. A backend that cannot report a figure records it as absent rather
+than as zero.
+
+Two sampling limits accompany every memory cell. \system{} samples at phase
+boundaries rather than continuously within a step, so its per-process figure
+bounds residency from below. PyTorch's phases share one allocator pool
+without releasing it, so each peak includes residency established by earlier
+phases.
+
 To keep qualitative language falsifiable, a valid result is called
 \textit{competitive} only when its median is no more than $2\times$ the
 PyTorch median in the same device, workload, shape, and arithmetic mode.
@@ -661,6 +696,29 @@ Whisper backward execution also passed after the precision repair, with
 0.0228\% total-gradient error. These numbers demonstrate that the paths are
 viable; they are not included in the final table because both source revisions
 were dirty.
+
+\subsection{Memory}
+\label{sec:memory}
+
+Artifact size is only one deployment cost; the memory a workload holds while
+running decides whether it fits on a shared device at all. LlamaWeb treats
+its memory reduction as a headline portability result for exactly this
+reason~\cite{levine2026llamaweb}. The frozen tables therefore report, per
+device, workload, and phase, the quantities defined in
+Section~\ref{sec:method}: \system{}'s planned physical allocation, the same
+plan's logical total, and per-process device memory for both engines.
+
+Two questions follow that the timing tables cannot answer. First, whether
+the compact stack's residency advantage or disadvantage survives once driver
+and context overhead are counted --- a portable stack avoids a vendor
+compute runtime, but a graphics driver is not free either, and only the
+per-process figure settles it. Second, how much the lifetime-based memory
+planner contributes: the gap between the logical and physical plan totals is
+the aliasing saving, and re-running with aliasing disabled turns the design
+described in Section~\ref{sec:memplan} into a measured ablation. Both are
+reported per workload rather than as a single ratio, because the saving
+depends on how much of a graph is step-local intermediate rather than
+parameter, gradient, or optimizer state.
 
 \subsection{Deployment footprint}
 \label{sec:footprint}
@@ -856,6 +914,24 @@ Vulkan and Metal implementations~\cite{maczan2026dispatch}. \system{} instead
 studies native Vulkan/Metal, several model families, and automatically
 differentiated training as well as inference. We do not claim graphics-API
 inference itself as novel.
+
+\paragraph{On-device deployment and training.}
+ExecuTorch is the closest production analogue to the deployment half of this
+work: a PyTorch program is exported once and executed across mobile,
+embedded, and desktop backends without reimplementation, at very large
+deployed scale~\cite{nachin2026executorch}. Its scope is inference. IREE
+similarly compiles a model through MLIR into host scheduling logic and
+device executables, and its Vulkan/SPIR-V path is the closest architectural
+precedent for compiling machine learning to a portable graphics
+API.\footnote{\url{https://github.com/iree-org/iree}} \system{} differs in
+what crosses the deployment boundary rather than in the ambition to cross
+it: the same graph, compiler, memory plan, and runtime also produce the
+backward pass and the optimizer update, so adaptation can occur on the
+deployed device instead of in a separate training stack. Research on
+training within edge budgets approaches the same goal from the algorithm
+side, co-designing quantized sparse updates for microcontroller-class
+memory~\cite{lin2022ondevice}; \system{} retains full-precision reverse-mode
+differentiation and instead asks how much a portable GPU stack can carry.
 
 \paragraph{Tensor graph search.}
 TASO searches verified graph substitutions~\cite{jia2019taso}. egg and egglog
