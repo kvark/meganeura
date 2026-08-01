@@ -39,6 +39,26 @@ pub struct MemorySummary {
     pub device_local_bytes: usize,
 }
 
+/// Per-process GPU memory usage as reported by the graphics API.
+///
+/// This is the only memory figure that is directly comparable against
+/// another engine: unlike [`MemorySummary`], which describes what the
+/// execution plan asked for, this includes driver allocations, pipeline
+/// objects, and staging that the plan does not account for.
+///
+/// The value is scoped to the calling process on both backends, so an
+/// unrelated workload sharing the GPU does not contaminate it.
+#[derive(Clone, Copy, Debug)]
+pub struct DeviceMemoryStats {
+    /// Bytes currently allocated on the device by this process.
+    ///
+    /// Vulkan sums `VK_EXT_memory_budget` heap usage over device-local
+    /// heaps; Metal reports `MTLDevice.currentAllocatedSize`.
+    pub usage_bytes: u64,
+    /// Device-local memory available to this process, per the same query.
+    pub budget_bytes: u64,
+}
+
 impl std::fmt::Display for MemorySummary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -5547,6 +5567,25 @@ impl Session {
             num_allocations: self.alias.sizes.len(),
             device_local_bytes: self.alias.device_local_bytes(),
         }
+    }
+
+    /// Per-process GPU memory usage, or `None` when the backend cannot
+    /// report it.
+    ///
+    /// Vulkan requires `VK_EXT_memory_budget`; a device without it reports
+    /// a zero budget, which is returned as `None` rather than as zero bytes
+    /// so that "unsupported" is never recorded as a measurement.
+    pub fn device_memory_stats(&self) -> Option<DeviceMemoryStats> {
+        let stats = self.gpu.memory_stats();
+        // A supported query always reports a non-zero budget; usage alone
+        // cannot distinguish "nothing allocated" from "not implemented".
+        if stats.budget == 0 {
+            return None;
+        }
+        Some(DeviceMemoryStats {
+            usage_bytes: stats.usage,
+            budget_bytes: stats.budget,
+        })
     }
 
     pub fn plan(&self) -> &ExecutionPlan {
