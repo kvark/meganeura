@@ -2125,8 +2125,19 @@ impl Session {
         // Small-tile selection: use 32×32 tiles when the 64×64 dispatch
         // produces very few workgroups (< 16). The 4× more workgroups from
         // smaller tiles improve occupancy on GPUs with many SMs.
+        //
+        // The threshold is overridable because 16 looks low. A ViT-S/16
+        // attention projection is [201, 384] × [384, 384], which is 24
+        // workgroups — just above the line, and measured at 510 GFLOP/s on
+        // an RTX 3050 against 1381 for the same kernel given 384 workgroups.
+        // Small tiles would also cut the tail waste from m=201: four 64-row
+        // tiles cover 256 rows for 201 useful, seven 32-row tiles cover 224.
         {
             use crate::codegen::ShaderGroup;
+            let min_wgs: u32 = std::env::var("MEGANEURA_SMALL_TILE_BELOW")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(16);
             for dispatch in plan.dispatches.iter_mut() {
                 if dispatch.use_coop
                     || dispatch.use_small_tiles
@@ -2143,7 +2154,7 @@ impl Session {
                         | ShaderGroup::MatMulAT
                         | ShaderGroup::MatMulBT
                 );
-                if has_small && wgs_64 < 16 {
+                if has_small && wgs_64 < min_wgs {
                     dispatch.use_small_tiles = true;
                     // 32×32 tiles → double the WG count in each spatial dimension
                     dispatch.workgroups[0] *= 2;
