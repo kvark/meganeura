@@ -1,8 +1,27 @@
 # Meganeura paper
 
-This directory contains the working arXiv manuscript. The benchmark numbers
-in `main.tex` remain placeholders until Meganeura and Inferena are committed,
-pinned to one another, and rerun on the complete device matrix.
+This directory contains the working arXiv manuscript. The numeric tables in
+`tables/` are generated from the frozen benchmark artifacts in `results/`
+(five devices, five workloads, strict and accelerated modes, all at
+Meganeura `7561a64` / Inferena `7ca9c5c7`; the gap-profile sidecars in
+`results/*/profiles/` record their own revision):
+
+```sh
+python3 mktables.py   # regenerates tables/*.tex, the ratio figure, and facts
+```
+
+The revision pair is preserved as the Inferena tag `paper-arxiv-1`.
+`dinovision-section.tex` is the frozen fragment from
+`kvark/dinovision/experiments`; update it from there, not in place.
+
+Rerun it after refreshing `results/`; every table in `main.tex` updates in
+place. The script also prints the aggregate numbers cited in prose so a text
+sweep can be checked against the artifacts.
+
+`p3hpc/` holds the P3HPC (SC26 workshop) submission: IEEE format
+(vendored `IEEEtran.cls`/`.bst`), single-blind, reuses `../tables/` and
+`../references.bib`. Build the same way from inside that directory.
+Deadline: August 12, 2026.
 
 Build locally with:
 
@@ -29,14 +48,16 @@ podman run --rm -v "$PWD:/paper:Z" -w /paper \
 
 Before submission:
 
-1. populate the strict and practical-default result tables from the frozen
-   device matrix;
-2. generate figures from immutable Inferena JSON artifacts;
-3. add per-dispatch analysis for the two largest frozen gaps;
-4. record clean Meganeura and Inferena revisions in the artifact appendix;
-5. verify every bibliography entry against its primary source;
-6. update the AI-assistance disclosure to match the final workflow;
-7. run arXiv's TeX source checker and inspect the rendered PDF.
+1. ~~populate the strict and practical-default result tables from the frozen
+   device matrix~~ (done — `mktables.py`);
+2. ~~add the Radeon 780M machine~~ (done — full member of the matrix);
+3. ~~add per-dispatch profiles for the largest frozen gaps~~ (done —
+   integrated in the gap-analysis section; optionally recapture the M3
+   Whisper profile at the frozen revision to replace the pre-optimization
+   one);
+4. verify every bibliography entry against its primary source;
+5. update the AI-assistance disclosure to match the final workflow;
+6. run arXiv's TeX source checker and inspect the rendered PDF.
 
 The intended initial submission is a technical preprint, not an anonymous
 conference manuscript. A later systems-conference version can use the same

@@ -1,0 +1,13 @@
+\begin{tabular}{l rrr rrr}
+\toprule
+ & \multicolumn{3}{c}{Training (MiB)} & \multicolumn{3}{c}{Inference (MiB)} \\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}
+Workload & Logical & Phys. & Saved & Logical & Phys. & Saved \\
+\midrule
+SmolLM2-135M & 1974 & 1707 & 14\% & 875 & 742 & 15\% \\
+SmolVLA & 1024 & 978 & 4\% & 596 & 563 & 6\% \\
+Diffusion U-Net & 159 & 118 & 26\% & 121 & 84 & 30\% \\
+ResNet-50 & 1640 & 861 & 48\% & 877 & 283 & 68\% \\
+Whisper-tiny & 978 & 558 & 43\% & 287 & 61 & 79\% \\
+\bottomrule
+\end{tabular}

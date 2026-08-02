@@ -1,0 +1,11 @@
+\begin{tabular}{l l l l l}
+\toprule
+Device & Class & OS & \system{} backend & PyTorch build (backend, mode) \\
+\midrule
+NVIDIA GeForce RTX 5070 & discrete, 12\,GB & Linux & Vulkan, 595.71.05 & 2.13.0+cu130 (CUDA 13.0, compiled) \\
+AMD Radeon RX 7900 XT (RADV) & discrete, 20\,GB & Linux & Vulkan, Mesa 26.0.3 & 2.10.0+rocm7.1 (ROCm 7.1, compiled) \\
+AMD Radeon 780M (RADV) & integrated & Linux & Vulkan, Mesa 25.2.8 & 2.12.0+rocm7.14.0 (ROCm 7.14, compiled) \\
+Intel Graphics (RPL-U) & integrated & Linux & Vulkan, Mesa 26.0.3 & 2.11.0+xpu (CPU, eager) \\
+Apple M3 & unified SoC & macOS 15.7.3 & Metal & 2.11.0 (MPS, eager) \\
+\bottomrule
+\end{tabular}
