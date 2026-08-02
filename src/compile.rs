@@ -841,9 +841,9 @@ fn compile_with_caps_policy(
     if options.use_schedule_reduction {
         fuse_reduction_chains(&mut compiler.plan);
     }
-    // RmsNorm+MatMul prologue fusion is applied later in the runtime,
-    // after coop availability is known — the prologue path currently only
-    // has a coop-matmul implementation. See Session::with_context.
+    // RmsNorm+MatMul prologue fusion is applied later in the runtime, after
+    // per-dispatch coop selection — the prologue path currently only has a
+    // coop-matmul implementation. See Session::with_context.
 
     compiler.plan
 }
@@ -1250,6 +1250,8 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
 /// the matmul via 64-thread tree reduction → 25% regression), this uses
 /// a separate lightweight `RmsNormRsqrt` dispatch, so the matmul prologue
 /// is only two scalar multiplies per A element — essentially free.
+/// Dispatches must already have their runtime `use_coop` decision; scalar
+/// matmuls are deliberately left unchanged.
 pub fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
     use std::collections::HashMap;
 
@@ -1282,14 +1284,18 @@ pub fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
 
     for (i, d) in plan.dispatches.iter().enumerate() {
         // Find MatMul dispatches whose input_buffers[0] comes from a
-        // single-consumer RmsNorm.
-        if !matches!(
-            d.shader,
-            ShaderEntry::MatMul
-                | ShaderEntry::MatMulAT
-                | ShaderEntry::FusedMatMulAdd
-                | ShaderEntry::FusedMatMulATAdd
-        ) {
+        // single-consumer RmsNorm. The scalar pipeline cannot execute a
+        // matmul prologue, so only transform dispatches that runtime policy
+        // has already selected for cooperative matrices.
+        if !d.use_coop
+            || !matches!(
+                d.shader,
+                ShaderEntry::MatMul
+                    | ShaderEntry::MatMulAT
+                    | ShaderEntry::FusedMatMulAdd
+                    | ShaderEntry::FusedMatMulATAdd
+            )
+        {
             continue;
         }
         // Skip GEMV variants (M=1) — those use a different kernel path.
@@ -1349,13 +1355,18 @@ pub fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
         // Modify the matmul: read raw x instead of normalized x.
         plan.dispatches[matmul_idx].input_buffers[0] = x_buf;
 
-        // Attach the prologue: multiply A-elements by rsqrt[gr] and w_norm[tc].
-        plan.dispatches[matmul_idx].matmul_prologue = Some(MatMulPrologue {
-            factors: vec![
-                (rsqrt_buf, PrologueLoadKind::PerRow),
-                (w_norm_buf, PrologueLoadKind::PerKCol),
-            ],
-        });
+        // Attach the prologue: multiply A-elements by rsqrt[gr] and
+        // w_norm[tc]. Also declare both factor buffers as dispatch inputs so
+        // scheduling and memory planning preserve the producer dependency and
+        // lifetime; shader binding still uses the typed prologue metadata.
+        let factors = vec![
+            (rsqrt_buf, PrologueLoadKind::PerRow),
+            (w_norm_buf, PrologueLoadKind::PerKCol),
+        ];
+        plan.dispatches[matmul_idx]
+            .input_buffers
+            .extend(factors.iter().map(|&(buffer, _)| buffer));
+        plan.dispatches[matmul_idx].matmul_prologue = Some(MatMulPrologue { factors });
     }
 
     if !to_fuse.is_empty() {
@@ -1855,18 +1866,31 @@ impl<'a> Compiler<'a> {
 
         // Build param→grad pairs from the trailing grad outputs.
         if num_grads > 0 {
-            let param_names: Vec<String> = self
-                .plan
-                .param_buffers
+            let param_nodes: Vec<&Node> = self
+                .graph
+                .nodes()
                 .iter()
-                .map(|entry| entry.0.clone())
+                .filter(|node| matches!(node.op, Op::Parameter { .. }))
                 .collect();
             assert_eq!(
-                param_names.len(),
+                param_nodes.len(),
                 num_grads,
                 "autodiff must emit one grad output per Parameter",
             );
             for i in 0..num_grads {
+                let grad_node = self.graph.node(outputs[num_user + i]);
+                if grad_node.ty.num_elements() != param_nodes[i].ty.num_elements() {
+                    // Autodiff uses a scalar zero as the positional placeholder
+                    // for a parameter that receives no gradient (for example,
+                    // one behind StopGradient). Do not expose that sentinel as
+                    // a real gradient: optimizers iterate over the parameter's
+                    // full length and would otherwise read past the scalar.
+                    assert!(
+                        matches!(grad_node.op, Op::Constant { ref data } if data == &[0.0]),
+                        "parameter gradient shape mismatch without a zero placeholder",
+                    );
+                    continue;
+                }
                 let param_buf = self.plan.param_buffers[i].1;
                 let grad_buf = self.get_buffer(outputs[num_user + i]);
                 self.plan.param_grad_pairs.push((param_buf, grad_buf));
@@ -3973,7 +3997,10 @@ impl<'a> Compiler<'a> {
             input_buffers: vec![x, w],
             output_buffer: out_buf,
             extra_outputs: vec![],
-            params: vec![rows, cols, 0, 0],
+            // The schedule shader embeds epsilon in its DAG, but retain the
+            // bits in dispatch metadata as well: runtime may rewrite this
+            // dispatch to RmsNormRsqrt for a cooperative matmul prologue.
+            params: vec![rows, cols, eps.to_bits(), 0],
             use_coop: false,
             use_small_tiles: false,
             reduction: Some(kernel),
@@ -4224,6 +4251,54 @@ mod tests {
     }
 
     #[test]
+    fn rmsnorm_prologue_requires_coop_and_declares_factor_reads() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[32, 64]);
+        let w_norm = g.parameter("w_norm", &[64]);
+        let normalized = g.rms_norm(x, w_norm, 1e-5);
+        let projection = g.parameter("projection", &[64, 64]);
+        let output = g.matmul(normalized, projection);
+        g.set_outputs(vec![output]);
+
+        let mut scalar_plan = compile(&g);
+        fuse_rmsnorm_prologues(&mut scalar_plan);
+        assert!(
+            scalar_plan
+                .dispatches
+                .iter()
+                .any(|dispatch| dispatch.shader == ShaderEntry::RmsNorm)
+        );
+        assert!(
+            scalar_plan
+                .dispatches
+                .iter()
+                .all(|dispatch| dispatch.matmul_prologue.is_none())
+        );
+
+        let mut coop_plan = compile(&g);
+        let matmul_index = coop_plan
+            .dispatches
+            .iter()
+            .position(|dispatch| dispatch.shader == ShaderEntry::MatMul)
+            .expect("matmul dispatch");
+        coop_plan.dispatches[matmul_index].use_coop = true;
+        fuse_rmsnorm_prologues(&mut coop_plan);
+
+        let rsqrt = coop_plan
+            .dispatches
+            .iter()
+            .find(|dispatch| dispatch.shader == ShaderEntry::RmsNormRsqrt)
+            .expect("RmsNorm rsqrt dispatch");
+        assert_eq!(rsqrt.params[2], 1e-5f32.to_bits());
+        let matmul = &coop_plan.dispatches[matmul_index];
+        let prologue = matmul.matmul_prologue.as_ref().expect("matmul prologue");
+        assert_eq!(prologue.factors.len(), 2);
+        for &(factor, _) in &prologue.factors {
+            assert!(matmul.input_buffers.contains(&factor));
+        }
+    }
+
+    #[test]
     fn conv1d_emulation_dispatches_flat_spatial_tiles() {
         // Whisper represents its temporal convolutions as H×1 Conv2d. The
         // spatial workgroup axis tiles H*W, rather than tiling W once per H.
@@ -4277,6 +4352,23 @@ mod tests {
         assert_eq!(plan.param_grad_pairs.len(), 1);
         // param buffer and grad buffer should be different
         assert_ne!(plan.param_grad_pairs[0].0, plan.param_grad_pairs[0].1);
+    }
+
+    #[test]
+    fn frozen_parameter_is_excluded_from_param_grad_pairs() {
+        let mut g = Graph::new();
+        let trained = g.parameter("trained", &[8]);
+        let frozen = g.parameter("frozen", &[8]);
+        let frozen = g.stop_gradient(frozen);
+        let sum = g.add(trained, frozen);
+        let loss = g.mean_all(sum);
+        g.set_outputs(vec![loss]);
+
+        let diff = crate::autodiff::differentiate(&g);
+        let plan = compile(&diff);
+        assert_eq!(plan.param_buffers.len(), 2);
+        assert_eq!(plan.param_grad_pairs.len(), 1);
+        assert_eq!(plan.param_grad_pairs[0].0, plan.param_buffers[0].1);
     }
 
     #[test]

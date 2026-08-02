@@ -13,7 +13,7 @@
 //! no-coop hardware (e.g. lavapipe CI) both paths are scalar and the test
 //! trivially passes.
 
-use meganeura::{Graph, build_inference_session};
+use meganeura::{Graph, build_inference_session, build_session};
 use std::sync::Mutex;
 
 static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -53,6 +53,47 @@ fn conv_out(in_c: u32, coop: bool) -> Vec<f32> {
     s.read_output((batch * out_c * hw * hw) as usize)
 }
 
+fn conv_input_grad(coop: bool) -> Vec<f32> {
+    // SAFETY: the caller holds GPU_TEST_LOCK while mutating these
+    // process-global feature switches.
+    unsafe {
+        if coop {
+            std::env::remove_var("MEGANEURA_DISABLE_COOP");
+        } else {
+            std::env::set_var("MEGANEURA_DISABLE_COOP", "1");
+        }
+    }
+
+    // H*W = 196 is not a multiple of the 16-wide f32 cooperative output
+    // tile on Apple Silicon. The grad-input kernel must bounds-check the
+    // partial right edge instead of letting coopStoreT cross NCHW rows.
+    let (batch, channels, hw) = (4u32, 64u32, 14u32);
+    let x_size = (batch * channels * hw * hw) as usize;
+    let k_size = (channels * channels) as usize;
+    let mut g = Graph::new();
+    let x = g.parameter("x", &[x_size]);
+    let k = g.parameter("k", &[k_size]);
+    let y = g.conv2d(x, k, batch, channels, hw, hw, channels, 1, 1, 1, 0);
+    let loss = g.mean_all(y);
+    g.set_outputs(vec![loss]);
+
+    let mut s = build_session(&g);
+    let xd: Vec<f32> = (0..x_size)
+        .map(|i| ((i * 31 % 17) as f32 - 8.0) * 0.01)
+        .collect();
+    let kd: Vec<f32> = (0..k_size)
+        .map(|i| ((i * 13 % 19) as f32 - 9.0) * 0.01)
+        .collect();
+    s.set_parameter("x", &xd);
+    s.set_parameter("k", &kd);
+    s.step();
+    s.wait();
+
+    let mut grad = vec![0.0; x_size];
+    s.read_param_grad("x", &mut grad);
+    grad
+}
+
 #[test]
 fn coop_conv_unaligned_k_matches_scalar() {
     let _guard = GPU_TEST_LOCK.lock().expect("GPU test lock poisoned");
@@ -89,5 +130,21 @@ fn coop_conv_aligned_k_matches_scalar() {
     assert!(
         max_abs < 0.05,
         "coop conv wrong at K=144: max_abs_diff={max_abs}"
+    );
+}
+
+#[test]
+fn coop_conv_grad_input_partial_right_edge_matches_scalar() {
+    let _guard = GPU_TEST_LOCK.lock().expect("GPU test lock poisoned");
+    let scalar = conv_input_grad(false);
+    let coop = conv_input_grad(true);
+    let max_abs = scalar
+        .iter()
+        .zip(&coop)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_abs < 1e-5,
+        "coop grad-input wrong at partial right edge: max_abs_diff={max_abs}"
     );
 }
