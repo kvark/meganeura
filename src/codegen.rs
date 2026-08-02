@@ -2043,12 +2043,38 @@ pub fn coop_caps() -> CoopCaps {
 /// `MEGANEURA_FLASH_EPT_CAP` overrides either default for benchmarking sweeps.
 /// Codegen and dispatch both read this so they agree on tile size.
 pub fn flash_ept_cap() -> u32 {
-    std::env::var("MEGANEURA_FLASH_EPT_CAP")
+    flash_ept_override("MEGANEURA_FLASH_EPT_CAP").unwrap_or(
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            16
+        } else {
+            32
+        },
+    )
+}
+
+fn flash_ept_override(name: &str) -> Option<u32> {
+    std::env::var(name)
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .filter(|v| v.is_power_of_two() && *v >= 2)
+}
+
+/// dQ has fewer live accumulators than fused dK/dV and follows the forward
+/// cap by default. The shared backward override remains useful for sweeps.
+pub fn flash_grad_q_ept_cap() -> u32 {
+    flash_ept_override("MEGANEURA_FLASH_GRAD_Q_EPT_CAP")
+        .or_else(|| flash_ept_override("MEGANEURA_FLASH_BWD_EPT_CAP"))
+        .unwrap_or_else(flash_ept_cap)
+}
+
+/// Fused dK/dV benefits from more threads on Apple Silicon, where reducing
+/// its register-heavy per-thread slice outweighs the extra reductions.
+pub fn flash_grad_kv_ept_cap() -> u32 {
+    flash_ept_override("MEGANEURA_FLASH_GRAD_KV_EPT_CAP")
+        .or_else(|| flash_ept_override("MEGANEURA_FLASH_BWD_EPT_CAP"))
+        .or_else(|| flash_ept_override("MEGANEURA_FLASH_EPT_CAP"))
         .unwrap_or(if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-            16
+            8
         } else {
             32
         })
@@ -3365,8 +3391,8 @@ pub fn generate_flash_grad_q_module(head_dim: u32) -> ShaderModule {
     assert!(head_dim.is_power_of_two() && head_dim >= 2);
 
     let hd = head_dim;
-    // EPT cap via flash_ept_cap() (env-var override + default).
-    let ept: u32 = hd.min(flash_ept_cap());
+    // Backward uses its own cap because these kernels carry more live state.
+    let ept: u32 = hd.min(flash_grad_q_ept_cap());
     let tpq = hd / ept; // threads per query
     let bq: u32 = (256 / tpq).max(1);
     if bq <= 1 {
@@ -3672,10 +3698,10 @@ pub fn generate_flash_grad_kv_module(head_dim: u32) -> ShaderModule {
     assert!(head_dim.is_power_of_two() && head_dim >= 2);
 
     let hd = head_dim;
-    // EPT cap via flash_ept_cap() (env-var override + default).
+    // Backward uses its own cap because these kernels carry more live state.
     // The fused dK+dV kernel reports 210 regs at EPT=32 on Blackwell,
     // so the auto-tune typically chooses a smaller value here.
-    let ept: u32 = hd.min(flash_ept_cap());
+    let ept: u32 = hd.min(flash_grad_kv_ept_cap());
     let tpq = hd / ept; // threads per KV position
     let bkv: u32 = (256 / tpq).max(1);
     if bkv <= 1 {
