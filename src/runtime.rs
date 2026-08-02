@@ -1815,7 +1815,7 @@ pub struct Session {
     /// compute pass. Pass boundaries in blade emit ALL_COMMANDS barriers.
     groups: Vec<std::ops::Range<usize>>,
     encoder: blade_graphics::CommandEncoder,
-    /// How many submissions `step()` splits its dispatches across.
+    /// Caller-selected upper bound on the submissions used by `step()`.
     /// See [`Session::set_submission_chunks`]. Always at least 1.
     submission_chunks: usize,
     sync_point: Option<blade_graphics::SyncPoint>,
@@ -2778,14 +2778,20 @@ impl Session {
         }
     }
 
-    /// Split `step()`'s dispatches across several submissions instead of one.
+    /// Set an upper bound on the submissions used by `step()`.
     ///
-    /// By default the whole plan goes into a single command buffer, which
-    /// occupies the queue for its entire duration. That is ideal when
-    /// meganeura owns the GPU, and poor when it does not: sharing a device
-    /// with a renderer means every frame queues behind the whole inference.
-    /// On a Quest 3S a 135 ms encoder drops a 90 Hz render loop to 15 Hz.
-    /// Splitting into chunks lets the other work interleave.
+    /// By default the whole plan goes into a single command buffer. When the
+    /// queue is shared with another workload, such as a renderer, splitting
+    /// the plan lets that work interleave between submissions without
+    /// dividing the model into independently compiled graphs.
+    ///
+    /// This is a caller-selected scheduling policy, not an automatic tuner.
+    /// Meganeura partitions the compiled plan's ordered barrier groups as
+    /// evenly as possible by group count; it does not estimate their duration
+    /// or observe the latency of other queue users. The requested value is an
+    /// upper bound, since a short plan can produce fewer chunks. Profile the
+    /// end-to-end workload on the target device: extra submissions have CPU
+    /// and driver overhead and can make either workload slower.
     ///
     /// Correctness across the resulting submission boundaries does not need
     /// extra synchronization. Blade ends every command buffer with a
@@ -2794,10 +2800,10 @@ impl Session {
     /// commands submitted to the same queue before and after it — not merely
     /// those in the same command buffer.
     ///
-    /// Costs one extra submit per chunk, and reallocates the command encoder
-    /// so that no command buffer is re-recorded while still in flight. Call
-    /// it once during setup rather than per step. `chunks` is clamped to at
-    /// least 1; 1 restores the single-submission default.
+    /// Reallocates the command encoder so that no command buffer is re-recorded
+    /// while still in flight. Call it once during setup rather than per step.
+    /// `chunks` is clamped to at least 1; 1 restores the single-submission
+    /// default.
     pub fn set_submission_chunks(&mut self, chunks: usize) {
         let chunks = chunks.max(1);
         if chunks == self.submission_chunks {

@@ -1,9 +1,10 @@
 //! Splitting a plan across submissions must not change what it computes.
 //!
-//! `Session::set_submission_chunks` exists so that a co-tenant on the GPU
-//! queue — a renderer, typically — can interleave its work between chunks
-//! instead of waiting behind an entire inference. That only pays off if the
-//! chunk boundaries are as sound as the pass boundaries they replace.
+//! `Session::set_submission_chunks` lets a caller choose an upper bound on
+//! submissions so that a co-tenant on the GPU queue — a renderer, typically
+//! — can interleave its work between chunks instead of waiting behind an
+//! entire inference. That only pays off if the chunk boundaries are as sound
+//! as the pass boundaries they replace.
 //!
 //! The argument for soundness is that blade ends every command buffer with a
 //! conservative global memory barrier, opens each new one assuming an
@@ -43,7 +44,9 @@ fn seed_parameters(session: &mut Session, layers: usize, dim: usize) {
             .map(|k| ((k + i * 7) as f32 * 0.017).sin() * 0.1)
             .collect();
         session.set_parameter(&format!("w{i}"), &w);
-        let b: Vec<f32> = (0..dim).map(|k| ((k + i) as f32 * 0.03).cos() * 0.01).collect();
+        let b: Vec<f32> = (0..dim)
+            .map(|k| ((k + i) as f32 * 0.03).cos() * 0.01)
+            .collect();
         session.set_parameter(&format!("b{i}"), &b);
         session.set_parameter(&format!("ln{i}.w"), &vec![1.0f32; dim]);
         session.set_parameter(&format!("ln{i}.b"), &vec![0.0f32; dim]);
@@ -52,10 +55,13 @@ fn seed_parameters(session: &mut Session, layers: usize, dim: usize) {
 
 fn run(chunks: usize, layers: usize, rows: usize, dim: usize, steps: usize) -> Vec<f32> {
     let g = build_chain(layers, rows, dim);
-    let (mut session, _) = meganeura::train::build(&g, SessionConfig {
-        mode: Mode::Inference,
-        ..Default::default()
-    });
+    let (mut session, _) = meganeura::train::build(
+        &g,
+        SessionConfig {
+            mode: Mode::Inference,
+            ..Default::default()
+        },
+    );
     session.set_submission_chunks(chunks);
     seed_parameters(&mut session, layers, dim);
 
@@ -90,11 +96,12 @@ fn chunked_submission_matches_single_submission() {
     );
     // A chain of layer norms should not collapse to a constant, or the
     // comparison below would pass for the wrong reason.
-    let spread = reference
-        .iter()
-        .fold(f32::NEG_INFINITY, |a, &b| a.max(b))
+    let spread = reference.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b))
         - reference.iter().fold(f32::INFINITY, |a, &b| a.min(b));
-    assert!(spread > 0.1, "reference output is nearly constant: {spread}");
+    assert!(
+        spread > 0.1,
+        "reference output is nearly constant: {spread}"
+    );
 
     for chunks in [2, 3, 5, 16] {
         let got = run(chunks, LAYERS, ROWS, DIM, STEPS);
