@@ -1,0 +1,42 @@
+\begin{tabular}{l rrr rrr rrr}
+\toprule
+ & \multicolumn{3}{c}{Full / prefill (ms)} & \multicolumn{3}{c}{Minimal / one-token (ms)} & \multicolumn{3}{c}{F+L+B (ms)} \\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}\cmidrule(lr){8-10}
+Workload & Ours & PT & $\times$ & Ours & PT & $\times$ & Ours & PT & $\times$ \\
+\midrule
+\multicolumn{10}{l}{\textbf{NVIDIA GeForce RTX 5070} --- \system{} Vulkan vs.\ PyTorch CUDA, compiled} \\
+SmolLM2-135M & 9.90 & 3.45 & 2.87 & 2.86 & 3.22 & \textbf{0.89} & 44.28 & 11.21 & 3.95 \\
+SmolVLA & 4.45 & 1.72 & 2.59 & 1.80 & 1.45 & 1.24 & 13.02 & 5.75 & 2.26 \\
+Diffusion U-Net & 2.18 & 1.72 & 1.27 & 2.28 & 1.74 & 1.31 & 10.26 & 6.08 & 1.69 \\
+ResNet-50 & 7.29 & 2.64 & 2.76 & 4.67 & 1.60 & 2.91 & 36.77 & 7.94 & 4.63 \\
+Whisper-tiny & 4.91 & 2.81 & 1.75 & 4.91 & 2.81 & 1.75 & 29.14 & 10.47 & 2.78 \\
+\midrule
+\multicolumn{10}{l}{\textbf{AMD Radeon RX 7900 XT} --- \system{} Vulkan vs.\ PyTorch ROCm, compiled} \\
+SmolLM2-135M & 9.77 & 9.86 & \textbf{0.99} & 1.96 & 6.69 & \textbf{0.29} & 38.14 & 32.84 & 1.16 \\
+SmolVLA & 3.82 & 4.56 & \textbf{0.84} & 1.38 & 3.96 & \textbf{0.35} & 9.59 & 12.71 & \textbf{0.75} \\
+Diffusion U-Net & 2.13 & 2.36 & \textbf{0.90} & 2.10 & 2.36 & \textbf{0.89} & 7.84 & 8.77 & \textbf{0.89} \\
+ResNet-50 & 6.62 & 3.68 & 1.80 & 4.23 & 3.46 & 1.22 & 38.62 & 16.18 & 2.39 \\
+Whisper-tiny & 4.78 & 6.32 & \textbf{0.76} & 4.79 & 6.49 & \textbf{0.74} & 23.60 & 28.02 & \textbf{0.84} \\
+\midrule
+\multicolumn{10}{l}{\textbf{AMD Radeon 780M} --- \system{} Vulkan vs.\ PyTorch ROCm, compiled} \\
+SmolLM2-135M & 31.42 & 56.65 & \textbf{0.55} & 14.69 & 19.45 & \textbf{0.76} & 151 & 169 & \textbf{0.90} \\
+SmolVLA & 19.27 & 22.36 & \textbf{0.86} & 11.09 & 14.20 & \textbf{0.78} & 55.15 & 58.19 & \textbf{0.95} \\
+Diffusion U-Net & 11.36 & 5.65 & 2.01 & 11.16 & 4.73 & 2.36 & 19.77 & 12.41 & 1.59 \\
+ResNet-50 & 78.75 & 41.44 & 1.90 & 22.49 & 10.84 & 2.07 & 207 & 132 & 1.57 \\
+Whisper-tiny & 52.41 & 69.73 & \textbf{0.75} & 52.34 & 69.86 & \textbf{0.75} & 231 & 186 & 1.24$^\dagger$ \\
+\midrule
+\multicolumn{10}{l}{\textbf{Intel Graphics (RPL-U)} --- \system{} Vulkan vs.\ PyTorch CPU fallback, eager} \\
+SmolLM2-135M & 162 & 302 & \textbf{0.54} & 22.97 & 25.70 & \textbf{0.89} & 859 & 968 & \textbf{0.89} \\
+SmolVLA & 59.02 & 101 & \textbf{0.59} & 18.91 & 25.24 & \textbf{0.75} & 222 & 323 & \textbf{0.69} \\
+Diffusion U-Net & 18.25 & 36.21 & \textbf{0.50} & 18.73 & 31.28 & \textbf{0.60} & 74.24 & 84.64 & \textbf{0.88} \\
+ResNet-50 & 169 & 283 & \textbf{0.60} & 43.93 & 80.91 & \textbf{0.54} & 731 & 853 & \textbf{0.86} \\
+Whisper-tiny & 194 & 312 & \textbf{0.62} & 195 & 295 & \textbf{0.66} & 1269 & 912 & 1.39 \\
+\midrule
+\multicolumn{10}{l}{\textbf{Apple M3} --- \system{} Metal vs.\ PyTorch MPS, eager} \\
+SmolLM2-135M & 41.22 & 31.09 & 1.33 & 7.49 & 11.81 & \textbf{0.63} & 189 & 94.54 & 2.00 \\
+SmolVLA & 20.07 & 11.49 & 1.75 & 5.45 & 7.84 & \textbf{0.69} & 59.89 & 29.06 & 2.06 \\
+Diffusion U-Net & 6.80 & 7.44 & \textbf{0.91} & 6.80 & 7.58 & \textbf{0.90} & 24.56 & 20.13 & 1.22 \\
+ResNet-50 & 50.52 & 34.38 & 1.47 & 16.06 & 10.33 & 1.55 & 216 & 93.28 & 2.32 \\
+Whisper-tiny & 58.55 & 39.58 & 1.48 & 58.51 & 39.74 & 1.47 & 274 & 97.34 & 2.82 \\
+\bottomrule
+\end{tabular}
