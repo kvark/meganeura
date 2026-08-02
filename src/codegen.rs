@@ -2038,16 +2038,20 @@ pub fn coop_caps() -> CoopCaps {
 }
 
 /// Single tunable cap on elements-per-thread for flash codegen.
-/// Default 32 keeps register count below the spilling cliff on
-/// Ampere/Blackwell. `MEGANEURA_FLASH_EPT_CAP` overrides for
-/// benchmarking sweeps. Codegen and dispatch both read this so they
-/// agree on tile size.
+/// Apple Silicon benefits from the extra parallelism at 16, while 32 keeps
+/// register count below the spilling cliff on Ampere/Blackwell.
+/// `MEGANEURA_FLASH_EPT_CAP` overrides either default for benchmarking sweeps.
+/// Codegen and dispatch both read this so they agree on tile size.
 pub fn flash_ept_cap() -> u32 {
     std::env::var("MEGANEURA_FLASH_EPT_CAP")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .filter(|v| v.is_power_of_two() && *v >= 2)
-        .unwrap_or(32)
+        .unwrap_or(if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            16
+        } else {
+            32
+        })
 }
 
 pub fn generate_flash_attention_module(head_dim: u32) -> ShaderModule {
@@ -3900,6 +3904,41 @@ fn gen_conv2d_gemm_coop_wgsl(config: &CoopConfig) -> ShaderModule {
     let coop_ab = format!("coop_mat{}x{}<{},A>", tile, tile, ab_type);
     let coop_ba = format!("coop_mat{}x{}<{},B>", tile, tile, ab_type);
     let coop_c = format!("coop_mat{}x{}<f32,C>", tile, tile);
+    let use_vec4 = tile >= 16;
+
+    let staging_vars = if use_vec4 {
+        "let v4_row = lid.x >> 2u;\n    let v4_col = (lid.x & 3u) << 2u;"
+    } else {
+        ""
+    };
+    let mut weight_stage_0 = String::new();
+    emit_forward_weight_stage(
+        &mut weight_stage_0,
+        "shared_b0",
+        "tile_row",
+        false,
+        tile,
+        use_vec4,
+        staging_iters,
+        row_stride,
+        cast_open,
+        cast_close,
+        elem_zero,
+    );
+    let mut weight_stage_1 = String::new();
+    emit_forward_weight_stage(
+        &mut weight_stage_1,
+        "shared_b1",
+        "tile_row",
+        true,
+        tile,
+        use_vec4,
+        staging_iters,
+        row_stride,
+        cast_open,
+        cast_close,
+        elem_zero,
+    );
 
     let acc_init = format!(
         "var acc00 = {coop_c}();\n\
@@ -3935,6 +3974,9 @@ fn gen_conv2d_gemm_coop_wgsl(config: &CoopConfig) -> ShaderModule {
             ("$COOP_AB", &coop_ab),
             ("$COOP_BA", &coop_ba),
             ("$ACC_INIT", &acc_init),
+            ("$WEIGHT_STAGING_VARS", staging_vars),
+            ("$WEIGHT_STAGE_0", &weight_stage_0),
+            ("$WEIGHT_STAGE_1", &weight_stage_1),
         ],
     );
     parse_wgsl(&src)
@@ -4112,6 +4154,7 @@ pub fn generate_conv2d_coop_module(
     let row_stride = wg_size / tile;
     let tile_mask = tile - 1;
     let tile_shift = tile.trailing_zeros();
+    let use_vec4 = tile >= 16;
 
     let (elem_type, enable_f16, elem_zero, cast_open, cast_close) = if config.use_f16_input {
         ("f16", "enable f16;\n", "f16(0.0)", "f16(", ")")
@@ -4271,8 +4314,10 @@ pub fn generate_conv2d_coop_module(
         let _ = writeln!(src, "    let src_col = lid.x & {tile_mask}u;");
         let _ = writeln!(src, "    let base_row = lid.x >> {tile_shift}u;");
     } else {
-        src.push_str("    let v4_row = lid.x >> 2u;\n");
-        src.push_str("    let v4_col = (lid.x & 3u) << 2u;\n");
+        if use_vec4 {
+            src.push_str("    let v4_row = lid.x >> 2u;\n");
+            src.push_str("    let v4_col = (lid.x & 3u) << 2u;\n");
+        }
         let _ = writeln!(src, "    let src_col = lid.x & {tile_mask}u;");
         let _ = writeln!(src, "    let base_row = lid.x >> {tile_shift}u;");
     }
@@ -4366,6 +4411,9 @@ pub fn generate_conv2d_coop_module(
             "tile_row",
             false,
             tile,
+            use_vec4,
+            staging_iters,
+            row_stride,
             cast_open,
             cast_close,
             elem_zero,
@@ -4378,6 +4426,9 @@ pub fn generate_conv2d_coop_module(
             "tile_row",
             true,
             tile,
+            use_vec4,
+            staging_iters,
+            row_stride,
             cast_open,
             cast_close,
             elem_zero,
@@ -4457,16 +4508,70 @@ pub fn generate_conv2d_coop_module(
         src,
         "    // Store results to {store_comment} in NCHW layout"
     );
-    src.push_str("    coopStoreT(acc00, &dst[c00], n_total);\n");
-    src.push_str("    if n1_valid {\n");
-    src.push_str("        coopStoreT(acc01, &dst[c01], n_total);\n");
-    src.push_str("    }\n");
-    src.push_str("    if m1_valid {\n");
-    src.push_str("        coopStoreT(acc10, &dst[c10], n_total);\n");
-    src.push_str("    }\n");
-    src.push_str("    if n1_valid && m1_valid {\n");
-    src.push_str("        coopStoreT(acc11, &dst[c11], n_total);\n");
-    src.push_str("    }\n");
+    if config.use_f16_input || !backward {
+        // Forward and f16 cooperative kernels retain the direct-store
+        // alignment requirement enforced by runtime selection.
+        src.push_str("    coopStoreT(acc00, &dst[c00], n_total);\n");
+        src.push_str("    if n1_valid {\n");
+        src.push_str("        coopStoreT(acc01, &dst[c01], n_total);\n");
+        src.push_str("    }\n");
+        src.push_str("    if m1_valid {\n");
+        src.push_str("        coopStoreT(acc10, &dst[c10], n_total);\n");
+        src.push_str("    }\n");
+        src.push_str("    if n1_valid && m1_valid {\n");
+        src.push_str("        coopStoreT(acc11, &dst[c11], n_total);\n");
+        src.push_str("    }\n");
+    } else {
+        // A direct cooperative store at a partial right edge crosses the
+        // logical NCHW row boundary. Full column tiles keep the fast path;
+        // only the final partial workgroup stages through the now-dead f32
+        // input tiles and performs bounds-checked scalar stores.
+        let _ = writeln!(src, "    if (tile_col + {output_tile}u) <= n_total {{");
+        src.push_str("        coopStoreT(acc00, &dst[c00], n_total);\n");
+        src.push_str("        coopStoreT(acc01, &dst[c01], n_total);\n");
+        src.push_str("        if m1_valid {\n");
+        src.push_str("            coopStoreT(acc10, &dst[c10], n_total);\n");
+        src.push_str("            coopStoreT(acc11, &dst[c11], n_total);\n");
+        src.push_str("        }\n");
+        src.push_str("    } else {\n");
+        let _ = writeln!(src, "        coopStoreT(acc00, &shared_b0[0], {tile}u);");
+        let _ = writeln!(src, "        coopStoreT(acc01, &shared_b1[0], {tile}u);");
+        let _ = writeln!(src, "        coopStoreT(acc10, &shared_a0[0], {tile}u);");
+        let _ = writeln!(src, "        coopStoreT(acc11, &shared_a1[0], {tile}u);");
+        src.push_str("        workgroupBarrier();\n");
+        let _ = writeln!(
+            src,
+            "        for (var flat = lid.x; flat < {shared_size}u; flat += 64u) {{"
+        );
+        let _ = writeln!(src, "            let local_row = flat >> {tile_shift}u;");
+        let _ = writeln!(src, "            let local_col = flat & {tile_mask}u;");
+        src.push_str("            let row0 = tile_row + local_row;\n");
+        src.push_str("            let col0 = tile_col + local_col;\n");
+        src.push_str("            if row0 < m_total && col0 < n_total {\n");
+        src.push_str(
+            "                dst[n * m_total * n_total + row0 * n_total + col0] = shared_b0[flat];\n",
+        );
+        src.push_str("            }\n");
+        let _ = writeln!(src, "            let col1 = col0 + {tile}u;");
+        src.push_str("            if row0 < m_total && col1 < n_total {\n");
+        src.push_str(
+            "                dst[n * m_total * n_total + row0 * n_total + col1] = shared_b1[flat];\n",
+        );
+        src.push_str("            }\n");
+        let _ = writeln!(src, "            let row1 = row0 + {tile}u;");
+        src.push_str("            if row1 < m_total && col0 < n_total {\n");
+        src.push_str(
+            "                dst[n * m_total * n_total + row1 * n_total + col0] = shared_a0[flat];\n",
+        );
+        src.push_str("            }\n");
+        src.push_str("            if row1 < m_total && col1 < n_total {\n");
+        src.push_str(
+            "                dst[n * m_total * n_total + row1 * n_total + col1] = shared_a1[flat];\n",
+        );
+        src.push_str("            }\n");
+        src.push_str("        }\n");
+        src.push_str("    }\n");
+    }
     src.push_str("}\n");
 
     parse_wgsl(&src)
@@ -4639,9 +4744,12 @@ fn emit_grad_input_weight_stage(
     src.push_str("        }\n\n");
 }
 
-/// Emit the vec4 weight staging for forward direction.
+/// Emit weight staging for the forward direction.
 ///
-/// Weight is stored as dense [Co, K] row-major with vec4 loads.
+/// Weight is stored as dense [Co, K] row-major. Tiles of at least 16 use
+/// vec4 loads; an 8x8 tile has only 64 shared elements, so each of the 64
+/// threads stages one scalar instead. Mapping an 8x8 tile with the vec4
+/// layout would address it as 16 rows by 16 columns and write out of bounds.
 #[allow(clippy::too_many_arguments)]
 fn emit_forward_weight_stage(
     src: &mut String,
@@ -4649,11 +4757,47 @@ fn emit_forward_weight_stage(
     tile_row_expr: &str,
     is_second_block: bool,
     tile: u32,
+    use_vec4: bool,
+    staging_iters: u32,
+    row_stride: u32,
     cast_open: &str,
     cast_close: &str,
     _elem_zero: &str,
 ) {
     use std::fmt::Write;
+
+    let row_offset = if is_second_block {
+        format!("{tile_row_expr} + {tile}u + ")
+    } else {
+        format!("{tile_row_expr} + ")
+    };
+
+    if !use_vec4 {
+        src.push_str("        {\n");
+        src.push_str("            let tc = t + src_col;\n");
+        src.push_str("            let in_k = tc < k_total;\n");
+        let _ = writeln!(
+            src,
+            "            for (var e = 0u; e < {staging_iters}u; e++) {{"
+        );
+        src.push_str("                let flat = lid.x + e * 64u;\n");
+        let _ = writeln!(
+            src,
+            "                let gr = {row_offset}base_row + e * {row_stride}u;"
+        );
+        src.push_str("                var val = zero_val;\n");
+        src.push_str("                if gr < m_total && in_k {\n");
+        src.push_str("                    let idx = gr * k_total + tc;\n");
+        let _ = writeln!(
+            src,
+            "                    val = {cast_open}weight[idx >> 2u][idx & 3u]{cast_close};"
+        );
+        src.push_str("                }\n");
+        let _ = writeln!(src, "                {shared_name}[flat] = val;");
+        src.push_str("            }\n");
+        src.push_str("        }\n\n");
+        return;
+    }
 
     src.push_str("        {\n");
     let row_offset = if is_second_block {
@@ -5540,10 +5684,16 @@ mod tests {
 
         let coop_caps = Capabilities::COOPERATIVE_MATRIX | Capabilities::SHADER_FLOAT16;
         let flags = ValidationFlags::all() ^ ValidationFlags::BINDINGS;
-        let config = CoopConfig {
-            tile_size: 16,
-            use_f16_input: true,
-        };
+        let configs = [
+            CoopConfig {
+                tile_size: 8,
+                use_f16_input: false,
+            },
+            CoopConfig {
+                tile_size: 16,
+                use_f16_input: true,
+            },
+        ];
 
         // Test several kernel configs x direction combinations
         let cases = [
@@ -5557,15 +5707,38 @@ mod tests {
             (7, 7, 2, Conv2dCoopDirection::Forward),
         ];
 
-        for &(kh, kw, stride, direction) in &cases {
-            let sm = generate_conv2d_coop_module(kh, kw, stride, direction, &config);
-            let mut validator = Validator::new(flags, coop_caps);
-            let result = validator.validate(&sm.module);
-            assert!(
-                result.is_ok(),
-                "Conv2d coop gen ({kh}x{kw} s{stride} {direction:?}) failed validation: {:?}",
-                result.err()
-            );
+        for config in configs {
+            let template = generate_coop_module(ShaderGroup::Conv2dGemmCoop, &config);
+            Validator::new(flags, coop_caps)
+                .validate(&template.module)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "Conv2d coop template (tile {}) failed validation: {error:?}",
+                        config.tile_size
+                    )
+                });
+            if config.tile_size == 8 {
+                assert!(!template.source.contains("v4_row"));
+                assert!(template.source.contains("let flat = lid.x + e * 64u"));
+            }
+
+            for &(kh, kw, stride, direction) in &cases {
+                let sm = generate_conv2d_coop_module(kh, kw, stride, direction, &config);
+                let mut validator = Validator::new(flags, coop_caps);
+                let result = validator.validate(&sm.module);
+                assert!(
+                    result.is_ok(),
+                    "Conv2d coop gen (tile {} {kh}x{kw} s{stride} {direction:?}) failed validation: {:?}",
+                    config.tile_size,
+                    result.err()
+                );
+                if !config.use_f16_input && direction == Conv2dCoopDirection::GradInput {
+                    assert!(sm.source.contains(") <= n_total {"));
+                    assert!(sm.source.contains("shared_b0[flat]"));
+                } else {
+                    assert!(!sm.source.contains(") <= n_total {"));
+                }
+            }
         }
     }
 

@@ -507,12 +507,23 @@ mod tests {
 
         let (plan, _) = compile_training_graph(&g);
 
-        assert_eq!(plan.param_buffers.len(), plan.param_grad_pairs.len());
+        // The original gate/up buffers remain loadable sources for the
+        // derived packed parameter, but their consumers were replaced before
+        // autodiff and they must not receive scalar placeholder gradients.
+        assert_eq!(plan.param_buffers.len(), 4);
+        assert_eq!(plan.param_grad_pairs.len(), 2);
         assert!(
             plan.param_buffers
                 .iter()
                 .any(|buffer| buffer.0 == "gate+up")
         );
+        let trained: Vec<&str> = plan
+            .param_buffers
+            .iter()
+            .filter(|entry| plan.param_grad_pairs.iter().any(|pair| pair.0 == entry.1))
+            .map(|entry| entry.0.as_str())
+            .collect();
+        assert_eq!(trained, ["down", "gate+up"]);
     }
 
     #[test]

@@ -2160,15 +2160,6 @@ impl Session {
 
         let mut plan = plan;
 
-        // RmsNorm+MatMul prologue fusion: only safe when coop matmuls are
-        // available, since the prologue path (global reads + shared cache
-        // of PerRow factors) is currently only wired up in the coop
-        // shader (see matmul_prologue_to_wgsl + prologue_map). Without
-        // coop, fusing would silently drop the rsqrt×w_norm multiplies.
-        if coop_config.is_some() {
-            crate::compile::fuse_rmsnorm_prologues(&mut plan);
-        }
-
         // Mark individual dispatches for coop and recompute their workgroups.
         // Unlike the old all-or-nothing policy, each dispatch is independently
         // evaluated. Pipelines now stores both scalar and coop variants.
@@ -2296,10 +2287,16 @@ impl Session {
                 let vec4_ok = match group {
                     ShaderGroup::MatMulBT => store_ok,
                     ShaderGroup::MatMulAT => store_ok,
+                    ShaderGroup::Conv2dGradInputGemm => {
+                        // Generated f32 grad-input kernels stage a partial
+                        // right-edge tile through shared memory for
+                        // bounds-checked stores. f16 kernels retain the
+                        // direct-store alignment gate.
+                        (!config.use_f16_input || store_ok) && k >= 4
+                    }
+                    ShaderGroup::Conv2dGemm => store_ok && k >= 4,
                     ShaderGroup::MatMul
                     | ShaderGroup::MatMulAdd
-                    | ShaderGroup::Conv2dGemm
-                    | ShaderGroup::Conv2dGradInputGemm
                     | ShaderGroup::FusedRmsNormMatMul => store_ok && k >= 4,
                     _ => true,
                 };
@@ -2340,6 +2337,13 @@ impl Session {
                 }
             }
         }
+
+        // Apply RmsNorm+MatMul prologue fusion only after per-dispatch coop
+        // selection. A coop-capable device can still route small matmuls to a
+        // scalar pipeline, which has no prologue implementation. The fusion
+        // pass filters on `use_coop` and records its factor buffers as declared
+        // inputs for scheduling and memory planning.
+        crate::compile::fuse_rmsnorm_prologues(&mut plan);
 
         // Small-tile selection: use 32×32 tiles when the 64×64 dispatch
         // produces very few workgroups (< 16). The 4× more workgroups from

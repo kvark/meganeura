@@ -61,8 +61,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     $ACC_INIT
 
     // Hoisted staging index components
-    let v4_row = lid.x >> 2u;
-    let v4_col = (lid.x & 3u) << 2u;
+    $WEIGHT_STAGING_VARS
     let src_col = lid.x & $TILE_MASK_U;
     let base_row = lid.x >> $TILE_SHIFT_U;
 
@@ -72,44 +71,10 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
 
         let zero_val = $ELEM_ZERO;
 
-        // Stage sb0: A-tile weight[Co, K] → shared_b0
-        // Vec4 staging: weight is dense [Co, K] row-major
-        {
-            let gr = tile_row + v4_row;
-            let tc4 = t + v4_col;
-            let flat = v4_row * $TILE_SIZE_U + v4_col;
-            if gr < m_total && (tc4 + 4u) <= k_total {
-                let v = weight[(gr * k_total + tc4) >> 2u];
-                shared_b0[flat] = $CAST_OPEN v.x $CAST_CLOSE;
-                shared_b0[flat + 1u] = $CAST_OPEN v.y $CAST_CLOSE;
-                shared_b0[flat + 2u] = $CAST_OPEN v.z $CAST_CLOSE;
-                shared_b0[flat + 3u] = $CAST_OPEN v.w $CAST_CLOSE;
-            } else {
-                shared_b0[flat] = zero_val;
-                shared_b0[flat + 1u] = zero_val;
-                shared_b0[flat + 2u] = zero_val;
-                shared_b0[flat + 3u] = zero_val;
-            }
-        }
-
-        // Stage sb1: A-tile second row block [Co+TILE, K]
-        {
-            let gr = (tile_row + $TILE_SIZE_U) + v4_row;
-            let tc4 = t + v4_col;
-            let flat = v4_row * $TILE_SIZE_U + v4_col;
-            if gr < m_total && (tc4 + 4u) <= k_total {
-                let v = weight[(gr * k_total + tc4) >> 2u];
-                shared_b1[flat] = $CAST_OPEN v.x $CAST_CLOSE;
-                shared_b1[flat + 1u] = $CAST_OPEN v.y $CAST_CLOSE;
-                shared_b1[flat + 2u] = $CAST_OPEN v.z $CAST_CLOSE;
-                shared_b1[flat + 3u] = $CAST_OPEN v.w $CAST_CLOSE;
-            } else {
-                shared_b1[flat] = zero_val;
-                shared_b1[flat + 1u] = zero_val;
-                shared_b1[flat + 2u] = zero_val;
-                shared_b1[flat + 3u] = zero_val;
-            }
-        }
+        // Stage A-tile weights [Co, K]. The generated fragments use one
+        // scalar per thread for 8x8 tiles and vec4 loads for 16x16 tiles.
+        $WEIGHT_STAGE_0
+        $WEIGHT_STAGE_1
 
         // Stage sa0: B-tile im2col(input)[K, oH*oW] → shared_a0
         // Scalar staging: im2col requires index decomposition
