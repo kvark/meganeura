@@ -10,7 +10,7 @@ description = "E-graph optimized neural network training on Blade"
 license = "MIT"
 
 [dependencies]
-blade-graphics = { version = "0.8.4", git = "https://github.com/kvark/blade", rev = "675dc40115a2921c8169a61244971cc41f133a5a" }
+blade-graphics = { version = "0.8.4", git = "https://github.com/kvark/blade", rev = "19f787080c3034a81c1030554c1b33daacf3066d" }
 blade-macros = "0.3"
 egglog = "2.0"
 bytemuck = { version = "1", features = ["derive"] }
