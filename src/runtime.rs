@@ -2167,6 +2167,14 @@ impl Session {
             use crate::codegen::ShaderGroup;
             let output_tile = config.output_tile();
             let _half_tile = config.tile_size;
+            // Apple's native 8x8 f32 cooperative matrix path is useful for
+            // compact GEMMs, but loses to the scalar tiled kernels once a
+            // dimension grows beyond 1024. Its forward convolution staging
+            // is also slower than the scalar im2col path; grad-input remains
+            // profitable and is selected independently below.
+            let apple_f32_coop = cfg!(all(target_os = "macos", target_arch = "aarch64"))
+                && !config.use_f16_input
+                && config.tile_size == 8;
             for dispatch in &mut plan.dispatches {
                 // Autodiff marks derivative work as f32-sensitive. NVIDIA's
                 // TF32 keeps the f32 exponent range, but our portable f16
@@ -2233,6 +2241,19 @@ impl Session {
                     // rsqrt prologue is too slow vs the 256-thread scalar shader.
                     _ => continue,
                 };
+                if apple_f32_coop
+                    && (matches!(group, ShaderGroup::Conv2dGemm)
+                        || (matches!(
+                            group,
+                            ShaderGroup::MatMul
+                                | ShaderGroup::MatMulAdd
+                                | ShaderGroup::MatMulAT
+                                | ShaderGroup::MatMulBT
+                                | ShaderGroup::FusedRmsNormMatMul
+                        ) && m.max(n).max(k) > 1024))
+                {
+                    continue;
+                }
                 let coop_wgs = m.div_ceil(output_tile) * n.div_ceil(output_tile) * batch;
                 // Conv2d backward GEMM has all-scalar staging with heavy im2col
                 // decomposition (integer division), and only 64 threads vs 256

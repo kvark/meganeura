@@ -1676,9 +1676,7 @@ impl<'a> Compiler<'a> {
                 [q_seq.div_ceil(16), num_heads, 1],
             );
         }
-        // EPT (elements per thread) must match codegen — both
-        // `attention_dispatch{,_bwd}` and the codegen functions read
-        // `crate::codegen::flash_ept_cap()` (env-var override or default).
+        // EPT (elements per thread) must match forward codegen.
         let ept = head_dim.min(crate::codegen::flash_ept_cap());
         let tpq = head_dim / ept; // threads per query
         let bq = (256 / tpq).max(1);
@@ -1698,8 +1696,9 @@ impl<'a> Compiler<'a> {
         q_seq: u32,
         head_dim: u32,
         num_heads: u32,
+        ept_cap: u32,
     ) -> (ShaderEntry, [u32; 3]) {
-        let ept = head_dim.min(crate::codegen::flash_ept_cap());
+        let ept = head_dim.min(ept_cap);
         let tpq = head_dim / ept;
         let bq = (256 / tpq).max(1);
         if bq >= 2 && q_seq >= bq {
@@ -2189,14 +2188,15 @@ impl<'a> Compiler<'a> {
             }
 
             Op::SumRows => {
-                // [M, N] → [N]: one thread per column, loops over M rows
+                // [M, N] → [N]: one workgroup per 32-column tile; eight
+                // row lanes cooperate on each column.
                 let input = self.get_buffer(node.inputs[0]);
                 let in_shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let m = in_shape[0] as u32;
                 let n = in_shape[1] as u32;
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::SumRows,
-                    workgroups: [n.div_ceil(256), 1, 1],
+                    workgroups: [n.div_ceil(32), 1, 1],
                     input_buffers: vec![input],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
@@ -3456,8 +3456,12 @@ impl<'a> Compiler<'a> {
                         [q_seq.div_ceil(16), num_heads, 1],
                     )
                 } else {
-                    let (raw_shader, wgs) =
-                        Self::attention_dispatch_bwd(q_seq, head_dim, num_heads);
+                    let (raw_shader, wgs) = Self::attention_dispatch_bwd(
+                        q_seq,
+                        head_dim,
+                        num_heads,
+                        crate::codegen::flash_grad_q_ept_cap(),
+                    );
                     let mapped = match raw_shader {
                         ShaderEntry::FlashAttention => ShaderEntry::FlashGradQ,
                         _ => ShaderEntry::MultiHeadAttnGradQ,
@@ -3526,8 +3530,12 @@ impl<'a> Compiler<'a> {
                     head_dim,
                     window_size,
                 ];
-                let (grad_kv_shader, grad_kv_wgs) =
-                    Self::attention_dispatch_bwd(dispatch_kv, head_dim, num_kv_heads);
+                let (grad_kv_shader, grad_kv_wgs) = Self::attention_dispatch_bwd(
+                    dispatch_kv,
+                    head_dim,
+                    num_kv_heads,
+                    crate::codegen::flash_grad_kv_ept_cap(),
+                );
                 // See GradQ above: reduced-input precision in backward is an
                 // experimental opt-in until its error is bounded (or loss
                 // scaling keeps the derivative operands representable).
@@ -3688,7 +3696,7 @@ impl<'a> Compiler<'a> {
                     });
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::SumRows,
-                        workgroups: [cols.div_ceil(256), 1, 1],
+                        workgroups: [cols.div_ceil(32), 1, 1],
                         input_buffers: vec![temp_buf],
                         output_buffer: out_buf,
                         extra_outputs: vec![],
@@ -3756,7 +3764,7 @@ impl<'a> Compiler<'a> {
                     });
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::SumRows,
-                        workgroups: [cols.div_ceil(256), 1, 1],
+                        workgroups: [cols.div_ceil(32), 1, 1],
                         input_buffers: vec![temp_buf],
                         output_buffer: out_buf,
                         extra_outputs: vec![],
@@ -4470,9 +4478,8 @@ mod tests {
     /// producing wrong results for attention kernels.
     #[test]
     fn test_attention_dispatch_matches_codegen_ept() {
-        // Both dispatch and codegen call `crate::codegen::flash_ept_cap()`
-        // so they must agree on EPT/TPQ/BQ. If they ever diverge, the
-        // workgroup count won't match the shader's tile size.
+        // Dispatch and the corresponding codegen path must agree on
+        // EPT/TPQ/BQ. Forward and backward may use different caps.
         let graph = Graph::new();
         let compiler = Compiler::new_with_options(
             &graph,
@@ -4482,17 +4489,32 @@ mod tests {
         );
         for hd_log2 in 1..=8 {
             let hd: u32 = 1 << hd_log2;
-            let codegen_ept = hd.min(crate::codegen::flash_ept_cap());
-            let codegen_tpq = hd / codegen_ept;
-            let codegen_bq: u32 = (256 / codegen_tpq).max(1);
+            let fwd_ept = hd.min(crate::codegen::flash_ept_cap());
+            let fwd_tpq = hd / fwd_ept;
+            let fwd_bq: u32 = (256 / fwd_tpq).max(1);
+            let grad_q_ept = hd.min(crate::codegen::flash_grad_q_ept_cap());
+            let grad_q_tpq = hd / grad_q_ept;
+            let grad_q_bq: u32 = (256 / grad_q_tpq).max(1);
+            let grad_kv_ept = hd.min(crate::codegen::flash_grad_kv_ept_cap());
+            let grad_kv_tpq = hd / grad_kv_ept;
+            let grad_kv_bq: u32 = (256 / grad_kv_tpq).max(1);
 
             let (fwd_entry, fwd_wg) = compiler.attention_dispatch(256, hd, 1);
-            let (bwd_entry, bwd_wg) = Compiler::attention_dispatch_bwd(256, hd, 1);
-            assert_eq!(fwd_entry, bwd_entry, "hd={hd}: fwd/bwd entry mismatch");
-            assert_eq!(fwd_wg, bwd_wg, "hd={hd}: fwd/bwd workgroups mismatch");
-            if codegen_bq >= 2 {
+            let (grad_q_entry, grad_q_wg) =
+                Compiler::attention_dispatch_bwd(256, hd, 1, grad_q_ept);
+            let (grad_kv_entry, grad_kv_wg) =
+                Compiler::attention_dispatch_bwd(256, hd, 1, grad_kv_ept);
+            if fwd_bq >= 2 {
                 assert_eq!(fwd_entry, ShaderEntry::FlashAttention);
-                assert_eq!(fwd_wg[0], 256u32.div_ceil(codegen_bq));
+                assert_eq!(fwd_wg[0], 256u32.div_ceil(fwd_bq));
+            }
+            if grad_q_bq >= 2 {
+                assert_eq!(grad_q_entry, ShaderEntry::FlashAttention);
+                assert_eq!(grad_q_wg[0], 256u32.div_ceil(grad_q_bq));
+            }
+            if grad_kv_bq >= 2 {
+                assert_eq!(grad_kv_entry, ShaderEntry::FlashAttention);
+                assert_eq!(grad_kv_wg[0], 256u32.div_ceil(grad_kv_bq));
             }
         }
     }

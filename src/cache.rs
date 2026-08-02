@@ -128,6 +128,8 @@ pub(crate) fn hash_build_config(
         flash_forward_coop: bool,
         flash_backward_coop: bool,
         flash_ept_cap: u32,
+        flash_grad_q_ept_cap: u32,
+        flash_grad_kv_ept_cap: u32,
     }
 
     let fingerprint = BuildFingerprint {
@@ -139,6 +141,8 @@ pub(crate) fn hash_build_config(
         flash_forward_coop: std::env::var("MEGANEURA_FLASH_FWD_COOP").as_deref() != Ok("0"),
         flash_backward_coop: std::env::var("MEGANEURA_FLASH_BWD_COOP").as_deref() == Ok("1"),
         flash_ept_cap: crate::codegen::flash_ept_cap(),
+        flash_grad_q_ept_cap: crate::codegen::flash_grad_q_ept_cap(),
+        flash_grad_kv_ept_cap: crate::codegen::flash_grad_kv_ept_cap(),
     };
     hash_serializable(&fingerprint)
 }
