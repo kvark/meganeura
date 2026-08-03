@@ -21,7 +21,7 @@ fn tune_preserves_correctness() {
         &g,
         SessionConfig {
             mode: Mode::Inference,
-            ..SessionConfig::default()
+            ..SessionConfig::from_env()
         },
     );
 

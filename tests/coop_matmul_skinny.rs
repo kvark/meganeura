@@ -123,7 +123,7 @@ fn run_matmul(m: usize, k: usize, n: usize) -> Vec<f32> {
         &g,
         SessionConfig {
             mode: Mode::Inference,
-            ..Default::default()
+            ..SessionConfig::from_env()
         },
     );
     let a_data = pcg_inputs(m * k, 1);
@@ -150,7 +150,7 @@ fn run_matmul_at(m: usize, k: usize, n: usize) -> Vec<f32> {
         &g,
         SessionConfig {
             mode: Mode::Inference,
-            ..Default::default()
+            ..SessionConfig::from_env()
         },
     );
     let a_data = pcg_inputs(k * m, 1);
@@ -177,7 +177,7 @@ fn run_matmul_bt(m: usize, k: usize, n: usize) -> Vec<f32> {
         &g,
         SessionConfig {
             mode: Mode::Inference,
-            ..Default::default()
+            ..SessionConfig::from_env()
         },
     );
     let a_data = pcg_inputs(m * k, 1);
@@ -353,7 +353,7 @@ fn run_matmul_sigmoid(m: usize, k: usize, n: usize) -> Vec<f32> {
         &g,
         SessionConfig {
             mode: Mode::Inference,
-            ..Default::default()
+            ..SessionConfig::from_env()
         },
     );
     let a_data = pcg_inputs(m * k, 1);

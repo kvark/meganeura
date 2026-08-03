@@ -8,7 +8,7 @@
 ///   cargo run --release --example bench_ci_latency
 use std::time::Instant;
 
-use meganeura::{Graph, build_inference_session, build_session};
+use meganeura::Graph;
 
 fn main() {
     env_logger::init();
@@ -38,7 +38,7 @@ fn main() {
     let out = g.matmul(h2, w3);
     let loss = g.cross_entropy_loss(out, labels);
     g.set_outputs(vec![loss]);
-    let mut train_session = build_session(&g);
+    let mut train_session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
 
     // Inference graph (forward only, logits output)
     let mut g_inf = Graph::new();
@@ -56,7 +56,8 @@ fn main() {
     let w3i = g_inf.parameter("w3", &[hidden, classes]);
     let logits = g_inf.matmul(h2i, w3i);
     g_inf.set_outputs(vec![logits]);
-    let mut inf_session = build_inference_session(&g_inf);
+    let mut inf_session =
+        meganeura::build(&g_inf, meganeura::SessionConfig::inference_from_env()).0;
 
     // Load weights (not timed)
     let w1_data = vec![0.01_f32; input_dim * hidden];

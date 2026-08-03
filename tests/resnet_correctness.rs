@@ -1,7 +1,7 @@
 /// Compare ResNet mini-model output against PyTorch reference.
 ///
 /// Run `python3 scripts/gen_reference.py` first to generate the reference.
-use meganeura::{Graph, build_inference_session};
+use meganeura::Graph;
 
 fn parse_f32_array(json: &str, key: &str) -> Vec<f32> {
     let needle = format!("\"{key}\": [");
@@ -88,7 +88,7 @@ fn resnet_mini_matches_pytorch() {
     let logits = g.bias_add(logits, fc_b);
     g.set_outputs(vec![logits]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
 
     // Load weights
     session.set_parameter("conv1_weight", &parse_f32_array(&json, "conv1_weight"));

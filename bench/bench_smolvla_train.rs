@@ -11,7 +11,7 @@
 use std::time::Instant;
 
 use meganeura::{
-    build_inference_session, build_session, compile_training_graph,
+    compile_training_graph,
     models::smolvla::{self, SmolVLAConfig},
 };
 
@@ -161,7 +161,8 @@ fn main() {
 
     // --- Build sessions ---
     eprintln!("compiling inference session (forward only)...");
-    let mut infer_session = build_inference_session(&training_g);
+    let mut infer_session =
+        meganeura::build(&training_g, meganeura::SessionConfig::inference_from_env()).0;
     eprintln!(
         "  infer: {} buffers, {} dispatches, {} barrier groups",
         infer_session.plan().buffers.len(),
@@ -170,7 +171,7 @@ fn main() {
     );
 
     eprintln!("compiling training session (fwd + bwd + SGD)...");
-    let mut train_session = build_session(&training_g);
+    let mut train_session = meganeura::build(&training_g, meganeura::SessionConfig::from_env()).0;
     eprintln!(
         "  train: {} buffers, {} dispatches, {} barrier groups",
         train_session.plan().buffers.len(),

@@ -30,7 +30,7 @@ fn infer_raw(g: &Graph) -> Session {
         SessionConfig {
             mode: Mode::Inference,
             options: raw_opts(),
-            ..SessionConfig::default()
+            ..SessionConfig::from_env()
         },
     )
     .0

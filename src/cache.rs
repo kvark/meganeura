@@ -125,8 +125,6 @@ pub(crate) fn hash_build_config(
         mode_tag: u8,
         skip_full_optimize: bool,
         coop_caps: CoopCaps,
-        flash_forward_coop: bool,
-        flash_backward_coop: bool,
     }
 
     let fingerprint = BuildFingerprint {
@@ -135,9 +133,7 @@ pub(crate) fn hash_build_config(
         mode_tag,
         skip_full_optimize,
         coop_caps,
-        flash_forward_coop: crate::config::FLASH_FWD_COOP.bool_or(true),
-        flash_backward_coop: crate::config::FLASH_BWD_COOP.bool_or(false),
-        // The flash EPT caps now live in `options.knobs`, hashed above.
+        // Flash coop flags and EPT caps live in `options`, hashed above.
     };
     hash_serializable(&fingerprint)
 }

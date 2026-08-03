@@ -2,7 +2,7 @@
 //! prologue fusion. Ineligible matmuls must remain scalar, while eligible
 //! matmuls must preserve the rsqrt dependency and observe parameter updates.
 
-use meganeura::{Graph, Session, build_inference_session};
+use meganeura::{Graph, Session};
 use std::sync::Mutex;
 
 static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -35,7 +35,7 @@ fn build(cooperative: bool, expose_normalized: bool) -> Session {
     } else {
         graph.set_outputs(vec![output]);
     }
-    build_inference_session(&graph)
+    meganeura::build(&graph, meganeura::SessionConfig::inference_from_env()).0
 }
 
 fn run(

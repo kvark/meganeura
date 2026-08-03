@@ -11,7 +11,7 @@
 
 use std::time::Instant;
 
-use meganeura::{Graph, build_inference_session, models::smollm2};
+use meganeura::{Graph, models::smollm2};
 
 fn main() {
     env_logger::init();
@@ -28,7 +28,7 @@ fn main() {
     g.set_outputs(vec![logits]);
 
     eprintln!("compiling...");
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
     eprintln!(
         "decode: {} buffers, {} dispatches, {} barrier groups",
         session.plan().buffers.len(),

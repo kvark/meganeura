@@ -1,5 +1,5 @@
 /// Gradient debugging: test individual components with large weights
-use meganeura::{Graph, build_inference_session, build_session, compile::BufferRef};
+use meganeura::{Graph, compile::BufferRef};
 use std::collections::HashMap;
 
 fn name_seed(name: &str) -> f32 {
@@ -21,7 +21,7 @@ fn check_grad(
     check_indices: &[usize],
 ) {
     let g_train = build_train();
-    let mut train_sess = build_session(&g_train);
+    let mut train_sess = meganeura::build(&g_train, meganeura::SessionConfig::from_env()).0;
     for (name, data) in params_init {
         train_sess.set_parameter(name, data);
     }
@@ -46,7 +46,8 @@ fn check_grad(
 
     // Finite differences
     let g_infer = build_infer();
-    let mut infer_sess = build_inference_session(&g_infer);
+    let mut infer_sess =
+        meganeura::build(&g_infer, meganeura::SessionConfig::inference_from_env()).0;
     let orig_data = params_init
         .iter()
         .find(|(name, _)| name == check_param)

@@ -5,7 +5,7 @@
 //! training but garbage sampling, which is what van-world SR sampling
 //! shows at step 10k-20k.
 
-use meganeura::{Graph, build_inference_session};
+use meganeura::Graph;
 
 fn ramp(n: usize, scale: f32, offset: f32) -> Vec<f32> {
     (0..n)
@@ -34,7 +34,7 @@ fn check_conv3x3(c_in: u32, c_out: u32, hw: u32) {
     let y = g.conv2d(x, k, 1, c_in, hw, hw, c_out, 3, 3, 1, 1);
     g.set_outputs(vec![y]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
     let x_data = ramp(in_size, 0.7, 0.1);
     let k_data = ramp(k_size, 0.2, 0.0);
     session.set_parameter("k", &k_data);
@@ -100,7 +100,7 @@ fn group_norm_silu_parity_sr_scale() {
     let y = g.silu(y);
     g.set_outputs(vec![y]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
     let x_data = ramp(n, 1.0, 0.4);
     let w_data = ramp(c as usize, 0.2, 1.0);
     let b_data = ramp(c as usize, 0.2, 0.0);
@@ -153,7 +153,7 @@ fn conv1x1_layout_parity() {
     let y = g.conv2d(x, k, 1, c_in, hw, hw, c_out, 1, 1, 1, 0);
     g.set_outputs(vec![y]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
     let x_data = ramp(in_size, 0.7, 0.1);
     let k_data = ramp(k_size, 0.4, 0.1);
     session.set_parameter("k", &k_data);
@@ -210,7 +210,7 @@ fn conv3x1_flat_spatial_dispatch_parity() {
     );
     g.set_outputs(vec![y]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
     let x_data = ramp(in_size, 0.7, 0.1);
     let k_data = ramp(c_out * c_in * 3, 0.2, 0.0);
     session.set_parameter("k", &k_data);

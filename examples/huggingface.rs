@@ -13,9 +13,7 @@
 /// MNIST test data is expected in `data/` (gzipped or raw):
 ///   data/t10k-images-idx3-ubyte.gz
 ///   data/t10k-labels-idx1-ubyte.gz
-use meganeura::{
-    Graph, MnistDataset, build_inference_session, data::safetensors::SafeTensorsModel,
-};
+use meganeura::{Graph, MnistDataset, data::safetensors::SafeTensorsModel};
 use std::path::{Path, PathBuf};
 
 fn main() {
@@ -81,7 +79,7 @@ fn main() {
 
     // --- Build inference session ---
     println!("compiling inference session...");
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
     println!(
         "session ready: {} buffers, {} dispatches",
         session.plan().buffers.len(),

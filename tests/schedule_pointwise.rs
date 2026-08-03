@@ -11,7 +11,7 @@ fn inference(g: &Graph, opts: CompileOptions) -> Session {
         SessionConfig {
             mode: Mode::Inference,
             options: opts,
-            ..SessionConfig::default()
+            ..SessionConfig::from_env()
         },
     )
     .0

@@ -5,7 +5,7 @@
 //! non-uniform target so the loss is non-degenerate, `* coef` to catch
 //! dropped upstream gradients, analytical vs central finite differences.
 
-use meganeura::{Graph, build_session};
+use meganeura::Graph;
 
 const EPS: f32 = 5e-3;
 const TOL: f32 = 1e-2;
@@ -97,7 +97,7 @@ fn silu_mid_chain() {
     let coef = g.scalar(0.7);
     let loss = g.mul(mean, coef);
     g.set_outputs(vec![loss]);
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let x_data = ramp(6, 1.0, 0.0);
     session.set_parameter("w", &ramp(6, 0.5, 0.1));
     let set_inputs = |s: &mut meganeura::Session| s.set_input("x", &x_data);
@@ -124,7 +124,7 @@ fn conv2d_3x3_s1_kernel_grad() {
     let loss = g.mul(mean, coef);
     g.set_outputs(vec![loss]);
 
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let x_data = ramp(in_size, 1.0, 0.0);
     let t_data = ramp(out_size, 1.0, 0.2);
     session.set_parameter("k", &ramp(k_size, 0.4, 0.0));
@@ -156,7 +156,7 @@ fn conv2d_3x3_s2_kernel_grad() {
     let loss = g.mul(mean, coef);
     g.set_outputs(vec![loss]);
 
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let x_data = ramp(in_size, 1.0, 0.0);
     let t_data = ramp(out_size, 1.0, 0.2);
     session.set_parameter("k", &ramp(k_size, 0.4, 0.0));
@@ -190,7 +190,7 @@ fn conv2d_1x1_input_grad() {
     let loss = g.mul(mean, coef);
     g.set_outputs(vec![loss]);
 
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let x_data = ramp(in_size, 1.0, 0.0);
     let t_data = ramp(out_size, 1.0, 0.2);
     session.set_parameter("w", &ramp(in_size, 0.5, 0.2));
@@ -223,7 +223,7 @@ fn conv2d_3x3_s1_input_grad() {
     let loss = g.mul(mean, coef);
     g.set_outputs(vec![loss]);
 
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let x_data = ramp(in_size, 1.0, 0.0);
     let t_data = ramp(out_size, 1.0, 0.2);
     session.set_parameter("w", &ramp(in_size, 0.5, 0.2));
@@ -253,7 +253,7 @@ fn group_norm_weight_bias_grad() {
     let loss = g.mul(mean, coef);
     g.set_outputs(vec![loss]);
 
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let x_data = ramp(x_size, 1.0, 0.0);
     let t_data = ramp(x_size, 1.0, 0.3);
     session.set_parameter("w", &ramp(c as usize, 0.5, 1.0));
@@ -287,7 +287,7 @@ fn group_norm_input_grad() {
     let loss = g.mul(mean, coef);
     g.set_outputs(vec![loss]);
 
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let x_data = ramp(x_size, 1.0, 0.5);
     let t_data = ramp(x_size, 1.0, 0.3);
     session.set_parameter("w", &ramp(x_size, 0.5, 1.0));
@@ -319,7 +319,7 @@ fn upsample_2x_input_grad() {
     let loss = g.mul(mean, coef);
     g.set_outputs(vec![loss]);
 
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let x_data = ramp(in_size, 1.0, 0.0);
     let t_data = ramp(out_size, 1.0, 0.2);
     session.set_parameter("w", &ramp(in_size, 0.5, 0.3));
@@ -354,7 +354,7 @@ fn concat_both_branches_grad() {
     let loss = g.mul(mean, coef);
     g.set_outputs(vec![loss]);
 
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let xa_data = ramp(a_size, 1.0, 0.0);
     let xb_data = ramp(b_size, 1.0, 0.1);
     let t_data = ramp(out_size, 1.0, 0.2);
@@ -388,7 +388,7 @@ fn embedding_table_grad() {
     let loss = g.mul(mean, coef);
     g.set_outputs(vec![loss]);
 
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let t_data = ramp(out_size, 1.0, 0.2);
     session.set_parameter("table", &ramp(vocab * dim, 0.5, 0.0));
     let set_inputs = |s: &mut meganeura::Session| {

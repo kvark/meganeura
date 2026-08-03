@@ -6,7 +6,7 @@
 //! scalar one — and asserts the outputs match within f16-input
 //! tolerance.
 
-use meganeura::{Graph, build_inference_session};
+use meganeura::Graph;
 
 fn build_and_run(label: &str, seq: usize, num_heads: u32, head_dim: u32, causal: bool) -> Vec<f32> {
     let d = (num_heads * head_dim) as usize;
@@ -20,7 +20,7 @@ fn build_and_run(label: &str, seq: usize, num_heads: u32, head_dim: u32, causal:
         g.full_attention(q, k, v, num_heads, num_heads, head_dim)
     };
     g.set_outputs(vec![out]);
-    let mut sess = build_inference_session(&g);
+    let mut sess = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
 
     let total = seq * d;
     let qd: Vec<f32> = (0..total).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();

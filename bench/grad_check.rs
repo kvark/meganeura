@@ -16,7 +16,6 @@
 use std::collections::HashMap;
 
 use meganeura::{
-    build_session,
     graph::Op,
     models::smolvla::{self, SmolVLAConfig},
 };
@@ -74,7 +73,7 @@ fn main() {
     }
 
     eprintln!("compiling session...");
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
 
     // Fill shapes for derived params (e.g. SwiGLU concat "gate+up") from buffer sizes.
     // These aren't in the original graph, so param_shapes doesn't have them.

@@ -1,3 +1,4 @@
+use meganeura::Graph;
 /// SD U-Net training benchmark for meganeura.
 ///
 /// Architecture: Conv2d + GroupNorm + SiLU ResBlocks with skip connections,
@@ -5,7 +6,6 @@
 ///
 /// Outputs JSON to stdout (for compare.sh), human-readable to stderr.
 use meganeura::models::sd_unet::{self, SDUNetConfig};
-use meganeura::{Graph, build_session};
 use std::time::Instant;
 
 fn main() {
@@ -57,7 +57,7 @@ fn main() {
     // --- Compile ---
     eprintln!("compiling (autodiff + egglog + codegen)...");
     let t0 = Instant::now();
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let compile_time = t0.elapsed();
     let device_info = session.device_information().clone();
     let device_name = &device_info.device_name;

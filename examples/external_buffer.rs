@@ -24,7 +24,7 @@
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 
 use blade_graphics as bg;
-use meganeura::{ExternalSlot, Graph, build_inference_session};
+use meganeura::{ExternalSlot, Graph};
 
 fn main() {
     env_logger::init();
@@ -105,7 +105,7 @@ fn main() {
     // `build_inference_session` internally calls `Session::new`, which
     // initialises a fresh `blade_graphics::Context` owned by the
     // session — no context sharing with `producer`.
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
     eprintln!(
         "meganeura device: {}",
         session.device_information().device_name

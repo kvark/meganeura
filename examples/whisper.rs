@@ -6,7 +6,7 @@
 /// Usage:
 ///   cargo run --release --example whisper
 use meganeura::{
-    Graph, build_inference_session,
+    Graph,
     data::safetensors::SafeTensorsModel,
     models::whisper::{self, WhisperConfig},
 };
@@ -28,7 +28,7 @@ fn main() {
 
     // --- Compile ---
     println!("compiling...");
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
     println!(
         "  {} buffers, {} dispatches",
         session.plan().buffers.len(),

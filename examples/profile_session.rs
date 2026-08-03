@@ -4,7 +4,7 @@
 //! `MEGANEURA_GPU_TIMING=1 cargo run --release --example profile_session -- gap-profile.json`
 
 use meganeura::{
-    Graph, build_inference_session,
+    Graph,
     profiler::{CaptureOptions, capture_session_profile, save_session_profile_json},
 };
 use std::time::Instant;
@@ -34,7 +34,7 @@ fn main() {
     let probabilities = graph.softmax(activated);
     graph.set_outputs(vec![probabilities]);
 
-    let mut session = build_inference_session(&graph);
+    let mut session = meganeura::build(&graph, meganeura::SessionConfig::inference_from_env()).0;
     let input_data: Vec<f32> = (0..ROWS * WIDTH)
         .map(|index| (index as f32 * 0.001).sin())
         .collect();

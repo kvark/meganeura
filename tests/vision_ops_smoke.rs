@@ -1,6 +1,6 @@
 /// Smoke tests for vision/VLA ops on GPU (lavapipe).
 /// Tests LayerNorm, GELU, and FullAttention individually.
-use meganeura::{Graph, build_inference_session};
+use meganeura::Graph;
 
 #[test]
 fn layer_norm_basic() {
@@ -11,7 +11,7 @@ fn layer_norm_basic() {
     let y = g.layer_norm(x, w, b, 1e-5);
     g.set_outputs(vec![y]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
     session.set_parameter("w", &[1.0, 1.0, 1.0, 1.0f32]);
     session.set_parameter("b", &[0.0, 0.0, 0.0, 0.0f32]);
     session.set_input("x", &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0f32]);
@@ -45,7 +45,7 @@ fn gelu_basic() {
     let y = g.gelu(x);
     g.set_outputs(vec![y]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
     session.set_input("x", &[-2.0, -1.0, 0.0, 1.0f32]);
 
     session.step();
@@ -76,7 +76,7 @@ fn full_attention_basic() {
     let attn = g.full_attention(q, k, v, 2, 2, 4);
     g.set_outputs(vec![attn]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
 
     // Simple identity-like attention: q=k so attention is uniform
     let qk_data: Vec<f32> = (0..32).map(|i| (i as f32) * 0.1).collect();
@@ -161,7 +161,7 @@ fn full_attention_matches_cpu_reference() {
         }
     }
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
     session.set_input("q", &q);
     session.set_input("k", &k);
     session.set_input("v", &v);
@@ -215,7 +215,7 @@ fn vision_encoder_one_layer() {
     let out = g.add(x, attn_out);
     g.set_outputs(vec![out]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
 
     // Initialize with small random-ish values
     let ones: Vec<f32> = vec![1.0; hidden];

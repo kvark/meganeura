@@ -5,7 +5,7 @@
 /// existing gpu_smoke tests.
 ///
 /// Run `python3 scripts/gen_reference.py` first to generate the reference.
-use meganeura::{Graph, build_inference_session};
+use meganeura::Graph;
 
 fn parse_f32_array(json: &str, key: &str) -> Vec<f32> {
     let needle = format!("\"{key}\": [");
@@ -107,7 +107,7 @@ fn whisper_conv_stem_ffn_matches_pytorch() {
     let x = g.layer_norm(x, fln_w, fln_b, 1e-5);
     g.set_outputs(vec![x]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
 
     // Load weights
     session.set_parameter("conv1.weight", &parse_f32_array(&json, "conv1.weight"));

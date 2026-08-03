@@ -9,7 +9,7 @@
 use std::time::Instant;
 
 use meganeura::{
-    Graph, build_inference_session,
+    Graph,
     data::safetensors::SafeTensorsModel,
     models::smollm2::{self, SmolLM2Config},
 };
@@ -164,7 +164,8 @@ fn main() {
         pg.set_outputs(prefill_outputs);
 
         eprintln!("compiling prefill...");
-        let mut prefill_session = build_inference_session(&pg);
+        let mut prefill_session =
+            meganeura::build(&pg, meganeura::SessionConfig::inference_from_env()).0;
         eprintln!(
             "prefill: {} buffers, {} dispatches, {} barrier groups",
             prefill_session.plan().buffers.len(),
@@ -180,7 +181,7 @@ fn main() {
         dg.set_outputs(vec![decode_logits]);
 
         eprintln!("compiling decode...");
-        session = build_inference_session(&dg);
+        session = meganeura::build(&dg, meganeura::SessionConfig::inference_from_env()).0;
         eprintln!(
             "decode: {} buffers, {} dispatches, {} barrier groups",
             session.plan().buffers.len(),
@@ -282,7 +283,7 @@ fn main() {
         g.set_outputs(vec![logits]);
 
         eprintln!("compiling...");
-        session = build_inference_session(&g);
+        session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
         eprintln!(
             "ready: {} buffers, {} dispatches",
             session.plan().buffers.len(),

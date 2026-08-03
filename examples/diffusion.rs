@@ -12,7 +12,7 @@
 ///
 /// MSE loss is built from primitives: `mean_all(mul(diff, diff))`
 /// where `diff = add(pred, neg(target))`.
-use meganeura::{DataLoader, Graph, TrainConfig, Trainer, build_session};
+use meganeura::{DataLoader, Graph, TrainConfig, Trainer};
 use std::time::Instant;
 
 fn main() {
@@ -96,7 +96,7 @@ fn main() {
     // --- Build session ---
     println!("building session (autodiff + egglog + compile)...");
     let t0 = Instant::now();
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let compile_time = t0.elapsed();
     println!(
         "session ready in {:.2}s: {} buffers, {} dispatches",

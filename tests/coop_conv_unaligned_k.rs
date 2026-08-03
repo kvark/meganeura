@@ -13,7 +13,7 @@
 //! no-coop hardware (e.g. lavapipe CI) both paths are scalar and the test
 //! trivially passes.
 
-use meganeura::{Graph, build_inference_session, build_session};
+use meganeura::Graph;
 use std::sync::Mutex;
 
 static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -38,7 +38,7 @@ fn conv_out(in_c: u32, coop: bool) -> Vec<f32> {
     let k = g.parameter("k", &[k_size]);
     let y = g.conv2d(x, k, batch, in_c, hw, hw, out_c, 3, 3, 1, 1);
     g.set_outputs(vec![y]);
-    let mut s = build_inference_session(&g);
+    let mut s = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
     // Small bounded values so f16 coop precision is not the issue.
     let xd: Vec<f32> = (0..in_size)
         .map(|i| ((i * 31 % 17) as f32 / 16.0 - 0.5) * 0.2)
@@ -77,7 +77,7 @@ fn conv_input_grad(coop: bool) -> Vec<f32> {
     let loss = g.mean_all(y);
     g.set_outputs(vec![loss]);
 
-    let mut s = build_session(&g);
+    let mut s = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let xd: Vec<f32> = (0..x_size)
         .map(|i| ((i * 31 % 17) as f32 - 8.0) * 0.01)
         .collect();

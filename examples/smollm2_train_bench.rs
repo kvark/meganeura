@@ -11,7 +11,7 @@ fn main() {
     eprintln!("SmolLM2-135M training benchmark (seq={})", seq_len);
     let g = meganeura::models::smollm2::build_training_graph(&config, seq_len);
 
-    let mut sess = meganeura::build_session(&g);
+    let mut sess = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     eprintln!(
         "  {} dispatches, {} groups",
         sess.plan().dispatches.len(),

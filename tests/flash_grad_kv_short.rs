@@ -37,7 +37,7 @@ fn run(
         SessionConfig {
             mode: Mode::Training,
             gpu: Some(gpu),
-            ..Default::default()
+            ..SessionConfig::from_env()
         },
     );
     let uses_coop = session
@@ -88,7 +88,9 @@ fn assert_close(label: &str, scalar: &[f32], cooperative: &[f32]) {
 
 #[test]
 fn short_cross_and_self_attention_grad_kv_match_scalar() {
-    let gpu = Arc::new(meganeura::runtime::init_gpu_context().expect("GPU context"));
+    let gpu = Arc::new(
+        meganeura::init_gpu_context_with(meganeura::GpuOptions::from_env()).expect("GPU context"),
+    );
     let has_coop = gpu.capabilities().cooperative_matrix.f16_tile == 16;
 
     for (label, q_seq, kv_seq) in [("cross", 50, 16), ("self", 50, 50)] {

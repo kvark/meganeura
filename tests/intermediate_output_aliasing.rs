@@ -2,7 +2,7 @@
 //! consumers and a backward gradient path) returned to the user via
 //! `set_outputs` becomes corrupted after `step()` at batch_size > 1.
 
-use meganeura::{Graph, build_session, nn};
+use meganeura::{Graph, nn};
 
 #[test]
 fn intermediate_node_output_is_stable_across_batch_sizes() {
@@ -24,7 +24,7 @@ fn intermediate_node_output_is_stable_across_batch_sizes() {
         let loss = g.mse_loss(y2, target);
         g.set_outputs(vec![loss, y]);
 
-        let mut s = build_session(&g);
+        let mut s = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
         s.set_parameter("fc1.weight", &[0.1; 16]);
         s.set_parameter("fc1.bias", &[0.1; 4]);
         s.set_parameter("norm.weight", &[1.0; 4]);

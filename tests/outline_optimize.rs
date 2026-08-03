@@ -6,8 +6,7 @@
 
 use meganeura::graph::Op;
 use meganeura::{
-    Graph, OptimizeConfig, OptimizeMode, autodiff, build_session, compile, optimize,
-    runtime::Session,
+    Graph, OptimizeConfig, OptimizeMode, autodiff, compile, optimize, runtime::Session,
 };
 
 /// Residual MLP with a decomposed-Silu activation. Each layer carries
@@ -112,7 +111,7 @@ fn production_optimization_preserves_outputs() {
     // Fully optimized production training session (forward optimize →
     // autodiff → full-graph optimize). Greedy is the production default;
     // the two tests above exercise outlined egglog explicitly.
-    let mut opt_session = build_session(&g);
+    let mut opt_session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
 
     // Baseline: autodiff + compile with no optimization at all.
     let sorted = g.toposort();

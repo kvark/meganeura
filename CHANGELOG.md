@@ -1,5 +1,20 @@
 # Unreleased
 
+- The library core is now environment-free: `compile`, `runtime`,
+  `codegen`, and `optimize` accept strongly typed options and never read
+  `MEGANEURA_*` variables. New typed surface: `CoopPolicy`
+  (Auto/Disabled/AllowF16) and the diagnostic switches on
+  `SessionOptions`, flash coop toggles on `CompileOptions`,
+  `SessionConfig::{optimize, runtime}`, and `GpuOptions` +
+  `init_gpu_context_with` for adapter selection/timestamps.
+  `TuningKnobs::default()` is pure platform defaults. Env-driven behavior
+  is an explicit opt-in via the `from_env` constructors in
+  `meganeura::config` (`SessionConfig::from_env()` resolves everything,
+  including WGSL dump-dir installation and env-selected GPU contexts);
+  the repo's examples, benches, and tests opt in, so external
+  `MEGANEURA_*` workflows keep working — embedders that never call
+  `from_env` get a fully hermetic library.
+
 - Central environment-variable registry (`meganeura::config`): every
   `MEGANEURA_*` variable is declared once with type, class, and docs.
   Session build logs active overrides and warns on unrecognized

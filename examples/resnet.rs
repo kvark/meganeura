@@ -6,9 +6,7 @@
 ///
 /// Usage:
 ///   cargo run --release --example resnet
-use meganeura::{
-    Graph, build_inference_session, data::safetensors::SafeTensorsModel, models::resnet,
-};
+use meganeura::{Graph, data::safetensors::SafeTensorsModel, models::resnet};
 
 const REPO_ID: &str = "microsoft/resnet-18";
 
@@ -25,7 +23,7 @@ fn main() {
 
     // --- Compile ---
     println!("compiling...");
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
     println!(
         "  {} buffers, {} dispatches",
         session.plan().buffers.len(),

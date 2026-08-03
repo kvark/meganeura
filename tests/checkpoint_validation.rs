@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use meganeura::{Graph, build_session};
+use meganeura::Graph;
 use safetensors::tensor::{Dtype, TensorView};
 
 fn training_session() -> meganeura::Session {
@@ -10,7 +10,7 @@ fn training_session() -> meganeura::Session {
     let y = graph.matmul(x, w);
     let loss = graph.mean_all(y);
     graph.set_outputs(vec![loss]);
-    build_session(&graph)
+    meganeura::build(&graph, meganeura::SessionConfig::from_env()).0
 }
 
 #[test]

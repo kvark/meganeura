@@ -59,7 +59,7 @@ fn run(chunks: usize, layers: usize, rows: usize, dim: usize, steps: usize) -> V
         &g,
         SessionConfig {
             mode: Mode::Inference,
-            ..Default::default()
+            ..SessionConfig::from_env()
         },
     );
     session.set_submission_chunks(chunks);

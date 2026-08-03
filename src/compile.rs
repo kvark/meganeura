@@ -53,21 +53,20 @@ pub struct TuningKnobs {
     pub flash_grad_kv_ept_cap: u32,
 }
 
-impl TuningKnobs {
-    /// Current-platform defaults with `MEGANEURA_FLASH_*_EPT_CAP` overrides —
-    /// the historical behavior of the global cap readers.
-    pub fn from_env() -> Self {
-        Self {
-            flash_ept_cap: crate::codegen::flash_ept_cap(),
-            flash_grad_q_ept_cap: crate::codegen::flash_grad_q_ept_cap(),
-            flash_grad_kv_ept_cap: crate::codegen::flash_grad_kv_ept_cap(),
-        }
-    }
-}
-
 impl Default for TuningKnobs {
+    /// Pure per-platform defaults. Apple Silicon benefits from the extra
+    /// parallelism of smaller EPT; 32 keeps register count below the
+    /// spilling cliff on Ampere/Blackwell. `MEGANEURA_FLASH_*_EPT_CAP`
+    /// overrides are applied only by [`TuningKnobs::from_env`] (in
+    /// `crate::config`) — the library itself never reads the environment.
     fn default() -> Self {
-        Self::from_env()
+        let apple = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+        let fwd = if apple { 16 } else { 32 };
+        Self {
+            flash_ept_cap: fwd,
+            flash_grad_q_ept_cap: fwd,
+            flash_grad_kv_ept_cap: if apple { 8 } else { 32 },
+        }
     }
 }
 
@@ -96,6 +95,12 @@ pub struct CompileOptions {
     pub fuse_dispatches: bool,
     /// Tuning knobs stamped into the compiled plan.
     pub knobs: TuningKnobs,
+    /// Use the cooperative flash-attention forward kernel when the device
+    /// supports it.
+    pub flash_forward_coop: bool,
+    /// Enable the experimental reduced-precision cooperative flash
+    /// backward kernels.
+    pub flash_backward_coop: bool,
 }
 
 impl Default for CompileOptions {
@@ -105,6 +110,8 @@ impl Default for CompileOptions {
             use_schedule_reduction: true,
             fuse_dispatches: true,
             knobs: TuningKnobs::default(),
+            flash_forward_coop: true,
+            flash_backward_coop: false,
         }
     }
 }
@@ -825,7 +832,7 @@ pub(crate) fn compile_with_caps(
     options: &CompileOptions,
     coop_caps: crate::codegen::CoopCaps,
 ) -> ExecutionPlan {
-    let allow_reduced_precision_attention_backward = crate::config::FLASH_BWD_COOP.bool_or(false);
+    let allow_reduced_precision_attention_backward = options.flash_backward_coop;
     compile_with_caps_policy(
         graph,
         options,
@@ -837,12 +844,9 @@ pub(crate) fn compile_with_caps(
 fn compile_with_caps_policy(
     graph: &Graph,
     options: &CompileOptions,
-    mut coop_caps: crate::codegen::CoopCaps,
+    coop_caps: crate::codegen::CoopCaps,
     allow_reduced_precision_attention_backward: bool,
 ) -> ExecutionPlan {
-    if crate::config::DISABLE_COOP.bool_or(false) {
-        coop_caps = crate::codegen::CoopCaps::default();
-    }
     let mut compiler = Compiler::new_with_options(
         graph,
         options.clone(),
@@ -1744,7 +1748,7 @@ impl<'a> Compiler<'a> {
         // the scalar kernel on Blackwell. The env var
         // `MEGANEURA_FLASH_FWD_COOP=0` opts back to scalar (regression
         // escape hatch).
-        let coop_disabled = !crate::config::FLASH_FWD_COOP.bool_or(true);
+        let coop_disabled = !self.options.flash_forward_coop;
         if !coop_disabled
             && self.coop_caps.supports_16x16_f16()
             && head_dim >= 16
@@ -4653,13 +4657,13 @@ mod tests {
         );
         for hd_log2 in 1..=8 {
             let hd: u32 = 1 << hd_log2;
-            let fwd_ept = hd.min(crate::codegen::flash_ept_cap());
+            let fwd_ept = hd.min(TuningKnobs::default().flash_ept_cap);
             let fwd_tpq = hd / fwd_ept;
             let fwd_bq: u32 = (256 / fwd_tpq).max(1);
-            let grad_q_ept = hd.min(crate::codegen::flash_grad_q_ept_cap());
+            let grad_q_ept = hd.min(TuningKnobs::default().flash_grad_q_ept_cap);
             let grad_q_tpq = hd / grad_q_ept;
             let grad_q_bq: u32 = (256 / grad_q_tpq).max(1);
-            let grad_kv_ept = hd.min(crate::codegen::flash_grad_kv_ept_cap());
+            let grad_kv_ept = hd.min(TuningKnobs::default().flash_grad_kv_ept_cap);
             let grad_kv_tpq = hd / grad_kv_ept;
             let grad_kv_bq: u32 = (256 / grad_kv_tpq).max(1);
 

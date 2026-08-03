@@ -331,7 +331,7 @@ fn main() {
     {
         let sm = meganeura::codegen::generate_flash_attention_module(
             64,
-            meganeura::codegen::flash_ept_cap(),
+            meganeura::TuningKnobs::from_env().flash_ept_cap,
         );
         analyze(
             "flash_attention_hd64",
@@ -343,7 +343,7 @@ fn main() {
 
         let sm_gq = meganeura::codegen::generate_flash_grad_q_module(
             64,
-            meganeura::codegen::flash_grad_q_ept_cap(),
+            meganeura::TuningKnobs::from_env().flash_grad_q_ept_cap,
         );
         analyze(
             "flash_grad_q_hd64",
@@ -355,7 +355,7 @@ fn main() {
 
         let sm_gkv = meganeura::codegen::generate_flash_grad_kv_module(
             64,
-            meganeura::codegen::flash_grad_kv_ept_cap(),
+            meganeura::TuningKnobs::from_env().flash_grad_kv_ept_cap,
         );
         analyze(
             "flash_grad_kv_hd64",
