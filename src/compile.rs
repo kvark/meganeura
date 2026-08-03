@@ -825,8 +825,7 @@ pub(crate) fn compile_with_caps(
     options: &CompileOptions,
     coop_caps: crate::codegen::CoopCaps,
 ) -> ExecutionPlan {
-    let allow_reduced_precision_attention_backward =
-        std::env::var("MEGANEURA_FLASH_BWD_COOP").as_deref() == Ok("1");
+    let allow_reduced_precision_attention_backward = crate::config::FLASH_BWD_COOP.bool_or(false);
     compile_with_caps_policy(
         graph,
         options,
@@ -841,7 +840,7 @@ fn compile_with_caps_policy(
     mut coop_caps: crate::codegen::CoopCaps,
     allow_reduced_precision_attention_backward: bool,
 ) -> ExecutionPlan {
-    if std::env::var("MEGANEURA_DISABLE_COOP").is_ok() {
+    if crate::config::DISABLE_COOP.bool_or(false) {
         coop_caps = crate::codegen::CoopCaps::default();
     }
     let mut compiler = Compiler::new_with_options(
@@ -1745,7 +1744,7 @@ impl<'a> Compiler<'a> {
         // the scalar kernel on Blackwell. The env var
         // `MEGANEURA_FLASH_FWD_COOP=0` opts back to scalar (regression
         // escape hatch).
-        let coop_disabled = std::env::var("MEGANEURA_FLASH_FWD_COOP").as_deref() == Ok("0");
+        let coop_disabled = !crate::config::FLASH_FWD_COOP.bool_or(true);
         if !coop_disabled
             && self.coop_caps.supports_16x16_f16()
             && head_dim >= 16

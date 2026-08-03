@@ -106,7 +106,7 @@ impl OptimizeConfig {
     /// - `MEGANEURA_EGRAPH_CUTOFF=<positive integer>`
     pub fn from_env() -> Self {
         let mut config = Self::default();
-        if let Ok(value) = std::env::var("MEGANEURA_OPTIMIZER") {
+        if let Some(value) = crate::config::OPTIMIZER.text() {
             config.mode = match value.as_str() {
                 "off" => OptimizeMode::Off,
                 "greedy" => OptimizeMode::Greedy,
@@ -119,7 +119,7 @@ impl OptimizeConfig {
                 }
             };
         }
-        if let Ok(value) = std::env::var("MEGANEURA_EGRAPH_COST") {
+        if let Some(value) = crate::config::EGRAPH_COST.text() {
             config.extraction_cost = match value.as_str() {
                 "ast-size" | "ast" | "unit" => ExtractionCost::AstSize,
                 "tensor-traffic" | "traffic" => ExtractionCost::TensorTraffic,
@@ -129,12 +129,11 @@ impl OptimizeConfig {
                 }
             };
         }
-        if let Ok(value) = std::env::var("MEGANEURA_EGRAPH_CUTOFF") {
-            match value.parse::<usize>() {
-                Ok(value) if value > 0 => config.saturation_cutoff = value,
-                _ => log::warn!(
-                    "invalid MEGANEURA_EGRAPH_CUTOFF={value:?}; using {SATURATION_CUTOFF}"
-                ),
+        if let Some(value) = crate::config::EGRAPH_CUTOFF.u32_value() {
+            if value > 0 {
+                config.saturation_cutoff = value as usize;
+            } else {
+                log::warn!("MEGANEURA_EGRAPH_CUTOFF must be > 0; using {SATURATION_CUTOFF}");
             }
         }
         config
