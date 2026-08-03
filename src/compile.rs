@@ -37,6 +37,40 @@ impl WeightFormat {
     }
 }
 
+/// Performance-tuning knobs that shape generated kernels and dispatch
+/// geometry. A knob is *data*: it lives in `CompileOptions`, is stamped into
+/// the compiled `ExecutionPlan` (geometry and generated WGSL must agree), and
+/// participates in the plan-cache fingerprint automatically. Defaults come
+/// from capability-signature heuristics plus `MEGANEURA_FLASH_*` env
+/// overrides; a session-build tuner can substitute measured values instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TuningKnobs {
+    /// Elements-per-thread cap for flash-attention forward codegen.
+    pub flash_ept_cap: u32,
+    /// EPT cap for the flash dQ backward kernel.
+    pub flash_grad_q_ept_cap: u32,
+    /// EPT cap for the fused flash dK/dV backward kernel.
+    pub flash_grad_kv_ept_cap: u32,
+}
+
+impl TuningKnobs {
+    /// Current-platform defaults with `MEGANEURA_FLASH_*_EPT_CAP` overrides —
+    /// the historical behavior of the global cap readers.
+    pub fn from_env() -> Self {
+        Self {
+            flash_ept_cap: crate::codegen::flash_ept_cap(),
+            flash_grad_q_ept_cap: crate::codegen::flash_grad_q_ept_cap(),
+            flash_grad_kv_ept_cap: crate::codegen::flash_grad_kv_ept_cap(),
+        }
+    }
+}
+
+impl Default for TuningKnobs {
+    fn default() -> Self {
+        Self::from_env()
+    }
+}
+
 /// Options controlling graph → execution-plan compilation.
 ///
 /// Wire these to env vars or CLI flags in your own harness if you want —
@@ -55,6 +89,13 @@ pub struct CompileOptions {
     /// which is much more parallel than the 1-thread-per-row loops in
     /// the existing softmax.wgsl. Enabled by default after parity validation.
     pub use_schedule_reduction: bool,
+    /// Apply dispatch-level fusion passes (matmul epilogues, pointwise
+    /// chains, reduction prologues, RmsNorm→matmul prologues). These are
+    /// numerics-neutral performance transforms; debug sessions disable them
+    /// so every graph node's value stays materialized and readable.
+    pub fuse_dispatches: bool,
+    /// Tuning knobs stamped into the compiled plan.
+    pub knobs: TuningKnobs,
 }
 
 impl Default for CompileOptions {
@@ -62,6 +103,8 @@ impl Default for CompileOptions {
         Self {
             use_schedule_pointwise: true,
             use_schedule_reduction: true,
+            fuse_dispatches: true,
+            knobs: TuningKnobs::default(),
         }
     }
 }
@@ -148,7 +191,6 @@ pub enum ShaderEntry {
     RmsNormGradX,
     LayerNormGradWB,
     LayerNormGradX,
-    FusedRmsNormMatMul,
     /// Precompute rsqrt for RmsNorm (phase 1 of two-phase fusion)
     RmsNormRsqrt,
     GroupNorm,
@@ -160,7 +202,6 @@ pub enum ShaderEntry {
     SplitB,
     Upsample2x,
     Upsample2xGrad,
-    Conv2d,
     /// Depthwise Conv2d forward (groups == channels). Weight shape
     /// `[C, 1, kH, kW]`; each output channel reads one input channel.
     /// Used by EfficientNet MBConv blocks.
@@ -173,17 +214,12 @@ pub enum ShaderEntry {
     AddPerChannel,
     Conv2dGemm,
     Conv2dGemmSmall,
-    Conv2dGemmCoop,
     /// Generated conv2d forward coop kernel specialized for (kernel_h, kernel_w, stride).
     Conv2dGemmCoopGen(u32, u32, u32),
-    Conv2dGradInput,
     Conv2dGradInputGemm,
     Conv2dGradInputGemmSmall,
-    Conv2dGradInputGemmCoop,
-    Conv2dGradInputGemmCoop3x3,
     /// Generated conv2d grad_input coop kernel specialized for (kernel_h, kernel_w, stride).
     Conv2dGradInputGemmCoopGen(u32, u32, u32),
-    Conv2dGradWeight,
     Conv2dGradWeightGemm,
     Conv2dGradWeightGemmSmall,
     CacheWrite,
@@ -195,7 +231,6 @@ pub enum ShaderEntry {
     WinogradInputTransform,
     WinogradOutputTransform,
     WinogradBatchedMatMul,
-    WinogradBatchedMatMulSmall,
     WinogradWeightTransform,
     /// Zero a 1-element scalar accumulator buffer (gradient-clip pre-pass).
     GradClipZero,
@@ -230,8 +265,7 @@ impl ShaderEntry {
             | ShaderEntry::MatMulGemvBT
             | ShaderEntry::FusedMatMulAdd
             | ShaderEntry::FusedMatMulATAdd
-            | ShaderEntry::FusedMatMulBTAdd
-            | ShaderEntry::FusedRmsNormMatMul => "matrix",
+            | ShaderEntry::FusedMatMulBTAdd => "matrix",
 
             ShaderEntry::MultiHeadAttn
             | ShaderEntry::FlashAttention
@@ -244,19 +278,13 @@ impl ShaderEntry {
             | ShaderEntry::FlashGradKV
             | ShaderEntry::CachedAttention => "attention",
 
-            ShaderEntry::Conv2d
-            | ShaderEntry::Conv2dDw
+            ShaderEntry::Conv2dDw
             | ShaderEntry::Conv2dGemm
             | ShaderEntry::Conv2dGemmSmall
-            | ShaderEntry::Conv2dGemmCoop
             | ShaderEntry::Conv2dGemmCoopGen(..)
-            | ShaderEntry::Conv2dGradInput
             | ShaderEntry::Conv2dGradInputGemm
             | ShaderEntry::Conv2dGradInputGemmSmall
-            | ShaderEntry::Conv2dGradInputGemmCoop
-            | ShaderEntry::Conv2dGradInputGemmCoop3x3
             | ShaderEntry::Conv2dGradInputGemmCoopGen(..)
-            | ShaderEntry::Conv2dGradWeight
             | ShaderEntry::Conv2dGradWeightGemm
             | ShaderEntry::Conv2dGradWeightGemmSmall
             | ShaderEntry::Upsample2x
@@ -265,7 +293,6 @@ impl ShaderEntry {
             | ShaderEntry::WinogradInputTransform
             | ShaderEntry::WinogradOutputTransform
             | ShaderEntry::WinogradBatchedMatMul
-            | ShaderEntry::WinogradBatchedMatMulSmall
             | ShaderEntry::WinogradWeightTransform => "convolution_spatial",
 
             ShaderEntry::SumAll
@@ -391,7 +418,6 @@ impl ShaderEntry {
             ShaderEntry::LayerNormGradWB | ShaderEntry::LayerNormGradX => {
                 ShaderGroup::LayerNormGrad
             }
-            ShaderEntry::FusedRmsNormMatMul => ShaderGroup::FusedRmsNormMatMul,
             ShaderEntry::RmsNormRsqrt => ShaderGroup::RmsNormRsqrt,
             ShaderEntry::GroupNorm => ShaderGroup::GroupNorm,
             ShaderEntry::GroupNormSilu => ShaderGroup::GroupNormSilu,
@@ -401,21 +427,15 @@ impl ShaderEntry {
             ShaderEntry::SplitA | ShaderEntry::SplitB => ShaderGroup::Split,
             ShaderEntry::Upsample2x => ShaderGroup::Upsample,
             ShaderEntry::Upsample2xGrad => ShaderGroup::UpsampleGrad,
-            ShaderEntry::Conv2d => ShaderGroup::Conv2d,
             ShaderEntry::Conv2dDw => ShaderGroup::Conv2dDw,
             ShaderEntry::MulPerChannel => ShaderGroup::MulPerChannel,
             ShaderEntry::AddPerChannel => ShaderGroup::AddPerChannel,
             ShaderEntry::Conv2dGemm => ShaderGroup::Conv2dGemm,
-            ShaderEntry::Conv2dGemmCoop => ShaderGroup::Conv2dGemmCoop,
             ShaderEntry::Conv2dGemmCoopGen(..) => ShaderGroup::Conv2dGemmCoop,
             ShaderEntry::Conv2dGemmSmall => ShaderGroup::Conv2dGemmSmall,
-            ShaderEntry::Conv2dGradInput => ShaderGroup::Conv2dGradInput,
             ShaderEntry::Conv2dGradInputGemm => ShaderGroup::Conv2dGradInputGemm,
             ShaderEntry::Conv2dGradInputGemmSmall => ShaderGroup::Conv2dGradInputGemmSmall,
-            ShaderEntry::Conv2dGradInputGemmCoop => ShaderGroup::Conv2dGradInputGemmCoop,
-            ShaderEntry::Conv2dGradInputGemmCoop3x3 => ShaderGroup::Conv2dGradInputGemmCoop3x3,
             ShaderEntry::Conv2dGradInputGemmCoopGen(..) => ShaderGroup::Conv2dGradInputGemmCoop,
-            ShaderEntry::Conv2dGradWeight => ShaderGroup::Conv2dGradWeight,
             ShaderEntry::Conv2dGradWeightGemm => ShaderGroup::Conv2dGradWeightGemm,
             ShaderEntry::Conv2dGradWeightGemmSmall => ShaderGroup::Conv2dGradWeightGemmSmall,
             ShaderEntry::CacheWrite => ShaderGroup::CacheWrite,
@@ -427,7 +447,6 @@ impl ShaderEntry {
             ShaderEntry::WinogradInputTransform => ShaderGroup::WinogradInputTransform,
             ShaderEntry::WinogradOutputTransform => ShaderGroup::WinogradOutputTransform,
             ShaderEntry::WinogradBatchedMatMul => ShaderGroup::WinogradBatchedMatMul,
-            ShaderEntry::WinogradBatchedMatMulSmall => ShaderGroup::WinogradBatchedMatMulSmall,
             ShaderEntry::WinogradWeightTransform => ShaderGroup::WinogradWeightTransform,
             ShaderEntry::GradClipZero => ShaderGroup::GradClipZero,
             ShaderEntry::GradClipNormSq => ShaderGroup::GradClipNormSq,
@@ -497,7 +516,6 @@ impl ShaderEntry {
             ShaderEntry::RmsNormGradX => "rms_norm_grad_x",
             ShaderEntry::LayerNormGradWB => "layer_norm_grad_wb",
             ShaderEntry::LayerNormGradX => "layer_norm_grad_x",
-            ShaderEntry::FusedRmsNormMatMul => "main",
             ShaderEntry::RmsNormRsqrt => "main",
             ShaderEntry::GroupNorm | ShaderEntry::GroupNormSilu => "main",
             ShaderEntry::GroupNormGradInput => "grad_input",
@@ -507,23 +525,16 @@ impl ShaderEntry {
             ShaderEntry::SplitB => "split_b",
             ShaderEntry::Upsample2x => "main",
             ShaderEntry::Upsample2xGrad => "main",
-            ShaderEntry::Conv2d => "main",
             ShaderEntry::Conv2dDw => "main",
             ShaderEntry::MulPerChannel => "main",
             ShaderEntry::AddPerChannel => "main",
             ShaderEntry::Conv2dGemm
             | ShaderEntry::Conv2dGemmSmall
-            | ShaderEntry::Conv2dGemmCoop
             | ShaderEntry::Conv2dGemmCoopGen(..) => "main",
-            ShaderEntry::Conv2dGradInput => "main",
             ShaderEntry::Conv2dGradInputGemm
             | ShaderEntry::Conv2dGradInputGemmSmall
-            | ShaderEntry::Conv2dGradInputGemmCoop
-            | ShaderEntry::Conv2dGradInputGemmCoop3x3
             | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => "main",
-            ShaderEntry::Conv2dGradWeight
-            | ShaderEntry::Conv2dGradWeightGemm
-            | ShaderEntry::Conv2dGradWeightGemmSmall => "main",
+            ShaderEntry::Conv2dGradWeightGemm | ShaderEntry::Conv2dGradWeightGemmSmall => "main",
             ShaderEntry::CacheWrite => "main",
             ShaderEntry::CachedAttention => "main",
             ShaderEntry::RoPEDynamic => "main",
@@ -533,7 +544,6 @@ impl ShaderEntry {
             ShaderEntry::WinogradInputTransform
             | ShaderEntry::WinogradOutputTransform
             | ShaderEntry::WinogradBatchedMatMul
-            | ShaderEntry::WinogradBatchedMatMulSmall
             | ShaderEntry::WinogradWeightTransform => "main",
             ShaderEntry::GradClipZero
             | ShaderEntry::GradClipNormSq
@@ -658,6 +668,19 @@ pub struct Dispatch {
     /// Human-readable label for profiling (e.g. `"MatMul[50,720,960]"`).
     #[serde(default)]
     pub label: String,
+    /// Graph node ids this dispatch implements. One entry normally; several
+    /// after dispatch-level fusion absorbs a neighbor. Provenance only —
+    /// execution never reads it, but labels, plan dumps, profiler rows, and
+    /// `Session::read_node` do.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub origin: Vec<NodeId>,
+    /// The scalar `(shader, workgroups)` this dispatch had before
+    /// cooperative-matrix promotion. Recorded by variant selection so the
+    /// session-build tuner can measure both variants and keep the faster
+    /// one. Not serialized: cached plans are stored pre-selection and
+    /// re-selected per session.
+    #[serde(skip)]
+    pub scalar_fallback: Option<(ShaderEntry, [u32; 3])>,
     /// When `Some`, this dispatch uses a schedule-template-generated
     /// pointwise kernel. The runtime compiles a dedicated pipeline from the
     /// DAG (keyed by `PointwiseDAG::hash_key`) and binds it using the same
@@ -714,6 +737,21 @@ pub struct ExecutionPlan {
     /// Quantized weight buffers: format + matrix dimensions (rows, cols).
     #[serde(default)]
     pub weight_buffers: HashMap<BufferRef, (WeightFormat, usize, usize)>,
+    /// Node id → buffer holding that node's value, for every graph node.
+    /// Debug/introspection only (`Session::read_node`); aliasing may reuse
+    /// the physical allocation once the value's live range ends unless the
+    /// session pins it (debug mode).
+    #[serde(default)]
+    pub node_buffers: Vec<(NodeId, BufferRef)>,
+    /// Names attached via `Graph::named`, for name-based lookup in sessions,
+    /// dumps, and profiler rows.
+    #[serde(default)]
+    pub node_names: Vec<(NodeId, String)>,
+    /// The tuning knobs this plan was compiled with. Dispatch geometry
+    /// depends on them, and pipeline creation must generate WGSL with the
+    /// same values — they travel with the plan, not as ambient globals.
+    #[serde(default)]
+    pub knobs: TuningKnobs,
 }
 
 /// Compile a differentiated graph into an ExecutionPlan.
@@ -834,12 +872,14 @@ fn compile_with_caps_policy(
         }
     }
 
-    fuse_epilogues(&mut compiler.plan);
-    if options.use_schedule_pointwise {
-        fuse_pointwise_chains(&mut compiler.plan);
-    }
-    if options.use_schedule_reduction {
-        fuse_reduction_chains(&mut compiler.plan);
+    if options.fuse_dispatches {
+        fuse_epilogues(&mut compiler.plan);
+        if options.use_schedule_pointwise {
+            fuse_pointwise_chains(&mut compiler.plan);
+        }
+        if options.use_schedule_reduction {
+            fuse_reduction_chains(&mut compiler.plan);
+        }
     }
     // RmsNorm+MatMul prologue fusion is applied later in the runtime, after
     // per-dispatch coop selection — the prologue path currently only has a
@@ -987,6 +1027,7 @@ fn fuse_pointwise_chains(plan: &mut ExecutionPlan) {
             }
             consumer_d.input_buffers = new_inputs;
             consumer_d.pointwise = Some(fused_dag);
+            consumer_d.origin.extend(producer_d.origin.iter().copied());
             // The consumer now reads from more buffers; its ShaderEntry
             // (used only to pick the data layout) must reflect the new
             // arity. The runtime binds via UnaryData for n=1, BinaryData
@@ -1150,6 +1191,7 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                     }
                 }
                 c.input_buffers = new_inputs;
+                c.origin.extend(producer_d.origin.iter().copied());
                 plan.dispatches.remove(pi);
                 fused = true;
                 break 'outer;
@@ -1229,7 +1271,9 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                 c.input_buffers.insert(flat_pos + 1, idx_buf);
                 // Drop the embedding dispatch if it's now unused.
                 if reads.get(&buf).copied().unwrap_or(0) == 1 {
-                    plan.dispatches.remove(pi);
+                    let removed = plan.dispatches.remove(pi);
+                    let ci = if pi < ci { ci - 1 } else { ci };
+                    plan.dispatches[ci].origin.extend(removed.origin);
                 }
                 fused = true;
                 break 'outer2;
@@ -1246,10 +1290,10 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
 /// normalized output and writing it to DRAM, the matmul reads raw x and
 /// multiplies by pre-computed rsqrt and weight during A-tile staging.
 ///
-/// Unlike the disabled `FusedRmsNormMatMul` (which computed rsqrt INSIDE
-/// the matmul via 64-thread tree reduction → 25% regression), this uses
-/// a separate lightweight `RmsNormRsqrt` dispatch, so the matmul prologue
-/// is only two scalar multiplies per A element — essentially free.
+/// Unlike the deleted single-dispatch fused form (which computed rsqrt
+/// INSIDE the matmul via 64-thread tree reduction → 25% regression), this
+/// uses a separate lightweight `RmsNormRsqrt` dispatch, so the matmul
+/// prologue is only two scalar multiplies per A element — essentially free.
 /// Dispatches must already have their runtime `use_coop` decision; scalar
 /// matmuls are deliberately left unchanged.
 pub fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
@@ -1339,7 +1383,10 @@ pub fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
         plan.buffers.push((rows as usize) * 4);
         let rsqrt_buf = BufferRef(rsqrt_buf_idx);
 
-        // Replace the RmsNorm dispatch with RmsNormRsqrt.
+        // Replace the RmsNorm dispatch with RmsNormRsqrt, keeping its
+        // provenance.
+        let norm_origin = plan.dispatches[norm_idx].origin.clone();
+        let norm_label = plan.dispatches[norm_idx].label.clone();
         plan.dispatches[norm_idx] = Dispatch {
             shader: ShaderEntry::RmsNormRsqrt,
             workgroups: [rows, 1, 1],
@@ -1349,11 +1396,16 @@ pub fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
             params: vec![rows, cols, eps_bits, 0],
             use_coop: false,
             use_small_tiles: false,
+            origin: norm_origin.clone(),
+            label: norm_label,
             ..Default::default()
         };
 
-        // Modify the matmul: read raw x instead of normalized x.
+        // Modify the matmul: read raw x instead of normalized x. The
+        // normalization now happens inside the matmul, so it inherits the
+        // norm node's provenance too.
         plan.dispatches[matmul_idx].input_buffers[0] = x_buf;
+        plan.dispatches[matmul_idx].origin.extend(norm_origin);
 
         // Attach the prologue: multiply A-elements by rsqrt[gr] and
         // w_norm[tc]. Also declare both factor buffers as dispatch inputs so
@@ -1525,6 +1577,8 @@ fn fuse_epilogues(plan: &mut ExecutionPlan) {
 
         dispatches[prod_idx].requires_full_precision |= consumer_requires_full_precision;
         dispatches[prod_idx].output_buffer = elem_output;
+        let absorbed_origin = dispatches[i].origin.clone();
+        dispatches[prod_idx].origin.extend(absorbed_origin);
         producer.insert(elem_output, prod_idx);
 
         to_remove.push(i);
@@ -1551,6 +1605,30 @@ fn unary_shader_to_pointwise(shader: &ShaderEntry) -> Option<PointwiseDAG> {
         ShaderEntry::Log => Pw::Log(0),
         ShaderEntry::Recip => Pw::Recip(0),
         ShaderEntry::Silu => Pw::Silu(0),
+        ShaderEntry::Gelu => {
+            // Tanh-approx GELU, bit-matching unary.wgsl's `gelu` entry:
+            // 0.5 * x * (1 + tanh(0.7978845608 * (x + 0.044715 * x³)))
+            return Some(PointwiseDAG {
+                n_inputs: 1,
+                ops: vec![
+                    Pw::LoadInput(0),           // v0 = x
+                    Pw::Mul(0, 0),              // v1 = x²
+                    Pw::Mul(1, 0),              // v2 = x³
+                    Pw::const_f32(0.044715),    // v3
+                    Pw::Mul(2, 3),              // v4 = 0.044715·x³
+                    Pw::Add(0, 4),              // v5 = x + 0.044715·x³
+                    Pw::const_f32(0.797_884_6), // v6 = sqrt(2/π)
+                    Pw::Mul(5, 6),              // v7 = inner
+                    Pw::Tanh(7),                // v8
+                    Pw::const_f32(1.0),         // v9
+                    Pw::Add(8, 9),              // v10 = 1 + tanh
+                    Pw::const_f32(0.5),         // v11
+                    Pw::Mul(0, 11),             // v12 = 0.5·x
+                    Pw::Mul(12, 10),            // v13 = gelu
+                ],
+                output: 13,
+            });
+        }
         _ => return None,
     };
     Some(PointwiseDAG {
@@ -1635,6 +1713,9 @@ impl<'a> Compiler<'a> {
                 lse_buffers: Vec::new(),
                 derived_params: Vec::new(),
                 weight_buffers: HashMap::new(),
+                node_buffers: Vec::new(),
+                node_names: Vec::new(),
+                knobs: options.knobs,
             },
             node_buffers: HashMap::new(),
             options,
@@ -1677,7 +1758,7 @@ impl<'a> Compiler<'a> {
             );
         }
         // EPT (elements per thread) must match forward codegen.
-        let ept = head_dim.min(crate::codegen::flash_ept_cap());
+        let ept = head_dim.min(self.options.knobs.flash_ept_cap);
         let tpq = head_dim / ept; // threads per query
         let bq = (256 / tpq).max(1);
         if bq >= 2 && q_seq >= bq {
@@ -1787,8 +1868,25 @@ impl<'a> Compiler<'a> {
         // Processing in ID order would dispatch consumers before producers.
         let topo = topological_order(self.graph);
         for &node_id in &topo {
+            let first_new = self.plan.dispatches.len();
             self.compile_node(&self.graph.nodes()[node_id as usize]);
+            // Stamp provenance on every dispatch this node emitted.
+            for d in &mut self.plan.dispatches[first_new..] {
+                d.origin.push(node_id);
+            }
         }
+
+        // Record the node → buffer map and node names for debug readback.
+        let mut node_buffers: Vec<(NodeId, BufferRef)> =
+            self.node_buffers.iter().map(|(&n, &b)| (n, b)).collect();
+        node_buffers.sort_unstable_by_key(|&(n, _)| n);
+        self.plan.node_buffers = node_buffers;
+        self.plan.node_names = self
+            .graph
+            .nodes()
+            .iter()
+            .filter_map(|n| n.name.clone().map(|name| (n.id, name)))
+            .collect();
 
         // Generate labels for profiling
         for d in &mut self.plan.dispatches {
@@ -1830,12 +1928,6 @@ impl<'a> Compiler<'a> {
                 | ShaderEntry::LayerNormGradX => {
                     format!("{:?}[{}x{}]", d.shader, d.params[0], d.params[1])
                 }
-                ShaderEntry::FusedRmsNormMatMul => {
-                    format!(
-                        "{:?}[{}x{}x{}]",
-                        d.shader, d.params[0], d.params[2], d.params[1]
-                    )
-                }
                 _ => {
                     if d.params[0] > 0 {
                         format!("{:?}[{}]", d.shader, d.params[0])
@@ -1844,6 +1936,12 @@ impl<'a> Compiler<'a> {
                     }
                 }
             };
+            // Prefix the graph-level name when the originating node has one,
+            // so profiler rows and dumps read "blk3.mlp.gate: MatMul[...]"
+            // instead of a dozen identical "MatMul[...]" entries.
+            if let Some(name) = d.origin.iter().find_map(|&n| self.graph.node_name(n)) {
+                d.label = format!("{name}: {}", d.label);
+            }
         }
 
         // Outputs layout (from autodiff): [user_outputs..., param_grads...]
@@ -2225,6 +2323,7 @@ impl<'a> Compiler<'a> {
                         ops: vec![Pw::LoadInput(0)],
                         output: 0,
                     },
+                    extra_prologues: vec![],
                     epilogue: None,
                     n_per_elem: 1,
                     n_per_row: 0,
@@ -3316,20 +3415,24 @@ impl<'a> Compiler<'a> {
                 let shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let rows = shape[0] as u32;
                 let cols = shape[1] as u32;
-                // One workgroup per row — threads inside cooperate on the
-                // mean/variance reduction. Matches the new shader's
-                // workgroup-cooperative layout.
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::LayerNorm,
-                    workgroups: [rows, 1, 1],
-                    input_buffers: vec![x, w, bias],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![rows, cols, eps.to_bits(), 0],
-                    use_coop: false,
-                    use_small_tiles: false,
-                    ..Default::default()
-                });
+                if self.options.use_schedule_reduction {
+                    self.emit_layernorm_schedule(x, w, bias, out_buf, rows, cols, eps);
+                } else {
+                    // One workgroup per row — threads inside cooperate on the
+                    // mean/variance reduction. Matches the hand-written
+                    // shader's workgroup-cooperative layout.
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::LayerNorm,
+                        workgroups: [rows, 1, 1],
+                        input_buffers: vec![x, w, bias],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params: vec![rows, cols, eps.to_bits(), 0],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
+                }
             }
 
             Op::FullAttention {
@@ -3460,7 +3563,7 @@ impl<'a> Compiler<'a> {
                         q_seq,
                         head_dim,
                         num_heads,
-                        crate::codegen::flash_grad_q_ept_cap(),
+                        self.options.knobs.flash_grad_q_ept_cap,
                     );
                     let mapped = match raw_shader {
                         ShaderEntry::FlashAttention => ShaderEntry::FlashGradQ,
@@ -3534,7 +3637,7 @@ impl<'a> Compiler<'a> {
                     dispatch_kv,
                     head_dim,
                     num_kv_heads,
-                    crate::codegen::flash_grad_kv_ept_cap(),
+                    self.options.knobs.flash_grad_kv_ept_cap,
                 );
                 // See GradQ above: reduced-input precision in backward is an
                 // experimental opt-in until its error is bounded (or loss
@@ -3633,38 +3736,6 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![len, 0, 0, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
-                    ..Default::default()
-                });
-            }
-
-            Op::FusedRmsNormMatMul { eps } => {
-                // Single dispatch: coop matmul with cooperative rsqrt prologue.
-                // The coop shader (matmul_rms_norm_coop.wgsl) computes rsqrt using
-                // 64-thread tree reduction in the prologue, then applies normalization
-                // during the A-staging phase with tensor cores.
-                let x = self.get_buffer(node.inputs[0]);
-                let w_norm = self.get_buffer(node.inputs[1]);
-                let w_proj = self.get_buffer(node.inputs[2]);
-                let x_shape = &self.graph.node(node.inputs[0]).ty.shape;
-                let w_proj_shape = &self.graph.node(node.inputs[2]).ty.shape;
-                let m = x_shape[0] as u32;
-                let k = x_shape[1] as u32;
-                let n = w_proj_shape[1] as u32;
-
-                // Single fused dispatch: rsqrt prologue + coop matmul
-                // input_buffers: [x, w_proj, w_norm] for scalar path
-                //                [x, w_proj, (unused), w_norm] for coop path
-                // The coop selection will mark this for coop and the runtime
-                // binds FusedRmsNormMatMulCoopData with rsqrt_cache in shared mem.
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::FusedRmsNormMatMul,
-                    workgroups: [n.div_ceil(64), m.div_ceil(64), 1],
-                    input_buffers: vec![x, w_norm, w_proj],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![m, n, k, eps.to_bits()],
                     use_coop: false,
                     use_small_tiles: false,
                     ..Default::default()
@@ -3859,6 +3930,7 @@ impl<'a> Compiler<'a> {
         let max_kernel = ReductionKernel {
             op: ReduceOp::Max,
             prologue: max_prologue,
+            extra_prologues: vec![],
             epilogue: None,
             n_per_elem: 1,
             n_per_row: 0,
@@ -3909,6 +3981,7 @@ impl<'a> Compiler<'a> {
         let sum_kernel = ReductionKernel {
             op: ReduceOp::Sum,
             prologue: sum_prologue,
+            extra_prologues: vec![],
             epilogue: Some(ReductionEpilogue {
                 dag: sum_epilogue_dag,
                 n_per_col_inputs: 0,
@@ -3932,6 +4005,98 @@ impl<'a> Compiler<'a> {
             use_coop: false,
             use_small_tiles: false,
             reduction: Some(sum_kernel),
+            ..Default::default()
+        });
+    }
+
+    /// Emit LayerNorm as a single schedule-template reduction with two
+    /// accumulators:
+    ///   prologues: x and x*x (sum and sum-of-squares)
+    ///   op: Sum
+    ///   epilogue: (x - mean) * rsqrt(var + eps) * weight[col] + bias[col]
+    ///   where mean = r0/cols, var = r1/cols - mean².
+    #[allow(clippy::too_many_arguments)]
+    fn emit_layernorm_schedule(
+        &mut self,
+        x: BufferRef,
+        w: BufferRef,
+        bias: BufferRef,
+        out_buf: BufferRef,
+        rows: u32,
+        cols: u32,
+        eps: f32,
+    ) {
+        use crate::schedule::{PointwiseDAG, Pw, ReduceOp, ReductionEpilogue, ReductionKernel};
+
+        const WG: u32 = 256;
+
+        let sum_x = PointwiseDAG {
+            n_inputs: 1,
+            ops: vec![Pw::LoadInput(0)],
+            output: 0,
+        };
+        let sum_x2 = PointwiseDAG {
+            n_inputs: 1,
+            ops: vec![Pw::LoadInput(0), Pw::Mul(0, 0)],
+            output: 1,
+        };
+
+        // Epilogue inputs (canonical layout):
+        //   0 = x[row, col]   (per-elem)
+        //   1 = weight[col]   (per-col)
+        //   2 = bias[col]     (per-col)
+        //   3 = sum(x)        (reduced 0)
+        //   4 = sum(x*x)      (reduced 1)
+        let inv_cols = Pw::const_f32(1.0 / cols as f32);
+        let eps_c = Pw::const_f32(eps);
+        let epilogue_dag = PointwiseDAG {
+            n_inputs: 5,
+            ops: vec![
+                Pw::LoadInput(0), // v0 = x
+                Pw::LoadInput(1), // v1 = weight
+                Pw::LoadInput(2), // v2 = bias
+                Pw::LoadInput(3), // v3 = sum(x)
+                Pw::LoadInput(4), // v4 = sum(x*x)
+                inv_cols,         // v5 = 1/cols
+                eps_c,            // v6 = eps
+                Pw::Mul(3, 5),    // v7 = mean
+                Pw::Mul(4, 5),    // v8 = E[x²]
+                Pw::Mul(7, 7),    // v9 = mean²
+                Pw::Sub(8, 9),    // v10 = var
+                Pw::Add(10, 6),   // v11 = var + eps
+                Pw::Rsqrt(11),    // v12 = rsqrt(var + eps)
+                Pw::Sub(0, 7),    // v13 = x - mean
+                Pw::Mul(13, 12),  // v14 = normalized
+                Pw::Mul(14, 1),   // v15 = * weight
+                Pw::Add(15, 2),   // v16 = + bias
+            ],
+            output: 16,
+        };
+
+        let kernel = ReductionKernel {
+            op: ReduceOp::Sum,
+            prologue: sum_x,
+            extra_prologues: vec![sum_x2],
+            epilogue: Some(ReductionEpilogue {
+                dag: epilogue_dag,
+                n_per_col_inputs: 2,
+            }),
+            n_per_elem: 1,
+            n_per_row: 0,
+            workgroup_size: WG,
+            gather_elem: Vec::new(),
+        };
+
+        self.plan.dispatches.push(Dispatch {
+            shader: ShaderEntry::LayerNorm, // sentinel for layout family
+            workgroups: [rows, 1, 1],
+            input_buffers: vec![x, w, bias],
+            output_buffer: out_buf,
+            extra_outputs: vec![],
+            params: vec![rows, cols, eps.to_bits(), 0],
+            use_coop: false,
+            use_small_tiles: false,
+            reduction: Some(kernel),
             ..Default::default()
         });
     }
@@ -3988,6 +4153,7 @@ impl<'a> Compiler<'a> {
         let kernel = ReductionKernel {
             op: ReduceOp::Sum,
             prologue,
+            extra_prologues: vec![],
             epilogue: Some(ReductionEpilogue {
                 dag: epilogue_dag,
                 n_per_col_inputs: 1,
@@ -4463,7 +4629,6 @@ mod tests {
             ShaderEntry::RmsNormGradX,
             ShaderEntry::LayerNormGradWB,
             ShaderEntry::LayerNormGradX,
-            ShaderEntry::FusedRmsNormMatMul,
         ];
         for entry in &entries {
             let _group = entry.shader_group();

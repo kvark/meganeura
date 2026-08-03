@@ -75,11 +75,6 @@ impl std::fmt::Display for MemorySummary {
     }
 }
 
-/// Minimum workgroup count below which the cooperative-matrix (2×2-tile) path is
-/// skipped and the scalar tiled matmul is used instead.
-///
-/// On discrete GPUs (NVIDIA, AMD dGPU), tensor core throughput is so much higher
-/// than scalar ALUs that the coop path wins even at moderate workgroup counts.
 /// Minimum cooperative matrix workgroups for conv2d backward GEMM.
 /// Conv2d backward has all-scalar staging with heavy im2col decomposition
 /// and only 64 threads vs 256 for the scalar shader.
@@ -92,18 +87,6 @@ const MIN_COOP_WORKGROUPS_CONV_BWD: u32 = 16;
 struct MatMulData {
     matrix_a: blade_graphics::BufferPiece,
     matrix_b: blade_graphics::BufferPiece,
-    matrix_c: blade_graphics::BufferPiece,
-    params: MatMulParams,
-}
-
-// fused_rms_norm_matmul_coop: var matrix_a, matrix_b, rsqrt_buf, w_norm, matrix_c, params
-#[derive(blade_macros::ShaderData)]
-#[allow(unused)] // Coop path is currently disabled
-struct FusedRmsNormMatMulCoopData {
-    matrix_a: blade_graphics::BufferPiece,
-    matrix_b: blade_graphics::BufferPiece,
-    rsqrt_buf: blade_graphics::BufferPiece,
-    w_norm: blade_graphics::BufferPiece,
     matrix_c: blade_graphics::BufferPiece,
     params: MatMulParams,
 }
@@ -807,6 +790,10 @@ impl Pipelines {
         use crate::codegen::ShaderGroup;
         use blade_graphics as bg;
 
+        // Generated attention kernels must agree with the plan's dispatch
+        // geometry, so their knobs come from the plan itself.
+        let knobs = plan.knobs;
+
         // Collect which shader groups are needed.
         // For matmul entries, compile BOTH scalar and coop if any dispatch uses coop.
         let mut needed: HashSet<ShaderGroup> = HashSet::new();
@@ -818,19 +805,28 @@ impl Pipelines {
 
         for dispatch in &plan.dispatches {
             let group = dispatch.shader.shader_group();
-            // Generated conv2d coop entries and Conv2dGradInputGemmCoop3x3
-            // are coop-only; skip for non-coop map.
+            // Generated conv2d coop entries are coop-only; skip for non-coop map.
             let is_gen_coop = matches!(
                 dispatch.shader,
                 ShaderEntry::Conv2dGradInputGemmCoopGen(..) | ShaderEntry::Conv2dGemmCoopGen(..)
             );
-            if group != ShaderGroup::Conv2dGradInputGemmCoop3x3 && !is_gen_coop {
+            if !is_gen_coop {
                 needed.insert(group);
             }
             entries_for_group
                 .entry(group)
                 .or_default()
                 .insert(dispatch.shader.clone());
+            // The tuner may flip a coop-promoted dispatch back to its scalar
+            // variant at runtime; make sure that variant's pipeline exists.
+            if let Some((ref fb_shader, _)) = dispatch.scalar_fallback {
+                let fb_group = fb_shader.shader_group();
+                needed.insert(fb_group);
+                entries_for_group
+                    .entry(fb_group)
+                    .or_default()
+                    .insert(fb_shader.clone());
+            }
             // Attention dispatches store head_dim at params[3].
             if matches!(
                 group,
@@ -871,10 +867,6 @@ impl Pipelines {
                     ShaderGroup::Conv2dGradInputGemm | ShaderGroup::Conv2dGradInputGemmCoop => {
                         ShaderGroup::Conv2dGradInputGemmCoop
                     }
-                    ShaderGroup::Conv2dGradInputGemmCoop3x3 => {
-                        ShaderGroup::Conv2dGradInputGemmCoop3x3
-                    }
-                    ShaderGroup::FusedRmsNormMatMul => ShaderGroup::FusedRmsNormMatMulCoop,
                     _ => continue,
                 };
                 needed_coop.insert(coop_group);
@@ -992,15 +984,21 @@ impl Pipelines {
         for (entry, hd) in attention_entries {
             let group = entry.shader_group();
             let sm = match group {
-                ShaderGroup::FlashAttention => crate::codegen::generate_flash_attention_module(hd),
+                ShaderGroup::FlashAttention => {
+                    crate::codegen::generate_flash_attention_module(hd, knobs.flash_ept_cap)
+                }
                 ShaderGroup::FlashAttentionCoop => {
                     crate::codegen::generate_flash_attention_coop_module(hd)
                 }
-                ShaderGroup::FlashGradQ => crate::codegen::generate_flash_grad_q_module(hd),
+                ShaderGroup::FlashGradQ => {
+                    crate::codegen::generate_flash_grad_q_module(hd, knobs.flash_grad_q_ept_cap)
+                }
                 ShaderGroup::FlashGradQCoop => {
                     crate::codegen::generate_flash_grad_q_coop_module(hd)
                 }
-                ShaderGroup::FlashGradKV => crate::codegen::generate_flash_grad_kv_module(hd),
+                ShaderGroup::FlashGradKV => {
+                    crate::codegen::generate_flash_grad_kv_module(hd, knobs.flash_grad_kv_ept_cap)
+                }
                 ShaderGroup::FlashGradKVCoop => {
                     crate::codegen::generate_flash_grad_kv_coop_module(hd)
                 }
@@ -1683,7 +1681,6 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
             FourBufData::layout()
         }
         ShaderEntry::LayerNormGradWB | ShaderEntry::LayerNormGradX => FourBufData::layout(),
-        ShaderEntry::FusedRmsNormMatMul => FourBufData::layout(),
         ShaderEntry::RmsNormRsqrt => UnaryData::layout(),
         ShaderEntry::GroupNorm | ShaderEntry::GroupNormSilu => GroupNormData::layout(),
         ShaderEntry::GroupNormGradInput => GroupNormGradInputData::layout(),
@@ -1691,23 +1688,18 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::Concat => BinaryData::layout(),
         ShaderEntry::SplitA | ShaderEntry::SplitB => UnaryData::layout(),
         ShaderEntry::Upsample2x | ShaderEntry::Upsample2xGrad => UnaryData::layout(),
-        ShaderEntry::Conv2d => Conv2dData::layout(),
         ShaderEntry::Conv2dDw => Conv2dDwData::layout(),
         ShaderEntry::MulPerChannel => MulPerChannelData::layout(),
         ShaderEntry::AddPerChannel => AddPerChannelData::layout(),
         ShaderEntry::Conv2dGemm
         | ShaderEntry::Conv2dGemmSmall
-        | ShaderEntry::Conv2dGemmCoop
         | ShaderEntry::Conv2dGemmCoopGen(..) => Conv2dData::layout(),
-        ShaderEntry::Conv2dGradInput => Conv2dGradInputData::layout(),
         ShaderEntry::Conv2dGradInputGemm
         | ShaderEntry::Conv2dGradInputGemmSmall
-        | ShaderEntry::Conv2dGradInputGemmCoop
-        | ShaderEntry::Conv2dGradInputGemmCoop3x3
         | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => Conv2dGradInputData::layout(),
-        ShaderEntry::Conv2dGradWeight
-        | ShaderEntry::Conv2dGradWeightGemm
-        | ShaderEntry::Conv2dGradWeightGemmSmall => Conv2dGradWeightData::layout(),
+        ShaderEntry::Conv2dGradWeightGemm | ShaderEntry::Conv2dGradWeightGemmSmall => {
+            Conv2dGradWeightData::layout()
+        }
         ShaderEntry::RoPEDynamic => RoPEDynamicData::layout(),
         ShaderEntry::CacheWrite => CacheWriteData::layout(),
         ShaderEntry::CachedAttention => CachedAttentionData::layout(),
@@ -1717,9 +1709,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::WinogradInputTransform
         | ShaderEntry::WinogradOutputTransform
         | ShaderEntry::WinogradWeightTransform => WinogradTransformData::layout(),
-        ShaderEntry::WinogradBatchedMatMul | ShaderEntry::WinogradBatchedMatMulSmall => {
-            MatMulData::layout()
-        }
+        ShaderEntry::WinogradBatchedMatMul => MatMulData::layout(),
         ShaderEntry::GradClipZero => GradClipZeroData::layout(),
         ShaderEntry::GradClipNormSq => GradClipNormSqData::layout(),
         ShaderEntry::GradClipScale => GradClipScaleData::layout(),
@@ -1798,6 +1788,347 @@ fn compute_groups(dispatches: &[Dispatch]) -> Vec<std::ops::Range<usize>> {
 ///
 /// Holds all blade-graphics resources: context, buffers, pipelines.
 /// Calling `step()` replays the pre-compiled dispatch sequence.
+/// Per-dispatch kernel-variant selection — the single owner of the runtime
+/// decisions that were historically smeared across session construction
+/// (roadmap A2): cooperative-matrix promotion (including generated conv
+/// kernels and output padding), the RmsNorm→matmul prologue fusion that
+/// depends on it, and small-tile demotion. Mutates the plan in place.
+/// Capability and precision constraints are enforced here and nowhere else;
+/// a tuner re-runs measurement over the choices this pass makes.
+pub(crate) fn select_variants(
+    plan: &mut ExecutionPlan,
+    coop_config: Option<&crate::codegen::CoopConfig>,
+    fuse_prologues: bool,
+) {
+    if let Some(config) = coop_config {
+        use crate::codegen::ShaderGroup;
+        let output_tile = config.output_tile();
+        let _half_tile = config.tile_size;
+        // Apple's native 8x8 f32 cooperative matrix path is useful for
+        // compact GEMMs, but loses to the scalar tiled kernels once a
+        // dimension grows beyond 1024. Its forward convolution staging
+        // is also slower than the scalar im2col path; grad-input remains
+        // profitable and is selected independently below.
+        let apple_f32_coop = cfg!(all(target_os = "macos", target_arch = "aarch64"))
+            && !config.use_f16_input
+            && config.tile_size == 8;
+        for dispatch in &mut plan.dispatches {
+            // Autodiff marks derivative work as f32-sensitive. NVIDIA's
+            // TF32 keeps the f32 exponent range, but our portable f16
+            // cooperative path does not: tiny gradient operands can
+            // underflow before accumulation. A native f32 cooperative
+            // implementation is still safe and remains eligible.
+            if config.use_f16_input && dispatch.requires_full_precision {
+                continue;
+            }
+            // Cooperative epilogues are supported for the compiler's
+            // current unary PointwiseDAG chains. They stage matrix
+            // accumulators through workgroup memory, then apply scalar
+            // WGSL with bounds checks. Legacy-only plans and DAGs needing
+            // extra storage bindings stay on scalar geometry.
+            if !dispatch.epilogue.is_empty() || dispatch.matmul_epilogue.is_some() {
+                match dispatch.matmul_epilogue {
+                    Some(ref epilogue) if epilogue.inputs.is_empty() => {}
+                    _ => continue,
+                }
+            }
+            let group = dispatch.shader.shader_group();
+            // Extract (m, n, k, batch) from dispatch params based on shader group.
+            let (m, n, k, batch) = match group {
+                ShaderGroup::MatMul | ShaderGroup::MatMulAdd => (
+                    dispatch.params[0],
+                    dispatch.params[2],
+                    dispatch.params[1],
+                    1u32,
+                ),
+                ShaderGroup::Conv2dGemm => {
+                    // Forward: C[Co, oH*oW] = W[Co, K] × im2col[K, oH*oW]
+                    // params: [batch, in_channels, in_h, in_w, out_channels, kernel_h, kernel_w, stride, padding_h, out_h, out_w, padding_w]
+                    let out_ch = dispatch.params[4];
+                    let kh = dispatch.params[5];
+                    let kw = dispatch.params[6];
+                    let in_ch = dispatch.params[1];
+                    let out_h = dispatch.params[9];
+                    let out_w = dispatch.params[10];
+                    (out_ch, out_h * out_w, in_ch * kh * kw, dispatch.params[0])
+                }
+                ShaderGroup::Conv2dGradInputGemm => {
+                    // params: [batch, in_channels, in_h, in_w, out_channels, kernel_h, kernel_w, stride, padding, out_h, out_w, ...]
+                    let in_ch = dispatch.params[1];
+                    let in_h = dispatch.params[2];
+                    let in_w = dispatch.params[3];
+                    let out_ch = dispatch.params[4];
+                    let kh = dispatch.params[5];
+                    let kw = dispatch.params[6];
+                    (in_ch, in_h * in_w, out_ch * kh * kw, dispatch.params[0])
+                }
+                ShaderGroup::MatMulAT | ShaderGroup::MatMulBT => (
+                    dispatch.params[0],
+                    dispatch.params[1],
+                    dispatch.params[2],
+                    1u32,
+                ),
+                _ => continue,
+            };
+            if apple_f32_coop
+                && (matches!(group, ShaderGroup::Conv2dGemm)
+                    || (matches!(
+                        group,
+                        ShaderGroup::MatMul
+                            | ShaderGroup::MatMulAdd
+                            | ShaderGroup::MatMulAT
+                            | ShaderGroup::MatMulBT
+                    ) && m.max(n).max(k) > 1024))
+            {
+                continue;
+            }
+            let coop_wgs = m.div_ceil(output_tile) * n.div_ceil(output_tile) * batch;
+            // Conv2d backward GEMM has all-scalar staging with heavy im2col
+            // decomposition (integer division), and only 64 threads vs 256
+            // for the scalar shader. Require more workgroups to amortize.
+            let is_conv_bwd = matches!(group, ShaderGroup::Conv2dGradInputGemm);
+            let min_wgs = if is_conv_bwd {
+                MIN_COOP_WORKGROUPS_CONV_BWD
+            } else if config.use_f16_input {
+                // On discrete NVIDIA GPUs the f16 cooperative kernel's
+                // shared-memory staging costs more than the scalar tile
+                // kernel at low occupancy. Representative transformer
+                // projections with 20--72 output workgroups regress,
+                // while the wider backward/MLP shapes win once there are
+                // enough independent tiles to fill the device.
+                128
+            } else {
+                16 // enables coop for attention K/V projections (N=320, 20 WGs)
+            };
+            // matmul_coop.wgsl's vec4 staging packs 4 consecutive elements
+            // from the contiguous axis into a single 128-bit load. The
+            // gating expression `(tr4 + 4u) <= k` / `(v4_col + 4u) <= n`
+            // skips the load whenever the relevant dimension is < 4,
+            // zero-padding the whole tile and silently producing zero
+            // output. Refuse to enable coop in those cases — the scalar
+            // / small-tile fallbacks handle them correctly.
+            //
+            // Required vec4 dimensions per variant:
+            //   * MatMul / MatMulAdd:  A vec4 along K, B vec4 along N.
+            //   * MatMulAT:            A vec4-T along M, B vec4 along N.
+            //   * MatMulBT:            A vec4 along K, B vec4-T along K.
+            // matmul_coop.wgsl correctness conditions:
+            //
+            //   * Vec4 STAGING along the K direction (vec4_a for
+            //     Normal/BT, vec4_b_transposed for BT) now has a
+            //     per-lane fallback (codegen.rs), so any K is fine for
+            //     those variants.
+            //
+            //   * The OUTPUT STORE uses `coopStoreT(acc, &c[row*n+col],
+            //     n)` which writes a 16×16 sub-tile with row stride
+            //     `n`. A right-edge tile with N not divisible by 16
+            //     straddles logical rows, so it remains unsupported. A
+            //     bottom-edge tile is safe: session construction pads the
+            //     allocation to `ceil(M/16) * N`, and consumers retain the
+            //     logical M extent, so the extra rows are never observed.
+            //     Allowing partial M tiles is important for sequence
+            //     lengths such as 50, which dominate transformer training.
+            //
+            // (Conv2dGemm also stores via coopStoreT and needs the same
+            // check; its `m`/`n` come from the params destructure above.)
+            let store_ok = n.is_multiple_of(16);
+            let vec4_ok = match group {
+                ShaderGroup::MatMulBT => store_ok,
+                ShaderGroup::MatMulAT => store_ok,
+                ShaderGroup::Conv2dGradInputGemm => {
+                    // Generated f32 grad-input kernels stage a partial
+                    // right-edge tile through shared memory for
+                    // bounds-checked stores. f16 kernels retain the
+                    // direct-store alignment gate.
+                    (!config.use_f16_input || store_ok) && k >= 4
+                }
+                ShaderGroup::Conv2dGemm => store_ok && k >= 4,
+                ShaderGroup::MatMul | ShaderGroup::MatMulAdd => store_ok && k >= 4,
+                _ => true,
+            };
+            let _ = k;
+            if coop_wgs >= min_wgs && !dispatch.weight_format.uses_reduced_storage() && vec4_ok {
+                // Remember the scalar variant so `Session::tune` can flip
+                // this dispatch back and measure both. Rides on the
+                // dispatch, so it survives reordering.
+                dispatch.scalar_fallback = Some((dispatch.shader.clone(), dispatch.workgroups));
+                dispatch.use_coop = true;
+                // Route conv2d coop dispatches to generated specialized kernels
+                if is_conv_bwd {
+                    let kh = dispatch.params[5];
+                    let kw = dispatch.params[6];
+                    let stride = dispatch.params[7];
+                    dispatch.shader = ShaderEntry::Conv2dGradInputGemmCoopGen(kh, kw, stride);
+                } else if matches!(group, ShaderGroup::Conv2dGemm) {
+                    let kh = dispatch.params[5];
+                    let kw = dispatch.params[6];
+                    let stride = dispatch.params[7];
+                    dispatch.shader = ShaderEntry::Conv2dGemmCoopGen(kh, kw, stride);
+                }
+                dispatch.workgroups = [m.div_ceil(output_tile), n.div_ceil(output_tile), batch];
+                // coopStore/coopLoad operate on full tiles without per-element
+                // bounds checking. Pad output and addend buffers so edge
+                // tiles don't read/write past the end.
+                let padded_m = m.div_ceil(output_tile) * output_tile;
+                let padded_n = n.div_ceil(output_tile) * output_tile;
+                let padded_bytes = (padded_m * padded_n * batch * 4) as usize;
+                let buf_idx = dispatch.output_buffer.0 as usize;
+                if plan.buffers[buf_idx] < padded_bytes {
+                    plan.buffers[buf_idx] = padded_bytes;
+                }
+                // FusedMatMulAdd: also pad the addend (src) buffer.
+                if dispatch.input_buffers.len() > 2 {
+                    let src_idx = dispatch.input_buffers[2].0 as usize;
+                    if plan.buffers[src_idx] < padded_bytes {
+                        plan.buffers[src_idx] = padded_bytes;
+                    }
+                }
+            }
+        }
+    }
+
+    // Apply RmsNorm+MatMul prologue fusion only after per-dispatch coop
+    // selection. A coop-capable device can still route small matmuls to a
+    // scalar pipeline, which has no prologue implementation. The fusion
+    // pass filters on `use_coop` and records its factor buffers as declared
+    // inputs for scheduling and memory planning. Debug sessions skip it —
+    // dispatch-level fusion is numerics-neutral, and keeping the RmsNorm
+    // output materialized is the point of debug mode.
+    if fuse_prologues {
+        crate::compile::fuse_rmsnorm_prologues(plan);
+    }
+
+    // Small-tile selection: use 32×32 tiles when the 64×64 dispatch
+    // produces very few workgroups (< 16). The 4× more workgroups from
+    // smaller tiles improve occupancy on GPUs with many SMs.
+    {
+        use crate::codegen::ShaderGroup;
+        for dispatch in plan.dispatches.iter_mut() {
+            if dispatch.use_coop
+                || dispatch.use_small_tiles
+                || dispatch.weight_format.uses_reduced_storage()
+            {
+                continue;
+            }
+            let group = dispatch.shader.shader_group();
+            let wgs_64: u32 = dispatch.workgroups.iter().product();
+            let has_small = matches!(
+                group,
+                ShaderGroup::MatMul
+                    | ShaderGroup::MatMulAdd
+                    | ShaderGroup::MatMulAT
+                    | ShaderGroup::MatMulBT
+            );
+            if has_small && wgs_64 < 16 {
+                dispatch.use_small_tiles = true;
+                // 32×32 tiles → double the WG count in each spatial dimension
+                dispatch.workgroups[0] *= 2;
+                dispatch.workgroups[1] *= 2;
+            }
+        }
+    }
+}
+
+/// Options for session construction beyond the plan itself.
+#[derive(Clone, Debug, Default)]
+pub struct SessionOptions {
+    /// Debug session: disable buffer aliasing and device-local placement so
+    /// every node's value stays materialized, host-visible, and readable via
+    /// [`Session::read_node`] after a step. Costs memory and bandwidth;
+    /// intended for development, not benchmarking.
+    pub debug: bool,
+}
+
+/// Why [`Session::read_node`] could not return a value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadNodeError {
+    /// The node id has no buffer in the plan (out of range, or the plan
+    /// predates provenance recording).
+    UnknownNode,
+    /// No node carries this name. Contains the names that do exist.
+    UnknownName(Vec<String>),
+    /// The value was eliminated by fusion: its buffer is never written.
+    /// Rebuild with `build_session_unoptimized` / `MEGANEURA_OPTIMIZER=off`
+    /// or mark the node as an output to keep it.
+    FusedAway,
+    /// The buffer shares a physical allocation with other values
+    /// (lifetime aliasing), so its content after a step may belong to a
+    /// later tenant. Build the session with [`SessionOptions::debug`] to
+    /// pin everything.
+    Aliased,
+}
+
+impl std::fmt::Display for ReadNodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            ReadNodeError::UnknownNode => write!(f, "node id has no buffer in the plan"),
+            ReadNodeError::UnknownName(ref names) => {
+                write!(f, "no node with this name; named nodes: {names:?}")
+            }
+            ReadNodeError::FusedAway => write!(
+                f,
+                "value was fused into a neighboring kernel and never materialized; \
+                 rebuild unoptimized or mark it as an output"
+            ),
+            ReadNodeError::Aliased => write!(
+                f,
+                "buffer is lifetime-aliased and may hold a later value; \
+                 use a debug session (SessionOptions {{ debug: true }})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReadNodeError {}
+
+/// Result of measuring one variant family in [`Session::tune`].
+#[derive(Clone, Debug)]
+pub struct TuneOutcome {
+    /// Which family of dispatches was measured ("matmul-coop", "conv-coop").
+    pub family: &'static str,
+    /// Number of dispatches in the family.
+    pub dispatches: usize,
+    /// Median `step()` wall-clock with the family on its selected
+    /// (cooperative) variant, in milliseconds.
+    pub coop_ms: f64,
+    /// Median `step()` wall-clock with the family flipped to scalar.
+    pub scalar_ms: f64,
+    /// Whether the cooperative variant was kept.
+    pub kept_coop: bool,
+}
+
+/// One suspicious dispatch output found by [`Session::step_debug`].
+#[derive(Clone, Debug)]
+pub struct DispatchAnomaly {
+    /// Index into `plan.dispatches`.
+    pub dispatch: usize,
+    /// Human-readable label (includes the graph-node name when present).
+    pub label: String,
+    /// Graph node ids this dispatch implements.
+    pub origin: Vec<u32>,
+    pub has_nan: bool,
+    pub has_inf: bool,
+    pub max_abs: f32,
+}
+
+/// Result of [`Session::step_debug`]: the per-dispatch numeric health scan.
+#[derive(Clone, Debug, Default)]
+pub struct DebugStepReport {
+    /// Dispatches whose output contains NaN/Inf, in execution order. The
+    /// first entry is where the problem enters the plan.
+    pub anomalies: Vec<DispatchAnomaly>,
+    /// Dispatches skipped because their output buffer is aliased (only in
+    /// non-debug sessions).
+    pub skipped_aliased: usize,
+}
+
+impl DebugStepReport {
+    /// The first dispatch that produced NaN/Inf, if any.
+    pub fn first_bad(&self) -> Option<&DispatchAnomaly> {
+        self.anomalies.first()
+    }
+}
+
 pub struct Session {
     gpu: Arc<Gpu>,
     /// Per-logical-buffer view: `buffers[i]` backs `BufferRef(i)`. Aliased
@@ -1825,6 +2156,11 @@ pub struct Session {
     /// When true, run in multi-pass mode: one compute pass per dispatch
     /// with individual GPU timestamps. Enables `dump_gpu_timings()`.
     profiling: bool,
+    /// Debug session: aliasing off, every buffer host-visible, all node
+    /// values readable via [`Session::read_node`].
+    debug: bool,
+    /// Per logical buffer: written by any dispatch or session setup.
+    written: Vec<bool>,
     /// Active SGD learning rate. When set, every `step()` appends SGD
     /// updates to the same GPU submission (avoiding a separate submit/wait
     /// cycle). Persistent: stays in effect across `step()` calls until
@@ -2125,6 +2461,13 @@ impl Session {
         Self::with_context(plan, Arc::new(gpu))
     }
 
+    /// Create a session that reuses an externally-owned Blade GPU context,
+    /// with explicit session options. [`Session::with_context`] is the
+    /// defaults-taking shorthand.
+    pub fn with_context_opts(plan: ExecutionPlan, gpu: Arc<Gpu>, opts: SessionOptions) -> Self {
+        Self::build_session_impl(plan, gpu, opts)
+    }
+
     /// Create a session that reuses an externally-owned Blade GPU context.
     ///
     /// Intended for embedding: a host application (renderer, game) creates
@@ -2134,6 +2477,10 @@ impl Session {
     /// pipelines, the command encoder — on drop; the context is released
     /// once the last `Arc` clone is dropped.
     pub fn with_context(plan: ExecutionPlan, gpu: Arc<Gpu>) -> Self {
+        Self::build_session_impl(plan, gpu, SessionOptions::default())
+    }
+
+    fn build_session_impl(plan: ExecutionPlan, gpu: Arc<Gpu>, opts: SessionOptions) -> Self {
         let coop_caps = gpu.capabilities().cooperative_matrix;
         let coop_config = Self::select_coop_config(&coop_caps)
             .filter(|config| Self::test_coop_matmul(&gpu, config));
@@ -2163,241 +2510,8 @@ impl Session {
 
         let mut plan = plan;
 
-        // Mark individual dispatches for coop and recompute their workgroups.
-        // Unlike the old all-or-nothing policy, each dispatch is independently
-        // evaluated. Pipelines now stores both scalar and coop variants.
-        if let Some(ref config) = coop_config {
-            use crate::codegen::ShaderGroup;
-            let output_tile = config.output_tile();
-            let _half_tile = config.tile_size;
-            // Apple's native 8x8 f32 cooperative matrix path is useful for
-            // compact GEMMs, but loses to the scalar tiled kernels once a
-            // dimension grows beyond 1024. Its forward convolution staging
-            // is also slower than the scalar im2col path; grad-input remains
-            // profitable and is selected independently below.
-            let apple_f32_coop = cfg!(all(target_os = "macos", target_arch = "aarch64"))
-                && !config.use_f16_input
-                && config.tile_size == 8;
-            for dispatch in &mut plan.dispatches {
-                // Autodiff marks derivative work as f32-sensitive. NVIDIA's
-                // TF32 keeps the f32 exponent range, but our portable f16
-                // cooperative path does not: tiny gradient operands can
-                // underflow before accumulation. A native f32 cooperative
-                // implementation is still safe and remains eligible.
-                if config.use_f16_input && dispatch.requires_full_precision {
-                    continue;
-                }
-                // Cooperative epilogues are supported for the compiler's
-                // current unary PointwiseDAG chains. They stage matrix
-                // accumulators through workgroup memory, then apply scalar
-                // WGSL with bounds checks. Legacy-only plans and DAGs needing
-                // extra storage bindings stay on scalar geometry.
-                if !dispatch.epilogue.is_empty() || dispatch.matmul_epilogue.is_some() {
-                    match dispatch.matmul_epilogue {
-                        Some(ref epilogue) if epilogue.inputs.is_empty() => {}
-                        _ => continue,
-                    }
-                }
-                let group = dispatch.shader.shader_group();
-                // Extract (m, n, k, batch) from dispatch params based on shader group.
-                let (m, n, k, batch) = match group {
-                    ShaderGroup::MatMul | ShaderGroup::MatMulAdd => (
-                        dispatch.params[0],
-                        dispatch.params[2],
-                        dispatch.params[1],
-                        1u32,
-                    ),
-                    ShaderGroup::Conv2dGemm => {
-                        // Forward: C[Co, oH*oW] = W[Co, K] × im2col[K, oH*oW]
-                        // params: [batch, in_channels, in_h, in_w, out_channels, kernel_h, kernel_w, stride, padding_h, out_h, out_w, padding_w]
-                        let out_ch = dispatch.params[4];
-                        let kh = dispatch.params[5];
-                        let kw = dispatch.params[6];
-                        let in_ch = dispatch.params[1];
-                        let out_h = dispatch.params[9];
-                        let out_w = dispatch.params[10];
-                        (out_ch, out_h * out_w, in_ch * kh * kw, dispatch.params[0])
-                    }
-                    ShaderGroup::Conv2dGradInputGemm => {
-                        // params: [batch, in_channels, in_h, in_w, out_channels, kernel_h, kernel_w, stride, padding, out_h, out_w, ...]
-                        let in_ch = dispatch.params[1];
-                        let in_h = dispatch.params[2];
-                        let in_w = dispatch.params[3];
-                        let out_ch = dispatch.params[4];
-                        let kh = dispatch.params[5];
-                        let kw = dispatch.params[6];
-                        (in_ch, in_h * in_w, out_ch * kh * kw, dispatch.params[0])
-                    }
-                    ShaderGroup::FusedRmsNormMatMul => (
-                        dispatch.params[0], // m
-                        dispatch.params[1], // n
-                        dispatch.params[2], // k
-                        1u32,
-                    ),
-                    ShaderGroup::MatMulAT | ShaderGroup::MatMulBT => (
-                        dispatch.params[0],
-                        dispatch.params[1],
-                        dispatch.params[2],
-                        1u32,
-                    ),
-                    // FusedRmsNormMatMul excluded: coop variant's 64-thread
-                    // rsqrt prologue is too slow vs the 256-thread scalar shader.
-                    _ => continue,
-                };
-                if apple_f32_coop
-                    && (matches!(group, ShaderGroup::Conv2dGemm)
-                        || (matches!(
-                            group,
-                            ShaderGroup::MatMul
-                                | ShaderGroup::MatMulAdd
-                                | ShaderGroup::MatMulAT
-                                | ShaderGroup::MatMulBT
-                                | ShaderGroup::FusedRmsNormMatMul
-                        ) && m.max(n).max(k) > 1024))
-                {
-                    continue;
-                }
-                let coop_wgs = m.div_ceil(output_tile) * n.div_ceil(output_tile) * batch;
-                // Conv2d backward GEMM has all-scalar staging with heavy im2col
-                // decomposition (integer division), and only 64 threads vs 256
-                // for the scalar shader. Require more workgroups to amortize.
-                let is_conv_bwd = matches!(group, ShaderGroup::Conv2dGradInputGemm);
-                let min_wgs = if is_conv_bwd {
-                    MIN_COOP_WORKGROUPS_CONV_BWD
-                } else if config.use_f16_input {
-                    // On discrete NVIDIA GPUs the f16 cooperative kernel's
-                    // shared-memory staging costs more than the scalar tile
-                    // kernel at low occupancy. Representative transformer
-                    // projections with 20--72 output workgroups regress,
-                    // while the wider backward/MLP shapes win once there are
-                    // enough independent tiles to fill the device.
-                    128
-                } else {
-                    16 // enables coop for attention K/V projections (N=320, 20 WGs)
-                };
-                // matmul_coop.wgsl's vec4 staging packs 4 consecutive elements
-                // from the contiguous axis into a single 128-bit load. The
-                // gating expression `(tr4 + 4u) <= k` / `(v4_col + 4u) <= n`
-                // skips the load whenever the relevant dimension is < 4,
-                // zero-padding the whole tile and silently producing zero
-                // output. Refuse to enable coop in those cases — the scalar
-                // / small-tile fallbacks handle them correctly.
-                //
-                // Required vec4 dimensions per variant:
-                //   * MatMul / MatMulAdd:  A vec4 along K, B vec4 along N.
-                //   * MatMulAT:            A vec4-T along M, B vec4 along N.
-                //   * MatMulBT:            A vec4 along K, B vec4-T along K.
-                // matmul_coop.wgsl correctness conditions:
-                //
-                //   * Vec4 STAGING along the K direction (vec4_a for
-                //     Normal/BT, vec4_b_transposed for BT) now has a
-                //     per-lane fallback (codegen.rs), so any K is fine for
-                //     those variants.
-                //
-                //   * The OUTPUT STORE uses `coopStoreT(acc, &c[row*n+col],
-                //     n)` which writes a 16×16 sub-tile with row stride
-                //     `n`. A right-edge tile with N not divisible by 16
-                //     straddles logical rows, so it remains unsupported. A
-                //     bottom-edge tile is safe: session construction pads the
-                //     allocation to `ceil(M/16) * N`, and consumers retain the
-                //     logical M extent, so the extra rows are never observed.
-                //     Allowing partial M tiles is important for sequence
-                //     lengths such as 50, which dominate transformer training.
-                //
-                // (Conv2d / FusedRmsNormMatMul also store via coopStoreT
-                // and need the same check; their `m`/`n` come from the
-                // params destructure above.)
-                let store_ok = n.is_multiple_of(16);
-                let vec4_ok = match group {
-                    ShaderGroup::MatMulBT => store_ok,
-                    ShaderGroup::MatMulAT => store_ok,
-                    ShaderGroup::Conv2dGradInputGemm => {
-                        // Generated f32 grad-input kernels stage a partial
-                        // right-edge tile through shared memory for
-                        // bounds-checked stores. f16 kernels retain the
-                        // direct-store alignment gate.
-                        (!config.use_f16_input || store_ok) && k >= 4
-                    }
-                    ShaderGroup::Conv2dGemm => store_ok && k >= 4,
-                    ShaderGroup::MatMul
-                    | ShaderGroup::MatMulAdd
-                    | ShaderGroup::FusedRmsNormMatMul => store_ok && k >= 4,
-                    _ => true,
-                };
-                let _ = k;
-                if coop_wgs >= min_wgs && !dispatch.weight_format.uses_reduced_storage() && vec4_ok
-                {
-                    dispatch.use_coop = true;
-                    // Route conv2d coop dispatches to generated specialized kernels
-                    if is_conv_bwd {
-                        let kh = dispatch.params[5];
-                        let kw = dispatch.params[6];
-                        let stride = dispatch.params[7];
-                        dispatch.shader = ShaderEntry::Conv2dGradInputGemmCoopGen(kh, kw, stride);
-                    } else if matches!(group, ShaderGroup::Conv2dGemm) {
-                        let kh = dispatch.params[5];
-                        let kw = dispatch.params[6];
-                        let stride = dispatch.params[7];
-                        dispatch.shader = ShaderEntry::Conv2dGemmCoopGen(kh, kw, stride);
-                    }
-                    dispatch.workgroups = [m.div_ceil(output_tile), n.div_ceil(output_tile), batch];
-                    // coopStore/coopLoad operate on full tiles without per-element
-                    // bounds checking. Pad output and addend buffers so edge
-                    // tiles don't read/write past the end.
-                    let padded_m = m.div_ceil(output_tile) * output_tile;
-                    let padded_n = n.div_ceil(output_tile) * output_tile;
-                    let padded_bytes = (padded_m * padded_n * batch * 4) as usize;
-                    let buf_idx = dispatch.output_buffer.0 as usize;
-                    if plan.buffers[buf_idx] < padded_bytes {
-                        plan.buffers[buf_idx] = padded_bytes;
-                    }
-                    // FusedMatMulAdd: also pad the addend (src) buffer.
-                    if dispatch.input_buffers.len() > 2 {
-                        let src_idx = dispatch.input_buffers[2].0 as usize;
-                        if plan.buffers[src_idx] < padded_bytes {
-                            plan.buffers[src_idx] = padded_bytes;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Apply RmsNorm+MatMul prologue fusion only after per-dispatch coop
-        // selection. A coop-capable device can still route small matmuls to a
-        // scalar pipeline, which has no prologue implementation. The fusion
-        // pass filters on `use_coop` and records its factor buffers as declared
-        // inputs for scheduling and memory planning.
-        crate::compile::fuse_rmsnorm_prologues(&mut plan);
-
-        // Small-tile selection: use 32×32 tiles when the 64×64 dispatch
-        // produces very few workgroups (< 16). The 4× more workgroups from
-        // smaller tiles improve occupancy on GPUs with many SMs.
-        {
-            use crate::codegen::ShaderGroup;
-            for dispatch in plan.dispatches.iter_mut() {
-                if dispatch.use_coop
-                    || dispatch.use_small_tiles
-                    || dispatch.weight_format.uses_reduced_storage()
-                {
-                    continue;
-                }
-                let group = dispatch.shader.shader_group();
-                let wgs_64: u32 = dispatch.workgroups.iter().product();
-                let has_small = matches!(
-                    group,
-                    ShaderGroup::MatMul
-                        | ShaderGroup::MatMulAdd
-                        | ShaderGroup::MatMulAT
-                        | ShaderGroup::MatMulBT
-                );
-                if has_small && wgs_64 < 16 {
-                    dispatch.use_small_tiles = true;
-                    // 32×32 tiles → double the WG count in each spatial dimension
-                    dispatch.workgroups[0] *= 2;
-                    dispatch.workgroups[1] *= 2;
-                }
-            }
-        }
+        // Per-dispatch kernel-variant selection: one pass, one owner.
+        select_variants(&mut plan, coop_config.as_ref(), !opts.debug);
 
         // Reorder dispatches by dependency level so parallel branches (e.g. Q/K/V
         // projections) cluster together, then partition into barrier groups.
@@ -2439,8 +2553,14 @@ impl Session {
         // Lifetime-based buffer aliasing: step-local intermediates with
         // disjoint live ranges (at barrier-group granularity) share one
         // physical allocation. See `memplan` for the safety argument.
-        let mut alias = if std::env::var("MEGANEURA_NO_ALIAS").is_ok() {
-            log::info!("MEGANEURA_NO_ALIAS: buffer aliasing disabled");
+        // Debug sessions keep every logical buffer distinct and
+        // host-visible so any node's value can be read back after a step.
+        let mut alias = if opts.debug || std::env::var("MEGANEURA_NO_ALIAS").is_ok() {
+            if opts.debug {
+                log::info!("debug session: buffer aliasing disabled");
+            } else {
+                log::info!("MEGANEURA_NO_ALIAS: buffer aliasing disabled");
+            }
             crate::memplan::plan_no_alias(&plan, &groups)
         } else {
             crate::memplan::plan_buffer_aliasing(&plan, &groups)
@@ -2448,8 +2568,10 @@ impl Session {
         // Step-local intermediates default to device-local memory on the
         // theory that host-visible (ReBAR) traffic is slower on discrete
         // boards; kill switch for measurement and UMA debugging.
-        if std::env::var("MEGANEURA_NO_DEVICE_LOCAL").is_ok() {
-            log::info!("MEGANEURA_NO_DEVICE_LOCAL: all buffers host-visible");
+        if opts.debug || std::env::var("MEGANEURA_NO_DEVICE_LOCAL").is_ok() {
+            if !opts.debug {
+                log::info!("MEGANEURA_NO_DEVICE_LOCAL: all buffers host-visible");
+            }
             alias.device_local.fill(false);
         }
         let alias = alias;
@@ -2460,8 +2582,13 @@ impl Session {
                 for i in range.clone() {
                     let d = &plan.dispatches[i];
                     eprintln!(
-                        "g{gi:03} d{i:03} {:?} coop={} epilogue={} in={:?} out={} wg={:?} params={:?}",
-                        d.shader,
+                        "g{gi:03} d{i:03} {} nodes={:?} coop={} epilogue={} in={:?} out={} wg={:?} params={:?}",
+                        if d.label.is_empty() {
+                            format!("{:?}", d.shader)
+                        } else {
+                            d.label.clone()
+                        },
+                        d.origin,
                         d.use_coop,
                         d.matmul_epilogue.is_some() || !d.epilogue.is_empty(),
                         d.input_buffers.iter().map(|b| b.0).collect::<Vec<_>>(),
@@ -2592,6 +2719,33 @@ impl Session {
             None
         };
 
+        // Buffers that some dispatch (or session setup) actually writes.
+        // Values whose producer was fused away have allocated-but-never-
+        // written buffers; `read_node` reports those instead of returning
+        // zeros that look like data.
+        let mut written = vec![false; plan.buffers.len()];
+        for d in &plan.dispatches {
+            written[d.output_buffer.0 as usize] = true;
+            for b in &d.extra_outputs {
+                written[b.0 as usize] = true;
+            }
+        }
+        for &(_, b) in &plan.param_buffers {
+            written[b.0 as usize] = true;
+        }
+        for &(_, b) in &plan.input_buffers {
+            written[b.0 as usize] = true;
+        }
+        for &(b, _) in &plan.constant_buffers {
+            written[b.0 as usize] = true;
+        }
+        for d in &plan.derived_params {
+            written[d.0.0 as usize] = true;
+        }
+        for &(_, b) in &plan.lse_buffers {
+            written[b.0 as usize] = true;
+        }
+
         Self {
             gpu,
             buffers,
@@ -2605,6 +2759,8 @@ impl Session {
             sync_point: None,
             last_submit_ns: 0,
             profiling: false,
+            debug: opts.debug,
+            written,
             pending_lr: None,
             pending_grad_clip: None,
             grad_clip_every: 1,
@@ -3264,6 +3420,16 @@ pub fn install_auto_tune(result: AutoTuneResult) {
 }
 
 impl Session {
+    /// Whether the plan has a parameter with this name.
+    pub fn has_parameter(&self, name: &str) -> bool {
+        self.plan.param_buffers.iter().any(|entry| entry.0 == name)
+    }
+
+    /// Whether the plan has an input with this name.
+    pub fn has_input(&self, name: &str) -> bool {
+        self.plan.input_buffers.iter().any(|entry| entry.0 == name)
+    }
+
     /// Upload parameter data to GPU buffers.
     pub fn set_parameter(&mut self, name: &str, data: &[f32]) {
         // Host writes target the same host-coherent allocation read by GPU
@@ -3574,6 +3740,234 @@ impl Session {
         } else {
             0.0
         }
+    }
+
+    /// Median wall-clock of `steps` `step()+wait()` cycles, in ms.
+    fn measure_step_ms(&mut self, warmup: usize, steps: usize) -> f64 {
+        for _ in 0..warmup {
+            self.step();
+            self.wait();
+        }
+        let mut samples: Vec<f64> = (0..steps)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                self.step();
+                self.wait();
+                t.elapsed().as_secs_f64() * 1e3
+            })
+            .collect();
+        samples.sort_by(|a, b| a.total_cmp(b));
+        samples[samples.len() / 2]
+    }
+
+    /// Empirical variant selection: measure real `step()` wall-clock with
+    /// each flippable kernel family on its cooperative variant vs its scalar
+    /// fallback, and keep whichever is faster **on this device with this
+    /// plan** — instead of trusting the static promotion heuristics.
+    ///
+    /// Measures whole-step wall-clock (never per-dispatch GPU time, which is
+    /// misleading below ~50 µs/dispatch), touches only flips that need no
+    /// recompilation, and skips dispatches whose selected form carries a
+    /// prologue/epilogue the scalar kernel can't run. Buffer contents are
+    /// whatever the session holds — call after uploading real parameters for
+    /// representative timing, or right after build for zero-filled timing.
+    ///
+    /// Budget: `2 + 5` steps per family plus a shared baseline — well under
+    /// a second for transformer-class plans on discrete GPUs.
+    pub fn tune(&mut self) -> Vec<TuneOutcome> {
+        use crate::codegen::ShaderGroup;
+        let matmul_family = |d: &Dispatch| {
+            d.use_coop
+                && d.scalar_fallback.is_some()
+                && d.matmul_prologue.is_none()
+                && d.matmul_epilogue.is_none()
+                && d.epilogue.is_empty()
+                && matches!(
+                    d.shader.shader_group(),
+                    ShaderGroup::MatMulCoop
+                        | ShaderGroup::MatMul
+                        | ShaderGroup::MatMulAdd
+                        | ShaderGroup::MatMulAT
+                        | ShaderGroup::MatMulBT
+                )
+        };
+        let conv_family = |d: &Dispatch| {
+            d.use_coop
+                && d.scalar_fallback.is_some()
+                && matches!(
+                    d.shader,
+                    ShaderEntry::Conv2dGemmCoopGen(..)
+                        | ShaderEntry::Conv2dGradInputGemmCoopGen(..)
+                )
+        };
+        type FamilyPredicate<'a> = &'a dyn Fn(&Dispatch) -> bool;
+        let families: [(&'static str, FamilyPredicate); 2] =
+            [("matmul-coop", &matmul_family), ("conv-coop", &conv_family)];
+
+        let mut outcomes = Vec::new();
+        let mut baseline: Option<f64> = None;
+        for (name, in_family) in families {
+            let members: Vec<usize> = self
+                .plan
+                .dispatches
+                .iter()
+                .enumerate()
+                .filter(|&(_, d)| in_family(d))
+                .map(|(i, _)| i)
+                .collect();
+            if members.is_empty() {
+                continue;
+            }
+            let coop_ms = match baseline {
+                Some(ms) => ms,
+                None => {
+                    let ms = self.measure_step_ms(2, 5);
+                    baseline = Some(ms);
+                    ms
+                }
+            };
+
+            // Flip the whole family to its scalar variant.
+            let mut saved = Vec::with_capacity(members.len());
+            for &i in &members {
+                let d = &mut self.plan.dispatches[i];
+                let (fb_shader, fb_wg) = d.scalar_fallback.clone().expect("filtered above");
+                saved.push((i, d.shader.clone(), d.workgroups));
+                d.shader = fb_shader;
+                d.workgroups = fb_wg;
+                d.use_coop = false;
+            }
+            let scalar_ms = self.measure_step_ms(1, 5);
+
+            let kept_coop = coop_ms <= scalar_ms;
+            if kept_coop {
+                for (i, shader, wg) in saved {
+                    let d = &mut self.plan.dispatches[i];
+                    d.shader = shader;
+                    d.workgroups = wg;
+                    d.use_coop = true;
+                }
+            } else {
+                // The scalar family is now selected; later families measure
+                // against this new configuration.
+                baseline = Some(scalar_ms);
+            }
+            log::info!(
+                "tune: {name} ({} dispatches) coop {coop_ms:.3} ms vs scalar {scalar_ms:.3} ms → keeping {}",
+                members.len(),
+                if kept_coop { "coop" } else { "scalar" },
+            );
+            outcomes.push(TuneOutcome {
+                family: name,
+                dispatches: members.len(),
+                coop_ms,
+                scalar_ms,
+                kept_coop,
+            });
+        }
+        outcomes
+    }
+
+    /// True when a logical buffer's content can be trusted after `step()`:
+    /// it is the only tenant of its physical allocation.
+    fn buffer_unaliased(&self, buf: BufferRef) -> bool {
+        let phys = self.alias.map[buf.0 as usize];
+        self.alias
+            .map
+            .iter()
+            .enumerate()
+            .all(|(i, &p)| p != phys || i == buf.0 as usize)
+    }
+
+    /// Read back the value of any graph node after a step.
+    ///
+    /// Works for every node in a debug session
+    /// ([`SessionOptions::debug`] / `SessionConfig::debug()`); in a normal
+    /// session it works for values whose buffer is not lifetime-aliased
+    /// (params, inputs, outputs, and whatever the alias planner left
+    /// unshared). Use [`Session::read_node_by_name`] to address nodes named
+    /// via `Graph::named` (or `nn` layers, which name their outputs).
+    pub fn read_node(&self, node: crate::graph::NodeId) -> Result<Vec<f32>, ReadNodeError> {
+        let buf = self
+            .plan
+            .node_buffers
+            .binary_search_by_key(&node, |&(n, _)| n)
+            .map(|i| self.plan.node_buffers[i].1)
+            .map_err(|_| ReadNodeError::UnknownNode)?;
+        if !self.written[buf.0 as usize] {
+            return Err(ReadNodeError::FusedAway);
+        }
+        if !self.debug && !self.buffer_unaliased(buf) {
+            return Err(ReadNodeError::Aliased);
+        }
+        let n = self.plan.buffers[buf.0 as usize] / 4;
+        let mut out = vec![0.0f32; n];
+        self.read_buffer(buf, &mut out);
+        Ok(out)
+    }
+
+    /// Read back a node's value by the name attached via `Graph::named`.
+    /// When several nodes share a name (a reused module), the last one wins.
+    pub fn read_node_by_name(&self, name: &str) -> Result<Vec<f32>, ReadNodeError> {
+        let node = self
+            .plan
+            .node_names
+            .iter()
+            .rev()
+            .find(|entry| entry.1 == name)
+            .map(|&(id, _)| id)
+            .ok_or_else(|| {
+                ReadNodeError::UnknownName(
+                    self.plan
+                        .node_names
+                        .iter()
+                        .map(|entry| entry.1.clone())
+                        .collect(),
+                )
+            })?;
+        self.read_node(node)
+    }
+
+    /// Run one step, then scan every dispatch output for NaN/Inf in
+    /// execution order. `report.first_bad()` names the dispatch — and via
+    /// its `origin`/label, the graph node — where non-finite values first
+    /// appear. Sound in debug sessions (nothing aliased); in normal
+    /// sessions aliased outputs are skipped and counted.
+    pub fn step_debug(&mut self) -> DebugStepReport {
+        self.step();
+        self.wait();
+        let mut report = DebugStepReport::default();
+        for (i, d) in self.plan.dispatches.iter().enumerate() {
+            if !self.debug && !self.buffer_unaliased(d.output_buffer) {
+                report.skipped_aliased += 1;
+                continue;
+            }
+            let buf_size = self.plan.buffers[d.output_buffer.0 as usize];
+            let n = (buf_size / 4).min(65536);
+            if n == 0 {
+                continue;
+            }
+            let mut data = vec![0.0f32; n];
+            self.read_buffer(d.output_buffer, &mut data);
+            let max_abs = data.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let has_nan = data.iter().any(|v| v.is_nan());
+            let has_inf = data.iter().any(|v| v.is_infinite());
+            if has_nan || has_inf {
+                report.anomalies.push(DispatchAnomaly {
+                    dispatch: i,
+                    label: if d.label.is_empty() {
+                        format!("{:?}", d.shader)
+                    } else {
+                        d.label.clone()
+                    },
+                    origin: d.origin.clone(),
+                    has_nan,
+                    has_inf,
+                    max_abs,
+                });
+            }
+        }
+        report
     }
 
     /// Diagnostic: print per-dispatch output buffer statistics.
@@ -4953,29 +5347,6 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::FusedRmsNormMatMul => {
-                {
-                    // Both scalar and coop paths use FourBufData layout:
-                    // src_a=X, src_b=W_proj, bias=W_norm, dst=output
-                    // Coop variant: rsqrt computed via workgroup tree reduction
-                    // input_buffers: [x, w_norm, w_proj]
-                    pc.bind(
-                        0,
-                        &FourBufData {
-                            src_a: buf(dispatch.input_buffers[0]), // X
-                            src_b: buf(dispatch.input_buffers[2]), // W_proj
-                            bias: buf(dispatch.input_buffers[1]),  // W_norm
-                            dst: buf(dispatch.output_buffer),
-                            params: MatMulParams {
-                                m: dispatch.params[0],
-                                n: dispatch.params[1],
-                                k: dispatch.params[2],
-                                _pad: dispatch.params[3],
-                            },
-                        },
-                    );
-                }
-            }
             ShaderEntry::RmsNormRsqrt => {
                 // bindings: src=X, dst=rsqrt, params=(rows, cols, eps_bits, _pad)
                 pc.bind(
@@ -5194,10 +5565,8 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::Conv2d
-            | ShaderEntry::Conv2dGemm
+            ShaderEntry::Conv2dGemm
             | ShaderEntry::Conv2dGemmSmall
-            | ShaderEntry::Conv2dGemmCoop
             | ShaderEntry::Conv2dGemmCoopGen(..) => {
                 let p = &dispatch.params;
                 let kernel_hw = p[5] * p[6];
@@ -5228,11 +5597,8 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::Conv2dGradInput
-            | ShaderEntry::Conv2dGradInputGemm
+            ShaderEntry::Conv2dGradInputGemm
             | ShaderEntry::Conv2dGradInputGemmSmall
-            | ShaderEntry::Conv2dGradInputGemmCoop
-            | ShaderEntry::Conv2dGradInputGemmCoop3x3
             | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => {
                 let p = &dispatch.params;
                 let kernel_hw = p[5] * p[6];
@@ -5263,9 +5629,7 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::Conv2dGradWeight
-            | ShaderEntry::Conv2dGradWeightGemm
-            | ShaderEntry::Conv2dGradWeightGemmSmall => {
+            ShaderEntry::Conv2dGradWeightGemm | ShaderEntry::Conv2dGradWeightGemmSmall => {
                 let p = &dispatch.params;
                 let kernel_hw = p[5] * p[6];
                 let go_spatial = p[9] * p[10]; // out_h * out_w
@@ -5426,7 +5790,7 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::WinogradBatchedMatMul | ShaderEntry::WinogradBatchedMatMulSmall => {
+            ShaderEntry::WinogradBatchedMatMul => {
                 pc.bind(
                     0,
                     &MatMulData {

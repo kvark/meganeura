@@ -26,6 +26,7 @@ pub mod cache;
 pub mod codegen;
 pub mod compile;
 pub mod data;
+pub mod eager;
 pub mod graph;
 pub mod load;
 pub mod memplan;
@@ -40,13 +41,15 @@ pub mod train;
 
 pub use codegen::{CoopCaps, coop_caps, set_coop_caps};
 pub use compile::CompileOptions;
+pub use compile::TuningKnobs;
 pub use data::{DataLoader, MnistDataset};
 pub use graph::{DType, Graph, NodeId, TensorType};
 pub use load::nnef::{NnefError, NnefModel, load_nnef};
 pub use load::onnx::{OnnxError, OnnxModel, load_onnx, load_onnx_bytes};
 pub use optimize::{ExtractionCost, OptimizeConfig, OptimizeMode, OptimizeReport};
 pub use runtime::{
-    DeviceMemoryStats, ExternalBindError, ExternalSlot, MemorySummary, Session, init_gpu_context,
+    DebugStepReport, DeviceMemoryStats, DispatchAnomaly, ExternalBindError, ExternalSlot,
+    MemorySummary, ReadNodeError, Session, SessionOptions, TuneOutcome, init_gpu_context,
 };
 pub use train::{
     EpochStats, LossHistory, MetricCallback, Mode, Optimizer, SessionConfig, StepMetrics,

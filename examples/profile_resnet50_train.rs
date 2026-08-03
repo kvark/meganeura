@@ -9,10 +9,10 @@ use meganeura::{build_session, models::resnet};
 fn main() {
     env_logger::init();
 
-    // Install coop-matrix availability + fusion register costs so the
-    // compile path picks Conv2dGradInputGemmCoop3x3 for the 3x3
-    // stride-1 backward dispatches. Without this the scalar
-    // Conv2dGradInputGemm runs (34% of training time on RTX 5080).
+    // Install coop-matrix availability so the runtime promotes the 3x3
+    // stride-1 backward dispatches to the generated conv coop kernels.
+    // Without this the scalar Conv2dGradInputGemm runs (34% of training
+    // time on RTX 5080).
     let gpu = meganeura::runtime::init_gpu_context().expect("gpu");
     let result = meganeura::runtime::auto_tune(&gpu, 64);
     eprintln!("coop_matrix_available={}", result.coop_caps.is_supported());

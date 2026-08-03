@@ -328,6 +328,9 @@ mod tests {
             lse_buffers: Vec::new(),
             derived_params: Vec::new(),
             weight_buffers: Default::default(),
+            node_buffers: Vec::new(),
+            node_names: Vec::new(),
+            knobs: Default::default(),
         }
     }
 

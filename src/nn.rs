@@ -25,42 +25,62 @@ use crate::graph::{Graph, NodeId};
 pub struct Linear {
     pub weight: NodeId,
     pub bias: Option<NodeId>,
+    pub name: String,
 }
 
 impl Linear {
+    #[track_caller]
     pub fn new(g: &mut Graph, name: &str, in_features: usize, out_features: usize) -> Self {
         let weight = g.parameter(&format!("{name}.weight"), &[in_features, out_features]);
         let bias = Some(g.parameter(&format!("{name}.bias"), &[out_features]));
-        Self { weight, bias }
+        Self {
+            weight,
+            bias,
+            name: name.to_string(),
+        }
     }
 
+    #[track_caller]
     pub fn no_bias(g: &mut Graph, name: &str, in_features: usize, out_features: usize) -> Self {
         let weight = g.parameter(&format!("{name}.weight"), &[in_features, out_features]);
-        Self { weight, bias: None }
+        Self {
+            weight,
+            bias: None,
+            name: name.to_string(),
+        }
     }
 
+    #[track_caller]
     pub fn forward(&self, g: &mut Graph, x: NodeId) -> NodeId {
         let mm = g.matmul(x, self.weight);
-        match self.bias {
+        let out = match self.bias {
             Some(b) => g.bias_add(mm, b),
             None => mm,
-        }
+        };
+        g.named(out, &self.name)
     }
 }
 
 /// Token embedding lookup table.
 pub struct Embedding {
     pub weight: NodeId,
+    pub name: String,
 }
 
 impl Embedding {
+    #[track_caller]
     pub fn new(g: &mut Graph, name: &str, vocab_size: usize, embed_dim: usize) -> Self {
         let weight = g.parameter(name, &[vocab_size, embed_dim]);
-        Self { weight }
+        Self {
+            weight,
+            name: name.to_string(),
+        }
     }
 
+    #[track_caller]
     pub fn forward(&self, g: &mut Graph, indices: NodeId) -> NodeId {
-        g.embedding(indices, self.weight)
+        let out = g.embedding(indices, self.weight);
+        g.named(out, &self.name)
     }
 }
 
@@ -68,16 +88,24 @@ impl Embedding {
 pub struct RmsNorm {
     pub weight: NodeId,
     pub eps: f32,
+    pub name: String,
 }
 
 impl RmsNorm {
+    #[track_caller]
     pub fn new(g: &mut Graph, name: &str, dim: usize, eps: f32) -> Self {
         let weight = g.parameter(name, &[dim]);
-        Self { weight, eps }
+        Self {
+            weight,
+            eps,
+            name: name.to_string(),
+        }
     }
 
+    #[track_caller]
     pub fn forward(&self, g: &mut Graph, x: NodeId) -> NodeId {
-        g.rms_norm(x, self.weight, self.eps)
+        let out = g.rms_norm(x, self.weight, self.eps);
+        g.named(out, &self.name)
     }
 }
 
@@ -86,17 +114,26 @@ pub struct LayerNorm {
     pub weight: NodeId,
     pub bias: NodeId,
     pub eps: f32,
+    pub name: String,
 }
 
 impl LayerNorm {
+    #[track_caller]
     pub fn new(g: &mut Graph, name: &str, dim: usize, eps: f32) -> Self {
         let weight = g.parameter(&format!("{name}.weight"), &[dim]);
         let bias = g.parameter(&format!("{name}.bias"), &[dim]);
-        Self { weight, bias, eps }
+        Self {
+            weight,
+            bias,
+            eps,
+            name: name.to_string(),
+        }
     }
 
+    #[track_caller]
     pub fn forward(&self, g: &mut Graph, x: NodeId) -> NodeId {
-        g.layer_norm(x, self.weight, self.bias, self.eps)
+        let out = g.layer_norm(x, self.weight, self.bias, self.eps);
+        g.named(out, &self.name)
     }
 }
 
@@ -108,6 +145,7 @@ pub struct SwiGluFfn {
 }
 
 impl SwiGluFfn {
+    #[track_caller]
     pub fn new(g: &mut Graph, name: &str, hidden: usize, intermediate: usize) -> Self {
         Self {
             gate: Linear::no_bias(g, &format!("{name}.gate_proj"), hidden, intermediate),
@@ -116,6 +154,7 @@ impl SwiGluFfn {
         }
     }
 
+    #[track_caller]
     pub fn forward(&self, g: &mut Graph, x: NodeId) -> NodeId {
         let gate = self.gate.forward(g, x);
         let up = self.up.forward(g, x);
@@ -140,6 +179,7 @@ pub enum Activation {
 }
 
 impl Mlp {
+    #[track_caller]
     pub fn new(
         g: &mut Graph,
         name: &str,
@@ -155,6 +195,7 @@ impl Mlp {
         }
     }
 
+    #[track_caller]
     pub fn forward(&self, g: &mut Graph, x: NodeId) -> NodeId {
         let h = self.fc1.forward(g, x);
         let h = match self.activation {
@@ -185,6 +226,7 @@ pub struct Conv2d {
 
 impl Conv2d {
     #[allow(clippy::too_many_arguments)]
+    #[track_caller]
     pub fn new(
         g: &mut Graph,
         name: &str,
@@ -217,6 +259,7 @@ impl Conv2d {
         }
     }
 
+    #[track_caller]
     pub fn forward(&self, g: &mut Graph, x: NodeId, batch: u32) -> NodeId {
         g.conv2d(
             x,
@@ -257,6 +300,7 @@ pub struct CausalSelfAttention {
 }
 
 impl CausalSelfAttention {
+    #[track_caller]
     pub fn new(g: &mut Graph, name: &str, cfg: &AttentionConfig) -> Self {
         Self {
             q_proj: Linear::no_bias(g, &format!("{name}.q_proj"), cfg.hidden, cfg.hidden),
@@ -270,6 +314,7 @@ impl CausalSelfAttention {
         }
     }
 
+    #[track_caller]
     pub fn forward(&self, g: &mut Graph, x: NodeId) -> NodeId {
         let q = self.q_proj.forward(g, x);
         let k = self.k_proj.forward(g, x);
@@ -302,6 +347,7 @@ pub struct TransformerBlock {
 }
 
 impl TransformerBlock {
+    #[track_caller]
     pub fn new(g: &mut Graph, name: &str, cfg: &TransformerBlockConfig) -> Self {
         Self {
             attn_norm: RmsNorm::new(
@@ -332,6 +378,7 @@ impl TransformerBlock {
         }
     }
 
+    #[track_caller]
     pub fn forward(&self, g: &mut Graph, x: NodeId) -> NodeId {
         let h = self.attn_norm.forward(g, x);
         let h = self.attn.forward(g, h);

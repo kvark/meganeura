@@ -246,6 +246,10 @@ pub struct DispatchProfile {
     pub family: String,
     pub shader: String,
     pub label: String,
+    /// Graph node ids this dispatch implements (provenance; several after
+    /// dispatch-level fusion).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub origin: Vec<u32>,
     pub timestamp_label: String,
     pub pipeline: String,
     pub workgroups: [u32; 3],
@@ -465,6 +469,7 @@ pub fn capture_session_profile(
             family: dispatch.profile_family().to_string(),
             shader: format!("{:?}", dispatch.shader),
             label: dispatch.label.clone(),
+            origin: dispatch.origin.clone(),
             timestamp_label: timestamp_labels[index].clone(),
             pipeline: pipeline_keys[index].clone(),
             workgroups: dispatch.workgroups,
