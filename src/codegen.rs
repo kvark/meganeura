@@ -47,7 +47,7 @@ pub struct ShaderModule {
 
 /// Dump WGSL source to `$MEGANEURA_DUMP_WGSL` if set (for debugging/inspection).
 fn maybe_dump_wgsl(source: &str, hint: &str) {
-    if let Ok(dir) = std::env::var("MEGANEURA_DUMP_WGSL") {
+    if let Some(dir) = crate::config::DUMP_WGSL.text() {
         let _ = std::fs::create_dir_all(&dir);
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(source, &mut hasher);
@@ -2172,7 +2172,7 @@ pub fn coop_caps() -> CoopCaps {
 /// `MEGANEURA_FLASH_EPT_CAP` overrides either default for benchmarking sweeps.
 /// Codegen and dispatch both read this so they agree on tile size.
 pub fn flash_ept_cap() -> u32 {
-    flash_ept_override("MEGANEURA_FLASH_EPT_CAP").unwrap_or(
+    flash_ept_override(&crate::config::FLASH_EPT_CAP).unwrap_or(
         if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
             16
         } else {
@@ -2181,27 +2181,30 @@ pub fn flash_ept_cap() -> u32 {
     )
 }
 
-fn flash_ept_override(name: &str) -> Option<u32> {
-    std::env::var(name)
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .filter(|v| v.is_power_of_two() && *v >= 2)
+fn flash_ept_override(var: &crate::config::VarSpec) -> Option<u32> {
+    var.u32_value().filter(|v| {
+        let ok = v.is_power_of_two() && *v >= 2;
+        if !ok {
+            log::warn!("{}={v} must be a power of two >= 2; ignoring", var.name);
+        }
+        ok
+    })
 }
 
 /// dQ has fewer live accumulators than fused dK/dV and follows the forward
 /// cap by default. The shared backward override remains useful for sweeps.
 pub fn flash_grad_q_ept_cap() -> u32 {
-    flash_ept_override("MEGANEURA_FLASH_GRAD_Q_EPT_CAP")
-        .or_else(|| flash_ept_override("MEGANEURA_FLASH_BWD_EPT_CAP"))
+    flash_ept_override(&crate::config::FLASH_GRAD_Q_EPT_CAP)
+        .or_else(|| flash_ept_override(&crate::config::FLASH_BWD_EPT_CAP))
         .unwrap_or_else(flash_ept_cap)
 }
 
 /// Fused dK/dV benefits from more threads on Apple Silicon, where reducing
 /// its register-heavy per-thread slice outweighs the extra reductions.
 pub fn flash_grad_kv_ept_cap() -> u32 {
-    flash_ept_override("MEGANEURA_FLASH_GRAD_KV_EPT_CAP")
-        .or_else(|| flash_ept_override("MEGANEURA_FLASH_BWD_EPT_CAP"))
-        .or_else(|| flash_ept_override("MEGANEURA_FLASH_EPT_CAP"))
+    flash_ept_override(&crate::config::FLASH_GRAD_KV_EPT_CAP)
+        .or_else(|| flash_ept_override(&crate::config::FLASH_BWD_EPT_CAP))
+        .or_else(|| flash_ept_override(&crate::config::FLASH_EPT_CAP))
         .unwrap_or(if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
             8
         } else {

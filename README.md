@@ -125,14 +125,41 @@ device ID (on Vulkan this is normally the PCI device ID, not an adapter ordinal)
 MEGANEURA_DEVICE_ID=0x744c cargo run --release --example mnist
 ```
 
-Decimal IDs are accepted too. `MEGANEURA_DISABLE_COOP=1` forces the portable
-scalar path for regression diagnosis; `MEGANEURA_FLASH_FWD_COOP=0` and
-`MEGANEURA_FLASH_BWD_COOP=0` disable only cooperative flash attention.
-Device-local intermediate storage and lifetime aliasing are default-on, with
-`MEGANEURA_NO_DEVICE_LOCAL=1` and `MEGANEURA_NO_ALIAS=1` as diagnostic escape
-hatches. `MEGANEURA_TUNE=1` (or `SessionConfig { tune: true }`) measures each
-flippable kernel family both ways on real `step()` wall-clock at session
-build and keeps the faster variant on this device.
+Decimal IDs are accepted too.
+
+## Environment variables
+
+Every `MEGANEURA_*` variable is declared in `meganeura::config::REGISTRY`
+(a test pins this table against it). Semantics are uniform: boolean
+variables treat unset as their default, `0` as off, and anything else as
+on; active overrides are logged at session build, and unrecognized
+`MEGANEURA_*` names produce a warning instead of silently doing nothing.
+Diagnostic switches override code-level configuration; tuning variables
+only provide the *defaults* for `TuningKnobs` / `SessionConfig`, so
+explicitly set options win.
+
+| Variable | Effect |
+|---|---|
+| `MEGANEURA_DISABLE_COOP` | Force the portable scalar matmul path (regression diagnosis). |
+| `MEGANEURA_COOP_F16` | Opt in to f16-input cooperative tiles when no f32 tile is advertised. |
+| `MEGANEURA_FLASH_FWD_COOP=0` | Disable only cooperative flash-attention forward. |
+| `MEGANEURA_FLASH_BWD_COOP` | Enable the experimental reduced-precision flash backward. |
+| `MEGANEURA_NO_ALIAS` | Disable buffer lifetime aliasing (every value gets its own allocation). |
+| `MEGANEURA_NO_DEVICE_LOCAL` | Keep all buffers host-visible. |
+| `MEGANEURA_SERIAL_DISPATCH` | One compute pass per dispatch — serial execution for bisection. |
+| `MEGANEURA_PIN_BUFS=3,25-40` | Force-pin logical buffers to bisect aliasing corruption. |
+| `MEGANEURA_DUMP_PLAN` | Dump dispatch order, provenance, and the alias map at build. |
+| `MEGANEURA_DUMP_WGSL=<dir>` | Write every generated shader into `<dir>`. |
+| `MEGANEURA_OPTIMIZER` | Rewrite mode: `off` \| `greedy` \| `egglog-windowed` \| `egglog-outlined` \| `egglog-whole`. |
+| `MEGANEURA_EGRAPH_COST` | Extraction objective: `ast-size` \| `tensor-traffic`. |
+| `MEGANEURA_EGRAPH_CUTOFF=<n>` | Saturation segment-size ceiling (default 300). |
+| `MEGANEURA_TUNE` | Measure coop vs scalar per kernel family at session build; keep the faster (`SessionConfig { tune: true }` equivalent). |
+| `MEGANEURA_FLASH_EPT_CAP=<n>` | Flash forward elements-per-thread cap (power of two ≥ 2). |
+| `MEGANEURA_FLASH_GRAD_Q_EPT_CAP=<n>` | EPT cap for flash dQ backward. |
+| `MEGANEURA_FLASH_GRAD_KV_EPT_CAP=<n>` | EPT cap for fused flash dK/dV backward. |
+| `MEGANEURA_FLASH_BWD_EPT_CAP=<n>` | Shared fallback cap for both flash backward kernels. |
+| `MEGANEURA_DEVICE_ID=0x744c` | Adapter selection by numeric device id. |
+| `MEGANEURA_GPU_TIMING` | Enable hardware timestamp pools (set before context creation). |
 
 ## Debugging
 

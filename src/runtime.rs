@@ -2264,7 +2264,7 @@ impl Session {
     ) -> Option<crate::codegen::CoopConfig> {
         use crate::codegen::CoopConfig;
         // Escape hatch for diagnosing coop-matrix numerical bugs.
-        if std::env::var("MEGANEURA_DISABLE_COOP").is_ok() {
+        if crate::config::DISABLE_COOP.bool_or(false) {
             log::warn!("MEGANEURA_DISABLE_COOP set — forcing scalar matmul");
             return None;
         }
@@ -2279,7 +2279,7 @@ impl Session {
         // prefer f32 coop tiles; treat f16 as opt-in (MEGANEURA_COOP_F16)
         // for throughput when the model is known to fit f16. With only f16
         // tiles and no opt-in, fall back to scalar f32 (correct).
-        let want_f16 = std::env::var("MEGANEURA_COOP_F16").is_ok();
+        let want_f16 = crate::config::COOP_F16.bool_or(false);
         if caps.f32_tile > 0 {
             Some(CoopConfig {
                 tile_size: caps.f32_tile,
@@ -2481,6 +2481,7 @@ impl Session {
     }
 
     fn build_session_impl(plan: ExecutionPlan, gpu: Arc<Gpu>, opts: SessionOptions) -> Self {
+        crate::config::log_overrides();
         let coop_caps = gpu.capabilities().cooperative_matrix;
         let coop_config = Self::select_coop_config(&coop_caps)
             .filter(|config| Self::test_coop_matmul(&gpu, config));
@@ -2516,7 +2517,7 @@ impl Session {
         // Reorder dispatches by dependency level so parallel branches (e.g. Q/K/V
         // projections) cluster together, then partition into barrier groups.
         reorder_by_level(&mut plan.dispatches);
-        let groups = if std::env::var("MEGANEURA_SERIAL_DISPATCH").is_ok() {
+        let groups = if crate::config::SERIAL_DISPATCH.bool_or(false) {
             // Debug: one dispatch per pass — guarantees serial execution.
             log::info!("MEGANEURA_SERIAL_DISPATCH: forcing one dispatch per pass");
             (0..plan.dispatches.len()).map(|i| i..i + 1).collect()
@@ -2555,7 +2556,7 @@ impl Session {
         // physical allocation. See `memplan` for the safety argument.
         // Debug sessions keep every logical buffer distinct and
         // host-visible so any node's value can be read back after a step.
-        let mut alias = if opts.debug || std::env::var("MEGANEURA_NO_ALIAS").is_ok() {
+        let mut alias = if opts.debug || crate::config::NO_ALIAS.bool_or(false) {
             if opts.debug {
                 log::info!("debug session: buffer aliasing disabled");
             } else {
@@ -2568,7 +2569,7 @@ impl Session {
         // Step-local intermediates default to device-local memory on the
         // theory that host-visible (ReBAR) traffic is slower on discrete
         // boards; kill switch for measurement and UMA debugging.
-        if opts.debug || std::env::var("MEGANEURA_NO_DEVICE_LOCAL").is_ok() {
+        if opts.debug || crate::config::NO_DEVICE_LOCAL.bool_or(false) {
             if !opts.debug {
                 log::info!("MEGANEURA_NO_DEVICE_LOCAL: all buffers host-visible");
             }
@@ -2577,7 +2578,7 @@ impl Session {
         let alias = alias;
         // Debug aid: dump dispatch order, declared accesses, and the
         // alias map for corruption bisection (see MEGANEURA_PIN_BUFS).
-        if std::env::var("MEGANEURA_DUMP_PLAN").is_ok() {
+        if crate::config::DUMP_PLAN.bool_or(false) {
             for (gi, range) in groups.iter().enumerate() {
                 for i in range.clone() {
                     let d = &plan.dispatches[i];
@@ -3071,7 +3072,8 @@ impl Session {
 /// Wraps `blade_graphics::Context::init`, which is `unsafe` because it
 /// loads the system graphics driver.
 pub fn init_gpu_context() -> Result<blade_graphics::Context, blade_graphics::NotSupportedError> {
-    let dev_id = std::env::var("MEGANEURA_DEVICE_ID").ok().and_then(|value| {
+    crate::config::log_overrides();
+    let dev_id = crate::config::DEVICE_ID.text().and_then(|value| {
         let parsed = parse_device_id(&value);
         if parsed.is_none() {
             log::warn!(
@@ -3087,7 +3089,7 @@ pub fn init_gpu_context() -> Result<blade_graphics::Context, blade_graphics::Not
             // Blade's timing collection reads the query pool without waiting
             // when a command buffer is re-begun; on slow GPUs the previous
             // submission may still be in flight. Keep this off by default.
-            timing: std::env::var("MEGANEURA_GPU_TIMING").is_ok(),
+            timing: crate::config::GPU_TIMING.bool_or(false),
             capture: false,
             overlay: false,
             device_id: dev_id,

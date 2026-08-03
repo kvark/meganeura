@@ -322,7 +322,7 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, Optimiz
         }
     };
     let mut coop_caps = runtime::auto_tune(&gpu, 0).coop_caps;
-    if std::env::var("MEGANEURA_DISABLE_COOP").is_ok() {
+    if crate::config::DISABLE_COOP.bool_or(false) {
         coop_caps = crate::codegen::CoopCaps::default();
     }
     let mode_tag = match mode {
@@ -410,12 +410,7 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, Optimiz
         let _span = tracing::info_span!("gpu_init").entered();
         make_session(plan, gpu, cfg.debug)
     };
-    let tune = match std::env::var("MEGANEURA_TUNE").as_deref() {
-        Ok("0") => false,
-        Ok(_) => true,
-        Err(_) => cfg.tune,
-    };
-    if tune {
+    if crate::config::TUNE.bool_or(cfg.tune) {
         let _span = tracing::info_span!("tune").entered();
         session.tune();
     }

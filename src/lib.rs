@@ -25,6 +25,7 @@ pub mod autodiff;
 pub mod cache;
 pub mod codegen;
 pub mod compile;
+pub mod config;
 pub mod data;
 pub mod eager;
 pub mod graph;

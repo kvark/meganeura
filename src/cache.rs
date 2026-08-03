@@ -135,8 +135,8 @@ pub(crate) fn hash_build_config(
         mode_tag,
         skip_full_optimize,
         coop_caps,
-        flash_forward_coop: std::env::var("MEGANEURA_FLASH_FWD_COOP").as_deref() != Ok("0"),
-        flash_backward_coop: std::env::var("MEGANEURA_FLASH_BWD_COOP").as_deref() == Ok("1"),
+        flash_forward_coop: crate::config::FLASH_FWD_COOP.bool_or(true),
+        flash_backward_coop: crate::config::FLASH_BWD_COOP.bool_or(false),
         // The flash EPT caps now live in `options.knobs`, hashed above.
     };
     hash_serializable(&fingerprint)

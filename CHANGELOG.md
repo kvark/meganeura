@@ -1,5 +1,18 @@
 # Unreleased
 
+- Central environment-variable registry (`meganeura::config`): every
+  `MEGANEURA_*` variable is declared once with type, class, and docs.
+  Session build logs active overrides and warns on unrecognized
+  `MEGANEURA_*` names (typos no longer fail silently); a test pins the
+  README table against the registry. Boolean semantics are now uniform —
+  unset = default, `0` = off, anything else = on. Two behavior
+  normalizations: `MEGANEURA_DISABLE_COOP=0` (and other diagnostic
+  flags set to `0`) no longer *enable* the switch, and
+  `MEGANEURA_FLASH_BWD_COOP` accepts any non-zero value instead of
+  exactly `1`. Precedence is per class: diagnostic switches override
+  code configuration; tuning variables only feed defaults, so
+  explicitly set `TuningKnobs`/`SessionConfig` fields win.
+
 - Eager evaluation (`meganeura::eager::Eager`): inspect any node of a graph
   while building it — `e.eval(&g, node)` executes the same builder-produced
   graph through the same generated kernels (no rewrites, no dispatch

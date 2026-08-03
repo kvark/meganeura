@@ -266,7 +266,7 @@ fn compute_pinned(plan: &ExecutionPlan, groups: &[Range<usize>]) -> (Vec<bool>, 
     // Debug aid: MEGANEURA_PIN_BUFS="3,17,25-40" force-pins logical
     // buffers, excluding them from aliasing. Used to bisect aliasing
     // corruption down to a single buffer.
-    if let Ok(spec) = std::env::var("MEGANEURA_PIN_BUFS") {
+    if let Some(spec) = crate::config::PIN_BUFS.text() {
         for part in spec.split(',').filter(|s| !s.is_empty()) {
             if let Some((a, b)) = part.split_once('-') {
                 let (a, b): (usize, usize) = (a.parse().unwrap(), b.parse().unwrap());
