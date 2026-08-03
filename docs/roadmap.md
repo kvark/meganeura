@@ -372,36 +372,67 @@ updated with the new data.
 
 ---
 
-## Track F — Session-build autotuning (in-memory only)
+## Track F — The representation menu: empirical kernel selection
 
-*First cut landed:* `Session::tune` (opt-in via
-`SessionConfig { tune: true }` / `MEGANEURA_TUNE=1`) measures real
-`step()` wall-clock per flippable kernel family — plain coop matmuls
-and generated coop conv kernels vs their recorded scalar fallbacks —
-and keeps the faster variant. Both variants' pipelines are compiled up
-front, so flips need no recompilation. Default-off until the bench
-fleet validates it on coop-capable adapters. *Still open:* knobs that
-require recompilation (EPT caps, tile sizes — now plumbed as
-`TuningKnobs` plan data, so a search over them is a plan-rebuild loop),
-and the workgroup-size sweep for generated kernels.
+**End state.** No hand-maintained performance heuristics for kernel
+variants. Instead, a per-device **menu of legal representations** and a
+measured choice among them:
 
-**Problem.** Tile sizes (64/32), `flash_ept_cap` (32), coop workgroup
-thresholds (16/32), GEMV switchover — all fixed heuristics, tuned
-mostly on one GPU, applied to Apple/RDNA/Intel/NVIDIA alike.
+1. **Legality** — the menu is derived from capabilities: the tile
+   shapes/dtypes the driver advertises, subgroup support, f16. Facts,
+   registered once per device, never guessed.
+2. **Validity** — declarative numeric constraints filter the menu per
+   value: `requires_full_precision` (autodiff-marked) × the format each
+   representation stages through. This stage can never be empirical —
+   the canonical cautionary tale is the coop-threshold experiment that
+   went 44 ms → 29 ms *and failed gradcheck*
+   (`rejected-optimizations.md`): a purely measured selector picks the
+   fast wrong kernel every time. Validity is checked by parity/gradcheck
+   tests, not by timing.
+3. **Speed** — whatever survives 1–2 is chosen by measured
+   `step()`-context wall-clock, per (archetype, shape-class), applied to
+   every instance of that class. The remaining hard-coded thresholds
+   (coop workgroup minimums, the Apple >1024 veto, small-tile cutoff,
+   GEMV switchover) demote from *deciders* to *search priors* — the
+   starting configuration when tuning is off or budget-limited.
 
-**Plan.** At session build, for the handful of distinct
-(archetype, shape-class) pairs in the plan, run a micro-search over
-the small knob set (2–4 values each), measuring real `step()`-context
-wall-clock, and pick winners. **No on-disk cache** — the tune budget
-must simply be small relative to a training run (target: < 2 s for a
-SmolLM2-class plan; the archetype design keeps the space tiny).
-In-memory only, per session; inference sessions can opt out
-(`SessionConfig`) to protect TTFT.
+**Landed.** The enabling structure: variant decisions have one owner
+(`select_variants`), every promoted dispatch records its
+`scalar_fallback`, codegen knobs travel as `TuningKnobs` plan data, and
+`Session::tune` (opt-in via `SessionConfig { tune: true }` /
+`MEGANEURA_TUNE=1`) measures coop↔scalar per family on real `step()`
+wall-clock with both pipelines pre-compiled — flips need no
+recompilation. Default-off until the bench fleet validates the flip
+path on coop-capable adapters.
 
-**Lessons honored.** This is wall-clock tuning, not register-stats
-tuning (that was tried and removed); per-kernel × per-cap
-combinatorial tuning is what made the old `auto_tune_flash_ept` take
-30 s — bounding the space per shape-class is the fix.
+**Remaining plan.**
+1. *Fleet validation*, then default-on for the family-level flips.
+2. *Shape-class granularity:* group dispatches by
+   (archetype, m/n/k-class) and measure per class instead of per
+   family. Transformer plans have a handful of classes repeated across
+   layers, so the space stays tiny.
+3. *Recompiling knobs:* EPT caps / tile sizes / generated-kernel
+   workgroup sizes are plan data now, so a candidate is a plan rebuild
+   (~seconds). Bound the space per shape-class (2–4 values per knob).
+4. *Persist measured winners* in the semantic plan cache: it already
+   fingerprints device caps and every knob (A-002), so invalidation is
+   solved and the search becomes a first-run-only cost. This revises
+   the earlier "in-memory only" stance — that call predates the
+   semantic cache; with invalidation free, refusing persistence just
+   re-pays the tune budget every process.
+
+**Non-goals.** Representation choice stays *out of the e-graph*: the
+e-graph is semantic and device-free, and `coop(x) ≡ scalar(x)` is not a
+true congruence when staging dtypes differ. The e-graph picks *what* to
+compute (extraction by bytes-moved, validated offline by benches); the
+plan/runtime layer picks *how* (measured per device). Coupling them is
+how the register-cost experiment failed — `optimize` runs before a GPU
+exists in many paths.
+
+**Lessons honored.** Wall-clock only, never per-dispatch GPU time
+(<~50 µs is submission-dominated) and never register stats; the old
+`auto_tune_flash_ept` took 30 s because it tuned per-kernel × per-cap —
+shape-class bounding is the fix.
 
 ---
 
