@@ -79,9 +79,9 @@ fn sum_inner_of_mul_parity() {
     );
 }
 
-/// Narrow rows use one lane per row and deliberately retain the materialized
-/// pointwise product. This preserves the scalar column-order sum while the
-/// final partial workgroup exercises inactive packed rows.
+/// Narrow rows use one lane per row and preserve the scalar column-order sum
+/// while the final partial workgroup exercises inactive packed rows. The
+/// pointwise product is folded into the reduction prologue.
 #[test]
 fn narrow_sum_inner_matches_scalar_f32_order() {
     let m = 259usize;

@@ -667,7 +667,7 @@ fn lower_reduction(
 
     let mut src = String::new();
     src.push_str(
-        "struct Params {\n    outer: u32,\n    inner: u32,\n    _pad0: u32,\n    _pad1: u32,\n}\n\n",
+        "struct Params {\n    outer: u32,\n    inner: u32,\n    round_one_bits: u32,\n    _pad1: u32,\n}\n\n",
     );
     for (i, name) in per_elem_names.iter().enumerate() {
         let _ = writeln!(src, "var<storage> {}: array<f32>;", name);
@@ -727,10 +727,19 @@ fn lower_reduction(
             src.push_str(line.trim_start_matches(' '));
             src.push('\n');
         }
+        let prologue_value = if lanes_per_row == 1 {
+            // Multiplication by a runtime one prevents a folded producer
+            // multiply from contracting with the reduction add. This keeps
+            // the fused packed path bit-identical to materializing the
+            // producer without a global-memory round trip.
+            format!("v{} * bitcast<f32>(params.round_one_bits)", dag.output)
+        } else {
+            format!("v{}", dag.output)
+        };
         let _ = writeln!(
             src,
             "                {}",
-            op.combine_wgsl(&format!("acc_{k}"), &format!("v{}", dag.output))
+            op.combine_wgsl(&format!("acc_{k}"), &prologue_value)
         );
         src.push_str("            }\n");
     }
