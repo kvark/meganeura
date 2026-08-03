@@ -321,10 +321,10 @@ pub enum KernelTemplate {
         dag: PointwiseDAG,
         grid: GridShape,
     },
-    /// Per-row reduction: one workgroup per outer row reduces along the
-    /// inner axis. Uniform input layout shared by the prologue (pre-
-    /// reduction per-element transform) and the optional epilogue (post-
-    /// reduction per-element map).
+    /// Per-row reduction. One workgroup normally reduces one outer row;
+    /// narrow reductions may pack several rows into one workgroup. Uniform
+    /// input layout is shared by the prologue (pre-reduction per-element
+    /// transform) and the optional epilogue (post-reduction per-element map).
     ///
     /// **Input categories**, addressed by `LoadInput(idx)` in the DAGs:
     ///   * **Per-element** `[row * inner + col]` — `n_per_elem` streams.
@@ -359,8 +359,11 @@ pub enum KernelTemplate {
         /// Per-element gather flags (see [`ReductionKernel::gather_elem`]).
         /// Empty = all direct.
         gather_elem: Vec<bool>,
-        /// Workgroup size (threads per row). Must be a power of 2 — the
-        /// tree reduction assumes it.
+        /// Number of independent rows handled by one workgroup. Must divide
+        /// the workgroup size; each row retains a power-of-two lane group.
+        rows_per_workgroup: u32,
+        /// Total workgroup size. Must be a power of 2 — the tree reduction
+        /// within each packed row assumes it.
         grid: GridShape,
     },
     /// Multi-head attention forward with online softmax (FlashAttention-1).
@@ -399,6 +402,10 @@ pub struct ReductionKernel {
     pub n_per_elem: u8,
     pub n_per_row: u8,
     pub workgroup_size: u32,
+    /// Independent outer rows reduced by one workgroup. Old cached plans
+    /// omit this field and retain the original one-row behavior.
+    #[serde(default = "default_rows_per_workgroup")]
+    pub rows_per_workgroup: u32,
     /// Which per-element streams are **gathers**: stream `i` loads
     /// `name[name_idx[row] * inner + col]` (the row is indirected through
     /// a `u32` indices buffer `{name}_idx`) instead of the direct
@@ -429,6 +436,7 @@ impl ReductionKernel {
             n_per_elem: self.n_per_elem,
             n_per_row: self.n_per_row,
             gather_elem: self.gather_elem.clone(),
+            rows_per_workgroup: self.rows_per_workgroup,
             grid: GridShape {
                 workgroup_size: self.workgroup_size,
             },
@@ -441,6 +449,10 @@ impl ReductionKernel {
     pub fn n_buffer_inputs(&self) -> u8 {
         self.n_per_elem + self.n_per_row + self.epilogue.as_ref().map_or(0, |e| e.n_per_col_inputs)
     }
+}
+
+fn default_rows_per_workgroup() -> u32 {
+    1
 }
 
 /// Attention mask type for the attention archetype.
@@ -469,6 +481,7 @@ pub fn lower(t: &KernelTemplate) -> ShaderModule {
             n_per_elem,
             n_per_row,
             ref gather_elem,
+            rows_per_workgroup,
             grid,
         } => lower_reduction(
             op,
@@ -477,6 +490,7 @@ pub fn lower(t: &KernelTemplate) -> ShaderModule {
             n_per_elem,
             n_per_row,
             gather_elem,
+            rows_per_workgroup,
             grid,
         ),
         KernelTemplate::Attention {
@@ -535,6 +549,7 @@ fn lower_reduction(
     n_per_elem: u8,
     n_per_row: u8,
     gather_elem: &[bool],
+    rows_per_workgroup: u32,
     grid: GridShape,
 ) -> ShaderModule {
     assert!(
@@ -563,6 +578,12 @@ fn lower_reduction(
     assert!(
         grid.workgroup_size.is_power_of_two() && grid.workgroup_size >= 2,
         "reduction workgroup_size must be a power of 2 ≥ 2"
+    );
+    assert!(
+        rows_per_workgroup.is_power_of_two()
+            && rows_per_workgroup <= grid.workgroup_size
+            && grid.workgroup_size.is_multiple_of(rows_per_workgroup),
+        "reduction rows_per_workgroup must be a power of 2 that divides workgroup_size"
     );
     if let Some(epi) = epilogue {
         let expected = n_per_elem + n_per_row + epi.n_per_col_inputs + 1;
@@ -637,6 +658,7 @@ fn lower_reduction(
     src.push_str("var<storage, read_write> dst: array<f32>;\n");
     src.push_str("var<uniform> params: Params;\n");
     let wg = grid.workgroup_size;
+    let lanes_per_row = wg / rows_per_workgroup;
     let _ = writeln!(src, "var<workgroup> wg_data: array<f32, {}>;\n", wg);
     let _ = writeln!(src, "@compute @workgroup_size({})", wg);
     let _ = writeln!(
@@ -644,36 +666,44 @@ fn lower_reduction(
         "fn {}(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{",
         REDUCTION_ENTRY
     );
-    src.push_str("    let row = wgid.x;\n");
     src.push_str("    let tid = lid.x;\n");
-    src.push_str("    if row >= params.outer { return; }\n");
+    let _ = writeln!(src, "    let row_slot = tid / {}u;", lanes_per_row);
+    let _ = writeln!(src, "    let lane = tid % {}u;", lanes_per_row);
+    let _ = writeln!(
+        src,
+        "    let row = wgid.x * {}u + row_slot;",
+        rows_per_workgroup
+    );
+    src.push_str("    let row_valid = row < params.outer;\n");
     src.push_str("    let row_offset = row * params.inner;\n");
     let _ = writeln!(src, "    var acc: f32 = {};", op.identity_wgsl());
-    src.push_str("    var col = tid;\n");
-    src.push_str("    loop {\n");
-    src.push_str("        if col >= params.inner { break; }\n");
+    src.push_str("    var col = lane;\n");
+    src.push_str("    if row_valid {\n");
+    src.push_str("        loop {\n");
+    src.push_str("            if col >= params.inner { break; }\n");
     // Prologue body: `col` is the per-element index variable.
     let body = prologue.emit_body(|idx| load_expr(idx, "col", false));
     // Indent each line of the prologue body by 4 extra spaces for the loop.
     for line in body.lines() {
-        src.push_str("        ");
+        src.push_str("            ");
         src.push_str(line.trim_start_matches(' '));
         src.push('\n');
     }
     let _ = writeln!(
         src,
-        "        {}",
+        "            {}",
         op.combine_wgsl("acc", &format!("v{}", prologue.output))
     );
-    let _ = writeln!(src, "        col += {}u;", wg);
+    let _ = writeln!(src, "            col += {}u;", lanes_per_row);
+    src.push_str("        }\n");
     src.push_str("    }\n");
     src.push_str("    wg_data[tid] = acc;\n");
     src.push_str("    workgroupBarrier();\n");
-    // Tree reduction.
-    let mut stride = wg / 2;
-    src.push_str("    // tree reduction\n");
+    // Independent tree reduction within each packed row's lane group.
+    let mut stride = lanes_per_row / 2;
+    src.push_str("    // packed per-row tree reduction\n");
     while stride > 0 {
-        let _ = writeln!(src, "    if tid < {}u {{", stride);
+        let _ = writeln!(src, "    if lane < {}u {{", stride);
         let combined = op.combine_wgsl("wg_data[tid]", &format!("wg_data[tid + {}u]", stride));
         let _ = writeln!(src, "        {}", combined);
         src.push_str("    }\n");
@@ -682,23 +712,30 @@ fn lower_reduction(
     }
     match epilogue {
         None => {
-            src.push_str("    if tid == 0u { dst[row] = wg_data[0]; }\n");
+            src.push_str("    if lane == 0u && row_valid { dst[row] = wg_data[tid]; }\n");
         }
         Some(epi) => {
             // Reduce-then-map: broadcast the reduced value and write a
             // transformed element back for every col.
-            src.push_str("    let reduced_value = wg_data[0];\n");
-            src.push_str("    var wcol = tid;\n");
-            src.push_str("    loop {\n");
-            src.push_str("        if wcol >= params.inner { break; }\n");
+            src.push_str("    let reduced_value = wg_data[row_slot * ");
+            let _ = writeln!(src, "{}u];", lanes_per_row);
+            src.push_str("    var wcol = lane;\n");
+            src.push_str("    if row_valid {\n");
+            src.push_str("        loop {\n");
+            src.push_str("            if wcol >= params.inner { break; }\n");
             let body = epi.dag.emit_body(|idx| load_expr(idx, "wcol", true));
             for line in body.lines() {
-                src.push_str("        ");
+                src.push_str("            ");
                 src.push_str(line.trim_start_matches(' '));
                 src.push('\n');
             }
-            let _ = writeln!(src, "        dst[row_offset + wcol] = v{};", epi.dag.output);
-            let _ = writeln!(src, "        wcol += {}u;", wg);
+            let _ = writeln!(
+                src,
+                "            dst[row_offset + wcol] = v{};",
+                epi.dag.output
+            );
+            let _ = writeln!(src, "            wcol += {}u;", lanes_per_row);
+            src.push_str("        }\n");
             src.push_str("    }\n");
         }
     }
@@ -1112,6 +1149,7 @@ mod tests {
             n_per_elem: 1,
             n_per_row: 0,
             gather_elem: Vec::new(),
+            rows_per_workgroup: 1,
             grid: GridShape::default(),
         });
         assert!(sm.source.contains("struct Params"));
@@ -1121,7 +1159,7 @@ mod tests {
         // Identity for sum is 0.
         assert!(sm.source.contains("var acc: f32 = 0.0f"));
         // Dst writes one scalar per row.
-        assert!(sm.source.contains("dst[row] = wg_data[0]"));
+        assert!(sm.source.contains("dst[row] = wg_data[tid]"));
     }
 
     #[test]
@@ -1133,6 +1171,7 @@ mod tests {
             n_per_elem: 1,
             n_per_row: 0,
             gather_elem: Vec::new(),
+            rows_per_workgroup: 1,
             grid: GridShape::default(),
         });
         // Max identity is -inf via bitcast.
@@ -1151,6 +1190,7 @@ mod tests {
             n_per_elem: 1,
             n_per_row: 0,
             gather_elem: Vec::new(),
+            rows_per_workgroup: 1,
             grid: GridShape::default(),
         });
         // Prologue emits the multiply.
@@ -1176,6 +1216,7 @@ mod tests {
             n_per_elem: 2,
             n_per_row: 0,
             gather_elem: vec![true, true],
+            rows_per_workgroup: 1,
             grid: GridShape::default(),
         });
         // Indices buffers declared for both gather streams.
@@ -1210,6 +1251,7 @@ mod tests {
             n_per_elem: 2,
             n_per_row: 0,
             gather_elem: vec![true, false],
+            rows_per_workgroup: 1,
             grid: GridShape::default(),
         });
         // Stream 0 gathered, stream 1 direct.
@@ -1240,6 +1282,7 @@ mod tests {
                 n_per_elem: 1,
                 n_per_row: 0,
                 gather_elem: Vec::new(),
+                rows_per_workgroup: 1,
                 grid: GridShape::default(),
             });
             v.validate(&sm.module).unwrap_or_else(|e| {
@@ -1289,6 +1332,7 @@ mod tests {
             n_per_elem: 1,
             n_per_row: 0,
             gather_elem: Vec::new(),
+            rows_per_workgroup: 1,
             grid: GridShape::default(),
         });
         // Has the per-col bias binding.
@@ -1296,7 +1340,10 @@ mod tests {
         // Per-element writeback instead of per-row.
         assert!(sm.source.contains("dst[row_offset + wcol]"));
         // Reduced value is read into a local.
-        assert!(sm.source.contains("let reduced_value = wg_data[0];"));
+        assert!(
+            sm.source
+                .contains("let reduced_value = wg_data[row_slot * 256u];")
+        );
         // Per-col load uses wcol.
         assert!(sm.source.contains("bias[wcol]"));
         // Rsqrt appears in generated epilogue.
@@ -1348,6 +1395,7 @@ mod tests {
             n_per_elem: 1,
             n_per_row: 1,
             gather_elem: Vec::new(),
+            rows_per_workgroup: 1,
             grid: GridShape::default(),
         });
         // Bindings: src + per_row_src (for row_max) + dst.
@@ -1380,11 +1428,35 @@ mod tests {
             n_per_elem: 1,
             n_per_row: 0,
             gather_elem: Vec::new(),
+            rows_per_workgroup: 1,
             grid: GridShape::default(),
         });
         Validator::new(flags, Capabilities::all())
             .validate(&sm.module)
             .unwrap_or_else(|e| panic!("RMSNorm reduction invalid: {:?}\n{}", e, sm.source));
+    }
+
+    #[test]
+    fn packed_narrow_reduction_lowers_and_validates() {
+        use naga::valid::{Capabilities, ValidationFlags, Validator};
+        let flags = ValidationFlags::all() ^ ValidationFlags::BINDINGS;
+        let sm = lower(&KernelTemplate::Reduction {
+            op: ReduceOp::Sum,
+            prologue: identity_prologue(),
+            epilogue: None,
+            n_per_elem: 1,
+            n_per_row: 0,
+            gather_elem: Vec::new(),
+            rows_per_workgroup: 16,
+            grid: GridShape::default(),
+        });
+        assert!(sm.source.contains("let row_slot = tid / 16u;"));
+        assert!(sm.source.contains("let lane = tid % 16u;"));
+        assert!(sm.source.contains("let row = wgid.x * 16u + row_slot;"));
+        assert!(sm.source.contains("if lane < 8u"));
+        Validator::new(flags, Capabilities::all())
+            .validate(&sm.module)
+            .unwrap_or_else(|e| panic!("packed reduction invalid: {:?}\n{}", e, sm.source));
     }
 
     #[test]
@@ -1408,6 +1480,7 @@ mod tests {
             n_per_elem: 1,
             n_per_row: 0,
             gather_elem: Vec::new(),
+            rows_per_workgroup: 1,
             grid: GridShape::default(),
         });
     }
@@ -1422,6 +1495,7 @@ mod tests {
             n_per_elem: 1,
             n_per_row: 0,
             gather_elem: Vec::new(),
+            rows_per_workgroup: 1,
             grid: GridShape {
                 workgroup_size: 250, // not power of 2
             },

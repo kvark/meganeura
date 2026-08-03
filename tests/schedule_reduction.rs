@@ -64,7 +64,7 @@ fn assert_parity(build: impl Fn(&mut Graph) -> BuildResult, n_out: usize) {
 #[test]
 fn sum_inner_of_mul_parity() {
     let m = 6usize;
-    let n = 8usize;
+    let n = 64usize;
     assert_parity(
         |g| {
             let a = g.input("a", &[m, n]);
@@ -79,6 +79,88 @@ fn sum_inner_of_mul_parity() {
     );
 }
 
+/// Narrow rows use one lane per row and deliberately retain the materialized
+/// pointwise product. This preserves the scalar column-order sum while the
+/// final partial workgroup exercises inactive packed rows.
+#[test]
+fn narrow_sum_inner_matches_scalar_f32_order() {
+    let m = 259usize;
+    let n = 9usize;
+    let a_data: Vec<f32> = (0..m * n)
+        .map(|i| ((i * 17 % 101) as f32 - 50.0) * 0.013)
+        .collect();
+    let b_data: Vec<f32> = (0..m * n)
+        .map(|i| ((i * 29 % 97) as f32 - 48.0) * -0.021)
+        .collect();
+    let actual = run(
+        &|g| {
+            let a = g.input("a", &[m, n]);
+            let b = g.input("b", &[m, n]);
+            let product = g.mul(a, b);
+            let output = g.sum_inner(product);
+            (
+                output,
+                vec![("a", a_data.clone()), ("b", b_data.clone())],
+                vec![],
+            )
+        },
+        m,
+        true,
+    );
+    for (row, &actual_row) in actual.iter().enumerate().take(m) {
+        let mut expected = 0.0_f32;
+        for col in 0..n {
+            let index = row * n + col;
+            expected += a_data[index] * b_data[index];
+        }
+        assert_eq!(
+            actual_row.to_bits(),
+            expected.to_bits(),
+            "packed row {row}: {} != {expected}",
+            actual_row
+        );
+    }
+}
+
+#[test]
+fn narrow_sum_inner_matches_ones_matmul_bit_exactly() {
+    let m = 259usize;
+    let n = 9usize;
+    let input_data: Vec<f32> = (0..m * n)
+        .map(|i| ((i * 37 % 211) as f32 - 105.0) * 0.0073)
+        .collect();
+    let mut graph = Graph::new();
+    let input = graph.input("input", &[m, n]);
+    let ones = graph.constant(vec![1.0; n], &[n, 1]);
+    let matmul = graph.matmul(input, ones);
+    let packed = graph.sum_inner(input);
+    graph.set_outputs(vec![matmul, packed]);
+    let mut session = meganeura::build(
+        &graph,
+        SessionConfig {
+            mode: Mode::Inference,
+            ..SessionConfig::default()
+        },
+    )
+    .0;
+    session.set_input("input", &input_data);
+    session.step();
+    session.wait();
+    let mut matmul_output = vec![0.0; m];
+    let mut packed_output = vec![0.0; m];
+    session.read_output_by_index(0, &mut matmul_output);
+    session.read_output_by_index(1, &mut packed_output);
+    for row in 0..m {
+        assert_eq!(
+            packed_output[row].to_bits(),
+            matmul_output[row].to_bits(),
+            "packed row {row}: {} != matmul {}",
+            packed_output[row],
+            matmul_output[row]
+        );
+    }
+}
+
 /// Phase 2: `sum_inner(mul(embedding(idx, table), basis))` — the SH colour
 /// path. Folds the gather (Embedding) into the reduction as a gather
 /// stream. Exercises the full gather codegen + dynamic binding.
@@ -86,7 +168,7 @@ fn sum_inner_of_mul_parity() {
 fn sum_inner_of_gather_times_basis_parity() {
     let vocab = 4usize;
     let m = 6usize; // outer (P*L)
-    let n = 8usize; // inner (K) = table hidden
+    let n = 64usize; // inner (K) = table hidden
     assert_parity(
         |g| {
             let idx = g.input_u32("idx", &[m]);
@@ -116,7 +198,7 @@ fn sum_inner_of_gather_times_basis_parity() {
 fn two_gather_reduction_actually_fuses() {
     let vocab = 5usize;
     let m = 6usize;
-    let n = 8usize;
+    let n = 64usize;
     let mut g = Graph::new();
     let idx_a = g.input_u32("idx_a", &[m]);
     let idx_b = g.input_u32("idx_b", &[m]);
@@ -167,7 +249,7 @@ fn two_gather_reduction_actually_fuses() {
 fn sum_inner_of_two_gathers_parity() {
     let vocab = 5usize;
     let m = 6usize;
-    let n = 8usize;
+    let n = 64usize;
     assert_parity(
         |g| {
             let idx_a = g.input_u32("idx_a", &[m]);

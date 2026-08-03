@@ -944,6 +944,12 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
             let Some(kernel) = c.reduction.as_ref() else {
                 continue;
             };
+            // A one-lane packed reduction intentionally consumes a
+            // materialized producer: each row then sums stored f32 values in
+            // column order, matching the stable scalar-matmul convention.
+            if kernel.rows_per_workgroup == kernel.workgroup_size {
+                continue;
+            }
             // Phase 1 invariant: no gather streams yet, so input_buffers
             // is 1:1 with prologue inputs (per-elem first, then per-row).
             if kernel.gather_elem.iter().any(|&g| g) {
@@ -1015,6 +1021,9 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
             let Some(kernel) = c.reduction.as_ref() else {
                 continue;
             };
+            if kernel.rows_per_workgroup == kernel.workgroup_size {
+                continue;
+            }
             let outer = c.params[0];
             let inner = c.params[1];
             let per_elem = kernel.n_per_elem as usize;
@@ -2083,16 +2092,19 @@ impl<'a> Compiler<'a> {
             }
 
             Op::SumInner => {
-                // [M, N] → [M, 1]: per-row reduction over the inner axis,
-                // one workgroup per row. Lowers to a schedule-template
-                // reduction with an identity prologue, so the fusion pass
-                // can later fold a pointwise/gather producer into it.
+                // [M, N] → [M, 1]: per-row reduction over the inner axis.
+                // Pack narrow rows into one workgroup so SH-width reductions
+                // do not launch hundreds of idle lanes per output scalar.
+                // Wide reductions keep the existing producer-fusion path.
+                // The one-lane packed path materializes its producer so each
+                // row retains scalar column-order summation.
                 use crate::schedule::{PointwiseDAG, Pw, ReduceOp, ReductionKernel};
                 const WG: u32 = 256;
                 let input = self.get_buffer(node.inputs[0]);
                 let in_shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let m = in_shape[0] as u32;
                 let n = in_shape[1] as u32;
+                let rows_per_workgroup = if n <= 32 { WG } else { 1 };
                 let kernel = ReductionKernel {
                     op: ReduceOp::Sum,
                     prologue: PointwiseDAG {
@@ -2104,11 +2116,12 @@ impl<'a> Compiler<'a> {
                     n_per_elem: 1,
                     n_per_row: 0,
                     workgroup_size: WG,
+                    rows_per_workgroup,
                     gather_elem: Vec::new(),
                 };
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::Relu, // sentinel; routing is via `reduction`
-                    workgroups: [m, 1, 1],
+                    workgroups: [m.div_ceil(rows_per_workgroup), 1, 1],
                     input_buffers: vec![input],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
@@ -3798,6 +3811,7 @@ impl<'a> Compiler<'a> {
             n_per_elem: 1,
             n_per_row: 0,
             workgroup_size: WG,
+            rows_per_workgroup: 1,
             gather_elem: Vec::new(),
         };
         self.plan.dispatches.push(Dispatch {
@@ -3851,6 +3865,7 @@ impl<'a> Compiler<'a> {
             n_per_elem: 1,
             n_per_row: 1,
             workgroup_size: WG,
+            rows_per_workgroup: 1,
             gather_elem: Vec::new(),
         };
         self.plan.dispatches.push(Dispatch {
@@ -3930,6 +3945,7 @@ impl<'a> Compiler<'a> {
             n_per_elem: 1,
             n_per_row: 0,
             workgroup_size: WG,
+            rows_per_workgroup: 1,
             gather_elem: Vec::new(),
         };
 
@@ -4104,6 +4120,52 @@ mod tests {
         for d in &plan.dispatches {
             assert_eq!(d.params[0], 32);
         }
+    }
+
+    #[test]
+    fn sum_inner_packs_narrow_rows_only() {
+        let mut narrow = Graph::new();
+        let input = narrow.input("input", &[100, 9]);
+        let output = narrow.sum_inner(input);
+        narrow.set_outputs(vec![output]);
+        let narrow_plan = compile(&narrow);
+        let narrow_dispatch = &narrow_plan.dispatches[0];
+        assert_eq!(narrow_dispatch.workgroups, [1, 1, 1]);
+        assert_eq!(
+            narrow_dispatch
+                .reduction
+                .as_ref()
+                .unwrap()
+                .rows_per_workgroup,
+            256
+        );
+
+        let mut wide = Graph::new();
+        let input = wide.input("input", &[100, 33]);
+        let output = wide.sum_inner(input);
+        wide.set_outputs(vec![output]);
+        let wide_plan = compile(&wide);
+        let wide_dispatch = &wide_plan.dispatches[0];
+        assert_eq!(wide_dispatch.workgroups, [100, 1, 1]);
+        assert_eq!(
+            wide_dispatch.reduction.as_ref().unwrap().rows_per_workgroup,
+            1
+        );
+
+        let mut product = Graph::new();
+        let a = product.input("a", &[100, 9]);
+        let b = product.input("b", &[100, 9]);
+        let terms = product.mul(a, b);
+        let output = product.sum_inner(terms);
+        product.set_outputs(vec![output]);
+        let product_plan = compile(&product);
+        assert_eq!(
+            product_plan.dispatches.len(),
+            2,
+            "narrow reductions must retain the materialized f32 product"
+        );
+        assert!(product_plan.dispatches[0].pointwise.is_some());
+        assert!(product_plan.dispatches[1].reduction.is_some());
     }
 
     #[test]
