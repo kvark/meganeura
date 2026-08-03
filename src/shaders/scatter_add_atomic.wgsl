@@ -24,6 +24,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let source_len = params.seq_len * params.embed_dim;
     if source_index >= source_len { return; }
 
+    // Sparse gradients are common when gathers are followed by masks or
+    // activation gates. Avoid contending on the destination for updates that
+    // cannot change it. This is especially important for padded sequences,
+    // where many invocations would otherwise serialize while adding zero.
+    let value = src[source_index];
+    if value == 0.0 { return; }
+
     let source_row = source_index / params.embed_dim;
     let column = source_index % params.embed_dim;
     let output_row = indices[source_row];
@@ -31,7 +38,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if output_row >= output_rows { return; }
 
     let output_index = output_row * params.embed_dim + column;
-    let value = src[source_index];
     var old_bits = atomicLoad(&dst[output_index]);
     loop {
         let old_value = bitcast<f32>(old_bits);
