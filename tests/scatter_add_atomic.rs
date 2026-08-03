@@ -1,7 +1,7 @@
 use meganeura::{Graph, Mode, SessionConfig};
 
 #[test]
-fn large_scatter_add_matches_cpu_with_repeated_indices() {
+fn large_scatter_add_matches_cpu_with_repeated_indices_and_zeros() {
     const VOCAB_SIZE: usize = 4097;
     const SEQ_LEN: usize = 256;
     const EMBED_DIM: usize = 3;
@@ -22,7 +22,11 @@ fn large_scatter_add_matches_cpu_with_repeated_indices() {
 
     let indices: Vec<u32> = (0..SEQ_LEN).map(|i| ((i * 17) % 31) as u32).collect();
     let src: Vec<f32> = (0..SEQ_LEN * EMBED_DIM)
-        .map(|i| (i as f32 - 200.0) * 0.001)
+        .map(|i| match i % 19 {
+            0 => (i as f32 - 200.0) * 0.001,
+            1 => -0.0,
+            _ => 0.0,
+        })
         .collect();
     let mut expected = vec![0.0_f32; VOCAB_SIZE * EMBED_DIM];
     for row in 0..SEQ_LEN {
