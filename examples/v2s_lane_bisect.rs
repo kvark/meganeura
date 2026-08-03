@@ -13,7 +13,6 @@
 
 use meganeura::Graph;
 use meganeura::NodeId;
-use meganeura::build_inference_session;
 use meganeura::data::safetensors::SafeTensorsModel;
 use meganeura::models::efficientnet;
 use meganeura::models::efficientnet::{Spatial, fused_mbconv, mbconv};
@@ -168,7 +167,7 @@ fn main() {
         };
     g.set_outputs(vec![out_node]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
 
     println!("loading weights from {weights_path}...");
     let weights = SafeTensorsModel::load(weights_path.clone().into()).expect("safetensors load");

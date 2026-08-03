@@ -6,7 +6,7 @@
 /// Usage:
 ///   cargo run --release --example smollm2 [-- "Your prompt here"]
 use meganeura::{
-    Graph, build_inference_session,
+    Graph,
     data::safetensors::SafeTensorsModel,
     models::smollm2::{self, SmolLM2Config},
 };
@@ -76,7 +76,7 @@ fn main() {
 
     // --- Compile ---
     println!("compiling inference session...");
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
     println!(
         "session ready: {} buffers, {} dispatches",
         session.plan().buffers.len(),

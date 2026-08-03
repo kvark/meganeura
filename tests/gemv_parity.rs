@@ -5,7 +5,7 @@
 //! it produces numerically identical output to the tiled matmul for
 //! representative decode-sized shapes.
 
-use meganeura::{Graph, build_inference_session, compile};
+use meganeura::{Graph, compile};
 
 /// Reference CPU matmul for [1,K] × [K,N] → [1,N].
 fn cpu_gemv(a: &[f32], b: &[f32], k: usize, n: usize) -> Vec<f32> {
@@ -27,7 +27,7 @@ fn run_gpu_gemv(a_data: &[f32], b_data: &[f32], k: usize, n: usize) -> Vec<f32> 
     let c = g.matmul(a, b);
     g.set_outputs(vec![c]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
 
     // Sanity: when N % 4 == 0 the plan should route through GEMV;
     // otherwise it falls back to the tile matmul.
@@ -153,7 +153,7 @@ fn test_gemv_add_shape(k: usize, n: usize, seed: u32) {
     let out = g.add(mm, d_n);
     g.set_outputs(vec![out]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
     // Sanity: the optimizer should fuse MatMul+Add to FusedMatMulAdd, which
     // at M=1 with N%4==0 routes through MatMulGemvAdd.
     let plan = session.plan();
@@ -231,7 +231,7 @@ fn test_gemv_bt_shape(k: usize, n: usize, seed: u32) {
     let c = g.matmul_bt(a_n, b_n);
     g.set_outputs(vec![c]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
 
     let plan = session.plan();
     let gemv_bt_count = plan

@@ -102,8 +102,12 @@ impl BufferUse {
 /// - `ScatterAdd` outputs — read-modify-write;
 /// - any buffer whose first use is a read (live-in from a prior step),
 ///   and any buffer no dispatch touches.
-pub fn plan_buffer_aliasing(plan: &ExecutionPlan, groups: &[Range<usize>]) -> AliasPlan {
-    let (pinned, uses) = compute_pinned(plan, groups);
+pub fn plan_buffer_aliasing(
+    plan: &ExecutionPlan,
+    groups: &[Range<usize>],
+    pin_spec: Option<&str>,
+) -> AliasPlan {
+    let (pinned, uses) = compute_pinned(plan, groups, pin_spec);
     let n = plan.buffers.len();
 
     let mut map = vec![usize::MAX; n];
@@ -179,8 +183,12 @@ pub fn plan_buffer_aliasing(plan: &ExecutionPlan, groups: &[Range<usize>]) -> Al
 /// — step-local intermediates are still marked for `Memory::Device`.
 /// Used when `MEGANEURA_NO_ALIAS` disables reuse, so the aliasing and
 /// device-local decisions can be toggled independently.
-pub fn plan_no_alias(plan: &ExecutionPlan, groups: &[Range<usize>]) -> AliasPlan {
-    let (pinned, _) = compute_pinned(plan, groups);
+pub fn plan_no_alias(
+    plan: &ExecutionPlan,
+    groups: &[Range<usize>],
+    pin_spec: Option<&str>,
+) -> AliasPlan {
+    let (pinned, _) = compute_pinned(plan, groups, pin_spec);
     AliasPlan {
         map: (0..plan.buffers.len()).collect(),
         sizes: plan.buffers.clone(),
@@ -192,7 +200,11 @@ pub fn plan_no_alias(plan: &ExecutionPlan, groups: &[Range<usize>]) -> AliasPlan
 /// which buffers must keep a dedicated, host-visible allocation (see
 /// [`plan_buffer_aliasing`] for the full list), plus the per-buffer
 /// barrier-group use intervals.
-fn compute_pinned(plan: &ExecutionPlan, groups: &[Range<usize>]) -> (Vec<bool>, Vec<BufferUse>) {
+fn compute_pinned(
+    plan: &ExecutionPlan,
+    groups: &[Range<usize>],
+    pin_spec: Option<&str>,
+) -> (Vec<bool>, Vec<BufferUse>) {
     let n = plan.buffers.len();
     let mut pinned = vec![false; n];
     let pin = |b: BufferRef, pinned: &mut Vec<bool>| {
@@ -266,7 +278,7 @@ fn compute_pinned(plan: &ExecutionPlan, groups: &[Range<usize>]) -> (Vec<bool>, 
     // Debug aid: MEGANEURA_PIN_BUFS="3,17,25-40" force-pins logical
     // buffers, excluding them from aliasing. Used to bisect aliasing
     // corruption down to a single buffer.
-    if let Some(spec) = crate::config::PIN_BUFS.text() {
+    if let Some(spec) = pin_spec {
         for part in spec.split(',').filter(|s| !s.is_empty()) {
             if let Some((a, b)) = part.split_once('-') {
                 let (a, b): (usize, usize) = (a.parse().unwrap(), b.parse().unwrap());
@@ -388,7 +400,7 @@ mod tests {
         p.input_buffers.push(("x".into(), BufferRef(0)));
         p.output_buffers.push(BufferRef(4));
         let groups: Vec<Range<usize>> = (0..4).map(|i| i..i + 1).collect();
-        let alias = plan_buffer_aliasing(&p, &groups);
+        let alias = plan_buffer_aliasing(&p, &groups, None);
 
         assert_eq!(alias.map[1], alias.map[3], "t1 and t3 should alias");
         assert_ne!(alias.map[2], alias.map[1], "t2 overlaps t1");
@@ -428,7 +440,7 @@ mod tests {
         p.input_buffers.push(("x".into(), BufferRef(0)));
         p.output_buffers.push(BufferRef(4));
         let groups: Vec<Range<usize>> = (0..4).map(|i| i..i + 1).collect();
-        let alias = plan_no_alias(&p, &groups);
+        let alias = plan_no_alias(&p, &groups, None);
         assert_eq!(alias.map, vec![0, 1, 2, 3, 4]);
         assert_eq!(alias.sizes, p.buffers);
         assert_eq!(alias.device_local, vec![false, true, true, true, false]);
@@ -446,7 +458,7 @@ mod tests {
         p.input_buffers.push(("x".into(), BufferRef(0)));
         p.output_buffers.push(BufferRef(3));
         let groups = vec![0..2, 2..3];
-        let alias = plan_buffer_aliasing(&p, &groups);
+        let alias = plan_buffer_aliasing(&p, &groups, None);
         assert_ne!(alias.map[1], alias.map[2]);
         check_disjoint(&p, &groups, &alias);
     }
@@ -462,7 +474,7 @@ mod tests {
         p.input_buffers.push(("x".into(), BufferRef(0)));
         p.output_buffers.push(BufferRef(3));
         let groups: Vec<Range<usize>> = (0..3).map(|i| i..i + 1).collect();
-        let alias = plan_buffer_aliasing(&p, &groups);
+        let alias = plan_buffer_aliasing(&p, &groups, None);
         // Buffer 2 dies at group 2 and nothing later could reuse buffer 1's
         // slot anyway; the property under test: 1 keeps a dedicated slot.
         assert!(alias.map.iter().filter(|&&m| m == alias.map[1]).count() == 1);
@@ -479,7 +491,7 @@ mod tests {
         p.input_buffers.push(("kv".into(), BufferRef(0)));
         p.output_buffers.push(BufferRef(3));
         let groups: Vec<Range<usize>> = (0..3).map(|i| i..i + 1).collect();
-        let alias = plan_buffer_aliasing(&p, &groups);
+        let alias = plan_buffer_aliasing(&p, &groups, None);
         assert!(alias.map.iter().filter(|&&m| m == alias.map[1]).count() == 1);
     }
 
@@ -494,7 +506,7 @@ mod tests {
         p.param_grad_pairs.push((BufferRef(1), BufferRef(4)));
         p.output_buffers.push(BufferRef(3));
         let groups: Vec<Range<usize>> = (0..3).map(|i| i..i + 1).collect();
-        let alias = plan_buffer_aliasing(&p, &groups);
+        let alias = plan_buffer_aliasing(&p, &groups, None);
         for pinned in [0usize, 1, 3, 4] {
             assert!(
                 alias

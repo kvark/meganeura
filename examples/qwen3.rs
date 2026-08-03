@@ -15,7 +15,7 @@
 ///   cargo run --release --example qwen3 -- --tokens 128           # generate 128 tokens
 ///   cargo run --release --example qwen3 -- --f16                  # half-precision weights
 ///   cargo run --release --example qwen3 -- --q4                   # 4-bit quantized weights
-use meganeura::{Graph, build_inference_session, data::safetensors::SafeTensorsModel};
+use meganeura::{Graph, data::safetensors::SafeTensorsModel};
 
 struct Qwen3Config {
     repo_id: &'static str,
@@ -325,7 +325,7 @@ fn main() {
 
     // --- Compile ---
     println!("compiling inference session...");
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
     let total_vram: usize = session.plan().buffers.iter().sum();
     println!(
         "session ready: {} buffers, {} dispatches, {:.1} MB VRAM",

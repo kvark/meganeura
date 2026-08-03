@@ -4,7 +4,7 @@
 //! dead output from `outputs()`, collapsing `num_outputs()` and making
 //! `read_output_by_index(1)` panic.
 
-use meganeura::{Graph, build_session, nn};
+use meganeura::{Graph, nn};
 
 #[test]
 fn output_matmul_survives_matmul_add_fusion() {
@@ -23,7 +23,7 @@ fn output_matmul_survives_matmul_add_fusion() {
     let loss = g.mse_loss(pred_pre_bias, target);
     g.set_outputs(vec![loss, pred_pre_bias]);
 
-    let mut s = build_session(&g);
+    let mut s = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     assert_eq!(
         s.num_outputs(),
         2,

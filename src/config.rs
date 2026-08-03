@@ -1,4 +1,16 @@
-//! Central registry of every `MEGANEURA_*` environment variable.
+//! Central registry of every `MEGANEURA_*` environment variable — and the
+//! ONLY place that reads them.
+//!
+//! The library core is environment-free: `compile`, `runtime`, `codegen`,
+//! and `optimize` accept strongly typed options and never touch
+//! `std::env`. Clients that want env-driven behavior (the repo's own
+//! examples, benches, and tests; external harnesses like Inferena) opt in
+//! explicitly through the `from_env` constructors below, typically:
+//!
+//! ```no_run
+//! # let graph = meganeura::Graph::new();
+//! let session = meganeura::build(&graph, meganeura::SessionConfig::from_env()).0;
+//! ```
 //!
 //! Every variable the library reads is declared here — its type, its
 //! class, its documentation, and nothing else reads `std::env` for
@@ -7,8 +19,8 @@
 //!
 //! * **Discoverability** — [`describe`] renders the full table, and a
 //!   test pins the README against the registry so docs can't drift.
-//! * **Visibility** — [`log_overrides`] (called once at session build)
-//!   logs every variable that is actually set, and warns about
+//! * **Visibility** — [`log_overrides`] (called by every `from_env`
+//!   constructor) logs every variable that is actually set, and warns about
 //!   `MEGANEURA_*` names it doesn't recognize, so a typo like
 //!   `MEGANEURA_DISBLE_COOP=1` fails loudly instead of silently doing
 //!   nothing.
@@ -17,19 +29,26 @@
 //!   (Historically some flags treated *any* value, including `0`, as
 //!   on.)
 //!
-//! Precedence is per class:
+//! Precedence is simple: `from_env` resolves the environment into a
+//! value, and any field the caller assigns afterwards wins. A binary
+//! that never calls `from_env` is completely environment-independent.
+//! The classes below describe intent:
 //!
-//! * [`VarClass::Diagnostic`] switches **override everything** — they
-//!   exist to change the behavior of a binary you can't edit.
-//! * [`VarClass::Tuning`] variables feed **defaults** — an explicitly
-//!   constructed [`TuningKnobs`](crate::compile::TuningKnobs) or
-//!   `SessionConfig` field wins over the environment.
+//! * [`VarClass::Diagnostic`] switches exist to change the behavior of
+//!   a binary you can't edit — harnesses should honor them by building
+//!   their configs through `from_env`.
+//! * [`VarClass::Tuning`] variables feed the defaults of
+//!   [`TuningKnobs`] / `SessionConfig` knobs.
 //! * [`VarClass::Selection`] variables choose external resources
 //!   (device, output paths) and have no in-code counterpart.
 //! * [`VarClass::External`] names are read by tests/examples, not the
 //!   library; they're registered so the unknown-variable warning
 //!   doesn't fire on them.
 
+use crate::compile::{CompileOptions, TuningKnobs};
+use crate::optimize::{ExtractionCost, OptimizeConfig, OptimizeMode};
+use crate::runtime::{CoopPolicy, GpuOptions, SessionOptions};
+use crate::train::SessionConfig;
 use std::sync::OnceLock;
 
 /// How a variable's value is interpreted.
@@ -164,6 +183,194 @@ registry! {
         "Examples convention: write a Perfetto trace to this path.";
     SKIP_BACKPROP: "MEGANEURA_SKIP_BACKPROP", Bool, External,
         "Tests convention: skip MHA-backward tests on software drivers with broken wg reductions.";
+}
+
+impl OptimizeConfig {
+    /// Read benchmark-oriented overrides while retaining production defaults.
+    ///
+    /// - `MEGANEURA_OPTIMIZER=off|greedy|egglog-windowed|egglog-outlined|egglog-whole`
+    /// - `MEGANEURA_EGRAPH_COST=ast-size|tensor-traffic`
+    /// - `MEGANEURA_EGRAPH_CUTOFF=<positive integer>`
+    pub fn from_env() -> Self {
+        log_overrides();
+        let mut config = Self::default();
+        if let Some(value) = OPTIMIZER.text() {
+            config.mode = match value.as_str() {
+                "off" => OptimizeMode::Off,
+                "greedy" => OptimizeMode::Greedy,
+                "egglog-windowed" | "windowed" => OptimizeMode::EgglogWindowed,
+                "egglog-outlined" | "outlined" => OptimizeMode::EgglogOutlined,
+                "egglog-whole" | "whole" => OptimizeMode::EgglogWhole,
+                _ => {
+                    log::warn!("unknown MEGANEURA_OPTIMIZER={value:?}; using greedy");
+                    OptimizeMode::Greedy
+                }
+            };
+        }
+        if let Some(value) = EGRAPH_COST.text() {
+            config.extraction_cost = match value.as_str() {
+                "ast-size" | "ast" | "unit" => ExtractionCost::AstSize,
+                "tensor-traffic" | "traffic" => ExtractionCost::TensorTraffic,
+                _ => {
+                    log::warn!("unknown MEGANEURA_EGRAPH_COST={value:?}; using tensor-traffic");
+                    ExtractionCost::TensorTraffic
+                }
+            };
+        }
+        if let Some(value) = EGRAPH_CUTOFF.u32_value() {
+            if value > 0 {
+                config.saturation_cutoff = value as usize;
+            } else {
+                log::warn!("MEGANEURA_EGRAPH_CUTOFF must be > 0; using the default");
+            }
+        }
+        config
+    }
+}
+
+impl TuningKnobs {
+    /// Platform defaults with `MEGANEURA_FLASH_*_EPT_CAP` overrides.
+    /// Caps must be powers of two ≥ 2; invalid values warn and are ignored.
+    pub fn from_env() -> Self {
+        log_overrides();
+        fn cap(var: &VarSpec) -> Option<u32> {
+            var.u32_value().filter(|v| {
+                let ok = v.is_power_of_two() && *v >= 2;
+                if !ok {
+                    log::warn!("{}={v} must be a power of two >= 2; ignoring", var.name);
+                }
+                ok
+            })
+        }
+        let d = Self::default();
+        let bwd = cap(&FLASH_BWD_EPT_CAP);
+        let fwd = cap(&FLASH_EPT_CAP);
+        Self {
+            flash_ept_cap: fwd.unwrap_or(d.flash_ept_cap),
+            flash_grad_q_ept_cap: cap(&FLASH_GRAD_Q_EPT_CAP)
+                .or(bwd)
+                .or(fwd)
+                .unwrap_or(d.flash_grad_q_ept_cap),
+            flash_grad_kv_ept_cap: cap(&FLASH_GRAD_KV_EPT_CAP)
+                .or(bwd)
+                .or(fwd)
+                .unwrap_or(d.flash_grad_kv_ept_cap),
+        }
+    }
+}
+
+impl CompileOptions {
+    /// Defaults with the flash-coop switches and EPT caps read from the
+    /// environment.
+    pub fn from_env() -> Self {
+        log_overrides();
+        Self {
+            knobs: TuningKnobs::from_env(),
+            flash_forward_coop: FLASH_FWD_COOP.bool_or(true),
+            flash_backward_coop: FLASH_BWD_COOP.bool_or(false),
+            ..Self::default()
+        }
+    }
+}
+
+impl SessionOptions {
+    /// Defaults with the diagnostic switches and cooperative-matrix policy
+    /// read from the environment.
+    pub fn from_env() -> Self {
+        log_overrides();
+        let coop = if DISABLE_COOP.bool_or(false) {
+            CoopPolicy::Disabled
+        } else if COOP_F16.bool_or(false) {
+            CoopPolicy::AllowF16
+        } else {
+            CoopPolicy::Auto
+        };
+        Self {
+            debug: false,
+            coop,
+            no_alias: NO_ALIAS.bool_or(false),
+            no_device_local: NO_DEVICE_LOCAL.bool_or(false),
+            serial_dispatch: SERIAL_DISPATCH.bool_or(false),
+            dump_plan: DUMP_PLAN.bool_or(false),
+            pin_buffers: PIN_BUFS.text(),
+        }
+    }
+}
+
+impl GpuOptions {
+    /// Adapter selection and timestamp collection from the environment.
+    pub fn from_env() -> Self {
+        log_overrides();
+        let device_id = DEVICE_ID.text().and_then(|value| {
+            let parsed = crate::runtime::parse_device_id(&value);
+            if parsed.is_none() {
+                log::warn!(
+                    "ignoring invalid MEGANEURA_DEVICE_ID={value:?}; \
+                     expected decimal or 0x-prefixed u32"
+                );
+            }
+            parsed
+        });
+        Self {
+            device_id,
+            timing: GPU_TIMING.bool_or(false),
+        }
+    }
+}
+
+impl SessionConfig<'_> {
+    /// A [`SessionConfig`] with every environment override applied — the
+    /// one-liner for harnesses, examples, and env-driven test runs:
+    /// compile options, tuning knobs, optimizer mode, diagnostic switches,
+    /// coop policy, `MEGANEURA_TUNE`, and (only when `MEGANEURA_DEVICE_ID`
+    /// or `MEGANEURA_GPU_TIMING` is set) a GPU context created with those
+    /// options. Also installs the WGSL dump directory when
+    /// `MEGANEURA_DUMP_WGSL` is set.
+    ///
+    /// Fields assigned *after* this call win — precedence is simply
+    /// "explicit code runs last".
+    pub fn from_env() -> Self {
+        log_overrides();
+        if let Some(dir) = DUMP_WGSL.text() {
+            crate::codegen::set_wgsl_dump_dir(dir);
+        }
+        let gpu_opts = GpuOptions::from_env();
+        let gpu = if gpu_opts.device_id.is_some() || gpu_opts.timing {
+            match crate::runtime::init_gpu_context_with(gpu_opts) {
+                Ok(context) => Some(std::sync::Arc::new(context)),
+                Err(e) => {
+                    log::warn!("env-selected GPU init failed ({e:?}); using default adapter");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        Self {
+            gpu,
+            options: CompileOptions::from_env(),
+            optimize: OptimizeConfig::from_env(),
+            runtime: SessionOptions::from_env(),
+            tune: TUNE.bool_or(false),
+            ..Self::default()
+        }
+    }
+
+    /// [`SessionConfig::from_env`] with `mode: Inference`.
+    pub fn inference_from_env() -> Self {
+        Self {
+            mode: crate::train::Mode::Inference,
+            ..Self::from_env()
+        }
+    }
+
+    /// [`SessionConfig::from_env`] with `skip_full_optimize: true`.
+    pub fn unoptimized_from_env() -> Self {
+        Self {
+            skip_full_optimize: true,
+            ..Self::from_env()
+        }
+    }
 }
 
 /// Render the registry as an aligned plain-text table.

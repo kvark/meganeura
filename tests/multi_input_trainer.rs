@@ -8,7 +8,7 @@
 //! input rework, the loader declares N named streams and the trainer
 //! binds them by name.
 
-use meganeura::{DataLoader, Graph, TrainConfig, Trainer, build_session, data::InputStream, nn};
+use meganeura::{DataLoader, Graph, TrainConfig, Trainer, data::InputStream, nn};
 
 fn build_xy_plus_bias_regressor(batch: usize, in_d: usize, out_d: usize) -> Graph {
     let mut g = Graph::new();
@@ -33,7 +33,7 @@ fn trainer_drives_three_named_streams() {
     let n = 32;
 
     let g = build_xy_plus_bias_regressor(batch, in_d, out_d);
-    let session = build_session(&g);
+    let session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
 
     // Deterministic synthetic data.
     let x: Vec<f32> = (0..n * in_d).map(|i| (i as f32 * 0.1).sin()).collect();

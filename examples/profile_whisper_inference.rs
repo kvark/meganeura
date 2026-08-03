@@ -9,7 +9,7 @@
 //!   MEGANEURA_DEVICE_ID=<id> cargo run --release --example profile_whisper_inference
 
 use meganeura::{
-    Graph, build_inference_session,
+    Graph,
     models::whisper::{self, WhisperConfig},
 };
 
@@ -19,7 +19,7 @@ fn main() {
     // Install coop_matrix_available global so the FlashAttentionCoop
     // dispatch (gated additionally by MEGANEURA_FLASH_FWD_COOP=1) can
     // fire on capable GPUs.
-    let gpu = meganeura::runtime::init_gpu_context().expect("gpu");
+    let gpu = meganeura::init_gpu_context_with(meganeura::GpuOptions::from_env()).expect("gpu");
     let result = meganeura::runtime::auto_tune(&gpu, 64);
     eprintln!("coop_matrix_available={}", result.coop_caps.is_supported());
     meganeura::runtime::install_auto_tune(result);
@@ -34,7 +34,7 @@ fn main() {
     let hidden = whisper::build_encoder(&mut g, &config, batch, mel_len);
     g.set_outputs(vec![hidden]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
     eprintln!(
         "Whisper-tiny encoder: {} dispatches, {} buffers, seq_len={}",
         session.plan().dispatches.len(),

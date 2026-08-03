@@ -4,7 +4,7 @@
 //! Usage:
 //!   MEGANEURA_DEVICE_ID=<id> cargo run --release --example profile_resnet50_train
 
-use meganeura::{build_session, models::resnet};
+use meganeura::models::resnet;
 
 fn main() {
     env_logger::init();
@@ -13,7 +13,7 @@ fn main() {
     // stride-1 backward dispatches to the generated conv coop kernels.
     // Without this the scalar Conv2dGradInputGemm runs (34% of training
     // time on RTX 5080).
-    let gpu = meganeura::runtime::init_gpu_context().expect("gpu");
+    let gpu = meganeura::init_gpu_context_with(meganeura::GpuOptions::from_env()).expect("gpu");
     let result = meganeura::runtime::auto_tune(&gpu, 64);
     eprintln!("coop_matrix_available={}", result.coop_caps.is_supported());
     meganeura::runtime::install_auto_tune(result);
@@ -22,7 +22,7 @@ fn main() {
     let batch = 1u32;
     let g = resnet::build_resnet50_training(batch);
 
-    let mut sess = build_session(&g);
+    let mut sess = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     eprintln!(
         "ResNet-50 training: {} dispatches, {} buffers",
         sess.plan().dispatches.len(),

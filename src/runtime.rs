@@ -2037,6 +2037,33 @@ pub struct SessionOptions {
     /// [`Session::read_node`] after a step. Costs memory and bandwidth;
     /// intended for development, not benchmarking.
     pub debug: bool,
+    /// Cooperative-matrix policy (see [`CoopPolicy`]).
+    pub coop: CoopPolicy,
+    /// Disable buffer lifetime aliasing (independent of `debug`).
+    pub no_alias: bool,
+    /// Keep every buffer host-visible instead of device-local.
+    pub no_device_local: bool,
+    /// One compute pass per dispatch — serial execution for bisection.
+    pub serial_dispatch: bool,
+    /// Dump dispatch order, provenance, accesses, and the alias map at
+    /// session build.
+    pub dump_plan: bool,
+    /// Force-pin logical buffers by id/range, e.g. `"3,17,25-40"` — the
+    /// aliasing-corruption bisection aid.
+    pub pin_buffers: Option<String>,
+}
+
+/// How cooperative-matrix hardware may be used.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CoopPolicy {
+    /// Use native f32 tiles when advertised; never stage through f16.
+    #[default]
+    Auto,
+    /// Never use cooperative matrices — force the scalar paths.
+    Disabled,
+    /// Additionally allow f16-input tiles on devices that advertise no
+    /// f32 tile. Opt-in: f16 staging can overflow/round on f32 models.
+    AllowF16,
 }
 
 /// Why [`Session::read_node`] could not return a value.
@@ -2261,11 +2288,12 @@ impl Session {
     /// remains opt-in because rounding compounds across deep training graphs.
     fn select_coop_config(
         caps: &blade_graphics::CooperativeMatrix,
+        policy: CoopPolicy,
     ) -> Option<crate::codegen::CoopConfig> {
         use crate::codegen::CoopConfig;
         // Escape hatch for diagnosing coop-matrix numerical bugs.
-        if crate::config::DISABLE_COOP.bool_or(false) {
-            log::warn!("MEGANEURA_DISABLE_COOP set — forcing scalar matmul");
+        if policy == CoopPolicy::Disabled {
+            log::warn!("cooperative matrices disabled by policy — forcing scalar matmul");
             return None;
         }
         log::info!(
@@ -2279,7 +2307,7 @@ impl Session {
         // prefer f32 coop tiles; treat f16 as opt-in (MEGANEURA_COOP_F16)
         // for throughput when the model is known to fit f16. With only f16
         // tiles and no opt-in, fall back to scalar f32 (correct).
-        let want_f16 = crate::config::COOP_F16.bool_or(false);
+        let want_f16 = policy == CoopPolicy::AllowF16;
         if caps.f32_tile > 0 {
             Some(CoopConfig {
                 tile_size: caps.f32_tile,
@@ -2481,9 +2509,8 @@ impl Session {
     }
 
     fn build_session_impl(plan: ExecutionPlan, gpu: Arc<Gpu>, opts: SessionOptions) -> Self {
-        crate::config::log_overrides();
         let coop_caps = gpu.capabilities().cooperative_matrix;
-        let coop_config = Self::select_coop_config(&coop_caps)
+        let coop_config = Self::select_coop_config(&coop_caps, opts.coop)
             .filter(|config| Self::test_coop_matmul(&gpu, config));
         if let Some(ref config) = coop_config {
             log::info!(
@@ -2517,7 +2544,7 @@ impl Session {
         // Reorder dispatches by dependency level so parallel branches (e.g. Q/K/V
         // projections) cluster together, then partition into barrier groups.
         reorder_by_level(&mut plan.dispatches);
-        let groups = if crate::config::SERIAL_DISPATCH.bool_or(false) {
+        let groups = if opts.serial_dispatch {
             // Debug: one dispatch per pass — guarantees serial execution.
             log::info!("MEGANEURA_SERIAL_DISPATCH: forcing one dispatch per pass");
             (0..plan.dispatches.len()).map(|i| i..i + 1).collect()
@@ -2556,20 +2583,20 @@ impl Session {
         // physical allocation. See `memplan` for the safety argument.
         // Debug sessions keep every logical buffer distinct and
         // host-visible so any node's value can be read back after a step.
-        let mut alias = if opts.debug || crate::config::NO_ALIAS.bool_or(false) {
+        let mut alias = if opts.debug || opts.no_alias {
             if opts.debug {
                 log::info!("debug session: buffer aliasing disabled");
             } else {
                 log::info!("MEGANEURA_NO_ALIAS: buffer aliasing disabled");
             }
-            crate::memplan::plan_no_alias(&plan, &groups)
+            crate::memplan::plan_no_alias(&plan, &groups, opts.pin_buffers.as_deref())
         } else {
-            crate::memplan::plan_buffer_aliasing(&plan, &groups)
+            crate::memplan::plan_buffer_aliasing(&plan, &groups, opts.pin_buffers.as_deref())
         };
         // Step-local intermediates default to device-local memory on the
         // theory that host-visible (ReBAR) traffic is slower on discrete
         // boards; kill switch for measurement and UMA debugging.
-        if opts.debug || crate::config::NO_DEVICE_LOCAL.bool_or(false) {
+        if opts.debug || opts.no_device_local {
             if !opts.debug {
                 log::info!("MEGANEURA_NO_DEVICE_LOCAL: all buffers host-visible");
             }
@@ -2578,7 +2605,7 @@ impl Session {
         let alias = alias;
         // Debug aid: dump dispatch order, declared accesses, and the
         // alias map for corruption bisection (see MEGANEURA_PIN_BUFS).
-        if crate::config::DUMP_PLAN.bool_or(false) {
+        if opts.dump_plan {
             for (gi, range) in groups.iter().enumerate() {
                 for i in range.clone() {
                     let d = &plan.dispatches[i];
@@ -3071,17 +3098,26 @@ impl Session {
 /// # Safety
 /// Wraps `blade_graphics::Context::init`, which is `unsafe` because it
 /// loads the system graphics driver.
+/// GPU context creation options. The library never reads the environment;
+/// map `MEGANEURA_DEVICE_ID` / `MEGANEURA_GPU_TIMING` with
+/// [`GpuOptions::from_env`] if you want env-driven selection.
+#[derive(Clone, Debug, Default)]
+pub struct GpuOptions {
+    /// Adapter selection by backend-reported numeric device id.
+    pub device_id: Option<u32>,
+    /// Enable hardware timestamp query pools (needed before the context
+    /// exists; feeds `dump_gpu_timings` and the profiler).
+    pub timing: bool,
+}
+
 pub fn init_gpu_context() -> Result<blade_graphics::Context, blade_graphics::NotSupportedError> {
-    crate::config::log_overrides();
-    let dev_id = crate::config::DEVICE_ID.text().and_then(|value| {
-        let parsed = parse_device_id(&value);
-        if parsed.is_none() {
-            log::warn!(
-                "ignoring invalid MEGANEURA_DEVICE_ID={value:?}; expected decimal or 0x-prefixed u32"
-            );
-        }
-        parsed
-    });
+    init_gpu_context_with(GpuOptions::default())
+}
+
+pub fn init_gpu_context_with(
+    options: GpuOptions,
+) -> Result<blade_graphics::Context, blade_graphics::NotSupportedError> {
+    let dev_id = options.device_id;
     unsafe {
         blade_graphics::Context::init(blade_graphics::ContextDesc {
             validation: cfg!(debug_assertions),
@@ -3089,7 +3125,7 @@ pub fn init_gpu_context() -> Result<blade_graphics::Context, blade_graphics::Not
             // Blade's timing collection reads the query pool without waiting
             // when a command buffer is re-begun; on slow GPUs the previous
             // submission may still be in flight. Keep this off by default.
-            timing: crate::config::GPU_TIMING.bool_or(false),
+            timing: options.timing,
             capture: false,
             overlay: false,
             device_id: dev_id,
@@ -3098,7 +3134,7 @@ pub fn init_gpu_context() -> Result<blade_graphics::Context, blade_graphics::Not
     }
 }
 
-fn parse_device_id(value: &str) -> Option<u32> {
+pub(crate) fn parse_device_id(value: &str) -> Option<u32> {
     let value = value.trim();
     value
         .strip_prefix("0x")

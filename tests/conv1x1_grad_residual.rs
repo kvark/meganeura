@@ -10,7 +10,7 @@
 //! stale (aliased) memory — but only when batch*H*W exceeds the tile
 //! coverage, so this checks spatial sizes on both sides of it.
 
-use meganeura::{Graph, build_session};
+use meganeura::Graph;
 
 const EPS: f32 = 1e-2;
 const TOL: f32 = 5e-2;
@@ -40,7 +40,7 @@ fn check_at(res: u32) {
     let loss = g.mse_loss(pred, target);
     g.set_outputs(vec![loss]);
 
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     session.set_parameter("w0", &ramp((mid_c * in_c * 9) as usize, 0.3, 0.05));
     session.set_parameter("w1", &ramp((mid_c * mid_c * 9) as usize, 0.3, 0.05));
     session.set_parameter("w2", &ramp((out_c * mid_c) as usize, 0.3, 0.05));

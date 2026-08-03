@@ -6,7 +6,7 @@
 //! Run: cargo test --test smollm2_correctness -- --ignored
 
 use meganeura::{
-    Graph, build_inference_session,
+    Graph,
     data::safetensors::SafeTensorsModel,
     models::smollm2::{self, SmolLM2Config},
 };
@@ -117,7 +117,7 @@ fn smollm2_logits_match_pytorch() {
     let logits = smollm2::build_graph(&mut g, &config, SEQ_LEN);
     g.set_outputs(vec![logits]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
 
     let model =
         SafeTensorsModel::download("HuggingFaceTB/SmolLM2-135M").expect("failed to download model");

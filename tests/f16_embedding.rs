@@ -4,7 +4,7 @@
 //! This validates the f16-coefficients path (halved gather bytes) end to
 //! end — forward gather + straight-through backward + scatter-add.
 
-use meganeura::{Graph, build_session};
+use meganeura::Graph;
 
 fn run(use_f16: bool) -> (f32, Vec<f32>) {
     let vocab = 5usize;
@@ -24,7 +24,7 @@ fn run(use_f16: bool) -> (f32, Vec<f32>) {
     let loss = g.sum_all(prod);
     g.set_outputs(vec![loss]);
 
-    let mut s = build_session(&g);
+    let mut s = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let w_init: Vec<f32> = (0..vocab * hidden)
         .map(|i| (i as f32 % 7.0 - 3.0) * 0.3)
         .collect();

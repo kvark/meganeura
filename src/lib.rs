@@ -49,8 +49,9 @@ pub use load::nnef::{NnefError, NnefModel, load_nnef};
 pub use load::onnx::{OnnxError, OnnxModel, load_onnx, load_onnx_bytes};
 pub use optimize::{ExtractionCost, OptimizeConfig, OptimizeMode, OptimizeReport};
 pub use runtime::{
-    DebugStepReport, DeviceMemoryStats, DispatchAnomaly, ExternalBindError, ExternalSlot,
-    MemorySummary, ReadNodeError, Session, SessionOptions, TuneOutcome, init_gpu_context,
+    CoopPolicy, DebugStepReport, DeviceMemoryStats, DispatchAnomaly, ExternalBindError,
+    ExternalSlot, GpuOptions, MemorySummary, ReadNodeError, Session, SessionOptions, TuneOutcome,
+    init_gpu_context, init_gpu_context_with,
 };
 pub use train::{
     EpochStats, LossHistory, MetricCallback, Mode, Optimizer, SessionConfig, StepMetrics,

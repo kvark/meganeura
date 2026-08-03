@@ -4,7 +4,7 @@
 use meganeura::graph::Graph;
 use meganeura::nn::Linear;
 use meganeura::runtime::ReadNodeError;
-use meganeura::{Mode, SessionConfig, build};
+use meganeura::{Mode, SessionConfig, SessionOptions, build};
 
 fn build_mlp() -> Graph {
     let mut g = Graph::new();
@@ -26,8 +26,11 @@ fn read_node_by_name_matches_cpu() {
         &g,
         SessionConfig {
             mode: Mode::Inference,
-            debug: true,
-            ..SessionConfig::default()
+            runtime: SessionOptions {
+                debug: true,
+                ..Default::default()
+            },
+            ..SessionConfig::from_env()
         },
     );
 
@@ -85,8 +88,11 @@ fn step_debug_attributes_first_nan() {
         &g,
         SessionConfig {
             mode: Mode::Inference,
-            debug: true,
-            ..SessionConfig::default()
+            runtime: SessionOptions {
+                debug: true,
+                ..Default::default()
+            },
+            ..SessionConfig::from_env()
         },
     );
 

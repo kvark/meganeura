@@ -17,9 +17,7 @@
 /// Expects:
 ///   - models/onnx/mnist-mlp.onnx  (from the export script)
 ///   - data/t10k-images-idx3-ubyte.gz  (MNIST test set, optional for accuracy test)
-use meganeura::{
-    Graph, build_inference_session, data::safetensors::SafeTensorsModel, load::onnx::load_onnx,
-};
+use meganeura::{Graph, data::safetensors::SafeTensorsModel, load::onnx::load_onnx};
 use std::path::Path;
 
 fn main() {
@@ -54,7 +52,11 @@ fn main() {
 
     // ─── Compile both ───
     println!("compiling ONNX session...");
-    let mut onnx_session = build_inference_session(&onnx_model.graph);
+    let mut onnx_session = meganeura::build(
+        &onnx_model.graph,
+        meganeura::SessionConfig::inference_from_env(),
+    )
+    .0;
     println!(
         "  {} buffers, {} dispatches",
         onnx_session.plan().buffers.len(),
@@ -62,7 +64,11 @@ fn main() {
     );
 
     println!("compiling native session...");
-    let mut native_session = build_inference_session(&native_graph);
+    let mut native_session = meganeura::build(
+        &native_graph,
+        meganeura::SessionConfig::inference_from_env(),
+    )
+    .0;
     println!(
         "  {} buffers, {} dispatches",
         native_session.plan().buffers.len(),

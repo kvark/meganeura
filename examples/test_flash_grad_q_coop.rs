@@ -2,7 +2,7 @@
 //! scalar version. Builds a small attention forward + sum_all loss,
 //! reads the dQ output, compares scalar vs coop.
 
-use meganeura::{Graph, build_session};
+use meganeura::Graph;
 
 fn build_and_run(seq: usize, num_heads: u32, head_dim: u32, causal: bool) -> Vec<f32> {
     let d = (num_heads * head_dim) as usize;
@@ -19,7 +19,7 @@ fn build_and_run(seq: usize, num_heads: u32, head_dim: u32, causal: bool) -> Vec
     g.set_outputs(vec![loss]);
 
     // build_session differentiates internally (training session).
-    let mut sess = build_session(&g);
+    let mut sess = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
 
     let total = seq * d;
     let qd: Vec<f32> = (0..total).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();

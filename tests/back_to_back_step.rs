@@ -6,7 +6,7 @@
 /// Empirically the SIL pattern has zero downstream effect; this test
 /// isolates whether the meganeura session correctly applies a second
 /// optimizer step in this pattern.
-use meganeura::{Graph, build_session};
+use meganeura::Graph;
 
 fn build_linear_regression(batch_size: usize, in_dim: usize, out_dim: usize) -> Graph {
     let mut g = Graph::new();
@@ -31,7 +31,7 @@ fn back_to_back_step_applies_two_distinct_updates() {
     let in_d = 3;
     let out_d = 2;
     let g = build_linear_regression(batch, in_d, out_d);
-    let mut s = build_session(&g);
+    let mut s = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
 
     // Init params deterministically.
     let n_w = in_d * out_d;
@@ -121,7 +121,7 @@ fn set_adam_persists_across_steps_without_re_arming() {
     let in_d = 3;
     let out_d = 2;
     let g = build_linear_regression(batch, in_d, out_d);
-    let mut s = build_session(&g);
+    let mut s = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
 
     let n_w = in_d * out_d;
     let w_init: Vec<f32> = (0..n_w).map(|i| (i as f32 * 0.1).sin()).collect();
@@ -163,7 +163,7 @@ fn clear_optimizer_stops_updates() {
     let in_d = 3;
     let out_d = 2;
     let g = build_linear_regression(batch, in_d, out_d);
-    let mut s = build_session(&g);
+    let mut s = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
 
     let n_w = in_d * out_d;
     let w_init: Vec<f32> = (0..n_w).map(|i| (i as f32 * 0.1).sin()).collect();
@@ -203,7 +203,7 @@ fn back_to_back_with_zero_lr_in_between_does_not_compound() {
     let in_d = 3;
     let out_d = 2;
     let g = build_linear_regression(batch, in_d, out_d);
-    let mut s = build_session(&g);
+    let mut s = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
 
     let n_w = in_d * out_d;
     let w_init: Vec<f32> = (0..n_w).map(|i| (i as f32 * 0.1).sin()).collect();

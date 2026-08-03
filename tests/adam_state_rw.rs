@@ -5,7 +5,7 @@
 //! training loop reshapes a parameter table (RadFoam densification was
 //! the original motivating use case).
 
-use meganeura::{Graph, build_session};
+use meganeura::Graph;
 
 #[test]
 fn adam_state_roundtrip_and_step_counter() {
@@ -24,7 +24,7 @@ fn adam_state_roundtrip_and_step_counter() {
     let loss = g.mse_loss(pred, labels);
     g.set_outputs(vec![loss]);
 
-    let mut sess = build_session(&g);
+    let mut sess = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     sess.set_adam(0.01, 0.9, 0.999, 1e-8);
     sess.set_parameter("log_density", &vec![1.0_f32; n]);
     sess.set_input("x", &vec![0.0_f32; n]);

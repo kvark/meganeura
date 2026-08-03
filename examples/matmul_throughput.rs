@@ -10,7 +10,7 @@
 
 use std::time::Instant;
 
-use meganeura::{Graph, build_inference_session};
+use meganeura::Graph;
 
 /// Theoretical fp32 peak for a few GPUs (TFLOPS). Rough; used only for
 /// percentage reporting.
@@ -77,7 +77,7 @@ fn bench_shape(
     let c = g.matmul(a, b);
     g.set_outputs(vec![c]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
     let a_data = vec![0.01_f32; m * k];
     let b_data = vec![0.01_f32; k * n];
     session.set_input("a", &a_data);
@@ -139,7 +139,7 @@ fn main() {
         let w = g.parameter("w", &[4, 4]);
         let y = g.matmul(x, w);
         g.set_outputs(vec![y]);
-        let s = build_inference_session(&g);
+        let s = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
         s.device_information().device_name.clone()
     };
     let peak_fp32 = approximate_peak_tflops(&device_name);

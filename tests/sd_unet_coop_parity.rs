@@ -4,7 +4,7 @@
 //! opening 4-to-64-channel convolution then corrupted the whole SD U-Net.
 
 use meganeura::models::sd_unet::{self, SDUNetConfig};
-use meganeura::{Graph, Session, build_inference_session};
+use meganeura::{Graph, Session};
 use std::sync::Mutex;
 
 static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -52,7 +52,7 @@ fn run(cooperative: bool) -> Vec<f32> {
     let mut graph = Graph::new();
     let output = sd_unet::build_unet(&mut graph, &config);
     graph.set_outputs(vec![output]);
-    let mut session = build_inference_session(&graph);
+    let mut session = meganeura::build(&graph, meganeura::SessionConfig::inference_from_env()).0;
     initialize(&mut session);
 
     let noisy_latent = (0..output_len)

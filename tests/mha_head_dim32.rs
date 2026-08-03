@@ -4,7 +4,7 @@
 //! inactive lanes were zero-padded, `head_dim=32` made lanes 32..63 read the
 //! next head (or the next sequence row), corrupting every Q/K/V derivative.
 
-use meganeura::{Graph, Session, build_inference_session, build_session};
+use meganeura::{Graph, Session};
 
 fn values(n: usize, frequency: f32, phase: f32) -> Vec<f32> {
     (0..n)
@@ -42,7 +42,7 @@ fn scalar_attention_backward_masks_inactive_lanes() {
     let v = values(n, 0.023, 1.1);
     let weights = values(n, 0.013, 1.7);
 
-    let mut training = build_session(&graph);
+    let mut training = meganeura::build(&graph, meganeura::SessionConfig::from_env()).0;
     set_parameters(&mut training, &q, &k, &v);
     training.set_input("weights", &weights);
     training.step();
@@ -57,7 +57,7 @@ fn scalar_attention_backward_masks_inactive_lanes() {
         training.read_param_grad(name, gradient);
     }
 
-    let mut inference = build_inference_session(&graph);
+    let mut inference = meganeura::build(&graph, meganeura::SessionConfig::inference_from_env()).0;
     let finite_difference =
         |session: &mut Session, name: &str, data: &mut [f32], index: usize| -> f32 {
             let original = data[index];

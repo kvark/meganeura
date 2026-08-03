@@ -31,7 +31,7 @@ fn run(build: &dyn Fn(&mut Graph) -> BuildResult, n_out: usize, fuse: bool) -> V
         SessionConfig {
             mode: Mode::Inference,
             options: opts,
-            ..SessionConfig::default()
+            ..SessionConfig::from_env()
         },
     )
     .0;

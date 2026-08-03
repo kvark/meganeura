@@ -10,7 +10,7 @@
 /// Expected files (gzipped or raw):
 ///   data/train-images-idx3-ubyte.gz  (or without .gz)
 ///   data/train-labels-idx1-ubyte.gz  (or without .gz)
-use meganeura::{DataLoader, Graph, MnistDataset, TrainConfig, Trainer, build_session};
+use meganeura::{DataLoader, Graph, MnistDataset, TrainConfig, Trainer};
 use std::path::Path;
 
 fn main() {
@@ -67,7 +67,7 @@ fn main() {
     // --- Build training session ---
     // This runs: autodiff → egglog optimize → compile → GPU init
     println!("building session (autodiff + egglog + compile)...");
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     println!(
         "session ready: {} buffers, {} dispatches",
         session.plan().buffers.len(),

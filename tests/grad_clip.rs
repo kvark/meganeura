@@ -4,7 +4,7 @@
 /// gradient is large enough to push the parameter past the target
 /// in one update; with `set_grad_clip_norm(small)` the update should
 /// become much smaller.
-use meganeura::{Graph, build_session};
+use meganeura::Graph;
 
 fn build_linreg(batch: usize, in_d: usize, out_d: usize) -> Graph {
     let mut g = Graph::new();
@@ -19,7 +19,7 @@ fn build_linreg(batch: usize, in_d: usize, out_d: usize) -> Graph {
 
 fn run_one_step(grad_clip: Option<f32>) -> Vec<f32> {
     let g = build_linreg(4, 3, 2);
-    let mut s = build_session(&g);
+    let mut s = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
 
     // Same init for every run so we can compare.
     let w_init: Vec<f32> = (0..6).map(|i| (i as f32 * 0.1).sin()).collect();
@@ -105,7 +105,7 @@ fn grad_clip_zero_disables() {
 #[test]
 fn grad_clip_every_skips_clip() {
     let g = build_linreg(4, 3, 2);
-    let mut s = build_session(&g);
+    let mut s = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let w_init: Vec<f32> = (0..6).map(|i| (i as f32 * 0.1).sin()).collect();
     s.set_parameter("w.weight", &w_init);
     s.set_parameter("w.bias", &[0.0; 2]);

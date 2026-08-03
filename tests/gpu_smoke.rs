@@ -1,7 +1,7 @@
 /// GPU smoke test: validates that all shaders compile with blade + lavapipe
 /// and that a simple forward pass executes without errors.
 use meganeura::{
-    Graph, build_inference_session, build_session, build_session_unoptimized,
+    Graph, build_session, build_session_unoptimized,
     compile::BufferRef,
     models::smolvla::{self, SmolVLAConfig},
 };
@@ -42,7 +42,7 @@ fn matmul_non_uniform_values() {
     let c = g.matmul(a, b);
     g.set_outputs(vec![c]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
 
     let a_data: Vec<f32> = (0..m * k).map(|i| (i / k + 1) as f32).collect(); // A[i,j] = i+1
     let b_data: Vec<f32> = (0..k * n).map(|i| (i % n + 1) as f32).collect(); // B[i,j] = j+1
@@ -90,7 +90,7 @@ fn shader_compilation_and_forward_pass() {
     g.set_outputs(vec![loss]);
 
     // Build session (this compiles all shaders via blade)
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
 
     // Initialize with small data
     let w1_data = vec![0.1_f32; 8 * 5];
@@ -141,7 +141,7 @@ fn matmul_produces_correct_values() {
     let c = g.matmul(a, b);
     g.set_outputs(vec![c]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
 
     let a_data = vec![0.1_f32; m * k];
     let b_data = vec![0.1_f32; k * n];
@@ -184,7 +184,7 @@ fn fused_matmul_add_correct() {
     let out = g.add(mm, d);
     g.set_outputs(vec![out]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
 
     session.set_input("a", &vec![0.1_f32; m * k]);
     session.set_parameter("b", &vec![0.1_f32; k * n]);
@@ -217,7 +217,7 @@ fn simple_sgd_decreases_loss() {
     let loss = g.mean_all(y);
     g.set_outputs(vec![loss]);
 
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     session.set_parameter("w", &[0.1_f32; 8 * 4]);
     session.set_input("x", &[1.0_f32; 4 * 8]);
     session.step();
@@ -259,7 +259,7 @@ fn silu_swiglu_rmsnorm_gradients() {
     let loss = g.mean_all(rn);
     g.set_outputs(vec![loss]);
 
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     session.set_parameter("w1", &vec![0.1_f32; d * d]);
     session.set_parameter("w_gate", &vec![0.1_f32; d * d]);
     session.set_parameter("w_up", &vec![0.1_f32; d * d]);
@@ -293,7 +293,7 @@ fn smolvla_training_backprop_smoke() {
     let vlm_seq_len = 4;
 
     let training_g = smolvla::build_action_expert_training(&config, action_seq_len, vlm_seq_len);
-    let mut session = build_session(&training_g);
+    let mut session = meganeura::build(&training_g, meganeura::SessionConfig::from_env()).0;
 
     // Initialize with small uniform weights
     for (name, buf_ref) in session.plan().param_buffers.clone() {
@@ -409,7 +409,7 @@ fn multi_head_attn_gradient_check() {
     let loss_node = g_train.mean_all(out);
     g_train.set_outputs(vec![loss_node]);
 
-    let mut train_sess = build_session(&g_train);
+    let mut train_sess = meganeura::build(&g_train, meganeura::SessionConfig::from_env()).0;
 
     // Varied initialisation — using sin patterns to avoid degenerate cases
     let q_data: Vec<f32> = (0..n_q).map(|i| (i as f32 * 0.01).sin() * 0.1).collect();
@@ -455,7 +455,8 @@ fn multi_head_attn_gradient_check() {
     let out_i = g_infer.multi_head_attn(qi, ki, vi, num_heads, num_kv_heads, head_dim, false);
     let loss_i = g_infer.mean_all(out_i);
     g_infer.set_outputs(vec![loss_i]);
-    let mut infer_sess = build_inference_session(&g_infer);
+    let mut infer_sess =
+        meganeura::build(&g_infer, meganeura::SessionConfig::inference_from_env()).0;
 
     let fwd = |sess: &mut meganeura::Session, qd: &[f32], kd: &[f32], vd: &[f32]| -> f32 {
         sess.set_parameter("q", qd);
@@ -693,9 +694,9 @@ fn smollm2_e2e_gradient_finite_diff() {
     let g = meganeura::models::smollm2::build_training_graph(&config, seq);
     let use_unopt = std::env::var("UNOPT").is_ok();
     let mut train_sess = if use_unopt {
-        build_session_unoptimized(&g)
+        meganeura::build(&g, meganeura::SessionConfig::unoptimized_from_env()).0
     } else {
-        build_session(&g)
+        meganeura::build(&g, meganeura::SessionConfig::from_env()).0
     };
 
     // Deterministic init
@@ -742,7 +743,7 @@ fn smollm2_e2e_gradient_finite_diff() {
 
     // --- Build inference session for finite differences ---
     let gi = meganeura::models::smollm2::build_training_graph(&config, seq);
-    let mut infer_sess = build_inference_session(&gi);
+    let mut infer_sess = meganeura::build(&gi, meganeura::SessionConfig::inference_from_env()).0;
 
     // Same init (must use the same scale)
     for (name, buf_ref) in infer_sess.plan().param_buffers.clone() {
@@ -924,7 +925,7 @@ fn causal_attention_gradient_check() {
     let loss_node = g_train.mean_all(out);
     g_train.set_outputs(vec![loss_node]);
 
-    let mut train_sess = build_session(&g_train);
+    let mut train_sess = meganeura::build(&g_train, meganeura::SessionConfig::from_env()).0;
 
     let q_data: Vec<f32> = (0..n_q).map(|i| (i as f32 * 0.01).sin() * 0.1).collect();
     let k_data: Vec<f32> = (0..n_kv)
@@ -972,7 +973,8 @@ fn causal_attention_gradient_check() {
     let out_i = g_infer.causal_attention(qi, ki, vi, num_heads, num_kv_heads, head_dim);
     let loss_i = g_infer.mean_all(out_i);
     g_infer.set_outputs(vec![loss_i]);
-    let mut infer_sess = build_inference_session(&g_infer);
+    let mut infer_sess =
+        meganeura::build(&g_infer, meganeura::SessionConfig::inference_from_env()).0;
 
     let fwd = |sess: &mut meganeura::Session, qd: &[f32], kd: &[f32], vd: &[f32]| -> f32 {
         sess.set_parameter("q", qd);
@@ -1093,7 +1095,8 @@ fn flash_attention_seq128_correctness() {
     let v = g_flash.input("v", &[seq, d]);
     let out = g_flash.causal_attention(q, k, v, num_heads, num_kv_heads, head_dim);
     g_flash.set_outputs(vec![out]);
-    let mut flash_sess = build_inference_session(&g_flash);
+    let mut flash_sess =
+        meganeura::build(&g_flash, meganeura::SessionConfig::inference_from_env()).0;
 
     // Build reference graph (seq=4 uses MultiHeadAttn kernel)
     let mut g_ref = Graph::new();
@@ -1102,7 +1105,7 @@ fn flash_attention_seq128_correctness() {
     let vr = g_ref.input("v", &[ref_seq, d]);
     let out_ref = g_ref.causal_attention(qr, kr, vr, num_heads, num_kv_heads, head_dim);
     g_ref.set_outputs(vec![out_ref]);
-    let mut ref_sess = build_inference_session(&g_ref);
+    let mut ref_sess = meganeura::build(&g_ref, meganeura::SessionConfig::inference_from_env()).0;
 
     // Shared data for the small prefix
     let q_data: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin() * 0.1).collect();
@@ -1184,7 +1187,7 @@ fn flash_attention_seq128_gradient_check() {
     let loss_node = g_train.mean_all(out);
     g_train.set_outputs(vec![loss_node]);
 
-    let mut train_sess = build_session(&g_train);
+    let mut train_sess = meganeura::build(&g_train, meganeura::SessionConfig::from_env()).0;
 
     let q_data: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin() * 0.1).collect();
     let k_data: Vec<f32> = (0..n)
@@ -1222,7 +1225,8 @@ fn flash_attention_seq128_gradient_check() {
     let out_i = g_infer.causal_attention(qi, ki, vi, num_heads, num_kv_heads, head_dim);
     let loss_i = g_infer.mean_all(out_i);
     g_infer.set_outputs(vec![loss_i]);
-    let mut infer_sess = build_inference_session(&g_infer);
+    let mut infer_sess =
+        meganeura::build(&g_infer, meganeura::SessionConfig::inference_from_env()).0;
 
     let fwd = |sess: &mut meganeura::Session, qd: &[f32]| -> f32 {
         sess.set_parameter("q", qd);
@@ -1280,7 +1284,7 @@ fn swiglu_concat_gradient_check() {
     let loss = g_train.mean_all(swiglu);
     g_train.set_outputs(vec![loss]);
 
-    let mut sess = build_session(&g_train);
+    let mut sess = meganeura::build(&g_train, meganeura::SessionConfig::from_env()).0;
     let x_data: Vec<f32> = (0..seq * d)
         .map(|i| (i as f32 * 0.13).sin() * 1.0)
         .collect();
@@ -1321,7 +1325,7 @@ fn swiglu_concat_gradient_check() {
     let swi = g_infer.swiglu_concat(mmi);
     let li = g_infer.mean_all(swi);
     g_infer.set_outputs(vec![li]);
-    let mut isess = build_inference_session(&g_infer);
+    let mut isess = meganeura::build(&g_infer, meganeura::SessionConfig::inference_from_env()).0;
 
     let fwd = |s: &mut meganeura::Session, wd: &[f32]| -> f32 {
         s.set_parameter("w", wd);
@@ -1375,7 +1379,7 @@ fn abs_log_recip_ops() {
     let a = g.abs(x);
     g.set_outputs(vec![a]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
     let input: Vec<f32> = vec![-3.0, -2.0, -1.0, -0.5, 0.5, 1.0, 2.0, 3.0];
     session.set_input("x", &input);
     session.step();
@@ -1399,7 +1403,7 @@ fn abs_log_recip_ops() {
     let l = g.log(x);
     g.set_outputs(vec![l]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
     let input: Vec<f32> = vec![0.1, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 100.0];
     session.set_input("x", &input);
     session.step();
@@ -1423,7 +1427,7 @@ fn abs_log_recip_ops() {
     let r = g.recip(x);
     g.set_outputs(vec![r]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
     let input: Vec<f32> = vec![0.1, 0.5, 1.0, 2.0, 4.0, 5.0, 10.0, 100.0];
     session.set_input("x", &input);
     session.step();
@@ -1453,7 +1457,7 @@ fn mse_loss_training() {
     let loss = g.mse_loss(pred, target);
     g.set_outputs(vec![loss]);
 
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     session.set_parameter("w", &[0.1_f32; 16]);
     session.set_input("x", &[1.0_f32; 16]);
     session.set_input("target", &[0.0_f32; 16]);
@@ -1490,7 +1494,7 @@ fn bce_loss_forward() {
     let loss = g.bce_loss(pred, labels);
     g.set_outputs(vec![loss]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
     session.set_input("pred", &[0.9, 0.1, 0.8, 0.2]);
     session.set_input("labels", &[1.0, 0.0, 1.0, 0.0]);
 
@@ -1520,7 +1524,7 @@ fn checkpoint_round_trip() {
     let loss = g.mean_all(y);
     g.set_outputs(vec![loss]);
 
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     session.set_parameter("w", &[0.1_f32; 8 * 4]);
     session.set_input("x", &[1.0_f32; 4 * 8]);
 
@@ -1549,7 +1553,7 @@ fn checkpoint_round_trip() {
     session.read_buffer(w_buf, &mut w_saved);
 
     // Fresh session, load checkpoint
-    let mut session2 = build_session(&g);
+    let mut session2 = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     session2.load_checkpoint(&tmp).expect("load checkpoint");
 
     let mut w_loaded = vec![0.0f32; 32];
@@ -1619,7 +1623,7 @@ fn kv_cache_ops_smoke() {
 
     g.set_outputs(vec![attn]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
 
     // Initialize caches to zero
     session.set_parameter("k_cache", &vec![0.0f32; max_seq * kv_dim]);
@@ -1687,7 +1691,7 @@ fn conv2d_forward_smoke() {
     );
     g.set_outputs(vec![output]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
 
     // All-ones input, all-ones kernel → each output = 9.0 (sum of 3×3 ones)
     session.set_input("input", &vec![1.0f32; in_size]);
@@ -1737,7 +1741,7 @@ fn conv2d_padding_smoke() {
     );
     g.set_outputs(vec![output]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
     session.set_input("input", &vec![1.0f32; in_size]);
     session.set_parameter("kernel", &vec![1.0f32; kernel_size]);
 
@@ -1798,7 +1802,7 @@ fn conv2d_dw_smoke() {
     );
     g.set_outputs(vec![output]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
 
     // Fill input channel c with constant (c+1): channel 0 = 1.0, channel 1 = 2.0, channel 2 = 3.0.
     let mut x = vec![0.0f32; in_size];
@@ -1888,7 +1892,7 @@ fn conv2d_dw_channel_isolation() {
     );
     g.set_outputs(vec![output]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
 
     let hw = (h * w) as usize;
     let mut x = vec![1.0f32; in_size];
@@ -1940,7 +1944,7 @@ fn mul_per_channel_smoke() {
     let out = g.mul_per_channel(src, gate, channels, spatial);
     g.set_outputs(vec![out]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
 
     // src = i (linear ramp), gate[n,c] = 10 + n*100 + c*10
     let mut src_data = vec![0.0f32; total];
@@ -2055,7 +2059,7 @@ fn conv2d_backward_smoke() {
         let loss2 = g2.sum_all(conv2);
         g2.set_outputs(vec![loss2]);
 
-        let mut s2 = build_inference_session(&g2);
+        let mut s2 = meganeura::build(&g2, meganeura::SessionConfig::inference_from_env()).0;
         s2.set_input("input", &input_data);
         s2.set_parameter("kernel", &k_plus);
         s2.step();
@@ -2081,7 +2085,7 @@ fn conv2d_backward_smoke() {
 /// finite norms in compile order matching individual read_param_grad.
 #[test]
 fn grad_inspection_api_basic() {
-    use meganeura::{Graph, build_session};
+    use meganeura::Graph;
     let mut g = Graph::new();
     let x = g.input("x", &[2, 3]);
     let w = g.parameter("weights", &[3, 2]);
@@ -2091,7 +2095,7 @@ fn grad_inspection_api_basic() {
     let target = g.input("target", &[2, 2]);
     let loss = g.mse_loss(h, target);
     g.set_outputs(vec![loss]);
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
 
     session.set_input("x", &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     session.set_input("target", &[0.5, 0.5, 0.5, 0.5]);
@@ -2151,7 +2155,7 @@ fn grad_inspection_api_basic() {
 /// scaled param should have moved that-many-times-more.
 #[test]
 fn lr_multipliers_apply_to_sgd_update() {
-    use meganeura::{Graph, build_session};
+    use meganeura::Graph;
     let mut g = Graph::new();
     let x = g.input("x", &[2, 2]);
     let w_a = g.parameter("a.weight", &[2, 2]);
@@ -2161,7 +2165,7 @@ fn lr_multipliers_apply_to_sgd_update() {
     let target = g.input("target", &[2, 2]);
     let loss = g.mse_loss(h, target);
     g.set_outputs(vec![loss]);
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
 
     let init = vec![1.0, 0.1, 0.1, 1.0];
 
@@ -2269,7 +2273,7 @@ fn rope_per_head_correctness() {
     let x = g.input("x", &[seq, dim]);
     let y = g.rope(x, theta, head_dim);
     g.set_outputs(vec![y]);
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
 
     // Input: all ones — makes it easy to verify rotation
     let input = vec![1.0f32; seq * dim];
@@ -2359,7 +2363,7 @@ fn cross_entropy_gradient_check() {
     let loss = g.cross_entropy_loss(logits, labels);
     g.set_outputs(vec![loss]);
 
-    let mut sess = build_session(&g);
+    let mut sess = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
 
     let x_data: Vec<f32> = (0..seq * hidden)
         .map(|i| (i as f32 * 0.1).sin() * 0.5)
@@ -2401,7 +2405,7 @@ fn cross_entropy_gradient_check() {
     let la = gi.input("labels", &[seq, vocab]);
     let lo = gi.cross_entropy_loss(li, la);
     gi.set_outputs(vec![lo]);
-    let mut isess = build_inference_session(&gi);
+    let mut isess = meganeura::build(&gi, meganeura::SessionConfig::inference_from_env()).0;
 
     let fwd = |s: &mut meganeura::Session, xd: &[f32], wd: &[f32]| -> f32 {
         s.set_parameter("x", xd);
@@ -2472,7 +2476,7 @@ fn cross_entropy_gradient_check_weighted_labels() {
     let loss = g.cross_entropy_loss(logits, labels);
     g.set_outputs(vec![loss]);
 
-    let mut sess = build_session(&g);
+    let mut sess = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
 
     let x_data: Vec<f32> = (0..seq * hidden)
         .map(|i| (i as f32 * 0.13).sin() * 0.4)
@@ -2513,7 +2517,7 @@ fn cross_entropy_gradient_check_weighted_labels() {
     let la = gi.input("labels", &[seq, vocab]);
     let lo = gi.cross_entropy_loss(li, la);
     gi.set_outputs(vec![lo]);
-    let mut isess = build_inference_session(&gi);
+    let mut isess = meganeura::build(&gi, meganeura::SessionConfig::inference_from_env()).0;
 
     let fwd = |s: &mut meganeura::Session, xd: &[f32], wd: &[f32]| -> f32 {
         s.set_parameter("x", xd);
@@ -2580,7 +2584,7 @@ fn matmul_bt_gradient_check() {
     let loss = g.mean_all(c);
     g.set_outputs(vec![loss]);
 
-    let mut sess = build_session(&g);
+    let mut sess = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.1).sin()).collect();
     let b_data: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.07 + 1.0).cos()).collect();
     sess.set_parameter("a", &a_data);
@@ -2606,7 +2610,7 @@ fn matmul_bt_gradient_check() {
     let ci = gi.matmul_bt(ai, bi);
     let li = gi.mean_all(ci);
     gi.set_outputs(vec![li]);
-    let mut isess = build_inference_session(&gi);
+    let mut isess = meganeura::build(&gi, meganeura::SessionConfig::inference_from_env()).0;
 
     let fwd = |s: &mut meganeura::Session, ad: &[f32], bd: &[f32]| -> f32 {
         s.set_parameter("a", ad);
@@ -2672,7 +2676,7 @@ fn tanh_gradient_check() {
     let loss = g_train.mean_all(y);
     g_train.set_outputs(vec![loss]);
 
-    let mut train_sess = build_session(&g_train);
+    let mut train_sess = meganeura::build(&g_train, meganeura::SessionConfig::from_env()).0;
     let x_data: Vec<f32> = (0..n).map(|i| i as f32 * 0.02 - 2.56).collect();
     train_sess.set_parameter("x", &x_data);
     train_sess.step();
@@ -2691,7 +2695,8 @@ fn tanh_gradient_check() {
     let yi = g_infer.tanh(xi);
     let li = g_infer.mean_all(yi);
     g_infer.set_outputs(vec![li]);
-    let mut infer_sess = build_inference_session(&g_infer);
+    let mut infer_sess =
+        meganeura::build(&g_infer, meganeura::SessionConfig::inference_from_env()).0;
 
     let eps = 1e-3_f32;
     let check_idxs = [0, 10, 64, 128, 200, 255];
@@ -2755,7 +2760,7 @@ fn sliding_window_attention_gradient_check() {
     let loss_node = g_train.mean_all(out);
     g_train.set_outputs(vec![loss_node]);
 
-    let mut train_sess = build_session(&g_train);
+    let mut train_sess = meganeura::build(&g_train, meganeura::SessionConfig::from_env()).0;
 
     let q_data: Vec<f32> = (0..n_q).map(|i| (i as f32 * 0.01).sin() * 0.1).collect();
     let k_data: Vec<f32> = (0..n_kv)
@@ -2811,7 +2816,8 @@ fn sliding_window_attention_gradient_check() {
     );
     let loss_i = g_infer.mean_all(out_i);
     g_infer.set_outputs(vec![loss_i]);
-    let mut infer_sess = build_inference_session(&g_infer);
+    let mut infer_sess =
+        meganeura::build(&g_infer, meganeura::SessionConfig::inference_from_env()).0;
 
     let fwd = |sess: &mut meganeura::Session, qd: &[f32], kd: &[f32], vd: &[f32]| -> f32 {
         sess.set_parameter("q", qd);
@@ -2912,8 +2918,8 @@ fn q4_matmul_correctness() {
     let c_q4 = g_q4.matmul(a_q4, b_q4);
     g_q4.set_outputs(vec![c_q4]);
 
-    let mut sess_ref = build_inference_session(&g_ref);
-    let mut sess_q4 = build_inference_session(&g_q4);
+    let mut sess_ref = meganeura::build(&g_ref, meganeura::SessionConfig::inference_from_env()).0;
+    let mut sess_q4 = meganeura::build(&g_q4, meganeura::SessionConfig::inference_from_env()).0;
 
     // Use values closer to real model scale
     let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 7) as f32 - 3.0) * 0.5).collect();
@@ -3050,7 +3056,7 @@ fn q4_layer_nan_hunt() {
             g.set_outputs(vec![x]);
         }
 
-        let mut session = build_inference_session(&g);
+        let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
 
         // Set dummy inputs
         session.set_input_u32("token_ids", &[10, 20, 30, 40, 50, 60]);
@@ -3139,7 +3145,7 @@ fn conv2d_1x1_batch_replicated_input_is_uniform() {
     let y = g.conv2d(input, kernel, batch, in_ch, h, w, out_ch, 1, 1, 1, 0);
     g.set_outputs(vec![y]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
 
     // Deterministic kernel weights so every conv output is nonzero.
     let kernel_data: Vec<f32> = (0..(out_ch * in_ch))
@@ -3206,7 +3212,7 @@ fn add_per_channel_smoke() {
     let out = g.add_per_channel(src, bias, channels, spatial);
     g.set_outputs(vec![out]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
 
     let mut src_data = vec![0.0f32; total];
     for (i, v) in src_data.iter_mut().enumerate() {
@@ -3269,7 +3275,7 @@ fn upload_buffer_rejects_undersized_parameter_upload() {
     let y = g.bias_add(x, bias);
     g.set_outputs(vec![y]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
     let undersized = vec![0.5_f32; 24]; // 24 floats == 96 bytes
     // Buffer is 48 floats == 192 bytes.  upload_buffer must panic with
     // "byte-size mismatch ... got 96, slot expects 192".

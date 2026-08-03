@@ -98,48 +98,6 @@ impl Default for OptimizeConfig {
     }
 }
 
-impl OptimizeConfig {
-    /// Read benchmark-oriented overrides while retaining production defaults.
-    ///
-    /// - `MEGANEURA_OPTIMIZER=off|greedy|egglog-windowed|egglog-outlined|egglog-whole`
-    /// - `MEGANEURA_EGRAPH_COST=ast-size|tensor-traffic`
-    /// - `MEGANEURA_EGRAPH_CUTOFF=<positive integer>`
-    pub fn from_env() -> Self {
-        let mut config = Self::default();
-        if let Some(value) = crate::config::OPTIMIZER.text() {
-            config.mode = match value.as_str() {
-                "off" => OptimizeMode::Off,
-                "greedy" => OptimizeMode::Greedy,
-                "egglog-windowed" | "windowed" => OptimizeMode::EgglogWindowed,
-                "egglog-outlined" | "outlined" => OptimizeMode::EgglogOutlined,
-                "egglog-whole" | "whole" => OptimizeMode::EgglogWhole,
-                _ => {
-                    log::warn!("unknown MEGANEURA_OPTIMIZER={value:?}; using greedy");
-                    OptimizeMode::Greedy
-                }
-            };
-        }
-        if let Some(value) = crate::config::EGRAPH_COST.text() {
-            config.extraction_cost = match value.as_str() {
-                "ast-size" | "ast" | "unit" => ExtractionCost::AstSize,
-                "tensor-traffic" | "traffic" => ExtractionCost::TensorTraffic,
-                _ => {
-                    log::warn!("unknown MEGANEURA_EGRAPH_COST={value:?}; using tensor-traffic");
-                    ExtractionCost::TensorTraffic
-                }
-            };
-        }
-        if let Some(value) = crate::config::EGRAPH_CUTOFF.u32_value() {
-            if value > 0 {
-                config.saturation_cutoff = value as usize;
-            } else {
-                log::warn!("MEGANEURA_EGRAPH_CUTOFF must be > 0; using {SATURATION_CUTOFF}");
-            }
-        }
-        config
-    }
-}
-
 // ---------------------------------------------------------------------------
 // HBM-traffic-aware cost model for e-graph extraction.
 //
@@ -354,7 +312,7 @@ pub fn optimize(graph: &Graph) -> Graph {
 
 /// Like `optimize`, but also returns a detailed report for debugging.
 pub fn optimize_with_report(graph: &Graph) -> (Graph, OptimizeReport) {
-    optimize_with_config(graph, OptimizeConfig::from_env())
+    optimize_with_config(graph, OptimizeConfig::default())
 }
 
 /// Optimize with an explicit strategy and extraction objective.

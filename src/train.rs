@@ -260,12 +260,12 @@ pub struct SessionConfig<'a> {
     /// debugging gradient flow through aggressively-fused ops. Training
     /// mode only.
     pub skip_full_optimize: bool,
-    /// Build a debug session: buffer aliasing off, every buffer
-    /// host-visible, so any node's value can be read after a step via
-    /// [`Session::read_node`] / [`Session::read_node_by_name`], and
-    /// [`Session::step_debug`] can attribute the first NaN/Inf to a graph
-    /// node. Costs memory and bandwidth; keep it off for benchmarking.
-    pub debug: bool,
+    /// Graph-rewrite configuration (mode, extraction cost, cutoff).
+    pub optimize: optimize::OptimizeConfig,
+    /// Runtime session options: debug observability, cooperative-matrix
+    /// policy, and the diagnostic switches (aliasing, device-local,
+    /// serial dispatch, plan dumps, buffer pinning).
+    pub runtime: runtime::SessionOptions,
     /// Run [`Session::tune`] after construction: measure `step()` wall-clock
     /// with each flippable kernel family on its cooperative variant vs its
     /// scalar fallback and keep the faster one — replacing static promotion
@@ -279,7 +279,10 @@ impl SessionConfig<'_> {
     /// `build(&g, SessionConfig::debug())` is the "print any tensor" mode.
     pub fn debug() -> Self {
         Self {
-            debug: true,
+            runtime: runtime::SessionOptions {
+                debug: true,
+                ..Default::default()
+            },
             ..Self::default()
         }
     }
@@ -299,7 +302,7 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, Optimiz
     let _span = tracing::info_span!("build_session").entered();
     let mode = cfg.mode;
     let mut options = cfg.options;
-    if cfg.debug {
+    if cfg.runtime.debug {
         // Dispatch-level fusion is numerics-neutral; disabling it in debug
         // sessions keeps every graph node's value materialized for
         // `read_node` without changing what the model computes.
@@ -322,7 +325,7 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, Optimiz
         }
     };
     let mut coop_caps = runtime::auto_tune(&gpu, 0).coop_caps;
-    if crate::config::DISABLE_COOP.bool_or(false) {
+    if cfg.runtime.coop == runtime::CoopPolicy::Disabled {
         coop_caps = crate::codegen::CoopCaps::default();
     }
     let mode_tag = match mode {
@@ -335,7 +338,7 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, Optimiz
         match cache::load_build_plan(forward_graph, build_hash, path) {
             Ok(Some(plan)) => {
                 log::info!("loaded cached execution plan from {}", path.display());
-                let session = make_session(plan, gpu, cfg.debug);
+                let session = make_session(plan, gpu, cfg.runtime.clone());
                 return (session, OptimizeReport::empty());
             }
             Ok(None) => log::info!("no valid cache found, recompiling"),
@@ -345,7 +348,7 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, Optimiz
 
     let (optimized_forward, forward_report) = {
         let _span = tracing::info_span!("optimize_forward").entered();
-        optimize::optimize_with_report(forward_graph)
+        optimize::optimize_with_config(forward_graph, cfg.optimize)
     };
     log::info!(
         "optimized forward: {} nodes",
@@ -383,7 +386,7 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, Optimiz
                 (full, forward_report)
             } else {
                 let _span = tracing::info_span!("optimize_full").entered();
-                optimize::optimize_with_report(&full)
+                optimize::optimize_with_config(&full, cfg.optimize)
             }
         }
     };
@@ -408,9 +411,9 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, Optimiz
 
     let mut session = {
         let _span = tracing::info_span!("gpu_init").entered();
-        make_session(plan, gpu, cfg.debug)
+        make_session(plan, gpu, cfg.runtime.clone())
     };
-    if crate::config::TUNE.bool_or(cfg.tune) {
+    if cfg.tune {
         let _span = tracing::info_span!("tune").entered();
         session.tune();
     }
@@ -420,9 +423,9 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, Optimiz
 fn make_session(
     plan: compile::ExecutionPlan,
     gpu: Arc<blade_graphics::Context>,
-    debug: bool,
+    opts: runtime::SessionOptions,
 ) -> Session {
-    Session::with_context_opts(plan, gpu, runtime::SessionOptions { debug })
+    Session::with_context_opts(plan, gpu, opts)
 }
 
 /// Sugar for `build(g, SessionConfig::default()).0` — the common

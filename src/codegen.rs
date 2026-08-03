@@ -45,10 +45,19 @@ pub struct ShaderModule {
     pub source: String,
 }
 
-/// Dump WGSL source to `$MEGANEURA_DUMP_WGSL` if set (for debugging/inspection).
+static WGSL_DUMP_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Route every generated/parsed WGSL shader into `dir` (debug hook; the
+/// `MEGANEURA_DUMP_WGSL` mapping in `crate::config` calls this). First
+/// call wins for the process lifetime.
+pub fn set_wgsl_dump_dir(dir: impl Into<String>) {
+    let _ = WGSL_DUMP_DIR.set(dir.into());
+}
+
+/// Dump WGSL source to the configured dump dir, if any.
 fn maybe_dump_wgsl(source: &str, hint: &str) {
-    if let Some(dir) = crate::config::DUMP_WGSL.text() {
-        let _ = std::fs::create_dir_all(&dir);
+    if let Some(dir) = WGSL_DUMP_DIR.get() {
+        let _ = std::fs::create_dir_all(dir);
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(source, &mut hasher);
         let h = std::hash::Hasher::finish(&hasher);
@@ -473,15 +482,24 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::FlashAttention => {
             // Default head_dim=64 fallback; runtime calls
             // generate_flash_attention_module(head_dim) directly.
-            generate_flash_attention_module(64, flash_ept_cap())
+            generate_flash_attention_module(
+                64,
+                crate::compile::TuningKnobs::default().flash_ept_cap,
+            )
         }
         ShaderGroup::FlashAttentionCoop => generate_flash_attention_coop_module(64),
         ShaderGroup::FlashGradQCoop => generate_flash_grad_q_coop_module(64),
         ShaderGroup::FlashGradKVCoop => generate_flash_grad_kv_coop_module(64),
         ShaderGroup::MultiHeadAttnGradQ => parse_wgsl(include_str!("shaders/mha_grad_q.wgsl")),
-        ShaderGroup::FlashGradQ => generate_flash_grad_q_module(64, flash_grad_q_ept_cap()),
+        ShaderGroup::FlashGradQ => generate_flash_grad_q_module(
+            64,
+            crate::compile::TuningKnobs::default().flash_grad_q_ept_cap,
+        ),
         ShaderGroup::MultiHeadAttnGradKV => parse_wgsl(include_str!("shaders/mha_grad_kv.wgsl")),
-        ShaderGroup::FlashGradKV => generate_flash_grad_kv_module(64, flash_grad_kv_ept_cap()),
+        ShaderGroup::FlashGradKV => generate_flash_grad_kv_module(
+            64,
+            crate::compile::TuningKnobs::default().flash_grad_kv_ept_cap,
+        ),
         ShaderGroup::SwiGLUGrad => parse_wgsl(include_str!("shaders/swiglu_grad.wgsl")),
         ShaderGroup::SwiGLUConcat => parse_wgsl(include_str!("shaders/swiglu_concat.wgsl")),
         ShaderGroup::SumRows => parse_wgsl(include_str!("shaders/sum_rows.wgsl")),
@@ -2164,52 +2182,6 @@ pub fn set_coop_caps(caps: CoopCaps) {
 
 pub fn coop_caps() -> CoopCaps {
     *COOP_CAPS.get().unwrap_or(&CoopCaps::default())
-}
-
-/// Single tunable cap on elements-per-thread for flash codegen.
-/// Apple Silicon benefits from the extra parallelism at 16, while 32 keeps
-/// register count below the spilling cliff on Ampere/Blackwell.
-/// `MEGANEURA_FLASH_EPT_CAP` overrides either default for benchmarking sweeps.
-/// Codegen and dispatch both read this so they agree on tile size.
-pub fn flash_ept_cap() -> u32 {
-    flash_ept_override(&crate::config::FLASH_EPT_CAP).unwrap_or(
-        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-            16
-        } else {
-            32
-        },
-    )
-}
-
-fn flash_ept_override(var: &crate::config::VarSpec) -> Option<u32> {
-    var.u32_value().filter(|v| {
-        let ok = v.is_power_of_two() && *v >= 2;
-        if !ok {
-            log::warn!("{}={v} must be a power of two >= 2; ignoring", var.name);
-        }
-        ok
-    })
-}
-
-/// dQ has fewer live accumulators than fused dK/dV and follows the forward
-/// cap by default. The shared backward override remains useful for sweeps.
-pub fn flash_grad_q_ept_cap() -> u32 {
-    flash_ept_override(&crate::config::FLASH_GRAD_Q_EPT_CAP)
-        .or_else(|| flash_ept_override(&crate::config::FLASH_BWD_EPT_CAP))
-        .unwrap_or_else(flash_ept_cap)
-}
-
-/// Fused dK/dV benefits from more threads on Apple Silicon, where reducing
-/// its register-heavy per-thread slice outweighs the extra reductions.
-pub fn flash_grad_kv_ept_cap() -> u32 {
-    flash_ept_override(&crate::config::FLASH_GRAD_KV_EPT_CAP)
-        .or_else(|| flash_ept_override(&crate::config::FLASH_BWD_EPT_CAP))
-        .or_else(|| flash_ept_override(&crate::config::FLASH_EPT_CAP))
-        .unwrap_or(if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-            8
-        } else {
-            32
-        })
 }
 
 pub fn generate_flash_attention_module(head_dim: u32, ept_cap: u32) -> ShaderModule {
@@ -5067,11 +5039,23 @@ mod tests {
     #[test]
     fn test_flash_attention_wgsl() {
         // BQ=4 for hd=64, BQ=8 for hd=32, BQ=2 for hd=128
-        let _ = generate_flash_attention_module(64, flash_ept_cap());
-        let _ = generate_flash_attention_module(32, flash_ept_cap());
-        let _ = generate_flash_attention_module(128, flash_ept_cap());
+        let _ = generate_flash_attention_module(
+            64,
+            crate::compile::TuningKnobs::default().flash_ept_cap,
+        );
+        let _ = generate_flash_attention_module(
+            32,
+            crate::compile::TuningKnobs::default().flash_ept_cap,
+        );
+        let _ = generate_flash_attention_module(
+            128,
+            crate::compile::TuningKnobs::default().flash_ept_cap,
+        );
         // hd=256 should fall back to BQ=1 (regular attention)
-        let _ = generate_flash_attention_module(256, flash_ept_cap());
+        let _ = generate_flash_attention_module(
+            256,
+            crate::compile::TuningKnobs::default().flash_ept_cap,
+        );
     }
 
     #[test]

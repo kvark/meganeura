@@ -17,7 +17,7 @@
 //! `mul(scalar)` and `add(other_term)`) and compares analytical
 //! gradients against finite-difference gradients.
 
-use meganeura::{Graph, build_session};
+use meganeura::Graph;
 
 const EPS: f32 = 5e-3;
 const TOL: f32 = 1e-2;
@@ -107,7 +107,7 @@ fn mean_all_mid_chain_respects_upstream_coef() {
     let loss = g.mul(mean, coef);
     g.set_outputs(vec![loss]);
 
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let x_data: Vec<f32> = (0..6).map(|i| (i as f32) * 0.7 - 1.5).collect();
     let w_init: Vec<f32> = (0..6).map(|i| (i as f32) * 0.3 + 0.1).collect();
     session.set_parameter("w", &w_init);
@@ -129,7 +129,7 @@ fn sum_all_mid_chain_respects_upstream_coef() {
     let loss = g.mul(sum, coef);
     g.set_outputs(vec![loss]);
 
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let x_data: Vec<f32> = (0..6).map(|i| (i as f32) * 0.5 - 1.0).collect();
     let w_init: Vec<f32> = (0..6).map(|i| (i as f32) * 0.2 + 0.05).collect();
     session.set_parameter("w", &w_init);
@@ -154,7 +154,7 @@ fn sum_inner_mid_chain_respects_upstream_coef() {
     let loss = g.mul(s, coef); // [1]; grad_output reaches sum_inner via sum_all
     g.set_outputs(vec![loss]);
 
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let x_data: Vec<f32> = (0..6).map(|i| (i as f32) * 0.5 - 1.0).collect();
     let w_init: Vec<f32> = (0..6).map(|i| (i as f32) * 0.2 + 0.05).collect();
     session.set_parameter("w", &w_init);
@@ -179,7 +179,7 @@ fn mse_loss_with_coef_scales_param_gradient() {
     let loss = g.mul(mse, coef);
     g.set_outputs(vec![loss]);
 
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let x_data: Vec<f32> = (0..6).map(|i| (i as f32) * 0.3 + 0.5).collect();
     let target_data: Vec<f32> = (0..4).map(|i| (i as f32) * 0.4 - 0.2).collect();
     let w_init: Vec<f32> = (0..6).map(|i| (i as f32) * 0.25 + 0.1).collect();
@@ -209,7 +209,7 @@ fn cross_entropy_loss_with_coef_scales_param_gradient() {
     let loss = g.mul(ce, coef);
     g.set_outputs(vec![loss]);
 
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let x_data: Vec<f32> = vec![-0.5, 0.2, 0.7];
     let labels_data: Vec<f32> = vec![0.1, 0.2, 0.3, 0.4];
     let w_init: Vec<f32> = (0..12).map(|i| (i as f32) * 0.1 - 0.5).collect();
@@ -236,7 +236,7 @@ fn bce_loss_with_coef_scales_param_gradient() {
     let loss = g.mul(bce, coef);
     g.set_outputs(vec![loss]);
 
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let x_data: Vec<f32> = (0..6).map(|i| (i as f32) * 0.2 - 0.4).collect();
     let labels_data: Vec<f32> = vec![0.7, 0.3];
     let w_init: Vec<f32> = vec![0.2, -0.3, 0.5];
@@ -270,7 +270,7 @@ fn multi_loss_with_independent_coefs() {
     let total = g.add(policy_loss, value_loss);
     g.set_outputs(vec![total]);
 
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let x_data: Vec<f32> = vec![0.5, 0.7, 0.9];
     let labels_data: Vec<f32> = vec![0.1, 0.2, 0.3, 0.4];
     let vt_data: Vec<f32> = vec![1.0];
@@ -310,7 +310,7 @@ fn check_activation_mid_chain(
     let coef_node = g.scalar(coef);
     let loss = g.mul(mean, coef_node);
     g.set_outputs(vec![loss]);
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let x_data: Vec<f32> = (0..6).map(|i| (i as f32) * 0.3 - 0.5).collect();
     let w_init: Vec<f32> = (0..6).map(|i| (i as f32) * 0.2 + 0.1).collect();
     session.set_parameter("w", &w_init);
@@ -361,7 +361,7 @@ fn log_softmax_mid_chain() {
     let coef = g.scalar(0.5);
     let loss = g.mul(mean, coef);
     g.set_outputs(vec![loss]);
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let x_data: Vec<f32> = (0..6).map(|i| (i as f32) * 0.3 - 0.5).collect();
     let w_init: Vec<f32> = (0..12).map(|i| (i as f32) * 0.1 - 0.4).collect();
     session.set_parameter("w", &w_init);
@@ -393,7 +393,7 @@ fn softmax_mid_chain() {
     let coef = g.scalar(0.5);
     let loss = g.mul(mean, coef);
     g.set_outputs(vec![loss]);
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let x_data: Vec<f32> = (0..6).map(|i| (i as f32) * 0.3 - 0.5).collect();
     let targets_data: Vec<f32> = vec![1.0, 0.5, -0.2, 0.8, -1.0, 0.3, 0.7, -0.4];
     let w_init: Vec<f32> = (0..12).map(|i| (i as f32) * 0.1 - 0.4).collect();
@@ -418,7 +418,7 @@ fn transpose_mid_chain() {
     let coef = g.scalar(0.5);
     let loss = g.mul(mean, coef);
     g.set_outputs(vec![loss]);
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let x_data: Vec<f32> = (0..6).map(|i| (i as f32) * 0.3 - 0.5).collect();
     let w_init: Vec<f32> = (0..12).map(|i| (i as f32) * 0.1 - 0.4).collect();
     session.set_parameter("w", &w_init);
@@ -443,7 +443,7 @@ fn recip_mid_chain() {
     let coef = g.scalar(0.5);
     let loss = g.mul(mean, coef);
     g.set_outputs(vec![loss]);
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let x_data: Vec<f32> = (0..6).map(|i| (i as f32) * 0.3 - 0.5).collect();
     let w_init: Vec<f32> = (0..6).map(|i| (i as f32) * 0.2 + 0.1).collect();
     session.set_parameter("w", &w_init);
@@ -480,7 +480,7 @@ fn split_a_mid_chain_backprops_to_parameter() {
     let loss = g.mul(mean, coef);
     g.set_outputs(vec![loss]);
 
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let w_init: Vec<f32> = vec![0.5, -0.3, 1.2, -0.8];
     session.set_parameter("w", &w_init);
     let set_inputs = |_: &mut meganeura::Session| {};
@@ -500,7 +500,7 @@ fn split_b_mid_chain_backprops_to_parameter() {
     let loss = g.mul(mean, coef);
     g.set_outputs(vec![loss]);
 
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let w_init: Vec<f32> = vec![0.2, -0.6, 0.9, 0.3];
     session.set_parameter("w", &w_init);
     let set_inputs = |_: &mut meganeura::Session| {};
@@ -522,7 +522,7 @@ fn cross_entropy_buffer_aliasing_at_batch_2() {
     let loss = g.mul(ce, coef);
     g.set_outputs(vec![loss]);
 
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let x_data: Vec<f32> = (0..6).map(|i| (i as f32) * 0.4 - 1.0).collect();
     let labels_data: Vec<f32> = vec![0.1, 0.2, 0.3, 0.4, 0.4, 0.3, 0.2, 0.1];
     let w_init: Vec<f32> = (0..12).map(|i| (i as f32) * 0.1 - 0.5).collect();

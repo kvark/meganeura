@@ -7,7 +7,7 @@
 /// Usage:
 ///   cargo run --release --example smolvlm2
 use meganeura::{
-    Graph, build_inference_session,
+    Graph,
     data::safetensors::SafeTensorsModel,
     models::smolvlm2::{self, SmolVLM2Config},
 };
@@ -96,7 +96,7 @@ fn main() {
         "compiling vision encoder ({} patches, {} hidden)...",
         test_num_patches, hidden
     );
-    let mut vision_session = build_inference_session(&g);
+    let mut vision_session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
     println!(
         "  {} buffers, {} dispatches",
         vision_session.plan().buffers.len(),
@@ -230,7 +230,7 @@ fn main() {
         "compiling text decoder (seq_len={}, vocab={})...",
         total_seq_len, config.text.vocab_size
     );
-    let mut text_session = build_inference_session(&g);
+    let mut text_session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
     println!(
         "  {} buffers, {} dispatches",
         text_session.plan().buffers.len(),

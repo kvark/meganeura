@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use meganeura::{
-    Graph, build_inference_session,
+    Graph,
     data::safetensors::SafeTensorsModel,
     models::smolvla::{self, SmolVLAConfig},
 };
@@ -235,7 +235,7 @@ fn main() {
     g.set_outputs(vec![action_out]);
 
     eprintln!("compiling...");
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
     eprintln!(
         "ready: {} buffers, {} dispatches",
         session.plan().buffers.len(),

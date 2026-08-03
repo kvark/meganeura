@@ -4,7 +4,7 @@
 //! one of them is wrong. Verify C = A @ B against CPU for non-square
 //! shapes through the real session pipeline.
 
-use meganeura::{Graph, build_inference_session};
+use meganeura::Graph;
 
 fn check(m: usize, k: usize, n: usize) {
     let mut g = Graph::new();
@@ -13,7 +13,7 @@ fn check(m: usize, k: usize, n: usize) {
     let c = g.matmul(a, b);
     g.set_outputs(vec![c]);
 
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
     let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.1 + 0.5).collect();
     let b_data: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.01 - 0.3).collect();
     session.set_input("a", &a_data);

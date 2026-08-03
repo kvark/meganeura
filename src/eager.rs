@@ -180,7 +180,14 @@ impl Eager {
                 ..CompileOptions::default()
             },
         );
-        Session::with_context_opts(plan, self.gpu.clone(), SessionOptions { debug: true })
+        Session::with_context_opts(
+            plan,
+            self.gpu.clone(),
+            SessionOptions {
+                debug: true,
+                ..Default::default()
+            },
+        )
     }
 }
 

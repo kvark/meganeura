@@ -2,7 +2,7 @@
 //! example, a multimodal vision encoder and text decoder). Each generated
 //! attention pipeline must be specialized independently.
 
-use meganeura::{Graph, build_inference_session};
+use meganeura::Graph;
 
 fn values(len: usize, phase: f32) -> Vec<f32> {
     (0..len)
@@ -19,7 +19,7 @@ fn run_single(head_dim: usize, q: &[f32], k: &[f32], v: &[f32]) -> Vec<f32> {
     let out = graph.full_attention(qn, kn, vn, 1, 1, head_dim as u32);
     graph.set_outputs(vec![out]);
 
-    let mut session = build_inference_session(&graph);
+    let mut session = meganeura::build(&graph, meganeura::SessionConfig::inference_from_env()).0;
     session.set_input("q", q);
     session.set_input("k", k);
     session.set_input("v", v);
@@ -52,7 +52,7 @@ fn mixed_head_dims_match_independent_sessions() {
     let out_b = graph.full_attention(qb_node, kb_node, vb_node, 1, 1, hd_b as u32);
     graph.set_outputs(vec![out_a, out_b]);
 
-    let mut session = build_inference_session(&graph);
+    let mut session = meganeura::build(&graph, meganeura::SessionConfig::inference_from_env()).0;
     for (name, data) in [
         ("qa", qa.as_slice()),
         ("ka", ka.as_slice()),

@@ -6,7 +6,7 @@
 //! otherwise too slow); tolerances are loose — we hunt factor-of-N or
 //! sign errors, not 1% noise.
 
-use meganeura::{Graph, build_session};
+use meganeura::Graph;
 
 const EPS: f32 = 2e-2;
 const TOL: f32 = 5e-2;
@@ -108,7 +108,7 @@ fn group_norm_large_spatial() {
     let loss = g.mul(mean, coef);
     g.set_outputs(vec![loss]);
 
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let x_data = ramp(x_size, 1.0, 0.5);
     let t_data = ramp(x_size, 1.0, 0.3);
     session.set_parameter("w", &ramp(x_size, 0.5, 1.0));
@@ -143,7 +143,7 @@ fn conv2d_large_spatial_kernel_grad() {
     let loss = g.mul(mean, coef);
     g.set_outputs(vec![loss]);
 
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let x_data = ramp(in_size, 1.0, 0.0);
     let t_data = ramp(out_size, 1.0, 0.2);
     session.set_parameter("k", &ramp(k_size, 0.4, 0.0));
@@ -173,7 +173,7 @@ fn film_matmul_large_spatial() {
     let loss = g.mul(mean, coef);
     g.set_outputs(vec![loss]);
 
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let t_data = ramp(c * spatial, 1.0, 0.2);
     session.set_parameter("e", &ramp(c, 0.5, 0.1));
     let set_inputs = |s: &mut meganeura::Session| {
@@ -195,7 +195,7 @@ fn mse_loss_large() {
     let loss = g.mse_loss(pred, target);
     g.set_outputs(vec![loss]);
 
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let x_data = ramp(n, 1.0, 0.0);
     let target_data = ramp(n, 1.0, 0.4);
     session.set_parameter("w", &ramp(n, 0.5, 0.2));

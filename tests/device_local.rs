@@ -7,7 +7,7 @@
 //! Kept in its own test binary: the env var is process-global and the
 //! sessions here are built sequentially to avoid racing other tests.
 
-use meganeura::{Graph, build_session, nn};
+use meganeura::{Graph, nn};
 
 fn model(bs: usize) -> Graph {
     let mut g = Graph::new();
@@ -27,7 +27,7 @@ fn model(bs: usize) -> Graph {
 
 fn run(bs: usize) -> (f32, Vec<f32>) {
     let g = model(bs);
-    let mut s = build_session(&g);
+    let mut s = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     s.set_parameter("fc1.weight", &vec![0.05; 8 * 16]);
     s.set_parameter("fc1.bias", &[0.1; 16]);
     s.set_parameter("norm.weight", &[1.0; 16]);

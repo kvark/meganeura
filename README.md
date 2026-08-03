@@ -129,14 +129,19 @@ Decimal IDs are accepted too.
 
 ## Environment variables
 
-Every `MEGANEURA_*` variable is declared in `meganeura::config::REGISTRY`
-(a test pins this table against it). Semantics are uniform: boolean
-variables treat unset as their default, `0` as off, and anything else as
-on; active overrides are logged at session build, and unrecognized
-`MEGANEURA_*` names produce a warning instead of silently doing nothing.
-Diagnostic switches override code-level configuration; tuning variables
-only provide the *defaults* for `TuningKnobs` / `SessionConfig`, so
-explicitly set options win.
+The library core never reads the environment: `compile`, `runtime`,
+`codegen`, and `optimize` accept strongly typed options only. Env-driven
+behavior is an explicit client opt-in through the `from_env` constructors
+in `meganeura::config` — `SessionConfig::from_env()` is the one-liner
+that resolves everything below (the repo's own examples, benches, and
+tests use it; embedders that want a hermetic library simply never call
+it). Every `MEGANEURA_*` variable is declared in
+`meganeura::config::REGISTRY` (a test pins this table against it).
+Semantics are uniform: boolean variables treat unset as their default,
+`0` as off, and anything else as on; `from_env` logs the active
+overrides, and unrecognized `MEGANEURA_*` names produce a warning
+instead of silently doing nothing. Fields assigned after `from_env`
+win, so explicit code always has the last word.
 
 | Variable | Effect |
 |---|---|

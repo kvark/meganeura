@@ -1,3 +1,4 @@
+use meganeura::Graph;
 /// Stable Diffusion U-Net training benchmark for Meganeura.
 ///
 /// Trains a U-Net denoiser on synthetic latent data via score matching:
@@ -12,7 +13,6 @@
 /// This is structurally equivalent to the Stable Diffusion 1.5 U-Net, scaled
 /// down to fit in GPU memory and run quickly for benchmarking.
 use meganeura::models::sd_unet::{self, SDUNetConfig};
-use meganeura::{Graph, build_session};
 use std::time::Instant;
 
 fn main() {
@@ -64,7 +64,7 @@ fn main() {
     // --- Compile (autodiff + optimize + GPU init) ---
     println!("compiling (autodiff + egglog + codegen)...");
     let t0 = Instant::now();
-    let mut session = build_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
     let compile_time = t0.elapsed();
     println!(
         "compiled in {:.2}s: {} buffers, {} dispatches",

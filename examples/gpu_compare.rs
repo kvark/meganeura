@@ -8,7 +8,7 @@
 
 use std::time::Instant;
 
-use meganeura::{Graph, build_inference_session};
+use meganeura::Graph;
 
 fn bench_matmul(n: usize, warmup: usize, iters: usize) -> (f64, &'static str) {
     // Square n×n×n matmul: 2 n^3 flops, O(n^2) memory — compute-bound for
@@ -18,7 +18,7 @@ fn bench_matmul(n: usize, warmup: usize, iters: usize) -> (f64, &'static str) {
     let b = g.parameter("b", &[n, n]);
     let c = g.matmul(a, b);
     g.set_outputs(vec![c]);
-    let mut s = build_inference_session(&g);
+    let mut s = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
 
     let kernel = s
         .plan()
@@ -58,7 +58,7 @@ fn bench_bandwidth(n: usize, warmup: usize, iters: usize) -> f64 {
     let b = g.parameter("b", &[n]);
     let c = g.add(a, b);
     g.set_outputs(vec![c]);
-    let mut s = build_inference_session(&g);
+    let mut s = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
     s.set_input("a", &vec![1.0_f32; n]);
     s.set_parameter("b", &vec![2.0_f32; n]);
     for _ in 0..warmup {
@@ -81,7 +81,8 @@ fn main() {
         let w = g.parameter("w", &[4, 4]);
         let y = g.matmul(x, w);
         g.set_outputs(vec![y]);
-        build_inference_session(&g)
+        meganeura::build(&g, meganeura::SessionConfig::inference_from_env())
+            .0
             .device_information()
             .device_name
             .clone()
