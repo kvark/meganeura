@@ -944,12 +944,6 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
             let Some(kernel) = c.reduction.as_ref() else {
                 continue;
             };
-            // A one-lane packed reduction intentionally consumes a
-            // materialized producer: each row then sums stored f32 values in
-            // column order, matching the stable scalar-matmul convention.
-            if kernel.rows_per_workgroup == kernel.workgroup_size {
-                continue;
-            }
             // Phase 1 invariant: no gather streams yet, so input_buffers
             // is 1:1 with prologue inputs (per-elem first, then per-row).
             if kernel.gather_elem.iter().any(|&g| g) {
@@ -1021,9 +1015,6 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
             let Some(kernel) = c.reduction.as_ref() else {
                 continue;
             };
-            if kernel.rows_per_workgroup == kernel.workgroup_size {
-                continue;
-            }
             let outer = c.params[0];
             let inner = c.params[1];
             let per_elem = kernel.n_per_elem as usize;
@@ -2096,8 +2087,9 @@ impl<'a> Compiler<'a> {
                 // Pack narrow rows into one workgroup so SH-width reductions
                 // do not launch hundreds of idle lanes per output scalar.
                 // Wide reductions keep the existing producer-fusion path.
-                // The one-lane packed path materializes its producer so each
-                // row retains scalar column-order summation.
+                // A one-lane packed path retains scalar column-order
+                // summation while still allowing pointwise and gather
+                // producers to fold into the reduction prologue.
                 use crate::schedule::{PointwiseDAG, Pw, ReduceOp, ReductionKernel};
                 const WG: u32 = 256;
                 let input = self.get_buffer(node.inputs[0]);
@@ -2125,7 +2117,7 @@ impl<'a> Compiler<'a> {
                     input_buffers: vec![input],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
-                    params: vec![m, n, 0, 0],
+                    params: vec![m, n, 1.0_f32.to_bits(), 0],
                     use_coop: false,
                     use_small_tiles: false,
                     reduction: Some(kernel),
@@ -4161,11 +4153,11 @@ mod tests {
         let product_plan = compile(&product);
         assert_eq!(
             product_plan.dispatches.len(),
-            2,
-            "narrow reductions must retain the materialized f32 product"
+            1,
+            "narrow reductions should fold their pointwise producer"
         );
-        assert!(product_plan.dispatches[0].pointwise.is_some());
-        assert!(product_plan.dispatches[1].reduction.is_some());
+        let product_kernel = product_plan.dispatches[0].reduction.as_ref().unwrap();
+        assert_eq!(product_kernel.n_per_elem, 2);
     }
 
     #[test]

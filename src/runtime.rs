@@ -298,7 +298,7 @@ struct GradAccumParams {
 
 // reduce: var src, dst, params (same layout as UnaryData)
 
-// Schedule-template reduction params: { outer, inner, _pad0, _pad1 }.
+// Schedule-template reduction params: { outer, inner, round_one_bits, _pad1 }.
 // 16 bytes; same layout as BiasAddParams with a different name for
 // clarity at the call site.
 #[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
@@ -306,7 +306,7 @@ struct GradAccumParams {
 struct ReductionParams {
     outer: u32,
     inner: u32,
-    _pad0: u32,
+    round_one_bits: u32,
     _pad1: u32,
 }
 
@@ -3906,7 +3906,7 @@ impl Session {
             let params = ReductionParams {
                 outer: dispatch.params[0],
                 inner: dispatch.params[1],
-                _pad0: 0,
+                round_one_bits: dispatch.params.get(2).copied().unwrap_or(0),
                 _pad1: 0,
             };
             if reduction_is_dynamic(k) {
