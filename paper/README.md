@@ -10,7 +10,7 @@ Meganeura `7561a64` / Inferena `7ca9c5c7`; the gap-profile sidecars in
 python3 mktables.py   # regenerates tables/*.tex, the ratio figure, and facts
 ```
 
-The revision pair is preserved as the Inferena tag `paper-arxiv-1`.
+Both revisions are preserved under the public tag `paper-arxiv-1`.
 `dinovision-section.tex` is the frozen fragment from
 `kvark/dinovision/experiments`; update it from there, not in place.
 

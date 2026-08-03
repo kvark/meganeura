@@ -1,0 +1,3026 @@
+{
+  "schema_version": 1,
+  "artifact": "inferena-meganeura-gap-profile",
+  "model": "Whisper-tiny",
+  "mode": "inference",
+  "precision": "accelerated-f32",
+  "framework_rev": "b1405a3",
+  "environment": {
+    "os": "macos",
+    "arch": "aarch64"
+  },
+  "graph_optimizer": {
+    "mode": "greedy",
+    "extraction_cost": "tensor-traffic"
+  },
+  "benchmark_protocol": "inferena-paper-v1",
+  "normal_benchmark": {
+    "samples_ms": [
+      62.060375,
+      61.921875,
+      62.0645,
+      61.995125,
+      62.122249999999994,
+      61.886458,
+      61.826916000000004,
+      61.79775,
+      61.935542000000005,
+      61.892833,
+      61.907959,
+      62.020083,
+      61.901292,
+      62.551582999999994,
+      61.937375,
+      62.086334,
+      62.209666,
+      61.72,
+      62.272917,
+      61.776625
+    ],
+    "median_ms": 61.9364585,
+    "p25_ms": 61.891239250000005,
+    "p75_ms": 62.0699585
+  },
+  "profile": {
+    "schema_version": 1,
+    "timing_contract": "Blade hardware counter samples at compute-encoder boundaries; one compute pass per plan dispatch",
+    "device": {
+      "backend": "Metal",
+      "device_name": "Apple M3",
+      "driver_name": "Metal",
+      "driver_info": "",
+      "software_emulated": false
+    },
+    "plan": {
+      "dispatch_count": 77,
+      "forward_dispatch_count": 77,
+      "backward_dispatch_count": 0,
+      "barrier_group_count": 65,
+      "logical_buffer_bytes": 301566720,
+      "allocated_buffer_bytes": 63788544,
+      "device_local_bytes": 27691008,
+      "physical_allocation_count": 75
+    },
+    "measurement": {
+      "sample_count": 5,
+      "unprofiled_median_ms": 61.9364585,
+      "profiled_wall_samples_ms": [
+        62.886250000000004,
+        61.812042,
+        61.776833,
+        61.985749999999996,
+        61.988125
+      ],
+      "profiled_wall_median_ms": 61.985749999999996,
+      "gpu_total_samples_ms": [
+        61.151958000000015,
+        61.184041999999984,
+        61.16087700000002,
+        61.366126999999985,
+        61.35071000000001
+      ],
+      "gpu_total_median_ms": 61.184041999999984,
+      "instrumentation_wall_ratio": 1.000795839820257,
+      "timestamped_gpu_share_of_profiled_wall_pct": 98.70662531307597
+    },
+    "families": [
+      {
+        "phase": "forward",
+        "family": "attention",
+        "dispatch_count": 4,
+        "timing_samples_ms": [
+          32.382292,
+          32.419166000000004,
+          32.417626,
+          32.590709000000004,
+          32.584917000000004
+        ],
+        "median_ms": 32.419166000000004,
+        "dispatch_median_sum_ms": 32.500083000000004,
+        "share_of_dispatch_median_sum_pct": 53.06882949190283
+      },
+      {
+        "phase": "forward",
+        "family": "convolution_spatial",
+        "dispatch_count": 2,
+        "timing_samples_ms": [
+          2.162584,
+          2.152958,
+          2.146833,
+          2.156167,
+          2.150708
+        ],
+        "median_ms": 2.152958,
+        "dispatch_median_sum_ms": 2.15325,
+        "share_of_dispatch_median_sum_pct": 3.516005085385159
+      },
+      {
+        "phase": "forward",
+        "family": "data_movement",
+        "dispatch_count": 1,
+        "timing_samples_ms": [
+          0.023625,
+          0.023208,
+          0.023666,
+          0.023333,
+          0.023208
+        ],
+        "median_ms": 0.023333,
+        "dispatch_median_sum_ms": 0.023333,
+        "share_of_dispatch_median_sum_pct": 0.0381000564993809
+      },
+      {
+        "phase": "forward",
+        "family": "matrix",
+        "dispatch_count": 24,
+        "timing_samples_ms": [
+          23.385166,
+          23.394209,
+          23.364580999999994,
+          23.377748,
+          23.385833
+        ],
+        "median_ms": 23.385166,
+        "dispatch_median_sum_ms": 23.373001,
+        "share_of_dispatch_median_sum_pct": 38.16537344791009
+      },
+      {
+        "phase": "forward",
+        "family": "normalization_reduction",
+        "dispatch_count": 9,
+        "timing_samples_ms": [
+          0.424666,
+          0.423419,
+          0.43083499999999997,
+          0.426,
+          0.42816800000000005
+        ],
+        "median_ms": 0.426,
+        "dispatch_median_sum_ms": 0.4245850000000001,
+        "share_of_dispatch_median_sum_pct": 0.693297582342161
+      },
+      {
+        "phase": "forward",
+        "family": "pointwise",
+        "dispatch_count": 37,
+        "timing_samples_ms": [
+          2.7736249999999987,
+          2.7710820000000003,
+          2.7773359999999996,
+          2.7921699999999996,
+          2.7778759999999996
+        ],
+        "median_ms": 2.7773359999999996,
+        "dispatch_median_sum_ms": 2.767127,
+        "share_of_dispatch_median_sum_pct": 4.51839433596033
+      }
+    ],
+    "dispatches": [
+      {
+        "index": 0,
+        "phase": "forward",
+        "family": "convolution_spatial",
+        "shader": "Conv2dGemm",
+        "label": "Conv2dGemm[1]",
+        "timestamp_label": "Conv2dGemm[1]",
+        "pipeline": "Conv2dGemm:scalar",
+        "workgroups": [
+          47,
+          6,
+          1
+        ],
+        "workgroup_count": 282,
+        "input_buffer_bytes": 1328640,
+        "output_buffer_bytes": 4608000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.612667,
+          0.6032500000000001,
+          0.6032500000000001,
+          0.609,
+          0.606083
+        ],
+        "median_ms": 0.606083,
+        "p25_ms": 0.6032500000000001,
+        "p75_ms": 0.609,
+        "share_of_dispatch_median_sum_pct": 0.9896625613214878
+      },
+      {
+        "index": 1,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "AddPerChannel",
+        "label": "AddPerChannel[1152000]",
+        "timestamp_label": "AddPerChannel[1152000]",
+        "pipeline": "AddPerChannel:scalar",
+        "workgroups": [
+          4500,
+          1,
+          1
+        ],
+        "workgroup_count": 4500,
+        "input_buffer_bytes": 4609536,
+        "output_buffer_bytes": 4608000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.08512499999999999,
+          0.08475,
+          0.08425,
+          0.087209,
+          0.083625
+        ],
+        "median_ms": 0.08475,
+        "p25_ms": 0.08425,
+        "p75_ms": 0.08512499999999999,
+        "share_of_dispatch_median_sum_pct": 0.13838682502560887
+      },
+      {
+        "index": 2,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "Gelu",
+        "label": "Gelu[1152000]",
+        "timestamp_label": "Gelu[1152000]",
+        "pipeline": "Gelu:scalar",
+        "workgroups": [
+          4500,
+          1,
+          1
+        ],
+        "workgroup_count": 4500,
+        "input_buffer_bytes": 4608000,
+        "output_buffer_bytes": 4608000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.072667,
+          0.074875,
+          0.074625,
+          0.076875,
+          0.076584
+        ],
+        "median_ms": 0.074875,
+        "p25_ms": 0.074625,
+        "p75_ms": 0.076584,
+        "share_of_dispatch_median_sum_pct": 0.12226210647542728
+      },
+      {
+        "index": 3,
+        "phase": "forward",
+        "family": "convolution_spatial",
+        "shader": "Conv2dGemm",
+        "label": "Conv2dGemm[1]",
+        "timestamp_label": "Conv2dGemm[1]",
+        "pipeline": "Conv2dGemm:scalar",
+        "workgroups": [
+          24,
+          6,
+          1
+        ],
+        "workgroup_count": 144,
+        "input_buffer_bytes": 6377472,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          1.549917,
+          1.5497079999999999,
+          1.5435830000000001,
+          1.547167,
+          1.544625
+        ],
+        "median_ms": 1.547167,
+        "p25_ms": 1.544625,
+        "p75_ms": 1.5497079999999999,
+        "share_of_dispatch_median_sum_pct": 2.5263425240636717
+      },
+      {
+        "index": 4,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "AddPerChannel",
+        "label": "AddPerChannel[576000]",
+        "timestamp_label": "AddPerChannel[576000]",
+        "pipeline": "AddPerChannel:scalar",
+        "workgroups": [
+          2250,
+          1,
+          1
+        ],
+        "workgroup_count": 2250,
+        "input_buffer_bytes": 2305536,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.032875,
+          0.033041,
+          0.032959,
+          0.032625,
+          0.033
+        ],
+        "median_ms": 0.032959,
+        "p25_ms": 0.032875,
+        "p75_ms": 0.033,
+        "share_of_dispatch_median_sum_pct": 0.05381818720966422
+      },
+      {
+        "index": 5,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "Gelu",
+        "label": "Gelu[576000]",
+        "timestamp_label": "Gelu[576000]",
+        "pipeline": "Gelu:scalar",
+        "workgroups": [
+          2250,
+          1,
+          1
+        ],
+        "workgroup_count": 2250,
+        "input_buffer_bytes": 2304000,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.022083,
+          0.022083,
+          0.022167,
+          0.022125,
+          0.022084
+        ],
+        "median_ms": 0.022084,
+        "p25_ms": 0.022083,
+        "p75_ms": 0.022125,
+        "share_of_dispatch_median_sum_pct": 0.03606058576832502
+      },
+      {
+        "index": 6,
+        "phase": "forward",
+        "family": "data_movement",
+        "shader": "Transpose",
+        "label": "Transpose[384]",
+        "timestamp_label": "Transpose[384]",
+        "pipeline": "Transpose:scalar",
+        "workgroups": [
+          94,
+          24,
+          1
+        ],
+        "workgroup_count": 2256,
+        "input_buffer_bytes": 2304000,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.023625,
+          0.023208,
+          0.023666,
+          0.023333,
+          0.023208
+        ],
+        "median_ms": 0.023333,
+        "p25_ms": 0.023208,
+        "p75_ms": 0.023625,
+        "share_of_dispatch_median_sum_pct": 0.0381000564993809
+      },
+      {
+        "index": 7,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "Add",
+        "label": "Add[576000]",
+        "timestamp_label": "Add[576000]",
+        "pipeline": "generated-pointwise:ef13ca5b80c77f5e",
+        "workgroups": [
+          2250,
+          1,
+          1
+        ],
+        "workgroup_count": 2250,
+        "input_buffer_bytes": 4608000,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.059542,
+          0.055791999999999994,
+          0.056084,
+          0.06224999999999999,
+          0.056208
+        ],
+        "median_ms": 0.056208,
+        "p25_ms": 0.056084,
+        "p75_ms": 0.059542,
+        "share_of_dispatch_median_sum_pct": 0.09178108154618787
+      },
+      {
+        "index": 8,
+        "phase": "forward",
+        "family": "normalization_reduction",
+        "shader": "LayerNorm",
+        "label": "LayerNorm[1500]",
+        "timestamp_label": "LayerNorm[1500]",
+        "pipeline": "LayerNorm:scalar",
+        "workgroups": [
+          1500,
+          1,
+          1
+        ],
+        "workgroup_count": 1500,
+        "input_buffer_bytes": 2307072,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.047166,
+          0.047042,
+          0.050417000000000003,
+          0.047333,
+          0.050459
+        ],
+        "median_ms": 0.047333,
+        "p25_ms": 0.047166,
+        "p75_ms": 0.050417000000000003,
+        "share_of_dispatch_median_sum_pct": 0.07728924588716393
+      },
+      {
+        "index": 9,
+        "phase": "forward",
+        "family": "matrix",
+        "shader": "MatMul",
+        "label": "MatMul[1500x384x384]",
+        "timestamp_label": "MatMul[1500x384x384]",
+        "pipeline": "MatMul:cooperative",
+        "workgroups": [
+          94,
+          24,
+          1
+        ],
+        "workgroup_count": 2256,
+        "input_buffer_bytes": 2893824,
+        "output_buffer_bytes": 2310144,
+        "cooperative": true,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.49120900000000006,
+          0.49466699999999997,
+          0.492458,
+          0.492417,
+          0.49112500000000003
+        ],
+        "median_ms": 0.492417,
+        "p25_ms": 0.49120900000000006,
+        "p75_ms": 0.492458,
+        "share_of_dispatch_median_sum_pct": 0.8040592946151649
+      },
+      {
+        "index": 10,
+        "phase": "forward",
+        "family": "matrix",
+        "shader": "MatMul",
+        "label": "MatMul[1500x384x384]",
+        "timestamp_label": "MatMul[1500x384x384]",
+        "pipeline": "MatMul:cooperative",
+        "workgroups": [
+          94,
+          24,
+          1
+        ],
+        "workgroup_count": 2256,
+        "input_buffer_bytes": 2893824,
+        "output_buffer_bytes": 2310144,
+        "cooperative": true,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.49441700000000005,
+          0.49479199999999995,
+          0.495542,
+          0.498416,
+          0.49708300000000005
+        ],
+        "median_ms": 0.495542,
+        "p25_ms": 0.49479199999999995,
+        "p75_ms": 0.49708300000000005,
+        "share_of_dispatch_median_sum_pct": 0.8091620536500326
+      },
+      {
+        "index": 11,
+        "phase": "forward",
+        "family": "matrix",
+        "shader": "MatMul",
+        "label": "MatMul[1500x384x384]",
+        "timestamp_label": "MatMul[1500x384x384]",
+        "pipeline": "MatMul:cooperative",
+        "workgroups": [
+          94,
+          24,
+          1
+        ],
+        "workgroup_count": 2256,
+        "input_buffer_bytes": 2893824,
+        "output_buffer_bytes": 2310144,
+        "cooperative": true,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.491958,
+          0.494375,
+          0.4922079999999999,
+          0.49408399999999997,
+          0.493292
+        ],
+        "median_ms": 0.493292,
+        "p25_ms": 0.4922079999999999,
+        "p75_ms": 0.49408399999999997,
+        "share_of_dispatch_median_sum_pct": 0.8054880671449278
+      },
+      {
+        "index": 12,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "BiasAdd",
+        "label": "BiasAdd[576000]",
+        "timestamp_label": "BiasAdd[576000]",
+        "pipeline": "BiasAdd:scalar",
+        "workgroups": [
+          2250,
+          1,
+          1
+        ],
+        "workgroup_count": 2250,
+        "input_buffer_bytes": 2311680,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.045667,
+          0.045667,
+          0.046042,
+          0.046959,
+          0.045958000000000006
+        ],
+        "median_ms": 0.045958000000000006,
+        "p25_ms": 0.045667,
+        "p75_ms": 0.046042,
+        "share_of_dispatch_median_sum_pct": 0.07504403191182221
+      },
+      {
+        "index": 13,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "BiasAdd",
+        "label": "BiasAdd[576000]",
+        "timestamp_label": "BiasAdd[576000]",
+        "pipeline": "BiasAdd:scalar",
+        "workgroups": [
+          2250,
+          1,
+          1
+        ],
+        "workgroup_count": 2250,
+        "input_buffer_bytes": 2311680,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.033167,
+          0.033333,
+          0.034416999999999996,
+          0.035417000000000004,
+          0.033417
+        ],
+        "median_ms": 0.033417,
+        "p25_ms": 0.033333,
+        "p75_ms": 0.034416999999999996,
+        "share_of_dispatch_median_sum_pct": 0.054566047573814405
+      },
+      {
+        "index": 14,
+        "phase": "forward",
+        "family": "attention",
+        "shader": "FlashAttention",
+        "label": "FlashAttention[1500]",
+        "timestamp_label": "FlashAttention[1500]",
+        "pipeline": "FlashAttention:head-dim-64",
+        "workgroups": [
+          24,
+          6,
+          1
+        ],
+        "workgroup_count": 144,
+        "input_buffer_bytes": 6918144,
+        "output_buffer_bytes": 2376000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          8.092500000000001,
+          8.133625,
+          8.050208999999999,
+          8.136541000000001,
+          8.214917
+        ],
+        "median_ms": 8.133625,
+        "p25_ms": 8.092500000000001,
+        "p75_ms": 8.136541000000001,
+        "share_of_dispatch_median_sum_pct": 13.281257105591951
+      },
+      {
+        "index": 15,
+        "phase": "forward",
+        "family": "matrix",
+        "shader": "MatMul",
+        "label": "MatMul[1500x384x384]",
+        "timestamp_label": "MatMul[1500x384x384]",
+        "pipeline": "MatMul:cooperative",
+        "workgroups": [
+          94,
+          24,
+          1
+        ],
+        "workgroup_count": 2256,
+        "input_buffer_bytes": 2893824,
+        "output_buffer_bytes": 2310144,
+        "cooperative": true,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.49445900000000004,
+          0.498166,
+          0.493541,
+          0.499625,
+          0.49333299999999997
+        ],
+        "median_ms": 0.49445900000000004,
+        "p25_ms": 0.493541,
+        "p75_ms": 0.498166,
+        "share_of_dispatch_median_sum_pct": 0.8073936414789089
+      },
+      {
+        "index": 16,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "BiasAdd",
+        "label": "BiasAdd[576000]",
+        "timestamp_label": "BiasAdd[576000]",
+        "pipeline": "BiasAdd:scalar",
+        "workgroups": [
+          2250,
+          1,
+          1
+        ],
+        "workgroup_count": 2250,
+        "input_buffer_bytes": 2311680,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.024333,
+          0.024041,
+          0.024083999999999998,
+          0.023875,
+          0.02425
+        ],
+        "median_ms": 0.024083999999999998,
+        "p25_ms": 0.024041,
+        "p75_ms": 0.02425,
+        "share_of_dispatch_median_sum_pct": 0.03932635155064027
+      },
+      {
+        "index": 17,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "Add",
+        "label": "Add[576000]",
+        "timestamp_label": "Add[576000]",
+        "pipeline": "generated-pointwise:ef13ca5b80c77f5e",
+        "workgroups": [
+          2250,
+          1,
+          1
+        ],
+        "workgroup_count": 2250,
+        "input_buffer_bytes": 4608000,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.055,
+          0.054959,
+          0.058041999999999996,
+          0.054583,
+          0.055417
+        ],
+        "median_ms": 0.055,
+        "p25_ms": 0.054959,
+        "p75_ms": 0.055417,
+        "share_of_dispatch_median_sum_pct": 0.08980855901366946
+      },
+      {
+        "index": 18,
+        "phase": "forward",
+        "family": "normalization_reduction",
+        "shader": "LayerNorm",
+        "label": "LayerNorm[1500]",
+        "timestamp_label": "LayerNorm[1500]",
+        "pipeline": "LayerNorm:scalar",
+        "workgroups": [
+          1500,
+          1,
+          1
+        ],
+        "workgroup_count": 1500,
+        "input_buffer_bytes": 2307072,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.047125,
+          0.046917,
+          0.050041999999999996,
+          0.047042,
+          0.047542
+        ],
+        "median_ms": 0.047125,
+        "p25_ms": 0.047042,
+        "p75_ms": 0.047542,
+        "share_of_dispatch_median_sum_pct": 0.07694960624580315
+      },
+      {
+        "index": 19,
+        "phase": "forward",
+        "family": "matrix",
+        "shader": "MatMul",
+        "label": "MatMul[1500x1536x384]",
+        "timestamp_label": "MatMul[1500x1536x384]",
+        "pipeline": "MatMul:cooperative",
+        "workgroups": [
+          94,
+          96,
+          1
+        ],
+        "workgroup_count": 9024,
+        "input_buffer_bytes": 4663296,
+        "output_buffer_bytes": 9240576,
+        "cooperative": true,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          1.894417,
+          1.890625,
+          1.8906669999999999,
+          1.896167,
+          1.8931250000000002
+        ],
+        "median_ms": 1.8931250000000002,
+        "p25_ms": 1.8906669999999999,
+        "p75_ms": 1.894417,
+        "share_of_dispatch_median_sum_pct": 3.091251423322782
+      },
+      {
+        "index": 20,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "BiasAdd",
+        "label": "BiasAdd[2304000]",
+        "timestamp_label": "BiasAdd[2304000]",
+        "pipeline": "BiasAdd:scalar",
+        "workgroups": [
+          9000,
+          1,
+          1
+        ],
+        "workgroup_count": 9000,
+        "input_buffer_bytes": 9246720,
+        "output_buffer_bytes": 9216000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.20049999999999998,
+          0.2,
+          0.20441700000000002,
+          0.202042,
+          0.20274999999999999
+        ],
+        "median_ms": 0.202042,
+        "p25_ms": 0.20049999999999998,
+        "p75_ms": 0.20274999999999999,
+        "share_of_dispatch_median_sum_pct": 0.32991092509526915
+      },
+      {
+        "index": 21,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "Gelu",
+        "label": "Gelu[2304000]",
+        "timestamp_label": "Gelu[2304000]",
+        "pipeline": "Gelu:scalar",
+        "workgroups": [
+          9000,
+          1,
+          1
+        ],
+        "workgroup_count": 9000,
+        "input_buffer_bytes": 9216000,
+        "output_buffer_bytes": 9216000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.19075,
+          0.189917,
+          0.190333,
+          0.19279200000000002,
+          0.19179200000000002
+        ],
+        "median_ms": 0.19075,
+        "p25_ms": 0.190333,
+        "p75_ms": 0.19179200000000002,
+        "share_of_dispatch_median_sum_pct": 0.3114724114883173
+      },
+      {
+        "index": 22,
+        "phase": "forward",
+        "family": "matrix",
+        "shader": "MatMul",
+        "label": "MatMul[1500x384x1536]",
+        "timestamp_label": "MatMul[1500x384x1536]",
+        "pipeline": "MatMul:cooperative",
+        "workgroups": [
+          94,
+          24,
+          1
+        ],
+        "workgroup_count": 2256,
+        "input_buffer_bytes": 11575296,
+        "output_buffer_bytes": 2310144,
+        "cooperative": true,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          1.974208,
+          1.9725419999999998,
+          1.9670830000000001,
+          1.9705830000000002,
+          1.976084
+        ],
+        "median_ms": 1.9725419999999998,
+        "p25_ms": 1.9705830000000002,
+        "p75_ms": 1.974208,
+        "share_of_dispatch_median_sum_pct": 3.2209300838898467
+      },
+      {
+        "index": 23,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "BiasAdd",
+        "label": "BiasAdd[576000]",
+        "timestamp_label": "BiasAdd[576000]",
+        "pipeline": "BiasAdd:scalar",
+        "workgroups": [
+          2250,
+          1,
+          1
+        ],
+        "workgroup_count": 2250,
+        "input_buffer_bytes": 2311680,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.023166000000000003,
+          0.02525,
+          0.0235,
+          0.023375,
+          0.024
+        ],
+        "median_ms": 0.0235,
+        "p25_ms": 0.023375,
+        "p75_ms": 0.024,
+        "share_of_dispatch_median_sum_pct": 0.03837274794220422
+      },
+      {
+        "index": 24,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "Add",
+        "label": "Add[576000]",
+        "timestamp_label": "Add[576000]",
+        "pipeline": "generated-pointwise:ef13ca5b80c77f5e",
+        "workgroups": [
+          2250,
+          1,
+          1
+        ],
+        "workgroup_count": 2250,
+        "input_buffer_bytes": 4608000,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.044375,
+          0.046333,
+          0.044792,
+          0.044667,
+          0.046916
+        ],
+        "median_ms": 0.044792,
+        "p25_ms": 0.044667,
+        "p75_ms": 0.046333,
+        "share_of_dispatch_median_sum_pct": 0.0731400904607324
+      },
+      {
+        "index": 25,
+        "phase": "forward",
+        "family": "normalization_reduction",
+        "shader": "LayerNorm",
+        "label": "LayerNorm[1500]",
+        "timestamp_label": "LayerNorm[1500]",
+        "pipeline": "LayerNorm:scalar",
+        "workgroups": [
+          1500,
+          1,
+          1
+        ],
+        "workgroup_count": 1500,
+        "input_buffer_bytes": 2307072,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.047167,
+          0.047084,
+          0.047083,
+          0.047166,
+          0.046958
+        ],
+        "median_ms": 0.047084,
+        "p25_ms": 0.047083,
+        "p75_ms": 0.047166,
+        "share_of_dispatch_median_sum_pct": 0.07688265804726568
+      },
+      {
+        "index": 26,
+        "phase": "forward",
+        "family": "matrix",
+        "shader": "MatMul",
+        "label": "MatMul[1500x384x384]",
+        "timestamp_label": "MatMul[1500x384x384]",
+        "pipeline": "MatMul:cooperative",
+        "workgroups": [
+          94,
+          24,
+          1
+        ],
+        "workgroup_count": 2256,
+        "input_buffer_bytes": 2893824,
+        "output_buffer_bytes": 2310144,
+        "cooperative": true,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.49270800000000003,
+          0.491542,
+          0.49074999999999996,
+          0.49029100000000003,
+          0.494
+        ],
+        "median_ms": 0.491542,
+        "p25_ms": 0.49074999999999996,
+        "p75_ms": 0.49270800000000003,
+        "share_of_dispatch_median_sum_pct": 0.802630522085402
+      },
+      {
+        "index": 27,
+        "phase": "forward",
+        "family": "matrix",
+        "shader": "MatMul",
+        "label": "MatMul[1500x384x384]",
+        "timestamp_label": "MatMul[1500x384x384]",
+        "pipeline": "MatMul:cooperative",
+        "workgroups": [
+          94,
+          24,
+          1
+        ],
+        "workgroup_count": 2256,
+        "input_buffer_bytes": 2893824,
+        "output_buffer_bytes": 2310144,
+        "cooperative": true,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.49566599999999994,
+          0.49308299999999994,
+          0.493291,
+          0.4925,
+          0.496
+        ],
+        "median_ms": 0.493291,
+        "p25_ms": 0.49308299999999994,
+        "p75_ms": 0.49566599999999994,
+        "share_of_dispatch_median_sum_pct": 0.8054864342620366
+      },
+      {
+        "index": 28,
+        "phase": "forward",
+        "family": "matrix",
+        "shader": "MatMul",
+        "label": "MatMul[1500x384x384]",
+        "timestamp_label": "MatMul[1500x384x384]",
+        "pipeline": "MatMul:cooperative",
+        "workgroups": [
+          94,
+          24,
+          1
+        ],
+        "workgroup_count": 2256,
+        "input_buffer_bytes": 2893824,
+        "output_buffer_bytes": 2310144,
+        "cooperative": true,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.49354200000000004,
+          0.494209,
+          0.49287500000000006,
+          0.49491599999999997,
+          0.496
+        ],
+        "median_ms": 0.494209,
+        "p25_ms": 0.49354200000000004,
+        "p75_ms": 0.49491599999999997,
+        "share_of_dispatch_median_sum_pct": 0.8069854207561193
+      },
+      {
+        "index": 29,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "BiasAdd",
+        "label": "BiasAdd[576000]",
+        "timestamp_label": "BiasAdd[576000]",
+        "pipeline": "BiasAdd:scalar",
+        "workgroups": [
+          2250,
+          1,
+          1
+        ],
+        "workgroup_count": 2250,
+        "input_buffer_bytes": 2311680,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.047916,
+          0.047209,
+          0.047,
+          0.050459,
+          0.046792
+        ],
+        "median_ms": 0.047209,
+        "p25_ms": 0.047,
+        "p75_ms": 0.047916,
+        "share_of_dispatch_median_sum_pct": 0.0770867684086604
+      },
+      {
+        "index": 30,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "BiasAdd",
+        "label": "BiasAdd[576000]",
+        "timestamp_label": "BiasAdd[576000]",
+        "pipeline": "BiasAdd:scalar",
+        "workgroups": [
+          2250,
+          1,
+          1
+        ],
+        "workgroup_count": 2250,
+        "input_buffer_bytes": 2311680,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.037625,
+          0.035500000000000004,
+          0.0375,
+          0.036000000000000004,
+          0.035040999999999996
+        ],
+        "median_ms": 0.036000000000000004,
+        "p25_ms": 0.035500000000000004,
+        "p75_ms": 0.0375,
+        "share_of_dispatch_median_sum_pct": 0.058783784081674555
+      },
+      {
+        "index": 31,
+        "phase": "forward",
+        "family": "attention",
+        "shader": "FlashAttention",
+        "label": "FlashAttention[1500]",
+        "timestamp_label": "FlashAttention[1500]",
+        "pipeline": "FlashAttention:head-dim-64",
+        "workgroups": [
+          24,
+          6,
+          1
+        ],
+        "workgroup_count": 144,
+        "input_buffer_bytes": 6918144,
+        "output_buffer_bytes": 2376000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          8.011959000000001,
+          8.076958000000001,
+          8.082792,
+          8.072334,
+          8.114875000000001
+        ],
+        "median_ms": 8.076958000000001,
+        "p25_ms": 8.072334,
+        "p75_ms": 8.082792,
+        "share_of_dispatch_median_sum_pct": 13.188726530798721
+      },
+      {
+        "index": 32,
+        "phase": "forward",
+        "family": "matrix",
+        "shader": "MatMul",
+        "label": "MatMul[1500x384x384]",
+        "timestamp_label": "MatMul[1500x384x384]",
+        "pipeline": "MatMul:cooperative",
+        "workgroups": [
+          94,
+          24,
+          1
+        ],
+        "workgroup_count": 2256,
+        "input_buffer_bytes": 2893824,
+        "output_buffer_bytes": 2310144,
+        "cooperative": true,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.49708300000000005,
+          0.49612500000000004,
+          0.498333,
+          0.494083,
+          0.49995900000000004
+        ],
+        "median_ms": 0.49708300000000005,
+        "p25_ms": 0.49612500000000004,
+        "p75_ms": 0.498333,
+        "share_of_dispatch_median_sum_pct": 0.8116783261853066
+      },
+      {
+        "index": 33,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "BiasAdd",
+        "label": "BiasAdd[576000]",
+        "timestamp_label": "BiasAdd[576000]",
+        "pipeline": "BiasAdd:scalar",
+        "workgroups": [
+          2250,
+          1,
+          1
+        ],
+        "workgroup_count": 2250,
+        "input_buffer_bytes": 2311680,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.023708,
+          0.024208,
+          0.024,
+          0.024208,
+          0.023791999999999997
+        ],
+        "median_ms": 0.024,
+        "p25_ms": 0.023791999999999997,
+        "p75_ms": 0.024208,
+        "share_of_dispatch_median_sum_pct": 0.03918918938778304
+      },
+      {
+        "index": 34,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "Add",
+        "label": "Add[576000]",
+        "timestamp_label": "Add[576000]",
+        "pipeline": "generated-pointwise:ef13ca5b80c77f5e",
+        "workgroups": [
+          2250,
+          1,
+          1
+        ],
+        "workgroup_count": 2250,
+        "input_buffer_bytes": 4608000,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.060791,
+          0.056541,
+          0.056875,
+          0.058041999999999996,
+          0.055667
+        ],
+        "median_ms": 0.056875,
+        "p25_ms": 0.056541,
+        "p75_ms": 0.058041999999999996,
+        "share_of_dispatch_median_sum_pct": 0.09287021443459001
+      },
+      {
+        "index": 35,
+        "phase": "forward",
+        "family": "normalization_reduction",
+        "shader": "LayerNorm",
+        "label": "LayerNorm[1500]",
+        "timestamp_label": "LayerNorm[1500]",
+        "pipeline": "LayerNorm:scalar",
+        "workgroups": [
+          1500,
+          1,
+          1
+        ],
+        "workgroup_count": 1500,
+        "input_buffer_bytes": 2307072,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.047416999999999994,
+          0.047084,
+          0.047084,
+          0.048374999999999994,
+          0.047167
+        ],
+        "median_ms": 0.047167,
+        "p25_ms": 0.047084,
+        "p75_ms": 0.047416999999999994,
+        "share_of_dispatch_median_sum_pct": 0.07701818732723177
+      },
+      {
+        "index": 36,
+        "phase": "forward",
+        "family": "matrix",
+        "shader": "MatMul",
+        "label": "MatMul[1500x1536x384]",
+        "timestamp_label": "MatMul[1500x1536x384]",
+        "pipeline": "MatMul:cooperative",
+        "workgroups": [
+          94,
+          96,
+          1
+        ],
+        "workgroup_count": 9024,
+        "input_buffer_bytes": 4663296,
+        "output_buffer_bytes": 9240576,
+        "cooperative": true,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          1.8964159999999999,
+          1.8968749999999999,
+          1.895625,
+          1.897,
+          1.8932499999999999
+        ],
+        "median_ms": 1.8964159999999999,
+        "p25_ms": 1.895625,
+        "p75_ms": 1.8968749999999999,
+        "share_of_dispatch_median_sum_pct": 3.096625240917581
+      },
+      {
+        "index": 37,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "BiasAdd",
+        "label": "BiasAdd[2304000]",
+        "timestamp_label": "BiasAdd[2304000]",
+        "pipeline": "BiasAdd:scalar",
+        "workgroups": [
+          9000,
+          1,
+          1
+        ],
+        "workgroup_count": 9000,
+        "input_buffer_bytes": 9246720,
+        "output_buffer_bytes": 9216000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.19799999999999998,
+          0.202666,
+          0.200917,
+          0.198958,
+          0.200875
+        ],
+        "median_ms": 0.200875,
+        "p25_ms": 0.198958,
+        "p75_ms": 0.200917,
+        "share_of_dispatch_median_sum_pct": 0.32800535076128823
+      },
+      {
+        "index": 38,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "Gelu",
+        "label": "Gelu[2304000]",
+        "timestamp_label": "Gelu[2304000]",
+        "pipeline": "Gelu:scalar",
+        "workgroups": [
+          9000,
+          1,
+          1
+        ],
+        "workgroup_count": 9000,
+        "input_buffer_bytes": 9216000,
+        "output_buffer_bytes": 9216000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.193375,
+          0.190125,
+          0.193666,
+          0.190292,
+          0.190916
+        ],
+        "median_ms": 0.190916,
+        "p25_ms": 0.190292,
+        "p75_ms": 0.193375,
+        "share_of_dispatch_median_sum_pct": 0.3117434700482494
+      },
+      {
+        "index": 39,
+        "phase": "forward",
+        "family": "matrix",
+        "shader": "MatMul",
+        "label": "MatMul[1500x384x1536]",
+        "timestamp_label": "MatMul[1500x384x1536]",
+        "pipeline": "MatMul:cooperative",
+        "workgroups": [
+          94,
+          24,
+          1
+        ],
+        "workgroup_count": 2256,
+        "input_buffer_bytes": 11575296,
+        "output_buffer_bytes": 2310144,
+        "cooperative": true,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          1.9760419999999999,
+          1.995208,
+          1.97475,
+          1.973667,
+          1.973542
+        ],
+        "median_ms": 1.97475,
+        "p25_ms": 1.973667,
+        "p75_ms": 1.9760419999999999,
+        "share_of_dispatch_median_sum_pct": 3.224535489313523
+      },
+      {
+        "index": 40,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "BiasAdd",
+        "label": "BiasAdd[576000]",
+        "timestamp_label": "BiasAdd[576000]",
+        "pipeline": "BiasAdd:scalar",
+        "workgroups": [
+          2250,
+          1,
+          1
+        ],
+        "workgroup_count": 2250,
+        "input_buffer_bytes": 2311680,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.02375,
+          0.023916,
+          0.024375,
+          0.023125,
+          0.023958
+        ],
+        "median_ms": 0.023916,
+        "p25_ms": 0.02375,
+        "p75_ms": 0.023958,
+        "share_of_dispatch_median_sum_pct": 0.039052027224925796
+      },
+      {
+        "index": 41,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "Add",
+        "label": "Add[576000]",
+        "timestamp_label": "Add[576000]",
+        "pipeline": "generated-pointwise:ef13ca5b80c77f5e",
+        "workgroups": [
+          2250,
+          1,
+          1
+        ],
+        "workgroup_count": 2250,
+        "input_buffer_bytes": 4608000,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.044959,
+          0.045708,
+          0.044458,
+          0.044916000000000005,
+          0.044167
+        ],
+        "median_ms": 0.044916000000000005,
+        "p25_ms": 0.044458,
+        "p75_ms": 0.044959,
+        "share_of_dispatch_median_sum_pct": 0.07334256793923595
+      },
+      {
+        "index": 42,
+        "phase": "forward",
+        "family": "normalization_reduction",
+        "shader": "LayerNorm",
+        "label": "LayerNorm[1500]",
+        "timestamp_label": "LayerNorm[1500]",
+        "pipeline": "LayerNorm:scalar",
+        "workgroups": [
+          1500,
+          1,
+          1
+        ],
+        "workgroup_count": 1500,
+        "input_buffer_bytes": 2307072,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.047125,
+          0.047209,
+          0.047583999999999994,
+          0.047333,
+          0.04725
+        ],
+        "median_ms": 0.04725,
+        "p25_ms": 0.047209,
+        "p75_ms": 0.047333,
+        "share_of_dispatch_median_sum_pct": 0.07715371660719786
+      },
+      {
+        "index": 43,
+        "phase": "forward",
+        "family": "matrix",
+        "shader": "MatMul",
+        "label": "MatMul[1500x384x384]",
+        "timestamp_label": "MatMul[1500x384x384]",
+        "pipeline": "MatMul:cooperative",
+        "workgroups": [
+          94,
+          24,
+          1
+        ],
+        "workgroup_count": 2256,
+        "input_buffer_bytes": 2893824,
+        "output_buffer_bytes": 2310144,
+        "cooperative": true,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.49129200000000006,
+          0.4938330000000001,
+          0.49112500000000003,
+          0.494042,
+          0.49233299999999997
+        ],
+        "median_ms": 0.49233299999999997,
+        "p25_ms": 0.49129200000000006,
+        "p75_ms": 0.4938330000000001,
+        "share_of_dispatch_median_sum_pct": 0.8039221324523076
+      },
+      {
+        "index": 44,
+        "phase": "forward",
+        "family": "matrix",
+        "shader": "MatMul",
+        "label": "MatMul[1500x384x384]",
+        "timestamp_label": "MatMul[1500x384x384]",
+        "pipeline": "MatMul:cooperative",
+        "workgroups": [
+          94,
+          24,
+          1
+        ],
+        "workgroup_count": 2256,
+        "input_buffer_bytes": 2893824,
+        "output_buffer_bytes": 2310144,
+        "cooperative": true,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.493667,
+          0.493125,
+          0.495166,
+          0.49512500000000004,
+          0.494
+        ],
+        "median_ms": 0.494,
+        "p25_ms": 0.493667,
+        "p75_ms": 0.49512500000000004,
+        "share_of_dispatch_median_sum_pct": 0.8066441482318675
+      },
+      {
+        "index": 45,
+        "phase": "forward",
+        "family": "matrix",
+        "shader": "MatMul",
+        "label": "MatMul[1500x384x384]",
+        "timestamp_label": "MatMul[1500x384x384]",
+        "pipeline": "MatMul:cooperative",
+        "workgroups": [
+          94,
+          24,
+          1
+        ],
+        "workgroup_count": 2256,
+        "input_buffer_bytes": 2893824,
+        "output_buffer_bytes": 2310144,
+        "cooperative": true,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.49279100000000003,
+          0.494959,
+          0.49450000000000005,
+          0.49370800000000004,
+          0.49537500000000007
+        ],
+        "median_ms": 0.49450000000000005,
+        "p25_ms": 0.49370800000000004,
+        "p75_ms": 0.494959,
+        "share_of_dispatch_median_sum_pct": 0.8074605896774464
+      },
+      {
+        "index": 46,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "BiasAdd",
+        "label": "BiasAdd[576000]",
+        "timestamp_label": "BiasAdd[576000]",
+        "pipeline": "BiasAdd:scalar",
+        "workgroups": [
+          2250,
+          1,
+          1
+        ],
+        "workgroup_count": 2250,
+        "input_buffer_bytes": 2311680,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.049792,
+          0.046958,
+          0.047041,
+          0.047083,
+          0.046333
+        ],
+        "median_ms": 0.047041,
+        "p25_ms": 0.046958,
+        "p75_ms": 0.047083,
+        "share_of_dispatch_median_sum_pct": 0.0768124440829459
+      },
+      {
+        "index": 47,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "BiasAdd",
+        "label": "BiasAdd[576000]",
+        "timestamp_label": "BiasAdd[576000]",
+        "pipeline": "BiasAdd:scalar",
+        "workgroups": [
+          2250,
+          1,
+          1
+        ],
+        "workgroup_count": 2250,
+        "input_buffer_bytes": 2311680,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.036167,
+          0.035667000000000004,
+          0.035958,
+          0.037208,
+          0.036042
+        ],
+        "median_ms": 0.036042,
+        "p25_ms": 0.035958,
+        "p75_ms": 0.036167,
+        "share_of_dispatch_median_sum_pct": 0.05885236516310317
+      },
+      {
+        "index": 48,
+        "phase": "forward",
+        "family": "attention",
+        "shader": "FlashAttention",
+        "label": "FlashAttention[1500]",
+        "timestamp_label": "FlashAttention[1500]",
+        "pipeline": "FlashAttention:head-dim-64",
+        "workgroups": [
+          24,
+          6,
+          1
+        ],
+        "workgroup_count": 144,
+        "input_buffer_bytes": 6918144,
+        "output_buffer_bytes": 2376000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          8.135333,
+          8.1535,
+          8.130458,
+          8.213417,
+          8.063708
+        ],
+        "median_ms": 8.135333,
+        "p25_ms": 8.130458,
+        "p75_ms": 8.1535,
+        "share_of_dispatch_median_sum_pct": 13.284046069570046
+      },
+      {
+        "index": 49,
+        "phase": "forward",
+        "family": "matrix",
+        "shader": "MatMul",
+        "label": "MatMul[1500x384x384]",
+        "timestamp_label": "MatMul[1500x384x384]",
+        "pipeline": "MatMul:cooperative",
+        "workgroups": [
+          94,
+          24,
+          1
+        ],
+        "workgroup_count": 2256,
+        "input_buffer_bytes": 2893824,
+        "output_buffer_bytes": 2310144,
+        "cooperative": true,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.492583,
+          0.495917,
+          0.498125,
+          0.497916,
+          0.49549999999999994
+        ],
+        "median_ms": 0.495917,
+        "p25_ms": 0.49549999999999994,
+        "p75_ms": 0.497916,
+        "share_of_dispatch_median_sum_pct": 0.8097743847342166
+      },
+      {
+        "index": 50,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "BiasAdd",
+        "label": "BiasAdd[576000]",
+        "timestamp_label": "BiasAdd[576000]",
+        "pipeline": "BiasAdd:scalar",
+        "workgroups": [
+          2250,
+          1,
+          1
+        ],
+        "workgroup_count": 2250,
+        "input_buffer_bytes": 2311680,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.024166,
+          0.023709,
+          0.024457999999999997,
+          0.023875,
+          0.023875
+        ],
+        "median_ms": 0.023875,
+        "p25_ms": 0.023875,
+        "p75_ms": 0.024166,
+        "share_of_dispatch_median_sum_pct": 0.038985079026388335
+      },
+      {
+        "index": 51,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "Add",
+        "label": "Add[576000]",
+        "timestamp_label": "Add[576000]",
+        "pipeline": "generated-pointwise:ef13ca5b80c77f5e",
+        "workgroups": [
+          2250,
+          1,
+          1
+        ],
+        "workgroup_count": 2250,
+        "input_buffer_bytes": 4608000,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.056375,
+          0.058832999999999996,
+          0.057834,
+          0.056666999999999995,
+          0.059625
+        ],
+        "median_ms": 0.057834,
+        "p25_ms": 0.056666999999999995,
+        "p75_ms": 0.058832999999999996,
+        "share_of_dispatch_median_sum_pct": 0.09443614912721018
+      },
+      {
+        "index": 52,
+        "phase": "forward",
+        "family": "normalization_reduction",
+        "shader": "LayerNorm",
+        "label": "LayerNorm[1500]",
+        "timestamp_label": "LayerNorm[1500]",
+        "pipeline": "LayerNorm:scalar",
+        "workgroups": [
+          1500,
+          1,
+          1
+        ],
+        "workgroup_count": 1500,
+        "input_buffer_bytes": 2307072,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.04725,
+          0.046875,
+          0.046916,
+          0.047167,
+          0.047208
+        ],
+        "median_ms": 0.047167,
+        "p25_ms": 0.046916,
+        "p75_ms": 0.047208,
+        "share_of_dispatch_median_sum_pct": 0.07701818732723177
+      },
+      {
+        "index": 53,
+        "phase": "forward",
+        "family": "matrix",
+        "shader": "MatMul",
+        "label": "MatMul[1500x1536x384]",
+        "timestamp_label": "MatMul[1500x1536x384]",
+        "pipeline": "MatMul:cooperative",
+        "workgroups": [
+          94,
+          96,
+          1
+        ],
+        "workgroup_count": 9024,
+        "input_buffer_bytes": 4663296,
+        "output_buffer_bytes": 9240576,
+        "cooperative": true,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          1.890084,
+          1.886541,
+          1.8869589999999998,
+          1.886042,
+          1.888125
+        ],
+        "median_ms": 1.8869589999999998,
+        "p25_ms": 1.886541,
+        "p75_ms": 1.888125,
+        "share_of_dispatch_median_sum_pct": 3.0811830674159033
+      },
+      {
+        "index": 54,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "BiasAdd",
+        "label": "BiasAdd[2304000]",
+        "timestamp_label": "BiasAdd[2304000]",
+        "pipeline": "BiasAdd:scalar",
+        "workgroups": [
+          9000,
+          1,
+          1
+        ],
+        "workgroup_count": 9000,
+        "input_buffer_bytes": 9246720,
+        "output_buffer_bytes": 9216000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.198875,
+          0.198792,
+          0.202041,
+          0.200125,
+          0.19858399999999998
+        ],
+        "median_ms": 0.198875,
+        "p25_ms": 0.198792,
+        "p75_ms": 0.200125,
+        "share_of_dispatch_median_sum_pct": 0.324739584978973
+      },
+      {
+        "index": 55,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "Gelu",
+        "label": "Gelu[2304000]",
+        "timestamp_label": "Gelu[2304000]",
+        "pipeline": "Gelu:scalar",
+        "workgroups": [
+          9000,
+          1,
+          1
+        ],
+        "workgroup_count": 9000,
+        "input_buffer_bytes": 9216000,
+        "output_buffer_bytes": 9216000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.193167,
+          0.193,
+          0.189792,
+          0.199667,
+          0.190125
+        ],
+        "median_ms": 0.193,
+        "p25_ms": 0.190125,
+        "p75_ms": 0.193167,
+        "share_of_dispatch_median_sum_pct": 0.3151463979934219
+      },
+      {
+        "index": 56,
+        "phase": "forward",
+        "family": "matrix",
+        "shader": "MatMul",
+        "label": "MatMul[1500x384x1536]",
+        "timestamp_label": "MatMul[1500x384x1536]",
+        "pipeline": "MatMul:cooperative",
+        "workgroups": [
+          94,
+          24,
+          1
+        ],
+        "workgroup_count": 2256,
+        "input_buffer_bytes": 11575296,
+        "output_buffer_bytes": 2310144,
+        "cooperative": true,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          1.9801670000000002,
+          1.9819999999999998,
+          1.984,
+          1.9759170000000001,
+          1.9797500000000001
+        ],
+        "median_ms": 1.9801670000000002,
+        "p25_ms": 1.9797500000000001,
+        "p75_ms": 1.9819999999999998,
+        "share_of_dispatch_median_sum_pct": 3.233380815934924
+      },
+      {
+        "index": 57,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "BiasAdd",
+        "label": "BiasAdd[576000]",
+        "timestamp_label": "BiasAdd[576000]",
+        "pipeline": "BiasAdd:scalar",
+        "workgroups": [
+          2250,
+          1,
+          1
+        ],
+        "workgroup_count": 2250,
+        "input_buffer_bytes": 2311680,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.024208,
+          0.024417,
+          0.024708,
+          0.024208,
+          0.024083
+        ],
+        "median_ms": 0.024208,
+        "p25_ms": 0.024208,
+        "p75_ms": 0.024417,
+        "share_of_dispatch_median_sum_pct": 0.03952882902914382
+      },
+      {
+        "index": 58,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "Add",
+        "label": "Add[576000]",
+        "timestamp_label": "Add[576000]",
+        "pipeline": "generated-pointwise:ef13ca5b80c77f5e",
+        "workgroups": [
+          2250,
+          1,
+          1
+        ],
+        "workgroup_count": 2250,
+        "input_buffer_bytes": 4608000,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.044584,
+          0.044792,
+          0.045667,
+          0.044583000000000005,
+          0.045166
+        ],
+        "median_ms": 0.044792,
+        "p25_ms": 0.044584,
+        "p75_ms": 0.045166,
+        "share_of_dispatch_median_sum_pct": 0.0731400904607324
+      },
+      {
+        "index": 59,
+        "phase": "forward",
+        "family": "normalization_reduction",
+        "shader": "LayerNorm",
+        "label": "LayerNorm[1500]",
+        "timestamp_label": "LayerNorm[1500]",
+        "pipeline": "LayerNorm:scalar",
+        "workgroups": [
+          1500,
+          1,
+          1
+        ],
+        "workgroup_count": 1500,
+        "input_buffer_bytes": 2307072,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.047208,
+          0.047,
+          0.047125,
+          0.04725,
+          0.047125
+        ],
+        "median_ms": 0.047125,
+        "p25_ms": 0.047125,
+        "p75_ms": 0.047208,
+        "share_of_dispatch_median_sum_pct": 0.07694960624580315
+      },
+      {
+        "index": 60,
+        "phase": "forward",
+        "family": "matrix",
+        "shader": "MatMul",
+        "label": "MatMul[1500x384x384]",
+        "timestamp_label": "MatMul[1500x384x384]",
+        "pipeline": "MatMul:cooperative",
+        "workgroups": [
+          94,
+          24,
+          1
+        ],
+        "workgroup_count": 2256,
+        "input_buffer_bytes": 2893824,
+        "output_buffer_bytes": 2310144,
+        "cooperative": true,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.49520800000000004,
+          0.489959,
+          0.49,
+          0.491916,
+          0.49483299999999997
+        ],
+        "median_ms": 0.491916,
+        "p25_ms": 0.49,
+        "p75_ms": 0.49483299999999997,
+        "share_of_dispatch_median_sum_pct": 0.803241220286695
+      },
+      {
+        "index": 61,
+        "phase": "forward",
+        "family": "matrix",
+        "shader": "MatMul",
+        "label": "MatMul[1500x384x384]",
+        "timestamp_label": "MatMul[1500x384x384]",
+        "pipeline": "MatMul:cooperative",
+        "workgroups": [
+          94,
+          24,
+          1
+        ],
+        "workgroup_count": 2256,
+        "input_buffer_bytes": 2893824,
+        "output_buffer_bytes": 2310144,
+        "cooperative": true,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.493291,
+          0.491958,
+          0.491625,
+          0.492541,
+          0.4935
+        ],
+        "median_ms": 0.492541,
+        "p25_ms": 0.491958,
+        "p75_ms": 0.493291,
+        "share_of_dispatch_median_sum_pct": 0.8042617720936686
+      },
+      {
+        "index": 62,
+        "phase": "forward",
+        "family": "matrix",
+        "shader": "MatMul",
+        "label": "MatMul[1500x384x384]",
+        "timestamp_label": "MatMul[1500x384x384]",
+        "pipeline": "MatMul:cooperative",
+        "workgroups": [
+          94,
+          24,
+          1
+        ],
+        "workgroup_count": 2256,
+        "input_buffer_bytes": 2893824,
+        "output_buffer_bytes": 2310144,
+        "cooperative": true,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.49537500000000007,
+          0.49474999999999997,
+          0.4947079999999999,
+          0.494291,
+          0.497208
+        ],
+        "median_ms": 0.49474999999999997,
+        "p25_ms": 0.4947079999999999,
+        "p75_ms": 0.49537500000000007,
+        "share_of_dispatch_median_sum_pct": 0.8078688104002356
+      },
+      {
+        "index": 63,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "BiasAdd",
+        "label": "BiasAdd[576000]",
+        "timestamp_label": "BiasAdd[576000]",
+        "pipeline": "BiasAdd:scalar",
+        "workgroups": [
+          2250,
+          1,
+          1
+        ],
+        "workgroup_count": 2250,
+        "input_buffer_bytes": 2311680,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.046791,
+          0.049249999999999995,
+          0.04575,
+          0.047667,
+          0.046834
+        ],
+        "median_ms": 0.046834,
+        "p25_ms": 0.046791,
+        "p75_ms": 0.047667,
+        "share_of_dispatch_median_sum_pct": 0.07647443732447629
+      },
+      {
+        "index": 64,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "BiasAdd",
+        "label": "BiasAdd[576000]",
+        "timestamp_label": "BiasAdd[576000]",
+        "pipeline": "BiasAdd:scalar",
+        "workgroups": [
+          2250,
+          1,
+          1
+        ],
+        "workgroup_count": 2250,
+        "input_buffer_bytes": 2311680,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.035417000000000004,
+          0.035708,
+          0.03625,
+          0.037,
+          0.035500000000000004
+        ],
+        "median_ms": 0.035708,
+        "p25_ms": 0.035500000000000004,
+        "p75_ms": 0.03625,
+        "share_of_dispatch_median_sum_pct": 0.05830698227745652
+      },
+      {
+        "index": 65,
+        "phase": "forward",
+        "family": "attention",
+        "shader": "FlashAttention",
+        "label": "FlashAttention[1500]",
+        "timestamp_label": "FlashAttention[1500]",
+        "pipeline": "FlashAttention:head-dim-64",
+        "workgroups": [
+          24,
+          6,
+          1
+        ],
+        "workgroup_count": 144,
+        "input_buffer_bytes": 6918144,
+        "output_buffer_bytes": 2376000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          8.1425,
+          8.055083,
+          8.154167000000001,
+          8.168417000000002,
+          8.191417
+        ],
+        "median_ms": 8.154167000000001,
+        "p25_ms": 8.1425,
+        "p75_ms": 8.168417000000002,
+        "share_of_dispatch_median_sum_pct": 13.31479978594211
+      },
+      {
+        "index": 66,
+        "phase": "forward",
+        "family": "matrix",
+        "shader": "MatMul",
+        "label": "MatMul[1500x384x384]",
+        "timestamp_label": "MatMul[1500x384x384]",
+        "pipeline": "MatMul:cooperative",
+        "workgroups": [
+          94,
+          24,
+          1
+        ],
+        "workgroup_count": 2256,
+        "input_buffer_bytes": 2893824,
+        "output_buffer_bytes": 2310144,
+        "cooperative": true,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.497833,
+          0.4946249999999999,
+          0.49958299999999994,
+          0.492959,
+          0.49558299999999994
+        ],
+        "median_ms": 0.49558299999999994,
+        "p25_ms": 0.4946249999999999,
+        "p75_ms": 0.497833,
+        "share_of_dispatch_median_sum_pct": 0.8092290018485699
+      },
+      {
+        "index": 67,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "BiasAdd",
+        "label": "BiasAdd[576000]",
+        "timestamp_label": "BiasAdd[576000]",
+        "pipeline": "BiasAdd:scalar",
+        "workgroups": [
+          2250,
+          1,
+          1
+        ],
+        "workgroup_count": 2250,
+        "input_buffer_bytes": 2311680,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.024292,
+          0.02425,
+          0.024125,
+          0.024334,
+          0.02375
+        ],
+        "median_ms": 0.02425,
+        "p25_ms": 0.024125,
+        "p75_ms": 0.024292,
+        "share_of_dispatch_median_sum_pct": 0.03959741011057245
+      },
+      {
+        "index": 68,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "Add",
+        "label": "Add[576000]",
+        "timestamp_label": "Add[576000]",
+        "pipeline": "generated-pointwise:ef13ca5b80c77f5e",
+        "workgroups": [
+          2250,
+          1,
+          1
+        ],
+        "workgroup_count": 2250,
+        "input_buffer_bytes": 4608000,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.057874999999999996,
+          0.057791999999999996,
+          0.056916999999999995,
+          0.058375,
+          0.057042
+        ],
+        "median_ms": 0.057791999999999996,
+        "p25_ms": 0.057042,
+        "p75_ms": 0.057874999999999996,
+        "share_of_dispatch_median_sum_pct": 0.09436756804578154
+      },
+      {
+        "index": 69,
+        "phase": "forward",
+        "family": "normalization_reduction",
+        "shader": "LayerNorm",
+        "label": "LayerNorm[1500]",
+        "timestamp_label": "LayerNorm[1500]",
+        "pipeline": "LayerNorm:scalar",
+        "workgroups": [
+          1500,
+          1,
+          1
+        ],
+        "workgroup_count": 1500,
+        "input_buffer_bytes": 2307072,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.047083,
+          0.04725,
+          0.047416999999999994,
+          0.047,
+          0.047167
+        ],
+        "median_ms": 0.047167,
+        "p25_ms": 0.047083,
+        "p75_ms": 0.04725,
+        "share_of_dispatch_median_sum_pct": 0.07701818732723177
+      },
+      {
+        "index": 70,
+        "phase": "forward",
+        "family": "matrix",
+        "shader": "MatMul",
+        "label": "MatMul[1500x1536x384]",
+        "timestamp_label": "MatMul[1500x1536x384]",
+        "pipeline": "MatMul:cooperative",
+        "workgroups": [
+          94,
+          96,
+          1
+        ],
+        "workgroup_count": 9024,
+        "input_buffer_bytes": 4663296,
+        "output_buffer_bytes": 9240576,
+        "cooperative": true,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          1.8920000000000001,
+          1.890125,
+          1.887292,
+          1.891667,
+          1.891292
+        ],
+        "median_ms": 1.891292,
+        "p25_ms": 1.890125,
+        "p75_ms": 1.891667,
+        "share_of_dispatch_median_sum_pct": 3.0882583489832895
+      },
+      {
+        "index": 71,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "BiasAdd",
+        "label": "BiasAdd[2304000]",
+        "timestamp_label": "BiasAdd[2304000]",
+        "pipeline": "BiasAdd:scalar",
+        "workgroups": [
+          9000,
+          1,
+          1
+        ],
+        "workgroup_count": 9000,
+        "input_buffer_bytes": 9246720,
+        "output_buffer_bytes": 9216000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.199667,
+          0.20133299999999998,
+          0.200167,
+          0.20024999999999998,
+          0.207292
+        ],
+        "median_ms": 0.20024999999999998,
+        "p25_ms": 0.200167,
+        "p75_ms": 0.20133299999999998,
+        "share_of_dispatch_median_sum_pct": 0.3269847989543147
+      },
+      {
+        "index": 72,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "Gelu",
+        "label": "Gelu[2304000]",
+        "timestamp_label": "Gelu[2304000]",
+        "pipeline": "Gelu:scalar",
+        "workgroups": [
+          9000,
+          1,
+          1
+        ],
+        "workgroup_count": 9000,
+        "input_buffer_bytes": 9216000,
+        "output_buffer_bytes": 9216000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.18937500000000002,
+          0.192208,
+          0.193625,
+          0.190084,
+          0.197166
+        ],
+        "median_ms": 0.192208,
+        "p25_ms": 0.190084,
+        "p75_ms": 0.193625,
+        "share_of_dispatch_median_sum_pct": 0.313853154743625
+      },
+      {
+        "index": 73,
+        "phase": "forward",
+        "family": "matrix",
+        "shader": "MatMul",
+        "label": "MatMul[1500x384x1536]",
+        "timestamp_label": "MatMul[1500x384x1536]",
+        "pipeline": "MatMul:cooperative",
+        "workgroups": [
+          94,
+          24,
+          1
+        ],
+        "workgroup_count": 2256,
+        "input_buffer_bytes": 11575296,
+        "output_buffer_bytes": 2310144,
+        "cooperative": true,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          1.97875,
+          1.974208,
+          1.974375,
+          1.977875,
+          1.9715409999999998
+        ],
+        "median_ms": 1.974375,
+        "p25_ms": 1.974208,
+        "p75_ms": 1.977875,
+        "share_of_dispatch_median_sum_pct": 3.2239231582293386
+      },
+      {
+        "index": 74,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "BiasAdd",
+        "label": "BiasAdd[576000]",
+        "timestamp_label": "BiasAdd[576000]",
+        "pipeline": "BiasAdd:scalar",
+        "workgroups": [
+          2250,
+          1,
+          1
+        ],
+        "workgroup_count": 2250,
+        "input_buffer_bytes": 2311680,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.025707999999999998,
+          0.023375,
+          0.023875,
+          0.024749999999999998,
+          0.024208
+        ],
+        "median_ms": 0.024208,
+        "p25_ms": 0.023875,
+        "p75_ms": 0.024749999999999998,
+        "share_of_dispatch_median_sum_pct": 0.03952882902914382
+      },
+      {
+        "index": 75,
+        "phase": "forward",
+        "family": "pointwise",
+        "shader": "Add",
+        "label": "Add[576000]",
+        "timestamp_label": "Add[576000]",
+        "pipeline": "generated-pointwise:ef13ca5b80c77f5e",
+        "workgroups": [
+          2250,
+          1,
+          1
+        ],
+        "workgroup_count": 2250,
+        "input_buffer_bytes": 4608000,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.047792,
+          0.045084,
+          0.044625,
+          0.0455,
+          0.045042
+        ],
+        "median_ms": 0.045084,
+        "p25_ms": 0.045042,
+        "p75_ms": 0.0455,
+        "share_of_dispatch_median_sum_pct": 0.07361689226495043
+      },
+      {
+        "index": 76,
+        "phase": "forward",
+        "family": "normalization_reduction",
+        "shader": "LayerNorm",
+        "label": "LayerNorm[1500]",
+        "timestamp_label": "LayerNorm[1500]",
+        "pipeline": "LayerNorm:scalar",
+        "workgroups": [
+          1500,
+          1,
+          1
+        ],
+        "workgroup_count": 1500,
+        "input_buffer_bytes": 2307072,
+        "output_buffer_bytes": 2304000,
+        "cooperative": false,
+        "small_tile": false,
+        "requires_full_precision": false,
+        "weight_format": "F32",
+        "has_prologue": false,
+        "has_epilogue": false,
+        "timing_samples_ms": [
+          0.047125,
+          0.046958,
+          0.047167,
+          0.047334,
+          0.047292
+        ],
+        "median_ms": 0.047167,
+        "p25_ms": 0.047125,
+        "p75_ms": 0.047292,
+        "share_of_dispatch_median_sum_pct": 0.07701818732723177
+      }
+    ],
+    "pipeline_statistics": [
+      {
+        "pipeline": "AddPerChannel:scalar",
+        "executables": [
+          {
+            "name": "main",
+            "statistics": [
+              {
+                "name": "maxTotalThreadsPerThreadgroup",
+                "description": "Maximum threads per threadgroup for this pipeline",
+                "value": 256.0
+              },
+              {
+                "name": "threadExecutionWidth",
+                "description": "SIMD-group width",
+                "value": 32.0
+              },
+              {
+                "name": "staticThreadgroupMemoryLength",
+                "description": "Statically allocated threadgroup memory in bytes",
+                "value": 0.0
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "pipeline": "BiasAdd:scalar",
+        "executables": [
+          {
+            "name": "main",
+            "statistics": [
+              {
+                "name": "maxTotalThreadsPerThreadgroup",
+                "description": "Maximum threads per threadgroup for this pipeline",
+                "value": 256.0
+              },
+              {
+                "name": "threadExecutionWidth",
+                "description": "SIMD-group width",
+                "value": 32.0
+              },
+              {
+                "name": "staticThreadgroupMemoryLength",
+                "description": "Statically allocated threadgroup memory in bytes",
+                "value": 0.0
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "pipeline": "Conv2dGemm:scalar",
+        "executables": [
+          {
+            "name": "main",
+            "statistics": [
+              {
+                "name": "maxTotalThreadsPerThreadgroup",
+                "description": "Maximum threads per threadgroup for this pipeline",
+                "value": 256.0
+              },
+              {
+                "name": "threadExecutionWidth",
+                "description": "SIMD-group width",
+                "value": 32.0
+              },
+              {
+                "name": "staticThreadgroupMemoryLength",
+                "description": "Statically allocated threadgroup memory in bytes",
+                "value": 0.0
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "pipeline": "FlashAttention:head-dim-64",
+        "executables": [
+          {
+            "name": "main",
+            "statistics": [
+              {
+                "name": "maxTotalThreadsPerThreadgroup",
+                "description": "Maximum threads per threadgroup for this pipeline",
+                "value": 256.0
+              },
+              {
+                "name": "threadExecutionWidth",
+                "description": "SIMD-group width",
+                "value": 32.0
+              },
+              {
+                "name": "staticThreadgroupMemoryLength",
+                "description": "Statically allocated threadgroup memory in bytes",
+                "value": 0.0
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "pipeline": "Gelu:scalar",
+        "executables": [
+          {
+            "name": "gelu",
+            "statistics": [
+              {
+                "name": "maxTotalThreadsPerThreadgroup",
+                "description": "Maximum threads per threadgroup for this pipeline",
+                "value": 256.0
+              },
+              {
+                "name": "threadExecutionWidth",
+                "description": "SIMD-group width",
+                "value": 32.0
+              },
+              {
+                "name": "staticThreadgroupMemoryLength",
+                "description": "Statically allocated threadgroup memory in bytes",
+                "value": 0.0
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "pipeline": "LayerNorm:scalar",
+        "executables": [
+          {
+            "name": "main",
+            "statistics": [
+              {
+                "name": "maxTotalThreadsPerThreadgroup",
+                "description": "Maximum threads per threadgroup for this pipeline",
+                "value": 128.0
+              },
+              {
+                "name": "threadExecutionWidth",
+                "description": "SIMD-group width",
+                "value": 32.0
+              },
+              {
+                "name": "staticThreadgroupMemoryLength",
+                "description": "Statically allocated threadgroup memory in bytes",
+                "value": 0.0
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "pipeline": "MatMul:cooperative",
+        "executables": [
+          {
+            "name": "main",
+            "statistics": [
+              {
+                "name": "maxTotalThreadsPerThreadgroup",
+                "description": "Maximum threads per threadgroup for this pipeline",
+                "value": 64.0
+              },
+              {
+                "name": "threadExecutionWidth",
+                "description": "SIMD-group width",
+                "value": 32.0
+              },
+              {
+                "name": "staticThreadgroupMemoryLength",
+                "description": "Statically allocated threadgroup memory in bytes",
+                "value": 0.0
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "pipeline": "Transpose:scalar",
+        "executables": [
+          {
+            "name": "main",
+            "statistics": [
+              {
+                "name": "maxTotalThreadsPerThreadgroup",
+                "description": "Maximum threads per threadgroup for this pipeline",
+                "value": 256.0
+              },
+              {
+                "name": "threadExecutionWidth",
+                "description": "SIMD-group width",
+                "value": 32.0
+              },
+              {
+                "name": "staticThreadgroupMemoryLength",
+                "description": "Statically allocated threadgroup memory in bytes",
+                "value": 0.0
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "pipeline": "generated-pointwise:ef13ca5b80c77f5e",
+        "executables": [
+          {
+            "name": "main",
+            "statistics": [
+              {
+                "name": "maxTotalThreadsPerThreadgroup",
+                "description": "Maximum threads per threadgroup for this pipeline",
+                "value": 256.0
+              },
+              {
+                "name": "threadExecutionWidth",
+                "description": "SIMD-group width",
+                "value": 32.0
+              },
+              {
+                "name": "staticThreadgroupMemoryLength",
+                "description": "Statically allocated threadgroup memory in bytes",
+                "value": 0.0
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

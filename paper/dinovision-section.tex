@@ -5,9 +5,10 @@
 
 We evaluate \system{} beyond isolated operators with DinoVision, an Android XR
 application that reconstructs passthrough imagery from intermediate
-DINOv3~\cite{simeoni2025dinov3} features. The application center-crops and
-resizes an RGB frame to $224\times224$, executes the first three layers of a
-frozen DINOv3 ViT-S/16 encoder, rearranges its
+DINOv3~\cite{simeoni2025dinov3} features
+(Figure~\ref{fig:dinovision-quest3s}). The application center-crops and resizes
+an RGB frame to $224\times224$, executes the first three layers of a frozen
+DINOv3 ViT-S/16 encoder, rearranges its
 $14\times14\times384$ patch features, and decodes them to RGB. On device, the
 encoder and decoder form one batch-one inference graph, and two asynchronous
 eye sessions share Blade's Vulkan context and queue with OpenXR rendering.
@@ -18,6 +19,15 @@ convolution, group normalization, SiLU, upsampling, autodiff, Adam, parameter
 serialization, Android cross-compilation, and compute/graphics co-tenancy. It
 is evidence about stack breadth and deployment closure, not a matched PyTorch
 comparison or a capture-to-photon measurement.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.82\columnwidth]{figures/dinovision-quest3s.jpg}
+  \caption{Quest 3S casting capture of DinoVision's live RGB reconstruction.
+  This qualitative image documents physical deployment; the correctness and
+  timing claims use the protocols described below.}
+  \label{fig:dinovision-quest3s}
+\end{figure}
 
 \paragraph{Host training and held-out evaluation.}
 The frozen encoder caches features on an NVIDIA host, after which \system{}
@@ -37,13 +47,10 @@ artifact retains every per-image record; host wall time is excluded because
 the interactive machine experienced recorded suspension gaps.
 
 \paragraph{Independent correctness gate.}
-The audit found a silent layout error in the initial implementation:
-\system{}'s NCHW-flat per-channel multiplication was applied directly to a
-$[\mathrm{tokens},\mathrm{hidden}]$ LayerScale branch. Only the first token
-received the intended residual update, even though output images remained
-plausible. We rejected all weights and measurements from that graph, corrected
-the layout, added exact attention and LayerScale CPU tests, and retrained all
-replicates.
+The independent gate proved necessary: an initial LayerScale layout mismatch
+updated only the first token even though the output images remained plausible.
+We rejected all affected weights and measurements, corrected the layout,
+added exact attention and LayerScale CPU tests, and retrained all replicates.
 
 An independent Torch/Transformers reference and \system{} consume the same
 normalized f32 tensor and checkpoint. Predeclared thresholds are relative
@@ -67,12 +74,6 @@ controls pass.
     \bottomrule
   \end{tabular}
 \end{table}
-
-The failure suggests a reusable API hardening change: graph construction
-should validate the flattened element count, channel/spatial product, and gate
-length of per-channel multiplication. The compiler revision used here derives
-dispatch length from the first shape coordinate, so an inconsistent layout
-otherwise fails silently.
 
 \paragraph{Physical Android correctness.}
 Before timing, the host and Quest execute one public fixed RGB frame with
@@ -130,4 +131,5 @@ GPU transfers, output readback, temporal smoothing, and renderer upload.
 Full weights, raw samples, manifests, environment records, and validation
 scripts are available at
 \url{https://huggingface.co/mad-bot/dinovision}; source is available at
-\url{https://github.com/kvark/dinovision}.
+\url{https://github.com/kvark/dinovision}. The artifact also provides the
+full-resolution casting captures and a 39-second live video.
