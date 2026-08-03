@@ -310,8 +310,9 @@ and deterministic inputs. Three timed series are reported per cell:
 decode claim is made), and \emph{forward--loss--backward} (no optimizer
 update). \emph{Compile} covers graph construction, optimization, autodiff,
 and GPU pipeline creation for all three sessions. Each series takes five
-untimed warmups and 20 retained samples; medians are reported and raw
-distributions ship in the artifact.
+untimed warmups, except the Intel sweep, which records four; every series
+retains 20 timed samples. Medians are reported and raw distributions ship
+in the artifact.
 
 \subsection{Arithmetic contracts}
 \label{sec:contracts}
@@ -379,7 +380,8 @@ the performance-portability aggregate.
 \scriptsize
 \setlength{\tabcolsep}{3.6pt}
 \input{../tables/strict}
-\caption{Strict-f32 results: medians over 20 samples after 5 warmups.
+\caption{Strict-f32 results: medians over 20 samples after 5 warmups
+(4 on Intel).
 $\times$ is the \system{}/PyTorch ratio; bold marks cells where \system{}
 is faster. F+L+B is forward, scalar loss, and backward without an
 optimizer update. Every cell passes the forward gate; every F+L+B cell
@@ -828,12 +830,15 @@ ANV 26.0.3, torch 2.11.0+xpu on CPU), Apple M3 (macOS 15.7.3, torch
 2.11.0 on MPS). \system{} runs on the installed graphics driver on every
 machine; no vendor compute runtime is used.
 
-\textbf{Reproduction.} \code{run.sh} with the per-vendor requirements
-file, then \code{--strict} for the control run; \code{--profile} captures
-the per-dispatch sidecars. Weights are generated deterministically or
-fetched from HuggingFace; inputs are deterministic. One full
-strict-plus-accelerated sweep takes under an hour per machine, dominated
-by \code{torch.compile}.
+\textbf{Reproduction.} At the frozen \inferena{} revision, \code{run.sh}
+executes the practical contract and \code{--strict} executes the control;
+\code{--profile} captures per-dispatch sidecars. The vendor requirements
+files are installation starting points rather than lockfiles: in particular,
+the two AMD machines use different recorded ROCm channels. Every result
+records its exact Python, PyTorch, driver/runtime, precision, and protocol
+metadata. Weights are generated deterministically or fetched from
+HuggingFace; inputs are deterministic. One full strict-plus-accelerated
+sweep takes under an hour per machine, dominated by \code{torch.compile}.
 
 \textbf{Evaluation status.} The artifact was not independently evaluated
 before submission. The author regenerated every numeric table from the raw
