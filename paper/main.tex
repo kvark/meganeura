@@ -38,44 +38,32 @@ through Vulkan and Metal}
 \maketitle
 
 \begin{abstract}
-Model development and model deployment are commonly separated by export,
-conversion, and platform-specific runtime boundaries. \system{} asks whether
-one compact native compiler can instead support optimizer-backed training and
-deployed inference on consumer GPUs: a Rust system that lowers a typed static
-graph and its automatically differentiated training graph to specialized GPU
-programs, executed through Vulkan on Linux, Windows, and Android and through
-Metal on Apple platforms with one graph API, compiler, checkpoint format,
-memory planner, and runtime.
+Training and deployed inference often cross export, conversion, and
+platform-specific runtime boundaries. \system{} asks whether one compact
+native compiler can span both phases on consumer GPUs. Its typed static graph,
+automatic differentiation, optimizer, checkpoint, memory planner, and runtime
+lower specialized programs through Vulkan and Metal.
 
-We evaluate five matched transformer, robotics, diffusion, vision, and speech
-workloads against PyTorch on five consumer devices: NVIDIA and AMD discrete
-GPUs, an AMD APU newly reached by ROCm, Apple silicon, and an Intel
-integrated GPU whose vendor path does not function. The protocol separates a
-strict-f32 control from each engine's documented fast path and gates forward
-and backward correctness independently; 48 of 50 device--workload--mode
-cells pass both gates, and the two exceptions are one workload's backward
-pass on the newest-supported machine, where the recorded gradient norms
-show the vendor reference disagreeing with itself across its own two ROCm
-devices while the portable results are reproduced bit-stably. On the AMD
-discrete GPU, four of five workloads run at $0.67$--$1.10\times$ compiled
-ROCm PyTorch for inference and $0.73$--$1.22\times$ for training ---
-several outright faster; on the AMD APU the portable stack wins three of
-five inference cells, by up to $1.8\times$. Across the GPU-referenced
-devices in strict f32 it also wins 12 of 20 minimal-batch latency cells ---
-by up to $3.4\times$ on ROCm --- and two inference cells beat compiled CUDA
-PyTorch on NVIDIA. Training is where vendor libraries earn their keep: the
-median valid forward--loss--backward gap on those devices is $1.8\times$
-and the worst is $4.6\times$, and per-dispatch profiles attribute the worst
-NVIDIA and Apple gaps to convolution derivatives and attention backward
-respectively.
-Model compilation takes 0.1--2.4\,s where \code{torch.compile} takes
-6--96\,s, and the deployed artifact is a 13\,MiB binary with no vendor
-compute runtime, against a multi-GiB Python closure. A physical Android XR
-case study carries a \system{}-trained decoder from an NVIDIA host into a
-live Adreno/OpenXR application and measures its interference with
-rendering. We attribute the remaining gaps to kernel coverage, launch structure, and arithmetic policy
-rather than to the graphics APIs, and report the compiler engineering
-lessons behind both outcomes.
+We compare five matched workloads with PyTorch on NVIDIA and AMD discrete
+GPUs, an AMD APU, Apple silicon, and an Intel iGPU. The protocol separates
+strict f32 from validated fast paths and gates forward and backward
+independently. Forty-eight of 50 device--workload--mode cells pass both gates;
+the other two share one unresolved backward-reference disagreement on a newly
+supported APU. In strict f32, \system{} wins 12 of 20 GPU-referenced
+minimal-latency cells and has a median valid training gap of $1.8\times$. On
+the discrete AMD GPU, four of five inference workloads are within
+$1.10\times$ of compiled ROCm PyTorch and three training workloads are faster.
+Under accelerated contracts, the worst training gap is $4.6\times$.
+
+Compilation takes 0.1--2.4\,s versus 6--96\,s for \code{torch.compile} on
+supported GPU paths; the stripped binary is 13\,MiB. Dispatch profiles
+localize the largest gaps to convolution derivatives and attention backward.
+A physical Android XR case study transfers a \system{}-trained decoder into
+an Adreno/OpenXR application sharing the graphics queue. The results show
+that general consumer graphics APIs can support a compact shared
+train-to-deploy stack at useful, sometimes vendor-competitive performance.
+The measured gaps point to kernel coverage, scheduling, and arithmetic policy
+rather than an identified API limitation.
 \end{abstract}
 
 \section{Introduction}
@@ -185,8 +173,9 @@ Within that setting, the measured answer is more positive than the
 conventional wisdom about graphics APIs suggests: both AMD devices reach
 near-parity or better with compiled ROCm PyTorch on most workloads,
 minimal-batch latency favors the portable stack on most devices, and the
-only correctness-gate failures in fifty audited cells are ones the recorded
-gradient norms attribute to the vendor reference itself. The gaps that
+only correctness-gate failures in fifty audited cells are two modes of one
+APU workload whose cross-device gradients strongly implicate the reference
+path. The gaps that
 remain --- chiefly backward passes on NVIDIA and Apple hardware --- are
 profiled down to the responsible kernel families, and the paper reports
 them with the same prominence as the wins.
@@ -223,8 +212,9 @@ This work makes four contributions:
         arithmetic contracts, raw timing samples, and independent forward and
         backward correctness gates, frozen at one revision pair across five
         devices from three GPU vendors and Apple silicon --- 48 of 50 cells
-        passing both gates, with the two exceptions localized by recorded
-        gradient norms to a defect on the vendor side.
+        passing both gates, with cross-device gradient records localizing the
+        two exceptions to the newly enabled reference path, subject to the
+        need for a third implementation.
   \item A decomposition of performance into the kernel coverage, dispatch
         structure, cooperative-matrix use, and precision policy that produce
         both near-reference cases and the largest remaining gaps.
@@ -283,11 +273,13 @@ intermediates, and a single operator replay tool are future work.
 
 \paragraph{Scale of the implementation.}
 ``Compact'' is meant as a measurable property rather than a stylistic one.
-The system is 34.0 KLOC of Rust spanning the typed graph, automatic
-differentiation, rewrites, compiler, code generation, memory planner,
-runtime, optimizer, ONNX/NNEF importers, and model builders, plus 6.1 KLOC
-of WGSL across 75 shader files; tests and examples add a further 14.5 KLOC.
-That is the budget within which every result below was produced. It is also
+At the frozen revision, the system is 34.5 KLOC of Rust spanning the typed
+graph, automatic differentiation, rewrites, compiler, code generation, memory
+planner, runtime, optimizer, ONNX/NNEF importers, and model builders, plus
+6.1 KLOC of WGSL across 75 shader files; tests and examples add a further
+14.8 KLOC.
+These are physical source-line counts. That is the budget within which every
+result below was produced. It is also
 part of the explanation for them, in both directions: a kernel library of
 this size cannot cover what a vendor stack covers, so the gaps analyzed in
 Section~\ref{sec:gaps} are better read as a consequence of scope than as a
@@ -379,11 +371,9 @@ local, its lowering maps to one kernel archetype or a short fusion of them,
 and importers translate near one-to-one --- matrix products, convolutions,
 attention, and normalizations are nodes; their scalar decompositions are
 not. Both ends of the granularity spectrum carry real costs. Very low-level
-primitive sets --- Luminal, for instance, lowers everything to roughly a
-dozen primitive ops\footnote{\url{https://github.com/luminal-ai/luminal}}
---- keep the IR minimal but push all performance recovery into search:
-fused kernels must be rediscovered from clouds of primitives, which is
-precisely the regime where global techniques such as equality saturation
+primitive sets keep the IR minimal but push all performance recovery into
+search: fused kernels must be rediscovered from clouds of primitives, which
+is precisely the regime where global techniques such as equality saturation
 become load-bearing. Monolithic high-level ops at the other end duplicate
 kernel work per model family and starve the rewriter of reusable structure.
 The mid-level choice keeps \system{}'s profitable rewrites local and
@@ -745,8 +735,9 @@ faster. F+L+B is forward, scalar loss, and backward without an optimizer
 update. Every cell passes the forward gate of Section~\ref{sec:method}, and
 every F+L+B cell except the marked one passes the backward gate.
 $\dagger$: invalid --- the Whisper backward comparison on the 780M fails
-the 5\% gradient gate, and Section~\ref{sec:apu} attributes the deviation
-to the reference; the ratio is shown for completeness only. Whisper's
+the 5\% gradient gate; Section~\ref{sec:apu} presents cross-device evidence
+implicating the reference path, but the ratio is shown for completeness only.
+Whisper's
 minimal shape equals its full shape, so its two forward columns coincide.
 The Intel rows compare the integrated GPU against PyTorch's CPU fallback
 and are reported as a support result, not an engine-efficiency result.}
@@ -793,17 +784,19 @@ while being the only functional GPU path on that device.
 Three cross-cutting observations. First, minimal-shape latency favors the
 static dispatch plan: \system{} is outright faster in 12 of the 20
 GPU-referenced one-token/minimal cells, most visibly on ROCm, where PyTorch's
-one-token SmolLM step takes 6.65\,ms against 1.93\,ms ($3.4\times$) --- at
-one token the step is launch-bound, and a precompiled dispatch sequence beats
-eager submission even with \code{torch.compile} active. The exceptions are
+one-token SmolLM step takes 6.65\,ms against 1.93\,ms ($3.4\times$). This
+small shape is especially sensitive to launch and synchronization structure,
+and the static dispatch sequence is faster despite \code{torch.compile}; the
+measurement does not separate host launch cost from small-kernel quality. The
+exceptions are
 compute-bound minimal shapes (Whisper's full-length encoder, batch-1
 ResNet-50 on the M3), where kernel quality decides instead. Second, the
 convolution workloads are the only ones that resist parity on the AMD
 devices: ResNet-50 training spans $1.60$--$2.41\times$ across the
 GPU-referenced machines, while every non-convolution AMD training cell sits
 at or below $1.22\times$ --- implicating convolution derivative coverage
-rather than any one backend, an attribution Section~\ref{sec:gaps} confirms
-with per-dispatch profiles.
+rather than a uniform graphics-API tax. Section~\ref{sec:gaps} directly
+confirms that kernel-family concentration for the largest NVIDIA gap.
 Third, the correctness margins are wide: across all 25 strict cells the
 worst forward relative L2 error is 0.0043\% against a 1\% gate, and across
 the 24 valid backward comparisons the worst per-parameter gradient-norm
@@ -941,7 +934,10 @@ compiler, autodiff, runtime, model builders, and shader sources in one
 executable. It dynamically links ordinary OS libraries and relies on the
 installed GPU driver, but has no Python, CUDA, or ROCm userspace dependency.
 The PyTorch closure was computed recursively from active Python package
-metadata rather than from the complete development virtual environment.
+metadata rather than from the complete development virtual environment:
+active \code{Requires-Dist} edges and requested extras were followed from
+\code{torch}, and each installed file was counted once. The packages-only
+row sums the \code{torch} and \code{triton} distributions.
 
 \begin{table}[t]
 \centering
@@ -984,8 +980,8 @@ experiment is one statically specialized binary per platform plus the
 system's installed graphics driver; no per-vendor package source, version
 pin, or compute runtime was involved on any of the machines. The Radeon
 780M APU makes the asymmetry sharpest; Section~\ref{sec:apu} reports its
-bring-up cost and the one correctness failure in the matrix, which the
-recorded gradients attribute to the vendor side.
+bring-up cost and the one workload responsible for both correctness failures
+in the matrix, whose cross-device gradients implicate the reference path.
 
 \subsection{Performance portability}
 \label{sec:portability}
@@ -1001,8 +997,8 @@ best \emph{valid} time either engine achieved there, so values are $\le 1$
 and PyTorch's CPU fallback on the Intel machine counts as its own result on
 that machine. $\dagger$: an invalid cell is not a result, so \system{}'s
 Whisper training entry scores zero under the metric's discipline --- even
-though Section~\ref{sec:apu} attributes the underlying disagreement to the
-reference. Accelerated-mode values are in the artifact; they shift the
+though Section~\ref{sec:apu} presents evidence implicating the reference
+path. Accelerated-mode values are in the artifact; they shift the
 column means by at most 0.05 and change no ordering.}
 \label{tab:portability}
 \end{table}
@@ -1014,17 +1010,18 @@ by harmonic mean over the frozen set, with zero for a machine on which an
 application produces no valid result. The metric's severity is visible in
 one cell: \system{}'s single invalid backward comparison zeroes its entire
 Whisper training score, cutting the training mean from 0.62 to 0.52 ---
-even though the underlying disagreement is attributed to the reference
+even though the cross-device evidence implicates the reference path
 (Section~\ref{sec:apu}). We apply the discipline to ourselves and report
 the zero. The remaining structure is symmetric in an informative way. For
 forward--loss--backward the incumbent is clearly more portable (mean 0.93
 versus 0.52): vendor training libraries are good wherever they run. For
 full-shape inference the two are close (0.81 versus 0.75). For
 minimal-shape latency the portable stack is the more performance-portable
-system (0.83 versus 0.73), because launch overhead varies wildly across
-vendor backends while a static dispatch plan does not.
+system (0.83 versus 0.73). The result is consistent with the static plan
+reducing sensitivity to backend launch and synchronization costs, although
+the end-to-end measurements also include kernel quality.
 
-\subsection{The newest vendor path: bring-up and a localized defect}
+\subsection{The newest vendor path: bring-up and a localized anomaly}
 \label{sec:apu}
 
 The Radeon 780M machine is a full member of the frozen matrix, and it is
@@ -1033,7 +1030,7 @@ class only recently, and standing the reference up required a current Linux
 firmware payload and a PyTorch wheel from the separate ROCm~7.14 channel,
 after which the runs still emit persistent rocSHMEM warnings. The portable
 stack ran unchanged against the installed Mesa driver. That freshness shows
-up in the one correctness failure of the entire matrix.
+up in the matrix's one recurring correctness anomaly.
 
 Whisper's forward pass on this machine validates at 0.0016\%, but its
 backward comparison fails the gate at 17.8\% per-parameter
@@ -1042,14 +1039,14 @@ artifacts localize the disagreement. \system{}'s per-parameter gradient
 norms on this machine are identical, at recorded precision, to its own
 norms on the RX~7900~XT, where they pass against that machine's ROCm
 reference at 0.035\%; PyTorch's norms meanwhile differ by 16.3\% between
-its own two ROCm machines. The deviation therefore entered on the newly
-enabled vendor path, and the independent forward/backward gates did exactly
-what they were designed to do: an accurate forward pass did not launder an
-incorrect backward one. We report the cell as invalid --- the protocol has
-no mechanism to bless our own result without a reference --- but the
-attribution stands on the recorded norms, and it is why the Whisper row in
-Table~\ref{tab:portability} scores a zero that we would contest with a
-third implementation rather than with rhetoric.
+its own two ROCm machines. This cross-device evidence strongly implicates the
+newly enabled reference path, and the independent forward/backward gates did
+exactly what they were designed to do: an accurate forward pass did not
+launder a backward disagreement. We report the cell as invalid --- the
+protocol has no mechanism to bless our own result without a reference ---
+and do not claim that these records alone prove which implementation is
+correct. A third implementation is needed to resolve the anomaly; until then,
+the Whisper row in Table~\ref{tab:portability} correctly scores a zero.
 
 The rest of the machine's column is unremarkable in the best way: the
 reference's per-process memory figure is recorded as absent per the
@@ -1162,8 +1159,9 @@ matrix, normalization, pointwise, and data movement together are under
 11\%. The weight-gradient ``small'' variant averaging over 1\,ms per
 dispatch marks the concrete occupancy target. This confirms, at dispatch
 granularity, that the worst gap in the matrix is a coverage-and-tuning
-property of two convolution derivative kernels rather than of any backend
---- TF32 cuDNN convolutions on the reference side then widen it.
+property of the current convolution-derivative implementations rather than a
+uniform graphics-API overhead --- TF32 cuDNN convolutions on the reference
+side then widen it.
 
 \paragraph{Attention backward owned the Metal gap --- and paid for the fix.}
 The M3 Whisper training profile predates the frozen revision deliberately:
@@ -1187,9 +1185,10 @@ from eliding them~\cite{malyshau2026barriers}. Those measurements predate
 Blade's newer global resource-access tracking, so we cite them as
 demonstrated headroom rather than as a gain this stack currently banks.
 Together with the frozen latency results
-(Section~\ref{sec:strict-results}), the picture is consistent: where launch and synchronization structure dominates,
-\system{}'s static plan already wins; where a single kernel family
-dominates, coverage decides. Cooperative-matrix promotion is the remaining
+(Section~\ref{sec:strict-results}), the picture is consistent: where launch
+and synchronization structure dominates, \system{}'s static plan already
+wins; where a single kernel family dominates, coverage decides.
+Cooperative-matrix promotion is the remaining
 policy gap: the accelerated contract helps only where hot matmuls promote
 (Whisper $1.8\times$ on NVIDIA, SmolLM $1.3\times$ on the APU), leaves
 NVIDIA ResNet-50 and SmolVLA unimproved, and regresses SmolVLA on both
@@ -1245,24 +1244,36 @@ TVM established graph/operator optimization and learned scheduling for
 heterogeneous targets~\cite{chen2018tvm}. Glow and MLIR demonstrate typed,
 multi-level compiler architectures and static planning
 \cite{rotem2018glow,lattner2021mlir}; Triton exposes a tile-level language for
-high-performance deep-learning kernels~\cite{tillet2019triton}. \system{} is
-narrower in framework breadth and execution substrate: it asks how far a
-compact native Vulkan/Metal stack can take a shared inference and backward
-path. TinyIREE makes compiled-artifact and runtime footprint a first-class
-result for embedded inference~\cite{liu2022tinyiree}; \system{} measures the
-same deployment concern for a graphics-API executable that also includes
-training.
+high-performance deep-learning kernels~\cite{tillet2019triton}. RAF generates
+and optimizes training graphs, including automatic differentiation and mixed
+precision, for vendor GPU systems~\cite{yu2023raf}. \system{} is narrower in
+framework breadth and execution substrate: it asks how far a compact native
+Vulkan/Metal stack can take a shared inference and backward path. TinyIREE
+makes compiled-artifact and runtime footprint a first-class result for
+embedded inference~\cite{liu2022tinyiree}; \system{} measures the same
+deployment concern for a graphics-API executable that also includes training.
 
-WebLLM demonstrates that WebGPU can retain a substantial fraction of native
-LLM inference performance~\cite{ruan2024webllm}. LlamaWeb is the closest
-recent broad graphics-API performance-portability study: it implements
-memory-efficient, multi-precision browser inference and evaluates 10 models
-on 16 devices from eight vendors~\cite{levine2026llamaweb}. A complementary
-WebGPU dispatch study separates API, framework, and shader overhead across
-Vulkan and Metal implementations~\cite{maczan2026dispatch}. \system{} instead
-studies native Vulkan/Metal, several model families, and automatically
-differentiated training as well as inference. We do not claim graphics-API
-inference itself as novel.
+Burn is a close open-source implementation analogue: it is a Rust
+training-and-inference framework whose composable automatic differentiation
+supports GPU backends including Vulkan, Metal, and WebGPU
+\cite{simard2026burn}. Its broader framework and backend design establish
+that portable Rust autodiff is not itself new. The distinction measured here
+is one frozen native graphics-stack path evaluated across devices with matched
+forward/backward gates, vendor references, compile and deployment costs, and
+physical application co-tenancy.
+
+TensorFlow.js demonstrated browser-resident training and inference through
+WebGL~\cite{smilkov2019tensorflowjs}; WebLLM shows that WebGPU can retain a
+substantial fraction of native LLM inference performance
+\cite{ruan2024webllm}. LlamaWeb is the closest recent broad graphics-API
+performance-portability study: it implements memory-efficient,
+multi-precision browser inference and evaluates 10 models on 16 devices from
+eight vendors~\cite{levine2026llamaweb}. A complementary WebGPU dispatch study
+separates API, framework, and shader overhead across Vulkan and Metal
+implementations~\cite{maczan2026dispatch}. \system{} instead studies native
+Vulkan/Metal, several model families, and automatically differentiated
+training as well as inference. We claim neither graphics-API machine learning
+nor portable automatic differentiation in isolation as novel.
 
 \paragraph{On-device deployment and training.}
 ExecuTorch is the closest production analogue to the deployment half of this
@@ -1362,23 +1373,24 @@ Can one portable GPU stack span training and deployment at useful
 performance? On the evidence of the frozen matrix, yes --- with measured,
 attributable exceptions. A typed graph, automatic differentiation,
 specialized kernels, static execution, checkpointing, and lifetime-based
-memory planning fit in 34 KLOC of Rust and 6 KLOC of WGSL, pass 48 of 50
-forward-and-backward correctness gates across five consumer devices, and
-deploy as a 13\,MiB binary that compiles workloads in seconds. Where kernel
+memory planning fit in 34.5 KLOC of Rust and 6.1 KLOC of WGSL; 48 of 50
+audited cells pass both forward and backward gates across five consumer
+devices. The stack deploys as a 13\,MiB binary that compiles workloads in
+seconds. Where kernel
 coverage matches a workload, the graphics-API path reaches a mature
 vendor-native reference: training and inference near-parity or wins on both
 AMD devices against compiled ROCm PyTorch, wins against compiled CUDA
 PyTorch on two strict inference cells, and the stronger Pennycook
 portability score for minimal-batch latency. On the machine where vendor
 support arrived newest, the roles inverted: the portable stack ran
-everything, and the only failed gates in the matrix are ones the recorded
-gradient norms attribute to the vendor reference. Where coverage runs out,
+everything, and cross-device gradient records strongly implicate the
+reference path in the matrix's only failed gates. Where coverage runs out,
 the gap is profiled, not guessed: convolution derivatives are 89\% of the
 worst step, Metal attention backward was 58\% of the second-worst before a
-profile-guided pass reduced it, and cooperative-matrix promotion without a
-cost model accounts for the rest of the $2$--$4.6\times$ training deficits
---- each an absent specialization rather than an identified API
-limitation.
+profile-guided pass reduced it, while cooperative-matrix coverage and
+selection explain several arithmetic-policy shifts. These are concrete
+specialization and policy targets; no API limitation is identified by the
+measurements.
 
 The shared stack does not eliminate systems work; it moves that work from
 several conversion/runtime boundaries into one inspectable compiler and
@@ -1395,21 +1407,22 @@ training and inference to become routine.
 
 Source code is available in the public \system{} and \inferena{}
 repositories.\footnote{\url{https://github.com/kvark/meganeura}}\footnote{
-\url{https://github.com/kvark/inferena}} Every table derives from the
-revision pair \system{} \code{7561a64} and \inferena{} \code{7ca9c5c7}
-(preserved as the \inferena{} tag \code{paper-arxiv-1}), recorded in each
-result file. The artifact includes the raw JSON for all 50 cells --- timing
+\url{https://github.com/kvark/inferena}} Every benchmark-matrix table and the
+ratio figure derive from the revision pair \system{} \code{7561a64} and
+\inferena{} \code{7ca9c5c7} (both preserved under the public tag
+\code{paper-arxiv-1}), recorded in each result file. The artifact includes the
+raw JSON for all 50 cells --- timing
 samples, correctness diagnostics, memory figures with basis labels, and
 environment metadata --- plus the per-dispatch profile sidecars of
 Section~\ref{sec:gaps} (which record their own revision), together with the
-script that regenerates every numeric table in this paper from those files.
+script that regenerates the benchmark-matrix tables and ratio figure from
+those files.
 The DinoVision case study (Section~\ref{sec:dinovision}) is its own frozen
 artifact: source at \url{https://github.com/kvark/dinovision}, weights and
 evidence records at \url{https://huggingface.co/mad-bot/dinovision}, with
 its evidence revisions documented there. The repository includes
-machine-readable citation metadata; the submitted artifact adds a versioned
-release and archival identifier without changing the source revisions used
-for the tables.
+machine-readable citation metadata, and both benchmark revisions have public
+frozen tags.
 
 \section*{Acknowledgments}
 
@@ -1424,7 +1437,7 @@ Generative AI tools were used for code review, benchmark-harness development,
 experimental debugging, and editorial assistance. The author designed the
 study, reviewed generated changes, executed the experiments, verified the
 reported claims and references, and accepts responsibility for the
-manuscript. This disclosure will be updated if the final workflow changes.
+manuscript.
 
 \bibliographystyle{plain}
 \bibliography{references}
