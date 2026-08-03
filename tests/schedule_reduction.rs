@@ -191,3 +191,24 @@ fn sum_inner_of_two_gathers_parity() {
         m,
     );
 }
+
+/// LayerNorm forward: the two-accumulator archetype (sum + sum-of-squares
+/// in one pass) must match the hand-written layer_norm.wgsl shader.
+#[test]
+fn layer_norm_archetype_parity() {
+    assert_parity(
+        |g| {
+            let x = g.input("x", &[5, 96]);
+            let w = g.input("w", &[96]);
+            let b = g.input("b", &[96]);
+            let y = g.layer_norm(x, w, b, 1e-5);
+            let x_data: Vec<f32> = (0..5 * 96)
+                .map(|i| ((i * 37 % 101) as f32) * 0.11 - 4.7)
+                .collect();
+            let w_data: Vec<f32> = (0..96).map(|i| 0.5 + ((i % 7) as f32) * 0.2).collect();
+            let b_data: Vec<f32> = (0..96).map(|i| ((i % 5) as f32) * 0.3 - 0.6).collect();
+            (y, vec![("x", x_data), ("w", w_data), ("b", b_data)], vec![])
+        },
+        5 * 96,
+    );
+}

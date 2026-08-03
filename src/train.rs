@@ -260,6 +260,29 @@ pub struct SessionConfig<'a> {
     /// debugging gradient flow through aggressively-fused ops. Training
     /// mode only.
     pub skip_full_optimize: bool,
+    /// Build a debug session: buffer aliasing off, every buffer
+    /// host-visible, so any node's value can be read after a step via
+    /// [`Session::read_node`] / [`Session::read_node_by_name`], and
+    /// [`Session::step_debug`] can attribute the first NaN/Inf to a graph
+    /// node. Costs memory and bandwidth; keep it off for benchmarking.
+    pub debug: bool,
+    /// Run [`Session::tune`] after construction: measure `step()` wall-clock
+    /// with each flippable kernel family on its cooperative variant vs its
+    /// scalar fallback and keep the faster one — replacing static promotion
+    /// heuristics with a measurement on this device. Adds a handful of
+    /// steps to build time. `MEGANEURA_TUNE=1`/`=0` overrides.
+    pub tune: bool,
+}
+
+impl SessionConfig<'_> {
+    /// A debug-session config: same compile pipeline, observable execution.
+    /// `build(&g, SessionConfig::debug())` is the "print any tensor" mode.
+    pub fn debug() -> Self {
+        Self {
+            debug: true,
+            ..Self::default()
+        }
+    }
 }
 
 /// Build a [`Session`] from a forward-pass graph.
@@ -275,7 +298,13 @@ pub struct SessionConfig<'a> {
 pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, OptimizeReport) {
     let _span = tracing::info_span!("build_session").entered();
     let mode = cfg.mode;
-    let options = cfg.options;
+    let mut options = cfg.options;
+    if cfg.debug {
+        // Dispatch-level fusion is numerics-neutral; disabling it in debug
+        // sessions keeps every graph node's value materialized for
+        // `read_node` without changing what the model computes.
+        options.fuse_dispatches = false;
+    }
     let cache_path = cfg.cache;
     let skip_full_optimize = cfg.skip_full_optimize;
     log::info!("building {:?} session", mode);
@@ -306,7 +335,7 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, Optimiz
         match cache::load_build_plan(forward_graph, build_hash, path) {
             Ok(Some(plan)) => {
                 log::info!("loaded cached execution plan from {}", path.display());
-                let session = make_session(plan, gpu);
+                let session = make_session(plan, gpu, cfg.debug);
                 return (session, OptimizeReport::empty());
             }
             Ok(None) => log::info!("no valid cache found, recompiling"),
@@ -377,15 +406,28 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, Optimiz
         }
     }
 
-    let session = {
+    let mut session = {
         let _span = tracing::info_span!("gpu_init").entered();
-        make_session(plan, gpu)
+        make_session(plan, gpu, cfg.debug)
     };
+    let tune = match std::env::var("MEGANEURA_TUNE").as_deref() {
+        Ok("0") => false,
+        Ok(_) => true,
+        Err(_) => cfg.tune,
+    };
+    if tune {
+        let _span = tracing::info_span!("tune").entered();
+        session.tune();
+    }
     (session, report)
 }
 
-fn make_session(plan: compile::ExecutionPlan, gpu: Arc<blade_graphics::Context>) -> Session {
-    Session::with_context(plan, gpu)
+fn make_session(
+    plan: compile::ExecutionPlan,
+    gpu: Arc<blade_graphics::Context>,
+    debug: bool,
+) -> Session {
+    Session::with_context_opts(plan, gpu, runtime::SessionOptions { debug })
 }
 
 /// Sugar for `build(g, SessionConfig::default()).0` — the common

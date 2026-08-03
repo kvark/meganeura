@@ -349,6 +349,8 @@ pub enum KernelTemplate {
     Reduction {
         op: ReduceOp,
         prologue: PointwiseDAG,
+        /// Extra accumulators (see [`ReductionKernel::extra_prologues`]).
+        extra_prologues: Vec<PointwiseDAG>,
         epilogue: Option<ReductionEpilogue>,
         /// Number of per-element input streams. Used to split the
         /// prologue/epilogue DAG input-index range into per-elem vs
@@ -395,6 +397,14 @@ pub struct ReductionEpilogue {
 pub struct ReductionKernel {
     pub op: ReduceOp,
     pub prologue: PointwiseDAG,
+    /// Additional accumulators: each extra prologue is reduced with the
+    /// same `op` over the same input streams, producing one more reduced
+    /// scalar. The epilogue sees reduced values at the tail of its input
+    /// range in order: `prologue`'s result first, then each extra.
+    /// LayerNorm needs `[sum(x), sum(x*x)]`; norm backwards need two
+    /// differently-weighted sums.
+    #[serde(default)]
+    pub extra_prologues: Vec<PointwiseDAG>,
     pub epilogue: Option<ReductionEpilogue>,
     pub n_per_elem: u8,
     pub n_per_row: u8,
@@ -425,6 +435,7 @@ impl ReductionKernel {
         KernelTemplate::Reduction {
             op: self.op,
             prologue: self.prologue.clone(),
+            extra_prologues: self.extra_prologues.clone(),
             epilogue: self.epilogue.clone(),
             n_per_elem: self.n_per_elem,
             n_per_row: self.n_per_row,
@@ -465,6 +476,7 @@ pub fn lower(t: &KernelTemplate) -> ShaderModule {
         KernelTemplate::Reduction {
             op,
             ref prologue,
+            ref extra_prologues,
             ref epilogue,
             n_per_elem,
             n_per_row,
@@ -473,6 +485,7 @@ pub fn lower(t: &KernelTemplate) -> ShaderModule {
         } => lower_reduction(
             op,
             prologue,
+            extra_prologues,
             epilogue.as_ref(),
             n_per_elem,
             n_per_row,
@@ -528,9 +541,11 @@ fn lower_pointwise(dag: &PointwiseDAG, grid: GridShape) -> ShaderModule {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_reduction(
     op: ReduceOp,
     prologue: &PointwiseDAG,
+    extra_prologues: &[PointwiseDAG],
     epilogue: Option<&ReductionEpilogue>,
     n_per_elem: u8,
     n_per_row: u8,
@@ -560,16 +575,28 @@ fn lower_reduction(
         (prologue.output as usize) < prologue.ops.len(),
         "reduction prologue output index is out of range"
     );
+    for (i, extra) in extra_prologues.iter().enumerate() {
+        assert_eq!(
+            extra.n_inputs, prologue.n_inputs,
+            "extra prologue {i} arity must match the primary prologue"
+        );
+        assert!(
+            (extra.output as usize) < extra.ops.len(),
+            "extra prologue {i} output index is out of range"
+        );
+    }
+    let n_reduced = 1 + extra_prologues.len();
     assert!(
         grid.workgroup_size.is_power_of_two() && grid.workgroup_size >= 2,
         "reduction workgroup_size must be a power of 2 ≥ 2"
     );
     if let Some(epi) = epilogue {
-        let expected = n_per_elem + n_per_row + epi.n_per_col_inputs + 1;
+        let expected =
+            n_per_elem as usize + n_per_row as usize + epi.n_per_col_inputs as usize + n_reduced;
         assert_eq!(
-            epi.dag.n_inputs, expected,
-            "reduction epilogue expects {} inputs ({} per-elem + {} per-row + {} per-col + 1 reduced), got {}",
-            expected, n_per_elem, n_per_row, epi.n_per_col_inputs, epi.dag.n_inputs,
+            epi.dag.n_inputs as usize, expected,
+            "reduction epilogue expects {} inputs ({} per-elem + {} per-row + {} per-col + {} reduced), got {}",
+            expected, n_per_elem, n_per_row, epi.n_per_col_inputs, n_reduced, epi.dag.n_inputs,
         );
         assert!(
             (epi.dag.output as usize) < epi.dag.ops.len(),
@@ -611,8 +638,8 @@ fn lower_reduction(
             if i < per_col_end {
                 format!("{}[{}]", per_col_names[i - per_row_end], col_var)
             } else {
-                // Reduced scalar — exactly one, at the final position.
-                "reduced_value".to_string()
+                // Reduced scalars occupy the tail positions in order.
+                format!("reduced_{}", i - per_col_end)
             }
         }
     };
@@ -637,7 +664,10 @@ fn lower_reduction(
     src.push_str("var<storage, read_write> dst: array<f32>;\n");
     src.push_str("var<uniform> params: Params;\n");
     let wg = grid.workgroup_size;
-    let _ = writeln!(src, "var<workgroup> wg_data: array<f32, {}>;\n", wg);
+    for k in 0..n_reduced {
+        let _ = writeln!(src, "var<workgroup> wg_data_{k}: array<f32, {wg}>;");
+    }
+    src.push('\n');
     let _ = writeln!(src, "@compute @workgroup_size({})", wg);
     let _ = writeln!(
         src,
@@ -648,46 +678,77 @@ fn lower_reduction(
     src.push_str("    let tid = lid.x;\n");
     src.push_str("    if row >= params.outer { return; }\n");
     src.push_str("    let row_offset = row * params.inner;\n");
-    let _ = writeln!(src, "    var acc: f32 = {};", op.identity_wgsl());
+    for k in 0..n_reduced {
+        let _ = writeln!(src, "    var acc_{k}: f32 = {};", op.identity_wgsl());
+    }
     src.push_str("    var col = tid;\n");
     src.push_str("    loop {\n");
     src.push_str("        if col >= params.inner { break; }\n");
-    // Prologue body: `col` is the per-element index variable.
-    let body = prologue.emit_body(|idx| load_expr(idx, "col", false));
-    // Indent each line of the prologue body by 4 extra spaces for the loop.
-    for line in body.lines() {
-        src.push_str("        ");
-        src.push_str(line.trim_start_matches(' '));
-        src.push('\n');
+    // Prologue bodies: `col` is the per-element index variable. Each
+    // accumulator's DAG is evaluated in its own block so the `let vN`
+    // value names don't collide.
+    for (k, dag) in std::iter::once(prologue)
+        .chain(extra_prologues.iter())
+        .enumerate()
+    {
+        src.push_str("        {\n");
+        let body = dag.emit_body(|idx| load_expr(idx, "col", false));
+        for line in body.lines() {
+            src.push_str("            ");
+            src.push_str(line.trim_start_matches(' '));
+            src.push('\n');
+        }
+        let _ = writeln!(
+            src,
+            "            {}",
+            op.combine_wgsl(&format!("acc_{k}"), &format!("v{}", dag.output))
+        );
+        src.push_str("        }\n");
     }
-    let _ = writeln!(
-        src,
-        "        {}",
-        op.combine_wgsl("acc", &format!("v{}", prologue.output))
-    );
     let _ = writeln!(src, "        col += {}u;", wg);
     src.push_str("    }\n");
-    src.push_str("    wg_data[tid] = acc;\n");
+    for k in 0..n_reduced {
+        let _ = writeln!(src, "    wg_data_{k}[tid] = acc_{k};");
+    }
     src.push_str("    workgroupBarrier();\n");
-    // Tree reduction.
+    // Tree reduction (all accumulators per stride step).
     let mut stride = wg / 2;
     src.push_str("    // tree reduction\n");
     while stride > 0 {
         let _ = writeln!(src, "    if tid < {}u {{", stride);
-        let combined = op.combine_wgsl("wg_data[tid]", &format!("wg_data[tid + {}u]", stride));
-        let _ = writeln!(src, "        {}", combined);
+        for k in 0..n_reduced {
+            let combined = op.combine_wgsl(
+                &format!("wg_data_{k}[tid]"),
+                &format!("wg_data_{k}[tid + {}u]", stride),
+            );
+            let _ = writeln!(src, "        {}", combined);
+        }
         src.push_str("    }\n");
         src.push_str("    workgroupBarrier();\n");
         stride /= 2;
     }
     match epilogue {
         None => {
-            src.push_str("    if tid == 0u { dst[row] = wg_data[0]; }\n");
+            // K reduced scalars per row, stored interleaved: dst[row*K + k].
+            src.push_str("    if tid == 0u {\n");
+            for k in 0..n_reduced {
+                if n_reduced == 1 {
+                    let _ = writeln!(src, "        dst[row] = wg_data_{k}[0];");
+                } else {
+                    let _ = writeln!(
+                        src,
+                        "        dst[row * {n_reduced}u + {k}u] = wg_data_{k}[0];"
+                    );
+                }
+            }
+            src.push_str("    }\n");
         }
         Some(epi) => {
-            // Reduce-then-map: broadcast the reduced value and write a
+            // Reduce-then-map: broadcast the reduced values and write a
             // transformed element back for every col.
-            src.push_str("    let reduced_value = wg_data[0];\n");
+            for k in 0..n_reduced {
+                let _ = writeln!(src, "    let reduced_{k} = wg_data_{k}[0];");
+            }
             src.push_str("    var wcol = tid;\n");
             src.push_str("    loop {\n");
             src.push_str("        if wcol >= params.inner { break; }\n");
@@ -1108,6 +1169,7 @@ mod tests {
         let sm = lower(&KernelTemplate::Reduction {
             op: ReduceOp::Sum,
             prologue: identity_prologue(),
+            extra_prologues: vec![],
             epilogue: None,
             n_per_elem: 1,
             n_per_row: 0,
@@ -1116,12 +1178,12 @@ mod tests {
         });
         assert!(sm.source.contains("struct Params"));
         assert!(sm.source.contains("outer: u32"));
-        assert!(sm.source.contains("var<workgroup> wg_data"));
+        assert!(sm.source.contains("var<workgroup> wg_data_0"));
         assert!(sm.source.contains("workgroupBarrier"));
         // Identity for sum is 0.
-        assert!(sm.source.contains("var acc: f32 = 0.0f"));
+        assert!(sm.source.contains("var acc_0: f32 = 0.0f"));
         // Dst writes one scalar per row.
-        assert!(sm.source.contains("dst[row] = wg_data[0]"));
+        assert!(sm.source.contains("dst[row] = wg_data_0[0]"));
     }
 
     #[test]
@@ -1129,6 +1191,7 @@ mod tests {
         let sm = lower(&KernelTemplate::Reduction {
             op: ReduceOp::Max,
             prologue: identity_prologue(),
+            extra_prologues: vec![],
             epilogue: None,
             n_per_elem: 1,
             n_per_row: 0,
@@ -1138,7 +1201,7 @@ mod tests {
         // Max identity is -inf via bitcast.
         assert!(sm.source.contains("0xff800000u"));
         // Combiner uses max().
-        assert!(sm.source.contains("max(acc,"));
+        assert!(sm.source.contains("max(acc_0,"));
     }
 
     #[test]
@@ -1147,6 +1210,7 @@ mod tests {
         let sm = lower(&KernelTemplate::Reduction {
             op: ReduceOp::Sum,
             prologue: square_prologue(),
+            extra_prologues: vec![],
             epilogue: None,
             n_per_elem: 1,
             n_per_row: 0,
@@ -1172,6 +1236,7 @@ mod tests {
         let sm = lower(&KernelTemplate::Reduction {
             op: ReduceOp::Sum,
             prologue,
+            extra_prologues: vec![],
             epilogue: None,
             n_per_elem: 2,
             n_per_row: 0,
@@ -1206,6 +1271,7 @@ mod tests {
         let sm = lower(&KernelTemplate::Reduction {
             op: ReduceOp::Sum,
             prologue,
+            extra_prologues: vec![],
             epilogue: None,
             n_per_elem: 2,
             n_per_row: 0,
@@ -1236,6 +1302,7 @@ mod tests {
             let sm = lower(&KernelTemplate::Reduction {
                 op,
                 prologue,
+                extra_prologues: vec![],
                 epilogue: None,
                 n_per_elem: 1,
                 n_per_row: 0,
@@ -1285,6 +1352,7 @@ mod tests {
         let sm = lower(&KernelTemplate::Reduction {
             op: ReduceOp::Sum,
             prologue: square_prologue(),
+            extra_prologues: vec![],
             epilogue: Some(rmsnorm_epilogue(720.0, 1e-5)),
             n_per_elem: 1,
             n_per_row: 0,
@@ -1296,7 +1364,7 @@ mod tests {
         // Per-element writeback instead of per-row.
         assert!(sm.source.contains("dst[row_offset + wcol]"));
         // Reduced value is read into a local.
-        assert!(sm.source.contains("let reduced_value = wg_data[0];"));
+        assert!(sm.source.contains("let reduced_0 = wg_data_0[0];"));
         // Per-col load uses wcol.
         assert!(sm.source.contains("bias[wcol]"));
         // Rsqrt appears in generated epilogue.
@@ -1341,6 +1409,7 @@ mod tests {
         let sm = lower(&KernelTemplate::Reduction {
             op: ReduceOp::Sum,
             prologue,
+            extra_prologues: vec![],
             epilogue: Some(ReductionEpilogue {
                 dag: epi_dag,
                 n_per_col_inputs: 0,
@@ -1376,6 +1445,7 @@ mod tests {
         let sm = lower(&KernelTemplate::Reduction {
             op: ReduceOp::Sum,
             prologue: square_prologue(),
+            extra_prologues: vec![],
             epilogue: Some(rmsnorm_epilogue(720.0, 1e-5)),
             n_per_elem: 1,
             n_per_row: 0,
@@ -1404,6 +1474,7 @@ mod tests {
         lower(&KernelTemplate::Reduction {
             op: ReduceOp::Sum,
             prologue: square_prologue(),
+            extra_prologues: vec![],
             epilogue: Some(bad),
             n_per_elem: 1,
             n_per_row: 0,
@@ -1418,6 +1489,7 @@ mod tests {
         lower(&KernelTemplate::Reduction {
             op: ReduceOp::Sum,
             prologue: identity_prologue(),
+            extra_prologues: vec![],
             epilogue: None,
             n_per_elem: 1,
             n_per_row: 0,

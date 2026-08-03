@@ -311,23 +311,6 @@ fn main() {
             dump,
             gpu_ref,
         );
-
-        // Coop variant — only valid on cooperative_matrix-capable GPUs.
-        let coop_config = meganeura::codegen::CoopConfig {
-            tile_size: 16,
-            use_f16_input: true,
-        };
-        let sm_coop_3x3 = meganeura::codegen::generate_coop_module(
-            ShaderGroup::Conv2dGradInputGemmCoop3x3,
-            &coop_config,
-        );
-        analyze(
-            "conv2d_grad_input_gemm_coop_3x3",
-            &sm_coop_3x3,
-            &ShaderEntry::Conv2dGradInputGemmCoop3x3,
-            dump,
-            gpu_ref,
-        );
     }
 
     // 7. Attention
@@ -346,7 +329,10 @@ fn main() {
     // 8. Flash Attention
     println!("\nFlash Attention:");
     {
-        let sm = meganeura::codegen::generate_flash_attention_module(64);
+        let sm = meganeura::codegen::generate_flash_attention_module(
+            64,
+            meganeura::codegen::flash_ept_cap(),
+        );
         analyze(
             "flash_attention_hd64",
             &sm,
@@ -355,7 +341,10 @@ fn main() {
             gpu_ref,
         );
 
-        let sm_gq = meganeura::codegen::generate_flash_grad_q_module(64);
+        let sm_gq = meganeura::codegen::generate_flash_grad_q_module(
+            64,
+            meganeura::codegen::flash_grad_q_ept_cap(),
+        );
         analyze(
             "flash_grad_q_hd64",
             &sm_gq,
@@ -364,7 +353,10 @@ fn main() {
             gpu_ref,
         );
 
-        let sm_gkv = meganeura::codegen::generate_flash_grad_kv_module(64);
+        let sm_gkv = meganeura::codegen::generate_flash_grad_kv_module(
+            64,
+            meganeura::codegen::flash_grad_kv_ept_cap(),
+        );
         analyze(
             "flash_grad_kv_hd64",
             &sm_gkv,
@@ -479,14 +471,6 @@ fn main() {
             "fused_matmul_bt_add",
             &sm_bt,
             &ShaderEntry::FusedMatMulBTAdd,
-            dump,
-            gpu_ref,
-        );
-        let sm_rms = meganeura::codegen::generate_module(ShaderGroup::FusedRmsNormMatMul);
-        analyze(
-            "fused_rms_norm_matmul",
-            &sm_rms,
-            &ShaderEntry::FusedRmsNormMatMul,
             dump,
             gpu_ref,
         );

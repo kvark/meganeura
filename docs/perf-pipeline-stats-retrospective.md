@@ -49,9 +49,10 @@ runtime on `gpu.capabilities().cooperative_matrix.f16_tile == 16`
   conv backward). GPU profile showed -44% per dispatch; wall-clock
   showed +0.3 ms regression on ResNet — suspected CPU dispatch
   overhead from 14× more workgroups. The pre-existing legacy
-  `Conv2dGradInputGemmCoop3x3` (opt-in via `MEGANEURA_CONV_COOP=1`)
-  still wires through, in case the wall-clock story changes on a
-  different driver.
+  `Conv2dGradInputGemmCoop3x3` lingered as a dead variant (its
+  `MEGANEURA_CONV_COOP=1` opt-in lost its reader long ago) and has
+  since been deleted; `generate_conv2d_coop_module` bakes 3×3
+  constants into the generated kernel, which supersedes it.
 * **Split `FlashGradK` / `FlashGradV` kernels.** Hypothesis: avoid
   the dKV kernel's register pressure by splitting work. Measured
   ~5 % regression because each kernel re-reads the same Q/dO/L tiles.
@@ -66,9 +67,9 @@ runtime on `gpu.capabilities().cooperative_matrix.f16_tile == 16`
   AMD RDNA3 in theory has VK_KHR_cooperative_matrix but we haven't
   validated tile sizes 16x16x16; the gate (`f16_tile == 16`) will
   silently fall back to scalar if the driver reports a different tile.
-* **`Conv2dGradInputGemmCoop3x3`** is hand-written WGSL with a 16x16
-  tile baked in. It works on Blackwell and Ada; it has not been
-  exercised on RDNA3 / Apple. Default-off (`MEGANEURA_CONV_COOP=1`).
+* **`Conv2dGradInputGemmCoop3x3`** (hand-written, 16x16 tile baked in)
+  has been deleted; the generated per-(kernel, stride) conv coop
+  kernels cover its role on every tile size.
 
 ## Non-trivial lessons that survived
 

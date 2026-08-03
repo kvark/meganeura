@@ -109,12 +109,18 @@ supports. Accumulator tiles are staged through workgroup memory before
 guarded scalar lanes evaluate the DAG. A 1024×16 by 16×128 GPU
 regression test verifies both cooperative selection and output parity.
 
-**Remaining plan.** Make session build produce, per dispatch, an atomic
-`(pipeline key, geometry, buffer padding requirement)` in one pass
-that has access to GPU caps. `Pipelines::get` becomes a pure map
-lookup with no fallback hierarchy. Extend cooperative epilogues beyond
-the current unary/no-extra-binding subset only when an active graph
-and profile justify each form.
+*Also landed:* runtime variant decisions have a single owner —
+`runtime::select_variants` performs cooperative promotion (including
+generated conv kernels and buffer padding), the RmsNorm→matmul
+prologue fusion, and small-tile demotion in one pass, records a
+`scalar_fallback` per promoted dispatch, and the flash EPT knobs
+travel as plan data (`TuningKnobs`) instead of ambient globals — the
+generated WGSL and dispatch geometry can no longer disagree.
+
+**Remaining plan.** `Pipelines::get` becomes a pure map lookup with no
+fallback hierarchy. Extend cooperative epilogues beyond the current
+unary/no-extra-binding subset only when an active graph and profile
+justify each form.
 
 **Touchpoints.** `runtime.rs` (variant selection pass, `Pipelines`),
 `codegen.rs` (coop store epilogue emission).
@@ -367,6 +373,17 @@ updated with the new data.
 ---
 
 ## Track F — Session-build autotuning (in-memory only)
+
+*First cut landed:* `Session::tune` (opt-in via
+`SessionConfig { tune: true }` / `MEGANEURA_TUNE=1`) measures real
+`step()` wall-clock per flippable kernel family — plain coop matmuls
+and generated coop conv kernels vs their recorded scalar fallbacks —
+and keeps the faster variant. Both variants' pipelines are compiled up
+front, so flips need no recompilation. Default-off until the bench
+fleet validates it on coop-capable adapters. *Still open:* knobs that
+require recompilation (EPT caps, tile sizes — now plumbed as
+`TuningKnobs` plan data, so a search over them is a plan-rebuild loop),
+and the workgroup-size sweep for generated kernels.
 
 **Problem.** Tile sizes (64/32), `flash_ept_cap` (32), coop workgroup
 thresholds (16/32), GEMV switchover — all fixed heuristics, tuned

@@ -18,6 +18,7 @@ pub enum DType {
 }
 
 impl DType {
+    #[track_caller]
     pub fn size_bytes(self) -> usize {
         match self {
             DType::F32 => 4,
@@ -301,12 +302,6 @@ pub enum Op {
         is_cross: bool,
     },
 
-    // Fused RmsNorm + MatMul: C = RmsNorm(X, W_norm) × W_proj
-    // inputs: [x, w_norm, w_proj], output: [M, N] where x=[M,K], w_proj=[K,N]
-    FusedRmsNormMatMul {
-        eps: f32,
-    },
-
     // Exact RmsNorm backward: grad_w[j] = sum_i(dy[i,j] * x[i,j] * rsqrt_i)
     // inputs: [dy, x, w] → [cols]
     RmsNormGradW {
@@ -566,6 +561,12 @@ pub struct Node {
     /// f16-input cooperative matrices.
     #[serde(default)]
     pub requires_full_precision: bool,
+    /// Optional human-readable name (e.g. `"blk7.mlp.gate"`). Carried through
+    /// autodiff, rewrites, and compilation so dispatch labels, profiler rows,
+    /// plan dumps, and debug readback can address values by name instead of
+    /// bare node ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// How a derived parameter is computed from its source(s).
@@ -624,6 +625,7 @@ impl Graph {
     /// Rebuild the graph with nodes in topological order, removing Nop nodes.
     /// Returns a new graph with consecutive IDs where every node's inputs
     /// have lower IDs than the node itself.
+    #[track_caller]
     pub fn toposort(&self) -> Graph {
         // Build adjacency: for each node, which nodes depend on it
         let n = self.nodes.len();
@@ -695,12 +697,13 @@ impl Graph {
                 .iter()
                 .filter_map(|&inp| old_to_new[inp as usize])
                 .collect();
-            new_graph.add_raw_node_with_precision(
+            let new_id = new_graph.add_raw_node_with_precision(
                 op,
                 new_inputs,
                 node.ty.clone(),
                 node.requires_full_precision,
             );
+            new_graph.nodes[new_id as usize].name = node.name.clone();
         }
 
         // Remap outputs. An output being Nop'd would silently drop it and
@@ -787,8 +790,36 @@ impl Graph {
             inputs,
             ty,
             requires_full_precision,
+            name: None,
         });
         id
+    }
+
+    /// Attach a human-readable name to a node. Names survive autodiff,
+    /// rewrites, and toposort, and surface in dispatch labels, profiler rows,
+    /// plan dumps, and `Session::read_node`. Returns the id so naming can
+    /// wrap a binding: `let h = g.matmul(x, w); let h = g.named(h, "blk0.qkv");`
+    pub fn named(&mut self, id: NodeId, name: impl Into<String>) -> NodeId {
+        self.nodes[id as usize].name = Some(name.into());
+        id
+    }
+
+    /// The node's name, if one was attached via [`Graph::named`].
+    pub fn node_name(&self, id: NodeId) -> Option<&str> {
+        self.nodes[id as usize].name.as_deref()
+    }
+
+    /// Field-complete copy. Prefer this over hand-rolled node-by-node
+    /// reconstruction, which silently drops any `Node` field it doesn't
+    /// know about (that bug has happened with `name`).
+    pub fn deep_clone(&self) -> Graph {
+        Graph {
+            nodes: self.nodes.clone(),
+            outputs: self.outputs.clone(),
+            new_nodes_require_full_precision: self.new_nodes_require_full_precision,
+            num_param_grad_outputs: self.num_param_grad_outputs,
+            derived_params: self.derived_params.clone(),
+        }
     }
 
     /// Mark subsequently appended nodes as numerically sensitive derivative
@@ -872,6 +903,7 @@ impl Graph {
         )
     }
 
+    #[track_caller]
     pub fn constant(&mut self, data: Vec<f32>, shape: &[usize]) -> NodeId {
         assert_eq!(data.len(), shape.iter().product::<usize>());
         let ty = TensorType::f32(shape.to_vec());
@@ -884,6 +916,7 @@ impl Graph {
 
     // --- Binary ops ---
 
+    #[track_caller]
     pub fn matmul(&mut self, a: NodeId, b: NodeId) -> NodeId {
         let a_shape = &self.node(a).ty.shape;
         let b_shape = &self.node(b).ty.shape;
@@ -895,6 +928,7 @@ impl Graph {
     }
 
     /// C = A^T @ B  (A is [K, M], B is [K, N], C is [M, N])
+    #[track_caller]
     pub fn matmul_at(&mut self, a: NodeId, b: NodeId) -> NodeId {
         let a_shape = &self.node(a).ty.shape;
         let b_shape = &self.node(b).ty.shape;
@@ -906,6 +940,7 @@ impl Graph {
     }
 
     /// C = A @ B^T  (A is [M, K], B is [N, K], C is [M, N])
+    #[track_caller]
     pub fn matmul_bt(&mut self, a: NodeId, b: NodeId) -> NodeId {
         let a_shape = &self.node(a).ty.shape;
         let b_shape = &self.node(b).ty.shape;
@@ -916,6 +951,7 @@ impl Graph {
         self.add_node(Op::MatMulBT, vec![a, b], ty)
     }
 
+    #[track_caller]
     pub fn add(&mut self, a: NodeId, b: NodeId) -> NodeId {
         let a_ty = &self.node(a).ty;
         let b_ty = &self.node(b).ty;
@@ -924,6 +960,7 @@ impl Graph {
         self.add_node(Op::Add, vec![a, b], ty)
     }
 
+    #[track_caller]
     pub fn bias_add(&mut self, a: NodeId, bias: NodeId) -> NodeId {
         let a_shape = &self.node(a).ty.shape;
         let b_shape = &self.node(bias).ty.shape;
@@ -937,6 +974,7 @@ impl Graph {
     /// Broadcast-add a `[1, N]` tensor across a `[M, N]` tensor.
     ///
     /// Uses the BiasAdd shader which does `dst[i] = a[i] + b[i % N]`.
+    #[track_caller]
     pub fn broadcast_add(&mut self, a: NodeId, b: NodeId) -> NodeId {
         let a_shape = &self.node(a).ty.shape;
         let b_shape = &self.node(b).ty.shape;
@@ -954,6 +992,7 @@ impl Graph {
         self.add_node(Op::BiasAdd, vec![a, b], ty)
     }
 
+    #[track_caller]
     pub fn mul(&mut self, a: NodeId, b: NodeId) -> NodeId {
         let a_ty = &self.node(a).ty;
         let b_ty = &self.node(b).ty;
@@ -962,6 +1001,7 @@ impl Graph {
         self.add_node(Op::Mul, vec![a, b], ty)
     }
 
+    #[track_caller]
     pub fn greater(&mut self, a: NodeId, b: NodeId) -> NodeId {
         let a_ty = &self.node(a).ty;
         let b_ty = &self.node(b).ty;
@@ -1012,6 +1052,7 @@ impl Graph {
     /// Implemented as `x + 0` with the target shape. The e-graph optimizer
     /// or a future pass could eliminate this, but it's cheap (one element-wise
     /// add of zeros).
+    #[track_caller]
     pub fn reshape(&mut self, x: NodeId, new_shape: &[usize]) -> NodeId {
         let old_elems = self.node(x).ty.num_elements();
         let new_elems: usize = new_shape.iter().product();
@@ -1056,6 +1097,7 @@ impl Graph {
         self.mean_all(a)
     }
 
+    #[track_caller]
     pub fn transpose(&mut self, x: NodeId) -> NodeId {
         let x_shape = &self.node(x).ty.shape;
         assert_eq!(x_shape.len(), 2, "transpose requires 2D tensor");
@@ -1078,6 +1120,7 @@ impl Graph {
     /// Row-wise sum over the inner axis: `x: [M, N] → [M, 1]`. Equivalent
     /// to `matmul(x, ones[N, 1])` but lowers to a fused-able reduction
     /// kernel.
+    #[track_caller]
     pub fn sum_inner(&mut self, x: NodeId) -> NodeId {
         let shape = &self.node(x).ty.shape;
         assert_eq!(
@@ -1115,6 +1158,7 @@ impl Graph {
 
     /// SwiGLU on concatenated input: input[M, 2*N] → output[M, N].
     /// Reads gate from first half, up from second half.
+    #[track_caller]
     pub fn swiglu_concat(&mut self, input: NodeId) -> NodeId {
         let in_shape = &self.node(input).ty.shape;
         assert_eq!(in_shape.len(), 2);
@@ -1141,6 +1185,7 @@ impl Graph {
         self.add_raw_node(Op::SiluGrad, vec![grad_out, x], ty)
     }
 
+    #[track_caller]
     pub fn rms_norm(&mut self, x: NodeId, weight: NodeId, eps: f32) -> NodeId {
         let x_shape = &self.node(x).ty.shape;
         let w_shape = &self.node(weight).ty.shape;
@@ -1185,6 +1230,7 @@ impl Graph {
         )
     }
 
+    #[track_caller]
     pub fn embedding(&mut self, indices: NodeId, table: NodeId) -> NodeId {
         let idx_shape = &self.node(indices).ty.shape;
         let tbl_shape = &self.node(table).ty.shape;
@@ -1217,6 +1263,7 @@ impl Graph {
     /// read per gathered element). Backward scatter-adds f32 gradients
     /// into the table's grad (so it composes with `to_f16` → the f32
     /// parameter).
+    #[track_caller]
     pub fn embedding_f16(&mut self, indices: NodeId, table: NodeId) -> NodeId {
         let idx_shape = &self.node(indices).ty.shape;
         let tbl = self.node(table);
@@ -1239,6 +1286,7 @@ impl Graph {
     }
 
     /// Scatter-add: accumulate `src[i]` rows into `output[indices[i]]`.
+    #[track_caller]
     pub fn scatter_add(&mut self, indices: NodeId, src: NodeId, vocab_size: usize) -> NodeId {
         let src_shape = &self.node(src).ty.shape;
         assert_eq!(src_shape.len(), 2);
@@ -1270,6 +1318,7 @@ impl Graph {
         )
     }
 
+    #[track_caller]
     pub fn rope_with_offset(
         &mut self,
         x: NodeId,
@@ -1297,6 +1346,7 @@ impl Graph {
 
     /// RoPE with a dynamic position offset read from an input buffer.
     /// The position for each row is `row_index + offset_buf[0]`.
+    #[track_caller]
     pub fn rope_dynamic_offset(
         &mut self,
         x: NodeId,
@@ -1322,6 +1372,7 @@ impl Graph {
         )
     }
 
+    #[track_caller]
     pub fn causal_attention(
         &mut self,
         q: NodeId,
@@ -1372,6 +1423,7 @@ impl Graph {
     /// Same as `causal_attention` but each position only attends to the
     /// last `window_size` positions (inclusive).
     #[allow(clippy::too_many_arguments)]
+    #[track_caller]
     pub fn sliding_window_attention(
         &mut self,
         q: NodeId,
@@ -1882,6 +1934,7 @@ impl Graph {
 
     /// Write `new_kv` [1, dim] into row `kv_pos` of `cache` [max_seq, dim].
     /// Returns a node representing the updated cache buffer.
+    #[track_caller]
     pub fn cache_write(&mut self, new_kv: NodeId, cache: NodeId, kv_pos: NodeId) -> NodeId {
         let nk_shape = &self.node(new_kv).ty.shape;
         let c_shape = &self.node(cache).ty.shape;
@@ -1896,6 +1949,7 @@ impl Graph {
     /// Cached attention: Q attends to K/V cache.
     /// q: [1, num_heads*head_dim], k_cache/v_cache: [max_seq, kv_dim],
     /// kv_pos: u32 scalar (number of valid positions in cache).
+    #[track_caller]
     pub fn cached_attention(
         &mut self,
         q: NodeId,
@@ -1933,6 +1987,7 @@ impl Graph {
         self.add_node(Op::Gelu, vec![x], ty)
     }
 
+    #[track_caller]
     pub fn layer_norm(&mut self, x: NodeId, weight: NodeId, bias: NodeId, eps: f32) -> NodeId {
         let x_shape = &self.node(x).ty.shape;
         let w_shape = &self.node(weight).ty.shape;
@@ -1952,6 +2007,7 @@ impl Graph {
         self.add_node(Op::LayerNorm { eps }, vec![x, weight, bias], ty)
     }
 
+    #[track_caller]
     pub fn full_attention(
         &mut self,
         q: NodeId,
@@ -1997,6 +2053,7 @@ impl Graph {
         )
     }
 
+    #[track_caller]
     pub fn cross_attention(
         &mut self,
         q: NodeId,
@@ -2045,6 +2102,7 @@ impl Graph {
     /// Differentiable multi-head attention with LSE output for backward.
     /// Handles both self-attention (q_seq == kv_seq, is_cross=false) and
     /// cross-attention (q_seq != kv_seq, is_cross=true).
+    #[track_caller]
     pub fn multi_head_attn(
         &mut self,
         q: NodeId,
@@ -2093,6 +2151,7 @@ impl Graph {
 
     // --- Loss ---
 
+    #[track_caller]
     pub fn cross_entropy_loss(&mut self, logits: NodeId, labels: NodeId) -> NodeId {
         let l_shape = &self.node(logits).ty.shape;
         let t_shape = &self.node(labels).ty.shape;
@@ -2107,6 +2166,7 @@ impl Graph {
     ///
     /// `pred` should be in (0, 1) (e.g. after sigmoid).
     /// Both `pred` and `labels` must have the same shape; output is scalar `[1]`.
+    #[track_caller]
     pub fn bce_loss(&mut self, pred: NodeId, labels: NodeId) -> NodeId {
         let p_shape = &self.node(pred).ty.shape;
         let l_shape = &self.node(labels).ty.shape;
@@ -2121,7 +2181,10 @@ impl Graph {
 impl fmt::Display for Graph {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for node in &self.nodes {
-            write!(f, "%{} = {:?}(", node.id, node.op)?;
+            match node.name {
+                Some(ref name) => write!(f, "%{} \"{}\" = {:?}(", node.id, name, node.op)?,
+                None => write!(f, "%{} = {:?}(", node.id, node.op)?,
+            }
             for (i, input) in node.inputs.iter().enumerate() {
                 if i > 0 {
                     write!(f, ", ")?;

@@ -143,8 +143,8 @@ fn diagnose(plan: &ExecutionPlan) -> Vec<Finding> {
             }
         }
 
-        // Pattern 2: MatMul consumes an RmsNorm output — could in
-        // principle be FusedRmsNormMatMul if not already.
+        // Pattern 2: MatMul consumes an RmsNorm output — a candidate for
+        // the RmsNormRsqrt + prologue fusion if not already applied.
         if matches!(
             d.shader,
             ShaderEntry::MatMul | ShaderEntry::MatMulBT | ShaderEntry::MatMulAT

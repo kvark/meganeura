@@ -1738,20 +1738,7 @@ pub fn apply_winograd_conv_fusions(graph: &mut Graph, fusions: &mut Vec<(String,
 }
 
 fn clone_graph(graph: &Graph) -> Graph {
-    let mut new_graph = Graph::new();
-    for node in graph.nodes() {
-        new_graph.add_raw_node_with_precision(
-            node.op.clone(),
-            node.inputs.clone(),
-            node.ty.clone(),
-            node.requires_full_precision,
-        );
-    }
-    let num_user = graph.num_user_outputs();
-    new_graph.set_outputs(graph.outputs()[..num_user].to_vec());
-    new_graph.append_param_grad_outputs(&graph.outputs()[num_user..]);
-    new_graph.derived_params = graph.derived_params.clone();
-    new_graph
+    graph.deep_clone()
 }
 
 #[cfg(test)]

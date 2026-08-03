@@ -130,7 +130,29 @@ scalar path for regression diagnosis; `MEGANEURA_FLASH_FWD_COOP=0` and
 `MEGANEURA_FLASH_BWD_COOP=0` disable only cooperative flash attention.
 Device-local intermediate storage and lifetime aliasing are default-on, with
 `MEGANEURA_NO_DEVICE_LOCAL=1` and `MEGANEURA_NO_ALIAS=1` as diagnostic escape
-hatches.
+hatches. `MEGANEURA_TUNE=1` (or `SessionConfig { tune: true }`) measures each
+flippable kernel family both ways on real `step()` wall-clock at session
+build and keeps the faster variant on this device.
+
+## Debugging
+
+Three levels, cheapest first:
+
+- **Provenance everywhere.** Name values while building
+  (`let h = g.matmul(x, w); let h = g.named(h, "blk3.qkv");` — `nn` layers
+  name their outputs automatically) and the name follows the value through
+  autodiff, rewrites, and fusion into dispatch labels, profiler rows,
+  `MEGANEURA_DUMP_PLAN`, and NaN reports. Shape panics report the
+  model-builder line that created the bad node.
+- **Debug sessions.** `build(&g, SessionConfig::debug())` disables buffer
+  aliasing and keeps everything host-visible: `session.read_node_by_name("blk3.qkv")`
+  returns any value after a step, and `session.step_debug()` attributes the
+  first NaN/Inf to a named dispatch. Fused-away or aliased values return a
+  structured error instead of garbage.
+- **Eager evaluation.** `meganeura::eager::Eager` runs the graph you are
+  *still building*, one `eval(&g, node)` at a time, on the same kernels the
+  compiled path uses — the PyTorch-style inspect-as-you-go loop. The same
+  graph then compiles unchanged via `build_session` for training speed.
 
 Hosted CI executes Linux Vulkan (Lavapipe) and macOS Metal tests and compile-checks
 Windows. Generated Vulkan shaders, including the f16 cooperative-matrix path used

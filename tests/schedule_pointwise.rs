@@ -392,3 +392,11 @@ fn chain_add_relu_parity() {
         g.relu(s)
     });
 }
+
+#[test]
+fn gelu_parity() {
+    // Gelu was the last unary op without a DAG mapping; this pins the
+    // generated tanh-approx DAG against unary.wgsl's `gelu` entry point.
+    let input: Vec<f32> = (0..256).map(|i| (i as f32) * 0.05 - 6.0).collect();
+    assert_parity(&["x"], &[&input], 256, |g, xs| g.gelu(xs[0]));
+}

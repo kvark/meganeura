@@ -8,7 +8,7 @@ use std::{io, path::Path};
 
 /// Increment whenever the serialized execution plan or build pipeline changes
 /// in a way that can make an older plan unsafe to reuse.
-const CACHE_FORMAT_VERSION: u32 = 2;
+const CACHE_FORMAT_VERSION: u32 = 3;
 
 /// Cached execution plan with a graph fingerprint for invalidation.
 #[derive(Serialize, Deserialize)]
@@ -127,9 +127,6 @@ pub(crate) fn hash_build_config(
         coop_caps: CoopCaps,
         flash_forward_coop: bool,
         flash_backward_coop: bool,
-        flash_ept_cap: u32,
-        flash_grad_q_ept_cap: u32,
-        flash_grad_kv_ept_cap: u32,
     }
 
     let fingerprint = BuildFingerprint {
@@ -140,9 +137,7 @@ pub(crate) fn hash_build_config(
         coop_caps,
         flash_forward_coop: std::env::var("MEGANEURA_FLASH_FWD_COOP").as_deref() != Ok("0"),
         flash_backward_coop: std::env::var("MEGANEURA_FLASH_BWD_COOP").as_deref() == Ok("1"),
-        flash_ept_cap: crate::codegen::flash_ept_cap(),
-        flash_grad_q_ept_cap: crate::codegen::flash_grad_q_ept_cap(),
-        flash_grad_kv_ept_cap: crate::codegen::flash_grad_kv_ept_cap(),
+        // The flash EPT caps now live in `options.knobs`, hashed above.
     };
     hash_serializable(&fingerprint)
 }

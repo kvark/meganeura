@@ -4,15 +4,17 @@ Instead of carrying hundreds of hand-written GPU shaders, meganeura generates sp
 
 ## Pointwise
 
-Arbitrary elementwise DAGs (`PointwiseDAG`) fused into a single dispatch. The e-graph optimizer chains ops like `relu -> neg -> silu` and collapses them automatically. Replaces what would otherwise be `unary.wgsl`, `binary.wgsl`, and dozens of one-off elementwise shaders.
+Arbitrary elementwise DAGs (`PointwiseDAG`) fused into a single dispatch. The e-graph optimizer chains ops like `relu -> neg -> silu` and collapses them automatically. Covers every unary op (including the tanh-approx Gelu) and the binary arithmetic set; `unary.wgsl` / `binary.wgsl` remain only as the `use_schedule_pointwise = false` parity oracles for tests.
 
 Each DAG node is an arithmetic op or activation; the schedule template walks the DAG and emits inline WGSL for the fused body. One thread per element, one dispatch for the entire chain.
 
 ## Reduction
 
-Per-row tree reduction with optional **prologue** (transform before reducing, e.g. `v*v` for sum-of-squares) and **epilogue** (per-element post-processing using the reduced scalar, e.g. `x * rsqrt(mean + eps) * weight` for RMSNorm).
+Per-row tree reduction with optional **prologue** (transform before reducing, e.g. `v*v` for sum-of-squares), **extra accumulators** (`extra_prologues`: additional integrands reduced over the same inputs in the same pass), and **epilogue** (per-element post-processing using the reduced scalars, e.g. `x * rsqrt(mean + eps) * weight` for RMSNorm). Per-row broadcast inputs, per-column inputs (weights/biases), and indexed gather streams are supported.
 
-This single template replaces hand-written `rms_norm.wgsl`, `softmax.wgsl`, `layer_norm.wgsl`, and similar kernels. Two-pass reductions (like softmax = max-reduce then sum-exp-reduce) compose naturally.
+RMSNorm, Softmax, and LayerNorm forward (two accumulators: sum + sum-of-squares in one pass) compile to this template; the hand-written shaders remain as `use_schedule_reduction = false` parity oracles. Two-pass reductions (like softmax = max-reduce then sum-exp-reduce) compose naturally.
+
+Current boundary, still hand-written by design: GroupNorm (its epilogue needs per-channel loads indexed by a function of both row and column — a layout-aware input category), the norm backwards that reduce along the *column* axis (GradW/GradWB), and LogSoftmax.
 
 ## Matmul
 

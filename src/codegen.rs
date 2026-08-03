@@ -389,8 +389,6 @@ pub enum ShaderGroup {
     LayerNormGrad,
     ScatterAdd,
     BceLoss,
-    FusedRmsNormMatMul,
-    FusedRmsNormMatMulCoop,
     RmsNormRsqrt,
     GroupNorm,
     GroupNormGrad,
@@ -398,7 +396,6 @@ pub enum ShaderGroup {
     Split,
     Upsample,
     UpsampleGrad,
-    Conv2d,
     /// Depthwise Conv2d (groups == channels). Used by EfficientNet MBConv.
     Conv2dDw,
     /// Per-channel broadcast mul: `dst[n,c,h,w] = src[n,c,h,w] * gate[n,c]`.
@@ -410,18 +407,14 @@ pub enum ShaderGroup {
     Conv2dGemm,
     Conv2dGemmSmall,
     Conv2dGemmCoop,
-    Conv2dGradInput,
     Conv2dGradInputGemm,
     Conv2dGradInputGemmSmall,
     Conv2dGradInputGemmCoop,
-    Conv2dGradInputGemmCoop3x3,
     GroupNormSilu,
     WinogradInputTransform,
     WinogradOutputTransform,
     WinogradBatchedMatMul,
-    WinogradBatchedMatMulSmall,
     WinogradWeightTransform,
-    Conv2dGradWeight,
     Conv2dGradWeightGemm,
     Conv2dGradWeightGemmSmall,
     CacheWrite,
@@ -480,15 +473,15 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::FlashAttention => {
             // Default head_dim=64 fallback; runtime calls
             // generate_flash_attention_module(head_dim) directly.
-            generate_flash_attention_module(64)
+            generate_flash_attention_module(64, flash_ept_cap())
         }
         ShaderGroup::FlashAttentionCoop => generate_flash_attention_coop_module(64),
         ShaderGroup::FlashGradQCoop => generate_flash_grad_q_coop_module(64),
         ShaderGroup::FlashGradKVCoop => generate_flash_grad_kv_coop_module(64),
         ShaderGroup::MultiHeadAttnGradQ => parse_wgsl(include_str!("shaders/mha_grad_q.wgsl")),
-        ShaderGroup::FlashGradQ => generate_flash_grad_q_module(64),
+        ShaderGroup::FlashGradQ => generate_flash_grad_q_module(64, flash_grad_q_ept_cap()),
         ShaderGroup::MultiHeadAttnGradKV => parse_wgsl(include_str!("shaders/mha_grad_kv.wgsl")),
-        ShaderGroup::FlashGradKV => generate_flash_grad_kv_module(64),
+        ShaderGroup::FlashGradKV => generate_flash_grad_kv_module(64, flash_grad_kv_ept_cap()),
         ShaderGroup::SwiGLUGrad => parse_wgsl(include_str!("shaders/swiglu_grad.wgsl")),
         ShaderGroup::SwiGLUConcat => parse_wgsl(include_str!("shaders/swiglu_concat.wgsl")),
         ShaderGroup::SumRows => parse_wgsl(include_str!("shaders/sum_rows.wgsl")),
@@ -497,11 +490,7 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
             parse_wgsl(include_str!("shaders/rms_norm_grad_w_rowpar.wgsl"))
         }
         ShaderGroup::LayerNormGrad => parse_wgsl(include_str!("shaders/layer_norm_grad.wgsl")),
-        ShaderGroup::FusedRmsNormMatMul => parse_wgsl(include_str!("shaders/matmul_rms_norm.wgsl")),
         ShaderGroup::RmsNormRsqrt => parse_wgsl(include_str!("shaders/rms_norm_rsqrt.wgsl")),
-        ShaderGroup::FusedRmsNormMatMulCoop => {
-            panic!("use generate_coop_module for FusedRmsNormMatMulCoop")
-        }
         ShaderGroup::ScatterAdd => parse_wgsl(include_str!("shaders/scatter_add.wgsl")),
         ShaderGroup::BceLoss => parse_wgsl(include_str!("shaders/bce.wgsl")),
         ShaderGroup::GroupNorm => parse_wgsl(include_str!("shaders/group_norm.wgsl")),
@@ -510,22 +499,28 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::Split => parse_wgsl(include_str!("shaders/split.wgsl")),
         ShaderGroup::Upsample => parse_wgsl(include_str!("shaders/upsample.wgsl")),
         ShaderGroup::UpsampleGrad => parse_wgsl(include_str!("shaders/upsample_grad.wgsl")),
-        ShaderGroup::Conv2d => parse_wgsl(include_str!("shaders/conv2d.wgsl")),
         ShaderGroup::Conv2dDw => parse_wgsl(include_str!("shaders/conv2d_dw.wgsl")),
         ShaderGroup::MulPerChannel => parse_wgsl(include_str!("shaders/mul_per_channel.wgsl")),
         ShaderGroup::AddPerChannel => parse_wgsl(include_str!("shaders/add_per_channel.wgsl")),
-        ShaderGroup::Conv2dGemm => parse_wgsl(include_str!("shaders/conv2d_gemm.wgsl")),
-        ShaderGroup::Conv2dGemmSmall => parse_wgsl(include_str!("shaders/conv2d_gemm_small.wgsl")),
-        ShaderGroup::Conv2dGradInput => parse_wgsl(include_str!("shaders/conv2d_grad_input.wgsl")),
-        ShaderGroup::Conv2dGradInputGemm => {
-            parse_wgsl(include_str!("shaders/conv2d_grad_input_gemm.wgsl"))
+        ShaderGroup::Conv2dGemm => {
+            conv_gemm_tiled(include_str!("shaders/conv2d_gemm.wgsl"), MatMulTile::Large)
         }
-        ShaderGroup::Conv2dGradInputGemmSmall => {
-            parse_wgsl(include_str!("shaders/conv2d_grad_input_gemm_small.wgsl"))
+        ShaderGroup::Conv2dGemmSmall => {
+            conv_gemm_tiled(include_str!("shaders/conv2d_gemm.wgsl"), MatMulTile::Small)
         }
-        ShaderGroup::Conv2dGemmCoop => gen_conv2d_gemm_coop(),
-        ShaderGroup::Conv2dGradInputGemmCoop => gen_conv2d_grad_input_gemm_coop(),
-        ShaderGroup::Conv2dGradInputGemmCoop3x3 => gen_conv2d_grad_input_gemm_coop_3x3(),
+        ShaderGroup::Conv2dGradInputGemm => conv_gemm_tiled(
+            include_str!("shaders/conv2d_grad_input_gemm.wgsl"),
+            MatMulTile::Large,
+        ),
+        ShaderGroup::Conv2dGradInputGemmSmall => conv_gemm_tiled(
+            include_str!("shaders/conv2d_grad_input_gemm.wgsl"),
+            MatMulTile::Small,
+        ),
+        ShaderGroup::Conv2dGemmCoop | ShaderGroup::Conv2dGradInputGemmCoop => {
+            panic!(
+                "conv coop kernels are generated per (kernel, stride) via generate_conv2d_coop_module"
+            )
+        }
         ShaderGroup::GroupNormSilu => parse_wgsl(include_str!("shaders/group_norm_silu.wgsl")),
         ShaderGroup::WinogradInputTransform => {
             parse_wgsl(include_str!("shaders/winograd_input_transform.wgsl"))
@@ -533,21 +528,20 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::WinogradOutputTransform => {
             parse_wgsl(include_str!("shaders/winograd_output_transform.wgsl"))
         }
-        ShaderGroup::WinogradBatchedMatMul | ShaderGroup::WinogradBatchedMatMulSmall => {
+        ShaderGroup::WinogradBatchedMatMul => {
             parse_wgsl(include_str!("shaders/winograd_matmul.wgsl"))
         }
         ShaderGroup::WinogradWeightTransform => {
             parse_wgsl(include_str!("shaders/winograd_weight_transform.wgsl"))
         }
-        ShaderGroup::Conv2dGradWeight => {
-            parse_wgsl(include_str!("shaders/conv2d_grad_weight.wgsl"))
-        }
-        ShaderGroup::Conv2dGradWeightGemm => {
-            parse_wgsl(include_str!("shaders/conv2d_grad_weight_gemm.wgsl"))
-        }
-        ShaderGroup::Conv2dGradWeightGemmSmall => {
-            parse_wgsl(include_str!("shaders/conv2d_grad_weight_gemm_small.wgsl"))
-        }
+        ShaderGroup::Conv2dGradWeightGemm => conv_gemm_tiled(
+            include_str!("shaders/conv2d_grad_weight_gemm.wgsl"),
+            MatMulTile::Large,
+        ),
+        ShaderGroup::Conv2dGradWeightGemmSmall => conv_gemm_tiled(
+            include_str!("shaders/conv2d_grad_weight_gemm.wgsl"),
+            MatMulTile::Small,
+        ),
         ShaderGroup::CacheWrite => parse_wgsl(include_str!("shaders/cache_write.wgsl")),
         ShaderGroup::CachedAttention => parse_wgsl(include_str!("shaders/cached_attention.wgsl")),
         ShaderGroup::RoPEDynamic => parse_wgsl(include_str!("shaders/rope_dynamic.wgsl")),
@@ -570,10 +564,6 @@ pub fn generate_coop_module(group: ShaderGroup, config: &CoopConfig) -> ShaderMo
         ShaderGroup::MatMulCoopAdd => gen_matmul_coop_wgsl(true, MatMulCoopVariant::Normal, config),
         ShaderGroup::MatMulCoopBT => gen_matmul_coop_wgsl(false, MatMulCoopVariant::BT, config),
         ShaderGroup::MatMulCoopAT => gen_matmul_coop_wgsl(false, MatMulCoopVariant::AT, config),
-        ShaderGroup::Conv2dGemmCoop => gen_conv2d_gemm_coop_wgsl(config),
-        ShaderGroup::Conv2dGradInputGemmCoop => gen_conv2d_grad_input_gemm_coop_wgsl(config),
-        ShaderGroup::Conv2dGradInputGemmCoop3x3 => gen_conv2d_grad_input_gemm_coop_3x3_wgsl(config),
-        ShaderGroup::FusedRmsNormMatMulCoop => gen_fused_rms_norm_matmul_coop_wgsl(config),
         _ => panic!("not a coop shader group: {:?}", group),
     }
 }
@@ -587,9 +577,7 @@ pub fn generate_wgsl(group: ShaderGroup) -> String {
         | ShaderGroup::MatMulCoopAT
         | ShaderGroup::Conv2dGemmCoop
         | ShaderGroup::Conv2dGradInputGemmCoop
-        | ShaderGroup::Conv2dGradInputGemmCoop3x3
-        | ShaderGroup::MatMulCoopBT
-        | ShaderGroup::FusedRmsNormMatMulCoop => {
+        | ShaderGroup::MatMulCoopBT => {
             naga::valid::Capabilities::COOPERATIVE_MATRIX
                 | naga::valid::Capabilities::SHADER_FLOAT16
         }
@@ -732,6 +720,106 @@ fn matmul_vars_with_mode(
 
 use crate::compile::WeightFormat;
 
+/// Tile geometry for the register-tiled scalar matmul skeleton.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MatMulTile {
+    /// BM=BN=64, TM=TN=4 — the default tile.
+    Large,
+    /// BM=BN=32, TM=TN=2 — 4× more workgroups for low-occupancy shapes.
+    Small,
+}
+
+impl MatMulTile {
+    fn bm(self) -> u32 {
+        match self {
+            MatMulTile::Large => 64,
+            MatMulTile::Small => 32,
+        }
+    }
+    fn tm(self) -> u32 {
+        match self {
+            MatMulTile::Large => 4,
+            MatMulTile::Small => 2,
+        }
+    }
+}
+
+/// Generate the unrolled `(acc_decl, compute_body, acc_array)` sections of
+/// the tiled-matmul skeleton for a TM×TM register tile.
+fn tiled_matmul_body(tile: MatMulTile) -> (String, String, String) {
+    // matmul.wgsl stages A at padded stride 33 and B at BM+1.
+    tiled_gemm_body(tile.tm(), 33, tile.bm() + 1)
+}
+
+/// Specialize one of the implicit-GEMM conv skeletons
+/// (`conv2d_gemm.wgsl`, `conv2d_grad_input_gemm.wgsl`,
+/// `conv2d_grad_weight_gemm.wgsl`) for a tile size. All three stage A at
+/// stride KTILE=16 and B at stride BM, with BM·16/256 elements per thread.
+fn conv_gemm_tiled(src: &str, tile: MatMulTile) -> ShaderModule {
+    let bm = tile.bm();
+    let tm = tile.tm();
+    let (acc_decl, compute_body, acc_array) = tiled_gemm_body(tm, 16, bm);
+    let src = preprocess(
+        src,
+        &[
+            ("$BM_U", &format!("{bm}u")),
+            ("$TM_U", &format!("{tm}u")),
+            ("$STAGE_EPT_U", &format!("{}u", bm * 16 / 256)),
+            ("$SHARED_SIZE", &(bm * 16).to_string()),
+            ("$ACC_DECL", &acc_decl),
+            ("$COMPUTE_BODY", &compute_body),
+            ("$ACC_ARRAY", &acc_array),
+        ],
+    );
+    parse_wgsl(&src)
+}
+
+/// Shared unroll generator for every register-tiled GEMM skeleton
+/// (matmul.wgsl and the implicit-GEMM conv kernels): accumulator
+/// declarations, the KTILE inner-loop FMA body, and the store array,
+/// parameterized by register tile size and shared-memory strides.
+fn tiled_gemm_body(tm: u32, a_stride: u32, b_stride: u32) -> (String, String, String) {
+    use std::fmt::Write;
+
+    let mut acc_decl = String::new();
+    for i in 0..tm {
+        for j in 0..tm {
+            let _ = write!(acc_decl, "var s{i}_{j} = 0.0; ");
+        }
+        acc_decl.push_str("\n    ");
+    }
+
+    let mut body = String::new();
+    for i in 0..tm {
+        let _ = writeln!(
+            body,
+            "            let a{i} = shared_a[(ty * {tm}u + {i}u) * {a_stride}u + kk];"
+        );
+    }
+    for j in 0..tm {
+        let _ = writeln!(
+            body,
+            "            let b{j} = shared_b[kk * {b_stride}u + tx * {tm}u + {j}u];"
+        );
+    }
+    for i in 0..tm {
+        body.push_str("            ");
+        for j in 0..tm {
+            let _ = write!(body, "s{i}_{j} += a{i} * b{j}; ");
+        }
+        body.push('\n');
+    }
+
+    let mut acc_array = format!("array<array<f32, {tm}>, {tm}>(\n");
+    for i in 0..tm {
+        let cols: Vec<String> = (0..tm).map(|j| format!("s{i}_{j}")).collect();
+        let _ = writeln!(acc_array, "        array<f32, {tm}>({}),", cols.join(", "));
+    }
+    acc_array.push_str("    )");
+
+    (acc_decl, body, acc_array)
+}
+
 fn matmul_vars_full(
     a_idx: &str,
     b_idx: &str,
@@ -744,6 +832,37 @@ fn matmul_vars_full(
     epilogue_decl: &str,
     epilogue_body: &str,
     b_mode: WeightFormat,
+) -> ShaderModule {
+    matmul_vars_tiled(
+        a_idx,
+        b_idx,
+        a_row,
+        a_col,
+        b_row,
+        b_col,
+        fused_decl,
+        fused_expr,
+        epilogue_decl,
+        epilogue_body,
+        b_mode,
+        MatMulTile::Large,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn matmul_vars_tiled(
+    a_idx: &str,
+    b_idx: &str,
+    a_row: &str,
+    a_col: &str,
+    b_row: &str,
+    b_col: &str,
+    fused_decl: &str,
+    fused_expr: &str,
+    epilogue_decl: &str,
+    epilogue_body: &str,
+    b_mode: WeightFormat,
+    tile: MatMulTile,
 ) -> ShaderModule {
     let src = include_str!("shaders/matmul.wgsl");
     let full_decl = if epilogue_decl.is_empty() {
@@ -785,6 +904,9 @@ fn matmul_vars_full(
             Q8_DEQUANT_FN.to_string(),
         ),
     };
+    let bm = tile.bm();
+    let tm = tile.tm();
+    let (acc_decl, compute_body, acc_array) = tiled_matmul_body(tile);
     let src = preprocess(
         src,
         &[
@@ -800,6 +922,15 @@ fn matmul_vars_full(
             ("$B_COL", b_col),
             ("$FUSED_ADD_DECL", &full_decl),
             ("$STORE_BODY", &store_body),
+            ("$BM_U", &format!("{bm}u")),
+            ("$TM_U", &format!("{tm}u")),
+            ("$B_STRIDE_U", &format!("{}u", bm + 1)),
+            ("$STAGE_EPT_U", &format!("{}u", bm * 32 / 256)),
+            ("$SHARED_A_SIZE", &(bm * 33).to_string()),
+            ("$SHARED_B_SIZE", &(32 * (bm + 1)).to_string()),
+            ("$ACC_DECL", &acc_decl),
+            ("$COMPUTE_BODY", &compute_body),
+            ("$ACC_ARRAY", &acc_array),
         ],
     );
     parse_wgsl(&src)
@@ -888,22 +1019,20 @@ fn matmul_small_vars(
     fused_decl: &str,
     fused_expr: &str,
 ) -> ShaderModule {
-    let src = include_str!("shaders/matmul_small.wgsl");
-    let store_body = format!("matrix_c[idx] = s[i][j]{};", fused_expr);
-    let src = preprocess(
-        src,
-        &[
-            ("$A_INDEX", a_idx),
-            ("$B_INDEX", b_idx),
-            ("$A_ROW_S", a_row),
-            ("$A_COL_S", a_col),
-            ("$B_ROW_S", b_row),
-            ("$B_COL_S", b_col),
-            ("$FUSED_ADD_DECL", fused_decl),
-            ("$STORE_BODY", &store_body),
-        ],
-    );
-    parse_wgsl(&src)
+    matmul_vars_tiled(
+        a_idx,
+        b_idx,
+        a_row,
+        a_col,
+        b_row,
+        b_col,
+        fused_decl,
+        fused_expr,
+        "",
+        "",
+        WeightFormat::F32,
+        MatMulTile::Small,
+    )
 }
 
 fn gen_matmul_small() -> ShaderModule {
@@ -2080,7 +2209,7 @@ pub fn flash_grad_kv_ept_cap() -> u32 {
         })
 }
 
-pub fn generate_flash_attention_module(head_dim: u32) -> ShaderModule {
+pub fn generate_flash_attention_module(head_dim: u32, ept_cap: u32) -> ShaderModule {
     use std::fmt::Write;
     assert!(
         head_dim.is_power_of_two() && head_dim >= 2,
@@ -2088,9 +2217,8 @@ pub fn generate_flash_attention_module(head_dim: u32) -> ShaderModule {
     );
 
     let hd = head_dim;
-    // EPT cap via flash_ept_cap() (env-var override + default).,
     // which honors MEGANEURA_FLASH_EPT_CAP overrides.
-    let ept: u32 = hd.min(flash_ept_cap());
+    let ept: u32 = hd.min(ept_cap);
     let tpq = hd / ept; // threads per query
     let bq: u32 = (256 / tpq).max(1);
     // Fall back to BQ=1 kernel when multi-query isn't beneficial
@@ -3386,13 +3514,13 @@ pub fn generate_flash_grad_kv_coop_module(head_dim: u32) -> ShaderModule {
 /// there are NO workgroup barriers inside the KV loop — each thread owns
 /// one full query row and sequentially accumulates dQ by loading K/V
 /// scalars directly from global memory.
-pub fn generate_flash_grad_q_module(head_dim: u32) -> ShaderModule {
+pub fn generate_flash_grad_q_module(head_dim: u32, ept_cap: u32) -> ShaderModule {
     use std::fmt::Write;
     assert!(head_dim.is_power_of_two() && head_dim >= 2);
 
     let hd = head_dim;
     // Backward uses its own cap because these kernels carry more live state.
-    let ept: u32 = hd.min(flash_grad_q_ept_cap());
+    let ept: u32 = hd.min(ept_cap);
     let tpq = hd / ept; // threads per query
     let bq: u32 = (256 / tpq).max(1);
     if bq <= 1 {
@@ -3693,7 +3821,7 @@ pub fn generate_flash_grad_q_module(head_dim: u32) -> ShaderModule {
 /// there are NO workgroup barriers inside the Q loop — each thread owns
 /// one full (kv_pos, head_range) output row and sequentially accumulates
 /// dK/dV by loading Q/dO/O scalars directly from global memory.
-pub fn generate_flash_grad_kv_module(head_dim: u32) -> ShaderModule {
+pub fn generate_flash_grad_kv_module(head_dim: u32, ept_cap: u32) -> ShaderModule {
     use std::fmt::Write;
     assert!(head_dim.is_power_of_two() && head_dim >= 2);
 
@@ -3701,7 +3829,7 @@ pub fn generate_flash_grad_kv_module(head_dim: u32) -> ShaderModule {
     // Backward uses its own cap because these kernels carry more live state.
     // The fused dK+dV kernel reports 210 regs at EPT=32 on Blackwell,
     // so the auto-tune typically chooses a smaller value here.
-    let ept: u32 = hd.min(flash_grad_kv_ept_cap());
+    let ept: u32 = hd.min(ept_cap);
     let tpq = hd / ept; // threads per KV position
     let bkv: u32 = (256 / tpq).max(1);
     if bkv <= 1 {
@@ -3901,245 +4029,6 @@ pub fn generate_flash_grad_kv_module(head_dim: u32) -> ShaderModule {
         module,
         source: src,
     }
-}
-
-fn gen_conv2d_gemm_coop() -> ShaderModule {
-    let default_config = CoopConfig {
-        tile_size: 16,
-        use_f16_input: true,
-    };
-    gen_conv2d_gemm_coop_wgsl(&default_config)
-}
-
-fn gen_conv2d_gemm_coop_wgsl(config: &CoopConfig) -> ShaderModule {
-    let tile = config.tile_size;
-    let output_tile = config.output_tile();
-    let shared_size = tile * tile;
-    let wg_size: u32 = 64;
-    let staging_iters = shared_size / wg_size;
-    let row_stride = wg_size / tile;
-    let tile_mask = tile - 1;
-    let tile_shift = tile.trailing_zeros();
-
-    let (elem_type, enable_f16, elem_zero, cast_open, cast_close) = if config.use_f16_input {
-        ("f16", "enable f16;", "f16(0.0)", "f16(", ")")
-    } else {
-        ("f32", "", "0.0", "", "")
-    };
-    let ab_type = if config.use_f16_input { "f16" } else { "f32" };
-    let coop_ab = format!("coop_mat{}x{}<{},A>", tile, tile, ab_type);
-    let coop_ba = format!("coop_mat{}x{}<{},B>", tile, tile, ab_type);
-    let coop_c = format!("coop_mat{}x{}<f32,C>", tile, tile);
-    let use_vec4 = tile >= 16;
-
-    let staging_vars = if use_vec4 {
-        "let v4_row = lid.x >> 2u;\n    let v4_col = (lid.x & 3u) << 2u;"
-    } else {
-        ""
-    };
-    let mut weight_stage_0 = String::new();
-    emit_forward_weight_stage(
-        &mut weight_stage_0,
-        "shared_b0",
-        "tile_row",
-        false,
-        tile,
-        use_vec4,
-        staging_iters,
-        row_stride,
-        cast_open,
-        cast_close,
-        elem_zero,
-    );
-    let mut weight_stage_1 = String::new();
-    emit_forward_weight_stage(
-        &mut weight_stage_1,
-        "shared_b1",
-        "tile_row",
-        true,
-        tile,
-        use_vec4,
-        staging_iters,
-        row_stride,
-        cast_open,
-        cast_close,
-        elem_zero,
-    );
-
-    let acc_init = format!(
-        "var acc00 = {coop_c}();\n\
-         \x20   var acc01 = {coop_c}();\n\
-         \x20   var acc10 = {coop_c}();\n\
-         \x20   var acc11 = {coop_c}();"
-    );
-
-    let output_tile_u = format!("{}u", output_tile);
-    let tile_size_u = format!("{}u", tile);
-    let tile_mask_u = format!("{}u", tile_mask);
-    let tile_shift_u = format!("{}u", tile_shift);
-    let staging_iters_u = format!("{}u", staging_iters);
-    let row_stride_u = format!("{}u", row_stride);
-    let shared_size_s = format!("{}", shared_size);
-
-    let src = include_str!("shaders/conv2d_gemm_coop.wgsl");
-    let src = preprocess(
-        src,
-        &[
-            ("$ENABLE_F16", enable_f16),
-            ("$ELEM_TYPE", elem_type),
-            ("$ELEM_ZERO", elem_zero),
-            ("$SHARED_SIZE", &shared_size_s),
-            ("$OUTPUT_TILE_U", &output_tile_u),
-            ("$TILE_SIZE_U", &tile_size_u),
-            ("$TILE_MASK_U", &tile_mask_u),
-            ("$TILE_SHIFT_U", &tile_shift_u),
-            ("$STAGING_ITERS_U", &staging_iters_u),
-            ("$ROW_STRIDE_U", &row_stride_u),
-            ("$CAST_OPEN", cast_open),
-            ("$CAST_CLOSE", cast_close),
-            ("$COOP_AB", &coop_ab),
-            ("$COOP_BA", &coop_ba),
-            ("$ACC_INIT", &acc_init),
-            ("$WEIGHT_STAGING_VARS", staging_vars),
-            ("$WEIGHT_STAGE_0", &weight_stage_0),
-            ("$WEIGHT_STAGE_1", &weight_stage_1),
-        ],
-    );
-    parse_wgsl(&src)
-}
-
-fn gen_conv2d_grad_input_gemm_coop() -> ShaderModule {
-    let default_config = CoopConfig {
-        tile_size: 16,
-        use_f16_input: true,
-    };
-    gen_conv2d_grad_input_gemm_coop_wgsl(&default_config)
-}
-
-fn gen_conv2d_grad_input_gemm_coop_wgsl(config: &CoopConfig) -> ShaderModule {
-    let tile = config.tile_size;
-    let output_tile = config.output_tile();
-    let shared_size = tile * tile;
-    let wg_size: u32 = 64;
-    let staging_iters = shared_size / wg_size;
-    let row_stride = wg_size / tile;
-    let tile_mask = tile - 1;
-    let tile_shift = tile.trailing_zeros();
-
-    let (elem_type, enable_f16, elem_zero, cast_open, cast_close) = if config.use_f16_input {
-        ("f16", "enable f16;", "f16(0.0)", "f16(", ")")
-    } else {
-        ("f32", "", "0.0", "", "")
-    };
-    let ab_type = if config.use_f16_input { "f16" } else { "f32" };
-    let coop_ab = format!("coop_mat{}x{}<{},A>", tile, tile, ab_type);
-    let coop_ba = format!("coop_mat{}x{}<{},B>", tile, tile, ab_type);
-    let coop_c = format!("coop_mat{}x{}<f32,C>", tile, tile);
-
-    let acc_init = format!(
-        "var acc00 = {coop_c}();\n\
-         \x20   var acc01 = {coop_c}();\n\
-         \x20   var acc10 = {coop_c}();\n\
-         \x20   var acc11 = {coop_c}();"
-    );
-
-    let output_tile_u = format!("{}u", output_tile);
-    let tile_size_u = format!("{}u", tile);
-    let tile_mask_u = format!("{}u", tile_mask);
-    let tile_shift_u = format!("{}u", tile_shift);
-    let staging_iters_u = format!("{}u", staging_iters);
-    let row_stride_u = format!("{}u", row_stride);
-    let shared_size_s = format!("{}", shared_size);
-
-    let src = include_str!("shaders/conv2d_grad_input_gemm_coop.wgsl");
-    let src = preprocess(
-        src,
-        &[
-            ("$ENABLE_F16", enable_f16),
-            ("$ELEM_TYPE", elem_type),
-            ("$ELEM_ZERO", elem_zero),
-            ("$SHARED_SIZE", &shared_size_s),
-            ("$OUTPUT_TILE_U", &output_tile_u),
-            ("$TILE_SIZE_U", &tile_size_u),
-            ("$TILE_MASK_U", &tile_mask_u),
-            ("$TILE_SHIFT_U", &tile_shift_u),
-            ("$STAGING_ITERS_U", &staging_iters_u),
-            ("$ROW_STRIDE_U", &row_stride_u),
-            ("$CAST_OPEN", cast_open),
-            ("$CAST_CLOSE", cast_close),
-            ("$COOP_AB", &coop_ab),
-            ("$COOP_BA", &coop_ba),
-            ("$ACC_INIT", &acc_init),
-        ],
-    );
-    parse_wgsl(&src)
-}
-
-fn gen_conv2d_grad_input_gemm_coop_3x3() -> ShaderModule {
-    let default_config = CoopConfig {
-        tile_size: 16,
-        use_f16_input: true,
-    };
-    gen_conv2d_grad_input_gemm_coop_3x3_wgsl(&default_config)
-}
-
-fn gen_conv2d_grad_input_gemm_coop_3x3_wgsl(config: &CoopConfig) -> ShaderModule {
-    let tile = config.tile_size;
-    let output_tile = config.output_tile();
-    let shared_size = tile * tile;
-    let wg_size: u32 = 64;
-    let staging_iters = shared_size / wg_size;
-    let row_stride = wg_size / tile;
-    let tile_mask = tile - 1;
-    let tile_shift = tile.trailing_zeros();
-
-    let (elem_type, enable_f16, elem_zero, cast_open, cast_close) = if config.use_f16_input {
-        ("f16", "enable f16;", "f16(0.0)", "f16(", ")")
-    } else {
-        ("f32", "", "0.0", "", "")
-    };
-    let ab_type = if config.use_f16_input { "f16" } else { "f32" };
-    let coop_ab = format!("coop_mat{}x{}<{},A>", tile, tile, ab_type);
-    let coop_ba = format!("coop_mat{}x{}<{},B>", tile, tile, ab_type);
-    let coop_c = format!("coop_mat{}x{}<f32,C>", tile, tile);
-
-    let acc_init = format!(
-        "var acc00 = {coop_c}();\n\
-         \x20   var acc01 = {coop_c}();\n\
-         \x20   var acc10 = {coop_c}();\n\
-         \x20   var acc11 = {coop_c}();"
-    );
-
-    let output_tile_u = format!("{}u", output_tile);
-    let tile_size_u = format!("{}u", tile);
-    let tile_mask_u = format!("{}u", tile_mask);
-    let tile_shift_u = format!("{}u", tile_shift);
-    let staging_iters_u = format!("{}u", staging_iters);
-    let row_stride_u = format!("{}u", row_stride);
-    let shared_size_s = format!("{}", shared_size);
-
-    let src = include_str!("shaders/conv2d_grad_input_gemm_coop_3x3.wgsl");
-    let src = preprocess(
-        src,
-        &[
-            ("$ENABLE_F16", enable_f16),
-            ("$ELEM_TYPE", elem_type),
-            ("$ELEM_ZERO", elem_zero),
-            ("$SHARED_SIZE", &shared_size_s),
-            ("$OUTPUT_TILE_U", &output_tile_u),
-            ("$TILE_SIZE_U", &tile_size_u),
-            ("$TILE_MASK_U", &tile_mask_u),
-            ("$TILE_SHIFT_U", &tile_shift_u),
-            ("$STAGING_ITERS_U", &staging_iters_u),
-            ("$ROW_STRIDE_U", &row_stride_u),
-            ("$CAST_OPEN", cast_open),
-            ("$CAST_CLOSE", cast_close),
-            ("$COOP_AB", &coop_ab),
-            ("$COOP_BA", &coop_ba),
-            ("$ACC_INIT", &acc_init),
-        ],
-    );
-    parse_wgsl(&src)
 }
 
 /// Conv2d cooperative-matrix GEMM direction.
@@ -4960,63 +4849,6 @@ fn emit_forward_im2col_stage(
     src.push_str("        }\n\n");
 }
 
-#[allow(dead_code)]
-fn gen_fused_rms_norm_matmul_coop() -> ShaderModule {
-    let default_config = CoopConfig {
-        tile_size: 16,
-        use_f16_input: true,
-    };
-    gen_fused_rms_norm_matmul_coop_wgsl(&default_config)
-}
-
-fn gen_fused_rms_norm_matmul_coop_wgsl(config: &CoopConfig) -> ShaderModule {
-    // Use the standalone matmul_rms_norm_coop.wgsl which has:
-    // - 64-thread cooperative rsqrt prologue (tree reduction)
-    // - on-the-fly normalization during A-staging
-    // - FourBufData-compatible globals (src_a, src_b, bias, dst)
-    let tile = config.tile_size;
-    let output_tile = config.output_tile();
-    let shared_size = tile * tile;
-    let wg_size: u32 = 64;
-    let staging_iters = shared_size / wg_size;
-    let row_stride = wg_size / tile;
-    let tile_mask = tile - 1;
-    let tile_shift = tile.trailing_zeros();
-
-    let (elem_type, enable_f16, elem_zero, cast_open, cast_close) = if config.use_f16_input {
-        ("f16", "enable f16;", "f16(0.0)", "f16(", ")")
-    } else {
-        ("f32", "", "0.0", "", "")
-    };
-    let ab_type = if config.use_f16_input { "f16" } else { "f32" };
-    let coop_ab = format!("coop_mat{}x{}<{},A>", tile, tile, ab_type);
-    let coop_ba = format!("coop_mat{}x{}<{},B>", tile, tile, ab_type);
-    let coop_c = format!("coop_mat{}x{}<f32,C>", tile, tile);
-
-    let src = include_str!("shaders/matmul_rms_norm_coop.wgsl");
-    let src = preprocess(
-        src,
-        &[
-            ("$ENABLE_F16", enable_f16),
-            ("$ELEM_TYPE", elem_type),
-            ("$ELEM_ZERO", elem_zero),
-            ("$SHARED_SIZE", &shared_size.to_string()),
-            ("$OUTPUT_TILE_U", &format!("{}u", output_tile)),
-            ("$TILE_SIZE_U", &format!("{}u", tile)),
-            ("$TILE_MASK_U", &format!("{}u", tile_mask)),
-            ("$TILE_SHIFT_U", &format!("{}u", tile_shift)),
-            ("$STAGING_ITERS_U", &format!("{}u", staging_iters)),
-            ("$ROW_STRIDE_U", &format!("{}u", row_stride)),
-            ("$CAST_OPEN", cast_open),
-            ("$CAST_CLOSE", cast_close),
-            ("$COOP_AB", &coop_ab),
-            ("$COOP_BA", &coop_ba),
-            ("$COOP_OUT", &coop_c),
-        ],
-    );
-    parse_wgsl(&src)
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -5067,21 +4899,6 @@ mod tests {
             ),
             (
                 ShaderGroup::MatMulCoopBT,
-                naga::valid::Capabilities::COOPERATIVE_MATRIX
-                    | naga::valid::Capabilities::SHADER_FLOAT16,
-            ),
-            (
-                ShaderGroup::Conv2dGemmCoop,
-                naga::valid::Capabilities::COOPERATIVE_MATRIX
-                    | naga::valid::Capabilities::SHADER_FLOAT16,
-            ),
-            (
-                ShaderGroup::Conv2dGradInputGemmCoop,
-                naga::valid::Capabilities::COOPERATIVE_MATRIX
-                    | naga::valid::Capabilities::SHADER_FLOAT16,
-            ),
-            (
-                ShaderGroup::Conv2dGradInputGemmCoop3x3,
                 naga::valid::Capabilities::COOPERATIVE_MATRIX
                     | naga::valid::Capabilities::SHADER_FLOAT16,
             ),
@@ -5150,10 +4967,6 @@ mod tests {
             ),
             (ShaderGroup::ScatterAdd, naga::valid::Capabilities::empty()),
             (ShaderGroup::BceLoss, naga::valid::Capabilities::empty()),
-            (
-                ShaderGroup::FusedRmsNormMatMul,
-                naga::valid::Capabilities::empty(),
-            ),
             (
                 ShaderGroup::GlobalAvgPoolGrad,
                 naga::valid::Capabilities::empty(),
@@ -5251,11 +5064,11 @@ mod tests {
     #[test]
     fn test_flash_attention_wgsl() {
         // BQ=4 for hd=64, BQ=8 for hd=32, BQ=2 for hd=128
-        let _ = generate_flash_attention_module(64);
-        let _ = generate_flash_attention_module(32);
-        let _ = generate_flash_attention_module(128);
+        let _ = generate_flash_attention_module(64, flash_ept_cap());
+        let _ = generate_flash_attention_module(32, flash_ept_cap());
+        let _ = generate_flash_attention_module(128, flash_ept_cap());
         // hd=256 should fall back to BQ=1 (regular attention)
-        let _ = generate_flash_attention_module(256);
+        let _ = generate_flash_attention_module(256, flash_ept_cap());
     }
 
     #[test]
@@ -5356,7 +5169,6 @@ mod tests {
             (ShaderGroup::RmsNormGradWRowPar, empty),
             (ShaderGroup::ScatterAdd, empty),
             (ShaderGroup::BceLoss, empty),
-            (ShaderGroup::FusedRmsNormMatMul, empty),
             (ShaderGroup::GlobalAvgPoolGrad, empty),
             (ShaderGroup::GradClipZero, empty),
             (ShaderGroup::GradClipNormSq, empty),
@@ -5385,7 +5197,6 @@ mod tests {
                     | ShaderGroup::MatMulCoopBT
                     | ShaderGroup::Conv2dGemmCoop
                     | ShaderGroup::Conv2dGradInputGemmCoop
-                    | ShaderGroup::Conv2dGradInputGemmCoop3x3
             ) {
                 continue;
             }
@@ -5524,9 +5335,6 @@ mod tests {
                     vec!["src_a", "src_b", "bias", "dst", "params"]
                 }
                 ShaderEntry::RmsNormRsqrt => vec!["src", "dst", "params"],
-                ShaderEntry::FusedRmsNormMatMul => {
-                    vec!["src_a", "src_b", "bias", "dst", "params"]
-                }
                 ShaderEntry::CacheWrite => vec!["src", "dst", "kv_pos_buf", "params"],
                 ShaderEntry::CachedAttention => {
                     vec!["src_a", "src_b", "bias", "kv_pos_buf", "dst", "params"]
@@ -5543,27 +5351,20 @@ mod tests {
                 ShaderEntry::Upsample2x | ShaderEntry::Upsample2xGrad => {
                     vec!["src", "dst", "params"]
                 }
-                ShaderEntry::Conv2d | ShaderEntry::Conv2dDw => {
+                ShaderEntry::Conv2dDw => {
                     vec!["src", "weight", "dst", "params"]
                 }
                 ShaderEntry::MulPerChannel => vec!["src", "gate", "dst", "params"],
                 ShaderEntry::AddPerChannel => vec!["src", "bias", "dst", "params"],
                 ShaderEntry::Conv2dGemm
                 | ShaderEntry::Conv2dGemmSmall
-                | ShaderEntry::Conv2dGemmCoop
                 | ShaderEntry::Conv2dGemmCoopGen(..) => vec!["src", "weight", "dst", "params"],
-                ShaderEntry::Conv2dGradInput => vec!["grad_out", "weight", "dst", "params"],
-                ShaderEntry::Conv2dGradInputGemm | ShaderEntry::Conv2dGradInputGemmSmall => {
-                    vec!["grad_out", "weight", "dst", "params"]
-                }
-                ShaderEntry::Conv2dGradInputGemmCoop
-                | ShaderEntry::Conv2dGradInputGemmCoop3x3
+                ShaderEntry::Conv2dGradInputGemm
+                | ShaderEntry::Conv2dGradInputGemmSmall
                 | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => {
                     vec!["grad_out", "weight", "dst", "params"]
                 }
-                ShaderEntry::Conv2dGradWeight
-                | ShaderEntry::Conv2dGradWeightGemm
-                | ShaderEntry::Conv2dGradWeightGemmSmall => {
+                ShaderEntry::Conv2dGradWeightGemm | ShaderEntry::Conv2dGradWeightGemmSmall => {
                     vec!["grad_out", "src", "dst", "params"]
                 }
                 ShaderEntry::RoPEDynamic => vec!["src", "dst", "pos_offset_buf", "params"],
@@ -5573,7 +5374,7 @@ mod tests {
                 ShaderEntry::WinogradInputTransform | ShaderEntry::WinogradOutputTransform => {
                     vec!["src", "dst", "params"]
                 }
-                ShaderEntry::WinogradBatchedMatMul | ShaderEntry::WinogradBatchedMatMulSmall => {
+                ShaderEntry::WinogradBatchedMatMul => {
                     vec!["matrix_a", "matrix_b", "matrix_c", "params"]
                 }
                 ShaderEntry::WinogradWeightTransform => vec!["src", "dst", "params"],
@@ -5642,7 +5443,6 @@ mod tests {
             ShaderEntry::LayerNormGradWB,
             ShaderEntry::LayerNormGradX,
             ShaderEntry::RmsNormRsqrt,
-            ShaderEntry::FusedRmsNormMatMul,
             ShaderEntry::AdamUpdate,
             ShaderEntry::ScatterAdd,
             ShaderEntry::BceLoss,
@@ -5654,16 +5454,13 @@ mod tests {
             ShaderEntry::SplitB,
             ShaderEntry::Upsample2x,
             ShaderEntry::Upsample2xGrad,
-            ShaderEntry::Conv2d,
             ShaderEntry::Conv2dDw,
             ShaderEntry::MulPerChannel,
             ShaderEntry::AddPerChannel,
             ShaderEntry::Conv2dGemm,
             ShaderEntry::Conv2dGemmSmall,
-            ShaderEntry::Conv2dGradInput,
             ShaderEntry::Conv2dGradInputGemm,
             ShaderEntry::Conv2dGradInputGemmSmall,
-            ShaderEntry::Conv2dGradWeight,
             ShaderEntry::WinogradInputTransform,
             ShaderEntry::WinogradOutputTransform,
             ShaderEntry::WinogradBatchedMatMul,
@@ -5734,20 +5531,6 @@ mod tests {
         ];
 
         for config in configs {
-            let template = generate_coop_module(ShaderGroup::Conv2dGemmCoop, &config);
-            Validator::new(flags, coop_caps)
-                .validate(&template.module)
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "Conv2d coop template (tile {}) failed validation: {error:?}",
-                        config.tile_size
-                    )
-                });
-            if config.tile_size == 8 {
-                assert!(!template.source.contains("v4_row"));
-                assert!(template.source.contains("let flat = lid.x + e * 64u"));
-            }
-
             for &(kh, kw, stride, direction) in &cases {
                 let sm = generate_conv2d_coop_module(kh, kw, stride, direction, &config);
                 let mut validator = Validator::new(flags, coop_caps);
