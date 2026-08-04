@@ -1,7 +1,6 @@
 \documentclass[conference]{IEEEtran}
 
 \usepackage[T1]{fontenc}
-\usepackage{lmodern}
 \usepackage{booktabs}
 \usepackage{amsmath}
 \usepackage{xcolor}
@@ -22,7 +21,8 @@
 \newcommand{\inferena}{Inferena}
 \newcommand{\code}[1]{\texttt{#1}}
 
-\title{Meganeura: Compact GPU Training and Inference Across Vulkan and Metal}
+\title{Meganeura: Vulkan and Metal as a Performance-Portability Layer\\
+for GPU Training and Inference}
 
 \author{\IEEEauthorblockN{Dzmitry Malyshau}
 \IEEEauthorblockA{Independent Researcher\\
@@ -623,9 +623,11 @@ optimization that survives in the frozen measurements.
 
 The third structural factor is synchronization: the ResNet-50 inference
 profile records 177 barrier groups over 198 dispatches, and our companion
-cross-vendor study of Blade's pass-boundary barrier model measures
-29--32\% GPU gains from eliding redundant compute-pass barriers on
-discrete NVIDIA and AMD hardware~\cite{malyshau2026barriers}. Where launch
+cross-vendor study of Blade's pass-boundary barrier model quantifies the
+cost of redundant compute-pass barriers and the headroom from eliding
+them~\cite{malyshau2026barriers}. Those measurements predate Blade's newer
+global resource-access tracking, so we cite them as demonstrated headroom
+rather than as a gain this stack currently banks. Where launch
 and synchronization structure dominates, the static plan already wins
 (the latency column); where one kernel family dominates, coverage
 decides. Each identified gap is an absent specialization or policy ---
