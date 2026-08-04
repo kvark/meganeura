@@ -1714,18 +1714,31 @@ impl<'a> Compiler<'a> {
 
         // Build param→grad pairs from the trailing grad outputs.
         if num_grads > 0 {
-            let param_names: Vec<String> = self
-                .plan
-                .param_buffers
+            let param_nodes: Vec<&Node> = self
+                .graph
+                .nodes()
                 .iter()
-                .map(|entry| entry.0.clone())
+                .filter(|node| matches!(node.op, Op::Parameter { .. }))
                 .collect();
             assert_eq!(
-                param_names.len(),
+                param_nodes.len(),
                 num_grads,
                 "autodiff must emit one grad output per Parameter",
             );
             for i in 0..num_grads {
+                let grad_node = self.graph.node(outputs[num_user + i]);
+                if grad_node.ty.num_elements() != param_nodes[i].ty.num_elements() {
+                    // Autodiff uses a scalar zero as the positional placeholder
+                    // for a parameter that receives no gradient (for example,
+                    // one behind StopGradient). Do not expose that sentinel as
+                    // a real gradient: optimizers iterate over the parameter's
+                    // full length and would otherwise read past the scalar.
+                    assert!(
+                        matches!(grad_node.op, Op::Constant { ref data } if data == &[0.0]),
+                        "parameter gradient shape mismatch without a zero placeholder",
+                    );
+                    continue;
+                }
                 let param_buf = self.plan.param_buffers[i].1;
                 let grad_buf = self.get_buffer(outputs[num_user + i]);
                 self.plan.param_grad_pairs.push((param_buf, grad_buf));
@@ -4330,6 +4343,23 @@ mod tests {
         assert_eq!(plan.param_grad_pairs.len(), 1);
         // param buffer and grad buffer should be different
         assert_ne!(plan.param_grad_pairs[0].0, plan.param_grad_pairs[0].1);
+    }
+
+    #[test]
+    fn frozen_parameter_is_excluded_from_param_grad_pairs() {
+        let mut g = Graph::new();
+        let trained = g.parameter("trained", &[8]);
+        let frozen = g.parameter("frozen", &[8]);
+        let frozen = g.stop_gradient(frozen);
+        let sum = g.add(trained, frozen);
+        let loss = g.mean_all(sum);
+        g.set_outputs(vec![loss]);
+
+        let diff = crate::autodiff::differentiate(&g);
+        let plan = compile(&diff);
+        assert_eq!(plan.param_buffers.len(), 2);
+        assert_eq!(plan.param_grad_pairs.len(), 1);
+        assert_eq!(plan.param_grad_pairs[0].0, plan.param_buffers[0].1);
     }
 
     #[test]
