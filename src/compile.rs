@@ -2798,6 +2798,55 @@ impl<'a> Compiler<'a> {
                     ..Default::default()
                 });
             }
+            Op::SoftplusGrad { beta } => {
+                let grad_output = self.get_buffer(node.inputs[0]);
+                let input = self.get_buffer(node.inputs[1]);
+                let len = node.ty.num_elements() as u32;
+                let pointwise = PointwiseDAG {
+                    n_inputs: 2,
+                    ops: vec![
+                        Pw::LoadInput(0),            // 0: upstream gradient
+                        Pw::LoadInput(1),            // 1: x
+                        Pw::const_f32(beta),         // 2: beta
+                        Pw::Mul(1, 2),               // 3: beta * x
+                        Pw::const_f32(beta.recip()), // 4: 1 / beta
+                        Pw::Mul(0, 4),               // 5: gradient after final scale
+                        Pw::Abs(3),                  // 6: abs(beta * x)
+                        Pw::Sigmoid(6),              // 7: stable probability
+                        Pw::Neg(5),                  // 8: gradient through negation
+                        Pw::Recip(7),                // 9: gradient through logarithm
+                        Pw::Mul(8, 9),               // 10: log input gradient
+                        Pw::const_f32(1.0),          // 11: one
+                        Pw::Neg(7),                  // 12: -probability
+                        Pw::Add(11, 12),             // 13: 1 - probability
+                        Pw::Mul(7, 13),              // 14: sigmoid derivative
+                        Pw::Mul(10, 14),             // 15: abs output gradient
+                        Pw::const_f32(0.0),          // 16: zero
+                        Pw::Greater(3, 16),          // 17: positive mask for abs
+                        Pw::const_f32(2.0),          // 18: two
+                        Pw::Mul(17, 18),             // 19: doubled mask
+                        Pw::const_f32(1.0),          // 20: one
+                        Pw::Neg(20),                 // 21: negative one
+                        Pw::Add(19, 21),             // 22: sign(beta * x)
+                        Pw::Mul(15, 22),             // 23: abs branch gradient
+                        Pw::const_f32(0.0),          // 24: zero
+                        Pw::Greater(3, 24),          // 25: ReLU mask
+                        Pw::Mul(5, 25),              // 26: ReLU branch gradient
+                        Pw::Add(23, 26),             // 27: accumulated beta*x gradient
+                        Pw::Mul(27, 2),              // 28: input gradient
+                    ],
+                    output: 28,
+                };
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::Add,
+                    workgroups: [len.div_ceil(256), 1, 1],
+                    input_buffers: vec![grad_output, input],
+                    output_buffer: out_buf,
+                    params: vec![len, 0, 0, 0],
+                    pointwise: Some(pointwise),
+                    ..Default::default()
+                });
+            }
 
             Op::SumAll => {
                 let input = self.get_buffer(node.inputs[0]);

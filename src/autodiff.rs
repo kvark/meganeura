@@ -407,11 +407,11 @@ pub fn differentiate(forward: &Graph) -> Graph {
             }
             Op::Softplus { beta } => {
                 let x = node.inputs[0];
-                let x_ty = &forward.nodes()[x as usize].ty;
-                let beta = graph.constant(vec![beta; x_ty.num_elements()], &x_ty.shape);
-                let scaled = graph.mul(x, beta);
-                let slope = graph.sigmoid(scaled);
-                let grad_x = graph.mul(grad_output, slope);
+                let grad_x = graph.add_raw_node(
+                    Op::SoftplusGrad { beta },
+                    vec![grad_output, x],
+                    forward.nodes()[x as usize].ty.clone(),
+                );
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
             Op::Transpose => {
@@ -924,6 +924,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::Conv2dGradWeight { .. }
             | Op::GroupNormGradInput { .. }
             | Op::GroupNormGradWeightBias { .. }
+            | Op::SoftplusGrad { .. }
             | Op::Upsample2xGrad { .. } => {}
             Op::RoPE {
                 theta,
