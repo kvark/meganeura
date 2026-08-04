@@ -27,7 +27,12 @@ generator prints that audit and marks the affected table entry with
 
 `p3hpc/` holds the P3HPC (SC26 workshop) submission: IEEE format
 (vendored `IEEEtran.cls`/`.bst`), single-blind, reuses `../tables/` and
-`../references.bib`. Build the same way from inside that directory.
+`../references.bib`. Build the same way from inside that directory, but
+note that IEEEtran needs the PostScript base fonts (Times/Courier/
+Helvetica), which the small TeX Live image lacks --- run
+`tlmgr install collection-fontsrecommended` in the container first (or
+use the full `texlive/texlive:latest` image). Do not substitute
+`lmodern`: it silently replaces the IEEE Times font.
 Deadline: August 12, 2026.
 
 Build locally with:
