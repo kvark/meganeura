@@ -341,7 +341,15 @@ impl ShaderEntry {
             | ShaderEntry::GroupNormGradInput
             | ShaderEntry::GroupNormGradWeightBias
             | ShaderEntry::GlobalAvgPool
-            | ShaderEntry::GlobalAvgPoolGrad => "normalization_reduction",
+            | ShaderEntry::GlobalAvgPoolGrad
+            | ShaderEntry::NormalizeInnerSum
+            | ShaderEntry::NormalizeInnerSumGrad
+            | ShaderEntry::PairwiseSquaredDistance
+            | ShaderEntry::PairwiseSquaredDistanceGradLeft
+            | ShaderEntry::PairwiseSquaredDistanceGradRight
+            | ShaderEntry::PairwiseVectorRejection
+            | ShaderEntry::PairwiseVectorRejectionGradVectors
+            | ShaderEntry::PairwiseVectorRejectionGradDirections => "normalization_reduction",
 
             ShaderEntry::SgdUpdate
             | ShaderEntry::AdamUpdate
@@ -355,6 +363,9 @@ impl ShaderEntry {
             | ShaderEntry::ScatterAddAtomic
             | ShaderEntry::ScatterAddAtomicRowMul
             | ShaderEntry::BroadcastInner
+            | ShaderEntry::Materialize
+            | ShaderEntry::TileInner
+            | ShaderEntry::TileInnerGrad
             | ShaderEntry::ExclusiveCumsum
             | ShaderEntry::ShiftInner
             | ShaderEntry::Transpose
@@ -372,6 +383,7 @@ impl ShaderEntry {
             | ShaderEntry::Abs
             | ShaderEntry::Log
             | ShaderEntry::Recip
+            | ShaderEntry::Exp
             | ShaderEntry::Add
             | ShaderEntry::Mul
             | ShaderEntry::Greater
@@ -1338,21 +1350,117 @@ fn fuse_pointwise_chains(plan: &mut ExecutionPlan) {
     }
 }
 
-/// Post-compile pass: fold single-use producers into a reduction
-/// dispatch's prologue, eliminating intermediate buffers. Two phases:
+fn shared_pointwise_consumers_are_foldable(
+    plan: &ExecutionPlan,
+    buffer: BufferRef,
+    producer: &Dispatch,
+    read_count: usize,
+) -> bool {
+    let mut foldable_reads = 0usize;
+    for dispatch in &plan.dispatches {
+        if dispatch.epilogue_buffers.contains(&buffer) {
+            return false;
+        }
+        let occurrences = dispatch
+            .input_buffers
+            .iter()
+            .filter(|&&input| input == buffer)
+            .count();
+        if occurrences == 0 {
+            continue;
+        }
+        if occurrences > 1 {
+            return false;
+        }
+        let Some(ref kernel) = dispatch.reduction else {
+            return false;
+        };
+        let per_elem = kernel.n_per_elem as usize;
+        let input_index = dispatch
+            .input_buffers
+            .iter()
+            .position(|&input| input == buffer)
+            .unwrap();
+        if kernel.gather_elem.iter().any(|&g| g)
+            || kernel.n_per_row != 0
+            || input_index >= per_elem
+            || producer.params.first().copied()
+                != Some(dispatch.params[0].saturating_mul(dispatch.params[1]))
+            || per_elem - 1 + producer.input_buffers.len() > 3
+        {
+            return false;
+        }
+        foldable_reads += 1;
+    }
+    foldable_reads == read_count
+}
+
+fn shared_embedding_consumers_are_foldable(
+    plan: &ExecutionPlan,
+    buffer: BufferRef,
+    outer: u32,
+    inner: u32,
+    read_count: usize,
+) -> bool {
+    let mut foldable_reads = 0usize;
+    for dispatch in &plan.dispatches {
+        if dispatch.epilogue_buffers.contains(&buffer) {
+            return false;
+        }
+        let occurrences = dispatch
+            .input_buffers
+            .iter()
+            .filter(|&&input| input == buffer)
+            .count();
+        if occurrences == 0 {
+            continue;
+        }
+        if occurrences > 1 {
+            return false;
+        }
+        let Some(ref kernel) = dispatch.reduction else {
+            return false;
+        };
+        if dispatch.params.first().copied() != Some(outer)
+            || dispatch.params.get(1).copied() != Some(inner)
+        {
+            return false;
+        }
+        let mut stream_position = 0usize;
+        let mut is_direct_stream = false;
+        for stream in 0..kernel.n_per_elem as usize {
+            let is_gather = kernel.gather_elem.get(stream).copied().unwrap_or(false);
+            if !is_gather && dispatch.input_buffers.get(stream_position) == Some(&buffer) {
+                is_direct_stream = true;
+                break;
+            }
+            stream_position += if is_gather { 2 } else { 1 };
+        }
+        if !is_direct_stream {
+            return false;
+        }
+        foldable_reads += 1;
+    }
+    foldable_reads == read_count
+}
+
+/// Post-compile pass: fold producers into a reduction dispatch's prologue,
+/// eliminating intermediate buffers. Two phases:
 ///
 ///   Phase 1 (pointwise → prologue): a per-element input of the reduction
-///   produced by a single-use pointwise dispatch is folded into the
-///   prologue DAG via `PointwiseDAG::fuse_input` (grows `n_per_elem`).
+///   produced by a pointwise dispatch is folded into the prologue DAG via
+///   `PointwiseDAG::fuse_input` (grows `n_per_elem`). Shared producers are
+///   cloned only when all of their consumers are compatible reductions.
 ///   Runs while the reduction has no gather streams, so `input_buffers`
 ///   stays 1:1 with prologue inputs (no gather expansion to track).
 ///
-///   Phase 2 (gather → prologue): a per-element input produced by a
-///   single-use `Embedding` (indexed load) is marked a gather stream —
+///   Phase 2 (gather → prologue): a per-element input produced by an
+///   `Embedding` (indexed load) is marked a gather stream —
 ///   `gather_elem[s] = true`, and the stream's buffer is replaced by the
-///   table with the indices buffer spliced in right after. Valid because
-///   the gathered axis is the reduced (inner) axis: `embedding` params
-///   `[seq, hidden] = [outer, inner]`.
+///   table with the indices buffer spliced in right after. Shared embeddings
+///   are folded only when all consumers are compatible reductions. This is
+///   valid because the gathered axis is the reduced (inner) axis: `embedding`
+///   params `[seq, hidden] = [outer, inner]`.
 ///
 /// Together these let `sum_inner(mul(embedding(idx,tbl), x))` collapse to
 /// one fused reduction kernel — the SH colour path — discovered from
@@ -1432,7 +1540,7 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                 let Some(&pi) = producer.get(&buf) else {
                     continue;
                 };
-                if pi == ci || reads.get(&buf).copied().unwrap_or(0) != 1 {
+                if pi == ci {
                     continue;
                 }
                 let p = &plan.dispatches[pi];
@@ -1446,6 +1554,13 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                 // Arity cap (binding vocab supports ≤3 per-elem streams).
                 let new_n_per_elem = per_elem - 1 + p.input_buffers.len();
                 if new_n_per_elem > 3 || kernel.n_per_row != 0 {
+                    continue;
+                }
+
+                let read_count = reads.get(&buf).copied().unwrap_or(0);
+                if read_count > 1
+                    && !shared_pointwise_consumers_are_foldable(plan, buf, p, read_count)
+                {
                     continue;
                 }
 
@@ -1474,7 +1589,9 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                 }
                 c.input_buffers = new_inputs;
                 c.origin.extend(producer_d.origin.iter().copied());
-                plan.dispatches.remove(pi);
+                if read_count == 1 {
+                    plan.dispatches.remove(pi);
+                }
                 fused = true;
                 break 'outer;
             }
@@ -1523,7 +1640,7 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                 let Some(&pi) = producer.get(&buf) else {
                     continue;
                 };
-                if pi == ci || reads.get(&buf).copied().unwrap_or(0) != 1 {
+                if pi == ci {
                     continue;
                 }
                 let p = &plan.dispatches[pi];
@@ -1538,8 +1655,15 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                 if !is_embedding {
                     continue;
                 }
+                let read_count = reads.get(&buf).copied().unwrap_or(0);
+                if read_count > 1
+                    && !shared_embedding_consumers_are_foldable(plan, buf, outer, inner, read_count)
+                {
+                    continue;
+                }
                 let idx_buf = p.input_buffers[0]; // Embedding inputs[0] = indices
                 let table_buf = p.input_buffers[1]; // inputs[1] = table
+                let producer_origin = p.origin.clone();
 
                 let c = &mut plan.dispatches[ci];
                 let kernel = c.reduction.as_mut().expect("checked");
@@ -1551,11 +1675,10 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                 // table, and splice the indices buffer right after it.
                 c.input_buffers[flat_pos] = table_buf;
                 c.input_buffers.insert(flat_pos + 1, idx_buf);
+                c.origin.extend(producer_origin);
                 // Drop the embedding dispatch if it's now unused.
                 if reads.get(&buf).copied().unwrap_or(0) == 1 {
-                    let removed = plan.dispatches.remove(pi);
-                    let ci = if pi < ci { ci - 1 } else { ci };
-                    plan.dispatches[ci].origin.extend(removed.origin);
+                    plan.dispatches.remove(pi);
                 }
                 fused = true;
                 break 'outer2;
