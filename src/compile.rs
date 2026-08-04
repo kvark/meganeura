@@ -3689,13 +3689,22 @@ impl<'a> Compiler<'a> {
                 let x_shape = &self.graph.node(node.inputs[1]).ty.shape;
                 let rows = x_shape[0] as u32;
                 let cols = x_shape[1] as u32;
+                const WG: u32 = 256;
+                let lanes_per_row = if (2..=32).contains(&cols) {
+                    cols.next_power_of_two()
+                } else {
+                    0
+                };
+                let workgroups = WG
+                    .checked_div(lanes_per_row)
+                    .map_or(rows, |packed_rows| rows.div_ceil(packed_rows));
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::RmsNormGradX,
-                    workgroups: [rows, 1, 1],
+                    workgroups: [workgroups, 1, 1],
                     input_buffers: vec![dy, x, w],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
-                    params: vec![rows, cols, eps.to_bits(), 0],
+                    params: vec![rows, cols, eps.to_bits(), lanes_per_row],
                     use_coop: false,
                     use_small_tiles: false,
                     ..Default::default()
@@ -3907,6 +3916,14 @@ impl<'a> Compiler<'a> {
         use crate::schedule::{PointwiseDAG, Pw, ReduceOp, ReductionEpilogue, ReductionKernel};
 
         const WG: u32 = 256;
+        // A power-of-two lane group at least as wide as the row preserves the
+        // existing tree-reduction order. Pack several narrow rows into the
+        // otherwise idle lanes of one workgroup.
+        let rows_per_workgroup = if (2..=32).contains(&cols) {
+            WG / cols.next_power_of_two()
+        } else {
+            1
+        };
 
         // Prologue: v*v → scalar contribution to sum-of-squares.
         let prologue = PointwiseDAG {
@@ -3950,14 +3967,14 @@ impl<'a> Compiler<'a> {
             n_per_elem: 1,
             n_per_row: 0,
             workgroup_size: WG,
-            rows_per_workgroup: 1,
+            rows_per_workgroup,
             gather_elem: Vec::new(),
         };
 
         // Uses RmsNormData layout: src + bias (per-col weight) + dst + params.
         self.plan.dispatches.push(Dispatch {
             shader: ShaderEntry::RmsNorm, // sentinel for layout
-            workgroups: [rows, 1, 1],
+            workgroups: [rows.div_ceil(rows_per_workgroup), 1, 1],
             input_buffers: vec![x, w],
             output_buffer: out_buf,
             extra_outputs: vec![],
@@ -4171,6 +4188,40 @@ mod tests {
         );
         let product_kernel = product_plan.dispatches[0].reduction.as_ref().unwrap();
         assert_eq!(product_kernel.n_per_elem, 2);
+    }
+
+    #[test]
+    fn rms_norm_packs_narrow_rows_only() {
+        let mut narrow = Graph::new();
+        let x = narrow.input("x", &[100, 3]);
+        let weight = narrow.input("weight", &[3]);
+        let output = narrow.rms_norm(x, weight, 1.0e-6);
+        narrow.set_outputs(vec![output]);
+        let narrow_plan = compile(&narrow);
+        let forward = &narrow_plan.dispatches[0];
+        assert_eq!(forward.workgroups, [2, 1, 1]);
+        assert_eq!(forward.reduction.as_ref().unwrap().rows_per_workgroup, 64);
+
+        let mut narrow_grad = Graph::new();
+        let dy = narrow_grad.input("dy", &[100, 3]);
+        let x = narrow_grad.input("x", &[100, 3]);
+        let weight = narrow_grad.input("weight", &[3]);
+        let output = narrow_grad.rms_norm_grad_x(dy, x, weight, 1.0e-6);
+        narrow_grad.set_outputs(vec![output]);
+        let narrow_grad_plan = compile(&narrow_grad);
+        let grad_x = &narrow_grad_plan.dispatches[0];
+        assert_eq!(grad_x.workgroups, [2, 1, 1]);
+        assert_eq!(grad_x.params[3], 4);
+
+        let mut wide = Graph::new();
+        let dy = wide.input("dy", &[100, 33]);
+        let x = wide.input("x", &[100, 33]);
+        let weight = wide.input("weight", &[33]);
+        let output = wide.rms_norm_grad_x(dy, x, weight, 1.0e-6);
+        wide.set_outputs(vec![output]);
+        let wide_plan = compile(&wide);
+        assert_eq!(wide_plan.dispatches[0].workgroups, [100, 1, 1]);
+        assert_eq!(wide_plan.dispatches[0].params[3], 0);
     }
 
     #[test]
