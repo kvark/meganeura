@@ -196,6 +196,50 @@ fn sum_inner_gradient_repeats_each_row_bit_exactly() {
     }
 }
 
+#[test]
+fn broadcast_inner_forward_and_gradient_match_explicit_repetition() {
+    const ROWS: usize = 513;
+    const COLS: usize = 8;
+    let input_data = (0..ROWS)
+        .map(|row| ((row * 31 % 127) as f32 - 63.0) * 0.017)
+        .collect::<Vec<_>>();
+    let weights_data = (0..ROWS * COLS)
+        .map(|index| ((index * 17 % 41) as f32 - 20.0) * 0.031)
+        .collect::<Vec<_>>();
+
+    let mut graph = Graph::new();
+    let input = graph.parameter("input", &[ROWS, 1]);
+    let repeated = graph.broadcast_inner(input, COLS);
+    let weights = graph.input("weights", &[ROWS, COLS]);
+    let weighted = graph.mul(repeated, weights);
+    let loss = graph.sum_all(weighted);
+    graph.set_outputs(vec![loss, repeated]);
+
+    let mut session = meganeura::build_session(&graph);
+    session.set_parameter("input", &input_data);
+    session.set_input("weights", &weights_data);
+    session.step();
+    session.wait();
+
+    let mut repeated_output = vec![0.0; ROWS * COLS];
+    session.read_output_by_index(1, &mut repeated_output);
+    let mut gradient = vec![0.0; ROWS];
+    session.read_param_grad("input", &mut gradient);
+    for row in 0..ROWS {
+        let mut expected_gradient = 0.0_f32;
+        for col in 0..COLS {
+            let index = row * COLS + col;
+            assert_eq!(repeated_output[index].to_bits(), input_data[row].to_bits());
+            expected_gradient += weights_data[index];
+        }
+        assert_eq!(
+            gradient[row].to_bits(),
+            expected_gradient.to_bits(),
+            "gradient mismatch at row {row}",
+        );
+    }
+}
+
 /// Phase 2: `sum_inner(mul(embedding(idx, table), basis))` — the SH colour
 /// path. Folds the gather (Embedding) into the reduction as a gather
 /// stream. Exercises the full gather codegen + dynamic binding.
