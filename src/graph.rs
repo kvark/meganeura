@@ -152,6 +152,20 @@ pub enum Op {
         inner: u32,
         pairs: u32,
     },
+    /// Remove each shared row direction from `pairs` consecutive vectors.
+    PairwiseVectorRejection {
+        pairs: u32,
+    },
+    /// Backward helper for vector inputs to [`Op::PairwiseVectorRejection`].
+    PairwiseVectorRejectionGradVectors {
+        inner: u32,
+        pairs: u32,
+    },
+    /// Backward helper for shared directions in [`Op::PairwiseVectorRejection`].
+    PairwiseVectorRejectionGradDirections {
+        inner: u32,
+        pairs: u32,
+    },
     /// Exclusive cumulative sum over the inner axis of a 2D tensor.
     ///
     /// Forward order emits `y[m, n] = sum(x[m, 0..n])`; reverse order emits
@@ -1271,6 +1285,52 @@ impl Graph {
         let pairs = u32::try_from(pairs).expect("pairwise distance pair count exceeds u32");
         let ty = TensorType::f32(vec![left_shape[0], pairs as usize]);
         self.add_raw_node(Op::PairwiseSquaredDistance { pairs }, vec![left, right], ty)
+    }
+
+    /// Remove each `[M, D]` unit direction's component from its `pairs`
+    /// consecutive vectors in `[M * pairs, D]`.
+    pub fn pairwise_vector_rejection(
+        &mut self,
+        vectors: NodeId,
+        directions: NodeId,
+        pairs: usize,
+    ) -> NodeId {
+        let vector_ty = self.node(vectors).ty.clone();
+        let direction_shape = self.node(directions).ty.shape.clone();
+        assert_eq!(
+            vector_ty.shape.len(),
+            2,
+            "pairwise_vector_rejection expects 2D vectors, got {:?}",
+            vector_ty.shape
+        );
+        assert_eq!(
+            direction_shape.len(),
+            2,
+            "pairwise_vector_rejection expects 2D directions, got {direction_shape:?}"
+        );
+        assert!(
+            vector_ty.shape[1] > 0,
+            "pairwise vector rows must be non-empty"
+        );
+        assert!(
+            pairs > 0,
+            "pairwise vector rejection needs at least one pair"
+        );
+        let vector_rows = direction_shape[0]
+            .checked_mul(pairs)
+            .expect("pairwise vector row count overflows usize");
+        assert_eq!(
+            vector_ty.shape,
+            [vector_rows, direction_shape[1]],
+            "pairwise vectors must have shape [M * pairs, D]"
+        );
+        u32::try_from(direction_shape[1]).expect("pairwise vector width exceeds u32");
+        let pairs = u32::try_from(pairs).expect("pairwise vector pair count exceeds u32");
+        self.add_raw_node(
+            Op::PairwiseVectorRejection { pairs },
+            vec![vectors, directions],
+            vector_ty,
+        )
     }
 
     /// Exclusive cumulative sum over the inner axis of a 2D tensor.
