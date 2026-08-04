@@ -290,6 +290,16 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let grad_x = graph.sum_inner(grad_output);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
+            Op::NormalizeInnerSum { inner, floor } => {
+                let x = node.inputs[0];
+                let x_ty = forward.nodes()[x as usize].ty.clone();
+                let grad_x = graph.add_raw_node(
+                    Op::NormalizeInnerSumGrad { inner, floor },
+                    vec![grad_output, x],
+                    x_ty,
+                );
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
             Op::TileInner { repeats } => {
                 let x = node.inputs[0];
                 let x_ty = forward.nodes()[x as usize].ty.clone();
@@ -617,6 +627,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::LayerNormGradWB { .. }
             | Op::LayerNormGradX { .. }
             | Op::RoPEGrad { .. }
+            | Op::NormalizeInnerSumGrad { .. }
             | Op::TileInnerGrad { .. }
             | Op::PairwiseSquaredDistanceGradLeft { .. }
             | Op::PairwiseSquaredDistanceGradRight { .. }
