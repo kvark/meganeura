@@ -161,6 +161,41 @@ fn narrow_sum_inner_matches_ones_matmul_bit_exactly() {
     }
 }
 
+#[test]
+fn sum_inner_gradient_repeats_each_row_bit_exactly() {
+    const ROWS: usize = 513;
+    const COLS: usize = 16;
+    let row_weights = (0..ROWS)
+        .map(|row| ((row * 31 % 127) as f32 - 63.0) * 0.017)
+        .collect::<Vec<_>>();
+
+    let mut graph = Graph::new();
+    let input = graph.parameter("input", &[ROWS, COLS]);
+    let reduced = graph.sum_inner(input);
+    let weights = graph.input("weights", &[ROWS, 1]);
+    let weighted = graph.mul(reduced, weights);
+    let loss = graph.sum_all(weighted);
+    graph.set_outputs(vec![loss]);
+
+    let mut session = meganeura::build_session(&graph);
+    session.set_parameter("input", &vec![0.0; ROWS * COLS]);
+    session.set_input("weights", &row_weights);
+    session.step();
+    session.wait();
+
+    let mut gradient = vec![0.0; ROWS * COLS];
+    session.read_param_grad("input", &mut gradient);
+    for row in 0..ROWS {
+        for col in 0..COLS {
+            assert_eq!(
+                gradient[row * COLS + col].to_bits(),
+                row_weights[row].to_bits(),
+                "gradient mismatch at [{row}, {col}]"
+            );
+        }
+    }
+}
+
 /// Phase 2: `sum_inner(mul(embedding(idx, table), basis))` — the SH colour
 /// path. Folds the gather (Embedding) into the reduction as a gather
 /// stream. Exercises the full gather codegen + dynamic binding.
