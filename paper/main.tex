@@ -263,14 +263,20 @@ order, buffer ownership, pipelines, and synchronization, and each
 application-managed graph-safe input buffer. This is an automation and
 usability distinction, not a claim that Blade pre-records a native command
 buffer or eliminates all host submission overhead.
-The tradeoff is observability. PyTorch provides a mature eager mode,
-operator-level inspection, autograd
-diagnostics, and integrated profilers. \system{} currently provides graph and
-dispatch-plan dumps, WGSL source-located parser errors, API validation,
-per-dispatch GPU timings, gradient summaries, and Perfetto traces, but a
-failure that crosses generated WGSL, Naga, Blade, and a vendor driver is still
-hard to localize. Source mapping, automatic graph bisection, captured
-intermediates, and a single operator replay tool are future work.
+At the frozen revision, the tradeoff was observability. PyTorch provided a
+mature eager mode, operator-level inspection, autograd diagnostics, and
+integrated profilers. \system{} provided graph and dispatch-plan dumps, WGSL
+source-located parser errors, API validation, per-dispatch GPU timings,
+gradient summaries, and Perfetto traces, but could not read arbitrary
+intermediates or attribute a numerical failure to its first graph node.
+Post-freeze work added names and dispatch provenance that survive autodiff,
+rewrites, and fusion; debug sessions with arbitrary node readback and first
+NaN/Inf attribution; and eager graph evaluation on the same generated
+kernels.\footnote{\url{https://github.com/kvark/meganeura/pull/137}}
+Those facilities were not used for the benchmark and are excluded from its
+source and binary measurements. PyTorch's debugging ecosystem remains much
+broader; automatic graph bisection and source mapping through Naga, Blade,
+and vendor drivers remain future work.
 
 \paragraph{Scale of the implementation.}
 ``Compact'' is meant as a measurable property rather than a stylistic one.
@@ -285,7 +291,11 @@ part of the explanation for them, in both directions: a kernel library of
 this size cannot cover what a vendor stack covers, so the gaps analyzed in
 Section~\ref{sec:gaps} are better read as a consequence of scope than as a
 property of the graphics APIs --- while the cells at parity show what the
-same budget already suffices for.
+same budget already suffices for. The count covers one graph compiler and one
+Blade/WGSL execution path rather than a collection of CUDA, ROCm, CPU, and
+graphics backends. The post-freeze work cited above also consolidated the
+shader set from 75 to 55 files; that reduction is not retroactively included
+in the frozen counts or results.
 
 \paragraph{Non-goals.}
 \system{} is not a complete replacement for PyTorch, does not cover arbitrary
@@ -1244,13 +1254,14 @@ fixed direct module submission, yet retained WGSL authoring because:
         cooperative variants.
 \end{itemize}
 
-The current system still has 75 WGSL files and 6.1 KLOC, so retreating from
-direct IR did not solve shader-family proliferation. During this work we
+The frozen system still has 75 WGSL files and 6.1 KLOC, so retreating from
+direct IR did not by itself solve shader-family proliferation. During this work we
 removed separate dK and dV shaders after making fused dK+dV the compiler
 invariant. The longer-term target is one typed generator per major archetype,
 with specialized kernels retained only when profiles justify them. The
 broader lesson is that the best interchange IR and the best authoring IR need
-not be the same representation.
+not be the same representation. Post-freeze consolidation reduced the shader
+inventory to 55 files, but is outside the measured revision.
 
 \section{Related Work}
 
@@ -1268,14 +1279,16 @@ makes compiled-artifact and runtime footprint a first-class result for
 embedded inference~\cite{liu2022tinyiree}; \system{} measures the same
 deployment concern for a graphics-API executable that also includes training.
 
-Burn is a close open-source implementation analogue: it is a Rust
-training-and-inference framework whose composable automatic differentiation
-supports GPU backends including Vulkan, Metal, and WebGPU
-\cite{simard2026burn}. Its broader framework and backend design establish
-that portable Rust autodiff is not itself new. The distinction measured here
-is one frozen native graphics-stack path evaluated across devices with matched
-forward/backward gates, vendor references, compile and deployment costs, and
-physical application co-tenancy.
+Burn is a close open-source implementation analogue, but not a like-for-like
+compactness baseline. Burn~0.21 is a broad Rust tensor and deep-learning
+framework whose documented GPU targets span CUDA, ROCm, Metal, Vulkan,
+WebGPU, and LibTorch, with CubeCL, Flex, and LibTorch CPU paths and composable
+backend decorators for autodiff, fusion, routing, and remote
+execution~\cite{simard2026burn}. That breadth establishes that portable Rust
+autodiff is not itself new. \system{}
+instead measures one native Blade/WGSL compiler path, including its complete
+12.8\,MiB runner, across devices with matched forward/backward gates, vendor
+references, compile and deployment costs, and physical application co-tenancy.
 
 TensorFlow.js demonstrated browser-resident training and inference through
 WebGL~\cite{smilkov2019tensorflowjs}; WebLLM shows that WebGPU can retain a
@@ -1370,10 +1383,10 @@ cross-vendor reproducibility of the strict contract, and
 \code{RelaxedPrecision}, a portable reduced-precision hint distinct from
 explicit f16 storage; both are future work at the shader boundary.
 
-The implementation has been optimized most heavily on NVIDIA hardware.
-Results on AMD, Apple, and integrated devices are therefore both a
-portability test and a maturity test --- which makes the AMD parity result
-more surprising, not less. The frozen matrix contains one machine per
+Development and tuning time was not recorded by platform, and substantial
+bring-up and profile-guided work occurred on AMD and Apple as well as NVIDIA.
+The matrix therefore cannot separate architectural portability from the
+uneven, evolving history of manual tuning. It contains one machine per
 vendor and class, AMD excepted (one discrete and one integrated machine),
 so per-device results should not be read as vendor-wide generalizations. The
 frozen matrix contains no Windows device: the Vulkan path is the same code
@@ -1416,7 +1429,9 @@ worst step, Metal attention backward was 58\% of the second-worst before a
 profile-guided pass reduced it, while cooperative-matrix coverage and
 selection explain several arithmetic-policy shifts. These are concrete
 specialization and policy targets; no API limitation is identified by the
-measurements.
+measurements. Optimization is ongoing, and the NVIDIA results do not establish
+a ceiling: how closely a portable graphics-API stack can ultimately approach
+a highly tuned CUDA/cuBLAS/cuDNN stack on that platform remains open.
 
 The shared stack does not eliminate systems work; it moves that work from
 several conversion/runtime boundaries into one inspectable compiler and
@@ -1452,18 +1467,14 @@ frozen tags.
 
 \section*{Acknowledgments}
 
-The author thanks the wgpu community for maintaining Naga, the shader
-validation and translation library that anchors \system{}'s portable shader
-boundary, and thanks their family for support and patience throughout this
-work.
+I thank my family for their support and patience throughout this work.
 
 \section*{AI-Assistance Disclosure}
 
 Generative AI tools were used for code review, benchmark-harness development,
-experimental debugging, and editorial assistance. The author designed the
-study, reviewed generated changes, executed the experiments, verified the
-reported claims and references, and accepts responsibility for the
-manuscript.
+experimental debugging, and editorial assistance. I designed the study,
+reviewed generated changes, executed the experiments, verified the reported
+claims and references, and accept responsibility for the manuscript.
 
 \bibliographystyle{plain}
 \bibliography{references}

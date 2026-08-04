@@ -275,7 +275,12 @@ matters for the oracle audit in Section~\ref{sec:oracle}. Finally, physical
 source-line counts put the layer at 34.5\,KLOC of Rust and 6.1\,KLOC of WGSL;
 tests and examples add 14.8\,KLOC. This is implementation scale, not a direct
 productivity metric, and it also explains the gaps: a kernel library of this
-size cannot cover everything mature vendor libraries cover.
+size cannot cover everything mature vendor libraries cover. The count covers
+one graph compiler and one Blade/WGSL path, not a collection of vendor, CPU,
+and graphics backends. Post-freeze work added persistent provenance,
+intermediate readback and first-NaN/Inf attribution, same-kernel eager
+evaluation, and reduced the shader inventory from 75 to 55 files;
+none enters the frozen counts or results.\footnote{\url{https://github.com/kvark/meganeura/pull/137}}
 
 \section{Methodology}
 \label{sec:method}
@@ -732,15 +737,18 @@ measurements are not a substitute for their programmer-facing method
 
 TVM, Glow, MLIR, and Triton established graph and kernel compilation for ML
 \cite{chen2018tvm,rotem2018glow,lattner2021mlir,tillet2019triton}; RAF
-extends whole-graph compilation to training~\cite{yu2023raf}. Burn is a
-close implementation analogue: a Rust training/inference framework with
-portable GPU backends~\cite{simard2026burn}. TensorFlow.js demonstrated
+extends whole-graph compilation to training~\cite{yu2023raf}. Burn~0.21 is a
+broader Rust analogue, not a like-for-like compactness baseline: its documented
+GPU targets span CUDA, ROCm, Metal, Vulkan, WebGPU, and LibTorch, with CubeCL,
+Flex, and LibTorch CPU paths and decorators for autodiff, fusion, routing, and
+remote execution~\cite{simard2026burn}. TensorFlow.js demonstrated
 browser-resident training and inference~\cite{smilkov2019tensorflowjs}, and
 systems for memory-constrained on-device training study a complementary
-resource regime~\cite{lin2022ondevice}. Portable autodiff is therefore not
-the novelty claimed here. The contribution is a frozen, validity-gated
-comparison of one native graphics path across discrete and integrated
-devices, coupled to profiles and deployment evidence.
+resource regime~\cite{lin2022ondevice}. Portable Rust autodiff is not the
+novelty claimed here. The contribution is a frozen, validity-gated comparison
+of one compact native graphics path --- including its complete 12.8\,MiB
+runner --- across discrete and integrated devices, coupled to profiles and
+deployment evidence.
 
 TinyIREE treats artifact and runtime footprint as first-class deployment
 results for embedded inference~\cite{liu2022tinyiree}; ExecuTorch deploys
@@ -793,10 +801,11 @@ the best valid observation between them, not an architecture-normalized
 roofline or globally best-known implementation. The gap profiles were
 captured one revision before the freeze; the NVIDIA profile's control median
 matches the frozen cell within 0.1\%, while the M3 profile is reported
-explicitly as the pre-optimization breakdown. Development and tuning effort
-was not balanced by vendor --- \system{} was optimized most heavily on
-NVIDIA --- so the matrix cannot separate architectural portability from the
-history of manual tuning. Finally, the operational productivity evidence
+explicitly as the pre-optimization breakdown. Development and tuning time was
+not recorded by platform, and substantial bring-up and profile-guided work
+occurred on AMD and Apple as well as NVIDIA. The matrix therefore cannot
+separate architectural portability from an uneven, evolving history of manual
+tuning. Finally, the operational productivity evidence
 does not measure developer time, learnability, maintenance cost, or debugging
 quality; it supports only the narrower definition stated in the Introduction.
 
@@ -812,6 +821,9 @@ where mature vendor libraries remain ahead. Profiles turn the largest deficits
 into concrete work on convolution derivatives, Metal attention backward,
 barrier policy, and cooperative-matrix selection. No measured gap requires
 an API-level explanation, but broader workloads could expose one.
+Optimization remains ongoing, leaving the NVIDIA ceiling open: how closely a
+portable graphics-API stack can approach tuned CUDA/cuBLAS/cuDNN remains
+unknown.
 
 Portability is also a support and validity result. One native stack runs on
 all five graphics paths, including the Intel machine with no usable vendor
@@ -827,22 +839,19 @@ platform support as one P3 problem.
 
 \section*{Acknowledgments}
 
-The author thanks the wgpu community for maintaining Naga, the shader
-validation and translation library that anchors \system{}'s portable shader
-boundary, and thanks their family for support and patience throughout this
-work.
+I thank my family for their support and patience throughout this work.
 
 Anthropic Claude and OpenAI Codex/GPT
 \cite{anthropic2026claude,openai2026codex} assisted code review,
 benchmark-harness and instrumentation development, experimental debugging,
 data analysis, and drafting and editing throughout all numbered sections and
 the Artifact Description.
-AI-generated draft passages were subsequently reviewed and revised by the
-author. Substantial portions of the \system{} and \inferena{} source code
---- themselves objects of study in this paper --- were likewise developed
-with AI assistance under the author's direction and review. The author
-designed the study, executed all experiments, verified the reported claims
-against the raw artifacts, and accepts full responsibility for the content.
+AI-generated draft passages were subsequently reviewed and revised.
+Substantial portions of the \system{} and \inferena{} source code ---
+themselves objects of study in this paper --- were likewise developed with AI
+assistance under my direction and review. I designed the study, executed all
+experiments, verified the reported claims against the raw artifacts, and
+accept full responsibility for the content.
 
 \appendix
 
@@ -885,7 +894,7 @@ HuggingFace; inputs are deterministic. One full strict-plus-accelerated
 sweep takes under an hour per machine, dominated by \code{torch.compile}.
 
 \textbf{Evaluation status.} The artifact was not independently evaluated
-before submission. The author regenerated every numeric table from the raw
+before submission. I regenerated every numeric table from the raw
 files, rebuilt the paper from a clean auxiliary state, and checked the
 load-bearing prose values against the artifacts. DinoVision's
 \href{https://github.com/kvark/dinovision}{source} and
