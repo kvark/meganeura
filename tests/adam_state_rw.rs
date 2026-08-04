@@ -1,5 +1,5 @@
 //! Verify the Adam-state read/write API: `read_adam_m`, `read_adam_v`,
-//! `write_adam_m`, `write_adam_v`, `adam_step_count`,
+//! `read_adam_states`, `write_adam_m`, `write_adam_v`, `adam_step_count`,
 //! `set_adam_step_count`. These are the building blocks for carrying
 //! optimizer state across a session rebuild — e.g. when a downstream
 //! training loop reshapes a parameter table (RadFoam densification was
@@ -90,4 +90,35 @@ fn adam_state_roundtrip_and_step_counter() {
         43,
         "step counter must increment from set value 42 to 43, not from 2 to 3"
     );
+}
+
+#[test]
+fn batched_adam_state_read_preserves_names_and_values() {
+    let mut graph = Graph::new();
+    let a = graph.parameter("a", &[3]);
+    let b = graph.parameter("b", &[2]);
+    let a_mean = graph.mean_all(a);
+    let b_mean = graph.mean_all(b);
+    let loss = graph.add(a_mean, b_mean);
+    graph.set_outputs(vec![loss]);
+
+    let mut session = build_session(&graph);
+    session.set_adam(0.01, 0.9, 0.999, 1.0e-8);
+    session.set_parameter("a", &[1.0, 2.0, 3.0]);
+    session.set_parameter("b", &[4.0, 5.0]);
+    session.step();
+    session.wait();
+
+    let a_m = [0.1, 0.2, 0.3];
+    let a_v = [1.1, 1.2, 1.3];
+    let b_m = [-0.4, -0.5];
+    let b_v = [2.4, 2.5];
+    session.write_adam_m("a", &a_m);
+    session.write_adam_v("a", &a_v);
+    session.write_adam_m("b", &b_m);
+    session.write_adam_v("b", &b_v);
+
+    let states = session.read_adam_states(&["b", "a"]);
+    assert_eq!(states[0], (b_m.to_vec(), b_v.to_vec()));
+    assert_eq!(states[1], (a_m.to_vec(), a_v.to_vec()));
 }
