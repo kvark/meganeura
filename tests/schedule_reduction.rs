@@ -385,6 +385,114 @@ fn pairwise_squared_distance_matches_explicit_forward_and_gradients() {
     }
 }
 
+#[test]
+fn pairwise_vector_rejection_matches_explicit_forward_and_gradients() {
+    const ROWS: usize = 257;
+    const INNER: usize = 3;
+    const PAIRS: usize = 8;
+    let vectors_data = (0..ROWS * PAIRS * INNER)
+        .map(|index| ((index * 31 % 127) as f32 - 63.0) * 0.017)
+        .collect::<Vec<_>>();
+    let directions_data = (0..ROWS * INNER)
+        .map(|index| ((index * 19 % 109) as f32 - 54.0) * 0.013)
+        .collect::<Vec<_>>();
+    let weights_data = (0..ROWS * PAIRS * INNER)
+        .map(|index| ((index * 17 % 41) as f32 - 20.0) * 0.031)
+        .collect::<Vec<_>>();
+
+    let mut graph = Graph::new();
+    let vectors = graph.parameter("vectors", &[ROWS * PAIRS, INNER]);
+    let directions = graph.parameter("directions", &[ROWS, INNER]);
+    let rejected = graph.pairwise_vector_rejection(vectors, directions, PAIRS);
+    let weights = graph.input("weights", &[ROWS * PAIRS, INNER]);
+    let weighted = graph.mul(rejected, weights);
+    let loss = graph.sum_all(weighted);
+    graph.set_outputs(vec![loss, rejected]);
+
+    let mut session = meganeura::build_session(&graph);
+    session.set_parameter("vectors", &vectors_data);
+    session.set_parameter("directions", &directions_data);
+    session.set_input("weights", &weights_data);
+    session.step();
+    session.wait();
+
+    let mut rejected_output = vec![0.0; ROWS * PAIRS * INNER];
+    session.read_output_by_index(1, &mut rejected_output);
+    let mut vectors_gradient = vec![0.0; ROWS * PAIRS * INNER];
+    session.read_param_grad("vectors", &mut vectors_gradient);
+    let mut directions_gradient = vec![0.0; ROWS * INNER];
+    session.read_param_grad("directions", &mut directions_gradient);
+
+    for row in 0..ROWS {
+        let direction_begin = row * INNER;
+        for pair in 0..PAIRS {
+            let vector_begin = (row * PAIRS + pair) * INNER;
+            let mut component = 0.0_f32;
+            let mut grad_component = 0.0_f32;
+            for column in 0..INNER {
+                component +=
+                    vectors_data[vector_begin + column] * directions_data[direction_begin + column];
+                grad_component +=
+                    weights_data[vector_begin + column] * directions_data[direction_begin + column];
+            }
+            grad_component = -grad_component;
+            for column in 0..INNER {
+                let index = vector_begin + column;
+                let projection = directions_data[direction_begin + column] * component;
+                let expected = vectors_data[index] + (-projection);
+                assert!(
+                    (rejected_output[index] - expected).abs()
+                        <= rejected_output[index].abs().max(expected.abs()) * 1.0e-6 + 2.0e-7,
+                    "rejection mismatch at [{row}, {pair}, {column}]: {} != {}",
+                    rejected_output[index],
+                    expected,
+                );
+
+                let indirect = directions_data[direction_begin + column] * grad_component;
+                let expected_gradient = weights_data[index] + indirect;
+                assert!(
+                    (vectors_gradient[index] - expected_gradient).abs()
+                        <= vectors_gradient[index].abs().max(expected_gradient.abs()) * 1.0e-6
+                            + 2.0e-7,
+                    "vector gradient mismatch at [{row}, {pair}, {column}]: {} != {}",
+                    vectors_gradient[index],
+                    expected_gradient,
+                );
+            }
+        }
+
+        for output_column in 0..INNER {
+            let mut expected_gradient = 0.0_f32;
+            for pair in 0..PAIRS {
+                let vector_begin = (row * PAIRS + pair) * INNER;
+                let mut component = 0.0_f32;
+                let mut grad_component = 0.0_f32;
+                for column in 0..INNER {
+                    component += vectors_data[vector_begin + column]
+                        * directions_data[direction_begin + column];
+                    grad_component += weights_data[vector_begin + column]
+                        * directions_data[direction_begin + column];
+                }
+                let direct = (-weights_data[vector_begin + output_column]) * component;
+                let indirect = vectors_data[vector_begin + output_column] * (-grad_component);
+                expected_gradient += direct + indirect;
+            }
+            let index = direction_begin + output_column;
+            assert!(
+                (directions_gradient[index] - expected_gradient).abs()
+                    <= directions_gradient[index]
+                        .abs()
+                        .max(expected_gradient.abs())
+                        * 1.0e-6
+                        + 2.0e-7,
+                "direction gradient mismatch at [{row}, {output_column}]: {} != {}",
+                directions_gradient[index],
+                expected_gradient,
+            );
+        }
+    }
+}
+
 /// Phase 2: `sum_inner(mul(embedding(idx, table), basis))` — the SH colour
 /// path. Folds the gather (Embedding) into the reduction as a gather
 /// stream. Exercises the full gather codegen + dynamic binding.

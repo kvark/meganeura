@@ -322,6 +322,26 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 accumulate_grad(&mut graph, &mut grads, left, grad_left);
                 accumulate_grad(&mut graph, &mut grads, right, grad_right);
             }
+            Op::PairwiseVectorRejection { pairs } => {
+                let vectors = node.inputs[0];
+                let directions = node.inputs[1];
+                let vector_ty = forward.nodes()[vectors as usize].ty.clone();
+                let direction_ty = forward.nodes()[directions as usize].ty.clone();
+                let inner = u32::try_from(direction_ty.shape[1])
+                    .expect("pairwise vector width exceeds u32");
+                let grad_vectors = graph.add_raw_node(
+                    Op::PairwiseVectorRejectionGradVectors { inner, pairs },
+                    vec![grad_output, vectors, directions],
+                    vector_ty,
+                );
+                let grad_directions = graph.add_raw_node(
+                    Op::PairwiseVectorRejectionGradDirections { inner, pairs },
+                    vec![grad_output, vectors, directions],
+                    direction_ty,
+                );
+                accumulate_grad(&mut graph, &mut grads, vectors, grad_vectors);
+                accumulate_grad(&mut graph, &mut grads, directions, grad_directions);
+            }
             Op::ExclusiveCumsum { reverse } => {
                 // The transpose of a left-to-right exclusive prefix sum is a
                 // right-to-left exclusive suffix sum, and vice versa.
@@ -595,6 +615,8 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::TileInnerGrad { .. }
             | Op::PairwiseSquaredDistanceGradLeft { .. }
             | Op::PairwiseSquaredDistanceGradRight { .. }
+            | Op::PairwiseVectorRejectionGradVectors { .. }
+            | Op::PairwiseVectorRejectionGradDirections { .. }
             | Op::GlobalAvgPoolGrad { .. } => {}
             Op::Gelu => {
                 // gelu(x) ≈ x * sigmoid(1.702 * x) (sigmoid approximation)
