@@ -146,6 +146,71 @@ fn exp_matches_cpu_forward_and_gradient() {
 }
 
 #[test]
+fn softplus_matches_stable_cpu_forward_and_gradient() {
+    const BETA: f32 = 10.0;
+    const LEN: usize = 513;
+    let mut input = (0..LEN)
+        .map(|index| ((index * 19 % 101) as f32 - 50.0) * 0.06)
+        .collect::<Vec<_>>();
+    input[LEN / 2] = 0.0;
+    let weights = (0..LEN)
+        .map(|index| ((index * 13 % 47) as f32 - 23.0) * 0.03)
+        .collect::<Vec<_>>();
+
+    let mut graph = Graph::new();
+    let x = graph.parameter("x", &[LEN]);
+    let y = graph.softplus(x, BETA);
+    let weight = graph.input("weight", &[LEN]);
+    let weighted = graph.mul(y, weight);
+    let loss = graph.sum_all(weighted);
+    graph.set_outputs(vec![loss, y]);
+
+    let mut session = meganeura::build_session(&graph);
+    session.set_parameter("x", &input);
+    session.set_input("weight", &weights);
+    session.step();
+    session.wait();
+
+    let mut output = vec![0.0_f32; LEN];
+    session.read_output_by_index(1, &mut output);
+    let mut gradient = vec![0.0_f32; LEN];
+    session.read_param_grad("x", &mut gradient);
+    for index in 0..LEN {
+        let scaled = BETA * input[index];
+        let expected = (scaled.max(0.0) + (-scaled.abs()).exp().ln_1p()) / BETA;
+        let expected_gradient = weights[index] / (1.0 + (-scaled).exp());
+        assert!(
+            (output[index] - expected).abs()
+                <= output[index].abs().max(expected.abs()) * 1.0e-6 + 1.0e-7,
+            "forward mismatch at {index}: {} != {expected}",
+            output[index],
+        );
+        assert!(
+            (gradient[index] - expected_gradient).abs()
+                <= gradient[index].abs().max(expected_gradient.abs()) * 1.0e-6 + 1.0e-7,
+            "gradient mismatch at {index}: {} != {expected_gradient}",
+            gradient[index],
+        );
+    }
+}
+
+#[test]
+fn softplus_compiles_to_one_pointwise_dispatch() {
+    use meganeura::compile::{CompileOptions, compile_with};
+
+    let mut graph = Graph::new();
+    let x = graph.input("x", &[513]);
+    let y = graph.softplus(x, 10.0);
+    graph.set_outputs(vec![y]);
+
+    let plan = compile_with(&graph, &CompileOptions::default());
+    assert_eq!(plan.dispatches.len(), 1);
+    let dispatch = &plan.dispatches[0];
+    assert_eq!(dispatch.input_buffers.len(), 1);
+    assert!(dispatch.pointwise.is_some());
+}
+
+#[test]
 fn chain_relu_neg_parity() {
     // Two unary ops in sequence exercise two separately-generated
     // pointwise pipelines in the same plan.
