@@ -115,6 +115,11 @@ pub enum Op {
     Softplus {
         beta: f32,
     },
+    /// Backward helper for [`Op::Softplus`] that preserves the expanded
+    /// stable identity's evaluation order.
+    SoftplusGrad {
+        beta: f32,
+    },
 
     // Reduction
     SumAll,

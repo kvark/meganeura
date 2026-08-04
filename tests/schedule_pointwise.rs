@@ -195,6 +195,62 @@ fn softplus_matches_stable_cpu_forward_and_gradient() {
 }
 
 #[test]
+fn softplus_preserves_expanded_gradient_bits() {
+    const BETA: f32 = 10.0;
+    const LEN: usize = 513;
+    let input = (0..LEN)
+        .map(|index| ((index * 19 % 101) as f32 - 50.0) * 0.06)
+        .collect::<Vec<_>>();
+    let weights = (0..LEN)
+        .map(|index| ((index * 13 % 47) as f32 - 23.0) * 0.03)
+        .collect::<Vec<_>>();
+
+    let mut graph = Graph::new();
+    let expanded_x = graph.parameter("expanded_x", &[LEN]);
+    let beta = graph.constant(vec![BETA; LEN], &[LEN]);
+    let scaled = graph.mul(expanded_x, beta);
+    let positive = graph.relu(scaled);
+    let magnitude = graph.abs(scaled);
+    let probability = graph.sigmoid(magnitude);
+    let log_probability = graph.log(probability);
+    let correction = graph.neg(log_probability);
+    let stable_sum = graph.add(positive, correction);
+    let inverse_beta = graph.constant(vec![BETA.recip(); LEN], &[LEN]);
+    let expanded = graph.mul(stable_sum, inverse_beta);
+
+    let fused_x = graph.parameter("fused_x", &[LEN]);
+    let fused = graph.softplus(fused_x, BETA);
+    let weight = graph.input("weight", &[LEN]);
+    let expanded_weighted = graph.mul(expanded, weight);
+    let fused_weighted = graph.mul(fused, weight);
+    let expanded_loss = graph.sum_all(expanded_weighted);
+    let fused_loss = graph.sum_all(fused_weighted);
+    let loss = graph.add(expanded_loss, fused_loss);
+    graph.set_outputs(vec![loss, expanded, fused]);
+
+    let mut session = meganeura::build_session(&graph);
+    session.set_parameter("expanded_x", &input);
+    session.set_parameter("fused_x", &input);
+    session.set_input("weight", &weights);
+    session.step();
+    session.wait();
+
+    let mut expanded_output = vec![0.0_f32; LEN];
+    session.read_output_by_index(1, &mut expanded_output);
+    let mut fused_output = vec![0.0_f32; LEN];
+    session.read_output_by_index(2, &mut fused_output);
+    for (expanded, fused) in expanded_output.iter().zip(&fused_output) {
+        assert!((expanded - fused).abs() <= expanded.abs().max(fused.abs()) * 1.0e-6 + 1.0e-7);
+    }
+
+    let mut expanded_gradient = vec![0.0_f32; LEN];
+    session.read_param_grad("expanded_x", &mut expanded_gradient);
+    let mut fused_gradient = vec![0.0_f32; LEN];
+    session.read_param_grad("fused_x", &mut fused_gradient);
+    assert_eq!(expanded_gradient, fused_gradient);
+}
+
+#[test]
 fn softplus_compiles_to_one_pointwise_dispatch() {
     use meganeura::compile::{CompileOptions, compile_with};
 
