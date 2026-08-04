@@ -22,8 +22,7 @@
 \newcommand{\inferena}{Inferena}
 \newcommand{\code}[1]{\texttt{#1}}
 
-\title{Vulkan and Metal as a Performance-Portability Layer for GPU
-Training and Inference}
+\title{Meganeura: Compact GPU Training and Inference Across Vulkan and Metal}
 
 \author{\IEEEauthorblockN{Dzmitry Malyshau}
 \IEEEauthorblockA{Independent Researcher\\
@@ -33,38 +32,20 @@ kvark@fastmail.com \quad ORCID: 0009-0005-6410-4276}}
 \maketitle
 
 \begin{abstract}
-Performance-portability work usually evaluates source-level abstractions.
-We ask whether consumer graphics APIs can instead be the execution layer
-for machine-learning workloads across heterogeneous GPUs. \system{} is a
-compact compiler/runtime (34.5\,KLOC of Rust and 6.1\,KLOC of WGSL) that
-transforms typed static inference and automatically differentiated training
-graphs into specialized Vulkan/Metal kernels and fixed dispatch plans. We
-compare five matched workloads with PyTorch's best usable backend on five
-consumer machines spanning NVIDIA, AMD, Intel, and Apple.
-
-Under a strict-f32 contract, \system{} wins 12 of 20 GPU-referenced
-minimal-shape latency cells, while its median valid training time is
-$1.8\times$ PyTorch's.
-On the discrete AMD GPU, four of five inference workloads are within
-$1.10\times$ of compiled ROCm PyTorch and three training workloads are
-faster. Separate accelerated contracts expose both gains and regressions
-from capability-driven arithmetic policies; per-dispatch profiles localize
-the largest deficits to convolution derivatives and Metal attention
-backward. Independent forward and backward comparisons validate in 48 of
-50 device--workload--mode cells. In the other two, the PyTorch/ROCm
-Radeon~780M backward record disagrees with the other four PyTorch backends
-and with all five \system{} records; we classify that pair as
-oracle-disputed rather than as a \system{} failure.
-
-Using best-valid per-machine efficiency, Pennycook aggregation gives
-\system{} and PyTorch scores, respectively, of 0.75 and 0.81 for inference,
-0.83 and 0.73 for minimal-shape latency, and 0.62 and 0.93 for training.
-\system{} compiles models
-in 0.1--2.4\,s; its standalone runner, embedding the compiler and runtime,
-is 12.8\,MiB. A physical Quest~3S case study exercises the same compiler and
-checkpoint path inside an OpenXR application. The results establish graphics
-APIs as a viable ML portability layer where kernel coverage matches, while
-identifying the specialization and policy work still required.
+Can a compact native stack span training and deployed inference across
+consumer GPUs? \system{} (34.5\,KLOC of Rust, 6.1\,KLOC of WGSL;
+12.8\,MiB runner) lowers typed graphs and automatic differentiation to
+specialized Vulkan and Metal kernels. We compare five workloads with PyTorch
+on five NVIDIA, AMD, Intel, and Apple machines under correctness-gated
+strict-f32 and accelerated contracts. In strict f32, \system{} wins 12 of 20
+GPU-referenced minimal-latency cells; median valid training time is
+$1.8\times$ PyTorch's. On discrete AMD, four of five inference workloads are
+within $1.10\times$ PyTorch and three training workloads are faster.
+Forty-eight of 50 device--workload--mode cells validate; two are excluded
+symmetrically after a cross-backend audit identifies a PyTorch/ROCm oracle
+dispute. Profiles localize the largest gaps to convolution derivatives and
+Metal attention backward. Compilation takes 0.1--2.4\,s; a Quest~3S
+application physically exercises the same train-to-deploy path.
 \end{abstract}
 
 \begin{IEEEkeywords}
