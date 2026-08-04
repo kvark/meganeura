@@ -2342,9 +2342,13 @@ impl<'a> Compiler<'a> {
                 let tbl_shape = &self.graph.node(node.inputs[1]).ty.shape;
                 let seq = idx_shape[0] as u32;
                 let hidden = tbl_shape[1] as u32;
+                let workgroups = seq
+                    .checked_mul(hidden)
+                    .expect("embedding output exceeds u32 indexing")
+                    .div_ceil(256);
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::Embedding,
-                    workgroups: [seq * hidden.div_ceil(256), 1, 1],
+                    workgroups: [workgroups, 1, 1],
                     input_buffers: vec![indices, table],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
@@ -2363,9 +2367,13 @@ impl<'a> Compiler<'a> {
                 let tbl_shape = &self.graph.node(node.inputs[1]).ty.shape;
                 let seq = idx_shape[0] as u32;
                 let hidden = tbl_shape[1] as u32;
+                let workgroups = seq
+                    .checked_mul(hidden)
+                    .expect("embedding output exceeds u32 indexing")
+                    .div_ceil(256);
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::EmbeddingF16,
-                    workgroups: [seq * hidden.div_ceil(256), 1, 1],
+                    workgroups: [workgroups, 1, 1],
                     input_buffers: vec![indices, table],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
@@ -4222,6 +4230,32 @@ mod tests {
         let wide_plan = compile(&wide);
         assert_eq!(wide_plan.dispatches[0].workgroups, [100, 1, 1]);
         assert_eq!(wide_plan.dispatches[0].params[3], 0);
+    }
+
+    #[test]
+    fn embedding_dispatch_covers_only_output_elements() {
+        let mut f32_graph = Graph::new();
+        let indices = f32_graph.input_u32("indices", &[513]);
+        let table = f32_graph.input("table", &[17, 3]);
+        let output = f32_graph.embedding(indices, table);
+        f32_graph.set_outputs(vec![output]);
+        let f32_plan = compile(&f32_graph);
+        assert_eq!(f32_plan.dispatches[0].shader, ShaderEntry::Embedding);
+        assert_eq!(f32_plan.dispatches[0].workgroups, [7, 1, 1]);
+
+        let mut f16_graph = Graph::new();
+        let indices = f16_graph.input_u32("indices", &[513]);
+        let table = f16_graph.input("table", &[17, 257]);
+        let table = f16_graph.to_f16(table);
+        let output = f16_graph.embedding_f16(indices, table);
+        f16_graph.set_outputs(vec![output]);
+        let f16_plan = compile(&f16_graph);
+        let embedding = f16_plan
+            .dispatches
+            .iter()
+            .find(|dispatch| dispatch.shader == ShaderEntry::EmbeddingF16)
+            .unwrap();
+        assert_eq!(embedding.workgroups, [516, 1, 1]);
     }
 
     #[test]
