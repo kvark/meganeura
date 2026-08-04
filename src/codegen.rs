@@ -382,6 +382,8 @@ pub enum ShaderGroup {
     GlobalAvgPoolGrad,
     PairwiseSquaredDistance,
     PairwiseSquaredDistanceGrad,
+    PairwiseVectorRejection,
+    PairwiseVectorRejectionGrad,
     GradClipZero,
     GradClipNormSq,
     GradClipScale,
@@ -518,6 +520,12 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         }
         ShaderGroup::PairwiseSquaredDistanceGrad => {
             parse_wgsl(include_str!("shaders/pairwise_squared_distance_grad.wgsl"))
+        }
+        ShaderGroup::PairwiseVectorRejection => {
+            parse_wgsl(include_str!("shaders/pairwise_vector_rejection.wgsl"))
+        }
+        ShaderGroup::PairwiseVectorRejectionGrad => {
+            parse_wgsl(include_str!("shaders/pairwise_vector_rejection_grad.wgsl"))
         }
         ShaderGroup::GradClipZero => parse_wgsl(include_str!("shaders/grad_clip_zero.wgsl")),
         ShaderGroup::GradClipNormSq => parse_wgsl(include_str!("shaders/grad_clip_norm_sq.wgsl")),
@@ -4875,6 +4883,14 @@ mod tests {
                 naga::valid::Capabilities::empty(),
             ),
             (
+                ShaderGroup::PairwiseVectorRejection,
+                naga::valid::Capabilities::empty(),
+            ),
+            (
+                ShaderGroup::PairwiseVectorRejectionGrad,
+                naga::valid::Capabilities::empty(),
+            ),
+            (
                 ShaderGroup::GradClipZero,
                 naga::valid::Capabilities::empty(),
             ),
@@ -5053,6 +5069,8 @@ mod tests {
             (ShaderGroup::GlobalAvgPoolGrad, empty),
             (ShaderGroup::PairwiseSquaredDistance, empty),
             (ShaderGroup::PairwiseSquaredDistanceGrad, empty),
+            (ShaderGroup::PairwiseVectorRejection, empty),
+            (ShaderGroup::PairwiseVectorRejectionGrad, empty),
             (ShaderGroup::GradClipZero, empty),
             (ShaderGroup::GradClipNormSq, empty),
             (ShaderGroup::GradClipScale, empty),
@@ -5285,6 +5303,13 @@ mod tests {
                 | ShaderEntry::PairwiseSquaredDistanceGradRight => {
                     vec!["src_a", "src_b", "src_c", "dst", "params"]
                 }
+                ShaderEntry::PairwiseVectorRejection => {
+                    vec!["src_a", "src_b", "dst", "params"]
+                }
+                ShaderEntry::PairwiseVectorRejectionGradVectors
+                | ShaderEntry::PairwiseVectorRejectionGradDirections => {
+                    vec!["src_a", "src_b", "src_c", "dst", "params"]
+                }
                 ShaderEntry::WinogradInputTransform | ShaderEntry::WinogradOutputTransform => {
                     vec!["src", "dst", "params"]
                 }
@@ -5402,6 +5427,9 @@ mod tests {
             ShaderEntry::PairwiseSquaredDistance,
             ShaderEntry::PairwiseSquaredDistanceGradLeft,
             ShaderEntry::PairwiseSquaredDistanceGradRight,
+            ShaderEntry::PairwiseVectorRejection,
+            ShaderEntry::PairwiseVectorRejectionGradVectors,
+            ShaderEntry::PairwiseVectorRejectionGradDirections,
         ];
 
         for entry in &entries {
