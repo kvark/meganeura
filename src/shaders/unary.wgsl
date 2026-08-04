@@ -59,6 +59,13 @@ fn recip(@builtin(global_invocation_id) gid: vec3<u32>) {
     dst[i] = 1.0 / src[i];
 }
 
+@compute @workgroup_size(256)
+fn exp_(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if i >= params.len { return; }
+    dst[i] = exp(src[i]);
+}
+
 // silu: x * sigmoid(x) = x / (1 + exp(-x))
 @compute @workgroup_size(256)
 fn silu(@builtin(global_invocation_id) gid: vec3<u32>) {

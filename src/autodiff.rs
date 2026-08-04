@@ -390,6 +390,11 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let grad_x = graph.mul(grad_output, neg_recip_sq);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
+            Op::Exp => {
+                let x = node.inputs[0];
+                let grad_x = graph.mul(grad_output, node.id);
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
             Op::Transpose => {
                 let x = node.inputs[0];
                 let grad_x = graph.transpose(grad_output);

@@ -94,6 +94,58 @@ fn silu_parity() {
 }
 
 #[test]
+fn exp_parity() {
+    let input: Vec<f32> = (0..256).map(|i| (i as f32) * 0.04 - 5.0).collect();
+    assert_parity(&["x"], &[&input], 256, |g, xs| g.exp(xs[0]));
+}
+
+#[test]
+fn exp_matches_cpu_forward_and_gradient() {
+    const LEN: usize = 513;
+    let input = (0..LEN)
+        .map(|index| ((index * 19 % 101) as f32 - 50.0) * 0.06)
+        .collect::<Vec<_>>();
+    let weights = (0..LEN)
+        .map(|index| ((index * 13 % 47) as f32 - 23.0) * 0.03)
+        .collect::<Vec<_>>();
+
+    let mut graph = Graph::new();
+    let x = graph.parameter("x", &[LEN]);
+    let y = graph.exp(x);
+    let weight = graph.input("weight", &[LEN]);
+    let weighted = graph.mul(y, weight);
+    let loss = graph.sum_all(weighted);
+    graph.set_outputs(vec![loss, y]);
+
+    let mut session = meganeura::build_session(&graph);
+    session.set_parameter("x", &input);
+    session.set_input("weight", &weights);
+    session.step();
+    session.wait();
+
+    let mut output = vec![0.0_f32; LEN];
+    session.read_output_by_index(1, &mut output);
+    let mut gradient = vec![0.0_f32; LEN];
+    session.read_param_grad("x", &mut gradient);
+    for index in 0..LEN {
+        let expected = input[index].exp();
+        let expected_gradient = weights[index] * expected;
+        assert!(
+            (output[index] - expected).abs()
+                <= output[index].abs().max(expected.abs()) * 1.0e-6 + 1.0e-7,
+            "forward mismatch at {index}: {} != {expected}",
+            output[index],
+        );
+        assert!(
+            (gradient[index] - expected_gradient).abs()
+                <= gradient[index].abs().max(expected_gradient.abs()) * 1.0e-6 + 1.0e-7,
+            "gradient mismatch at {index}: {} != {expected_gradient}",
+            gradient[index],
+        );
+    }
+}
+
+#[test]
 fn chain_relu_neg_parity() {
     // Two unary ops in sequence exercise two separately-generated
     // pointwise pipelines in the same plan.
