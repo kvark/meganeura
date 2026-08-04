@@ -1725,6 +1725,9 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater | ShaderEntry::SwiGLU => {
             BinaryData::layout()
         }
+        ShaderEntry::PairwiseSquaredDistance => BinaryData::layout(),
+        ShaderEntry::PairwiseSquaredDistanceGradLeft
+        | ShaderEntry::PairwiseSquaredDistanceGradRight => TernaryData::layout(),
         ShaderEntry::BiasAdd => BiasAddData::layout(),
         ShaderEntry::SgdUpdate => SgdData::layout(),
         ShaderEntry::AdamUpdate => AdamData::layout(),
@@ -5269,6 +5272,40 @@ impl Session {
                             _pad0: 0,
                             _pad1: 0,
                             _pad2: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::PairwiseSquaredDistance => {
+                pc.bind(
+                    0,
+                    &BinaryData {
+                        src_a: buf(dispatch.input_buffers[0]),
+                        src_b: buf(dispatch.input_buffers[1]),
+                        dst: buf(dispatch.output_buffer),
+                        params: UnaryParams {
+                            len: dispatch.params[0],
+                            _pad0: dispatch.params[1],
+                            _pad1: dispatch.params[2],
+                            _pad2: dispatch.params[3],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::PairwiseSquaredDistanceGradLeft
+            | ShaderEntry::PairwiseSquaredDistanceGradRight => {
+                pc.bind(
+                    0,
+                    &TernaryData {
+                        src_a: buf(dispatch.input_buffers[0]),
+                        src_b: buf(dispatch.input_buffers[1]),
+                        src_c: buf(dispatch.input_buffers[2]),
+                        dst: buf(dispatch.output_buffer),
+                        params: UnaryParams {
+                            len: dispatch.params[0],
+                            _pad0: dispatch.params[1],
+                            _pad1: dispatch.params[2],
+                            _pad2: dispatch.params[3],
                         },
                     },
                 );

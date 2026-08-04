@@ -290,6 +290,101 @@ fn tile_inner_forward_and_gradient_match_explicit_repetition() {
     }
 }
 
+#[test]
+fn pairwise_squared_distance_matches_explicit_forward_and_gradients() {
+    const ROWS: usize = 513;
+    const INNER: usize = 3;
+    const PAIRS: usize = 8;
+    let left_data = (0..ROWS * INNER)
+        .map(|index| ((index * 31 % 127) as f32 - 63.0) * 0.017)
+        .collect::<Vec<_>>();
+    let right_data = (0..ROWS * PAIRS * INNER)
+        .map(|index| ((index * 19 % 109) as f32 - 54.0) * 0.013)
+        .collect::<Vec<_>>();
+    let weights_data = (0..ROWS * PAIRS)
+        .map(|index| ((index * 17 % 41) as f32 - 20.0) * 0.031)
+        .collect::<Vec<_>>();
+
+    let mut graph = Graph::new();
+    let left = graph.parameter("left", &[ROWS, INNER]);
+    let right = graph.parameter("right", &[ROWS * PAIRS, INNER]);
+    let distances = graph.pairwise_squared_distance(left, right, PAIRS);
+    let weights = graph.input("weights", &[ROWS, PAIRS]);
+    let weighted = graph.mul(distances, weights);
+    let loss = graph.sum_all(weighted);
+    graph.set_outputs(vec![loss, distances]);
+
+    let mut session = meganeura::build_session(&graph);
+    session.set_parameter("left", &left_data);
+    session.set_parameter("right", &right_data);
+    session.set_input("weights", &weights_data);
+    session.step();
+    session.wait();
+
+    let mut distances_output = vec![0.0; ROWS * PAIRS];
+    session.read_output_by_index(1, &mut distances_output);
+    let mut left_gradient = vec![0.0; ROWS * INNER];
+    session.read_param_grad("left", &mut left_gradient);
+    let mut right_gradient = vec![0.0; ROWS * PAIRS * INNER];
+    session.read_param_grad("right", &mut right_gradient);
+
+    for row in 0..ROWS {
+        for pair in 0..PAIRS {
+            let pair_index = row * PAIRS + pair;
+            let mut expected_distance = 0.0_f32;
+            for column in 0..INNER {
+                let left_index = row * INNER + column;
+                let right_index = pair_index * INNER + column;
+                let delta = left_data[left_index] - right_data[right_index];
+                expected_distance += delta * delta;
+                let term = weights_data[pair_index] * delta;
+                let expected_gradient = -(term + term);
+                assert!(
+                    (right_gradient[right_index] - expected_gradient).abs()
+                        <= right_gradient[right_index]
+                            .abs()
+                            .max(expected_gradient.abs())
+                            * 1.0e-6
+                            + 1.0e-7,
+                    "right gradient mismatch at [{row}, {pair}, {column}]: {} != {}",
+                    right_gradient[right_index],
+                    expected_gradient,
+                );
+            }
+            assert!(
+                (distances_output[pair_index] - expected_distance).abs()
+                    <= distances_output[pair_index]
+                        .abs()
+                        .max(expected_distance.abs())
+                        * 1.0e-6
+                        + 1.0e-7,
+                "distance mismatch at [{row}, {pair}]: {} != {}",
+                distances_output[pair_index],
+                expected_distance,
+            );
+        }
+        for column in 0..INNER {
+            let left_index = row * INNER + column;
+            let mut expected_gradient = 0.0_f32;
+            for pair in 0..PAIRS {
+                let pair_index = row * PAIRS + pair;
+                let right_index = pair_index * INNER + column;
+                let delta = left_data[left_index] - right_data[right_index];
+                let term = weights_data[pair_index] * delta;
+                expected_gradient += term + term;
+            }
+            assert!(
+                (left_gradient[left_index] - expected_gradient).abs()
+                    <= left_gradient[left_index].abs().max(expected_gradient.abs()) * 1.0e-6
+                        + 1.0e-7,
+                "left gradient mismatch at [{row}, {column}]: {} != {}",
+                left_gradient[left_index],
+                expected_gradient,
+            );
+        }
+    }
+}
+
 /// Phase 2: `sum_inner(mul(embedding(idx, table), basis))` — the SH colour
 /// path. Folds the gather (Embedding) into the reduction as a gather
 /// stream. Exercises the full gather codegen + dynamic binding.
