@@ -1,5 +1,4 @@
-// GlobalAvgPool backward: broadcast + scale
-// grad_input[i] = grad_output[i / spatial] / spatial
+// Row broadcast used by GlobalAvgPool backward and BroadcastInner.
 // Dispatch: [ceil(total/256), 1, 1] where total = batch * channels * spatial
 
 struct Params {
@@ -19,4 +18,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if i >= params.total { return; }
     let spatial = params.spatial;
     dst[i] = src[i / spatial] / f32(spatial);
+}
+
+@compute @workgroup_size(256)
+fn broadcast_inner(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if i >= params.total { return; }
+    dst[i] = src[i / params.spatial];
 }

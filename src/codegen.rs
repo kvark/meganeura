@@ -5458,7 +5458,8 @@ mod tests {
                 ShaderEntry::RoPEDynamic => vec!["src", "dst", "pos_offset_buf", "params"],
                 ShaderEntry::MaxPool2d
                 | ShaderEntry::GlobalAvgPool
-                | ShaderEntry::GlobalAvgPoolGrad => vec!["src", "dst", "params"],
+                | ShaderEntry::GlobalAvgPoolGrad
+                | ShaderEntry::BroadcastInner => vec!["src", "dst", "params"],
                 ShaderEntry::WinogradInputTransform | ShaderEntry::WinogradOutputTransform => {
                     vec!["src", "dst", "params"]
                 }
@@ -5564,6 +5565,7 @@ mod tests {
             ShaderEntry::MaxPool2d,
             ShaderEntry::GlobalAvgPool,
             ShaderEntry::GlobalAvgPoolGrad,
+            ShaderEntry::BroadcastInner,
         ];
 
         for entry in &entries {

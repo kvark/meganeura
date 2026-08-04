@@ -122,6 +122,11 @@ pub enum Op {
     /// so the fusion pass can fold a pointwise/gather producer into its
     /// prologue. The differentiable equivalent of `matmul(x, ones[N,1])`.
     SumInner,
+    /// Backward helper for [`Op::SumInner`]: repeat each `[M, 1]` row across
+    /// the inner axis, `[M, 1]` → `[M, N]`.
+    BroadcastInner {
+        inner: u32,
+    },
     /// Exclusive cumulative sum over the inner axis of a 2D tensor.
     ///
     /// Forward order emits `y[m, n] = sum(x[m, 0..n])`; reverse order emits
@@ -1142,6 +1147,24 @@ impl Graph {
         let m = shape[0];
         let ty = TensorType::f32(vec![m, 1]);
         self.add_node(Op::SumInner, vec![x], ty)
+    }
+
+    /// Repeat each scalar row of `x: [M, 1]` across `inner` columns.
+    pub(crate) fn broadcast_inner(&mut self, x: NodeId, inner: usize) -> NodeId {
+        let shape = &self.node(x).ty.shape;
+        assert_eq!(
+            shape.len(),
+            2,
+            "broadcast_inner expects a 2D [M, 1] input, got shape {shape:?}"
+        );
+        assert_eq!(shape[1], 1, "broadcast_inner expects one input column");
+        assert!(
+            inner > 0,
+            "broadcast_inner needs at least one output column"
+        );
+        let inner_u32 = u32::try_from(inner).expect("broadcast_inner width exceeds u32");
+        let ty = TensorType::f32(vec![shape[0], inner]);
+        self.add_raw_node(Op::BroadcastInner { inner: inner_u32 }, vec![x], ty)
     }
 
     /// Exclusive cumulative sum over the inner axis of a 2D tensor.

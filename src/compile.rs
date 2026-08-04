@@ -239,6 +239,7 @@ pub enum ShaderEntry {
     MaxPool2d,
     GlobalAvgPool,
     GlobalAvgPoolGrad,
+    BroadcastInner,
     WinogradInputTransform,
     WinogradOutputTransform,
     WinogradBatchedMatMul,
@@ -463,7 +464,9 @@ impl ShaderEntry {
             ShaderEntry::RoPEDynamic => ShaderGroup::RoPEDynamic,
             ShaderEntry::MaxPool2d => ShaderGroup::MaxPool2d,
             ShaderEntry::GlobalAvgPool => ShaderGroup::GlobalAvgPool,
-            ShaderEntry::GlobalAvgPoolGrad => ShaderGroup::GlobalAvgPoolGrad,
+            ShaderEntry::GlobalAvgPoolGrad | ShaderEntry::BroadcastInner => {
+                ShaderGroup::GlobalAvgPoolGrad
+            }
             ShaderEntry::WinogradInputTransform => ShaderGroup::WinogradInputTransform,
             ShaderEntry::WinogradOutputTransform => ShaderGroup::WinogradOutputTransform,
             ShaderEntry::WinogradBatchedMatMul => ShaderGroup::WinogradBatchedMatMul,
@@ -565,6 +568,7 @@ impl ShaderEntry {
             ShaderEntry::MaxPool2d => "max_pool_2d",
             ShaderEntry::GlobalAvgPool => "global_avg_pool",
             ShaderEntry::GlobalAvgPoolGrad => "main",
+            ShaderEntry::BroadcastInner => "broadcast_inner",
             ShaderEntry::WinogradInputTransform
             | ShaderEntry::WinogradOutputTransform
             | ShaderEntry::WinogradBatchedMatMul
@@ -2572,6 +2576,22 @@ impl<'a> Compiler<'a> {
                     use_coop: false,
                     use_small_tiles: false,
                     reduction: Some(kernel),
+                    ..Default::default()
+                });
+            }
+
+            Op::BroadcastInner { inner } => {
+                let input = self.get_buffer(node.inputs[0]);
+                let total = node.ty.num_elements() as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::BroadcastInner,
+                    workgroups: [total.div_ceil(256), 1, 1],
+                    input_buffers: vec![input],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![total, inner, 0, 0],
+                    use_coop: false,
+                    use_small_tiles: false,
                     ..Default::default()
                 });
             }
@@ -4743,6 +4763,27 @@ mod tests {
         );
         let product_kernel = product_plan.dispatches[0].reduction.as_ref().unwrap();
         assert_eq!(product_kernel.n_per_elem, 2);
+    }
+
+    #[test]
+    fn sum_inner_gradient_uses_direct_row_broadcast() {
+        let mut graph = Graph::new();
+        let input = graph.parameter("input", &[513, 16]);
+        let rows = graph.sum_inner(input);
+        let loss = graph.sum_all(rows);
+        graph.set_outputs(vec![loss]);
+
+        let differentiated = crate::autodiff::differentiate(&graph);
+        let plan = compile(&differentiated);
+        let broadcast = plan
+            .dispatches
+            .iter()
+            .find(|dispatch| {
+                dispatch.shader == ShaderEntry::BroadcastInner
+                    && dispatch.params == [513 * 16, 16, 0, 0]
+            })
+            .expect("sum_inner backward should emit a direct row broadcast");
+        assert_eq!(broadcast.workgroups, [33, 1, 1]);
     }
 
     #[test]
