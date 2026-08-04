@@ -26,6 +26,8 @@ INFERENA_REV = "7ca9c5c7b2cd614343a3de3dcc86999ced66e8c0"
 PROFILE_REV = "b1405a3a52fabf9858aca5cbd80e246811cb6a58"
 DINOVISION_SOURCE_REV = "dc35cdf1c7c910cdd93c5b5362846842ae469a21"
 DINOVISION_EVIDENCE_REV = "2c3f9017fe74c41482b165890c14737a2ccd4b6a"
+COMPANION_REPORT = "https://arxiv.org/abs/2608.01563"
+COMPANION_REPORT_DOI = "10.48550/arXiv.2608.01563"
 ZIP_TIME = (1980, 1, 1, 0, 0, 0)
 
 
@@ -186,6 +188,8 @@ def assemble(inferena_repo: Path, output: Path) -> tuple[str, str]:
             "meganeura_profile_revision": PROFILE_REV,
             "dinovision_source_revision": DINOVISION_SOURCE_REV,
             "dinovision_evidence_revision": DINOVISION_EVIDENCE_REV,
+            "companion_report": COMPANION_REPORT,
+            "companion_report_doi": COMPANION_REPORT_DOI,
         }
         (stage / "BUILD_INFO.json").write_text(
             json.dumps(build_info, indent=2, sort_keys=True) + "\n"

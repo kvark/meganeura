@@ -1,6 +1,7 @@
 # Meganeura paper
 
-This directory contains the working arXiv manuscript. The numeric tables in
+This directory contains the source of
+[arXiv:2608.01563](https://arxiv.org/abs/2608.01563). The numeric tables in
 `tables/` are generated from the frozen benchmark artifacts in `results/`
 (five devices, five workloads, strict and accelerated modes, all at
 Meganeura `7561a64` / Inferena `7ca9c5c7`; the gap-profile sidecars in
@@ -46,7 +47,7 @@ podman run --rm -v "$PWD:/paper:Z" -w /paper \
   latexmk -pdf -interaction=nonstopmode -halt-on-error main.tex
 ```
 
-Before submission:
+Before producing a revised arXiv version:
 
 1. ~~populate the strict and practical-default result tables from the frozen
    device matrix~~ (done — `mktables.py`);
@@ -59,7 +60,6 @@ Before submission:
 5. update the AI-assistance disclosure to match the final workflow;
 6. run arXiv's TeX source checker and inspect the rendered PDF.
 
-The intended initial submission is a technical preprint, not an anonymous
-conference manuscript. A later systems-conference version can use the same
-technical core after adapting format, anonymity, artifact, and venue-policy
-requirements.
+The public v1 is a technical preprint, not a peer-reviewed conference paper.
+A later systems-conference version can use the same technical core after
+adapting format, anonymity, artifact, and venue-policy requirements.

@@ -7,6 +7,9 @@ tables and aggregate values, and source snapshots for the two measured
 systems. The analysis replay needs only Python 3 and does not need a GPU or
 network access.
 
+The extended companion report is
+[arXiv:2608.01563](https://arxiv.org/abs/2608.01563).
+
 The package has not yet been independently evaluated. Its permanent DOI is
 pending the workshop artifact-freeze process.
 
@@ -191,8 +194,8 @@ separate and fast.
 ## License, citation, and contact
 
 The packaged code, measurements, and documentation are distributed under
-the MIT license in `LICENSE`. Citation metadata is in `CITATION.cff`; update
-it with the public paper identifier when assigned.
+the MIT license in `LICENSE`. Citation metadata in `CITATION.cff` includes the
+public companion-report identifier.
 
 Questions: Dzmitry Malyshau, `kvark@fastmail.com`, ORCID
 `0009-0005-6410-4276`.

@@ -1,5 +1,5 @@
 cff-version: 1.2.0
-message: "If you use Meganeura in published work, please cite this software. Paper metadata will be added after publication."
+message: "If you use Meganeura in published work, please cite the paper below."
 type: software
 title: Meganeura
 version: 0.2.0
@@ -17,3 +17,20 @@ keywords:
   - Vulkan
   - Metal
   - Rust
+preferred-citation:
+  type: article
+  title: "Meganeura: Portable GPU Training and Inference through Vulkan and Metal"
+  authors:
+    - given-names: Dzmitry
+      family-names: Malyshau
+      email: kvark@fastmail.com
+      orcid: "https://orcid.org/0009-0005-6410-4276"
+  year: 2026
+  journal: arXiv
+  identifiers:
+    - type: doi
+      value: "10.48550/arXiv.2608.01563"
+    - type: other
+      value: "arXiv:2608.01563"
+      description: arXiv identifier
+  url: "https://arxiv.org/abs/2608.01563"
