@@ -1720,6 +1720,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         | ShaderEntry::Abs
         | ShaderEntry::Log
         | ShaderEntry::Recip
+        | ShaderEntry::Exp
         | ShaderEntry::Materialize
         | ShaderEntry::Silu => UnaryData::layout(),
         ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater | ShaderEntry::SwiGLU => {
@@ -5215,6 +5216,7 @@ impl Session {
             | ShaderEntry::Abs
             | ShaderEntry::Log
             | ShaderEntry::Recip
+            | ShaderEntry::Exp
             | ShaderEntry::Materialize
             | ShaderEntry::ToF16
             | ShaderEntry::Silu => {

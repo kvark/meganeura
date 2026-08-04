@@ -111,6 +111,7 @@ pub enum Op {
     Abs,
     Log,
     Recip,
+    Exp,
 
     // Reduction
     SumAll,
@@ -1107,6 +1108,11 @@ impl Graph {
     pub fn recip(&mut self, x: NodeId) -> NodeId {
         let ty = self.node(x).ty.clone();
         self.add_node(Op::Recip, vec![x], ty)
+    }
+
+    pub fn exp(&mut self, x: NodeId) -> NodeId {
+        let ty = self.node(x).ty.clone();
+        self.add_node(Op::Exp, vec![x], ty)
     }
 
     /// Reshape: reinterpret the tensor with a new shape (same element count).
@@ -2484,12 +2490,14 @@ mod tests {
         let r = g.relu(x);
         let s = g.sigmoid(x);
         let n = g.neg(x);
+        let e = g.exp(x);
         let t = g.transpose(x);
-        g.set_outputs(vec![r, s, n, t]);
+        g.set_outputs(vec![r, s, n, e, t]);
 
         assert_eq!(g.node(r).ty.shape, vec![4, 8]);
         assert_eq!(g.node(s).ty.shape, vec![4, 8]);
         assert_eq!(g.node(n).ty.shape, vec![4, 8]);
+        assert_eq!(g.node(e).ty.shape, vec![4, 8]);
         assert_eq!(g.node(t).ty.shape, vec![8, 4]); // transposed
     }
 

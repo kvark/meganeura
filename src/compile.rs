@@ -142,6 +142,7 @@ pub enum ShaderEntry {
     Abs,
     Log,
     Recip,
+    Exp,
     Materialize,
     Add,
     Mul,
@@ -408,6 +409,7 @@ impl ShaderEntry {
             | ShaderEntry::Abs
             | ShaderEntry::Log
             | ShaderEntry::Recip
+            | ShaderEntry::Exp
             | ShaderEntry::Materialize => ShaderGroup::Unary,
             ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater => ShaderGroup::Binary,
             ShaderEntry::BiasAdd => ShaderGroup::BiasAdd,
@@ -532,6 +534,7 @@ impl ShaderEntry {
             ShaderEntry::Abs => "abs_",
             ShaderEntry::Log => "log_",
             ShaderEntry::Recip => "recip",
+            ShaderEntry::Exp => "exp_",
             ShaderEntry::Materialize => "materialize",
             ShaderEntry::Add => "add",
             ShaderEntry::Mul => "mul",
@@ -1960,6 +1963,7 @@ fn unary_shader_to_pointwise(shader: &ShaderEntry) -> Option<PointwiseDAG> {
         ShaderEntry::Abs => Pw::Abs(0),
         ShaderEntry::Log => Pw::Log(0),
         ShaderEntry::Recip => Pw::Recip(0),
+        ShaderEntry::Exp => Pw::Exp(0),
         ShaderEntry::Silu => Pw::Silu(0),
         ShaderEntry::Gelu => {
             // Tanh-approx GELU, bit-matching unary.wgsl's `gelu` entry:
@@ -2632,6 +2636,9 @@ impl<'a> Compiler<'a> {
             }
             Op::Recip => {
                 self.emit_unary(ShaderEntry::Recip, node, out_buf);
+            }
+            Op::Exp => {
+                self.emit_unary(ShaderEntry::Exp, node, out_buf);
             }
 
             Op::SumAll => {
@@ -4978,13 +4985,15 @@ mod tests {
         let r = g.relu(x);
         let s = g.sigmoid(x);
         let n = g.neg(x);
-        g.set_outputs(vec![r, s, n]);
+        let e = g.exp(x);
+        g.set_outputs(vec![r, s, n, e]);
 
         let plan = compile(&g);
-        assert_eq!(plan.dispatches.len(), 3);
+        assert_eq!(plan.dispatches.len(), 4);
         assert_eq!(plan.dispatches[0].shader, ShaderEntry::Relu);
         assert_eq!(plan.dispatches[1].shader, ShaderEntry::Sigmoid);
         assert_eq!(plan.dispatches[2].shader, ShaderEntry::Neg);
+        assert_eq!(plan.dispatches[3].shader, ShaderEntry::Exp);
         // All unary ops: params = [len, 0, 0, 0]
         for d in &plan.dispatches {
             assert_eq!(d.params[0], 32); // 4*8
