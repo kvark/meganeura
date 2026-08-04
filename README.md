@@ -3,6 +3,7 @@
 [![CI](https://github.com/kvark/meganeura/actions/workflows/ci.yml/badge.svg)](https://github.com/kvark/meganeura/actions/workflows/ci.yml)
 [![Docs](https://docs.rs/meganeura/badge.svg)](https://docs.rs/meganeura)
 [![Crates.io](https://img.shields.io/crates/v/meganeura.svg?label=meganeura)](https://crates.io/crates/meganeura)
+[![arXiv](https://img.shields.io/badge/arXiv-2608.01563-b31b1b.svg)](https://arxiv.org/abs/2608.01563)
 
 **Portable neural-network training and inference in Rust.** Meganeura uses
 Vulkan on Linux, Windows, and Android and Metal on Apple platforms. It does
