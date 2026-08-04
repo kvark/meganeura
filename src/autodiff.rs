@@ -289,6 +289,26 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 );
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
+            Op::PairwiseSquaredDistance { pairs } => {
+                let left = node.inputs[0];
+                let right = node.inputs[1];
+                let left_ty = forward.nodes()[left as usize].ty.clone();
+                let right_ty = forward.nodes()[right as usize].ty.clone();
+                let inner =
+                    u32::try_from(left_ty.shape[1]).expect("pairwise distance width exceeds u32");
+                let grad_left = graph.add_raw_node(
+                    Op::PairwiseSquaredDistanceGradLeft { inner, pairs },
+                    vec![grad_output, left, right],
+                    left_ty,
+                );
+                let grad_right = graph.add_raw_node(
+                    Op::PairwiseSquaredDistanceGradRight { inner, pairs },
+                    vec![grad_output, left, right],
+                    right_ty,
+                );
+                accumulate_grad(&mut graph, &mut grads, left, grad_left);
+                accumulate_grad(&mut graph, &mut grads, right, grad_right);
+            }
             Op::ExclusiveCumsum { reverse } => {
                 // The transpose of a left-to-right exclusive prefix sum is a
                 // right-to-left exclusive suffix sum, and vice versa.
@@ -586,6 +606,8 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::LayerNormGradX { .. }
             | Op::RoPEGrad { .. }
             | Op::TileInnerGrad { .. }
+            | Op::PairwiseSquaredDistanceGradLeft { .. }
+            | Op::PairwiseSquaredDistanceGradRight { .. }
             | Op::GlobalAvgPoolGrad { .. } => {}
             Op::Gelu => {
                 eprintln!(

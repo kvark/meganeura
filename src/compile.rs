@@ -194,6 +194,9 @@ pub enum ShaderEntry {
     BroadcastInner,
     TileInner,
     TileInnerGrad,
+    PairwiseSquaredDistance,
+    PairwiseSquaredDistanceGradLeft,
+    PairwiseSquaredDistanceGradRight,
     WinogradInputTransform,
     WinogradOutputTransform,
     WinogradBatchedMatMul,
@@ -319,6 +322,11 @@ impl ShaderEntry {
             | ShaderEntry::BroadcastInner
             | ShaderEntry::TileInner
             | ShaderEntry::TileInnerGrad => ShaderGroup::GlobalAvgPoolGrad,
+            ShaderEntry::PairwiseSquaredDistance => ShaderGroup::PairwiseSquaredDistance,
+            ShaderEntry::PairwiseSquaredDistanceGradLeft
+            | ShaderEntry::PairwiseSquaredDistanceGradRight => {
+                ShaderGroup::PairwiseSquaredDistanceGrad
+            }
             ShaderEntry::WinogradInputTransform => ShaderGroup::WinogradInputTransform,
             ShaderEntry::WinogradOutputTransform => ShaderGroup::WinogradOutputTransform,
             ShaderEntry::WinogradBatchedMatMul => ShaderGroup::WinogradBatchedMatMul,
@@ -436,6 +444,9 @@ impl ShaderEntry {
             ShaderEntry::BroadcastInner => "broadcast_inner",
             ShaderEntry::TileInner => "tile_inner",
             ShaderEntry::TileInnerGrad => "tile_inner_grad",
+            ShaderEntry::PairwiseSquaredDistance => "main",
+            ShaderEntry::PairwiseSquaredDistanceGradLeft => "grad_left",
+            ShaderEntry::PairwiseSquaredDistanceGradRight => "grad_right",
             ShaderEntry::WinogradInputTransform
             | ShaderEntry::WinogradOutputTransform
             | ShaderEntry::WinogradBatchedMatMul
@@ -2355,6 +2366,55 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![total, inner, repeats, 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
+            Op::PairwiseSquaredDistance { pairs } => {
+                let left = self.get_buffer(node.inputs[0]);
+                let right = self.get_buffer(node.inputs[1]);
+                let inner = u32::try_from(self.graph.node(node.inputs[0]).ty.shape[1])
+                    .expect("pairwise distance width exceeds u32");
+                let total = u32::try_from(node.ty.num_elements())
+                    .expect("pairwise distance output element count exceeds u32");
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::PairwiseSquaredDistance,
+                    workgroups: [total.div_ceil(256), 1, 1],
+                    input_buffers: vec![left, right],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![total, inner, pairs, 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
+            Op::PairwiseSquaredDistanceGradLeft { inner, pairs }
+            | Op::PairwiseSquaredDistanceGradRight { inner, pairs } => {
+                let grad_output = self.get_buffer(node.inputs[0]);
+                let left = self.get_buffer(node.inputs[1]);
+                let right = self.get_buffer(node.inputs[2]);
+                let total = u32::try_from(node.ty.num_elements())
+                    .expect("pairwise distance gradient element count exceeds u32");
+                let shader = match node.op {
+                    Op::PairwiseSquaredDistanceGradLeft { .. } => {
+                        ShaderEntry::PairwiseSquaredDistanceGradLeft
+                    }
+                    Op::PairwiseSquaredDistanceGradRight { .. } => {
+                        ShaderEntry::PairwiseSquaredDistanceGradRight
+                    }
+                    _ => unreachable!(),
+                };
+                self.plan.dispatches.push(Dispatch {
+                    shader,
+                    workgroups: [total.div_ceil(256), 1, 1],
+                    input_buffers: vec![grad_output, left, right],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![total, inner, pairs, 0],
                     use_coop: false,
                     use_small_tiles: false,
                     ..Default::default()
