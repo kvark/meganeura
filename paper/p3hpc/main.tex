@@ -161,10 +161,10 @@ The study makes four contributions:
 
 Sections below describe the layer (\S\ref{sec:system}), define the
 protocol (\S\ref{sec:method}), report the matrix (\S\ref{sec:results}),
-attribute the gaps with per-dispatch profiles (\S\ref{sec:gaps}), and
+locate the gaps with per-dispatch profiles (\S\ref{sec:gaps}), and
 quantify the productivity dimension (\S\ref{sec:productivity}). The
 extended system description, memory-planner and rewrite ablations, and
-compiler-engineering lessons appear in the accompanying technical
+compiler-engineering lessons appear in the companion technical
 report~\cite{malyshau2026meganeura}; this paper is self-contained for the
 portability question.
 
@@ -265,10 +265,11 @@ accelerated contract changes the generated program: a portable permission
 is not a portable mechanism (Section~\ref{sec:accel}). The compiler may
 select different variants across capabilities and drivers, so cross-device
 agreement is evidence, not identity by construction; that distinction
-matters for the anomaly in Section~\ref{sec:defect}. Finally, the layer fits
-in a 34.5\,KLOC Rust and 6.1\,KLOC WGSL budget. This is implementation scale,
-not a direct productivity metric, and it also explains the gaps: a kernel
-library of this size cannot cover everything mature vendor libraries cover.
+matters for the anomaly in Section~\ref{sec:defect}. Finally, physical
+source-line counts put the layer at 34.5\,KLOC of Rust and 6.1\,KLOC of WGSL;
+tests and examples add 14.8\,KLOC. This is implementation scale, not a direct
+productivity metric, and it also explains the gaps: a kernel library of this
+size cannot cover everything mature vendor libraries cover.
 
 \section{Methodology}
 \label{sec:method}
@@ -537,9 +538,9 @@ The remaining structure: for training the incumbent is clearly more
 portable (mean 0.93 versus 0.52) --- vendor training libraries are good
 wherever they run; for full-shape inference the two are close (0.81 versus
 0.75); for minimal-shape latency the portable stack is the more
-performance-portable system (0.83 versus 0.73), because launch overhead
-varies wildly across vendor backends while a static dispatch plan does
-not.
+performance-portable system (0.83 versus 0.73). The result is consistent with
+the static plan reducing sensitivity to backend launch and synchronization
+costs, although the end-to-end measurements also include kernel quality.
 
 \section{Edge Deployment Beyond the Matrix}
 \label{sec:edge}
@@ -585,7 +586,7 @@ samples, manifests, and full-resolution media are available in the public
 archive}; its \href{https://github.com/kvark/dinovision}{source code} is
 public as well.
 
-\section{Attributing the Gaps}
+\section{Locating the Gaps}
 \label{sec:gaps}
 
 The largest valid gaps are ResNet-50 training on NVIDIA ($4.6\times$
@@ -601,9 +602,10 @@ The NVIDIA ResNet-50 profile is directly comparable to the frozen cell
 and forward convolution another 16.3\% --- convolution is 89\% of the
 step, with three derivative shaders accounting for 28.5\,ms of 36.8
 (\code{Conv2dGradWeightGemmSmall} 12.6\,ms over just 12 dispatches marks
-the occupancy target). The worst gap in the matrix is a
-coverage-and-tuning property of two convolution derivative kernels, and
-TF32 cuDNN convolutions on the reference side widen it.
+the occupancy target). The worst gap in the matrix is a coverage-and-tuning
+property of the current convolution-derivative implementations rather than a
+uniform graphics-API overhead, and TF32 cuDNN convolutions on the reference
+side widen it.
 
 The M3 Whisper profile predates the frozen revision deliberately: it
 showed backward attention at 58.3\% of GPU time (\code{FlashGradKV} alone
@@ -635,6 +637,14 @@ specialization wait, deployment closure, and the support work visible in
 standing up one application on the frozen machine set. The 34.5\,KLOC/6.1\,KLOC
 implementation size is context for what the measured layer contains, not a
 productivity score.
+
+For the footprint comparison, the PyTorch closure follows active
+\code{Requires-Dist} edges and requested extras recursively from \code{torch}
+and counts each installed file once; the packages-only row sums the
+\code{torch} and \code{triton} distributions. The \system{} entry is the
+stripped runner, which embeds the compiler, autodiff, runtime, model builders,
+and shader sources while relying on ordinary OS libraries and the installed
+GPU driver.
 
 \begin{table}[t]
 \centering
@@ -718,7 +728,7 @@ exported PyTorch programs across mobile backends at scale
 graphics-API inference performance
 \cite{ruan2024webllm,levine2026llamaweb}. \system{} is narrower in framework
 breadth, but carries the backward pass, optimizer, and checkpoint through a
-native Vulkan/Metal stack. The accompanying technical report gives the full
+native Vulkan/Metal stack. The companion technical report gives the full
 system and compiler account~\cite{malyshau2026meganeura}; the Blade study
 isolates synchronization in the underlying graphics abstraction
 \cite{malyshau2026barriers}.
@@ -786,13 +796,16 @@ platform support as one P3 problem.
 
 \section*{Acknowledgments}
 
-The author thanks the open-source contributors and hardware testers whose
-reports exercised \system{} across graphics backends and GPU vendors.
+The author thanks the wgpu community for maintaining Naga, the shader
+validation and translation library that anchors \system{}'s portable shader
+boundary, and thanks their family for support and patience throughout this
+work.
+
 Anthropic Claude and OpenAI Codex/GPT
-\cite{anthropic2026claude,openai2026codex} assisted benchmark-harness and
-instrumentation development, experimental debugging, data analysis, and
-drafting and editing throughout all numbered sections and the Artifact
-Description.
+\cite{anthropic2026claude,openai2026codex} assisted code review,
+benchmark-harness and instrumentation development, experimental debugging,
+data analysis, and drafting and editing throughout all numbered sections and
+the Artifact Description.
 AI-generated draft passages were subsequently reviewed and revised by the
 author. Substantial portions of the \system{} and \inferena{} source code
 --- themselves objects of study in this paper --- were likewise developed
