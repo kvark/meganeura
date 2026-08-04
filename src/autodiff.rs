@@ -270,6 +270,13 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let grad_broadcast = graph.broadcast_inner(grad_output, n);
                 accumulate_grad(&mut graph, &mut grads, x, grad_broadcast);
             }
+            Op::BroadcastInner { .. } => {
+                // BroadcastInner: [M, 1] → [M, N]. Its transpose sums the
+                // repeated gradient columns back into one scalar per row.
+                let x = node.inputs[0];
+                let grad_x = graph.sum_inner(grad_output);
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
             Op::ExclusiveCumsum { reverse } => {
                 // The transpose of a left-to-right exclusive prefix sum is a
                 // right-to-left exclusive suffix sum, and vice versa.
@@ -566,7 +573,6 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::LayerNormGradWB { .. }
             | Op::LayerNormGradX { .. }
             | Op::RoPEGrad { .. }
-            | Op::BroadcastInner { .. }
             | Op::GlobalAvgPoolGrad { .. } => {}
             Op::Gelu => {
                 eprintln!(
