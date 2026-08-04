@@ -290,6 +290,18 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let grad_x = graph.sum_inner(grad_output);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
+            Op::TileInner { repeats } => {
+                let x = node.inputs[0];
+                let x_ty = forward.nodes()[x as usize].ty.clone();
+                let inner =
+                    u32::try_from(x_ty.shape[1]).expect("tile_inner input width exceeds u32");
+                let grad_x = graph.add_raw_node(
+                    Op::TileInnerGrad { inner, repeats },
+                    vec![grad_output],
+                    x_ty,
+                );
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
             Op::ExclusiveCumsum { reverse } => {
                 // The transpose of a left-to-right exclusive prefix sum is a
                 // right-to-left exclusive suffix sum, and vice versa.
@@ -560,6 +572,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::LayerNormGradWB { .. }
             | Op::LayerNormGradX { .. }
             | Op::RoPEGrad { .. }
+            | Op::TileInnerGrad { .. }
             | Op::GlobalAvgPoolGrad { .. } => {}
             Op::Gelu => {
                 // gelu(x) ≈ x * sigmoid(1.702 * x) (sigmoid approximation)

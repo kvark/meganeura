@@ -127,6 +127,16 @@ pub enum Op {
     BroadcastInner {
         inner: u32,
     },
+    /// Repeat each complete inner row `repeats` times:
+    /// `[M, N] → [M, N * repeats]`.
+    TileInner {
+        repeats: u32,
+    },
+    /// Backward helper for [`Op::TileInner`].
+    TileInnerGrad {
+        inner: u32,
+        repeats: u32,
+    },
     /// Exclusive cumulative sum over the inner axis of a 2D tensor.
     ///
     /// Forward order emits `y[m, n] = sum(x[m, 0..n])`; reverse order emits
@@ -1188,6 +1198,25 @@ impl Graph {
         let inner_u32 = u32::try_from(inner).expect("broadcast_inner width exceeds u32");
         let ty = TensorType::f32(vec![shape[0], inner]);
         self.add_raw_node(Op::BroadcastInner { inner: inner_u32 }, vec![x], ty)
+    }
+
+    /// Repeat each complete inner row of `x: [M, N]` `repeats` times.
+    pub fn tile_inner(&mut self, x: NodeId, repeats: usize) -> NodeId {
+        let shape = &self.node(x).ty.shape;
+        assert_eq!(
+            shape.len(),
+            2,
+            "tile_inner expects a 2D [M, N] input, got shape {shape:?}"
+        );
+        assert!(shape[1] > 0, "tile_inner needs a non-empty inner row");
+        assert!(repeats > 0, "tile_inner needs at least one repetition");
+        let output_inner = shape[1]
+            .checked_mul(repeats)
+            .expect("tile_inner output width overflows usize");
+        u32::try_from(shape[1]).expect("tile_inner input width exceeds u32");
+        let repeats = u32::try_from(repeats).expect("tile_inner repeat count exceeds u32");
+        let ty = TensorType::f32(vec![shape[0], output_inner]);
+        self.add_raw_node(Op::TileInner { repeats }, vec![x], ty)
     }
 
     /// Exclusive cumulative sum over the inner axis of a 2D tensor.
