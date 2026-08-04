@@ -2,7 +2,7 @@ struct Params {
     rows: u32,
     inner: u32,
     floor_bits: u32,
-    _pad: u32,
+    round_one_bits: u32,
 }
 
 var<storage> src: array<f32>;
@@ -17,9 +17,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let begin = row * params.inner;
+    let round_one = bitcast<f32>(params.round_one_bits);
     var sum = 0.0;
     for (var column = 0u; column < params.inner; column += 1u) {
-        sum += src[begin + column];
+        sum += src[begin + column] * round_one;
     }
     let floor = bitcast<f32>(params.floor_bits);
     let denominator = max(sum - floor, 0.0) + floor;

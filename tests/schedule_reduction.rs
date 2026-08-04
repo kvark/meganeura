@@ -276,20 +276,22 @@ fn normalize_inner_sum_matches_explicit_forward_and_gradient() {
     for row in 0..ROWS {
         let begin = row * INNER;
         let mut sum = 0.0_f32;
-        let mut weighted_gradient = 0.0_f32;
         for column in 0..INNER {
             let index = begin + column;
             sum += input_data[index];
-            weighted_gradient += weights_data[index] * input_data[index];
         }
         let above_floor = sum - FLOOR;
         let denominator = above_floor.max(0.0) + FLOOR;
         let inverse = 1.0 / denominator;
-        let denominator_gradient = if above_floor > 0.0 {
-            -(weighted_gradient * (inverse * inverse))
-        } else {
-            0.0
-        };
+        let negative_inverse_squared = -(inverse * inverse);
+        let mut denominator_gradient = 0.0_f32;
+        if above_floor > 0.0 {
+            for column in 0..INNER {
+                let index = begin + column;
+                let reciprocal_gradient = weights_data[index] * input_data[index];
+                denominator_gradient += reciprocal_gradient * negative_inverse_squared;
+            }
+        }
         for column in 0..INNER {
             let index = begin + column;
             let expected_output = input_data[index] * inverse;
@@ -309,6 +311,47 @@ fn normalize_inner_sum_matches_explicit_forward_and_gradient() {
                 expected_gradient,
             );
         }
+    }
+
+    let mut expanded_graph = Graph::new();
+    let expanded_input = expanded_graph.parameter("input", &[ROWS, INNER]);
+    let sum = expanded_graph.sum_inner(expanded_input);
+    let negative_floor = expanded_graph.constant(vec![-FLOOR; ROWS], &[ROWS, 1]);
+    let above_floor = expanded_graph.add(sum, negative_floor);
+    let above_floor = expanded_graph.relu(above_floor);
+    let floor = expanded_graph.constant(vec![FLOOR; ROWS], &[ROWS, 1]);
+    let denominator = expanded_graph.add(above_floor, floor);
+    let denominator = expanded_graph.broadcast_inner(denominator, INNER);
+    let expanded_normalized = expanded_graph.div(expanded_input, denominator);
+    let expanded_weights = expanded_graph.input("weights", &[ROWS, INNER]);
+    let expanded_weighted = expanded_graph.mul(expanded_normalized, expanded_weights);
+    let expanded_loss = expanded_graph.sum_all(expanded_weighted);
+    expanded_graph.set_outputs(vec![expanded_loss, expanded_normalized]);
+
+    let mut expanded_session = meganeura::build_session(&expanded_graph);
+    expanded_session.set_parameter("input", &input_data);
+    expanded_session.set_input("weights", &weights_data);
+    expanded_session.step();
+    expanded_session.wait();
+    let mut expanded_output = vec![0.0; ROWS * INNER];
+    expanded_session.read_output_by_index(1, &mut expanded_output);
+    let mut expanded_gradient = vec![0.0; ROWS * INNER];
+    expanded_session.read_param_grad("input", &mut expanded_gradient);
+    for index in 0..ROWS * INNER {
+        assert_eq!(
+            normalized_output[index].to_bits(),
+            expanded_output[index].to_bits(),
+            "expanded output mismatch at {index}: {} != {}",
+            normalized_output[index],
+            expanded_output[index],
+        );
+        assert_eq!(
+            gradient[index].to_bits(),
+            expanded_gradient[index].to_bits(),
+            "expanded gradient mismatch at {index}: {} != {}",
+            gradient[index],
+            expanded_gradient[index],
+        );
     }
 }
 
