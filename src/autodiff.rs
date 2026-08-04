@@ -549,6 +549,10 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let grad_x = graph.add_raw_node(Op::Identity, vec![grad_output], x_ty);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
+            Op::Materialize => {
+                // The forward copy does not change values or shape.
+                accumulate_grad(&mut graph, &mut grads, node.inputs[0], grad_output);
+            }
             // Backward grad ops: never appear in forward pass
             Op::MultiHeadAttnGradQ { .. }
             | Op::MultiHeadAttnGradK { .. }
