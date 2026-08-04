@@ -76,11 +76,72 @@ fn rms_norm_grad_w(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invoca
 // where s_i = (rsqrt_i^2 / cols) * sum_j(dy[i,j]*w[j]*x[i,j])
 @compute @workgroup_size(256)
 fn rms_norm_grad_x(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let row = wgid.x;
     let tid = lid.x;
     let rows = params.m;
     let cols = params.n;
     let eps = bitcast<f32>(params.k);
+
+    // For narrow rows, params._pad is the power-of-two lane count assigned to
+    // each row. Several independent reductions share one workgroup while
+    // retaining the same tree order as the full 256-lane kernel.
+    if params._pad != 0u {
+        let lanes_per_row = params._pad;
+        let rows_per_workgroup = 256u / lanes_per_row;
+        let row_slot = tid / lanes_per_row;
+        let lane = tid % lanes_per_row;
+        let packed_row = wgid.x * rows_per_workgroup + row_slot;
+        let row_valid = packed_row < rows;
+        let packed_offset = packed_row * cols;
+
+        var packed_ss = 0.0;
+        if row_valid && lane < cols {
+            let x = src_b[packed_offset + lane];
+            packed_ss = x * x;
+        }
+        wg_data[tid] = packed_ss;
+        workgroupBarrier();
+
+        var packed_stride = lanes_per_row >> 1u;
+        loop {
+            if packed_stride == 0u { break; }
+            if lane < packed_stride {
+                wg_data[tid] += wg_data[tid + packed_stride];
+            }
+            workgroupBarrier();
+            packed_stride >>= 1u;
+        }
+        let packed_base = row_slot * lanes_per_row;
+        let packed_rsqrt = inverseSqrt(wg_data[packed_base] / f32(cols) + eps);
+        workgroupBarrier();
+
+        var packed_dot = 0.0;
+        if row_valid && lane < cols {
+            let index = packed_offset + lane;
+            packed_dot = src_a[index] * bias[lane] * src_b[index];
+        }
+        wg_data[tid] = packed_dot;
+        workgroupBarrier();
+
+        packed_stride = lanes_per_row >> 1u;
+        loop {
+            if packed_stride == 0u { break; }
+            if lane < packed_stride {
+                wg_data[tid] += wg_data[tid + packed_stride];
+            }
+            workgroupBarrier();
+            packed_stride >>= 1u;
+        }
+        let packed_s =
+            (packed_rsqrt * packed_rsqrt / f32(cols)) * wg_data[packed_base];
+        if row_valid && lane < cols {
+            let index = packed_offset + lane;
+            dst[index] = packed_rsqrt *
+                (src_a[index] * bias[lane] - src_b[index] * packed_s);
+        }
+        return;
+    }
+
+    let row = wgid.x;
     if row >= rows { return; }
     let offset = row * cols;
 
