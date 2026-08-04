@@ -1173,7 +1173,7 @@ impl Graph {
     }
 
     /// Repeat each scalar row of `x: [M, 1]` across `inner` columns.
-    pub(crate) fn broadcast_inner(&mut self, x: NodeId, inner: usize) -> NodeId {
+    pub fn broadcast_inner(&mut self, x: NodeId, inner: usize) -> NodeId {
         let shape = &self.node(x).ty.shape;
         assert_eq!(
             shape.len(),
