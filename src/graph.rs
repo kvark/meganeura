@@ -127,6 +127,17 @@ pub enum Op {
     BroadcastInner {
         inner: u32,
     },
+    /// Normalize every `[M, N]` row by its sum, using
+    /// `relu(sum - floor) + floor` as the denominator.
+    NormalizeInnerSum {
+        inner: u32,
+        floor: f32,
+    },
+    /// Backward helper for [`Op::NormalizeInnerSum`].
+    NormalizeInnerSumGrad {
+        inner: u32,
+        floor: f32,
+    },
     /// Repeat each complete inner row `repeats` times:
     /// `[M, N] → [M, N * repeats]`.
     TileInner {
@@ -1154,6 +1165,37 @@ impl Graph {
         let inner_u32 = u32::try_from(inner).expect("broadcast_inner width exceeds u32");
         let ty = TensorType::f32(vec![shape[0], inner]);
         self.add_raw_node(Op::BroadcastInner { inner: inner_u32 }, vec![x], ty)
+    }
+
+    /// Normalize each row of `x: [M, N]` by
+    /// `relu(sum(row) - floor) + floor`.
+    ///
+    /// Rows whose sum does not exceed `floor` keep a normalized sum below one
+    /// instead of being forced to sum to one. This is useful for non-negative
+    /// weights that may all underflow to zero.
+    pub fn normalize_inner_sum(&mut self, x: NodeId, floor: f32) -> NodeId {
+        let ty = self.node(x).ty.clone();
+        assert_eq!(
+            ty.shape.len(),
+            2,
+            "normalize_inner_sum expects a 2D [M, N] input, got {:?}",
+            ty.shape
+        );
+        assert_eq!(
+            ty.dtype,
+            DType::F32,
+            "normalize_inner_sum expects an f32 input"
+        );
+        assert!(
+            ty.shape[1] > 0,
+            "normalize_inner_sum needs a non-empty inner row"
+        );
+        assert!(
+            floor.is_finite() && floor > 0.0,
+            "normalize_inner_sum floor must be positive and finite"
+        );
+        let inner = u32::try_from(ty.shape[1]).expect("normalize_inner_sum width exceeds u32");
+        self.add_raw_node(Op::NormalizeInnerSum { inner, floor }, vec![x], ty)
     }
 
     /// Repeat each complete inner row of `x: [M, N]` `repeats` times.

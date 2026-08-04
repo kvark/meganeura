@@ -193,6 +193,8 @@ pub enum ShaderEntry {
     GlobalAvgPool,
     GlobalAvgPoolGrad,
     BroadcastInner,
+    NormalizeInnerSum,
+    NormalizeInnerSumGrad,
     TileInner,
     TileInnerGrad,
     PairwiseSquaredDistance,
@@ -327,6 +329,8 @@ impl ShaderEntry {
             | ShaderEntry::BroadcastInner
             | ShaderEntry::TileInner
             | ShaderEntry::TileInnerGrad => ShaderGroup::GlobalAvgPoolGrad,
+            ShaderEntry::NormalizeInnerSum => ShaderGroup::NormalizeInnerSum,
+            ShaderEntry::NormalizeInnerSumGrad => ShaderGroup::NormalizeInnerSumGrad,
             ShaderEntry::PairwiseSquaredDistance => ShaderGroup::PairwiseSquaredDistance,
             ShaderEntry::PairwiseSquaredDistanceGradLeft
             | ShaderEntry::PairwiseSquaredDistanceGradRight => {
@@ -453,6 +457,7 @@ impl ShaderEntry {
             ShaderEntry::GlobalAvgPool => "global_avg_pool",
             ShaderEntry::GlobalAvgPoolGrad => "main",
             ShaderEntry::BroadcastInner => "broadcast_inner",
+            ShaderEntry::NormalizeInnerSum | ShaderEntry::NormalizeInnerSumGrad => "main",
             ShaderEntry::TileInner => "tile_inner",
             ShaderEntry::TileInnerGrad => "tile_inner_grad",
             ShaderEntry::PairwiseSquaredDistance => "main",
@@ -2348,6 +2353,41 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![total, inner, 0, 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
+            Op::NormalizeInnerSum { inner, floor } => {
+                let input = self.get_buffer(node.inputs[0]);
+                let rows = u32::try_from(node.ty.shape[0])
+                    .expect("normalize_inner_sum row count exceeds u32");
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::NormalizeInnerSum,
+                    workgroups: [rows.div_ceil(256), 1, 1],
+                    input_buffers: vec![input],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![rows, inner, floor.to_bits(), 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
+            Op::NormalizeInnerSumGrad { inner, floor } => {
+                let grad_output = self.get_buffer(node.inputs[0]);
+                let input = self.get_buffer(node.inputs[1]);
+                let rows = u32::try_from(node.ty.shape[0])
+                    .expect("normalize_inner_sum gradient row count exceeds u32");
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::NormalizeInnerSumGrad,
+                    workgroups: [rows.div_ceil(256), 1, 1],
+                    input_buffers: vec![grad_output, input],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![rows, inner, floor.to_bits(), 0],
                     use_coop: false,
                     use_small_tiles: false,
                     ..Default::default()

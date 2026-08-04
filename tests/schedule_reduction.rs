@@ -241,6 +241,78 @@ fn broadcast_inner_forward_and_gradient_match_explicit_repetition() {
 }
 
 #[test]
+fn normalize_inner_sum_matches_explicit_forward_and_gradient() {
+    const ROWS: usize = 257;
+    const INNER: usize = 8;
+    const FLOOR: f32 = 0.125;
+    let mut input_data = (0..ROWS * INNER)
+        .map(|index| ((index * 31 % 101) as f32 + 1.0) * 0.004)
+        .collect::<Vec<_>>();
+    input_data[0..INNER].fill(0.0);
+    input_data[INNER..2 * INNER].fill(0.005);
+    input_data[2 * INNER..3 * INNER].fill(FLOOR / INNER as f32);
+    let weights_data = (0..ROWS * INNER)
+        .map(|index| ((index * 17 % 41) as f32 - 20.0) * 0.031)
+        .collect::<Vec<_>>();
+
+    let mut graph = Graph::new();
+    let input = graph.parameter("input", &[ROWS, INNER]);
+    let normalized = graph.normalize_inner_sum(input, FLOOR);
+    let weights = graph.input("weights", &[ROWS, INNER]);
+    let weighted = graph.mul(normalized, weights);
+    let loss = graph.sum_all(weighted);
+    graph.set_outputs(vec![loss, normalized]);
+
+    let mut session = meganeura::build_session(&graph);
+    session.set_parameter("input", &input_data);
+    session.set_input("weights", &weights_data);
+    session.step();
+    session.wait();
+
+    let mut normalized_output = vec![0.0; ROWS * INNER];
+    session.read_output_by_index(1, &mut normalized_output);
+    let mut gradient = vec![0.0; ROWS * INNER];
+    session.read_param_grad("input", &mut gradient);
+    for row in 0..ROWS {
+        let begin = row * INNER;
+        let mut sum = 0.0_f32;
+        let mut weighted_gradient = 0.0_f32;
+        for column in 0..INNER {
+            let index = begin + column;
+            sum += input_data[index];
+            weighted_gradient += weights_data[index] * input_data[index];
+        }
+        let above_floor = sum - FLOOR;
+        let denominator = above_floor.max(0.0) + FLOOR;
+        let inverse = 1.0 / denominator;
+        let denominator_gradient = if above_floor > 0.0 {
+            -(weighted_gradient * (inverse * inverse))
+        } else {
+            0.0
+        };
+        for column in 0..INNER {
+            let index = begin + column;
+            let expected_output = input_data[index] * inverse;
+            assert!(
+                (normalized_output[index] - expected_output).abs()
+                    <= normalized_output[index].abs().max(expected_output.abs()) * 2.0e-6 + 2.0e-7,
+                "normalized value mismatch at [{row}, {column}]: {} != {}",
+                normalized_output[index],
+                expected_output,
+            );
+            let expected_gradient = weights_data[index] * inverse + denominator_gradient;
+            assert!(
+                (gradient[index] - expected_gradient).abs()
+                    <= gradient[index].abs().max(expected_gradient.abs()) * 2.0e-6 + 2.0e-7,
+                "gradient mismatch at [{row}, {column}]: {} != {}",
+                gradient[index],
+                expected_gradient,
+            );
+        }
+    }
+}
+
+#[test]
 fn tile_inner_forward_and_gradient_match_explicit_repetition() {
     const ROWS: usize = 513;
     const INNER: usize = 3;
