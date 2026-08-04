@@ -184,6 +184,9 @@ separate and fast.
   independent process replicates.
 - The Apple and Intel references are eager, and Intel falls back to CPU.
 - No manual CUDA Graph capture was added to PyTorch.
+- The post-freeze observability and shader-consolidation work linked from the
+  paper (Meganeura PR 137) is intentionally absent from this bundle's frozen
+  source and did not affect any reported measurement or source-size count.
 - The PyTorch/ROCm Whisper backward record on the 780M fails the
   cross-backend oracle-consistency check in both arithmetic contracts. Raw
   timings and diagnostics are retained, but that paired training comparison
