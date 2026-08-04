@@ -690,6 +690,154 @@ fn two_gather_reduction_actually_fuses() {
     assert_eq!(embeds, 0, "embedding dispatches should be folded away");
 }
 
+#[test]
+fn shared_gather_and_offset_fold_into_each_reduction() {
+    let vocab = 5usize;
+    let m = 6usize;
+    let n = 64usize;
+    let mut graph = Graph::new();
+    let indices = graph.input_u32("indices", &[m]);
+    let table = graph.input("table", &[vocab, n]);
+    let offset = graph.input("offset", &[m, n]);
+    let factors_a = graph.input("factors_a", &[m, n]);
+    let factors_b = graph.input("factors_b", &[m, n]);
+    let gathered = graph.embedding(indices, table);
+    let relative = graph.add(gathered, offset);
+    let terms_a = graph.mul(relative, factors_a);
+    let reduced_a = graph.sum_inner(terms_a);
+    let terms_b = graph.mul(relative, factors_b);
+    let reduced_b = graph.sum_inner(terms_b);
+    let output = graph.add(reduced_a, reduced_b);
+    graph.set_outputs(vec![output]);
+
+    let opts = CompileOptions {
+        use_schedule_reduction: true,
+        ..CompileOptions::default()
+    };
+    let plan = compile_with(&graph, &opts);
+    let reductions: Vec<_> = plan
+        .dispatches
+        .iter()
+        .filter(|dispatch| dispatch.reduction.is_some())
+        .collect();
+    assert_eq!(reductions.len(), 2);
+    for reduction in reductions {
+        let kernel = reduction.reduction.as_ref().unwrap();
+        assert_eq!(kernel.n_per_elem, 3);
+        assert_eq!(kernel.gather_elem, vec![true, false, false]);
+        assert_eq!(reduction.input_buffers.len(), 4);
+    }
+    assert!(!plan.dispatches.iter().any(|dispatch| {
+        dispatch.shader == ShaderEntry::Embedding && dispatch.reduction.is_none()
+    }));
+    assert!(!plan.dispatches.iter().any(|dispatch| {
+        dispatch.shader == ShaderEntry::Add && dispatch.params[0] == (m * n) as u32
+    }));
+}
+
+#[test]
+fn shared_gather_and_offset_reduction_parity() {
+    let vocab = 5usize;
+    let m = 6usize;
+    let n = 64usize;
+    assert_parity(
+        |graph| {
+            let indices = graph.input_u32("indices", &[m]);
+            let table = graph.input("table", &[vocab, n]);
+            let offset = graph.input("offset", &[m, n]);
+            let factors_a = graph.input("factors_a", &[m, n]);
+            let factors_b = graph.input("factors_b", &[m, n]);
+            let gathered = graph.embedding(indices, table);
+            let relative = graph.add(gathered, offset);
+            let terms_a = graph.mul(relative, factors_a);
+            let reduced_a = graph.sum_inner(terms_a);
+            let terms_b = graph.mul(relative, factors_b);
+            let reduced_b = graph.sum_inner(terms_b);
+            let output = graph.add(reduced_a, reduced_b);
+            let table_data = (0..vocab * n)
+                .map(|index| index as f32 * 0.021 - 1.0)
+                .collect();
+            let offset_data = (0..m * n)
+                .map(|index| index as f32 * -0.013 + 0.5)
+                .collect();
+            let factors_a_data = (0..m * n).map(|index| index as f32 * 0.005 + 0.3).collect();
+            let factors_b_data = (0..m * n)
+                .map(|index| index as f32 * -0.007 + 0.7)
+                .collect();
+            let indices_data = (0..m).map(|row| (row * 3 % vocab) as u32).collect();
+            (
+                output,
+                vec![
+                    ("table", table_data),
+                    ("offset", offset_data),
+                    ("factors_a", factors_a_data),
+                    ("factors_b", factors_b_data),
+                ],
+                vec![("indices", indices_data)],
+            )
+        },
+        m,
+    );
+}
+
+#[test]
+fn shared_gather_reductions_accumulate_the_table_gradient() {
+    let vocab = 5usize;
+    let m = 6usize;
+    let n = 64usize;
+    let mut graph = Graph::new();
+    let indices = graph.input_u32("indices", &[m]);
+    let table = graph.parameter("table", &[vocab, n]);
+    let offset = graph.input("offset", &[m, n]);
+    let factors_a = graph.input("factors_a", &[m, n]);
+    let factors_b = graph.input("factors_b", &[m, n]);
+    let gathered = graph.embedding(indices, table);
+    let relative = graph.add(gathered, offset);
+    let terms_a = graph.mul(relative, factors_a);
+    let reduced_a = graph.sum_inner(terms_a);
+    let terms_b = graph.mul(relative, factors_b);
+    let reduced_b = graph.sum_inner(terms_b);
+    let rows = graph.add(reduced_a, reduced_b);
+    let loss = graph.sum_all(rows);
+    graph.set_outputs(vec![loss]);
+
+    let indices_data = (0..m)
+        .map(|row| (row * 3 % vocab) as u32)
+        .collect::<Vec<_>>();
+    let factors_a_data = (0..m * n)
+        .map(|index| index as f32 * 0.005 + 0.3)
+        .collect::<Vec<_>>();
+    let factors_b_data = (0..m * n)
+        .map(|index| index as f32 * -0.007 + 0.7)
+        .collect::<Vec<_>>();
+    let mut session = meganeura::build_session(&graph);
+    session.set_parameter("table", &vec![0.0; vocab * n]);
+    session.set_input("offset", &vec![0.0; m * n]);
+    session.set_input("factors_a", &factors_a_data);
+    session.set_input("factors_b", &factors_b_data);
+    session.set_input_u32("indices", &indices_data);
+    session.set_learning_rate(0.0);
+    session.step();
+    session.wait();
+
+    let mut actual = vec![0.0; vocab * n];
+    session.read_param_grad("table", &mut actual);
+    let mut expected = vec![0.0; vocab * n];
+    for row in 0..m {
+        let table_row = indices_data[row] as usize;
+        for column in 0..n {
+            expected[table_row * n + column] +=
+                factors_a_data[row * n + column] + factors_b_data[row * n + column];
+        }
+    }
+    for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+        assert!(
+            (actual - expected).abs() <= expected.abs() * 1.0e-6 + 1.0e-6,
+            "table gradient mismatch at {index}: {actual} != {expected}"
+        );
+    }
+}
+
 /// Two gather streams (both operands gathered) — closest to the real SH
 /// case where both coeff and per-step basis are indexed loads.
 #[test]
