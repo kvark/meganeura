@@ -240,6 +240,56 @@ fn broadcast_inner_forward_and_gradient_match_explicit_repetition() {
     }
 }
 
+#[test]
+fn tile_inner_forward_and_gradient_match_explicit_repetition() {
+    const ROWS: usize = 513;
+    const INNER: usize = 3;
+    const REPEATS: usize = 8;
+    let input_data = (0..ROWS * INNER)
+        .map(|index| ((index * 31 % 127) as f32 - 63.0) * 0.017)
+        .collect::<Vec<_>>();
+    let weights_data = (0..ROWS * INNER * REPEATS)
+        .map(|index| ((index * 17 % 41) as f32 - 20.0) * 0.031)
+        .collect::<Vec<_>>();
+
+    let mut graph = Graph::new();
+    let input = graph.parameter("input", &[ROWS, INNER]);
+    let repeated = graph.tile_inner(input, REPEATS);
+    let weights = graph.input("weights", &[ROWS, INNER * REPEATS]);
+    let weighted = graph.mul(repeated, weights);
+    let loss = graph.sum_all(weighted);
+    graph.set_outputs(vec![loss, repeated]);
+
+    let mut session = meganeura::build_session(&graph);
+    session.set_parameter("input", &input_data);
+    session.set_input("weights", &weights_data);
+    session.step();
+    session.wait();
+
+    let mut repeated_output = vec![0.0; ROWS * INNER * REPEATS];
+    session.read_output_by_index(1, &mut repeated_output);
+    let mut gradient = vec![0.0; ROWS * INNER];
+    session.read_param_grad("input", &mut gradient);
+    for row in 0..ROWS {
+        for column in 0..INNER {
+            let mut expected_gradient = 0.0_f32;
+            for repeat in 0..REPEATS {
+                let output_index = row * INNER * REPEATS + repeat * INNER + column;
+                assert_eq!(
+                    repeated_output[output_index].to_bits(),
+                    input_data[row * INNER + column].to_bits(),
+                );
+                expected_gradient += weights_data[output_index];
+            }
+            assert_eq!(
+                gradient[row * INNER + column].to_bits(),
+                expected_gradient.to_bits(),
+                "gradient mismatch at [{row}, {column}]",
+            );
+        }
+    }
+}
+
 /// Phase 2: `sum_inner(mul(embedding(idx, table), basis))` — the SH colour
 /// path. Folds the gather (Embedding) into the reduction as a gather
 /// stream. Exercises the full gather codegen + dynamic binding.

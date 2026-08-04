@@ -5462,7 +5462,9 @@ mod tests {
                 ShaderEntry::MaxPool2d
                 | ShaderEntry::GlobalAvgPool
                 | ShaderEntry::GlobalAvgPoolGrad
-                | ShaderEntry::BroadcastInner => vec!["src", "dst", "params"],
+                | ShaderEntry::BroadcastInner
+                | ShaderEntry::TileInner
+                | ShaderEntry::TileInnerGrad => vec!["src", "dst", "params"],
                 ShaderEntry::WinogradInputTransform | ShaderEntry::WinogradOutputTransform => {
                     vec!["src", "dst", "params"]
                 }
@@ -5571,6 +5573,8 @@ mod tests {
             ShaderEntry::GlobalAvgPool,
             ShaderEntry::GlobalAvgPoolGrad,
             ShaderEntry::BroadcastInner,
+            ShaderEntry::TileInner,
+            ShaderEntry::TileInnerGrad,
         ];
 
         for entry in &entries {

@@ -243,6 +243,8 @@ pub enum ShaderEntry {
     GlobalAvgPool,
     GlobalAvgPoolGrad,
     BroadcastInner,
+    TileInner,
+    TileInnerGrad,
     WinogradInputTransform,
     WinogradOutputTransform,
     WinogradBatchedMatMul,
@@ -470,9 +472,10 @@ impl ShaderEntry {
             ShaderEntry::RoPEDynamic => ShaderGroup::RoPEDynamic,
             ShaderEntry::MaxPool2d => ShaderGroup::MaxPool2d,
             ShaderEntry::GlobalAvgPool => ShaderGroup::GlobalAvgPool,
-            ShaderEntry::GlobalAvgPoolGrad | ShaderEntry::BroadcastInner => {
-                ShaderGroup::GlobalAvgPoolGrad
-            }
+            ShaderEntry::GlobalAvgPoolGrad
+            | ShaderEntry::BroadcastInner
+            | ShaderEntry::TileInner
+            | ShaderEntry::TileInnerGrad => ShaderGroup::GlobalAvgPoolGrad,
             ShaderEntry::WinogradInputTransform => ShaderGroup::WinogradInputTransform,
             ShaderEntry::WinogradOutputTransform => ShaderGroup::WinogradOutputTransform,
             ShaderEntry::WinogradBatchedMatMul => ShaderGroup::WinogradBatchedMatMul,
@@ -577,6 +580,8 @@ impl ShaderEntry {
             ShaderEntry::GlobalAvgPool => "global_avg_pool",
             ShaderEntry::GlobalAvgPoolGrad => "main",
             ShaderEntry::BroadcastInner => "broadcast_inner",
+            ShaderEntry::TileInner => "tile_inner",
+            ShaderEntry::TileInnerGrad => "tile_inner_grad",
             ShaderEntry::WinogradInputTransform
             | ShaderEntry::WinogradOutputTransform
             | ShaderEntry::WinogradBatchedMatMul
@@ -2754,6 +2759,42 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![total, inner, 0, 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
+            Op::TileInner { repeats } => {
+                let input = self.get_buffer(node.inputs[0]);
+                let inner = u32::try_from(self.graph.node(node.inputs[0]).ty.shape[1])
+                    .expect("tile_inner input width exceeds u32");
+                let total = u32::try_from(node.ty.num_elements())
+                    .expect("tile_inner output element count exceeds u32");
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::TileInner,
+                    workgroups: [total.div_ceil(256), 1, 1],
+                    input_buffers: vec![input],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![total, inner, repeats, 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
+            Op::TileInnerGrad { inner, repeats } => {
+                let input = self.get_buffer(node.inputs[0]);
+                let total = u32::try_from(node.ty.num_elements())
+                    .expect("tile_inner gradient element count exceeds u32");
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::TileInnerGrad,
+                    workgroups: [total.div_ceil(256), 1, 1],
+                    input_buffers: vec![input],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![total, inner, repeats, 0],
                     use_coop: false,
                     use_small_tiles: false,
                     ..Default::default()
