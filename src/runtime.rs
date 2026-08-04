@@ -3317,58 +3317,40 @@ impl Session {
         self.read_buffer(buf_ref, out);
     }
 
-    /// Read several full F32 parameter buffers with one GPU transfer.
-    ///
-    /// Shared parameter memory is fast for GPU access and CPU uploads, but
-    /// can be very slow for CPU reads on a discrete GPU. This stages every
-    /// requested parameter into cached download memory before copying it to
-    /// the returned vectors. Results have the same order as `names`.
-    pub fn read_params(&self, names: &[&str]) -> Vec<Vec<f32>> {
-        if names.is_empty() {
+    fn read_f32_buffers(
+        &self,
+        buffers: &[(blade_graphics::Buffer, usize)],
+        label: &'static str,
+    ) -> Vec<Vec<f32>> {
+        if buffers.is_empty() {
             return Vec::new();
         }
 
         let mut total_bytes = 0_usize;
-        let requests: Vec<_> = names
+        let requests: Vec<_> = buffers
             .iter()
-            .map(|name| {
-                let buf_ref = self
-                    .param_buffer(name)
-                    .unwrap_or_else(|| panic!("unknown param: {name}"));
-                assert!(
-                    matches!(
-                        self.plan.weight_buffers.get(&buf_ref).map(|entry| entry.0),
-                        None | Some(crate::compile::WeightFormat::F32)
-                    ),
-                    "parameter {name:?} is not an F32 buffer",
-                );
-                let byte_len = self.plan.buffers[buf_ref.0 as usize];
-                assert_eq!(
-                    byte_len % std::mem::size_of::<f32>(),
-                    0,
-                    "parameter {name:?} is not an F32 buffer",
-                );
+            .map(|&(buffer, byte_len)| {
+                assert_eq!(byte_len % std::mem::size_of::<f32>(), 0);
                 let offset = total_bytes;
                 total_bytes += byte_len;
-                (self.buffers[buf_ref.0 as usize], offset, byte_len)
+                (buffer, offset, byte_len)
             })
             .collect();
-
         let staging = self.gpu.create_buffer(blade_graphics::BufferDesc {
-            name: "parameter_readback",
+            name: label,
             size: (total_bytes as u64).max(4),
             memory: blade_graphics::Memory::Download,
         });
         let mut encoder = self
             .gpu
             .create_command_encoder(blade_graphics::CommandEncoderDesc {
-                name: "parameter_readback",
+                name: label,
                 buffer_count: 1,
                 manual_barriers: false,
             });
         encoder.start();
         {
-            let mut transfer = encoder.transfer("parameter_readback");
+            let mut transfer = encoder.transfer(label);
             for &(buffer, offset, byte_len) in &requests {
                 if byte_len != 0 {
                     transfer.copy_buffer_to_buffer(
@@ -3398,6 +3380,33 @@ impl Session {
         self.gpu.destroy_command_encoder(&mut encoder);
         self.gpu.destroy_buffer(staging);
         outputs
+    }
+
+    /// Read several full F32 parameter buffers with one GPU transfer.
+    ///
+    /// Shared parameter memory is fast for GPU access and CPU uploads, but
+    /// can be very slow for CPU reads on a discrete GPU. This stages every
+    /// requested parameter into cached download memory before copying it to
+    /// the returned vectors. Results have the same order as `names`.
+    pub fn read_params(&self, names: &[&str]) -> Vec<Vec<f32>> {
+        let buffers: Vec<_> = names
+            .iter()
+            .map(|name| {
+                let buf_ref = self
+                    .param_buffer(name)
+                    .unwrap_or_else(|| panic!("unknown param: {name}"));
+                assert!(
+                    matches!(
+                        self.plan.weight_buffers.get(&buf_ref).map(|entry| entry.0),
+                        None | Some(crate::compile::WeightFormat::F32)
+                    ),
+                    "parameter {name:?} is not an F32 buffer",
+                );
+                let byte_len = self.plan.buffers[buf_ref.0 as usize];
+                (self.buffers[buf_ref.0 as usize], byte_len)
+            })
+            .collect();
+        self.read_f32_buffers(&buffers, "parameter_readback")
     }
 
     /// Read a parameter's gradient buffer by name.
@@ -3497,6 +3506,35 @@ impl Session {
             let ptr = buf.data() as *const f32;
             std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), n);
         }
+    }
+
+    /// Read both Adam moment buffers for several parameters with one GPU
+    /// transfer through cached download memory. Results have the same order
+    /// as `names`.
+    pub fn read_adam_states(&self, names: &[&str]) -> Vec<(Vec<f32>, Vec<f32>)> {
+        let buffers: Vec<_> = names
+            .iter()
+            .flat_map(|name| {
+                let idx = self
+                    .adam_state_index(name)
+                    .unwrap_or_else(|| panic!("no Adam state for param: {name}"));
+                let byte_len = self.param_size(name).expect("param exists; size known")
+                    * std::mem::size_of::<f32>();
+                [
+                    (self.adam_state[idx].0, byte_len),
+                    (self.adam_state[idx].1, byte_len),
+                ]
+            })
+            .collect();
+        let mut values = self
+            .read_f32_buffers(&buffers, "adam_state_readback")
+            .into_iter();
+        let mut states = Vec::with_capacity(names.len());
+        for _ in names {
+            states.push((values.next().unwrap(), values.next().unwrap()));
+        }
+        debug_assert!(values.next().is_none());
+        states
     }
 
     /// Write the Adam first-moment buffer for a parameter. `data.len()`
