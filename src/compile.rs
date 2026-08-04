@@ -2809,7 +2809,7 @@ impl<'a> Compiler<'a> {
                     input_buffers: vec![input],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
-                    params: vec![rows, inner, floor.to_bits(), 0],
+                    params: vec![rows, inner, floor.to_bits(), 1.0_f32.to_bits()],
                     use_coop: false,
                     use_small_tiles: false,
                     ..Default::default()
@@ -2827,7 +2827,7 @@ impl<'a> Compiler<'a> {
                     input_buffers: vec![grad_output, input],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
-                    params: vec![rows, inner, floor.to_bits(), 0],
+                    params: vec![rows, inner, floor.to_bits(), 1.0_f32.to_bits()],
                     use_coop: false,
                     use_small_tiles: false,
                     ..Default::default()
