@@ -329,3 +329,68 @@ fn layer_norm_archetype_parity() {
         5 * 96,
     );
 }
+
+#[test]
+fn gathered_reduction_table_gradient_matches_row_scale_bit_exactly() {
+    const ROWS: usize = 2049;
+    const COLS: usize = 16;
+    const VOCAB: usize = 2053;
+
+    let mut graph = Graph::new();
+    let indices = graph.input_u32("indices", &[ROWS]);
+    let table = graph.parameter("table", &[VOCAB, COLS]);
+    let factors = graph.input("factors", &[ROWS, COLS]);
+    let gathered = graph.embedding(indices, table);
+    let terms = graph.mul(gathered, factors);
+    let reduced = graph.sum_inner(terms);
+    let row_scale = graph.input("row_scale", &[ROWS, 1]);
+    let weighted = graph.mul(reduced, row_scale);
+    let loss = graph.sum_all(weighted);
+    graph.set_outputs(vec![loss]);
+
+    let indices_data = (0..ROWS)
+        .map(|row| ((row * 37) % VOCAB) as u32)
+        .collect::<Vec<_>>();
+    let factors_data = (0..ROWS * COLS)
+        .map(|index| {
+            let magnitude = (index * 5 % 8 + 1) as f32 * 0.125;
+            if index & 8 == 0 {
+                magnitude
+            } else {
+                -magnitude
+            }
+        })
+        .collect::<Vec<_>>();
+    let row_scale_data = (0..ROWS)
+        .map(|row| {
+            let magnitude = (row * 7 % 4 + 1) as f32 * 0.25;
+            if row & 4 == 0 { magnitude } else { -magnitude }
+        })
+        .collect::<Vec<_>>();
+
+    let mut session = meganeura::build_session(&graph);
+    session.set_parameter("table", &vec![0.0; VOCAB * COLS]);
+    session.set_input_u32("indices", &indices_data);
+    session.set_input("factors", &factors_data);
+    session.set_input("row_scale", &row_scale_data);
+    session.step();
+    session.wait();
+
+    let mut actual = vec![0.0; VOCAB * COLS];
+    session.read_param_grad("table", &mut actual);
+    let mut expected = vec![0.0; VOCAB * COLS];
+    for row in 0..ROWS {
+        let output_row = indices_data[row] as usize;
+        for col in 0..COLS {
+            expected[output_row * COLS + col] =
+                row_scale_data[row] * factors_data[row * COLS + col];
+        }
+    }
+    for (index, (&actual, &expected)) in actual.iter().zip(expected.iter()).enumerate() {
+        assert_eq!(
+            actual.to_bits(),
+            expected.to_bits(),
+            "table gradient mismatch at flat index {index}: {actual} != {expected}"
+        );
+    }
+}

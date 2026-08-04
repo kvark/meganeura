@@ -5369,10 +5369,11 @@ mod tests {
                 ShaderEntry::BiasAdd => vec!["src", "bias", "dst", "params"],
                 ShaderEntry::SgdUpdate => vec!["param", "grad", "dst", "params"],
                 ShaderEntry::AdamUpdate => vec!["param", "grad", "m", "v", "params"],
-                ShaderEntry::ScatterAdd
-                | ShaderEntry::ScatterAddAtomicZero
-                | ShaderEntry::ScatterAddAtomic => {
-                    vec!["indices", "src", "dst", "params"]
+                ShaderEntry::ScatterAdd => vec!["indices", "src", "dst", "params"],
+                ShaderEntry::ScatterAddAtomicZero
+                | ShaderEntry::ScatterAddAtomic
+                | ShaderEntry::ScatterAddAtomicRowMul => {
+                    vec!["indices", "src", "row_scale", "dst", "params"]
                 }
                 ShaderEntry::BceLoss => vec!["pred", "labels", "grad_out", "loss_out", "params"],
                 ShaderEntry::Softmax => vec!["src", "dst", "params"],
@@ -5538,6 +5539,7 @@ mod tests {
             ShaderEntry::ScatterAdd,
             ShaderEntry::ScatterAddAtomicZero,
             ShaderEntry::ScatterAddAtomic,
+            ShaderEntry::ScatterAddAtomicRowMul,
             ShaderEntry::BceLoss,
             ShaderEntry::GroupNorm,
             ShaderEntry::GroupNormSilu,
