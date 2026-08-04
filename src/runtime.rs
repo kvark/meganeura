@@ -13,6 +13,17 @@ struct ScatterAddData {
     params: ScatterAddParams,
 }
 
+// Naga reflects the module-wide globals for every atomic entry point. The
+// ordinary and zeroing entries bind `src` again for their unused row scale.
+#[derive(blade_macros::ShaderData)]
+struct ScatterAddAtomicData {
+    indices: blade_graphics::BufferPiece,
+    src: blade_graphics::BufferPiece,
+    row_scale: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: ScatterAddParams,
+}
+
 #[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
 #[repr(C)]
 struct ScatterAddParams {
@@ -1716,9 +1727,10 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::BiasAdd => BiasAddData::layout(),
         ShaderEntry::SgdUpdate => SgdData::layout(),
         ShaderEntry::AdamUpdate => AdamData::layout(),
-        ShaderEntry::ScatterAdd
-        | ShaderEntry::ScatterAddAtomicZero
-        | ShaderEntry::ScatterAddAtomic => ScatterAddData::layout(),
+        ShaderEntry::ScatterAdd => ScatterAddData::layout(),
+        ShaderEntry::ScatterAddAtomicZero
+        | ShaderEntry::ScatterAddAtomic
+        | ShaderEntry::ScatterAddAtomicRowMul => ScatterAddAtomicData::layout(),
         ShaderEntry::SwiGLUConcat | ShaderEntry::SwiGLUConcatGrad => BinaryData::layout(),
         ShaderEntry::SumAll
         | ShaderEntry::MeanAll
@@ -5540,14 +5552,46 @@ impl Session {
                      not via bind_dispatch"
                 );
             }
-            ShaderEntry::ScatterAdd
-            | ShaderEntry::ScatterAddAtomicZero
-            | ShaderEntry::ScatterAddAtomic => {
+            ShaderEntry::ScatterAdd => {
                 pc.bind(
                     0,
                     &ScatterAddData {
                         indices: buf(dispatch.input_buffers[0]),
                         src: buf(dispatch.input_buffers[1]),
+                        dst: buf(dispatch.output_buffer),
+                        params: ScatterAddParams {
+                            total: dispatch.params[0],
+                            seq_len: dispatch.params[1],
+                            embed_dim: dispatch.params[2],
+                            _pad: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::ScatterAddAtomicZero | ShaderEntry::ScatterAddAtomic => {
+                pc.bind(
+                    0,
+                    &ScatterAddAtomicData {
+                        indices: buf(dispatch.input_buffers[0]),
+                        src: buf(dispatch.input_buffers[1]),
+                        row_scale: buf(dispatch.input_buffers[1]),
+                        dst: buf(dispatch.output_buffer),
+                        params: ScatterAddParams {
+                            total: dispatch.params[0],
+                            seq_len: dispatch.params[1],
+                            embed_dim: dispatch.params[2],
+                            _pad: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::ScatterAddAtomicRowMul => {
+                pc.bind(
+                    0,
+                    &ScatterAddAtomicData {
+                        indices: buf(dispatch.input_buffers[0]),
+                        src: buf(dispatch.input_buffers[1]),
+                        row_scale: buf(dispatch.input_buffers[2]),
                         dst: buf(dispatch.output_buffer),
                         params: ScatterAddParams {
                             total: dispatch.params[0],

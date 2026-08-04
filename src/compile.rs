@@ -151,6 +151,8 @@ pub enum ShaderEntry {
     ScatterAdd,
     ScatterAddAtomicZero,
     ScatterAddAtomic,
+    /// Atomic scatter where each source row is multiplied by one scalar.
+    ScatterAddAtomicRowMul,
     SumAll,
     MeanAll,
     Softmax,
@@ -339,6 +341,8 @@ impl ShaderEntry {
             ShaderEntry::ScatterAdd
             | ShaderEntry::ScatterAddAtomicZero
             | ShaderEntry::ScatterAddAtomic
+            | ShaderEntry::ScatterAddAtomicRowMul
+            | ShaderEntry::BroadcastInner
             | ShaderEntry::ExclusiveCumsum
             | ShaderEntry::ShiftInner
             | ShaderEntry::Transpose
@@ -400,9 +404,9 @@ impl ShaderEntry {
             ShaderEntry::SgdUpdate => ShaderGroup::Sgd,
             ShaderEntry::AdamUpdate => ShaderGroup::Adam,
             ShaderEntry::ScatterAdd => ShaderGroup::ScatterAdd,
-            ShaderEntry::ScatterAddAtomicZero | ShaderEntry::ScatterAddAtomic => {
-                ShaderGroup::ScatterAddAtomic
-            }
+            ShaderEntry::ScatterAddAtomicZero
+            | ShaderEntry::ScatterAddAtomic
+            | ShaderEntry::ScatterAddAtomicRowMul => ShaderGroup::ScatterAddAtomic,
             ShaderEntry::SumAll | ShaderEntry::MeanAll => ShaderGroup::Reduce,
             ShaderEntry::Softmax => ShaderGroup::Softmax,
             ShaderEntry::CrossEntropyLoss => ShaderGroup::CrossEntropy,
@@ -499,6 +503,7 @@ impl ShaderEntry {
             | ShaderEntry::BceLoss
             | ShaderEntry::Transpose => "main",
             ShaderEntry::ScatterAddAtomicZero => "zero",
+            ShaderEntry::ScatterAddAtomicRowMul => "row_mul",
             ShaderEntry::Relu => "relu",
             ShaderEntry::Sigmoid => "sigmoid",
             ShaderEntry::Tanh => "tanh_",
@@ -967,12 +972,164 @@ fn compile_with_caps_policy(
         if options.use_schedule_reduction {
             fuse_reduction_chains(&mut compiler.plan);
         }
+        fuse_row_scaled_scatters(&mut compiler.plan);
     }
     // RmsNorm+MatMul prologue fusion is applied later in the runtime, after
     // per-dispatch coop selection — the prologue path currently only has a
     // coop-matmul implementation. See Session::with_context.
 
     compiler.plan
+}
+
+/// Fuse the table-gradient chain produced by
+/// `sum_inner(embedding(indices, table) * factors)`:
+///
+/// `BroadcastInner(row_grad) -> Mul(factors) -> ScatterAddAtomic`
+///
+/// into one row-scaled atomic scatter. The atomic work mapping and zeroing
+/// pass stay unchanged; only the two large intermediate buffers disappear.
+fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
+    use crate::schedule::Pw;
+    use std::collections::{HashMap, HashSet};
+
+    let mut protected: HashSet<BufferRef> = HashSet::new();
+    protected.extend(plan.output_buffers.iter().copied());
+    if let Some(buffer) = plan.loss_buffer {
+        protected.insert(buffer);
+    }
+    protected.extend(plan.param_buffers.iter().map(|entry| entry.1));
+    protected.extend(plan.input_buffers.iter().map(|entry| entry.1));
+    protected.extend(plan.constant_buffers.iter().map(|entry| entry.0));
+    protected.extend(plan.lse_buffers.iter().map(|entry| entry.1));
+    for dispatch in &plan.dispatches {
+        protected.extend(dispatch.extra_outputs.iter().copied());
+    }
+
+    loop {
+        let mut producer = HashMap::new();
+        let mut reads = HashMap::new();
+        for (index, dispatch) in plan.dispatches.iter().enumerate() {
+            producer.insert(dispatch.output_buffer, index);
+            for buffer in &dispatch.input_buffers {
+                *reads.entry(*buffer).or_insert(0usize) += 1;
+            }
+            for buffer in &dispatch.epilogue_buffers {
+                *reads.entry(*buffer).or_insert(0usize) += 1;
+            }
+        }
+
+        let mut candidate = None;
+        for (scatter_index, scatter) in plan.dispatches.iter().enumerate() {
+            if scatter.shader != ShaderEntry::ScatterAddAtomic || scatter.input_buffers.len() != 3 {
+                continue;
+            }
+            let indices = scatter.input_buffers[0];
+            let product = scatter.input_buffers[1];
+            let Some(&mul_index) = producer.get(&product) else {
+                continue;
+            };
+            let mul = &plan.dispatches[mul_index];
+            let plain_mul = mul.shader == ShaderEntry::Mul
+                && mul.input_buffers.len() == 2
+                && mul.reduction.is_none()
+                && match mul.pointwise.as_ref() {
+                    None => true,
+                    Some(dag) => {
+                        dag.n_inputs == 2
+                            && dag.ops == [Pw::LoadInput(0), Pw::LoadInput(1), Pw::Mul(0, 1)]
+                            && dag.output == 2
+                    }
+                };
+            if !plain_mul || protected.contains(&product) {
+                continue;
+            }
+
+            let broadcast_side = mul
+                .input_buffers
+                .iter()
+                .enumerate()
+                .find_map(|(side, buffer)| match producer.get(buffer).copied() {
+                    Some(index) if plan.dispatches[index].shader == ShaderEntry::BroadcastInner => {
+                        Some((side, index))
+                    }
+                    _ => None,
+                });
+            let Some((broadcast_side, broadcast_index)) = broadcast_side else {
+                continue;
+            };
+            let broadcast = &plan.dispatches[broadcast_index];
+            let broadcast_output = broadcast.output_buffer;
+            let factors = mul.input_buffers[1 - broadcast_side];
+            if broadcast.input_buffers.len() != 1
+                || protected.contains(&broadcast_output)
+                || reads.get(&broadcast_output).copied() != Some(1)
+                || reads.get(&product).copied() != Some(2)
+            {
+                continue;
+            }
+
+            let Some((zero_index, _)) = plan.dispatches.iter().enumerate().find(|entry| {
+                let dispatch = entry.1;
+                dispatch.shader == ShaderEntry::ScatterAddAtomicZero
+                    && dispatch.output_buffer == scatter.output_buffer
+                    && dispatch.params == scatter.params
+                    && dispatch.input_buffers.first() == Some(&indices)
+                    && dispatch.input_buffers.get(1) == Some(&product)
+            }) else {
+                continue;
+            };
+            if scatter.params.len() < 4 {
+                continue;
+            }
+            let source_len = scatter.params[1].saturating_mul(scatter.params[2]);
+            if mul.params != [source_len, 0, 0, 0]
+                || broadcast.params != [source_len, scatter.params[2], 0, 0]
+                || scatter.workgroups != [source_len.div_ceil(256), 1, 1]
+            {
+                continue;
+            }
+            candidate = Some((
+                scatter_index,
+                zero_index,
+                mul_index,
+                broadcast_index,
+                indices,
+                factors,
+                broadcast.input_buffers[0],
+            ));
+            break;
+        }
+
+        let Some((
+            scatter_index,
+            zero_index,
+            mul_index,
+            broadcast_index,
+            indices,
+            factors,
+            row_scale,
+        )) = candidate
+        else {
+            break;
+        };
+
+        let output = plan.dispatches[scatter_index].output_buffer;
+        let total = plan.dispatches[scatter_index].params[0];
+        plan.dispatches[scatter_index].shader = ShaderEntry::ScatterAddAtomicRowMul;
+        plan.dispatches[scatter_index].input_buffers = vec![indices, factors, row_scale, output];
+        plan.dispatches[scatter_index].pointwise = None;
+        plan.dispatches[scatter_index].label = format!("ScatterAddAtomicRowMul[{total}]");
+        // The zero entry point does not read `src`, but its shared binding
+        // layout still requires a valid buffer. Stop it from retaining the
+        // now-eliminated product buffer.
+        plan.dispatches[zero_index].input_buffers = vec![indices, factors];
+
+        let mut remove = [mul_index, broadcast_index];
+        remove.sort_unstable();
+        for index in remove.into_iter().rev() {
+            plan.dispatches.remove(index);
+        }
+    }
 }
 
 /// Post-compile pass: merge sequential single-use pointwise dispatches into
@@ -4881,6 +5038,53 @@ mod tests {
     }
 
     #[test]
+    fn gather_reduction_gradient_fuses_row_scaled_atomic_scatter() {
+        const SEQ: usize = 256;
+        const VOCAB: usize = 4097;
+        const INNER: usize = 16;
+
+        let mut graph = Graph::new();
+        let indices = graph.input_u32("indices", &[SEQ]);
+        let table = graph.parameter("table", &[VOCAB, INNER]);
+        let factors = graph.input("factors", &[SEQ, INNER]);
+        let gathered = graph.embedding(indices, table);
+        let terms = graph.mul(gathered, factors);
+        let rows = graph.sum_inner(terms);
+        let row_scale = graph.input("row_scale", &[SEQ, 1]);
+        let weighted = graph.mul(rows, row_scale);
+        let loss = graph.sum_all(weighted);
+        graph.set_outputs(vec![loss]);
+
+        let (plan, _) = crate::train::compile_training_graph(&graph);
+        let fused = plan
+            .dispatches
+            .iter()
+            .find(|dispatch| dispatch.shader == ShaderEntry::ScatterAddAtomicRowMul)
+            .expect("gathered row reduction should fuse its table gradient");
+        assert_eq!(
+            fused.params,
+            [VOCAB as u32 * INNER as u32, SEQ as u32, INNER as u32, 0]
+        );
+        assert_eq!(fused.workgroups, [16, 1, 1]);
+        assert_eq!(fused.input_buffers.len(), 4);
+        assert_eq!(fused.input_buffers[3], fused.output_buffer);
+        assert!(!plan.dispatches.iter().any(|dispatch| {
+            dispatch.shader == ShaderEntry::BroadcastInner
+                && dispatch.params == [SEQ as u32 * INNER as u32, INNER as u32, 0, 0]
+        }));
+
+        let zero = plan
+            .dispatches
+            .iter()
+            .find(|dispatch| {
+                dispatch.shader == ShaderEntry::ScatterAddAtomicZero
+                    && dispatch.output_buffer == fused.output_buffer
+            })
+            .expect("fused atomic scatter still needs its zeroing pass");
+        assert_eq!(zero.input_buffers[1], fused.input_buffers[1]);
+    }
+
+    #[test]
     fn test_compile_softmax() {
         let mut g = Graph::new();
         let x = g.input("x", &[4, 10]);
@@ -5178,6 +5382,7 @@ mod tests {
             ShaderEntry::ScatterAdd,
             ShaderEntry::ScatterAddAtomicZero,
             ShaderEntry::ScatterAddAtomic,
+            ShaderEntry::ScatterAddAtomicRowMul,
             ShaderEntry::SumAll,
             ShaderEntry::MeanAll,
             ShaderEntry::SumRows,
