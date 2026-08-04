@@ -300,6 +300,66 @@ fn silu_swiglu_rmsnorm_gradients() {
 }
 
 #[test]
+fn narrow_rms_norm_matches_cpu_forward_and_grad_x() {
+    const ROWS: usize = 513;
+    const COLS: usize = 3;
+    const EPS: f32 = 1.0e-6;
+    let weights = [0.75_f32, -1.25, 0.5];
+    let x_data = (0..ROWS * COLS)
+        .map(|index| ((index * 17 % 101) as f32 - 50.0) / 23.0)
+        .collect::<Vec<_>>();
+    let dy_data = (0..ROWS * COLS)
+        .map(|index| ((index * 29 % 83) as f32 - 41.0) / 31.0)
+        .collect::<Vec<_>>();
+
+    let mut graph = Graph::new();
+    let x = graph.parameter("x", &[ROWS, COLS]);
+    let weight = graph.constant(weights.to_vec(), &[COLS]);
+    let dy = graph.input("dy", &[ROWS, COLS]);
+    let normalized = graph.rms_norm(x, weight, EPS);
+    let product = graph.mul(normalized, dy);
+    let loss = graph.sum_all(product);
+    graph.set_outputs(vec![loss]);
+
+    let mut session = build_session(&graph);
+    session.set_parameter("x", &x_data);
+    session.set_input("dy", &dy_data);
+    session.step();
+    session.wait();
+
+    let mut expected_loss = 0.0_f32;
+    let mut expected_grad = vec![0.0_f32; x_data.len()];
+    for row in 0..ROWS {
+        let offset = row * COLS;
+        let x = &x_data[offset..offset + COLS];
+        let dy = &dy_data[offset..offset + COLS];
+        let sum_squared = x.iter().map(|value| value * value).sum::<f32>();
+        let inverse_rms = (sum_squared / COLS as f32 + EPS).sqrt().recip();
+        let dot = (0..COLS)
+            .map(|col| dy[col] * weights[col] * x[col])
+            .sum::<f32>();
+        let scale = inverse_rms * inverse_rms / COLS as f32 * dot;
+        for col in 0..COLS {
+            expected_loss += dy[col] * x[col] * inverse_rms * weights[col];
+            expected_grad[offset + col] = inverse_rms * (dy[col] * weights[col] - x[col] * scale);
+        }
+    }
+    let actual_loss = session.read_loss();
+    assert!(
+        (actual_loss - expected_loss).abs() < expected_loss.abs() * 1.0e-5 + 1.0e-3,
+        "loss {actual_loss} != {expected_loss}"
+    );
+    let mut actual_grad = vec![0.0_f32; expected_grad.len()];
+    session.read_param_grad("x", &mut actual_grad);
+    for (index, (&actual, &expected)) in actual_grad.iter().zip(&expected_grad).enumerate() {
+        assert!(
+            (actual - expected).abs() < 2.0e-5,
+            "grad[{index}] {actual} != {expected}"
+        );
+    }
+}
+
+#[test]
 fn smolvla_training_backprop_smoke() {
     // MHA backward shaders produce incorrect gradients on lavapipe (software Vulkan).
     // The workgroup shared memory reductions give wrong results when multiple reductions
