@@ -1662,6 +1662,26 @@ fn checkpoint_round_trip() {
 }
 
 #[test]
+fn batched_parameter_read_matches_uploaded_values() {
+    let mut graph = Graph::new();
+    let a = graph.parameter("a", &[2, 3]);
+    let b = graph.parameter("b", &[5]);
+    let a_mean = graph.mean_all(a);
+    let b_mean = graph.mean_all(b);
+    let output = graph.add(a_mean, b_mean);
+    graph.set_outputs(vec![output]);
+
+    let a_values = [0.25_f32, -1.0, 2.5, 7.0, -3.25, 0.125];
+    let b_values = [4.0_f32, 3.0, 2.0, 1.0, -5.0];
+    let mut session = build_inference_session(&graph);
+    session.set_parameter("a", &a_values);
+    session.set_parameter("b", &b_values);
+
+    let values = session.read_params(&["b", "a"]);
+    assert_eq!(values, [b_values.to_vec(), a_values.to_vec()]);
+}
+
+#[test]
 fn checkpoint_round_trip_preserves_odd_f16_tail() {
     let mut g = Graph::new();
     let x = g.input("x", &[1, 3]);
