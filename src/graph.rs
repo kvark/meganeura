@@ -166,6 +166,13 @@ pub enum Op {
     /// Identity / reshape: zero-cost view with potentially different shape.
     /// Compiled as buffer alias (no GPU dispatch). Backward reshapes grad back.
     Identity,
+    /// Copy a tensor into a distinct intermediate buffer.
+    ///
+    /// Unlike [`Op::Identity`], this is an explicit GPU dispatch and must not
+    /// be fused away. It is useful when consumers benefit from staging an
+    /// externally-backed or otherwise non-local buffer in device-local memory.
+    /// Backward is the identity.
+    Materialize,
     /// Forward identity, backward zero. Lets a graph use a value in two
     /// places where one branch's gradient should not flow back to the
     /// shared producer (the standard "detach" / "stop_gradient" op in
@@ -1079,6 +1086,22 @@ impl Graph {
         // Reshape is a zero-cost view — just reinterprets the shape.
         // Uses Identity op (compiled as buffer alias, no GPU dispatch).
         self.add_raw_node(Op::Identity, vec![x], TensorType::f32(new_shape.to_vec()))
+    }
+
+    /// Copy `x` into a distinct intermediate buffer.
+    ///
+    /// This is a memory-placement barrier rather than an algebraic operation:
+    /// compilation always emits the copy and pointwise fusion does not remove
+    /// it. The returned tensor has the same type and propagates gradients to
+    /// `x` unchanged.
+    pub fn materialize(&mut self, x: NodeId) -> NodeId {
+        let ty = self.node(x).ty.clone();
+        assert_eq!(
+            ty.dtype,
+            DType::F32,
+            "materialize only supports f32 tensors"
+        );
+        self.add_raw_node(Op::Materialize, vec![x], ty)
     }
 
     /// Forward identity, backward zero — the "detach" / `stop_gradient`

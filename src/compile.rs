@@ -142,6 +142,7 @@ pub enum ShaderEntry {
     Abs,
     Log,
     Recip,
+    Materialize,
     Add,
     Mul,
     Greater,
@@ -398,7 +399,8 @@ impl ShaderEntry {
             | ShaderEntry::Neg
             | ShaderEntry::Abs
             | ShaderEntry::Log
-            | ShaderEntry::Recip => ShaderGroup::Unary,
+            | ShaderEntry::Recip
+            | ShaderEntry::Materialize => ShaderGroup::Unary,
             ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater => ShaderGroup::Binary,
             ShaderEntry::BiasAdd => ShaderGroup::BiasAdd,
             ShaderEntry::SgdUpdate => ShaderGroup::Sgd,
@@ -511,6 +513,7 @@ impl ShaderEntry {
             ShaderEntry::Abs => "abs_",
             ShaderEntry::Log => "log_",
             ShaderEntry::Recip => "recip",
+            ShaderEntry::Materialize => "materialize",
             ShaderEntry::Add => "add",
             ShaderEntry::Mul => "mul",
             ShaderEntry::Greater => "greater",
@@ -2354,6 +2357,10 @@ impl<'a> Compiler<'a> {
             | Op::Nop
             | Op::Identity
             | Op::StopGradient => {}
+
+            Op::Materialize => {
+                self.emit_unary(ShaderEntry::Materialize, node, out_buf);
+            }
 
             Op::MatMul => {
                 let a = self.get_buffer(node.inputs[0]);
@@ -4823,6 +4830,31 @@ mod tests {
     }
 
     #[test]
+    fn test_materialize_is_a_distinct_non_fused_dispatch() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[2, 4]);
+        let staged = g.materialize(x);
+        let first = g.split_a(staged, 2, 3, 1, 1);
+        g.set_outputs(vec![first]);
+
+        let optimized = crate::optimize::optimize(&g);
+        let plan = compile(&optimized);
+
+        assert_eq!(plan.dispatches.len(), 2);
+        let copy = &plan.dispatches[0];
+        assert_eq!(copy.shader, ShaderEntry::Materialize);
+        assert_eq!(copy.params, [8, 0, 0, 0]);
+        assert_eq!(copy.workgroups, [1, 1, 1]);
+        assert_eq!(copy.input_buffers.len(), 1);
+        assert_ne!(copy.input_buffers[0], copy.output_buffer);
+        assert!(copy.pointwise.is_none());
+
+        let split = &plan.dispatches[1];
+        assert_eq!(split.shader, ShaderEntry::SplitA);
+        assert_eq!(split.input_buffers, [copy.output_buffer]);
+    }
+
+    #[test]
     fn test_compile_all_binary_ops() {
         let mut g = Graph::new();
         let a = g.input("a", &[4, 8]);
@@ -5373,6 +5405,7 @@ mod tests {
             ShaderEntry::Abs,
             ShaderEntry::Log,
             ShaderEntry::Recip,
+            ShaderEntry::Materialize,
             ShaderEntry::Add,
             ShaderEntry::Mul,
             ShaderEntry::Greater,
