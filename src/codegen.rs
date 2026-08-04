@@ -432,6 +432,8 @@ pub enum ShaderGroup {
     MaxPool2d,
     GlobalAvgPool,
     GlobalAvgPoolGrad,
+    NormalizeInnerSum,
+    NormalizeInnerSumGrad,
     PairwiseSquaredDistance,
     PairwiseSquaredDistanceGrad,
     PairwiseVectorRejection,
@@ -573,6 +575,12 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::GlobalAvgPool => parse_wgsl(include_str!("shaders/global_avg_pool.wgsl")),
         ShaderGroup::GlobalAvgPoolGrad => {
             parse_wgsl(include_str!("shaders/global_avg_pool_grad.wgsl"))
+        }
+        ShaderGroup::NormalizeInnerSum => {
+            parse_wgsl(include_str!("shaders/normalize_inner_sum.wgsl"))
+        }
+        ShaderGroup::NormalizeInnerSumGrad => {
+            parse_wgsl(include_str!("shaders/normalize_inner_sum_grad.wgsl"))
         }
         ShaderGroup::PairwiseSquaredDistance => {
             parse_wgsl(include_str!("shaders/pairwise_squared_distance.wgsl"))
@@ -5045,6 +5053,14 @@ mod tests {
                 naga::valid::Capabilities::empty(),
             ),
             (
+                ShaderGroup::NormalizeInnerSum,
+                naga::valid::Capabilities::empty(),
+            ),
+            (
+                ShaderGroup::NormalizeInnerSumGrad,
+                naga::valid::Capabilities::empty(),
+            ),
+            (
                 ShaderGroup::PairwiseSquaredDistance,
                 naga::valid::Capabilities::empty(),
             ),
@@ -5284,6 +5300,8 @@ mod tests {
             (ShaderGroup::ScatterAddAtomic, empty),
             (ShaderGroup::BceLoss, empty),
             (ShaderGroup::GlobalAvgPoolGrad, empty),
+            (ShaderGroup::NormalizeInnerSum, empty),
+            (ShaderGroup::NormalizeInnerSumGrad, empty),
             (ShaderGroup::PairwiseSquaredDistance, empty),
             (ShaderGroup::PairwiseSquaredDistanceGrad, empty),
             (ShaderGroup::PairwiseVectorRejection, empty),
@@ -5503,6 +5521,10 @@ mod tests {
                 | ShaderEntry::BroadcastInner
                 | ShaderEntry::TileInner
                 | ShaderEntry::TileInnerGrad => vec!["src", "dst", "params"],
+                ShaderEntry::NormalizeInnerSum => vec!["src", "dst", "params"],
+                ShaderEntry::NormalizeInnerSumGrad => {
+                    vec!["src_a", "src_b", "dst", "params"]
+                }
                 ShaderEntry::PairwiseSquaredDistance => {
                     vec!["src_a", "src_b", "dst", "params"]
                 }
@@ -5626,6 +5648,8 @@ mod tests {
             ShaderEntry::GlobalAvgPool,
             ShaderEntry::GlobalAvgPoolGrad,
             ShaderEntry::BroadcastInner,
+            ShaderEntry::NormalizeInnerSum,
+            ShaderEntry::NormalizeInnerSumGrad,
             ShaderEntry::TileInner,
             ShaderEntry::TileInnerGrad,
             ShaderEntry::PairwiseSquaredDistance,
