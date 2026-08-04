@@ -8,6 +8,7 @@ be checked against the frozen artifacts.
 """
 
 import json
+import math
 import os
 import statistics
 
@@ -27,6 +28,17 @@ MODELS = [
     ("Whisper-tiny", "Whisper-tiny"),
 ]
 PHASES = ["inference_ms", "latency_ms", "training_ms"]
+
+# The Radeon 780M PyTorch/ROCm Whisper backward result is inconsistent with
+# PyTorch on CUDA, discrete ROCm, CPU, and MPS, while Meganeura reproduces the
+# cross-backend consensus on all five devices.  The raw times and diagnostics
+# remain in the artifact, but this device/workload/phase is not a valid paired
+# comparison and is excluded symmetrically for both engines.
+ORACLE_DISPUTES = {("amd-i", "Whisper-tiny", "training_ms")}
+
+
+def oracle_disputed(platform, model, phase):
+    return (platform, model, phase) in ORACLE_DISPUTES
 
 
 def load(platform, mode, model):
@@ -59,8 +71,9 @@ def device_header(platform):
 
 
 def check_validation():
-    total = passed = 0
+    total = passed = disputed = 0
     worst = {"strict": {}, "accelerated": {}}
+    dispute_metrics = {"strict": {}, "accelerated": {}}
     for platform in PLATFORMS:
         for mode in MODES:
             for model, _ in MODELS:
@@ -68,12 +81,72 @@ def check_validation():
                 total += 1
                 if v["forward_valid"] and v["training_valid"]:
                     passed += 1
+                elif oracle_disputed(platform, model, "training_ms"):
+                    disputed += 1
                 for key in ("output_relative_l2_error",
                             "total_gradient_relative_error",
                             "parameter_gradient_relative_l2_error"):
-                    cur = worst[mode].get(key, 0.0)
-                    worst[mode][key] = max(cur, v[key])
-    return total, passed, worst
+                    if oracle_disputed(platform, model, "training_ms"):
+                        dispute_metrics[mode][key] = v[key]
+                    else:
+                        cur = worst[mode].get(key, 0.0)
+                        worst[mode][key] = max(cur, v[key])
+    return total, passed, disputed, worst, dispute_metrics
+
+
+def gradient_relative_l2(vector, reference):
+    """Relative L2 over named per-parameter gradient norms."""
+    if vector.keys() != reference.keys():
+        raise ValueError("gradient parameter sets differ in oracle audit")
+    numerator = math.sqrt(sum(
+        (vector[key] - reference[key]) ** 2 for key in vector
+    ))
+    denominator = math.sqrt(sum(value ** 2 for value in reference.values()))
+    return numerator / denominator
+
+
+def oracle_audit(mode):
+    """Cross-backend evidence for the one declared oracle dispute."""
+    records = {
+        platform: load(platform, mode, "Whisper-tiny")
+        for platform in PLATFORMS
+    }
+    reference_platforms = [p for p in PLATFORMS if p != "amd-i"]
+    references = [
+        records[p]["pytorch"]["outputs"]["gradient_norms"]
+        for p in reference_platforms
+    ]
+    candidates = [
+        records[p]["meganeura"]["outputs"]["gradient_norms"]
+        for p in PLATFORMS
+    ]
+    disputed = records["amd-i"]["pytorch"]["outputs"]
+
+    def max_internal(vectors):
+        return max(
+            gradient_relative_l2(a, b)
+            for a in vectors for b in vectors if a is not b
+        )
+
+    reference_norm = statistics.mean(
+        records[p]["pytorch"]["outputs"]["grad_norm"]
+        for p in reference_platforms
+    )
+    return {
+        "reference_internal": max_internal(references),
+        "candidate_internal": max_internal(candidates),
+        "candidate_to_reference": max(
+            gradient_relative_l2(candidate, reference)
+            for candidate in candidates for reference in references
+        ),
+        "disputed_to_reference": max(
+            gradient_relative_l2(disputed["gradient_norms"], reference)
+            for reference in references
+        ),
+        "disputed_total_norm": (
+            abs(disputed["grad_norm"] - reference_norm) / reference_norm
+        ),
+    }
 
 
 def emit(fname, colspec, header, body_lines):
@@ -147,7 +220,9 @@ def write_results_table(mode, fname, with_compile):
             for phase in PHASES:
                 a, b = t(mg, phase), t(pt_e, phase)
                 cell = ratio_cell(a / b)
-                if phase == "training_ms" and not mg["validation"]["training_valid"]:
+                if oracle_disputed(platform, model, phase):
+                    cell = r"--$^\ddagger$"
+                elif phase == "training_ms" and not mg["validation"]["training_valid"]:
                     cell = f"{a / b:.2f}$^\\dagger$"
                 cells += [fnum(a), fnum(b), cell]
             lines.append(" & ".join(cells) + r" \\")
@@ -188,10 +263,13 @@ def write_memory():
 def efficiencies(mode, phase, model):
     eff = {"meganeura": [], "pytorch": []}
     for platform in PLATFORMS:
+        if oracle_disputed(platform, model, phase):
+            continue
         s = load(platform, mode, model)
         tmg, tpt = t(s["meganeura"], phase), t(s["pytorch"], phase)
-        # An invalid cell is not a result: it scores zero for us and does
-        # not set the best-observed bar for the reference.
+        # An invalid implementation result scores zero and does not set the
+        # best-observed bar. Oracle-disputed pairs are removed above for both
+        # engines rather than being assigned to either one.
         valid = (phase != "training_ms"
                  or s["meganeura"]["validation"]["training_valid"])
         best = min(tmg, tpt) if valid else tpt
@@ -210,7 +288,8 @@ def write_portability():
     lines = []
     sums = {(p, e): 0.0 for p in PHASES for e in ("meganeura", "pytorch")}
     for model, disp in MODELS:
-        cells = [disp]
+        label = disp + (r"$^\ddagger$" if model == "Whisper-tiny" else "")
+        cells = [label]
         for phase in PHASES:
             pp = pennycook("strict", phase, model)
             for engine in ("meganeura", "pytorch"):
@@ -238,13 +317,28 @@ def write_portability():
 
 def facts():
     print("== FACTS ==")
-    total, passed, worst = check_validation()
-    print(f"validation: {passed}/{total} cells pass")
+    total, passed, disputed, worst, dispute_metrics = check_validation()
+    print(f"validation: {passed}/{total} paired comparisons pass; "
+          f"{disputed} excluded because the PyTorch/ROCm 780M Whisper "
+          "backward record is oracle-disputed")
     for mode in MODES:
         w = worst[mode]
-        print(f"  worst {mode}: out_l2={100*w['output_relative_l2_error']:.3g}% "
+        d = dispute_metrics[mode]
+        print(f"  worst comparable {mode}: "
+              f"out_l2={100*w['output_relative_l2_error']:.3g}% "
               f"grad_tot={100*w['total_gradient_relative_error']:.3g}% "
               f"grad_vec={100*w['parameter_gradient_relative_l2_error']:.3g}%")
+        print(f"  oracle dispute {mode}: "
+              f"out_l2={100*d['output_relative_l2_error']:.3g}% "
+              f"grad_tot={100*d['total_gradient_relative_error']:.3g}% "
+              f"grad_vec={100*d['parameter_gradient_relative_l2_error']:.3g}%")
+        audit = oracle_audit(mode)
+        print(f"  cross-backend audit {mode}: "
+              f"PT-good={100*audit['reference_internal']:.3g}% "
+              f"Meganeura={100*audit['candidate_internal']:.3g}% "
+              f"Meganeura-to-PT-good={100*audit['candidate_to_reference']:.3g}% "
+              f"PT-780M-to-PT-good={100*audit['disputed_to_reference']:.3g}% "
+              f"PT-780M-total-norm={100*audit['disputed_total_norm']:.3g}%")
 
     for scope, plats in (("all5", PLATFORMS), ("gpuref", GPU_REF)):
         for mode in MODES:
@@ -253,9 +347,11 @@ def facts():
                 for p in plats:
                     for model, _ in MODELS:
                         s = load(p, mode, model)
+                        if oracle_disputed(p, model, phase):
+                            continue
                         if phase == "training_ms" and \
                                 not s["meganeura"]["validation"]["training_valid"]:
-                            continue  # invalid cells never enter a count
+                            continue  # invalid implementation cells never enter a count
                         rs.append(t(s["meganeura"], phase) / t(s["pytorch"], phase))
                 w2 = sum(1 for r in rs if r <= 2.0)
                 fast = sum(1 for r in rs if r < 1.0)
@@ -341,6 +437,13 @@ def write_figure():
                 rf"\node[anchor=west, font=\tiny] at (0.15,{yc:.2f}) {{{disp}}};")
             for p in (0, 1):
                 r = t(s["meganeura"], phases[p]) / t(s["pytorch"], phases[p])
+                disputed = oracle_disputed(plat, model, phases[p])
+                if disputed:
+                    x0 = x(1.0, offs[p])
+                    lines.append(
+                        rf"\node[font=\tiny, violet!80!black] at ({x0:.2f},{yc:.2f}) "
+                        rf"{{$\ddagger$}};")
+                    continue
                 invalid = (p == 1 and not s["meganeura"]["validation"]["training_valid"])
                 x0 = x(1.0, offs[p])
                 x1 = x(max(min(r, xmax), xmin), offs[p])

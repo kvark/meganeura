@@ -19,6 +19,12 @@ Rerun it after refreshing `results/`; every table in `main.tex` updates in
 place. The script also prints the aggregate numbers cited in prose so a text
 sweep can be checked against the artifacts.
 
+The Radeon 780M--Whisper backward pair is retained in the raw results but
+excluded symmetrically from training ratios and aggregation because the
+PyTorch/ROCm record fails the cross-backend oracle-consistency audit. The
+generator prints that audit and marks the affected table entry with
+`\ddagger`; all forward measurements remain included.
+
 `p3hpc/` holds the P3HPC (SC26 workshop) submission: IEEE format
 (vendored `IEEEtran.cls`/`.bst`), single-blind, reuses `../tables/` and
 `../references.bib`. Build the same way from inside that directory.

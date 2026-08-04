@@ -49,7 +49,8 @@ The paper makes four principal contributions:
 - **C3: independent correctness gates.** Supported by the output, loss,
   total-gradient, and per-parameter-gradient evidence in every **A1** record.
 - **C4: validity-disciplined Pennycook aggregation.** Supported by **A1** and
-  the aggregation implementation and expected output in **A2**.
+  the aggregation implementation and expected output in **A2**, including the
+  symmetric oracle-dispute exclusion and its cross-backend audit.
 
 The computational artifacts are:
 
@@ -183,9 +184,12 @@ separate and fast.
   independent process replicates.
 - The Apple and Intel references are eager, and Intel falls back to CPU.
 - No manual CUDA Graph capture was added to PyTorch.
-- Whisper backward on the 780M fails the gate in both arithmetic contracts.
-  The cross-device records implicate the reference path but do not prove
-  which implementation is correct; both cells remain invalid.
+- The PyTorch/ROCm Whisper backward record on the 780M fails the
+  cross-backend oracle-consistency check in both arithmetic contracts. Raw
+  timings and diagnostics are retained, but that paired training comparison
+  is excluded symmetrically from ratios and aggregation; its valid forward
+  timings remain included. The records identify an unusable local oracle but
+  do not establish whether the root cause lies in PyTorch, ROCm, or the driver.
 - The gap profiles predate the matrix freeze by one Meganeura revision. The
   NVIDIA control median matches the frozen result; the Apple profile is
   explicitly a pre-optimization diagnostic.

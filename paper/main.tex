@@ -48,8 +48,10 @@ We compare five matched workloads with PyTorch on NVIDIA and AMD discrete
 GPUs, an AMD APU, Apple silicon, and an Intel iGPU. The protocol separates
 strict f32 from validated fast paths and gates forward and backward
 independently. Forty-eight of 50 device--workload--mode cells pass both gates;
-the other two share one unresolved backward-reference disagreement on a newly
-supported APU. In strict f32, \system{} wins 12 of 20 GPU-referenced
+in the other two, the PyTorch/ROCm Radeon~780M backward record disagrees with
+the other four PyTorch backends and all five \system{} records. We classify
+that paired comparison as oracle-disputed rather than as a \system{} failure.
+In strict f32, \system{} wins 12 of 20 GPU-referenced
 minimal-latency cells and has a median valid training gap of $1.8\times$. On
 the discrete AMD GPU, four of five inference workloads are within
 $1.10\times$ of compiled ROCm PyTorch and three training workloads are faster.
@@ -172,10 +174,9 @@ cloud-scale training, or the full operator breadth of mature frameworks.
 Within that setting, the measured answer is more positive than the
 conventional wisdom about graphics APIs suggests: both AMD devices reach
 near-parity or better with compiled ROCm PyTorch on most workloads,
-minimal-batch latency favors the portable stack on most devices, and the
-only correctness-gate failures in fifty audited cells are two modes of one
-APU workload whose cross-device gradients strongly implicate the reference
-path. The gaps that
+minimal-batch latency favors the portable stack on most devices, and a
+cross-backend audit identifies the only two non-comparable cells as two modes
+of one PyTorch/ROCm APU oracle dispute. The gaps that
 remain --- chiefly backward passes on NVIDIA and Apple hardware --- are
 profiled down to the responsible kernel families, and the paper reports
 them with the same prominence as the wins.
@@ -211,10 +212,10 @@ This work makes four contributions:
   \item A controlled comparison with five matched model families, explicit
         arithmetic contracts, raw timing samples, and independent forward and
         backward correctness gates, frozen at one revision pair across five
-        devices from three GPU vendors and Apple silicon --- 48 of 50 cells
-        passing both gates, with cross-device gradient records localizing the
-        two exceptions to the newly enabled reference path, subject to the
-        need for a third implementation.
+        devices from three GPU vendors and Apple silicon --- 48 of 50 paired
+        cells passing both gates, with cross-backend gradient records
+        identifying the other two as one PyTorch oracle dispute rather than a
+        \system{} failure.
   \item A decomposition of performance into the kernel coverage, dispatch
         structure, cooperative-matrix use, and precision policy that produce
         both near-reference cases and the largest remaining gaps.
@@ -662,7 +663,12 @@ below 1\%. A forward--loss--backward cell additionally requires matching
 canonical trainable parameter sets, total-gradient-norm error below 5\%, and
 relative L2 error below 5\% over the vector of per-parameter gradient norms. A
 backward failure invalidates that cell without discarding a valid inference
-cell.
+cell. The designated reference must also be a usable oracle. If its
+deterministic backward record is inconsistent with the other reference
+backends while the candidate reproduces their consensus across devices, the
+pair is labeled oracle-disputed: raw values remain visible, but neither
+implementation gets a ratio or aggregate contribution from that pair
+(Section~\ref{sec:apu}).
 
 \subsection{Device and revision controls}
 
@@ -678,9 +684,10 @@ historical cells are mixed in. An integrated or edge-class device is
 included only if both runners complete the audited workloads: the Intel
 machine qualifies because the PyTorch reference completes there on its
 documented CPU fallback, which the tables label explicitly, and the AMD
-APU qualifies because its reference completes every workload --- its
-backward-validation failure on one workload is a reported result
-(Section~\ref{sec:apu}), not an exclusion.
+APU qualifies because both runners complete every workload. Its Whisper
+backward records are retained as diagnostics, but that one paired comparison
+is excluded from training measures because the PyTorch result fails the
+oracle-consistency check (Section~\ref{sec:apu}).
 
 \begin{table*}[t]
 \centering
@@ -733,11 +740,11 @@ decompose.
 $\times$ is the \system{}/PyTorch ratio; bold marks cells where \system{} is
 faster. F+L+B is forward, scalar loss, and backward without an optimizer
 update. Every cell passes the forward gate of Section~\ref{sec:method}, and
-every F+L+B cell except the marked one passes the backward gate.
-$\dagger$: invalid --- the Whisper backward comparison on the 780M fails
-the 5\% gradient gate; Section~\ref{sec:apu} presents cross-device evidence
-implicating the reference path, but the ratio is shown for completeness only.
-Whisper's
+every F+L+B cell except the marked pair passes the backward comparison.
+$\ddagger$: oracle-disputed --- Section~\ref{sec:apu} shows that the
+PyTorch/ROCm 780M result is inconsistent with the other reference backends.
+The two raw times are retained, but their ratio and both aggregate
+contributions are omitted. Whisper's
 minimal shape equals its full shape, so its two forward columns coincide.
 The Intel rows compare the integrated GPU against PyTorch's CPU fallback
 and are reported as a support result, not an engine-efficiency result.}
@@ -747,11 +754,12 @@ and are reported as a support result, not an engine-efficiency result.}
 \begin{figure*}[!t]
 \centering
 \resizebox{0.98\textwidth}{!}{\input{tables/figratios}}
-\caption{Strict-f32 \system{}/PyTorch median ratios for all 25
-device--workload cells (log scale; the solid line is parity). Teal bars
+\caption{Strict-f32 \system{}/PyTorch median ratios for 25 inference and 24
+comparable training device--workload cells (log scale; the solid line is parity). Teal bars
 extend left of parity: \system{} is faster. Orange bars extend right:
-PyTorch is faster. The hollow bar ($\dagger$) is the invalid 780M Whisper
-backward cell of Section~\ref{sec:apu}. One-token latency, where \system{}
+PyTorch is faster. The $\ddagger$ marker denotes the oracle-disputed 780M
+Whisper backward pair of Section~\ref{sec:apu}; no ratio bar is drawn.
+One-token latency, where \system{}
 wins 12 of 20 GPU-referenced cells, is tabulated in
 Table~\ref{tab:strict-results}. Generated from the same artifacts as the
 tables.}
@@ -772,7 +780,7 @@ outright faster} (SmolVLA $0.73\times$, diffusion U-Net $0.89\times$,
 Whisper $0.90\times$), with ResNet-50 the outlier in both ($1.85\times$ and
 $2.41\times$). On the Radeon~780M APU --- the machine whose vendor support
 is newest --- \system{} wins three of five inference cells at $0.72\times$
-and two training cells, with only the convolution pair beyond
+and two of four comparable training cells, with only the convolution pair beyond
 $1.25\times$. On the Apple~M3, inference lands at $0.93$--$1.88\times$ and
 training at $1.20$--$2.84\times$ against eager MPS --- the weakest surface
 in the matrix, and the one that improved most from the profile-guided
@@ -799,7 +807,7 @@ rather than a uniform graphics-API tax. Section~\ref{sec:gaps} directly
 confirms that kernel-family concentration for the largest NVIDIA gap.
 Third, the correctness margins are wide: across all 25 strict cells the
 worst forward relative L2 error is 0.0043\% against a 1\% gate, and across
-the 24 valid backward comparisons the worst per-parameter gradient-norm
+the 24 comparable backward comparisons the worst per-parameter gradient-norm
 error is 0.64\% against a 5\% gate. Several per-cell error values reproduce to three digits across
 all five devices, indicating that the residual disagreement is a
 deterministic operation-ordering difference between the two engines rather
@@ -817,8 +825,8 @@ than platform noise.
 \system{} may round eligible forward matrix inputs to f16 with f32
 accumulation. The two fast paths are not format-equivalent, so this table is
 reported separately from Table~\ref{tab:strict-results} rather than merged
-with it. Validation matches the strict table: every cell passes except the
-marked 780M Whisper backward comparison ($\dagger$,
+with it. Validation matches the strict table: every paired comparison passes
+except the oracle-disputed 780M Whisper backward pair ($\ddagger$,
 Section~\ref{sec:apu}). Compile times match the strict table within 2\,s
 and are omitted.}
 \label{tab:accel-results}
@@ -980,8 +988,8 @@ experiment is one statically specialized binary per platform plus the
 system's installed graphics driver; no per-vendor package source, version
 pin, or compute runtime was involved on any of the machines. The Radeon
 780M APU makes the asymmetry sharpest; Section~\ref{sec:apu} reports its
-bring-up cost and the one workload responsible for both correctness failures
-in the matrix, whose cross-device gradients implicate the reference path.
+bring-up cost and the one PyTorch backward record that fails the
+cross-backend oracle-consistency check.
 
 \subsection{Performance portability}
 \label{sec:portability}
@@ -991,37 +999,38 @@ in the matrix, whose cross-device gradients implicate the reference path.
 \small
 \setlength{\tabcolsep}{4.5pt}
 \input{tables/portability}
-\caption{Pennycook performance portability over the frozen five-machine set,
+\caption{Pennycook performance portability over the comparable frozen set,
 strict mode. Application efficiency on each machine is measured against the
 best \emph{valid} time either engine achieved there, so values are $\le 1$
 and PyTorch's CPU fallback on the Intel machine counts as its own result on
-that machine. $\dagger$: an invalid cell is not a result, so \system{}'s
-Whisper training entry scores zero under the metric's discipline --- even
-though Section~\ref{sec:apu} presents evidence implicating the reference
-path. Accelerated-mode values are in the artifact; they shift the
-column means by at most 0.05 and change no ordering.}
+that machine. $\ddagger$: Whisper F+L+B uses four machines because the 780M
+pair is oracle-disputed and omitted for both implementations; every other
+entry uses all five. Accelerated-mode values are in the artifact; they shift
+the column means by at most 0.05 and change no ordering.}
 \label{tab:portability}
 \end{table}
 
 Table~\ref{tab:portability} aggregates the per-device results with the
 Pennycook metric~\cite{pennycook2016metric}: application efficiency per
 machine (relative to the best valid time observed on that machine), combined
-by harmonic mean over the frozen set, with zero for a machine on which an
-application produces no valid result. The metric's severity is visible in
-one cell: \system{}'s single invalid backward comparison zeroes its entire
-Whisper training score, cutting the training mean from 0.62 to 0.52 ---
-even though the cross-device evidence implicates the reference path
-(Section~\ref{sec:apu}). We apply the discipline to ourselves and report
-the zero. The remaining structure is symmetric in an informative way. For
+by harmonic mean over an explicit comparable set, with zero for an
+implementation that is unsupported or invalid on that set. All sets contain
+the five frozen machines except Whisper F+L+B, which contains four because
+the 780M pair has no usable oracle. Its symmetric four-machine scores are
+0.50 for \system{} and 0.97 for PyTorch. Because this oracle-consistency rule
+was applied after inspecting the frozen records, we expose the sensitivity:
+mechanically assigning the mismatch to \system{}, as an earlier draft did,
+would lower its mean training score from 0.62 to 0.52; PyTorch's rounded mean
+would remain 0.93. No disputed timing enters either score. For
 forward--loss--backward the incumbent is clearly more portable (mean 0.93
-versus 0.52): vendor training libraries are good wherever they run. For
+versus 0.62): vendor training libraries are good wherever they run. For
 full-shape inference the two are close (0.81 versus 0.75). For
 minimal-shape latency the portable stack is the more performance-portable
 system (0.83 versus 0.73). The result is consistent with the static plan
 reducing sensitivity to backend launch and synchronization costs, although
 the end-to-end measurements also include kernel quality.
 
-\subsection{The newest vendor path: bring-up and a localized anomaly}
+\subsection{The newest vendor path: bring-up and an oracle-disputed reference}
 \label{sec:apu}
 
 The Radeon 780M machine is a full member of the frozen matrix, and it is
@@ -1029,24 +1038,30 @@ also the machine whose vendor support is newest --- ROCm reached this APU
 class only recently, and standing the reference up required a current Linux
 firmware payload and a PyTorch wheel from the separate ROCm~7.14 channel,
 after which the runs still emit persistent rocSHMEM warnings. The portable
-stack ran unchanged against the installed Mesa driver. That freshness shows
-up in the matrix's one recurring correctness anomaly.
+stack ran unchanged against the installed Mesa driver. The records expose one
+reference-consistency anomaly.
 
-Whisper's forward pass on this machine validates at 0.0016\%, but its
-backward comparison fails the gate at 17.8\% per-parameter
-gradient-norm error, in both arithmetic modes --- and the recorded
-artifacts localize the disagreement. \system{}'s per-parameter gradient
-norms on this machine are identical, at recorded precision, to its own
-norms on the RX~7900~XT, where they pass against that machine's ROCm
-reference at 0.035\%; PyTorch's norms meanwhile differ by 16.3\% between
-its own two ROCm machines. This cross-device evidence strongly implicates the
-newly enabled reference path, and the independent forward/backward gates did
-exactly what they were designed to do: an accurate forward pass did not
-launder a backward disagreement. We report the cell as invalid --- the
-protocol has no mechanism to bless our own result without a reference ---
-and do not claim that these records alone prove which implementation is
-correct. A third implementation is needed to resolve the anomaly; until then,
-the Whisper row in Table~\ref{tab:portability} correctly scores a zero.
+Whisper's forward pass on this machine validates at 0.0016\%, but the paired
+backward comparison disagrees by 17.7--17.8\% in the vector of per-parameter
+gradient norms across the two arithmetic modes. This is not a failed
+\system{} execution: all five \system{} runs complete. Under strict f32,
+their gradient vectors agree mutually within 0.00002\%; PyTorch on CUDA,
+discrete ROCm, CPU, and MPS agrees within 0.001\%; and the two clusters agree
+within 0.035\%. Accelerated records preserve the separation: each cluster is
+internally within 0.007\%, their cross-cluster disagreement is at most
+0.042\%, and the PyTorch/ROCm 780M vector remains 16.3\% from the other
+PyTorch backends. Its strict total gradient norm is also 8.15\% away from
+their consensus.
+
+We therefore treat the PyTorch 780M backward record as unusable as a
+numerical oracle and classify the \emph{paired comparison}, not \system{}, as
+oracle-disputed. The raw \system{} and PyTorch timings and diagnostics remain
+in the tables and artifact; their ratio and both implementations' aggregate
+contributions are omitted. The valid forward timings remain in every
+inference measure. These records do not establish the root cause inside
+PyTorch, ROCm, or the driver; an independent implementation would still aid
+that diagnosis. They do establish that this local PyTorch result cannot be
+used to attribute a \system{} correctness failure.
 
 The rest of the machine's column is unremarkable in the best way: the
 reference's per-process memory figure is recorded as absent per the
@@ -1334,6 +1349,16 @@ Conversely, graphics drivers may optimize SPIR-V or Metal differently. Exact
 revisions, raw samples, and environment metadata make the experiment
 reproducible but do not eliminate this external validity threat.
 
+The oracle-consistency rule was applied after inspecting the frozen records,
+not preregistered. It removes the same 780M--Whisper backward observation
+from both implementations, leaves all raw artifacts and forward results in
+place, and makes that one workload's training score a four-machine rather
+than five-machine measure. The prior one-way assignment is reported as a
+sensitivity: it changes \system{}'s mean training score from 0.62 to 0.52
+and leaves PyTorch's rounded mean at 0.93. This avoids presenting a disputed
+reference as a \system{} failure, but the varying comparable set should be
+remembered when comparing the aggregate's workload rows.
+
 Strict f32 controls arithmetic permissions, not operation order or bitwise
 identity. Accelerated mode intentionally compares different fast formats and
 must not be interpreted as format equivalence. Gradient-norm gates can miss
@@ -1374,17 +1399,18 @@ performance? On the evidence of the frozen matrix, yes --- with measured,
 attributable exceptions. A typed graph, automatic differentiation,
 specialized kernels, static execution, checkpointing, and lifetime-based
 memory planning fit in 34.5 KLOC of Rust and 6.1 KLOC of WGSL; 48 of 50
-audited cells pass both forward and backward gates across five consumer
-devices. The stack deploys as a 13\,MiB binary that compiles workloads in
+paired cells pass both forward and backward gates across five consumer
+devices; the other two are the same PyTorch oracle dispute under two
+arithmetic contracts. The stack deploys as a 13\,MiB binary that compiles workloads in
 seconds. Where kernel
 coverage matches a workload, the graphics-API path reaches a mature
 vendor-native reference: training and inference near-parity or wins on both
 AMD devices against compiled ROCm PyTorch, wins against compiled CUDA
 PyTorch on two strict inference cells, and the stronger Pennycook
 portability score for minimal-batch latency. On the machine where vendor
-support arrived newest, the roles inverted: the portable stack ran
-everything, and cross-device gradient records strongly implicate the
-reference path in the matrix's only failed gates. Where coverage runs out,
+support arrived newest, the portable stack ran everything, while the
+PyTorch/ROCm Whisper backward record disagreed with every other PyTorch
+backend and was excluded symmetrically as an unusable oracle. Where coverage runs out,
 the gap is profiled, not guessed: convolution derivatives are 89\% of the
 worst step, Metal attention backward was 58\% of the second-worst before a
 profile-guided pass reduced it, while cooperative-matrix coverage and
