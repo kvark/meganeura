@@ -392,6 +392,15 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let grad_x = graph.mul(grad_output, node.id);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
+            Op::Softplus { beta } => {
+                let x = node.inputs[0];
+                let x_ty = &forward.nodes()[x as usize].ty;
+                let beta = graph.constant(vec![beta; x_ty.num_elements()], &x_ty.shape);
+                let scaled = graph.mul(x, beta);
+                let slope = graph.sigmoid(scaled);
+                let grad_x = graph.mul(grad_output, slope);
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
             Op::Transpose => {
                 let x = node.inputs[0];
                 let grad_x = graph.transpose(grad_output);

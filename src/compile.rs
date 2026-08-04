@@ -1,5 +1,5 @@
 use crate::graph::{DType, Graph, Node, NodeId, Op};
-use crate::schedule::{PointwiseDAG, ReductionKernel};
+use crate::schedule::{PointwiseDAG, Pw, ReductionKernel};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -2317,6 +2317,36 @@ impl<'a> Compiler<'a> {
             }
             Op::Exp => {
                 self.emit_unary(ShaderEntry::Exp, node, out_buf);
+            }
+            Op::Softplus { beta } => {
+                let input = self.get_buffer(node.inputs[0]);
+                let len = node.ty.num_elements() as u32;
+                let pointwise = PointwiseDAG {
+                    n_inputs: 1,
+                    ops: vec![
+                        Pw::LoadInput(0),
+                        Pw::const_f32(beta),
+                        Pw::Mul(0, 1),
+                        Pw::Relu(2),
+                        Pw::Abs(2),
+                        Pw::Sigmoid(4),
+                        Pw::Log(5),
+                        Pw::Neg(6),
+                        Pw::Add(3, 7),
+                        Pw::const_f32(beta.recip()),
+                        Pw::Mul(8, 9),
+                    ],
+                    output: 10,
+                };
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::Relu,
+                    workgroups: [len.div_ceil(256), 1, 1],
+                    input_buffers: vec![input],
+                    output_buffer: out_buf,
+                    params: vec![len, 0, 0, 0],
+                    pointwise: Some(pointwise),
+                    ..Default::default()
+                });
             }
 
             Op::SumAll => {

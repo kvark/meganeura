@@ -111,6 +111,10 @@ pub enum Op {
     Log,
     Recip,
     Exp,
+    /// Numerically stable `ln(1 + exp(beta * x)) / beta`.
+    Softplus {
+        beta: f32,
+    },
 
     // Reduction
     SumAll,
@@ -1048,6 +1052,15 @@ impl Graph {
     pub fn exp(&mut self, x: NodeId) -> NodeId {
         let ty = self.node(x).ty.clone();
         self.add_node(Op::Exp, vec![x], ty)
+    }
+
+    pub fn softplus(&mut self, x: NodeId, beta: f32) -> NodeId {
+        assert!(
+            beta.is_finite() && beta > 0.0,
+            "softplus beta must be finite and positive"
+        );
+        let ty = self.node(x).ty.clone();
+        self.add_node(Op::Softplus { beta }, vec![x], ty)
     }
 
     /// Reshape: reinterpret the tensor with a new shape (same element count).
