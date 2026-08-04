@@ -432,6 +432,8 @@ pub enum ShaderGroup {
     MaxPool2d,
     GlobalAvgPool,
     GlobalAvgPoolGrad,
+    PairwiseSquaredDistance,
+    PairwiseSquaredDistanceGrad,
     GradClipZero,
     GradClipNormSq,
     GradClipScale,
@@ -569,6 +571,12 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::GlobalAvgPool => parse_wgsl(include_str!("shaders/global_avg_pool.wgsl")),
         ShaderGroup::GlobalAvgPoolGrad => {
             parse_wgsl(include_str!("shaders/global_avg_pool_grad.wgsl"))
+        }
+        ShaderGroup::PairwiseSquaredDistance => {
+            parse_wgsl(include_str!("shaders/pairwise_squared_distance.wgsl"))
+        }
+        ShaderGroup::PairwiseSquaredDistanceGrad => {
+            parse_wgsl(include_str!("shaders/pairwise_squared_distance_grad.wgsl"))
         }
         ShaderGroup::GradClipZero => parse_wgsl(include_str!("shaders/grad_clip_zero.wgsl")),
         ShaderGroup::GradClipNormSq => parse_wgsl(include_str!("shaders/grad_clip_norm_sq.wgsl")),
@@ -5029,6 +5037,14 @@ mod tests {
                 naga::valid::Capabilities::empty(),
             ),
             (
+                ShaderGroup::PairwiseSquaredDistance,
+                naga::valid::Capabilities::empty(),
+            ),
+            (
+                ShaderGroup::PairwiseSquaredDistanceGrad,
+                naga::valid::Capabilities::empty(),
+            ),
+            (
                 ShaderGroup::GradClipZero,
                 naga::valid::Capabilities::empty(),
             ),
@@ -5251,6 +5267,8 @@ mod tests {
             (ShaderGroup::ScatterAddAtomic, empty),
             (ShaderGroup::BceLoss, empty),
             (ShaderGroup::GlobalAvgPoolGrad, empty),
+            (ShaderGroup::PairwiseSquaredDistance, empty),
+            (ShaderGroup::PairwiseSquaredDistanceGrad, empty),
             (ShaderGroup::GradClipZero, empty),
             (ShaderGroup::GradClipNormSq, empty),
             (ShaderGroup::GradClipScale, empty),
@@ -5465,6 +5483,13 @@ mod tests {
                 | ShaderEntry::BroadcastInner
                 | ShaderEntry::TileInner
                 | ShaderEntry::TileInnerGrad => vec!["src", "dst", "params"],
+                ShaderEntry::PairwiseSquaredDistance => {
+                    vec!["src_a", "src_b", "dst", "params"]
+                }
+                ShaderEntry::PairwiseSquaredDistanceGradLeft
+                | ShaderEntry::PairwiseSquaredDistanceGradRight => {
+                    vec!["src_a", "src_b", "src_c", "dst", "params"]
+                }
                 ShaderEntry::WinogradInputTransform | ShaderEntry::WinogradOutputTransform => {
                     vec!["src", "dst", "params"]
                 }
@@ -5575,6 +5600,9 @@ mod tests {
             ShaderEntry::BroadcastInner,
             ShaderEntry::TileInner,
             ShaderEntry::TileInnerGrad,
+            ShaderEntry::PairwiseSquaredDistance,
+            ShaderEntry::PairwiseSquaredDistanceGradLeft,
+            ShaderEntry::PairwiseSquaredDistanceGradRight,
         ];
 
         for entry in &entries {

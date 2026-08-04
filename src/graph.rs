@@ -137,6 +137,21 @@ pub enum Op {
         inner: u32,
         repeats: u32,
     },
+    /// Squared distance from each `[M, D]` row to `pairs` consecutive
+    /// `[M * pairs, D]` rows, producing `[M, pairs]`.
+    PairwiseSquaredDistance {
+        pairs: u32,
+    },
+    /// Backward helper for the left input of [`Op::PairwiseSquaredDistance`].
+    PairwiseSquaredDistanceGradLeft {
+        inner: u32,
+        pairs: u32,
+    },
+    /// Backward helper for the right input of [`Op::PairwiseSquaredDistance`].
+    PairwiseSquaredDistanceGradRight {
+        inner: u32,
+        pairs: u32,
+    },
     /// Exclusive cumulative sum over the inner axis of a 2D tensor.
     ///
     /// Forward order emits `y[m, n] = sum(x[m, 0..n])`; reverse order emits
@@ -1217,6 +1232,45 @@ impl Graph {
         let repeats = u32::try_from(repeats).expect("tile_inner repeat count exceeds u32");
         let ty = TensorType::f32(vec![shape[0], output_inner]);
         self.add_raw_node(Op::TileInner { repeats }, vec![x], ty)
+    }
+
+    /// Compute squared distances from every `[M, D]` row in `left` to its
+    /// `pairs` consecutive rows in `right: [M * pairs, D]`.
+    pub fn pairwise_squared_distance(
+        &mut self,
+        left: NodeId,
+        right: NodeId,
+        pairs: usize,
+    ) -> NodeId {
+        let left_shape = self.node(left).ty.shape.clone();
+        let right_shape = self.node(right).ty.shape.clone();
+        assert_eq!(
+            left_shape.len(),
+            2,
+            "pairwise_squared_distance expects a 2D left input, got {left_shape:?}"
+        );
+        assert_eq!(
+            right_shape.len(),
+            2,
+            "pairwise_squared_distance expects a 2D right input, got {right_shape:?}"
+        );
+        assert!(
+            left_shape[1] > 0,
+            "pairwise distance rows must be non-empty"
+        );
+        assert!(pairs > 0, "pairwise distance needs at least one pair");
+        let right_rows = left_shape[0]
+            .checked_mul(pairs)
+            .expect("pairwise distance row count overflows usize");
+        assert_eq!(
+            right_shape,
+            [right_rows, left_shape[1]],
+            "pairwise distance right shape must be [M * pairs, D]"
+        );
+        u32::try_from(left_shape[1]).expect("pairwise distance width exceeds u32");
+        let pairs = u32::try_from(pairs).expect("pairwise distance pair count exceeds u32");
+        let ty = TensorType::f32(vec![left_shape[0], pairs as usize]);
+        self.add_raw_node(Op::PairwiseSquaredDistance { pairs }, vec![left, right], ty)
     }
 
     /// Exclusive cumulative sum over the inner axis of a 2D tensor.
