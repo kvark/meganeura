@@ -197,6 +197,88 @@ fn sum_inner_gradient_repeats_each_row_bit_exactly() {
 }
 
 #[test]
+fn unit_column_matmul_matches_generic_forward_and_gradient_bits() {
+    const ROWS: usize = 513;
+    const COLS: usize = 3;
+    let input_data = (0..ROWS * COLS)
+        .map(|index| ((index * 37 % 211) as f32 - 105.0) * 0.0073)
+        .collect::<Vec<_>>();
+    let row_weights = (0..ROWS)
+        .map(|row| ((row * 31 % 127) as f32 - 63.0) * 0.017)
+        .collect::<Vec<_>>();
+
+    let mut graph = Graph::new();
+    let input = graph.parameter("input", &[ROWS, COLS]);
+    let ones = graph.constant(vec![1.0; COLS], &[COLS, 1]);
+    let reduced = graph.matmul(input, ones);
+    let weights = graph.input("weights", &[ROWS, 1]);
+    let weighted = graph.mul(reduced, weights);
+    let loss = graph.sum_all(weighted);
+    graph.set_outputs(vec![loss, reduced]);
+
+    let mut session = meganeura::build_session(&graph);
+    session.set_parameter("input", &input_data);
+    session.set_input("weights", &row_weights);
+    session.step();
+    session.wait();
+
+    let mut reduced_output = vec![0.0; ROWS];
+    session.read_output_by_index(1, &mut reduced_output);
+    let mut gradient = vec![0.0; ROWS * COLS];
+    session.read_param_grad("input", &mut gradient);
+
+    // Supplying the same unit column at runtime prevents the compiler from
+    // taking the constant specialization and provides the generic MatMul /
+    // MatMulBT reference path.
+    let mut reference_graph = Graph::new();
+    let reference_input = reference_graph.parameter("input", &[ROWS, COLS]);
+    let reference_ones = reference_graph.input("ones", &[COLS, 1]);
+    let reference_reduced = reference_graph.matmul(reference_input, reference_ones);
+    let reference_weights = reference_graph.input("weights", &[ROWS, 1]);
+    let reference_weighted = reference_graph.mul(reference_reduced, reference_weights);
+    let reference_loss = reference_graph.sum_all(reference_weighted);
+    reference_graph.set_outputs(vec![reference_loss, reference_reduced]);
+
+    let mut reference_session = meganeura::build_session(&reference_graph);
+    reference_session.set_parameter("input", &input_data);
+    reference_session.set_input("ones", &[1.0; COLS]);
+    reference_session.set_input("weights", &row_weights);
+    reference_session.step();
+    reference_session.wait();
+
+    let mut reference_output = vec![0.0; ROWS];
+    reference_session.read_output_by_index(1, &mut reference_output);
+    let mut reference_gradient = vec![0.0; ROWS * COLS];
+    reference_session.read_param_grad("input", &mut reference_gradient);
+    for row in 0..ROWS {
+        let mut expected = 0.0_f32;
+        for col in 0..COLS {
+            expected += input_data[row * COLS + col];
+            assert_eq!(
+                gradient[row * COLS + col].to_bits(),
+                row_weights[row].to_bits(),
+                "gradient mismatch at [{row}, {col}]"
+            );
+            assert_eq!(
+                gradient[row * COLS + col].to_bits(),
+                reference_gradient[row * COLS + col].to_bits(),
+                "specialized/generic gradient mismatch at [{row}, {col}]"
+            );
+        }
+        assert_eq!(
+            reduced_output[row].to_bits(),
+            expected.to_bits(),
+            "reduction mismatch at row {row}"
+        );
+        assert_eq!(
+            reduced_output[row].to_bits(),
+            reference_output[row].to_bits(),
+            "specialized/generic forward mismatch at row {row}"
+        );
+    }
+}
+
+#[test]
 fn broadcast_inner_forward_and_gradient_match_explicit_repetition() {
     const ROWS: usize = 513;
     const COLS: usize = 8;
