@@ -127,3 +127,12 @@ path = "bench/grad_check.rs"
 [[example]]
 name = "optimizer_ablation"
 path = "bench/optimizer_ablation.rs"
+
+[[example]]
+name = "decode_baseline"
+path = "bench/decode_baseline.rs"
+
+[[example]]
+name = "decode_op_diff"
+path = "bench/decode_op_diff.rs"
+

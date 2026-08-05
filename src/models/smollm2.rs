@@ -370,14 +370,18 @@ pub fn build_decode_graph(
         v_cache_params.push(v_cache);
 
         // Write new K/V into cache at kv_pos
-        let _k_updated = g.cache_write(k, k_cache, kv_pos);
-        let _v_updated = g.cache_write(v, v_cache, kv_pos);
+        let k_updated = g.cache_write(k, k_cache, kv_pos);
+        let v_updated = g.cache_write(v, v_cache, kv_pos);
 
-        // Cached attention: Q attends to full cache
+        // Cached attention: Q attends to the full cache. It must consume the
+        // *written* caches, not the raw parameters: with no data dependency
+        // the scheduler is free to order the K write after the attention
+        // that reads it, which leaves the current token's K missing from
+        // the cache and makes the result racy.
         let attn = g.cached_attention(
             q,
-            k_cache,
-            v_cache,
+            k_updated,
+            v_updated,
             kv_pos,
             config.num_attention_heads,
             config.num_key_value_heads,
