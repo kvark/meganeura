@@ -589,6 +589,20 @@ pub enum EpilogueOp {
     Neg,
 }
 
+/// A RmsNorm folded into a GEMV's A operand.
+///
+/// A modifier on `ShaderEntry::MatMulGemv` rather than a shader entry of
+/// its own, in the same way `weight_format` is: variants of a kernel are
+/// resolved when the pipeline is picked, so fusions compose with the other
+/// axes instead of multiplying the entry enum.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct GemvRmsNorm {
+    /// The norm's weight vector, applied per element alongside the scale.
+    pub weight: BufferRef,
+    /// `f32::to_bits` of the norm's epsilon.
+    pub eps_bits: u32,
+}
+
 /// How an epilogue buffer is indexed in the matmul store loop.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EpilogueLoadKind {
@@ -661,6 +675,9 @@ pub struct Dispatch {
     /// one dispatch + barrier per fused op.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matmul_epilogue: Option<MatMulEpilogue>,
+    /// RmsNorm folded into this GEMV's A operand. See [`GemvRmsNorm`].
+    #[serde(default)]
+    pub gemv_rmsnorm: Option<GemvRmsNorm>,
     /// Multiplicative prologue applied during matmul A-tile staging.
     /// When present, the coop matmul fills `$A_TRANSFORM` and
     /// `$PROLOGUE_DECL` template variables from the prologue's factors.
@@ -1299,6 +1316,88 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
 /// prologue is only two scalar multiplies per A element — essentially free.
 /// Dispatches must already have their runtime `use_coop` decision; scalar
 /// matmuls are deliberately left unchanged.
+/// Fold a RmsNorm into every GEMV that consumes it, removing both the
+/// norm's dispatch and the boundary that separated it.
+///
+/// The norm's own work is trivial — one workgroup over `hidden` elements —
+/// while each consuming GEMV already streams a `K`-element input vector, so
+/// reading the un-normalized one and scaling on the way past costs no extra
+/// traffic; only the per-workgroup sum of squares is duplicated. Requires
+/// every consumer to be a GEMV and nothing else to read the normalized
+/// values.
+pub fn fuse_rmsnorm_into_gemv(plan: &mut ExecutionPlan) {
+    use std::collections::HashMap;
+
+    let mut readers: HashMap<BufferRef, Vec<usize>> = HashMap::new();
+    for (i, d) in plan.dispatches.iter().enumerate() {
+        for buf in &d.input_buffers {
+            readers.entry(*buf).or_default().push(i);
+        }
+    }
+    let mut external: std::collections::HashSet<BufferRef> = Default::default();
+    external.extend(plan.output_buffers.iter().copied());
+    if let Some(b) = plan.loss_buffer {
+        external.insert(b);
+    }
+    for entry in &plan.param_buffers {
+        external.insert(entry.1);
+    }
+    for entry in &plan.input_buffers {
+        external.insert(entry.1);
+    }
+
+    let mut drop_norm: Vec<usize> = Vec::new();
+    let mut rewrite: Vec<(usize, BufferRef, BufferRef, u32)> = Vec::new();
+    for (ni, norm) in plan.dispatches.iter().enumerate() {
+        if norm.shader != ShaderEntry::RmsNorm || norm.input_buffers.len() < 2 {
+            continue;
+        }
+        let normed = norm.output_buffer;
+        if external.contains(&normed) {
+            continue;
+        }
+        // Only fuse a single-row norm; the fused kernel assumes M = 1.
+        if norm.params.first().copied().unwrap_or(0) != 1 {
+            continue;
+        }
+        let Some(consumers) = readers.get(&normed) else {
+            continue;
+        };
+        if consumers.is_empty()
+            || consumers.iter().any(|&c| {
+                let d = &plan.dispatches[c];
+                d.shader != ShaderEntry::MatMulGemv || d.input_buffers.first() != Some(&normed)
+            })
+        {
+            continue;
+        }
+        let (src, weight, eps_bits) = (
+            norm.input_buffers[0],
+            norm.input_buffers[1],
+            norm.params.get(2).copied().unwrap_or(0),
+        );
+        for &c in consumers {
+            rewrite.push((c, src, weight, eps_bits));
+        }
+        drop_norm.push(ni);
+    }
+    if drop_norm.is_empty() {
+        return;
+    }
+
+    for (idx, src, weight, eps_bits) in rewrite {
+        let d = &mut plan.dispatches[idx];
+        d.input_buffers[0] = src;
+        d.gemv_rmsnorm = Some(GemvRmsNorm { weight, eps_bits });
+    }
+    let dropped = drop_norm.len();
+    drop_norm.sort_unstable();
+    for ni in drop_norm.into_iter().rev() {
+        plan.dispatches.remove(ni);
+    }
+    log::info!("fuse_rmsnorm_into_gemv: folded {dropped} RmsNorm dispatches into their GEMVs");
+}
+
 pub fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
     use std::collections::HashMap;
 

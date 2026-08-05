@@ -1294,29 +1294,104 @@ pub fn generate_module_weighted(group: ShaderGroup, format: WeightFormat) -> Sha
     }
 }
 
-fn gen_matmul_gemv_f16() -> ShaderModule {
+/// The K-split GEMV with the RmsNorm of its input folded in:
+///   C[1, N] = (rmsnorm(A) * norm_w) x B[K, N]
+///
+/// Derived from `matmul_gemv.wgsl` by substitution rather than kept as a
+/// second copy, so improvements to the canonical GEMV — tile shape, thread
+/// count, reduction — reach this variant automatically.
+///
+/// The prologue is a workgroup-wide sum of squares over A, which every
+/// consuming workgroup recomputes. That is cheap: A is a few kilobytes
+/// read by all of them at once, so it is an L2 broadcast, and it buys the
+/// removal of the separate RmsNorm dispatch and the boundary after it.
+pub fn generate_module_gemv_rmsnorm() -> ShaderModule {
+    // `_pad` carries eps; the fused kernel needs no other new parameter.
     let src = include_str!("shaders/matmul_gemv.wgsl")
+        .replace("    _pad: u32,", "    eps_bits: u32,")
         .replace(
             "var<storage> matrix_b: array<vec4<f32>>;",
-            "enable f16;\nvar<storage> matrix_b: array<vec4<f16>>;",
+            "var<storage> norm_w: array<f32>;\nvar<storage> matrix_b: array<vec4<f32>>;",
         )
         .replace(
-            "let b = matrix_b[kk * n_v4 + col4];",
-            "let b = vec4<f32>(matrix_b[kk * n_v4 + col4]);",
+            "var<workgroup> reduce_buf: array<vec4<f32>, 256>;",
+            "var<workgroup> reduce_buf: array<vec4<f32>, 256>;\n\
+             var<workgroup> scale_buf: array<f32, 256>;\n\
+             var<workgroup> inv_rms: f32;",
+        )
+        // The early-out must not precede the prologue's barriers, which every
+        // lane has to reach. The dispatch is exactly N/4 workgroups, so it
+        // never fires in practice, but keep it uniform regardless.
+        .replace(
+            "    if col4 >= n_v4 { return; }\n    let k = params.k;\n",
+            "    let k = params.k;\n",
+        )
+        .replace(
+            "    // Each thread accumulates a partial sum over its K-stride slice.",
+            "    // Prologue: sum of squares over A, reduced across the workgroup.\n\
+    var ss = 0.0;\n\
+    var si = lane;\n\
+    loop {\n\
+        if si >= k { break; }\n\
+        let v = matrix_a[si];\n\
+        ss += v * v;\n\
+        si += 256u;\n\
+    }\n\
+    scale_buf[lane] = ss;\n\
+    workgroupBarrier();\n\
+    var sstride = 128u;\n\
+    loop {\n\
+        if sstride == 0u { break; }\n\
+        if lane < sstride { scale_buf[lane] += scale_buf[lane + sstride]; }\n\
+        workgroupBarrier();\n\
+        sstride >>= 1u;\n\
+    }\n\
+    if lane == 0u {\n\
+        inv_rms = inverseSqrt(scale_buf[0] / f32(k) + bitcast<f32>(params.eps_bits));\n\
+    }\n\
+    workgroupBarrier();\n\
+    let rs = inv_rms;\n\
+    if col4 >= n_v4 { return; }\n\
+\n\
+    // Each thread accumulates a partial sum over its K-stride slice.",
+        )
+        .replace(
+            "        let a = matrix_a[kk];",
+            "        let a = matrix_a[kk] * rs * norm_w[kk];",
         );
     parse_wgsl(&src)
 }
 
+fn gen_matmul_gemv_f16() -> ShaderModule {
+    // `enable` directives must precede every declaration, so prepend rather
+    // than splice at the matrix_b declaration - spliced there it landed
+    // after matrix_a and the shader could never compile.
+    let src = "enable f16;\n".to_string()
+        + &include_str!("shaders/matmul_gemv.wgsl")
+            .replace(
+                "var<storage> matrix_b: array<vec4<f32>>;",
+                "var<storage> matrix_b: array<vec4<f16>>;",
+            )
+            .replace(
+                "let b = matrix_b[kk * n_v4 + col4];",
+                "let b = vec4<f32>(matrix_b[kk * n_v4 + col4]);",
+            );
+    parse_wgsl(&src)
+}
+
 fn gen_matmul_gemv_bt_f16() -> ShaderModule {
-    let src = include_str!("shaders/matmul_gemv_bt.wgsl")
-        .replace(
-            "var<storage> matrix_b: array<vec4<f32>>;",
-            "enable f16;\nvar<storage> matrix_b: array<vec4<f16>>;",
-        )
-        .replace(
-            "let b = matrix_b[(col * k_v4) + kk4];",
-            "let b = vec4<f32>(matrix_b[(col * k_v4) + kk4]);",
-        );
+    let src = "enable f16;\n".to_string()
+        + &include_str!("shaders/matmul_gemv_bt.wgsl")
+            .replace(
+                "var<storage> matrix_b: array<vec4<f32>>;",
+                "var<storage> matrix_b: array<vec4<f16>>;",
+            )
+            // The shader reads `matrix_b[row_off + kk_v4]`; convert at the load
+            // so the f32 accumulation below is unchanged.
+            .replace(
+                "let b = matrix_b[row_off + kk_v4];",
+                "let b = vec4<f32>(matrix_b[row_off + kk_v4]);",
+            );
     parse_wgsl(&src)
 }
 

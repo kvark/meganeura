@@ -29,9 +29,9 @@ var<storage> matrix_a: array<f32>;
 var<storage> matrix_b: array<vec4<f32>>;
 var<storage, read_write> matrix_c: array<vec4<f32>>;
 var<uniform> params: Params;
-var<workgroup> reduce_buf: array<vec4<f32>, 32>;
+var<workgroup> reduce_buf: array<vec4<f32>, 256>;
 
-@compute @workgroup_size(32)
+@compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let col4 = wgid.x;
     let lane = lid.x;
@@ -47,13 +47,19 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         let a = matrix_a[kk];
         let b = matrix_b[kk * n_v4 + col4];
         acc = acc + vec4<f32>(a) * b;
-        kk += 32u;
+        kk += 256u;
     }
 
     // Warp-wide reduction via shared memory. WG=32 means one warp; on
     // NVIDIA the workgroupBarrier calls compile to near-free subgroup
     // sync instructions.
     reduce_buf[lane] = acc;
+    workgroupBarrier();
+    if lane < 128u { reduce_buf[lane] += reduce_buf[lane + 128u]; }
+    workgroupBarrier();
+    if lane < 64u { reduce_buf[lane] += reduce_buf[lane + 64u]; }
+    workgroupBarrier();
+    if lane < 32u { reduce_buf[lane] += reduce_buf[lane + 32u]; }
     workgroupBarrier();
     if lane < 16u { reduce_buf[lane] += reduce_buf[lane + 16u]; }
     workgroupBarrier();

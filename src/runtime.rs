@@ -751,6 +751,8 @@ struct Pipelines {
     coop_map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
     /// Small-tile (32×32) pipelines for dispatches with `use_small_tiles = true`.
     small_map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
+    /// GEMVs with a RmsNorm folded into their A operand.
+    rmsnorm_map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
     /// Pipelines for non-f32 weight formats (f16, Q4, Q8).
     weight_map:
         HashMap<(ShaderEntry, crate::compile::WeightFormat), blade_graphics::ComputePipeline>,
@@ -1096,6 +1098,27 @@ impl Pipelines {
             }
         }
 
+        // Compile the RmsNorm-fused GEMV when any dispatch asks for it. The
+        // module is derived from the plain GEMV, so it needs no ShaderGroup
+        // of its own; it is a variant of `MatMulGemv`, resolved by
+        // `get_pipeline` the same way a weight format is.
+        let mut rmsnorm_map: HashMap<ShaderEntry, blade_graphics::ComputePipeline> = HashMap::new();
+        if plan.dispatches.iter().any(|d| d.gemv_rmsnorm.is_some()) {
+            let sm = crate::codegen::generate_module_gemv_rmsnorm();
+            let shader = gpu.create_shader(bg::ShaderDesc {
+                source: &sm.source,
+                naga_module: Some(sm.module),
+            });
+            let entry = ShaderEntry::MatMulGemv;
+            let layout = <MatMulRmsNormData as blade_graphics::ShaderData>::layout();
+            let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
+                name: "matmul_gemv_rmsnorm",
+                data_layouts: &[&layout],
+                compute: shader.at(entry.entry_point()),
+            });
+            rmsnorm_map.insert(entry, pipeline);
+        }
+
         // Compile weight-format-specific pipelines (f16, Q4, Q8).
         let mut weight_map: HashMap<
             (ShaderEntry, crate::compile::WeightFormat),
@@ -1300,6 +1323,7 @@ impl Pipelines {
             map,
             coop_map,
             small_map,
+            rmsnorm_map,
             weight_map,
             attention_map,
             epilogue_map,
@@ -1334,6 +1358,11 @@ impl Pipelines {
             } else {
                 &self.epilogue_map[&key]
             };
+        }
+        if dispatch.gemv_rmsnorm.is_some() {
+            if let Some(p) = self.rmsnorm_map.get(&dispatch.shader) {
+                return p;
+            }
         }
         if dispatch.weight_format.uses_reduced_storage() {
             let key = (dispatch.shader.clone(), dispatch.weight_format);
@@ -1378,6 +1407,9 @@ impl Pipelines {
         }
         if let Some(epilogue) = epilogue_pipeline_key(dispatch) {
             return epilogue_profile_key(&dispatch.shader, &epilogue, dispatch.use_coop);
+        }
+        if dispatch.gemv_rmsnorm.is_some() && self.rmsnorm_map.contains_key(&dispatch.shader) {
+            return format!("{:?}:rmsnorm", dispatch.shader);
         }
         if dispatch.weight_format.uses_reduced_storage() {
             let key = (dispatch.shader.clone(), dispatch.weight_format);
@@ -1548,6 +1580,25 @@ fn reduction_is_dynamic(k: &crate::schedule::ReductionKernel) -> bool {
 
 /// Dynamically-built reduction bind data: storage buffers (per the
 /// `reduction_input_binding_names` order, plus `dst`) followed by the
+/// Bindings for a GEMV with its input RmsNorm folded in.
+#[derive(blade_macros::ShaderData)]
+struct MatMulRmsNormData {
+    matrix_a: blade_graphics::BufferPiece,
+    norm_w: blade_graphics::BufferPiece,
+    matrix_b: blade_graphics::BufferPiece,
+    matrix_c: blade_graphics::BufferPiece,
+    params: MatMulRmsNormParams,
+}
+
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+struct MatMulRmsNormParams {
+    m: u32,
+    n: u32,
+    k: u32,
+    eps_bits: u32,
+}
+
 /// `params` uniform. Used for gather reductions and any arity outside the
 /// three fixed layout structs — avoids a per-combination `ShaderData`
 /// struct. `bind<D>` ignores `D::layout()` (uses the pipeline's layout),
@@ -1996,6 +2047,7 @@ pub(crate) fn select_variants(
     // output materialized is the point of debug mode.
     if fuse_prologues {
         crate::compile::fuse_rmsnorm_prologues(plan);
+        crate::compile::fuse_rmsnorm_into_gemv(plan);
     }
 
     // Small-tile selection: use 32×32 tiles when the 64×64 dispatch
@@ -4743,6 +4795,26 @@ impl Session {
         pc: &mut impl blade_graphics::traits::PipelineEncoder,
     ) {
         let buf = |r: BufferRef| buffers[r.0 as usize].at(0);
+        // A GEMV with its RmsNorm folded in takes the norm's weight vector
+        // as an extra binding and carries eps in the params' spare slot.
+        if let Some(ref rn) = dispatch.gemv_rmsnorm {
+            pc.bind(
+                0,
+                &MatMulRmsNormData {
+                    matrix_a: buf(dispatch.input_buffers[0]),
+                    norm_w: buf(rn.weight),
+                    matrix_b: buf(dispatch.input_buffers[1]),
+                    matrix_c: buf(dispatch.output_buffer),
+                    params: MatMulRmsNormParams {
+                        m: dispatch.params[0],
+                        n: dispatch.params[2],
+                        k: dispatch.params[1],
+                        eps_bits: rn.eps_bits,
+                    },
+                },
+            );
+            return;
+        }
         // Schedule-template reduction dispatches have priority and route
         // by kernel arity (n_per_elem, n_per_row, n_per_col).
         if let Some(ref k) = dispatch.reduction {
