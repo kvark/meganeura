@@ -2305,6 +2305,68 @@ impl<'a> Compiler<'a> {
         self.node_buffers[&node]
     }
 
+    fn is_f32_unit_constant(&self, node: NodeId) -> bool {
+        let node = self.graph.node(node);
+        node.ty.dtype == DType::F32
+            && matches!(
+                node.op,
+                Op::Constant { ref data }
+                    if !data.is_empty()
+                        && data.iter().all(|value| value.to_bits() == 1.0_f32.to_bits())
+            )
+    }
+
+    fn emit_sum_inner(&mut self, input: BufferRef, output: BufferRef, rows: u32, inner: u32) {
+        use crate::schedule::ReduceOp;
+
+        const WORKGROUP_SIZE: u32 = 256;
+        let rows_per_workgroup = if inner <= 32 { WORKGROUP_SIZE } else { 1 };
+        let kernel = ReductionKernel {
+            op: ReduceOp::Sum,
+            prologue: PointwiseDAG {
+                n_inputs: 1,
+                ops: vec![Pw::LoadInput(0)],
+                output: 0,
+            },
+            extra_prologues: vec![],
+            epilogue: None,
+            n_per_elem: 1,
+            n_per_row: 0,
+            workgroup_size: WORKGROUP_SIZE,
+            rows_per_workgroup,
+            gather_elem: Vec::new(),
+        };
+        self.plan.dispatches.push(Dispatch {
+            shader: ShaderEntry::Relu, // sentinel; routing is via `reduction`
+            workgroups: [rows.div_ceil(rows_per_workgroup), 1, 1],
+            input_buffers: vec![input],
+            output_buffer: output,
+            extra_outputs: vec![],
+            params: vec![rows, inner, 1.0_f32.to_bits(), 0],
+            use_coop: false,
+            use_small_tiles: false,
+            reduction: Some(kernel),
+            ..Default::default()
+        });
+    }
+
+    fn emit_broadcast_inner(&mut self, input: BufferRef, output: BufferRef, rows: u32, inner: u32) {
+        let total = rows
+            .checked_mul(inner)
+            .expect("inner broadcast element count exceeds u32");
+        self.plan.dispatches.push(Dispatch {
+            shader: ShaderEntry::BroadcastInner,
+            workgroups: [total.div_ceil(256), 1, 1],
+            input_buffers: vec![input],
+            output_buffer: output,
+            extra_outputs: vec![],
+            params: vec![total, inner, 0, 0],
+            use_coop: false,
+            use_small_tiles: false,
+            ..Default::default()
+        });
+    }
+
     fn compile(&mut self) {
         // First pass: allocate buffers for all nodes
         for node in self.graph.nodes() {
@@ -2530,7 +2592,13 @@ impl<'a> Compiler<'a> {
                 let m = a_shape[0] as u32;
                 let k = a_shape[1] as u32;
                 let n = b_shape[1] as u32;
-                if m == 1 && n.is_multiple_of(4) {
+                if n == 1 && k <= 32 && self.is_f32_unit_constant(node.inputs[1]) {
+                    // A narrow multiplication by an all-ones column is a
+                    // scalar-order row sum. Keep MatMul in the graph so its
+                    // autodiff topology and accumulation order are unchanged;
+                    // specialize only the physical forward dispatch.
+                    self.emit_sum_inner(a, out_buf, m, k);
+                } else if m == 1 && n.is_multiple_of(4) {
                     // K-split GEMV: one WG per 4 output columns (vec4),
                     // 32 threads cooperatively K-split with a shared-
                     // memory tree reduction. Many more WGs than N/128,
@@ -2597,7 +2665,12 @@ impl<'a> Compiler<'a> {
                 let m = a_shape[0] as u32; // A is [M, K]
                 let k = a_shape[1] as u32;
                 let n = b_shape[0] as u32; // B is [N, K]
-                if m == 1 && k.is_multiple_of(4) {
+                if k == 1 && self.is_f32_unit_constant(node.inputs[1]) {
+                    // MatMul's input gradient against a unit column is an
+                    // exact row broadcast. Preserve the MatMulBT graph node
+                    // and its dependency order while avoiding tiled GEMM.
+                    self.emit_broadcast_inner(a, out_buf, m, n);
+                } else if m == 1 && k.is_multiple_of(4) {
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::MatMulGemvBT,
                         workgroups: [n, 1, 1],
@@ -2949,56 +3022,17 @@ impl<'a> Compiler<'a> {
                 // A one-lane packed path retains scalar column-order
                 // summation while still allowing pointwise and gather
                 // producers to fold into the reduction prologue.
-                use crate::schedule::{PointwiseDAG, Pw, ReduceOp, ReductionKernel};
-                const WG: u32 = 256;
                 let input = self.get_buffer(node.inputs[0]);
                 let in_shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let m = in_shape[0] as u32;
                 let n = in_shape[1] as u32;
-                let rows_per_workgroup = if n <= 32 { WG } else { 1 };
-                let kernel = ReductionKernel {
-                    op: ReduceOp::Sum,
-                    prologue: PointwiseDAG {
-                        n_inputs: 1,
-                        ops: vec![Pw::LoadInput(0)],
-                        output: 0,
-                    },
-                    extra_prologues: vec![],
-                    epilogue: None,
-                    n_per_elem: 1,
-                    n_per_row: 0,
-                    workgroup_size: WG,
-                    rows_per_workgroup,
-                    gather_elem: Vec::new(),
-                };
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Relu, // sentinel; routing is via `reduction`
-                    workgroups: [m.div_ceil(rows_per_workgroup), 1, 1],
-                    input_buffers: vec![input],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![m, n, 1.0_f32.to_bits(), 0],
-                    use_coop: false,
-                    use_small_tiles: false,
-                    reduction: Some(kernel),
-                    ..Default::default()
-                });
+                self.emit_sum_inner(input, out_buf, m, n);
             }
 
             Op::BroadcastInner { inner } => {
                 let input = self.get_buffer(node.inputs[0]);
-                let total = node.ty.num_elements() as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::BroadcastInner,
-                    workgroups: [total.div_ceil(256), 1, 1],
-                    input_buffers: vec![input],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![total, inner, 0, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
-                    ..Default::default()
-                });
+                let rows = node.ty.shape[0] as u32;
+                self.emit_broadcast_inner(input, out_buf, rows, inner);
             }
 
             Op::NormalizeInnerSum { inner, floor } => {
@@ -5366,6 +5400,43 @@ mod tests {
         );
         let product_kernel = product_plan.dispatches[0].reduction.as_ref().unwrap();
         assert_eq!(product_kernel.n_per_elem, 2);
+    }
+
+    #[test]
+    fn unit_column_matmuls_use_exact_inner_kernels() {
+        let mut forward = Graph::new();
+        let input = forward.input("input", &[100, 3]);
+        let ones = forward.constant(vec![1.0; 3], &[3, 1]);
+        let output = forward.matmul(input, ones);
+        forward.set_outputs(vec![output]);
+        let forward_plan = compile(&forward);
+        assert_eq!(forward_plan.dispatches.len(), 1);
+        let reduction = &forward_plan.dispatches[0];
+        assert!(reduction.reduction.is_some());
+        assert_eq!(reduction.params[..2], [100, 3]);
+        assert_eq!(reduction.input_buffers.len(), 1);
+
+        let mut backward = Graph::new();
+        let row_gradient = backward.input("row_gradient", &[100, 1]);
+        let ones = backward.constant(vec![1.0; 3], &[3, 1]);
+        let output = backward.matmul_bt(row_gradient, ones);
+        backward.set_outputs(vec![output]);
+        let backward_plan = compile(&backward);
+        assert_eq!(backward_plan.dispatches.len(), 1);
+        let broadcast = &backward_plan.dispatches[0];
+        assert_eq!(broadcast.shader, ShaderEntry::BroadcastInner);
+        assert_eq!(broadcast.params, [300, 3, 0, 0]);
+        assert_eq!(broadcast.input_buffers.len(), 1);
+
+        let mut non_unit = Graph::new();
+        let input = non_unit.input("input", &[100, 3]);
+        let weights = non_unit.constant(vec![1.0, 2.0, 1.0], &[3, 1]);
+        let output = non_unit.matmul(input, weights);
+        non_unit.set_outputs(vec![output]);
+        let non_unit_plan = compile(&non_unit);
+        assert_eq!(non_unit_plan.dispatches.len(), 1);
+        assert_eq!(non_unit_plan.dispatches[0].shader, ShaderEntry::MatMul);
+        assert!(non_unit_plan.dispatches[0].reduction.is_none());
     }
 
     #[test]
