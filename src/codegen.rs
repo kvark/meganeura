@@ -353,10 +353,6 @@ pub enum ShaderGroup {
     /// M=1 MatMulBT (`B` stored `[N,K]`): `C[1,N] = A × Bᵀ`. K-split with
     /// coalesced contiguous-K vec4 loads.
     MatMulGemvBT,
-    MatMulCoop,
-    MatMulCoopAdd,
-    MatMulCoopAT,
-    MatMulCoopBT,
     Reduce,
     Softmax,
     CrossEntropy,
@@ -453,10 +449,6 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::MatMulGemv => parse_wgsl(include_str!("shaders/matmul_gemv.wgsl")),
         ShaderGroup::MatMulGemvAdd => parse_wgsl(include_str!("shaders/matmul_gemv_add.wgsl")),
         ShaderGroup::MatMulGemvBT => parse_wgsl(include_str!("shaders/matmul_gemv_bt.wgsl")),
-        ShaderGroup::MatMulCoop => gen_matmul_coop(),
-        ShaderGroup::MatMulCoopAdd => gen_matmul_coop_add(),
-        ShaderGroup::MatMulCoopAT => gen_matmul_coop_at(),
-        ShaderGroup::MatMulCoopBT => gen_matmul_coop_bt(),
         ShaderGroup::Reduce => parse_wgsl(include_str!("shaders/reduce.wgsl")),
         ShaderGroup::Softmax => parse_wgsl(include_str!("shaders/softmax.wgsl")),
         ShaderGroup::CrossEntropy => parse_wgsl(include_str!("shaders/cross_entropy.wgsl")),
@@ -571,27 +563,38 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
     }
 }
 
-/// Generate a cooperative matrix shader module with the given tile config.
-pub fn generate_coop_module(group: ShaderGroup, config: &CoopConfig) -> ShaderModule {
-    match group {
-        ShaderGroup::MatMulCoop => gen_matmul_coop_wgsl(false, MatMulCoopVariant::Normal, config),
-        ShaderGroup::MatMulCoopAdd => gen_matmul_coop_wgsl(true, MatMulCoopVariant::Normal, config),
-        ShaderGroup::MatMulCoopBT => gen_matmul_coop_wgsl(false, MatMulCoopVariant::BT, config),
-        ShaderGroup::MatMulCoopAT => gen_matmul_coop_wgsl(false, MatMulCoopVariant::AT, config),
-        _ => panic!("not a coop shader group: {:?}", group),
-    }
+/// The cooperative-matrix form of a matmul group: whether it fuses a
+/// residual add, and which operand (if any) is transposed.
+///
+/// `None` for groups that have no cooperative form. This is the single
+/// definition of that mapping - the module, prologue and epilogue
+/// generators all route through it.
+pub(crate) fn coop_shape(group: ShaderGroup) -> Option<(bool, MatMulCoopVariant)> {
+    Some(match group {
+        ShaderGroup::MatMul => (false, MatMulCoopVariant::Normal),
+        ShaderGroup::MatMulAdd => (true, MatMulCoopVariant::Normal),
+        ShaderGroup::MatMulAT => (false, MatMulCoopVariant::AT),
+        ShaderGroup::MatMulATAdd => (true, MatMulCoopVariant::AT),
+        ShaderGroup::MatMulBT => (false, MatMulCoopVariant::BT),
+        ShaderGroup::MatMulBTAdd => (true, MatMulCoopVariant::BT),
+        _ => return None,
+    })
+}
+
+/// Generate the cooperative-matrix form of a shader group, with the given
+/// tile config. Takes the scalar group: cooperative execution is a
+/// modifier on a dispatch, not a group of its own.
+pub fn generate_module_coop(group: ShaderGroup, config: &CoopConfig) -> ShaderModule {
+    let (fused_add, variant) =
+        coop_shape(group).unwrap_or_else(|| panic!("no cooperative form for {group:?}"));
+    gen_matmul_coop_wgsl(fused_add, variant, config)
 }
 
 /// Generate WGSL source for a shader group.
 pub fn generate_wgsl(group: ShaderGroup) -> String {
     let sm = generate_module(group);
     let capabilities = match group {
-        ShaderGroup::MatMulCoop
-        | ShaderGroup::MatMulCoopAdd
-        | ShaderGroup::MatMulCoopAT
-        | ShaderGroup::Conv2dGemmCoop
-        | ShaderGroup::Conv2dGradInputGemmCoop
-        | ShaderGroup::MatMulCoopBT => {
+        ShaderGroup::Conv2dGemmCoop | ShaderGroup::Conv2dGradInputGemmCoop => {
             naga::valid::Capabilities::COOPERATIVE_MATRIX
                 | naga::valid::Capabilities::SHADER_FLOAT16
         }
@@ -1411,38 +1414,6 @@ fn gen_matmul_gemv_bt_f16() -> ShaderModule {
     parse_wgsl(&src)
 }
 
-fn gen_matmul_coop() -> ShaderModule {
-    let default_config = CoopConfig {
-        tile_size: 16,
-        use_f16_input: true,
-    };
-    gen_matmul_coop_wgsl(false, MatMulCoopVariant::Normal, &default_config)
-}
-
-fn gen_matmul_coop_add() -> ShaderModule {
-    let default_config = CoopConfig {
-        tile_size: 16,
-        use_f16_input: true,
-    };
-    gen_matmul_coop_wgsl(true, MatMulCoopVariant::Normal, &default_config)
-}
-
-fn gen_matmul_coop_bt() -> ShaderModule {
-    let default_config = CoopConfig {
-        tile_size: 16,
-        use_f16_input: true,
-    };
-    gen_matmul_coop_wgsl(false, MatMulCoopVariant::BT, &default_config)
-}
-
-fn gen_matmul_coop_at() -> ShaderModule {
-    let default_config = CoopConfig {
-        tile_size: 16,
-        use_f16_input: true,
-    };
-    gen_matmul_coop_wgsl(false, MatMulCoopVariant::AT, &default_config)
-}
-
 fn gen_matmul_coop_wgsl(
     fused_add: bool,
     variant: MatMulCoopVariant,
@@ -1478,13 +1449,8 @@ pub fn generate_coop_matmul_with_dag_epilogue(
         epilogue.inputs.is_empty(),
         "cooperative matmul epilogues with extra buffers are not supported"
     );
-    let (fused_add, variant) = match group {
-        ShaderGroup::MatMul => (false, MatMulCoopVariant::Normal),
-        ShaderGroup::MatMulAdd => (true, MatMulCoopVariant::Normal),
-        ShaderGroup::MatMulAT => (false, MatMulCoopVariant::AT),
-        ShaderGroup::MatMulBT => (false, MatMulCoopVariant::BT),
-        _ => panic!("cooperative epilogue not supported for {group:?}"),
-    };
+    let (fused_add, variant) = coop_shape(group)
+        .unwrap_or_else(|| panic!("cooperative epilogue not supported for {group:?}"));
     gen_matmul_coop_wgsl_full(fused_add, variant, config, None, Some(epilogue))
 }
 
@@ -4948,26 +4914,6 @@ mod tests {
                 ShaderGroup::MatMulGemvBT,
                 naga::valid::Capabilities::empty(),
             ),
-            (
-                ShaderGroup::MatMulCoop,
-                naga::valid::Capabilities::COOPERATIVE_MATRIX
-                    | naga::valid::Capabilities::SHADER_FLOAT16,
-            ),
-            (
-                ShaderGroup::MatMulCoopAdd,
-                naga::valid::Capabilities::COOPERATIVE_MATRIX
-                    | naga::valid::Capabilities::SHADER_FLOAT16,
-            ),
-            (
-                ShaderGroup::MatMulCoopAT,
-                naga::valid::Capabilities::COOPERATIVE_MATRIX
-                    | naga::valid::Capabilities::SHADER_FLOAT16,
-            ),
-            (
-                ShaderGroup::MatMulCoopBT,
-                naga::valid::Capabilities::COOPERATIVE_MATRIX
-                    | naga::valid::Capabilities::SHADER_FLOAT16,
-            ),
             (ShaderGroup::Reduce, naga::valid::Capabilities::empty()),
             (ShaderGroup::Softmax, naga::valid::Capabilities::empty()),
             (
@@ -5063,6 +5009,26 @@ mod tests {
                 .validate(&sm.module)
                 .unwrap_or_else(|e| {
                     panic!("{group:?}: generated module failed validation: {e:#?}")
+                });
+        }
+
+        // Cooperative execution is a modifier rather than a group, so its
+        // modules are reached through the scalar group they derive from.
+        let coop_caps = naga::valid::Capabilities::COOPERATIVE_MATRIX
+            | naga::valid::Capabilities::SHADER_FLOAT16;
+        let config = CoopConfig {
+            tile_size: 16,
+            use_f16_input: true,
+        };
+        for &(group, caps) in &groups {
+            if coop_shape(group).is_none() {
+                continue;
+            }
+            let sm = generate_module_coop(group, &config);
+            naga::valid::Validator::new(flags, caps | coop_caps)
+                .validate(&sm.module)
+                .unwrap_or_else(|e| {
+                    panic!("{group:?} (coop): generated module failed validation: {e:#?}")
                 });
         }
     }
@@ -5230,10 +5196,6 @@ mod tests {
             (ShaderGroup::MatMulBT, empty),
             (ShaderGroup::MatMulATAdd, empty),
             (ShaderGroup::MatMulBTAdd, empty),
-            (ShaderGroup::MatMulCoop, coop),
-            (ShaderGroup::MatMulCoopAdd, coop),
-            (ShaderGroup::MatMulCoopAT, coop),
-            (ShaderGroup::MatMulCoopBT, coop),
             (ShaderGroup::Reduce, empty),
             (ShaderGroup::Softmax, empty),
             (ShaderGroup::CrossEntropy, empty),
@@ -5283,12 +5245,7 @@ mod tests {
             // See note in all_shaders_generate_valid_modules
             if matches!(
                 group,
-                ShaderGroup::MatMulCoop
-                    | ShaderGroup::MatMulCoopAdd
-                    | ShaderGroup::MatMulCoopAT
-                    | ShaderGroup::MatMulCoopBT
-                    | ShaderGroup::Conv2dGemmCoop
-                    | ShaderGroup::Conv2dGradInputGemmCoop
+                ShaderGroup::Conv2dGemmCoop | ShaderGroup::Conv2dGradInputGemmCoop
             ) {
                 continue;
             }

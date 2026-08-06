@@ -195,30 +195,16 @@ fn main() {
             tile_size: 16,
             use_f16_input: true,
         };
-        let cases: &[(&str, ShaderGroup, ShaderEntry)] = &[
-            (
-                "matmul_coop_16x16_f16",
-                ShaderGroup::MatMulCoop,
-                ShaderEntry::MatMul,
-            ),
-            (
-                "matmul_coop_bt_16x16_f16",
-                ShaderGroup::MatMulCoopBT,
-                ShaderEntry::MatMulBT,
-            ),
-            (
-                "matmul_coop_at_16x16_f16",
-                ShaderGroup::MatMulCoopAT,
-                ShaderEntry::MatMulAT,
-            ),
-            (
-                "matmul_coop_add_16x16_f16",
-                ShaderGroup::MatMulCoopAdd,
-                ShaderEntry::FusedMatMulAdd,
-            ),
+        // The cooperative form is a modifier on the scalar group, so the
+        // entry alone names the kernel.
+        let cases: &[(&str, ShaderEntry)] = &[
+            ("matmul_coop_16x16_f16", ShaderEntry::MatMul),
+            ("matmul_coop_bt_16x16_f16", ShaderEntry::MatMulBT),
+            ("matmul_coop_at_16x16_f16", ShaderEntry::MatMulAT),
+            ("matmul_coop_add_16x16_f16", ShaderEntry::FusedMatMulAdd),
         ];
-        for (name, group, entry) in cases {
-            let sm = meganeura::codegen::generate_coop_module(*group, &config);
+        for (name, entry) in cases {
+            let sm = meganeura::codegen::generate_module_coop(entry.shader_group(), &config);
             analyze(name, &sm, entry, dump, gpu_ref);
         }
     }
@@ -230,7 +216,7 @@ fn main() {
             tile_size: 8,
             use_f16_input: false,
         };
-        let sm = meganeura::codegen::generate_coop_module(ShaderGroup::MatMulCoop, &config);
+        let sm = meganeura::codegen::generate_module_coop(ShaderGroup::MatMul, &config);
         analyze(
             "matmul_coop_8x8_f32",
             &sm,
