@@ -159,7 +159,6 @@ pub enum ShaderEntry {
     SwiGLU,
     RmsNorm,
     Embedding,
-    EmbeddingF16,
     ToF16,
     RoPE,
     RoPEGrad,
@@ -333,7 +332,6 @@ impl ShaderEntry {
             ShaderEntry::ScatterAdd
             | ShaderEntry::Transpose
             | ShaderEntry::Embedding
-            | ShaderEntry::EmbeddingF16
             | ShaderEntry::ToF16
             | ShaderEntry::Concat
             | ShaderEntry::SplitA
@@ -400,7 +398,6 @@ impl ShaderEntry {
             ShaderEntry::SwiGLU => ShaderGroup::Binary,
             ShaderEntry::RmsNorm => ShaderGroup::RmsNorm,
             ShaderEntry::Embedding => ShaderGroup::Embedding,
-            ShaderEntry::EmbeddingF16 => ShaderGroup::EmbeddingF16,
             ShaderEntry::ToF16 => ShaderGroup::ToF16,
             ShaderEntry::RoPE => ShaderGroup::RoPE,
             ShaderEntry::RoPEGrad => ShaderGroup::RoPEGrad,
@@ -497,7 +494,6 @@ impl ShaderEntry {
             ShaderEntry::SwiGLU => "swiglu",
             ShaderEntry::RmsNorm => "main",
             ShaderEntry::Embedding => "main",
-            ShaderEntry::EmbeddingF16 => "main",
             ShaderEntry::ToF16 => "main",
             ShaderEntry::RoPE => "main",
             ShaderEntry::RoPEGrad => "main",
@@ -2647,9 +2643,13 @@ impl<'a> Compiler<'a> {
                 let indices = self.get_buffer(node.inputs[0]);
                 let table = self.get_buffer(node.inputs[1]);
                 let idx_shape = &self.graph.node(node.inputs[0]).ty.shape;
-                let tbl_shape = &self.graph.node(node.inputs[1]).ty.shape;
+                let tbl_node = self.graph.node(node.inputs[1]);
+                let tbl_shape = &tbl_node.ty.shape;
                 let seq = idx_shape[0] as u32;
                 let hidden = tbl_shape[1] as u32;
+                // The table's storage format picks the gather variant, so an
+                // f16 table cannot silently be read by the f32 kernel.
+                let wf = WeightFormat::from_dtype(tbl_node.ty.dtype);
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::Embedding,
                     workgroups: [seq * hidden.div_ceil(256), 1, 1],
@@ -2659,27 +2659,7 @@ impl<'a> Compiler<'a> {
                     params: vec![seq, hidden, 0, 0],
                     use_coop: false,
                     use_small_tiles: false,
-                    ..Default::default()
-                });
-            }
-
-            Op::EmbeddingF16 => {
-                // Same as Embedding but the table buffer is f16.
-                let indices = self.get_buffer(node.inputs[0]);
-                let table = self.get_buffer(node.inputs[1]);
-                let idx_shape = &self.graph.node(node.inputs[0]).ty.shape;
-                let tbl_shape = &self.graph.node(node.inputs[1]).ty.shape;
-                let seq = idx_shape[0] as u32;
-                let hidden = tbl_shape[1] as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::EmbeddingF16,
-                    workgroups: [seq * hidden.div_ceil(256), 1, 1],
-                    input_buffers: vec![indices, table],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![seq, hidden, 0, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+                    weight_format: wf,
                     ..Default::default()
                 });
             }
