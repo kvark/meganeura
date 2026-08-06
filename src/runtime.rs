@@ -768,43 +768,88 @@ fn epilogue_pipeline_key(dispatch: &Dispatch) -> Option<EpiloguePipelineKey> {
     }
 }
 
+/// Identifies one compiled pipeline.
+///
+/// A dispatch names a `ShaderEntry`, but the pipeline it actually runs
+/// also depends on the modifiers the plan attached to it - weight format,
+/// tiling, a fused epilogue, and so on. Each modifier axis is one variant
+/// here, and [`Pipelines::candidates`] lists them most-specific-first, so
+/// adding an axis costs a variant, a `candidates` line, and a `label`
+/// arm rather than a map, a struct field, and four parallel match chains.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Variant {
+    /// Schedule-template kernels, keyed by kernel content hash. These are
+    /// generated from a DAG rather than a shader group, so no `ShaderEntry`
+    /// identifies them.
+    Reduction(u64),
+    Pointwise(u64),
+    /// Attention kernels specialize their workgroup layout and generated
+    /// WGSL for `head_dim`. Keying only by `ShaderEntry` made a graph
+    /// containing different attention widths run every dispatch through
+    /// whichever width happened to be encountered last.
+    Attention(ShaderEntry, u32),
+    /// Epilogue-fused matmuls, keyed by their actual DAG (or the legacy
+    /// closed op list for deserialized old plans). The cooperative form
+    /// uses workgroup memory to expose accumulator lanes to the epilogue.
+    Epilogue(ShaderEntry, EpiloguePipelineKey),
+    CoopEpilogue(ShaderEntry, EpiloguePipelineKey),
+    /// Prologue-fused coop matmuls. Prologues only apply when `use_coop`
+    /// is set; the kind sequence alone determines the shader, since buffer
+    /// IDs are resolved at dispatch time.
+    CoopPrologue(ShaderEntry, Vec<crate::compile::PrologueLoadKind>),
+    /// GEMV with a RmsNorm folded into its A operand.
+    GemvRmsNorm(ShaderEntry),
+    /// Non-f32 weight storage (f16, Q4, Q8).
+    Weight(ShaderEntry, crate::compile::WeightFormat),
+    /// Cooperative-matrix and small-tile (32×32) forms. Unlike every other
+    /// axis these are pure performance: the scalar pipeline computes the
+    /// same thing, so falling back to it is safe.
+    Coop(ShaderEntry),
+    SmallTile(ShaderEntry),
+    /// The unmodified pipeline. Always compiled.
+    Scalar(ShaderEntry),
+}
+
+impl Variant {
+    /// The shader entry this pipeline was generated from. `None` for the
+    /// schedule-template kernels, which have no entry of their own.
+    fn entry(&self) -> Option<&ShaderEntry> {
+        match *self {
+            Variant::Reduction(_) | Variant::Pointwise(_) => None,
+            Variant::Attention(ref e, _)
+            | Variant::Epilogue(ref e, _)
+            | Variant::CoopEpilogue(ref e, _)
+            | Variant::CoopPrologue(ref e, _)
+            | Variant::GemvRmsNorm(ref e)
+            | Variant::Weight(ref e, _)
+            | Variant::Coop(ref e)
+            | Variant::SmallTile(ref e)
+            | Variant::Scalar(ref e) => Some(e),
+        }
+    }
+
+    /// Name used by the profiler and by pipeline-statistics dumps.
+    fn label(&self) -> String {
+        match *self {
+            Variant::Reduction(hash) => format!("generated-reduction:{hash:016x}"),
+            Variant::Pointwise(hash) => format!("generated-pointwise:{hash:016x}"),
+            Variant::Attention(ref e, head_dim) => format!("{e:?}:head-dim-{head_dim}"),
+            Variant::Epilogue(ref e, ref key) => epilogue_profile_key(e, key, false),
+            Variant::CoopEpilogue(ref e, ref key) => epilogue_profile_key(e, key, true),
+            Variant::CoopPrologue(ref e, ref kinds) => {
+                format!("{e:?}:cooperative-prologue:{kinds:?}")
+            }
+            Variant::GemvRmsNorm(ref e) => format!("{e:?}:rmsnorm"),
+            Variant::Weight(ref e, format) => format!("{e:?}:weight-{format:?}"),
+            Variant::Coop(ref e) => format!("{e:?}:cooperative"),
+            Variant::SmallTile(ref e) => format!("{e:?}:small-tile"),
+            Variant::Scalar(ref e) => format!("{e:?}:scalar"),
+        }
+    }
+}
+
 struct Pipelines {
-    /// Scalar (default) pipelines.
-    map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
-    /// Cooperative-matrix pipelines for dispatches with `use_coop = true`.
-    coop_map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
-    /// Small-tile (32×32) pipelines for dispatches with `use_small_tiles = true`.
-    small_map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
-    /// GEMVs with a RmsNorm folded into their A operand.
-    rmsnorm_map: HashMap<ShaderEntry, blade_graphics::ComputePipeline>,
-    /// Pipelines for non-f32 weight formats (f16, Q4, Q8).
-    weight_map:
-        HashMap<(ShaderEntry, crate::compile::WeightFormat), blade_graphics::ComputePipeline>,
-    /// Attention kernels specialize their workgroup layout and generated WGSL
-    /// for `head_dim`. Keying only by `ShaderEntry` made a graph containing
-    /// different attention widths run every dispatch through whichever width
-    /// happened to be encountered last.
-    attention_map: HashMap<(ShaderEntry, u32), blade_graphics::ComputePipeline>,
-    /// Scalar epilogue-fused pipelines keyed by their actual DAG (or the
-    /// legacy closed op list for deserialized old plans).
-    epilogue_map: HashMap<(ShaderEntry, EpiloguePipelineKey), blade_graphics::ComputePipeline>,
-    /// Cooperative-matrix equivalents. These use workgroup memory to expose
-    /// matrix accumulator lanes to the scalar epilogue.
-    coop_epilogue_map: HashMap<(ShaderEntry, EpiloguePipelineKey), blade_graphics::ComputePipeline>,
-    /// Prologue-fused coop-matmul pipelines keyed by (shader, prologue kinds).
-    /// Prologues only apply when `use_coop = true`; the kind sequence alone
-    /// determines the shader (buffer IDs are resolved at dispatch time).
-    prologue_map: HashMap<
-        (ShaderEntry, Vec<crate::compile::PrologueLoadKind>),
-        blade_graphics::ComputePipeline,
-    >,
-    /// Schedule-template-generated pointwise pipelines, keyed by DAG hash.
-    /// Populated for dispatches that carry a `pointwise` DAG.
-    pointwise_map: HashMap<u64, blade_graphics::ComputePipeline>,
-    /// Schedule-template-generated reduction pipelines, keyed by kernel
-    /// content hash. Populated for dispatches that carry a `reduction`
-    /// kernel spec.
-    reduction_map: HashMap<u64, blade_graphics::ComputePipeline>,
+    map: HashMap<Variant, blade_graphics::ComputePipeline>,
 }
 
 impl Pipelines {
@@ -946,17 +991,17 @@ impl Pipelines {
                 .insert(ShaderEntry::GradAccum);
         }
 
-        let mut map = HashMap::new();
-        let mut coop_map = HashMap::new();
-        let mut small_map = HashMap::new();
+        let mut map: HashMap<Variant, blade_graphics::ComputePipeline> = HashMap::new();
 
         // One place that turns a generated module into pipelines for the
         // entries of a group. Every modifier axis - base, small tile, coop,
-        // fused RmsNorm - differs only in which module it hands over.
+        // weight format - differs only in which module it hands over and
+        // which `Variant` it files the result under.
         let compile_variant =
             |sm: crate::codegen::ShaderModule,
              group: ShaderGroup,
-             target: &mut HashMap<ShaderEntry, blade_graphics::ComputePipeline>| {
+             key: &dyn Fn(ShaderEntry) -> Variant,
+             target: &mut HashMap<Variant, blade_graphics::ComputePipeline>| {
                 let shader = gpu.create_shader(bg::ShaderDesc {
                     source: &sm.source,
                     naga_module: Some(sm.module),
@@ -969,21 +1014,23 @@ impl Pipelines {
                             data_layouts: &[&layout],
                             compute: shader.at(entry.entry_point()),
                         });
-                        target.insert(entry.clone(), pipeline);
+                        target.insert(key(entry.clone()), pipeline);
                     }
                 }
             };
         let compile_group =
             |group: ShaderGroup,
-             target: &mut HashMap<ShaderEntry, blade_graphics::ComputePipeline>| {
-                compile_variant(crate::codegen::generate_module(group), group, target);
+             key: &dyn Fn(ShaderEntry) -> Variant,
+             target: &mut HashMap<Variant, blade_graphics::ComputePipeline>| {
+                compile_variant(crate::codegen::generate_module(group), group, key, target);
             };
 
         for &group in &needed_small {
             compile_variant(
                 crate::codegen::generate_module_small(group),
                 group,
-                &mut small_map,
+                &Variant::SmallTile,
+                &mut map,
             );
         }
 
@@ -1001,11 +1048,10 @@ impl Pipelines {
                 // Compiled below per (entry, head_dim), not once per group.
                 continue;
             } else {
-                compile_group(group, &mut map);
+                compile_group(group, &Variant::Scalar, &mut map);
             }
         }
 
-        let mut attention_map = HashMap::new();
         for (entry, hd) in attention_entries {
             let group = entry.shader_group();
             let sm = match group {
@@ -1040,7 +1086,7 @@ impl Pipelines {
                 data_layouts: &[&layout],
                 compute: shader.at(entry.entry_point()),
             });
-            attention_map.insert((entry, hd), pipeline);
+            map.insert(Variant::Attention(entry, hd), pipeline);
         }
         // Collect generated conv2d coop entries that need individual compilation.
         let mut conv2d_gen_entries: Vec<ShaderEntry> = Vec::new();
@@ -1084,12 +1130,12 @@ impl Pipelines {
                                 data_layouts: &[&layout],
                                 compute: shader.at(entry.entry_point()),
                             });
-                            coop_map.insert(entry.clone(), pipeline);
+                            map.insert(Variant::Coop(entry.clone()), pipeline);
                         }
                     }
                 }
             } else {
-                compile_group(group, &mut coop_map);
+                compile_group(group, &Variant::Coop, &mut map);
             }
         }
         // Compile generated conv2d coop kernels individually.
@@ -1117,7 +1163,7 @@ impl Pipelines {
                     data_layouts: &[&layout],
                     compute: shader.at(entry.entry_point()),
                 });
-                coop_map.insert(entry.clone(), pipeline);
+                map.insert(Variant::Coop(entry.clone()), pipeline);
             }
         }
 
@@ -1125,7 +1171,6 @@ impl Pipelines {
         // module is derived from the plain GEMV, so it needs no ShaderGroup
         // of its own; it is a variant of `MatMulGemv`, resolved by
         // `get_pipeline` the same way a weight format is.
-        let mut rmsnorm_map: HashMap<ShaderEntry, blade_graphics::ComputePipeline> = HashMap::new();
         if plan.dispatches.iter().any(|d| d.gemv_rmsnorm.is_some()) {
             let sm = crate::codegen::generate_module_gemv_rmsnorm();
             let shader = gpu.create_shader(bg::ShaderDesc {
@@ -1139,46 +1184,31 @@ impl Pipelines {
                 data_layouts: &[&layout],
                 compute: shader.at(entry.entry_point()),
             });
-            rmsnorm_map.insert(entry, pipeline);
+            map.insert(Variant::GemvRmsNorm(entry), pipeline);
         }
 
         // Compile weight-format-specific pipelines (f16, Q4, Q8).
-        let mut weight_map: HashMap<
-            (ShaderEntry, crate::compile::WeightFormat),
-            blade_graphics::ComputePipeline,
-        > = HashMap::new();
         for (&format, groups) in &needed_weighted {
             for &group in groups {
-                let sm = crate::codegen::generate_module_weighted(group, format);
-                let shader = gpu.create_shader(bg::ShaderDesc {
-                    source: &sm.source,
-                    naga_module: Some(sm.module),
-                });
-                if let Some(entries) = entries_for_group.get(&group) {
-                    for entry in entries {
-                        let layout = shader_data_layout(entry);
-                        let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                            name: entry.entry_point(),
-                            data_layouts: &[&layout],
-                            compute: shader.at(entry.entry_point()),
-                        });
-                        weight_map.insert((entry.clone(), format), pipeline);
-                    }
-                }
+                compile_variant(
+                    crate::codegen::generate_module_weighted(group, format),
+                    group,
+                    &|entry| Variant::Weight(entry, format),
+                    &mut map,
+                );
             }
         }
 
         // Compile epilogue-fused pipelines for dispatches with non-empty epilogue.
         // Prefer the new MatMulEpilogue (PointwiseDAG); fall back to legacy
         // Vec<EpilogueOp> for cached plans that predate the DAG migration.
-        let mut epilogue_map = HashMap::new();
-        let mut coop_epilogue_map = HashMap::new();
         for dispatch in &plan.dispatches {
             let Some(epilogue_key) = epilogue_pipeline_key(dispatch) else {
                 continue;
             };
-            let key = (dispatch.shader.clone(), epilogue_key);
-            if !epilogue_map.contains_key(&key) {
+            let key = Variant::Epilogue(dispatch.shader.clone(), epilogue_key.clone());
+            let coop_key = Variant::CoopEpilogue(dispatch.shader.clone(), epilogue_key);
+            if let std::collections::hash_map::Entry::Vacant(slot) = map.entry(key) {
                 let group = dispatch.shader.shader_group();
                 let sm = if let Some(ref epi) = dispatch.matmul_epilogue {
                     crate::codegen::generate_matmul_with_dag_epilogue(group, epi)
@@ -1195,10 +1225,10 @@ impl Pipelines {
                     data_layouts: &[&layout],
                     compute: shader.at(dispatch.shader.entry_point()),
                 });
-                epilogue_map.insert(key.clone(), pipeline);
+                slot.insert(pipeline);
             }
 
-            if dispatch.use_coop && !coop_epilogue_map.contains_key(&key) {
+            if dispatch.use_coop && !map.contains_key(&coop_key) {
                 let config = coop_config
                     .expect("dispatch selected cooperative epilogue without a coop config");
                 let epi = dispatch
@@ -1220,7 +1250,7 @@ impl Pipelines {
                     data_layouts: &[&layout],
                     compute: shader.at(dispatch.shader.entry_point()),
                 });
-                coop_epilogue_map.insert(key, pipeline);
+                map.insert(coop_key, pipeline);
             }
         }
 
@@ -1228,7 +1258,6 @@ impl Pipelines {
         // (shader, prologue kind sequence); buffer IDs are bound at dispatch
         // time via the existing matmul data layout extended with prologue
         // factor buffers.
-        let mut prologue_map = HashMap::new();
         if let Some(coop_cfg) = coop_config {
             for dispatch in &plan.dispatches {
                 let Some(ref prologue) = dispatch.matmul_prologue else {
@@ -1237,9 +1266,9 @@ impl Pipelines {
                 if !dispatch.use_coop {
                     continue;
                 }
-                let kinds: Vec<_> = prologue.factors.iter().map(|f| f.1.clone()).collect();
-                let key = (dispatch.shader.clone(), kinds);
-                if prologue_map.contains_key(&key) {
+                let kinds = prologue.factors.iter().map(|f| f.1.clone()).collect();
+                let key = Variant::CoopPrologue(dispatch.shader.clone(), kinds);
+                if map.contains_key(&key) {
                     continue;
                 }
                 let group = dispatch.shader.shader_group();
@@ -1280,7 +1309,7 @@ impl Pipelines {
                     data_layouts: &[&layout],
                     compute: shader.at(dispatch.shader.entry_point()),
                 });
-                prologue_map.insert(key, pipeline);
+                map.insert(key, pipeline);
             }
         }
 
@@ -1289,14 +1318,13 @@ impl Pipelines {
         // existing `shader` field is used only to pick the data layout
         // (UnaryData for n=1 inputs, BinaryData for n=2), which already
         // matches the generated WGSL's binding names.
-        let mut pointwise_map: HashMap<u64, blade_graphics::ComputePipeline> = HashMap::new();
         for dispatch in &plan.dispatches {
             let dag = match dispatch.pointwise {
                 Some(ref d) => d,
                 None => continue,
             };
-            let key = dag.hash_key();
-            if pointwise_map.contains_key(&key) {
+            let key = Variant::Pointwise(dag.hash_key());
+            if map.contains_key(&key) {
                 continue;
             }
             let template = crate::schedule::KernelTemplate::Pointwise {
@@ -1314,18 +1342,17 @@ impl Pipelines {
                 data_layouts: &[&layout],
                 compute: shader.at(crate::schedule::POINTWISE_ENTRY),
             });
-            pointwise_map.insert(key, pipeline);
+            map.insert(key, pipeline);
         }
 
         // Compile schedule-template reduction pipelines.
-        let mut reduction_map: HashMap<u64, blade_graphics::ComputePipeline> = HashMap::new();
         for dispatch in &plan.dispatches {
             let kernel = match dispatch.reduction {
                 Some(ref k) => k,
                 None => continue,
             };
-            let key = kernel.hash_key();
-            if reduction_map.contains_key(&key) {
+            let key = Variant::Reduction(kernel.hash_key());
+            if map.contains_key(&key) {
                 continue;
             }
             let sm = crate::schedule::lower(&kernel.to_template());
@@ -1339,189 +1366,93 @@ impl Pipelines {
                 data_layouts: &[&layout],
                 compute: shader.at(crate::schedule::REDUCTION_ENTRY),
             });
-            reduction_map.insert(key, pipeline);
+            map.insert(key, pipeline);
         }
 
-        Self {
-            map,
-            coop_map,
-            small_map,
-            rmsnorm_map,
-            weight_map,
-            attention_map,
-            epilogue_map,
-            coop_epilogue_map,
-            prologue_map,
-            pointwise_map,
-            reduction_map,
+        Self { map }
+    }
+
+    /// Pipelines this dispatch can run, most specific first; `get` takes the
+    /// first one that was compiled.
+    ///
+    /// Every list ends with `Scalar`, which is always compiled - except for
+    /// epilogue fusion, where the plan has already deleted the standalone
+    /// ops, so running the unfused matmul would silently drop them. That
+    /// list stays a single entry and a miss is a panic.
+    fn candidates(dispatch: &Dispatch) -> Vec<Variant> {
+        let entry = &dispatch.shader;
+        if let Some(epilogue) = epilogue_pipeline_key(dispatch) {
+            return vec![if dispatch.use_coop {
+                Variant::CoopEpilogue(entry.clone(), epilogue)
+            } else {
+                Variant::Epilogue(entry.clone(), epilogue)
+            }];
         }
+        let mut out = Vec::new();
+        if let Some(ref kernel) = dispatch.reduction {
+            out.push(Variant::Reduction(kernel.hash_key()));
+        }
+        if let Some(ref dag) = dispatch.pointwise {
+            out.push(Variant::Pointwise(dag.hash_key()));
+        }
+        if dispatch.params.len() >= 4 {
+            out.push(Variant::Attention(entry.clone(), dispatch.params[3]));
+        }
+        if dispatch.gemv_rmsnorm.is_some() {
+            out.push(Variant::GemvRmsNorm(entry.clone()));
+        }
+        if dispatch.weight_format.uses_reduced_storage() {
+            out.push(Variant::Weight(entry.clone(), dispatch.weight_format));
+        }
+        if dispatch.use_coop {
+            if let Some(ref prologue) = dispatch.matmul_prologue {
+                let kinds = prologue.factors.iter().map(|f| f.1.clone()).collect();
+                out.push(Variant::CoopPrologue(entry.clone(), kinds));
+            }
+            out.push(Variant::Coop(entry.clone()));
+        }
+        if dispatch.use_small_tiles {
+            out.push(Variant::SmallTile(entry.clone()));
+        }
+        out.push(Variant::Scalar(entry.clone()));
+        out
+    }
+
+    /// The unmodified pipeline for an entry, for the fixed passes -
+    /// optimizer step, grad clip, grad accumulate - that are issued
+    /// directly rather than through a `Dispatch`, and so never carry a
+    /// modifier.
+    fn scalar(&self, entry: ShaderEntry) -> &blade_graphics::ComputePipeline {
+        &self.map[&Variant::Scalar(entry)]
     }
 
     fn get(&self, dispatch: &Dispatch) -> &blade_graphics::ComputePipeline {
-        if let Some(ref k) = dispatch.reduction {
-            if let Some(p) = self.reduction_map.get(&k.hash_key()) {
-                return p;
-            }
-        }
-        if let Some(ref dag) = dispatch.pointwise {
-            if let Some(p) = self.pointwise_map.get(&dag.hash_key()) {
-                return p;
-            }
-        }
-        if dispatch.params.len() >= 4 {
-            let key = (dispatch.shader.clone(), dispatch.params[3]);
-            if let Some(p) = self.attention_map.get(&key) {
-                return p;
-            }
-        }
-        if let Some(epilogue) = epilogue_pipeline_key(dispatch) {
-            let key = (dispatch.shader.clone(), epilogue);
-            return if dispatch.use_coop {
-                &self.coop_epilogue_map[&key]
-            } else {
-                &self.epilogue_map[&key]
-            };
-        }
-        if dispatch.gemv_rmsnorm.is_some() {
-            if let Some(p) = self.rmsnorm_map.get(&dispatch.shader) {
-                return p;
-            }
-        }
-        if dispatch.weight_format.uses_reduced_storage() {
-            let key = (dispatch.shader.clone(), dispatch.weight_format);
-            if let Some(p) = self.weight_map.get(&key) {
-                return p;
-            }
-        }
-        if let Some(ref prologue) = dispatch.matmul_prologue {
-            if dispatch.use_coop {
-                let kinds: Vec<_> = prologue.factors.iter().map(|f| f.1.clone()).collect();
-                let key = (dispatch.shader.clone(), kinds);
-                if let Some(p) = self.prologue_map.get(&key) {
-                    return p;
-                }
-            }
-        }
-        if dispatch.use_coop {
-            if let Some(p) = self.coop_map.get(&dispatch.shader) {
-                return p;
-            }
-        }
-        if dispatch.use_small_tiles {
-            if let Some(p) = self.small_map.get(&dispatch.shader) {
-                return p;
-            }
-        }
-        &self.map[&dispatch.shader]
+        let candidates = Self::candidates(dispatch);
+        candidates
+            .iter()
+            .find_map(|variant| self.map.get(variant))
+            .unwrap_or_else(|| panic!("no pipeline was compiled for any of {candidates:?}"))
     }
 
     fn profile_key(&self, dispatch: &Dispatch) -> String {
-        if let Some(ref kernel) = dispatch.reduction {
-            return format!("generated-reduction:{:016x}", kernel.hash_key());
-        }
-        if let Some(ref dag) = dispatch.pointwise {
-            return format!("generated-pointwise:{:016x}", dag.hash_key());
-        }
-        if dispatch.params.len() >= 4 {
-            let key = (dispatch.shader.clone(), dispatch.params[3]);
-            if self.attention_map.contains_key(&key) {
-                return format!("{:?}:head-dim-{}", dispatch.shader, dispatch.params[3]);
-            }
-        }
-        if let Some(epilogue) = epilogue_pipeline_key(dispatch) {
-            return epilogue_profile_key(&dispatch.shader, &epilogue, dispatch.use_coop);
-        }
-        if dispatch.gemv_rmsnorm.is_some() && self.rmsnorm_map.contains_key(&dispatch.shader) {
-            return format!("{:?}:rmsnorm", dispatch.shader);
-        }
-        if dispatch.weight_format.uses_reduced_storage() {
-            let key = (dispatch.shader.clone(), dispatch.weight_format);
-            if self.weight_map.contains_key(&key) {
-                return format!("{:?}:weight-{:?}", dispatch.shader, dispatch.weight_format);
-            }
-        }
-        if dispatch.use_coop && self.coop_map.contains_key(&dispatch.shader) {
-            return format!("{:?}:cooperative", dispatch.shader);
-        }
-        if dispatch.use_small_tiles && self.small_map.contains_key(&dispatch.shader) {
-            return format!("{:?}:small-tile", dispatch.shader);
-        }
-        format!("{:?}:scalar", dispatch.shader)
+        Self::candidates(dispatch)
+            .into_iter()
+            .find(|variant| self.map.contains_key(variant))
+            .map_or_else(|| format!("{:?}:scalar", dispatch.shader), |v| v.label())
     }
 
     fn all_pipelines(&self) -> Vec<(&str, &blade_graphics::ComputePipeline)> {
-        let mut result = Vec::new();
-        for (entry, pipeline) in &self.map {
-            result.push((entry.entry_point(), pipeline));
-        }
-        for (entry, pipeline) in &self.coop_map {
-            result.push((entry.entry_point(), pipeline));
-        }
-        for (entry, pipeline) in &self.small_map {
-            result.push((entry.entry_point(), pipeline));
-        }
-        for (key, pipeline) in &self.attention_map {
-            result.push((key.0.entry_point(), pipeline));
-        }
-        #[allow(clippy::pattern_type_mismatch)]
-        for ((entry, _), pipeline) in &self.weight_map {
-            result.push((entry.entry_point(), pipeline));
-        }
-        #[allow(clippy::needless_borrowed_reference)]
-        for (&(ref entry, _), pipeline) in &self.epilogue_map {
-            result.push((entry.entry_point(), pipeline));
-        }
-        #[allow(clippy::needless_borrowed_reference)]
-        for (&(ref entry, _), pipeline) in &self.coop_epilogue_map {
-            result.push((entry.entry_point(), pipeline));
-        }
-        #[allow(clippy::needless_borrowed_reference)]
-        for (&(ref entry, _), pipeline) in &self.prologue_map {
-            result.push((entry.entry_point(), pipeline));
-        }
-        result
+        self.map
+            .iter()
+            .filter_map(|(variant, pipeline)| variant.entry().map(|e| (e.entry_point(), pipeline)))
+            .collect()
     }
 
     fn all_profile_pipelines(&self) -> Vec<(String, &blade_graphics::ComputePipeline)> {
-        let mut result = Vec::new();
-        for (entry, pipeline) in &self.map {
-            result.push((format!("{entry:?}:scalar"), pipeline));
-        }
-        for (entry, pipeline) in &self.coop_map {
-            result.push((format!("{entry:?}:cooperative"), pipeline));
-        }
-        for (entry, pipeline) in &self.small_map {
-            result.push((format!("{entry:?}:small-tile"), pipeline));
-        }
-        for (key, pipeline) in &self.attention_map {
-            result.push((format!("{:?}:head-dim-{}", key.0, key.1), pipeline));
-        }
-        #[allow(clippy::pattern_type_mismatch)]
-        for ((entry, format), pipeline) in &self.weight_map {
-            result.push((format!("{entry:?}:weight-{format:?}"), pipeline));
-        }
-        #[allow(clippy::needless_borrowed_reference)]
-        for (&(ref entry, ref epilogue), pipeline) in &self.epilogue_map {
-            result.push((epilogue_profile_key(entry, epilogue, false), pipeline));
-        }
-        #[allow(clippy::needless_borrowed_reference)]
-        for (&(ref entry, ref epilogue), pipeline) in &self.coop_epilogue_map {
-            result.push((epilogue_profile_key(entry, epilogue, true), pipeline));
-        }
-        for (hash, pipeline) in &self.pointwise_map {
-            result.push((format!("generated-pointwise:{hash:016x}"), pipeline));
-        }
-        for (hash, pipeline) in &self.reduction_map {
-            result.push((format!("generated-reduction:{hash:016x}"), pipeline));
-        }
-        #[allow(clippy::needless_borrowed_reference)]
-        for (&(ref entry, ref kinds), pipeline) in &self.prologue_map {
-            result.push((
-                format!("{entry:?}:cooperative-prologue:{kinds:?}"),
-                pipeline,
-            ));
-        }
-        result
+        self.map
+            .iter()
+            .map(|(variant, pipeline)| (variant.label(), pipeline))
+            .collect()
     }
 }
 
@@ -3223,6 +3154,75 @@ pub(crate) fn parse_device_id(value: &str) -> Option<u32> {
 }
 
 #[cfg(test)]
+mod variant_tests {
+    use super::{Dispatch, Pipelines, ShaderEntry, Variant};
+
+    fn relu_epilogue() -> crate::compile::MatMulEpilogue {
+        crate::compile::MatMulEpilogue {
+            dag: crate::schedule::PointwiseDAG {
+                n_inputs: 1,
+                ops: vec![
+                    crate::schedule::Pw::LoadInput(0),
+                    crate::schedule::Pw::Relu(0),
+                ],
+                output: 1,
+            },
+            inputs: Vec::new(),
+        }
+    }
+
+    fn matmul(f: impl FnOnce(&mut Dispatch)) -> Vec<Variant> {
+        let mut d = Dispatch {
+            shader: ShaderEntry::MatMul,
+            ..Default::default()
+        };
+        f(&mut d);
+        Pipelines::candidates(&d)
+    }
+
+    /// The order here is what makes a modifier win over a less specific
+    /// one. Reordering it silently changes which kernel every affected
+    /// dispatch runs, so it is pinned rather than left to review.
+    #[test]
+    fn modifiers_outrank_the_scalar_base() {
+        assert_eq!(matmul(|_| {}), vec![Variant::Scalar(ShaderEntry::MatMul)]);
+
+        assert_eq!(
+            matmul(|d| {
+                d.use_coop = true;
+                d.use_small_tiles = true;
+                d.weight_format = crate::compile::WeightFormat::F16;
+            }),
+            vec![
+                Variant::Weight(ShaderEntry::MatMul, crate::compile::WeightFormat::F16),
+                Variant::Coop(ShaderEntry::MatMul),
+                Variant::SmallTile(ShaderEntry::MatMul),
+                Variant::Scalar(ShaderEntry::MatMul),
+            ],
+        );
+    }
+
+    /// A dispatch whose epilogue ops were folded into the matmul has no
+    /// standalone dispatch left to run them, so it must not be allowed to
+    /// fall back to the unfused kernel.
+    #[test]
+    fn epilogue_fusion_has_no_fallback() {
+        let candidates = matmul(|d| {
+            d.matmul_epilogue = Some(relu_epilogue());
+        });
+        assert_eq!(candidates.len(), 1);
+        assert!(matches!(candidates[0], Variant::Epilogue(..)));
+
+        let coop = matmul(|d| {
+            d.matmul_epilogue = Some(relu_epilogue());
+            d.use_coop = true;
+        });
+        assert_eq!(coop.len(), 1);
+        assert!(matches!(coop[0], Variant::CoopEpilogue(..)));
+    }
+}
+
+#[cfg(test)]
 mod device_id_tests {
     use super::parse_device_id;
 
@@ -4708,7 +4708,7 @@ impl Session {
         // buffers the backward just wrote).
         if let Some(scale) = self.grad_accum_scale {
             {
-                let pipeline = &self.pipelines.map[&ShaderEntry::GradAccum];
+                let pipeline = self.pipelines.scalar(ShaderEntry::GradAccum);
                 let mut pass = self.encoder.compute("grad_accum");
                 for (idx, &(_, grad_buf)) in self.plan.param_grad_pairs.iter().enumerate() {
                     let len = (self.plan.buffers[grad_buf.0 as usize] / 4) as u32;
@@ -4773,7 +4773,7 @@ impl Session {
 
             // Pass 1: zero accumulator.
             {
-                let pipeline = &self.pipelines.map[&ShaderEntry::GradClipZero];
+                let pipeline = self.pipelines.scalar(ShaderEntry::GradClipZero);
                 let mut pass = self.encoder.compute("grad_clip_zero");
                 let mut pc = pass.with(pipeline);
                 pc.bind(0, &GradClipZeroData { acc: acc_buf.at(0) });
@@ -4782,7 +4782,7 @@ impl Session {
             // Pass 2: sum of squares per gradient buffer.
             let accumulating = self.grad_accum_scale.is_some();
             {
-                let pipeline = &self.pipelines.map[&ShaderEntry::GradClipNormSq];
+                let pipeline = self.pipelines.scalar(ShaderEntry::GradClipNormSq);
                 let mut pass = self.encoder.compute("grad_clip_norm_sq");
                 for (idx, &(param_buf, grad_buf)) in self.plan.param_grad_pairs.iter().enumerate() {
                     let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
@@ -4818,7 +4818,7 @@ impl Session {
             }
             // Pass 3: scale each gradient by min(1, max_norm/sqrt(acc)).
             {
-                let pipeline = &self.pipelines.map[&ShaderEntry::GradClipScale];
+                let pipeline = self.pipelines.scalar(ShaderEntry::GradClipScale);
                 let mut pass = self.encoder.compute("grad_clip_scale");
                 for (idx, &(param_buf, grad_buf)) in self.plan.param_grad_pairs.iter().enumerate() {
                     let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
@@ -4857,7 +4857,7 @@ impl Session {
             let accumulating = self.grad_accum_scale.is_some();
             let lr = self.pending_lr;
             if let Some(learning_rate) = lr {
-                let pipeline = &self.pipelines.map[&ShaderEntry::SgdUpdate];
+                let pipeline = self.pipelines.scalar(ShaderEntry::SgdUpdate);
                 let mut pass = self.encoder.compute("sgd_update");
                 for (idx, &(param_buf, grad_buf)) in self.plan.param_grad_pairs.iter().enumerate() {
                     let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
@@ -4893,7 +4893,7 @@ impl Session {
             } else if let Some((lr, beta1, beta2, eps)) = self.pending_adam {
                 self.adam_step += 1;
                 let wd = self.adam_wd;
-                let pipeline = &self.pipelines.map[&ShaderEntry::AdamUpdate];
+                let pipeline = self.pipelines.scalar(ShaderEntry::AdamUpdate);
                 let mut pass = self.encoder.compute("adam_update");
                 for (idx, &(param_buf, grad_buf)) in self.plan.param_grad_pairs.iter().enumerate() {
                     let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
@@ -6165,7 +6165,7 @@ impl Session {
 
         // All SGD updates are independent (different param/grad buffers),
         // so they share a single compute pass — no barriers between them.
-        let pipeline = &self.pipelines.map[&ShaderEntry::SgdUpdate];
+        let pipeline = self.pipelines.scalar(ShaderEntry::SgdUpdate);
         let mut pass = self.encoder.compute("sgd_update");
         for &(param_buf, grad_buf) in &self.plan.param_grad_pairs {
             let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
@@ -6365,7 +6365,7 @@ impl Session {
         self.encoder.start();
         self.drain_gpu_timings();
 
-        let pipeline = &self.pipelines.map[&ShaderEntry::AdamUpdate];
+        let pipeline = self.pipelines.scalar(ShaderEntry::AdamUpdate);
         let mut pass = self.encoder.compute("adam_update");
         for (idx, &(param_buf, grad_buf)) in self.plan.param_grad_pairs.iter().enumerate() {
             let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
@@ -6855,33 +6855,6 @@ impl Drop for Session {
         self.wait();
         self.gpu.destroy_command_encoder(&mut self.encoder);
         for pipeline in self.pipelines.map.values_mut() {
-            self.gpu.destroy_compute_pipeline(pipeline);
-        }
-        for pipeline in self.pipelines.coop_map.values_mut() {
-            self.gpu.destroy_compute_pipeline(pipeline);
-        }
-        for pipeline in self.pipelines.small_map.values_mut() {
-            self.gpu.destroy_compute_pipeline(pipeline);
-        }
-        for pipeline in self.pipelines.weight_map.values_mut() {
-            self.gpu.destroy_compute_pipeline(pipeline);
-        }
-        for pipeline in self.pipelines.attention_map.values_mut() {
-            self.gpu.destroy_compute_pipeline(pipeline);
-        }
-        for pipeline in self.pipelines.epilogue_map.values_mut() {
-            self.gpu.destroy_compute_pipeline(pipeline);
-        }
-        for pipeline in self.pipelines.coop_epilogue_map.values_mut() {
-            self.gpu.destroy_compute_pipeline(pipeline);
-        }
-        for pipeline in self.pipelines.prologue_map.values_mut() {
-            self.gpu.destroy_compute_pipeline(pipeline);
-        }
-        for pipeline in self.pipelines.pointwise_map.values_mut() {
-            self.gpu.destroy_compute_pipeline(pipeline);
-        }
-        for pipeline in self.pipelines.reduction_map.values_mut() {
             self.gpu.destroy_compute_pipeline(pipeline);
         }
         // `buffers` holds aliased copies of these handles; destroy each
