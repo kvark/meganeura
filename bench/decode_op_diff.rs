@@ -5,8 +5,9 @@
 //! comparison disagrees this says which op is responsible, and it is cheap
 //! enough to run as a gate on kernel changes.
 //!
-//! It currently reports `embedding f16` returning zeros — a real defect in
-//! the f16 embedding path, left visible rather than skipped.
+//! It caught the f16 embedding silently returning zeros: `g.embedding`
+//! never checked the table's dtype, so an f16 table selected the f32
+//! kernel. Keep new ops represented here.
 //!
 //! Usage: MEGANEURA_DEVICE_ID=<id> cargo run --release --example decode_op_diff
 

@@ -3041,8 +3041,10 @@ impl Session {
     /// Stable descriptive key for the pipeline selected by each plan
     /// dispatch, in dispatch order.
     ///
-    /// Keys distinguish scalar, cooperative, small-tile, reduced-weight,
-    /// generated pointwise/reduction, attention-width, and epilogue variants.
+    /// One key per [`Variant`], so the key names the pipeline that will
+    /// actually run: scalar, cooperative, small-tile, reduced-weight,
+    /// fused RmsNorm, fused epilogue or prologue, attention width, or a
+    /// generated pointwise/reduction kernel.
     pub fn dispatch_pipeline_keys(&self) -> Vec<String> {
         self.plan
             .dispatches
