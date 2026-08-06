@@ -858,7 +858,6 @@ impl Pipelines {
         plan: &ExecutionPlan,
         coop_config: Option<&crate::codegen::CoopConfig>,
     ) -> Self {
-        use crate::codegen::ShaderGroup;
         use blade_graphics as bg;
 
         // Generated attention kernels must agree with the plan's dispatch
@@ -867,6 +866,7 @@ impl Pipelines {
 
         // Collect which shader groups are needed.
         // For matmul entries, compile BOTH scalar and coop if any dispatch uses coop.
+        use crate::codegen::ShaderGroup;
         let mut needed: HashSet<ShaderGroup> = HashSet::new();
         let mut needed_coop: HashSet<ShaderGroup> = HashSet::new();
         let mut needed_weighted: HashMap<crate::compile::WeightFormat, HashSet<ShaderGroup>> =
@@ -920,25 +920,19 @@ impl Pipelines {
                     .or_default()
                     .insert(dispatch.shader.clone());
             }
-            if dispatch.use_coop {
-                let coop_group = match group {
-                    ShaderGroup::MatMul => ShaderGroup::MatMulCoop,
-                    ShaderGroup::MatMulAdd => ShaderGroup::MatMulCoopAdd,
-                    ShaderGroup::MatMulAT => ShaderGroup::MatMulCoopAT,
-                    ShaderGroup::MatMulBT => ShaderGroup::MatMulCoopBT,
-                    ShaderGroup::Conv2dGemm | ShaderGroup::Conv2dGemmCoop => {
-                        ShaderGroup::Conv2dGemmCoop
-                    }
-                    ShaderGroup::Conv2dGradInputGemm | ShaderGroup::Conv2dGradInputGemmCoop => {
-                        ShaderGroup::Conv2dGradInputGemmCoop
-                    }
-                    _ => continue,
-                };
-                needed_coop.insert(coop_group);
-                entries_for_group
-                    .entry(coop_group)
-                    .or_default()
-                    .insert(dispatch.shader.clone());
+            // Cooperative execution is a modifier on the dispatch, so the
+            // group stays the scalar one and only the generated module
+            // differs. Conv2d is the exception: `select_variants` already
+            // rewrote those dispatches to their per-kernel generated
+            // entries, which carry their own group.
+            if dispatch.use_coop
+                && (crate::codegen::coop_shape(group).is_some()
+                    || matches!(
+                        group,
+                        ShaderGroup::Conv2dGemmCoop | ShaderGroup::Conv2dGradInputGemmCoop
+                    ))
+            {
+                needed_coop.insert(group);
             }
             if dispatch.weight_format.uses_reduced_storage() {
                 needed_weighted
@@ -1088,54 +1082,29 @@ impl Pipelines {
             });
             map.insert(Variant::Attention(entry, hd), pipeline);
         }
-        // Collect generated conv2d coop entries that need individual compilation.
+        // Conv2d coop dispatches were rewritten by `select_variants` to
+        // generated per-(kernel, stride) entries, compiled individually
+        // below. Every other cooperative group compiles from its own
+        // module, keyed by the same entry as its scalar form.
         let mut conv2d_gen_entries: Vec<ShaderEntry> = Vec::new();
         for &group in &needed_coop {
-            if let Some(config) = coop_config {
-                // Check if this group has generated conv2d entries that need
-                // per-kernel-config compilation.
-                let mut has_non_gen = false;
-                if let Some(entries) = entries_for_group.get(&group) {
-                    for entry in entries {
-                        if matches!(
-                            entry,
-                            ShaderEntry::Conv2dGemmCoopGen(..)
-                                | ShaderEntry::Conv2dGradInputGemmCoopGen(..)
-                        ) {
-                            conv2d_gen_entries.push(entry.clone());
-                        } else {
-                            has_non_gen = true;
-                        }
-                    }
-                }
-                // Compile the non-generated entries with the template-based path.
-                if has_non_gen {
-                    let sm = crate::codegen::generate_coop_module(group, config);
-                    let shader = gpu.create_shader(bg::ShaderDesc {
-                        source: &sm.source,
-                        naga_module: Some(sm.module),
-                    });
-                    if let Some(entries) = entries_for_group.get(&group) {
-                        for entry in entries {
-                            if matches!(
-                                entry,
-                                ShaderEntry::Conv2dGemmCoopGen(..)
-                                    | ShaderEntry::Conv2dGradInputGemmCoopGen(..)
-                            ) {
-                                continue;
-                            }
-                            let layout = shader_data_layout(entry);
-                            let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                                name: entry.entry_point(),
-                                data_layouts: &[&layout],
-                                compute: shader.at(entry.entry_point()),
-                            });
-                            map.insert(Variant::Coop(entry.clone()), pipeline);
-                        }
-                    }
-                }
-            } else {
-                compile_group(group, &Variant::Coop, &mut map);
+            let is_conv_gen = matches!(
+                group,
+                ShaderGroup::Conv2dGemmCoop | ShaderGroup::Conv2dGradInputGemmCoop
+            );
+            match (coop_config, is_conv_gen) {
+                (Some(config), false) => compile_variant(
+                    crate::codegen::generate_module_coop(group, config),
+                    group,
+                    &Variant::Coop,
+                    &mut map,
+                ),
+                (Some(_), true) => conv2d_gen_entries
+                    .extend(entries_for_group.get(&group).into_iter().flatten().cloned()),
+                // A deserialized plan can carry `use_coop` from a machine
+                // whose capabilities this one lacks. The scalar kernel
+                // computes the same thing.
+                (None, _) => compile_group(group, &Variant::Coop, &mut map),
             }
         }
         // Compile generated conv2d coop kernels individually.
@@ -1272,30 +1241,9 @@ impl Pipelines {
                     continue;
                 }
                 let group = dispatch.shader.shader_group();
-                let variant = match group {
-                    ShaderGroup::MatMul | ShaderGroup::MatMulCoop => {
-                        crate::codegen::MatMulCoopVariant::Normal
-                    }
-                    ShaderGroup::MatMulAdd | ShaderGroup::MatMulCoopAdd => {
-                        crate::codegen::MatMulCoopVariant::Normal
-                    }
-                    ShaderGroup::MatMulAT | ShaderGroup::MatMulCoopAT => {
-                        crate::codegen::MatMulCoopVariant::AT
-                    }
-                    ShaderGroup::MatMulATAdd => crate::codegen::MatMulCoopVariant::AT,
-                    ShaderGroup::MatMulBT | ShaderGroup::MatMulCoopBT => {
-                        crate::codegen::MatMulCoopVariant::BT
-                    }
-                    ShaderGroup::MatMulBTAdd => crate::codegen::MatMulCoopVariant::BT,
-                    _ => continue,
+                let Some((fused_add, variant)) = crate::codegen::coop_shape(group) else {
+                    continue;
                 };
-                let fused_add = matches!(
-                    group,
-                    ShaderGroup::MatMulAdd
-                        | ShaderGroup::MatMulCoopAdd
-                        | ShaderGroup::MatMulATAdd
-                        | ShaderGroup::MatMulBTAdd
-                );
                 let sm = crate::codegen::gen_matmul_coop_with_prologue(
                     fused_add, variant, coop_cfg, prologue,
                 );
@@ -2346,7 +2294,7 @@ impl Session {
         use crate::codegen::ShaderGroup;
         use blade_graphics as bg;
 
-        let sm = crate::codegen::generate_coop_module(ShaderGroup::MatMulCoop, config);
+        let sm = crate::codegen::generate_module_coop(ShaderGroup::MatMul, config);
         let shader = match gpu.try_create_shader(bg::ShaderDesc {
             source: &sm.source,
             naga_module: Some(sm.module),
@@ -3913,21 +3861,13 @@ impl Session {
     /// Budget: `2 + 5` steps per family plus a shared baseline — well under
     /// a second for transformer-class plans on discrete GPUs.
     pub fn tune(&mut self) -> Vec<TuneOutcome> {
-        use crate::codegen::ShaderGroup;
         let matmul_family = |d: &Dispatch| {
             d.use_coop
                 && d.scalar_fallback.is_some()
                 && d.matmul_prologue.is_none()
                 && d.matmul_epilogue.is_none()
                 && d.epilogue.is_empty()
-                && matches!(
-                    d.shader.shader_group(),
-                    ShaderGroup::MatMulCoop
-                        | ShaderGroup::MatMul
-                        | ShaderGroup::MatMulAdd
-                        | ShaderGroup::MatMulAT
-                        | ShaderGroup::MatMulBT
-                )
+                && crate::codegen::coop_shape(d.shader.shader_group()).is_some()
         };
         let conv_family = |d: &Dispatch| {
             d.use_coop
