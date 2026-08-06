@@ -196,7 +196,6 @@ pub enum Op {
     // inputs: [indices (U32), table (F32)]
     Embedding,
     // inputs: [indices (U32), table (F16)] → f32 output. f16-table gather.
-    EmbeddingF16,
     // input: [x (F32)] → f16. Cast f32→f16; backward = identity.
     ToF16,
 
@@ -1282,7 +1281,7 @@ impl Graph {
         let seq_len = idx_shape[0];
         let hidden = tbl.ty.shape[1];
         let ty = TensorType::f32(vec![seq_len, hidden]);
-        self.add_node(Op::EmbeddingF16, vec![indices, table], ty)
+        self.add_node(Op::Embedding, vec![indices, table], ty)
     }
 
     /// Scatter-add: accumulate `src[i]` rows into `output[indices[i]]`.

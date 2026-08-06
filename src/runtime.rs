@@ -1712,7 +1712,6 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::Transpose => TransposeData::layout(),
         ShaderEntry::RmsNorm => RmsNormData::layout(),
         ShaderEntry::Embedding => EmbeddingData::layout(),
-        ShaderEntry::EmbeddingF16 => EmbeddingData::layout(),
         ShaderEntry::ToF16 => UnaryData::layout(),
         ShaderEntry::RoPE | ShaderEntry::RoPEGrad => RoPEData::layout(),
         ShaderEntry::Gelu => UnaryData::layout(),
@@ -5228,7 +5227,7 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::Embedding | ShaderEntry::EmbeddingF16 => {
+            ShaderEntry::Embedding => {
                 pc.bind(
                     0,
                     &EmbeddingData {

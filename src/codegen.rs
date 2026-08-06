@@ -366,7 +366,6 @@ pub enum ShaderGroup {
     CrossEntropy,
     RmsNorm,
     Embedding,
-    EmbeddingF16,
     ToF16,
     RoPE,
     RoPEGrad,
@@ -469,7 +468,6 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::CrossEntropy => parse_wgsl(include_str!("shaders/cross_entropy.wgsl")),
         ShaderGroup::RmsNorm => parse_wgsl(include_str!("shaders/rms_norm.wgsl")),
         ShaderGroup::Embedding => parse_wgsl(include_str!("shaders/embedding.wgsl")),
-        ShaderGroup::EmbeddingF16 => parse_wgsl(include_str!("shaders/embedding_f16.wgsl")),
         ShaderGroup::ToF16 => parse_wgsl(include_str!("shaders/to_f16.wgsl")),
         ShaderGroup::RoPE => parse_wgsl(include_str!("shaders/rope.wgsl")),
         ShaderGroup::RoPEGrad => parse_wgsl(include_str!("shaders/rope_grad.wgsl")),
@@ -599,7 +597,7 @@ pub fn generate_wgsl(group: ShaderGroup) -> String {
             naga::valid::Capabilities::COOPERATIVE_MATRIX
                 | naga::valid::Capabilities::SHADER_FLOAT16
         }
-        ShaderGroup::EmbeddingF16 | ShaderGroup::ToF16 => naga::valid::Capabilities::SHADER_FLOAT16,
+        ShaderGroup::ToF16 => naga::valid::Capabilities::SHADER_FLOAT16,
         _ => naga::valid::Capabilities::empty(),
     };
     module_to_wgsl(&sm.module, capabilities)
@@ -1282,6 +1280,11 @@ pub fn generate_module_weighted(group: ShaderGroup, format: WeightFormat) -> Sha
             " + src[idx]",
             mode,
         ),
+        // The f16 embedding is a variant of the same gather, selected by the
+        // table's dtype rather than by a separate op and shader group.
+        ShaderGroup::Embedding if mode == WeightFormat::F16 => {
+            parse_wgsl(include_str!("shaders/embedding_f16.wgsl"))
+        }
         ShaderGroup::MatMulGemv | ShaderGroup::MatMulGemvBT if mode == WeightFormat::F16 => {
             if group == ShaderGroup::MatMulGemv {
                 gen_matmul_gemv_f16()
@@ -4961,10 +4964,6 @@ mod tests {
             (ShaderGroup::RmsNorm, naga::valid::Capabilities::empty()),
             (ShaderGroup::Embedding, naga::valid::Capabilities::empty()),
             (
-                ShaderGroup::EmbeddingF16,
-                naga::valid::Capabilities::SHADER_FLOAT16,
-            ),
-            (
                 ShaderGroup::ToF16,
                 naga::valid::Capabilities::SHADER_FLOAT16,
             ),
@@ -5210,7 +5209,6 @@ mod tests {
             (ShaderGroup::CrossEntropy, empty),
             (ShaderGroup::RmsNorm, empty),
             (ShaderGroup::Embedding, empty),
-            (ShaderGroup::EmbeddingF16, f16),
             (ShaderGroup::ToF16, f16),
             (ShaderGroup::RoPE, empty),
             (ShaderGroup::RoPEGrad, empty),
@@ -5358,7 +5356,6 @@ mod tests {
                 ShaderEntry::Transpose => vec!["src", "dst", "params"],
                 ShaderEntry::RmsNorm => vec!["src", "bias", "dst", "params"],
                 ShaderEntry::Embedding => vec!["indices", "src", "dst", "params"],
-                ShaderEntry::EmbeddingF16 => vec!["indices", "src", "dst", "params"],
                 ShaderEntry::ToF16 => vec!["src", "dst", "params"],
                 ShaderEntry::LayerNorm => vec!["src", "src_b", "bias", "dst", "params"],
                 ShaderEntry::MultiHeadAttn
