@@ -1287,9 +1287,9 @@ fn fuse_pointwise_chains(plan: &mut ExecutionPlan) {
             // arity. The runtime binds via UnaryData for n=1, BinaryData
             // for n=2; arities >2 would need a wider layout we don't yet
             // plumb. Guard against that.
-            // Update the sentinel `shader` so the (legacy) pipeline-map
+            // Update the sentinel `shader` so the (legacy) pipeline
             // lookup still resolves — actual binding/pipeline come from
-            // `pointwise`/`pointwise_map` via DAG arity.
+            // the `pointwise` DAG's arity.
             let new_arity = consumer_d.input_buffers.len();
             consumer_d.shader = match new_arity {
                 1 => ShaderEntry::Relu,
