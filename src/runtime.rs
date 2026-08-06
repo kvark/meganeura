@@ -826,6 +826,7 @@ impl Pipelines {
         let mut needed_coop: HashSet<ShaderGroup> = HashSet::new();
         let mut needed_weighted: HashMap<crate::compile::WeightFormat, HashSet<ShaderGroup>> =
             HashMap::new();
+        let mut needed_small: HashSet<ShaderGroup> = HashSet::new();
         let mut entries_for_group: HashMap<ShaderGroup, HashSet<ShaderEntry>> = HashMap::new();
         let mut attention_entries: HashSet<(ShaderEntry, u32)> = HashSet::new();
 
@@ -868,16 +869,9 @@ impl Pipelines {
                 attention_entries.insert((dispatch.shader.clone(), dispatch.params[3]));
             }
             if dispatch.use_small_tiles {
-                let small_group = match group {
-                    ShaderGroup::MatMul => ShaderGroup::MatMulSmall,
-                    ShaderGroup::MatMulAdd => ShaderGroup::MatMulSmallAdd,
-                    ShaderGroup::MatMulAT => ShaderGroup::MatMulSmallAT,
-                    ShaderGroup::MatMulBT => ShaderGroup::MatMulSmallBT,
-                    _ => continue,
-                };
-                needed.insert(small_group);
+                needed_small.insert(group);
                 entries_for_group
-                    .entry(small_group)
+                    .entry(group)
                     .or_default()
                     .insert(dispatch.shader.clone());
             }
@@ -956,10 +950,13 @@ impl Pipelines {
         let mut coop_map = HashMap::new();
         let mut small_map = HashMap::new();
 
-        let compile_group =
-            |group: ShaderGroup,
+        // One place that turns a generated module into pipelines for the
+        // entries of a group. Every modifier axis - base, small tile, coop,
+        // fused RmsNorm - differs only in which module it hands over.
+        let compile_variant =
+            |sm: crate::codegen::ShaderModule,
+             group: ShaderGroup,
              target: &mut HashMap<ShaderEntry, blade_graphics::ComputePipeline>| {
-                let sm = crate::codegen::generate_module(group);
                 let shader = gpu.create_shader(bg::ShaderDesc {
                     source: &sm.source,
                     naga_module: Some(sm.module),
@@ -976,20 +973,22 @@ impl Pipelines {
                     }
                 }
             };
+        let compile_group =
+            |group: ShaderGroup,
+             target: &mut HashMap<ShaderEntry, blade_graphics::ComputePipeline>| {
+                compile_variant(crate::codegen::generate_module(group), group, target);
+            };
 
-        let small_tile_groups: HashSet<ShaderGroup> = [
-            ShaderGroup::MatMulSmall,
-            ShaderGroup::MatMulSmallAdd,
-            ShaderGroup::MatMulSmallAT,
-            ShaderGroup::MatMulSmallBT,
-        ]
-        .into_iter()
-        .collect();
+        for &group in &needed_small {
+            compile_variant(
+                crate::codegen::generate_module_small(group),
+                group,
+                &mut small_map,
+            );
+        }
 
         for &group in &needed {
-            if small_tile_groups.contains(&group) {
-                compile_group(group, &mut small_map);
-            } else if matches!(
+            if matches!(
                 group,
                 ShaderGroup::MultiHeadAttn
                     | ShaderGroup::FlashAttention

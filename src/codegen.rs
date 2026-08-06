@@ -344,10 +344,6 @@ pub enum ShaderGroup {
     MatMulBT,
     MatMulATAdd,
     MatMulBTAdd,
-    MatMulSmall,
-    MatMulSmallAdd,
-    MatMulSmallAT,
-    MatMulSmallBT,
     /// M=1 matmul (GEMV): `C[1,N] = A[1,K] × B[K,N]`. One thread per
     /// output column; dispatched for batch-1 decode on transformers.
     MatMulGemv,
@@ -454,10 +450,6 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::MatMulBT => gen_matmul_bt(),
         ShaderGroup::MatMulATAdd => gen_matmul_at_add(),
         ShaderGroup::MatMulBTAdd => gen_matmul_bt_add(),
-        ShaderGroup::MatMulSmall => gen_matmul_small(),
-        ShaderGroup::MatMulSmallAdd => gen_matmul_small_add(),
-        ShaderGroup::MatMulSmallAT => gen_matmul_small_at(),
-        ShaderGroup::MatMulSmallBT => gen_matmul_small_bt(),
         ShaderGroup::MatMulGemv => parse_wgsl(include_str!("shaders/matmul_gemv.wgsl")),
         ShaderGroup::MatMulGemvAdd => parse_wgsl(include_str!("shaders/matmul_gemv_add.wgsl")),
         ShaderGroup::MatMulGemvBT => parse_wgsl(include_str!("shaders/matmul_gemv_bt.wgsl")),
@@ -1217,6 +1209,21 @@ fn gen_matmul_at() -> ShaderModule {
 /// Generate a matmul module with f16 weight (B) storage.
 /// Returns a module containing all matmul variants (Normal, AT, BT)
 /// Generate a matmul module for the given weight storage format.
+/// Generate the 32x32 small-tile form of a matmul group.
+///
+/// Tiling is a modifier on the matmul groups, like weight format: the
+/// dispatch carries `use_small_tiles` and the pipeline is picked from it,
+/// so the tiling does not multiply the group enum.
+pub fn generate_module_small(group: ShaderGroup) -> ShaderModule {
+    match group {
+        ShaderGroup::MatMul => gen_matmul_small(),
+        ShaderGroup::MatMulAdd => gen_matmul_small_add(),
+        ShaderGroup::MatMulAT => gen_matmul_small_at(),
+        ShaderGroup::MatMulBT => gen_matmul_small_bt(),
+        _ => generate_module(group),
+    }
+}
+
 pub fn generate_module_weighted(group: ShaderGroup, format: WeightFormat) -> ShaderModule {
     let mode = format;
     match group {
