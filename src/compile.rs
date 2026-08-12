@@ -142,7 +142,6 @@ pub enum ShaderEntry {
     Abs,
     Log,
     Recip,
-    Exp,
     Materialize,
     Add,
     Mul,
@@ -373,7 +372,6 @@ impl ShaderEntry {
             | ShaderEntry::Abs
             | ShaderEntry::Log
             | ShaderEntry::Recip
-            | ShaderEntry::Exp
             | ShaderEntry::Add
             | ShaderEntry::Mul
             | ShaderEntry::Greater
@@ -413,7 +411,6 @@ impl ShaderEntry {
             | ShaderEntry::Abs
             | ShaderEntry::Log
             | ShaderEntry::Recip
-            | ShaderEntry::Exp
             | ShaderEntry::Materialize => ShaderGroup::Unary,
             ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater => ShaderGroup::Binary,
             ShaderEntry::BiasAdd => ShaderGroup::BiasAdd,
@@ -531,7 +528,6 @@ impl ShaderEntry {
             ShaderEntry::Abs => "abs_",
             ShaderEntry::Log => "log_",
             ShaderEntry::Recip => "recip",
-            ShaderEntry::Exp => "exp_",
             ShaderEntry::Materialize => "materialize",
             ShaderEntry::Add => "add",
             ShaderEntry::Mul => "mul",
@@ -2083,7 +2079,6 @@ fn unary_shader_to_pointwise(shader: &ShaderEntry) -> Option<PointwiseDAG> {
         ShaderEntry::Abs => Pw::Abs(0),
         ShaderEntry::Log => Pw::Log(0),
         ShaderEntry::Recip => Pw::Recip(0),
-        ShaderEntry::Exp => Pw::Exp(0),
         ShaderEntry::Silu => Pw::Silu(0),
         ShaderEntry::Gelu => {
             // Tanh-approx GELU, bit-matching unary.wgsl's `gelu` entry:
@@ -2844,7 +2839,7 @@ impl<'a> Compiler<'a> {
                 self.emit_unary(ShaderEntry::Recip, node, out_buf);
             }
             Op::Exp => {
-                self.emit_unary(ShaderEntry::Exp, node, out_buf);
+                self.emit_generated_unary(Pw::Exp(0), node, out_buf);
             }
             Op::Softplus { beta } => {
                 let input = self.get_buffer(node.inputs[0]);
@@ -5355,6 +5350,27 @@ impl<'a> Compiler<'a> {
         });
     }
 
+    fn emit_generated_unary(&mut self, op: Pw, node: &Node, out_buf: BufferRef) {
+        let input = self.get_buffer(node.inputs[0]);
+        let len = node.ty.num_elements() as u32;
+        self.plan.dispatches.push(Dispatch {
+            shader: ShaderEntry::Relu,
+            workgroups: [len.div_ceil(256), 1, 1],
+            input_buffers: vec![input],
+            output_buffer: out_buf,
+            extra_outputs: vec![],
+            params: vec![len, 0, 0, 0],
+            use_coop: false,
+            use_small_tiles: false,
+            pointwise: Some(PointwiseDAG {
+                n_inputs: 1,
+                ops: vec![Pw::LoadInput(0), op],
+                output: 1,
+            }),
+            ..Default::default()
+        });
+    }
+
     fn emit_unary(&mut self, shader: ShaderEntry, node: &Node, out_buf: BufferRef) {
         let input = self.get_buffer(node.inputs[0]);
         let len = node.ty.num_elements() as u32;
@@ -5453,7 +5469,8 @@ mod tests {
         assert_eq!(plan.dispatches[0].shader, ShaderEntry::Relu);
         assert_eq!(plan.dispatches[1].shader, ShaderEntry::Sigmoid);
         assert_eq!(plan.dispatches[2].shader, ShaderEntry::Neg);
-        assert_eq!(plan.dispatches[3].shader, ShaderEntry::Exp);
+        assert_eq!(plan.dispatches[3].shader, ShaderEntry::Relu);
+        assert!(plan.dispatches[3].pointwise.is_some());
         // All unary ops: params = [len, 0, 0, 0]
         for d in &plan.dispatches {
             assert_eq!(d.params[0], 32); // 4*8
