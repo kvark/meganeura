@@ -1,5 +1,5 @@
 use crate::graph::{DType, Graph, Node, NodeId, Op};
-use crate::schedule::{PointwiseDAG, Pw, ReductionKernel};
+use crate::schedule::{PointwiseDAG, Pw, ReductionEpilogue, ReductionKernel};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -244,15 +244,10 @@ pub enum ShaderEntry {
     GlobalAvgPool,
     GlobalAvgPoolGrad,
     BroadcastInner,
-    NormalizeInnerSum,
-    NormalizeInnerSumGrad,
     TileInner,
     TileInnerGrad,
-    PairwiseSquaredDistance,
     PairwiseSquaredDistanceGradLeft,
     PairwiseSquaredDistanceGradRight,
-    PairwiseVectorRejection,
-    PairwiseVectorRejectionGradVectors,
     PairwiseVectorRejectionGradDirections,
     WinogradInputTransform,
     WinogradOutputTransform,
@@ -342,13 +337,8 @@ impl ShaderEntry {
             | ShaderEntry::GroupNormGradWeightBias
             | ShaderEntry::GlobalAvgPool
             | ShaderEntry::GlobalAvgPoolGrad
-            | ShaderEntry::NormalizeInnerSum
-            | ShaderEntry::NormalizeInnerSumGrad
-            | ShaderEntry::PairwiseSquaredDistance
             | ShaderEntry::PairwiseSquaredDistanceGradLeft
             | ShaderEntry::PairwiseSquaredDistanceGradRight
-            | ShaderEntry::PairwiseVectorRejection
-            | ShaderEntry::PairwiseVectorRejectionGradVectors
             | ShaderEntry::PairwiseVectorRejectionGradDirections => "normalization_reduction",
 
             ShaderEntry::SgdUpdate
@@ -498,18 +488,9 @@ impl ShaderEntry {
             | ShaderEntry::BroadcastInner
             | ShaderEntry::TileInner
             | ShaderEntry::TileInnerGrad => ShaderGroup::GlobalAvgPoolGrad,
-            ShaderEntry::NormalizeInnerSum => ShaderGroup::NormalizeInnerSum,
-            ShaderEntry::NormalizeInnerSumGrad => ShaderGroup::NormalizeInnerSumGrad,
-            ShaderEntry::PairwiseSquaredDistance => ShaderGroup::PairwiseSquaredDistance,
             ShaderEntry::PairwiseSquaredDistanceGradLeft
-            | ShaderEntry::PairwiseSquaredDistanceGradRight => {
-                ShaderGroup::PairwiseSquaredDistanceGrad
-            }
-            ShaderEntry::PairwiseVectorRejection => ShaderGroup::PairwiseVectorRejection,
-            ShaderEntry::PairwiseVectorRejectionGradVectors
-            | ShaderEntry::PairwiseVectorRejectionGradDirections => {
-                ShaderGroup::PairwiseVectorRejectionGrad
-            }
+            | ShaderEntry::PairwiseSquaredDistanceGradRight
+            | ShaderEntry::PairwiseVectorRejectionGradDirections => ShaderGroup::PairwiseGrad,
             ShaderEntry::WinogradInputTransform => ShaderGroup::WinogradInputTransform,
             ShaderEntry::WinogradOutputTransform => ShaderGroup::WinogradOutputTransform,
             ShaderEntry::WinogradBatchedMatMul => ShaderGroup::WinogradBatchedMatMul,
@@ -615,14 +596,10 @@ impl ShaderEntry {
             ShaderEntry::GlobalAvgPool => "global_avg_pool",
             ShaderEntry::GlobalAvgPoolGrad => "main",
             ShaderEntry::BroadcastInner => "broadcast_inner",
-            ShaderEntry::NormalizeInnerSum | ShaderEntry::NormalizeInnerSumGrad => "main",
             ShaderEntry::TileInner => "tile_inner",
             ShaderEntry::TileInnerGrad => "tile_inner_grad",
-            ShaderEntry::PairwiseSquaredDistance => "main",
             ShaderEntry::PairwiseSquaredDistanceGradLeft => "grad_left",
             ShaderEntry::PairwiseSquaredDistanceGradRight => "grad_right",
-            ShaderEntry::PairwiseVectorRejection => "main",
-            ShaderEntry::PairwiseVectorRejectionGradVectors => "grad_vectors",
             ShaderEntry::PairwiseVectorRejectionGradDirections => "grad_directions",
             ShaderEntry::WinogradInputTransform
             | ShaderEntry::WinogradOutputTransform
@@ -765,6 +742,7 @@ fn group_norm_stats_kernel() -> crate::schedule::ReductionKernel {
         workgroup_size: 256,
         rows_per_workgroup: 1,
         gather_elem: Vec::new(),
+        input_row_repeats: Vec::new(),
     }
 }
 
@@ -1375,6 +1353,9 @@ fn shared_pointwise_consumers_are_foldable(
         let Some(ref kernel) = dispatch.reduction else {
             return false;
         };
+        if kernel.input_row_repeats.iter().any(|&factor| factor != 1) {
+            return false;
+        }
         let per_elem = kernel.n_per_elem as usize;
         let input_index = dispatch
             .input_buffers
@@ -1421,6 +1402,9 @@ fn shared_embedding_consumers_are_foldable(
         let Some(ref kernel) = dispatch.reduction else {
             return false;
         };
+        if kernel.input_row_repeats.iter().any(|&factor| factor != 1) {
+            return false;
+        }
         if dispatch.params.first().copied() != Some(outer)
             || dispatch.params.get(1).copied() != Some(inner)
         {
@@ -1525,7 +1509,9 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
             };
             // Phase 1 invariant: no gather streams yet, so input_buffers
             // is 1:1 with prologue inputs (per-elem first, then per-row).
-            if kernel.gather_elem.iter().any(|&g| g) {
+            if kernel.gather_elem.iter().any(|&g| g)
+                || kernel.input_row_repeats.iter().any(|&factor| factor != 1)
+            {
                 continue;
             }
             let outer = c.params[0];
@@ -1569,6 +1555,9 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                 let c = &mut plan.dispatches[ci];
                 let kernel = c.reduction.as_mut().expect("checked");
                 kernel.prologue = kernel.prologue.fuse_input(s as u8, &p_dag);
+                for prologue in &mut kernel.extra_prologues {
+                    *prologue = prologue.fuse_input(s as u8, &p_dag);
+                }
                 // The reduction epilogue sees the same per-element streams
                 // before its per-column and reduced-value inputs. If it
                 // references the folded stream, expand that input there as
@@ -1612,6 +1601,9 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
             let Some(kernel) = c.reduction.as_ref() else {
                 continue;
             };
+            if kernel.input_row_repeats.iter().any(|&factor| factor != 1) {
+                continue;
+            }
             let outer = c.params[0];
             let inner = c.params[1];
             let per_elem = kernel.n_per_elem as usize;
@@ -2317,10 +2309,22 @@ impl<'a> Compiler<'a> {
     }
 
     fn emit_sum_inner(&mut self, input: BufferRef, output: BufferRef, rows: u32, inner: u32) {
+        const WORKGROUP_SIZE: u32 = 256;
+        let rows_per_workgroup = if inner <= 32 { WORKGROUP_SIZE } else { 1 };
+        self.emit_sum_inner_with_rows_per_workgroup(input, output, rows, inner, rows_per_workgroup);
+    }
+
+    fn emit_sum_inner_with_rows_per_workgroup(
+        &mut self,
+        input: BufferRef,
+        output: BufferRef,
+        rows: u32,
+        inner: u32,
+        rows_per_workgroup: u32,
+    ) {
         use crate::schedule::ReduceOp;
 
         const WORKGROUP_SIZE: u32 = 256;
-        let rows_per_workgroup = if inner <= 32 { WORKGROUP_SIZE } else { 1 };
         let kernel = ReductionKernel {
             op: ReduceOp::Sum,
             prologue: PointwiseDAG {
@@ -2335,6 +2339,7 @@ impl<'a> Compiler<'a> {
             workgroup_size: WORKGROUP_SIZE,
             rows_per_workgroup,
             gather_elem: Vec::new(),
+            input_row_repeats: Vec::new(),
         };
         self.plan.dispatches.push(Dispatch {
             shader: ShaderEntry::Relu, // sentinel; routing is via `reduction`
@@ -3039,15 +3044,48 @@ impl<'a> Compiler<'a> {
                 let input = self.get_buffer(node.inputs[0]);
                 let rows = u32::try_from(node.ty.shape[0])
                     .expect("normalize_inner_sum row count exceeds u32");
+                let floor = Pw::const_f32(floor);
+                let kernel = ReductionKernel {
+                    op: crate::schedule::ReduceOp::Sum,
+                    prologue: PointwiseDAG {
+                        n_inputs: 1,
+                        ops: vec![Pw::LoadInput(0)],
+                        output: 0,
+                    },
+                    extra_prologues: vec![],
+                    epilogue: Some(ReductionEpilogue {
+                        dag: PointwiseDAG {
+                            n_inputs: 2,
+                            ops: vec![
+                                Pw::LoadInput(0),
+                                Pw::LoadInput(1),
+                                floor,
+                                Pw::Sub(1, 2),
+                                Pw::Relu(3),
+                                Pw::Add(4, 2),
+                                Pw::Div(0, 5),
+                            ],
+                            output: 6,
+                        },
+                        n_per_col_inputs: 0,
+                    }),
+                    n_per_elem: 1,
+                    n_per_row: 0,
+                    workgroup_size: 256,
+                    rows_per_workgroup: 256,
+                    gather_elem: vec![],
+                    input_row_repeats: vec![],
+                };
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::NormalizeInnerSum,
+                    shader: ShaderEntry::Relu,
                     workgroups: [rows.div_ceil(256), 1, 1],
                     input_buffers: vec![input],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
-                    params: vec![rows, inner, floor.to_bits(), 1.0_f32.to_bits()],
+                    params: vec![rows, inner, 1.0_f32.to_bits(), 0],
                     use_coop: false,
                     use_small_tiles: false,
+                    reduction: Some(kernel),
                     ..Default::default()
                 });
             }
@@ -3057,15 +3095,69 @@ impl<'a> Compiler<'a> {
                 let input = self.get_buffer(node.inputs[1]);
                 let rows = u32::try_from(node.ty.shape[0])
                     .expect("normalize_inner_sum gradient row count exceeds u32");
+                let sum = self.alloc_buffer(rows as usize * std::mem::size_of::<f32>());
+                self.emit_sum_inner_with_rows_per_workgroup(input, sum, rows, inner, 256);
+                let floor = Pw::const_f32(floor);
+                let kernel = ReductionKernel {
+                    op: crate::schedule::ReduceOp::Sum,
+                    prologue: PointwiseDAG {
+                        n_inputs: 3,
+                        ops: vec![
+                            Pw::LoadInput(0),
+                            Pw::LoadInput(1),
+                            Pw::LoadInput(2),
+                            floor.clone(),
+                            Pw::Sub(2, 3),
+                            Pw::Relu(4),
+                            Pw::Add(5, 3),
+                            Pw::Recip(6),
+                            Pw::Mul(7, 7),
+                            Pw::Neg(8),
+                            Pw::Mul(0, 1),
+                            Pw::Mul(10, 9),
+                            Pw::Greater(2, 3),
+                            Pw::Mul(11, 12),
+                        ],
+                        output: 13,
+                    },
+                    extra_prologues: vec![],
+                    epilogue: Some(ReductionEpilogue {
+                        dag: PointwiseDAG {
+                            n_inputs: 4,
+                            ops: vec![
+                                Pw::LoadInput(0),
+                                Pw::LoadInput(1),
+                                Pw::LoadInput(2),
+                                Pw::LoadInput(3),
+                                floor,
+                                Pw::Sub(2, 4),
+                                Pw::Relu(5),
+                                Pw::Add(6, 4),
+                                Pw::Recip(7),
+                                Pw::Mul(0, 8),
+                                Pw::Add(9, 3),
+                            ],
+                            output: 10,
+                        },
+                        n_per_col_inputs: 0,
+                    }),
+                    n_per_elem: 2,
+                    n_per_row: 1,
+                    workgroup_size: 256,
+                    rows_per_workgroup: 256,
+                    gather_elem: vec![],
+                    input_row_repeats: vec![],
+                };
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::NormalizeInnerSumGrad,
+                    shader: ShaderEntry::Relu,
                     workgroups: [rows.div_ceil(256), 1, 1],
-                    input_buffers: vec![grad_output, input],
+                    input_buffers: vec![grad_output, input, sum],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
-                    params: vec![rows, inner, floor.to_bits(), 1.0_f32.to_bits()],
+                    params: vec![rows, inner, 1.0_f32.to_bits(), 0],
                     use_coop: false,
                     use_small_tiles: false,
+                    reduction: Some(kernel),
                     ..Default::default()
                 });
             }
@@ -3113,15 +3205,37 @@ impl<'a> Compiler<'a> {
                     .expect("pairwise distance width exceeds u32");
                 let total = u32::try_from(node.ty.num_elements())
                     .expect("pairwise distance output element count exceeds u32");
+                let kernel = ReductionKernel {
+                    op: crate::schedule::ReduceOp::Sum,
+                    prologue: PointwiseDAG {
+                        n_inputs: 2,
+                        ops: vec![
+                            Pw::LoadInput(0),
+                            Pw::LoadInput(1),
+                            Pw::Sub(0, 1),
+                            Pw::Mul(2, 2),
+                        ],
+                        output: 3,
+                    },
+                    extra_prologues: vec![],
+                    epilogue: None,
+                    n_per_elem: 2,
+                    n_per_row: 0,
+                    workgroup_size: 256,
+                    rows_per_workgroup: 256,
+                    gather_elem: vec![],
+                    input_row_repeats: vec![pairs, 1],
+                };
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::PairwiseSquaredDistance,
+                    shader: ShaderEntry::Relu,
                     workgroups: [total.div_ceil(256), 1, 1],
                     input_buffers: vec![left, right],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
-                    params: vec![total, inner, pairs, 0],
+                    params: vec![total, inner, 1.0_f32.to_bits(), 0],
                     use_coop: false,
                     use_small_tiles: false,
+                    reduction: Some(kernel),
                     ..Default::default()
                 });
             }
@@ -3162,39 +3276,105 @@ impl<'a> Compiler<'a> {
                     .expect("pairwise vector width exceeds u32");
                 let vector_rows =
                     u32::try_from(node.ty.shape[0]).expect("pairwise vector row count exceeds u32");
+                let kernel = ReductionKernel {
+                    op: crate::schedule::ReduceOp::Sum,
+                    prologue: PointwiseDAG {
+                        n_inputs: 2,
+                        ops: vec![Pw::LoadInput(0), Pw::LoadInput(1), Pw::Mul(0, 1)],
+                        output: 2,
+                    },
+                    extra_prologues: vec![],
+                    epilogue: Some(ReductionEpilogue {
+                        dag: PointwiseDAG {
+                            n_inputs: 3,
+                            ops: vec![
+                                Pw::LoadInput(0),
+                                Pw::LoadInput(1),
+                                Pw::LoadInput(2),
+                                Pw::Mul(1, 2),
+                                Pw::Sub(0, 3),
+                            ],
+                            output: 4,
+                        },
+                        n_per_col_inputs: 0,
+                    }),
+                    n_per_elem: 2,
+                    n_per_row: 0,
+                    workgroup_size: 256,
+                    rows_per_workgroup: 256,
+                    gather_elem: vec![],
+                    input_row_repeats: vec![1, pairs],
+                };
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::PairwiseVectorRejection,
+                    shader: ShaderEntry::Relu,
                     workgroups: [vector_rows.div_ceil(256), 1, 1],
                     input_buffers: vec![vectors, directions],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
-                    params: vec![vector_rows, inner, pairs, 0],
+                    params: vec![vector_rows, inner, 1.0_f32.to_bits(), 0],
                     use_coop: false,
                     use_small_tiles: false,
+                    reduction: Some(kernel),
                     ..Default::default()
                 });
             }
 
-            Op::PairwiseVectorRejectionGradVectors { inner, pairs }
-            | Op::PairwiseVectorRejectionGradDirections { inner, pairs } => {
+            Op::PairwiseVectorRejectionGradVectors { inner, pairs } => {
+                let grad_output = self.get_buffer(node.inputs[0]);
+                let directions = self.get_buffer(node.inputs[2]);
+                let total = u32::try_from(node.ty.shape[0])
+                    .expect("pairwise vector gradient rows exceed u32");
+                let kernel = ReductionKernel {
+                    op: crate::schedule::ReduceOp::Sum,
+                    prologue: PointwiseDAG {
+                        n_inputs: 2,
+                        ops: vec![Pw::LoadInput(0), Pw::LoadInput(1), Pw::Mul(0, 1)],
+                        output: 2,
+                    },
+                    extra_prologues: vec![],
+                    epilogue: Some(ReductionEpilogue {
+                        dag: PointwiseDAG {
+                            n_inputs: 3,
+                            ops: vec![
+                                Pw::LoadInput(0),
+                                Pw::LoadInput(1),
+                                Pw::LoadInput(2),
+                                Pw::Mul(1, 2),
+                                Pw::Sub(0, 3),
+                            ],
+                            output: 4,
+                        },
+                        n_per_col_inputs: 0,
+                    }),
+                    n_per_elem: 2,
+                    n_per_row: 0,
+                    workgroup_size: 256,
+                    rows_per_workgroup: 256,
+                    gather_elem: vec![],
+                    input_row_repeats: vec![1, pairs],
+                };
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::Relu,
+                    workgroups: [total.div_ceil(256), 1, 1],
+                    input_buffers: vec![grad_output, directions],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![total, inner, 1.0_f32.to_bits(), 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    reduction: Some(kernel),
+                    ..Default::default()
+                });
+            }
+
+            Op::PairwiseVectorRejectionGradDirections { inner, pairs } => {
                 let grad_output = self.get_buffer(node.inputs[0]);
                 let vectors = self.get_buffer(node.inputs[1]);
                 let directions = self.get_buffer(node.inputs[2]);
-                let (shader, total) = match node.op {
-                    Op::PairwiseVectorRejectionGradVectors { .. } => (
-                        ShaderEntry::PairwiseVectorRejectionGradVectors,
-                        u32::try_from(node.ty.shape[0])
-                            .expect("pairwise vector gradient rows exceed u32"),
-                    ),
-                    Op::PairwiseVectorRejectionGradDirections { .. } => (
-                        ShaderEntry::PairwiseVectorRejectionGradDirections,
-                        u32::try_from(node.ty.num_elements())
-                            .expect("pairwise direction gradient size exceeds u32"),
-                    ),
-                    _ => unreachable!(),
-                };
+                let total = u32::try_from(node.ty.num_elements())
+                    .expect("pairwise direction gradient size exceeds u32");
                 self.plan.dispatches.push(Dispatch {
-                    shader,
+                    shader: ShaderEntry::PairwiseVectorRejectionGradDirections,
                     workgroups: [total.div_ceil(256), 1, 1],
                     input_buffers: vec![grad_output, vectors, directions],
                     output_buffer: out_buf,
@@ -4914,6 +5094,7 @@ impl<'a> Compiler<'a> {
             workgroup_size: WG,
             rows_per_workgroup: 1,
             gather_elem: Vec::new(),
+            input_row_repeats: Vec::new(),
         };
         self.plan.dispatches.push(Dispatch {
             // Sentinel shader for runtime data-layout selection (UnaryData).
@@ -4969,6 +5150,7 @@ impl<'a> Compiler<'a> {
             workgroup_size: WG,
             rows_per_workgroup: 1,
             gather_elem: Vec::new(),
+            input_row_repeats: Vec::new(),
         };
         self.plan.dispatches.push(Dispatch {
             // Sentinel for runtime data-layout: 1 per-elem + 1 per-row → 2
@@ -5065,6 +5247,7 @@ impl<'a> Compiler<'a> {
             workgroup_size: WG,
             rows_per_workgroup: 1,
             gather_elem: Vec::new(),
+            input_row_repeats: Vec::new(),
         };
 
         self.plan.dispatches.push(Dispatch {
@@ -5151,6 +5334,7 @@ impl<'a> Compiler<'a> {
             workgroup_size: WG,
             rows_per_workgroup,
             gather_elem: Vec::new(),
+            input_row_repeats: Vec::new(),
         };
 
         // Uses RmsNormData layout: src + bias (per-col weight) + dst + params.
