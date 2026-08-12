@@ -167,6 +167,9 @@ fn rms_norm_grad_x(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invoca
         stride >>= 1u;
     }
     let rsqrt_val = inverseSqrt(wg_data[0] / f32(cols) + eps);
+    // Every lane must capture the first reduction before wg_data is reused
+    // for the dot-product reduction below.
+    workgroupBarrier();
 
     // Phase 2: Compute s_i = (rsqrt^2 / cols) * sum_j(dy[j]*w[j]*x[j])
     var dot = 0.0;

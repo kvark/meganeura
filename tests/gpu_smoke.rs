@@ -361,9 +361,7 @@ fn narrow_rms_norm_matches_cpu_forward_and_grad_x() {
 
 #[test]
 fn smolvla_training_backprop_smoke() {
-    // MHA backward shaders produce incorrect gradients on lavapipe (software Vulkan).
-    // The workgroup shared memory reductions give wrong results when multiple reductions
-    // reuse the same wg array in a single shader invocation. Works correctly on real GPUs.
+    // GPU-less validation jobs may opt out of the full model backpropagation test.
     if std::env::var("MEGANEURA_SKIP_BACKPROP").unwrap_or_default() == "1" {
         eprintln!("MEGANEURA_SKIP_BACKPROP set — skipping MHA backward test");
         return;
