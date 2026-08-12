@@ -1790,7 +1790,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::CachedAttention => CachedAttentionData::layout(),
         ShaderEntry::MaxPool2d => MaxPool2dData::layout(),
         ShaderEntry::GlobalAvgPool => GlobalAvgPoolData::layout(),
-        ShaderEntry::GlobalAvgPoolGrad | ShaderEntry::BroadcastInner => UnaryData::layout(),
+        ShaderEntry::GlobalAvgPoolGrad => UnaryData::layout(),
         ShaderEntry::WinogradInputTransform
         | ShaderEntry::WinogradOutputTransform
         | ShaderEntry::WinogradWeightTransform => WinogradTransformData::layout(),
@@ -6145,7 +6145,7 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::GlobalAvgPoolGrad | ShaderEntry::BroadcastInner => {
+            ShaderEntry::GlobalAvgPoolGrad => {
                 let p = &dispatch.params;
                 pc.bind(
                     0,
