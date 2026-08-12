@@ -5071,7 +5071,6 @@ mod tests {
             .map(|ep| ep.name.as_str())
             .collect();
         assert!(names.contains(&"relu"), "missing relu");
-        assert!(names.contains(&"materialize"), "missing materialize");
         assert!(names.contains(&"sigmoid"), "missing sigmoid");
         assert!(names.contains(&"neg"), "missing neg");
         assert!(names.contains(&"silu"), "missing silu");
@@ -5358,7 +5357,6 @@ mod tests {
                 | ShaderEntry::Abs
                 | ShaderEntry::Log
                 | ShaderEntry::Recip
-                | ShaderEntry::Materialize
                 | ShaderEntry::Silu
                 | ShaderEntry::Gelu
                 | ShaderEntry::Tanh
@@ -5507,7 +5505,6 @@ mod tests {
             ShaderEntry::Abs,
             ShaderEntry::Log,
             ShaderEntry::Recip,
-            ShaderEntry::Materialize,
             ShaderEntry::Add,
             ShaderEntry::Mul,
             ShaderEntry::Greater,
