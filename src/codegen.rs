@@ -432,12 +432,7 @@ pub enum ShaderGroup {
     MaxPool2d,
     GlobalAvgPool,
     GlobalAvgPoolGrad,
-    NormalizeInnerSum,
-    NormalizeInnerSumGrad,
-    PairwiseSquaredDistance,
-    PairwiseSquaredDistanceGrad,
-    PairwiseVectorRejection,
-    PairwiseVectorRejectionGrad,
+    PairwiseGrad,
     GradClipZero,
     GradClipNormSq,
     GradClipScale,
@@ -576,24 +571,7 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::GlobalAvgPoolGrad => {
             parse_wgsl(include_str!("shaders/global_avg_pool_grad.wgsl"))
         }
-        ShaderGroup::NormalizeInnerSum => {
-            parse_wgsl(include_str!("shaders/normalize_inner_sum.wgsl"))
-        }
-        ShaderGroup::NormalizeInnerSumGrad => {
-            parse_wgsl(include_str!("shaders/normalize_inner_sum_grad.wgsl"))
-        }
-        ShaderGroup::PairwiseSquaredDistance => {
-            parse_wgsl(include_str!("shaders/pairwise_squared_distance.wgsl"))
-        }
-        ShaderGroup::PairwiseSquaredDistanceGrad => {
-            parse_wgsl(include_str!("shaders/pairwise_squared_distance_grad.wgsl"))
-        }
-        ShaderGroup::PairwiseVectorRejection => {
-            parse_wgsl(include_str!("shaders/pairwise_vector_rejection.wgsl"))
-        }
-        ShaderGroup::PairwiseVectorRejectionGrad => {
-            parse_wgsl(include_str!("shaders/pairwise_vector_rejection_grad.wgsl"))
-        }
+        ShaderGroup::PairwiseGrad => parse_wgsl(include_str!("shaders/pairwise_grad.wgsl")),
         ShaderGroup::GradClipZero => parse_wgsl(include_str!("shaders/grad_clip_zero.wgsl")),
         ShaderGroup::GradClipNormSq => parse_wgsl(include_str!("shaders/grad_clip_norm_sq.wgsl")),
         ShaderGroup::GradClipScale => parse_wgsl(include_str!("shaders/grad_clip_scale.wgsl")),
@@ -5053,27 +5031,7 @@ mod tests {
                 naga::valid::Capabilities::empty(),
             ),
             (
-                ShaderGroup::NormalizeInnerSum,
-                naga::valid::Capabilities::empty(),
-            ),
-            (
-                ShaderGroup::NormalizeInnerSumGrad,
-                naga::valid::Capabilities::empty(),
-            ),
-            (
-                ShaderGroup::PairwiseSquaredDistance,
-                naga::valid::Capabilities::empty(),
-            ),
-            (
-                ShaderGroup::PairwiseSquaredDistanceGrad,
-                naga::valid::Capabilities::empty(),
-            ),
-            (
-                ShaderGroup::PairwiseVectorRejection,
-                naga::valid::Capabilities::empty(),
-            ),
-            (
-                ShaderGroup::PairwiseVectorRejectionGrad,
+                ShaderGroup::PairwiseGrad,
                 naga::valid::Capabilities::empty(),
             ),
             (
@@ -5300,12 +5258,7 @@ mod tests {
             (ShaderGroup::ScatterAddAtomic, empty),
             (ShaderGroup::BceLoss, empty),
             (ShaderGroup::GlobalAvgPoolGrad, empty),
-            (ShaderGroup::NormalizeInnerSum, empty),
-            (ShaderGroup::NormalizeInnerSumGrad, empty),
-            (ShaderGroup::PairwiseSquaredDistance, empty),
-            (ShaderGroup::PairwiseSquaredDistanceGrad, empty),
-            (ShaderGroup::PairwiseVectorRejection, empty),
-            (ShaderGroup::PairwiseVectorRejectionGrad, empty),
+            (ShaderGroup::PairwiseGrad, empty),
             (ShaderGroup::GradClipZero, empty),
             (ShaderGroup::GradClipNormSq, empty),
             (ShaderGroup::GradClipScale, empty),
@@ -5521,22 +5474,11 @@ mod tests {
                 | ShaderEntry::BroadcastInner
                 | ShaderEntry::TileInner
                 | ShaderEntry::TileInnerGrad => vec!["src", "dst", "params"],
-                ShaderEntry::NormalizeInnerSum => vec!["src", "dst", "params"],
-                ShaderEntry::NormalizeInnerSumGrad => {
-                    vec!["src_a", "src_b", "dst", "params"]
-                }
-                ShaderEntry::PairwiseSquaredDistance => {
-                    vec!["src_a", "src_b", "dst", "params"]
-                }
                 ShaderEntry::PairwiseSquaredDistanceGradLeft
                 | ShaderEntry::PairwiseSquaredDistanceGradRight => {
                     vec!["src_a", "src_b", "src_c", "dst", "params"]
                 }
-                ShaderEntry::PairwiseVectorRejection => {
-                    vec!["src_a", "src_b", "dst", "params"]
-                }
-                ShaderEntry::PairwiseVectorRejectionGradVectors
-                | ShaderEntry::PairwiseVectorRejectionGradDirections => {
+                ShaderEntry::PairwiseVectorRejectionGradDirections => {
                     vec!["src_a", "src_b", "src_c", "dst", "params"]
                 }
                 ShaderEntry::WinogradInputTransform | ShaderEntry::WinogradOutputTransform => {
@@ -5648,15 +5590,10 @@ mod tests {
             ShaderEntry::GlobalAvgPool,
             ShaderEntry::GlobalAvgPoolGrad,
             ShaderEntry::BroadcastInner,
-            ShaderEntry::NormalizeInnerSum,
-            ShaderEntry::NormalizeInnerSumGrad,
             ShaderEntry::TileInner,
             ShaderEntry::TileInnerGrad,
-            ShaderEntry::PairwiseSquaredDistance,
             ShaderEntry::PairwiseSquaredDistanceGradLeft,
             ShaderEntry::PairwiseSquaredDistanceGradRight,
-            ShaderEntry::PairwiseVectorRejection,
-            ShaderEntry::PairwiseVectorRejectionGradVectors,
             ShaderEntry::PairwiseVectorRejectionGradDirections,
         ];
 

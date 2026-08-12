@@ -82,8 +82,7 @@ fn tall_matmul_splits_dispatch_across_z() {
     let output = graph.matmul(input, weight);
     graph.set_outputs(vec![output]);
 
-    let mut session =
-        meganeura::build(&graph, meganeura::SessionConfig::inference_from_env()).0;
+    let mut session = meganeura::build(&graph, meganeura::SessionConfig::inference_from_env()).0;
     session.set_input("input", &vec![1.25_f32; ROWS]);
     session.set_parameter("weight", &[2.0]);
     session.step();
@@ -1678,8 +1677,7 @@ fn batched_parameter_read_matches_uploaded_values() {
 
     let a_values = [0.25_f32, -1.0, 2.5, 7.0, -3.25, 0.125];
     let b_values = [4.0_f32, 3.0, 2.0, 1.0, -5.0];
-    let mut session =
-        meganeura::build(&graph, meganeura::SessionConfig::inference_from_env()).0;
+    let mut session = meganeura::build(&graph, meganeura::SessionConfig::inference_from_env()).0;
     session.set_parameter("a", &a_values);
     session.set_parameter("b", &b_values);
 

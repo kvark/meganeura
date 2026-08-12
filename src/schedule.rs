@@ -361,6 +361,9 @@ pub enum KernelTemplate {
         /// Per-element gather flags (see [`ReductionKernel::gather_elem`]).
         /// Empty = all direct.
         gather_elem: Vec<bool>,
+        /// Row-repeat factors for per-element streams (see
+        /// [`ReductionKernel::input_row_repeats`]). Empty = all one.
+        input_row_repeats: Vec<u32>,
         /// Number of independent rows handled by one workgroup. Must divide
         /// the workgroup size; each row retains a power-of-two lane group.
         rows_per_workgroup: u32,
@@ -427,6 +430,11 @@ pub struct ReductionKernel {
     /// axis (table row-stride == inner).
     #[serde(default)]
     pub gather_elem: Vec<bool>,
+    /// Per-element stream `i` uses logical row `row / factor[i]`.
+    /// This expresses shared-row pairwise inputs without a bespoke shader.
+    /// Empty is equivalent to all factors being one.
+    #[serde(default)]
+    pub input_row_repeats: Vec<u32>,
 }
 
 impl ReductionKernel {
@@ -447,6 +455,7 @@ impl ReductionKernel {
             n_per_elem: self.n_per_elem,
             n_per_row: self.n_per_row,
             gather_elem: self.gather_elem.clone(),
+            input_row_repeats: self.input_row_repeats.clone(),
             rows_per_workgroup: self.rows_per_workgroup,
             grid: GridShape {
                 workgroup_size: self.workgroup_size,
@@ -493,6 +502,7 @@ pub fn lower(t: &KernelTemplate) -> ShaderModule {
             n_per_elem,
             n_per_row,
             ref gather_elem,
+            ref input_row_repeats,
             rows_per_workgroup,
             grid,
         } => lower_reduction(
@@ -503,6 +513,7 @@ pub fn lower(t: &KernelTemplate) -> ShaderModule {
             n_per_elem,
             n_per_row,
             gather_elem,
+            input_row_repeats,
             rows_per_workgroup,
             grid,
         ),
@@ -564,6 +575,7 @@ fn lower_reduction(
     n_per_elem: u8,
     n_per_row: u8,
     gather_elem: &[bool],
+    input_row_repeats: &[u32],
     rows_per_workgroup: u32,
     grid: GridShape,
 ) -> ShaderModule {
@@ -576,6 +588,15 @@ fn lower_reduction(
         "gather_elem must be empty or length n_per_elem ({}), got {}",
         n_per_elem,
         gather_elem.len(),
+    );
+    assert!(
+        input_row_repeats.is_empty() || input_row_repeats.len() == n_per_elem as usize,
+        "input_row_repeats must be empty or length n_per_elem ({n_per_elem}), got {}",
+        input_row_repeats.len(),
+    );
+    assert!(
+        input_row_repeats.iter().all(|&factor| factor > 0),
+        "input row repeat factors must be non-zero",
     );
     let is_gather = |i: usize| gather_elem.get(i).copied().unwrap_or(false);
     assert_eq!(
@@ -639,17 +660,28 @@ fn lower_reduction(
         let per_elem_end = n_per_elem as usize;
         let per_row_end = per_elem_end + n_per_row as usize;
         if i < per_elem_end {
+            let repeat = input_row_repeats.get(i).copied().unwrap_or(1);
             if is_gather(i) {
+                let source_row = if repeat == 1 {
+                    "row".to_string()
+                } else {
+                    format!("(row / {repeat}u)")
+                };
                 // Gather: the row is indirected through a u32 indices
                 // buffer, then the gathered row's `inner`-stride slice is
                 // indexed by the reduction column. Valid only when the
                 // gathered axis IS the reduced axis (table stride == inner).
                 format!(
-                    "{0}[{0}_idx[row] * params.inner + {1}]",
+                    "{0}[{0}_idx[{1}] * params.inner + {2}]",
+                    per_elem_names[i], source_row, col_var
+                )
+            } else if repeat == 1 {
+                format!("{}[row_offset + {}]", per_elem_names[i], col_var)
+            } else {
+                format!(
+                    "{}[(row / {repeat}u) * params.inner + {}]",
                     per_elem_names[i], col_var
                 )
-            } else {
-                format!("{}[row_offset + {}]", per_elem_names[i], col_var)
             }
         } else if i < per_row_end {
             format!("{}[row]", per_row_names[i - per_elem_end])
@@ -1222,6 +1254,7 @@ mod tests {
             n_per_elem: 1,
             n_per_row: 0,
             gather_elem: Vec::new(),
+            input_row_repeats: Vec::new(),
             rows_per_workgroup: 1,
             grid: GridShape::default(),
         });
@@ -1245,6 +1278,7 @@ mod tests {
             n_per_elem: 1,
             n_per_row: 0,
             gather_elem: Vec::new(),
+            input_row_repeats: Vec::new(),
             rows_per_workgroup: 1,
             grid: GridShape::default(),
         });
@@ -1265,6 +1299,7 @@ mod tests {
             n_per_elem: 1,
             n_per_row: 0,
             gather_elem: Vec::new(),
+            input_row_repeats: Vec::new(),
             rows_per_workgroup: 1,
             grid: GridShape::default(),
         });
@@ -1292,6 +1327,7 @@ mod tests {
             n_per_elem: 2,
             n_per_row: 0,
             gather_elem: vec![true, true],
+            input_row_repeats: Vec::new(),
             rows_per_workgroup: 1,
             grid: GridShape::default(),
         });
@@ -1328,6 +1364,7 @@ mod tests {
             n_per_elem: 2,
             n_per_row: 0,
             gather_elem: vec![true, false],
+            input_row_repeats: Vec::new(),
             rows_per_workgroup: 1,
             grid: GridShape::default(),
         });
@@ -1339,6 +1376,35 @@ mod tests {
         assert!(sm.source.contains("src_b[row_offset + col]"));
         assert!(sm.source.contains("var<storage> src_a_idx: array<u32>;"));
         assert!(!sm.source.contains("src_b_idx"));
+    }
+
+    #[test]
+    fn reduction_with_repeated_input_rows_compiles() {
+        let prologue = PointwiseDAG {
+            n_inputs: 2,
+            ops: vec![Pw::LoadInput(0), Pw::LoadInput(1), Pw::Sub(0, 1)],
+            output: 2,
+        };
+        let sm = lower(&KernelTemplate::Reduction {
+            op: ReduceOp::Sum,
+            prologue,
+            extra_prologues: vec![],
+            epilogue: None,
+            n_per_elem: 2,
+            n_per_row: 0,
+            gather_elem: Vec::new(),
+            input_row_repeats: vec![4, 1],
+            rows_per_workgroup: 1,
+            grid: GridShape::default(),
+        });
+        assert!(sm.source.contains("src_a[(row / 4u) * params.inner + col]"));
+        assert!(sm.source.contains("src_b[row_offset + col]"));
+
+        use naga::valid::{Capabilities, ValidationFlags, Validator};
+        let flags = ValidationFlags::all() ^ ValidationFlags::BINDINGS;
+        Validator::new(flags, Capabilities::all())
+            .validate(&sm.module)
+            .unwrap_or_else(|e| panic!("repeated-row reduction invalid: {:?}\n{}", e, sm.source));
     }
 
     #[test]
@@ -1360,6 +1426,7 @@ mod tests {
                 n_per_elem: 1,
                 n_per_row: 0,
                 gather_elem: Vec::new(),
+                input_row_repeats: Vec::new(),
                 rows_per_workgroup: 1,
                 grid: GridShape::default(),
             });
@@ -1411,6 +1478,7 @@ mod tests {
             n_per_elem: 1,
             n_per_row: 0,
             gather_elem: Vec::new(),
+            input_row_repeats: Vec::new(),
             rows_per_workgroup: 1,
             grid: GridShape::default(),
         });
@@ -1475,6 +1543,7 @@ mod tests {
             n_per_elem: 1,
             n_per_row: 1,
             gather_elem: Vec::new(),
+            input_row_repeats: Vec::new(),
             rows_per_workgroup: 1,
             grid: GridShape::default(),
         });
@@ -1509,6 +1578,7 @@ mod tests {
             n_per_elem: 1,
             n_per_row: 0,
             gather_elem: Vec::new(),
+            input_row_repeats: Vec::new(),
             rows_per_workgroup: 1,
             grid: GridShape::default(),
         });
@@ -1529,6 +1599,7 @@ mod tests {
             n_per_elem: 1,
             n_per_row: 0,
             gather_elem: Vec::new(),
+            input_row_repeats: Vec::new(),
             rows_per_workgroup: 16,
             grid: GridShape::default(),
         });
@@ -1566,6 +1637,7 @@ mod tests {
             n_per_elem: 1,
             n_per_row: 0,
             gather_elem: Vec::new(),
+            input_row_repeats: Vec::new(),
             rows_per_workgroup: 1,
             grid: GridShape::default(),
         });
@@ -1582,6 +1654,7 @@ mod tests {
             n_per_elem: 1,
             n_per_row: 0,
             gather_elem: Vec::new(),
+            input_row_repeats: Vec::new(),
             rows_per_workgroup: 1,
             grid: GridShape {
                 workgroup_size: 250, // not power of 2
