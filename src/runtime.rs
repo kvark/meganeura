@@ -1731,9 +1731,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::SgdUpdate => SgdData::layout(),
         ShaderEntry::AdamUpdate => AdamData::layout(),
         ShaderEntry::ScatterAdd => ScatterAddData::layout(),
-        ShaderEntry::ScatterAddAtomic | ShaderEntry::ScatterAddAtomicRowMul => {
-            ScatterAddAtomicData::layout()
-        }
+        ShaderEntry::ScatterAddAtomic => ScatterAddAtomicData::layout(),
         ShaderEntry::SwiGLUConcat | ShaderEntry::SwiGLUConcatGrad => BinaryData::layout(),
         ShaderEntry::SumAll
         | ShaderEntry::MeanAll
@@ -5732,30 +5730,17 @@ impl Session {
                     &ScatterAddAtomicData {
                         indices: buf(dispatch.input_buffers[0]),
                         src: buf(dispatch.input_buffers[1]),
-                        row_scale: buf(dispatch.input_buffers[1]),
+                        row_scale: buf(dispatch
+                            .input_buffers
+                            .get(2)
+                            .copied()
+                            .unwrap_or(dispatch.input_buffers[1])),
                         dst: buf(dispatch.output_buffer),
                         params: ScatterAddParams {
                             total: dispatch.params[0],
                             seq_len: dispatch.params[1],
                             embed_dim: dispatch.params[2],
-                            _pad: 0,
-                        },
-                    },
-                );
-            }
-            ShaderEntry::ScatterAddAtomicRowMul => {
-                pc.bind(
-                    0,
-                    &ScatterAddAtomicData {
-                        indices: buf(dispatch.input_buffers[0]),
-                        src: buf(dispatch.input_buffers[1]),
-                        row_scale: buf(dispatch.input_buffers[2]),
-                        dst: buf(dispatch.output_buffer),
-                        params: ScatterAddParams {
-                            total: dispatch.params[0],
-                            seq_len: dispatch.params[1],
-                            embed_dim: dispatch.params[2],
-                            _pad: 0,
+                            _pad: dispatch.params[3],
                         },
                     },
                 );
