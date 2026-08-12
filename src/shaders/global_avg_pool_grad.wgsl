@@ -26,29 +26,3 @@ fn broadcast_inner(@builtin(global_invocation_id) gid: vec3<u32>) {
     if i >= params.total { return; }
     dst[i] = src[i / params.spatial];
 }
-
-@compute @workgroup_size(256)
-fn tile_inner(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if i >= params.total { return; }
-    let inner = params.spatial;
-    let repeated_inner = inner * params._pad0;
-    let row = i / repeated_inner;
-    dst[i] = src[row * inner + i % inner];
-}
-
-@compute @workgroup_size(256)
-fn tile_inner_grad(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if i >= params.total { return; }
-    let inner = params.spatial;
-    let repeats = params._pad0;
-    let row = i / inner;
-    let column = i % inner;
-    let base = row * inner * repeats + column;
-    var sum = 0.0;
-    for (var repeat = 0u; repeat < repeats; repeat += 1u) {
-        sum += src[base + repeat * inner];
-    }
-    dst[i] = sum;
-}

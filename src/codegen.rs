@@ -5469,9 +5469,7 @@ mod tests {
                 ShaderEntry::MaxPool2d
                 | ShaderEntry::GlobalAvgPool
                 | ShaderEntry::GlobalAvgPoolGrad
-                | ShaderEntry::BroadcastInner
-                | ShaderEntry::TileInner
-                | ShaderEntry::TileInnerGrad => vec!["src", "dst", "params"],
+                | ShaderEntry::BroadcastInner => vec!["src", "dst", "params"],
                 ShaderEntry::PairwiseSquaredDistanceGradLeft
                 | ShaderEntry::PairwiseSquaredDistanceGradRight => {
                     vec!["src_a", "src_b", "src_c", "dst", "params"]
@@ -5587,8 +5585,6 @@ mod tests {
             ShaderEntry::GlobalAvgPool,
             ShaderEntry::GlobalAvgPoolGrad,
             ShaderEntry::BroadcastInner,
-            ShaderEntry::TileInner,
-            ShaderEntry::TileInnerGrad,
             ShaderEntry::PairwiseSquaredDistanceGradLeft,
             ShaderEntry::PairwiseSquaredDistanceGradRight,
             ShaderEntry::PairwiseVectorRejectionGradDirections,
