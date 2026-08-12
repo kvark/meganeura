@@ -153,6 +153,7 @@ win, so explicit code always has the last word.
 | `MEGANEURA_NO_ALIAS` | Disable buffer lifetime aliasing (every value gets its own allocation). |
 | `MEGANEURA_NO_DEVICE_LOCAL` | Keep all buffers host-visible. |
 | `MEGANEURA_SERIAL_DISPATCH` | One compute pass per dispatch — serial execution for bisection. |
+| `MEGANEURA_NO_WINOGRAD` | Skip the Conv2d-to-Winograd rewrite; its selection heuristic weighs channel counts only, so this measures which side of it a workload belongs on. |
 | `MEGANEURA_PIN_BUFS=3,25-40` | Force-pin logical buffers to bisect aliasing corruption. |
 | `MEGANEURA_DUMP_PLAN` | Dump dispatch order, provenance, and the alias map at build. |
 | `MEGANEURA_DUMP_WGSL=<dir>` | Write every generated shader into `<dir>`. |

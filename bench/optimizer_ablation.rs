@@ -168,10 +168,14 @@ fn main() {
     assert!(cutoff > 0, "--cutoff must be positive");
     assert!(repeats > 0, "--repeats must be positive");
 
+    // The flags this bench parses win; anything it does not parse — the
+    // Winograd switch, for one — still comes from the environment, which is
+    // the precedence `from_env` documents.
     let config = OptimizeConfig {
         mode,
         extraction_cost,
         saturation_cutoff: cutoff,
+        ..OptimizeConfig::from_env()
     };
     let source = build_model_graph(&model, phase);
     let source_nodes = source.nodes().len();

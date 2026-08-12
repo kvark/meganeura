@@ -147,6 +147,8 @@ registry! {
         "Keep all buffers host-visible instead of device-local.";
     SERIAL_DISPATCH: "MEGANEURA_SERIAL_DISPATCH", Bool, Diagnostic,
         "One compute pass per dispatch — guarantees serial execution for bisection.";
+    NO_WINOGRAD: "MEGANEURA_NO_WINOGRAD", Bool, Diagnostic,
+        "Skip the Conv2d-to-Winograd rewrite; the selection heuristic weighs channel counts only, so this measures which side of it a workload belongs on.";
     PIN_BUFS: "MEGANEURA_PIN_BUFS", Text, Diagnostic,
         "Force-pin logical buffers by id/range (e.g. \"3,17,25-40\") to bisect aliasing bugs.";
     DUMP_PLAN: "MEGANEURA_DUMP_PLAN", Bool, Diagnostic,
@@ -191,9 +193,13 @@ impl OptimizeConfig {
     /// - `MEGANEURA_OPTIMIZER=off|greedy|egglog-windowed|egglog-outlined|egglog-whole`
     /// - `MEGANEURA_EGRAPH_COST=ast-size|tensor-traffic`
     /// - `MEGANEURA_EGRAPH_CUTOFF=<positive integer>`
+    /// - `MEGANEURA_NO_WINOGRAD`
     pub fn from_env() -> Self {
         log_overrides();
-        let mut config = Self::default();
+        let mut config = Self {
+            no_winograd: NO_WINOGRAD.bool_or(false),
+            ..Self::default()
+        };
         if let Some(value) = OPTIMIZER.text() {
             config.mode = match value.as_str() {
                 "off" => OptimizeMode::Off,
@@ -450,6 +456,19 @@ mod tests {
             "README.md does not mention: {missing:?} — document them \
              in the environment-variable table"
         );
+    }
+
+    #[test]
+    fn no_winograd_reaches_the_typed_option() {
+        // Not set: the rewrite stays on.
+        unsafe { std::env::remove_var("MEGANEURA_NO_WINOGRAD") };
+        assert!(!crate::optimize::OptimizeConfig::from_env().no_winograd);
+        // Set: it turns off, and "0" means off in the uniform semantics.
+        unsafe { std::env::set_var("MEGANEURA_NO_WINOGRAD", "1") };
+        assert!(crate::optimize::OptimizeConfig::from_env().no_winograd);
+        unsafe { std::env::set_var("MEGANEURA_NO_WINOGRAD", "0") };
+        assert!(!crate::optimize::OptimizeConfig::from_env().no_winograd);
+        unsafe { std::env::remove_var("MEGANEURA_NO_WINOGRAD") };
     }
 
     #[test]

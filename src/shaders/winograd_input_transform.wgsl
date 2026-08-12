@@ -24,8 +24,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let total = params.total_tiles * params.in_channels;
     if idx >= total { return; }
 
-    let tile_idx = idx / params.in_channels;
-    let ci = idx % params.in_channels;
+    // Channel-major, so that neighbouring threads walk neighbouring tiles.
+    //
+    // The other way round — tile_idx = idx / in_channels — puts consecutive
+    // threads on consecutive channels, which are H*W apart in the input and
+    // total_tiles apart in V. At any real resolution that is a megabyte of
+    // stride per lane, so every wave scatters across memory on both the load
+    // and the store. This way the store is contiguous and the load walks a row.
+    let ci = idx / params.total_tiles;
+    let tile_idx = idx % params.total_tiles;
 
     // Decompose tile_idx → (n, tile_r, tile_c)
     let tiles_per_batch = params.tiles_h * params.tiles_w;

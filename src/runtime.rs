@@ -420,6 +420,17 @@ struct GroupNormData {
     params: GroupNormParams,
 }
 
+/// Normalisation pass: reads the tensor and the partials, writes the result.
+#[derive(blade_macros::ShaderData)]
+struct GroupNormApplyData {
+    src: blade_graphics::BufferPiece,
+    src_b: blade_graphics::BufferPiece,
+    bias: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    partials: blade_graphics::BufferPiece,
+    params: GroupNormParams,
+}
+
 #[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
 #[repr(C)]
 struct GroupNormParams {
@@ -428,8 +439,10 @@ struct GroupNormParams {
     spatial: u32,
     num_groups: u32,
     eps_bits: u32,
-    _pad0: u32,
-    _pad1: u32,
+    /// Slices each group is split into, so the parallelism follows the image
+    /// rather than the batch. One for the legacy single-pass kernels.
+    chunks: u32,
+    apply_silu: u32,
     _pad2: u32,
 }
 
@@ -1683,6 +1696,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::LayerNormGradWB | ShaderEntry::LayerNormGradX => FourBufData::layout(),
         ShaderEntry::RmsNormRsqrt => UnaryData::layout(),
         ShaderEntry::GroupNorm | ShaderEntry::GroupNormSilu => GroupNormData::layout(),
+        ShaderEntry::GroupNormApply => GroupNormApplyData::layout(),
         ShaderEntry::GroupNormGradInput => GroupNormGradInputData::layout(),
         ShaderEntry::GroupNormGradWeightBias => GroupNormGradWeightBiasData::layout(),
         ShaderEntry::Concat => BinaryData::layout(),
@@ -3714,6 +3728,27 @@ impl Session {
         None
     }
 
+    /// Return the underlying blade `BufferPiece` for a graph output.
+    ///
+    /// Graph outputs are pinned by the memory planner, so the returned handle
+    /// remains stable for the lifetime of the session. This lets a sibling
+    /// compute pipeline on the same [`blade_graphics::Context`] consume a
+    /// prediction directly, without a device-to-host readback followed by an
+    /// upload.
+    ///
+    /// # Ordering
+    ///
+    /// Call [`Session::step`] before recording or submitting the consumer.
+    /// Submissions to the shared context's queue are ordered, so the consumer
+    /// can be submitted after `step()` without a host-side [`Session::wait`].
+    /// The handle must not be used after the session is destroyed.
+    pub fn output_buffer(&self, index: usize) -> Option<blade_graphics::BufferPiece> {
+        let &buf_ref = self.plan.output_buffers.get(index)?;
+        Some(blade_graphics::BufferPiece::from(
+            self.buffers[buf_ref.0 as usize],
+        ))
+    }
+
     /// Upload u32 input data (e.g. token IDs for embedding lookup).
     pub fn set_input_u32(&mut self, name: &str, data: &[u32]) {
         self.wait();
@@ -5444,8 +5479,31 @@ impl Session {
                             spatial: p[2],
                             num_groups: p[3],
                             eps_bits: p[4],
-                            _pad0: 0,
-                            _pad1: 0,
+                            chunks: 1,
+                            apply_silu: 0,
+                            _pad2: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::GroupNormApply => {
+                let p = &dispatch.params;
+                pc.bind(
+                    0,
+                    &GroupNormApplyData {
+                        src: buf(dispatch.input_buffers[0]),
+                        src_b: buf(dispatch.input_buffers[2]),
+                        bias: buf(dispatch.input_buffers[3]),
+                        dst: buf(dispatch.output_buffer),
+                        partials: buf(dispatch.input_buffers[1]),
+                        params: GroupNormParams {
+                            batch: p[0],
+                            channels: p[1],
+                            spatial: p[2],
+                            num_groups: p[3],
+                            eps_bits: p[4],
+                            chunks: p[5],
+                            apply_silu: p[6],
                             _pad2: 0,
                         },
                     },
@@ -5466,8 +5524,8 @@ impl Session {
                             spatial: p[2],
                             num_groups: p[3],
                             eps_bits: p[4],
-                            _pad0: 0,
-                            _pad1: 0,
+                            chunks: 1,
+                            apply_silu: 0,
                             _pad2: 0,
                         },
                     },
@@ -5488,8 +5546,8 @@ impl Session {
                             spatial: p[2],
                             num_groups: p[3],
                             eps_bits: p[4],
-                            _pad0: 0,
-                            _pad1: 0,
+                            chunks: 1,
+                            apply_silu: 0,
                             _pad2: 0,
                         },
                     },

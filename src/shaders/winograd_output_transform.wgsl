@@ -23,8 +23,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let total = params.total_tiles * params.out_channels;
     if idx >= total { return; }
 
-    let tile_idx = idx / params.out_channels;
-    let co = idx % params.out_channels;
+    // Channel-major, for the same reason as the input transform: this way
+    // neighbouring threads read neighbouring entries of M and write
+    // neighbouring output pixels, instead of striding a megabyte per lane.
+    let co = idx / params.total_tiles;
+    let tile_idx = idx % params.total_tiles;
 
     // Decompose tile_idx → (n, tile_r, tile_c)
     let tiles_per_batch = params.tiles_h * params.tiles_w;

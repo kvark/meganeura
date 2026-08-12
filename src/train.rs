@@ -360,7 +360,7 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, Optimiz
             let mut g = optimized_forward;
             let mut fusions = Vec::new();
             optimize::apply_group_norm_silu_fusions(&mut g, &mut fusions);
-            optimize::apply_winograd_conv_fusions(&mut g, &mut fusions);
+            optimize::apply_winograd_conv_fusions(&mut g, &mut fusions, &cfg.optimize);
             for (name, count) in fusions.iter().fold(
                 std::collections::BTreeMap::<&str, usize>::new(),
                 |mut acc, entry| {
