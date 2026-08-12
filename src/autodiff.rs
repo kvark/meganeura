@@ -300,18 +300,6 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 );
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
-            Op::TileInner { repeats } => {
-                let x = node.inputs[0];
-                let x_ty = forward.nodes()[x as usize].ty.clone();
-                let inner =
-                    u32::try_from(x_ty.shape[1]).expect("tile_inner input width exceeds u32");
-                let grad_x = graph.add_raw_node(
-                    Op::TileInnerGrad { inner, repeats },
-                    vec![grad_output],
-                    x_ty,
-                );
-                accumulate_grad(&mut graph, &mut grads, x, grad_x);
-            }
             Op::PairwiseSquaredDistance { pairs } => {
                 let left = node.inputs[0];
                 let right = node.inputs[1];
@@ -637,7 +625,6 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::LayerNormGradX { .. }
             | Op::RoPEGrad { .. }
             | Op::NormalizeInnerSumGrad { .. }
-            | Op::TileInnerGrad { .. }
             | Op::PairwiseSquaredDistanceGradLeft { .. }
             | Op::PairwiseSquaredDistanceGradRight { .. }
             | Op::PairwiseVectorRejectionGradVectors { .. }
