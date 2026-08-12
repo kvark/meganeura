@@ -102,7 +102,7 @@ fn batched_adam_state_read_preserves_names_and_values() {
     let loss = graph.add(a_mean, b_mean);
     graph.set_outputs(vec![loss]);
 
-    let mut session = build_session(&graph);
+    let mut session = meganeura::build_session(&graph);
     session.set_adam(0.01, 0.9, 0.999, 1.0e-8);
     session.set_parameter("a", &[1.0, 2.0, 3.0]);
     session.set_parameter("b", &[4.0, 5.0]);
