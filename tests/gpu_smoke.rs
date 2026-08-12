@@ -82,7 +82,8 @@ fn tall_matmul_splits_dispatch_across_z() {
     let output = graph.matmul(input, weight);
     graph.set_outputs(vec![output]);
 
-    let mut session = build_inference_session(&graph);
+    let mut session =
+        meganeura::build(&graph, meganeura::SessionConfig::inference_from_env()).0;
     session.set_input("input", &vec![1.25_f32; ROWS]);
     session.set_parameter("weight", &[2.0]);
     session.step();
@@ -1677,7 +1678,8 @@ fn batched_parameter_read_matches_uploaded_values() {
 
     let a_values = [0.25_f32, -1.0, 2.5, 7.0, -3.25, 0.125];
     let b_values = [4.0_f32, 3.0, 2.0, 1.0, -5.0];
-    let mut session = build_inference_session(&graph);
+    let mut session =
+        meganeura::build(&graph, meganeura::SessionConfig::inference_from_env()).0;
     session.set_parameter("a", &a_values);
     session.set_parameter("b", &b_values);
 
@@ -1696,11 +1698,11 @@ fn checkpoint_round_trip_preserves_odd_f16_tail() {
     let values = [0.25_f32, -0.5, 0.75];
     let input = [1.0_f32, 2.0, 3.0];
     let tmp = std::env::temp_dir().join("meganeura_test_odd_f16_ckpt.safetensors");
-    let mut session = build_inference_session(&g);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
     session.set_parameter("w", &values);
     session.save_checkpoint(&tmp).expect("save checkpoint");
 
-    let mut restored = build_inference_session(&g);
+    let mut restored = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
     restored.load_checkpoint(&tmp).expect("load checkpoint");
     restored.set_input("x", &input);
     restored.step();
