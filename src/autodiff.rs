@@ -1,4 +1,4 @@
-use crate::graph::{Graph, NodeId, Op, TensorType};
+use crate::graph::{Graph, NodeId, Op, PairwiseGradKind, TensorType};
 use std::collections::HashMap;
 
 /// Build the backward (gradient) graph from a forward graph.
@@ -308,12 +308,20 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let inner =
                     u32::try_from(left_ty.shape[1]).expect("pairwise distance width exceeds u32");
                 let grad_left = graph.add_raw_node(
-                    Op::PairwiseSquaredDistanceGradLeft { inner, pairs },
+                    Op::PairwiseGrad {
+                        kind: PairwiseGradKind::DistanceLeft,
+                        inner,
+                        pairs,
+                    },
                     vec![grad_output, left, right],
                     left_ty,
                 );
                 let grad_right = graph.add_raw_node(
-                    Op::PairwiseSquaredDistanceGradRight { inner, pairs },
+                    Op::PairwiseGrad {
+                        kind: PairwiseGradKind::DistanceRight,
+                        inner,
+                        pairs,
+                    },
                     vec![grad_output, left, right],
                     right_ty,
                 );
@@ -329,7 +337,11 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let grad_vectors =
                     graph.pairwise_vector_rejection(grad_output, directions, pairs as usize);
                 let grad_directions = graph.add_raw_node(
-                    Op::PairwiseVectorRejectionGradDirections { inner, pairs },
+                    Op::PairwiseGrad {
+                        kind: PairwiseGradKind::RejectionDirections,
+                        inner,
+                        pairs,
+                    },
                     vec![grad_output, vectors, directions],
                     direction_ty,
                 );
@@ -621,9 +633,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::LayerNormGradX { .. }
             | Op::RoPEGrad { .. }
             | Op::NormalizeInnerSumGrad { .. }
-            | Op::PairwiseSquaredDistanceGradLeft { .. }
-            | Op::PairwiseSquaredDistanceGradRight { .. }
-            | Op::PairwiseVectorRejectionGradDirections { .. }
+            | Op::PairwiseGrad { .. }
             | Op::GlobalAvgPoolGrad { .. } => {}
             Op::Gelu => {
                 // gelu(x) ≈ x * sigmoid(1.702 * x) (sigmoid approximation)
