@@ -10,13 +10,6 @@ var<storage, read_write> dst: array<f32>;
 var<uniform> params: Params;
 
 @compute @workgroup_size(256)
-fn materialize(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if i >= params.len { return; }
-    dst[i] = src[i];
-}
-
-@compute @workgroup_size(256)
 fn relu(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if i >= params.len { return; }

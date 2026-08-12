@@ -142,7 +142,6 @@ pub enum ShaderEntry {
     Abs,
     Log,
     Recip,
-    Materialize,
     Add,
     Mul,
     Greater,
@@ -350,7 +349,6 @@ impl ShaderEntry {
             | ShaderEntry::ScatterAddAtomic
             | ShaderEntry::ScatterAddAtomicRowMul
             | ShaderEntry::BroadcastInner
-            | ShaderEntry::Materialize
             | ShaderEntry::ExclusiveCumsum
             | ShaderEntry::ShiftInner
             | ShaderEntry::Transpose
@@ -406,8 +404,7 @@ impl ShaderEntry {
             | ShaderEntry::Neg
             | ShaderEntry::Abs
             | ShaderEntry::Log
-            | ShaderEntry::Recip
-            | ShaderEntry::Materialize => ShaderGroup::Unary,
+            | ShaderEntry::Recip => ShaderGroup::Unary,
             ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater => ShaderGroup::Binary,
             ShaderEntry::BiasAdd => ShaderGroup::BiasAdd,
             ShaderEntry::SgdUpdate => ShaderGroup::Sgd,
@@ -523,7 +520,6 @@ impl ShaderEntry {
             ShaderEntry::Abs => "abs_",
             ShaderEntry::Log => "log_",
             ShaderEntry::Recip => "recip",
-            ShaderEntry::Materialize => "materialize",
             ShaderEntry::Add => "add",
             ShaderEntry::Mul => "mul",
             ShaderEntry::Greater => "greater",
@@ -759,6 +755,10 @@ pub struct Dispatch {
     /// f32 cooperative kernels remain eligible.
     #[serde(default)]
     pub requires_full_precision: bool,
+    /// Prevent this dispatch from being absorbed into a producer or consumer.
+    /// Used for explicit memory-placement boundaries such as [`Op::Materialize`].
+    #[serde(default)]
+    pub fusion_barrier: bool,
     /// Fused elementwise epilogue (PointwiseDAG) applied in the matmul
     /// store loop. `None` = no epilogue (default). When present, saves
     /// one dispatch + barrier per fused op.
@@ -1214,7 +1214,7 @@ fn fuse_pointwise_chains(plan: &mut ExecutionPlan) {
         let mut fused_any = false;
         for ci in 0..n {
             let c = &plan.dispatches[ci];
-            if c.pointwise.is_none() {
+            if c.pointwise.is_none() || c.fusion_barrier {
                 continue;
             }
 
@@ -1232,7 +1232,7 @@ fn fuse_pointwise_chains(plan: &mut ExecutionPlan) {
                     continue;
                 }
                 let p = &plan.dispatches[pi];
-                if p.pointwise.is_none() {
+                if p.pointwise.is_none() || p.fusion_barrier {
                     continue;
                 }
                 if reads.get(buf).copied().unwrap_or(0) != 1 {
@@ -1519,7 +1519,7 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                     continue;
                 }
                 let p = &plan.dispatches[pi];
-                if p.pointwise.is_none() || p.reduction.is_some() {
+                if p.pointwise.is_none() || p.reduction.is_some() || p.fusion_barrier {
                     continue;
                 }
                 // Producer must cover the per-element domain (outer*inner).
@@ -2573,7 +2573,23 @@ impl<'a> Compiler<'a> {
             | Op::StopGradient => {}
 
             Op::Materialize => {
-                self.emit_unary(ShaderEntry::Materialize, node, out_buf);
+                let input = self.get_buffer(node.inputs[0]);
+                let len = node.ty.num_elements() as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::Relu,
+                    workgroups: [len.div_ceil(256), 1, 1],
+                    input_buffers: vec![input],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![len, 0, 0, 0],
+                    pointwise: Some(PointwiseDAG {
+                        n_inputs: 1,
+                        ops: vec![Pw::LoadInput(0)],
+                        output: 0,
+                    }),
+                    fusion_barrier: true,
+                    ..Default::default()
+                });
             }
 
             Op::MatMul => {
@@ -5448,12 +5464,13 @@ mod tests {
 
         assert_eq!(plan.dispatches.len(), 2);
         let copy = &plan.dispatches[0];
-        assert_eq!(copy.shader, ShaderEntry::Materialize);
+        assert_eq!(copy.shader, ShaderEntry::Relu);
         assert_eq!(copy.params, [8, 0, 0, 0]);
         assert_eq!(copy.workgroups, [1, 1, 1]);
         assert_eq!(copy.input_buffers.len(), 1);
         assert_ne!(copy.input_buffers[0], copy.output_buffer);
-        assert!(copy.pointwise.is_none());
+        assert!(copy.pointwise.is_some());
+        assert!(copy.fusion_barrier);
 
         let split = &plan.dispatches[1];
         assert_eq!(split.shader, ShaderEntry::SplitA);
@@ -6048,7 +6065,6 @@ mod tests {
             ShaderEntry::Abs,
             ShaderEntry::Log,
             ShaderEntry::Recip,
-            ShaderEntry::Materialize,
             ShaderEntry::Add,
             ShaderEntry::Mul,
             ShaderEntry::Greater,
