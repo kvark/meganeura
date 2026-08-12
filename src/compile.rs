@@ -201,6 +201,7 @@ pub enum ShaderEntry {
     RmsNormRsqrt,
     GroupNorm,
     GroupNormSilu,
+    GroupNormApply,
     GroupNormGradInput,
     GroupNormGradWeightBias,
     Concat,
@@ -317,6 +318,7 @@ impl ShaderEntry {
             | ShaderEntry::RmsNormRsqrt
             | ShaderEntry::GroupNorm
             | ShaderEntry::GroupNormSilu
+            | ShaderEntry::GroupNormApply
             | ShaderEntry::GroupNormGradInput
             | ShaderEntry::GroupNormGradWeightBias
             | ShaderEntry::GlobalAvgPool
@@ -425,6 +427,7 @@ impl ShaderEntry {
             ShaderEntry::RmsNormRsqrt => ShaderGroup::RmsNormRsqrt,
             ShaderEntry::GroupNorm => ShaderGroup::GroupNorm,
             ShaderEntry::GroupNormSilu => ShaderGroup::GroupNormSilu,
+            ShaderEntry::GroupNormApply => ShaderGroup::GroupNorm,
             ShaderEntry::GroupNormGradInput => ShaderGroup::GroupNormGrad,
             ShaderEntry::GroupNormGradWeightBias => ShaderGroup::GroupNormGrad,
             ShaderEntry::Concat => ShaderGroup::Concat,
@@ -521,6 +524,7 @@ impl ShaderEntry {
             ShaderEntry::LayerNormGradX => "layer_norm_grad_x",
             ShaderEntry::RmsNormRsqrt => "main",
             ShaderEntry::GroupNorm | ShaderEntry::GroupNormSilu => "main",
+            ShaderEntry::GroupNormApply => "apply",
             ShaderEntry::GroupNormGradInput => "grad_input",
             ShaderEntry::GroupNormGradWeightBias => "grad_weight_bias",
             ShaderEntry::Concat => "main",
@@ -640,6 +644,51 @@ pub enum PrologueLoadKind {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MatMulPrologue {
     pub factors: Vec<(BufferRef, PrologueLoadKind)>,
+}
+/// Slices to split each GroupNorm group into, so the normalisation's
+/// parallelism follows the image instead of the batch.
+///
+/// The single-pass kernel launches `batch * num_groups` workgroups, which at
+/// inference is a handful however large the image is. Enough slices to fill
+/// the device, but not so many that a workgroup has less than a few thousand
+/// elements to chew on, nor that combining the partials costs more than
+/// splitting saved.
+pub fn group_norm_chunks(batch: u32, channels: u32, spatial: u32, num_groups: u32) -> u32 {
+    const TARGET_WORKGROUPS: u32 = 1024;
+    const MIN_PER_WORKGROUP: u32 = 2048;
+    let group_size = (channels / num_groups.max(1)) * spatial;
+    let by_occupancy = TARGET_WORKGROUPS.div_ceil((batch * num_groups).max(1));
+    let by_work = (group_size / MIN_PER_WORKGROUP).max(1);
+    let mut chunks = by_occupancy.min(by_work).clamp(1, 256);
+    // The generated reduction archetype treats every row as the same length.
+    // Pick the closest exact divisor so each chunk is one contiguous row and
+    // no bespoke ragged-tail statistics kernel is needed.
+    while !group_size.is_multiple_of(chunks) {
+        chunks -= 1;
+    }
+    chunks
+}
+
+fn group_norm_stats_kernel() -> crate::schedule::ReductionKernel {
+    use crate::schedule::{PointwiseDAG, Pw, ReduceOp, ReductionKernel};
+    ReductionKernel {
+        op: ReduceOp::Sum,
+        prologue: PointwiseDAG {
+            n_inputs: 1,
+            ops: vec![Pw::LoadInput(0)],
+            output: 0,
+        },
+        extra_prologues: vec![PointwiseDAG {
+            n_inputs: 1,
+            ops: vec![Pw::LoadInput(0), Pw::Mul(0, 0)],
+            output: 1,
+        }],
+        epilogue: None,
+        n_per_elem: 1,
+        n_per_row: 0,
+        workgroup_size: 256,
+        gather_elem: Vec::new(),
+    }
 }
 
 /// A single GPU dispatch in the execution plan.
@@ -2838,17 +2887,65 @@ impl<'a> Compiler<'a> {
                 let bias = self.get_buffer(node.inputs[2]);
                 let total = node.ty.shape[0] as u32;
                 let batch = total / (channels * spatial);
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::GroupNorm,
-                    workgroups: [batch * num_groups, 1, 1],
-                    input_buffers: vec![x, weight, bias],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![batch, channels, spatial, num_groups, eps.to_bits(), 0, 0, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
-                    ..Default::default()
-                });
+                // Two passes so the parallelism scales with the image: one
+                // workgroup per slice of a group, rather than one per group.
+                let chunks = group_norm_chunks(batch, channels, spatial, num_groups);
+                if chunks == 1 {
+                    // On small tensors the original kernel is already busy
+                    // enough. Keep its single dispatch instead of paying for
+                    // an intermediate buffer, another full tensor pass, and a
+                    // global barrier merely to split the group once.
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::GroupNorm,
+                        workgroups: [batch * num_groups, 1, 1],
+                        input_buffers: vec![x, weight, bias],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params: vec![batch, channels, spatial, num_groups, eps.to_bits(), 0, 0, 0],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
+                } else {
+                    let group_size = (channels / num_groups) * spatial;
+                    let slices = batch * num_groups * chunks;
+                    let partials = self.alloc_buffer(slices as usize * 2 * 4);
+                    let params = vec![
+                        batch,
+                        channels,
+                        spatial,
+                        num_groups,
+                        eps.to_bits(),
+                        chunks,
+                        0,
+                        0,
+                    ];
+                    self.plan.dispatches.push(Dispatch {
+                        // Generated-reduction routing takes priority over the
+                        // sentinel entry in pipeline selection and binding.
+                        shader: ShaderEntry::GroupNorm,
+                        workgroups: [slices, 1, 1],
+                        input_buffers: vec![x],
+                        output_buffer: partials,
+                        extra_outputs: vec![],
+                        params: vec![slices, group_size / chunks, 0, 0],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        reduction: Some(group_norm_stats_kernel()),
+                        ..Default::default()
+                    });
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::GroupNormApply,
+                        workgroups: [slices, 1, 1],
+                        input_buffers: vec![x, partials, weight, bias],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params,
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
+                }
             }
 
             Op::GroupNormSilu {
@@ -2862,17 +2959,59 @@ impl<'a> Compiler<'a> {
                 let bias = self.get_buffer(node.inputs[2]);
                 let total = node.ty.shape[0] as u32;
                 let batch = total / (channels * spatial);
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::GroupNormSilu,
-                    workgroups: [batch * num_groups, 1, 1],
-                    input_buffers: vec![x, weight, bias],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![batch, channels, spatial, num_groups, eps.to_bits(), 0, 0, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
-                    ..Default::default()
-                });
+                // Two passes so the parallelism scales with the image: one
+                // workgroup per slice of a group, rather than one per group.
+                let chunks = group_norm_chunks(batch, channels, spatial, num_groups);
+                if chunks == 1 {
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::GroupNormSilu,
+                        workgroups: [batch * num_groups, 1, 1],
+                        input_buffers: vec![x, weight, bias],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params: vec![batch, channels, spatial, num_groups, eps.to_bits(), 0, 0, 0],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
+                } else {
+                    let group_size = (channels / num_groups) * spatial;
+                    let slices = batch * num_groups * chunks;
+                    let partials = self.alloc_buffer(slices as usize * 2 * 4);
+                    let params = vec![
+                        batch,
+                        channels,
+                        spatial,
+                        num_groups,
+                        eps.to_bits(),
+                        chunks,
+                        1,
+                        0,
+                    ];
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::GroupNorm,
+                        workgroups: [slices, 1, 1],
+                        input_buffers: vec![x],
+                        output_buffer: partials,
+                        extra_outputs: vec![],
+                        params: vec![slices, group_size / chunks, 0, 0],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        reduction: Some(group_norm_stats_kernel()),
+                        ..Default::default()
+                    });
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::GroupNormApply,
+                        workgroups: [slices, 1, 1],
+                        input_buffers: vec![x, partials, weight, bias],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params,
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
+                }
             }
 
             Op::GroupNormGradInput {
@@ -4888,5 +5027,34 @@ mod tests {
                 .filter(|dispatch| dispatch.reduction.is_some())
                 .all(|dispatch| dispatch.profile_family() == "normalization_reduction")
         );
+    }
+
+    #[test]
+    fn group_norm_only_splits_when_there_is_parallel_work_to_gain() {
+        let make_plan = |spatial: u32| {
+            let mut graph = Graph::new();
+            let channels = 8;
+            let groups = 8;
+            let input = graph.input("input", &[(channels * spatial) as usize]);
+            let weight = graph.parameter("weight", &[channels as usize]);
+            let bias = graph.parameter("bias", &[channels as usize]);
+            let output =
+                graph.group_norm(input, weight, bias, 1, channels, spatial, groups, 1.0e-5);
+            graph.set_outputs(vec![output]);
+            compile(&graph)
+        };
+
+        let small = make_plan(256);
+        assert_eq!(small.dispatches.len(), 1);
+        assert_eq!(small.dispatches[0].shader, ShaderEntry::GroupNorm);
+
+        let large = make_plan(8202);
+        assert_eq!(large.dispatches.len(), 2);
+        assert!(large.dispatches[0].reduction.is_some());
+        assert_eq!(large.dispatches[1].shader, ShaderEntry::GroupNormApply);
+        let chunks = large.dispatches[1].params[5];
+        assert_eq!(chunks, 3);
+        assert_eq!(8202 % chunks, 0);
+        assert_eq!(large.dispatches[0].params[..2], [8 * chunks, 8202 / chunks]);
     }
 }

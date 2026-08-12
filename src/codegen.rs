@@ -5401,6 +5401,9 @@ mod tests {
                 ShaderEntry::GroupNorm | ShaderEntry::GroupNormSilu => {
                     vec!["src", "src_b", "bias", "dst", "params"]
                 }
+                ShaderEntry::GroupNormApply => {
+                    vec!["src", "src_b", "bias", "dst", "partials", "params"]
+                }
                 ShaderEntry::GroupNormGradInput => vec!["src_a", "src_b", "bias", "dst", "params"],
                 ShaderEntry::GroupNormGradWeightBias => {
                     vec!["src_a", "src_b", "bias", "dst", "params"]
@@ -5506,6 +5509,8 @@ mod tests {
             ShaderEntry::ScatterAdd,
             ShaderEntry::BceLoss,
             ShaderEntry::GroupNorm,
+            ShaderEntry::GroupNormSilu,
+            ShaderEntry::GroupNormApply,
             ShaderEntry::GroupNormGradInput,
             ShaderEntry::GroupNormGradWeightBias,
             ShaderEntry::Concat,
@@ -5536,24 +5541,37 @@ mod tests {
             let expected: HashSet<&str> = expected_globals(entry).into_iter().collect();
 
             let sm = generate_module(group);
+            let info = naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS,
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&sm.module)
+            .unwrap();
+            let ep_index = sm
+                .module
+                .entry_points
+                .iter()
+                .position(|ep| ep.name == entry.entry_point())
+                .unwrap();
+            let ep_info = info.get_entry_point(ep_index);
 
             let actual: HashSet<&str> = sm
                 .module
                 .global_variables
                 .iter()
-                .filter_map(|(_, gv)| {
-                    // Skip workgroup variables — blade doesn't bind those
-                    if gv.space == naga::AddressSpace::WorkGroup {
+                .filter_map(|(handle, gv)| {
+                    // Blade binds only resources used by this entry point.
+                    if gv.space == naga::AddressSpace::WorkGroup || ep_info[handle].is_empty() {
                         return None;
                     }
                     gv.name.as_deref()
                 })
                 .collect();
 
-            assert_eq!(
-                expected, actual,
-                "{entry:?} (group {group:?}): shader globals {actual:?} \
-                 don't match expected runtime bindings {expected:?}"
+            assert!(
+                actual.is_subset(&expected),
+                "{entry:?} (group {group:?}): shader globals {actual:?} include resources \
+                 absent from the runtime bindings {expected:?}"
             );
         }
     }

@@ -86,6 +86,12 @@ pub struct OptimizeConfig {
     pub extraction_cost: ExtractionCost,
     /// Maximum nodes in an outlined region or residual window.
     pub saturation_cutoff: usize,
+    /// Skip the Conv2d-to-Winograd rewrite.
+    ///
+    /// The selection heuristic weighs channel counts only, so a workload
+    /// with few channels over a large image sits near its boundary; this
+    /// makes which side it should be on measurable without a rebuild.
+    pub no_winograd: bool,
 }
 
 impl Default for OptimizeConfig {
@@ -94,6 +100,7 @@ impl Default for OptimizeConfig {
             mode: OptimizeMode::Greedy,
             extraction_cost: ExtractionCost::TensorTraffic,
             saturation_cutoff: SATURATION_CUTOFF,
+            no_winograd: false,
         }
     }
 }
@@ -1602,7 +1609,15 @@ pub fn apply_group_norm_silu_fusions(graph: &mut Graph, fusions: &mut Vec<(Strin
 ///
 /// For each matching Conv2d node, creates a derived parameter for the Winograd-transformed
 /// weights and rewrites the node to WinogradConv2d.
-pub fn apply_winograd_conv_fusions(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
+pub fn apply_winograd_conv_fusions(
+    graph: &mut Graph,
+    fusions: &mut Vec<(String, u32)>,
+    config: &OptimizeConfig,
+) {
+    if config.no_winograd {
+        log::info!("Winograd convolution disabled by OptimizeConfig::no_winograd");
+        return;
+    }
     let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
     for &id in &node_ids {
         let node = &graph.nodes()[id];
@@ -2039,6 +2054,7 @@ mod tests {
                         mode,
                         extraction_cost,
                         saturation_cutoff: 3,
+                        ..OptimizeConfig::default()
                     },
                 );
                 assert!(

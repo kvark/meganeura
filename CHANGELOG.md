@@ -1,5 +1,14 @@
 # Unreleased
 
+- External GPU composition: `Session::output_buffer` exposes a pinned graph
+  output as a Blade `BufferPiece`, so a renderer sharing the context can feed
+  a prediction directly into its next compute pass without a host readback.
+- GroupNorm inference splits large image groups into parallel statistics and
+  apply passes. Statistics use the generated reduction path and application is
+  an entry point in the existing GroupNorm module, rather than two new shader
+  groups. Small tensors retain the original single-pass kernel, avoiding an
+  extra tensor traversal and barrier when the split would contain one chunk.
+
 - The library core is now environment-free: `compile`, `runtime`,
   `codegen`, and `optimize` accept strongly typed options and never read
   `MEGANEURA_*` variables. New typed surface: `CoopPolicy`
