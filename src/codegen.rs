@@ -5104,7 +5104,6 @@ mod tests {
             .map(|ep| ep.name.as_str())
             .collect();
         assert!(names.contains(&"sum_rows"));
-        assert!(names.contains(&"exclusive_cumsum"));
     }
 
     #[test]
@@ -5362,7 +5361,6 @@ mod tests {
                 | ShaderEntry::SumAll
                 | ShaderEntry::MeanAll
                 | ShaderEntry::SumRows
-                | ShaderEntry::ExclusiveCumsum
                 | ShaderEntry::RoPE
                 | ShaderEntry::RoPEGrad => vec!["src", "dst", "params"],
                 ShaderEntry::Add
@@ -5511,7 +5509,6 @@ mod tests {
             ShaderEntry::GradAccum,
             ShaderEntry::SumAll,
             ShaderEntry::MeanAll,
-            ShaderEntry::ExclusiveCumsum,
             ShaderEntry::Softmax,
             ShaderEntry::CrossEntropyLoss,
             ShaderEntry::Transpose,

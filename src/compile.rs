@@ -193,7 +193,6 @@ pub enum ShaderEntry {
     SwiGLUConcat,
     SwiGLUConcatGrad,
     SumRows,
-    ExclusiveCumsum,
     RmsNormGradW,
     RmsNormGradWRowPar,
     RmsNormGradX,
@@ -341,7 +340,6 @@ impl ShaderEntry {
 
             ShaderEntry::ScatterAdd
             | ShaderEntry::ScatterAddAtomic
-            | ShaderEntry::ExclusiveCumsum
             | ShaderEntry::Transpose
             | ShaderEntry::Embedding
             | ShaderEntry::ToF16
@@ -429,7 +427,7 @@ impl ShaderEntry {
                 ShaderGroup::SwiGLUGrad
             }
             ShaderEntry::SwiGLUConcat | ShaderEntry::SwiGLUConcatGrad => ShaderGroup::SwiGLUConcat,
-            ShaderEntry::SumRows | ShaderEntry::ExclusiveCumsum => ShaderGroup::SumRows,
+            ShaderEntry::SumRows => ShaderGroup::SumRows,
             ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => ShaderGroup::RmsNormGrad,
             ShaderEntry::RmsNormGradWRowPar => ShaderGroup::RmsNormGradWRowPar,
             ShaderEntry::LayerNormGradWB | ShaderEntry::LayerNormGradX => {
@@ -532,7 +530,6 @@ impl ShaderEntry {
             ShaderEntry::SwiGLUConcat => "swiglu_concat",
             ShaderEntry::SwiGLUConcatGrad => "swiglu_concat_grad",
             ShaderEntry::SumRows => "sum_rows",
-            ShaderEntry::ExclusiveCumsum => "exclusive_cumsum",
             ShaderEntry::RmsNormGradW => "rms_norm_grad_w",
             ShaderEntry::RmsNormGradWRowPar => "rms_norm_grad_w_rowpar",
             ShaderEntry::RmsNormGradX => "rms_norm_grad_x",
@@ -2994,12 +2991,12 @@ impl<'a> Compiler<'a> {
                 let m = in_shape[0] as u32;
                 let n = in_shape[1] as u32;
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::ExclusiveCumsum,
-                    workgroups: [m.div_ceil(64), 1, 1],
+                    shader: ShaderEntry::GlobalAvgPoolGrad,
+                    workgroups: [m.div_ceil(256), 1, 1],
                     input_buffers: vec![input],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
-                    params: vec![m, n, u32::from(reverse), 0],
+                    params: vec![m, n, 3, u32::from(reverse)],
                     use_coop: false,
                     use_small_tiles: false,
                     ..Default::default()
@@ -6032,7 +6029,6 @@ mod tests {
             ShaderEntry::SumAll,
             ShaderEntry::MeanAll,
             ShaderEntry::SumRows,
-            ShaderEntry::ExclusiveCumsum,
             ShaderEntry::Softmax,
             ShaderEntry::CrossEntropyLoss,
             ShaderEntry::BceLoss,
