@@ -5375,7 +5375,7 @@ mod tests {
                 ShaderEntry::SgdUpdate => vec!["param", "grad", "dst", "params"],
                 ShaderEntry::AdamUpdate => vec!["param", "grad", "m", "v", "params"],
                 ShaderEntry::ScatterAdd => vec!["indices", "src", "dst", "params"],
-                ShaderEntry::ScatterAddAtomic | ShaderEntry::ScatterAddAtomicRowMul => {
+                ShaderEntry::ScatterAddAtomic => {
                     vec!["indices", "src", "row_scale", "dst", "params"]
                 }
                 ShaderEntry::BceLoss => vec!["pred", "labels", "grad_out", "loss_out", "params"],
@@ -5546,7 +5546,6 @@ mod tests {
             ShaderEntry::AdamUpdate,
             ShaderEntry::ScatterAdd,
             ShaderEntry::ScatterAddAtomic,
-            ShaderEntry::ScatterAddAtomicRowMul,
             ShaderEntry::BceLoss,
             ShaderEntry::GroupNorm,
             ShaderEntry::GroupNormSilu,

@@ -271,9 +271,7 @@ fn compute_pinned(
             // KV caches persist across steps.
             ShaderEntry::CacheWrite => pinned[d.output_buffer.0 as usize] = true,
             // Read-modify-write accumulation into the output.
-            ShaderEntry::ScatterAdd
-            | ShaderEntry::ScatterAddAtomic
-            | ShaderEntry::ScatterAddAtomicRowMul => {
+            ShaderEntry::ScatterAdd | ShaderEntry::ScatterAddAtomic => {
                 uses[d.output_buffer.0 as usize].read(g);
             }
             _ => {}

@@ -150,8 +150,6 @@ pub enum ShaderEntry {
     AdamUpdate,
     ScatterAdd,
     ScatterAddAtomic,
-    /// Atomic scatter where each source row is multiplied by one scalar.
-    ScatterAddAtomicRowMul,
     SumAll,
     MeanAll,
     Softmax,
@@ -343,7 +341,6 @@ impl ShaderEntry {
 
             ShaderEntry::ScatterAdd
             | ShaderEntry::ScatterAddAtomic
-            | ShaderEntry::ScatterAddAtomicRowMul
             | ShaderEntry::ExclusiveCumsum
             | ShaderEntry::Transpose
             | ShaderEntry::Embedding
@@ -404,9 +401,7 @@ impl ShaderEntry {
             ShaderEntry::SgdUpdate => ShaderGroup::Sgd,
             ShaderEntry::AdamUpdate => ShaderGroup::Adam,
             ShaderEntry::ScatterAdd => ShaderGroup::ScatterAdd,
-            ShaderEntry::ScatterAddAtomic | ShaderEntry::ScatterAddAtomicRowMul => {
-                ShaderGroup::ScatterAddAtomic
-            }
+            ShaderEntry::ScatterAddAtomic => ShaderGroup::ScatterAddAtomic,
             ShaderEntry::SumAll | ShaderEntry::MeanAll => ShaderGroup::Reduce,
             ShaderEntry::Softmax => ShaderGroup::Softmax,
             ShaderEntry::CrossEntropyLoss => ShaderGroup::CrossEntropy,
@@ -501,7 +496,6 @@ impl ShaderEntry {
             | ShaderEntry::CrossEntropyLoss
             | ShaderEntry::BceLoss
             | ShaderEntry::Transpose => "main",
-            ShaderEntry::ScatterAddAtomicRowMul => "row_mul",
             ShaderEntry::Relu => "relu",
             ShaderEntry::Sigmoid => "sigmoid",
             ShaderEntry::Tanh => "tanh_",
@@ -616,6 +610,11 @@ impl Dispatch {
         self.pointwise.as_ref().is_some_and(|dag| {
             dag.n_inputs == 1 && dag.ops == [Pw::const_f32(0.0)] && dag.output == 0
         })
+    }
+
+    #[cfg(test)]
+    fn is_row_scaled_atomic_scatter(&self) -> bool {
+        self.shader == ShaderEntry::ScatterAddAtomic && self.params.get(3) == Some(&1)
     }
 }
 
@@ -1041,7 +1040,10 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
 
         let mut candidate = None;
         for (scatter_index, scatter) in plan.dispatches.iter().enumerate() {
-            if scatter.shader != ShaderEntry::ScatterAddAtomic || scatter.input_buffers.len() != 3 {
+            if scatter.shader != ShaderEntry::ScatterAddAtomic
+                || scatter.params.get(3) != Some(&0)
+                || scatter.input_buffers.len() != 3
+            {
                 continue;
             }
             let indices = scatter.input_buffers[0];
@@ -1134,8 +1136,8 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
 
         let output = plan.dispatches[scatter_index].output_buffer;
         let total = plan.dispatches[scatter_index].params[0];
-        plan.dispatches[scatter_index].shader = ShaderEntry::ScatterAddAtomicRowMul;
         plan.dispatches[scatter_index].input_buffers = vec![indices, factors, row_scale, output];
+        plan.dispatches[scatter_index].params[3] = 1;
         plan.dispatches[scatter_index].pointwise = None;
         plan.dispatches[scatter_index].label = format!("ScatterAddAtomicRowMul[{total}]");
         // The zero entry point does not read `src`, but its shared binding
@@ -5706,11 +5708,11 @@ mod tests {
         let fused = plan
             .dispatches
             .iter()
-            .find(|dispatch| dispatch.shader == ShaderEntry::ScatterAddAtomicRowMul)
+            .find(|dispatch| dispatch.is_row_scaled_atomic_scatter())
             .expect("gathered row reduction should fuse its table gradient");
         assert_eq!(
             fused.params,
-            [VOCAB as u32 * INNER as u32, SEQ as u32, INNER as u32, 0]
+            [VOCAB as u32 * INNER as u32, SEQ as u32, INNER as u32, 1]
         );
         assert_eq!(fused.workgroups, [16, 1, 1]);
         assert_eq!(fused.input_buffers.len(), 4);
@@ -6027,7 +6029,6 @@ mod tests {
             ShaderEntry::AdamUpdate,
             ShaderEntry::ScatterAdd,
             ShaderEntry::ScatterAddAtomic,
-            ShaderEntry::ScatterAddAtomicRowMul,
             ShaderEntry::SumAll,
             ShaderEntry::MeanAll,
             ShaderEntry::SumRows,
