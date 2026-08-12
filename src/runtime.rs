@@ -1731,9 +1731,9 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::SgdUpdate => SgdData::layout(),
         ShaderEntry::AdamUpdate => AdamData::layout(),
         ShaderEntry::ScatterAdd => ScatterAddData::layout(),
-        ShaderEntry::ScatterAddAtomicZero
-        | ShaderEntry::ScatterAddAtomic
-        | ShaderEntry::ScatterAddAtomicRowMul => ScatterAddAtomicData::layout(),
+        ShaderEntry::ScatterAddAtomic | ShaderEntry::ScatterAddAtomicRowMul => {
+            ScatterAddAtomicData::layout()
+        }
         ShaderEntry::SwiGLUConcat | ShaderEntry::SwiGLUConcatGrad => BinaryData::layout(),
         ShaderEntry::SumAll
         | ShaderEntry::MeanAll
@@ -5726,7 +5726,7 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::ScatterAddAtomicZero | ShaderEntry::ScatterAddAtomic => {
+            ShaderEntry::ScatterAddAtomic => {
                 pc.bind(
                     0,
                     &ScatterAddAtomicData {
