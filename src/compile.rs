@@ -197,7 +197,6 @@ pub enum ShaderEntry {
     SwiGLUConcatGrad,
     SumRows,
     ExclusiveCumsum,
-    ShiftInner,
     RmsNormGradW,
     RmsNormGradWRowPar,
     RmsNormGradX,
@@ -348,7 +347,6 @@ impl ShaderEntry {
             | ShaderEntry::ScatterAddAtomic
             | ShaderEntry::ScatterAddAtomicRowMul
             | ShaderEntry::ExclusiveCumsum
-            | ShaderEntry::ShiftInner
             | ShaderEntry::Transpose
             | ShaderEntry::Embedding
             | ShaderEntry::ToF16
@@ -438,9 +436,7 @@ impl ShaderEntry {
                 ShaderGroup::SwiGLUGrad
             }
             ShaderEntry::SwiGLUConcat | ShaderEntry::SwiGLUConcatGrad => ShaderGroup::SwiGLUConcat,
-            ShaderEntry::SumRows | ShaderEntry::ExclusiveCumsum | ShaderEntry::ShiftInner => {
-                ShaderGroup::SumRows
-            }
+            ShaderEntry::SumRows | ShaderEntry::ExclusiveCumsum => ShaderGroup::SumRows,
             ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => ShaderGroup::RmsNormGrad,
             ShaderEntry::RmsNormGradWRowPar => ShaderGroup::RmsNormGradWRowPar,
             ShaderEntry::LayerNormGradWB | ShaderEntry::LayerNormGradX => {
@@ -546,7 +542,6 @@ impl ShaderEntry {
             ShaderEntry::SwiGLUConcatGrad => "swiglu_concat_grad",
             ShaderEntry::SumRows => "sum_rows",
             ShaderEntry::ExclusiveCumsum => "exclusive_cumsum",
-            ShaderEntry::ShiftInner => "shift_inner",
             ShaderEntry::RmsNormGradW => "rms_norm_grad_w",
             ShaderEntry::RmsNormGradWRowPar => "rms_norm_grad_w_rowpar",
             ShaderEntry::RmsNormGradX => "rms_norm_grad_x",
@@ -600,7 +595,7 @@ impl Dispatch {
     /// layout compatibility, so their schedule kind takes precedence over
     /// that placeholder when profiling.
     pub fn profile_family(&self) -> &'static str {
-        if self.is_inner_broadcast() {
+        if self.is_row_data_movement() {
             "data_movement"
         } else if self.reduction.is_some() {
             "normalization_reduction"
@@ -613,6 +608,11 @@ impl Dispatch {
 
     fn is_inner_broadcast(&self) -> bool {
         self.shader == ShaderEntry::GlobalAvgPoolGrad && self.params.get(2) == Some(&1)
+    }
+
+    fn is_row_data_movement(&self) -> bool {
+        self.shader == ShaderEntry::GlobalAvgPoolGrad
+            && self.params.get(2).is_some_and(|&mode| mode != 0)
     }
 }
 
@@ -3012,12 +3012,12 @@ impl<'a> Compiler<'a> {
                     .checked_mul(n)
                     .expect("shift_inner element count exceeds u32");
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::ShiftInner,
+                    shader: ShaderEntry::GlobalAvgPoolGrad,
                     workgroups: [len.div_ceil(256), 1, 1],
                     input_buffers: vec![input],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
-                    params: vec![m, n, offset as u32, 0],
+                    params: vec![len, n, 2, offset as u32],
                     use_coop: false,
                     use_small_tiles: false,
                     ..Default::default()
@@ -6079,7 +6079,6 @@ mod tests {
             ShaderEntry::MeanAll,
             ShaderEntry::SumRows,
             ShaderEntry::ExclusiveCumsum,
-            ShaderEntry::ShiftInner,
             ShaderEntry::Softmax,
             ShaderEntry::CrossEntropyLoss,
             ShaderEntry::BceLoss,

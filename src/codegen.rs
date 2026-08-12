@@ -5105,7 +5105,6 @@ mod tests {
             .collect();
         assert!(names.contains(&"sum_rows"));
         assert!(names.contains(&"exclusive_cumsum"));
-        assert!(names.contains(&"shift_inner"));
     }
 
     #[test]
@@ -5364,7 +5363,6 @@ mod tests {
                 | ShaderEntry::MeanAll
                 | ShaderEntry::SumRows
                 | ShaderEntry::ExclusiveCumsum
-                | ShaderEntry::ShiftInner
                 | ShaderEntry::RoPE
                 | ShaderEntry::RoPEGrad => vec!["src", "dst", "params"],
                 ShaderEntry::Add
@@ -5516,7 +5514,6 @@ mod tests {
             ShaderEntry::SumAll,
             ShaderEntry::MeanAll,
             ShaderEntry::ExclusiveCumsum,
-            ShaderEntry::ShiftInner,
             ShaderEntry::Softmax,
             ShaderEntry::CrossEntropyLoss,
             ShaderEntry::Transpose,

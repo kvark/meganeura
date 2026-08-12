@@ -1738,8 +1738,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::SumAll
         | ShaderEntry::MeanAll
         | ShaderEntry::SumRows
-        | ShaderEntry::ExclusiveCumsum
-        | ShaderEntry::ShiftInner => UnaryData::layout(),
+        | ShaderEntry::ExclusiveCumsum => UnaryData::layout(),
         ShaderEntry::Softmax => SoftmaxData::layout(),
         ShaderEntry::CrossEntropyLoss => CrossEntropyData::layout(),
         ShaderEntry::BceLoss => BceData::layout(),
@@ -5224,7 +5223,7 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::ExclusiveCumsum | ShaderEntry::ShiftInner => {
+            ShaderEntry::ExclusiveCumsum => {
                 pc.bind(
                     0,
                     &UnaryData {
