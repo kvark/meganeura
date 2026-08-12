@@ -241,7 +241,6 @@ pub enum ShaderEntry {
     MaxPool2d,
     GlobalAvgPool,
     GlobalAvgPoolGrad,
-    BroadcastInner,
     PairwiseSquaredDistanceGradLeft,
     PairwiseSquaredDistanceGradRight,
     PairwiseVectorRejectionGradDirections,
@@ -348,7 +347,6 @@ impl ShaderEntry {
             | ShaderEntry::ScatterAddAtomicZero
             | ShaderEntry::ScatterAddAtomic
             | ShaderEntry::ScatterAddAtomicRowMul
-            | ShaderEntry::BroadcastInner
             | ShaderEntry::ExclusiveCumsum
             | ShaderEntry::ShiftInner
             | ShaderEntry::Transpose
@@ -474,9 +472,7 @@ impl ShaderEntry {
             ShaderEntry::RoPEDynamic => ShaderGroup::RoPEDynamic,
             ShaderEntry::MaxPool2d => ShaderGroup::MaxPool2d,
             ShaderEntry::GlobalAvgPool => ShaderGroup::GlobalAvgPool,
-            ShaderEntry::GlobalAvgPoolGrad | ShaderEntry::BroadcastInner => {
-                ShaderGroup::GlobalAvgPoolGrad
-            }
+            ShaderEntry::GlobalAvgPoolGrad => ShaderGroup::GlobalAvgPoolGrad,
             ShaderEntry::PairwiseSquaredDistanceGradLeft
             | ShaderEntry::PairwiseSquaredDistanceGradRight
             | ShaderEntry::PairwiseVectorRejectionGradDirections => ShaderGroup::PairwiseGrad,
@@ -582,7 +578,6 @@ impl ShaderEntry {
             ShaderEntry::MaxPool2d => "max_pool_2d",
             ShaderEntry::GlobalAvgPool => "global_avg_pool",
             ShaderEntry::GlobalAvgPoolGrad => "main",
-            ShaderEntry::BroadcastInner => "broadcast_inner",
             ShaderEntry::PairwiseSquaredDistanceGradLeft => "grad_left",
             ShaderEntry::PairwiseSquaredDistanceGradRight => "grad_right",
             ShaderEntry::PairwiseVectorRejectionGradDirections => "grad_directions",
@@ -605,13 +600,19 @@ impl Dispatch {
     /// layout compatibility, so their schedule kind takes precedence over
     /// that placeholder when profiling.
     pub fn profile_family(&self) -> &'static str {
-        if self.reduction.is_some() {
+        if self.is_inner_broadcast() {
+            "data_movement"
+        } else if self.reduction.is_some() {
             "normalization_reduction"
         } else if self.pointwise.is_some() {
             "pointwise"
         } else {
             self.shader.profile_family()
         }
+    }
+
+    fn is_inner_broadcast(&self) -> bool {
+        self.shader == ShaderEntry::GlobalAvgPoolGrad && self.params.get(2) == Some(&1)
     }
 }
 
@@ -1066,7 +1067,7 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
                 .iter()
                 .enumerate()
                 .find_map(|(side, buffer)| match producer.get(buffer).copied() {
-                    Some(index) if plan.dispatches[index].shader == ShaderEntry::BroadcastInner => {
+                    Some(index) if plan.dispatches[index].is_inner_broadcast() => {
                         Some((side, index))
                     }
                     _ => None,
@@ -1100,7 +1101,7 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
             }
             let source_len = scatter.params[1].saturating_mul(scatter.params[2]);
             if mul.params != [source_len, 0, 0, 0]
-                || broadcast.params != [source_len, scatter.params[2], 0, 0]
+                || broadcast.params != [source_len, scatter.params[2], 1, 0]
                 || scatter.workgroups != [source_len.div_ceil(256), 1, 1]
             {
                 continue;
@@ -2348,12 +2349,12 @@ impl<'a> Compiler<'a> {
             .checked_mul(inner)
             .expect("inner broadcast element count exceeds u32");
         self.plan.dispatches.push(Dispatch {
-            shader: ShaderEntry::BroadcastInner,
+            shader: ShaderEntry::GlobalAvgPoolGrad,
             workgroups: [total.div_ceil(256), 1, 1],
             input_buffers: vec![input],
             output_buffer: output,
             extra_outputs: vec![],
-            params: vec![total, inner, 0, 0],
+            params: vec![total, inner, 1, 0],
             use_coop: false,
             use_small_tiles: false,
             ..Default::default()
@@ -5599,8 +5600,8 @@ mod tests {
         let backward_plan = compile(&backward);
         assert_eq!(backward_plan.dispatches.len(), 1);
         let broadcast = &backward_plan.dispatches[0];
-        assert_eq!(broadcast.shader, ShaderEntry::BroadcastInner);
-        assert_eq!(broadcast.params, [300, 3, 0, 0]);
+        assert!(broadcast.is_inner_broadcast());
+        assert_eq!(broadcast.params, [300, 3, 1, 0]);
         assert_eq!(broadcast.input_buffers.len(), 1);
 
         let mut non_unit = Graph::new();
@@ -5628,8 +5629,7 @@ mod tests {
             .dispatches
             .iter()
             .find(|dispatch| {
-                dispatch.shader == ShaderEntry::BroadcastInner
-                    && dispatch.params == [513 * 16, 16, 0, 0]
+                dispatch.is_inner_broadcast() && dispatch.params == [513 * 16, 16, 1, 0]
             })
             .expect("sum_inner backward should emit a direct row broadcast");
         assert_eq!(broadcast.workgroups, [33, 1, 1]);
@@ -5761,8 +5761,8 @@ mod tests {
         assert_eq!(fused.input_buffers.len(), 4);
         assert_eq!(fused.input_buffers[3], fused.output_buffer);
         assert!(!plan.dispatches.iter().any(|dispatch| {
-            dispatch.shader == ShaderEntry::BroadcastInner
-                && dispatch.params == [SEQ as u32 * INNER as u32, INNER as u32, 0, 0]
+            dispatch.is_inner_broadcast()
+                && dispatch.params == [SEQ as u32 * INNER as u32, INNER as u32, 1, 0]
         }));
 
         let zero = plan

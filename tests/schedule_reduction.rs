@@ -323,6 +323,31 @@ fn broadcast_inner_forward_and_gradient_match_explicit_repetition() {
 }
 
 #[test]
+fn global_avg_pool_gradient_keeps_spatial_normalization() {
+    const BATCH: usize = 2;
+    const CHANNELS: usize = 3;
+    const SPATIAL: usize = 5;
+
+    let mut graph = Graph::new();
+    let input = graph.parameter("input", &[BATCH * CHANNELS * SPATIAL]);
+    let pooled = graph.global_avg_pool(input, BATCH as u32, CHANNELS as u32, SPATIAL as u32);
+    let loss = graph.sum_all(pooled);
+    graph.set_outputs(vec![loss]);
+
+    let mut session = meganeura::build_session(&graph);
+    let input_data = [1.0; BATCH * CHANNELS * SPATIAL];
+    session.set_parameter("input", &input_data);
+    session.step();
+    session.wait();
+
+    let mut gradient = vec![0.0; BATCH * CHANNELS * SPATIAL];
+    session.read_param_grad("input", &mut gradient);
+    for value in gradient {
+        assert!((value - (SPATIAL as f32).recip()).abs() <= 1.0e-7);
+    }
+}
+
+#[test]
 fn normalize_inner_sum_matches_explicit_forward_and_gradient() {
     const ROWS: usize = 257;
     const INNER: usize = 8;
