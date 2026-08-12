@@ -3288,54 +3288,6 @@ impl<'a> Compiler<'a> {
                 });
             }
 
-            Op::PairwiseVectorRejectionGradVectors { inner, pairs } => {
-                let grad_output = self.get_buffer(node.inputs[0]);
-                let directions = self.get_buffer(node.inputs[2]);
-                let total = u32::try_from(node.ty.shape[0])
-                    .expect("pairwise vector gradient rows exceed u32");
-                let kernel = ReductionKernel {
-                    op: crate::schedule::ReduceOp::Sum,
-                    prologue: PointwiseDAG {
-                        n_inputs: 2,
-                        ops: vec![Pw::LoadInput(0), Pw::LoadInput(1), Pw::Mul(0, 1)],
-                        output: 2,
-                    },
-                    extra_prologues: vec![],
-                    epilogue: Some(ReductionEpilogue {
-                        dag: PointwiseDAG {
-                            n_inputs: 3,
-                            ops: vec![
-                                Pw::LoadInput(0),
-                                Pw::LoadInput(1),
-                                Pw::LoadInput(2),
-                                Pw::Mul(1, 2),
-                                Pw::Sub(0, 3),
-                            ],
-                            output: 4,
-                        },
-                        n_per_col_inputs: 0,
-                    }),
-                    n_per_elem: 2,
-                    n_per_row: 0,
-                    workgroup_size: 256,
-                    rows_per_workgroup: 256,
-                    gather_elem: vec![],
-                    input_row_repeats: vec![1, pairs],
-                };
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Relu,
-                    workgroups: [total.div_ceil(256), 1, 1],
-                    input_buffers: vec![grad_output, directions],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![total, inner, 1.0_f32.to_bits(), 0],
-                    use_coop: false,
-                    use_small_tiles: false,
-                    reduction: Some(kernel),
-                    ..Default::default()
-                });
-            }
-
             Op::PairwiseVectorRejectionGradDirections { inner, pairs } => {
                 let grad_output = self.get_buffer(node.inputs[0]);
                 let vectors = self.get_buffer(node.inputs[1]);
