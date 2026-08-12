@@ -167,11 +167,6 @@ pub enum Op {
     PairwiseVectorRejection {
         pairs: u32,
     },
-    /// Backward helper for vector inputs to [`Op::PairwiseVectorRejection`].
-    PairwiseVectorRejectionGradVectors {
-        inner: u32,
-        pairs: u32,
-    },
     /// Backward helper for shared directions in [`Op::PairwiseVectorRejection`].
     PairwiseVectorRejectionGradDirections {
         inner: u32,

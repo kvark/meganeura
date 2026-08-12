@@ -323,15 +323,11 @@ pub fn differentiate(forward: &Graph) -> Graph {
             Op::PairwiseVectorRejection { pairs } => {
                 let vectors = node.inputs[0];
                 let directions = node.inputs[1];
-                let vector_ty = forward.nodes()[vectors as usize].ty.clone();
                 let direction_ty = forward.nodes()[directions as usize].ty.clone();
                 let inner = u32::try_from(direction_ty.shape[1])
                     .expect("pairwise vector width exceeds u32");
-                let grad_vectors = graph.add_raw_node(
-                    Op::PairwiseVectorRejectionGradVectors { inner, pairs },
-                    vec![grad_output, vectors, directions],
-                    vector_ty,
-                );
+                let grad_vectors =
+                    graph.pairwise_vector_rejection(grad_output, directions, pairs as usize);
                 let grad_directions = graph.add_raw_node(
                     Op::PairwiseVectorRejectionGradDirections { inner, pairs },
                     vec![grad_output, vectors, directions],
@@ -627,7 +623,6 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::NormalizeInnerSumGrad { .. }
             | Op::PairwiseSquaredDistanceGradLeft { .. }
             | Op::PairwiseSquaredDistanceGradRight { .. }
-            | Op::PairwiseVectorRejectionGradVectors { .. }
             | Op::PairwiseVectorRejectionGradDirections { .. }
             | Op::GlobalAvgPoolGrad { .. } => {}
             Op::Gelu => {
