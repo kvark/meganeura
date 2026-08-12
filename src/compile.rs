@@ -236,9 +236,7 @@ pub enum ShaderEntry {
     MaxPool2d,
     GlobalAvgPool,
     GlobalAvgPoolGrad,
-    PairwiseSquaredDistanceGradLeft,
-    PairwiseSquaredDistanceGradRight,
-    PairwiseVectorRejectionGradDirections,
+    PairwiseGrad,
     WinogradInputTransform,
     WinogradOutputTransform,
     WinogradBatchedMatMul,
@@ -327,9 +325,7 @@ impl ShaderEntry {
             | ShaderEntry::GroupNormGradWeightBias
             | ShaderEntry::GlobalAvgPool
             | ShaderEntry::GlobalAvgPoolGrad
-            | ShaderEntry::PairwiseSquaredDistanceGradLeft
-            | ShaderEntry::PairwiseSquaredDistanceGradRight
-            | ShaderEntry::PairwiseVectorRejectionGradDirections => "normalization_reduction",
+            | ShaderEntry::PairwiseGrad => "normalization_reduction",
 
             ShaderEntry::SgdUpdate
             | ShaderEntry::AdamUpdate
@@ -460,9 +456,7 @@ impl ShaderEntry {
             ShaderEntry::MaxPool2d => ShaderGroup::MaxPool2d,
             ShaderEntry::GlobalAvgPool => ShaderGroup::GlobalAvgPool,
             ShaderEntry::GlobalAvgPoolGrad => ShaderGroup::GlobalAvgPoolGrad,
-            ShaderEntry::PairwiseSquaredDistanceGradLeft
-            | ShaderEntry::PairwiseSquaredDistanceGradRight
-            | ShaderEntry::PairwiseVectorRejectionGradDirections => ShaderGroup::PairwiseGrad,
+            ShaderEntry::PairwiseGrad => ShaderGroup::PairwiseGrad,
             ShaderEntry::WinogradInputTransform => ShaderGroup::WinogradInputTransform,
             ShaderEntry::WinogradOutputTransform => ShaderGroup::WinogradOutputTransform,
             ShaderEntry::WinogradBatchedMatMul => ShaderGroup::WinogradBatchedMatMul,
@@ -561,9 +555,7 @@ impl ShaderEntry {
             ShaderEntry::MaxPool2d => "max_pool_2d",
             ShaderEntry::GlobalAvgPool => "global_avg_pool",
             ShaderEntry::GlobalAvgPoolGrad => "main",
-            ShaderEntry::PairwiseSquaredDistanceGradLeft => "grad_left",
-            ShaderEntry::PairwiseSquaredDistanceGradRight => "grad_right",
-            ShaderEntry::PairwiseVectorRejectionGradDirections => "grad_directions",
+            ShaderEntry::PairwiseGrad => "main",
             ShaderEntry::WinogradInputTransform
             | ShaderEntry::WinogradOutputTransform
             | ShaderEntry::WinogradBatchedMatMul
@@ -3216,22 +3208,18 @@ impl<'a> Compiler<'a> {
                 let right = self.get_buffer(node.inputs[2]);
                 let total = u32::try_from(node.ty.num_elements())
                     .expect("pairwise distance gradient element count exceeds u32");
-                let shader = match node.op {
-                    Op::PairwiseSquaredDistanceGradLeft { .. } => {
-                        ShaderEntry::PairwiseSquaredDistanceGradLeft
-                    }
-                    Op::PairwiseSquaredDistanceGradRight { .. } => {
-                        ShaderEntry::PairwiseSquaredDistanceGradRight
-                    }
+                let mode = match node.op {
+                    Op::PairwiseSquaredDistanceGradLeft { .. } => 0,
+                    Op::PairwiseSquaredDistanceGradRight { .. } => 1,
                     _ => unreachable!(),
                 };
                 self.plan.dispatches.push(Dispatch {
-                    shader,
+                    shader: ShaderEntry::PairwiseGrad,
                     workgroups: [total.div_ceil(256), 1, 1],
                     input_buffers: vec![grad_output, left, right],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
-                    params: vec![total, inner, pairs, 0],
+                    params: vec![total, inner, pairs, mode],
                     use_coop: false,
                     use_small_tiles: false,
                     ..Default::default()
@@ -3295,12 +3283,12 @@ impl<'a> Compiler<'a> {
                 let total = u32::try_from(node.ty.num_elements())
                     .expect("pairwise direction gradient size exceeds u32");
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::PairwiseVectorRejectionGradDirections,
+                    shader: ShaderEntry::PairwiseGrad,
                     workgroups: [total.div_ceil(256), 1, 1],
                     input_buffers: vec![grad_output, vectors, directions],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
-                    params: vec![total, inner, pairs, 0],
+                    params: vec![total, inner, pairs, 2],
                     use_coop: false,
                     use_small_tiles: false,
                     ..Default::default()

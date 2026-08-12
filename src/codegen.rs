@@ -5461,11 +5461,7 @@ mod tests {
                 ShaderEntry::MaxPool2d
                 | ShaderEntry::GlobalAvgPool
                 | ShaderEntry::GlobalAvgPoolGrad => vec!["src", "dst", "params"],
-                ShaderEntry::PairwiseSquaredDistanceGradLeft
-                | ShaderEntry::PairwiseSquaredDistanceGradRight => {
-                    vec!["src_a", "src_b", "src_c", "dst", "params"]
-                }
-                ShaderEntry::PairwiseVectorRejectionGradDirections => {
+                ShaderEntry::PairwiseGrad => {
                     vec!["src_a", "src_b", "src_c", "dst", "params"]
                 }
                 ShaderEntry::WinogradInputTransform | ShaderEntry::WinogradOutputTransform => {
@@ -5570,9 +5566,7 @@ mod tests {
             ShaderEntry::MaxPool2d,
             ShaderEntry::GlobalAvgPool,
             ShaderEntry::GlobalAvgPoolGrad,
-            ShaderEntry::PairwiseSquaredDistanceGradLeft,
-            ShaderEntry::PairwiseSquaredDistanceGradRight,
-            ShaderEntry::PairwiseVectorRejectionGradDirections,
+            ShaderEntry::PairwiseGrad,
         ];
 
         for entry in &entries {
