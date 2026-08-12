@@ -104,6 +104,9 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             let score = wg_a[0] * scale;
             let row_sum = wg_b[0];
             let dp_t = wg_c[0];
+            // The next head/query iteration reuses all three arrays.
+            // Ensure every lane has captured their reduced values first.
+            workgroupBarrier();
 
             // Softmax probability
             let lse_idx = (pos * num_heads + head) * 2u;

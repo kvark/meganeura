@@ -944,6 +944,7 @@ fn lower_attention(mask: AttentionMask, head_dim: u32, output_lse: bool) -> Shad
     src.push_str("        wg_dot[tid] = q_val * src_b[k_base + tid];\n");
     src.push_str("        tree_reduce(tid);\n");
     src.push_str("        let score = wg_dot[0] * scale;\n\n");
+    src.push_str("        workgroupBarrier();\n");
 
     // Online softmax update
     src.push_str("        let new_max = max(max_score, score);\n");

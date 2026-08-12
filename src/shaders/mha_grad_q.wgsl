@@ -94,6 +94,9 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     wg_a[tid] = do_val * out_val;
     tree_reduce_a(tid);
     let row_sum = wg_a[0];
+    // Every lane must capture the reduced value before wg_a is reused for
+    // the first Q·K reduction below.
+    workgroupBarrier();
 
     var my_dq = 0.0;
 
@@ -116,6 +119,9 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         dual_tree_reduce(tid);
         let score = wg_a[0] * scale;
         let dp_t = wg_b[0];
+        // Keep faster lanes from replacing the lane-zero values while
+        // slower lanes are still reading this iteration's reductions.
+        workgroupBarrier();
 
         // P_t = exp(score - max_score) / sum_exp
         let p_t = exp(min(score - max_s, 0.0) - log_sum);

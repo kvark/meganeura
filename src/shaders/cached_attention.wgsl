@@ -97,6 +97,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             my_out = my_out * correction + weight * bias[v_base + tid];
             max_score = new_max;
         }
+        workgroupBarrier();
     }
 
     // Tail
@@ -105,6 +106,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         wg_dot[tid] = q_val * src_b[k_base + tid];
         tree_reduce(tid);
         let score = wg_dot[0] * scale;
+        workgroupBarrier();
         let new_max = max(max_score, score);
         let correction = exp(max_score - new_max);
         let weight = exp(score - new_max);
