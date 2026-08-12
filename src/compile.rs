@@ -1,4 +1,4 @@
-use crate::graph::{DType, Graph, Node, NodeId, Op};
+use crate::graph::{DType, Graph, Node, NodeId, Op, PairwiseGradKind};
 use crate::schedule::{PointwiseDAG, Pw, ReductionEpilogue, ReductionKernel};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -3201,22 +3201,21 @@ impl<'a> Compiler<'a> {
                 });
             }
 
-            Op::PairwiseSquaredDistanceGradLeft { inner, pairs }
-            | Op::PairwiseSquaredDistanceGradRight { inner, pairs } => {
+            Op::PairwiseGrad { kind, inner, pairs } => {
                 let grad_output = self.get_buffer(node.inputs[0]);
-                let left = self.get_buffer(node.inputs[1]);
-                let right = self.get_buffer(node.inputs[2]);
+                let first = self.get_buffer(node.inputs[1]);
+                let second = self.get_buffer(node.inputs[2]);
                 let total = u32::try_from(node.ty.num_elements())
-                    .expect("pairwise distance gradient element count exceeds u32");
-                let mode = match node.op {
-                    Op::PairwiseSquaredDistanceGradLeft { .. } => 0,
-                    Op::PairwiseSquaredDistanceGradRight { .. } => 1,
-                    _ => unreachable!(),
+                    .expect("pairwise gradient element count exceeds u32");
+                let mode = match kind {
+                    PairwiseGradKind::DistanceLeft => 0,
+                    PairwiseGradKind::DistanceRight => 1,
+                    PairwiseGradKind::RejectionDirections => 2,
                 };
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::PairwiseGrad,
                     workgroups: [total.div_ceil(256), 1, 1],
-                    input_buffers: vec![grad_output, left, right],
+                    input_buffers: vec![grad_output, first, second],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![total, inner, pairs, mode],
@@ -3272,25 +3271,6 @@ impl<'a> Compiler<'a> {
                     use_coop: false,
                     use_small_tiles: false,
                     reduction: Some(kernel),
-                    ..Default::default()
-                });
-            }
-
-            Op::PairwiseVectorRejectionGradDirections { inner, pairs } => {
-                let grad_output = self.get_buffer(node.inputs[0]);
-                let vectors = self.get_buffer(node.inputs[1]);
-                let directions = self.get_buffer(node.inputs[2]);
-                let total = u32::try_from(node.ty.num_elements())
-                    .expect("pairwise direction gradient size exceeds u32");
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::PairwiseGrad,
-                    workgroups: [total.div_ceil(256), 1, 1],
-                    input_buffers: vec![grad_output, vectors, directions],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![total, inner, pairs, 2],
-                    use_coop: false,
-                    use_small_tiles: false,
                     ..Default::default()
                 });
             }

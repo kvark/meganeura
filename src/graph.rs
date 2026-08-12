@@ -81,6 +81,13 @@ impl fmt::Display for TensorType {
     }
 }
 
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub enum PairwiseGradKind {
+    DistanceLeft,
+    DistanceRight,
+    RejectionDirections,
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Op {
     // Leaf nodes
@@ -153,22 +160,13 @@ pub enum Op {
     PairwiseSquaredDistance {
         pairs: u32,
     },
-    /// Backward helper for the left input of [`Op::PairwiseSquaredDistance`].
-    PairwiseSquaredDistanceGradLeft {
-        inner: u32,
-        pairs: u32,
-    },
-    /// Backward helper for the right input of [`Op::PairwiseSquaredDistance`].
-    PairwiseSquaredDistanceGradRight {
-        inner: u32,
-        pairs: u32,
-    },
     /// Remove each shared row direction from `pairs` consecutive vectors.
     PairwiseVectorRejection {
         pairs: u32,
     },
-    /// Backward helper for shared directions in [`Op::PairwiseVectorRejection`].
-    PairwiseVectorRejectionGradDirections {
+    /// Backward helper for indexed pairwise operations.
+    PairwiseGrad {
+        kind: PairwiseGradKind,
         inner: u32,
         pairs: u32,
     },
