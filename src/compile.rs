@@ -149,7 +149,6 @@ pub enum ShaderEntry {
     SgdUpdate,
     AdamUpdate,
     ScatterAdd,
-    ScatterAddAtomicZero,
     ScatterAddAtomic,
     /// Atomic scatter where each source row is multiplied by one scalar.
     ScatterAddAtomicRowMul,
@@ -343,7 +342,6 @@ impl ShaderEntry {
             | ShaderEntry::GradAccum => "optimizer",
 
             ShaderEntry::ScatterAdd
-            | ShaderEntry::ScatterAddAtomicZero
             | ShaderEntry::ScatterAddAtomic
             | ShaderEntry::ScatterAddAtomicRowMul
             | ShaderEntry::ExclusiveCumsum
@@ -406,9 +404,9 @@ impl ShaderEntry {
             ShaderEntry::SgdUpdate => ShaderGroup::Sgd,
             ShaderEntry::AdamUpdate => ShaderGroup::Adam,
             ShaderEntry::ScatterAdd => ShaderGroup::ScatterAdd,
-            ShaderEntry::ScatterAddAtomicZero
-            | ShaderEntry::ScatterAddAtomic
-            | ShaderEntry::ScatterAddAtomicRowMul => ShaderGroup::ScatterAddAtomic,
+            ShaderEntry::ScatterAddAtomic | ShaderEntry::ScatterAddAtomicRowMul => {
+                ShaderGroup::ScatterAddAtomic
+            }
             ShaderEntry::SumAll | ShaderEntry::MeanAll => ShaderGroup::Reduce,
             ShaderEntry::Softmax => ShaderGroup::Softmax,
             ShaderEntry::CrossEntropyLoss => ShaderGroup::CrossEntropy,
@@ -503,7 +501,6 @@ impl ShaderEntry {
             | ShaderEntry::CrossEntropyLoss
             | ShaderEntry::BceLoss
             | ShaderEntry::Transpose => "main",
-            ShaderEntry::ScatterAddAtomicZero => "zero",
             ShaderEntry::ScatterAddAtomicRowMul => "row_mul",
             ShaderEntry::Relu => "relu",
             ShaderEntry::Sigmoid => "sigmoid",
@@ -613,6 +610,12 @@ impl Dispatch {
     fn is_row_data_movement(&self) -> bool {
         self.shader == ShaderEntry::GlobalAvgPoolGrad
             && self.params.get(2).is_some_and(|&mode| mode != 0)
+    }
+
+    fn is_zero_fill(&self) -> bool {
+        self.pointwise.as_ref().is_some_and(|dag| {
+            dag.n_inputs == 1 && dag.ops == [Pw::const_f32(0.0)] && dag.output == 0
+        })
     }
 }
 
@@ -1088,11 +1091,9 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
 
             let Some((zero_index, _)) = plan.dispatches.iter().enumerate().find(|entry| {
                 let dispatch = entry.1;
-                dispatch.shader == ShaderEntry::ScatterAddAtomicZero
+                dispatch.is_zero_fill()
                     && dispatch.output_buffer == scatter.output_buffer
-                    && dispatch.params == scatter.params
-                    && dispatch.input_buffers.first() == Some(&indices)
-                    && dispatch.input_buffers.get(1) == Some(&product)
+                    && dispatch.params.first() == scatter.params.first()
             }) else {
                 continue;
             };
@@ -1140,7 +1141,7 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
         // The zero entry point does not read `src`, but its shared binding
         // layout still requires a valid buffer. Stop it from retaining the
         // now-eliminated product buffer.
-        plan.dispatches[zero_index].input_buffers = vec![indices, factors];
+        plan.dispatches[zero_index].input_buffers = vec![factors];
 
         let mut remove = [mul_index, broadcast_index];
         remove.sort_unstable();
@@ -3561,12 +3562,17 @@ impl<'a> Compiler<'a> {
                 let params = vec![total, seq_len, embed_dim, 0];
                 if u64::from(vocab_size as u32) * u64::from(seq_len) > 1_000_000 {
                     self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::ScatterAddAtomicZero,
+                        shader: ShaderEntry::Relu,
                         workgroups: [total.div_ceil(256), 1, 1],
-                        input_buffers: vec![indices, src],
+                        input_buffers: vec![src],
                         output_buffer: out_buf,
                         extra_outputs: vec![],
-                        params: params.clone(),
+                        params: vec![total, 0, 0, 0],
+                        pointwise: Some(PointwiseDAG {
+                            n_inputs: 1,
+                            ops: vec![Pw::const_f32(0.0)],
+                            output: 0,
+                        }),
                         use_coop: false,
                         use_small_tiles: false,
                         ..Default::default()
@@ -5666,10 +5672,7 @@ mod tests {
         large.set_outputs(vec![large_output]);
         let large_plan = compile(&large);
         assert_eq!(large_plan.dispatches.len(), 2);
-        assert_eq!(
-            large_plan.dispatches[0].shader,
-            ShaderEntry::ScatterAddAtomicZero
-        );
+        assert!(large_plan.dispatches[0].is_zero_fill());
         assert_eq!(
             large_plan.dispatches[1].shader,
             ShaderEntry::ScatterAddAtomic
@@ -5721,11 +5724,10 @@ mod tests {
             .dispatches
             .iter()
             .find(|dispatch| {
-                dispatch.shader == ShaderEntry::ScatterAddAtomicZero
-                    && dispatch.output_buffer == fused.output_buffer
+                dispatch.is_zero_fill() && dispatch.output_buffer == fused.output_buffer
             })
             .expect("fused atomic scatter still needs its zeroing pass");
-        assert_eq!(zero.input_buffers[1], fused.input_buffers[1]);
+        assert_eq!(zero.input_buffers[0], fused.input_buffers[1]);
     }
 
     #[test]
@@ -6024,7 +6026,6 @@ mod tests {
             ShaderEntry::SgdUpdate,
             ShaderEntry::AdamUpdate,
             ShaderEntry::ScatterAdd,
-            ShaderEntry::ScatterAddAtomicZero,
             ShaderEntry::ScatterAddAtomic,
             ShaderEntry::ScatterAddAtomicRowMul,
             ShaderEntry::SumAll,

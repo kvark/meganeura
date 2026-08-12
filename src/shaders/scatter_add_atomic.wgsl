@@ -12,14 +12,6 @@ var<storage, read_write> dst: array<atomic<u32>>;
 var<uniform> params: Params;
 
 @compute @workgroup_size(256)
-fn zero(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let index = gid.x;
-    if index < params.total {
-        atomicStore(&dst[index], 0u);
-    }
-}
-
-@compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let source_index = gid.x;
     let source_len = params.seq_len * params.embed_dim;
