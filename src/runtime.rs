@@ -2680,10 +2680,29 @@ impl Session {
             manual_barriers: false,
         });
 
-        // Zero-fill device-local allocations on the GPU (no host pointer).
-        // One submission at build time; the wait below orders it before
-        // the first step()'s reads.
-        if alias.device_local.iter().any(|&d| d) {
+        let adam_state: Vec<_> = plan
+            .param_grad_pairs
+            .iter()
+            .enumerate()
+            .map(|(i, &(param_buf, _))| {
+                let size = (plan.buffers[param_buf.0 as usize] as u64).max(4);
+                let m_buf = gpu.create_buffer(blade_graphics::BufferDesc {
+                    name: &format!("adam_m_{i}"),
+                    size,
+                    memory: blade_graphics::Memory::Device,
+                });
+                let v_buf = gpu.create_buffer(blade_graphics::BufferDesc {
+                    name: &format!("adam_v_{i}"),
+                    size,
+                    memory: blade_graphics::Memory::Device,
+                });
+                (m_buf, v_buf)
+            })
+            .collect();
+
+        // Zero-fill every device-local allocation in one build-time
+        // submission. The wait orders it before the first step()'s reads.
+        if alias.device_local.iter().any(|&d| d) || !adam_state.is_empty() {
             encoder.start();
             {
                 let mut transfer = encoder.transfer("zero_device_local");
@@ -2693,34 +2712,14 @@ impl Session {
                         transfer.fill_buffer(physical_buffers[i].at(0), size, 0);
                     }
                 }
+                for &(m_buf, v_buf) in &adam_state {
+                    transfer.fill_buffer(m_buf.at(0), m_buf.size(), 0);
+                    transfer.fill_buffer(v_buf.at(0), v_buf.size(), 0);
+                }
             }
             let sp = gpu.submit(&mut encoder);
             let _ = gpu.wait_for(&sp, !0);
         }
-
-        let adam_state = plan
-            .param_grad_pairs
-            .iter()
-            .enumerate()
-            .map(|(i, &(param_buf, _))| {
-                let size = (plan.buffers[param_buf.0 as usize] as u64).max(4);
-                let m_buf = gpu.create_buffer(blade_graphics::BufferDesc {
-                    name: &format!("adam_m_{i}"),
-                    size,
-                    memory: blade_graphics::Memory::Shared,
-                });
-                let v_buf = gpu.create_buffer(blade_graphics::BufferDesc {
-                    name: &format!("adam_v_{i}"),
-                    size,
-                    memory: blade_graphics::Memory::Shared,
-                });
-                unsafe {
-                    std::ptr::write_bytes(m_buf.data(), 0, size as usize);
-                    std::ptr::write_bytes(v_buf.data(), 0, size as usize);
-                }
-                (m_buf, v_buf)
-            })
-            .collect();
 
         // Grad-clip accumulator: a single u32 (4 bytes) holding f32 bits
         // of the running sum-of-squares. Allocated unconditionally so
@@ -4277,6 +4276,38 @@ impl Session {
         outputs
     }
 
+    fn write_buffer_data(&self, buffer: blade_graphics::Buffer, data: &[u8], label: &'static str) {
+        let byte_len = data.len();
+        assert_eq!((byte_len as u64).max(4), buffer.size());
+        let staging = self.gpu.create_buffer(blade_graphics::BufferDesc {
+            name: label,
+            size: (byte_len as u64).max(4),
+            memory: blade_graphics::Memory::Upload,
+        });
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), staging.data(), data.len());
+        }
+        let mut encoder = self
+            .gpu
+            .create_command_encoder(blade_graphics::CommandEncoderDesc {
+                name: label,
+                buffer_count: 1,
+                manual_barriers: false,
+            });
+        encoder.start();
+        if byte_len != 0 {
+            encoder.transfer(label).copy_buffer_to_buffer(
+                staging.at(0),
+                buffer.at(0),
+                byte_len as u64,
+            );
+        }
+        let sync = self.gpu.submit(&mut encoder);
+        let _ = self.gpu.wait_for(&sync, !0);
+        self.gpu.destroy_command_encoder(&mut encoder);
+        self.gpu.destroy_buffer(staging);
+    }
+
     /// Read several full F32 parameter buffers with one GPU transfer.
     ///
     /// Shared parameter memory is fast for GPU access and CPU uploads, but
@@ -4377,10 +4408,7 @@ impl Session {
             "read_adam_m: out.len()={} but param '{name}' has {n} elements",
             out.len()
         );
-        unsafe {
-            let ptr = buf.data() as *const f32;
-            std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), n);
-        }
+        out.copy_from_slice(&self.read_f32_buffers(&[(*buf, n * 4)], "adam_m_readback")[0]);
     }
 
     /// Read the Adam second-moment buffer (`v`) for a parameter. See
@@ -4397,10 +4425,7 @@ impl Session {
             "read_adam_v: out.len()={} but param '{name}' has {n} elements",
             out.len()
         );
-        unsafe {
-            let ptr = buf.data() as *const f32;
-            std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), n);
-        }
+        out.copy_from_slice(&self.read_f32_buffers(&[(*buf, n * 4)], "adam_v_readback")[0]);
     }
 
     /// Read both Adam moment buffers for several parameters with one GPU
@@ -4448,10 +4473,7 @@ impl Session {
             "write_adam_m: data.len()={} but param '{name}' has {n} elements",
             data.len()
         );
-        unsafe {
-            let ptr = buf.data() as *mut f32;
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, n);
-        }
+        self.write_buffer_data(*buf, bytemuck::cast_slice(data), "adam_m_upload");
     }
 
     /// Write the Adam second-moment buffer for a parameter. See
@@ -4469,10 +4491,7 @@ impl Session {
             "write_adam_v: data.len()={} but param '{name}' has {n} elements",
             data.len()
         );
-        unsafe {
-            let ptr = buf.data() as *mut f32;
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, n);
-        }
+        self.write_buffer_data(*buf, bytemuck::cast_slice(data), "adam_v_upload");
     }
 
     /// Current Adam step counter (`t`). Adam's bias correction uses
@@ -6927,14 +6946,7 @@ impl Session {
                             ),
                         ));
                     }
-                    unsafe {
-                        let ptr = buf.data();
-                        std::ptr::copy_nonoverlapping(
-                            tensor.data().as_ptr(),
-                            ptr,
-                            tensor.data().len(),
-                        );
-                    }
+                    self.write_buffer_data(*buf, tensor.data(), "checkpoint_adam_upload");
                 }
             }
         }

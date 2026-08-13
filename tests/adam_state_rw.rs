@@ -29,6 +29,14 @@ fn adam_state_roundtrip_and_step_counter() {
     sess.set_parameter("log_density", &vec![1.0_f32; n]);
     sess.set_input("x", &vec![0.0_f32; n]);
     sess.set_input("labels", &vec![0.0_f32; n]);
+
+    let mut initial_m = vec![f32::NAN; n];
+    let mut initial_v = vec![f32::NAN; n];
+    sess.read_adam_m("log_density", &mut initial_m);
+    sess.read_adam_v("log_density", &mut initial_v);
+    assert_eq!(initial_m, vec![0.0; n]);
+    assert_eq!(initial_v, vec![0.0; n]);
+
     sess.step();
     sess.wait();
 
