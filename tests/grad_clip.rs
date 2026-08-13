@@ -137,3 +137,32 @@ fn grad_clip_every_skips_clip() {
         max_diff
     );
 }
+
+#[test]
+fn cpu_grad_clip_stages_device_local_gradients() {
+    let g = build_linreg(4, 3, 2);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
+    session.set_parameter("w.weight", &[1.0; 6]);
+    session.set_parameter("w.bias", &[0.0; 2]);
+    session.set_input("x", &[1.0; 12]);
+    session.set_input("target", &[10.0; 8]);
+    session.clear_optimizer();
+    session.step();
+    session.wait();
+
+    let (before, clipped) = session.clip_grad_norm_cpu(0.01);
+    assert!(clipped);
+    assert!(before > 0.01);
+
+    let mut weight_gradient = [0.0; 6];
+    let mut bias_gradient = [0.0; 2];
+    session.read_param_grad("w.weight", &mut weight_gradient);
+    session.read_param_grad("w.bias", &mut bias_gradient);
+    let after = weight_gradient
+        .into_iter()
+        .chain(bias_gradient)
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    assert!((after - 0.01).abs() < 1.0e-6, "clipped norm is {after}");
+}
