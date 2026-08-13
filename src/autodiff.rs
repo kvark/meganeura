@@ -415,6 +415,42 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let grad_x = graph.transpose(grad_output);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
+            Op::WindowRearrange {
+                batch,
+                channels,
+                height,
+                width,
+                window,
+                shift,
+                reverse,
+            } => {
+                let x = node.inputs[0];
+                // Packing and merging are inverse gathers over every valid
+                // image element. Padding has no source, so its gradient is
+                // intentionally discarded by the merge direction.
+                let grad_x = if reverse {
+                    graph.window_partition_2d(
+                        grad_output,
+                        batch,
+                        channels,
+                        height,
+                        width,
+                        window,
+                        shift,
+                    )
+                } else {
+                    graph.window_merge_2d(
+                        grad_output,
+                        batch,
+                        channels,
+                        height,
+                        width,
+                        window,
+                        shift,
+                    )
+                };
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
             Op::Softmax => {
                 // dL/dx_i = s_i * (dL/ds_i - sum_j(dL/ds_j * s_j))
                 let s = node.id; // forward softmax output [batch, features]

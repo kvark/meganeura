@@ -695,6 +695,30 @@ struct TransposeData {
 struct TransposeParams {
     m: u32,
     n: u32,
+    _dim2: u32,
+    _dim3: u32,
+    _dim4: u32,
+    _dim5: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+#[derive(blade_macros::ShaderData)]
+struct WindowRearrangeData {
+    src: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: WindowRearrangeParams,
+}
+
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct WindowRearrangeParams {
+    batch: u32,
+    channels: u32,
+    height: u32,
+    width: u32,
+    window: u32,
+    shift: u32,
     _pad0: u32,
     _pad1: u32,
 }
@@ -1614,6 +1638,9 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::CrossEntropyLoss => CrossEntropyData::layout(),
         ShaderEntry::BceLoss => BceData::layout(),
         ShaderEntry::Transpose => TransposeData::layout(),
+        ShaderEntry::WindowPartition2d | ShaderEntry::WindowMerge2d => {
+            WindowRearrangeData::layout()
+        }
         ShaderEntry::RmsNorm => RmsNormData::layout(),
         ShaderEntry::Embedding => EmbeddingData::layout(),
         ShaderEntry::ToF16 => UnaryData::layout(),
@@ -5332,6 +5359,30 @@ impl Session {
                         params: TransposeParams {
                             m: dispatch.params[0],
                             n: dispatch.params[1],
+                            _dim2: 0,
+                            _dim3: 0,
+                            _dim4: 0,
+                            _dim5: 0,
+                            _pad0: 0,
+                            _pad1: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::WindowPartition2d | ShaderEntry::WindowMerge2d => {
+                let p = &dispatch.params;
+                pc.bind(
+                    0,
+                    &WindowRearrangeData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: WindowRearrangeParams {
+                            batch: p[0],
+                            channels: p[1],
+                            height: p[2],
+                            width: p[3],
+                            window: p[4],
+                            shift: p[5],
                             _pad0: 0,
                             _pad1: 0,
                         },

@@ -156,6 +156,8 @@ pub enum ShaderEntry {
     CrossEntropyLoss,
     BceLoss,
     Transpose,
+    WindowPartition2d,
+    WindowMerge2d,
     Silu,
     SwiGLU,
     RmsNorm,
@@ -337,6 +339,8 @@ impl ShaderEntry {
             ShaderEntry::ScatterAdd
             | ShaderEntry::ScatterAddAtomic
             | ShaderEntry::Transpose
+            | ShaderEntry::WindowPartition2d
+            | ShaderEntry::WindowMerge2d
             | ShaderEntry::Embedding
             | ShaderEntry::ToF16
             | ShaderEntry::Concat
@@ -401,6 +405,7 @@ impl ShaderEntry {
             ShaderEntry::CrossEntropyLoss => ShaderGroup::CrossEntropy,
             ShaderEntry::BceLoss => ShaderGroup::BceLoss,
             ShaderEntry::Transpose => ShaderGroup::Transpose,
+            ShaderEntry::WindowPartition2d | ShaderEntry::WindowMerge2d => ShaderGroup::Transpose,
             ShaderEntry::Silu => ShaderGroup::Unary,
             ShaderEntry::SwiGLU => ShaderGroup::Binary,
             ShaderEntry::RmsNorm => ShaderGroup::RmsNorm,
@@ -488,6 +493,8 @@ impl ShaderEntry {
             | ShaderEntry::CrossEntropyLoss
             | ShaderEntry::BceLoss
             | ShaderEntry::Transpose => "main",
+            ShaderEntry::WindowPartition2d => "window_pack",
+            ShaderEntry::WindowMerge2d => "window_merge",
             ShaderEntry::Relu => "relu",
             ShaderEntry::Sigmoid => "sigmoid",
             ShaderEntry::Tanh => "tanh_",
@@ -3404,6 +3411,34 @@ impl<'a> Compiler<'a> {
                 });
             }
 
+            Op::WindowRearrange {
+                batch,
+                channels,
+                height,
+                width,
+                window,
+                shift,
+                reverse,
+            } => {
+                let input = self.get_buffer(node.inputs[0]);
+                let total = node.ty.num_elements() as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: if reverse {
+                        ShaderEntry::WindowMerge2d
+                    } else {
+                        ShaderEntry::WindowPartition2d
+                    },
+                    workgroups: [total.div_ceil(256), 1, 1],
+                    input_buffers: vec![input],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![batch, channels, height, width, window, shift, 0, 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
             Op::Silu => {
                 self.emit_unary(ShaderEntry::Silu, node, out_buf);
             }
@@ -6001,6 +6036,8 @@ mod tests {
             ShaderEntry::CrossEntropyLoss,
             ShaderEntry::BceLoss,
             ShaderEntry::Transpose,
+            ShaderEntry::WindowPartition2d,
+            ShaderEntry::WindowMerge2d,
             ShaderEntry::SwiGLUGradGate,
             ShaderEntry::SwiGLUGradUp,
             ShaderEntry::SiluGrad,
@@ -6014,6 +6051,11 @@ mod tests {
             let ep = entry.entry_point();
             assert!(!ep.is_empty());
         }
+        assert_eq!(
+            ShaderEntry::WindowPartition2d.shader_group(),
+            ShaderEntry::Transpose.shader_group(),
+            "pure data rearrangements should share one shader module"
+        );
     }
 
     /// Verify that the EPT/TPQ/BQ values computed in the dispatch functions
