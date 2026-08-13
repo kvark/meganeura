@@ -194,6 +194,25 @@ pub enum Op {
     // Transpose (swap last two dims)
     Transpose,
 
+    /// Reindex an NCHW image into independent window-token columns, or undo
+    /// that permutation.  The packed layout is
+    /// `[window * window, batch * windows_y * windows_x * channels]`, which
+    /// lets ordinary multi-head attention treat each image window as a set
+    /// of additional heads without teaching the attention kernel about
+    /// batches or two-dimensional geometry.
+    ///
+    /// A non-zero shift moves the window grid up and left.  Positions outside
+    /// the image are zero-padded while packing and discarded while merging.
+    WindowRearrange {
+        batch: u32,
+        channels: u32,
+        height: u32,
+        width: u32,
+        window: u32,
+        shift: u32,
+        reverse: bool,
+    },
+
     // Broadcast add (bias add: [M,N] + [N])
     BiasAdd,
 
@@ -1199,6 +1218,98 @@ impl Graph {
         assert_eq!(x_shape.len(), 2, "transpose requires 2D tensor");
         let ty = TensorType::f32(vec![x_shape[1], x_shape[0]]);
         self.add_node(Op::Transpose, vec![x], ty)
+    }
+
+    /// Pack `[N, C, H, W]` into window-major attention tokens.
+    ///
+    /// The result has shape `[window², N * ceil((H+shift)/window) *
+    /// ceil((W+shift)/window) * C]`.  Channels belonging to one window are
+    /// contiguous, so callers can set the attention head count to
+    /// `N * window_count * (C / head_dim)`.
+    #[allow(clippy::too_many_arguments)]
+    #[track_caller]
+    pub fn window_partition_2d(
+        &mut self,
+        x: NodeId,
+        batch: u32,
+        channels: u32,
+        height: u32,
+        width: u32,
+        window: u32,
+        shift: u32,
+    ) -> NodeId {
+        assert!(window > 0, "window size must be non-zero");
+        assert!(
+            shift < window,
+            "window shift must be smaller than the window"
+        );
+        assert_eq!(
+            self.node(x).ty.num_elements(),
+            (batch * channels * height * width) as usize,
+            "window partition input does not match NCHW metadata"
+        );
+        let windows_y = (height + shift).div_ceil(window);
+        let windows_x = (width + shift).div_ceil(window);
+        let inner = (batch * windows_y * windows_x * channels) as usize;
+        let ty = TensorType::f32(vec![(window * window) as usize, inner]);
+        self.add_node(
+            Op::WindowRearrange {
+                batch,
+                channels,
+                height,
+                width,
+                window,
+                shift,
+                reverse: false,
+            },
+            vec![x],
+            ty,
+        )
+    }
+
+    /// Undo [`Graph::window_partition_2d`], discarding padded positions.
+    #[allow(clippy::too_many_arguments)]
+    #[track_caller]
+    pub fn window_merge_2d(
+        &mut self,
+        x: NodeId,
+        batch: u32,
+        channels: u32,
+        height: u32,
+        width: u32,
+        window: u32,
+        shift: u32,
+    ) -> NodeId {
+        assert!(window > 0, "window size must be non-zero");
+        assert!(
+            shift < window,
+            "window shift must be smaller than the window"
+        );
+        let windows_y = (height + shift).div_ceil(window);
+        let windows_x = (width + shift).div_ceil(window);
+        let expected = vec![
+            (window * window) as usize,
+            (batch * windows_y * windows_x * channels) as usize,
+        ];
+        assert_eq!(
+            self.node(x).ty.shape,
+            expected,
+            "window merge input does not match packed window metadata"
+        );
+        let ty = TensorType::f32(vec![(batch * channels * height * width) as usize]);
+        self.add_node(
+            Op::WindowRearrange {
+                batch,
+                channels,
+                height,
+                width,
+                window,
+                shift,
+                reverse: true,
+            },
+            vec![x],
+            ty,
+        )
     }
 
     // --- Reductions ---

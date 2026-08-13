@@ -5345,7 +5345,9 @@ mod tests {
                 ShaderEntry::CrossEntropyLoss => {
                     vec!["logits", "labels", "grad_out", "loss_out", "params"]
                 }
-                ShaderEntry::Transpose => vec!["src", "dst", "params"],
+                ShaderEntry::Transpose
+                | ShaderEntry::WindowPartition2d
+                | ShaderEntry::WindowMerge2d => vec!["src", "dst", "params"],
                 ShaderEntry::RmsNorm => vec!["src", "bias", "dst", "params"],
                 ShaderEntry::Embedding => vec!["indices", "src", "dst", "params"],
                 ShaderEntry::ToF16 => vec!["src", "dst", "params"],
@@ -5472,6 +5474,8 @@ mod tests {
             ShaderEntry::Softmax,
             ShaderEntry::CrossEntropyLoss,
             ShaderEntry::Transpose,
+            ShaderEntry::WindowPartition2d,
+            ShaderEntry::WindowMerge2d,
             ShaderEntry::Silu,
             ShaderEntry::RmsNorm,
             ShaderEntry::Embedding,
