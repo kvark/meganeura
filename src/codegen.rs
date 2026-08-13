@@ -5335,7 +5335,9 @@ mod tests {
                 }
                 ShaderEntry::BiasAdd => vec!["src", "bias", "dst", "params"],
                 ShaderEntry::SgdUpdate => vec!["param", "grad", "dst", "params"],
-                ShaderEntry::AdamUpdate => vec!["param", "grad", "m", "v", "params"],
+                ShaderEntry::AdamUpdate => {
+                    vec!["param", "grad", "m", "v", "grouped_grad_norm", "params"]
+                }
                 ShaderEntry::ScatterAdd => vec!["indices", "src", "dst", "params"],
                 ShaderEntry::ScatterAddAtomic => {
                     vec!["indices", "src", "row_scale", "dst", "params"]

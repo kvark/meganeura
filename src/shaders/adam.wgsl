@@ -6,13 +6,14 @@ struct Params {
     eps: f32,
     step: f32,
     wd: f32,
-    _pad1: u32,
+    grad_group_size: u32,
 }
 
 var<storage, read_write> param: array<f32>;
 var<storage> grad: array<f32>;
 var<storage, read_write> m: array<f32>;
 var<storage, read_write> v: array<f32>;
+var<storage, read_write> grouped_grad_norm: array<f32>;
 var<uniform> params: Params;
 
 @compute @workgroup_size(256)
@@ -21,6 +22,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if i >= params.len { return; }
 
     let g = grad[i];
+
+    if params.grad_group_size != 0u && i % params.grad_group_size == 0u {
+        var sum_squared = 0.0;
+        var component = 0u;
+        loop {
+            if component >= params.grad_group_size { break; }
+            let value = grad[i + component];
+            sum_squared = sum_squared + value * value;
+            component = component + 1u;
+        }
+        let group = i / params.grad_group_size;
+        grouped_grad_norm[group] = grouped_grad_norm[group] + sqrt(sum_squared);
+    }
 
     // Update biased first moment
     let m_new = params.beta1 * m[i] + (1.0 - params.beta1) * g;
