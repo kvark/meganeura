@@ -3842,14 +3842,10 @@ impl Session {
             data.len(),
             expected,
         );
-        // All upload targets (params, inputs) are pinned by the memory
-        // plan and therefore host-visible; a null pointer here means a
-        // buffer class regression, not a user error.
-        assert!(
-            !buffer.data().is_null(),
-            "upload_buffer: buffer {} is device-local (not host-visible)",
-            buf_ref.0
-        );
+        if buffer.data().is_null() {
+            self.write_buffer_data(*buffer, data, "buffer_upload");
+            return;
+        }
         unsafe {
             let ptr = buffer.data();
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
@@ -6395,15 +6391,14 @@ impl Session {
         self.wait();
         for &(param_buf, grad_buf) in &self.plan.param_grad_pairs {
             let size = self.plan.buffers[param_buf.0 as usize] / 4;
-            let param = &self.buffers[param_buf.0 as usize];
-            let grad = &self.buffers[grad_buf.0 as usize];
-            unsafe {
-                let p = param.data() as *mut f32;
-                let g = grad.data() as *const f32;
-                for i in 0..size {
-                    *p.add(i) -= learning_rate * *g.add(i);
-                }
+            let mut param = vec![0.0; size];
+            let mut grad = vec![0.0; size];
+            self.read_buffer(param_buf, &mut param);
+            self.read_buffer(grad_buf, &mut grad);
+            for (value, gradient) in param.iter_mut().zip(grad) {
+                *value -= learning_rate * gradient;
             }
+            self.upload_buffer(param_buf, bytemuck::cast_slice(&param));
         }
     }
 

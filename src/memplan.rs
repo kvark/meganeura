@@ -17,12 +17,11 @@
 //! padding garbage can only land in the discarded output padding.
 //! Re-check this reasoning if a kernel ever gains unguarded reads.
 //!
-//! The same pinning analysis also decides memory placement: pinned
-//! buffers are host-accessed (uploads, readbacks, external binding)
-//! and must stay `Memory::Shared`; everything else is only ever
-//! touched by GPU dispatches and goes in `Memory::Device`, which on
-//! discrete boards avoids routing intermediate traffic through the
-//! host-visible (ReBAR) heap.
+//! The same analysis also decides memory placement. User-visible pinned
+//! buffers stay `Memory::Shared`; parameter gradients remain dedicated
+//! because the runtime optimizer consumes them after the static plan, but use
+//! `Memory::Device` and staged diagnostic transfers. Other GPU-only buffers
+//! are device-local and may alias when their lifetimes do not overlap.
 
 use crate::compile::{BufferRef, ExecutionPlan, ShaderEntry};
 use std::ops::Range;
@@ -33,11 +32,9 @@ pub struct AliasPlan {
     pub map: Vec<usize>,
     /// Size in bytes of each physical allocation (max over its tenants).
     pub sizes: Vec<usize>,
-    /// Per physical allocation: every tenant is a step-local
-    /// intermediate that no host path ever touches, so the allocation
-    /// may live in `Memory::Device` (device-local, not host-visible).
-    /// Pinned buffers — anything uploaded, read back, or externally
-    /// bindable — must stay host-visible.
+    /// Per physical allocation: place it in `Memory::Device` rather than
+    /// host-visible shared memory. This covers GPU-only intermediates and
+    /// dedicated parameter gradients; other pinned buffers stay host-visible.
     pub device_local: Vec<bool>,
 }
 
@@ -96,7 +93,8 @@ impl BufferUse {
 /// - parameters, inputs, constants, outputs, loss — user-visible and/or
 ///   persistent across steps, and externally bindable;
 /// - gradients — read by the runtime-encoded optimizer and grad-clip
-///   passes that run *after* the plan's dispatches;
+///   passes that run *after* the plan's dispatches. They remain dedicated but
+///   are device-local because diagnostics use staged transfers;
 /// - derived params and quantized weight buffers — uploaded once;
 /// - `CacheWrite` outputs (KV caches) — carry state across steps;
 /// - `ScatterAdd` outputs — read-modify-write;
@@ -117,7 +115,7 @@ pub fn plan_buffer_aliasing(
         if pinned[i] {
             map[i] = sizes.len();
             sizes.push(plan.buffers[i]);
-            device_local.push(false);
+            device_local.push(is_parameter_gradient(plan, i));
         }
     }
 
@@ -192,8 +190,18 @@ pub fn plan_no_alias(
     AliasPlan {
         map: (0..plan.buffers.len()).collect(),
         sizes: plan.buffers.clone(),
-        device_local: pinned.iter().map(|&p| !p).collect(),
+        device_local: pinned
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| !p || is_parameter_gradient(plan, i))
+            .collect(),
     }
+}
+
+fn is_parameter_gradient(plan: &ExecutionPlan, index: usize) -> bool {
+    plan.param_grad_pairs
+        .iter()
+        .any(|&(_, gradient)| gradient.0 as usize == index)
 }
 
 /// The pinning analysis shared by aliasing and memory-class decisions:
@@ -498,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn params_and_grads_are_pinned() {
+    fn params_and_grads_are_dedicated_but_only_grads_are_device_local() {
         let mut p = plan(
             vec![64, 64, 64, 64, 64],
             vec![dispatch(&[0, 1], 2), dispatch(&[2], 3), dispatch(&[3], 4)],
@@ -520,6 +528,8 @@ mod tests {
                 "buffer {pinned} must keep a dedicated allocation"
             );
         }
+        assert!(!alias.device_local[alias.map[1]]);
+        assert!(alias.device_local[alias.map[4]]);
     }
 
     #[test]
