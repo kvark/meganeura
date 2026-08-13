@@ -320,9 +320,7 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, Optimiz
     // first-device capability snapshot.
     let gpu = match cfg.gpu {
         Some(gpu) => gpu,
-        None => {
-            Arc::new(runtime::init_gpu_context().expect("failed to initialize blade GPU context"))
-        }
+        None => runtime::default_gpu_context(),
     };
     let mut coop_caps = runtime::auto_tune(&gpu, 0).coop_caps;
     if cfg.runtime.coop == runtime::CoopPolicy::Disabled {
