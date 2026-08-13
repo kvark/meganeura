@@ -2339,7 +2339,18 @@ impl<'a> Compiler<'a> {
         };
         self.plan.dispatches.push(Dispatch {
             shader: ShaderEntry::Relu, // sentinel; routing is via `reduction`
-            workgroups: [rows.div_ceil(rows_per_workgroup), 1, 1],
+            workgroups: [
+                // One-lane reductions need no cross-invocation cooperation.
+                // Give every invocation a second row to amortize scheduling
+                // without exceeding the portable 256-thread workgroup size.
+                rows.div_ceil(if rows_per_workgroup == WORKGROUP_SIZE {
+                    rows_per_workgroup * 2
+                } else {
+                    rows_per_workgroup
+                }),
+                1,
+                1,
+            ],
             input_buffers: vec![input],
             output_buffer: output,
             extra_outputs: vec![],

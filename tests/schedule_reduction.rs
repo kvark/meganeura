@@ -123,6 +123,23 @@ fn narrow_sum_inner_matches_scalar_f32_order() {
 }
 
 #[test]
+fn narrow_sum_inner_schedules_two_rows_per_invocation() {
+    const ROWS: usize = 513;
+    const COLS: usize = 4;
+    let mut graph = Graph::new();
+    let input = graph.input("input", &[ROWS, COLS]);
+    let output = graph.sum_inner(input);
+    graph.set_outputs(vec![output]);
+    let plan = compile_with(&graph, &CompileOptions::default());
+    let dispatch = plan
+        .dispatches
+        .iter()
+        .find(|dispatch| dispatch.reduction.is_some())
+        .expect("sum-inner reduction dispatch");
+    assert_eq!(dispatch.workgroups, [2, 1, 1]);
+}
+
+#[test]
 fn narrow_sum_inner_matches_ones_matmul_bit_exactly() {
     let m = 259usize;
     let n = 9usize;

@@ -646,6 +646,21 @@ fn lower_reduction(
         );
     }
 
+    if rows_per_workgroup == grid.workgroup_size
+        && extra_prologues.is_empty()
+        && epilogue.is_none()
+        && n_per_row == 0
+    {
+        return lower_serial_reduction(
+            op,
+            prologue,
+            n_per_elem,
+            gather_elem,
+            input_row_repeats,
+            grid,
+        );
+    }
+
     let per_elem_names = PointwiseDAG::input_binding_names(n_per_elem);
     let per_row_names = per_row_binding_names(n_per_row);
     let per_col_names: Vec<String> = epilogue
@@ -851,6 +866,83 @@ fn lower_reduction(
             e, src
         )
     });
+    ShaderModule {
+        module,
+        source: src,
+    }
+}
+
+fn lower_serial_reduction(
+    op: ReduceOp,
+    prologue: &PointwiseDAG,
+    n_per_elem: u8,
+    gather_elem: &[bool],
+    input_row_repeats: &[u32],
+    grid: GridShape,
+) -> ShaderModule {
+    let per_elem_names = PointwiseDAG::input_binding_names(n_per_elem);
+    let is_gather = |i: usize| gather_elem.get(i).copied().unwrap_or(false);
+    let mut src = String::new();
+    src.push_str(
+        "struct Params {\n    outer: u32,\n    inner: u32,\n    round_one_bits: u32,\n    _pad1: u32,\n}\n\n",
+    );
+    for (i, name) in per_elem_names.iter().enumerate() {
+        let _ = writeln!(src, "var<storage> {}: array<f32>;", name);
+        if is_gather(i) {
+            let _ = writeln!(src, "var<storage> {}_idx: array<u32>;", name);
+        }
+    }
+    src.push_str("var<storage, read_write> dst: array<f32>;\n");
+    src.push_str("var<uniform> params: Params;\n\n");
+    let _ = writeln!(src, "@compute @workgroup_size({})", grid.workgroup_size);
+    let _ = writeln!(
+        src,
+        "fn {}(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) group_count: vec3<u32>) {{",
+        REDUCTION_ENTRY
+    );
+    src.push_str("    let row_stride = group_count.x * ");
+    let _ = writeln!(src, "{}u;", grid.workgroup_size);
+    src.push_str("    var row = gid.x;\n");
+    src.push_str("    loop {\n");
+    src.push_str("        if row >= params.outer { break; }\n");
+    src.push_str("        let row_offset = row * params.inner;\n");
+    let _ = writeln!(src, "        var acc: f32 = {};", op.identity_wgsl());
+    src.push_str("        var col = 0u;\n");
+    src.push_str("        loop {\n");
+    src.push_str("            if col >= params.inner { break; }\n");
+    let body = prologue.emit_body(|idx| {
+        let i = idx as usize;
+        let name = &per_elem_names[i];
+        let repeat = input_row_repeats.get(i).copied().unwrap_or(1);
+        if is_gather(i) {
+            let source_row = if repeat == 1 {
+                "row".to_string()
+            } else {
+                format!("(row / {repeat}u)")
+            };
+            format!("{name}[{name}_idx[{source_row}] * params.inner + col]")
+        } else if repeat == 1 {
+            format!("{name}[row_offset + col]")
+        } else {
+            format!("{name}[(row / {repeat}u) * params.inner + col]")
+        }
+    });
+    for line in body.lines() {
+        src.push_str("            ");
+        src.push_str(line.trim_start_matches(' '));
+        src.push('\n');
+    }
+    let value = format!("v{} * bitcast<f32>(params.round_one_bits)", prologue.output);
+    let _ = writeln!(src, "            {}", op.combine_wgsl("acc", &value));
+    src.push_str("            col += 1u;\n");
+    src.push_str("        }\n");
+    src.push_str("        dst[row] = acc;\n");
+    src.push_str("        row += row_stride;\n");
+    src.push_str("    }\n");
+    src.push_str("}\n");
+
+    let module = naga::front::wgsl::parse_str(&src)
+        .unwrap_or_else(|e| panic!("generated WGSL failed to parse:\n{}\n---\n{}", e, src));
     ShaderModule {
         module,
         source: src,
@@ -1377,6 +1469,26 @@ mod tests {
         assert!(sm.source.contains("src_b[row_offset + col]"));
         assert!(sm.source.contains("var<storage> src_a_idx: array<u32>;"));
         assert!(!sm.source.contains("src_b_idx"));
+    }
+
+    #[test]
+    fn one_lane_reduction_strides_rows_without_workgroup_memory() {
+        let sm = lower(&KernelTemplate::Reduction {
+            op: ReduceOp::Sum,
+            prologue: identity_prologue(),
+            extra_prologues: vec![],
+            epilogue: None,
+            n_per_elem: 1,
+            n_per_row: 0,
+            gather_elem: Vec::new(),
+            input_row_repeats: Vec::new(),
+            rows_per_workgroup: 256,
+            grid: GridShape::default(),
+        });
+        assert!(sm.source.contains("@builtin(num_workgroups)"));
+        assert!(sm.source.contains("row += row_stride"));
+        assert!(!sm.source.contains("var<workgroup>"));
+        assert!(!sm.source.contains("workgroupBarrier"));
     }
 
     #[test]
