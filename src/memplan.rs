@@ -20,8 +20,10 @@
 //! The same analysis also decides memory placement. User-visible pinned
 //! buffers stay `Memory::Shared`; parameter gradients remain dedicated
 //! because the runtime optimizer consumes them after the static plan, but use
-//! `Memory::Device` and staged diagnostic transfers. Other GPU-only buffers
-//! are device-local and may alias when their lifetimes do not overlap.
+//! `Memory::Device` and staged diagnostic transfers. Constant gradients stay
+//! shared because session construction initializes constants from the host.
+//! Other GPU-only buffers are device-local and may alias when their lifetimes
+//! do not overlap.
 
 use crate::compile::{BufferRef, ExecutionPlan, ShaderEntry};
 use std::ops::Range;
@@ -34,7 +36,8 @@ pub struct AliasPlan {
     pub sizes: Vec<usize>,
     /// Per physical allocation: place it in `Memory::Device` rather than
     /// host-visible shared memory. This covers GPU-only intermediates and
-    /// dedicated parameter gradients; other pinned buffers stay host-visible.
+    /// dedicated non-constant parameter gradients; other pinned buffers stay
+    /// host-visible.
     pub device_local: Vec<bool>,
 }
 
@@ -94,7 +97,8 @@ impl BufferUse {
 ///   persistent across steps, and externally bindable;
 /// - gradients — read by the runtime-encoded optimizer and grad-clip
 ///   passes that run *after* the plan's dispatches. They remain dedicated but
-///   are device-local because diagnostics use staged transfers;
+///   are device-local because diagnostics use staged transfers, except for
+///   constant gradients initialized from the host;
 /// - derived params and quantized weight buffers — uploaded once;
 /// - `CacheWrite` outputs (KV caches) — carry state across steps;
 /// - `ScatterAdd` outputs — read-modify-write;
@@ -199,9 +203,14 @@ pub fn plan_no_alias(
 }
 
 fn is_parameter_gradient(plan: &ExecutionPlan, index: usize) -> bool {
+    let buffer = BufferRef(index as u32);
     plan.param_grad_pairs
         .iter()
-        .any(|&(_, gradient)| gradient.0 as usize == index)
+        .any(|&(_, gradient)| gradient == buffer)
+        && !plan
+            .constant_buffers
+            .iter()
+            .any(|&(constant, _)| constant == buffer)
 }
 
 /// The pinning analysis shared by aliasing and memory-class decisions:
@@ -530,6 +539,16 @@ mod tests {
         }
         assert!(!alias.device_local[alias.map[1]]);
         assert!(alias.device_local[alias.map[4]]);
+    }
+
+    #[test]
+    fn constant_parameter_gradient_stays_host_visible() {
+        let mut p = plan(vec![4, 4], Vec::new());
+        p.param_buffers.push(("value".into(), BufferRef(0)));
+        p.param_grad_pairs.push((BufferRef(0), BufferRef(1)));
+        p.constant_buffers.push((BufferRef(1), vec![1.0]));
+        let alias = plan_buffer_aliasing(&p, &[], None);
+        assert!(!alias.device_local[alias.map[1]]);
     }
 
     #[test]
