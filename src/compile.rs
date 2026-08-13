@@ -610,7 +610,8 @@ impl Dispatch {
 
     #[cfg(test)]
     fn is_row_scaled_atomic_scatter(&self) -> bool {
-        self.shader == ShaderEntry::ScatterAddAtomic && self.params.get(3) == Some(&1)
+        self.shader == ShaderEntry::ScatterAddAtomic
+            && self.params.get(3).is_some_and(|&mode| mode != 0)
     }
 }
 
@@ -1002,8 +1003,10 @@ fn compile_with_caps_policy(
 ///
 /// `BroadcastInner(row_grad) -> Mul(factors) -> ScatterAddAtomic`
 ///
-/// into one row-scaled atomic scatter. The atomic work mapping and zeroing
-/// pass stay unchanged; only the two large intermediate buffers disappear.
+/// into one row-scaled atomic scatter. For narrow rows the fused shader maps
+/// one invocation to a complete source row; wider rows retain the scalar work
+/// mapping. The zeroing pass stays unchanged and the two large intermediate
+/// buffers disappear.
 fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
     use crate::schedule::Pw;
     use std::collections::{HashMap, HashSet};
@@ -1132,10 +1135,15 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
 
         let output = plan.dispatches[scatter_index].output_buffer;
         let total = plan.dispatches[scatter_index].params[0];
-        plan.dispatches[scatter_index].input_buffers = vec![indices, factors, row_scale, output];
-        plan.dispatches[scatter_index].params[3] = 1;
-        plan.dispatches[scatter_index].pointwise = None;
-        plan.dispatches[scatter_index].label = format!("ScatterAddAtomicRowMul[{total}]");
+        let scatter = &mut plan.dispatches[scatter_index];
+        scatter.input_buffers = vec![indices, factors, row_scale, output];
+        let small_row = scatter.params[2] <= 16;
+        scatter.params[3] = if small_row { 2 } else { 1 };
+        if small_row {
+            scatter.workgroups = [scatter.params[1].div_ceil(256), 1, 1];
+        }
+        scatter.pointwise = None;
+        scatter.label = format!("ScatterAddAtomicRowMul[{total}]");
         // The zero entry point does not read `src`, but its shared binding
         // layout still requires a valid buffer. Stop it from retaining the
         // now-eliminated product buffer.
@@ -5712,9 +5720,9 @@ mod tests {
             .expect("gathered row reduction should fuse its table gradient");
         assert_eq!(
             fused.params,
-            [VOCAB as u32 * INNER as u32, SEQ as u32, INNER as u32, 1]
+            [VOCAB as u32 * INNER as u32, SEQ as u32, INNER as u32, 2]
         );
-        assert_eq!(fused.workgroups, [16, 1, 1]);
+        assert_eq!(fused.workgroups, [1, 1, 1]);
         assert_eq!(fused.input_buffers.len(), 4);
         assert_eq!(fused.input_buffers[3], fused.output_buffer);
         assert!(!plan.dispatches.iter().any(|dispatch| {
@@ -5730,6 +5738,34 @@ mod tests {
             })
             .expect("fused atomic scatter still needs its zeroing pass");
         assert_eq!(zero.input_buffers[0], fused.input_buffers[1]);
+    }
+
+    #[test]
+    fn wide_gather_reduction_keeps_scalar_atomic_mapping() {
+        const SEQ: usize = 256;
+        const VOCAB: usize = 4097;
+        const INNER: usize = 32;
+
+        let mut graph = Graph::new();
+        let indices = graph.input_u32("indices", &[SEQ]);
+        let table = graph.parameter("table", &[VOCAB, INNER]);
+        let factors = graph.input("factors", &[SEQ, INNER]);
+        let gathered = graph.embedding(indices, table);
+        let terms = graph.mul(gathered, factors);
+        let rows = graph.sum_inner(terms);
+        let row_scale = graph.input("row_scale", &[SEQ, 1]);
+        let weighted = graph.mul(rows, row_scale);
+        let loss = graph.sum_all(weighted);
+        graph.set_outputs(vec![loss]);
+
+        let (plan, _) = crate::train::compile_training_graph(&graph);
+        let fused = plan
+            .dispatches
+            .iter()
+            .find(|dispatch| dispatch.is_row_scaled_atomic_scatter())
+            .expect("gathered row reduction should fuse its table gradient");
+        assert_eq!(fused.params[3], 1);
+        assert_eq!(fused.workgroups, [(SEQ * INNER).div_ceil(256) as u32, 1, 1]);
     }
 
     #[test]

@@ -951,7 +951,7 @@ fn layer_norm_archetype_parity() {
 fn gathered_reduction_table_gradient_matches_row_scale_bit_exactly() {
     const ROWS: usize = 2049;
     const COLS: usize = 16;
-    const VOCAB: usize = 2053;
+    const VOCAB: usize = 257;
 
     let mut graph = Graph::new();
     let indices = graph.input_u32("indices", &[ROWS]);
@@ -999,7 +999,7 @@ fn gathered_reduction_table_gradient_matches_row_scale_bit_exactly() {
     for row in 0..ROWS {
         let output_row = indices_data[row] as usize;
         for col in 0..COLS {
-            expected[output_row * COLS + col] =
+            expected[output_row * COLS + col] +=
                 row_scale_data[row] * factors_data[row * COLS + col];
         }
     }
