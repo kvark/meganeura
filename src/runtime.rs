@@ -1,6 +1,6 @@
 use crate::compile::{BufferRef, Dispatch, ExecutionPlan, ShaderEntry};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 type Gpu = blade_graphics::Context;
 
@@ -248,6 +248,7 @@ struct AdamData {
     grad: blade_graphics::BufferPiece,
     m: blade_graphics::BufferPiece,
     v: blade_graphics::BufferPiece,
+    grouped_grad_norm: blade_graphics::BufferPiece,
     params: AdamParams,
 }
 
@@ -261,7 +262,7 @@ struct AdamParams {
     eps: f32,
     step: f32,
     wd: f32,
-    _pad1: u32,
+    grad_group_size: u32,
 }
 
 // Grad-clip pre-pass: zero the 1-element scalar accumulator buffer.
@@ -2179,6 +2180,10 @@ pub struct Session {
     pending_lr: Option<f32>,
     /// Per-parameter Adam state buffers: (m_buf, v_buf).
     adam_state: Vec<(blade_graphics::Buffer, blade_graphics::Buffer)>,
+    /// Optional exact temporal sum of grouped gradient L2 norms for one
+    /// parameter. Adam already visits every scalar gradient, so collecting
+    /// this diagnostic does not require another dispatch or shader variant.
+    adam_grouped_grad_norm: Option<AdamGroupedGradNorm>,
     /// Single-element f32 (stored as u32 bits for atomic ops) holding
     /// the running sum-of-squares of the gradient buffers in the
     /// current step(). Filled by GradClipNormSq, consumed by
@@ -2228,6 +2233,13 @@ pub struct Session {
     lr_multipliers: Vec<(String, f32)>,
     /// Staging buffers for Q4 HorizontalConcat derived params.
     weight_staging: HashMap<crate::compile::BufferRef, Vec<f32>>,
+}
+
+struct AdamGroupedGradNorm {
+    param_index: usize,
+    group_size: u32,
+    len: usize,
+    buffer: blade_graphics::Buffer,
 }
 
 /// Identifies a graph-facing slot that can be backed by an imported
@@ -2463,13 +2475,10 @@ impl Session {
 
     /// Create a session from a compiled execution plan.
     ///
-    /// Initializes a fresh `blade_graphics::Context` owned by this session.
-    /// Use [`Session::with_context`] to share a context with an existing
-    /// Blade-based renderer.
+    /// Reuses the process-default GPU context. Use [`Session::with_context`]
+    /// to share a context with an existing Blade-based renderer instead.
     pub fn new(plan: ExecutionPlan) -> Self {
-        let gpu = init_gpu_context().expect("failed to initialize blade GPU context");
-
-        Self::with_context(plan, Arc::new(gpu))
+        Self::with_context(plan, default_gpu_context())
     }
 
     /// Create a session that reuses an externally-owned Blade GPU context,
@@ -2781,6 +2790,7 @@ impl Session {
             grad_accum_scale: None,
             lr_multipliers: Vec::new(),
             adam_state,
+            adam_grouped_grad_norm: None,
             adam_step: 0,
             pending_adam: None,
             adam_wd: 0.0,
@@ -3117,6 +3127,13 @@ pub fn init_gpu_context_with(
             ..Default::default()
         })
     }
+}
+
+pub(crate) fn default_gpu_context() -> Arc<Gpu> {
+    static CONTEXT: OnceLock<Arc<Gpu>> = OnceLock::new();
+    Arc::clone(CONTEXT.get_or_init(|| {
+        Arc::new(init_gpu_context().expect("failed to initialize blade GPU context"))
+    }))
 }
 
 pub(crate) fn parse_device_id(value: &str) -> Option<u32> {
@@ -4873,6 +4890,13 @@ impl Session {
                             param_buf,
                         );
                     let (ref m_buf, ref v_buf) = self.adam_state[idx];
+                    let (grouped_grad_norm, grad_group_size) = Self::adam_grouped_grad_norm_binding(
+                        self.adam_grouped_grad_norm.as_ref(),
+                        self.grad_clip_acc
+                            .as_ref()
+                            .expect("Adam requires a gradient accumulator buffer"),
+                        idx,
+                    );
                     let mut pc = pass.with(pipeline);
                     pc.bind(
                         0,
@@ -4887,6 +4911,7 @@ impl Session {
                             ),
                             m: m_buf.at(0),
                             v: v_buf.at(0),
+                            grouped_grad_norm,
                             params: AdamParams {
                                 len,
                                 lr: effective_lr,
@@ -4895,7 +4920,7 @@ impl Session {
                                 eps,
                                 step: self.adam_step as f32,
                                 wd,
-                                _pad1: 0,
+                                grad_group_size,
                             },
                         },
                     );
@@ -4922,6 +4947,19 @@ impl Session {
             accum_bufs[idx].at(0)
         } else {
             buffers[grad_buf.0 as usize].at(0)
+        }
+    }
+
+    fn adam_grouped_grad_norm_binding(
+        accumulator: Option<&AdamGroupedGradNorm>,
+        fallback: &blade_graphics::Buffer,
+        param_index: usize,
+    ) -> (blade_graphics::BufferPiece, u32) {
+        match accumulator {
+            Some(value) if value.param_index == param_index => {
+                (value.buffer.at(0), value.group_size)
+            }
+            _ => (fallback.at(0), 0),
         }
     }
 
@@ -6363,6 +6401,13 @@ impl Session {
         for (idx, &(param_buf, grad_buf)) in self.plan.param_grad_pairs.iter().enumerate() {
             let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
             let (ref m_buf, ref v_buf) = self.adam_state[idx];
+            let (grouped_grad_norm, grad_group_size) = Self::adam_grouped_grad_norm_binding(
+                self.adam_grouped_grad_norm.as_ref(),
+                self.grad_clip_acc
+                    .as_ref()
+                    .expect("Adam requires a gradient accumulator buffer"),
+                idx,
+            );
             let mut pc = pass.with(pipeline);
             pc.bind(
                 0,
@@ -6371,6 +6416,7 @@ impl Session {
                     grad: self.buffers[grad_buf.0 as usize].at(0),
                     m: m_buf.at(0),
                     v: v_buf.at(0),
+                    grouped_grad_norm,
                     params: AdamParams {
                         len,
                         lr,
@@ -6379,7 +6425,7 @@ impl Session {
                         eps,
                         step: self.adam_step as f32,
                         wd: self.adam_wd,
-                        _pad1: 0,
+                        grad_group_size,
                     },
                 },
             );
@@ -6402,6 +6448,72 @@ impl Session {
         self.pending_adam = Some((lr, beta1, beta2, eps));
         // Switching optimizers: Adam wins, SGD stops applying.
         self.pending_lr = None;
+    }
+
+    /// Accumulate the L2 norm of each consecutive gradient group for one
+    /// parameter on every Adam update.
+    ///
+    /// For a `[N, 3]` position parameter, `group_size = 3` produces `N`
+    /// values containing the exact temporal sum of each point's gradient
+    /// magnitude. Collection is folded into the existing Adam dispatch and
+    /// adds no synchronization. Configuring another parameter replaces and
+    /// zeroes the previous accumulator.
+    pub fn set_adam_grouped_grad_norm(&mut self, name: &str, group_size: usize) {
+        assert!(group_size > 0, "gradient group size must be non-zero");
+        let group_size = u32::try_from(group_size).expect("gradient group size exceeds u32");
+        let param_index = self
+            .adam_state_index(name)
+            .unwrap_or_else(|| panic!("no Adam state for param: {name}"));
+        let param_len = self.param_size(name).expect("parameter exists");
+        assert_eq!(
+            param_len % group_size as usize,
+            0,
+            "parameter {name:?} has {param_len} elements, not divisible by group size {group_size}",
+        );
+        let len = param_len / group_size as usize;
+        let byte_len = len * std::mem::size_of::<f32>();
+
+        self.wait();
+        if let Some(previous) = self.adam_grouped_grad_norm.take() {
+            self.gpu.destroy_buffer(previous.buffer);
+        }
+        let buffer = self.gpu.create_buffer(blade_graphics::BufferDesc {
+            name: "adam_grouped_grad_norm",
+            size: (byte_len as u64).max(4),
+            memory: blade_graphics::Memory::Shared,
+        });
+        unsafe {
+            std::ptr::write_bytes(buffer.data(), 0, byte_len.max(4));
+        }
+        self.adam_grouped_grad_norm = Some(AdamGroupedGradNorm {
+            param_index,
+            group_size,
+            len,
+            buffer,
+        });
+    }
+
+    /// Read the grouped gradient-norm totals configured by
+    /// [`Session::set_adam_grouped_grad_norm`].
+    pub fn read_adam_grouped_grad_norm(&self, name: &str) -> Vec<f32> {
+        let accumulator = self
+            .adam_grouped_grad_norm
+            .as_ref()
+            .expect("Adam grouped gradient norm is not configured");
+        assert_eq!(
+            self.adam_state_index(name),
+            Some(accumulator.param_index),
+            "Adam grouped gradient norm is configured for another parameter",
+        );
+        self.read_f32_buffers(
+            &[(
+                accumulator.buffer,
+                accumulator.len * std::mem::size_of::<f32>(),
+            )],
+            "adam_grouped_grad_norm_readback",
+        )
+        .pop()
+        .unwrap()
     }
 
     /// Set the decoupled weight-decay coefficient for the Adam update,
@@ -6861,6 +6973,9 @@ impl Drop for Session {
         }
         if let Some(buffer) = self.grad_clip_acc {
             self.gpu.destroy_buffer(buffer);
+        }
+        if let Some(ref accumulator) = self.adam_grouped_grad_norm {
+            self.gpu.destroy_buffer(accumulator.buffer);
         }
         for &buffer in &self.grad_accum_bufs {
             self.gpu.destroy_buffer(buffer);
