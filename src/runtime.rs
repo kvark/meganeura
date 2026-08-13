@@ -2989,7 +2989,7 @@ impl Session {
     /// Stable descriptive key for the pipeline selected by each plan
     /// dispatch, in dispatch order.
     ///
-    /// One key per [`Variant`], so the key names the pipeline that will
+    /// One key per internal pipeline variant, so the key names what will
     /// actually run: scalar, cooperative, small-tile, reduced-weight,
     /// fused RmsNorm, fused epilogue or prologue, attention width, or a
     /// generated pointwise/reduction kernel.
