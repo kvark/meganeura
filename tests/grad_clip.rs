@@ -166,3 +166,20 @@ fn cpu_grad_clip_stages_device_local_gradients() {
         .sqrt();
     assert!((after - 0.01).abs() < 1.0e-6, "clipped norm is {after}");
 }
+
+#[test]
+fn constant_parameter_gradient_remains_host_visible() {
+    let mut graph = Graph::new();
+    let parameter = graph.parameter("value", &[1]);
+    graph.set_outputs(vec![parameter]);
+    let mut session = meganeura::build(&graph, meganeura::SessionConfig::from_env()).0;
+    session.set_parameter("value", &[2.0]);
+    session.clear_optimizer();
+    session.step();
+    session.wait();
+    assert_eq!(session.read_loss(), 2.0);
+
+    let mut gradient = [0.0];
+    session.read_param_grad("value", &mut gradient);
+    assert_eq!(gradient, [1.0]);
+}
