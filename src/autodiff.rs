@@ -194,23 +194,14 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let logits = node.inputs[0];
                 let labels = node.inputs[1];
                 let shape = forward.nodes()[logits as usize].ty.shape.clone();
-                let batch = shape[0];
-                let features = shape[1];
-                let n = batch * features;
-                let softmax = graph.softmax(logits);
-                // Build per-row label sum broadcast to [batch, features]:
-                // SumInner gives S[b] as [batch, 1]; matmul with
-                // ones[1, features] replicates it across the row. Must
-                // stay O(batch·features) — a ones[features, features]
-                // matmul is quadratic in vocab size for LM heads.
-                let label_sum_b1 = graph.sum_inner(labels);
-                let ones_1f = graph.constant(vec![1.0; features], &[1, features]);
-                let label_sum_bf = graph.matmul(label_sum_b1, ones_1f);
-                let softmax_scaled = graph.mul(softmax, label_sum_bf);
-                let neg_labels = graph.neg(labels);
-                let diff = graph.add(softmax_scaled, neg_labels);
-                let inv_batch = graph.constant(vec![1.0 / batch as f32; n], &shape);
-                let local_grad = graph.mul(diff, inv_batch);
+                // The CE forward kernel already writes `softmax·S − labels`
+                // into a sibling buffer. Reuse it instead of rebuilding
+                // softmax + a ones-row broadcast matmul.
+                let local_grad = graph.add_raw_node(
+                    Op::CrossEntropyLogitsGrad,
+                    vec![logits, labels],
+                    TensorType::f32(shape.clone()),
+                );
                 // Chain with upstream grad_output (broadcast scalar to
                 // [batch, features]). Without this, any coef or downstream
                 // op multiplied onto policy_loss is silently dropped from
@@ -634,7 +625,8 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::RoPEGrad { .. }
             | Op::NormalizeInnerSumGrad { .. }
             | Op::PairwiseGrad { .. }
-            | Op::GlobalAvgPoolGrad { .. } => {}
+            | Op::GlobalAvgPoolGrad { .. }
+            | Op::CrossEntropyLogitsGrad => {}
             Op::Gelu => {
                 // gelu(x) ≈ x * sigmoid(1.702 * x) (sigmoid approximation)
                 // gelu'(x) ≈ sigmoid(1.702x) * (1 + 1.702*x*(1 - sigmoid(1.702x)))

@@ -1,7 +1,4 @@
 pub mod efficientnet;
-pub mod gemma4;
-pub mod mistral;
-pub mod phi3;
 pub mod resnet;
 pub mod sd_unet;
 pub mod smollm2;

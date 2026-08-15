@@ -9,7 +9,8 @@
 //! use meganeura::data::safetensors::SafeTensorsModel;
 //!
 //! // `SafeTensorsModel::download("dacorvo/mnist-mlp")` fetches from the
-//! // Hub instead, when the `hub` feature is enabled.
+//! // Hub instead, when the `hub` feature is enabled. Embedded assets
+//! // use `SafeTensorsModel::from_bytes`.
 //! let model = SafeTensorsModel::load("model.safetensors".into()).unwrap();
 //! for (name, info) in model.tensor_info() {
 //!     println!("{}: shape={:?}", name, info.shape);
@@ -132,6 +133,20 @@ impl SafeTensorsModel {
     /// Load a model from a local safetensors file.
     pub fn load(path: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
         let data = std::fs::read(&path)?;
+        let model = Self::from_bytes(data)?;
+        log::info!(
+            "loaded {} tensors from {}",
+            model.info.len(),
+            path.display()
+        );
+        Ok(model)
+    }
+
+    /// Load a model from an in-memory safetensors buffer.
+    ///
+    /// This is the embed path for targets that ship weights as app assets
+    /// (Android, iOS) rather than as a filesystem file.
+    pub fn from_bytes(data: Vec<u8>) -> Result<Self, Box<dyn std::error::Error>> {
         let tensors = SafeTensors::deserialize(&data)?;
 
         let mut info = HashMap::new();
@@ -147,7 +162,6 @@ impl SafeTensorsModel {
             tensor_shard.insert(name.to_string(), 0);
         }
 
-        log::info!("loaded {} tensors from {}", info.len(), path.display());
         Ok(Self {
             shards: vec![data],
             info,

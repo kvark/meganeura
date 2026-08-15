@@ -187,6 +187,10 @@ pub enum Op {
     // Loss
     CrossEntropyLoss,
     BceLoss,
+    /// Logits gradient already written by a sibling [`Op::CrossEntropyLoss`]
+    /// forward kernel on the same `(logits, labels)`. Compile aliases that
+    /// buffer; no extra dispatch.
+    CrossEntropyLogitsGrad,
 
     // Comparison (for autodiff)
     Greater,

@@ -100,6 +100,14 @@ devices.
 cargo add meganeura
 ```
 
+Hub downloads (`SafeTensorsModel::download`) need the optional `hub` feature:
+
+```
+cargo add meganeura --features hub
+```
+
+Embedded targets should load weights with `SafeTensorsModel::from_bytes` or `SafeTensorsModel::load` instead.
+
 Worked examples live in [`examples/`](https://github.com/kvark/meganeura/tree/main/examples):
 
 - [`mnist.rs`](https://github.com/kvark/meganeura/blob/main/examples/mnist.rs) — MNIST training end to end.
@@ -212,7 +220,7 @@ for the Inferena harness and interpretation rules.
 For a CPU/GPU timeline:
 
 ```
-MEGANEURA_TRACE=trace.pftrace cargo run --example mnist
+MEGANEURA_TRACE=trace.pftrace cargo run --example mnist --features profiler
 ```
 
 Open the trace in [Perfetto](https://ui.perfetto.dev):

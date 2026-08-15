@@ -21,7 +21,7 @@
 struct Params {
     batch: u32,
     features: u32,
-    _pad0: u32,
+    write_grad: u32,
     _pad1: u32,
 }
 
@@ -115,7 +115,9 @@ fn main(
         let log_softmax = logits[offset + j] - log_sum_exp;
         let softmax = exp(log_softmax);
         local_loss -= labels[offset + j] * log_softmax;
-        grad_out[offset + j] = (softmax * label_sum - labels[offset + j]) * inv_batch;
+        if params.write_grad != 0u {
+            grad_out[offset + j] = (softmax * label_sum - labels[offset + j]) * inv_batch;
+        }
         j += 256u;
     }
 

@@ -10,23 +10,30 @@ description = "E-graph optimized neural network training on Blade"
 license = "MIT"
 
 [features]
-default = ["hub"]
+default = []
 # Downloading weights from the HuggingFace Hub
-# (`SafeTensorsModel::download` / `download_file`). Turn this off on
-# targets where there is no ambient HTTP/TLS stack or writable cache
-# directory — Android, for instance, ships weights as app assets and
-# loads them through `SafeTensorsModel::load`.
+# (`SafeTensorsModel::download` / `download_file`). Off by default so
+# embedders (Android, iOS, hermetic CI) do not pull ureq/rustls or write
+# `~/.cache/huggingface`. Those targets ship weights as assets and load
+# them through `SafeTensorsModel::from_bytes` or `::load`.
 hub = ["dep:hf-hub"]
+# Installs a tracing subscriber in `profiler::init` for Perfetto CPU
+# spans. GPU timestamp recording does not need this feature.
+profiler = ["dep:tracing-subscriber"]
 
 [dependencies]
 blade-graphics = { version = "0.8.4", git = "https://github.com/kvark/blade", rev = "20fcb84953dc216bbb7179bda6ce985693208736" }
 blade-macros = { version = "0.3", git = "https://github.com/kvark/blade", rev = "20fcb84953dc216bbb7179bda6ce985693208736" }
-egglog = "2.0"
+# `default-features = false` drops egglog's `bin` stack (clap, mimalloc,
+# env_logger, chrono, graphviz). Greedy mode never constructs an EGraph
+# but the crate is still linked for the optional equality-saturation
+# modes.
+egglog = { version = "2.0", default-features = false }
 bytemuck = { version = "1", features = ["derive"] }
 # Pinned to the same wgpu/naga rev as blade-graphics so the `naga::Module`
 # we build unifies with the one blade's SPIR-V backend consumes. This rev
 # carries `spv::Options::emit_int_div_checks`, which blade sets to false.
-naga = { version = "29.0.0", git = "https://github.com/gfx-rs/wgpu", rev = "78b4dfd0cb1ef5ed208fefe80ae2f855db3609bb", features = ["wgsl-in", "wgsl-out", "spv-out"] }
+naga = { version = "29.0.0", git = "https://github.com/gfx-rs/wgpu", rev = "78b4dfd0cb1ef5ed208fefe80ae2f855db3609bb", default-features = false, features = ["wgsl-in", "wgsl-out", "spv-out"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ron = "0.8"
@@ -38,7 +45,7 @@ oxionnx-core = "0.1"
 oxionnx-proto = "0.1"
 half = "2"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["registry"] }
+tracing-subscriber = { version = "0.3", optional = true, features = ["registry"] }
 
 # Only the examples, benches, and tests need these. Keeping them out of
 # `[dependencies]` matters for cross-compilation: `tokenizers`/`onig`
@@ -71,14 +78,17 @@ path = "examples/diffusion.rs"
 [[example]]
 name = "huggingface"
 path = "examples/huggingface.rs"
+required-features = ["hub"]
 
 [[example]]
 name = "smollm2"
 path = "examples/smollm2.rs"
+required-features = ["hub"]
 
 [[example]]
 name = "smolvlm2"
 path = "examples/smolvlm2.rs"
+required-features = ["hub"]
 
 [[example]]
 name = "sd_unet_train"
@@ -91,10 +101,12 @@ path = "bench/bench_sd_unet_train.rs"
 [[example]]
 name = "bench_meganeura"
 path = "bench/bench_meganeura.rs"
+required-features = ["hub"]
 
 [[example]]
 name = "bench_smolvla_meganeura"
 path = "bench/bench_smolvla_meganeura.rs"
+required-features = ["hub"]
 
 [[example]]
 name = "bench_smolvla_train"
@@ -103,14 +115,17 @@ path = "bench/bench_smolvla_train.rs"
 [[example]]
 name = "onnx_compare"
 path = "examples/onnx_compare.rs"
+required-features = ["hub"]
 
 [[example]]
 name = "resnet"
 path = "examples/resnet.rs"
+required-features = ["hub"]
 
 [[example]]
 name = "whisper"
 path = "examples/whisper.rs"
+required-features = ["hub"]
 
 [[example]]
 name = "bench_ci_latency"
@@ -119,6 +134,7 @@ path = "bench/bench_ci_latency.rs"
 [[example]]
 name = "qwen3"
 path = "examples/qwen3.rs"
+required-features = ["hub"]
 
 [[example]]
 name = "grad_check"

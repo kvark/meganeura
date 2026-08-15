@@ -13,8 +13,8 @@ struct ScatterAddData {
     params: ScatterAddParams,
 }
 
-// Naga reflects the module-wide globals for every atomic entry point. The
-// ordinary and zeroing entries bind `src` again for their unused row scale.
+// Column-parallel scatter (historical name). `row_scale` is bound even
+// when the unscaled path ignores it so the layout stays one module.
 #[derive(blade_macros::ShaderData)]
 struct ScatterAddAtomicData {
     indices: blade_graphics::BufferPiece,
@@ -673,12 +673,11 @@ struct CrossEntropyData {
     params: SoftmaxParams,
 }
 
-// bce: var pred, labels, grad_out, loss_out, params
+// bce: var pred, labels, loss_out, params
 #[derive(blade_macros::ShaderData)]
 struct BceData {
     pred: blade_graphics::BufferPiece,
     labels: blade_graphics::BufferPiece,
-    grad_out: blade_graphics::BufferPiece,
     loss_out: blade_graphics::BufferPiece,
     params: UnaryParams, // len, _pad x3
 }
@@ -1765,9 +1764,10 @@ pub(crate) fn select_variants(
         // dimension grows beyond 1024. Its forward convolution staging
         // is also slower than the scalar im2col path; grad-input remains
         // profitable and is selected independently below.
-        let apple_f32_coop = cfg!(all(target_os = "macos", target_arch = "aarch64"))
-            && !config.use_f16_input
-            && config.tile_size == 8;
+        // Native 8×8 f32 tiles (Apple simdgroup) lose to the scalar path
+        // on large GEMMs and on forward conv. Key off the tile, not OS:
+        // iOS and future 8×8 f32 advertisers need the same veto.
+        let apple_f32_coop = !config.use_f16_input && config.tile_size == 8;
         for dispatch in &mut plan.dispatches {
             // Autodiff marks derivative work as f32-sensitive. NVIDIA's
             // TF32 keeps the f32 exponent range, but our portable f16
@@ -5338,7 +5338,7 @@ impl Session {
                         params: SoftmaxParams {
                             batch: dispatch.params[0],
                             features: dispatch.params[1],
-                            _pad0: 0,
+                            _pad0: dispatch.params.get(2).copied().unwrap_or(0),
                             _pad1: 0,
                         },
                     },
@@ -5350,7 +5350,6 @@ impl Session {
                     &BceData {
                         pred: buf(dispatch.input_buffers[0]),
                         labels: buf(dispatch.input_buffers[1]),
-                        grad_out: buf(dispatch.output_buffer),
                         loss_out: buf(dispatch.output_buffer),
                         params: UnaryParams {
                             len: dispatch.params[0],

@@ -21,7 +21,9 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
+#[cfg(feature = "profiler")]
 use tracing::{Subscriber, span};
+#[cfg(feature = "profiler")]
 use tracing_subscriber::{Layer, layer::Context, prelude::*, registry::LookupSpan};
 
 // ---- Track IDs ----
@@ -72,17 +74,22 @@ fn get_or_init() -> &'static Arc<Mutex<ProfilerInner>> {
 
 // ---- Public API ----
 
-/// Initialize profiling: installs a global [`tracing`] subscriber that records
-/// spans as Perfetto slice events on the CPU track.
+/// Initialize profiling.
 ///
-/// Safe to call multiple times (subsequent calls are no-ops).
-/// Must be called *before* any tracing spans you want captured.
+/// Always arms the in-process event buffer used by GPU timestamp
+/// recording. With the `profiler` feature, also installs a global
+/// [`tracing`] subscriber that records CPU spans as Perfetto slices.
+/// Safe to call multiple times (subsequent subscriber installs are
+/// no-ops). Must be called *before* any tracing spans you want captured.
 pub fn init() {
-    let inner = get_or_init().clone();
-    let layer = ProfileLayer { inner };
-    let subscriber = tracing_subscriber::registry().with(layer);
-    // Ignore error if a subscriber is already set.
-    let _ = tracing::subscriber::set_global_default(subscriber);
+    let _ = get_or_init();
+    #[cfg(feature = "profiler")]
+    {
+        let inner = get_or_init().clone();
+        let layer = ProfileLayer { inner };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    }
 }
 
 /// Record GPU pass timing events on the GPU track.
@@ -651,10 +658,12 @@ fn quantile(values: &[f64], q: f64) -> f64 {
 
 /// A [`tracing_subscriber::Layer`] that captures span enter/exit as Perfetto
 /// slice events on the CPU track.
+#[cfg(feature = "profiler")]
 pub struct ProfileLayer {
     inner: Arc<Mutex<ProfilerInner>>,
 }
 
+#[cfg(feature = "profiler")]
 impl<S> Layer<S> for ProfileLayer
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
