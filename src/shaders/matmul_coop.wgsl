@@ -25,6 +25,7 @@ var<workgroup> shared_a0: array<$ELEM_TYPE, $SHARED_SIZE>;
 var<workgroup> shared_a1: array<$ELEM_TYPE, $SHARED_SIZE>;
 var<workgroup> shared_b0: array<$ELEM_TYPE, $SHARED_SIZE>;
 var<workgroup> shared_b1: array<$ELEM_TYPE, $SHARED_SIZE>;
+$SHARED_LO_DECL
 $RESULT_SHARED_DECL
 $PROLOGUE_CACHE_DECL
 
@@ -85,6 +86,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         acc01 = coopMultiplyAdd(a0, b1, acc01);
         acc10 = coopMultiplyAdd(a1, b0, acc10);
         acc11 = coopMultiplyAdd(a1, b1, acc11);
+        $COMPENSATED_MMA
 
         workgroupBarrier();
         t += $TILE_SIZE_U;

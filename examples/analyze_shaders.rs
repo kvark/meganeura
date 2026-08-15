@@ -194,6 +194,7 @@ fn main() {
         let config = CoopConfig {
             tile_size: 16,
             use_f16_input: true,
+            compensated: false,
         };
         // The cooperative form is a modifier on the scalar group, so the
         // entry alone names the kernel.
@@ -215,6 +216,7 @@ fn main() {
         let config = CoopConfig {
             tile_size: 8,
             use_f16_input: false,
+            compensated: false,
         };
         let sm = meganeura::codegen::generate_module_coop(ShaderGroup::MatMul, &config);
         analyze(

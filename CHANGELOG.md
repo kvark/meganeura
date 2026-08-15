@@ -1,5 +1,20 @@
 # Unreleased
 
+- Compensated f16 cooperative matmul (C1): on devices that only expose
+  f16 tiles, `requires_full_precision` work stages each operand as
+  `hi = f16(x)` plus residual `lo` and accumulates `hi·hi + hi·lo +
+  lo·hi` in f32. Inference keeps plain f16 staging. `AllowF16` still
+  forces the uncompensated path.
+- Horizontal fusion (D1): independent same-A matmuls that already share
+  a barrier group (Q/K/V projections) pack into one dispatch with
+  `workgroups.z` selecting the sibling.
+
+- Parameter gradients, Adam m/v, the clip accumulator, and temporal
+  grad-accumulators default to device-local memory. Host read/write
+  (checkpoints, `read_param_grad`, `read_adam_*`) stages through a
+  transient buffer. `MEGANEURA_NO_DEVICE_LOCAL=1` and debug sessions
+  keep the previous host-visible layout.
+
 - Cross-entropy training reuses the forward kernel's fused logits gradient
   instead of rebuilding softmax and a ones-row broadcast matmul. Inference
   skips the unused gradient write.

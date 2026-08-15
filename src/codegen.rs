@@ -19,6 +19,10 @@ pub struct CoopConfig {
     pub tile_size: u32,
     /// Use f16 input with f32 accumulator (true for Vulkan), or all-f32 (true for Metal).
     pub use_f16_input: bool,
+    /// Split each f32 operand into `hi = f16(x)` and `lo = f16(x - f32(hi))`
+    /// and accumulate `hi·hi + hi·lo + lo·hi` in f32 (Ootomo & Yokota).
+    /// Used for `requires_full_precision` work on f16-only coop devices.
+    pub compensated: bool,
 }
 
 impl CoopConfig {
@@ -588,6 +592,83 @@ pub fn generate_module_coop(group: ShaderGroup, config: &CoopConfig) -> ShaderMo
     let (fused_add, variant) =
         coop_shape(group).unwrap_or_else(|| panic!("no cooperative form for {group:?}"));
     gen_matmul_coop_wgsl(fused_add, variant, config)
+}
+
+/// Pack `count` same-A matmuls into one dispatch (`workgroups.z = count`).
+/// Each z-slice uses `matrix_b{i}` / `matrix_c{i}`.
+pub fn generate_horizontal_matmul(
+    group: ShaderGroup,
+    count: u32,
+    coop: Option<&CoopConfig>,
+) -> ShaderModule {
+    assert!((2..=3).contains(&count));
+    let base = match coop {
+        Some(config) => generate_module_coop(group, config),
+        None => generate_module(group),
+    };
+    let src = &base.source;
+    let Some((header, rest)) = src.split_once("@compute") else {
+        panic!("matmul source missing @compute");
+    };
+    let compute_attr = if rest.contains("@workgroup_size(64)") {
+        "@compute @workgroup_size(64)"
+    } else {
+        "@compute @workgroup_size(16, 16)"
+    };
+    let b_line = header
+        .lines()
+        .find(|l| l.contains("var<storage> matrix_b"))
+        .unwrap_or("var<storage> matrix_b: array<f32>;");
+    let b_ty = b_line
+        .split_once(':')
+        .map(|(_, t)| t.trim().trim_end_matches(';').trim())
+        .unwrap_or("array<f32>");
+    let mut header = header.replace("var<storage> matrix_b:", "var<storage> matrix_b0:");
+    header = header.replace(
+        "var<storage, read_write> matrix_c:",
+        "var<storage, read_write> matrix_c0:",
+    );
+    let extras: String = (1..count)
+        .map(|i| {
+            format!("var<storage> matrix_b{i}: {b_ty};\nvar<storage, read_write> matrix_c{i}: array<f32>;\n")
+        })
+        .collect();
+    if let Some(pos) = header.find("var<storage, read_write> matrix_c0:") {
+        let insert_at = header[pos..]
+            .find('\n')
+            .map(|n| pos + n + 1)
+            .unwrap_or(header.len());
+        header.insert_str(insert_at, &extras);
+    } else {
+        header.push_str(&extras);
+    }
+    let mut bodies = String::new();
+    for i in 0..count {
+        let mut fn_src = rest.replace("fn main", &format!("fn horiz_{i}"));
+        fn_src = fn_src.replacen("@workgroup_size(64)", "", 1);
+        fn_src = fn_src.replacen("@workgroup_size(16, 16)", "", 1);
+        fn_src = fn_src.replace("@builtin(workgroup_id) ", "");
+        fn_src = fn_src.replace("@builtin(local_invocation_id) ", "");
+        fn_src = fn_src.replace("matrix_b[", &format!("matrix_b{i}["));
+        fn_src = fn_src.replace("matrix_c[", &format!("matrix_c{i}["));
+        bodies.push_str(&fn_src);
+        bodies.push('\n');
+    }
+    let mut dispatch = format!(
+        "{compute_attr}\nfn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{\n"
+    );
+    for i in 0..count {
+        let cond = if i + 1 == count {
+            "else".to_string()
+        } else if i == 0 {
+            format!("if wgid.z == {i}u")
+        } else {
+            format!("else if wgid.z == {i}u")
+        };
+        dispatch.push_str(&format!("    {cond} {{ horiz_{i}(wgid, lid); }}\n"));
+    }
+    dispatch.push_str("}\n");
+    parse_wgsl(&format!("{header}{bodies}{dispatch}"))
 }
 
 /// Generate WGSL source for a shader group.
@@ -1470,10 +1551,22 @@ fn gen_matmul_coop_wgsl_full(
     let tile_mask = tile - 1;
     let tile_shift = tile.trailing_zeros();
 
-    let (elem_type, enable_f16, elem_zero, cast_open, cast_close) = if config.use_f16_input {
-        ("f16", "enable f16;", "f16(0.0)", "f16(", ")")
+    let compensated = config.compensated && config.use_f16_input;
+    let (elem_type, enable_f16) = if config.use_f16_input {
+        ("f16", "enable f16;")
     } else {
-        ("f32", "", "0.0", "", "")
+        ("f32", "")
+    };
+    let store = |shared: &str, idx: &str, f32_expr: &str| -> String {
+        if compensated {
+            format!(
+                "{{ let _x = ({f32_expr}); let _h = f16(_x); {shared}[{idx}] = _h; {shared}_lo[{idx}] = f16(_x - f32(_h)); }}"
+            )
+        } else if config.use_f16_input {
+            format!("{shared}[{idx}] = f16({f32_expr});")
+        } else {
+            format!("{shared}[{idx}] = {f32_expr};")
+        }
     };
     let ab_type = if config.use_f16_input { "f16" } else { "f32" };
     let coop_ab = format!("coop_mat{}x{}<{},A>", tile, tile, ab_type);
@@ -1562,6 +1655,18 @@ fn gen_matmul_coop_wgsl_full(
         // aligned N to keep the store safe — the slow-staging path here
         // is only exercised when N >= 16 but N % 4 != 0 (e.g., N=20).
         let gen_vec4_b = |shared: &str, col_offset: &str| -> String {
+            let st_x = store(shared, "flat", "v.x");
+            let st_y = store(shared, "flat + 1u", "v.y");
+            let st_z = store(shared, "flat + 2u", "v.z");
+            let st_w = store(shared, "flat + 3u", "v.w");
+            let st_m0 = store(shared, "flat", "select(0.0, v0, m0)");
+            let st_m1 = store(shared, "flat + 1u", "select(0.0, v1, m1)");
+            let st_m2 = store(shared, "flat + 2u", "select(0.0, v2, m2)");
+            let st_m3 = store(shared, "flat + 3u", "select(0.0, v3, m3)");
+            let st_z0 = store(shared, "flat", "0.0");
+            let st_z1 = store(shared, "flat + 1u", "0.0");
+            let st_z2 = store(shared, "flat + 2u", "0.0");
+            let st_z3 = store(shared, "flat + 3u", "0.0");
             format!(
                 "{{\
                \n            let tr = t + v4_row;\
@@ -1569,10 +1674,10 @@ fn gen_matmul_coop_wgsl_full(
                \n            let flat = v4_row * {t}u + v4_col;\
                \n            if tr < k && (cc4 + 4u) <= n && (n & 3u) == 0u {{\
                \n                let v = matrix_b[(tr * n + cc4) >> 2u];\
-               \n                {s}[flat] = {co}v.x{cc};\
-               \n                {s}[flat + 1u] = {co}v.y{cc};\
-               \n                {s}[flat + 2u] = {co}v.z{cc};\
-               \n                {s}[flat + 3u] = {co}v.w{cc};\
+               \n                {st_x}\
+               \n                {st_y}\
+               \n                {st_z}\
+               \n                {st_w}\
                \n            }} else if tr < k {{\
                \n                let m0 = (cc4 + 0u) < n;\
                \n                let m1 = (cc4 + 1u) < n;\
@@ -1586,24 +1691,19 @@ fn gen_matmul_coop_wgsl_full(
                \n                let v1 = matrix_b[a1 >> 2u][a1 & 3u];\
                \n                let v2 = matrix_b[a2 >> 2u][a2 & 3u];\
                \n                let v3 = matrix_b[a3 >> 2u][a3 & 3u];\
-               \n                {s}[flat] = select({z}, {co}v0{cc}, m0);\
-               \n                {s}[flat + 1u] = select({z}, {co}v1{cc}, m1);\
-               \n                {s}[flat + 2u] = select({z}, {co}v2{cc}, m2);\
-               \n                {s}[flat + 3u] = select({z}, {co}v3{cc}, m3);\
+               \n                {st_m0}\
+               \n                {st_m1}\
+               \n                {st_m2}\
+               \n                {st_m3}\
                \n            }} else {{\
-               \n                let z = {z};\
-               \n                {s}[flat] = z;\
-               \n                {s}[flat + 1u] = z;\
-               \n                {s}[flat + 2u] = z;\
-               \n                {s}[flat + 3u] = z;\
+               \n                {st_z0}\
+               \n                {st_z1}\
+               \n                {st_z2}\
+               \n                {st_z3}\
                \n            }}\
                \n        }}",
                 col = col_offset,
                 t = tile,
-                s = shared,
-                co = cast_open,
-                cc = cast_close,
-                z = elem_zero,
             )
         };
         b_stage_0 = gen_vec4_b("shared_a0", "tile_col");
@@ -1626,16 +1726,32 @@ fn gen_matmul_coop_wgsl_full(
         // per-lane scalar load through `array<vec4<f32>>` indexed by
         // `(addr >> 2u)[addr & 3u]` with K-bounds masking.
         let gen_vec4_bt = |shared: &str, col_offset: &str| -> String {
+            let ix0 = format!("v4_col * {tile}u + v4_row");
+            let ix1 = format!("(v4_col + 1u) * {tile}u + v4_row");
+            let ix2 = format!("(v4_col + 2u) * {tile}u + v4_row");
+            let ix3 = format!("(v4_col + 3u) * {tile}u + v4_row");
+            let st_x = store(shared, &ix0, "v.x");
+            let st_y = store(shared, &ix1, "v.y");
+            let st_z = store(shared, &ix2, "v.z");
+            let st_w = store(shared, &ix3, "v.w");
+            let st_m0 = store(shared, &ix0, "select(0.0, v0, m0)");
+            let st_m1 = store(shared, &ix1, "select(0.0, v1, m1)");
+            let st_m2 = store(shared, &ix2, "select(0.0, v2, m2)");
+            let st_m3 = store(shared, &ix3, "select(0.0, v3, m3)");
+            let st_z0 = store(shared, &ix0, "0.0");
+            let st_z1 = store(shared, &ix1, "0.0");
+            let st_z2 = store(shared, &ix2, "0.0");
+            let st_z3 = store(shared, &ix3, "0.0");
             format!(
                 "{{\
                \n            let cc = {col} + v4_row;\
                \n            let tr4 = t + v4_col;\
                \n            if cc < n && (tr4 + 4u) <= k && (k & 3u) == 0u {{\
                \n                let v = matrix_b[(cc * k + tr4) >> 2u];\
-               \n                {s}[v4_col * {t}u + v4_row] = {co}v.x{cc2};\
-               \n                {s}[(v4_col + 1u) * {t}u + v4_row] = {co}v.y{cc2};\
-               \n                {s}[(v4_col + 2u) * {t}u + v4_row] = {co}v.z{cc2};\
-               \n                {s}[(v4_col + 3u) * {t}u + v4_row] = {co}v.w{cc2};\
+               \n                {st_x}\
+               \n                {st_y}\
+               \n                {st_z}\
+               \n                {st_w}\
                \n            }} else if cc < n {{\
                \n                let m0 = (tr4 + 0u) < k;\
                \n                let m1 = (tr4 + 1u) < k;\
@@ -1649,24 +1765,18 @@ fn gen_matmul_coop_wgsl_full(
                \n                let v1 = matrix_b[a1 >> 2u][a1 & 3u];\
                \n                let v2 = matrix_b[a2 >> 2u][a2 & 3u];\
                \n                let v3 = matrix_b[a3 >> 2u][a3 & 3u];\
-               \n                {s}[v4_col * {t}u + v4_row] = select({z}, {co}v0{cc2}, m0);\
-               \n                {s}[(v4_col + 1u) * {t}u + v4_row] = select({z}, {co}v1{cc2}, m1);\
-               \n                {s}[(v4_col + 2u) * {t}u + v4_row] = select({z}, {co}v2{cc2}, m2);\
-               \n                {s}[(v4_col + 3u) * {t}u + v4_row] = select({z}, {co}v3{cc2}, m3);\
+               \n                {st_m0}\
+               \n                {st_m1}\
+               \n                {st_m2}\
+               \n                {st_m3}\
                \n            }} else {{\
-               \n                let z = {z};\
-               \n                {s}[v4_col * {t}u + v4_row] = z;\
-               \n                {s}[(v4_col + 1u) * {t}u + v4_row] = z;\
-               \n                {s}[(v4_col + 2u) * {t}u + v4_row] = z;\
-               \n                {s}[(v4_col + 3u) * {t}u + v4_row] = z;\
+               \n                {st_z0}\
+               \n                {st_z1}\
+               \n                {st_z2}\
+               \n                {st_z3}\
                \n            }}\
                \n        }}",
                 col = col_offset,
-                t = tile,
-                s = shared,
-                co = cast_open,
-                cc2 = cast_close,
-                z = elem_zero,
             )
         };
         b_stage_0 = gen_vec4_bt("shared_a0", "tile_col");
@@ -1678,28 +1788,24 @@ fn gen_matmul_coop_wgsl_full(
             MatMulCoopVariant::BT => ("cc * k + tr", "cc1 * k + tr"),
         };
         let gen_scalar_b = |shared: &str, in_col: &str, b_index: &str| -> String {
+            let st = store(shared, "flat", &format!("matrix_b[{b_index}]"));
+            let stz = store(shared, "flat", "0.0");
             format!(
                 "{{\
-               \n            let zero_val = {z};\
                \n            for (var e = 0u; e < {iters}u; e++) {{\
                \n                let flat = lid.x + e * 64u;\
                \n                let tr = t + base_row + e * {stride}u;\
                \n                let in_bounds = (tr < k) && {ic};\
                \n                if in_bounds {{\
-               \n                    {s}[flat] = {co}matrix_b[{bi}]{cc};\
+               \n                    {st}\
                \n                }} else {{\
-               \n                    {s}[flat] = zero_val;\
+               \n                    {stz}\
                \n                }}\
                \n            }}\
                \n        }}",
-                z = elem_zero,
                 iters = staging_iters,
                 stride = row_stride,
                 ic = in_col,
-                s = shared,
-                co = cast_open,
-                cc = cast_close,
-                bi = b_index,
             )
         };
         b_stage_0 = gen_scalar_b("shared_a0", "in_n", bi0);
@@ -1719,6 +1825,18 @@ fn gen_matmul_coop_wgsl_full(
         // Required for backward passes whose effective K is small (e.g.
         // d_loss/d_pred has shape [N, 1] in the BT of an MLP output head).
         let gen_vec4_a = |shared: &str, row_offset: &str| -> String {
+            let st_x = store(shared, "flat", "v.x");
+            let st_y = store(shared, "flat + 1u", "v.y");
+            let st_z = store(shared, "flat + 2u", "v.z");
+            let st_w = store(shared, "flat + 3u", "v.w");
+            let st_m0 = store(shared, "flat", "select(0.0, v0, m0)");
+            let st_m1 = store(shared, "flat + 1u", "select(0.0, v1, m1)");
+            let st_m2 = store(shared, "flat + 2u", "select(0.0, v2, m2)");
+            let st_m3 = store(shared, "flat + 3u", "select(0.0, v3, m3)");
+            let st_z0 = store(shared, "flat", "0.0");
+            let st_z1 = store(shared, "flat + 1u", "0.0");
+            let st_z2 = store(shared, "flat + 2u", "0.0");
+            let st_z3 = store(shared, "flat + 3u", "0.0");
             format!(
                 "{{\
                \n            let gr = {row} + v4_row;\
@@ -1726,10 +1844,10 @@ fn gen_matmul_coop_wgsl_full(
                \n            let flat = v4_row * {t}u + v4_col;\
                \n            if gr < m && (tc4 + 4u) <= k && (k & 3u) == 0u {{\
                \n                let v = matrix_a[(gr * k + tc4) >> 2u];\
-               \n                {s}[flat] = {co}v.x{cc};\
-               \n                {s}[flat + 1u] = {co}v.y{cc};\
-               \n                {s}[flat + 2u] = {co}v.z{cc};\
-               \n                {s}[flat + 3u] = {co}v.w{cc};\
+               \n                {st_x}\
+               \n                {st_y}\
+               \n                {st_z}\
+               \n                {st_w}\
                \n            }} else if gr < m {{\
                \n                let m0 = (tc4 + 0u) < k;\
                \n                let m1 = (tc4 + 1u) < k;\
@@ -1743,24 +1861,19 @@ fn gen_matmul_coop_wgsl_full(
                \n                let v1 = matrix_a[a1 >> 2u][a1 & 3u];\
                \n                let v2 = matrix_a[a2 >> 2u][a2 & 3u];\
                \n                let v3 = matrix_a[a3 >> 2u][a3 & 3u];\
-               \n                {s}[flat] = select({z}, {co}v0{cc}, m0);\
-               \n                {s}[flat + 1u] = select({z}, {co}v1{cc}, m1);\
-               \n                {s}[flat + 2u] = select({z}, {co}v2{cc}, m2);\
-               \n                {s}[flat + 3u] = select({z}, {co}v3{cc}, m3);\
+               \n                {st_m0}\
+               \n                {st_m1}\
+               \n                {st_m2}\
+               \n                {st_m3}\
                \n            }} else {{\
-               \n                let z = {z};\
-               \n                {s}[flat] = z;\
-               \n                {s}[flat + 1u] = z;\
-               \n                {s}[flat + 2u] = z;\
-               \n                {s}[flat + 3u] = z;\
+               \n                {st_z0}\
+               \n                {st_z1}\
+               \n                {st_z2}\
+               \n                {st_z3}\
                \n            }}\
                \n        }}",
                 row = row_offset,
                 t = tile,
-                s = shared,
-                co = cast_open,
-                cc = cast_close,
-                z = elem_zero,
             )
         };
         a_stage_0 = gen_vec4_a("shared_b0", "tile_row");
@@ -1772,16 +1885,32 @@ fn gen_matmul_coop_wgsl_full(
         // lanes of the storage vec4. Partial rows and unaligned row strides
         // use scalar lane extraction, mirroring the Normal/BT staging paths.
         let gen_vec4_at = |shared: &str, row_offset: &str| -> String {
+            let ix0 = format!("v4_col * {tile}u + v4_row");
+            let ix1 = format!("(v4_col + 1u) * {tile}u + v4_row");
+            let ix2 = format!("(v4_col + 2u) * {tile}u + v4_row");
+            let ix3 = format!("(v4_col + 3u) * {tile}u + v4_row");
+            let st_x = store(shared, &ix0, "v.x");
+            let st_y = store(shared, &ix1, "v.y");
+            let st_z = store(shared, &ix2, "v.z");
+            let st_w = store(shared, &ix3, "v.w");
+            let st_m0 = store(shared, &ix0, "select(0.0, v0, m0)");
+            let st_m1 = store(shared, &ix1, "select(0.0, v1, m1)");
+            let st_m2 = store(shared, &ix2, "select(0.0, v2, m2)");
+            let st_m3 = store(shared, &ix3, "select(0.0, v3, m3)");
+            let st_z0 = store(shared, &ix0, "0.0");
+            let st_z1 = store(shared, &ix1, "0.0");
+            let st_z2 = store(shared, &ix2, "0.0");
+            let st_z3 = store(shared, &ix3, "0.0");
             format!(
                 "{{\
                \n            let tc = t + v4_row;\
                \n            let gr4 = {row} + v4_col;\
                \n            if tc < k && (gr4 + 4u) <= m && (m & 3u) == 0u {{\
                \n                let v = matrix_a[(tc * m + gr4) >> 2u];\
-               \n                {s}[v4_col * {t}u + v4_row] = {co}v.x{cc};\
-               \n                {s}[(v4_col + 1u) * {t}u + v4_row] = {co}v.y{cc};\
-               \n                {s}[(v4_col + 2u) * {t}u + v4_row] = {co}v.z{cc};\
-               \n                {s}[(v4_col + 3u) * {t}u + v4_row] = {co}v.w{cc};\
+               \n                {st_x}\
+               \n                {st_y}\
+               \n                {st_z}\
+               \n                {st_w}\
                \n            }} else if tc < k {{\
                \n                let m0 = (gr4 + 0u) < m;\
                \n                let m1 = (gr4 + 1u) < m;\
@@ -1796,24 +1925,18 @@ fn gen_matmul_coop_wgsl_full(
                \n                let v1 = matrix_a[a1 >> 2u][a1 & 3u];\
                \n                let v2 = matrix_a[a2 >> 2u][a2 & 3u];\
                \n                let v3 = matrix_a[a3 >> 2u][a3 & 3u];\
-               \n                {s}[v4_col * {t}u + v4_row] = select({z}, {co}v0{cc}, m0);\
-               \n                {s}[(v4_col + 1u) * {t}u + v4_row] = select({z}, {co}v1{cc}, m1);\
-               \n                {s}[(v4_col + 2u) * {t}u + v4_row] = select({z}, {co}v2{cc}, m2);\
-               \n                {s}[(v4_col + 3u) * {t}u + v4_row] = select({z}, {co}v3{cc}, m3);\
+               \n                {st_m0}\
+               \n                {st_m1}\
+               \n                {st_m2}\
+               \n                {st_m3}\
                \n            }} else {{\
-               \n                let z = {z};\
-               \n                {s}[v4_col * {t}u + v4_row] = z;\
-               \n                {s}[(v4_col + 1u) * {t}u + v4_row] = z;\
-               \n                {s}[(v4_col + 2u) * {t}u + v4_row] = z;\
-               \n                {s}[(v4_col + 3u) * {t}u + v4_row] = z;\
+               \n                {st_z0}\
+               \n                {st_z1}\
+               \n                {st_z2}\
+               \n                {st_z3}\
                \n            }}\
                \n        }}",
                 row = row_offset,
-                t = tile,
-                s = shared,
-                co = cast_open,
-                cc = cast_close,
-                z = elem_zero,
             )
         };
         a_stage_0 = gen_vec4_at("shared_b0", "tile_row");
@@ -1825,6 +1948,8 @@ fn gen_matmul_coop_wgsl_full(
             MatMulCoopVariant::AT => "tc * m + gr",
         };
         let gen_scalar_a = |shared: &str, row_offset: &str| -> String {
+            let st = store(shared, "flat", &format!("a_val{a_transform}"));
+            let stz = store(shared, "flat", "0.0");
             format!(
                 "{{\
                \n            let tc = t + src_col;\
@@ -1835,9 +1960,9 @@ fn gen_matmul_coop_wgsl_full(
                \n                let in_bounds = (gr < m) && in_k;\
                \n                if in_bounds {{\
                \n                    let a_val = matrix_a[{ai}];\
-               \n                    {s}[flat] = {co}a_val{xf}{cc};\
+               \n                    {st}\
                \n                }} else {{\
-               \n                    {s}[flat] = {z};\
+               \n                    {stz}\
                \n                }}\
                \n            }}\
                \n        }}",
@@ -1845,11 +1970,6 @@ fn gen_matmul_coop_wgsl_full(
                 stride = row_stride,
                 row = row_offset,
                 ai = a_idx,
-                s = shared,
-                co = cast_open,
-                cc = cast_close,
-                z = elem_zero,
-                xf = a_transform,
             )
         };
         a_stage_0 = gen_scalar_a("shared_b0", "tile_row");
@@ -1932,6 +2052,33 @@ fn gen_matmul_coop_wgsl_full(
         )
     };
 
+    let (shared_lo_decl, compensated_mma) = if compensated {
+        (
+            format!(
+                "var<workgroup> shared_a0_lo: array<f16, {shared_size}>;\n\
+                 var<workgroup> shared_a1_lo: array<f16, {shared_size}>;\n\
+                 var<workgroup> shared_b0_lo: array<f16, {shared_size}>;\n\
+                 var<workgroup> shared_b1_lo: array<f16, {shared_size}>;"
+            ),
+            format!(
+                "let a0_lo = coopLoadT<{coop_ab}>(&shared_b0_lo[0], {tile}u);\n\
+                 \x20   let a1_lo = coopLoadT<{coop_ab}>(&shared_b1_lo[0], {tile}u);\n\
+                 \x20   let b0_lo = coopLoadT<{coop_ba}>(&shared_a0_lo[0], {tile}u);\n\
+                 \x20   let b1_lo = coopLoadT<{coop_ba}>(&shared_a1_lo[0], {tile}u);\n\
+                 \x20   acc00 = coopMultiplyAdd(a0, b0_lo, acc00);\n\
+                 \x20   acc00 = coopMultiplyAdd(a0_lo, b0, acc00);\n\
+                 \x20   acc01 = coopMultiplyAdd(a0, b1_lo, acc01);\n\
+                 \x20   acc01 = coopMultiplyAdd(a0_lo, b1, acc01);\n\
+                 \x20   acc10 = coopMultiplyAdd(a1, b0_lo, acc10);\n\
+                 \x20   acc10 = coopMultiplyAdd(a1_lo, b0, acc10);\n\
+                 \x20   acc11 = coopMultiplyAdd(a1, b1_lo, acc11);\n\
+                 \x20   acc11 = coopMultiplyAdd(a1_lo, b1, acc11);"
+            ),
+        )
+    } else {
+        (String::new(), String::new())
+    };
+
     let src = include_str!("shaders/matmul_coop.wgsl");
     let src = preprocess(
         src,
@@ -1958,6 +2105,8 @@ fn gen_matmul_coop_wgsl_full(
             ("$ACC_INIT", &acc_init),
             ("$RESULT_SHARED_DECL", &result_shared_decl),
             ("$RESULT_STORE", &result_store),
+            ("$SHARED_LO_DECL", &shared_lo_decl),
+            ("$COMPENSATED_MMA", &compensated_mma),
         ],
     );
     parse_wgsl(&src)
@@ -5019,6 +5168,7 @@ mod tests {
         let config = CoopConfig {
             tile_size: 16,
             use_f16_input: true,
+            compensated: false,
         };
         for &(group, caps) in &groups {
             if coop_shape(group).is_none() {
@@ -5144,6 +5294,81 @@ mod tests {
     }
 
     #[test]
+    fn horizontal_matmul_modules_validate() {
+        use naga::valid::{Capabilities, ValidationFlags, Validator};
+        let flags = ValidationFlags::all() ^ ValidationFlags::BINDINGS;
+        let coop = CoopConfig {
+            tile_size: 16,
+            use_f16_input: true,
+            compensated: false,
+        };
+        let compensated = CoopConfig {
+            tile_size: 16,
+            use_f16_input: true,
+            compensated: true,
+        };
+        for count in [2u32, 3] {
+            for group in [
+                ShaderGroup::MatMul,
+                ShaderGroup::MatMulAT,
+                ShaderGroup::MatMulBT,
+            ] {
+                let module = generate_horizontal_matmul(group, count, None);
+                assert!(module.source.contains("matrix_b0"));
+                assert!(module.source.contains("horiz_0"));
+                Validator::new(flags, Capabilities::empty())
+                    .validate(&module.module)
+                    .unwrap_or_else(|e| panic!("horizontal {group:?} {count} failed: {e:#?}"));
+            }
+            for (label, cfg, caps) in [
+                (
+                    "coop",
+                    coop,
+                    Capabilities::COOPERATIVE_MATRIX | Capabilities::SHADER_FLOAT16,
+                ),
+                (
+                    "compensated",
+                    compensated,
+                    Capabilities::COOPERATIVE_MATRIX | Capabilities::SHADER_FLOAT16,
+                ),
+            ] {
+                let module = generate_horizontal_matmul(ShaderGroup::MatMul, count, Some(&cfg));
+                assert!(module.source.contains("matrix_b0"));
+                Validator::new(flags, caps)
+                    .validate(&module.module)
+                    .unwrap_or_else(|e| panic!("horizontal {label} {count} failed: {e:#?}"));
+            }
+        }
+    }
+
+    #[test]
+    fn compensated_f16_coop_validates() {
+        use naga::valid::{Capabilities, ValidationFlags, Validator};
+        let config = CoopConfig {
+            tile_size: 16,
+            use_f16_input: true,
+            compensated: true,
+        };
+        for group in [
+            ShaderGroup::MatMul,
+            ShaderGroup::MatMulAT,
+            ShaderGroup::MatMulBT,
+        ] {
+            let module = generate_module_coop(group, &config);
+            assert!(
+                module.source.contains("shared_a0_lo"),
+                "{group:?} missing residual shared"
+            );
+            Validator::new(
+                ValidationFlags::all() ^ ValidationFlags::BINDINGS,
+                Capabilities::COOPERATIVE_MATRIX | Capabilities::SHADER_FLOAT16,
+            )
+            .validate(&module.module)
+            .unwrap_or_else(|error| panic!("{group:?} compensated coop failed: {error:#?}"));
+        }
+    }
+
+    #[test]
     fn cooperative_matmul_epilogue_stages_and_validates() {
         use crate::compile::MatMulEpilogue;
         use crate::schedule::{PointwiseDAG, Pw};
@@ -5160,6 +5385,7 @@ mod tests {
         let config = CoopConfig {
             tile_size: 16,
             use_f16_input: true,
+            compensated: false,
         };
         let capabilities = Capabilities::COOPERATIVE_MATRIX | Capabilities::SHADER_FLOAT16;
         let flags = ValidationFlags::all() ^ ValidationFlags::BINDINGS;
@@ -5595,10 +5821,12 @@ mod tests {
             CoopConfig {
                 tile_size: 8,
                 use_f16_input: false,
+                compensated: false,
             },
             CoopConfig {
                 tile_size: 16,
                 use_f16_input: true,
+                compensated: false,
             },
         ];
 
