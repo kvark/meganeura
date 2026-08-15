@@ -7,13 +7,13 @@ struct Params {
 
 var<storage> pred: array<f32>;
 var<storage> labels: array<f32>;
-var<storage, read_write> grad_out: array<f32>;
 var<storage, read_write> loss_out: array<f32>;
 var<uniform> params: Params;
 var<workgroup> wg_buf: array<f32, 256>;
 
 // Binary cross-entropy: -mean(t*log(p) + (1-t)*log(1-p))
-// Gradient wrt pred:  (p - t) / (p * (1-p) * N)
+// Forward-only: the logits gradient is rebuilt by autodiff. Writing a
+// per-element grad into the per-workgroup loss buffer overran it.
 // Dispatch: [ceil(len/256), 1, 1], workgroup_size(256)
 @compute @workgroup_size(256)
 fn main(
@@ -25,13 +25,11 @@ fn main(
     let n = f32(params.len);
     let i = gid.x;
 
-    // Each thread computes gradient and partial loss for one element
     var local_loss = 0.0;
     if i < params.len {
         let p = clamp(pred[i], eps, 1.0 - eps);
         let t = labels[i];
         local_loss = -(t * log(p) + (1.0 - t) * log(1.0 - p));
-        grad_out[i] = (p - t) / (p * (1.0 - p) * n);
     }
 
     // Tree reduction for loss

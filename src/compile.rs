@@ -60,7 +60,7 @@ impl Default for TuningKnobs {
     /// overrides are applied only by [`TuningKnobs::from_env`] (in
     /// `crate::config`) — the library itself never reads the environment.
     fn default() -> Self {
-        let apple = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+        let apple = cfg!(all(target_vendor = "apple", target_arch = "aarch64"));
         let fwd = if apple { 16 } else { 32 };
         Self {
             flash_ept_cap: fwd,
@@ -1097,7 +1097,7 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
             let source_len = scatter.params[1].saturating_mul(scatter.params[2]);
             if mul.params != [source_len, 0, 0, 0]
                 || broadcast.params != [source_len, scatter.params[2], 1, 0]
-                || scatter.workgroups != [source_len.div_ceil(256), 1, 1]
+                || scatter.workgroups != [scatter.params[2].div_ceil(256), 1, 1]
             {
                 continue;
             }
@@ -1132,9 +1132,9 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
         scatter.input_buffers = vec![indices, factors, row_scale, output];
         let small_row = scatter.params[2] <= 16;
         scatter.params[3] = if small_row { 2 } else { 1 };
-        if small_row {
-            scatter.workgroups = [scatter.params[1].div_ceil(256), 1, 1];
-        }
+        // Column-parallel non-atomic kernel: one thread per embedding
+        // column, regardless of the historical row-mapping pad flag.
+        scatter.workgroups = [scatter.params[2].div_ceil(256), 1, 1];
         scatter.pointwise = None;
         scatter.label = format!("ScatterAddAtomicRowMul[{total}]");
         // The zero entry point does not read `src`, but its shared binding
@@ -2221,6 +2221,21 @@ impl<'a> Compiler<'a> {
         BufferRef(idx)
     }
 
+    /// Buffer already allocated for a `CrossEntropyLogitsGrad` on the same
+    /// `(logits, labels)` pair. Present only on training graphs.
+    fn ce_logits_grad_buffer(&self, logits: NodeId, labels: NodeId) -> Option<BufferRef> {
+        self.graph.nodes().iter().find_map(|node| {
+            if matches!(node.op, Op::CrossEntropyLogitsGrad)
+                && node.inputs.first().copied() == Some(logits)
+                && node.inputs.get(1).copied() == Some(labels)
+            {
+                Some(self.get_buffer(node.id))
+            } else {
+                None
+            }
+        })
+    }
+
     /// Choose between FlashAttention (BQ>1) and MultiHeadAttn (BQ=1) for
     /// a forward attention dispatch. Returns (shader_entry, workgroups_x).
     fn attention_dispatch(
@@ -2571,7 +2586,8 @@ impl<'a> Compiler<'a> {
             | Op::Constant { .. }
             | Op::Nop
             | Op::Identity
-            | Op::StopGradient => {}
+            | Op::StopGradient
+            | Op::CrossEntropyLogitsGrad => {}
 
             Op::Materialize => {
                 let input = self.get_buffer(node.inputs[0]);
@@ -3359,9 +3375,14 @@ impl<'a> Compiler<'a> {
                 let shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let batch = shape[0] as u32;
                 let features = shape[1] as u32;
-                // The cross_entropy shader writes both grad_out (batch*features f32s)
-                // and loss_out (per-batch losses, summed by read_loss on CPU).
-                let grad_buf = self.alloc_buffer(shape.iter().product::<usize>() * 4);
+                // Training autodiff emits CrossEntropyLogitsGrad on the same
+                // (logits, labels). Reuse that pre-allocated buffer so the
+                // forward kernel's fused grad is the backward value — no
+                // second softmax / ones-row matmul. Inference leaves
+                // write_grad=0 and binds the loss buffer as a dummy.
+                let grad_buf = self.ce_logits_grad_buffer(node.inputs[0], node.inputs[1]);
+                let write_grad = u32::from(grad_buf.is_some());
+                let grad_buf = grad_buf.unwrap_or(out_buf);
                 // One workgroup per batch item (256 threads each).
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::CrossEntropyLoss,
@@ -3369,7 +3390,7 @@ impl<'a> Compiler<'a> {
                     input_buffers: vec![logits, labels],
                     output_buffer: grad_buf,
                     extra_outputs: vec![out_buf],
-                    params: vec![batch, features, 0, 0],
+                    params: vec![batch, features, write_grad, 0],
                     use_coop: false,
                     use_small_tiles: false,
                     ..Default::default()
@@ -3554,7 +3575,7 @@ impl<'a> Compiler<'a> {
                     });
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::ScatterAddAtomic,
-                        workgroups: [(seq_len * embed_dim).div_ceil(256), 1, 1],
+                        workgroups: [embed_dim.div_ceil(256), 1, 1],
                         // The output is also an input so scheduling inserts a
                         // global barrier after the zeroing dispatch.
                         input_buffers: vec![indices, src, out_buf],
@@ -5730,7 +5751,7 @@ mod tests {
             .find(|dispatch| dispatch.is_row_scaled_atomic_scatter())
             .expect("gathered row reduction should fuse its table gradient");
         assert_eq!(fused.params[3], 1);
-        assert_eq!(fused.workgroups, [(SEQ * INNER).div_ceil(256) as u32, 1, 1]);
+        assert_eq!(fused.workgroups, [INNER.div_ceil(256) as u32, 1, 1]);
     }
 
     #[test]
@@ -5786,6 +5807,33 @@ mod tests {
         assert_eq!(plan.dispatches[0].workgroups, [4, 1, 1]);
         assert_eq!(plan.dispatches[0].params[0], 4);
         assert_eq!(plan.dispatches[0].params[1], 10);
+        assert_eq!(plan.dispatches[0].params[2], 0);
+    }
+
+    #[test]
+    fn training_cross_entropy_reuses_fused_logits_grad() {
+        let mut g = Graph::new();
+        let logits = g.parameter("logits", &[4, 10]);
+        let labels = g.input("labels", &[4, 10]);
+        let loss = g.cross_entropy_loss(logits, labels);
+        g.set_outputs(vec![loss]);
+
+        let (plan, _) = crate::train::compile_training_graph(&g);
+        let ce = plan
+            .dispatches
+            .iter()
+            .find(|d| d.shader == ShaderEntry::CrossEntropyLoss)
+            .expect("CE forward");
+        assert_eq!(ce.params[2], 1, "training CE must write the fused grad");
+        let softmax_dispatches = plan
+            .dispatches
+            .iter()
+            .filter(|d| d.shader == ShaderEntry::Softmax || d.reduction.is_some())
+            .count();
+        assert_eq!(
+            softmax_dispatches, 0,
+            "fused CE grad should not rebuild softmax"
+        );
     }
 
     #[test]

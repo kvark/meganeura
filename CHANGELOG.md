@@ -1,5 +1,22 @@
 # Unreleased
 
+- Cross-entropy training reuses the forward kernel's fused logits gradient
+  instead of rebuilding softmax and a ones-row broadcast matmul. Inference
+  skips the unused gradient write.
+- Binary cross-entropy no longer writes a per-element gradient into the
+  per-workgroup loss buffer (that overran the allocation for `n > 1`).
+- Large scatter-add no longer uses device-scope storage atomics
+  (VUID 06265 on cooperative-matrix Vulkan). A column-parallel sequential
+  accumulation is portable to Metal and strict Vulkan.
+- `egglog` and `naga` disable crate default features. Default crate
+  features are now empty: `hub` (HuggingFace downloads) and `profiler`
+  (Perfetto CPU-span subscriber) are opt-in. `SafeTensorsModel::from_bytes`
+  loads in-memory assets.
+- Apple flash EPT defaults key off `target_vendor = "apple"` (covers iOS).
+  The 8×8 f32 cooperative veto keys off the advertised tile, not macOS.
+- Unused in-tree Mistral / Phi-3 / Gemma-4 builders removed. Compiler
+  internals (`compile`, `codegen`, `schedule`, …) are `#[doc(hidden)]`.
+
 - External GPU composition: `Session::output_buffer` exposes a pinned graph
   output as a Blade `BufferPiece`, so a renderer sharing the context can feed
   a prediction directly into its next compute pass without a host readback.

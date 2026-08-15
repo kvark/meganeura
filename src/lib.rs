@@ -21,22 +21,29 @@
 //! and compiled to static GPU dispatch sequences — no manual CUDA-graphing
 //! needed.
 
+#[doc(hidden)]
 pub mod autodiff;
+#[doc(hidden)]
 pub mod cache;
+#[doc(hidden)]
 pub mod codegen;
+#[doc(hidden)]
 pub mod compile;
 pub mod config;
 pub mod data;
 pub mod eager;
 pub mod graph;
 pub mod load;
+#[doc(hidden)]
 pub mod memplan;
 pub mod models;
 pub mod nn;
 pub mod optimize;
+#[doc(hidden)]
 pub mod outline;
 pub mod profiler;
 pub mod runtime;
+#[doc(hidden)]
 pub mod schedule;
 pub mod train;
 

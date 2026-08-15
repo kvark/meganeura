@@ -8,7 +8,7 @@
 /// mean=0.1307, std=0.3081.
 ///
 /// Usage:
-///   cargo run --example huggingface [model.safetensors]
+///   cargo run --example huggingface --features hub [model.safetensors]
 ///
 /// MNIST test data is expected in `data/` (gzipped or raw):
 ///   data/t10k-images-idx3-ubyte.gz

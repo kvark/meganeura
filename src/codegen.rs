@@ -5136,6 +5136,14 @@ mod tests {
     }
 
     #[test]
+    fn scatter_add_avoids_device_scope_storage_atomics() {
+        let module = generate_module(ShaderGroup::ScatterAddAtomic);
+        assert!(!module.source.contains("array<atomic"));
+        assert!(!module.source.contains("atomicLoad"));
+        assert!(!module.source.contains("atomicCompareExchangeWeak"));
+    }
+
+    #[test]
     fn cooperative_matmul_epilogue_stages_and_validates() {
         use crate::compile::MatMulEpilogue;
         use crate::schedule::{PointwiseDAG, Pw};
@@ -5342,7 +5350,7 @@ mod tests {
                 ShaderEntry::ScatterAddAtomic => {
                     vec!["indices", "src", "row_scale", "dst", "params"]
                 }
-                ShaderEntry::BceLoss => vec!["pred", "labels", "grad_out", "loss_out", "params"],
+                ShaderEntry::BceLoss => vec!["pred", "labels", "loss_out", "params"],
                 ShaderEntry::Softmax => vec!["src", "dst", "params"],
                 ShaderEntry::CrossEntropyLoss => {
                     vec!["logits", "labels", "grad_out", "loss_out", "params"]
