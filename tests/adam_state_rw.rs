@@ -122,3 +122,30 @@ fn batched_adam_state_read_preserves_names_and_values() {
     assert_eq!(states[0], (b_m.to_vec(), b_v.to_vec()));
     assert_eq!(states[1], (a_m.to_vec(), a_v.to_vec()));
 }
+
+#[test]
+fn adam_grouped_grad_norm_accumulates_exact_temporal_magnitudes() {
+    let mut graph = Graph::new();
+    let positions = graph.parameter("positions", &[2, 3]);
+    let loss = graph.mean_all(positions);
+    graph.set_outputs(vec![loss]);
+
+    let mut session = meganeura::build_session(&graph);
+    session.set_parameter("positions", &[1.0; 6]);
+    session.set_adam_grouped_grad_norm("positions", 3);
+    session.set_adam(0.01, 0.9, 0.999, 1.0e-8);
+
+    for _ in 0..2 {
+        session.step();
+        session.wait();
+    }
+
+    let accumulated = session.read_adam_grouped_grad_norm("positions");
+    let expected = 2.0 * (3.0_f32 / 36.0).sqrt();
+    for (index, actual) in accumulated.into_iter().enumerate() {
+        assert!(
+            (actual - expected).abs() < 1.0e-6,
+            "group {index}: got {actual}, expected {expected}",
+        );
+    }
+}
