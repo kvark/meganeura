@@ -17,12 +17,13 @@
 //! padding garbage can only land in the discarded output padding.
 //! Re-check this reasoning if a kernel ever gains unguarded reads.
 //!
-//! The same pinning analysis also decides memory placement: pinned
-//! buffers are host-accessed (uploads, readbacks, external binding)
-//! and must stay `Memory::Shared`; everything else is only ever
-//! touched by GPU dispatches and goes in `Memory::Device`, which on
-//! discrete boards avoids routing intermediate traffic through the
-//! host-visible (ReBAR) heap.
+//! Memory placement is a second bit, not the same as pinning. Pinned
+//! user-facing slots (params, inputs, constants, outputs, loss) stay
+//! `Memory::Shared`. Parameter-gradient buffers are pinned so the
+//! optimizer can find them after the plan, but they are only touched
+//! by GPU clip/Adam/SGD, so they go in `Memory::Device` with the
+//! step-local intermediates. On discrete boards that keeps grad and
+//! Adam traffic out of the ReBAR heap.
 
 use crate::compile::{BufferRef, ExecutionPlan, ShaderEntry};
 use std::ops::Range;
@@ -96,7 +97,8 @@ impl BufferUse {
 /// - parameters, inputs, constants, outputs, loss — user-visible and/or
 ///   persistent across steps, and externally bindable;
 /// - gradients — read by the runtime-encoded optimizer and grad-clip
-///   passes that run *after* the plan's dispatches;
+///   passes that run *after* the plan's dispatches (pinned, but
+///   device-local: those passes are GPU-only);
 /// - derived params and quantized weight buffers — uploaded once;
 /// - `CacheWrite` outputs (KV caches) — carry state across steps;
 /// - `ScatterAdd` outputs — read-modify-write;
@@ -113,11 +115,12 @@ pub fn plan_buffer_aliasing(
     let mut map = vec![usize::MAX; n];
     let mut sizes = Vec::new();
     let mut device_local = Vec::new();
+    let device_ok = device_local_eligible(plan);
     for i in 0..n {
         if pinned[i] {
             map[i] = sizes.len();
             sizes.push(plan.buffers[i]);
-            device_local.push(false);
+            device_local.push(device_ok[i]);
         }
     }
 
@@ -189,11 +192,32 @@ pub fn plan_no_alias(
     pin_spec: Option<&str>,
 ) -> AliasPlan {
     let (pinned, _) = compute_pinned(plan, groups, pin_spec);
+    let device_ok = device_local_eligible(plan);
     AliasPlan {
         map: (0..plan.buffers.len()).collect(),
         sizes: plan.buffers.clone(),
-        device_local: pinned.iter().map(|&p| !p).collect(),
+        device_local: pinned
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| !p || device_ok[i])
+            .collect(),
     }
+}
+
+/// Pinned buffers that are still eligible for `Memory::Device`.
+///
+/// Parameter gradients are pinned so clip/Adam can find them after the
+/// plan, but those passes are GPU-only. Host diagnostics go through the
+/// staging readback path.
+fn device_local_eligible(plan: &ExecutionPlan) -> Vec<bool> {
+    let mut ok = vec![false; plan.buffers.len()];
+    for &(_, grad) in &plan.param_grad_pairs {
+        let i = grad.0 as usize;
+        if i < ok.len() {
+            ok[i] = true;
+        }
+    }
+    ok
 }
 
 /// The pinning analysis shared by aliasing and memory-class decisions:
@@ -520,6 +544,14 @@ mod tests {
                 "buffer {pinned} must keep a dedicated allocation"
             );
         }
+        assert!(
+            alias.device_local[alias.map[4]],
+            "parameter gradients are device-local"
+        );
+        assert!(
+            !alias.device_local[alias.map[1]],
+            "parameters stay host-visible"
+        );
     }
 
     #[test]

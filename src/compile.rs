@@ -700,6 +700,96 @@ pub fn group_norm_chunks(batch: u32, channels: u32, spatial: u32, num_groups: u3
     chunks
 }
 
+/// Pack independent same-A matmuls that share a barrier group into one
+/// dispatch (`workgroups[2] = N`, `horizontal_batch = N`).
+pub fn fuse_horizontal_matmuls(
+    dispatches: &mut Vec<Dispatch>,
+    groups: &mut Vec<std::ops::Range<usize>>,
+) {
+    let old = std::mem::take(dispatches);
+    let mut new = Vec::with_capacity(old.len());
+    let mut new_groups = Vec::with_capacity(groups.len());
+    for group in groups.iter() {
+        let members: Vec<usize> = group.clone().collect();
+        let mut used = vec![false; members.len()];
+        let start = new.len();
+        for i in 0..members.len() {
+            if used[i] {
+                continue;
+            }
+            let mut batch = vec![members[i]];
+            for j in (i + 1)..members.len() {
+                if used[j] {
+                    continue;
+                }
+                if batch.len() < 3 && can_horizontal_fuse(&old[members[i]], &old[members[j]]) {
+                    batch.push(members[j]);
+                    used[j] = true;
+                }
+            }
+            used[i] = true;
+            if batch.len() >= 2 {
+                new.push(merge_horizontal(&old, &batch));
+            } else {
+                new.push(old[members[i]].clone());
+            }
+        }
+        new_groups.push(start..new.len());
+    }
+    *dispatches = new;
+    *groups = new_groups;
+}
+
+fn can_horizontal_fuse(a: &Dispatch, b: &Dispatch) -> bool {
+    matches!(
+        a.shader,
+        ShaderEntry::MatMul | ShaderEntry::MatMulAT | ShaderEntry::MatMulBT
+    ) && a.shader == b.shader
+        && a.workgroups == b.workgroups
+        && a.workgroups[2] == 1
+        && a.params == b.params
+        && a.use_coop == b.use_coop
+        && a.use_coop_compensated == b.use_coop_compensated
+        && a.use_small_tiles == b.use_small_tiles
+        && !a.weight_format.uses_reduced_storage()
+        && a.weight_format == b.weight_format
+        && a.matmul_prologue.is_none()
+        && b.matmul_prologue.is_none()
+        && a.matmul_epilogue.is_none()
+        && b.matmul_epilogue.is_none()
+        && a.epilogue.is_empty()
+        && b.epilogue.is_empty()
+        && a.pointwise.is_none()
+        && b.pointwise.is_none()
+        && a.reduction.is_none()
+        && b.reduction.is_none()
+        && a.gemv_rmsnorm.is_none()
+        && b.gemv_rmsnorm.is_none()
+        && a.input_buffers.len() == 2
+        && b.input_buffers.len() == 2
+        && a.input_buffers[0] == b.input_buffers[0]
+}
+
+fn merge_horizontal(dispatches: &[Dispatch], batch: &[usize]) -> Dispatch {
+    let mut merged = dispatches[batch[0]].clone();
+    let n = batch.len() as u32;
+    merged.horizontal_batch = n;
+    merged.workgroups[2] = n;
+    merged.input_buffers = vec![merged.input_buffers[0]];
+    merged.extra_outputs.clear();
+    for (k, &idx) in batch.iter().enumerate() {
+        let d = &dispatches[idx];
+        merged.input_buffers.push(d.input_buffers[1]);
+        if k == 0 {
+            merged.output_buffer = d.output_buffer;
+        } else {
+            merged.extra_outputs.push(d.output_buffer);
+        }
+    }
+    merged.label = format!("{}x{}", merged.label, n);
+    merged
+}
+
 fn group_norm_stats_kernel() -> crate::schedule::ReductionKernel {
     use crate::schedule::{PointwiseDAG, Pw, ReduceOp, ReductionKernel};
     ReductionKernel {
@@ -740,6 +830,16 @@ pub struct Dispatch {
     /// (set at runtime based on per-dispatch eligibility).
     #[serde(default)]
     pub use_coop: bool,
+    /// Cooperative f16 path with hi/lo residual staging (C1). Only set
+    /// together with `use_coop` on `requires_full_precision` dispatches.
+    #[serde(default)]
+    pub use_coop_compensated: bool,
+    /// Number of same-A sibling matmuls packed into this dispatch (D1).
+    /// 0/1 = not packed. Extra B operands follow A in `input_buffers`;
+    /// extra C outputs are `extra_outputs`. `workgroups[2]` is the pack
+    /// count when this is ≥ 2 (only applied when the original Z was 1).
+    #[serde(default)]
+    pub horizontal_batch: u32,
     /// When true, use the 32×32 small-tile matmul pipeline instead of 64×64.
     #[serde(default)]
     pub use_small_tiles: bool,
@@ -5848,6 +5948,108 @@ mod tests {
         assert_eq!(plan.dispatches[0].shader, ShaderEntry::Transpose);
         assert_eq!(plan.dispatches[0].params[0], 4); // m
         assert_eq!(plan.dispatches[0].params[1], 8); // n
+    }
+
+    #[test]
+    fn horizontal_fuse_packs_same_a_matmuls() {
+        let mut dispatches = vec![
+            Dispatch {
+                shader: ShaderEntry::MatMul,
+                workgroups: [2, 2, 1],
+                input_buffers: vec![BufferRef(0), BufferRef(1)],
+                output_buffer: BufferRef(2),
+                params: vec![32, 32, 32, 0],
+                ..Default::default()
+            },
+            Dispatch {
+                shader: ShaderEntry::MatMul,
+                workgroups: [2, 2, 1],
+                input_buffers: vec![BufferRef(0), BufferRef(3)],
+                output_buffer: BufferRef(4),
+                params: vec![32, 32, 32, 0],
+                ..Default::default()
+            },
+            Dispatch {
+                shader: ShaderEntry::MatMul,
+                workgroups: [2, 2, 1],
+                input_buffers: vec![BufferRef(0), BufferRef(5)],
+                output_buffer: BufferRef(6),
+                params: vec![32, 32, 32, 0],
+                ..Default::default()
+            },
+        ];
+        let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
+        groups.push(0..3);
+        fuse_horizontal_matmuls(&mut dispatches, &mut groups);
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(dispatches[0].horizontal_batch, 3);
+        assert_eq!(dispatches[0].workgroups[2], 3);
+        assert_eq!(dispatches[0].input_buffers.len(), 4);
+        assert_eq!(dispatches[0].extra_outputs.len(), 2);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0], 0..1);
+    }
+
+    fn mm_dispatch(a: u32, b: u32, c: u32, wgz: u32, n: u32) -> Dispatch {
+        Dispatch {
+            shader: ShaderEntry::MatMul,
+            workgroups: [2, 2, wgz],
+            input_buffers: vec![BufferRef(a), BufferRef(b)],
+            output_buffer: BufferRef(c),
+            params: vec![32, 32, n, 0],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn horizontal_fuse_skips_mismatched_siblings() {
+        let cases: &[(&str, Vec<Dispatch>)] = &[
+            (
+                "different A",
+                vec![mm_dispatch(0, 1, 2, 1, 32), mm_dispatch(7, 3, 4, 1, 32)],
+            ),
+            (
+                "different N",
+                vec![mm_dispatch(0, 1, 2, 1, 32), mm_dispatch(0, 3, 4, 1, 64)],
+            ),
+            (
+                "tall-split uses Z",
+                vec![mm_dispatch(0, 1, 2, 2, 32), mm_dispatch(0, 3, 4, 2, 32)],
+            ),
+            (
+                "fused add has three inputs",
+                vec![
+                    Dispatch {
+                        shader: ShaderEntry::FusedMatMulAdd,
+                        workgroups: [2, 2, 1],
+                        input_buffers: vec![BufferRef(0), BufferRef(1), BufferRef(7)],
+                        output_buffer: BufferRef(2),
+                        params: vec![32, 32, 32, 0],
+                        ..Default::default()
+                    },
+                    Dispatch {
+                        shader: ShaderEntry::FusedMatMulAdd,
+                        workgroups: [2, 2, 1],
+                        input_buffers: vec![BufferRef(0), BufferRef(3), BufferRef(8)],
+                        output_buffer: BufferRef(4),
+                        params: vec![32, 32, 32, 0],
+                        ..Default::default()
+                    },
+                ],
+            ),
+        ];
+        for &(label, ref dispatches) in cases {
+            let mut dispatches = dispatches.clone();
+            let n = dispatches.len();
+            let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
+            groups.push(0..n);
+            fuse_horizontal_matmuls(&mut dispatches, &mut groups);
+            assert_eq!(dispatches.len(), n, "{label} should not pack");
+            assert!(
+                dispatches.iter().all(|d| d.horizontal_batch < 2),
+                "{label} should leave horizontal_batch unset"
+            );
+        }
     }
 
     #[test]

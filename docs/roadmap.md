@@ -213,6 +213,10 @@ summary deltas on the bench models.
 
 ### B2. Device-local memory for intermediates  ← *landed, default-on*
 
+Parameter gradients, Adam moment buffers, the clip accumulator, and
+temporal grad-accumulators also use `Memory::Device` by default
+(host diagnostics go through the existing staging readback/upload).
+
 *Landed:* allocations whose tenants are all step-local intermediates
 (the non-pinned set from B1's analysis) use `Memory::Device`, zeroed by
 one GPU transfer pass at session build. This is default-on;
@@ -260,7 +264,16 @@ with barrier-group concurrency. Start after A1 + A3 + B1 land.
 
 ## Track C — Precision: tensor cores for training
 
-### C1. Error-compensated f16 coop matmul **(highest expected win)**
+### C1. Error-compensated f16 coop matmul  ← *landed (first cut)*
+
+*Landed:* f16-only devices enable coop under `Auto`. Derivative
+dispatches (`requires_full_precision`) use hi/lo residual staging and
+three f32 MMAs per tile; inference uses plain f16. `AllowF16` keeps
+the uncompensated path. Naga-validated for Normal/AT/BT.
+
+### C1 (historical)
+
+The original write-up:
 
 **Problem.** The biggest measured-and-blocked win in the repo:
 lowering the coop threshold took SmolLM2 train 44 ms → 29 ms but
@@ -319,7 +332,13 @@ Per the retrospective: below ~50 µs/dispatch, submission and
 synchronization dominate. Encoding is *not* the cost (ground rules) —
 the dispatch *count* and the barriers between groups are.
 
-### D1. Horizontal fusion (dispatch batching)
+### D1. Horizontal fusion (dispatch batching)  ← *landed (matmul)*
+
+*Landed:* same-A `MatMul` / `MatMulAT` / `MatMulBT` siblings in one
+barrier group (up to 3, typically Q/K/V) become one dispatch.
+Pointwise/conv packing is still open.
+
+### D1 (historical)
 
 Independent same-shape dispatches inside one barrier group (Q/K/V
 projections; per-head pointwise) still bind and launch separately.

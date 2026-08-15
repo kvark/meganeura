@@ -805,9 +805,32 @@ enum Variant {
     /// axis these are pure performance: the scalar pipeline computes the
     /// same thing, so falling back to it is safe.
     Coop(ShaderEntry),
+    /// Cooperative f16 with hi/lo residual staging (C1).
+    CoopCompensated(ShaderEntry),
+    /// Same-A matmul pack (D1). The kind is part of the key so a
+    /// forward Q/K/V pack (plain f16 coop) cannot share a pipeline with
+    /// a backward pack of the same arity (compensated).
+    Horizontal(ShaderEntry, u32, HorizMatMulKind),
     SmallTile(ShaderEntry),
     /// The unmodified pipeline. Always compiled.
     Scalar(ShaderEntry),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum HorizMatMulKind {
+    Scalar,
+    Coop,
+    CoopCompensated,
+}
+
+fn horiz_kind(dispatch: &Dispatch) -> HorizMatMulKind {
+    if dispatch.use_coop_compensated {
+        HorizMatMulKind::CoopCompensated
+    } else if dispatch.use_coop {
+        HorizMatMulKind::Coop
+    } else {
+        HorizMatMulKind::Scalar
+    }
 }
 
 impl Variant {
@@ -823,6 +846,8 @@ impl Variant {
             | Variant::GemvRmsNorm(ref e)
             | Variant::Weight(ref e, _)
             | Variant::Coop(ref e)
+            | Variant::CoopCompensated(ref e)
+            | Variant::Horizontal(ref e, _, _)
             | Variant::SmallTile(ref e)
             | Variant::Scalar(ref e) => Some(e),
         }
@@ -842,6 +867,8 @@ impl Variant {
             Variant::GemvRmsNorm(ref e) => format!("{e:?}:rmsnorm"),
             Variant::Weight(ref e, format) => format!("{e:?}:weight-{format:?}"),
             Variant::Coop(ref e) => format!("{e:?}:cooperative"),
+            Variant::CoopCompensated(ref e) => format!("{e:?}:cooperative-compensated"),
+            Variant::Horizontal(ref e, n, kind) => format!("{e:?}:horizontal-{n}-{kind:?}"),
             Variant::SmallTile(ref e) => format!("{e:?}:small-tile"),
             Variant::Scalar(ref e) => format!("{e:?}:scalar"),
         }
@@ -869,6 +896,7 @@ impl Pipelines {
         use crate::codegen::ShaderGroup;
         let mut needed: HashSet<ShaderGroup> = HashSet::new();
         let mut needed_coop: HashSet<ShaderGroup> = HashSet::new();
+        let mut needed_coop_compensated: HashSet<ShaderGroup> = HashSet::new();
         let mut needed_weighted: HashMap<crate::compile::WeightFormat, HashSet<ShaderGroup>> =
             HashMap::new();
         let mut needed_small: HashSet<ShaderGroup> = HashSet::new();
@@ -933,6 +961,9 @@ impl Pipelines {
                     ))
             {
                 needed_coop.insert(group);
+                if dispatch.use_coop_compensated {
+                    needed_coop_compensated.insert(group);
+                }
             }
             if dispatch.weight_format.uses_reduced_storage() {
                 needed_weighted
@@ -1105,6 +1136,21 @@ impl Pipelines {
                 // whose capabilities this one lacks. The scalar kernel
                 // computes the same thing.
                 (None, _) => compile_group(group, &Variant::Coop, &mut map),
+            }
+        }
+        if let Some(config) = coop_config {
+            for &group in &needed_coop_compensated {
+                if crate::codegen::coop_shape(group).is_none() {
+                    continue;
+                }
+                let mut compensated = *config;
+                compensated.compensated = true;
+                compile_variant(
+                    crate::codegen::generate_module_coop(group, &compensated),
+                    group,
+                    &Variant::CoopCompensated,
+                    &mut map,
+                );
             }
         }
         // Compile generated conv2d coop kernels individually.
@@ -1317,6 +1363,42 @@ impl Pipelines {
             map.insert(key, pipeline);
         }
 
+        for dispatch in &plan.dispatches {
+            let count = dispatch.horizontal_batch;
+            if count < 2 {
+                continue;
+            }
+            let kind = horiz_kind(dispatch);
+            let key = Variant::Horizontal(dispatch.shader.clone(), count, kind);
+            if map.contains_key(&key) {
+                continue;
+            }
+            let coop = match kind {
+                HorizMatMulKind::Scalar => None,
+                HorizMatMulKind::Coop | HorizMatMulKind::CoopCompensated => coop_config.map(|c| {
+                    let mut cfg = *c;
+                    cfg.compensated = matches!(kind, HorizMatMulKind::CoopCompensated);
+                    cfg
+                }),
+            };
+            let sm = crate::codegen::generate_horizontal_matmul(
+                dispatch.shader.shader_group(),
+                count,
+                coop.as_ref(),
+            );
+            let shader = gpu.create_shader(bg::ShaderDesc {
+                source: &sm.source,
+                naga_module: Some(sm.module),
+            });
+            let layout = horizontal_matmul_layout(count);
+            let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
+                name: "horizontal_matmul",
+                data_layouts: &[&layout],
+                compute: shader.at("main"),
+            });
+            map.insert(key, pipeline);
+        }
+
         Self { map }
     }
 
@@ -1329,6 +1411,13 @@ impl Pipelines {
     /// list stays a single entry and a miss is a panic.
     fn candidates(dispatch: &Dispatch) -> Vec<Variant> {
         let entry = &dispatch.shader;
+        if dispatch.horizontal_batch >= 2 {
+            return vec![Variant::Horizontal(
+                dispatch.shader.clone(),
+                dispatch.horizontal_batch,
+                horiz_kind(dispatch),
+            )];
+        }
         if let Some(epilogue) = epilogue_pipeline_key(dispatch) {
             return vec![if dispatch.use_coop {
                 Variant::CoopEpilogue(entry.clone(), epilogue)
@@ -1357,7 +1446,11 @@ impl Pipelines {
                 let kinds = prologue.factors.iter().map(|f| f.1.clone()).collect();
                 out.push(Variant::CoopPrologue(entry.clone(), kinds));
             }
-            out.push(Variant::Coop(entry.clone()));
+            if dispatch.use_coop_compensated {
+                out.push(Variant::CoopCompensated(entry.clone()));
+            } else {
+                out.push(Variant::Coop(entry.clone()));
+            }
         }
         if dispatch.use_small_tiles {
             out.push(Variant::SmallTile(entry.clone()));
@@ -1419,6 +1512,38 @@ fn epilogue_profile_key(
         "scalar-epilogue"
     };
     format!("{entry:?}:{variant}:{:016x}", hasher.finish())
+}
+
+fn horizontal_matmul_layout(count: u32) -> blade_graphics::ShaderDataLayout {
+    let mut bindings: Vec<(&'static str, blade_graphics::ShaderBinding)> =
+        vec![("matrix_a", blade_graphics::ShaderBinding::Buffer)];
+    for i in 0..count {
+        bindings.push((
+            match i {
+                0 => "matrix_b0",
+                1 => "matrix_b1",
+                _ => "matrix_b2",
+            },
+            blade_graphics::ShaderBinding::Buffer,
+        ));
+    }
+    for i in 0..count {
+        bindings.push((
+            match i {
+                0 => "matrix_c0",
+                1 => "matrix_c1",
+                _ => "matrix_c2",
+            },
+            blade_graphics::ShaderBinding::Buffer,
+        ));
+    }
+    bindings.push((
+        "params",
+        blade_graphics::ShaderBinding::Plain {
+            size: std::mem::size_of::<MatMulParams>() as u32,
+        },
+    ));
+    blade_graphics::ShaderDataLayout { bindings }
 }
 
 /// ShaderDataLayout for a schedule-template reduction pipeline, chosen
@@ -1505,6 +1630,26 @@ struct MatMulRmsNormParams {
 /// three fixed layout structs — avoids a per-combination `ShaderData`
 /// struct. `bind<D>` ignores `D::layout()` (uses the pipeline's layout),
 /// so the static `layout()` here is a harmless placeholder.
+struct HorizMatMulData {
+    buffers: Vec<blade_graphics::BufferPiece>,
+    params: MatMulParams,
+}
+
+impl blade_graphics::ShaderData for HorizMatMulData {
+    fn layout() -> blade_graphics::ShaderDataLayout {
+        blade_graphics::ShaderDataLayout::default()
+    }
+    fn fill(&self, mut context: blade_graphics::PipelineContext) {
+        use blade_graphics::ShaderBindable;
+        let mut index = 0u32;
+        for b in &self.buffers {
+            b.bind_to(&mut context, index);
+            index += 1;
+        }
+        self.params.bind_to(&mut context, index);
+    }
+}
+
 struct DynReductionData {
     buffers: Vec<blade_graphics::BufferPiece>,
     params: ReductionParams,
@@ -1754,6 +1899,7 @@ pub(crate) fn select_variants(
     plan: &mut ExecutionPlan,
     coop_config: Option<&crate::codegen::CoopConfig>,
     fuse_prologues: bool,
+    allow_raw_f16: bool,
 ) {
     if let Some(config) = coop_config {
         use crate::codegen::ShaderGroup;
@@ -1774,9 +1920,8 @@ pub(crate) fn select_variants(
             // cooperative path does not: tiny gradient operands can
             // underflow before accumulation. A native f32 cooperative
             // implementation is still safe and remains eligible.
-            if config.use_f16_input && dispatch.requires_full_precision {
-                continue;
-            }
+            let compensate =
+                config.use_f16_input && dispatch.requires_full_precision && !allow_raw_f16;
             // Cooperative epilogues are supported for the compiler's
             // current unary PointwiseDAG chains. They stage matrix
             // accumulators through workgroup memory, then apply scalar
@@ -1909,6 +2054,14 @@ pub(crate) fn select_variants(
                 // dispatch, so it survives reordering.
                 dispatch.scalar_fallback = Some((dispatch.shader.clone(), dispatch.workgroups));
                 dispatch.use_coop = true;
+                dispatch.use_coop_compensated = compensate
+                    && matches!(
+                        group,
+                        ShaderGroup::MatMul
+                            | ShaderGroup::MatMulAdd
+                            | ShaderGroup::MatMulAT
+                            | ShaderGroup::MatMulBT
+                    );
                 // Route conv2d coop dispatches to generated specialized kernels
                 if is_conv_bwd {
                     let kh = dispatch.params[5];
@@ -2013,13 +2166,16 @@ pub struct SessionOptions {
 /// How cooperative-matrix hardware may be used.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CoopPolicy {
-    /// Use native f32 tiles when advertised; never stage through f16.
+    /// Prefer native f32 tiles. On f16-only devices, enable f16 tiles:
+    /// inference uses plain f16 staging; `requires_full_precision`
+    /// dispatches use compensated hi/lo residuals.
     #[default]
     Auto,
     /// Never use cooperative matrices — force the scalar paths.
     Disabled,
-    /// Additionally allow f16-input tiles on devices that advertise no
-    /// f32 tile. Opt-in: f16 staging can overflow/round on f32 models.
+    /// Use f16 tiles without residual compensation, including for
+    /// derivative work. Faster than [`Self::Auto`] on f16-only devices,
+    /// and can overflow or lose gradient range.
     AllowF16,
 }
 
@@ -2143,6 +2299,9 @@ pub struct Session {
     /// Debug session: aliasing off, every buffer host-visible, all node
     /// values readable via [`Session::read_node`].
     debug: bool,
+    /// Optimizer / gradient scratch (Adam m/v, clip acc, grad-accum) live
+    /// in device-local memory. False when `debug` or `no_device_local`.
+    optimizer_device: bool,
     /// Per logical buffer: written by any dispatch or session setup.
     written: Vec<bool>,
     /// Active SGD learning rate. When set, every `step()` appends SGD
@@ -2250,6 +2409,32 @@ impl std::fmt::Display for ExternalBindError {
 
 impl std::error::Error for ExternalBindError {}
 
+fn create_optimizer_buffer(
+    gpu: &Gpu,
+    name: &str,
+    size: u64,
+    device_local: bool,
+    device_bufs: &mut Vec<(blade_graphics::Buffer, u64)>,
+) -> blade_graphics::Buffer {
+    let buf = gpu.create_buffer(blade_graphics::BufferDesc {
+        name,
+        size,
+        memory: if device_local {
+            blade_graphics::Memory::Device
+        } else {
+            blade_graphics::Memory::Shared
+        },
+    });
+    if device_local {
+        device_bufs.push((buf, size));
+    } else {
+        unsafe {
+            std::ptr::write_bytes(buf.data(), 0, size as usize);
+        }
+    }
+    buf
+}
+
 impl Session {
     /// Select the safest cooperative matrix config from GPU capabilities.
     /// Prefers native f32 for training correctness. The faster f16-input path
@@ -2269,31 +2454,23 @@ impl Session {
             caps.f16_tile,
             caps.f32_tile
         );
-        // f16 coop operands (max 65504, ~3 decimal digits) silently
-        // overflow to NaN / lose precision on f32 models whose activations
-        // exceed f16 range — which the scalar f32 path handles fine. So
-        // prefer f32 coop tiles; treat f16 as opt-in (MEGANEURA_COOP_F16)
-        // for throughput when the model is known to fit f16. With only f16
-        // tiles and no opt-in, fall back to scalar f32 (correct).
-        let want_f16 = policy == CoopPolicy::AllowF16;
+        // Prefer native f32 tiles. f16-only devices enable the f16 path;
+        // `select_variants` then uses compensated hi/lo for
+        // `requires_full_precision` work unless the caller opted into
+        // raw f16 via `CoopPolicy::AllowF16`.
         if caps.f32_tile > 0 {
             Some(CoopConfig {
                 tile_size: caps.f32_tile,
                 use_f16_input: false,
+                compensated: false,
             })
-        } else if caps.f16_tile > 0 && want_f16 {
+        } else if caps.f16_tile > 0 {
             Some(CoopConfig {
                 tile_size: caps.f16_tile,
                 use_f16_input: true,
+                compensated: false,
             })
         } else {
-            if caps.f16_tile > 0 {
-                log::warn!(
-                    "only f16 cooperative-matrix tiles available; using scalar \
-                     matmul (f16 coop overflows f32 models with large \
-                     activations). Set MEGANEURA_COOP_F16=1 to force f16 coop."
-                );
-            }
             None
         }
     }
@@ -2504,18 +2681,26 @@ impl Session {
         let mut plan = plan;
 
         // Per-dispatch kernel-variant selection: one pass, one owner.
-        select_variants(&mut plan, coop_config.as_ref(), !opts.debug);
+        select_variants(
+            &mut plan,
+            coop_config.as_ref(),
+            !opts.debug,
+            opts.coop == CoopPolicy::AllowF16,
+        );
 
         // Reorder dispatches by dependency level so parallel branches (e.g. Q/K/V
         // projections) cluster together, then partition into barrier groups.
         reorder_by_level(&mut plan.dispatches);
-        let groups = if opts.serial_dispatch {
+        let mut groups = if opts.serial_dispatch {
             // Debug: one dispatch per pass — guarantees serial execution.
             log::info!("MEGANEURA_SERIAL_DISPATCH: forcing one dispatch per pass");
             (0..plan.dispatches.len()).map(|i| i..i + 1).collect()
         } else {
             compute_groups(&plan.dispatches)
         };
+        if !opts.serial_dispatch && !opts.debug {
+            crate::compile::fuse_horizontal_matmuls(&mut plan.dispatches, &mut groups);
+        }
         log::info!(
             "{} dispatches → {} barrier groups",
             plan.dispatches.len(),
@@ -2671,46 +2856,57 @@ impl Session {
             let _ = gpu.wait_for(&sp, !0);
         }
 
+        let optimizer_device = !opts.no_device_local && !opts.debug;
+        let mut optimizer_device_bufs: Vec<(blade_graphics::Buffer, u64)> = Vec::new();
         let adam_state = plan
             .param_grad_pairs
             .iter()
             .enumerate()
             .map(|(i, &(param_buf, _))| {
                 let size = (plan.buffers[param_buf.0 as usize] as u64).max(4);
-                let m_buf = gpu.create_buffer(blade_graphics::BufferDesc {
-                    name: &format!("adam_m_{i}"),
+                let m_buf = create_optimizer_buffer(
+                    &gpu,
+                    &format!("adam_m_{i}"),
                     size,
-                    memory: blade_graphics::Memory::Shared,
-                });
-                let v_buf = gpu.create_buffer(blade_graphics::BufferDesc {
-                    name: &format!("adam_v_{i}"),
+                    optimizer_device,
+                    &mut optimizer_device_bufs,
+                );
+                let v_buf = create_optimizer_buffer(
+                    &gpu,
+                    &format!("adam_v_{i}"),
                     size,
-                    memory: blade_graphics::Memory::Shared,
-                });
-                unsafe {
-                    std::ptr::write_bytes(m_buf.data(), 0, size as usize);
-                    std::ptr::write_bytes(v_buf.data(), 0, size as usize);
-                }
+                    optimizer_device,
+                    &mut optimizer_device_bufs,
+                );
                 (m_buf, v_buf)
             })
             .collect();
 
-        // Grad-clip accumulator: a single u32 (4 bytes) holding f32 bits
-        // of the running sum-of-squares. Allocated unconditionally so
-        // `set_grad_clip_norm` works without rebuilding the session.
+        // Grad-clip accumulator: a single f32. GPU-only after the
+        // barriered clip path landed; host-visible only in debug.
         let grad_clip_acc = if !plan.param_grad_pairs.is_empty() {
-            let buf = gpu.create_buffer(blade_graphics::BufferDesc {
-                name: "grad_clip_acc",
-                size: 4,
-                memory: blade_graphics::Memory::Shared,
-            });
-            unsafe {
-                std::ptr::write_bytes(buf.data(), 0, 4);
-            }
-            Some(buf)
+            Some(create_optimizer_buffer(
+                &gpu,
+                "grad_clip_acc",
+                4,
+                optimizer_device,
+                &mut optimizer_device_bufs,
+            ))
         } else {
             None
         };
+
+        if !optimizer_device_bufs.is_empty() {
+            encoder.start();
+            {
+                let mut transfer = encoder.transfer("zero_optimizer");
+                for &(buf, size) in &optimizer_device_bufs {
+                    transfer.fill_buffer(buf.at(0), size, 0);
+                }
+            }
+            let sp = gpu.submit(&mut encoder);
+            let _ = gpu.wait_for(&sp, !0);
+        }
 
         // Buffers that some dispatch (or session setup) actually writes.
         // Values whose producer was fused away have allocated-but-never-
@@ -2753,6 +2949,7 @@ impl Session {
             last_submit_ns: 0,
             profiling: false,
             debug: opts.debug,
+            optimizer_device,
             written,
             pending_lr: None,
             pending_grad_clip: None,
@@ -3122,7 +3319,7 @@ pub(crate) fn parse_device_id(value: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod variant_tests {
-    use super::{Dispatch, Pipelines, ShaderEntry, Variant};
+    use super::{Dispatch, HorizMatMulKind, Pipelines, ShaderEntry, Variant};
 
     fn relu_epilogue() -> crate::compile::MatMulEpilogue {
         crate::compile::MatMulEpilogue {
@@ -3186,6 +3383,38 @@ mod variant_tests {
         });
         assert_eq!(coop.len(), 1);
         assert!(matches!(coop[0], Variant::CoopEpilogue(..)));
+    }
+
+    #[test]
+    fn horizontal_pack_keys_include_precision() {
+        let scalar = matmul(|d| d.horizontal_batch = 3);
+        let coop = matmul(|d| {
+            d.horizontal_batch = 3;
+            d.use_coop = true;
+        });
+        let compensated = matmul(|d| {
+            d.horizontal_batch = 3;
+            d.use_coop = true;
+            d.use_coop_compensated = true;
+        });
+        assert_eq!(
+            scalar,
+            vec![Variant::Horizontal(
+                ShaderEntry::MatMul,
+                3,
+                HorizMatMulKind::Scalar
+            )]
+        );
+        assert_ne!(scalar, coop);
+        assert_ne!(coop, compensated);
+        assert_eq!(
+            compensated,
+            vec![Variant::Horizontal(
+                ShaderEntry::MatMul,
+                3,
+                HorizMatMulKind::CoopCompensated
+            )]
+        );
     }
 }
 
@@ -3816,18 +4045,84 @@ impl Session {
             data.len(),
             expected,
         );
-        // All upload targets (params, inputs) are pinned by the memory
-        // plan and therefore host-visible; a null pointer here means a
-        // buffer class regression, not a user error.
-        assert!(
-            !buffer.data().is_null(),
-            "upload_buffer: buffer {} is device-local (not host-visible)",
-            buf_ref.0
-        );
-        unsafe {
-            let ptr = buffer.data();
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+        self.write_raw_buffer(buffer, data);
+    }
+
+    /// Write `data` into a GPU buffer, staging through a host-visible
+    /// allocation when the destination is device-local.
+    fn write_raw_buffer(&self, buffer: &blade_graphics::Buffer, data: &[u8]) {
+        if !buffer.data().is_null() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), buffer.data(), data.len());
+            }
+            return;
         }
+        let staging = self.gpu.create_buffer(blade_graphics::BufferDesc {
+            name: "upload_staging",
+            size: (data.len() as u64).max(4),
+            memory: blade_graphics::Memory::Shared,
+        });
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), staging.data(), data.len());
+        }
+        let mut encoder = self
+            .gpu
+            .create_command_encoder(blade_graphics::CommandEncoderDesc {
+                name: "upload_staging",
+                buffer_count: 1,
+                manual_barriers: false,
+            });
+        encoder.start();
+        encoder.transfer("upload_staging").copy_buffer_to_buffer(
+            staging.at(0),
+            buffer.at(0),
+            data.len() as u64,
+        );
+        let sync = self.gpu.submit(&mut encoder);
+        let _ = self.gpu.wait_for(&sync, !0);
+        self.gpu.destroy_command_encoder(&mut encoder);
+        self.gpu.destroy_buffer(staging);
+    }
+
+    fn read_raw_f32(&self, buffer: &blade_graphics::Buffer, out: &mut [f32]) {
+        if !buffer.data().is_null() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    buffer.data() as *const f32,
+                    out.as_mut_ptr(),
+                    out.len(),
+                );
+            }
+            return;
+        }
+        let bytes = std::mem::size_of_val(out) as u64;
+        let staging = self.gpu.create_buffer(blade_graphics::BufferDesc {
+            name: "readback_staging",
+            size: bytes.max(4),
+            memory: blade_graphics::Memory::Download,
+        });
+        let mut encoder = self
+            .gpu
+            .create_command_encoder(blade_graphics::CommandEncoderDesc {
+                name: "readback",
+                buffer_count: 1,
+                manual_barriers: false,
+            });
+        encoder.start();
+        encoder
+            .transfer("readback_copy")
+            .copy_buffer_to_buffer(buffer.at(0), staging.at(0), bytes);
+        let sync = self.gpu.submit(&mut encoder);
+        let _ = self.gpu.wait_for(&sync, !0);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                staging.data() as *const f32,
+                out.as_mut_ptr(),
+                out.len(),
+            );
+        }
+        self.gpu.destroy_command_encoder(&mut encoder);
+        self.gpu.destroy_buffer(staging);
     }
 
     /// Read back the loss value.
@@ -4114,44 +4409,11 @@ impl Session {
 
     /// Read back a buffer's contents.
     ///
-    /// Host-visible buffers (params, grads, inputs, outputs, loss) read
-    /// directly through the mapped pointer. Device-local intermediates
-    /// take a staging round-trip with its own submit + wait — fine for
-    /// tests and diagnostics, not for a hot path.
+    /// Host-visible buffers (params, inputs, outputs, loss) read
+    /// directly through the mapped pointer. Device-local buffers
+    /// (intermediates, parameter gradients) take a staging round-trip.
     pub fn read_buffer(&self, buf_ref: BufferRef, out: &mut [f32]) {
-        let buffer = &self.buffers[buf_ref.0 as usize];
-        if !buffer.data().is_null() {
-            unsafe {
-                let ptr = buffer.data() as *const f32;
-                std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), out.len());
-            }
-            return;
-        }
-        let bytes = std::mem::size_of_val(out) as u64;
-        let staging = self.gpu.create_buffer(blade_graphics::BufferDesc {
-            name: "readback_staging",
-            size: bytes.max(4),
-            memory: blade_graphics::Memory::Download,
-        });
-        let mut encoder = self
-            .gpu
-            .create_command_encoder(blade_graphics::CommandEncoderDesc {
-                name: "readback",
-                buffer_count: 1,
-                manual_barriers: false,
-            });
-        encoder.start();
-        encoder
-            .transfer("readback_copy")
-            .copy_buffer_to_buffer(buffer.at(0), staging.at(0), bytes);
-        let sp = self.gpu.submit(&mut encoder);
-        let _ = self.gpu.wait_for(&sp, !0);
-        unsafe {
-            let ptr = staging.data() as *const f32;
-            std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), out.len());
-        }
-        self.gpu.destroy_command_encoder(&mut encoder);
-        self.gpu.destroy_buffer(staging);
+        self.read_raw_f32(&self.buffers[buf_ref.0 as usize], out);
     }
 
     /// Read back a graph output by index.
@@ -4350,10 +4612,7 @@ impl Session {
             "read_adam_m: out.len()={} but param '{name}' has {n} elements",
             out.len()
         );
-        unsafe {
-            let ptr = buf.data() as *const f32;
-            std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), n);
-        }
+        self.read_raw_f32(buf, out);
     }
 
     /// Read the Adam second-moment buffer (`v`) for a parameter. See
@@ -4370,10 +4629,7 @@ impl Session {
             "read_adam_v: out.len()={} but param '{name}' has {n} elements",
             out.len()
         );
-        unsafe {
-            let ptr = buf.data() as *const f32;
-            std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), n);
-        }
+        self.read_raw_f32(buf, out);
     }
 
     /// Read both Adam moment buffers for several parameters with one GPU
@@ -4421,10 +4677,7 @@ impl Session {
             "write_adam_m: data.len()={} but param '{name}' has {n} elements",
             data.len()
         );
-        unsafe {
-            let ptr = buf.data() as *mut f32;
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, n);
-        }
+        self.write_raw_buffer(buf, bytemuck::cast_slice(data));
     }
 
     /// Write the Adam second-moment buffer for a parameter. See
@@ -4442,10 +4695,7 @@ impl Session {
             "write_adam_v: data.len()={} but param '{name}' has {n} elements",
             data.len()
         );
-        unsafe {
-            let ptr = buf.data() as *mut f32;
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, n);
-        }
+        self.write_raw_buffer(buf, bytemuck::cast_slice(data));
     }
 
     /// Current Adam step counter (`t`). Adam's bias correction uses
@@ -4942,6 +5192,27 @@ impl Session {
         pc: &mut impl blade_graphics::traits::PipelineEncoder,
     ) {
         let buf = |r: BufferRef| buffers[r.0 as usize].at(0);
+        if dispatch.horizontal_batch >= 2 {
+            let count = dispatch.horizontal_batch as usize;
+            let mut pieces = vec![buf(dispatch.input_buffers[0])];
+            for i in 0..count {
+                pieces.push(buf(dispatch.input_buffers[1 + i]));
+            }
+            pieces.push(buf(dispatch.output_buffer));
+            pieces.extend(dispatch.extra_outputs.iter().map(|&r| buf(r)));
+            let (m, n, k) = match dispatch.shader {
+                ShaderEntry::MatMul => (dispatch.params[0], dispatch.params[2], dispatch.params[1]),
+                _ => (dispatch.params[0], dispatch.params[1], dispatch.params[2]),
+            };
+            pc.bind(
+                0,
+                &HorizMatMulData {
+                    buffers: pieces,
+                    params: MatMulParams { m, n, k, _pad: 0 },
+                },
+            );
+            return;
+        }
         // A GEMV with its RmsNorm folded in takes the norm's weight vector
         // as an extra binding and carries eps in the params' spare slot.
         if let Some(ref rn) = dispatch.gemv_rmsnorm {
@@ -6324,15 +6595,14 @@ impl Session {
         self.wait();
         for &(param_buf, grad_buf) in &self.plan.param_grad_pairs {
             let size = self.plan.buffers[param_buf.0 as usize] / 4;
-            let param = &self.buffers[param_buf.0 as usize];
-            let grad = &self.buffers[grad_buf.0 as usize];
-            unsafe {
-                let p = param.data() as *mut f32;
-                let g = grad.data() as *const f32;
-                for i in 0..size {
-                    *p.add(i) -= learning_rate * *g.add(i);
-                }
+            let mut param = vec![0.0f32; size];
+            let mut grad = vec![0.0f32; size];
+            self.read_buffer(param_buf, &mut param);
+            self.read_buffer(grad_buf, &mut grad);
+            for i in 0..size {
+                param[i] -= learning_rate * grad[i];
             }
+            self.upload_buffer(param_buf, bytemuck::cast_slice(&param));
         }
     }
 
@@ -6502,6 +6772,7 @@ impl Session {
             return;
         }
         if self.grad_accum_bufs.is_empty() {
+            let mut device_bufs = Vec::new();
             self.grad_accum_bufs = self
                 .plan
                 .param_grad_pairs
@@ -6509,17 +6780,34 @@ impl Session {
                 .enumerate()
                 .map(|(i, &(_, grad_buf))| {
                     let size = (self.plan.buffers[grad_buf.0 as usize] as u64).max(4);
-                    let buf = self.gpu.create_buffer(blade_graphics::BufferDesc {
-                        name: &format!("grad_accum_{i}"),
+                    create_optimizer_buffer(
+                        &self.gpu,
+                        &format!("grad_accum_{i}"),
                         size,
-                        memory: blade_graphics::Memory::Shared,
-                    });
-                    unsafe {
-                        std::ptr::write_bytes(buf.data(), 0, size as usize);
-                    }
-                    buf
+                        self.optimizer_device,
+                        &mut device_bufs,
+                    )
                 })
                 .collect();
+            if !device_bufs.is_empty() {
+                let mut encoder =
+                    self.gpu
+                        .create_command_encoder(blade_graphics::CommandEncoderDesc {
+                            name: "zero_grad_accum",
+                            buffer_count: 1,
+                            manual_barriers: false,
+                        });
+                encoder.start();
+                {
+                    let mut transfer = encoder.transfer("zero_grad_accum");
+                    for &(buf, size) in &device_bufs {
+                        transfer.fill_buffer(buf.at(0), size, 0);
+                    }
+                }
+                let sync = self.gpu.submit(&mut encoder);
+                let _ = self.gpu.wait_for(&sync, !0);
+                self.gpu.destroy_command_encoder(&mut encoder);
+            }
         }
         self.grad_accum_scale = Some(1.0 / micro_batches as f32);
     }
@@ -6535,11 +6823,27 @@ impl Session {
             return;
         }
         self.wait();
-        // Accumulators are host-visible (Shared); zero in place.
-        for (buf, &(_, grad_buf)) in self.grad_accum_bufs.iter().zip(&self.plan.param_grad_pairs) {
-            let size = self.plan.buffers[grad_buf.0 as usize].max(4);
-            unsafe {
-                std::ptr::write_bytes(buf.data(), 0, size);
+        if self.optimizer_device {
+            self.encoder.start();
+            {
+                let mut transfer = self.encoder.transfer("zero_grad");
+                for (buf, &(_, grad_buf)) in
+                    self.grad_accum_bufs.iter().zip(&self.plan.param_grad_pairs)
+                {
+                    let size = self.plan.buffers[grad_buf.0 as usize].max(4) as u64;
+                    transfer.fill_buffer(buf.at(0), size, 0);
+                }
+            }
+            self.sync_point = Some(self.gpu.submit(&mut self.encoder));
+            self.wait();
+        } else {
+            for (buf, &(_, grad_buf)) in
+                self.grad_accum_bufs.iter().zip(&self.plan.param_grad_pairs)
+            {
+                let size = self.plan.buffers[grad_buf.0 as usize].max(4);
+                unsafe {
+                    std::ptr::write_bytes(buf.data(), 0, size);
+                }
             }
         }
     }
@@ -6560,7 +6864,14 @@ impl Session {
             largest_buffer_bytes: largest,
             allocated_buffer_bytes: self.alias.physical_bytes(),
             num_allocations: self.alias.sizes.len(),
-            device_local_bytes: self.alias.device_local_bytes(),
+            device_local_bytes: self.alias.device_local_bytes()
+                + if self.optimizer_device {
+                    adam_bytes
+                        + self.grad_accum_bufs.len() * adam_bytes / 2
+                        + usize::from(self.grad_clip_acc.is_some()) * 4
+                } else {
+                    0
+                },
         }
     }
 
@@ -6875,14 +7186,7 @@ impl Session {
                             ),
                         ));
                     }
-                    unsafe {
-                        let ptr = buf.data();
-                        std::ptr::copy_nonoverlapping(
-                            tensor.data().as_ptr(),
-                            ptr,
-                            tensor.data().len(),
-                        );
-                    }
+                    self.write_raw_buffer(buf, tensor.data());
                 }
             }
         }
