@@ -19,8 +19,8 @@ default = ["hub"]
 hub = ["dep:hf-hub"]
 
 [dependencies]
-blade-graphics = { version = "0.8.4", git = "https://github.com/kvark/blade", rev = "60c2eeb8d6180ff2db5167e304d55b78a18dfee2" }
-blade-macros = "0.3"
+blade-graphics = { version = "0.8.4", git = "https://github.com/kvark/blade", rev = "20fcb84953dc216bbb7179bda6ce985693208736" }
+blade-macros = { version = "0.3", git = "https://github.com/kvark/blade", rev = "20fcb84953dc216bbb7179bda6ce985693208736" }
 egglog = "2.0"
 bytemuck = { version = "1", features = ["derive"] }
 # Pinned to the same wgpu/naga rev as blade-graphics so the `naga::Module`
