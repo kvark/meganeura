@@ -12,8 +12,10 @@
 - Parameter gradients, Adam m/v, the clip accumulator, and temporal
   grad-accumulators default to device-local memory. Host read/write
   (checkpoints, `read_param_grad`, `read_adam_*`) stages through a
-  transient buffer. `MEGANEURA_NO_DEVICE_LOCAL=1` and debug sessions
-  keep the previous host-visible layout.
+  transient buffer — including on Metal, where `Memory::Device` is
+  `MTLStorageModePrivate` and `contents()` is not a valid host
+  pointer. `MEGANEURA_NO_DEVICE_LOCAL=1` and debug sessions keep the
+  previous host-visible layout.
 
 - Cross-entropy training reuses the forward kernel's fused logits gradient
   instead of rebuilding softmax and a ones-row broadcast matmul. Inference
