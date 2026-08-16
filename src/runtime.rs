@@ -4045,13 +4045,23 @@ impl Session {
             data.len(),
             expected,
         );
-        self.write_raw_buffer(buffer, data);
+        self.write_raw_buffer(buffer, data, self.logical_host_visible(buf_ref));
+    }
+
+    /// Whether this logical buffer's physical allocation is CPU-accessible.
+    ///
+    /// Do not probe `Buffer::data()` for this: on Metal, `Memory::Device`
+    /// (`MTLStorageModePrivate`) still returns a non-null `contents()`
+    /// pointer, and touching it trips
+    /// `validateCPUWriteable` / `validateCPUReadable`.
+    fn logical_host_visible(&self, buf_ref: BufferRef) -> bool {
+        !self.alias.device_local[self.alias.map[buf_ref.0 as usize]]
     }
 
     /// Write `data` into a GPU buffer, staging through a host-visible
     /// allocation when the destination is device-local.
-    fn write_raw_buffer(&self, buffer: &blade_graphics::Buffer, data: &[u8]) {
-        if !buffer.data().is_null() {
+    fn write_raw_buffer(&self, buffer: &blade_graphics::Buffer, data: &[u8], host_visible: bool) {
+        if host_visible {
             unsafe {
                 std::ptr::copy_nonoverlapping(data.as_ptr(), buffer.data(), data.len());
             }
@@ -4084,8 +4094,8 @@ impl Session {
         self.gpu.destroy_buffer(staging);
     }
 
-    fn read_raw_f32(&self, buffer: &blade_graphics::Buffer, out: &mut [f32]) {
-        if !buffer.data().is_null() {
+    fn read_raw_f32(&self, buffer: &blade_graphics::Buffer, out: &mut [f32], host_visible: bool) {
+        if host_visible {
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     buffer.data() as *const f32,
@@ -4413,7 +4423,11 @@ impl Session {
     /// directly through the mapped pointer. Device-local buffers
     /// (intermediates, parameter gradients) take a staging round-trip.
     pub fn read_buffer(&self, buf_ref: BufferRef, out: &mut [f32]) {
-        self.read_raw_f32(&self.buffers[buf_ref.0 as usize], out);
+        self.read_raw_f32(
+            &self.buffers[buf_ref.0 as usize],
+            out,
+            self.logical_host_visible(buf_ref),
+        );
     }
 
     /// Read back a graph output by index.
@@ -4612,7 +4626,7 @@ impl Session {
             "read_adam_m: out.len()={} but param '{name}' has {n} elements",
             out.len()
         );
-        self.read_raw_f32(buf, out);
+        self.read_raw_f32(buf, out, !self.optimizer_device);
     }
 
     /// Read the Adam second-moment buffer (`v`) for a parameter. See
@@ -4629,7 +4643,7 @@ impl Session {
             "read_adam_v: out.len()={} but param '{name}' has {n} elements",
             out.len()
         );
-        self.read_raw_f32(buf, out);
+        self.read_raw_f32(buf, out, !self.optimizer_device);
     }
 
     /// Read both Adam moment buffers for several parameters with one GPU
@@ -4677,7 +4691,7 @@ impl Session {
             "write_adam_m: data.len()={} but param '{name}' has {n} elements",
             data.len()
         );
-        self.write_raw_buffer(buf, bytemuck::cast_slice(data));
+        self.write_raw_buffer(buf, bytemuck::cast_slice(data), !self.optimizer_device);
     }
 
     /// Write the Adam second-moment buffer for a parameter. See
@@ -4695,7 +4709,7 @@ impl Session {
             "write_adam_v: data.len()={} but param '{name}' has {n} elements",
             data.len()
         );
-        self.write_raw_buffer(buf, bytemuck::cast_slice(data));
+        self.write_raw_buffer(buf, bytemuck::cast_slice(data), !self.optimizer_device);
     }
 
     /// Current Adam step counter (`t`). Adam's bias correction uses
@@ -7186,7 +7200,7 @@ impl Session {
                             ),
                         ));
                     }
-                    self.write_raw_buffer(buf, tensor.data());
+                    self.write_raw_buffer(buf, tensor.data(), !self.optimizer_device);
                 }
             }
         }
