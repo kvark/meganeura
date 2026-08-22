@@ -22,8 +22,8 @@ hub = ["dep:hf-hub"]
 profiler = ["dep:tracing-subscriber"]
 
 [dependencies]
-blade-graphics = { version = "0.8.4", git = "https://github.com/kvark/blade", rev = "20fcb84953dc216bbb7179bda6ce985693208736" }
-blade-macros = { version = "0.3", git = "https://github.com/kvark/blade", rev = "20fcb84953dc216bbb7179bda6ce985693208736" }
+blade-graphics = { version = "0.8.4", git = "https://github.com/kvark/blade", rev = "a6ae6a73219762f63efb4e5be4550fbc0d301b2f" }
+blade-macros = { version = "0.3", git = "https://github.com/kvark/blade", rev = "a6ae6a73219762f63efb4e5be4550fbc0d301b2f" }
 # `default-features = false` drops egglog's `bin` stack (clap, mimalloc,
 # env_logger, chrono, graphviz). Greedy mode never constructs an EGraph
 # but the crate is still linked for the optional equality-saturation
@@ -33,7 +33,7 @@ bytemuck = { version = "1", features = ["derive"] }
 # Pinned to the same wgpu/naga rev as blade-graphics so the `naga::Module`
 # we build unifies with the one blade's SPIR-V backend consumes. This rev
 # carries `spv::Options::emit_int_div_checks`, which blade sets to false.
-naga = { version = "29.0.0", git = "https://github.com/gfx-rs/wgpu", rev = "78b4dfd0cb1ef5ed208fefe80ae2f855db3609bb", default-features = false, features = ["wgsl-in", "wgsl-out", "spv-out"] }
+naga = { version = "29.0.0", git = "https://github.com/gfx-rs/wgpu", rev = "cefd48f6cff61d64abe1cdb4002c4e39bfc2c728", default-features = false, features = ["wgsl-in", "wgsl-out", "spv-out"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ron = "0.8"
@@ -151,4 +151,3 @@ path = "bench/decode_baseline.rs"
 [[example]]
 name = "decode_op_diff"
 path = "bench/decode_op_diff.rs"
-
