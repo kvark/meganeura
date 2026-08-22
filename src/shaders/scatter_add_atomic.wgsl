@@ -8,40 +8,69 @@ struct Params {
 var<storage> indices: array<u32>;
 var<storage> src: array<f32>;
 var<storage> row_scale: array<f32>;
-var<storage, read_write> dst: array<f32>;
+var<storage, read_write> dst: array<atomic<u32>>;
 var<uniform> params: Params;
 
-// Column-parallel scatter-add. Each thread owns one embedding column and
-// walks the source rows sequentially, so duplicate indices accumulate
-// correctly without storage atomics.
-//
-// The previous CAS loop used device-scope `atomic<u32>` on a storage
-// buffer. Blade enables `vulkanMemoryModel` without
-// `vulkanMemoryModelDeviceScope`, which is VUID 06265 on cooperative-
-// matrix Vulkan contexts (the same hole grad-clip closed).
-//
-// Parallelism is `embed_dim` rather than `seq_len * embed_dim`. That is
-// enough for the embedding widths we train (768–4096) and is portable
-// to Metal and strict Vulkan.
-//
-// `_pad` 0: unscaled. `_pad` 1 or 2: multiply by `row_scale[s]` (the
-// two values are historical work-mapping modes; they are the same math).
-// Dispatch: [ceil(embed_dim / 256), 1, 1]
+// Blade enables Vulkan memory-model device scope when cooperative matrices
+// require the Vulkan memory model, so storage CAS is valid on that path.
+// `_pad == 2` maps one invocation to each narrow source row; wider rows map
+// one invocation to each source element.
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let col = gid.x;
-    if col >= params.embed_dim { return; }
+    if params._pad == 2u {
+        let source_row = gid.x;
+        if source_row >= params.seq_len { return; }
 
-    let output_rows = params.total / params.embed_dim;
-    let scaled = params._pad != 0u;
-    for (var s = 0u; s < params.seq_len; s++) {
-        var value = src[s * params.embed_dim + col];
-        if scaled {
-            value *= row_scale[s];
+        let scale = row_scale[source_row];
+        if scale == 0.0 { return; }
+        let output_row = indices[source_row];
+        let output_rows = params.total / params.embed_dim;
+        if output_row >= output_rows { return; }
+
+        for (var column = 0u; column < params.embed_dim; column += 1u) {
+            let value = src[source_row * params.embed_dim + column] * scale;
+            if value == 0.0 { continue; }
+
+            let output_index = output_row * params.embed_dim + column;
+            var old_bits = atomicLoad(&dst[output_index]);
+            loop {
+                let old_value = bitcast<f32>(old_bits);
+                let new_bits = bitcast<u32>(old_value + value);
+                let result = atomicCompareExchangeWeak(&dst[output_index], old_bits, new_bits);
+                if result.exchanged {
+                    break;
+                }
+                old_bits = result.old_value;
+            }
         }
-        if value == 0.0 { continue; }
-        let output_row = indices[s];
-        if output_row >= output_rows { continue; }
-        dst[output_row * params.embed_dim + col] += value;
+        return;
+    }
+
+    let source_index = gid.x;
+    let source_len = params.seq_len * params.embed_dim;
+    if source_index >= source_len { return; }
+
+    let source_row = source_index / params.embed_dim;
+    var value = src[source_index];
+    if params._pad == 1u {
+        value *= row_scale[source_row];
+    }
+    if value == 0.0 { return; }
+
+    let column = source_index % params.embed_dim;
+    let output_row = indices[source_row];
+    let output_rows = params.total / params.embed_dim;
+    if output_row >= output_rows { return; }
+
+    let output_index = output_row * params.embed_dim + column;
+    var old_bits = atomicLoad(&dst[output_index]);
+    loop {
+        let old_value = bitcast<f32>(old_bits);
+        let new_bits = bitcast<u32>(old_value + value);
+        let result = atomicCompareExchangeWeak(&dst[output_index], old_bits, new_bits);
+        if result.exchanged {
+            break;
+        }
+        old_bits = result.old_value;
     }
 }

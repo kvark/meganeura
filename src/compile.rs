@@ -1197,7 +1197,7 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
             let source_len = scatter.params[1].saturating_mul(scatter.params[2]);
             if mul.params != [source_len, 0, 0, 0]
                 || broadcast.params != [source_len, scatter.params[2], 1, 0]
-                || scatter.workgroups != [scatter.params[2].div_ceil(256), 1, 1]
+                || scatter.workgroups != [source_len.div_ceil(256), 1, 1]
             {
                 continue;
             }
@@ -1232,9 +1232,9 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
         scatter.input_buffers = vec![indices, factors, row_scale, output];
         let small_row = scatter.params[2] <= 16;
         scatter.params[3] = if small_row { 2 } else { 1 };
-        // Column-parallel non-atomic kernel: one thread per embedding
-        // column, regardless of the historical row-mapping pad flag.
-        scatter.workgroups = [scatter.params[2].div_ceil(256), 1, 1];
+        if small_row {
+            scatter.workgroups = [scatter.params[1].div_ceil(256), 1, 1];
+        }
         scatter.pointwise = None;
         scatter.label = format!("ScatterAddAtomicRowMul[{total}]");
         // The zero entry point does not read `src`, but its shared binding
@@ -3675,7 +3675,7 @@ impl<'a> Compiler<'a> {
                     });
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::ScatterAddAtomic,
-                        workgroups: [embed_dim.div_ceil(256), 1, 1],
+                        workgroups: [(seq_len * embed_dim).div_ceil(256), 1, 1],
                         // The output is also an input so scheduling inserts a
                         // global barrier after the zeroing dispatch.
                         input_buffers: vec![indices, src, out_buf],
@@ -5773,6 +5773,7 @@ mod tests {
             large_plan.dispatches[1].shader,
             ShaderEntry::ScatterAddAtomic
         );
+        assert_eq!(large_plan.dispatches[1].workgroups, [3, 1, 1]);
         assert!(
             large_plan.dispatches[1]
                 .input_buffers
@@ -5782,7 +5783,7 @@ mod tests {
 
     #[test]
     fn gather_reduction_gradient_fuses_row_scaled_atomic_scatter() {
-        const SEQ: usize = 256;
+        const SEQ: usize = 1024;
         const VOCAB: usize = 4097;
         const INNER: usize = 16;
 
@@ -5808,7 +5809,7 @@ mod tests {
             fused.params,
             [VOCAB as u32 * INNER as u32, SEQ as u32, INNER as u32, 2]
         );
-        assert_eq!(fused.workgroups, [1, 1, 1]);
+        assert_eq!(fused.workgroups, [4, 1, 1]);
         assert_eq!(fused.input_buffers.len(), 4);
         assert_eq!(fused.input_buffers[3], fused.output_buffer);
         assert!(!plan.dispatches.iter().any(|dispatch| {
@@ -5851,7 +5852,7 @@ mod tests {
             .find(|dispatch| dispatch.is_row_scaled_atomic_scatter())
             .expect("gathered row reduction should fuse its table gradient");
         assert_eq!(fused.params[3], 1);
-        assert_eq!(fused.workgroups, [INNER.div_ceil(256) as u32, 1, 1]);
+        assert_eq!(fused.workgroups, [(SEQ * INNER).div_ceil(256) as u32, 1, 1]);
     }
 
     #[test]
