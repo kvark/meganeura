@@ -13,8 +13,8 @@ struct ScatterAddData {
     params: ScatterAddParams,
 }
 
-// Column-parallel scatter (historical name). `row_scale` is bound even
-// when the unscaled path ignores it so the layout stays one module.
+// The ordinary and zeroing entries bind `src` again for their unused row
+// scale so every entry point can share one reflected layout.
 #[derive(blade_macros::ShaderData)]
 struct ScatterAddAtomicData {
     indices: blade_graphics::BufferPiece,

@@ -22,9 +22,10 @@
   skips the unused gradient write.
 - Binary cross-entropy no longer writes a per-element gradient into the
   per-workgroup loss buffer (that overran the allocation for `n > 1`).
-- Large scatter-add no longer uses device-scope storage atomics
-  (VUID 06265 on cooperative-matrix Vulkan). A column-parallel sequential
-  accumulation is portable to Metal and strict Vulkan.
+- Large scatter-add uses float CAS with source-parallel work mapping. Blade
+  enables Vulkan memory-model device scope when required, so serializing every
+  source row behind one invocation per column is unnecessary. Narrow
+  row-scaled scatters map one invocation to each source row.
 - `egglog` and `naga` disable crate default features. Default crate
   features are now empty: `hub` (HuggingFace downloads) and `profiler`
   (Perfetto CPU-span subscriber) are opt-in. `SafeTensorsModel::from_bytes`

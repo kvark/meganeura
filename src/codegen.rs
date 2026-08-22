@@ -5286,11 +5286,11 @@ mod tests {
     }
 
     #[test]
-    fn scatter_add_avoids_device_scope_storage_atomics() {
+    fn scatter_add_uses_float_cas() {
         let module = generate_module(ShaderGroup::ScatterAddAtomic);
-        assert!(!module.source.contains("array<atomic"));
-        assert!(!module.source.contains("atomicLoad"));
-        assert!(!module.source.contains("atomicCompareExchangeWeak"));
+        assert!(module.source.contains("array<atomic"));
+        assert!(module.source.contains("atomicLoad"));
+        assert!(module.source.contains("atomicCompareExchangeWeak"));
     }
 
     #[test]
