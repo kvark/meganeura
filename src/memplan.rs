@@ -217,6 +217,12 @@ fn device_local_eligible(plan: &ExecutionPlan) -> Vec<bool> {
             ok[i] = true;
         }
     }
+    // A gradient seed can also be a compile-time constant. Session setup
+    // initializes constants through their host pointer, so that role takes
+    // precedence over device-local gradient storage.
+    for &(buffer, _) in &plan.constant_buffers {
+        ok[buffer.0 as usize] = false;
+    }
     ok
 }
 
@@ -552,6 +558,21 @@ mod tests {
             !alias.device_local[alias.map[1]],
             "parameters stay host-visible"
         );
+    }
+
+    #[test]
+    fn constant_gradient_seed_stays_host_visible() {
+        let mut p = plan(vec![16, 16], vec![dispatch(&[0], 1)]);
+        p.param_buffers.push(("w".into(), BufferRef(0)));
+        p.param_grad_pairs.push((BufferRef(0), BufferRef(1)));
+        p.constant_buffers.push((BufferRef(1), vec![1.0]));
+        let groups = std::iter::once(0..1).collect::<Vec<_>>();
+
+        let alias = plan_buffer_aliasing(&p, &groups, None);
+        assert!(!alias.device_local[alias.map[1]]);
+
+        let no_alias = plan_no_alias(&p, &groups, None);
+        assert!(!no_alias.device_local[1]);
     }
 
     #[test]
