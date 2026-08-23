@@ -5084,9 +5084,7 @@ impl<'a> Compiler<'a> {
     ///   2. Sum reduction with prologue `exp(src - row_max)` and epilogue
     ///      `exp(src - row_max) / row_sum` → output `[batch, features]`.
     ///
-    /// Matches softmax.wgsl semantics bit-for-bit on finite inputs. No
-    /// workgroup-size autotune yet — hardcoded at 256, which matches the
-    /// existing softmax's tile size.
+    /// Matches softmax.wgsl semantics bit-for-bit on finite inputs.
     fn emit_softmax_schedule(
         &mut self,
         input: BufferRef,
@@ -5097,6 +5095,14 @@ impl<'a> Compiler<'a> {
         use crate::schedule::{PointwiseDAG, Pw, ReduceOp, ReductionEpilogue, ReductionKernel};
 
         const WG: u32 = 256;
+        // Give each narrow row a power-of-two lane group and fill the rest of
+        // the workgroup with independent rows. This keeps the reduction order
+        // while avoiding one mostly idle 256-lane workgroup per short row.
+        let rows_per_workgroup = if (2..=32).contains(&features) {
+            WG / features.next_power_of_two()
+        } else {
+            1
+        };
 
         // Allocate intermediate row_max buffer: batch × f32.
         let row_max = self.alloc_buffer((batch as usize) * 4);
@@ -5115,14 +5121,14 @@ impl<'a> Compiler<'a> {
             n_per_elem: 1,
             n_per_row: 0,
             workgroup_size: WG,
-            rows_per_workgroup: 1,
+            rows_per_workgroup,
             gather_elem: Vec::new(),
             input_row_repeats: Vec::new(),
         };
         self.plan.dispatches.push(Dispatch {
             // Sentinel shader for runtime data-layout selection (UnaryData).
             shader: ShaderEntry::Relu,
-            workgroups: [batch, 1, 1],
+            workgroups: [batch.div_ceil(rows_per_workgroup), 1, 1],
             input_buffers: vec![input],
             output_buffer: row_max,
             extra_outputs: vec![],
@@ -5171,7 +5177,7 @@ impl<'a> Compiler<'a> {
             n_per_elem: 1,
             n_per_row: 1,
             workgroup_size: WG,
-            rows_per_workgroup: 1,
+            rows_per_workgroup,
             gather_elem: Vec::new(),
             input_row_repeats: Vec::new(),
         };
@@ -5181,7 +5187,7 @@ impl<'a> Compiler<'a> {
             // and the kernel's arity, so the shader field is purely a
             // historical leftover here.
             shader: ShaderEntry::Add,
-            workgroups: [batch, 1, 1],
+            workgroups: [batch.div_ceil(rows_per_workgroup), 1, 1],
             input_buffers: vec![input, row_max],
             output_buffer: out_buf,
             extra_outputs: vec![],
@@ -5858,7 +5864,7 @@ mod tests {
     #[test]
     fn test_compile_softmax() {
         let mut g = Graph::new();
-        let x = g.input("x", &[4, 10]);
+        let x = g.input("x", &[100, 10]);
         let sm = g.softmax(x);
         g.set_outputs(vec![sm]);
 
@@ -5867,9 +5873,13 @@ mod tests {
         // 2 Reduction dispatches (max + sum/normalize). With =false, it's
         // 1 Softmax dispatch. Check that it compiles and has the right
         // batch/features params.
-        assert!(!plan.dispatches.is_empty());
-        assert_eq!(plan.dispatches[0].params[0], 4); // batch/outer
+        assert_eq!(plan.dispatches.len(), 2);
+        assert_eq!(plan.dispatches[0].params[0], 100); // batch/outer
         assert_eq!(plan.dispatches[0].params[1], 10); // features/inner
+        for dispatch in &plan.dispatches {
+            assert_eq!(dispatch.workgroups, [7, 1, 1]);
+            assert_eq!(dispatch.reduction.as_ref().unwrap().rows_per_workgroup, 16);
+        }
     }
 
     #[test]

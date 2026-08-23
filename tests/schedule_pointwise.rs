@@ -439,49 +439,47 @@ fn ternary_fusion_add_of_mul() {
 /// the hand-written softmax.wgsl within f32 round-off.
 #[test]
 fn softmax_parity() {
-    let batch = 4usize;
-    let features = 64usize;
-    let n = batch * features;
-    // Non-uniform input so per-row max varies and exp(x - max) is
-    // exercised across the subtraction axis.
-    let input: Vec<f32> = (0..n)
-        .map(|i| ((i as f32) * 0.017 - 3.0).sin() * 2.0)
-        .collect();
+    for (batch, features) in [(4, 64), (513, 8), (259, 3), (257, 10)] {
+        let n = batch * features;
+        // Non-uniform input so per-row max varies and exp(x - max) is
+        // exercised across the subtraction axis.
+        let input: Vec<f32> = (0..n)
+            .map(|i| ((i as f32) * 0.017 - 3.0).sin() * 2.0)
+            .collect();
 
-    let run = |use_schedule: bool| -> Vec<f32> {
-        let mut g = Graph::new();
-        let x = g.input("x", &[batch, features]);
-        let y = g.softmax(x);
-        g.set_outputs(vec![y]);
-        let opts = CompileOptions {
-            use_schedule_reduction: use_schedule,
-            ..Default::default()
+        let run = |use_schedule: bool| -> Vec<f32> {
+            let mut g = Graph::new();
+            let x = g.input("x", &[batch, features]);
+            let y = g.softmax(x);
+            g.set_outputs(vec![y]);
+            let opts = CompileOptions {
+                use_schedule_reduction: use_schedule,
+                ..Default::default()
+            };
+            let mut s = inference(&g, opts);
+            s.set_input("x", &input);
+            s.step();
+            s.wait();
+            s.read_output(n)
         };
-        let mut s = inference(&g, opts);
-        s.set_input("x", &input);
-        s.step();
-        s.wait();
-        s.read_output(n)
-    };
 
-    let baseline = run(false);
-    let schedule = run(true);
+        let baseline = run(false);
+        let schedule = run(true);
 
-    assert_eq!(baseline.len(), schedule.len());
-    for (i, (a, b)) in baseline.iter().zip(schedule.iter()).enumerate() {
-        assert!(
-            (a - b).abs() <= a.abs().max(b.abs()) * 1e-5 + 1e-7,
-            "softmax parity mismatch at [{i}]: baseline={a}, schedule={b}",
-        );
-    }
-    for row in 0..batch {
-        let sum: f32 = schedule[row * features..(row + 1) * features].iter().sum();
-        assert!(
-            (sum - 1.0).abs() < 1e-5,
-            "softmax row {} doesn't sum to 1: got {}",
-            row,
-            sum
-        );
+        assert_eq!(baseline.len(), schedule.len());
+        for (i, (a, b)) in baseline.iter().zip(schedule.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= a.abs().max(b.abs()) * 1e-5 + 1e-7,
+                "softmax parity for [{batch}, {features}] at [{i}]: baseline={a}, schedule={b}",
+            );
+        }
+        for row in 0..batch {
+            let sum: f32 = schedule[row * features..(row + 1) * features].iter().sum();
+            assert!(
+                (sum - 1.0).abs() < 1e-5,
+                "softmax [{batch}, {features}] row {row} doesn't sum to 1: got {sum}",
+            );
+        }
     }
 }
 
