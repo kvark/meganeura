@@ -104,14 +104,18 @@ fn read_tensor_dat(path: &Path) -> Result<(Vec<usize>, Vec<f32>), NnefError> {
         (0, 32) => {
             // Float32
             tensor_data
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                 .collect()
         }
         (0, 16) => {
             // Float16 → f32
             tensor_data
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|b| half::f16::from_le_bytes([b[0], b[1]]).to_f32())
                 .collect()
         }

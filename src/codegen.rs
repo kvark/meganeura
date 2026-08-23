@@ -1641,9 +1641,7 @@ fn gen_matmul_coop_wgsl_full(
     };
 
     // Generate B staging blocks (shared_a0, shared_a1)
-    let b_stage_0;
-    let b_stage_1;
-    if vec4_b {
+    let (b_stage_0, b_stage_1) = if vec4_b {
         // Normal/AT: B[K,N], load vec4 along N (consecutive in memory).
         //
         // The fast vec4 packs the 4 lanes as four consecutive N-elements
@@ -1706,8 +1704,10 @@ fn gen_matmul_coop_wgsl_full(
                 t = tile,
             )
         };
-        b_stage_0 = gen_vec4_b("shared_a0", "tile_col");
-        b_stage_1 = gen_vec4_b("shared_a1", &format!("(tile_col + {}u)", tile));
+        (
+            gen_vec4_b("shared_a0", "tile_col"),
+            gen_vec4_b("shared_a1", &format!("(tile_col + {}u)", tile)),
+        )
     } else if vec4_b_transposed {
         // BT: B[N,K], load vec4 along K (consecutive in memory), write
         // transposed to shared.
@@ -1779,8 +1779,10 @@ fn gen_matmul_coop_wgsl_full(
                 col = col_offset,
             )
         };
-        b_stage_0 = gen_vec4_bt("shared_a0", "tile_col");
-        b_stage_1 = gen_vec4_bt("shared_a1", &format!("(tile_col + {}u)", tile));
+        (
+            gen_vec4_bt("shared_a0", "tile_col"),
+            gen_vec4_bt("shared_a1", &format!("(tile_col + {}u)", tile)),
+        )
     } else {
         // Scalar B staging (tile_size < 16 fallback)
         let (bi0, bi1) = match variant {
@@ -1808,14 +1810,14 @@ fn gen_matmul_coop_wgsl_full(
                 ic = in_col,
             )
         };
-        b_stage_0 = gen_scalar_b("shared_a0", "in_n", bi0);
-        b_stage_1 = gen_scalar_b("shared_a1", "in_n1", bi1);
-    }
+        (
+            gen_scalar_b("shared_a0", "in_n", bi0),
+            gen_scalar_b("shared_a1", "in_n1", bi1),
+        )
+    };
 
     // Generate A staging blocks (shared_b0, shared_b1)
-    let a_stage_0;
-    let a_stage_1;
-    if vec4_a {
+    let (a_stage_0, a_stage_1) = if vec4_a {
         // Normal/BT: A[M,K], load vec4 along K (consecutive in memory).
         //
         // The fast vec4 path packs 4 lanes as 4 consecutive K-elements for
@@ -1876,8 +1878,10 @@ fn gen_matmul_coop_wgsl_full(
                 t = tile,
             )
         };
-        a_stage_0 = gen_vec4_a("shared_b0", "tile_row");
-        a_stage_1 = gen_vec4_a("shared_b1", &format!("(tile_row + {}u)", tile));
+        (
+            gen_vec4_a("shared_b0", "tile_row"),
+            gen_vec4_a("shared_b1", &format!("(tile_row + {}u)", tile)),
+        )
     } else if vec4_a_transposed {
         // AT: A[K,M], load vec4 along M (consecutive in memory), write
         // transposed to shared. The packed vec4 load is valid only when M is
@@ -1939,8 +1943,10 @@ fn gen_matmul_coop_wgsl_full(
                 row = row_offset,
             )
         };
-        a_stage_0 = gen_vec4_at("shared_b0", "tile_row");
-        a_stage_1 = gen_vec4_at("shared_b1", &format!("(tile_row + {}u)", tile));
+        (
+            gen_vec4_at("shared_b0", "tile_row"),
+            gen_vec4_at("shared_b1", &format!("(tile_row + {}u)", tile)),
+        )
     } else {
         // Scalar A staging (prologue or tile_size < 16)
         let a_idx = match variant {
@@ -1972,9 +1978,11 @@ fn gen_matmul_coop_wgsl_full(
                 ai = a_idx,
             )
         };
-        a_stage_0 = gen_scalar_a("shared_b0", "tile_row");
-        a_stage_1 = gen_scalar_a("shared_b1", &format!("(tile_row + {}u)", tile));
-    }
+        (
+            gen_scalar_a("shared_b0", "tile_row"),
+            gen_scalar_a("shared_b1", &format!("(tile_row + {}u)", tile)),
+        )
+    };
 
     let (fused_decl, acc_init) = if fused_add {
         (
