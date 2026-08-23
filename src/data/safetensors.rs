@@ -205,7 +205,9 @@ impl SafeTensorsModel {
         let bytes = view.data();
         // safetensors stores data in little-endian, which matches x86/ARM
         let floats: Vec<f32> = bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect();
 
@@ -225,7 +227,9 @@ impl SafeTensorsModel {
             safetensors::Dtype::F32 => {
                 let bytes = view.data();
                 let floats: Vec<f32> = bytes
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
                     .collect();
                 Ok(floats)
@@ -236,7 +240,9 @@ impl SafeTensorsModel {
                 // shift (zero-fills the lower mantissa bits).
                 let bytes = view.data();
                 let floats: Vec<f32> = bytes
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|chunk| {
                         let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
                         f32::from_bits((bits as u32) << 16)

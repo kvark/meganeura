@@ -69,7 +69,9 @@ fn main() {
 
     let logits = inference.read_output(BATCH * CLASSES);
     let correct = logits
-        .chunks_exact(CLASSES)
+        .as_chunks::<CLASSES>()
+        .0
+        .iter()
         .enumerate()
         .filter(|&(sample, scores)| {
             let predicted = usize::from(scores[1] > scores[0]);
