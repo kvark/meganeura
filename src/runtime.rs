@@ -263,6 +263,10 @@ struct AdamParams {
     step: f32,
     wd: f32,
     grad_group_size: u32,
+    algorithm: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 // Grad-clip pre-pass: zero the 1-element scalar accumulator buffer.
@@ -304,6 +308,22 @@ struct GradClipScaleParams {
     max_norm: f32,
     _pad0: u32,
     _pad1: u32,
+}
+
+#[derive(blade_macros::ShaderData)]
+struct AdaptiveGradClipData {
+    param: blade_graphics::BufferPiece,
+    grad: blade_graphics::BufferPiece,
+    params: AdaptiveGradClipParams,
+}
+
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct AdaptiveGradClipParams {
+    len: u32,
+    clip: f32,
+    pmin: f32,
+    _pad0: u32,
 }
 
 // Temporal grad accumulation: acc[i] += grad[i] * scale.
@@ -1007,6 +1027,11 @@ impl Pipelines {
                 .entry(ShaderGroup::GradClipScale)
                 .or_default()
                 .insert(ShaderEntry::GradClipScale);
+            needed.insert(ShaderGroup::AdaptiveGradClip);
+            entries_for_group
+                .entry(ShaderGroup::AdaptiveGradClip)
+                .or_default()
+                .insert(ShaderEntry::AdaptiveGradClip);
             // Temporal grad accumulator pass, compiled unconditionally so
             // `set_grad_accumulate` works without a session rebuild.
             needed.insert(ShaderGroup::GradAccum);
@@ -1813,6 +1838,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::GradClipZero => GradClipZeroData::layout(),
         ShaderEntry::GradClipNormSq => GradClipNormSqData::layout(),
         ShaderEntry::GradClipScale => GradClipScaleData::layout(),
+        ShaderEntry::AdaptiveGradClip => AdaptiveGradClipData::layout(),
         ShaderEntry::GradAccum => GradAccumData::layout(),
     }
 }
@@ -2335,11 +2361,10 @@ pub struct Session {
     grad_accum_scale: Option<f32>,
     /// Adam step counter.
     adam_step: u32,
-    /// Active Adam parameters. When set, every `step()` appends Adam updates
-    /// to the same GPU submission. Persistent: stays in effect across
-    /// `step()` calls until overridden by another `set_adam` /
-    /// `set_learning_rate` call or cleared via `clear_optimizer()`.
-    pending_adam: Option<(f32, f32, f32, f32)>, // (lr, beta1, beta2, eps)
+    /// Active adaptive optimizer parameters. Adam and LaProp share the same
+    /// two moment buffers but differ in whether momentum is accumulated
+    /// before or after RMS normalization.
+    pending_adam: Option<(f32, f32, f32, f32, AdaptiveOptimizer)>,
     /// Decoupled weight-decay coefficient (AdamW). 0.0 = plain Adam.
     adam_wd: f32,
     /// Maximum L2 norm of the per-step concatenated gradient. When set,
@@ -2349,6 +2374,8 @@ pub struct Session {
     /// with bounded gradients. Persists across calls (set once at agent
     /// build, not per-step). `None` (default) is the unclipped fast path.
     pending_grad_clip: Option<f32>,
+    /// Per-parameter adaptive gradient clipping `(clip, minimum_param_norm)`.
+    pending_agc: Option<(f32, f32)>,
     /// Clip cadence: when grad clipping is enabled, only compute the clip
     /// every N `step()` calls. N=1 (default) clips every step (PyTorch
     /// semantics). N>1 amortizes the extra submit/readback cost — the
@@ -2372,6 +2399,13 @@ struct AdamGroupedGradNorm {
     group_size: u32,
     len: usize,
     buffer: blade_graphics::Buffer,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+enum AdaptiveOptimizer {
+    Adam = 0,
+    LaProp = 1,
 }
 
 /// Identifies a graph-facing slot that can be backed by an imported
@@ -2895,7 +2929,6 @@ impl Session {
         } else {
             None
         };
-
         if !optimizer_device_bufs.is_empty() {
             encoder.start();
             {
@@ -2953,6 +2986,7 @@ impl Session {
             written,
             pending_lr: None,
             pending_grad_clip: None,
+            pending_agc: None,
             grad_clip_every: 1,
             grad_clip_tick: 0,
             grad_clip_acc,
@@ -4961,15 +4995,10 @@ impl Session {
             self.encoder.start();
         }
 
-        // Gradient clipping (if requested) needs to happen between
-        // backward and optimizer. We split the submission: submit the
-        // forward+backward pass we just encoded, wait, do CPU readback
-        // + scale + upload of every gradient buffer, then start a new
-        // encoder for the optimizer pass. This costs one extra submit
-        // + wait per `step()` (~1-10ms typical) but bounds the
-        // per-step parameter update so Adam's variance estimate
-        // doesn't drive sparse-reward visual training to NaN.
-        let needs_clip = self.pending_grad_clip.is_some()
+        // Gradient clipping runs after backward and before the optimizer in
+        // the same GPU submission. Global clipping measures the concatenated
+        // gradient; AGC measures each parameter and its gradient separately.
+        let needs_clip = (self.pending_grad_clip.is_some() || self.pending_agc.is_some())
             && !self.plan.param_grad_pairs.is_empty()
             && (self.pending_lr.is_some() || self.pending_adam.is_some())
             && self.grad_clip_acc.is_some();
@@ -4980,40 +5009,107 @@ impl Session {
             self.grad_clip_tick.is_multiple_of(self.grad_clip_every)
         };
         if do_clip_now {
-            // GPU-side gradient clipping in three passes (all in the
-            // same submission as forward+backward and the optimizer):
-            //   1. GradClipZero — store 0 into the accumulator
-            //   2. GradClipNormSq — for each grad, add its sum-of-squares
-            //      to the accumulator, with barriers between dispatches
-            //   3. GradClipScale — for each grad, multiply in place by
-            //      min(1, max_norm / sqrt(acc))
-            // Barriers between passes keep the dispatches ordered.
-            let max_norm = self.pending_grad_clip.unwrap();
-            let acc_buf = self
-                .grad_clip_acc
-                .as_ref()
-                .expect("grad_clip_acc allocated when param_grad_pairs nonempty");
-
-            // Pass 1: zero accumulator.
-            {
-                let pipeline = self.pipelines.scalar(ShaderEntry::GradClipZero);
-                let mut pass = self.encoder.compute("grad_clip_zero");
-                let mut pc = pass.with(pipeline);
-                pc.bind(0, &GradClipZeroData { acc: acc_buf.at(0) });
-                pc.dispatch([1, 1, 1]);
-            }
-            // Pass 2: sum of squares per gradient buffer.
             let accumulating = self.grad_accum_scale.is_some();
-            {
-                let pipeline = self.pipelines.scalar(ShaderEntry::GradClipNormSq);
-                let mut pass = self.encoder.compute("grad_clip_norm_sq");
+            if let Some((clip, pmin)) = self.pending_agc {
+                let pipeline = self.pipelines.scalar(ShaderEntry::AdaptiveGradClip);
+                let mut pass = self.encoder.compute("adaptive_grad_clip");
                 for (idx, &(param_buf, grad_buf)) in self.plan.param_grad_pairs.iter().enumerate() {
                     let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
+                    let mut pc = pass.with(pipeline);
+                    pc.bind(
+                        0,
+                        &AdaptiveGradClipData {
+                            param: self.buffers[param_buf.0 as usize].at(0),
+                            grad: Self::grad_source(
+                                &self.buffers,
+                                &self.grad_accum_bufs,
+                                accumulating,
+                                idx,
+                                grad_buf,
+                            ),
+                            params: AdaptiveGradClipParams {
+                                len,
+                                clip,
+                                pmin,
+                                _pad0: 0,
+                            },
+                        },
+                    );
+                    pc.dispatch([1, 1, 1]);
+                }
+            } else {
+                // GPU-side gradient clipping in three passes (all in the
+                // same submission as forward+backward and the optimizer):
+                //   1. GradClipZero — store 0 into the accumulator
+                //   2. GradClipNormSq — for each grad, add its sum-of-squares
+                //      to the accumulator, with barriers between dispatches
+                //   3. GradClipScale — for each grad, multiply in place by
+                //      min(1, max_norm / sqrt(acc))
+                // Barriers between passes keep the dispatches ordered.
+                let max_norm = self.pending_grad_clip.unwrap();
+                let acc_buf = self
+                    .grad_clip_acc
+                    .as_ref()
+                    .expect("grad_clip_acc allocated when param_grad_pairs nonempty");
+
+                // Pass 1: zero accumulator.
+                {
+                    let pipeline = self.pipelines.scalar(ShaderEntry::GradClipZero);
+                    let mut pass = self.encoder.compute("grad_clip_zero");
+                    let mut pc = pass.with(pipeline);
+                    pc.bind(0, &GradClipZeroData { acc: acc_buf.at(0) });
+                    pc.dispatch([1, 1, 1]);
+                }
+                // Pass 2: sum of squares per gradient buffer.
+                {
+                    let pipeline = self.pipelines.scalar(ShaderEntry::GradClipNormSq);
+                    let mut pass = self.encoder.compute("grad_clip_norm_sq");
+                    for (idx, &(param_buf, grad_buf)) in
+                        self.plan.param_grad_pairs.iter().enumerate()
                     {
+                        let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
+                        {
+                            let mut pc = pass.with(pipeline);
+                            pc.bind(
+                                0,
+                                &GradClipNormSqData {
+                                    grad: Self::grad_source(
+                                        &self.buffers,
+                                        &self.grad_accum_bufs,
+                                        accumulating,
+                                        idx,
+                                        grad_buf,
+                                    ),
+                                    acc: acc_buf.at(0),
+                                    params: GradClipNormSqParams {
+                                        len,
+                                        _pad0: 0,
+                                        _pad1: 0,
+                                        _pad2: 0,
+                                    },
+                                },
+                            );
+                            // One workgroup of 256 threads strides over `len`
+                            // elements and adds its partial sum to `acc`.
+                            pc.dispatch([1, 1, 1]);
+                        }
+                        if idx + 1 < self.plan.param_grad_pairs.len() {
+                            pass.barrier();
+                        }
+                    }
+                }
+                // Pass 3: scale each gradient by min(1, max_norm/sqrt(acc)).
+                {
+                    let pipeline = self.pipelines.scalar(ShaderEntry::GradClipScale);
+                    let mut pass = self.encoder.compute("grad_clip_scale");
+                    for (idx, &(param_buf, grad_buf)) in
+                        self.plan.param_grad_pairs.iter().enumerate()
+                    {
+                        let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
                         let mut pc = pass.with(pipeline);
                         pc.bind(
                             0,
-                            &GradClipNormSqData {
+                            &GradClipScaleData {
                                 grad: Self::grad_source(
                                     &self.buffers,
                                     &self.grad_accum_bufs,
@@ -5022,50 +5118,16 @@ impl Session {
                                     grad_buf,
                                 ),
                                 acc: acc_buf.at(0),
-                                params: GradClipNormSqParams {
+                                params: GradClipScaleParams {
                                     len,
+                                    max_norm,
                                     _pad0: 0,
                                     _pad1: 0,
-                                    _pad2: 0,
                                 },
                             },
                         );
-                        // One workgroup of 256 threads strides over `len`
-                        // elements and adds its partial sum to `acc`.
-                        pc.dispatch([1, 1, 1]);
+                        pc.dispatch([len.div_ceil(256), 1, 1]);
                     }
-                    if idx + 1 < self.plan.param_grad_pairs.len() {
-                        pass.barrier();
-                    }
-                }
-            }
-            // Pass 3: scale each gradient by min(1, max_norm/sqrt(acc)).
-            {
-                let pipeline = self.pipelines.scalar(ShaderEntry::GradClipScale);
-                let mut pass = self.encoder.compute("grad_clip_scale");
-                for (idx, &(param_buf, grad_buf)) in self.plan.param_grad_pairs.iter().enumerate() {
-                    let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
-                    let mut pc = pass.with(pipeline);
-                    pc.bind(
-                        0,
-                        &GradClipScaleData {
-                            grad: Self::grad_source(
-                                &self.buffers,
-                                &self.grad_accum_bufs,
-                                accumulating,
-                                idx,
-                                grad_buf,
-                            ),
-                            acc: acc_buf.at(0),
-                            params: GradClipScaleParams {
-                                len,
-                                max_norm,
-                                _pad0: 0,
-                                _pad1: 0,
-                            },
-                        },
-                    );
-                    pc.dispatch([len.div_ceil(256), 1, 1]);
                 }
             }
         }
@@ -5113,7 +5175,7 @@ impl Session {
                     );
                     pc.dispatch([len.div_ceil(256), 1, 1]);
                 }
-            } else if let Some((lr, beta1, beta2, eps)) = self.pending_adam {
+            } else if let Some((lr, beta1, beta2, eps, algorithm)) = self.pending_adam {
                 self.adam_step += 1;
                 let wd = self.adam_wd;
                 let pipeline = self.pipelines.scalar(ShaderEntry::AdamUpdate);
@@ -5158,6 +5220,10 @@ impl Session {
                                 step: self.adam_step as f32,
                                 wd,
                                 grad_group_size,
+                                algorithm: algorithm as u32,
+                                _pad0: 0,
+                                _pad1: 0,
+                                _pad2: 0,
                             },
                         },
                     );
@@ -5927,6 +5993,7 @@ impl Session {
             ShaderEntry::GradClipZero
             | ShaderEntry::GradClipNormSq
             | ShaderEntry::GradClipScale
+            | ShaderEntry::AdaptiveGradClip
             | ShaderEntry::GradAccum => {
                 unreachable!(
                     "Grad-clip/accum shaders are dispatched directly from step(), \
@@ -6488,11 +6555,35 @@ impl Session {
     /// Persistent: stays on across `step()` calls until cleared.
     pub fn set_grad_clip_norm(&mut self, max_norm: f32) {
         self.pending_grad_clip = if max_norm > 0.0 { Some(max_norm) } else { None };
+        self.pending_agc = None;
+    }
+
+    /// Enable adaptive gradient clipping for every trainable parameter.
+    ///
+    /// Each gradient is scaled to at most
+    /// `clip * max(min_param_norm, ||parameter||)`. This matches the
+    /// per-parameter transformation used by DreamerV3.
+    pub fn set_adaptive_grad_clip(&mut self, clip: f32, min_param_norm: f32) {
+        assert!(
+            clip >= 0.0 && clip.is_finite(),
+            "AGC clip must be finite and non-negative"
+        );
+        assert!(
+            min_param_norm >= 0.0 && min_param_norm.is_finite(),
+            "AGC minimum parameter norm must be finite and non-negative"
+        );
+        self.pending_agc = if clip > 0.0 {
+            Some((clip, min_param_norm))
+        } else {
+            None
+        };
+        self.pending_grad_clip = None;
     }
 
     /// Disable gradient clipping for subsequent `step()` calls.
     pub fn disable_grad_clip(&mut self) {
         self.pending_grad_clip = None;
+        self.pending_agc = None;
     }
 
     /// Set clip cadence. `every=1` clips every step (PyTorch default).
@@ -6658,6 +6749,10 @@ impl Session {
                         step: self.adam_step as f32,
                         wd: self.adam_wd,
                         grad_group_size,
+                        algorithm: AdaptiveOptimizer::Adam as u32,
+                        _pad0: 0,
+                        _pad1: 0,
+                        _pad2: 0,
                     },
                 },
             );
@@ -6677,8 +6772,19 @@ impl Session {
     /// [`set_learning_rate`](Self::set_learning_rate), or stop optimizer
     /// updates via [`clear_optimizer`](Self::clear_optimizer).
     pub fn set_adam(&mut self, lr: f32, beta1: f32, beta2: f32, eps: f32) {
-        self.pending_adam = Some((lr, beta1, beta2, eps));
+        self.pending_adam = Some((lr, beta1, beta2, eps, AdaptiveOptimizer::Adam));
         // Switching optimizers: Adam wins, SGD stops applying.
+        self.pending_lr = None;
+    }
+
+    /// Configure LaProp updates to run after each `step()`.
+    ///
+    /// LaProp updates the RMS estimate from the clipped raw gradient,
+    /// normalizes that gradient, and only then accumulates momentum. This is
+    /// the optimizer ordering used by DreamerV3. Its two state tensors are
+    /// checkpoint-compatible with Adam's `m` and `v` buffers.
+    pub fn set_laprop(&mut self, lr: f32, beta1: f32, beta2: f32, eps: f32) {
+        self.pending_adam = Some((lr, beta1, beta2, eps, AdaptiveOptimizer::LaProp));
         self.pending_lr = None;
     }
 

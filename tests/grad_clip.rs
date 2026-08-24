@@ -137,3 +137,30 @@ fn grad_clip_every_skips_clip() {
         max_diff
     );
 }
+
+#[test]
+fn adaptive_grad_clip_uses_the_parameter_relative_bound() {
+    let mut graph = Graph::new();
+    let parameter = graph.parameter("parameter", &[2]);
+    let loss = graph.mean_all(parameter);
+    graph.set_outputs(vec![loss]);
+
+    let mut session = meganeura::build_session(&graph);
+    session.set_parameter("parameter", &[0.0, 0.0]);
+    session.set_adaptive_grad_clip(0.1, 1.0);
+    session.set_learning_rate(1.0);
+    session.step();
+    session.wait();
+
+    let mut updated = [0.0; 2];
+    session.read_param("parameter", &mut updated);
+    let update_norm = updated
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    assert!(
+        (update_norm - 0.1).abs() < 1.0e-5,
+        "AGC update norm was {update_norm}, expected the 0.1 relative bound"
+    );
+}

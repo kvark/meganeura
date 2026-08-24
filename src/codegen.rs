@@ -432,6 +432,7 @@ pub enum ShaderGroup {
     GradClipZero,
     GradClipNormSq,
     GradClipScale,
+    AdaptiveGradClip,
     GradAccum,
 }
 
@@ -563,6 +564,9 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::GradClipZero => parse_wgsl(include_str!("shaders/grad_clip_zero.wgsl")),
         ShaderGroup::GradClipNormSq => parse_wgsl(include_str!("shaders/grad_clip_norm_sq.wgsl")),
         ShaderGroup::GradClipScale => parse_wgsl(include_str!("shaders/grad_clip_scale.wgsl")),
+        ShaderGroup::AdaptiveGradClip => {
+            parse_wgsl(include_str!("shaders/adaptive_grad_clip.wgsl"))
+        }
         ShaderGroup::GradAccum => parse_wgsl(include_str!("shaders/grad_accum.wgsl")),
     }
 }
@@ -5156,6 +5160,10 @@ mod tests {
                 ShaderGroup::GradClipScale,
                 naga::valid::Capabilities::empty(),
             ),
+            (
+                ShaderGroup::AdaptiveGradClip,
+                naga::valid::Capabilities::empty(),
+            ),
             (ShaderGroup::GradAccum, naga::valid::Capabilities::empty()),
         ];
 
@@ -5469,6 +5477,7 @@ mod tests {
             (ShaderGroup::GradClipZero, empty),
             (ShaderGroup::GradClipNormSq, empty),
             (ShaderGroup::GradClipScale, empty),
+            (ShaderGroup::AdaptiveGradClip, empty),
             (ShaderGroup::GradAccum, empty),
         ];
 
@@ -5682,6 +5691,7 @@ mod tests {
                 ShaderEntry::GradClipZero => vec!["acc"],
                 ShaderEntry::GradClipNormSq => vec!["grad", "acc", "params"],
                 ShaderEntry::GradClipScale => vec!["grad", "acc", "params"],
+                ShaderEntry::AdaptiveGradClip => vec!["param", "grad", "params"],
                 ShaderEntry::GradAccum => vec!["grad", "acc", "params"],
             }
         }
@@ -5710,6 +5720,7 @@ mod tests {
             ShaderEntry::GradClipZero,
             ShaderEntry::GradClipNormSq,
             ShaderEntry::GradClipScale,
+            ShaderEntry::AdaptiveGradClip,
             ShaderEntry::GradAccum,
             ShaderEntry::SumAll,
             ShaderEntry::MeanAll,
