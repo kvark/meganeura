@@ -1,5 +1,9 @@
 # Unreleased
 
+- `Session::set_laprop` provides RMS-normalize-then-momentum updates, and
+  `Session::set_adaptive_grad_clip` applies a per-parameter relative norm
+  bound. Together they reproduce DreamerV3's optimizer chain on the GPU.
+
 - Compensated f16 cooperative matmul (C1): on devices that only expose
   f16 tiles, `requires_full_precision` work stages each operand as
   `hi = f16(x)` plus residual `lo` and accumulates `hi·hi + hi·lo +

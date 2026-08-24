@@ -252,6 +252,9 @@ pub enum ShaderEntry {
     /// where `norm = sqrt(acc[0])` from the accumulator
     /// produced by `GradClipNormSq`.
     GradClipScale,
+    /// Per-parameter adaptive gradient clipping. One workgroup measures the
+    /// parameter and gradient norms and scales the gradient in place.
+    AdaptiveGradClip,
     /// Temporal gradient accumulation: `acc[i] += grad[i] * scale`. Adds
     /// each step's fresh (overwritten) grad into a persistent accumulator
     /// so gradients sum across `step()` calls. Cleared by `zero_grad`.
@@ -332,6 +335,7 @@ impl ShaderEntry {
             | ShaderEntry::GradClipZero
             | ShaderEntry::GradClipNormSq
             | ShaderEntry::GradClipScale
+            | ShaderEntry::AdaptiveGradClip
             | ShaderEntry::GradAccum => "optimizer",
 
             ShaderEntry::ScatterAdd
@@ -464,6 +468,7 @@ impl ShaderEntry {
             ShaderEntry::GradClipZero => ShaderGroup::GradClipZero,
             ShaderEntry::GradClipNormSq => ShaderGroup::GradClipNormSq,
             ShaderEntry::GradClipScale => ShaderGroup::GradClipScale,
+            ShaderEntry::AdaptiveGradClip => ShaderGroup::AdaptiveGradClip,
             ShaderEntry::GradAccum => ShaderGroup::GradAccum,
         }
     }
@@ -563,6 +568,7 @@ impl ShaderEntry {
             ShaderEntry::GradClipZero
             | ShaderEntry::GradClipNormSq
             | ShaderEntry::GradClipScale
+            | ShaderEntry::AdaptiveGradClip
             | ShaderEntry::GradAccum => "main",
         }
     }

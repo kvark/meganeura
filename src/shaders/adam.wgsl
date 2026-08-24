@@ -7,6 +7,10 @@ struct Params {
     step: f32,
     wd: f32,
     grad_group_size: u32,
+    algorithm: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 var<storage, read_write> param: array<f32>;
@@ -36,20 +40,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         grouped_grad_norm[group] = grouped_grad_norm[group] + sqrt(sum_squared);
     }
 
-    // Update biased first moment
-    let m_new = params.beta1 * m[i] + (1.0 - params.beta1) * g;
     // Update biased second moment
     let v_new = params.beta2 * v[i] + (1.0 - params.beta2) * g * g;
-
-    m[i] = m_new;
     v[i] = v_new;
-
-    // Bias-corrected estimates
-    let m_hat = m_new / (1.0 - pow(params.beta1, params.step));
     let v_hat = v_new / (1.0 - pow(params.beta2, params.step));
+
+    // Adam accumulates momentum on raw gradients and normalizes the result.
+    // LaProp (algorithm=1) normalizes each gradient first and then accumulates
+    // momentum, matching DreamerV3's RMS -> momentum optimizer chain.
+    var moment_input = g;
+    if params.algorithm == 1u {
+        moment_input = g / (sqrt(v_hat) + params.eps);
+    }
+    let m_new = params.beta1 * m[i] + (1.0 - params.beta1) * moment_input;
+    m[i] = m_new;
+    let m_hat = m_new / (1.0 - pow(params.beta1, params.step));
+
+    var update = m_hat / (sqrt(v_hat) + params.eps);
+    if params.algorithm == 1u {
+        update = m_hat;
+    }
 
     // Update parameter. Decoupled weight decay (AdamW): the wd*param term is
     // applied directly to the weight, NOT routed through the Adam moments, so
     // it is independent of the gradient's adaptive scaling.
-    param[i] = param[i] - params.lr * (m_hat / (sqrt(v_hat) + params.eps) + params.wd * param[i]);
+    param[i] = param[i] - params.lr * (update + params.wd * param[i]);
 }
