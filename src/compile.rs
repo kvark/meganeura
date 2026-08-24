@@ -1094,12 +1094,13 @@ fn compile_with_caps_policy(
 /// Fuse the table-gradient chain produced by
 /// `sum_inner(embedding(indices, table) * factors)`:
 ///
-/// `BroadcastInner(row_grad) -> Mul(factors) -> ScatterAddAtomic`
+/// `BroadcastInner(group_grad) -> Mul(factors) -> ScatterAddAtomic`
 ///
-/// into one row-scaled atomic scatter. For narrow rows the fused shader maps
-/// one invocation to a complete source row; wider rows retain the scalar work
-/// mapping. The zeroing pass stays unchanged and the two large intermediate
-/// buffers disappear.
+/// into one group-scaled atomic scatter. A group may cover the complete source
+/// row or an equal-width subdivision of it. For narrow complete rows the fused
+/// shader maps one invocation to a source row; other cases retain the scalar
+/// work mapping. The zeroing pass stays unchanged and the two large
+/// intermediate buffers disappear.
 fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
     use crate::schedule::Pw;
     use std::collections::{HashMap, HashSet};
@@ -1195,8 +1196,12 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
                 continue;
             }
             let source_len = scatter.params[1].saturating_mul(scatter.params[2]);
+            let group_width = broadcast.params[1];
             if mul.params != [source_len, 0, 0, 0]
-                || broadcast.params != [source_len, scatter.params[2], 1, 0]
+                || broadcast.params != [source_len, group_width, 1, 0]
+                || group_width == 0
+                || group_width > scatter.params[2]
+                || !scatter.params[2].is_multiple_of(group_width)
                 || scatter.workgroups != [source_len.div_ceil(256), 1, 1]
             {
                 continue;
@@ -1209,6 +1214,7 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
                 indices,
                 factors,
                 broadcast.input_buffers[0],
+                group_width,
             ));
             break;
         }
@@ -1221,6 +1227,7 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
             indices,
             factors,
             row_scale,
+            group_width,
         )) = candidate
         else {
             break;
@@ -1230,8 +1237,15 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
         let total = plan.dispatches[scatter_index].params[0];
         let scatter = &mut plan.dispatches[scatter_index];
         scatter.input_buffers = vec![indices, factors, row_scale, output];
-        let small_row = scatter.params[2] <= 16;
-        scatter.params[3] = if small_row { 2 } else { 1 };
+        let complete_row = group_width == scatter.params[2];
+        let small_row = complete_row && group_width <= 16;
+        scatter.params[3] = if small_row {
+            2
+        } else if complete_row {
+            1
+        } else {
+            group_width + 2
+        };
         if small_row {
             scatter.workgroups = [scatter.params[1].div_ceil(256), 1, 1];
         }
@@ -5859,6 +5873,48 @@ mod tests {
             .expect("gathered row reduction should fuse its table gradient");
         assert_eq!(fused.params[3], 1);
         assert_eq!(fused.workgroups, [(SEQ * INNER).div_ceil(256) as u32, 1, 1]);
+    }
+
+    #[test]
+    fn grouped_gather_reduction_fuses_group_scaled_atomic_scatter() {
+        const SEQ: usize = 256;
+        const VOCAB: usize = 4097;
+        const INNER: usize = 64;
+        const GROUP: usize = 8;
+
+        let mut graph = Graph::new();
+        let indices = graph.input_u32("indices", &[SEQ]);
+        let table = graph.parameter("table", &[VOCAB, INNER]);
+        let factors = graph.input("factors", &[SEQ * INNER / GROUP, GROUP]);
+        let gathered = graph.embedding(indices, table);
+        let groups = graph.reshape(gathered, &[SEQ * INNER / GROUP, GROUP]);
+        let terms = graph.mul(groups, factors);
+        let rows = graph.sum_inner(terms);
+        let group_scale = graph.input("group_scale", &[SEQ * INNER / GROUP, 1]);
+        let weighted = graph.mul(rows, group_scale);
+        let loss = graph.sum_all(weighted);
+        graph.set_outputs(vec![loss]);
+
+        let (plan, _) = crate::train::compile_training_graph(&graph);
+        let fused = plan
+            .dispatches
+            .iter()
+            .find(|dispatch| dispatch.is_row_scaled_atomic_scatter())
+            .expect("grouped gather reduction should fuse its table gradient");
+        assert_eq!(
+            fused.params,
+            [
+                VOCAB as u32 * INNER as u32,
+                SEQ as u32,
+                INNER as u32,
+                GROUP as u32 + 2,
+            ]
+        );
+        assert_eq!(fused.workgroups, [(SEQ * INNER).div_ceil(256) as u32, 1, 1]);
+        assert!(!plan.dispatches.iter().any(|dispatch| {
+            dispatch.is_inner_broadcast()
+                && dispatch.params == [(SEQ * INNER) as u32, GROUP as u32, 1, 0]
+        }));
     }
 
     #[test]

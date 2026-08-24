@@ -1011,3 +1011,76 @@ fn gathered_reduction_table_gradient_matches_row_scale_bit_exactly() {
         );
     }
 }
+
+#[test]
+fn grouped_gather_reduction_table_gradient_matches_cpu() {
+    const ROWS: usize = 256;
+    const COLS: usize = 64;
+    const GROUP: usize = 8;
+    const VOCAB: usize = 4097;
+
+    let mut graph = Graph::new();
+    let indices = graph.input_u32("indices", &[ROWS]);
+    let table = graph.parameter("table", &[VOCAB, COLS]);
+    let factors = graph.input("factors", &[ROWS * COLS / GROUP, GROUP]);
+    let gathered = graph.embedding(indices, table);
+    let groups = graph.reshape(gathered, &[ROWS * COLS / GROUP, GROUP]);
+    let terms = graph.mul(groups, factors);
+    let reduced = graph.sum_inner(terms);
+    let group_scale = graph.input("group_scale", &[ROWS * COLS / GROUP, 1]);
+    let weighted = graph.mul(reduced, group_scale);
+    let loss = graph.sum_all(weighted);
+    graph.set_outputs(vec![loss]);
+
+    let indices_data = (0..ROWS)
+        .map(|row| ((row * 17) % 31) as u32)
+        .collect::<Vec<_>>();
+    let factors_data = (0..ROWS * COLS)
+        .map(|index| {
+            let magnitude = (index * 5 % 8 + 1) as f32 * 0.125;
+            if index & 8 == 0 {
+                magnitude
+            } else {
+                -magnitude
+            }
+        })
+        .collect::<Vec<_>>();
+    let group_scale_data = (0..ROWS * COLS / GROUP)
+        .map(|group| {
+            let magnitude = (group * 7 % 4 + 1) as f32 * 0.25;
+            if group & 4 == 0 {
+                magnitude
+            } else {
+                -magnitude
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut session = meganeura::build_session(&graph);
+    session.set_parameter("table", &vec![0.0; VOCAB * COLS]);
+    session.set_input_u32("indices", &indices_data);
+    session.set_input("factors", &factors_data);
+    session.set_input("group_scale", &group_scale_data);
+    session.set_learning_rate(0.0);
+    session.step();
+    session.wait();
+
+    let mut actual = vec![0.0; VOCAB * COLS];
+    session.read_param_grad("table", &mut actual);
+    let mut expected = vec![0.0; VOCAB * COLS];
+    for (row, &output_row) in indices_data.iter().enumerate() {
+        let output_row = output_row as usize;
+        for column in 0..COLS {
+            let source_index = row * COLS + column;
+            expected[output_row * COLS + column] +=
+                group_scale_data[source_index / GROUP] * factors_data[source_index];
+        }
+    }
+    for (index, (&actual, &expected)) in actual.iter().zip(expected.iter()).enumerate() {
+        assert_eq!(
+            actual.to_bits(),
+            expected.to_bits(),
+            "table gradient mismatch at flat index {index}: {actual} != {expected}"
+        );
+    }
+}

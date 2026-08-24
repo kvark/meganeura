@@ -13,8 +13,9 @@ var<uniform> params: Params;
 
 // Blade enables Vulkan memory-model device scope when cooperative matrices
 // require the Vulkan memory model, so storage CAS is valid on that path.
-// `_pad == 2` maps one invocation to each narrow source row; wider rows map
-// one invocation to each source element.
+// `_pad == 2` maps one invocation to each narrow source row. `_pad > 2`
+// encodes a scale-group width as `_pad - 2`; other modes map one invocation
+// to each source element.
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if params._pad == 2u {
@@ -54,6 +55,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var value = src[source_index];
     if params._pad == 1u {
         value *= row_scale[source_row];
+    } else if params._pad > 2u {
+        value *= row_scale[source_index / (params._pad - 2u)];
     }
     if value == 0.0 { return; }
 
