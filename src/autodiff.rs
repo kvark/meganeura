@@ -1224,7 +1224,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
             } else {
                 // Dead or explicitly frozen parameter — use a scalar-zero
                 // sentinel so positions remain aligned. The compiler omits
-                // shape-mismatched sentinels from `param_grad_pairs`.
+                // these sentinel nodes from `param_grad_pairs`.
                 let zero = graph.scalar(0.0);
                 grad_outputs.push(zero);
             }
