@@ -694,6 +694,41 @@ fn sum_inner_of_gather_times_basis_parity() {
     );
 }
 
+/// A reshape may split each gathered table row into independent contiguous
+/// reduction groups. The fused path must index the source row and group
+/// exactly like the materialized embedding.
+#[test]
+fn sum_inner_of_grouped_gather_times_weights_parity() {
+    let vocab = 5usize;
+    let m = 7usize;
+    let groups = 8usize;
+    let n = 8usize;
+    assert_parity(
+        |g| {
+            let idx = g.input_u32("idx", &[m]);
+            let table = g.input("table", &[vocab, groups * n]);
+            let weights = g.input("weights", &[m * groups, n]);
+            let gathered = g.embedding(idx, table);
+            let gathered = g.reshape(gathered, &[m * groups, n]);
+            let terms = g.mul(gathered, weights);
+            let y = g.sum_inner(terms);
+            let table_data: Vec<f32> = (0..vocab * groups * n)
+                .map(|i| (i as f32) * 0.021 - 1.3)
+                .collect();
+            let weight_data: Vec<f32> = (0..m * groups * n)
+                .map(|i| (i as f32) * -0.013 + 0.7)
+                .collect();
+            let idx_data: Vec<u32> = (0..m).map(|i| (i * 3 % vocab) as u32).collect();
+            (
+                y,
+                vec![("table", table_data), ("weights", weight_data)],
+                vec![("idx", idx_data)],
+            )
+        },
+        m * groups,
+    );
+}
+
 /// White-box: the two-gather graph must actually COLLAPSE — one reduction
 /// dispatch with two gather streams, and zero Embedding / standalone-mul
 /// dispatches left. Guards against the parity tests passing on a silent

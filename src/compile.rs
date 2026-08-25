@@ -1545,10 +1545,11 @@ fn shared_embedding_consumers_are_foldable(
 ///   Phase 2 (gather → prologue): a per-element input produced by an
 ///   `Embedding` (indexed load) is marked a gather stream —
 ///   `gather_elem[s] = true`, and the stream's buffer is replaced by the
-///   table with the indices buffer spliced in right after. Shared embeddings
-///   are folded only when all consumers are compatible reductions. This is
-///   valid because the gathered axis is the reduced (inner) axis: `embedding`
-///   params `[seq, hidden] = [outer, inner]`.
+///   table with the indices buffer spliced in right after. A reshape may split
+///   each gathered row into equal contiguous reduction groups; that group
+///   factor is carried by the generated reduction instead of materializing
+///   the complete gathered row. Shared embeddings are folded only when all
+///   consumers are compatible reductions.
 ///
 /// Together these let `sum_inner(mul(embedding(idx,tbl), x))` collapse to
 /// one fused reduction kernel — the SH colour path — discovered from
@@ -1672,6 +1673,7 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                 }
                 kernel.n_per_elem = new_n_per_elem as u8;
                 kernel.gather_elem = Vec::new();
+                kernel.input_row_repeats = Vec::new();
                 // Rebuild input_buffers: producer inputs first (matching
                 // fuse_input's ordering), then consumer's others.
                 let mut new_inputs = producer_d.input_buffers.clone();
@@ -1705,7 +1707,11 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
             let Some(kernel) = c.reduction.as_ref() else {
                 continue;
             };
-            if kernel.input_row_repeats.iter().any(|&factor| factor != 1) {
+            let has_direct_row_repeats = (0..kernel.n_per_elem as usize).any(|stream| {
+                !kernel.gather_elem.get(stream).copied().unwrap_or(false)
+                    && kernel.input_row_repeats.get(stream).copied().unwrap_or(1) != 1
+            });
+            if has_direct_row_repeats {
                 continue;
             }
             let outer = c.params[0];
@@ -1740,18 +1746,33 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                     continue;
                 }
                 let p = &plan.dispatches[pi];
-                // Plain Embedding dispatch: indexed load, gathered axis ==
-                // reduced axis (params [seq, hidden] = [outer, inner]).
+                // Plain Embedding dispatch: indexed load whose gathered row
+                // is either the reduction row or an integer number of
+                // contiguous reduction-width groups.
                 let is_embedding = p.shader == ShaderEntry::Embedding
                     && p.reduction.is_none()
                     && p.pointwise.is_none()
-                    && p.params.first().copied() == Some(outer)
-                    && p.params.get(1).copied() == Some(inner)
                     && p.input_buffers.len() == 2;
                 if !is_embedding {
                     continue;
                 }
+                let embedding_outer = p.params[0];
+                let embedding_inner = p.params[1];
+                let Some(group_factor) = outer
+                    .checked_div(embedding_outer)
+                    .filter(|&factor| factor > 0)
+                else {
+                    continue;
+                };
+                if embedding_outer.saturating_mul(group_factor) != outer
+                    || inner.saturating_mul(group_factor) != embedding_inner
+                {
+                    continue;
+                }
                 let read_count = reads.get(&buf).copied().unwrap_or(0);
+                if read_count > 1 && group_factor != 1 {
+                    continue;
+                }
                 if read_count > 1
                     && !shared_embedding_consumers_are_foldable(plan, buf, outer, inner, read_count)
                 {
@@ -1766,7 +1787,11 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                 if kernel.gather_elem.is_empty() {
                     kernel.gather_elem = vec![false; per_elem];
                 }
+                if kernel.input_row_repeats.is_empty() {
+                    kernel.input_row_repeats = vec![1; per_elem];
+                }
                 kernel.gather_elem[s] = true;
+                kernel.input_row_repeats[s] = group_factor;
                 // Replace stream s's buffer (the embedding output) with the
                 // table, and splice the indices buffer right after it.
                 c.input_buffers[flat_pos] = table_buf;
@@ -5687,6 +5712,35 @@ mod tests {
         assert_eq!(non_unit_plan.dispatches.len(), 1);
         assert_eq!(non_unit_plan.dispatches[0].shader, ShaderEntry::MatMul);
         assert!(non_unit_plan.dispatches[0].reduction.is_none());
+    }
+
+    #[test]
+    fn grouped_gather_reduction_elides_the_full_row_embedding() {
+        const SEQ: usize = 32;
+        const VOCAB: usize = 17;
+        const GROUPS: usize = 8;
+        const INNER: usize = 8;
+
+        let mut graph = Graph::new();
+        let indices = graph.input_u32("indices", &[SEQ]);
+        let table = graph.input("table", &[VOCAB, GROUPS * INNER]);
+        let factors = graph.input("factors", &[SEQ * GROUPS, INNER]);
+        let gathered = graph.embedding(indices, table);
+        let gathered = graph.reshape(gathered, &[SEQ * GROUPS, INNER]);
+        let terms = graph.mul(gathered, factors);
+        let output = graph.sum_inner(terms);
+        graph.set_outputs(vec![output]);
+
+        let plan = compile(&graph);
+        assert_eq!(plan.dispatches.len(), 1);
+        let reduction = &plan.dispatches[0];
+        assert!(reduction.reduction.is_some());
+        assert_eq!(reduction.params[..2], [(SEQ * GROUPS) as u32, INNER as u32]);
+        assert_eq!(reduction.input_buffers.len(), 3);
+        let kernel = reduction.reduction.as_ref().unwrap();
+        assert_eq!(kernel.n_per_elem, 2);
+        assert_eq!(kernel.gather_elem, vec![true, false]);
+        assert_eq!(kernel.input_row_repeats, vec![GROUPS as u32, 1]);
     }
 
     #[test]
