@@ -116,6 +116,11 @@ pub fn plan_buffer_aliasing(
     let mut sizes = Vec::new();
     let mut device_local = Vec::new();
     let device_ok = device_local_eligible(plan);
+    let unused: Vec<bool> = uses
+        .iter()
+        .enumerate()
+        .map(|(i, usage)| !pinned[i] && usage.last_use.is_none())
+        .collect();
     for i in 0..n {
         if pinned[i] {
             map[i] = sizes.len();
@@ -123,9 +128,19 @@ pub fn plan_buffer_aliasing(
             device_local.push(device_ok[i]);
         }
     }
+    if unused.iter().any(|&is_unused| is_unused) {
+        let physical = sizes.len();
+        sizes.push(4);
+        device_local.push(false);
+        for (i, &is_unused) in unused.iter().enumerate() {
+            if is_unused {
+                map[i] = physical;
+            }
+        }
+    }
 
     // Greedy best-fit over live intervals [first_write, last_use].
-    let mut order: Vec<usize> = (0..n).filter(|&i| !pinned[i]).collect();
+    let mut order: Vec<usize> = (0..n).filter(|&i| !pinned[i] && !unused[i]).collect();
     order.sort_by_key(|&i| {
         (
             uses[i].first_write.unwrap(),
@@ -335,9 +350,10 @@ fn compute_pinned(
             (Some(r), Some(w)) => r <= w,
             (Some(_), None) => true,
             // Written but never read is fine (e.g. unused LSE in
-            // inference); untouched buffers stay dedicated.
+            // inference). Untouched compiler artifacts share a tiny dummy
+            // allocation; persistent/user-visible roles were pinned above.
             (None, Some(_)) => false,
-            (None, None) => true,
+            (None, None) => false,
         };
         if live_in {
             pinned[i] = true;
@@ -510,6 +526,24 @@ mod tests {
         // Buffer 2 dies at group 2 and nothing later could reuse buffer 1's
         // slot anyway; the property under test: 1 keeps a dedicated slot.
         assert!(alias.map.iter().filter(|&&m| m == alias.map[1]).count() == 1);
+    }
+
+    #[test]
+    fn fused_away_buffers_share_a_tiny_allocation() {
+        let mut p = plan(
+            vec![16, 64 * 1024 * 1024, 32 * 1024 * 1024, 16],
+            vec![dispatch(&[0], 3)],
+        );
+        p.input_buffers.push(("x".into(), BufferRef(0)));
+        p.output_buffers.push(BufferRef(3));
+        let groups = std::iter::once(0..1).collect::<Vec<_>>();
+        let alias = plan_buffer_aliasing(&p, &groups, None);
+
+        assert_eq!(alias.map[1], alias.map[2]);
+        assert_eq!(alias.sizes[alias.map[1]], 4);
+        assert_ne!(alias.map[0], alias.map[1]);
+        assert_ne!(alias.map[3], alias.map[1]);
+        assert_eq!(alias.physical_bytes(), 36);
     }
 
     #[test]
