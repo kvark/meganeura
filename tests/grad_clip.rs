@@ -164,3 +164,31 @@ fn adaptive_grad_clip_uses_the_parameter_relative_bound() {
         "AGC update norm was {update_norm}, expected the 0.1 relative bound"
     );
 }
+
+#[test]
+fn optax_adaptive_grad_clip_uses_output_units() {
+    let mut graph = Graph::new();
+    let parameter = graph.parameter("parameter", &[2, 2]);
+    let loss = graph.mean_all(parameter);
+    graph.set_outputs(vec![loss]);
+
+    let mut session = meganeura::build_session(&graph);
+    // Column zero has norm 5 and should remain unclipped. Column one has norm
+    // zero and should be clipped against the pmin-derived bound of 0.1.
+    session.set_parameter("parameter", &[3.0, 0.0, 4.0, 0.0]);
+    session.set_optax_adaptive_grad_clip(0.1, 1.0);
+    session.set_learning_rate(1.0);
+    session.step();
+    session.wait();
+
+    let mut updated = [0.0; 4];
+    session.read_param("parameter", &mut updated);
+    let clipped_element = 0.1 / 2.0_f32.sqrt();
+    let expected = [2.75, -clipped_element, 3.75, -clipped_element];
+    for (actual, expected) in updated.into_iter().zip(expected) {
+        assert!(
+            (actual - expected).abs() < 1.0e-5,
+            "unit-wise AGC produced {actual}, expected {expected}"
+        );
+    }
+}

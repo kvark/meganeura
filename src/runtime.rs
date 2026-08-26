@@ -321,9 +321,13 @@ struct AdaptiveGradClipData {
 #[repr(C)]
 struct AdaptiveGradClipParams {
     len: u32,
+    unit_count: u32,
+    reduction_count: u32,
+    workgroups_x: u32,
     clip: f32,
     pmin: f32,
-    _pad0: u32,
+    optax_semantics: u32,
+    _pad1: u32,
 }
 
 // Temporal grad accumulation: acc[i] += grad[i] * scale.
@@ -2374,8 +2378,8 @@ pub struct Session {
     /// with bounded gradients. Persists across calls (set once at agent
     /// build, not per-step). `None` (default) is the unclipped fast path.
     pending_grad_clip: Option<f32>,
-    /// Per-parameter adaptive gradient clipping `(clip, minimum_param_norm)`.
-    pending_agc: Option<(f32, f32)>,
+    /// Adaptive gradient clipping `(clip, minimum_param_norm, norm axes)`.
+    pending_agc: Option<(f32, f32, AdaptiveGradClipMode)>,
     /// Clip cadence: when grad clipping is enabled, only compute the clip
     /// every N `step()` calls. N=1 (default) clips every step (PyTorch
     /// semantics). N>1 amortizes the extra submit/readback cost — the
@@ -2406,6 +2410,33 @@ struct AdamGroupedGradNorm {
 enum AdaptiveOptimizer {
     Adam = 0,
     LaProp = 1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AdaptiveGradClipMode {
+    /// One norm for the complete parameter leaf. This preserves the original
+    /// Meganeura API semantics.
+    Leafwise,
+    /// Optax `adaptive_grad_clip`: one norm per output unit, with its exact
+    /// rank-dependent axis convention.
+    OptaxUnitwise,
+}
+
+fn optax_agc_partition(shape: &[usize]) -> Option<(usize, usize)> {
+    let squeezed_rank = shape.iter().filter(|&&extent| extent != 1).count();
+    let elements = shape.iter().product::<usize>().max(1);
+    if squeezed_rank <= 1 {
+        return Some((1, elements));
+    }
+
+    match shape.len() {
+        // Optax reduces axis 0 for both ordinary and rank-3 multi-head linear
+        // parameters, leaving every trailing coordinate as an output unit.
+        2 | 3 => Some((shape[1..].iter().product(), shape[0])),
+        // HWIO convolution kernels reduce H, W, and I for each output channel.
+        4 => Some((shape[3], shape[..3].iter().product())),
+        _ => None,
+    }
 }
 
 /// Identifies a graph-facing slot that can be backed by an imported
@@ -4997,7 +5028,7 @@ impl Session {
 
         // Gradient clipping runs after backward and before the optimizer in
         // the same GPU submission. Global clipping measures the concatenated
-        // gradient; AGC measures each parameter and its gradient separately.
+        // gradient; AGC measures either complete leaves or Optax output units.
         let needs_clip = (self.pending_grad_clip.is_some() || self.pending_agc.is_some())
             && !self.plan.param_grad_pairs.is_empty()
             && (self.pending_lr.is_some() || self.pending_adam.is_some())
@@ -5010,11 +5041,56 @@ impl Session {
         };
         if do_clip_now {
             let accumulating = self.grad_accum_scale.is_some();
-            if let Some((clip, pmin)) = self.pending_agc {
+            if let Some((clip, pmin, mode)) = self.pending_agc {
+                let geometry = self
+                    .plan
+                    .param_grad_pairs
+                    .iter()
+                    .map(|&(param_buf, _)| {
+                        let len = self.plan.buffers[param_buf.0 as usize] / 4;
+                        let (unit_count, reduction_count) = match mode {
+                            AdaptiveGradClipMode::Leafwise => (1, len),
+                            AdaptiveGradClipMode::OptaxUnitwise => {
+                                let shape = self
+                                    .plan
+                                    .param_shapes
+                                    .iter()
+                                    .find(|entry| entry.0 == param_buf)
+                                    .map(|entry| entry.1.as_slice())
+                                    .expect("trainable parameter shape is recorded");
+                                optax_agc_partition(shape).unwrap_or_else(|| {
+                                    panic!(
+                                        "Optax AGC expects a squeezed vector or rank 2, 3, or 4 parameter, got {shape:?}"
+                                    )
+                                })
+                            }
+                        };
+                        assert_eq!(
+                            unit_count * reduction_count,
+                            len,
+                            "AGC unit partition must cover the parameter"
+                        );
+                        let unit_count = u32::try_from(unit_count)
+                            .expect("AGC unit count exceeds u32");
+                        let reduction_count = u32::try_from(reduction_count)
+                            .expect("AGC reduction count exceeds u32");
+                        let len = u32::try_from(len).expect("AGC parameter length exceeds u32");
+                        let workgroups_x = unit_count.min(65_535);
+                        let workgroups_y = unit_count.div_ceil(workgroups_x);
+                        (
+                            len,
+                            unit_count,
+                            reduction_count,
+                            workgroups_x,
+                            workgroups_y,
+                        )
+                    })
+                    .collect::<Vec<_>>();
                 let pipeline = self.pipelines.scalar(ShaderEntry::AdaptiveGradClip);
                 let mut pass = self.encoder.compute("adaptive_grad_clip");
                 for (idx, &(param_buf, grad_buf)) in self.plan.param_grad_pairs.iter().enumerate() {
-                    let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
+                    let (len, unit_count, reduction_count, workgroups_x, workgroups_y) =
+                        geometry[idx];
                     let mut pc = pass.with(pipeline);
                     pc.bind(
                         0,
@@ -5029,13 +5105,19 @@ impl Session {
                             ),
                             params: AdaptiveGradClipParams {
                                 len,
+                                unit_count,
+                                reduction_count,
+                                workgroups_x,
                                 clip,
                                 pmin,
-                                _pad0: 0,
+                                optax_semantics: u32::from(
+                                    mode == AdaptiveGradClipMode::OptaxUnitwise,
+                                ),
+                                _pad1: 0,
                             },
                         },
                     );
-                    pc.dispatch([1, 1, 1]);
+                    pc.dispatch([workgroups_x, workgroups_y, 1]);
                 }
             } else {
                 // GPU-side gradient clipping in three passes (all in the
@@ -6558,11 +6640,13 @@ impl Session {
         self.pending_agc = None;
     }
 
-    /// Enable adaptive gradient clipping for every trainable parameter.
+    /// Enable leaf-wise adaptive gradient clipping for every trainable parameter.
     ///
-    /// Each gradient is scaled to at most
+    /// Each complete parameter-leaf gradient is scaled to at most
     /// `clip * max(min_param_norm, ||parameter||)`. This matches the
-    /// per-parameter transformation used by DreamerV3.
+    /// historical Meganeura behavior. Use
+    /// [`Self::set_optax_adaptive_grad_clip`] for Optax and DreamerV3's
+    /// rank-dependent output-unit semantics.
     pub fn set_adaptive_grad_clip(&mut self, clip: f32, min_param_norm: f32) {
         assert!(
             clip >= 0.0 && clip.is_finite(),
@@ -6573,7 +6657,44 @@ impl Session {
             "AGC minimum parameter norm must be finite and non-negative"
         );
         self.pending_agc = if clip > 0.0 {
-            Some((clip, min_param_norm))
+            Some((clip, min_param_norm, AdaptiveGradClipMode::Leafwise))
+        } else {
+            None
+        };
+        self.pending_grad_clip = None;
+    }
+
+    /// Enable Optax-compatible unit-wise adaptive gradient clipping.
+    ///
+    /// This reproduces `optax.adaptive_grad_clip`: squeezed scalars and
+    /// vectors use one norm; rank-2 and rank-3 linear parameters reduce axis
+    /// zero; rank-4 HWIO kernels reduce axes zero through two. Each remaining
+    /// output unit is clipped independently to
+    /// `clip * max(min_param_norm, ||parameter unit||)`.
+    pub fn set_optax_adaptive_grad_clip(&mut self, clip: f32, min_param_norm: f32) {
+        assert!(
+            clip >= 0.0 && clip.is_finite(),
+            "AGC clip must be finite and non-negative"
+        );
+        assert!(
+            min_param_norm >= 0.0 && min_param_norm.is_finite(),
+            "AGC minimum parameter norm must be finite and non-negative"
+        );
+        for &(param_buf, _) in &self.plan.param_grad_pairs {
+            let shape = self
+                .plan
+                .param_shapes
+                .iter()
+                .find(|entry| entry.0 == param_buf)
+                .map(|entry| entry.1.as_slice())
+                .expect("trainable parameter shape is recorded");
+            assert!(
+                optax_agc_partition(shape).is_some(),
+                "Optax AGC expects a squeezed vector or rank 2, 3, or 4 parameter, got {shape:?}"
+            );
+        }
+        self.pending_agc = if clip > 0.0 {
+            Some((clip, min_param_norm, AdaptiveGradClipMode::OptaxUnitwise))
         } else {
             None
         };
@@ -7352,5 +7473,23 @@ impl Drop for Session {
         for &buffer in &self.grad_accum_bufs {
             self.gpu.destroy_buffer(buffer);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::optax_agc_partition;
+
+    #[test]
+    fn optax_agc_axes_match_rank_conventions() {
+        assert_eq!(optax_agc_partition(&[]), Some((1, 1)));
+        assert_eq!(optax_agc_partition(&[7]), Some((1, 7)));
+        assert_eq!(optax_agc_partition(&[5, 3]), Some((3, 5)));
+        assert_eq!(optax_agc_partition(&[8, 5, 3]), Some((15, 8)));
+        assert_eq!(optax_agc_partition(&[3, 3, 2, 7]), Some((7, 18)));
+        // Optax checks squeezed rank before the original tensor rank.
+        assert_eq!(optax_agc_partition(&[1, 7]), Some((1, 7)));
+        assert_eq!(optax_agc_partition(&[1, 7, 1]), Some((1, 7)));
+        assert_eq!(optax_agc_partition(&[2, 2, 2, 2, 2]), None);
     }
 }

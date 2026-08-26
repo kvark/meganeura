@@ -252,8 +252,8 @@ pub enum ShaderEntry {
     /// where `norm = sqrt(acc[0])` from the accumulator
     /// produced by `GradClipNormSq`.
     GradClipScale,
-    /// Per-parameter adaptive gradient clipping. One workgroup measures the
-    /// parameter and gradient norms and scales the gradient in place.
+    /// Adaptive gradient clipping. One workgroup measures each configured
+    /// parameter unit and scales its gradient in place.
     AdaptiveGradClip,
     /// Temporal gradient accumulation: `acc[i] += grad[i] * scale`. Adds
     /// each step's fresh (overwritten) grad into a persistent accumulator
@@ -922,6 +922,11 @@ pub struct ExecutionPlan {
     pub buffers: Vec<usize>,
     /// Which buffers hold parameters (need initialization).
     pub param_buffers: Vec<(String, BufferRef)>,
+    /// Original tensor shape for each parameter buffer. Optimizer transforms
+    /// such as Optax-compatible unit-wise AGC need the logical axes after the
+    /// graph has been lowered to flat GPU buffers.
+    #[serde(default)]
+    pub param_shapes: Vec<(BufferRef, Vec<usize>)>,
     /// Which buffers hold inputs (filled each step).
     pub input_buffers: Vec<(String, BufferRef)>,
     /// Constant buffers with their initial data (uploaded once at session creation).
@@ -2300,6 +2305,7 @@ impl<'a> Compiler<'a> {
             plan: ExecutionPlan {
                 buffers: vec![],
                 param_buffers: vec![],
+                param_shapes: vec![],
                 input_buffers: Vec::new(),
                 constant_buffers: Vec::new(),
                 dispatches: Vec::new(),
@@ -2514,6 +2520,7 @@ impl<'a> Compiler<'a> {
             match node.op {
                 Op::Parameter { ref name } => {
                     self.plan.param_buffers.push((name.clone(), buf));
+                    self.plan.param_shapes.push((buf, node.ty.shape.clone()));
                     let wf = WeightFormat::from_dtype(node.ty.dtype);
                     if wf.uses_reduced_storage() {
                         let shape = &node.ty.shape;

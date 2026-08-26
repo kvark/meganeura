@@ -363,6 +363,7 @@ mod tests {
         ExecutionPlan {
             buffers,
             param_buffers: Vec::new(),
+            param_shapes: Vec::new(),
             input_buffers: Vec::new(),
             constant_buffers: Vec::new(),
             dispatches,
