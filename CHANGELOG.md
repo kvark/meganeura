@@ -1,10 +1,11 @@
 # Unreleased
 
 - `Session::set_laprop` provides RMS-normalize-then-momentum updates, and
-  `Session::set_optax_adaptive_grad_clip` applies Optax's rank-dependent
-  output-unit relative norm bound. Together they reproduce DreamerV3's
-  optimizer chain on the GPU. The original
-  `Session::set_adaptive_grad_clip` remains available with leaf-wise norms.
+  `Session::set_adaptive_grad_clip` applies one relative norm bound per
+  complete parameter leaf. Together they reproduce DreamerV3's custom
+  `clip_by_agc` optimizer chain on the GPU. The separate
+  `Session::set_optax_adaptive_grad_clip` method provides Optax's
+  rank-dependent output-unit variant for models that explicitly use it.
 
 - Compensated f16 cooperative matmul (C1): on devices that only expose
   f16 tiles, `requires_full_precision` work stages each operand as

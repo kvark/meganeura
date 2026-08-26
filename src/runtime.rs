@@ -6643,10 +6643,10 @@ impl Session {
     /// Enable leaf-wise adaptive gradient clipping for every trainable parameter.
     ///
     /// Each complete parameter-leaf gradient is scaled to at most
-    /// `clip * max(min_param_norm, ||parameter||)`. This matches the
-    /// historical Meganeura behavior. Use
-    /// [`Self::set_optax_adaptive_grad_clip`] for Optax and DreamerV3's
-    /// rank-dependent output-unit semantics.
+    /// `clip * max(min_param_norm, ||parameter||)`. This matches the custom
+    /// `clip_by_agc` transform used by DreamerV3. Use
+    /// [`Self::set_optax_adaptive_grad_clip`] only for models that explicitly
+    /// call Optax's rank-dependent output-unit transform.
     pub fn set_adaptive_grad_clip(&mut self, clip: f32, min_param_norm: f32) {
         assert!(
             clip >= 0.0 && clip.is_finite(),
