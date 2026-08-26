@@ -8,7 +8,7 @@ use std::{io, path::Path};
 
 /// Increment whenever the serialized execution plan or build pipeline changes
 /// in a way that can make an older plan unsafe to reuse.
-const CACHE_FORMAT_VERSION: u32 = 3;
+const CACHE_FORMAT_VERSION: u32 = 4;
 
 /// Cached execution plan with a graph fingerprint for invalidation.
 #[derive(Serialize, Deserialize)]
@@ -203,6 +203,7 @@ mod tests {
         let loaded = loaded.unwrap();
         assert_eq!(loaded.buffers.len(), plan.buffers.len());
         assert_eq!(loaded.dispatches.len(), plan.dispatches.len());
+        assert_eq!(loaded.param_shapes, plan.param_shapes);
 
         // Load with different graph — should invalidate
         let mut g2 = Graph::new();
