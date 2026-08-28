@@ -22,8 +22,8 @@ hub = ["dep:hf-hub"]
 profiler = ["dep:tracing-subscriber"]
 
 [dependencies]
-blade-graphics = { version = "0.8.4", git = "https://github.com/kvark/blade", rev = "95f5004fb02785a792c883a5312ca5ac37872a75" }
-blade-macros = { version = "0.3", git = "https://github.com/kvark/blade", rev = "95f5004fb02785a792c883a5312ca5ac37872a75" }
+blade-graphics = { version = "0.8.4", git = "https://github.com/kvark/blade", rev = "357777a4a167b7be2d1ee6131abe97b250be902c" }
+blade-macros = { version = "0.3", git = "https://github.com/kvark/blade", rev = "357777a4a167b7be2d1ee6131abe97b250be902c" }
 # `default-features = false` drops egglog's `bin` stack (clap, mimalloc,
 # env_logger, chrono, graphviz). Greedy mode never constructs an EGraph
 # but the crate is still linked for the optional equality-saturation
