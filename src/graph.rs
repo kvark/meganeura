@@ -697,15 +697,35 @@ impl Graph {
     /// have lower IDs than the node itself.
     #[track_caller]
     pub fn toposort(&self) -> Graph {
+        self.deep_clone().into_toposort()
+    }
+
+    /// Consuming variant of [`Graph::toposort`].
+    ///
+    /// Node-owned payloads such as constants are moved into the sorted graph
+    /// instead of cloned. This materially lowers construction peaks for large
+    /// differentiated graphs while producing the same remapped IR.
+    #[track_caller]
+    pub(crate) fn into_toposort(self) -> Graph {
+        let Graph {
+            nodes,
+            outputs,
+            new_nodes_require_full_precision,
+            num_param_grad_outputs,
+            derived_params,
+        } = self;
+
         // Build adjacency: for each node, which nodes depend on it
-        let n = self.nodes.len();
+        let n = nodes.len();
         let mut in_degree = vec![0u32; n];
         let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
-        let mut is_nop = vec![false; n];
+        let is_nop = nodes
+            .iter()
+            .map(|node| matches!(node.op, Op::Nop))
+            .collect::<Vec<_>>();
 
-        for (i, node) in self.nodes.iter().enumerate() {
-            if matches!(node.op, Op::Nop) {
-                is_nop[i] = true;
+        for (i, node) in nodes.iter().enumerate() {
+            if is_nop[i] {
                 continue;
             }
             for &inp in &node.inputs {
@@ -718,18 +738,17 @@ impl Graph {
         }
 
         // Kahn's algorithm: process nodes with in_degree 0
-        let mut queue: Vec<usize> = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
         for i in 0..n {
             if !is_nop[i] && in_degree[i] == 0 {
-                queue.push(i);
+                queue.push_back(i);
             }
         }
 
         let mut order: Vec<usize> = Vec::new();
         let mut old_to_new: Vec<Option<NodeId>> = vec![None; n];
 
-        while let Some(old_id) = queue.first().copied() {
-            queue.remove(0);
+        while let Some(old_id) = queue.pop_front() {
             let new_id = order.len() as NodeId;
             old_to_new[old_id] = Some(new_id);
             order.push(old_id);
@@ -737,17 +756,21 @@ impl Graph {
             for &dep in &dependents[old_id] {
                 in_degree[dep] -= 1;
                 if in_degree[dep] == 0 {
-                    queue.push(dep);
+                    queue.push_back(dep);
                 }
             }
         }
 
-        // Build new graph with remapped IDs
-        let mut new_graph = Graph::new();
+        // Build the remapped node list by moving payloads out of the old
+        // slots. Keeping Option<Node> metadata is cheap; cloning large
+        // Constant payloads here is not.
+        let mut old_nodes = nodes.into_iter().map(Some).collect::<Vec<_>>();
+        let mut new_nodes = Vec::with_capacity(order.len());
         for &old_id in &order {
-            let node = &self.nodes[old_id];
-            let mut op = node.op.clone();
-            match op {
+            let mut node = old_nodes[old_id]
+                .take()
+                .expect("toposort: active node was already moved");
+            match node.op {
                 Op::MultiHeadAttnGradQ {
                     ref mut fwd_node, ..
                 }
@@ -762,41 +785,41 @@ impl Graph {
                 }
                 _ => {}
             }
-            let new_inputs: Vec<NodeId> = node
+            node.inputs = node
                 .inputs
-                .iter()
-                .filter_map(|&inp| old_to_new[inp as usize])
+                .into_iter()
+                .filter_map(|inp| old_to_new[inp as usize])
                 .collect();
-            let new_id = new_graph.add_raw_node_with_precision(
-                op,
-                new_inputs,
-                node.ty.clone(),
-                node.requires_full_precision,
-            );
-            new_graph.nodes[new_id as usize].name = node.name.clone();
+            node.id = new_nodes.len() as NodeId;
+            new_nodes.push(node);
         }
 
         // Remap outputs. An output being Nop'd would silently drop it and
         // shift downstream indices — assert loudly instead so fusion bugs
         // surface at build time rather than as `read_output_by_index`
         // panics at inference time.
-        let mut new_outputs: Vec<NodeId> = Vec::with_capacity(self.outputs.len());
-        for (i, &out) in self.outputs.iter().enumerate() {
+        let mut new_outputs: Vec<NodeId> = Vec::with_capacity(outputs.len());
+        for (i, &out) in outputs.iter().enumerate() {
             match old_to_new[out as usize] {
                 Some(new_id) => new_outputs.push(new_id),
                 None => panic!(
                     "toposort: output #{i} (node {out}, op {:?}) was removed as Nop. \
                      A fusion pass Nop'd a node that's listed in `set_outputs`. \
                      Add an `is_output(id)` guard to that fusion.",
-                    self.nodes[out as usize].op,
+                    old_nodes[out as usize]
+                        .as_ref()
+                        .expect("toposort: removed output slot is missing")
+                        .op,
                 ),
             }
         }
-        new_graph.set_outputs(new_outputs);
-        // Preserve the user/grad output boundary (set_outputs resets it).
-        new_graph.num_param_grad_outputs = self.num_param_grad_outputs;
-        new_graph.derived_params = self.derived_params.clone();
-        new_graph
+        Graph {
+            nodes: new_nodes,
+            outputs: new_outputs,
+            new_nodes_require_full_precision,
+            num_param_grad_outputs,
+            derived_params,
+        }
     }
 
     pub fn nodes(&self) -> &[Node] {

@@ -1046,7 +1046,45 @@ pub(crate) fn compile_with_caps(
     )
 }
 
+/// Compile an owned graph, moving constant payloads into the execution plan.
+///
+/// A differentiated recurrent graph can contain large generated constants.
+/// The ordinary borrowed API must clone those values into the plan; session
+/// construction no longer needs the optimized graph afterward and can avoid
+/// holding both copies at once.
+pub(crate) fn compile_owned_with_caps(
+    mut graph: Graph,
+    options: &CompileOptions,
+    coop_caps: crate::codegen::CoopCaps,
+) -> ExecutionPlan {
+    let allow_reduced_precision_attention_backward = options.flash_backward_coop;
+    let mut plan = compile_base_with_caps_policy(
+        &graph,
+        options,
+        coop_caps,
+        allow_reduced_precision_attention_backward,
+    );
+    attach_owned_constant_buffers(&mut plan, &mut graph);
+    finish_compile(plan, options)
+}
+
 fn compile_with_caps_policy(
+    graph: &Graph,
+    options: &CompileOptions,
+    coop_caps: crate::codegen::CoopCaps,
+    allow_reduced_precision_attention_backward: bool,
+) -> ExecutionPlan {
+    let mut plan = compile_base_with_caps_policy(
+        graph,
+        options,
+        coop_caps,
+        allow_reduced_precision_attention_backward,
+    );
+    attach_borrowed_constant_buffers(&mut plan, graph);
+    finish_compile(plan, options)
+}
+
+fn compile_base_with_caps_policy(
     graph: &Graph,
     options: &CompileOptions,
     coop_caps: crate::codegen::CoopCaps,
@@ -1080,21 +1118,56 @@ fn compile_with_caps_policy(
         }
     }
 
+    compiler.plan
+}
+
+fn node_buffer(plan: &ExecutionPlan, node_id: NodeId) -> BufferRef {
+    let &(mapped_id, buffer) = plan
+        .node_buffers
+        .get(node_id as usize)
+        .expect("compiled plan is missing a graph node buffer");
+    assert_eq!(
+        mapped_id, node_id,
+        "compiled node buffers are not ID-sorted"
+    );
+    buffer
+}
+
+fn attach_borrowed_constant_buffers(plan: &mut ExecutionPlan, graph: &Graph) {
+    for node in graph.nodes() {
+        if let Op::Constant { ref data } = node.op {
+            let buffer = node_buffer(plan, node.id);
+            plan.constant_buffers.push((buffer, data.clone()));
+        }
+    }
+}
+
+fn attach_owned_constant_buffers(plan: &mut ExecutionPlan, graph: &mut Graph) {
+    for node in graph.nodes_mut() {
+        let node_id = node.id;
+        if let Op::Constant { ref mut data } = node.op {
+            let buffer = node_buffer(plan, node_id);
+            plan.constant_buffers.push((buffer, std::mem::take(data)));
+        }
+    }
+}
+
+fn finish_compile(mut plan: ExecutionPlan, options: &CompileOptions) -> ExecutionPlan {
     if options.fuse_dispatches {
-        fuse_epilogues(&mut compiler.plan);
+        fuse_epilogues(&mut plan);
         if options.use_schedule_pointwise {
-            fuse_pointwise_chains(&mut compiler.plan);
+            fuse_pointwise_chains(&mut plan);
         }
         if options.use_schedule_reduction {
-            fuse_reduction_chains(&mut compiler.plan);
+            fuse_reduction_chains(&mut plan);
         }
-        fuse_row_scaled_scatters(&mut compiler.plan);
+        fuse_row_scaled_scatters(&mut plan);
     }
     // RmsNorm+MatMul prologue fusion is applied later in the runtime, after
     // per-dispatch coop selection — the prologue path currently only has a
     // coop-matmul implementation. See Session::with_context.
 
-    compiler.plan
+    plan
 }
 
 /// Fuse the table-gradient chain produced by
@@ -2528,9 +2601,7 @@ impl<'a> Compiler<'a> {
                 Op::Input { ref name } => {
                     self.plan.input_buffers.push((name.clone(), buf));
                 }
-                Op::Constant { ref data } => {
-                    self.plan.constant_buffers.push((buf, data.clone()));
-                }
+                Op::Constant { .. } => {}
                 Op::MultiHeadAttn { num_heads, .. }
                 | Op::CausalAttention { num_heads, .. }
                 | Op::CausalAttentionRoPE { num_heads, .. }
@@ -5475,6 +5546,32 @@ mod tests {
         assert_eq!(plan.input_buffers.len(), 1);
         assert_eq!(plan.param_buffers.len(), 1);
         assert_eq!(plan.dispatches.len(), 1); // matmul with fused relu epilogue
+    }
+
+    #[test]
+    fn owned_compile_preserves_constant_plan_data() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[2, 2]);
+        let constant = g.constant(vec![1.0, 2.0, 3.0, 4.0], &[2, 2]);
+        let output = g.add(x, constant);
+        g.set_outputs(vec![output]);
+
+        let options = CompileOptions::default();
+        let caps = crate::codegen::CoopCaps::default();
+        let borrowed = compile_with_caps(&g, &options, caps);
+        let owned = compile_owned_with_caps(g.deep_clone(), &options, caps);
+
+        assert_eq!(
+            serde_json::to_value(borrowed).unwrap(),
+            serde_json::to_value(owned).unwrap(),
+        );
+        let Op::Constant { data } = g.node(constant).op.clone() else {
+            panic!(
+                "expected retained source constant, got {:?}",
+                g.node(constant).op,
+            );
+        };
+        assert_eq!(data, [1.0, 2.0, 3.0, 4.0]);
     }
 
     #[test]
