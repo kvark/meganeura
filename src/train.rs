@@ -371,11 +371,16 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, Optimiz
             (g, forward_report)
         }
         Mode::Training => {
-            let sorted = optimized_forward.toposort();
+            let sorted = optimized_forward.into_toposort();
+            // Training compilation expands the forward graph several times.
+            // Do not retain superseded copies across those stages: large
+            // recurrent graphs can otherwise peak at the source, optimized,
+            // sorted, differentiated, and fully optimized graphs together.
             let full = {
                 let _span = tracing::info_span!("autodiff").entered();
                 autodiff::differentiate(&sorted)
             };
+            drop(sorted);
             log::info!(
                 "full graph (forward + backward): {} nodes",
                 full.nodes().len()
@@ -384,14 +389,14 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, Optimiz
                 (full, forward_report)
             } else {
                 let _span = tracing::info_span!("optimize_full").entered();
-                optimize::optimize_with_config(&full, cfg.optimize)
+                optimize::optimize_owned_with_config(full, cfg.optimize)
             }
         }
     };
 
     let plan = {
         let _span = tracing::info_span!("compile").entered();
-        compile::compile_with_caps(&final_graph, &options, coop_caps)
+        compile::compile_owned_with_caps(final_graph, &options, coop_caps)
     };
     log::info!(
         "execution plan: {} buffers, {} dispatches",

@@ -324,6 +324,18 @@ pub fn optimize_with_report(graph: &Graph) -> (Graph, OptimizeReport) {
 
 /// Optimize with an explicit strategy and extraction objective.
 pub fn optimize_with_config(graph: &Graph, config: OptimizeConfig) -> (Graph, OptimizeReport) {
+    optimize_owned_with_config(clone_graph(graph), config)
+}
+
+/// Optimize an owned graph without first duplicating all node payloads.
+///
+/// Training uses this after autodiff, when the unoptimized graph has no
+/// remaining consumer. The borrowed public API above retains its existing
+/// behavior for callers that need to keep their source graph.
+pub(crate) fn optimize_owned_with_config(
+    graph: Graph,
+    config: OptimizeConfig,
+) -> (Graph, OptimizeReport) {
     match config.mode {
         OptimizeMode::Off => optimize_off(graph, config),
         OptimizeMode::Greedy => optimize_greedy(graph, config),
@@ -333,9 +345,8 @@ pub fn optimize_with_config(graph: &Graph, config: OptimizeConfig) -> (Graph, Op
     }
 }
 
-fn optimize_egglog(graph: &Graph, config: OptimizeConfig) -> (Graph, OptimizeReport) {
-    let nodes_before = graph.nodes().len();
-    let mut g = clone_graph(graph);
+fn optimize_egglog(mut g: Graph, config: OptimizeConfig) -> (Graph, OptimizeReport) {
+    let nodes_before = g.nodes().len();
 
     let segments = plan_segments(&g, config.mode, config.saturation_cutoff);
     let outlined_regions = segments.iter().filter(|s| s.shifts.len() > 1).count();
@@ -411,13 +422,12 @@ fn optimize_egglog(graph: &Graph, config: OptimizeConfig) -> (Graph, OptimizeRep
         max_segment_nodes,
         extraction_failures,
     };
-    (g.toposort(), report)
+    (g.into_toposort(), report)
 }
 
-fn optimize_off(graph: &Graph, config: OptimizeConfig) -> (Graph, OptimizeReport) {
-    let nodes_before = graph.nodes().len();
+fn optimize_off(mut g: Graph, config: OptimizeConfig) -> (Graph, OptimizeReport) {
+    let nodes_before = g.nodes().len();
     let start = Instant::now();
-    let mut g = clone_graph(graph);
     sweep_dead_nodes(&mut g);
     let extract_time = start.elapsed();
     let nodes_after = g
@@ -426,7 +436,7 @@ fn optimize_off(graph: &Graph, config: OptimizeConfig) -> (Graph, OptimizeReport
         .filter(|node| !matches!(node.op, Op::Nop))
         .count();
     (
-        g.toposort(),
+        g.into_toposort(),
         OptimizeReport {
             mode: config.mode,
             extraction_cost: config.extraction_cost,
@@ -447,10 +457,9 @@ fn optimize_off(graph: &Graph, config: OptimizeConfig) -> (Graph, OptimizeReport
     )
 }
 
-fn optimize_greedy(graph: &Graph, config: OptimizeConfig) -> (Graph, OptimizeReport) {
-    let nodes_before = graph.nodes().len();
+fn optimize_greedy(mut g: Graph, config: OptimizeConfig) -> (Graph, OptimizeReport) {
+    let nodes_before = g.nodes().len();
     let start = Instant::now();
-    let mut g = clone_graph(graph);
     let mut fusions = Vec::new();
 
     loop {
@@ -474,7 +483,7 @@ fn optimize_greedy(graph: &Graph, config: OptimizeConfig) -> (Graph, OptimizeRep
     let rules_fired = summarize_fusions(&fusions);
 
     (
-        g.toposort(),
+        g.into_toposort(),
         OptimizeReport {
             mode: config.mode,
             extraction_cost: config.extraction_cost,
