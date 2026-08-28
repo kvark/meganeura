@@ -2793,6 +2793,66 @@ fn matmul_bt_gradient_check() {
 }
 
 #[test]
+fn full_precision_weight_gradient_preserves_tiny_values() {
+    // This shape reaches the f16 cooperative-matrix promotion threshold on
+    // NVIDIA (16 * 8 = 128 output workgroups). The loss scale makes every
+    // dL/dY element smaller than f16's minimum subnormal, while the f32
+    // A^T*dY result remains representable. Routing this derivative matmul
+    // through even compensated f16 therefore turns the whole weight gradient
+    // into zero.
+    // Keep the elementwise output dispatch below Vulkan's 65,535-workgroup
+    // per-axis limit while retaining the same weight-gradient tile geometry.
+    const ROWS: usize = 1_023;
+    const INPUTS: usize = 512;
+    const OUTPUTS: usize = 256;
+    const LOSS_SCALE: f32 = 1.0e-6;
+
+    let mut graph = Graph::new();
+    let input = graph.input("input", &[ROWS, INPUTS]);
+    let weight = graph.parameter("weight", &[INPUTS, OUTPUTS]);
+    let prediction = graph.matmul(input, weight);
+    let mean = graph.mean_all(prediction);
+    let scale = graph.scalar(LOSS_SCALE);
+    let loss = graph.mul(mean, scale);
+    graph.set_outputs(vec![loss]);
+
+    let mut session = meganeura::build(&graph, meganeura::SessionConfig::from_env()).0;
+    session.set_input("input", &vec![1.0; ROWS * INPUTS]);
+    session.set_parameter("weight", &vec![0.0; INPUTS * OUTPUTS]);
+    session.step();
+    session.wait();
+
+    let plan = session.plan();
+    let parameter = plan
+        .param_buffers
+        .iter()
+        .find_map(|(name, buffer)| (name == "weight").then_some(*buffer))
+        .expect("weight parameter buffer");
+    let gradient = plan
+        .param_grad_pairs
+        .iter()
+        .find_map(|(candidate, gradient)| (*candidate == parameter).then_some(*gradient))
+        .expect("weight gradient buffer");
+    let mut actual = vec![0.0; INPUTS * OUTPUTS];
+    session.read_buffer(gradient, &mut actual);
+
+    let expected = LOSS_SCALE / OUTPUTS as f32;
+    let max_error = actual
+        .iter()
+        .map(|value| (value - expected).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(actual.iter().all(|value| value.is_finite()));
+    assert!(
+        actual.iter().all(|value| *value != 0.0),
+        "full-precision weight gradient underflowed to zero"
+    );
+    assert!(
+        max_error <= expected.abs() * 1.0e-4,
+        "weight gradient error {max_error:e}, expected {expected:e}"
+    );
+}
+
+#[test]
 fn tanh_gradient_check() {
     if std::env::var("MEGANEURA_SKIP_BACKPROP").unwrap_or_default() == "1" {
         eprintln!("MEGANEURA_SKIP_BACKPROP set — skipping tanh gradient check");
