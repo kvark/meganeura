@@ -4,6 +4,40 @@ use std::sync::{Arc, OnceLock};
 
 type Gpu = blade_graphics::Context;
 
+/// Leave room for pipelines, command buffers, and driver-owned allocations
+/// that are not represented by the execution plan's buffer sizes.
+const DEVICE_MEMORY_SAFE_NUMERATOR: u64 = 9;
+const DEVICE_MEMORY_SAFE_DENOMINATOR: u64 = 10;
+
+fn safe_device_memory_remaining(usage: u64, budget: u64) -> u64 {
+    let safe_limit = ((budget as u128 * DEVICE_MEMORY_SAFE_NUMERATOR as u128)
+        / DEVICE_MEMORY_SAFE_DENOMINATOR as u128) as u64;
+    safe_limit.saturating_sub(usage)
+}
+
+fn ensure_device_memory_budget(gpu: &Gpu, requested: usize, allocation: &str) {
+    let stats = gpu.memory_stats();
+    if stats.budget == 0 {
+        return;
+    }
+    let requested = u64::try_from(requested).expect("GPU allocation request exceeds u64");
+    let remaining = safe_device_memory_remaining(stats.usage, stats.budget);
+    assert!(
+        requested <= remaining,
+        "refusing to oversubscribe GPU memory for {allocation}: requested {:.2} GB with {:.2} GB already used, but the device reports a {:.2} GB budget and Meganeura reserves 10% for pipelines and the driver ({:.2} GB safely available); reduce the model, sequence, batch, or microbatch geometry",
+        requested as f64 / 1e9,
+        stats.usage as f64 / 1e9,
+        stats.budget as f64 / 1e9,
+        remaining as f64 / 1e9,
+    );
+    log::debug!(
+        "device-memory preflight for {allocation}: {:.1} MB requested, {:.1} MB used, {:.1} MB budget",
+        requested as f64 / 1e6,
+        stats.usage as f64 / 1e6,
+        stats.budget as f64 / 1e6,
+    );
+}
+
 // scatter_add: var indices (u32), src, dst, params
 #[derive(blade_macros::ShaderData)]
 struct ScatterAddData {
@@ -2454,7 +2488,7 @@ fn create_optimizer_buffer(
         name,
         size,
         memory: if device_local {
-            blade_graphics::Memory::Device
+            blade_graphics::Memory::DeviceTransient
         } else {
             blade_graphics::Memory::Shared
         },
@@ -2825,6 +2859,27 @@ impl Session {
             alias.physical_bytes() as f64 / 1e6,
             alias.device_local_bytes() as f64 / 1e6,
         );
+        let adam_state_bytes = plan
+            .param_grad_pairs
+            .iter()
+            .try_fold(0usize, |total, &(param, _)| {
+                let parameter_bytes = plan.buffers[param.0 as usize];
+                total.checked_add(
+                    parameter_bytes
+                        .checked_mul(2)
+                        .expect("Adam state size overflow"),
+                )
+            })
+            .expect("Adam state total size overflow");
+        let planned_allocation_bytes = alias
+            .physical_bytes()
+            .checked_add(adam_state_bytes)
+            .expect("session allocation size overflow");
+        ensure_device_memory_budget(
+            &gpu,
+            planned_allocation_bytes,
+            "session buffers and Adam state",
+        );
         let physical_buffers: Vec<blade_graphics::Buffer> = alias
             .sizes
             .iter()
@@ -2836,7 +2891,7 @@ impl Session {
                     name: &format!("buf_{}", i),
                     size: size as u64,
                     memory: if device_local {
-                        blade_graphics::Memory::Device
+                        blade_graphics::Memory::DeviceTransient
                     } else {
                         blade_graphics::Memory::Shared
                     },
@@ -3463,6 +3518,25 @@ mod device_id_tests {
         assert_eq!(parse_device_id("  0X744C  "), Some(0x744c));
         assert_eq!(parse_device_id("not-a-device"), None);
         assert_eq!(parse_device_id("0x"), None);
+    }
+}
+
+#[cfg(test)]
+mod device_memory_budget_tests {
+    use super::safe_device_memory_remaining;
+
+    #[test]
+    fn reserves_ten_percent_of_the_reported_budget() {
+        assert_eq!(safe_device_memory_remaining(100, 1_000), 800);
+        assert_eq!(safe_device_memory_remaining(900, 1_000), 0);
+        assert_eq!(safe_device_memory_remaining(950, 1_000), 0);
+    }
+
+    #[test]
+    fn budget_math_does_not_overflow() {
+        let safe_limit = ((u64::MAX as u128 * 9) / 10) as u64;
+        assert_eq!(safe_device_memory_remaining(0, u64::MAX), safe_limit);
+        assert_eq!(safe_device_memory_remaining(safe_limit - 1, u64::MAX), 1);
     }
 }
 
@@ -4313,14 +4387,48 @@ impl Session {
             .all(|(i, &p)| p != phys || i == buf.0 as usize)
     }
 
+    /// True when every tenant of this allocation is an immutable constant
+    /// with the same bitwise payload. Such aliases remain readable because no
+    /// step can replace their contents with a later value.
+    fn buffer_has_equivalent_constant_aliases(&self, buf: BufferRef) -> bool {
+        let phys = self.alias.map[buf.0 as usize];
+        let Some(reference) = self
+            .plan
+            .constant_buffers
+            .iter()
+            .find_map(|&(buffer, ref data)| (buffer == buf).then_some(data))
+        else {
+            return false;
+        };
+        let tenant_count = self.alias.map.iter().filter(|&&p| p == phys).count();
+        let mut constant_count = 0usize;
+        for &(buffer, ref data) in &self.plan.constant_buffers {
+            if self.alias.map[buffer.0 as usize] != phys {
+                continue;
+            }
+            constant_count += 1;
+            if data.len() != reference.len()
+                || !data
+                    .iter()
+                    .zip(reference)
+                    .all(|(left, right)| left.to_bits() == right.to_bits())
+            {
+                return false;
+            }
+        }
+        tenant_count > 1 && tenant_count == constant_count
+    }
+
     /// Read back the value of any graph node after a step.
     ///
     /// Works for every node in a debug session
     /// ([`SessionOptions::debug`] / `SessionConfig::debug()`); in a normal
     /// session it works for values whose buffer is not lifetime-aliased
     /// (params, inputs, outputs, and whatever the alias planner left
-    /// unshared). Use [`Session::read_node_by_name`] to address nodes named
-    /// via `Graph::named` (or `nn` layers, which name their outputs).
+    /// unshared). Bit-identical immutable constants remain readable when they
+    /// share an allocation. Use [`Session::read_node_by_name`] to address
+    /// nodes named via `Graph::named` (or `nn` layers, which name their
+    /// outputs).
     pub fn read_node(&self, node: crate::graph::NodeId) -> Result<Vec<f32>, ReadNodeError> {
         let buf = self
             .plan
@@ -4331,7 +4439,10 @@ impl Session {
         if !self.written[buf.0 as usize] {
             return Err(ReadNodeError::FusedAway);
         }
-        if !self.debug && !self.buffer_unaliased(buf) {
+        if !self.debug
+            && !self.buffer_unaliased(buf)
+            && !self.buffer_has_equivalent_constant_aliases(buf)
+        {
             return Err(ReadNodeError::Aliased);
         }
         let n = self.plan.buffers[buf.0 as usize] / 4;
@@ -6892,6 +7003,19 @@ impl Session {
             return;
         }
         if self.grad_accum_bufs.is_empty() {
+            let accumulator_bytes = self
+                .plan
+                .param_grad_pairs
+                .iter()
+                .try_fold(0usize, |total, &(_, grad_buf)| {
+                    total.checked_add(self.plan.buffers[grad_buf.0 as usize].max(4))
+                })
+                .expect("gradient accumulator size overflow");
+            ensure_device_memory_budget(
+                &self.gpu,
+                accumulator_bytes,
+                "gradient accumulation buffers",
+            );
             let mut device_bufs = Vec::new();
             self.grad_accum_bufs = self
                 .plan

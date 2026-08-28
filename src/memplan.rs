@@ -26,7 +26,7 @@
 //! Adam traffic out of the ReBAR heap.
 
 use crate::compile::{BufferRef, ExecutionPlan, ShaderEntry};
-use std::ops::Range;
+use std::{collections::HashMap, ops::Range};
 
 /// Mapping from the plan's logical buffers onto physical allocations.
 pub struct AliasPlan {
@@ -102,14 +102,27 @@ impl BufferUse {
 /// - derived params and quantized weight buffers — uploaded once;
 /// - `CacheWrite` outputs (KV caches) — carry state across steps;
 /// - `ScatterAdd` outputs — read-modify-write;
-/// - any buffer whose first use is a read (live-in from a prior step),
-///   and any buffer no dispatch touches.
+/// - any buffer whose first use is a read (live-in from a prior step).
+///
+/// Compiler-eliminated buffers that no dispatch or session-level role touches
+/// all share one placeholder allocation sized for the largest of them.
 pub fn plan_buffer_aliasing(
     plan: &ExecutionPlan,
     groups: &[Range<usize>],
     pin_spec: Option<&str>,
 ) -> AliasPlan {
     let (pinned, uses) = compute_pinned(plan, groups, pin_spec);
+    let constant_aliases = uniform_constant_aliases(plan);
+    let dead: Vec<bool> = uses
+        .iter()
+        .enumerate()
+        .map(|(i, usage)| {
+            !pinned[i]
+                && usage.first_write.is_none()
+                && usage.first_read.is_none()
+                && usage.last_use.is_none()
+        })
+        .collect();
     let n = plan.buffers.len();
 
     let mut map = vec![usize::MAX; n];
@@ -117,15 +130,49 @@ pub fn plan_buffer_aliasing(
     let mut device_local = Vec::new();
     let device_ok = device_local_eligible(plan);
     for i in 0..n {
-        if pinned[i] {
+        if pinned[i] && constant_aliases[i].is_none() {
             map[i] = sizes.len();
             sizes.push(plan.buffers[i]);
             device_local.push(device_ok[i]);
         }
     }
+    for (logical, &target) in constant_aliases.iter().enumerate() {
+        if let Some(target) = target {
+            debug_assert!(pinned[target]);
+            debug_assert_ne!(map[target], usize::MAX);
+            map[logical] = map[target];
+        }
+    }
+    let dead_count = dead.iter().filter(|&&is_dead| is_dead).count();
+    if dead_count != 0 {
+        let dead_logical_bytes = dead
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &is_dead)| is_dead.then_some(plan.buffers[i]))
+            .sum::<usize>();
+        let dead_physical_bytes = dead
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &is_dead)| is_dead.then_some(plan.buffers[i]))
+            .max()
+            .unwrap();
+        let physical = sizes.len();
+        sizes.push(dead_physical_bytes);
+        device_local.push(false);
+        for (logical, &is_dead) in dead.iter().enumerate() {
+            if is_dead {
+                map[logical] = physical;
+            }
+        }
+        log::info!(
+            "eliminated-buffer placeholder: {dead_count} logical buffers ({:.1} MB) share {:.1} MB",
+            dead_logical_bytes as f64 / 1e6,
+            dead_physical_bytes as f64 / 1e6,
+        );
+    }
 
     // Greedy best-fit over live intervals [first_write, last_use].
-    let mut order: Vec<usize> = (0..n).filter(|&i| !pinned[i]).collect();
+    let mut order: Vec<usize> = (0..n).filter(|&i| !pinned[i] && !dead[i]).collect();
     order.sort_by_key(|&i| {
         (
             uses[i].first_write.unwrap(),
@@ -179,6 +226,70 @@ pub fn plan_buffer_aliasing(
         sizes,
         device_local,
     }
+}
+
+/// Recurrent autodiff emits identical full-size zero, one, and scale tensors
+/// at every unrolled step. Bit-identical immutable uniform constants can share
+/// one physical allocation while retaining distinct logical/node identities.
+/// Buffers written by a dispatch or a session-level mutation path are excluded.
+fn uniform_constant_aliases(plan: &ExecutionPlan) -> Vec<Option<usize>> {
+    let n = plan.buffers.len();
+    let mut mutable = vec![false; n];
+    let mark = |buffer: BufferRef, mutable: &mut [bool]| mutable[buffer.0 as usize] = true;
+    for &(_, buffer) in &plan.param_buffers {
+        mark(buffer, &mut mutable);
+    }
+    for &(_, buffer) in &plan.input_buffers {
+        mark(buffer, &mut mutable);
+    }
+    for &(parameter, gradient) in &plan.param_grad_pairs {
+        mark(parameter, &mut mutable);
+        mark(gradient, &mut mutable);
+    }
+    for entry in &plan.derived_params {
+        mark(entry.0, &mut mutable);
+    }
+    for &buffer in plan.weight_buffers.keys() {
+        mark(buffer, &mut mutable);
+    }
+    for dispatch in &plan.dispatches {
+        mark(dispatch.output_buffer, &mut mutable);
+        for &buffer in &dispatch.extra_outputs {
+            mark(buffer, &mut mutable);
+        }
+    }
+
+    let mut canonical = HashMap::<(usize, usize, u32), usize>::new();
+    let mut aliases = vec![None; n];
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    for &(buffer, ref data) in &plan.constant_buffers {
+        let index = buffer.0 as usize;
+        if mutable[index] {
+            continue;
+        }
+        let Some(bits) = data.first().map(|value| value.to_bits()) else {
+            continue;
+        };
+        if !data.iter().all(|value| value.to_bits() == bits) {
+            continue;
+        }
+        let key = (plan.buffers[index], data.len(), bits);
+        if let Some(&target) = canonical.get(&key) {
+            aliases[index] = Some(target);
+            count += 1;
+            bytes += plan.buffers[index];
+        } else {
+            canonical.insert(key, index);
+        }
+    }
+    if count != 0 {
+        log::info!(
+            "uniform constant aliasing: {count} buffers share canonical allocations ({:.1} MB eliminated)",
+            bytes as f64 / 1e6,
+        );
+    }
+    aliases
 }
 
 /// One physical allocation per logical buffer (no aliasing), but with
@@ -335,9 +446,10 @@ fn compute_pinned(
             (Some(r), Some(w)) => r <= w,
             (Some(_), None) => true,
             // Written but never read is fine (e.g. unused LSE in
-            // inference); untouched buffers stay dedicated.
+            // inference). Untouched, non-persistent buffers were eliminated
+            // by compilation and share a placeholder allocation.
             (None, Some(_)) => false,
-            (None, None) => true,
+            (None, None) => false,
         };
         if live_in {
             pinned[i] = true;
@@ -477,6 +589,73 @@ mod tests {
         assert_eq!(alias.sizes, p.buffers);
         assert_eq!(alias.device_local, vec![false, true, true, true, false]);
         assert_eq!(alias.device_local_bytes(), 316);
+    }
+
+    #[test]
+    fn eliminated_buffers_share_one_placeholder() {
+        let mut p = plan(vec![16, 64, 128, 16], vec![dispatch(&[0], 3)]);
+        p.input_buffers.push(("x".into(), BufferRef(0)));
+        p.output_buffers.push(BufferRef(3));
+        let groups = std::iter::once(0..1).collect::<Vec<_>>();
+
+        let alias = plan_buffer_aliasing(&p, &groups, None);
+
+        assert_eq!(alias.map[1], alias.map[2]);
+        assert_eq!(alias.sizes[alias.map[1]], 128);
+        assert!(!alias.device_local[alias.map[1]]);
+        assert_ne!(alias.map[0], alias.map[1]);
+        assert_ne!(alias.map[3], alias.map[1]);
+    }
+
+    #[test]
+    fn unused_parameter_does_not_share_the_placeholder() {
+        let mut p = plan(vec![16, 64, 128, 16], vec![dispatch(&[0], 3)]);
+        p.input_buffers.push(("x".into(), BufferRef(0)));
+        p.param_buffers.push(("unused".into(), BufferRef(1)));
+        p.output_buffers.push(BufferRef(3));
+        let groups = std::iter::once(0..1).collect::<Vec<_>>();
+
+        let alias = plan_buffer_aliasing(&p, &groups, None);
+
+        assert_ne!(alias.map[1], alias.map[2]);
+        assert_eq!(alias.sizes[alias.map[1]], 64);
+        assert_eq!(alias.sizes[alias.map[2]], 128);
+    }
+
+    #[test]
+    fn identical_uniform_constants_share_one_allocation() {
+        let mut p = plan(vec![16, 16], Vec::new());
+        p.constant_buffers.push((BufferRef(0), vec![1.0; 4]));
+        p.constant_buffers.push((BufferRef(1), vec![1.0; 4]));
+
+        let alias = plan_buffer_aliasing(&p, &[], None);
+
+        assert_eq!(alias.map[0], alias.map[1]);
+        assert_eq!(alias.sizes, [16]);
+    }
+
+    #[test]
+    fn different_uniform_constants_remain_distinct() {
+        let mut p = plan(vec![16, 16], Vec::new());
+        p.constant_buffers.push((BufferRef(0), vec![1.0; 4]));
+        p.constant_buffers.push((BufferRef(1), vec![2.0; 4]));
+
+        let alias = plan_buffer_aliasing(&p, &[], None);
+
+        assert_ne!(alias.map[0], alias.map[1]);
+    }
+
+    #[test]
+    fn mutable_constant_role_is_not_aliased() {
+        let mut p = plan(vec![16, 16, 16], Vec::new());
+        p.constant_buffers.push((BufferRef(0), vec![1.0; 4]));
+        p.constant_buffers.push((BufferRef(1), vec![1.0; 4]));
+        p.param_buffers.push(("weight".into(), BufferRef(2)));
+        p.param_grad_pairs.push((BufferRef(2), BufferRef(1)));
+
+        let alias = plan_buffer_aliasing(&p, &[], None);
+
+        assert_ne!(alias.map[0], alias.map[1]);
     }
 
     #[test]
