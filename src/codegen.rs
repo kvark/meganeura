@@ -21,7 +21,8 @@ pub struct CoopConfig {
     pub use_f16_input: bool,
     /// Split each f32 operand into `hi = f16(x)` and `lo = f16(x - f32(hi))`
     /// and accumulate `hi·hi + hi·lo + lo·hi` in f32 (Ootomo & Yokota).
-    /// Used for `requires_full_precision` work on f16-only coop devices.
+    /// This improves mantissa precision but does not preserve f32's exponent
+    /// range, so automatic selection never uses it for full-precision work.
     pub compensated: bool,
 }
 
