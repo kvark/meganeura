@@ -836,8 +836,10 @@ pub struct Dispatch {
     /// (set at runtime based on per-dispatch eligibility).
     #[serde(default)]
     pub use_coop: bool,
-    /// Cooperative f16 path with hi/lo residual staging (C1). Only set
-    /// together with `use_coop` on `requires_full_precision` dispatches.
+    /// Cooperative f16 path with hi/lo residual staging (C1). Retained as an
+    /// explicit experimental variant; automatic selection does not use it
+    /// for `requires_full_precision` work because it cannot preserve f32's
+    /// exponent range.
     #[serde(default)]
     pub use_coop_compensated: bool,
     /// Number of same-A sibling matmuls packed into this dispatch (D1).
