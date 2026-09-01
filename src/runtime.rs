@@ -2163,6 +2163,121 @@ pub struct SessionOptions {
     pub pin_buffers: Option<String>,
 }
 
+/// Static requirements of a configured runtime prefix.
+///
+/// The caller supplies full-capacity input buffers as usual, but may ask a
+/// session step to execute only an aligned leading prefix. Padding between the
+/// active row count and [`Self::alignment`] must be semantically neutral.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimePrefixInfo {
+    /// Maximum row capacity declared when the prefix was configured.
+    pub max_rows: u32,
+    /// Runtime row counts must be a positive multiple of this value.
+    pub alignment: u32,
+    /// Number of existing plan dispatches whose work is scaled by the prefix.
+    pub dispatches: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RuntimePrefixDispatch {
+    row_units: u32,
+    workgroup_units: u32,
+    indirect_index: u32,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimePrefixState {
+    info: RuntimePrefixInfo,
+    rows: u32,
+    dispatches: Vec<Option<RuntimePrefixDispatch>>,
+}
+
+#[derive(blade_macros::ShaderData)]
+struct RuntimePrefixData {
+    active_count: blade_graphics::BufferPiece,
+    scales: blade_graphics::BufferPiece,
+    indirect: blade_graphics::BufferPiece,
+    params: RuntimePrefixParams,
+}
+
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct RuntimePrefixParams {
+    entries: u32,
+    alignment: u32,
+    max_rows: u32,
+    _pad: u32,
+}
+
+struct RuntimePrefixGpu {
+    active_count: blade_graphics::Buffer,
+    scales: blade_graphics::Buffer,
+    indirect: blade_graphics::Buffer,
+    pipeline: blade_graphics::ComputePipeline,
+    entries: u32,
+}
+
+fn gcd_u32(mut left: u32, mut right: u32) -> u32 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
+}
+
+fn lcm_u32(left: u32, right: u32) -> Option<u32> {
+    left.checked_mul(right / gcd_u32(left, right))
+}
+
+fn buffer_has_runtime_rows(
+    buffers: &[usize],
+    buffer: BufferRef,
+    row_capacity_bytes: usize,
+) -> bool {
+    let bytes = buffers[buffer.0 as usize];
+    bytes >= row_capacity_bytes && bytes.is_multiple_of(row_capacity_bytes)
+}
+
+fn runtime_prefix_family_supported(dispatch: &Dispatch) -> bool {
+    if dispatch.shader == ShaderEntry::ScatterAddAtomic {
+        return true;
+    }
+    matches!(
+        dispatch.profile_family(),
+        "pointwise" | "data_movement" | "normalization_reduction"
+    ) && dispatch.shader != ShaderEntry::ScatterAdd
+}
+
+fn runtime_prefix_workgroups(
+    prefix: Option<&RuntimePrefixState>,
+    index: usize,
+    original: [u32; 3],
+) -> [u32; 3] {
+    let Some(prefix) = prefix else {
+        return original;
+    };
+    let Some(scale) = prefix.dispatches[index] else {
+        return original;
+    };
+    debug_assert!(prefix.rows.is_multiple_of(scale.row_units));
+    [
+        prefix.rows / scale.row_units * scale.workgroup_units,
+        original[1],
+        original[2],
+    ]
+}
+
+fn runtime_prefix_indirect(
+    prefix: Option<&RuntimePrefixState>,
+    gpu: Option<&RuntimePrefixGpu>,
+    index: usize,
+) -> Option<blade_graphics::BufferPiece> {
+    let gpu = gpu?;
+    let indirect_index = prefix?.dispatches[index]?.indirect_index;
+    Some(gpu.indirect.at(u64::from(indirect_index) * 16))
+}
+
 /// How cooperative-matrix hardware may be used.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CoopPolicy {
@@ -2363,6 +2478,13 @@ pub struct Session {
     /// Longest-prefix-match wins; default multiplier is 1.0. Empty by
     /// default (preserves base LR for all params).
     lr_multipliers: Vec<(String, f32)>,
+    /// Optional host-selected leading-row extent for a compact subgraph.
+    /// Dispatch ratios are discovered from stable input slots after the final
+    /// plan has been reordered and fused; no graph or shader variant is added.
+    runtime_prefix: Option<RuntimePrefixState>,
+    /// Optional GPU-owned active count and indirect arguments for the same
+    /// compact prefix. This removes the per-step host synchronization.
+    runtime_prefix_gpu: Option<RuntimePrefixGpu>,
     /// Staging buffers for Q4 HorizontalConcat derived params.
     weight_staging: HashMap<crate::compile::BufferRef, Vec<f32>>,
 }
@@ -2959,6 +3081,8 @@ impl Session {
             grad_accum_bufs: Vec::new(),
             grad_accum_scale: None,
             lr_multipliers: Vec::new(),
+            runtime_prefix: None,
+            runtime_prefix_gpu: None,
             adam_state,
             adam_grouped_grad_norm: None,
             adam_step: 0,
@@ -3739,6 +3863,258 @@ impl Session {
     /// Whether the plan has an input with this name.
     pub fn has_input(&self, name: &str) -> bool {
         self.plan.input_buffers.iter().any(|entry| entry.0 == name)
+    }
+
+    /// Configure one compact leading-row prefix from stable graph input slots.
+    ///
+    /// This is execution metadata, not a graph operation: the compiled plan,
+    /// shaders, bindings, and full-capacity buffers stay unchanged. Starting
+    /// from `inputs`, the session follows prefix-sized intermediate buffers
+    /// through the final fused dispatch plan and records a reduced rational
+    /// workgroup ratio for every one-dimensional, prefix-preserving dispatch.
+    /// Atomic scatters may terminate the prefix in a fixed-size destination.
+    ///
+    /// Every named input must contain an integral number of four-byte values
+    /// per prefix row. The caller must keep the unused tail neutral. Host-set
+    /// row counts must already have the returned [`RuntimePrefixInfo::alignment`];
+    /// a GPU count bound with [`Self::bind_runtime_prefix_count`] is rounded up
+    /// by the session. Reductions or scatters after the compact branch may
+    /// still consume their fixed-size destination normally.
+    pub fn configure_runtime_prefix(
+        &mut self,
+        inputs: &[&str],
+        max_rows: u32,
+    ) -> Result<RuntimePrefixInfo, String> {
+        self.wait();
+        self.destroy_runtime_prefix_gpu();
+        if inputs.is_empty() {
+            return Err("runtime prefix requires at least one input".to_string());
+        }
+        if max_rows == 0 {
+            return Err("runtime prefix max_rows must be nonzero".to_string());
+        }
+
+        let row_capacity_bytes = usize::try_from(max_rows)
+            .unwrap()
+            .checked_mul(4)
+            .ok_or_else(|| "runtime prefix byte capacity overflows usize".to_string())?;
+        let mut dynamic_buffers = HashSet::new();
+        for &name in inputs {
+            let Some(&(_, buffer)) = self.plan.input_buffers.iter().find(|entry| entry.0 == name)
+            else {
+                return Err(format!("runtime prefix input '{name}' does not exist"));
+            };
+            let bytes = self.plan.buffers[buffer.0 as usize];
+            if bytes < row_capacity_bytes || !bytes.is_multiple_of(row_capacity_bytes) {
+                return Err(format!(
+                    "runtime prefix input '{name}' has {bytes} bytes, which is not an integral \
+                     four-byte row width at max_rows={max_rows}"
+                ));
+            }
+            dynamic_buffers.insert(buffer);
+        }
+
+        let mut alignment = 1_u32;
+        let mut scaled = 0_usize;
+        let mut dispatches = vec![None; self.plan.dispatches.len()];
+        for (index, dispatch) in self.plan.dispatches.iter().enumerate() {
+            if dispatch.is_zero_fill()
+                || !dispatch
+                    .input_buffers
+                    .iter()
+                    .any(|buffer| dynamic_buffers.contains(buffer))
+            {
+                continue;
+            }
+
+            let output_has_prefix = buffer_has_runtime_rows(
+                &self.plan.buffers,
+                dispatch.output_buffer,
+                row_capacity_bytes,
+            );
+            let atomic_boundary = dispatch.shader == ShaderEntry::ScatterAddAtomic;
+            if !output_has_prefix && !atomic_boundary {
+                continue;
+            }
+            if dispatch.workgroups[1] != 1 || dispatch.workgroups[2] != 1 {
+                return Err(format!(
+                    "runtime prefix reaches non-linear dispatch {} ({}) with workgroups {:?}",
+                    index, dispatch.label, dispatch.workgroups
+                ));
+            }
+            if !runtime_prefix_family_supported(dispatch) {
+                return Err(format!(
+                    "runtime prefix reaches unsupported dispatch {} ({}, family {})",
+                    index,
+                    dispatch.label,
+                    dispatch.profile_family(),
+                ));
+            }
+
+            let workgroups = dispatch.workgroups[0];
+            if workgroups == 0 {
+                return Err(format!(
+                    "runtime prefix reaches zero-workgroup dispatch {index} ({})",
+                    dispatch.label
+                ));
+            }
+            let divisor = gcd_u32(max_rows, workgroups);
+            let row_units = max_rows / divisor;
+            let workgroup_units = workgroups / divisor;
+            alignment = lcm_u32(alignment, row_units).ok_or_else(|| {
+                format!(
+                    "runtime prefix alignment overflow at dispatch {index} ({})",
+                    dispatch.label
+                )
+            })?;
+            dispatches[index] = Some(RuntimePrefixDispatch {
+                row_units,
+                workgroup_units,
+                indirect_index: scaled as u32,
+            });
+            scaled += 1;
+
+            if output_has_prefix && !atomic_boundary {
+                dynamic_buffers.insert(dispatch.output_buffer);
+                for &output in &dispatch.extra_outputs {
+                    if buffer_has_runtime_rows(&self.plan.buffers, output, row_capacity_bytes) {
+                        dynamic_buffers.insert(output);
+                    }
+                }
+            }
+        }
+
+        if scaled == 0 {
+            return Err("runtime prefix does not reach a scalable dispatch".to_string());
+        }
+        debug_assert!(max_rows.is_multiple_of(alignment));
+        let info = RuntimePrefixInfo {
+            max_rows,
+            alignment,
+            dispatches: scaled,
+        };
+        self.runtime_prefix = Some(RuntimePrefixState {
+            info,
+            rows: max_rows,
+            dispatches,
+        });
+        Ok(info)
+    }
+
+    /// Drive the configured prefix from a producer-owned GPU `u32` count.
+    ///
+    /// The count is imported directly and converted to aligned
+    /// dispatch-indirect arguments at the start of every [`Self::step`]. The
+    /// full-capacity graph buffers and compiled dispatches are unchanged; this
+    /// only replaces the host-selected workgroup counts. Counts are clamped to
+    /// capacity and rounded up to the configured alignment; zero executes one
+    /// neutral aligned block. The producer must submit its count write before
+    /// calling `step` on the same ordered queue or provide equivalent external
+    /// synchronization.
+    pub fn bind_runtime_prefix_count(
+        &mut self,
+        source: blade_graphics::ExternalMemorySource,
+        size: u64,
+    ) -> Result<(), String> {
+        if size < 4 {
+            return Err(format!(
+                "runtime prefix count buffer is {size} bytes, expected at least 4"
+            ));
+        }
+        self.wait();
+        self.destroy_runtime_prefix_gpu();
+        let Some(ref prefix) = self.runtime_prefix else {
+            return Err("runtime prefix must be configured before binding its count".to_string());
+        };
+        let entries = prefix.dispatches.iter().flatten().count() as u32;
+        debug_assert_eq!(entries as usize, prefix.info.dispatches);
+        let bytes = u64::from(entries) * 16;
+        let active_count = self.gpu.create_buffer(blade_graphics::BufferDesc {
+            name: "runtime_prefix_count",
+            size,
+            memory: blade_graphics::Memory::External(source),
+        });
+        let scales = self.gpu.create_buffer(blade_graphics::BufferDesc {
+            name: "runtime_prefix_scales",
+            size: bytes,
+            memory: blade_graphics::Memory::Shared,
+        });
+        let indirect = self.gpu.create_buffer(blade_graphics::BufferDesc {
+            name: "runtime_prefix_indirect",
+            size: bytes,
+            memory: blade_graphics::Memory::Device,
+        });
+        let mut scale_data = Vec::with_capacity(entries as usize);
+        for dispatch in &prefix.dispatches {
+            if let Some(scale) = dispatch.as_ref() {
+                scale_data.push([scale.row_units, scale.workgroup_units, 0, 0]);
+            }
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                scale_data.as_ptr(),
+                scales.data() as *mut [u32; 4],
+                scale_data.len(),
+            );
+        }
+        let shader = self.gpu.create_shader(blade_graphics::ShaderDesc {
+            source: include_str!("shaders/runtime_prefix.wgsl"),
+            naga_module: None,
+        });
+        let layout = <RuntimePrefixData as blade_graphics::ShaderData>::layout();
+        let pipeline = self
+            .gpu
+            .create_compute_pipeline(blade_graphics::ComputePipelineDesc {
+                name: "runtime-prefix",
+                data_layouts: &[&layout],
+                compute: shader.at("prepare_runtime_prefix"),
+            });
+        self.runtime_prefix_gpu = Some(RuntimePrefixGpu {
+            active_count,
+            scales,
+            indirect,
+            pipeline,
+            entries,
+        });
+        Ok(())
+    }
+
+    fn destroy_runtime_prefix_gpu(&mut self) {
+        if let Some(mut prefix) = self.runtime_prefix_gpu.take() {
+            self.gpu.destroy_buffer(prefix.active_count);
+            self.gpu.destroy_buffer(prefix.scales);
+            self.gpu.destroy_buffer(prefix.indirect);
+            self.gpu.destroy_compute_pipeline(&mut prefix.pipeline);
+        }
+    }
+
+    /// Select the aligned leading-row count used by the next and later steps.
+    pub fn set_runtime_prefix_rows(&mut self, rows: u32) -> Result<(), String> {
+        if self.runtime_prefix_gpu.is_some() {
+            return Err("runtime prefix rows are driven by a bound GPU count".to_string());
+        }
+        let Some(ref mut prefix) = self.runtime_prefix else {
+            return Err("runtime prefix is not configured".to_string());
+        };
+        if rows == 0 || rows > prefix.info.max_rows {
+            return Err(format!(
+                "runtime prefix rows must be in 1..={}, got {rows}",
+                prefix.info.max_rows
+            ));
+        }
+        if !rows.is_multiple_of(prefix.info.alignment) {
+            return Err(format!(
+                "runtime prefix rows must be a multiple of {}, got {rows}",
+                prefix.info.alignment
+            ));
+        }
+        prefix.rows = rows;
+        Ok(())
+    }
+
+    /// Return the current runtime-prefix requirements, if configured.
+    pub fn runtime_prefix_info(&self) -> Option<RuntimePrefixInfo> {
+        self.runtime_prefix.as_ref().map(|prefix| prefix.info)
     }
 
     /// Upload parameter data to GPU buffers.
@@ -4874,16 +5250,44 @@ impl Session {
         // After start(), blade exposes GPU timings from the *previous* submission.
         self.drain_gpu_timings();
 
+        if let Some(ref prefix) = self.runtime_prefix_gpu {
+            let data = RuntimePrefixData {
+                active_count: prefix.active_count.at(0),
+                scales: prefix.scales.at(0),
+                indirect: prefix.indirect.at(0),
+                params: RuntimePrefixParams {
+                    entries: prefix.entries,
+                    alignment: self.runtime_prefix.as_ref().unwrap().info.alignment,
+                    max_rows: self.runtime_prefix.as_ref().unwrap().info.max_rows,
+                    _pad: 0,
+                },
+            };
+            let mut pass = self.encoder.compute("runtime-prefix");
+            let mut compute = pass.with(&prefix.pipeline);
+            compute.bind(0, &data);
+            compute.dispatch([prefix.entries.div_ceil(64), 1, 1]);
+        }
+
         if self.profiling {
             // Multi-pass mode: one compute pass per dispatch with per-pass barriers
             // and GPU timestamps. Enables dump_gpu_timings() after the next step().
             for i in 0..self.plan.dispatches.len() {
                 let dispatch = &self.plan.dispatches[i];
+                let workgroups =
+                    runtime_prefix_workgroups(self.runtime_prefix.as_ref(), i, dispatch.workgroups);
+                let indirect = runtime_prefix_indirect(
+                    self.runtime_prefix.as_ref(),
+                    self.runtime_prefix_gpu.as_ref(),
+                    i,
+                );
                 let pipeline = self.pipelines.get(dispatch);
                 let mut pass = self.encoder.compute(&dispatch.label);
                 let mut pc = pass.with(pipeline);
                 Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
-                pc.dispatch(dispatch.workgroups);
+                match indirect {
+                    Some(buffer) => pc.dispatch_indirect(buffer),
+                    None => pc.dispatch(workgroups),
+                }
             }
         } else {
             // Inline-barrier mode: dispatches share one compute pass with
@@ -4910,10 +5314,23 @@ impl Session {
                         let group = self.groups[gi].clone();
                         for i in group {
                             let dispatch = &self.plan.dispatches[i];
+                            let workgroups = runtime_prefix_workgroups(
+                                self.runtime_prefix.as_ref(),
+                                i,
+                                dispatch.workgroups,
+                            );
+                            let indirect = runtime_prefix_indirect(
+                                self.runtime_prefix.as_ref(),
+                                self.runtime_prefix_gpu.as_ref(),
+                                i,
+                            );
                             let pipeline = self.pipelines.get(dispatch);
                             let mut pc = pass.with(pipeline);
                             Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
-                            pc.dispatch(dispatch.workgroups);
+                            match indirect {
+                                Some(buffer) => pc.dispatch_indirect(buffer),
+                                None => pc.dispatch(workgroups),
+                            }
                         }
                     }
                 }
@@ -7224,6 +7641,7 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.wait();
+        self.destroy_runtime_prefix_gpu();
         self.gpu.destroy_command_encoder(&mut self.encoder);
         for pipeline in self.pipelines.map.values_mut() {
             self.gpu.destroy_compute_pipeline(pipeline);

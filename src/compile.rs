@@ -595,7 +595,7 @@ impl Dispatch {
             && self.params.get(2).is_some_and(|&mode| mode != 0)
     }
 
-    fn is_zero_fill(&self) -> bool {
+    pub(crate) fn is_zero_fill(&self) -> bool {
         self.pointwise.as_ref().is_some_and(|dag| {
             dag.n_inputs == 1 && dag.ops == [Pw::const_f32(0.0)] && dag.output == 0
         })
