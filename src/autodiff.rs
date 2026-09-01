@@ -790,7 +790,12 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 accumulate_grad(&mut graph, &mut grads, original_kernel, grad_kernel);
             }
             Op::ScatterAdd { .. } => {
-                // ScatterAdd only appears in backward graphs; no further differentiation needed.
+                // y[indices[i]] += src[i], so each source row receives the
+                // upstream row selected by its index. Indices are discrete.
+                let indices = node.inputs[0];
+                let src = node.inputs[1];
+                let grad_src = graph.embedding(indices, grad_output);
+                accumulate_grad(&mut graph, &mut grads, src, grad_src);
             }
             Op::GroupNorm {
                 num_groups,

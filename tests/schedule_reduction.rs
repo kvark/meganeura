@@ -558,6 +558,65 @@ fn pairwise_squared_distance_matches_explicit_forward_and_gradients() {
 }
 
 #[test]
+fn grouped_gather_pairwise_squared_distance_matches_cpu() {
+    const ROWS: usize = 33;
+    const TABLE_ROWS: usize = 11;
+    const GROUPS: usize = 4;
+    const PAIRS: usize = 8;
+    const INNER: usize = 3;
+
+    let indices = (0..ROWS)
+        .map(|row| ((row * 7 + 3) % TABLE_ROWS) as u32)
+        .collect::<Vec<_>>();
+    let left = (0..ROWS * GROUPS * INNER)
+        .map(|index| ((index * 31 % 127) as f32 - 63.0) * 0.017)
+        .collect::<Vec<_>>();
+    let table = (0..TABLE_ROWS * GROUPS * PAIRS * INNER)
+        .map(|index| ((index * 19 % 109) as f32 - 54.0) * 0.013)
+        .collect::<Vec<_>>();
+
+    let mut graph = Graph::new();
+    let index_node = graph.input_u32("indices", &[ROWS]);
+    let table_node = graph.input("table", &[TABLE_ROWS, GROUPS * PAIRS * INNER]);
+    let right = graph.embedding(index_node, table_node);
+    let right = graph.reshape(right, &[ROWS * GROUPS * PAIRS, INNER]);
+    let left_node = graph.input("left", &[ROWS * GROUPS, INNER]);
+    let distances = graph.pairwise_squared_distance(left_node, right, PAIRS);
+    graph.set_outputs(vec![distances]);
+
+    let mut session = meganeura::build_session(&graph);
+    session.set_input_u32("indices", &indices);
+    session.set_input("table", &table);
+    session.set_input("left", &left);
+    session.step();
+    session.wait();
+
+    let mut output = vec![0.0_f32; ROWS * GROUPS * PAIRS];
+    session.read_output_by_index(0, &mut output);
+    for (row, &table_row) in indices.iter().enumerate() {
+        for group in 0..GROUPS {
+            for pair in 0..PAIRS {
+                let output_index = (row * GROUPS + group) * PAIRS + pair;
+                let mut expected = 0.0_f32;
+                for inner in 0..INNER {
+                    let left_index = (row * GROUPS + group) * INNER + inner;
+                    let table_index =
+                        (((table_row as usize * GROUPS + group) * PAIRS + pair) * INNER) + inner;
+                    let delta = left[left_index] - table[table_index];
+                    expected += delta * delta;
+                }
+                assert!(
+                    (output[output_index] - expected).abs()
+                        <= output[output_index].abs().max(expected.abs()) * 1.0e-6 + 1.0e-7,
+                    "distance mismatch at [{row}, {group}, {pair}]: {} != {expected}",
+                    output[output_index],
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn pairwise_vector_rejection_matches_explicit_forward_and_gradients() {
     const ROWS: usize = 257;
     const INNER: usize = 3;
@@ -691,6 +750,41 @@ fn sum_inner_of_gather_times_basis_parity() {
             )
         },
         m,
+    );
+}
+
+/// A reshape may split each gathered table row into independent contiguous
+/// reduction groups. The fused path must index the source row and group
+/// exactly like the materialized embedding.
+#[test]
+fn sum_inner_of_grouped_gather_times_weights_parity() {
+    let vocab = 5usize;
+    let m = 7usize;
+    let groups = 8usize;
+    let n = 8usize;
+    assert_parity(
+        |g| {
+            let idx = g.input_u32("idx", &[m]);
+            let table = g.input("table", &[vocab, groups * n]);
+            let weights = g.input("weights", &[m * groups, n]);
+            let gathered = g.embedding(idx, table);
+            let gathered = g.reshape(gathered, &[m * groups, n]);
+            let terms = g.mul(gathered, weights);
+            let y = g.sum_inner(terms);
+            let table_data: Vec<f32> = (0..vocab * groups * n)
+                .map(|i| (i as f32) * 0.021 - 1.3)
+                .collect();
+            let weight_data: Vec<f32> = (0..m * groups * n)
+                .map(|i| (i as f32) * -0.013 + 0.7)
+                .collect();
+            let idx_data: Vec<u32> = (0..m).map(|i| (i * 3 % vocab) as u32).collect();
+            (
+                y,
+                vec![("table", table_data), ("weights", weight_data)],
+                vec![("idx", idx_data)],
+            )
+        },
+        m * groups,
     );
 }
 
@@ -1001,6 +1095,82 @@ fn gathered_reduction_table_gradient_matches_row_scale_bit_exactly() {
         for col in 0..COLS {
             expected[output_row * COLS + col] +=
                 row_scale_data[row] * factors_data[row * COLS + col];
+        }
+    }
+    for (index, (&actual, &expected)) in actual.iter().zip(expected.iter()).enumerate() {
+        assert_eq!(
+            actual.to_bits(),
+            expected.to_bits(),
+            "table gradient mismatch at flat index {index}: {actual} != {expected}"
+        );
+    }
+}
+
+#[test]
+fn grouped_gather_reduction_table_gradient_matches_cpu() {
+    const ROWS: usize = 256;
+    const COLS: usize = 64;
+    const GROUP: usize = 8;
+    const VOCAB: usize = 4097;
+
+    let mut graph = Graph::new();
+    let indices = graph.input_u32("indices", &[ROWS]);
+    let table = graph.parameter("table", &[VOCAB, COLS]);
+    let factors = graph.input("factors", &[ROWS * COLS / GROUP, GROUP]);
+    let gathered = graph.embedding(indices, table);
+    let groups = graph.reshape(gathered, &[ROWS * COLS / GROUP, GROUP]);
+    let terms = graph.mul(groups, factors);
+    let reduced = graph.sum_inner(terms);
+    let group_scale = graph.input("group_scale", &[ROWS * COLS / GROUP, 1]);
+    let weighted = graph.mul(reduced, group_scale);
+    let loss = graph.sum_all(weighted);
+    graph.set_outputs(vec![loss]);
+
+    let indices_data = (0..ROWS)
+        .map(|row| ((row * 17) % 31) as u32)
+        .collect::<Vec<_>>();
+    let factors_data = (0..ROWS * COLS)
+        .map(|index| {
+            let magnitude = (index * 5 % 8 + 1) as f32 * 0.125;
+            if index & 8 == 0 {
+                magnitude
+            } else {
+                -magnitude
+            }
+        })
+        .collect::<Vec<_>>();
+    let group_scale_data = (0..ROWS * COLS / GROUP)
+        .map(|group| {
+            if group % 11 == 0 {
+                return 0.0;
+            }
+            let magnitude = (group * 7 % 4 + 1) as f32 * 0.25;
+            if group & 4 == 0 {
+                magnitude
+            } else {
+                -magnitude
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut session = meganeura::build_session(&graph);
+    session.set_parameter("table", &vec![0.0; VOCAB * COLS]);
+    session.set_input_u32("indices", &indices_data);
+    session.set_input("factors", &factors_data);
+    session.set_input("group_scale", &group_scale_data);
+    session.set_learning_rate(0.0);
+    session.step();
+    session.wait();
+
+    let mut actual = vec![0.0; VOCAB * COLS];
+    session.read_param_grad("table", &mut actual);
+    let mut expected = vec![0.0; VOCAB * COLS];
+    for (row, &output_row) in indices_data.iter().enumerate() {
+        let output_row = output_row as usize;
+        for column in 0..COLS {
+            let source_index = row * COLS + column;
+            expected[output_row * COLS + column] +=
+                group_scale_data[source_index / GROUP] * factors_data[source_index];
         }
     }
     for (index, (&actual, &expected)) in actual.iter().zip(expected.iter()).enumerate() {

@@ -430,9 +430,11 @@ pub struct ReductionKernel {
     /// axis (table row-stride == inner).
     #[serde(default)]
     pub gather_elem: Vec<bool>,
-    /// Per-element stream `i` uses logical row `row / factor[i]`.
-    /// This expresses shared-row pairwise inputs without a bespoke shader.
-    /// Empty is equivalent to all factors being one.
+    /// Per-element stream `i` uses logical row `row / factor[i]`. A gathered
+    /// stream also selects contiguous `inner`-wide group `row % factor[i]`
+    /// from that table row. This expresses shared-row and reshaped-gather
+    /// inputs without a bespoke shader. Empty is equivalent to all factors
+    /// being one.
     #[serde(default)]
     pub input_row_repeats: Vec<u32>,
 }
@@ -668,13 +670,20 @@ fn lower_reduction(
                     format!("(row / {repeat}u)")
                 };
                 // Gather: the row is indirected through a u32 indices
-                // buffer, then the gathered row's `inner`-stride slice is
-                // indexed by the reduction column. Valid only when the
-                // gathered axis IS the reduced axis (table stride == inner).
-                format!(
-                    "{0}[{0}_idx[{1}] * params.inner + {2}]",
-                    per_elem_names[i], source_row, col_var
-                )
+                // buffer, then the selected `inner`-wide group is indexed by
+                // the reduction column.
+                if repeat == 1 {
+                    format!(
+                        "{0}[{0}_idx[{1}] * params.inner + {2}]",
+                        per_elem_names[i], source_row, col_var
+                    )
+                } else {
+                    format!(
+                        "{0}[{0}_idx[{1}] * params.inner * {2}u + \
+                         (row % {2}u) * params.inner + {3}]",
+                        per_elem_names[i], source_row, repeat, col_var
+                    )
+                }
             } else if repeat == 1 {
                 format!("{}[row_offset + {}]", per_elem_names[i], col_var)
             } else {
@@ -1347,6 +1356,30 @@ mod tests {
         assert!(!sm.source.contains("src_a[row_offset"));
         // The prologue multiply still fuses in.
         assert!(sm.source.contains("v0 * v1"));
+    }
+
+    #[test]
+    fn reduction_with_grouped_gather_selects_contiguous_subrows() {
+        let sm = lower(&KernelTemplate::Reduction {
+            op: ReduceOp::Sum,
+            prologue: identity_prologue(),
+            extra_prologues: vec![],
+            epilogue: None,
+            n_per_elem: 1,
+            n_per_row: 0,
+            gather_elem: vec![true],
+            input_row_repeats: vec![8],
+            rows_per_workgroup: 1,
+            grid: GridShape::default(),
+        });
+        assert!(
+            sm.source.contains(
+                "src[src_idx[(row / 8u)] * params.inner * 8u + \
+                 (row % 8u) * params.inner + col]"
+            ),
+            "{}",
+            sm.source,
+        );
     }
 
     #[test]

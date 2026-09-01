@@ -13,10 +13,47 @@ var<uniform> params: Params;
 
 // Blade enables Vulkan memory-model device scope when cooperative matrices
 // require the Vulkan memory model, so storage CAS is valid on that path.
-// `_pad == 2` maps one invocation to each narrow source row; wider rows map
-// one invocation to each source element.
+// `_pad == 2` maps one invocation to each narrow source row. `_pad > 2`
+// encodes a scale-group width as `_pad - 2`; setting its high bit instead maps
+// one invocation to each narrow scale group. Other modes map one invocation
+// to each source element.
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (params._pad & 0x80000000u) != 0u {
+        let group_width = params._pad & 0x7fffffffu;
+        let groups_per_row = params.embed_dim / group_width;
+        let group_index = gid.x;
+        let group_count = params.seq_len * groups_per_row;
+        if group_index >= group_count { return; }
+
+        let scale = row_scale[group_index];
+        if scale == 0.0 { return; }
+        let source_row = group_index / groups_per_row;
+        let output_row = indices[source_row];
+        let output_rows = params.total / params.embed_dim;
+        if output_row >= output_rows { return; }
+
+        let column_begin = (group_index % groups_per_row) * group_width;
+        for (var offset = 0u; offset < group_width; offset += 1u) {
+            let column = column_begin + offset;
+            let value = src[source_row * params.embed_dim + column] * scale;
+            if value == 0.0 { continue; }
+
+            let output_index = output_row * params.embed_dim + column;
+            var old_bits = atomicLoad(&dst[output_index]);
+            loop {
+                let old_value = bitcast<f32>(old_bits);
+                let new_bits = bitcast<u32>(old_value + value);
+                let result = atomicCompareExchangeWeak(&dst[output_index], old_bits, new_bits);
+                if result.exchanged {
+                    break;
+                }
+                old_bits = result.old_value;
+            }
+        }
+        return;
+    }
+
     if params._pad == 2u {
         let source_row = gid.x;
         if source_row >= params.seq_len { return; }
@@ -54,6 +91,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var value = src[source_index];
     if params._pad == 1u {
         value *= row_scale[source_row];
+    } else if params._pad > 2u {
+        value *= row_scale[source_index / (params._pad - 2u)];
     }
     if value == 0.0 { return; }
 

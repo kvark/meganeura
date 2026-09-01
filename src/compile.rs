@@ -1094,12 +1094,15 @@ fn compile_with_caps_policy(
 /// Fuse the table-gradient chain produced by
 /// `sum_inner(embedding(indices, table) * factors)`:
 ///
-/// `BroadcastInner(row_grad) -> Mul(factors) -> ScatterAddAtomic`
+/// `BroadcastInner(group_grad) -> Mul(factors) -> ScatterAddAtomic`
 ///
-/// into one row-scaled atomic scatter. For narrow rows the fused shader maps
-/// one invocation to a complete source row; wider rows retain the scalar work
-/// mapping. The zeroing pass stays unchanged and the two large intermediate
-/// buffers disappear.
+/// into one group-scaled atomic scatter. A group may cover the complete source
+/// row or an equal-width subdivision of it. For narrow groups the fused shader
+/// maps one invocation to a group; wider cases retain the scalar work mapping.
+/// The zeroing pass stays unchanged and the two large intermediate buffers
+/// disappear.
+const NARROW_SCATTER_GROUP_BIT: u32 = 1 << 31;
+
 fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
     use crate::schedule::Pw;
     use std::collections::{HashMap, HashSet};
@@ -1195,8 +1198,12 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
                 continue;
             }
             let source_len = scatter.params[1].saturating_mul(scatter.params[2]);
+            let group_width = broadcast.params[1];
             if mul.params != [source_len, 0, 0, 0]
-                || broadcast.params != [source_len, scatter.params[2], 1, 0]
+                || broadcast.params != [source_len, group_width, 1, 0]
+                || group_width == 0
+                || group_width > scatter.params[2]
+                || !scatter.params[2].is_multiple_of(group_width)
                 || scatter.workgroups != [source_len.div_ceil(256), 1, 1]
             {
                 continue;
@@ -1209,6 +1216,7 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
                 indices,
                 factors,
                 broadcast.input_buffers[0],
+                group_width,
             ));
             break;
         }
@@ -1221,6 +1229,7 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
             indices,
             factors,
             row_scale,
+            group_width,
         )) = candidate
         else {
             break;
@@ -1229,11 +1238,21 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
         let output = plan.dispatches[scatter_index].output_buffer;
         let total = plan.dispatches[scatter_index].params[0];
         let scatter = &mut plan.dispatches[scatter_index];
+        let source_len = scatter.params[1].saturating_mul(scatter.params[2]);
         scatter.input_buffers = vec![indices, factors, row_scale, output];
-        let small_row = scatter.params[2] <= 16;
-        scatter.params[3] = if small_row { 2 } else { 1 };
-        if small_row {
-            scatter.workgroups = [scatter.params[1].div_ceil(256), 1, 1];
+        let complete_row = group_width == scatter.params[2];
+        let small_group = group_width <= 16;
+        scatter.params[3] = if small_group && complete_row {
+            2
+        } else if small_group {
+            NARROW_SCATTER_GROUP_BIT | group_width
+        } else if complete_row {
+            1
+        } else {
+            group_width + 2
+        };
+        if small_group {
+            scatter.workgroups = [source_len.div_ceil(group_width).div_ceil(256), 1, 1];
         }
         scatter.pointwise = None;
         scatter.label = format!("ScatterAddAtomicRowMul[{total}]");
@@ -1531,10 +1550,11 @@ fn shared_embedding_consumers_are_foldable(
 ///   Phase 2 (gather → prologue): a per-element input produced by an
 ///   `Embedding` (indexed load) is marked a gather stream —
 ///   `gather_elem[s] = true`, and the stream's buffer is replaced by the
-///   table with the indices buffer spliced in right after. Shared embeddings
-///   are folded only when all consumers are compatible reductions. This is
-///   valid because the gathered axis is the reduced (inner) axis: `embedding`
-///   params `[seq, hidden] = [outer, inner]`.
+///   table with the indices buffer spliced in right after. A reshape may split
+///   each gathered row into equal contiguous reduction groups; that group
+///   factor is carried by the generated reduction instead of materializing
+///   the complete gathered row. Shared embeddings are folded only when all
+///   consumers are compatible reductions.
 ///
 /// Together these let `sum_inner(mul(embedding(idx,tbl), x))` collapse to
 /// one fused reduction kernel — the SH colour path — discovered from
@@ -1658,6 +1678,7 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                 }
                 kernel.n_per_elem = new_n_per_elem as u8;
                 kernel.gather_elem = Vec::new();
+                kernel.input_row_repeats = Vec::new();
                 // Rebuild input_buffers: producer inputs first (matching
                 // fuse_input's ordering), then consumer's others.
                 let mut new_inputs = producer_d.input_buffers.clone();
@@ -1691,9 +1712,6 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
             let Some(kernel) = c.reduction.as_ref() else {
                 continue;
             };
-            if kernel.input_row_repeats.iter().any(|&factor| factor != 1) {
-                continue;
-            }
             let outer = c.params[0];
             let inner = c.params[1];
             let per_elem = kernel.n_per_elem as usize;
@@ -1726,18 +1744,33 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                     continue;
                 }
                 let p = &plan.dispatches[pi];
-                // Plain Embedding dispatch: indexed load, gathered axis ==
-                // reduced axis (params [seq, hidden] = [outer, inner]).
+                // Plain Embedding dispatch: indexed load whose gathered row
+                // is either the reduction row or an integer number of
+                // contiguous reduction-width groups.
                 let is_embedding = p.shader == ShaderEntry::Embedding
                     && p.reduction.is_none()
                     && p.pointwise.is_none()
-                    && p.params.first().copied() == Some(outer)
-                    && p.params.get(1).copied() == Some(inner)
                     && p.input_buffers.len() == 2;
                 if !is_embedding {
                     continue;
                 }
+                let embedding_outer = p.params[0];
+                let embedding_inner = p.params[1];
+                let Some(group_factor) = outer
+                    .checked_div(embedding_outer)
+                    .filter(|&factor| factor > 0)
+                else {
+                    continue;
+                };
+                if embedding_outer.saturating_mul(group_factor) != outer
+                    || inner.saturating_mul(group_factor) != embedding_inner
+                {
+                    continue;
+                }
                 let read_count = reads.get(&buf).copied().unwrap_or(0);
+                if read_count > 1 && group_factor != 1 {
+                    continue;
+                }
                 if read_count > 1
                     && !shared_embedding_consumers_are_foldable(plan, buf, outer, inner, read_count)
                 {
@@ -1752,7 +1785,11 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                 if kernel.gather_elem.is_empty() {
                     kernel.gather_elem = vec![false; per_elem];
                 }
+                if kernel.input_row_repeats.is_empty() {
+                    kernel.input_row_repeats = vec![1; per_elem];
+                }
                 kernel.gather_elem[s] = true;
+                kernel.input_row_repeats[s] = group_factor;
                 // Replace stream s's buffer (the embedding output) with the
                 // table, and splice the indices buffer right after it.
                 c.input_buffers[flat_pos] = table_buf;
@@ -5676,6 +5713,69 @@ mod tests {
     }
 
     #[test]
+    fn grouped_gather_reduction_elides_the_full_row_embedding() {
+        const SEQ: usize = 32;
+        const VOCAB: usize = 17;
+        const GROUPS: usize = 8;
+        const INNER: usize = 8;
+
+        let mut graph = Graph::new();
+        let indices = graph.input_u32("indices", &[SEQ]);
+        let table = graph.input("table", &[VOCAB, GROUPS * INNER]);
+        let factors = graph.input("factors", &[SEQ * GROUPS, INNER]);
+        let gathered = graph.embedding(indices, table);
+        let gathered = graph.reshape(gathered, &[SEQ * GROUPS, INNER]);
+        let terms = graph.mul(gathered, factors);
+        let output = graph.sum_inner(terms);
+        graph.set_outputs(vec![output]);
+
+        let plan = compile(&graph);
+        assert_eq!(plan.dispatches.len(), 1);
+        let reduction = &plan.dispatches[0];
+        assert!(reduction.reduction.is_some());
+        assert_eq!(reduction.params[..2], [(SEQ * GROUPS) as u32, INNER as u32]);
+        assert_eq!(reduction.input_buffers.len(), 3);
+        let kernel = reduction.reduction.as_ref().unwrap();
+        assert_eq!(kernel.n_per_elem, 2);
+        assert_eq!(kernel.gather_elem, vec![true, false]);
+        assert_eq!(kernel.input_row_repeats, vec![GROUPS as u32, 1]);
+    }
+
+    #[test]
+    fn pairwise_distance_fuses_gather_with_repeated_left_rows() {
+        const ROWS: usize = 32;
+        const TABLE_ROWS: usize = 17;
+        const GROUPS: usize = 8;
+        const PAIRS: usize = 8;
+        const INNER: usize = 3;
+
+        let mut graph = Graph::new();
+        let indices = graph.input_u32("indices", &[ROWS]);
+        let table = graph.input("table", &[TABLE_ROWS, GROUPS * PAIRS * INNER]);
+        let right = graph.embedding(indices, table);
+        let right = graph.reshape(right, &[ROWS * GROUPS * PAIRS, INNER]);
+        let left = graph.input("left", &[ROWS * GROUPS, INNER]);
+        let output = graph.pairwise_squared_distance(left, right, PAIRS);
+        graph.set_outputs(vec![output]);
+
+        let plan = compile(&graph);
+        assert_eq!(plan.dispatches.len(), 1);
+        let reduction = &plan.dispatches[0];
+        assert_eq!(
+            reduction.params[..2],
+            [(ROWS * GROUPS * PAIRS) as u32, INNER as u32]
+        );
+        assert_eq!(reduction.input_buffers.len(), 3);
+        let kernel = reduction.reduction.as_ref().unwrap();
+        assert_eq!(kernel.n_per_elem, 2);
+        assert_eq!(kernel.gather_elem, vec![false, true]);
+        assert_eq!(
+            kernel.input_row_repeats,
+            vec![PAIRS as u32, (GROUPS * PAIRS) as u32]
+        );
+    }
+
+    #[test]
     fn sum_inner_gradient_uses_direct_row_broadcast() {
         let mut graph = Graph::new();
         let input = graph.parameter("input", &[513, 16]);
@@ -5859,6 +5959,51 @@ mod tests {
             .expect("gathered row reduction should fuse its table gradient");
         assert_eq!(fused.params[3], 1);
         assert_eq!(fused.workgroups, [(SEQ * INNER).div_ceil(256) as u32, 1, 1]);
+    }
+
+    #[test]
+    fn grouped_gather_reduction_fuses_group_scaled_atomic_scatter() {
+        const SEQ: usize = 256;
+        const VOCAB: usize = 4097;
+        const INNER: usize = 64;
+        const GROUP: usize = 8;
+
+        let mut graph = Graph::new();
+        let indices = graph.input_u32("indices", &[SEQ]);
+        let table = graph.parameter("table", &[VOCAB, INNER]);
+        let factors = graph.input("factors", &[SEQ * INNER / GROUP, GROUP]);
+        let gathered = graph.embedding(indices, table);
+        let groups = graph.reshape(gathered, &[SEQ * INNER / GROUP, GROUP]);
+        let terms = graph.mul(groups, factors);
+        let rows = graph.sum_inner(terms);
+        let group_scale = graph.input("group_scale", &[SEQ * INNER / GROUP, 1]);
+        let weighted = graph.mul(rows, group_scale);
+        let loss = graph.sum_all(weighted);
+        graph.set_outputs(vec![loss]);
+
+        let (plan, _) = crate::train::compile_training_graph(&graph);
+        let fused = plan
+            .dispatches
+            .iter()
+            .find(|dispatch| dispatch.is_row_scaled_atomic_scatter())
+            .expect("grouped gather reduction should fuse its table gradient");
+        assert_eq!(
+            fused.params,
+            [
+                VOCAB as u32 * INNER as u32,
+                SEQ as u32,
+                INNER as u32,
+                NARROW_SCATTER_GROUP_BIT | GROUP as u32,
+            ]
+        );
+        assert_eq!(
+            fused.workgroups,
+            [(SEQ * INNER / GROUP).div_ceil(256) as u32, 1, 1]
+        );
+        assert!(!plan.dispatches.iter().any(|dispatch| {
+            dispatch.is_inner_broadcast()
+                && dispatch.params == [(SEQ * INNER) as u32, GROUP as u32, 1, 0]
+        }));
     }
 
     #[test]

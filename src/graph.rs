@@ -1563,8 +1563,21 @@ impl Graph {
     /// Scatter-add: accumulate `src[i]` rows into `output[indices[i]]`.
     #[track_caller]
     pub fn scatter_add(&mut self, indices: NodeId, src: NodeId, vocab_size: usize) -> NodeId {
-        let src_shape = &self.node(src).ty.shape;
-        assert_eq!(src_shape.len(), 2);
+        let indices_ty = &self.node(indices).ty;
+        assert_eq!(
+            indices_ty.dtype,
+            DType::U32,
+            "scatter_add indices must be U32"
+        );
+        assert_eq!(indices_ty.shape.len(), 1, "scatter_add indices must be 1D");
+        let src_ty = &self.node(src).ty;
+        assert_eq!(src_ty.dtype, DType::F32, "scatter_add source must be F32");
+        let src_shape = &src_ty.shape;
+        assert_eq!(src_shape.len(), 2, "scatter_add source must be 2D");
+        assert_eq!(
+            indices_ty.shape[0], src_shape[0],
+            "scatter_add index and source row counts must match"
+        );
         let embed_dim = src_shape[1];
         let ty = TensorType::f32(vec![vocab_size, embed_dim]);
         self.add_node(Op::ScatterAdd { vocab_size }, vec![indices, src], ty)

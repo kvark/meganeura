@@ -72,3 +72,51 @@ fn large_scatter_add_matches_cpu_with_repeated_indices_and_zeros() {
         );
     }
 }
+
+#[test]
+fn scatter_add_source_gradient_gathers_repeated_output_rows() {
+    const VOCAB_SIZE: usize = 5;
+    const SEQ_LEN: usize = 4;
+    const EMBED_DIM: usize = 3;
+
+    let mut graph = Graph::new();
+    let indices = graph.input_u32("indices", &[SEQ_LEN]);
+    let src = graph.parameter("src", &[SEQ_LEN, EMBED_DIM]);
+    let weights = graph.input("weights", &[VOCAB_SIZE, EMBED_DIM]);
+    let output = graph.scatter_add(indices, src, VOCAB_SIZE);
+    let weighted = graph.mul(output, weights);
+    let mean = graph.mean_all(weighted);
+    let scale = graph.scalar(1.5);
+    let loss = graph.mul(mean, scale);
+    graph.set_outputs(vec![loss]);
+
+    let (mut session, _) = meganeura::build(&graph, SessionConfig::default());
+    let indices = [1_u32, 4, 1, 0];
+    let src = [
+        0.1_f32, -0.2, 0.3, -0.4, 0.5, -0.6, 0.7, -0.8, 0.9, -1.0, 1.1, -1.2,
+    ];
+    let weights: Vec<f32> = (0..VOCAB_SIZE * EMBED_DIM)
+        .map(|index| index as f32 * 0.1 - 0.4)
+        .collect();
+
+    session.set_input_u32("indices", &indices);
+    session.set_input("weights", &weights);
+    session.set_parameter("src", &src);
+    session.step();
+    session.wait();
+
+    let mut actual = [0.0_f32; SEQ_LEN * EMBED_DIM];
+    session.read_param_grad("src", &mut actual);
+    let normalizer = 1.5 / (VOCAB_SIZE * EMBED_DIM) as f32;
+    for row in 0..SEQ_LEN {
+        for column in 0..EMBED_DIM {
+            let expected = weights[indices[row] as usize * EMBED_DIM + column] * normalizer;
+            let index = row * EMBED_DIM + column;
+            assert!(
+                (actual[index] - expected).abs() < 1.0e-6,
+                "gradient mismatch at ({row}, {column}): actual={}, expected={expected}",
+                actual[index],
+            );
+        }
+    }
+}
