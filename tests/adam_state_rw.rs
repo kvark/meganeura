@@ -8,6 +8,58 @@
 use meganeura::Graph;
 
 #[test]
+fn adam_zero_gradient_skip_preserves_virgin_state_only() {
+    let mut graph = Graph::new();
+    let scale = graph.input("scale", &[3]);
+    let parameter = graph.parameter("parameter", &[3]);
+    let scaled = graph.mul(parameter, scale);
+    let loss = graph.mean_all(scaled);
+    graph.set_outputs(vec![loss]);
+
+    let initial = [1.0, 2.0, 3.0];
+    let mut session = meganeura::build_session(&graph);
+    session.set_parameter("parameter", &initial);
+    session.set_adam(0.01, 0.9, 0.999, 1.0e-8);
+    session.set_input("scale", &[0.0, 1.0, 0.0]);
+    session.step();
+    session.wait();
+
+    let mut after_active = [0.0; 3];
+    session.read_param("parameter", &mut after_active);
+    assert_eq!(after_active[0], initial[0]);
+    assert_ne!(after_active[1], initial[1]);
+    assert_eq!(after_active[2], initial[2]);
+
+    let mut m = [0.0; 3];
+    let mut v = [0.0; 3];
+    session.read_adam_m("parameter", &mut m);
+    session.read_adam_v("parameter", &mut v);
+    assert_eq!(m[0], 0.0);
+    assert_ne!(m[1], 0.0);
+    assert_eq!(m[2], 0.0);
+    assert_eq!(v[0], 0.0);
+    assert_ne!(v[1], 0.0);
+    assert_eq!(v[2], 0.0);
+
+    session.set_input("scale", &[0.0; 3]);
+    session.step();
+    session.wait();
+    let mut after_zero = [0.0; 3];
+    session.read_param("parameter", &mut after_zero);
+    assert_eq!(after_zero[0], initial[0]);
+    assert_ne!(after_zero[1], after_active[1]);
+    assert_eq!(after_zero[2], initial[2]);
+
+    session.set_weight_decay(0.1);
+    session.step();
+    session.wait();
+    let mut after_decay = [0.0; 3];
+    session.read_param("parameter", &mut after_decay);
+    assert_ne!(after_decay[0], initial[0]);
+    assert_ne!(after_decay[2], initial[2]);
+}
+
+#[test]
 fn adam_state_roundtrip_and_step_counter() {
     let n = 8usize;
 

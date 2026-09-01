@@ -36,10 +36,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         grouped_grad_norm[group] = grouped_grad_norm[group] + sqrt(sum_squared);
     }
 
+    let m_old = m[i];
+    let v_old = v[i];
+    if g == 0.0 && m_old == 0.0 && v_old == 0.0 && params.wd == 0.0 {
+        return;
+    }
+
     // Update biased first moment
-    let m_new = params.beta1 * m[i] + (1.0 - params.beta1) * g;
+    let m_new = params.beta1 * m_old + (1.0 - params.beta1) * g;
     // Update biased second moment
-    let v_new = params.beta2 * v[i] + (1.0 - params.beta2) * g * g;
+    let v_new = params.beta2 * v_old + (1.0 - params.beta2) * g * g;
 
     m[i] = m_new;
     v[i] = v_new;
