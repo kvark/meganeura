@@ -968,6 +968,57 @@ pub struct ExecutionPlan {
     pub knobs: TuningKnobs,
 }
 
+impl ExecutionPlan {
+    fn node_buffer(&self, node_id: NodeId) -> BufferRef {
+        let &(mapped_id, buffer) = self
+            .node_buffers
+            .get(node_id as usize)
+            .expect("compiled plan is missing a graph node buffer");
+        assert_eq!(
+            mapped_id, node_id,
+            "compiled node buffers are not ID-sorted"
+        );
+        buffer
+    }
+
+    fn attach_borrowed_constant_buffers(&mut self, graph: &Graph) {
+        for node in graph.nodes() {
+            if let Op::Constant { ref data } = node.op {
+                let buffer = self.node_buffer(node.id);
+                self.constant_buffers.push((buffer, data.clone()));
+            }
+        }
+    }
+
+    fn attach_owned_constant_buffers(&mut self, graph: &mut Graph) {
+        for node in graph.nodes_mut() {
+            let node_id = node.id;
+            if let Op::Constant { ref mut data } = node.op {
+                let buffer = self.node_buffer(node_id);
+                self.constant_buffers.push((buffer, std::mem::take(data)));
+            }
+        }
+    }
+
+    fn finish(mut self, options: &CompileOptions) -> Self {
+        if options.fuse_dispatches {
+            fuse_epilogues(&mut self);
+            if options.use_schedule_pointwise {
+                fuse_pointwise_chains(&mut self);
+            }
+            if options.use_schedule_reduction {
+                fuse_reduction_chains(&mut self);
+            }
+            fuse_row_scaled_scatters(&mut self);
+        }
+        // RmsNorm+MatMul prologue fusion is applied later in the runtime,
+        // after per-dispatch coop selection — the prologue path currently
+        // only has a coop-matmul implementation. See Session::with_context.
+
+        self
+    }
+}
+
 /// Compile a differentiated graph into an ExecutionPlan.
 /// Topological sort of graph nodes (Kahn's algorithm).
 /// Returns node IDs in dependency order: producers before consumers.
@@ -1060,14 +1111,15 @@ pub(crate) fn compile_owned_with_caps(
     coop_caps: crate::codegen::CoopCaps,
 ) -> ExecutionPlan {
     let allow_reduced_precision_attention_backward = options.flash_backward_coop;
-    let mut plan = compile_base_with_caps_policy(
+    let mut plan = Compiler::new_with_options(
         &graph,
-        options,
+        options.clone(),
         coop_caps,
         allow_reduced_precision_attention_backward,
-    );
-    attach_owned_constant_buffers(&mut plan, &mut graph);
-    finish_compile(plan, options)
+    )
+    .into_plan();
+    plan.attach_owned_constant_buffers(&mut graph);
+    plan.finish(options)
 }
 
 fn compile_with_caps_policy(
@@ -1076,100 +1128,15 @@ fn compile_with_caps_policy(
     coop_caps: crate::codegen::CoopCaps,
     allow_reduced_precision_attention_backward: bool,
 ) -> ExecutionPlan {
-    let mut plan = compile_base_with_caps_policy(
-        graph,
-        options,
-        coop_caps,
-        allow_reduced_precision_attention_backward,
-    );
-    attach_borrowed_constant_buffers(&mut plan, graph);
-    finish_compile(plan, options)
-}
-
-fn compile_base_with_caps_policy(
-    graph: &Graph,
-    options: &CompileOptions,
-    coop_caps: crate::codegen::CoopCaps,
-    allow_reduced_precision_attention_backward: bool,
-) -> ExecutionPlan {
-    let mut compiler = Compiler::new_with_options(
+    let mut plan = Compiler::new_with_options(
         graph,
         options.clone(),
         coop_caps,
         allow_reduced_precision_attention_backward,
-    );
-    compiler.compile();
-
-    // Propagate derived parameter info from graph to plan
-    for dp in &graph.derived_params {
-        if let Some(&(_, buf_ref)) = compiler
-            .plan
-            .param_buffers
-            .iter()
-            .find(|entry| entry.0 == dp.name)
-        {
-            let sources: Vec<(String, usize)> = dp
-                .sources
-                .iter()
-                .map(|entry| (entry.0.clone(), entry.1))
-                .collect();
-            compiler
-                .plan
-                .derived_params
-                .push((buf_ref, sources, dp.transform.clone()));
-        }
-    }
-
-    compiler.plan
-}
-
-fn node_buffer(plan: &ExecutionPlan, node_id: NodeId) -> BufferRef {
-    let &(mapped_id, buffer) = plan
-        .node_buffers
-        .get(node_id as usize)
-        .expect("compiled plan is missing a graph node buffer");
-    assert_eq!(
-        mapped_id, node_id,
-        "compiled node buffers are not ID-sorted"
-    );
-    buffer
-}
-
-fn attach_borrowed_constant_buffers(plan: &mut ExecutionPlan, graph: &Graph) {
-    for node in graph.nodes() {
-        if let Op::Constant { ref data } = node.op {
-            let buffer = node_buffer(plan, node.id);
-            plan.constant_buffers.push((buffer, data.clone()));
-        }
-    }
-}
-
-fn attach_owned_constant_buffers(plan: &mut ExecutionPlan, graph: &mut Graph) {
-    for node in graph.nodes_mut() {
-        let node_id = node.id;
-        if let Op::Constant { ref mut data } = node.op {
-            let buffer = node_buffer(plan, node_id);
-            plan.constant_buffers.push((buffer, std::mem::take(data)));
-        }
-    }
-}
-
-fn finish_compile(mut plan: ExecutionPlan, options: &CompileOptions) -> ExecutionPlan {
-    if options.fuse_dispatches {
-        fuse_epilogues(&mut plan);
-        if options.use_schedule_pointwise {
-            fuse_pointwise_chains(&mut plan);
-        }
-        if options.use_schedule_reduction {
-            fuse_reduction_chains(&mut plan);
-        }
-        fuse_row_scaled_scatters(&mut plan);
-    }
-    // RmsNorm+MatMul prologue fusion is applied later in the runtime, after
-    // per-dispatch coop selection — the prologue path currently only has a
-    // coop-matmul implementation. See Session::with_context.
-
-    plan
+    )
+    .into_plan();
+    plan.attach_borrowed_constant_buffers(graph);
+    plan.finish(options)
 }
 
 /// Fuse the table-gradient chain produced by
@@ -2394,6 +2361,31 @@ impl<'a> Compiler<'a> {
             allow_reduced_precision_attention_backward,
             fused_grad_kv_dv: HashMap::new(),
         }
+    }
+
+    fn into_plan(mut self) -> ExecutionPlan {
+        self.compile();
+
+        // Propagate derived parameter info from graph to plan.
+        for derived in &self.graph.derived_params {
+            if let Some(&(_, buffer)) = self
+                .plan
+                .param_buffers
+                .iter()
+                .find(|entry| entry.0 == derived.name)
+            {
+                let sources = derived
+                    .sources
+                    .iter()
+                    .map(|entry| (entry.0.clone(), entry.1))
+                    .collect();
+                self.plan
+                    .derived_params
+                    .push((buffer, sources, derived.transform.clone()));
+            }
+        }
+
+        self.plan
     }
 
     fn alloc_buffer(&mut self, size_bytes: usize) -> BufferRef {
