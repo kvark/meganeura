@@ -235,27 +235,27 @@ pub fn plan_buffer_aliasing(
 fn uniform_constant_aliases(plan: &ExecutionPlan) -> Vec<Option<usize>> {
     let n = plan.buffers.len();
     let mut mutable = vec![false; n];
-    let mark = |buffer: BufferRef, mutable: &mut [bool]| mutable[buffer.0 as usize] = true;
+    let mut mark = |buffer: BufferRef| mutable[buffer.0 as usize] = true;
     for &(_, buffer) in &plan.param_buffers {
-        mark(buffer, &mut mutable);
+        mark(buffer);
     }
     for &(_, buffer) in &plan.input_buffers {
-        mark(buffer, &mut mutable);
+        mark(buffer);
     }
     for &(parameter, gradient) in &plan.param_grad_pairs {
-        mark(parameter, &mut mutable);
-        mark(gradient, &mut mutable);
+        mark(parameter);
+        mark(gradient);
     }
     for entry in &plan.derived_params {
-        mark(entry.0, &mut mutable);
+        mark(entry.0);
     }
     for &buffer in plan.weight_buffers.keys() {
-        mark(buffer, &mut mutable);
+        mark(buffer);
     }
     for dispatch in &plan.dispatches {
-        mark(dispatch.output_buffer, &mut mutable);
+        mark(dispatch.output_buffer);
         for &buffer in &dispatch.extra_outputs {
-            mark(buffer, &mut mutable);
+            mark(buffer);
         }
     }
 

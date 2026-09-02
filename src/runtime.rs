@@ -6,12 +6,11 @@ type Gpu = blade_graphics::Context;
 
 /// Leave room for pipelines, command buffers, and driver-owned allocations
 /// that are not represented by the execution plan's buffer sizes.
-const DEVICE_MEMORY_SAFE_NUMERATOR: u64 = 9;
-const DEVICE_MEMORY_SAFE_DENOMINATOR: u64 = 10;
+const DEVICE_MEMORY_SAFE_PERCENT: u64 = 90;
+const DEVICE_MEMORY_RESERVE_PERCENT: u64 = 100 - DEVICE_MEMORY_SAFE_PERCENT;
 
 fn safe_device_memory_remaining(usage: u64, budget: u64) -> u64 {
-    let safe_limit = ((budget as u128 * DEVICE_MEMORY_SAFE_NUMERATOR as u128)
-        / DEVICE_MEMORY_SAFE_DENOMINATOR as u128) as u64;
+    let safe_limit = ((budget as u128 * DEVICE_MEMORY_SAFE_PERCENT as u128) / 100u128) as u64;
     safe_limit.saturating_sub(usage)
 }
 
@@ -24,7 +23,7 @@ fn ensure_device_memory_budget(gpu: &Gpu, requested: usize, allocation: &str) {
     let remaining = safe_device_memory_remaining(stats.usage, stats.budget);
     assert!(
         requested <= remaining,
-        "refusing to oversubscribe GPU memory for {allocation}: requested {:.2} GB with {:.2} GB already used, but the device reports a {:.2} GB budget and Meganeura reserves 10% for pipelines and the driver ({:.2} GB safely available); reduce the model, sequence, batch, or microbatch geometry",
+        "refusing to oversubscribe GPU memory for {allocation}: requested {:.2} GB with {:.2} GB already used, but the device reports a {:.2} GB budget and Meganeura reserves {DEVICE_MEMORY_RESERVE_PERCENT}% for pipelines and the driver ({:.2} GB safely available); reduce the model, sequence, batch, or microbatch geometry",
         requested as f64 / 1e9,
         stats.usage as f64 / 1e9,
         stats.budget as f64 / 1e9,

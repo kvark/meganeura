@@ -20,6 +20,8 @@ var<storage, read_write> v: array<f32>;
 var<storage, read_write> grouped_grad_norm: array<f32>;
 var<uniform> params: Params;
 
+const ADAM_ALGORITHM_LAPROP: u32 = 1u;
+
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
@@ -46,10 +48,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let v_hat = v_new / (1.0 - pow(params.beta2, params.step));
 
     // Adam accumulates momentum on raw gradients and normalizes the result.
-    // LaProp (algorithm=1) normalizes each gradient first and then accumulates
+    // LaProp normalizes each gradient first and then accumulates
     // momentum, matching DreamerV3's RMS -> momentum optimizer chain.
     var moment_input = g;
-    if params.algorithm == 1u {
+    if params.algorithm == ADAM_ALGORITHM_LAPROP {
         moment_input = g / (sqrt(v_hat) + params.eps);
     }
     let m_new = params.beta1 * m[i] + (1.0 - params.beta1) * moment_input;
@@ -57,7 +59,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let m_hat = m_new / (1.0 - pow(params.beta1, params.step));
 
     var update = m_hat / (sqrt(v_hat) + params.eps);
-    if params.algorithm == 1u {
+    if params.algorithm == ADAM_ALGORITHM_LAPROP {
         update = m_hat;
     }
 
