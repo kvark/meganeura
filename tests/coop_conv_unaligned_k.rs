@@ -7,29 +7,30 @@
 //! k_total % 4 != 0 (codegen::emit_forward_weight_stage).
 //!
 //! The coop path runs only on GPUs that advertise cooperative matrices;
-//! on f16-only GPUs it is opt-in (overflow-unsafe for large activations),
-//! so we force it with MEGANEURA_COOP_F16. With small bounded inputs f16
-//! precision is fine, isolating the K%4 *alignment* correctness. On
-//! no-coop hardware (e.g. lavapipe CI) both paths are scalar and the test
-//! trivially passes.
+//! on f16-only GPUs it is opt-in (overflow-unsafe for large activations).
+//! The test selects that policy explicitly. With small bounded inputs f16
+//! precision is fine, isolating the K%4 *alignment* correctness. On no-coop
+//! hardware (e.g. lavapipe CI) both paths are scalar and the test trivially
+//! passes.
 
-use meganeura::Graph;
-use std::sync::Mutex;
+use meganeura::{CoopPolicy, Graph, Mode, SessionConfig, SessionOptions};
 
-static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
+fn config(mode: Mode, coop: bool) -> SessionConfig<'static> {
+    SessionConfig {
+        mode,
+        runtime: SessionOptions {
+            coop: if coop {
+                CoopPolicy::AllowF16
+            } else {
+                CoopPolicy::Disabled
+            },
+            ..SessionOptions::default()
+        },
+        ..SessionConfig::default()
+    }
+}
 
 fn conv_out(in_c: u32, coop: bool) -> Vec<f32> {
-    // SAFETY: both tests hold GPU_TEST_LOCK while mutating these
-    // process-global feature switches.
-    unsafe {
-        if coop {
-            std::env::set_var("MEGANEURA_COOP_F16", "1");
-            std::env::remove_var("MEGANEURA_DISABLE_COOP");
-        } else {
-            std::env::set_var("MEGANEURA_DISABLE_COOP", "1");
-            std::env::remove_var("MEGANEURA_COOP_F16");
-        }
-    }
     let (batch, hw, out_c) = (32u32, 16u32, 64u32);
     let in_size = (batch * in_c * hw * hw) as usize;
     let k_size = (out_c * in_c * 9) as usize;
@@ -38,7 +39,7 @@ fn conv_out(in_c: u32, coop: bool) -> Vec<f32> {
     let k = g.parameter("k", &[k_size]);
     let y = g.conv2d(x, k, batch, in_c, hw, hw, out_c, 3, 3, 1, 1);
     g.set_outputs(vec![y]);
-    let mut s = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    let mut s = meganeura::build(&g, config(Mode::Inference, coop)).0;
     // Small bounded values so f16 coop precision is not the issue.
     let xd: Vec<f32> = (0..in_size)
         .map(|i| ((i * 31 % 17) as f32 / 16.0 - 0.5) * 0.2)
@@ -54,16 +55,6 @@ fn conv_out(in_c: u32, coop: bool) -> Vec<f32> {
 }
 
 fn conv_input_grad(coop: bool) -> Vec<f32> {
-    // SAFETY: the caller holds GPU_TEST_LOCK while mutating these
-    // process-global feature switches.
-    unsafe {
-        if coop {
-            std::env::remove_var("MEGANEURA_DISABLE_COOP");
-        } else {
-            std::env::set_var("MEGANEURA_DISABLE_COOP", "1");
-        }
-    }
-
     // H*W = 196 is not a multiple of the 16-wide f32 cooperative output
     // tile on Apple Silicon. The grad-input kernel must bounds-check the
     // partial right edge instead of letting coopStoreT cross NCHW rows.
@@ -77,7 +68,7 @@ fn conv_input_grad(coop: bool) -> Vec<f32> {
     let loss = g.mean_all(y);
     g.set_outputs(vec![loss]);
 
-    let mut s = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
+    let mut s = meganeura::build(&g, config(Mode::Training, coop)).0;
     let xd: Vec<f32> = (0..x_size)
         .map(|i| ((i * 31 % 17) as f32 - 8.0) * 0.01)
         .collect();
@@ -94,9 +85,32 @@ fn conv_input_grad(coop: bool) -> Vec<f32> {
     grad
 }
 
+fn conv_partial_output_batch(coop: bool) -> Vec<f32> {
+    // Co=1 needs a partial cooperative output tile. With N>1, padding those
+    // rows changes the batch stride unless this dispatch stays scalar.
+    let (batch, in_c, out_c, hw) = (4u32, 6u32, 1u32, 64u32);
+    let input_size = (batch * in_c * hw * hw) as usize;
+    let kernel_size = (out_c * in_c) as usize;
+    let mut g = Graph::new();
+    let x = g.input("x", &[input_size]);
+    let k = g.parameter("k", &[kernel_size]);
+    let y = g.conv2d(x, k, batch, in_c, hw, hw, out_c, 1, 1, 1, 0);
+    g.set_outputs(vec![y]);
+
+    let mut s = meganeura::build(&g, config(Mode::Inference, coop)).0;
+    let xd: Vec<f32> = (0..input_size)
+        .map(|i| ((i * 31 % 37) as f32 - 18.0) * 0.01)
+        .collect();
+    let kd: Vec<f32> = (0..kernel_size).map(|i| (i as f32 + 1.0) * 0.05).collect();
+    s.set_parameter("k", &kd);
+    s.set_input("x", &xd);
+    s.step();
+    s.wait();
+    s.read_output((batch * out_c * hw * hw) as usize)
+}
+
 #[test]
 fn coop_conv_unaligned_k_matches_scalar() {
-    let _guard = GPU_TEST_LOCK.lock().expect("GPU test lock poisoned");
     // K = 14*9 = 126, not a multiple of 4 — the failing case.
     let scalar = conv_out(14, false);
     let coop = conv_out(14, true);
@@ -118,7 +132,6 @@ fn coop_conv_unaligned_k_matches_scalar() {
 
 #[test]
 fn coop_conv_aligned_k_matches_scalar() {
-    let _guard = GPU_TEST_LOCK.lock().expect("GPU test lock poisoned");
     // K = 16*9 = 144, a multiple of 4 — the already-working case (guard).
     let scalar = conv_out(16, false);
     let coop = conv_out(16, true);
@@ -135,7 +148,6 @@ fn coop_conv_aligned_k_matches_scalar() {
 
 #[test]
 fn coop_conv_grad_input_partial_right_edge_matches_scalar() {
-    let _guard = GPU_TEST_LOCK.lock().expect("GPU test lock poisoned");
     let scalar = conv_input_grad(false);
     let coop = conv_input_grad(true);
     let max_abs = scalar
@@ -146,5 +158,20 @@ fn coop_conv_grad_input_partial_right_edge_matches_scalar() {
     assert!(
         max_abs < 1e-5,
         "coop grad-input wrong at partial right edge: max_abs_diff={max_abs}"
+    );
+}
+
+#[test]
+fn coop_conv_batched_partial_output_tile_matches_scalar() {
+    let scalar = conv_partial_output_batch(false);
+    let coop = conv_partial_output_batch(true);
+    let max_abs = scalar
+        .iter()
+        .zip(&coop)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_abs < 1e-5,
+        "batched conv with a partial output tile changed under cooperative selection: {max_abs}"
     );
 }
