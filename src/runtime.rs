@@ -2086,15 +2086,21 @@ pub(crate) fn select_variants(
             //     n)` which writes a 16×16 sub-tile with row stride
             //     `n`. A right-edge tile with N not divisible by 16
             //     straddles logical rows, so it remains unsupported. A
-            //     bottom-edge tile is safe: session construction pads the
-            //     allocation to `ceil(M/16) * N`, and consumers retain the
-            //     logical M extent, so the extra rows are never observed.
-            //     Allowing partial M tiles is important for sequence
-            //     lengths such as 50, which dominate transformer training.
+            //     bottom-edge tile is safe for one matrix: session construction
+            //     pads the allocation to `ceil(M/16) * N`, and consumers retain
+            //     the logical M extent, so the extra rows are never observed.
+            //     It is not safe for batched convolution. The cooperative
+            //     kernel stores each later batch after the padded M rows, while
+            //     every consumer addresses it after the logical M rows. Require
+            //     a complete M tile there; batch zero otherwise looks correct
+            //     while every later image reads padding.
             //
             // (Conv2dGemm also stores via coopStoreT and needs the same
             // check; its `m`/`n` come from the params destructure above.)
-            let store_ok = n.is_multiple_of(16);
+            let store_ok = n.is_multiple_of(16)
+                && (!matches!(group, ShaderGroup::Conv2dGemm)
+                    || batch == 1
+                    || m.is_multiple_of(output_tile));
             let vec4_ok = match group {
                 ShaderGroup::MatMulBT => store_ok,
                 ShaderGroup::MatMulAT => store_ok,
