@@ -53,5 +53,57 @@ tests; native-f32 shaders have offline Naga/SPIR-V coverage only on this host.
 
 ## Results
 
-Raw runs and interpretation will be recorded here after the committed harness
-has run. Frozen `paper/results` and `paper/tables` are not experiment outputs.
+Measured source: `0e27b68e92bfb72745eb2f582107236cd541c409`, Rust 1.98.0,
+Linux x86_64, Intel Core i5-12400F host, RTX 5070 / NVIDIA 595.71.05.
+All five processes used the same lockfile and executable hashes. The GPU
+reported 0% utilization before the serial experiment; no other qualification
+or benchmark was run concurrently. Clocks/power were not locked and driver
+shader caches were not cleared between runs; observed search costs are not a
+clean-install cold-start estimate. Sequential processes on one host are
+repeatability evidence, not independent fleet samples.
+
+Raw evidence: [run 1](run-01.json), [run 2](run-02.json), [run 3](run-03.json),
+[run 4](run-04.json), [run 5](run-05.json). No runs were discarded.
+
+| Dense chain (rows × input → width; layers) | Whole-step ms, baseline → tuned¹ | Median speedup² (process range) | Runs above guard | Changed dispatches | Median search cost |
+|---|---:|---:|---:|---:|---:|
+| 33 × 17 → 65; 4 | 0.0562 → 0.0562 | 1.000× (1.000–1.019×) | 0/5 | 0 | 11.5 ms |
+| 32 × 256 → 256; 8 | 0.1118 → 0.1117 | 1.001× (0.990–1.002×) | 0/5 | 0 | 20.2 ms |
+| 128 × 512 → 512; 8 | 0.3078 → 0.2678 | 1.151× (1.127–1.155×) | 5/5 | 8 | 65.7 ms |
+| 64 × 1024 → 1024; 4 | 0.3007 → 0.2678 | 1.127× (1.118–1.132×) | 5/5 | 4 | 98.3 ms |
+
+¹ Each entry is the median of five per-process medians.
+² Median of five within-process ratios, not the ratio of the aggregated times.
+
+All 60 class comparisons qualified; 30 retained the incumbent and 30 chose the
+challenger. Both larger chains consistently switched every dispatch from
+64×64 to 32×32 scalar tiles; both smaller chains retained 32×32. Every graph's
+final output matched its untuned reference exactly in this experiment.
+This does not promise bitwise equality for all f32 implementations or inputs.
+
+The larger cases clear the descriptive whole-step guard in all five processes.
+Median per-process amortization estimates are **1,617 steps** for the 512-wide
+chain and **2,850 steps** for the 1024-wide chain, using search cost divided by
+measured whole-step time saved. The smaller cases pay search cost with no
+demonstrated benefit. These costs exclude ordinary session construction and
+do not count this experiment's extra control-session/confirmation overhead.
+
+The two larger shapes have exactly 16 initial 64-tile output workgroups, where
+the static `<16` small-tile rule retains Tile64. The measured search challenges
+that boundary without changing the cutoff, adding a device-name exception, or
+recognizing a model. Three classes per chain arise from shape and binding
+placement; the final host-visible output is not pooled with device-local
+intermediates even at equal M/N/K.
+
+CPU record replay: `cargo test --test tuning_evidence -- --nocapture` recomputes
+the raw-sample medians, paired guards, kernel decisions, pipeline-change counts
+and process speedups. This checks evidence consistency, not GPU correctness.
+
+Interpretation: this is positive evidence that isolated scalar choices can
+transfer to whole-step gains at this heuristic boundary. It does **not** show
+a PyTorch win, a model-training gain, native-f32 cooperative performance,
+transfer across devices, or enough holdout coverage to enable tuning by default.
+No hardware-specific threshold was changed in response to these four shapes.
+Next: broader held-out shapes/models, native-f32 hardware, and state-safe
+whole-step confirmation before persistence/default-on. Frozen `paper/results`
+and `paper/tables` remain unchanged.

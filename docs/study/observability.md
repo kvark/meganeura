@@ -269,6 +269,12 @@ a whole-model win. Choices are session-local, and scratch timing omits normal
 cross-kernel overlap, cache history and surrounding work. See the
 [implementation contract and hardware qualification](performance-plan.md).
 
+The [retained transfer experiment](../experiments/tuning-2026-09-05/README.md)
+is a concrete report-reading exercise: compare the three placement-sensitive
+classes, per-class decisions, final pipeline keys, search cost and independent
+whole-step samples. On this RTX 5070 the native-f32 coverage flag is false;
+positive scalar timings cannot be used as evidence for that unexecuted path.
+
 ## What we should improve next
 
 The highest-value debugging improvements are typed logical-tensor reads;

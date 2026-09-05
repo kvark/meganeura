@@ -30,7 +30,9 @@ names. The implementation searches scalar-f32 and legal native-f32 cooperative
 matmul tiles in isolated scratch. Scalar GPU qualification passed; native-f32
 hardware coverage is still due. F16-input/complex-fusion search and persistent
 winners remain future work. The whole-step experiment harness is separate
-from the frozen publication evidence.
+from the frozen publication evidence. Its [first five-process experiment](../experiments/tuning-2026-09-05/README.md)
+found repeatable 1.15×/1.13× gains on two synthetic dense chains; two smaller
+cases retained their initial tiles. This is not a new PyTorch comparison.
 
 ## Reading paths
 

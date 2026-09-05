@@ -138,6 +138,11 @@ qualification needs a different device: our RTX 5070 advertises f16 tiles only.
 Capability probing is named `auto_tune` but does not time kernels. Neither
 this new search nor new speedups are part of the frozen paper evidence.
 
+The [separate five-process transfer pilot](../experiments/tuning-2026-09-05/README.md)
+shows 1.15×/1.13× whole-step gains on two synthetic chains and unchanged choices
+on two smaller ones. Search amortizes over roughly 1,600–2,850 steps in the
+winning cases; do not turn that into a general model or PyTorch claim.
+
 ## Numerical behavior
 
 ### 13. Does strict f32 mean identical results?
