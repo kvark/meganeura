@@ -56,7 +56,8 @@ publication-grade comparisons. The new protocol reports raw samples, uses
 matched workloads and full forward-plus-backward timing, and separates strict
 f32 from reduced-input accelerated modes.
 
-PyTorch CUDA currently leads several RTX 5080 workloads, especially training.
+In the frozen paper matrix, PyTorch CUDA leads several RTX 5070 workloads,
+especially training.
 Meganeura's strongest result is therefore not universal speed superiority; it
 is how much of that performance can be reached through a portable execution
 stack that also runs on AMD, Intel, and Apple GPUs.
@@ -86,19 +87,30 @@ generators is active work.
 |                                                 |GPU backends                        |Training      |Approach                                |
 |-------------------------------------------------|------------------------------------|--------------|----------------------------------------|
 |**Meganeura**                                    |blade-graphics (Vulkan, Metal)      |yes           |graph IR + rewrites + specialized WGSL         |
-|[Candle](https://github.com/huggingface/candle)  |CUDA, Metal, CPU                    |limited       |eager tensors, hand-written kernels     |
-|[Burn](https://github.com/tracel-ai/burn)        |CUDA, wgpu, NDArray, LibTorch       |yes           |modular multi-backend                   |
+|[Candle](https://github.com/huggingface/candle)  |CUDA, Metal, CPU                    |yes           |tensor API, native kernels              |
+|[Burn](https://github.com/tracel-ai/burn)        |CubeCL: CUDA, ROCm, Metal, Vulkan, WebGPU; CPU paths |yes |modular backends, JIT fusion      |
 |[tch-rs](https://github.com/LaurentMazare/tch-rs)|CUDA, CPU (via libtorch)            |yes           |PyTorch FFI bindings                    |
 
 Meganeura's wedge is a uniform graph, autodiff, compiler, and runtime stack for
 both training and inference across desktop and edge-class Vulkan/Metal
 devices.
 
+For the detailed, source-backed comparison, read the
+[study guide](docs/study/README.md) and [alternatives](docs/study/alternatives.md).
+The [September audit](docs/audit-2026-09.md) separates current implementation
+status from the frozen results; the [performance plan](docs/study/performance-plan.md)
+describes bounded, correctness-gated autotuning work still to be done.
+
 ## Install
 
 ```
 cargo add meganeura
 ```
+
+Development HEAD pins Blade APIs newer than its published dependency version.
+Use this checkout for current development; assembling a package with
+`--no-verify` does not establish that HEAD builds against crates.io-only
+dependencies. A release needs a matching published Blade/Naga dependency set.
 
 Hub downloads (`SafeTensorsModel::download`) need the optional `hub` feature:
 
@@ -155,7 +167,7 @@ win, so explicit code always has the last word.
 | Variable | Effect |
 |---|---|
 | `MEGANEURA_DISABLE_COOP` | Force the portable scalar matmul path (regression diagnosis). |
-| `MEGANEURA_COOP_F16` | Opt in to f16-input cooperative tiles when no f32 tile is advertised. |
+| `MEGANEURA_COOP_F16` | Allow f16-input cooperative tiles even for precision-sensitive derivative work; requires numerical validation. Default `Auto` protects derivatives and can already use f16 tiles for forward work. |
 | `MEGANEURA_FLASH_FWD_COOP=0` | Disable only cooperative flash-attention forward. |
 | `MEGANEURA_FLASH_BWD_COOP` | Enable the experimental reduced-precision flash backward. |
 | `MEGANEURA_NO_ALIAS` | Disable buffer lifetime aliasing (every value gets its own allocation). |
@@ -168,13 +180,18 @@ win, so explicit code always has the last word.
 | `MEGANEURA_OPTIMIZER` | Rewrite mode: `off` \| `greedy` \| `egglog-windowed` \| `egglog-outlined` \| `egglog-whole`. |
 | `MEGANEURA_EGRAPH_COST` | Extraction objective: `ast-size` \| `tensor-traffic`. |
 | `MEGANEURA_EGRAPH_CUTOFF=<n>` | Saturation segment-size ceiling (default 300). |
-| `MEGANEURA_TUNE` | Measure coop vs scalar per kernel family at session build; keep the faster (`SessionConfig { tune: true }` equivalent). |
+| `MEGANEURA_TUNE` | Opt-in family-level coop-to-scalar measurements at build (`SessionConfig { tune: true }`). Not comprehensive shape tuning; see the state caveat below. |
 | `MEGANEURA_FLASH_EPT_CAP=<n>` | Flash forward elements-per-thread cap (power of two ≥ 2). |
 | `MEGANEURA_FLASH_GRAD_Q_EPT_CAP=<n>` | EPT cap for flash dQ backward. |
 | `MEGANEURA_FLASH_GRAD_KV_EPT_CAP=<n>` | EPT cap for fused flash dK/dV backward. |
 | `MEGANEURA_FLASH_BWD_EPT_CAP=<n>` | Shared fallback cap for both flash backward kernels. |
 | `MEGANEURA_DEVICE_ID=0x744c` | Adapter selection by numeric device id. |
 | `MEGANEURA_GPU_TIMING` | Enable hardware timestamp pools (set before context creation). |
+
+Tuning runs real steps. Build-time tuning precedes user input/weight uploads;
+calling `Session::tune` on an active session can advance optimizer,
+accumulation, or KV state. It is not a side-effect-free query. Keep it off
+when those side effects are inappropriate; state-isolated tuning is planned.
 
 ## Debugging
 

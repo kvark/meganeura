@@ -52,9 +52,9 @@ in the other two, the PyTorch/ROCm Radeon~780M backward record disagrees with
 the other four PyTorch backends and all five \system{} records. We classify
 that paired comparison as oracle-disputed rather than as a \system{} failure.
 In strict f32, \system{} wins 12 of 20 GPU-referenced
-minimal-latency cells and has a median valid training gap of $1.8\times$. On
+minimal-latency cells and has a median valid GPU-referenced training gap of $1.8\times$. On
 the discrete AMD GPU, four of five inference workloads are within
-$1.10\times$ of compiled ROCm PyTorch and three training workloads are faster.
+$1.11\times$ of compiled ROCm PyTorch and three training workloads are faster.
 Under accelerated contracts, the worst training gap is $4.6\times$.
 
 Compilation takes 0.1--2.4\,s versus 6--96\,s for \code{torch.compile} on
@@ -668,10 +668,12 @@ This paper makes no decode claim; a decode result would require both engines
 to use a matched cache layout and cache length.
 
 PyTorch is the numerical reference. Forward validity requires matching output
-shape, relative output L2 error below 1\%, and symmetric relative loss error
+shape, relative L2 error below 1\% over 256 evenly spaced flattened output
+samples, and symmetric relative loss error
 below 1\%. A forward--loss--backward cell additionally requires matching
 canonical trainable parameter sets, total-gradient-norm error below 5\%, and
-relative L2 error below 5\% over the vector of per-parameter gradient norms. A
+relative L2 error below 5\% over the vector of per-parameter gradient norms.
+These checks do not compare full output or elementwise gradient tensors. A
 backward failure invalidates that cell without discarding a valid inference
 cell. The designated reference must also be a usable oracle. If its
 deterministic backward record is inconsistent with the other reference
@@ -784,7 +786,7 @@ two of five inference cells (diffusion U-Net $0.82\times$, ResNet-50
 $0.90\times$) and three of five one-token cells; the remaining inference
 gaps are $1.84$--$2.65\times$, and training runs $1.8$--$2.9\times$ behind.
 On the RX~7900~XT the portable stack effectively reaches the vendor stack:
-four of five workloads are within $1.10\times$ for inference (SmolVLA is
+four of five workloads are within $1.11\times$ for inference (SmolVLA is
 $0.67\times$, i.e.\ 33\% faster) and \emph{three of five training cells are
 outright faster} (SmolVLA $0.73\times$, diffusion U-Net $0.89\times$,
 Whisper $0.90\times$), with ResNet-50 the outlier in both ($1.85\times$ and
@@ -862,9 +864,9 @@ training cells between $0.75\times$ and $1.16\times$.
 
 Two honest wrinkles. On the RX~7900~XT, SmolVLA \emph{regresses} from
 $3.05$ to $3.82$\,ms when the cooperative path is permitted, and the same
-regression reproduces on the 780M: the current selection treats an
-available cooperative tile as always profitable, and for these shapes on
-RADV it is not --- a per-shape cost model is the indicated fix. And
+regression reproduces on the 780M: the shape heuristics select an
+unprofitable cooperative variant here. Measured per-shape selection is a
+plausible remedy, not a demonstrated gain. And
 \system{}'s ResNet-50 and SmolVLA cells gain nothing on NVIDIA because
 their hot matrix sites do not currently promote to cooperative geometry
 (Section~\ref{sec:ablation}). Correctness margins remain wide in this mode:
@@ -882,7 +884,7 @@ mode and at most 2.4\,s with cooperative variants enabled, on every device
 in the matrix. Where \code{torch.compile} functions it takes 6.5--96\,s for
 the corresponding specializations (Table~\ref{tab:strict-results}), the
 maximum being SmolLM on ROCm: 96\,s against 0.47\,s. This is not only a
-development-loop difference: sub-second specialization is what makes
+development-loop difference: short specialization times are what make
 compile-on-device practical for the deployment scenarios of
 Section~\ref{sec:implications}, where a shipped application cannot assume a
 warm compiler cache or tolerate a minute of stall.
@@ -1055,7 +1057,7 @@ Whisper's forward pass on this machine validates at 0.0016\%, but the paired
 backward comparison disagrees by 17.7--17.8\% in the vector of per-parameter
 gradient norms across the two arithmetic modes. This is not a failed
 \system{} execution: all five \system{} runs complete. Under strict f32,
-their gradient vectors agree mutually within 0.00002\%; PyTorch on CUDA,
+their parameter-gradient-norm vectors agree mutually within 0.00002\%; PyTorch on CUDA,
 discrete ROCm, CPU, and MPS agrees within 0.001\%; and the two clusters agree
 within 0.035\%. Accelerated records preserve the separation: each cluster is
 internally within 0.007\%, their cross-cluster disagreement is at most
@@ -1374,8 +1376,9 @@ remembered when comparing the aggregate's workload rows.
 
 Strict f32 controls arithmetic permissions, not operation order or bitwise
 identity. Accelerated mode intentionally compares different fast formats and
-must not be interpreted as format equivalence. Gradient-norm gates can miss
-elementwise cancellation; the artifact should add sampled or full gradient
+must not be interpreted as format equivalence. Output sampling can miss
+localized errors, and gradient-norm gates can miss elementwise disagreement,
+including sign changes; the artifact should add sampled or full gradient
 vector comparisons where memory permits. Two SPIR-V decorations bear on
 this and are currently unexploited through Blade/Naga:
 \code{NoContraction}, which would pin FMA contraction and tighten

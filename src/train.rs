@@ -330,13 +330,19 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, Optimiz
         Mode::Training => 0,
         Mode::Inference => 1,
     };
-    let build_hash = cache::hash_build_config(&options, mode_tag, skip_full_optimize, coop_caps);
+    let build_hash = cache::hash_build_config(
+        &options,
+        &cfg.optimize,
+        mode_tag,
+        skip_full_optimize,
+        coop_caps,
+    );
 
     if let Some(path) = cache_path {
         match cache::load_build_plan(forward_graph, build_hash, path) {
             Ok(Some(plan)) => {
                 log::info!("loaded cached execution plan from {}", path.display());
-                let session = make_session(plan, gpu, cfg.runtime.clone());
+                let session = make_session(plan, gpu, cfg.runtime.clone(), cfg.tune);
                 return (session, OptimizeReport::empty());
             }
             Ok(None) => log::info!("no valid cache found, recompiling"),
@@ -412,14 +418,7 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, Optimiz
         }
     }
 
-    let mut session = {
-        let _span = tracing::info_span!("gpu_init").entered();
-        make_session(plan, gpu, cfg.runtime.clone())
-    };
-    if cfg.tune {
-        let _span = tracing::info_span!("tune").entered();
-        session.tune();
-    }
+    let session = make_session(plan, gpu, cfg.runtime.clone(), cfg.tune);
     (session, report)
 }
 
@@ -427,8 +426,17 @@ fn make_session(
     plan: compile::ExecutionPlan,
     gpu: Arc<blade_graphics::Context>,
     opts: runtime::SessionOptions,
+    tune: bool,
 ) -> Session {
-    Session::with_context_opts(plan, gpu, opts)
+    let mut session = {
+        let _span = tracing::info_span!("gpu_init").entered();
+        Session::with_context_opts(plan, gpu, opts)
+    };
+    if tune {
+        let _span = tracing::info_span!("tune").entered();
+        session.tune();
+    }
+    session
 }
 
 /// Sugar for `build(g, SessionConfig::default()).0` — the common

@@ -33,9 +33,26 @@ LaTeX table/figure fragments in a temporary directory, and compares them
 byte-for-byte with `expected/tables/`. Add `--show-facts` to print the full
 aggregate fact block used for the prose audit.
 
-This is the recommended first evaluation tier. It verifies the paper from
-the retained observations without pretending that hardware-dependent timing
-can be recreated on an arbitrary machine.
+The checks include raw-versus-joined record equality, median recomputation,
+and replay of the sampled-output and gradient-norm validity gates. These
+records retain 256 output samples and one norm per parameter tensor, not full
+outputs or elementwise gradients. The verifier cannot validate unretained
+elements or assert arbitrary claims in the paper's prose.
+
+This is the recommended first evaluation tier. It verifies the retained
+observations and their analysis without pretending that hardware-dependent
+timing can be recreated on an arbitrary machine.
+
+From the Meganeura checkout (not an extracted bundle), use:
+
+```sh
+python3 paper/p3hpc/artifact/verify.py --repository --show-facts
+python3 -m unittest discover -s paper/p3hpc/artifact -p 'test_*.py'
+```
+
+Repository mode checks `paper/results/` and replays the tracked tables in a
+temporary directory. It does not require or assert a bundle manifest or a
+packaged expected-facts file. Neither mode launches a GPU or collects timings.
 
 ## Contributions and supporting artifacts
 
@@ -47,7 +64,7 @@ The paper makes four principal contributions:
 - **C2: mechanism-resolved performance results.** Supported by the ordinary
   timings in **A1** and the per-dispatch timestamp sidecars in **A4**.
 - **C3: independent correctness gates.** Supported by the output, loss,
-  total-gradient, and per-parameter-gradient evidence in every **A1** record.
+  total-gradient-norm, and per-parameter-gradient-norm evidence in every **A1** record.
 - **C4: validity-disciplined Pennycook aggregation.** Supported by **A1** and
   the aggregation implementation and expected output in **A2**, including the
   symmetric oracle-dispute exclusion and its cross-backend audit.

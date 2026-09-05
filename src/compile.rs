@@ -781,10 +781,15 @@ fn merge_horizontal(dispatches: &[Dispatch], batch: &[usize]) -> Dispatch {
     let n = batch.len() as u32;
     merged.horizontal_batch = n;
     merged.workgroups[2] = n;
+    // The original fallback describes one output with z=1. The packed
+    // pipeline has different bindings, and only its selected variant is
+    // compiled. It cannot be flipped by the ordinary family tuner.
+    merged.scalar_fallback = None;
     merged.input_buffers = vec![merged.input_buffers[0]];
     merged.extra_outputs.clear();
     for (k, &idx) in batch.iter().enumerate() {
         let d = &dispatches[idx];
+        merged.requires_full_precision |= d.requires_full_precision;
         merged.input_buffers.push(d.input_buffers[1]);
         if k == 0 {
             merged.output_buffer = d.output_buffer;
@@ -6107,6 +6112,29 @@ mod tests {
             params: vec![32, 32, n, 0],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn horizontal_fusion_drops_unpacked_fallback_and_preserves_precision() {
+        let mut dispatches = vec![mm_dispatch(0, 1, 2, 1, 32), mm_dispatch(0, 3, 4, 1, 32)];
+        for d in &mut dispatches {
+            d.use_coop = true;
+            d.scalar_fallback = Some((d.shader.clone(), [1, 1, 1]));
+        }
+        dispatches[1].requires_full_precision = true;
+        let mut groups = Vec::new();
+        groups.push(0..2);
+
+        fuse_horizontal_matmuls(&mut dispatches, &mut groups);
+
+        assert_eq!(dispatches.len(), 1);
+        let packed = &dispatches[0];
+        assert_eq!(packed.horizontal_batch, 2);
+        assert_eq!(packed.workgroups, [2, 2, 2]);
+        assert!(packed.use_coop);
+        assert!(packed.requires_full_precision);
+        assert!(packed.scalar_fallback.is_none());
+        assert_eq!(packed.extra_outputs, [BufferRef(4)]);
     }
 
     #[test]

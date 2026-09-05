@@ -38,11 +38,12 @@ consumer GPUs? \system{} (34.5\,KLOC of Rust, 6.1\,KLOC of WGSL;
 specialized Vulkan and Metal kernels. We compare five workloads with PyTorch
 on five NVIDIA, AMD, Intel, and Apple machines under correctness-gated
 strict-f32 and accelerated contracts. In strict f32, \system{} wins 12 of 20
-GPU-referenced minimal-latency cells; median valid training time is
-$1.8\times$ PyTorch's. On discrete AMD, four of five inference workloads are
-within $1.10\times$ PyTorch and three training workloads are faster.
-Forty-eight of 50 device--workload--mode cells validate; two are excluded
-symmetrically after a cross-backend audit identifies a PyTorch/ROCm oracle
+GPU-referenced minimal-latency cells; median valid GPU-referenced training
+time is $1.8\times$ PyTorch's. On discrete AMD, four of five inference
+workloads are within $1.11\times$ PyTorch and three training workloads are faster.
+All 50 device--workload--mode cells pass the forward gate; 48 pass backward.
+Two backward pairs are excluded symmetrically after a cross-backend audit
+identifies a PyTorch/ROCm oracle
 dispute. Profiles localize the largest gaps to convolution derivatives and
 Metal attention backward. Compilation takes 0.1--2.4\,s; a Quest~3S
 application physically exercises the same train-to-deploy path.
@@ -128,7 +129,7 @@ The study makes four contributions:
   \item \textbf{Mechanism-resolved results.} The compact layer wins 12 of
         20 GPU-referenced minimal-shape latency cells, consistent with its
         static execution model; four of five discrete-AMD inference cells
-        are within $1.10\times$ of compiled ROCm PyTorch; per-dispatch
+        are within $1.11\times$ of compiled ROCm PyTorch; per-dispatch
         profiles locate dominant costs in convolution derivatives and Metal
         attention backward; capability probing explains exactly where the
         accelerated contract engages.
@@ -235,7 +236,7 @@ claim that execution occurs in a browser. Naga parses and validates the
 generated source, and Blade consumes the resulting module for Vulkan or
 Metal. Compilation fixes one dispatch sequence over lifetime-aliased
 buffers. A step walks that plan with no graph rediscovery,
-application-managed capture, or dynamic allocation, although Blade still
+application-managed capture, or per-step tensor allocation, although Blade still
 records and submits compute work rather than replaying a native CUDA Graph.
 The pinned runtime synchronizes compiler-selected pass groups; a companion
 study quantifies related barrier costs across vendors
@@ -278,7 +279,7 @@ PyTorch is both the numerical reference and the state-of-practice
 performance target. Each runner implements the same tensor shapes,
 deterministic inputs, scalar objective, and canonical parameter names; it
 does not share implementation kernels. The PyTorch runner uses
-\code{torch.compile} on the Linux CUDA and ROCm paths after clearing its
+\code{torch.compile} in its default mode on the Linux CUDA and ROCm paths after clearing its
 compiler cache. MPS remains eager because compilation is unsupported in
 this harness, and the Intel \code{+xpu} build falls back to eager CPU
 execution because it exposes no usable XPU. Consequently, ratios compare
@@ -325,7 +326,8 @@ both discrete devices where the path engages.
 \subsection{Correctness gates}
 
 PyTorch is the numerical reference. A forward result is valid when the
-output shape matches, relative output L2 error is below 1\%, and symmetric
+output shape matches, relative L2 error over 256 evenly spaced flattened
+output samples is below 1\%, and symmetric
 relative loss error is below 1\%. A training cell additionally requires
 matching canonical parameter sets, total-gradient-norm error below 5\%,
 and relative L2 error below 5\% over the vector of per-parameter gradient
@@ -333,6 +335,8 @@ norms. Forward and backward validity are independent: a backward failure
 invalidates the training cell without discarding a valid inference cell.
 Per-parameter gradient norms are recorded in every artifact, which is what
 later allows disagreements to be \emph{localized} rather than merely detected.
+These are norm-vector checks, not elementwise gradient comparisons; output
+sampling can also miss localized errors.
 The designated reference must also be a usable oracle. If its deterministic
 backward record is inconsistent with the other reference backends while the
 candidate reproduces their consensus across devices, the pair is labeled
@@ -420,7 +424,7 @@ of five inference cells (diffusion U-Net $0.82\times$, ResNet-50
 $0.90\times$) and three of five one-token cells; the remaining inference
 gaps are $1.84$--$2.65\times$ and training runs $1.8$--$2.9\times$
 behind. On the RX~7900~XT the portable stack effectively reaches the
-vendor stack: four of five workloads within $1.10\times$ for inference
+vendor stack: four of five workloads within $1.11\times$ for inference
 (SmolVLA 33\% faster) and three of five training cells outright faster
 (SmolVLA $0.73\times$, diffusion U-Net $0.89\times$, Whisper
 $0.90\times$), with ResNet-50 the outlier in both ($1.85\times$,
@@ -441,7 +445,7 @@ ROCm, where PyTorch's one-token SmolLM step takes 6.65\,ms against
 and synchronization structure, and the fixed dispatch sequence wins despite
 \code{torch.compile}; the measurement does not separate host launch cost
 from small-kernel quality. Correctness margins are wide: across all 25
-strict cells the worst forward relative L2 error is 0.0043\% against a 1\%
+strict cells the worst sampled forward relative L2 error is 0.0043\% against a 1\%
 gate, and across the 24 comparable backward comparisons the worst per-parameter
 gradient-norm error is 0.64\% against a 5\% gate. Several per-cell error
 values reproduce to three digits across all five devices: the residual
@@ -466,9 +470,9 @@ convolutions compound the conv-derivative gap), while both AMD devices keep
 most non-convolution cells near parity or faster. One negative result is
 worth reporting: SmolVLA
 \emph{regresses} under the cooperative permission on both RADV devices
-($3.05\rightarrow3.82$\,ms on the 7900~XT) --- the promotion decision
-currently treats an available cooperative tile as always profitable, and
-it is not; a per-shape cost model is the indicated fix.
+($3.05\rightarrow3.82$\,ms on the 7900~XT) --- the shape heuristics select
+an unprofitable cooperative variant here. Measured per-shape selection is a
+plausible remedy, not a gain established by this experiment.
 
 \subsection{Cross-backend records identify an oracle-disputed reference}
 \label{sec:oracle}
@@ -477,7 +481,7 @@ Whisper's forward pass on the 780M validates at 0.0016\%, but the paired
 backward comparison disagrees by 17.7--17.8\% in the vector of per-parameter
 gradient norms across the two arithmetic modes. This is not a failed
 \system{} execution: all five \system{} runs complete. Under strict f32,
-their gradient vectors agree mutually within 0.00002\%; PyTorch on CUDA,
+their parameter-gradient-norm vectors agree mutually within 0.00002\%; PyTorch on CUDA,
 discrete ROCm, CPU, and MPS agrees within 0.001\%; and the two clusters agree
 within 0.035\%. Accelerated records preserve the separation: each cluster is
 internally within 0.007\%, their cross-cluster disagreement is at most
@@ -505,7 +509,7 @@ that this local PyTorch result cannot serve as the oracle for attributing a
 \input{../tables/portability}
 \caption{Pennycook performance portability over the comparable frozen set,
 strict mode. Application efficiency per machine is measured against the
-best \emph{valid} time either engine achieved there; PyTorch's CPU
+best valid time either engine achieved there; PyTorch's CPU
 fallback on the Intel machine counts as its own result on that machine.
 $\ddagger$: Whisper F+L+B uses four machines because the 780M pair is
 oracle-disputed and omitted for both implementations; every other entry
@@ -609,8 +613,8 @@ and forward convolution another 16.3\% --- convolution is 89\% of the
 step, with three derivative shaders accounting for 28.5\,ms of 36.8
 (\code{Conv2dGradWeightGemmSmall} 12.6\,ms over just 12 dispatches marks
 the occupancy target). The worst gap in the matrix is a coverage-and-tuning
-property of the current convolution-derivative implementations rather than a
-uniform graphics-API overhead, and TF32 cuDNN convolutions on the reference
+property of the current convolution-derivative implementations in this
+profile, not evidence of a uniform graphics-API overhead; TF32 cuDNN convolutions on the reference
 side widen it.
 
 The M3 Whisper profile predates the frozen revision deliberately: it
@@ -630,8 +634,8 @@ global resource-access tracking, so we cite them as demonstrated headroom
 rather than as a gain this stack currently banks. Where launch
 and synchronization structure dominates, the static plan already wins
 (the latency column); where one kernel family dominates, coverage
-decides. Each identified gap is an absent specialization or policy ---
-no measured gap currently requires an API-level explanation.
+matters. These profiles motivate kernel and policy improvements; they do not
+establish that API or driver limitations are absent.
 
 \section{The Third P: Productivity and Support}
 \label{sec:productivity}
@@ -695,7 +699,7 @@ Two further productivity numbers. Compilation: \system{} prepares a
 workload (all three sessions, pipelines included) in 0.08--1.5\,s strict
 and at most 2.4\,s with cooperative variants, on every device; where
 \code{torch.compile} functions it takes 6.5--96\,s, the maximum being
-SmolLM on ROCm (96\,s versus 0.47\,s) --- sub-second specialization is
+SmolLM on ROCm (96\,s versus 0.47\,s) --- short specialization times are
 what makes compile-on-device deployment plausible. Footprint: the
 standalone \inferena{} executable is a 12.8\,MiB stripped binary embedding
 compiler, autodiff, runtime, model builders, and shaders, against a
@@ -758,8 +762,9 @@ reference still wins. The Intel CPU reference shows up to
 $\sim$1.5$\times$ swings between arithmetic modes whose switches are
 no-ops on CPU; Intel ratios are coarse. One machine per vendor and class
 (AMD excepted) limits vendor-wide generalization. Strict f32 controls
-permissions, not operation order or bitwise identity; gradient-norm gates
-can miss elementwise cancellation.
+permissions, not operation order or bitwise identity; output sampling can
+miss localized errors and gradient-norm gates can miss elementwise
+disagreement, including sign changes.
 
 The oracle-consistency rule was applied after inspecting the frozen records,
 not preregistered. It removes the same 780M--Whisper backward observation
@@ -770,11 +775,12 @@ report the prior one-way assignment as a sensitivity: it changes
 \system{}'s mean training score from 0.62 to 0.52 and leaves PyTorch's
 rounded mean at 0.93.
 
-The frozen protocol does not add manual CUDA Graph capture. A
-purpose-tuned PyTorch deployment could therefore improve the
-launch-sensitive minimal-shape cells; this study compares the ordinary
-compiled path against \system{}'s automatic static plan, not every possible
-application-specific reference optimization.
+The frozen protocol uses default \code{torch.compile}, without manual CUDA
+Graph capture. Automated \code{reduce-overhead} and \code{max-autotune}
+modes can change capture and kernel selection~\cite{pytorch2026compile};
+they were not tested. These are stronger automatic baselines, not necessarily
+application-specific tuning. The measured minimal-shape wins therefore do
+not establish superiority over all compiled PyTorch configurations.
 
 The matrix reports 20 synchronized samples after warmup from one frozen
 process-level run per cell, not independent process replicates; raw samples
@@ -798,12 +804,12 @@ On the frozen five-machine set, consumer graphics APIs support a credible
 ML performance-portability layer, but not a universal performance win.
 Under strict f32, the compact stack reaches or beats compiled ROCm PyTorch
 on most measured workloads on both AMD devices and wins 12 of 20
-GPU-referenced minimal-shape cells, while its median valid training time of
+GPU-referenced minimal-shape cells, while its median valid GPU-referenced training time of
 $1.8\times$ PyTorch's and Pennycook training score of 0.62 versus 0.93 show
 where mature vendor libraries remain ahead. Profiles turn the largest deficits
 into concrete work on convolution derivatives, Metal attention backward,
-barrier policy, and cooperative-matrix selection. No measured gap requires
-an API-level explanation, but broader workloads could expose one.
+barrier policy, and cooperative-matrix selection. These are improvement
+targets, not proof that graphics APIs or their drivers impose no ceiling.
 Optimization remains ongoing, leaving the NVIDIA ceiling open: how closely a
 portable graphics-API stack can approach tuned CUDA/cuBLAS/cuDNN remains
 unknown.
@@ -849,14 +855,16 @@ revisions are preserved under the public tag \code{paper-arxiv-1}; the raw
 result bundle accompanies this submission.
 
 \textbf{Contents.} Raw JSON per cell: 20 timing samples per series,
-validation diagnostics (output L2, loss error, total and per-parameter
+validation diagnostics (sampled-output L2, loss error, total and per-parameter
 gradient norms), memory figures with explicit basis labels, environment
 metadata (GPU, driver, OS, toolchain, precision switches), and the
 protocol identifier \code{inferena-paper-v1}. Per-dispatch profile
 sidecars record pipeline, workgroup geometry, family, and hardware
 timestamps, with instrumentation-overhead ratios. A single script
-regenerates every numeric table from these files; a second script asserts
-every load-bearing prose number against them.
+regenerates every numeric table from these files; a second script checks
+record consistency, retained-sample medians, numerical gates, and exact table
+and aggregate replay. Load-bearing prose is checked manually against that
+fact block; the verifier does not parse arbitrary prose claims.
 
 \textbf{Hardware/software.} Five machines as in Table~\ref{tab:devices}:
 RTX~5070 (driver 595.71.05, CUDA 13.0, torch 2.13.0+cu130), RX~7900~XT
@@ -885,6 +893,7 @@ load-bearing prose values against the artifacts. DinoVision's
 separately public; those records carry their own source revisions and are not
 part of the frozen 50-cell matrix.
 
+\IEEEtriggeratref{24}
 \bibliographystyle{IEEEtran}
 \bibliography{../references,references}
 

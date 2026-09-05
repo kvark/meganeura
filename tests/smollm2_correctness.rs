@@ -108,8 +108,10 @@ fn smollm2_logits_match_pytorch() {
         )
     });
     let ref_logits: Vec<f32> = bin_data
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&bytes| f32::from_le_bytes(bytes))
         .collect();
     assert_eq!(ref_logits.len(), SEQ_LEN * VOCAB_SIZE);
 

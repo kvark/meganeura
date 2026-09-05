@@ -2,13 +2,14 @@ use crate::{
     codegen::CoopCaps,
     compile::{CompileOptions, ExecutionPlan},
     graph::Graph,
+    optimize::OptimizeConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::{io, path::Path};
 
 /// Increment whenever the serialized execution plan or build pipeline changes
 /// in a way that can make an older plan unsafe to reuse.
-const CACHE_FORMAT_VERSION: u32 = 3;
+const CACHE_FORMAT_VERSION: u32 = 4;
 
 /// Cached execution plan with a graph fingerprint for invalidation.
 #[derive(Serialize, Deserialize)]
@@ -16,9 +17,9 @@ struct CachedPlan {
     #[serde(default)]
     format_version: u32,
     graph_hash: u64,
-    /// Hash of mode, compiler options, target capabilities, and environment
-    /// switches that affect optimization/code generation. Zero is the public
-    /// `save_plan`/`load_plan` compatibility key.
+    /// Hash of mode, rewrite/compiler options, and target capabilities.
+    /// Environment overrides are resolved into those typed options before
+    /// hashing. Zero is the public `save_plan`/`load_plan` compatibility key.
     #[serde(default)]
     build_hash: u64,
     plan: ExecutionPlan,
@@ -114,6 +115,7 @@ pub(crate) fn load_build_plan(
 /// higher-level `train::Mode` type (`0` = training, `1` = inference).
 pub(crate) fn hash_build_config(
     options: &CompileOptions,
+    optimize: &OptimizeConfig,
     mode_tag: u8,
     skip_full_optimize: bool,
     coop_caps: CoopCaps,
@@ -122,6 +124,7 @@ pub(crate) fn hash_build_config(
     struct BuildFingerprint<'a> {
         package_version: &'a str,
         options: &'a CompileOptions,
+        optimize: &'a OptimizeConfig,
         mode_tag: u8,
         skip_full_optimize: bool,
         coop_caps: CoopCaps,
@@ -130,6 +133,7 @@ pub(crate) fn hash_build_config(
     let fingerprint = BuildFingerprint {
         package_version: env!("CARGO_PKG_VERSION"),
         options,
+        optimize,
         mode_tag,
         skip_full_optimize,
         coop_caps,
@@ -328,14 +332,15 @@ mod tests {
     #[test]
     fn test_build_hash_includes_mode_options_and_target() {
         let defaults = CompileOptions::default();
-        let base = hash_build_config(&defaults, 0, false, CoopCaps::default());
+        let optimize = OptimizeConfig::default();
+        let base = hash_build_config(&defaults, &optimize, 0, false, CoopCaps::default());
         assert_ne!(
             base,
-            hash_build_config(&defaults, 1, false, CoopCaps::default()),
+            hash_build_config(&defaults, &optimize, 1, false, CoopCaps::default()),
         );
         assert_ne!(
             base,
-            hash_build_config(&defaults, 0, true, CoopCaps::default()),
+            hash_build_config(&defaults, &optimize, 0, true, CoopCaps::default()),
         );
         assert_ne!(
             base,
@@ -344,6 +349,7 @@ mod tests {
                     use_schedule_pointwise: false,
                     ..CompileOptions::default()
                 },
+                &optimize,
                 0,
                 false,
                 CoopCaps::default(),
@@ -353,6 +359,7 @@ mod tests {
             base,
             hash_build_config(
                 &defaults,
+                &optimize,
                 0,
                 false,
                 CoopCaps {
@@ -361,6 +368,62 @@ mod tests {
                 },
             ),
         );
+    }
+
+    #[test]
+    fn build_cache_rejects_rewrite_configuration_changes() {
+        use crate::optimize::{ExtractionCost, OptimizeMode};
+
+        let mut graph = Graph::new();
+        let x = graph.input("x", &[4, 8]);
+        graph.set_outputs(vec![x]);
+        let options = CompileOptions::default();
+        let defaults = OptimizeConfig::default();
+        let hash = |config: &OptimizeConfig| {
+            hash_build_config(&options, config, 1, false, CoopCaps::default())
+        };
+        let plan = compile::compile(&graph);
+        let path = std::env::temp_dir().join(format!(
+            "meganeura_test_rewrite_cache_{}.ron",
+            std::process::id(),
+        ));
+        save_build_plan(&plan, &graph, hash(&defaults), &path).unwrap();
+        assert!(
+            load_build_plan(&graph, hash(&defaults), &path)
+                .unwrap()
+                .is_some()
+        );
+
+        for config in [
+            OptimizeConfig {
+                mode: OptimizeMode::Off,
+                ..defaults
+            },
+            OptimizeConfig {
+                mode: OptimizeMode::EgglogOutlined,
+                ..defaults
+            },
+            OptimizeConfig {
+                extraction_cost: ExtractionCost::AstSize,
+                ..defaults
+            },
+            OptimizeConfig {
+                saturation_cutoff: defaults.saturation_cutoff + 1,
+                ..defaults
+            },
+            OptimizeConfig {
+                no_winograd: true,
+                ..defaults
+            },
+        ] {
+            assert!(
+                load_build_plan(&graph, hash(&config), &path)
+                    .unwrap()
+                    .is_none(),
+                "rewrite configuration reused an incompatible plan: {config:?}",
+            );
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
