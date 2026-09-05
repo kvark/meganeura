@@ -5905,4 +5905,30 @@ mod tests {
             eprintln!("Q4 {group:?} shader: {} chars", sm.source.len());
         }
     }
+
+    /// The GEMV groups have no Q4 variant: `generate_module_weighted`
+    /// falls them through to `generate_module`, which emits the f32
+    /// shader. That shader would read the packed 4-bit blocks as floats,
+    /// so `compile.rs` must not route a Q4 weight to a GEMV dispatch —
+    /// it guards the `m == 1 && n % 4 == 0` specialization on
+    /// `wf != WeightFormat::Q4` for exactly this reason.
+    ///
+    /// When Q4 GEMV shaders land, this test flips to the assertion above
+    /// and that guard comes out. Until then, pinning the gap here keeps
+    /// the two files from drifting apart silently, which is how m=1 Q4
+    /// shipped returning ~1e37 (see tests/q4_decode_shapes.rs).
+    #[test]
+    fn q4_gemv_shaders_do_not_exist_yet() {
+        for group in [
+            ShaderGroup::MatMulGemv,
+            ShaderGroup::MatMulGemvAdd,
+            ShaderGroup::MatMulGemvBT,
+        ] {
+            let sm = generate_module_weighted(group, WeightFormat::Q4);
+            assert!(
+                !sm.source.contains("dequant_q4"),
+                "{group:?} now has a Q4 variant — drop the WeightFormat::Q4                  guard on the GEMV branch in compile.rs and move this group                  into q4_matmul_shader_generates"
+            );
+        }
+    }
 }
