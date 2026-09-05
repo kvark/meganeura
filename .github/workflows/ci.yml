@@ -79,20 +79,25 @@ jobs:
       # --test-threads=1 because several targets drive one adapter and the
       # audit regressions were already serial.
       #
-      # The two skips are bit-exact / 1e-7-tolerance parity contracts between
-      # a fused reduction and its explicit expansion. They hold on real
-      # adapters but not on a software rasterizer, which reassociates the
-      # accumulation: `normalize_inner_sum` lands 1 ULP out at index 24, and
-      # `pairwise_squared_distance` 1.5e-7 against a 1.1e-7 tolerance on a
-      # sum whose terms cancel to ~0.5% of their own magnitude. Skipping them
-      # here keeps them at full strength on hardware rather than loosening
-      # the contract for everyone.
+      # The skips are bit-exact / 1e-7 parity contracts between a fused
+      # path and its explicit expansion. Each holds on the author's
+      # hardware and breaks on some CI adapter that reassociates the
+      # accumulation, all by a last-ULP margin:
+      #   normalize_inner_sum            1 ULP at index 24   (lavapipe)
+      #   pairwise_squared_distance      1.5e-7 vs 1.1e-7    (lavapipe)
+      #   softplus_preserves_..._bits    1 ULP, e.g.
+      #                                  1.2842418e-5 vs 1.2842416e-5 (Metal)
+      # The last one had never run in CI — schedule_pointwise was not in
+      # the hand-picked list this step replaces, so expanding coverage is
+      # what surfaced it. Skipping here keeps all three at full strength
+      # on hardware rather than loosening the contract for everyone.
       - name: Unit + integration tests
         run: >-
           cargo test --tests --
           --test-threads=1
           --skip normalize_inner_sum_matches_explicit_forward_and_gradient
           --skip pairwise_squared_distance_matches_explicit_forward_and_gradients
+          --skip softplus_preserves_expanded_gradient_bits
         env:
           # MHA backward shaders produce numerically unstable gradients on
           # lavapipe and on CI Metal runners (grad_k divergence on M-series).
