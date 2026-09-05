@@ -1956,7 +1956,7 @@ fn compute_groups(dispatches: &[Dispatch]) -> Vec<std::ops::Range<usize>> {
 /// kernels and output padding), the RmsNorm→matmul prologue fusion that
 /// depends on it, and small-tile demotion. Mutates the plan in place.
 /// This establishes deterministic initial choices. The optional scratch tuner
-/// independently checks legality within its narrower scalar-tile domain.
+/// independently checks legality within its narrower f32-matmul domain.
 pub(crate) fn select_variants(
     plan: &mut ExecutionPlan,
     coop_config: Option<&crate::codegen::CoopConfig>,
@@ -2404,6 +2404,9 @@ pub struct Session {
     /// device-local placement.
     alias: crate::memplan::AliasPlan,
     pipelines: Pipelines,
+    /// Session policy/capabilities after the cooperative smoke test. Tuning
+    /// must not re-enable a rejected or explicitly disabled implementation.
+    coop_config: Option<crate::codegen::CoopConfig>,
     plan: ExecutionPlan,
     /// Pre-computed barrier groups: each range of dispatch indices shares one
     /// compute pass. Pass boundaries in blade emit ALL_COMMANDS barriers.
@@ -3092,6 +3095,7 @@ impl Session {
             physical_buffers,
             alias,
             pipelines,
+            coop_config,
             plan,
             groups,
             encoder,

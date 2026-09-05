@@ -19,9 +19,11 @@ still loses to eager MPS. Intel is compared with a labeled CPU fallback.
 See [results](study/results.md) for denominators and numerical gates. Do not
 mix exploratory Inferena history with publication-grade results.
 
-The first state-isolated exact-class search is implemented for the existing
-32/64 scalar-f32 matmul tiles. It is default-off and CPU-validated only;
-cooperative/fused search and whole-step/fleet qualification remain ahead.
+State-isolated exact-class search is implemented for the existing 32/64 scalar
+and legal native-f32 cooperative matmul tiles. It is default-off. Scalar GPU
+qualification passed on RTX 5070; native-f32 hardware and fleet qualification
+remain ahead. A separate harness checks transfer to whole-step time;
+automatic confirmation, f16-input/complex-fusion search and persistence remain open.
 See the [implementation contract](study/performance-plan.md).
 
 The next sequence is:
@@ -40,8 +42,9 @@ acceptance and profiles for localization. Cooperative backward is experimental
 and default-off; compensated f16 is not a safe automatic derivative path.
 General dynamic shape replanning is not yet exposed by the session API.
 
-No GPU benchmarking was performed during this audit; measurements below are
-historical and future experiments remain deferred until the device is free.
+The initial audit performed no GPU benchmarking. The user subsequently
+released the device for qualification and experiments. Timings in the older
+tracks below remain historical, not rerun results.
 
 ---
 
@@ -415,18 +418,20 @@ measured choice among them:
 
 **Landed.** Variant decisions have one owner (`select_variants`) and codegen
 knobs travel as `TuningKnobs` plan data. The September first cut of
-`Session::tune` / `tune_with` measures 32↔64 scalar-f32 tiles per exact eligible
+`Session::tune` / `tune_with` measures scalar and native-f32 cooperative tiles per exact eligible
 class, with private scratch, numerical qualification, interleaved samples and
 explicit budgets/reports. It replaces the earlier family-wide cooperative
 demotion tuner, which ran live steps and mutated training/cache state.
-Default-off, with CPU validation only; real-device qualification remains due.
+Default-off. Scalar correctness/state GPU tests passed on RTX 5070. Native-f32
+shaders pass offline validation; that device cannot qualify their execution.
 
 **Remaining plan.**
 1. *Fleet qualification and whole-step confirmation* before default-on;
    preserve the implemented scratch-state isolation contract.
-2. *Broader exact-class candidates:* cooperative, packed/fused and GEMV
-   implementations need complete precision/padding/binding contracts. The
-   scalar slice does not yet replace their profitability thresholds.
+2. *Broader exact-class candidates:* f16-input cooperative, packed/complex-fused
+   and GEMV implementations need complete precision/padding/binding contracts.
+   Native-f32 matmul already challenges profitability thresholds where its
+   complete candidate fits existing allocations.
 3. *Recompiling knobs:* EPT caps / tile sizes / generated-kernel
    workgroup sizes are plan data now, so a candidate is a plan rebuild
    (~seconds). Bound the space per shape-class (2–4 values per knob).

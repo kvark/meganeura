@@ -8,19 +8,30 @@ use blade_graphics as bg;
 use std::{collections::HashMap, time::Instant};
 
 impl Pipelines {
-    fn ensure_scalar_tile(&mut self, gpu: &Gpu, entry: &ShaderEntry, tile: MatmulTile) {
+    fn ensure_tune_tile(
+        &mut self,
+        gpu: &Gpu,
+        entry: &ShaderEntry,
+        tile: MatmulTile,
+    ) -> Result<(), String> {
         let key = tile_variant(entry, tile);
         if self.map.contains_key(&key) {
-            return;
+            return Ok(());
         }
         let module = match tile {
             MatmulTile::Tile32 => crate::codegen::generate_module_small(entry.shader_group()),
             MatmulTile::Tile64 => crate::codegen::generate_module(entry.shader_group()),
+            MatmulTile::CooperativeF32 { .. } => crate::codegen::generate_module_coop(
+                entry.shader_group(),
+                &tile.coop_config().expect("cooperative candidate"),
+            ),
         };
-        let shader = gpu.create_shader(bg::ShaderDesc {
-            source: &module.source,
-            naga_module: Some(module.module),
-        });
+        let shader = gpu
+            .try_create_shader(bg::ShaderDesc {
+                source: &module.source,
+                naga_module: Some(module.module),
+            })
+            .map_err(|error| error.to_string())?;
         let layout = super::shader_data_layout(entry);
         let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
             name: entry.entry_point(),
@@ -28,6 +39,7 @@ impl Pipelines {
             compute: shader.at(entry.entry_point()),
         });
         self.map.insert(key, pipeline);
+        Ok(())
     }
 }
 
@@ -35,6 +47,7 @@ fn tile_variant(entry: &ShaderEntry, tile: MatmulTile) -> Variant {
     match tile {
         MatmulTile::Tile32 => Variant::SmallTile(entry.clone()),
         MatmulTile::Tile64 => Variant::Scalar(entry.clone()),
+        MatmulTile::CooperativeF32 { .. } => Variant::Coop(entry.clone()),
     }
 }
 
@@ -42,17 +55,19 @@ struct SearchClass {
     key: TuneClass,
     initial: MatmulTile,
     members: Vec<usize>,
+    challengers: Vec<MatmulTile>,
 }
 
 fn collect_classes(
     plan: &crate::compile::ExecutionPlan,
     alias: &crate::memplan::AliasPlan,
+    coop_config: Option<&crate::codegen::CoopConfig>,
 ) -> (Vec<SearchClass>, usize) {
     let mut classes: Vec<SearchClass> = Vec::new();
     let mut indices = HashMap::new();
     let mut excluded = 0;
     for (index, dispatch) in plan.dispatches.iter().enumerate() {
-        let Some(mut key) = TuneClass::from_dispatch(dispatch) else {
+        let Some(mut key) = TuneClass::from_dispatch(dispatch, coop_config) else {
             excluded += 1;
             continue;
         };
@@ -76,23 +91,16 @@ fn collect_classes(
             let slot = if i + 1 == physical.len() { 3 } else { i };
             key.device_local[slot] = alias.device_local[p];
         }
-        let Some(sizes) = key.buffer_sizes() else {
-            excluded += 1;
-            continue;
-        };
-        if bindings
+        key.binding_bytes = bindings
             .iter()
-            .zip(sizes)
-            .any(|(b, size)| plan.buffers[b.0 as usize] < size)
-        {
+            .map(|b| plan.buffers[b.0 as usize])
+            .collect();
+        let initial = MatmulTile::selected(dispatch, coop_config).expect("checked class geometry");
+        if !initial.fits(&key) {
             excluded += 1;
             continue;
         }
-        let initial = if dispatch.use_small_tiles {
-            MatmulTile::Tile32
-        } else {
-            MatmulTile::Tile64
-        };
+        let challengers = key.challengers(initial, coop_config);
         let next_index = classes.len();
         let class_index = *indices.entry((key.clone(), initial)).or_insert(next_index);
         if class_index == next_index {
@@ -100,6 +108,7 @@ fn collect_classes(
                 key,
                 initial,
                 members: Vec::new(),
+                challengers,
             });
         }
         classes[class_index].members.push(index);
@@ -115,8 +124,8 @@ fn collect_classes(
 }
 
 impl Session {
-    /// Bounded scalar-tile search with default options; logs skips and returns
-    /// per-class evidence. Use [`Self::tune_with`] for budgets and full reporting.
+    /// Bounded f32 tile search with default options; logs skips and returns
+    /// per-comparison evidence. Use [`Self::tune_with`] for budgets and full reporting.
     ///
     /// Unlike the former family-wide tuner, this never calls `step()` and
     /// never reads or writes live tensor, optimizer, accumulator, or KV state.
@@ -127,9 +136,9 @@ impl Session {
             .outcomes
     }
 
-    /// Search the two existing scalar f32 matmul tiles for exact eligible
-    /// classes. The old occupancy threshold is only the initial choice;
-    /// measurements can select either size regardless of that threshold.
+    /// Search scalar tiles and advertised, smoke-tested native-f32 cooperative
+    /// matmul for exact eligible classes. Occupancy/large-shape thresholds only
+    /// choose the starting implementation; they do not remove challengers.
     ///
     /// Each class uses private scratch with matching memory placement and two
     /// deterministic nonzero input patterns (including tiny f32 operands).
@@ -138,16 +147,20 @@ impl Session {
     /// The result is an isolated-kernel choice, not an end-to-end speed claim.
     ///
     /// Forward MatMul+Add is supported; other prologues/epilogues, horizontal
-    /// packs, cooperative, reduced-storage, GEMV and overlapping-binding
+    /// packs, f16-input cooperative, reduced-storage, GEMV and overlapping-binding
     /// dispatches are excluded. Winners live in this session, not the plan cache.
     /// Only selected dispatch geometry and pipeline resources change. No graph
     /// execution occurs, including when an optimizer or external buffer is bound.
-    /// A soft deadline may be exceeded by one in-flight operation; incomplete
-    /// measurements always retain the original choice.
+    /// Cooperative padding must fit each binding's declared size; the live
+    /// allocation/alias plan is never resized. Up to two sequential challenger
+    /// comparisons per class reuse the latest fully qualified winner as the
+    /// incumbent. A soft deadline may be exceeded by one in-flight operation;
+    /// an incomplete comparison always retains its incumbent.
     pub fn tune_with(&mut self, options: TuneOptions) -> Result<TuneReport, TuneError> {
         options.validate()?;
         let start = Instant::now();
-        let (classes, excluded_dispatches) = collect_classes(&self.plan, &self.alias);
+        let (classes, excluded_dispatches) =
+            collect_classes(&self.plan, &self.alias, self.coop_config.as_ref());
         let mut report = TuneReport {
             options: options.clone(),
             eligible_classes: classes.len(),
@@ -160,52 +173,68 @@ impl Session {
                 report.time_budget_exhausted = true;
                 break;
             }
-            let mut outcome = TuneOutcome {
-                class: class.key.clone(),
-                dispatches: class.members.len(),
-                initial: class.initial,
-                selected: class.initial,
-                decision: TuneDecision::KeepBaseline,
-                qualified: false,
-                elapsed: std::time::Duration::ZERO,
-                compile_time: std::time::Duration::ZERO,
-                baseline_ms: Vec::new(),
-                candidate_ms: Vec::new(),
-                baseline_median_ms: None,
-                candidate_median_ms: None,
-                noise_margin_ms: None,
-            };
-            let class_start = Instant::now();
-            self.measure_scalar_class(class, &options, start, &mut outcome);
-            outcome.elapsed = class_start.elapsed();
-            if outcome.selected != outcome.initial {
-                for &index in &class.members {
-                    outcome
-                        .selected
-                        .apply(&mut self.plan.dispatches[index], &class.key);
+            report.visited_classes += 1;
+            let mut incumbent = class.initial;
+            for &candidate in &class.challengers {
+                if start.elapsed() >= options.max_time {
+                    report.time_budget_exhausted = true;
+                    break;
                 }
+                let mut outcome = TuneOutcome {
+                    class: class.key.clone(),
+                    dispatches: class.members.len(),
+                    initial: incumbent,
+                    candidate,
+                    selected: incumbent,
+                    decision: TuneDecision::KeepBaseline,
+                    qualified: false,
+                    failure: None,
+                    elapsed: std::time::Duration::ZERO,
+                    compile_time: std::time::Duration::ZERO,
+                    baseline_ms: Vec::new(),
+                    candidate_ms: Vec::new(),
+                    baseline_median_ms: None,
+                    candidate_median_ms: None,
+                    noise_margin_ms: None,
+                };
+                let class_start = Instant::now();
+                self.measure_candidate(class, &options, start, &mut outcome);
+                outcome.elapsed = class_start.elapsed();
+                if outcome.selected != outcome.initial {
+                    for &index in &class.members {
+                        outcome
+                            .selected
+                            .apply(&mut self.plan.dispatches[index], &class.key);
+                    }
+                    incumbent = outcome.selected;
+                }
+                log::info!(
+                    "tune: {:?} {}x{}x{} ({} dispatches): {:?} vs {:?} -> {:?}, {:?}, medians {:?}/{:?} ms",
+                    class.key.shader,
+                    class.key.m,
+                    class.key.n,
+                    class.key.k,
+                    class.members.len(),
+                    outcome.initial,
+                    outcome.candidate,
+                    outcome.selected,
+                    outcome.decision,
+                    outcome.baseline_median_ms,
+                    outcome.candidate_median_ms
+                );
+                if let Some(ref failure) = outcome.failure {
+                    log::warn!("tune: {failure}");
+                }
+                report.outcomes.push(outcome);
             }
-            log::info!(
-                "tune: {:?} {}x{}x{} ({} dispatches): {:?} -> {:?}, {:?}, medians {:?}/{:?} ms",
-                class.key.shader,
-                class.key.m,
-                class.key.n,
-                class.key.k,
-                class.members.len(),
-                outcome.initial,
-                outcome.selected,
-                outcome.decision,
-                outcome.baseline_median_ms,
-                outcome.candidate_median_ms
-            );
-            report.outcomes.push(outcome);
         }
         report.elapsed = start.elapsed();
         report.time_budget_exhausted |= report.elapsed >= options.max_time;
         log::info!(
-            "tune: {}/{} classes visited; {} dispatches excluded; {:.3}s; class limit={}, time limit={}",
-            report.outcomes.len(),
+            "tune: {}/{} classes visited, {} comparisons; {} dispatches excluded; {:.3}s; class limit={}, time limit={}",
+            report.visited_classes,
             report.eligible_classes,
+            report.outcomes.len(),
             report.excluded_dispatches,
             report.elapsed.as_secs_f64(),
             report.class_limit_reached,
@@ -214,17 +243,30 @@ impl Session {
         Ok(report)
     }
 
-    fn measure_scalar_class(
+    fn measure_candidate(
         &mut self,
         class: &SearchClass,
         options: &TuneOptions,
         start: Instant,
         outcome: &mut TuneOutcome,
     ) {
-        let sizes = class
+        let logical_sizes = class
             .key
             .buffer_sizes()
             .expect("class collection checked extents");
+        let baseline_sizes = outcome
+            .initial
+            .buffer_sizes(&class.key)
+            .expect("legal incumbent");
+        let candidate_sizes = outcome
+            .candidate
+            .buffer_sizes(&class.key)
+            .expect("legal challenger");
+        let sizes: Vec<_> = baseline_sizes
+            .into_iter()
+            .zip(candidate_sizes)
+            .map(|(a, b)| a.max(b))
+            .collect();
         let Some(bytes) = scratch_bytes(&sizes) else {
             outcome.decision = TuneDecision::ScratchLimit;
             return;
@@ -240,15 +282,21 @@ impl Session {
             outcome.decision = TuneDecision::DeviceMemoryBudget;
             return;
         }
-        for tile in [class.initial, class.initial.other()] {
+        for tile in [outcome.initial, outcome.candidate] {
             if start.elapsed() >= options.max_time {
                 outcome.decision = TuneDecision::TimeBudget;
                 return;
             }
             let compile_start = Instant::now();
-            self.pipelines
-                .ensure_scalar_tile(&self.gpu, &class.key.shader, tile);
+            let compiled = self
+                .pipelines
+                .ensure_tune_tile(&self.gpu, &class.key.shader, tile);
             outcome.compile_time += compile_start.elapsed();
+            if let Err(error) = compiled {
+                outcome.decision = TuneDecision::ShaderRejected;
+                outcome.failure = Some(format!("{tile:?}: {error}"));
+                return;
+            }
         }
         if start.elapsed() >= options.max_time {
             outcome.decision = TuneDecision::TimeBudget;
@@ -259,19 +307,20 @@ impl Session {
         dispatch.input_buffers = (0..sizes.len() - 1).map(|i| BufferRef(i as u32)).collect();
         dispatch.output_buffer = BufferRef((sizes.len() - 1) as u32);
         let mut variants = [dispatch.clone(), dispatch];
-        class.initial.apply(&mut variants[0], &class.key);
-        class.initial.other().apply(&mut variants[1], &class.key);
+        outcome.initial.apply(&mut variants[0], &class.key);
+        outcome.candidate.apply(&mut variants[1], &class.key);
         let pipelines = [
-            &self.pipelines.map[&tile_variant(&class.key.shader, class.initial)],
-            &self.pipelines.map[&tile_variant(&class.key.shader, class.initial.other())],
+            &self.pipelines.map[&tile_variant(&class.key.shader, outcome.initial)],
+            &self.pipelines.map[&tile_variant(&class.key.shader, outcome.candidate)],
         ];
         for pattern in 0..2 {
             if start.elapsed() >= options.max_time {
                 outcome.decision = TuneDecision::TimeBudget;
                 return;
             }
-            let inputs = test_inputs(&sizes, pattern);
-            for (index, data) in inputs.iter().enumerate() {
+            let mut inputs = test_inputs(&logical_sizes, pattern);
+            for (index, data) in inputs.iter_mut().enumerate() {
+                data.resize(sizes[index] / 4, 0.0);
                 scratch.upload(index, data);
             }
             let mut reference = Vec::new();
@@ -288,6 +337,10 @@ impl Session {
                     || (variant == 1 && !outputs_agree(&reference, &output, scale))
                 {
                     outcome.decision = TuneDecision::InvalidOutput;
+                    outcome.failure = Some(format!(
+                        "{:?}, input pattern {pattern}: reference or cross-variant mismatch",
+                        [outcome.initial, outcome.candidate][variant]
+                    ));
                     return;
                 }
                 reference = output;
@@ -295,7 +348,8 @@ impl Session {
         }
         outcome.qualified = true;
         // Time ordinary-magnitude data, not a zero-filled or subnormal workload.
-        for (index, data) in test_inputs(&sizes, 0).iter().enumerate() {
+        for (index, data) in test_inputs(&logical_sizes, 0).iter_mut().enumerate() {
+            data.resize(sizes[index] / 4, 0.0);
             scratch.upload(index, data);
         }
         for _ in 0..options.warmup_runs {
@@ -342,7 +396,7 @@ struct Scratch<'a> {
 
 impl<'a> Scratch<'a> {
     fn new(gpu: &'a Gpu, class: &TuneClass, sizes: &[usize], bytes: usize) -> Self {
-        ensure_device_memory_budget(gpu, bytes, "scalar-tile tuning scratch");
+        ensure_device_memory_budget(gpu, bytes, "matmul tuning scratch");
         let buffers = sizes
             .iter()
             .enumerate()
@@ -365,7 +419,7 @@ impl<'a> Scratch<'a> {
             memory: bg::Memory::Shared,
         });
         let encoder = gpu.create_command_encoder(bg::CommandEncoderDesc {
-            name: "scalar_tile_tune",
+            name: "matmul_tune",
             buffer_count: 1,
             manual_barriers: false,
         });
@@ -373,7 +427,7 @@ impl<'a> Scratch<'a> {
             gpu,
             buffers,
             staging,
-            output_elements: sizes[sizes.len() - 1] / 4,
+            output_elements: class.m as usize * class.n as usize,
             encoder,
         }
     }
@@ -452,7 +506,9 @@ fn test_inputs(sizes: &[usize], pattern: u32) -> Vec<Vec<f32>> {
                     bits = bits.wrapping_mul(0x85eb_ca6b);
                     bits ^= bits >> 13;
                     // All operands differ, including addend; no all-zero qualification.
-                    ((bits % 1024) as f32 - 511.5) * (scale / 1024.0)
+                    // Exercise full mantissas, not just values already exact
+                    // in a reduced-mantissa matrix implementation.
+                    ((bits >> 8) as f32 / 16_777_216.0 - 0.5) * scale
                 })
                 .collect()
         })
@@ -501,20 +557,20 @@ fn qualify_output(class: &TuneClass, inputs: &[Vec<f32>], output: &[f32], scale:
     }
     let (m, n) = (class.m as usize, class.n as usize);
     // Explicit tile boundaries and last row/column, then scattered dots.
-    let edges = [0, 1, 31, 32, 63, 64, usize::MAX];
+    let edges = [0, 1, 7, 8, 15, 16, 31, 32, 63, 64, usize::MAX];
     for i in 0..32 {
-        let row = if i == 7 {
+        let row = if i == edges.len() {
             m - 1
-        } else if i == 8 {
+        } else if i == edges.len() + 1 {
             0
         } else if i < edges.len() {
             edges[i].min(m - 1)
         } else {
             i * 104729 % m
         };
-        let col = if i == 7 {
+        let col = if i == edges.len() {
             n - 1
-        } else if i == 8 {
+        } else if i == edges.len() + 1 {
             0
         } else if i < edges.len() {
             edges[edges.len() - 1 - i].min(n - 1)
@@ -554,7 +610,7 @@ mod tests {
         let dispatch = &plan.dispatches[0];
         assert!(dispatch.use_small_tiles);
         assert_eq!(dispatch.workgroups, [3, 2, 1]);
-        assert!(TuneClass::from_dispatch(dispatch).is_some());
+        assert!(TuneClass::from_dispatch(dispatch, None).is_some());
     }
 
     #[test]
@@ -566,6 +622,7 @@ mod tests {
             k: 3,
             requires_full_precision: false,
             device_local: [false; 4],
+            binding_bytes: Vec::new(),
         };
         let normal = vec![
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
@@ -615,30 +672,39 @@ mod tests {
             },
         );
         let mut alias = crate::memplan::AliasPlan::identity(&plan.buffers);
-        let (classes, excluded) = collect_classes(&plan, &alias);
+        let (classes, excluded) = collect_classes(&plan, &alias, None);
         assert_eq!(excluded, 0);
         assert_eq!(classes.len(), 1);
         assert_eq!(classes[0].members.len(), 2);
         alias.device_local[plan.dispatches[1].output_buffer.0 as usize] = true;
-        assert_eq!(collect_classes(&plan, &alias).0.len(), 2);
+        assert_eq!(collect_classes(&plan, &alias, None).0.len(), 2);
         plan.dispatches[0].input_buffers[1] = plan.dispatches[0].output_buffer;
-        assert_eq!(collect_classes(&plan, &alias).1, 1);
+        assert_eq!(collect_classes(&plan, &alias, None).1, 1);
     }
 
     #[test]
-    fn both_scalar_tiles_generate_valid_exact_binding_layouts() {
+    fn tuning_tiles_generate_valid_exact_binding_layouts() {
         for entry in [
             ShaderEntry::MatMul,
             ShaderEntry::FusedMatMulAdd,
             ShaderEntry::MatMulAT,
             ShaderEntry::MatMulBT,
         ] {
-            for tile in [MatmulTile::Tile32, MatmulTile::Tile64] {
+            for tile in [
+                MatmulTile::Tile32,
+                MatmulTile::Tile64,
+                MatmulTile::CooperativeF32 { tile_size: 8 },
+                MatmulTile::CooperativeF32 { tile_size: 16 },
+            ] {
                 let mut module = match tile {
                     MatmulTile::Tile32 => {
                         crate::codegen::generate_module_small(entry.shader_group())
                     }
                     MatmulTile::Tile64 => crate::codegen::generate_module(entry.shader_group()),
+                    MatmulTile::CooperativeF32 { .. } => crate::codegen::generate_module_coop(
+                        entry.shader_group(),
+                        &tile.coop_config().unwrap(),
+                    ),
                 };
                 // Blade assigns resource bindings by ShaderData field name.
                 // Assign distinct test bindings before full offline validation.
@@ -709,6 +775,7 @@ mod tests {
                 k: 7,
                 requires_full_precision: true,
                 device_local: [false; 4],
+                binding_bytes: Vec::new(),
             };
             let sizes = class.buffer_sizes().unwrap();
             for pattern in 0..2 {

@@ -1,10 +1,10 @@
 # Meganeura: study and workshop preparation
 
 Prepared 2026-09-05 against development base `bd6be08`, with the audit and
-scalar-tuning follow-up on `codex/audit-observability-tuning`. Performance
-statements refer to the separately frozen
-paper revision, not today's code. No new GPU execution or benchmarking was
-performed for this audit.
+f32-tuning follow-up on `codex/audit-observability-tuning`. Paper performance
+statements refer to the separately frozen revision. The initial audit was
+CPU-only; subsequent GPU qualification is described separately in the
+[performance plan](performance-plan.md), after the device was released.
 
 ## The one-minute explanation
 
@@ -26,9 +26,11 @@ PyTorch replacement.
 The next engineering opportunity is to replace performance thresholds with
 small, reusable, measured searches over legal kernel implementations. That
 means specializing to tensor structure and hardware, not recognizing model
-names. The first implementation now searches two scalar-f32 matmul tile sizes
-in isolated scratch; cooperative/fused search and whole-step confirmation
-remain future work. It has CPU validation, not new GPU performance evidence.
+names. The implementation searches scalar-f32 and legal native-f32 cooperative
+matmul tiles in isolated scratch. Scalar GPU qualification passed; native-f32
+hardware coverage is still due. F16-input/complex-fusion search and persistent
+winners remain future work. The whole-step experiment harness is separate
+from the frozen publication evidence.
 
 ## Reading paths
 
@@ -64,7 +66,7 @@ and [paper source](../../paper/p3hpc/main.tex).
 | Minimal latency | Small, stateless shapes; the LLM cell is one token without KV cache, not production autoregressive decoding. |
 | Valid | Passes sampled-output/loss and gradient-norm gates; not proof of elementwise gradients or convergence. |
 | Strict f32 | A controlled arithmetic permission contract, not bitwise identity across engines. |
-| Current code | Development base plus audit changes; no newly established performance numbers. |
+| Current code | Development base plus audit/tuning changes; qualification and tuning experiments must be distinguished from the frozen model results. |
 
 ## Claims to avoid
 

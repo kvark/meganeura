@@ -5,10 +5,19 @@
   `tune_with` and serializable evidence, numerical qualification, interleaved
   trials and a noise guard. Both tile sizes are candidates regardless of the
   initial occupancy cutoff; small-tile geometry uses exact ceil division.
-  Default-off and CPU-validated only; GPU qualification and whole-step gains
-  remain unmeasured. Cooperative/fused/GEMV search and persistence are deferred.
+  Default-off; scalar GPU qualification passes on RTX 5070, including state
+  preservation and subsequent optimizer updates against an untuned control.
   `TuneOutcome`'s former family/coop/scalar timing fields are replaced by
   class/tile/sample/decision fields; callers reading them must migrate.
+- Extend the same search to advertised, smoke-tested native-f32 cooperative
+  tiles when padding fits existing bindings. Occupancy/large-shape thresholds
+  are initial choices, not challenger vetoes. Reports expose each comparison,
+  binding capacities, shader rejection and qualification failures. Native-f32
+  GPU coverage remains due; RTX 5070 advertises only f16 matrix tiles. F16-input,
+  complex-fusion/GEMV search and persistence remain deferred.
+- Add a Rust whole-step tuning experiment with paired trials, output parity,
+  search evidence and revision/device/driver/hash metadata; frozen paper
+  results remain untouched.
 - Add a dedicated observability/debugging study chapter, eager-PyTorch
   comparison, probe coverage caveats, bisection ladder and rehearsal questions.
 
@@ -126,8 +135,7 @@
   (column-axis reductions), and LogSoftmax.
 - Historical Track F first cut measured cooperative-family demotion on live
   steps and retained scalar fallbacks. Superseded by the state-isolated
-  scalar-tile search above; cooperative tuning is deferred until equivalent
-  safe candidate contracts are implemented.
+  f32-matmul search above; f16-input cooperative tuning remains deferred.
 - Kernel-variant selection has a single owner (roadmap A2, scoped):
   cooperative promotion (incl. generated conv kernels and output padding),
   the RmsNorm→matmul prologue fusion, and small-tile demotion moved from
