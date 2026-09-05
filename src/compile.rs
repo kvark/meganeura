@@ -2800,20 +2800,11 @@ impl<'a> Compiler<'a> {
                     // autodiff topology and accumulation order are unchanged;
                     // specialize only the physical forward dispatch.
                     self.emit_sum_inner(a, out_buf, m, k);
-                } else if m == 1 && n.is_multiple_of(4) && wf != WeightFormat::Q4 {
+                } else if m == 1 && n.is_multiple_of(4) {
                     // K-split GEMV: one WG per 4 output columns (vec4),
                     // 32 threads cooperatively K-split with a shared-
                     // memory tree reduction. Many more WGs than N/128,
                     // giving occupancy to hide DRAM latency at M=1.
-                    //
-                    // Q4 is excluded because `generate_module_weighted` has
-                    // no Q4 variant of the GEMV shaders and falls back to
-                    // the f32 ones, which then read the packed blocks as
-                    // floats — silently producing ~1e37 garbage rather than
-                    // failing. The general MatMul path below does dequantize
-                    // correctly at m=1, so Q4 loses the occupancy win and
-                    // keeps its numbers. Drop this guard once the Q4 GEMV
-                    // shaders exist.
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::MatMulGemv,
                         workgroups: [n / 4, 1, 1],
@@ -2881,7 +2872,13 @@ impl<'a> Compiler<'a> {
                     // exact row broadcast. Preserve the MatMulBT graph node
                     // and its dependency order while avoiding tiled GEMM.
                     self.emit_broadcast_inner(a, out_buf, m, n);
-                } else if m == 1 && k.is_multiple_of(4) {
+                } else if m == 1 && k.is_multiple_of(4) && wf != WeightFormat::Q4 {
+                    // Q4 stays on the tiled path here. The K-split GEMV-BT
+                    // reads B as [N, K], while the Q4 block layout runs
+                    // along K per column of a [K, N] weight, so it would
+                    // need its own index mapping; `generate_module_weighted`
+                    // has no Q4 variant for this group and would otherwise
+                    // emit the f32 shader over packed blocks.
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::MatMulGemvBT,
                         workgroups: [n, 1, 1],
