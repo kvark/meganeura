@@ -99,7 +99,7 @@ For the detailed, source-backed comparison, read the
 [study guide](docs/study/README.md) and [alternatives](docs/study/alternatives.md).
 The [September audit](docs/audit-2026-09.md) separates current implementation
 status from the frozen results; the [performance plan](docs/study/performance-plan.md)
-describes the first bounded scalar-tile search and the remaining qualification
+describes bounded f32-matmul tile search and the remaining qualification
 and broader-search work.
 
 ## Install
@@ -181,7 +181,7 @@ win, so explicit code always has the last word.
 | `MEGANEURA_OPTIMIZER` | Rewrite mode: `off` \| `greedy` \| `egglog-windowed` \| `egglog-outlined` \| `egglog-whole`. |
 | `MEGANEURA_EGRAPH_COST` | Extraction objective: `ast-size` \| `tensor-traffic`. |
 | `MEGANEURA_EGRAPH_CUTOFF=<n>` | Saturation segment-size ceiling (default 300). |
-| `MEGANEURA_TUNE` | Opt-in bounded scalar-f32 matmul tile searches at build (`SessionConfig { tune: true }`), using private scratch. |
+| `MEGANEURA_TUNE` | Opt-in bounded f32 matmul tile searches at build (`SessionConfig { tune: true }`), using private scratch. |
 | `MEGANEURA_FLASH_EPT_CAP=<n>` | Flash forward elements-per-thread cap (power of two ≥ 2). |
 | `MEGANEURA_FLASH_GRAD_Q_EPT_CAP=<n>` | EPT cap for flash dQ backward. |
 | `MEGANEURA_FLASH_GRAD_KV_EPT_CAP=<n>` | EPT cap for fused flash dK/dV backward. |
@@ -189,12 +189,14 @@ win, so explicit code always has the last word.
 | `MEGANEURA_DEVICE_ID=0x744c` | Adapter selection by numeric device id. |
 | `MEGANEURA_GPU_TIMING` | Enable hardware timestamp pools (set before context creation). |
 
-`Session::tune_with(TuneOptions)` searches 32/64 scalar tiles for exact dense
-matmul classes, qualifies nonzero scratch outputs, interleaves measurements,
+`Session::tune_with(TuneOptions)` searches 32/64 scalar and legal native-f32
+cooperative tiles for exact dense matmul classes, qualifies nonzero scratch outputs, interleaves measurements,
 and returns raw samples and decisions. It never runs the live graph or advances
-optimizer/KV state. Default-off: GPU qualification and end-to-end confirmation
-are still due. Cooperative/fused/GEMV candidates and persistent winners are not
-included yet. See the [search contract](docs/study/performance-plan.md).
+optimizer/KV state. Default-off: scalar GPU qualification passed on RTX 5070;
+native-f32 hardware coverage and automatic whole-step confirmation remain due.
+F16-input/complex-fusion/GEMV candidates and persistent winners are not included.
+See the [search contract](docs/study/performance-plan.md) and
+[whole-step experiment](examples/tune_session.rs).
 
 ## Debugging
 
