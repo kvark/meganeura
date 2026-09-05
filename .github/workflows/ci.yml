@@ -73,39 +73,35 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Unit tests
-        run: cargo test --lib
-
-      - name: Gradient correctness (gradcheck)
-        # Catches the bug class where backward ops drop grad_output
-        # (works only when op is final loss, fails mid-graph). Every
-        # backward must chain grad_output; gradcheck verifies analytical
-        # vs finite-difference gradients in mid-graph contexts. See
-        # tests/gradcheck.rs and the contract comment at the top of
-        # autodiff.rs's match block.
-        run: cargo test --test gradcheck
-
-      - name: GPU smoke test
-        run: cargo test --test gpu_smoke
+      # Every target, not a hand-picked subset: the whole suite
+      # is ~2 min on lavapipe, and naming targets one by one meant new test
+      # files silently never ran. `--tests` covers the lib unit tests too.
+      # Among the coverage this restores:
+      # gradcheck (backward ops must chain grad_output — see the contract
+      # comment atop autodiff.rs's match block), gpu_smoke, cache_inference,
+      # the matmul/attention audit regressions, and the vision ops.
+      #
+      # --test-threads=1 because several targets drive one adapter and the
+      # audit regressions were already serial.
+      #
+      # The two skips are bit-exact / 1e-7-tolerance parity contracts between
+      # a fused reduction and its explicit expansion. They hold on real
+      # adapters but not on a software rasterizer, which reassociates the
+      # accumulation: `normalize_inner_sum` lands 1 ULP out at index 24, and
+      # `pairwise_squared_distance` 1.5e-7 against a 1.1e-7 tolerance on a
+      # sum whose terms cancel to ~0.5% of their own magnitude. Skipping them
+      # here keeps them at full strength on hardware rather than loosening
+      # the contract for everyone.
+      - name: Unit + integration tests
+        run: >-
+          cargo test --tests --
+          --test-threads=1
+          --skip normalize_inner_sum_matches_explicit_forward_and_gradient
+          --skip pairwise_squared_distance_matches_explicit_forward_and_gradients
         env:
           # MHA backward shaders produce numerically unstable gradients on
           # lavapipe and on CI Metal runners (grad_k divergence on M-series).
           MEGANEURA_SKIP_BACKPROP: ${{ matrix.skip_backprop }}
-
-      - name: Cache + inference roundtrip test
-        run: cargo test --test cache_inference
-
-      - name: Audit regression tests
-        run: >-
-          cargo test
-          --test checkpoint_validation
-          --test coop_matmul_skinny
-          --test mha_head_dim32
-          --test mixed_attention_widths
-          -- --test-threads=1
-
-      - name: Vision ops smoke test
-        run: cargo test --test vision_ops_smoke -- --skip vision_encoder_one_layer
 
       - name: Latency benchmark
         if: runner.os == 'Linux'
