@@ -33,7 +33,22 @@ Helvetica), which the small TeX Live image lacks --- run
 `tlmgr install collection-fontsrecommended` in the container first (or
 use the full `texlive/texlive:latest` image). Do not substitute
 `lmodern`: it silently replaces the IEEE Times font.
-Deadline: August 12, 2026.
+The P3HPC paper has been accepted. Camera-ready is due **September 25, 2026**;
+the working target is a reviewed draft by September 19. See the
+[official submission page](https://p3hpc.org/workshop/2026/submissions/),
+[revision plan](p3hpc/REVISION.md), and [study guide](../docs/study/README.md).
+Reviewer-specific revisions still need to be incorporated when available.
+
+Replay the frozen evidence without a GPU, from the repository root:
+
+```sh
+python3 paper/p3hpc/artifact/verify.py --repository --show-facts
+python3 -m unittest discover -s paper/p3hpc/artifact -p 'test_*.py'
+```
+
+This checks records, sampled-output/gradient-norm gates, medians and table
+regeneration. It does not run benchmarks or automatically validate all prose.
+Keep post-freeze development results separate from `paper/results/`.
 
 Build locally with:
 

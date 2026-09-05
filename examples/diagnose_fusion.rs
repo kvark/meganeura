@@ -2,14 +2,15 @@
 //! fusion opportunities that the current compiler is leaving on the
 //! table.
 //!
-//! Runs on the SmolVLA training graph by default. Prints a per-pattern
-//! report with estimated barrier-overhead savings (~33µs per eliminated
-//! dispatch on NVIDIA).
+//! CPU-only inspection: no GPU context, weight download, or timing. Reports
+//! possible fusion sites and exact matmul shape/precision classes in the
+//! compiler's plan, before runtime variant selection and horizontal packing.
+//! Counts identify experiments; they do not predict latency savings.
 //!
 //! Usage:
 //!   cargo run --release --example diagnose_fusion
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use meganeura::{
     compile::{BufferRef, Dispatch, ExecutionPlan, ShaderEntry},
@@ -19,10 +20,6 @@ use meganeura::{
         smolvla::{self, SmolVLAConfig},
     },
 };
-
-/// Approximate barrier cost per saved dispatch on NVIDIA (from the
-/// existing fusion-pass docs).
-const BARRIER_US: f64 = 33.0;
 
 #[derive(Debug)]
 struct Finding {
@@ -37,7 +34,7 @@ fn shader_name(s: &ShaderEntry) -> String {
 }
 
 /// True if `shader` is any matmul variant that currently supports
-/// epilogue absorption (scalar path only — coop matmul can't fuse).
+/// epilogue absorption on the scalar plan inspected here.
 fn is_scalar_matmul(d: &Dispatch) -> bool {
     use ShaderEntry::*;
     !d.use_coop
@@ -209,10 +206,9 @@ fn print_report(label: &str, plan: &ExecutionPlan, findings: &[Finding]) {
         by_kind.entry(f.kind).or_default().push(f);
     }
     let total = findings.len();
-    let saved_ms = total as f64 * BARRIER_US / 1000.0;
     println!(
-        "  {} unfused opportunities. If all fused, saves ≈ {:.2} ms barrier overhead.",
-        total, saved_ms,
+        "  {} candidate sites (patterns may overlap; profitability requires measurement).",
+        total,
     );
     let mut kinds: Vec<_> = by_kind.keys().copied().collect();
     kinds.sort();
@@ -249,12 +245,28 @@ fn analyze(label: &str, plan: &ExecutionPlan) {
     for (name, count) in dispatch_histogram(plan).iter().take(12) {
         println!("    {:>6}  {}", count, name);
     }
-    println!(
-        "\n  Barrier overhead assuming {:.0} µs/group × {} groups: ≈ {:.2} ms\n",
-        BARRIER_US,
-        plan.dispatches.len(),
-        plan.dispatches.len() as f64 * BARRIER_US / 1000.0,
-    );
+    let mut shapes = BTreeMap::new();
+    for d in &plan.dispatches {
+        let (m, n, k) = match d.shader {
+            ShaderEntry::MatMul
+            | ShaderEntry::FusedMatMulAdd
+            | ShaderEntry::MatMulGemv
+            | ShaderEntry::MatMulGemvAdd => (d.params[0], d.params[2], d.params[1]),
+            ShaderEntry::MatMulAT
+            | ShaderEntry::MatMulBT
+            | ShaderEntry::FusedMatMulATAdd
+            | ShaderEntry::FusedMatMulBTAdd
+            | ShaderEntry::MatMulGemvBT => (d.params[0], d.params[1], d.params[2]),
+            _ => continue,
+        };
+        let key = (shader_name(&d.shader), m, n, k, d.requires_full_precision);
+        *shapes.entry(key).or_insert(0usize) += 1;
+    }
+    println!("\n  matmul shape classes (entry, M, N, K, full-precision operands):");
+    for ((entry, m, n, k, full_precision), count) in shapes {
+        println!("    {count:>6}  {entry} M={m} N={n} K={k} full_precision={full_precision}");
+    }
+    println!("\n  Pre-runtime plan: counts exclude device selection, final packing and barriers.");
 }
 
 fn main() {
@@ -307,7 +319,8 @@ fn main() {
                 let max_seq = 256;
                 eprintln!("Building SmolLM2-135M decode (max_seq={})", max_seq);
                 let mut g = meganeura::Graph::new();
-                let _ = smollm2::build_decode_graph(&mut g, &config, max_seq);
+                let (logits, _, _) = smollm2::build_decode_graph(&mut g, &config, max_seq);
+                g.set_outputs(vec![logits]);
                 let optimized = meganeura::optimize::optimize(&g);
                 let plan = meganeura::compile::compile(&optimized);
                 analyze("SmolLM2-135M decode", &plan);

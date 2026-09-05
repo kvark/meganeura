@@ -1,14 +1,25 @@
 # Unreleased
 
+- Build-plan cache format 4 fingerprints rewrite configuration as well as
+  compiler options and capabilities; cache hits honor the requested tuning flag.
+- Horizontal matmul fusion drops incompatible single-dispatch scalar
+  fallbacks and preserves the precision requirement of every packed sibling.
+- CPU-only fusion diagnostics report exact matmul shape classes, retain the
+  decode output, and no longer turn dispatch counts into guessed timings.
+- Frozen-paper verification now replays numerical gates and medians, checks
+  raw/joined consistency, and runs in CI alongside all-feature quality checks.
+- Added a source-linked project audit, architecture/design study guide,
+  alternatives comparison, performance plan and P3HPC rehearsal/revision kit.
+
 - `Session::set_laprop` provides RMS-normalize-then-momentum updates, and
   `Session::set_adaptive_grad_clip` applies a per-parameter relative norm
   bound. Together they reproduce DreamerV3's optimizer chain on the GPU.
 
-- Compensated f16 cooperative matmul (C1): on devices that only expose
-  f16 tiles, `requires_full_precision` work stages each operand as
-  `hi = f16(x)` plus residual `lo` and accumulates `hi·hi + hi·lo +
-  lo·hi` in f32. Inference keeps plain f16 staging. `AllowF16` still
-  forces the uncompensated path.
+- Compensated f16 cooperative code generation remains available for research,
+  but automatic derivative promotion was rolled back on August 28: splitting
+  hi/lo operands does not preserve f32 exponent range. `Auto` protects
+  `requires_full_precision` work with native-f32 tiles or scalar f32;
+  `AllowF16` explicitly permits the uncompensated reduced-input path.
 - Horizontal fusion (D1): independent same-A matmuls that already share
   a barrier group (Q/K/V projections) pack into one dispatch with
   `workgroups.z` selecting the sibling.

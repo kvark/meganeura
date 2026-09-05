@@ -270,8 +270,8 @@ def efficiencies(mode, phase, model):
         # An invalid implementation result scores zero and does not set the
         # best-observed bar. Oracle-disputed pairs are removed above for both
         # engines rather than being assigned to either one.
-        valid = (phase != "training_ms"
-                 or s["meganeura"]["validation"]["training_valid"])
+        gate = "training_valid" if phase == "training_ms" else "forward_valid"
+        valid = s["meganeura"]["validation"][gate]
         best = min(tmg, tpt) if valid else tpt
         eff["meganeura"].append(best / tmg if valid else 0.0)
         eff["pytorch"].append(best / tpt)

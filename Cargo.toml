@@ -6,7 +6,7 @@ repository = "https://github.com/kvark/meganeura"
 categories = ["science"]
 edition = "2024"
 rust-version = "1.88"
-description = "E-graph optimized neural network training on Blade"
+description = "Portable GPU training and inference through Vulkan and Metal"
 license = "MIT"
 
 [features]

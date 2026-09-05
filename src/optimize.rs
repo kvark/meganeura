@@ -1,12 +1,11 @@
-//! E-graph optimization pass: the graph is encoded into egglog, rewrite
-//! rules discover fusions under equality saturation, a traffic-aware
-//! cost model extracts the cheapest equivalent term per output, and the
-//! extracted terms are stamped back into the graph IR. The e-graph is
-//! the single owner of every rewrite decision — there is no parallel
-//! pattern-matching path.
+//! Graph optimization with deterministic greedy rewrites by default and
+//! optional equality saturation through egglog. The current local rule set
+//! reaches the same useful forms with greedy rewriting at much lower build
+//! cost. Equality saturation retains alternatives for extraction using an
+//! expression-size or estimated tensor-traffic objective.
 //!
-//! Scaling: saturation cost is superlinear in node count, so graphs over
-//! `SATURATION_CUTOFF` are split into segments — repeated regions
+//! In outlined mode, graphs over `SATURATION_CUTOFF` are split into segments:
+//! repeated regions
 //! (transformer layers, detected by `outline`) saturate one instance and
 //! stamp the result into every instance; the remaining nodes are chunked
 //! into windows under the cutoff. Every node therefore passes through
@@ -35,7 +34,7 @@ const SATURATION_CUTOFF: usize = 300;
 /// ablations and future global rewrites. `Greedy` is the production strategy:
 /// for the current local rewrite set it extracts the same useful forms with
 /// far less compile-time overhead.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum OptimizeMode {
     /// Preserve the graph as written (apart from dead-code elimination).
     Off,
@@ -62,7 +61,7 @@ impl OptimizeMode {
 }
 
 /// Objective used when extracting a representative from each e-class.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ExtractionCost {
     /// Minimize expression-tree nodes.
     AstSize,
@@ -80,7 +79,7 @@ impl ExtractionCost {
 }
 
 /// Configuration for graph-rewrite ablations.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OptimizeConfig {
     pub mode: OptimizeMode,
     pub extraction_cost: ExtractionCost,

@@ -1,48 +1,42 @@
 # Roadmap
 
-Strategic plan for making meganeura faster while preserving its core
-property: **no hand-written kernel per model pattern** — everything
-composes from the four archetypes (pointwise, reduction, matmul,
-attention) plus graph fusion.
+Strategic plan for making Meganeura faster while preserving reusable,
+operator/shape-driven specialization rather than per-model kernels. The
+organizing families are pointwise, reduction, matmul, convolution and attention.
+Handwritten templates still exist; consolidating them into generators is
+ongoing.
 
-## Positioning
+## September 2026 priorities
 
-The benchmark picture (see README / [inferena.tech](https://inferena.tech)):
+The [study guide](study/README.md), [audit](audit-2026-09.md) and
+[performance plan](study/performance-plan.md) are the current decision record.
+The detailed tracks below retain earlier motivation and experiment notes;
+historical timings and rejected ideas are not current universal guarantees.
 
-- **Apple / AMD / Intel**: leading PyTorch on transformer inference and
-  training. Hold the lead while closing the remaining losses.
-- **NVIDIA**: close to parity on inference; training still trails CUDA.
-  NVIDIA is a first-class target — the goal is parity-to-lead there,
-  not just on the platforms PyTorch neglects.
-- **Known losses**: ResNet-50 (conv-heavy), Whisper-tiny (small
-  dispatches, CPU-overhead-bound), NVIDIA training (tensor cores
-  largely unusable for f32 gradients).
+The frozen GPU-reference matrix has 12/20 strict minimal-latency wins but a
+1.78× median valid training-time ratio. Discrete AMD is strong; Apple training
+still loses to eager MPS. Intel is compared with a labeled CPU fallback.
+See [results](study/results.md) for denominators and numerical gates. Do not
+mix exploratory Inferena history with publication-grade results.
 
-Everything below is organized so each track attacks one of those
-losses or removes a structural ceiling. Items marked **[research]**
-have open questions; the rest are engineering with known shape.
+The next sequence is:
 
-Ground rules accumulated from past work (do not re-litigate without
-new hardware or new data — see `rejected-optimizations.md` and
-`perf-pipeline-stats-retrospective.md`):
+1. State-safe tuning, exact variant contracts and stronger numerical evidence.
+2. Bounded bidirectional shape-level search; thresholds become search priors.
+3. Reusable convolution-derivative and Metal attention schedules.
+4. Persistent winners with device/driver/compiler provenance; lazy optimizer
+   state and logical checkpoint serialization.
+5. Layout/rematerialization and new precision formats only with an observed
+   need, capability support, correctness evidence and an amortization budget.
 
-- CPU command encoding is **not** a bottleneck — measured negligible.
-  Command-buffer reuse is a non-goal (blade doesn't expose it, and
-  there's nothing to win).
-- Cooperative matrix on Vulkan **and** Metal already ships through
-  Naga (`coop_mat`, subgroups, f16) and is load-bearing in matmul,
-  flash attention forward, and both flash backward kernels. It is not
-  a TODO; the only missing *type* is bf16 (see C2).
-- Dynamic shapes need no new GPU machinery (no indirect dispatch):
-  the command stream is re-encoded every iteration and shapes flow
-  through uniform params, so runtime shapes already have everywhere
-  they need to go. The only cost of a shape change is re-running plan
-  emission, which is cheap; pipelines are shape-agnostic and already
-  carry over.
-- GPU-time wins on dispatches under ~50 µs routinely lose on
-  wall-clock. Always judge by `step()` wall-clock.
-- Register-count-driven cost models don't track wall-clock. Bytes
-  moved does.
+Existing profiles prioritize work but do not establish that command encoding,
+API overhead or register pressure can never matter. Use whole-step time for
+acceptance and profiles for localization. Cooperative backward is experimental
+and default-off; compensated f16 is not a safe automatic derivative path.
+General dynamic shape replanning is not yet exposed by the session API.
+
+No GPU benchmarking was performed during this audit; measurements below are
+historical and future experiments remain deferred until the device is free.
 
 ---
 
@@ -264,12 +258,14 @@ with barrier-group concurrency. Start after A1 + A3 + B1 land.
 
 ## Track C — Precision: tensor cores for training
 
-### C1. Error-compensated f16 coop matmul  ← *landed (first cut)*
+### C1. Error-compensated f16 coop matmul  ← *automatic use rolled back*
 
-*Landed:* f16-only devices enable coop under `Auto`. Derivative
-dispatches (`requires_full_precision`) use hi/lo residual staging and
-three f32 MMAs per tile; inference uses plain f16. `AllowF16` keeps
-the uncompensated path. Naga-validated for Normal/AT/BT.
+The generator validates, but `3326f39` removed automatic compensated
+derivative selection and `f2a0108` pins tiny-gradient correctness. Both hi and
+lo can underflow: mantissa compensation does not preserve exponent range.
+`Auto` uses native-f32 tiles or scalar f32 for protected derivatives.
+`AllowF16` explicitly relaxes that contract. The proposal below is historical,
+not a description of current defaults or established near-f32 accuracy.
 
 ### C1 (historical)
 
@@ -302,15 +298,12 @@ compensated accumulation only for K > threshold.
 
 ### C2. bf16 cooperative matrix
 
-Coop matrix and subgroups already ship through Naga on Vulkan and
-Metal — the gap is purely the **bf16 type**: `VK_KHR_shader_bfloat16`
-+ the bf16 cooperative-matrix formats in Vulkan, `bfloat` in MSL 3.1.
-bf16's dynamic range removes the loss-scaling problem that f16
-staging has, potentially making C1's residual trick unnecessary on
-hardware that exposes bf16 tiles. Requires plumbing through naga and
-blade first (upstream work we're well-positioned to do), then it's a
-`CoopConfig` variant here. Sequence after C1 — C1 works on today's
-naga.
+Cooperative matrices and subgroups already have a Naga/Blade path. bf16 needs
+end-to-end type, advertised tile, feature-bit and backend support, followed
+by numerical qualification. Its f32-like exponent range helps the underflow
+problem but its shorter mantissa is not f32 accuracy. This is research, not
+a one-enum implementation task or a prerequisite blocked on completing C1.
+See the [precision plan](study/performance-plan.md).
 
 ### C3. Mixed-precision training recipe
 
@@ -425,7 +418,7 @@ recompilation. Default-off until the bench fleet validates the flip
 path on coop-capable adapters.
 
 **Remaining plan.**
-1. *Fleet validation*, then default-on for the family-level flips.
+1. *State isolation and fleet validation* before considering default-on.
 2. *Shape-class granularity:* group dispatches by
    (archetype, m/n/k-class) and measure per class instead of per
    family. Transformer plans have a handful of classes repeated across
@@ -433,12 +426,10 @@ path on coop-capable adapters.
 3. *Recompiling knobs:* EPT caps / tile sizes / generated-kernel
    workgroup sizes are plan data now, so a candidate is a plan rebuild
    (~seconds). Bound the space per shape-class (2–4 values per knob).
-4. *Persist measured winners* in the semantic plan cache: it already
-   fingerprints device caps and every knob (A-002), so invalidation is
-   solved and the search becomes a first-run-only cost. This revises
-   the earlier "in-memory only" stance — that call predates the
-   semantic cache; with invalidation free, refusing persistence just
-   re-pays the tune budget every process.
+4. *Persist measured winners* with a stronger performance identity: device,
+   driver, backend/compiler/generator revision, numerical policy and validation
+   provenance. Semantic plan caching is not already a tuning database;
+   invalidation is not free or solved by capability bits alone.
 
 **Non-goals.** Representation choice stays *out of the e-graph*: the
 e-graph is semantic and device-free, and `coop(x) ≡ scalar(x)` is not a
@@ -460,17 +451,22 @@ shape-class bounding is the fix.
 Q4/Q8 weight formats, derived-param plumbing, and the training stack
 already coexist. Frozen quantized base + trainable f16/f32 LoRA
 adapters = fine-tuning SmolLM2/Gemma-class models on Radeon 780M /
-Apple M-series — a capability no other framework offers, and squarely
-on the wedge. The quantized-weights-disable-coop restriction is
+Apple M-series. MLX-LM already offers LoRA/QLoRA on Apple; the opportunity is
+a common Vulkan/Metal path, not uniqueness. See the sourced
+[alternatives comparison](study/alternatives.md). The quantized-weights-disable-coop restriction is
 acceptable here (LoRA matmuls are small; base-model matmuls are
 inference-shaped). Needs: LoRA graph helper in `nn`, gradient flow
 around frozen quantized params (StopGradient exists), an example +
 bench. Mostly assembly of existing parts; good first "product"
-milestone after B1/C1.
+milestone after memory and numerical-contract work.
 
 ---
 
-## Sequencing
+## Historical sequencing
+
+This earlier sequence is retained to explain the track dependencies, not as
+the current priority order. In particular, C1's automatic use was rolled back
+and safe autotuning is now an early priority rather than a final add-on.
 
 ```
 Now        B1 aliasing ──→ B2 device-local ──→ B3 remat [research]
