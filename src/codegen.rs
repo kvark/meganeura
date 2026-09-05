@@ -1387,6 +1387,12 @@ pub fn generate_module_weighted(group: ShaderGroup, format: WeightFormat) -> Sha
         ShaderGroup::Embedding if mode == WeightFormat::F16 => {
             parse_wgsl(include_str!("shaders/embedding_f16.wgsl"))
         }
+        ShaderGroup::MatMulGemv if mode == WeightFormat::Q4 => {
+            gen_matmul_gemv_q4(include_str!("shaders/matmul_gemv.wgsl"))
+        }
+        ShaderGroup::MatMulGemvAdd if mode == WeightFormat::Q4 => {
+            gen_matmul_gemv_q4(include_str!("shaders/matmul_gemv_add.wgsl"))
+        }
         ShaderGroup::MatMulGemv | ShaderGroup::MatMulGemvBT if mode == WeightFormat::F16 => {
             if group == ShaderGroup::MatMulGemv {
                 gen_matmul_gemv_f16()
@@ -1394,7 +1400,8 @@ pub fn generate_module_weighted(group: ShaderGroup, format: WeightFormat) -> Sha
                 gen_matmul_gemv_bt_f16()
             }
         }
-        // Q4 GEMV not yet implemented — fall back to standard pipeline
+        // MatMulGemvBT has no Q4 variant; compile.rs keeps Q4 off that
+        // specialization so this never emits an f32 shader for packed data.
         _ => generate_module(group),
     }
 }
@@ -1463,6 +1470,42 @@ pub fn generate_module_gemv_rmsnorm() -> ShaderModule {
         .replace(
             "        let a = matrix_a[kk];",
             "        let a = matrix_a[kk] * rs * norm_w[kk];",
+        );
+    parse_wgsl(&src)
+}
+
+/// Q4 variant of the K-split GEMV, derived from the canonical shader by
+/// substitution like the f16 one, so tile shape and reduction changes
+/// reach it automatically.
+///
+/// `matrix_b` becomes a raw `array<u32>` of packed blocks and the vec4
+/// load becomes four `dequant_q4` calls, one per output column in the
+/// vec4. Block metadata is indexed by absolute (k, n), which the K-split
+/// loop already has, so no re-blocking is needed.
+///
+/// Applies to `matmul_gemv.wgsl` and `matmul_gemv_add.wgsl`, which share
+/// the declaration and the load line. `matmul_gemv_bt.wgsl` is not
+/// covered: it reads B as [N, K], and the Q4 block layout runs along K
+/// per column of a [K, N] weight, so it needs its own index mapping.
+fn gen_matmul_gemv_q4(src: &str) -> ShaderModule {
+    let src = src
+        .replace(
+            "var<storage> matrix_b: array<vec4<f32>>;",
+            "var<storage> matrix_b: array<u32>;",
+        )
+        .replace(
+            "@compute @workgroup_size(",
+            &format!("{Q4_DEQUANT_FN}\n@compute @workgroup_size("),
+        )
+        .replace(
+            "let b = matrix_b[kk * n_v4 + col4];",
+            "let col = col4 * 4u;\n\
+        let b = vec4<f32>(\n\
+            dequant_q4(kk, col),\n\
+            dequant_q4(kk, col + 1u),\n\
+            dequant_q4(kk, col + 2u),\n\
+            dequant_q4(kk, col + 3u),\n\
+        );",
         );
     parse_wgsl(&src)
 }
@@ -5892,6 +5935,9 @@ mod tests {
             ShaderGroup::MatMulATAdd,
             ShaderGroup::MatMulBT,
             ShaderGroup::MatMulBTAdd,
+            // Decode is m=1, which compile.rs routes to these instead.
+            ShaderGroup::MatMulGemv,
+            ShaderGroup::MatMulGemvAdd,
         ] {
             let sm = generate_module_weighted(group, WeightFormat::Q4);
             assert!(
@@ -5906,29 +5952,22 @@ mod tests {
         }
     }
 
-    /// The GEMV groups have no Q4 variant: `generate_module_weighted`
-    /// falls them through to `generate_module`, which emits the f32
-    /// shader. That shader would read the packed 4-bit blocks as floats,
-    /// so `compile.rs` must not route a Q4 weight to a GEMV dispatch —
-    /// it guards the `m == 1 && n % 4 == 0` specialization on
-    /// `wf != WeightFormat::Q4` for exactly this reason.
+    /// `MatMulGemvBT` is the one GEMV group still without a Q4 variant:
+    /// it reads B as [N, K] while the Q4 block layout runs along K per
+    /// column of a [K, N] weight. `compile.rs` therefore keeps Q4 off
+    /// that specialization — without the guard it would emit the f32
+    /// shader over packed blocks, which is how m=1 Q4 returned ~1e37.
     ///
-    /// When Q4 GEMV shaders land, this test flips to the assertion above
-    /// and that guard comes out. Until then, pinning the gap here keeps
-    /// the two files from drifting apart silently, which is how m=1 Q4
-    /// shipped returning ~1e37 (see tests/q4_decode_shapes.rs).
+    /// When a Q4 GEMV-BT shader lands, move the group into the test above
+    /// and drop that guard.
     #[test]
-    fn q4_gemv_shaders_do_not_exist_yet() {
-        for group in [
-            ShaderGroup::MatMulGemv,
-            ShaderGroup::MatMulGemvAdd,
-            ShaderGroup::MatMulGemvBT,
-        ] {
-            let sm = generate_module_weighted(group, WeightFormat::Q4);
-            assert!(
-                !sm.source.contains("dequant_q4"),
-                "{group:?} now has a Q4 variant — drop the WeightFormat::Q4                  guard on the GEMV branch in compile.rs and move this group                  into q4_matmul_shader_generates"
-            );
-        }
+    fn q4_gemv_bt_shader_does_not_exist_yet() {
+        let sm = generate_module_weighted(ShaderGroup::MatMulGemvBT, WeightFormat::Q4);
+        assert!(
+            !sm.source.contains("dequant_q4"),
+            "MatMulGemvBT now has a Q4 variant — drop the WeightFormat::Q4 \
+             guard on the MatMulBT GEMV branch in compile.rs and move this \
+             group into q4_matmul_shader_generates"
+        );
     }
 }

@@ -3181,6 +3181,99 @@ fn q4_matmul_correctness() {
     eprintln!("Q4 matmul PASSED: GPU-CPU max error {:.4}", max_err);
 }
 
+/// `q4_matmul_correctness` uses m=6, which only reaches the tiled matmul.
+/// Decode multiplies one row at a time, and `compile.rs` sends
+/// `m == 1 && n % 4 == 0` to the K-split GEMV instead — a separate shader
+/// that needed its own Q4 variant. Without one it emitted the f32 GEMV
+/// over packed blocks and returned ~1e37.
+#[test]
+fn q4_matmul_single_row_matches_reference() {
+    // SmolLM2-135M widths: n % 4 == 0 takes the GEMV path, 1534 the tiled
+    // one as a control.
+    for (k, n) in [
+        (576usize, 1536usize),
+        (576, 49152),
+        (1536, 576),
+        (576, 1534),
+    ] {
+        let a: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
+        let b: Vec<f32> = (0..k * n)
+            .map(|i| ((i % 97) as f32 - 48.0) * 0.01)
+            .collect();
+
+        let mut g = Graph::new();
+        let a_in = g.input("a", &[1, k]);
+        let b_q4 = g.parameter_q4("b", &[k, n]);
+        let c = g.matmul(a_in, b_q4);
+        g.set_outputs(vec![c]);
+        let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+        session.set_input("a", &a);
+        session.set_parameter("b", &b);
+        session.step();
+        session.wait();
+        let gpu = session.read_output(n);
+
+        let b_deq =
+            meganeura::runtime::dequantize_q4_0(&meganeura::runtime::quantize_q4_0(&b, k, n), k, n);
+        let mut max_err = 0.0f32;
+        for col in 0..n {
+            let mut want = 0.0f32;
+            for i in 0..k {
+                want += a[i] * b_deq[i * n + col];
+            }
+            max_err = max_err.max((gpu[col] - want).abs());
+        }
+        assert!(
+            gpu.iter().all(|v| v.is_finite()),
+            "Q4 m=1 {k}x{n}: non-finite output"
+        );
+        // The GEMV K-splits the sum, so this is f32 reassociation only.
+        assert!(
+            max_err < 1e-2,
+            "Q4 m=1 {k}x{n}: GPU vs CPU Q4 max error {max_err}"
+        );
+    }
+
+    // A fused matmul+add at m=1 goes to MatMulGemvAdd, a second shader
+    // that needed the same Q4 variant.
+    let (k, n) = (576usize, 1536usize);
+    let a: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
+    let b: Vec<f32> = (0..k * n)
+        .map(|i| ((i % 97) as f32 - 48.0) * 0.01)
+        .collect();
+    let bias: Vec<f32> = (0..n).map(|i| ((i % 7) as f32 - 3.0) * 0.02).collect();
+
+    let mut g = Graph::new();
+    let a_in = g.input("a", &[1, k]);
+    let b_q4 = g.parameter_q4("b", &[k, n]);
+    let d_in = g.input("d", &[1, n]);
+    let mm = g.matmul(a_in, b_q4);
+    let c = g.add(mm, d_in);
+    g.set_outputs(vec![c]);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    session.set_input("a", &a);
+    session.set_parameter("b", &b);
+    session.set_input("d", &bias);
+    session.step();
+    session.wait();
+    let gpu = session.read_output(n);
+
+    let b_deq =
+        meganeura::runtime::dequantize_q4_0(&meganeura::runtime::quantize_q4_0(&b, k, n), k, n);
+    let mut max_err = 0.0f32;
+    for col in 0..n {
+        let mut want = bias[col];
+        for i in 0..k {
+            want += a[i] * b_deq[i * n + col];
+        }
+        max_err = max_err.max((gpu[col] - want).abs());
+    }
+    assert!(
+        max_err < 1e-2,
+        "Q4 fused m=1 {k}x{n}: GPU vs CPU Q4 max error {max_err}"
+    );
+}
+
 /// Incrementally build a 1-layer transformer with Q4 weights.
 /// Output each intermediate result to find where NaN first appears.
 #[test]
