@@ -164,7 +164,7 @@ registry! {
 
     // --- Tuning defaults (explicit code-level options win) ---
     TUNE: "MEGANEURA_TUNE", Bool, Tuning,
-        "Run Session::tune at build: measure coop vs scalar per kernel family and keep the winner.";
+        "Run bounded scalar-f32 matmul tile searches on private scratch at build; never executes the live graph.";
     FLASH_EPT_CAP: "MEGANEURA_FLASH_EPT_CAP", U32, Tuning,
         "Elements-per-thread cap for flash-attention forward codegen (power of two ≥ 2).";
     FLASH_GRAD_Q_EPT_CAP: "MEGANEURA_FLASH_GRAD_Q_EPT_CAP", U32, Tuning,

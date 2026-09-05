@@ -99,7 +99,8 @@ For the detailed, source-backed comparison, read the
 [study guide](docs/study/README.md) and [alternatives](docs/study/alternatives.md).
 The [September audit](docs/audit-2026-09.md) separates current implementation
 status from the frozen results; the [performance plan](docs/study/performance-plan.md)
-describes bounded, correctness-gated autotuning work still to be done.
+describes the first bounded scalar-tile search and the remaining qualification
+and broader-search work.
 
 ## Install
 
@@ -180,7 +181,7 @@ win, so explicit code always has the last word.
 | `MEGANEURA_OPTIMIZER` | Rewrite mode: `off` \| `greedy` \| `egglog-windowed` \| `egglog-outlined` \| `egglog-whole`. |
 | `MEGANEURA_EGRAPH_COST` | Extraction objective: `ast-size` \| `tensor-traffic`. |
 | `MEGANEURA_EGRAPH_CUTOFF=<n>` | Saturation segment-size ceiling (default 300). |
-| `MEGANEURA_TUNE` | Opt-in family-level coop-to-scalar measurements at build (`SessionConfig { tune: true }`). Not comprehensive shape tuning; see the state caveat below. |
+| `MEGANEURA_TUNE` | Opt-in bounded scalar-f32 matmul tile searches at build (`SessionConfig { tune: true }`), using private scratch. |
 | `MEGANEURA_FLASH_EPT_CAP=<n>` | Flash forward elements-per-thread cap (power of two ≥ 2). |
 | `MEGANEURA_FLASH_GRAD_Q_EPT_CAP=<n>` | EPT cap for flash dQ backward. |
 | `MEGANEURA_FLASH_GRAD_KV_EPT_CAP=<n>` | EPT cap for fused flash dK/dV backward. |
@@ -188,12 +189,17 @@ win, so explicit code always has the last word.
 | `MEGANEURA_DEVICE_ID=0x744c` | Adapter selection by numeric device id. |
 | `MEGANEURA_GPU_TIMING` | Enable hardware timestamp pools (set before context creation). |
 
-Tuning runs real steps. Build-time tuning precedes user input/weight uploads;
-calling `Session::tune` on an active session can advance optimizer,
-accumulation, or KV state. It is not a side-effect-free query. Keep it off
-when those side effects are inappropriate; state-isolated tuning is planned.
+`Session::tune_with(TuneOptions)` searches 32/64 scalar tiles for exact dense
+matmul classes, qualifies nonzero scratch outputs, interleaves measurements,
+and returns raw samples and decisions. It never runs the live graph or advances
+optimizer/KV state. Default-off: GPU qualification and end-to-end confirmation
+are still due. Cooperative/fused/GEMV candidates and persistent winners are not
+included yet. See the [search contract](docs/study/performance-plan.md).
 
 ## Debugging
+
+See the [debugging study chapter](docs/study/observability.md) for the detailed
+eager-PyTorch comparison, bisection workflow and observation limits.
 
 Three levels, cheapest first:
 
@@ -205,9 +211,10 @@ Three levels, cheapest first:
   model-builder line that created the bad node.
 - **Debug sessions.** `build(&g, SessionConfig::debug())` disables buffer
   aliasing and keeps everything host-visible: `session.read_node_by_name("blk3.qkv")`
-  returns any value after a step, and `session.step_debug()` attributes the
-  first NaN/Inf to a named dispatch. Fused-away or aliased values return a
-  structured error instead of garbage.
+  reads materialized values after `step()` and `wait()`. Graph rewrites and
+  precision policy are separate controls. `session.step_debug()` scans primary
+  output prefixes after execution; its first reported NaN/Inf is not a complete
+  root-cause guarantee. Fused-away or aliased values return structured errors.
 - **Eager evaluation.** `meganeura::eager::Eager` runs the graph you are
   *still building*, one `eval(&g, node)` at a time, on the same kernels the
   compiled path uses — the PyTorch-style inspect-as-you-go loop. The same

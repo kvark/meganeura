@@ -40,6 +40,13 @@ inadequate when both execute compiled GPU kernels. Use the frozen ratios for
 observed performance and test stronger automatic baselines before attributing
 small-shape wins to an inherent runtime advantage.
 
+For development, eager tensor inspection, retained gradients, hooks and
+anomaly/profiler tools are genuine PyTorch strengths. Meganeura's named
+materialized debug sessions and plan/shader inspection help, but do not give
+identical interactivity or coverage. See the source-backed
+[observability comparison and debugging workflow](observability.md), including
+the tools available in compiled PyTorch rather than only eager mode.
+
 ### Burn and CubeCL
 
 Burn is the closest broad Rust-framework comparison: one API for training

@@ -2,6 +2,9 @@ use crate::compile::{BufferRef, Dispatch, ExecutionPlan, ShaderEntry};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
+mod tuning;
+pub use crate::tune::TuneOutcome;
+
 type Gpu = blade_graphics::Context;
 
 /// Leave room for pipelines, command buffers, and driver-owned allocations
@@ -970,8 +973,8 @@ impl Pipelines {
                 .entry(group)
                 .or_default()
                 .insert(dispatch.shader.clone());
-            // The tuner may flip a coop-promoted dispatch back to its scalar
-            // variant at runtime; make sure that variant's pipeline exists.
+            // Retain the recorded scalar pipeline for cooperative fallback
+            // provenance. The current scratch tuner only searches scalar tiles.
             if let Some((ref fb_shader, _)) = dispatch.scalar_fallback {
                 let fb_group = fb_shader.shader_group();
                 needed.insert(fb_group);
@@ -1952,8 +1955,8 @@ fn compute_groups(dispatches: &[Dispatch]) -> Vec<std::ops::Range<usize>> {
 /// (roadmap A2): cooperative-matrix promotion (including generated conv
 /// kernels and output padding), the RmsNorm→matmul prologue fusion that
 /// depends on it, and small-tile demotion. Mutates the plan in place.
-/// Capability and precision constraints are enforced here and nowhere else;
-/// a tuner re-runs measurement over the choices this pass makes.
+/// This establishes deterministic initial choices. The optional scratch tuner
+/// independently checks legality within its narrower scalar-tile domain.
 pub(crate) fn select_variants(
     plan: &mut ExecutionPlan,
     coop_config: Option<&crate::codegen::CoopConfig>,
@@ -2117,9 +2120,8 @@ pub(crate) fn select_variants(
             };
             let _ = k;
             if coop_wgs >= min_wgs && !dispatch.weight_format.uses_reduced_storage() && vec4_ok {
-                // Remember the scalar variant so `Session::tune` can flip
-                // this dispatch back and measure both. Rides on the
-                // dispatch, so it survives reordering.
+                // Retain pre-promotion geometry for diagnostics and future
+                // complete cooperative candidates. Survives reordering.
                 dispatch.scalar_fallback = Some((dispatch.shader.clone(), dispatch.workgroups));
                 dispatch.use_coop = true;
                 dispatch.use_coop_compensated = false;
@@ -2192,9 +2194,13 @@ pub(crate) fn select_variants(
             );
             if has_small && wgs_64 < 16 {
                 dispatch.use_small_tiles = true;
-                // 32×32 tiles → double the WG count in each spatial dimension
-                dispatch.workgroups[0] *= 2;
-                dispatch.workgroups[1] *= 2;
+                let (m, n) = match group {
+                    ShaderGroup::MatMul | ShaderGroup::MatMulAdd => {
+                        (dispatch.params[0], dispatch.params[2])
+                    }
+                    _ => (dispatch.params[0], dispatch.params[1]),
+                };
+                dispatch.workgroups = [n.div_ceil(32), m.div_ceil(32), 1];
             }
         }
     }
@@ -2275,9 +2281,10 @@ mod coop_precision_tests {
 #[derive(Clone, Debug, Default)]
 pub struct SessionOptions {
     /// Debug session: disable buffer aliasing and device-local placement so
-    /// every node's value stays materialized, host-visible, and readable via
-    /// [`Session::read_node`] after a step. Costs memory and bandwidth;
-    /// intended for development, not benchmarking.
+    /// materialized values stay host-visible and readable via
+    /// [`Session::read_node`] after a completed step. `build` also disables
+    /// dispatch fusion; graph rewrites are a separate option, and an already
+    /// fused plan cannot be unfused here. Costs memory and bandwidth.
     pub debug: bool,
     /// Cooperative-matrix policy (see [`CoopPolicy`]).
     pub coop: CoopPolicy,
@@ -2353,22 +2360,6 @@ impl std::fmt::Display for ReadNodeError {
 
 impl std::error::Error for ReadNodeError {}
 
-/// Result of measuring one variant family in [`Session::tune`].
-#[derive(Clone, Debug)]
-pub struct TuneOutcome {
-    /// Which family of dispatches was measured ("matmul-coop", "conv-coop").
-    pub family: &'static str,
-    /// Number of dispatches in the family.
-    pub dispatches: usize,
-    /// Median `step()` wall-clock with the family on its selected
-    /// (cooperative) variant, in milliseconds.
-    pub coop_ms: f64,
-    /// Median `step()` wall-clock with the family flipped to scalar.
-    pub scalar_ms: f64,
-    /// Whether the cooperative variant was kept.
-    pub kept_coop: bool,
-}
-
 /// One suspicious dispatch output found by [`Session::step_debug`].
 #[derive(Clone, Debug)]
 pub struct DispatchAnomaly {
@@ -2386,8 +2377,8 @@ pub struct DispatchAnomaly {
 /// Result of [`Session::step_debug`]: the per-dispatch numeric health scan.
 #[derive(Clone, Debug, Default)]
 pub struct DebugStepReport {
-    /// Dispatches whose output contains NaN/Inf, in execution order. The
-    /// first entry is where the problem enters the plan.
+    /// Dispatches whose scanned primary-output prefix contains NaN/Inf,
+    /// listed in plan order. Post-step scanning does not establish root cause.
     pub anomalies: Vec<DispatchAnomaly>,
     /// Dispatches skipped because their output buffer is aliased (only in
     /// non-debug sessions).
@@ -2395,7 +2386,7 @@ pub struct DebugStepReport {
 }
 
 impl DebugStepReport {
-    /// The first dispatch that produced NaN/Inf, if any.
+    /// The first reported nonfinite primary-output prefix, if any.
     pub fn first_bad(&self) -> Option<&DispatchAnomaly> {
         self.anomalies.first()
     }
@@ -4330,124 +4321,6 @@ impl Session {
         }
     }
 
-    /// Median wall-clock of `steps` `step()+wait()` cycles, in ms.
-    fn measure_step_ms(&mut self, warmup: usize, steps: usize) -> f64 {
-        for _ in 0..warmup {
-            self.step();
-            self.wait();
-        }
-        let mut samples: Vec<f64> = (0..steps)
-            .map(|_| {
-                let t = std::time::Instant::now();
-                self.step();
-                self.wait();
-                t.elapsed().as_secs_f64() * 1e3
-            })
-            .collect();
-        samples.sort_by(|a, b| a.total_cmp(b));
-        samples[samples.len() / 2]
-    }
-
-    /// Empirical variant selection: measure real `step()` wall-clock with
-    /// each flippable kernel family on its cooperative variant vs its scalar
-    /// fallback, and keep whichever is faster **on this device with this
-    /// plan** — instead of trusting the static promotion heuristics.
-    ///
-    /// Measures whole-step wall-clock (never per-dispatch GPU time, which is
-    /// misleading below ~50 µs/dispatch), touches only flips that need no
-    /// recompilation, and skips dispatches whose selected form carries a
-    /// prologue/epilogue the scalar kernel can't run. Buffer contents are
-    /// whatever the session holds — call after uploading real parameters for
-    /// representative timing, or right after build for zero-filled timing.
-    ///
-    /// Budget: `2 + 5` steps per family plus a shared baseline — well under
-    /// a second for transformer-class plans on discrete GPUs.
-    pub fn tune(&mut self) -> Vec<TuneOutcome> {
-        let matmul_family = |d: &Dispatch| {
-            d.use_coop
-                && d.scalar_fallback.is_some()
-                && d.matmul_prologue.is_none()
-                && d.matmul_epilogue.is_none()
-                && d.epilogue.is_empty()
-                && crate::codegen::coop_shape(d.shader.shader_group()).is_some()
-        };
-        let conv_family = |d: &Dispatch| {
-            d.use_coop
-                && d.scalar_fallback.is_some()
-                && matches!(
-                    d.shader,
-                    ShaderEntry::Conv2dGemmCoopGen(..)
-                        | ShaderEntry::Conv2dGradInputGemmCoopGen(..)
-                )
-        };
-        type FamilyPredicate<'a> = &'a dyn Fn(&Dispatch) -> bool;
-        let families: [(&'static str, FamilyPredicate); 2] =
-            [("matmul-coop", &matmul_family), ("conv-coop", &conv_family)];
-
-        let mut outcomes = Vec::new();
-        let mut baseline: Option<f64> = None;
-        for (name, in_family) in families {
-            let members: Vec<usize> = self
-                .plan
-                .dispatches
-                .iter()
-                .enumerate()
-                .filter(|&(_, d)| in_family(d))
-                .map(|(i, _)| i)
-                .collect();
-            if members.is_empty() {
-                continue;
-            }
-            let coop_ms = match baseline {
-                Some(ms) => ms,
-                None => {
-                    let ms = self.measure_step_ms(2, 5);
-                    baseline = Some(ms);
-                    ms
-                }
-            };
-
-            // Flip the whole family to its scalar variant.
-            let mut saved = Vec::with_capacity(members.len());
-            for &i in &members {
-                let d = &mut self.plan.dispatches[i];
-                let (fb_shader, fb_wg) = d.scalar_fallback.clone().expect("filtered above");
-                saved.push((i, d.shader.clone(), d.workgroups));
-                d.shader = fb_shader;
-                d.workgroups = fb_wg;
-                d.use_coop = false;
-            }
-            let scalar_ms = self.measure_step_ms(1, 5);
-
-            let kept_coop = coop_ms <= scalar_ms;
-            if kept_coop {
-                for (i, shader, wg) in saved {
-                    let d = &mut self.plan.dispatches[i];
-                    d.shader = shader;
-                    d.workgroups = wg;
-                    d.use_coop = true;
-                }
-            } else {
-                // The scalar family is now selected; later families measure
-                // against this new configuration.
-                baseline = Some(scalar_ms);
-            }
-            log::info!(
-                "tune: {name} ({} dispatches) coop {coop_ms:.3} ms vs scalar {scalar_ms:.3} ms → keeping {}",
-                members.len(),
-                if kept_coop { "coop" } else { "scalar" },
-            );
-            outcomes.push(TuneOutcome {
-                family: name,
-                dispatches: members.len(),
-                coop_ms,
-                scalar_ms,
-                kept_coop,
-            });
-        }
-        outcomes
-    }
-
     /// True when a logical buffer's content can be trusted after `step()`:
     /// it is the only tenant of its physical allocation.
     fn buffer_unaliased(&self, buf: BufferRef) -> bool {
@@ -4493,7 +4366,7 @@ impl Session {
 
     /// Read back the value of any graph node after a step.
     ///
-    /// Works for every node in a debug session
+    /// Works for materialized nodes in a debug session
     /// ([`SessionOptions::debug`] / `SessionConfig::debug()`); in a normal
     /// session it works for values whose buffer is not lifetime-aliased
     /// (params, inputs, outputs, and whatever the alias planner left
@@ -4545,11 +4418,12 @@ impl Session {
         self.read_node(node)
     }
 
-    /// Run one step, then scan every dispatch output for NaN/Inf in
-    /// execution order. `report.first_bad()` names the dispatch — and via
-    /// its `origin`/label, the graph node — where non-finite values first
-    /// appear. Sound in debug sessions (nothing aliased); in normal
-    /// sessions aliased outputs are skipped and counted.
+    /// Run a full step, then scan at most 65,536 f32 elements of each primary
+    /// dispatch output in plan order. Extra outputs and runtime-appended
+    /// optimizer state are not scanned. Aliased outputs are skipped outside
+    /// debug mode; overwritten values and nonfinite tails can be missed.
+    /// `first_bad()` identifies the first reported prefix, not necessarily
+    /// the root cause. Active optimizer, accumulation and KV updates still run.
     pub fn step_debug(&mut self) -> DebugStepReport {
         self.step();
         self.wait();
