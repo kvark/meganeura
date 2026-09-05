@@ -1,9 +1,10 @@
 //! Bounded, opt-in kernel selection. See [`crate::Session::tune_with`].
 //!
-//! The first search space is deliberately small: two scalar f32 tiles for
-//! unpacked dense matmuls, with no precision or binding-layout changes.
+//! The search space is deliberately small: scalar and native-f32 cooperative
+//! tiles for unpacked dense matmuls, with no precision or binding-layout changes.
 //! Measurements use synthetic, private scratch, not a live training step.
 
+use crate::codegen::CoopConfig;
 use crate::compile::{Dispatch, ShaderEntry};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -19,25 +20,61 @@ pub struct TuneClass {
     pub requires_full_precision: bool,
     /// Placement of A, B, addend (false if absent), and output, respectively.
     pub device_local: [bool; 4],
+    /// Declared bytes for A, B, optional addend, output, in binding order.
+    /// Candidates cannot borrow unused capacity from an aliased allocation.
+    pub binding_bytes: Vec<usize>,
 }
 
-/// Scalar f32 implementations with identical bindings and logical extents.
+/// f32 implementations with identical bindings and logical extents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MatmulTile {
     Tile32,
     Tile64,
+    /// Hardware-native f32 operands/accumulators, never f16 staging.
+    CooperativeF32 {
+        tile_size: u32,
+    },
 }
 
 impl MatmulTile {
-    pub(crate) fn other(self) -> Self {
+    pub(crate) fn native_cooperative(config: Option<&CoopConfig>) -> Option<Self> {
+        let config = config?;
+        if config.use_f16_input || config.compensated || !matches!(config.tile_size, 8 | 16) {
+            return None;
+        }
+        Some(Self::CooperativeF32 {
+            tile_size: config.tile_size,
+        })
+    }
+
+    pub(crate) fn selected(dispatch: &Dispatch, config: Option<&CoopConfig>) -> Option<Self> {
+        if dispatch.use_coop {
+            Self::native_cooperative(config)
+        } else if dispatch.use_small_tiles {
+            Some(Self::Tile32)
+        } else {
+            Some(Self::Tile64)
+        }
+    }
+
+    pub(crate) fn coop_config(self) -> Option<CoopConfig> {
         match self {
-            Self::Tile32 => Self::Tile64,
-            Self::Tile64 => Self::Tile32,
+            Self::CooperativeF32 { tile_size } => Some(CoopConfig {
+                tile_size,
+                use_f16_input: false,
+                compensated: false,
+            }),
+            _ => None,
         }
     }
 
     pub(crate) fn apply(self, dispatch: &mut Dispatch, class: &TuneClass) {
         dispatch.use_small_tiles = self == Self::Tile32;
+        dispatch.use_coop = matches!(self, Self::CooperativeF32 { .. });
+        dispatch.use_coop_compensated = false;
+        dispatch.scalar_fallback = dispatch
+            .use_coop
+            .then(|| (dispatch.shader.clone(), Self::Tile64.workgroups(class)));
         dispatch.workgroups = self.workgroups(class);
     }
 
@@ -45,15 +82,60 @@ impl MatmulTile {
         let tile = match self {
             Self::Tile32 => 32,
             Self::Tile64 => 64,
+            Self::CooperativeF32 { tile_size } => {
+                let tile = 2 * tile_size;
+                // Cooperative tiles use X for rows, Y for columns.
+                return [class.m.div_ceil(tile), class.n.div_ceil(tile), 1];
+            }
         };
         // Scalar tiled kernels use X for columns, Y for rows. Derive exact
         // geometry; doubling rounded 64-tile counts overdispatches edges.
         [class.n.div_ceil(tile), class.m.div_ceil(tile), 1]
     }
+
+    pub(crate) fn buffer_sizes(self, class: &TuneClass) -> Option<Vec<usize>> {
+        let mut sizes = class.buffer_sizes()?;
+        if let Self::CooperativeF32 { tile_size } = self {
+            if !matches!(tile_size, 8 | 16)
+                || !class.n.is_multiple_of(16)
+                || (matches!(
+                    class.shader,
+                    ShaderEntry::MatMul | ShaderEntry::FusedMatMulAdd
+                ) && class.k < 4)
+            {
+                return None;
+            }
+            let tile = 2 * tile_size;
+            let padded_m = class.m.div_ceil(tile).checked_mul(tile)?;
+            let padded_n = class.n.div_ceil(tile).checked_mul(tile)?;
+            let bytes = usize::try_from(padded_m.checked_mul(padded_n)?)
+                .ok()?
+                .checked_mul(4)?;
+            *sizes.last_mut()? = bytes;
+            if class.has_addend() {
+                sizes[2] = bytes;
+            }
+        }
+        if self.workgroups(class).iter().any(|&n| n == 0 || n > 65_535) {
+            return None;
+        }
+        Some(sizes)
+    }
+
+    pub(crate) fn fits(self, class: &TuneClass) -> bool {
+        let Some(sizes) = self.buffer_sizes(class) else {
+            return false;
+        };
+        sizes.len() == class.binding_bytes.len()
+            && sizes
+                .iter()
+                .zip(&class.binding_bytes)
+                .all(|(required, available)| required <= available)
+    }
 }
 
 impl TuneClass {
-    pub(crate) fn from_dispatch(dispatch: &Dispatch) -> Option<Self> {
+    pub(crate) fn from_dispatch(dispatch: &Dispatch, config: Option<&CoopConfig>) -> Option<Self> {
         let addend = dispatch.shader == ShaderEntry::FusedMatMulAdd;
         if !matches!(
             dispatch.shader,
@@ -61,8 +143,8 @@ impl TuneClass {
                 | ShaderEntry::FusedMatMulAdd
                 | ShaderEntry::MatMulAT
                 | ShaderEntry::MatMulBT
-        ) || dispatch.use_coop
-            || dispatch.use_coop_compensated
+        ) || dispatch.use_coop_compensated
+            || (dispatch.use_coop && dispatch.use_small_tiles)
             || dispatch.weight_format.uses_reduced_storage()
             || dispatch.horizontal_batch >= 2
             || dispatch.matmul_prologue.is_some()
@@ -96,13 +178,12 @@ impl TuneClass {
             k,
             requires_full_precision: dispatch.requires_full_precision,
             device_local: [false; 4],
+            binding_bytes: Vec::new(),
         };
-        let initial = if dispatch.use_small_tiles {
-            MatmulTile::Tile32
-        } else {
-            MatmulTile::Tile64
-        };
-        (dispatch.workgroups == initial.workgroups(&class)).then_some(class)
+        let initial = MatmulTile::selected(dispatch, config)?;
+        (initial.buffer_sizes(&class).is_some()
+            && dispatch.workgroups == initial.workgroups(&class))
+        .then_some(class)
     }
 
     pub(crate) fn has_addend(&self) -> bool {
@@ -119,6 +200,25 @@ impl TuneClass {
         }
         sizes.push(bytes(self.m, self.n)?);
         Some(sizes)
+    }
+
+    /// A small deterministic tournament: scalar alternative first, then
+    /// native f32 where it fits. Capability/precision/padding are legality;
+    /// occupancy and the static large-shape veto do not exclude candidates.
+    pub(crate) fn challengers(
+        &self,
+        initial: MatmulTile,
+        config: Option<&CoopConfig>,
+    ) -> Vec<MatmulTile> {
+        [
+            Some(MatmulTile::Tile64),
+            Some(MatmulTile::Tile32),
+            MatmulTile::native_cooperative(config),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|&tile| tile != initial && tile.fits(self))
+        .collect()
     }
 }
 
@@ -193,19 +293,24 @@ pub enum TuneDecision {
     TimeBudget,
     ScratchLimit,
     DeviceMemoryBudget,
+    ShaderRejected,
 }
 
-/// Evidence for one exact class. Times are batched scratch wall times per
-/// dispatch, not GPU timestamps or predicted whole-step latency.
+/// Evidence for one candidate comparison within an exact class. Times are
+/// batched scratch wall times per dispatch, not GPU timestamps or predicted
+/// whole-step latency.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TuneOutcome {
     pub class: TuneClass,
     pub dispatches: usize,
     pub initial: MatmulTile,
+    pub candidate: MatmulTile,
     pub selected: MatmulTile,
     pub decision: TuneDecision,
     pub qualified: bool,
-    /// Total class cost, including pipeline setup, qualification and timing.
+    /// Shader rejection or the candidate/input pattern that failed qualification.
+    pub failure: Option<String>,
+    /// Total comparison cost, including pipeline setup, qualification and timing.
     pub elapsed: Duration,
     pub compile_time: Duration,
     pub baseline_ms: Vec<f64>,
@@ -222,6 +327,8 @@ pub struct TuneReport {
     pub options: TuneOptions,
     pub outcomes: Vec<TuneOutcome>,
     pub eligible_classes: usize,
+    /// A class may have up to two challenger comparisons in `outcomes`.
+    pub visited_classes: usize,
     pub excluded_dispatches: usize,
     pub class_limit_reached: bool,
     pub time_budget_exhausted: bool,
@@ -304,7 +411,7 @@ pub(crate) fn decide(outcome: &mut TuneOutcome, options: &TuneOptions) {
         && baseline - candidate > baseline * options.min_improvement + noise
         && gain > baseline * options.min_improvement + noise
     {
-        outcome.selected = outcome.initial.other();
+        outcome.selected = outcome.candidate;
         outcome.decision = TuneDecision::FasterCandidate;
     } else {
         outcome.decision = TuneDecision::KeepBaseline;
@@ -328,7 +435,7 @@ mod tests {
     #[test]
     fn complete_geometry_handles_edges_in_both_directions() {
         let mut d = dispatch();
-        let class = TuneClass::from_dispatch(&d).unwrap();
+        let class = TuneClass::from_dispatch(&d, None).unwrap();
         assert_eq!((class.m, class.n, class.k), (33, 65, 17));
         MatmulTile::Tile32.apply(&mut d, &class);
         assert_eq!(d.workgroups, [3, 2, 1]);
@@ -341,7 +448,7 @@ mod tests {
     #[test]
     fn class_separates_shape_direction_precision_and_placement() {
         let d = dispatch();
-        let base = TuneClass::from_dispatch(&d).unwrap();
+        let base = TuneClass::from_dispatch(&d, None).unwrap();
         let mut changed = base.clone();
         changed.k += 1;
         assert_ne!(base, changed);
@@ -351,10 +458,13 @@ mod tests {
         changed = base.clone();
         changed.requires_full_precision = true;
         assert_ne!(base, changed);
+        changed = base.clone();
+        changed.binding_bytes = vec![4096; 3];
+        assert_ne!(base, changed);
         let mut at = d;
         at.shader = ShaderEntry::MatMulAT;
         at.params = vec![33, 65, 17, 0];
-        let at_class = TuneClass::from_dispatch(&at).unwrap();
+        let at_class = TuneClass::from_dispatch(&at, None).unwrap();
         assert_eq!((at_class.m, at_class.n, at_class.k), (33, 65, 17));
         assert_ne!(base, at_class);
     }
@@ -374,9 +484,9 @@ mod tests {
         variants[8].params[0] = 32 * 65_535 + 1;
         variants[9].workgroups = [1, 2, 1]; // wrong row/column geometry
         for d in variants {
-            assert!(TuneClass::from_dispatch(&d).is_none());
+            assert!(TuneClass::from_dispatch(&d, None).is_none());
         }
-        let mut class = TuneClass::from_dispatch(&base).unwrap();
+        let mut class = TuneClass::from_dispatch(&base, None).unwrap();
         class.m = u32::MAX;
         assert!(class.buffer_sizes().is_none());
     }
@@ -395,12 +505,14 @@ mod tests {
 
     fn outcome() -> TuneOutcome {
         TuneOutcome {
-            class: TuneClass::from_dispatch(&dispatch()).unwrap(),
+            class: TuneClass::from_dispatch(&dispatch(), None).unwrap(),
             dispatches: 3,
             initial: MatmulTile::Tile32,
+            candidate: MatmulTile::Tile64,
             selected: MatmulTile::Tile32,
             decision: TuneDecision::KeepBaseline,
             qualified: true,
+            failure: None,
             elapsed: Duration::ZERO,
             compile_time: Duration::ZERO,
             baseline_ms: vec![10.0; 6],
@@ -420,6 +532,7 @@ mod tests {
         assert_eq!(win.decision, TuneDecision::FasterCandidate);
         let mut reverse = outcome();
         reverse.initial = MatmulTile::Tile64;
+        reverse.candidate = MatmulTile::Tile32;
         reverse.selected = MatmulTile::Tile64;
         decide(&mut reverse, &options);
         assert_eq!(reverse.selected, MatmulTile::Tile32);
@@ -481,5 +594,126 @@ mod tests {
         );
         assert_eq!(restored.options.max_time, report.options.max_time);
         assert_eq!(restored.outcomes[0].class, report.outcomes[0].class);
+    }
+
+    fn native_config(tile_size: u32) -> CoopConfig {
+        CoopConfig {
+            tile_size,
+            use_f16_input: false,
+            compensated: false,
+        }
+    }
+
+    fn class(m: u32, n: u32, k: u32) -> TuneClass {
+        let mut class = TuneClass {
+            shader: ShaderEntry::MatMul,
+            m,
+            n,
+            k,
+            requires_full_precision: true,
+            device_local: [false; 4],
+            binding_bytes: Vec::new(),
+        };
+        class.binding_bytes = class.buffer_sizes().unwrap();
+        class
+    }
+
+    #[test]
+    fn native_candidates_ignore_profitability_but_obey_capability_and_precision() {
+        let config = native_config(8);
+        let native = MatmulTile::CooperativeF32 { tile_size: 8 };
+        // One workgroup, and then a dimension above the static 1024 veto.
+        for class in [class(16, 16, 8), class(2048, 32, 17)] {
+            assert!(
+                class
+                    .challengers(MatmulTile::Tile64, Some(&config))
+                    .contains(&native)
+            );
+            assert!(
+                !class
+                    .challengers(MatmulTile::Tile64, None)
+                    .contains(&native)
+            );
+            let f16 = CoopConfig {
+                use_f16_input: true,
+                ..config
+            };
+            assert!(
+                !class
+                    .challengers(MatmulTile::Tile64, Some(&f16))
+                    .contains(&native)
+            );
+            let compensated = CoopConfig {
+                compensated: true,
+                ..config
+            };
+            assert!(
+                !class
+                    .challengers(MatmulTile::Tile64, Some(&compensated))
+                    .contains(&native)
+            );
+        }
+        assert!(MatmulTile::native_cooperative(Some(&native_config(4))).is_none());
+    }
+
+    #[test]
+    fn native_padding_and_addend_capacity_are_legality_not_allocation_requests() {
+        let native = MatmulTile::CooperativeF32 { tile_size: 8 };
+        let mut class = class(33, 32, 17);
+        assert!(!native.fits(&class));
+        let required = native.buffer_sizes(&class).unwrap();
+        assert_eq!(required, [33 * 17 * 4, 17 * 32 * 4, 48 * 32 * 4]);
+        class.binding_bytes = required;
+        assert!(native.fits(&class));
+        class.shader = ShaderEntry::FusedMatMulAdd;
+        class.binding_bytes = class.buffer_sizes().unwrap();
+        class.binding_bytes[3] = 48 * 32 * 4;
+        assert!(!native.fits(&class)); // output fits, addend does not
+        class.binding_bytes[2] = 48 * 32 * 4;
+        assert!(native.fits(&class));
+        class.n = 17;
+        assert!(native.buffer_sizes(&class).is_none());
+        class.n = 32;
+        class.k = 1;
+        assert!(native.buffer_sizes(&class).is_none());
+        class.shader = ShaderEntry::MatMulBT;
+        assert!(native.buffer_sizes(&class).is_some());
+    }
+
+    #[test]
+    fn native_geometry_flags_and_scalar_fallback_move_together() {
+        let config = native_config(8);
+        let native = MatmulTile::CooperativeF32 { tile_size: 8 };
+        let class = class(32, 64, 17);
+        let mut d = dispatch();
+        d.params = vec![class.m, class.k, class.n, 0];
+        native.apply(&mut d, &class);
+        assert_eq!(d.workgroups, [2, 4, 1]);
+        assert!(d.use_coop && !d.use_coop_compensated && !d.use_small_tiles);
+        assert_eq!(d.scalar_fallback, Some((ShaderEntry::MatMul, [1, 1, 1])));
+        assert!(TuneClass::from_dispatch(&d, Some(&config)).is_some());
+        assert!(TuneClass::from_dispatch(&d, None).is_none());
+        MatmulTile::Tile32.apply(&mut d, &class);
+        assert_eq!(d.workgroups, [2, 1, 1]);
+        assert!(!d.use_coop && d.use_small_tiles && d.scalar_fallback.is_none());
+        assert!(TuneClass::from_dispatch(&d, Some(&config)).is_some());
+    }
+
+    #[test]
+    fn an_incomplete_next_challenger_keeps_the_completed_winner() {
+        let options = TuneOptions::default();
+        let mut first = outcome();
+        decide(&mut first, &options);
+        let mut next = outcome();
+        next.initial = first.selected;
+        next.selected = first.selected;
+        next.candidate = MatmulTile::CooperativeF32 { tile_size: 8 };
+        next.candidate_ms.pop();
+        decide(&mut next, &options);
+        assert_eq!(next.selected, first.selected);
+        assert_eq!(next.decision, TuneDecision::TimeBudget);
+        next.candidate_ms.push(8.0);
+        decide(&mut next, &options);
+        assert_eq!(next.selected, next.candidate);
     }
 }

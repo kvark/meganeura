@@ -235,13 +235,16 @@ cutoff and Winograd policy. Cache format 4 invalidates older entries.
 
 This cache is not a persistent performance database. Measured winners need
 stronger device/driver/compiler identity and validation provenance. The current
-opt-in `Session::tune` / `tune_with` searches 32/64 scalar tiles for exact
-eligible dense-f32 classes using private scratch. It never executes the live
+opt-in `Session::tune` / `tune_with` searches 32/64 scalar tiles and legal,
+advertised native-f32 cooperative tiles for exact dense-f32 classes using
+private scratch. Complete candidate geometry/padding must fit the existing
+bindings; capacities and placement are part of the key. It never executes the live
 graph, so it does not advance optimizer, accumulation or KV state. The previous
 family-wide cooperative demotion tuner did execute real steps and was removed.
-Cooperative/fused search, persistent choices and whole-step confirmation remain
-unimplemented. Selection is default-off, and real-device qualification is still
-due. See the [bounded search contract](performance-plan.md).
+F16-input cooperative/complex-fusion search, persistent choices and automatic
+whole-step confirmation remain unimplemented. Selection is default-off; scalar
+GPU qualification passed on the RTX 5070, while native-f32 hardware coverage
+remains due. See the [bounded search contract](performance-plan.md).
 
 Checkpoints serialize current physical buffers, including padding. Load
 validation has improved, but restoring is not transactional and cross-plan

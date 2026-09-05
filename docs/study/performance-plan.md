@@ -1,9 +1,11 @@
 # How to win while staying general
 
-This separates the implemented first slice from the remaining engineering and
-experiment plan. It is not a claim of new speedups. No GPU work was run during
-the September audit or this follow-up. Do not execute the GPU portions until
-the user releases the busy device.
+This separates the implemented search from the remaining engineering and
+experiment plan. The initial September audit was CPU-only. After the user
+released the GPU, the scalar search passed device qualification on an RTX
+5070 (driver 595.71.05). This does not establish a performance improvement or
+native-f32 cooperative coverage; that device advertises only f16 matrix tiles.
+New tuning experiments are separate from the frozen paper evidence.
 
 ## The objective
 
@@ -25,9 +27,11 @@ selection are complementary work.
 Graph construction helpers, autodiff, greedy fusion, shader specialization,
 scheduling, allocation aliases and device capability selection already work.
 Measured tuning is optional. The September follow-up replaces the old
-family-wide cooperative demotion tuner with bounded exact-class scalar-tile
-search. Cooperative selection still uses heuristics and is outside this first
-search space. Winners are not persisted. The misleadingly named
+family-wide cooperative demotion tuner with bounded exact-class f32-matmul
+search. Scalar 32/64 tiles and advertised, smoke-tested native-f32 cooperative
+tiles can compete. Cooperative occupancy and native-8 large-shape thresholds
+choose the initial implementation, not the legal challengers in this domain.
+Other kernel families still use heuristics. Winners are not persisted. The misleadingly named
 `runtime::auto_tune` is capability probing.
 
 The CPU-only shape census now exposes the amount of repeated work. A full
@@ -48,7 +52,7 @@ The diagnostic's old fixed barrier-cost estimate was removed. The absence of
 matches in its narrow legacy fusion matcher does not establish absence of
 optimization opportunities.
 
-## Implemented first slice: scalar-f32 tile search
+## Implemented search: scalar and native-f32 matmul tiles
 
 `Session::tune()` uses defaults; `Session::tune_with(TuneOptions)` returns a
 serializable `TuneReport`. `SessionConfig { tune: true }` invokes the safe
@@ -64,25 +68,36 @@ behind as a second unsafe default path.
 
 | Contract | Current implementation |
 |---|---|
-| Search space | Existing 32×32 and 64×64 scalar-f32 implementations of plain MatMul, MatMulAT, MatMulBT and forward MatMul+Add. |
-| Eligibility | Contiguous row-major f32; fixed supported binding arity; nonzero checked extents; portable workgroup limits; non-overlapping physical bindings. No cooperative, GEMV, horizontal packs, arbitrary prologues/epilogues or reduced storage. |
-| Exact class | Entry/direction, M/N/K, derivative precision requirement and A/B/addend/output placement. Different initial tile choices are separate searches. No device-to-device transfer. |
-| Complete candidate | Exact pipeline key and recalculated X/Y/Z geometry; unchanged logical extents, input/output bindings, access sets and allocation plan. Lazy compilation supplies a missing tile pipeline; no fallback lookup during trials. |
+| Search space | Existing 32×32 and 64×64 scalar-f32 implementations, plus the device's native-f32 cooperative 8×8 or 16×16 primitive (2×2 output primitives/workgroup), for plain MatMul, MatMulAT, MatMulBT and forward MatMul+Add. |
+| Eligibility | Contiguous row-major f32; fixed supported binding arity; nonzero checked extents; portable workgroup limits; non-overlapping physical bindings. Cooperative candidates honor session policy, capability/smoke tests and existing binding capacity. No f16-input/compensated cooperative, GEMV, horizontal packs, arbitrary prologues/epilogues or reduced storage. |
+| Exact class | Entry/direction, M/N/K, derivative precision requirement, declared binding capacities and A/B/addend/output placement. Different initial choices are separate searches. No device-to-device transfer. |
+| Complete candidate | Exact pipeline key, variant flags, scalar fallback and recalculated X/Y/Z geometry together; cooperative and scalar axes differ. Logical extents, bindings, access sets and allocation plan stay fixed. Lazy shader rejection is reported; no fallback lookup during trials. |
 | State isolation | Private per-class scratch and command encoder. No `Session::step`, no live tensor bindings, no reads/writes of model state. Matching Shared/DeviceTransient placement, with bounded upload/readback staging. |
-| Qualification | Two deterministic signed, nonzero patterns: ordinary magnitudes and tiny `1e-12` A/addend operands. Full finite-output and cross-variant comparisons; 32 f64 reference dots including edge/tile boundaries. NaN output initialization detects unwritten elements. |
+| Qualification | Two deterministic signed, nonzero, full-mantissa patterns: ordinary magnitudes and tiny `1e-12` A/addend operands. Full logical-output finite and cross-variant comparisons; 32 f64 reference dots including 8/16/32/64 tile edges. Scratch padding is zeroed for inputs and NaN-poisoned for outputs; only logical outputs are checked. |
 | Numerical tolerance | `abs(reference-actual) <= scale*1e-5 + abs(reference)*2e-4`, with scale 1 or `1e-12`. A domain-specific screen, not a proof or training convergence test. |
 | Timing | Default six complete pairs, alternating AB/BA order; each sample encodes/submits/waits for 16 barrier-delimited repeated dispatches. Upload/qualification/readback excluded from samples, included in total cost. |
-| Decision | Candidate median and median paired gain must beat a 5% margin plus twice the MAD of paired differences. Noise guard is not a confidence interval. Invalid or incomplete evidence keeps the original tile. |
+| Decision | Up to two sequential challenger comparisons per class. Each uses the last accepted winner as incumbent. Candidate median and median paired gain must beat a 5% margin plus twice the MAD of paired differences. Noise guard is not a confidence interval. Invalid/incomplete comparisons retain the incumbent, including a completed earlier winner. |
 | Budget | Default eight classes, 64 MiB GPU scratch including staging, two-second soft total deadline, one warmup per variant. An in-flight driver/validation/submission operation can overrun. Pipeline/CPU memory is not charged to the scratch byte cap. |
-| Priority/reporting | Descending repetition×M×N×K structural prior, stable ties; report resolved settings, total/class/pipeline setup costs, exclusions, scratch/time/device-memory skips, qualification and raw timings. This prior orders searches, never declares a winner. |
+| Priority/reporting | Descending repetition×M×N×K structural prior, stable ties; resolved settings, eligible/visited classes, per-comparison and pipeline costs, exclusions, scratch/time/device-memory skips, qualification/rejection details and raw timings. This prior orders searches, never declares a winner. |
 | Lifetime | Choices affect this session only. Semantic plan cache and frozen results stay untouched. |
 
 The former small-tile occupancy cutoff is now an **initial choice**, not a
 profitability veto for eligible tuned classes: either tile can win. Untuned,
 unsupported or budget-limited work keeps deterministic selection. The default
 small-tile geometry now uses exact ceil-divided extents instead of doubling
-already-rounded 64-tile counts. Cooperative/GEMV profitability thresholds have
-not been removed, and we do not call the system fully autotuned.
+already-rounded 64-tile counts. Native-f32 cooperative profitability thresholds
+are likewise challenged where the candidate fits. GEMV, f16-input cooperative
+and complex fusion thresholds remain outside this search; the system is not
+fully autotuned.
+
+Cooperative padding is a legality constraint, not a performance veto. N must
+be divisible by 16; normal/add matmuls require K≥4; output and addend need
+full-output-tile capacity. The tuner cannot enlarge a session or borrow unused
+slack from another tenant of an aliased allocation. Thus an unpadded scalar
+class may have only one challenger; an already-padded cooperative class may
+have both scalar challengers. Capacity is part of the class key. The search
+never re-enables cooperative matrices disabled by policy or rejected by the
+session's smoke test.
 
 Why start here? Both scalar variants already share a precision, layout,
 allocation and access contract. This gives useful search/qualification/report
@@ -94,11 +109,11 @@ Limits: scratch input/cache history and isolated barriers are not the live
 graph's context; repeated warm buffers can favor a different implementation
 than streaming weights. Memory-placement matching does not reproduce every
 external allocator property or concurrent workload. The paired noise guard
-cannot prove an idle GPU. Whole-step confirmation, more input distributions,
-GPU state-preservation checks and Vulkan/Metal fleet qualification are still
-required. **This opt-in implementation has only CPU validation so far.**
+cannot prove an idle GPU. More input distributions, native-f32 hardware and
+Vulkan/Metal fleet qualification remain required. The runtime does not yet
+automatically confirm or roll back choices using a whole-step measurement.
 
-Later, on an idle GPU, inspect a report with explicit bounds:
+On an idle GPU, inspect a report with explicit bounds:
 
 ```rust
 let report = session.tune_with(meganeura::TuneOptions {
@@ -111,11 +126,34 @@ println!("{}", serde_json::to_string_pretty(&report)?);
 
 The regression target is intentionally ignored by default because it performs
 timings. Compile it without running: `cargo test --test tune --no-run`.
-Only after the device is released:
-`cargo test --release --test tune -- --ignored --test-threads=1`.
-It checks output preservation and active-training tensor/moment/counter
-preservation, but is not the complete KV/external-buffer/optimizer trajectory
-acceptance matrix. Do not treat a successful compile as a passed GPU test.
+Portable scalar qualification:
+
+```sh
+cargo test --release --test tune -- --ignored --skip tune_native_cooperative_f32 --test-threads=1
+```
+
+All four tests passed on the RTX 5070: output preservation, active-training
+tensor/moment/counter preservation plus subsequent optimizer updates against
+an untuned control, all four entries across three rectangular/edge shapes,
+and budget skips. This is not a complete KV/external-buffer/optimizer matrix.
+
+`cargo run --release --example tune_session -- --device` prints actual matrix
+capabilities. Only on a native-f32 device, run
+`cargo test --release --test tune tune_native_cooperative_f32 -- --ignored --test-threads=1`.
+That test requires real native execution, including below-threshold shapes,
+padded rows and a dimension above the native-8 veto; it deliberately fails on
+unsupported hardware. Native shaders passed offline Naga/SPIR-V checks here,
+but that is not a passed native GPU test.
+
+For an independent whole-step experiment, commit tracked source changes,
+then run `cargo run --release --example tune_session -- new-results.json` on
+an idle device. The Rust harness builds matched untuned/tuned dense chains,
+records the exact revision, lockfile/executable hashes, device and driver,
+search costs/decisions, output parity, and 40 alternating whole-step pairs
+after warmup. Repeat in independent processes. It refuses to overwrite an
+existing file and uses explicit f32 policy, not environment-selected f16
+staging. Synthetic chains are a transfer experiment, not a PyTorch comparison
+or a new result for the paper's model matrix.
 
 ## Target contract for broader tuning
 

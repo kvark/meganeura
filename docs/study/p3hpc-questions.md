@@ -124,13 +124,17 @@ extend the relevant physical/lifetime contract.
 
 ### 12. How much autotuning exists now?
 
-Short: a new opt-in exact-shape search over two scalar-f32 matmul tiles, using
-private scratch. CPU-validated implementation, not yet GPU-qualified results.
+Short: an opt-in exact-shape search over scalar and legal native-f32
+cooperative matmul tiles, using private scratch. Scalar GPU qualification has
+passed; this is new engineering, not part of the frozen paper's results.
 
-Detail: both sizes can win regardless of the initial occupancy threshold;
+Detail: legal implementations can win regardless of the initial occupancy or
+native-8 large-shape profitability threshold;
 qualification, paired samples, a noise guard and resource bounds are explicit.
-It replaces the state-mutating family demotion tuner. Cooperative/fused/GEMV
-search, persistent winners and whole-step confirmation remain future work.
+It replaces the state-mutating family demotion tuner. Native padding must fit
+existing allocations. F16-input/complex-fusion/GEMV search, persistent winners
+and automatic whole-step confirmation remain future work. Native-f32 GPU
+qualification needs a different device: our RTX 5070 advertises f16 tiles only.
 Capability probing is named `auto_tune` but does not time kernels. Neither
 this new search nor new speedups are part of the frozen paper evidence.
 

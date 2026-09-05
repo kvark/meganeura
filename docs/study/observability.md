@@ -8,9 +8,9 @@ dumps, numerical probes and structured profiles. These are real facilities,
 but they are not a Python debugger, an arbitrary backward-hook system, or a
 complete GPU anomaly detector.
 
-This chapter describes current source, including the September scalar-tile
-tuner. It is not a result from the frozen paper. GPU examples below are for
-later: **do not run them while the GPU is reserved by another process.**
+This chapter describes current source, including the September f32-matmul
+tuner. It is not a result from the frozen paper. Run GPU examples only on an
+available device; instrumented/tuning executions can disturb other timings.
 
 ## Compare the debugging models, not just the feature names
 
@@ -245,21 +245,29 @@ box. Trace bundles can contain model source: review them before sharing.
 ## Make autotuning explainable from its first version
 
 `Session::tune_with(TuneOptions)` returns a serializable `TuneReport` rather
-than only logging a winner. Inspect exact `(shader,M,N,K,precision,placement)`
-classes, counts, initial/selected tile, qualification status, raw paired
+than only logging a winner. Inspect exact
+`(shader,M,N,K,precision,binding capacity,placement)` classes, eligible/visited
+counts, incumbent/challenger/selected implementation, qualification status, raw paired
 samples, medians, the noise guard and budget/validation rejection decisions.
-Reports retain resolved options, total/class elapsed time and pipeline setup
+Reports retain resolved options, total/comparison elapsed time and pipeline setup
 time, so a winner's search cost remains visible.
 `serde_json::to_string_pretty(&report)` can preserve the evidence. The selected
 pipeline keys remain visible in `dispatch_pipeline_keys()`.
 
-This initial scalar search never runs a live step or binds live tensors. Its
-scratch data exercises ordinary and tiny nonzero operands, both variants are
+There may be two comparisons per class; the second challenges the last accepted
+winner, not necessarily the original heuristic choice. `failure` identifies
+shader rejection or the implementation/input pattern that failed qualification.
+It is not a full numerical discrepancy trace. Native cooperative candidates
+include complete geometry/padding constraints, and unsupported or policy-disabled
+matrix types are never silently substituted by f16 implementations.
+
+This f32 search never runs a live step or binds live tensors. Its
+scratch data exercises ordinary and tiny full-mantissa operands, both variants are
 checked against sampled f64 dots and each other, and the soft deadline includes
 qualification/compilation. These checks do not prove every input or guarantee
 a whole-model win. Choices are session-local, and scratch timing omits normal
 cross-kernel overlap, cache history and surrounding work. See the
-[implementation contract and deferred validation](performance-plan.md).
+[implementation contract and hardware qualification](performance-plan.md).
 
 ## What we should improve next
 
