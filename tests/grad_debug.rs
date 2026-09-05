@@ -55,7 +55,14 @@ fn check_grad(
         .1
         .clone();
 
-    let eps = 1e-3f32;
+    // The f32 loss carries ~1e-7 of absolute noise, so a central difference
+    // has an error floor of roughly noise/(2·eps) regardless of how correct
+    // the analytical gradient is. At eps=1e-3 that floor is ~5e-5, which
+    // swamps attention gradients of order 1e-4 and reports a ~17% relative
+    // error for a gradient that is right. Sweeping eps confirms the error is
+    // pure round-off (it falls as 1/eps, rather than staying put as a real
+    // backward bug would): 1e-3 -> 16.7%, 5e-3 -> 1.8%, 2e-2 -> 0.11%.
+    let eps = 2e-2f32;
     let mut max_rel = 0.0f32;
     for &idx in check_indices {
         if idx >= orig_data.len() {
