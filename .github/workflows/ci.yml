@@ -84,29 +84,20 @@ jobs:
       # --test-threads=1 because several targets drive one adapter and the
       # audit regressions were already serial.
       #
-      # The skips are bit-exact / 1e-7 parity contracts between a fused
-      # path and its explicit expansion. Each holds on the author's
-      # hardware and breaks on some CI adapter that reassociates the
-      # accumulation, all by a last-ULP margin:
-      #   normalize_inner_sum            1 ULP at index 24   (lavapipe)
-      #   pairwise_squared_distance      1.5e-7 vs 1.1e-7    (lavapipe)
-      #   softplus_preserves_..._bits    1 ULP, e.g.
-      #                                  1.2842418e-5 vs 1.2842416e-5 (Metal)
-      # The last one had never run in CI — schedule_pointwise was not in
-      # the hand-picked list this step replaces, so expanding coverage is
-      # what surfaced it. Skipping here keeps all three at full strength
-      # on hardware rather than loosening the contract for everyone.
+      # `MEGANEURA_SKIP_BIT_EXACT` gates one class of test: exact equality
+      # between a fused path and its explicit expansion. The contract holds
+      # on the author's hardware and breaks by a last ULP wherever the
+      # adapter reassociates the accumulation — lavapipe on two reduction
+      # cases, Metal on two others. Gating the class beats naming cases one
+      # at a time, which grew with every adapter; `tests/schedule_*.rs`
+      # still run these at full strength locally.
       - name: Unit + integration tests
-        run: >-
-          cargo test --tests --
-          --test-threads=1
-          --skip normalize_inner_sum_matches_explicit_forward_and_gradient
-          --skip pairwise_squared_distance_matches_explicit_forward_and_gradients
-          --skip softplus_preserves_expanded_gradient_bits
+        run: cargo test --tests -- --test-threads=1
         env:
           # MHA backward shaders produce numerically unstable gradients on
           # lavapipe and on CI Metal runners (grad_k divergence on M-series).
           MEGANEURA_SKIP_BACKPROP: ${{ matrix.skip_backprop }}
+          MEGANEURA_SKIP_BIT_EXACT: "1"
 
       - name: Latency benchmark
         if: runner.os == 'Linux'
