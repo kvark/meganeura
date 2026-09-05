@@ -185,6 +185,8 @@ registry! {
         "Examples convention: write a Perfetto trace to this path.";
     SKIP_BACKPROP: "MEGANEURA_SKIP_BACKPROP", Bool, External,
         "Tests convention: skip MHA-backward tests on software drivers with broken wg reductions.";
+    SKIP_BIT_EXACT: "MEGANEURA_SKIP_BIT_EXACT", Bool, External,
+        "Tests convention: skip fused-vs-expanded exact-equality checks on adapters that reassociate.";
 }
 
 impl OptimizeConfig {
