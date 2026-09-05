@@ -46,6 +46,7 @@ pub mod runtime;
 #[doc(hidden)]
 pub mod schedule;
 pub mod train;
+pub mod tune;
 
 pub use codegen::{CoopCaps, coop_caps, set_coop_caps};
 pub use compile::CompileOptions;
@@ -65,3 +66,4 @@ pub use train::{
     TrainConfig, TrainHistory, Trainer, build, build_inference_session, build_session,
     build_session_unoptimized, compile_training_graph,
 };
+pub use tune::{MatmulTile, TuneClass, TuneDecision, TuneError, TuneOptions, TuneReport};

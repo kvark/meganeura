@@ -783,7 +783,7 @@ fn merge_horizontal(dispatches: &[Dispatch], batch: &[usize]) -> Dispatch {
     merged.workgroups[2] = n;
     // The original fallback describes one output with z=1. The packed
     // pipeline has different bindings, and only its selected variant is
-    // compiled. It cannot be flipped by the ordinary family tuner.
+    // compiled. A future cooperative search must construct a packed fallback.
     merged.scalar_fallback = None;
     merged.input_buffers = vec![merged.input_buffers[0]];
     merged.extra_outputs.clear();
@@ -894,9 +894,9 @@ pub struct Dispatch {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub origin: Vec<NodeId>,
     /// The scalar `(shader, workgroups)` this dispatch had before
-    /// cooperative-matrix promotion. Recorded by variant selection so the
-    /// session-build tuner can measure both variants and keep the faster
-    /// one. Not serialized: cached plans are stored pre-selection and
+    /// cooperative-matrix promotion. Retained for diagnostics and future
+    /// complete cooperative candidates; the current tuner searches scalar
+    /// tiles only. Not serialized: cached plans are stored pre-selection and
     /// re-selected per session.
     #[serde(skip)]
     pub scalar_fallback: Option<(ShaderEntry, [u32; 3])>,

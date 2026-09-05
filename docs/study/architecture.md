@@ -222,7 +222,9 @@ optimization. It can rebuild sessions as the graph grows; it is a debugging
 workflow, not a fully dynamic low-overhead tensor interpreter. Named-node
 provenance, plan dumps and first-NaN/Inf diagnostics make compilation visible.
 Aliased or fused-away intermediate reads return errors rather than pretending
-the original tensor is still materialized.
+the original tensor is still materialized. The dedicated
+[observability chapter](observability.md) covers the eager-PyTorch comparison,
+debug configuration, incomplete post-step anomaly scans and profiler overhead.
 
 ## 8. Configuration, cache and state hazards
 
@@ -233,12 +235,13 @@ cutoff and Winograd policy. Cache format 4 invalidates older entries.
 
 This cache is not a persistent performance database. Measured winners need
 stronger device/driver/compiler identity and validation provenance. The current
-opt-in `Session::tune` measures family-wide coop-to-scalar flips; it cannot
-discover candidates rejected before promotion and does not persist winners.
-Build-time tuning runs before user data upload. Calling tuning later can
-advance optimizer, accumulation or KV state because it executes real steps.
-Do not treat it as an observational, side-effect-free query. A safe scratch
-execution design is a prerequisite for default-on tuning.
+opt-in `Session::tune` / `tune_with` searches 32/64 scalar tiles for exact
+eligible dense-f32 classes using private scratch. It never executes the live
+graph, so it does not advance optimizer, accumulation or KV state. The previous
+family-wide cooperative demotion tuner did execute real steps and was removed.
+Cooperative/fused search, persistent choices and whole-step confirmation remain
+unimplemented. Selection is default-off, and real-device qualification is still
+due. See the [bounded search contract](performance-plan.md).
 
 Checkpoints serialize current physical buffers, including padding. Load
 validation has improved, but restoring is not transactional and cross-plan

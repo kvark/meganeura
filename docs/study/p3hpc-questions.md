@@ -124,14 +124,15 @@ extend the relevant physical/lifetime contract.
 
 ### 12. How much autotuning exists now?
 
-Short: opt-in family-level coop-to-scalar measurements; not a comprehensive
-shape-level search.
+Short: a new opt-in exact-shape search over two scalar-f32 matmul tiles, using
+private scratch. CPU-validated implementation, not yet GPU-qualified results.
 
-Detail: heuristics still exclude candidates, the tuner does not persist
-winners, and executing a tuning step can mutate session state. Capability
-probing is named `auto_tune` but does not time kernels. Our proposed design
-adds bounded bidirectional candidates, isolated state, stronger qualification
-and persistent measured choices. Do not describe that proposal as shipped.
+Detail: both sizes can win regardless of the initial occupancy threshold;
+qualification, paired samples, a noise guard and resource bounds are explicit.
+It replaces the state-mutating family demotion tuner. Cooperative/fused/GEMV
+search, persistent winners and whole-step confirmation remain future work.
+Capability probing is named `auto_tune` but does not time kernels. Neither
+this new search nor new speedups are part of the frozen paper evidence.
 
 ## Numerical behavior
 
@@ -290,6 +291,41 @@ Detail: convolution derivatives and Metal attention have evidence-backed
 priority. Report compile/tune amortization, regressions, memory and multiple
 processes. A new default-on tuner before state isolation, or a fast single
 kernel without a whole-step gain, would not settle the question.
+
+## Observability and debugging
+
+### 29. Isn't a static graph much harder to debug than eager PyTorch?
+
+Short: eager PyTorch is more convenient interactively. We preserve names and
+dispatch provenance and offer materialized debug sessions, growing-graph
+evaluation, plan/shader dumps and structured profiles.
+
+Detail: inspection must distinguish a fused-away value from an aliased one.
+Debug mode disables dispatch fusion/aliasing, but graph rewrites and precision
+policy are separate controls. We do not claim arbitrary gradient hooks, Python
+breakpoints inside shaders, or identical eager/compiler tooling. See the
+[debugging comparison](observability.md).
+
+### 30. Does first_bad identify the operation that caused a NaN?
+
+Short: it identifies the first *reported* nonfinite output prefix in plan
+order, not necessarily the root cause.
+
+Detail: `step_debug` scans at most 65,536 floats of each primary output after
+the complete step, skips aliased outputs outside debug mode, and can miss
+overwritten values and extra outputs. A poisoned input can implicate its first
+consumer; finite wrong answers and underflow need independent checks. Active
+optimizer/KV updates still happen during this diagnostic step.
+
+### 31. Can I use your GPU profile as the end-to-end benchmark?
+
+Short: no. Per-dispatch instrumentation changes the pass/barrier structure.
+
+Detail: keep raw profile samples and the overhead relative to normal grouped
+execution. Reset state for the timestamp-ring advance runs too. The structured
+collector cannot assign appended optimizer passes to graph metadata, so capture
+without those passes and time full optimizer-backed training separately.
+Likewise, the new tuner's isolated scratch result needs whole-step confirmation.
 
 ## Talk outline
 

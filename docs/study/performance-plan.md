@@ -1,8 +1,9 @@
 # How to win while staying general
 
-This is a proposed engineering and experiment plan, not a claim of new
-speedups. No GPU work was run during the September audit. Do not execute the
-GPU portions until the user releases the busy device.
+This separates the implemented first slice from the remaining engineering and
+experiment plan. It is not a claim of new speedups. No GPU work was run during
+the September audit or this follow-up. Do not execute the GPU portions until
+the user releases the busy device.
 
 ## The objective
 
@@ -23,10 +24,11 @@ selection are complementary work.
 
 Graph construction helpers, autodiff, greedy fusion, shader specialization,
 scheduling, allocation aliases and device capability selection already work.
-Measured tuning is optional, family-wide and demotion-only: it compares an
-already-promoted cooperative family with saved scalar fallbacks. Heuristic-
-rejected cooperative candidates are absent from the search. Winners are not
-persisted. The misleadingly named `runtime::auto_tune` is capability probing.
+Measured tuning is optional. The September follow-up replaces the old
+family-wide cooperative demotion tuner with bounded exact-class scalar-tile
+search. Cooperative selection still uses heuristics and is outside this first
+search space. Winners are not persisted. The misleadingly named
+`runtime::auto_tune` is capability probing.
 
 The CPU-only shape census now exposes the amount of repeated work. A full
 SmolLM2-135M training graph at sequence 128 has 1,123 pre-runtime dispatches
@@ -46,7 +48,76 @@ The diagnostic's old fixed barrier-cost estimate was removed. The absence of
 matches in its narrow legacy fusion matcher does not establish absence of
 optimization opportunities.
 
-## Proposed minimal tuner contract
+## Implemented first slice: scalar-f32 tile search
+
+`Session::tune()` uses defaults; `Session::tune_with(TuneOptions)` returns a
+serializable `TuneReport`. `SessionConfig { tune: true }` invokes the safe
+default search on both a cache hit and a newly compiled plan. Core code is
+Rust, with no new dependency or per-model/per-vendor rule.
+[Search types and decision logic](../../src/tune.rs),
+[runtime runner](../../src/runtime/tuning.rs)
+
+The old API entry point remains, but `TuneOutcome` now contains class/tile
+evidence instead of `family/coop_ms/scalar_ms/kept_coop`. Consumers reading
+those former fields must migrate. The old live-step tuner is removed, not left
+behind as a second unsafe default path.
+
+| Contract | Current implementation |
+|---|---|
+| Search space | Existing 32×32 and 64×64 scalar-f32 implementations of plain MatMul, MatMulAT, MatMulBT and forward MatMul+Add. |
+| Eligibility | Contiguous row-major f32; fixed supported binding arity; nonzero checked extents; portable workgroup limits; non-overlapping physical bindings. No cooperative, GEMV, horizontal packs, arbitrary prologues/epilogues or reduced storage. |
+| Exact class | Entry/direction, M/N/K, derivative precision requirement and A/B/addend/output placement. Different initial tile choices are separate searches. No device-to-device transfer. |
+| Complete candidate | Exact pipeline key and recalculated X/Y/Z geometry; unchanged logical extents, input/output bindings, access sets and allocation plan. Lazy compilation supplies a missing tile pipeline; no fallback lookup during trials. |
+| State isolation | Private per-class scratch and command encoder. No `Session::step`, no live tensor bindings, no reads/writes of model state. Matching Shared/DeviceTransient placement, with bounded upload/readback staging. |
+| Qualification | Two deterministic signed, nonzero patterns: ordinary magnitudes and tiny `1e-12` A/addend operands. Full finite-output and cross-variant comparisons; 32 f64 reference dots including edge/tile boundaries. NaN output initialization detects unwritten elements. |
+| Numerical tolerance | `abs(reference-actual) <= scale*1e-5 + abs(reference)*2e-4`, with scale 1 or `1e-12`. A domain-specific screen, not a proof or training convergence test. |
+| Timing | Default six complete pairs, alternating AB/BA order; each sample encodes/submits/waits for 16 barrier-delimited repeated dispatches. Upload/qualification/readback excluded from samples, included in total cost. |
+| Decision | Candidate median and median paired gain must beat a 5% margin plus twice the MAD of paired differences. Noise guard is not a confidence interval. Invalid or incomplete evidence keeps the original tile. |
+| Budget | Default eight classes, 64 MiB GPU scratch including staging, two-second soft total deadline, one warmup per variant. An in-flight driver/validation/submission operation can overrun. Pipeline/CPU memory is not charged to the scratch byte cap. |
+| Priority/reporting | Descending repetition×M×N×K structural prior, stable ties; report resolved settings, total/class/pipeline setup costs, exclusions, scratch/time/device-memory skips, qualification and raw timings. This prior orders searches, never declares a winner. |
+| Lifetime | Choices affect this session only. Semantic plan cache and frozen results stay untouched. |
+
+The former small-tile occupancy cutoff is now an **initial choice**, not a
+profitability veto for eligible tuned classes: either tile can win. Untuned,
+unsupported or budget-limited work keeps deterministic selection. The default
+small-tile geometry now uses exact ceil-divided extents instead of doubling
+already-rounded 64-tile counts. Cooperative/GEMV profitability thresholds have
+not been removed, and we do not call the system fully autotuned.
+
+Why start here? Both scalar variants already share a precision, layout,
+allocation and access contract. This gives useful search/qualification/report
+infrastructure without simultaneously changing precision or late-fusion
+semantics. It also removes the old tuner's optimizer/KV side effects without
+copying an entire model and all hidden training state.
+
+Limits: scratch input/cache history and isolated barriers are not the live
+graph's context; repeated warm buffers can favor a different implementation
+than streaming weights. Memory-placement matching does not reproduce every
+external allocator property or concurrent workload. The paired noise guard
+cannot prove an idle GPU. Whole-step confirmation, more input distributions,
+GPU state-preservation checks and Vulkan/Metal fleet qualification are still
+required. **This opt-in implementation has only CPU validation so far.**
+
+Later, on an idle GPU, inspect a report with explicit bounds:
+
+```rust
+let report = session.tune_with(meganeura::TuneOptions {
+    max_classes: 8,
+    max_time: std::time::Duration::from_secs(10),
+    ..Default::default()
+})?;
+println!("{}", serde_json::to_string_pretty(&report)?);
+```
+
+The regression target is intentionally ignored by default because it performs
+timings. Compile it without running: `cargo test --test tune --no-run`.
+Only after the device is released:
+`cargo test --release --test tune -- --ignored --test-threads=1`.
+It checks output preservation and active-training tensor/moment/counter
+preservation, but is not the complete KV/external-buffer/optimizer trajectory
+acceptance matrix. Do not treat a successful compile as a passed GPU test.
+
+## Target contract for broader tuning
 
 Separate three stages rather than folding all decisions into one cost model:
 

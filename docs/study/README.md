@@ -1,7 +1,8 @@
 # Meganeura: study and workshop preparation
 
-Prepared 2026-09-05 against development base `bd6be08`, with the audit fixes
-in this working tree. Performance statements refer to the separately frozen
+Prepared 2026-09-05 against development base `bd6be08`, with the audit and
+scalar-tuning follow-up on `codex/audit-observability-tuning`. Performance
+statements refer to the separately frozen
 paper revision, not today's code. No new GPU execution or benchmarking was
 performed for this audit.
 
@@ -25,7 +26,9 @@ PyTorch replacement.
 The next engineering opportunity is to replace performance thresholds with
 small, reusable, measured searches over legal kernel implementations. That
 means specializing to tensor structure and hardware, not recognizing model
-names. This is the proposed direction, not an already-completed autotuner.
+names. The first implementation now searches two scalar-f32 matmul tile sizes
+in isolated scratch; cooperative/fused search and whole-step confirmation
+remain future work. It has CPU validation, not new GPU performance evidence.
 
 ## Reading paths
 
@@ -36,11 +39,14 @@ of [results](results.md), and the short answers in
 For a two-hour technical pass, read in this order:
 
 1. [Architecture](architecture.md): follow one graph all the way to execution.
-2. [Design decisions](design-decisions.md): understand why the design changed.
-3. [Results and evidence](results.md): know exactly what each number means.
-4. [Alternatives](alternatives.md): compare layers and scope, not slogans.
-5. [Performance plan](performance-plan.md): the minimal, general route forward.
-6. [Questions and exercises](p3hpc-questions.md): practice defending the claims.
+2. [Observability and debugging](observability.md): inspect values and plans;
+   understand the eager-PyTorch tradeoff and probe limitations.
+3. [Design decisions](design-decisions.md): understand why the design changed.
+4. [Results and evidence](results.md): know exactly what each number means.
+5. [Alternatives](alternatives.md): compare layers and scope, not slogans.
+6. [Performance plan](performance-plan.md): the implemented first slice and
+   the minimal, general route forward.
+7. [Questions and exercises](p3hpc-questions.md): practice defending the claims.
 
 For the engineering backlog, use the [September audit](../audit-2026-09.md).
 For camera-ready work, use the [revision plan](../../paper/p3hpc/REVISION.md)

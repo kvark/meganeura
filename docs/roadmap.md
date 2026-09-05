@@ -19,6 +19,11 @@ still loses to eager MPS. Intel is compared with a labeled CPU fallback.
 See [results](study/results.md) for denominators and numerical gates. Do not
 mix exploratory Inferena history with publication-grade results.
 
+The first state-isolated exact-class search is implemented for the existing
+32/64 scalar-f32 matmul tiles. It is default-off and CPU-validated only;
+cooperative/fused search and whole-step/fleet qualification remain ahead.
+See the [implementation contract](study/performance-plan.md).
+
 The next sequence is:
 
 1. State-safe tuning, exact variant contracts and stronger numerical evidence.
@@ -408,21 +413,20 @@ measured choice among them:
    GEMV switchover) demote from *deciders* to *search priors* — the
    starting configuration when tuning is off or budget-limited.
 
-**Landed.** The enabling structure: variant decisions have one owner
-(`select_variants`), every promoted dispatch records its
-`scalar_fallback`, codegen knobs travel as `TuningKnobs` plan data, and
-`Session::tune` (opt-in via `SessionConfig { tune: true }` /
-`MEGANEURA_TUNE=1`) measures coop↔scalar per family on real `step()`
-wall-clock with both pipelines pre-compiled — flips need no
-recompilation. Default-off until the bench fleet validates the flip
-path on coop-capable adapters.
+**Landed.** Variant decisions have one owner (`select_variants`) and codegen
+knobs travel as `TuningKnobs` plan data. The September first cut of
+`Session::tune` / `tune_with` measures 32↔64 scalar-f32 tiles per exact eligible
+class, with private scratch, numerical qualification, interleaved samples and
+explicit budgets/reports. It replaces the earlier family-wide cooperative
+demotion tuner, which ran live steps and mutated training/cache state.
+Default-off, with CPU validation only; real-device qualification remains due.
 
 **Remaining plan.**
-1. *State isolation and fleet validation* before considering default-on.
-2. *Shape-class granularity:* group dispatches by
-   (archetype, m/n/k-class) and measure per class instead of per
-   family. Transformer plans have a handful of classes repeated across
-   layers, so the space stays tiny.
+1. *Fleet qualification and whole-step confirmation* before default-on;
+   preserve the implemented scratch-state isolation contract.
+2. *Broader exact-class candidates:* cooperative, packed/fused and GEMV
+   implementations need complete precision/padding/binding contracts. The
+   scalar slice does not yet replace their profitability thresholds.
 3. *Recompiling knobs:* EPT caps / tile sizes / generated-kernel
    workgroup sizes are plan data now, so a candidate is a plan rebuild
    (~seconds). Bound the space per shape-class (2–4 values per knob).
@@ -439,8 +443,9 @@ plan/runtime layer picks *how* (measured per device). Coupling them is
 how the register-cost experiment failed — `optimize` runs before a GPU
 exists in many paths.
 
-**Lessons honored.** Wall-clock only, never per-dispatch GPU time
-(<~50 µs is submission-dominated) and never register stats; the old
+**Lessons honored.** Batched scratch wall-clock in the first slice, not an
+individual timestamp or register-count prediction. It still needs whole-step
+confirmation because batching/barriers/cache reuse change context. The old
 `auto_tune_flash_ept` took 30 s because it tuned per-kernel × per-cap —
 shape-class bounding is the fix.
 

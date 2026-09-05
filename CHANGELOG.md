@@ -1,5 +1,17 @@
 # Unreleased
 
+- Replace the state-mutating family-wide tuner with bounded exact-class
+  32/64 scalar-f32 matmul tile search on private scratch. Adds `TuneOptions`,
+  `tune_with` and serializable evidence, numerical qualification, interleaved
+  trials and a noise guard. Both tile sizes are candidates regardless of the
+  initial occupancy cutoff; small-tile geometry uses exact ceil division.
+  Default-off and CPU-validated only; GPU qualification and whole-step gains
+  remain unmeasured. Cooperative/fused/GEMV search and persistence are deferred.
+  `TuneOutcome`'s former family/coop/scalar timing fields are replaced by
+  class/tile/sample/decision fields; callers reading them must migrate.
+- Add a dedicated observability/debugging study chapter, eager-PyTorch
+  comparison, probe coverage caveats, bisection ladder and rehearsal questions.
+
 - Build-plan cache format 4 fingerprints rewrite configuration as well as
   compiler options and capabilities; cache hits honor the requested tuning flag.
 - Horizontal matmul fusion drops incompatible single-dispatch scalar
@@ -112,15 +124,10 @@
   oracles rather than being deleted. Still hand-written by design for now:
   GroupNorm (epilogue needs indexed per-channel loads), the norm backwards
   (column-axis reductions), and LogSoftmax.
-- Empirical variant selection (roadmap Track F, first cut):
-  `SessionConfig { tune: true }` / `MEGANEURA_TUNE=1` measures real `step()`
-  wall-clock with each flippable kernel family (plain coop matmuls,
-  generated coop conv kernels) on its cooperative variant vs its scalar
-  fallback, and keeps whichever is faster on this device — replacing static
-  promotion thresholds with measurement. Selection now records a
-  `scalar_fallback` on every promoted dispatch and compiles both variants'
-  pipelines, so flips need no recompilation. Off by default until the bench
-  fleet validates it; needs a coop-capable adapter to do anything.
+- Historical Track F first cut measured cooperative-family demotion on live
+  steps and retained scalar fallbacks. Superseded by the state-isolated
+  scalar-tile search above; cooperative tuning is deferred until equivalent
+  safe candidate contracts are implemented.
 - Kernel-variant selection has a single owner (roadmap A2, scoped):
   cooperative promotion (incl. generated conv kernels and output padding),
   the RmsNorm→matmul prologue fusion, and small-tile demotion moved from
