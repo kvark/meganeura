@@ -7,6 +7,13 @@ released the GPU, the scalar search passed device qualification on an RTX
 native-f32 cooperative coverage; that device advertises only f16 matrix tiles.
 New tuning experiments are separate from the frozen paper evidence.
 
+The [first whole-step transfer experiment](../experiments/tuning-2026-09-05/README.md)
+now retains five independent processes: two of four synthetic dense chains
+improved by median 1.151× and 1.127×, while the two smaller cases kept their
+initial tiles and showed no benefit. All outputs matched their untuned
+references exactly. This is scoped Meganeura-versus-Meganeura evidence, not a
+PyTorch or model-training result; search amortization takes thousands of steps.
+
 ## The objective
 
 Win useful workloads under a matched numerical and workload contract, without

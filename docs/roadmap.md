@@ -25,6 +25,9 @@ qualification passed on RTX 5070; native-f32 hardware and fleet qualification
 remain ahead. A separate harness checks transfer to whole-step time;
 automatic confirmation, f16-input/complex-fusion search and persistence remain open.
 See the [implementation contract](study/performance-plan.md).
+The [five-process synthetic transfer pilot](experiments/tuning-2026-09-05/README.md)
+shows repeatable 1.15×/1.13× whole-step gains on two larger chains, with no
+selection change on two smaller ones. It is not model/fleet qualification.
 
 The next sequence is:
 

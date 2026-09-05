@@ -1,0 +1,1285 @@
+{
+  "cases": [
+    {
+      "baseline_median_ms": 0.0630345,
+      "baseline_ms": [
+        0.080595,
+        0.07799600000000001,
+        0.079401,
+        0.071754,
+        0.07457,
+        0.075868,
+        0.075499,
+        0.069944,
+        0.07026400000000001,
+        0.0697,
+        0.071467,
+        0.06724300000000001,
+        0.06619,
+        0.065399,
+        0.065742,
+        0.119267,
+        0.068035,
+        0.06573599999999999,
+        0.06067,
+        0.059366,
+        0.059646,
+        0.058244,
+        0.059332,
+        0.055151,
+        0.055511,
+        0.055823,
+        0.055763999999999994,
+        0.128778,
+        0.06917799999999999,
+        0.054983,
+        0.055748,
+        0.055741,
+        0.055704000000000004,
+        0.055797,
+        0.055751,
+        0.055714,
+        0.055777,
+        0.055711000000000004,
+        0.055243,
+        0.055707
+      ],
+      "baseline_pipeline_keys": [
+        "MatMul:small-tile",
+        "MatMul:small-tile",
+        "MatMul:small-tile",
+        "MatMul:small-tile"
+      ],
+      "dispatches_changed": 0,
+      "final_parity": {
+        "elements": 2145,
+        "max_abs": 0.0,
+        "passed": true,
+        "relative_l2": 0.0
+      },
+      "initial_parity": {
+        "elements": 2145,
+        "max_abs": 0.0,
+        "passed": true,
+        "relative_l2": 0.0
+      },
+      "input_width": 17,
+      "layers": 4,
+      "live_output_unchanged_by_search": true,
+      "native_f32_qualified": false,
+      "paired_difference_median_ms": -0.00004149999999999987,
+      "paired_noise_margin_ms": 0.0019460000000000033,
+      "rows": 33,
+      "search": {
+        "class_limit_reached": false,
+        "elapsed": {
+          "nanos": 13577613,
+          "secs": 0
+        },
+        "eligible_classes": 3,
+        "excluded_dispatches": 0,
+        "options": {
+          "dispatches_per_sample": 16,
+          "max_classes": 8,
+          "max_scratch_bytes": 67108864,
+          "max_time": {
+            "nanos": 0,
+            "secs": 10
+          },
+          "min_improvement": 0.05,
+          "sample_pairs": 6,
+          "warmup_runs": 1
+        },
+        "outcomes": [
+          {
+            "baseline_median_ms": 0.0107101875,
+            "baseline_ms": [
+              0.010679625,
+              0.0107281875,
+              0.0111110625,
+              0.0106921875,
+              0.010661062499999999,
+              0.010992437499999999
+            ],
+            "candidate": "Tile64",
+            "candidate_median_ms": 0.0129283125,
+            "candidate_ms": [
+              0.0128791875,
+              0.012644500000000001,
+              0.012899375000000001,
+              0.012983874999999999,
+              0.0130740625,
+              0.01295725
+            ],
+            "class": {
+              "binding_bytes": [
+                8580,
+                16900,
+                8580
+              ],
+              "device_local": [
+                true,
+                false,
+                false,
+                true
+              ],
+              "k": 65,
+              "m": 33,
+              "n": 65,
+              "requires_full_precision": false,
+              "shader": "MatMul"
+            },
+            "compile_time": {
+              "nanos": 252,
+              "secs": 0
+            },
+            "decision": "KeepBaseline",
+            "dispatches": 2,
+            "elapsed": {
+              "nanos": 4408439,
+              "secs": 0
+            },
+            "failure": null,
+            "initial": "Tile32",
+            "noise_margin_ms": 0.00037537499999999724,
+            "qualified": true,
+            "selected": "Tile32"
+          },
+          {
+            "baseline_median_ms": 0.011123312500000001,
+            "baseline_ms": [
+              0.010998625,
+              0.01107225,
+              0.011119812500000001,
+              0.011126812500000001,
+              0.0119364375,
+              0.011423
+            ],
+            "candidate": "Tile64",
+            "candidate_median_ms": 0.0133016875,
+            "candidate_ms": [
+              0.0132190625,
+              0.012994,
+              0.0133090625,
+              0.013305125000000001,
+              0.01329825,
+              0.013343375
+            ],
+            "class": {
+              "binding_bytes": [
+                8580,
+                16900,
+                8580
+              ],
+              "device_local": [
+                true,
+                false,
+                false,
+                false
+              ],
+              "k": 65,
+              "m": 33,
+              "n": 65,
+              "requires_full_precision": false,
+              "shader": "MatMul"
+            },
+            "compile_time": {
+              "nanos": 256,
+              "secs": 0
+            },
+            "decision": "KeepBaseline",
+            "dispatches": 1,
+            "elapsed": {
+              "nanos": 4629685,
+              "secs": 0
+            },
+            "failure": null,
+            "initial": "Tile32",
+            "noise_margin_ms": 0.000268875,
+            "qualified": true,
+            "selected": "Tile32"
+          },
+          {
+            "baseline_median_ms": 0.0097684375,
+            "baseline_ms": [
+              0.009566125,
+              0.009785750000000001,
+              0.009774812499999999,
+              0.009753062500000001,
+              0.0097620625,
+              0.00992675
+            ],
+            "candidate": "Tile64",
+            "candidate_median_ms": 0.010136937499999998,
+            "candidate_ms": [
+              0.0106710625,
+              0.010118374999999999,
+              0.0101555,
+              0.010099375,
+              0.0100725,
+              0.0102063125
+            ],
+            "class": {
+              "binding_bytes": [
+                2244,
+                4420,
+                8580
+              ],
+              "device_local": [
+                false,
+                false,
+                false,
+                true
+              ],
+              "k": 17,
+              "m": 33,
+              "n": 65,
+              "requires_full_precision": false,
+              "shader": "MatMul"
+            },
+            "compile_time": {
+              "nanos": 234,
+              "secs": 0
+            },
+            "decision": "KeepBaseline",
+            "dispatches": 1,
+            "elapsed": {
+              "nanos": 4531920,
+              "secs": 0
+            },
+            "failure": null,
+            "initial": "Tile32",
+            "noise_margin_ms": 0.00007025000000000087,
+            "qualified": true,
+            "selected": "Tile32"
+          }
+        ],
+        "time_budget_exhausted": false,
+        "visited_classes": 3
+      },
+      "speedup": 1.0185830054375489,
+      "tuned_median_ms": 0.061884499999999995,
+      "tuned_ms": [
+        0.083194,
+        0.07692600000000001,
+        0.075879,
+        0.074244,
+        0.075527,
+        0.075707,
+        0.073117,
+        0.068787,
+        0.07252199999999999,
+        0.06943,
+        0.06951299999999999,
+        0.066437,
+        0.06622499999999999,
+        0.068531,
+        0.065235,
+        0.065551,
+        0.063496,
+        0.063142,
+        0.060794,
+        0.06098,
+        0.060393999999999996,
+        0.062789,
+        0.057562999999999996,
+        0.060769000000000004,
+        0.058698,
+        0.054833999999999994,
+        0.055696999999999997,
+        0.30850700000000003,
+        0.057555,
+        0.055771,
+        0.055857,
+        0.055831,
+        0.055875999999999995,
+        0.055470000000000005,
+        0.055793,
+        0.055755,
+        0.056003,
+        0.055509,
+        0.05571,
+        0.055778
+      ],
+      "tuned_pipeline_keys": [
+        "MatMul:small-tile",
+        "MatMul:small-tile",
+        "MatMul:small-tile",
+        "MatMul:small-tile"
+      ],
+      "whole_step_improvement_exceeds_guard": false,
+      "width": 65
+    },
+    {
+      "baseline_median_ms": 0.1159075,
+      "baseline_ms": [
+        0.119613,
+        0.118926,
+        0.118621,
+        0.11566,
+        0.117526,
+        0.11588699999999999,
+        0.117646,
+        0.11443900000000001,
+        0.115928,
+        0.116137,
+        0.114165,
+        0.114833,
+        0.114324,
+        0.156301,
+        0.12233799999999999,
+        0.11471100000000001,
+        1.847426,
+        0.11984600000000001,
+        0.11981699999999999,
+        0.11643099999999999,
+        0.117477,
+        0.117989,
+        0.117414,
+        0.118922,
+        0.12215899999999999,
+        0.11532200000000001,
+        0.115703,
+        0.117732,
+        0.114807,
+        0.115769,
+        0.115578,
+        0.113755,
+        0.11479,
+        0.11354,
+        0.113706,
+        0.114026,
+        0.126936,
+        0.111224,
+        0.111435,
+        0.10958999999999999
+      ],
+      "baseline_pipeline_keys": [
+        "MatMul:small-tile",
+        "MatMul:small-tile",
+        "MatMul:small-tile",
+        "MatMul:small-tile",
+        "MatMul:small-tile",
+        "MatMul:small-tile",
+        "MatMul:small-tile",
+        "MatMul:small-tile"
+      ],
+      "dispatches_changed": 0,
+      "final_parity": {
+        "elements": 8192,
+        "max_abs": 0.0,
+        "passed": true,
+        "relative_l2": 0.0
+      },
+      "initial_parity": {
+        "elements": 8192,
+        "max_abs": 0.0,
+        "passed": true,
+        "relative_l2": 0.0
+      },
+      "input_width": 256,
+      "layers": 8,
+      "live_output_unchanged_by_search": true,
+      "native_f32_qualified": false,
+      "paired_difference_median_ms": 0.00040299999999999364,
+      "paired_noise_margin_ms": 0.0022579999999999822,
+      "rows": 32,
+      "search": {
+        "class_limit_reached": false,
+        "elapsed": {
+          "nanos": 18896275,
+          "secs": 0
+        },
+        "eligible_classes": 3,
+        "excluded_dispatches": 0,
+        "options": {
+          "dispatches_per_sample": 16,
+          "max_classes": 8,
+          "max_scratch_bytes": 67108864,
+          "max_time": {
+            "nanos": 0,
+            "secs": 10
+          },
+          "min_improvement": 0.05,
+          "sample_pairs": 6,
+          "warmup_runs": 1
+        },
+        "outcomes": [
+          {
+            "baseline_median_ms": 0.011479093749999999,
+            "baseline_ms": [
+              0.0115529375,
+              0.011556562499999999,
+              0.0115185625,
+              0.011439625,
+              0.011320624999999999,
+              0.0113888125
+            ],
+            "candidate": "Tile64",
+            "candidate_median_ms": 0.019506093749999998,
+            "candidate_ms": [
+              0.0195843125,
+              0.019502937499999998,
+              0.019534625,
+              0.01950925,
+              0.0194539375,
+              0.019438312500000002
+            ],
+            "class": {
+              "binding_bytes": [
+                32768,
+                262144,
+                32768
+              ],
+              "device_local": [
+                true,
+                false,
+                false,
+                true
+              ],
+              "k": 256,
+              "m": 32,
+              "n": 256,
+              "requires_full_precision": false,
+              "shader": "MatMul"
+            },
+            "compile_time": {
+              "nanos": 184,
+              "secs": 0
+            },
+            "decision": "KeepBaseline",
+            "dispatches": 6,
+            "elapsed": {
+              "nanos": 6016245,
+              "secs": 0
+            },
+            "failure": null,
+            "initial": "Tile32",
+            "noise_margin_ms": 0.000053562499999998056,
+            "qualified": true,
+            "selected": "Tile32"
+          },
+          {
+            "baseline_median_ms": 0.01139275,
+            "baseline_ms": [
+              0.011402187499999999,
+              0.011481,
+              0.011334,
+              0.011356312499999998,
+              0.011383312500000001,
+              0.011555875
+            ],
+            "candidate": "Tile64",
+            "candidate_median_ms": 0.0194378125,
+            "candidate_ms": [
+              0.019396187500000002,
+              0.0196638125,
+              0.019445125,
+              0.0194489375,
+              0.0194305,
+              0.0194271875
+            ],
+            "class": {
+              "binding_bytes": [
+                32768,
+                262144,
+                32768
+              ],
+              "device_local": [
+                false,
+                false,
+                false,
+                true
+              ],
+              "k": 256,
+              "m": 32,
+              "n": 256,
+              "requires_full_precision": false,
+              "shader": "MatMul"
+            },
+            "compile_time": {
+              "nanos": 181,
+              "secs": 0
+            },
+            "decision": "KeepBaseline",
+            "dispatches": 1,
+            "elapsed": {
+              "nanos": 6433836,
+              "secs": 0
+            },
+            "failure": null,
+            "initial": "Tile32",
+            "noise_margin_ms": 0.00011712499999999744,
+            "qualified": true,
+            "selected": "Tile32"
+          },
+          {
+            "baseline_median_ms": 0.01144496875,
+            "baseline_ms": [
+              0.01140825,
+              0.0115134375,
+              0.0113070625,
+              0.011481687499999999,
+              0.0113355,
+              0.011537875
+            ],
+            "candidate": "Tile64",
+            "candidate_median_ms": 0.01944003125,
+            "candidate_ms": [
+              0.01943725,
+              0.019406187499999998,
+              0.01948,
+              0.0194428125,
+              0.019392,
+              0.01953875
+            ],
+            "class": {
+              "binding_bytes": [
+                32768,
+                262144,
+                32768
+              ],
+              "device_local": [
+                true,
+                false,
+                false,
+                false
+              ],
+              "k": 256,
+              "m": 32,
+              "n": 256,
+              "requires_full_precision": false,
+              "shader": "MatMul"
+            },
+            "compile_time": {
+              "nanos": 112,
+              "secs": 0
+            },
+            "decision": "KeepBaseline",
+            "dispatches": 1,
+            "elapsed": {
+              "nanos": 6439426,
+              "secs": 0
+            },
+            "failure": null,
+            "initial": "Tile32",
+            "noise_margin_ms": 0.00009537499999999824,
+            "qualified": true,
+            "selected": "Tile32"
+          }
+        ],
+        "time_budget_exhausted": false,
+        "visited_classes": 3
+      },
+      "speedup": 1.002027266518548,
+      "tuned_median_ms": 0.115673,
+      "tuned_ms": [
+        0.117129,
+        0.1193,
+        0.126742,
+        0.121055,
+        0.115726,
+        0.11554400000000001,
+        0.114536,
+        0.115841,
+        0.11544099999999999,
+        0.115674,
+        0.116795,
+        0.11554400000000001,
+        0.112805,
+        0.115521,
+        0.11466,
+        0.114545,
+        0.127581,
+        0.118402,
+        0.119794,
+        0.117672,
+        0.11821599999999999,
+        0.117425,
+        0.11665199999999999,
+        0.117771,
+        0.116951,
+        0.116173,
+        0.114523,
+        0.115672,
+        0.115423,
+        0.11458600000000001,
+        0.11484000000000001,
+        0.114437,
+        0.11445999999999999,
+        0.114675,
+        0.11659699999999999,
+        0.112627,
+        0.118015,
+        0.115382,
+        0.111803,
+        0.111483
+      ],
+      "tuned_pipeline_keys": [
+        "MatMul:small-tile",
+        "MatMul:small-tile",
+        "MatMul:small-tile",
+        "MatMul:small-tile",
+        "MatMul:small-tile",
+        "MatMul:small-tile",
+        "MatMul:small-tile",
+        "MatMul:small-tile"
+      ],
+      "whole_step_improvement_exceeds_guard": false,
+      "width": 256
+    },
+    {
+      "baseline_median_ms": 0.307575,
+      "baseline_ms": [
+        0.265033,
+        0.26782500000000004,
+        0.268259,
+        0.27324800000000005,
+        0.274356,
+        0.274811,
+        0.27765100000000004,
+        0.278002,
+        0.28020900000000004,
+        0.28212400000000004,
+        0.282597,
+        0.291624,
+        0.308587,
+        0.291536,
+        0.29091700000000004,
+        0.293989,
+        0.306254,
+        0.301434,
+        0.29944200000000004,
+        0.305571,
+        0.307133,
+        0.308017,
+        0.31046999999999997,
+        0.320721,
+        0.31477000000000005,
+        0.321278,
+        0.32380499999999995,
+        0.324292,
+        0.33407,
+        0.331934,
+        0.332158,
+        0.343417,
+        0.341212,
+        0.352675,
+        0.34200600000000003,
+        0.34093300000000004,
+        0.34862,
+        0.33306399999999997,
+        0.332069,
+        0.33313499999999996
+      ],
+      "baseline_pipeline_keys": [
+        "MatMul:scalar",
+        "MatMul:scalar",
+        "MatMul:scalar",
+        "MatMul:scalar",
+        "MatMul:scalar",
+        "MatMul:scalar",
+        "MatMul:scalar",
+        "MatMul:scalar"
+      ],
+      "dispatches_changed": 8,
+      "final_parity": {
+        "elements": 65536,
+        "max_abs": 0.0,
+        "passed": true,
+        "relative_l2": 0.0
+      },
+      "initial_parity": {
+        "elements": 65536,
+        "max_abs": 0.0,
+        "passed": true,
+        "relative_l2": 0.0
+      },
+      "input_width": 512,
+      "layers": 8,
+      "live_output_unchanged_by_search": true,
+      "native_f32_qualified": false,
+      "paired_difference_median_ms": 0.03754100000000002,
+      "paired_noise_margin_ms": 0.003454999999999986,
+      "rows": 128,
+      "search": {
+        "class_limit_reached": false,
+        "elapsed": {
+          "nanos": 65349041,
+          "secs": 0
+        },
+        "eligible_classes": 3,
+        "excluded_dispatches": 0,
+        "options": {
+          "dispatches_per_sample": 16,
+          "max_classes": 8,
+          "max_scratch_bytes": 67108864,
+          "max_time": {
+            "nanos": 0,
+            "secs": 10
+          },
+          "min_improvement": 0.05,
+          "sample_pairs": 6,
+          "warmup_runs": 1
+        },
+        "outcomes": [
+          {
+            "baseline_median_ms": 0.0318065,
+            "baseline_ms": [
+              0.0319485,
+              0.031859875,
+              0.031902875000000004,
+              0.031745625,
+              0.031668812500000004,
+              0.031753125
+            ],
+            "candidate": "Tile32",
+            "candidate_median_ms": 0.02588653125,
+            "candidate_ms": [
+              0.0258239375,
+              0.0261104375,
+              0.026157437500000002,
+              0.025949125,
+              0.0257714375,
+              0.0255786875
+            ],
+            "class": {
+              "binding_bytes": [
+                262144,
+                1048576,
+                262144
+              ],
+              "device_local": [
+                true,
+                false,
+                false,
+                true
+              ],
+              "k": 512,
+              "m": 128,
+              "n": 512,
+              "requires_full_precision": false,
+              "shader": "MatMul"
+            },
+            "compile_time": {
+              "nanos": 431128,
+              "secs": 0
+            },
+            "decision": "FasterCandidate",
+            "dispatches": 6,
+            "elapsed": {
+              "nanos": 21811737,
+              "secs": 0
+            },
+            "failure": null,
+            "initial": "Tile64",
+            "noise_margin_ms": 0.0001989999999999978,
+            "qualified": true,
+            "selected": "Tile32"
+          },
+          {
+            "baseline_median_ms": 0.0317078125,
+            "baseline_ms": [
+              0.0317919375,
+              0.031720375,
+              0.03156225,
+              0.0318305,
+              0.031691250000000004,
+              0.03169525
+            ],
+            "candidate": "Tile32",
+            "candidate_median_ms": 0.026016937499999997,
+            "candidate_ms": [
+              0.0260546875,
+              0.026049062499999998,
+              0.0263240625,
+              0.0255825,
+              0.0259848125,
+              0.025741125
+            ],
+            "class": {
+              "binding_bytes": [
+                262144,
+                1048576,
+                262144
+              ],
+              "device_local": [
+                false,
+                false,
+                false,
+                true
+              ],
+              "k": 512,
+              "m": 128,
+              "n": 512,
+              "requires_full_precision": false,
+              "shader": "MatMul"
+            },
+            "compile_time": {
+              "nanos": 328,
+              "secs": 0
+            },
+            "decision": "FasterCandidate",
+            "dispatches": 1,
+            "elapsed": {
+              "nanos": 21842914,
+              "secs": 0
+            },
+            "failure": null,
+            "initial": "Tile64",
+            "noise_margin_ms": 0.0002828124999999966,
+            "qualified": true,
+            "selected": "Tile32"
+          },
+          {
+            "baseline_median_ms": 0.03163828125,
+            "baseline_ms": [
+              0.0316740625,
+              0.031657374999999995,
+              0.0316456875,
+              0.0316141875,
+              0.031604375,
+              0.031630875
+            ],
+            "candidate": "Tile32",
+            "candidate_median_ms": 0.026026031249999998,
+            "candidate_ms": [
+              0.025871875,
+              0.0260831875,
+              0.0260903125,
+              0.0259755625,
+              0.025922124999999997,
+              0.0260765
+            ],
+            "class": {
+              "binding_bytes": [
+                262144,
+                1048576,
+                262144
+              ],
+              "device_local": [
+                true,
+                false,
+                false,
+                false
+              ],
+              "k": 512,
+              "m": 128,
+              "n": 512,
+              "requires_full_precision": false,
+              "shader": "MatMul"
+            },
+            "compile_time": {
+              "nanos": 262,
+              "secs": 0
+            },
+            "decision": "FasterCandidate",
+            "dispatches": 1,
+            "elapsed": {
+              "nanos": 21686804,
+              "secs": 0
+            },
+            "failure": null,
+            "initial": "Tile64",
+            "noise_margin_ms": 0.00010306249999999378,
+            "qualified": true,
+            "selected": "Tile32"
+          }
+        ],
+        "time_budget_exhausted": false,
+        "visited_classes": 3
+      },
+      "speedup": 1.1514768066758139,
+      "tuned_median_ms": 0.2671135,
+      "tuned_ms": [
+        0.228554,
+        0.231617,
+        0.232427,
+        0.23709,
+        0.236845,
+        0.236584,
+        0.23966600000000002,
+        0.241327,
+        0.24317,
+        0.244553,
+        0.24690299999999998,
+        0.248326,
+        0.2512,
+        0.252022,
+        0.25630899999999995,
+        0.255757,
+        0.261725,
+        0.259633,
+        0.264814,
+        0.26653499999999997,
+        0.267692,
+        0.26899,
+        0.274341,
+        0.278879,
+        0.283368,
+        0.285483,
+        0.286174,
+        0.284574,
+        0.295723,
+        0.294851,
+        0.29928000000000005,
+        0.302949,
+        0.30301599999999995,
+        0.30236599999999997,
+        0.304996,
+        0.306749,
+        0.305415,
+        0.304299,
+        0.295262,
+        0.301031
+      ],
+      "tuned_pipeline_keys": [
+        "MatMul:small-tile",
+        "MatMul:small-tile",
+        "MatMul:small-tile",
+        "MatMul:small-tile",
+        "MatMul:small-tile",
+        "MatMul:small-tile",
+        "MatMul:small-tile",
+        "MatMul:small-tile"
+      ],
+      "whole_step_improvement_exceeds_guard": true,
+      "width": 512
+    },
+    {
+      "baseline_median_ms": 0.3007215,
+      "baseline_ms": [
+        0.26032900000000003,
+        0.262769,
+        0.263566,
+        0.26616999999999996,
+        0.26614899999999997,
+        0.27146499999999996,
+        0.271686,
+        0.27264200000000005,
+        0.27604700000000004,
+        0.27615,
+        0.27797,
+        0.281675,
+        0.28081599999999995,
+        0.284157,
+        0.28517000000000003,
+        0.289186,
+        0.289583,
+        0.296944,
+        0.296564,
+        0.300113,
+        0.30133,
+        0.303273,
+        0.310484,
+        0.312246,
+        0.31332899999999997,
+        0.320202,
+        0.310133,
+        0.320074,
+        0.319023,
+        0.320053,
+        0.317768,
+        0.32095700000000005,
+        0.317076,
+        0.31110099999999996,
+        0.311164,
+        0.462224,
+        0.327532,
+        0.35892999999999997,
+        0.306515,
+        0.305843
+      ],
+      "baseline_pipeline_keys": [
+        "MatMul:scalar",
+        "MatMul:scalar",
+        "MatMul:scalar",
+        "MatMul:scalar"
+      ],
+      "dispatches_changed": 4,
+      "final_parity": {
+        "elements": 65536,
+        "max_abs": 0.0,
+        "passed": true,
+        "relative_l2": 0.0
+      },
+      "initial_parity": {
+        "elements": 65536,
+        "max_abs": 0.0,
+        "passed": true,
+        "relative_l2": 0.0
+      },
+      "input_width": 1024,
+      "layers": 4,
+      "live_output_unchanged_by_search": true,
+      "native_f32_qualified": false,
+      "paired_difference_median_ms": 0.034472,
+      "paired_noise_margin_ms": 0.002742000000000022,
+      "rows": 64,
+      "search": {
+        "class_limit_reached": false,
+        "elapsed": {
+          "nanos": 99771378,
+          "secs": 0
+        },
+        "eligible_classes": 3,
+        "excluded_dispatches": 0,
+        "options": {
+          "dispatches_per_sample": 16,
+          "max_classes": 8,
+          "max_scratch_bytes": 67108864,
+          "max_time": {
+            "nanos": 0,
+            "secs": 10
+          },
+          "min_improvement": 0.05,
+          "sample_pairs": 6,
+          "warmup_runs": 1
+        },
+        "outcomes": [
+          {
+            "baseline_median_ms": 0.05749234375,
+            "baseline_ms": [
+              0.056999125000000005,
+              0.0595485625,
+              0.0583580625,
+              0.0579855625,
+              0.0543716875,
+              0.0543405625
+            ],
+            "candidate": "Tile32",
+            "candidate_median_ms": 0.04891678125,
+            "candidate_ms": [
+              0.051284125,
+              0.050199875,
+              0.049065625,
+              0.0487679375,
+              0.0460710625,
+              0.04612375
+            ],
+            "class": {
+              "binding_bytes": [
+                262144,
+                4194304,
+                262144
+              ],
+              "device_local": [
+                true,
+                false,
+                false,
+                true
+              ],
+              "k": 1024,
+              "m": 64,
+              "n": 1024,
+              "requires_full_precision": false,
+              "shader": "MatMul"
+            },
+            "compile_time": {
+              "nanos": 425077,
+              "secs": 0
+            },
+            "decision": "FasterCandidate",
+            "dispatches": 2,
+            "elapsed": {
+              "nanos": 34513566,
+              "secs": 0
+            },
+            "failure": null,
+            "initial": "Tile64",
+            "noise_margin_ms": 0.0010756249999999967,
+            "qualified": true,
+            "selected": "Tile32"
+          },
+          {
+            "baseline_median_ms": 0.054273906250000004,
+            "baseline_ms": [
+              0.05434375,
+              0.054299875000000004,
+              0.0542806875,
+              0.054267125,
+              0.054261875,
+              0.05425325
+            ],
+            "candidate": "Tile32",
+            "candidate_median_ms": 0.0460761875,
+            "candidate_ms": [
+              0.046088000000000004,
+              0.0460745625,
+              0.0460561875,
+              0.0460779375,
+              0.046077812499999996,
+              0.0460589375
+            ],
+            "class": {
+              "binding_bytes": [
+                262144,
+                4194304,
+                262144
+              ],
+              "device_local": [
+                false,
+                false,
+                false,
+                true
+              ],
+              "k": 1024,
+              "m": 64,
+              "n": 1024,
+              "requires_full_precision": false,
+              "shader": "MatMul"
+            },
+            "compile_time": {
+              "nanos": 375,
+              "secs": 0
+            },
+            "decision": "FasterCandidate",
+            "dispatches": 1,
+            "elapsed": {
+              "nanos": 32714148,
+              "secs": 0
+            },
+            "failure": null,
+            "initial": "Tile64",
+            "noise_margin_ms": 0.0000361250000000049,
+            "qualified": true,
+            "selected": "Tile32"
+          },
+          {
+            "baseline_median_ms": 0.05429028125,
+            "baseline_ms": [
+              0.054340875,
+              0.0542879375,
+              0.05421875,
+              0.054292625,
+              0.054340625000000004,
+              0.0542741875
+            ],
+            "candidate": "Tile32",
+            "candidate_median_ms": 0.04605840625,
+            "candidate_ms": [
+              0.0459680625,
+              0.046030625,
+              0.0462264375,
+              0.0460861875,
+              0.046091437500000006,
+              0.0460066875
+            ],
+            "class": {
+              "binding_bytes": [
+                262144,
+                4194304,
+                262144
+              ],
+              "device_local": [
+                true,
+                false,
+                false,
+                false
+              ],
+              "k": 1024,
+              "m": 64,
+              "n": 1024,
+              "requires_full_precision": false,
+              "shader": "MatMul"
+            },
+            "compile_time": {
+              "nanos": 300,
+              "secs": 0
+            },
+            "decision": "FasterCandidate",
+            "dispatches": 1,
+            "elapsed": {
+              "nanos": 32538130,
+              "secs": 0
+            },
+            "failure": null,
+            "initial": "Tile64",
+            "noise_margin_ms": 0.00006106250000000729,
+            "qualified": true,
+            "selected": "Tile32"
+          }
+        ],
+        "time_budget_exhausted": false,
+        "visited_classes": 3
+      },
+      "speedup": 1.1317722240726207,
+      "tuned_median_ms": 0.2657085,
+      "tuned_ms": [
+        0.228318,
+        0.22741499999999998,
+        0.23001400000000002,
+        0.231543,
+        0.232762,
+        0.235,
+        0.236411,
+        0.238325,
+        0.241356,
+        0.241173,
+        0.244405,
+        0.24589700000000003,
+        0.247625,
+        0.261688,
+        0.25384,
+        0.254214,
+        0.256634,
+        0.26225800000000005,
+        0.263316,
+        0.26236,
+        0.268426,
+        0.268101,
+        0.27744800000000003,
+        0.274828,
+        0.279721,
+        0.282626,
+        0.28698599999999996,
+        0.28357000000000004,
+        0.285274,
+        0.285262,
+        0.29163,
+        0.286247,
+        0.285224,
+        0.27561399999999997,
+        0.278363,
+        0.278777,
+        0.28403,
+        0.28781,
+        0.27908400000000005,
+        0.27907099999999996
+      ],
+      "tuned_pipeline_keys": [
+        "MatMul:small-tile",
+        "MatMul:small-tile",
+        "MatMul:small-tile",
+        "MatMul:small-tile"
+      ],
+      "whole_step_improvement_exceeds_guard": true,
+      "width": 1024
+    }
+  ],
+  "metadata": {
+    "arch": "x86_64",
+    "available_parallelism": 12,
+    "cargo_lock_sha256": "4a84951f05631821a4dedb57f87195f82e59dad6eaf93bca015848b8a44eb874",
+    "contract": "strict f32 operands/storage; deterministic nonzero dense chains; inference; normal step+wait wall time; uploads, compilation and search excluded from steady-state samples",
+    "cooperative_policy": "Disabled",
+    "device": {
+      "driver_info": "595.71.05",
+      "driver_name": "NVIDIA",
+      "f16_tile": 16,
+      "f32_tile": 0,
+      "name": "NVIDIA GeForce RTX 5070",
+      "software_emulated": false
+    },
+    "executable_sha256": "d83cdd555eb963bde2a33b0a175a91b22ffff2c37041a72996d4b3052322d011",
+    "order": "alternating baseline/tuned then tuned/baseline; raw arrays remain paired",
+    "os": "linux",
+    "revision": "0e27b68e92bfb72745eb2f582107236cd541c409",
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "started_unix_seconds": 1788649940,
+    "tracked_source_clean": true,
+    "warmups_per_session": 30,
+    "whole_step_sample_pairs": 40
+  },
+  "schema_version": 1
+}
