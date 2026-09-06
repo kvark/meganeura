@@ -238,6 +238,12 @@ replay cannot independently reproduce them or authenticate the producer.
 Quality CI runs the replay without a GPU. The frozen paper still passes all
 six verifier tests, 50 cells / 165 files, and byte-identical generated tables.
 
+After promotion, the full release test suite and the six explicitly enabled
+GPU tuning/staging regressions pass again. Full `cargo package` verification
+passes; a fresh consumer builds and runs on Rust 1.92 using the assembled
+package and registry dependencies, including the new/default and historical
+staging settings. This is packaging/API qualification, not a new GPU cohort.
+
 Next, split preparation's allocation/binding and pipeline work, and time final
 scratch cleanup separately before testing bounded reuse. Do not reduce the validation
 coverage or quietly add uncharged staging buffers. Fleet measurements remain
