@@ -2,7 +2,13 @@ use meganeura::{Graph, SessionConfig};
 
 #[test]
 fn cached_blocks_match_cpu_and_reset_excludes_stale_tokens() {
-    const BLOCK: usize = 3;
+    check_cached_blocks::<1>();
+    check_cached_blocks::<3>();
+    check_cached_blocks::<33>();
+    check_cached_blocks::<196>();
+}
+
+fn check_cached_blocks<const BLOCK: usize>() {
     const HEADS: usize = 4;
     const KV_HEADS: usize = 2;
     const D: usize = 64;

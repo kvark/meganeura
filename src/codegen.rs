@@ -425,6 +425,7 @@ pub enum ShaderGroup {
     Conv2dGradWeightGemmSmall,
     CacheWrite,
     CachedAttention,
+    CachedBlockAttention,
     RoPEDynamic,
     MaxPool2d,
     GlobalAvgPool,
@@ -555,6 +556,7 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ),
         ShaderGroup::CacheWrite => parse_wgsl(include_str!("shaders/cache_write.wgsl")),
         ShaderGroup::CachedAttention => parse_wgsl(include_str!("shaders/cached_attention.wgsl")),
+        ShaderGroup::CachedBlockAttention => generate_flash_attention(64, 8, true),
         ShaderGroup::RoPEDynamic => parse_wgsl(include_str!("shaders/rope_dynamic.wgsl")),
         ShaderGroup::MaxPool2d => parse_wgsl(include_str!("shaders/max_pool_2d.wgsl")),
         ShaderGroup::GlobalAvgPool => parse_wgsl(include_str!("shaders/global_avg_pool.wgsl")),
@@ -2403,7 +2405,13 @@ pub fn coop_caps() -> CoopCaps {
     *COOP_CAPS.get().unwrap_or(&CoopCaps::default())
 }
 
+pub const CACHED_ATTENTION_QUERIES: u32 = 32; // 256 threads / (64 dimensions / 8 elements)
+
 pub fn generate_flash_attention_module(head_dim: u32, ept_cap: u32) -> ShaderModule {
+    generate_flash_attention(head_dim, ept_cap, false)
+}
+
+fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> ShaderModule {
     use std::fmt::Write;
     assert!(
         head_dim.is_power_of_two() && head_dim >= 2,
@@ -2415,6 +2423,9 @@ pub fn generate_flash_attention_module(head_dim: u32, ept_cap: u32) -> ShaderMod
     let ept: u32 = hd.min(ept_cap);
     let tpq = hd / ept; // threads per query
     let bq: u32 = (256 / tpq).max(1);
+    if cached {
+        assert_eq!(bq, CACHED_ATTENTION_QUERIES);
+    }
     // Fall back to BQ=1 kernel when multi-query isn't beneficial
     if bq <= 1 {
         return generate_attention_module(head_dim);
@@ -2424,14 +2435,23 @@ pub fn generate_flash_attention_module(head_dim: u32, ept_cap: u32) -> ShaderMod
     let mut src = String::new();
 
     // Params struct (matches AttentionParams: 8 u32 = 32 bytes)
-    src.push_str(
-        "struct Params {\n    q_seq: u32,\n    kv_seq: u32,\n    packed_heads: u32,\n    head_dim: u32,\n    window_size: u32,\n    _pad0: u32,\n    _pad1: u32,\n    _pad2: u32,\n}\n\n",
-    );
+    if cached {
+        src.push_str("struct Params {\n    q_seq: u32,\n    num_heads: u32,\n    num_kv_heads: u32,\n    head_dim: u32,\n}\n\n");
+    } else {
+        src.push_str(
+            "struct Params {\n    q_seq: u32,\n    kv_seq: u32,\n    packed_heads: u32,\n    head_dim: u32,\n    window_size: u32,\n    _pad0: u32,\n    _pad1: u32,\n    _pad2: u32,\n}\n\n",
+        );
+    }
     src.push_str("var<storage> src_a: array<f32>;\n"); // Q
     src.push_str("var<storage> src_b: array<f32>;\n"); // K
     src.push_str("var<storage> bias: array<f32>;\n"); // V
+    if cached {
+        src.push_str("var<storage> kv_pos_buf: array<u32>;\n");
+    }
     src.push_str("var<storage, read_write> dst: array<f32>;\n"); // O
-    src.push_str("var<storage, read_write> lse: array<f32>;\n"); // LSE
+    if !cached {
+        src.push_str("var<storage, read_write> lse: array<f32>;\n");
+    }
     src.push_str("var<uniform> params: Params;\n\n");
 
     // Shared memory:
@@ -2492,9 +2512,15 @@ pub fn generate_flash_attention_module(head_dim: u32, ept_cap: u32) -> ShaderMod
     let _ = writeln!(src, "    let pos = wgid.x * {bq}u + qi;"); // global query position
     src.push_str("    let head = wgid.y;\n");
     src.push_str("    let q_seq = params.q_seq;\n");
-    src.push_str("    let kv_seq = params.kv_seq;\n");
-    src.push_str("    let num_heads = params.packed_heads >> 16u;\n");
-    src.push_str("    let num_kv_heads = params.packed_heads & 0xFFFFu;\n");
+    if cached {
+        src.push_str("    let kv_seq = kv_pos_buf[0] + 1u;\n");
+        src.push_str("    let num_heads = params.num_heads;\n");
+        src.push_str("    let num_kv_heads = params.num_kv_heads;\n");
+    } else {
+        src.push_str("    let kv_seq = params.kv_seq;\n");
+        src.push_str("    let num_heads = params.packed_heads >> 16u;\n");
+        src.push_str("    let num_kv_heads = params.packed_heads & 0xFFFFu;\n");
+    }
     src.push_str("    let head_dim = params.head_dim;\n");
     src.push_str("    let valid = pos < q_seq && head < num_heads;\n\n");
 
@@ -2502,7 +2528,11 @@ pub fn generate_flash_attention_module(head_dim: u32, ept_cap: u32) -> ShaderMod
     src.push_str(
         "    let my_kv_len = select(kv_seq, select(pos + 1u, 0u, !valid), kv_seq == 0u);\n",
     );
-    src.push_str("    let window_size = params.window_size;\n");
+    src.push_str(if cached {
+        "    let window_size = 0u;\n"
+    } else {
+        "    let window_size = params.window_size;\n"
+    });
     src.push_str("    let my_kv_start = select(0u, my_kv_len - min(my_kv_len, window_size), window_size > 0u);\n\n");
 
     // Workgroup-wide loop bounds
@@ -2662,16 +2692,25 @@ pub fn generate_flash_attention_module(head_dim: u32, ept_cap: u32) -> ShaderMod
         );
     }
 
-    // LSE output: only first thread in each group
-    src.push_str("        if lane == 0u {\n");
-    src.push_str("            let idx = (pos * num_heads + head) * 2u;\n");
-    src.push_str("            lse[idx] = max_score;\n");
-    src.push_str("            lse[idx + 1u] = select(log(sum_exp), -1e30, sum_exp == 0.0);\n");
-    src.push_str("        }\n");
+    if !cached {
+        // LSE output: only first thread in each group.
+        src.push_str("        if lane == 0u {\n");
+        src.push_str("            let idx = (pos * num_heads + head) * 2u;\n");
+        src.push_str("            lse[idx] = max_score;\n");
+        src.push_str("            lse[idx + 1u] = select(log(sum_exp), -1e30, sum_exp == 0.0);\n");
+        src.push_str("        }\n");
+    }
     src.push_str("    }\n");
     src.push_str("}\n");
 
-    maybe_dump_wgsl(&src, "flash_attention");
+    maybe_dump_wgsl(
+        &src,
+        if cached {
+            "cached_block_attention"
+        } else {
+            "flash_attention"
+        },
+    );
     let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
         panic!(
             "generated flash attention WGSL failed to parse:\n{}\n---\n{}",
@@ -5641,7 +5680,7 @@ mod tests {
                 }
                 ShaderEntry::RmsNormRsqrt => vec!["src", "dst", "params"],
                 ShaderEntry::CacheWrite => vec!["src", "dst", "kv_pos_buf", "params"],
-                ShaderEntry::CachedAttention => {
+                ShaderEntry::CachedAttention | ShaderEntry::CachedBlockAttention => {
                     vec!["src_a", "src_b", "bias", "kv_pos_buf", "dst", "params"]
                 }
                 ShaderEntry::GroupNorm | ShaderEntry::GroupNormSilu => {
@@ -5782,6 +5821,7 @@ mod tests {
             ShaderEntry::WinogradBatchedMatMul,
             ShaderEntry::CacheWrite,
             ShaderEntry::CachedAttention,
+            ShaderEntry::CachedBlockAttention,
             ShaderEntry::RoPEDynamic,
             ShaderEntry::MaxPool2d,
             ShaderEntry::GlobalAvgPool,

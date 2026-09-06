@@ -608,10 +608,10 @@ pub enum Op {
     // output: cache_buf (in-place write at row kv_pos)
     CacheWrite,
 
-    // Attention with Q from current token and K/V from pre-allocated cache.
+    // Attention with Q from a current query block and K/V from pre-allocated cache.
     // inputs: [q, k_cache, v_cache, kv_pos_input]
-    // q: [1, num_heads*head_dim], k_cache/v_cache: [max_seq, kv_dim]
-    // kv_pos_input: u32 scalar (number of valid cached positions)
+    // q: [queries, num_heads*head_dim], k_cache/v_cache: [max_seq, kv_dim]
+    // kv_pos_input: u32 scalar (last valid cached position, inclusive)
     CachedAttention {
         num_heads: u32,
         num_kv_heads: u32,
