@@ -233,6 +233,17 @@ pub enum TuneStaging {
     Download,
 }
 
+/// Lifetime of one private staging buffer, never of bindings or qualified data.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TuneStagingReuse {
+    /// Allocate and destroy staging for every comparison (historical policy).
+    #[default]
+    Fresh,
+    /// Keep one exact-size buffer between comparisons within this tuning call.
+    /// Release on a size change and before returning; never retain extra capacity.
+    SameSize,
+}
+
 /// Resource bounds and decision policy for [`crate::Session::tune_with`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TuneOptions {
@@ -244,6 +255,10 @@ pub struct TuneOptions {
     /// Missing historical settings deserialize to the original shared staging.
     #[serde(default)]
     pub staging: TuneStaging,
+    /// Reuse only private staging, without changing validation or scratch bounds.
+    /// Historical missing settings retain Fresh.
+    #[serde(default)]
+    pub staging_reuse: TuneStagingReuse,
     /// Soft wall-clock deadline, including compilation and qualification.
     /// An in-flight driver call, GPU submission, or validation cannot be preempted.
     pub max_time: Duration,
@@ -262,6 +277,7 @@ impl Default for TuneOptions {
             max_classes: 8,
             max_scratch_bytes: 64 * 1024 * 1024,
             staging: TuneStaging::Download,
+            staging_reuse: TuneStagingReuse::Fresh,
             max_time: Duration::from_secs(2),
             warmup_runs: 1,
             sample_pairs: 6,
@@ -336,7 +352,8 @@ pub struct TunePhaseTimes {
     /// Paired timing loop, including incomplete/discarded pairs and host checks.
     /// Not the sum of accepted per-dispatch samples or GPU timestamp duration.
     pub sampling: Option<Duration>,
-    /// Destruction of the private comparison resources, including early exits.
+    /// Destruction of private comparison resources, including early exits.
+    /// Retained staging is released separately in [`TuneReport::final_cleanup`].
     #[serde(default)]
     pub cleanup: Option<Duration>,
 }
@@ -350,7 +367,7 @@ pub struct TunePreparationTimes {
     pub pipelines: Option<Duration>,
     /// Candidate binding allocations with matching memory placement.
     pub buffers: Option<Duration>,
-    /// The private upload/readback allocation.
+    /// Private staging allocation/reuse and release of a previous size.
     pub staging: Option<Duration>,
     pub encoder: Option<Duration>,
     /// Dispatch cloning, geometry and pipeline lookup, not GPU execution.
@@ -400,6 +417,9 @@ pub struct TuneOutcome {
     /// Never reinterpret missing historical measurements as zero-cost phases.
     #[serde(default)]
     pub phase_times: Option<TunePhaseTimes>,
+    /// Actual private allocation requests; absent for historical/skipped work.
+    #[serde(default)]
+    pub scratch: Option<TuneScratchUsage>,
     pub baseline_ms: Vec<f64>,
     pub candidate_ms: Vec<f64>,
     pub baseline_median_ms: Option<f64>,
@@ -407,6 +427,26 @@ pub struct TuneOutcome {
     /// Twice the median absolute deviation of paired time differences.
     /// A conservative selection guard, not a statistical confidence interval.
     pub noise_margin_ms: Option<f64>,
+}
+
+/// Per-comparison buffer requests, not driver heap sizes or peak VRAM.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TuneScratchUsage {
+    pub binding_bytes: Vec<usize>,
+    pub staging_bytes: usize,
+    pub staging_reused: bool,
+}
+
+/// Private staging lifetime and peak simultaneous scratch requests in one call.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TuneScratchStats {
+    pub staging_allocations: usize,
+    pub staging_reuses: usize,
+    pub staging_releases: usize,
+    /// Binding requests plus the one staging buffer, never pipelines/driver heaps.
+    pub peak_bytes: usize,
+    /// Must be zero when `tune_with` returns, including bounded/failed searches.
+    pub retained_staging_bytes: usize,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -420,6 +460,12 @@ pub struct TuneReport {
     pub class_limit_reached: bool,
     pub time_budget_exhausted: bool,
     pub elapsed: Duration,
+    /// Release of staging retained across comparisons, within total `elapsed`.
+    /// None for historical reports or when no buffer remained to release.
+    #[serde(default)]
+    pub final_cleanup: Option<Duration>,
+    #[serde(default)]
+    pub scratch: Option<TuneScratchStats>,
 }
 
 pub(crate) fn median(values: &[f64]) -> f64 {
@@ -603,6 +649,7 @@ mod tests {
             elapsed: Duration::ZERO,
             compile_time: Duration::ZERO,
             phase_times: None,
+            scratch: None,
             baseline_ms: vec![10.0; 6],
             candidate_ms: vec![8.0; 6],
             baseline_median_ms: None,
@@ -737,6 +784,40 @@ mod tests {
             let historical: TuneOptions = serde_json::from_value(value).unwrap();
             assert_eq!(historical.staging, TuneStaging::Shared);
         }
+    }
+
+    #[test]
+    fn missing_historical_reuse_and_scratch_accounting_stay_distinct() {
+        for staging_reuse in [TuneStagingReuse::Fresh, TuneStagingReuse::SameSize] {
+            let mut value = serde_json::to_value(TuneReport {
+                options: TuneOptions {
+                    staging_reuse,
+                    ..Default::default()
+                },
+                scratch: Some(Default::default()),
+                final_cleanup: Some(Duration::ZERO),
+                ..Default::default()
+            })
+            .unwrap();
+            let restored: TuneReport = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(restored.options.staging_reuse, staging_reuse);
+            assert!(restored.scratch.is_some());
+            value["options"]
+                .as_object_mut()
+                .unwrap()
+                .remove("staging_reuse");
+            for key in ["scratch", "final_cleanup"] {
+                value.as_object_mut().unwrap().remove(key);
+            }
+            let old: TuneReport = serde_json::from_value(value).unwrap();
+            assert_eq!(old.options.staging_reuse, TuneStagingReuse::Fresh);
+            assert_eq!(old.scratch, None);
+            assert_eq!(old.final_cleanup, None);
+        }
+        let mut value = serde_json::to_value(outcome()).unwrap();
+        value.as_object_mut().unwrap().remove("scratch");
+        let old: TuneOutcome = serde_json::from_value(value).unwrap();
+        assert_eq!(old.scratch, None);
     }
 
     fn native_config(tile_size: u32) -> CoopConfig {

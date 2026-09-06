@@ -58,6 +58,7 @@ pub fn close(a: f64, b: f64) {
     );
 }
 
+#[allow(dead_code)] // The standalone allocation profile has no paired summary.
 pub fn check_timing(expected: &PairedTiming, recorded: &Value) {
     let replayed = serde_json::to_value(expected).unwrap();
     assert_eq!(

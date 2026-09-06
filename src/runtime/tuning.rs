@@ -2,7 +2,8 @@ use super::{Gpu, Pipelines, Session, Variant, ensure_device_memory_budget};
 use crate::compile::{BufferRef, Dispatch, ShaderEntry};
 use crate::tune::{
     MatmulTile, TuneClass, TuneDecision, TuneError, TuneOptions, TuneOutcome, TunePreparationTimes,
-    TuneQualificationTimes, TuneReport, TuneStaging, decide, measure_pairs,
+    TuneQualificationTimes, TuneReport, TuneScratchStats, TuneScratchUsage, TuneStaging,
+    TuneStagingReuse, decide, measure_pairs,
 };
 use blade_graphics as bg;
 use std::{
@@ -312,6 +313,8 @@ impl Session {
             class_limit_reached: classes.len() > options.max_classes,
             ..Default::default()
         };
+        let gpu = std::sync::Arc::clone(&self.gpu);
+        let mut staging = Staging::new(&gpu, options.staging, options.staging_reuse);
         for class in classes.iter().take(options.max_classes) {
             if start.elapsed() >= options.max_time {
                 report.time_budget_exhausted = true;
@@ -336,6 +339,7 @@ impl Session {
                     elapsed: std::time::Duration::ZERO,
                     compile_time: std::time::Duration::ZERO,
                     phase_times: Some(Default::default()),
+                    scratch: None,
                     baseline_ms: Vec::new(),
                     candidate_ms: Vec::new(),
                     baseline_median_ms: None,
@@ -343,7 +347,7 @@ impl Session {
                     noise_margin_ms: None,
                 };
                 let class_start = Instant::now();
-                self.measure_candidate(class, &options, start, &mut outcome);
+                self.measure_candidate(class, &options, start, &mut outcome, &mut staging);
                 outcome.elapsed = class_start.elapsed();
                 if outcome.selected != outcome.initial {
                     for &index in &class.members {
@@ -373,6 +377,11 @@ impl Session {
                 report.outcomes.push(outcome);
             }
         }
+        if staging.buffer.is_some() {
+            let _timer = PhaseTimer::new(&mut report.final_cleanup);
+            staging.clear();
+        }
+        report.scratch = Some(staging.stats);
         report.elapsed = start.elapsed();
         report.time_budget_exhausted |= report.elapsed >= options.max_time;
         log::info!(
@@ -394,6 +403,7 @@ impl Session {
         options: &TuneOptions,
         start: Instant,
         outcome: &mut TuneOutcome,
+        staging: &mut Staging<'_>,
     ) {
         let phases = outcome
             .phase_times
@@ -428,9 +438,16 @@ impl Session {
             outcome.decision = TuneDecision::ScratchLimit;
             return;
         }
+        drop(checks);
+        {
+            let _timer = PhaseTimer::new(&mut prep.staging);
+            staging.discard_unmatched(*sizes.iter().max().unwrap());
+        }
+        let checks = PhaseTimer::new(&mut prep.checks);
         let memory = self.gpu.memory_stats();
         if memory.budget != 0
-            && bytes as u64 > super::safe_device_memory_remaining(memory.usage, memory.budget)
+            && (bytes - staging.stats.retained_staging_bytes) as u64
+                > super::safe_device_memory_remaining(memory.usage, memory.budget)
         {
             outcome.decision = TuneDecision::DeviceMemoryBudget;
             return;
@@ -458,14 +475,18 @@ impl Session {
             return;
         }
         let mut scratch = Scratch::new(
-            &self.gpu,
             &class.key,
             &sizes,
             bytes,
-            options.staging,
+            staging,
             prep,
             &mut phases.cleanup,
         );
+        outcome.scratch = Some(TuneScratchUsage {
+            binding_bytes: sizes.clone(),
+            staging_bytes: scratch.staging.stats.retained_staging_bytes,
+            staging_reused: scratch.staging_reused,
+        });
         let bindings = PhaseTimer::new(&mut prep.bindings);
         let mut dispatch = self.plan.dispatches[class.members[0]].clone();
         dispatch.input_buffers = (0..sizes.len() - 1).map(|i| BufferRef(i as u32)).collect();
@@ -578,27 +599,111 @@ fn scratch_bytes(sizes: &[usize]) -> Option<usize> {
         .try_fold(*sizes.iter().max()?, |sum, size| sum.checked_add(*size))
 }
 
-struct Scratch<'a> {
-    gpu: &'a Gpu,
-    buffers: Vec<bg::Buffer>,
-    staging: bg::Buffer,
-    output_elements: usize,
-    encoder: bg::CommandEncoder,
-    cleanup: &'a mut Option<Duration>,
+fn reuse_staging(policy: TuneStagingReuse, retained: usize, requested: usize) -> bool {
+    policy == TuneStagingReuse::SameSize && retained != 0 && retained == requested
 }
 
-impl<'a> Scratch<'a> {
+struct Staging<'gpu> {
+    gpu: &'gpu Gpu,
+    memory: TuneStaging,
+    reuse: TuneStagingReuse,
+    buffer: Option<bg::Buffer>,
+    stats: TuneScratchStats,
+}
+
+impl<'gpu> Staging<'gpu> {
+    fn new(gpu: &'gpu Gpu, memory: TuneStaging, reuse: TuneStagingReuse) -> Self {
+        Self {
+            gpu,
+            memory,
+            reuse,
+            buffer: None,
+            stats: Default::default(),
+        }
+    }
+
+    fn clear(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            self.gpu.destroy_buffer(buffer);
+            self.stats.staging_releases += 1;
+            self.stats.retained_staging_bytes = 0;
+        }
+    }
+
+    fn discard_unmatched(&mut self, bytes: usize) {
+        if !reuse_staging(self.reuse, self.stats.retained_staging_bytes, bytes) {
+            self.clear();
+        }
+    }
+
+    fn acquire(&mut self, bytes: usize) -> bool {
+        if self.buffer.is_some() {
+            assert!(reuse_staging(
+                self.reuse,
+                self.stats.retained_staging_bytes,
+                bytes
+            ));
+            self.stats.staging_reuses += 1;
+            return true;
+        }
+        self.buffer = Some(self.gpu.create_buffer(bg::BufferDesc {
+            name: "tune_staging",
+            size: bytes as u64,
+            memory: match self.memory {
+                TuneStaging::Shared => bg::Memory::Shared,
+                TuneStaging::Download => bg::Memory::Download,
+            },
+        }));
+        self.stats.staging_allocations += 1;
+        self.stats.retained_staging_bytes = bytes;
+        false
+    }
+
+    fn buffer(&self) -> bg::Buffer {
+        self.buffer.expect("comparison owns initialized staging")
+    }
+}
+
+impl Drop for Staging<'_> {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+struct Scratch<'gpu, 'trial> {
+    gpu: &'gpu Gpu,
+    buffers: Vec<bg::Buffer>,
+    staging: &'trial mut Staging<'gpu>,
+    staging_reused: bool,
+    output_elements: usize,
+    encoder: bg::CommandEncoder,
+    cleanup: &'trial mut Option<Duration>,
+}
+
+impl<'gpu, 'trial> Scratch<'gpu, 'trial> {
     fn new(
-        gpu: &'a Gpu,
         class: &TuneClass,
         sizes: &[usize],
         bytes: usize,
-        staging: TuneStaging,
+        staging: &'trial mut Staging<'gpu>,
         preparation: &mut TunePreparationTimes,
-        cleanup: &'a mut Option<Duration>,
+        cleanup: &'trial mut Option<Duration>,
     ) -> Self {
+        let gpu = staging.gpu;
+        assert!(
+            staging.buffer.is_none()
+                || reuse_staging(
+                    staging.reuse,
+                    staging.stats.retained_staging_bytes,
+                    *sizes.iter().max().unwrap()
+                )
+        );
         let checks = PhaseTimer::new(&mut preparation.checks);
-        ensure_device_memory_budget(gpu, bytes, "matmul tuning scratch");
+        ensure_device_memory_budget(
+            gpu,
+            bytes - staging.stats.retained_staging_bytes,
+            "matmul tuning scratch",
+        );
         drop(checks);
         let buffers_time = PhaseTimer::new(&mut preparation.buffers);
         let buffers = sizes
@@ -619,14 +724,8 @@ impl<'a> Scratch<'a> {
             .collect();
         drop(buffers_time);
         let staging_time = PhaseTimer::new(&mut preparation.staging);
-        let staging = gpu.create_buffer(bg::BufferDesc {
-            name: "tune_staging",
-            size: *sizes.iter().max().unwrap() as u64,
-            memory: match staging {
-                TuneStaging::Shared => bg::Memory::Shared,
-                TuneStaging::Download => bg::Memory::Download,
-            },
-        });
+        let staging_reused = staging.acquire(*sizes.iter().max().unwrap());
+        staging.stats.peak_bytes = staging.stats.peak_bytes.max(bytes);
         drop(staging_time);
         let encoder_time = PhaseTimer::new(&mut preparation.encoder);
         let encoder = gpu.create_command_encoder(bg::CommandEncoderDesc {
@@ -639,6 +738,7 @@ impl<'a> Scratch<'a> {
             gpu,
             buffers,
             staging,
+            staging_reused,
             output_elements: class.m as usize * class.n as usize,
             encoder,
             cleanup,
@@ -651,13 +751,17 @@ impl<'a> Scratch<'a> {
             .unzip();
         let host = host.map(PhaseTimer::new);
         unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), self.staging.data().cast(), data.len());
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                self.staging.buffer().data().cast(),
+                data.len(),
+            );
         }
         drop(host);
         let _transfer = transfer.map(PhaseTimer::new);
         self.encoder.start();
         self.encoder.transfer("tune_upload").copy_buffer_to_buffer(
-            self.staging.at(0),
+            self.staging.buffer().at(0),
             self.buffers[index].at(0),
             std::mem::size_of_val(data) as u64,
         );
@@ -671,15 +775,18 @@ impl<'a> Scratch<'a> {
             .transfer("tune_readback")
             .copy_buffer_to_buffer(
                 self.buffers.last().unwrap().at(0),
-                self.staging.at(0),
+                self.staging.buffer().at(0),
                 (self.output_elements * 4) as u64,
             );
         self.submit_wait();
         drop(transfer);
         let _host = PhaseTimer::new(&mut times.readback_host_copy);
         unsafe {
-            std::slice::from_raw_parts(self.staging.data().cast::<f32>(), self.output_elements)
-                .to_vec()
+            std::slice::from_raw_parts(
+                self.staging.buffer().data().cast::<f32>(),
+                self.output_elements,
+            )
+            .to_vec()
         }
     }
 
@@ -702,11 +809,13 @@ impl<'a> Scratch<'a> {
     }
 }
 
-impl Drop for Scratch<'_> {
+impl Drop for Scratch<'_, '_> {
     fn drop(&mut self) {
         let _timer = PhaseTimer::new(self.cleanup);
         self.gpu.destroy_command_encoder(&mut self.encoder);
-        self.gpu.destroy_buffer(self.staging);
+        if self.staging.reuse == TuneStagingReuse::Fresh {
+            self.staging.clear();
+        }
         for buffer in self.buffers.drain(..) {
             self.gpu.destroy_buffer(buffer);
         }
@@ -1061,17 +1170,11 @@ mod tests {
                     .map(|i| f32::from_bits(patterns[i % patterns.len()]))
                     .collect();
                 for staging in [TuneStaging::Shared, TuneStaging::Download] {
+                    let mut staging = Staging::new(&gpu, staging, TuneStagingReuse::Fresh);
                     let mut prep = TunePreparationTimes::default();
                     let mut cleanup = None;
-                    let mut scratch = Scratch::new(
-                        &gpu,
-                        &class,
-                        &sizes,
-                        bytes,
-                        staging,
-                        &mut prep,
-                        &mut cleanup,
-                    );
+                    let mut scratch =
+                        Scratch::new(&class, &sizes, bytes, &mut staging, &mut prep, &mut cleanup);
                     let mut times = TuneQualificationTimes::default();
                     scratch.upload(sizes.len() - 1, &data, Some(&mut times));
                     let read = scratch.read_output(&mut times);
@@ -1102,6 +1205,88 @@ mod tests {
     fn scratch_cap_counts_staging_and_checks_overflow() {
         assert_eq!(scratch_bytes(&[4, 8, 12]), Some(36));
         assert_eq!(scratch_bytes(&[usize::MAX, 4]), None);
+        assert!(reuse_staging(TuneStagingReuse::SameSize, 12, 12));
+        for (retained, requested) in [(0, 0), (0, 12), (12, 8), (8, 12)] {
+            assert!(!reuse_staging(
+                TuneStagingReuse::SameSize,
+                retained,
+                requested
+            ));
+        }
+        assert!(!reuse_staging(TuneStagingReuse::Fresh, 12, 12));
+    }
+
+    #[test]
+    #[ignore = "GPU exact-size reuse and early-return cleanup qualification"]
+    fn staging_reuse_replaces_sizes_and_cleans_up_after_early_returns() {
+        fn trial(staging: &mut Staging<'_>, n: u32, stamp: u32) -> Result<(), ()> {
+            let class = TuneClass {
+                shader: ShaderEntry::MatMul,
+                m: 3,
+                n,
+                k: 5,
+                requires_full_precision: false,
+                device_local: [true; 4],
+                binding_bytes: Vec::new(),
+            };
+            let sizes = class.buffer_sizes().unwrap();
+            staging.discard_unmatched(*sizes.iter().max().unwrap());
+            let mut prep = TunePreparationTimes::default();
+            let mut cleanup = None;
+            let result = (|| {
+                let mut scratch = Scratch::new(
+                    &class,
+                    &sizes,
+                    scratch_bytes(&sizes).unwrap(),
+                    staging,
+                    &mut prep,
+                    &mut cleanup,
+                );
+                let data: Vec<_> = (0..class.m * class.n)
+                    .map(|i| f32::from_bits(0x7fc0_0000 | (stamp + i)))
+                    .collect();
+                let mut times = TuneQualificationTimes::default();
+                scratch.upload(sizes.len() - 1, &data, Some(&mut times));
+                let read = scratch.read_output(&mut times);
+                if read.len() == data.len()
+                    && read
+                        .iter()
+                        .zip(data)
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+                {
+                    return Err(());
+                }
+                panic!("stale or corrupted staging data");
+            })();
+            assert!(cleanup.is_some());
+            result
+        }
+        let gpu = crate::init_gpu_context().unwrap();
+        for memory in [TuneStaging::Shared, TuneStaging::Download] {
+            for policy in [TuneStagingReuse::Fresh, TuneStagingReuse::SameSize] {
+                let mut staging = Staging::new(&gpu, memory, policy);
+                for (index, n) in [7, 7, 65, 7].into_iter().enumerate() {
+                    assert!(trial(&mut staging, n, index as u32 * 1024).is_err());
+                }
+                let fresh = policy == TuneStagingReuse::Fresh;
+                assert_eq!(staging.stats.staging_allocations, if fresh { 4 } else { 3 });
+                assert_eq!(staging.stats.staging_reuses, if fresh { 0 } else { 1 });
+                assert_eq!(
+                    staging.stats.peak_bytes,
+                    scratch_bytes(&[60, 1300, 780]).unwrap()
+                );
+                assert_eq!(
+                    staging.stats.retained_staging_bytes,
+                    if fresh { 0 } else { 140 }
+                );
+                staging.clear();
+                assert_eq!(staging.stats.retained_staging_bytes, 0);
+                assert_eq!(
+                    staging.stats.staging_allocations,
+                    staging.stats.staging_releases
+                );
+            }
+        }
     }
 
     #[test]

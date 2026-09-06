@@ -4,7 +4,7 @@
 use meganeura::graph::Graph;
 use meganeura::{
     CoopPolicy, MatmulTile, Mode, SessionConfig, SessionOptions, TuneDecision, TuneOptions,
-    TuneStaging, build,
+    TuneStaging, TuneStagingReuse, build,
 };
 use std::time::Duration;
 
@@ -150,11 +150,13 @@ fn tune_preserves_correctness() {
 #[ignore = "GPU tuning requires an idle device"]
 fn tune_preserves_training_parameters_gradients_and_moments() {
     for staging in [TuneStaging::Shared, TuneStaging::Download] {
-        preserves_training_state(staging);
+        for reuse in [TuneStagingReuse::Fresh, TuneStagingReuse::SameSize] {
+            preserves_training_state(staging, reuse);
+        }
     }
 }
 
-fn preserves_training_state(staging: TuneStaging) {
+fn preserves_training_state(staging: TuneStaging, staging_reuse: TuneStagingReuse) {
     let mut graph = Graph::new();
     let x = graph.input("x", &[33, 17]);
     let weight = graph.parameter("weight", &[17, 65]);
@@ -216,6 +218,7 @@ fn preserves_training_state(staging: TuneStaging) {
     let report = session
         .tune_with(TuneOptions {
             staging,
+            staging_reuse,
             max_time: Duration::from_secs(60),
             ..Default::default()
         })
@@ -251,11 +254,13 @@ fn preserves_training_state(staging: TuneStaging) {
 #[ignore = "GPU tuning requires an idle device"]
 fn tune_qualifies_all_four_scalar_entries_on_rectangular_edges() {
     for staging in [TuneStaging::Shared, TuneStaging::Download] {
-        qualify_scalar_entries(staging);
+        for reuse in [TuneStagingReuse::Fresh, TuneStagingReuse::SameSize] {
+            qualify_scalar_entries(staging, reuse);
+        }
     }
 }
 
-fn qualify_scalar_entries(staging: TuneStaging) {
+fn qualify_scalar_entries(staging: TuneStaging, staging_reuse: TuneStagingReuse) {
     use meganeura::compile::ShaderEntry;
     for shader in [
         ShaderEntry::MatMul,
@@ -279,6 +284,7 @@ fn qualify_scalar_entries(staging: TuneStaging) {
             let report = session
                 .tune_with(TuneOptions {
                     staging,
+                    staging_reuse,
                     max_time: Duration::from_secs(60),
                     ..Default::default()
                 })
@@ -289,6 +295,12 @@ fn qualify_scalar_entries(staging: TuneStaging) {
                 "{shader:?} {m}x{n}x{k}: {report:?}"
             );
             let outcome = &report.outcomes[0];
+            assert_eq!(report.scratch.unwrap().retained_staging_bytes, 0);
+            assert_eq!(
+                report.scratch.unwrap().staging_allocations,
+                report.scratch.unwrap().staging_releases
+            );
+            assert!(report.scratch.unwrap().peak_bytes <= report.options.max_scratch_bytes);
             assert_eq!(outcome.class.shader, shader);
             assert!(outcome.qualified, "{outcome:?}");
             assert!(matches!(
@@ -334,6 +346,8 @@ fn tune_budget_skips_leave_selection_unchanged() {
         },
     ] {
         let report = session.tune_with(options).unwrap();
+        assert_eq!(report.scratch.unwrap(), Default::default());
+        assert_eq!(report.final_cleanup, None);
         assert_eq!(report.eligible_classes, 1);
         assert!(
             report.class_limit_reached
@@ -358,6 +372,60 @@ fn tune_budget_skips_leave_selection_unchanged() {
             assert_eq!(preparation.staging, None);
         }
     }
+}
+
+#[test]
+#[ignore = "GPU tuning requires an idle device"]
+fn tuning_releases_retained_staging_after_a_later_scratch_skip() {
+    let mut graph = Graph::new();
+    let a = graph.input("a", &[32, 4096]);
+    let b = graph.parameter("b", &[4096, 32]);
+    let small = graph.matmul(a, b);
+    let x = graph.input("x", &[1024, 1]);
+    let y = graph.parameter("y", &[1, 1024]);
+    let large = graph.matmul(x, y);
+    graph.set_outputs(vec![small, large]);
+    let (mut session, _) = build(
+        &graph,
+        SessionConfig {
+            mode: Mode::Inference,
+            runtime: SessionOptions {
+                coop: CoopPolicy::Disabled,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let report = session
+        .tune_with(TuneOptions {
+            staging_reuse: TuneStagingReuse::SameSize,
+            max_scratch_bytes: 2 * 1024 * 1024,
+            max_time: Duration::from_secs(60),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(report.outcomes.len(), 2);
+    assert!(report.outcomes[0].qualified);
+    assert_eq!(report.outcomes[1].decision, TuneDecision::ScratchLimit);
+    assert_eq!(report.outcomes[1].scratch, None);
+    let stats = report.scratch.unwrap();
+    assert_eq!(stats.staging_allocations, 1);
+    assert_eq!(stats.staging_releases, 1);
+    assert_eq!(stats.staging_reuses, 0);
+    assert_eq!(stats.retained_staging_bytes, 0);
+    assert_eq!(stats.peak_bytes, 3 * 32 * 4096 * 4 + 32 * 32 * 4);
+    assert!(report.final_cleanup.is_some());
+    let keys = session.dispatch_pipeline_keys();
+    let report = session
+        .tune_with(TuneOptions {
+            staging_reuse: TuneStagingReuse::SameSize,
+            max_time: Duration::ZERO,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(report.scratch.unwrap(), Default::default());
+    assert_eq!(report.final_cleanup, None);
+    assert_eq!(keys, session.dispatch_pipeline_keys());
 }
 
 #[test]
