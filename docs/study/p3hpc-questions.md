@@ -514,6 +514,9 @@ The eight-class structural budget visits only 8/45 ResNet derivative classes;
 it is not a measured cost ranking. The next experiment is bounded split-K dW
 with charged partial storage/reduction and explicit search coverage, not a
 lower threshold or an unconditional performance claim.
+Before widening the admitted shape domain, ordinary convolution indexing also
+needs hardening: the new tuner rejects inexact reciprocal decomposition, but
+does not repair those pre-existing untuned kernels.
 
 ## Talk outline
 

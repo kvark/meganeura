@@ -134,7 +134,8 @@ data and strict comparison/decision tolerances were not relaxed. The dependency
 lock is unchanged. Full vectors remain unarchived; replay does not recreate
 them. Earlier cohorts and frozen paper tables remain separate.
 
-Next: bounded split-K dW with charged partial storage and final reduction,
+Next: harden ordinary convolution's reciprocal indexing outside the admitted
+search domain, then bounded split-K dW with charged partial storage and final reduction,
 an explicit direction/search-coverage policy, independent oracles and another
 predeclared whole-step test. Neither broader coverage nor a new algorithm is
 obtained by fitting the existing performance threshold.

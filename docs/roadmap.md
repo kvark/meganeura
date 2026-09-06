@@ -70,7 +70,10 @@ Original malformed flat-layout controls are retained/disqualified; public
 operand checks, full forward oracles and nonzero training preflights prevent
 their zero-data success from becoming evidence. Sampling now dominates search
 cost, and the eight-class structural prior visits only 8/45 ResNet classes.
-Next: bounded split-K weight gradients with charged partial storage and whole-step confirmation;
+Before broadening this domain, repair ordinary convolution's reciprocal
+index decomposition: the tuning guard excludes inexact cases (e.g. divisor 41),
+but does not repair untuned kernels. Then add bounded split-K weight gradients
+with charged partial storage and whole-step confirmation;
 attention schedules remain a separate device-qualified family.
 Keep tuning opt-in; do not fit a smaller margin or model rule.
 

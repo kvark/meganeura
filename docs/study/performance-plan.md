@@ -117,6 +117,10 @@ exact at every quotient interval's endpoints within exactly representable
 integer inputs. Monotonicity then covers the interior. This restriction excludes
 unsafe search domains; it does not fix those pre-existing kernels. Forward and
 cooperative convolution remain outside this search.
+For example, f32 reciprocal multiplication truncates `41 / 41` to zero with
+the existing formula. This CPU counterexample is now an explicit open audit
+item: repair the reusable indexing and add adversarial GPU oracles before
+widening the admitted domain. It is not a retained GPU accuracy measurement.
 | Lifetime | Choices affect this session only. Semantic plan cache and frozen results stay untouched. |
 
 The former small-tile occupancy cutoff is now an **initial choice**, not a
