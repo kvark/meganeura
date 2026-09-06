@@ -240,22 +240,26 @@ fn run_case(
 fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
     let mut args = std::env::args_os().skip(1);
-    let path = args
-        .next()
-        .ok_or("usage: profile_training <new-output.json> <seed 1..3> [--conv-indexing]")?;
+    let path = args.next().ok_or(
+        "usage: profile_training <new-output.json> <seed 1..3> [--conv-indexing|--conv-divisor]",
+    )?;
     let seed: usize = args
         .next()
         .ok_or("missing seed")?
         .to_str()
         .ok_or("non-UTF8 seed")?
         .parse()?;
-    let indexing_audit = match args.next() {
-        None => false,
-        Some(arg) if arg == "--conv-indexing" => true,
+    let protocol = match args.next() {
+        None => "training-profile-2026-09-06",
+        Some(arg) if arg == "--conv-indexing" => "conv-indexing-2026-09-06",
+        Some(arg) if arg == "--conv-divisor" => "conv-divisor-2026-09-06",
         Some(_) => return Err("unknown profiling mode".into()),
     };
+    let indexing_audit = protocol != "training-profile-2026-09-06";
     if !(1..=3).contains(&seed) || args.next().is_some() {
-        return Err("expected one output, seed 1..3, optional --conv-indexing".into());
+        return Err(
+            "expected one output, seed 1..3, optional --conv-indexing or --conv-divisor".into(),
+        );
     }
     if !command("git", &["status", "--porcelain", "--untracked-files=no"])?.is_empty() {
         return Err("commit tracked source before profiling".into());
@@ -272,11 +276,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let caps = &gpu.capabilities().cooperative_matrix;
     let mut cases = profile_cases();
     cases.rotate_left(seed - 1);
-    let protocol = if indexing_audit {
-        "conv-indexing-2026-09-06"
-    } else {
-        "training-profile-2026-09-06"
-    };
     let mut document = json!({"schema_version": 1, "protocol": protocol, "status": "running",
         "metadata": {"revision": command("git", &["rev-parse", "HEAD"])?, "tracked_source_clean": true,
             "cargo_lock_sha256": sha256(&Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"))?,
