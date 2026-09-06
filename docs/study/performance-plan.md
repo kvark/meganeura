@@ -1,14 +1,19 @@
 # How to win while staying general
 
-## Current milestone: bounded closure
+## Current milestone: closed; split-K promotion deferred
 
 The author agreed to close this phase after one shared long-reduction accuracy
 attempt and, only if it qualifies, one predeclared whole-step acceptance cohort.
-An explicit defer decision also closes the milestone. See the
-[bounded experiment](../experiments/compensated-dw-2026-09-06/README.md).
+The [bounded experiment](../experiments/compensated-dw-2026-09-06/README.md)
+completed: compensated tile accumulation passes 230/240 rows, but fails the
+long tiny cancellation fixture. Its production change is removed and split-K
+promotion is deferred. The conditional whole-step cohort is not run. This closes
+the milestone without changing tolerances or pretending every research question
+is solved.
 The broader priorities below are a research backlog, not prerequisites for this
 freeze or the accepted paper. Attention, persistent tuning, new precision and
-layout search belong to a later phase. Paper finalization can proceed now.
+layout search belong to a later phase. The next active task is paper finalization,
+starting with the author's actual reviews and technical read-through.
 
 This separates the implemented search from the remaining engineering and
 experiment plan. The initial September audit was CPU-only. After the user

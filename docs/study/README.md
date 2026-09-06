@@ -13,6 +13,13 @@ performance statements refer to the separately frozen revision. The initial audi
 CPU-only; subsequent GPU qualification is described separately in the
 [performance plan](performance-plan.md), after the device was released.
 
+The tuning-foundation milestone is now closed. Its final
+[bounded accuracy attempt](../experiments/compensated-dw-2026-09-06/README.md)
+resolved the original fixtures but failed broader tiny cancellation checks
+(230/240 rows qualify). The arithmetic change is not retained; split-K promotion
+is deferred without another performance experiment. The remaining engineering
+roadmap is future research. Paper review, rehearsal and packaging are next.
+
 ## The one-minute explanation
 
 Meganeura is a native Rust compiler and runtime for static neural-network

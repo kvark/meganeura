@@ -463,3 +463,97 @@ fn replay_rejects_changed_sequence_identity_bytes_timings_and_state() {
         );
     }
 }
+
+fn replay_compensated_accuracy(record: &Value) {
+    assert_eq!(record["protocol"], "bounded-dw-accuracy-v1");
+    assert_eq!(
+        record["revision"],
+        "4142e29c4975910738b2a0b16158ac853fa04047"
+    );
+    assert_eq!(record["tracked_source_clean"], true);
+    assert_eq!(record["device"], "NVIDIA GeForce RTX 5070");
+    assert_eq!(record["driver"], "595.71.05");
+    assert_eq!(
+        record["executable_sha256"],
+        "e24f57f7ed704b7453604bc4dfc953cff5688cdabc636f08a9b15273440a6ef2"
+    );
+    assert_eq!(
+        record["cargo_lock_sha256"],
+        "72cecddd0f090e82d5db46bc6f7f80429a058b2afa0eaec84a9b27e7340a4a80"
+    );
+    assert_eq!(record["status"], "rejected");
+    assert_eq!(record["qualified"], 230);
+    let rows = record["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 240);
+    let mut index = 0;
+    let mut qualified = 0;
+    for (case, (_, shape, _)) in CASES.into_iter().enumerate() {
+        let [_, ci, _, _, co, kh, kw, _, _, _] = shape;
+        let elements = co * ci * kh * kw;
+        for pattern in 0..3 {
+            for scale in [1.0f32, 1e-12] {
+                for splits in [1, 2, 3, 4, 8] {
+                    for tile in [32, 64] {
+                        let row = &rows[index];
+                        index += 1;
+                        assert_eq!(row["shape"], json!(shape));
+                        assert_eq!(row["pattern"], pattern);
+                        assert_eq!(row["scale"].as_f64().unwrap(), f64::from(scale));
+                        assert_eq!(row["splits"], splits);
+                        assert_eq!(row["tile"], tile);
+                        assert_eq!(row["final_elements"], elements);
+                        assert_eq!(
+                            row["partial_elements"],
+                            if splits == 1 { 0 } else { elements * splits }
+                        );
+                        let passes = !(case == 3 && pattern == 2 && scale < 1.0);
+                        assert_eq!(row["qualified"], passes);
+                        let errors = row["errors"].as_array().unwrap();
+                        assert_eq!(errors.is_empty(), passes);
+                        if !passes {
+                            assert!(errors[0].as_str().unwrap().starts_with("final[6] = "));
+                            if splits > 1 {
+                                assert!(
+                                    errors[1..]
+                                        .iter()
+                                        .any(|e| { e.as_str().unwrap().contains("relative L2") })
+                                );
+                            }
+                        }
+                        qualified += usize::from(passes);
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(qualified, 230);
+}
+
+#[test]
+fn bounded_accuracy_replay_keeps_rejection_distinct_from_test_process_success() {
+    let original: Value = serde_json::from_str(include_str!(
+        "../docs/experiments/compensated-dw-2026-09-06/accuracy.json"
+    ))
+    .unwrap();
+    replay_compensated_accuracy(&original);
+    for (pointer, value) in [
+        ("/status", json!("qualified")),
+        ("/qualified", json!(240)),
+        ("/revision", json!("different")),
+        ("/rows/0/tile", json!(16)),
+        ("/rows/2/partial_elements", json!(4)),
+        ("/rows/230/qualified", json!(true)),
+        ("/rows/230/errors", json!([])),
+        (
+            "/rows/232/errors",
+            json!(["final[6] = missing partial failures"]),
+        ),
+    ] {
+        let mut changed = original.clone();
+        *changed.pointer_mut(pointer).unwrap() = value;
+        assert!(
+            std::panic::catch_unwind(|| replay_compensated_accuracy(&changed)).is_err(),
+            "accepted {pointer}"
+        );
+    }
+}

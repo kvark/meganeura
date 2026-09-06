@@ -8,6 +8,14 @@ ongoing.
 
 ## September 2026 priorities
 
+The current tuning-foundation milestone is **closed**. The final
+[bounded accumulation attempt](experiments/compensated-dw-2026-09-06/README.md)
+passes 230/240 accuracy rows but fails tiny cancellation cases, so its arithmetic
+change is not retained and split-K promotion is deferred. No conditional
+whole-step cohort follows the failed gate. The next active milestone is
+[paper finalization](../paper/p3hpc/REVISION.md). The engineering tracks below
+are a deferred research backlog, not additional requirements for this freeze.
+
 The [study guide](study/README.md), [audit](audit-2026-09.md) and
 [performance plan](study/performance-plan.md) are the current decision record.
 The detailed tracks below retain earlier motivation and experiment notes;

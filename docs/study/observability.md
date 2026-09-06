@@ -472,6 +472,13 @@ the phase breakdown prevents mistaking this for a return of the old readback-cop
 bottleneck. Full-vector checks are executed but vectors are not archived; replay
 cannot retrospectively change their tolerance or inspect an unrecorded element.
 
+The [bounded accumulation reporting test](../experiments/compensated-dw-2026-09-06/README.md)
+illustrates another distinction: a successful test process means all declared
+rows were recorded, not that the candidate qualified. Read JSON `status`, the
+`qualified` count and each row's errors. Its 230/240 pass count still means
+rejection, and no performance samples are collected. The failed candidate's
+source tag remains separate from the active, unchanged arithmetic.
+
 ## What we should improve next
 
 The highest-value debugging improvements are typed logical-tensor reads;

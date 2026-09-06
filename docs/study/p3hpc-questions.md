@@ -583,6 +583,25 @@ or claiming two same-order scalar tiles are independent references would not
 resolve this. The probe's full validation can cost seconds, so its cost is reported
 separately from sequence timing. [Evidence and limits](../experiments/split-k-sequence-2026-09-06/README.md).
 
+### 48. Why stop after a mostly successful accuracy improvement?
+
+Short: the acceptance rule was declared before the test, and a deferred feature
+is a valid outcome.
+
+Detail: summing 16-term tiles locally and compensating their outer sum fixes
+the known control and partial failures. But only 230/240 broader rows qualify;
+long tiny cancellation inputs fail for both tiles and every tested count.
+A CPU reproduction confirms the reported error even with compensated outer
+addition. That step cannot recover rounding already lost within the tile.
+
+We remove the unqualified arithmetic, retain the source and rejection evidence,
+and defer split-K promotion without a whole-step benchmark. We do not add a
+shape exception, relax the gate, or turn the next possible algorithm into another
+mandatory deadline item. The tuning foundation is useful without universal
+kernel coverage. This closes the engineering milestone and lets paper review
+proceed; it does not prove split-K can never succeed.
+[Decision and evidence](../experiments/compensated-dw-2026-09-06/README.md).
+
 ## Talk outline
 
 The actual workshop slot length is not confirmed here. For a 12-minute talk,

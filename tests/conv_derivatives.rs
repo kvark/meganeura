@@ -553,6 +553,41 @@ fn weight_partial_scatter_agrees_with_independent_full_reference() {
 }
 
 #[test]
+fn compensated_tile_rejection_matches_cpu_and_keeps_the_original_gate() {
+    let spatial = 32771;
+    let x = qualification_inputs(2 * 3 * spatial, 1, 2, 1.0);
+    let dy = qualification_inputs(2 * 5 * spatial, 0, 2, 1e-12);
+    let (mut total, mut error) = (0.0f32, 0.0f32);
+    let mut exact = 0.0f64;
+    for start in (0..2 * spatial).step_by(16) {
+        let mut block = 0.0f32;
+        for k in start..(start + 16).min(2 * spatial) {
+            let (batch, offset) = (k / spatial, k % spatial);
+            let a = dy[(batch * 5 + 2) * spatial + offset];
+            let b = x[batch * 3 * spatial + offset];
+            block = a.mul_add(b, block);
+            exact += f64::from(a) * f64::from(b);
+        }
+        let corrected = block - error;
+        let next = total + corrected;
+        error = (next - total) - corrected;
+        total = next;
+    }
+    let observed = 1.9869085e-15f32;
+    assert_eq!(total.to_bits(), observed.to_bits());
+    assert_eq!(exact, 1.9731522921401375e-15);
+    assert!(
+        qualification(
+            "retained compensated final[6]",
+            &[observed],
+            &[exact],
+            1e-12
+        )
+        .is_err()
+    );
+}
+
+#[test]
 #[ignore = "Full GPU/f64 accuracy experiment; reports all rejections without timing"]
 fn report_bounded_weight_accumulation_qualification() {
     #[path = "../examples/support/experiment_io.rs"]
