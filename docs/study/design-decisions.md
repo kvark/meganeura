@@ -112,6 +112,10 @@ Large-graph host-memory and allocation hardening followed on August 28
 Blade pin adds the `DeviceTransient` allocation path
 ([`bd6be08`](https://github.com/kvark/meganeura/commit/bd6be08)). None of
 these post-freeze changes can inherit the paper's performance numbers.
+The September 6 migration replaces the git pins with published Blade 0.9,
+blade-macros 0.3 and Naga 30, raises the Rust minimum to 1.92, and restores
+full `cargo package` verification. This closes the registry-dependency gap;
+it is not a new publication or cross-backend performance result.
 
 ## 6. The precision turn: accurate forward was not enough
 
@@ -162,3 +166,54 @@ Do not turn [rejected experiments](../rejected-optimizations.md) into eternal
 prohibitions. Driver versions, shapes, dependency behavior and precision
 contracts change. Retesting needs a reason and a controlled protocol, but an
 old failure is evidence about that experiment, not a proof of impossibility.
+
+## 9. A shared baseline is not an independent oracle
+
+The [September 6 whole-step profiles](../experiments/training-profile-2026-09-06/README.md)
+prioritize convolution derivatives. Reviewing their indexing then uncovered
+a stride-1 dX bug outside same padding. Forward cross-correlation uses
+`ih = oh*stride + kh - padding_h`; inversion requires
+`oh = (ih + padding_h - kh)/stride`, with divisibility/bounds checks. Both
+scalar and generated cooperative paths incorrectly used `kernel_h-1-padding_h`
+while leaving the weight indices unflipped. Width had the same error.
+
+Same padding satisfies `2*padding == kernel-1`, masking this substitution.
+The model profiles' full-state parity therefore passed while a newly added
+unpadded 3×3 f64 oracle failed. The oracle scatters forward contributions
+directly, independently of the kernels' implicit-GEMM gather indexing. Fixing
+the padding expression preserves bindings, geometry, precision and budgets;
+it is not a new performance schedule or a justification to loosen validation.
+
+The regression covers eight shapes, both scalar tiles, full dX/dW and tiny
+upstream derivatives. A separate test requires actual generated cooperative
+execution. On f16-only hardware it uses bounded, exactly representable operands
+to isolate indexing, not to certify f32 derivative range. Native-f32 modules
+validate offline; that is different evidence from native-f32 device execution.
+
+Lesson: full control-session comparisons establish preservation against that
+control, not absolute operator correctness. Independent oracles and unaligned,
+asymmetric, tiny and otherwise uncovered cases are complementary requirements
+before an automatic search can safely choose a faster implementation.
+
+## 10. Exact arithmetic is shared machinery, not a model exception
+
+Replacing floating-point index reciprocals with integer division fixed a
+width-41 batch-boundary error, but added about 23% to a retained ResNet F+L+B
+cohort. The next implementation precomputes `floor(2^32/d)` for each positive
+invariant divisor greater than one, multiplies to obtain the high word, then
+corrects by at most one. A short proof covers all u32 numerators, and a shared
+WGSL implementation uses only 32-bit integer operations. It needs neither
+special widths nor approximate-addressing fallbacks. Division by one is the
+identity; zero is rejected.
+
+This is semantic strength reduction, not a learned performance threshold or
+a new runtime search space. The four derived integer uniforms and their host
+binding work are real costs. Raw-u32 GPU tests exercise the same shared helper;
+full f64 convolution oracles and state-preservation checks remain unchanged.
+The [six-process follow-up](../experiments/conv-divisor-2026-09-06/README.md)
+finds only about 2% lower ResNet step time on RTX 5070, leaving most of the
+earlier regression. Two candidate Whisper after-blocks worsen substantially.
+Retain those observations: exactness, backend profitability, timing stability
+and whole-model generality are separate questions. A growing arithmetic-variant
+menu is not yet justified. Split-K remains a distinct, explicitly budgeted
+dispatch-sequence experiment using the existing SumRows reduction.

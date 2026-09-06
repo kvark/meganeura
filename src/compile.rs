@@ -3,6 +3,8 @@ use crate::schedule::{PointwiseDAG, Pw, ReductionEpilogue, ReductionKernel};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+mod split_k;
+
 /// Weight storage format for matmul B operands.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WeightFormat {
@@ -230,6 +232,9 @@ pub enum ShaderEntry {
     Conv2dGradInputGemmCoopGen(u32, u32, u32),
     Conv2dGradWeightGemm,
     Conv2dGradWeightGemmSmall,
+    /// Split reduction tiles into `[split, Co, Ci*Kh*Kw]` partials for SumRows.
+    Conv2dGradWeightGemmSplit,
+    Conv2dGradWeightGemmSplitSmall,
     CacheWrite,
     CachedAttention,
     RoPEDynamic,
@@ -299,6 +304,8 @@ impl ShaderEntry {
             | ShaderEntry::Conv2dGradInputGemmCoopGen(..)
             | ShaderEntry::Conv2dGradWeightGemm
             | ShaderEntry::Conv2dGradWeightGemmSmall
+            | ShaderEntry::Conv2dGradWeightGemmSplit
+            | ShaderEntry::Conv2dGradWeightGemmSplitSmall
             | ShaderEntry::Upsample2x
             | ShaderEntry::Upsample2xGrad
             | ShaderEntry::MaxPool2d
@@ -454,6 +461,10 @@ impl ShaderEntry {
             ShaderEntry::Conv2dGradInputGemmCoopGen(..) => ShaderGroup::Conv2dGradInputGemmCoop,
             ShaderEntry::Conv2dGradWeightGemm => ShaderGroup::Conv2dGradWeightGemm,
             ShaderEntry::Conv2dGradWeightGemmSmall => ShaderGroup::Conv2dGradWeightGemmSmall,
+            ShaderEntry::Conv2dGradWeightGemmSplit => ShaderGroup::Conv2dGradWeightGemmSplit,
+            ShaderEntry::Conv2dGradWeightGemmSplitSmall => {
+                ShaderGroup::Conv2dGradWeightGemmSplitSmall
+            }
             ShaderEntry::CacheWrite => ShaderGroup::CacheWrite,
             ShaderEntry::CachedAttention => ShaderGroup::CachedAttention,
             ShaderEntry::RoPEDynamic => ShaderGroup::RoPEDynamic,
@@ -553,7 +564,10 @@ impl ShaderEntry {
             ShaderEntry::Conv2dGradInputGemm
             | ShaderEntry::Conv2dGradInputGemmSmall
             | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => "main",
-            ShaderEntry::Conv2dGradWeightGemm | ShaderEntry::Conv2dGradWeightGemmSmall => "main",
+            ShaderEntry::Conv2dGradWeightGemm
+            | ShaderEntry::Conv2dGradWeightGemmSmall
+            | ShaderEntry::Conv2dGradWeightGemmSplit
+            | ShaderEntry::Conv2dGradWeightGemmSplitSmall => "main",
             ShaderEntry::CacheWrite => "main",
             ShaderEntry::CachedAttention => "main",
             ShaderEntry::RoPEDynamic => "main",
@@ -826,7 +840,7 @@ fn group_norm_stats_kernel() -> crate::schedule::ReductionKernel {
 }
 
 /// A single GPU dispatch in the execution plan.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Dispatch {
     pub shader: ShaderEntry,
     pub workgroups: [u32; 3],
@@ -929,6 +943,9 @@ pub struct ExecutionPlan {
     pub buffers: Vec<usize>,
     /// Which buffers hold parameters (need initialization).
     pub param_buffers: Vec<(String, BufferRef)>,
+    /// Logical parameter types, unaffected by runtime allocation padding.
+    #[serde(default)]
+    pub param_types: HashMap<BufferRef, crate::graph::TensorType>,
     /// Which buffers hold inputs (filled each step).
     pub input_buffers: Vec<(String, BufferRef)>,
     /// Constant buffers with their initial data (uploaded once at session creation).
@@ -2355,6 +2372,7 @@ impl<'a> Compiler<'a> {
             plan: ExecutionPlan {
                 buffers: vec![],
                 param_buffers: vec![],
+                param_types: HashMap::new(),
                 input_buffers: Vec::new(),
                 constant_buffers: Vec::new(),
                 dispatches: Vec::new(),
@@ -2594,6 +2612,7 @@ impl<'a> Compiler<'a> {
             match node.op {
                 Op::Parameter { ref name } => {
                     self.plan.param_buffers.push((name.clone(), buf));
+                    self.plan.param_types.insert(buf, node.ty.clone());
                     let wf = WeightFormat::from_dtype(node.ty.dtype);
                     if wf.uses_reduced_storage() {
                         let shape = &node.ty.shape;

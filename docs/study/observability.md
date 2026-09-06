@@ -8,9 +8,9 @@ dumps, numerical probes and structured profiles. These are real facilities,
 but they are not a Python debugger, an arbitrary backward-hook system, or a
 complete GPU anomaly detector.
 
-This chapter describes current source, including the September scalar-tile
-tuner. It is not a result from the frozen paper. GPU examples below are for
-later: **do not run them while the GPU is reserved by another process.**
+This chapter describes current source, including the September f32-matmul
+tuner. It is not a result from the frozen paper. Run GPU examples only on an
+available device; instrumented/tuning executions can disturb other timings.
 
 ## Compare the debugging models, not just the feature names
 
@@ -227,8 +227,21 @@ backend exposes them, are supporting diagnostics, not a timing model.
 [profiling protocol](../performance-profiling.md),
 [GPU example](../../examples/profile_session.rs)
 
-`MemorySummary` separates logical bytes from actual aliased allocations and
-optimizer state. `device_memory_stats` reports a broader API-level process
+`MemorySummary` separates plan capacities (including padding), graph
+allocations after aliasing, and actually allocated moments, accumulators and
+auxiliary buffers. `total_allocated_bytes()` sums those retained buffer
+requests; structured profiles expose the same total as `resident_buffer_bytes`.
+Lazy moment reads return zeros without creating GPU state, so inspection
+does not turn an SGD/F+L+B session into an Adam-sized allocation.
+F32 parameter reads reject reduced/integer storage instead of reinterpreting
+it, and raw F32 buffer reads check capacity before copying. Bulk parameter
+norm inspection remains F32-only; logical sizes do not imply automatic
+dequantization in every diagnostic API.
+These fields are not a driver allocation or peak measurement. See the
+[checkpoint/memory chapter](checkpoints-and-memory.md) for the field map,
+restore-error guarantees and qualification tests.
+
+`device_memory_stats` reports a broader API-level process
 view; it does not establish system-wide pressure, fragmentation or peak
 allocation history. Compare the same quantity and measurement boundary across
 engines. PyTorch's profiler can record shapes, stacks and memory activity,
@@ -244,22 +257,227 @@ box. Trace bundles can contain model source: review them before sharing.
 
 ## Make autotuning explainable from its first version
 
+Convolution-derivative searches add `TuneOptions.scope` and the optional
+`TuneClass.conv2d` shape. Inspect all twelve NCHW convolution parameters, not
+just M/N/K: dX also has batch in dispatch Z. Scalar convolution tiles appear
+as distinct Small/large shader entries, unlike dense `use_small_tiles`.
+The [convolution crossover](../experiments/conv-tiles-2026-09-06/README.md)
+archives complete before/after dispatches and declared buffer sizes so a
+selection can be traced back to its exact class. Missing historical scope is
+Dense; missing convolution shape means a dense class, not an unknown batch.
+
+Those full dispatch records exposed a vacuous benchmark: the first small-case
+builder supplied nonflat operands to the flat convolution API, producing zero
+forward workgroups. Matching zero gradients/moments had passed the original
+runner. The [corrected cohort](../experiments/conv-tiles-corrected-2026-09-06/README.md)
+rejects zero-workgroup plans, records `prefix_training_signal` and
+`parameters_updated`, and validates nonzero gradients/moments and actual
+parameter changes. Public convolution helpers reject malformed operand shapes
+early; independent tests read full forward outputs as well as derivatives.
+The original twelve controls are retained/disqualified, not overwritten.
+This is an example of observability finding invalid work, not merely locating
+slow work. Full state agreement alone cannot establish workload validity.
+
 `Session::tune_with(TuneOptions)` returns a serializable `TuneReport` rather
-than only logging a winner. Inspect exact `(shader,M,N,K,precision,placement)`
-classes, counts, initial/selected tile, qualification status, raw paired
+than only logging a winner. Inspect exact
+`(shader,M,N,K,precision,binding capacity,placement)` classes, eligible/visited
+counts, incumbent/challenger/selected implementation, qualification status, raw paired
 samples, medians, the noise guard and budget/validation rejection decisions.
-Reports retain resolved options, total/class elapsed time and pipeline setup
+Reports retain resolved options, total/comparison elapsed time and pipeline setup
 time, so a winner's search cost remains visible.
 `serde_json::to_string_pretty(&report)` can preserve the evidence. The selected
 pipeline keys remain visible in `dispatch_pipeline_keys()`.
 
-This initial scalar search never runs a live step or binds live tensors. Its
-scratch data exercises ordinary and tiny nonzero operands, both variants are
+The follow-up prompted by the holdouts adds `TuneOutcome.phase_times`:
+preparation (including pipeline setup and scratch allocation), qualification
+(data/uploads/dispatches/readbacks/CPU checks), warmup (including input reset),
+and the paired sampling loop. These are non-overlapping host wall times, not
+GPU timestamps. `compile_time` is a subset of preparation; do not add it again.
+The original four-phase sum excluded final decision bookkeeping and scratch
+destruction. The allocation follow-up below measures cleanup separately; always
+compare phase sums with total `elapsed` rather than forcing equality.
+An early exit retains partial time for the active phase; an unreached phase
+is `None`. Entire `phase_times` is `None` for historical reports written before
+instrumentation, including the first pilot and six-case holdouts—not zero
+measured cost. The later crossover records contain measured phases.
+
+The readback follow-up adds `qualification_breakdown` within those phases:
+input preparation, CPU upload copy, upload transfer/wait, dispatch/wait,
+readback transfer/wait, CPU allocation/copy from mapped staging, and CPU
+validation. Repeated operations accumulate, early exits retain partial times,
+and absent historical/unreached measurements remain `None`. The enclosing
+qualification timer already contains these costs. Transfer/dispatch fields
+include host encoding/submission and waiting; they are not GPU timestamps.
+CPU validation still scans complete outputs and compares sampled f64 dots.
+`TuneOptions::staging` controls only the one private copy buffer: Shared and
+Download keep its capacity and all candidate bindings/validation unchanged.
+New options default to Download after the measured promotion gates passed;
+missing settings in historical reports still deserialize as Shared. See the
+[separate staging protocol and results](../experiments/readback-2026-09-06/README.md).
+
+There may be two comparisons per class; the second challenges the last accepted
+winner, not necessarily the original heuristic choice. `failure` identifies
+shader rejection or the implementation/input pattern that failed qualification.
+It is not a full numerical discrepancy trace. Native cooperative candidates
+include complete geometry/padding constraints, and unsupported or policy-disabled
+matrix types are never silently substituted by f16 implementations.
+
+This f32 search never runs a live step or binds live tensors. Its
+scratch data exercises ordinary and tiny full-mantissa operands, both variants are
 checked against sampled f64 dots and each other, and the soft deadline includes
 qualification/compilation. These checks do not prove every input or guarantee
 a whole-model win. Choices are session-local, and scratch timing omits normal
 cross-kernel overlap, cache history and surrounding work. See the
-[implementation contract and deferred validation](performance-plan.md).
+[implementation contract and hardware qualification](performance-plan.md).
+
+The [retained transfer experiment](../experiments/tuning-2026-09-05/README.md)
+is a concrete report-reading exercise: compare the three placement-sensitive
+classes, per-class decisions, final pipeline keys, search cost and independent
+whole-step samples. On this RTX 5070 the native-f32 coverage flag is false;
+positive scalar timings cannot be used as evidence for that unexecuted path.
+
+The [optimizer-backed holdout records](../experiments/holdouts-2026-09-06/README.md)
+add full in-memory parameter/gradient/moment comparisons, expected Adam counts,
+loss trajectories, memory-accounting stages and every timing pair. Read their
+ResNet run 3 as a debugging exercise: identical pipeline keys, a 1.071× ratio
+of medians, but only 0.01470 ms median paired gain. The guard rejects the apparent
+gain. This separates “the kernels changed,” “the numerical state matches,”
+and “whole-step time improved.” The retained summaries are not tensor dumps;
+CPU replay checks their consistency, not the absent full vectors. Validation
+readbacks are outside timers, followed by settling steps, and process memory
+samples with both sessions resident are not peak VRAM.
+
+The [predeclared crossover experiment](../experiments/crossover-2026-09-06/README.md)
+adds an untuned/untuned control, balanced session roles and continuous optional
+GPU telemetry. `Session::swap_tuning_with` exchanges complete legal f32 tile
+choices between compatible sessions sharing one GPU context; it does not
+exchange tensor allocations, weights, moments or training age. It preflights
+the entire layout and prepares missing pipelines before changing choices.
+Preparation and waits stay outside timing. On error, choices and tensor state
+are unchanged, although newly prepared pipelines may remain cached. Callers
+must still match inputs, optimizer settings and age. This is an experimental
+control primitive, not a snapshot, persistent tuning profile, or automatic
+whole-step confirmation/rollback feature.
+
+The retained crossover is another report-reading exercise. Dense inference
+passes both role orientations in all six processes (median 1.177×); MLP+Adam
+has four inconclusive outcomes and two noisy A/A controls; ResNet changes no
+selection. Bit-exact state checks through Adam step 178 do not imply a training
+speedup. That cohort localized ResNet's search to qualification (median 538 of
+546 ms), not sampling (7 ms). Its timers still combined CPU checking,
+transfers and GPU work within that phase; they did not prove a readback cause.
+The 250 ms device telemetry is too coarse to describe every short timing pair.
+
+The subsequent Shared/Download cohort provides the narrower diagnosis. On
+Blade 0.9 and the same RTX 5070, median ResNet qualification falls from 598
+to 21 ms. Its CPU mapped-memory-to-vector allocation/copy falls from 582 to
+2 ms, while complete finite/parity scans and sampled f64 checks remain about
+6 ms. Readback transfer/encode/wait actually rises from 0.54 to 2.33 ms, and
+preparation rises from 0.65 to 10.41 ms; total search still falls from 606 to
+39 ms. The raw records retain all six processes, both search orders, every
+check and the first slower dense run. This supports changing the private
+staging policy, not shortening validation, claiming pure GPU transfer timings,
+or inferring physical heap/cache properties. The Metal backend maps Shared
+and Download to the same storage mode; no Metal performance gain is measured.
+
+The [allocation/reuse follow-up](../experiments/staging-reuse-2026-09-06/README.md)
+adds `preparation_breakdown`: checks, pipeline setup, candidate buffer allocation,
+staging management, encoder creation and binding/geometry work. The pipeline
+field is exactly `compile_time`, already within preparation. `phase_times.cleanup`
+measures comparison resource destruction, including early exits. Reused staging's
+last release is `TuneReport::final_cleanup`, inside total search but outside
+comparison times. Release of a previous size belongs to preparation's staging
+management. Historical missing fields remain `None`; never add nested times twice.
+
+`TuneOutcome.scratch` records actual binding/staging requests and reuse status.
+`TuneReport.scratch` counts staging allocations/reuses/releases, peak simultaneous
+scratch requests and bytes retained at return (zero). These are requested bytes,
+not physical heap sizes or driver peak VRAM. One slot is reused only at the same
+exact size within one call. A size change releases it before new scratch
+allocation; candidate bindings/encoders and every validation operation remain
+fresh. `staging_reuse: Fresh` disables reuse, and missing historical options
+still mean Fresh even though new options now default to SameSize.
+
+Six matched processes reduce dense search from median 44.01 to 31.84 ms and
+MLP+Adam from 64.27 to 45.46 ms. Staging allocations fall 3→1 and 5→2; ResNet
+stays at one. All 108 comparisons qualify with bit-exact state checks through
+Adam step 178 and equal scratch requests. No validation or qualification gain
+guard passes: the improvement is allocation/cleanup, not fewer numerical checks.
+Read the retained first dense slowdown and the ResNet search-order reversal
+before interpreting medians; ResNet passes no gain/regression guard, which
+does not establish zero harm. No whole-step or fleet speedup was measured.
+
+## Profiled-state parity is not stationary timing or an independent oracle
+
+The [whole-step localization runner](../experiments/training-profile-2026-09-06/README.md)
+profiles synthetic ResNet, SmolLM2 and Whisper F+L+B without optimizer/clip
+passes. It compares every retained profiled full state before the collector's
+two ordinary ring-advance steps overwrite it; readbacks use separate encoders,
+outside the retained wall timer. The GPU regression checks this callback order
+and exact timestamp counts. All 45 captured full states match bitwise.
+
+Normal timing blocks still drift: Whisper's first after-block median is nearly
+twice its before-block median. Profiled/normal wall ratios are retained, not
+silently treated as normal step times. Readback interruptions and timestamp
+passes can perturb execution; coarse telemetry does not identify the cause.
+The phase label is the scheduled prefix/suffix at the last loss dispatch, so
+independent gradient seeds may appear in the prefix. Use shader direction and
+origins as well as the phase label.
+
+Source inspection then found a non-same-padding convolution dX bug that both
+control and profiled paths shared. A direct f64 scatter oracle exposed it;
+the scalar and cooperative generators are now fixed. Read the
+[design lesson](design-decisions.md#9-a-shared-baseline-is-not-an-independent-oracle):
+observability helps find where to look, but neither exact same-engine parity
+nor a complete timing trace proves the underlying derivative is correct.
+
+The [indexing cost check](../experiments/conv-indexing-2026-09-06/README.md)
+adds optional full-state SHA-256 digests to the existing profiling runner. Sorted
+tensor names, lengths and f32 bits, plus optimizer counter/allocation, make
+source-to-source parity checks possible without archiving model tensors. Hashing
+and all readbacks stay outside step timers. A digest checks identity, not
+correctness: both implementations could still share an address error. Here the
+independent f64 oracle first reproduced a width-41 dW error; the shared integer
+indexing repair then passes all full-output regressions. Raw digests cannot
+replace missing vectors for numerical reanalysis.
+
+The [split-K plan prototype](../experiments/split-k-2026-09-06/README.md) makes
+another distinction visible: one logical dW now has a partial producer and a
+SumRows consumer. Both retain its origin; labels identify the two passes. The
+logical node still reads the **final** gradient. To inspect partials, retain a
+diagnostic `no_alias` plan and read its producer output buffer after completion;
+ordinary alias reuse can overwrite that temporary later in the step. Do not
+treat its buffer index as a persistent graph-node identity. CPU/GPU profiling
+must include the final reduction even though its family is not convolution.
+Independent f64 checks exposed a long tiny-gradient partial error that final
+gradient parity alone would miss. That partition count remains unqualified;
+observing a plausible final tensor does not make every intermediate correct.
+
+`Session::measure_conv_weight_splits` now returns ordinary TuneReports for an
+explicit class without installing a choice. Read `candidate_split_k` as well as
+the tile: baseline/challenger tile fields are identical, but the challenger has
+two passes. `FasterCandidate` describes that isolated comparison, not a live-plan
+change. Scratch bindings are upstream/input/**final output**/partials, with the
+largest binding charged again for staging; the last buffer is no longer implicitly
+the final result. Timed repetitions include both passes and their barrier.
+
+The [retained cohort](../experiments/split-k-sequence-2026-09-06/README.md) contains
+32 rejections with no warmup/sampling observations, not zero-cost measurements.
+Full f64 scans expose two control errors that sampled dots missed. A subsequent
+CPU FMA diagnostic reproduces those GPU bits, separating accumulation error from
+addressing error. Future generic failure messages also identify the variant;
+the four older pointwise two-way records lack that attribution and stay unchanged.
+The pointwise probe spends about three seconds in CPU validation before rejecting:
+the phase breakdown prevents mistaking this for a return of the old readback-copy
+bottleneck. Full-vector checks are executed but vectors are not archived; replay
+cannot retrospectively change their tolerance or inspect an unrecorded element.
+
+The [bounded accumulation reporting test](../experiments/compensated-dw-2026-09-06/README.md)
+illustrates another distinction: a successful test process means all declared
+rows were recorded, not that the candidate qualified. Read JSON `status`, the
+`qualified` count and each row's errors. Its 230/240 pass count still means
+rejection, and no performance samples are collected. The failed candidate's
+source tag remains separate from the active, unchanged arithmetic.
 
 ## What we should improve next
 

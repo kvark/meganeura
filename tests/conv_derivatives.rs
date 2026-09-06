@@ -1,0 +1,1130 @@
+//! Full f64 oracle for convolution derivatives; no finite-difference cancellation.
+use meganeura::{
+    CoopPolicy, Graph, Session, SessionOptions,
+    compile::{BufferRef, ExecutionPlan, ShaderEntry},
+};
+use std::sync::Arc;
+
+#[derive(Clone, Copy, Debug)]
+struct Shape {
+    batch: u32,
+    ci: u32,
+    h: u32,
+    w: u32,
+    co: u32,
+    kh: u32,
+    kw: u32,
+    stride: u32,
+    ph: u32,
+    pw: u32,
+}
+
+impl Shape {
+    fn output(self) -> (u32, u32) {
+        (
+            (self.h + 2 * self.ph - self.kh) / self.stride + 1,
+            (self.w + 2 * self.pw - self.kw) / self.stride + 1,
+        )
+    }
+
+    fn sizes(self) -> [usize; 3] {
+        let (oh, ow) = self.output();
+        [
+            (self.batch * self.ci * self.h * self.w) as usize,
+            (self.co * self.ci * self.kh * self.kw) as usize,
+            (self.batch * self.co * oh * ow) as usize,
+        ]
+    }
+}
+
+fn data(n: usize, seed: u32, scale: f32) -> Vec<f32> {
+    let mut state = seed;
+    (0..n)
+        .map(|_| {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((state >> 8) as f32 / 16777216.0 - 0.5) * scale
+        })
+        .collect()
+}
+
+fn reference(s: Shape, x: &[f32], w: &[f32], dy: &[f32]) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let mut output = vec![0.0; dy.len()];
+    let mut dx = vec![0.0; x.len()];
+    let mut dw = vec![0.0; w.len()];
+    let (out_h, out_w) = s.output();
+    // Scatter the forward cross-correlation's contributions. This independent
+    // indexing does not use either GPU kernel's implicit-GEMM/gather formula.
+    for n in 0..s.batch {
+        for co in 0..s.co {
+            for oh in 0..out_h {
+                for ow in 0..out_w {
+                    let yi = (((n * s.co + co) * out_h + oh) * out_w + ow) as usize;
+                    for ci in 0..s.ci {
+                        for kh in 0..s.kh {
+                            for kw in 0..s.kw {
+                                let ih = (oh * s.stride + kh) as i32 - s.ph as i32;
+                                let iw = (ow * s.stride + kw) as i32 - s.pw as i32;
+                                if ih < 0 || iw < 0 || ih >= s.h as i32 || iw >= s.w as i32 {
+                                    continue;
+                                }
+                                let xi = (((n * s.ci + ci) * s.h + ih as u32) * s.w + iw as u32)
+                                    as usize;
+                                let wi = (((co * s.ci + ci) * s.kh + kh) * s.kw + kw) as usize;
+                                output[yi] += f64::from(x[xi]) * f64::from(w[wi]);
+                                dx[xi] += f64::from(dy[yi]) * f64::from(w[wi]);
+                                dw[wi] += f64::from(dy[yi]) * f64::from(x[xi]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (output, dx, dw)
+}
+
+fn check(label: &str, actual: &[f32], expected: &[f64], scale: f32) {
+    qualification(label, actual, expected, scale).unwrap();
+}
+
+fn qualification(label: &str, actual: &[f32], expected: &[f64], scale: f32) -> Result<(), String> {
+    assert_eq!(actual.len(), expected.len());
+    let mut error = 0.0;
+    let mut norm = 0.0;
+    for (i, (&a, &b)) in actual.iter().zip(expected).enumerate() {
+        let difference = (f64::from(a) - b).abs();
+        if !(a.is_finite()
+            && b.is_finite()
+            && difference <= f64::from(scale) * 1e-5 + b.abs() * 2e-4)
+        {
+            return Err(format!("{label}[{i}] = {a:e}, reference {b:e}"));
+        }
+        error += difference * difference;
+        norm += b * b;
+    }
+    if !(norm > 0.0 && (error / norm).sqrt() <= 2e-4) {
+        return Err(format!(
+            "{label}: reference norm {norm:e}, relative L2 {}",
+            (error / norm).sqrt()
+        ));
+    }
+    Ok(())
+}
+
+fn run(
+    s: Shape,
+    tile: u32,
+    gpu: &Arc<blade_graphics::Context>,
+    policy: CoopPolicy,
+    tune: bool,
+) -> Session {
+    let (session, rejected) = run_split(s, tile, gpu, policy, tune, 1);
+    assert!(rejected.is_empty());
+    session
+}
+
+fn plan(s: Shape, tile: u32, splits: u32) -> (ExecutionPlan, Option<BufferRef>) {
+    let [nx, nw, ny] = s.sizes();
+    let mut graph = Graph::new();
+    let x = graph.parameter("x", &[nx]);
+    let w = graph.parameter("w", &[nw]);
+    let y = graph.conv2d_hw(
+        x, w, s.batch, s.ci, s.h, s.w, s.co, s.kh, s.kw, s.stride, s.ph, s.pw,
+    );
+    let dy = graph.input("dy", &[ny]);
+    let weighted = graph.mul(y, dy);
+    let loss = graph.sum_all(weighted);
+    graph.set_outputs(vec![loss]);
+    let mut plan = meganeura::compile::compile(&meganeura::autodiff::differentiate(&graph));
+    let mut forced = 0;
+    for d in &mut plan.dispatches {
+        match d.shader {
+            ShaderEntry::Conv2dGemm | ShaderEntry::Conv2dGemmSmall => {
+                d.shader = if tile == 32 {
+                    ShaderEntry::Conv2dGemmSmall
+                } else {
+                    ShaderEntry::Conv2dGemm
+                };
+                let (oh, ow) = s.output();
+                d.workgroups = [(oh * ow).div_ceil(tile), s.co.div_ceil(tile), s.batch];
+                forced += 1;
+            }
+            ShaderEntry::Conv2dGradInputGemm | ShaderEntry::Conv2dGradInputGemmSmall => {
+                d.shader = if tile == 32 {
+                    ShaderEntry::Conv2dGradInputGemmSmall
+                } else {
+                    ShaderEntry::Conv2dGradInputGemm
+                };
+                d.workgroups = [(s.h * s.w).div_ceil(tile), s.ci.div_ceil(tile), s.batch];
+                forced += 1;
+            }
+            ShaderEntry::Conv2dGradWeightGemm | ShaderEntry::Conv2dGradWeightGemmSmall => {
+                d.shader = if tile == 32 {
+                    ShaderEntry::Conv2dGradWeightGemmSmall
+                } else {
+                    ShaderEntry::Conv2dGradWeightGemm
+                };
+                d.workgroups = [(s.ci * s.kh * s.kw).div_ceil(tile), s.co.div_ceil(tile), 1];
+                forced += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(forced, 3);
+    let partial = if splits > 1 {
+        let index = plan
+            .dispatches
+            .iter()
+            .position(|d| {
+                matches!(
+                    d.shader,
+                    ShaderEntry::Conv2dGradWeightGemm | ShaderEntry::Conv2dGradWeightGemmSmall
+                )
+            })
+            .unwrap();
+        let buffer = BufferRef(plan.buffers.len() as u32);
+        let bytes = nw * splits as usize * 4;
+        assert_eq!(
+            plan.split_conv_weight_gradients(&[(index, splits)], bytes),
+            Ok(bytes)
+        );
+        Some(buffer)
+    } else {
+        None
+    };
+    (plan, partial)
+}
+
+fn run_split(
+    s: Shape,
+    tile: u32,
+    gpu: &Arc<blade_graphics::Context>,
+    policy: CoopPolicy,
+    tune: bool,
+    splits: u32,
+) -> (Session, Vec<String>) {
+    let [nx, nw, ny] = s.sizes();
+    let (plan, partial) = plan(s, tile, splits);
+    let mut session = Session::with_context_opts(
+        plan,
+        Arc::clone(gpu),
+        SessionOptions {
+            coop: policy,
+            no_alias: true, // Keep forward output available for the independent full oracle.
+            ..Default::default()
+        },
+    );
+    let cooperative = policy != CoopPolicy::Disabled;
+    let half_inputs = cooperative && gpu.capabilities().cooperative_matrix.f32_tile == 0;
+    if cooperative {
+        assert!(
+            session
+                .plan()
+                .dispatches
+                .iter()
+                .any(|d| d.use_coop
+                    && matches!(d.shader, ShaderEntry::Conv2dGradInputGemmCoopGen(..))),
+            "generated dX kernel must actually execute"
+        );
+    }
+    let values = |n, seed, scale| {
+        let mut values = data(n, seed, scale);
+        if half_inputs {
+            for value in &mut values {
+                *value = half::f16::from_f32(*value).to_f32();
+            }
+        }
+        values
+    };
+    let x = values(nx, 7, 1.0);
+    let w = values(nw, 19, 1.0);
+    session.set_parameter("x", &x);
+    session.set_parameter("w", &w);
+    let mut searched = false;
+    let mut rejected = Vec::new();
+    for scale in [1.0, 1e-12] {
+        if half_inputs && scale < 1.0 {
+            continue;
+        }
+        let dy = values(ny, 37, scale);
+        session.set_input("dy", &dy);
+        session.step();
+        session.wait();
+        if tune && !searched {
+            let state = |s: &Session| {
+                let mut values = vec![s.adam_step_count()];
+                for (i, bytes) in s.plan().buffers.iter().enumerate() {
+                    let mut data = vec![0.0; bytes / 4];
+                    s.read_buffer(meganeura::compile::BufferRef(i as u32), &mut data);
+                    values.extend(data.into_iter().map(f32::to_bits));
+                }
+                values
+            };
+            let before = state(&session);
+            let keys = session.dispatch_pipeline_keys();
+            for mut options in [
+                meganeura::TuneOptions {
+                    max_scratch_bytes: 0,
+                    ..Default::default()
+                },
+                meganeura::TuneOptions {
+                    max_time: std::time::Duration::ZERO,
+                    ..Default::default()
+                },
+            ] {
+                options.scope = meganeura::TuneScope::ConvDerivatives;
+                let report = session.tune_with(options).unwrap();
+                assert_eq!(report.eligible_classes, 2, "{s:?}");
+                assert_eq!(session.dispatch_pipeline_keys(), keys);
+                assert_eq!(state(&session), before);
+                assert_eq!(report.scratch.unwrap().retained_staging_bytes, 0);
+            }
+            let report = session
+                .tune_with(meganeura::TuneOptions {
+                    scope: meganeura::TuneScope::ConvDerivatives,
+                    max_time: std::time::Duration::from_secs(60),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(report.outcomes.len(), 2, "{s:?}: {report:?}");
+            assert!(
+                report.outcomes.iter().all(|o| o.qualified
+                    && o.class.conv2d.is_some()
+                    && matches!(
+                        o.decision,
+                        meganeura::TuneDecision::KeepBaseline
+                            | meganeura::TuneDecision::FasterCandidate
+                    )),
+                "{report:?}"
+            );
+            assert_eq!(report.scratch.unwrap().retained_staging_bytes, 0);
+            assert_eq!(state(&session), before);
+            session.step();
+            session.wait();
+            searched = true;
+        }
+        let (output, dx, dw) = reference(s, &x, &w, &dy);
+        if let Some(buffer) = partial {
+            let mut actual = vec![f32::NAN; nw * splits as usize];
+            session.read_buffer(buffer, &mut actual);
+            let (oh, ow) = s.output();
+            let spatial = oh * ow;
+            let tiles = (s.batch * spatial).div_ceil(16);
+            for split in 0..splits {
+                let first = split * (tiles / splits) + split.min(tiles % splits);
+                let last = first + tiles / splits + u32::from(split < tiles % splits);
+                let mut masked = dy.clone();
+                for n in 0..s.batch {
+                    for co in 0..s.co {
+                        for hw in 0..spatial {
+                            if !(first * 16..last * 16).contains(&(n * spatial + hw)) {
+                                masked[((n * s.co + co) * spatial + hw) as usize] = 0.0;
+                            }
+                        }
+                    }
+                }
+                let expected = reference(s, &x, &w, &masked).2;
+                let offset = split as usize * nw;
+                if let Err(error) = qualification(
+                    &format!("{s:?}, tile={tile}, scale={scale:e}, partial {split}/{splits}"),
+                    &actual[offset..offset + nw],
+                    &expected,
+                    scale,
+                ) {
+                    rejected.push(error);
+                }
+            }
+        }
+        let forward = session
+            .plan()
+            .dispatches
+            .iter()
+            .find(|d| {
+                matches!(
+                    d.shader,
+                    ShaderEntry::Conv2dGemm
+                        | ShaderEntry::Conv2dGemmSmall
+                        | ShaderEntry::Conv2dGemmCoopGen(..)
+                )
+            })
+            .unwrap();
+        assert_eq!(forward.workgroups[2], s.batch);
+        let mut actual = vec![f32::NAN; ny];
+        session.read_buffer(forward.output_buffer, &mut actual);
+        check(&format!("{s:?}, forward"), &actual, &output, 1.0);
+        for (name, expected) in [("x", dx), ("w", dw)] {
+            let mut actual = vec![f32::NAN; expected.len()];
+            session.read_param_grad(name, &mut actual);
+            check(
+                &format!("{s:?}, tile={tile}, d{name}, scale={scale:e}"),
+                &actual,
+                &expected,
+                scale,
+            );
+        }
+    }
+    (session, rejected)
+}
+
+#[test]
+fn split_weight_gradients_and_every_partial_match_full_f64_oracles() {
+    let gpu = Arc::new(meganeura::init_gpu_context().unwrap());
+    for (batch, ci, h, w, co, kh, kw, stride, ph, pw) in [
+        (3, 5, 7, 9, 7, 2, 3, 1, 1, 0),
+        (2, 17, 9, 11, 19, 3, 3, 2, 0, 1),
+        (2, 65, 5, 13, 33, 2, 2, 1, 1, 0),
+        (2, 3, 1, 41, 5, 1, 1, 1, 0, 0),
+    ] {
+        let s = Shape {
+            batch,
+            ci,
+            h,
+            w,
+            co,
+            kh,
+            kw,
+            stride,
+            ph,
+            pw,
+        };
+        let (oh, ow) = s.output();
+        for tile in [32, 64] {
+            run(s, tile, &gpu, CoopPolicy::Disabled, false);
+            for splits in [2, 3, 7, 16]
+                .into_iter()
+                .filter(|&count| count <= (batch * oh * ow).div_ceil(16))
+            {
+                let (_, rejected) = run_split(s, tile, &gpu, CoopPolicy::Disabled, false, splits);
+                assert!(rejected.is_empty(), "{rejected:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn long_split_weight_gradients_report_partial_rejections_without_relaxing_the_gate() {
+    let gpu = Arc::new(meganeura::init_gpu_context().unwrap());
+    let s = Shape {
+        batch: 2,
+        ci: 3,
+        h: 1,
+        w: 32771,
+        co: 5,
+        kh: 1,
+        kw: 1,
+        stride: 1,
+        ph: 0,
+        pw: 0,
+    };
+    for tile in [32, 64] {
+        run(s, tile, &gpu, CoopPolicy::Disabled, false);
+        let mut qualified = 0;
+        for splits in [2, 3, 7, 16] {
+            let (_, rejected) = run_split(s, tile, &gpu, CoopPolicy::Disabled, false, splits);
+            qualified += usize::from(rejected.is_empty());
+            eprintln!(
+                "long split-K tile={tile}, splits={splits}, qualified={}, rejections={rejected:?}",
+                rejected.is_empty()
+            );
+        }
+        assert!(
+            qualified > 0,
+            "no fully qualified partition count for tile {tile}"
+        );
+    }
+}
+
+#[test]
+fn observed_tiny_partial_error_is_rejected_by_the_original_gate() {
+    assert!(
+        qualification(
+            "observed partial",
+            &[-8.967522e-14],
+            &[-8.963817608922598e-14],
+            1e-12
+        )
+        .is_err()
+    );
+    for (actual, expected, scale) in [
+        (f32::NAN, 1.0, 1.0),
+        (1.0, f64::INFINITY, 1.0),
+        (1.0, 1.0, f32::NAN),
+        (0.0, 0.0, 1.0),
+        (0.0, 1e-12, 1e-12),
+    ] {
+        assert!(qualification("gate", &[actual], &[expected], scale).is_err());
+    }
+}
+
+fn qualification_inputs(n: usize, operand: u32, pattern: usize, scale: f32) -> Vec<f32> {
+    match pattern {
+        0 => (0..n)
+            .map(|index| {
+                let mut bits =
+                    (index as u32).wrapping_add(0x9e37_79b9u32.wrapping_mul(operand + 1));
+                bits ^= bits >> 16;
+                bits = bits.wrapping_mul(0x85eb_ca6b);
+                bits ^= bits >> 13;
+                ((bits >> 8) as f32 / 16_777_216.0 - 0.5) * scale
+            })
+            .collect(),
+        1 => data(n, if operand == 0 { 37 } else { 7 }, scale),
+        2 => (0..n)
+            .map(|i| {
+                let magnitude = 0.25 + (i % 29) as f32 / 1024.0;
+                let sign = if operand == 0 && i % 2 == 0 {
+                    -1.0
+                } else {
+                    1.0
+                };
+                sign * magnitude * scale
+            })
+            .collect(),
+        _ => unreachable!(),
+    }
+}
+
+fn weight_partial_reference(s: Shape, x: &[f32], dy: &[f32], splits: u32) -> Vec<f64> {
+    let [_, nw, _] = s.sizes();
+    let (oh, ow) = s.output();
+    let tiles = (s.batch * oh * ow).div_ceil(16);
+    let owners: Vec<_> = (0..splits)
+        .flat_map(|split| {
+            std::iter::repeat_n(
+                split as usize,
+                (tiles / splits + u32::from(split < tiles % splits)) as usize,
+            )
+        })
+        .collect();
+    let mut expected = vec![0.0; nw * splits as usize];
+    for batch in 0..s.batch {
+        for co in 0..s.co {
+            for y in 0..oh {
+                for z in 0..ow {
+                    let yi = (((batch * s.co + co) * oh + y) * ow + z) as usize;
+                    let owner = owners[((batch * oh * ow + y * ow + z) / 16) as usize];
+                    for ci in 0..s.ci {
+                        for ky in 0..s.kh {
+                            for kx in 0..s.kw {
+                                let iy = (y * s.stride + ky) as i32 - s.ph as i32;
+                                let ix = (z * s.stride + kx) as i32 - s.pw as i32;
+                                if iy < 0 || ix < 0 || iy >= s.h as i32 || ix >= s.w as i32 {
+                                    continue;
+                                }
+                                let xi = (((batch * s.ci + ci) * s.h + iy as u32) * s.w + ix as u32)
+                                    as usize;
+                                let wi = (((co * s.ci + ci) * s.kh + ky) * s.kw + kx) as usize;
+                                expected[owner * nw + wi] += f64::from(dy[yi]) * f64::from(x[xi]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    expected
+}
+
+#[test]
+fn weight_partial_scatter_agrees_with_independent_full_reference() {
+    let s = Shape {
+        batch: 3,
+        ci: 5,
+        h: 7,
+        w: 9,
+        co: 7,
+        kh: 2,
+        kw: 3,
+        stride: 1,
+        ph: 1,
+        pw: 0,
+    };
+    let [nx, nw, ny] = s.sizes();
+    let (x, w, dy) = (data(nx, 7, 1.0), data(nw, 19, 1.0), data(ny, 37, 1.0));
+    let expected = reference(s, &x, &w, &dy).2;
+    assert_eq!(weight_partial_reference(s, &x, &dy, 1), expected);
+    for splits in [2, 3, 4, 8] {
+        let partials = weight_partial_reference(s, &x, &dy, splits);
+        for (i, &value) in expected.iter().enumerate() {
+            let total: f64 = partials.chunks(nw).map(|p| p[i]).sum();
+            assert!((total - value).abs() <= 1e-12 * value.abs().max(1.0));
+        }
+    }
+}
+
+#[test]
+fn compensated_tile_rejection_matches_cpu_and_keeps_the_original_gate() {
+    let spatial = 32771;
+    let x = qualification_inputs(2 * 3 * spatial, 1, 2, 1.0);
+    let dy = qualification_inputs(2 * 5 * spatial, 0, 2, 1e-12);
+    let (mut total, mut error) = (0.0f32, 0.0f32);
+    let mut exact = 0.0f64;
+    for start in (0..2 * spatial).step_by(16) {
+        let mut block = 0.0f32;
+        for k in start..(start + 16).min(2 * spatial) {
+            let (batch, offset) = (k / spatial, k % spatial);
+            let a = dy[(batch * 5 + 2) * spatial + offset];
+            let b = x[batch * 3 * spatial + offset];
+            block = a.mul_add(b, block);
+            exact += f64::from(a) * f64::from(b);
+        }
+        let corrected = block - error;
+        let next = total + corrected;
+        error = (next - total) - corrected;
+        total = next;
+    }
+    let observed = 1.9869085e-15f32;
+    assert_eq!(total.to_bits(), observed.to_bits());
+    assert_eq!(exact, 1.9731522921401375e-15);
+    assert!(
+        qualification(
+            "retained compensated final[6]",
+            &[observed],
+            &[exact],
+            1e-12
+        )
+        .is_err()
+    );
+}
+
+#[test]
+#[ignore = "Full GPU/f64 accuracy experiment; reports all rejections without timing"]
+fn report_bounded_weight_accumulation_qualification() {
+    #[path = "../examples/support/experiment_io.rs"]
+    #[allow(dead_code)]
+    mod experiment_io;
+    use experiment_io::{command, sha256};
+    use serde_json::json;
+
+    let mut output = std::env::var_os("MEGANEURA_ACCUMULATION_RECORD").map(|path| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .unwrap()
+    });
+    let gpu = Arc::new(meganeura::init_gpu_context().unwrap());
+    let info = gpu.device_information();
+    let mut record = json!({
+        "protocol": "bounded-dw-accuracy-v1", "revision": command("git", &["rev-parse", "HEAD"]).unwrap(),
+        "tracked_source_clean": command("git", &["status", "--porcelain", "--untracked-files=no"]).unwrap().is_empty(),
+        "executable_sha256": sha256(&std::env::current_exe().unwrap()).unwrap(),
+        "cargo_lock_sha256": sha256(std::path::Path::new("Cargo.lock")).unwrap(),
+        "device": info.device_name, "driver": info.driver_info, "rows": []
+    });
+    for shape in [
+        [1, 3, 224, 224, 64, 7, 7, 2, 3, 3],
+        [1, 256, 56, 56, 64, 1, 1, 1, 0, 0],
+        [3, 5, 7, 9, 7, 2, 3, 1, 1, 0],
+        [2, 3, 1, 32771, 5, 1, 1, 1, 0, 0],
+    ] {
+        let [batch, ci, h, w, co, kh, kw, stride, ph, pw] = shape;
+        let s = Shape {
+            batch,
+            ci,
+            h,
+            w,
+            co,
+            kh,
+            kw,
+            stride,
+            ph,
+            pw,
+        };
+        let [nx, nw, ny] = s.sizes();
+        let mut sessions = Vec::new();
+        for splits in [1, 2, 3, 4, 8] {
+            for tile in [32, 64] {
+                let (plan, partial) = plan(s, tile, splits);
+                let mut session = Session::with_context_opts(
+                    plan,
+                    Arc::clone(&gpu),
+                    SessionOptions {
+                        coop: CoopPolicy::Disabled,
+                        no_alias: true,
+                        ..Default::default()
+                    },
+                );
+                session.set_parameter("w", &data(nw, 19, 1.0));
+                sessions.push((splits, tile, partial, session));
+            }
+        }
+        for pattern in 0..3 {
+            let x = qualification_inputs(nx, 1, pattern, 1.0);
+            for scale in [1.0, 1e-12] {
+                let dy = qualification_inputs(ny, 0, pattern, scale);
+                let expected = weight_partial_reference(s, &x, &dy, 1);
+                for pair in sessions.chunks_mut(2) {
+                    let splits = pair[0].0;
+                    let partials = if splits == 1 {
+                        Vec::new()
+                    } else {
+                        weight_partial_reference(s, &x, &dy, splits)
+                    };
+                    for (splits, tile, partial, session) in pair {
+                        session.set_parameter("x", &x);
+                        session.set_input("dy", &dy);
+                        session.step();
+                        session.wait();
+                        let mut dw = vec![f32::NAN; nw];
+                        session.read_param_grad("w", &mut dw);
+                        let mut errors = Vec::new();
+                        if let Err(error) = qualification("final", &dw, &expected, scale) {
+                            errors.push(error);
+                        }
+                        if let Some(buffer) = partial {
+                            let mut actual = vec![f32::NAN; partials.len()];
+                            session.read_buffer(*buffer, &mut actual);
+                            for (index, (a, b)) in
+                                actual.chunks(nw).zip(partials.chunks(nw)).enumerate()
+                            {
+                                if let Err(error) =
+                                    qualification(&format!("partial {index}/{splits}"), a, b, scale)
+                                {
+                                    errors.push(error);
+                                }
+                            }
+                        }
+                        eprintln!(
+                            "shape={shape:?}, pattern={pattern}, scale={scale:e}, tile={tile}, splits={splits}: {errors:?}"
+                        );
+                        record["rows"].as_array_mut().unwrap().push(json!({
+                            "shape": shape, "pattern": pattern, "scale": scale, "tile": tile, "splits": splits,
+                            "final_elements": nw, "partial_elements": partials.len(), "qualified": errors.is_empty(), "errors": errors
+                        }));
+                        if let Some(file) = output.as_mut() {
+                            experiment_io::write_record(file, &record).unwrap();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let rows = record["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 240);
+    let qualified = rows.iter().filter(|r| r["qualified"] == true).count();
+    eprintln!(
+        "Qualified {qualified}/240; this reporting test does not turn rejection into qualification"
+    );
+    record["qualified"] = json!(qualified);
+    record["status"] = json!(if qualified == 240 {
+        "qualified"
+    } else {
+        "rejected"
+    });
+    if let Some(file) = output.as_mut() {
+        experiment_io::write_record(file, &record).unwrap();
+    }
+}
+
+fn training_state(session: &Session) -> Vec<(String, Vec<f32>)> {
+    let loss = session.plan().loss_buffer.unwrap();
+    let mut partials = vec![f32::NAN; session.plan().buffers[loss.0 as usize] / 4];
+    session.read_buffer(loss, &mut partials);
+    let mut state = vec![
+        ("loss".into(), vec![session.read_loss()]),
+        ("loss_partials".into(), partials),
+    ];
+    for name in ["x", "w"] {
+        let n = session.param_size(name).unwrap();
+        let mut parameter = vec![f32::NAN; n];
+        let mut gradient = vec![f32::NAN; n];
+        session.read_param(name, &mut parameter);
+        session.read_param_grad(name, &mut gradient);
+        state.push((format!("parameter.{name}"), parameter));
+        state.push((format!("gradient.{name}"), gradient));
+        if session.memory_summary().adam_state_bytes != 0 {
+            let mut m = vec![f32::NAN; n];
+            let mut v = vec![f32::NAN; n];
+            session.read_adam_m(name, &mut m);
+            session.read_adam_v(name, &mut v);
+            state.push((format!("adam_m.{name}"), m));
+            state.push((format!("adam_v.{name}"), v));
+        }
+    }
+    state
+}
+
+#[test]
+fn split_weight_gradients_preserve_optimizer_updates_with_and_without_aliasing() {
+    optimizer_updates(false, 32);
+}
+
+#[test]
+#[ignore = "GPU isolated sequence qualification/timing; requires idle device"]
+fn split_sequence_measurement_preserves_state_budgets_and_subsequent_updates() {
+    for tile in [32, 64] {
+        optimizer_updates(true, tile);
+    }
+}
+
+fn optimizer_updates(measure: bool, tile: u32) {
+    let gpu = Arc::new(meganeura::init_gpu_context().unwrap());
+    let s = Shape {
+        batch: 3,
+        ci: 5,
+        h: 7,
+        w: 9,
+        co: 7,
+        kh: 2,
+        kw: 3,
+        stride: 1,
+        ph: 1,
+        pw: 0,
+    };
+    let [nx, nw, ny] = s.sizes();
+    for adam in [false, true] {
+        let mut sessions: Vec<_> = [(1, true), (3, true), (3, false)]
+            .into_iter()
+            .map(|(splits, no_alias)| {
+                let mut session = Session::with_context_opts(
+                    plan(s, tile, splits).0,
+                    Arc::clone(&gpu),
+                    SessionOptions {
+                        coop: CoopPolicy::Disabled,
+                        no_alias,
+                        ..Default::default()
+                    },
+                );
+                session.set_parameter("x", &data(nx, 7, 1.0));
+                session.set_parameter("w", &data(nw, 19, 1.0));
+                if adam {
+                    session.set_adam(1e-4, 0.9, 0.999, 1e-8);
+                } else {
+                    session.set_learning_rate(1e-3);
+                }
+                session.set_grad_clip_norm(1.0);
+                session
+            })
+            .collect();
+        for step in 1..=4 {
+            for session in &mut sessions {
+                session.set_input("dy", &data(ny, 37 + step, 1.0));
+                session.step();
+                session.wait();
+                assert_eq!(session.adam_step_count(), if adam { step } else { 0 });
+                assert_eq!(
+                    session.memory_summary().adam_state_bytes,
+                    if adam { (nx + nw) * 8 } else { 0 }
+                );
+                for (name, n, seed) in [("x", nx, 7), ("w", nw, 19)] {
+                    let mut actual = vec![f32::NAN; n];
+                    session.read_param(name, &mut actual);
+                    assert_ne!(actual, data(n, seed, 1.0), "{name} must update");
+                }
+            }
+            let control = training_state(&sessions[0]);
+            if measure && step == 2 {
+                let session = &mut sessions[0];
+                let index = session
+                    .plan()
+                    .dispatches
+                    .iter()
+                    .position(|d| {
+                        matches!(
+                            d.shader,
+                            ShaderEntry::Conv2dGradWeightGemm
+                                | ShaderEntry::Conv2dGradWeightGemmSmall
+                        )
+                    })
+                    .unwrap();
+                let keys = session.dispatch_pipeline_keys();
+                let bytes = session.memory_summary().total_allocated_bytes();
+                for counts in [
+                    vec![],
+                    vec![1],
+                    vec![2, 2],
+                    vec![2, 3, 4, 7, 8],
+                    vec![2, u32::MAX],
+                ] {
+                    assert!(
+                        session
+                            .measure_conv_weight_splits(index, &counts, Default::default())
+                            .is_err()
+                    );
+                }
+                for options in [
+                    meganeura::TuneOptions {
+                        max_time: std::time::Duration::ZERO,
+                        ..Default::default()
+                    },
+                    meganeura::TuneOptions {
+                        max_classes: 0,
+                        ..Default::default()
+                    },
+                    meganeura::TuneOptions {
+                        max_scratch_bytes: 0,
+                        ..Default::default()
+                    },
+                    meganeura::TuneOptions {
+                        max_scratch_bytes: (ny + nx + nw + 2 * nw) * 4 + ny.max(nx).max(2 * nw) * 4
+                            - 1,
+                        ..Default::default()
+                    },
+                ] {
+                    let report = session
+                        .measure_conv_weight_splits(index, &[2, 3], options)
+                        .unwrap();
+                    assert!(
+                        report
+                            .outcomes
+                            .iter()
+                            .all(|o| o.decision == meganeura::TuneDecision::ScratchLimit)
+                    );
+                    assert_eq!(report.scratch.unwrap().peak_bytes, 0);
+                }
+                let report = session
+                    .measure_conv_weight_splits(
+                        index,
+                        &[2, 3, 7, 8],
+                        meganeura::TuneOptions {
+                            max_time: std::time::Duration::from_secs(60),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(report.outcomes.len(), 4);
+                for (outcome, splits) in report.outcomes.iter().zip([2, 3, 7, 8]) {
+                    assert!(outcome.qualified, "{outcome:?}");
+                    assert_eq!(outcome.candidate_split_k, Some(splits));
+                    assert_eq!(outcome.initial, outcome.candidate);
+                    assert_eq!(outcome.selected, outcome.initial);
+                    assert_eq!(outcome.baseline_ms.len(), 6);
+                    assert_eq!(outcome.candidate_ms.len(), 6);
+                    let scratch = outcome.scratch.as_ref().unwrap();
+                    assert_eq!(
+                        scratch.binding_bytes,
+                        [ny * 4, nx * 4, nw * 4, nw * splits as usize * 4]
+                    );
+                    assert_eq!(
+                        scratch.staging_bytes,
+                        *scratch.binding_bytes.iter().max().unwrap()
+                    );
+                }
+                let scratch = report.scratch.unwrap();
+                assert_eq!(scratch.staging_allocations, scratch.staging_releases);
+                assert_eq!(scratch.retained_staging_bytes, 0);
+                assert_eq!(scratch.staging_allocations, 3);
+                assert_eq!(scratch.staging_reuses, 1);
+                assert_eq!(
+                    scratch.peak_bytes,
+                    (ny + nx + nw + 8 * nw) * 4 + (8 * nw * 4).max(ny * 4).max(nx * 4)
+                );
+                assert_eq!(session.dispatch_pipeline_keys(), keys);
+                assert_eq!(session.memory_summary().total_allocated_bytes(), bytes);
+                assert_eq!(training_state(session), control);
+                assert_eq!(session.adam_step_count(), if adam { step } else { 0 });
+            }
+            for session in &mut sessions[1..] {
+                let before = training_state(session);
+                assert_eq!(before.len(), control.len());
+                for ((name, actual), (other, expected)) in before.iter().zip(&control) {
+                    assert_eq!(name, other);
+                    check(
+                        &format!("Adam={adam}, step={step}, {name}"),
+                        actual,
+                        &expected.iter().copied().map(f64::from).collect::<Vec<_>>(),
+                        1.0,
+                    );
+                }
+                let keys = session.dispatch_pipeline_keys();
+                let report = session
+                    .tune_with(meganeura::TuneOptions {
+                        scope: meganeura::TuneScope::ConvDerivatives,
+                        max_time: std::time::Duration::ZERO,
+                        ..Default::default()
+                    })
+                    .unwrap();
+                assert_eq!(
+                    report.eligible_classes, 1,
+                    "only unsplit dX is tile-tunable"
+                );
+                assert_eq!(session.dispatch_pipeline_keys(), keys);
+                assert_eq!(training_state(session), before);
+            }
+            let keys: Vec<_> = sessions
+                .iter()
+                .map(Session::dispatch_pipeline_keys)
+                .collect();
+            let before: Vec<_> = sessions.iter().map(training_state).collect();
+            let (control, split) = sessions.split_at_mut(1);
+            for session in split {
+                assert!(control[0].swap_tuning_with(session).is_err());
+            }
+            for (i, session) in sessions.iter().enumerate() {
+                assert_eq!(session.dispatch_pipeline_keys(), keys[i]);
+                assert_eq!(training_state(session), before[i]);
+                assert_eq!(session.adam_step_count(), if adam { step } else { 0 });
+            }
+        }
+        assert!(
+            sessions[2].memory_summary().allocated_buffer_bytes
+                < sessions[1].memory_summary().allocated_buffer_bytes
+        );
+    }
+}
+
+#[test]
+fn scalar_conv_derivatives_match_full_oracle_across_padding_stride_and_tile_edges() {
+    scalar_oracles(false);
+}
+
+#[test]
+fn scalar_conv_indexing_matches_full_oracle_at_reciprocal_boundaries() {
+    reciprocal_boundary_oracles(false);
+}
+
+#[test]
+#[ignore = "GPU scalar convolution tuning qualification; requires idle device"]
+fn tuned_conv_indexing_matches_full_oracle_at_reciprocal_boundaries() {
+    reciprocal_boundary_oracles(true);
+}
+
+fn reciprocal_boundary_oracles(tune: bool) {
+    let gpu = Arc::new(meganeura::init_gpu_context().unwrap());
+    for divisor in [41, 47, 55] {
+        // Old f32 reciprocal multiplication maps divisor/divisor to zero.
+        // Cover spatial/batch boundaries, then kernel/channel decomposition.
+        for (h, w, kh, kw, ph, pw) in [
+            (1, divisor, 1, 1, 0, 0),
+            (3, divisor + 6, 2, divisor, 1, divisor / 2),
+        ] {
+            for tile in [32, 64] {
+                run(
+                    Shape {
+                        batch: 2,
+                        ci: 3,
+                        h,
+                        w,
+                        co: 5,
+                        kh,
+                        kw,
+                        stride: 1,
+                        ph,
+                        pw,
+                    },
+                    tile,
+                    &gpu,
+                    CoopPolicy::Disabled,
+                    tune,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "GPU scalar convolution tuning qualification; requires idle device"]
+fn tuned_conv_derivatives_match_full_oracle_and_preserve_state_and_budgets() {
+    scalar_oracles(true);
+}
+
+fn scalar_oracles(tune: bool) {
+    let gpu = Arc::new(meganeura::init_gpu_context().unwrap());
+    for (batch, ci, h, w, co, kh, kw, stride, ph, pw) in [
+        (2, 3, 5, 7, 5, 3, 3, 1, 0, 0),
+        (2, 3, 7, 9, 5, 2, 4, 1, 0, 1),
+        (2, 5, 5, 9, 7, 3, 2, 1, 2, 0),
+        (2, 3, 7, 9, 5, 3, 2, 2, 0, 1),
+        (1, 17, 9, 11, 19, 3, 3, 1, 1, 1),
+        (2, 65, 5, 13, 33, 2, 2, 1, 1, 0),
+        (3, 5, 7, 9, 3, 1, 1, 1, 0, 0),
+        (2, 3, 9, 7, 5, 1, 3, 2, 0, 1),
+    ] {
+        for tile in [32, 64] {
+            run(
+                Shape {
+                    batch,
+                    ci,
+                    h,
+                    w,
+                    co,
+                    kh,
+                    kw,
+                    stride,
+                    ph,
+                    pw,
+                },
+                tile,
+                &gpu,
+                CoopPolicy::Disabled,
+                tune,
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "Requires cooperative hardware; verifies actual generated dX execution"]
+fn generated_conv_derivatives_match_oracle_without_assuming_same_padding() {
+    let gpu = Arc::new(meganeura::init_gpu_context().unwrap());
+    let policy = cooperative_policy(&gpu);
+    for (kh, kw, stride, ph, pw) in [(3, 3, 1, 0, 0), (2, 4, 1, 0, 1), (3, 2, 2, 0, 1)] {
+        run(
+            Shape {
+                batch: 2,
+                ci: 64,
+                h: 8,
+                w: 16,
+                co: 5,
+                kh,
+                kw,
+                stride,
+                ph,
+                pw,
+            },
+            64,
+            &gpu,
+            policy,
+            false,
+        );
+    }
+}
+
+fn cooperative_policy(gpu: &blade_graphics::Context) -> CoopPolicy {
+    assert!(gpu.capabilities().cooperative_matrix.is_supported());
+    if gpu.capabilities().cooperative_matrix.f32_tile > 0 {
+        CoopPolicy::Auto
+    } else {
+        // Exactly representable bounded operands isolate indexing on f16-only
+        // hardware. This is not qualification of tiny f32 derivatives on f16.
+        CoopPolicy::AllowF16
+    }
+}
+
+#[test]
+#[ignore = "Requires cooperative hardware; verifies generated dX and admitted forward execution"]
+fn generated_conv_indexing_matches_full_oracle_at_reciprocal_boundaries() {
+    let gpu = Arc::new(meganeura::init_gpu_context().unwrap());
+    let policy = cooperative_policy(&gpu);
+    for width in [41, 47, 55] {
+        let session = run(
+            Shape {
+                batch: 2,
+                ci: 64,
+                h: 16,
+                w: width,
+                co: 128,
+                kh: 1,
+                kw: 1,
+                stride: 1,
+                ph: 0,
+                pw: 0,
+            },
+            64,
+            &gpu,
+            policy,
+            false,
+        );
+        // The native tile-8 policy deliberately keeps forward convolution scalar.
+        if gpu.capabilities().cooperative_matrix.f32_tile != 8 {
+            assert!(
+                session
+                    .plan()
+                    .dispatches
+                    .iter()
+                    .any(|d| d.use_coop && matches!(d.shader, ShaderEntry::Conv2dGemmCoopGen(..)))
+            );
+        }
+    }
+}

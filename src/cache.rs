@@ -9,7 +9,7 @@ use std::{io, path::Path};
 
 /// Increment whenever the serialized execution plan or build pipeline changes
 /// in a way that can make an older plan unsafe to reuse.
-const CACHE_FORMAT_VERSION: u32 = 4;
+const CACHE_FORMAT_VERSION: u32 = 5;
 
 /// Cached execution plan with a graph fingerprint for invalidation.
 #[derive(Serialize, Deserialize)]
@@ -207,6 +207,7 @@ mod tests {
         let loaded = loaded.unwrap();
         assert_eq!(loaded.buffers.len(), plan.buffers.len());
         assert_eq!(loaded.dispatches.len(), plan.dispatches.len());
+        assert_eq!(loaded.param_types, plan.param_types);
 
         // Load with different graph — should invalidate
         let mut g2 = Graph::new();
@@ -228,6 +229,26 @@ mod tests {
         let path = std::env::temp_dir().join("meganeura_nonexistent_cache.ron");
         let result = load_plan(&g, &path).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn cache_without_logical_parameter_types_is_invalidated() {
+        let mut graph = Graph::new();
+        let p = graph.parameter("p", &[2, 3]);
+        graph.set_outputs(vec![p]);
+        let mut plan = compile::compile(&graph);
+        plan.param_types.clear();
+        let legacy = CachedPlan {
+            format_version: 4,
+            graph_hash: hash_graph(&graph),
+            build_hash: 0,
+            plan,
+        };
+        let path =
+            std::env::temp_dir().join(format!("meganeura-cache-v4-{}.ron", std::process::id()));
+        std::fs::write(&path, ron::ser::to_string(&legacy).unwrap()).unwrap();
+        assert!(load_plan(&graph, &path).unwrap().is_none());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
