@@ -486,6 +486,18 @@ fn training_state(session: &Session) -> Vec<(String, Vec<f32>)> {
 
 #[test]
 fn split_weight_gradients_preserve_optimizer_updates_with_and_without_aliasing() {
+    optimizer_updates(false, 32);
+}
+
+#[test]
+#[ignore = "GPU isolated sequence qualification/timing; requires idle device"]
+fn split_sequence_measurement_preserves_state_budgets_and_subsequent_updates() {
+    for tile in [32, 64] {
+        optimizer_updates(true, tile);
+    }
+}
+
+fn optimizer_updates(measure: bool, tile: u32) {
     let gpu = Arc::new(meganeura::init_gpu_context().unwrap());
     let s = Shape {
         batch: 3,
@@ -505,7 +517,7 @@ fn split_weight_gradients_preserve_optimizer_updates_with_and_without_aliasing()
             .into_iter()
             .map(|(splits, no_alias)| {
                 let mut session = Session::with_context_opts(
-                    plan(s, 32, splits).0,
+                    plan(s, tile, splits).0,
                     Arc::clone(&gpu),
                     SessionOptions {
                         coop: CoopPolicy::Disabled,
@@ -541,6 +553,107 @@ fn split_weight_gradients_preserve_optimizer_updates_with_and_without_aliasing()
                 }
             }
             let control = training_state(&sessions[0]);
+            if measure && step == 2 {
+                let session = &mut sessions[0];
+                let index = session
+                    .plan()
+                    .dispatches
+                    .iter()
+                    .position(|d| {
+                        matches!(
+                            d.shader,
+                            ShaderEntry::Conv2dGradWeightGemm
+                                | ShaderEntry::Conv2dGradWeightGemmSmall
+                        )
+                    })
+                    .unwrap();
+                let keys = session.dispatch_pipeline_keys();
+                let bytes = session.memory_summary().total_allocated_bytes();
+                for counts in [
+                    vec![],
+                    vec![1],
+                    vec![2, 2],
+                    vec![2, 3, 4, 7, 8],
+                    vec![2, u32::MAX],
+                ] {
+                    assert!(
+                        session
+                            .measure_conv_weight_splits(index, &counts, Default::default())
+                            .is_err()
+                    );
+                }
+                for options in [
+                    meganeura::TuneOptions {
+                        max_time: std::time::Duration::ZERO,
+                        ..Default::default()
+                    },
+                    meganeura::TuneOptions {
+                        max_classes: 0,
+                        ..Default::default()
+                    },
+                    meganeura::TuneOptions {
+                        max_scratch_bytes: 0,
+                        ..Default::default()
+                    },
+                    meganeura::TuneOptions {
+                        max_scratch_bytes: (ny + nx + nw + 2 * nw) * 4 + ny.max(nx).max(2 * nw) * 4
+                            - 1,
+                        ..Default::default()
+                    },
+                ] {
+                    let report = session
+                        .measure_conv_weight_splits(index, &[2, 3], options)
+                        .unwrap();
+                    assert!(
+                        report
+                            .outcomes
+                            .iter()
+                            .all(|o| o.decision == meganeura::TuneDecision::ScratchLimit)
+                    );
+                    assert_eq!(report.scratch.unwrap().peak_bytes, 0);
+                }
+                let report = session
+                    .measure_conv_weight_splits(
+                        index,
+                        &[2, 3, 7, 8],
+                        meganeura::TuneOptions {
+                            max_time: std::time::Duration::from_secs(60),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(report.outcomes.len(), 4);
+                for (outcome, splits) in report.outcomes.iter().zip([2, 3, 7, 8]) {
+                    assert!(outcome.qualified, "{outcome:?}");
+                    assert_eq!(outcome.candidate_split_k, Some(splits));
+                    assert_eq!(outcome.initial, outcome.candidate);
+                    assert_eq!(outcome.selected, outcome.initial);
+                    assert_eq!(outcome.baseline_ms.len(), 6);
+                    assert_eq!(outcome.candidate_ms.len(), 6);
+                    let scratch = outcome.scratch.as_ref().unwrap();
+                    assert_eq!(
+                        scratch.binding_bytes,
+                        [ny * 4, nx * 4, nw * 4, nw * splits as usize * 4]
+                    );
+                    assert_eq!(
+                        scratch.staging_bytes,
+                        *scratch.binding_bytes.iter().max().unwrap()
+                    );
+                }
+                let scratch = report.scratch.unwrap();
+                assert_eq!(scratch.staging_allocations, scratch.staging_releases);
+                assert_eq!(scratch.retained_staging_bytes, 0);
+                assert_eq!(scratch.staging_allocations, 3);
+                assert_eq!(scratch.staging_reuses, 1);
+                assert_eq!(
+                    scratch.peak_bytes,
+                    (ny + nx + nw + 8 * nw) * 4 + (8 * nw * 4).max(ny * 4).max(nx * 4)
+                );
+                assert_eq!(session.dispatch_pipeline_keys(), keys);
+                assert_eq!(session.memory_summary().total_allocated_bytes(), bytes);
+                assert_eq!(training_state(session), control);
+                assert_eq!(session.adam_step_count(), if adam { step } else { 0 });
+            }
             for session in &mut sessions[1..] {
                 let before = training_state(session);
                 assert_eq!(before.len(), control.len());

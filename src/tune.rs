@@ -4,6 +4,7 @@
 //! tiles for unpacked dense matmuls, and scalar convolution derivatives,
 //! with no precision or binding-layout changes.
 //! Measurements use synthetic, private scratch, not a live training step.
+//! Explicit split-K probes measure complete sequences without installing them.
 
 use crate::codegen::CoopConfig;
 use crate::compile::{Dispatch, ShaderEntry};
@@ -483,7 +484,8 @@ pub struct TuneOptions {
     pub warmup_runs: u32,
     /// Complete, alternating baseline/candidate pairs required for a decision.
     pub sample_pairs: usize,
-    /// Separate, barrier-delimited dispatches in each timed submission.
+    /// Separate, barrier-delimited dispatches in each timed submission;
+    /// complete sequences for explicit split-K measurements.
     pub dispatches_per_sample: u32,
     /// Required fractional improvement, in addition to a noise margin.
     pub min_improvement: f64,
@@ -616,8 +618,8 @@ pub struct TuneQualificationTimes {
 }
 
 /// Evidence for one candidate comparison within an exact class. Times are
-/// batched scratch wall times per dispatch, not GPU timestamps or predicted
-/// whole-step latency.
+/// batched scratch wall times per dispatch (per complete sequence when
+/// `candidate_split_k` is present), not GPU timestamps or whole-step latency.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TuneOutcome {
     pub class: TuneClass,
@@ -625,6 +627,11 @@ pub struct TuneOutcome {
     pub initial: MatmulTile,
     pub candidate: MatmulTile,
     pub selected: MatmulTile,
+    /// Experimental two-pass dW challenger; baseline is unsplit with the same
+    /// tile. Times are per complete sequence. `decision` reports the result;
+    /// no live plan is changed and `selected` still describes only the tile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_split_k: Option<u32>,
     pub decision: TuneDecision,
     pub qualified: bool,
     /// Shader rejection or the candidate/input pattern that failed qualification.
@@ -646,6 +653,36 @@ pub struct TuneOutcome {
     /// Twice the median absolute deviation of paired time differences.
     /// A conservative selection guard, not a statistical confidence interval.
     pub noise_margin_ms: Option<f64>,
+}
+
+impl TuneOutcome {
+    pub(crate) fn new(
+        class: TuneClass,
+        dispatches: usize,
+        initial: MatmulTile,
+        candidate: MatmulTile,
+    ) -> Self {
+        Self {
+            class,
+            dispatches,
+            initial,
+            candidate,
+            selected: initial,
+            candidate_split_k: None,
+            decision: TuneDecision::KeepBaseline,
+            qualified: false,
+            failure: None,
+            elapsed: Duration::ZERO,
+            compile_time: Duration::ZERO,
+            phase_times: Some(Default::default()),
+            scratch: None,
+            baseline_ms: Vec::new(),
+            candidate_ms: Vec::new(),
+            baseline_median_ms: None,
+            candidate_median_ms: None,
+            noise_margin_ms: None,
+        }
+    }
 }
 
 /// Per-comparison buffer requests, not driver heap sizes or peak VRAM.
@@ -673,7 +710,8 @@ pub struct TuneReport {
     pub options: TuneOptions,
     pub outcomes: Vec<TuneOutcome>,
     pub eligible_classes: usize,
-    /// A class may have up to two challenger comparisons in `outcomes`.
+    /// Live tile search has up to two challengers per class; explicit split-K
+    /// probes accept up to four counts against the same unsplit control.
     pub visited_classes: usize,
     pub excluded_dispatches: usize,
     pub class_limit_reached: bool,
@@ -1026,6 +1064,7 @@ mod tests {
             initial: MatmulTile::Tile32,
             candidate: MatmulTile::Tile64,
             selected: MatmulTile::Tile32,
+            candidate_split_k: None,
             decision: TuneDecision::KeepBaseline,
             qualified: true,
             failure: None,

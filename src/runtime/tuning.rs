@@ -360,25 +360,8 @@ impl Session {
                     report.time_budget_exhausted = true;
                     break;
                 }
-                let mut outcome = TuneOutcome {
-                    class: class.key.clone(),
-                    dispatches: class.members.len(),
-                    initial: incumbent,
-                    candidate,
-                    selected: incumbent,
-                    decision: TuneDecision::KeepBaseline,
-                    qualified: false,
-                    failure: None,
-                    elapsed: std::time::Duration::ZERO,
-                    compile_time: std::time::Duration::ZERO,
-                    phase_times: Some(Default::default()),
-                    scratch: None,
-                    baseline_ms: Vec::new(),
-                    candidate_ms: Vec::new(),
-                    baseline_median_ms: None,
-                    candidate_median_ms: None,
-                    noise_margin_ms: None,
-                };
+                let mut outcome =
+                    TuneOutcome::new(class.key.clone(), class.members.len(), incumbent, candidate);
                 let class_start = Instant::now();
                 self.measure_candidate(class, &options, start, &mut outcome, &mut staging);
                 outcome.elapsed = class_start.elapsed();
@@ -430,6 +413,92 @@ impl Session {
         Ok(report)
     }
 
+    /// Measure up to four explicit split-K counts for one eligible scalar dW
+    /// class, without changing the live plan, allocations or tensor state.
+    /// Every challenger uses the current unsplit tile as its control.
+    ///
+    /// Reuses tile-search deadlines, staging, phase accounting, paired timing
+    /// and decision guards. Partial buffers and the largest upload/readback are
+    /// charged to `max_scratch_bytes`. `dispatches_per_sample` counts complete
+    /// sequences, including the final SumRows and its dependency barrier.
+    /// Full f64 final/partial checks supplement the ordinary finite/parity gates.
+    ///
+    /// Selections must be legal in advance; duplicates and more than four counts
+    /// are errors. `max_classes == 0` skips work; scope must include this class.
+    /// Pipeline preparation may populate the cache. A FasterCandidate result is
+    /// evidence for a rebuilt-plan experiment, not installation or a whole-step
+    /// speed claim. Inspect `candidate_split_k` as well as the tile and decision.
+    pub fn measure_conv_weight_splits(
+        &mut self,
+        dispatch_index: usize,
+        splits: &[u32],
+        options: TuneOptions,
+    ) -> Result<TuneReport, TuneError> {
+        options.validate()?;
+        let start = Instant::now();
+        if splits.is_empty()
+            || splits.len() > 4
+            || splits
+                .iter()
+                .enumerate()
+                .any(|(i, s)| splits[..i].contains(s))
+        {
+            return Err(TuneError("provide one to four distinct split-K counts"));
+        }
+        let class = collect_classes(&self.plan, &self.alias, self.coop_config.as_ref())
+            .0
+            .into_iter()
+            .find(|c| c.members.contains(&dispatch_index))
+            .filter(|c| c.key.shader == ShaderEntry::Conv2dGradWeightGemm)
+            .ok_or(TuneError(
+                "split-K measurement requires an eligible scalar dW class",
+            ))?;
+        if !options.scope.includes(&class.key) {
+            return Err(TuneError(
+                "tuning scope excludes the requested split-K class",
+            ));
+        }
+        for &count in splits {
+            split_dispatches(&self.plan.dispatches[dispatch_index], &class.key, count)?;
+        }
+        let mut report = TuneReport {
+            options: options.clone(),
+            eligible_classes: 1,
+            excluded_dispatches: self.plan.dispatches.len() - class.members.len(),
+            class_limit_reached: options.max_classes == 0,
+            ..Default::default()
+        };
+        let gpu = std::sync::Arc::clone(&self.gpu);
+        let mut staging = Staging::new(&gpu, options.staging, options.staging_reuse);
+        if options.max_classes != 0 {
+            for &count in splits {
+                if start.elapsed() >= options.max_time {
+                    break;
+                }
+                report.visited_classes = 1;
+                let mut outcome = TuneOutcome::new(
+                    class.key.clone(),
+                    class.members.len(),
+                    class.initial,
+                    class.initial,
+                );
+                outcome.candidate_split_k = Some(count);
+                let comparison_start = Instant::now();
+                self.measure_candidate(&class, &options, start, &mut outcome, &mut staging);
+                outcome.elapsed = comparison_start.elapsed();
+                report.outcomes.push(outcome);
+            }
+        }
+        if staging.buffer.is_some() {
+            let _timer = PhaseTimer::new(&mut report.final_cleanup);
+            staging.clear();
+        }
+        report.scratch = Some(staging.stats);
+        report.elapsed = start.elapsed();
+        report.time_budget_exhausted = report.elapsed >= options.max_time;
+        Ok(report)
+    }
+
     fn measure_candidate(
         &mut self,
         class: &SearchClass,
@@ -458,11 +527,24 @@ impl Session {
             .candidate
             .buffer_sizes(&class.key)
             .expect("legal challenger");
-        let sizes: Vec<_> = baseline_sizes
+        let mut sizes: Vec<_> = baseline_sizes
             .into_iter()
             .zip(candidate_sizes)
             .map(|(a, b)| a.max(b))
             .collect();
+        let output_index = sizes.len() - 1;
+        let mut dispatch = self.plan.dispatches[class.members[0]].clone();
+        dispatch.input_buffers = (0..output_index).map(|i| BufferRef(i as u32)).collect();
+        dispatch.output_buffer = BufferRef(output_index as u32);
+        let mut variants = [vec![dispatch.clone()], vec![dispatch]];
+        outcome.initial.apply(&mut variants[0][0], &class.key);
+        outcome.candidate.apply(&mut variants[1][0], &class.key);
+        if let Some(splits) = outcome.candidate_split_k {
+            let (sequence, partial_bytes) = split_dispatches(&variants[1][0], &class.key, splits)
+                .expect("explicit split-K counts were preflighted");
+            variants[1] = sequence;
+            sizes.push(partial_bytes);
+        }
         let Some(bytes) = scratch_bytes(&sizes) else {
             outcome.decision = TuneDecision::ScratchLimit;
             return;
@@ -503,6 +585,25 @@ impl Session {
                 return;
             }
         }
+        if outcome.candidate_split_k.is_some() {
+            for dispatch in &variants[1] {
+                if start.elapsed() >= options.max_time {
+                    outcome.decision = TuneDecision::TimeBudget;
+                    return;
+                }
+                let compiled = {
+                    let _timer = PhaseTimer::new(&mut prep.pipelines);
+                    self.pipelines
+                        .ensure_tune_tile(&self.gpu, &dispatch.shader, MatmulTile::Tile64)
+                };
+                outcome.compile_time = prep.pipelines.unwrap();
+                if let Err(error) = compiled {
+                    outcome.decision = TuneDecision::ShaderRejected;
+                    outcome.failure = Some(error);
+                    return;
+                }
+            }
+        }
         if start.elapsed() >= options.max_time {
             outcome.decision = TuneDecision::TimeBudget;
             return;
@@ -510,6 +611,7 @@ impl Session {
         let mut scratch = Scratch::new(
             &class.key,
             &sizes,
+            output_index,
             bytes,
             staging,
             prep,
@@ -521,16 +623,23 @@ impl Session {
             staging_reused: scratch.staging_reused,
         });
         let bindings = PhaseTimer::new(&mut prep.bindings);
-        let mut dispatch = self.plan.dispatches[class.members[0]].clone();
-        dispatch.input_buffers = (0..sizes.len() - 1).map(|i| BufferRef(i as u32)).collect();
-        dispatch.output_buffer = BufferRef((sizes.len() - 1) as u32);
-        let mut variants = [dispatch.clone(), dispatch];
-        outcome.initial.apply(&mut variants[0], &class.key);
-        outcome.candidate.apply(&mut variants[1], &class.key);
-        let pipelines = [
-            &self.pipelines.map[&tile_variant(&class.key.shader, outcome.initial)],
-            &self.pipelines.map[&tile_variant(&class.key.shader, outcome.candidate)],
-        ];
+        let sequences: Vec<Vec<_>> = variants
+            .iter()
+            .enumerate()
+            .map(|(i, sequence)| {
+                sequence
+                    .iter()
+                    .map(|dispatch| {
+                        let key = if i == 1 && outcome.candidate_split_k.is_some() {
+                            Variant::Scalar(dispatch.shader.clone())
+                        } else {
+                            tile_variant(&class.key.shader, [outcome.initial, outcome.candidate][i])
+                        };
+                        (&self.pipelines.map[&key], dispatch)
+                    })
+                    .collect()
+            })
+            .collect();
         drop(bindings);
         drop(preparation);
         phases.qualification_breakdown = Some(Default::default());
@@ -558,15 +667,16 @@ impl Session {
                     outcome.decision = TuneDecision::TimeBudget;
                     return;
                 }
-                let sentinel = {
-                    let _timer = PhaseTimer::new(&mut details.input_preparation);
-                    vec![f32::NAN; sizes[sizes.len() - 1] / 4]
-                };
-                scratch.upload(sizes.len() - 1, &sentinel, Some(&mut *details));
-                drop(sentinel);
+                for (index, &bytes) in sizes.iter().enumerate().skip(output_index) {
+                    let sentinel = {
+                        let _timer = PhaseTimer::new(&mut details.input_preparation);
+                        vec![f32::NAN; bytes / 4]
+                    };
+                    scratch.upload(index, &sentinel, Some(&mut *details));
+                }
                 {
                     let _timer = PhaseTimer::new(&mut details.dispatch);
-                    scratch.run(pipelines[variant], &variants[variant], 1);
+                    scratch.run(&sequences[variant], 1);
                 }
                 let output = scratch.read_output(details);
                 let scale = if pattern == 0 { 1.0 } else { 1.0e-12 };
@@ -582,6 +692,54 @@ impl Session {
                         [outcome.initial, outcome.candidate][variant]
                     ));
                     return;
+                }
+                if let Some(splits) = outcome.candidate_split_k {
+                    let final_check = {
+                        let _timer = PhaseTimer::new(&mut details.validation);
+                        qualify_weight_range(
+                            &class.key,
+                            &inputs,
+                            &output,
+                            scale,
+                            0..class.key.k as usize,
+                        )
+                    };
+                    if let Err(error) = final_check {
+                        outcome.decision = TuneDecision::InvalidOutput;
+                        outcome.failure = Some(format!(
+                            "variant {variant}, pattern {pattern}, final: {error}"
+                        ));
+                        return;
+                    }
+                    if variant == 1 {
+                        let partials = scratch.read_buffer(
+                            output_index + 1,
+                            sizes[output_index + 1] / 4,
+                            details,
+                        );
+                        let _timer = PhaseTimer::new(&mut details.validation);
+                        for split in 0..splits {
+                            if start.elapsed() >= options.max_time {
+                                outcome.decision = TuneDecision::TimeBudget;
+                                return;
+                            }
+                            let elements = class.key.output_elements();
+                            let offset = split as usize * elements;
+                            if let Err(error) = qualify_weight_range(
+                                &class.key,
+                                &inputs,
+                                &partials[offset..offset + elements],
+                                scale,
+                                split_range(class.key.k, splits, split),
+                            ) {
+                                outcome.decision = TuneDecision::InvalidOutput;
+                                outcome.failure = Some(format!(
+                                    "pattern {pattern}, partial {split}/{splits}: {error}"
+                                ));
+                                return;
+                            }
+                        }
+                    }
                 }
                 reference = output;
             }
@@ -600,7 +758,7 @@ impl Session {
                     outcome.decision = TuneDecision::TimeBudget;
                     return;
                 }
-                scratch.run(pipelines[variant], &variants[variant], 1);
+                scratch.run(&sequences[variant], 1);
             }
         }
         drop(warmup);
@@ -611,11 +769,7 @@ impl Session {
                     return None;
                 }
                 let index = usize::from(alternative);
-                let ms = scratch.run(
-                    pipelines[index],
-                    &variants[index],
-                    options.dispatches_per_sample,
-                );
+                let ms = scratch.run(&sequences[index], options.dispatches_per_sample);
                 // Do not accept a last pair that only finished after the deadline.
                 (start.elapsed() < options.max_time)
                     .then_some(ms / options.dispatches_per_sample as f64)
@@ -624,6 +778,110 @@ impl Session {
         drop(scratch);
         decide(outcome, options);
     }
+}
+
+fn split_dispatches(
+    dispatch: &Dispatch,
+    class: &TuneClass,
+    splits: u32,
+) -> Result<(Vec<Dispatch>, usize), TuneError> {
+    let mut plan = crate::compile::compile(&crate::Graph::new());
+    plan.buffers = class
+        .buffer_sizes()
+        .ok_or(TuneError("invalid split-K extents"))?;
+    let mut dispatch = dispatch.clone();
+    dispatch.input_buffers = vec![BufferRef(0), BufferRef(1)];
+    dispatch.output_buffer = BufferRef(2);
+    plan.dispatches.push(dispatch);
+    let bytes = plan.split_conv_weight_gradients(&[(0, splits)], usize::MAX)?;
+    Ok((plan.dispatches, bytes))
+}
+
+fn split_range(k: u32, splits: u32, split: u32) -> std::ops::Range<usize> {
+    let tiles = k.div_ceil(16);
+    let first = split * (tiles / splits) + split.min(tiles % splits);
+    let last = first + tiles / splits + u32::from(split < tiles % splits);
+    first as usize * 16..(last as usize * 16).min(k as usize)
+}
+
+fn qualify_weight_range(
+    class: &TuneClass,
+    inputs: &[Vec<f32>],
+    output: &[f32],
+    scale: f64,
+    range: std::ops::Range<usize>,
+) -> Result<(), String> {
+    if output.len() != class.output_elements() {
+        return Err("incorrect output length".into());
+    }
+    let mut error = 0.0;
+    let mut norm = 0.0;
+    for (index, &actual) in output.iter().enumerate() {
+        let reference = weight_reference_dot(
+            class,
+            inputs,
+            index / class.n as usize,
+            index % class.n as usize,
+            range.clone(),
+        );
+        if !reference.is_finite() || !close(reference, actual, scale) {
+            return Err(format!(
+                "element {index}: {actual:e}, f64 reference {reference:e}"
+            ));
+        }
+        error += (f64::from(actual) - reference).powi(2);
+        norm += reference * reference;
+    }
+    if !(norm > 0.0 && (error / norm).sqrt() <= 2e-4) {
+        return Err(format!(
+            "reference norm {norm:e}, relative L2 {}",
+            (error / norm).sqrt()
+        ));
+    }
+    Ok(())
+}
+
+fn weight_reference_dot(
+    class: &TuneClass,
+    inputs: &[Vec<f32>],
+    row: usize,
+    col: usize,
+    range: std::ops::Range<usize>,
+) -> f64 {
+    let s = class.conv2d.expect("weight-gradient reference");
+    let [ci, h, w, co, kh, kw, stride, ph, oh, ow, pw] = [
+        s.in_channels,
+        s.in_h,
+        s.in_w,
+        s.out_channels,
+        s.kernel_h,
+        s.kernel_w,
+        s.stride,
+        s.padding_h,
+        s.out_h,
+        s.out_w,
+        s.padding_w,
+    ]
+    .map(|v| v as usize);
+    let channel = col / (kh * kw);
+    let (y, x) = (col / kw % kh, col % kw);
+    let mut value = 0.0;
+    for k in range {
+        let (batch, oy, ox) = (k / (oh * ow), k / ow % oh, k % ow);
+        let Some(iy) = (oy * stride + y).checked_sub(ph) else {
+            continue;
+        };
+        let Some(ix) = (ox * stride + x).checked_sub(pw) else {
+            continue;
+        };
+        if iy >= h || ix >= w {
+            continue;
+        }
+        let a = ((batch * co + row) * oh + oy) * ow + ox;
+        let b = ((batch * ci + channel) * h + iy) * w + ix;
+        value += inputs[0][a] as f64 * inputs[1][b] as f64;
+    }
+    value
 }
 
 fn scratch_bytes(sizes: &[usize]) -> Option<usize> {
@@ -708,6 +966,7 @@ struct Scratch<'gpu, 'trial> {
     buffers: Vec<bg::Buffer>,
     staging: &'trial mut Staging<'gpu>,
     staging_reused: bool,
+    output_index: usize,
     output_elements: usize,
     encoder: bg::CommandEncoder,
     cleanup: &'trial mut Option<Duration>,
@@ -717,6 +976,7 @@ impl<'gpu, 'trial> Scratch<'gpu, 'trial> {
     fn new(
         class: &TuneClass,
         sizes: &[usize],
+        output_index: usize,
         bytes: usize,
         staging: &'trial mut Staging<'gpu>,
         preparation: &mut TunePreparationTimes,
@@ -743,11 +1003,15 @@ impl<'gpu, 'trial> Scratch<'gpu, 'trial> {
             .iter()
             .enumerate()
             .map(|(i, &size)| {
-                let slot = if i + 1 == sizes.len() { 3 } else { i };
+                let device_local = if i > output_index {
+                    true
+                } else {
+                    class.device_local[if i == output_index { 3 } else { i }]
+                };
                 gpu.create_buffer(bg::BufferDesc {
                     name: "tune_scratch",
                     size: size as u64,
-                    memory: if class.device_local[slot] {
+                    memory: if device_local {
                         bg::Memory::DeviceTransient
                     } else {
                         bg::Memory::Shared
@@ -772,6 +1036,7 @@ impl<'gpu, 'trial> Scratch<'gpu, 'trial> {
             buffers,
             staging,
             staging_reused,
+            output_index,
             output_elements: class.output_elements(),
             encoder,
             cleanup,
@@ -802,24 +1067,30 @@ impl<'gpu, 'trial> Scratch<'gpu, 'trial> {
     }
 
     fn read_output(&mut self, times: &mut TuneQualificationTimes) -> Vec<f32> {
+        self.read_buffer(self.output_index, self.output_elements, times)
+    }
+
+    fn read_buffer(
+        &mut self,
+        index: usize,
+        elements: usize,
+        times: &mut TuneQualificationTimes,
+    ) -> Vec<f32> {
         let transfer = PhaseTimer::new(&mut times.readback_transfer);
         self.encoder.start();
         self.encoder
             .transfer("tune_readback")
             .copy_buffer_to_buffer(
-                self.buffers.last().unwrap().at(0),
+                self.buffers[index].at(0),
                 self.staging.buffer().at(0),
-                (self.output_elements * 4) as u64,
+                (elements * 4) as u64,
             );
         self.submit_wait();
         drop(transfer);
         let _host = PhaseTimer::new(&mut times.readback_host_copy);
         unsafe {
-            std::slice::from_raw_parts(
-                self.staging.buffer().data().cast::<f32>(),
-                self.output_elements,
-            )
-            .to_vec()
+            std::slice::from_raw_parts(self.staging.buffer().data().cast::<f32>(), elements)
+                .to_vec()
         }
     }
 
@@ -828,14 +1099,16 @@ impl<'gpu, 'trial> Scratch<'gpu, 'trial> {
         let _ = self.gpu.wait_for(&sync, !0);
     }
 
-    fn run(&mut self, pipeline: &bg::ComputePipeline, dispatch: &Dispatch, repeats: u32) -> f64 {
+    fn run(&mut self, sequence: &[(&bg::ComputePipeline, &Dispatch)], repeats: u32) -> f64 {
         let start = Instant::now();
         self.encoder.start();
         for _ in 0..repeats {
-            let mut pass = self.encoder.compute("tune_kernel");
-            let mut pc = pass.with(pipeline);
-            Session::bind_dispatch(&self.buffers, dispatch, &mut pc);
-            pc.dispatch(dispatch.workgroups);
+            for &(pipeline, dispatch) in sequence {
+                let mut pass = self.encoder.compute("tune_kernel");
+                let mut pc = pass.with(pipeline);
+                Session::bind_dispatch(&self.buffers, dispatch, &mut pc);
+                pc.dispatch(dispatch.workgroups);
+            }
         }
         self.submit_wait();
         start.elapsed().as_secs_f64() * 1e3
@@ -895,9 +1168,8 @@ fn outputs_agree(reference: &[f32], actual: &[f32], scale: f64) -> bool {
 
 fn reference_dot(class: &TuneClass, inputs: &[Vec<f32>], row: usize, col: usize) -> f64 {
     if let Some(s) = class.conv2d {
-        let [ci, h, w, co, kh, kw, stride, ph, oh, ow, pw] = [
+        let [ci, w, co, kh, kw, stride, ph, oh, ow, pw] = [
             s.in_channels,
-            s.in_h,
             s.in_w,
             s.out_channels,
             s.kernel_h,
@@ -936,26 +1208,7 @@ fn reference_dot(class: &TuneClass, inputs: &[Vec<f32>], row: usize, col: usize)
                 }
             }
         } else {
-            let channel = col / (kh * kw);
-            let (y, x) = (col / kw % kh, col % kw);
-            for batch in 0..s.batch as usize {
-                for oy in 0..oh {
-                    for ox in 0..ow {
-                        let Some(iy) = (oy * stride + y).checked_sub(ph) else {
-                            continue;
-                        };
-                        let Some(ix) = (ox * stride + x).checked_sub(pw) else {
-                            continue;
-                        };
-                        if iy >= h || ix >= w {
-                            continue;
-                        }
-                        let a = ((batch * co + row) * oh + oy) * ow + ox;
-                        let b = ((batch * ci + channel) * h + iy) * w + ix;
-                        value += inputs[0][a] as f64 * inputs[1][b] as f64;
-                    }
-                }
-            }
+            value = weight_reference_dot(class, inputs, row, col, 0..class.k as usize);
         }
         return value;
     }
@@ -1034,6 +1287,78 @@ fn qualify_output(class: &TuneClass, inputs: &[Vec<f32>], output: &[f32], scale:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_scratch_contract_and_full_partial_oracles_reject_corruption() {
+        let dispatch = Dispatch {
+            shader: ShaderEntry::Conv2dGradWeightGemmSmall,
+            workgroups: [1, 1, 1],
+            input_buffers: vec![BufferRef(0), BufferRef(1)],
+            output_buffer: BufferRef(2),
+            params: vec![2, 2, 1, 41, 3, 1, 1, 1, 0, 1, 41, 0],
+            requires_full_precision: true,
+            ..Default::default()
+        };
+        let class = TuneClass::from_dispatch(&dispatch, None).unwrap();
+        let sizes = class.buffer_sizes().unwrap();
+        for splits in [2, 3, 6] {
+            let (sequence, partial_bytes) = split_dispatches(&dispatch, &class, splits).unwrap();
+            assert_eq!(partial_bytes, sizes[2] * splits as usize);
+            assert_eq!(sequence.len(), 2);
+            assert_eq!(sequence[0].output_buffer, BufferRef(3));
+            assert_eq!(sequence[1].input_buffers, [BufferRef(3)]);
+            assert_eq!(sequence[1].output_buffer, BufferRef(2));
+            let mut allocation = sizes.clone();
+            allocation.push(partial_bytes);
+            assert_eq!(
+                scratch_bytes(&allocation),
+                Some(984 + 656 + 24 + partial_bytes + 984)
+            );
+            for pattern in 0..2 {
+                let inputs = test_inputs(&sizes, pattern);
+                let scale = if pattern == 0 { 1.0 } else { 1e-12 };
+                let mut previous = 0;
+                for split in 0..splits {
+                    let range = split_range(class.k, splits, split);
+                    assert_eq!(range.start, previous);
+                    previous = range.end;
+                    // Direct forward scatter for this 1x1 fixture, independently
+                    // indexed in NCHW and restricted to the selected spatial range.
+                    let mut expected = vec![0.0f64; class.output_elements()];
+                    for batch in 0..2 {
+                        for co in 0..3 {
+                            for x in 0..41 {
+                                if range.contains(&(batch * 41 + x)) {
+                                    for ci in 0..2 {
+                                        expected[co * 2 + ci] +=
+                                            f64::from(inputs[0][(batch * 3 + co) * 41 + x])
+                                                * f64::from(inputs[1][(batch * 2 + ci) * 41 + x]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let mut output: Vec<_> = expected.iter().map(|&v| v as f32).collect();
+                    assert!(
+                        qualify_weight_range(&class, &inputs, &output, scale, range.clone())
+                            .is_ok()
+                    );
+                    *output.last_mut().unwrap() = f32::NAN;
+                    assert!(
+                        qualify_weight_range(&class, &inputs, &output, scale, range.clone())
+                            .is_err()
+                    );
+                    output.fill(0.0);
+                    assert!(qualify_weight_range(&class, &inputs, &output, scale, range).is_err());
+                }
+                assert_eq!(previous, class.k as usize);
+            }
+        }
+        for splits in [0, 1, 7, u32::MAX] {
+            assert!(split_dispatches(&dispatch, &class, splits).is_err());
+        }
+        assert_eq!(scratch_bytes(&[4, 8, 12, 128]), Some(280));
+    }
 
     #[test]
     fn swap_preflight_checks_complete_layout_before_any_change() {
@@ -1320,8 +1645,15 @@ mod tests {
                     let mut staging = Staging::new(&gpu, staging, TuneStagingReuse::Fresh);
                     let mut prep = TunePreparationTimes::default();
                     let mut cleanup = None;
-                    let mut scratch =
-                        Scratch::new(&class, &sizes, bytes, &mut staging, &mut prep, &mut cleanup);
+                    let mut scratch = Scratch::new(
+                        &class,
+                        &sizes,
+                        sizes.len() - 1,
+                        bytes,
+                        &mut staging,
+                        &mut prep,
+                        &mut cleanup,
+                    );
                     let mut times = TuneQualificationTimes::default();
                     scratch.upload(sizes.len() - 1, &data, Some(&mut times));
                     let read = scratch.read_output(&mut times);
@@ -1385,6 +1717,7 @@ mod tests {
                 let mut scratch = Scratch::new(
                     &class,
                     &sizes,
+                    sizes.len() - 1,
                     scratch_bytes(&sizes).unwrap(),
                     staging,
                     &mut prep,
