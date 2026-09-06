@@ -125,8 +125,12 @@ This distinction matters: multiplying by the rounded f32 reciprocal mapped
 instead of the independent f64 oracle's `0.8370`. Full oracles now cover fourteen
 scalar shapes, both tiles and ordinary/tiny gradients; six generated cooperative
 shapes execute on this GPU with exactly representable f16 operands. Native-f32
-execution still needs hardware qualification. The [separate cost protocol](../experiments/conv-indexing-2026-09-06/README.md)
-keeps correctness and performance evidence distinct.
+execution still needs hardware qualification. The [separate cost cohort](../experiments/conv-indexing-2026-09-06/README.md)
+retains full-state bit identity across revisions, but ResNet normal F+L+B rises
+17.55→21.55 ms, about 23%. Short-case drift prevents an equivalence claim for
+SmolLM2/Whisper. These untuned, sequential source-level processes are separate
+from the earlier tile crossover and its timings. Correctness stays; future
+exact indexing optimization must recover cost without restoring the approximation.
 
 The former small-tile occupancy cutoff is now an **initial choice**, not a
 profitability veto for eligible tuned classes: either tile can win. Untuned,
@@ -333,21 +337,21 @@ The original small-case builder violated the documented flat operand contract;
 both controls agreed on zero loss/gradients after a zero-workgroup forward
 dispatch. Those twelve cases remain archived and disqualified. The public
 helper now rejects malformed operand shapes, and the runner requires nonzero
-training signals and actual parameter updates. Independent full
-f64 scatter oracles cover forward outputs, eight shapes and both derivative tiles before/after search,
-ordinary/tiny gradients, state isolation and budget skips. Distinct-state
+training signals and actual parameter updates. Independent full f64 scatter
+oracles now cover forward outputs, fourteen scalar shapes and both tiles
+before/after search, ordinary/tiny gradients, state isolation and budget skips. Distinct-state
 Adam swaps cover subsequent accumulation/clipping updates as well.
 The long-reduction, small-output dW classes motivate the next bounded split-K
 candidate, including its partial storage and final reduction. It needs a small
 extension from one dispatch to a candidate sequence with explicit scratch
 lifetime: the current geometry-only swap promises a fixed allocation plan.
-Reuse class keys, qualification and decision logic; do not hide persistent
-partials outside the budget or create another tuner. Keep these measured
-choices about algebra, not model names.
-Do not infer that cross-call pools, larger budgets
-or weaker checks follow from this result. Cheaper search neither supplies
-convolution candidates nor turns MLP's earlier inconclusive whole-step ratios
-into a training gain. Tuning remains opt-in.
+Reuse class keys, qualification, decision logic and the existing SumRows kernel
+for `[split, M*N]` partials; do not hide persistent partials outside the budget
+or create another tuner. Keep these measured choices about algebra, not model
+names. Do not infer that cross-call pools, larger budgets or weaker checks
+follow from this result. Cheaper search by itself provides no new kernel
+algorithms and does not turn MLP's earlier inconclusive whole-step ratios into
+a training gain. Tuning remains opt-in.
 
 ## Target contract for broader tuning
 

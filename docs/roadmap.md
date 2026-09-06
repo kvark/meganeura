@@ -75,9 +75,12 @@ unsafe f32 reciprocal decomposition with integer division in the shared scalar
 and generated cooperative kernels. Adversarial full forward/dX/dW GPU oracles
 reproduce the old width-41 error and pass at widths/kernel sizes 41/47/55 after
 repair. Four uniforms and the obsolete tuner-only filter are removed, without
-weakening numerical or overflow checks. Its cost check is separate from tuning.
-Next add bounded split-K weight gradients
-with charged partial storage and whole-step confirmation;
+weakening numerical or overflow checks. The separate cost check retains bit-exact
+full states across revisions but observes ResNet 17.55→21.55 ms, about 23% slower.
+Recover that cost with a qualified, reusable exact indexing implementation;
+do not restore approximate addresses. Then add bounded split-K weight gradients,
+reusing SumRows with charged partial storage, complete dispatch-sequence accounting
+and whole-step confirmation;
 attention schedules remain a separate device-qualified family.
 Keep tuning opt-in; do not fit a smaller margin or model rule.
 

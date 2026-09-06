@@ -527,6 +527,9 @@ scalar and generated convolution kernels, deleted four reciprocal uniforms and
 removed the tuner-only interval filter. Full forward/dX/dW oracles cover the
 failure and nearby boundaries. There is no list of special widths. A separate
 cost check measures the tradeoff; correctness is not conditional on winning it.
+On this RTX 5070 the repair increases ResNet F+L+B from about 17.55 to 21.55 ms,
+despite bit-identical full states on that workload. That cost is retained, not
+hidden behind the earlier tile-selection results from different source.
 [Repair and protocol](../experiments/conv-indexing-2026-09-06/README.md).
 
 ### 46. Why isn't split-K just another tile size?
@@ -538,8 +541,9 @@ also writes partial results and launches a reduction before consumers run.
 Those bytes, barriers and dispatch costs belong to the candidate. Our current
 tile search changes geometry with identical live allocations, so it needs an
 explicit bounded sequence/scratch contract before supporting split-K. Reuse
-qualification and selection, keep deterministic f32 reduction, and test tiny
-gradients and subsequent optimizer updates. More parallelism alone is not a win.
+qualification and selection, use the existing deterministic f32 SumRows reduction,
+and test tiny gradients and subsequent optimizer updates. More parallelism alone
+is not a win.
 
 ## Talk outline
 

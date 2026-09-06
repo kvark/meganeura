@@ -300,12 +300,22 @@ fn check_conv_contract(profile: &Value, dispatch: &Dispatch) {
 }
 
 fn validate(record: &Value, seed: usize) {
+    validate_source(
+        record,
+        seed,
+        "training-profile-2026-09-06",
+        REVISION,
+        EXECUTABLE,
+    );
+}
+
+fn validate_source(record: &Value, seed: usize, protocol: &str, revision: &str, executable: &str) {
     assert_eq!(record["schema_version"], 1);
-    assert_eq!(record["protocol"], "training-profile-2026-09-06");
+    assert_eq!(record["protocol"], protocol);
     assert_eq!(record["status"], "complete");
     let meta = &record["metadata"];
-    assert_eq!(meta["revision"], REVISION);
-    assert_eq!(meta["executable_sha256"], EXECUTABLE);
+    assert_eq!(meta["revision"], revision);
+    assert_eq!(meta["executable_sha256"], executable);
     assert_eq!(
         meta["cargo_lock_sha256"],
         "72cecddd0f090e82d5db46bc6f7f80429a058b2afa0eaec84a9b27e7340a4a80"
@@ -371,7 +381,11 @@ fn validate(record: &Value, seed: usize) {
             previous = time;
         }
         let census: TuneReport = serde_json::from_value(case["search_census"].clone()).unwrap();
-        assert!(case["search_census"]["options"].get("scope").is_none());
+        if protocol == "training-profile-2026-09-06" {
+            assert!(case["search_census"]["options"].get("scope").is_none());
+        } else {
+            assert_eq!(case["search_census"]["options"]["scope"], "Dense");
+        }
         assert_eq!(
             serde_json::to_value(census.options).unwrap(),
             json!({"scope":"Dense", "max_time":{"secs":0,"nanos":0}, "max_classes":8,
@@ -484,6 +498,139 @@ fn check_summary(expected: &Value, recorded: &Value) {
         }
         Value::Number(value) => close(value.as_f64().unwrap(), recorded.as_f64().unwrap()),
         _ => assert_eq!(expected, recorded),
+    }
+}
+
+const INDEXING_ORDER: [(&str, usize); 6] = [
+    ("baseline", 1),
+    ("exact", 1),
+    ("exact", 2),
+    ("baseline", 2),
+    ("baseline", 3),
+    ("exact", 3),
+];
+
+fn indexing_records() -> Vec<Value> {
+    INDEXING_ORDER
+        .iter()
+        .map(|(kind, seed)| {
+            let path = format!(
+                "{}/docs/experiments/conv-indexing-2026-09-06/{kind}-{seed:02}.json.gz",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let file = std::fs::File::open(path).unwrap();
+            serde_json::from_reader(flate2::read::GzDecoder::new(file)).unwrap()
+        })
+        .collect()
+}
+
+fn indexing_cohort(records: &[Value]) -> Value {
+    assert_eq!(records.len(), INDEXING_ORDER.len());
+    let mut previous = 0;
+    let mut ids = HashSet::new();
+    for (record, &(kind, seed)) in records.iter().zip(&INDEXING_ORDER) {
+        let (revision, executable) = if kind == "baseline" {
+            (
+                "aa1344e784a37462b8261aed97cb804c11ce8ba3",
+                "f4e681345ac30729ce45bfdbdbd0dd3fce395c4dbfa6f6a9fe8016fa5b015a59",
+            )
+        } else {
+            (
+                "45304b884d821875c476f6d28446051ad22fe35f",
+                "7f0c7fbae450e8a16b553a4a6de3bfed2c8e3c4ae7ea505ca831371344feabde",
+            )
+        };
+        validate_source(
+            record,
+            seed,
+            "conv-indexing-2026-09-06",
+            revision,
+            executable,
+        );
+        let meta = &record["metadata"];
+        assert!(ids.insert(meta["process_id"].as_u64().unwrap()));
+        assert!(previous <= meta["started_unix_ms"].as_u64().unwrap());
+        previous = record["finished_unix_ms"].as_u64().unwrap();
+    }
+    let cases: Vec<_> = CASES.iter().map(|expected| {
+        let runs: Vec<_> = records.iter().map(|record| record["cases"].as_array().unwrap().iter()
+            .find(|case| case["name"] == expected.name).unwrap()).collect();
+        let reference = runs[0];
+        let digest = reference["reference_state_sha256"].as_str().unwrap();
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|c| c.is_ascii_hexdigit()));
+        for case in &runs {
+            assert_eq!(case["reference_state_sha256"], digest);
+            assert_eq!(case["final_state_sha256"], digest);
+            for key in ["description", "dispatch_contracts", "pipeline_keys", "reference_comparison"] {
+                assert_eq!(case[key], reference[key]);
+            }
+            for (key, value) in reference["initial_memory"].as_object().unwrap() {
+                if key != "process_api_sample" {
+                    assert_eq!(&case["initial_memory"][key], value);
+                }
+            }
+        }
+        let conv_ms = |case: &Value| {
+            let dispatches = case["profile"]["dispatches"].as_array().unwrap();
+            let mut fields = serde_json::Map::new();
+            for (direction, entries) in [
+                ("forward", ["Conv2dGemm", "Conv2dGemmSmall"]),
+                ("dx", ["Conv2dGradInputGemm", "Conv2dGradInputGemmSmall"]),
+                ("dw", ["Conv2dGradWeightGemm", "Conv2dGradWeightGemmSmall"]),
+            ] {
+                let sum: f64 = dispatches.iter().filter(|d| entries.contains(&d["shader"].as_str().unwrap()))
+                    .map(|d| number(&d["median_ms"])).sum();
+                fields.insert(direction.into(), json!(sum));
+            }
+            Value::Object(fields)
+        };
+        let pairs: Vec<_> = (1..=3).map(|seed| {
+            let get = |kind| runs[INDEXING_ORDER.iter().position(|&pair| pair == (kind, seed)).unwrap()];
+            let baseline = get("baseline");
+            let exact = get("exact");
+            let bb = number(&baseline["normal_before"]["median_ms"]);
+            let ba = number(&baseline["normal_after"]["median_ms"]);
+            let eb = number(&exact["normal_before"]["median_ms"]);
+            let ea = number(&exact["normal_after"]["median_ms"]);
+            json!({"seed":seed, "baseline_before_ms":bb, "baseline_after_ms":ba,
+                "exact_before_ms":eb, "exact_after_ms":ea,
+                "baseline_to_exact_before_ratio":bb/eb, "baseline_to_exact_after_ratio":ba/ea,
+                "baseline_drift_pct":(ba/bb-1.0)*100.0, "exact_drift_pct":(ea/eb-1.0)*100.0,
+                "profile_baseline_conv_ms":conv_ms(baseline), "profile_exact_conv_ms":conv_ms(exact)})
+        }).collect();
+        json!({"name":expected.name, "state_sha256":digest,
+            "same_dispatch_contracts_and_requested_memory":true, "process_pairs":pairs})
+    }).collect();
+    json!({"protocol":"conv-indexing-2026-09-06", "cases":cases,
+        "processes":6, "normal_steps":720, "profiled_full_state_checks":90,
+        "interpretation":"sequential process pairs, not paired-kernel or cross-engine gain evidence"})
+}
+
+#[test]
+fn exact_convolution_indexing_cost_and_cross_source_states_replay() {
+    let summary = indexing_cohort(&indexing_records());
+    let recorded = std::fs::File::open(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/docs/experiments/conv-indexing-2026-09-06/summary.json"
+    ))
+    .unwrap();
+    check_summary(&summary, &serde_json::from_reader(recorded).unwrap());
+    println!(
+        "INDEXING_SUMMARY={}",
+        serde_json::to_string(&summary).unwrap()
+    );
+}
+
+#[test]
+fn indexing_replay_rejects_cross_source_state_drift() {
+    let original = indexing_records();
+    for key in ["reference_state_sha256", "final_state_sha256"] {
+        let mut changed = original.clone();
+        // Seed 1 starts with SmolLM2 in both revisions. Preserve the record's
+        // in-process comparisons to isolate the new cross-source hash check.
+        changed[1]["cases"][0][key] = json!("0".repeat(64));
+        assert!(std::panic::catch_unwind(|| indexing_cohort(&changed)).is_err());
     }
 }
 
