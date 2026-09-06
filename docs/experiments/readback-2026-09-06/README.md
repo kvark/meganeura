@@ -26,9 +26,11 @@ patterns, NaN poisoning, finite scans, full cross-candidate comparisons,
 sampled f64 dots, search samples and selection guard remain unchanged.
 The staging enum is an explicit diagnostic control, not a model-name rule.
 
-The published Vulkan backend's Shared allocation requests fast device access
-in addition to host upload/download; Download omits the fast-device preference.
-The published Metal backend maps both to shared storage. These are source-level
+The published [Vulkan backend's allocation flags](https://github.com/kvark/blade/blob/866de2c37acbcf1e54c3a21f3213dae4f2f45746/blade-graphics/src/vulkan/resource.rs)
+request fast device access for Shared in addition to host upload/download;
+Download omits the fast-device preference. The published
+[Metal backend](https://github.com/kvark/blade/blob/866de2c37acbcf1e54c3a21f3213dae4f2f45746/blade-graphics/src/metal/resource.rs)
+maps both to shared storage. These are source-level
 policies, not proof of a particular allocation's physical location or cache
 properties on this machine.
 
@@ -93,8 +95,9 @@ for seed in 1 2 3 4 5 6; do
 done
 ```
 
-The runner refuses existing outputs and dirty tracked source. Results and
-the measured-source tag will be added afterward; prior records are immutable.
+The runner refuses existing outputs and dirty tracked source. The protocol
+and measured source were committed before the cohort below; prior records
+are immutable.
 
 Before measurement, the Blade 0.9 full release test suite passed, including
 247 library tests (two GPU tests ignored by default). The two GPU tests then
@@ -105,3 +108,139 @@ optimizer/accumulation-state checks exercising both staging choices. All six
 old holdout prefixes and three crossover prefixes passed too. Native-f32 GPU
 and absent external-reference-fixture coverage are not implied. CPU evidence
 replay, all-feature Clippy, strict rustdoc and Rust 1.92 library checks pass.
+
+## Retained cohort — September 6, 2026
+
+All six fresh processes completed serially with no failed/discarded attempts
+or retries. Raw records: [1](run-01.json), [2](run-02.json), [3](run-03.json),
+[4](run-04.json), [5](run-05.json), [6](run-06.json).
+[summary.json](summary.json) contains all cost-level paired arithmetic and
+per-process total-search ratios; CPU replay recomputes it from the raw reports.
+
+| Identity | Measured value |
+|---|---|
+| Source | `2abeff93b6ae5d9714a698cdc64d942ca965d2ff` |
+| Immutable source tag | `evidence/readback-2026-09-06` |
+| Executable SHA-256 | `306e52acccefb9ad8d346aae7370f213d953c8e91c581aa201c53395e7644ce1` |
+| GPU / driver | NVIDIA GeForce RTX 5070 / 595.71.05 |
+| Host / build | Linux x86_64, Intel Core i5-12400F, release Rust 1.98.0, no RUSTFLAGS |
+| Matrix capability | f32 tile 0 / f16 tile 16; both cooperative paths disabled |
+
+No build, qualification test or heavy analysis overlapped the retained cohort.
+The pre-run compute-process query was empty; graphics processes remained
+resident. Telemetry retained 465 samples across the six processes, with
+42–62 °C, graphics clocks 217–2902 MHz and memory clocks 405–14001 MHz over
+the **whole processes**, including idle/session-construction/validation intervals. There was
+no clock lock or cache clearing. At 250 ms, this is neither per-pair telemetry
+nor proof that external activity could never interfere.
+
+### Total cost and the promotion decision
+
+Costs below are medians of six per-process sums over all class comparisons,
+in milliseconds. The ratio column is the median of six paired process ratios,
+not the ratio of the two cost medians. Ratios greater than one favor Download.
+
+| Case | Total search, Shared → Download | Qualification, Shared → Download | Median process search ratio |
+|---|---:|---:|---:|
+| Dense inference | 73.202 → 43.977 | 51.825 → 6.791 | 1.661× |
+| MLP+Adam | 175.439 → 63.532 | 144.883 → 10.421 | 2.803× |
+| ResNet F+L+B | 606.464 → 38.853 | 598.378 → 20.592 | 15.567× |
+
+All three cases pass the total-search gain guard; none passes a total-search
+regression guard. ResNet also passes both targeted qualification and CPU
+readback-copy gain guards. All 18 case runs, 36 searches and **108 class
+comparisons qualify**. Both arms search identical classes, candidates,
+dispatch multiplicities and binding capacities/placements, with matching
+retained tensor-buffer requests. Prefix, per-search, step-33 and step-178
+full tensor/counter comparisons are bit-exact, including Adam moments and
+the expected 178 updates. All 175 subsequent training loss pairs per case
+pass. These are control-session comparisons, not a cross-engine oracle or
+convergence result; no whole-step latency was timed.
+
+The fixed promotion rule passes. A follow-up commit changes only the new
+`TuneOptions` staging default to Download, alongside replay/tests/docs.
+`TuneStaging::Shared` remains explicit, and omitted historical staging fields
+still deserialize as Shared. The measured tag does not move to that later
+commit. Numerical gates, candidates, live-buffer allocation policy, search
+budgets and default-off tuning are unchanged.
+
+### Where qualification spent time
+
+ResNet's nested qualification medians, in milliseconds:
+
+| Disjoint cost within qualification | Shared | Download |
+|---|---:|---:|
+| CPU input/padding/sentinel preparation | 3.017 | 3.058 |
+| CPU upload copy | 3.598 | 2.852 |
+| Upload encode/transfer/submit/wait | 1.124 | 3.592 |
+| Candidate encode/dispatch/submit/wait | 0.562 | 0.664 |
+| Readback encode/transfer/submit/wait | 0.535 | 2.331 |
+| CPU mapped-memory-to-vector allocation/copy | 582.238 | 2.035 |
+| CPU finite/parity scans and f64 reference checks | 6.027 | 6.006 |
+| Other qualification bookkeeping/destruction | 0.006 | 0.007 |
+
+These are not GPU timestamp intervals. Medians of components need not add
+to the median total. CPU readback allocation/copy also falls from 45.280 to
+0.142 ms on dense inference and from 134.656 to 0.466 ms on MLP+Adam. Validation
+is still performed at full declared strength; its gain/regression guard passes
+in **neither direction on any case**. The changed staging policy addresses the
+measured host-copy cost without claiming a measured physical heap/cache cause.
+
+The tradeoff is visible. Download increases preparation on every case:
+dense 2.280 → 17.235 ms, MLP 1.454 → 28.142 ms, ResNet 0.648 → 10.408 ms.
+Preparation includes pipeline setup, allocation and binding work; these timers
+do not yet separate all of it. Upload transfer/wait passes a regression guard
+on every case; ResNet's readback transfer/wait does too. Those costs are
+outweighed here by CPU readback savings, not assumed to be free.
+
+### Every process and both orders
+
+Each cell below is that process's Shared total search divided by Download
+total search. The first-search column lists dense / MLP / ResNet arms.
+
+| Seed | First search | Dense | MLP+Adam | ResNet F+L+B |
+|---|---|---:|---:|---:|
+| 1 | Download / Shared / Download | 0.853× | 3.430× | 15.976× |
+| 2 | Shared / Download / Shared | 1.542× | 2.784× | 16.004× |
+| 3 | Download / Shared / Download | 1.781× | 3.044× | 11.678× |
+| 4 | Shared / Download / Shared | 1.845× | 2.822× | 15.828× |
+| 5 | Download / Shared / Download | 1.515× | 2.488× | 15.307× |
+| 6 | Shared / Download / Shared | 1.819× | 2.408× | 12.116× |
+
+For Shared-first versus Download-first subgroups (three observations each),
+median ratios are dense 1.819× / 1.515×, MLP 3.044× / 2.784× and ResNet
+15.828× / 15.307×. These descriptive subgroups are not extra independent
+cohorts or confidence intervals.
+
+The first dense Download search is **slower overall**, 78.824 versus 67.216 ms.
+Its preparation costs 51.947 ms, including 32.647 ms pipeline setup; Shared
+costs 2.075 ms, including 0.498 ms pipeline setup. Qualification still falls
+from 45.847 to 6.682 ms. The first MLP Shared search also has 70.4 ms pipeline
+setup. These observations stay in the cohort. Balanced order does not erase
+startup effects, and no cold-cache or guaranteed one-shot latency claim is made.
+
+### Replay and next question
+
+CPU-only consistency and mutation tests:
+
+```sh
+cargo test --test readback_evidence retained_readback_runs_and_promotion_gates_replay -- --nocapture
+cargo test --test tuning_evidence --test holdout_evidence --test crossover_evidence --test readback_evidence
+cargo test --example tune_readback
+```
+
+The replay checks identities, complete case/search/phase rosters, search order,
+class/binding equivalence, selected keys and guards, counters/full-tensor
+comparison summaries, loss trajectories, memory requests, elapsed costs and
+summary arithmetic. Mutations exercise missing data and corrupted policy,
+coverage, timing, state, memory and decisions. Raw vectors are not archived;
+replay cannot independently reproduce them or authenticate the producer.
+Quality CI runs the replay without a GPU. The frozen paper still passes all
+six verifier tests, 50 cells / 165 files, and byte-identical generated tables.
+
+Next, split preparation's allocation/binding and pipeline work, and time final
+scratch cleanup separately before testing bounded reuse. Do not reduce the validation
+coverage or quietly add uncharged staging buffers. Fleet measurements remain
+due, especially because Metal maps these two policies identically. Cheaper
+search is not faster GPU math, a ResNet model speedup, a Blade-version win,
+or grounds to enable tuning by default.

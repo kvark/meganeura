@@ -87,7 +87,7 @@ behind as a second unsafe default path.
 | Eligibility | Contiguous row-major f32; fixed supported binding arity; nonzero checked extents; portable workgroup limits; non-overlapping physical bindings. Cooperative candidates honor session policy, capability/smoke tests and existing binding capacity. No f16-input/compensated cooperative, GEMV, horizontal packs, arbitrary prologues/epilogues or reduced storage. |
 | Exact class | Entry/direction, M/N/K, derivative precision requirement, declared binding capacities and A/B/addend/output placement. Different initial choices are separate searches. No device-to-device transfer. |
 | Complete candidate | Exact pipeline key, variant flags, scalar fallback and recalculated X/Y/Z geometry together; cooperative and scalar axes differ. Logical extents, bindings, access sets and allocation plan stay fixed. Lazy shader rejection is reported; no fallback lookup during trials. |
-| State isolation | Private per-class scratch and command encoder. No `Session::step`, no live tensor bindings, no reads/writes of model state. Matching Shared/DeviceTransient placement, with bounded upload/readback staging. |
+| State isolation | Private per-class scratch and command encoder. No `Session::step`, no live tensor bindings, no reads/writes of model state. Matching Shared/DeviceTransient bindings, with one bounded upload/readback buffer: Download by default, Shared as an explicit control. |
 | Qualification | Two deterministic signed, nonzero, full-mantissa patterns: ordinary magnitudes and tiny `1e-12` A/addend operands. Full logical-output finite and cross-variant comparisons; 32 f64 reference dots including 8/16/32/64 tile edges. Scratch padding is zeroed for inputs and NaN-poisoned for outputs; only logical outputs are checked. |
 | Numerical tolerance | `abs(reference-actual) <= scale*1e-5 + abs(reference)*2e-4`, with scale 1 or `1e-12`. A domain-specific screen, not a proof or training convergence test. |
 | Timing | Default six complete pairs, alternating AB/BA order; each sample encodes/submits/waits for 16 barrier-delimited repeated dispatches. Upload/qualification/readback excluded from samples, included in total cost. |
@@ -215,15 +215,49 @@ both orientations in all six processes (median 1.177×); MLP+Adam has no
 confirmed gain, with two unstable controls; ResNet remains unchanged. All
 declared tensor comparisons are bit-exact through Adam step 178.
 
-Qualification takes 98.26–98.65% of ResNet's newly measured search wall time
-(median 538 of 546 ms); sampling takes about 7 ms. The next experiment should
-split qualification into transfers/readback, CPU checks and device execution,
-and test staging placement without changing the live-binding equivalence or
-the ordinary/tiny-input numerical gates. `Memory::Shared` staging versus the
-pinned Blade's `Memory::Download` is a concrete source-based hypothesis, not
-a measured explanation yet. Keep this separate from whole-step acceptance:
-making search cheaper would not create useful convolution candidates or turn
-MLP's small negative ratios into a training win.
+Qualification took 98.26–98.65% of ResNet's search wall time in that cohort
+(median 538 of 546 ms); sampling took about 7 ms. That motivated the separately
+recorded experiment below, not a retrospective change to those measurements.
+
+## Qualification cost: measured readback staging
+
+The [six-process Shared/Download experiment](../experiments/readback-2026-09-06/README.md)
+uses published Blade 0.9 and Naga 30 in both arms. New nested timers separate
+input preparation, CPU upload copy, upload transfer/wait, dispatch/wait,
+readback transfer/wait, CPU readback allocation/copy and numerical validation.
+These are accumulated host wall times, not GPU timestamps. The staging buffer
+alone changes memory policy; candidate bindings, capacities, ordinary/tiny
+patterns, complete finite/parity scans and sampled f64 dots remain identical.
+
+| Diagnostic repeat case | Median total search, Shared → Download | Median qualification, Shared → Download | Median per-process search ratio |
+|---|---:|---:|---:|
+| Dense inference | 73.20 → 43.98 ms | 51.82 → 6.79 ms | 1.661× |
+| MLP+Adam | 175.44 → 63.53 ms | 144.88 → 10.42 ms | 2.803× |
+| ResNet F+L+B | 606.46 → 38.85 ms | 598.38 → 20.59 ms | 15.567× |
+
+ResNet's CPU readback allocation/copy accounts for 582.24 ms with Shared versus
+2.03 ms with Download; its unchanged numerical validation takes 6.03 versus
+6.01 ms. Download is not free: preparation increases from 0.65 to 10.41 ms,
+upload transfer/wait from 1.12 to 3.59 ms and readback transfer/wait from 0.54
+to 2.33 ms. Preparation also increases on both other cases. The first dense
+Download search is slower overall and is included, not discarded.
+
+All 18 case runs and 108 class comparisons qualify. Full tensor/counter checks
+are bit-exact through Adam step 178 and allocation requests match. ResNet's
+total/qualification/readback-copy gain guards pass, and neither other case
+has a total-search regression guard. This meets the predeclared promotion
+rule: `TuneOptions::default()` now selects Download for private staging.
+Explicit Shared and historical missing-field deserialization preserve the
+old policy. Tuning remains default-off. Six process pairs on one GPU do not
+establish fleet behavior; Metal maps both policies to shared storage.
+
+The next search-cost question is preparation and cleanup: separate private
+allocation/binding work from pipeline setup and time final destruction before
+testing bounded scratch/staging reuse.
+Keep retained-byte budgets and all validation unchanged; do not introduce a
+second staging allocation without charging it. This experiment contains no
+whole-step timings. Cheaper search neither supplies convolution candidates
+nor turns MLP's earlier inconclusive whole-step ratios into a training gain.
 
 ## Target contract for broader tuning
 

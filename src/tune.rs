@@ -223,6 +223,7 @@ impl TuneClass {
 }
 
 /// Placement of the private upload/readback buffer, never the kernel bindings.
+/// Its default preserves historical reports; new [`TuneOptions`] use Download.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TuneStaging {
     /// Original bidirectional, GPU-preferred shared staging.
@@ -238,7 +239,8 @@ pub struct TuneOptions {
     pub max_classes: usize,
     /// GPU scratch including the upload/readback buffer, not pipelines.
     pub max_scratch_bytes: usize,
-    /// Does not alter scratch binding placement, validation or kernel candidates.
+    /// Defaults to Download. Does not alter scratch binding placement,
+    /// validation or kernel candidates.
     /// Missing historical settings deserialize to the original shared staging.
     #[serde(default)]
     pub staging: TuneStaging,
@@ -259,7 +261,7 @@ impl Default for TuneOptions {
         Self {
             max_classes: 8,
             max_scratch_bytes: 64 * 1024 * 1024,
-            staging: TuneStaging::Shared,
+            staging: TuneStaging::Download,
             max_time: Duration::from_secs(2),
             warmup_runs: 1,
             sample_pairs: 6,
@@ -687,6 +689,8 @@ mod tests {
 
     #[test]
     fn staging_round_trips_and_missing_historical_policy_is_shared() {
+        assert_eq!(TuneOptions::default().staging, TuneStaging::Download);
+        assert_eq!(TuneStaging::default(), TuneStaging::Shared);
         for staging in [TuneStaging::Shared, TuneStaging::Download] {
             let options = TuneOptions {
                 staging,

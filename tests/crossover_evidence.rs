@@ -6,12 +6,16 @@ mod evidence;
 #[path = "../examples/support/tuning_measurement.rs"]
 mod measurement;
 
+#[path = "support/telemetry.rs"]
+mod telemetry;
+
 use crossover::{Block, Confirmation, Pair};
-use evidence::*;
+use evidence::{DIAGNOSTIC_CASES as CASES, *};
 use measurement::{TensorComparison, median};
 use meganeura::TuneReport;
 use serde_json::{Value, json};
 use std::{collections::HashSet, time::Duration};
+use telemetry::{check_telemetry, time_window};
 
 const RECORDS: [&str; 6] = [
     include_str!("../docs/experiments/crossover-2026-09-06/run-01.json"),
@@ -20,39 +24,6 @@ const RECORDS: [&str; 6] = [
     include_str!("../docs/experiments/crossover-2026-09-06/run-04.json"),
     include_str!("../docs/experiments/crossover-2026-09-06/run-05.json"),
     include_str!("../docs/experiments/crossover-2026-09-06/run-06.json"),
-];
-
-const CASES: [Expected; 3] = [
-    Expected {
-        name: "dense-inference",
-        work: "Inference",
-        dispatches: 8,
-        eligible: 3,
-        excluded: 0,
-        parameters: (8, 2097152),
-        gradients: (0, 0),
-        output_elements: 65536,
-    },
-    Expected {
-        name: "mlp-adam",
-        work: "Adam",
-        dispatches: 18,
-        eligible: 5,
-        excluded: 13,
-        parameters: (4, 410496),
-        gradients: (4, 410496),
-        output_elements: 127,
-    },
-    Expected {
-        name: "resnet50-flb",
-        work: "ForwardLossBackward",
-        dispatches: 512,
-        eligible: 1,
-        excluded: 511,
-        parameters: (108, 25530472),
-        gradients: (108, 25530472),
-        output_elements: 1,
-    },
 ];
 
 fn check_pairs(pairs: &[Pair], count: usize, first_step: usize, order: usize, work: &str) {
@@ -75,53 +46,6 @@ fn check_pairs(pairs: &[Pair], count: usize, first_step: usize, order: usize, wo
             );
         }
     }
-}
-
-fn time_window(value: &Value, earliest: u64, latest: u64) -> u64 {
-    let host = value["host_start"]["unix_ms"].as_u64().unwrap();
-    let start = value["started_unix_ms"].as_u64().unwrap();
-    let end = value["finished_unix_ms"].as_u64().unwrap();
-    assert!(earliest <= host && host <= start && start < end && end <= latest);
-    end
-}
-
-fn check_telemetry(record: &Value) {
-    let telemetry = &record["telemetry"];
-    assert!(telemetry["error"].is_null());
-    assert_eq!(telemetry["requested_interval_ms"], 250);
-    assert_eq!(telemetry["sample_cap"], 40000);
-    assert_eq!(telemetry["cap_reached"], false);
-    assert_eq!(
-        telemetry["fields"],
-        "timestamp,uuid,utilization.gpu,memory.used,clocks.gr,clocks.mem,power.draw,temperature.gpu,pstate"
-    );
-    let samples = telemetry["samples"].as_array().unwrap();
-    assert!(!samples.is_empty());
-    let mut previous = 0;
-    for sample in samples {
-        let time = sample["received_unix_ms"].as_u64().unwrap();
-        assert!(time >= previous);
-        previous = time;
-        let fields: Vec<_> = sample["csv"]
-            .as_str()
-            .unwrap()
-            .split(',')
-            .map(str::trim)
-            .collect();
-        assert_eq!(fields.len(), 9);
-        assert_eq!(fields[1], "GPU-705c613d-97a2-2380-4fd9-49006cebab54");
-        for field in &fields[2..8] {
-            let number = field.parse::<f64>().unwrap();
-            assert!(number.is_finite() && number >= 0.0);
-        }
-        assert!(fields[2].parse::<f64>().unwrap() <= 100.0);
-        assert!(fields[8].strip_prefix('P').unwrap().parse::<u32>().is_ok());
-    }
-    assert!(
-        samples[0]["received_unix_ms"].as_u64().unwrap()
-            <= record["metadata"]["started_unix_ms"].as_u64().unwrap()
-    );
-    assert!(previous <= record["finished_unix_ms"].as_u64().unwrap());
 }
 
 fn validate(record: &Value, seed: usize) -> Vec<Confirmation> {

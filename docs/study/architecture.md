@@ -145,7 +145,7 @@ still real specialization work. "No per-model kernels" must not be shortened
 to "no handcrafted kernels."
 
 Naga parses and validates generated shaders and supplies the representation
-Blade consumes. The pinned implementation uses native extensions including
+Blade consumes. The published Blade 0.9/Naga 30 implementation uses native extensions including
 cooperative matrices: WGSL is an authoring/debugging boundary here, not a
 claim that every shader runs in a standard browser WebGPU implementation.
 
@@ -198,7 +198,7 @@ cross-step/read-modify-write state are pinned as appropriate. Pinning prevents
 alias reuse; it does not require host-visible memory.
 
 Parameters use shared storage. Intermediates, gradients and optimizer state
-can be device-local; the current Blade pin supplies `DeviceTransient` for
+can be device-local; Blade 0.9 supplies `DeviceTransient` for
 that allocation path. Diagnostics and checkpoints use staging when necessary.
 Metal private memory must never be treated as a host pointer. Buffer padding
 must be included in physical allocation and alias-safety reasoning.

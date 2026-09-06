@@ -201,6 +201,10 @@ and returns raw samples and decisions. It never runs the live graph or advances
 optimizer/KV state. Default-off: scalar GPU qualification passed on RTX 5070;
 native-f32 hardware coverage and automatic whole-step confirmation remain due.
 F16-input/complex-fusion/GEMV candidates and persistent winners are not included.
+Reports separate qualification's CPU preparation/copies/checks from
+transfer/dispatch/wait costs. Private tuning staging defaults to read-optimized
+Download; `TuneOptions::staging = TuneStaging::Shared` retains the original
+policy. Neither setting changes candidate bindings or numerical validation.
 See the [search contract](docs/study/performance-plan.md) and
 [whole-step experiment](examples/tune_session.rs).
 

@@ -4,8 +4,9 @@ Prepared 2026-09-05 against development base `bd6be08`, subsequently rebased
 onto `8069cf3` with checkpoint/memory work, `a455409` for training holdouts,
 then `230cab0` for controlled crossover confirmation
 on `codex/audit-observability-tuning`.
-Measured sources are retained as `evidence/tuning-2026-09-05` and
-`evidence/holdouts-2026-09-06` and `evidence/crossover-2026-09-06`;
+Measured sources are retained as `evidence/tuning-2026-09-05`,
+`evidence/holdouts-2026-09-06`, `evidence/crossover-2026-09-06` and
+`evidence/readback-2026-09-06`;
 rebasing does not relabel those measurements as results of newer code. Paper
 performance statements refer to the separately frozen revision. The initial audit was
 CPU-only; subsequent GPU qualification is described separately in the
@@ -51,6 +52,17 @@ session. MLP+Adam has no confirmed gain; two untuned/untuned controls are noisy.
 ResNet is unchanged, and its new phase timers put roughly 98% of search time
 in qualification. Read this as a lesson in separating numerical correctness,
 kernel selection, search cost and whole-step acceptance—not as a new paper result.
+
+The [staging follow-up](../experiments/readback-2026-09-06/README.md), on published
+Blade 0.9, separates CPU readback copies from numerical checks and transfer/wait.
+Across six paired processes, ResNet's median total search falls from 606 to
+39 ms: CPU readback allocation/copy falls from 582 to 2 ms, while the same
+validation takes about 6 ms. All 108 comparisons qualify and state remains
+bit-exact through Adam step 178. Private tuning staging now defaults to
+Download, with Shared still available; tuning itself remains opt-in. Added
+preparation/transfer costs and the first slower dense run are retained. This
+is cheaper search on one device, not faster ResNet execution or a Blade-version
+comparison. Development now requires Rust 1.92.
 
 The memory/restore follow-up removes unused Adam allocations, reports actual
 resident tensor-buffer requests, and restores logical checkpoints only after

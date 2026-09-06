@@ -289,7 +289,9 @@ include host encoding/submission and waiting; they are not GPU timestamps.
 CPU validation still scans complete outputs and compares sampled f64 dots.
 `TuneOptions::staging` controls only the one private copy buffer: Shared and
 Download keep its capacity and all candidate bindings/validation unchanged.
-See the [separate staging protocol](../experiments/readback-2026-09-06/README.md).
+New options default to Download after the measured promotion gates passed;
+missing settings in historical reports still deserialize as Shared. See the
+[separate staging protocol and results](../experiments/readback-2026-09-06/README.md).
 
 There may be two comparisons per class; the second challenges the last accepted
 winner, not necessarily the original heuristic choice. `failure` identifies
@@ -339,10 +341,22 @@ The retained crossover is another report-reading exercise. Dense inference
 passes both role orientations in all six processes (median 1.177×); MLP+Adam
 has four inconclusive outcomes and two noisy A/A controls; ResNet changes no
 selection. Bit-exact state checks through Adam step 178 do not imply a training
-speedup. ResNet's search is now localized to qualification (median 538 of
-546 ms), not sampling (7 ms). These timers still combine CPU checking,
-transfers and GPU work within that phase; they do not prove a readback cause.
+speedup. That cohort localized ResNet's search to qualification (median 538 of
+546 ms), not sampling (7 ms). Its timers still combined CPU checking,
+transfers and GPU work within that phase; they did not prove a readback cause.
 The 250 ms device telemetry is too coarse to describe every short timing pair.
+
+The subsequent Shared/Download cohort provides the narrower diagnosis. On
+Blade 0.9 and the same RTX 5070, median ResNet qualification falls from 598
+to 21 ms. Its CPU mapped-memory-to-vector allocation/copy falls from 582 to
+2 ms, while complete finite/parity scans and sampled f64 checks remain about
+6 ms. Readback transfer/encode/wait actually rises from 0.54 to 2.33 ms, and
+preparation rises from 0.65 to 10.41 ms; total search still falls from 606 to
+39 ms. The raw records retain all six processes, both search orders, every
+check and the first slower dense run. This supports changing the private
+staging policy, not shortening validation, claiming pure GPU transfer timings,
+or inferring physical heap/cache properties. The Metal backend maps Shared
+and Download to the same storage mode; no Metal performance gain is measured.
 
 ## What we should improve next
 

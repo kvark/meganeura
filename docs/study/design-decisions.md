@@ -112,6 +112,10 @@ Large-graph host-memory and allocation hardening followed on August 28
 Blade pin adds the `DeviceTransient` allocation path
 ([`bd6be08`](https://github.com/kvark/meganeura/commit/bd6be08)). None of
 these post-freeze changes can inherit the paper's performance numbers.
+The September 6 migration replaces the git pins with published Blade 0.9,
+blade-macros 0.3 and Naga 30, raises the Rust minimum to 1.92, and restores
+full `cargo package` verification. This closes the registry-dependency gap;
+it is not a new publication or cross-backend performance result.
 
 ## 6. The precision turn: accurate forward was not enough
 

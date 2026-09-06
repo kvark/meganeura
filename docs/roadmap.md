@@ -39,9 +39,18 @@ now confirms the dense chain in both session orientations (median 1.177×),
 but not MLP+Adam; two MLP A/A controls fail the noise screen. ResNet remains
 unchanged, with 98.26–98.65% of search time spent in qualification. A checked
 selection-only swap preserves tensor/optimizer state through role reversal.
-Next: localize qualification transfers/CPU checks and investigate staging
-placement, then whole-step profiles and broader reusable convolution/attention
-coverage. Keep tuning opt-in; do not fit a smaller margin or model rule.
+The [readback follow-up](experiments/readback-2026-09-06/README.md) now separates
+qualification's CPU copies/checks from transfer/dispatch/wait, using published
+Blade 0.9/Naga 30 (Rust 1.92). Across six paired processes, read-optimized
+private staging lowers median ResNet search from 606 to 39 ms: CPU readback
+allocation/copy falls from 582 to 2 ms while unchanged validation stays about
+6 ms. All 108 class comparisons qualify and full state is bit-exact through
+Adam step 178. Download becomes the private staging default; Shared remains
+available. Preparation and transfers cost more, and one dense search is slower
+overall; every attempt is retained. This is not a whole-step speed result.
+Next: split preparation/allocation/cleanup before bounded staging reuse, then
+whole-step profiles and broader reusable convolution/attention coverage.
+Keep tuning opt-in; do not fit a smaller margin or model rule.
 
 The [checkpoint/memory follow-up](study/checkpoints-and-memory.md) implements
 logical format-3 saves and preflighted restores, lazy Adam/LaProp state, and

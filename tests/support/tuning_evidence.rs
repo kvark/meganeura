@@ -16,6 +16,40 @@ pub struct Expected {
     pub output_elements: usize,
 }
 
+#[allow(dead_code)] // The original six-case holdout cohort has a different roster.
+pub const DIAGNOSTIC_CASES: [Expected; 3] = [
+    Expected {
+        name: "dense-inference",
+        work: "Inference",
+        dispatches: 8,
+        eligible: 3,
+        excluded: 0,
+        parameters: (8, 2097152),
+        gradients: (0, 0),
+        output_elements: 65536,
+    },
+    Expected {
+        name: "mlp-adam",
+        work: "Adam",
+        dispatches: 18,
+        eligible: 5,
+        excluded: 13,
+        parameters: (4, 410496),
+        gradients: (4, 410496),
+        output_elements: 127,
+    },
+    Expected {
+        name: "resnet50-flb",
+        work: "ForwardLossBackward",
+        dispatches: 512,
+        eligible: 1,
+        excluded: 511,
+        parameters: (108, 25530472),
+        gradients: (108, 25530472),
+        output_elements: 1,
+    },
+];
+
 pub fn close(a: f64, b: f64) {
     assert!(a.is_finite() && b.is_finite());
     assert!(

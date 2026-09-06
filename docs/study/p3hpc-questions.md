@@ -386,12 +386,27 @@ confidence interval. A/A runs before search only, and telemetry is coarse.
 
 Short: correctness qualification, transfers and host work cost time too.
 
-Detail: ResNet's only eligible classifier outer product spends median 538 ms
-in qualification out of 546 ms total search; sampling is about 7 ms. The phase
-timer has not yet separated CPU checks from uploads/readbacks and GPU work.
-Read-optimized staging is a testable hypothesis, not an established cause.
-Do not remove tiny-operand checks or reinterpret a cheaper search as a model
-speedup. See the [complete protocol and results](../experiments/crossover-2026-09-06/README.md).
+Detail: the first phase profile put 98% of ResNet's search in qualification.
+The follow-up separates CPU work and transfer/dispatch/wait, then changes
+only the private staging allocation. With Blade 0.9 on RTX 5070, median CPU
+readback allocation/copy falls from 582 to 2 ms; unchanged CPU validation
+still takes about 6 ms. Total search falls from 606 to 39 ms despite increased
+preparation and transfer costs. Keep the ordinary/tiny patterns, full scans
+and sampled f64 checks: they were not the dominant cost. See the
+[six-process protocol and results](../experiments/readback-2026-09-06/README.md).
+
+### 36. Does read-optimized staging mean faster kernels or faster ResNet?
+
+Short: neither. It means cheaper kernel search on the tested device.
+
+Detail: candidate code, bindings, precision and selection guards are identical.
+Download is the default for one private upload/readback buffer, not the live
+model's allocations. All 108 comparisons qualify, with bit-exact state checks
+through Adam step 178; continuation was untimed. Both arms used Blade 0.9,
+so this is not a Blade-version benchmark either. The original Shared option
+remains available and tuning remains opt-in. Source policies differ on Vulkan,
+but Shared and Download map to the same Metal storage mode; fleet performance
+and automatic whole-step confirmation are still open.
 
 ## Talk outline
 

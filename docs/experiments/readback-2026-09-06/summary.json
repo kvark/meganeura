@@ -1,0 +1,427 @@
+{
+  "schema_version": 1,
+  "measured_revision": "2abeff93b6ae5d9714a698cdc64d942ca965d2ff",
+  "default_download_accepted": true,
+  "cases": [
+    {
+      "name": "dense-inference",
+      "costs": {
+        "compile": {
+          "baseline_median_ms": 0.6950230000000001,
+          "tuned_median_ms": 0.6635575,
+          "speedup": 1.0474194022371837,
+          "paired_gain_median_ms": 0.024764000000000064,
+          "paired_noise_margin_ms": 0.7605519999999997,
+          "improvement_exceeds_guard": false,
+          "regression_exceeds_guard": false
+        },
+        "dispatch": {
+          "baseline_median_ms": 0.996182,
+          "tuned_median_ms": 0.9908025,
+          "speedup": 1.0054294372490986,
+          "paired_gain_median_ms": -0.0016189999999999816,
+          "paired_noise_margin_ms": 0.06419799999999976,
+          "improvement_exceeds_guard": false,
+          "regression_exceeds_guard": false
+        },
+        "elapsed": {
+          "baseline_median_ms": 73.201648,
+          "tuned_median_ms": 43.9765145,
+          "speedup": 1.664562297223442,
+          "paired_gain_median_ms": 29.14678200000001,
+          "paired_noise_margin_ms": 12.991656000000006,
+          "improvement_exceeds_guard": true,
+          "regression_exceeds_guard": false
+        },
+        "input_preparation": {
+          "baseline_median_ms": 1.267018,
+          "tuned_median_ms": 1.2346065,
+          "speedup": 1.0262524942157685,
+          "paired_gain_median_ms": 0.06464400000000003,
+          "paired_noise_margin_ms": 0.1207100000000001,
+          "improvement_exceeds_guard": false,
+          "regression_exceeds_guard": false
+        },
+        "preparation": {
+          "baseline_median_ms": 2.2800570000000002,
+          "tuned_median_ms": 17.234640499999998,
+          "speedup": 0.1322950136383756,
+          "paired_gain_median_ms": -14.944519499999998,
+          "paired_noise_margin_ms": 1.0801330000000018,
+          "improvement_exceeds_guard": false,
+          "regression_exceeds_guard": true
+        },
+        "qualification": {
+          "baseline_median_ms": 51.82474500000001,
+          "tuned_median_ms": 6.7905584999999995,
+          "speedup": 7.631882561647913,
+          "paired_gain_median_ms": 45.1693295,
+          "paired_noise_margin_ms": 11.778231999999996,
+          "improvement_exceeds_guard": true,
+          "regression_exceeds_guard": false
+        },
+        "qualification_other": {
+          "baseline_median_ms": 0.009531999999996543,
+          "tuned_median_ms": 0.008014499999999813,
+          "speedup": 1.1893443134315012,
+          "paired_gain_median_ms": 0.001128499999996091,
+          "paired_noise_margin_ms": 0.0010040000000044458,
+          "improvement_exceeds_guard": false,
+          "regression_exceeds_guard": false
+        },
+        "readback_host_copy": {
+          "baseline_median_ms": 45.280466000000004,
+          "tuned_median_ms": 0.141947,
+          "speedup": 318.99558285839083,
+          "paired_gain_median_ms": 45.136252,
+          "paired_noise_margin_ms": 12.407364000000008,
+          "improvement_exceeds_guard": true,
+          "regression_exceeds_guard": false
+        },
+        "readback_transfer": {
+          "baseline_median_ms": 0.657682,
+          "tuned_median_ms": 0.6858949999999999,
+          "speedup": 0.958866881957151,
+          "paired_gain_median_ms": -0.020426,
+          "paired_noise_margin_ms": 0.15767399999999998,
+          "improvement_exceeds_guard": false,
+          "regression_exceeds_guard": false
+        },
+        "sampling": {
+          "baseline_median_ms": 16.8340185,
+          "tuned_median_ms": 16.682164,
+          "speedup": 1.009102805847011,
+          "paired_gain_median_ms": 0.13889700000000005,
+          "paired_noise_margin_ms": 0.20418699999999745,
+          "improvement_exceeds_guard": false,
+          "regression_exceeds_guard": false
+        },
+        "upload_host_copy": {
+          "baseline_median_ms": 1.1611004999999999,
+          "tuned_median_ms": 0.7279895000000001,
+          "speedup": 1.5949412731914399,
+          "paired_gain_median_ms": 0.434494,
+          "paired_noise_margin_ms": 0.0438299999999997,
+          "improvement_exceeds_guard": true,
+          "regression_exceeds_guard": false
+        },
+        "upload_transfer": {
+          "baseline_median_ms": 1.3901654999999997,
+          "tuned_median_ms": 2.1375775,
+          "speedup": 0.650346244756038,
+          "paired_gain_median_ms": -0.6670314999999999,
+          "paired_noise_margin_ms": 0.18978899999999932,
+          "improvement_exceeds_guard": false,
+          "regression_exceeds_guard": true
+        },
+        "validation": {
+          "baseline_median_ms": 0.956083,
+          "tuned_median_ms": 0.8919469999999999,
+          "speedup": 1.0719056177104695,
+          "paired_gain_median_ms": 0.06736799999999998,
+          "paired_noise_margin_ms": 0.05326199999999981,
+          "improvement_exceeds_guard": false,
+          "regression_exceeds_guard": false
+        },
+        "warmup": {
+          "baseline_median_ms": 1.4962495,
+          "tuned_median_ms": 1.415986,
+          "speedup": 1.056683823145144,
+          "paired_gain_median_ms": 0.06767000000000012,
+          "paired_noise_margin_ms": 0.10316800000000037,
+          "improvement_exceeds_guard": false,
+          "regression_exceeds_guard": false
+        }
+      },
+      "process_search_ratios": [
+        0.8527376311576275,
+        1.5415151615043674,
+        1.7808243863499225,
+        1.844545911420889,
+        1.5149164695327906,
+        1.8190440279079163
+      ],
+      "median_process_search_ratio": 1.661169773927145
+    },
+    {
+      "name": "mlp-adam",
+      "costs": {
+        "compile": {
+          "baseline_median_ms": 0.961989,
+          "tuned_median_ms": 1.0332280000000003,
+          "speedup": 0.9310520040107312,
+          "paired_gain_median_ms": -0.056146000000000085,
+          "paired_noise_margin_ms": 0.242085,
+          "improvement_exceeds_guard": false,
+          "regression_exceeds_guard": false
+        },
+        "dispatch": {
+          "baseline_median_ms": 1.2271904999999999,
+          "tuned_median_ms": 1.2921010000000002,
+          "speedup": 0.9497636020713549,
+          "paired_gain_median_ms": 0.002127499999999838,
+          "paired_noise_margin_ms": 0.23700099999999957,
+          "improvement_exceeds_guard": false,
+          "regression_exceeds_guard": false
+        },
+        "elapsed": {
+          "baseline_median_ms": 175.439472,
+          "tuned_median_ms": 63.5316915,
+          "speedup": 2.7614481506446276,
+          "paired_gain_median_ms": 112.84833449999999,
+          "paired_noise_margin_ms": 36.824821000000014,
+          "improvement_exceeds_guard": true,
+          "regression_exceeds_guard": false
+        },
+        "input_preparation": {
+          "baseline_median_ms": 1.5034885,
+          "tuned_median_ms": 1.45574,
+          "speedup": 1.0328001566213747,
+          "paired_gain_median_ms": 0.04389399999999988,
+          "paired_noise_margin_ms": 0.05335999999999985,
+          "improvement_exceeds_guard": false,
+          "regression_exceeds_guard": false
+        },
+        "preparation": {
+          "baseline_median_ms": 1.4536194999999998,
+          "tuned_median_ms": 28.141848000000003,
+          "speedup": 0.05165330649216781,
+          "paired_gain_median_ms": -26.425479,
+          "paired_noise_margin_ms": 0.8491020000000056,
+          "improvement_exceeds_guard": false,
+          "regression_exceeds_guard": true
+        },
+        "qualification": {
+          "baseline_median_ms": 144.883161,
+          "tuned_median_ms": 10.420556000000001,
+          "speedup": 13.903592188363076,
+          "paired_gain_median_ms": 134.8068545,
+          "paired_noise_margin_ms": 20.699427999999983,
+          "improvement_exceeds_guard": true,
+          "regression_exceeds_guard": false
+        },
+        "qualification_other": {
+          "baseline_median_ms": 0.016039999999989618,
+          "tuned_median_ms": 0.013846500000000539,
+          "speedup": 1.1584154840565482,
+          "paired_gain_median_ms": 0.002376999999973428,
+          "paired_noise_margin_ms": 0.0012080000000231905,
+          "improvement_exceeds_guard": true,
+          "regression_exceeds_guard": false
+        },
+        "readback_host_copy": {
+          "baseline_median_ms": 134.65595100000002,
+          "tuned_median_ms": 0.466282,
+          "speedup": 288.78650902243714,
+          "paired_gain_median_ms": 134.18067050000002,
+          "paired_noise_margin_ms": 20.881129999999985,
+          "improvement_exceeds_guard": true,
+          "regression_exceeds_guard": false
+        },
+        "readback_transfer": {
+          "baseline_median_ms": 1.1092430000000002,
+          "tuned_median_ms": 1.1964565,
+          "speedup": 0.9271068358941593,
+          "paired_gain_median_ms": -0.08653800000000011,
+          "paired_noise_margin_ms": 0.05612399999999984,
+          "improvement_exceeds_guard": false,
+          "regression_exceeds_guard": false
+        },
+        "sampling": {
+          "baseline_median_ms": 21.2299975,
+          "tuned_median_ms": 19.864099999999997,
+          "speedup": 1.0687621135616516,
+          "paired_gain_median_ms": 1.3604285000000012,
+          "paired_noise_margin_ms": 0.7423310000000036,
+          "improvement_exceeds_guard": false,
+          "regression_exceeds_guard": false
+        },
+        "upload_host_copy": {
+          "baseline_median_ms": 1.742182,
+          "tuned_median_ms": 1.0304275,
+          "speedup": 1.6907370969815925,
+          "paired_gain_median_ms": 0.7120879999999999,
+          "paired_noise_margin_ms": 0.026682000000000317,
+          "improvement_exceeds_guard": true,
+          "regression_exceeds_guard": false
+        },
+        "upload_transfer": {
+          "baseline_median_ms": 2.3508690000000003,
+          "tuned_median_ms": 2.942056,
+          "speedup": 0.7990565101412075,
+          "paired_gain_median_ms": -0.6129274999999998,
+          "paired_noise_margin_ms": 0.3773879999999994,
+          "improvement_exceeds_guard": false,
+          "regression_exceeds_guard": true
+        },
+        "validation": {
+          "baseline_median_ms": 2.1709810000000003,
+          "tuned_median_ms": 2.0175300000000003,
+          "speedup": 1.0760588442303212,
+          "paired_gain_median_ms": 0.15529099999999985,
+          "paired_noise_margin_ms": 0.06502599999999958,
+          "improvement_exceeds_guard": false,
+          "regression_exceeds_guard": false
+        },
+        "warmup": {
+          "baseline_median_ms": 1.905293,
+          "tuned_median_ms": 1.7459275,
+          "speedup": 1.0912784179182697,
+          "paired_gain_median_ms": 0.1740434999999999,
+          "paired_noise_margin_ms": 0.06811000000000034,
+          "improvement_exceeds_guard": false,
+          "regression_exceeds_guard": false
+        }
+      },
+      "process_search_ratios": [
+        3.4300471695407335,
+        2.7843313583776745,
+        3.0437914296030706,
+        2.82210295061146,
+        2.4876149916913355,
+        2.4078797319699587
+      ],
+      "median_process_search_ratio": 2.8032171544945674
+    },
+    {
+      "name": "resnet50-flb",
+      "costs": {
+        "compile": {
+          "baseline_median_ms": 0.5478750000000001,
+          "tuned_median_ms": 0.506938,
+          "speedup": 1.0807534649207597,
+          "paired_gain_median_ms": 0.029283500000000046,
+          "paired_noise_margin_ms": 0.17496299999999992,
+          "improvement_exceeds_guard": false,
+          "regression_exceeds_guard": false
+        },
+        "dispatch": {
+          "baseline_median_ms": 0.5618345,
+          "tuned_median_ms": 0.6643680000000001,
+          "speedup": 0.8456676119259205,
+          "paired_gain_median_ms": -0.13918450000000004,
+          "paired_noise_margin_ms": 0.11795299999999986,
+          "improvement_exceeds_guard": false,
+          "regression_exceeds_guard": false
+        },
+        "elapsed": {
+          "baseline_median_ms": 606.464198,
+          "tuned_median_ms": 38.8527845,
+          "speedup": 15.609285301031642,
+          "paired_gain_median_ms": 568.360496,
+          "paired_noise_margin_ms": 25.56199499999991,
+          "improvement_exceeds_guard": true,
+          "regression_exceeds_guard": false
+        },
+        "input_preparation": {
+          "baseline_median_ms": 3.0166135,
+          "tuned_median_ms": 3.057592,
+          "speedup": 0.9865977867550674,
+          "paired_gain_median_ms": -0.04097850000000003,
+          "paired_noise_margin_ms": 5.908798999999999,
+          "improvement_exceeds_guard": false,
+          "regression_exceeds_guard": false
+        },
+        "preparation": {
+          "baseline_median_ms": 0.647988,
+          "tuned_median_ms": 10.4079385,
+          "speedup": 0.06225901507776972,
+          "paired_gain_median_ms": -9.799379,
+          "paired_noise_margin_ms": 0.14997299999999925,
+          "improvement_exceeds_guard": false,
+          "regression_exceeds_guard": true
+        },
+        "qualification": {
+          "baseline_median_ms": 598.3776115000001,
+          "tuned_median_ms": 20.591999,
+          "speedup": 29.058743228377196,
+          "paired_gain_median_ms": 578.6211344999999,
+          "paired_noise_margin_ms": 21.499923000000194,
+          "improvement_exceeds_guard": true,
+          "regression_exceeds_guard": false
+        },
+        "qualification_other": {
+          "baseline_median_ms": 0.0056564999999864085,
+          "tuned_median_ms": 0.007241499999999235,
+          "speedup": 0.781122695572327,
+          "paired_gain_median_ms": -0.0017950000000226396,
+          "paired_noise_margin_ms": 0.012741999999910547,
+          "improvement_exceeds_guard": false,
+          "regression_exceeds_guard": false
+        },
+        "readback_host_copy": {
+          "baseline_median_ms": 582.2379835,
+          "tuned_median_ms": 2.0347679999999997,
+          "speedup": 286.14465310050093,
+          "paired_gain_median_ms": 580.2010985000001,
+          "paired_noise_margin_ms": 29.768750999999725,
+          "improvement_exceeds_guard": true,
+          "regression_exceeds_guard": false
+        },
+        "readback_transfer": {
+          "baseline_median_ms": 0.535415,
+          "tuned_median_ms": 2.331364,
+          "speedup": 0.2296574022760924,
+          "paired_gain_median_ms": -1.8508065000000002,
+          "paired_noise_margin_ms": 0.2672760000000003,
+          "improvement_exceeds_guard": false,
+          "regression_exceeds_guard": true
+        },
+        "sampling": {
+          "baseline_median_ms": 6.8992115,
+          "tuned_median_ms": 6.0823730000000005,
+          "speedup": 1.134296022292615,
+          "paired_gain_median_ms": 0.922733,
+          "paired_noise_margin_ms": 0.9428049999999999,
+          "improvement_exceeds_guard": false,
+          "regression_exceeds_guard": false
+        },
+        "upload_host_copy": {
+          "baseline_median_ms": 3.598484,
+          "tuned_median_ms": 2.8522055,
+          "speedup": 1.261649625176026,
+          "paired_gain_median_ms": 0.7641315,
+          "paired_noise_margin_ms": 0.035731999999999875,
+          "improvement_exceeds_guard": true,
+          "regression_exceeds_guard": false
+        },
+        "upload_transfer": {
+          "baseline_median_ms": 1.123567,
+          "tuned_median_ms": 3.5916865,
+          "speedup": 0.3128243514571776,
+          "paired_gain_median_ms": -2.483037,
+          "paired_noise_margin_ms": 0.500159,
+          "improvement_exceeds_guard": false,
+          "regression_exceeds_guard": true
+        },
+        "validation": {
+          "baseline_median_ms": 6.0271165,
+          "tuned_median_ms": 6.006032,
+          "speedup": 1.003510554056322,
+          "paired_gain_median_ms": 0.12280699999999944,
+          "paired_noise_margin_ms": 0.18674000000000124,
+          "improvement_exceeds_guard": false,
+          "regression_exceeds_guard": false
+        },
+        "warmup": {
+          "baseline_median_ms": 0.487727,
+          "tuned_median_ms": 0.5368885,
+          "speedup": 0.9084325702636582,
+          "paired_gain_median_ms": -0.06601549999999995,
+          "paired_noise_margin_ms": 0.2446790000000001,
+          "improvement_exceeds_guard": false,
+          "regression_exceeds_guard": false
+        }
+      },
+      "process_search_ratios": [
+        15.976364781480163,
+        16.004461091872965,
+        11.678164433866046,
+        15.82803213034596,
+        15.306890680392284,
+        12.115768753668007
+      ],
+      "median_process_search_ratio": 15.567461405369123
+    }
+  ]
+}
