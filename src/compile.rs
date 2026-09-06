@@ -1883,10 +1883,18 @@ pub fn fuse_rmsnorm_into_gemv(plan: &mut ExecutionPlan) {
         let Some(consumers) = readers.get(&normed) else {
             continue;
         };
+        // `generate_module_gemv_rmsnorm` derives from the f32 GEMV, and the
+        // fused pipeline is a `Variant::GemvRmsNorm`, which does not compose
+        // with `Variant::Weight`. Folding the norm into a GEMV whose weight
+        // is not f32 would therefore run the f32 kernel over packed blocks —
+        // and under a binding layout with an extra buffer, so the damage
+        // lands in neighbouring buffers rather than just the result.
         if consumers.is_empty()
             || consumers.iter().any(|&c| {
                 let d = &plan.dispatches[c];
-                d.shader != ShaderEntry::MatMulGemv || d.input_buffers.first() != Some(&normed)
+                d.shader != ShaderEntry::MatMulGemv
+                    || d.input_buffers.first() != Some(&normed)
+                    || d.weight_format != WeightFormat::F32
             })
         {
             continue;

@@ -3274,6 +3274,160 @@ fn q4_matmul_single_row_matches_reference() {
     );
 }
 
+/// Roadmap: "quantized matmul, required before E4B". A decode graph is
+/// all m=1 matmuls, so this is the shape the Q4 GEMV was for.
+///
+/// Only the seven per-layer projections are packed. The embedding table
+/// stays f32 (`embedding` has no Q4 gather, and a tied `lm_head` shares
+/// it), as do the norms and the KV cache.
+#[test]
+fn smollm2_q4_projections_match_f32_decode() {
+    use meganeura::models::smollm2::{self, ProjectionWeights, SmolLM2Config};
+
+    fn decode(config: &SmolLM2Config, weights: ProjectionWeights) -> (Vec<f32>, usize) {
+        let mut g = Graph::new();
+        let (logits, _k, _v) = smollm2::build_decode_graph_with(&mut g, config, 16, weights);
+        g.set_outputs(vec![logits]);
+        let mut s = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+        let mut param_bytes = 0usize;
+        for (name, buf) in s.plan().param_buffers.clone() {
+            let bytes = s.plan().buffers[buf.0 as usize];
+            param_bytes += bytes;
+            if name.contains("kv_cache") {
+                s.set_parameter(&name, &vec![0.0f32; bytes / 4]);
+                continue;
+            }
+            // A packed buffer is smaller than its logical element count, so
+            // size the upload from the weight shape, not the buffer.
+            let n = s
+                .plan()
+                .weight_buffers
+                .get(&buf)
+                .map(|&(_, r, c)| r * c)
+                .unwrap_or(bytes / 4);
+            let seed = name.bytes().fold(2166136261u32, |h, b| {
+                h.wrapping_mul(16777619) ^ u32::from(b)
+            });
+            let data: Vec<f32> = (0..n)
+                .map(|i| {
+                    let x = seed.wrapping_add((i as u32).wrapping_mul(2654435761)) as f32
+                        / (1u32 << 31) as f32;
+                    (x - 1.0) * 0.2
+                })
+                .collect();
+            s.set_parameter(&name, &data);
+        }
+        let mut logits = Vec::new();
+        for (pos, tok) in [1u32, 2, 3, 4, 5].iter().enumerate() {
+            s.set_input_u32("token_ids", &[*tok]);
+            s.set_input_u32("kv_pos", &[pos as u32]);
+            s.step();
+            s.wait();
+            logits = s.read_output(config.vocab_size);
+        }
+        (logits, param_bytes)
+    }
+
+    let config = SmolLM2Config::small_test();
+    let (f32_logits, f32_bytes) = decode(&config, ProjectionWeights::F32);
+    let (q4_logits, q4_bytes) = decode(&config, ProjectionWeights::Q4);
+
+    assert!(
+        q4_logits.iter().all(|v| v.is_finite()),
+        "Q4 decode produced non-finite logits"
+    );
+    let scale = f32_logits
+        .iter()
+        .cloned()
+        .fold(0.0f32, |m, v| m.max(v.abs()));
+    let err = f32_logits
+        .iter()
+        .zip(&q4_logits)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let argmax = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    };
+    // Measured 0.5% of the logit range on lavapipe; the margin is for other
+    // adapters, not for a second bug.
+    assert!(
+        err / scale < 0.05,
+        "Q4 decode diverged from f32: max_abs_err={err} (logit range {scale})"
+    );
+    assert_eq!(
+        argmax(&f32_logits),
+        argmax(&q4_logits),
+        "Q4 decode would generate a different token"
+    );
+    assert!(
+        q4_bytes * 2 < f32_bytes,
+        "Q4 parameters should be far smaller: {q4_bytes} vs {f32_bytes} bytes"
+    );
+}
+
+/// RmsNorm folds into a following GEMV, and that fused pipeline is a
+/// `Variant::GemvRmsNorm` which does not compose with `Variant::Weight`.
+/// Folding it into a Q4 GEMV therefore ran the f32 kernel over packed
+/// blocks, under a binding layout carrying an extra buffer — so the
+/// corruption landed in neighbouring buffers (a KV cache, in the graph
+/// that found this) rather than only in the result.
+///
+/// Unreachable until Q4 gained a GEMV variant, since Q4 was kept off that
+/// path entirely before then.
+#[test]
+fn q4_matmul_after_rms_norm_matches_reference() {
+    let (k, n) = (576usize, 1536usize);
+    let x: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
+    let nw: Vec<f32> = (0..k).map(|i| 1.0 + ((i % 5) as f32 - 2.0) * 0.1).collect();
+    let w: Vec<f32> = (0..k * n)
+        .map(|i| ((i % 97) as f32 - 48.0) * 0.01)
+        .collect();
+    let eps = 1e-5f32;
+
+    let mut g = Graph::new();
+    let x_in = g.input("x", &[1, k]);
+    let norm_w = g.parameter("norm_w", &[k]);
+    let h = g.rms_norm(x_in, norm_w, eps);
+    let w_q4 = g.parameter_q4("w", &[k, n]);
+    let out = g.matmul(h, w_q4);
+    g.set_outputs(vec![out]);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    session.set_input("x", &x);
+    session.set_parameter("norm_w", &nw);
+    session.set_parameter("w", &w);
+    session.step();
+    session.wait();
+    let gpu = session.read_output(n);
+
+    let ms = x.iter().map(|v| v * v).sum::<f32>() / k as f32;
+    let inv = (ms + eps).sqrt().recip();
+    let normed: Vec<f32> = x.iter().zip(&nw).map(|(v, g)| v * inv * g).collect();
+    let w_deq =
+        meganeura::runtime::dequantize_q4_0(&meganeura::runtime::quantize_q4_0(&w, k, n), k, n);
+    let mut max_err = 0.0f32;
+    let mut scale = 0.0f32;
+    for col in 0..n {
+        let mut want = 0.0f32;
+        for i in 0..k {
+            want += normed[i] * w_deq[i * n + col];
+        }
+        scale = scale.max(want.abs());
+        max_err = max_err.max((gpu[col] - want).abs());
+    }
+    assert!(
+        gpu.iter().all(|v| v.is_finite()),
+        "Q4 matmul after RmsNorm produced non-finite values"
+    );
+    assert!(
+        max_err / scale < 1e-3,
+        "Q4 matmul after RmsNorm diverged: max_abs_err={max_err} (scale {scale})"
+    );
+}
+
 /// Incrementally build a 1-layer transformer with Q4 weights.
 /// Output each intermediate result to find where NaN first appears.
 #[test]
