@@ -314,8 +314,8 @@ impl Session {
     ///
     /// Forward MatMul+Add and unpacked NCHW scalar convolution dX/dW are supported;
     /// convolution keys include batch, channels, spatial extents, kernel, stride
-    /// and padding. Existing reciprocal index decomposition must be exact over
-    /// its full domain. Forward/cooperative convolutions remain excluded.
+    /// and padding. Index decomposition uses exact integer division.
+    /// Forward/cooperative convolutions remain excluded.
     /// Other prologues/epilogues, horizontal
     /// packs, f16-input cooperative, reduced-storage, GEMV and overlapping-binding
     /// dispatches are excluded. Winners live in this session, not the plan cache.

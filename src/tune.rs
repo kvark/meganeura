@@ -137,25 +137,6 @@ impl TuneConv2d {
     }
 }
 
-// Existing convolution kernels decompose indices by f32 reciprocal multiplication.
-// Within exactly representable integer inputs this is monotone. Checking both
-// endpoints of each quotient interval proves every decomposition, not just samples.
-fn exact_reciprocal_division(count: u32, divisor: u32) -> bool {
-    if count == 0 || divisor == 0 || count > 1 << 24 {
-        return false;
-    }
-    if divisor.is_power_of_two() {
-        return true;
-    }
-    let reciprocal = 1.0 / divisor as f32;
-    (0..count).step_by(divisor as usize).all(|first| {
-        let last = (u64::from(first) + u64::from(divisor) - 1).min(u64::from(count - 1)) as u32;
-        [first, last]
-            .into_iter()
-            .all(|i| (i as f32 * reciprocal) as u32 == i / divisor)
-    })
-}
-
 /// f32 implementations with identical bindings and logical extents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MatmulTile {
@@ -339,26 +320,14 @@ impl TuneClass {
         };
         let (m, n, k) = if let Some(s) = conv2d {
             let kernel = s.kernel_h.checked_mul(s.kernel_w)?;
-            if !exact_reciprocal_division(kernel, s.kernel_w) {
-                return None;
-            }
             if shader == ShaderEntry::Conv2dGradInputGemm {
                 let n = s.in_h.checked_mul(s.in_w)?;
                 let k = s.out_channels.checked_mul(kernel)?;
-                if !exact_reciprocal_division(k, kernel) || !exact_reciprocal_division(n, s.in_w) {
-                    return None;
-                }
                 (s.in_channels, n, k)
             } else {
                 let n = s.in_channels.checked_mul(kernel)?;
                 let spatial = s.out_h.checked_mul(s.out_w)?;
                 let k = s.batch.checked_mul(spatial)?;
-                if !exact_reciprocal_division(n, kernel)
-                    || !exact_reciprocal_division(k, spatial)
-                    || !exact_reciprocal_division(spatial, s.out_w)
-                {
-                    return None;
-                }
                 (s.out_channels, n, k)
             }
         } else if matches!(shader, ShaderEntry::MatMul | ShaderEntry::FusedMatMulAdd) {
@@ -366,7 +335,14 @@ impl TuneClass {
         } else {
             (dispatch.params[0], dispatch.params[1], dispatch.params[2])
         };
-        if m == 0 || n == 0 || k == 0 || m.div_ceil(32) > 65_535 || n.div_ceil(32) > 65_535 {
+        // Scalar K loops advance by 16, including the final padded tile.
+        if m == 0
+            || n == 0
+            || k == 0
+            || k > u32::MAX - 15
+            || m.div_ceil(32) > 65_535
+            || n.div_ceil(32) > 65_535
+        {
             return None;
         }
         let class = Self {
@@ -976,18 +952,23 @@ mod tests {
     }
 
     #[test]
-    fn reciprocal_legality_proves_intervals_and_rejects_rounding_errors() {
-        let mut rejected = 0;
-        for divisor in 1..130 {
-            let count = 4000;
-            let reciprocal = 1.0 / divisor as f32;
-            let exhaustive = (0..count).all(|i| (i as f32 * reciprocal) as u32 == i / divisor);
-            assert_eq!(exact_reciprocal_division(count, divisor), exhaustive);
-            rejected += usize::from(!exhaustive);
+    fn convolution_indexing_does_not_require_exact_f32_reciprocals() {
+        for divisor in [41, 47, 55] {
+            assert_eq!((divisor as f32 * (1.0 / divisor as f32)) as u32, 0);
+            for shader in [
+                ShaderEntry::Conv2dGradInputGemm,
+                ShaderEntry::Conv2dGradWeightGemm,
+            ] {
+                let mut d = conv_dispatch(shader);
+                d.params = vec![2, 3, 1, divisor, 5, 1, 1, 1, 0, 1, divisor, 0];
+                assert!(TuneClass::from_dispatch(&d, None).is_some(), "{d:?}");
+            }
         }
-        assert!(rejected > 0);
-        for (count, divisor) in [(0, 1), (1, 0), ((1 << 24) + 1, 2), (u32::MAX, 1)] {
-            assert!(!exact_reciprocal_division(count, divisor));
+        // No f32 integer-domain limit, but a padded K loop must not wrap u32.
+        let mut d = conv_dispatch(ShaderEntry::Conv2dGradWeightGemm);
+        for (batch, width, admitted) in [(2, (1 << 23) + 1, true), (65_535, 65_537, false)] {
+            d.params = vec![batch, 1, 1, width, 1, 1, 1, 1, 0, 1, width, 0];
+            assert_eq!(TuneClass::from_dispatch(&d, None).is_some(), admitted);
         }
     }
 

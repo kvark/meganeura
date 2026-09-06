@@ -102,7 +102,13 @@ fn check(label: &str, actual: &[f32], expected: &[f64], scale: f32) {
     );
 }
 
-fn run(s: Shape, tile: u32, gpu: &Arc<blade_graphics::Context>, policy: CoopPolicy, tune: bool) {
+fn run(
+    s: Shape,
+    tile: u32,
+    gpu: &Arc<blade_graphics::Context>,
+    policy: CoopPolicy,
+    tune: bool,
+) -> Session {
     let [nx, nw, ny] = s.sizes();
     let mut graph = Graph::new();
     let x = graph.parameter("x", &[nx]);
@@ -118,6 +124,16 @@ fn run(s: Shape, tile: u32, gpu: &Arc<blade_graphics::Context>, policy: CoopPoli
     let mut forced = 0;
     for d in &mut plan.dispatches {
         match d.shader {
+            ShaderEntry::Conv2dGemm | ShaderEntry::Conv2dGemmSmall => {
+                d.shader = if tile == 32 {
+                    ShaderEntry::Conv2dGemmSmall
+                } else {
+                    ShaderEntry::Conv2dGemm
+                };
+                let (oh, ow) = s.output();
+                d.workgroups = [(oh * ow).div_ceil(tile), s.co.div_ceil(tile), s.batch];
+                forced += 1;
+            }
             ShaderEntry::Conv2dGradInputGemm | ShaderEntry::Conv2dGradInputGemmSmall => {
                 d.shader = if tile == 32 {
                     ShaderEntry::Conv2dGradInputGemmSmall
@@ -139,7 +155,7 @@ fn run(s: Shape, tile: u32, gpu: &Arc<blade_graphics::Context>, policy: CoopPoli
             _ => {}
         }
     }
-    assert_eq!(forced, 2);
+    assert_eq!(forced, 3);
     let mut session = Session::with_context_opts(
         plan,
         Arc::clone(gpu),
@@ -266,11 +282,56 @@ fn run(s: Shape, tile: u32, gpu: &Arc<blade_graphics::Context>, policy: CoopPoli
             );
         }
     }
+    session
 }
 
 #[test]
 fn scalar_conv_derivatives_match_full_oracle_across_padding_stride_and_tile_edges() {
     scalar_oracles(false);
+}
+
+#[test]
+fn scalar_conv_indexing_matches_full_oracle_at_reciprocal_boundaries() {
+    reciprocal_boundary_oracles(false);
+}
+
+#[test]
+#[ignore = "GPU scalar convolution tuning qualification; requires idle device"]
+fn tuned_conv_indexing_matches_full_oracle_at_reciprocal_boundaries() {
+    reciprocal_boundary_oracles(true);
+}
+
+fn reciprocal_boundary_oracles(tune: bool) {
+    let gpu = Arc::new(meganeura::init_gpu_context().unwrap());
+    for divisor in [41, 47, 55] {
+        // Old f32 reciprocal multiplication maps divisor/divisor to zero.
+        // Cover spatial/batch boundaries, then kernel/channel decomposition.
+        for (h, w, kh, kw, ph, pw) in [
+            (1, divisor, 1, 1, 0, 0),
+            (3, divisor + 6, 2, divisor, 1, divisor / 2),
+        ] {
+            for tile in [32, 64] {
+                run(
+                    Shape {
+                        batch: 2,
+                        ci: 3,
+                        h,
+                        w,
+                        co: 5,
+                        kh,
+                        kw,
+                        stride: 1,
+                        ph,
+                        pw,
+                    },
+                    tile,
+                    &gpu,
+                    CoopPolicy::Disabled,
+                    tune,
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -318,14 +379,7 @@ fn scalar_oracles(tune: bool) {
 #[ignore = "Requires cooperative hardware; verifies actual generated dX execution"]
 fn generated_conv_derivatives_match_oracle_without_assuming_same_padding() {
     let gpu = Arc::new(meganeura::init_gpu_context().unwrap());
-    assert!(gpu.capabilities().cooperative_matrix.is_supported());
-    let policy = if gpu.capabilities().cooperative_matrix.f32_tile > 0 {
-        CoopPolicy::Auto
-    } else {
-        // Exactly representable bounded operands isolate indexing on f16-only
-        // hardware. This is not qualification of tiny f32 derivatives on f16.
-        CoopPolicy::AllowF16
-    };
+    let policy = cooperative_policy(&gpu);
     for (kh, kw, stride, ph, pw) in [(3, 3, 1, 0, 0), (2, 4, 1, 0, 1), (3, 2, 2, 0, 1)] {
         run(
             Shape {
@@ -345,5 +399,53 @@ fn generated_conv_derivatives_match_oracle_without_assuming_same_padding() {
             policy,
             false,
         );
+    }
+}
+
+fn cooperative_policy(gpu: &blade_graphics::Context) -> CoopPolicy {
+    assert!(gpu.capabilities().cooperative_matrix.is_supported());
+    if gpu.capabilities().cooperative_matrix.f32_tile > 0 {
+        CoopPolicy::Auto
+    } else {
+        // Exactly representable bounded operands isolate indexing on f16-only
+        // hardware. This is not qualification of tiny f32 derivatives on f16.
+        CoopPolicy::AllowF16
+    }
+}
+
+#[test]
+#[ignore = "Requires cooperative hardware; verifies generated dX and admitted forward execution"]
+fn generated_conv_indexing_matches_full_oracle_at_reciprocal_boundaries() {
+    let gpu = Arc::new(meganeura::init_gpu_context().unwrap());
+    let policy = cooperative_policy(&gpu);
+    for width in [41, 47, 55] {
+        let session = run(
+            Shape {
+                batch: 2,
+                ci: 64,
+                h: 16,
+                w: width,
+                co: 128,
+                kh: 1,
+                kw: 1,
+                stride: 1,
+                ph: 0,
+                pw: 0,
+            },
+            64,
+            &gpu,
+            policy,
+            false,
+        );
+        // The native tile-8 policy deliberately keeps forward convolution scalar.
+        if gpu.capabilities().cooperative_matrix.f32_tile != 8 {
+            assert!(
+                session
+                    .plan()
+                    .dispatches
+                    .iter()
+                    .any(|d| d.use_coop && matches!(d.shader, ShaderEntry::Conv2dGemmCoopGen(..)))
+            );
+        }
     }
 }

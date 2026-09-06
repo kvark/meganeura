@@ -95,6 +95,7 @@ behind as a second unsafe default path.
 | Decision | Up to two sequential challenger comparisons per class. Each uses the last accepted winner as incumbent. Candidate median and median paired gain must beat a 5% margin plus twice the MAD of paired differences. Noise guard is not a confidence interval. Invalid/incomplete comparisons retain the incumbent, including a completed earlier winner. |
 | Budget | Default eight classes, 64 MiB GPU scratch including staging, two-second soft total deadline, one warmup per variant. An in-flight driver/validation/submission operation can overrun. Pipeline/CPU memory is not charged to the scratch byte cap. |
 | Priority/reporting | Descending repetition×M×N×K×Z structural prior (Z is batch for dX, otherwise 1), stable ties; resolved settings, eligible/visited classes, per-comparison and pipeline costs, exclusions, scratch/time/device-memory skips, qualification/rejection details and raw timings. This prior orders searches, never declares a winner. |
+| Lifetime | Choices affect this session only. Semantic plan cache and frozen results stay untouched. |
 
 The dense contract above now extends to scalar NCHW convolution dX/dW, with
 `TuneScope::{Dense, ConvDerivatives, All}` selecting the experiment domain.
@@ -112,16 +113,20 @@ and geometry together; dense `use_small_tiles` is not a convolution flag.
 Both scalar variants retain f32 arithmetic. The full finite/cross-variant
 scans include all dX batches, while the 32 f64 dots use convolution indexing
 and explicit first/last/scattered batches. Checked integer products and signed
-coordinates reject overflow; existing reciprocal index decomposition must be
-exact at every quotient interval's endpoints within exactly representable
-integer inputs. Monotonicity then covers the interior. This restriction excludes
-unsafe search domains; it does not fix those pre-existing kernels. Forward and
-cooperative convolution remain outside this search.
-For example, f32 reciprocal multiplication truncates `41 / 41` to zero with
-the existing formula. This CPU counterexample is now an explicit open audit
-item: repair the reusable indexing and add adversarial GPU oracles before
-widening the admitted domain. It is not a retained GPU accuracy measurement.
-| Lifetime | Choices affect this session only. Semantic plan cache and frozen results stay untouched. |
+coordinates and padded K loops reject overflow. Convolution now decomposes
+indices using integer division, including ordinary forward/cooperative paths
+outside the tuner. The earlier f32 reciprocal interval filter is obsolete and
+removed, along with four uniform fields. This admits formerly excluded shapes
+without relaxing validation. Forward and cooperative convolution remain outside
+the search, but receive the shared correctness repair.
+
+This distinction matters: multiplying by the rounded f32 reciprocal mapped
+`41 / 41` to zero. A batch-2, width-41 GPU regression produced `dW[0]=0.9391`
+instead of the independent f64 oracle's `0.8370`. Full oracles now cover fourteen
+scalar shapes, both tiles and ordinary/tiny gradients; six generated cooperative
+shapes execute on this GPU with exactly representable f16 operands. Native-f32
+execution still needs hardware qualification. The [separate cost protocol](../experiments/conv-indexing-2026-09-06/README.md)
+keeps correctness and performance evidence distinct.
 
 The former small-tile occupancy cutoff is now an **initial choice**, not a
 profitability veto for eligible tuned classes: either tile can win. Untuned,
@@ -333,8 +338,12 @@ f64 scatter oracles cover forward outputs, eight shapes and both derivative tile
 ordinary/tiny gradients, state isolation and budget skips. Distinct-state
 Adam swaps cover subsequent accumulation/clipping updates as well.
 The long-reduction, small-output dW classes motivate the next bounded split-K
-candidate, including its partial storage and final reduction. Keep these
-measured choices about algebra, not model names.
+candidate, including its partial storage and final reduction. It needs a small
+extension from one dispatch to a candidate sequence with explicit scratch
+lifetime: the current geometry-only swap promises a fixed allocation plan.
+Reuse class keys, qualification and decision logic; do not hide persistent
+partials outside the budget or create another tuner. Keep these measured
+choices about algebra, not model names.
 Do not infer that cross-call pools, larger budgets
 or weaker checks follow from this result. Cheaper search neither supplies
 convolution candidates nor turns MLP's earlier inconclusive whole-step ratios

@@ -7,6 +7,8 @@ use integer division for index decomposition. Four reciprocal uniforms and
 the tuner's f32 interval filter are removed; checked products, signed coordinate
 bounds, padded-K loop bounds, declared capacities and dispatch limits remain.
 There is no approximate-division fallback, new precision policy or model rule.
+The transposed-weight and flattened-upstream loads also reuse their original
+remainders instead of decomposing coordinates only to reconstruct them.
 
 Before the repair, the new full f64 oracle reproduced a GPU error on the
 RTX 5070: batch 2, Ci=3, H=1, W=41, Co=5, 1×1 kernel, stride 1, no padding,

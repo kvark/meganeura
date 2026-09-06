@@ -4357,10 +4357,6 @@ pub fn generate_conv2d_coop_module(
          \x20   out_h: u32,\n\
          \x20   out_w: u32,\n\
          \x20   padding_w: u32,\n\
-         \x20   inv_kernel_w: f32,\n\
-         \x20   inv_kernel_hw: f32,\n\
-         \x20   inv_col_w: f32,\n\
-         \x20   inv_go_spatial: f32,\n\
          }\n\n",
     );
 
@@ -4756,10 +4752,7 @@ fn emit_grad_input_im2col_stage(
     let _ = writeln!(src, "        let {in_n_var} = {cc_var} < n_total;");
 
     // Pre-decompose spatial position (invariant across e iterations)
-    let _ = writeln!(
-        src,
-        "        let {ih_var} = u32(f32({cc_var}) * params.inv_col_w);"
-    );
+    let _ = writeln!(src, "        let {ih_var} = {cc_var} / params.in_w;");
     let _ = writeln!(
         src,
         "        let {iw_var} = {cc_var} - {ih_var} * params.in_w;"
@@ -5048,10 +5041,7 @@ fn emit_forward_im2col_stage(
     src.push_str("                let kw = k_rem - kh * KERNEL_W;\n");
 
     // Decompose hw_idx -> (oh, ow) -> (ih, iw)
-    let _ = writeln!(
-        src,
-        "                let oh = u32(f32({cc_var}) * params.inv_col_w);"
-    );
+    let _ = writeln!(src, "                let oh = {cc_var} / params.out_w;");
     let _ = writeln!(
         src,
         "                let ow = {cc_var} - oh * params.out_w;"

@@ -431,6 +431,16 @@ the scalar and cooperative generators are now fixed. Read the
 observability helps find where to look, but neither exact same-engine parity
 nor a complete timing trace proves the underlying derivative is correct.
 
+The [indexing cost check](../experiments/conv-indexing-2026-09-06/README.md)
+adds optional full-state SHA-256 digests to the existing profiling runner. Sorted
+tensor names, lengths and f32 bits, plus optimizer counter/allocation, make
+source-to-source parity checks possible without archiving model tensors. Hashing
+and all readbacks stay outside step timers. A digest checks identity, not
+correctness: both implementations could still share an address error. Here the
+independent f64 oracle first reproduced a width-41 dW error; the shared integer
+indexing repair then passes all full-output regressions. Raw digests cannot
+replace missing vectors for numerical reanalysis.
+
 ## What we should improve next
 
 The highest-value debugging improvements are typed logical-tensor reads;

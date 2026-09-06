@@ -477,10 +477,10 @@ Dense, ConvDerivatives and All scopes. No model name enters selection.
 
 Short: structural legality and numerical testing are separate checks.
 
-Detail: checked extents prevent index overflow, and monotone reciprocal
-decomposition is checked at every quotient interval's endpoints within exact
-f32 integer inputs. That establishes this particular address decomposition,
-not the whole kernel. Both variants must still produce finite, matching full
+Detail: checked extents prevent index overflow, and shared convolution kernels
+now decompose indices by integer division. The earlier reciprocal-domain filter
+only excluded unsafe shapes from tuning; it did not fix ordinary execution.
+Both variants must still produce finite, matching full
 outputs on ordinary/tiny synthetic inputs and match 32 f64 contractions,
 including dX batch edges. Separate full f64 scatter oracles cover padding,
 stride and tile edges. Shared bugs, untested domains and convergence still
@@ -514,9 +514,32 @@ The eight-class structural budget visits only 8/45 ResNet derivative classes;
 it is not a measured cost ranking. The next experiment is bounded split-K dW
 with charged partial storage/reduction and explicit search coverage, not a
 lower threshold or an unconditional performance claim.
-Before widening the admitted shape domain, ordinary convolution indexing also
-needs hardening: the new tuner rejects inexact reciprocal decomposition, but
-does not repair those pre-existing untuned kernels.
+Ordinary convolution indexing is now repaired separately: integer division
+replaces unsafe reciprocal multiplication, with full adversarial GPU oracles.
+
+### 45. How does exact indexing fit a minimal, general engine?
+
+Short: fix the shared arithmetic, not individual shapes.
+
+Detail: the old f32 reciprocal mapped 41/41 to zero, selecting the wrong batch
+in a weight gradient. We replaced that operation with integer division across
+scalar and generated convolution kernels, deleted four reciprocal uniforms and
+removed the tuner-only interval filter. Full forward/dX/dW oracles cover the
+failure and nearby boundaries. There is no list of special widths. A separate
+cost check measures the tradeoff; correctness is not conditional on winning it.
+[Repair and protocol](../experiments/conv-indexing-2026-09-06/README.md).
+
+### 46. Why isn't split-K just another tile size?
+
+Short: it changes both the reduction order and the execution plan.
+
+Detail: splitting a long contraction creates more independent workgroups, but
+also writes partial results and launches a reduction before consumers run.
+Those bytes, barriers and dispatch costs belong to the candidate. Our current
+tile search changes geometry with identical live allocations, so it needs an
+explicit bounded sequence/scratch contract before supporting split-K. Reuse
+qualification and selection, keep deterministic f32 reduction, and test tiny
+gradients and subsequent optimizer updates. More parallelism alone is not a win.
 
 ## Talk outline
 

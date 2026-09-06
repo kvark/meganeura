@@ -61,8 +61,8 @@ All 45 profiled full states match, but short-case timing drift is substantial;
 these optimizer-free profiles are not whole-step speedup evidence. The follow-up
 also fixes dX indexing outside same padding and adds full f64 derivative oracles.
 Exact-class scalar convolution-derivative tile selection is now implemented,
-with full NCHW keys, physical scratch sizes, batch-aware references, checked
-reciprocal indexing and unchanged precision/budgets. The [corrected six-process crossover](experiments/conv-tiles-corrected-2026-09-06/README.md)
+with full NCHW keys, physical scratch sizes, batch-aware references and unchanged
+precision/budgets. The [corrected six-process crossover](experiments/conv-tiles-corrected-2026-09-06/README.md)
 observes ResNet 17.5808→16.7293 ms (median ratio 1.05056×), but all six decisions
 remain inconclusive under the unchanged 5%+noise guard. Four dX classes change
 eight dispatches; the small Adam/SGD chains keep their tiles and make real updates.
@@ -70,9 +70,13 @@ Original malformed flat-layout controls are retained/disqualified; public
 operand checks, full forward oracles and nonzero training preflights prevent
 their zero-data success from becoming evidence. Sampling now dominates search
 cost, and the eight-class structural prior visits only 8/45 ResNet classes.
-Before broadening this domain, repair ordinary convolution's reciprocal
-index decomposition: the tuning guard excludes inexact cases (e.g. divisor 41),
-but does not repair untuned kernels. Then add bounded split-K weight gradients
+The [indexing repair](experiments/conv-indexing-2026-09-06/README.md) replaces
+unsafe f32 reciprocal decomposition with integer division in the shared scalar
+and generated cooperative kernels. Adversarial full forward/dX/dW GPU oracles
+reproduce the old width-41 error and pass at widths/kernel sizes 41/47/55 after
+repair. Four uniforms and the obsolete tuner-only filter are removed, without
+weakening numerical or overflow checks. Its cost check is separate from tuning.
+Next add bounded split-K weight gradients
 with charged partial storage and whole-step confirmation;
 attention schedules remain a separate device-qualified family.
 Keep tuning opt-in; do not fit a smaller margin or model rule.

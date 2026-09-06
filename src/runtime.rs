@@ -625,11 +625,25 @@ struct Conv2dParams {
     out_h: u32,
     out_w: u32,
     padding_w: u32,
-    // Reciprocals for strength-reduced integer division in im2col
-    inv_kernel_w: f32,
-    inv_kernel_hw: f32,
-    inv_col_w: f32,      // 1/out_w (forward, grad_weight) or 1/in_w (grad_input)
-    inv_go_spatial: f32, // 1/(out_h*out_w) for grad_weight, unused otherwise
+}
+
+impl From<&[u32]> for Conv2dParams {
+    fn from(p: &[u32]) -> Self {
+        Self {
+            batch: p[0],
+            in_channels: p[1],
+            in_h: p[2],
+            in_w: p[3],
+            out_channels: p[4],
+            kernel_h: p[5],
+            kernel_w: p[6],
+            stride: p[7],
+            padding_h: p[8],
+            out_h: p[9],
+            out_w: p[10],
+            padding_w: p[11],
+        }
+    }
 }
 
 // conv2d_dw: var src, weight, dst, params (depthwise, no in/out channels split)
@@ -6416,95 +6430,37 @@ impl Session {
             ShaderEntry::Conv2dGemm
             | ShaderEntry::Conv2dGemmSmall
             | ShaderEntry::Conv2dGemmCoopGen(..) => {
-                let p = &dispatch.params;
-                let kernel_hw = p[5] * p[6];
                 pc.bind(
                     0,
                     &Conv2dData {
                         src: buf(dispatch.input_buffers[0]),
                         weight: buf(dispatch.input_buffers[1]),
                         dst: buf(dispatch.output_buffer),
-                        params: Conv2dParams {
-                            batch: p[0],
-                            in_channels: p[1],
-                            in_h: p[2],
-                            in_w: p[3],
-                            out_channels: p[4],
-                            kernel_h: p[5],
-                            kernel_w: p[6],
-                            stride: p[7],
-                            padding_h: p[8],
-                            out_h: p[9],
-                            out_w: p[10],
-                            padding_w: p[11],
-                            inv_kernel_w: 1.0 / p[6] as f32,
-                            inv_kernel_hw: 1.0 / kernel_hw as f32,
-                            inv_col_w: 1.0 / p[10] as f32, // 1/out_w
-                            inv_go_spatial: 0.0,
-                        },
+                        params: Conv2dParams::from(dispatch.params.as_slice()),
                     },
                 );
             }
             ShaderEntry::Conv2dGradInputGemm
             | ShaderEntry::Conv2dGradInputGemmSmall
             | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => {
-                let p = &dispatch.params;
-                let kernel_hw = p[5] * p[6];
                 pc.bind(
                     0,
                     &Conv2dGradInputData {
                         grad_out: buf(dispatch.input_buffers[0]),
                         weight: buf(dispatch.input_buffers[1]),
                         dst: buf(dispatch.output_buffer),
-                        params: Conv2dParams {
-                            batch: p[0],
-                            in_channels: p[1],
-                            in_h: p[2],
-                            in_w: p[3],
-                            out_channels: p[4],
-                            kernel_h: p[5],
-                            kernel_w: p[6],
-                            stride: p[7],
-                            padding_h: p[8],
-                            out_h: p[9],
-                            out_w: p[10],
-                            padding_w: p[11],
-                            inv_kernel_w: 1.0 / p[6] as f32,
-                            inv_kernel_hw: 1.0 / kernel_hw as f32,
-                            inv_col_w: 1.0 / p[3] as f32, // 1/in_w
-                            inv_go_spatial: 0.0,
-                        },
+                        params: Conv2dParams::from(dispatch.params.as_slice()),
                     },
                 );
             }
             ShaderEntry::Conv2dGradWeightGemm | ShaderEntry::Conv2dGradWeightGemmSmall => {
-                let p = &dispatch.params;
-                let kernel_hw = p[5] * p[6];
-                let go_spatial = p[9] * p[10]; // out_h * out_w
                 pc.bind(
                     0,
                     &Conv2dGradWeightData {
                         grad_out: buf(dispatch.input_buffers[0]),
                         src: buf(dispatch.input_buffers[1]),
                         dst: buf(dispatch.output_buffer),
-                        params: Conv2dParams {
-                            batch: p[0],
-                            in_channels: p[1],
-                            in_h: p[2],
-                            in_w: p[3],
-                            out_channels: p[4],
-                            kernel_h: p[5],
-                            kernel_w: p[6],
-                            stride: p[7],
-                            padding_h: p[8],
-                            out_h: p[9],
-                            out_w: p[10],
-                            padding_w: p[11],
-                            inv_kernel_w: 1.0 / p[6] as f32,
-                            inv_kernel_hw: 1.0 / kernel_hw as f32,
-                            inv_col_w: 1.0 / p[10] as f32, // 1/out_w
-                            inv_go_spatial: 1.0 / go_spatial as f32,
-                        },
+                        params: Conv2dParams::from(dispatch.params.as_slice()),
                     },
                 );
             }
