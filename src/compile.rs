@@ -237,6 +237,7 @@ pub enum ShaderEntry {
     Conv2dGradWeightGemmSplitSmall,
     CacheWrite,
     CachedAttention,
+    CachedBlockAttention,
     RoPEDynamic,
     MaxPool2d,
     GlobalAvgPool,
@@ -293,7 +294,8 @@ impl ShaderEntry {
             | ShaderEntry::FlashGradQ
             | ShaderEntry::MultiHeadAttnGradKV
             | ShaderEntry::FlashGradKV
-            | ShaderEntry::CachedAttention => "attention",
+            | ShaderEntry::CachedAttention
+            | ShaderEntry::CachedBlockAttention => "attention",
 
             ShaderEntry::Conv2dDw
             | ShaderEntry::Conv2dGemm
@@ -467,6 +469,7 @@ impl ShaderEntry {
             }
             ShaderEntry::CacheWrite => ShaderGroup::CacheWrite,
             ShaderEntry::CachedAttention => ShaderGroup::CachedAttention,
+            ShaderEntry::CachedBlockAttention => ShaderGroup::CachedBlockAttention,
             ShaderEntry::RoPEDynamic => ShaderGroup::RoPEDynamic,
             ShaderEntry::MaxPool2d => ShaderGroup::MaxPool2d,
             ShaderEntry::GlobalAvgPool => ShaderGroup::GlobalAvgPool,
@@ -569,7 +572,7 @@ impl ShaderEntry {
             | ShaderEntry::Conv2dGradWeightGemmSplit
             | ShaderEntry::Conv2dGradWeightGemmSplitSmall => "main",
             ShaderEntry::CacheWrite => "main",
-            ShaderEntry::CachedAttention => "main",
+            ShaderEntry::CachedAttention | ShaderEntry::CachedBlockAttention => "main",
             ShaderEntry::RoPEDynamic => "main",
             ShaderEntry::MaxPool2d => "max_pool_2d",
             ShaderEntry::GlobalAvgPool => "global_avg_pool",
@@ -4613,9 +4616,14 @@ impl<'a> Compiler<'a> {
                 let v_cache = self.get_buffer(node.inputs[2]);
                 let kv_pos_input = self.get_buffer(node.inputs[3]);
                 let q_seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
+                let block_queries = crate::codegen::CACHED_ATTENTION_QUERIES;
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::CachedAttention,
-                    workgroups: [q_seq, num_heads, 1],
+                    shader: if q_seq > 1 {
+                        ShaderEntry::CachedBlockAttention
+                    } else {
+                        ShaderEntry::CachedAttention
+                    },
+                    workgroups: [q_seq.div_ceil(block_queries), num_heads, 1],
                     input_buffers: vec![q, k_cache, v_cache, kv_pos_input],
                     output_buffer: out_buf,
                     extra_outputs: vec![],

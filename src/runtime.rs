@@ -1912,7 +1912,9 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         | ShaderEntry::Conv2dGradWeightGemmSplitSmall => Conv2dGradWeightData::layout(),
         ShaderEntry::RoPEDynamic => RoPEDynamicData::layout(),
         ShaderEntry::CacheWrite => CacheWriteData::layout(),
-        ShaderEntry::CachedAttention => CachedAttentionData::layout(),
+        ShaderEntry::CachedAttention | ShaderEntry::CachedBlockAttention => {
+            CachedAttentionData::layout()
+        }
         ShaderEntry::MaxPool2d => MaxPool2dData::layout(),
         ShaderEntry::GlobalAvgPool => GlobalAvgPoolData::layout(),
         ShaderEntry::GlobalAvgPoolGrad => UnaryData::layout(),
@@ -6568,7 +6570,7 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::CachedAttention => {
+            ShaderEntry::CachedAttention | ShaderEntry::CachedBlockAttention => {
                 pc.bind(
                     0,
                     &CachedAttentionData {
