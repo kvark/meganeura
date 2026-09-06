@@ -336,6 +336,30 @@ collector cannot assign appended optimizer passes to graph metadata, so capture
 without those passes and time full optimizer-backed training separately.
 Likewise, the new tuner's isolated scratch result needs whole-step confirmation.
 
+### 32. Can a bad checkpoint corrupt a running session, and is it portable?
+
+Short: format 3 validates the entire logical restore before writing anything.
+Matching parameter names, shapes and storage types can use different padding.
+
+Detail: malformed files leave parameters, gradients, moments and counters
+unchanged and do not allocate moments. This is not rollback after device loss
+or allocation failure. Training-to-inference validates and ignores moments;
+legacy files retain partial-load behavior. Optimizer configuration, in-flight
+accumulation windows, clipping cadence and application RNG are not saved.
+Cross-padding GPU tests pass; cross-backend qualification is still due.
+
+### 33. What memory did lazy optimizer state actually save?
+
+Short: two unused F32 moment buffers: 8 MiB for the tested 1,048,576-element
+parameter. Adam itself still needs that storage when selected.
+
+Detail: the regression checks retained buffer allocation requests, not peak
+driver VRAM. Graph buffers, moments, accumulators and diagnostics are reported
+separately; staging and driver objects are outside that sum. Reads of
+uninitialized moments return zeros without allocating; clearing the optimizer
+retains initialized state for later reuse. See
+[checkpoint and memory contracts](checkpoints-and-memory.md).
+
 ## Talk outline
 
 The actual workshop slot length is not confirmed here. For a 12-minute talk,

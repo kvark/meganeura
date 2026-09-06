@@ -37,7 +37,7 @@ lower-level graph/compiler routines can still be exercised without a GPU.
 | [optimize.rs](../../src/optimize.rs), [outline.rs](../../src/outline.rs) | Semantic rewrites; optional e-graph extraction and repeated-region detection. |
 | [compile.rs](../../src/compile.rs), [schedule.rs](../../src/schedule.rs) | Buffer references, dispatches, pointwise/reduction schedules, fusions and barrier grouping. |
 | [codegen.rs](../../src/codegen.rs), [shaders/](../../src/shaders/) | WGSL/Naga modules and parameterized kernel implementations. |
-| [runtime.rs](../../src/runtime.rs) | Hardware discovery, variant selection, pipeline keys, allocation, execution, readback, optimizer and checkpoints. |
+| [runtime.rs](../../src/runtime.rs) | Hardware discovery, variant selection, pipeline keys, allocation, execution, readback and optimizer; checkpoint preflight/serialization lives in [runtime/checkpoint.rs](../../src/runtime/checkpoint.rs). |
 | [memplan.rs](../../src/memplan.rs) | Logical lifetimes, pinned values, physical allocation reuse. |
 | [train.rs](../../src/train.rs), [config.rs](../../src/config.rs), [cache.rs](../../src/cache.rs) | Public build/training workflow, explicit configuration and cached plans. |
 | [Blade](https://github.com/kvark/blade/tree/b208f3b1f97196c2971436b5726e61e71b149c37) | Native GPU API objects, commands, synchronization and allocation semantics. |
@@ -199,8 +199,12 @@ The planner preallocates tensor storage; this is not a guarantee of zero CPU
 heap allocation during a step. Memory-budget checks reserve headroom when a
 budget is available, but cannot prevent another process consuming memory
 after the check. There is no general rematerialization, paging, distributed
-execution or multi-GPU memory planner. Adam state is currently created for
-trainable sessions even when the immediate workload does not need Adam.
+execution or multi-GPU memory planner. Adam/LaProp moments are allocated only
+when configured, explicitly written/stepped, or restored from a checkpoint;
+SGD and forward+loss+backward sessions no longer reserve unused moments.
+Read-only moment inspection returns zeros without allocation. Switching away
+from Adam retains already allocated state. Gradient accumulators are separate,
+and the memory summary counts their actual storage once.
 
 ## 7. Session execution, training and embedding
 
@@ -231,7 +235,8 @@ debug configuration, incomplete post-step anomaly scans and profiler overhead.
 The core uses typed configuration; `from_env` is the explicit environment
 boundary. The semantic build cache stores a pre-runtime plan. Its key includes
 the graph and relevant build configuration, now including rewrite mode, cost,
-cutoff and Winograd policy. Cache format 4 invalidates older entries.
+cutoff and Winograd policy. Cache format 5 also requires retained logical
+parameter types, independent of runtime padding, and invalidates older entries.
 
 This cache is not a persistent performance database. Measured winners need
 stronger device/driver/compiler identity and validation provenance. The current
@@ -246,8 +251,13 @@ whole-step confirmation remain unimplemented. Selection is default-off; scalar
 GPU qualification passed on the RTX 5070, while native-f32 hardware coverage
 remains due. See the [bounded search contract](performance-plan.md).
 
-Checkpoints serialize current physical buffers, including padding. Load
-validation has improved, but restoring is not transactional and cross-plan
-padding can differ. Stable logical-tensor serialization and validate-all-
-before-write restore are still needed for a robust cross-device deployment
-contract. See the [audit](../audit-2026-09.md) for concrete exit criteria.
+Checkpoint format 3 stores logical shapes/storage types and omits allocation
+padding. All tensors and metadata are validated before mutation or moment
+allocation; malformed late fields cannot partially restore the session.
+Matching logical parameter sets can restore across padding differences, and
+inference validates but ignores saved moments. Formats 1/2 retain their
+legacy physical/partial-load contract with preflighted writes. This is neither
+a complete training-loop snapshot nor rollback after device failure; optimizer
+configuration and accumulation state remain caller-owned. See
+[checkpoints and memory](checkpoints-and-memory.md) for the exact guarantees
+and remaining cross-backend qualification.

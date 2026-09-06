@@ -227,8 +227,21 @@ backend exposes them, are supporting diagnostics, not a timing model.
 [profiling protocol](../performance-profiling.md),
 [GPU example](../../examples/profile_session.rs)
 
-`MemorySummary` separates logical bytes from actual aliased allocations and
-optimizer state. `device_memory_stats` reports a broader API-level process
+`MemorySummary` separates plan capacities (including padding), graph
+allocations after aliasing, and actually allocated moments, accumulators and
+auxiliary buffers. `total_allocated_bytes()` sums those retained buffer
+requests; structured profiles expose the same total as `resident_buffer_bytes`.
+Lazy moment reads return zeros without creating GPU state, so inspection
+does not turn an SGD/F+L+B session into an Adam-sized allocation.
+F32 parameter reads reject reduced/integer storage instead of reinterpreting
+it, and raw F32 buffer reads check capacity before copying. Bulk parameter
+norm inspection remains F32-only; logical sizes do not imply automatic
+dequantization in every diagnostic API.
+These fields are not a driver allocation or peak measurement. See the
+[checkpoint/memory chapter](checkpoints-and-memory.md) for the field map,
+restore-error guarantees and qualification tests.
+
+`device_memory_stats` reports a broader API-level process
 view; it does not establish system-wide pressure, fragmentation or peak
 allocation history. Compare the same quantity and measurement boundary across
 engines. PyTorch's profiler can record shapes, stacks and memory activity,

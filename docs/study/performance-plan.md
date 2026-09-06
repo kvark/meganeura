@@ -231,9 +231,21 @@ long training run should be able to request different budgets.
 | 1 | Reusable convolution derivative tiling/layout | NVIDIA ResNet profile concentrates in backward convolution. | Correct odd/stride/channel cases, dX/dW parity; F+L+B and optimizer-backed step improve. |
 | 1 | Metal attention backward schedules | Frozen profile identified dK/dV and dQ costs. | Tune EPT/tiles/workgroup layout jointly; several sequence/head widths, end-to-end memory and time. |
 | 2 | Eliminate materializations via existing prologue/epilogue/reduction generators | Common traffic costs; small-kernel populations. | Dispatch/traffic reduction plus wall-time improvement; avoid register-spill and fanout regressions. |
-| 2 | Lazy optimizer state and logical checkpoint layout | Memory limits larger training workloads independently of ALU speed. | Peak allocated bytes drop without changed updates or restore behavior. |
+| 2, implemented; fleet/peak qualification open | Lazy optimizer state and logical checkpoint layout | Memory limits larger training workloads independently of ALU speed. | RTX tests check actual allocation deltas, preflight rejection and next-update parity; measure peak process memory on larger workloads/backends. |
 | 3 | Layout search, rematerialization | May unlock convolution performance or larger models. | Account for conversion/recompute traffic and complete backward dependencies. |
 | Research | bf16, scaled/compensated low-precision derivatives | Scalar f32 can leave matrix hardware idle. | Device/compiler support and exponent-sensitive accuracy, then convergence and speed. |
+
+The checkpoint/memory follow-up now avoids Adam/LaProp moments for SGD and
+F+L+B-only sessions, accounts for accumulators once, and serializes logical
+tensors with whole-file preflight. Optimizer/clip/accumulation lengths ignore
+allocation padding, with poisoned-tail regressions. The 1,048,576-element F32 test verifies
+8 MiB of unused moment allocations are absent. Different-padding restores
+preserve the next Adam update, and eight training-correctness tests pass on
+RTX 5070. These are storage/correctness results, not a speedup or measured
+driver-peak reduction. Detailed contracts and reproduction live in
+[checkpoints and memory](checkpoints-and-memory.md). Remaining work includes
+cross-backend restore qualification, large-workload peak measurements and
+structured allocation failures; it does not require a new kernel family.
 
 For convolution, first reuse the contraction generator with explicit indexing
 maps for forward/dX/dW. Add a small number of tilings and layouts, not separate
