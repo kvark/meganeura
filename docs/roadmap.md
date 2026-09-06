@@ -8,6 +8,14 @@ ongoing.
 
 ## September 2026 priorities
 
+The current tuning-foundation milestone is **closed**. The final
+[bounded accumulation attempt](experiments/compensated-dw-2026-09-06/README.md)
+passes 230/240 accuracy rows but fails tiny cancellation cases, so its arithmetic
+change is not retained and split-K promotion is deferred. No conditional
+whole-step cohort follows the failed gate. The next active milestone is
+[paper finalization](../paper/p3hpc/REVISION.md). The engineering tracks below
+are a deferred research backlog, not additional requirements for this freeze.
+
 The [study guide](study/README.md), [audit](audit-2026-09.md) and
 [performance plan](study/performance-plan.md) are the current decision record.
 The detailed tracks below retain earlier motivation and experiment notes;
@@ -19,18 +27,85 @@ still loses to eager MPS. Intel is compared with a labeled CPU fallback.
 See [results](study/results.md) for denominators and numerical gates. Do not
 mix exploratory Inferena history with publication-grade results.
 
-The first state-isolated exact-class search is implemented for the existing
-32/64 scalar-f32 matmul tiles. It is default-off and CPU-validated only;
-cooperative/fused search and whole-step/fleet qualification remain ahead.
+State-isolated exact-class search is implemented for the existing 32/64 scalar
+and legal native-f32 cooperative matmul tiles. It is default-off. Scalar GPU
+qualification passed on RTX 5070; native-f32 hardware and fleet qualification
+remain ahead. A separate harness checks transfer to whole-step time;
+automatic confirmation, f16-input/complex-fusion search and persistence remain open.
 See the [implementation contract](study/performance-plan.md).
+The [five-process synthetic transfer pilot](experiments/tuning-2026-09-05/README.md)
+shows repeatable 1.15×/1.13× whole-step gains on two larger chains, with no
+selection change on two smaller ones. It is not model/fleet qualification.
+
+The subsequent [six-case inference/training holdouts](experiments/holdouts-2026-09-06/README.md)
+retain five processes, full control-session gradients/moments and matched Adam
+updates through step 78. All numerical checks pass, but no whole-step gain or
+regression clears the predeclared guard. The unchanged ResNet control exposes
+timing drift, and only 1/512 of its plan dispatches is eligible for matmul search.
+The [controlled six-process crossover](experiments/crossover-2026-09-06/README.md)
+now confirms the dense chain in both session orientations (median 1.177×),
+but not MLP+Adam; two MLP A/A controls fail the noise screen. ResNet remains
+unchanged, with 98.26–98.65% of search time spent in qualification. A checked
+selection-only swap preserves tensor/optimizer state through role reversal.
+The [readback follow-up](experiments/readback-2026-09-06/README.md) now separates
+qualification's CPU copies/checks from transfer/dispatch/wait, using published
+Blade 0.9/Naga 30 (Rust 1.92). Across six paired processes, read-optimized
+private staging lowers median ResNet search from 606 to 39 ms: CPU readback
+allocation/copy falls from 582 to 2 ms while unchanged validation stays about
+6 ms. All 108 class comparisons qualify and full state is bit-exact through
+Adam step 178. Download becomes the private staging default; Shared remains
+available. Preparation and transfers cost more, and one dense search is slower
+overall; every attempt is retained. This is not a whole-step speed result.
+The [allocation/reuse follow-up](experiments/staging-reuse-2026-09-06/README.md)
+locates that preparation cost in staging allocation and tests one exact-size
+slot retained only within a tuning call. Six process pairs lower median dense
+search 44.01→31.84 ms and MLP 64.27→45.46 ms; ResNet has no reuse opportunity
+and no guarded change. SameSize becomes the option default, with identical
+scratch requests, zero retention at return and all validation intact.
+The [whole-step profiles](experiments/training-profile-2026-09-06/README.md)
+now consistently put 60.66–60.77% of ResNet's instrumented dispatch time in
+backward convolution, and 36.25–40.58% of SmolLM2's in backward attention.
+All 45 profiled full states match, but short-case timing drift is substantial;
+these optimizer-free profiles are not whole-step speedup evidence. The follow-up
+also fixes dX indexing outside same padding and adds full f64 derivative oracles.
+Exact-class scalar convolution-derivative tile selection is now implemented,
+with full NCHW keys, physical scratch sizes, batch-aware references and unchanged
+precision/budgets. The [corrected six-process crossover](experiments/conv-tiles-corrected-2026-09-06/README.md)
+observes ResNet 17.5808→16.7293 ms (median ratio 1.05056×), but all six decisions
+remain inconclusive under the unchanged 5%+noise guard. Four dX classes change
+eight dispatches; the small Adam/SGD chains keep their tiles and make real updates.
+Original malformed flat-layout controls are retained/disqualified; public
+operand checks, full forward oracles and nonzero training preflights prevent
+their zero-data success from becoming evidence. Sampling now dominates search
+cost, and the eight-class structural prior visits only 8/45 ResNet classes.
+The [indexing repair](experiments/conv-indexing-2026-09-06/README.md) replaces
+unsafe f32 reciprocal decomposition with integer division in the shared scalar
+and generated cooperative kernels. Adversarial full forward/dX/dW GPU oracles
+reproduce the old width-41 error and pass at widths/kernel sizes 41/47/55 after
+repair. Four uniforms and the obsolete tuner-only filter are removed, without
+weakening numerical or overflow checks. The separate cost check retains bit-exact
+full states across revisions but observes ResNet 17.55→21.55 ms, about 23% slower.
+Recover that cost with a qualified, reusable exact indexing implementation;
+do not restore approximate addresses. Then add bounded split-K weight gradients,
+reusing SumRows with charged partial storage, complete dispatch-sequence accounting
+and whole-step confirmation;
+attention schedules remain a separate device-qualified family.
+Keep tuning opt-in; do not fit a smaller margin or model rule.
+
+The [checkpoint/memory follow-up](study/checkpoints-and-memory.md) implements
+logical format-3 saves and preflighted restores, lazy Adam/LaProp state, and
+resident tensor-buffer accounting. RTX tests cover malformed late fields,
+different allocation padding, the next optimizer update, and an 8 MiB unused
+moment allocation avoided for 1,048,576 F32 elements. Peak driver memory and
+cross-backend restore behavior still need qualification.
 
 The next sequence is:
 
 1. State-safe tuning, exact variant contracts and stronger numerical evidence.
 2. Bounded bidirectional shape-level search; thresholds become search priors.
 3. Reusable convolution-derivative and Metal attention schedules.
-4. Persistent winners with device/driver/compiler provenance; lazy optimizer
-   state and logical checkpoint serialization.
+4. Persistent winners with device/driver/compiler provenance; fleet/peak-memory
+   qualification of the implemented lazy optimizer and logical checkpoints.
 5. Layout/rematerialization and new precision formats only with an observed
    need, capability support, correctness evidence and an amortization budget.
 
@@ -40,8 +115,9 @@ acceptance and profiles for localization. Cooperative backward is experimental
 and default-off; compensated f16 is not a safe automatic derivative path.
 General dynamic shape replanning is not yet exposed by the session API.
 
-No GPU benchmarking was performed during this audit; measurements below are
-historical and future experiments remain deferred until the device is free.
+The initial audit performed no GPU benchmarking. The user subsequently
+released the device for qualification and experiments. Timings in the older
+tracks below remain historical, not rerun results.
 
 ---
 
@@ -241,9 +317,31 @@ touching the clip path.
 SmolLM2/SmolVLA train, before any code is final — if the win isn't
 real, close the item with a note in `rejected-optimizations.md`.
 
+### B2a. Lazy optimizer state and logical persistence  ← *implemented, RTX qualified*
+
+Keep logical parameter types separate from physical capacities. Format-3
+checkpoints omit padding and validate every record before writes or moment
+allocation. Cache format 5 invalidates plans lacking the metadata. Legacy
+files keep physical/partial-load compatibility with preflighted writes.
+
+Adam/LaProp moments are allocated on first configuration, write, explicit
+step or applicable restore. SGD/F+L+B sessions no longer reserve them; reads
+of uninitialized state return zeros without GPU allocation. Clearing the
+optimizer retains existing state. Memory reports separately count graph,
+moments, accumulators and auxiliary buffers; the previous accumulator total
+incorrectly multiplied by the parameter count. Update, clip and accumulation
+loops use logical lengths; poisoned tails cannot affect optimizer results or
+overrun logical-sized grouped diagnostics. Raw F32 reads are capacity-checked.
+
+**Still open:** driver-peak sampling on larger workloads, Metal↔Vulkan restore
+qualification, structured allocation failures, crash-atomic checkpoint file
+replacement, and a separately designed complete training-loop snapshot.
+See the [contract and tests](study/checkpoints-and-memory.md). This does not
+implement activation rematerialization or reduce Adam's required moment size.
+
 ### B3. [research] E-graph rematerialization (activation checkpointing)
 
-**Problem.** No checkpointing exists; trainable model size is bounded
+**Problem.** No activation checkpointing exists; trainable model size is bounded
 by storing every activation. Classic checkpointing APIs (manual block
 annotations) are against the project's grain.
 
@@ -415,18 +513,20 @@ measured choice among them:
 
 **Landed.** Variant decisions have one owner (`select_variants`) and codegen
 knobs travel as `TuningKnobs` plan data. The September first cut of
-`Session::tune` / `tune_with` measures 32↔64 scalar-f32 tiles per exact eligible
+`Session::tune` / `tune_with` measures scalar and native-f32 cooperative tiles per exact eligible
 class, with private scratch, numerical qualification, interleaved samples and
 explicit budgets/reports. It replaces the earlier family-wide cooperative
 demotion tuner, which ran live steps and mutated training/cache state.
-Default-off, with CPU validation only; real-device qualification remains due.
+Default-off. Scalar correctness/state GPU tests passed on RTX 5070. Native-f32
+shaders pass offline validation; that device cannot qualify their execution.
 
 **Remaining plan.**
 1. *Fleet qualification and whole-step confirmation* before default-on;
    preserve the implemented scratch-state isolation contract.
-2. *Broader exact-class candidates:* cooperative, packed/fused and GEMV
-   implementations need complete precision/padding/binding contracts. The
-   scalar slice does not yet replace their profitability thresholds.
+2. *Broader exact-class candidates:* f16-input cooperative, packed/complex-fused
+   and GEMV implementations need complete precision/padding/binding contracts.
+   Native-f32 matmul already challenges profitability thresholds where its
+   complete candidate fits existing allocations.
 3. *Recompiling knobs:* EPT caps / tile sizes / generated-kernel
    workgroup sizes are plan data now, so a candidate is a plan rebuild
    (~seconds). Bound the space per shape-class (2–4 values per knob).

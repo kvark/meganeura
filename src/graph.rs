@@ -2003,6 +2003,8 @@ impl Graph {
     }
 
     /// Conv2d with separate height/width padding (for Conv1d emulation etc.).
+    /// Input and kernel must have the flat shapes documented by [`Self::conv2d`].
+    #[track_caller]
     #[allow(clippy::too_many_arguments)]
     pub fn conv2d_hw(
         &mut self,
@@ -2019,6 +2021,19 @@ impl Graph {
         padding_h: u32,
         padding_w: u32,
     ) -> NodeId {
+        let input_size = batch as usize * in_channels as usize * in_h as usize * in_w as usize;
+        let kernel_size =
+            out_channels as usize * in_channels as usize * kernel_h as usize * kernel_w as usize;
+        assert_eq!(
+            self.node(input).ty.shape,
+            [input_size],
+            "Conv2d expects a flat NCHW input matching batch/channels/spatial extents; reshape first"
+        );
+        assert_eq!(
+            self.node(kernel).ty.shape,
+            [kernel_size],
+            "Conv2d expects a flat kernel matching channels/kernel extents; reshape first"
+        );
         let out_h = (in_h + 2 * padding_h - kernel_h) / stride + 1;
         let out_w = (in_w + 2 * padding_w - kernel_w) / stride + 1;
         let out_size = batch as usize * out_channels as usize * out_h as usize * out_w as usize;
@@ -2504,6 +2519,25 @@ impl fmt::Display for Graph {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn conv2d_rejects_nonflat_or_mismatched_operands_before_compilation() {
+        for (input_shape, weight_shape, batch) in [
+            (vec![2, 3, 5, 7], vec![5 * 3 * 2 * 3], 2),
+            (vec![2 * 3 * 5 * 7], vec![5, 3, 2, 3], 2),
+            (vec![2 * 3 * 5 * 7 - 1], vec![5 * 3 * 2 * 3], 2),
+            (vec![2 * 3 * 5 * 7], vec![5 * 3 * 2 * 3], 1),
+        ] {
+            assert!(
+                std::panic::catch_unwind(|| {
+                    let mut graph = super::Graph::new();
+                    let x = graph.input("x", &input_shape);
+                    let w = graph.parameter("w", &weight_shape);
+                    graph.conv2d_hw(x, w, batch, 3, 5, 7, 5, 2, 3, 1, 0, 1);
+                })
+                .is_err()
+            );
+        }
+    }
     use super::*;
 
     #[test]

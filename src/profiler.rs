@@ -215,6 +215,11 @@ pub struct ProfilePlan {
     pub barrier_group_count: usize,
     pub logical_buffer_bytes: usize,
     pub allocated_buffer_bytes: usize,
+    /// Resident graph/optimizer buffer requests, not driver allocation or peak.
+    pub resident_buffer_bytes: usize,
+    pub adam_state_bytes: usize,
+    pub grad_accumulator_bytes: usize,
+    pub optimizer_aux_bytes: usize,
     pub device_local_bytes: usize,
     pub physical_allocation_count: usize,
 }
@@ -597,6 +602,10 @@ pub fn capture_session_profile(
             barrier_group_count: session.num_groups(),
             logical_buffer_bytes: memory.total_buffer_bytes,
             allocated_buffer_bytes: memory.allocated_buffer_bytes,
+            resident_buffer_bytes: memory.total_allocated_bytes(),
+            adam_state_bytes: memory.adam_state_bytes,
+            grad_accumulator_bytes: memory.grad_accumulator_bytes,
+            optimizer_aux_bytes: memory.optimizer_aux_bytes,
             device_local_bytes: memory.device_local_bytes,
             physical_allocation_count: memory.num_allocations,
         },

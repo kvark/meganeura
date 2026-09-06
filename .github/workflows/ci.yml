@@ -117,11 +117,11 @@ jobs:
       - run: cargo check --lib --tests
 
   msrv:
-    name: Rust 1.88 MSRV
+    name: Rust MSRV
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@1.92.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --lib
 

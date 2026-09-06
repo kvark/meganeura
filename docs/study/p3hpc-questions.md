@@ -124,15 +124,33 @@ extend the relevant physical/lifetime contract.
 
 ### 12. How much autotuning exists now?
 
-Short: a new opt-in exact-shape search over two scalar-f32 matmul tiles, using
-private scratch. CPU-validated implementation, not yet GPU-qualified results.
+Short: an opt-in exact-shape search over scalar and legal native-f32
+cooperative matmul tiles, using private scratch. Scalar GPU qualification has
+passed; this is new engineering, not part of the frozen paper's results.
 
-Detail: both sizes can win regardless of the initial occupancy threshold;
+Detail: legal implementations can win regardless of the initial occupancy or
+native-8 large-shape profitability threshold;
 qualification, paired samples, a noise guard and resource bounds are explicit.
-It replaces the state-mutating family demotion tuner. Cooperative/fused/GEMV
-search, persistent winners and whole-step confirmation remain future work.
+It replaces the state-mutating family demotion tuner. Native padding must fit
+existing allocations. F16-input/complex-fusion/GEMV search, persistent winners
+and automatic whole-step confirmation remain future work. Native-f32 GPU
+qualification needs a different device: our RTX 5070 advertises f16 tiles only.
 Capability probing is named `auto_tune` but does not time kernels. Neither
 this new search nor new speedups are part of the frozen paper evidence.
+
+The [separate five-process transfer pilot](../experiments/tuning-2026-09-05/README.md)
+shows 1.15×/1.13× whole-step gains on two synthetic chains and unchanged choices
+on two smaller ones. Search amortizes over roughly 1,600–2,850 steps in the
+winning cases; do not turn that into a general model or PyTorch claim.
+
+The [six-case holdouts](../experiments/holdouts-2026-09-06/README.md) then tested
+inference, Adam, SGD and F+L+B across five processes. All full control-session
+tensor/state comparisons passed through step 78, but none cleared the whole-step
+guard. An unchanged ResNet control even showed a misleading 1.071× ratio of
+medians, rejected by the paired-gain gate. The honest conclusion is stronger
+state evidence and limited transfer, not “automatic tuning makes training
+faster.” More representative kernel families and controlled confirmation come
+before default-on or persistent winners.
 
 ## Numerical behavior
 
@@ -326,6 +344,263 @@ execution. Reset state for the timestamp-ring advance runs too. The structured
 collector cannot assign appended optimizer passes to graph metadata, so capture
 without those passes and time full optimizer-backed training separately.
 Likewise, the new tuner's isolated scratch result needs whole-step confirmation.
+
+### 32. Can a bad checkpoint corrupt a running session, and is it portable?
+
+Short: format 3 validates the entire logical restore before writing anything.
+Matching parameter names, shapes and storage types can use different padding.
+
+Detail: malformed files leave parameters, gradients, moments and counters
+unchanged and do not allocate moments. This is not rollback after device loss
+or allocation failure. Training-to-inference validates and ignores moments;
+legacy files retain partial-load behavior. Optimizer configuration, in-flight
+accumulation windows, clipping cadence and application RNG are not saved.
+Cross-padding GPU tests pass; cross-backend qualification is still due.
+
+### 33. What memory did lazy optimizer state actually save?
+
+Short: two unused F32 moment buffers: 8 MiB for the tested 1,048,576-element
+parameter. Adam itself still needs that storage when selected.
+
+Detail: the regression checks retained buffer allocation requests, not peak
+driver VRAM. Graph buffers, moments, accumulators and diagnostics are reported
+separately; staging and driver objects are outside that sum. Reads of
+uninitialized moments return zeros without allocating; clearing the optimizer
+retains initialized state for later reuse. See
+[checkpoint and memory contracts](checkpoints-and-memory.md).
+
+### 34. How do you distinguish a tuning gain from a lucky session or timing drift?
+
+Short: compare untuned sessions first, then reverse which session owns the
+selected kernels while keeping buffers and training history in place.
+
+Detail: the new six-process experiment uses four symmetric crossover blocks
+and balanced starting roles. It requires a quiet A/A control and the same
+5% + twice-MAD guard in both orientations and pooled pairs. Dense inference
+passes all six processes (median 1.177×); MLP+Adam has four inconclusive results
+and two unstable controls; ResNet never changes selection. Keep every attempt.
+This is descriptive counterbalancing, not randomized causal proof or a
+confidence interval. A/A runs before search only, and telemetry is coarse.
+
+### 35. Why can search be expensive when the candidate kernels are fast?
+
+Short: correctness qualification, transfers and host work cost time too.
+
+Detail: the first phase profile put 98% of ResNet's search in qualification.
+The follow-up separates CPU work and transfer/dispatch/wait, then changes
+only the private staging allocation. With Blade 0.9 on RTX 5070, median CPU
+readback allocation/copy falls from 582 to 2 ms; unchanged CPU validation
+still takes about 6 ms. Total search falls from 606 to 39 ms despite increased
+preparation and transfer costs. Keep the ordinary/tiny patterns, full scans
+and sampled f64 checks: they were not the dominant cost. See the
+[six-process protocol and results](../experiments/readback-2026-09-06/README.md).
+
+### 36. Does read-optimized staging mean faster kernels or faster ResNet?
+
+Short: neither. It means cheaper kernel search on the tested device.
+
+Detail: candidate code, bindings, precision and selection guards are identical.
+Download is the default for one private upload/readback buffer, not the live
+model's allocations. All 108 comparisons qualify, with bit-exact state checks
+through Adam step 178; continuation was untimed. Both arms used Blade 0.9,
+so this is not a Blade-version benchmark either. The original Shared option
+remains available and tuning remains opt-in. Source policies differ on Vulkan,
+but Shared and Download map to the same Metal storage mode; fleet performance
+and automatic whole-step confirmation are still open.
+
+### 37. What exactly is reused, and can it change validation or the memory budget?
+
+Short: one private staging allocation, at the same exact size, within one
+tuning call. Not model buffers, qualified outputs, inputs or selected winners.
+
+Detail: a size change releases the old buffer before allocation; all binding
+buffers and encoders remain fresh. Every ordinary/tiny input upload, NaN poison,
+readback, finite/parity scan and sampled f64 check still runs. Full simultaneous
+requests count against the same byte cap, and nothing is retained on return.
+Reports expose allocation/reuse/release counts and both comparison/final cleanup.
+Six process pairs reduce dense and MLP search costs by median paired ratios
+1.378× and 1.414×, with bit-exact state checks through Adam step 178. Tuning
+remains opt-in; these are not model or cross-engine gains.
+
+### 38. Why does a no-reuse control still show timing differences?
+
+Short: equal implementations do not guarantee equal observed times.
+
+Detail: ResNet uses one allocation in each arm. Fresh-first process ratios have
+median 1.105×; reuse-first ratios have median 0.914×. All six are retained,
+and the overall gain/regression guards both reject a claim. Even the ratio of
+cost medians (0.981×) and median process ratio (1.007×) differ in direction.
+Balanced order is a control, not proof of constant clocks or causal isolation;
+the 250 ms telemetry cannot explain every short operation. See the
+[complete resource protocol and results](../experiments/staging-reuse-2026-09-06/README.md).
+
+### 39. Can all full-state comparisons pass while a gradient is still wrong?
+
+Short: yes, if both executions share a bug or the cases miss its domain.
+
+Detail: the new profiler preserved all 45 full states exactly. Reviewing the
+convolution family still found dX using the wrong padding outside same padding.
+A direct f64 oracle failed where same-padding models could not expose the
+error. Both scalar and generated cooperative indexing are fixed, with full
+odd/asymmetric/batched/tiny derivative checks. Control-session parity measures
+preservation; an independent oracle addresses correctness. Neither replaces
+domain coverage or convergence evidence.
+
+### 40. What do the new whole-step profiles justify doing next?
+
+Short: broaden reusable derivative implementations and measured selection,
+not the matmul search budget or the numerical tolerance.
+
+Detail: ResNet backward convolution accounts for 60.66–60.77% of instrumented
+dispatch time; SmolLM2 backward attention accounts for 36.25–40.58%. A long
+weight-gradient reduction with ten output workgroups motivates testing split-K
+with charged temporary storage. These are F+L+B-only RTX profiles, not optimizer
+or Metal evidence. Intrusive pass timing and substantial short-case drift mean
+the shares are localization evidence, not guaranteed whole-step speedup bounds.
+Exact convolution classes/qualification now cover the existing scalar
+tiles; accept any new schedule only after independent edge tests and matched
+whole-step confirmation. [Protocol and limitations](../experiments/training-profile-2026-09-06/README.md).
+
+### 41. Why isn't convolution tuning just another M/N/K lookup?
+
+Short: equal contraction dimensions can gather different physical tensors.
+
+Detail: dX uses M=Ci, N=H×W, K=Co×Kh×Kw, with one dispatch plane per batch;
+dW uses M=Co, N=Ci×Kh×Kw, K=batch×Oh×Ow. Kernel aspect ratio, stride and both
+padding dimensions affect addresses even when M/N/K match. Our exact key
+records all of them, plus precision, binding capacity and placement. Scratch
+is physical NCHW data, not an im2col allocation. The existing two scalar tiles
+share one bounded runner and unchanged decision guard; new options expose
+Dense, ConvDerivatives and All scopes. No model name enters selection.
+
+### 42. What does convolution qualification prove, and what doesn't it?
+
+Short: structural legality and numerical testing are separate checks.
+
+Detail: checked extents prevent index overflow, and shared convolution kernels
+now decompose indices with exact integer arithmetic. The earlier reciprocal-domain
+filter only excluded unsafe shapes from tuning; it did not fix ordinary execution.
+Both variants must still produce finite, matching full
+outputs on ordinary/tiny synthetic inputs and match 32 f64 contractions,
+including dX batch edges. Separate full f64 scatter oracles cover padding,
+stride and tile edges. Shared bugs, untested domains and convergence still
+require independent evidence. A qualified isolated winner is not automatically
+a whole-step win. [Contract and experiment](../experiments/conv-tiles-2026-09-06/README.md).
+
+### 43. Can two bit-exact training sessions still be an invalid benchmark?
+
+Short: yes—matching zeros and advancing a counter do not prove useful work.
+
+Detail: the first small convolution-chain builder supplied 4-D operands to
+an API documented for flat NCHW arrays. Its first forward dispatch had zero
+workgroups. Both sessions agreed on zero loss, gradients and Adam moments,
+so the original comparisons passed. We retained/disqualified those twelve
+cases, corrected the builder, added early operand rejection and full forward
+oracles, and required nonzero prefix signals plus actual parameter changes.
+The corrected six-process cohort passes these checks. This is why workload
+validity, independent correctness, state preservation and performance are
+separate gates. [Correction and archive](../experiments/conv-tiles-corrected-2026-09-06/README.md).
+
+### 44. Did convolution autotuning win?
+
+Short: four isolated dX classes win; whole-step confirmation remains inconclusive.
+
+Detail: eight ResNet dispatches change from scalar 64 to 32 tiles in every
+corrected process. The median whole-step ratio is 1.05056×, with observed
+time reductions 4.60–4.85%. That is below our 5% requirement even before the
+noise margin. All six A/A screens pass, but no confirmed gain follows. The
+small Adam/SGD chains make real updates and retain their starting tiles.
+The eight-class structural budget visits only 8/45 ResNet derivative classes;
+it is not a measured cost ranking. The next experiment is bounded split-K dW
+with charged partial storage/reduction and explicit search coverage, not a
+lower threshold or an unconditional performance claim.
+Ordinary convolution indexing is now repaired separately: exact integer arithmetic
+replaces unsafe float reciprocal multiplication, with full adversarial GPU oracles.
+
+### 45. How does exact indexing fit a minimal, general engine?
+
+Short: fix the shared arithmetic, not individual shapes.
+
+Detail: the old f32 reciprocal mapped 41/41 to zero, selecting the wrong batch
+in a weight gradient. Exact division repaired this across scalar and generated
+convolution kernels and removed the tuner-only interval filter. Its retained
+cost check increased ResNet F+L+B from about 17.55 to 21.55 ms.
+
+The follow-up uses an **integer** reciprocal: for `d > 1`, precompute
+`m = floor(2^32/d)`, take the high word of `n*m`, and increment if the remainder
+is still at least `d`. The estimate is at most one low for every u32 numerator;
+`d = 1` returns `n`. One shared WGSL helper and four derived u32 uniforms serve
+all convolution directions. No float addressing, width exceptions or new tuning
+knob is needed. GPU raw-u32 checks and full f64 forward/dX/dW oracles pass.
+
+A new six-process RTX cohort shows only about 2% lower ResNet F+L+B time, with
+bit-identical full states. Most of the old cost remains, and short-case drift
+prevents a no-regression claim. A correctness proof does not prove profitability;
+this local comparison is not a new PyTorch result or paired-MAD tuning decision.
+[Repair](../experiments/conv-indexing-2026-09-06/README.md),
+[proof and follow-up measurements](../experiments/conv-divisor-2026-09-06/README.md).
+
+### 46. Why isn't split-K just another tile size?
+
+Short: it changes both the reduction order and the execution plan.
+
+Detail: splitting a long contraction creates more independent workgroups, but
+also writes partial results and launches a reduction before consumers run.
+Those bytes, barriers and dispatch costs belong to the candidate. The explicit
+prototype now partitions the existing scalar dW template into `[split,M,N]`
+partials and uses existing f32 SumRows to write the original gradient. It runs
+as a plan transformation before allocation, with an all-or-nothing logical-byte
+cap; ordinary scheduling and memory reuse handle the intermediate lifetime.
+Labels/origins preserve attribution, but profiling only the convolution family
+would miss the final generic reduction.
+
+Full independent f64 partial/final oracles and short SGD/Adam trajectories test
+the sequence. A long tiny-gradient three-way partial fails the unchanged accuracy
+gate even though its final gradient passes: it remains unqualified. The live
+tile search still cannot change allocation layouts. Explicit bounded sequence
+probes now reuse its scratch, timers and decision guard without installing a
+choice. A four-process cohort finds an isolated 6.93× eight-way gain on the
+synthetic long case, including SumRows, but both profiled large shapes reject
+before timing. No whole-step training gain is established; defaults are unchanged.
+[Prototype](../experiments/split-k-2026-09-06/README.md),
+[sequence measurements](../experiments/split-k-sequence-2026-09-06/README.md).
+
+### 47. How can the unsplit f32 control fail qualification?
+
+Short: f32 arithmetic does not guarantee a fixed error bound for every long sum.
+
+Detail: two long dW control elements pass the sampled checks but fail the full
+f64 scan, one on ordinary and one on tiny inputs. Independent input-coordinate
+scatter with sequential CPU f32 FMA reproduces their GPU bits exactly. These
+particular failures are accumulation rounding, not an integer-indexing discrepancy.
+We retain the rejections and collect no timings for those comparisons.
+
+The earlier three-way partial failure and a later pass on different synthetic
+inputs of the same shape also coexist. “Qualified” means the executed tests
+passed, not that every possible gradient is covered. Stronger shared accumulation
+and broader input coverage come before training promotion; loosening tolerances
+or claiming two same-order scalar tiles are independent references would not
+resolve this. The probe's full validation can cost seconds, so its cost is reported
+separately from sequence timing. [Evidence and limits](../experiments/split-k-sequence-2026-09-06/README.md).
+
+### 48. Why stop after a mostly successful accuracy improvement?
+
+Short: the acceptance rule was declared before the test, and a deferred feature
+is a valid outcome.
+
+Detail: summing 16-term tiles locally and compensating their outer sum fixes
+the known control and partial failures. But only 230/240 broader rows qualify;
+long tiny cancellation inputs fail for both tiles and every tested count.
+A CPU reproduction confirms the reported error even with compensated outer
+addition. That step cannot recover rounding already lost within the tile.
+
+We remove the unqualified arithmetic, retain the source and rejection evidence,
+and defer split-K promotion without a whole-step benchmark. We do not add a
+shape exception, relax the gate, or turn the next possible algorithm into another
+mandatory deadline item. The tuning foundation is useful without universal
+kernel coverage. This closes the engineering milestone and lets paper review
+proceed; it does not prove split-K can never succeed.
+[Decision and evidence](../experiments/compensated-dw-2026-09-06/README.md).
 
 ## Talk outline
 
