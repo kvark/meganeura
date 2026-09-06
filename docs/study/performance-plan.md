@@ -203,6 +203,15 @@ attempt and retain one predeclared acceptance policy; do not pick a favorable
 process or quietly loosen the margin. Cross-session bitwise equality here
 does not strengthen the frozen paper's sampled-output/gradient-norm contract.
 
+The next [controlled crossover protocol](../experiments/crossover-2026-09-06/README.md)
+is implemented separately: six processes, three diagnostic repeat cases, an
+untuned/untuned control and four role-reversed blocks with matched evolving
+states. It uses a checked selection-only swap instead of resetting training
+from an incomplete snapshot. Confirmation requires a stable control and the
+existing guard in both winner-side orientations and pooled pairs. Device
+telemetry and the new search phase timers are retained; this does not change
+runtime selection policy or enable tuning by default.
+
 ## Target contract for broader tuning
 
 Separate three stages rather than folding all decisions into one cost model:

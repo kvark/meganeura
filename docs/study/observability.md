@@ -310,6 +310,18 @@ CPU replay checks their consistency, not the absent full vectors. Validation
 readbacks are outside timers, followed by settling steps, and process memory
 samples with both sessions resident are not peak VRAM.
 
+The [predeclared crossover experiment](../experiments/crossover-2026-09-06/README.md)
+adds an untuned/untuned control, balanced session roles and continuous optional
+GPU telemetry. `Session::swap_tuning_with` exchanges complete legal f32 tile
+choices between compatible sessions sharing one GPU context; it does not
+exchange tensor allocations, weights, moments or training age. It preflights
+the entire layout and prepares missing pipelines before changing choices.
+Preparation and waits stay outside timing. On error, choices and tensor state
+are unchanged, although newly prepared pipelines may remain cached. Callers
+must still match inputs, optimizer settings and age. This is an experimental
+control primitive, not a snapshot, persistent tuning profile, or automatic
+whole-step confirmation/rollback feature.
+
 ## What we should improve next
 
 The highest-value debugging improvements are typed logical-tensor reads;

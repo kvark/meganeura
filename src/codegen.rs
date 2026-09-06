@@ -13,7 +13,7 @@ use naga::Module;
 ///
 /// Derived from `blade_graphics::CooperativeMatrix` capabilities at runtime.
 /// Determines which shader variant is generated for coop matmul.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CoopConfig {
     /// Cooperative matrix tile dimension (8 for Apple Silicon, 16 for RDNA3/Volta+).
     pub tile_size: u32,

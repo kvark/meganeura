@@ -44,6 +44,7 @@ jobs:
         run: |
           cargo test --test tuning_evidence --test holdout_evidence
           cargo test --example tune_holdouts
+          cargo test --example tune_crossover
 
       # Full verification substitutes crates.io dependencies for the pinned
       # git revisions. Re-enable it after Blade publishes the APIs used here.

@@ -826,7 +826,7 @@ fn group_norm_stats_kernel() -> crate::schedule::ReductionKernel {
 }
 
 /// A single GPU dispatch in the execution plan.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Dispatch {
     pub shader: ShaderEntry,
     pub workgroups: [u32; 3],

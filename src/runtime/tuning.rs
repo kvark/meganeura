@@ -81,6 +81,65 @@ struct SearchClass {
     challengers: Vec<MatmulTile>,
 }
 
+struct SelectionSwap {
+    index: usize,
+    class: TuneClass,
+    left: MatmulTile,
+    right: MatmulTile,
+}
+
+fn selection_swaps(
+    left: &[Dispatch],
+    right: &[Dispatch],
+    left_classes: &[SearchClass],
+    right_classes: &[SearchClass],
+) -> Result<Vec<SelectionSwap>, TuneError> {
+    if left.len() != right.len() {
+        return Err(TuneError("tuning swap requires matching dispatch layouts"));
+    }
+    let by_index = |classes: &[SearchClass]| {
+        let mut indices = vec![None; left.len()];
+        for (class_index, class) in classes.iter().enumerate() {
+            for &index in &class.members {
+                indices[index] = Some(class_index);
+            }
+        }
+        indices
+    };
+    let left_indices = by_index(left_classes);
+    let right_indices = by_index(right_classes);
+    let mut swaps = Vec::new();
+    for (index, (a, b)) in left.iter().zip(right).enumerate() {
+        if a == b {
+            continue;
+        }
+        let (Some(ai), Some(bi)) = (left_indices[index], right_indices[index]) else {
+            return Err(TuneError(
+                "tuning swap only permits eligible f32 tile changes",
+            ));
+        };
+        let (ac, bc) = (&left_classes[ai], &right_classes[bi]);
+        if ac.key != bc.key || !ac.initial.fits(&bc.key) || !bc.initial.fits(&ac.key) {
+            return Err(TuneError("tuning swap requires identical legal classes"));
+        }
+        let (mut normalized_a, mut normalized_b) = (a.clone(), b.clone());
+        ac.initial.apply(&mut normalized_a, &ac.key);
+        ac.initial.apply(&mut normalized_b, &bc.key);
+        if normalized_a != normalized_b {
+            return Err(TuneError(
+                "tuning swap cannot change bindings, fusion or provenance",
+            ));
+        }
+        swaps.push(SelectionSwap {
+            index,
+            class: ac.key.clone(),
+            left: ac.initial,
+            right: bc.initial,
+        });
+    }
+    Ok(swaps)
+}
+
 fn collect_classes(
     plan: &crate::compile::ExecutionPlan,
     alias: &crate::memplan::AliasPlan,
@@ -147,6 +206,68 @@ fn collect_classes(
 }
 
 impl Session {
+    /// Exchange eligible f32 matmul choices without exchanging tensor state.
+    ///
+    /// This supports controlled crossover experiments, not automatic confirmation,
+    /// arbitrary report application, or persistent/cross-device winner reuse.
+    /// Sessions must share the exact GPU context, cooperative policy after smoke
+    /// tests, allocation layout, generator knobs and scheduling groups. Dispatches
+    /// may differ only in complete legal matmul tile selection. Callers remain
+    /// responsible for matching inputs, weights, optimizer settings and training age.
+    ///
+    /// Preflights the entire swap, prepares missing pipelines, then waits for both
+    /// sessions before installing choices. No step, upload, readback or optimizer
+    /// update occurs. On error choices and tensors remain unchanged; successfully
+    /// prepared pipelines can remain cached. Preparation and waits belong outside
+    /// whole-step timers. Returns the changed dispatch count per session.
+    pub fn swap_tuning_with(&mut self, other: &mut Self) -> Result<usize, TuneError> {
+        if !std::sync::Arc::ptr_eq(&self.gpu, &other.gpu)
+            || self.coop_config != other.coop_config
+            || self.plan.buffers != other.plan.buffers
+            || self.plan.knobs != other.plan.knobs
+            || self.alias.map != other.alias.map
+            || self.alias.sizes != other.alias.sizes
+            || self.alias.device_local != other.alias.device_local
+            || self.groups != other.groups
+        {
+            return Err(TuneError(
+                "tuning swap requires compatible sessions on one context",
+            ));
+        }
+        let left_classes = collect_classes(&self.plan, &self.alias, self.coop_config.as_ref()).0;
+        let right_classes =
+            collect_classes(&other.plan, &other.alias, other.coop_config.as_ref()).0;
+        let swaps = selection_swaps(
+            &self.plan.dispatches,
+            &other.plan.dispatches,
+            &left_classes,
+            &right_classes,
+        )?;
+        for swap in &swaps {
+            for (session, tile) in [(&mut *self, swap.right), (&mut *other, swap.left)] {
+                if let Err(error) =
+                    session
+                        .pipelines
+                        .ensure_tune_tile(&session.gpu, &swap.class.shader, tile)
+                {
+                    log::warn!("tuning swap pipeline preparation: {error}");
+                    return Err(TuneError(
+                        "tuning swap pipeline preparation failed; see log",
+                    ));
+                }
+            }
+        }
+        self.wait();
+        other.wait();
+        for swap in &swaps {
+            swap.right
+                .apply(&mut self.plan.dispatches[swap.index], &swap.class);
+            swap.left
+                .apply(&mut other.plan.dispatches[swap.index], &swap.class);
+        }
+        Ok(swaps.len())
+    }
+
     /// Bounded f32 tile search with default options; logs skips and returns
     /// per-comparison evidence. Use [`Self::tune_with`] for budgets and full reporting.
     ///
@@ -627,6 +748,204 @@ fn qualify_output(class: &TuneClass, inputs: &[Vec<f32>], output: &[f32], scale:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swap_preflight_checks_complete_layout_before_any_change() {
+        let mut graph = crate::Graph::new();
+        let x = graph.input("x", &[128, 512]);
+        let w = graph.parameter("w", &[512, 512]);
+        let h = graph.matmul(x, w);
+        let y = graph.matmul(h, w);
+        graph.set_outputs(vec![y]);
+        let mut left = crate::compile::compile_with(&graph, &Default::default());
+        super::super::select_variants(&mut left, None, false, false);
+        let alias = crate::memplan::AliasPlan::identity(&left.buffers);
+        let classes = collect_classes(&left, &alias, None).0;
+        let mut right = left.clone();
+        for class in &classes {
+            for &index in &class.members {
+                MatmulTile::Tile32.apply(&mut right.dispatches[index], &class.key);
+            }
+        }
+        let right_classes = collect_classes(&right, &alias, None).0;
+        let swaps = selection_swaps(
+            &left.dispatches,
+            &right.dispatches,
+            &classes,
+            &right_classes,
+        )
+        .unwrap();
+        assert_eq!(swaps.len(), 2);
+        let original_left = left.dispatches.clone();
+        let mut invalid = right.dispatches.clone();
+        invalid[1].origin.push(12345);
+        assert!(selection_swaps(&left.dispatches, &invalid, &classes, &right_classes).is_err());
+        invalid[1] = right.dispatches[1].clone();
+        invalid[1].input_buffers.swap(0, 1);
+        assert!(selection_swaps(&left.dispatches, &invalid, &classes, &right_classes).is_err());
+        assert_eq!(left.dispatches, original_left);
+        for swap in swaps {
+            swap.right
+                .apply(&mut left.dispatches[swap.index], &swap.class);
+            swap.left
+                .apply(&mut right.dispatches[swap.index], &swap.class);
+        }
+        assert_eq!(right.dispatches, original_left);
+        assert!(
+            selection_swaps(
+                &left.dispatches,
+                &right.dispatches[..1],
+                &classes,
+                &right_classes
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "GPU state/crossover qualification; does not select winners by timing"]
+    fn tuning_swap_keeps_distinct_training_states_and_next_updates() {
+        use crate::{CoopPolicy, SessionConfig, SessionOptions};
+        let gpu = std::sync::Arc::new(crate::init_gpu_context().unwrap());
+        let mut graph = crate::Graph::new();
+        let x = graph.input("x", &[33, 17]);
+        let w = graph.parameter("w", &[17, 65]);
+        let y = graph.matmul(x, w);
+        let loss = graph.mean_all(y);
+        graph.set_outputs(vec![loss]);
+        let make = |input: f32, steps: usize| {
+            let (mut s, _) = crate::build(
+                &graph,
+                SessionConfig {
+                    gpu: Some(gpu.clone()),
+                    runtime: SessionOptions {
+                        debug: true,
+                        coop: CoopPolicy::Disabled,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+            s.set_input("x", &vec![input; 33 * 17]);
+            s.set_parameter("w", &vec![0.125; 17 * 65]);
+            s.set_adam(0.001, 0.9, 0.999, 1e-8);
+            s.set_grad_clip_norm(0.05);
+            s.set_grad_clip_every(3);
+            s.set_grad_accumulate(2);
+            for _ in 0..steps {
+                s.step();
+                s.wait();
+            }
+            s
+        };
+        let (mut a, mut a_control) = (make(0.25, 1), make(0.25, 1));
+        let (mut b, mut b_control) = (make(-0.125, 2), make(-0.125, 2));
+        let state = |s: &Session| {
+            let mut values = vec![s.adam_step_count()];
+            for (index, &bytes) in s.plan.buffers.iter().enumerate() {
+                let mut data = vec![0.0; bytes / 4];
+                s.read_buffer(BufferRef(index as u32), &mut data);
+                values.extend(data.into_iter().map(f32::to_bits));
+            }
+            for (m, v) in s.read_adam_states(&["w"]) {
+                values.extend(m.into_iter().chain(v).map(f32::to_bits));
+            }
+            values
+        };
+        let class = collect_classes(&b.plan, &b.alias, None).0.remove(0);
+        let alternative = if class.initial == MatmulTile::Tile32 {
+            MatmulTile::Tile64
+        } else {
+            MatmulTile::Tile32
+        };
+        b.pipelines
+            .ensure_tune_tile(&gpu, &class.key.shader, alternative)
+            .unwrap();
+        for &index in &class.members {
+            alternative.apply(&mut b.plan.dispatches[index], &class.key);
+        }
+        let (a_keys, b_keys) = (a.dispatch_pipeline_keys(), b.dispatch_pipeline_keys());
+        assert_ne!(a_keys, b_keys);
+        for _ in 0..4 {
+            let (before_a, before_b) = (state(&a), state(&b));
+            assert_ne!(before_a, before_b);
+            assert!(a.swap_tuning_with(&mut b).unwrap() > 0);
+            assert_eq!(state(&a), before_a);
+            assert_eq!(state(&b), before_b);
+            for s in [&mut a, &mut b, &mut a_control, &mut b_control] {
+                s.step();
+                s.wait();
+            }
+            assert_eq!(state(&a), state(&a_control));
+            assert_eq!(state(&b), state(&b_control));
+        }
+        assert_eq!(a.dispatch_pipeline_keys(), a_keys);
+        assert_eq!(b.dispatch_pipeline_keys(), b_keys);
+        let before = state(&a);
+        b.plan.knobs.flash_ept_cap += 1;
+        assert!(a.swap_tuning_with(&mut b).is_err());
+        assert_eq!(state(&a), before);
+        assert_eq!(a.dispatch_pipeline_keys(), a_keys);
+    }
+
+    #[test]
+    fn swap_preflight_obeys_native_precision_and_complete_geometry() {
+        let mut graph = crate::Graph::new();
+        let x = graph.input("x", &[32, 32]);
+        let w = graph.parameter("w", &[32, 32]);
+        let y = graph.matmul(x, w);
+        graph.set_outputs(vec![y]);
+        let mut left = crate::compile::compile_with(&graph, &Default::default());
+        super::super::select_variants(&mut left, None, false, false);
+        let alias = crate::memplan::AliasPlan::identity(&left.buffers);
+        for tile_size in [8, 16] {
+            let config = crate::codegen::CoopConfig {
+                tile_size,
+                use_f16_input: false,
+                compensated: false,
+            };
+            let classes = collect_classes(&left, &alias, Some(&config)).0;
+            let mut right = left.clone();
+            MatmulTile::CooperativeF32 { tile_size }
+                .apply(&mut right.dispatches[0], &classes[0].key);
+            let right_classes = collect_classes(&right, &alias, Some(&config)).0;
+            let swaps = selection_swaps(
+                &left.dispatches,
+                &right.dispatches,
+                &classes,
+                &right_classes,
+            )
+            .unwrap();
+            assert_eq!(swaps.len(), 1);
+            let mut selected = left.dispatches[0].clone();
+            swaps[0].right.apply(&mut selected, &swaps[0].class);
+            assert_eq!(selected, right.dispatches[0]);
+            assert!(selected.scalar_fallback.is_some());
+            let reduced = crate::codegen::CoopConfig {
+                use_f16_input: true,
+                ..config
+            };
+            assert!(
+                selection_swaps(
+                    &left.dispatches,
+                    &right.dispatches,
+                    &classes,
+                    &collect_classes(&right, &alias, Some(&reduced)).0
+                )
+                .is_err()
+            );
+            right.dispatches[0].workgroups[0] += 1;
+            assert!(
+                selection_swaps(
+                    &left.dispatches,
+                    &right.dispatches,
+                    &classes,
+                    &collect_classes(&right, &alias, Some(&config)).0
+                )
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn phase_timer_records_partial_time_on_early_exit() {
