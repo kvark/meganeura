@@ -34,9 +34,14 @@ retain five processes, full control-session gradients/moments and matched Adam
 updates through step 78. All numerical checks pass, but no whole-step gain or
 regression clears the predeclared guard. The unchanged ResNet control exposes
 timing drift, and only 1/512 of its plan dispatches is eligible for matmul search.
-Next: A/A and crossover confirmation controls, phase/whole-step profiles, then
-broader reusable convolution/attention coverage. Keep tuning opt-in; do not
-fit a smaller margin or new per-model rule to this cohort.
+The [controlled six-process crossover](experiments/crossover-2026-09-06/README.md)
+now confirms the dense chain in both session orientations (median 1.177×),
+but not MLP+Adam; two MLP A/A controls fail the noise screen. ResNet remains
+unchanged, with 98.26–98.65% of search time spent in qualification. A checked
+selection-only swap preserves tensor/optimizer state through role reversal.
+Next: localize qualification transfers/CPU checks and investigate staging
+placement, then whole-step profiles and broader reusable convolution/attention
+coverage. Keep tuning opt-in; do not fit a smaller margin or model rule.
 
 The [checkpoint/memory follow-up](study/checkpoints-and-memory.md) implements
 logical format-3 saves and preflighted restores, lazy Adam/LaProp state, and

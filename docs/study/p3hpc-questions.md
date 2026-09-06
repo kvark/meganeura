@@ -369,6 +369,30 @@ uninitialized moments return zeros without allocating; clearing the optimizer
 retains initialized state for later reuse. See
 [checkpoint and memory contracts](checkpoints-and-memory.md).
 
+### 34. How do you distinguish a tuning gain from a lucky session or timing drift?
+
+Short: compare untuned sessions first, then reverse which session owns the
+selected kernels while keeping buffers and training history in place.
+
+Detail: the new six-process experiment uses four symmetric crossover blocks
+and balanced starting roles. It requires a quiet A/A control and the same
+5% + twice-MAD guard in both orientations and pooled pairs. Dense inference
+passes all six processes (median 1.177×); MLP+Adam has four inconclusive results
+and two unstable controls; ResNet never changes selection. Keep every attempt.
+This is descriptive counterbalancing, not randomized causal proof or a
+confidence interval. A/A runs before search only, and telemetry is coarse.
+
+### 35. Why can search be expensive when the candidate kernels are fast?
+
+Short: correctness qualification, transfers and host work cost time too.
+
+Detail: ResNet's only eligible classifier outer product spends median 538 ms
+in qualification out of 546 ms total search; sampling is about 7 ms. The phase
+timer has not yet separated CPU checks from uploads/readbacks and GPU work.
+Read-optimized staging is a testable hypothesis, not an established cause.
+Do not remove tiny-operand checks or reinterpret a cheaper search as a model
+speedup. See the [complete protocol and results](../experiments/crossover-2026-09-06/README.md).
+
 ## Talk outline
 
 The actual workshop slot length is not confirmed here. For a 12-minute talk,

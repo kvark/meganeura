@@ -58,6 +58,14 @@ not a promise of GGML byte-format compatibility. Arithmetic, storage and
 matrix-input precision are separate choices: an f32 tensor can be staged
 through f16 matrix operands while accumulating into f32.
 
+Upstream `230cab0` adds explicit `ProjectionWeights::Q4` arguments to SmolLM2
+prefill/decode builders. Per-layer projections and an untied output head can
+use Q4; embeddings, normalization weights and a tied head remain f32. Custom
+projection K sizes not divisible by 32 fall back to f32. This is a deployment
+storage choice, not a changed model hyperparameter or newly demonstrated
+quantized-training path. The f32 RMSNorm/GEMV fusion excludes packed weights;
+the Q4 and fused-f32 pipeline layouts cannot be combined implicitly.
+
 Views, indexing, broadcasting and materialization are represented through
 specific supported operators, not an unrestricted strided tensor language.
 The ONNX and NNEF importers lower subsets into this same IR. Import format

@@ -203,14 +203,27 @@ attempt and retain one predeclared acceptance policy; do not pick a favorable
 process or quietly loosen the margin. Cross-session bitwise equality here
 does not strengthen the frozen paper's sampled-output/gradient-norm contract.
 
-The next [controlled crossover protocol](../experiments/crossover-2026-09-06/README.md)
-is implemented separately: six processes, three diagnostic repeat cases, an
+The [controlled crossover cohort](../experiments/crossover-2026-09-06/README.md)
+is retained separately: six processes, three diagnostic repeat cases, an
 untuned/untuned control and four role-reversed blocks with matched evolving
 states. It uses a checked selection-only swap instead of resetting training
 from an incomplete snapshot. Confirmation requires a stable control and the
 existing guard in both winner-side orientations and pooled pairs. Device
 telemetry and the new search phase timers are retained; this does not change
-runtime selection policy or enable tuning by default.
+runtime selection policy or enable tuning by default. Dense inference passes
+both orientations in all six processes (median 1.177×); MLP+Adam has no
+confirmed gain, with two unstable controls; ResNet remains unchanged. All
+declared tensor comparisons are bit-exact through Adam step 178.
+
+Qualification takes 98.26–98.65% of ResNet's newly measured search wall time
+(median 538 of 546 ms); sampling takes about 7 ms. The next experiment should
+split qualification into transfers/readback, CPU checks and device execution,
+and test staging placement without changing the live-binding equivalence or
+the ordinary/tiny-input numerical gates. `Memory::Shared` staging versus the
+pinned Blade's `Memory::Download` is a concrete source-based hypothesis, not
+a measured explanation yet. Keep this separate from whole-step acceptance:
+making search cheaper would not create useful convolution candidates or turn
+MLP's small negative ratios into a training win.
 
 ## Target contract for broader tuning
 

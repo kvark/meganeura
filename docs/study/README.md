@@ -1,10 +1,11 @@
 # Meganeura: study and workshop preparation
 
 Prepared 2026-09-05 against development base `bd6be08`, subsequently rebased
-onto `8069cf3` with checkpoint/memory work, then `a455409` for training holdouts
+onto `8069cf3` with checkpoint/memory work, `a455409` for training holdouts,
+then `230cab0` for controlled crossover confirmation
 on `codex/audit-observability-tuning`.
 Measured sources are retained as `evidence/tuning-2026-09-05` and
-`evidence/holdouts-2026-09-06`;
+`evidence/holdouts-2026-09-06` and `evidence/crossover-2026-09-06`;
 rebasing does not relabel those measurements as results of newer code. Paper
 performance statements refer to the separately frozen revision. The initial audit was
 CPU-only; subsequent GPU qualification is described separately in the
@@ -42,7 +43,14 @@ The [broader five-process holdouts](../experiments/holdouts-2026-09-06/README.md
 now cover nonlinear inference and optimizer-backed trajectories: full control-
 session gradients/moments and update counts pass, but none of the 30 case runs
 clears the whole-step gain/regression guard. This is why tuning remains opt-in
-and why controlled confirmation and wider kernel-family coverage come next.
+and why controlled confirmation and wider kernel-family coverage matter.
+
+The [six-process crossover](../experiments/crossover-2026-09-06/README.md)
+now confirms a median 1.177× dense-chain gain with the selected plan on either
+session. MLP+Adam has no confirmed gain; two untuned/untuned controls are noisy.
+ResNet is unchanged, and its new phase timers put roughly 98% of search time
+in qualification. Read this as a lesson in separating numerical correctness,
+kernel selection, search cost and whole-step acceptance—not as a new paper result.
 
 The memory/restore follow-up removes unused Adam allocations, reports actual
 resident tensor-buffer requests, and restores logical checkpoints only after

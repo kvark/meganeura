@@ -42,7 +42,7 @@ jobs:
 
       - name: Tuning experiment record replay (CPU only)
         run: |
-          cargo test --test tuning_evidence --test holdout_evidence
+          cargo test --test tuning_evidence --test holdout_evidence --test crossover_evidence
           cargo test --example tune_holdouts
           cargo test --example tune_crossover
 

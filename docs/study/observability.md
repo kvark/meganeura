@@ -276,7 +276,8 @@ The sum excludes final decision bookkeeping and scratch destruction, so compare
 it with total `elapsed` rather than forcing the pieces to sum to the total.
 An early exit retains partial time for the active phase; an unreached phase
 is `None`. Entire `phase_times` is `None` for historical reports written before
-instrumentation, including both retained experiments—not zero measured cost.
+instrumentation, including the first pilot and six-case holdouts—not zero
+measured cost. The later crossover records contain measured phases.
 
 There may be two comparisons per class; the second challenges the last accepted
 winner, not necessarily the original heuristic choice. `failure` identifies
@@ -321,6 +322,15 @@ are unchanged, although newly prepared pipelines may remain cached. Callers
 must still match inputs, optimizer settings and age. This is an experimental
 control primitive, not a snapshot, persistent tuning profile, or automatic
 whole-step confirmation/rollback feature.
+
+The retained crossover is another report-reading exercise. Dense inference
+passes both role orientations in all six processes (median 1.177×); MLP+Adam
+has four inconclusive outcomes and two noisy A/A controls; ResNet changes no
+selection. Bit-exact state checks through Adam step 178 do not imply a training
+speedup. ResNet's search is now localized to qualification (median 538 of
+546 ms), not sampling (7 ms). These timers still combine CPU checking,
+transfers and GPU work within that phase; they do not prove a readback cause.
+The 250 ms device telemetry is too coarse to describe every short timing pair.
 
 ## What we should improve next
 
