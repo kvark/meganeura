@@ -41,7 +41,9 @@ jobs:
           python3 paper/p3hpc/artifact/verify.py --repository
 
       - name: Tuning experiment record replay (CPU only)
-        run: cargo test --test tuning_evidence
+        run: |
+          cargo test --test tuning_evidence
+          cargo test --example tune_holdouts
 
       # Full verification substitutes crates.io dependencies for the pinned
       # git revisions. Re-enable it after Blade publishes the APIs used here.
