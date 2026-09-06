@@ -1,17 +1,17 @@
-// Cached single-token attention: Q=[1, num_heads*head_dim], K/V from cache.
-// Dispatch: [1, num_heads, 1]
-// Each workgroup handles one head: loops over 0..kv_len cached positions.
+// Cached block attention: Q=[queries, num_heads*head_dim], K/V from cache.
+// Dispatch: [queries, num_heads, 1]
+// Each workgroup handles one query/head over 0..kv_len cached positions.
 // kv_len = kv_pos + 1 (read from kv_pos_buf storage buffer).
 // Uses online softmax (same algorithm as attention.wgsl).
 
 struct Params {
-    _reserved: u32,
+    queries: u32,
     num_heads: u32,
     num_kv_heads: u32,
     head_dim: u32,
 }
 
-var<storage> src_a: array<f32>;      // Q: [1, num_heads * head_dim]
+var<storage> src_a: array<f32>;      // Q: [queries, num_heads * head_dim]
 var<storage> src_b: array<f32>;      // K cache: [max_seq, num_kv_heads * head_dim]
 var<storage> bias: array<f32>;       // V cache: [max_seq, num_kv_heads * head_dim]
 var<storage> kv_pos_buf: array<u32>; // [1] — current kv position
@@ -70,7 +70,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let kv_head_off = kv_head * head_dim;
     let kv_dim = num_kv_heads * head_dim;
     let scale = inverseSqrt(f32(head_dim));
-    let q_base = head * head_dim;
+    let q_base = (wgid.x * num_heads + head) * head_dim;
     let q_val = src_a[q_base + tid];
 
     var my_out = 0.0;

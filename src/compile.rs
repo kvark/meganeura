@@ -2552,6 +2552,14 @@ impl<'a> Compiler<'a> {
     fn compile(&mut self) {
         // First pass: allocate buffers for all nodes
         for node in self.graph.nodes() {
+            // CacheWrite must alias before views of its result are allocated.
+            // Deferring this to dispatch emission leaves a following reshape
+            // pointing at an unused, uninitialized allocation.
+            if matches!(node.op, Op::CacheWrite) {
+                let cache = self.get_buffer(node.inputs[1]);
+                self.node_buffers.insert(node.id, cache);
+                continue;
+            }
             // Identity and StopGradient are zero-cost: alias the input
             // buffer. (Identity may also reshape; StopGradient is forward-
             // identity with backward zero, handled in autodiff.)
@@ -4543,8 +4551,7 @@ impl<'a> Compiler<'a> {
                 let cache = self.get_buffer(node.inputs[1]);
                 let kv_pos_input = self.get_buffer(node.inputs[2]);
                 let dim = self.graph.node(node.inputs[0]).ty.shape[1] as u32;
-                // Output aliases the cache buffer (in-place write)
-                self.node_buffers.insert(node.id, cache);
+                debug_assert_eq!(out_buf, cache);
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::CacheWrite,
                     workgroups: [dim.div_ceil(256), 1, 1],
@@ -4567,13 +4574,14 @@ impl<'a> Compiler<'a> {
                 let k_cache = self.get_buffer(node.inputs[1]);
                 let v_cache = self.get_buffer(node.inputs[2]);
                 let kv_pos_input = self.get_buffer(node.inputs[3]);
+                let q_seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::CachedAttention,
-                    workgroups: [1, num_heads, 1],
+                    workgroups: [q_seq, num_heads, 1],
                     input_buffers: vec![q, k_cache, v_cache, kv_pos_input],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
-                    params: vec![0, num_heads, num_kv_heads, head_dim], // kv_len read from input buffer
+                    params: vec![q_seq, num_heads, num_kv_heads, head_dim], // kv_len read from input buffer
                     use_coop: false,
                     use_small_tiles: false,
                     ..Default::default()
