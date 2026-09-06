@@ -75,6 +75,15 @@ fn valid_losses(pairs: &[Pair], work: Work) -> bool {
     })
 }
 
+fn has_training_signal(comparison: &Comparison, work: Work) -> bool {
+    work == Work::Inference
+        || ["loss", "gradient."].iter().all(|prefix| {
+            comparison.tensors.iter().any(|t| {
+                t.name.starts_with(prefix) && t.reference_sum_sq > 0.0 && t.candidate_sum_sq > 0.0
+            })
+        })
+}
+
 fn run_case(
     case: &Case,
     gpu: &Arc<blade_graphics::Context>,
@@ -94,7 +103,17 @@ fn run_case(
     if scope == TuneScope::ConvDerivatives {
         record["baseline_dispatches"] = serde_json::to_value(&sessions[0].plan().dispatches)?;
         record["plan_buffers"] = json!(sessions[0].plan().buffers);
+        if sessions[0]
+            .plan()
+            .dispatches
+            .iter()
+            .any(|d| d.workgroups.contains(&0))
+        {
+            record["status"] = json!("zero_workgroups");
+            return Ok(record);
+        }
     }
+    let initial_parameters = sessions[0].read_params(&sessions[0].param_names());
     let mut age = 0;
     advance(&mut sessions, PREFIX, &mut age);
     let prefix = snapshots(&mut sessions, case);
@@ -104,7 +123,9 @@ fn run_case(
         &prefix[0],
         &prefix[1],
     );
-    let mut valid = prefix_comparison.passed;
+    let signal = has_training_signal(&prefix_comparison, case.work);
+    let mut valid = prefix_comparison.passed && signal;
+    record["prefix_training_signal"] = json!(signal);
     record["prefix_comparison"] = serde_json::to_value(prefix_comparison)?;
     drop(prefix);
     if !valid {
@@ -246,6 +267,13 @@ fn run_case(
         );
         blocks.push(block);
     }
+    if matches!(case.work, Work::Adam | Work::Sgd) {
+        let updates: [bool; 2] = std::array::from_fn(|index| {
+            sessions[index].read_params(&sessions[index].param_names()) != initial_parameters
+        });
+        valid &= updates.into_iter().all(|changed| changed);
+        record["parameters_updated"] = json!(updates);
+    }
     let confirmation = Confirmation::new(&control, &blocks, changed, valid)?;
     eprintln!(
         "{}: {} changed; {:.3}x / {:.3}x by winner side; {}",
@@ -302,7 +330,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         CoopPolicy::Disabled
     };
     let protocol = if scope == TuneScope::ConvDerivatives {
-        "conv-tiles-2026-09-06"
+        "conv-tiles-corrected-2026-09-06"
     } else {
         "crossover-2026-09-06"
     };
@@ -353,6 +381,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn matching_zero_states_are_not_training_qualification() {
+        for (loss, gradient) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
+            let state = Snapshot {
+                tensors: vec![
+                    ("loss".into(), vec![loss]),
+                    ("gradient.w".into(), vec![gradient]),
+                ],
+                adam_step: 0,
+                adam_bytes: 0,
+            };
+            let comparison = compare("prefix", 0, &state, &state);
+            assert!(comparison.passed && comparison.exact);
+            assert_eq!(
+                has_training_signal(&comparison, Work::Sgd),
+                loss != 0.0 && gradient != 0.0
+            );
+        }
+    }
+
+    #[test]
     fn fixed_roster_and_balanced_roles() {
         assert_eq!(
             crossover_cases().iter().map(|c| c.name).collect::<Vec<_>>(),
@@ -382,15 +430,13 @@ mod tests {
             let mut age = 0;
             advance(&mut sessions, PREFIX, &mut age);
             let before = snapshots(&mut sessions, &case);
-            assert!(
-                compare(
-                    "prefix",
-                    case.work.adam_step_after(age),
-                    &before[0],
-                    &before[1]
-                )
-                .passed
+            let comparison = compare(
+                "prefix",
+                case.work.adam_step_after(age),
+                &before[0],
+                &before[1],
             );
+            assert!(comparison.passed && has_training_signal(&comparison, case.work));
             let [left, right] = &mut sessions;
             assert_eq!(left.swap_tuning_with(right).unwrap(), 0);
             let after = snapshots(&mut sessions, &case);

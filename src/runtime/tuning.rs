@@ -1108,12 +1108,19 @@ mod tests {
         let x = graph.input(
             "x",
             &if convolution {
-                [2 * 3 * 11, 17]
+                vec![input_len]
             } else {
-                [33, 17]
+                vec![33, 17]
             },
         );
-        let w = graph.parameter("w", &[17, 65]);
+        let w = graph.parameter(
+            "w",
+            &if convolution {
+                vec![17 * 65]
+            } else {
+                vec![17, 65]
+            },
+        );
         let y = if convolution {
             graph.conv2d_hw(x, w, 2, 17, 3, 11, 65, 1, 1, 1, 0, 0)
         } else {
@@ -1148,6 +1155,7 @@ mod tests {
         };
         let (mut a, mut a_control) = (make(0.25, 1), make(0.25, 1));
         let (mut b, mut b_control) = (make(-0.125, 2), make(-0.125, 2));
+        let initial_parameters = a.read_params(&["w"]);
         let state = |s: &Session| {
             let mut values = vec![s.adam_step_count()];
             for (index, &bytes) in s.plan.buffers.iter().enumerate() {
@@ -1189,6 +1197,11 @@ mod tests {
         }
         assert_eq!(a.dispatch_pipeline_keys(), a_keys);
         assert_eq!(b.dispatch_pipeline_keys(), b_keys);
+        assert_ne!(
+            a.read_params(&["w"]),
+            initial_parameters,
+            "optimizer must make a real update"
+        );
         let before = state(&a);
         b.plan.knobs.flash_ept_cap += 1;
         assert!(a.swap_tuning_with(&mut b).is_err());

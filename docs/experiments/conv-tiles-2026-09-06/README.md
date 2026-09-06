@@ -1,5 +1,15 @@
 # Exact-class convolution derivative tiles
 
+**Validity correction:** the small Adam/SGD case builder used 4-D operands,
+violating the documented flat convolution API. Its first forward dispatch had
+zero workgroups; loss, gradients and moments were all zero. The original runner
+reported matching states but did not reject this vacuous workload. All six
+original raw files remain unchanged and these optimizer cases are disqualified
+as training/performance evidence. ResNet's nonzero workload is unaffected.
+See the [separately predeclared corrected cohort](../conv-tiles-corrected-2026-09-06/README.md).
+The protocol below is preserved as the original intention, not a claim that
+the malformed cases fulfilled it.
+
 ## Predeclared protocol
 
 This is a separate Meganeura-versus-Meganeura engineering cohort, not a new

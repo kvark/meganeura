@@ -44,7 +44,8 @@ fn data(n: usize, seed: u32, scale: f32) -> Vec<f32> {
         .collect()
 }
 
-fn reference(s: Shape, x: &[f32], w: &[f32], dy: &[f32]) -> (Vec<f64>, Vec<f64>) {
+fn reference(s: Shape, x: &[f32], w: &[f32], dy: &[f32]) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let mut output = vec![0.0; dy.len()];
     let mut dx = vec![0.0; x.len()];
     let mut dw = vec![0.0; w.len()];
     let (out_h, out_w) = s.output();
@@ -66,6 +67,7 @@ fn reference(s: Shape, x: &[f32], w: &[f32], dy: &[f32]) -> (Vec<f64>, Vec<f64>)
                                 let xi = (((n * s.ci + ci) * s.h + ih as u32) * s.w + iw as u32)
                                     as usize;
                                 let wi = (((co * s.ci + ci) * s.kh + kh) * s.kw + kw) as usize;
+                                output[yi] += f64::from(x[xi]) * f64::from(w[wi]);
                                 dx[xi] += f64::from(dy[yi]) * f64::from(w[wi]);
                                 dw[wi] += f64::from(dy[yi]) * f64::from(x[xi]);
                             }
@@ -75,7 +77,7 @@ fn reference(s: Shape, x: &[f32], w: &[f32], dy: &[f32]) -> (Vec<f64>, Vec<f64>)
             }
         }
     }
-    (dx, dw)
+    (output, dx, dw)
 }
 
 fn check(label: &str, actual: &[f32], expected: &[f64], scale: f32) {
@@ -143,6 +145,7 @@ fn run(s: Shape, tile: u32, gpu: &Arc<blade_graphics::Context>, policy: CoopPoli
         Arc::clone(gpu),
         SessionOptions {
             coop: policy,
+            no_alias: true, // Keep forward output available for the independent full oracle.
             ..Default::default()
         },
     );
@@ -234,7 +237,24 @@ fn run(s: Shape, tile: u32, gpu: &Arc<blade_graphics::Context>, policy: CoopPoli
             session.wait();
             searched = true;
         }
-        let (dx, dw) = reference(s, &x, &w, &dy);
+        let (output, dx, dw) = reference(s, &x, &w, &dy);
+        let forward = session
+            .plan()
+            .dispatches
+            .iter()
+            .find(|d| {
+                matches!(
+                    d.shader,
+                    ShaderEntry::Conv2dGemm
+                        | ShaderEntry::Conv2dGemmSmall
+                        | ShaderEntry::Conv2dGemmCoopGen(..)
+                )
+            })
+            .unwrap();
+        assert_eq!(forward.workgroups[2], s.batch);
+        let mut actual = vec![f32::NAN; ny];
+        session.read_buffer(forward.output_buffer, &mut actual);
+        check(&format!("{s:?}, forward"), &actual, &output, 1.0);
         for (name, expected) in [("x", dx), ("w", dw)] {
             let mut actual = vec![f32::NAN; expected.len()];
             session.read_param_grad(name, &mut actual);

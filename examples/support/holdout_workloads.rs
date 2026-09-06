@@ -177,10 +177,10 @@ pub fn conv_derivative_cases() -> Vec<Case> {
         .collect();
     for work in [Work::Adam, Work::Sgd] {
         let mut graph = Graph::new();
-        let x = graph.input("input", &[2, 5, 17, 19]);
-        let w1 = graph.parameter("first.weight", &[17, 5, 3, 2]);
+        let x = graph.input("input", &[2 * 5 * 17 * 19]);
+        let w1 = graph.parameter("first.weight", &[17 * 5 * 3 * 2]);
         let h = graph.conv2d_hw(x, w1, 2, 5, 17, 19, 17, 3, 2, 1, 2, 0);
-        let w2 = graph.parameter("second.weight", &[33, 17, 2, 3]);
+        let w2 = graph.parameter("second.weight", &[33 * 17 * 2 * 3]);
         let y = graph.conv2d_hw(h, w2, 2, 17, 19, 18, 33, 2, 3, 2, 0, 1);
         let squared = graph.mul(y, y);
         let loss = graph.mean_all(squared);
