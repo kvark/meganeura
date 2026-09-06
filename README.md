@@ -205,6 +205,9 @@ Reports separate qualification's CPU preparation/copies/checks from
 transfer/dispatch/wait costs. Private tuning staging defaults to read-optimized
 Download; `TuneOptions::staging = TuneStaging::Shared` retains the original
 policy. Neither setting changes candidate bindings or numerical validation.
+One exact-size staging buffer is reused within a tuning call and released on
+size changes or return. `TuneOptions::staging_reuse = TuneStagingReuse::Fresh`
+disables reuse; reports include preparation, cleanup and scratch byte accounting.
 See the [search contract](docs/study/performance-plan.md) and
 [whole-step experiment](examples/tune_session.rs).
 

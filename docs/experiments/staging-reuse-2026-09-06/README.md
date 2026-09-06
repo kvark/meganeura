@@ -107,3 +107,129 @@ It refuses dirty tracked source or existing outputs, saves completed cases
 incrementally and retains optional 250 ms GPU telemetry/host boundaries. Keep
 the GPU free of concurrent tests, builds, other benchmarks and heavy analysis.
 Telemetry cannot establish constant clocks or resolve every short pair.
+
+## Retained comparison results
+
+All six serial processes completed with no retries or discarded attempts:
+[1](run-01.json), [2](run-02.json), [3](run-03.json), [4](run-04.json),
+[5](run-05.json), [6](run-06.json). [summary.json](summary.json) retains all
+cost-level paired medians/noise guards and every process search ratio.
+
+| Identity | Measured value |
+|---|---|
+| Source | `875c501af4d9b9b5e63274758fa5cb610a629c3e` |
+| Immutable tag | `evidence/staging-reuse-2026-09-06` |
+| Executable SHA-256 | `13d937c3fdade2488889c26ee1280f6188db35e76d629a6b05b309c5e34fcb78` |
+| GPU / driver | NVIDIA GeForce RTX 5070 / 595.71.05 |
+| Host / build | Linux x86_64, Intel Core i5-12400F, release Rust 1.98.0, no RUSTFLAGS |
+| Lockfile | The unchanged archived readback lockfile identified above |
+
+The compute-process query was empty before the cohort. No builds, GPU tests,
+other benchmarks or heavy analysis overlapped it; resident graphics processes
+remained. The 453 device samples span 41–61 °C, graphics clocks 180–2902 MHz
+and memory clocks 405–14001 MHz over the whole processes, including idle and
+validation. These coarse observations do not establish isolation or constant
+clocks for each short search.
+
+### Decision and accounting
+
+Times are medians of six per-process costs, in milliseconds. The last column
+is the median of the six paired **process ratios**, not a ratio of cost medians.
+
+| Case | Total search, Fresh → SameSize | Preparation, Fresh → SameSize | Staging management + all cleanup, Fresh → SameSize | Median process ratio |
+|---|---:|---:|---:|---:|
+| Dense inference | 44.005 → 31.837 | 17.586 → 6.272 | 18.273 → 6.097 | 1.378× |
+| MLP+Adam | 64.271 → 45.459 | 28.687 → 12.783 | 30.319 → 12.084 | 1.414× |
+| ResNet F+L+B | 38.510 → 39.239 | 10.562 → 10.570 | 11.380 → 11.367 | 1.007× |
+
+Dense and MLP pass both required total-search and staging-plus-cleanup gain
+guards. ResNet passes neither a total-search gain nor regression guard. All
+18 case runs and 36 searches complete; **108 comparisons qualify**, with
+bit-exact full tensor/counter comparisons through Adam step 178 and all 175 later training
+loss pairs per case passing. Per-search state is unchanged. Candidate classes,
+directions, initial/challenger implementations, dispatch multiplicity and
+binding placement/capacity match between arms. This is control-session parity,
+not an independent engine oracle or a convergence result.
+
+| Case | Staging allocations, Fresh → SameSize | Reuses, Fresh → SameSize | Peak simultaneous scratch requests, both arms |
+|---|---:|---:|---:|
+| Dense inference | 3 → 1 | 0 → 2 | 2,621,440 bytes |
+| MLP+Adam | 5 → 2 | 0 → 3 | 2,486,272 bytes |
+| ResNet F+L+B | 1 → 1 | 0 → 0 | 16,396,192 bytes |
+
+Allocation and release counts balance, per-comparison byte requests match,
+and retained staging is zero at return in every search. Post-search model
+buffer requests also match. This establishes requested-byte accounting, not
+driver peak VRAM. MLP's size-change release is inside preparation; every last
+release is inside total search. Nothing is hidden in untimed teardown.
+
+All predeclared gates pass. A later commit promotes SameSize in
+`TuneOptions::default()`; the measured tag stays fixed. Fresh remains explicit,
+omitted historical reuse settings still deserialize as Fresh, and tuning
+itself stays opt-in. No validation, binding, candidate, memory-cap or kernel
+selection gate changes accompany promotion.
+
+Qualification medians are dense 6.516 → 6.385 ms, MLP 10.826 → 10.207 ms and
+ResNet 20.256 → 20.611 ms. Validation alone is 0.888 → 0.869 ms, 2.052 →
+2.022 ms and 6.135 → 6.129 ms, respectively. Neither qualification nor validation
+passes a gain/regression guard on any case. The measured improvement is in
+allocation/lifetime management, not reduced correctness work. Other small
+component guards remain visible in the summary; do not inflate them into
+additional independent discoveries.
+
+### Every process, including startup and order effects
+
+Each ratio is Fresh total search divided by SameSize total search. The first
+column after the seed lists dense / MLP / ResNet search order.
+
+| Seed | First arm | Dense | MLP+Adam | ResNet |
+|---|---|---:|---:|---:|
+| 1 | Reuse / Fresh / Reuse | 0.698× | 3.013× | 0.931× |
+| 2 | Fresh / Reuse / Fresh | 1.420× | 1.409× | 1.084× |
+| 3 | Reuse / Fresh / Reuse | 1.324× | 1.422× | 0.914× |
+| 4 | Fresh / Reuse / Fresh | 1.415× | 1.393× | 1.105× |
+| 5 | Reuse / Fresh / Reuse | 1.368× | 1.418× | 0.909× |
+| 6 | Fresh / Reuse / Fresh | 1.389× | 1.409× | 1.128× |
+
+Fresh-first versus reuse-first subgroup median ratios are dense 1.415× / 1.324×,
+MLP 1.422× / 1.409× and ResNet 1.105× / 0.914×. ResNet's clear order reversal
+is a warning against claiming causality or zero harm from a balanced median.
+Its ratio of cost medians is 0.981×, while its median process ratio is 1.007×;
+neither is a passed gain. These are six descriptive process pairs, not fleet
+samples or confidence intervals.
+
+In process 1, dense reuse costs 62.643 ms versus Fresh 43.732 ms; pipeline
+setup is 32.105 versus 0.462 ms. Staging-plus-cleanup still falls 19.038 →
+6.035 ms. Conversely, MLP Fresh has 71.628 ms pipeline setup versus reuse's
+1.013 ms, inflating its first ratio. Both observations are retained. Driver
+caches were not cleared, and no cold-cache or guaranteed one-shot claim is made.
+
+### Reproduction and remaining scope
+
+```sh
+cargo test --test staging_reuse_evidence -- --nocapture
+cargo test --test tuning_evidence --test holdout_evidence --test crossover_evidence --test readback_evidence --test staging_reuse_evidence
+cargo test --example tune_staging_reuse
+```
+
+CPU replay recomputes costs, every guard, exact-size hit/miss counts, per-binding
+and peak scratch requests, final release accounting, state summaries and
+identities for both the profile and cohort. Mutation tests reject altered
+policies, missing release, excess capacity, stale reuse flags, corrupt timing,
+state, memory or promotion decisions. Raw tensor vectors are not archived:
+replay checks the retained summaries, not independent producer authenticity.
+
+GPU tests cover both staging placements and both policies, stale NaN payloads,
+grow/shrink/reuse sequences, early-return cleanup, a later oversized class
+after a completed comparison, and subsequent optimizer/accumulation updates.
+After default promotion, the release unit/integration suite, all three ignored
+GPU library regressions and all five scalar tuning tests pass on this host.
+Formatting, all-target/all-feature Clippy, strict rustdoc, the Rust 1.92 library
+check and both diagnostic examples' CPU tests also pass. The frozen paper
+verifier passes six tests and reproduces every table byte-for-byte; external
+fixtures and unavailable native-f32 hardware are not newly qualified here.
+
+Native-f32 hardware and fleet coverage remain due. The next decision should
+come from whole-step profiles and reusable kernel-family coverage, not an
+unmeasured cross-call pool, larger budget or weaker validation. None of these
+new results changes the frozen P3HPC tables or establishes faster model execution.

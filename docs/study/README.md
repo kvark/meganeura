@@ -6,7 +6,8 @@ then `230cab0` for controlled crossover confirmation
 on `codex/audit-observability-tuning`.
 Measured sources are retained as `evidence/tuning-2026-09-05`,
 `evidence/holdouts-2026-09-06`, `evidence/crossover-2026-09-06` and
-`evidence/readback-2026-09-06`;
+`evidence/readback-2026-09-06`, `evidence/allocation-profile-2026-09-06` and
+`evidence/staging-reuse-2026-09-06`;
 rebasing does not relabel those measurements as results of newer code. Paper
 performance statements refer to the separately frozen revision. The initial audit was
 CPU-only; subsequent GPU qualification is described separately in the
@@ -63,6 +64,14 @@ Download, with Shared still available; tuning itself remains opt-in. Added
 preparation/transfer costs and the first slower dense run are retained. This
 is cheaper search on one device, not faster ResNet execution or a Blade-version
 comparison. Development now requires Rust 1.92.
+
+The [allocation/reuse follow-up](../experiments/staging-reuse-2026-09-06/README.md)
+then locates the remaining preparation cost in staging allocation. One exact-size
+buffer now survives between comparisons within a tuning call, never after return.
+Across six paired processes this lowers median dense search 44.01→31.84 ms and
+MLP+Adam 64.27→45.46 ms. ResNet has no reuse opportunity and no guarded change.
+All validation and scratch byte bounds remain intact. This is another search-cost
+result, not a reversal of the earlier inconclusive MLP whole-step result.
 
 The memory/restore follow-up removes unused Adam allocations, reports actual
 resident tensor-buffer requests, and restores logical checkpoints only after

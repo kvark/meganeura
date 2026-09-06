@@ -251,13 +251,38 @@ Explicit Shared and historical missing-field deserialization preserve the
 old policy. Tuning remains default-off. Six process pairs on one GPU do not
 establish fleet behavior; Metal maps both policies to shared storage.
 
-The next search-cost question is preparation and cleanup: separate private
-allocation/binding work from pipeline setup and time final destruction before
-testing bounded scratch/staging reuse.
-Keep retained-byte budgets and all validation unchanged; do not introduce a
-second staging allocation without charging it. This experiment contains no
-whole-step timings. Cheaper search neither supplies convolution candidates
-nor turns MLP's earlier inconclusive whole-step ratios into a training gain.
+The [allocation and exact-size reuse follow-up](../experiments/staging-reuse-2026-09-06/README.md)
+now splits preparation and times cleanup. A tagged localization profile puts
+19.60/20.79 ms dense preparation and 32.05/33.98 ms MLP preparation in staging
+allocation, while candidate binding allocations cost hundredths of a millisecond.
+That motivates one reusable staging slot, not a broader binding/encoder pool.
+
+`TuneStagingReuse::SameSize` now defaults on **within a tuning call** after a
+separate six-process comparison passes its predeclared gates. Sizes must match
+exactly; a change releases the old buffer before new allocation. Full binding
+plus staging requests still count against the same cap, and nothing remains
+after return. Every input upload, poison, readback and numerical check repeats.
+Fresh remains an explicit control and the historical missing-field policy.
+
+| Case | Median total search, Fresh → SameSize | Staging allocations per search | Median paired process ratio |
+|---|---:|---:|---:|
+| Dense inference | 44.01 → 31.84 ms | 3 → 1 | 1.378× |
+| MLP+Adam | 64.27 → 45.46 ms | 5 → 2 | 1.414× |
+| ResNet F+L+B | 38.51 → 39.24 ms | 1 → 1 | 1.007×; no guarded change |
+
+The ratio column is not a ratio of medians. ResNet is strongly order-sensitive;
+the first dense SameSize run is slower overall. Both remain in the records.
+All 108 comparisons qualify with bit-exact state checks through Adam step 178,
+identical per-comparison/peak scratch requests and zero retained staging at
+return. Cleanup includes the final retained-buffer release; it is not moved
+outside total search. No qualification or validation gain guard passes.
+
+This closes the measured staging-allocation opportunity at this scope. Next,
+use whole-step profiles to prioritize reusable convolution/attention work and
+broader kernel selection. Do not infer that cross-call pools, larger budgets
+or weaker checks follow from this result. Cheaper search neither supplies
+convolution candidates nor turns MLP's earlier inconclusive whole-step ratios
+into a training gain. Tuning remains opt-in.
 
 ## Target contract for broader tuning
 

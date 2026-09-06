@@ -234,6 +234,7 @@ pub enum TuneStaging {
 }
 
 /// Lifetime of one private staging buffer, never of bindings or qualified data.
+/// Its default preserves historical reports; new [`TuneOptions`] use SameSize.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TuneStagingReuse {
     /// Allocate and destroy staging for every comparison (historical policy).
@@ -255,7 +256,8 @@ pub struct TuneOptions {
     /// Missing historical settings deserialize to the original shared staging.
     #[serde(default)]
     pub staging: TuneStaging,
-    /// Reuse only private staging, without changing validation or scratch bounds.
+    /// Defaults to SameSize. Reuses only private staging, without changing
+    /// validation or scratch bounds.
     /// Historical missing settings retain Fresh.
     #[serde(default)]
     pub staging_reuse: TuneStagingReuse,
@@ -277,7 +279,7 @@ impl Default for TuneOptions {
             max_classes: 8,
             max_scratch_bytes: 64 * 1024 * 1024,
             staging: TuneStaging::Download,
-            staging_reuse: TuneStagingReuse::Fresh,
+            staging_reuse: TuneStagingReuse::SameSize,
             max_time: Duration::from_secs(2),
             warmup_runs: 1,
             sample_pairs: 6,
@@ -788,6 +790,11 @@ mod tests {
 
     #[test]
     fn missing_historical_reuse_and_scratch_accounting_stay_distinct() {
+        assert_eq!(
+            TuneOptions::default().staging_reuse,
+            TuneStagingReuse::SameSize
+        );
+        assert_eq!(TuneStagingReuse::default(), TuneStagingReuse::Fresh);
         for staging_reuse in [TuneStagingReuse::Fresh, TuneStagingReuse::SameSize] {
             let mut value = serde_json::to_value(TuneReport {
                 options: TuneOptions {

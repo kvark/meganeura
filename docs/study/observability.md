@@ -272,8 +272,9 @@ preparation (including pipeline setup and scratch allocation), qualification
 (data/uploads/dispatches/readbacks/CPU checks), warmup (including input reset),
 and the paired sampling loop. These are non-overlapping host wall times, not
 GPU timestamps. `compile_time` is a subset of preparation; do not add it again.
-The sum excludes final decision bookkeeping and scratch destruction, so compare
-it with total `elapsed` rather than forcing the pieces to sum to the total.
+The original four-phase sum excluded final decision bookkeeping and scratch
+destruction. The allocation follow-up below measures cleanup separately; always
+compare phase sums with total `elapsed` rather than forcing equality.
 An early exit retains partial time for the active phase; an unreached phase
 is `None`. Entire `phase_times` is `None` for historical reports written before
 instrumentation, including the first pilot and six-case holdouts—not zero
@@ -357,6 +358,33 @@ check and the first slower dense run. This supports changing the private
 staging policy, not shortening validation, claiming pure GPU transfer timings,
 or inferring physical heap/cache properties. The Metal backend maps Shared
 and Download to the same storage mode; no Metal performance gain is measured.
+
+The [allocation/reuse follow-up](../experiments/staging-reuse-2026-09-06/README.md)
+adds `preparation_breakdown`: checks, pipeline setup, candidate buffer allocation,
+staging management, encoder creation and binding/geometry work. The pipeline
+field is exactly `compile_time`, already within preparation. `phase_times.cleanup`
+measures comparison resource destruction, including early exits. Reused staging's
+last release is `TuneReport::final_cleanup`, inside total search but outside
+comparison times. Release of a previous size belongs to preparation's staging
+management. Historical missing fields remain `None`; never add nested times twice.
+
+`TuneOutcome.scratch` records actual binding/staging requests and reuse status.
+`TuneReport.scratch` counts staging allocations/reuses/releases, peak simultaneous
+scratch requests and bytes retained at return (zero). These are requested bytes,
+not physical heap sizes or driver peak VRAM. One slot is reused only at the same
+exact size within one call. A size change releases it before new scratch
+allocation; candidate bindings/encoders and every validation operation remain
+fresh. `staging_reuse: Fresh` disables reuse, and missing historical options
+still mean Fresh even though new options now default to SameSize.
+
+Six matched processes reduce dense search from median 44.01 to 31.84 ms and
+MLP+Adam from 64.27 to 45.46 ms. Staging allocations fall 3→1 and 5→2; ResNet
+stays at one. All 108 comparisons qualify with bit-exact state checks through
+Adam step 178 and equal scratch requests. No validation or qualification gain
+guard passes: the improvement is allocation/cleanup, not fewer numerical checks.
+Read the retained first dense slowdown and the ResNet search-order reversal
+before interpreting medians; ResNet passes no gain/regression guard, which
+does not establish zero harm. No whole-step or fleet speedup was measured.
 
 ## What we should improve next
 

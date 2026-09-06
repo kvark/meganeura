@@ -408,6 +408,32 @@ remains available and tuning remains opt-in. Source policies differ on Vulkan,
 but Shared and Download map to the same Metal storage mode; fleet performance
 and automatic whole-step confirmation are still open.
 
+### 37. What exactly is reused, and can it change validation or the memory budget?
+
+Short: one private staging allocation, at the same exact size, within one
+tuning call. Not model buffers, qualified outputs, inputs or selected winners.
+
+Detail: a size change releases the old buffer before allocation; all binding
+buffers and encoders remain fresh. Every ordinary/tiny input upload, NaN poison,
+readback, finite/parity scan and sampled f64 check still runs. Full simultaneous
+requests count against the same byte cap, and nothing is retained on return.
+Reports expose allocation/reuse/release counts and both comparison/final cleanup.
+Six process pairs reduce dense and MLP search costs by median paired ratios
+1.378× and 1.414×, with bit-exact state checks through Adam step 178. Tuning
+remains opt-in; these are not model or cross-engine gains.
+
+### 38. Why does a no-reuse control still show timing differences?
+
+Short: equal implementations do not guarantee equal observed times.
+
+Detail: ResNet uses one allocation in each arm. Fresh-first process ratios have
+median 1.105×; reuse-first ratios have median 0.914×. All six are retained,
+and the overall gain/regression guards both reject a claim. Even the ratio of
+cost medians (0.981×) and median process ratio (1.007×) differ in direction.
+Balanced order is a control, not proof of constant clocks or causal isolation;
+the 250 ms telemetry cannot explain every short operation. See the
+[complete resource protocol and results](../experiments/staging-reuse-2026-09-06/README.md).
+
 ## Talk outline
 
 The actual workshop slot length is not confirmed here. For a 12-minute talk,

@@ -48,8 +48,13 @@ allocation/copy falls from 582 to 2 ms while unchanged validation stays about
 Adam step 178. Download becomes the private staging default; Shared remains
 available. Preparation and transfers cost more, and one dense search is slower
 overall; every attempt is retained. This is not a whole-step speed result.
-Next: split preparation/allocation/cleanup before bounded staging reuse, then
-whole-step profiles and broader reusable convolution/attention coverage.
+The [allocation/reuse follow-up](experiments/staging-reuse-2026-09-06/README.md)
+locates that preparation cost in staging allocation and tests one exact-size
+slot retained only within a tuning call. Six process pairs lower median dense
+search 44.01→31.84 ms and MLP 64.27→45.46 ms; ResNet has no reuse opportunity
+and no guarded change. SameSize becomes the option default, with identical
+scratch requests, zero retention at return and all validation intact.
+Next: whole-step profiles and broader reusable convolution/attention coverage.
 Keep tuning opt-in; do not fit a smaller margin or model rule.
 
 The [checkpoint/memory follow-up](study/checkpoints-and-memory.md) implements
