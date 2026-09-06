@@ -47,6 +47,7 @@ jobs:
           cargo test --example tune_crossover
           cargo test --example tune_readback
           cargo test --example tune_staging_reuse
+          cargo test --example profile_training
 
       - name: Package verification
         run: cargo package
