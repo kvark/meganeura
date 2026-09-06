@@ -5,6 +5,41 @@
 
 use crate::graph::{Graph, NodeId};
 
+/// How the large projection weights are stored on the GPU.
+///
+/// This is a deployment choice, not a model hyperparameter, so it is a
+/// builder argument rather than a [`SmolLM2Config`] field — that struct
+/// mirrors the published `config.json`.
+///
+/// Only the seven per-layer projections (q/k/v/o, gate/up/down) and an
+/// untied `lm_head` are affected. The embedding table stays f32: it is
+/// read by `embedding`, which has no Q4 gather, and a tied `lm_head`
+/// shares it. Norm weights are one-dimensional and not worth packing.
+/// On SmolLM2-135M the projections are ~106M of the 135M parameters.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ProjectionWeights {
+    /// Full precision.
+    #[default]
+    F32,
+    /// Asymmetric Q4 (~5 bits/element), dequantized in the matmul.
+    Q4,
+}
+
+/// A projection weight in the requested format.
+///
+/// Q4 blocks 32 elements along K, and `quantize_q4_0` drops a trailing
+/// partial block, so a K that is not a multiple of 32 would corrupt the
+/// weight rather than fail. Such a projection stays f32; every SmolLM2
+/// shape in this file satisfies the constraint, so this only guards
+/// hand-written configs.
+fn projection(g: &mut Graph, weights: ProjectionWeights, name: &str, shape: &[usize]) -> NodeId {
+    if weights == ProjectionWeights::Q4 && shape[0].is_multiple_of(32) {
+        g.parameter_q4(name, shape)
+    } else {
+        g.parameter(name, shape)
+    }
+}
+
 /// Hyperparameters for a SmolLM2 model instance.
 ///
 /// Values correspond to the `config.json` published alongside the
@@ -217,6 +252,19 @@ pub fn build_prefill_graph(
     config: &SmolLM2Config,
     seq_len: usize,
 ) -> (NodeId, Vec<NodeId>, Vec<NodeId>) {
+    build_prefill_graph_with(g, config, seq_len, ProjectionWeights::F32)
+}
+
+/// [`build_prefill_graph`] with the projection weight format chosen.
+///
+/// Prefill runs `seq_len` rows, so its matmuls take the tiled path,
+/// which has had a Q4 variant all along.
+pub fn build_prefill_graph_with(
+    g: &mut Graph,
+    config: &SmolLM2Config,
+    seq_len: usize,
+    weights: ProjectionWeights,
+) -> (NodeId, Vec<NodeId>, Vec<NodeId>) {
     let hidden = config.hidden_size;
     let kv_dim = config.kv_dim();
     let ffn = config.intermediate_size;
@@ -236,15 +284,21 @@ pub fn build_prefill_graph(
         let ln1_w = g.parameter(&format!("{}.input_layernorm.weight", prefix), &[hidden]);
         let h = g.rms_norm(x, ln1_w, eps);
 
-        let wq = g.parameter(
+        let wq = projection(
+            g,
+            weights,
             &format!("{}.self_attn.q_proj.weight", prefix),
             &[hidden, hidden],
         );
-        let wk = g.parameter(
+        let wk = projection(
+            g,
+            weights,
             &format!("{}.self_attn.k_proj.weight", prefix),
             &[hidden, kv_dim],
         );
-        let wv = g.parameter(
+        let wv = projection(
+            g,
+            weights,
             &format!("{}.self_attn.v_proj.weight", prefix),
             &[hidden, kv_dim],
         );
@@ -269,7 +323,9 @@ pub fn build_prefill_graph(
             config.head_dim(),
         );
 
-        let wo = g.parameter(
+        let wo = projection(
+            g,
+            weights,
             &format!("{}.self_attn.o_proj.weight", prefix),
             &[hidden, hidden],
         );
@@ -282,9 +338,24 @@ pub fn build_prefill_graph(
         );
         let h = g.rms_norm(x, ln2_w, eps);
 
-        let w_gate = g.parameter(&format!("{}.mlp.gate_proj.weight", prefix), &[hidden, ffn]);
-        let w_up = g.parameter(&format!("{}.mlp.up_proj.weight", prefix), &[hidden, ffn]);
-        let w_down = g.parameter(&format!("{}.mlp.down_proj.weight", prefix), &[ffn, hidden]);
+        let w_gate = projection(
+            g,
+            weights,
+            &format!("{}.mlp.gate_proj.weight", prefix),
+            &[hidden, ffn],
+        );
+        let w_up = projection(
+            g,
+            weights,
+            &format!("{}.mlp.up_proj.weight", prefix),
+            &[hidden, ffn],
+        );
+        let w_down = projection(
+            g,
+            weights,
+            &format!("{}.mlp.down_proj.weight", prefix),
+            &[ffn, hidden],
+        );
 
         let gate = g.matmul(h, w_gate);
         let up = g.matmul(h, w_up);
@@ -300,7 +371,7 @@ pub fn build_prefill_graph(
     let logits = if config.tie_word_embeddings {
         g.matmul_bt(x, embed_weight)
     } else {
-        let lm_head = g.parameter("lm_head.weight", &[hidden, config.vocab_size]);
+        let lm_head = projection(g, weights, "lm_head.weight", &[hidden, config.vocab_size]);
         g.matmul(x, lm_head)
     };
 
@@ -318,6 +389,20 @@ pub fn build_decode_graph(
     g: &mut Graph,
     config: &SmolLM2Config,
     max_seq_len: usize,
+) -> (NodeId, Vec<NodeId>, Vec<NodeId>) {
+    build_decode_graph_with(g, config, max_seq_len, ProjectionWeights::F32)
+}
+
+/// [`build_decode_graph`] with the projection weight format chosen.
+///
+/// Decode is a single row, which `compile.rs` sends to the K-split GEMV;
+/// that shader has a Q4 variant, so quantized projections stay on the
+/// fast path here.
+pub fn build_decode_graph_with(
+    g: &mut Graph,
+    config: &SmolLM2Config,
+    max_seq_len: usize,
+    weights: ProjectionWeights,
 ) -> (NodeId, Vec<NodeId>, Vec<NodeId>) {
     let hidden = config.hidden_size;
     let kv_dim = config.kv_dim();
@@ -342,15 +427,21 @@ pub fn build_decode_graph(
         let ln1_w = g.parameter(&format!("{}.input_layernorm.weight", prefix), &[hidden]);
         let h = g.rms_norm(x, ln1_w, eps);
 
-        let wq = g.parameter(
+        let wq = projection(
+            g,
+            weights,
             &format!("{}.self_attn.q_proj.weight", prefix),
             &[hidden, hidden],
         );
-        let wk = g.parameter(
+        let wk = projection(
+            g,
+            weights,
             &format!("{}.self_attn.k_proj.weight", prefix),
             &[hidden, kv_dim],
         );
-        let wv = g.parameter(
+        let wv = projection(
+            g,
+            weights,
             &format!("{}.self_attn.v_proj.weight", prefix),
             &[hidden, kv_dim],
         );
@@ -388,7 +479,9 @@ pub fn build_decode_graph(
             config.head_dim(),
         );
 
-        let wo = g.parameter(
+        let wo = projection(
+            g,
+            weights,
             &format!("{}.self_attn.o_proj.weight", prefix),
             &[hidden, hidden],
         );
@@ -401,9 +494,24 @@ pub fn build_decode_graph(
         );
         let h = g.rms_norm(x, ln2_w, eps);
 
-        let w_gate = g.parameter(&format!("{}.mlp.gate_proj.weight", prefix), &[hidden, ffn]);
-        let w_up = g.parameter(&format!("{}.mlp.up_proj.weight", prefix), &[hidden, ffn]);
-        let w_down = g.parameter(&format!("{}.mlp.down_proj.weight", prefix), &[ffn, hidden]);
+        let w_gate = projection(
+            g,
+            weights,
+            &format!("{}.mlp.gate_proj.weight", prefix),
+            &[hidden, ffn],
+        );
+        let w_up = projection(
+            g,
+            weights,
+            &format!("{}.mlp.up_proj.weight", prefix),
+            &[hidden, ffn],
+        );
+        let w_down = projection(
+            g,
+            weights,
+            &format!("{}.mlp.down_proj.weight", prefix),
+            &[ffn, hidden],
+        );
 
         let gate = g.matmul(h, w_gate);
         let up = g.matmul(h, w_up);
@@ -419,7 +527,7 @@ pub fn build_decode_graph(
     let logits = if config.tie_word_embeddings {
         g.matmul_bt(x, embed_weight)
     } else {
-        let lm_head = g.parameter("lm_head.weight", &[hidden, config.vocab_size]);
+        let lm_head = projection(g, weights, "lm_head.weight", &[hidden, config.vocab_size]);
         g.matmul(x, lm_head) // [1, vocab]
     };
 
