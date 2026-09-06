@@ -16,7 +16,15 @@ use meganeura::{
     profiler::{CaptureOptions, capture_session_profile},
 };
 use serde_json::{Value, json};
-use std::{error::Error, fs::OpenOptions, path::Path, sync::Arc, time::Duration};
+use std::{
+    error::Error,
+    fs::OpenOptions,
+    io::{BufWriter, Write},
+    path::Path,
+    process::{Command, Stdio},
+    sync::Arc,
+    time::Duration,
+};
 use workloads::*;
 
 const WARMUP: usize = 30;
@@ -65,7 +73,53 @@ fn normal_samples(session: &mut Session, expected_loss: f32) -> Value {
         "median_ms": median(&samples), "losses": losses, "loss_comparison": comparison})
 }
 
-fn run_case(case: &Case, gpu: &Arc<blade_graphics::Context>) -> Result<Value, Box<dyn Error>> {
+// Canonical, length-delimited names and f32 bits; no float formatting or norm floor.
+fn state_sha256(state: &Snapshot) -> Result<String, Box<dyn Error>> {
+    let mut child = Command::new("sha256sum")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .or_else(|_| {
+            Command::new("shasum")
+                .args(["-a", "256"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+        })?;
+    {
+        let mut stream = BufWriter::new(child.stdin.take().unwrap());
+        stream.write_all(b"meganeura.snapshot.f32le.v1\0")?;
+        stream.write_all(&state.adam_step.to_le_bytes())?;
+        stream.write_all(&(state.adam_bytes as u64).to_le_bytes())?;
+        let mut tensors: Vec<_> = state.tensors.iter().collect();
+        tensors.sort_by(|a, b| a.0.cmp(&b.0));
+        stream.write_all(&(tensors.len() as u64).to_le_bytes())?;
+        for (name, values) in tensors {
+            stream.write_all(&(name.len() as u64).to_le_bytes())?;
+            stream.write_all(name.as_bytes())?;
+            stream.write_all(&(values.len() as u64).to_le_bytes())?;
+            for value in values {
+                stream.write_all(&value.to_bits().to_le_bytes())?;
+            }
+        }
+        stream.flush()?;
+    }
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err("snapshot sha256sum failed".into());
+    }
+    Ok(String::from_utf8(output.stdout)?
+        .split_whitespace()
+        .next()
+        .ok_or("missing snapshot hash")?
+        .into())
+}
+
+fn run_case(
+    case: &Case,
+    gpu: &Arc<blade_graphics::Context>,
+    indexing_audit: bool,
+) -> Result<Value, Box<dyn Error>> {
     let (mut session, build) = make_session(case, gpu, CoopPolicy::Disabled);
     let keys = session.dispatch_pipeline_keys();
     let mut record = json!({"name": case.name, "description": case.description, "work": case.work,
@@ -80,6 +134,9 @@ fn run_case(case: &Case, gpu: &Arc<blade_graphics::Context>) -> Result<Value, Bo
     })?)?;
     advance(&mut session, WARMUP);
     let reference = snapshot(&mut session, case);
+    if indexing_audit {
+        record["reference_state_sha256"] = json!(state_sha256(&reference)?);
+    }
     let expected_loss = session.read_loss();
     let prefix = compare(
         "reference",
@@ -148,6 +205,10 @@ fn run_case(case: &Case, gpu: &Arc<blade_graphics::Context>) -> Result<Value, Bo
     record["profile"] = serde_json::to_value(profile)?;
     record["normal_after"] = normal_samples(&mut session, expected_loss);
     let after = snapshot(&mut session, case);
+    if indexing_audit {
+        record["final_state_sha256"] = json!(state_sha256(&after)?);
+        valid &= record["reference_state_sha256"] == record["final_state_sha256"];
+    }
     let comparison = compare("normal_after", 0, &reference, &after);
     valid &= comparison.passed
         && record["normal_before"]["loss_comparison"]["passed"] == true
@@ -181,15 +242,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args_os().skip(1);
     let path = args
         .next()
-        .ok_or("usage: profile_training <new-output.json> <seed 1..3>")?;
+        .ok_or("usage: profile_training <new-output.json> <seed 1..3> [--conv-indexing]")?;
     let seed: usize = args
         .next()
         .ok_or("missing seed")?
         .to_str()
         .ok_or("non-UTF8 seed")?
         .parse()?;
+    let indexing_audit = match args.next() {
+        None => false,
+        Some(arg) if arg == "--conv-indexing" => true,
+        Some(_) => return Err("unknown profiling mode".into()),
+    };
     if !(1..=3).contains(&seed) || args.next().is_some() {
-        return Err("expected one output and seed 1..3".into());
+        return Err("expected one output, seed 1..3, optional --conv-indexing".into());
     }
     if !command("git", &["status", "--porcelain", "--untracked-files=no"])?.is_empty() {
         return Err("commit tracked source before profiling".into());
@@ -206,7 +272,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let caps = &gpu.capabilities().cooperative_matrix;
     let mut cases = profile_cases();
     cases.rotate_left(seed - 1);
-    let mut document = json!({"schema_version": 1, "protocol": "training-profile-2026-09-06", "status": "running",
+    let protocol = if indexing_audit {
+        "conv-indexing-2026-09-06"
+    } else {
+        "training-profile-2026-09-06"
+    };
+    let mut document = json!({"schema_version": 1, "protocol": protocol, "status": "running",
         "metadata": {"revision": command("git", &["rev-parse", "HEAD"])?, "tracked_source_clean": true,
             "cargo_lock_sha256": sha256(&Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"))?,
             "executable_sha256": sha256(&std::env::current_exe()?)?, "rustc": command("rustc", &["--version"])?,
@@ -222,7 +293,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut valid = true;
     for case in cases {
         eprintln!("profiling {}", case.name);
-        let record = run_case(&case, &gpu).unwrap_or_else(
+        let record = run_case(&case, &gpu, indexing_audit).unwrap_or_else(
             |error| json!({"name": case.name, "status": "error", "error": error.to_string()}),
         );
         valid &= record["status"] == "complete";
@@ -246,6 +317,36 @@ fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_digest_covers_bits_names_lengths_and_optimizer_state() {
+        let mut state = Snapshot {
+            tensors: vec![("a".into(), vec![0.0, 1.0]), ("b".into(), vec![1e-12])],
+            adam_step: 0,
+            adam_bytes: 0,
+        };
+        let baseline = state_sha256(&state).unwrap();
+        assert_eq!(baseline.len(), 64);
+        state.tensors.reverse();
+        assert_eq!(state_sha256(&state).unwrap(), baseline);
+        state.tensors.reverse();
+        state.tensors[0].1[0] = -0.0;
+        assert_ne!(state_sha256(&state).unwrap(), baseline);
+        state.tensors[0].1[0] = 0.0;
+        state.tensors[0].0 = "c".into();
+        assert_ne!(state_sha256(&state).unwrap(), baseline);
+        state.tensors[0].0 = "a".into();
+        let value = state.tensors[1].1.pop().unwrap();
+        state.tensors[0].1.push(value);
+        assert_ne!(state_sha256(&state).unwrap(), baseline);
+        let value = state.tensors[0].1.pop().unwrap();
+        state.tensors[1].1.push(value);
+        state.adam_step = 1;
+        assert_ne!(state_sha256(&state).unwrap(), baseline);
+        state.adam_step = 0;
+        state.adam_bytes = 4;
+        assert_ne!(state_sha256(&state).unwrap(), baseline);
+    }
 
     #[test]
     fn fixed_profile_boundaries_and_balanced_case_order() {
