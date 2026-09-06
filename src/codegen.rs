@@ -1566,8 +1566,12 @@ fn gen_matmul_coop_wgsl_full(
     };
     let store = |shared: &str, idx: &str, f32_expr: &str| -> String {
         if compensated {
+            // Make the split explicit in f32 bits: an f32->f16->f32 cast
+            // roundtrip can disappear in driver compilation before staging.
+            // Keep ten mantissa bits in the high operand; put very small
+            // values entirely in the scaled low operand to avoid high-term FTZ.
             format!(
-                "{{ let _x = ({f32_expr}); let _h = f16(_x); {shared}[{idx}] = _h; {shared}_lo[{idx}] = f16(_x - f32(_h)); }}"
+                "{{ let _x = ({f32_expr}); let _h = select(bitcast<f32>(bitcast<u32>(_x) & 0xffffe000u), 0.0, abs(_x) < 0.00006103515625); {shared}[{idx}] = f16(_h); {shared}_lo[{idx}] = f16((_x - _h) * 2048.0); }}"
             )
         } else if config.use_f16_input {
             format!("{shared}[{idx}] = f16({f32_expr});")
@@ -2080,20 +2084,35 @@ fn gen_matmul_coop_wgsl_full(
                  \x20   let a1_lo = coopLoadT<{coop_ab}>(&shared_b1_lo[0], {tile}u);\n\
                  \x20   let b0_lo = coopLoadT<{coop_ba}>(&shared_a0_lo[0], {tile}u);\n\
                  \x20   let b1_lo = coopLoadT<{coop_ba}>(&shared_a1_lo[0], {tile}u);\n\
-                 \x20   acc00 = coopMultiplyAdd(a0, b0_lo, acc00);\n\
-                 \x20   acc00 = coopMultiplyAdd(a0_lo, b0, acc00);\n\
-                 \x20   acc01 = coopMultiplyAdd(a0, b1_lo, acc01);\n\
-                 \x20   acc01 = coopMultiplyAdd(a0_lo, b1, acc01);\n\
-                 \x20   acc10 = coopMultiplyAdd(a1, b0_lo, acc10);\n\
-                 \x20   acc10 = coopMultiplyAdd(a1_lo, b0, acc10);\n\
-                 \x20   acc11 = coopMultiplyAdd(a1, b1_lo, acc11);\n\
-                 \x20   acc11 = coopMultiplyAdd(a1_lo, b1, acc11);"
+                 \x20   correction00 = coopMultiplyAdd(a0, b0_lo, correction00);\n\
+                 \x20   correction00 = coopMultiplyAdd(a0_lo, b0, correction00);\n\
+                 \x20   correction01 = coopMultiplyAdd(a0, b1_lo, correction01);\n\
+                 \x20   correction01 = coopMultiplyAdd(a0_lo, b1, correction01);\n\
+                 \x20   correction10 = coopMultiplyAdd(a1, b0_lo, correction10);\n\
+                 \x20   correction10 = coopMultiplyAdd(a1_lo, b0, correction10);\n\
+                 \x20   correction11 = coopMultiplyAdd(a1, b1_lo, correction11);\n\
+                 \x20   correction11 = coopMultiplyAdd(a1_lo, b1, correction11);"
             ),
         )
     } else {
         (String::new(), String::new())
     };
 
+    // Scale residual operands out of f16's subnormal range. Accumulate their
+    // cross-products separately, then undo the exact power-of-two scale once.
+    // This improves bounded inference; it still cannot represent f32 gradients.
+    let (acc_init, result_store) = if compensated {
+        let mut initial = acc_init;
+        let mut correction = String::new();
+        for tile in ["00", "01", "10", "11"] {
+            initial += &format!("\n    var correction{tile} = {coop_c}();");
+            correction +=
+                &format!("\n    acc{tile} = acc{tile} + correction{tile} * 0.00048828125;");
+        }
+        (initial, format!("{correction}\n{result_store}"))
+    } else {
+        (acc_init, result_store)
+    };
     let src = include_str!("shaders/matmul_coop.wgsl");
     let src = preprocess(
         src,

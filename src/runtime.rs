@@ -1977,9 +1977,9 @@ pub(crate) fn select_variants(
         let apple_f32_coop = !config.use_f16_input && config.tile_size == 8;
         for dispatch in &mut plan.dispatches {
             // Autodiff marks derivative work as requiring f32 operands. A
-            // hi/lo f16 split improves mantissa precision but cannot extend
-            // the f16 exponent range: values below the minimum subnormal
-            // become zero in both halves before the matrix multiply. Keep
+            // hi/lo f16 split improves mantissa precision but cannot cover
+            // f32's exponent range: sufficiently small values become zero
+            // in both halves before the matrix multiply. Keep
             // such work on scalar f32 unless the caller explicitly selected
             // `AllowF16`. Native f32 cooperative implementations remain
             // eligible.
@@ -1998,6 +1998,20 @@ pub(crate) fn select_variants(
                 }
             }
             let group = dispatch.shader.shader_group();
+            // Hi/lo staging is implemented only by the matrix-product
+            // generator. Do not silently use raw f16 for convolutions under
+            // the compensated policy.
+            if config.compensated
+                && !matches!(
+                    group,
+                    ShaderGroup::MatMul
+                        | ShaderGroup::MatMulAdd
+                        | ShaderGroup::MatMulAT
+                        | ShaderGroup::MatMulBT
+                )
+            {
+                continue;
+            }
             // Extract (m, n, k, batch) from dispatch params based on shader group.
             let (m, n, k, batch) = match group {
                 ShaderGroup::MatMul | ShaderGroup::MatMulAdd => (
@@ -2118,7 +2132,7 @@ pub(crate) fn select_variants(
                 // dispatch, so it survives reordering.
                 dispatch.scalar_fallback = Some((dispatch.shader.clone(), dispatch.workgroups));
                 dispatch.use_coop = true;
-                dispatch.use_coop_compensated = false;
+                dispatch.use_coop_compensated = config.compensated && config.use_f16_input;
                 // Route conv2d coop dispatches to generated specialized kernels
                 if is_conv_bwd {
                     let kh = dispatch.params[5];
@@ -2206,7 +2220,7 @@ fn coop_preserves_required_precision(
 
 #[cfg(test)]
 mod coop_precision_tests {
-    use super::{Dispatch, coop_preserves_required_precision};
+    use super::{Dispatch, coop_preserves_required_precision, select_variants};
     use crate::codegen::CoopConfig;
 
     #[test]
@@ -2260,10 +2274,34 @@ mod coop_precision_tests {
     fn compensated_f16_does_not_extend_exponent_range() {
         let value = 1.0e-12_f32;
         let high = half::f16::from_f32(value);
-        let low = half::f16::from_f32(value - high.to_f32());
+        let low = half::f16::from_f32((value - high.to_f32()) * 2048.0);
 
         assert_eq!(high.to_bits(), 0);
         assert_eq!(low.to_bits(), 0);
+    }
+
+    #[test]
+    fn compensated_policy_promotes_forward_matmul_but_preserves_derivative_range() {
+        let mut graph = crate::Graph::new();
+        let a = graph.input("a", &[256, 64]);
+        let b = graph.input("b", &[64, 512]);
+        let c = graph.matmul(a, b);
+        graph.set_outputs(vec![c]);
+        let config = CoopConfig {
+            tile_size: 16,
+            use_f16_input: true,
+            compensated: true,
+        };
+        for derivative in [false, true] {
+            let mut plan = crate::compile::compile(&graph);
+            for dispatch in &mut plan.dispatches {
+                dispatch.requires_full_precision = derivative;
+            }
+            select_variants(&mut plan, Some(&config), false, false);
+            assert_eq!(plan.dispatches.len(), 1);
+            assert_eq!(plan.dispatches[0].use_coop, !derivative);
+            assert_eq!(plan.dispatches[0].use_coop_compensated, !derivative);
+        }
     }
 }
 
@@ -2301,6 +2339,12 @@ pub enum CoopPolicy {
     Auto,
     /// Never use cooperative matrices — force the scalar paths.
     Disabled,
+    /// Opt-in hi/lo f16 matrix products with f32 accumulation for bounded
+    /// inference operands. Improves mantissa precision, not f32's exponent range;
+    /// tiny inputs may underflow and large inputs may overflow. Derivative
+    /// work marked `requires_full_precision` still uses f32. Convolutions
+    /// without compensated staging remain scalar. Native f32 is preferred.
+    CompensatedF16,
     /// Use f16 tiles without residual compensation, including for
     /// derivative work. Faster than [`Self::Auto`] on f16-only devices,
     /// and can overflow or lose gradient range.
@@ -2604,7 +2648,7 @@ impl Session {
             Some(CoopConfig {
                 tile_size: caps.f16_tile,
                 use_f16_input: true,
-                compensated: false,
+                compensated: policy == CoopPolicy::CompensatedF16,
             })
         } else {
             None
