@@ -31,6 +31,7 @@ pub mod codegen;
 pub mod compile;
 pub mod config;
 pub mod data;
+mod divisor;
 pub mod eager;
 pub mod graph;
 pub mod load;
@@ -66,4 +67,8 @@ pub use train::{
     TrainConfig, TrainHistory, Trainer, build, build_inference_session, build_session,
     build_session_unoptimized, compile_training_graph,
 };
-pub use tune::{MatmulTile, TuneClass, TuneDecision, TuneError, TuneOptions, TuneReport};
+pub use tune::{
+    MatmulTile, TuneClass, TuneConv2d, TuneDecision, TuneError, TuneOptions, TunePhaseTimes,
+    TunePreparationTimes, TuneQualificationTimes, TuneReport, TuneScope, TuneScratchStats,
+    TuneScratchUsage, TuneStaging, TuneStagingReuse,
+};

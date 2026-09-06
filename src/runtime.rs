@@ -2,6 +2,7 @@ use crate::compile::{BufferRef, Dispatch, ExecutionPlan, ShaderEntry};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
+mod checkpoint;
 mod tuning;
 pub use crate::tune::TuneOutcome;
 
@@ -72,18 +73,34 @@ struct ScatterAddParams {
 /// Summary of GPU memory allocation for a session.
 #[derive(Clone, Debug)]
 pub struct MemorySummary {
+    /// Sum of plan buffer capacities before aliasing, including runtime padding.
     pub total_buffer_bytes: usize,
+    /// Resident Adam/LaProp moments; zero until configuration, write or restore.
     pub adam_state_bytes: usize,
+    pub grad_accumulator_bytes: usize,
+    /// Clip scalar and optional grouped-gradient diagnostic storage.
+    pub optimizer_aux_bytes: usize,
     pub num_buffers: usize,
     pub largest_buffer_bytes: usize,
     /// Bytes actually allocated on the GPU after lifetime-based buffer
-    /// aliasing (≤ `total_buffer_bytes`, which counts logical buffers).
+    /// aliasing, excluding optimizer state and staging.
     pub allocated_buffer_bytes: usize,
     /// Number of physical allocations backing the logical buffers.
     pub num_allocations: usize,
     /// Bytes placed in device-local (non-host-visible) memory —
     /// step-local intermediates on discrete GPUs.
     pub device_local_bytes: usize,
+}
+
+impl MemorySummary {
+    /// Resident tensor/optimizer allocation requests, excluding driver objects
+    /// and staging. Not a peak or device-budget measurement.
+    pub fn total_allocated_bytes(&self) -> usize {
+        self.allocated_buffer_bytes
+            + self.adam_state_bytes
+            + self.grad_accumulator_bytes
+            + self.optimizer_aux_bytes
+    }
 }
 
 /// Per-process GPU memory usage as reported by the graphics API.
@@ -110,13 +127,15 @@ impl std::fmt::Display for MemorySummary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} buffers in {} allocations, {:.1} MB allocated ({:.1} MB device-local, {:.1} MB logical, {:.1} MB adam state), largest {:.1} MB",
+            "{} graph buffers in {} allocations, {:.1} MB resident ({:.1} MB graph, {:.1} MB device-local, {:.1} MB logical, {:.1} MB adam, {:.1} MB accumulators), largest {:.1} MB",
             self.num_buffers,
             self.num_allocations,
+            self.total_allocated_bytes() as f64 / 1e6,
             self.allocated_buffer_bytes as f64 / 1e6,
             self.device_local_bytes as f64 / 1e6,
             self.total_buffer_bytes as f64 / 1e6,
             self.adam_state_bytes as f64 / 1e6,
+            self.grad_accumulator_bytes as f64 / 1e6,
             self.largest_buffer_bytes as f64 / 1e6,
         )
     }
@@ -606,11 +625,40 @@ struct Conv2dParams {
     out_h: u32,
     out_w: u32,
     padding_w: u32,
-    // Reciprocals for strength-reduced integer division in im2col
-    inv_kernel_w: f32,
-    inv_kernel_hw: f32,
-    inv_col_w: f32,      // 1/out_w (forward, grad_weight) or 1/in_w (grad_input)
-    inv_go_spatial: f32, // 1/(out_h*out_w) for grad_weight, unused otherwise
+    kernel_w_multiplier: u32,
+    kernel_hw_multiplier: u32,
+    column_width_multiplier: u32,
+    output_spatial_multiplier: u32,
+}
+
+impl From<&Dispatch> for Conv2dParams {
+    fn from(dispatch: &Dispatch) -> Self {
+        let p = &dispatch.params;
+        let column_width = match dispatch.shader {
+            ShaderEntry::Conv2dGradInputGemm
+            | ShaderEntry::Conv2dGradInputGemmSmall
+            | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => p[3],
+            _ => p[10],
+        };
+        Self {
+            batch: p[0],
+            in_channels: p[1],
+            in_h: p[2],
+            in_w: p[3],
+            out_channels: p[4],
+            kernel_h: p[5],
+            kernel_w: p[6],
+            stride: p[7],
+            padding_h: p[8],
+            out_h: p[9],
+            out_w: p[10],
+            padding_w: p[11],
+            kernel_w_multiplier: crate::divisor::multiplier(p[6]),
+            kernel_hw_multiplier: crate::divisor::multiplier(p[5] * p[6]),
+            column_width_multiplier: crate::divisor::multiplier(column_width),
+            output_spatial_multiplier: crate::divisor::multiplier(p[9] * p[10]),
+        }
+    }
 }
 
 // conv2d_dw: var src, weight, dst, params (depthwise, no in/out channels split)
@@ -1858,9 +1906,10 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::Conv2dGradInputGemm
         | ShaderEntry::Conv2dGradInputGemmSmall
         | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => Conv2dGradInputData::layout(),
-        ShaderEntry::Conv2dGradWeightGemm | ShaderEntry::Conv2dGradWeightGemmSmall => {
-            Conv2dGradWeightData::layout()
-        }
+        ShaderEntry::Conv2dGradWeightGemm
+        | ShaderEntry::Conv2dGradWeightGemmSmall
+        | ShaderEntry::Conv2dGradWeightGemmSplit
+        | ShaderEntry::Conv2dGradWeightGemmSplitSmall => Conv2dGradWeightData::layout(),
         ShaderEntry::RoPEDynamic => RoPEDynamicData::layout(),
         ShaderEntry::CacheWrite => CacheWriteData::layout(),
         ShaderEntry::CachedAttention => CachedAttentionData::layout(),
@@ -1956,7 +2005,7 @@ fn compute_groups(dispatches: &[Dispatch]) -> Vec<std::ops::Range<usize>> {
 /// kernels and output padding), the RmsNorm→matmul prologue fusion that
 /// depends on it, and small-tile demotion. Mutates the plan in place.
 /// This establishes deterministic initial choices. The optional scratch tuner
-/// independently checks legality within its narrower scalar-tile domain.
+/// independently checks legality within its narrower f32-matmul domain.
 pub(crate) fn select_variants(
     plan: &mut ExecutionPlan,
     coop_config: Option<&crate::codegen::CoopConfig>,
@@ -2404,6 +2453,9 @@ pub struct Session {
     /// device-local placement.
     alias: crate::memplan::AliasPlan,
     pipelines: Pipelines,
+    /// Session policy/capabilities after the cooperative smoke test. Tuning
+    /// must not re-enable a rejected or explicitly disabled implementation.
+    coop_config: Option<crate::codegen::CoopConfig>,
     plan: ExecutionPlan,
     /// Pre-computed barrier groups: each range of dispatch indices shares one
     /// compute pass. Pass boundaries in blade emit ALL_COMMANDS barriers.
@@ -2433,7 +2485,7 @@ pub struct Session {
     /// overridden by another `set_learning_rate` / `set_adam` call or
     /// cleared via `clear_optimizer()`.
     pending_lr: Option<f32>,
-    /// Per-parameter Adam state buffers: (m_buf, v_buf).
+    /// Per-parameter Adam/LaProp state, empty until configured or restored.
     adam_state: Vec<(blade_graphics::Buffer, blade_graphics::Buffer)>,
     /// Optional exact temporal sum of grouped gradient L2 norms for one
     /// parameter. Adam already visits every scalar gradient, so collecting
@@ -2922,27 +2974,13 @@ impl Session {
             alias.physical_bytes() as f64 / 1e6,
             alias.device_local_bytes() as f64 / 1e6,
         );
-        let adam_state_bytes = plan
-            .param_grad_pairs
-            .iter()
-            .try_fold(0usize, |total, &(param, _)| {
-                let parameter_bytes = plan.buffers[param.0 as usize];
-                total.checked_add(
-                    parameter_bytes
-                        .checked_mul(2)
-                        .expect("Adam state size overflow"),
-                )
-            })
-            .expect("Adam state total size overflow");
         let planned_allocation_bytes = alias
-            .physical_bytes()
-            .checked_add(adam_state_bytes)
+            .sizes
+            .iter()
+            .try_fold(0usize, |sum, &size| sum.checked_add(size.max(4)))
+            .and_then(|bytes| bytes.checked_add(usize::from(!plan.param_grad_pairs.is_empty()) * 4))
             .expect("session allocation size overflow");
-        ensure_device_memory_budget(
-            &gpu,
-            planned_allocation_bytes,
-            "session buffers and Adam state",
-        );
+        ensure_device_memory_budget(&gpu, planned_allocation_bytes, "session buffers");
         let physical_buffers: Vec<blade_graphics::Buffer> = alias
             .sizes
             .iter()
@@ -3010,30 +3048,6 @@ impl Session {
 
         let optimizer_device = !opts.no_device_local && !opts.debug;
         let mut optimizer_device_bufs: Vec<(blade_graphics::Buffer, u64)> = Vec::new();
-        let adam_state = plan
-            .param_grad_pairs
-            .iter()
-            .enumerate()
-            .map(|(i, &(param_buf, _))| {
-                let size = (plan.buffers[param_buf.0 as usize] as u64).max(4);
-                let m_buf = create_optimizer_buffer(
-                    &gpu,
-                    &format!("adam_m_{i}"),
-                    size,
-                    optimizer_device,
-                    &mut optimizer_device_bufs,
-                );
-                let v_buf = create_optimizer_buffer(
-                    &gpu,
-                    &format!("adam_v_{i}"),
-                    size,
-                    optimizer_device,
-                    &mut optimizer_device_bufs,
-                );
-                (m_buf, v_buf)
-            })
-            .collect();
-
         // Grad-clip accumulator: a single f32. GPU-only after the
         // barriered clip path landed; host-visible only in debug.
         let grad_clip_acc = if !plan.param_grad_pairs.is_empty() {
@@ -3092,6 +3106,7 @@ impl Session {
             physical_buffers,
             alias,
             pipelines,
+            coop_config,
             plan,
             groups,
             encoder,
@@ -3111,7 +3126,7 @@ impl Session {
             grad_accum_bufs: Vec::new(),
             grad_accum_scale: None,
             lr_multipliers: Vec::new(),
-            adam_state,
+            adam_state: Vec::new(),
             adam_grouped_grad_norm: None,
             adam_step: 0,
             pending_adam: None,
@@ -3571,6 +3586,55 @@ mod variant_tests {
 }
 
 #[cfg(test)]
+mod split_k_tests {
+    use super::{BufferRef, Dispatch, ShaderEntry, compute_groups, reorder_by_level};
+
+    #[test]
+    fn split_sequences_get_barriers_and_reuse_nonoverlapping_partials() {
+        let mut plan = crate::compile::compile(&crate::Graph::new());
+        let bytes = 33 * 33 * 4;
+        plan.buffers = vec![bytes; 4];
+        plan.input_buffers = vec![
+            ("upstream".into(), BufferRef(0)),
+            ("input".into(), BufferRef(1)),
+        ];
+        plan.output_buffers = vec![BufferRef(2), BufferRef(3)];
+        let first = Dispatch {
+            shader: ShaderEntry::Conv2dGradWeightGemmSmall,
+            workgroups: [2, 2, 1],
+            input_buffers: vec![BufferRef(0), BufferRef(1)],
+            output_buffer: BufferRef(2),
+            params: vec![1, 33, 1, 33, 33, 1, 1, 1, 0, 1, 33, 0],
+            requires_full_precision: true,
+            ..Default::default()
+        };
+        let mut second = first.clone();
+        second.input_buffers[1] = BufferRef(2);
+        second.output_buffer = BufferRef(3);
+        plan.dispatches = vec![first, second];
+        assert_eq!(
+            plan.split_conv_weight_gradients(&[(0, 2), (1, 2)], bytes * 4),
+            Ok(bytes * 4)
+        );
+        reorder_by_level(&mut plan.dispatches);
+        let groups = compute_groups(&plan.dispatches);
+        assert_eq!(groups, [0..1, 1..2, 2..3, 3..4]);
+        let alias = crate::memplan::plan_buffer_aliasing(&plan, &groups, None);
+        assert_eq!(alias.map[4], alias.map[5]);
+        assert_eq!(alias.sizes[alias.map[4]], bytes * 2);
+        assert!(alias.device_local[alias.map[4]]);
+        for i in 0..4 {
+            assert_ne!(alias.map[i], alias.map[4]);
+        }
+        let no_alias = crate::memplan::plan_no_alias(&plan, &groups, None);
+        assert_eq!(
+            no_alias.physical_bytes() - alias.physical_bytes(),
+            bytes * 2
+        );
+    }
+}
+
+#[cfg(test)]
 mod device_id_tests {
     use super::parse_device_id;
 
@@ -3932,9 +3996,9 @@ impl Session {
                             .collect(),
                         crate::compile::WeightFormat::F32 => unreachable!(),
                     };
-                    self.upload_buffer(buf_ref, &packed);
+                    self.upload_parameter_bytes(buf_ref, &packed);
                 } else {
-                    self.upload_buffer(buf_ref, bytemuck::cast_slice(data));
+                    self.upload_parameter_bytes(buf_ref, bytemuck::cast_slice(data));
                 }
 
                 // If this source param feeds a derived param, fill the
@@ -3996,10 +4060,14 @@ impl Session {
                                         .collect(),
                                     _ => unreachable!(),
                                 };
-                                self.upload_buffer(*derived_buf, &packed);
+                                self.upload_parameter_bytes(*derived_buf, &packed);
                             } else {
                                 // f32: direct copy into GPU buffer
-                                let buf_f32 = self.plan.buffers[derived_buf.0 as usize] / 4;
+                                let buf_f32 =
+                                    self.plan.param_types.get(derived_buf).map_or(
+                                        self.plan.buffers[derived_buf.0 as usize] / 4,
+                                        |ty| ty.num_elements(),
+                                    );
                                 let rows = buf_f32.checked_div(total_cols).unwrap_or(0);
                                 let mut col_offset = 0usize;
                                 for src in sources {
@@ -4191,6 +4259,24 @@ impl Session {
         panic!("unknown input: {}", name);
     }
 
+    fn upload_parameter_bytes(&self, buffer: BufferRef, data: &[u8]) {
+        let capacity = self.plan.buffers[buffer.0 as usize];
+        let logical = self
+            .plan
+            .param_types
+            .get(&buffer)
+            .map_or(capacity, |ty| ty.size_bytes());
+        if data.len() == logical && logical < capacity {
+            let mut padded = vec![0; capacity];
+            padded[..logical].copy_from_slice(data);
+            self.upload_buffer(buffer, &padded);
+        } else {
+            // Retain compatibility with callers supplying a full padded slot;
+            // every other short/mismatched upload remains an error.
+            self.upload_buffer(buffer, data);
+        }
+    }
+
     fn upload_buffer(&self, buf_ref: BufferRef, data: &[u8]) {
         let buffer = &self.buffers[buf_ref.0 as usize];
         let expected = self.plan.buffers[buf_ref.0 as usize];
@@ -4232,6 +4318,9 @@ impl Session {
     /// Write `data` into a GPU buffer, staging through a host-visible
     /// allocation when the destination is device-local.
     fn write_raw_buffer(&self, buffer: &blade_graphics::Buffer, data: &[u8], host_visible: bool) {
+        if data.is_empty() {
+            return;
+        }
         if host_visible {
             unsafe {
                 std::ptr::copy_nonoverlapping(data.as_ptr(), buffer.data(), data.len());
@@ -4266,6 +4355,9 @@ impl Session {
     }
 
     fn read_raw_f32(&self, buffer: &blade_graphics::Buffer, out: &mut [f32], host_visible: bool) {
+        if out.is_empty() {
+            return;
+        }
         if host_visible {
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -4514,6 +4606,10 @@ impl Session {
     /// directly through the mapped pointer. Device-local buffers
     /// (intermediates, parameter gradients) take a staging round-trip.
     pub fn read_buffer(&self, buf_ref: BufferRef, out: &mut [f32]) {
+        assert!(
+            std::mem::size_of_val(out) <= self.plan.buffers[buf_ref.0 as usize],
+            "read_buffer: F32 view exceeds buffer capacity"
+        );
         self.read_raw_f32(
             &self.buffers[buf_ref.0 as usize],
             out,
@@ -4544,12 +4640,23 @@ impl Session {
             .map(|entry| entry.1)
     }
 
-    /// Read a parameter buffer's contents by name.
+    /// Read an F32 parameter buffer's contents by name.
     pub fn read_param(&self, name: &str, out: &mut [f32]) {
         let buf_ref = self
             .param_buffer(name)
             .unwrap_or_else(|| panic!("unknown param: {}", name));
+        self.assert_f32_parameter(buf_ref);
         self.read_buffer(buf_ref, out);
+    }
+
+    fn assert_f32_parameter(&self, buffer: BufferRef) {
+        assert!(
+            self.plan
+                .param_types
+                .get(&buffer)
+                .is_none_or(|ty| ty.dtype == crate::graph::DType::F32),
+            "parameter read requires F32 storage"
+        );
     }
 
     fn read_f32_buffers(
@@ -4637,7 +4744,8 @@ impl Session {
                     ),
                     "parameter {name:?} is not an F32 buffer",
                 );
-                let byte_len = self.plan.buffers[buf_ref.0 as usize];
+                self.assert_f32_parameter(buf_ref);
+                let byte_len = self.param_size(name).expect("parameter exists") * 4;
                 (self.buffers[buf_ref.0 as usize], byte_len)
             })
             .collect();
@@ -4676,13 +4784,14 @@ impl Session {
             .collect()
     }
 
-    /// Element count for a parameter (in `f32` elements). Returns
+    /// Logical element count for a parameter, independent of storage/padding. Returns
     /// `None` if the name doesn't exist.
     pub fn param_size(&self, name: &str) -> Option<usize> {
         let buf_ref = self.param_buffer(name)?;
-        // BufferRef indexes into self.plan.buffers; entry is byte size.
-        let bytes = self.plan.buffers[buf_ref.0 as usize];
-        Some(bytes / std::mem::size_of::<f32>())
+        Some(self.plan.param_types.get(&buf_ref).map_or(
+            self.plan.buffers[buf_ref.0 as usize] / std::mem::size_of::<f32>(),
+            |ty| ty.num_elements(),
+        ))
     }
 
     /// Returns true iff the parameter has an associated gradient buffer
@@ -4699,8 +4808,8 @@ impl Session {
 
     /// Read the Adam first-moment buffer (`m`) for a parameter into
     /// `out`. `out.len()` must equal the parameter's element count.
-    /// Panics if the parameter has no Adam state (no gradient, or
-    /// optimizer wasn't initialised). Used together with
+    /// Returns zeros without allocating before optimizer initialization.
+    /// Panics if the parameter has no gradient. Used together with
     /// [`Session::write_adam_m`] / [`Session::write_adam_v`] /
     /// [`Session::set_adam_step_count`] to carry optimizer state
     /// across a session rebuild — e.g. when the parameter table
@@ -4709,7 +4818,6 @@ impl Session {
         let idx = self
             .adam_state_index(name)
             .unwrap_or_else(|| panic!("no Adam state for param: {name}"));
-        let buf = &self.adam_state[idx].0;
         let n = self.param_size(name).expect("param exists; size known");
         assert_eq!(
             out.len(),
@@ -4717,7 +4825,11 @@ impl Session {
             "read_adam_m: out.len()={} but param '{name}' has {n} elements",
             out.len()
         );
-        self.read_raw_f32(buf, out, !self.optimizer_device);
+        if let Some(&(buffer, _)) = self.adam_state.get(idx) {
+            self.read_raw_f32(&buffer, out, !self.optimizer_device);
+        } else {
+            out.fill(0.0);
+        }
     }
 
     /// Read the Adam second-moment buffer (`v`) for a parameter. See
@@ -4726,7 +4838,6 @@ impl Session {
         let idx = self
             .adam_state_index(name)
             .unwrap_or_else(|| panic!("no Adam state for param: {name}"));
-        let buf = &self.adam_state[idx].1;
         let n = self.param_size(name).expect("param exists; size known");
         assert_eq!(
             out.len(),
@@ -4734,13 +4845,30 @@ impl Session {
             "read_adam_v: out.len()={} but param '{name}' has {n} elements",
             out.len()
         );
-        self.read_raw_f32(buf, out, !self.optimizer_device);
+        if let Some(&(_, buffer)) = self.adam_state.get(idx) {
+            self.read_raw_f32(&buffer, out, !self.optimizer_device);
+        } else {
+            out.fill(0.0);
+        }
     }
 
     /// Read both Adam moment buffers for several parameters with one GPU
     /// transfer through cached download memory. Results have the same order
     /// as `names`.
     pub fn read_adam_states(&self, names: &[&str]) -> Vec<(Vec<f32>, Vec<f32>)> {
+        if self.adam_state.is_empty() {
+            return names
+                .iter()
+                .map(|name| {
+                    assert!(
+                        self.adam_state_index(name).is_some(),
+                        "no Adam state for param: {name}"
+                    );
+                    let n = self.param_size(name).expect("parameter exists");
+                    (vec![0.0; n], vec![0.0; n])
+                })
+                .collect();
+        }
         let buffers: Vec<_> = names
             .iter()
             .flat_map(|name| {
@@ -4774,7 +4902,6 @@ impl Session {
         let idx = self
             .adam_state_index(name)
             .unwrap_or_else(|| panic!("no Adam state for param: {name}"));
-        let buf = &self.adam_state[idx].0;
         let n = self.param_size(name).expect("param exists; size known");
         assert_eq!(
             data.len(),
@@ -4782,7 +4909,12 @@ impl Session {
             "write_adam_m: data.len()={} but param '{name}' has {n} elements",
             data.len()
         );
-        self.write_raw_buffer(buf, bytemuck::cast_slice(data), !self.optimizer_device);
+        self.ensure_adam_state();
+        self.write_raw_buffer(
+            &self.adam_state[idx].0,
+            bytemuck::cast_slice(data),
+            !self.optimizer_device,
+        );
     }
 
     /// Write the Adam second-moment buffer for a parameter. See
@@ -4792,7 +4924,6 @@ impl Session {
         let idx = self
             .adam_state_index(name)
             .unwrap_or_else(|| panic!("no Adam state for param: {name}"));
-        let buf = &self.adam_state[idx].1;
         let n = self.param_size(name).expect("param exists; size known");
         assert_eq!(
             data.len(),
@@ -4800,7 +4931,12 @@ impl Session {
             "write_adam_v: data.len()={} but param '{name}' has {n} elements",
             data.len()
         );
-        self.write_raw_buffer(buf, bytemuck::cast_slice(data), !self.optimizer_device);
+        self.ensure_adam_state();
+        self.write_raw_buffer(
+            &self.adam_state[idx].1,
+            bytemuck::cast_slice(data),
+            !self.optimizer_device,
+        );
     }
 
     /// Current Adam step counter (`t`). Adam's bias correction uses
@@ -4824,6 +4960,56 @@ impl Session {
             .param_grad_pairs
             .iter()
             .position(|&(p, _)| p == param_buf)
+    }
+
+    fn ensure_adam_state(&mut self) {
+        if !self.adam_state.is_empty() || self.plan.param_grad_pairs.is_empty() {
+            return;
+        }
+        for &(param, _) in &self.plan.param_grad_pairs {
+            Self::optimizer_len(&self.plan, param);
+        }
+        let bytes = self
+            .plan
+            .param_grad_pairs
+            .iter()
+            .try_fold(0usize, |sum, &(p, _)| {
+                sum.checked_add(self.plan.buffers[p.0 as usize].max(4).checked_mul(2)?)
+            })
+            .expect("Adam state size overflow");
+        ensure_device_memory_budget(&self.gpu, bytes, "Adam state");
+        self.wait();
+        let mut device_buffers = Vec::new();
+        self.adam_state = self
+            .plan
+            .param_grad_pairs
+            .iter()
+            .enumerate()
+            .map(|(index, &(param, _))| {
+                let size = self.plan.buffers[param.0 as usize].max(4) as u64;
+                let mut create = |suffix| {
+                    create_optimizer_buffer(
+                        &self.gpu,
+                        &format!("adam_{suffix}_{index}"),
+                        size,
+                        self.optimizer_device,
+                        &mut device_buffers,
+                    )
+                };
+                (create("m"), create("v"))
+            })
+            .collect();
+        if !device_buffers.is_empty() {
+            self.encoder.start();
+            {
+                let mut transfer = self.encoder.transfer("zero_adam");
+                for (buffer, size) in device_buffers {
+                    transfer.fill_buffer(buffer.at(0), size, 0);
+                }
+            }
+            self.sync_point = Some(self.gpu.submit(&mut self.encoder));
+            self.wait();
+        }
     }
 
     /// Bulk read of per-parameter gradient L2 norms (Frobenius for
@@ -4851,7 +5037,7 @@ impl Session {
         out
     }
 
-    /// Bulk read of per-parameter weight L2 norms. Same shape as
+    /// Bulk read of F32 per-parameter weight L2 norms. Same shape as
     /// `read_all_param_grad_norms`. Useful for computing
     /// gradient-to-weight ratios as a stability indicator.
     pub fn read_all_param_norms(&self) -> Vec<(String, f32)> {
@@ -5024,8 +5210,8 @@ impl Session {
             {
                 let pipeline = self.pipelines.scalar(ShaderEntry::GradAccum);
                 let mut pass = self.encoder.compute("grad_accum");
-                for (idx, &(_, grad_buf)) in self.plan.param_grad_pairs.iter().enumerate() {
-                    let len = (self.plan.buffers[grad_buf.0 as usize] / 4) as u32;
+                for (idx, &(param_buf, grad_buf)) in self.plan.param_grad_pairs.iter().enumerate() {
+                    let len = Self::optimizer_len(&self.plan, param_buf);
                     let mut pc = pass.with(pipeline);
                     pc.bind(
                         0,
@@ -5071,7 +5257,7 @@ impl Session {
                 let pipeline = self.pipelines.scalar(ShaderEntry::AdaptiveGradClip);
                 let mut pass = self.encoder.compute("adaptive_grad_clip");
                 for (idx, &(param_buf, grad_buf)) in self.plan.param_grad_pairs.iter().enumerate() {
-                    let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
+                    let len = Self::optimizer_len(&self.plan, param_buf);
                     let mut pc = pass.with(pipeline);
                     pc.bind(
                         0,
@@ -5124,7 +5310,7 @@ impl Session {
                     for (idx, &(param_buf, grad_buf)) in
                         self.plan.param_grad_pairs.iter().enumerate()
                     {
-                        let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
+                        let len = Self::optimizer_len(&self.plan, param_buf);
                         {
                             let mut pc = pass.with(pipeline);
                             pc.bind(
@@ -5162,7 +5348,7 @@ impl Session {
                     for (idx, &(param_buf, grad_buf)) in
                         self.plan.param_grad_pairs.iter().enumerate()
                     {
-                        let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
+                        let len = Self::optimizer_len(&self.plan, param_buf);
                         let mut pc = pass.with(pipeline);
                         pc.bind(
                             0,
@@ -5202,7 +5388,7 @@ impl Session {
                 let pipeline = self.pipelines.scalar(ShaderEntry::SgdUpdate);
                 let mut pass = self.encoder.compute("sgd_update");
                 for (idx, &(param_buf, grad_buf)) in self.plan.param_grad_pairs.iter().enumerate() {
-                    let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
+                    let len = Self::optimizer_len(&self.plan, param_buf);
                     let effective_lr = learning_rate
                         * Self::lr_multiplier_for_buf(
                             &self.plan.param_buffers,
@@ -5238,7 +5424,7 @@ impl Session {
                 let pipeline = self.pipelines.scalar(ShaderEntry::AdamUpdate);
                 let mut pass = self.encoder.compute("adam_update");
                 for (idx, &(param_buf, grad_buf)) in self.plan.param_grad_pairs.iter().enumerate() {
-                    let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
+                    let len = Self::optimizer_len(&self.plan, param_buf);
                     let effective_lr = lr
                         * Self::lr_multiplier_for_buf(
                             &self.plan.param_buffers,
@@ -5291,6 +5477,21 @@ impl Session {
 
         self.last_submit_ns = crate::profiler::now_ns();
         self.sync_point = Some(self.gpu.submit(&mut self.encoder));
+    }
+
+    fn optimizer_len(plan: &ExecutionPlan, param: BufferRef) -> u32 {
+        let len = match plan.param_types.get(&param) {
+            Some(ty) => {
+                assert_eq!(
+                    ty.dtype,
+                    crate::graph::DType::F32,
+                    "optimizer/clip/accumulation requires F32 trainable parameter storage"
+                );
+                ty.num_elements()
+            }
+            None => plan.buffers[param.0 as usize] / 4,
+        };
+        u32::try_from(len).expect("optimizer parameter exceeds u32 element limit")
     }
 
     /// The buffer the optimizer/clip should read for param `idx`'s
@@ -6294,95 +6495,40 @@ impl Session {
             ShaderEntry::Conv2dGemm
             | ShaderEntry::Conv2dGemmSmall
             | ShaderEntry::Conv2dGemmCoopGen(..) => {
-                let p = &dispatch.params;
-                let kernel_hw = p[5] * p[6];
                 pc.bind(
                     0,
                     &Conv2dData {
                         src: buf(dispatch.input_buffers[0]),
                         weight: buf(dispatch.input_buffers[1]),
                         dst: buf(dispatch.output_buffer),
-                        params: Conv2dParams {
-                            batch: p[0],
-                            in_channels: p[1],
-                            in_h: p[2],
-                            in_w: p[3],
-                            out_channels: p[4],
-                            kernel_h: p[5],
-                            kernel_w: p[6],
-                            stride: p[7],
-                            padding_h: p[8],
-                            out_h: p[9],
-                            out_w: p[10],
-                            padding_w: p[11],
-                            inv_kernel_w: 1.0 / p[6] as f32,
-                            inv_kernel_hw: 1.0 / kernel_hw as f32,
-                            inv_col_w: 1.0 / p[10] as f32, // 1/out_w
-                            inv_go_spatial: 0.0,
-                        },
+                        params: Conv2dParams::from(dispatch),
                     },
                 );
             }
             ShaderEntry::Conv2dGradInputGemm
             | ShaderEntry::Conv2dGradInputGemmSmall
             | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => {
-                let p = &dispatch.params;
-                let kernel_hw = p[5] * p[6];
                 pc.bind(
                     0,
                     &Conv2dGradInputData {
                         grad_out: buf(dispatch.input_buffers[0]),
                         weight: buf(dispatch.input_buffers[1]),
                         dst: buf(dispatch.output_buffer),
-                        params: Conv2dParams {
-                            batch: p[0],
-                            in_channels: p[1],
-                            in_h: p[2],
-                            in_w: p[3],
-                            out_channels: p[4],
-                            kernel_h: p[5],
-                            kernel_w: p[6],
-                            stride: p[7],
-                            padding_h: p[8],
-                            out_h: p[9],
-                            out_w: p[10],
-                            padding_w: p[11],
-                            inv_kernel_w: 1.0 / p[6] as f32,
-                            inv_kernel_hw: 1.0 / kernel_hw as f32,
-                            inv_col_w: 1.0 / p[3] as f32, // 1/in_w
-                            inv_go_spatial: 0.0,
-                        },
+                        params: Conv2dParams::from(dispatch),
                     },
                 );
             }
-            ShaderEntry::Conv2dGradWeightGemm | ShaderEntry::Conv2dGradWeightGemmSmall => {
-                let p = &dispatch.params;
-                let kernel_hw = p[5] * p[6];
-                let go_spatial = p[9] * p[10]; // out_h * out_w
+            ShaderEntry::Conv2dGradWeightGemm
+            | ShaderEntry::Conv2dGradWeightGemmSmall
+            | ShaderEntry::Conv2dGradWeightGemmSplit
+            | ShaderEntry::Conv2dGradWeightGemmSplitSmall => {
                 pc.bind(
                     0,
                     &Conv2dGradWeightData {
                         grad_out: buf(dispatch.input_buffers[0]),
                         src: buf(dispatch.input_buffers[1]),
                         dst: buf(dispatch.output_buffer),
-                        params: Conv2dParams {
-                            batch: p[0],
-                            in_channels: p[1],
-                            in_h: p[2],
-                            in_w: p[3],
-                            out_channels: p[4],
-                            kernel_h: p[5],
-                            kernel_w: p[6],
-                            stride: p[7],
-                            padding_h: p[8],
-                            out_h: p[9],
-                            out_w: p[10],
-                            padding_w: p[11],
-                            inv_kernel_w: 1.0 / p[6] as f32,
-                            inv_kernel_hw: 1.0 / kernel_hw as f32,
-                            inv_col_w: 1.0 / p[10] as f32, // 1/out_w
-                            inv_go_spatial: 1.0 / go_spatial as f32,
-                        },
+                        params: Conv2dParams::from(dispatch),
                     },
                 );
             }
@@ -6556,7 +6702,7 @@ impl Session {
         let pipeline = self.pipelines.scalar(ShaderEntry::SgdUpdate);
         let mut pass = self.encoder.compute("sgd_update");
         for &(param_buf, grad_buf) in &self.plan.param_grad_pairs {
-            let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
+            let len = Self::optimizer_len(&self.plan, param_buf);
             let mut pc = pass.with(pipeline);
             pc.bind(
                 0,
@@ -6658,19 +6804,18 @@ impl Session {
     /// `max_norm`, scales every buffer in place by `max_norm / norm`.
     /// Returns `(pre_clip_norm, did_clip)`.
     ///
-    /// Used internally by `step()` when `pending_grad_clip` is set.
-    /// Public for diagnostic / unit-test use.
+    /// Diagnostic/fallback helper; `step()` uses GPU clipping instead.
     pub fn clip_grad_norm_cpu(&mut self, max_norm: f32) -> (f32, bool) {
         if max_norm <= 0.0 {
             return (0.0, false);
         }
+        self.wait();
         // Sum of squares across all gradient buffers.
         let mut total_sq: f64 = 0.0;
         let mut buffers: Vec<(BufferRef, Vec<f32>)> =
             Vec::with_capacity(self.plan.param_grad_pairs.len());
-        for &(_param_buf, grad_buf) in &self.plan.param_grad_pairs {
-            let bytes = self.plan.buffers[grad_buf.0 as usize];
-            let n = bytes / 4;
+        for &(param_buf, grad_buf) in &self.plan.param_grad_pairs {
+            let n = Self::optimizer_len(&self.plan, param_buf) as usize;
             let mut data = vec![0.0f32; n];
             self.read_buffer(grad_buf, &mut data);
             for &v in &data {
@@ -6689,7 +6834,11 @@ impl Session {
             for v in &mut data {
                 *v *= scale;
             }
-            self.upload_buffer(grad_buf, bytemuck::cast_slice(&data));
+            self.write_raw_buffer(
+                &self.buffers[grad_buf.0 as usize],
+                bytemuck::cast_slice(&data),
+                self.logical_host_visible(grad_buf),
+            );
         }
         (total_norm, true)
     }
@@ -6756,7 +6905,7 @@ impl Session {
         let _span = tracing::info_span!("sgd_step_cpu").entered();
         self.wait();
         for &(param_buf, grad_buf) in &self.plan.param_grad_pairs {
-            let size = self.plan.buffers[param_buf.0 as usize] / 4;
+            let size = Self::optimizer_len(&self.plan, param_buf) as usize;
             let mut param = vec![0.0f32; size];
             let mut grad = vec![0.0f32; size];
             self.read_buffer(param_buf, &mut param);
@@ -6764,13 +6913,18 @@ impl Session {
             for i in 0..size {
                 param[i] -= learning_rate * grad[i];
             }
-            self.upload_buffer(param_buf, bytemuck::cast_slice(&param));
+            self.write_raw_buffer(
+                &self.buffers[param_buf.0 as usize],
+                bytemuck::cast_slice(&param),
+                self.logical_host_visible(param_buf),
+            );
         }
     }
 
     /// Apply Adam optimizer updates to all parameters on the GPU.
     pub fn adam_step(&mut self, lr: f32, beta1: f32, beta2: f32, eps: f32) {
         let _span = tracing::info_span!("adam_step").entered();
+        self.ensure_adam_state();
         self.adam_step += 1;
         self.wait();
         self.encoder.start();
@@ -6779,7 +6933,7 @@ impl Session {
         let pipeline = self.pipelines.scalar(ShaderEntry::AdamUpdate);
         let mut pass = self.encoder.compute("adam_update");
         for (idx, &(param_buf, grad_buf)) in self.plan.param_grad_pairs.iter().enumerate() {
-            let len = (self.plan.buffers[param_buf.0 as usize] / 4) as u32;
+            let len = Self::optimizer_len(&self.plan, param_buf);
             let (ref m_buf, ref v_buf) = self.adam_state[idx];
             let (grouped_grad_norm, grad_group_size) = Self::adam_grouped_grad_norm_binding(
                 self.adam_grouped_grad_norm.as_ref(),
@@ -6829,6 +6983,7 @@ impl Session {
     /// [`set_learning_rate`](Self::set_learning_rate), or stop optimizer
     /// updates via [`clear_optimizer`](Self::clear_optimizer).
     pub fn set_adam(&mut self, lr: f32, beta1: f32, beta2: f32, eps: f32) {
+        self.ensure_adam_state();
         self.pending_adam = Some((lr, beta1, beta2, eps, AdaptiveOptimizer::Adam));
         // Switching optimizers: Adam wins, SGD stops applying.
         self.pending_lr = None;
@@ -6841,6 +6996,7 @@ impl Session {
     /// the optimizer ordering used by DreamerV3. Its two state tensors are
     /// checkpoint-compatible with Adam's `m` and `v` buffers.
     pub fn set_laprop(&mut self, lr: f32, beta1: f32, beta2: f32, eps: f32) {
+        self.ensure_adam_state();
         self.pending_adam = Some((lr, beta1, beta2, eps, AdaptiveOptimizer::LaProp));
         self.pending_lr = None;
     }
@@ -6924,6 +7080,7 @@ impl Session {
     /// Forward+backward still runs (gradients are computed) but no SGD
     /// or Adam pass is appended. Useful when freezing parameters for
     /// evaluation or pinning the model after a warmup phase.
+    /// Retains allocated moments and counters so reconfiguration can resume.
     pub fn clear_optimizer(&mut self) {
         self.pending_lr = None;
         self.pending_adam = None;
@@ -7045,20 +7202,40 @@ impl Session {
             .plan
             .param_grad_pairs
             .iter()
-            .map(|&(p, _)| self.plan.buffers[p.0 as usize] * 2)
+            .take(self.adam_state.len())
+            .map(|&(p, _)| self.plan.buffers[p.0 as usize].max(4) * 2)
             .sum();
+        let grad_accumulator_bytes = self
+            .plan
+            .param_grad_pairs
+            .iter()
+            .take(self.grad_accum_bufs.len())
+            .map(|&(_, g)| self.plan.buffers[g.0 as usize].max(4))
+            .sum();
+        let clip_bytes = usize::from(self.grad_clip_acc.is_some()) * 4;
+        let optimizer_aux_bytes = clip_bytes
+            + self
+                .adam_grouped_grad_norm
+                .as_ref()
+                .map_or(0, |state| (state.len * 4).max(4));
         MemorySummary {
             total_buffer_bytes: total,
             adam_state_bytes: adam_bytes,
+            grad_accumulator_bytes,
+            optimizer_aux_bytes,
             num_buffers: self.plan.buffers.len(),
             largest_buffer_bytes: largest,
-            allocated_buffer_bytes: self.alias.physical_bytes(),
+            allocated_buffer_bytes: self.alias.sizes.iter().map(|&size| size.max(4)).sum(),
             num_allocations: self.alias.sizes.len(),
-            device_local_bytes: self.alias.device_local_bytes()
+            device_local_bytes: self
+                .alias
+                .sizes
+                .iter()
+                .zip(&self.alias.device_local)
+                .filter_map(|(&size, &device)| device.then_some(size.max(4)))
+                .sum::<usize>()
                 + if self.optimizer_device {
-                    adam_bytes
-                        + self.grad_accum_bufs.len() * adam_bytes / 2
-                        + usize::from(self.grad_clip_acc.is_some()) * 4
+                    adam_bytes + grad_accumulator_bytes + clip_bytes
                 } else {
                     0
                 },
@@ -7096,304 +7273,6 @@ impl Session {
     /// GPU device and driver name.
     pub fn device_information(&self) -> &blade_graphics::DeviceInformation {
         self.gpu.device_information()
-    }
-
-    /// Save a training checkpoint (parameters + Adam state) to a safetensors file.
-    ///
-    /// Saves all parameter values, Adam first/second moment buffers (if any),
-    /// and the Adam step counter as metadata.
-    #[allow(clippy::pattern_type_mismatch)]
-    pub fn save_checkpoint(&mut self, path: &std::path::Path) -> std::io::Result<()> {
-        use safetensors::tensor::{Dtype, TensorView};
-
-        struct CheckpointTensor {
-            name: String,
-            buffer: blade_graphics::Buffer,
-            offset: usize,
-            byte_len: usize,
-            dtype: Dtype,
-            shape: Vec<usize>,
-        }
-
-        let wall_start = std::time::Instant::now();
-        let wait_start = std::time::Instant::now();
-        self.wait();
-        let wait_duration = wait_start.elapsed();
-        let collection_start = std::time::Instant::now();
-        let mut tensors = Vec::new();
-        let mut total_bytes = 0_usize;
-
-        // Collect parameter data
-        for (name, buf_ref) in &self.plan.param_buffers {
-            let byte_len = self.plan.buffers[buf_ref.0 as usize];
-            let (dtype, shape) = match self.plan.weight_buffers.get(buf_ref).map(|entry| entry.0) {
-                Some(crate::compile::WeightFormat::F16) => (Dtype::F16, vec![byte_len / 2]),
-                Some(crate::compile::WeightFormat::Q4 | crate::compile::WeightFormat::Q8) => {
-                    // Safetensors has no standard Q4/Q8 block dtype. Preserve
-                    // the exact packed representation as bytes rather than
-                    // falsely labelling it F32.
-                    (Dtype::U8, vec![byte_len])
-                }
-                Some(crate::compile::WeightFormat::F32) | None => (Dtype::F32, vec![byte_len / 4]),
-            };
-            let offset = total_bytes.next_multiple_of(4);
-            tensors.push(CheckpointTensor {
-                name: name.clone(),
-                buffer: self.buffers[buf_ref.0 as usize],
-                offset,
-                byte_len,
-                dtype,
-                shape,
-            });
-            total_bytes = offset + byte_len;
-        }
-
-        // Collect Adam moment buffers (parallel to param_grad_pairs)
-        for (idx, &(param_buf, _)) in self.plan.param_grad_pairs.iter().enumerate() {
-            if idx >= self.adam_state.len() {
-                break;
-            }
-            let name = self
-                .plan
-                .param_buffers
-                .iter()
-                .find(|(_, br)| *br == param_buf)
-                .map(|(n, _)| n.clone())
-                .unwrap_or_else(|| format!("param_{}", param_buf.0));
-            let byte_len = self.plan.buffers[param_buf.0 as usize];
-            for (suffix, buf) in [
-                ("adam_m", &self.adam_state[idx].0),
-                ("adam_v", &self.adam_state[idx].1),
-            ] {
-                let offset = total_bytes.next_multiple_of(4);
-                tensors.push(CheckpointTensor {
-                    name: format!("{suffix}.{name}"),
-                    buffer: *buf,
-                    offset,
-                    byte_len,
-                    dtype: Dtype::F32,
-                    shape: vec![byte_len / 4],
-                });
-                total_bytes = offset + byte_len;
-            }
-        }
-        let collection_duration = collection_start.elapsed();
-
-        // Host-visible parameter allocations are optimized for GPU access and
-        // CPU writes; reading them directly is extremely slow on a discrete
-        // GPU. Snapshot every tensor through one GPU transfer instead.
-        let readback_start = std::time::Instant::now();
-        let staging = self.gpu.create_buffer(blade_graphics::BufferDesc {
-            name: "checkpoint_readback",
-            size: (total_bytes as u64).max(4),
-            memory: blade_graphics::Memory::Download,
-        });
-        let mut encoder = self
-            .gpu
-            .create_command_encoder(blade_graphics::CommandEncoderDesc {
-                name: "checkpoint_readback",
-                buffer_count: 1,
-                manual_barriers: false,
-            });
-        encoder.start();
-        {
-            let mut transfer = encoder.transfer("checkpoint_readback");
-            for tensor in &tensors {
-                let aligned_len = tensor.byte_len / 4 * 4;
-                if aligned_len != 0 {
-                    transfer.copy_buffer_to_buffer(
-                        tensor.buffer.at(0),
-                        staging.at(tensor.offset as u64),
-                        aligned_len as u64,
-                    );
-                }
-            }
-        }
-        let sync = self.gpu.submit(&mut encoder);
-        let _ = self.gpu.wait_for(&sync, !0);
-        for tensor in &tensors {
-            let aligned_len = tensor.byte_len / 4 * 4;
-            let tail_len = tensor.byte_len - aligned_len;
-            if tail_len != 0 {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        tensor.buffer.data().add(aligned_len),
-                        staging.data().add(tensor.offset + aligned_len),
-                        tail_len,
-                    );
-                }
-            }
-        }
-        let readback_duration = readback_start.elapsed();
-
-        // Build tensor views
-        let view_start = std::time::Instant::now();
-        let staging_data = unsafe { std::slice::from_raw_parts(staging.data(), total_bytes) };
-        let views: Vec<(String, TensorView<'_>)> = tensors
-            .iter()
-            .map(|tensor| {
-                let data = &staging_data[tensor.offset..tensor.offset + tensor.byte_len];
-                (
-                    tensor.name.clone(),
-                    TensorView::new(tensor.dtype, tensor.shape.clone(), data).expect("tensor view"),
-                )
-            })
-            .collect();
-        let view_duration = view_start.elapsed();
-
-        // Metadata
-        let mut metadata = HashMap::new();
-        metadata.insert("meganeura_checkpoint_format".to_string(), "2".to_string());
-        metadata.insert("adam_step".to_string(), self.adam_step.to_string());
-
-        let persist_start = std::time::Instant::now();
-        let result = safetensors::tensor::serialize_to_file(views, &Some(metadata), path)
-            .map_err(|e| std::io::Error::other(e.to_string()));
-        let persist_duration = persist_start.elapsed();
-        let bytes = if result.is_ok() {
-            std::fs::metadata(path).map_or(0, |file| file.len())
-        } else {
-            0
-        };
-        self.gpu.destroy_command_encoder(&mut encoder);
-        self.gpu.destroy_buffer(staging);
-        log::info!(
-            "checkpoint timing: wall={:.3}s wait={:.3}s collect={:.3}s \
-             readback={:.3}s views={:.3}s persist={:.3}s bytes={bytes}",
-            wall_start.elapsed().as_secs_f64(),
-            wait_duration.as_secs_f64(),
-            collection_duration.as_secs_f64(),
-            readback_duration.as_secs_f64(),
-            view_duration.as_secs_f64(),
-            persist_duration.as_secs_f64(),
-        );
-        result
-    }
-
-    /// Load a training checkpoint from a safetensors file.
-    ///
-    /// Restores parameter values and Adam optimizer state. The session must
-    /// have been created from the same graph (same parameter names/sizes).
-    #[allow(clippy::pattern_type_mismatch)]
-    pub fn load_checkpoint(&mut self, path: &std::path::Path) -> std::io::Result<()> {
-        use safetensors::tensor::Dtype;
-
-        self.wait();
-        let file_data = std::fs::read(path)?;
-        let (header_size, metadata) = safetensors::SafeTensors::read_metadata(&file_data)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-        let st = safetensors::SafeTensors::deserialize(&file_data)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-        let _ = header_size;
-        let checkpoint_format = metadata
-            .metadata()
-            .as_ref()
-            .and_then(|meta| meta.get("meganeura_checkpoint_format"))
-            .map(|value| {
-                value.parse::<u32>().map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("invalid meganeura_checkpoint_format {value:?}"),
-                    )
-                })
-            })
-            .transpose()?
-            .unwrap_or(1);
-
-        // Restore parameters
-        for (name, buf_ref) in &self.plan.param_buffers {
-            if let Ok(tensor) = st.tensor(name) {
-                let expected_len = self.plan.buffers[buf_ref.0 as usize];
-                if tensor.data().len() != expected_len {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "checkpoint tensor {name:?} has {} bytes, expected {expected_len}",
-                            tensor.data().len(),
-                        ),
-                    ));
-                }
-                if checkpoint_format >= 2 {
-                    let expected_dtype =
-                        match self.plan.weight_buffers.get(buf_ref).map(|entry| entry.0) {
-                            Some(crate::compile::WeightFormat::F16) => Dtype::F16,
-                            Some(
-                                crate::compile::WeightFormat::Q4 | crate::compile::WeightFormat::Q8,
-                            ) => Dtype::U8,
-                            Some(crate::compile::WeightFormat::F32) | None => Dtype::F32,
-                        };
-                    if tensor.dtype() != expected_dtype {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!(
-                                "checkpoint tensor {name:?} has dtype {:?}, expected {:?}",
-                                tensor.dtype(),
-                                expected_dtype,
-                            ),
-                        ));
-                    }
-                }
-                self.upload_buffer(*buf_ref, tensor.data());
-            } else {
-                log::warn!("checkpoint missing parameter: {name}");
-            }
-        }
-
-        // Restore Adam moment buffers
-        for (idx, &(param_buf, _)) in self.plan.param_grad_pairs.iter().enumerate() {
-            if idx >= self.adam_state.len() {
-                break;
-            }
-            let name = self
-                .plan
-                .param_buffers
-                .iter()
-                .find(|(_, br)| *br == param_buf)
-                .map(|(n, _)| n.as_str())
-                .unwrap_or("");
-            for (suffix, buf) in [
-                ("adam_m", &self.adam_state[idx].0),
-                ("adam_v", &self.adam_state[idx].1),
-            ] {
-                let key = format!("{suffix}.{name}");
-                if let Ok(tensor) = st.tensor(&key) {
-                    let expected_len = self.plan.buffers[param_buf.0 as usize];
-                    if tensor.data().len() != expected_len {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!(
-                                "checkpoint tensor {key:?} has {} bytes, expected {expected_len}",
-                                tensor.data().len(),
-                            ),
-                        ));
-                    }
-                    if checkpoint_format >= 2 && tensor.dtype() != Dtype::F32 {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!(
-                                "checkpoint tensor {key:?} has dtype {:?}, expected F32",
-                                tensor.dtype(),
-                            ),
-                        ));
-                    }
-                    self.write_raw_buffer(buf, tensor.data(), !self.optimizer_device);
-                }
-            }
-        }
-
-        // Restore adam_step from metadata
-        if let Some(ref meta) = *metadata.metadata() {
-            if let Some(step_str) = meta.get("adam_step") {
-                self.adam_step = step_str.parse::<u32>().map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("invalid adam_step {step_str:?}"),
-                    )
-                })?;
-            }
-        }
-
-        Ok(())
     }
 }
 

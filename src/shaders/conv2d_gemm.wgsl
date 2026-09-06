@@ -8,6 +8,8 @@
 //
 // Dispatch: [ceil(oH*oW / 64), ceil(Co / 64), batch]
 
+$DIVISOR
+
 struct Params {
     batch: u32,
     in_channels: u32,
@@ -21,10 +23,10 @@ struct Params {
     out_h: u32,
     out_w: u32,
     padding_w: u32,
-    inv_kernel_w: f32,
-    inv_kernel_hw: f32,
-    inv_col_w: f32,
-    inv_go_spatial: f32,
+    kernel_w_multiplier: u32,
+    kernel_hw_multiplier: u32,
+    column_width_multiplier: u32,
+    output_spatial_multiplier: u32,
 }
 
 var<storage> src: array<f32>;              // input [N, Ci, H, W]
@@ -78,13 +80,13 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
 
             var val = 0.0;
             if k_idx < k_total && hw_idx < n_total {
-                // Decompose k_idx → (ci, kh, kw) via reciprocal multiply
-                let ci = u32(f32(k_idx) * params.inv_kernel_hw);
+                // Decompose k_idx → (ci, kh, kw)
+                let ci = divide_exact(k_idx, kernel_hw, params.kernel_hw_multiplier);
                 let k_rem = k_idx - ci * kernel_hw;
-                let kh = u32(f32(k_rem) * params.inv_kernel_w);
+                let kh = divide_exact(k_rem, params.kernel_w, params.kernel_w_multiplier);
                 let kw = k_rem - kh * params.kernel_w;
                 // Decompose hw_idx → (oh, ow)
-                let oh = u32(f32(hw_idx) * params.inv_col_w);
+                let oh = divide_exact(hw_idx, params.out_w, params.column_width_multiplier);
                 let ow = hw_idx - oh * params.out_w;
                 // Input position
                 let ih = i32(oh * params.stride + kh) - i32(params.padding_h);

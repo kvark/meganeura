@@ -40,10 +40,26 @@ jobs:
           python3 -m unittest discover -s paper/p3hpc/artifact -p 'test_*.py'
           python3 paper/p3hpc/artifact/verify.py --repository
 
-      # Full verification substitutes crates.io dependencies for the pinned
-      # git revisions. Re-enable it after Blade publishes the APIs used here.
-      - name: Package assembly
-        run: cargo package --no-verify
+      - name: Retained experiment archives
+        run: |
+          (cd docs/experiments && sha256sum --check SHA256SUMS)
+          raw_records=$(git ls-files 'docs/experiments/*/*.json' 'docs/experiments/*/Cargo.lock' ':(exclude)docs/experiments/*/summary.json')
+          if test -n "$raw_records"; then
+            printf 'Compress raw experiment records before committing:\n%s\n' "$raw_records"
+            exit 1
+          fi
+
+      - name: Tuning experiment record replay (CPU only)
+        run: |
+          cargo test --test tuning_evidence --test holdout_evidence --test crossover_evidence --test readback_evidence --test staging_reuse_evidence --test training_profile_evidence --test conv_tuning_evidence --test split_k_evidence
+          cargo test --example tune_holdouts
+          cargo test --example tune_crossover
+          cargo test --example tune_readback
+          cargo test --example tune_staging_reuse
+          cargo test --example profile_training
+
+      - name: Package verification
+        run: cargo package
 
   check:
     name: ${{ matrix.name }}
@@ -117,11 +133,11 @@ jobs:
       - run: cargo check --lib --tests
 
   msrv:
-    name: Rust 1.88 MSRV
+    name: Rust 1.92 MSRV
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@1.92.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --lib
 

@@ -1,13 +1,16 @@
 // Conv2d backward w.r.t. input via implicit GEMM.
 //
 // grad_input[n] = weight_T @ im2col(grad_out[n])^T
-// where weight_T[ci, co*kH*kW + kh*kW + kw] = weight[co, ci, kh, kw]
-// and im2col of grad_out uses transposed padding (kH-1-pad, kW-1-pad).
+// where weight_T[ci, co*kH*kW + kh*kW + kw] = weight[co, ci, kh, kw].
+// Invert the forward cross-correlation: ih = oh*stride + kh - padding_h.
+// Thus oh = (ih + padding_h - kh)/stride when divisible, without flipping weights.
 //
 // C[Ci, H*W] = A[Ci, K] × B[K, H*W], K = Co*kH*kW, per batch item.
 // BM=64, BN=64, KTILE=16, TM=4, TN=4, workgroup [16,16,1]
 //
 // Dispatch: [ceil(H*W / 64), ceil(Ci / 64), batch]
+
+$DIVISOR
 
 struct Params {
     batch: u32,
@@ -22,10 +25,10 @@ struct Params {
     out_h: u32,
     out_w: u32,
     padding_w: u32,
-    inv_kernel_w: f32,
-    inv_kernel_hw: f32,
-    inv_col_w: f32,
-    inv_go_spatial: f32,
+    kernel_w_multiplier: u32,
+    kernel_hw_multiplier: u32,
+    column_width_multiplier: u32,
+    output_spatial_multiplier: u32,
 }
 
 var<storage> grad_out: array<f32>;         // grad_output [N, Co, oH, oW]
@@ -50,9 +53,8 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let m_total = params.in_channels;               // Ci
     let go_spatial = params.out_h * params.out_w;    // oH * oW
 
-    // Transposed padding for the "flipped convolution"
-    let pad_h = i32(params.kernel_h) - 1 - i32(params.padding_h);
-    let pad_w = i32(params.kernel_w) - 1 - i32(params.padding_w);
+    let pad_h = i32(params.padding_h);
+    let pad_w = i32(params.padding_w);
 
     $ACC_DECL
 
@@ -72,13 +74,11 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
 
             var val = 0.0;
             if ci < m_total && k_idx < k_total {
-                // Decompose k_idx → (co, kh, kw) via reciprocal multiply
-                let co = u32(f32(k_idx) * params.inv_kernel_hw);
+                // Decompose k_idx → (co, kernel offset)
+                let co = divide_exact(k_idx, kernel_hw, params.kernel_hw_multiplier);
                 let k_rem = k_idx - co * kernel_hw;
-                let kh = u32(f32(k_rem) * params.inv_kernel_w);
-                let kw = k_rem - kh * params.kernel_w;
                 // Read weight[co, ci, kh, kw]
-                val = weight[(co * m_total + ci) * kernel_hw + kh * params.kernel_w + kw];
+                val = weight[(co * m_total + ci) * kernel_hw + k_rem];
             }
             shared_a[row_local * 16u + col_local] = val;
         }
@@ -96,11 +96,11 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
 
             var val = 0.0;
             if k_idx < k_total && hw_idx < n_total {
-                let co = u32(f32(k_idx) * params.inv_kernel_hw);
+                let co = divide_exact(k_idx, kernel_hw, params.kernel_hw_multiplier);
                 let k_rem = k_idx - co * kernel_hw;
-                let kh = u32(f32(k_rem) * params.inv_kernel_w);
+                let kh = divide_exact(k_rem, params.kernel_w, params.kernel_w_multiplier);
                 let kw = k_rem - kh * params.kernel_w;
-                let ih = u32(f32(hw_idx) * params.inv_col_w);
+                let ih = divide_exact(hw_idx, params.in_w, params.column_width_multiplier);
                 let iw = hw_idx - ih * params.in_w;
 
                 if params.stride == 1u {
