@@ -1,5 +1,28 @@
 # Unreleased
 
+- Allocate Adam/LaProp moments only on configuration, explicit state write/step
+  or applicable restore. Read-only uninitialized moments return zeros without
+  allocation; switching optimizers retains existing moments and counters.
+  SGD/F+L+B sessions avoid the unused storage. Optimizer/clip/accumulation
+  paths explicitly reject non-F32 trainable parameter storage.
+- Checkpoint format 3 retains named logical shapes/storage types and omits
+  device padding. Validate the full restore before writes or moment allocation;
+  restore reduced-weight CPU staging too. Inference validates/ignores moments,
+  and missing saved moments reset existing state. Formats 1/2 remain readable
+  under their legacy physical/partial-load contract. This is not a complete
+  training-loop snapshot or rollback after device/allocation failure.
+- Preserve logical parameter types in execution plans; build-cache format 5
+  invalidates older plans. `param_size` now counts logical elements independent
+  of storage/padding, batched F32 reads omit padding, and parameter uploads
+  accept logical-sized data while zero-filling larger slots.
+- Use logical lengths for optimizer, clipping and accumulation loops, including
+  CPU helpers; allocation padding must not affect norms or updates. Reject
+  oversized raw F32 reads and non-F32 parameter reads before copying.
+- Correct gradient-accumulator accounting and report resident graph, moment,
+  accumulator and auxiliary buffer requests in `MemorySummary` and profiles.
+  Add checkpoint/memory study material and GPU regression coverage; these
+  quantities do not establish driver peak-memory usage or a timing gain.
+
 - Replace the state-mutating family-wide tuner with bounded exact-class
   32/64 scalar-f32 matmul tile search on private scratch. Adds `TuneOptions`,
   `tune_with` and serializable evidence, numerical qualification, interleaved

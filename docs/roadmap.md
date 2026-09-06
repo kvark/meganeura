@@ -29,13 +29,20 @@ The [five-process synthetic transfer pilot](experiments/tuning-2026-09-05/README
 shows repeatable 1.15×/1.13× whole-step gains on two larger chains, with no
 selection change on two smaller ones. It is not model/fleet qualification.
 
+The [checkpoint/memory follow-up](study/checkpoints-and-memory.md) implements
+logical format-3 saves and preflighted restores, lazy Adam/LaProp state, and
+resident tensor-buffer accounting. RTX tests cover malformed late fields,
+different allocation padding, the next optimizer update, and an 8 MiB unused
+moment allocation avoided for 1,048,576 F32 elements. Peak driver memory and
+cross-backend restore behavior still need qualification.
+
 The next sequence is:
 
 1. State-safe tuning, exact variant contracts and stronger numerical evidence.
 2. Bounded bidirectional shape-level search; thresholds become search priors.
 3. Reusable convolution-derivative and Metal attention schedules.
-4. Persistent winners with device/driver/compiler provenance; lazy optimizer
-   state and logical checkpoint serialization.
+4. Persistent winners with device/driver/compiler provenance; fleet/peak-memory
+   qualification of the implemented lazy optimizer and logical checkpoints.
 5. Layout/rematerialization and new precision formats only with an observed
    need, capability support, correctness evidence and an amortization budget.
 
@@ -247,9 +254,31 @@ touching the clip path.
 SmolLM2/SmolVLA train, before any code is final — if the win isn't
 real, close the item with a note in `rejected-optimizations.md`.
 
+### B2a. Lazy optimizer state and logical persistence  ← *implemented, RTX qualified*
+
+Keep logical parameter types separate from physical capacities. Format-3
+checkpoints omit padding and validate every record before writes or moment
+allocation. Cache format 5 invalidates plans lacking the metadata. Legacy
+files keep physical/partial-load compatibility with preflighted writes.
+
+Adam/LaProp moments are allocated on first configuration, write, explicit
+step or applicable restore. SGD/F+L+B sessions no longer reserve them; reads
+of uninitialized state return zeros without GPU allocation. Clearing the
+optimizer retains existing state. Memory reports separately count graph,
+moments, accumulators and auxiliary buffers; the previous accumulator total
+incorrectly multiplied by the parameter count. Update, clip and accumulation
+loops use logical lengths; poisoned tails cannot affect optimizer results or
+overrun logical-sized grouped diagnostics. Raw F32 reads are capacity-checked.
+
+**Still open:** driver-peak sampling on larger workloads, Metal↔Vulkan restore
+qualification, structured allocation failures, crash-atomic checkpoint file
+replacement, and a separately designed complete training-loop snapshot.
+See the [contract and tests](study/checkpoints-and-memory.md). This does not
+implement activation rematerialization or reduce Adam's required moment size.
+
 ### B3. [research] E-graph rematerialization (activation checkpointing)
 
-**Problem.** No checkpointing exists; trainable model size is bounded
+**Problem.** No activation checkpointing exists; trainable model size is bounded
 by storing every activation. Classic checkpointing APIs (manual block
 annotations) are against the project's grain.
 

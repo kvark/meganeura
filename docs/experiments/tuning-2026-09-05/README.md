@@ -55,6 +55,12 @@ tests; native-f32 shaders have offline Naga/SPIR-V coverage only on this host.
 
 Measured source: `0e27b68e92bfb72745eb2f582107236cd541c409`, Rust 1.98.0,
 Linux x86_64, Intel Core i5-12400F host, RTX 5070 / NVIDIA 595.71.05.
+The original source is retained by Git tag `evidence/tuning-2026-09-05`.
+The development branch was subsequently rebased onto `8069cf3` and extended
+with checkpoint/memory work. Those changes do not alter these raw records or
+turn them into measurements of the newer source; reproduce this table from
+the tagged revision and retained lockfile.
+
 All five processes used the same lockfile and executable hashes. The GPU
 reported 0% utilization before the serial experiment; no other qualification
 or benchmark was run concurrently. Clocks/power were not locked and driver

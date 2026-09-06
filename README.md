@@ -127,6 +127,13 @@ Worked examples live in [`examples/`](https://github.com/kvark/meganeura/tree/ma
 - [`train_deploy.rs`](https://github.com/kvark/meganeura/blob/main/examples/train_deploy.rs) — optimizer-backed training, checkpoint save, and reload into a fresh inference session.
 - [`smollm2.rs`](https://github.com/kvark/meganeura/blob/main/examples/smollm2.rs) — LLM inference with HuggingFace weights.
 
+Current checkpoints store logical tensors without device padding and preflight
+the restore before mutation. Adam/LaProp moments are allocated only when
+requested; SGD and forward/backward-only sessions avoid that unused storage.
+See [checkpoints and memory](docs/study/checkpoints-and-memory.md) for format
+compatibility, resume limits and the distinction between buffer counts and
+driver peak memory.
+
 Pretrained models can be loaded from ONNX or NNEF via `meganeura::load_onnx(...)` / `meganeura::load_nnef(...)`. Both lower through Meganeura’s IR, so the same graph rewrites apply to imported graphs and hand-built ones.
 
 ## System requirements
