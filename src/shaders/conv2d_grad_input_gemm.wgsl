@@ -10,6 +10,8 @@
 //
 // Dispatch: [ceil(H*W / 64), ceil(Ci / 64), batch]
 
+$DIVISOR
+
 struct Params {
     batch: u32,
     in_channels: u32,
@@ -23,6 +25,10 @@ struct Params {
     out_h: u32,
     out_w: u32,
     padding_w: u32,
+    kernel_w_multiplier: u32,
+    kernel_hw_multiplier: u32,
+    column_width_multiplier: u32,
+    output_spatial_multiplier: u32,
 }
 
 var<storage> grad_out: array<f32>;         // grad_output [N, Co, oH, oW]
@@ -69,7 +75,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             var val = 0.0;
             if ci < m_total && k_idx < k_total {
                 // Decompose k_idx → (co, kernel offset)
-                let co = k_idx / kernel_hw;
+                let co = divide_exact(k_idx, kernel_hw, params.kernel_hw_multiplier);
                 let k_rem = k_idx - co * kernel_hw;
                 // Read weight[co, ci, kh, kw]
                 val = weight[(co * m_total + ci) * kernel_hw + k_rem];
@@ -90,11 +96,11 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
 
             var val = 0.0;
             if k_idx < k_total && hw_idx < n_total {
-                let co = k_idx / kernel_hw;
+                let co = divide_exact(k_idx, kernel_hw, params.kernel_hw_multiplier);
                 let k_rem = k_idx - co * kernel_hw;
-                let kh = k_rem / params.kernel_w;
+                let kh = divide_exact(k_rem, params.kernel_w, params.kernel_w_multiplier);
                 let kw = k_rem - kh * params.kernel_w;
-                let ih = hw_idx / params.in_w;
+                let ih = divide_exact(hw_idx, params.in_w, params.column_width_multiplier);
                 let iw = hw_idx - ih * params.in_w;
 
                 if params.stride == 1u {

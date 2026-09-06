@@ -31,6 +31,7 @@ pub mod codegen;
 pub mod compile;
 pub mod config;
 pub mod data;
+mod divisor;
 pub mod eager;
 pub mod graph;
 pub mod load;

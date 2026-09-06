@@ -865,6 +865,7 @@ fn conv_gemm_tiled(src: &str, tile: MatMulTile) -> ShaderModule {
     let src = preprocess(
         src,
         &[
+            ("$DIVISOR", crate::divisor::SHADER),
             ("$BM_U", &format!("{bm}u")),
             ("$TM_U", &format!("{tm}u")),
             ("$STAGE_EPT_U", &format!("{}u", bm * 16 / 256)),
@@ -4340,6 +4341,7 @@ pub fn generate_conv2d_coop_module(
     src.push('\n');
     src.push_str(enable_f16);
     src.push_str("enable wgpu_cooperative_matrix;\n\n");
+    src.push_str(crate::divisor::SHADER);
 
     // Params struct — identical layout to Conv2dParams for binding compatibility.
     // kernel_h/kernel_w/stride fields are still present but ignored in favor of constants.
@@ -4357,6 +4359,10 @@ pub fn generate_conv2d_coop_module(
          \x20   out_h: u32,\n\
          \x20   out_w: u32,\n\
          \x20   padding_w: u32,\n\
+         \x20   kernel_w_multiplier: u32,\n\
+         \x20   kernel_hw_multiplier: u32,\n\
+         \x20   column_width_multiplier: u32,\n\
+         \x20   output_spatial_multiplier: u32,\n\
          }\n\n",
     );
 
@@ -4752,7 +4758,10 @@ fn emit_grad_input_im2col_stage(
     let _ = writeln!(src, "        let {in_n_var} = {cc_var} < n_total;");
 
     // Pre-decompose spatial position (invariant across e iterations)
-    let _ = writeln!(src, "        let {ih_var} = {cc_var} / params.in_w;");
+    let _ = writeln!(
+        src,
+        "        let {ih_var} = divide_exact({cc_var}, params.in_w, params.column_width_multiplier);"
+    );
     let _ = writeln!(
         src,
         "        let {iw_var} = {cc_var} - {ih_var} * params.in_w;"
@@ -5041,7 +5050,10 @@ fn emit_forward_im2col_stage(
     src.push_str("                let kw = k_rem - kh * KERNEL_W;\n");
 
     // Decompose hw_idx -> (oh, ow) -> (ih, iw)
-    let _ = writeln!(src, "                let oh = {cc_var} / params.out_w;");
+    let _ = writeln!(
+        src,
+        "                let oh = divide_exact({cc_var}, params.out_w, params.column_width_multiplier);"
+    );
     let _ = writeln!(
         src,
         "                let ow = {cc_var} - oh * params.out_w;"

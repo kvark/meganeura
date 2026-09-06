@@ -53,3 +53,36 @@ from noisy controls or compare with old cohorts as if measurements were paired.
 Choose no new performance threshold, workload rule or tuning default from this
 cohort. A regression is a retained negative result, not permission to return to
 approximate indexing. Split-K remains a separate candidate-sequence change.
+
+## Implementation and correctness argument
+
+[One private Rust helper](../../../src/divisor.rs) derives each multiplier;
+[one shared WGSL implementation](../../../src/shaders/divisor.wgsl) is injected
+into both scalar templates and generated cooperative source. No new public API,
+dependency, pipeline key, tuning option or numerical tolerance is introduced.
+The convolution uniform grows from 48 to 64 bytes. Multipliers are derived when
+binding the dispatch, so their host cost is included in normal step+wait samples.
+
+For `d > 1`, let `B = 2^32`, `m = floor(B/d)` and `0 <= n < B`.
+Then `0 <= n/d - n*m/B <= n/B < 1`. Thus `floor(n*m/B)` is the true quotient
+or one less. Its product with `d` cannot exceed `n`; both the product and
+remainder fit u32, and comparing the remainder with `d` supplies the exact
+single correction. Division by one returns `n`; zero divisors are rejected.
+There is no f32 range condition or correction retry loop.
+
+The high product splits each operand into two base-65536 limbs. The two middle
+accumulations are at most 4,294,901,759 and 4,294,901,760, respectively, so they
+fit u32; their carries plus the high-limb product reconstruct `floor(a*b/2^32)`.
+The GPU test executes this same source, reads raw u32 outputs and checks both
+the quotient against CPU integer division and high product against CPU u64
+multiplication. Inputs cover divisors 1..256, powers of two and neighbors,
+quotient boundaries, u32 endpoints, and 100,000 deterministic random pairs
+alternating full-width and 16-bit divisors. It runs in the ordinary GPU suite,
+including CI; it is not a floating-point norm comparison or a translated CPU
+implementation substituted for device execution.
+
+This is the general invariant-divisor strength-reduction idea also used by
+[libdivide](https://libdivide.com/), not an integration or copy of that library's
+magic-number algorithms. Here a truncated reciprocal and one correction keep
+the implementation small. Whether this portable limb expansion is profitable
+depends on backend code generation and requires measurements on each device.

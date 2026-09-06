@@ -625,10 +625,21 @@ struct Conv2dParams {
     out_h: u32,
     out_w: u32,
     padding_w: u32,
+    kernel_w_multiplier: u32,
+    kernel_hw_multiplier: u32,
+    column_width_multiplier: u32,
+    output_spatial_multiplier: u32,
 }
 
-impl From<&[u32]> for Conv2dParams {
-    fn from(p: &[u32]) -> Self {
+impl From<&Dispatch> for Conv2dParams {
+    fn from(dispatch: &Dispatch) -> Self {
+        let p = &dispatch.params;
+        let column_width = match dispatch.shader {
+            ShaderEntry::Conv2dGradInputGemm
+            | ShaderEntry::Conv2dGradInputGemmSmall
+            | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => p[3],
+            _ => p[10],
+        };
         Self {
             batch: p[0],
             in_channels: p[1],
@@ -642,6 +653,10 @@ impl From<&[u32]> for Conv2dParams {
             out_h: p[9],
             out_w: p[10],
             padding_w: p[11],
+            kernel_w_multiplier: crate::divisor::multiplier(p[6]),
+            kernel_hw_multiplier: crate::divisor::multiplier(p[5] * p[6]),
+            column_width_multiplier: crate::divisor::multiplier(column_width),
+            output_spatial_multiplier: crate::divisor::multiplier(p[9] * p[10]),
         }
     }
 }
@@ -6436,7 +6451,7 @@ impl Session {
                         src: buf(dispatch.input_buffers[0]),
                         weight: buf(dispatch.input_buffers[1]),
                         dst: buf(dispatch.output_buffer),
-                        params: Conv2dParams::from(dispatch.params.as_slice()),
+                        params: Conv2dParams::from(dispatch),
                     },
                 );
             }
@@ -6449,7 +6464,7 @@ impl Session {
                         grad_out: buf(dispatch.input_buffers[0]),
                         weight: buf(dispatch.input_buffers[1]),
                         dst: buf(dispatch.output_buffer),
-                        params: Conv2dParams::from(dispatch.params.as_slice()),
+                        params: Conv2dParams::from(dispatch),
                     },
                 );
             }
@@ -6460,7 +6475,7 @@ impl Session {
                         grad_out: buf(dispatch.input_buffers[0]),
                         src: buf(dispatch.input_buffers[1]),
                         dst: buf(dispatch.output_buffer),
-                        params: Conv2dParams::from(dispatch.params.as_slice()),
+                        params: Conv2dParams::from(dispatch),
                     },
                 );
             }

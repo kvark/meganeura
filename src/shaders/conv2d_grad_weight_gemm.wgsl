@@ -6,6 +6,8 @@
 // BM=64, BN=64, KTILE=16, TM=4, TN=4, workgroup [16,16,1]
 // Dispatch: [ceil(Ci*kH*kW / 64), ceil(Co / 64), 1]
 
+$DIVISOR
+
 struct Params {
     batch: u32,
     in_channels: u32,
@@ -19,6 +21,10 @@ struct Params {
     out_h: u32,
     out_w: u32,
     padding_w: u32,
+    kernel_w_multiplier: u32,
+    kernel_hw_multiplier: u32,
+    column_width_multiplier: u32,
+    output_spatial_multiplier: u32,
 }
 
 var<storage> grad_out: array<f32>;           // [N, Co, oH, oW]
@@ -60,7 +66,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
 
             var val = 0.0;
             if co < m_total && k_idx < k_total {
-                let n = k_idx / go_spatial;
+                let n = divide_exact(k_idx, go_spatial, params.output_spatial_multiplier);
                 let rem = k_idx - n * go_spatial;
                 val = grad_out[(n * params.out_channels + co) * go_spatial + rem];
             }
@@ -80,14 +86,14 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             var val = 0.0;
             if k_idx < k_total && col_idx < n_total {
                 // Decompose k_idx → (n, oh, ow)
-                let n = k_idx / go_spatial;
+                let n = divide_exact(k_idx, go_spatial, params.output_spatial_multiplier);
                 let rem = k_idx - n * go_spatial;
-                let oh = rem / params.out_w;
+                let oh = divide_exact(rem, params.out_w, params.column_width_multiplier);
                 let ow = rem - oh * params.out_w;
                 // Decompose col_idx → (ci, kh, kw)
-                let ci = col_idx / kernel_hw;
+                let ci = divide_exact(col_idx, kernel_hw, params.kernel_hw_multiplier);
                 let k_rem = col_idx - ci * kernel_hw;
-                let kh = k_rem / params.kernel_w;
+                let kh = divide_exact(k_rem, params.kernel_w, params.kernel_w_multiplier);
                 let kw = k_rem - kh * params.kernel_w;
                 // Input position
                 let ih = i32(oh * params.stride + kh) - i32(params.padding_h);
