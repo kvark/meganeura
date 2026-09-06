@@ -29,6 +29,15 @@ The [five-process synthetic transfer pilot](experiments/tuning-2026-09-05/README
 shows repeatable 1.15×/1.13× whole-step gains on two larger chains, with no
 selection change on two smaller ones. It is not model/fleet qualification.
 
+The subsequent [six-case inference/training holdouts](experiments/holdouts-2026-09-06/README.md)
+retain five processes, full control-session gradients/moments and matched Adam
+updates through step 78. All numerical checks pass, but no whole-step gain or
+regression clears the predeclared guard. The unchanged ResNet control exposes
+timing drift, and only 1/512 of its plan dispatches is eligible for matmul search.
+Next: A/A and crossover confirmation controls, phase/whole-step profiles, then
+broader reusable convolution/attention coverage. Keep tuning opt-in; do not
+fit a smaller margin or new per-model rule to this cohort.
+
 The [checkpoint/memory follow-up](study/checkpoints-and-memory.md) implements
 logical format-3 saves and preflighted restores, lazy Adam/LaProp state, and
 resident tensor-buffer accounting. RTX tests cover malformed late fields,

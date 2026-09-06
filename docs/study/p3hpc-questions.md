@@ -143,6 +143,15 @@ shows 1.15×/1.13× whole-step gains on two synthetic chains and unchanged choic
 on two smaller ones. Search amortizes over roughly 1,600–2,850 steps in the
 winning cases; do not turn that into a general model or PyTorch claim.
 
+The [six-case holdouts](../experiments/holdouts-2026-09-06/README.md) then tested
+inference, Adam, SGD and F+L+B across five processes. All full control-session
+tensor/state comparisons passed through step 78, but none cleared the whole-step
+guard. An unchanged ResNet control even showed a misleading 1.071× ratio of
+medians, rejected by the paired-gain gate. The honest conclusion is stronger
+state evidence and limited transfer, not “automatic tuning makes training
+faster.” More representative kernel families and controlled confirmation come
+before default-on or persistent winners.
+
 ## Numerical behavior
 
 ### 13. Does strict f32 mean identical results?

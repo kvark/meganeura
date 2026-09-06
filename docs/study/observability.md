@@ -288,6 +288,17 @@ classes, per-class decisions, final pipeline keys, search cost and independent
 whole-step samples. On this RTX 5070 the native-f32 coverage flag is false;
 positive scalar timings cannot be used as evidence for that unexecuted path.
 
+The [optimizer-backed holdout records](../experiments/holdouts-2026-09-06/README.md)
+add full in-memory parameter/gradient/moment comparisons, expected Adam counts,
+loss trajectories, memory-accounting stages and every timing pair. Read their
+ResNet run 3 as a debugging exercise: identical pipeline keys, a 1.071× ratio
+of medians, but only 0.01470 ms median paired gain. The guard rejects the apparent
+gain. This separates “the kernels changed,” “the numerical state matches,”
+and “whole-step time improved.” The retained summaries are not tensor dumps;
+CPU replay checks their consistency, not the absent full vectors. Validation
+readbacks are outside timers, followed by settling steps, and process memory
+samples with both sessions resident are not peak VRAM.
+
 ## What we should improve next
 
 The highest-value debugging improvements are typed logical-tensor reads;

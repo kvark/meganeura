@@ -14,6 +14,14 @@ initial tiles and showed no benefit. All outputs matched their untuned
 references exactly. This is scoped Meganeura-versus-Meganeura evidence, not a
 PyTorch or model-training result; search amortization takes thousands of steps.
 
+The [six-case holdout follow-up](../experiments/holdouts-2026-09-06/README.md)
+now includes nonlinear MLP/SmolLM2 inference, Adam trajectories, Whisper SGD
+and ResNet F+L+B. All 30 case runs pass full control-session tensor/state parity,
+but **none clears the whole-step guard**. Median ratios range from 0.977× for
+MLP Adam to 1.052× for MLP inference. These are synthetic engineering results,
+not new cross-engine or convergence evidence. This limits the pilot's scope;
+it does not justify default-on tuning or lowering the threshold.
+
 ## The objective
 
 Win useful workloads under a matched numerical and workload contract, without
@@ -161,6 +169,31 @@ after warmup. Repeat in independent processes. It refuses to overwrite an
 existing file and uses explicit f32 policy, not environment-selected f16
 staging. Synthetic chains are a transfer experiment, not a PyTorch comparison
 or a new result for the paper's model matrix.
+
+## Lessons from optimizer-backed holdouts
+
+The fixed [September 6 protocol and records](../experiments/holdouts-2026-09-06/README.md)
+keep normal optimization and compare complete parameter, gradient and allocated
+moment arrays at matched training ages through step 78. All 140 isolated
+comparisons qualify; 31 choose challengers. Nevertheless no process/case
+clears the descriptive gain or regression guard, and four MLP Adam processes
+have lower whole-step ratios. Kernel qualification and measured isolated
+profitability are necessary screens, not end-to-end acceptance.
+
+Coverage is narrow even for these graphs. Only 1/512 ResNet plan dispatches is
+eligible (the classifier weight gradient); none of its convolutions is searched.
+Its median search cost is 1.12 s for no changed choice. SmolLM2 Adam and Whisper
+SGD reach the eight-class cap. These counts do not measure time shares and do
+not establish that raising the cap would help. Search phase profiling and
+whole-step profiles should precede a larger budget or a new kernel family.
+
+The unchanged ResNet control in one process has a 1.071× ratio of medians but
+only 0.01470 ms median paired gain. The paired guard correctly rejects it.
+This makes A/A controls, randomized/crossover session roles and interference/
+clock telemetry concrete next work for automatic confirmation. Keep every
+attempt and retain one predeclared acceptance policy; do not pick a favorable
+process or quietly loosen the margin. Cross-session bitwise equality here
+does not strengthen the frozen paper's sampled-output/gradient-norm contract.
 
 ## Target contract for broader tuning
 

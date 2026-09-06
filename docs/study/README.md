@@ -1,8 +1,10 @@
 # Meganeura: study and workshop preparation
 
 Prepared 2026-09-05 against development base `bd6be08`, subsequently rebased
-onto `8069cf3` with checkpoint/memory work on `codex/audit-observability-tuning`.
-The measured tuning source is retained as `evidence/tuning-2026-09-05`;
+onto `8069cf3` with checkpoint/memory work, then `a455409` for training holdouts
+on `codex/audit-observability-tuning`.
+Measured sources are retained as `evidence/tuning-2026-09-05` and
+`evidence/holdouts-2026-09-06`;
 rebasing does not relabel those measurements as results of newer code. Paper
 performance statements refer to the separately frozen revision. The initial audit was
 CPU-only; subsequent GPU qualification is described separately in the
@@ -35,6 +37,12 @@ winners remain future work. The whole-step experiment harness is separate
 from the frozen publication evidence. Its [first five-process experiment](../experiments/tuning-2026-09-05/README.md)
 found repeatable 1.15×/1.13× gains on two synthetic dense chains; two smaller
 cases retained their initial tiles. This is not a new PyTorch comparison.
+
+The [broader five-process holdouts](../experiments/holdouts-2026-09-06/README.md)
+now cover nonlinear inference and optimizer-backed trajectories: full control-
+session gradients/moments and update counts pass, but none of the 30 case runs
+clears the whole-step gain/regression guard. This is why tuning remains opt-in
+and why controlled confirmation and wider kernel-family coverage come next.
 
 The memory/restore follow-up removes unused Adam allocations, reports actual
 resident tensor-buffer requests, and restores logical checkpoints only after
@@ -84,8 +92,9 @@ and [paper source](../../paper/p3hpc/main.tex).
 Do not say that all Apple/AMD/Intel training is faster, that the paper tests
 an RTX 5080 (it tests a 5070), that equality saturation provides the measured
 speedups, that all kernel choices are autotuned, or that compensated f16
-preserves the exponent range of f32. Do not describe the validation as full
-gradient comparison, the Intel CPU ratios as GPU-to-GPU speedups, or the
+preserves the exponent range of f32. Do not describe the frozen matrix's
+validation as full gradient comparison (the newer control-session holdouts
+are separate), the Intel CPU ratios as GPU-to-GPU speedups, or the
 Quest demonstration as on-device training. LoRA/QLoRA on Apple is not unique
 to Meganeura. Compiler specialization and automatic tuning are established
 ideas; the particular implementation and validity-gated portability evidence
