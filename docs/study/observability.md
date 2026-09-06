@@ -266,6 +266,18 @@ archives complete before/after dispatches and declared buffer sizes so a
 selection can be traced back to its exact class. Missing historical scope is
 Dense; missing convolution shape means a dense class, not an unknown batch.
 
+Those full dispatch records exposed a vacuous benchmark: the first small-case
+builder supplied nonflat operands to the flat convolution API, producing zero
+forward workgroups. Matching zero gradients/moments had passed the original
+runner. The [corrected cohort](../experiments/conv-tiles-corrected-2026-09-06/README.md)
+rejects zero-workgroup plans, records `prefix_training_signal` and
+`parameters_updated`, and validates nonzero gradients/moments and actual
+parameter changes. Public convolution helpers reject malformed operand shapes
+early; independent tests read full forward outputs as well as derivatives.
+The original twelve controls are retained/disqualified, not overwritten.
+This is an example of observability finding invalid work, not merely locating
+slow work. Full state agreement alone cannot establish workload validity.
+
 `Session::tune_with(TuneOptions)` returns a serializable `TuneReport` rather
 than only logging a winner. Inspect exact
 `(shader,M,N,K,precision,binding capacity,placement)` classes, eligible/visited

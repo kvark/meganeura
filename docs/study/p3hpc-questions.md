@@ -487,6 +487,34 @@ stride and tile edges. Shared bugs, untested domains and convergence still
 require independent evidence. A qualified isolated winner is not automatically
 a whole-step win. [Contract and experiment](../experiments/conv-tiles-2026-09-06/README.md).
 
+### 43. Can two bit-exact training sessions still be an invalid benchmark?
+
+Short: yes—matching zeros and advancing a counter do not prove useful work.
+
+Detail: the first small convolution-chain builder supplied 4-D operands to
+an API documented for flat NCHW arrays. Its first forward dispatch had zero
+workgroups. Both sessions agreed on zero loss, gradients and Adam moments,
+so the original comparisons passed. We retained/disqualified those twelve
+cases, corrected the builder, added early operand rejection and full forward
+oracles, and required nonzero prefix signals plus actual parameter changes.
+The corrected six-process cohort passes these checks. This is why workload
+validity, independent correctness, state preservation and performance are
+separate gates. [Correction and archive](../experiments/conv-tiles-corrected-2026-09-06/README.md).
+
+### 44. Did convolution autotuning win?
+
+Short: four isolated dX classes win; whole-step confirmation remains inconclusive.
+
+Detail: eight ResNet dispatches change from scalar 64 to 32 tiles in every
+corrected process. The median whole-step ratio is 1.05056×, with observed
+time reductions 4.60–4.85%. That is below our 5% requirement even before the
+noise margin. All six A/A screens pass, but no confirmed gain follows. The
+small Adam/SGD chains make real updates and retain their starting tiles.
+The eight-class structural budget visits only 8/45 ResNet derivative classes;
+it is not a measured cost ranking. The next experiment is bounded split-K dW
+with charged partial storage/reduction and explicit search coverage, not a
+lower threshold or an unconditional performance claim.
+
 ## Talk outline
 
 The actual workshop slot length is not confirmed here. For a 12-minute talk,

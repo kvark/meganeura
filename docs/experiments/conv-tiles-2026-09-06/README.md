@@ -112,3 +112,23 @@ Regardless of outcome, split-K dW remains a separate next implementation and
 cohort: charge partial storage and reduction dispatches, retain full-precision
 validation and whole-step confirmation. Tile selection alone cannot create
 more parallel work than these existing algorithms expose.
+
+## Original archive and disposition
+
+Source `fc151ac30626991e9d9d4611df0433dbe9e59a43`, immutable tag
+`evidence/conv-tiles-2026-09-06`; executable SHA-256
+`f6361f97aa1b5839975eaea39200d25fcf1b4c9bacf77ed0b2e6615522fe66ef`.
+Six serial attempts ran 18:00–18:03 UTC on September 6:
+[run 1](run-01.json), [run 2](run-02.json), [run 3](run-03.json),
+[run 4](run-04.json), [run 5](run-05.json), [run 6](run-06.json).
+All are retained unchanged, including the misleading `complete` statuses of
+the twelve malformed optimizer controls. Their zero workgroups and zero
+loss/gradient/moment signals are checked by the
+[disqualification replay](../../../tests/conv_tuning_evidence.rs).
+
+The six ResNet cases have nonzero loss/gradients, stable A/A, eight changed
+dispatches and inconclusive whole-step decisions. The isolated synthetic
+scratch comparisons also remain numerically meaningful: all 84 qualify,
+independent of the live zero-data mistake. Neither fact rehabilitates the
+malformed optimizer workloads. See the corrected cohort for the separately
+measured intended graphs; do not pool or overwrite these attempts.

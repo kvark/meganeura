@@ -310,9 +310,22 @@ passes nor establish candidate gains. A newly exposed non-same-padding dX bug
 is fixed before widening the search, with full independent f64 derivative tests.
 
 Exact-class qualification and selection for the existing 32/64 convolution
-derivative tiles are implemented. The [separate crossover protocol](../experiments/conv-tiles-2026-09-06/README.md)
-checks ResNet F+L+B and small Adam/SGD convolution chains. Independent full
-f64 scatter oracles cover eight shapes and both tiles before/after search,
+derivative tiles are implemented. The [corrected crossover](../experiments/conv-tiles-corrected-2026-09-06/README.md)
+retains six ResNet F+L+B and small Adam/SGD convolution-chain processes.
+ResNet changes eight dX dispatches and observes median 17.5808→16.7293 ms,
+ratio 1.05056×, but all six decisions are inconclusive under the unchanged
+5%+noise guard. The small chains keep their original choices. All 84 isolated
+comparisons qualify, full compared state is bit-exact, and both optimizer
+sessions actually update parameters through age 178. Search costs median
+640/37/38 ms respectively; sampling dominates ResNet search. Its structural
+prior visits only 8/45 exact derivative classes, not the expensive stem dW.
+
+The original small-case builder violated the documented flat operand contract;
+both controls agreed on zero loss/gradients after a zero-workgroup forward
+dispatch. Those twelve cases remain archived and disqualified. The public
+helper now rejects malformed operand shapes, and the runner requires nonzero
+training signals and actual parameter updates. Independent full
+f64 scatter oracles cover forward outputs, eight shapes and both derivative tiles before/after search,
 ordinary/tiny gradients, state isolation and budget skips. Distinct-state
 Adam swaps cover subsequent accumulation/clipping updates as well.
 The long-reduction, small-output dW classes motivate the next bounded split-K

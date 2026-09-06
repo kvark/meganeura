@@ -50,6 +50,8 @@ tracing-subscriber = { version = "0.3", optional = true, features = ["registry"]
 # pulls in a C library, which is a needless build-script burden for
 # downstream crates that just want the inference runtime.
 [dev-dependencies]
+# Replay small paired timing differences without lossy f64 JSON parsing.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 env_logger = "0.11"
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 

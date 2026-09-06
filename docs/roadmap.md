@@ -62,8 +62,14 @@ these optimizer-free profiles are not whole-step speedup evidence. The follow-up
 also fixes dX indexing outside same padding and adds full f64 derivative oracles.
 Exact-class scalar convolution-derivative tile selection is now implemented,
 with full NCHW keys, physical scratch sizes, batch-aware references, checked
-reciprocal indexing and unchanged precision/budgets. A [separate crossover](experiments/conv-tiles-2026-09-06/README.md)
-tests transfer on ResNet F+L+B and Adam/SGD convolution chains.
+reciprocal indexing and unchanged precision/budgets. The [corrected six-process crossover](experiments/conv-tiles-corrected-2026-09-06/README.md)
+observes ResNet 17.5808→16.7293 ms (median ratio 1.05056×), but all six decisions
+remain inconclusive under the unchanged 5%+noise guard. Four dX classes change
+eight dispatches; the small Adam/SGD chains keep their tiles and make real updates.
+Original malformed flat-layout controls are retained/disqualified; public
+operand checks, full forward oracles and nonzero training preflights prevent
+their zero-data success from becoming evidence. Sampling now dominates search
+cost, and the eight-class structural prior visits only 8/45 ResNet classes.
 Next: bounded split-K weight gradients with charged partial storage and whole-step confirmation;
 attention schedules remain a separate device-qualified family.
 Keep tuning opt-in; do not fit a smaller margin or model rule.
