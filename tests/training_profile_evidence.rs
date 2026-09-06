@@ -501,22 +501,53 @@ fn check_summary(expected: &Value, recorded: &Value) {
     }
 }
 
-const INDEXING_ORDER: [(&str, usize); 6] = [
-    ("baseline", 1),
-    ("exact", 1),
-    ("exact", 2),
-    ("baseline", 2),
-    ("baseline", 3),
-    ("exact", 3),
-];
+struct IndexingExperiment {
+    protocol: &'static str,
+    candidate: &'static str,
+    sources: [(&'static str, &'static str); 2],
+}
 
-fn indexing_records() -> Vec<Value> {
+const INDEXING: IndexingExperiment = IndexingExperiment {
+    protocol: "conv-indexing-2026-09-06",
+    candidate: "exact",
+    sources: [
+        (
+            "aa1344e784a37462b8261aed97cb804c11ce8ba3",
+            "f4e681345ac30729ce45bfdbdbd0dd3fce395c4dbfa6f6a9fe8016fa5b015a59",
+        ),
+        (
+            "45304b884d821875c476f6d28446051ad22fe35f",
+            "7f0c7fbae450e8a16b553a4a6de3bfed2c8e3c4ae7ea505ca831371344feabde",
+        ),
+    ],
+};
+
+const DIVISOR: IndexingExperiment = IndexingExperiment {
+    protocol: "conv-divisor-2026-09-06",
+    candidate: "reciprocal",
+    sources: [
+        (
+            "1b7a09f2140c886dc9b28504e06f15f7d0d9a67c",
+            "8b91fda6ac63fae73883f18710860f395360be1488852c4731e2fb7fefb32e17",
+        ),
+        (
+            "1f2c7740231fc4998be1de244678f247843533dd",
+            "76e9ead4c7d3412738c54de8ef15bf995cf822a432d35fe81bea6115909e508f",
+        ),
+    ],
+};
+
+const INDEXING_ORDER: [(usize, usize); 6] = [(0, 1), (1, 1), (1, 2), (0, 2), (0, 3), (1, 3)];
+
+fn indexing_records(experiment: &IndexingExperiment) -> Vec<Value> {
     INDEXING_ORDER
         .iter()
-        .map(|(kind, seed)| {
+        .map(|&(variant, seed)| {
+            let kind = ["baseline", experiment.candidate][variant];
             let path = format!(
-                "{}/docs/experiments/conv-indexing-2026-09-06/{kind}-{seed:02}.json.gz",
-                env!("CARGO_MANIFEST_DIR")
+                "{}/docs/experiments/{}/{kind}-{seed:02}.json.gz",
+                env!("CARGO_MANIFEST_DIR"),
+                experiment.protocol,
             );
             let file = std::fs::File::open(path).unwrap();
             serde_json::from_reader(flate2::read::GzDecoder::new(file)).unwrap()
@@ -524,29 +555,13 @@ fn indexing_records() -> Vec<Value> {
         .collect()
 }
 
-fn indexing_cohort(records: &[Value]) -> Value {
+fn indexing_cohort(experiment: &IndexingExperiment, records: &[Value]) -> Value {
     assert_eq!(records.len(), INDEXING_ORDER.len());
     let mut previous = 0;
     let mut ids = HashSet::new();
-    for (record, &(kind, seed)) in records.iter().zip(&INDEXING_ORDER) {
-        let (revision, executable) = if kind == "baseline" {
-            (
-                "aa1344e784a37462b8261aed97cb804c11ce8ba3",
-                "f4e681345ac30729ce45bfdbdbd0dd3fce395c4dbfa6f6a9fe8016fa5b015a59",
-            )
-        } else {
-            (
-                "45304b884d821875c476f6d28446051ad22fe35f",
-                "7f0c7fbae450e8a16b553a4a6de3bfed2c8e3c4ae7ea505ca831371344feabde",
-            )
-        };
-        validate_source(
-            record,
-            seed,
-            "conv-indexing-2026-09-06",
-            revision,
-            executable,
-        );
+    for (record, &(variant, seed)) in records.iter().zip(&INDEXING_ORDER) {
+        let (revision, executable) = experiment.sources[variant];
+        validate_source(record, seed, experiment.protocol, revision, executable);
         let meta = &record["metadata"];
         assert!(ids.insert(meta["process_id"].as_u64().unwrap()));
         assert!(previous <= meta["started_unix_ms"].as_u64().unwrap());
@@ -586,30 +601,32 @@ fn indexing_cohort(records: &[Value]) -> Value {
             Value::Object(fields)
         };
         let pairs: Vec<_> = (1..=3).map(|seed| {
-            let get = |kind| runs[INDEXING_ORDER.iter().position(|&pair| pair == (kind, seed)).unwrap()];
-            let baseline = get("baseline");
-            let exact = get("exact");
+            let get = |variant| runs[INDEXING_ORDER.iter().position(|&pair| pair == (variant, seed)).unwrap()];
+            let baseline = get(0);
+            let candidate = get(1);
             let bb = number(&baseline["normal_before"]["median_ms"]);
             let ba = number(&baseline["normal_after"]["median_ms"]);
-            let eb = number(&exact["normal_before"]["median_ms"]);
-            let ea = number(&exact["normal_after"]["median_ms"]);
+            let cb = number(&candidate["normal_before"]["median_ms"]);
+            let ca = number(&candidate["normal_after"]["median_ms"]);
+            let label = experiment.candidate;
             json!({"seed":seed, "baseline_before_ms":bb, "baseline_after_ms":ba,
-                "exact_before_ms":eb, "exact_after_ms":ea,
-                "baseline_to_exact_before_ratio":bb/eb, "baseline_to_exact_after_ratio":ba/ea,
-                "baseline_drift_pct":(ba/bb-1.0)*100.0, "exact_drift_pct":(ea/eb-1.0)*100.0,
-                "profile_baseline_conv_ms":conv_ms(baseline), "profile_exact_conv_ms":conv_ms(exact)})
+                (format!("{label}_before_ms")):cb, (format!("{label}_after_ms")):ca,
+                (format!("baseline_to_{label}_before_ratio")):bb/cb,
+                (format!("baseline_to_{label}_after_ratio")):ba/ca,
+                "baseline_drift_pct":(ba/bb-1.0)*100.0, (format!("{label}_drift_pct")):(ca/cb-1.0)*100.0,
+                "profile_baseline_conv_ms":conv_ms(baseline), (format!("profile_{label}_conv_ms")):conv_ms(candidate)})
         }).collect();
         json!({"name":expected.name, "state_sha256":digest,
             "same_dispatch_contracts_and_requested_memory":true, "process_pairs":pairs})
     }).collect();
-    json!({"protocol":"conv-indexing-2026-09-06", "cases":cases,
+    json!({"protocol":experiment.protocol, "cases":cases,
         "processes":6, "normal_steps":720, "profiled_full_state_checks":90,
         "interpretation":"sequential process pairs, not paired-kernel or cross-engine gain evidence"})
 }
 
 #[test]
 fn exact_convolution_indexing_cost_and_cross_source_states_replay() {
-    let summary = indexing_cohort(&indexing_records());
+    let summary = indexing_cohort(&INDEXING, &indexing_records(&INDEXING));
     let recorded = std::fs::File::open(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/docs/experiments/conv-indexing-2026-09-06/summary.json"
@@ -624,14 +641,31 @@ fn exact_convolution_indexing_cost_and_cross_source_states_replay() {
 
 #[test]
 fn indexing_replay_rejects_cross_source_state_drift() {
-    let original = indexing_records();
-    for key in ["reference_state_sha256", "final_state_sha256"] {
-        let mut changed = original.clone();
-        // Seed 1 starts with SmolLM2 in both revisions. Preserve the record's
-        // in-process comparisons to isolate the new cross-source hash check.
-        changed[1]["cases"][0][key] = json!("0".repeat(64));
-        assert!(std::panic::catch_unwind(|| indexing_cohort(&changed)).is_err());
+    for experiment in [&INDEXING, &DIVISOR] {
+        let original = indexing_records(experiment);
+        for key in ["reference_state_sha256", "final_state_sha256"] {
+            let mut changed = original.clone();
+            // Seed 1 starts with SmolLM2 in both revisions. Preserve the record's
+            // in-process comparisons to isolate the new cross-source hash check.
+            changed[1]["cases"][0][key] = json!("0".repeat(64));
+            assert!(std::panic::catch_unwind(|| indexing_cohort(experiment, &changed)).is_err());
+        }
     }
+}
+
+#[test]
+fn exact_invariant_divisor_cost_and_cross_source_states_replay() {
+    let summary = indexing_cohort(&DIVISOR, &indexing_records(&DIVISOR));
+    let recorded = std::fs::File::open(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/docs/experiments/conv-divisor-2026-09-06/summary.json"
+    ))
+    .unwrap();
+    check_summary(&summary, &serde_json::from_reader(recorded).unwrap());
+    println!(
+        "DIVISOR_SUMMARY={}",
+        serde_json::to_string(&summary).unwrap()
+    );
 }
 
 #[test]

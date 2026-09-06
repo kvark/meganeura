@@ -478,8 +478,8 @@ Dense, ConvDerivatives and All scopes. No model name enters selection.
 Short: structural legality and numerical testing are separate checks.
 
 Detail: checked extents prevent index overflow, and shared convolution kernels
-now decompose indices by integer division. The earlier reciprocal-domain filter
-only excluded unsafe shapes from tuning; it did not fix ordinary execution.
+now decompose indices with exact integer arithmetic. The earlier reciprocal-domain
+filter only excluded unsafe shapes from tuning; it did not fix ordinary execution.
 Both variants must still produce finite, matching full
 outputs on ordinary/tiny synthetic inputs and match 32 f64 contractions,
 including dX batch edges. Separate full f64 scatter oracles cover padding,
@@ -514,23 +514,31 @@ The eight-class structural budget visits only 8/45 ResNet derivative classes;
 it is not a measured cost ranking. The next experiment is bounded split-K dW
 with charged partial storage/reduction and explicit search coverage, not a
 lower threshold or an unconditional performance claim.
-Ordinary convolution indexing is now repaired separately: integer division
-replaces unsafe reciprocal multiplication, with full adversarial GPU oracles.
+Ordinary convolution indexing is now repaired separately: exact integer arithmetic
+replaces unsafe float reciprocal multiplication, with full adversarial GPU oracles.
 
 ### 45. How does exact indexing fit a minimal, general engine?
 
 Short: fix the shared arithmetic, not individual shapes.
 
 Detail: the old f32 reciprocal mapped 41/41 to zero, selecting the wrong batch
-in a weight gradient. We replaced that operation with integer division across
-scalar and generated convolution kernels, deleted four reciprocal uniforms and
-removed the tuner-only interval filter. Full forward/dX/dW oracles cover the
-failure and nearby boundaries. There is no list of special widths. A separate
-cost check measures the tradeoff; correctness is not conditional on winning it.
-On this RTX 5070 the repair increases ResNet F+L+B from about 17.55 to 21.55 ms,
-despite bit-identical full states on that workload. That cost is retained, not
-hidden behind the earlier tile-selection results from different source.
-[Repair and protocol](../experiments/conv-indexing-2026-09-06/README.md).
+in a weight gradient. Exact division repaired this across scalar and generated
+convolution kernels and removed the tuner-only interval filter. Its retained
+cost check increased ResNet F+L+B from about 17.55 to 21.55 ms.
+
+The follow-up uses an **integer** reciprocal: for `d > 1`, precompute
+`m = floor(2^32/d)`, take the high word of `n*m`, and increment if the remainder
+is still at least `d`. The estimate is at most one low for every u32 numerator;
+`d = 1` returns `n`. One shared WGSL helper and four derived u32 uniforms serve
+all convolution directions. No float addressing, width exceptions or new tuning
+knob is needed. GPU raw-u32 checks and full f64 forward/dX/dW oracles pass.
+
+A new six-process RTX cohort shows only about 2% lower ResNet F+L+B time, with
+bit-identical full states. Most of the old cost remains, and short-case drift
+prevents a no-regression claim. A correctness proof does not prove profitability;
+this local comparison is not a new PyTorch result or paired-MAD tuning decision.
+[Repair](../experiments/conv-indexing-2026-09-06/README.md),
+[proof and follow-up measurements](../experiments/conv-divisor-2026-09-06/README.md).
 
 ### 46. Why isn't split-K just another tile size?
 

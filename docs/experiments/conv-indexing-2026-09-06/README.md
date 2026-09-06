@@ -173,3 +173,9 @@ fitting model thresholds. The subsequent split-K prototype can reuse SumRows,
 but still needs explicit candidate-sequence/scratch accounting and independent
 numerical and whole-step evidence. Tuning remains opt-in; frozen paper tables
 and prior evidence tags are untouched.
+
+Follow-up: the [shared integer-divisor cohort](../conv-divisor-2026-09-06/README.md)
+qualifies an all-integer high-product/remainder correction without width
+exceptions. It observes only about 2% lower ResNet time than exact division,
+with bit-identical full states. Most of this repair's cost remains; the two
+cohorts are separate source/process comparisons, not a jointly measured triple.

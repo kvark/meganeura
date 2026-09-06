@@ -114,11 +114,13 @@ Both scalar variants retain f32 arithmetic. The full finite/cross-variant
 scans include all dX batches, while the 32 f64 dots use convolution indexing
 and explicit first/last/scattered batches. Checked integer products and signed
 coordinates and padded K loops reject overflow. Convolution now decomposes
-indices using integer division, including ordinary forward/cooperative paths
-outside the tuner. The earlier f32 reciprocal interval filter is obsolete and
-removed, along with four uniform fields. This admits formerly excluded shapes
-without relaxing validation. Forward and cooperative convolution remain outside
-the search, but receive the shared correctness repair.
+indices using exact integer arithmetic, including ordinary forward/cooperative
+paths outside the tuner. The earlier f32 reciprocal interval filter and its four
+float uniforms were removed. A subsequent shared helper uses four derived u32
+multipliers with an exact, single remainder correction; it covers every u32
+numerator and positive divisor, not a narrower shape interval. This admits
+formerly excluded shapes without relaxing validation. Forward and cooperative
+convolution remain outside the search, but receive the shared correctness repair.
 
 This distinction matters: multiplying by the rounded f32 reciprocal mapped
 `41 / 41` to zero. A batch-2, width-41 GPU regression produced `dW[0]=0.9391`
@@ -129,8 +131,20 @@ execution still needs hardware qualification. The [separate cost cohort](../expe
 retains full-state bit identity across revisions, but ResNet normal F+L+B rises
 17.55→21.55 ms, about 23%. Short-case drift prevents an equivalence claim for
 SmolLM2/Whisper. These untuned, sequential source-level processes are separate
-from the earlier tile crossover and its timings. Correctness stays; future
-exact indexing optimization must recover cost without restoring the approximation.
+from the earlier tile crossover and its timings.
+
+The [integer-divisor follow-up](../experiments/conv-divisor-2026-09-06/README.md)
+qualifies one shared WGSL high-multiply/correction implementation against raw-u32
+CPU oracles and all existing full convolution oracles. Its separate six-process
+cohort retains bit-identical full states and requested tensor memory, with 16
+extra uniform bytes per convolution binding. ResNet falls 21.5986→21.1966 ms
+before profiling and 21.6076→21.1521 ms after, a modest 1.86%/2.11% local reduction.
+Most of the original cost remains. Whisper's first two candidate after-blocks
+deteriorate sharply; the cohort does not establish short-case stability or
+no regression. Do not confuse these sequential source pairs with tuned
+interleaved comparisons, or change the 5%+2MAD decision guard to accommodate them.
+Exact-arithmetic lowering, short-case timing stability and bounded split-K dW
+with existing SumRows are still distinct engineering opportunities.
 
 The former small-tile occupancy cutoff is now an **initial choice**, not a
 profitability veto for eligible tuned classes: either tile can win. Untuned,

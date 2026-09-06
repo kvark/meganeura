@@ -81,6 +81,14 @@ not optimizer-backed or cross-engine speedups. Reviewing convolution then found
 and repaired a non-same-padding dX indexing bug using an independent f64 oracle;
 read [the design lesson](design-decisions.md#9-a-shared-baseline-is-not-an-independent-oracle).
 
+The subsequent [exact-indexing follow-up](../experiments/conv-divisor-2026-09-06/README.md)
+replaces costly integer division with one shared, all-integer reciprocal and
+exact correction. Its full-u32 proof and GPU oracles do not depend on model
+names or special widths. A fresh six-process cohort lowers ResNet F+L+B time
+by only about 2%; most of the preceding correctness-repair cost remains.
+Short-case instability, including two much slower Whisper after-blocks, is
+retained. This is neither a new paper result nor a reason to weaken validation.
+
 The memory/restore follow-up removes unused Adam allocations, reports actual
 resident tensor-buffer requests, and restores logical checkpoints only after
 whole-file preflight. Read the [checkpoint and memory chapter](checkpoints-and-memory.md)

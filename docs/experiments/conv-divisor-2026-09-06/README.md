@@ -86,3 +86,80 @@ This is the general invariant-divisor strength-reduction idea also used by
 magic-number algorithms. Here a truncated reciprocal and one correction keep
 the implementation small. Whether this portable limb expansion is profitable
 depends on backend code generation and requires measurements on each device.
+
+## Retained results
+
+All six processes completed September 6, 20:11:24.293–20:16:00.821 UTC, on
+RTX 5070 / driver 595.71.05, i5-12400F, Rust 1.98.0. Every predeclared attempt
+is retained: [baseline 1](baseline-01.json.gz), [reciprocal 1](reciprocal-01.json.gz),
+[reciprocal 2](reciprocal-02.json.gz), [baseline 2](baseline-02.json.gz),
+[baseline 3](baseline-03.json.gz), [reciprocal 3](reciprocal-03.json.gz).
+Lossless `gzip -n` compression keeps the cohort around 1.1 MiB; decompressed
+bytes match [all six original SHA-256 digests](RAW-SHA256SUMS). There were no
+discarded or repeated attempts and no concurrent build/qualification work.
+
+| Implementation | Source / immutable tag | Executable SHA-256 |
+|---|---|---|
+| Exact division | `1b7a09f2140c886dc9b28504e06f15f7d0d9a67c` / `evidence/conv-divisor-baseline-2026-09-06` | `8b91fda6ac63fae73883f18710860f395360be1488852c4731e2fb7fefb32e17` |
+| Integer reciprocal + correction | `1f2c7740231fc4998be1de244678f247843533dd` / `evidence/conv-divisor-reciprocal-2026-09-06` | `76e9ead4c7d3412738c54de8ef15bf995cf822a432d35fe81bea6115909e508f` |
+
+The [shared CPU replay](../../../tests/training_profile_evidence.rs) checks all
+18 cases, 90 profiled full-state checks, 720 timed loss checks, source/executable/
+lock identity, process windows, numerical rosters, telemetry, profile arithmetic
+and normal medians. Reference/final state hashes agree within and across sources,
+as do dispatch contracts, pipeline keys and requested tensor memory. The extra
+16 bytes per convolution uniform binding remain explicitly outside tensor-memory
+accounting. Cross-source hash mutation checks cover both this and the prior
+indexing cohort. Raw vectors are not archived; replay checks the recorded
+observations, not a fresh independent operator oracle.
+
+Each value below is the median of three process medians, in milliseconds.
+Before/after refer to instrumented capture between the normal blocks.
+
+| Workload | Division before | Reciprocal before | Division after | Reciprocal after |
+|---|---:|---:|---:|---:|
+| SmolLM2 F+L+B | 2.8120 | 2.8396 | 2.8361 | 2.7876 |
+| Whisper F+L+B | 2.8775 | 2.8615 | 3.2447 | 6.4303 |
+| ResNet-50 F+L+B | 21.5986 | 21.1966 | 21.6076 | 21.1521 |
+
+ResNet time falls 1.86% before and 2.11% after profiling. Seed-matched
+division/reciprocal ratios are 1.01902/1.01705/1.02240 before and
+1.02026/1.02181/1.02791 after. All six within-process ResNet drifts are below
+0.43% in magnitude. This is a small, consistent local observation, not the
+tuner's paired-MAD acceptance test or a cross-engine/optimizer-backed gain.
+It does **not** recover most of the preceding exact-indexing regression.
+The earlier 17.55 ms approximate implementation is historical context, not
+a third arm measured alongside this cohort.
+
+The short cases remain nonstationary. SmolLM2, which has no convolution, drifts
+up to 28.24%. Whisper's after-block source ratios are 0.48507/0.50597/1.01437:
+the first two candidate processes deteriorate substantially, not merely by a
+rounding-sized difference. The largest within-process drift is 252.34%.
+In reciprocal seed 2, the first eleven after-block samples are 9.75–11.12 ms,
+whereas the last eight are 3.47–3.54 ms. Five predeclared settling steps did
+not establish a stable regime for this short workload. Keep every sample;
+these data neither establish a steady-state regression cause nor support a
+no-regression/equivalence claim. [The summary](summary.json) retains all process
+medians, drifts and ratios. A separate stability investigation is still due.
+
+Instrumented ResNet median directional sums are forward 5.3772→5.1938 ms,
+dX 9.3832→9.1067 ms and dW 6.5672→6.5210 ms. These localize small changes,
+not additive whole-step savings. All 1,082 telemetry samples remain: utilization
+0–90%, graphics 217–2902 MHz, memory clocks 405–14001 MHz, device memory used
+271–710 MiB, power 7.51–71.83 W and temperature 43–57°C. These are coarse
+observations, not a diagnosis of short-case transitions or a peak-memory measurement.
+
+Before the cohort, all ordinary integration tests passed, as did all six full
+convolution oracle suites, all 259 library tests including ignored GPU/state
+tests, the profiling preflight, all-target/all-feature Clippy, Rust 1.92 library
+check, strict docs, package verification and frozen-paper artifact replay.
+The primitive GPU arithmetic test is in the ordinary suite. Native-f32
+cooperative execution and other-device profitability remain unqualified here.
+
+Retain the shared exact implementation and its modest result without new
+thresholds or a growing indexing-variant menu. Tuning stays opt-in and the
+frozen paper tables stay untouched. The next scheduling experiment remains
+bounded split-K dW using existing SumRows, with explicit partial-buffer lifetime,
+charged bytes and full-sequence timing. Better lowering of exact arithmetic and
+short-case timing stability remain separate open items; neither is solved by
+this cohort.
