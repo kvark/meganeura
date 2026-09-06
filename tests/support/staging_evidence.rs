@@ -78,7 +78,7 @@ pub fn validate(record: &Value, seed: usize, protocol: &Protocol) -> Vec<[Costs;
         metadata["optimizer"],
         json!({"adam_lr": 1e-4, "beta1": 0.9, "beta2": 0.999, "epsilon": 1e-8, "clip_norm": 1.0, "clip_every": 1, "accumulation": false, "decay": 0.0})
     );
-    telemetry::check_telemetry(record);
+    telemetry::check_telemetry(record, false);
     let mut previous_case = metadata["started_unix_ms"].as_u64().unwrap();
     let end = record["finished_unix_ms"].as_u64().unwrap();
     let cases = record["cases"].as_array().unwrap();

@@ -386,6 +386,30 @@ Read the retained first dense slowdown and the ResNet search-order reversal
 before interpreting medians; ResNet passes no gain/regression guard, which
 does not establish zero harm. No whole-step or fleet speedup was measured.
 
+## Profiled-state parity is not stationary timing or an independent oracle
+
+The [whole-step localization runner](../experiments/training-profile-2026-09-06/README.md)
+profiles synthetic ResNet, SmolLM2 and Whisper F+L+B without optimizer/clip
+passes. It compares every retained profiled full state before the collector's
+two ordinary ring-advance steps overwrite it; readbacks use separate encoders,
+outside the retained wall timer. The GPU regression checks this callback order
+and exact timestamp counts. All 45 captured full states match bitwise.
+
+Normal timing blocks still drift: Whisper's first after-block median is nearly
+twice its before-block median. Profiled/normal wall ratios are retained, not
+silently treated as normal step times. Readback interruptions and timestamp
+passes can perturb execution; coarse telemetry does not identify the cause.
+The phase label is the scheduled prefix/suffix at the last loss dispatch, so
+independent gradient seeds may appear in the prefix. Use shader direction and
+origins as well as the phase label.
+
+Source inspection then found a non-same-padding convolution dX bug that both
+control and profiled paths shared. A direct f64 scatter oracle exposed it;
+the scalar and cooperative generators are now fixed. Read the
+[design lesson](design-decisions.md#9-a-shared-baseline-is-not-an-independent-oracle):
+observability helps find where to look, but neither exact same-engine parity
+nor a complete timing trace proves the underlying derivative is correct.
+
 ## What we should improve next
 
 The highest-value debugging improvements are typed logical-tensor reads;

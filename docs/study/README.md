@@ -7,7 +7,7 @@ on `codex/audit-observability-tuning`.
 Measured sources are retained as `evidence/tuning-2026-09-05`,
 `evidence/holdouts-2026-09-06`, `evidence/crossover-2026-09-06` and
 `evidence/readback-2026-09-06`, `evidence/allocation-profile-2026-09-06` and
-`evidence/staging-reuse-2026-09-06`;
+`evidence/staging-reuse-2026-09-06` and `evidence/training-profile-2026-09-06`;
 rebasing does not relabel those measurements as results of newer code. Paper
 performance statements refer to the separately frozen revision. The initial audit was
 CPU-only; subsequent GPU qualification is described separately in the
@@ -72,6 +72,14 @@ Across six paired processes this lowers median dense search 44.01→31.84 ms and
 MLP+Adam 64.27→45.46 ms. ResNet has no reuse opportunity and no guarded change.
 All validation and scratch byte bounds remain intact. This is another search-cost
 result, not a reversal of the earlier inconclusive MLP whole-step result.
+
+The [whole-step localization follow-up](../experiments/training-profile-2026-09-06/README.md)
+prioritizes backward convolution in ResNet and backward attention in SmolLM2.
+All 45 profiled full states match ordinary execution, but short-model timing
+drift and instrumented pass overhead remain visible. These are F+L+B profiles,
+not optimizer-backed or cross-engine speedups. Reviewing convolution then found
+and repaired a non-same-padding dX indexing bug using an independent f64 oracle;
+read [the design lesson](design-decisions.md#9-a-shared-baseline-is-not-an-independent-oracle).
 
 The memory/restore follow-up removes unused Adam allocations, reports actual
 resident tensor-buffer requests, and restores logical checkpoints only after

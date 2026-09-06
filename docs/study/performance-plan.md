@@ -277,9 +277,20 @@ identical per-comparison/peak scratch requests and zero retained staging at
 return. Cleanup includes the final retained-buffer release; it is not moved
 outside total search. No qualification or validation gain guard passes.
 
-This closes the measured staging-allocation opportunity at this scope. Next,
-use whole-step profiles to prioritize reusable convolution/attention work and
-broader kernel selection. Do not infer that cross-call pools, larger budgets
+This closes the measured staging-allocation opportunity at this scope. The
+[subsequent whole-step profiles](../experiments/training-profile-2026-09-06/README.md)
+put 60.66–60.77% of instrumented ResNet dispatch time in backward convolution
+and 36.25–40.58% of SmolLM2's in backward attention. Full profiled state agrees,
+but ordinary before/after timing drift is up to 27% for SmolLM2 and 100% for
+Whisper. These F+L+B-only profiles rank work; they neither measure optimizer
+passes nor establish candidate gains. A newly exposed non-same-padding dX bug
+is fixed before widening the search, with full independent f64 derivative tests.
+
+Next, extend exact-class qualification and selection to the existing 32/64
+convolution derivative tiles. The long-reduction, small-output dW classes
+motivate a later bounded split-K candidate, including its partial storage and
+final reduction. Keep these measured choices about algebra, not model names.
+Do not infer that cross-call pools, larger budgets
 or weaker checks follow from this result. Cheaper search neither supplies
 convolution candidates nor turns MLP's earlier inconclusive whole-step ratios
 into a training gain. Tuning remains opt-in.

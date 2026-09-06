@@ -54,7 +54,15 @@ slot retained only within a tuning call. Six process pairs lower median dense
 search 44.01→31.84 ms and MLP 64.27→45.46 ms; ResNet has no reuse opportunity
 and no guarded change. SameSize becomes the option default, with identical
 scratch requests, zero retention at return and all validation intact.
-Next: whole-step profiles and broader reusable convolution/attention coverage.
+The [whole-step profiles](experiments/training-profile-2026-09-06/README.md)
+now consistently put 60.66–60.77% of ResNet's instrumented dispatch time in
+backward convolution, and 36.25–40.58% of SmolLM2's in backward attention.
+All 45 profiled full states match, but short-case timing drift is substantial;
+these optimizer-free profiles are not whole-step speedup evidence. The follow-up
+also fixes dX indexing outside same padding and adds full f64 derivative oracles.
+Next: exact-class convolution-derivative tile selection, then bounded split-K
+weight gradients with charged partial storage and whole-step confirmation;
+attention schedules remain a separate device-qualified family.
 Keep tuning opt-in; do not fit a smaller margin or model rule.
 
 The [checkpoint/memory follow-up](study/checkpoints-and-memory.md) implements

@@ -434,6 +434,33 @@ Balanced order is a control, not proof of constant clocks or causal isolation;
 the 250 ms telemetry cannot explain every short operation. See the
 [complete resource protocol and results](../experiments/staging-reuse-2026-09-06/README.md).
 
+### 39. Can all full-state comparisons pass while a gradient is still wrong?
+
+Short: yes, if both executions share a bug or the cases miss its domain.
+
+Detail: the new profiler preserved all 45 full states exactly. Reviewing the
+convolution family still found dX using the wrong padding outside same padding.
+A direct f64 oracle failed where same-padding models could not expose the
+error. Both scalar and generated cooperative indexing are fixed, with full
+odd/asymmetric/batched/tiny derivative checks. Control-session parity measures
+preservation; an independent oracle addresses correctness. Neither replaces
+domain coverage or convergence evidence.
+
+### 40. What do the new whole-step profiles justify doing next?
+
+Short: broaden reusable derivative implementations and measured selection,
+not the matmul search budget or the numerical tolerance.
+
+Detail: ResNet backward convolution accounts for 60.66–60.77% of instrumented
+dispatch time; SmolLM2 backward attention accounts for 36.25–40.58%. A long
+weight-gradient reduction with ten output workgroups motivates testing split-K
+with charged temporary storage. These are F+L+B-only RTX profiles, not optimizer
+or Metal evidence. Intrusive pass timing and substantial short-case drift mean
+the shares are localization evidence, not guaranteed whole-step speedup bounds.
+First extend exact convolution classes/qualification to the existing scalar
+tiles; accept any new schedule only after independent edge tests and matched
+whole-step confirmation. [Protocol and limitations](../experiments/training-profile-2026-09-06/README.md).
+
 ## Talk outline
 
 The actual workshop slot length is not confirmed here. For a 12-minute talk,

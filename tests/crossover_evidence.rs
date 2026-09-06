@@ -103,7 +103,7 @@ fn validate(record: &Value, seed: usize) -> Vec<Confirmation> {
         metadata["optimizer"],
         json!({"adam_lr": 1e-4, "beta1": 0.9, "beta2": 0.999, "epsilon": 1e-8, "clip_norm": 1.0, "clip_every": 1, "accumulation": false, "decay": 0.0})
     );
-    check_telemetry(record);
+    check_telemetry(record, false);
     let end = record["finished_unix_ms"].as_u64().unwrap();
     let mut previous_case = metadata["started_unix_ms"].as_u64().unwrap();
     let cases = record["cases"].as_array().unwrap();

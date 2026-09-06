@@ -97,3 +97,22 @@ throughput, occupancy, cache behavior, or tensor-core utilization, use the
 vendor tool for the affected platform (for example Nsight, Radeon GPU
 Profiler, or Xcode GPU capture). Those captures are supporting forensic
 evidence, not portable benchmark artifacts.
+
+## State-checked training localization
+
+`examples/profile_training.rs` provides a fixed, synthetic F+L+B roster with
+normal timing blocks before and after capture, full profiled-result comparisons
+before ordinary ring advancement, exact dispatch contracts, provenance and
+telemetry. It enables timestamp queries through `GpuOptions`, with no environment
+variable required. The [retained protocol and results](experiments/training-profile-2026-09-06/README.md)
+separate localization from optimizer-backed timing and candidate acceptance.
+
+Those records show why both controls matter: all 45 profiled full states match
+bitwise, but short normal timing blocks can still drift badly. Before/after
+normal samples are not interleaved candidate comparisons. Timing-enabled
+contexts also do not reproduce the profiler-disabled production configuration.
+
+The current phase label is the scheduled prefix/suffix around the last loss
+dispatch. Independent gradient seeds can be hoisted into the prefix. Use shader
+direction, `requires_full_precision` and node origins for semantic attribution;
+do not assume everything labeled forward belongs to the undifferentiated graph.

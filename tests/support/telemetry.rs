@@ -9,7 +9,7 @@ pub fn time_window(value: &Value, earliest: u64, latest: u64) -> u64 {
     end
 }
 
-pub fn check_telemetry(record: &Value) {
+pub fn check_telemetry(record: &Value, metadata_before_monitor: bool) {
     let telemetry = &record["telemetry"];
     assert!(telemetry["error"].is_null());
     assert_eq!(telemetry["requested_interval_ms"], 250);
@@ -41,9 +41,12 @@ pub fn check_telemetry(record: &Value) {
         assert!(fields[2].parse::<f64>().unwrap() <= 100.0);
         assert!(fields[8].strip_prefix('P').unwrap().parse::<u32>().is_ok());
     }
-    assert!(
-        samples[0]["received_unix_ms"].as_u64().unwrap()
-            <= record["metadata"]["started_unix_ms"].as_u64().unwrap()
-    );
+    let first = samples[0]["received_unix_ms"].as_u64().unwrap();
+    let start = record["metadata"]["started_unix_ms"].as_u64().unwrap();
+    if metadata_before_monitor {
+        assert!(start <= first);
+    } else {
+        assert!(first <= start);
+    }
     assert!(previous <= record["finished_unix_ms"].as_u64().unwrap());
 }
