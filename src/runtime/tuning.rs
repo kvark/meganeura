@@ -688,7 +688,7 @@ impl Session {
                 if !valid {
                     outcome.decision = TuneDecision::InvalidOutput;
                     outcome.failure = Some(format!(
-                        "{:?}, input pattern {pattern}: reference or cross-variant mismatch",
+                        "variant {variant}, {:?}, input pattern {pattern}: reference or cross-variant mismatch",
                         [outcome.initial, outcome.candidate][variant]
                     ));
                     return;
@@ -1287,6 +1287,82 @@ fn qualify_output(class: &TuneClass, inputs: &[Vec<f32>], output: &[f32], scale:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_control_rejections_match_independent_f32_accumulation() {
+        for (params, pattern, index, observed) in [
+            (
+                [1u32, 3, 224, 224, 64, 7, 7, 2, 3, 112, 112, 3],
+                0,
+                177,
+                -7.426374e-3f32,
+            ),
+            (
+                [1u32, 256, 56, 56, 64, 1, 1, 1, 0, 56, 56, 0],
+                1,
+                6391,
+                1.4238133e-14f32,
+            ),
+        ] {
+            let [batch, ci, h, w, co, kh, kw, stride, ph, oh, ow, pw] = params;
+            let dispatch = Dispatch {
+                shader: ShaderEntry::Conv2dGradWeightGemmSmall,
+                input_buffers: vec![BufferRef(0), BufferRef(1)],
+                output_buffer: BufferRef(2),
+                params: params.to_vec(),
+                workgroups: [(ci * kh * kw).div_ceil(32), co.div_ceil(32), 1],
+                ..Default::default()
+            };
+            let class = TuneClass::from_dispatch(&dispatch, None).unwrap();
+            let inputs = test_inputs(&class.buffer_sizes().unwrap(), pattern);
+            let n = ci * kh * kw;
+            let (channel_out, column) = (index / n, index % n);
+            let (channel_in, ky, kx) = (column / (kh * kw), column / kw % kh, column % kw);
+            let (mut exact, mut separate, mut fused) = (0.0f64, 0.0f32, 0.0f32);
+            // Scatter from input coordinates, independently of the K gather.
+            for b in 0..batch {
+                for iy in 0..h {
+                    for ix in 0..w {
+                        let Some(y) = (iy + ph).checked_sub(ky) else {
+                            continue;
+                        };
+                        let Some(x) = (ix + pw).checked_sub(kx) else {
+                            continue;
+                        };
+                        if y % stride != 0
+                            || x % stride != 0
+                            || y / stride >= oh
+                            || x / stride >= ow
+                        {
+                            continue;
+                        }
+                        let a = inputs[0][(((b * co + channel_out) * oh + y / stride) * ow
+                            + x / stride) as usize];
+                        let v = inputs[1][(((b * ci + channel_in) * h + iy) * w + ix) as usize];
+                        exact += f64::from(a) * f64::from(v);
+                        separate += a * v;
+                        fused = a.mul_add(v, fused);
+                    }
+                }
+            }
+            assert_eq!(
+                exact,
+                reference_dot(&class, &inputs, channel_out as usize, column as usize)
+            );
+            assert!(!close(
+                exact,
+                observed,
+                if pattern == 0 { 1.0 } else { 1e-12 }
+            ));
+            assert!(
+                observed.to_bits() == separate.to_bits() || observed.to_bits() == fused.to_bits(),
+                "observed={observed:e}, separate={separate:e}, fused={fused:e}"
+            );
+            eprintln!(
+                "element {index}: observed={observed:e}, separate={separate:e}, fused={fused:e}, f64={exact:e}"
+            );
+        }
+    }
 
     #[test]
     fn split_scratch_contract_and_full_partial_oracles_reject_corruption() {

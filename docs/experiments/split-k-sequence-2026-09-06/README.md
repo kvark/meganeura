@@ -84,3 +84,122 @@ requests and qualification/search costs. Do not pool shapes, treat 2MAD as a
 confidence interval, present producer-only time as a sequence gain, or call an
 isolated result a PyTorch/whole-step speedup. Whole-step experiments across rebuilt
 plans need their own protocol only if these results warrant proceeding.
+
+## Retained results
+
+All four processes completed September 6, 22:09:46.219–22:10:10.134 UTC on
+RTX 5070 / driver 595.71.05, i5-12400F, Rust 1.98.0. Measured source is
+`8d77f90d4565aa150b8b5f70a50a8d72331cabb4` at the tag above; executable SHA-256 is
+`34f94f2fcdd3ba90ab7dc5f2de81416f5e6720520f9d45ee41d676133119d301`.
+Every predeclared attempt is retained: [1](run-01.json), [2](run-02.json),
+[3](run-03.json), [4](run-04.json), with [digests](SHA256SUMS) and a
+[per-process summary](summary.json). There were no retries, discarded runs,
+concurrent builds, other GPU tests or heavy host analysis during the cohort.
+
+All 16 live plan/state comparisons remain bit-identical, including all six
+retained tensor roles, allocation requests and zero optimizer state. Of 64
+isolated comparisons, **32 qualify and 32 reject before timing**. The qualified
+comparisons supply 192 complete pairs; 27 pass the unchanged gain guard and
+five keep the baseline. These decisions are per comparison, not a family-wide
+selection or automatic installation.
+
+Each time below is the median of four process medians, in milliseconds. Ratios
+are medians of the four process ratios, not ratios of the displayed medians.
+
+| Shape | Splits | Unsplit | Complete sequence | Ratio | Gain guards passed |
+|---|---:|---:|---:|---:|---:|
+| rectangular-tail | 2 | 0.015384 | 0.016306 | 0.9411× | 0/4 |
+| rectangular-tail | 3 | 0.015373 | 0.014268 | 1.0765× | 4/4 |
+| rectangular-tail | 4 | 0.015370 | 0.014230 | 1.0801× | 3/4 |
+| rectangular-tail | 8 | 0.015415 | 0.012328 | 1.2492× | 4/4 |
+| long-tail | 2 | 3.084264 | 1.616171 | 1.9087× | 4/4 |
+| long-tail | 3 | 3.083817 | 1.091155 | 2.8263× | 4/4 |
+| long-tail | 4 | 3.083641 | 0.829207 | 3.7192× | 4/4 |
+| long-tail | 8 | 3.083991 | 0.444891 | 6.9317× | 4/4 |
+
+This demonstrates an isolated scheduling opportunity, including the final
+reduction cost. It does not establish ResNet acceleration. Two-way splitting
+slows the small case's medians, and four-way splitting misses the guard in
+process 3. Small-case absolute timings also vary by order: process 4's first,
+eight-way comparison is 0.01738→0.01421 ms rather than roughly 0.0154→0.0123.
+Keep that variation rather than claiming every observation is stationary.
+
+### Full scans expose control errors
+
+Neither profiled large shape reaches timing:
+
+- `spatial-7x7`: all 16 comparisons reject the unsplit control on ordinary
+  inputs. Element 177 is `-7.426374e-3`, versus f64 `-7.406972790242605e-3`.
+  Its approximately `1.94e-5` error exceeds the approximately `1.15e-5` bound.
+- `pointwise`: twelve comparisons (counts 3, 4, 8) reject the unsplit control
+  on tiny inputs. Element 6391 is `1.4238133e-14`, versus f64
+  `1.4255220975027645e-14`; approximately `1.71e-17` error exceeds the
+  approximately `1.29e-17` bound. The four two-way comparisons exit earlier
+  at the ordinary reference/parity gate. Their original message does not
+  identify the variant or element; do not invent that attribution.
+
+A subsequent **CPU-only diagnostic**, now an ordinary library regression,
+scatters from input coordinates independently of the GPU K-gather. For the two
+reported control elements, sequential `f32::mul_add` reproduces the observed
+GPU bits exactly, and independent f64 scatter agrees with the runtime oracle.
+These particular discrepancies are accumulation rounding, not an indexing
+discrepancy. This does not prove every element or backend behaves identically.
+The follow-up also adds the variant number to future generic failure messages;
+it does not relabel or rerun the frozen cohort above.
+
+The ordinary tuner's 32 sampled f64 dots missed these two control elements;
+full scans find them. Strict-f32 storage/arithmetic policy is not a promise that
+every long sum meets a fixed error bound. Do not weaken the bound, time an
+unqualified control, or treat agreement between two scalar tiles with the same
+accumulation order as independent correctness evidence.
+
+Conversely, this cohort's three-way long-tail comparison passes its hashed
+synthetic patterns, while the [earlier LCG fixture](../split-k-2026-09-06/README.md)
+still fails a tiny partial on the same shape. No shader arithmetic changed
+between those tests. Qualification is evidence about the executed inputs, not
+a guarantee over all values for that shape. The earlier rejection remains
+active and prevents calling three-way splitting universally qualified.
+
+### Search and memory costs
+
+| Shape | Median search | Median qualification | Median CPU validation | Peak scratch requests |
+|---|---:|---:|---:|---:|
+| spatial-7x7 | 72.18 ms | 67.09 ms | 55.23 ms | 7,363,328 B |
+| pointwise | 3,038.27 ms | 3,033.41 ms | 3,015.87 ms | 7,815,168 B |
+| rectangular-tail | 31.96 ms | 9.78 ms | 5.02 ms | 22,764 B |
+| long-tail | 2,000.68 ms | 390.07 ms | 339.79 ms | 3,408,724 B |
+
+The pointwise row pays for full f64 checks repeatedly and then rejects; this is
+CPU numerical work, not the old mapped-readback problem. The long-tail row
+spends about 1.57 seconds in sampling. The larger 120-second ceiling was not
+exhausted; the default two-second ceiling remains a soft bound and can stop
+this exhaustive probe before all counts finish. No claim is made that this
+full-oracle search is production-cheap.
+
+Live tensor requests are separately 23,156,236 / 11,370,508 / 38,400 /
+9,962,516 bytes in the table's order. Staging allocations equal releases in
+every call; retained bytes are zero. The small case needs two or three staging
+allocations depending on count order because eight-way partials become the
+largest binding. Other cases allocate staging once and reuse it three times.
+All 98 telemetry samples remain: utilization 0–99%, graphics clock 202–2902 MHz,
+reported device memory 271–348 MiB, power 7.06–47.35 W and temperature 44–48°C.
+Those coarse observations neither diagnose each short timing transition nor
+measure peak VRAM.
+
+Before measurement, the ordinary release suite, all 267 library tests including
+ignored state/staging checks, all eleven convolution suites, five scalar tuner
+tests, Clippy, MSRV, strict docs, package verification and frozen-paper replay
+passed. Native-f32 cooperative hardware remains outside this device's coverage.
+The [CPU evidence replay](../../../tests/split_k_evidence.rs) checks the full
+roster, source identities, windows/telemetry, tensor summaries, complete sequence
+sizes, staging lifetimes, phase arithmetic, raw pairs, guards and summary.
+Mutation tests reject changed counts, bytes, timings, rejected-work promotion and
+state. This replays recorded observations, not absent full oracle vectors.
+
+The next general engineering task is to improve long-reduction accuracy and
+qualification coverage, including the discovered control fixtures, before
+claiming improvement on the profiled shapes. Favor a small shared accumulation
+strategy, not a shape blacklist or tolerance exception. Whole-step experiments
+with qualified rebuilt plans remain useful, but the synthetic 6.93× result is
+not sufficient to promote split-K for training. Defaults and paper tables stay
+unchanged.

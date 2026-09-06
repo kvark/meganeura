@@ -154,3 +154,9 @@ from selected plans, with optimizer-state checks and a predeclared, source-froze
 protocol retaining every attempt. Whole-step confirmation needs distinct layouts;
 the current geometry-only live swap is not that mechanism. No speedup, automatic
 adoption or profitable split count is claimed by this prototype.
+
+The [subsequent isolated sequence cohort](../split-k-sequence-2026-09-06/README.md)
+now measures both passes with complete scratch accounting. It finds a synthetic
+long-reduction gain but rejects both profiled large shapes before timing; full
+scans expose unsplit-control accuracy failures. Read it as a separate source and
+qualification result, not a retrospective speed claim for this initial prototype.

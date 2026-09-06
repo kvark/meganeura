@@ -147,7 +147,10 @@ Exact-arithmetic lowering and short-case timing stability remain open. The
 [bounded split-K prototype](../experiments/split-k-2026-09-06/README.md) now lowers
 explicit dW selections to partials plus existing SumRows before session allocation.
 Its legality, full/partial f64 oracles and short optimizer trajectories are tested;
-automatic sequence qualification/measurement and whole-step confirmation remain open.
+explicit isolated sequence qualification/measurement is now implemented.
+Its [four-process cohort](../experiments/split-k-sequence-2026-09-06/README.md)
+shows synthetic gains but rejects both profiled large shapes on accuracy before
+timing. Automatic installation and whole-step confirmation remain open.
 
 The former small-tile occupancy cutoff is now an **initial choice**, not a
 profitability veto for eligible tuned classes: either tile can win. Untuned,
@@ -364,14 +367,22 @@ plan-before-allocation lowering now shares the scalar template and existing
 SumRows for `[split, M*N]` partials, with all-or-nothing legality/byte preflight.
 Ordinary scheduler edges enforce the final reduction and permit lifetime-based
 partial reuse. It is not a live-tuner choice: the geometry-only swap still promises
-fixed allocations. The next extension is isolated candidate-sequence qualification
-and timing with complete scratch accounting, reusing class keys and decision logic,
-followed by whole-step confirmation across rebuilt plans. Do not hide partials
+fixed allocations. Explicit isolated candidate-sequence qualification and timing
+now reuse the scratch runner, class keys, options and decision guard, with a named
+final output slot and all partial/staging bytes charged. Whole-step confirmation
+across rebuilt plans and automatic installation remain open. Do not hide partials
 outside the budget or create another tuner. Full f64 checks and short SGD/Adam
 trajectories pass for the tested short fixtures; a long tiny-gradient three-way
 partial fails the unchanged gate even though the final gradient passes. The
 [prototype record](../experiments/split-k-2026-09-06/README.md) retains that rejection;
-there are no split-K timing results or default changes yet.
+the [later measurement cohort](../experiments/split-k-sequence-2026-09-06/README.md)
+is separate. Its 64 comparisons include 32 numerical rejections and no default
+change. The synthetic long case observes a 6.93× eight-way sequence ratio, but
+neither profiled large shape reaches timing. Full f64 scans expose unsplit-control
+errors missed by sampled dots; independent CPU f32 FMA reproduces the reported
+bits. Improve shared long-reduction accumulation and qualification coverage before
+claiming training gains. A passing synthetic pattern does not erase the earlier
+three-way partial failure on different inputs of the same shape.
 
 Keep these choices about algebra, not model names. Do not infer that cross-call
 pools, larger budgets or weaker checks follow from this result. Cheaper search

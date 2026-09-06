@@ -557,10 +557,31 @@ would miss the final generic reduction.
 Full independent f64 partial/final oracles and short SGD/Adam trajectories test
 the sequence. A long tiny-gradient three-way partial fails the unchanged accuracy
 gate even though its final gradient passes: it remains unqualified. The live
-tile search still cannot change allocation layouts. Bounded isolated sequence
-measurement and rebuilt-session whole-step confirmation come next; there is no
-automatic selection or split-K performance claim yet. More parallelism alone is
-not a win. [Implementation and rejection](../experiments/split-k-2026-09-06/README.md).
+tile search still cannot change allocation layouts. Explicit bounded sequence
+probes now reuse its scratch, timers and decision guard without installing a
+choice. A four-process cohort finds an isolated 6.93× eight-way gain on the
+synthetic long case, including SumRows, but both profiled large shapes reject
+before timing. No whole-step training gain is established; defaults are unchanged.
+[Prototype](../experiments/split-k-2026-09-06/README.md),
+[sequence measurements](../experiments/split-k-sequence-2026-09-06/README.md).
+
+### 47. How can the unsplit f32 control fail qualification?
+
+Short: f32 arithmetic does not guarantee a fixed error bound for every long sum.
+
+Detail: two long dW control elements pass the sampled checks but fail the full
+f64 scan, one on ordinary and one on tiny inputs. Independent input-coordinate
+scatter with sequential CPU f32 FMA reproduces their GPU bits exactly. These
+particular failures are accumulation rounding, not an integer-indexing discrepancy.
+We retain the rejections and collect no timings for those comparisons.
+
+The earlier three-way partial failure and a later pass on different synthetic
+inputs of the same shape also coexist. “Qualified” means the executed tests
+passed, not that every possible gradient is covered. Stronger shared accumulation
+and broader input coverage come before training promotion; loosening tolerances
+or claiming two same-order scalar tiles are independent references would not
+resolve this. The probe's full validation can cost seconds, so its cost is reported
+separately from sequence timing. [Evidence and limits](../experiments/split-k-sequence-2026-09-06/README.md).
 
 ## Talk outline
 

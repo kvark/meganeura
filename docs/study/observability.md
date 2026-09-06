@@ -453,6 +453,25 @@ Independent f64 checks exposed a long tiny-gradient partial error that final
 gradient parity alone would miss. That partition count remains unqualified;
 observing a plausible final tensor does not make every intermediate correct.
 
+`Session::measure_conv_weight_splits` now returns ordinary TuneReports for an
+explicit class without installing a choice. Read `candidate_split_k` as well as
+the tile: baseline/challenger tile fields are identical, but the challenger has
+two passes. `FasterCandidate` describes that isolated comparison, not a live-plan
+change. Scratch bindings are upstream/input/**final output**/partials, with the
+largest binding charged again for staging; the last buffer is no longer implicitly
+the final result. Timed repetitions include both passes and their barrier.
+
+The [retained cohort](../experiments/split-k-sequence-2026-09-06/README.md) contains
+32 rejections with no warmup/sampling observations, not zero-cost measurements.
+Full f64 scans expose two control errors that sampled dots missed. A subsequent
+CPU FMA diagnostic reproduces those GPU bits, separating accumulation error from
+addressing error. Future generic failure messages also identify the variant;
+the four older pointwise two-way records lack that attribution and stay unchanged.
+The pointwise probe spends about three seconds in CPU validation before rejecting:
+the phase breakdown prevents mistaking this for a return of the old readback-copy
+bottleneck. Full-vector checks are executed but vectors are not archived; replay
+cannot retrospectively change their tolerance or inspect an unrecorded element.
+
 ## What we should improve next
 
 The highest-value debugging improvements are typed logical-tensor reads;

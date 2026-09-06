@@ -93,8 +93,12 @@ The [split-K prototype](../experiments/split-k-2026-09-06/README.md) adds an
 explicit bounded plan transformation: shared scalar dW partials followed by
 existing SumRows. The normal memory planner handles their lifetime. Full f64
 oracles and short optimizer trajectories cover qualified fixtures; a long tiny
-partial fails and remains rejected. Sequence measurement and automatic selection
-are still open—there is no split-K speedup claim or default change.
+partial fails and remains rejected. The [isolated sequence follow-up](../experiments/split-k-sequence-2026-09-06/README.md)
+now measures both passes with all scratch charged: eight-way splitting gives a
+6.93× synthetic long-reduction ratio, but both profiled large shapes fail
+qualification before timing. Full scans expose control accumulation errors missed
+by sampled dots. No whole-step gain is established, and no live installation or
+default change is made.
 
 The memory/restore follow-up removes unused Adam allocations, reports actual
 resident tensor-buffer requests, and restores logical checkpoints only after
