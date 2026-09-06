@@ -166,3 +166,31 @@ Do not turn [rejected experiments](../rejected-optimizations.md) into eternal
 prohibitions. Driver versions, shapes, dependency behavior and precision
 contracts change. Retesting needs a reason and a controlled protocol, but an
 old failure is evidence about that experiment, not a proof of impossibility.
+
+## 9. A shared baseline is not an independent oracle
+
+The [September 6 whole-step profiles](../experiments/training-profile-2026-09-06/README.md)
+prioritize convolution derivatives. Reviewing their indexing then uncovered
+a stride-1 dX bug outside same padding. Forward cross-correlation uses
+`ih = oh*stride + kh - padding_h`; inversion requires
+`oh = (ih + padding_h - kh)/stride`, with divisibility/bounds checks. Both
+scalar and generated cooperative paths incorrectly used `kernel_h-1-padding_h`
+while leaving the weight indices unflipped. Width had the same error.
+
+Same padding satisfies `2*padding == kernel-1`, masking this substitution.
+The model profiles' full-state parity therefore passed while a newly added
+unpadded 3×3 f64 oracle failed. The oracle scatters forward contributions
+directly, independently of the kernels' implicit-GEMM gather indexing. Fixing
+the padding expression preserves bindings, geometry, precision and budgets;
+it is not a new performance schedule or a justification to loosen validation.
+
+The regression covers eight shapes, both scalar tiles, full dX/dW and tiny
+upstream derivatives. A separate test requires actual generated cooperative
+execution. On f16-only hardware it uses bounded, exactly representable operands
+to isolate indexing, not to certify f32 derivative range. Native-f32 modules
+validate offline; that is different evidence from native-f32 device execution.
+
+Lesson: full control-session comparisons establish preservation against that
+control, not absolute operator correctness. Independent oracles and unaligned,
+asymmetric, tiny and otherwise uncovered cases are complementary requirements
+before an automatic search can safely choose a faster implementation.

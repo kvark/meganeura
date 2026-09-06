@@ -4415,15 +4415,9 @@ pub fn generate_conv2d_coop_module(
         let _ = writeln!(src, "    let k_total = params.out_channels * KERNEL_HW;");
         src.push_str("    let go_spatial = params.out_h * params.out_w;\n\n");
 
-        // Padding computation for backward
-        let _ = writeln!(
-            src,
-            "    let pad_h = i32(KERNEL_H) - 1 - i32(params.padding_h);"
-        );
-        let _ = writeln!(
-            src,
-            "    let pad_w = i32(KERNEL_W) - 1 - i32(params.padding_w);"
-        );
+        // Invert forward cross-correlation without flipping the weight indices.
+        src.push_str("    let pad_h = i32(params.padding_h);\n");
+        src.push_str("    let pad_w = i32(params.padding_w);\n");
     } else {
         // Forward: M = Co, N = oH*oW, K = Ci*kH*kW
         let _ = writeln!(src, "    let tile_row = wgid.x * {output_tile}u;");
@@ -5888,6 +5882,11 @@ mod tests {
             },
             CoopConfig {
                 tile_size: 16,
+                use_f16_input: false,
+                compensated: false,
+            },
+            CoopConfig {
+                tile_size: 16,
                 use_f16_input: true,
                 compensated: false,
             },
@@ -5901,6 +5900,8 @@ mod tests {
             (3, 3, 1, Conv2dCoopDirection::GradInput),
             (3, 3, 2, Conv2dCoopDirection::Forward),
             (3, 3, 2, Conv2dCoopDirection::GradInput),
+            (2, 4, 1, Conv2dCoopDirection::GradInput),
+            (3, 2, 2, Conv2dCoopDirection::GradInput),
             (5, 5, 1, Conv2dCoopDirection::GradInput),
             (7, 7, 2, Conv2dCoopDirection::Forward),
         ];

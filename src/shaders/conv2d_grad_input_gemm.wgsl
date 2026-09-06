@@ -1,8 +1,9 @@
 // Conv2d backward w.r.t. input via implicit GEMM.
 //
 // grad_input[n] = weight_T @ im2col(grad_out[n])^T
-// where weight_T[ci, co*kH*kW + kh*kW + kw] = weight[co, ci, kh, kw]
-// and im2col of grad_out uses transposed padding (kH-1-pad, kW-1-pad).
+// where weight_T[ci, co*kH*kW + kh*kW + kw] = weight[co, ci, kh, kw].
+// Invert the forward cross-correlation: ih = oh*stride + kh - padding_h.
+// Thus oh = (ih + padding_h - kh)/stride when divisible, without flipping weights.
 //
 // C[Ci, H*W] = A[Ci, K] × B[K, H*W], K = Co*kH*kW, per batch item.
 // BM=64, BN=64, KTILE=16, TM=4, TN=4, workgroup [16,16,1]
@@ -50,9 +51,8 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let m_total = params.in_channels;               // Ci
     let go_spatial = params.out_h * params.out_w;    // oH * oW
 
-    // Transposed padding for the "flipped convolution"
-    let pad_h = i32(params.kernel_h) - 1 - i32(params.padding_h);
-    let pad_w = i32(params.kernel_w) - 1 - i32(params.padding_w);
+    let pad_h = i32(params.padding_h);
+    let pad_w = i32(params.padding_w);
 
     $ACC_DECL
 
