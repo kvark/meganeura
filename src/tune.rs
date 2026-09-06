@@ -315,12 +315,16 @@ pub enum TuneDecision {
 
 /// Non-overlapping host wall-time phases within one candidate comparison.
 /// `None` means the phase was not reached; an early exit records partial time.
-/// Their sum excludes final decision bookkeeping and scratch destruction.
+/// Their sum excludes final decision bookkeeping. Historical reports did not
+/// measure cleanup; missing measurements are not zero cost.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TunePhaseTimes {
     /// Legality/budget checks, pipeline setup, scratch allocation and bindings.
     /// Includes [`TuneOutcome::compile_time`]; do not add that timer again.
     pub preparation: Option<Duration>,
+    /// Nested accounting, already inside `preparation`.
+    #[serde(default)]
+    pub preparation_breakdown: Option<TunePreparationTimes>,
     /// Input generation, uploads, trial dispatches, readbacks and CPU checks.
     pub qualification: Option<Duration>,
     /// Nested accounting, already inside `qualification`; never add it twice.
@@ -332,6 +336,25 @@ pub struct TunePhaseTimes {
     /// Paired timing loop, including incomplete/discarded pairs and host checks.
     /// Not the sum of accepted per-dispatch samples or GPU timestamp duration.
     pub sampling: Option<Duration>,
+    /// Destruction of the private comparison resources, including early exits.
+    #[serde(default)]
+    pub cleanup: Option<Duration>,
+}
+
+/// Disjoint host wall times within preparation, not GPU timestamps.
+/// `None` means historical/unreached work; repeated operations accumulate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TunePreparationTimes {
+    pub checks: Option<Duration>,
+    /// Same measurement as [`TuneOutcome::compile_time`]; do not add it twice.
+    pub pipelines: Option<Duration>,
+    /// Candidate binding allocations with matching memory placement.
+    pub buffers: Option<Duration>,
+    /// The private upload/readback allocation.
+    pub staging: Option<Duration>,
+    pub encoder: Option<Duration>,
+    /// Dispatch cloning, geometry and pipeline lookup, not GPU execution.
+    pub bindings: Option<Duration>,
 }
 
 /// Accumulated, disjoint host wall times within qualification, not GPU timestamps.
@@ -666,7 +689,12 @@ mod tests {
         let mut outcome = outcome();
         outcome.phase_times = Some(TunePhaseTimes {
             preparation: Some(Duration::from_millis(3)),
+            preparation_breakdown: Some(TunePreparationTimes {
+                buffers: Some(Duration::from_millis(1)),
+                ..Default::default()
+            }),
             qualification: Some(Duration::ZERO),
+            cleanup: Some(Duration::from_millis(1)),
             qualification_breakdown: Some(TuneQualificationTimes {
                 upload_host_copy: Some(Duration::ZERO),
                 ..Default::default()
@@ -676,6 +704,12 @@ mod tests {
         let mut json = serde_json::to_value(&outcome).unwrap();
         let restored: TuneOutcome = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(restored.phase_times, outcome.phase_times);
+        for key in ["preparation_breakdown", "cleanup"] {
+            json["phase_times"].as_object_mut().unwrap().remove(key);
+        }
+        let older: TuneOutcome = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(older.phase_times.unwrap().preparation_breakdown, None);
+        assert_eq!(older.phase_times.unwrap().cleanup, None);
         json["phase_times"]
             .as_object_mut()
             .unwrap()

@@ -95,7 +95,23 @@ fn tune_preserves_correctness() {
         let warmup = phases.warmup.unwrap();
         let sampling = phases.sampling.unwrap();
         assert!(o.compile_time <= preparation);
-        assert!(preparation + qualification + warmup + sampling <= o.elapsed);
+        assert!(
+            preparation + qualification + warmup + sampling + phases.cleanup.unwrap() <= o.elapsed
+        );
+        let prep = phases.preparation_breakdown.unwrap();
+        assert_eq!(prep.pipelines.unwrap(), o.compile_time);
+        let sum: Duration = [
+            prep.checks,
+            prep.pipelines,
+            prep.buffers,
+            prep.staging,
+            prep.encoder,
+            prep.bindings,
+        ]
+        .into_iter()
+        .map(Option::unwrap)
+        .sum();
+        assert!(sum <= preparation);
         assert!(!qualification.is_zero() && !sampling.is_zero());
         let detail = phases.qualification_breakdown.unwrap();
         let parts = [
@@ -335,6 +351,11 @@ fn tune_budget_skips_leave_selection_unchanged() {
             assert_eq!(phases.qualification, None);
             assert_eq!(phases.warmup, None);
             assert_eq!(phases.sampling, None);
+            assert_eq!(phases.cleanup, None);
+            let preparation = phases.preparation_breakdown.unwrap();
+            assert!(preparation.checks.is_some());
+            assert_eq!(preparation.buffers, None);
+            assert_eq!(preparation.staging, None);
         }
     }
 }

@@ -1,7 +1,7 @@
 use super::{Gpu, Pipelines, Session, Variant, ensure_device_memory_budget};
 use crate::compile::{BufferRef, Dispatch, ShaderEntry};
 use crate::tune::{
-    MatmulTile, TuneClass, TuneDecision, TuneError, TuneOptions, TuneOutcome,
+    MatmulTile, TuneClass, TuneDecision, TuneError, TuneOptions, TuneOutcome, TunePreparationTimes,
     TuneQualificationTimes, TuneReport, TuneStaging, decide, measure_pairs,
 };
 use blade_graphics as bg;
@@ -400,6 +400,9 @@ impl Session {
             .as_mut()
             .expect("new outcome has phase timers");
         let preparation = PhaseTimer::new(&mut phases.preparation);
+        phases.preparation_breakdown = Some(Default::default());
+        let prep = phases.preparation_breakdown.as_mut().unwrap();
+        let checks = PhaseTimer::new(&mut prep.checks);
         let logical_sizes = class
             .key
             .buffer_sizes()
@@ -432,16 +435,18 @@ impl Session {
             outcome.decision = TuneDecision::DeviceMemoryBudget;
             return;
         }
+        drop(checks);
         for tile in [outcome.initial, outcome.candidate] {
             if start.elapsed() >= options.max_time {
                 outcome.decision = TuneDecision::TimeBudget;
                 return;
             }
-            let compile_start = Instant::now();
-            let compiled = self
-                .pipelines
-                .ensure_tune_tile(&self.gpu, &class.key.shader, tile);
-            outcome.compile_time += compile_start.elapsed();
+            let compiled = {
+                let _timer = PhaseTimer::new(&mut prep.pipelines);
+                self.pipelines
+                    .ensure_tune_tile(&self.gpu, &class.key.shader, tile)
+            };
+            outcome.compile_time = prep.pipelines.unwrap();
             if let Err(error) = compiled {
                 outcome.decision = TuneDecision::ShaderRejected;
                 outcome.failure = Some(format!("{tile:?}: {error}"));
@@ -452,7 +457,16 @@ impl Session {
             outcome.decision = TuneDecision::TimeBudget;
             return;
         }
-        let mut scratch = Scratch::new(&self.gpu, &class.key, &sizes, bytes, options.staging);
+        let mut scratch = Scratch::new(
+            &self.gpu,
+            &class.key,
+            &sizes,
+            bytes,
+            options.staging,
+            prep,
+            &mut phases.cleanup,
+        );
+        let bindings = PhaseTimer::new(&mut prep.bindings);
         let mut dispatch = self.plan.dispatches[class.members[0]].clone();
         dispatch.input_buffers = (0..sizes.len() - 1).map(|i| BufferRef(i as u32)).collect();
         dispatch.output_buffer = BufferRef((sizes.len() - 1) as u32);
@@ -463,6 +477,7 @@ impl Session {
             &self.pipelines.map[&tile_variant(&class.key.shader, outcome.initial)],
             &self.pipelines.map[&tile_variant(&class.key.shader, outcome.candidate)],
         ];
+        drop(bindings);
         drop(preparation);
         phases.qualification_breakdown = Some(Default::default());
         let details = phases.qualification_breakdown.as_mut().unwrap();
@@ -552,6 +567,7 @@ impl Session {
                     .then_some(ms / options.dispatches_per_sample as f64)
             });
         drop(sampling);
+        drop(scratch);
         decide(outcome, options);
     }
 }
@@ -568,6 +584,7 @@ struct Scratch<'a> {
     staging: bg::Buffer,
     output_elements: usize,
     encoder: bg::CommandEncoder,
+    cleanup: &'a mut Option<Duration>,
 }
 
 impl<'a> Scratch<'a> {
@@ -577,8 +594,13 @@ impl<'a> Scratch<'a> {
         sizes: &[usize],
         bytes: usize,
         staging: TuneStaging,
+        preparation: &mut TunePreparationTimes,
+        cleanup: &'a mut Option<Duration>,
     ) -> Self {
+        let checks = PhaseTimer::new(&mut preparation.checks);
         ensure_device_memory_budget(gpu, bytes, "matmul tuning scratch");
+        drop(checks);
+        let buffers_time = PhaseTimer::new(&mut preparation.buffers);
         let buffers = sizes
             .iter()
             .enumerate()
@@ -595,6 +617,8 @@ impl<'a> Scratch<'a> {
                 })
             })
             .collect();
+        drop(buffers_time);
+        let staging_time = PhaseTimer::new(&mut preparation.staging);
         let staging = gpu.create_buffer(bg::BufferDesc {
             name: "tune_staging",
             size: *sizes.iter().max().unwrap() as u64,
@@ -603,17 +627,21 @@ impl<'a> Scratch<'a> {
                 TuneStaging::Download => bg::Memory::Download,
             },
         });
+        drop(staging_time);
+        let encoder_time = PhaseTimer::new(&mut preparation.encoder);
         let encoder = gpu.create_command_encoder(bg::CommandEncoderDesc {
             name: "matmul_tune",
             buffer_count: 1,
             manual_barriers: false,
         });
+        drop(encoder_time);
         Self {
             gpu,
             buffers,
             staging,
             output_elements: class.m as usize * class.n as usize,
             encoder,
+            cleanup,
         }
     }
 
@@ -676,6 +704,7 @@ impl<'a> Scratch<'a> {
 
 impl Drop for Scratch<'_> {
     fn drop(&mut self) {
+        let _timer = PhaseTimer::new(self.cleanup);
         self.gpu.destroy_command_encoder(&mut self.encoder);
         self.gpu.destroy_buffer(self.staging);
         for buffer in self.buffers.drain(..) {
@@ -1032,7 +1061,17 @@ mod tests {
                     .map(|i| f32::from_bits(patterns[i % patterns.len()]))
                     .collect();
                 for staging in [TuneStaging::Shared, TuneStaging::Download] {
-                    let mut scratch = Scratch::new(&gpu, &class, &sizes, bytes, staging);
+                    let mut prep = TunePreparationTimes::default();
+                    let mut cleanup = None;
+                    let mut scratch = Scratch::new(
+                        &gpu,
+                        &class,
+                        &sizes,
+                        bytes,
+                        staging,
+                        &mut prep,
+                        &mut cleanup,
+                    );
                     let mut times = TuneQualificationTimes::default();
                     scratch.upload(sizes.len() - 1, &data, Some(&mut times));
                     let read = scratch.read_output(&mut times);
@@ -1052,6 +1091,8 @@ mod tests {
                     }
                     assert_eq!(times.validation, None);
                     assert_eq!(times.dispatch, None);
+                    drop(scratch);
+                    assert!(cleanup.is_some_and(|time| !time.is_zero()));
                 }
             }
         }

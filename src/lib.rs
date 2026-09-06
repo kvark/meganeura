@@ -68,5 +68,5 @@ pub use train::{
 };
 pub use tune::{
     MatmulTile, TuneClass, TuneDecision, TuneError, TuneOptions, TunePhaseTimes,
-    TuneQualificationTimes, TuneReport, TuneStaging,
+    TunePreparationTimes, TuneQualificationTimes, TuneReport, TuneStaging,
 };
