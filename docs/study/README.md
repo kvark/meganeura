@@ -89,6 +89,13 @@ by only about 2%; most of the preceding correctness-repair cost remains.
 Short-case instability, including two much slower Whisper after-blocks, is
 retained. This is neither a new paper result nor a reason to weaken validation.
 
+The [split-K prototype](../experiments/split-k-2026-09-06/README.md) adds an
+explicit bounded plan transformation: shared scalar dW partials followed by
+existing SumRows. The normal memory planner handles their lifetime. Full f64
+oracles and short optimizer trajectories cover qualified fixtures; a long tiny
+partial fails and remains rejected. Sequence measurement and automatic selection
+are still open—there is no split-K speedup claim or default change.
+
 The memory/restore follow-up removes unused Adam allocations, reports actual
 resident tensor-buffer requests, and restores logical checkpoints only after
 whole-file preflight. Read the [checkpoint and memory chapter](checkpoints-and-memory.md)

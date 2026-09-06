@@ -1906,9 +1906,10 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::Conv2dGradInputGemm
         | ShaderEntry::Conv2dGradInputGemmSmall
         | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => Conv2dGradInputData::layout(),
-        ShaderEntry::Conv2dGradWeightGemm | ShaderEntry::Conv2dGradWeightGemmSmall => {
-            Conv2dGradWeightData::layout()
-        }
+        ShaderEntry::Conv2dGradWeightGemm
+        | ShaderEntry::Conv2dGradWeightGemmSmall
+        | ShaderEntry::Conv2dGradWeightGemmSplit
+        | ShaderEntry::Conv2dGradWeightGemmSplitSmall => Conv2dGradWeightData::layout(),
         ShaderEntry::RoPEDynamic => RoPEDynamicData::layout(),
         ShaderEntry::CacheWrite => CacheWriteData::layout(),
         ShaderEntry::CachedAttention => CachedAttentionData::layout(),
@@ -3580,6 +3581,55 @@ mod variant_tests {
                 3,
                 HorizMatMulKind::CoopCompensated
             )]
+        );
+    }
+}
+
+#[cfg(test)]
+mod split_k_tests {
+    use super::{BufferRef, Dispatch, ShaderEntry, compute_groups, reorder_by_level};
+
+    #[test]
+    fn split_sequences_get_barriers_and_reuse_nonoverlapping_partials() {
+        let mut plan = crate::compile::compile(&crate::Graph::new());
+        let bytes = 33 * 33 * 4;
+        plan.buffers = vec![bytes; 4];
+        plan.input_buffers = vec![
+            ("upstream".into(), BufferRef(0)),
+            ("input".into(), BufferRef(1)),
+        ];
+        plan.output_buffers = vec![BufferRef(2), BufferRef(3)];
+        let first = Dispatch {
+            shader: ShaderEntry::Conv2dGradWeightGemmSmall,
+            workgroups: [2, 2, 1],
+            input_buffers: vec![BufferRef(0), BufferRef(1)],
+            output_buffer: BufferRef(2),
+            params: vec![1, 33, 1, 33, 33, 1, 1, 1, 0, 1, 33, 0],
+            requires_full_precision: true,
+            ..Default::default()
+        };
+        let mut second = first.clone();
+        second.input_buffers[1] = BufferRef(2);
+        second.output_buffer = BufferRef(3);
+        plan.dispatches = vec![first, second];
+        assert_eq!(
+            plan.split_conv_weight_gradients(&[(0, 2), (1, 2)], bytes * 4),
+            Ok(bytes * 4)
+        );
+        reorder_by_level(&mut plan.dispatches);
+        let groups = compute_groups(&plan.dispatches);
+        assert_eq!(groups, [0..1, 1..2, 2..3, 3..4]);
+        let alias = crate::memplan::plan_buffer_aliasing(&plan, &groups, None);
+        assert_eq!(alias.map[4], alias.map[5]);
+        assert_eq!(alias.sizes[alias.map[4]], bytes * 2);
+        assert!(alias.device_local[alias.map[4]]);
+        for i in 0..4 {
+            assert_ne!(alias.map[i], alias.map[4]);
+        }
+        let no_alias = crate::memplan::plan_no_alias(&plan, &groups, None);
+        assert_eq!(
+            no_alias.physical_bytes() - alias.physical_bytes(),
+            bytes * 2
         );
     }
 }
@@ -6468,7 +6518,10 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::Conv2dGradWeightGemm | ShaderEntry::Conv2dGradWeightGemmSmall => {
+            ShaderEntry::Conv2dGradWeightGemm
+            | ShaderEntry::Conv2dGradWeightGemmSmall
+            | ShaderEntry::Conv2dGradWeightGemmSplit
+            | ShaderEntry::Conv2dGradWeightGemmSplitSmall => {
                 pc.bind(
                     0,
                     &Conv2dGradWeightData {

@@ -3,6 +3,8 @@ use crate::schedule::{PointwiseDAG, Pw, ReductionEpilogue, ReductionKernel};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+mod split_k;
+
 /// Weight storage format for matmul B operands.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WeightFormat {
@@ -230,6 +232,9 @@ pub enum ShaderEntry {
     Conv2dGradInputGemmCoopGen(u32, u32, u32),
     Conv2dGradWeightGemm,
     Conv2dGradWeightGemmSmall,
+    /// Split reduction tiles into `[split, Co, Ci*Kh*Kw]` partials for SumRows.
+    Conv2dGradWeightGemmSplit,
+    Conv2dGradWeightGemmSplitSmall,
     CacheWrite,
     CachedAttention,
     RoPEDynamic,
@@ -299,6 +304,8 @@ impl ShaderEntry {
             | ShaderEntry::Conv2dGradInputGemmCoopGen(..)
             | ShaderEntry::Conv2dGradWeightGemm
             | ShaderEntry::Conv2dGradWeightGemmSmall
+            | ShaderEntry::Conv2dGradWeightGemmSplit
+            | ShaderEntry::Conv2dGradWeightGemmSplitSmall
             | ShaderEntry::Upsample2x
             | ShaderEntry::Upsample2xGrad
             | ShaderEntry::MaxPool2d
@@ -454,6 +461,10 @@ impl ShaderEntry {
             ShaderEntry::Conv2dGradInputGemmCoopGen(..) => ShaderGroup::Conv2dGradInputGemmCoop,
             ShaderEntry::Conv2dGradWeightGemm => ShaderGroup::Conv2dGradWeightGemm,
             ShaderEntry::Conv2dGradWeightGemmSmall => ShaderGroup::Conv2dGradWeightGemmSmall,
+            ShaderEntry::Conv2dGradWeightGemmSplit => ShaderGroup::Conv2dGradWeightGemmSplit,
+            ShaderEntry::Conv2dGradWeightGemmSplitSmall => {
+                ShaderGroup::Conv2dGradWeightGemmSplitSmall
+            }
             ShaderEntry::CacheWrite => ShaderGroup::CacheWrite,
             ShaderEntry::CachedAttention => ShaderGroup::CachedAttention,
             ShaderEntry::RoPEDynamic => ShaderGroup::RoPEDynamic,
@@ -553,7 +564,10 @@ impl ShaderEntry {
             ShaderEntry::Conv2dGradInputGemm
             | ShaderEntry::Conv2dGradInputGemmSmall
             | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => "main",
-            ShaderEntry::Conv2dGradWeightGemm | ShaderEntry::Conv2dGradWeightGemmSmall => "main",
+            ShaderEntry::Conv2dGradWeightGemm
+            | ShaderEntry::Conv2dGradWeightGemmSmall
+            | ShaderEntry::Conv2dGradWeightGemmSplit
+            | ShaderEntry::Conv2dGradWeightGemmSplitSmall => "main",
             ShaderEntry::CacheWrite => "main",
             ShaderEntry::CachedAttention => "main",
             ShaderEntry::RoPEDynamic => "main",

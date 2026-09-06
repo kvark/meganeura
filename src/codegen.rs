@@ -423,6 +423,8 @@ pub enum ShaderGroup {
     WinogradWeightTransform,
     Conv2dGradWeightGemm,
     Conv2dGradWeightGemmSmall,
+    Conv2dGradWeightGemmSplit,
+    Conv2dGradWeightGemmSplitSmall,
     CacheWrite,
     CachedAttention,
     RoPEDynamic,
@@ -545,14 +547,12 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::WinogradWeightTransform => {
             parse_wgsl(include_str!("shaders/winograd_weight_transform.wgsl"))
         }
-        ShaderGroup::Conv2dGradWeightGemm => conv_gemm_tiled(
-            include_str!("shaders/conv2d_grad_weight_gemm.wgsl"),
-            MatMulTile::Large,
-        ),
-        ShaderGroup::Conv2dGradWeightGemmSmall => conv_gemm_tiled(
-            include_str!("shaders/conv2d_grad_weight_gemm.wgsl"),
-            MatMulTile::Small,
-        ),
+        ShaderGroup::Conv2dGradWeightGemm => conv_grad_weight_tiled(MatMulTile::Large, false),
+        ShaderGroup::Conv2dGradWeightGemmSmall => conv_grad_weight_tiled(MatMulTile::Small, false),
+        ShaderGroup::Conv2dGradWeightGemmSplit => conv_grad_weight_tiled(MatMulTile::Large, true),
+        ShaderGroup::Conv2dGradWeightGemmSplitSmall => {
+            conv_grad_weight_tiled(MatMulTile::Small, true)
+        }
         ShaderGroup::CacheWrite => parse_wgsl(include_str!("shaders/cache_write.wgsl")),
         ShaderGroup::CachedAttention => parse_wgsl(include_str!("shaders/cached_attention.wgsl")),
         ShaderGroup::RoPEDynamic => parse_wgsl(include_str!("shaders/rope_dynamic.wgsl")),
@@ -876,6 +876,36 @@ fn conv_gemm_tiled(src: &str, tile: MatMulTile) -> ShaderModule {
         ],
     );
     parse_wgsl(&src)
+}
+
+fn conv_grad_weight_tiled(tile: MatMulTile, split_k: bool) -> ShaderModule {
+    let (counts, range, start, end, offset) = if split_k {
+        (
+            ", @builtin(num_workgroups) counts: vec3<u32>",
+            "let tiles = (k_total + 15u) / 16u;\n\
+             let per_split = tiles / counts.z;\n\
+             let extra = tiles - per_split * counts.z;\n\
+             let first = wgid.z * per_split + min(wgid.z, extra);\n\
+             let last = first + per_split + u32(wgid.z < extra);\n\
+             let k_end = min(last * 16u, k_total);",
+            "first * 16u",
+            "k_end",
+            "wgid.z * m_total * n_total + ",
+        )
+    } else {
+        ("", "", "0u", "k_total", "")
+    };
+    let source = preprocess(
+        include_str!("shaders/conv2d_grad_weight_gemm.wgsl"),
+        &[
+            ("$COUNTS", counts),
+            ("$K_RANGE", range),
+            ("$K_START", start),
+            ("$K_END", end),
+            ("$OUTPUT_OFFSET", offset),
+        ],
+    );
+    conv_gemm_tiled(&source, tile)
 }
 
 /// Shared unroll generator for every register-tiled GEMM skeleton
@@ -5090,6 +5120,19 @@ fn emit_forward_im2col_stage(
 mod tests {
     use super::*;
 
+    #[test]
+    fn ordinary_weight_gradients_have_no_split_partition_logic() {
+        for tile in [MatMulTile::Small, MatMulTile::Large] {
+            let ordinary = conv_grad_weight_tiled(tile, false);
+            assert!(!ordinary.source.contains("num_workgroups"));
+            assert!(!ordinary.source.contains("k_end"));
+            assert!(ordinary.source.contains("var t = 0u;"));
+            let split = conv_grad_weight_tiled(tile, true);
+            assert!(split.source.contains("num_workgroups"));
+            assert!(split.source.contains("var t = first * 16u;"));
+        }
+    }
+
     /// Verify every shader group generates a valid Naga module.
     #[test]
     fn all_shaders_generate_valid_modules() {
@@ -5169,6 +5212,22 @@ mod tests {
                 naga::valid::Capabilities::empty(),
             ),
             (ShaderGroup::SumRows, naga::valid::Capabilities::empty()),
+            (
+                ShaderGroup::Conv2dGradWeightGemm,
+                naga::valid::Capabilities::empty(),
+            ),
+            (
+                ShaderGroup::Conv2dGradWeightGemmSmall,
+                naga::valid::Capabilities::empty(),
+            ),
+            (
+                ShaderGroup::Conv2dGradWeightGemmSplit,
+                naga::valid::Capabilities::empty(),
+            ),
+            (
+                ShaderGroup::Conv2dGradWeightGemmSplitSmall,
+                naga::valid::Capabilities::empty(),
+            ),
             (ShaderGroup::RmsNormGrad, naga::valid::Capabilities::empty()),
             (
                 ShaderGroup::RmsNormGradWRowPar,
@@ -5507,6 +5566,10 @@ mod tests {
             (ShaderGroup::SwiGLUGrad, empty),
             (ShaderGroup::SwiGLUConcat, empty),
             (ShaderGroup::SumRows, empty),
+            (ShaderGroup::Conv2dGradWeightGemm, empty),
+            (ShaderGroup::Conv2dGradWeightGemmSmall, empty),
+            (ShaderGroup::Conv2dGradWeightGemmSplit, empty),
+            (ShaderGroup::Conv2dGradWeightGemmSplitSmall, empty),
             (ShaderGroup::RmsNormGrad, empty),
             (ShaderGroup::RmsNormGradWRowPar, empty),
             (ShaderGroup::ScatterAdd, empty),
@@ -5711,7 +5774,10 @@ mod tests {
                 | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => {
                     vec!["grad_out", "weight", "dst", "params"]
                 }
-                ShaderEntry::Conv2dGradWeightGemm | ShaderEntry::Conv2dGradWeightGemmSmall => {
+                ShaderEntry::Conv2dGradWeightGemm
+                | ShaderEntry::Conv2dGradWeightGemmSmall
+                | ShaderEntry::Conv2dGradWeightGemmSplit
+                | ShaderEntry::Conv2dGradWeightGemmSplitSmall => {
                     vec!["grad_out", "src", "dst", "params"]
                 }
                 ShaderEntry::RoPEDynamic => vec!["src", "dst", "pos_offset_buf", "params"],
@@ -5816,6 +5882,10 @@ mod tests {
             ShaderEntry::Conv2dGemmSmall,
             ShaderEntry::Conv2dGradInputGemm,
             ShaderEntry::Conv2dGradInputGemmSmall,
+            ShaderEntry::Conv2dGradWeightGemm,
+            ShaderEntry::Conv2dGradWeightGemmSmall,
+            ShaderEntry::Conv2dGradWeightGemmSplit,
+            ShaderEntry::Conv2dGradWeightGemmSplitSmall,
             ShaderEntry::WinogradInputTransform,
             ShaderEntry::WinogradOutputTransform,
             ShaderEntry::WinogradBatchedMatMul,

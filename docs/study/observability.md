@@ -441,6 +441,18 @@ independent f64 oracle first reproduced a width-41 dW error; the shared integer
 indexing repair then passes all full-output regressions. Raw digests cannot
 replace missing vectors for numerical reanalysis.
 
+The [split-K plan prototype](../experiments/split-k-2026-09-06/README.md) makes
+another distinction visible: one logical dW now has a partial producer and a
+SumRows consumer. Both retain its origin; labels identify the two passes. The
+logical node still reads the **final** gradient. To inspect partials, retain a
+diagnostic `no_alias` plan and read its producer output buffer after completion;
+ordinary alias reuse can overwrite that temporary later in the step. Do not
+treat its buffer index as a persistent graph-node identity. CPU/GPU profiling
+must include the final reduction even though its family is not convolution.
+Independent f64 checks exposed a long tiny-gradient partial error that final
+gradient parity alone would miss. That partition count remains unqualified;
+observing a plausible final tensor does not make every intermediate correct.
+
 ## What we should improve next
 
 The highest-value debugging improvements are typed logical-tensor reads;

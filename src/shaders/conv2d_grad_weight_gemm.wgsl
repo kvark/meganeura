@@ -35,7 +35,7 @@ var<workgroup> shared_a: array<f32, $SHARED_SIZE>;   // A tile: [64, 16]
 var<workgroup> shared_b: array<f32, $SHARED_SIZE>;   // B tile: [16, 64]
 
 @compute @workgroup_size(16, 16)
-fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>$COUNTS) {
     let tx = lid.x;
     let ty = lid.y;
     let tile_row = wgid.y * $BM_U;   // M (Co) tile start
@@ -51,9 +51,10 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
 
     $ACC_DECL
 
-    var t = 0u;
+    $K_RANGE
+    var t = $K_START;
     loop {
-        if t >= k_total { break; }
+        if t >= $K_END { break; }
 
         // Load A tile: grad_out_flat[Co, N*oH*oW] → shared_a[64, 16]
         // A[co, n*oH*oW + oh*oW + ow] = grad_out[n, co, oh, ow]
@@ -124,7 +125,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             let co = tile_row + ty * $TM_U + i;
             let cikk = tile_col + tx * $TM_U + j;
             if co < m_total && cikk < n_total {
-                dst[co * n_total + cikk] = s[i][j];
+                dst[$OUTPUT_OFFSET co * n_total + cikk] = s[i][j];
             }
         }
     }

@@ -143,8 +143,11 @@ Most of the original cost remains. Whisper's first two candidate after-blocks
 deteriorate sharply; the cohort does not establish short-case stability or
 no regression. Do not confuse these sequential source pairs with tuned
 interleaved comparisons, or change the 5%+2MAD decision guard to accommodate them.
-Exact-arithmetic lowering, short-case timing stability and bounded split-K dW
-with existing SumRows are still distinct engineering opportunities.
+Exact-arithmetic lowering and short-case timing stability remain open. The
+[bounded split-K prototype](../experiments/split-k-2026-09-06/README.md) now lowers
+explicit dW selections to partials plus existing SumRows before session allocation.
+Its legality, full/partial f64 oracles and short optimizer trajectories are tested;
+automatic sequence qualification/measurement and whole-step confirmation remain open.
 
 The former small-tile occupancy cutoff is now an **initial choice**, not a
 profitability veto for eligible tuned classes: either tile can win. Untuned,
@@ -353,17 +356,26 @@ dispatch. Those twelve cases remain archived and disqualified. The public
 helper now rejects malformed operand shapes, and the runner requires nonzero
 training signals and actual parameter updates. Independent full f64 scatter
 oracles now cover forward outputs, fourteen scalar shapes and both tiles
-before/after search, ordinary/tiny gradients, state isolation and budget skips. Distinct-state
-Adam swaps cover subsequent accumulation/clipping updates as well.
-The long-reduction, small-output dW classes motivate the next bounded split-K
-candidate, including its partial storage and final reduction. It needs a small
-extension from one dispatch to a candidate sequence with explicit scratch
-lifetime: the current geometry-only swap promises a fixed allocation plan.
-Reuse class keys, qualification, decision logic and the existing SumRows kernel
-for `[split, M*N]` partials; do not hide persistent partials outside the budget
-or create another tuner. Keep these measured choices about algebra, not model
-names. Do not infer that cross-call pools, larger budgets or weaker checks
-follow from this result. Cheaper search by itself provides no new kernel
+before/after search, ordinary/tiny gradients, state isolation and budget skips.
+Distinct-state Adam swaps cover subsequent accumulation/clipping updates as well.
+
+The long-reduction, small-output dW classes motivate bounded split-K. An explicit
+plan-before-allocation lowering now shares the scalar template and existing
+SumRows for `[split, M*N]` partials, with all-or-nothing legality/byte preflight.
+Ordinary scheduler edges enforce the final reduction and permit lifetime-based
+partial reuse. It is not a live-tuner choice: the geometry-only swap still promises
+fixed allocations. The next extension is isolated candidate-sequence qualification
+and timing with complete scratch accounting, reusing class keys and decision logic,
+followed by whole-step confirmation across rebuilt plans. Do not hide partials
+outside the budget or create another tuner. Full f64 checks and short SGD/Adam
+trajectories pass for the tested short fixtures; a long tiny-gradient three-way
+partial fails the unchanged gate even though the final gradient passes. The
+[prototype record](../experiments/split-k-2026-09-06/README.md) retains that rejection;
+there are no split-K timing results or default changes yet.
+
+Keep these choices about algebra, not model names. Do not infer that cross-call
+pools, larger budgets or weaker checks follow from this result. Cheaper search
+by itself provides no new kernel
 algorithms and does not turn MLP's earlier inconclusive whole-step ratios into
 a training gain. Tuning remains opt-in.
 

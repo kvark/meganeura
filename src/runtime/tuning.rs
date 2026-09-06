@@ -314,7 +314,7 @@ impl Session {
     ///
     /// Forward MatMul+Add and unpacked NCHW scalar convolution dX/dW are supported;
     /// convolution keys include batch, channels, spatial extents, kernel, stride
-    /// and padding. Index decomposition uses exact integer division.
+    /// and padding. Index decomposition uses exact integer arithmetic.
     /// Forward/cooperative convolutions remain excluded.
     /// Other prologues/epilogues, horizontal
     /// packs, f16-input cooperative, reduced-storage, GEMV and overlapping-binding

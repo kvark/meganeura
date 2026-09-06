@@ -546,12 +546,21 @@ Short: it changes both the reduction order and the execution plan.
 
 Detail: splitting a long contraction creates more independent workgroups, but
 also writes partial results and launches a reduction before consumers run.
-Those bytes, barriers and dispatch costs belong to the candidate. Our current
-tile search changes geometry with identical live allocations, so it needs an
-explicit bounded sequence/scratch contract before supporting split-K. Reuse
-qualification and selection, use the existing deterministic f32 SumRows reduction,
-and test tiny gradients and subsequent optimizer updates. More parallelism alone
-is not a win.
+Those bytes, barriers and dispatch costs belong to the candidate. The explicit
+prototype now partitions the existing scalar dW template into `[split,M,N]`
+partials and uses existing f32 SumRows to write the original gradient. It runs
+as a plan transformation before allocation, with an all-or-nothing logical-byte
+cap; ordinary scheduling and memory reuse handle the intermediate lifetime.
+Labels/origins preserve attribution, but profiling only the convolution family
+would miss the final generic reduction.
+
+Full independent f64 partial/final oracles and short SGD/Adam trajectories test
+the sequence. A long tiny-gradient three-way partial fails the unchanged accuracy
+gate even though its final gradient passes: it remains unqualified. The live
+tile search still cannot change allocation layouts. Bounded isolated sequence
+measurement and rebuilt-session whole-step confirmation come next; there is no
+automatic selection or split-K performance claim yet. More parallelism alone is
+not a win. [Implementation and rejection](../experiments/split-k-2026-09-06/README.md).
 
 ## Talk outline
 
