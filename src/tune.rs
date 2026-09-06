@@ -296,6 +296,23 @@ pub enum TuneDecision {
     ShaderRejected,
 }
 
+/// Non-overlapping host wall-time phases within one candidate comparison.
+/// `None` means the phase was not reached; an early exit records partial time.
+/// Their sum excludes final decision bookkeeping and scratch destruction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TunePhaseTimes {
+    /// Legality/budget checks, pipeline setup, scratch allocation and bindings.
+    /// Includes [`TuneOutcome::compile_time`]; do not add that timer again.
+    pub preparation: Option<Duration>,
+    /// Input generation, uploads, trial dispatches, readbacks and CPU checks.
+    pub qualification: Option<Duration>,
+    /// Restoring ordinary-magnitude scratch inputs and warming both variants.
+    pub warmup: Option<Duration>,
+    /// Paired timing loop, including incomplete/discarded pairs and host checks.
+    /// Not the sum of accepted per-dispatch samples or GPU timestamp duration.
+    pub sampling: Option<Duration>,
+}
+
 /// Evidence for one candidate comparison within an exact class. Times are
 /// batched scratch wall times per dispatch, not GPU timestamps or predicted
 /// whole-step latency.
@@ -313,6 +330,10 @@ pub struct TuneOutcome {
     /// Total comparison cost, including pipeline setup, qualification and timing.
     pub elapsed: Duration,
     pub compile_time: Duration,
+    /// Phase accounting is absent in reports written before this instrumentation.
+    /// Never reinterpret missing historical measurements as zero-cost phases.
+    #[serde(default)]
+    pub phase_times: Option<TunePhaseTimes>,
     pub baseline_ms: Vec<f64>,
     pub candidate_ms: Vec<f64>,
     pub baseline_median_ms: Option<f64>,
@@ -515,6 +536,7 @@ mod tests {
             failure: None,
             elapsed: Duration::ZERO,
             compile_time: Duration::ZERO,
+            phase_times: None,
             baseline_ms: vec![10.0; 6],
             candidate_ms: vec![8.0; 6],
             baseline_median_ms: None,
@@ -594,6 +616,22 @@ mod tests {
         );
         assert_eq!(restored.options.max_time, report.options.max_time);
         assert_eq!(restored.outcomes[0].class, report.outcomes[0].class);
+    }
+
+    #[test]
+    fn phase_times_distinguish_legacy_missing_unreached_and_measured() {
+        let mut outcome = outcome();
+        outcome.phase_times = Some(TunePhaseTimes {
+            preparation: Some(Duration::from_millis(3)),
+            qualification: Some(Duration::ZERO),
+            ..Default::default()
+        });
+        let mut json = serde_json::to_value(&outcome).unwrap();
+        let restored: TuneOutcome = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(restored.phase_times, outcome.phase_times);
+        json.as_object_mut().unwrap().remove("phase_times");
+        let legacy: TuneOutcome = serde_json::from_value(json).unwrap();
+        assert_eq!(legacy.phase_times, None);
     }
 
     fn native_config(tile_size: u32) -> CoopConfig {

@@ -66,4 +66,6 @@ pub use train::{
     TrainConfig, TrainHistory, Trainer, build, build_inference_session, build_session,
     build_session_unoptimized, compile_training_graph,
 };
-pub use tune::{MatmulTile, TuneClass, TuneDecision, TuneError, TuneOptions, TuneReport};
+pub use tune::{
+    MatmulTile, TuneClass, TuneDecision, TuneError, TuneOptions, TunePhaseTimes, TuneReport,
+};

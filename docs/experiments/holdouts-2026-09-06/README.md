@@ -238,3 +238,10 @@ prints the aggregate table values and retains the unchanged-control example
 as a regression. It cannot reconstruct omitted full vectors or independently
 prove GPU execution from JSON. Both this cohort and the prior pilot are in
 CPU CI; frozen publication artifacts remain byte-identical.
+
+Post-measurement engineering: new reports now include `TuneOutcome.phase_times`
+for preparation, qualification, warmup and sampling, including partial early
+exits. This responds to the unexplained search-cost gap above. These records
+predate that instrumentation and have no phase measurements; the tagged source
+remains the reproduction target. No measured cost is retroactively attributed
+to a phase. See the [observability contract](../../study/observability.md).

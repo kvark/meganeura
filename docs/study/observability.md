@@ -267,6 +267,17 @@ time, so a winner's search cost remains visible.
 `serde_json::to_string_pretty(&report)` can preserve the evidence. The selected
 pipeline keys remain visible in `dispatch_pipeline_keys()`.
 
+The follow-up prompted by the holdouts adds `TuneOutcome.phase_times`:
+preparation (including pipeline setup and scratch allocation), qualification
+(data/uploads/dispatches/readbacks/CPU checks), warmup (including input reset),
+and the paired sampling loop. These are non-overlapping host wall times, not
+GPU timestamps. `compile_time` is a subset of preparation; do not add it again.
+The sum excludes final decision bookkeeping and scratch destruction, so compare
+it with total `elapsed` rather than forcing the pieces to sum to the total.
+An early exit retains partial time for the active phase; an unreached phase
+is `None`. Entire `phase_times` is `None` for historical reports written before
+instrumentation, including both retained experiments—not zero measured cost.
+
 There may be two comparisons per class; the second challenges the last accepted
 winner, not necessarily the original heuristic choice. `failure` identifies
 shader rejection or the implementation/input pattern that failed qualification.

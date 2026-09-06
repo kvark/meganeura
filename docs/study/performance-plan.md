@@ -187,6 +187,14 @@ SGD reach the eight-class cap. These counts do not measure time shares and do
 not establish that raising the cap would help. Search phase profiling and
 whole-step profiles should precede a larger budget or a new kernel family.
 
+The immediate follow-up adds structured preparation/qualification/warmup/
+sampling wall times to new `TuneOutcome` reports, with partial early-exit
+accounting. This instrumentation postdates the measured source; the old raw
+records remain unchanged and deserialize with `phase_times: None`.
+It does not change selection policy or explain the old ResNet cost after the
+fact. Use it for the next separately recorded profile; see
+[phase boundaries and missing-data semantics](observability.md).
+
 The unchanged ResNet control in one process has a 1.071× ratio of medians but
 only 0.01470 ms median paired gain. The paired guard correctly rejects it.
 This makes A/A controls, randomized/crossover session roles and interference/

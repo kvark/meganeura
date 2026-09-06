@@ -88,6 +88,14 @@ fn tune_preserves_correctness() {
         assert!(o.qualified, "qualification failed: {o:?}");
         assert!(o.baseline_median_ms.unwrap() > 0.0);
         assert!(o.candidate_median_ms.unwrap() > 0.0);
+        let phases = o.phase_times.expect("new reports must account for phases");
+        let preparation = phases.preparation.unwrap();
+        let qualification = phases.qualification.unwrap();
+        let warmup = phases.warmup.unwrap();
+        let sampling = phases.sampling.unwrap();
+        assert!(o.compile_time <= preparation);
+        assert!(preparation + qualification + warmup + sampling <= o.elapsed);
+        assert!(!qualification.is_zero() && !sampling.is_zero());
     }
     // Tuning must not execute the graph or overwrite the previous output.
     assert_eq!(
@@ -293,6 +301,14 @@ fn tune_budget_skips_leave_selection_unchanged() {
                     .all(|o| o.decision == TuneDecision::ScratchLimit)
         );
         assert_eq!(before, session.dispatch_pipeline_keys());
+        for outcome in &report.outcomes {
+            assert_eq!(outcome.decision, TuneDecision::ScratchLimit);
+            let phases = outcome.phase_times.unwrap();
+            assert!(phases.preparation.unwrap() <= outcome.elapsed);
+            assert_eq!(phases.qualification, None);
+            assert_eq!(phases.warmup, None);
+            assert_eq!(phases.sampling, None);
+        }
     }
 }
 

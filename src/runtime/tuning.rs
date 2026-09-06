@@ -5,7 +5,30 @@ use crate::tune::{
     measure_pairs,
 };
 use blade_graphics as bg;
-use std::{collections::HashMap, time::Instant};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
+
+struct PhaseTimer<'a> {
+    start: Instant,
+    elapsed: &'a mut Option<Duration>,
+}
+
+impl<'a> PhaseTimer<'a> {
+    fn new(elapsed: &'a mut Option<Duration>) -> Self {
+        Self {
+            start: Instant::now(),
+            elapsed,
+        }
+    }
+}
+
+impl Drop for PhaseTimer<'_> {
+    fn drop(&mut self) {
+        *self.elapsed = Some(self.start.elapsed());
+    }
+}
 
 impl Pipelines {
     fn ensure_tune_tile(
@@ -191,6 +214,7 @@ impl Session {
                     failure: None,
                     elapsed: std::time::Duration::ZERO,
                     compile_time: std::time::Duration::ZERO,
+                    phase_times: Some(Default::default()),
                     baseline_ms: Vec::new(),
                     candidate_ms: Vec::new(),
                     baseline_median_ms: None,
@@ -250,6 +274,11 @@ impl Session {
         start: Instant,
         outcome: &mut TuneOutcome,
     ) {
+        let phases = outcome
+            .phase_times
+            .as_mut()
+            .expect("new outcome has phase timers");
+        let preparation = PhaseTimer::new(&mut phases.preparation);
         let logical_sizes = class
             .key
             .buffer_sizes()
@@ -313,6 +342,8 @@ impl Session {
             &self.pipelines.map[&tile_variant(&class.key.shader, outcome.initial)],
             &self.pipelines.map[&tile_variant(&class.key.shader, outcome.candidate)],
         ];
+        drop(preparation);
+        let qualification = PhaseTimer::new(&mut phases.qualification);
         for pattern in 0..2 {
             if start.elapsed() >= options.max_time {
                 outcome.decision = TuneDecision::TimeBudget;
@@ -347,6 +378,8 @@ impl Session {
             }
         }
         outcome.qualified = true;
+        drop(qualification);
+        let warmup = PhaseTimer::new(&mut phases.warmup);
         // Time ordinary-magnitude data, not a zero-filled or subnormal workload.
         for (index, data) in test_inputs(&logical_sizes, 0).iter_mut().enumerate() {
             data.resize(sizes[index] / 4, 0.0);
@@ -361,6 +394,8 @@ impl Session {
                 scratch.run(pipelines[variant], &variants[variant], 1);
             }
         }
+        drop(warmup);
+        let sampling = PhaseTimer::new(&mut phases.sampling);
         (outcome.baseline_ms, outcome.candidate_ms) =
             measure_pairs(options.sample_pairs, |alternative| {
                 if start.elapsed() >= options.max_time {
@@ -376,6 +411,7 @@ impl Session {
                 (start.elapsed() < options.max_time)
                     .then_some(ms / options.dispatches_per_sample as f64)
             });
+        drop(sampling);
         decide(outcome, options);
     }
 }
@@ -591,6 +627,20 @@ fn qualify_output(class: &TuneClass, inputs: &[Vec<f32>], output: &[f32], scale:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phase_timer_records_partial_time_on_early_exit() {
+        fn exit_early(elapsed: &mut Option<Duration>) -> Result<(), ()> {
+            let _timer = PhaseTimer {
+                start: Instant::now() - Duration::from_millis(10),
+                elapsed,
+            };
+            Err(())
+        }
+        let mut elapsed = None;
+        assert!(exit_early(&mut elapsed).is_err());
+        assert!(elapsed.unwrap() >= Duration::from_millis(10));
+    }
 
     #[test]
     fn scratch_cap_counts_staging_and_checks_overflow() {
