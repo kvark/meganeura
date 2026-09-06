@@ -1,0 +1,53 @@
+{
+  "protocol": "conv-tiles-corrected-2026-09-06",
+  "processes": 6,
+  "qualified_comparisons": 84,
+  "original_small_controls_disqualified": 12,
+  "cases": [
+    {
+      "name": "resnet50-flb",
+      "baseline_median_ms": 17.5807825,
+      "selected_median_ms": 16.7293015,
+      "median_process_ratio": 1.050562999109379,
+      "process_ratios": [1.0503032467246338, 1.0508882655118117, 1.0510046629775898, 1.0482319184600755, 1.0508227514941244, 1.05024348024423],
+      "decisions": ["inconclusive", "inconclusive", "inconclusive", "inconclusive", "inconclusive", "inconclusive"],
+      "stable_controls": 6,
+      "changed_dispatches": [8, 8, 8, 8, 8, 8],
+      "eligible_classes": 45,
+      "visited_classes": 8,
+      "scratch_peak_bytes": 19376128,
+      "search_median_ms": 640.3928515,
+      "phase_medians_ms": {"preparation": 137.389039, "qualification": 73.154829, "sampling": 412.13367800000003, "warmup": 12.4906735}
+    },
+    {
+      "name": "conv-edges-adam",
+      "baseline_median_ms": 0.13495475,
+      "selected_median_ms": 0.13476675,
+      "median_process_ratio": 1.0002705695777836,
+      "process_ratios": [0.9995205058663111, 1.000261201712254, 1.0023785946895067, 1.000279937443313, 1.0024967730038725, 0.9966718587164806],
+      "decisions": ["unchanged_selection", "unchanged_selection", "unchanged_selection", "unchanged_selection", "unchanged_selection", "unchanged_selection"],
+      "stable_controls": 6,
+      "changed_dispatches": [0, 0, 0, 0, 0, 0],
+      "eligible_classes": 3,
+      "visited_classes": 3,
+      "scratch_peak_bytes": 127872,
+      "search_median_ms": 36.926188999999994,
+      "phase_medians_ms": {"preparation": 12.226591499999998, "qualification": 3.19726, "sampling": 19.38525, "warmup": 0.7028829999999999}
+    },
+    {
+      "name": "conv-edges-sgd",
+      "baseline_median_ms": 0.1405675,
+      "selected_median_ms": 0.140513,
+      "median_process_ratio": 0.999553551562262,
+      "process_ratios": [0.9989555333691729, 0.9994501460645511, 1.000349883029301, 0.9996569570599729, 1.0007691340585874, 0.9985250955545864],
+      "decisions": ["unchanged_selection", "unchanged_selection", "unchanged_selection", "unchanged_selection", "unchanged_selection", "unchanged_selection"],
+      "stable_controls": 6,
+      "changed_dispatches": [0, 0, 0, 0, 0, 0],
+      "eligible_classes": 3,
+      "visited_classes": 3,
+      "scratch_peak_bytes": 127872,
+      "search_median_ms": 37.7436225,
+      "phase_medians_ms": {"preparation": 12.1996115, "qualification": 3.2052155000000004, "sampling": 19.883526, "warmup": 0.7391885}
+    }
+  ]
+}

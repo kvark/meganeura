@@ -1,0 +1,378 @@
+{
+  "schema_version": 1,
+  "measured_revision": "48e23154419e2098db1109be6e59d8cd4d265b6a",
+  "cases": [
+    {
+      "name": "smollm2-flb",
+      "processes": [
+        {
+          "seed": 1,
+          "normal_before_ms": 2.6538705,
+          "normal_after_ms": 2.6930885,
+          "normal_drift_pct": 1.477766153246729,
+          "profiled_wall_ms": 3.490767,
+          "instrumentation_ratio": 1.315349411359748
+        },
+        {
+          "seed": 2,
+          "normal_before_ms": 2.6613065000000002,
+          "normal_after_ms": 3.383484,
+          "normal_drift_pct": 27.136201711452614,
+          "profiled_wall_ms": 4.2886820000000005,
+          "instrumentation_ratio": 1.611494955579149
+        },
+        {
+          "seed": 3,
+          "normal_before_ms": 2.626067,
+          "normal_after_ms": 2.848682,
+          "normal_drift_pct": 8.47712567881933,
+          "profiled_wall_ms": 3.600551,
+          "instrumentation_ratio": 1.3710811643419607
+        }
+      ],
+      "families": [
+        {
+          "phase": "backward",
+          "family": "attention",
+          "dispatch_count": 16,
+          "median_dispatch_sum_ms": 1.256576,
+          "median_share_pct": 40.550197236621955,
+          "share_min_pct": 36.252499545537134,
+          "share_max_pct": 40.578538102643826
+        },
+        {
+          "phase": "backward",
+          "family": "data_movement",
+          "dispatch_count": 1,
+          "median_dispatch_sum_ms": 0.006144,
+          "median_share_pct": 0.19906687402799364,
+          "share_min_pct": 0.1982692744583736,
+          "share_max_pct": 0.1999636429740045
+        },
+        {
+          "phase": "backward",
+          "family": "matrix",
+          "dispatch_count": 90,
+          "median_dispatch_sum_ms": 0.7528960000000003,
+          "median_share_pct": 24.356661482633477,
+          "share_min_pct": 24.29624734091988,
+          "share_max_pct": 25.63079440101797
+        },
+        {
+          "phase": "backward",
+          "family": "normalization_reduction",
+          "dispatch_count": 51,
+          "median_dispatch_sum_ms": 0.21446399999999993,
+          "median_share_pct": 6.920836861562601,
+          "share_min_pct": 6.8211508553654685,
+          "share_max_pct": 7.904926377022351
+        },
+        {
+          "phase": "backward",
+          "family": "pointwise",
+          "dispatch_count": 41,
+          "median_dispatch_sum_ms": 0.16713599999999998,
+          "median_share_pct": 5.334370139968892,
+          "share_min_pct": 4.754590074531897,
+          "share_max_pct": 5.393543856750444
+        },
+        {
+          "phase": "forward",
+          "family": "attention",
+          "dispatch_count": 8,
+          "median_dispatch_sum_ms": 0.21302400000000002,
+          "median_share_pct": 6.874367500361424,
+          "share_min_pct": 6.863297582257764,
+          "share_max_pct": 6.898911353032656
+        },
+        {
+          "phase": "forward",
+          "family": "data_movement",
+          "dispatch_count": 1,
+          "median_dispatch_sum_ms": 0.00304,
+          "median_share_pct": 0.09810198475804946,
+          "share_min_pct": 0.08501814411612228,
+          "share_max_pct": 0.21268860207235024
+        },
+        {
+          "phase": "forward",
+          "family": "matrix",
+          "dispatch_count": 34,
+          "median_dispatch_sum_ms": 0.3112960000000001,
+          "median_share_pct": 10.07050285121824,
+          "share_min_pct": 10.045643239224265,
+          "share_max_pct": 10.99890928922013
+        },
+        {
+          "phase": "forward",
+          "family": "normalization_reduction",
+          "dispatch_count": 18,
+          "median_dispatch_sum_ms": 0.07628800000000001,
+          "median_share_pct": 2.471747019180921,
+          "share_min_pct": 2.448419009066687,
+          "share_max_pct": 3.283948373023083
+        },
+        {
+          "phase": "forward",
+          "family": "pointwise",
+          "dispatch_count": 24,
+          "median_dispatch_sum_ms": 0.09836800000000004,
+          "median_share_pct": 3.1840331778123363,
+          "share_min_pct": 3.1743736962762537,
+          "share_max_pct": 3.8983821123432065
+        }
+      ]
+    },
+    {
+      "name": "whisper-flb",
+      "processes": [
+        {
+          "seed": 1,
+          "normal_before_ms": 2.7971565,
+          "normal_after_ms": 5.5816725,
+          "normal_drift_pct": 99.5480946454015,
+          "profiled_wall_ms": 3.051232,
+          "instrumentation_ratio": 1.0908334946578786
+        },
+        {
+          "seed": 2,
+          "normal_before_ms": 2.7673185,
+          "normal_after_ms": 3.0947515,
+          "normal_drift_pct": 11.832140030141103,
+          "profiled_wall_ms": 3.459332,
+          "instrumentation_ratio": 1.250066445188727
+        },
+        {
+          "seed": 3,
+          "normal_before_ms": 2.741848,
+          "normal_after_ms": 3.1238099999999998,
+          "normal_drift_pct": 13.930823298738648,
+          "profiled_wall_ms": 3.3172509999999997,
+          "instrumentation_ratio": 1.2098595545777884
+        }
+      ],
+      "families": [
+        {
+          "phase": "backward",
+          "family": "attention",
+          "dispatch_count": 8,
+          "median_dispatch_sum_ms": 0.327648,
+          "median_share_pct": 11.904101675332178,
+          "share_min_pct": 11.64634423768142,
+          "share_max_pct": 12.17611751109122
+        },
+        {
+          "phase": "backward",
+          "family": "convolution_spatial",
+          "dispatch_count": 3,
+          "median_dispatch_sum_ms": 0.153632,
+          "median_share_pct": 5.648137792193263,
+          "share_min_pct": 5.5470826112073945,
+          "share_max_pct": 5.895400154693115
+        },
+        {
+          "phase": "backward",
+          "family": "data_movement",
+          "dispatch_count": 3,
+          "median_dispatch_sum_ms": 0.012447999999999999,
+          "median_share_pct": 0.44945118428653963,
+          "share_min_pct": 0.4470176077164565,
+          "share_max_pct": 0.47968783009606153
+        },
+        {
+          "phase": "backward",
+          "family": "matrix",
+          "dispatch_count": 40,
+          "median_dispatch_sum_ms": 0.886112,
+          "median_share_pct": 31.994222992489895,
+          "share_min_pct": 31.506542892293904,
+          "share_max_pct": 32.276263706265055
+        },
+        {
+          "phase": "backward",
+          "family": "normalization_reduction",
+          "dispatch_count": 60,
+          "median_dispatch_sum_ms": 0.30511999999999984,
+          "median_share_pct": 10.845579871695701,
+          "share_min_pct": 10.471113099454437,
+          "share_max_pct": 11.017908723281336
+        },
+        {
+          "phase": "backward",
+          "family": "pointwise",
+          "dispatch_count": 15,
+          "median_dispatch_sum_ms": 0.06211200000000001,
+          "median_share_pct": 2.3292894280762573,
+          "share_min_pct": 2.207789253378224,
+          "share_max_pct": 2.397196435894567
+        },
+        {
+          "phase": "forward",
+          "family": "attention",
+          "dispatch_count": 4,
+          "median_dispatch_sum_ms": 0.059488,
+          "median_share_pct": 2.2195262853841715,
+          "share_min_pct": 2.1145184039310245,
+          "share_max_pct": 2.238128968919707
+        },
+        {
+          "phase": "forward",
+          "family": "convolution_spatial",
+          "dispatch_count": 2,
+          "median_dispatch_sum_ms": 0.08057600000000001,
+          "median_share_pct": 2.9093009820912776,
+          "share_min_pct": 2.87433459211065,
+          "share_max_pct": 3.0496215934086397
+        },
+        {
+          "phase": "forward",
+          "family": "data_movement",
+          "dispatch_count": 1,
+          "median_dispatch_sum_ms": 0.00416,
+          "median_share_pct": 0.1513575967648758,
+          "share_min_pct": 0.14786841985531637,
+          "share_max_pct": 0.16031018156060084
+        },
+        {
+          "phase": "forward",
+          "family": "matrix",
+          "dispatch_count": 17,
+          "median_dispatch_sum_ms": 0.542656,
+          "median_share_pct": 19.67217189228149,
+          "share_min_pct": 19.593298671288277,
+          "share_max_pct": 19.9542745347832
+        },
+        {
+          "phase": "forward",
+          "family": "normalization_reduction",
+          "dispatch_count": 10,
+          "median_dispatch_sum_ms": 0.054688,
+          "median_share_pct": 1.9995277684574173,
+          "share_min_pct": 1.9745811669555173,
+          "share_max_pct": 2.122480549615541
+        },
+        {
+          "phase": "forward",
+          "family": "pointwise",
+          "dispatch_count": 64,
+          "median_dispatch_sum_ms": 0.2663679999999999,
+          "median_share_pct": 9.909878682842287,
+          "share_min_pct": 9.468128668274254,
+          "share_max_pct": 10.20144403434862
+        }
+      ]
+    },
+    {
+      "name": "resnet50-flb",
+      "processes": [
+        {
+          "seed": 1,
+          "normal_before_ms": 17.6169155,
+          "normal_after_ms": 17.6466345,
+          "normal_drift_pct": 0.16869581965128777,
+          "profiled_wall_ms": 22.200112,
+          "instrumentation_ratio": 1.2601588513040207
+        },
+        {
+          "seed": 2,
+          "normal_before_ms": 17.6072385,
+          "normal_after_ms": 17.591440500000004,
+          "normal_drift_pct": -0.08972446190239625,
+          "profiled_wall_ms": 21.43893,
+          "instrumentation_ratio": 1.2176202418113435
+        },
+        {
+          "seed": 3,
+          "normal_before_ms": 17.5678805,
+          "normal_after_ms": 17.629973,
+          "normal_drift_pct": 0.35344331947158025,
+          "profiled_wall_ms": 20.929607,
+          "instrumentation_ratio": 1.1913564075074394
+        }
+      ],
+      "families": [
+        {
+          "phase": "backward",
+          "family": "convolution_spatial",
+          "dispatch_count": 105,
+          "median_dispatch_sum_ms": 11.565344000000003,
+          "median_share_pct": 60.67295464535324,
+          "share_min_pct": 60.65549834522657,
+          "share_max_pct": 60.77408304154764
+        },
+        {
+          "phase": "backward",
+          "family": "data_movement",
+          "dispatch_count": 53,
+          "median_dispatch_sum_ms": 0.24966400000000005,
+          "median_share_pct": 1.3119029557675372,
+          "share_min_pct": 1.30759087202923,
+          "share_max_pct": 1.3127409229568126
+        },
+        {
+          "phase": "backward",
+          "family": "matrix",
+          "dispatch_count": 2,
+          "median_dispatch_sum_ms": 0.0328,
+          "median_share_pct": 0.17235823660909055,
+          "share_min_pct": 0.17162759328790128,
+          "share_max_pct": 0.17246339990140128
+        },
+        {
+          "phase": "backward",
+          "family": "normalization_reduction",
+          "dispatch_count": 109,
+          "median_dispatch_sum_ms": 1.349056,
+          "median_share_pct": 7.08665910326724,
+          "share_min_pct": 7.072801640108839,
+          "share_max_pct": 7.089171149312916
+        },
+        {
+          "phase": "backward",
+          "family": "pointwise",
+          "dispatch_count": 51,
+          "median_dispatch_sum_ms": 0.2901119999999999,
+          "median_share_pct": 1.5209929235074413,
+          "share_min_pct": 1.520033516789521,
+          "share_max_pct": 1.5295744580869046
+        },
+        {
+          "phase": "forward",
+          "family": "convolution_spatial",
+          "dispatch_count": 54,
+          "median_dispatch_sum_ms": 4.9027199999999995,
+          "median_share_pct": 25.7127608869316,
+          "share_min_pct": 25.675677949418564,
+          "share_max_pct": 25.75185636297135
+        },
+        {
+          "phase": "forward",
+          "family": "matrix",
+          "dispatch_count": 2,
+          "median_dispatch_sum_ms": 0.024576,
+          "median_share_pct": 0.12884652164722207,
+          "share_min_pct": 0.11912593866360204,
+          "share_max_pct": 0.1290588938192703
+        },
+        {
+          "phase": "forward",
+          "family": "normalization_reduction",
+          "dispatch_count": 2,
+          "median_dispatch_sum_ms": 0.012288000000000002,
+          "median_share_pct": 0.06461067859720789,
+          "share_min_pct": 0.06427770654457807,
+          "share_max_pct": 0.06475879864040068
+        },
+        {
+          "phase": "forward",
+          "family": "pointwise",
+          "dispatch_count": 134,
+          "median_dispatch_sum_ms": 0.6310719999999997,
+          "median_share_pct": 3.308570642454252,
+          "share_min_pct": 3.2720934028122435,
+          "share_max_pct": 3.337909413747032
+        }
+      ]
+    }
+  ]
+}

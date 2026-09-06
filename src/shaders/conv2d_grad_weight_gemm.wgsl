@@ -6,6 +6,8 @@
 // BM=64, BN=64, KTILE=16, TM=4, TN=4, workgroup [16,16,1]
 // Dispatch: [ceil(Ci*kH*kW / 64), ceil(Co / 64), 1]
 
+$DIVISOR
+
 struct Params {
     batch: u32,
     in_channels: u32,
@@ -19,10 +21,10 @@ struct Params {
     out_h: u32,
     out_w: u32,
     padding_w: u32,
-    inv_kernel_w: f32,
-    inv_kernel_hw: f32,
-    inv_col_w: f32,
-    inv_go_spatial: f32,
+    kernel_w_multiplier: u32,
+    kernel_hw_multiplier: u32,
+    column_width_multiplier: u32,
+    output_spatial_multiplier: u32,
 }
 
 var<storage> grad_out: array<f32>;           // [N, Co, oH, oW]
@@ -33,7 +35,7 @@ var<workgroup> shared_a: array<f32, $SHARED_SIZE>;   // A tile: [64, 16]
 var<workgroup> shared_b: array<f32, $SHARED_SIZE>;   // B tile: [16, 64]
 
 @compute @workgroup_size(16, 16)
-fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>$COUNTS) {
     let tx = lid.x;
     let ty = lid.y;
     let tile_row = wgid.y * $BM_U;   // M (Co) tile start
@@ -49,9 +51,10 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
 
     $ACC_DECL
 
-    var t = 0u;
+    $K_RANGE
+    var t = $K_START;
     loop {
-        if t >= k_total { break; }
+        if t >= $K_END { break; }
 
         // Load A tile: grad_out_flat[Co, N*oH*oW] → shared_a[64, 16]
         // A[co, n*oH*oW + oh*oW + ow] = grad_out[n, co, oh, ow]
@@ -64,11 +67,9 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
 
             var val = 0.0;
             if co < m_total && k_idx < k_total {
-                let n = u32(f32(k_idx) * params.inv_go_spatial);
+                let n = divide_exact(k_idx, go_spatial, params.output_spatial_multiplier);
                 let rem = k_idx - n * go_spatial;
-                let oh = u32(f32(rem) * params.inv_col_w);
-                let ow = rem - oh * params.out_w;
-                val = grad_out[((n * params.out_channels + co) * params.out_h + oh) * params.out_w + ow];
+                val = grad_out[(n * params.out_channels + co) * go_spatial + rem];
             }
             shared_a[row_local * 16u + col_local] = val;
         }
@@ -85,15 +86,15 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
 
             var val = 0.0;
             if k_idx < k_total && col_idx < n_total {
-                // Decompose k_idx → (n, oh, ow) via reciprocal multiply
-                let n = u32(f32(k_idx) * params.inv_go_spatial);
+                // Decompose k_idx → (n, oh, ow)
+                let n = divide_exact(k_idx, go_spatial, params.output_spatial_multiplier);
                 let rem = k_idx - n * go_spatial;
-                let oh = u32(f32(rem) * params.inv_col_w);
+                let oh = divide_exact(rem, params.out_w, params.column_width_multiplier);
                 let ow = rem - oh * params.out_w;
-                // Decompose col_idx → (ci, kh, kw) via reciprocal multiply
-                let ci = u32(f32(col_idx) * params.inv_kernel_hw);
+                // Decompose col_idx → (ci, kh, kw)
+                let ci = divide_exact(col_idx, kernel_hw, params.kernel_hw_multiplier);
                 let k_rem = col_idx - ci * kernel_hw;
-                let kh = u32(f32(k_rem) * params.inv_kernel_w);
+                let kh = divide_exact(k_rem, params.kernel_w, params.kernel_w_multiplier);
                 let kw = k_rem - kh * params.kernel_w;
                 // Input position
                 let ih = i32(oh * params.stride + kh) - i32(params.padding_h);
@@ -124,7 +125,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             let co = tile_row + ty * $TM_U + i;
             let cikk = tile_col + tx * $TM_U + j;
             if co < m_total && cikk < n_total {
-                dst[co * n_total + cikk] = s[i][j];
+                dst[$OUTPUT_OFFSET co * n_total + cikk] = s[i][j];
             }
         }
     }

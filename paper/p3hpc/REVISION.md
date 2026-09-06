@@ -138,8 +138,10 @@ hide a missing dependency.
   provenance. Do not claim independent evaluation unless it actually occurred.
 - [ ] Resolve permanent artifact hosting/DOI, rights and upload requirements
   through the venue's instructions. Nothing was uploaded in this audit.
-- [ ] Rehearse with [28 questions and exercises](../../docs/study/p3hpc-questions.md),
+- [ ] Rehearse with [48 questions and exercises](../../docs/study/p3hpc-questions.md),
   then adapt slides to the confirmed talk length.
 
-GPU benchmarks remain deferred. Current development improvements cannot be
-described as measured paper improvements without a new controlled experiment.
+The bounded tuning-foundation engineering phase is closed with split-K promotion
+deferred after numerical rejection. No further development benchmark is required
+for this checklist. Separately retained development results must not be described
+as improvements to the frozen paper measurements.

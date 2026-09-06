@@ -266,9 +266,10 @@ pub struct SessionConfig<'a> {
     /// policy, and the diagnostic switches (aliasing, device-local,
     /// serial dispatch, plan dumps, buffer pinning).
     pub runtime: runtime::SessionOptions,
-    /// Run [`Session::tune`] after construction: bounded scalar-f32 tile
+    /// Run [`Session::tune`] after construction: bounded f32 matmul tile
     /// selection on private, nonzero scratch. Does not execute the graph or
-    /// advance training state. Cooperative/fused kernels remain heuristic.
+    /// advance training state. Native-f32 cooperative tiles are candidates
+    /// where existing allocations fit; f16-input and complex fusions are excluded.
     /// Environment users opt in through `SessionConfig::from_env()`.
     pub tune: bool,
 }

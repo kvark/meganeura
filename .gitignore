@@ -9,3 +9,7 @@ data/*.gz
 /.claude/
 *.spv
 __pycache__/
+# Retain raw experiment evidence as deterministic gzip, with readable summaries.
+/docs/experiments/*/*.json
+!/docs/experiments/*/summary.json
+/docs/experiments/*/Cargo.lock
