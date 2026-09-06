@@ -108,10 +108,9 @@ and broader-search work.
 cargo add meganeura
 ```
 
-Development HEAD pins Blade APIs newer than its published dependency version.
-Use this checkout for current development; assembling a package with
-`--no-verify` does not establish that HEAD builds against crates.io-only
-dependencies. A release needs a matching published Blade/Naga dependency set.
+Development HEAD uses published Blade 0.9 and Naga 30 with Rust 1.92 or newer.
+CI verifies the assembled package against registry dependencies. This does not
+publish a new Meganeura release; use this checkout for unreleased changes.
 
 Hub downloads (`SafeTensorsModel::download`) need the optional `hub` feature:
 

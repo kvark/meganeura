@@ -46,10 +46,8 @@ jobs:
           cargo test --example tune_holdouts
           cargo test --example tune_crossover
 
-      # Full verification substitutes crates.io dependencies for the pinned
-      # git revisions. Re-enable it after Blade publishes the APIs used here.
-      - name: Package assembly
-        run: cargo package --no-verify
+      - name: Package verification
+        run: cargo package
 
   check:
     name: ${{ matrix.name }}
@@ -123,11 +121,11 @@ jobs:
       - run: cargo check --lib --tests
 
   msrv:
-    name: Rust 1.88 MSRV
+    name: Rust 1.92 MSRV
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@1.92.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --lib
 
