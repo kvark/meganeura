@@ -1,5 +1,15 @@
 # How to win while staying general
 
+## Current milestone: bounded closure
+
+The author agreed to close this phase after one shared long-reduction accuracy
+attempt and, only if it qualifies, one predeclared whole-step acceptance cohort.
+An explicit defer decision also closes the milestone. See the
+[bounded experiment](../experiments/compensated-dw-2026-09-06/README.md).
+The broader priorities below are a research backlog, not prerequisites for this
+freeze or the accepted paper. Attention, persistent tuning, new precision and
+layout search belong to a later phase. Paper finalization can proceed now.
+
 This separates the implemented search from the remaining engineering and
 experiment plan. The initial September audit was CPU-only. After the user
 released the GPU, the scalar search passed device qualification on an RTX

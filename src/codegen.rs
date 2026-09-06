@@ -879,6 +879,7 @@ fn conv_gemm_tiled(src: &str, tile: MatMulTile) -> ShaderModule {
 }
 
 fn conv_grad_weight_tiled(tile: MatMulTile, split_k: bool) -> ShaderModule {
+    let (total_decl, total_update, total_array) = compensated_tile_sum(tile.tm());
     let (counts, range, start, end, offset) = if split_k {
         (
             ", @builtin(num_workgroups) counts: vec3<u32>",
@@ -903,9 +904,39 @@ fn conv_grad_weight_tiled(tile: MatMulTile, split_k: bool) -> ShaderModule {
             ("$K_START", start),
             ("$K_END", end),
             ("$OUTPUT_OFFSET", offset),
+            ("$TOTAL_DECL", &total_decl),
+            ("$TOTAL_UPDATE", &total_update),
+            ("$TOTAL_ARRAY", &total_array),
         ],
     );
     conv_gemm_tiled(&source, tile)
+}
+
+fn compensated_tile_sum(tm: u32) -> (String, String, String) {
+    use std::fmt::Write;
+
+    let mut declarations = String::new();
+    let mut update = String::new();
+    let mut array = format!("array<array<f32, {tm}>, {tm}>(\n");
+    for i in 0..tm {
+        for j in 0..tm {
+            let _ = writeln!(
+                declarations,
+                "var total{i}_{j} = 0.0; var error{i}_{j} = 0.0;"
+            );
+            let _ = writeln!(
+                update,
+                "let corrected{i}_{j} = s{i}_{j} - error{i}_{j};\n\
+                 let next{i}_{j} = total{i}_{j} + corrected{i}_{j};\n\
+                 error{i}_{j} = (next{i}_{j} - total{i}_{j}) - corrected{i}_{j};\n\
+                 total{i}_{j} = next{i}_{j};"
+            );
+        }
+        let columns: Vec<_> = (0..tm).map(|j| format!("total{i}_{j}")).collect();
+        let _ = writeln!(array, "array<f32, {tm}>({}),", columns.join(", "));
+    }
+    array.push(')');
+    (declarations, update, array)
 }
 
 /// Shared unroll generator for every register-tiled GEMM skeleton

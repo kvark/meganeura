@@ -49,7 +49,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let k_total = params.batch * go_spatial;             // N*oH*oW
     let input_spatial = params.in_h * params.in_w;
 
-    $ACC_DECL
+    $TOTAL_DECL
 
     $K_RANGE
     var t = $K_START;
@@ -109,9 +109,11 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         workgroupBarrier();
 
         // Compute: 4×4 register-tiled matmul over KTILE=16
+        $ACC_DECL
         for (var kk = 0u; kk < 16u; kk++) {
             $COMPUTE_BODY
         }
+        $TOTAL_UPDATE
 
         workgroupBarrier();
         t += 16u;
@@ -119,7 +121,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
 
     // Store: grad_kernel[co, ci*kH*kW + kh*kW + kw]
     // Output layout: [Co, Ci, kH, kW] = [Co, Ci*kH*kW] row-major
-    let s = $ACC_ARRAY;
+    let s = $TOTAL_ARRAY;
     for (var i = 0u; i < $TM_U; i++) {
         for (var j = 0u; j < $TM_U; j++) {
             let co = tile_row + ty * $TM_U + i;

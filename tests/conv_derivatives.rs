@@ -456,6 +456,232 @@ fn observed_tiny_partial_error_is_rejected_by_the_original_gate() {
     }
 }
 
+fn qualification_inputs(n: usize, operand: u32, pattern: usize, scale: f32) -> Vec<f32> {
+    match pattern {
+        0 => (0..n)
+            .map(|index| {
+                let mut bits =
+                    (index as u32).wrapping_add(0x9e37_79b9u32.wrapping_mul(operand + 1));
+                bits ^= bits >> 16;
+                bits = bits.wrapping_mul(0x85eb_ca6b);
+                bits ^= bits >> 13;
+                ((bits >> 8) as f32 / 16_777_216.0 - 0.5) * scale
+            })
+            .collect(),
+        1 => data(n, if operand == 0 { 37 } else { 7 }, scale),
+        2 => (0..n)
+            .map(|i| {
+                let magnitude = 0.25 + (i % 29) as f32 / 1024.0;
+                let sign = if operand == 0 && i % 2 == 0 {
+                    -1.0
+                } else {
+                    1.0
+                };
+                sign * magnitude * scale
+            })
+            .collect(),
+        _ => unreachable!(),
+    }
+}
+
+fn weight_partial_reference(s: Shape, x: &[f32], dy: &[f32], splits: u32) -> Vec<f64> {
+    let [_, nw, _] = s.sizes();
+    let (oh, ow) = s.output();
+    let tiles = (s.batch * oh * ow).div_ceil(16);
+    let owners: Vec<_> = (0..splits)
+        .flat_map(|split| {
+            std::iter::repeat_n(
+                split as usize,
+                (tiles / splits + u32::from(split < tiles % splits)) as usize,
+            )
+        })
+        .collect();
+    let mut expected = vec![0.0; nw * splits as usize];
+    for batch in 0..s.batch {
+        for co in 0..s.co {
+            for y in 0..oh {
+                for z in 0..ow {
+                    let yi = (((batch * s.co + co) * oh + y) * ow + z) as usize;
+                    let owner = owners[((batch * oh * ow + y * ow + z) / 16) as usize];
+                    for ci in 0..s.ci {
+                        for ky in 0..s.kh {
+                            for kx in 0..s.kw {
+                                let iy = (y * s.stride + ky) as i32 - s.ph as i32;
+                                let ix = (z * s.stride + kx) as i32 - s.pw as i32;
+                                if iy < 0 || ix < 0 || iy >= s.h as i32 || ix >= s.w as i32 {
+                                    continue;
+                                }
+                                let xi = (((batch * s.ci + ci) * s.h + iy as u32) * s.w + ix as u32)
+                                    as usize;
+                                let wi = (((co * s.ci + ci) * s.kh + ky) * s.kw + kx) as usize;
+                                expected[owner * nw + wi] += f64::from(dy[yi]) * f64::from(x[xi]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    expected
+}
+
+#[test]
+fn weight_partial_scatter_agrees_with_independent_full_reference() {
+    let s = Shape {
+        batch: 3,
+        ci: 5,
+        h: 7,
+        w: 9,
+        co: 7,
+        kh: 2,
+        kw: 3,
+        stride: 1,
+        ph: 1,
+        pw: 0,
+    };
+    let [nx, nw, ny] = s.sizes();
+    let (x, w, dy) = (data(nx, 7, 1.0), data(nw, 19, 1.0), data(ny, 37, 1.0));
+    let expected = reference(s, &x, &w, &dy).2;
+    assert_eq!(weight_partial_reference(s, &x, &dy, 1), expected);
+    for splits in [2, 3, 4, 8] {
+        let partials = weight_partial_reference(s, &x, &dy, splits);
+        for (i, &value) in expected.iter().enumerate() {
+            let total: f64 = partials.chunks(nw).map(|p| p[i]).sum();
+            assert!((total - value).abs() <= 1e-12 * value.abs().max(1.0));
+        }
+    }
+}
+
+#[test]
+#[ignore = "Full GPU/f64 accuracy experiment; reports all rejections without timing"]
+fn report_bounded_weight_accumulation_qualification() {
+    #[path = "../examples/support/experiment_io.rs"]
+    #[allow(dead_code)]
+    mod experiment_io;
+    use experiment_io::{command, sha256};
+    use serde_json::json;
+
+    let mut output = std::env::var_os("MEGANEURA_ACCUMULATION_RECORD").map(|path| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .unwrap()
+    });
+    let gpu = Arc::new(meganeura::init_gpu_context().unwrap());
+    let info = gpu.device_information();
+    let mut record = json!({
+        "protocol": "bounded-dw-accuracy-v1", "revision": command("git", &["rev-parse", "HEAD"]).unwrap(),
+        "tracked_source_clean": command("git", &["status", "--porcelain", "--untracked-files=no"]).unwrap().is_empty(),
+        "executable_sha256": sha256(&std::env::current_exe().unwrap()).unwrap(),
+        "cargo_lock_sha256": sha256(std::path::Path::new("Cargo.lock")).unwrap(),
+        "device": info.device_name, "driver": info.driver_info, "rows": []
+    });
+    for shape in [
+        [1, 3, 224, 224, 64, 7, 7, 2, 3, 3],
+        [1, 256, 56, 56, 64, 1, 1, 1, 0, 0],
+        [3, 5, 7, 9, 7, 2, 3, 1, 1, 0],
+        [2, 3, 1, 32771, 5, 1, 1, 1, 0, 0],
+    ] {
+        let [batch, ci, h, w, co, kh, kw, stride, ph, pw] = shape;
+        let s = Shape {
+            batch,
+            ci,
+            h,
+            w,
+            co,
+            kh,
+            kw,
+            stride,
+            ph,
+            pw,
+        };
+        let [nx, nw, ny] = s.sizes();
+        let mut sessions = Vec::new();
+        for splits in [1, 2, 3, 4, 8] {
+            for tile in [32, 64] {
+                let (plan, partial) = plan(s, tile, splits);
+                let mut session = Session::with_context_opts(
+                    plan,
+                    Arc::clone(&gpu),
+                    SessionOptions {
+                        coop: CoopPolicy::Disabled,
+                        no_alias: true,
+                        ..Default::default()
+                    },
+                );
+                session.set_parameter("w", &data(nw, 19, 1.0));
+                sessions.push((splits, tile, partial, session));
+            }
+        }
+        for pattern in 0..3 {
+            let x = qualification_inputs(nx, 1, pattern, 1.0);
+            for scale in [1.0, 1e-12] {
+                let dy = qualification_inputs(ny, 0, pattern, scale);
+                let expected = weight_partial_reference(s, &x, &dy, 1);
+                for pair in sessions.chunks_mut(2) {
+                    let splits = pair[0].0;
+                    let partials = if splits == 1 {
+                        Vec::new()
+                    } else {
+                        weight_partial_reference(s, &x, &dy, splits)
+                    };
+                    for (splits, tile, partial, session) in pair {
+                        session.set_parameter("x", &x);
+                        session.set_input("dy", &dy);
+                        session.step();
+                        session.wait();
+                        let mut dw = vec![f32::NAN; nw];
+                        session.read_param_grad("w", &mut dw);
+                        let mut errors = Vec::new();
+                        if let Err(error) = qualification("final", &dw, &expected, scale) {
+                            errors.push(error);
+                        }
+                        if let Some(buffer) = partial {
+                            let mut actual = vec![f32::NAN; partials.len()];
+                            session.read_buffer(*buffer, &mut actual);
+                            for (index, (a, b)) in
+                                actual.chunks(nw).zip(partials.chunks(nw)).enumerate()
+                            {
+                                if let Err(error) =
+                                    qualification(&format!("partial {index}/{splits}"), a, b, scale)
+                                {
+                                    errors.push(error);
+                                }
+                            }
+                        }
+                        eprintln!(
+                            "shape={shape:?}, pattern={pattern}, scale={scale:e}, tile={tile}, splits={splits}: {errors:?}"
+                        );
+                        record["rows"].as_array_mut().unwrap().push(json!({
+                            "shape": shape, "pattern": pattern, "scale": scale, "tile": tile, "splits": splits,
+                            "final_elements": nw, "partial_elements": partials.len(), "qualified": errors.is_empty(), "errors": errors
+                        }));
+                        if let Some(file) = output.as_mut() {
+                            experiment_io::write_record(file, &record).unwrap();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let rows = record["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 240);
+    let qualified = rows.iter().filter(|r| r["qualified"] == true).count();
+    eprintln!(
+        "Qualified {qualified}/240; this reporting test does not turn rejection into qualification"
+    );
+    record["qualified"] = json!(qualified);
+    record["status"] = json!(if qualified == 240 {
+        "qualified"
+    } else {
+        "rejected"
+    });
+    if let Some(file) = output.as_mut() {
+        experiment_io::write_record(file, &record).unwrap();
+    }
+}
+
 fn training_state(session: &Session) -> Vec<(String, Vec<f32>)> {
     let loss = session.plan().loss_buffer.unwrap();
     let mut partials = vec![f32::NAN; session.plan().buffers[loss.0 as usize] / 4];
