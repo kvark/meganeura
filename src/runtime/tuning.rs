@@ -1,8 +1,8 @@
 use super::{Gpu, Pipelines, Session, Variant, ensure_device_memory_budget};
 use crate::compile::{BufferRef, Dispatch, ShaderEntry};
 use crate::tune::{
-    MatmulTile, TuneClass, TuneDecision, TuneError, TuneOptions, TuneOutcome, TuneReport, decide,
-    measure_pairs,
+    MatmulTile, TuneClass, TuneDecision, TuneError, TuneOptions, TuneOutcome,
+    TuneQualificationTimes, TuneReport, TuneStaging, decide, measure_pairs,
 };
 use blade_graphics as bg;
 use std::{
@@ -26,7 +26,7 @@ impl<'a> PhaseTimer<'a> {
 
 impl Drop for PhaseTimer<'_> {
     fn drop(&mut self) {
-        *self.elapsed = Some(self.start.elapsed());
+        *self.elapsed.get_or_insert(Duration::ZERO) += self.start.elapsed();
     }
 }
 
@@ -452,7 +452,7 @@ impl Session {
             outcome.decision = TuneDecision::TimeBudget;
             return;
         }
-        let mut scratch = Scratch::new(&self.gpu, &class.key, &sizes, bytes);
+        let mut scratch = Scratch::new(&self.gpu, &class.key, &sizes, bytes, options.staging);
         let mut dispatch = self.plan.dispatches[class.members[0]].clone();
         dispatch.input_buffers = (0..sizes.len() - 1).map(|i| BufferRef(i as u32)).collect();
         dispatch.output_buffer = BufferRef((sizes.len() - 1) as u32);
@@ -464,16 +464,24 @@ impl Session {
             &self.pipelines.map[&tile_variant(&class.key.shader, outcome.candidate)],
         ];
         drop(preparation);
+        phases.qualification_breakdown = Some(Default::default());
+        let details = phases.qualification_breakdown.as_mut().unwrap();
         let qualification = PhaseTimer::new(&mut phases.qualification);
         for pattern in 0..2 {
             if start.elapsed() >= options.max_time {
                 outcome.decision = TuneDecision::TimeBudget;
                 return;
             }
-            let mut inputs = test_inputs(&logical_sizes, pattern);
-            for (index, data) in inputs.iter_mut().enumerate() {
-                data.resize(sizes[index] / 4, 0.0);
-                scratch.upload(index, data);
+            let inputs = {
+                let _timer = PhaseTimer::new(&mut details.input_preparation);
+                let mut inputs = test_inputs(&logical_sizes, pattern);
+                for (index, data) in inputs.iter_mut().enumerate() {
+                    data.resize(sizes[index] / 4, 0.0);
+                }
+                inputs
+            };
+            for (index, data) in inputs.iter().enumerate() {
+                scratch.upload(index, data, Some(&mut *details));
             }
             let mut reference = Vec::new();
             for variant in 0..2 {
@@ -481,13 +489,24 @@ impl Session {
                     outcome.decision = TuneDecision::TimeBudget;
                     return;
                 }
-                scratch.upload(sizes.len() - 1, &vec![f32::NAN; sizes[sizes.len() - 1] / 4]);
-                scratch.run(pipelines[variant], &variants[variant], 1);
-                let output = scratch.read_output();
-                let scale = if pattern == 0 { 1.0 } else { 1.0e-12 };
-                if !qualify_output(&class.key, &inputs, &output, scale)
-                    || (variant == 1 && !outputs_agree(&reference, &output, scale))
+                let sentinel = {
+                    let _timer = PhaseTimer::new(&mut details.input_preparation);
+                    vec![f32::NAN; sizes[sizes.len() - 1] / 4]
+                };
+                scratch.upload(sizes.len() - 1, &sentinel, Some(&mut *details));
+                drop(sentinel);
                 {
+                    let _timer = PhaseTimer::new(&mut details.dispatch);
+                    scratch.run(pipelines[variant], &variants[variant], 1);
+                }
+                let output = scratch.read_output(details);
+                let scale = if pattern == 0 { 1.0 } else { 1.0e-12 };
+                let valid = {
+                    let _timer = PhaseTimer::new(&mut details.validation);
+                    qualify_output(&class.key, &inputs, &output, scale)
+                        && (variant == 0 || outputs_agree(&reference, &output, scale))
+                };
+                if !valid {
                     outcome.decision = TuneDecision::InvalidOutput;
                     outcome.failure = Some(format!(
                         "{:?}, input pattern {pattern}: reference or cross-variant mismatch",
@@ -504,7 +523,7 @@ impl Session {
         // Time ordinary-magnitude data, not a zero-filled or subnormal workload.
         for (index, data) in test_inputs(&logical_sizes, 0).iter_mut().enumerate() {
             data.resize(sizes[index] / 4, 0.0);
-            scratch.upload(index, data);
+            scratch.upload(index, data, None);
         }
         for _ in 0..options.warmup_runs {
             for variant in 0..2 {
@@ -552,7 +571,13 @@ struct Scratch<'a> {
 }
 
 impl<'a> Scratch<'a> {
-    fn new(gpu: &'a Gpu, class: &TuneClass, sizes: &[usize], bytes: usize) -> Self {
+    fn new(
+        gpu: &'a Gpu,
+        class: &TuneClass,
+        sizes: &[usize],
+        bytes: usize,
+        staging: TuneStaging,
+    ) -> Self {
         ensure_device_memory_budget(gpu, bytes, "matmul tuning scratch");
         let buffers = sizes
             .iter()
@@ -573,7 +598,10 @@ impl<'a> Scratch<'a> {
         let staging = gpu.create_buffer(bg::BufferDesc {
             name: "tune_staging",
             size: *sizes.iter().max().unwrap() as u64,
-            memory: bg::Memory::Shared,
+            memory: match staging {
+                TuneStaging::Shared => bg::Memory::Shared,
+                TuneStaging::Download => bg::Memory::Download,
+            },
         });
         let encoder = gpu.create_command_encoder(bg::CommandEncoderDesc {
             name: "matmul_tune",
@@ -589,10 +617,16 @@ impl<'a> Scratch<'a> {
         }
     }
 
-    fn upload(&mut self, index: usize, data: &[f32]) {
+    fn upload(&mut self, index: usize, data: &[f32], times: Option<&mut TuneQualificationTimes>) {
+        let (host, transfer) = times
+            .map(|t| (&mut t.upload_host_copy, &mut t.upload_transfer))
+            .unzip();
+        let host = host.map(PhaseTimer::new);
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), self.staging.data().cast(), data.len());
         }
+        drop(host);
+        let _transfer = transfer.map(PhaseTimer::new);
         self.encoder.start();
         self.encoder.transfer("tune_upload").copy_buffer_to_buffer(
             self.staging.at(0),
@@ -602,7 +636,8 @@ impl<'a> Scratch<'a> {
         self.submit_wait();
     }
 
-    fn read_output(&mut self) -> Vec<f32> {
+    fn read_output(&mut self, times: &mut TuneQualificationTimes) -> Vec<f32> {
+        let transfer = PhaseTimer::new(&mut times.readback_transfer);
         self.encoder.start();
         self.encoder
             .transfer("tune_readback")
@@ -612,6 +647,8 @@ impl<'a> Scratch<'a> {
                 (self.output_elements * 4) as u64,
             );
         self.submit_wait();
+        drop(transfer);
+        let _host = PhaseTimer::new(&mut times.readback_host_copy);
         unsafe {
             std::slice::from_raw_parts(self.staging.data().cast::<f32>(), self.output_elements)
                 .to_vec()
@@ -959,6 +996,65 @@ mod tests {
         let mut elapsed = None;
         assert!(exit_early(&mut elapsed).is_err());
         assert!(elapsed.unwrap() >= Duration::from_millis(10));
+        let first = elapsed.unwrap();
+        assert!(exit_early(&mut elapsed).is_err());
+        assert!(elapsed.unwrap() >= first + Duration::from_millis(10));
+    }
+
+    #[test]
+    #[ignore = "GPU staging round-trip qualification, not a performance assertion"]
+    fn tuning_staging_round_trips_all_bits_and_declared_extents() {
+        let gpu = crate::init_gpu_context().unwrap();
+        for (m, n, k) in [(3, 7, 5), (33, 65, 17), (2048, 1000, 1)] {
+            for device_local in [false, true] {
+                let class = TuneClass {
+                    shader: ShaderEntry::MatMulAT,
+                    m,
+                    n,
+                    k,
+                    requires_full_precision: true,
+                    device_local: [device_local; 4],
+                    binding_bytes: Vec::new(),
+                };
+                let sizes = class.buffer_sizes().unwrap();
+                let bytes = scratch_bytes(&sizes).unwrap();
+                let patterns = [
+                    0,
+                    0x8000_0000,
+                    1,
+                    0x0080_0000,
+                    0x3f80_0000,
+                    0xbf80_0000,
+                    0x7f80_0000,
+                    0x7fc0_1234,
+                ];
+                let data: Vec<_> = (0..m as usize * n as usize)
+                    .map(|i| f32::from_bits(patterns[i % patterns.len()]))
+                    .collect();
+                for staging in [TuneStaging::Shared, TuneStaging::Download] {
+                    let mut scratch = Scratch::new(&gpu, &class, &sizes, bytes, staging);
+                    let mut times = TuneQualificationTimes::default();
+                    scratch.upload(sizes.len() - 1, &data, Some(&mut times));
+                    let read = scratch.read_output(&mut times);
+                    assert_eq!(read.len(), data.len());
+                    assert!(
+                        read.iter()
+                            .zip(&data)
+                            .all(|(a, b)| a.to_bits() == b.to_bits())
+                    );
+                    for time in [
+                        times.upload_host_copy,
+                        times.upload_transfer,
+                        times.readback_transfer,
+                        times.readback_host_copy,
+                    ] {
+                        assert!(time.is_some_and(|time| !time.is_zero()));
+                    }
+                    assert_eq!(times.validation, None);
+                    assert_eq!(times.dispatch, None);
+                }
+            }
+        }
     }
 
     #[test]

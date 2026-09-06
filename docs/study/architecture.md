@@ -40,7 +40,7 @@ lower-level graph/compiler routines can still be exercised without a GPU.
 | [runtime.rs](../../src/runtime.rs) | Hardware discovery, variant selection, pipeline keys, allocation, execution, readback and optimizer; checkpoint preflight/serialization lives in [runtime/checkpoint.rs](../../src/runtime/checkpoint.rs). |
 | [memplan.rs](../../src/memplan.rs) | Logical lifetimes, pinned values, physical allocation reuse. |
 | [train.rs](../../src/train.rs), [config.rs](../../src/config.rs), [cache.rs](../../src/cache.rs) | Public build/training workflow, explicit configuration and cached plans. |
-| [Blade](https://github.com/kvark/blade/tree/b208f3b1f97196c2971436b5726e61e71b149c37) | Native GPU API objects, commands, synchronization and allocation semantics. |
+| [Blade 0.9](https://github.com/kvark/blade/tree/866de2c37acbcf1e54c3a21f3213dae4f2f45746) | Native GPU API objects, commands, synchronization and allocation semantics. Published registry dependency, sharing Naga 30 with Meganeura; Rust 1.92 minimum. |
 
 ## 1. What the graph knows
 

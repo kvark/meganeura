@@ -386,6 +386,7 @@ pub fn memory(session: &Session) -> Value {
     })
 }
 
+#[allow(dead_code)] // The readback experiment continues these workloads without timing steps.
 pub fn step_ms(session: &mut Session) -> f64 {
     let start = Instant::now();
     session.step();

@@ -45,6 +45,7 @@ jobs:
           cargo test --test tuning_evidence --test holdout_evidence --test crossover_evidence
           cargo test --example tune_holdouts
           cargo test --example tune_crossover
+          cargo test --example tune_readback
 
       - name: Package verification
         run: cargo package

@@ -3,7 +3,8 @@
 
 use meganeura::graph::Graph;
 use meganeura::{
-    CoopPolicy, MatmulTile, Mode, SessionConfig, SessionOptions, TuneDecision, TuneOptions, build,
+    CoopPolicy, MatmulTile, Mode, SessionConfig, SessionOptions, TuneDecision, TuneOptions,
+    TuneStaging, build,
 };
 use std::time::Duration;
 
@@ -96,6 +97,18 @@ fn tune_preserves_correctness() {
         assert!(o.compile_time <= preparation);
         assert!(preparation + qualification + warmup + sampling <= o.elapsed);
         assert!(!qualification.is_zero() && !sampling.is_zero());
+        let detail = phases.qualification_breakdown.unwrap();
+        let parts = [
+            detail.input_preparation,
+            detail.upload_host_copy,
+            detail.upload_transfer,
+            detail.dispatch,
+            detail.readback_transfer,
+            detail.readback_host_copy,
+            detail.validation,
+        ];
+        let sum: Duration = parts.into_iter().map(Option::unwrap).sum();
+        assert!(sum <= qualification);
     }
     // Tuning must not execute the graph or overwrite the previous output.
     assert_eq!(
@@ -120,6 +133,12 @@ fn tune_preserves_correctness() {
 #[test]
 #[ignore = "GPU tuning requires an idle device"]
 fn tune_preserves_training_parameters_gradients_and_moments() {
+    for staging in [TuneStaging::Shared, TuneStaging::Download] {
+        preserves_training_state(staging);
+    }
+}
+
+fn preserves_training_state(staging: TuneStaging) {
     let mut graph = Graph::new();
     let x = graph.input("x", &[33, 17]);
     let weight = graph.parameter("weight", &[17, 65]);
@@ -180,6 +199,7 @@ fn tune_preserves_training_parameters_gradients_and_moments() {
     let before = snapshot(&session);
     let report = session
         .tune_with(TuneOptions {
+            staging,
             max_time: Duration::from_secs(60),
             ..Default::default()
         })
@@ -214,6 +234,12 @@ fn tune_preserves_training_parameters_gradients_and_moments() {
 #[test]
 #[ignore = "GPU tuning requires an idle device"]
 fn tune_qualifies_all_four_scalar_entries_on_rectangular_edges() {
+    for staging in [TuneStaging::Shared, TuneStaging::Download] {
+        qualify_scalar_entries(staging);
+    }
+}
+
+fn qualify_scalar_entries(staging: TuneStaging) {
     use meganeura::compile::ShaderEntry;
     for shader in [
         ShaderEntry::MatMul,
@@ -236,6 +262,7 @@ fn tune_qualifies_all_four_scalar_entries_on_rectangular_edges() {
             );
             let report = session
                 .tune_with(TuneOptions {
+                    staging,
                     max_time: Duration::from_secs(60),
                     ..Default::default()
                 })

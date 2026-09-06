@@ -222,12 +222,26 @@ impl TuneClass {
     }
 }
 
+/// Placement of the private upload/readback buffer, never the kernel bindings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TuneStaging {
+    /// Original bidirectional, GPU-preferred shared staging.
+    #[default]
+    Shared,
+    /// Host-read-optimized staging; still used for uploads as well as readbacks.
+    Download,
+}
+
 /// Resource bounds and decision policy for [`crate::Session::tune_with`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TuneOptions {
     pub max_classes: usize,
-    /// GPU scratch including the shared upload/readback buffer, not pipelines.
+    /// GPU scratch including the upload/readback buffer, not pipelines.
     pub max_scratch_bytes: usize,
+    /// Does not alter scratch binding placement, validation or kernel candidates.
+    /// Missing historical settings deserialize to the original shared staging.
+    #[serde(default)]
+    pub staging: TuneStaging,
     /// Soft wall-clock deadline, including compilation and qualification.
     /// An in-flight driver call, GPU submission, or validation cannot be preempted.
     pub max_time: Duration,
@@ -245,6 +259,7 @@ impl Default for TuneOptions {
         Self {
             max_classes: 8,
             max_scratch_bytes: 64 * 1024 * 1024,
+            staging: TuneStaging::Shared,
             max_time: Duration::from_secs(2),
             warmup_runs: 1,
             sample_pairs: 6,
@@ -306,11 +321,37 @@ pub struct TunePhaseTimes {
     pub preparation: Option<Duration>,
     /// Input generation, uploads, trial dispatches, readbacks and CPU checks.
     pub qualification: Option<Duration>,
+    /// Nested accounting, already inside `qualification`; never add it twice.
+    /// `None` means an older report or qualification was not reached.
+    #[serde(default)]
+    pub qualification_breakdown: Option<TuneQualificationTimes>,
     /// Restoring ordinary-magnitude scratch inputs and warming both variants.
     pub warmup: Option<Duration>,
     /// Paired timing loop, including incomplete/discarded pairs and host checks.
     /// Not the sum of accepted per-dispatch samples or GPU timestamp duration.
     pub sampling: Option<Duration>,
+}
+
+/// Accumulated, disjoint host wall times within qualification, not GPU timestamps.
+/// Repeated operations add to each field; `None` means the operation was not
+/// reached. Early returns preserve partial time. Bookkeeping and destruction
+/// outside these scopes remain in the enclosing qualification time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TuneQualificationTimes {
+    /// Deterministic inputs, padding and NaN output sentinels.
+    pub input_preparation: Option<Duration>,
+    /// CPU copy into mapped staging memory.
+    pub upload_host_copy: Option<Duration>,
+    /// Upload encoding, transfer, submission and wait.
+    pub upload_transfer: Option<Duration>,
+    /// Candidate encoding, dispatch, submission and wait.
+    pub dispatch: Option<Duration>,
+    /// Readback encoding, transfer, submission and wait.
+    pub readback_transfer: Option<Duration>,
+    /// Host vector allocation and CPU copy out of mapped staging memory.
+    pub readback_host_copy: Option<Duration>,
+    /// Full-output finite/parity scans and sampled f64 reference dots.
+    pub validation: Option<Duration>,
 }
 
 /// Evidence for one candidate comparison within an exact class. Times are
@@ -624,14 +665,40 @@ mod tests {
         outcome.phase_times = Some(TunePhaseTimes {
             preparation: Some(Duration::from_millis(3)),
             qualification: Some(Duration::ZERO),
+            qualification_breakdown: Some(TuneQualificationTimes {
+                upload_host_copy: Some(Duration::ZERO),
+                ..Default::default()
+            }),
             ..Default::default()
         });
         let mut json = serde_json::to_value(&outcome).unwrap();
         let restored: TuneOutcome = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(restored.phase_times, outcome.phase_times);
+        json["phase_times"]
+            .as_object_mut()
+            .unwrap()
+            .remove("qualification_breakdown");
+        let older: TuneOutcome = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(older.phase_times.unwrap().qualification_breakdown, None);
         json.as_object_mut().unwrap().remove("phase_times");
         let legacy: TuneOutcome = serde_json::from_value(json).unwrap();
         assert_eq!(legacy.phase_times, None);
+    }
+
+    #[test]
+    fn staging_round_trips_and_missing_historical_policy_is_shared() {
+        for staging in [TuneStaging::Shared, TuneStaging::Download] {
+            let options = TuneOptions {
+                staging,
+                ..Default::default()
+            };
+            let mut value = serde_json::to_value(&options).unwrap();
+            let restored: TuneOptions = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(restored.staging, staging);
+            value.as_object_mut().unwrap().remove("staging");
+            let historical: TuneOptions = serde_json::from_value(value).unwrap();
+            assert_eq!(historical.staging, TuneStaging::Shared);
+        }
     }
 
     fn native_config(tile_size: u32) -> CoopConfig {

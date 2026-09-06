@@ -279,6 +279,18 @@ is `None`. Entire `phase_times` is `None` for historical reports written before
 instrumentation, including the first pilot and six-case holdouts—not zero
 measured cost. The later crossover records contain measured phases.
 
+The readback follow-up adds `qualification_breakdown` within those phases:
+input preparation, CPU upload copy, upload transfer/wait, dispatch/wait,
+readback transfer/wait, CPU allocation/copy from mapped staging, and CPU
+validation. Repeated operations accumulate, early exits retain partial times,
+and absent historical/unreached measurements remain `None`. The enclosing
+qualification timer already contains these costs. Transfer/dispatch fields
+include host encoding/submission and waiting; they are not GPU timestamps.
+CPU validation still scans complete outputs and compares sampled f64 dots.
+`TuneOptions::staging` controls only the one private copy buffer: Shared and
+Download keep its capacity and all candidate bindings/validation unchanged.
+See the [separate staging protocol](../experiments/readback-2026-09-06/README.md).
+
 There may be two comparisons per class; the second challenges the last accepted
 winner, not necessarily the original heuristic choice. `failure` identifies
 shader rejection or the implementation/input pattern that failed qualification.
