@@ -100,7 +100,7 @@ fn check(label: &str, actual: &[f32], expected: &[f64], scale: f32) {
     );
 }
 
-fn run(s: Shape, tile: u32, gpu: &Arc<blade_graphics::Context>, policy: CoopPolicy) {
+fn run(s: Shape, tile: u32, gpu: &Arc<blade_graphics::Context>, policy: CoopPolicy, tune: bool) {
     let [nx, nw, ny] = s.sizes();
     let mut graph = Graph::new();
     let x = graph.parameter("x", &[nx]);
@@ -172,6 +172,7 @@ fn run(s: Shape, tile: u32, gpu: &Arc<blade_graphics::Context>, policy: CoopPoli
     let w = values(nw, 19, 1.0);
     session.set_parameter("x", &x);
     session.set_parameter("w", &w);
+    let mut searched = false;
     for scale in [1.0, 1e-12] {
         if half_inputs && scale < 1.0 {
             continue;
@@ -180,6 +181,59 @@ fn run(s: Shape, tile: u32, gpu: &Arc<blade_graphics::Context>, policy: CoopPoli
         session.set_input("dy", &dy);
         session.step();
         session.wait();
+        if tune && !searched {
+            let state = |s: &Session| {
+                let mut values = vec![s.adam_step_count()];
+                for (i, bytes) in s.plan().buffers.iter().enumerate() {
+                    let mut data = vec![0.0; bytes / 4];
+                    s.read_buffer(meganeura::compile::BufferRef(i as u32), &mut data);
+                    values.extend(data.into_iter().map(f32::to_bits));
+                }
+                values
+            };
+            let before = state(&session);
+            let keys = session.dispatch_pipeline_keys();
+            for mut options in [
+                meganeura::TuneOptions {
+                    max_scratch_bytes: 0,
+                    ..Default::default()
+                },
+                meganeura::TuneOptions {
+                    max_time: std::time::Duration::ZERO,
+                    ..Default::default()
+                },
+            ] {
+                options.scope = meganeura::TuneScope::ConvDerivatives;
+                let report = session.tune_with(options).unwrap();
+                assert_eq!(report.eligible_classes, 2, "{s:?}");
+                assert_eq!(session.dispatch_pipeline_keys(), keys);
+                assert_eq!(state(&session), before);
+                assert_eq!(report.scratch.unwrap().retained_staging_bytes, 0);
+            }
+            let report = session
+                .tune_with(meganeura::TuneOptions {
+                    scope: meganeura::TuneScope::ConvDerivatives,
+                    max_time: std::time::Duration::from_secs(60),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(report.outcomes.len(), 2, "{s:?}: {report:?}");
+            assert!(
+                report.outcomes.iter().all(|o| o.qualified
+                    && o.class.conv2d.is_some()
+                    && matches!(
+                        o.decision,
+                        meganeura::TuneDecision::KeepBaseline
+                            | meganeura::TuneDecision::FasterCandidate
+                    )),
+                "{report:?}"
+            );
+            assert_eq!(report.scratch.unwrap().retained_staging_bytes, 0);
+            assert_eq!(state(&session), before);
+            session.step();
+            session.wait();
+            searched = true;
+        }
         let (dx, dw) = reference(s, &x, &w, &dy);
         for (name, expected) in [("x", dx), ("w", dw)] {
             let mut actual = vec![f32::NAN; expected.len()];
@@ -196,6 +250,16 @@ fn run(s: Shape, tile: u32, gpu: &Arc<blade_graphics::Context>, policy: CoopPoli
 
 #[test]
 fn scalar_conv_derivatives_match_full_oracle_across_padding_stride_and_tile_edges() {
+    scalar_oracles(false);
+}
+
+#[test]
+#[ignore = "GPU scalar convolution tuning qualification; requires idle device"]
+fn tuned_conv_derivatives_match_full_oracle_and_preserve_state_and_budgets() {
+    scalar_oracles(true);
+}
+
+fn scalar_oracles(tune: bool) {
     let gpu = Arc::new(meganeura::init_gpu_context().unwrap());
     for (batch, ci, h, w, co, kh, kw, stride, ph, pw) in [
         (2, 3, 5, 7, 5, 3, 3, 1, 0, 0),
@@ -224,6 +288,7 @@ fn scalar_conv_derivatives_match_full_oracle_across_padding_stride_and_tile_edge
                 tile,
                 &gpu,
                 CoopPolicy::Disabled,
+                tune,
             );
         }
     }
@@ -258,6 +323,7 @@ fn generated_conv_derivatives_match_oracle_without_assuming_same_padding() {
             64,
             &gpu,
             policy,
+            false,
         );
     }
 }

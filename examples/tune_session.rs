@@ -234,6 +234,7 @@ fn run_case(
     let before = tuned.read_output(rows * width);
     let initial_parity = parity(&reference, &before)?;
     let report = tuned.tune_with(TuneOptions {
+        scope: meganeura::TuneScope::Dense,
         max_time: Duration::from_secs(10),
         ..Default::default()
     })?;

@@ -55,6 +55,7 @@ fn run_case(
     }
     drop(a);
     let report = match tuned.tune_with(TuneOptions {
+        scope: meganeura::TuneScope::Dense,
         max_time: Duration::from_secs(10),
         ..Default::default()
     }) {

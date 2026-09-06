@@ -60,8 +60,11 @@ backward convolution, and 36.25–40.58% of SmolLM2's in backward attention.
 All 45 profiled full states match, but short-case timing drift is substantial;
 these optimizer-free profiles are not whole-step speedup evidence. The follow-up
 also fixes dX indexing outside same padding and adds full f64 derivative oracles.
-Next: exact-class convolution-derivative tile selection, then bounded split-K
-weight gradients with charged partial storage and whole-step confirmation;
+Exact-class scalar convolution-derivative tile selection is now implemented,
+with full NCHW keys, physical scratch sizes, batch-aware references, checked
+reciprocal indexing and unchanged precision/budgets. A [separate crossover](experiments/conv-tiles-2026-09-06/README.md)
+tests transfer on ResNet F+L+B and Adam/SGD convolution chains.
+Next: bounded split-K weight gradients with charged partial storage and whole-step confirmation;
 attention schedules remain a separate device-qualified family.
 Keep tuning opt-in; do not fit a smaller margin or model rule.
 

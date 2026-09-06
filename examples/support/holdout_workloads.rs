@@ -169,6 +169,40 @@ pub fn crossover_cases() -> Vec<Case> {
     result
 }
 
+#[allow(dead_code)] // Only the convolution crossover uses this diagnostic roster.
+pub fn conv_derivative_cases() -> Vec<Case> {
+    let mut result: Vec<_> = cases()
+        .into_iter()
+        .filter(|c| c.name == "resnet50-flb")
+        .collect();
+    for work in [Work::Adam, Work::Sgd] {
+        let mut graph = Graph::new();
+        let x = graph.input("input", &[2, 5, 17, 19]);
+        let w1 = graph.parameter("first.weight", &[17, 5, 3, 2]);
+        let h = graph.conv2d_hw(x, w1, 2, 5, 17, 19, 17, 3, 2, 1, 2, 0);
+        let w2 = graph.parameter("second.weight", &[33, 17, 2, 3]);
+        let y = graph.conv2d_hw(h, w2, 2, 17, 19, 18, 33, 2, 3, 2, 0, 1);
+        let squared = graph.mul(y, y);
+        let loss = graph.mean_all(squared);
+        graph.set_outputs(vec![loss]);
+        result.push(Case {
+            name: if work == Work::Adam {
+                "conv-edges-adam"
+            } else {
+                "conv-edges-sgd"
+            },
+            description: json!({"batch": 2, "input": [5, 17, 19], "channels": [17, 33],
+                "kernels": [[3, 2], [2, 3]], "strides": [1, 2], "padding": [[2, 0], [0, 1]],
+                "activation": null, "loss": "mean squared output"}),
+            work,
+            graph,
+            inputs: vec![Input::F32("input", data(2 * 5 * 17 * 19, 1, 2.0))],
+            output_elements: 1,
+        });
+    }
+    result
+}
+
 fn initialize(case: &Case, session: &mut Session) {
     let mut ones = HashSet::<NodeId>::new();
     let mut zeros = HashSet::<NodeId>::new();

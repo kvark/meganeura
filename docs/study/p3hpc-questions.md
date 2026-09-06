@@ -457,9 +457,35 @@ weight-gradient reduction with ten output workgroups motivates testing split-K
 with charged temporary storage. These are F+L+B-only RTX profiles, not optimizer
 or Metal evidence. Intrusive pass timing and substantial short-case drift mean
 the shares are localization evidence, not guaranteed whole-step speedup bounds.
-First extend exact convolution classes/qualification to the existing scalar
+Exact convolution classes/qualification now cover the existing scalar
 tiles; accept any new schedule only after independent edge tests and matched
 whole-step confirmation. [Protocol and limitations](../experiments/training-profile-2026-09-06/README.md).
+
+### 41. Why isn't convolution tuning just another M/N/K lookup?
+
+Short: equal contraction dimensions can gather different physical tensors.
+
+Detail: dX uses M=Ci, N=H×W, K=Co×Kh×Kw, with one dispatch plane per batch;
+dW uses M=Co, N=Ci×Kh×Kw, K=batch×Oh×Ow. Kernel aspect ratio, stride and both
+padding dimensions affect addresses even when M/N/K match. Our exact key
+records all of them, plus precision, binding capacity and placement. Scratch
+is physical NCHW data, not an im2col allocation. The existing two scalar tiles
+share one bounded runner and unchanged decision guard; new options expose
+Dense, ConvDerivatives and All scopes. No model name enters selection.
+
+### 42. What does convolution qualification prove, and what doesn't it?
+
+Short: structural legality and numerical testing are separate checks.
+
+Detail: checked extents prevent index overflow, and monotone reciprocal
+decomposition is checked at every quotient interval's endpoints within exact
+f32 integer inputs. That establishes this particular address decomposition,
+not the whole kernel. Both variants must still produce finite, matching full
+outputs on ordinary/tiny synthetic inputs and match 32 f64 contractions,
+including dX batch edges. Separate full f64 scatter oracles cover padding,
+stride and tile edges. Shared bugs, untested domains and convergence still
+require independent evidence. A qualified isolated winner is not automatically
+a whole-step win. [Contract and experiment](../experiments/conv-tiles-2026-09-06/README.md).
 
 ## Talk outline
 

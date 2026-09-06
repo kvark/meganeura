@@ -8,6 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "staging-reuse-2026-09-06",
         ["fresh", "reuse"],
         [TuneStagingReuse::Fresh, TuneStagingReuse::SameSize].map(|staging_reuse| TuneOptions {
+            scope: meganeura::TuneScope::Dense,
             staging: TuneStaging::Download,
             staging_reuse,
             max_time: std::time::Duration::from_secs(10),

@@ -46,7 +46,8 @@ family-wide cooperative demotion tuner with bounded exact-class f32-matmul
 search. Scalar 32/64 tiles and advertised, smoke-tested native-f32 cooperative
 tiles can compete. Cooperative occupancy and native-8 large-shape thresholds
 choose the initial implementation, not the legal challengers in this domain.
-Other kernel families still use heuristics. Winners are not persisted. The misleadingly named
+Scalar convolution dX/dW now also expose their existing 32/64 tiles to this
+bounded search. Other kernel families still use heuristics. Winners are not persisted. The misleadingly named
 `runtime::auto_tune` is capability probing.
 
 The CPU-only shape census now exposes the amount of repeated work. A full
@@ -67,7 +68,7 @@ The diagnostic's old fixed barrier-cost estimate was removed. The absence of
 matches in its narrow legacy fusion matcher does not establish absence of
 optimization opportunities.
 
-## Implemented search: scalar and native-f32 matmul tiles
+## Implemented search: dense tiles and scalar convolution derivatives
 
 `Session::tune()` uses defaults; `Session::tune_with(TuneOptions)` returns a
 serializable `TuneReport`. `SessionConfig { tune: true }` invokes the safe
@@ -83,7 +84,7 @@ behind as a second unsafe default path.
 
 | Contract | Current implementation |
 |---|---|
-| Search space | Existing 32×32 and 64×64 scalar-f32 implementations, plus the device's native-f32 cooperative 8×8 or 16×16 primitive (2×2 output primitives/workgroup), for plain MatMul, MatMulAT, MatMulBT and forward MatMul+Add. |
+| Search space | Existing 32×32 and 64×64 scalar-f32 implementations, plus the device's native-f32 cooperative 8×8 or 16×16 primitive (2×2 output primitives/workgroup), for plain MatMul, MatMulAT, MatMulBT and forward MatMul+Add. Scalar tiles also cover convolution dX/dW, as detailed below. |
 | Eligibility | Contiguous row-major f32; fixed supported binding arity; nonzero checked extents; portable workgroup limits; non-overlapping physical bindings. Cooperative candidates honor session policy, capability/smoke tests and existing binding capacity. No f16-input/compensated cooperative, GEMV, horizontal packs, arbitrary prologues/epilogues or reduced storage. |
 | Exact class | Entry/direction, M/N/K, derivative precision requirement, declared binding capacities and A/B/addend/output placement. Different initial choices are separate searches. No device-to-device transfer. |
 | Complete candidate | Exact pipeline key, variant flags, scalar fallback and recalculated X/Y/Z geometry together; cooperative and scalar axes differ. Logical extents, bindings, access sets and allocation plan stay fixed. Lazy shader rejection is reported; no fallback lookup during trials. |
@@ -93,7 +94,29 @@ behind as a second unsafe default path.
 | Timing | Default six complete pairs, alternating AB/BA order; each sample encodes/submits/waits for 16 barrier-delimited repeated dispatches. Upload/qualification/readback excluded from samples, included in total cost. |
 | Decision | Up to two sequential challenger comparisons per class. Each uses the last accepted winner as incumbent. Candidate median and median paired gain must beat a 5% margin plus twice the MAD of paired differences. Noise guard is not a confidence interval. Invalid/incomplete comparisons retain the incumbent, including a completed earlier winner. |
 | Budget | Default eight classes, 64 MiB GPU scratch including staging, two-second soft total deadline, one warmup per variant. An in-flight driver/validation/submission operation can overrun. Pipeline/CPU memory is not charged to the scratch byte cap. |
-| Priority/reporting | Descending repetition×M×N×K structural prior, stable ties; resolved settings, eligible/visited classes, per-comparison and pipeline costs, exclusions, scratch/time/device-memory skips, qualification/rejection details and raw timings. This prior orders searches, never declares a winner. |
+| Priority/reporting | Descending repetition×M×N×K×Z structural prior (Z is batch for dX, otherwise 1), stable ties; resolved settings, eligible/visited classes, per-comparison and pipeline costs, exclusions, scratch/time/device-memory skips, qualification/rejection details and raw timings. This prior orders searches, never declares a winner. |
+
+The dense contract above now extends to scalar NCHW convolution dX/dW, with
+`TuneScope::{Dense, ConvDerivatives, All}` selecting the experiment domain.
+New options use All; tuning remains default-off. Old missing scope settings
+deserialize as Dense, and historical runners explicitly keep Dense.
+
+`TuneClass.conv2d` records all twelve convolution parameters. Equal M/N/K is
+not enough: kernel aspect ratio, stride and padding change gathered values,
+and batch changes physical NCHW storage. dX uses M=Ci, N=H×W,
+K=Co×Kh×Kw and Z=batch; dW uses M=Co, N=Ci×Kh×Kw, K=batch×Oh×Ow and Z=1.
+Priority includes Z, and scratch/readback sizes use physical tensors without
+allocating im2col. Tile choices change the distinct Small/large shader entry
+and geometry together; dense `use_small_tiles` is not a convolution flag.
+
+Both scalar variants retain f32 arithmetic. The full finite/cross-variant
+scans include all dX batches, while the 32 f64 dots use convolution indexing
+and explicit first/last/scattered batches. Checked integer products and signed
+coordinates reject overflow; existing reciprocal index decomposition must be
+exact at every quotient interval's endpoints within exactly representable
+integer inputs. Monotonicity then covers the interior. This restriction excludes
+unsafe search domains; it does not fix those pre-existing kernels. Forward and
+cooperative convolution remain outside this search.
 | Lifetime | Choices affect this session only. Semantic plan cache and frozen results stay untouched. |
 
 The former small-tile occupancy cutoff is now an **initial choice**, not a
@@ -286,10 +309,15 @@ Whisper. These F+L+B-only profiles rank work; they neither measure optimizer
 passes nor establish candidate gains. A newly exposed non-same-padding dX bug
 is fixed before widening the search, with full independent f64 derivative tests.
 
-Next, extend exact-class qualification and selection to the existing 32/64
-convolution derivative tiles. The long-reduction, small-output dW classes
-motivate a later bounded split-K candidate, including its partial storage and
-final reduction. Keep these measured choices about algebra, not model names.
+Exact-class qualification and selection for the existing 32/64 convolution
+derivative tiles are implemented. The [separate crossover protocol](../experiments/conv-tiles-2026-09-06/README.md)
+checks ResNet F+L+B and small Adam/SGD convolution chains. Independent full
+f64 scatter oracles cover eight shapes and both tiles before/after search,
+ordinary/tiny gradients, state isolation and budget skips. Distinct-state
+Adam swaps cover subsequent accumulation/clipping updates as well.
+The long-reduction, small-output dW classes motivate the next bounded split-K
+candidate, including its partial storage and final reduction. Keep these
+measured choices about algebra, not model names.
 Do not infer that cross-call pools, larger budgets
 or weaker checks follow from this result. Cheaper search neither supplies
 convolution candidates nor turns MLP's earlier inconclusive whole-step ratios

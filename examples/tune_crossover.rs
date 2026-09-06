@@ -13,7 +13,7 @@ mod workloads;
 use crossover::{BLOCK_PAIRS, Block, CONTROL_PAIRS, Confirmation, PREFIX, Pair, SETTLING, WARMUP};
 use experiment_io::{command, host_sample, sha256, unix_ms, write_record};
 use measurement::TensorComparison;
-use meganeura::{CoopPolicy, Session, TuneOptions};
+use meganeura::{CoopPolicy, Session, TuneOptions, TuneScope};
 use serde_json::{Value, json};
 use std::{
     error::Error,
@@ -80,6 +80,7 @@ fn run_case(
     gpu: &Arc<blade_graphics::Context>,
     policy: CoopPolicy,
     seed: usize,
+    scope: TuneScope,
 ) -> Result<Value, Box<dyn Error>> {
     let (left, left_build) = make_session(case, gpu, policy);
     let (right, right_build) = make_session(case, gpu, policy);
@@ -90,6 +91,10 @@ fn run_case(
         "seed": seed, "status": "running", "build": [left_build, right_build],
         "baseline_pipeline_keys": baseline_keys, "initial_memory": [memory(&sessions[0]), memory(&sessions[1])],
         "host_start": host_sample(), "blocks": []});
+    if scope == TuneScope::ConvDerivatives {
+        record["baseline_dispatches"] = serde_json::to_value(&sessions[0].plan().dispatches)?;
+        record["plan_buffers"] = json!(sessions[0].plan().buffers);
+    }
     let mut age = 0;
     advance(&mut sessions, PREFIX, &mut age);
     let prefix = snapshots(&mut sessions, case);
@@ -137,6 +142,7 @@ fn run_case(
         "finished_unix_ms": aa_finished_ms, "pairs": control, "comparison": aa_comparison});
     let first_winner = seed % 2;
     let search = sessions[first_winner].tune_with(TuneOptions {
+        scope,
         max_time: Duration::from_secs(10),
         ..Default::default()
     })?;
@@ -156,6 +162,10 @@ fn run_case(
         return Ok(record);
     }
     let winner_keys = sessions[first_winner].dispatch_pipeline_keys();
+    if scope == TuneScope::ConvDerivatives {
+        record["selected_dispatches"] =
+            serde_json::to_value(&sessions[first_winner].plan().dispatches)?;
+    }
     let changed = baseline_keys
         .iter()
         .zip(&winner_keys)
@@ -262,15 +272,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args_os().skip(1);
     let path = args
         .next()
-        .ok_or("usage: tune_crossover <new-output.json> <seed 1..6>")?;
+        .ok_or("usage: tune_crossover <new-output.json> <seed 1..6> [--conv-derivatives]")?;
     let seed: usize = args
         .next()
         .ok_or("missing seed")?
         .to_str()
         .ok_or("non-UTF8 seed")?
         .parse()?;
+    let scope = match args.next() {
+        None => TuneScope::Dense,
+        Some(arg) if arg == "--conv-derivatives" => TuneScope::ConvDerivatives,
+        _ => return Err("unknown search scope".into()),
+    };
     if !(1..=6).contains(&seed) || args.next().is_some() {
-        return Err("expected one output and seed 1..6".into());
+        return Err("expected one output, seed 1..6, optional --conv-derivatives".into());
     }
     if !command("git", &["status", "--porcelain", "--untracked-files=no"])?.is_empty() {
         return Err("commit tracked source before measuring".into());
@@ -286,23 +301,33 @@ fn main() -> Result<(), Box<dyn Error>> {
     } else {
         CoopPolicy::Disabled
     };
-    let mut document = json!({"schema_version": 1, "protocol": "crossover-2026-09-06", "status": "running",
+    let protocol = if scope == TuneScope::ConvDerivatives {
+        "conv-tiles-2026-09-06"
+    } else {
+        "crossover-2026-09-06"
+    };
+    let mut document = json!({"schema_version": 1, "protocol": protocol, "status": "running",
         "metadata": {"revision": command("git", &["rev-parse", "HEAD"])?, "tracked_source_clean": true,
             "cargo_lock_sha256": sha256(&Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"))?,
             "executable_sha256": sha256(&std::env::current_exe()?)?, "rustc": command("rustc", &["--version"])?,
-            "seed": seed, "process_id": std::process::id(), "started_unix_ms": unix_ms(),
+            "seed": seed, "scope": scope, "process_id": std::process::id(), "started_unix_ms": unix_ms(),
             "device": {"name": info.device_name, "driver": info.driver_info, "f32_tile": caps.f32_tile, "f16_tile": caps.f16_tile},
             "cooperative_policy": format!("{policy:?}"), "compile_options": compile_options(),
             "runtime_options": format!("{:?}", runtime_options(policy)), "optimize": meganeura::optimize::OptimizeConfig::default(),
             "prefix": PREFIX, "warmup": WARMUP, "settling": SETTLING, "control_pairs": CONTROL_PAIRS, "block_pairs": BLOCK_PAIRS,
             "contract": "strict f32; matched evolving states; step+wait including optimizer/clip; telemetry active; swapping/search/readbacks/settling excluded",
             "nvidia_smi_before": before, "rustflags": std::env::var("RUSTFLAGS").ok(),
-            "optimizer": {"adam_lr": 1e-4, "beta1": 0.9, "beta2": 0.999, "epsilon": 1e-8, "clip_norm": 1.0, "clip_every": 1, "accumulation": false, "decay": 0.0}}, "cases": []});
+            "optimizer": {"adam_lr": 1e-4, "sgd_lr": 1e-3, "beta1": 0.9, "beta2": 0.999, "epsilon": 1e-8, "clip_norm": 1.0, "clip_every": 1, "accumulation": false, "decay": 0.0}}, "cases": []});
     write_record(&mut output, &document)?;
     let mut valid = true;
-    for (index, case) in crossover_cases().into_iter().enumerate() {
+    let cases = if scope == TuneScope::ConvDerivatives {
+        conv_derivative_cases()
+    } else {
+        crossover_cases()
+    };
+    for (index, case) in cases.into_iter().enumerate() {
         eprintln!("running {}", case.name);
-        let record = run_case(&case, &gpu, policy, seed + index).unwrap_or_else(
+        let record = run_case(&case, &gpu, policy, seed + index, scope).unwrap_or_else(
             |e| json!({"name": case.name, "status": "error", "error": e.to_string()}),
         );
         valid &= record["status"] == "complete";
@@ -333,6 +358,13 @@ mod tests {
             crossover_cases().iter().map(|c| c.name).collect::<Vec<_>>(),
             ["dense-inference", "mlp-adam", "resnet50-flb"]
         );
+        assert_eq!(
+            conv_derivative_cases()
+                .iter()
+                .map(|c| c.name)
+                .collect::<Vec<_>>(),
+            ["resnet50-flb", "conv-edges-adam", "conv-edges-sgd"]
+        );
         for case in 0..3 {
             assert_eq!((1..=6).filter(|seed| (seed + case) % 2 == 0).count(), 3);
         }
@@ -342,7 +374,7 @@ mod tests {
     #[ignore = "GPU numerical preflight; no search or performance confirmation"]
     fn crossover_prefix_and_noop_swap_are_numerically_sound() {
         let gpu = Arc::new(meganeura::init_gpu_context().unwrap());
-        for case in crossover_cases() {
+        for case in crossover_cases().into_iter().chain(conv_derivative_cases()) {
             let mut sessions = [
                 make_session(&case, &gpu, CoopPolicy::Disabled).0,
                 make_session(&case, &gpu, CoopPolicy::Disabled).0,

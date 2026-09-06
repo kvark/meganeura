@@ -74,6 +74,7 @@ fn run_case(case: &Case, gpu: &Arc<blade_graphics::Context>) -> Result<Value, Bo
         "dispatch_contracts": session.plan().dispatches});
     // A zero deadline reports exact eligibility without compiling, allocating or selecting.
     record["search_census"] = serde_json::to_value(session.tune_with(TuneOptions {
+        scope: meganeura::TuneScope::Dense,
         max_time: Duration::ZERO,
         ..Default::default()
     })?)?;

@@ -257,6 +257,15 @@ box. Trace bundles can contain model source: review them before sharing.
 
 ## Make autotuning explainable from its first version
 
+Convolution-derivative searches add `TuneOptions.scope` and the optional
+`TuneClass.conv2d` shape. Inspect all twelve NCHW convolution parameters, not
+just M/N/K: dX also has batch in dispatch Z. Scalar convolution tiles appear
+as distinct Small/large shader entries, unlike dense `use_small_tiles`.
+The [convolution crossover](../experiments/conv-tiles-2026-09-06/README.md)
+archives complete before/after dispatches and declared buffer sizes so a
+selection can be traced back to its exact class. Missing historical scope is
+Dense; missing convolution shape means a dense class, not an unknown batch.
+
 `Session::tune_with(TuneOptions)` returns a serializable `TuneReport` rather
 than only logging a winner. Inspect exact
 `(shader,M,N,K,precision,binding capacity,placement)` classes, eligible/visited

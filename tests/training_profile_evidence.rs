@@ -371,9 +371,10 @@ fn validate(record: &Value, seed: usize) {
             previous = time;
         }
         let census: TuneReport = serde_json::from_value(case["search_census"].clone()).unwrap();
+        assert!(case["search_census"]["options"].get("scope").is_none());
         assert_eq!(
             serde_json::to_value(census.options).unwrap(),
-            json!({"max_time":{"secs":0,"nanos":0}, "max_classes":8,
+            json!({"scope":"Dense", "max_time":{"secs":0,"nanos":0}, "max_classes":8,
                 "max_scratch_bytes":67108864, "staging":"Download", "staging_reuse":"SameSize",
                 "warmup_runs":1, "sample_pairs":6, "dispatches_per_sample":16, "min_improvement":0.05})
         );

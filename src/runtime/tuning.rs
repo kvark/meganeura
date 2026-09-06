@@ -42,32 +42,48 @@ impl Pipelines {
         if self.map.contains_key(&key) {
             return Ok(());
         }
-        let module = match tile {
-            MatmulTile::Tile32 => crate::codegen::generate_module_small(entry.shader_group()),
-            MatmulTile::Tile64 => crate::codegen::generate_module(entry.shader_group()),
-            MatmulTile::CooperativeF32 { .. } => crate::codegen::generate_module_coop(
-                entry.shader_group(),
-                &tile.coop_config().expect("cooperative candidate"),
-            ),
-        };
+        let selected_entry = tile.shader(entry);
+        let module = tile_module(entry, tile);
         let shader = gpu
             .try_create_shader(bg::ShaderDesc {
                 source: &module.source,
                 naga_module: Some(module.module),
             })
             .map_err(|error| error.to_string())?;
-        let layout = super::shader_data_layout(entry);
+        let layout = super::shader_data_layout(&selected_entry);
         let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-            name: entry.entry_point(),
+            name: selected_entry.entry_point(),
             data_layouts: &[&layout],
-            compute: shader.at(entry.entry_point()),
+            compute: shader.at(selected_entry.entry_point()),
         });
         self.map.insert(key, pipeline);
         Ok(())
     }
 }
 
+fn tile_module(entry: &ShaderEntry, tile: MatmulTile) -> crate::codegen::ShaderModule {
+    let selected_entry = tile.shader(entry);
+    if selected_entry != *entry {
+        crate::codegen::generate_module(selected_entry.shader_group())
+    } else {
+        match tile {
+            MatmulTile::Tile32 => crate::codegen::generate_module_small(entry.shader_group()),
+            MatmulTile::Tile64 => crate::codegen::generate_module(entry.shader_group()),
+            MatmulTile::CooperativeF32 { .. } => crate::codegen::generate_module_coop(
+                entry.shader_group(),
+                &tile.coop_config().expect("cooperative candidate"),
+            ),
+        }
+    }
+}
+
 fn tile_variant(entry: &ShaderEntry, tile: MatmulTile) -> Variant {
+    if matches!(
+        entry,
+        ShaderEntry::Conv2dGradInputGemm | ShaderEntry::Conv2dGradWeightGemm
+    ) {
+        return Variant::Scalar(tile.shader(entry));
+    }
     match tile {
         MatmulTile::Tile32 => Variant::SmallTile(entry.clone()),
         MatmulTile::Tile64 => Variant::Scalar(entry.clone()),
@@ -200,20 +216,24 @@ fn collect_classes(
     // contractions. Stable ties keep the source dispatch order deterministic.
     classes.sort_by_key(|c| {
         std::cmp::Reverse(
-            c.members.len() as u128 * c.key.m as u128 * c.key.n as u128 * c.key.k as u128,
+            c.members.len() as u128
+                * c.key.m as u128
+                * c.key.n as u128
+                * c.key.k as u128
+                * c.key.batch_dispatches() as u128,
         )
     });
     (classes, excluded)
 }
 
 impl Session {
-    /// Exchange eligible f32 matmul choices without exchanging tensor state.
+    /// Exchange eligible f32 tile choices without exchanging tensor state.
     ///
     /// This supports controlled crossover experiments, not automatic confirmation,
     /// arbitrary report application, or persistent/cross-device winner reuse.
     /// Sessions must share the exact GPU context, cooperative policy after smoke
     /// tests, allocation layout, generator knobs and scheduling groups. Dispatches
-    /// may differ only in complete legal matmul tile selection. Callers remain
+    /// may differ only in complete legal tile selection. Callers remain
     /// responsible for matching inputs, weights, optimizer settings and training age.
     ///
     /// Preflights the entire swap, prepares missing pipelines, then waits for both
@@ -282,7 +302,8 @@ impl Session {
     }
 
     /// Search scalar tiles and advertised, smoke-tested native-f32 cooperative
-    /// matmul for exact eligible classes. Occupancy/large-shape thresholds only
+    /// matmul, plus scalar convolution derivatives, for exact eligible classes.
+    /// Occupancy/large-shape thresholds only
     /// choose the starting implementation; they do not remove challengers.
     ///
     /// Each class uses private scratch with matching memory placement and two
@@ -291,7 +312,11 @@ impl Session {
     /// dots before alternating, batched `encode+submit+wait` measurements.
     /// The result is an isolated-kernel choice, not an end-to-end speed claim.
     ///
-    /// Forward MatMul+Add is supported; other prologues/epilogues, horizontal
+    /// Forward MatMul+Add and unpacked NCHW scalar convolution dX/dW are supported;
+    /// convolution keys include batch, channels, spatial extents, kernel, stride
+    /// and padding. Existing reciprocal index decomposition must be exact over
+    /// its full domain. Forward/cooperative convolutions remain excluded.
+    /// Other prologues/epilogues, horizontal
     /// packs, f16-input cooperative, reduced-storage, GEMV and overlapping-binding
     /// dispatches are excluded. Winners live in this session, not the plan cache.
     /// Only selected dispatch geometry and pipeline resources change. No graph
@@ -304,8 +329,16 @@ impl Session {
     pub fn tune_with(&mut self, options: TuneOptions) -> Result<TuneReport, TuneError> {
         options.validate()?;
         let start = Instant::now();
-        let (classes, excluded_dispatches) =
+        let (mut classes, mut excluded_dispatches) =
             collect_classes(&self.plan, &self.alias, self.coop_config.as_ref());
+        classes.retain(|class| {
+            if options.scope.includes(&class.key) {
+                true
+            } else {
+                excluded_dispatches += class.members.len();
+                false
+            }
+        });
         let mut report = TuneReport {
             options: options.clone(),
             eligible_classes: classes.len(),
@@ -702,7 +735,7 @@ impl<'gpu, 'trial> Scratch<'gpu, 'trial> {
         ensure_device_memory_budget(
             gpu,
             bytes - staging.stats.retained_staging_bytes,
-            "matmul tuning scratch",
+            "kernel tuning scratch",
         );
         drop(checks);
         let buffers_time = PhaseTimer::new(&mut preparation.buffers);
@@ -729,7 +762,7 @@ impl<'gpu, 'trial> Scratch<'gpu, 'trial> {
         drop(staging_time);
         let encoder_time = PhaseTimer::new(&mut preparation.encoder);
         let encoder = gpu.create_command_encoder(bg::CommandEncoderDesc {
-            name: "matmul_tune",
+            name: "kernel_tune",
             buffer_count: 1,
             manual_barriers: false,
         });
@@ -739,7 +772,7 @@ impl<'gpu, 'trial> Scratch<'gpu, 'trial> {
             buffers,
             staging,
             staging_reused,
-            output_elements: class.m as usize * class.n as usize,
+            output_elements: class.output_elements(),
             encoder,
             cleanup,
         }
@@ -799,7 +832,7 @@ impl<'gpu, 'trial> Scratch<'gpu, 'trial> {
         let start = Instant::now();
         self.encoder.start();
         for _ in 0..repeats {
-            let mut pass = self.encoder.compute("tune_matmul");
+            let mut pass = self.encoder.compute("tune_kernel");
             let mut pc = pass.with(pipeline);
             Session::bind_dispatch(&self.buffers, dispatch, &mut pc);
             pc.dispatch(dispatch.workgroups);
@@ -861,6 +894,71 @@ fn outputs_agree(reference: &[f32], actual: &[f32], scale: f64) -> bool {
 }
 
 fn reference_dot(class: &TuneClass, inputs: &[Vec<f32>], row: usize, col: usize) -> f64 {
+    if let Some(s) = class.conv2d {
+        let [ci, h, w, co, kh, kw, stride, ph, oh, ow, pw] = [
+            s.in_channels,
+            s.in_h,
+            s.in_w,
+            s.out_channels,
+            s.kernel_h,
+            s.kernel_w,
+            s.stride,
+            s.padding_h,
+            s.out_h,
+            s.out_w,
+            s.padding_w,
+        ]
+        .map(|v| v as usize);
+        let mut value = 0.0;
+        if class.shader == ShaderEntry::Conv2dGradInputGemm {
+            // Flatten batch and channel into the reference row, never into K.
+            let (batch, channel) = (row / ci, row % ci);
+            for out_channel in 0..co {
+                for y in 0..kh {
+                    for x in 0..kw {
+                        let Some(oy) = (col / w + ph).checked_sub(y) else {
+                            continue;
+                        };
+                        let Some(ox) = (col % w + pw).checked_sub(x) else {
+                            continue;
+                        };
+                        if !oy.is_multiple_of(stride)
+                            || !ox.is_multiple_of(stride)
+                            || oy / stride >= oh
+                            || ox / stride >= ow
+                        {
+                            continue;
+                        }
+                        let a = ((batch * co + out_channel) * oh + oy / stride) * ow + ox / stride;
+                        let b = ((out_channel * ci + channel) * kh + y) * kw + x;
+                        value += inputs[0][a] as f64 * inputs[1][b] as f64;
+                    }
+                }
+            }
+        } else {
+            let channel = col / (kh * kw);
+            let (y, x) = (col / kw % kh, col % kw);
+            for batch in 0..s.batch as usize {
+                for oy in 0..oh {
+                    for ox in 0..ow {
+                        let Some(iy) = (oy * stride + y).checked_sub(ph) else {
+                            continue;
+                        };
+                        let Some(ix) = (ox * stride + x).checked_sub(pw) else {
+                            continue;
+                        };
+                        if iy >= h || ix >= w {
+                            continue;
+                        }
+                        let a = ((batch * co + row) * oh + oy) * ow + ox;
+                        let b = ((batch * ci + channel) * h + iy) * w + ix;
+                        value += inputs[0][a] as f64 * inputs[1][b] as f64;
+                    }
+                }
+            }
+        }
+        return value;
+    }
     let (m, n, k) = (class.m as usize, class.n as usize, class.k as usize);
     let mut value = if class.has_addend() {
         inputs[2][row * n + col] as f64
@@ -884,7 +982,7 @@ fn reference_dot(class: &TuneClass, inputs: &[Vec<f32>], row: usize, col: usize)
 }
 
 fn qualify_output(class: &TuneClass, inputs: &[Vec<f32>], output: &[f32], scale: f64) -> bool {
-    if output.iter().any(|x| !x.is_finite()) {
+    if output.len() != class.output_elements() || output.iter().any(|x| !x.is_finite()) {
         return false;
     }
     let (m, n) = (class.m as usize, class.n as usize);
@@ -908,6 +1006,19 @@ fn qualify_output(class: &TuneClass, inputs: &[Vec<f32>], output: &[f32], scale:
             edges[edges.len() - 1 - i].min(n - 1)
         } else {
             i * 130363 % n
+        };
+        let row = if class.conv2d.is_some() {
+            // Exercise first/last batches explicitly, then scattered batches.
+            let batches = class.batch_dispatches() as usize;
+            row + (if i % 2 == 0 {
+                0
+            } else if i < 13 {
+                batches - 1
+            } else {
+                i * 8191 % batches
+            }) * m
+        } else {
+            row
         };
         if !close(
             reference_dot(class, inputs, row, col),
@@ -980,12 +1091,34 @@ mod tests {
     #[test]
     #[ignore = "GPU state/crossover qualification; does not select winners by timing"]
     fn tuning_swap_keeps_distinct_training_states_and_next_updates() {
+        for convolution in [false, true] {
+            check_distinct_training_swap(convolution);
+        }
+    }
+
+    fn check_distinct_training_swap(convolution: bool) {
         use crate::{CoopPolicy, SessionConfig, SessionOptions};
         let gpu = std::sync::Arc::new(crate::init_gpu_context().unwrap());
         let mut graph = crate::Graph::new();
-        let x = graph.input("x", &[33, 17]);
+        let input_len = if convolution {
+            2 * 17 * 3 * 11
+        } else {
+            33 * 17
+        };
+        let x = graph.input(
+            "x",
+            &if convolution {
+                [2 * 3 * 11, 17]
+            } else {
+                [33, 17]
+            },
+        );
         let w = graph.parameter("w", &[17, 65]);
-        let y = graph.matmul(x, w);
+        let y = if convolution {
+            graph.conv2d_hw(x, w, 2, 17, 3, 11, 65, 1, 1, 1, 0, 0)
+        } else {
+            graph.matmul(x, w)
+        };
         let loss = graph.mean_all(y);
         graph.set_outputs(vec![loss]);
         let make = |input: f32, steps: usize| {
@@ -1001,7 +1134,7 @@ mod tests {
                     ..Default::default()
                 },
             );
-            s.set_input("x", &vec![input; 33 * 17]);
+            s.set_input("x", &vec![input; input_len]);
             s.set_parameter("w", &vec![0.125; 17 * 65]);
             s.set_adam(0.001, 0.9, 0.999, 1e-8);
             s.set_grad_clip_norm(0.05);
@@ -1150,6 +1283,7 @@ mod tests {
                     m,
                     n,
                     k,
+                    conv2d: None,
                     requires_full_precision: true,
                     device_local: [device_local; 4],
                     binding_bytes: Vec::new(),
@@ -1225,6 +1359,7 @@ mod tests {
                 m: 3,
                 n,
                 k: 5,
+                conv2d: None,
                 requires_full_precision: false,
                 device_local: [true; 4],
                 binding_bytes: Vec::new(),
@@ -1311,6 +1446,7 @@ mod tests {
             m: 2,
             n: 2,
             k: 3,
+            conv2d: None,
             requires_full_precision: false,
             device_local: [false; 4],
             binding_bytes: Vec::new(),
@@ -1380,6 +1516,8 @@ mod tests {
             ShaderEntry::FusedMatMulAdd,
             ShaderEntry::MatMulAT,
             ShaderEntry::MatMulBT,
+            ShaderEntry::Conv2dGradInputGemm,
+            ShaderEntry::Conv2dGradWeightGemm,
         ] {
             for tile in [
                 MatmulTile::Tile32,
@@ -1387,16 +1525,20 @@ mod tests {
                 MatmulTile::CooperativeF32 { tile_size: 8 },
                 MatmulTile::CooperativeF32 { tile_size: 16 },
             ] {
-                let mut module = match tile {
-                    MatmulTile::Tile32 => {
-                        crate::codegen::generate_module_small(entry.shader_group())
-                    }
-                    MatmulTile::Tile64 => crate::codegen::generate_module(entry.shader_group()),
-                    MatmulTile::CooperativeF32 { .. } => crate::codegen::generate_module_coop(
-                        entry.shader_group(),
-                        &tile.coop_config().unwrap(),
-                    ),
-                };
+                let convolution = matches!(
+                    entry,
+                    ShaderEntry::Conv2dGradInputGemm | ShaderEntry::Conv2dGradWeightGemm
+                );
+                if convolution && tile.coop_config().is_some() {
+                    continue;
+                }
+                if convolution {
+                    assert_eq!(
+                        tile_variant(&entry, tile),
+                        Variant::Scalar(tile.shader(&entry))
+                    );
+                }
+                let mut module = tile_module(&entry, tile);
                 // Blade assigns resource bindings by ShaderData field name.
                 // Assign distinct test bindings before full offline validation.
                 for (index, (_, var)) in module.module.global_variables.iter_mut().enumerate() {
@@ -1441,10 +1583,13 @@ mod tests {
                     .map(|(_, var)| var.name.as_deref().unwrap())
                     .collect();
                 names.sort_unstable();
-                let expected = if entry == ShaderEntry::FusedMatMulAdd {
-                    vec!["matrix_a", "matrix_b", "matrix_c", "params", "src"]
-                } else {
-                    vec!["matrix_a", "matrix_b", "matrix_c", "params"]
+                let expected = match entry {
+                    ShaderEntry::FusedMatMulAdd => {
+                        vec!["matrix_a", "matrix_b", "matrix_c", "params", "src"]
+                    }
+                    ShaderEntry::Conv2dGradInputGemm => vec!["dst", "grad_out", "params", "weight"],
+                    ShaderEntry::Conv2dGradWeightGemm => vec!["dst", "grad_out", "params", "src"],
+                    _ => vec!["matrix_a", "matrix_b", "matrix_c", "params"],
                 };
                 assert_eq!(names, expected);
             }
@@ -1464,6 +1609,7 @@ mod tests {
                 m: 3,
                 n: 5,
                 k: 7,
+                conv2d: None,
                 requires_full_precision: true,
                 device_local: [false; 4],
                 binding_bytes: Vec::new(),
