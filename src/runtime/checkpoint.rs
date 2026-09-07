@@ -47,8 +47,19 @@ fn logical_bytes(ty: &TensorType) -> io::Result<usize> {
 
 fn parameters(plan: &ExecutionPlan) -> io::Result<Vec<Parameter>> {
     let mut seen = HashSet::new();
+    // Winograd execution caches are regenerated from retained logical weights
+    // on every forward pass. Other derived/packed weights may be authoritative;
+    // never filter those, or ordinary parameters, by a naming convention.
+    let caches: HashSet<_> = plan
+        .derived_params
+        .iter()
+        .filter_map(|(buffer, _, transform)| {
+            matches!(transform, crate::graph::ParamTransform::Winograd3x3 { .. }).then_some(*buffer)
+        })
+        .collect();
     plan.param_buffers
         .iter()
+        .filter(|(_, buffer)| !caches.contains(buffer))
         .map(|&(ref name, buffer)| {
             if !seen.insert(name) {
                 return Err(invalid(format!("duplicate parameter name {name:?}")));

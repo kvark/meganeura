@@ -1626,6 +1626,7 @@ pub fn apply_winograd_conv_fusions(
         log::info!("Winograd convolution disabled by OptimizeConfig::no_winograd");
         return;
     }
+    let mut transformed = HashMap::new();
     let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
     for &id in &node_ids {
         let node = &graph.nodes()[id];
@@ -1679,28 +1680,38 @@ pub fn apply_winograd_conv_fusions(
         };
         let input_id = node.inputs[0];
 
-        // Create Winograd weight parameter name
-        let wino_name = format!("{}:winograd", weight_name);
+        let key = (weight_id, in_channels, out_channels);
+        let wino_param = if let Some(&parameter) = transformed.get(&key) {
+            graph.nodes_mut()[parameter as usize].requires_full_precision |=
+                requires_full_precision;
+            parameter
+        } else {
+            // One transform per logical weight and channel layout.
+            let wino_name = format!("{}:winograd", weight_name);
 
-        // Record derivation so runtime can fill this from original weights
-        graph.derived_params.push(crate::graph::DerivedParam {
-            name: wino_name.clone(),
-            sources: vec![(weight_name, (out_channels * in_channels * 9) as usize)],
-            rows: 1, // not used for Winograd
-            transform: crate::graph::ParamTransform::Winograd3x3 {
-                out_channels: out_channels as usize,
-                in_channels: in_channels as usize,
-            },
-        });
+            // Record derivation so runtime can fill this from original weights
+            graph.derived_params.push(crate::graph::DerivedParam {
+                name: wino_name.clone(),
+                sources: vec![(weight_name, (out_channels * in_channels * 9) as usize)],
+                rows: 1, // not used for Winograd
+                transform: crate::graph::ParamTransform::Winograd3x3 {
+                    out_channels: out_channels as usize,
+                    in_channels: in_channels as usize,
+                },
+            });
 
-        // Create new parameter node for Winograd-transformed weights [16 * Co * Ci]
-        let wino_size = 16 * out_channels as usize * in_channels as usize;
-        let wino_param = graph.add_raw_node_with_precision(
-            Op::Parameter { name: wino_name },
-            vec![],
-            TensorType::f32(vec![wino_size]),
-            requires_full_precision,
-        );
+            // Create new parameter node for Winograd-transformed weights [16 * Co * Ci]
+            let wino_size = 16 * out_channels as usize * in_channels as usize;
+            let parameter = graph.add_raw_node_with_precision(
+                Op::Parameter { name: wino_name },
+                vec![],
+                TensorType::f32(vec![wino_size]),
+                requires_full_precision,
+            );
+
+            transformed.insert(key, parameter);
+            parameter
+        };
 
         // Rewrite Conv2d → WinogradConv2d
         // Keep original weight as 3rd input for backward pass (grad_input/grad_weight)
