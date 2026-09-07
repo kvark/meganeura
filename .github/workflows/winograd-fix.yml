@@ -1,0 +1,55 @@
+name: shared Winograd checkpoint validation
+on:
+  pull_request:
+    paths: ['.github/workflows/winograd-fix.yml', '.github/winograd-fix.py', 'tests/shared_winograd_checkpoint.rs']
+permissions:
+  contents: read
+jobs:
+  validate:
+    if: github.head_ref == 'fix/shared-winograd-checkpoints' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - run: |
+          rustup toolchain install 1.92.0 --profile minimal --component rustfmt
+          sudo apt-get update -qq
+          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
+          python3 .github/winograd-fix.py
+          cargo +1.92.0 fmt --all
+          cargo +1.92.0 test --lib checkpoint
+      - name: Direct and Winograd checkpoint parity
+        env:
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
+        run: |
+          cargo +1.92.0 test --test shared_winograd_checkpoint -- --nocapture --test-threads=1
+          cargo +1.92.0 test --test checkpoint_validation -- --test-threads=1
+      - name: Commit tested source only
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          test "$(git ls-remote origin refs/heads/fix/shared-winograd-checkpoints | cut -f1)" = "$EXPECTED_SHA"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rm .github/winograd-fix.py
+          git add src/optimize.rs src/runtime/checkpoint.rs tests/shared_winograd_checkpoint.rs
+          git diff --cached --check
+          git commit -m 'fix: share Winograd caches and keep them out of logical checkpoints'
+          git push origin HEAD:refs/heads/fix/shared-winograd-checkpoints
+      - name: Export formatted files and formatter
+        if: always()
+        run: |
+          mkdir -p /tmp/winograd-validation
+          cp src/optimize.rs src/runtime/checkpoint.rs tests/shared_winograd_checkpoint.rs /tmp/winograd-validation/
+          cp "$(rustup which --toolchain 1.92.0 rustfmt)" /tmp/winograd-validation/rustfmt
+          git rev-parse HEAD > /tmp/winograd-validation/source-sha
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: winograd-validation
+          path: /tmp/winograd-validation
+          retention-days: 7
