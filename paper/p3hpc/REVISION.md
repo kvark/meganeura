@@ -1,15 +1,14 @@
 # P3HPC camera-ready working plan
 
-Prepared September 5, 2026, following acceptance reported by the author.
+Prepared September 5, 2026; updated September 8 after reading all three reviews.
 This is a revised working draft and preparation kit, not a declaration that
-the camera-ready has been approved or submitted. Reviewer text and any
-acceptance-specific conditions were not supplied during the audit.
+the camera-ready has been approved or submitted. Acceptance-specific upload
+conditions and talk instructions still need confirmation.
 
-September 8 follow-up: the author has placed reviews at
-`/home/kvark/Documents/P3HPC`, but that directory is not visible in this
-workspace. The reported baseline concern is independently confirmed in source;
-see [CUDA Graph diagnosis and collection plan](CUDA-GRAPHS.md). Actual review
-text is still required before closing the response matrix.
+The response matrix below paraphrases `review1.txt`, `review2.txt` and
+`review3.txt` supplied at `/home/kvark/Documents/P3HPC`; private review text
+is not copied into Git. The CUDA Graph concern is confirmed in the frozen
+runner; see [the diagnosis and collection plan](CUDA-GRAPHS.md).
 
 ## Dates and constraints
 
@@ -23,8 +22,10 @@ configuration differences.
 [Official P3HPC submission instructions](https://p3hpc.org/workshop/2026/submissions/)
 
 Target a reviewed content freeze by September 19, leaving six days before the
-official deadline. Keep the current frozen measurements unless a clearly
-separated new experiment can be completed, validated and reviewed in time.
+official deadline. A controlled, CUDA-Graph-qualified comparison is now the
+first evidence priority. Keep it separate from the frozen measurements; if
+it cannot be completed and reviewed in time, narrow the baseline claims
+explicitly rather than treating the review concern as resolved.
 
 ## Changes already made
 
@@ -51,31 +52,47 @@ table, frozen source tag or DinoVision imported fragment was modified.
 
 | Window | Work | Done when |
 |---|---|---|
-| Sep 5–7 | Read reviewer feedback; map each request to evidence and a proposed change; study architecture/results | A response matrix exists with no unexplained reviewer item. |
-| Sep 7–10 | Tighten narrative and related work; verify bibliography metadata and every load-bearing number | Abstract, contributions, captions and conclusion use the same populations and qualifications. |
+| Sep 8 | Read all three reviews; map requests to evidence and changes | Response matrix below populated; responses are not yet closed. |
+| Sep 8–10 | Tighten narrative and related work; verify bibliography metadata and every load-bearing number | Abstract, contributions, captions and conclusion use the same populations and qualifications. |
+| Sep 8–13 | Qualify the clean Inferena baseline, then collect a separately versioned, replicated comparison and representative overhead profiles | Graph replay and all validity gates pass; same-campaign engine results, preparation costs and memory are disclosed. |
 | Sep 10–13 | Author reads the full technical argument; rehearse the short talk and challenge questions | Can explain precision rollback, norm gate, oracle exclusion and portability equation without notes. |
-| Sep 13–16 | Optional narrowly scoped additional evidence only if hardware is free and protocol stable; otherwise keep frozen results | New results are separately versioned or explicitly deferred; no mixed-revision speed claims. |
+| Sep 13–16 | Analyze the new cohort and address review items; explicitly defer unavailable platforms or scale extensions | No mixed-revision speed claims, unsupported causal explanations or implied datacenter validation. |
 | Sep 16–19 | Clean PDF build, visual review, artifact replay, final language pass and reviewer-response closure | Author-approved content freeze; clean reviewed commit ready for packaging. |
 | Sep 19–25 | Build deterministic archive, verify extracted bundle, complete venue forms/format checks and submit | Author verifies final upload and all venue requirements; only the author merges/publishes. |
 
-The critical path is claim precision and author understanding, not a new
-performance breakthrough. If a reviewer asks for a materially larger scope,
-follow their/organizer guidance rather than treating this schedule as
-permission to rewrite the study or silently add incomparable measurements.
+The critical path is baseline validity, claim precision and author understanding,
+not a new performance breakthrough. Do not expand this into a datacenter or
+distributed-training campaign without an explicit scope decision.
 
-## Reviewer-response template
+## Reviewer-response matrix
 
-When feedback arrives, add one row per concern, preserving the reviewer's
-meaning and distinguishing required changes from suggestions:
+Status distinguishes a source diagnosis or pilot from completed manuscript
+changes and new evidence. A qualification pilot does not close a performance
+comparison request.
 
 | Review / concern | Response and evidence | Manuscript location | Status |
 |---|---|---|---|
-| Awaiting supplied reviewer text | Do not invent reviewer requests | — | Pending author input |
-| Author-reported CUDA Graph baseline concern | Paper-v1 bypassed legacy explicit capture; clean Inferena experiment adds qualified whole-phase replay and a new cohort plan | Evaluation setup; limitations; `CUDA-GRAPHS.md` | ResNet pilot qualified; remaining workloads and replicated full matrix pending |
+| R1, R2: mixed reference versions, execution modes and CPU fallback | Retain the installed-stack availability result, but distinguish it from a controlled engine comparison. Pin a common PyTorch release where supported; disclose exceptions as separate strata. Keep GPU-reference performance separate from Intel CPU fallback. | Evaluation setup; result tables; portability metric | Frozen GPU-reference aggregates already separate; controlled cohort pending. |
+| R1: missing CUDA Graph baseline for low latency | Paper-v1 bypassed legacy explicit capture. The clean Inferena branch adds qualified whole-phase replay for forward, minimal forward and forward/loss/backward, plus default/no-graph and stronger automatic-mode controls. | Evaluation setup; minimal-latency results; limitations; `CUDA-GRAPHS.md` | ResNet pilot qualified; other workloads, max-autotune qualification and replicated comparison pending. |
+| R1, R2: small workloads and consumer hardware do not establish datacenter scaling | State the consumer/edge research question consistently; identify reduced shapes and absent optimizer/distributed work. Larger-model and datacenter scaling remain unmeasured, not an implied consequence of API portability. | Abstract; introduction; workload definitions; limitations; conclusion | Scope language partly present; consistency pass pending. |
+| R1, R2, R3: deployment efficiency is not programmer productivity | Name compile time and footprint as deployment metrics. Discuss application-author versus backend-maintainer effort, WGSL/API expertise and observability versus eager PyTorch qualitatively; do not invent developer-hours or a productivity score. | Third-P section; introduction; conclusion | Existing caveats and [observability guide](../../docs/study/observability.md) available; heading and narrative revision pending. |
+| R2: separate host/runtime overhead from GPU kernel costs | On representative workloads/platforms, pair synchronized wall time with a GPU timeline and kernel-family profiles; identify encoding/launch, waits and device work. Profile separately from headline timing and report instrumentation effects. Overlap means summed dispatch medians subtracted from wall time are not an exact CPU-cost measurement. | Evaluation setup; minimal-latency results; gap analysis | Targeted frozen profiles exist; systematic decomposition protocol and collection pending. |
+| R2: explain what can be done about the performance gaps | Map each profiled gap to a general measured-selection or kernel-family opportunity, its source-ref experiment outcome and remaining limitation. Distinguish rejected approaches and untested platforms from demonstrated improvements. | Locating the Gaps; conclusion | [Lean experiment conclusions](../../docs/experiments.md) available; manuscript mapping pending. No new frozen-matrix speedup established. |
+| R2, R3: explain the edge experiment and reference Figure 2 | Introduce what DinoVision reconstructs, what is timed and what queue co-tenancy tests before implementation terms; explicitly cite the casting figure. | Edge Deployment Beyond the Matrix | Revision pending; Figure 2 is deployment evidence, not an image-quality or capture-to-photon benchmark. |
+| R3: abrupt abstract, inconsistent terminology, undefined abbreviations/cells, vague contribution, crowded captions | Remove opening KLOC clutter; use one compiler/runtime description; define device–workload–mode comparisons and abbreviations; link the first arithmetic-contract mention to Section III.C. State what profiling explains, and move caption detail into prose. | Abstract; introduction; contributions; captions | Writing and rendered-PDF pass pending. |
+| R3: abstract compile-time range differs from Table III | Frozen records give 0.083–1.518 s strict and 0.083–2.358 s accelerated. Table III reports strict only; the abstract's rounded 0.1–2.4 s spans both. Make the population explicit and use consistent rounding. | Abstract; Table III discussion; deployment section | Numerical source checked; wording revision pending. No record or generated table needs correction. |
+| Prevent two review misreadings | The backend is Blade, not wgpu (shared Naga does not imply a shared runtime). The cross-engine backward gate compares parameter-gradient norms, not every gradient element; full-element capture qualification checks replay integrity within PyTorch only. | Architecture; numerical contracts | Source facts confirmed; reinforce wording during the narrative pass. |
 
 Common questions and prepared responses are in
 [the rehearsal guide](../../docs/study/p3hpc-questions.md); they are anticipated
 discussion topics, not a substitute for actual review comments.
+
+Next evidence gate: qualify the remaining Inferena workloads and automatic
+compiler mode before timing them. Keep graph/uncaptured controls on the same
+device, rotate order across fresh processes, and recollect both engines in
+the same campaign. Do not interpret 20 samples from one process as 20
+independent experimental replicates. Preserve source refs and concise results,
+with generated records and binaries outside main.
 
 ## Evidence and build checks
 
@@ -129,7 +146,8 @@ hide a missing dependency.
 
 ## Final author checklist
 
-- [ ] Incorporate actual reviews and acceptance-specific instructions.
+- [x] Read all three reviews and map concerns to evidence and proposed changes.
+- [ ] Complete the response matrix and confirm acceptance-specific instructions.
 - [ ] Read the complete draft, especially numerical contracts and exclusions.
 - [ ] Check bibliography author order, publication metadata and URLs against
   primary sources; a successful BibTeX build checks syntax, not truth.

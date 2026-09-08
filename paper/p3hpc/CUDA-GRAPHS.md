@@ -75,6 +75,9 @@ against **default-compiled PyTorch without verified CUDA Graph replay**, not
 the strongest automatic CUDA baseline. Small-shape launch-sensitive claims
 need particular care.
 
-The author reported reviewer concern about this baseline. The actual reviews
-at `/home/kvark/Documents/P3HPC` were not visible in this workspace on September
-8; no review-specific quotation or response closure is claimed here.
+All three reviews were read on September 8. Review 1 explicitly challenges
+the missing CUDA Graph baseline; Reviews 1 and 2 also question mixed reference
+versions and execution modes. Review 2 requests a host/runtime-versus-GPU
+breakdown. Capture qualification is therefore necessary but not sufficient:
+the controlled comparison and overhead analysis remain open in the
+[reviewer-response matrix](REVISION.md#reviewer-response-matrix).
