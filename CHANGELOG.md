@@ -1,308 +1,56 @@
-# Unreleased
+# v0.3 (8 Sep 2026)
 
-- Allocate Adam/LaProp moments only on configuration, explicit state write/step
-  or applicable restore. Read-only uninitialized moments return zeros without
-  allocation; switching optimizers retains existing moments and counters.
-  SGD/F+L+B sessions avoid the unused storage. Optimizer/clip/accumulation
-  paths explicitly reject non-F32 trainable parameter storage.
-- Checkpoint format 3 retains named logical shapes/storage types and omits
-  device padding. Validate the full restore before writes or moment allocation;
-  restore reduced-weight CPU staging too. Inference validates/ignores moments,
-  and missing saved moments reset existing state. Formats 1/2 remain readable
-  under their legacy physical/partial-load contract. This is not a complete
-  training-loop snapshot or rollback after device/allocation failure.
-- Preserve logical parameter types in execution plans; build-cache format 5
-  invalidates older plans. `param_size` now counts logical elements independent
-  of storage/padding, batched F32 reads omit padding, and parameter uploads
-  accept logical-sized data while zero-filling larger slots.
-- Use logical lengths for optimizer, clipping and accumulation loops, including
-  CPU helpers; allocation padding must not affect norms or updates. Reject
-  oversized raw F32 reads and non-F32 parameter reads before copying.
-- Correct gradient-accumulator accounting and report resident graph, moment,
-  accumulator and auxiliary buffer requests in `MemorySummary` and profiles.
-  Add checkpoint/memory study material and GPU regression coverage; these
-  quantities do not establish driver peak-memory usage or a timing gain.
+## Inference & models
 
-- Replace the state-mutating family-wide tuner with bounded exact-class
-  32/64 scalar-f32 matmul tile search on private scratch. Adds `TuneOptions`,
-  `tune_with` and serializable evidence, numerical qualification, interleaved
-  trials and a noise guard. Both tile sizes are candidates regardless of the
-  initial occupancy cutoff; small-tile geometry uses exact ceil division.
-  Default-off; scalar GPU qualification passes on RTX 5070, including state
-  preservation and subsequent optimizer updates against an untuned control.
-  `TuneOutcome`'s former family/coop/scalar timing fields are replaced by
-  class/tile/sample/decision fields; callers reading them must migrate.
-- Extend the same search to advertised, smoke-tested native-f32 cooperative
-  tiles when padding fits existing bindings. Occupancy/large-shape thresholds
-  are initial choices, not challenger vetoes. Reports expose each comparison,
-  binding capacities, shader rejection and qualification failures. Native-f32
-  GPU coverage remains due; RTX 5070 advertises only f16 matrix tiles. F16-input,
-  complex-fusion/GEMV search and persistence remain deferred.
-- Add a Rust whole-step tuning experiment with paired trials, output parity,
-  search evidence and revision/device/driver/hash metadata; frozen paper
-  results remain untouched.
-- Add a dedicated observability/debugging study chapter, eager-PyTorch
-  comparison, probe coverage caveats, bisection ladder and rehearsal questions.
+- Qwen3 example, F16/Q4/Q8 weight storage, and sharded SafeTensors loading
+- Q4 projections for SmolLM2 prefill/decode; wider K-split GEMV and RmsNorm fusion
+- EfficientNetV2-S feature extractor, depthwise convolution and per-channel ops
+- Shared Blade contexts, GPU input/output buffers, external buffer import and
+  chunked submissions for renderer integration
 
-- Build-plan cache format 4 fingerprints rewrite configuration as well as
-  compiler options and capabilities; cache hits honor the requested tuning flag.
-- Horizontal matmul fusion drops incompatible single-dispatch scalar
-  fallbacks and preserves the precision requirement of every packed sibling.
-- CPU-only fusion diagnostics report exact matmul shape classes, retain the
-  decode output, and no longer turn dispatch counts into guessed timings.
-- Frozen-paper verification now replays numerical gates and medians, checks
-  raw/joined consistency, and runs in CI alongside all-feature quality checks.
-- Added a source-linked project audit, architecture/design study guide,
-  alternatives comparison, performance plan and P3HPC rehearsal/revision kit.
+## Training
 
-- `Session::set_laprop` provides RMS-normalize-then-momentum updates, and
-  `Session::set_adaptive_grad_clip` applies a per-parameter relative norm
-  bound. Together they reproduce DreamerV3's optimizer chain on the GPU.
+- LaProp, AdamW, adaptive/global gradient clipping and per-parameter learning rates
+- Temporal gradient accumulation and multi-input data loaders
+- Lazy device-local optimizer moments; batched, host-cached state readback
+- Logical-shape checkpoints omit padding and derived Winograd caches;
+  formats 1/2 remain readable
+- Differentiable row scans, exponential, softplus, normalization and pairwise ops
 
-- Compensated f16 cooperative code generation remains available for research,
-  but automatic derivative promotion was rolled back on August 28: splitting
-  hi/lo operands does not preserve f32 exponent range. `Auto` protects
-  `requires_full_precision` work with native-f32 tiles or scalar f32;
-  `AllowF16` explicitly permits the uncompensated reduced-input path.
-- Horizontal fusion (D1): independent same-A matmuls that already share
-  a barrier group (Q/K/V projections) pack into one dispatch with
-  `workgroups.z` selecting the sibling.
+## Optimizations
 
-- Parameter gradients, Adam m/v, the clip accumulator, and temporal
-  grad-accumulators default to device-local memory. Host read/write
-  (checkpoints, `read_param_grad`, `read_adam_*`) stages through a
-  transient buffer — including on Metal, where `Memory::Device` is
-  `MTLStorageModePrivate` and `contents()` is not a valid host
-  pointer. `MEGANEURA_NO_DEVICE_LOCAL=1` and debug sessions keep the
-  previous host-visible layout.
+- Unified matmul, convolution and attention variants; generated pointwise and
+  multi-accumulator reduction kernels with producer/epilogue fusion
+- E-graph extraction rewrites the graph, including repeated regions and
+  packed SwiGLU; horizontal fusion packs independent same-input matmuls
+- Device-local intermediates and lifetime-based buffer aliasing
+- Opt-in, state-isolated f32 matmul/convolution tile search with numerical
+  qualification, paired measurements and read-optimized private staging
+- Parallel GroupNorm, packed narrow reductions and source-parallel scatter-add
 
-- Cross-entropy training reuses the forward kernel's fused logits gradient
-  instead of rebuilding softmax and a ones-row broadcast matmul. Inference
-  skips the unused gradient write.
-- Binary cross-entropy no longer writes a per-element gradient into the
-  per-workgroup loss buffer (that overran the allocation for `n > 1`).
-- Large scatter-add uses float CAS with source-parallel work mapping. Blade
-  enables Vulkan memory-model device scope when required, so serializing every
-  source row behind one invocation per column is unnecessary. Narrow
-  row-scaled scatters map one invocation to each source row.
-- `egglog` and `naga` disable crate default features. Default crate
-  features are now empty: `hub` (HuggingFace downloads) and `profiler`
-  (Perfetto CPU-span subscriber) are opt-in. `SafeTensorsModel::from_bytes`
-  loads in-memory assets.
-- Apple flash EPT defaults key off `target_vendor = "apple"` (covers iOS).
-  The 8×8 f32 cooperative veto keys off the advertised tile, not macOS.
-- Unused in-tree Mistral / Phi-3 / Gemma-4 builders removed. Compiler
-  internals (`compile`, `codegen`, `schedule`, …) are `#[doc(hidden)]`.
+## Correctness fixes
 
-- External GPU composition: `Session::output_buffer` exposes a pinned graph
-  output as a Blade `BufferPiece`, so a renderer sharing the context can feed
-  a prediction directly into its next compute pass without a host readback.
-- GroupNorm inference splits large image groups into parallel statistics and
-  apply passes. Statistics use the generated reduction path and application is
-  an entry point in the existing GroupNorm module, rather than two new shader
-  groups. Small tensors retain the original single-pass kernel, avoiding an
-  extra tensor traversal and barrier when the split would contain one chunk.
+- Loss/softmax backward broadcasts use linear storage instead of a dense
+  vocabulary-square matrix; fix BCE gradient buffer overrun
+- Protect derivative exponent range in automatic cooperative selection
+- Fix rewritten graph ordering, partial/batched cooperative convolution,
+  mixed-width attention pipelines and scratch synchronization
+- Validate checkpoint metadata before writes; preserve logical parameter sizes
+  and share derived Winograd caches
+- Stage Metal private-buffer access, synchronize uploads and release GPU state
 
-- The library core is now environment-free: `compile`, `runtime`,
-  `codegen`, and `optimize` accept strongly typed options and never read
-  `MEGANEURA_*` variables. New typed surface: `CoopPolicy`
-  (Auto/Disabled/AllowF16) and the diagnostic switches on
-  `SessionOptions`, flash coop toggles on `CompileOptions`,
-  `SessionConfig::{optimize, runtime}`, and `GpuOptions` +
-  `init_gpu_context_with` for adapter selection/timestamps.
-  `TuningKnobs::default()` is pure platform defaults. Env-driven behavior
-  is an explicit opt-in via the `from_env` constructors in
-  `meganeura::config` (`SessionConfig::from_env()` resolves everything,
-  including WGSL dump-dir installation and env-selected GPU contexts);
-  the repo's examples, benches, and tests opt in, so external
-  `MEGANEURA_*` workflows keep working — embedders that never call
-  `from_env` get a fully hermetic library.
+## Infrastructure
 
-- Central environment-variable registry (`meganeura::config`): every
-  `MEGANEURA_*` variable is declared once with type, class, and docs.
-  Session build logs active overrides and warns on unrecognized
-  `MEGANEURA_*` names (typos no longer fail silently); a test pins the
-  README table against the registry. Boolean semantics are now uniform —
-  unset = default, `0` = off, anything else = on. Two behavior
-  normalizations: `MEGANEURA_DISABLE_COOP=0` (and other diagnostic
-  flags set to `0`) no longer *enable* the switch, and
-  `MEGANEURA_FLASH_BWD_COOP` accepts any non-zero value instead of
-  exactly `1`. Precedence is per class: diagnostic switches override
-  code configuration; tuning variables only feed defaults, so
-  explicitly set `TuningKnobs`/`SessionConfig` fields win.
-
-- Eager evaluation (`meganeura::eager::Eager`): inspect any node of a graph
-  while building it — `e.eval(&g, node)` executes the same builder-produced
-  graph through the same generated kernels (no rewrites, no dispatch
-  fusion, NodeIds stay valid as the graph grows) and returns a printable
-  `Tensor`. The same graph then compiles unchanged via `build_session` for
-  the fast path; eager-vs-compiled parity is tested. A development mode:
-  each growth step re-executes the prefix.
-- Shader consolidation (75 → 55 WGSL files, −2.3k lines): deleted the four
-  small-tile twins (`matmul_small`, `conv2d_gemm_small`,
-  `conv2d_grad_input_gemm_small`, `conv2d_grad_weight_gemm_small`) — tile
-  size is now a template parameter with the unrolled register-tile bodies
-  generated by `codegen::tiled_gemm_body`; retired the template-based conv
-  coop kernels (`conv2d_gemm_coop.wgsl`, `conv2d_grad_input_gemm_coop.wgsl`
-  and the legacy non-generated coop entries) in favor of the per-(kernel,
-  stride) generated modules the runtime already preferred.
-- Reduction archetype: multi-accumulator support — `extra_prologues` reduce
-  additional integrands over the same inputs in one pass, and the epilogue
-  sees all reduced scalars. LayerNorm forward now compiles to a single
-  two-accumulator archetype kernel (sum + sum-of-squares), GPU-parity-tested
-  against the hand-written shader. Gelu gained a pointwise-DAG mapping
-  (tanh-approx, parity-tested), closing the last unary gap. The hand-written
-  pointwise/reduction shaders stay as the `use_schedule_* = false` parity
-  oracles rather than being deleted. Still hand-written by design for now:
-  GroupNorm (epilogue needs indexed per-channel loads), the norm backwards
-  (column-axis reductions), and LogSoftmax.
-- Historical Track F first cut measured cooperative-family demotion on live
-  steps and retained scalar fallbacks. Superseded by the state-isolated
-  f32-matmul search above; f16-input cooperative tuning remains deferred.
-- Kernel-variant selection has a single owner (roadmap A2, scoped):
-  cooperative promotion (incl. generated conv kernels and output padding),
-  the RmsNorm→matmul prologue fusion, and small-tile demotion moved from
-  inline session-construction code into one `select_variants` pass.
-- Tuning knobs are data, not globals: the flash-attention EPT caps moved
-  into `CompileOptions::knobs` (`TuningKnobs`) and are stamped into the
-  compiled plan, which pipeline generation reads back — geometry and
-  generated WGSL can no longer disagree, and the plan cache fingerprints
-  them via the options instead of re-reading env vars. `MEGANEURA_FLASH_*`
-  env overrides still work as `TuningKnobs::from_env` defaults.
-- Debug sessions: `build(&g, SessionConfig::debug())` (or
-  `SessionOptions { debug: true }` on `Session::with_context_opts`) disables
-  lifetime aliasing, keeps every buffer host-visible, and skips the
-  numerics-neutral dispatch-level fusions so every graph node stays
-  materialized. `Session::read_node` / `read_node_by_name` return any
-  value after a step (with structured `ReadNodeError`s — fused-away and
-  aliased values are reported as such instead of returning garbage), and
-  `Session::step_debug()` scans dispatch outputs in execution order and
-  attributes the first NaN/Inf to a named dispatch and graph node.
-- Value identity and dispatch provenance: `Graph::named(id, "blk3.mlp.gate")`
-  attaches names that survive autodiff, rewrites, and toposort (`nn` layers
-  name their outputs automatically); every `Dispatch` now carries the graph
-  node ids it implements (`origin`), merged through dispatch-level fusion.
-  Labels, `MEGANEURA_DUMP_PLAN`, profiler rows, and NaN traces show
-  `"blk3.mlp.gate: MatMul[50x960x720]"` instead of anonymous shader names,
-  and the plan records a full node→buffer map (`ExecutionPlan::node_buffers`)
-  plus node names for debug readback. Graph builder methods are
-  `#[track_caller]`, so shape-assert panics report the model-builder line
-  that created the bad node. Plan-cache format bumped to v3.
-- Dead kernel purge: removed 10 unreachable WGSL files (~1.1k lines) and
-  their plumbing — the direct `conv2d`/`conv2d_grad_input`/
-  `conv2d_grad_weight` shaders (superseded by the GEMM path), the
-  never-constructed `FusedRmsNormMatMul` op and both its shaders
-  (superseded by `RmsNormRsqrt` + matmul prologue), the never-selected
-  `Conv2dGradInputGemmCoop3x3` (superseded by the generated per-shape
-  conv coop kernels; its documented `MEGANEURA_CONV_COOP` switch had no
-  reader), the `WinogradBatchedMatMulSmall` alias, and four files no
-  code included (`mha_forward`, `winograd_matmul_at`, both winograd
-  grad transforms).
-- E-graph extraction is now the rewrite mechanism: extracted terms are
-  stamped back into the graph IR (roots and interior nodes rewritten in
-  place so node ids, id-carrying attributes, and output bindings stay
-  valid; fused nodes appended; dead nodes swept). The hand-written
-  pattern appliers, the kind-level applier gating, the legacy text
-  `(extract …)` path, and `MEGANEURA_NO_TRAFFIC_COST` are gone —
-  egglog's cost-model decision is what runs, per site.
-- Generic egglog encoding: only ops that rewrite rules mention keep
-  named constructors; everything else encodes through arity-generic
-  `Op1..Op6` constructors tagged with the node id. Ops with different
-  attributes can no longer be wrongly unified, any op (present or
-  future, e.g. from ONNX import) encodes without prelude changes, and
-  parameter/input names no longer appear in program text (no escaping
-  hazards). `StopGradient` is no longer conflated with `Identity`.
-- Unified segmentation: repeated regions saturate one instance and
-  stamp every instance (per-instance parameter substitution included —
-  packed-SwiGLU derived params are created per layer at stamp time);
-  all remaining nodes are chunked into under-cutoff windows and
-  saturated too. Every node now passes through the e-graph exactly
-  once — previously >300-node graphs bypassed it for everything
-  outside detected regions, and graphs with encoding gaps silently
-  fell back to pattern matching.
-- The packed-SwiGLU rewrite (`SwiGLU(MatMul(h,wg), MatMul(h,wu))` →
-  one wide matmul over a concatenated derived weight) is now an egglog
-  rule (`SwiGLUPacked`) chosen by the cost model, with a stamp-time
-  fallback to the unpacked form when weights aren't plain parameters.
-  The `FusedRmsNormMatMul` rewrite rule is removed (its applier was
-  disabled for a documented ~25% regression; the kernels remain).
-- `compile::topological_order` rebuilt on an adjacency list: nodes
-  listing the same input twice (`Mul(x,x)`, grad-sum `Add(g,g)`) used
-  to under-decrement and fall into an append-in-id-order fallback,
-  which silently mis-ordered dispatches once the optimizer created
-  nodes referenced by earlier ids — reads of never-written buffers,
-  i.e. zero gradients. Also removes two O(n²) scans.
-- autodiff: CrossEntropyLoss/Softmax/LogSoftmax backward now broadcast
-  per-row sums via `SumInner` + `ones[1, F]` instead of a dense
-  `ones[F, F]` matmul — the old form materialized a 9.66 GB constant
-  for a 49k vocab and was 76% of the SmolLM2-135M train step
-  (RTX 5070: 106.8 → 22.0 ms/step; Radeon 610M: 1774 → 325 ms/step;
-  session buffers 11.3 GB → 1.69 GB).
-- Audit hardening: execution-plan cache format v2 now fingerprints the complete
-  typed graph, constant data, compilation options, runtime mode, optimization
-  switches, and cooperative-matrix target. Stale, partial, or cross-device
-  plans are rejected instead of being executed.
-- Session construction now probes the selected GPU before compilation and
-  compiles against that context's capabilities. This removes process-global
-  first-device coupling and lets f16 cooperative attention be selected safely
-  on both f16-only and scalar-only adapters.
-- Attention pipelines are keyed by `(entry point, head dimension)`, fixing
-  mixed-width attention graphs that previously reused the last width seen.
-- Checkpoint format v2 records truthful tensor dtypes and shapes and validates
-  every parameter and Adam-state byte length before upload. Invalid metadata is
-  reported as `InvalidData` instead of silently resetting state; the old
-  unbounded Adam copy could overwrite mapped memory.
-- Session teardown now releases weight-specialized and attention pipelines,
-  gradient-clipping storage, and accumulation buffers. Host uploads wait for
-  prior GPU submissions before modifying shared allocations.
-- Gradient clipping now uses an f32 accumulator with explicit barriers between
-  parameter dispatches instead of a device-scope storage atomic. This removes
-  Vulkan VUID 06265 on cooperative-matrix contexts where Blade enables the
-  Vulkan memory model without enabling device scope.
-- `DataLoader` rejects zero batch and sample sizes; cooperative 16×16 paths now
-  require an exact advertised tile size; decimal and hexadecimal device IDs are
-  accepted.
-- Portability documentation now matches the pinned Blade implementation:
-  Vulkan on Linux/Windows/Android and Metal on Apple platforms; DX12 is not
-  currently a backend.
-- CI now enforces formatting, all-target Clippy, strict rustdoc, MSRV, package
-  assembly, security, and Windows compile checks. Offline SPIR-V coverage
-  includes the f16 cooperative attention path used by NVIDIA and AMD, while
-  hardware-driver coverage remains an explicit release requirement.
-- Bump `naga` to the wgpu git rev carrying
-  `spv::Options::emit_int_div_checks`, pinned to the same rev as
-  `blade-graphics` so the `naga::Module` we build unifies with blade's
-  SPIR-V backend. Blade (rev `ba0fb5a`) sets the flag to `false`,
-  eliding the divide-by-zero / `INT_MIN/-1` guard wrappers naga
-  otherwise emits around integer division and modulo — a win for the
-  index-heavy conv2d im2col and reduction shaders. Adds the new
-  `CommandEncoderDesc::manual_barriers` field (kept `false`).
-- Device-local intermediates (default on, kill switch
-  `MEGANEURA_NO_DEVICE_LOCAL=1`): allocations holding only step-local
-  intermediates live in `Memory::Device` (GPU-zeroed at session build),
-  keeping user-visible buffers host-visible. Avoids routing
-  intermediate traffic through the host-visible (ReBAR) heap on
-  discrete GPUs.
-- Lifetime-based buffer aliasing: step-local intermediates with
-  disjoint live ranges (at barrier-group granularity) now share one
-  physical GPU allocation. Parameters, inputs, outputs, gradients,
-  KV caches, and other persistent buffers are never aliased. Opt out
-  with `MEGANEURA_NO_ALIAS=1`. `MemorySummary` reports allocated vs
-  logical bytes.
-- `docs/roadmap.md`: strategic plan across compiler, memory,
-  precision, latency, conv, autotuning, and quantized fine-tuning
-  tracks.
-- `Session::with_context(plan, Arc<Context>)` lets a host application
-  (renderer, game) share a single `blade_graphics::Context` with
-  meganeura's training and inference sessions instead of each side
-  opening its own device.
-- New unified entry point `build(graph, SessionConfig)` plus `Mode`
-  enum. Replaces the `build_session` / `build_session_with` /
-  `build_session_with_report` / `build_session_with_report_and_options`
-  / `build_session_cached` / `build_inference_session_with` family
-  with a single struct-parameterised call. Sugar functions
-  `build_session`, `build_inference_session` and
-  `build_session_unoptimized` remain for the common cases.
+- Unified `build(graph, SessionConfig)` and typed compiler/runtime/GPU options;
+  environment overrides now require explicit `from_env` opt-in
+- Eager graph inspection, named intermediate reads, nonfinite attribution,
+  dispatch provenance and structured GPU profiles
+- Empty default features; Hub downloads and CPU profiling are opt-in
+- Rust 1.92 minimum, published Blade 0.9 and Naga 30 dependencies
+- Remove unused Mistral/Phi-3/Gemma-4 builders; replace family-wide
+  `TuneOutcome` fields with class/candidate evidence; invalidate old plan caches
+- Consolidated regression executables, Rust host coverage and full package
+  verification in CI; keep paper artifacts out of the published crate
 
 # v0.2 (14 Apr 2026)
 
