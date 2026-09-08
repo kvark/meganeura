@@ -26,7 +26,12 @@ consistent with our preference against workload-specific hand tuning.
 The follow-up is in Inferena's
 [`experiment/p3hpc-cuda-graphs`](https://github.com/kvark/inferena/tree/experiment/p3hpc-cuda-graphs),
 based on its merged main. Its `EXPERIMENT.md` owns the reproduction commands
-and collection plan. It retains the same five workloads, precision classes
+and collection plan. `scripts/p3hpc.py` qualifies every selected engine pair
+before a replicated campaign, checks declared versions/backends/modes and
+validity gates, rotates execution order and retains failures outside Git.
+`--profile` separately exports PyTorch host/device timelines alongside the
+Meganeura dispatch sidecars; it is not a completed overhead analysis.
+The branch retains the same five workloads, precision classes
 and cross-engine validity gates, and adds explicit **whole-phase** capture:
 
 - Full forward, minimal-shape forward, and forward/loss/backward each have a
