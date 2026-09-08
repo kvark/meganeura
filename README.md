@@ -113,9 +113,9 @@ and broader-search work.
 cargo add meganeura
 ```
 
-Development HEAD uses published Blade 0.9 and Naga 30 with Rust 1.92 or newer.
-CI verifies the assembled package against registry dependencies. This does not
-publish a new Meganeura release; use this checkout for unreleased changes.
+Version 0.3 uses published Blade 0.9 and Naga 30 with Rust 1.92 or newer.
+See the [changelog](CHANGELOG.md) for API and feature changes from 0.2.
+CI verifies the packaged source against registry dependencies.
 
 Hub downloads (`SafeTensorsModel::download`) need the optional `hub` feature:
 

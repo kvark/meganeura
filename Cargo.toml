@@ -1,6 +1,6 @@
 [package]
 name = "meganeura"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Dzmitry Malyshau"]
 repository = "https://github.com/kvark/meganeura"
 categories = ["science"]
@@ -9,6 +9,7 @@ rust-version = "1.92"
 description = "Portable GPU training and inference through Vulkan and Metal"
 license = "MIT"
 autotests = false
+exclude = ["/paper/"]
 
 [[test]]
 name = "smoke"

@@ -2,7 +2,7 @@ cff-version: 1.2.0
 message: "If you use Meganeura in published work, please cite the paper below."
 type: software
 title: Meganeura
-version: 0.2.0
+version: 0.3.0
 authors:
   - given-names: Dzmitry
     family-names: Malyshau
