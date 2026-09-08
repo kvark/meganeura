@@ -50,6 +50,14 @@ and cross-engine validity gates, and adds explicit **whole-phase** capture:
 - Requested compile/capture failures stop that runner. Records disclose actual
   options and per-phase capture/validation; no eager timing is substituted.
 
+The new Meganeura runner also migrates to explicit session configuration:
+strict uses the scalar `Disabled` cooperative policy, including disabling
+native-f32 tiles where available; accelerated uses `Auto` to protect
+full-precision derivative regions. Precision permissions are typed options,
+not inferred from environment variables that the convenience builders no longer
+read. This is a declared new-cohort control, not a claim that strict is the
+fastest legal f32 implementation or identical to the frozen implementation.
+
 This follows the lifetime and gradient rules in
 [PyTorch's CUDA Graph documentation](https://docs.pytorch.org/docs/main/notes/cuda.html#cuda-graphs).
 It deliberately excludes Inductor's inner graph trees when capturing the full
