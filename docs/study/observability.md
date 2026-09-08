@@ -12,6 +12,11 @@ This chapter describes current source, including the September f32-matmul
 tuner. It is not a result from the frozen paper. Run GPU examples only on an
 available device; instrumented/tuning executions can disturb other timings.
 
+Use [broad regression checks with coverage](../testing.md) to detect a break,
+then use the facilities below to localize it. Experiment-specific sweeps are
+preserved by [source ref and conclusion](../experiments.md), not a growing
+collection of raw fixtures in the default test build.
+
 ## Compare the debugging models, not just the feature names
 
 | Question | Eager PyTorch | Meganeura today |
@@ -261,7 +266,7 @@ Convolution-derivative searches add `TuneOptions.scope` and the optional
 `TuneClass.conv2d` shape. Inspect all twelve NCHW convolution parameters, not
 just M/N/K: dX also has batch in dispatch Z. Scalar convolution tiles appear
 as distinct Small/large shader entries, unlike dense `use_small_tiles`.
-The [convolution crossover](../experiments/conv-tiles-2026-09-06/README.md)
+The [convolution crossover](../experiments.md#conv-tiles-2026-09-06)
 archives complete before/after dispatches and declared buffer sizes so a
 selection can be traced back to its exact class. Missing historical scope is
 Dense; missing convolution shape means a dense class, not an unknown batch.
@@ -269,7 +274,7 @@ Dense; missing convolution shape means a dense class, not an unknown batch.
 Those full dispatch records exposed a vacuous benchmark: the first small-case
 builder supplied nonflat operands to the flat convolution API, producing zero
 forward workgroups. Matching zero gradients/moments had passed the original
-runner. The [corrected cohort](../experiments/conv-tiles-corrected-2026-09-06/README.md)
+runner. The [corrected cohort](../experiments.md#conv-tiles-corrected-2026-09-06)
 rejects zero-workgroup plans, records `prefix_training_signal` and
 `parameters_updated`, and validates nonzero gradients/moments and actual
 parameter changes. Public convolution helpers reject malformed operand shapes
@@ -313,7 +318,7 @@ CPU validation still scans complete outputs and compares sampled f64 dots.
 Download keep its capacity and all candidate bindings/validation unchanged.
 New options default to Download after the measured promotion gates passed;
 missing settings in historical reports still deserialize as Shared. See the
-[separate staging protocol and results](../experiments/readback-2026-09-06/README.md).
+[separate staging protocol and results](../experiments.md#readback-2026-09-06).
 
 There may be two comparisons per class; the second challenges the last accepted
 winner, not necessarily the original heuristic choice. `failure` identifies
@@ -330,13 +335,13 @@ a whole-model win. Choices are session-local, and scratch timing omits normal
 cross-kernel overlap, cache history and surrounding work. See the
 [implementation contract and hardware qualification](performance-plan.md).
 
-The [retained transfer experiment](../experiments/tuning-2026-09-05/README.md)
+The [retained transfer experiment](../experiments.md#tuning-2026-09-05)
 is a concrete report-reading exercise: compare the three placement-sensitive
 classes, per-class decisions, final pipeline keys, search cost and independent
 whole-step samples. On this RTX 5070 the native-f32 coverage flag is false;
 positive scalar timings cannot be used as evidence for that unexecuted path.
 
-The [optimizer-backed holdout records](../experiments/holdouts-2026-09-06/README.md)
+The [optimizer-backed holdout records](../experiments.md#holdouts-2026-09-06)
 add full in-memory parameter/gradient/moment comparisons, expected Adam counts,
 loss trajectories, memory-accounting stages and every timing pair. Read their
 ResNet run 3 as a debugging exercise: identical pipeline keys, a 1.071× ratio
@@ -347,7 +352,7 @@ CPU replay checks their consistency, not the absent full vectors. Validation
 readbacks are outside timers, followed by settling steps, and process memory
 samples with both sessions resident are not peak VRAM.
 
-The [predeclared crossover experiment](../experiments/crossover-2026-09-06/README.md)
+The [predeclared crossover experiment](../experiments.md#crossover-2026-09-06)
 adds an untuned/untuned control, balanced session roles and continuous optional
 GPU telemetry. `Session::swap_tuning_with` exchanges complete legal f32 tile
 choices between compatible sessions sharing one GPU context; it does not
@@ -380,7 +385,7 @@ staging policy, not shortening validation, claiming pure GPU transfer timings,
 or inferring physical heap/cache properties. The Metal backend maps Shared
 and Download to the same storage mode; no Metal performance gain is measured.
 
-The [allocation/reuse follow-up](../experiments/staging-reuse-2026-09-06/README.md)
+The [allocation/reuse follow-up](../experiments.md#staging-reuse-2026-09-06)
 adds `preparation_breakdown`: checks, pipeline setup, candidate buffer allocation,
 staging management, encoder creation and binding/geometry work. The pipeline
 field is exactly `compile_time`, already within preparation. `phase_times.cleanup`
@@ -409,7 +414,7 @@ does not establish zero harm. No whole-step or fleet speedup was measured.
 
 ## Profiled-state parity is not stationary timing or an independent oracle
 
-The [whole-step localization runner](../experiments/training-profile-2026-09-06/README.md)
+The [whole-step localization runner](../experiments.md#training-profile-2026-09-06)
 profiles synthetic ResNet, SmolLM2 and Whisper F+L+B without optimizer/clip
 passes. It compares every retained profiled full state before the collector's
 two ordinary ring-advance steps overwrite it; readbacks use separate encoders,
@@ -431,7 +436,7 @@ the scalar and cooperative generators are now fixed. Read the
 observability helps find where to look, but neither exact same-engine parity
 nor a complete timing trace proves the underlying derivative is correct.
 
-The [indexing cost check](../experiments/conv-indexing-2026-09-06/README.md)
+The [indexing cost check](../experiments.md#conv-indexing-2026-09-06)
 adds optional full-state SHA-256 digests to the existing profiling runner. Sorted
 tensor names, lengths and f32 bits, plus optimizer counter/allocation, make
 source-to-source parity checks possible without archiving model tensors. Hashing
@@ -441,7 +446,7 @@ independent f64 oracle first reproduced a width-41 dW error; the shared integer
 indexing repair then passes all full-output regressions. Raw digests cannot
 replace missing vectors for numerical reanalysis.
 
-The [split-K plan prototype](../experiments/split-k-2026-09-06/README.md) makes
+The [split-K plan prototype](../experiments.md#split-k-2026-09-06) makes
 another distinction visible: one logical dW now has a partial producer and a
 SumRows consumer. Both retain its origin; labels identify the two passes. The
 logical node still reads the **final** gradient. To inspect partials, retain a
@@ -461,7 +466,7 @@ change. Scratch bindings are upstream/input/**final output**/partials, with the
 largest binding charged again for staging; the last buffer is no longer implicitly
 the final result. Timed repetitions include both passes and their barrier.
 
-The [retained cohort](../experiments/split-k-sequence-2026-09-06/README.md) contains
+The [retained cohort](../experiments.md#split-k-sequence-2026-09-06) contains
 32 rejections with no warmup/sampling observations, not zero-cost measurements.
 Full f64 scans expose two control errors that sampled dots missed. A subsequent
 CPU FMA diagnostic reproduces those GPU bits, separating accumulation error from
@@ -472,12 +477,13 @@ the phase breakdown prevents mistaking this for a return of the old readback-cop
 bottleneck. Full-vector checks are executed but vectors are not archived; replay
 cannot retrospectively change their tolerance or inspect an unrecorded element.
 
-The [bounded accumulation reporting test](../experiments/compensated-dw-2026-09-06/README.md)
+The [archived accumulation reporting test](../experiments.md#compensated-dw-2026-09-06)
 illustrates another distinction: a successful test process means all declared
 rows were recorded, not that the candidate qualified. Read JSON `status`, the
 `qualified` count and each row's errors. Its 230/240 pass count still means
 rejection, and no performance samples are collected. The failed candidate's
-source tag remains separate from the active, unchanged arithmetic.
+source tag remains separate from the active, unchanged arithmetic. The
+experiment-only reporter is no longer part of main's regression suite.
 
 ## What we should improve next
 

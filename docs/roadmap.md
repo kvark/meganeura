@@ -9,7 +9,7 @@ ongoing.
 ## September 2026 priorities
 
 The current tuning-foundation milestone is **closed**. The final
-[bounded accumulation attempt](experiments/compensated-dw-2026-09-06/README.md)
+[bounded accumulation attempt](experiments.md#compensated-dw-2026-09-06)
 passes 230/240 accuracy rows but fails tiny cancellation cases, so its arithmetic
 change is not retained and split-K promotion is deferred. No conditional
 whole-step cohort follows the failed gate. The next active milestone is
@@ -33,21 +33,21 @@ qualification passed on RTX 5070; native-f32 hardware and fleet qualification
 remain ahead. A separate harness checks transfer to whole-step time;
 automatic confirmation, f16-input/complex-fusion search and persistence remain open.
 See the [implementation contract](study/performance-plan.md).
-The [five-process synthetic transfer pilot](experiments/tuning-2026-09-05/README.md)
+The [five-process synthetic transfer pilot](experiments.md#tuning-2026-09-05)
 shows repeatable 1.15×/1.13× whole-step gains on two larger chains, with no
 selection change on two smaller ones. It is not model/fleet qualification.
 
-The subsequent [six-case inference/training holdouts](experiments/holdouts-2026-09-06/README.md)
+The subsequent [six-case inference/training holdouts](experiments.md#holdouts-2026-09-06)
 retain five processes, full control-session gradients/moments and matched Adam
 updates through step 78. All numerical checks pass, but no whole-step gain or
 regression clears the predeclared guard. The unchanged ResNet control exposes
 timing drift, and only 1/512 of its plan dispatches is eligible for matmul search.
-The [controlled six-process crossover](experiments/crossover-2026-09-06/README.md)
+The [controlled six-process crossover](experiments.md#crossover-2026-09-06)
 now confirms the dense chain in both session orientations (median 1.177×),
 but not MLP+Adam; two MLP A/A controls fail the noise screen. ResNet remains
 unchanged, with 98.26–98.65% of search time spent in qualification. A checked
 selection-only swap preserves tensor/optimizer state through role reversal.
-The [readback follow-up](experiments/readback-2026-09-06/README.md) now separates
+The [readback follow-up](experiments.md#readback-2026-09-06) now separates
 qualification's CPU copies/checks from transfer/dispatch/wait, using published
 Blade 0.9/Naga 30 (Rust 1.92). Across six paired processes, read-optimized
 private staging lowers median ResNet search from 606 to 39 ms: CPU readback
@@ -56,13 +56,13 @@ allocation/copy falls from 582 to 2 ms while unchanged validation stays about
 Adam step 178. Download becomes the private staging default; Shared remains
 available. Preparation and transfers cost more, and one dense search is slower
 overall; every attempt is retained. This is not a whole-step speed result.
-The [allocation/reuse follow-up](experiments/staging-reuse-2026-09-06/README.md)
+The [allocation/reuse follow-up](experiments.md#staging-reuse-2026-09-06)
 locates that preparation cost in staging allocation and tests one exact-size
 slot retained only within a tuning call. Six process pairs lower median dense
 search 44.01→31.84 ms and MLP 64.27→45.46 ms; ResNet has no reuse opportunity
 and no guarded change. SameSize becomes the option default, with identical
 scratch requests, zero retention at return and all validation intact.
-The [whole-step profiles](experiments/training-profile-2026-09-06/README.md)
+The [whole-step profiles](experiments.md#training-profile-2026-09-06)
 now consistently put 60.66–60.77% of ResNet's instrumented dispatch time in
 backward convolution, and 36.25–40.58% of SmolLM2's in backward attention.
 All 45 profiled full states match, but short-case timing drift is substantial;
@@ -70,7 +70,7 @@ these optimizer-free profiles are not whole-step speedup evidence. The follow-up
 also fixes dX indexing outside same padding and adds full f64 derivative oracles.
 Exact-class scalar convolution-derivative tile selection is now implemented,
 with full NCHW keys, physical scratch sizes, batch-aware references and unchanged
-precision/budgets. The [corrected six-process crossover](experiments/conv-tiles-corrected-2026-09-06/README.md)
+precision/budgets. The [corrected six-process crossover](experiments.md#conv-tiles-corrected-2026-09-06)
 observes ResNet 17.5808→16.7293 ms (median ratio 1.05056×), but all six decisions
 remain inconclusive under the unchanged 5%+noise guard. Four dX classes change
 eight dispatches; the small Adam/SGD chains keep their tiles and make real updates.
@@ -78,7 +78,7 @@ Original malformed flat-layout controls are retained/disqualified; public
 operand checks, full forward oracles and nonzero training preflights prevent
 their zero-data success from becoming evidence. Sampling now dominates search
 cost, and the eight-class structural prior visits only 8/45 ResNet classes.
-The [indexing repair](experiments/conv-indexing-2026-09-06/README.md) replaces
+The [indexing repair](experiments.md#conv-indexing-2026-09-06) replaces
 unsafe f32 reciprocal decomposition with integer division in the shared scalar
 and generated cooperative kernels. Adversarial full forward/dX/dW GPU oracles
 reproduce the old width-41 error and pass at widths/kernel sizes 41/47/55 after

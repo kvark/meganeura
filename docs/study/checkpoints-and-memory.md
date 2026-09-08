@@ -174,7 +174,7 @@ cargo test --lib
 Focused real-device checks (require an available GPU):
 
 ```sh
-cargo test --release --test checkpoint_validation --test optimizer_memory -- --test-threads=1
+cargo test --release --test smoke -- --test-threads=1
 cargo run --release --example train_deploy
 ```
 

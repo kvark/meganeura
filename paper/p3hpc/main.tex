@@ -284,9 +284,11 @@ compiler cache. MPS remains eager because compilation is unsupported in
 this harness, and the Intel \code{+xpu} build falls back to eager CPU
 execution because it exposes no usable XPU. Consequently, ratios compare
 the best usable path on each complete machine; they must not be read as a
-cross-device ranking of the accelerators themselves. No manual CUDA Graph
-capture is added to the frozen compiled Linux runs. Inductor remains free
-to apply its normal backend optimizations.
+cross-device ranking of the accelerators themselves. The frozen runner calls
+\code{torch.compile(model)} in default mode. Its explicit CUDA Graph helpers
+belong to a separate legacy path and are not invoked by this protocol;
+CUDA Graph replay was not verified for these measurements. Compiler graph
+capture must not be confused with CUDA command-graph replay.
 
 \subsection{Workloads}
 

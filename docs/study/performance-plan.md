@@ -4,7 +4,7 @@
 
 The author agreed to close this phase after one shared long-reduction accuracy
 attempt and, only if it qualifies, one predeclared whole-step acceptance cohort.
-The [bounded experiment](../experiments/compensated-dw-2026-09-06/README.md)
+The [bounded experiment](../experiments.md#compensated-dw-2026-09-06)
 completed: compensated tile accumulation passes 230/240 rows, but fails the
 long tiny cancellation fixture. Its production change is removed and split-K
 promotion is deferred. The conditional whole-step cohort is not run. This closes
@@ -22,14 +22,14 @@ released the GPU, the scalar search passed device qualification on an RTX
 native-f32 cooperative coverage; that device advertises only f16 matrix tiles.
 New tuning experiments are separate from the frozen paper evidence.
 
-The [first whole-step transfer experiment](../experiments/tuning-2026-09-05/README.md)
+The [first whole-step transfer experiment](../experiments.md#tuning-2026-09-05)
 now retains five independent processes: two of four synthetic dense chains
 improved by median 1.151× and 1.127×, while the two smaller cases kept their
 initial tiles and showed no benefit. All outputs matched their untuned
 references exactly. This is scoped Meganeura-versus-Meganeura evidence, not a
 PyTorch or model-training result; search amortization takes thousands of steps.
 
-The [six-case holdout follow-up](../experiments/holdouts-2026-09-06/README.md)
+The [six-case holdout follow-up](../experiments.md#holdouts-2026-09-06)
 now includes nonlinear MLP/SmolLM2 inference, Adam trajectories, Whisper SGD
 and ResNet F+L+B. All 30 case runs pass full control-session tensor/state parity,
 but **none clears the whole-step guard**. Median ratios range from 0.977× for
@@ -142,13 +142,13 @@ This distinction matters: multiplying by the rounded f32 reciprocal mapped
 instead of the independent f64 oracle's `0.8370`. Full oracles now cover fourteen
 scalar shapes, both tiles and ordinary/tiny gradients; six generated cooperative
 shapes execute on this GPU with exactly representable f16 operands. Native-f32
-execution still needs hardware qualification. The [separate cost cohort](../experiments/conv-indexing-2026-09-06/README.md)
+execution still needs hardware qualification. The [separate cost cohort](../experiments.md#conv-indexing-2026-09-06)
 retains full-state bit identity across revisions, but ResNet normal F+L+B rises
 17.55→21.55 ms, about 23%. Short-case drift prevents an equivalence claim for
 SmolLM2/Whisper. These untuned, sequential source-level processes are separate
 from the earlier tile crossover and its timings.
 
-The [integer-divisor follow-up](../experiments/conv-divisor-2026-09-06/README.md)
+The [integer-divisor follow-up](../experiments.md#conv-divisor-2026-09-06)
 qualifies one shared WGSL high-multiply/correction implementation against raw-u32
 CPU oracles and all existing full convolution oracles. Its separate six-process
 cohort retains bit-identical full states and requested tensor memory, with 16
@@ -159,11 +159,11 @@ deteriorate sharply; the cohort does not establish short-case stability or
 no regression. Do not confuse these sequential source pairs with tuned
 interleaved comparisons, or change the 5%+2MAD decision guard to accommodate them.
 Exact-arithmetic lowering and short-case timing stability remain open. The
-[bounded split-K prototype](../experiments/split-k-2026-09-06/README.md) now lowers
+[bounded split-K prototype](../experiments.md#split-k-2026-09-06) now lowers
 explicit dW selections to partials plus existing SumRows before session allocation.
 Its legality, full/partial f64 oracles and short optimizer trajectories are tested;
 explicit isolated sequence qualification/measurement is now implemented.
-Its [four-process cohort](../experiments/split-k-sequence-2026-09-06/README.md)
+Its [four-process cohort](../experiments.md#split-k-sequence-2026-09-06)
 shows synthetic gains but rejects both profiled large shapes on accuracy before
 timing. Automatic installation and whole-step confirmation remain open.
 
@@ -211,11 +211,11 @@ println!("{}", serde_json::to_string_pretty(&report)?);
 ```
 
 The regression target is intentionally ignored by default because it performs
-timings. Compile it without running: `cargo test --test tune --no-run`.
+timings. Compile it without running: `cargo test --test regression --no-run`.
 Portable scalar qualification:
 
 ```sh
-cargo test --release --test tune -- --ignored --skip tune_native_cooperative_f32 --test-threads=1
+cargo test --release --test regression tune:: -- --ignored --skip tune_native_cooperative_f32 --test-threads=1
 ```
 
 All four tests passed on the RTX 5070: output preservation, active-training
@@ -225,7 +225,7 @@ and budget skips. This is not a complete KV/external-buffer/optimizer matrix.
 
 `cargo run --release --example tune_session -- --device` prints actual matrix
 capabilities. Only on a native-f32 device, run
-`cargo test --release --test tune tune_native_cooperative_f32 -- --ignored --test-threads=1`.
+`cargo test --release --test regression tune::tune_native_cooperative_f32 -- --ignored --test-threads=1`.
 That test requires real native execution, including below-threshold shapes,
 padded rows and a dimension above the native-8 veto; it deliberately fails on
 unsupported hardware. Native shaders passed offline Naga/SPIR-V checks here,
@@ -243,7 +243,7 @@ or a new result for the paper's model matrix.
 
 ## Lessons from optimizer-backed holdouts
 
-The fixed [September 6 protocol and records](../experiments/holdouts-2026-09-06/README.md)
+The fixed [September 6 protocol and records](../experiments.md#holdouts-2026-09-06)
 keep normal optimization and compare complete parameter, gradient and allocated
 moment arrays at matched training ages through step 78. All 140 isolated
 comparisons qualify; 31 choose challengers. Nevertheless no process/case
@@ -274,7 +274,7 @@ attempt and retain one predeclared acceptance policy; do not pick a favorable
 process or quietly loosen the margin. Cross-session bitwise equality here
 does not strengthen the frozen paper's sampled-output/gradient-norm contract.
 
-The [controlled crossover cohort](../experiments/crossover-2026-09-06/README.md)
+The [controlled crossover cohort](../experiments.md#crossover-2026-09-06)
 is retained separately: six processes, three diagnostic repeat cases, an
 untuned/untuned control and four role-reversed blocks with matched evolving
 states. It uses a checked selection-only swap instead of resetting training
@@ -292,7 +292,7 @@ recorded experiment below, not a retrospective change to those measurements.
 
 ## Qualification cost: measured readback staging
 
-The [six-process Shared/Download experiment](../experiments/readback-2026-09-06/README.md)
+The [six-process Shared/Download experiment](../experiments.md#readback-2026-09-06)
 uses published Blade 0.9 and Naga 30 in both arms. New nested timers separate
 input preparation, CPU upload copy, upload transfer/wait, dispatch/wait,
 readback transfer/wait, CPU readback allocation/copy and numerical validation.
@@ -322,7 +322,7 @@ Explicit Shared and historical missing-field deserialization preserve the
 old policy. Tuning remains default-off. Six process pairs on one GPU do not
 establish fleet behavior; Metal maps both policies to shared storage.
 
-The [allocation and exact-size reuse follow-up](../experiments/staging-reuse-2026-09-06/README.md)
+The [allocation and exact-size reuse follow-up](../experiments.md#staging-reuse-2026-09-06)
 now splits preparation and times cleanup. A tagged localization profile puts
 19.60/20.79 ms dense preparation and 32.05/33.98 ms MLP preparation in staging
 allocation, while candidate binding allocations cost hundredths of a millisecond.
@@ -349,7 +349,7 @@ return. Cleanup includes the final retained-buffer release; it is not moved
 outside total search. No qualification or validation gain guard passes.
 
 This closes the measured staging-allocation opportunity at this scope. The
-[subsequent whole-step profiles](../experiments/training-profile-2026-09-06/README.md)
+[subsequent whole-step profiles](../experiments.md#training-profile-2026-09-06)
 put 60.66–60.77% of instrumented ResNet dispatch time in backward convolution
 and 36.25–40.58% of SmolLM2's in backward attention. Full profiled state agrees,
 but ordinary before/after timing drift is up to 27% for SmolLM2 and 100% for
@@ -358,7 +358,7 @@ passes nor establish candidate gains. A newly exposed non-same-padding dX bug
 is fixed before widening the search, with full independent f64 derivative tests.
 
 Exact-class qualification and selection for the existing 32/64 convolution
-derivative tiles are implemented. The [corrected crossover](../experiments/conv-tiles-corrected-2026-09-06/README.md)
+derivative tiles are implemented. The [corrected crossover](../experiments.md#conv-tiles-corrected-2026-09-06)
 retains six ResNet F+L+B and small Adam/SGD convolution-chain processes.
 ResNet changes eight dX dispatches and observes median 17.5808→16.7293 ms,
 ratio 1.05056×, but all six decisions are inconclusive under the unchanged
@@ -389,8 +389,8 @@ across rebuilt plans and automatic installation remain open. Do not hide partial
 outside the budget or create another tuner. Full f64 checks and short SGD/Adam
 trajectories pass for the tested short fixtures; a long tiny-gradient three-way
 partial fails the unchanged gate even though the final gradient passes. The
-[prototype record](../experiments/split-k-2026-09-06/README.md) retains that rejection;
-the [later measurement cohort](../experiments/split-k-sequence-2026-09-06/README.md)
+[prototype record](../experiments.md#split-k-2026-09-06) retains that rejection;
+the [later measurement cohort](../experiments.md#split-k-sequence-2026-09-06)
 is separate. Its 64 comparisons include 32 numerical rejections and no default
 change. The synthetic long case observes a 6.93× eight-way sequence ratio, but
 neither profiled large shape reaches timing. Full f64 scans expose unsplit-control

@@ -138,12 +138,12 @@ qualification needs a different device: our RTX 5070 advertises f16 tiles only.
 Capability probing is named `auto_tune` but does not time kernels. Neither
 this new search nor new speedups are part of the frozen paper evidence.
 
-The [separate five-process transfer pilot](../experiments/tuning-2026-09-05/README.md)
+The [separate five-process transfer pilot](../experiments.md#tuning-2026-09-05)
 shows 1.15×/1.13× whole-step gains on two synthetic chains and unchanged choices
 on two smaller ones. Search amortizes over roughly 1,600–2,850 steps in the
 winning cases; do not turn that into a general model or PyTorch claim.
 
-The [six-case holdouts](../experiments/holdouts-2026-09-06/README.md) then tested
+The [six-case holdouts](../experiments.md#holdouts-2026-09-06) then tested
 inference, Adam, SGD and F+L+B across five processes. All full control-session
 tensor/state comparisons passed through step 78, but none cleared the whole-step
 guard. An unchanged ResNet control even showed a misleading 1.071× ratio of
@@ -227,10 +227,16 @@ machine, not because CPU time measures the iGPU's hardware potential.
 Short: they are important stronger automatic baselines that were not tested.
 
 Detail: the frozen protocol uses default `torch.compile` on Linux and no
-additional manual capture. `reduce-overhead`/`max-autotune` can change capture
+additional manual capture. Its explicit CUDA Graph helpers were only used by
+the legacy runner, which the paper-v1 path bypassed. A captured compiler IR
+is not a replayed CUDA command graph. `reduce-overhead`/`max-autotune` can change capture
 and selection without model-specific kernels. The paper now states this
 limitation explicitly. A new sweep must verify actual activation and charge
 compile/search cost, memory and accuracy, not silently replace the old data.
+
+The [CUDA Graph follow-up](../../paper/p3hpc/CUDA-GRAPHS.md) explains the repair,
+the exact timed boundary and the new collection plan. Do not claim that the
+submitted measurements already used this repaired baseline.
 
 ### 21. Are the training times complete training steps?
 
@@ -393,7 +399,7 @@ readback allocation/copy falls from 582 to 2 ms; unchanged CPU validation
 still takes about 6 ms. Total search falls from 606 to 39 ms despite increased
 preparation and transfer costs. Keep the ordinary/tiny patterns, full scans
 and sampled f64 checks: they were not the dominant cost. See the
-[six-process protocol and results](../experiments/readback-2026-09-06/README.md).
+[six-process protocol and results](../experiments.md#readback-2026-09-06).
 
 ### 36. Does read-optimized staging mean faster kernels or faster ResNet?
 
@@ -432,7 +438,7 @@ and the overall gain/regression guards both reject a claim. Even the ratio of
 cost medians (0.981×) and median process ratio (1.007×) differ in direction.
 Balanced order is a control, not proof of constant clocks or causal isolation;
 the 250 ms telemetry cannot explain every short operation. See the
-[complete resource protocol and results](../experiments/staging-reuse-2026-09-06/README.md).
+[complete resource protocol and results](../experiments.md#staging-reuse-2026-09-06).
 
 ### 39. Can all full-state comparisons pass while a gradient is still wrong?
 
@@ -459,7 +465,7 @@ or Metal evidence. Intrusive pass timing and substantial short-case drift mean
 the shares are localization evidence, not guaranteed whole-step speedup bounds.
 Exact convolution classes/qualification now cover the existing scalar
 tiles; accept any new schedule only after independent edge tests and matched
-whole-step confirmation. [Protocol and limitations](../experiments/training-profile-2026-09-06/README.md).
+whole-step confirmation. [Protocol and limitations](../experiments.md#training-profile-2026-09-06).
 
 ### 41. Why isn't convolution tuning just another M/N/K lookup?
 
@@ -485,7 +491,7 @@ outputs on ordinary/tiny synthetic inputs and match 32 f64 contractions,
 including dX batch edges. Separate full f64 scatter oracles cover padding,
 stride and tile edges. Shared bugs, untested domains and convergence still
 require independent evidence. A qualified isolated winner is not automatically
-a whole-step win. [Contract and experiment](../experiments/conv-tiles-2026-09-06/README.md).
+a whole-step win. [Contract and experiment](../experiments.md#conv-tiles-2026-09-06).
 
 ### 43. Can two bit-exact training sessions still be an invalid benchmark?
 
@@ -499,7 +505,7 @@ cases, corrected the builder, added early operand rejection and full forward
 oracles, and required nonzero prefix signals plus actual parameter changes.
 The corrected six-process cohort passes these checks. This is why workload
 validity, independent correctness, state preservation and performance are
-separate gates. [Correction and archive](../experiments/conv-tiles-corrected-2026-09-06/README.md).
+separate gates. [Correction and archive](../experiments.md#conv-tiles-corrected-2026-09-06).
 
 ### 44. Did convolution autotuning win?
 
@@ -537,8 +543,8 @@ A new six-process RTX cohort shows only about 2% lower ResNet F+L+B time, with
 bit-identical full states. Most of the old cost remains, and short-case drift
 prevents a no-regression claim. A correctness proof does not prove profitability;
 this local comparison is not a new PyTorch result or paired-MAD tuning decision.
-[Repair](../experiments/conv-indexing-2026-09-06/README.md),
-[proof and follow-up measurements](../experiments/conv-divisor-2026-09-06/README.md).
+[Repair](../experiments.md#conv-indexing-2026-09-06),
+[proof and follow-up measurements](../experiments.md#conv-divisor-2026-09-06).
 
 ### 46. Why isn't split-K just another tile size?
 
@@ -562,8 +568,8 @@ probes now reuse its scratch, timers and decision guard without installing a
 choice. A four-process cohort finds an isolated 6.93× eight-way gain on the
 synthetic long case, including SumRows, but both profiled large shapes reject
 before timing. No whole-step training gain is established; defaults are unchanged.
-[Prototype](../experiments/split-k-2026-09-06/README.md),
-[sequence measurements](../experiments/split-k-sequence-2026-09-06/README.md).
+[Prototype](../experiments.md#split-k-2026-09-06),
+[sequence measurements](../experiments.md#split-k-sequence-2026-09-06).
 
 ### 47. How can the unsplit f32 control fail qualification?
 
@@ -581,7 +587,7 @@ passed, not that every possible gradient is covered. Stronger shared accumulatio
 and broader input coverage come before training promotion; loosening tolerances
 or claiming two same-order scalar tiles are independent references would not
 resolve this. The probe's full validation can cost seconds, so its cost is reported
-separately from sequence timing. [Evidence and limits](../experiments/split-k-sequence-2026-09-06/README.md).
+separately from sequence timing. [Evidence and limits](../experiments.md#split-k-sequence-2026-09-06).
 
 ### 48. Why stop after a mostly successful accuracy improvement?
 
@@ -600,7 +606,7 @@ shape exception, relax the gate, or turn the next possible algorithm into anothe
 mandatory deadline item. The tuning foundation is useful without universal
 kernel coverage. This closes the engineering milestone and lets paper review
 proceed; it does not prove split-K can never succeed.
-[Decision and evidence](../experiments/compensated-dw-2026-09-06/README.md).
+[Decision and evidence](../experiments.md#compensated-dw-2026-09-06).
 
 ## Talk outline
 

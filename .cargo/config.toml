@@ -1,0 +1,3 @@
+[env]
+# Integration suites share one GPU. An explicit caller setting still wins.
+RUST_TEST_THREADS = "1"

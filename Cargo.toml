@@ -8,6 +8,26 @@ edition = "2024"
 rust-version = "1.92"
 description = "Portable GPU training and inference through Vulkan and Metal"
 license = "MIT"
+autotests = false
+
+[[test]]
+name = "smoke"
+
+[[test]]
+name = "regression"
+
+# These tests change process-global environment variables.
+[[test]]
+name = "device_local"
+
+[[test]]
+name = "flash_grad_kv_short"
+
+[[test]]
+name = "rmsnorm_matmul_prologue"
+
+[[test]]
+name = "sd_unet_coop_parity"
 
 [features]
 default = []
