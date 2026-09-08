@@ -104,7 +104,7 @@ evidence, not portable benchmark artifacts.
 normal timing blocks before and after capture, full profiled-result comparisons
 before ordinary ring advancement, exact dispatch contracts, provenance and
 telemetry. It enables timestamp queries through `GpuOptions`, with no environment
-variable required. The [retained protocol and results](experiments/training-profile-2026-09-06/README.md)
+variable required. The [retained protocol and results](experiments.md#training-profile-2026-09-06)
 separate localization from optimizer-backed timing and candidate acceptance.
 
 Those records show why both controls matter: all 45 profiled full states match

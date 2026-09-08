@@ -4,6 +4,7 @@ data/mnist-mlp.safetensors
 data/*.gz
 /bench/results/
 /results/
+/docs/experiments/
 *.trace
 /.venv/
 /.claude/

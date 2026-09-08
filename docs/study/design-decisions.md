@@ -169,7 +169,7 @@ old failure is evidence about that experiment, not a proof of impossibility.
 
 ## 9. A shared baseline is not an independent oracle
 
-The [September 6 whole-step profiles](../experiments/training-profile-2026-09-06/README.md)
+The [September 6 whole-step profiles](../experiments.md#training-profile-2026-09-06)
 prioritize convolution derivatives. Reviewing their indexing then uncovered
 a stride-1 dX bug outside same padding. Forward cross-correlation uses
 `ih = oh*stride + kh - padding_h`; inversion requires
@@ -210,7 +210,7 @@ This is semantic strength reduction, not a learned performance threshold or
 a new runtime search space. The four derived integer uniforms and their host
 binding work are real costs. Raw-u32 GPU tests exercise the same shared helper;
 full f64 convolution oracles and state-preservation checks remain unchanged.
-The [six-process follow-up](../experiments/conv-divisor-2026-09-06/README.md)
+The [six-process follow-up](../experiments.md#conv-divisor-2026-09-06)
 finds only about 2% lower ResNet step time on RTX 5070, leaving most of the
 earlier regression. Two candidate Whisper after-blocks worsen substantially.
 Retain those observations: exactness, backend profitability, timing stability

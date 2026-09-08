@@ -5,6 +5,12 @@ This is a revised working draft and preparation kit, not a declaration that
 the camera-ready has been approved or submitted. Reviewer text and any
 acceptance-specific conditions were not supplied during the audit.
 
+September 8 follow-up: the author has placed reviews at
+`/home/kvark/Documents/P3HPC`, but that directory is not visible in this
+workspace. The reported baseline concern is independently confirmed in source;
+see [CUDA Graph diagnosis and collection plan](CUDA-GRAPHS.md). Actual review
+text is still required before closing the response matrix.
+
 ## Dates and constraints
 
 The official page lists September 25 for camera-ready submission and
@@ -65,6 +71,7 @@ meaning and distinguishing required changes from suggestions:
 | Review / concern | Response and evidence | Manuscript location | Status |
 |---|---|---|---|
 | Awaiting supplied reviewer text | Do not invent reviewer requests | — | Pending author input |
+| Author-reported CUDA Graph baseline concern | Paper-v1 bypassed legacy explicit capture; clean Inferena experiment adds qualified whole-phase replay and a new cohort plan | Evaluation setup; limitations; `CUDA-GRAPHS.md` | ResNet pilot qualified; remaining workloads and replicated full matrix pending |
 
 Common questions and prepared responses are in
 [the rehearsal guide](../../docs/study/p3hpc-questions.md); they are anticipated
@@ -97,10 +104,10 @@ notices remain. All ten pages were visually inspected. The final reference
 columns use `\IEEEtriggeratref{24}`; revisit that split if the bibliography
 changes. The companion report also builds at `target/paper-audit/main.pdf`.
 
-Current draft SHA-256:
-`4ad1d060c224a1a193718f3143adcb521e8d8e1a716d675e2d88122895c03419`.
-Rebuilding changes PDF metadata and may change this hash; record a fresh hash
-for the final submission artifact.
+The September 8 baseline clarification also builds to 10 pages without
+undefined references, citation warnings or overfull boxes. No working PDF or
+its changing metadata hash belongs in Git; the final submission package should
+record its own checksum separately from the reviewed source revision.
 
 This machine lacked the recommended fonts, TikZ and several LaTeX packages.
 They were downloaded/extracted under `target/tex-packages/`, not installed

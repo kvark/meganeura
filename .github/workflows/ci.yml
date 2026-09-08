@@ -63,6 +63,12 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install coverage tool
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Install lavapipe and Vulkan
         if: runner.os == 'Linux'
@@ -73,16 +79,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Every target, not a hand-picked subset: the whole suite
-      # is ~2 min on lavapipe, and naming targets one by one meant new test
-      # files silently never ran. `--tests` covers the lib unit tests too.
-      # Among the coverage this restores:
-      # gradcheck (backward ops must chain grad_output — see the contract
-      # comment atop autodiff.rs's match block), gpu_smoke, cache_inference,
-      # the matmul/attention audit regressions, and the vision ops.
-      #
-      # --test-threads=1 because several targets drive one adapter and the
-      # audit regressions were already serial.
+      # Build two shared suites plus the environment-isolated tests.
+      # Linux instruments this same run, not a second copy of the suite.
       #
       # `MEGANEURA_SKIP_BIT_EXACT` gates one class of test: exact equality
       # between a fused path and its explicit expansion. The contract holds
@@ -92,12 +90,37 @@ jobs:
       # at a time, which grew with every adapter; `tests/schedule_*.rs`
       # still run these at full strength locally.
       - name: Unit + integration tests
-        run: cargo test --tests -- --test-threads=1
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            cargo llvm-cov clean --workspace
+            cargo llvm-cov --tests --no-report -- --test-threads=1
+          else
+            cargo test --tests -- --test-threads=1
+          fi
         env:
           # MHA backward shaders produce numerically unstable gradients on
           # lavapipe and on CI Metal runners (grad_k divergence on M-series).
           MEGANEURA_SKIP_BACKPROP: ${{ matrix.skip_backprop }}
           MEGANEURA_SKIP_BIT_EXACT: "1"
+
+      - name: Rust host coverage
+        if: runner.os == 'Linux'
+        run: |
+          cargo llvm-cov report --ignore-filename-regex '(^|/)(tests|examples|bench)/' \
+            --json --summary-only --output-path target/llvm-cov/summary.json
+          cargo llvm-cov report --ignore-filename-regex '(^|/)(tests|examples|bench)/' \
+            --html
+          jq -r '.data[0].totals | "Rust host coverage: lines \(.lines.percent)%, functions \(.functions.percent)%, regions \(.regions.percent)%. WGSL execution is not instrumented; CI backprop/bit-exact skips apply."' \
+            target/llvm-cov/summary.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Retain coverage by revision
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-coverage-${{ github.sha }}
+          path: target/llvm-cov/
+          retention-days: 30
 
       - name: Latency benchmark
         if: runner.os == 'Linux'

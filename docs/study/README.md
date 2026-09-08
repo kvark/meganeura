@@ -14,7 +14,7 @@ CPU-only; subsequent GPU qualification is described separately in the
 [performance plan](performance-plan.md), after the device was released.
 
 The tuning-foundation milestone is now closed. Its final
-[bounded accuracy attempt](../experiments/compensated-dw-2026-09-06/README.md)
+[bounded accuracy attempt](../experiments.md#compensated-dw-2026-09-06)
 resolved the original fixtures but failed broader tiny cancellation checks
 (230/240 rows qualify). The arithmetic change is not retained; split-K promotion
 is deferred without another performance experiment. The remaining engineering
@@ -44,24 +44,24 @@ names. The implementation searches scalar-f32 and legal native-f32 cooperative
 matmul tiles in isolated scratch. Scalar GPU qualification passed; native-f32
 hardware coverage is still due. F16-input/complex-fusion search and persistent
 winners remain future work. The whole-step experiment harness is separate
-from the frozen publication evidence. Its [first five-process experiment](../experiments/tuning-2026-09-05/README.md)
+from the frozen publication evidence. Its [first five-process experiment](../experiments.md#tuning-2026-09-05)
 found repeatable 1.15×/1.13× gains on two synthetic dense chains; two smaller
 cases retained their initial tiles. This is not a new PyTorch comparison.
 
-The [broader five-process holdouts](../experiments/holdouts-2026-09-06/README.md)
+The [broader five-process holdouts](../experiments.md#holdouts-2026-09-06)
 now cover nonlinear inference and optimizer-backed trajectories: full control-
 session gradients/moments and update counts pass, but none of the 30 case runs
 clears the whole-step gain/regression guard. This is why tuning remains opt-in
 and why controlled confirmation and wider kernel-family coverage matter.
 
-The [six-process crossover](../experiments/crossover-2026-09-06/README.md)
+The [six-process crossover](../experiments.md#crossover-2026-09-06)
 now confirms a median 1.177× dense-chain gain with the selected plan on either
 session. MLP+Adam has no confirmed gain; two untuned/untuned controls are noisy.
 ResNet is unchanged, and its new phase timers put roughly 98% of search time
 in qualification. Read this as a lesson in separating numerical correctness,
 kernel selection, search cost and whole-step acceptance—not as a new paper result.
 
-The [staging follow-up](../experiments/readback-2026-09-06/README.md), on published
+The [staging follow-up](../experiments.md#readback-2026-09-06), on published
 Blade 0.9, separates CPU readback copies from numerical checks and transfer/wait.
 Across six paired processes, ResNet's median total search falls from 606 to
 39 ms: CPU readback allocation/copy falls from 582 to 2 ms, while the same
@@ -72,7 +72,7 @@ preparation/transfer costs and the first slower dense run are retained. This
 is cheaper search on one device, not faster ResNet execution or a Blade-version
 comparison. Development now requires Rust 1.92.
 
-The [allocation/reuse follow-up](../experiments/staging-reuse-2026-09-06/README.md)
+The [allocation/reuse follow-up](../experiments.md#staging-reuse-2026-09-06)
 then locates the remaining preparation cost in staging allocation. One exact-size
 buffer now survives between comparisons within a tuning call, never after return.
 Across six paired processes this lowers median dense search 44.01→31.84 ms and
@@ -80,7 +80,7 @@ MLP+Adam 64.27→45.46 ms. ResNet has no reuse opportunity and no guarded change
 All validation and scratch byte bounds remain intact. This is another search-cost
 result, not a reversal of the earlier inconclusive MLP whole-step result.
 
-The [whole-step localization follow-up](../experiments/training-profile-2026-09-06/README.md)
+The [whole-step localization follow-up](../experiments.md#training-profile-2026-09-06)
 prioritizes backward convolution in ResNet and backward attention in SmolLM2.
 All 45 profiled full states match ordinary execution, but short-model timing
 drift and instrumented pass overhead remain visible. These are F+L+B profiles,
@@ -88,7 +88,7 @@ not optimizer-backed or cross-engine speedups. Reviewing convolution then found
 and repaired a non-same-padding dX indexing bug using an independent f64 oracle;
 read [the design lesson](design-decisions.md#9-a-shared-baseline-is-not-an-independent-oracle).
 
-The subsequent [exact-indexing follow-up](../experiments/conv-divisor-2026-09-06/README.md)
+The subsequent [exact-indexing follow-up](../experiments.md#conv-divisor-2026-09-06)
 replaces costly integer division with one shared, all-integer reciprocal and
 exact correction. Its full-u32 proof and GPU oracles do not depend on model
 names or special widths. A fresh six-process cohort lowers ResNet F+L+B time
@@ -96,11 +96,11 @@ by only about 2%; most of the preceding correctness-repair cost remains.
 Short-case instability, including two much slower Whisper after-blocks, is
 retained. This is neither a new paper result nor a reason to weaken validation.
 
-The [split-K prototype](../experiments/split-k-2026-09-06/README.md) adds an
+The [split-K prototype](../experiments.md#split-k-2026-09-06) adds an
 explicit bounded plan transformation: shared scalar dW partials followed by
 existing SumRows. The normal memory planner handles their lifetime. Full f64
 oracles and short optimizer trajectories cover qualified fixtures; a long tiny
-partial fails and remains rejected. The [isolated sequence follow-up](../experiments/split-k-sequence-2026-09-06/README.md)
+partial fails and remains rejected. The [isolated sequence follow-up](../experiments.md#split-k-sequence-2026-09-06)
 now measures both passes with all scratch charged: eight-way splitting gives a
 6.93× synthetic long-reduction ratio, but both profiled large shapes fail
 qualification before timing. Full scans expose control accumulation errors missed
@@ -134,7 +134,9 @@ For a two-hour technical pass, read in this order:
 
 For the engineering backlog, use the [September audit](../audit-2026-09.md).
 For camera-ready work, use the [revision plan](../../paper/p3hpc/REVISION.md)
-and [paper source](../../paper/p3hpc/main.tex).
+and [paper source](../../paper/p3hpc/main.tex). Start the baseline discussion
+with [what happened to CUDA Graphs](../../paper/p3hpc/CUDA-GRAPHS.md);
+the repaired pilot is separate from the submitted results.
 
 ## Keep these distinctions straight
 

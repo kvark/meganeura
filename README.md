@@ -45,6 +45,11 @@ trainer.train(&mut data, /* epochs = */ 10); // data loader: see examples/mnist.
 
 A two-layer MLP, trained end to end on the GPU, in one screen.
 
+For local iteration use `cargo test --lib` and
+`cargo test --test smoke -- --test-threads=1` (GPU). See
+[testing and coverage](docs/testing.md) and
+[debugging the stack](docs/study/observability.md).
+
 ## Why Meganeura
 
 **Fast.** Meganeura is competitive with vendor-native ML stacks on selected
