@@ -107,6 +107,7 @@ jobs:
       - name: Rust host coverage
         if: runner.os == 'Linux'
         run: |
+          mkdir -p target/llvm-cov
           cargo llvm-cov report --ignore-filename-regex '(^|/)(tests|examples|bench)/' \
             --json --summary-only --output-path target/llvm-cov/summary.json
           cargo llvm-cov report --ignore-filename-regex '(^|/)(tests|examples|bench)/' \
