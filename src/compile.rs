@@ -240,6 +240,7 @@ pub enum ShaderEntry {
     CacheWrite,
     CacheWritePrefix,
     CachedAttention,
+    CachedQueryAttention,
     CachedBlockAttention,
     ChunkedRelativeAttention,
     PrefixLast,
@@ -301,6 +302,7 @@ impl ShaderEntry {
             | ShaderEntry::MultiHeadAttnGradKV
             | ShaderEntry::FlashGradKV
             | ShaderEntry::CachedAttention
+            | ShaderEntry::CachedQueryAttention
             | ShaderEntry::CachedBlockAttention
             | ShaderEntry::ChunkedRelativeAttention => "attention",
 
@@ -481,6 +483,7 @@ impl ShaderEntry {
             ShaderEntry::CacheWrite => ShaderGroup::CacheWrite,
             ShaderEntry::CacheWritePrefix => ShaderGroup::CacheWritePrefix,
             ShaderEntry::CachedAttention => ShaderGroup::CachedAttention,
+            ShaderEntry::CachedQueryAttention => ShaderGroup::CachedQueryAttention,
             ShaderEntry::CachedBlockAttention => ShaderGroup::CachedBlockAttention,
             ShaderEntry::ChunkedRelativeAttention => ShaderGroup::ChunkedRelativeAttention,
             ShaderEntry::PrefixLast => ShaderGroup::PrefixLast,
@@ -590,6 +593,7 @@ impl ShaderEntry {
             ShaderEntry::CacheWrite => "main",
             ShaderEntry::CacheWritePrefix => "main",
             ShaderEntry::CachedAttention => "main",
+            ShaderEntry::CachedQueryAttention => "main",
             ShaderEntry::CachedBlockAttention => "main",
             ShaderEntry::ChunkedRelativeAttention => "main",
             ShaderEntry::PrefixLast => "main",
@@ -2608,6 +2612,12 @@ impl<'a> Compiler<'a> {
     fn compile(&mut self) {
         // First pass: allocate buffers for all nodes
         for node in self.graph.nodes() {
+            // Cache outputs must alias before allocating views of the result.
+            if matches!(node.op, Op::CacheWrite | Op::CacheWritePrefix) {
+                let cache = self.get_buffer(node.inputs[1]);
+                self.node_buffers.insert(node.id, cache);
+                continue;
+            }
             // Identity and StopGradient are zero-cost: alias the input
             // buffer. (Identity may also reshape; StopGradient is forward-
             // identity with backward zero, handled in autodiff.)
@@ -4638,8 +4648,7 @@ impl<'a> Compiler<'a> {
                 let cache = self.get_buffer(node.inputs[1]);
                 let kv_pos_input = self.get_buffer(node.inputs[2]);
                 let dim = self.graph.node(node.inputs[0]).ty.shape[1] as u32;
-                // Output aliases the cache buffer (in-place write)
-                self.node_buffers.insert(node.id, cache);
+                debug_assert_eq!(out_buf, cache);
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::CacheWrite,
                     workgroups: [dim.div_ceil(256), 1, 1],
@@ -4663,7 +4672,7 @@ impl<'a> Compiler<'a> {
                 let block_len = new_shape[0] as u32;
                 let dim = new_shape[1] as u32;
                 let max_seq = cache_shape[0] as u32;
-                self.node_buffers.insert(node.id, cache);
+                debug_assert_eq!(out_buf, cache);
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::CacheWritePrefix,
                     workgroups: [(block_len * dim).div_ceil(256), 1, 1],
@@ -4686,13 +4695,19 @@ impl<'a> Compiler<'a> {
                 let k_cache = self.get_buffer(node.inputs[1]);
                 let v_cache = self.get_buffer(node.inputs[2]);
                 let kv_pos_input = self.get_buffer(node.inputs[3]);
+                let q_seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
+                let block_queries = crate::codegen::CACHED_ATTENTION_QUERIES;
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::CachedAttention,
-                    workgroups: [1, num_heads, 1],
+                    shader: if q_seq > 1 {
+                        ShaderEntry::CachedQueryAttention
+                    } else {
+                        ShaderEntry::CachedAttention
+                    },
+                    workgroups: [q_seq.div_ceil(block_queries), num_heads, 1],
                     input_buffers: vec![q, k_cache, v_cache, kv_pos_input],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
-                    params: vec![0, num_heads, num_kv_heads, head_dim], // kv_len read from input buffer
+                    params: vec![q_seq, num_heads, num_kv_heads, head_dim],
                     use_coop: false,
                     use_small_tiles: false,
                     ..Default::default()

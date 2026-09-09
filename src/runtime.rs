@@ -748,7 +748,7 @@ struct CachedAttentionData {
     bias: blade_graphics::BufferPiece,
     kv_pos_buf: blade_graphics::BufferPiece,
     dst: blade_graphics::BufferPiece,
-    params: MatMulParams, // _reserved, num_heads, num_kv_heads, head_dim
+    params: MatMulParams, // queries, num_heads, num_kv_heads, head_dim
 }
 
 #[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
@@ -2134,7 +2134,9 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::RoPEDynamic | ShaderEntry::RoPEPositions => RoPEDynamicData::layout(),
         ShaderEntry::CacheWrite => CacheWriteData::layout(),
         ShaderEntry::CacheWritePrefix => CacheWritePrefixData::layout(),
-        ShaderEntry::CachedAttention => CachedAttentionData::layout(),
+        ShaderEntry::CachedAttention | ShaderEntry::CachedQueryAttention => {
+            CachedAttentionData::layout()
+        }
         ShaderEntry::CachedBlockAttention => CachedBlockAttentionData::layout(),
         ShaderEntry::ChunkedRelativeAttention => ChunkedRelativeAttentionData::layout(),
         ShaderEntry::PrefixLast => PrefixLastData::layout(),
@@ -7302,7 +7304,7 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::CachedAttention => {
+            ShaderEntry::CachedAttention | ShaderEntry::CachedQueryAttention => {
                 pc.bind(
                     0,
                     &CachedAttentionData {
