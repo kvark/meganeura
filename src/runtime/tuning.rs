@@ -52,7 +52,7 @@ impl Pipelines {
             .map_err(|error| error.to_string())?;
         let layout = super::shader_data_layout(&selected_entry);
         let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-            name: selected_entry.entry_point(),
+            name: &key.label(),
             data_layouts: &[&layout],
             compute: shader.at(selected_entry.entry_point()),
         });
