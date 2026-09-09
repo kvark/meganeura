@@ -4,6 +4,9 @@ on:
     paths: ['.github/workflows/softplus-validate.yml', '.github/softplus-edit.py', 'src/compile/softplus.rs', 'tests/softplus_tail.rs']
 permissions:
   contents: read
+concurrency:
+  group: softplus-validation-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   validate:
     if: github.head_ref == 'fix/softplus-negative-tail' && github.event.pull_request.head.repo.full_name == github.repository
@@ -29,7 +32,7 @@ jobs:
       - name: Reproduce negative-tail failure
         run: |
           result=0
-          cargo +1.92.0 test --test regression softplus_tail --locked -- --nocapture --test-threads=1 > target/softplus-validation/before.log 2>&1 || result=$?
+          cargo +1.92.0 test --test regression softplus_tail -- --nocapture --test-threads=1 > target/softplus-validation/before.log 2>&1 || result=$?
           test "$result" = 101
           grep -q 'softplus forward:' target/softplus-validation/before.log
           grep -q 'normalized weight:' target/softplus-validation/before.log
@@ -49,7 +52,7 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git rm .github/softplus-edit.py
-          git add src/compile.rs src/compile/softplus.rs tests/softplus_tail.rs tests/schedule_pointwise.rs tests/regression.rs
+          git add Cargo.lock src/compile.rs src/compile/softplus.rs tests/softplus_tail.rs tests/schedule_pointwise.rs tests/regression.rs
           git diff --cached --check
           git commit -m 'fix: preserve softplus negative-tail values and gradients'
           git push origin HEAD:refs/heads/fix/softplus-negative-tail

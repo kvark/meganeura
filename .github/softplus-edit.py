@@ -16,3 +16,7 @@ b = s.index('#[test]\nfn softplus_compiles_to_one_pointwise_dispatch()', a)
 s = s[:a] + s[b:]
 s = s.replace('/// `narrow_sum_inner_matches_scalar_f32_order` and softplus\'s gradient.', '/// `narrow_sum_inner_matches_scalar_f32_order`.')
 p.write_text(s)
+p = Path('tests/softplus_tail.rs')
+s = p.read_text().replace('let mut options = CompileOptions::default();\n            options.use_schedule_pointwise = schedule;', 'let options = CompileOptions { use_schedule_pointwise: schedule, ..Default::default() };')
+s = s.replace('for c in 0..6 { accurate(output[row * 6 + c], raw[c] / total, "normalized weight"); }', 'for (c, &weight) in raw.iter().enumerate() { accurate(output[row * 6 + c], weight / total, "normalized weight"); }')
+p.write_text(s)
