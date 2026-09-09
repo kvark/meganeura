@@ -630,10 +630,10 @@ pub enum Op {
     /// This is the batched counterpart of [`Op::CacheWrite`].
     CacheWritePrefix,
 
-    // Attention with Q from current token and K/V from pre-allocated cache.
+    // Every query attends to the same causally populated cache prefix.
     // inputs: [q, k_cache, v_cache, kv_pos_input]
-    // q: [1, num_heads*head_dim], k_cache/v_cache: [max_seq, kv_dim]
-    // kv_pos_input: u32 scalar (number of valid cached positions)
+    // q: [queries, num_heads*head_dim], k_cache/v_cache: [max_seq, kv_dim]
+    // kv_pos_input: u32 scalar (last valid cached position, inclusive)
     CachedAttention {
         num_heads: u32,
         num_kv_heads: u32,
@@ -2396,8 +2396,11 @@ impl Graph {
     }
 
     /// Cached attention: Q attends to K/V cache.
-    /// q: [1, num_heads*head_dim], k_cache/v_cache: [max_seq, kv_dim],
-    /// kv_pos: u32 scalar (number of valid positions in cache).
+    /// q: [queries, num_heads*head_dim], k_cache/v_cache: [max_seq, kv_dim].
+    /// Every query attends to positions 0..=kv_pos. Unlike
+    /// [`Self::cached_block_attention`], this has no token-causal mask within
+    /// the query block: one video's frame can attend to all its own patches.
+    /// Currently requires head_dim=64.
     #[track_caller]
     pub fn cached_attention(
         &mut self,
@@ -2411,13 +2414,20 @@ impl Graph {
     ) -> NodeId {
         let q_shape = &self.node(q).ty.shape;
         assert_eq!(q_shape.len(), 2, "q must be 2D");
-        assert_eq!(q_shape[0], 1, "q must have seq_len=1 for cached attention");
+        assert!(q_shape[0] > 0, "cached attention needs a query");
+        assert_eq!(head_dim, 64, "cached attention supports 64-wide heads");
+        assert!(num_kv_heads > 0 && num_heads.is_multiple_of(num_kv_heads));
         assert_eq!(
             q_shape[1],
             (num_heads * head_dim) as usize,
             "q dim mismatch"
         );
-        let ty = TensorType::f32(vec![1, (num_heads * head_dim) as usize]);
+        let k_shape = &self.node(k_cache).ty.shape;
+        assert_eq!(k_shape.len(), 2, "cache must be 2D");
+        assert!(k_shape[0] > 0, "cache must be nonempty");
+        assert_eq!(k_shape[1], (num_kv_heads * head_dim) as usize);
+        assert_eq!(&self.node(v_cache).ty.shape, k_shape);
+        let ty = TensorType::f32(q_shape.clone());
         self.add_node(
             Op::CachedAttention {
                 num_heads,

@@ -1,6 +1,7 @@
 //! Focused regressions share one executable instead of linking the stack per file.
 mod adam_state_rw;
 mod back_to_back_step;
+mod cached_query_attention;
 mod constant_dedup;
 mod conv1x1_grad_residual;
 mod conv_derivatives;
