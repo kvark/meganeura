@@ -128,6 +128,15 @@ pub enum Op {
     SoftplusGrad {
         beta: f32,
     },
+    /// Elementwise clamp to the inclusive `[min, max]` range.
+    Clamp {
+        min: f32,
+        max: f32,
+    },
+    /// Multiply every element by a compile-time scalar.
+    Scale {
+        factor: f32,
+    },
 
     // Reduction
     SumAll,
@@ -200,6 +209,8 @@ pub enum Op {
 
     // Broadcast add (bias add: [M,N] + [N])
     BiasAdd,
+    // Broadcast multiply: [M,N] * [N]
+    BiasMul,
 
     // Fused MatMul + Add: C = A × B + D (inputs: [a, b, d])
     FusedMatMulAdd,
@@ -288,6 +299,12 @@ pub enum Op {
     RoPEGrad {
         theta: f32,
         pos_offset: u32,
+        head_dim: u32,
+    },
+    /// RoPE with an explicit position for every input row.
+    /// Inputs: `[x (F32), positions (U32)]`.
+    RoPEPositions {
+        theta: f32,
         head_dim: u32,
     },
 
@@ -608,6 +625,11 @@ pub enum Op {
     // output: cache_buf (in-place write at row kv_pos)
     CacheWrite,
 
+    /// Write a runtime-valid prefix of `[block, dim]` into a cache beginning
+    /// at `kv_pos`. Inputs: `[new_kv, cache, kv_pos, valid_len]`.
+    /// This is the batched counterpart of [`Op::CacheWrite`].
+    CacheWritePrefix,
+
     // Attention with Q from current token and K/V from pre-allocated cache.
     // inputs: [q, k_cache, v_cache, kv_pos_input]
     // q: [1, num_heads*head_dim], k_cache/v_cache: [max_seq, kv_dim]
@@ -617,6 +639,36 @@ pub enum Op {
         num_kv_heads: u32,
         head_dim: u32,
     },
+
+    /// Cached causal attention for a block of query rows. K/V for the valid
+    /// block prefix must already have been written to the cache at `kv_pos`.
+    /// Inputs: `[q, k_cache, v_cache, kv_pos, valid_len]`.
+    CachedBlockAttention {
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        /// Zero for full attention, otherwise the inclusive causal window.
+        window_size: u32,
+    },
+
+    /// Causal chunked self-attention with Transformer-XL relative keys.
+    ///
+    /// Inputs are `[q, k, v, relative_k]`. Q/K/V are `[seq, heads *
+    /// head_dim]`; relative K is `[left_context, heads * head_dim]` ordered
+    /// from the furthest relative position to the current position. A query
+    /// attends to its current chunk and `left_context - 1` rows before the
+    /// chunk. Relative logits apply to only its most recent `left_context`
+    /// keys, matching the blocked relative-shift formulation.
+    ChunkedRelativeAttention {
+        num_heads: u32,
+        head_dim: u32,
+        left_context: u32,
+        softcap_bits: u32,
+    },
+
+    /// Copy row `valid_len - 1` from a padded 2-D prefix into a one-row
+    /// tensor. Inputs: `[input, valid_len]`.
+    PrefixLast,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -1064,6 +1116,18 @@ impl Graph {
         self.add_node(Op::BiasAdd, vec![a, bias], ty)
     }
 
+    /// Multiply every row of a 2-D tensor by the same 1-D scale vector.
+    #[track_caller]
+    pub fn bias_mul(&mut self, a: NodeId, scale: NodeId) -> NodeId {
+        let a_shape = &self.node(a).ty.shape;
+        let s_shape = &self.node(scale).ty.shape;
+        assert_eq!(a_shape.len(), 2, "bias_mul requires 2D input");
+        assert_eq!(s_shape.len(), 1, "scale must be 1D");
+        assert_eq!(a_shape[1], s_shape[0], "scale size must match last dim");
+        let ty = self.node(a).ty.clone();
+        self.add_node(Op::BiasMul, vec![a, scale], ty)
+    }
+
     /// Broadcast-add a `[1, N]` tensor across a `[M, N]` tensor.
     ///
     /// Uses the BiasAdd shader which does `dst[i] = a[i] + b[i % N]`.
@@ -1152,6 +1216,20 @@ impl Graph {
         );
         let ty = self.node(x).ty.clone();
         self.add_node(Op::Softplus { beta }, vec![x], ty)
+    }
+
+    pub fn clamp(&mut self, x: NodeId, min: f32, max: f32) -> NodeId {
+        assert!(min.is_finite(), "clamp min must be finite");
+        assert!(max.is_finite(), "clamp max must be finite");
+        assert!(min <= max, "clamp min must not exceed max");
+        let ty = self.node(x).ty.clone();
+        self.add_node(Op::Clamp { min, max }, vec![x], ty)
+    }
+
+    pub fn scale(&mut self, x: NodeId, factor: f32) -> NodeId {
+        assert!(factor.is_finite(), "scale factor must be finite");
+        let ty = self.node(x).ty.clone();
+        self.add_node(Op::Scale { factor }, vec![x], ty)
     }
 
     /// Reshape: reinterpret the tensor with a new shape (same element count).
@@ -1666,6 +1744,36 @@ impl Graph {
                 head_dim,
             },
             vec![x, offset_input],
+            ty,
+        )
+    }
+
+    /// Apply RoPE using one explicit position per row.
+    #[track_caller]
+    pub fn rope_with_positions(
+        &mut self,
+        x: NodeId,
+        theta: f32,
+        positions: NodeId,
+        head_dim: u32,
+    ) -> NodeId {
+        let x_shape = &self.node(x).ty.shape;
+        assert_eq!(x_shape.len(), 2, "rope requires 2D input");
+        let dim = x_shape[1] as u32;
+        assert_eq!(dim % 2, 0, "rope requires even last dim");
+        assert_eq!(dim % head_dim, 0, "rope: dim must be divisible by head_dim");
+        assert_eq!(head_dim % 2, 0, "rope: head_dim must be even");
+        let position_ty = &self.node(positions).ty;
+        assert_eq!(position_ty.dtype, DType::U32, "rope positions must be U32");
+        assert_eq!(
+            position_ty.shape,
+            vec![x_shape[0]],
+            "rope needs one position per row"
+        );
+        let ty = self.node(x).ty.clone();
+        self.add_node(
+            Op::RoPEPositions { theta, head_dim },
+            vec![x, positions],
             ty,
         )
     }
@@ -2259,6 +2367,34 @@ impl Graph {
         self.add_node(Op::CacheWrite, vec![new_kv, cache, kv_pos], ty)
     }
 
+    /// Write the first `valid_len` rows of a fixed-size block into a cache,
+    /// starting at the dynamic `kv_pos` offset.
+    #[track_caller]
+    pub fn cache_write_prefix(
+        &mut self,
+        new_kv: NodeId,
+        cache: NodeId,
+        kv_pos: NodeId,
+        valid_len: NodeId,
+    ) -> NodeId {
+        let nk_shape = &self.node(new_kv).ty.shape;
+        let c_shape = &self.node(cache).ty.shape;
+        assert_eq!(nk_shape.len(), 2, "new_kv must be 2D");
+        assert_eq!(c_shape.len(), 2, "cache must be 2D");
+        assert_eq!(nk_shape[1], c_shape[1], "dim must match");
+        for (name, input) in [("kv_pos", kv_pos), ("valid_len", valid_len)] {
+            let ty = &self.node(input).ty;
+            assert_eq!(ty.dtype, DType::U32, "{name} must be U32");
+            assert_eq!(ty.shape, vec![1], "{name} must be a scalar buffer");
+        }
+        let ty = self.node(cache).ty.clone();
+        self.add_node(
+            Op::CacheWritePrefix,
+            vec![new_kv, cache, kv_pos, valid_len],
+            ty,
+        )
+    }
+
     /// Cached attention: Q attends to K/V cache.
     /// q: [1, num_heads*head_dim], k_cache/v_cache: [max_seq, kv_dim],
     /// kv_pos: u32 scalar (number of valid positions in cache).
@@ -2290,6 +2426,134 @@ impl Graph {
             },
             vec![q, k_cache, v_cache, kv_pos],
             ty,
+        )
+    }
+
+    /// Cached causal attention for a fixed-size query block with a
+    /// runtime-valid prefix. Query row `i` attends through absolute cache
+    /// position `kv_pos + i`, so chunks compose exactly with single-token
+    /// decoding.
+    #[allow(clippy::too_many_arguments)]
+    #[track_caller]
+    pub fn cached_block_attention(
+        &mut self,
+        q: NodeId,
+        k_cache: NodeId,
+        v_cache: NodeId,
+        kv_pos: NodeId,
+        valid_len: NodeId,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        window_size: u32,
+    ) -> NodeId {
+        assert!(
+            head_dim <= 512,
+            "cached attention supports head dimensions up to 512"
+        );
+        let q_shape = &self.node(q).ty.shape;
+        let k_shape = &self.node(k_cache).ty.shape;
+        let v_shape = &self.node(v_cache).ty.shape;
+        assert_eq!(q_shape.len(), 2, "q must be 2D");
+        assert_eq!(k_shape, v_shape, "K/V cache shapes must match");
+        assert_eq!(k_shape.len(), 2, "K/V caches must be 2D");
+        assert_eq!(
+            q_shape[1],
+            (num_heads * head_dim) as usize,
+            "q dim mismatch"
+        );
+        assert_eq!(
+            k_shape[1],
+            (num_kv_heads * head_dim) as usize,
+            "cache dim mismatch"
+        );
+        for (name, input) in [("kv_pos", kv_pos), ("valid_len", valid_len)] {
+            let ty = &self.node(input).ty;
+            assert_eq!(ty.dtype, DType::U32, "{name} must be U32");
+            assert_eq!(ty.shape, vec![1], "{name} must be a scalar buffer");
+        }
+        let ty = TensorType::f32(vec![q_shape[0], q_shape[1]]);
+        self.add_node(
+            Op::CachedBlockAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                window_size,
+            },
+            vec![q, k_cache, v_cache, kv_pos, valid_len],
+            ty,
+        )
+    }
+
+    /// Causal chunked attention with projected Transformer-XL relative keys.
+    /// `left_context` includes the extra oldest relative-position row used by
+    /// Gemma's blocked shift; the effective causal window has
+    /// `left_context - 1` keys.
+    #[track_caller]
+    pub fn chunked_relative_attention(
+        &mut self,
+        q: NodeId,
+        k: NodeId,
+        v: NodeId,
+        relative_k: NodeId,
+        num_heads: u32,
+        head_dim: u32,
+        left_context: u32,
+        softcap: f32,
+    ) -> NodeId {
+        assert!(
+            head_dim <= 512,
+            "attention supports head dimensions up to 512"
+        );
+        assert!(
+            left_context > 1,
+            "left_context must include a key window and shifted relative row"
+        );
+        assert!(
+            softcap > 0.0 && softcap.is_finite(),
+            "softcap must be finite and positive"
+        );
+        let q_shape = &self.node(q).ty.shape;
+        let k_shape = &self.node(k).ty.shape;
+        let v_shape = &self.node(v).ty.shape;
+        let relative_shape = &self.node(relative_k).ty.shape;
+        assert_eq!(q_shape.len(), 2, "q must be 2D");
+        assert_eq!(q_shape, k_shape, "Q/K shapes must match");
+        assert_eq!(q_shape, v_shape, "Q/V shapes must match");
+        assert_eq!(
+            q_shape[1],
+            (num_heads * head_dim) as usize,
+            "attention dimension mismatch"
+        );
+        assert_eq!(
+            relative_shape,
+            &vec![left_context as usize, q_shape[1]],
+            "relative K shape mismatch"
+        );
+        self.add_node(
+            Op::ChunkedRelativeAttention {
+                num_heads,
+                head_dim,
+                left_context,
+                softcap_bits: softcap.to_bits(),
+            },
+            vec![q, k, v, relative_k],
+            self.node(q).ty.clone(),
+        )
+    }
+
+    /// Select the last valid row of a padded 2-D prefix.
+    #[track_caller]
+    pub fn prefix_last(&mut self, input: NodeId, valid_len: NodeId) -> NodeId {
+        let input_shape = &self.node(input).ty.shape;
+        assert_eq!(input_shape.len(), 2, "prefix_last input must be 2D");
+        let valid_ty = &self.node(valid_len).ty;
+        assert_eq!(valid_ty.dtype, DType::U32, "valid_len must be U32");
+        assert_eq!(valid_ty.shape, vec![1], "valid_len must be a scalar buffer");
+        self.add_node(
+            Op::PrefixLast,
+            vec![input, valid_len],
+            TensorType::f32(vec![1, input_shape[1]]),
         )
     }
 

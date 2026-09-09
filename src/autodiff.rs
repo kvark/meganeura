@@ -138,6 +138,16 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let bias_grad = graph.sum_rows(grad_output, &forward.nodes()[bias as usize].ty);
                 accumulate_grad(&mut graph, &mut grads, bias, bias_grad);
             }
+            Op::BiasMul => {
+                // out[m,n] = input[m,n] * scale[n]
+                let input = node.inputs[0];
+                let scale = node.inputs[1];
+                let grad_input = graph.bias_mul(grad_output, scale);
+                let weighted = graph.mul(grad_output, input);
+                let scale_grad = graph.sum_rows(weighted, &forward.nodes()[scale as usize].ty);
+                accumulate_grad(&mut graph, &mut grads, input, grad_input);
+                accumulate_grad(&mut graph, &mut grads, scale, scale_grad);
+            }
             Op::Mul => {
                 let a = node.inputs[0];
                 let b = node.inputs[1];
@@ -645,6 +655,10 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let dgelu = graph.mul(sig_kx, bracket);
                 let grad_x = graph.mul(grad_output, dgelu);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
+            Op::Scale { factor } => {
+                let grad_x = graph.scale(grad_output, factor);
+                accumulate_grad(&mut graph, &mut grads, node.inputs[0], grad_x);
             }
             Op::Embedding => {
                 // Scatter-add regardless of the table's storage format;
@@ -1163,7 +1177,13 @@ pub fn differentiate(forward: &Graph) -> Graph {
             // Inference-only ops: should not appear in training graphs
             Op::CrossAttention { .. }
             | Op::CacheWrite
+            | Op::CacheWritePrefix
             | Op::CachedAttention { .. }
+            | Op::CachedBlockAttention { .. }
+            | Op::ChunkedRelativeAttention { .. }
+            | Op::PrefixLast
+            | Op::Clamp { .. }
+            | Op::RoPEPositions { .. }
             | Op::GroupNormSilu { .. } => {
                 panic!(
                     "autodiff not supported for {:?} — this op cannot appear in training graphs. \

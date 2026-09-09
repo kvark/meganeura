@@ -149,6 +149,7 @@ pub enum ShaderEntry {
     Mul,
     Greater,
     BiasAdd,
+    BiasMul,
     SgdUpdate,
     AdamUpdate,
     ScatterAdd,
@@ -237,8 +238,13 @@ pub enum ShaderEntry {
     Conv2dGradWeightGemmSplit,
     Conv2dGradWeightGemmSplitSmall,
     CacheWrite,
+    CacheWritePrefix,
     CachedAttention,
+    CachedBlockAttention,
+    ChunkedRelativeAttention,
+    PrefixLast,
     RoPEDynamic,
+    RoPEPositions,
     MaxPool2d,
     GlobalAvgPool,
     GlobalAvgPoolGrad,
@@ -294,7 +300,9 @@ impl ShaderEntry {
             | ShaderEntry::FlashGradQ
             | ShaderEntry::MultiHeadAttnGradKV
             | ShaderEntry::FlashGradKV
-            | ShaderEntry::CachedAttention => "attention",
+            | ShaderEntry::CachedAttention
+            | ShaderEntry::CachedBlockAttention
+            | ShaderEntry::ChunkedRelativeAttention => "attention",
 
             ShaderEntry::Conv2dDw
             | ShaderEntry::Conv2dGemm
@@ -354,7 +362,9 @@ impl ShaderEntry {
             | ShaderEntry::Concat
             | ShaderEntry::SplitA
             | ShaderEntry::SplitB
-            | ShaderEntry::CacheWrite => "data_movement",
+            | ShaderEntry::CacheWrite
+            | ShaderEntry::CacheWritePrefix
+            | ShaderEntry::PrefixLast => "data_movement",
 
             ShaderEntry::Relu
             | ShaderEntry::Sigmoid
@@ -367,6 +377,7 @@ impl ShaderEntry {
             | ShaderEntry::Mul
             | ShaderEntry::Greater
             | ShaderEntry::BiasAdd
+            | ShaderEntry::BiasMul
             | ShaderEntry::Silu
             | ShaderEntry::SwiGLU
             | ShaderEntry::RoPE
@@ -379,7 +390,8 @@ impl ShaderEntry {
             | ShaderEntry::SwiGLUConcatGrad
             | ShaderEntry::MulPerChannel
             | ShaderEntry::AddPerChannel
-            | ShaderEntry::RoPEDynamic => "pointwise",
+            | ShaderEntry::RoPEDynamic
+            | ShaderEntry::RoPEPositions => "pointwise",
         }
     }
 
@@ -403,7 +415,7 @@ impl ShaderEntry {
             | ShaderEntry::Log
             | ShaderEntry::Recip => ShaderGroup::Unary,
             ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater => ShaderGroup::Binary,
-            ShaderEntry::BiasAdd => ShaderGroup::BiasAdd,
+            ShaderEntry::BiasAdd | ShaderEntry::BiasMul => ShaderGroup::BiasAdd,
             ShaderEntry::SgdUpdate => ShaderGroup::Sgd,
             ShaderEntry::AdamUpdate => ShaderGroup::Adam,
             ShaderEntry::ScatterAdd => ShaderGroup::ScatterAdd,
@@ -467,8 +479,13 @@ impl ShaderEntry {
                 ShaderGroup::Conv2dGradWeightGemmSplitSmall
             }
             ShaderEntry::CacheWrite => ShaderGroup::CacheWrite,
+            ShaderEntry::CacheWritePrefix => ShaderGroup::CacheWritePrefix,
             ShaderEntry::CachedAttention => ShaderGroup::CachedAttention,
+            ShaderEntry::CachedBlockAttention => ShaderGroup::CachedBlockAttention,
+            ShaderEntry::ChunkedRelativeAttention => ShaderGroup::ChunkedRelativeAttention,
+            ShaderEntry::PrefixLast => ShaderGroup::PrefixLast,
             ShaderEntry::RoPEDynamic => ShaderGroup::RoPEDynamic,
+            ShaderEntry::RoPEPositions => ShaderGroup::RoPEDynamic,
             ShaderEntry::MaxPool2d => ShaderGroup::MaxPool2d,
             ShaderEntry::GlobalAvgPool => ShaderGroup::GlobalAvgPool,
             ShaderEntry::GlobalAvgPoolGrad => ShaderGroup::GlobalAvgPoolGrad,
@@ -505,6 +522,7 @@ impl ShaderEntry {
             | ShaderEntry::CrossEntropyLoss
             | ShaderEntry::BceLoss
             | ShaderEntry::Transpose => "main",
+            ShaderEntry::BiasMul => "mul",
             ShaderEntry::Relu => "relu",
             ShaderEntry::Sigmoid => "sigmoid",
             ShaderEntry::Tanh => "tanh_",
@@ -570,8 +588,13 @@ impl ShaderEntry {
             | ShaderEntry::Conv2dGradWeightGemmSplit
             | ShaderEntry::Conv2dGradWeightGemmSplitSmall => "main",
             ShaderEntry::CacheWrite => "main",
+            ShaderEntry::CacheWritePrefix => "main",
             ShaderEntry::CachedAttention => "main",
+            ShaderEntry::CachedBlockAttention => "main",
+            ShaderEntry::ChunkedRelativeAttention => "main",
+            ShaderEntry::PrefixLast => "main",
             ShaderEntry::RoPEDynamic => "main",
+            ShaderEntry::RoPEPositions => "with_positions",
             ShaderEntry::MaxPool2d => "max_pool_2d",
             ShaderEntry::GlobalAvgPool => "global_avg_pool",
             ShaderEntry::GlobalAvgPoolGrad => "main",
@@ -3053,6 +3076,24 @@ impl<'a> Compiler<'a> {
                 });
             }
 
+            Op::BiasMul => {
+                let a = self.get_buffer(node.inputs[0]);
+                let scale = self.get_buffer(node.inputs[1]);
+                let len = node.ty.num_elements() as u32;
+                let scale_len = self.graph.node(node.inputs[1]).ty.num_elements() as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::BiasMul,
+                    workgroups: [len.div_ceil(256), 1, 1],
+                    input_buffers: vec![a, scale],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![len, scale_len, 0, 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
             Op::Relu => {
                 self.emit_unary(ShaderEntry::Relu, node, out_buf);
             }
@@ -3083,6 +3124,51 @@ impl<'a> Compiler<'a> {
                 let pointwise = softplus::forward(beta);
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::Relu,
+                    workgroups: [len.div_ceil(256), 1, 1],
+                    input_buffers: vec![input],
+                    output_buffer: out_buf,
+                    params: vec![len, 0, 0, 0],
+                    pointwise: Some(pointwise),
+                    ..Default::default()
+                });
+            }
+            Op::Clamp { min, max } => {
+                let input = self.get_buffer(node.inputs[0]);
+                let len = node.ty.num_elements() as u32;
+                // Use native min/max rather than a ReLU identity. The latter
+                // loses every in-range low-magnitude value to cancellation
+                // when the bounds are large (for example ±1e10).
+                let pointwise = PointwiseDAG {
+                    n_inputs: 1,
+                    ops: vec![
+                        Pw::LoadInput(0),
+                        Pw::const_f32(min),
+                        Pw::const_f32(max),
+                        Pw::Max(0, 1),
+                        Pw::Min(3, 2),
+                    ],
+                    output: 4,
+                };
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::Relu,
+                    workgroups: [len.div_ceil(256), 1, 1],
+                    input_buffers: vec![input],
+                    output_buffer: out_buf,
+                    params: vec![len, 0, 0, 0],
+                    pointwise: Some(pointwise),
+                    ..Default::default()
+                });
+            }
+            Op::Scale { factor } => {
+                let input = self.get_buffer(node.inputs[0]);
+                let len = node.ty.num_elements() as u32;
+                let pointwise = PointwiseDAG {
+                    n_inputs: 1,
+                    ops: vec![Pw::LoadInput(0), Pw::const_f32(factor), Pw::Mul(0, 1)],
+                    output: 2,
+                };
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::Mul,
                     workgroups: [len.div_ceil(256), 1, 1],
                     input_buffers: vec![input],
                     output_buffer: out_buf,
@@ -3797,6 +3883,25 @@ impl<'a> Compiler<'a> {
                         ..Default::default()
                     });
                 }
+            }
+
+            Op::RoPEPositions { theta, head_dim } => {
+                let input = self.get_buffer(node.inputs[0]);
+                let positions = self.get_buffer(node.inputs[1]);
+                let shape = &self.graph.node(node.inputs[0]).ty.shape;
+                let seq = shape[0] as u32;
+                let dim = shape[1] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::RoPEPositions,
+                    workgroups: [(seq * dim / 2).div_ceil(256), 1, 1],
+                    input_buffers: vec![input, positions],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![seq, dim, theta.to_bits(), 0, head_dim, 0, 0, 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
             }
 
             Op::CausalAttention {
@@ -4547,6 +4652,30 @@ impl<'a> Compiler<'a> {
                 });
             }
 
+            Op::CacheWritePrefix => {
+                let new_kv = self.get_buffer(node.inputs[0]);
+                let cache = self.get_buffer(node.inputs[1]);
+                let kv_pos_input = self.get_buffer(node.inputs[2]);
+                let valid_len_input = self.get_buffer(node.inputs[3]);
+                let new_shape = &self.graph.node(node.inputs[0]).ty.shape;
+                let cache_shape = &self.graph.node(node.inputs[1]).ty.shape;
+                let block_len = new_shape[0] as u32;
+                let dim = new_shape[1] as u32;
+                let max_seq = cache_shape[0] as u32;
+                self.node_buffers.insert(node.id, cache);
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::CacheWritePrefix,
+                    workgroups: [(block_len * dim).div_ceil(256), 1, 1],
+                    input_buffers: vec![new_kv, cache, kv_pos_input, valid_len_input],
+                    output_buffer: cache,
+                    extra_outputs: vec![],
+                    params: vec![dim, block_len, max_seq, 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
             Op::CachedAttention {
                 num_heads,
                 num_kv_heads,
@@ -4563,6 +4692,93 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![0, num_heads, num_kv_heads, head_dim], // kv_len read from input buffer
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
+            Op::CachedBlockAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                window_size,
+            } => {
+                let q = self.get_buffer(node.inputs[0]);
+                let k_cache = self.get_buffer(node.inputs[1]);
+                let v_cache = self.get_buffer(node.inputs[2]);
+                let kv_pos_input = self.get_buffer(node.inputs[3]);
+                let valid_len_input = self.get_buffer(node.inputs[4]);
+                let block_len = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
+                let max_seq = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::CachedBlockAttention,
+                    workgroups: [block_len, num_heads, 1],
+                    input_buffers: vec![q, k_cache, v_cache, kv_pos_input, valid_len_input],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![
+                        window_size,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        block_len,
+                        max_seq,
+                        0,
+                        0,
+                    ],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
+            Op::ChunkedRelativeAttention {
+                num_heads,
+                head_dim,
+                left_context,
+                softcap_bits,
+            } => {
+                let q = self.get_buffer(node.inputs[0]);
+                let k = self.get_buffer(node.inputs[1]);
+                let v = self.get_buffer(node.inputs[2]);
+                let relative_k = self.get_buffer(node.inputs[3]);
+                let seq_len = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::ChunkedRelativeAttention,
+                    workgroups: [seq_len, num_heads, 1],
+                    input_buffers: vec![q, k, v, relative_k],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![
+                        seq_len,
+                        num_heads,
+                        head_dim,
+                        left_context,
+                        softcap_bits,
+                        0,
+                        0,
+                        0,
+                    ],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
+            Op::PrefixLast => {
+                let input = self.get_buffer(node.inputs[0]);
+                let valid_len = self.get_buffer(node.inputs[1]);
+                let shape = &self.graph.node(node.inputs[0]).ty.shape;
+                let rows = shape[0] as u32;
+                let cols = shape[1] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::PrefixLast,
+                    workgroups: [cols.div_ceil(256), 1, 1],
+                    input_buffers: vec![input, valid_len],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![cols, rows, 0, 0],
                     use_coop: false,
                     use_small_tiles: false,
                     ..Default::default()

@@ -45,6 +45,8 @@ pub enum Pw {
     Mul(u16, u16),
     Sub(u16, u16),
     Div(u16, u16),
+    Min(u16, u16),
+    Max(u16, u16),
     Greater(u16, u16),
     // Unary ops.
     Neg(u16),
@@ -128,6 +130,12 @@ impl PointwiseDAG {
                 }
                 Pw::Div(a, b) => {
                     let _ = write!(out, "v{} / v{}", a, b);
+                }
+                Pw::Min(a, b) => {
+                    let _ = write!(out, "min(v{}, v{})", a, b);
+                }
+                Pw::Max(a, b) => {
+                    let _ = write!(out, "max(v{}, v{})", a, b);
                 }
                 Pw::Greater(a, b) => {
                     let _ = write!(out, "select(0.0, 1.0, v{} > v{})", a, b);
@@ -242,6 +250,8 @@ impl PointwiseDAG {
                 Pw::Mul(a, b) => Pw::Mul(self_remap[a as usize], self_remap[b as usize]),
                 Pw::Sub(a, b) => Pw::Sub(self_remap[a as usize], self_remap[b as usize]),
                 Pw::Div(a, b) => Pw::Div(self_remap[a as usize], self_remap[b as usize]),
+                Pw::Min(a, b) => Pw::Min(self_remap[a as usize], self_remap[b as usize]),
+                Pw::Max(a, b) => Pw::Max(self_remap[a as usize], self_remap[b as usize]),
                 Pw::Greater(a, b) => Pw::Greater(self_remap[a as usize], self_remap[b as usize]),
                 Pw::Neg(a) => Pw::Neg(self_remap[a as usize]),
                 Pw::Recip(a) => Pw::Recip(self_remap[a as usize]),
