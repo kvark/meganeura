@@ -123,8 +123,8 @@ pub enum Op {
     Softplus {
         beta: f32,
     },
-    /// Backward helper for [`Op::Softplus`] that preserves the expanded
-    /// stable identity's evaluation order.
+    /// Analytic sigmoid derivative for [`Op::Softplus`], preserving the
+    /// negative tail and the derivative of one half at zero.
     SoftplusGrad {
         beta: f32,
     },

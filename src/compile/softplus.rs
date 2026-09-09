@@ -39,7 +39,11 @@ pub(super) fn forward(beta: f32) -> PointwiseDAG {
     ops.push(Pw::Relu(0));
     let output = ops.len() as u16;
     ops.push(Pw::Add(positive, scaled));
-    PointwiseDAG { n_inputs: 1, ops, output }
+    PointwiseDAG {
+        n_inputs: 1,
+        ops,
+        output,
+    }
 }
 
 pub(super) fn backward(beta: f32) -> PointwiseDAG {

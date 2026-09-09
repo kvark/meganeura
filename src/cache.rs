@@ -9,7 +9,8 @@ use std::{io, path::Path};
 
 /// Increment whenever the serialized execution plan or build pipeline changes
 /// in a way that can make an older plan unsafe to reuse.
-const CACHE_FORMAT_VERSION: u32 = 5;
+// Version 6 invalidates cancellation-prone Softplus/SoftplusGrad lowerings.
+const CACHE_FORMAT_VERSION: u32 = 6;
 
 /// Cached execution plan with a graph fingerprint for invalidation.
 #[derive(Serialize, Deserialize)]
@@ -458,5 +459,28 @@ mod tests {
         assert!(load_build_plan(&g, 11, &path).unwrap().is_some());
         assert!(load_build_plan(&g, 12, &path).unwrap().is_none());
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod softplus_cache_tests {
+    use super::*;
+    #[test]
+    fn old_softplus_execution_plans_are_invalidated() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", &[2]);
+        let y = graph.softplus(x, 1.0);
+        graph.set_outputs(vec![y]);
+        let legacy = CachedPlan {
+            format_version: 5,
+            graph_hash: hash_graph(&graph),
+            build_hash: 0,
+            plan: crate::compile::compile(&graph),
+        };
+        let path =
+            std::env::temp_dir().join(format!("meganeura-softplus-v5-{}.ron", std::process::id()));
+        std::fs::write(&path, ron::ser::to_string(&legacy).unwrap()).unwrap();
+        assert!(load_plan(&graph, &path).unwrap().is_none());
+        std::fs::remove_file(path).unwrap();
     }
 }
