@@ -2,43 +2,49 @@
 use crate::schedule::{PointwiseDAG, Pw};
 
 pub(super) fn forward(beta: f32) -> PointwiseDAG {
-    // log1p(t), t = exp(-abs(beta*x)), with compensation for rounded 1+t.
-    // If 1+t rounds to 1, return t; otherwise use log(1+t)*t/((1+t)-1).
-    // The masked denominator is always nonzero, including exp underflow.
-    // Keep max(x,0) outside beta scaling to avoid avoidable positive overflow.
-    PointwiseDAG {
-        n_inputs: 1,
-        ops: vec![
-            Pw::LoadInput(0),
-            Pw::const_f32(beta),
-            Pw::Mul(0, 1),
-            Pw::Abs(2),
-            Pw::Neg(3),
-            Pw::Exp(4),
-            Pw::const_f32(1.0),
-            Pw::Add(6, 5),
-            Pw::Sub(7, 6),
-            Pw::const_f32(0.0),
-            Pw::Greater(8, 9),
-            Pw::Sub(6, 10),
-            Pw::Add(8, 11),
-            Pw::Div(5, 12),
-            Pw::Log(7),
-            Pw::Mul(14, 13),
-            Pw::Mul(11, 5),
-            Pw::Add(15, 16),
-            Pw::const_f32(beta.recip()),
-            Pw::Mul(17, 18),
-            Pw::Relu(0),
-            Pw::Add(20, 19),
-        ],
-        output: 21,
+    // t = exp(-abs(beta*x)) lies in [0,1]. Evaluate log1p(t) as
+    // 2*atanh(t/(2+t)), using eight odd terms. The argument is at most 1/3;
+    // the omitted tail is below 1.1e-9 absolute. Unlike compensated (1+t)-1,
+    // this spelling cannot be reassociated into a cancellation-prone log(1+t).
+    let mut ops = vec![
+        Pw::LoadInput(0),
+        Pw::const_f32(beta),
+        Pw::Mul(0, 1),
+        Pw::Abs(2),
+        Pw::Neg(3),
+        Pw::Exp(4),
+        Pw::const_f32(2.0),
+        Pw::Add(6, 5),
+        Pw::Div(5, 7),
+        Pw::Mul(8, 8),
+        Pw::const_f32(1.0 / 15.0),
+    ];
+    let mut polynomial = 10;
+    for denominator in [13.0, 11.0, 9.0, 7.0, 5.0, 3.0, 1.0] {
+        let coefficient = ops.len() as u16;
+        ops.push(Pw::const_f32(1.0 / denominator));
+        let product = ops.len() as u16;
+        ops.push(Pw::Mul(9, polynomial));
+        polynomial = ops.len() as u16;
+        ops.push(Pw::Add(coefficient, product));
     }
+    let twice_y = ops.len() as u16;
+    ops.push(Pw::Mul(6, 8));
+    let logarithm = ops.len() as u16;
+    ops.push(Pw::Mul(twice_y, polynomial));
+    let scaled = ops.len() as u16;
+    ops.push(Pw::Div(logarithm, 1));
+    // Keep max(x,0) outside beta scaling to avoid avoidable positive overflow.
+    let positive = ops.len() as u16;
+    ops.push(Pw::Relu(0));
+    let output = ops.len() as u16;
+    ops.push(Pw::Add(positive, scaled));
+    PointwiseDAG { n_inputs: 1, ops, output }
 }
 
 pub(super) fn backward(beta: f32) -> PointwiseDAG {
-    // sigmoid(beta*x), evaluated without 1-sigmoid(abs(beta*x)) cancellation
-    // or exp(-beta*x) overflow. Its value at zero is exactly one half.
+    // sigmoid(beta*x), without 1-sigmoid(abs(beta*x)) cancellation or
+    // exp(-beta*x) overflow. Its value at zero is exactly one half.
     PointwiseDAG {
         n_inputs: 2,
         ops: vec![

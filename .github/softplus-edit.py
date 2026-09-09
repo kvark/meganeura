@@ -14,7 +14,12 @@ s = p.read_text()
 a = s.index('#[test]\nfn softplus_preserves_expanded_gradient_bits()')
 b = s.index('#[test]\nfn softplus_compiles_to_one_pointwise_dispatch()', a)
 s = s[:a] + s[b:]
-s = s.replace('/// `narrow_sum_inner_matches_scalar_f32_order` and softplus\'s gradient.', '/// `narrow_sum_inner_matches_scalar_f32_order`.')
+a = s.index('/// Exact-equality checks')
+b = s.index('fn inference(', a)
+s = s[:a] + s[b:]
+p.write_text(s)
+p = Path('src/graph.rs')
+s = p.read_text().replace('/// Backward helper for [`Op::Softplus`] that preserves the expanded\n    /// graph\'s rounding and subgradient convention at zero.', '/// Backward helper for [`Op::Softplus`], preserving the negative tail\n    /// and the analytic derivative of one half at zero.')
 p.write_text(s)
 p = Path('tests/softplus_tail.rs')
 s = p.read_text().replace('let mut options = CompileOptions::default();\n            options.use_schedule_pointwise = schedule;', 'let options = CompileOptions { use_schedule_pointwise: schedule, ..Default::default() };')
