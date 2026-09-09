@@ -52,7 +52,7 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git rm .github/softplus-edit.py
-          git add Cargo.lock src/compile.rs src/compile/softplus.rs tests/softplus_tail.rs tests/schedule_pointwise.rs tests/regression.rs
+          git add src/compile.rs src/compile/softplus.rs tests/softplus_tail.rs tests/schedule_pointwise.rs tests/regression.rs
           git diff --cached --check
           git commit -m 'fix: preserve softplus negative-tail values and gradients'
           git push origin HEAD:refs/heads/fix/softplus-negative-tail
