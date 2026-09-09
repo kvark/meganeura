@@ -1,3 +1,23 @@
+# Unreleased
+
+- Store-side unary epilogues (Relu/Sigmoid/Silu/Neg) now fuse into F16/Q4/Q8
+  tiled matmuls instead of running as a separate dispatch. The epilogue does
+  not inspect B, so the packed-weight kernels reuse the same `$STORE_BODY`
+  hook. Cooperative matmuls stay out.
+- Q4 tiled staging unpacks eight nibbles from one data word and reuses the
+  block `(d, m)` header, replacing eight independent `dequant_q4` calls. GEMV
+  keeps the scalar helper; `MatMulGemvBT` stays off Q4.
+- Fixed a 4× over-dispatch: a matmul demoted to 32×32 tiles by the occupancy
+  pass kept a 64×64 epilogue shader, so three quarters of its workgroups
+  bounds-checked their way to writing nothing. The epilogue pipeline is now
+  generated for the dispatch's own tile geometry, staging maps included, and
+  the tile is part of the pipeline key.
+- A dispatch with a fused epilogue no longer pulls the small-tile or
+  weighted kernels into the compile set. Variant selection resolves the
+  epilogue first, so those modules could never be selected and were built
+  and kept for nothing; groups that also hold an unfused dispatch still get
+  them from it.
+
 # v0.3 (8 Sep 2026)
 
 ## Inference & models

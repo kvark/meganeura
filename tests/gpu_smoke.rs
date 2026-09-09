@@ -3428,6 +3428,114 @@ fn q4_matmul_after_rms_norm_matches_reference() {
     );
 }
 
+/// A store-side unary epilogue fused onto a Q4 tiled matmul.
+///
+/// The epilogue generator emits the packed-B declaration and the pack8
+/// staging path, so this covers the combination that `fuse_epilogues`
+/// admits for reduced-storage weights: one dispatch, packed B, and the
+/// activation applied at the store.
+#[test]
+fn q4_matmul_with_relu_epilogue_matches_cpu() {
+    let (m, k, n) = (8usize, 256usize, 512usize);
+    let a: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
+    let w: Vec<f32> = (0..k * n)
+        .map(|i| ((i % 97) as f32 - 48.0) * 0.01)
+        .collect();
+
+    let mut g = Graph::new();
+    let x = g.input("x", &[m, k]);
+    let w_q4 = g.parameter_q4("w", &[k, n]);
+    let mm = g.matmul(x, w_q4);
+    let out = g.relu(mm);
+    g.set_outputs(vec![out]);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    session.set_input("x", &a);
+    session.set_parameter("w", &w);
+    session.step();
+    session.wait();
+    let gpu = session.read_output(m * n);
+
+    let w_deq =
+        meganeura::runtime::dequantize_q4_0(&meganeura::runtime::quantize_q4_0(&w, k, n), k, n);
+    let mut max_err = 0.0f32;
+    let mut scale = 0.0f32;
+    for row in 0..m {
+        for col in 0..n {
+            let mut want = 0.0f32;
+            for i in 0..k {
+                want += a[row * k + i] * w_deq[i * n + col];
+            }
+            let want = want.max(0.0);
+            scale = scale.max(want.abs());
+            max_err = max_err.max((gpu[row * n + col] - want).abs());
+        }
+    }
+    assert!(
+        gpu.iter().all(|v| v.is_finite()),
+        "Q4 + relu epilogue produced non-finite values"
+    );
+    assert!(
+        gpu.iter().all(|&v| v >= 0.0),
+        "Q4 + relu epilogue emitted a negative value"
+    );
+    assert!(
+        max_err / scale.max(1e-6) < 1e-3,
+        "Q4 + relu epilogue diverged: max_abs_err={max_err} (scale {scale})"
+    );
+}
+
+/// A fused epilogue on a matmul small enough to be demoted to 32×32 tiles.
+///
+/// `select_variants` rewrites `workgroups` for the smaller tile, so the
+/// epilogue pipeline has to be generated for the same geometry — and with
+/// the matching staging maps, since the 64-wide and 32-wide skeletons
+/// split the flat thread index differently. Getting the tile right but the
+/// maps wrong stages the wrong elements into shared memory, which is a
+/// value error rather than a dispatch-shape one, so this compares against
+/// a CPU reference. `small_tile_demotion_survives_epilogue_fusion` covers
+/// the dispatch geometry itself.
+#[test]
+fn small_tile_matmul_with_epilogue_matches_cpu() {
+    let dim = 64usize;
+    let a: Vec<f32> = (0..dim * dim)
+        .map(|i| ((i % 23) as f32 - 11.0) * 0.05)
+        .collect();
+    let w: Vec<f32> = (0..dim * dim)
+        .map(|i| ((i % 31) as f32 - 15.0) * 0.03)
+        .collect();
+
+    let mut g = Graph::new();
+    let x = g.input("x", &[dim, dim]);
+    let p = g.parameter("w", &[dim, dim]);
+    let mm = g.matmul(x, p);
+    let out = g.relu(mm);
+    g.set_outputs(vec![out]);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    session.set_input("x", &a);
+    session.set_parameter("w", &w);
+    session.step();
+    session.wait();
+    let gpu = session.read_output(dim * dim);
+
+    let mut max_err = 0.0f32;
+    let mut scale = 0.0f32;
+    for row in 0..dim {
+        for col in 0..dim {
+            let mut want = 0.0f32;
+            for i in 0..dim {
+                want += a[row * dim + i] * w[i * dim + col];
+            }
+            let want = want.max(0.0);
+            scale = scale.max(want.abs());
+            max_err = max_err.max((gpu[row * dim + col] - want).abs());
+        }
+    }
+    assert!(
+        max_err / scale.max(1e-6) < 1e-4,
+        "small-tile epilogue diverged: max_abs_err={max_err} (scale {scale})"
+    );
+}
+
 /// Incrementally build a 1-layer transformer with Q4 weights.
 /// Output each intermediate result to find where NaN first appears.
 #[test]

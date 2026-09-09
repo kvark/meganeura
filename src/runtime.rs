@@ -920,19 +920,52 @@ struct MultiHeadAttnGradKVData {
 
 // ---- Pipeline collection ----
 
+/// A packed B buffer and a 32×32 tile each change the generated WGSL, so
+/// both travel in the key: sharing one pipeline across them would run an
+/// f32 shader over packed blocks, or a 64×64 shader under a workgroup
+/// count computed for 32×32 tiles.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum EpiloguePipelineKey {
-    Dag(crate::compile::MatMulEpilogue),
-    Legacy(Vec<crate::compile::EpilogueOp>),
+    Dag(
+        crate::compile::MatMulEpilogue,
+        crate::compile::WeightFormat,
+        crate::codegen::MatMulTile,
+    ),
+    Legacy(
+        Vec<crate::compile::EpilogueOp>,
+        crate::compile::WeightFormat,
+        crate::codegen::MatMulTile,
+    ),
 }
 
 fn epilogue_pipeline_key(dispatch: &Dispatch) -> Option<EpiloguePipelineKey> {
+    let format = dispatch.weight_format;
+    let tile = epilogue_tile(dispatch);
     if let Some(ref epilogue) = dispatch.matmul_epilogue {
-        Some(EpiloguePipelineKey::Dag(epilogue.clone()))
+        Some(EpiloguePipelineKey::Dag(epilogue.clone(), format, tile))
     } else if !dispatch.epilogue.is_empty() {
-        Some(EpiloguePipelineKey::Legacy(dispatch.epilogue.clone()))
+        Some(EpiloguePipelineKey::Legacy(
+            dispatch.epilogue.clone(),
+            format,
+            tile,
+        ))
     } else {
         None
+    }
+}
+
+/// Tile geometry the epilogue shader must be generated for.
+///
+/// `select_variants` demotes low-occupancy matmuls to 32×32 tiles and
+/// recomputes `workgroups` to match. The epilogue path has to follow, or
+/// the dispatch runs a 64×64 shader over a 32×32 grid — the store bounds
+/// check keeps the result correct, but three quarters of the workgroups
+/// do nothing.
+fn epilogue_tile(dispatch: &Dispatch) -> crate::codegen::MatMulTile {
+    if dispatch.use_small_tiles {
+        crate::codegen::MatMulTile::Small
+    } else {
+        crate::codegen::MatMulTile::Large
     }
 }
 
@@ -1073,6 +1106,13 @@ impl Pipelines {
 
         for dispatch in &plan.dispatches {
             let group = dispatch.shader.shader_group();
+            // `pipeline_variants` resolves a fused epilogue before it looks
+            // at the small-tile or weight-format modifiers, so such a
+            // dispatch only ever runs its epilogue pipeline. Keep it from
+            // requesting the variants it cannot select — a group that also
+            // holds a plain dispatch still gets them from that one.
+            let resolves_to_epilogue =
+                dispatch.horizontal_batch < 2 && epilogue_pipeline_key(dispatch).is_some();
             // Generated conv2d coop entries are coop-only; skip for non-coop map.
             let is_gen_coop = matches!(
                 dispatch.shader,
@@ -1109,7 +1149,7 @@ impl Pipelines {
             {
                 attention_entries.insert((dispatch.shader.clone(), dispatch.params[3]));
             }
-            if dispatch.use_small_tiles {
+            if dispatch.use_small_tiles && !resolves_to_epilogue {
                 needed_small.insert(group);
                 entries_for_group
                     .entry(group)
@@ -1133,7 +1173,7 @@ impl Pipelines {
                     needed_coop_compensated.insert(group);
                 }
             }
-            if dispatch.weight_format.uses_reduced_storage() {
+            if dispatch.weight_format.uses_reduced_storage() && !resolves_to_epilogue {
                 needed_weighted
                     .entry(dispatch.weight_format)
                     .or_default()
@@ -1402,11 +1442,18 @@ impl Pipelines {
             let coop_key = Variant::CoopEpilogue(dispatch.shader.clone(), epilogue_key);
             if let std::collections::hash_map::Entry::Vacant(slot) = map.entry(key) {
                 let group = dispatch.shader.shader_group();
-                let sm = if let Some(ref epi) = dispatch.matmul_epilogue {
-                    crate::codegen::generate_matmul_with_dag_epilogue(group, epi)
-                } else {
-                    crate::codegen::generate_matmul_with_epilogue(group, &dispatch.epilogue)
+                let epilogue = match dispatch.matmul_epilogue {
+                    Some(ref epi) => crate::codegen::EpilogueSource::Dag(epi),
+                    None => crate::codegen::EpilogueSource::Ops(&dispatch.epilogue),
                 };
+                let sm = crate::codegen::generate_matmul_with_epilogue(
+                    group,
+                    epilogue,
+                    crate::codegen::MatMulOptions {
+                        format: dispatch.weight_format,
+                        tile: epilogue_tile(dispatch),
+                    },
+                );
                 let shader = gpu.create_shader(bg::ShaderDesc {
                     source: &sm.source,
                     naga_module: Some(sm.module),
@@ -3672,7 +3719,10 @@ pub(crate) fn parse_device_id(value: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod variant_tests {
-    use super::{Dispatch, HorizMatMulKind, Pipelines, ShaderEntry, Variant};
+    use super::{
+        Dispatch, HorizMatMulKind, Pipelines, ShaderEntry, Variant, epilogue_pipeline_key,
+        epilogue_tile, select_variants,
+    };
 
     fn relu_epilogue() -> crate::compile::MatMulEpilogue {
         crate::compile::MatMulEpilogue {
@@ -3736,6 +3786,182 @@ mod variant_tests {
         });
         assert_eq!(coop.len(), 1);
         assert!(matches!(coop[0], Variant::CoopEpilogue(..)));
+
+        let q4 = matmul(|d| {
+            d.matmul_epilogue = Some(relu_epilogue());
+            d.weight_format = crate::compile::WeightFormat::Q4;
+        });
+        assert_eq!(q4.len(), 1);
+        assert!(matches!(q4[0], Variant::Epilogue(..)));
+        assert_ne!(
+            epilogue_pipeline_key(&{
+                let mut d = Dispatch {
+                    shader: ShaderEntry::MatMul,
+                    matmul_epilogue: Some(relu_epilogue()),
+                    ..Default::default()
+                };
+                d.weight_format = crate::compile::WeightFormat::Q4;
+                d
+            }),
+            epilogue_pipeline_key(&Dispatch {
+                shader: ShaderEntry::MatMul,
+                matmul_epilogue: Some(relu_epilogue()),
+                ..Default::default()
+            }),
+            "Q4 and F32 epilogue pipelines must not share a key"
+        );
+    }
+
+    /// `select_variants` demotes low-occupancy matmuls to 32×32 tiles and
+    /// recomputes `workgroups` for them. The epilogue pipeline has to be
+    /// generated for the same geometry, so the tile belongs in the key.
+    #[test]
+    fn small_tile_epilogue_gets_its_own_pipeline() {
+        let large = Dispatch {
+            shader: ShaderEntry::MatMul,
+            matmul_epilogue: Some(relu_epilogue()),
+            ..Default::default()
+        };
+        let small = Dispatch {
+            use_small_tiles: true,
+            ..large.clone()
+        };
+        assert_ne!(
+            epilogue_pipeline_key(&small),
+            epilogue_pipeline_key(&large),
+            "32×32 and 64×64 epilogue pipelines must not share a key"
+        );
+    }
+
+    /// An epilogue dispatch resolves to its epilogue pipeline and never
+    /// selects `SmallTile` or `Weight`, so it must not be what pulls those
+    /// into the compile set. A plain dispatch sharing the group still has
+    /// to get them, which is why the guard is per-dispatch and not a
+    /// group-wide veto.
+    #[test]
+    fn epilogue_dispatch_does_not_request_unreachable_variants() {
+        let epilogue_small = matmul(|d| {
+            d.matmul_epilogue = Some(relu_epilogue());
+            d.use_small_tiles = true;
+            d.weight_format = crate::compile::WeightFormat::Q4;
+        });
+        assert_eq!(
+            epilogue_small.len(),
+            1,
+            "an epilogue dispatch offers exactly one pipeline, got {epilogue_small:?}"
+        );
+        assert!(matches!(epilogue_small[0], Variant::Epilogue(..)));
+
+        // The same modifiers without an epilogue do need those variants.
+        let plain_small = matmul(|d| {
+            d.use_small_tiles = true;
+            d.weight_format = crate::compile::WeightFormat::Q4;
+        });
+        assert!(
+            plain_small.contains(&Variant::SmallTile(ShaderEntry::MatMul)),
+            "a plain small-tile dispatch still needs the small-tile pipeline"
+        );
+        assert!(
+            plain_small.contains(&Variant::Weight(
+                ShaderEntry::MatMul,
+                crate::compile::WeightFormat::Q4
+            )),
+            "a plain weighted dispatch still needs the weighted pipeline"
+        );
+    }
+
+    /// The compile-side collection has to mirror `pipeline_variants`. That
+    /// side is what actually builds modules, so the check goes through
+    /// `Pipelines::new`: a variant absent from the map is a kernel that was
+    /// never compiled.
+    #[test]
+    fn epilogue_dispatch_compiles_no_unreachable_pipeline() {
+        let gpu = crate::init_gpu_context().unwrap();
+
+        // 64×64 f32 matmul: demoted to 32×32 by the occupancy pass.
+        let mut demoted = {
+            let mut g = crate::graph::Graph::new();
+            let x = g.input("x", &[64, 64]);
+            let w = g.parameter("w", &[64, 64]);
+            let mm = g.matmul(x, w);
+            let out = g.relu(mm);
+            g.set_outputs(vec![out]);
+            crate::compile::compile(&g)
+        };
+        select_variants(&mut demoted, None, false, false);
+        assert!(demoted.dispatches[0].use_small_tiles);
+        let pipelines = Pipelines::new(&gpu, &demoted, None);
+        assert!(
+            pipelines
+                .map
+                .keys()
+                .any(|v| matches!(v, Variant::Epilogue(..))),
+            "the epilogue pipeline itself must be compiled"
+        );
+        assert!(
+            !pipelines
+                .map
+                .contains_key(&Variant::SmallTile(ShaderEntry::MatMul)),
+            "no dispatch can select SmallTile here, so it must not be built"
+        );
+
+        // Q4 matmul + relu: reduced-storage weights, now fused.
+        let mut weighted = {
+            let mut g = crate::graph::Graph::new();
+            let x = g.input("x", &[8, 64]);
+            let w = g.parameter_q4("w", &[64, 128]);
+            let mm = g.matmul(x, w);
+            let out = g.relu(mm);
+            g.set_outputs(vec![out]);
+            crate::compile::compile(&g)
+        };
+        select_variants(&mut weighted, None, false, false);
+        assert_eq!(
+            weighted.dispatches[0].weight_format,
+            crate::compile::WeightFormat::Q4
+        );
+        let pipelines = Pipelines::new(&gpu, &weighted, None);
+        assert!(
+            !pipelines.map.contains_key(&Variant::Weight(
+                ShaderEntry::MatMul,
+                crate::compile::WeightFormat::Q4
+            )),
+            "no dispatch can select the plain weighted kernel here"
+        );
+    }
+
+    /// A fused epilogue must not keep a matmul on 64×64 geometry once the
+    /// occupancy pass has demoted it: the workgroup count is rewritten for
+    /// 32×32, and a 64×64 shader over that grid leaves three quarters of
+    /// its workgroups writing nothing.
+    #[test]
+    fn small_tile_demotion_survives_epilogue_fusion() {
+        let mut plan = {
+            let mut g = crate::graph::Graph::new();
+            let x = g.input("x", &[64, 64]);
+            let w = g.parameter("w", &[64, 64]);
+            let mm = g.matmul(x, w);
+            let out = g.relu(mm);
+            g.set_outputs(vec![out]);
+            crate::compile::compile(&g)
+        };
+        assert!(
+            plan.dispatches[0].matmul_epilogue.is_some(),
+            "expected the relu to fuse into the matmul"
+        );
+        select_variants(&mut plan, None, false, false);
+        let d = &plan.dispatches[0];
+        assert!(d.use_small_tiles, "64×64 matmul should demote to 32×32");
+        assert_eq!(
+            d.workgroups,
+            [2, 2, 1],
+            "workgroups must cover the 64×64 output in 32×32 tiles"
+        );
+        assert_eq!(
+            epilogue_tile(d),
+            crate::codegen::MatMulTile::Small,
+            "the epilogue shader must be generated for the demoted tile"
+        );
     }
 
     #[test]

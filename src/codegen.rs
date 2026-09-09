@@ -225,108 +225,111 @@ pub fn matmul_prologue_to_wgsl(
     (decls.join("\n"), cache_decls.join("\n"), cache_init, expr)
 }
 
+/// Where the fused epilogue statements come from.
+pub enum EpilogueSource<'a> {
+    /// PointwiseDAG epilogue — what the compiler emits today.
+    Dag(&'a crate::compile::MatMulEpilogue),
+    /// Flat op chain, kept for plans cached before the DAG migration.
+    Ops(&'a [crate::compile::EpilogueOp]),
+}
+
+/// How to specialize the matmul the epilogue is fused into.
+///
+/// [`Default`] is the plain f32 64×64 kernel, so a caller that only wants
+/// an epilogue and nothing else can pass `Default::default()`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MatMulOptions {
+    /// B-buffer storage format: drives its declaration and its load.
+    pub format: WeightFormat,
+    /// Tile geometry. Must match what the dispatch's workgroup count was
+    /// computed for, or the grid and the kernel disagree about coverage.
+    pub tile: MatMulTile,
+}
+
 /// Generate a matmul shader module with a fused epilogue chain.
 ///
-/// Used by the runtime when a dispatch has a non-empty epilogue field.
-/// The epilogue ops are compiled into WGSL statements that transform
-/// each output element before storing it.
+/// Used by the runtime when a dispatch carries an epilogue. The ops are
+/// compiled into WGSL statements that transform each output element
+/// before it is stored. The epilogue never inspects B, so the same
+/// `$STORE_BODY` hook serves every weight format.
 pub fn generate_matmul_with_epilogue(
     group: ShaderGroup,
-    epilogue: &[crate::compile::EpilogueOp],
+    epilogue: EpilogueSource<'_>,
+    options: MatMulOptions,
 ) -> ShaderModule {
-    let (epi_decl, epi_body) = epilogue_to_wgsl(epilogue);
-    generate_matmul_with_epilogue_wgsl(group, &epi_decl, &epi_body)
-}
-
-/// Same as above but from a [`crate::compile::MatMulEpilogue`] (PointwiseDAG-based).
-pub fn generate_matmul_with_dag_epilogue(
-    group: ShaderGroup,
-    epilogue: &crate::compile::MatMulEpilogue,
-) -> ShaderModule {
-    let (epi_decl, epi_body) = matmul_epilogue_to_wgsl(epilogue);
-    generate_matmul_with_epilogue_wgsl(group, &epi_decl, &epi_body)
-}
-
-fn generate_matmul_with_epilogue_wgsl(
-    group: ShaderGroup,
-    epi_decl: &str,
-    epi_body: &str,
-) -> ShaderModule {
-    match group {
-        ShaderGroup::MatMul => matmul_vars_epilogue(
+    let (epi_decl, epi_body) = match epilogue {
+        EpilogueSource::Dag(dag) => matmul_epilogue_to_wgsl(dag),
+        EpilogueSource::Ops(ops) => epilogue_to_wgsl(ops),
+    };
+    let MatMulOptions { tile, .. } = options;
+    let (a_idx, b_idx, fused_decl, fused_expr) = match group {
+        ShaderGroup::MatMul => (MATMUL_A_FWD, MATMUL_B_FWD, "", ""),
+        ShaderGroup::MatMulAdd => (
             MATMUL_A_FWD,
             MATMUL_B_FWD,
-            A_ROW_FWD,
-            A_COL_FWD,
-            B_ROW_FWD,
-            B_COL_FWD,
-            "",
-            "",
-            epi_decl,
-            epi_body,
-        ),
-        ShaderGroup::MatMulAdd => matmul_vars_epilogue(
-            MATMUL_A_FWD,
-            MATMUL_B_FWD,
-            A_ROW_FWD,
-            A_COL_FWD,
-            B_ROW_FWD,
-            B_COL_FWD,
             "var<storage> src: array<f32>;",
             " + src[idx]",
-            epi_decl,
-            epi_body,
         ),
-        ShaderGroup::MatMulAT => matmul_vars_epilogue(
+        ShaderGroup::MatMulAT => (MATMUL_A_AT, MATMUL_B_FWD, "", ""),
+        ShaderGroup::MatMulBT => (MATMUL_A_FWD, MATMUL_B_BT, "", ""),
+        ShaderGroup::MatMulATAdd => (
             MATMUL_A_AT,
             MATMUL_B_FWD,
-            A_ROW_AT,
-            A_COL_AT,
-            B_ROW_FWD,
-            B_COL_FWD,
-            "",
-            "",
-            epi_decl,
-            epi_body,
-        ),
-        ShaderGroup::MatMulBT => matmul_vars_epilogue(
-            MATMUL_A_FWD,
-            MATMUL_B_BT,
-            A_ROW_FWD,
-            A_COL_FWD,
-            B_ROW_BT,
-            B_COL_BT,
-            "",
-            "",
-            epi_decl,
-            epi_body,
-        ),
-        ShaderGroup::MatMulATAdd => matmul_vars_epilogue(
-            MATMUL_A_AT,
-            MATMUL_B_FWD,
-            A_ROW_AT,
-            A_COL_AT,
-            B_ROW_FWD,
-            B_COL_FWD,
             "var<storage> src: array<f32>;",
             " + src[idx]",
-            epi_decl,
-            epi_body,
         ),
-        ShaderGroup::MatMulBTAdd => matmul_vars_epilogue(
+        ShaderGroup::MatMulBTAdd => (
             MATMUL_A_FWD,
             MATMUL_B_BT,
-            A_ROW_FWD,
-            A_COL_FWD,
-            B_ROW_BT,
-            B_COL_BT,
             "var<storage> src: array<f32>;",
             " + src[idx]",
-            epi_decl,
-            epi_body,
         ),
         _ => panic!("epilogue fusion not supported for {:?}", group),
-    }
+    };
+    let (a_row, a_col, b_row, b_col) = epilogue_stage_maps(group, tile);
+    matmul_vars_tiled(
+        MatMulIndexing {
+            a_idx,
+            b_idx,
+            a_row,
+            a_col,
+            b_row,
+            b_col,
+        },
+        fused_decl,
+        fused_expr,
+        &epi_decl,
+        &epi_body,
+        options,
+    )
+}
+
+/// Thread-to-element staging maps for one tile size.
+///
+/// Both skeletons walk the same flat thread index over shared tiles, but
+/// the tiles are BM wide, so the row/col split differs between the 64×64
+/// and 32×32 geometries. Pairing a 64-wide map with a 32-wide tile reads
+/// the wrong elements into shared memory, so the maps travel with the
+/// tile rather than with the shader group.
+fn epilogue_stage_maps(
+    group: ShaderGroup,
+    tile: MatMulTile,
+) -> (&'static str, &'static str, &'static str, &'static str) {
+    let a_transposed = matches!(group, ShaderGroup::MatMulAT | ShaderGroup::MatMulATAdd);
+    let b_transposed = matches!(group, ShaderGroup::MatMulBT | ShaderGroup::MatMulBTAdd);
+    let (a_row, a_col) = match (a_transposed, tile) {
+        (false, MatMulTile::Large) => (A_ROW_FWD, A_COL_FWD),
+        (false, MatMulTile::Small) => (A_ROW_FWD_S, A_COL_FWD_S),
+        (true, MatMulTile::Large) => (A_ROW_AT, A_COL_AT),
+        (true, MatMulTile::Small) => (A_ROW_AT_S, A_COL_AT_S),
+    };
+    let (b_row, b_col) = match (b_transposed, tile) {
+        (false, MatMulTile::Large) => (B_ROW_FWD, B_COL_FWD),
+        (false, MatMulTile::Small) => (B_ROW_FWD_S, B_COL_FWD_S),
+        (true, MatMulTile::Large) => (B_ROW_BT, B_COL_BT),
+        (true, MatMulTile::Small) => (B_ROW_BT_S, B_COL_BT_S),
+    };
+    (a_row, a_col, b_row, b_col)
 }
 
 // ---------------------------------------------------------------------------
@@ -792,33 +795,6 @@ fn matmul_vars(
     )
 }
 
-fn matmul_vars_epilogue(
-    a_idx: &str,
-    b_idx: &str,
-    a_row: &str,
-    a_col: &str,
-    b_row: &str,
-    b_col: &str,
-    fused_decl: &str,
-    fused_expr: &str,
-    epilogue_decl: &str,
-    epilogue_body: &str,
-) -> ShaderModule {
-    matmul_vars_full(
-        a_idx,
-        b_idx,
-        a_row,
-        a_col,
-        b_row,
-        b_col,
-        fused_decl,
-        fused_expr,
-        epilogue_decl,
-        epilogue_body,
-        WeightFormat::F32,
-    )
-}
-
 fn matmul_vars_with_mode(
     a_idx: &str,
     b_idx: &str,
@@ -838,9 +814,15 @@ fn matmul_vars_with_mode(
 use crate::compile::WeightFormat;
 
 /// Tile geometry for the register-tiled scalar matmul skeleton.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum MatMulTile {
+///
+/// Public because the epilogue generators are driven by the runtime's
+/// small-tile demotion: a dispatch whose workgroup count was recomputed
+/// for 32×32 tiles must be paired with a 32×32 shader, so the choice
+/// travels with `Dispatch::use_small_tiles` into the pipeline key.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum MatMulTile {
     /// BM=BN=64, TM=TN=4 — the default tile.
+    #[default]
     Large,
     /// BM=BN=32, TM=TN=2 — 4× more workgroups for low-occupancy shapes.
     Small,
@@ -982,36 +964,61 @@ fn matmul_vars_full(
     b_mode: WeightFormat,
 ) -> ShaderModule {
     matmul_vars_tiled(
+        MatMulIndexing {
+            a_idx,
+            b_idx,
+            a_row,
+            a_col,
+            b_row,
+            b_col,
+        },
+        fused_decl,
+        fused_expr,
+        epilogue_decl,
+        epilogue_body,
+        MatMulOptions {
+            format: b_mode,
+            tile: MatMulTile::Large,
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Where the tiled skeleton reads A and B.
+///
+/// `*_idx` address the storage buffers; `*_row`/`*_col` split the flat
+/// thread index across the shared tile, so they depend on the tile width
+/// as well as on the transposition.
+#[derive(Clone, Copy)]
+struct MatMulIndexing<'a> {
+    a_idx: &'a str,
+    b_idx: &'a str,
+    a_row: &'a str,
+    a_col: &'a str,
+    b_row: &'a str,
+    b_col: &'a str,
+}
+
+fn matmul_vars_tiled(
+    indexing: MatMulIndexing<'_>,
+    fused_decl: &str,
+    fused_expr: &str,
+    epilogue_decl: &str,
+    epilogue_body: &str,
+    options: MatMulOptions,
+) -> ShaderModule {
+    let MatMulIndexing {
         a_idx,
         b_idx,
         a_row,
         a_col,
         b_row,
         b_col,
-        fused_decl,
-        fused_expr,
-        epilogue_decl,
-        epilogue_body,
-        b_mode,
-        MatMulTile::Large,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn matmul_vars_tiled(
-    a_idx: &str,
-    b_idx: &str,
-    a_row: &str,
-    a_col: &str,
-    b_row: &str,
-    b_col: &str,
-    fused_decl: &str,
-    fused_expr: &str,
-    epilogue_decl: &str,
-    epilogue_body: &str,
-    b_mode: WeightFormat,
-    tile: MatMulTile,
-) -> ShaderModule {
+    } = indexing;
+    let MatMulOptions {
+        format: b_mode,
+        tile,
+    } = options;
     let src = include_str!("shaders/matmul.wgsl");
     let full_decl = if epilogue_decl.is_empty() {
         fused_decl.to_string()
@@ -1052,12 +1059,43 @@ fn matmul_vars_tiled(
             Q8_DEQUANT_FN.to_string(),
         ),
     };
+    // Q4 large tile: 32×64 B tile, 256 threads → each thread owns 8
+    // consecutive K of one column, which is one data word + one (d, m).
+    // Small tile and Q8 stay on the per-element path.
+    let b_stage_body = if b_mode == WeightFormat::Q4 && tile == MatMulTile::Large {
+        "\
+        let n_local = tid % $BM_U;\n\
+        let k_base = (tid / $BM_U) * 8u;\n\
+        let b_col = tile_col + n_local;\n\
+        let unpacked = dequant_q4_pack8(t + k_base, b_col);\n\
+        for (var i = 0u; i < 8u; i++) {\n\
+            let b_row = t + k_base + i;\n\
+            let in_bounds = (b_row < params.k) && (b_col < params.n);\n\
+            shared_b[(k_base + i) * $B_STRIDE_U + n_local] = select(0.0, unpacked[i], in_bounds);\n\
+        }"
+        .to_string()
+    } else {
+        "\
+        for (var e = 0u; e < $STAGE_EPT_U; e++) {\n\
+            let flat = tid + e * 256u;\n\
+            let row_local = $B_ROW;\n\
+            let col_local = $B_COL;\n\
+            let b_row = t + row_local;\n\
+            let b_col = tile_col + col_local;\n\
+            let in_bounds = (b_row < params.k) && (b_col < params.n);\n\
+            shared_b[row_local * $B_STRIDE_U + col_local] = select(0.0, $B_LOAD_EXPR, in_bounds);\n\
+        }"
+        .to_string()
+    };
     let bm = tile.bm();
     let tm = tile.tm();
     let (acc_decl, compute_body, acc_array) = tiled_matmul_body(tile);
     let src = preprocess(
         src,
         &[
+            // Stage body is expanded first so the $VAR tokens it embeds
+            // ($B_LOAD_EXPR, $B_ROW, $BM_U, ...) still get substituted.
+            ("$B_STAGE_BODY", &b_stage_body),
             ("$ENABLE_F16", enable_f16),
             ("$B_STORAGE_TYPE", b_storage),
             ("$B_LOAD_EXPR", &b_load_expr),
@@ -1087,6 +1125,9 @@ fn matmul_vars_tiled(
 /// Meganeura asymmetric Q4 (Q4_1-style) dequantization helper for WGSL.
 /// Buffer layout: [scales as packed f16 pairs (u32)][packed nibble data (u32)].
 /// Column-wise blocking: blocks of 32 elements along the K dimension per column.
+///
+/// `dequant_q4` stays the scalar entry used by GEMV. Tiled staging uses
+/// `dequant_q4_pack8`: one (d, m) header and one data word → 8 values.
 const Q4_DEQUANT_FN: &str = "
 fn q4_decode_f16(bits: u32) -> f32 {
     let sign = (bits >> 15u) & 1u;
@@ -1097,6 +1138,11 @@ fn q4_decode_f16(bits: u32) -> f32 {
     return bitcast<f32>(f32_bits);
 }
 
+fn q4_unpack_nibble(data: u32, d: f32, m: f32, in_word: u32) -> f32 {
+    let nibble = (data >> (in_word * 4u)) & 0xFu;
+    return f32(nibble) * d + m;
+}
+
 fn dequant_q4(k_idx: u32, n_idx: u32) -> f32 {
     // Q4_1 asymmetric: value = nibble * d + m
     // Layout: [num_blocks u32s: (d_f16|m_f16)][num_blocks*4 u32s: nibble data]
@@ -1105,19 +1151,26 @@ fn dequant_q4(k_idx: u32, n_idx: u32) -> f32 {
     let block = n_idx * blocks_per_col + k_idx / 32u;
     let in_block = k_idx % 32u;
 
-    // d and m packed in one u32 per block (d=low16, m=high16)
     let dm = matrix_b[block];
     let d = q4_decode_f16(dm & 0xFFFFu);
     let m = q4_decode_f16(dm >> 16u);
+    let data_u32 = matrix_b[num_blocks + block * 4u + in_block / 8u];
+    return q4_unpack_nibble(data_u32, d, m, in_block % 8u);
+}
 
-    // Nibble data starts after the metadata region
-    let byte_in_block = in_block / 2u;
-    let u32_in_block = byte_in_block / 4u;
-    let data_u32 = matrix_b[num_blocks + block * 4u + u32_in_block];
-    let shift = (byte_in_block % 4u) * 8u + select(0u, 4u, (in_block & 1u) != 0u);
-    let nibble = (data_u32 >> shift) & 0xFu;
-
-    return f32(nibble) * d + m;
+fn dequant_q4_pack8(k_base: u32, n_idx: u32) -> array<f32, 8> {
+    let blocks_per_col = params.k / 32u;
+    let num_blocks = blocks_per_col * params.n;
+    let block = n_idx * blocks_per_col + k_base / 32u;
+    let dm = matrix_b[block];
+    let d = q4_decode_f16(dm & 0xFFFFu);
+    let m = q4_decode_f16(dm >> 16u);
+    let data_u32 = matrix_b[num_blocks + block * 4u + (k_base % 32u) / 8u];
+    var out: array<f32, 8>;
+    for (var i = 0u; i < 8u; i++) {
+        out[i] = q4_unpack_nibble(data_u32, d, m, i);
+    }
+    return out;
 }
 ";
 
@@ -1168,18 +1221,22 @@ fn matmul_small_vars(
     fused_expr: &str,
 ) -> ShaderModule {
     matmul_vars_tiled(
-        a_idx,
-        b_idx,
-        a_row,
-        a_col,
-        b_row,
-        b_col,
+        MatMulIndexing {
+            a_idx,
+            b_idx,
+            a_row,
+            a_col,
+            b_row,
+            b_col,
+        },
         fused_decl,
         fused_expr,
         "",
         "",
-        WeightFormat::F32,
-        MatMulTile::Small,
+        MatMulOptions {
+            tile: MatMulTile::Small,
+            ..Default::default()
+        },
     )
 }
 
@@ -6065,7 +6122,94 @@ mod tests {
                 sm.source.contains("array<u32>"),
                 "Q4 {group:?}: missing array<u32>"
             );
+            if group == ShaderGroup::MatMul {
+                assert!(
+                    sm.source.contains("dequant_q4_pack8"),
+                    "Q4 tiled MatMul must use pack8 B staging"
+                );
+            }
             eprintln!("Q4 {group:?} shader: {} chars", sm.source.len());
+        }
+    }
+
+    #[test]
+    fn q4_matmul_with_sigmoid_epilogue_keeps_packed_b() {
+        use crate::compile::MatMulEpilogue;
+        use crate::schedule::{PointwiseDAG, Pw};
+
+        let epi = MatMulEpilogue {
+            dag: PointwiseDAG {
+                n_inputs: 1,
+                ops: vec![Pw::LoadInput(0), Pw::Sigmoid(0)],
+                output: 1,
+            },
+            inputs: vec![],
+        };
+        let sm = generate_matmul_with_epilogue(
+            ShaderGroup::MatMul,
+            EpilogueSource::Dag(&epi),
+            MatMulOptions {
+                format: WeightFormat::Q4,
+                ..Default::default()
+            },
+        );
+        assert!(
+            sm.source.contains("dequant_q4"),
+            "Q4+sigmoid must keep the packed B path"
+        );
+        assert!(
+            sm.source.contains("array<u32>"),
+            "Q4+sigmoid must declare matrix_b as array<u32>"
+        );
+        assert!(
+            !sm.source.contains("matrix_b: array<f32>"),
+            "Q4+sigmoid must not fall back to f32 B"
+        );
+        assert!(
+            sm.source.contains("exp(-"),
+            "Q4+sigmoid must emit a store-side sigmoid"
+        );
+    }
+
+    /// The epilogue skeleton has to be specialized for the tile the
+    /// dispatch was sized for, staging maps included: a 64-wide map over
+    /// a 32-wide tile reads the wrong elements into shared memory.
+    #[test]
+    fn small_tile_epilogue_uses_small_tile_geometry() {
+        for group in [
+            ShaderGroup::MatMul,
+            ShaderGroup::MatMulAdd,
+            ShaderGroup::MatMulAT,
+            ShaderGroup::MatMulBT,
+        ] {
+            let relu = [crate::compile::EpilogueOp::Relu];
+            let small = generate_matmul_with_epilogue(
+                group,
+                EpilogueSource::Ops(&relu),
+                MatMulOptions {
+                    tile: MatMulTile::Small,
+                    ..Default::default()
+                },
+            );
+            let large = generate_matmul_with_epilogue(
+                group,
+                EpilogueSource::Ops(&relu),
+                MatMulOptions::default(),
+            );
+            assert_ne!(
+                small.source, large.source,
+                "{group:?}: small and large epilogue shaders must differ"
+            );
+            // 32×32 stages A at 32*33 and B at 32*33; 64×64 uses 64*33
+            // and 32*65.
+            assert!(
+                small.source.contains("array<f32, 1056>"),
+                "{group:?}: small epilogue must stage 32×32 tiles"
+            );
+            assert!(
+                !small.source.contains("flat / 64u") && !small.source.contains("flat % 64u"),
+                "{group:?}: small epilogue must not use 64-wide staging maps"
+            );
         }
     }
 
