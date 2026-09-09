@@ -120,3 +120,24 @@ report_bounded_weight_accumulation_qualification -- --ignored --nocapture
 10 tiny structured-cancellation rows failed. Arithmetic was reverted, split-K
 promotion deferred, and the bounded milestone closed. There were no performance
 measurements after this rejection.
+
+### dw-arithmetic-2026-09-09
+
+Source: `experiment/dw-arithmetic-2026-09-09`. Standalone CPU diagnostic:
+`rustc --edition=2024 -O bench/dw_rounding.rs -o /tmp/dw-rounding && /tmp/dw-rounding`.
+This does not build Meganeura or add an automatic test target. It reuses the four
+September 6 shapes, tiny structured-cancellation inputs and original f64 gates;
+it is not the full 240-row GPU qualification or a shader/compiler simulation.
+
+On the long uneven-K case, f32 FMA accumulation inside 16-product tiles followed
+by an f64 outer sum has relative L2 error `3.491e-3`, failing the `2e-4` gate.
+Rounding f64-evaluated tiles once gives `6.998e-5`; rounding f64-evaluated split
+partitions (1/2/3/4/8) gives at most `1.791e-7` on that case. All four shapes pass
+those partition-storage checks. The existing blocked-Kahan strategy can lose
+too much accuracy *inside* the tile, before outer compensation can help.
+
+Separate f32 multiply/add happens to pass this cancellation case; that is not
+a general argument for disabling FMA. Confirm actual GPU instructions before
+attributing the historical rejections to this mechanism. A future candidate
+needs inner dot-product error control, the unchanged full GPU gates and measured
+whole-step cost. No GPU execution, shader change or speedup is claimed here.
