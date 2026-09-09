@@ -1143,12 +1143,13 @@ impl Pipelines {
                 if let Some(entries) = entries_for_group.get(&group) {
                     for entry in entries {
                         let layout = shader_data_layout(entry);
+                        let variant = key(entry.clone());
                         let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                            name: entry.entry_point(),
+                            name: &variant.label(),
                             data_layouts: &[&layout],
                             compute: shader.at(entry.entry_point()),
                         });
-                        target.insert(key(entry.clone()), pipeline);
+                        target.insert(variant, pipeline);
                     }
                 }
             };
@@ -1215,12 +1216,13 @@ impl Pipelines {
                 naga_module: Some(sm.module),
             });
             let layout = shader_data_layout(&entry);
+            let key = Variant::Attention(entry.clone(), hd);
             let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                name: entry.entry_point(),
+                name: &key.label(),
                 data_layouts: &[&layout],
                 compute: shader.at(entry.entry_point()),
             });
-            map.insert(Variant::Attention(entry, hd), pipeline);
+            map.insert(key, pipeline);
         }
         // Conv2d coop dispatches were rewritten by `select_variants` to
         // generated per-(kernel, stride) entries, compiled individually
@@ -1282,12 +1284,13 @@ impl Pipelines {
                     naga_module: Some(sm.module),
                 });
                 let layout = shader_data_layout(entry);
+                let key = Variant::Coop(entry.clone());
                 let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                    name: entry.entry_point(),
+                    name: &key.label(),
                     data_layouts: &[&layout],
                     compute: shader.at(entry.entry_point()),
                 });
-                map.insert(Variant::Coop(entry.clone()), pipeline);
+                map.insert(key, pipeline);
             }
         }
 
@@ -1303,12 +1306,13 @@ impl Pipelines {
             });
             let entry = ShaderEntry::MatMulGemv;
             let layout = <MatMulRmsNormData as blade_graphics::ShaderData>::layout();
+            let key = Variant::GemvRmsNorm(entry.clone());
             let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                name: "matmul_gemv_rmsnorm",
+                name: &key.label(),
                 data_layouts: &[&layout],
                 compute: shader.at(entry.entry_point()),
             });
-            map.insert(Variant::GemvRmsNorm(entry), pipeline);
+            map.insert(key, pipeline);
         }
 
         // Compile weight-format-specific pipelines (f16, Q4, Q8).
@@ -1345,7 +1349,7 @@ impl Pipelines {
                 });
                 let layout = shader_data_layout(&dispatch.shader);
                 let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                    name: dispatch.shader.entry_point(),
+                    name: &slot.key().label(),
                     data_layouts: &[&layout],
                     compute: shader.at(dispatch.shader.entry_point()),
                 });
@@ -1370,7 +1374,7 @@ impl Pipelines {
                 });
                 let layout = shader_data_layout(&dispatch.shader);
                 let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                    name: dispatch.shader.entry_point(),
+                    name: &coop_key.label(),
                     data_layouts: &[&layout],
                     compute: shader.at(dispatch.shader.entry_point()),
                 });
@@ -1408,7 +1412,7 @@ impl Pipelines {
                 });
                 let layout = matmul_with_prologue_layout(prologue.factors.len());
                 let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                    name: dispatch.shader.entry_point(),
+                    name: &key.label(),
                     data_layouts: &[&layout],
                     compute: shader.at(dispatch.shader.entry_point()),
                 });
@@ -1441,7 +1445,7 @@ impl Pipelines {
             });
             let layout = pointwise_data_layout(dag.n_inputs);
             let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                name: crate::schedule::POINTWISE_ENTRY,
+                name: &key.label(),
                 data_layouts: &[&layout],
                 compute: shader.at(crate::schedule::POINTWISE_ENTRY),
             });
@@ -1465,7 +1469,7 @@ impl Pipelines {
             });
             let layout = reduction_data_layout(kernel);
             let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                name: crate::schedule::REDUCTION_ENTRY,
+                name: &key.label(),
                 data_layouts: &[&layout],
                 compute: shader.at(crate::schedule::REDUCTION_ENTRY),
             });
@@ -1501,7 +1505,7 @@ impl Pipelines {
             });
             let layout = horizontal_matmul_layout(count);
             let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                name: "horizontal_matmul",
+                name: &key.label(),
                 data_layouts: &[&layout],
                 compute: shader.at("main"),
             });
@@ -3420,18 +3424,8 @@ impl Session {
     }
 }
 
-/// Convenience: create a Blade GPU context with the same defaults
-/// `Session::new` uses, honoring the `MEGANEURA_DEVICE_ID` env var.
-///
-/// Use this when you need a context for [`auto_tune`] before any
-/// session exists. The returned context can be dropped after the tune
-/// or shared with sessions via `Session::with_context`.
-///
-/// # Safety
-/// Wraps `blade_graphics::Context::init`, which is `unsafe` because it
-/// loads the system graphics driver.
 /// GPU context creation options. The library never reads the environment;
-/// map `MEGANEURA_DEVICE_ID` / `MEGANEURA_GPU_TIMING` with
+/// map device, timing and capture overrides with
 /// [`GpuOptions::from_env`] if you want env-driven selection.
 #[derive(Clone, Debug, Default)]
 pub struct GpuOptions {
@@ -3440,8 +3434,14 @@ pub struct GpuOptions {
     /// Enable hardware timestamp query pools (needed before the context
     /// exists; feeds `dump_gpu_timings` and the profiler).
     pub timing: bool,
+    /// Enable Blade's native-tool capture support, including shader debug
+    /// information and command labels. Independent of pass timestamps;
+    /// does not change Meganeura's dispatch grouping. Off by default.
+    pub capture: bool,
 }
 
+/// Create a GPU context with the same environment-independent defaults as
+/// [`Session::new`]. Use [`init_gpu_context_with`] for explicit options.
 pub fn init_gpu_context() -> Result<blade_graphics::Context, blade_graphics::NotSupportedError> {
     init_gpu_context_with(GpuOptions::default())
 }
@@ -3458,7 +3458,7 @@ pub fn init_gpu_context_with(
             // when a command buffer is re-begun; on slow GPUs the previous
             // submission may still be in flight. Keep this off by default.
             timing: options.timing,
-            capture: false,
+            capture: options.capture,
             overlay: false,
             device_id: dev_id,
             ..Default::default()

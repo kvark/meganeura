@@ -199,6 +199,7 @@ win, so explicit code always has the last word.
 | `MEGANEURA_FLASH_BWD_EPT_CAP=<n>` | Shared fallback cap for both flash backward kernels. |
 | `MEGANEURA_DEVICE_ID=0x744c` | Adapter selection by numeric device id. |
 | `MEGANEURA_GPU_TIMING` | Enable hardware timestamp pools (set before context creation). |
+| `MEGANEURA_GPU_CAPTURE` | Enable Blade's native-tool labels and shader debug information before context creation; independent of GPU timing. |
 
 `Session::tune_with(TuneOptions)` searches 32/64 scalar and legal native-f32
 cooperative tiles for exact dense matmul classes, qualifies nonzero scratch outputs, interleaves measurements,

@@ -232,6 +232,25 @@ backend exposes them, are supporting diagnostics, not a timing model.
 [profiling protocol](../performance-profiling.md),
 [GPU example](../../examples/profile_session.rs)
 
+For native tools, set `GpuOptions { capture: true, ..Default::default() }`
+before creating the context, or use `MEGANEURA_GPU_CAPTURE=1` with a
+`from_env` caller. This exposes Blade's capture support independently of
+`timing` and `Session::set_profiling`: leave both timing switches off when
+examining the production grouped schedule. It does not start a profiler.
+Pipeline object names now reuse the same variant keys as the structured
+profile, instead of ambiguous entry-point names such as `main`.
+
+On Vulkan, Blade 0.9 emits shader debug information and WGSL files under the
+process temporary directory's `blade` subdirectory. Its SPIR-V source-language
+tag is GLSL for Nsight compatibility; the retained source is still WGSL.
+Keep those files outside Git with the diagnostic capture. Debug information
+and pipeline names do not guarantee source correlation or loss-free hardware
+events: verify both in the native tool, and preserve numeric qualification.
+The initial Nsight pilot had hardware-event overflow, so it cannot support a
+complete per-dispatch breakdown. GPU/host memory budgets must include the
+profiler, not just the model. See Inferena's
+[bounded workflow and evidence limits](https://github.com/kvark/inferena/blob/experiment/p3hpc-cuda-graphs/EXPERIMENT.md#nvidia-paper-analysis-captures).
+
 `MemorySummary` separates plan capacities (including padding), graph
 allocations after aliasing, and actually allocated moments, accumulators and
 auxiliary buffers. `total_allocated_bytes()` sums those retained buffer

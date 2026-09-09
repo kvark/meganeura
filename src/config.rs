@@ -179,6 +179,8 @@ registry! {
         "Adapter selection by backend-reported numeric device id (decimal or 0x-hex).";
     GPU_TIMING: "MEGANEURA_GPU_TIMING", Bool, Selection,
         "Enable hardware timestamp query pools (must be set before the GPU context is created).";
+    GPU_CAPTURE: "MEGANEURA_GPU_CAPTURE", Bool, Selection,
+        "Enable Blade's shader debug information and native-tool capture support; independent of timestamps.";
 
     // --- Read by tests/examples, not the library ---
     TRACE: "MEGANEURA_TRACE", Text, External,
@@ -306,7 +308,7 @@ impl SessionOptions {
 }
 
 impl GpuOptions {
-    /// Adapter selection and timestamp collection from the environment.
+    /// Adapter selection, timestamps and native capture from the environment.
     pub fn from_env() -> Self {
         log_overrides();
         let device_id = DEVICE_ID.text().and_then(|value| {
@@ -322,6 +324,7 @@ impl GpuOptions {
         Self {
             device_id,
             timing: GPU_TIMING.bool_or(false),
+            capture: GPU_CAPTURE.bool_or(false),
         }
     }
 }
@@ -330,9 +333,9 @@ impl SessionConfig<'_> {
     /// A [`SessionConfig`] with every environment override applied — the
     /// one-liner for harnesses, examples, and env-driven test runs:
     /// compile options, tuning knobs, optimizer mode, diagnostic switches,
-    /// coop policy, `MEGANEURA_TUNE`, and (only when `MEGANEURA_DEVICE_ID`
-    /// or `MEGANEURA_GPU_TIMING` is set) a GPU context created with those
-    /// options. Also installs the WGSL dump directory when
+    /// coop policy, `MEGANEURA_TUNE`, and a GPU context when device selection,
+    /// `MEGANEURA_GPU_TIMING` or `MEGANEURA_GPU_CAPTURE` is enabled.
+    /// Also installs the WGSL dump directory when
     /// `MEGANEURA_DUMP_WGSL` is set.
     ///
     /// Fields assigned *after* this call win — precedence is simply
@@ -343,7 +346,7 @@ impl SessionConfig<'_> {
             crate::codegen::set_wgsl_dump_dir(dir);
         }
         let gpu_opts = GpuOptions::from_env();
-        let gpu = if gpu_opts.device_id.is_some() || gpu_opts.timing {
+        let gpu = if gpu_opts.device_id.is_some() || gpu_opts.timing || gpu_opts.capture {
             match crate::runtime::init_gpu_context_with(gpu_opts) {
                 Ok(context) => Some(std::sync::Arc::new(context)),
                 Err(e) => {
@@ -461,16 +464,27 @@ mod tests {
     }
 
     #[test]
-    fn no_winograd_reaches_the_typed_option() {
-        // Not set: the rewrite stays on.
-        unsafe { std::env::remove_var("MEGANEURA_NO_WINOGRAD") };
-        assert!(!crate::optimize::OptimizeConfig::from_env().no_winograd);
-        // Set: it turns off, and "0" means off in the uniform semantics.
-        unsafe { std::env::set_var("MEGANEURA_NO_WINOGRAD", "1") };
-        assert!(crate::optimize::OptimizeConfig::from_env().no_winograd);
-        unsafe { std::env::set_var("MEGANEURA_NO_WINOGRAD", "0") };
-        assert!(!crate::optimize::OptimizeConfig::from_env().no_winograd);
-        unsafe { std::env::remove_var("MEGANEURA_NO_WINOGRAD") };
+    fn boolean_overrides_reach_typed_options() {
+        for (value, enabled) in [(None, false), (Some("1"), true), (Some("0"), false)] {
+            for name in ["MEGANEURA_NO_WINOGRAD", "MEGANEURA_GPU_CAPTURE"] {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+            assert_eq!(
+                crate::optimize::OptimizeConfig::from_env().no_winograd,
+                enabled
+            );
+            assert_eq!(GpuOptions::from_env().capture, enabled);
+            assert!(!GpuOptions::default().capture);
+        }
+        unsafe {
+            std::env::remove_var("MEGANEURA_NO_WINOGRAD");
+            std::env::remove_var("MEGANEURA_GPU_CAPTURE");
+        }
     }
 
     #[test]
