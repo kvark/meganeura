@@ -2177,10 +2177,11 @@ fn fuse_epilogues(plan: &mut ExecutionPlan) {
         };
         let prod = &dispatches[prod_idx];
 
-        // Weighted kernels have a different B-buffer declaration and are
-        // compiled through `generate_module_weighted`. The epilogue generator
-        // currently emits only the f32 layout, so keep f16/Q4/Q8 matmuls
-        // separate until those two codegen paths are composed explicitly.
+        // Store-side unary epilogues do not inspect B, so they compose
+        // with f16/Q4/Q8 tiled matmuls through
+        // `generate_matmul_with_dag_epilogue_fmt`. Cooperative matmuls
+        // stay out: their epilogue path is a separate generator and
+        // quantized weights still do not feed coop tiles.
         let is_matmul = matches!(
             prod.shader,
             ShaderEntry::MatMul
@@ -2190,7 +2191,7 @@ fn fuse_epilogues(plan: &mut ExecutionPlan) {
                 | ShaderEntry::FusedMatMulATAdd
                 | ShaderEntry::FusedMatMulBTAdd
         );
-        if !is_matmul || prod.use_coop || prod.weight_format != WeightFormat::F32 {
+        if !is_matmul || prod.use_coop {
             continue;
         }
 
@@ -6581,7 +6582,7 @@ mod tests {
     }
 
     #[test]
-    fn weighted_matmul_keeps_pointwise_epilogue_separate() {
+    fn weighted_matmul_fuses_pointwise_epilogue() {
         let mut g = Graph::new();
         let x = g.input("x", &[4, 32]);
         let w = g.parameter_q4("w", &[32, 64]);
@@ -6590,11 +6591,10 @@ mod tests {
         g.set_outputs(vec![output]);
 
         let plan = compile(&g);
-        assert_eq!(plan.dispatches.len(), 2);
+        assert_eq!(plan.dispatches.len(), 1);
         assert_eq!(plan.dispatches[0].weight_format, WeightFormat::Q4);
-        assert!(plan.dispatches[0].matmul_epilogue.is_none());
-        assert!(plan.dispatches[0].epilogue.is_empty());
-        assert_eq!(plan.dispatches[1].shader, ShaderEntry::Sigmoid);
+        assert!(plan.dispatches[0].matmul_epilogue.is_some());
+        assert_eq!(plan.dispatches[0].shader, ShaderEntry::MatMul);
     }
 
     #[test]

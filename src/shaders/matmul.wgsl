@@ -57,17 +57,9 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             shared_a[row_local * 33u + col_local] = select(0.0, matrix_a[$A_INDEX], in_bounds);
         }
 
-        // Load B tile into shared_b[32×BN]: 32*BN/256 elements per thread
-        // shared_b layout: [k_local * (BN+1) + n_local] (padded stride)
-        for (var e = 0u; e < $STAGE_EPT_U; e++) {
-            let flat = tid + e * 256u;
-            let row_local = $B_ROW;
-            let col_local = $B_COL;
-            let b_row = t + row_local;
-            let b_col = tile_col + col_local;
-            let in_bounds = (b_row < params.k) && (b_col < params.n);
-            shared_b[row_local * $B_STRIDE_U + col_local] = select(0.0, $B_LOAD_EXPR, in_bounds);
-        }
+        // Load B tile into shared_b[32×BN]. Default: one element per
+        // iteration. Q4 large-tile replaces this with pack8 staging.
+        $B_STAGE_BODY
 
         workgroupBarrier();
 
