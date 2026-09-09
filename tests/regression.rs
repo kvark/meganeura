@@ -33,6 +33,7 @@ mod scatter_add_atomic;
 mod schedule_pointwise;
 mod schedule_reduction;
 mod smollm2_correctness;
+mod softplus_tail;
 mod submission_chunks;
 mod tune;
 mod whisper_correctness;
