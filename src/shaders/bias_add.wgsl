@@ -16,3 +16,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if i >= params.len { return; }
     dst[i] = src[i] + bias[i % params.bias_len];
 }
+
+@compute @workgroup_size(256)
+fn mul(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if i >= params.len { return; }
+    dst[i] = src[i] * bias[i % params.bias_len];
+}

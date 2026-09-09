@@ -426,7 +426,11 @@ pub enum ShaderGroup {
     Conv2dGradWeightGemmSplit,
     Conv2dGradWeightGemmSplitSmall,
     CacheWrite,
+    CacheWritePrefix,
     CachedAttention,
+    CachedBlockAttention,
+    ChunkedRelativeAttention,
+    PrefixLast,
     RoPEDynamic,
     MaxPool2d,
     GlobalAvgPool,
@@ -554,7 +558,17 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
             conv_grad_weight_tiled(MatMulTile::Small, true)
         }
         ShaderGroup::CacheWrite => parse_wgsl(include_str!("shaders/cache_write.wgsl")),
+        ShaderGroup::CacheWritePrefix => {
+            parse_wgsl(include_str!("shaders/cache_write_prefix.wgsl"))
+        }
         ShaderGroup::CachedAttention => parse_wgsl(include_str!("shaders/cached_attention.wgsl")),
+        ShaderGroup::CachedBlockAttention => {
+            parse_wgsl(include_str!("shaders/cached_block_attention.wgsl"))
+        }
+        ShaderGroup::ChunkedRelativeAttention => {
+            parse_wgsl(include_str!("shaders/chunked_relative_attention.wgsl"))
+        }
+        ShaderGroup::PrefixLast => parse_wgsl(include_str!("shaders/prefix_last.wgsl")),
         ShaderGroup::RoPEDynamic => parse_wgsl(include_str!("shaders/rope_dynamic.wgsl")),
         ShaderGroup::MaxPool2d => parse_wgsl(include_str!("shaders/max_pool_2d.wgsl")),
         ShaderGroup::GlobalAvgPool => parse_wgsl(include_str!("shaders/global_avg_pool.wgsl")),
@@ -5140,6 +5154,10 @@ mod tests {
             (ShaderGroup::Unary, naga::valid::Capabilities::empty()),
             (ShaderGroup::Binary, naga::valid::Capabilities::empty()),
             (ShaderGroup::BiasAdd, naga::valid::Capabilities::empty()),
+            (
+                ShaderGroup::ChunkedRelativeAttention,
+                naga::valid::Capabilities::empty(),
+            ),
             (ShaderGroup::Sgd, naga::valid::Capabilities::empty()),
             (ShaderGroup::Adam, naga::valid::Capabilities::empty()),
             (ShaderGroup::Transpose, naga::valid::Capabilities::empty()),
@@ -5687,7 +5705,9 @@ mod tests {
                 | ShaderEntry::SwiGLU => {
                     vec!["src_a", "src_b", "dst", "params"]
                 }
-                ShaderEntry::BiasAdd => vec!["src", "bias", "dst", "params"],
+                ShaderEntry::BiasAdd | ShaderEntry::BiasMul => {
+                    vec!["src", "bias", "dst", "params"]
+                }
                 ShaderEntry::SgdUpdate => vec!["param", "grad", "dst", "params"],
                 ShaderEntry::AdamUpdate => {
                     vec!["param", "grad", "m", "v", "grouped_grad_norm", "params"]
@@ -5743,9 +5763,25 @@ mod tests {
                 }
                 ShaderEntry::RmsNormRsqrt => vec!["src", "dst", "params"],
                 ShaderEntry::CacheWrite => vec!["src", "dst", "kv_pos_buf", "params"],
+                ShaderEntry::CacheWritePrefix => {
+                    vec!["src", "dst", "kv_pos_buf", "valid_len_buf", "params"]
+                }
                 ShaderEntry::CachedAttention => {
                     vec!["src_a", "src_b", "bias", "kv_pos_buf", "dst", "params"]
                 }
+                ShaderEntry::CachedBlockAttention => vec![
+                    "src_a",
+                    "src_b",
+                    "bias",
+                    "kv_pos_buf",
+                    "valid_len_buf",
+                    "dst",
+                    "params",
+                ],
+                ShaderEntry::ChunkedRelativeAttention => {
+                    vec!["src_a", "src_b", "bias", "relative_k", "dst", "params"]
+                }
+                ShaderEntry::PrefixLast => vec!["src", "valid_len_buf", "dst", "params"],
                 ShaderEntry::GroupNorm | ShaderEntry::GroupNormSilu => {
                     vec!["src", "src_b", "bias", "dst", "params"]
                 }
@@ -5780,7 +5816,9 @@ mod tests {
                 | ShaderEntry::Conv2dGradWeightGemmSplitSmall => {
                     vec!["grad_out", "src", "dst", "params"]
                 }
-                ShaderEntry::RoPEDynamic => vec!["src", "dst", "pos_offset_buf", "params"],
+                ShaderEntry::RoPEDynamic | ShaderEntry::RoPEPositions => {
+                    vec!["src", "dst", "pos_offset_buf", "params"]
+                }
                 ShaderEntry::MaxPool2d
                 | ShaderEntry::GlobalAvgPool
                 | ShaderEntry::GlobalAvgPoolGrad => vec!["src", "dst", "params"],
@@ -5822,6 +5860,7 @@ mod tests {
             ShaderEntry::Mul,
             ShaderEntry::Greater,
             ShaderEntry::BiasAdd,
+            ShaderEntry::BiasMul,
             ShaderEntry::SgdUpdate,
             ShaderEntry::GradClipZero,
             ShaderEntry::GradClipNormSq,
@@ -5890,8 +5929,13 @@ mod tests {
             ShaderEntry::WinogradOutputTransform,
             ShaderEntry::WinogradBatchedMatMul,
             ShaderEntry::CacheWrite,
+            ShaderEntry::CacheWritePrefix,
             ShaderEntry::CachedAttention,
+            ShaderEntry::CachedBlockAttention,
+            ShaderEntry::ChunkedRelativeAttention,
+            ShaderEntry::PrefixLast,
             ShaderEntry::RoPEDynamic,
+            ShaderEntry::RoPEPositions,
             ShaderEntry::MaxPool2d,
             ShaderEntry::GlobalAvgPool,
             ShaderEntry::GlobalAvgPoolGrad,

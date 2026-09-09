@@ -28,6 +28,12 @@ name = "flash_grad_kv_short"
 name = "rmsnorm_matmul_prologue"
 
 [[test]]
+name = "gemma_inference_ops"
+
+[[test]]
+name = "shared_parameters"
+
+[[test]]
 name = "sd_unet_coop_parity"
 
 [features]

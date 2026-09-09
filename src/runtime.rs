@@ -497,6 +497,15 @@ struct CacheWriteData {
     params: UnaryParams, // dim, _pad x3
 }
 
+#[derive(blade_macros::ShaderData)]
+struct CacheWritePrefixData {
+    src: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    kv_pos_buf: blade_graphics::BufferPiece,
+    valid_len_buf: blade_graphics::BufferPiece,
+    params: MatMulParams, // dim, block_len, max_seq, _pad
+}
+
 // group_norm: var src, src_b (weight), bias, dst, params
 #[derive(blade_macros::ShaderData)]
 struct GroupNormData {
@@ -738,6 +747,61 @@ struct CachedAttentionData {
     kv_pos_buf: blade_graphics::BufferPiece,
     dst: blade_graphics::BufferPiece,
     params: MatMulParams, // _reserved, num_heads, num_kv_heads, head_dim
+}
+
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct CachedBlockAttentionParams {
+    window_size: u32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    block_len: u32,
+    max_seq: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+#[derive(blade_macros::ShaderData)]
+struct CachedBlockAttentionData {
+    src_a: blade_graphics::BufferPiece,
+    src_b: blade_graphics::BufferPiece,
+    bias: blade_graphics::BufferPiece,
+    kv_pos_buf: blade_graphics::BufferPiece,
+    valid_len_buf: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: CachedBlockAttentionParams,
+}
+
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct ChunkedRelativeAttentionParams {
+    seq_len: u32,
+    num_heads: u32,
+    head_dim: u32,
+    left_context: u32,
+    softcap_bits: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+#[derive(blade_macros::ShaderData)]
+struct ChunkedRelativeAttentionData {
+    src_a: blade_graphics::BufferPiece,
+    src_b: blade_graphics::BufferPiece,
+    bias: blade_graphics::BufferPiece,
+    relative_k: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: ChunkedRelativeAttentionParams,
+}
+
+#[derive(blade_macros::ShaderData)]
+struct PrefixLastData {
+    src: blade_graphics::BufferPiece,
+    valid_len_buf: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: MatMulParams, // cols, rows, _pad0, _pad1
 }
 
 // layer_norm: var src, src_b (weight), bias, dst, params
@@ -1857,7 +1921,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
             BinaryData::layout()
         }
         ShaderEntry::PairwiseGrad => TernaryData::layout(),
-        ShaderEntry::BiasAdd => BiasAddData::layout(),
+        ShaderEntry::BiasAdd | ShaderEntry::BiasMul => BiasAddData::layout(),
         ShaderEntry::SgdUpdate => SgdData::layout(),
         ShaderEntry::AdamUpdate => AdamData::layout(),
         ShaderEntry::ScatterAdd => ScatterAddData::layout(),
@@ -1910,9 +1974,13 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         | ShaderEntry::Conv2dGradWeightGemmSmall
         | ShaderEntry::Conv2dGradWeightGemmSplit
         | ShaderEntry::Conv2dGradWeightGemmSplitSmall => Conv2dGradWeightData::layout(),
-        ShaderEntry::RoPEDynamic => RoPEDynamicData::layout(),
+        ShaderEntry::RoPEDynamic | ShaderEntry::RoPEPositions => RoPEDynamicData::layout(),
         ShaderEntry::CacheWrite => CacheWriteData::layout(),
+        ShaderEntry::CacheWritePrefix => CacheWritePrefixData::layout(),
         ShaderEntry::CachedAttention => CachedAttentionData::layout(),
+        ShaderEntry::CachedBlockAttention => CachedBlockAttentionData::layout(),
+        ShaderEntry::ChunkedRelativeAttention => ChunkedRelativeAttentionData::layout(),
+        ShaderEntry::PrefixLast => PrefixLastData::layout(),
         ShaderEntry::MaxPool2d => MaxPool2dData::layout(),
         ShaderEntry::GlobalAvgPool => GlobalAvgPoolData::layout(),
         ShaderEntry::GlobalAvgPoolGrad => UnaryData::layout(),
@@ -2434,6 +2502,44 @@ pub struct DebugStepReport {
     pub skipped_aliased: usize,
 }
 
+/// A GPU allocation shared by one or more sessions. The final reference owns
+/// destruction, which lets separately compiled execution shapes reuse model
+/// parameters and state without duplicate uploads or double-free hazards.
+struct PhysicalBuffer {
+    gpu: Arc<Gpu>,
+    handle: blade_graphics::Buffer,
+}
+
+impl Drop for PhysicalBuffer {
+    fn drop(&mut self) {
+        self.gpu.destroy_buffer(self.handle);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShareParameterError {
+    DifferentContext,
+    UnknownTarget,
+    UnknownSource,
+    Incompatible { target: usize, source: usize },
+}
+
+impl std::fmt::Display for ShareParameterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::DifferentContext => write!(f, "sessions use different GPU contexts"),
+            Self::UnknownTarget => write!(f, "target session has no parameter by that name"),
+            Self::UnknownSource => write!(f, "source session has no parameter by that name"),
+            Self::Incompatible { target, source } => write!(
+                f,
+                "parameter storage sizes differ: target needs {target} bytes, source has {source}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ShareParameterError {}
+
 impl DebugStepReport {
     /// The first reported nonfinite primary-output prefix, if any.
     pub fn first_bad(&self) -> Option<&DispatchAnomaly> {
@@ -2448,7 +2554,7 @@ pub struct Session {
     /// owning handles live in `physical_buffers`.
     buffers: Vec<blade_graphics::Buffer>,
     /// One handle per physical allocation (what actually gets destroyed).
-    physical_buffers: Vec<blade_graphics::Buffer>,
+    physical_buffers: Vec<Arc<PhysicalBuffer>>,
     /// Logical-to-physical mapping, allocation sizes, and per-allocation
     /// device-local placement.
     alias: crate::memplan::AliasPlan,
@@ -2541,6 +2647,26 @@ pub struct Session {
     lr_multipliers: Vec<(String, f32)>,
     /// Staging buffers for Q4 HorizontalConcat derived params.
     weight_staging: HashMap<crate::compile::BufferRef, Vec<f32>>,
+}
+
+// SAFETY: a session owns or reference-counts every GPU object it contains.
+// Blade's Vulkan encoder is not auto-Send only because its persistently mapped
+// scratch allocation is represented by a raw pointer; moving the encoder does
+// not move or invalidate that allocation. Metal and Vulkan permit their
+// command objects to be used from another host thread when externally
+// synchronized. Session's mutating/submit/read methods require `&mut self`, so
+// transferring ownership is safe; Session intentionally remains !Sync.
+unsafe impl Send for Session {}
+
+#[cfg(test)]
+mod session_thread_traits {
+    use super::Session;
+
+    #[test]
+    fn session_can_transfer_between_serial_workers() {
+        fn assert_send<T: Send>() {}
+        assert_send::<Session>();
+    }
 }
 
 struct AdamGroupedGradNorm {
@@ -2981,14 +3107,14 @@ impl Session {
             .and_then(|bytes| bytes.checked_add(usize::from(!plan.param_grad_pairs.is_empty()) * 4))
             .expect("session allocation size overflow");
         ensure_device_memory_budget(&gpu, planned_allocation_bytes, "session buffers");
-        let physical_buffers: Vec<blade_graphics::Buffer> = alias
+        let physical_buffers: Vec<Arc<PhysicalBuffer>> = alias
             .sizes
             .iter()
             .enumerate()
             .map(|(i, &size)| {
                 let size = size.max(4);
                 let device_local = alias.device_local[i];
-                let buf = gpu.create_buffer(blade_graphics::BufferDesc {
+                let handle = gpu.create_buffer(blade_graphics::BufferDesc {
                     name: &format!("buf_{}", i),
                     size: size as u64,
                     memory: if device_local {
@@ -3003,14 +3129,20 @@ impl Session {
                 // zero-filled on the GPU below, before the first step().
                 if !device_local {
                     unsafe {
-                        std::ptr::write_bytes(buf.data(), 0, size);
+                        std::ptr::write_bytes(handle.data(), 0, size);
                     }
                 }
-                buf
+                Arc::new(PhysicalBuffer {
+                    gpu: Arc::clone(&gpu),
+                    handle,
+                })
             })
             .collect();
-        let buffers: Vec<blade_graphics::Buffer> =
-            alias.map.iter().map(|&p| physical_buffers[p]).collect();
+        let buffers: Vec<blade_graphics::Buffer> = alias
+            .map
+            .iter()
+            .map(|&p| physical_buffers[p].handle)
+            .collect();
 
         // Upload constant buffer data (gradient constants, scale factors, etc.)
         for &(buf_ref, ref data) in &plan.constant_buffers {
@@ -3038,7 +3170,7 @@ impl Session {
                 for (i, &device_local) in alias.device_local.iter().enumerate() {
                     if device_local {
                         let size = alias.sizes[i].max(4) as u64;
-                        transfer.fill_buffer(physical_buffers[i].at(0), size, 0);
+                        transfer.fill_buffer(physical_buffers[i].handle.at(0), size, 0);
                     }
                 }
             }
@@ -3251,9 +3383,63 @@ impl Session {
                 .all(|(j, &p)| p != pidx || j == idx),
             "external slot shares a physical allocation"
         );
-        self.gpu.destroy_buffer(self.physical_buffers[pidx]);
-        self.physical_buffers[pidx] = imported;
+        self.physical_buffers[pidx] = Arc::new(PhysicalBuffer {
+            gpu: Arc::clone(&self.gpu),
+            handle: imported,
+        });
         self.buffers[idx] = imported;
+        Ok(())
+    }
+
+    /// Make this session's named parameter use the same allocation as a
+    /// parameter in another idle session on the same GPU context.
+    ///
+    /// This is useful when one model needs separately compiled execution
+    /// shapes (for example, batched prefill and single-row decode). The
+    /// allocation is reference-counted and remains alive until every sharing
+    /// session is dropped. Both sessions observe writes to the parameter, so
+    /// callers must serialize their execution when the parameter is mutable.
+    pub fn share_parameter_from(
+        &mut self,
+        source: &mut Session,
+        name: &str,
+    ) -> Result<(), ShareParameterError> {
+        if !Arc::ptr_eq(&self.gpu, &source.gpu) {
+            return Err(ShareParameterError::DifferentContext);
+        }
+        self.wait();
+        source.wait();
+        let target = self
+            .plan
+            .param_buffers
+            .iter()
+            .find(|entry| entry.0 == name)
+            .map(|entry| entry.1)
+            .ok_or(ShareParameterError::UnknownTarget)?;
+        let source_buffer = source
+            .plan
+            .param_buffers
+            .iter()
+            .find(|entry| entry.0 == name)
+            .map(|entry| entry.1)
+            .ok_or(ShareParameterError::UnknownSource)?;
+        let target_size = self.plan.buffers[target.0 as usize];
+        let source_size = source.plan.buffers[source_buffer.0 as usize];
+        if target_size != source_size {
+            return Err(ShareParameterError::Incompatible {
+                target: target_size,
+                source: source_size,
+            });
+        }
+        let target_physical = self.alias.map[target.0 as usize];
+        let source_physical = source.alias.map[source_buffer.0 as usize];
+        let shared = Arc::clone(&source.physical_buffers[source_physical]);
+        self.physical_buffers[target_physical] = Arc::clone(&shared);
+        for (logical, &physical) in self.alias.map.iter().enumerate() {
+            if physical == target_physical {
+                self.buffers[logical] = shared.handle;
+            }
+        }
         Ok(())
     }
 
@@ -4151,6 +4337,38 @@ impl Session {
             }
         }
         panic!("unknown parameter: {}", name);
+    }
+
+    /// Upload a parameter in the exact packed representation described by
+    /// the graph's [`crate::graph::DType`].
+    ///
+    /// This is intended for checkpoint readers which can losslessly transcode
+    /// an external packed tensor into Meganeura's storage layout. Unlike
+    /// [`Self::set_parameter`], this method does not dequantize or requantize
+    /// the values. The byte count is validated against the logical tensor
+    /// size before anything is copied to the device.
+    pub fn set_parameter_packed(&mut self, name: &str, data: &[u8]) {
+        self.wait();
+        for &(ref param_name, buf_ref) in &self.plan.param_buffers {
+            if param_name != name {
+                continue;
+            }
+            let ty = self
+                .plan
+                .param_types
+                .get(&buf_ref)
+                .unwrap_or_else(|| panic!("parameter `{name}` has no tensor type"));
+            let expected = ty.size_bytes();
+            assert_eq!(
+                data.len(),
+                expected,
+                "packed parameter `{name}` needs {expected} bytes, got {}",
+                data.len()
+            );
+            self.upload_parameter_bytes(buf_ref, data);
+            return;
+        }
+        panic!("unknown parameter: {name}");
     }
 
     /// Upload input data.
@@ -5853,7 +6071,7 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::BiasAdd => {
+            ShaderEntry::BiasAdd | ShaderEntry::BiasMul => {
                 pc.bind(
                     0,
                     &BiasAddData {
@@ -6532,7 +6750,7 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::RoPEDynamic => {
+            ShaderEntry::RoPEDynamic | ShaderEntry::RoPEPositions => {
                 pc.bind(
                     0,
                     &RoPEDynamicData {
@@ -6568,6 +6786,23 @@ impl Session {
                     },
                 );
             }
+            ShaderEntry::CacheWritePrefix => {
+                pc.bind(
+                    0,
+                    &CacheWritePrefixData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        kv_pos_buf: buf(dispatch.input_buffers[2]),
+                        valid_len_buf: buf(dispatch.input_buffers[3]),
+                        params: MatMulParams {
+                            m: dispatch.params[0],
+                            n: dispatch.params[1],
+                            k: dispatch.params[2],
+                            _pad: dispatch.params[3],
+                        },
+                    },
+                );
+            }
             ShaderEntry::CachedAttention => {
                 pc.bind(
                     0,
@@ -6582,6 +6817,67 @@ impl Session {
                             n: dispatch.params[1],
                             k: dispatch.params[2],
                             _pad: dispatch.params[3],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::CachedBlockAttention => {
+                pc.bind(
+                    0,
+                    &CachedBlockAttentionData {
+                        src_a: buf(dispatch.input_buffers[0]),
+                        src_b: buf(dispatch.input_buffers[1]),
+                        bias: buf(dispatch.input_buffers[2]),
+                        kv_pos_buf: buf(dispatch.input_buffers[3]),
+                        valid_len_buf: buf(dispatch.input_buffers[4]),
+                        dst: buf(dispatch.output_buffer),
+                        params: CachedBlockAttentionParams {
+                            window_size: dispatch.params[0],
+                            num_heads: dispatch.params[1],
+                            num_kv_heads: dispatch.params[2],
+                            head_dim: dispatch.params[3],
+                            block_len: dispatch.params[4],
+                            max_seq: dispatch.params[5],
+                            _pad0: 0,
+                            _pad1: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::ChunkedRelativeAttention => {
+                pc.bind(
+                    0,
+                    &ChunkedRelativeAttentionData {
+                        src_a: buf(dispatch.input_buffers[0]),
+                        src_b: buf(dispatch.input_buffers[1]),
+                        bias: buf(dispatch.input_buffers[2]),
+                        relative_k: buf(dispatch.input_buffers[3]),
+                        dst: buf(dispatch.output_buffer),
+                        params: ChunkedRelativeAttentionParams {
+                            seq_len: dispatch.params[0],
+                            num_heads: dispatch.params[1],
+                            head_dim: dispatch.params[2],
+                            left_context: dispatch.params[3],
+                            softcap_bits: dispatch.params[4],
+                            _pad0: 0,
+                            _pad1: 0,
+                            _pad2: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::PrefixLast => {
+                pc.bind(
+                    0,
+                    &PrefixLastData {
+                        src: buf(dispatch.input_buffers[0]),
+                        valid_len_buf: buf(dispatch.input_buffers[1]),
+                        dst: buf(dispatch.output_buffer),
+                        params: MatMulParams {
+                            m: dispatch.params[0],
+                            n: dispatch.params[1],
+                            k: 0,
+                            _pad: 0,
                         },
                     },
                 );
@@ -7285,9 +7581,6 @@ impl Drop for Session {
         }
         // `buffers` holds aliased copies of these handles; destroy each
         // physical allocation exactly once.
-        for buffer in &self.physical_buffers {
-            self.gpu.destroy_buffer(*buffer);
-        }
         for &(m_buf, v_buf) in &self.adam_state {
             self.gpu.destroy_buffer(m_buf);
             self.gpu.destroy_buffer(v_buf);
