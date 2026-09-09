@@ -42,8 +42,9 @@ jobs:
           cargo +1.92.0 fmt --all
           cargo +1.92.0 test --test regression softplus_tail --locked -- --nocapture --test-threads=1 2>&1 | tee target/softplus-validation/after.log
           cargo +1.92.0 test --test regression schedule_pointwise --locked -- --nocapture --test-threads=1 2>&1 | tee target/softplus-validation/pointwise.log
-          cargo +1.92.0 check --all-targets --all-features --locked
-          cargo +1.92.0 clippy --all-targets --all-features --locked -- -D warnings
+          cargo +1.92.0 test --lib cache --locked 2>&1 | tee target/softplus-validation/cache.log
+          cargo +1.92.0 check --all-targets --all-features --locked 2>&1 | tee target/softplus-validation/check.log
+          cargo +1.92.0 clippy --all-targets --all-features --locked -- -D warnings 2>&1 | tee target/softplus-validation/clippy.log
       - name: Commit tested source on this branch
         env:
           EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
@@ -52,7 +53,7 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git rm .github/softplus-edit.py
-          git add src/compile.rs src/compile/softplus.rs tests/softplus_tail.rs tests/schedule_pointwise.rs tests/regression.rs
+          git add src/compile.rs src/compile/softplus.rs src/cache.rs src/graph.rs tests/softplus_tail.rs tests/schedule_pointwise.rs tests/regression.rs
           git diff --cached --check
           git commit -m 'fix: preserve softplus negative-tail values and gradients'
           git push origin HEAD:refs/heads/fix/softplus-negative-tail
