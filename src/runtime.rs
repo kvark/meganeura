@@ -1,4 +1,5 @@
 use crate::compile::{BufferRef, Dispatch, ExecutionPlan, ShaderEntry};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
@@ -2672,6 +2673,11 @@ impl Drop for PhysicalBuffer {
     }
 }
 
+struct UploadStaging {
+    buffer: blade_graphics::Buffer,
+    size: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ShareParameterError {
     DifferentContext,
@@ -2803,6 +2809,8 @@ pub struct Session {
     lr_multipliers: Vec<(String, f32)>,
     /// Staging buffers for Q4 HorizontalConcat derived params.
     weight_staging: HashMap<crate::compile::BufferRef, Vec<f32>>,
+    upload_staging: RefCell<Option<UploadStaging>>,
+    reuse_upload_staging: bool,
 }
 
 // SAFETY: a session owns or reference-counts every GPU object it contains.
@@ -3458,6 +3466,8 @@ impl Session {
             pending_adam: None,
             adam_wd: 0.0,
             weight_staging: HashMap::new(),
+            upload_staging: RefCell::new(None),
+            reuse_upload_staging: std::env::var("MEGANEURA_REUSE_UPLOAD").as_deref() == Ok("1"),
         }
     }
 
@@ -5012,11 +5022,21 @@ impl Session {
             }
             return;
         }
-        let staging_bytes = data.len().min(16 * 1024 * 1024);
-        let staging = self.gpu.create_buffer(blade_graphics::BufferDesc {
-            name: "upload_staging",
-            size: (staging_bytes as u64).max(4),
-            memory: blade_graphics::Memory::Upload,
+        let staging_bytes = data.len().min(16 * 1024 * 1024).max(4);
+        let mut cached = self.upload_staging.borrow_mut();
+        if cached
+            .as_ref()
+            .is_some_and(|staging| staging.size < staging_bytes)
+        {
+            self.gpu.destroy_buffer(cached.take().unwrap().buffer);
+        }
+        let staging = cached.get_or_insert_with(|| UploadStaging {
+            buffer: self.gpu.create_buffer(blade_graphics::BufferDesc {
+                name: "upload_staging",
+                size: staging_bytes as u64,
+                memory: blade_graphics::Memory::Upload,
+            }),
+            size: staging_bytes,
         });
         let mut encoder = self
             .gpu
@@ -5025,23 +5045,25 @@ impl Session {
                 buffer_count: 1,
                 manual_barriers: false,
             });
-        for (index, chunk) in data.chunks(staging_bytes).enumerate() {
+        for (index, chunk) in data.chunks(staging.size).enumerate() {
             unsafe {
-                std::ptr::copy_nonoverlapping(chunk.as_ptr(), staging.data(), chunk.len());
+                std::ptr::copy_nonoverlapping(chunk.as_ptr(), staging.buffer.data(), chunk.len());
             }
             encoder.start();
             encoder.transfer("upload_staging").copy_buffer_to_buffer(
-                staging.at(0),
+                staging.buffer.at(0),
                 destination
                     .buffer
-                    .at(destination.offset + (index * staging_bytes) as u64),
+                    .at(destination.offset + (index * staging.size) as u64),
                 chunk.len() as u64,
             );
             let sync = self.gpu.submit(&mut encoder);
             let _ = self.gpu.wait_for(&sync, !0);
         }
         self.gpu.destroy_command_encoder(&mut encoder);
-        self.gpu.destroy_buffer(staging);
+        if !self.reuse_upload_staging {
+            self.gpu.destroy_buffer(cached.take().unwrap().buffer);
+        }
     }
 
     fn read_raw_f32(&self, buffer: &blade_graphics::Buffer, out: &mut [f32], host_visible: bool) {
@@ -8053,6 +8075,9 @@ impl Drop for Session {
     fn drop(&mut self) {
         self.wait();
         self.gpu.destroy_command_encoder(&mut self.encoder);
+        if let Some(staging) = self.upload_staging.get_mut().take() {
+            self.gpu.destroy_buffer(staging.buffer);
+        }
         for pipeline in self.pipelines.map.values_mut() {
             self.gpu.destroy_compute_pipeline(pipeline);
         }
