@@ -3207,6 +3207,41 @@ impl Session {
         } else {
             crate::memplan::plan_buffer_aliasing(&plan, &groups, opts.pin_buffers.as_deref())
         };
+        let device_parameters = match std::env::var("MEGANEURA_DEVICE_PARAMETERS").as_deref() {
+            Err(_) | Ok("0") => false,
+            Ok("1") => true,
+            Ok(other) => panic!("unknown parameter placement experiment: {other}"),
+        };
+        if device_parameters {
+            for buffer in plan
+                .param_buffers
+                .iter()
+                .map(|entry| entry.1)
+                .chain(plan.derived_params.iter().map(|entry| entry.0))
+            {
+                if plan.input_buffers.iter().any(|entry| entry.1 == buffer)
+                    || plan.constant_buffers.iter().any(|entry| entry.0 == buffer)
+                    || plan.loss_buffer == Some(buffer)
+                    || plan.buffers[buffer.0 as usize] % 4 != 0
+                    || plan
+                        .param_types
+                        .get(&buffer)
+                        .is_some_and(|ty| ty.size_bytes() % 4 != 0)
+                {
+                    continue;
+                }
+                let physical = alias.map[buffer.0 as usize];
+                assert!(
+                    alias
+                        .map
+                        .iter()
+                        .enumerate()
+                        .all(|(i, &p)| p != physical || i == buffer.0 as usize),
+                    "device parameter must have its own pinned allocation"
+                );
+                alias.device_local[physical] = true;
+            }
+        }
         // Step-local intermediates default to device-local memory on the
         // theory that host-visible (ReBAR) traffic is slower on discrete
         // boards; kill switch for measurement and UMA debugging.
@@ -3543,6 +3578,7 @@ impl Session {
             handle: imported,
         });
         self.buffers[idx] = imported;
+        self.alias.device_local[pidx] = !blade_graphics::Memory::External(source).is_host_visible();
         Ok(())
     }
 
@@ -3590,6 +3626,7 @@ impl Session {
         let source_physical = source.alias.map[source_buffer.0 as usize];
         let shared = Arc::clone(&source.physical_buffers[source_physical]);
         self.physical_buffers[target_physical] = Arc::clone(&shared);
+        self.alias.device_local[target_physical] = source.alias.device_local[source_physical];
         for (logical, &physical) in self.alias.map.iter().enumerate() {
             if physical == target_physical {
                 self.buffers[logical] = shared.handle;
@@ -4589,18 +4626,31 @@ impl Session {
                                 for src in sources {
                                     if src.0 == name && rows > 0 {
                                         let src_cols = src.1;
-                                        let derived_ptr =
-                                            self.buffers[derived_buf.0 as usize].data() as *mut f32;
-                                        for r in 0..rows {
-                                            let src_start = r * src_cols;
-                                            let dst_start = r * total_cols + col_offset;
-                                            unsafe {
-                                                std::ptr::copy_nonoverlapping(
-                                                    data[src_start..].as_ptr(),
-                                                    derived_ptr.add(dst_start),
-                                                    src_cols,
-                                                );
+                                        if self.logical_host_visible(*derived_buf) {
+                                            let derived_ptr = self.buffers[derived_buf.0 as usize]
+                                                .data()
+                                                as *mut f32;
+                                            for r in 0..rows {
+                                                let src_start = r * src_cols;
+                                                let dst_start = r * total_cols + col_offset;
+                                                unsafe {
+                                                    std::ptr::copy_nonoverlapping(
+                                                        data[src_start..].as_ptr(),
+                                                        derived_ptr.add(dst_start),
+                                                        src_cols,
+                                                    );
+                                                }
                                             }
+                                        } else {
+                                            self.copy_parameter_columns(
+                                                buf_ref,
+                                                *derived_buf,
+                                                data,
+                                                rows,
+                                                src_cols,
+                                                total_cols,
+                                                col_offset,
+                                            );
                                         }
                                     }
                                     col_offset += src.1;
@@ -4618,8 +4668,14 @@ impl Session {
                                 [0.5, -0.5, 0.5],
                                 [0.0, 0.0, 1.0],
                             ];
-                            let derived_ptr =
-                                self.buffers[derived_buf.0 as usize].data() as *mut f32;
+                            let mut staging =
+                                (!self.logical_host_visible(*derived_buf)).then(|| {
+                                    vec![0.0f32; self.plan.buffers[derived_buf.0 as usize] / 4]
+                                });
+                            let derived_ptr = match staging {
+                                Some(ref mut data) => data.as_mut_ptr(),
+                                None => self.buffers[derived_buf.0 as usize].data() as *mut f32,
+                            };
                             for co in 0..out_channels {
                                 for ci in 0..in_channels {
                                     // Extract 3x3 filter: [Co, Ci, 3, 3]
@@ -4658,6 +4714,9 @@ impl Session {
                                         }
                                     }
                                 }
+                            }
+                            if let Some(data) = staging {
+                                self.upload_buffer(*derived_buf, bytemuck::cast_slice(&data));
                             }
                         }
                     }
@@ -4722,7 +4781,7 @@ impl Session {
     /// intermediates may live in `Memory::Device` instead, but those
     /// are never exposed through this API.)
     ///
-    /// Returns `None` if no input with that name exists.
+    /// Returns `None` if the input is absent or its external allocation is not host-visible.
     ///
     /// # Ordering
     ///
@@ -4742,6 +4801,9 @@ impl Session {
     pub fn input_host_ptr(&self, name: &str) -> Option<(*mut u8, usize)> {
         for &(ref input_name, buf_ref) in &self.plan.input_buffers {
             if input_name == name {
+                if !self.logical_host_visible(buf_ref) {
+                    return None;
+                }
                 let buffer = &self.buffers[buf_ref.0 as usize];
                 let size = self.plan.buffers[buf_ref.0 as usize];
                 return Some((buffer.data(), size));
@@ -4825,6 +4887,68 @@ impl Session {
         }
     }
 
+    fn copy_parameter_columns(
+        &self,
+        source: BufferRef,
+        destination: BufferRef,
+        data: &[f32],
+        rows: usize,
+        columns: usize,
+        destination_columns: usize,
+        column_offset: usize,
+    ) {
+        assert!(columns + column_offset <= destination_columns);
+        assert!(rows * destination_columns * 4 <= self.plan.buffers[destination.0 as usize]);
+        assert!(rows * columns <= data.len());
+        if columns == 0 || rows == 0 {
+            return;
+        }
+        let source_is_f32 = self
+            .plan
+            .param_types
+            .get(&source)
+            .is_none_or(|ty| ty.dtype == crate::graph::DType::F32)
+            && self
+                .plan
+                .weight_buffers
+                .get(&source)
+                .is_none_or(|&(format, _, _)| !format.uses_reduced_storage());
+        if !source_is_f32 {
+            for row in 0..rows {
+                self.write_raw_buffer_at(
+                    self.buffers[destination.0 as usize]
+                        .at(((row * destination_columns + column_offset) * 4) as u64),
+                    bytemuck::cast_slice(&data[row * columns..(row + 1) * columns]),
+                    false,
+                );
+            }
+            return;
+        }
+        assert!(rows * columns * 4 <= self.plan.buffers[source.0 as usize]);
+        let mut encoder = self
+            .gpu
+            .create_command_encoder(blade_graphics::CommandEncoderDesc {
+                name: "parameter_columns",
+                buffer_count: 1,
+                manual_barriers: false,
+            });
+        encoder.start();
+        {
+            let mut transfer = encoder.transfer("parameter_columns");
+            for row in 0..rows {
+                transfer.copy_buffer_to_buffer(
+                    self.buffers[source.0 as usize].at((row * columns * 4) as u64),
+                    self.buffers[destination.0 as usize]
+                        .at(((row * destination_columns + column_offset) * 4) as u64),
+                    (columns * 4) as u64,
+                );
+            }
+        }
+        let sync = self.gpu.submit(&mut encoder);
+        let _ = self.gpu.wait_for(&sync, !0);
+        self.gpu.destroy_command_encoder(&mut encoder);
+    }
+
     fn upload_buffer(&self, buf_ref: BufferRef, data: &[u8]) {
         let buffer = &self.buffers[buf_ref.0 as usize];
         let expected = self.plan.buffers[buf_ref.0 as usize];
@@ -4866,23 +4990,30 @@ impl Session {
     /// Write `data` into a GPU buffer, staging through a host-visible
     /// allocation when the destination is device-local.
     fn write_raw_buffer(&self, buffer: &blade_graphics::Buffer, data: &[u8], host_visible: bool) {
+        self.write_raw_buffer_at(buffer.at(0), data, host_visible);
+    }
+
+    fn write_raw_buffer_at(
+        &self,
+        destination: blade_graphics::BufferPiece,
+        data: &[u8],
+        host_visible: bool,
+    ) {
         if data.is_empty() {
             return;
         }
         if host_visible {
             unsafe {
-                std::ptr::copy_nonoverlapping(data.as_ptr(), buffer.data(), data.len());
+                std::ptr::copy_nonoverlapping(data.as_ptr(), destination.data(), data.len());
             }
             return;
         }
+        let staging_bytes = data.len().min(16 * 1024 * 1024);
         let staging = self.gpu.create_buffer(blade_graphics::BufferDesc {
             name: "upload_staging",
-            size: (data.len() as u64).max(4),
-            memory: blade_graphics::Memory::Shared,
+            size: (staging_bytes as u64).max(4),
+            memory: blade_graphics::Memory::Upload,
         });
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), staging.data(), data.len());
-        }
         let mut encoder = self
             .gpu
             .create_command_encoder(blade_graphics::CommandEncoderDesc {
@@ -4890,14 +5021,21 @@ impl Session {
                 buffer_count: 1,
                 manual_barriers: false,
             });
-        encoder.start();
-        encoder.transfer("upload_staging").copy_buffer_to_buffer(
-            staging.at(0),
-            buffer.at(0),
-            data.len() as u64,
-        );
-        let sync = self.gpu.submit(&mut encoder);
-        let _ = self.gpu.wait_for(&sync, !0);
+        for (index, chunk) in data.chunks(staging_bytes).enumerate() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(chunk.as_ptr(), staging.data(), chunk.len());
+            }
+            encoder.start();
+            encoder.transfer("upload_staging").copy_buffer_to_buffer(
+                staging.at(0),
+                destination
+                    .buffer
+                    .at(destination.offset + (index * staging_bytes) as u64),
+                chunk.len() as u64,
+            );
+            let sync = self.gpu.submit(&mut encoder);
+            let _ = self.gpu.wait_for(&sync, !0);
+        }
         self.gpu.destroy_command_encoder(&mut encoder);
         self.gpu.destroy_buffer(staging);
     }
@@ -4951,6 +5089,11 @@ impl Session {
         if let Some(buf_ref) = self.plan.loss_buffer {
             let buffer = &self.buffers[buf_ref.0 as usize];
             let n = self.plan.buffers[buf_ref.0 as usize] / 4;
+            if !self.logical_host_visible(buf_ref) {
+                let mut values = vec![0.0; n];
+                self.read_raw_f32(buffer, &mut values, false);
+                return values.iter().sum();
+            }
             unsafe {
                 let ptr = buffer.data() as *const f32;
                 let slice = std::slice::from_raw_parts(ptr, n);
