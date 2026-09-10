@@ -512,10 +512,16 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::MatMulBT => gen_matmul_bt(),
         ShaderGroup::MatMulATAdd => gen_matmul_at_add(),
         ShaderGroup::MatMulBTAdd => gen_matmul_bt_add(),
-        ShaderGroup::MatMulGemv => {
-            parse_wgsl(&gemv_width_source(include_str!("shaders/matmul_gemv.wgsl")))
-        }
-        ShaderGroup::MatMulGemvAdd => parse_wgsl(include_str!("shaders/matmul_gemv_add.wgsl")),
+        ShaderGroup::MatMulGemv => parse_wgsl(&gemv_width_source(
+            include_str!("shaders/matmul_gemv.wgsl"),
+            "MEGANEURA_GEMV_THREADS",
+            256,
+        )),
+        ShaderGroup::MatMulGemvAdd => parse_wgsl(&gemv_width_source(
+            include_str!("shaders/matmul_gemv_add.wgsl"),
+            "MEGANEURA_GEMV_ADD_THREADS",
+            32,
+        )),
         ShaderGroup::MatMulGemvBT => parse_wgsl(include_str!("shaders/matmul_gemv_bt.wgsl")),
         ShaderGroup::Reduce => parse_wgsl(include_str!("shaders/reduce.wgsl")),
         ShaderGroup::Softmax => parse_wgsl(include_str!("shaders/softmax.wgsl")),
@@ -1665,32 +1671,35 @@ pub fn generate_module_gemv_rmsnorm() -> ShaderModule {
             "        let a = matrix_a[kk];",
             "        let a = matrix_a[kk] * rs * norm_w[kk];",
         );
-    parse_wgsl(&gemv_width_source(&src))
+    parse_wgsl(&gemv_width_source(&src, "MEGANEURA_GEMV_THREADS", 256))
 }
 
-fn gemv_width_source(source: &str) -> String {
-    let threads = match std::env::var("MEGANEURA_GEMV_THREADS") {
+fn gemv_width_source(source: &str, variable: &str, initial: u32) -> String {
+    let threads = match std::env::var(variable) {
         Err(_) => return source.to_owned(),
         Ok(value) => value.parse::<u32>().expect("GEMV workgroup width"),
     };
     assert!(matches!(threads, 32 | 64 | 128 | 256));
-    if threads == 256 {
+    if threads == initial {
         return source.to_owned();
     }
     let mut source = source
         .replace(
-            "@workgroup_size(256)",
+            &format!("@workgroup_size({initial})"),
             &format!("@workgroup_size({threads})"),
         )
         .replace(
-            "array<vec4<f32>, 256>",
+            &format!("array<vec4<f32>, {initial}>"),
             &format!("array<vec4<f32>, {threads}>"),
         )
-        .replace("array<f32, 256>", &format!("array<f32, {threads}>"))
-        .replace("kk += 256u;", &format!("kk += {threads}u;"))
-        .replace("si += 256u;", &format!("si += {threads}u;"))
         .replace(
-            "var sstride = 128u;",
+            &format!("array<f32, {initial}>"),
+            &format!("array<f32, {threads}>"),
+        )
+        .replace(&format!("kk += {initial}u;"), &format!("kk += {threads}u;"))
+        .replace(&format!("si += {initial}u;"), &format!("si += {threads}u;"))
+        .replace(
+            &format!("var sstride = {}u;", initial / 2),
             &format!("var sstride = {}u;", threads / 2),
         );
     let start = source
