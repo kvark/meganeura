@@ -980,7 +980,7 @@ fn epilogue_tile(dispatch: &Dispatch) -> crate::codegen::MatMulTile {
 /// arm rather than a map, a struct field, and four parallel match chains.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Variant {
-    SpecializedConv(ShaderEntry, Vec<u32>, bool),
+    SpecializedConv(ShaderEntry, Vec<u32>, ConvSpecialization),
     /// Schedule-template kernels, keyed by kernel content hash. These are
     /// generated from a DAG rather than a shader group, so no `ShaderEntry`
     /// identifies them.
@@ -1060,13 +1060,13 @@ impl Variant {
     /// Name used by the profiler and by pipeline-statistics dumps.
     fn label(&self) -> String {
         match *self {
-            Variant::SpecializedConv(ref e, ref params, native_division) => {
-                let mode = if native_division {
+            Variant::SpecializedConv(ref e, ref params, options) => {
+                let mode = if options.native_division {
                     "fixed-native-div"
                 } else {
                     "fixed"
                 };
-                format!("{e:?}:{mode}-{params:?}")
+                format!("{e:?}:{mode}-k{}-{params:?}", options.k_tile)
             }
             Variant::Reduction(hash) => format!("generated-reduction:{hash:016x}"),
             Variant::Pointwise(hash) => format!("generated-pointwise:{hash:016x}"),
@@ -1089,10 +1089,16 @@ impl Variant {
 
 struct Pipelines {
     map: HashMap<Variant, blade_graphics::ComputePipeline>,
-    specialize_conv: Option<bool>,
+    specialize_conv: Option<ConvSpecialization>,
 }
 
-fn specialized_conv_variant(dispatch: &Dispatch, native_division: bool) -> Option<Variant> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ConvSpecialization {
+    native_division: bool,
+    k_tile: u32,
+}
+
+fn specialized_conv_variant(dispatch: &Dispatch, options: ConvSpecialization) -> Option<Variant> {
     if !matches!(
         dispatch.shader,
         ShaderEntry::Conv2dGemm
@@ -1112,7 +1118,7 @@ fn specialized_conv_variant(dispatch: &Dispatch, native_division: bool) -> Optio
     Some(Variant::SpecializedConv(
         dispatch.shader.clone(),
         dispatch.params.clone(),
-        native_division,
+        options,
     ))
 }
 
@@ -1661,13 +1667,27 @@ impl Pipelines {
 
         let specialize_conv = match std::env::var("MEGANEURA_SPECIALIZE_CONV").as_deref() {
             Err(_) | Ok("0") => None,
-            Ok("1") => Some(false),
-            Ok("native-div") => Some(true),
+            Ok("1") => Some(ConvSpecialization {
+                native_division: false,
+                k_tile: 16,
+            }),
+            Ok("native-div") => Some(ConvSpecialization {
+                native_division: true,
+                k_tile: 16,
+            }),
+            Ok("k32") => Some(ConvSpecialization {
+                native_division: false,
+                k_tile: 32,
+            }),
+            Ok("native-div-k32") => Some(ConvSpecialization {
+                native_division: true,
+                k_tile: 32,
+            }),
             Ok(other) => panic!("unknown convolution specialization experiment: {other}"),
         };
-        if let Some(native_division) = specialize_conv {
+        if let Some(options) = specialize_conv {
             for dispatch in &plan.dispatches {
-                let Some(key) = specialized_conv_variant(dispatch, native_division) else {
+                let Some(key) = specialized_conv_variant(dispatch, options) else {
                     continue;
                 };
                 if map.contains_key(&key) {
@@ -1675,9 +1695,12 @@ impl Pipelines {
                 }
                 let params = Conv2dParams::from(dispatch);
                 let sm = crate::codegen::specialize_u32_params(
-                    crate::codegen::generate_module(dispatch.shader.shader_group()),
+                    crate::codegen::generate_conv_module(
+                        dispatch.shader.shader_group(),
+                        options.k_tile,
+                    ),
                     bytemuck::cast_slice(std::slice::from_ref(&params)),
-                    native_division,
+                    options.native_division,
                 );
                 let shader = gpu.create_shader(bg::ShaderDesc {
                     source: &sm.source,
@@ -1764,8 +1787,8 @@ impl Pipelines {
     }
 
     fn get(&self, dispatch: &Dispatch) -> &blade_graphics::ComputePipeline {
-        if let Some(native_division) = self.specialize_conv {
-            if let Some(key) = specialized_conv_variant(dispatch, native_division) {
+        if let Some(options) = self.specialize_conv {
+            if let Some(key) = specialized_conv_variant(dispatch, options) {
                 return &self.map[&key];
             }
         }
@@ -1777,8 +1800,8 @@ impl Pipelines {
     }
 
     fn profile_key(&self, dispatch: &Dispatch) -> String {
-        if let Some(native_division) = self.specialize_conv {
-            if let Some(key) = specialized_conv_variant(dispatch, native_division) {
+        if let Some(options) = self.specialize_conv {
+            if let Some(key) = specialized_conv_variant(dispatch, options) {
                 return key.label();
             }
         }

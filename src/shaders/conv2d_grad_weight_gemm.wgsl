@@ -3,7 +3,7 @@
 // grad_weight[Co, Ci*kH*kW] = grad_out_flat[Co, N*oH*oW] × im2col(input)[N*oH*oW, Ci*kH*kW]
 // C[Co, Ci*kH*kW] = A[Co, K] × B[K, Ci*kH*kW], K = batch*oH*oW.
 //
-// BM=64, BN=64, KTILE=16, TM=4, TN=4, workgroup [16,16,1]
+// Register-tiled matmul, workgroup [16,16,1]. BM, TM and K are generated.
 // Dispatch: [ceil(Ci*kH*kW / 64), ceil(Co / 64), 1]
 
 $DIVISOR
@@ -31,8 +31,8 @@ var<storage> grad_out: array<f32>;           // [N, Co, oH, oW]
 var<storage> src: array<f32>;                // input [N, Ci, H, W]
 var<storage, read_write> dst: array<f32>;    // grad_kernel [Co, Ci, kH, kW]
 var<uniform> params: Params;
-var<workgroup> shared_a: array<f32, $SHARED_SIZE>;   // A tile: [64, 16]
-var<workgroup> shared_b: array<f32, $SHARED_SIZE>;   // B tile: [16, 64]
+var<workgroup> shared_a: array<f32, $SHARED_SIZE>;   // A tile: [BM, K]
+var<workgroup> shared_b: array<f32, $SHARED_SIZE>;   // B tile: [K, BM]
 
 @compute @workgroup_size(16, 16)
 fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>$COUNTS) {
@@ -56,12 +56,12 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     loop {
         if t >= $K_END { break; }
 
-        // Load A tile: grad_out_flat[Co, N*oH*oW] → shared_a[64, 16]
+        // Load A tile: grad_out_flat[Co, N*oH*oW].
         // A[co, n*oH*oW + oh*oW + ow] = grad_out[n, co, oh, ow]
         for (var e = 0u; e < $STAGE_EPT_U; e++) {
             let flat = tid + e * 256u;
-            let row_local = flat / 16u;  // M dimension (Co)
-            let col_local = flat % 16u;  // K dimension
+            let row_local = flat / $KTILE_U;  // M dimension (Co)
+            let col_local = flat % $KTILE_U;  // K dimension
             let co = tile_row + row_local;
             let k_idx = t + col_local;
 
@@ -71,15 +71,15 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
                 let rem = k_idx - n * go_spatial;
                 val = grad_out[(n * params.out_channels + co) * go_spatial + rem];
             }
-            shared_a[row_local * 16u + col_local] = val;
+            shared_a[row_local * $KTILE_U + col_local] = val;
         }
 
-        // Load B tile: im2col(input)[N*oH*oW, Ci*kH*kW] → shared_b[16, 64]
+        // Load B tile: im2col(input)[N*oH*oW, Ci*kH*kW].
         // B[k_idx, col] where k_idx = n*oH*oW + oh*oW + ow, col = ci*kH*kW + kh*kW + kw
         // B[k_idx, col] = input[n, ci, oh*stride+kh-padding, ow*stride+kw-padding]
         for (var e = 0u; e < $STAGE_EPT_U; e++) {
             let flat = tid + e * 256u;
-            let row_local = flat / $BM_U;  // K dimension (within KTILE=16)
+            let row_local = flat / $BM_U;  // K dimension
             let col_local = flat % $BM_U;  // N dimension (Ci*kH*kW)
             let k_idx = t + row_local;
             let col_idx = tile_col + col_local;
@@ -108,13 +108,13 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
 
         workgroupBarrier();
 
-        // Compute: 4×4 register-tiled matmul over KTILE=16
-        for (var kk = 0u; kk < 16u; kk++) {
+        // Compute the register tile over one K stage.
+        for (var kk = 0u; kk < $KTILE_U; kk++) {
             $COMPUTE_BODY
         }
 
         workgroupBarrier();
-        t += 16u;
+        t += $KTILE_U;
     }
 
     // Store: grad_kernel[co, ci*kH*kW + kh*kW + kw]
