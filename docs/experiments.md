@@ -171,8 +171,9 @@ reset, reboot or host OOM occurred in these bounded runs.
 The 360M control separates another issue: free-list allocation reduces buddy
 rounding but does not improve step time. Actual heap bindings, plan requests,
 allocator blocks and process-driver accounting answer different questions.
-Fresh qualified 135M/1.7B CUDA-Graph/Vulkan Systems pairs show that the remaining
-resident gap is chiefly GPU execution, not host encoding. They do not isolate
+Fresh qualified 135M/1.7B CUDA-Graph/Vulkan Systems pairs show substantial
+resident GPU-execution gaps; the later sustained-token control below also
+exposes CPU power-policy sensitivity. These measurements do not isolate
 barrier cost. Procedures, limitations and source pins are in Inferena's
 [analysis](https://github.com/kvark/inferena/blob/experiment/p3hpc-gap-2026-09-10/ANALYSIS.md#placement-and-allocation-ablation--september-10).
 The collection tag and paper tables remain unchanged.
@@ -211,9 +212,22 @@ An alternative scalar-matmul column layout is slower in the five-model pilot.
 
 Longer warmup also reveals that 135M's short token window is not sustained
 steady state: about 2.56 versus 3.58 ms on this configuration, with stable
-prefill. Preserve this sensitivity, not just the fastest samples. Diagnostic
-clock/host/GPU correlation must precede attribution. The collection tag is
-unchanged; these new source-only controls are not replacement paper timings.
+prefill. The `experiment/host-latency-2026-09-10` Inferena tag localizes this:
+GPU token time stays about 1.88 ms, but the CPU downclocks toward 800 MHz and
+command-recording thread CPU time grows from about 0.59 to 1.44–1.48 ms.
+Small Shared-allocation controls reproduce it; fixed-core and per-task
+utilization-hint controls do not prevent it. No system power setting changed.
+Preserve this sensitivity, not just the fastest samples. The collection tag is
+unchanged; these diagnostic controls are not replacement paper timings.
+
+The source-only `experiment/native-token-graphics-2026-09-10` tag qualifies
+SDK-triggered capture after warmup, with matching full output hashes and no
+reported hardware-event overflow. Token PC samples concentrate in residual-add
+GEMV (48%), RMSNorm-fused GEMV (41%) and transposed GEMV (11%). Memory-dependency
+stalls dominate the sampled warp states; these are not wall-time barrier costs.
+The first plain/RMSNorm GEMV-width pilot finds no broad win and does not vary
+the residual-add hotspot. Detailed controls and limits stay in Inferena's
+[analysis](https://github.com/kvark/inferena/blob/experiment/p3hpc-gap-2026-09-10/ANALYSIS.md#host-side-latency-transient).
 
 ## September tuning foundation
 
