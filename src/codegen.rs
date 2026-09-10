@@ -906,6 +906,15 @@ fn tiled_matmul_body(
     tiled_gemm_body(tile.tm(), k_tile + 1, tile.bm() + 1, interleave_columns)
 }
 
+fn matmul_k_stage() -> u32 {
+    match std::env::var("MEGANEURA_MATMUL_K_STAGE").as_deref() {
+        Ok("8") => 8,
+        Ok("16") => 16,
+        Ok("32") | Err(_) => 32,
+        value => panic!("unsupported scalar matmul K stage: {value:?}"),
+    }
+}
+
 /// Generate an ordinary scalar convolution with a measured K-tile candidate.
 pub(crate) fn generate_conv_module(group: ShaderGroup, k_tile: u32) -> ShaderModule {
     let (source, tile) = match group {
@@ -1183,12 +1192,7 @@ fn matmul_vars_tiled(
     let bm = tile.bm();
     let tm = tile.tm();
     let k_tile = if b_mode == WeightFormat::F32 {
-        match std::env::var("MEGANEURA_MATMUL_K_STAGE").as_deref() {
-            Ok("8") => 8,
-            Ok("16") => 16,
-            Ok("32") | Err(_) => 32,
-            value => panic!("unsupported scalar matmul K stage: {value:?}"),
-        }
+        matmul_k_stage()
     } else {
         32
     };
@@ -6372,11 +6376,15 @@ mod tests {
                 small.source, large.source,
                 "{group:?}: small and large epilogue shaders must differ"
             );
-            // 32×32 stages A at 32*33 and B at 32*33; 64×64 uses 64*33
-            // and 32*65.
+            let k_tile = matmul_k_stage();
             assert!(
-                small.source.contains("array<f32, 1056>"),
-                "{group:?}: small epilogue must stage 32×32 tiles"
+                small
+                    .source
+                    .contains(&format!("array<f32, {}>", 32 * (k_tile + 1)))
+                    && small
+                        .source
+                        .contains(&format!("array<f32, {}>", k_tile * 33)),
+                "{group:?}: small epilogue must stage 32-wide tiles at the requested K depth"
             );
             assert!(
                 !small.source.contains("flat / 64u") && !small.source.contains("flat % 64u"),
