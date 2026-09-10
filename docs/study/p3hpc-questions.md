@@ -152,12 +152,23 @@ state evidence and limited transfer, not “automatic tuning makes training
 faster.” More representative kernel families and controlled confirmation come
 before default-on or persistent winners.
 
+This is not a negative result across the paper's models and platforms. The
+tests used one RTX 5070 and a narrow tile search, not the full Inferena matrix;
+the role-reversed dense follow-up accepted a 1.177× whole-step gain. Greedy
+rewriting is shared by both arms: empirical kernel selection augments it,
+rather than competing with it. Broader search and cross-device transfer have
+not been measured.
+
 For the paper's proposed compile-and-tune emphasis, see
 [cheap compilation as a search budget](performance-plan.md#cheap-compilation-as-a-search-budget).
 One preparation API already combines the stages, but graph rewriting and
 kernel selection are not a joint search today. Naga-only timing is not
 end-to-end pipeline preparation, and low compilation cost alone does not
 establish tuning amortization or novelty over TVM/Triton.
+We should emphasize the integrated compile-and-tune deployment workflow and
+measure the inexpensive Naga stage explicitly. Native driver compilation is
+an additional cost to report, not a reason to suppress that architectural
+argument or the value of cheap candidate generation.
 
 ## Numerical behavior
 

@@ -13,6 +13,12 @@ graph-and-kernel search and keeps it outside the frozen matrix. Neither a
 boundaries and amortized whole-step gains need matched measurements before
 making this the paper's central performance result.
 
+The follow-up states the positive architectural argument explicitly: empirical
+tuning runs automatically inside session construction when enabled, without a
+separate offline workflow. The study guide now limits the negative transfer
+evidence to the one-device, narrow tile-search experiment; it is not an
+all-model/all-platform result, nor a comparison against greedy graph rewriting.
+
 The response matrix below paraphrases `review1.txt`, `review2.txt` and
 `review3.txt` supplied at `/home/kvark/Documents/P3HPC`; private review text
 is not copied into Git. The CUDA Graph concern is confirmed in the frozen

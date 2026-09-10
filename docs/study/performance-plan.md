@@ -37,6 +37,14 @@ MLP Adam to 1.052× for MLP inference. These are synthetic engineering results,
 not new cross-engine or convergence evidence. This limits the pilot's scope;
 it does not justify default-on tuning or lowering the threshold.
 
+These experiments do **not** show that empirical tuning cannot improve our
+measured models on any target platform. All ran on one RTX 5070, chiefly over
+the existing scalar 32/64 tiles; the device cannot exercise native-f32
+cooperative challengers. Synthetic holdouts are not the complete Inferena
+model/shape matrix. The later role-reversed dense confirmation accepted a
+1.177× whole-step gain. Other devices, broader kernel choices and full-size
+model transfer remain unmeasured, not negative results.
+
 ## The objective
 
 Win useful workloads under a matched numerical and workload contract, without
@@ -89,8 +97,9 @@ Suggested paper/talk framing: **a compact compiler makes hardware measurement
 part of on-device executable preparation, under one numerical contract**.
 Fast specialization is useful both for deployment startup and for trying legal
 implementations before committing to a plan. This is a stronger design argument
-than code size alone, but a hypothesis about broader performance gains, not a
-new result in the frozen matrix.
+than code size alone: the deployed compiler can automatically specialize to
+the actual device without an offline, per-model tuning workflow. Broader
+performance gains remain a hypothesis, not a new result in the frozen matrix.
 
 We already have one preparation entry point: `SessionConfig { tune: true }`
 runs measured selection before `build` returns, including on a semantic-cache
@@ -98,6 +107,14 @@ hit. It is not yet joint graph-and-kernel search: greedy graph rewrites and the
 allocation plan are fixed before the tuner compares compatible implementations.
 The selected variants live only in that session. `runtime::auto_tune` is a
 capability probe, not this measured search.
+
+It is fair to call this **autotuning inside compilation/session preparation**:
+the caller asks for a ready executable, not a separate tuning exercise. It is
+not fair to describe the experiment as empirical tuning *versus* greedy graph
+search. Both arms use the same greedy rewrites; tuning adds measured kernel
+selection afterward. Fusion/layout/graph alternatives are not being searched
+by today's tuner. A negative tile-search result cannot evaluate that broader
+design.
 
 The proposed **100 µs Naga / 10,000× Triton** comparison is not established by
 our records. Naga parses, validates and translates shaders; Blade still asks
@@ -108,6 +125,14 @@ scratch/qualification, and timing/selection separately; declare cold versus
 warm compiler and driver caches. The paper's existing 0.08–2.36 s figures
 cover whole-workload preparation, not a single shader or measured tuning.
 [Naga's documented stages](https://docs.rs/naga/30.0.1/naga/)
+
+We should explicitly report Naga's inexpensive stage as well as native
+pipeline creation. The latter does not negate the former's value: inexpensive
+candidate generation is precisely what can make a useful search affordable.
+A measured 100 µs translation result would support that stage-level claim;
+only matched end-to-end measurements could support a 10,000× compile advantage.
+The paper can make the architectural argument now without waiting for that
+ratio, and show an untuned/tuned ablation as separate evidence when available.
 
 Why not always search? Compilation is only one cost. Private inputs, uploads,
 full-output readback/checks, warmups and enough interleaved trials to distinguish
