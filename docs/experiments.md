@@ -16,6 +16,61 @@ separate research artifact; rerunning a revision reproduces the procedure, not
 the original timing noise. Record the environment and failure counts with the
 conclusion. Adopt production changes independently of experiment scaffolding.
 
+## Compiler stages — September 10
+
+Source: `experiment/compiler-stages-2026-09-10` in
+[Inferena](https://github.com/kvark/inferena/tree/experiment/compiler-stages-2026-09-10),
+[Meganeura](https://github.com/kvark/meganeura/tree/experiment/compiler-stages-2026-09-10)
+and [Blade](https://github.com/kvark/blade/tree/experiment/compiler-stages-2026-09-10).
+The latter two add CPU spans only. Inferena pins both revisions and instruments
+the installed Triton compiler. RTX 5070 / 595.71.05, i5-12400F, strict f32,
+Python 3.13.13, PyTorch 2.13.0+cu130 at `cf30153`, Triton 3.7.1.
+
+Three fresh processes per engine/model/cache state; private initially empty
+compiler/driver disk caches, then a new process reusing each cache. GPU/OS
+caches are not flushed. Engine order alternates. SmolLM2 runs 128-token prefill
+and one stateless token; the other two models include F+loss+backward.
+PyTorch uses default compilation with validated explicit CUDA Graphs.
+Compilation is serialized (`TORCHINDUCTOR_COMPILE_THREADS=1`) to observe its
+stages, so these are preparation diagnostics, not publication speed samples.
+
+| Fresh-cache process | Naga parse, median µs/call | All Naga stages, ms | Vulkan pipeline creation, ms | Cold Triton compilations, ms |
+|---|---:|---:|---:|---:|
+| SmolLM2-135M | 141 | 7.24 | 386.8 | 2235.0 |
+| ResNet-50 | 147 | 14.75 | 632.2 | 6725.5 |
+| Whisper-tiny | 172 | 20.20 | 851.1 | 6598.8 |
+
+Each cell is a median across three process records. Naga's total sums disjoint
+parse, validation, specialization and SPIR-V emission spans; it excludes WGSL
+generation and native driver work. Native pipeline calls number 21/66/56,
+including reuse within a process. Cold Triton compilations number 37/181/96;
+their per-call medians are 60.22/29.83/65.75 ms, including lowering to cubin.
+The engines generate different kernel catalogues: these are **not paired
+identical kernels**, nor a 10,000× compiler-speed result.
+
+| Reported preparation, seconds | Meganeura fresh / reused | PyTorch fresh / reused |
+|---|---:|---:|
+| SmolLM2-135M | 1.175 / 0.779 | 23.990 / 6.066 |
+| ResNet-50 | 1.385 / 0.713 | 19.521 / 2.225 |
+| Whisper-tiny | 1.420 / 0.555 | 11.256 / 1.189 |
+
+Preparation retains each runner's declared boundary: native graph/session
+construction, versus Torch specialization/first execution; not just shader
+compilation. Reused-cache native pipeline totals fall to 1.67/5.50/3.90 ms.
+A separate 36-process tracing-disabled control changes preparation medians
+by at most 2.1%; this sequential control is not a paired overhead confidence
+interval. All 36 traced and 36 control processes completed. Cross-engine
+forward/gradient-norm gates passed, CUDA replay validation stayed enabled,
+and native output records repeated exactly. An earlier series overlapped an
+automatic OS update and a user-space crash-handler loop; it is excluded.
+
+Reproduce with `scripts/compile_study.py --output <new-outside-checkout-dir>`
+in the pinned Inferena environment; repeat with `--untraced`. The later
+experiment-branch `scripts/study_results.py` checks numerical pairs and exports
+stage counts/times. Traces, caches and raw records stay outside Git. Cheap
+Naga processing is measured and supports an on-device search budget; driver
+compilation, qualification and whole-step amortization still must be charged.
+
 ## September tuning foundation
 
 These are development observations on RTX 5070 / driver 595.71.05, not updates

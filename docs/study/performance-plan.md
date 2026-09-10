@@ -119,23 +119,22 @@ selection afterward. Fusion/layout/graph alternatives are not being searched
 by today's tuner. A negative tile-search result cannot evaluate that broader
 design.
 
-The proposed **100 µs Naga / 10,000× Triton** comparison is not established by
-our records. Naga parses, validates and translates shaders; Blade still asks
-the native driver to create executable pipelines. Comparing Naga alone with
-Triton's entire lowering/native-compilation path mixes boundaries. Measure
-graph rewriting, WGSL generation/Naga processing, native pipeline creation,
-scratch/qualification, and timing/selection separately; declare cold versus
-warm compiler and driver caches. The paper's existing 0.08–2.36 s figures
-cover whole-workload preparation, not a single shader or measured tuning.
-[Naga's documented stages](https://docs.rs/naga/30.0.1/naga/)
+The [September 10 stage experiment](../experiments.md#compiler-stages--september-10)
+now measures this explicitly on three real workloads. Median WGSL parse calls
+take 141–172 µs; all Naga stages together take 7–20 ms per workload. Fresh-cache
+native pipeline creation adds 387–851 ms. Cold Triton compilation calls have
+30–66 ms medians, but cover different kernels and more compilation stages.
+This supports inexpensive candidate generation, not a 10,000× like-for-like
+compiler advantage. Reused caches and tracing-disabled controls are reported
+separately. The diagnostic serializes Torch compilation; it is not a replacement
+for the collection cohort's preparation/performance measurement.
 
-We should explicitly report Naga's inexpensive stage as well as native
-pipeline creation. The latter does not negate the former's value: inexpensive
-candidate generation is precisely what can make a useful search affordable.
-A measured 100 µs translation result would support that stage-level claim;
-only matched end-to-end measurements could support a 10,000× compile advantage.
-The paper can make the architectural argument now without waiting for that
-ratio, and show an untuned/tuned ablation as separate evidence when available.
+Native driver compilation does not negate the Naga result. It identifies the
+next part of the budget: cached native pipeline creation is far cheaper, while
+previously unseen candidates still pay the driver. The paper's frozen 0.08–2.36 s
+range is a different measurement—whole-workload preparation, not one shader
+or empirical search. Charge graph rewriting, shader generation/translation,
+native pipelines, scratch/qualification and timing/selection separately.
 
 Why not always search? Compilation is only one cost. Private inputs, uploads,
 full-output readback/checks, warmups and enough interleaved trials to distinguish
