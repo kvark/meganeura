@@ -48,6 +48,13 @@ choices and transfer across the complete matrix remain unmeasured, not
 negative results. The guard requires 5% plus twice the paired-difference MAD;
 failing it does not exclude smaller real gains.
 
+The [September 10 full-model confirmation](../experiments.md#full-model-tuning--september-10)
+now supplies a positive counterexample: default tuning improves real 135M
+prefill by 1.092× on the RTX 5070, repaying 85 ms extra preparation after about
+80 prefills. The 360M model changes no tiles and pays 224 ms without a gain.
+This supports compilation-time search with explicit amortization, not universal
+default-on tuning. Outputs repeat exactly in both six-pair AB/BA cohorts.
+
 ## The objective
 
 Win useful workloads under a matched numerical and workload contract, without
@@ -129,6 +136,14 @@ compiler advantage. Reused caches and tracing-disabled controls are reported
 separately. The diagnostic serializes Torch compilation; it is not a replacement
 for the collection cohort's preparation/performance measurement.
 
+A matched-domain GEMM follow-up separates first compiler use from another
+candidate in an initialized process. The latter takes about 31 ms native versus
+100–167 ms Triton with cold private caches, or 0.43–0.52 versus 0.72–0.87 ms
+with caches reused. Both use runtime shapes, f32 arithmetic and matching tile/K
+sizes; all full-output gates pass. Naga accounts for only about 0.35–0.41 ms of
+the native cold candidate. This measured advantage is worth discussing with
+its boundaries; the cheap frontend alone is not the complete search budget.
+
 Native driver compilation does not negate the Naga result. It identifies the
 next part of the budget: cached native pipeline creation is far cheaper, while
 previously unseen candidates still pay the driver. The paper's frozen 0.08–2.36 s
@@ -140,9 +155,10 @@ Why not always search? Compilation is only one cost. Private inputs, uploads,
 full-output readback/checks, warmups and enough interleaved trials to distinguish
 a gain from noise remain necessary. The read-optimized staging work below has
 already removed much of the old readback penalty: dense-only synthetic searches
-take about 32–45 ms in the SameSize experiment. The later ResNet convolution
-search still takes about 640 ms, mostly sampling, without a guarded whole-step
-win. Cheap shaders cannot make an unprofitable or incomplete candidate space
+take about 32–45 ms in the historical SameSize experiment. The current full-model
+ablation reports search/preparation and whole-step costs separately; its expanded
+ResNet search still fails the whole-step guard. Cheap shaders cannot make an
+unprofitable or incomplete candidate space
 profitable; repeated shapes help, but different bindings/precision still matter.
 
 Use `extra preparation / (baseline step − tuned step)` for break-even uses

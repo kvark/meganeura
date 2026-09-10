@@ -14,8 +14,11 @@ graph-and-kernel search and keeps it outside the frozen matrix. Neither a
 now measures 141–172 µs median WGSL parsing on three actual workloads, separately
 charging native driver compilation and reporting cold/reused-cache controls.
 It is a serial compilation diagnostic, not a replacement for the frozen tables
-or the new collection cohort. Full-model tuning/amortization is being measured
-separately before deciding how much experimental weight to give this argument.
+or the new collection cohort. A matched-domain GEMM follow-up measures about
+31 ms native versus 100–167 ms Triton for a cold candidate after compiler warmup.
+Separately, six-pair AB/BA confirmation finds 1.092× real 135M prefill gain,
+amortized after about 80 prefills, while 360M finds no gain. These development
+results inform the argument without silently changing the paper's frozen data.
 
 The follow-up states the positive architectural argument explicitly: empirical
 tuning runs automatically inside session construction when enabled, without a
