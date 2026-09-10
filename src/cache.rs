@@ -9,8 +9,9 @@ use std::{io, path::Path};
 
 /// Increment whenever the serialized execution plan or build pipeline changes
 /// in a way that can make an older plan unsafe to reuse.
-// Version 6 invalidates cancellation-prone Softplus/SoftplusGrad lowerings.
-const CACHE_FORMAT_VERSION: u32 = 6;
+// Version 7 invalidates plans that may have replaced a generated pointwise DAG
+// with its legacy shader sentinel while fusing a matmul epilogue.
+const CACHE_FORMAT_VERSION: u32 = 7;
 
 /// Cached execution plan with a graph fingerprint for invalidation.
 #[derive(Serialize, Deserialize)]
@@ -463,22 +464,27 @@ mod tests {
 }
 
 #[cfg(test)]
-mod softplus_cache_tests {
+mod cache_format_tests {
     use super::*;
+
     #[test]
-    fn old_softplus_execution_plans_are_invalidated() {
+    fn previous_cache_format_is_invalidated() {
         let mut graph = Graph::new();
-        let x = graph.input("x", &[2]);
-        let y = graph.softplus(x, 1.0);
-        graph.set_outputs(vec![y]);
+        let x = graph.input("x", &[2, 32]);
+        let w = graph.parameter_f16("w", &[20, 32]);
+        let product = graph.matmul_bt(x, w);
+        let output = graph.clamp(product, -3.25, 4.5);
+        graph.set_outputs(vec![output]);
         let legacy = CachedPlan {
-            format_version: 5,
+            format_version: CACHE_FORMAT_VERSION - 1,
             graph_hash: hash_graph(&graph),
             build_hash: 0,
             plan: crate::compile::compile(&graph),
         };
-        let path =
-            std::env::temp_dir().join(format!("meganeura-softplus-v5-{}.ron", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "meganeura-previous-cache-format-{}.ron",
+            std::process::id()
+        ));
         std::fs::write(&path, ron::ser::to_string(&legacy).unwrap()).unwrap();
         assert!(load_plan(&graph, &path).unwrap().is_none());
         std::fs::remove_file(path).unwrap();

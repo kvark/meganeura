@@ -2168,20 +2168,28 @@ fn fuse_epilogues(plan: &mut ExecutionPlan) {
             continue;
         }
 
-        // If this dispatch carries a schedule-template DAG, it can still be
-        // absorbed into a matmul epilogue as long as the DAG corresponds to
-        // an epilogue-supported op (Relu/Silu/Sigmoid/Neg — checked below
-        // via `d.shader`, which we preserve as the sentinel entry). The
-        // DAG field gets discarded along with the dispatch itself.
-        // Map the consumed op to a PointwiseDAG single-op applied to val.
+        // Generated pointwise dispatches retain a legacy shader entry as a
+        // runtime-layout sentinel. That entry does not describe the DAG: for
+        // example Clamp and Exp both currently use `Relu`. Preserve the exact
+        // DAG when one is present instead of silently changing its meaning.
         use crate::schedule::Pw;
         let d_shader = d.shader.clone();
-        let pw_op = match d_shader {
-            ShaderEntry::Relu => Pw::Relu(0),
-            ShaderEntry::Sigmoid => Pw::Sigmoid(0),
-            ShaderEntry::Neg => Pw::Neg(0),
-            ShaderEntry::Silu => Pw::Silu(0),
+        let (pw_op, legacy_op) = match d_shader {
+            ShaderEntry::Relu => (Pw::Relu(0), EpilogueOp::Relu),
+            ShaderEntry::Sigmoid => (Pw::Sigmoid(0), EpilogueOp::Sigmoid),
+            ShaderEntry::Neg => (Pw::Neg(0), EpilogueOp::Neg),
+            ShaderEntry::Silu => (Pw::Silu(0), EpilogueOp::Silu),
             _ => continue,
+        };
+        let canonical_dag = PointwiseDAG {
+            n_inputs: 1,
+            ops: vec![Pw::LoadInput(0), pw_op],
+            output: 1,
+        };
+        let (epilogue_dag, has_legacy_equivalent) = match d.pointwise.as_ref() {
+            Some(dag) if dag.n_inputs == 1 => (dag.clone(), *dag == canonical_dag),
+            Some(_) => continue,
+            None => (canonical_dag, true),
         };
         let primary_buf = d.input_buffers[0];
         let elem_output = d.output_buffer;
@@ -2225,43 +2233,19 @@ fn fuse_epilogues(plan: &mut ExecutionPlan) {
 
         // Build or extend the MatMulEpilogue DAG on the producer.
         if let Some(ref mut epi) = dispatches[prod_idx].matmul_epilogue {
-            // Chain: append the new op referencing the current output.
-            let prev_out = epi.dag.output;
-            epi.dag.ops.push(pw_op.clone());
-            // The new op's input index (0 in the single-op) needs to
-            // reference prev_out. Since pw_op was built with Pw::Relu(0)
-            // etc., the "0" refers to LoadInput(0). But we want it to
-            // refer to the PREVIOUS output. Adjust: replace the inner
-            // index with prev_out.
-            let last = epi.dag.ops.len() - 1;
-            epi.dag.ops[last] = match pw_op {
-                Pw::Relu(_) => Pw::Relu(prev_out),
-                Pw::Sigmoid(_) => Pw::Sigmoid(prev_out),
-                Pw::Neg(_) => Pw::Neg(prev_out),
-                Pw::Silu(_) => Pw::Silu(prev_out),
-                _ => unreachable!(),
-            };
-            epi.dag.output = last as u16;
+            epi.dag = epilogue_dag.fuse_input(0, &epi.dag);
         } else {
-            // First epilogue op: create DAG with LoadInput(0) = val.
             dispatches[prod_idx].matmul_epilogue = Some(MatMulEpilogue {
-                dag: PointwiseDAG {
-                    n_inputs: 1,
-                    ops: vec![Pw::LoadInput(0), pw_op],
-                    output: 1,
-                },
+                dag: epilogue_dag,
                 inputs: vec![],
             });
         }
-        // Also maintain the legacy fields for backward compat.
-        let legacy_op = match d_shader {
-            ShaderEntry::Relu => EpilogueOp::Relu,
-            ShaderEntry::Sigmoid => EpilogueOp::Sigmoid,
-            ShaderEntry::Neg => EpilogueOp::Neg,
-            ShaderEntry::Silu => EpilogueOp::Silu,
-            _ => unreachable!(),
-        };
-        dispatches[prod_idx].epilogue.push(legacy_op);
+        // Maintain the old flat field only when it describes the same op.
+        // New readers use `matmul_epilogue`; inventing a legacy Relu for a
+        // Clamp DAG is actively misleading to old diagnostics and caches.
+        if has_legacy_equivalent {
+            dispatches[prod_idx].epilogue.push(legacy_op);
+        }
 
         dispatches[prod_idx].requires_full_precision |= consumer_requires_full_precision;
         dispatches[prod_idx].output_buffer = elem_output;
@@ -6694,6 +6678,38 @@ mod tests {
         assert_eq!(plan.dispatches[0].weight_format, WeightFormat::Q4);
         assert!(plan.dispatches[0].matmul_epilogue.is_some());
         assert_eq!(plan.dispatches[0].shader, ShaderEntry::MatMul);
+    }
+
+    #[test]
+    fn generated_clamp_keeps_its_exact_matmul_epilogue() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[2, 32]);
+        let w = g.parameter_f16("w", &[20, 32]);
+        let mm = g.matmul_bt(x, w);
+        let output = g.clamp(mm, -3.25, 4.5);
+        g.set_outputs(vec![output]);
+
+        let plan = compile(&g);
+        assert_eq!(plan.dispatches.len(), 1);
+        let epilogue = plan.dispatches[0]
+            .matmul_epilogue
+            .as_ref()
+            .expect("clamp should fuse into the matmul store");
+        assert_eq!(
+            epilogue.dag,
+            PointwiseDAG {
+                n_inputs: 1,
+                ops: vec![
+                    Pw::LoadInput(0),
+                    Pw::const_f32(-3.25),
+                    Pw::const_f32(4.5),
+                    Pw::Max(0, 1),
+                    Pw::Min(3, 2),
+                ],
+                output: 4,
+            }
+        );
+        assert!(plan.dispatches[0].epilogue.is_empty());
     }
 
     #[test]
