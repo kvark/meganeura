@@ -3232,11 +3232,11 @@ impl Session {
                 if plan.input_buffers.iter().any(|entry| entry.1 == buffer)
                     || plan.constant_buffers.iter().any(|entry| entry.0 == buffer)
                     || plan.loss_buffer == Some(buffer)
-                    || plan.buffers[buffer.0 as usize] % 4 != 0
+                    || !plan.buffers[buffer.0 as usize].is_multiple_of(4)
                     || plan
                         .param_types
                         .get(&buffer)
-                        .is_some_and(|ty| ty.size_bytes() % 4 != 0)
+                        .is_some_and(|ty| !ty.size_bytes().is_multiple_of(4))
                 {
                     continue;
                 }
@@ -5021,7 +5021,7 @@ impl Session {
             }
             return;
         }
-        let staging_bytes = data.len().min(16 * 1024 * 1024).max(4);
+        let staging_bytes = data.len().clamp(4, 16 * 1024 * 1024);
         let mut cached = self.upload_staging.borrow_mut();
         if cached
             .as_ref()

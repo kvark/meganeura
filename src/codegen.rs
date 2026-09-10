@@ -101,14 +101,14 @@ pub(crate) fn specialize_u32_params(
         .module
         .global_variables
         .iter()
-        .find(|(_, var)| var.name.as_deref() == Some("params"))
+        .find(|&(_, var)| var.name.as_deref() == Some("params"))
         .expect("parameter uniform");
     assert_eq!(params.space, naga::AddressSpace::Uniform);
     let ty = &shader.module.types[params.ty];
-    let naga::TypeInner::Struct { members, span } = &ty.inner else {
+    let naga::TypeInner::Struct { ref members, span } = ty.inner else {
         panic!("parameter block must be a struct");
     };
-    assert_eq!(*span as usize, values.len() * 4);
+    assert_eq!(span as usize, values.len() * 4);
     assert_eq!(members.len(), values.len());
     for (index, member) in members.iter().enumerate() {
         assert_eq!(member.offset as usize, index * 4);
