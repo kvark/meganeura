@@ -938,28 +938,6 @@ fn conv_gemm_tiled(src: &str, tile: MatMulTile, k_tile: u32) -> ShaderModule {
     assert!(matches!(k_tile, 16 | 32));
     let bm = tile.bm();
     let tm = tile.tm();
-    let k_tile = if b_mode == WeightFormat::F32 {
-        match std::env::var("MEGANEURA_MATMUL_K_STAGE").as_deref() {
-            Ok("8") => 8,
-            Ok("16") => 16,
-            Ok("32") | Err(_) => 32,
-            value => panic!("unsupported scalar matmul K stage: {value:?}"),
-        }
-    } else {
-        32
-    };
-    let k_row = format!("flat / {k_tile}u");
-    let k_col = format!("flat % {k_tile}u");
-    let (a_row, a_col) = if a_idx == MATMUL_A_FWD {
-        (k_row.as_str(), k_col.as_str())
-    } else {
-        (a_row, a_col)
-    };
-    let (b_row, b_col) = if b_idx == MATMUL_B_BT {
-        (k_col.as_str(), k_row.as_str())
-    } else {
-        (b_row, b_col)
-    };
     let (acc_decl, compute_body, acc_array) = tiled_gemm_body(tm, k_tile, bm, false);
     let src = preprocess(
         src,
@@ -1204,6 +1182,28 @@ fn matmul_vars_tiled(
     };
     let bm = tile.bm();
     let tm = tile.tm();
+    let k_tile = if b_mode == WeightFormat::F32 {
+        match std::env::var("MEGANEURA_MATMUL_K_STAGE").as_deref() {
+            Ok("8") => 8,
+            Ok("16") => 16,
+            Ok("32") | Err(_) => 32,
+            value => panic!("unsupported scalar matmul K stage: {value:?}"),
+        }
+    } else {
+        32
+    };
+    let k_row = format!("flat / {k_tile}u");
+    let k_col = format!("flat % {k_tile}u");
+    let (a_row, a_col) = if a_idx == MATMUL_A_FWD {
+        (k_row.as_str(), k_col.as_str())
+    } else {
+        (a_row, a_col)
+    };
+    let (b_row, b_col) = if b_idx == MATMUL_B_BT {
+        (k_col.as_str(), k_row.as_str())
+    } else {
+        (b_row, b_col)
+    };
     let interleave_columns = b_mode == WeightFormat::F32
         && std::env::var("MEGANEURA_INTERLEAVE_COLUMNS").as_deref() == Ok("1");
     let (acc_decl, compute_body, acc_array) = tiled_matmul_body(tile, k_tile, interleave_columns);
