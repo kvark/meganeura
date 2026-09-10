@@ -3209,11 +3209,13 @@ impl Session {
             crate::memplan::plan_buffer_aliasing(&plan, &groups, opts.pin_buffers.as_deref())
         };
         let device_parameters = match std::env::var("MEGANEURA_DEVICE_PARAMETERS").as_deref() {
-            Err(_) | Ok("0") => false,
-            Ok("1") => true,
+            Err(_) | Ok("0") => None,
+            Ok("1") => Some(blade_graphics::Memory::DeviceTransient),
+            Ok("device-buddy") => Some(blade_graphics::Memory::Device),
             Ok(other) => panic!("unknown parameter placement experiment: {other}"),
         };
-        if device_parameters {
+        let mut parameter_memory = vec![None; alias.sizes.len()];
+        if let Some(memory) = device_parameters {
             for buffer in plan
                 .param_buffers
                 .iter()
@@ -3241,6 +3243,7 @@ impl Session {
                     "device parameter must have its own pinned allocation"
                 );
                 alias.device_local[physical] = true;
+                parameter_memory[physical] = Some(memory);
             }
         }
         // Step-local intermediates default to device-local memory on the
@@ -3309,7 +3312,7 @@ impl Session {
                     name: &format!("buf_{}", i),
                     size: size as u64,
                     memory: if device_local {
-                        blade_graphics::Memory::DeviceTransient
+                        parameter_memory[i].unwrap_or(blade_graphics::Memory::DeviceTransient)
                     } else {
                         blade_graphics::Memory::Shared
                     },
