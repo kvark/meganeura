@@ -91,6 +91,38 @@ fn parse_source(source: &str) -> Result<Module, naga::front::wgsl::ParseError> {
     naga::front::wgsl::parse_str(source)
 }
 
+/// Experiment: bind an immutable, tightly packed u32 parameter block in WGSL.
+pub(crate) fn specialize_u32_params(shader: ShaderModule, values: &[u32]) -> ShaderModule {
+    let (_, params) = shader
+        .module
+        .global_variables
+        .iter()
+        .find(|(_, var)| var.name.as_deref() == Some("params"))
+        .expect("parameter uniform");
+    assert_eq!(params.space, naga::AddressSpace::Uniform);
+    let ty = &shader.module.types[params.ty];
+    let naga::TypeInner::Struct { members, span } = &ty.inner else {
+        panic!("parameter block must be a struct");
+    };
+    assert_eq!(*span as usize, values.len() * 4);
+    assert_eq!(members.len(), values.len());
+    for (index, member) in members.iter().enumerate() {
+        assert_eq!(member.offset as usize, index * 4);
+        assert_eq!(
+            shader.module.types[member.ty].inner,
+            naga::TypeInner::Scalar(naga::Scalar::U32)
+        );
+    }
+    let name = ty.name.as_ref().expect("named parameter struct");
+    let declaration = format!("var<uniform> params: {name};");
+    assert_eq!(shader.source.matches(&declaration).count(), 1);
+    let arguments = values.iter().map(|v| format!("{v}u")).collect::<Vec<_>>();
+    parse_wgsl(&shader.source.replace(
+        &declaration,
+        &format!("const params = {name}({});", arguments.join(", ")),
+    ))
+}
+
 /// Generate WGSL declarations and body for a fused epilogue chain.
 ///
 /// Returns (declarations, body) where declarations are `var<storage>`
