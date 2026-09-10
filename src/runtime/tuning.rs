@@ -327,7 +327,7 @@ impl Session {
     /// incumbent. A soft deadline may be exceeded by one in-flight operation;
     /// an incomplete comparison always retains its incumbent.
     pub fn tune_with(&mut self, options: TuneOptions) -> Result<TuneReport, TuneError> {
-        if self.pipelines.specialize_conv {
+        if self.pipelines.specialize_conv.is_some() {
             return Err(TuneError(
                 "the fixed-parameter experiment does not support tile tuning",
             ));
