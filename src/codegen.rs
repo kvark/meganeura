@@ -890,9 +890,9 @@ impl MatMulTile {
 
 /// Generate the unrolled `(acc_decl, compute_body, acc_array)` sections of
 /// the tiled-matmul skeleton for a TM×TM register tile.
-fn tiled_matmul_body(tile: MatMulTile) -> (String, String, String) {
+fn tiled_matmul_body(tile: MatMulTile, interleave_columns: bool) -> (String, String, String) {
     // matmul.wgsl stages A at padded stride 33 and B at BM+1.
-    tiled_gemm_body(tile.tm(), 33, tile.bm() + 1)
+    tiled_gemm_body(tile.tm(), 33, tile.bm() + 1, interleave_columns)
 }
 
 /// Generate an ordinary scalar convolution with a measured K-tile candidate.
@@ -927,7 +927,7 @@ fn conv_gemm_tiled(src: &str, tile: MatMulTile, k_tile: u32) -> ShaderModule {
     assert!(matches!(k_tile, 16 | 32));
     let bm = tile.bm();
     let tm = tile.tm();
-    let (acc_decl, compute_body, acc_array) = tiled_gemm_body(tm, k_tile, bm);
+    let (acc_decl, compute_body, acc_array) = tiled_gemm_body(tm, k_tile, bm, false);
     let src = preprocess(
         src,
         &[
@@ -980,7 +980,12 @@ fn conv_grad_weight_tiled(tile: MatMulTile, split_k: bool, k_tile: u32) -> Shade
 /// (matmul.wgsl and the implicit-GEMM conv kernels): accumulator
 /// declarations, the KTILE inner-loop FMA body, and the store array,
 /// parameterized by register tile size and shared-memory strides.
-fn tiled_gemm_body(tm: u32, a_stride: u32, b_stride: u32) -> (String, String, String) {
+fn tiled_gemm_body(
+    tm: u32,
+    a_stride: u32,
+    b_stride: u32,
+    interleave_columns: bool,
+) -> (String, String, String) {
     use std::fmt::Write;
 
     let mut acc_decl = String::new();
@@ -999,9 +1004,14 @@ fn tiled_gemm_body(tm: u32, a_stride: u32, b_stride: u32) -> (String, String, St
         );
     }
     for j in 0..tm {
+        let column = if interleave_columns {
+            format!("tx + {j}u * 16u")
+        } else {
+            format!("tx * {tm}u + {j}u")
+        };
         let _ = writeln!(
             body,
-            "            let b{j} = shared_b[kk * {b_stride}u + tx * {tm}u + {j}u];"
+            "            let b{j} = shared_b[kk * {b_stride}u + {column}];"
         );
     }
     for i in 0..tm {
@@ -1161,7 +1171,14 @@ fn matmul_vars_tiled(
     };
     let bm = tile.bm();
     let tm = tile.tm();
-    let (acc_decl, compute_body, acc_array) = tiled_matmul_body(tile);
+    let interleave_columns = b_mode == WeightFormat::F32
+        && std::env::var("MEGANEURA_INTERLEAVE_COLUMNS").as_deref() == Ok("1");
+    let (acc_decl, compute_body, acc_array) = tiled_matmul_body(tile, interleave_columns);
+    let output_column = if interleave_columns {
+        "tx + j * 16u".to_string()
+    } else {
+        format!("tx * {tm}u + j")
+    };
     let src = preprocess(
         src,
         &[
@@ -1180,6 +1197,7 @@ fn matmul_vars_tiled(
             ("$B_COL", b_col),
             ("$FUSED_ADD_DECL", &full_decl),
             ("$STORE_BODY", &store_body),
+            ("$OUTPUT_COLUMN", &output_column),
             ("$BM_U", &format!("{bm}u")),
             ("$TM_U", &format!("{tm}u")),
             ("$B_STRIDE_U", &format!("{}u", bm + 1)),
