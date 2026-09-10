@@ -2062,6 +2062,9 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         | ShaderEntry::MatMulBT
         | ShaderEntry::MatMulGemv
         | ShaderEntry::MatMulGemvBT => MatMulData::layout(),
+        ShaderEntry::BlockMatMul | ShaderEntry::BlockMatMulAT | ShaderEntry::BlockMatMulBT => {
+            MatMulData::layout()
+        }
         ShaderEntry::FusedMatMulAdd
         | ShaderEntry::FusedMatMulATAdd
         | ShaderEntry::FusedMatMulBTAdd
@@ -2488,6 +2491,46 @@ fn coop_preserves_required_precision(
     allow_raw_f16: bool,
 ) -> bool {
     !config.use_f16_input || !dispatch.requires_full_precision || allow_raw_f16
+}
+
+#[cfg(test)]
+mod block_matmul_variant_tests {
+    use super::select_variants;
+    use crate::{Graph, codegen::CoopConfig, compile};
+
+    #[test]
+    fn small_block_shapes_preserve_nvidia_scalar_geometry() {
+        let coop = CoopConfig {
+            tile_size: 16,
+            use_f16_input: true,
+            compensated: false,
+        };
+        for rows in [6, 16] {
+            for (inner, columns) in [(1024, 256), (256, 768)] {
+                let mut serial = Graph::new();
+                let a = serial.input("a", &[rows, inner]);
+                let b = serial.parameter("b", &[inner, columns]);
+                let y = serial.matmul(a, b);
+                serial.set_outputs(vec![y]);
+                let mut serial = compile::compile(&serial);
+                select_variants(&mut serial, Some(&coop), false, false);
+
+                let mut grouped = Graph::new();
+                let a = grouped.input("a", &[rows, 8 * inner]);
+                let b = grouped.parameter("b", &[8, inner, columns]);
+                let y = grouped.block_matmul(a, b);
+                grouped.set_outputs(vec![y]);
+                let mut grouped = compile::compile(&grouped);
+                select_variants(&mut grouped, Some(&coop), false, false);
+                let serial = &serial.dispatches[0];
+                let grouped = &grouped.dispatches[0];
+                assert!(!serial.use_coop && !grouped.use_coop);
+                assert_eq!(serial.use_small_tiles, grouped.use_small_tiles);
+                assert_eq!(serial.workgroups[..2], grouped.workgroups[..2]);
+                assert_eq!(grouped.workgroups[2], 8);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -6432,6 +6475,22 @@ impl Session {
         }
 
         match dispatch.shader {
+            ShaderEntry::BlockMatMul | ShaderEntry::BlockMatMulAT | ShaderEntry::BlockMatMulBT => {
+                pc.bind(
+                    0,
+                    &MatMulData {
+                        matrix_a: buf(dispatch.input_buffers[0]),
+                        matrix_b: buf(dispatch.input_buffers[1]),
+                        matrix_c: buf(dispatch.output_buffer),
+                        params: MatMulParams {
+                            m: dispatch.params[0],
+                            n: dispatch.params[1],
+                            k: dispatch.params[2],
+                            _pad: dispatch.params[3],
+                        },
+                    },
+                );
+            }
             ShaderEntry::MatMul | ShaderEntry::MatMulGemv => {
                 pc.bind(
                     0,

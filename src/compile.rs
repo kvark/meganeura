@@ -126,6 +126,9 @@ pub enum ShaderEntry {
     MatMul,
     MatMulAT,
     MatMulBT,
+    BlockMatMul,
+    BlockMatMulAT,
+    BlockMatMulBT,
     /// M=1 GEMV specialization of MatMul. Selected when `C = A × B` has
     /// a single row on the output side (LM decode path).
     MatMulGemv,
@@ -285,6 +288,9 @@ impl ShaderEntry {
             ShaderEntry::MatMul
             | ShaderEntry::MatMulAT
             | ShaderEntry::MatMulBT
+            | ShaderEntry::BlockMatMul
+            | ShaderEntry::BlockMatMulAT
+            | ShaderEntry::BlockMatMulBT
             | ShaderEntry::MatMulGemv
             | ShaderEntry::MatMulGemvAdd
             | ShaderEntry::MatMulGemvBT
@@ -403,6 +409,9 @@ impl ShaderEntry {
             ShaderEntry::MatMul => ShaderGroup::MatMul,
             ShaderEntry::MatMulAT => ShaderGroup::MatMulAT,
             ShaderEntry::MatMulBT => ShaderGroup::MatMulBT,
+            ShaderEntry::BlockMatMul => ShaderGroup::BlockMatMul,
+            ShaderEntry::BlockMatMulAT => ShaderGroup::BlockMatMulAT,
+            ShaderEntry::BlockMatMulBT => ShaderGroup::BlockMatMulBT,
             ShaderEntry::MatMulGemv => ShaderGroup::MatMulGemv,
             ShaderEntry::MatMulGemvAdd => ShaderGroup::MatMulGemvAdd,
             ShaderEntry::MatMulGemvBT => ShaderGroup::MatMulGemvBT,
@@ -507,6 +516,9 @@ impl ShaderEntry {
 
     pub fn entry_point(&self) -> &'static str {
         match *self {
+            ShaderEntry::BlockMatMul | ShaderEntry::BlockMatMulAT | ShaderEntry::BlockMatMulBT => {
+                "main"
+            }
             ShaderEntry::MatMul
             | ShaderEntry::MatMulAT
             | ShaderEntry::MatMulBT
@@ -2709,6 +2721,14 @@ impl<'a> Compiler<'a> {
         // Generate labels for profiling
         for d in &mut self.plan.dispatches {
             d.label = match d.shader {
+                ShaderEntry::BlockMatMul
+                | ShaderEntry::BlockMatMulAT
+                | ShaderEntry::BlockMatMulBT => {
+                    format!(
+                        "{:?}[g={},{}x{}x{}]",
+                        d.shader, d.params[3], d.params[0], d.params[1], d.params[2]
+                    )
+                }
                 ShaderEntry::MatMul
                 | ShaderEntry::FusedMatMulAdd
                 | ShaderEntry::MatMulGemv
@@ -2967,6 +2987,70 @@ impl<'a> Compiler<'a> {
                         ..Default::default()
                     });
                 }
+            }
+
+            Op::BlockMatMul | Op::BlockMatMulAT { .. } | Op::BlockMatMulBT => {
+                let a = self.get_buffer(node.inputs[0]);
+                let b = self.get_buffer(node.inputs[1]);
+                let a_ty = &self.graph.node(node.inputs[0]).ty;
+                let b_ty = &self.graph.node(node.inputs[1]).ty;
+                assert_eq!(a_ty.dtype, crate::graph::DType::F32);
+                assert_eq!(b_ty.dtype, crate::graph::DType::F32);
+                for ty in [a_ty, b_ty, &node.ty] {
+                    let elements = ty
+                        .shape
+                        .iter()
+                        .try_fold(1usize, |n, &d| n.checked_mul(d))
+                        .expect("block tensor size overflow");
+                    assert!(
+                        elements <= u32::MAX as usize,
+                        "block tensor exceeds shader index range"
+                    );
+                }
+                let (shader, groups, m, n, k) = match node.op {
+                    Op::BlockMatMul => (
+                        ShaderEntry::BlockMatMul,
+                        b_ty.shape[0],
+                        a_ty.shape[0],
+                        b_ty.shape[2],
+                        b_ty.shape[1],
+                    ),
+                    Op::BlockMatMulAT { groups } => (
+                        ShaderEntry::BlockMatMulAT,
+                        groups,
+                        a_ty.shape[1] / groups,
+                        b_ty.shape[1] / groups,
+                        a_ty.shape[0],
+                    ),
+                    Op::BlockMatMulBT => (
+                        ShaderEntry::BlockMatMulBT,
+                        b_ty.shape[0],
+                        a_ty.shape[0],
+                        b_ty.shape[1],
+                        b_ty.shape[2],
+                    ),
+                    _ => unreachable!(),
+                };
+                let [m, n, k, groups] = [m, n, k, groups].map(|d| u32::try_from(d).unwrap());
+                assert!(
+                    groups <= 65535,
+                    "block count exceeds portable dispatch limit"
+                );
+                // Match the ordinary scalar per-block tile choice. This
+                // operator does not opt into GEMV or cooperative variants.
+                let small = m.div_ceil(64) * n.div_ceil(64) < 16;
+                let tile = if small { 32 } else { 64 };
+                let workgroups = [n.div_ceil(tile), m.div_ceil(tile), groups];
+                assert!(workgroups.iter().all(|&v| v <= 65535));
+                self.plan.dispatches.push(Dispatch {
+                    shader,
+                    workgroups,
+                    input_buffers: vec![a, b],
+                    output_buffer: out_buf,
+                    params: vec![m, n, k, groups],
+                    use_small_tiles: small,
+                    ..Default::default()
+                });
             }
 
             Op::FusedMatMulAdd => {

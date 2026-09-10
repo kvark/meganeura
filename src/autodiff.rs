@@ -117,6 +117,32 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 accumulate_grad(&mut graph, &mut grads, a, grad_a);
                 accumulate_grad(&mut graph, &mut grads, b, grad_b);
             }
+            Op::BlockMatMul => {
+                let a = node.inputs[0];
+                let b = node.inputs[1];
+                let groups = graph.node(b).ty.shape[0];
+                let grad_a = graph.block_matmul_bt(grad_output, b);
+                let grad_b = graph.block_matmul_at(a, grad_output, groups);
+                accumulate_grad(&mut graph, &mut grads, a, grad_a);
+                accumulate_grad(&mut graph, &mut grads, b, grad_b);
+            }
+            Op::BlockMatMulAT { groups: _ } => {
+                let a = node.inputs[0];
+                let b = node.inputs[1];
+                let grad_a = graph.block_matmul_bt(b, grad_output);
+                let grad_b = graph.block_matmul(a, grad_output);
+                accumulate_grad(&mut graph, &mut grads, a, grad_a);
+                accumulate_grad(&mut graph, &mut grads, b, grad_b);
+            }
+            Op::BlockMatMulBT => {
+                let a = node.inputs[0];
+                let b = node.inputs[1];
+                let groups = graph.node(b).ty.shape[0];
+                let grad_a = graph.block_matmul(grad_output, b);
+                let grad_b = graph.block_matmul_at(grad_output, a, groups);
+                accumulate_grad(&mut graph, &mut grads, a, grad_a);
+                accumulate_grad(&mut graph, &mut grads, b, grad_b);
+            }
             Op::Add => {
                 let a = node.inputs[0];
                 let b = node.inputs[1];
