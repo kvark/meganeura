@@ -621,6 +621,9 @@ fn apply_greedy_swiglu(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
 }
 
 fn apply_greedy_swiglu_packed(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
+    if std::env::var("MEGANEURA_GREEDY_PACK_SWIGLU").as_deref() == Ok("0") {
+        return;
+    }
     let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
     for id in node_ids {
         let (gate_id, up_id) = {
