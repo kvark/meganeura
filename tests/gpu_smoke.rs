@@ -3328,7 +3328,12 @@ fn smollm2_q4_projections_match_f32_decode() {
         (logits, param_bytes)
     }
 
-    let config = SmolLM2Config::small_test();
+    let config = SmolLM2Config {
+        hidden_size: 64, // One 64-wide head keeps the decode fixture small.
+        num_attention_heads: 1,
+        num_key_value_heads: 1,
+        ..SmolLM2Config::small_test()
+    };
     let (f32_logits, f32_bytes) = decode(&config, ProjectionWeights::F32);
     let (q4_logits, q4_bytes) = decode(&config, ProjectionWeights::Q4);
 
@@ -3352,8 +3357,7 @@ fn smollm2_q4_projections_match_f32_decode() {
             .map(|(i, _)| i)
             .unwrap_or(0)
     };
-    // Measured 0.5% of the logit range on lavapipe; the margin is for other
-    // adapters, not for a second bug.
+    // Bound quantization error relative to the f32 logit scale.
     assert!(
         err / scale < 0.05,
         "Q4 decode diverged from f32: max_abs_err={err} (logit range {scale})"

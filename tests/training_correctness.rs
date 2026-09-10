@@ -364,7 +364,12 @@ fn sd_unet_training_loss_decreases() {
 fn smollm2_kv_cache_decode_graph() {
     use meganeura::models::smollm2::{self, SmolLM2Config};
 
-    let config = SmolLM2Config::small_test();
+    let config = SmolLM2Config {
+        hidden_size: 64, // One 64-wide head keeps the decode fixture small.
+        num_attention_heads: 1,
+        num_key_value_heads: 1,
+        ..SmolLM2Config::small_test()
+    };
     let max_seq = 16;
     let _hidden = config.hidden_size;
     let _kv_dim = config.kv_dim();
