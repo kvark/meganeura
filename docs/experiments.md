@@ -145,6 +145,38 @@ Inferena's [analysis](https://github.com/kvark/inferena/blob/experiment/p3hpc-ga
 The GPU interval also shrinks in a qualified Graphics capture, but PC sample
 shares are not executed-instruction counts or wall-time barrier costs.
 
+The later `experiment/conv-k-stage-2026-09-10` tags retain a negative result:
+doubling K staging to 32 passes the full oracles but regresses ResNet training
+33.340→36.834 ms across six paired processes, despite fewer barrier rounds.
+No global K change is justified. A separate cold-cache confirmation of constant
+native division amortizes its 2.757 s extra preparation after about 256 steps.
+
+## Parameter placement and host RAM — September 10
+
+Source-only `experiment/parameter-allocation-2026-09-10` tags in Inferena,
+Meganeura and Blade separate allocator rounding from actual memory placement.
+On this RTX 5070, the 1.7B strict-f32 plan requests about 9.4 GiB, but ordinary
+`Shared` allocation puts about 4.9 GiB of its bindings on the host heap.
+It is not an all-VRAM scaling point. The general device-parameter prototype
+retains named/original/packed weights and uses bounded 16 MiB upload staging.
+
+A four-arm diagnostic pilot and **one completed untraced pair** preserve the
+full prefill hash. The latter changes prefill 951.234→54.887 ms and stateless
+token 1941.822→16.282 ms with the same plan and kernels. Do not report this as
+a replicated speedup: subsequent confirmation was stopped as a precaution
+after NVIDIA mapping-allocation errors in the Shared control. The manifest
+remains incomplete. Further experiments use resident-only controls; no GPU
+reset, reboot or host OOM occurred in these bounded runs.
+
+The 360M control separates another issue: free-list allocation reduces buddy
+rounding but does not improve step time. Actual heap bindings, plan requests,
+allocator blocks and process-driver accounting answer different questions.
+Fresh qualified 135M/1.7B CUDA-Graph/Vulkan Systems pairs show that the remaining
+resident gap is chiefly GPU execution, not host encoding. They do not isolate
+barrier cost. Procedures, limitations and source pins are in Inferena's
+[analysis](https://github.com/kvark/inferena/blob/experiment/p3hpc-gap-2026-09-10/ANALYSIS.md#placement-and-allocation-ablation--september-10).
+The collection tag and paper tables remain unchanged.
+
 ## September tuning foundation
 
 These are development observations on RTX 5070 / driver 595.71.05, not updates

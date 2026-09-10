@@ -173,8 +173,10 @@ is a concrete next candidate: making immutable parameters compile-time constants
 improves ResNet training by about 1.28×; constant native division reaches about
 1.325× against the same untuned control. It is general by shape, not model or
 GPU name, but currently a source-level ablation rather than automatic selection.
-Cold driver preparation for the constants-only arm takes about 319 training
-steps to amortize. This supports widening the candidate space, not default-on
+Cold driver preparation takes about 319 training steps to amortize for constants
+alone, or 256 for constant native division. Doubling K staging passes validation
+but regresses the training step despite fewer barrier rounds. This supports
+widening the candidate space, not default-on
 search without cost accounting or qualification.
 
 The lean next step is to widen the existing generator's legal choices where
