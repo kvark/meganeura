@@ -272,6 +272,17 @@ The 1.7B combined arm has a 12.163 ms grouped GPU interval versus Torch's
 recording. Prefill retains a large GPU gap. These instrumented intervals are
 diagnostics, not replacements for the unprofiled table or a barrier-cost metric.
 
+The bounded `experiment/matmul-k-stage-2026-09-10` follow-up stops **before
+performance measurement**. K=8/16/32 passes existing shader/matmul/edge checks,
+but full-f64 screening at M=128, N=2048, K=2048 rejects all depths, including
+the original K=32: 2 ordinary and 10 tiny outputs out of 262144 exceed the
+unchanged bound. Complete output hashes agree across depths and output tiles;
+the pre-change binary has the same failures. This is a limit of the existing
+scalar reduction under the tight oracle, not a new staging regression or a
+failed whole-model gate. A matched-input IEEE-f32 Triton control has the same
+failure counts at both tiles. The experiment runner reports output identity and
+the first failure without retaining full arrays. No bound or default is changed.
+
 ## September tuning foundation
 
 These are development observations on RTX 5070 / driver 595.71.05, not updates
