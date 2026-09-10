@@ -92,7 +92,11 @@ fn parse_source(source: &str) -> Result<Module, naga::front::wgsl::ParseError> {
 }
 
 /// Experiment: bind an immutable, tightly packed u32 parameter block in WGSL.
-pub(crate) fn specialize_u32_params(shader: ShaderModule, values: &[u32]) -> ShaderModule {
+pub(crate) fn specialize_u32_params(
+    shader: ShaderModule,
+    values: &[u32],
+    native_division: bool,
+) -> ShaderModule {
     let (_, params) = shader
         .module
         .global_variables
@@ -117,10 +121,20 @@ pub(crate) fn specialize_u32_params(shader: ShaderModule, values: &[u32]) -> Sha
     let declaration = format!("var<uniform> params: {name};");
     assert_eq!(shader.source.matches(&declaration).count(), 1);
     let arguments = values.iter().map(|v| format!("{v}u")).collect::<Vec<_>>();
-    parse_wgsl(&shader.source.replace(
+    let mut source = shader.source.replace(
         &declaration,
         &format!("const params = {name}({});", arguments.join(", ")),
-    ))
+    );
+    if native_division {
+        assert_eq!(source.matches(crate::divisor::SHADER).count(), 1);
+        source = source.replace(
+            crate::divisor::SHADER,
+            "fn divide_exact(value: u32, divisor: u32, multiplier: u32) -> u32 {\n\
+                 return value / divisor;\n\
+             }\n",
+        );
+    }
+    parse_wgsl(&source)
 }
 
 /// Generate WGSL declarations and body for a fused epilogue chain.
