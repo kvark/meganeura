@@ -512,7 +512,9 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::MatMulBT => gen_matmul_bt(),
         ShaderGroup::MatMulATAdd => gen_matmul_at_add(),
         ShaderGroup::MatMulBTAdd => gen_matmul_bt_add(),
-        ShaderGroup::MatMulGemv => parse_wgsl(include_str!("shaders/matmul_gemv.wgsl")),
+        ShaderGroup::MatMulGemv => {
+            parse_wgsl(&gemv_width_source(include_str!("shaders/matmul_gemv.wgsl")))
+        }
         ShaderGroup::MatMulGemvAdd => parse_wgsl(include_str!("shaders/matmul_gemv_add.wgsl")),
         ShaderGroup::MatMulGemvBT => parse_wgsl(include_str!("shaders/matmul_gemv_bt.wgsl")),
         ShaderGroup::Reduce => parse_wgsl(include_str!("shaders/reduce.wgsl")),
@@ -1663,7 +1665,51 @@ pub fn generate_module_gemv_rmsnorm() -> ShaderModule {
             "        let a = matrix_a[kk];",
             "        let a = matrix_a[kk] * rs * norm_w[kk];",
         );
-    parse_wgsl(&src)
+    parse_wgsl(&gemv_width_source(&src))
+}
+
+fn gemv_width_source(source: &str) -> String {
+    let threads = match std::env::var("MEGANEURA_GEMV_THREADS") {
+        Err(_) => return source.to_owned(),
+        Ok(value) => value.parse::<u32>().expect("GEMV workgroup width"),
+    };
+    assert!(matches!(threads, 32 | 64 | 128 | 256));
+    if threads == 256 {
+        return source.to_owned();
+    }
+    let mut source = source
+        .replace(
+            "@workgroup_size(256)",
+            &format!("@workgroup_size({threads})"),
+        )
+        .replace(
+            "array<vec4<f32>, 256>",
+            &format!("array<vec4<f32>, {threads}>"),
+        )
+        .replace("array<f32, 256>", &format!("array<f32, {threads}>"))
+        .replace("kk += 256u;", &format!("kk += {threads}u;"))
+        .replace("si += 256u;", &format!("si += {threads}u;"))
+        .replace(
+            "var sstride = 128u;",
+            &format!("var sstride = {}u;", threads / 2),
+        );
+    let start = source
+        .find("    reduce_buf[lane] = acc;")
+        .expect("GEMV reduction");
+    let end = start
+        + source[start..]
+            .find("    if lane == 0u")
+            .expect("GEMV store");
+    let mut reduction = "    reduce_buf[lane] = acc;\n    workgroupBarrier();\n".to_owned();
+    let mut stride = threads / 2;
+    while stride > 1 {
+        reduction.push_str(&format!(
+            "    if lane < {stride}u {{ reduce_buf[lane] += reduce_buf[lane + {stride}u]; }}\n    workgroupBarrier();\n"
+        ));
+        stride /= 2;
+    }
+    source.replace_range(start..end, &reduction);
+    source
 }
 
 /// Q4 variant of the K-split GEMV, derived from the canonical shader by
