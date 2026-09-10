@@ -87,8 +87,9 @@ pub struct MemorySummary {
     pub allocated_buffer_bytes: usize,
     /// Number of physical allocations backing the logical buffers.
     pub num_allocations: usize,
-    /// Bytes placed in device-local (non-host-visible) memory —
-    /// step-local intermediates on discrete GPUs.
+    /// Physical-slot bytes requested with device-local policy.
+    /// This is not a query of backend-selected memory types; allocations
+    /// may fall back to a different heap.
     pub device_local_bytes: usize,
 }
 
