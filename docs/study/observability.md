@@ -250,7 +250,7 @@ events: verify both in the native tool, and preserve numeric qualification.
 The initial Nsight pilot had hardware-event overflow, so it cannot support a
 complete per-dispatch breakdown. GPU/host memory budgets must include the
 profiler, not just the model. See Inferena's
-[bounded workflow and evidence limits](https://github.com/kvark/inferena/blob/experiment/p3hpc-cuda-graphs/EXPERIMENT.md#nvidia-paper-analysis-captures).
+[bounded workflow and evidence limits](https://github.com/kvark/inferena/blob/experiment/p3hpc-gap-2026-09-10/EXPERIMENT.md#nvidia-paper-analysis-captures).
 
 The September 10 experiment demonstrates why the host timeline matters:
 sustained 135M token GPU time stays near 1.88 ms while CPU downclocking grows
@@ -260,6 +260,13 @@ frequency snapshots help interpret the change without pretending they are
 instruction-level counters. The [qualified diagnostic source](https://github.com/kvark/inferena/tree/experiment/host-latency-2026-09-10)
 also preserves negative affinity/utilization-hint controls. Power policy and
 warmup state belong in a latency comparison, including on a quiet machine.
+
+An accepted residual-add GEMV-width experiment illustrates the next step:
+ordinary paired runs confirm the gain, Systems localizes it on the GPU, and
+Graphics shows changed occupancy with the same register count. Workgroup-barrier
+occupancy actually increases while execution gets faster. These observations
+are complementary; none is a removable Vulkan-barrier percentage. See the
+[source-pinned result](../experiments.md#residual-add-gemv-width--september-10).
 
 `MemorySummary` separates plan capacities (including padding), graph
 allocations after aliasing, and actually allocated moments, accumulators and
