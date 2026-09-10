@@ -117,6 +117,34 @@ An interrupted 512 MiB exploratory cohort lacks its final manifest and is not
 the confirmation evidence above. These results supersede an overly broad
 negative reading of the earlier synthetic holdouts, not the frozen paper matrix.
 
+## Profile-guided convolution specialization — September 10
+
+Sources: `experiment/conv-specialization-2026-09-10` and
+`experiment/conv-native-division-2026-09-10` in Inferena and Meganeura. Qualified
+short Nsight Graphics traces concentrate ResNet training samples in scalar
+convolution indexing/staging. The experiment binds immutable u32 parameters
+as WGSL constants; a second arm uses native division with constant divisors.
+No model/card rule, changed summation order, relaxed gate or default promotion.
+
+Six fresh strict-f32 process pairs per arm give ResNet F+loss+backward medians
+44.153→34.444→33.329 ms (untuned / constants / constants plus native division).
+The roughly 1.28× / 1.325× gains clear the 5% plus paired-noise guard against
+untuned. All recorded output fields repeat exactly; the existing full-f64
+convolution regression oracles pass separately for both variants. Whisper's
+roughly 1% gain does not clear the guard. A separate 135M control is unchanged.
+
+For constants alone, six fresh-driver-cache pairs confirm the gain but add
+3.067 s preparation: about 319 training steps to amortize, versus about twelve
+with warm driver caches. The prototype compiles fallback and exact pipelines;
+these are implementation ablations, not automated per-class selection. Run
+`scripts/tune_study.py --models ResNet-50 Whisper-tiny --variants untuned
+fixed-params fixed-native-div --replicates 6 --output <new-dir>` at the later
+Inferena tag; the earlier tag supports `untuned fixed-params` and
+`--fresh-driver-cache`. Native-tool methodology and attribution limits are in
+Inferena's [analysis](https://github.com/kvark/inferena/blob/experiment/p3hpc-gap-2026-09-10/ANALYSIS.md).
+The GPU interval also shrinks in a qualified Graphics capture, but PC sample
+shares are not executed-instruction counts or wall-time barrier costs.
+
 ## September tuning foundation
 
 These are development observations on RTX 5070 / driver 595.71.05, not updates
