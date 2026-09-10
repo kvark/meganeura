@@ -229,6 +229,49 @@ The first plain/RMSNorm GEMV-width pilot finds no broad win and does not vary
 the residual-add hotspot. Detailed controls and limits stay in Inferena's
 [analysis](https://github.com/kvark/inferena/blob/experiment/p3hpc-gap-2026-09-10/ANALYSIS.md#host-side-latency-transient).
 
+## Residual-add GEMV width — September 10
+
+The source-only `experiment/gemv-add-width-2026-09-10` tags in Inferena and
+Meganeura vary the residual-add hotspot separately, using the same general
+32/64/128/256-thread generator. A 24-process pilot selects 128 for confirmation;
+it is not a model/card rule or automatic production selection. All other
+kernels and the grouped schedule stay fixed. The subsequent 54-process cohort
+uses six replicates, all six three-arm orders, resident parameters, streamed
+weights, 100 warmups and 100 retained samples, without profiling.
+
+| Stateless token, median ms | Original 32 threads | 128 threads | 128 + unpacked weights |
+|---|---:|---:|---:|
+| SmolLM2-135M | 3.586 | 2.984 | 2.912 |
+| SmolLM2-360M | 5.368 | 4.714 | 4.828 |
+| SmolLM2-1.7B | 16.314 | 15.520 | 13.738 |
+
+Width alone clears the 5% plus paired-noise guard on 135M/360M (1.20×/1.14×),
+but not 1.7B. The combined arm clears it on all three; its 1.7B gain is 1.19×.
+Prefill does not materially change. Some token windows retain CPU-related
+drift; no samples are removed. These are this host's process-level observations,
+not a cross-platform policy or replacement paper data.
+
+All prefill output records match exactly. Changed reduction order changes token
+hashes between widths, but each variant repeats exactly across processes and
+full token/prefill-prefix relative L2 stays below 1.64e-5. Existing shader,
+GEMV parity and broad smoke tests pass, as do 217,792 full-f64 ordinary/tiny
+output checks. No validation bound is weakened or new regression file added.
+
+Reproduce with `scripts/tune_study.py --models SmolLM2-135M SmolLM2-360M
+SmolLM2-1.7B --variants untuned gemv-add128 unpacked-gemv-add128 --replicates 6
+--stream-weights --resident --warmup-runs 100 --measurement-runs 100
+--output <new-dir>` under the documented memory guard. Incorporating these
+legal choices into bounded per-class selection is separate engineering work;
+the current production tuner excludes GEMV.
+
+Qualified Systems and short Graphics controls independently localize the 135M
+improvement on the GPU. Systems' grouped token interval falls 1.877→1.389 ms;
+the Graphics residual-add pipeline's reported resident-warp limit rises 24→48.
+The 1.7B combined arm has a 12.163 ms grouped GPU interval versus Torch's
+11.506 ms first-to-last-kernel span, but still pays substantial CPU command
+recording. Prefill retains a large GPU gap. These instrumented intervals are
+diagnostics, not replacements for the unprofiled table or a barrier-cost metric.
+
 ## September tuning foundation
 
 These are development observations on RTX 5070 / driver 595.71.05, not updates

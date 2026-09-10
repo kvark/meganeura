@@ -55,6 +55,15 @@ prefill by 1.092× on the RTX 5070, repaying 85 ms extra preparation after about
 This supports compilation-time search with explicit amortization, not universal
 default-on tuning. Outputs repeat exactly in both six-pair AB/BA cohorts.
 
+The later [profile-guided experiments](../experiments.md#residual-add-gemv-width--september-10)
+identify useful choices outside that narrow tile space: immutable convolution
+parameters, residual-add GEMV workgroup width and retaining unpacked weights.
+These yield confirmed whole-model gains on this device, but are still explicit
+ablation arms. The next integration should add compact legal candidates to
+measured selection, not promote the winning constants or GPU/model-name rules.
+Representation choices also change allocation plans and need a wider contract
+than the current fixed-plan kernel tuner.
+
 ## The objective
 
 Win useful workloads under a matched numerical and workload contract, without
