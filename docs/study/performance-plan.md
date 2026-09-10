@@ -168,6 +168,15 @@ repay the budget, not just isolated kernel winners. An eventual persistent
 cache must include device/driver, generator, exact class and validation contract;
 it must not transfer a winner merely because a marketing name matches.
 
+The [profile-guided convolution experiment](../experiments.md#profile-guided-convolution-specialization--september-10)
+is a concrete next candidate: making immutable parameters compile-time constants
+improves ResNet training by about 1.28×; constant native division reaches about
+1.325× against the same untuned control. It is general by shape, not model or
+GPU name, but currently a source-level ablation rather than automatic selection.
+Cold driver preparation for the constants-only arm takes about 319 training
+steps to amortize. This supports widening the candidate space, not default-on
+search without cost accounting or qualification.
+
 The lean next step is to widen the existing generator's legal choices where
 profiles justify them, reuse exact classes, and allocate a bounded preparation
 budget. Do not enumerate the cross-product of every graph rewrite and tile or
