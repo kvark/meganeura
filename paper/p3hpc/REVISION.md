@@ -9,9 +9,13 @@ September 10: the deployment discussion now connects short specialization to
 bounded on-device search, with a [study explanation](../../docs/study/performance-plan.md#cheap-compilation-as-a-search-budget).
 It distinguishes today's opt-in, post-rewrite kernel selection from joint
 graph-and-kernel search and keeps it outside the frozen matrix. Neither a
-100 µs end-to-end compile nor a 10,000× Triton advantage is claimed. Those
-boundaries and amortized whole-step gains need matched measurements before
-making this the paper's central performance result.
+100 µs end-to-end compile nor a 10,000× Triton advantage is claimed. The
+[stage experiment](../../docs/experiments.md#compiler-stages--september-10)
+now measures 141–172 µs median WGSL parsing on three actual workloads, separately
+charging native driver compilation and reporting cold/reused-cache controls.
+It is a serial compilation diagnostic, not a replacement for the frozen tables
+or the new collection cohort. Full-model tuning/amortization is being measured
+separately before deciding how much experimental weight to give this argument.
 
 The follow-up states the positive architectural argument explicitly: empirical
 tuning runs automatically inside session construction when enabled, without a
