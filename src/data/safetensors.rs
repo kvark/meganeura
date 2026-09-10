@@ -280,13 +280,10 @@ impl SafeTensorsModel {
         let data = self.tensor_f32_auto(name)?;
         let rows = info.shape[0];
         let cols = info.shape[1];
-        let mut transposed = vec![0.0_f32; rows * cols];
-        for r in 0..rows {
-            for c in 0..cols {
-                transposed[c * rows + r] = data[r * cols + c];
-            }
-        }
-        Ok(transposed)
+        let tile = std::env::var("MEGANEURA_TRANSPOSE_TILE")
+            .map(|value| value.parse().expect("transpose tile size"))
+            .unwrap_or(0);
+        Ok(super::transpose::transpose(&data, rows, cols, tile))
     }
 
     /// Read a tensor as f32 and transpose it from (rows, cols) to (cols, rows).
@@ -314,12 +311,9 @@ impl SafeTensorsModel {
         let data = self.tensor_f32(name)?;
         let rows = info.shape[0];
         let cols = info.shape[1];
-        let mut transposed = vec![0.0_f32; rows * cols];
-        for r in 0..rows {
-            for c in 0..cols {
-                transposed[c * rows + r] = data[r * cols + c];
-            }
-        }
-        Ok(transposed)
+        let tile = std::env::var("MEGANEURA_TRANSPOSE_TILE")
+            .map(|value| value.parse().expect("transpose tile size"))
+            .unwrap_or(0);
+        Ok(super::transpose::transpose(&data, rows, cols, tile))
     }
 }

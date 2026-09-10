@@ -9,6 +9,7 @@
 
 pub mod mnist;
 pub mod safetensors;
+mod transpose;
 
 pub use mnist::MnistDataset;
 
