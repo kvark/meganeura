@@ -71,6 +71,52 @@ stage counts/times. Traces, caches and raw records stay outside Git. Cheap
 Naga processing is measured and supports an on-device search budget; driver
 compilation, qualification and whole-step amortization still must be charged.
 
+The narrower `experiment/compiler-gemm-2026-09-10` Inferena tag compares f32
+GEMMs with M=128, N=576, K=576/1536, output tiles 32/64, K tile 32 and 256
+threads. Both retain runtime dimensions and IEEE f32 multiplication; generated
+instructions/layouts need not be identical. Run `scripts/gemm_compile_study.py
+--output <new-dir>`, then a separate cohort with `--warm-compiler`. The latter
+compiles/loads the opposite tile first and reports that warmup separately.
+
+Across three processes per cell, a new candidate after compiler warmup takes
+**30.8–31.2 ms native versus 100.4–166.6 ms Triton**, including native pipeline
+creation or cubin compilation/launcher loading. Native Naga stages total about
+0.35–0.41 ms; the Vulkan driver accounts for about 30.4–30.7 ms. Reused private
+disk caches give 0.43–0.52 versus 0.72–0.87 ms. First compiler use is separately
+38.1–38.4 versus 375–442 ms; Triton's first-use initialization also appears on
+cache hits. Allocation, execution and validation are outside these preparation
+intervals. All 96 primary processes pass full-output f64 checks on ordinary and
+tiny inputs, using the tuner's unchanged bound. This matched-domain microstudy
+supports a roughly 3.2–5.4× cold-candidate preparation advantage here, not
+10,000× or a kernel-performance claim.
+
+## Full-model tuning — September 10
+
+Sources: Inferena `experiment/tune-full-models-2026-09-10` and
+`experiment/tune-smollm-confirm-2026-09-10`, pinning the compiler-stage revisions
+above. Strict f32 on the same RTX 5070, real Inferena shapes/weights, grouped
+unprofiled execution, five warmups and twenty samples per fresh process.
+Run `scripts/tune_study.py --output <new-dir>`; confirmation adds
+`--models SmolLM2-135M SmolLM2-360M --variants untuned default --replicates 6`.
+All kernel qualification and whole-model numerical gates remain unchanged.
+
+The six-pair AB/BA confirmation finds **1.092× SmolLM2-135M prefill speedup**:
+12.699→11.628 ms medians, with median paired gain 1.068 ms versus twice its MAD
+0.011 ms. Three exact classes switch 64→32 tiles, affecting 90 dispatches.
+Median extra preparation is 85 ms: about **80 prefills to amortize**. Outputs
+repeat exactly across all twelve runs. Stateless-token dispatches have no
+eligible classes and do not benefit. SmolLM2-360M retains every tile: no guarded
+gain, with 224 ms extra preparation. Its outputs also repeat exactly.
+
+A separate three-process, three-model cohort widens the search to 128 classes
+and 60 seconds, retaining the 64 MiB scratch cap. ResNet training changes
+44.049→42.202 ms medians, below the 5% whole-step guard, while preparation grows
+0.712→6.629 s. Two convolution classes reject output qualification. Whisper
+shows negligible whole-step benefit. No tolerance is relaxed or default changed.
+An interrupted 512 MiB exploratory cohort lacks its final manifest and is not
+the confirmation evidence above. These results supersede an overly broad
+negative reading of the earlier synthetic holdouts, not the frozen paper matrix.
+
 ## September tuning foundation
 
 These are development observations on RTX 5070 / driver 595.71.05, not updates
