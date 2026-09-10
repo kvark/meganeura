@@ -346,6 +346,8 @@ pub fn generate_matmul_with_epilogue(
             a_col,
             b_row,
             b_col,
+            tile_row: "wgid.y + wgid.z * params._pad",
+            c_idx: "row * params.n + col",
         },
         fused_decl,
         fused_expr,
@@ -401,6 +403,9 @@ pub enum ShaderGroup {
     MatMulAdd,
     MatMulAT,
     MatMulBT,
+    BlockMatMul,
+    BlockMatMulAT,
+    BlockMatMulBT,
     MatMulATAdd,
     MatMulBTAdd,
     /// M=1 matmul (GEMV): `C[1,N] = A[1,K] × B[K,N]`. One thread per
@@ -511,6 +516,9 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::MatMulAdd => gen_matmul_add(),
         ShaderGroup::MatMulAT => gen_matmul_at(),
         ShaderGroup::MatMulBT => gen_matmul_bt(),
+        ShaderGroup::BlockMatMul | ShaderGroup::BlockMatMulAT | ShaderGroup::BlockMatMulBT => {
+            gen_block_matmul(group, MatMulTile::Large)
+        }
         ShaderGroup::MatMulATAdd => gen_matmul_at_add(),
         ShaderGroup::MatMulBTAdd => gen_matmul_bt_add(),
         ShaderGroup::MatMulGemv => parse_wgsl(&gemv_width_source(
@@ -797,33 +805,27 @@ const MATMUL_B_BT: &str = "b_col * params.k + b_row"; // B^T[k,n] = B[n*K+k]
 
 /// Thread-to-tile mapping for coalesced global memory access.
 ///
-/// For row-major A[M,K]: K is the fast dimension → col = flat%16 (fast)
-/// For transposed A[K,M]: M is the fast dimension → row = flat%64 (fast)
-/// For row-major B[K,N]: N is the fast dimension → col = flat%64 (fast)
-/// Large-tile (64×64) load mappings — BM=64, BN=64, KTILE=32
-/// A tile: [64, 32] = 2048 elements, 8 per thread
-/// B tile: [32, 64] = 2048 elements, 8 per thread
-/// For transposed B[N,K]: K is the fast dimension → row = flat%32 (fast)
-const A_ROW_FWD: &str = "flat / 32u"; // M varies slowly (good for [M,K])
-const A_COL_FWD: &str = "flat % 32u"; // K varies fast (coalesced in [M,K])
+/// Large-tile (64×64) load mappings. Adjacent threads follow each operand's
+/// fast dimension: the selected K extent for A[M,K] and B[N,K], or the
+/// output tile width for A[K,M] and B[K,N].
+const A_ROW_FWD: &str = "flat / $K_TILE_U"; // M varies slowly (good for [M,K])
+const A_COL_FWD: &str = "flat % $K_TILE_U"; // K varies fast (coalesced in [M,K])
 const A_ROW_AT: &str = "flat % 64u"; // M varies fast (coalesced in [K,M])
 const A_COL_AT: &str = "flat / 64u"; // K varies slowly
 const B_ROW_FWD: &str = "flat / 64u"; // K varies slowly (good for [K,N])
 const B_COL_FWD: &str = "flat % 64u"; // N varies fast (coalesced in [K,N])
-const B_ROW_BT: &str = "flat % 32u"; // K varies fast (coalesced in [N,K])
-const B_COL_BT: &str = "flat / 32u"; // N varies slowly
+const B_ROW_BT: &str = "flat % $K_TILE_U"; // K varies fast (coalesced in [N,K])
+const B_COL_BT: &str = "flat / $K_TILE_U"; // N varies slowly
 
-// Small-tile (32×32) load mappings — BM=32, BN=32, KTILE=32
-// A tile: [32, 32] = 1024 elements, 4 per thread
-// B tile: [32, 32] = 1024 elements, 4 per thread
-const A_ROW_FWD_S: &str = "flat / 32u"; // M slow, K fast
-const A_COL_FWD_S: &str = "flat % 32u";
+// Small-tile (32×32) load mappings use the same K extent.
+const A_ROW_FWD_S: &str = A_ROW_FWD; // M slow, K fast
+const A_COL_FWD_S: &str = A_COL_FWD;
 const A_ROW_AT_S: &str = "flat % 32u"; // M fast (coalesced for [K,M])
 const A_COL_AT_S: &str = "flat / 32u";
 const B_ROW_FWD_S: &str = "flat / 32u"; // K slow
 const B_COL_FWD_S: &str = "flat % 32u"; // N fast
-const B_ROW_BT_S: &str = "flat % 32u"; // K fast (coalesced for [N,K])
-const B_COL_BT_S: &str = "flat / 32u";
+const B_ROW_BT_S: &str = B_ROW_BT; // K fast (coalesced for [N,K])
+const B_COL_BT_S: &str = B_COL_BT;
 
 fn matmul_vars(
     a_idx: &str,
@@ -1075,6 +1077,8 @@ fn matmul_vars_full(
             a_col,
             b_row,
             b_col,
+            tile_row: "wgid.y + wgid.z * params._pad",
+            c_idx: "row * params.n + col",
         },
         fused_decl,
         fused_expr,
@@ -1101,6 +1105,8 @@ struct MatMulIndexing<'a> {
     a_col: &'a str,
     b_row: &'a str,
     b_col: &'a str,
+    tile_row: &'a str,
+    c_idx: &'a str,
 }
 
 fn matmul_vars_tiled(
@@ -1118,6 +1124,8 @@ fn matmul_vars_tiled(
         a_col,
         b_row,
         b_col,
+        tile_row,
+        c_idx,
     } = indexing;
     let MatMulOptions {
         format: b_mode,
@@ -1198,18 +1206,6 @@ fn matmul_vars_tiled(
     } else {
         32
     };
-    let k_row = format!("flat / {k_tile}u");
-    let k_col = format!("flat % {k_tile}u");
-    let (a_row, a_col) = if a_idx == MATMUL_A_FWD {
-        (k_row.as_str(), k_col.as_str())
-    } else {
-        (a_row, a_col)
-    };
-    let (b_row, b_col) = if b_idx == MATMUL_B_BT {
-        (k_col.as_str(), k_row.as_str())
-    } else {
-        (b_row, b_col)
-    };
     let interleave_columns = b_mode == WeightFormat::F32
         && std::env::var("MEGANEURA_INTERLEAVE_COLUMNS").as_deref() == Ok("1");
     let (acc_decl, compute_body, acc_array) = tiled_matmul_body(tile, k_tile, interleave_columns);
@@ -1230,6 +1226,8 @@ fn matmul_vars_tiled(
             ("$B_DEQUANT_FN", &b_dequant_fn),
             ("$A_INDEX", a_idx),
             ("$B_INDEX", b_idx),
+            ("$TILE_ROW", tile_row),
+            ("$C_INDEX", c_idx),
             ("$A_ROW", a_row),
             ("$A_COL", a_col),
             ("$B_ROW", b_row),
@@ -1359,6 +1357,8 @@ fn matmul_small_vars(
             a_col,
             b_row,
             b_col,
+            tile_row: "wgid.y + wgid.z * params._pad",
+            c_idx: "row * params.n + col",
         },
         fused_decl,
         fused_expr,
@@ -1538,12 +1538,60 @@ fn gen_matmul_at() -> ShaderModule {
 /// so the tiling does not multiply the group enum.
 pub fn generate_module_small(group: ShaderGroup) -> ShaderModule {
     match group {
+        ShaderGroup::BlockMatMul | ShaderGroup::BlockMatMulAT | ShaderGroup::BlockMatMulBT => {
+            gen_block_matmul(group, MatMulTile::Small)
+        }
         ShaderGroup::MatMul => gen_matmul_small(),
         ShaderGroup::MatMulAdd => gen_matmul_small_add(),
         ShaderGroup::MatMulAT => gen_matmul_small_at(),
         ShaderGroup::MatMulBT => gen_matmul_small_bt(),
         _ => generate_module(group),
     }
+}
+
+fn gen_block_matmul(group: ShaderGroup, tile: MatMulTile) -> ShaderModule {
+    let (ordinary, a_idx, b_idx, c_idx) = match group {
+        ShaderGroup::BlockMatMul => (
+            ShaderGroup::MatMul,
+            "(a_row * params._pad + wgid.z) * params.k + a_col",
+            "(wgid.z * params.k + b_row) * params.n + b_col",
+            "(row * params._pad + wgid.z) * params.n + col",
+        ),
+        ShaderGroup::BlockMatMulAT => (
+            ShaderGroup::MatMulAT,
+            "(a_col * params._pad + wgid.z) * params.m + a_row",
+            "(b_row * params._pad + wgid.z) * params.n + b_col",
+            "(wgid.z * params.m + row) * params.n + col",
+        ),
+        ShaderGroup::BlockMatMulBT => (
+            ShaderGroup::MatMulBT,
+            "(a_row * params._pad + wgid.z) * params.k + a_col",
+            "(wgid.z * params.n + b_col) * params.k + b_row",
+            "(row * params._pad + wgid.z) * params.n + col",
+        ),
+        _ => unreachable!(),
+    };
+    let (a_row, a_col, b_row, b_col) = epilogue_stage_maps(ordinary, tile);
+    matmul_vars_tiled(
+        MatMulIndexing {
+            a_idx,
+            b_idx,
+            a_row,
+            a_col,
+            b_row,
+            b_col,
+            tile_row: "wgid.y",
+            c_idx,
+        },
+        "",
+        "",
+        "",
+        "",
+        MatMulOptions {
+            format: WeightFormat::F32,
+            tile,
+        },
+    )
 }
 
 pub fn generate_module_weighted(group: ShaderGroup, format: WeightFormat) -> ShaderModule {
@@ -5437,6 +5485,15 @@ mod tests {
             (ShaderGroup::MatMulAdd, naga::valid::Capabilities::empty()),
             (ShaderGroup::MatMulAT, naga::valid::Capabilities::empty()),
             (ShaderGroup::MatMulBT, naga::valid::Capabilities::empty()),
+            (ShaderGroup::BlockMatMul, naga::valid::Capabilities::empty()),
+            (
+                ShaderGroup::BlockMatMulAT,
+                naga::valid::Capabilities::empty(),
+            ),
+            (
+                ShaderGroup::BlockMatMulBT,
+                naga::valid::Capabilities::empty(),
+            ),
             (ShaderGroup::MatMulATAdd, naga::valid::Capabilities::empty()),
             (ShaderGroup::MatMulBTAdd, naga::valid::Capabilities::empty()),
             (ShaderGroup::MatMulGemv, naga::valid::Capabilities::empty()),
@@ -5833,6 +5890,9 @@ mod tests {
             (ShaderGroup::MatMulAdd, empty),
             (ShaderGroup::MatMulAT, empty),
             (ShaderGroup::MatMulBT, empty),
+            (ShaderGroup::BlockMatMul, empty),
+            (ShaderGroup::BlockMatMulAT, empty),
+            (ShaderGroup::BlockMatMulBT, empty),
             (ShaderGroup::MatMulATAdd, empty),
             (ShaderGroup::MatMulBTAdd, empty),
             (ShaderGroup::Reduce, empty),
@@ -5942,6 +6002,9 @@ mod tests {
         // builtin args are not bound by blade and can be ignored.
         fn expected_globals(entry: &ShaderEntry) -> Vec<&'static str> {
             match *entry {
+                ShaderEntry::BlockMatMul
+                | ShaderEntry::BlockMatMulAT
+                | ShaderEntry::BlockMatMulBT => vec!["matrix_a", "matrix_b", "matrix_c", "params"],
                 ShaderEntry::MatMul
                 | ShaderEntry::MatMulAT
                 | ShaderEntry::MatMulBT
@@ -6113,6 +6176,9 @@ mod tests {
         }
 
         let entries = [
+            ShaderEntry::BlockMatMul,
+            ShaderEntry::BlockMatMulAT,
+            ShaderEntry::BlockMatMulBT,
             ShaderEntry::MatMul,
             ShaderEntry::MatMulAT,
             ShaderEntry::MatMulBT,

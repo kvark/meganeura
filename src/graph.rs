@@ -107,6 +107,14 @@ pub enum Op {
     MatMulAT,
     // MatMulBT: C = A @ B^T  (A stored as [M,K], B stored as [N,K], C is [M,N])
     MatMulBT,
+    /// Independent column-block products: `[M, G*K] × [G, K, N] → [M, G*N]`.
+    BlockMatMul,
+    /// `[K, G*M]ᵀ × [K, G*N] → [G, M, N]`, independently per block.
+    BlockMatMulAT {
+        groups: usize,
+    },
+    /// `[M, G*K] × [G, N, K]ᵀ → [M, G*N]`, independently per block.
+    BlockMatMulBT,
     Add,
     Mul,
 
@@ -1094,6 +1102,65 @@ impl Graph {
         assert_eq!(a_shape[1], b_shape[1], "MatMulBT: K dimensions must match");
         let ty = TensorType::f32(vec![a_shape[0], b_shape[0]]);
         self.add_node(Op::MatMulBT, vec![a, b], ty)
+    }
+
+    /// Multiply independent column blocks without slicing or transposing storage.
+    /// A is `[M, G*K]`, B is `[G, K, N]`, and C is `[M, G*N]`. F32 only.
+    #[track_caller]
+    pub fn block_matmul(&mut self, a: NodeId, b: NodeId) -> NodeId {
+        self.block_matmul_impl(a, b, false)
+    }
+
+    /// Per-block input-transposed product, used for block-weight gradients.
+    /// A is `[K, G*M]`, B is `[K, G*N]`, and C is `[G, M, N]`. F32 only.
+    #[track_caller]
+    pub fn block_matmul_at(&mut self, a: NodeId, b: NodeId, groups: usize) -> NodeId {
+        let a_ty = &self.node(a).ty;
+        let b_ty = &self.node(b).ty;
+        assert_eq!(a_ty.dtype, DType::F32, "block matmul requires F32");
+        assert_eq!(b_ty.dtype, DType::F32, "block matmul requires F32");
+        assert_eq!(a_ty.rank(), 2, "block_matmul_at requires 2D inputs");
+        assert_eq!(b_ty.rank(), 2, "block_matmul_at requires 2D inputs");
+        assert!(groups > 0, "block matmul requires nonempty groups");
+        assert!(a_ty.shape.iter().chain(&b_ty.shape).all(|&d| d > 0));
+        assert_eq!(a_ty.shape[0], b_ty.shape[0], "block reduction sizes differ");
+        assert_eq!(a_ty.shape[1] % groups, 0, "incomplete A blocks");
+        assert_eq!(b_ty.shape[1] % groups, 0, "incomplete B blocks");
+        let ty = TensorType::f32(vec![groups, a_ty.shape[1] / groups, b_ty.shape[1] / groups]);
+        self.add_node(Op::BlockMatMulAT { groups }, vec![a, b], ty)
+    }
+
+    /// Per-block weight-transposed product, used for block-input gradients.
+    /// A is `[M, G*K]`, B is `[G, N, K]`, and C is `[M, G*N]`. F32 only.
+    #[track_caller]
+    pub fn block_matmul_bt(&mut self, a: NodeId, b: NodeId) -> NodeId {
+        self.block_matmul_impl(a, b, true)
+    }
+
+    #[track_caller]
+    fn block_matmul_impl(&mut self, a: NodeId, b: NodeId, transpose_b: bool) -> NodeId {
+        let a_ty = &self.node(a).ty;
+        let b_ty = &self.node(b).ty;
+        assert_eq!(a_ty.dtype, DType::F32, "block matmul requires F32");
+        assert_eq!(b_ty.dtype, DType::F32, "block matmul requires F32");
+        assert_eq!(a_ty.rank(), 2, "block matmul requires 2D activations");
+        assert_eq!(b_ty.rank(), 3, "block matmul requires 3D weights");
+        assert!(a_ty.shape.iter().chain(&b_ty.shape).all(|&d| d > 0));
+        let groups = b_ty.shape[0];
+        let inner = b_ty.shape[if transpose_b { 2 } else { 1 }];
+        let columns = b_ty.shape[if transpose_b { 1 } else { 2 }];
+        assert_eq!(
+            a_ty.shape[1],
+            groups.checked_mul(inner).unwrap(),
+            "block widths differ"
+        );
+        let ty = TensorType::f32(vec![a_ty.shape[0], groups.checked_mul(columns).unwrap()]);
+        let op = if transpose_b {
+            Op::BlockMatMulBT
+        } else {
+            Op::BlockMatMul
+        };
+        self.add_node(op, vec![a, b], ty)
     }
 
     #[track_caller]

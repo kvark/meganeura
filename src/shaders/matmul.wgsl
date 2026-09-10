@@ -11,7 +11,8 @@
 //
 // Template variables: BM_U/TM_U/B_STRIDE_U/STAGE_EPT_U and shared sizes
 // (tile geometry), A_INDEX/B_INDEX (global index), A_ROW/COL, B_ROW/COL
-// (tile mapping), ACC_DECL/COMPUTE_BODY/ACC_ARRAY (generated unrolls),
+// (tile mapping), TILE_ROW/C_INDEX (dispatch/storage layout),
+// ACC_DECL/COMPUTE_BODY/ACC_ARRAY (generated unrolls),
 // FUSED_ADD_DECL/STORE_BODY (addend/epilogue), B_* (weight format).
 
 $ENABLE_F16
@@ -35,7 +36,7 @@ $B_DEQUANT_FN
 fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let tx = lid.x;
     let ty = lid.y;
-    let tile_row = (wgid.y + wgid.z * params._pad) * $BM_U;
+    let tile_row = ($TILE_ROW) * $BM_U;
     let tile_col = wgid.x * $BM_U;
     let tid = ty * 16u + tx;
 
@@ -77,7 +78,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             let row = tile_row + ty * $TM_U + i;
             let col = tile_col + $OUTPUT_COLUMN;
             if row < params.m && col < params.n {
-                let idx = row * params.n + col;
+                let idx = $C_INDEX;
                 $STORE_BODY
             }
         }

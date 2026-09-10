@@ -34,6 +34,9 @@ name = "gemma_inference_ops"
 name = "shared_parameters"
 
 [[test]]
+name = "block_matmul"
+
+[[test]]
 name = "sd_unet_coop_parity"
 
 [features]
