@@ -266,6 +266,15 @@ These fields are not a driver allocation or peak measurement. See the
 [checkpoint/memory chapter](checkpoints-and-memory.md) for the field map,
 restore-error guarantees and qualification tests.
 
+The [September 10 placement experiment](../experiments.md#parameter-placement-and-host-ram--september-10)
+shows why this matters: a 9.4 GiB 1.7B plan can have roughly 4.9 GiB of bindings
+on the host heap. `Memory::Device` is a backend preference, not proof of a
+selected heap. Compare actual memory-type properties and allocator block sizes
+in native traces; do not interpret a planned device-local count as residency.
+On Linux, NVIDIA's freed host-page pools can also be reclaimable without being
+counted as reclaimable by `MemAvailable`. A process cgroup may not charge every
+driver-pinned page, so bounded captures need global headroom monitoring too.
+
 `device_memory_stats` reports a broader API-level process
 view; it does not establish system-wide pressure, fragmentation or peak
 allocation history. Compare the same quantity and measurement boundary across
