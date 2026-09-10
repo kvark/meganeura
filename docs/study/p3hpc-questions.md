@@ -124,12 +124,13 @@ extend the relevant physical/lifetime contract.
 
 ### 12. How much autotuning exists now?
 
-Short: an opt-in exact-shape search over scalar and legal native-f32
-cooperative matmul tiles, using private scratch. Scalar GPU qualification has
-passed; this is new engineering, not part of the frozen paper's results.
+Short: opt-in measured kernel selection runs inside `build`, before it returns
+a ready session. A real 135M prefill experiment gains 1.092×; this is development
+evidence, not part of the frozen paper's results.
 
-Detail: legal implementations can win regardless of the initial occupancy or
-native-8 large-shape profitability threshold;
+Detail: exact classes cover scalar matmul/convolution tiles and eligible
+native-f32 cooperative matmuls. Legal implementations can win regardless of
+the initial occupancy or native-8 large-shape profitability threshold;
 qualification, paired samples, a noise guard and resource bounds are explicit.
 It replaces the state-mutating family demotion tuner. Native padding must fit
 existing allocations. F16-input/complex-fusion/GEMV search, persistent winners
@@ -138,26 +139,14 @@ qualification needs a different device: our RTX 5070 advertises f16 tiles only.
 Capability probing is named `auto_tune` but does not time kernels. Neither
 this new search nor new speedups are part of the frozen paper evidence.
 
-The [separate five-process transfer pilot](../experiments.md#tuning-2026-09-05)
-shows 1.15×/1.13× whole-step gains on two synthetic chains and unchanged choices
-on two smaller ones. Search amortizes over roughly 1,600–2,850 steps in the
-winning cases; do not turn that into a general model or PyTorch claim.
-
-The [six-case holdouts](../experiments.md#holdouts-2026-09-06) then tested
-inference, Adam, SGD and F+L+B across five processes. All full control-session
-tensor/state comparisons passed through step 78, but none cleared the whole-step
-guard. An unchanged ResNet control even showed a misleading 1.071× ratio of
-medians, rejected by the paired-gain gate. The honest conclusion is stronger
-state evidence and limited transfer, not “automatic tuning makes training
-faster.” More representative kernel families and controlled confirmation come
-before default-on or persistent winners.
-
-This is not a negative result across the paper's models and platforms. The
-tests used one RTX 5070 and a narrow tile search, not the full Inferena matrix;
-the role-reversed dense follow-up accepted a 1.177× whole-step gain. Greedy
-rewriting is shared by both arms: empirical kernel selection augments it,
-rather than competing with it. Broader search and cross-device transfer have
-not been measured.
+The [six-pair full-model confirmation](../experiments.md#full-model-tuning--september-10)
+changes 135M prefill from 12.699 to 11.628 ms, with 85 ms extra preparation:
+about 80 prefills to amortize. Recorded outputs repeat exactly. The 360M control
+finds no qualifying gain; expanded ResNet/Whisper searches do not clear the
+whole-step guard. Earlier synthetic holdouts were mixed, not an all-model or
+all-platform negative result. More legal choices and cross-device confirmation
+are needed before default-on search. Both arms retain the same greedy rewrites;
+measured kernel selection augments graph optimization rather than replacing it.
 
 For the paper's proposed compile-and-tune emphasis, see
 [cheap compilation as a search budget](performance-plan.md#cheap-compilation-as-a-search-budget).
@@ -165,10 +154,11 @@ One preparation API already combines the stages, but graph rewriting and
 kernel selection are not a joint search today. Naga-only timing is not
 end-to-end pipeline preparation, and low compilation cost alone does not
 establish tuning amortization or novelty over TVM/Triton.
-We should emphasize the integrated compile-and-tune deployment workflow and
-measure the inexpensive Naga stage explicitly. Native driver compilation is
-an additional cost to report, not a reason to suppress that architectural
-argument or the value of cheap candidate generation.
+We now measure 141–172 µs median WGSL parsing, and about 31 ms native versus
+100–167 ms Triton for another cold GEMM candidate after compiler warmup.
+The latter includes native compilation/loading, not only translation. Emphasize
+the integrated workflow and measured frontend advantage; do not call either
+measurement a 10,000× end-to-end advantage or an invention of autotuning.
 
 ## Numerical behavior
 
