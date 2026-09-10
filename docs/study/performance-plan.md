@@ -83,6 +83,59 @@ The diagnostic's old fixed barrier-cost estimate was removed. The absence of
 matches in its narrow legacy fusion matcher does not establish absence of
 optimization opportunities.
 
+## Cheap compilation as a search budget
+
+Suggested paper/talk framing: **a compact compiler makes hardware measurement
+part of on-device executable preparation, under one numerical contract**.
+Fast specialization is useful both for deployment startup and for trying legal
+implementations before committing to a plan. This is a stronger design argument
+than code size alone, but a hypothesis about broader performance gains, not a
+new result in the frozen matrix.
+
+We already have one preparation entry point: `SessionConfig { tune: true }`
+runs measured selection before `build` returns, including on a semantic-cache
+hit. It is not yet joint graph-and-kernel search: greedy graph rewrites and the
+allocation plan are fixed before the tuner compares compatible implementations.
+The selected variants live only in that session. `runtime::auto_tune` is a
+capability probe, not this measured search.
+
+The proposed **100 µs Naga / 10,000× Triton** comparison is not established by
+our records. Naga parses, validates and translates shaders; Blade still asks
+the native driver to create executable pipelines. Comparing Naga alone with
+Triton's entire lowering/native-compilation path mixes boundaries. Measure
+graph rewriting, WGSL generation/Naga processing, native pipeline creation,
+scratch/qualification, and timing/selection separately; declare cold versus
+warm compiler and driver caches. The paper's existing 0.08–2.36 s figures
+cover whole-workload preparation, not a single shader or measured tuning.
+[Naga's documented stages](https://docs.rs/naga/30.0.1/naga/)
+
+Why not always search? Compilation is only one cost. Private inputs, uploads,
+full-output readback/checks, warmups and enough interleaved trials to distinguish
+a gain from noise remain necessary. The read-optimized staging work below has
+already removed much of the old readback penalty: dense-only synthetic searches
+take about 32–45 ms in the SameSize experiment. The later ResNet convolution
+search still takes about 640 ms, mostly sampling, without a guarded whole-step
+win. Cheap shaders cannot make an unprofitable or incomplete candidate space
+profitable; repeated shapes help, but different bindings/precision still matter.
+
+Use `extra preparation / (baseline step − tuned step)` for break-even uses
+when the denominator is positive. Keep compilation, search and ordinary whole
+steps visible separately. Default-on needs representative whole-step gains that
+repay the budget, not just isolated kernel winners. An eventual persistent
+cache must include device/driver, generator, exact class and validation contract;
+it must not transfer a winner merely because a marketing name matches.
+
+The lean next step is to widen the existing generator's legal choices where
+profiles justify them, reuse exact classes, and allocate a bounded preparation
+budget. Do not enumerate the cross-product of every graph rewrite and tile or
+silently enable tuning in the new Inferena baseline. Collect that pinned
+untuned cohort first; a declared tuned/untuned ablation can test this thesis.
+TVM/Ansor and Triton already integrate compilation and measured search. Our
+distinction would be the cost, scope and portable native implementation, not
+the invention of compile-time autotuning.
+[Ansor](https://www.usenix.org/conference/osdi20/presentation/zheng),
+[Triton autotune](https://triton-lang.org/main/python-api/generated/triton.autotune.html)
+
 ## Implemented search: dense tiles and scalar convolution derivatives
 
 `Session::tune()` uses defaults; `Session::tune_with(TuneOptions)` returns a

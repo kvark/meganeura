@@ -735,6 +735,15 @@ deployment-closure comparison rather than a feature-equivalence or
 developer-productivity claim; Section~\ref{sec:edge} supplies the physical
 application check.
 
+Short specialization also creates a budget for on-device autotuning. A
+post-freeze, opt-in path qualifies and measures compatible kernel variants
+after graph rewriting, before returning the session; it does not explain the
+frozen timings. Compilation with autotuning is established
+\cite{chen2018tvm,tillet2019triton}. The question here is whether useful
+whole-step gains repay native pipeline creation, numerical qualification and
+measurement---not shader translation alone---within a compact deployment's
+startup budget.
+
 \section{Related Work}
 
 Pennycook et al.\ define and later revisit the portability metric and

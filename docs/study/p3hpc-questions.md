@@ -152,6 +152,13 @@ state evidence and limited transfer, not “automatic tuning makes training
 faster.” More representative kernel families and controlled confirmation come
 before default-on or persistent winners.
 
+For the paper's proposed compile-and-tune emphasis, see
+[cheap compilation as a search budget](performance-plan.md#cheap-compilation-as-a-search-budget).
+One preparation API already combines the stages, but graph rewriting and
+kernel selection are not a joint search today. Naga-only timing is not
+end-to-end pipeline preparation, and low compilation cost alone does not
+establish tuning amortization or novelty over TVM/Triton.
+
 ## Numerical behavior
 
 ### 13. Does strict f32 mean identical results?

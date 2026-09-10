@@ -5,6 +5,14 @@ This is a revised working draft and preparation kit, not a declaration that
 the camera-ready has been approved or submitted. Acceptance-specific upload
 conditions and talk instructions still need confirmation.
 
+September 10: the deployment discussion now connects short specialization to
+bounded on-device search, with a [study explanation](../../docs/study/performance-plan.md#cheap-compilation-as-a-search-budget).
+It distinguishes today's opt-in, post-rewrite kernel selection from joint
+graph-and-kernel search and keeps it outside the frozen matrix. Neither a
+100 µs end-to-end compile nor a 10,000× Triton advantage is claimed. Those
+boundaries and amortized whole-step gains need matched measurements before
+making this the paper's central performance result.
+
 The response matrix below paraphrases `review1.txt`, `review2.txt` and
 `review3.txt` supplied at `/home/kvark/Documents/P3HPC`; private review text
 is not copied into Git. The CUDA Graph concern is confirmed in the frozen
