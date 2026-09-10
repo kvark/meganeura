@@ -40,10 +40,13 @@ it does not justify default-on tuning or lowering the threshold.
 These experiments do **not** show that empirical tuning cannot improve our
 measured models on any target platform. All ran on one RTX 5070, chiefly over
 the existing scalar 32/64 tiles; the device cannot exercise native-f32
-cooperative challengers. Synthetic holdouts are not the complete Inferena
-model/shape matrix. The later role-reversed dense confirmation accepted a
-1.177× whole-step gain. Other devices, broader kernel choices and full-size
-model transfer remain unmeasured, not negative results.
+cooperative challengers. SmolLM2 used `medium_test` (8 layers, hidden 128,
+vocabulary 64), not the 135M checkpoint; ResNet-50 was included, but this was
+not the complete Inferena model/shape matrix. The later role-reversed dense
+confirmation accepted a 1.177× whole-step gain. Other devices, broader kernel
+choices and transfer across the complete matrix remain unmeasured, not
+negative results. The guard requires 5% plus twice the paired-difference MAD;
+failing it does not exclude smaller real gains.
 
 ## The objective
 

@@ -50,6 +50,15 @@ and cross-engine validity gates, and adds explicit **whole-phase** capture:
 - Requested compile/capture failures stop that runner. Records disclose actual
   options and per-phase capture/validation; no eager timing is substituted.
 
+The September 10 replay policy also checks uncaptured repetitions. CUDA
+backward may be nondeterministic: gradient differences are checked with fixed
+per-parameter RMS and maximum-error bounds, not relative error against each
+near-zero element. Output/loss checks remain elementwise. Both ordinary and
+captured errors are recorded, with no per-run tolerance fitting or forced
+deterministic reference algorithms. See Inferena's
+[policy and qualification status](https://github.com/kvark/inferena/blob/experiment/p3hpc-cuda-graphs/EXPERIMENT.md#replay-qualification-policy);
+this changes replay integrity checks, not cross-engine accuracy gates.
+
 The new Meganeura runner also migrates to explicit session configuration:
 strict uses the scalar `Disabled` cooperative policy, including disabling
 native-f32 tiles where available; accelerated uses `Auto` to protect
