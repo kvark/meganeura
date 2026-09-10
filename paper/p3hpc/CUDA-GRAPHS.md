@@ -50,6 +50,16 @@ and cross-engine validity gates, and adds explicit **whole-phase** capture:
 - Requested compile/capture failures stop that runner. Records disclose actual
   options and per-phase capture/validation; no eager timing is substituted.
 
+The September 10 replay policy also checks uncaptured repetitions. Strict
+gradients have fixed per-parameter RMS and maximum-error bounds. Accelerated
+gradients add an allowance calibrated from eight uncaptured calls, frozen
+before two held-out calls and two replays. An independent full-gradient error
+ceiling prevents unbounded allowance; output/loss checks remain elementwise.
+All errors are recorded, without forcing deterministic reference algorithms.
+This accommodates documented backward variability, not arbitrary drift. See Inferena's
+[policy and qualification status](https://github.com/kvark/inferena/blob/experiment/p3hpc-cuda-graphs/EXPERIMENT.md#replay-qualification-policy);
+this changes replay integrity checks, not cross-engine accuracy gates.
+
 The new Meganeura runner also migrates to explicit session configuration:
 strict uses the scalar `Disabled` cooperative policy, including disabling
 native-f32 tiles where available; accelerated uses `Auto` to protect
@@ -65,6 +75,13 @@ phase, while retaining automatic kernel search in the max-autotune condition.
 
 ## What new evidence is required
 
+September 10: all 30 common-model CUDA qualification conditions pass on the
+RTX 5070 at implementation `24160533`. Inferena's source-only
+[`p3hpc-collection-2026-09-10`](https://github.com/kvark/inferena/tree/p3hpc-collection-2026-09-10)
+tag freezes the handoff. After setup, `python scripts/p3hpc.py` qualifies and
+collects without required arguments. Each additional machine must pass its
+own qualification; these preflight records do not update the paper's timings.
+
 The September 8 strict ResNet-50 pilot qualified all three captured phases,
 including every element of 108 gradient tensors. Its two process-level records
 remain outside Git, with source frozen at Inferena's
@@ -73,7 +90,7 @@ process per condition is not a replicated performance claim or a new engine
 comparison. See that branch's `EXPERIMENT.md` for the small result table and
 the substantial graph-pool residency cost observed in the pilot.
 
-First qualify all workloads. Then freeze an idle-device campaign with default
+On each machine, first qualify all workloads. Then collect on an idle device with default
 compiled/no-graph, default compiled/graph, and max-autotune/graph, rotating
 configuration order across at least three fresh processes. Keep the same
 precision settings and timing boundaries. Recollect Meganeura in the same
