@@ -898,9 +898,12 @@ impl MatMulTile {
 
 /// Generate the unrolled `(acc_decl, compute_body, acc_array)` sections of
 /// the tiled-matmul skeleton for a TM×TM register tile.
-fn tiled_matmul_body(tile: MatMulTile, interleave_columns: bool) -> (String, String, String) {
-    // matmul.wgsl stages A at padded stride 33 and B at BM+1.
-    tiled_gemm_body(tile.tm(), 33, tile.bm() + 1, interleave_columns)
+fn tiled_matmul_body(
+    tile: MatMulTile,
+    k_tile: u32,
+    interleave_columns: bool,
+) -> (String, String, String) {
+    tiled_gemm_body(tile.tm(), k_tile + 1, tile.bm() + 1, interleave_columns)
 }
 
 /// Generate an ordinary scalar convolution with a measured K-tile candidate.
@@ -935,6 +938,28 @@ fn conv_gemm_tiled(src: &str, tile: MatMulTile, k_tile: u32) -> ShaderModule {
     assert!(matches!(k_tile, 16 | 32));
     let bm = tile.bm();
     let tm = tile.tm();
+    let k_tile = if b_mode == WeightFormat::F32 {
+        match std::env::var("MEGANEURA_MATMUL_K_STAGE").as_deref() {
+            Ok("8") => 8,
+            Ok("16") => 16,
+            Ok("32") | Err(_) => 32,
+            value => panic!("unsupported scalar matmul K stage: {value:?}"),
+        }
+    } else {
+        32
+    };
+    let k_row = format!("flat / {k_tile}u");
+    let k_col = format!("flat % {k_tile}u");
+    let (a_row, a_col) = if a_idx == MATMUL_A_FWD {
+        (k_row.as_str(), k_col.as_str())
+    } else {
+        (a_row, a_col)
+    };
+    let (b_row, b_col) = if b_idx == MATMUL_B_BT {
+        (k_col.as_str(), k_row.as_str())
+    } else {
+        (b_row, b_col)
+    };
     let (acc_decl, compute_body, acc_array) = tiled_gemm_body(tm, k_tile, bm, false);
     let src = preprocess(
         src,
@@ -1181,7 +1206,7 @@ fn matmul_vars_tiled(
     let tm = tile.tm();
     let interleave_columns = b_mode == WeightFormat::F32
         && std::env::var("MEGANEURA_INTERLEAVE_COLUMNS").as_deref() == Ok("1");
-    let (acc_decl, compute_body, acc_array) = tiled_matmul_body(tile, interleave_columns);
+    let (acc_decl, compute_body, acc_array) = tiled_matmul_body(tile, k_tile, interleave_columns);
     let output_column = if interleave_columns {
         "tx + j * 16u".to_string()
     } else {
@@ -1209,9 +1234,11 @@ fn matmul_vars_tiled(
             ("$BM_U", &format!("{bm}u")),
             ("$TM_U", &format!("{tm}u")),
             ("$B_STRIDE_U", &format!("{}u", bm + 1)),
-            ("$STAGE_EPT_U", &format!("{}u", bm * 32 / 256)),
-            ("$SHARED_A_SIZE", &(bm * 33).to_string()),
-            ("$SHARED_B_SIZE", &(32 * (bm + 1)).to_string()),
+            ("$A_STRIDE_U", &format!("{}u", k_tile + 1)),
+            ("$K_TILE_U", &format!("{k_tile}u")),
+            ("$STAGE_EPT_U", &format!("{}u", bm * k_tile / 256)),
+            ("$SHARED_A_SIZE", &(bm * (k_tile + 1)).to_string()),
+            ("$SHARED_B_SIZE", &(k_tile * (bm + 1)).to_string()),
             ("$ACC_DECL", &acc_decl),
             ("$COMPUTE_BODY", &compute_body),
             ("$ACC_ARRAY", &acc_array),
