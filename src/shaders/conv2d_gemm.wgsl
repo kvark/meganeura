@@ -3,8 +3,7 @@
 // Computes C[Co, oH*oW] = A[Co, K] × B[K, oH*oW] per batch item,
 // where K = Ci*kH*kW and B is the im2col matrix computed on-the-fly.
 //
-// Uses the same 64×64 register-tiled matmul as matmul.wgsl:
-//   BM=64, BN=64, KTILE=16, TM=4, TN=4, workgroup [16,16,1]
+// Register-tiled matmul, workgroup [16,16,1]. BM, TM and K are generated.
 //
 // Dispatch: [ceil(oH*oW / 64), ceil(Co / 64), batch]
 
@@ -33,8 +32,8 @@ var<storage> src: array<f32>;              // input [N, Ci, H, W]
 var<storage> weight: array<f32>;           // kernel [Co, Ci, kH, kW] = [Co, K]
 var<storage, read_write> dst: array<f32>;  // output [N, Co, oH, oW]
 var<uniform> params: Params;
-var<workgroup> shared_a: array<f32, $SHARED_SIZE>; // A tile: [64, 16]
-var<workgroup> shared_b: array<f32, $SHARED_SIZE>; // B tile: [16, 64]
+var<workgroup> shared_a: array<f32, $SHARED_SIZE>; // A tile: [BM, K]
+var<workgroup> shared_b: array<f32, $SHARED_SIZE>; // B tile: [K, BM]
 
 @compute @workgroup_size(16, 16)
 fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
@@ -57,23 +56,22 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     loop {
         if t >= k_total { break; }
 
-        // Load A tile: weight[Co, K] → shared_a[64, 16]
-        // 4 elements per thread (256 threads × 4 = 1024)
+        // Load A tile: weight[Co, K].
         for (var e = 0u; e < $STAGE_EPT_U; e++) {
             let flat = tid + e * 256u;
-            let row_local = flat / 16u;  // M dimension (Co)
-            let col_local = flat % 16u;  // K dimension
+            let row_local = flat / $KTILE_U;  // M dimension (Co)
+            let col_local = flat % $KTILE_U;  // K dimension
             let a_row = tile_row + row_local;
             let a_col = t + col_local;
             let in_bounds_a = a_row < m_total && a_col < k_total;
-            shared_a[row_local * 16u + col_local] = select(0.0, weight[a_row * k_total + a_col], in_bounds_a);
+            shared_a[row_local * $KTILE_U + col_local] = select(0.0, weight[a_row * k_total + a_col], in_bounds_a);
         }
 
-        // Load B tile: im2col(input)^T [K, oH*oW] → shared_b[16, 64]
+        // Load B tile: im2col(input)^T [K, oH*oW].
         // B[k, hw] = input[n, ci, oh*stride+kh-pad, ow*stride+kw-pad]
         for (var e = 0u; e < $STAGE_EPT_U; e++) {
             let flat = tid + e * 256u;
-            let row_local = flat / $BM_U;  // K dimension (within KTILE=16)
+            let row_local = flat / $BM_U;  // K dimension
             let col_local = flat % $BM_U;  // N dimension (oH*oW)
             let k_idx = t + row_local;
             let hw_idx = tile_col + col_local;
@@ -100,13 +98,13 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
 
         workgroupBarrier();
 
-        // Compute: 4×4 register-tiled matmul over KTILE=16
-        for (var kk = 0u; kk < 16u; kk++) {
+        // Compute the register tile over one K stage.
+        for (var kk = 0u; kk < $KTILE_U; kk++) {
             $COMPUTE_BODY
         }
 
         workgroupBarrier();
-        t += 16u;
+        t += $KTILE_U;
     }
 
     // Store: output[n, co, oh*oW+ow] in NCHW layout
