@@ -177,6 +177,29 @@ barrier cost. Procedures, limitations and source pins are in Inferena's
 [analysis](https://github.com/kvark/inferena/blob/experiment/p3hpc-gap-2026-09-10/ANALYSIS.md#placement-and-allocation-ablation--september-10).
 The collection tag and paper tables remain unchanged.
 
+Resident-only preparation follow-ups use the source-only Inferena tag
+`experiment/parameter-preparation-2026-09-10`, pinning Meganeura `854b5b6`
+and Blade `7b6d97a`. Six fresh-process replicates per model visit all six
+orders of three arms: fresh upload allocations, reused bounded staging,
+then reused staging plus a cache-blocked CPU transpose. No profiler runs
+during this confirmation; all 54 recorded output sets repeat exactly.
+
+| Complete process, median seconds | Fresh staging | Reused staging | Reuse + CPU transpose |
+|---|---:|---:|---:|
+| SmolLM2-135M | 10.537 | 2.939 | 2.625 |
+| SmolLM2-360M | 14.164 | 5.718 | 4.521 |
+| SmolLM2-1.7B | 43.163 | 36.179 | 28.167 |
+
+These are startup/workflow savings, not shader-compilation or steady-state
+speedups: the process includes checkpoint loading, both sessions, warmup,
+measurement, validation and cleanup. No step gain clears the guard. Separate
+Systems captures attribute the first saving to hundreds of avoided Vulkan
+allocations; the next largest preparation span is CPU tensor conversion.
+Run `scripts/tune_study.py --stream-weights --baseline device-params-buddy
+--variants device-params-buddy device-params-reuse device-params-tiled
+--models SmolLM2-135M SmolLM2-360M SmolLM2-1.7B --replicates 6 --output <new-dir>`
+with the documented memory guard. No new main-branch fixture or binary is needed.
+
 ## September tuning foundation
 
 These are development observations on RTX 5070 / driver 595.71.05, not updates
