@@ -200,9 +200,10 @@ an environment override or misspelled variable does not invalidate the test.
 failing plan and shader sources. GPU context creation enables API validation
 in debug-assertion builds; that is separate from `SessionConfig::debug()`.
 
-Safe checks while the GPU is occupied include `cargo test --lib`, compiler
-checks, offline shader validation, artifact replay and the CPU-only
-`diagnose_fusion` example. Building a `Session` or an `Eager` evaluator is
+Safe checks while the GPU is occupied include compiler checks, explicitly
+CPU-only tests, offline shader validation, artifact replay and the CPU-only
+`diagnose_fusion` example. The library test executable now also contains GPU
+tests; `cargo test --lib` is not a CPU-only filter. Building a `Session` or an `Eager` evaluator is
 **not** CPU-only: even session construction can run a cooperative smoke test.
 
 ## Explain performance without confusing the instruments
