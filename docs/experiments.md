@@ -200,6 +200,21 @@ Run `scripts/tune_study.py --stream-weights --baseline device-params-buddy
 --models SmolLM2-135M SmolLM2-360M SmolLM2-1.7B --replicates 6 --output <new-dir>`
 with the documented memory guard. No new main-branch fixture or binary is needed.
 
+The `experiment/packing-layout-2026-09-10` and
+`experiment/packing-warmup-2026-09-10` Inferena tags test the graph's packed
+SwiGLU copy separately. Keeping the original unpacked weights saves about
+3 GiB on 1.7B. Six AB/BA process pairs with 100 warmups and 100 samples confirm
+16.316→14.558 ms stateless-token latency (1.121×), with identical full prefill
+and token hashes. Prefill is unchanged; smaller models have no guarded step
+gain. This is not yet an automatic representation search or default change.
+An alternative scalar-matmul column layout is slower in the five-model pilot.
+
+Longer warmup also reveals that 135M's short token window is not sustained
+steady state: about 2.56 versus 3.58 ms on this configuration, with stable
+prefill. Preserve this sensitivity, not just the fastest samples. Diagnostic
+clock/host/GPU correlation must precede attribution. The collection tag is
+unchanged; these new source-only controls are not replacement paper timings.
+
 ## September tuning foundation
 
 These are development observations on RTX 5070 / driver 595.71.05, not updates
