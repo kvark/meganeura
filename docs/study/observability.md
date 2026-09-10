@@ -252,6 +252,15 @@ complete per-dispatch breakdown. GPU/host memory budgets must include the
 profiler, not just the model. See Inferena's
 [bounded workflow and evidence limits](https://github.com/kvark/inferena/blob/experiment/p3hpc-cuda-graphs/EXPERIMENT.md#nvidia-paper-analysis-captures).
 
+The September 10 experiment demonstrates why the host timeline matters:
+sustained 135M token GPU time stays near 1.88 ms while CPU downclocking grows
+command-recording time. An opt-in thread-CPU clock separates actual CPU work
+from descheduling; elapsed `wait` remains a synchronization interval. Read-only
+frequency snapshots help interpret the change without pretending they are
+instruction-level counters. The [qualified diagnostic source](https://github.com/kvark/inferena/tree/experiment/host-latency-2026-09-10)
+also preserves negative affinity/utilization-hint controls. Power policy and
+warmup state belong in a latency comparison, including on a quiet machine.
+
 `MemorySummary` separates plan capacities (including padding), graph
 allocations after aliasing, and actually allocated moments, accumulators and
 auxiliary buffers. `total_allocated_bytes()` sums those retained buffer
