@@ -73,7 +73,7 @@ fn maybe_dump_wgsl(source: &str, hint: &str) {
 
 /// Parse a WGSL source string into a [`ShaderModule`].
 fn parse_wgsl(source: &str) -> ShaderModule {
-    let module = naga::front::wgsl::parse_str(source).expect("WGSL parse failed");
+    let module = parse_source(source).expect("WGSL parse failed");
     let entry = module
         .entry_points
         .first()
@@ -84,6 +84,11 @@ fn parse_wgsl(source: &str) -> ShaderModule {
         module,
         source: source.to_string(),
     }
+}
+
+fn parse_source(source: &str) -> Result<Module, naga::front::wgsl::ParseError> {
+    let _span = tracing::info_span!("naga_parse", source_bytes = source.len()).entered();
+    naga::front::wgsl::parse_str(source)
 }
 
 /// Generate WGSL declarations and body for a fused epilogue chain.
@@ -2456,7 +2461,7 @@ pub fn generate_attention_module(head_dim: u32) -> ShaderModule {
     src.push_str("}\n");
 
     maybe_dump_wgsl(&src, "attention");
-    let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
+    let module = parse_source(&src).unwrap_or_else(|e| {
         panic!(
             "generated unified attention WGSL failed to parse:\n{}\n---\n{}",
             e, src
@@ -2817,7 +2822,7 @@ pub fn generate_flash_attention_module(head_dim: u32, ept_cap: u32) -> ShaderMod
     src.push_str("}\n");
 
     maybe_dump_wgsl(&src, "flash_attention");
-    let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
+    let module = parse_source(&src).unwrap_or_else(|e| {
         panic!(
             "generated flash attention WGSL failed to parse:\n{}\n---\n{}",
             e, src
@@ -3097,7 +3102,7 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
     src.push_str("    }\n");
     src.push_str("}\n");
 
-    let module = naga::front::wgsl::parse_str(&src)
+    let module = parse_source(&src)
         .unwrap_or_else(|e| panic!("generated coop flash WGSL failed to parse:\n{e}\n---\n{src}"));
     ShaderModule {
         module,
@@ -3430,7 +3435,7 @@ pub fn generate_flash_grad_q_coop_module(head_dim: u32) -> ShaderModule {
     src.push_str("    }\n");
     src.push_str("}\n");
 
-    let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
+    let module = parse_source(&src).unwrap_or_else(|e| {
         panic!("generated coop flash grad_q WGSL failed to parse:\n{e}\n---\n{src}")
     });
     ShaderModule {
@@ -3837,7 +3842,7 @@ pub fn generate_flash_grad_kv_coop_module(head_dim: u32) -> ShaderModule {
     src.push_str("    }\n");
     src.push_str("}\n");
 
-    let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
+    let module = parse_source(&src).unwrap_or_else(|e| {
         panic!("generated coop flash grad_kv WGSL failed to parse:\n{e}\n---\n{src}")
     });
     ShaderModule {
@@ -4140,7 +4145,7 @@ pub fn generate_flash_grad_q_module(head_dim: u32, ept_cap: u32) -> ShaderModule
     src.push_str("}\n");
 
     maybe_dump_wgsl(&src, "flash_grad_q");
-    let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
+    let module = parse_source(&src).unwrap_or_else(|e| {
         panic!(
             "generated flash grad_q WGSL failed to parse:\n{}\n---\n{}",
             e, src
@@ -4358,7 +4363,7 @@ pub fn generate_flash_grad_kv_module(head_dim: u32, ept_cap: u32) -> ShaderModul
     src.push_str("}\n");
 
     maybe_dump_wgsl(&src, "flash_grad_kv");
-    let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
+    let module = parse_source(&src).unwrap_or_else(|e| {
         panic!(
             "generated flash grad_kv WGSL failed to parse:\n{}\n---\n{}",
             e, src
