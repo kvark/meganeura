@@ -330,6 +330,21 @@ impl GpuOptions {
 }
 
 impl SessionConfig<'_> {
+    fn from_env_with_gpu(gpu: Option<std::sync::Arc<blade_graphics::Context>>) -> Self {
+        log_overrides();
+        if let Some(dir) = DUMP_WGSL.text() {
+            crate::codegen::set_wgsl_dump_dir(dir);
+        }
+        Self {
+            gpu,
+            options: CompileOptions::from_env(),
+            optimize: OptimizeConfig::from_env(),
+            runtime: SessionOptions::from_env(),
+            tune: TUNE.bool_or(false),
+            ..Self::default()
+        }
+    }
+
     /// A [`SessionConfig`] with every environment override applied — the
     /// one-liner for harnesses, examples, and env-driven test runs:
     /// compile options, tuning knobs, optimizer mode, diagnostic switches,
@@ -341,10 +356,6 @@ impl SessionConfig<'_> {
     /// Fields assigned *after* this call win — precedence is simply
     /// "explicit code runs last".
     pub fn from_env() -> Self {
-        log_overrides();
-        if let Some(dir) = DUMP_WGSL.text() {
-            crate::codegen::set_wgsl_dump_dir(dir);
-        }
         let gpu_opts = GpuOptions::from_env();
         let gpu = if gpu_opts.device_id.is_some() || gpu_opts.timing || gpu_opts.capture {
             match crate::runtime::init_gpu_context_with(gpu_opts) {
@@ -357,14 +368,7 @@ impl SessionConfig<'_> {
         } else {
             None
         };
-        Self {
-            gpu,
-            options: CompileOptions::from_env(),
-            optimize: OptimizeConfig::from_env(),
-            runtime: SessionOptions::from_env(),
-            tune: TUNE.bool_or(false),
-            ..Self::default()
-        }
+        Self::from_env_with_gpu(gpu)
     }
 
     /// [`SessionConfig::from_env`] with `mode: Inference`.
@@ -372,6 +376,18 @@ impl SessionConfig<'_> {
         Self {
             mode: crate::train::Mode::Inference,
             ..Self::from_env()
+        }
+    }
+
+    /// [`SessionConfig::inference_from_env`] using an existing GPU context.
+    ///
+    /// This applies all non-device environment overrides without first
+    /// creating and then discarding an env-selected context. It is intended
+    /// for clients that compile several model graphs on one queue/device.
+    pub fn inference_from_env_on(gpu: std::sync::Arc<blade_graphics::Context>) -> Self {
+        Self {
+            mode: crate::train::Mode::Inference,
+            ..Self::from_env_with_gpu(Some(gpu))
         }
     }
 
