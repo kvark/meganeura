@@ -232,15 +232,22 @@ machine, not because CPU time measures the iGPU's hardware potential.
 
 ### 20. Why not PyTorch max-autotune or CUDA graphs?
 
-Short: they are important stronger automatic baselines that were not tested.
+Short: they were absent from the frozen matrix; the controlled follow-up tests
+them and records where they are unavailable.
 
 Detail: the frozen protocol uses default `torch.compile` on Linux and no
 additional manual capture. Its explicit CUDA Graph helpers were only used by
 the legacy runner, which the paper-v1 path bypassed. A captured compiler IR
-is not a replayed CUDA command graph. `reduce-overhead`/`max-autotune` can change capture
-and selection without model-specific kernels. The paper now states this
-limitation explicitly. A new sweep must verify actual activation and charge
-compile/search cost, memory and accuracy, not silently replace the old data.
+is not a replayed CUDA command graph. `reduce-overhead`/`max-autotune` can
+change capture and selection without model-specific kernels. The RTX 5070
+follow-up completes all default/no-graph, default/graph and max-autotune/graph pairs. On both AMD
+systems, max-autotune fails during diffusion training compilation: generated
+convolution candidates exceed local-memory limits or time out, then Inductor's
+ATen fallback is missing a required output buffer. Those failures are a
+portability result, not permission to substitute eager timing. AMD collection
+retains default mode and explicitly labels the missing condition. The new sweep
+also charges compile/search cost, memory and accuracy rather than silently
+replacing the old data.
 
 The [CUDA Graph follow-up](../../paper/p3hpc/CUDA-GRAPHS.md) explains the repair,
 the exact timed boundary and the new collection plan. Do not claim that the

@@ -722,6 +722,20 @@ driver --- no per-vendor package source, version pin, or compute runtime
 on any machine. These are reproducible configuration facts, not a timed
 measure of installation effort.
 
+A post-submission controlled qualification for the camera-ready cohort pins
+one PyTorch source revision across vendor builds and tests stronger automatic
+conditions separately. The RTX~5070 completes default compilation with and
+without whole-phase CUDA Graph replay and max-autotune with replay. On both AMD
+systems, however, max-autotune cannot compile the diffusion training graph:
+generated convolution-backward candidates exceed local-memory limits or time
+out, after which Inductor's library fallback is called without a required
+output buffer. The protocol preserves those failures, never substitutes eager
+timing, and collects default-compiled AMD results only as a labeled
+availability subset. This is not a \system{} speedup; it shows that compiler
+search is itself part of the portability surface. \system{}'s bounded tuner
+creates and numerically qualifies candidates on the selected device, measures
+only successful candidates, and retains the incumbent after rejection.
+
 Two deployment costs are quantified. Compilation: \system{} prepares a
 workload (all three sessions, pipelines included) in 0.08--1.52\,s strict
 and 0.08--2.36\,s accelerated across the measured devices; where
@@ -815,9 +829,14 @@ rounded mean at 0.93.
 The frozen protocol uses default \code{torch.compile}, without manual CUDA
 Graph capture. Automated \code{reduce-overhead} and \code{max-autotune}
 modes can change capture and kernel selection~\cite{pytorch2026compile};
-they were not tested. These are stronger automatic baselines, not necessarily
-application-specific tuning. The measured minimal-shape wins therefore do
-not establish superiority over all compiled PyTorch configurations.
+they were not tested in the frozen matrix. These are stronger automatic
+baselines, not necessarily application-specific tuning. The controlled
+follow-up completes CUDA Graph and max-autotune conditions on NVIDIA but finds
+max-autotune unavailable for diffusion training on both AMD systems, as
+described in Section~\ref{sec:productivity}. Those availability observations
+do not retroactively strengthen the frozen timing ratios; the measured
+minimal-shape wins therefore do not establish superiority over all compiled
+PyTorch configurations.
 
 The matrix reports 20 synchronized samples after warmup from one frozen
 process-level run per cell, not independent process replicates; raw samples
