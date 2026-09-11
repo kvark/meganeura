@@ -9,6 +9,23 @@ pub use crate::tune::TuneOutcome;
 
 type Gpu = blade_graphics::Context;
 
+/// Wait for a command encoder and harvest every completed timestamp query.
+///
+/// Temporary transfer encoders used during model loading would otherwise be
+/// destroyed before Blade's timing ring rotates, dropping their GPU spans.
+pub(super) fn wait_for_timed_encoder(
+    gpu: &Gpu,
+    sync: &blade_graphics::SyncPoint,
+    encoder: &mut blade_graphics::CommandEncoder,
+) -> Result<bool, blade_graphics::DeviceError> {
+    let result = gpu.wait_for(sync, !0);
+    if matches!(&result, Ok(true)) {
+        encoder.resolve_timings();
+        crate::profiler::record_gpu_passes(encoder.timing_spans());
+    }
+    result
+}
+
 /// Leave room for pipelines, command buffers, and driver-owned allocations
 /// that are not represented by the execution plan's buffer sizes.
 const DEVICE_MEMORY_SAFE_PERCENT: u64 = 90;
@@ -2778,9 +2795,6 @@ pub struct Session {
     /// See [`Session::set_submission_chunks`]. Always at least 1.
     submission_chunks: usize,
     sync_point: Option<blade_graphics::SyncPoint>,
-    /// Nanosecond offset (in profiler time) of the most recent GPU submit,
-    /// used to place GPU pass timings on the GPU track.
-    last_submit_ns: u64,
     /// When true, run in multi-pass mode: one compute pass per dispatch
     /// with individual GPU timestamps. Enables `dump_gpu_timings()`.
     profiling: bool,
@@ -3104,7 +3118,7 @@ impl Session {
             pc.dispatch([(m as u32).div_ceil(ot), (n_out as u32).div_ceil(ot), 1]);
         }
         let sp = gpu.submit(&mut encoder);
-        let _ = gpu.wait_for(&sp, !0);
+        let _ = wait_for_timed_encoder(gpu, &sp, &mut encoder);
 
         let result =
             unsafe { std::slice::from_raw_parts(c_buf.data() as *const f32, m * n_out).to_vec() };
@@ -3422,7 +3436,7 @@ impl Session {
                 }
             }
             let sp = gpu.submit(&mut encoder);
-            let _ = gpu.wait_for(&sp, !0);
+            let _ = wait_for_timed_encoder(&gpu, &sp, &mut encoder);
         }
 
         let optimizer_device = !opts.no_device_local && !opts.debug;
@@ -3449,7 +3463,7 @@ impl Session {
                 }
             }
             let sp = gpu.submit(&mut encoder);
-            let _ = gpu.wait_for(&sp, !0);
+            let _ = wait_for_timed_encoder(&gpu, &sp, &mut encoder);
         }
 
         // Buffers that some dispatch (or session setup) actually writes.
@@ -3491,7 +3505,6 @@ impl Session {
             encoder,
             submission_chunks: 1,
             sync_point: None,
-            last_submit_ns: 0,
             profiling: false,
             debug: opts.debug,
             optimizer_device,
@@ -3780,19 +3793,17 @@ impl Session {
     /// Enable or disable per-dispatch GPU profiling.
     ///
     /// When enabled, `step()` runs one compute pass per dispatch with
-    /// individual GPU timestamps. Call `dump_gpu_timings()` after the
-    /// *next* `step()` to see per-pass timings from the profiled run.
+    /// individual GPU timestamps. Call `wait()` and then
+    /// `dump_gpu_timings()` to see per-pass timings from the profiled run.
     pub fn set_profiling(&mut self, enabled: bool) {
         self.profiling = enabled;
     }
 
     /// Copy the GPU pass timings most recently resolved by Blade.
     ///
-    /// Blade keeps a two-command-buffer timing ring. The values become
-    /// available when `step()` next reuses the command buffer that recorded
-    /// them; callers should normally use
-    /// [`crate::profiler::capture_session_profile`] instead of managing that
-    /// ring directly.
+    /// The values become available as soon as [`Session::wait`] completes;
+    /// callers should normally use [`crate::profiler::capture_session_profile`]
+    /// rather than managing timestamp collection directly.
     pub fn gpu_timings(&self) -> Vec<(String, std::time::Duration)> {
         self.encoder.timings().to_vec()
     }
@@ -3882,14 +3893,14 @@ pub fn init_gpu_context() -> Result<blade_graphics::Context, blade_graphics::Not
 pub fn init_gpu_context_with(
     options: GpuOptions,
 ) -> Result<blade_graphics::Context, blade_graphics::NotSupportedError> {
+    let _span = tracing::info_span!("gpu_context_init").entered();
     let dev_id = options.device_id;
     unsafe {
         blade_graphics::Context::init(blade_graphics::ContextDesc {
             validation: cfg!(debug_assertions),
-            // Opt-in: GPU pass timestamps feed dump_gpu_timings() only.
-            // Blade's timing collection reads the query pool without waiting
-            // when a command buffer is re-begun; on slow GPUs the previous
-            // submission may still be in flight. Keep this off by default.
+            // Opt-in: GPU pass timestamps feed profiling and trace output.
+            // Completed timestamp queries are resolved after the submission
+            // fence. Keep this off by default to avoid instrumentation cost.
             timing: options.timing,
             capture: options.capture,
             overlay: false,
@@ -5004,7 +5015,7 @@ impl Session {
             }
         }
         let sync = self.gpu.submit(&mut encoder);
-        let _ = self.gpu.wait_for(&sync, !0);
+        let _ = wait_for_timed_encoder(&self.gpu, &sync, &mut encoder);
         self.gpu.destroy_command_encoder(&mut encoder);
     }
 
@@ -5103,7 +5114,7 @@ impl Session {
                 chunk.len() as u64,
             );
             let sync = self.gpu.submit(&mut encoder);
-            let _ = self.gpu.wait_for(&sync, !0);
+            let _ = wait_for_timed_encoder(&self.gpu, &sync, &mut encoder);
         }
         self.gpu.destroy_command_encoder(&mut encoder);
         if !self.reuse_upload_staging {
@@ -5143,7 +5154,7 @@ impl Session {
             .transfer("readback_copy")
             .copy_buffer_to_buffer(buffer.at(0), staging.at(0), bytes);
         let sync = self.gpu.submit(&mut encoder);
-        let _ = self.gpu.wait_for(&sync, !0);
+        let _ = wait_for_timed_encoder(&self.gpu, &sync, &mut encoder);
         unsafe {
             std::ptr::copy_nonoverlapping(
                 staging.data() as *const f32,
@@ -5466,7 +5477,7 @@ impl Session {
             }
         }
         let sync = self.gpu.submit(&mut encoder);
-        let _ = self.gpu.wait_for(&sync, !0);
+        let _ = wait_for_timed_encoder(&self.gpu, &sync, &mut encoder);
 
         let mut outputs = Vec::with_capacity(requests.len());
         for &(_, offset, byte_len) in &requests {
@@ -5857,9 +5868,7 @@ impl Session {
 
     /// Print GPU pass timings from the last completed step.
     ///
-    /// Must be called after `step()` + `wait()`, then another `step()`
-    /// (which triggers `encoder.start()` to collect timings from the
-    /// previous submission).
+    /// Must be called after `step()` + `wait()`.
     pub fn dump_gpu_timings(&self) {
         let timings = self.encoder.timings();
         if timings.is_empty() {
@@ -5900,7 +5909,7 @@ impl Session {
     pub fn wait(&mut self) {
         if let Some(sp) = self.sync_point.take() {
             let _span = tracing::info_span!("wait").entered();
-            let _ = self.gpu.wait_for(&sp, !0);
+            let _ = wait_for_timed_encoder(&self.gpu, &sp, &mut self.encoder);
         }
     }
 
@@ -5910,12 +5919,10 @@ impl Session {
         self.wait();
 
         self.encoder.start();
-        // After start(), blade exposes GPU timings from the *previous* submission.
-        self.drain_gpu_timings();
 
         if self.profiling {
             // Multi-pass mode: one compute pass per dispatch with per-pass barriers
-            // and GPU timestamps. Enables dump_gpu_timings() after the next step().
+            // and GPU timestamps. Enables dump_gpu_timings() after wait().
             for i in 0..self.plan.dispatches.len() {
                 let dispatch = &self.plan.dispatches[i];
                 let pipeline = self.pipelines.get(dispatch);
@@ -6237,7 +6244,6 @@ impl Session {
             }
         }
 
-        self.last_submit_ns = crate::profiler::now_ns();
         self.sync_point = Some(self.gpu.submit(&mut self.encoder));
     }
 
@@ -7537,21 +7543,11 @@ impl Session {
         }
     }
 
-    /// Read GPU pass timings from the encoder (available after `encoder.start()`)
-    /// and record them on the GPU profiling track.
-    fn drain_gpu_timings(&self) {
-        let timings = self.encoder.timings();
-        if !timings.is_empty() {
-            crate::profiler::record_gpu_passes(self.last_submit_ns, timings);
-        }
-    }
-
     /// Apply SGD updates to all parameters on the GPU.
     pub fn sgd_step(&mut self, learning_rate: f32) {
         let _span = tracing::info_span!("sgd_step").entered();
         self.wait();
         self.encoder.start();
-        self.drain_gpu_timings();
 
         // All SGD updates are independent (different param/grad buffers),
         // so they share a single compute pass — no barriers between them.
@@ -7578,7 +7574,6 @@ impl Session {
         }
         drop(pass);
 
-        self.last_submit_ns = crate::profiler::now_ns();
         self.sync_point = Some(self.gpu.submit(&mut self.encoder));
     }
 
@@ -7784,7 +7779,6 @@ impl Session {
         self.adam_step += 1;
         self.wait();
         self.encoder.start();
-        self.drain_gpu_timings();
 
         let pipeline = self.pipelines.scalar(ShaderEntry::AdamUpdate);
         let mut pass = self.encoder.compute("adam_update");
@@ -7827,7 +7821,6 @@ impl Session {
         }
         drop(pass);
 
-        self.last_submit_ns = crate::profiler::now_ns();
         self.sync_point = Some(self.gpu.submit(&mut self.encoder));
     }
 
@@ -8008,7 +8001,7 @@ impl Session {
                     }
                 }
                 let sync = self.gpu.submit(&mut encoder);
-                let _ = self.gpu.wait_for(&sync, !0);
+                let _ = wait_for_timed_encoder(&self.gpu, &sync, &mut encoder);
                 self.gpu.destroy_command_encoder(&mut encoder);
             }
         }
