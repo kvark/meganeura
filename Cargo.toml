@@ -52,7 +52,8 @@ hub = ["dep:hf-hub"]
 profiler = ["dep:tracing-subscriber"]
 
 [dependencies]
-blade-graphics = "0.9"
+# Absolute GPU timestamp ranges and explicit post-fence timing resolution.
+blade-graphics = { version = "0.9", git = "https://github.com/kvark/blade", rev = "03c2d682585ea046dd4cb94545335742700e84af" }
 blade-macros = "0.3"
 # `default-features = false` drops egglog's `bin` stack (clap, mimalloc,
 # env_logger, chrono, graphviz). Greedy mode never constructs an EGraph

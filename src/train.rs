@@ -429,7 +429,7 @@ fn make_session(
     tune: bool,
 ) -> Session {
     let mut session = {
-        let _span = tracing::info_span!("gpu_init").entered();
+        let _span = tracing::info_span!("session_gpu_init").entered();
         Session::with_context_opts(plan, gpu, opts)
     };
     if tune {

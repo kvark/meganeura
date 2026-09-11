@@ -1,8 +1,8 @@
 //! Profiling infrastructure producing Perfetto binary traces (`.pftrace`).
 //!
-//! CPU-side work is captured automatically via [`tracing`] spans. GPU pass
-//! durations come from blade-graphics hardware timestamp queries. Both land
-//! on separate tracks in the resulting trace, viewable in
+//! CPU-side work is captured automatically via [`tracing`] spans. Calibrated
+//! GPU pass ranges come from blade-graphics hardware timestamp queries. Both
+//! land on separate tracks in the resulting trace, viewable in
 //! [Perfetto UI](https://ui.perfetto.dev).
 //!
 //! # Quick start
@@ -14,12 +14,14 @@
 //! ```
 
 use serde::Serialize;
+#[cfg(test)]
+use std::time::Duration;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     path::Path,
     sync::{Arc, Mutex, OnceLock},
-    time::{Duration, Instant},
+    time::Instant,
 };
 #[cfg(feature = "profiler")]
 use tracing::{Subscriber, span};
@@ -92,26 +94,38 @@ pub fn init() {
     }
 }
 
-/// Record GPU pass timing events on the GPU track.
+/// Record calibrated GPU pass ranges on the GPU track.
 ///
-/// `submit_offset_ns` is the nanosecond offset (relative to profiler epoch)
-/// when the GPU work was submitted. Pass durations are laid out sequentially
-/// starting from that offset.
-pub fn record_gpu_passes(submit_offset_ns: u64, passes: &[(String, Duration)]) {
+/// Blade maps hardware timestamp queries into the same monotonic clock as
+/// [`Instant`]. Keeping both endpoints preserves real queue gaps and overlap;
+/// CPU submission time is intentionally not involved.
+pub fn record_gpu_passes(passes: &[blade_graphics::GpuTimingSpan]) {
     if let Some(inner) = PROFILER.get() {
         let mut guard = inner.lock().unwrap();
-        let mut offset = submit_offset_ns;
-        for &(ref name, dur) in passes {
+        for pass in passes {
+            let Some(start_ns) = pass
+                .start
+                .checked_duration_since(guard.epoch)
+                .map(|duration| duration.as_nanos() as u64)
+            else {
+                continue;
+            };
+            let Some(end_ns) = pass
+                .end
+                .checked_duration_since(guard.epoch)
+                .map(|duration| duration.as_nanos() as u64)
+            else {
+                continue;
+            };
             guard.events.push(TraceEvent {
-                name: name.clone(),
-                timestamp_ns: offset,
+                name: pass.name.clone(),
+                timestamp_ns: start_ns,
                 track_uuid: GPU_TRACK_UUID,
                 kind: EventKind::SliceBegin,
             });
-            offset += dur.as_nanos() as u64;
             guard.events.push(TraceEvent {
-                name: name.clone(),
-                timestamp_ns: offset,
+                name: pass.name.clone(),
+                timestamp_ns: end_ns,
                 track_uuid: GPU_TRACK_UUID,
                 kind: EventKind::SliceEnd,
             });
@@ -349,15 +363,14 @@ impl std::error::Error for ProfileError {}
 /// Capture repeated, structured per-dispatch GPU timings for a session.
 ///
 /// Set `MEGANEURA_GPU_TIMING=1` before the session creates its Blade context.
-/// Each retained execution runs in one-compute-pass-per-dispatch mode. Two
-/// normal executions then advance Blade's command-buffer ring so the hardware
-/// timestamps can be read. The returned artifact retains raw samples, reports
-/// instrumentation overhead against an optional normal benchmark median, and
-/// aggregates dispatches by forward/backward phase and coarse kernel family.
+/// Each retained execution runs in one-compute-pass-per-dispatch mode and
+/// resolves its hardware timestamps after the completion fence. The returned
+/// artifact retains raw samples, reports instrumentation overhead against an
+/// optional normal benchmark median, and aggregates dispatches by
+/// forward/backward phase and coarse kernel family.
 ///
-/// `prepare` is called immediately before every execution, including the two
-/// ring-advance executions. It should restore inputs and any state that the
-/// workload mutates.
+/// `prepare` is called immediately before every retained execution. It should
+/// restore inputs and any state that the workload mutates.
 ///
 /// The structured dispatch table describes the compiled execution plan.
 /// Capture with optimizer, gradient-accumulation, and gradient-clipping passes
@@ -395,16 +408,6 @@ pub fn capture_session_profile(
         session.wait();
         profiled_wall_samples_ms.push(wall_start.elapsed().as_secs_f64() * 1000.0);
 
-        // Blade command encoders retain two command buffers. Reuse the
-        // profiled command buffer after two ordinary submissions to resolve
-        // its query pool without timing two more instrumented executions.
-        session.set_profiling(false);
-        for _ in 0..2 {
-            prepare(session);
-            session.step();
-            session.wait();
-        }
-
         let timings = session.gpu_timings();
         if timings.is_empty() {
             return Err(ProfileError::MissingGpuTimings { sample });
@@ -427,6 +430,7 @@ pub fn capture_session_profile(
             }
         }
         gpu_total_samples_ms.push(total_ms);
+        session.set_profiling(false);
     }
     session.set_profiling(false);
 
@@ -758,9 +762,9 @@ fn write_pftrace(path: &Path, events: &[TraceEvent]) -> std::io::Result<()> {
     trace.message(1, &pkt);
 
     // Sort events by timestamp so Perfetto sees them in order within the
-    // shared packet sequence. GPU pass events are appended after CPU events
-    // but carry earlier timestamps (the submit offset), which causes
-    // "misplaced End" warnings if written in insertion order.
+    // shared packet sequence. Resolved GPU pass events are appended after
+    // CPU events but carry their earlier calibrated hardware timestamps,
+    // which causes "misplaced End" warnings if written in insertion order.
     let mut sorted: Vec<usize> = (0..events.len()).collect();
     sorted.sort_by_key(|&i| events[i].timestamp_ns);
 
@@ -919,15 +923,26 @@ mod tests {
     #[test]
     fn test_record_gpu_passes() {
         let inner = get_or_init();
-        inner.lock().unwrap().events.clear();
+        let epoch = {
+            let mut guard = inner.lock().unwrap();
+            guard.events.clear();
+            guard.epoch
+        };
 
-        record_gpu_passes(
-            5000,
-            &[
-                ("relu".into(), Duration::from_nanos(100)),
-                ("matmul".into(), Duration::from_nanos(500)),
-            ],
-        );
+        record_gpu_passes(&[
+            blade_graphics::GpuTimingSpan {
+                name: "relu".into(),
+                start: epoch + Duration::from_nanos(5_000),
+                end: epoch + Duration::from_nanos(5_100),
+            },
+            blade_graphics::GpuTimingSpan {
+                name: "matmul".into(),
+                // Deliberately overlaps `relu`: recording must retain the
+                // hardware timestamps rather than serialize pass durations.
+                start: epoch + Duration::from_nanos(5_050),
+                end: epoch + Duration::from_nanos(5_550),
+            },
+        ]);
 
         let guard = inner.lock().unwrap();
         assert_eq!(guard.events.len(), 4); // 2 begin + 2 end
@@ -937,8 +952,8 @@ mod tests {
         assert_eq!(guard.events[1].timestamp_ns, 5100); // 5000 + 100
         assert_eq!(guard.events[1].kind, EventKind::SliceEnd);
         assert_eq!(guard.events[2].name, "matmul");
-        assert_eq!(guard.events[2].timestamp_ns, 5100);
-        assert_eq!(guard.events[3].timestamp_ns, 5600); // 5100 + 500
+        assert_eq!(guard.events[2].timestamp_ns, 5050);
+        assert_eq!(guard.events[3].timestamp_ns, 5550);
 
         drop(guard);
         inner.lock().unwrap().events.clear();

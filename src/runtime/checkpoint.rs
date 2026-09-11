@@ -493,7 +493,7 @@ impl Session {
             }
         }
         let sync = self.gpu.submit(&mut encoder);
-        let _ = self.gpu.wait_for(&sync, !0);
+        let _ = super::wait_for_timed_encoder(&self.gpu, &sync, &mut encoder);
         for tensor in &tensors {
             let aligned_len = tensor.byte_len / 4 * 4;
             let tail_len = tensor.byte_len - aligned_len;
