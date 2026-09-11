@@ -50,13 +50,13 @@ and cross-engine validity gates, and adds explicit **whole-phase** capture:
 - Requested compile/capture failures stop that runner. Records disclose actual
   options and per-phase capture/validation; no eager timing is substituted.
 
-The September 10 replay policy also checks uncaptured repetitions. Strict
-gradients have fixed per-parameter RMS and maximum-error bounds. Accelerated
-gradients add an allowance calibrated from eight uncaptured calls, frozen
-before two held-out calls and two replays. An independent full-gradient error
-ceiling prevents unbounded allowance; output/loss checks remain elementwise.
-All errors are recorded, without forcing deterministic reference algorithms.
-This accommodates documented backward variability, not arbitrary drift. See Inferena's
+The replay policy also checks ordinary repetitions. Strict gradients retain
+the ordinary elementwise bounds. Accelerated training records every tensor and
+uses fixed whole-gradient maximum and RMS bounds over eight ordinary comparisons
+and two consecutive replays; the bounds are not fitted to the observed samples.
+Output/loss checks remain elementwise. All errors are recorded without forcing
+deterministic reference algorithms. This accommodates bounded backward
+variability, not arbitrary drift. See Inferena's
 [policy and qualification status](https://github.com/kvark/inferena/blob/experiment/p3hpc-cuda-graphs/EXPERIMENT.md#replay-qualification-policy);
 this changes replay integrity checks, not cross-engine accuracy gates.
 
@@ -75,12 +75,14 @@ phase, while retaining automatic kernel search in the max-autotune condition.
 
 ## What new evidence is required
 
-September 10: all 30 common-model CUDA qualification conditions pass on the
-RTX 5070 at implementation `24160533`. Inferena's source-only
-[`p3hpc-collection-2026-09-10`](https://github.com/kvark/inferena/tree/p3hpc-collection-2026-09-10)
-tag freezes the handoff. After setup, `python scripts/p3hpc.py` qualifies and
-collects without required arguments. Each additional machine must pass its
-own qualification; these preflight records do not update the paper's timings.
+September 11: the RTX 5070 campaign at Inferena `6f5f94cf` completes all 30
+common-model qualification pairs and 90 fresh-process measurement pairs, with
+no failures. The moving
+[`experiment/p3hpc-cuda-graphs`](https://github.com/kvark/inferena/tree/experiment/p3hpc-cuda-graphs)
+branch is the collection source until all platforms settle; no provisional tag
+is authoritative. Each additional machine must pass its own qualification.
+These new records remain outside Git and do not silently replace the paper's
+frozen timings.
 
 The September 8 strict ResNet-50 pilot qualified all three captured phases,
 including every element of 108 gradient tensors. Its two process-level records
@@ -90,13 +92,16 @@ process per condition is not a replicated performance claim or a new engine
 comparison. See that branch's `EXPERIMENT.md` for the small result table and
 the substantial graph-pool residency cost observed in the pilot.
 
-On each machine, first qualify all workloads. Then collect on an idle device with default
-compiled/no-graph, default compiled/graph, and max-autotune/graph, rotating
-configuration order across at least three fresh processes. Keep the same
-precision settings and timing boundaries. Recollect Meganeura in the same
-campaign, preserve failures, and report per-process dispersion, preparation
-cost and memory. Store records outside main; retain source refs and concise
-conclusions. NVIDIA results cannot establish ROCm/Metal behavior.
+On each machine, first qualify all workloads. NVIDIA collects default
+compiled/no-graph, default compiled/graph, and max-autotune/graph. ROCm has no
+qualified explicit graph condition. Both AMD systems reject max-autotune while
+compiling diffusion training, so they collect default/no-graph with
+`--no-max-autotune`; the manifest labels the omitted condition and the failed
+attempts remain evidence. Rotate configuration order across at least three
+fresh processes, keep precision and timing boundaries fixed, and recollect
+Meganeura in each paired campaign. Store records outside main; retain source
+refs and concise conclusions. NVIDIA results cannot establish ROCm/Metal
+behavior.
 
 Do not replace individual favorable cells in the old table or compare new
 PyTorch measurements to old Meganeura timings. A new qualified cohort gets its

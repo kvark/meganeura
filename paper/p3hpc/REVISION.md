@@ -26,6 +26,16 @@ separate offline workflow. The study guide now limits the negative transfer
 evidence to the one-device, narrow tile-search experiment; it is not an
 all-model/all-platform result, nor a comparison against greedy graph rewriting.
 
+September 11: the controlled RTX 5070 campaign completed all 120 paired entries
+(30 qualification and 90 replicated measurements) at Inferena `6f5f94cf`. On
+both AMD systems, PyTorch max-autotune instead fails while compiling the
+diffusion training graph:
+generated convolution candidates exhaust local memory or time out, and the
+remaining ATen fallback is malformed. The paper now treats automatic compiler
+search as part of the portability surface. AMD default-mode collection remains
+valid as an explicitly labeled availability subset; no eager timing replaces
+the failed condition.
+
 The response matrix below paraphrases `review1.txt`, `review2.txt` and
 `review3.txt` supplied at `/home/kvark/Documents/P3HPC`; private review text
 is not copied into Git. The CUDA Graph concern is confirmed in the frozen
@@ -93,8 +103,8 @@ comparison request.
 
 | Review / concern | Response and evidence | Manuscript location | Status |
 |---|---|---|---|
-| R1, R2: mixed reference versions, execution modes and CPU fallback | Distinguish installed-stack availability from a controlled engine comparison. Pin a common PyTorch release where supported and disclose exceptions separately. | Evaluation setup; result tables; portability metric | Available-stack scope and GPU/CPU populations now explicit, including the mixed-machine Pennycook score. Controlled cohort pending. |
-| R1: missing CUDA Graph baseline for low latency | Paper-v1 bypassed explicit capture. Inferena now qualifies whole-phase forward, minimal forward and forward/loss/backward replay before a paired campaign. | Abstract; methodology; minimal-latency results; limitations; `CUDA-GRAPHS.md` | All 30 conditions pass on RTX 5070: five common models × two precisions × default/no-graph, default/graph and max-autotune/graph. Collection tag `p3hpc-collection-2026-09-10`; other machines and replicated comparisons remain open. No new timings added to the paper. |
+| R1, R2: mixed reference versions, execution modes and CPU fallback | Distinguish installed-stack availability from a controlled engine comparison. Pin a common PyTorch release where supported and disclose exceptions separately. | Evaluation setup; result tables; portability metric | RTX controlled cohort complete at Inferena `6f5f94cf`; AMD default-mode collection pending. Both AMD max-autotune failures are retained as availability results. |
+| R1: missing CUDA Graph baseline for low latency | Paper-v1 bypassed explicit capture. Inferena now qualifies whole-phase forward, minimal forward and forward/loss/backward replay before a paired campaign. | Abstract; methodology; minimal-latency results; limitations; `CUDA-GRAPHS.md` | RTX 5070 campaign complete: 30 qualification and 90 measurement pairs across default/no-graph, default/graph and max-autotune/graph. No new timings have yet replaced the frozen tables. |
 | R1, R2: small workloads and consumer hardware do not establish datacenter scaling | State the consumer/edge question, reduced shapes and absent optimizer/distributed work. | Abstract; introduction; workloads; limitations; conclusion | Consumer/edge framing and datacenter/distributed-work exclusion revised. No scale extension claimed. |
 | R1, R2, R3: deployment efficiency is not programmer productivity | Separate compile/footprint metrics from qualitative application-author, backend-maintainer and debugging costs. | Deployment/productivity section; introduction; conclusion | Section retitled and rewritten, including the eager-PyTorch comparison and static-debugging costs. [Study guide](../../docs/study/observability.md) supplies detail. No productivity score claimed. |
 | R2: separate host/runtime overhead from GPU kernel costs | Pair synchronized wall time with host/GPU timelines and kernel-family profiles in separate diagnostic runs. Overlap prevents treating wall time minus summed dispatch medians as exact CPU time. | Methodology; minimal-latency results; gap analysis | Qualified Systems/Graphics diagnostics now separate host encoding, GPU execution and parameter placement on RTX 5070. Resident 135M/1.7B pairs retain full CUDA Graph gates. No removable-barrier percentage established; [development analysis](../../docs/experiments.md) remains separate from the frozen matrix. |
@@ -108,9 +118,9 @@ Common questions and prepared responses are in
 [the rehearsal guide](../../docs/study/p3hpc-questions.md); they are anticipated
 discussion topics, not a substitute for actual review comments.
 
-Next evidence gate: collect the qualified common-model cohort and qualify
-each additional platform locally. Keep graph/uncaptured controls on the same
-device, rotate order across fresh processes, and recollect both engines in
+Next evidence gate: complete the default-mode AMD availability cohorts and
+qualify each additional platform locally. Keep graph/uncaptured controls on
+the same device, rotate order across fresh processes, and recollect both engines in
 the same campaign. The larger-model placement experiments are not a silent
 change to that collection tag. Do not interpret 20 samples from one process as 20
 independent experimental replicates. Preserve source refs and concise results,
