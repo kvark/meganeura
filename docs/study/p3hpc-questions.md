@@ -230,6 +230,13 @@ and provide GPU-reference-only ratios separately. The complete-machine
 portability score includes CPU because that is the working reference on that
 machine, not because CPU time measures the iGPU's hardware potential.
 
+The camera-ready follow-up adds a different Intel machine: Arc B570 versus the
+common PyTorch 2.13 XPU source. Default/no-graph completes all pairs, but native
+dense embedding backward fails a shape-derived exact probe. The runner selects
+PyTorch's qualified dense `index_add` equivalent and records it in every
+affected result. Keep this separate from the frozen RPL-U/CPU row and call it a
+qualified-workaround availability result, not stock native-XPU performance.
+
 ### 20. Why not PyTorch max-autotune or CUDA graphs?
 
 Short: they were absent from the frozen matrix; the controlled follow-up tests

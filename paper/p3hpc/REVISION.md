@@ -36,6 +36,15 @@ search as part of the portability surface. AMD default-mode collection remains
 valid as an explicitly labeled availability subset; no eager timing replaces
 the failed condition.
 
+The Arc B570 follow-up at Inferena `f4255c4b` completes all 10 default/no-graph
+qualification pairs and 30 replicated measurements. Its pinned XPU build has a
+repeatable native dense-embedding backward defect; a shape-derived probe selects
+and records the qualified dense `index_add` autograd equivalent for SmolLM2.
+Max-autotune did not finish its first ResNet qualification within one hour, so
+the B570 data is also an availability subset. This is useful portability
+evidence, but the workaround and omitted condition must remain visible in any
+new table.
+
 The response matrix below paraphrases `review1.txt`, `review2.txt` and
 `review3.txt` supplied at `/home/kvark/Documents/P3HPC`; private review text
 is not copied into Git. The CUDA Graph concern is confirmed in the frozen
@@ -103,7 +112,7 @@ comparison request.
 
 | Review / concern | Response and evidence | Manuscript location | Status |
 |---|---|---|---|
-| R1, R2: mixed reference versions, execution modes and CPU fallback | Distinguish installed-stack availability from a controlled engine comparison. Pin a common PyTorch release where supported and disclose exceptions separately. | Evaluation setup; result tables; portability metric | RTX controlled cohort complete at Inferena `6f5f94cf`; AMD default-mode collection pending. Both AMD max-autotune failures are retained as availability results. |
+| R1, R2: mixed reference versions, execution modes and CPU fallback | Distinguish installed-stack availability from a controlled engine comparison. Pin a common PyTorch release where supported and disclose exceptions separately. | Evaluation setup; result tables; portability metric | RTX controlled cohort complete at Inferena `6f5f94cf`; Arc B570 default-mode cohort complete at `f4255c4b` with its probe-selected PyTorch workaround labelled; AMD default-mode collection pending. AMD and XPU max-autotune limitations are retained as availability results. |
 | R1: missing CUDA Graph baseline for low latency | Paper-v1 bypassed explicit capture. Inferena now qualifies whole-phase forward, minimal forward and forward/loss/backward replay before a paired campaign. | Abstract; methodology; minimal-latency results; limitations; `CUDA-GRAPHS.md` | RTX 5070 campaign complete: 30 qualification and 90 measurement pairs across default/no-graph, default/graph and max-autotune/graph. No new timings have yet replaced the frozen tables. |
 | R1, R2: small workloads and consumer hardware do not establish datacenter scaling | State the consumer/edge question, reduced shapes and absent optimizer/distributed work. | Abstract; introduction; workloads; limitations; conclusion | Consumer/edge framing and datacenter/distributed-work exclusion revised. No scale extension claimed. |
 | R1, R2, R3: deployment efficiency is not programmer productivity | Separate compile/footprint metrics from qualitative application-author, backend-maintainer and debugging costs. | Deployment/productivity section; introduction; conclusion | Section retitled and rewritten, including the eager-PyTorch comparison and static-debugging costs. [Study guide](../../docs/study/observability.md) supplies detail. No productivity score claimed. |
@@ -119,7 +128,7 @@ Common questions and prepared responses are in
 discussion topics, not a substitute for actual review comments.
 
 Next evidence gate: complete the default-mode AMD availability cohorts and
-qualify each additional platform locally. Keep graph/uncaptured controls on
+qualify Windows/RTX 3050 and macOS locally. Keep graph/uncaptured controls on
 the same device, rotate order across fresh processes, and recollect both engines in
 the same campaign. The larger-model placement experiments are not a silent
 change to that collection tag. Do not interpret 20 samples from one process as 20

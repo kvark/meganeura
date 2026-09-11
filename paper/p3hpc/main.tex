@@ -736,6 +736,20 @@ search is itself part of the portability surface. \system{}'s bounded tuner
 creates and numerically qualifies candidates on the selected device, measures
 only successful candidates, and retains the incumbent after rejection.
 
+The same qualification exposed a different boundary on an Intel Arc B570.
+Default/no-graph XPU completed all ten workload--precision pairs and 30
+replicated measurements, but the pinned build's native dense embedding
+backward populated only 19,968 of 73,728 expected elements in an exact
+unique-index probe. A shape-derived preflight selected PyTorch's equivalent
+dense \code{index\_add} formulation, qualified all expected elements, and
+recorded the substitution with every affected result; the corrected full
+SmolLM gradient agrees with CPU and \system{}. Max-autotune remained in its
+first ResNet qualification after one hour and was omitted. We therefore label
+this an availability cohort using a qualified PyTorch workaround, not an
+unmodified native-XPU or full-condition result. It further illustrates why
+correctness and bounded search are parts of performance portability rather
+than setup details outside it.
+
 Two deployment costs are quantified. Compilation: \system{} prepares a
 workload (all three sessions, pipelines included) in 0.08--1.52\,s strict
 and 0.08--2.36\,s accelerated across the measured devices; where

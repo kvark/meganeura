@@ -103,6 +103,16 @@ Meganeura in each paired campaign. Store records outside main; retain source
 refs and concise conclusions. NVIDIA results cannot establish ROCm/Metal
 behavior.
 
+The Arc B570 default/no-graph availability cohort is complete at Inferena
+`f4255c4b`: all 10 qualification and 30 measured pairs pass. PyTorch's native
+dense embedding backward failed an exact `[128, 576]` probe in every SmolLM2
+process, so the probe selected and qualified a standard dense `index_add`
+autograd formulation. Each affected result records both probe outcomes and the
+selection under `execution.embedding_backward`; this must be labelled as a
+qualified workaround. XPU max-autotune did not finish its first ResNet
+qualification within one hour, so it remains an omitted condition rather than
+a hidden fallback or a timing sample.
+
 Do not replace individual favorable cells in the old table or compare new
 PyTorch measurements to old Meganeura timings. A new qualified cohort gets its
 own table and provenance. Until then, the submitted table remains a comparison
