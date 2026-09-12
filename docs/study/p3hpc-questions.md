@@ -239,8 +239,9 @@ qualified-workaround availability result, not stock native-XPU performance.
 
 ### 20. Why not PyTorch max-autotune or CUDA graphs?
 
-Short: they were absent from the frozen matrix; the controlled follow-up tests
-them and records where they are unavailable.
+Short: they were absent from the frozen matrix; the controlled follow-up
+requests them everywhere and treats declined, failed, or timed-out automatic
+search as a portability result.
 
 Detail: the frozen protocol uses default `torch.compile` on Linux and no
 additional manual capture. Its explicit CUDA Graph helpers were only used by
@@ -256,10 +257,11 @@ retains default mode and explicitly labels the missing condition. The new sweep
 also charges compile/search cost, memory and accuracy rather than silently
 replacing the old data.
 
-Do not overstate the NVIDIA condition: pinned Inductor's fixed 68-SM policy
-disables GEMM template search on both the 48-SM RTX 5070 and 20-SM RTX 3050.
-The records expose that effective state. We test stock requested max-autotune;
-we do not claim that every internal kernel family actually searched candidates.
+Pinned Inductor's fixed 68-SM policy declines GEMM template search on both the
+48-SM RTX 5070 and 20-SM RTX 3050 even though the experiment requests
+max-autotune. Say exactly that: automatic search was requested, and PyTorch's
+stock policy did not make it available on those targets. The records expose
+the decision; we do not patch in a benchmark-specific threshold.
 
 The [CUDA Graph follow-up](../../paper/p3hpc/CUDA-GRAPHS.md) explains the repair,
 the exact timed boundary and the new collection plan. Do not claim that the
