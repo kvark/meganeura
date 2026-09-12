@@ -24,7 +24,7 @@ use std::{
     time::Instant,
 };
 #[cfg(feature = "profiler")]
-use tracing::{Subscriber, span};
+use tracing::{Subscriber, field, span};
 #[cfg(feature = "profiler")]
 use tracing_subscriber::{Layer, layer::Context, prelude::*, registry::LookupSpan};
 
@@ -84,11 +84,30 @@ fn get_or_init() -> &'static Arc<Mutex<ProfilerInner>> {
 /// Safe to call multiple times (subsequent subscriber installs are
 /// no-ops). Must be called *before* any tracing spans you want captured.
 pub fn init() {
+    init_with_targets(&[]);
+}
+
+/// Initialize profiling and include spans emitted by embedding crates.
+///
+/// Meganeura spans are always captured. Each additional entry is a tracing
+/// target prefix, such as `"my_app"`; dependency targets remain out of the
+/// performance trace unless explicitly requested.
+pub fn init_with_targets(additional_targets: &[&str]) {
     let _ = get_or_init();
+    #[cfg(not(feature = "profiler"))]
+    let _ = additional_targets;
     #[cfg(feature = "profiler")]
     {
         let inner = get_or_init().clone();
-        let layer = ProfileLayer { inner };
+        let mut targets = vec!["meganeura".to_string()];
+        targets.extend(
+            additional_targets
+                .iter()
+                .map(|target| (*target).to_string()),
+        );
+        targets.sort_unstable();
+        targets.dedup();
+        let layer = ProfileLayer { inner, targets };
         let subscriber = tracing_subscriber::registry().with(layer);
         let _ = tracing::subscriber::set_global_default(subscriber);
     }
@@ -103,19 +122,39 @@ pub fn record_gpu_passes(passes: &[blade_graphics::GpuTimingSpan]) {
     if let Some(inner) = PROFILER.get() {
         let mut guard = inner.lock().unwrap();
         for pass in passes {
-            let Some(start_ns) = pass
-                .start
-                .checked_duration_since(guard.epoch)
-                .map(|duration| duration.as_nanos() as u64)
-            else {
-                continue;
+            let start_ns = match pass.start.checked_duration_since(guard.epoch) {
+                Some(duration) => duration.as_nanos() as u64,
+                None => {
+                    let delta_ns = guard.epoch.duration_since(pass.start).as_nanos();
+                    let timestamp_ns = guard.now_ns();
+                    guard.events.push(TraceEvent {
+                        name: format!(
+                            "gpu_timestamp_rejected pass={} before_epoch_ns={delta_ns}",
+                            pass.name
+                        ),
+                        timestamp_ns,
+                        track_uuid: CPU_TRACK_UUID,
+                        kind: EventKind::Instant,
+                    });
+                    continue;
+                }
             };
-            let Some(end_ns) = pass
-                .end
-                .checked_duration_since(guard.epoch)
-                .map(|duration| duration.as_nanos() as u64)
-            else {
-                continue;
+            let end_ns = match pass.end.checked_duration_since(guard.epoch) {
+                Some(duration) => duration.as_nanos() as u64,
+                None => {
+                    let delta_ns = guard.epoch.duration_since(pass.end).as_nanos();
+                    let timestamp_ns = guard.now_ns();
+                    guard.events.push(TraceEvent {
+                        name: format!(
+                            "gpu_timestamp_rejected pass={} end_before_epoch_ns={delta_ns}",
+                            pass.name
+                        ),
+                        timestamp_ns,
+                        track_uuid: CPU_TRACK_UUID,
+                        kind: EventKind::Instant,
+                    });
+                    continue;
+                }
             };
             guard.events.push(TraceEvent {
                 name: pass.name.clone(),
@@ -674,19 +713,128 @@ fn quantile(values: &[f64], q: f64) -> f64 {
 #[cfg(feature = "profiler")]
 pub struct ProfileLayer {
     inner: Arc<Mutex<ProfilerInner>>,
+    targets: Vec<String>,
 }
+
+#[cfg(feature = "profiler")]
+impl ProfileLayer {
+    fn captures_target(&self, target: &str) -> bool {
+        self.targets.iter().any(|prefix| {
+            target == prefix
+                || target
+                    .strip_prefix(prefix)
+                    .is_some_and(|suffix| suffix.starts_with("::"))
+        })
+    }
+}
+
+#[cfg(feature = "profiler")]
+#[derive(Default)]
+struct TraceFields(Vec<(String, String)>);
+
+#[cfg(feature = "profiler")]
+impl TraceFields {
+    fn record(&mut self, field: &field::Field, value: String) {
+        const MAX_VALUE_CHARS: usize = 120;
+        let mut value = value;
+        if value.chars().count() > MAX_VALUE_CHARS {
+            value = value.chars().take(MAX_VALUE_CHARS - 1).collect();
+            value.push('\u{2026}');
+        }
+        if let Some(entry) = self.0.iter_mut().find(|entry| entry.0 == field.name()) {
+            entry.1 = value;
+        } else {
+            self.0.push((field.name().to_string(), value));
+        }
+    }
+
+    fn display_name(&self, base: &str) -> String {
+        let message = self
+            .0
+            .iter()
+            .find_map(|entry| (entry.0 == "message").then_some(entry.1.as_str()));
+        let base = message.unwrap_or(base);
+        let fields = self
+            .0
+            .iter()
+            .filter(|entry| entry.0 != "message")
+            .collect::<Vec<_>>();
+        if fields.is_empty() {
+            return base.to_string();
+        }
+        if fields.len() == 1 {
+            let field = fields[0];
+            return if field.0 == "name" {
+                format!("{base} {}", field.1)
+            } else {
+                format!("{base} {}={}", field.0, field.1)
+            };
+        }
+        let fields = fields
+            .iter()
+            .map(|entry| format!("{}={}", entry.0, entry.1))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("{base} {fields}")
+    }
+}
+
+#[cfg(feature = "profiler")]
+impl field::Visit for TraceFields {
+    fn record_i64(&mut self, field: &field::Field, value: i64) {
+        self.record(field, value.to_string());
+    }
+
+    fn record_u64(&mut self, field: &field::Field, value: u64) {
+        self.record(field, value.to_string());
+    }
+
+    fn record_bool(&mut self, field: &field::Field, value: bool) {
+        self.record(field, value.to_string());
+    }
+
+    fn record_str(&mut self, field: &field::Field, value: &str) {
+        self.record(field, value.to_string());
+    }
+
+    fn record_debug(&mut self, field: &field::Field, value: &dyn fmt::Debug) {
+        self.record(field, format!("{value:?}"));
+    }
+}
+
+#[cfg(feature = "profiler")]
+struct ProfileSpanName(String);
 
 #[cfg(feature = "profiler")]
 impl<S> Layer<S> for ProfileLayer
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
+    fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
+        if !self.captures_target(attrs.metadata().target()) {
+            return;
+        }
+        if let Some(span) = ctx.span(id) {
+            let mut fields = TraceFields::default();
+            attrs.record(&mut fields);
+            let name = fields.display_name(span.name());
+            span.extensions_mut().insert(ProfileSpanName(name));
+        }
+    }
+
     fn on_enter(&self, id: &span::Id, ctx: Context<'_, S>) {
         if let Some(span) = ctx.span(id) {
+            let Some(name) = span
+                .extensions()
+                .get::<ProfileSpanName>()
+                .map(|name| name.0.clone())
+            else {
+                return;
+            };
             let mut guard = self.inner.lock().unwrap();
             let ts = guard.now_ns();
             guard.events.push(TraceEvent {
-                name: span.name().to_string(),
+                name,
                 timestamp_ns: ts,
                 track_uuid: CPU_TRACK_UUID,
                 kind: EventKind::SliceBegin,
@@ -696,10 +844,17 @@ where
 
     fn on_exit(&self, id: &span::Id, ctx: Context<'_, S>) {
         if let Some(span) = ctx.span(id) {
+            let Some(name) = span
+                .extensions()
+                .get::<ProfileSpanName>()
+                .map(|name| name.0.clone())
+            else {
+                return;
+            };
             let mut guard = self.inner.lock().unwrap();
             let ts = guard.now_ns();
             guard.events.push(TraceEvent {
-                name: span.name().to_string(),
+                name,
                 timestamp_ns: ts,
                 track_uuid: CPU_TRACK_UUID,
                 kind: EventKind::SliceEnd,
@@ -708,10 +863,15 @@ where
     }
 
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        if !self.captures_target(event.metadata().target()) {
+            return;
+        }
+        let mut fields = TraceFields::default();
+        event.record(&mut fields);
         let mut guard = self.inner.lock().unwrap();
         let ts = guard.now_ns();
         guard.events.push(TraceEvent {
-            name: event.metadata().name().to_string(),
+            name: fields.display_name(event.metadata().name()),
             timestamp_ns: ts,
             track_uuid: CPU_TRACK_UUID,
             kind: EventKind::Instant,
@@ -968,6 +1128,54 @@ mod tests {
         }
         let t2 = now_ns();
         assert!(t2 >= t1);
+    }
+
+    #[cfg(feature = "profiler")]
+    #[test]
+    fn trace_fields_make_span_names_readable() {
+        let empty = TraceFields::default();
+        assert_eq!(empty.display_name("pipeline"), "pipeline");
+
+        let one = TraceFields(vec![("name".into(), "MatMul:cooperative".into())]);
+        assert_eq!(one.display_name("pipeline"), "pipeline MatMul:cooperative");
+
+        let measured = TraceFields(vec![("source_bytes".into(), "4627".into())]);
+        assert_eq!(
+            measured.display_name("naga_parse"),
+            "naga_parse source_bytes=4627"
+        );
+
+        let several = TraceFields(vec![
+            ("dispatches".into(), "1034".into()),
+            ("buffers".into(), "1703".into()),
+        ]);
+        assert_eq!(
+            several.display_name("session_init"),
+            "session_init dispatches=1034 buffers=1703"
+        );
+
+        let event = TraceFields(vec![
+            ("message".into(), "GPU timestamps resolved".into()),
+            ("durations".into(), "8".into()),
+            ("spans".into(), "8".into()),
+        ]);
+        assert_eq!(
+            event.display_name("event src/runtime.rs:25"),
+            "GPU timestamps resolved durations=8 spans=8"
+        );
+    }
+
+    #[cfg(feature = "profiler")]
+    #[test]
+    fn profile_targets_exclude_dependency_noise() {
+        let layer = ProfileLayer {
+            inner: get_or_init().clone(),
+            targets: vec!["meganeura".into(), "buddy".into()],
+        };
+        assert!(layer.captures_target("meganeura::runtime"));
+        assert!(layer.captures_target("buddy::brain::gemma4"));
+        assert!(!layer.captures_target("buddy_system"));
+        assert!(!layer.captures_target("libwayshot_xcap"));
     }
 
     #[test]

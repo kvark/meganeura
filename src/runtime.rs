@@ -21,7 +21,13 @@ pub(super) fn wait_for_timed_encoder(
     let result = gpu.wait_for(sync, !0);
     if matches!(&result, Ok(true)) {
         encoder.resolve_timings();
-        crate::profiler::record_gpu_passes(encoder.timing_spans());
+        let spans = encoder.timing_spans();
+        tracing::debug!(
+            durations = encoder.timings().len(),
+            spans = spans.len(),
+            "GPU timestamps resolved"
+        );
+        crate::profiler::record_gpu_passes(spans);
     }
     result
 }
@@ -1110,6 +1116,20 @@ struct Pipelines {
     specialize_conv: Option<ConvSpecialization>,
 }
 
+fn create_profiled_pipeline(
+    gpu: &Gpu,
+    name: String,
+    layout: &blade_graphics::ShaderDataLayout,
+    compute: blade_graphics::ShaderFunction<'_>,
+) -> blade_graphics::ComputePipeline {
+    let _span = tracing::info_span!("pipeline", name = %name).entered();
+    gpu.create_compute_pipeline(blade_graphics::ComputePipelineDesc {
+        name: &name,
+        data_layouts: &[layout],
+        compute,
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ConvSpecialization {
     native_division: bool,
@@ -1308,11 +1328,12 @@ impl Pipelines {
                     for entry in entries {
                         let layout = shader_data_layout(entry);
                         let variant = key(entry.clone());
-                        let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                            name: &variant.label(),
-                            data_layouts: &[&layout],
-                            compute: shader.at(entry.entry_point()),
-                        });
+                        let pipeline = create_profiled_pipeline(
+                            gpu,
+                            variant.label(),
+                            &layout,
+                            shader.at(entry.entry_point()),
+                        );
                         target.insert(variant, pipeline);
                     }
                 }
@@ -1381,11 +1402,8 @@ impl Pipelines {
             });
             let layout = shader_data_layout(&entry);
             let key = Variant::Attention(entry.clone(), hd);
-            let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                name: &key.label(),
-                data_layouts: &[&layout],
-                compute: shader.at(entry.entry_point()),
-            });
+            let pipeline =
+                create_profiled_pipeline(gpu, key.label(), &layout, shader.at(entry.entry_point()));
             map.insert(key, pipeline);
         }
         // Conv2d coop dispatches were rewritten by `select_variants` to
@@ -1449,11 +1467,12 @@ impl Pipelines {
                 });
                 let layout = shader_data_layout(entry);
                 let key = Variant::Coop(entry.clone());
-                let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                    name: &key.label(),
-                    data_layouts: &[&layout],
-                    compute: shader.at(entry.entry_point()),
-                });
+                let pipeline = create_profiled_pipeline(
+                    gpu,
+                    key.label(),
+                    &layout,
+                    shader.at(entry.entry_point()),
+                );
                 map.insert(key, pipeline);
             }
         }
@@ -1471,11 +1490,8 @@ impl Pipelines {
             let entry = ShaderEntry::MatMulGemv;
             let layout = <MatMulRmsNormData as blade_graphics::ShaderData>::layout();
             let key = Variant::GemvRmsNorm(entry.clone());
-            let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                name: &key.label(),
-                data_layouts: &[&layout],
-                compute: shader.at(entry.entry_point()),
-            });
+            let pipeline =
+                create_profiled_pipeline(gpu, key.label(), &layout, shader.at(entry.entry_point()));
             map.insert(key, pipeline);
         }
 
@@ -1519,11 +1535,12 @@ impl Pipelines {
                     naga_module: Some(sm.module),
                 });
                 let layout = shader_data_layout(&dispatch.shader);
-                let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                    name: &slot.key().label(),
-                    data_layouts: &[&layout],
-                    compute: shader.at(dispatch.shader.entry_point()),
-                });
+                let pipeline = create_profiled_pipeline(
+                    gpu,
+                    slot.key().label(),
+                    &layout,
+                    shader.at(dispatch.shader.entry_point()),
+                );
                 slot.insert(pipeline);
             }
 
@@ -1544,11 +1561,12 @@ impl Pipelines {
                     naga_module: Some(sm.module),
                 });
                 let layout = shader_data_layout(&dispatch.shader);
-                let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                    name: &coop_key.label(),
-                    data_layouts: &[&layout],
-                    compute: shader.at(dispatch.shader.entry_point()),
-                });
+                let pipeline = create_profiled_pipeline(
+                    gpu,
+                    coop_key.label(),
+                    &layout,
+                    shader.at(dispatch.shader.entry_point()),
+                );
                 map.insert(coop_key, pipeline);
             }
         }
@@ -1582,11 +1600,12 @@ impl Pipelines {
                     naga_module: Some(sm.module),
                 });
                 let layout = matmul_with_prologue_layout(prologue.factors.len());
-                let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                    name: &key.label(),
-                    data_layouts: &[&layout],
-                    compute: shader.at(dispatch.shader.entry_point()),
-                });
+                let pipeline = create_profiled_pipeline(
+                    gpu,
+                    key.label(),
+                    &layout,
+                    shader.at(dispatch.shader.entry_point()),
+                );
                 map.insert(key, pipeline);
             }
         }
@@ -1615,11 +1634,12 @@ impl Pipelines {
                 naga_module: Some(sm.module),
             });
             let layout = pointwise_data_layout(dag.n_inputs);
-            let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                name: &key.label(),
-                data_layouts: &[&layout],
-                compute: shader.at(crate::schedule::POINTWISE_ENTRY),
-            });
+            let pipeline = create_profiled_pipeline(
+                gpu,
+                key.label(),
+                &layout,
+                shader.at(crate::schedule::POINTWISE_ENTRY),
+            );
             map.insert(key, pipeline);
         }
 
@@ -1639,11 +1659,12 @@ impl Pipelines {
                 naga_module: Some(sm.module),
             });
             let layout = reduction_data_layout(kernel);
-            let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                name: &key.label(),
-                data_layouts: &[&layout],
-                compute: shader.at(crate::schedule::REDUCTION_ENTRY),
-            });
+            let pipeline = create_profiled_pipeline(
+                gpu,
+                key.label(),
+                &layout,
+                shader.at(crate::schedule::REDUCTION_ENTRY),
+            );
             map.insert(key, pipeline);
         }
 
@@ -1675,11 +1696,7 @@ impl Pipelines {
                 naga_module: Some(sm.module),
             });
             let layout = horizontal_matmul_layout(count);
-            let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                name: &key.label(),
-                data_layouts: &[&layout],
-                compute: shader.at("main"),
-            });
+            let pipeline = create_profiled_pipeline(gpu, key.label(), &layout, shader.at("main"));
             map.insert(key, pipeline);
         }
 
@@ -1725,11 +1742,12 @@ impl Pipelines {
                     naga_module: Some(sm.module),
                 });
                 let layout = shader_data_layout(&dispatch.shader);
-                let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                    name: &key.label(),
-                    data_layouts: &[&layout],
-                    compute: shader.at(dispatch.shader.entry_point()),
-                });
+                let pipeline = create_profiled_pipeline(
+                    gpu,
+                    key.label(),
+                    &layout,
+                    shader.at(dispatch.shader.entry_point()),
+                );
                 map.insert(key, pipeline);
             }
         }
@@ -3027,11 +3045,8 @@ impl Session {
             }
         };
         let layout = shader_data_layout(&ShaderEntry::MatMul);
-        let mut pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-            name: "main",
-            data_layouts: &[&layout],
-            compute: shader.at("main"),
-        });
+        let mut pipeline =
+            create_profiled_pipeline(gpu, "coop_probe".to_string(), &layout, shader.at("main"));
 
         // Test with a multi-tile matmul using varying values. A uniform
         // pattern like A[i,j]=i+1, B[i,j]=j+1 misses bugs where the shader
@@ -3183,9 +3198,18 @@ impl Session {
     }
 
     fn build_session_impl(plan: ExecutionPlan, gpu: Arc<Gpu>, opts: SessionOptions) -> Self {
+        let _session_span = tracing::info_span!(
+            "session_init",
+            dispatches = plan.dispatches.len(),
+            buffers = plan.buffers.len()
+        )
+        .entered();
         let coop_caps = gpu.capabilities().cooperative_matrix;
-        let coop_config = Self::select_coop_config(&coop_caps, opts.coop)
-            .filter(|config| Self::test_coop_matmul(&gpu, config));
+        let coop_config = {
+            let _span = tracing::info_span!("coop_probe").entered();
+            Self::select_coop_config(&coop_caps, opts.coop)
+                .filter(|config| Self::test_coop_matmul(&gpu, config))
+        };
         if let Some(ref config) = coop_config {
             log::info!(
                 "cooperative matrix enabled (tile={}×{}, {}, f32_tile={}, f16_tile={})",
@@ -3211,6 +3235,7 @@ impl Session {
         }
 
         let mut plan = plan;
+        let schedule_span = tracing::info_span!("schedule").entered();
 
         // Per-dispatch kernel-variant selection: one pass, one owner.
         select_variants(
@@ -3259,12 +3284,14 @@ impl Session {
                 }
             }
         }
+        drop(schedule_span);
 
         // Lifetime-based buffer aliasing: step-local intermediates with
         // disjoint live ranges (at barrier-group granularity) share one
         // physical allocation. See `memplan` for the safety argument.
         // Debug sessions keep every logical buffer distinct and
         // host-visible so any node's value can be read back after a step.
+        let memory_plan_span = tracing::info_span!("memory_plan").entered();
         let mut alias = if opts.debug || opts.no_alias {
             if opts.debug {
                 log::info!("debug session: buffer aliasing disabled");
@@ -3368,6 +3395,13 @@ impl Session {
             .and_then(|bytes| bytes.checked_add(usize::from(!plan.param_grad_pairs.is_empty()) * 4))
             .expect("session allocation size overflow");
         ensure_device_memory_budget(&gpu, planned_allocation_bytes, "session buffers");
+        drop(memory_plan_span);
+        let buffer_alloc_span = tracing::info_span!(
+            "buffer_alloc",
+            allocations = alias.sizes.len(),
+            bytes = planned_allocation_bytes
+        )
+        .entered();
         let physical_buffers: Vec<Arc<PhysicalBuffer>> = alias
             .sizes
             .iter()
@@ -3413,13 +3447,20 @@ impl Session {
                 std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
             }
         }
+        drop(buffer_alloc_span);
 
-        let pipelines = Pipelines::new(&gpu, &plan, coop_config.as_ref());
-        let mut encoder = gpu.create_command_encoder(blade_graphics::CommandEncoderDesc {
-            name: "meganeura",
-            buffer_count: 2,
-            manual_barriers: false,
-        });
+        let pipelines = {
+            let _span = tracing::info_span!("pipeline_set").entered();
+            Pipelines::new(&gpu, &plan, coop_config.as_ref())
+        };
+        let mut encoder = {
+            let _span = tracing::info_span!("encoder_create").entered();
+            gpu.create_command_encoder(blade_graphics::CommandEncoderDesc {
+                name: "meganeura",
+                buffer_count: 2,
+                manual_barriers: false,
+            })
+        };
 
         // Zero-fill device-local allocations on the GPU (no host pointer).
         // One submission at build time; the wait below orders it before
@@ -3893,7 +3934,13 @@ pub fn init_gpu_context() -> Result<blade_graphics::Context, blade_graphics::Not
 pub fn init_gpu_context_with(
     options: GpuOptions,
 ) -> Result<blade_graphics::Context, blade_graphics::NotSupportedError> {
-    let _span = tracing::info_span!("gpu_context_init").entered();
+    let _span = tracing::info_span!(
+        "gpu_context_init",
+        timing = options.timing,
+        capture = options.capture,
+        device = ?options.device_id
+    )
+    .entered();
     let dev_id = options.device_id;
     unsafe {
         blade_graphics::Context::init(blade_graphics::ContextDesc {
@@ -5915,7 +5962,13 @@ impl Session {
 
     /// Execute the full dispatch sequence (forward + backward + update).
     pub fn step(&mut self) {
-        let _span = tracing::info_span!("step").entered();
+        let _span = tracing::info_span!(
+            "step",
+            dispatches = self.plan.dispatches.len(),
+            groups = self.groups.len(),
+            chunks = self.submission_chunks,
+        )
+        .entered();
         self.wait();
 
         self.encoder.start();
@@ -5945,10 +5998,17 @@ impl Session {
             let total = self.groups.len();
             let per_chunk = total.div_ceil(self.submission_chunks.min(total).max(1));
             let mut start = 0;
+            let chunk_count = if total == 0 {
+                0
+            } else {
+                total.div_ceil(per_chunk)
+            };
+            let mut chunk_index = 0;
             while start < total {
                 let end = (start + per_chunk).min(total);
                 {
-                    let mut pass = self.encoder.compute("step");
+                    let label = format!("step {}/{}", chunk_index + 1, chunk_count);
+                    let mut pass = self.encoder.compute(&label);
                     for gi in start..end {
                         if gi > start {
                             pass.barrier();
@@ -5964,6 +6024,7 @@ impl Session {
                     }
                 }
                 start = end;
+                chunk_index += 1;
                 if start < total {
                     self.sync_point = Some(self.gpu.submit(&mut self.encoder));
                     self.encoder.start();
