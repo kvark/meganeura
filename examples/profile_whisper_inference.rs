@@ -65,14 +65,9 @@ fn main() {
     }
     session.wait();
 
-    // Profiled step: per-pass GPU timestamps go through encoder.timings()
-    // and are printed by dump_gpu_timings(). The dump happens after the
-    // *next* step() finishes.
+    // Blade resolves the profiled pass starts and final completion timestamp
+    // immediately after this step's completion fence.
     session.set_profiling(true);
-    session.step();
-    session.wait();
-    session.step();
-    session.wait();
     session.step();
     session.wait();
     session.dump_gpu_timings();

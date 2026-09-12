@@ -1,8 +1,8 @@
 //! Profiling infrastructure producing Perfetto binary traces (`.pftrace`).
 //!
 //! CPU-side work is captured automatically via [`tracing`] spans. Calibrated
-//! GPU pass ranges come from blade-graphics hardware timestamp queries. Both
-//! land on separate tracks in the resulting trace, viewable in
+//! GPU pass ranges come from Blade's calibrated pass-start and completion
+//! timestamps. Both land on separate tracks in the resulting trace, viewable in
 //! [Perfetto UI](https://ui.perfetto.dev).
 //!
 //! # Quick start
@@ -116,21 +116,25 @@ pub fn init_with_targets(additional_targets: &[&str]) {
 /// Record calibrated GPU pass ranges on the GPU track.
 ///
 /// Blade maps hardware timestamp queries into the same monotonic clock as
-/// [`Instant`]. Keeping both endpoints preserves real queue gaps and overlap;
-/// CPU submission time is intentionally not involved.
-pub fn record_gpu_passes(passes: &[blade_graphics::GpuTimingSpan]) {
+/// [`Instant`]. Each pass ends at the next pass start, or at `done` for the
+/// final pass. CPU submission time is intentionally not involved.
+pub fn record_gpu_timings(timings: &blade_graphics::Timings) {
     if let Some(inner) = PROFILER.get() {
         let mut guard = inner.lock().unwrap();
-        for pass in passes {
-            let start_ns = match pass.start.checked_duration_since(guard.epoch) {
+        for (index, &(ref name, start)) in timings.passes.iter().enumerate() {
+            let end = timings
+                .passes
+                .get(index + 1)
+                .map_or(timings.done, |next| next.1);
+            let start_ns = match start.checked_duration_since(guard.epoch) {
                 Some(duration) => duration.as_nanos() as u64,
                 None => {
-                    let delta_ns = guard.epoch.duration_since(pass.start).as_nanos();
+                    let delta_ns = guard.epoch.duration_since(start).as_nanos();
                     let timestamp_ns = guard.now_ns();
                     guard.events.push(TraceEvent {
                         name: format!(
                             "gpu_timestamp_rejected pass={} before_epoch_ns={delta_ns}",
-                            pass.name
+                            name
                         ),
                         timestamp_ns,
                         track_uuid: CPU_TRACK_UUID,
@@ -139,15 +143,15 @@ pub fn record_gpu_passes(passes: &[blade_graphics::GpuTimingSpan]) {
                     continue;
                 }
             };
-            let end_ns = match pass.end.checked_duration_since(guard.epoch) {
+            let end_ns = match end.checked_duration_since(guard.epoch) {
                 Some(duration) => duration.as_nanos() as u64,
                 None => {
-                    let delta_ns = guard.epoch.duration_since(pass.end).as_nanos();
+                    let delta_ns = guard.epoch.duration_since(end).as_nanos();
                     let timestamp_ns = guard.now_ns();
                     guard.events.push(TraceEvent {
                         name: format!(
                             "gpu_timestamp_rejected pass={} end_before_epoch_ns={delta_ns}",
-                            pass.name
+                            name
                         ),
                         timestamp_ns,
                         track_uuid: CPU_TRACK_UUID,
@@ -157,13 +161,13 @@ pub fn record_gpu_passes(passes: &[blade_graphics::GpuTimingSpan]) {
                 }
             };
             guard.events.push(TraceEvent {
-                name: pass.name.clone(),
+                name: name.clone(),
                 timestamp_ns: start_ns,
                 track_uuid: GPU_TRACK_UUID,
                 kind: EventKind::SliceBegin,
             });
             guard.events.push(TraceEvent {
-                name: pass.name.clone(),
+                name: name.clone(),
                 timestamp_ns: end_ns,
                 track_uuid: GPU_TRACK_UUID,
                 kind: EventKind::SliceEnd,
@@ -618,11 +622,7 @@ pub fn capture_session_profile(
     let backward_dispatch_count = dispatch_count - forward_dispatch_count;
     let profiled_wall_median_ms = quantile(&profiled_wall_samples_ms, 0.5);
     let gpu_total_median_ms = quantile(&gpu_total_samples_ms, 0.5);
-    let timing_contract = if device.driver_name == "Metal" {
-        "Blade hardware counter samples at compute-encoder boundaries; one compute pass per plan dispatch"
-    } else {
-        "Blade hardware timestamp intervals at pass boundaries; one compute pass per plan dispatch; Vulkan top-of-pipe intervals include the inter-pass barrier before the following dispatch"
-    };
+    let timing_contract = "Blade calibrated pass-start timestamps on the process monotonic clock; each interval ends at the next pass start or final submission completion; one compute pass per plan dispatch";
 
     Ok(SessionProfile {
         schema_version: 1,
@@ -1134,7 +1134,7 @@ mod tests {
     }
 
     #[test]
-    fn test_record_gpu_passes() {
+    fn test_record_gpu_timings() {
         let inner = get_or_init();
         let epoch = {
             let mut guard = inner.lock().unwrap();
@@ -1142,30 +1142,23 @@ mod tests {
             guard.epoch
         };
 
-        record_gpu_passes(&[
-            blade_graphics::GpuTimingSpan {
-                name: "relu".into(),
-                start: epoch + Duration::from_nanos(5_000),
-                end: epoch + Duration::from_nanos(5_100),
-            },
-            blade_graphics::GpuTimingSpan {
-                name: "matmul".into(),
-                // Deliberately overlaps `relu`: recording must retain the
-                // hardware timestamps rather than serialize pass durations.
-                start: epoch + Duration::from_nanos(5_050),
-                end: epoch + Duration::from_nanos(5_550),
-            },
-        ]);
+        record_gpu_timings(&blade_graphics::Timings {
+            passes: vec![
+                ("relu".into(), epoch + Duration::from_nanos(5_000)),
+                ("matmul".into(), epoch + Duration::from_nanos(5_100)),
+            ],
+            done: epoch + Duration::from_nanos(5_550),
+        });
 
         let guard = inner.lock().unwrap();
         assert_eq!(guard.events.len(), 4); // 2 begin + 2 end
         assert_eq!(guard.events[0].name, "relu");
         assert_eq!(guard.events[0].timestamp_ns, 5000);
         assert_eq!(guard.events[0].kind, EventKind::SliceBegin);
-        assert_eq!(guard.events[1].timestamp_ns, 5100); // 5000 + 100
+        assert_eq!(guard.events[1].timestamp_ns, 5100);
         assert_eq!(guard.events[1].kind, EventKind::SliceEnd);
         assert_eq!(guard.events[2].name, "matmul");
-        assert_eq!(guard.events[2].timestamp_ns, 5050);
+        assert_eq!(guard.events[2].timestamp_ns, 5100);
         assert_eq!(guard.events[3].timestamp_ns, 5550);
 
         drop(guard);
@@ -1216,12 +1209,11 @@ mod tests {
 
         let event = TraceFields(vec![
             ("message".into(), "GPU timestamps resolved".into()),
-            ("durations".into(), "8".into()),
-            ("spans".into(), "8".into()),
+            ("passes".into(), "8".into()),
         ]);
         assert_eq!(
             event.display_name("event src/runtime.rs:25"),
-            "GPU timestamps resolved durations=8 spans=8"
+            "GPU timestamps resolved passes=8"
         );
     }
 

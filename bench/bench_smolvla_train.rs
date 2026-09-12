@@ -262,13 +262,8 @@ fn main() {
             eprintln!("  {:>30}: {}", name, count);
         }
 
-        // GPU timing breakdown — blade 0.8.1+ supports up to 1000 timestamps
-        // per submission.
-        //
-        // Blade's command encoder uses a 2-buffer ring: start() reads timestamps
-        // from 2 submissions ago. So we need 3 steps to get step A's timings:
-        //   step A (profiling=true) → step B (advances ring) → step C's start()
-        //   reads A's data → dump_gpu_timings() shows A's per-shader breakdown.
+        // GPU timing breakdown. Blade resolves the completed pass timestamps
+        // directly after the submission fence.
         infer_session.set_profiling(true);
         eprintln!(
             "\n=== Forward pass GPU timings ({} dispatches) ===",
@@ -276,32 +271,20 @@ fn main() {
         );
         set_inputs(&mut infer_session);
         infer_session.step();
-        infer_session.wait(); // step A — profiling run, records shader timestamps
-        set_inputs(&mut infer_session);
-        infer_session.step();
-        infer_session.wait(); // step B — advances ring buffer
-        set_inputs(&mut infer_session);
-        infer_session.step(); // step C — start() reads step A's timestamps
-        infer_session.dump_gpu_timings();
         infer_session.wait();
+        infer_session.dump_gpu_timings();
 
         train_session.set_profiling(true);
         eprintln!(
             "\n=== Training step GPU timings ({} dispatches) ===",
             train_session.plan().dispatches.len()
         );
-        // Skip sgd_step during profiling so the ring buffer captures
-        // forward+backward timings (not SGD update timings).
+        // Skip sgd_step during profiling so this captures forward+backward
+        // timings rather than SGD update timings.
         set_inputs(&mut train_session);
         train_session.step();
-        train_session.wait(); // step A — profiling run
-        set_inputs(&mut train_session);
-        train_session.step();
-        train_session.wait(); // step B — advances ring buffer
-        set_inputs(&mut train_session);
-        train_session.step(); // step C — start() reads step A's timestamps
-        train_session.dump_gpu_timings();
         train_session.wait();
+        train_session.dump_gpu_timings();
 
         return;
     }

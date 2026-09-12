@@ -399,7 +399,7 @@ optimizer/KV updates still happen during this diagnostic step.
 Short: no. Per-dispatch instrumentation changes the pass/barrier structure.
 
 Detail: keep raw profile samples and the overhead relative to normal grouped
-execution. Reset state for the timestamp-ring advance runs too. The structured
+execution. Reset state before every retained profile run. The structured
 collector cannot assign appended optimizer passes to graph metadata, so capture
 without those passes and time full optimizer-backed training separately.
 Likewise, the new tuner's isolated scratch result needs whole-step confirmation.

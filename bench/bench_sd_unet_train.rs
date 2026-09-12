@@ -106,29 +106,14 @@ fn main() {
             "\n=== GPU timings ({} dispatches) ===",
             session.plan().dispatches.len()
         );
-        // 3-step dance for blade's 2-buffer ring:
-        // step A (profiled) → step B (advance ring) → step C reads A's timestamps
+        // Blade resolves this profiled step's timestamps after its fence.
         let noisy: Vec<f32> = (0..in_size).map(|_| next_f32()).collect();
         let noise: Vec<f32> = (0..in_size).map(|_| next_f32() * 0.5).collect();
         session.set_input("noisy_latent", &noisy);
         session.set_input("noise_target", &noise);
         session.step();
         session.wait();
-
-        let noisy: Vec<f32> = (0..in_size).map(|_| next_f32()).collect();
-        let noise: Vec<f32> = (0..in_size).map(|_| next_f32() * 0.5).collect();
-        session.set_input("noisy_latent", &noisy);
-        session.set_input("noise_target", &noise);
-        session.step();
-        session.wait();
-
-        let noisy: Vec<f32> = (0..in_size).map(|_| next_f32()).collect();
-        let noise: Vec<f32> = (0..in_size).map(|_| next_f32() * 0.5).collect();
-        session.set_input("noisy_latent", &noisy);
-        session.set_input("noise_target", &noise);
-        session.step();
         session.dump_gpu_timings();
-        session.wait();
 
         session.set_profiling(false);
         return;

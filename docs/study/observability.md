@@ -218,8 +218,8 @@ Meganeura has three complementary views:
    selected pipeline keys, workgroups, provenance, family/phase aggregates,
    memory/device information and instrumentation overhead. Timestamp pools
    must be enabled before context creation. Captures serialize dispatches;
-   two additional normal executions per sample advance the command-buffer
-   ring. The preparation callback must reset changing state for **all** runs.
+   Blade resolves calibrated pass starts and final completion after each
+   fence. The preparation callback must reset changing state for each run.
 3. **Normal end-to-end timing:** grouped execution with appropriate warmups,
    waits, transfer boundaries and repeated trials on an idle device. This is
    the test of a speed claim, not the sum of instrumented dispatch medians.
@@ -461,10 +461,10 @@ does not establish zero harm. No whole-step or fleet speedup was measured.
 
 The [whole-step localization runner](../experiments.md#training-profile-2026-09-06)
 profiles synthetic ResNet, SmolLM2 and Whisper F+L+B without optimizer/clip
-passes. It compares every retained profiled full state before the collector's
-two ordinary ring-advance steps overwrite it; readbacks use separate encoders,
-outside the retained wall timer. The GPU regression checks this callback order
-and exact timestamp counts. All 45 captured full states match bitwise.
+passes. It compares every retained profiled full state before the next sample
+overwrites it; readbacks use separate encoders, outside the retained wall
+timer. The GPU regression checks this callback order and exact timestamp
+counts. All 45 captured full states match bitwise.
 
 Normal timing blocks still drift: Whisper's first after-block median is nearly
 twice its before-block median. Profiled/normal wall ratios are retained, not

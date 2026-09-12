@@ -11,25 +11,21 @@ type Gpu = blade_graphics::Context;
 
 /// Wait for a command encoder and harvest every completed timestamp query.
 ///
-/// Temporary transfer encoders used during model loading would otherwise be
-/// destroyed before Blade's timing ring rotates, dropping their GPU spans.
+/// Temporary transfer encoders used during model loading must resolve their
+/// completed queries before being destroyed or their GPU spans are lost.
 pub(super) fn wait_for_timed_encoder(
     gpu: &Gpu,
     sync: &blade_graphics::SyncPoint,
     encoder: &mut blade_graphics::CommandEncoder,
-) -> Result<bool, blade_graphics::DeviceError> {
+) -> Result<Option<blade_graphics::Timings>, blade_graphics::DeviceError> {
     let result = gpu.wait_for(sync, !0);
-    if matches!(&result, Ok(true)) {
-        encoder.resolve_timings();
-        let spans = encoder.timing_spans();
-        tracing::debug!(
-            durations = encoder.timings().len(),
-            spans = spans.len(),
-            "GPU timestamps resolved"
-        );
-        crate::profiler::record_gpu_passes(spans);
+    if !result? {
+        return Ok(None);
     }
-    result
+    let timings = encoder.get_timings().clone();
+    tracing::debug!(passes = timings.passes.len(), "GPU timestamps resolved");
+    crate::profiler::record_gpu_timings(&timings);
+    Ok(Some(timings))
 }
 
 /// Leave room for pipelines, command buffers, and driver-owned allocations
@@ -2825,6 +2821,8 @@ pub struct Session {
     /// See [`Session::set_submission_chunks`]. Always at least 1.
     submission_chunks: usize,
     sync_point: Option<blade_graphics::SyncPoint>,
+    /// Calibrated timings harvested when the most recent submission completed.
+    last_gpu_timings: Option<blade_graphics::Timings>,
     /// When true, run in multi-pass mode: one compute pass per dispatch
     /// with individual GPU timestamps. Enables `dump_gpu_timings()`.
     profiling: bool,
@@ -3671,6 +3669,7 @@ impl Session {
             encoder,
             submission_chunks: 1,
             sync_point: None,
+            last_gpu_timings: None,
             profiling: false,
             debug: opts.debug,
             optimizer_device,
@@ -3971,7 +3970,15 @@ impl Session {
     /// callers should normally use [`crate::profiler::capture_session_profile`]
     /// rather than managing timestamp collection directly.
     pub fn gpu_timings(&self) -> Vec<(String, std::time::Duration)> {
-        self.encoder.timings().to_vec()
+        self.last_gpu_timings
+            .as_ref()
+            .map(|timings| {
+                timings
+                    .pass_durations()
+                    .map(|(name, duration)| (name.to_owned(), duration))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Stable descriptive key for the pipeline selected by each plan
@@ -6042,7 +6049,7 @@ impl Session {
     ///
     /// Must be called after `step()` + `wait()`.
     pub fn dump_gpu_timings(&self) {
-        let timings = self.encoder.timings();
+        let timings = self.gpu_timings();
         if timings.is_empty() {
             eprintln!("(no GPU timings available)");
             return;
@@ -6057,7 +6064,7 @@ impl Session {
         // Aggregate by shader type
         let mut by_type: std::collections::HashMap<&str, (u32, std::time::Duration)> =
             std::collections::HashMap::new();
-        for &(ref name, dur) in timings {
+        for &(ref name, dur) in &timings {
             let entry = by_type.entry(name.as_str()).or_default();
             entry.0 += 1;
             entry.1 += dur;
@@ -6081,7 +6088,9 @@ impl Session {
     pub fn wait(&mut self) {
         if let Some(sp) = self.sync_point.take() {
             let _span = tracing::info_span!("wait").entered();
-            let _ = wait_for_timed_encoder(&self.gpu, &sp, &mut self.encoder);
+            if let Ok(Some(timings)) = wait_for_timed_encoder(&self.gpu, &sp, &mut self.encoder) {
+                self.last_gpu_timings = Some(timings);
+            }
         }
     }
 
