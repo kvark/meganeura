@@ -84,11 +84,12 @@ is authoritative. Each additional machine must pass its own qualification.
 These new records remain outside Git and do not silently replace the paper's
 frozen timings.
 
-The pinned Inductor source only enables its GEMM template search at 68 NVIDIA
-SMs. It therefore records `inductor_is_big_gpu=false` on the 48-SM RTX 5070 and
-20-SM RTX 3050. Keep calling this the stock requested max-autotune condition,
-not full GEMM search; the experiment does not override PyTorch's hardware
-policy or silently substitute a hand-tuned configuration.
+The campaign requests stock max-autotune on every NVIDIA target. Pinned
+Inductor then declines GEMM template search below its fixed 68-SM threshold,
+recording `inductor_is_big_gpu=false` on the 48-SM RTX 5070 and 20-SM RTX 3050.
+That is a measured automatic-search coverage limit, not a missing benchmark
+condition. We retain PyTorch's decision instead of introducing a
+benchmark-specific threshold override.
 
 The September 8 strict ResNet-50 pilot qualified all three captured phases,
 including every element of 108 gradient tensors. Its two process-level records
@@ -99,11 +100,12 @@ comparison. See that branch's `EXPERIMENT.md` for the small result table and
 the substantial graph-pool residency cost observed in the pilot.
 
 On each machine, first qualify all workloads. NVIDIA collects default
-compiled/no-graph, default compiled/graph, and max-autotune/graph. ROCm has no
-qualified explicit graph condition. Both AMD systems reject max-autotune while
-compiling diffusion training, so they collect default/no-graph with
-`--no-max-autotune`; the manifest labels the omitted condition and the failed
-attempts remain evidence. Rotate configuration order across at least three
+compiled/no-graph, default compiled/graph, and requested max-autotune/graph.
+ROCm has no qualified explicit graph condition. Both AMD systems enter the
+requested max-autotune search and fail while compiling diffusion training, so
+the failed attempts are portability evidence and the runnable default/no-graph
+cohort is collected with `--no-max-autotune`. Its manifest labels the omitted
+timing condition. Rotate configuration order across at least three
 fresh processes, keep precision and timing boundaries fixed, and recollect
 Meganeura in each paired campaign. Store records outside main; retain source
 refs and concise conclusions. NVIDIA results cannot establish ROCm/Metal
@@ -115,9 +117,9 @@ dense embedding backward failed an exact `[128, 576]` probe in every SmolLM2
 process, so the probe selected and qualified a standard dense `index_add`
 autograd formulation. Each affected result records both probe outcomes and the
 selection under `execution.embedding_backward`; this must be labelled as a
-qualified workaround. XPU max-autotune did not finish its first ResNet
-qualification within one hour, so it remains an omitted condition rather than
-a hidden fallback or a timing sample.
+qualified workaround. Requested XPU max-autotune did not finish its first
+ResNet qualification within one hour; that timeout is the availability result,
+and no eager fallback or favorable timing sample replaces it.
 
 Do not replace individual favorable cells in the old table or compare new
 PyTorch measurements to old Meganeura timings. A new qualified cohort gets its

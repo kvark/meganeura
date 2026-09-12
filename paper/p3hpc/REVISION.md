@@ -27,8 +27,11 @@ evidence to the one-device, narrow tile-search experiment; it is not an
 all-model/all-platform result, nor a comparison against greedy graph rewriting.
 
 September 11: the controlled RTX 5070 campaign completed all 120 paired entries
-(30 qualification and 90 replicated measurements) at Inferena `6f5f94cf`. On
-both AMD systems, PyTorch max-autotune instead fails while compiling the
+(30 qualification and 90 replicated measurements) at Inferena `6f5f94cf`.
+The experiment requests stock max-autotune on every target. Pinned Inductor's
+fixed 68-SM gate then declines GEMM template search on the 48-SM RTX 5070 and
+20-SM RTX 3050; this is measured search coverage, not an omitted control. On
+both AMD systems, requested PyTorch max-autotune instead fails while compiling the
 diffusion training graph:
 generated convolution candidates exhaust local memory or time out, and the
 remaining ATen fallback is malformed. The paper now treats automatic compiler
@@ -40,10 +43,9 @@ The Arc B570 follow-up at Inferena `f4255c4b` completes all 10 default/no-graph
 qualification pairs and 30 replicated measurements. Its pinned XPU build has a
 repeatable native dense-embedding backward defect; a shape-derived probe selects
 and records the qualified dense `index_add` autograd equivalent for SmolLM2.
-Max-autotune did not finish its first ResNet qualification within one hour, so
-the B570 data is also an availability subset. This is useful portability
-evidence, but the workaround and omitted condition must remain visible in any
-new table.
+Requested max-autotune did not finish its first ResNet qualification within one
+hour. The timeout is useful portability evidence; the runnable B570 cohort and
+its qualified workaround must remain visible in any new table.
 
 The response matrix below paraphrases `review1.txt`, `review2.txt` and
 `review3.txt` supplied at `/home/kvark/Documents/P3HPC`; private review text

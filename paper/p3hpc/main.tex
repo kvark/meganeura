@@ -723,20 +723,22 @@ on any machine. These are reproducible configuration facts, not a timed
 measure of installation effort.
 
 A post-submission controlled qualification for the camera-ready cohort pins
-one PyTorch source revision across vendor builds and tests stronger automatic
-conditions separately. The RTX~5070 completes default compilation with and
-without whole-phase CUDA Graph replay and requested max-autotune with replay.
-The pinned Inductor policy classifies this 48-SM GPU as too small for GEMM
-template search (its fixed threshold is 68 SMs), so the records distinguish the
-requested mode from that effective limitation rather than overriding PyTorch's
-stock hardware policy. On both AMD systems, max-autotune cannot compile the
-diffusion training graph:
+one PyTorch source revision across vendor builds and requests its strongest
+stock automatic conditions on every target. The RTX~5070 completes default
+compilation with and without whole-phase CUDA Graph replay and requested
+max-autotune with replay. Despite that request, pinned Inductor declines GEMM
+template search below a fixed 68-SM threshold, excluding both the 48-SM
+RTX~5070 and 20-SM RTX~3050. This is a measured limit of PyTorch's automatic
+search coverage, not an omitted experiment; the protocol preserves the stock
+decision instead of adding a benchmark-specific override. On both AMD systems,
+the requested max-autotune search cannot compile the diffusion training graph:
 generated convolution-backward candidates exceed local-memory limits or time
 out, after which Inductor's library fallback is called without a required
 output buffer. The protocol preserves those failures, never substitutes eager
 timing, and collects default-compiled AMD results only as a labeled
-availability subset. This is not a \system{} speedup; it shows that compiler
-search is itself part of the portability surface. \system{}'s bounded tuner
+availability subset. Together, declined, failed, and timed-out searches show
+that automatic compiler search is itself part of the portability surface.
+\system{}'s bounded tuner
 creates and numerically qualifies candidates on the selected device, measures
 only successful candidates, and retains the incumbent after rejection.
 
@@ -747,10 +749,11 @@ backward populated only 19,968 of 73,728 expected elements in an exact
 unique-index probe. A shape-derived preflight selected PyTorch's equivalent
 dense \code{index\_add} formulation, qualified all expected elements, and
 recorded the substitution with every affected result; the corrected full
-SmolLM gradient agrees with CPU and \system{}. Max-autotune remained in its
-first ResNet qualification after one hour and was omitted. We therefore label
-this an availability cohort using a qualified PyTorch workaround, not an
-unmodified native-XPU or full-condition result. It further illustrates why
+SmolLM gradient agrees with CPU and \system{}. Requested max-autotune remained
+in its first ResNet qualification after one hour; the timeout is retained and
+the runnable default condition forms a labeled availability cohort. It uses a
+qualified PyTorch workaround rather than unmodified native-XPU execution. This
+further illustrates why
 correctness and bounded search are parts of performance portability rather
 than setup details outside it.
 
