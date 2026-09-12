@@ -1,4 +1,8 @@
-# Results: the evidence and its limits
+# Original-submission results (historical)
+
+For the camera-ready cohort, read [the final P3HPC evidence guide](../../paper/p3hpc/RESULTS.md).
+The numbers and exclusions below describe the original submission retained
+with the companion report. They are not the current P3HPC tables or headlines.
 
 This chapter is a reading guide to the frozen experiment, not a new benchmark.
 The September audit replays files already in [paper/results](../../paper/results/).

@@ -1,0 +1,14 @@
+\begin{tabular}{lllll}
+\toprule
+Device & PyTorch path & Graphics driver & Valid/selected pairs & Coverage \\
+\midrule
+RTX 5070 & CUDA/compiled & 595.91.07 & 90/90 & full \\
+H100 & CUDA/compiled & 570.195.03 & 90/90 & full \\
+RX 7900 XT & ROCM/compiled & Mesa 26.0.3 & 30/30 & light only \\
+Radeon 780M & ROCM/compiled & Mesa 25.2.8 & 30/30 & light only \\
+Arc B570 & XPU/compiled & Mesa 26.0.3 & 30/30 & light only \\
+Apple M3 & MPS/eager & Metal & 30/30 & full \\
+Intel RPL-U (CPU ref.) & CPU/eager & Mesa 26.0.3 & 30/30 & full \\
+RTX 3050 (Windows) & CUDA/compiled & 591.86 & 31/90 & partial \\
+\bottomrule
+\end{tabular}
