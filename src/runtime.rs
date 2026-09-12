@@ -1122,7 +1122,12 @@ fn create_profiled_pipeline(
     layout: &blade_graphics::ShaderDataLayout,
     compute: blade_graphics::ShaderFunction<'_>,
 ) -> blade_graphics::ComputePipeline {
-    let _span = tracing::info_span!("pipeline", name = %name).entered();
+    let _span = tracing::info_span!(
+        "pipeline",
+        name = %name,
+        trace_min_duration_us = 1_000u64,
+    )
+    .entered();
     gpu.create_compute_pipeline(blade_graphics::ComputePipelineDesc {
         name: &name,
         data_layouts: &[layout],
@@ -2646,6 +2651,13 @@ pub struct SessionOptions {
     pub no_alias: bool,
     /// Keep every buffer host-visible instead of device-local.
     pub no_device_local: bool,
+    /// Skip zeroing named parameter buffers during session construction.
+    ///
+    /// This is disabled by default so an unset parameter has deterministic
+    /// zero contents. Checkpoint loaders which guarantee that every parameter
+    /// is written before the first step can enable it to avoid touching the
+    /// complete model allocation twice.
+    pub skip_parameter_zero: bool,
     /// One compute pass per dispatch — serial execution for bisection.
     pub serial_dispatch: bool,
     /// Dump dispatch order, provenance, accesses, and the alias map at
@@ -3388,51 +3400,136 @@ impl Session {
             alias.physical_bytes() as f64 / 1e6,
             alias.device_local_bytes() as f64 / 1e6,
         );
-        let planned_allocation_bytes = alias
+        let physical_allocation_bytes = alias
             .sizes
             .iter()
             .try_fold(0usize, |sum, &size| sum.checked_add(size.max(4)))
-            .and_then(|bytes| bytes.checked_add(usize::from(!plan.param_grad_pairs.is_empty()) * 4))
+            .expect("session allocation size overflow");
+        let planned_allocation_bytes = physical_allocation_bytes
+            .checked_add(usize::from(!plan.param_grad_pairs.is_empty()) * 4)
             .expect("session allocation size overflow");
         ensure_device_memory_budget(&gpu, planned_allocation_bytes, "session buffers");
         drop(memory_plan_span);
+        let parameter_allocations = {
+            let mut allocations = vec![false; alias.sizes.len()];
+            for &(_, buffer) in &plan.param_buffers {
+                allocations[alias.map[buffer.0 as usize]] = true;
+            }
+            allocations
+        };
+        let shared_allocations = alias.device_local.iter().filter(|&&device| !device).count();
+        let device_allocations = alias.device_local.len() - shared_allocations;
+        let shared_bytes = alias
+            .sizes
+            .iter()
+            .zip(&alias.device_local)
+            .filter_map(|(&size, &device)| (!device).then_some(size.max(4)))
+            .sum::<usize>();
+        let device_bytes = physical_allocation_bytes - shared_bytes;
+        let zero_on_init: Vec<bool> = alias
+            .device_local
+            .iter()
+            .enumerate()
+            .map(|(index, _)| !opts.skip_parameter_zero || !parameter_allocations[index])
+            .collect();
+        let shared_zero_allocations = alias
+            .device_local
+            .iter()
+            .zip(&zero_on_init)
+            .filter(|&(device, zero)| !*device && *zero)
+            .count();
+        let shared_zero_bytes = alias
+            .sizes
+            .iter()
+            .zip(&alias.device_local)
+            .zip(&zero_on_init)
+            .filter_map(|((&size, &device), &zero)| (!device && zero).then_some(size.max(4)))
+            .sum::<usize>();
         let buffer_alloc_span = tracing::info_span!(
             "buffer_alloc",
             allocations = alias.sizes.len(),
-            bytes = planned_allocation_bytes
+            bytes = planned_allocation_bytes,
+            shared_bytes,
+            device_bytes,
         )
         .entered();
-        let physical_buffers: Vec<Arc<PhysicalBuffer>> = alias
-            .sizes
-            .iter()
-            .enumerate()
-            .map(|(i, &size)| {
-                let size = size.max(4);
-                let device_local = alias.device_local[i];
-                let handle = gpu.create_buffer(blade_graphics::BufferDesc {
-                    name: &format!("buf_{}", i),
-                    size: size as u64,
-                    memory: if device_local {
-                        parameter_memory[i].unwrap_or(blade_graphics::Memory::DeviceTransient)
-                    } else {
-                        blade_graphics::Memory::Shared
-                    },
-                });
-                // Zero-fill to prevent NaN from uninitialized padding regions
-                // (coop tiles read/write full tiles beyond logical dimensions).
-                // Device-local buffers have no host pointer; they are
-                // zero-filled on the GPU below, before the first step().
-                if !device_local {
+        let physical_buffers: Vec<Arc<PhysicalBuffer>> = {
+            let _span = tracing::info_span!(
+                "buffer_create",
+                shared_allocations,
+                shared_bytes,
+                device_allocations,
+                device_bytes,
+                trace_min_duration_us = 1_000u64,
+            )
+            .entered();
+            let mut slots = vec![None; alias.sizes.len()];
+            let mut create_class = |device_local: bool| {
+                for (i, &size) in alias.sizes.iter().enumerate() {
+                    if alias.device_local[i] != device_local {
+                        continue;
+                    }
+                    let size = size.max(4);
+                    let handle = gpu.create_buffer(blade_graphics::BufferDesc {
+                        name: &format!("buf_{}", i),
+                        size: size as u64,
+                        memory: if device_local {
+                            parameter_memory[i].unwrap_or(blade_graphics::Memory::DeviceTransient)
+                        } else {
+                            blade_graphics::Memory::Shared
+                        },
+                    });
+                    slots[i] = Some(Arc::new(PhysicalBuffer {
+                        gpu: Arc::clone(&gpu),
+                        handle,
+                    }));
+                }
+            };
+            {
+                let _span = tracing::info_span!(
+                    "buffer_create_shared",
+                    allocations = shared_allocations,
+                    bytes = shared_bytes,
+                    trace_min_duration_us = 1_000u64,
+                )
+                .entered();
+                create_class(false);
+            }
+            {
+                let _span = tracing::info_span!(
+                    "buffer_create_device",
+                    allocations = device_allocations,
+                    bytes = device_bytes,
+                    trace_min_duration_us = 1_000u64,
+                )
+                .entered();
+                create_class(true);
+            }
+            slots
+                .into_iter()
+                .map(|slot| slot.expect("every physical allocation was created"))
+                .collect()
+        };
+        // Zero-fill to prevent NaN from uninitialized padding regions (coop
+        // tiles read/write full tiles beyond logical dimensions). A caller
+        // which promises to initialize all parameters may skip those buffers;
+        // every other host-visible allocation remains deterministic.
+        {
+            let _span = tracing::info_span!(
+                "buffer_zero_host",
+                allocations = shared_zero_allocations,
+                bytes = shared_zero_bytes,
+                trace_min_duration_us = 1_000u64,
+            )
+            .entered();
+            for (index, buffer) in physical_buffers.iter().enumerate() {
+                if !alias.device_local[index] && zero_on_init[index] {
                     unsafe {
-                        std::ptr::write_bytes(handle.data(), 0, size);
+                        std::ptr::write_bytes(buffer.handle.data(), 0, alias.sizes[index].max(4));
                     }
                 }
-                Arc::new(PhysicalBuffer {
-                    gpu: Arc::clone(&gpu),
-                    handle,
-                })
-            })
-            .collect();
+            }
+        }
         let buffers: Vec<blade_graphics::Buffer> = alias
             .map
             .iter()
@@ -3440,11 +3537,19 @@ impl Session {
             .collect();
 
         // Upload constant buffer data (gradient constants, scale factors, etc.)
-        for &(buf_ref, ref data) in &plan.constant_buffers {
-            let buffer = &buffers[buf_ref.0 as usize];
-            unsafe {
-                let ptr = buffer.data() as *mut f32;
-                std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+        {
+            let _span = tracing::info_span!(
+                "buffer_constants",
+                buffers = plan.constant_buffers.len(),
+                trace_min_duration_us = 1_000u64,
+            )
+            .entered();
+            for &(buf_ref, ref data) in &plan.constant_buffers {
+                let buffer = &buffers[buf_ref.0 as usize];
+                unsafe {
+                    let ptr = buffer.data() as *mut f32;
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+                }
             }
         }
         drop(buffer_alloc_span);
@@ -3465,12 +3570,32 @@ impl Session {
         // Zero-fill device-local allocations on the GPU (no host pointer).
         // One submission at build time; the wait below orders it before
         // the first step()'s reads.
-        if alias.device_local.iter().any(|&d| d) {
+        let device_zero_allocations = alias
+            .device_local
+            .iter()
+            .zip(&zero_on_init)
+            .filter(|&(device, zero)| *device && *zero)
+            .count();
+        let device_zero_bytes = alias
+            .sizes
+            .iter()
+            .zip(&alias.device_local)
+            .zip(&zero_on_init)
+            .filter_map(|((&size, &device), &zero)| (device && zero).then_some(size.max(4)))
+            .sum::<usize>();
+        if device_zero_allocations != 0 {
+            let _span = tracing::info_span!(
+                "buffer_zero_gpu",
+                allocations = device_zero_allocations,
+                bytes = device_zero_bytes,
+                trace_min_duration_us = 1_000u64,
+            )
+            .entered();
             encoder.start();
             {
                 let mut transfer = encoder.transfer("zero_device_local");
                 for (i, &device_local) in alias.device_local.iter().enumerate() {
-                    if device_local {
+                    if device_local && zero_on_init[i] {
                         let size = alias.sizes[i].max(4) as u64;
                         transfer.fill_buffer(physical_buffers[i].handle.at(0), size, 0);
                     }
