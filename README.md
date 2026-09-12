@@ -116,7 +116,8 @@ cargo add meganeura
 Version 0.3 currently pins Blade commit `f6f2729` for calibrated GPU timings and
 uses Naga 30 with Rust 1.92 or newer.
 See the [changelog](CHANGELOG.md) for API and feature changes from 0.2.
-CI verifies the packaged source against registry dependencies.
+CI assembles the packaged crate; full registry verification waits on a Blade
+release that includes this timing API.
 
 Hub downloads (`SafeTensorsModel::download`) need the optional `hub` feature:
 
