@@ -121,9 +121,10 @@ oracle-disputed pair is retained as a diagnostic but excluded symmetrically
 from both implementations' ratios and aggregate. Shape- and
 capability-specific kernels are acceptable, but model code,
 checkpoint semantics, and the compiler/runtime interface must remain common
-across machines. We measure \emph{deployment efficiency} through cold
-compilation and deployment closure, and discuss platform support and debugging
-qualitatively. These inform, but do not measure, programmer productivity.
+across machines. We measure \emph{deployment efficiency} through compilation
+with fresh private caches and deployment closure, and discuss platform support
+and debugging qualitatively. These inform, but do not measure, programmer
+productivity.
 
 The study makes four contributions:
 \begin{itemize}
@@ -864,6 +865,15 @@ described in Section~\ref{sec:productivity}. Those availability observations
 do not retroactively strengthen the frozen timing ratios; the measured
 minimal-shape wins therefore do not establish superiority over all compiled
 PyTorch configurations.
+
+Every follow-up condition starts in a fresh process with empty private
+TorchInductor and Triton caches. Persistent driver and vendor-library caches
+remain as found, so rotating condition order mitigates rather than removes
+cross-condition reuse. Preparation times and derived break-even counts
+therefore describe naturally warm installed systems, not independent first-use
+cold starts; lower-level library decisions may also remain history-dependent.
+Steady-state samples still measure each declared policy after its own
+preparation and warmup.
 
 The matrix reports 20 synchronized samples after warmup from one frozen
 process-level run per cell, not independent process replicates; raw samples

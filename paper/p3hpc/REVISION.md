@@ -5,6 +5,15 @@ This is a revised working draft and preparation kit, not a declaration that
 the camera-ready has been approved or submitted. Acceptance-specific upload
 conditions and talk instructions still need confirmation.
 
+September 12: the final collection protocol is frozen at Inferena `17d13a3`.
+Each condition owns a fresh process and empty private TorchInductor/Triton
+cache, but the protocol does not flush persistent driver or vendor-library
+caches. Rotated condition order reduces a systematic advantage without making
+the processes independent at that lower layer. The paper therefore treats
+preparation and break-even values as naturally warm-system measurements, not
+first-use cold-start guarantees; no post-hoc cache reset or protocol revision
+will be introduced into this cohort.
+
 September 10: the deployment discussion now connects short specialization to
 bounded on-device search, with a [study explanation](../../docs/study/performance-plan.md#cheap-compilation-as-a-search-budget).
 It distinguishes today's opt-in, post-rewrite kernel selection from joint
