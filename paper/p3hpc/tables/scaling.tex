@@ -1,0 +1,12 @@
+\begin{tabular}{llrrrrrrrrr}
+\toprule
+Model & Policy & $n$ & \multicolumn{2}{c}{Prefill ms} & \multicolumn{2}{c}{One token ms} & \multicolumn{2}{c}{F+L+B ms} & \multicolumn{2}{c}{Compile s} \\ & & & M & P & M & P & M & P & M & P \\
+\midrule
+SmolLM2-135M & light & 3 & 12.17 & 3.34 & 1.52 & 1.28 & 49.22 & 9.93 & 2.50 & 59.91 \\
+SmolLM2-135M & searched & 3 & 8.81 & 3.35 & 1.52 & 0.87 & 39.57 & 9.37 & 2.88 & 282.46 \\
+SmolLM2-360M & light & 1 & 19.81 & 5.14 & 2.21 & 1.86 & 70.93 & 14.98 & 2.14 & 63.03 \\
+SmolLM2-360M & searched & 1 & 14.10 & 5.16 & 2.21 & 1.23 & 55.11 & 14.42 & 2.74 & 294.89 \\
+SmolLM2-1.7B & light & 1 & 42.43 & 11.96 & 6.99 & 3.27 & 133.80 & 35.83 & 6.94 & 47.73 \\
+SmolLM2-1.7B & searched & 0 & -- & -- & -- & -- & -- & -- & -- & -- \\
+\bottomrule
+\end{tabular}

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Build and smoke-test the deterministic P3HPC supplementary archive."""
+"""Build the original-submission (legacy five-machine) supplementary archive.
+
+For the camera-ready cohort use cohort.py and the externally retained archives;
+this packager intentionally preserves the companion report's historical data.
+"""
 
 from __future__ import annotations
 

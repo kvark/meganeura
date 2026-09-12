@@ -26,8 +26,8 @@ generator prints that audit and marks the affected table entry with
 `\ddagger`; all forward measurements remain included.
 
 `p3hpc/` holds the P3HPC (SC26 workshop) submission: IEEE format
-(vendored `IEEEtran.cls`/`.bst`), single-blind, reuses `../tables/` and
-`../references.bib`. Build the same way from inside that directory, but
+(vendored `IEEEtran.cls`/`.bst`), single-blind, with camera-ready tables in
+`p3hpc/tables/` and shared `../references.bib`. Build from that directory, but
 note that IEEEtran needs the PostScript base fonts (Times/Courier/
 Helvetica), which the small TeX Live image lacks --- run
 `tlmgr install collection-fontsrecommended` in the container first (or
@@ -37,9 +37,20 @@ The P3HPC paper has been accepted. Camera-ready is due **September 25, 2026**;
 the working target is a reviewed draft by September 19. See the
 [official submission page](https://p3hpc.org/workshop/2026/submissions/),
 [revision plan](p3hpc/REVISION.md), and [study guide](../docs/study/README.md).
-Reviewer-specific revisions still need to be incorporated when available.
+The final common-revision cohort and reviewer responses are incorporated;
+the author's final review and submission remain. See the
+[current evidence guide](p3hpc/RESULTS.md).
 
-Replay the frozen evidence without a GPU, from the repository root:
+Replay the camera-ready evidence without a GPU, from the repository root
+with the supplied archives and text reports in one directory (Python 3.11+):
+
+```sh
+python3 paper/p3hpc/artifact/cohort.py "$HOME/Downloads/p3hpc" \
+  --check paper/p3hpc/tables --output target/p3hpc-final-data
+```
+
+The original-submission evidence used by the companion report has a separate
+legacy replay, which remains the existing CI check:
 
 ```sh
 python3 paper/p3hpc/artifact/verify.py --repository --show-facts
@@ -48,7 +59,9 @@ python3 -m unittest discover -s paper/p3hpc/artifact -p 'test_*.py'
 
 This checks records, sampled-output/gradient-norm gates, medians and table
 regeneration. It does not run benchmarks or automatically validate all prose.
-Keep post-freeze development results separate from `paper/results/`.
+Keep final-cohort and development archives outside Git; `paper/results/`
+remains the original-submission dataset. The legacy artifact packager does
+not package the camera-ready cohort.
 
 Build locally with:
 

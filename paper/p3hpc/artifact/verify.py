@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the frozen P3HPC research object without GPU access."""
+"""Verify the original-submission five-machine research object (see cohort.py for camera-ready)."""
 
 from __future__ import annotations
 
