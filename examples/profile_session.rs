@@ -1,7 +1,7 @@
 //! Produce a structured, repeatable GPU profile for a small inference graph.
 //!
 //! Run with:
-//! `MEGANEURA_GPU_TIMING=1 cargo run --release --example profile_session -- gap-profile.json`
+//! `MEGANEURA_GPU_TIMING=1 MEGANEURA_TRACE=gap-profile.pftrace cargo run --release --features profiler --example profile_session -- gap-profile.json`
 
 use meganeura::{
     Graph,
@@ -18,6 +18,10 @@ fn main() {
     if std::env::var_os("MEGANEURA_GPU_TIMING").is_none() {
         eprintln!("set MEGANEURA_GPU_TIMING=1 before starting the example");
         std::process::exit(2);
+    }
+    let trace_path = std::env::var_os("MEGANEURA_TRACE").map(std::path::PathBuf::from);
+    if trace_path.is_some() {
+        meganeura::profiler::init();
     }
     let output_path = std::env::args_os()
         .nth(1)
@@ -77,6 +81,9 @@ fn main() {
     )
     .expect("capture structured GPU profile");
     save_session_profile_json(&output_path, &profile).expect("save profile JSON");
+    if let Some(ref path) = trace_path {
+        meganeura::profiler::save(path).expect("save Perfetto trace");
+    }
 
     println!(
         "wrote {} dispatches and {} samples to {}",

@@ -162,18 +162,18 @@ fn run_case(
     drop(state);
 
     advance(&mut session, SETTLING);
-    let mut preparations = 0;
+    let mut preparations = 0usize;
     let mut comparisons = Vec::new();
     let profile_start = host_sample();
     let profile = capture_session_profile(
         &mut session,
         |session| {
-            // The first ring-advance callback sees the retained profiled result,
-            // before an ordinary execution can overwrite it. Readbacks use their
-            // own encoders and are outside the retained step's wall timer.
-            if preparations % 3 == 1 {
+            // From the second preparation onward, the preceding profiled result
+            // is still resident. Readbacks use their own encoders and are outside
+            // the retained step's wall timer.
+            if preparations != 0 {
                 let state = snapshot(session, case);
-                let comparison = compare("profiled", 0, &reference, &state);
+                let comparison = compare("profiled", (preparations - 1) as u32, &reference, &state);
                 valid &= comparison.passed;
                 comparisons.push(comparison);
             }
@@ -187,21 +187,23 @@ fn run_case(
     );
     record["profile_host_start"] = profile_start;
     record["profile_host_finish"] = host_sample();
-    record["profile_comparisons"] = serde_json::to_value(comparisons)?;
     record["profile_prepare_calls"] = json!(preparations);
     let profile = match profile {
         Ok(profile) => profile,
         Err(error) => {
             record["status"] = json!("profile_error");
             record["error"] = json!(error.to_string());
+            record["profile_comparisons"] = serde_json::to_value(comparisons)?;
             return Ok(record);
         }
     };
-    assert_eq!(preparations, PROFILE_SAMPLES * 3);
-    assert_eq!(
-        record["profile_comparisons"].as_array().unwrap().len(),
-        PROFILE_SAMPLES
-    );
+    let state = snapshot(&mut session, case);
+    let comparison = compare("profiled", (preparations - 1) as u32, &reference, &state);
+    valid &= comparison.passed;
+    comparisons.push(comparison);
+    assert_eq!(preparations, PROFILE_SAMPLES);
+    assert_eq!(comparisons.len(), PROFILE_SAMPLES);
+    record["profile_comparisons"] = serde_json::to_value(comparisons)?;
     record["profile"] = serde_json::to_value(profile)?;
     record["normal_after"] = normal_samples(&mut session, expected_loss);
     let after = snapshot(&mut session, case);
@@ -286,7 +288,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "cooperative_policy": "Disabled", "compile_options": compile_options(),
             "runtime_options": format!("{:?}", runtime_options(CoopPolicy::Disabled)), "optimize": meganeura::optimize::OptimizeConfig::default(),
             "warmup": WARMUP, "settling": SETTLING, "normal_samples": NORMAL_SAMPLES, "profile_samples": PROFILE_SAMPLES,
-            "contract": "strict scalar f32; fixed-input F+L+B, no optimizer/clip/accumulation; normal step+wait before and after one-pass-per-dispatch capture; all profiled full states checked before ring advance; telemetry active",
+            "contract": "strict scalar f32; fixed-input F+L+B, no optimizer/clip/accumulation; normal step+wait before and after one-pass-per-dispatch capture; all profiled full states checked before the next capture; telemetry active",
             "gpu_timing": true, "nvidia_smi_before": before, "rustflags": std::env::var("RUSTFLAGS").ok()}, "cases": []});
     write_record(&mut output, &document)?;
     let mut valid = true;
@@ -363,8 +365,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "GPU numerical prefix and timestamp/readback-ring qualification, not retained performance"]
-    fn profiling_reads_retained_results_without_advancing_the_session_ring() {
+    #[ignore = "GPU numerical prefix and post-fence timestamp qualification, not retained performance"]
+    fn profiling_reads_each_retained_result_before_the_next_capture() {
         let gpu = Arc::new(
             meganeura::init_gpu_context_with(GpuOptions {
                 timing: true,
@@ -381,7 +383,7 @@ mod tests {
             let profile = capture_session_profile(
                 &mut session,
                 |session| {
-                    if preparations % 3 == 1 {
+                    if preparations != 0 {
                         let state = snapshot(session, &case);
                         assert!(compare("profiled", 0, &reference, &state).passed);
                         checked += 1;
@@ -395,8 +397,11 @@ mod tests {
                 },
             )
             .unwrap();
+            let state = snapshot(&mut session, &case);
+            assert!(compare("profiled", 0, &reference, &state).passed);
+            checked += 1;
             assert_eq!(checked, 2);
-            assert_eq!(preparations, 6);
+            assert_eq!(preparations, 2);
             assert_eq!(profile.plan.dispatch_count, session.plan().dispatches.len());
             assert_eq!(profile.plan.adam_state_bytes, 0);
             assert_eq!(profile.plan.optimizer_aux_bytes, 4);

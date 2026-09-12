@@ -43,15 +43,16 @@ Inferena writes one sidecar per execution mode under
 
 Set `MEGANEURA_GPU_TIMING=1` before constructing the first GPU context. Blade
 then allocates hardware timestamp queries. During structured capture,
-Meganeura deliberately records one compute pass per plan dispatch. Blade's
-two-command-buffer ring is advanced with two ordinary executions before each
-sample is read back.
+Meganeura deliberately records one compute pass per plan dispatch. Once the
+completion fence signals, Blade resolves every pass start and the final
+completion timestamp directly onto the process monotonic clock; no follow-up
+execution is needed.
 
-On Vulkan, a dispatch interval starts at the top-of-pipe timestamp for its
-pass and ends at the next pass's top-of-pipe timestamp. It therefore includes
-the dispatch and the inter-pass memory barrier before the following dispatch.
-Metal uses pass boundary counter samples. This is appropriate for ranking
-end-to-end dispatch costs, but it is not an instruction-level kernel metric.
+A dispatch interval starts at its calibrated pass-start timestamp and ends at
+the next pass start, or at the submission completion timestamp for the final
+pass. It therefore includes work and any inter-pass queue gap before the next
+timestamp. This is appropriate for ranking end-to-end dispatch costs, but it
+is not an instruction-level kernel metric.
 
 One-pass-per-dispatch execution is more intrusive than normal execution,
 which groups dispatches and uses inline barriers. Never substitute the
@@ -73,8 +74,7 @@ The separate median of each family's per-run total is retained as well.
 
 Call `meganeura::profiler::capture_session_profile` after the normal benchmark
 and pass the normal median through `CaptureOptions::unprofiled_median_ms`.
-The input-preparation closure runs before the retained execution and both ring
-advance executions.
+The input-preparation closure runs once before each retained execution.
 
 The collector describes dispatches in the compiled execution plan. Disable
 optimizer, gradient-accumulation, and gradient-clipping passes before capture;
@@ -102,7 +102,7 @@ evidence, not portable benchmark artifacts.
 
 `examples/profile_training.rs` provides a fixed, synthetic F+L+B roster with
 normal timing blocks before and after capture, full profiled-result comparisons
-before ordinary ring advancement, exact dispatch contracts, provenance and
+before the next profiled execution, exact dispatch contracts, provenance and
 telemetry. It enables timestamp queries through `GpuOptions`, with no environment
 variable required. The [retained protocol and results](experiments.md#training-profile-2026-09-06)
 separate localization from optimizer-backed timing and candidate acceptance.

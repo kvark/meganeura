@@ -350,15 +350,10 @@ fn main() {
     for _ in 0..warmup {
         run_denoise(&mut session);
     }
-    // Run one profiled step to get per-dispatch GPU timings.
-    // With double-buffered command buffers, timings appear after TWO
-    // subsequent start() calls (rotate_left(1) cycles through 2 buffers).
+    // Run one profiled step and resolve its timestamps after the fence.
     session.set_profiling(true);
     run_denoise(&mut session);
     session.set_profiling(false);
-    // Two more steps to rotate back to the profiled buffer's timestamps.
-    run_denoise(&mut session);
-    run_denoise(&mut session);
     session.dump_gpu_timings();
 
     // --- Benchmark ---

@@ -74,16 +74,10 @@ fn main() {
     eprintln!("\nenabling profiling (one pass per dispatch)...");
     session.set_profiling(true);
 
-    // 3-step dance: step A records, step B advances ring, step C's
-    // start() reads step A's timestamps.
     session.step();
     session.wait();
-    session.step();
-    session.wait();
-    session.step();
     eprintln!("\n=== GPU pass timings for a single decode step ===");
     session.dump_gpu_timings();
-    session.wait();
 
     eprintln!(
         "\nnote: baseline wall-time per step = {:.2}ms. Compare to sum of GPU \
