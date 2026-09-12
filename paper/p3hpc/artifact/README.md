@@ -1,4 +1,35 @@
-# Meganeura P3HPC artifact
+# Meganeura P3HPC artifacts
+
+## Camera-ready cohort
+
+The September 12 cohort supersedes the original-submission measurements for
+the P3HPC manuscript. Its nine campaign archives and three supplied text
+reports stay outside Git. Read [RESULTS.md](../RESULTS.md) for scope, failures,
+findings, and interpretation; [cohort.sha256](cohort.sha256) identifies inputs.
+
+From the repository root, with Python 3.11+:
+
+```sh
+python3 paper/p3hpc/artifact/cohort.py "$HOME/Downloads/p3hpc" \
+  --check paper/p3hpc/tables --output target/p3hpc-final-data
+```
+
+This verifies archive hashes, revisions, retained outputs/gradient norms,
+timing medians, replay summaries, and replication, then checks the generated
+LaTeX fragments and exports a per-condition CSV. It needs no GPU or network.
+It does not reconstruct unretained tensor elements or diagnose capture errors.
+No partial campaign is admitted to the completed-population aggregates.
+
+The supplied raw evidence needs external publication hosting before submission.
+The source branch remains `experiment/p3hpc-cuda-graphs` at Inferena `17d13a3`;
+no new collection tag was created during analysis.
+
+## Original-submission artifact (legacy)
+
+The remaining instructions, `verify.py`, and `package.py` apply to the
+original five-machine dataset used by the companion report. They do **not**
+verify or package the new camera-ready cohort. Keep this distinction when
+interpreting the existing CPU-only CI check.
 
 This research object supports the paper *Vulkan and Metal as a
 Performance-Portability Layer for GPU Training and Inference*. It contains

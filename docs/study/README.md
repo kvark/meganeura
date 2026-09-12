@@ -1,5 +1,9 @@
 # Meganeura: study and workshop preparation
 
+For the camera-ready results, start with [the final cohort guide](../../paper/p3hpc/RESULTS.md)
+and [updated workshop questions](p3hpc-questions.md). The dated engineering
+history below is separate from the final Inferena `17d13a3` measurements.
+
 Prepared 2026-09-05 against development base `bd6be08`, subsequently rebased
 onto `8069cf3` with checkpoint/memory work, `a455409` for training holdouts,
 then `230cab0` for controlled crossover confirmation
@@ -31,11 +35,18 @@ need Python, CUDA, or ROCm.
 The research question is not whether Rust is faster than Python. It is how
 much useful ML performance a compact, shared graphics-API implementation can
 recover across consumer GPUs, including devices poorly served by vendor ML
-stacks. The frozen study compares five workloads on five machines under
-explicit numerical gates. It wins 12/20 GPU-referenced strict-f32
-minimal-shape latency comparisons, but has a 1.78× median valid training-time
-ratio against those GPU references. It is credible and uneven, not a universal
-PyTorch replacement.
+stacks. The final study covers eight machines, including H100 and partial
+Windows results, at one PyTorch source revision with qualified CUDA replay.
+Across six complete GPU-reference configurations, strict light-policy training
+has a 2.41× median time ratio. Native compile-time search improves H100 135M
+prefill by 1.38×, while searched PyTorch wins all measured CUDA phase comparisons.
+The larger-model extension and MI300X report make the scaling and availability
+limits explicit.
+
+## Earlier engineering milestones
+
+These dated experiments explain how the implementation developed. Their
+timings and intermediate limitations are not the final-cohort results above.
 
 The next engineering opportunity is to replace performance thresholds with
 small, reusable, measured searches over legal kernel implementations. That
@@ -115,7 +126,7 @@ for the failure boundary, resume limitations and real-device qualification.
 ## Reading paths
 
 For a 30-minute orientation, read this page, the opening and summary tables
-of [results](results.md), and the short answers in
+of [the final results](../../paper/p3hpc/RESULTS.md), and the short answers in
 [workshop questions](p3hpc-questions.md).
 
 For a two-hour technical pass, read in this order:
@@ -126,7 +137,8 @@ For a two-hour technical pass, read in this order:
 3. [Checkpoints and memory](checkpoints-and-memory.md): understand state,
    portable serialization, lazy optimizer allocation and honest memory metrics.
 4. [Design decisions](design-decisions.md): understand why the design changed.
-5. [Results and evidence](results.md): know exactly what each number means.
+5. [Final results and evidence](../../paper/p3hpc/RESULTS.md): know exactly what
+   each current number means; [original-submission results](results.md) are historical.
 6. [Alternatives](alternatives.md): compare layers and scope, not slogans.
 7. [Performance plan](performance-plan.md): the implemented first slice and
    the minimal, general route forward.
@@ -136,7 +148,7 @@ For the engineering backlog, use the [September audit](../audit-2026-09.md).
 For camera-ready work, use the [revision plan](../../paper/p3hpc/REVISION.md)
 and [paper source](../../paper/p3hpc/main.tex). Start the baseline discussion
 with [what happened to CUDA Graphs](../../paper/p3hpc/CUDA-GRAPHS.md);
-the repaired pilot is separate from the submitted results.
+the final cohort replaces the original uncaptured reference timings.
 
 ## Keep these distinctions straight
 

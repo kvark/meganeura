@@ -1,0 +1,16 @@
+\begin{tabular}{llrrrrrrr}
+\toprule
+Device & Workload & \multicolumn{3}{c}{PyTorch replay gain} & \multicolumn{2}{c}{Search inf. gain} & \multicolumn{2}{c}{Compile seconds: light/searched} \\ & & Inf. & Min. & F+L+B & M & P & M & P \\
+\midrule
+RTX 5070 & SmolLM2-135M & 1.06 & 1.65 & 1.04 & 1.09 & 1.00 & 0.79/1.04 & 46.33/73.29 \\
+ & SmolVLA & 1.09 & 1.43 & 1.08 & 1.00 & 1.00 & 0.64/0.97 & 23.76/49.70 \\
+ & StableDiffusion & 1.13 & 1.12 & 1.46 & 1.01 & 1.09 & 0.40/0.74 & 29.65/123.65 \\
+ & ResNet-50 & 1.02 & 1.04 & 1.02 & 1.01 & 1.23 & 0.46/1.94 & 13.13/54.80 \\
+ & Whisper-tiny & 1.03 & 1.03 & 1.02 & 1.00 & 1.00 & 0.37/1.32 & 7.06/28.83 \\
+H100 & SmolLM2-135M & 1.71 & 3.32 & 1.80 & 1.38 & 0.99 & 2.50/2.88 & 59.91/282.46 \\
+ & SmolVLA & 1.50 & 2.05 & 2.47 & 1.11 & 1.26 & 2.20/2.52 & 35.50/178.10 \\
+ & StableDiffusion & 1.82 & 1.75 & 2.98 & 1.02 & 1.07 & 3.52/3.97 & 32.77/674.23 \\
+ & ResNet-50 & 1.20 & 1.30 & 1.17 & 1.02 & 1.28 & 1.79/2.95 & 15.14/708.33 \\
+ & Whisper-tiny & 1.25 & 1.26 & 1.19 & 1.05 & 1.01 & 1.95/2.67 & 8.20/219.23 \\
+\bottomrule
+\end{tabular}
