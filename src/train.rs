@@ -296,7 +296,7 @@ impl SessionConfig<'_> {
 /// strung together, now driven by [`SessionConfig`].
 ///
 /// Build stages (`optimize_forward`, `autodiff`, `optimize_full`,
-/// `compile`, `gpu_init`) are captured as tracing spans and appear in
+/// `compile`, `session_init`) are captured as tracing spans and appear in
 /// Perfetto traces when profiling is active.
 pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, OptimizeReport) {
     let _span = tracing::info_span!("build_session").entered();
@@ -428,10 +428,7 @@ fn make_session(
     opts: runtime::SessionOptions,
     tune: bool,
 ) -> Session {
-    let mut session = {
-        let _span = tracing::info_span!("session_gpu_init").entered();
-        Session::with_context_opts(plan, gpu, opts)
-    };
+    let mut session = Session::with_context_opts(plan, gpu, opts);
     if tune {
         let _span = tracing::info_span!("tune").entered();
         session.tune();
