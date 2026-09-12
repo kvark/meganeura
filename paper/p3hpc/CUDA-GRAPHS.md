@@ -84,6 +84,12 @@ is authoritative. Each additional machine must pass its own qualification.
 These new records remain outside Git and do not silently replace the paper's
 frozen timings.
 
+The pinned Inductor source only enables its GEMM template search at 68 NVIDIA
+SMs. It therefore records `inductor_is_big_gpu=false` on the 48-SM RTX 5070 and
+20-SM RTX 3050. Keep calling this the stock requested max-autotune condition,
+not full GEMM search; the experiment does not override PyTorch's hardware
+policy or silently substitute a hand-tuned configuration.
+
 The September 8 strict ResNet-50 pilot qualified all three captured phases,
 including every element of 108 gradient tensors. Its two process-level records
 remain outside Git, with source frozen at Inferena's
