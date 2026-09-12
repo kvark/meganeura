@@ -1,0 +1,16 @@
+\begin{tabular}{llrrrrrr}
+\toprule
+Device & Workload & \multicolumn{3}{c}{Strict: inf. / min. / F+L+B} & \multicolumn{3}{c}{Accelerated: inf. / min. / F+L+B} \\
+\midrule
+RTX 5070 & SmolLM2-135M & 1.91 & 1.95 & 2.88 & 3.29 & 1.95 & 4.46 \\
+ & SmolVLA & 2.02 & 2.08 & 2.46 & 3.56 & 2.08 & 3.43 \\
+ & StableDiffusion & 1.51 & 1.50 & 3.03 & 2.09 & 2.09 & 5.03 \\
+ & ResNet-50 & 1.22 & 1.74 & 3.29 & 2.78 & 3.47 & 6.04 \\
+ & Whisper-tiny & 2.75 & 2.71 & 2.88 & 1.88 & 1.88 & 2.97 \\
+H100 & SmolLM2-135M & 2.63 & 1.74 & 4.22 & 3.66 & 1.75 & 5.71 \\
+ & SmolVLA & 2.22 & 1.89 & 2.94 & 4.44 & 2.25 & 4.09 \\
+ & StableDiffusion & 1.72 & 1.72 & 3.27 & 3.02 & 3.03 & 4.61 \\
+ & ResNet-50 & 2.44 & 2.84 & 6.51 & 7.92 & 8.87 & 19.23 \\
+ & Whisper-tiny & 3.47 & 3.52 & 4.07 & 2.99 & 3.00 & 4.78 \\
+\bottomrule
+\end{tabular}
