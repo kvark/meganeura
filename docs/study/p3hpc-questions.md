@@ -287,6 +287,17 @@ a positive steady-state gain, the break-even count is
 Report `never` when the searched step is not faster, and report failed or timed
 out search as availability rather than inventing a timing.
 
+Does light inherit searched tuning? Not at the compiler layer: every condition
+runs in a fresh process with an empty private TorchInductor/Triton cache, so it
+cannot load the searched condition's saved Inductor winner. The protocol does
+not flush persistent driver or vendor-library caches, however. A later light
+process may reuse lower-level binaries or library state produced earlier, and
+vendor tuning databases may affect internal choices. Thus `light` means no
+compiler search requested in that process, not a globally pristine machine;
+preparation and break-even values describe the naturally warm system rather
+than a first-ever cold start. Rotated order mitigates systematic direction but
+does not remove this validity threat.
+
 The [CUDA Graph follow-up](../../paper/p3hpc/CUDA-GRAPHS.md) explains the repair,
 the exact timed boundary and the new collection plan. Do not claim that the
 submitted measurements already used this repaired baseline.
