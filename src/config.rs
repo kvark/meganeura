@@ -300,6 +300,7 @@ impl SessionOptions {
             coop,
             no_alias: NO_ALIAS.bool_or(false),
             no_device_local: NO_DEVICE_LOCAL.bool_or(false),
+            skip_parameter_zero: false,
             serial_dispatch: SERIAL_DISPATCH.bool_or(false),
             dump_plan: DUMP_PLAN.bool_or(false),
             pin_buffers: PIN_BUFS.text(),

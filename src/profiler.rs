@@ -734,6 +734,8 @@ struct TraceFields(Vec<(String, String)>);
 
 #[cfg(feature = "profiler")]
 impl TraceFields {
+    const MIN_DURATION_FIELD: &'static str = "trace_min_duration_us";
+
     fn record(&mut self, field: &field::Field, value: String) {
         const MAX_VALUE_CHARS: usize = 120;
         let mut value = value;
@@ -757,7 +759,7 @@ impl TraceFields {
         let fields = self
             .0
             .iter()
-            .filter(|entry| entry.0 != "message")
+            .filter(|entry| entry.0 != "message" && entry.0 != Self::MIN_DURATION_FIELD)
             .collect::<Vec<_>>();
         if fields.is_empty() {
             return base.to_string();
@@ -776,6 +778,18 @@ impl TraceFields {
             .collect::<Vec<_>>()
             .join(" ");
         format!("{base} {fields}")
+    }
+
+    fn min_duration_ns(&self) -> u64 {
+        self.0
+            .iter()
+            .find_map(|entry| {
+                (entry.0 == Self::MIN_DURATION_FIELD)
+                    .then(|| entry.1.parse::<u64>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0)
+            .saturating_mul(1_000)
     }
 }
 
@@ -803,7 +817,11 @@ impl field::Visit for TraceFields {
 }
 
 #[cfg(feature = "profiler")]
-struct ProfileSpanName(String);
+struct ProfileSpan {
+    name: String,
+    min_duration_ns: u64,
+    pending_starts: Mutex<Vec<(std::thread::ThreadId, u64)>>,
+}
 
 #[cfg(feature = "profiler")]
 impl<S> Layer<S> for ProfileLayer
@@ -818,23 +836,33 @@ where
             let mut fields = TraceFields::default();
             attrs.record(&mut fields);
             let name = fields.display_name(span.name());
-            span.extensions_mut().insert(ProfileSpanName(name));
+            span.extensions_mut().insert(ProfileSpan {
+                name,
+                min_duration_ns: fields.min_duration_ns(),
+                pending_starts: Mutex::new(Vec::new()),
+            });
         }
     }
 
     fn on_enter(&self, id: &span::Id, ctx: Context<'_, S>) {
         if let Some(span) = ctx.span(id) {
-            let Some(name) = span
-                .extensions()
-                .get::<ProfileSpanName>()
-                .map(|name| name.0.clone())
-            else {
+            let extensions = span.extensions();
+            let Some(profile) = extensions.get::<ProfileSpan>() else {
                 return;
             };
             let mut guard = self.inner.lock().unwrap();
             let ts = guard.now_ns();
+            if profile.min_duration_ns != 0 {
+                drop(guard);
+                profile
+                    .pending_starts
+                    .lock()
+                    .unwrap()
+                    .push((std::thread::current().id(), ts));
+                return;
+            }
             guard.events.push(TraceEvent {
-                name,
+                name: profile.name.clone(),
                 timestamp_ns: ts,
                 track_uuid: CPU_TRACK_UUID,
                 kind: EventKind::SliceBegin,
@@ -844,17 +872,42 @@ where
 
     fn on_exit(&self, id: &span::Id, ctx: Context<'_, S>) {
         if let Some(span) = ctx.span(id) {
-            let Some(name) = span
-                .extensions()
-                .get::<ProfileSpanName>()
-                .map(|name| name.0.clone())
-            else {
+            let extensions = span.extensions();
+            let Some(profile) = extensions.get::<ProfileSpan>() else {
                 return;
             };
             let mut guard = self.inner.lock().unwrap();
             let ts = guard.now_ns();
+            if profile.min_duration_ns != 0 {
+                drop(guard);
+                let thread = std::thread::current().id();
+                let start = {
+                    let mut starts = profile.pending_starts.lock().unwrap();
+                    let Some(index) = starts.iter().rposition(|entry| entry.0 == thread) else {
+                        return;
+                    };
+                    starts.remove(index).1
+                };
+                if ts.saturating_sub(start) < profile.min_duration_ns {
+                    return;
+                }
+                let mut guard = self.inner.lock().unwrap();
+                guard.events.push(TraceEvent {
+                    name: profile.name.clone(),
+                    timestamp_ns: start,
+                    track_uuid: CPU_TRACK_UUID,
+                    kind: EventKind::SliceBegin,
+                });
+                guard.events.push(TraceEvent {
+                    name: profile.name.clone(),
+                    timestamp_ns: ts,
+                    track_uuid: CPU_TRACK_UUID,
+                    kind: EventKind::SliceEnd,
+                });
+                return;
+            }
             guard.events.push(TraceEvent {
-                name,
+                name: profile.name.clone(),
                 timestamp_ns: ts,
                 track_uuid: CPU_TRACK_UUID,
                 kind: EventKind::SliceEnd,
@@ -1145,6 +1198,13 @@ mod tests {
             "naga_parse source_bytes=4627"
         );
 
+        let threshold = TraceFields(vec![(
+            TraceFields::MIN_DURATION_FIELD.into(),
+            "1000".into(),
+        )]);
+        assert_eq!(threshold.display_name("pipeline"), "pipeline");
+        assert_eq!(threshold.min_duration_ns(), 1_000_000);
+
         let several = TraceFields(vec![
             ("dispatches".into(), "1034".into()),
             ("buffers".into(), "1703".into()),
@@ -1176,6 +1236,29 @@ mod tests {
         assert!(layer.captures_target("buddy::brain::gemma4"));
         assert!(!layer.captures_target("buddy_system"));
         assert!(!layer.captures_target("libwayshot_xcap"));
+    }
+
+    #[cfg(feature = "profiler")]
+    #[test]
+    fn trace_minimum_duration_omits_short_span() {
+        let inner = Arc::new(Mutex::new(ProfilerInner {
+            epoch: Instant::now(),
+            events: Vec::new(),
+        }));
+        let layer = ProfileLayer {
+            inner: Arc::clone(&inner),
+            targets: vec!["meganeura".into()],
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            let _span = tracing::info_span!(
+                target: "meganeura",
+                "too_short",
+                trace_min_duration_us = 60_000_000u64,
+            )
+            .entered();
+        });
+        assert!(inner.lock().unwrap().events.is_empty());
     }
 
     #[test]
