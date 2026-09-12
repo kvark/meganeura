@@ -84,6 +84,13 @@ is authoritative. Each additional machine must pass its own qualification.
 These new records remain outside Git and do not silently replace the paper's
 frozen timings.
 
+The campaign does not add a third arithmetic mode. It crosses strict and
+accelerated arithmetic with two preparation policies: `light` uses default
+PyTorch compilation with Meganeura measured search disabled, while `searched`
+requests PyTorch max-autotune and enables Meganeura's bounded tuner. Both CUDA
+policies use whole-phase replay; default/no-graph is the replay ablation. The
+manifest records the requested policy and effective Meganeura search state.
+
 The campaign requests stock max-autotune on every NVIDIA target. Pinned
 Inductor then declines GEMM template search below its fixed 68-SM threshold,
 recording `inductor_is_big_gpu=false` on the 48-SM RTX 5070 and 20-SM RTX 3050.
@@ -99,8 +106,9 @@ process per condition is not a replicated performance claim or a new engine
 comparison. See that branch's `EXPERIMENT.md` for the small result table and
 the substantial graph-pool residency cost observed in the pilot.
 
-On each machine, first qualify all workloads. NVIDIA collects default
-compiled/no-graph, default compiled/graph, and requested max-autotune/graph.
+On each machine, first qualify all workloads. NVIDIA collects light/no-graph,
+light/graph, and searched/graph; the underlying PyTorch modes are default,
+default, and requested max-autotune respectively.
 ROCm has no qualified explicit graph condition. Both AMD systems enter the
 requested max-autotune search and fail while compiling diffusion training, so
 the failed attempts are portability evidence and the runnable default/no-graph

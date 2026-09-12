@@ -39,6 +39,14 @@ search as part of the portability surface. AMD default-mode collection remains
 valid as an explicitly labeled availability subset; no eager timing replaces
 the failed condition.
 
+The refreshed collection keeps arithmetic and preparation orthogonal. Its
+light policy pairs default PyTorch compilation with Meganeura measured search
+off; its searched policy requests PyTorch max-autotune and enables Meganeura's
+bounded tuner. Both CUDA policies use qualified whole-phase replay, with the
+no-graph condition retained as an ablation. The new analysis will report
+preparation cost, steady-state gain, and break-even call count rather than a
+single winner that assumes search is free.
+
 The Arc B570 follow-up at Inferena `f4255c4b` completes all 10 default/no-graph
 qualification pairs and 30 replicated measurements. Its pinned XPU build has a
 repeatable native dense-embedding backward defect; a shape-derived probe selects

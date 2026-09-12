@@ -724,7 +724,13 @@ measure of installation effort.
 
 A post-submission controlled qualification for the camera-ready cohort pins
 one PyTorch source revision across vendor builds and requests its strongest
-stock automatic conditions on every target. The RTX~5070 completes default
+stock automatic conditions on every target. Arithmetic and preparation remain
+separate axes: the light policy uses default PyTorch compilation and disables
+\system{}'s empirical search; the searched policy requests PyTorch max-autotune
+and enables \system{}'s bounded on-device tuner. Both retain the strict and
+accelerated arithmetic controls, while no-graph execution is a replay ablation.
+This exposes preparation--throughput tradeoffs without treating search as free.
+The RTX~5070 completes default
 compilation with and without whole-phase CUDA Graph replay and requested
 max-autotune with replay. Despite that request, pinned Inductor declines GEMM
 template search below a fixed 68-SM threshold, excluding both the 48-SM

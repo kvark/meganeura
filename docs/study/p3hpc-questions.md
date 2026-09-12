@@ -263,6 +263,30 @@ max-autotune. Say exactly that: automatic search was requested, and PyTorch's
 stock policy did not make it available on those targets. The records expose
 the decision; we do not patch in a benchmark-specific threshold.
 
+Do not mix this with precision. Strict versus accelerated defines permitted
+arithmetic; light versus searched defines preparation policy. The primary CUDA
+deployment points both use whole-phase replay, and default/no-graph remains an
+ablation. Light pairs default PyTorch compilation with Meganeura measured
+search off. Searched requests PyTorch max-autotune and enables Meganeura's
+bounded tuner.
+
+The completed pre-recollection NVIDIA records show why both matter. Across 30
+model--phase--precision cells, requested max-autotune improves the geometric
+mean over default/graph by 5.7% on RTX 5070 and 4.3% on RTX 3050, while adding
+roughly 20--200 seconds of compilation per model. Strict ResNet is the useful
+exception: its large gains repay search after about 20k--40k calls; most other
+cells need tens of thousands to millions of calls or regress. By contrast,
+adding whole-phase replay to default compilation improves the geometric mean
+by about 21% on both GPUs for roughly one second of measured capture plus the
+harness's heavy validation. These are diagnostic old-revision results; replace
+the numbers with the common new cohort before publication.
+
+Present the outcome as a preparation--throughput frontier. For any phase with
+a positive steady-state gain, the break-even count is
+`(searched preparation - light preparation) / (light step - searched step)`.
+Report `never` when the searched step is not faster, and report failed or timed
+out search as availability rather than inventing a timing.
+
 The [CUDA Graph follow-up](../../paper/p3hpc/CUDA-GRAPHS.md) explains the repair,
 the exact timed boundary and the new collection plan. Do not claim that the
 submitted measurements already used this repaired baseline.
