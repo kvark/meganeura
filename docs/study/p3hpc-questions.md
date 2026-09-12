@@ -256,6 +256,11 @@ retains default mode and explicitly labels the missing condition. The new sweep
 also charges compile/search cost, memory and accuracy rather than silently
 replacing the old data.
 
+Do not overstate the NVIDIA condition: pinned Inductor's fixed 68-SM policy
+disables GEMM template search on both the 48-SM RTX 5070 and 20-SM RTX 3050.
+The records expose that effective state. We test stock requested max-autotune;
+we do not claim that every internal kernel family actually searched candidates.
+
 The [CUDA Graph follow-up](../../paper/p3hpc/CUDA-GRAPHS.md) explains the repair,
 the exact timed boundary and the new collection plan. Do not claim that the
 submitted measurements already used this repaired baseline.
