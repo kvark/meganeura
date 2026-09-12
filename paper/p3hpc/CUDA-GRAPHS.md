@@ -91,6 +91,13 @@ requests PyTorch max-autotune and enables Meganeura's bounded tuner. Both CUDA
 policies use whole-phase replay; default/no-graph is the replay ablation. The
 manifest records the requested policy and effective Meganeura search state.
 
+The final protocol is frozen at Inferena `17d13a3`. Each condition starts in a
+fresh process with an empty private TorchInductor/Triton cache. Persistent
+driver and vendor-library caches remain as found: rotated condition order
+mitigates a systematic ordering advantage but does not establish independent
+cold starts. Report preparation and break-even values under that naturally
+warm-system boundary, and retain this limitation as a threat to validity.
+
 The campaign requests stock max-autotune on every NVIDIA target. Pinned
 Inductor then declines GEMM template search below its fixed 68-SM threshold,
 recording `inductor_is_big_gpu=false` on the 48-SM RTX 5070 and 20-SM RTX 3050.
