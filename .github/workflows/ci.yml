@@ -40,8 +40,10 @@ jobs:
           python3 -m unittest discover -s paper/p3hpc/artifact -p 'test_*.py'
           python3 paper/p3hpc/artifact/verify.py --repository
 
-      - name: Package verification
-        run: cargo package --locked --all-features
+      # Full verification substitutes crates.io dependencies for the pinned
+      # git revision. Re-enable it after Blade publishes calibrated timings.
+      - name: Package assembly
+        run: cargo package --no-verify --locked --all-features
 
   check:
     name: ${{ matrix.name }}
