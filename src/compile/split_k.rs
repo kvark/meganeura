@@ -32,7 +32,10 @@ impl ExecutionPlan {
                 .get(index)
                 .ok_or(TuneError("split-K dispatch index out of range"))?;
             let mut class = TuneClass::from_dispatch(dispatch, None)
-                .filter(|class| class.shader == ShaderEntry::Conv2dGradWeightGemm)
+                .filter(|class| {
+                    class.shader == ShaderEntry::Conv2dGradWeightGemm
+                        && dispatch.conv_k_tile.is_none()
+                })
                 .ok_or(TuneError(
                     "split-K requires an unmodified legal scalar weight gradient",
                 ))?;

@@ -272,21 +272,22 @@ fn run_split(
                     ..Default::default()
                 },
             ] {
-                options.scope = meganeura::TuneScope::ConvDerivatives;
+                options.scope = meganeura::TuneScope::Convolution;
                 let report = session.tune_with(options).unwrap();
-                assert_eq!(report.eligible_classes, 2, "{s:?}");
+                assert_eq!(report.eligible_classes, 3, "{s:?}");
                 assert_eq!(session.dispatch_pipeline_keys(), keys);
                 assert_eq!(state(&session), before);
                 assert_eq!(report.scratch.unwrap().retained_staging_bytes, 0);
             }
             let report = session
                 .tune_with(meganeura::TuneOptions {
-                    scope: meganeura::TuneScope::ConvDerivatives,
+                    scope: meganeura::TuneScope::Convolution,
                     max_time: std::time::Duration::from_secs(60),
                     ..Default::default()
                 })
                 .unwrap();
-            assert_eq!(report.outcomes.len(), 2, "{s:?}: {report:?}");
+            assert_eq!(report.eligible_classes, 3, "{s:?}: {report:?}");
+            assert_eq!(report.outcomes.len(), 15, "{s:?}: {report:?}");
             assert!(
                 report.outcomes.iter().all(|o| o.qualified
                     && o.class.conv2d.is_some()

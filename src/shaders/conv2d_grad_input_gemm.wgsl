@@ -12,29 +12,12 @@
 
 $DIVISOR
 
-struct Params {
-    batch: u32,
-    in_channels: u32,
-    in_h: u32,
-    in_w: u32,
-    out_channels: u32,
-    kernel_h: u32,
-    kernel_w: u32,
-    stride: u32,
-    padding_h: u32,
-    out_h: u32,
-    out_w: u32,
-    padding_w: u32,
-    kernel_w_multiplier: u32,
-    kernel_hw_multiplier: u32,
-    column_width_multiplier: u32,
-    output_spatial_multiplier: u32,
-}
+$PARAMS_TYPE
 
 var<storage> grad_out: array<f32>;         // grad_output [N, Co, oH, oW]
 var<storage> weight: array<f32>;           // kernel [Co, Ci, kH, kW]
 var<storage, read_write> dst: array<f32>;  // grad_input [N, Ci, H, W]
-var<uniform> params: Params;
+$PARAMS_DECL
 var<workgroup> shared_a: array<f32, $SHARED_SIZE>; // A tile: [BM, K]
 var<workgroup> shared_b: array<f32, $SHARED_SIZE>; // B tile: [K, BM]
 

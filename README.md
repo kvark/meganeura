@@ -104,8 +104,8 @@ For the detailed, source-backed comparison, read the
 [study guide](docs/study/README.md) and [alternatives](docs/study/alternatives.md).
 The [September audit](docs/audit-2026-09.md) separates current implementation
 status from the frozen results; the [performance plan](docs/study/performance-plan.md)
-describes bounded f32-matmul tile search and the remaining qualification
-and broader-search work.
+describes bounded f32 matmul and convolution search and the remaining
+qualification and broader-search work.
 
 ## Install
 
@@ -194,7 +194,7 @@ win, so explicit code always has the last word.
 | `MEGANEURA_OPTIMIZER` | Rewrite mode: `off` \| `greedy` \| `egglog-windowed` \| `egglog-outlined` \| `egglog-whole`. |
 | `MEGANEURA_EGRAPH_COST` | Extraction objective: `ast-size` \| `tensor-traffic`. |
 | `MEGANEURA_EGRAPH_CUTOFF=<n>` | Saturation segment-size ceiling (default 300). |
-| `MEGANEURA_TUNE` | Opt-in bounded f32 matmul tile searches at build (`SessionConfig { tune: true }`), using private scratch. |
+| `MEGANEURA_TUNE` | Opt-in bounded f32 matmul/convolution search at build (`SessionConfig { tune: true }`), using private scratch. |
 | `MEGANEURA_FLASH_EPT_CAP=<n>` | Flash forward elements-per-thread cap (power of two ≥ 2). |
 | `MEGANEURA_FLASH_GRAD_Q_EPT_CAP=<n>` | EPT cap for flash dQ backward. |
 | `MEGANEURA_FLASH_GRAD_KV_EPT_CAP=<n>` | EPT cap for fused flash dK/dV backward. |

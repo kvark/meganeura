@@ -1,7 +1,7 @@
 //! Bounded, opt-in kernel selection. See [`crate::Session::tune_with`].
 //!
 //! The search space is deliberately small: scalar and native-f32 cooperative
-//! tiles for unpacked dense matmuls, and scalar convolution derivatives,
+//! tiles for unpacked dense matmuls, and shape-specialized scalar convolutions,
 //! with no precision or binding-layout changes.
 //! Measurements use synthetic, private scratch, not a live training step.
 //! Explicit split-K probes measure complete sequences without installing them.
@@ -143,6 +143,12 @@ impl TuneConv2d {
 pub enum MatmulTile {
     Tile32,
     Tile64,
+    /// Scalar convolution with immutable parameters and native integer division.
+    /// Both spatial tiles and K-stage sizes are selected by measurement.
+    SpecializedConv {
+        tile_size: u32,
+        k_tile: u32,
+    },
     /// Hardware-native f32 operands/accumulators, never f16 staging.
     CooperativeF32 {
         tile_size: u32,
@@ -161,14 +167,21 @@ impl MatmulTile {
     }
 
     pub(crate) fn selected(dispatch: &Dispatch, config: Option<&CoopConfig>) -> Option<Self> {
-        if dispatch.use_coop {
-            Self::native_cooperative(config)
-        } else if dispatch.use_small_tiles
+        let small = dispatch.use_small_tiles
             || matches!(
                 dispatch.shader,
-                ShaderEntry::Conv2dGradInputGemmSmall | ShaderEntry::Conv2dGradWeightGemmSmall
-            )
-        {
+                ShaderEntry::Conv2dGemmSmall
+                    | ShaderEntry::Conv2dGradInputGemmSmall
+                    | ShaderEntry::Conv2dGradWeightGemmSmall
+            );
+        if let Some(k_tile) = dispatch.conv_k_tile {
+            Some(Self::SpecializedConv {
+                tile_size: if small { 32 } else { 64 },
+                k_tile,
+            })
+        } else if dispatch.use_coop {
+            Self::native_cooperative(config)
+        } else if small {
             Some(Self::Tile32)
         } else {
             Some(Self::Tile64)
@@ -191,6 +204,10 @@ impl MatmulTile {
         dispatch.use_small_tiles = class.conv2d.is_none() && self == Self::Tile32;
         dispatch.use_coop = matches!(self, Self::CooperativeF32 { .. });
         dispatch.use_coop_compensated = false;
+        dispatch.conv_k_tile = match self {
+            Self::SpecializedConv { k_tile, .. } => Some(k_tile),
+            _ => None,
+        };
         dispatch.scalar_fallback = dispatch
             .use_coop
             .then(|| (dispatch.shader.clone(), Self::Tile64.workgroups(class)));
@@ -198,13 +215,31 @@ impl MatmulTile {
     }
 
     pub(crate) fn shader(self, entry: &ShaderEntry) -> ShaderEntry {
-        match (entry, self) {
-            (&ShaderEntry::Conv2dGradInputGemm, Self::Tile32) => {
+        let small = matches!(
+            self,
+            Self::Tile32 | Self::SpecializedConv { tile_size: 32, .. }
+        );
+        match (entry, small) {
+            (&ShaderEntry::Conv2dGemm | &ShaderEntry::Conv2dGemmSmall, true) => {
+                ShaderEntry::Conv2dGemmSmall
+            }
+            (&ShaderEntry::Conv2dGemm | &ShaderEntry::Conv2dGemmSmall, false) => {
+                ShaderEntry::Conv2dGemm
+            }
+            (&ShaderEntry::Conv2dGradInputGemm | &ShaderEntry::Conv2dGradInputGemmSmall, true) => {
                 ShaderEntry::Conv2dGradInputGemmSmall
             }
-            (&ShaderEntry::Conv2dGradWeightGemm, Self::Tile32) => {
-                ShaderEntry::Conv2dGradWeightGemmSmall
+            (&ShaderEntry::Conv2dGradInputGemm | &ShaderEntry::Conv2dGradInputGemmSmall, false) => {
+                ShaderEntry::Conv2dGradInputGemm
             }
+            (
+                &ShaderEntry::Conv2dGradWeightGemm | &ShaderEntry::Conv2dGradWeightGemmSmall,
+                true,
+            ) => ShaderEntry::Conv2dGradWeightGemmSmall,
+            (
+                &ShaderEntry::Conv2dGradWeightGemm | &ShaderEntry::Conv2dGradWeightGemmSmall,
+                false,
+            ) => ShaderEntry::Conv2dGradWeightGemm,
             _ => entry.clone(),
         }
     }
@@ -213,6 +248,7 @@ impl MatmulTile {
         let tile = match self {
             Self::Tile32 => 32,
             Self::Tile64 => 64,
+            Self::SpecializedConv { tile_size, .. } => tile_size,
             Self::CooperativeF32 { tile_size } => {
                 let tile = 2 * tile_size;
                 // Cooperative tiles use X for rows, Y for columns.
@@ -229,6 +265,12 @@ impl MatmulTile {
     }
 
     pub(crate) fn buffer_sizes(self, class: &TuneClass) -> Option<Vec<usize>> {
+        if let Self::SpecializedConv { tile_size, k_tile } = self {
+            if class.conv2d.is_none() || !matches!(tile_size, 32 | 64) || !matches!(k_tile, 16 | 32)
+            {
+                return None;
+            }
+        }
         let mut sizes = class.buffer_sizes()?;
         if let Self::CooperativeF32 { tile_size } = self {
             if class.conv2d.is_some()
@@ -279,6 +321,8 @@ impl TuneClass {
                 | ShaderEntry::FusedMatMulAdd
                 | ShaderEntry::MatMulAT
                 | ShaderEntry::MatMulBT
+                | ShaderEntry::Conv2dGemm
+                | ShaderEntry::Conv2dGemmSmall
                 | ShaderEntry::Conv2dGradInputGemm
                 | ShaderEntry::Conv2dGradInputGemmSmall
                 | ShaderEntry::Conv2dGradWeightGemm
@@ -300,20 +344,26 @@ impl TuneClass {
             return None;
         }
         let shader = match dispatch.shader {
+            ShaderEntry::Conv2dGemmSmall => ShaderEntry::Conv2dGemm,
             ShaderEntry::Conv2dGradInputGemmSmall => ShaderEntry::Conv2dGradInputGemm,
             ShaderEntry::Conv2dGradWeightGemmSmall => ShaderEntry::Conv2dGradWeightGemm,
             _ => dispatch.shader.clone(),
         };
         let conv2d = if matches!(
             shader,
-            ShaderEntry::Conv2dGradInputGemm | ShaderEntry::Conv2dGradWeightGemm
+            ShaderEntry::Conv2dGemm
+                | ShaderEntry::Conv2dGradInputGemm
+                | ShaderEntry::Conv2dGradWeightGemm
         ) {
             if dispatch.use_coop || dispatch.use_small_tiles || dispatch.scalar_fallback.is_some() {
                 return None;
             }
             Some(TuneConv2d::from_params(&dispatch.params)?)
         } else {
-            if dispatch.workgroups[2] != 1 || dispatch.params.len() != 4 || dispatch.params[3] != 0
+            if dispatch.conv_k_tile.is_some()
+                || dispatch.workgroups[2] != 1
+                || dispatch.params.len() != 4
+                || dispatch.params[3] != 0
             {
                 return None;
             }
@@ -321,7 +371,13 @@ impl TuneClass {
         };
         let (m, n, k) = if let Some(s) = conv2d {
             let kernel = s.kernel_h.checked_mul(s.kernel_w)?;
-            if shader == ShaderEntry::Conv2dGradInputGemm {
+            if shader == ShaderEntry::Conv2dGemm {
+                (
+                    s.out_channels,
+                    s.out_h.checked_mul(s.out_w)?,
+                    s.in_channels.checked_mul(kernel)?,
+                )
+            } else if shader == ShaderEntry::Conv2dGradInputGemm {
                 let n = s.in_h.checked_mul(s.in_w)?;
                 let k = s.out_channels.checked_mul(kernel)?;
                 (s.in_channels, n, k)
@@ -336,11 +392,11 @@ impl TuneClass {
         } else {
             (dispatch.params[0], dispatch.params[1], dispatch.params[2])
         };
-        // Scalar K loops advance by 16, including the final padded tile.
+        // Scalar K loops advance by at most 32, including the final padded tile.
         if m == 0
             || n == 0
             || k == 0
-            || k > u32::MAX - 15
+            || k > u32::MAX - 31
             || m.div_ceil(32) > 65_535
             || n.div_ceil(32) > 65_535
         {
@@ -367,7 +423,10 @@ impl TuneClass {
     }
 
     pub(crate) fn batch_dispatches(&self) -> u32 {
-        if self.shader == ShaderEntry::Conv2dGradInputGemm {
+        if matches!(
+            self.shader,
+            ShaderEntry::Conv2dGemm | ShaderEntry::Conv2dGradInputGemm
+        ) {
             self.conv2d.expect("convolution class").batch
         } else {
             1
@@ -384,6 +443,13 @@ impl TuneClass {
         let bytes = |a: u32, b: u32| usize::try_from(a.checked_mul(b)?).ok()?.checked_mul(4);
         if let Some(s) = self.conv2d {
             let [input, weight, upstream] = s.elements()?;
+            if self.shader == ShaderEntry::Conv2dGemm {
+                return Some(vec![
+                    bytes(input, 1)?,
+                    bytes(weight, 1)?,
+                    bytes(upstream, 1)?,
+                ]);
+            }
             let (b, output) = if self.shader == ShaderEntry::Conv2dGradInputGemm {
                 (weight, input)
             } else {
@@ -407,6 +473,44 @@ impl TuneClass {
         initial: MatmulTile,
         config: Option<&CoopConfig>,
     ) -> Vec<MatmulTile> {
+        if self.conv2d.is_some() {
+            let small = matches!(
+                initial,
+                MatmulTile::Tile32 | MatmulTile::SpecializedConv { tile_size: 32, .. }
+            );
+            let (tile, other) = if small { (32, 64) } else { (64, 32) };
+            return [
+                MatmulTile::SpecializedConv {
+                    tile_size: tile,
+                    k_tile: 16,
+                },
+                MatmulTile::SpecializedConv {
+                    tile_size: tile,
+                    k_tile: 32,
+                },
+                if small {
+                    MatmulTile::Tile64
+                } else {
+                    MatmulTile::Tile32
+                },
+                if small {
+                    MatmulTile::Tile32
+                } else {
+                    MatmulTile::Tile64
+                },
+                MatmulTile::SpecializedConv {
+                    tile_size: other,
+                    k_tile: 16,
+                },
+                MatmulTile::SpecializedConv {
+                    tile_size: other,
+                    k_tile: 32,
+                },
+            ]
+            .into_iter()
+            .filter(|&tile| tile != initial && tile.fits(self))
+            .collect();
+        }
         [
             Some(MatmulTile::Tile64),
             Some(MatmulTile::Tile32),
@@ -427,12 +531,21 @@ pub enum TuneScope {
     Dense,
     /// Scalar input and weight gradients only; no forward or cooperative convolution.
     ConvDerivatives,
+    /// Scalar forward, input gradient and weight gradient convolutions.
+    Convolution,
     All,
 }
 
 impl TuneScope {
     pub(crate) fn includes(self, class: &TuneClass) -> bool {
-        self == Self::All || (class.conv2d.is_some() == (self == Self::ConvDerivatives))
+        match self {
+            Self::All => true,
+            Self::Dense => class.conv2d.is_none(),
+            Self::Convolution => class.conv2d.is_some(),
+            Self::ConvDerivatives => {
+                class.conv2d.is_some() && class.shader != ShaderEntry::Conv2dGemm
+            }
+        }
     }
 }
 
@@ -710,15 +823,15 @@ pub struct TuneReport {
     pub options: TuneOptions,
     pub outcomes: Vec<TuneOutcome>,
     pub eligible_classes: usize,
-    /// Live tile search has up to two challengers per class; explicit split-K
+    /// Live search visits a bounded candidate set per class; explicit split-K
     /// probes accept up to four counts against the same unsplit control.
     pub visited_classes: usize,
     pub excluded_dispatches: usize,
     pub class_limit_reached: bool,
     pub time_budget_exhausted: bool,
     pub elapsed: Duration,
-    /// Release of staging retained across comparisons, within total `elapsed`.
-    /// None for historical reports or when no buffer remained to release.
+    /// Release of retained staging and unused convolution pipelines, within
+    /// total `elapsed`. None when cleanup was not run or recorded.
     #[serde(default)]
     pub final_cleanup: Option<Duration>,
     #[serde(default)]
@@ -886,7 +999,10 @@ mod tests {
         d.shader = shader;
         d.use_small_tiles = false;
         d.params = vec![2, 3, 7, 9, 5, 3, 2, 2, 0, 3, 5, 1];
-        d.workgroups = if d.shader == ShaderEntry::Conv2dGradInputGemm {
+        d.workgroups = if matches!(
+            d.shader,
+            ShaderEntry::Conv2dGemm | ShaderEntry::Conv2dGradInputGemm
+        ) {
             [1, 1, 2]
         } else {
             [1, 1, 1]
@@ -897,6 +1013,7 @@ mod tests {
     #[test]
     fn conv_tiles_preserve_complete_nchw_contracts() {
         for shader in [
+            ShaderEntry::Conv2dGemm,
             ShaderEntry::Conv2dGradInputGemm,
             ShaderEntry::Conv2dGradWeightGemm,
         ] {
@@ -904,35 +1021,69 @@ mod tests {
             let original = d.clone();
             let mut class = TuneClass::from_dispatch(&d, None).unwrap();
             let dx = shader == ShaderEntry::Conv2dGradInputGemm;
+            let forward = shader == ShaderEntry::Conv2dGemm;
             assert_eq!(
                 (class.m, class.n, class.k),
-                if dx { (3, 63, 30) } else { (5, 18, 30) }
+                if forward {
+                    (5, 15, 18)
+                } else if dx {
+                    (3, 63, 30)
+                } else {
+                    (5, 18, 30)
+                }
             );
             class.binding_bytes = class.buffer_sizes().unwrap();
             assert_eq!(
                 class.binding_bytes,
-                if dx {
+                if forward {
+                    vec![1512, 360, 600]
+                } else if dx {
                     vec![600, 360, 1512]
                 } else {
                     vec![600, 1512, 360]
                 }
             );
-            assert_eq!(class.output_elements(), if dx { 378 } else { 90 });
             assert_eq!(
-                class.challengers(MatmulTile::Tile64, Some(&native_config(16))),
-                [MatmulTile::Tile32]
+                class.output_elements(),
+                if forward {
+                    150
+                } else if dx {
+                    378
+                } else {
+                    90
+                }
             );
+            let candidates = class.challengers(MatmulTile::Tile64, Some(&native_config(16)));
+            assert_eq!(candidates.len(), 5);
+            for candidate in candidates {
+                candidate.apply(&mut d, &class);
+                assert_eq!(MatmulTile::selected(&d, None), Some(candidate));
+                let mut restored = TuneClass::from_dispatch(&d, None).unwrap();
+                restored.binding_bytes = class.binding_bytes.clone();
+                assert_eq!(restored, class);
+            }
             assert!(!MatmulTile::CooperativeF32 { tile_size: 16 }.fits(&class));
             MatmulTile::Tile32.apply(&mut d, &class);
             assert_eq!(
                 d.shader,
-                if dx {
+                if forward {
+                    ShaderEntry::Conv2dGemmSmall
+                } else if dx {
                     ShaderEntry::Conv2dGradInputGemmSmall
                 } else {
                     ShaderEntry::Conv2dGradWeightGemmSmall
                 }
             );
-            assert_eq!(d.workgroups, if dx { [2, 1, 2] } else { [1, 1, 1] });
+            assert_eq!(
+                d.workgroups,
+                if forward {
+                    [1, 1, 2]
+                } else if dx {
+                    [2, 1, 2]
+                } else {
+                    [1, 1, 1]
+                }
+            );
             assert!(!d.use_small_tiles && !d.use_coop && d.scalar_fallback.is_none());
             assert_eq!(MatmulTile::selected(&d, None), Some(MatmulTile::Tile32));
             let small = TuneClass::from_dispatch(&d, None).unwrap();
@@ -976,7 +1127,7 @@ mod tests {
             variants[11].params[1] = u32::MAX;
             variants[12].weight_format = crate::compile::WeightFormat::F16;
             variants[13].shader = ShaderEntry::Conv2dGradInputGemmCoopGen(3, 2, 2);
-            variants[14].shader = ShaderEntry::Conv2dGemm;
+            variants[14].conv_k_tile = Some(7);
             variants[15].input_buffers.pop();
             variants[16].params[5] = 100;
             for d in variants {
@@ -1016,8 +1167,16 @@ mod tests {
         let dense = class(3, 5, 7);
         let conv = TuneClass::from_dispatch(&conv_dispatch(ShaderEntry::Conv2dGradInputGemm), None)
             .unwrap();
-        for scope in [TuneScope::Dense, TuneScope::ConvDerivatives, TuneScope::All] {
-            assert_eq!(scope.includes(&dense), scope != TuneScope::ConvDerivatives);
+        for scope in [
+            TuneScope::Dense,
+            TuneScope::ConvDerivatives,
+            TuneScope::Convolution,
+            TuneScope::All,
+        ] {
+            assert_eq!(
+                scope.includes(&dense),
+                matches!(scope, TuneScope::Dense | TuneScope::All)
+            );
             assert_eq!(scope.includes(&conv), scope != TuneScope::Dense);
             let options = TuneOptions {
                 scope,

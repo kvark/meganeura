@@ -1000,7 +1000,7 @@ fn epilogue_tile(dispatch: &Dispatch) -> crate::codegen::MatMulTile {
 /// arm rather than a map, a struct field, and four parallel match chains.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Variant {
-    SpecializedConv(ShaderEntry, Vec<u32>, ConvSpecialization),
+    SpecializedConv(ShaderEntry, Vec<u32>, u32),
     /// Schedule-template kernels, keyed by kernel content hash. These are
     /// generated from a DAG rather than a shader group, so no `ShaderEntry`
     /// identifies them.
@@ -1080,13 +1080,8 @@ impl Variant {
     /// Name used by the profiler and by pipeline-statistics dumps.
     fn label(&self) -> String {
         match *self {
-            Variant::SpecializedConv(ref e, ref params, options) => {
-                let mode = if options.native_division {
-                    "fixed-native-div"
-                } else {
-                    "fixed"
-                };
-                format!("{e:?}:{mode}-k{}-{params:?}", options.k_tile)
+            Variant::SpecializedConv(ref e, ref params, k_tile) => {
+                format!("{e:?}:fixed-native-div-k{k_tile}-{params:?}")
             }
             Variant::Reduction(hash) => format!("generated-reduction:{hash:016x}"),
             Variant::Pointwise(hash) => format!("generated-pointwise:{hash:016x}"),
@@ -1109,7 +1104,6 @@ impl Variant {
 
 struct Pipelines {
     map: HashMap<Variant, blade_graphics::ComputePipeline>,
-    specialize_conv: Option<ConvSpecialization>,
 }
 
 fn create_profiled_pipeline(
@@ -1129,36 +1123,6 @@ fn create_profiled_pipeline(
         data_layouts: &[layout],
         compute,
     })
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct ConvSpecialization {
-    native_division: bool,
-    k_tile: u32,
-}
-
-fn specialized_conv_variant(dispatch: &Dispatch, options: ConvSpecialization) -> Option<Variant> {
-    if !matches!(
-        dispatch.shader,
-        ShaderEntry::Conv2dGemm
-            | ShaderEntry::Conv2dGemmSmall
-            | ShaderEntry::Conv2dGradInputGemm
-            | ShaderEntry::Conv2dGradInputGemmSmall
-            | ShaderEntry::Conv2dGradWeightGemm
-            | ShaderEntry::Conv2dGradWeightGemmSmall
-    ) || dispatch.params.len() != 12
-        || dispatch.use_coop
-        || dispatch.weight_format.uses_reduced_storage()
-        || dispatch.horizontal_batch >= 2
-        || epilogue_pipeline_key(dispatch).is_some()
-    {
-        return None;
-    }
-    Some(Variant::SpecializedConv(
-        dispatch.shader.clone(),
-        dispatch.params.clone(),
-        options,
-    ))
 }
 
 impl Pipelines {
@@ -1186,6 +1150,9 @@ impl Pipelines {
         let mut attention_entries: HashSet<(ShaderEntry, u32)> = HashSet::new();
 
         for dispatch in &plan.dispatches {
+            if dispatch.conv_k_tile.is_some() {
+                continue;
+            }
             let group = dispatch.shader.shader_group();
             // `pipeline_variants` resolves a fused epilogue before it looks
             // at the small-tile or weight-format modifiers, so such a
@@ -1701,61 +1668,17 @@ impl Pipelines {
             map.insert(key, pipeline);
         }
 
-        let specialize_conv = match std::env::var("MEGANEURA_SPECIALIZE_CONV").as_deref() {
-            Err(_) | Ok("0") => None,
-            Ok("1") => Some(ConvSpecialization {
-                native_division: false,
-                k_tile: 16,
-            }),
-            Ok("native-div") => Some(ConvSpecialization {
-                native_division: true,
-                k_tile: 16,
-            }),
-            Ok("k32") => Some(ConvSpecialization {
-                native_division: false,
-                k_tile: 32,
-            }),
-            Ok("native-div-k32") => Some(ConvSpecialization {
-                native_division: true,
-                k_tile: 32,
-            }),
-            Ok(other) => panic!("unknown convolution specialization experiment: {other}"),
-        };
-        if let Some(options) = specialize_conv {
-            for dispatch in &plan.dispatches {
-                let Some(key) = specialized_conv_variant(dispatch, options) else {
-                    continue;
-                };
-                if map.contains_key(&key) {
-                    continue;
-                }
-                let params = Conv2dParams::from(dispatch);
-                let sm = crate::codegen::specialize_u32_params(
-                    crate::codegen::generate_conv_module(
-                        dispatch.shader.shader_group(),
-                        options.k_tile,
-                    ),
-                    bytemuck::cast_slice(std::slice::from_ref(&params)),
-                    options.native_division,
-                );
-                let shader = gpu.create_shader(bg::ShaderDesc {
-                    source: &sm.source,
-                    naga_module: Some(sm.module),
-                });
-                let layout = shader_data_layout(&dispatch.shader);
-                let pipeline = create_profiled_pipeline(
-                    gpu,
-                    key.label(),
-                    &layout,
-                    shader.at(dispatch.shader.entry_point()),
-                );
-                map.insert(key, pipeline);
+        let mut pipelines = Self { map };
+        for dispatch in &plan.dispatches {
+            if dispatch.conv_k_tile.is_some() {
+                let tile = crate::tune::MatmulTile::selected(dispatch, None)
+                    .expect("scalar convolution specialization");
+                pipelines
+                    .ensure_tune_tile(gpu, dispatch, tile)
+                    .expect("selected convolution pipeline");
             }
         }
-        Self {
-            map,
-            specialize_conv,
-        }
+        pipelines
     }
 
     /// Pipelines this dispatch can run, most specific first; `get` takes the
@@ -1767,6 +1690,13 @@ impl Pipelines {
     /// list stays a single entry and a miss is a panic.
     fn candidates(dispatch: &Dispatch) -> Vec<Variant> {
         let entry = &dispatch.shader;
+        if let Some(k_tile) = dispatch.conv_k_tile {
+            return vec![Variant::SpecializedConv(
+                entry.clone(),
+                dispatch.params.clone(),
+                k_tile,
+            )];
+        }
         if dispatch.horizontal_batch >= 2 {
             return vec![Variant::Horizontal(
                 dispatch.shader.clone(),
@@ -1824,11 +1754,6 @@ impl Pipelines {
     }
 
     fn get(&self, dispatch: &Dispatch) -> &blade_graphics::ComputePipeline {
-        if let Some(options) = self.specialize_conv {
-            if let Some(key) = specialized_conv_variant(dispatch, options) {
-                return &self.map[&key];
-            }
-        }
         let candidates = Self::candidates(dispatch);
         candidates
             .iter()
@@ -1837,11 +1762,6 @@ impl Pipelines {
     }
 
     fn profile_key(&self, dispatch: &Dispatch) -> String {
-        if let Some(options) = self.specialize_conv {
-            if let Some(key) = specialized_conv_variant(dispatch, options) {
-                return key.label();
-            }
-        }
         Self::candidates(dispatch)
             .into_iter()
             .find(|variant| self.map.contains_key(variant))
@@ -2292,6 +2212,9 @@ pub(crate) fn select_variants(
         // iOS and future 8×8 f32 advertisers need the same veto.
         let apple_f32_coop = !config.use_f16_input && config.tile_size == 8;
         for dispatch in &mut plan.dispatches {
+            if dispatch.conv_k_tile.is_some() {
+                continue;
+            }
             // Autodiff marks derivative work as requiring f32 operands. A
             // hi/lo f16 split improves mantissa precision but cannot extend
             // the f16 exponent range: values below the minimum subnormal

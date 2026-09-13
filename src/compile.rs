@@ -910,6 +910,10 @@ pub struct Dispatch {
     /// When true, use the 32×32 small-tile matmul pipeline instead of 64×64.
     #[serde(default)]
     pub use_small_tiles: bool,
+    /// Shape-specialized scalar convolution, with this many K elements staged.
+    /// Set by measured selection; None keeps the shared uniform-parameter kernel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conv_k_tile: Option<u32>,
     /// The dispatch belongs to numerically sensitive derivative work and may
     /// not be promoted to a reduced-input-precision implementation. Native
     /// f32 cooperative kernels remain eligible.

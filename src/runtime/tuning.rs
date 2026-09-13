@@ -32,18 +32,18 @@ impl Drop for PhaseTimer<'_> {
 }
 
 impl Pipelines {
-    fn ensure_tune_tile(
+    pub(super) fn ensure_tune_tile(
         &mut self,
         gpu: &Gpu,
-        entry: &ShaderEntry,
+        dispatch: &Dispatch,
         tile: MatmulTile,
     ) -> Result<(), String> {
-        let key = tile_variant(entry, tile);
+        let key = tile_variant(dispatch, tile);
         if self.map.contains_key(&key) {
             return Ok(());
         }
-        let selected_entry = tile.shader(entry);
-        let module = tile_module(entry, tile);
+        let selected_entry = tile.shader(&dispatch.shader);
+        let module = tile_module(dispatch, tile);
         let shader = gpu
             .try_create_shader(bg::ShaderDesc {
                 source: &module.source,
@@ -59,10 +59,43 @@ impl Pipelines {
         self.map.insert(key, pipeline);
         Ok(())
     }
+
+    fn discard_unused_convolutions(&mut self, gpu: &Gpu, plan: &crate::compile::ExecutionPlan) {
+        let used: std::collections::HashSet<_> =
+            plan.dispatches.iter().flat_map(Self::candidates).collect();
+        self.map.retain(|key, pipeline| {
+            let convolution = key.entry().is_some_and(|entry| {
+                matches!(
+                    entry,
+                    ShaderEntry::Conv2dGemm
+                        | ShaderEntry::Conv2dGemmSmall
+                        | ShaderEntry::Conv2dGradInputGemm
+                        | ShaderEntry::Conv2dGradInputGemmSmall
+                        | ShaderEntry::Conv2dGradWeightGemm
+                        | ShaderEntry::Conv2dGradWeightGemmSmall
+                )
+            });
+            if convolution && !used.contains(key) {
+                gpu.destroy_compute_pipeline(pipeline);
+                false
+            } else {
+                true
+            }
+        });
+    }
 }
 
-fn tile_module(entry: &ShaderEntry, tile: MatmulTile) -> crate::codegen::ShaderModule {
+fn tile_module(dispatch: &Dispatch, tile: MatmulTile) -> crate::codegen::ShaderModule {
+    let entry = &dispatch.shader;
     let selected_entry = tile.shader(entry);
+    if let MatmulTile::SpecializedConv { k_tile, .. } = tile {
+        let params = super::Conv2dParams::from(dispatch);
+        return crate::codegen::generate_conv_module(
+            selected_entry.shader_group(),
+            k_tile,
+            Some(bytemuck::cast_slice(std::slice::from_ref(&params))),
+        );
+    }
     if selected_entry != *entry {
         crate::codegen::generate_module(selected_entry.shader_group())
     } else {
@@ -73,14 +106,24 @@ fn tile_module(entry: &ShaderEntry, tile: MatmulTile) -> crate::codegen::ShaderM
                 entry.shader_group(),
                 &tile.coop_config().expect("cooperative candidate"),
             ),
+            MatmulTile::SpecializedConv { .. } => unreachable!(),
         }
     }
 }
 
-fn tile_variant(entry: &ShaderEntry, tile: MatmulTile) -> Variant {
+fn tile_variant(dispatch: &Dispatch, tile: MatmulTile) -> Variant {
+    let entry = &dispatch.shader;
+    if let MatmulTile::SpecializedConv { k_tile, .. } = tile {
+        return Variant::SpecializedConv(tile.shader(entry), dispatch.params.clone(), k_tile);
+    }
     if matches!(
         entry,
-        ShaderEntry::Conv2dGradInputGemm | ShaderEntry::Conv2dGradWeightGemm
+        ShaderEntry::Conv2dGemm
+            | ShaderEntry::Conv2dGemmSmall
+            | ShaderEntry::Conv2dGradInputGemm
+            | ShaderEntry::Conv2dGradInputGemmSmall
+            | ShaderEntry::Conv2dGradWeightGemm
+            | ShaderEntry::Conv2dGradWeightGemmSmall
     ) {
         return Variant::Scalar(tile.shader(entry));
     }
@@ -88,6 +131,7 @@ fn tile_variant(entry: &ShaderEntry, tile: MatmulTile) -> Variant {
         MatmulTile::Tile32 => Variant::SmallTile(entry.clone()),
         MatmulTile::Tile64 => Variant::Scalar(entry.clone()),
         MatmulTile::CooperativeF32 { .. } => Variant::Coop(entry.clone()),
+        MatmulTile::SpecializedConv { .. } => unreachable!(),
     }
 }
 
@@ -266,11 +310,11 @@ impl Session {
         )?;
         for swap in &swaps {
             for (session, tile) in [(&mut *self, swap.right), (&mut *other, swap.left)] {
-                if let Err(error) =
-                    session
-                        .pipelines
-                        .ensure_tune_tile(&session.gpu, &swap.class.shader, tile)
-                {
+                if let Err(error) = session.pipelines.ensure_tune_tile(
+                    &session.gpu,
+                    &session.plan.dispatches[swap.index],
+                    tile,
+                ) {
                     log::warn!("tuning swap pipeline preparation: {error}");
                     return Err(TuneError(
                         "tuning swap pipeline preparation failed; see log",
@@ -302,7 +346,7 @@ impl Session {
     }
 
     /// Search scalar tiles and advertised, smoke-tested native-f32 cooperative
-    /// matmul, plus scalar convolution derivatives, for exact eligible classes.
+    /// matmul, plus scalar convolution shapes and staging, for exact eligible classes.
     /// Occupancy/large-shape thresholds only
     /// choose the starting implementation; they do not remove challengers.
     ///
@@ -312,26 +356,21 @@ impl Session {
     /// dots before alternating, batched `encode+submit+wait` measurements.
     /// The result is an isolated-kernel choice, not an end-to-end speed claim.
     ///
-    /// Forward MatMul+Add and unpacked NCHW scalar convolution dX/dW are supported;
+    /// Forward MatMul+Add and unpacked NCHW scalar convolution forward/dX/dW are supported;
     /// convolution keys include batch, channels, spatial extents, kernel, stride
     /// and padding. Index decomposition uses exact integer arithmetic.
-    /// Forward/cooperative convolutions remain excluded.
+    /// Cooperative convolutions remain excluded.
     /// Other prologues/epilogues, horizontal
     /// packs, f16-input cooperative, reduced-storage, GEMV and overlapping-binding
     /// dispatches are excluded. Winners live in this session, not the plan cache.
     /// Only selected dispatch geometry and pipeline resources change. No graph
     /// execution occurs, including when an optimizer or external buffer is bound.
     /// Cooperative padding must fit each binding's declared size; the live
-    /// allocation/alias plan is never resized. Up to two sequential challenger
+    /// allocation/alias plan is never resized. Sequential challenger
     /// comparisons per class reuse the latest fully qualified winner as the
     /// incumbent. A soft deadline may be exceeded by one in-flight operation;
     /// an incomplete comparison always retains its incumbent.
     pub fn tune_with(&mut self, options: TuneOptions) -> Result<TuneReport, TuneError> {
-        if self.pipelines.specialize_conv.is_some() {
-            return Err(TuneError(
-                "the fixed-parameter experiment does not support tile tuning",
-            ));
-        }
         options.validate()?;
         let start = Instant::now();
         let (mut classes, mut excluded_dispatches) =
@@ -398,9 +437,11 @@ impl Session {
                 report.outcomes.push(outcome);
             }
         }
-        if staging.buffer.is_some() {
+        {
             let _timer = PhaseTimer::new(&mut report.final_cleanup);
             staging.clear();
+            self.wait();
+            self.pipelines.discard_unused_convolutions(&gpu, &self.plan);
         }
         report.scratch = Some(staging.stats);
         report.elapsed = start.elapsed();
@@ -581,7 +622,7 @@ impl Session {
             let compiled = {
                 let _timer = PhaseTimer::new(&mut prep.pipelines);
                 self.pipelines
-                    .ensure_tune_tile(&self.gpu, &class.key.shader, tile)
+                    .ensure_tune_tile(&self.gpu, &variants[0][0], tile)
             };
             outcome.compile_time = prep.pipelines.unwrap();
             if let Err(error) = compiled {
@@ -599,7 +640,7 @@ impl Session {
                 let compiled = {
                     let _timer = PhaseTimer::new(&mut prep.pipelines);
                     self.pipelines
-                        .ensure_tune_tile(&self.gpu, &dispatch.shader, MatmulTile::Tile64)
+                        .ensure_tune_tile(&self.gpu, dispatch, MatmulTile::Tile64)
                 };
                 outcome.compile_time = prep.pipelines.unwrap();
                 if let Err(error) = compiled {
@@ -638,7 +679,7 @@ impl Session {
                         let key = if i == 1 && outcome.candidate_split_k.is_some() {
                             Variant::Scalar(dispatch.shader.clone())
                         } else {
-                            tile_variant(&class.key.shader, [outcome.initial, outcome.candidate][i])
+                            tile_variant(dispatch, [outcome.initial, outcome.candidate][i])
                         };
                         (&self.pipelines.map[&key], dispatch)
                     })
@@ -795,6 +836,7 @@ fn split_dispatches(
         .buffer_sizes()
         .ok_or(TuneError("invalid split-K extents"))?;
     let mut dispatch = dispatch.clone();
+    dispatch.conv_k_tile = None; // Split-K has its own unspecialized K=16 shader.
     dispatch.input_buffers = vec![BufferRef(0), BufferRef(1)];
     dispatch.output_buffer = BufferRef(2);
     plan.dispatches.push(dispatch);
@@ -1187,7 +1229,28 @@ fn reference_dot(class: &TuneClass, inputs: &[Vec<f32>], row: usize, col: usize)
         ]
         .map(|v| v as usize);
         let mut value = 0.0;
-        if class.shader == ShaderEntry::Conv2dGradInputGemm {
+        if class.shader == ShaderEntry::Conv2dGemm {
+            let (batch, channel_out) = (row / co, row % co);
+            let h = s.in_h as usize;
+            for channel_in in 0..ci {
+                for y in 0..kh {
+                    for x in 0..kw {
+                        let Some(iy) = (col / ow * stride + y).checked_sub(ph) else {
+                            continue;
+                        };
+                        let Some(ix) = (col % ow * stride + x).checked_sub(pw) else {
+                            continue;
+                        };
+                        if iy >= h || ix >= w {
+                            continue;
+                        }
+                        let a = ((batch * ci + channel_in) * h + iy) * w + ix;
+                        let b = ((channel_out * ci + channel_in) * kh + y) * kw + x;
+                        value += inputs[0][a] as f64 * inputs[1][b] as f64;
+                    }
+                }
+            }
+        } else if class.shader == ShaderEntry::Conv2dGradInputGemm {
             // Flatten batch and channel into the reference row, never into K.
             let (batch, channel) = (row / ci, row % ci);
             for out_channel in 0..co {
@@ -1575,17 +1638,23 @@ mod tests {
             values
         };
         let class = collect_classes(&b.plan, &b.alias, None).0.remove(0);
-        let alternative = if class.initial == MatmulTile::Tile32 {
+        let alternative = if convolution {
+            MatmulTile::SpecializedConv {
+                tile_size: 32,
+                k_tile: 16,
+            }
+        } else if class.initial == MatmulTile::Tile32 {
             MatmulTile::Tile64
         } else {
             MatmulTile::Tile32
         };
         b.pipelines
-            .ensure_tune_tile(&gpu, &class.key.shader, alternative)
+            .ensure_tune_tile(&gpu, &b.plan.dispatches[class.members[0]], alternative)
             .unwrap();
         for &index in &class.members {
             alternative.apply(&mut b.plan.dispatches[index], &class.key);
         }
+        b.pipelines.discard_unused_convolutions(&gpu, &b.plan);
         let (a_keys, b_keys) = (a.dispatch_pipeline_keys(), b.dispatch_pipeline_keys());
         assert_ne!(a_keys, b_keys);
         for _ in 0..4 {
@@ -1943,6 +2012,7 @@ mod tests {
             ShaderEntry::FusedMatMulAdd,
             ShaderEntry::MatMulAT,
             ShaderEntry::MatMulBT,
+            ShaderEntry::Conv2dGemm,
             ShaderEntry::Conv2dGradInputGemm,
             ShaderEntry::Conv2dGradWeightGemm,
         ] {
@@ -1951,21 +2021,40 @@ mod tests {
                 MatmulTile::Tile64,
                 MatmulTile::CooperativeF32 { tile_size: 8 },
                 MatmulTile::CooperativeF32 { tile_size: 16 },
+                MatmulTile::SpecializedConv {
+                    tile_size: 32,
+                    k_tile: 16,
+                },
+                MatmulTile::SpecializedConv {
+                    tile_size: 64,
+                    k_tile: 32,
+                },
             ] {
                 let convolution = matches!(
                     entry,
-                    ShaderEntry::Conv2dGradInputGemm | ShaderEntry::Conv2dGradWeightGemm
+                    ShaderEntry::Conv2dGemm
+                        | ShaderEntry::Conv2dGradInputGemm
+                        | ShaderEntry::Conv2dGradWeightGemm
                 );
+                let specialized = matches!(tile, MatmulTile::SpecializedConv { .. });
+                if specialized && !convolution {
+                    continue;
+                }
                 if convolution && tile.coop_config().is_some() {
                     continue;
                 }
-                if convolution {
+                let dispatch = Dispatch {
+                    shader: entry.clone(),
+                    params: vec![2, 3, 7, 9, 5, 3, 2, 2, 0, 3, 5, 1],
+                    ..Default::default()
+                };
+                if convolution && !specialized {
                     assert_eq!(
-                        tile_variant(&entry, tile),
+                        tile_variant(&dispatch, tile),
                         Variant::Scalar(tile.shader(&entry))
                     );
                 }
-                let mut module = tile_module(&entry, tile);
+                let mut module = tile_module(&dispatch, tile);
                 // Blade assigns resource bindings by ShaderData field name.
                 // Assign distinct test bindings before full offline validation.
                 for (index, (_, var)) in module.module.global_variables.iter_mut().enumerate() {
@@ -2010,14 +2099,18 @@ mod tests {
                     .map(|(_, var)| var.name.as_deref().unwrap())
                     .collect();
                 names.sort_unstable();
-                let expected = match entry {
+                let mut expected = match entry {
                     ShaderEntry::FusedMatMulAdd => {
                         vec!["matrix_a", "matrix_b", "matrix_c", "params", "src"]
                     }
                     ShaderEntry::Conv2dGradInputGemm => vec!["dst", "grad_out", "params", "weight"],
                     ShaderEntry::Conv2dGradWeightGemm => vec!["dst", "grad_out", "params", "src"],
+                    ShaderEntry::Conv2dGemm => vec!["dst", "params", "src", "weight"],
                     _ => vec!["matrix_a", "matrix_b", "matrix_c", "params"],
                 };
+                if specialized {
+                    expected.retain(|&name| name != "params");
+                }
                 assert_eq!(names, expected);
             }
         }

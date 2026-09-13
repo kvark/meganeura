@@ -91,52 +91,6 @@ fn parse_source(source: &str) -> Result<Module, naga::front::wgsl::ParseError> {
     naga::front::wgsl::parse_str(source)
 }
 
-/// Experiment: bind an immutable, tightly packed u32 parameter block in WGSL.
-pub(crate) fn specialize_u32_params(
-    shader: ShaderModule,
-    values: &[u32],
-    native_division: bool,
-) -> ShaderModule {
-    let (_, params) = shader
-        .module
-        .global_variables
-        .iter()
-        .find(|&(_, var)| var.name.as_deref() == Some("params"))
-        .expect("parameter uniform");
-    assert_eq!(params.space, naga::AddressSpace::Uniform);
-    let ty = &shader.module.types[params.ty];
-    let naga::TypeInner::Struct { ref members, span } = ty.inner else {
-        panic!("parameter block must be a struct");
-    };
-    assert_eq!(span as usize, values.len() * 4);
-    assert_eq!(members.len(), values.len());
-    for (index, member) in members.iter().enumerate() {
-        assert_eq!(member.offset as usize, index * 4);
-        assert_eq!(
-            shader.module.types[member.ty].inner,
-            naga::TypeInner::Scalar(naga::Scalar::U32)
-        );
-    }
-    let name = ty.name.as_ref().expect("named parameter struct");
-    let declaration = format!("var<uniform> params: {name};");
-    assert_eq!(shader.source.matches(&declaration).count(), 1);
-    let arguments = values.iter().map(|v| format!("{v}u")).collect::<Vec<_>>();
-    let mut source = shader.source.replace(
-        &declaration,
-        &format!("const params = {name}({});", arguments.join(", ")),
-    );
-    if native_division {
-        assert_eq!(source.matches(crate::divisor::SHADER).count(), 1);
-        source = source.replace(
-            crate::divisor::SHADER,
-            "fn divide_exact(value: u32, divisor: u32, multiplier: u32) -> u32 {\n\
-                 return value / divisor;\n\
-             }\n",
-        );
-    }
-    parse_wgsl(&source)
-}
-
 /// Generate WGSL declarations and body for a fused epilogue chain.
 ///
 /// Returns (declarations, body) where declarations are `var<storage>`
@@ -593,7 +547,7 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::Conv2dGemm
         | ShaderGroup::Conv2dGemmSmall
         | ShaderGroup::Conv2dGradInputGemm
-        | ShaderGroup::Conv2dGradInputGemmSmall => generate_conv_module(group, 16),
+        | ShaderGroup::Conv2dGradInputGemmSmall => generate_conv_module(group, 16, None),
         ShaderGroup::Conv2dGemmCoop | ShaderGroup::Conv2dGradInputGemmCoop => {
             panic!(
                 "conv coop kernels are generated per (kernel, stride) via generate_conv2d_coop_module"
@@ -612,15 +566,17 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::WinogradWeightTransform => {
             parse_wgsl(include_str!("shaders/winograd_weight_transform.wgsl"))
         }
-        ShaderGroup::Conv2dGradWeightGemm => conv_grad_weight_tiled(MatMulTile::Large, false, 16),
+        ShaderGroup::Conv2dGradWeightGemm => {
+            conv_grad_weight_tiled(MatMulTile::Large, false, 16, None)
+        }
         ShaderGroup::Conv2dGradWeightGemmSmall => {
-            conv_grad_weight_tiled(MatMulTile::Small, false, 16)
+            conv_grad_weight_tiled(MatMulTile::Small, false, 16, None)
         }
         ShaderGroup::Conv2dGradWeightGemmSplit => {
-            conv_grad_weight_tiled(MatMulTile::Large, true, 16)
+            conv_grad_weight_tiled(MatMulTile::Large, true, 16, None)
         }
         ShaderGroup::Conv2dGradWeightGemmSplitSmall => {
-            conv_grad_weight_tiled(MatMulTile::Small, true, 16)
+            conv_grad_weight_tiled(MatMulTile::Small, true, 16, None)
         }
         ShaderGroup::CacheWrite => parse_wgsl(include_str!("shaders/cache_write.wgsl")),
         ShaderGroup::CacheWritePrefix => {
@@ -920,7 +876,11 @@ fn matmul_k_stage() -> u32 {
 }
 
 /// Generate an ordinary scalar convolution with a measured K-tile candidate.
-pub(crate) fn generate_conv_module(group: ShaderGroup, k_tile: u32) -> ShaderModule {
+pub(crate) fn generate_conv_module(
+    group: ShaderGroup,
+    k_tile: u32,
+    params: Option<&[u32]>,
+) -> ShaderModule {
     let (source, tile) = match group {
         ShaderGroup::Conv2dGemm => (include_str!("shaders/conv2d_gemm.wgsl"), MatMulTile::Large),
         ShaderGroup::Conv2dGemmSmall => {
@@ -935,27 +895,47 @@ pub(crate) fn generate_conv_module(group: ShaderGroup, k_tile: u32) -> ShaderMod
             MatMulTile::Small,
         ),
         ShaderGroup::Conv2dGradWeightGemm => {
-            return conv_grad_weight_tiled(MatMulTile::Large, false, k_tile);
+            return conv_grad_weight_tiled(MatMulTile::Large, false, k_tile, params);
         }
         ShaderGroup::Conv2dGradWeightGemmSmall => {
-            return conv_grad_weight_tiled(MatMulTile::Small, false, k_tile);
+            return conv_grad_weight_tiled(MatMulTile::Small, false, k_tile, params);
         }
         _ => panic!("not an ordinary scalar convolution: {group:?}"),
     };
-    conv_gemm_tiled(source, tile, k_tile)
+    conv_gemm_tiled(source, tile, k_tile, params)
 }
 
 /// All three implicit-GEMM conv skeletons stage A at stride K and B at
 /// stride BM, with BM·K/256 elements per thread.
-fn conv_gemm_tiled(src: &str, tile: MatMulTile, k_tile: u32) -> ShaderModule {
+fn conv_gemm_tiled(
+    src: &str,
+    tile: MatMulTile,
+    k_tile: u32,
+    params: Option<&[u32]>,
+) -> ShaderModule {
     assert!(matches!(k_tile, 16 | 32));
     let bm = tile.bm();
     let tm = tile.tm();
     let (acc_decl, compute_body, acc_array) = tiled_gemm_body(tm, k_tile, bm, false);
+    let (declaration, divisor) = if let Some(values) = params {
+        assert_eq!(values.len(), 16, "Conv2dParams layout");
+        let arguments = values.iter().map(|v| format!("{v}u")).collect::<Vec<_>>();
+        (
+            format!("const params = Params({});", arguments.join(", ")),
+            "fn divide_exact(value: u32, divisor: u32, multiplier: u32) -> u32 { return value / divisor; }",
+        )
+    } else {
+        (
+            "var<uniform> params: Params;".into(),
+            crate::divisor::SHADER,
+        )
+    };
     let src = preprocess(
         src,
         &[
-            ("$DIVISOR", crate::divisor::SHADER),
+            ("$DIVISOR", divisor),
+            ("$PARAMS_TYPE", include_str!("shaders/conv2d_params.wgsl")),
+            ("$PARAMS_DECL", &declaration),
             ("$BM_U", &format!("{bm}u")),
             ("$TM_U", &format!("{tm}u")),
             ("$KTILE_U", &format!("{k_tile}u")),
@@ -969,7 +949,12 @@ fn conv_gemm_tiled(src: &str, tile: MatMulTile, k_tile: u32) -> ShaderModule {
     parse_wgsl(&src)
 }
 
-fn conv_grad_weight_tiled(tile: MatMulTile, split_k: bool, k_tile: u32) -> ShaderModule {
+fn conv_grad_weight_tiled(
+    tile: MatMulTile,
+    split_k: bool,
+    k_tile: u32,
+    params: Option<&[u32]>,
+) -> ShaderModule {
     assert!(!split_k || k_tile == 16, "split-K partitioning uses K=16");
     let (counts, range, start, end, offset) = if split_k {
         (
@@ -997,7 +982,7 @@ fn conv_grad_weight_tiled(tile: MatMulTile, split_k: bool, k_tile: u32) -> Shade
             ("$OUTPUT_OFFSET", offset),
         ],
     );
-    conv_gemm_tiled(&source, tile, k_tile)
+    conv_gemm_tiled(&source, tile, k_tile, params)
 }
 
 /// Shared unroll generator for every register-tiled GEMM skeleton
@@ -5457,11 +5442,11 @@ mod tests {
     #[test]
     fn ordinary_weight_gradients_have_no_split_partition_logic() {
         for tile in [MatMulTile::Small, MatMulTile::Large] {
-            let ordinary = conv_grad_weight_tiled(tile, false, 16);
+            let ordinary = conv_grad_weight_tiled(tile, false, 16, None);
             assert!(!ordinary.source.contains("num_workgroups"));
             assert!(!ordinary.source.contains("k_end"));
             assert!(ordinary.source.contains("var t = 0u;"));
-            let split = conv_grad_weight_tiled(tile, true, 16);
+            let split = conv_grad_weight_tiled(tile, true, 16, None);
             assert!(split.source.contains("num_workgroups"));
             assert!(split.source.contains("var t = first * 16u;"));
         }
