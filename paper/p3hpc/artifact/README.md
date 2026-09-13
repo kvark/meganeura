@@ -2,9 +2,8 @@
 
 ## Camera-ready cohort
 
-The September 12 cohort supersedes the original-submission measurements for
-the P3HPC manuscript. Its nine campaign archives and three supplied text
-reports stay outside Git. Read [RESULTS.md](../RESULTS.md) for scope, failures,
+The September 13 cohort supplies the P3HPC manuscript's measurements.
+Its nine campaign archives stay outside Git. Read [RESULTS.md](../RESULTS.md) for scope, failures,
 findings, and interpretation; [cohort.sha256](cohort.sha256) identifies inputs.
 
 From the repository root, with Python 3.11+:
@@ -21,8 +20,13 @@ It does not reconstruct unretained tensor elements or diagnose capture errors.
 No partial campaign is admitted to the completed-population aggregates.
 
 The supplied raw evidence needs external publication hosting before submission.
-The source branch remains `experiment/p3hpc-cuda-graphs` at Inferena `17d13a3`;
+The source branch remains `experiment/p3hpc-cuda-graphs` at Inferena `efb1e520`;
 no new collection tag was created during analysis.
+The eight complete device campaigns contain 390 pairs; the H100 extension
+adds five valid pairs and one failed attempt. Windows is complete.
+The separate MI300X report is not an input to timing tables or this verifier.
+See [submission preparation](../SUBMISSION.md) for the paper/source/evidence
+packages and remaining author upload checks.
 
 ## Original-submission artifact (legacy)
 

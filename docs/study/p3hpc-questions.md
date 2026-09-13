@@ -127,7 +127,7 @@ extend the relevant physical/lifetime contract.
 ### 12. How much autotuning exists now?
 
 Short: bounded measured kernel selection runs inside `build`. In the final
-cohort it improves strict 135M prefill 1.38× on H100 and 1.09× on RTX 5070.
+cohort it improves strict 135M prefill 1.36× on H100 and 1.09× on RTX 5070.
 
 Detail: the light policy disables search; the searched policy enables it.
 Both use greedy graph rewriting. Exact classes cover scalar matmul/convolution
@@ -136,8 +136,8 @@ numerical qualification, timing/noise guards, and resource bounds.
 F16-input, complex-fusion, GEMV, representation search, persistent winners,
 and automatic whole-step confirmation remain opportunities.
 
-The final recorded preparation difference amortizes after about 111 H100
-or 238 RTX 5070 prefills. These estimates charge all three benchmark sessions,
+The final recorded preparation difference amortizes after about 109 H100
+or 234 RTX 5070 prefills. These estimates charge all three benchmark sessions,
 not an inference-only deployment, and assume naturally warm driver state.
 Searched PyTorch is still faster in every CUDA phase comparison.
 The older six-pair 1.092× experiment and its 80-call break-even are separate
@@ -181,7 +181,7 @@ Detail: replay qualification covers every participating element, checks
 fixed RMS/maximum bounds, and tests two consecutive replays. Accelerated
 training first checks eight ordinary repeats. Cross-engine norms can still
 miss a sign error (`g` and `-g`), and 256 output samples can miss localized
-errors. All 366 completed pairs individually pass the 5% gradient gate.
+errors. All 395 completed pairs individually pass the 5% gradient gate.
 This is not full cross-engine elementwise equivalence or convergence evidence.
 
 ### 16. Did you find a PyTorch bug on the 780M?
@@ -199,8 +199,8 @@ count belongs in the camera-ready tables.
 Short: the complete-GPU score is conditional, and the missing coverage is
 reported explicitly.
 
-Detail: the same six complete GPU-reference systems enter every primary
-workload and phase. CPU support, partial Windows, and the H100 extension
+Detail: the same seven complete GPU-reference systems enter every primary
+workload and phase. CPU support and the partial H100 extension
 are separate populations. Unreached conditions are not assigned failures,
 and failed conditions are not given replacement timings. Requiring support
 across every attempted GPU gives both stacks a known hole, hence zero
@@ -213,9 +213,9 @@ universal-set portability; reporting only the conditional score would mislead.
 Short: on selected workloads, especially Radeon and small transformer shapes,
 but the stronger CUDA baseline usually wins.
 
-Detail: across six complete GPU-reference systems under light preparation,
-strict inference/minimal/training median ratios are 1.66/1.26/2.41, with
-nominal wins 5/30, 10/30, and 4/30. One inference win is essentially a tie.
+Detail: across seven complete GPU-reference systems under light preparation,
+strict inference/minimal/training median ratios are 1.83/1.43/2.43, with
+nominal wins 5/35, 8/35, and 4/35. One inference win is essentially a tie.
 Searched PyTorch wins all 60 CUDA phase comparisons. Intel CPU and partial
 campaigns are excluded from these counts.
 
@@ -224,8 +224,8 @@ campaigns are excluded from these counts.
 Short: it answers support availability, not a GPU-to-GPU efficiency question.
 
 Detail: RPL-U explicitly uses eager CPU PyTorch and is excluded from all GPU
-scores. Native Vulkan wins its five full-inference comparisons but loses the
-two minimal transformer shapes. Arc B570 supplies a separate real XPU
+scores. Native Vulkan wins its five full-inference comparisons; minimal
+SmolVLA is a near tie with CPU. Arc B570 supplies a separate real XPU
 comparison: default/no-graph completes 30 pairs. Its embedding backward
 requires a shape-probed dense `index_add` equivalent, recorded in the results.
 State this qualified workaround rather than calling the reference unmodified
@@ -233,13 +233,13 @@ native-XPU execution.
 
 ### 20. Did the final comparison use PyTorch max-autotune and CUDA Graphs?
 
-Short: yes on both complete NVIDIA campaigns, with explicit whole-phase
-replay validation and an uncaptured ablation.
+Short: 5070 and H100 have both; Windows 3050 has qualified default replay
+and its uncaptured ablation, with searched compilation explicitly omitted.
 
 Detail: the original submission bypassed capture and the reviewer was right
 to question it. The camera-ready now uses the repaired common-source cohort.
-H100 135M one-token PyTorch time falls 4.244 → 1.276 ms with default replay
-alone; diffusion training falls 12.035 → 4.035 ms. These controls can reverse
+H100 135M one-token PyTorch time falls 3.496 → 1.275 ms with default replay
+alone; diffusion training falls 14.322 → 4.031 ms. These controls can reverse
 an apparent native win.
 
 Max-autotune was requested during bring-up on every applicable backend.
@@ -252,7 +252,7 @@ ROCm replay itself was not qualified in this protocol.
 Pinned Inductor's 68-SM gate declines GEMM template search on 5070/3050;
 H100 executes that search. Other compiler choices still help some small-GPU
 workloads. H100 strict ResNet inference gains 1.28× from searched preparation
-but compilation grows 15.14 → 708.33 seconds, giving about 1.14 million calls
+but compilation grows 14.09 → 601.27 seconds, giving about 970,000 calls
 to repay the recorded extra setup. That does not make search unhelpful for
 every workload or phase.
 
@@ -262,9 +262,10 @@ TorchInductor/Triton caches prevent reuse of a saved compiler winner; persistent
 driver/library caches remain naturally warm. The frozen protocol treats this
 as a threat to validity, not independent first-use cold starts.
 
-Windows and the H100 extension stop in `cublasSgemm` during training capture.
-The preceding validated pairs survive, with actual replicate counts;
-there are no replacement timing claims for the failed conditions.
+Windows completes all 60 selected pairs. The H100 extension stops in
+searched 1.7B training capture: a Triton launch reports an unspecified earlier
+capture error, then graph finalization reports invalidated capture. The five
+preceding valid pairs survive, with no replacement timing for the failure.
 [Methodology and failures](../../paper/p3hpc/CUDA-GRAPHS.md).
 
 ### 21. Are the training times complete training steps?
@@ -286,14 +287,14 @@ quantization, batching and memory accounting. Serving adds request scheduling
 and tail latency. llama.cpp or vLLM comparisons need that expanded protocol,
 not a relabeling of the current column.
 
-### 23. What does a portability score of 0.39 mean?
+### 23. What does a portability score of 0.38 mean?
 
 Short: the mean of five workload-level harmonic efficiencies for strict
-light-policy training over six complete GPU-reference systems.
+light-policy training over seven complete GPU-reference systems.
 
 Detail: the comparator is the faster valid result of the two engines on each
-machine. It is not 39% of peak or a median time ratio. The corresponding
-PyTorch score is 0.98. Every workload uses the same six systems; the final
+machine. It is not 38% of peak or a median time ratio. The corresponding
+PyTorch score is 0.99. Every workload uses the same seven systems; the final
 cohort has no oracle-dispute exclusion. The CPU comparison and partial
 campaigns remain separate. Expanding to every attempted GPU exposes
 availability holes and gives both stacks zero under that support requirement.
@@ -303,7 +304,13 @@ availability holes and gives both stacks zero under that support requirement.
 Short: they identify where to work, not prove the absence of API or driver
 limits.
 
-Detail: the separate resident-parameter 5070 Nsight experiment puts 1.7B
+Detail: the same-pin ResNet training diagnostic reports 39.736 ms grouped
+native GPU time versus 13.312 ms of CUDA kernel intervals. Convolution
+weight/input gradients dominate the separately instrumented pass profile;
+the ordinary tuner log visits only 5/71 classes and misses small-output
+weight-gradient hotspots. No removable-barrier percentage follows.
+
+The separate resident-parameter 5070 Nsight experiment puts 1.7B
 prefill's native grouped GPU span at 52.67 ms, versus 27.91 ms of CUDA
 kernels; native host recording takes another 2.56 ms. These are different
 timing boundaries, not additive components of an exact partition.
@@ -658,9 +665,9 @@ prepare approximately eight slides and leave detail in backup:
 |---|---|
 | 0–1 min | Question: can a compact graphics-API layer support useful training and deployment? |
 | 1–2.5 min | Architecture diagram: shared graph/autodiff/plan, native embedding boundary. |
-| 2.5–4 min | Protocol: eight machines, common PyTorch source, explicit replay and arithmetic/preparation policies. |
-| 4–6 min | Results: 2.41× strict training median; replay reverses apparent wins; native H100 prefill search gains 1.38×. |
-| 6–7.5 min | Numerical gates, intermittent capture failures, CPU support and MI300X limitation. |
+| 2.5–4 min | Protocol: eight device configurations, common PyTorch source, explicit replay and arithmetic/preparation policies. |
+| 4–6 min | Results: 2.43× strict training median; replay reverses apparent wins; native H100 prefill search gains 1.36×. |
+| 6–7.5 min | Numerical gates, H100 searched capture failure, complete Windows, CPU support and MI300X. |
 | 7.5–9 min | H100 partial scaling and the separate host/GPU timeline; explain what the traces establish. |
 | 9–10 min | Deployment and productivity scope; Quest inference, not headset training. |
 | 10–12 min | Limits, alternatives, bounded autotuning direction and takeaway. |
@@ -683,7 +690,7 @@ adding more performance claims.
    not a 2× whole-step improvement.
 6. Name three stateful objects a tuner must restore, and three hardware or
    software changes that invalidate a stored performance winner.
-7. Distinguish the six-system GPU training result from the seven complete
+7. Distinguish the seven-system GPU training result from the eight complete
    campaigns and the total number of retained valid pairs.
 
 Answers: (1) `dX=[32,784]`, `dW=[784,128]`, with derivative matmuls protected;
@@ -691,6 +698,6 @@ Answers: (1) `dX=[32,784]`, `dW=[784,128]`, with derivative matmuls protected;
 (3) 0.75 versus arithmetic 0.833; (4) `g` versus `-g`;
 (5) `1/(0.27+0.73/2)=1.57×`; (6) optimizer moments/counter, KV state and
 accumulated gradients; device/driver, generator revision and numerical policy;
-(7) six complete GPU-reference systems: 4/30 strict training wins and 2.41×
-median; seven complete campaigns: 330 pairs; adding partial Windows and H100
-extension records gives 366 valid pairs. Different denominators answer different questions.
+(7) seven complete GPU-reference systems: 4/35 strict training wins and 2.43×
+median; eight complete campaigns: 390 pairs; adding the H100 extension
+records gives 395 valid pairs. Different denominators answer different questions.
