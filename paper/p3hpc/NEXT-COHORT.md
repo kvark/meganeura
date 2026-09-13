@@ -17,9 +17,9 @@ that a full workload used the requested path.
 |---|---|
 | Always tune Meganeura, independently of PyTorch | Collector enables it for every pair; each actual session reports policy, search coverage, decisions and cost. Missing/disabled receipts fail. |
 | Strict permits native-f32 cooperative tiles | Meganeura merged `428fc2d` adds `NativeF32`, filtering both planning and runtime capabilities. Scalar f32 remains the baseline; f16-input kernels stay forbidden. Local GPUs have no native-f32 tiles, so positive hardware use requires the Mac receipt. |
-| Explore the legal search space | Remove eight-class cutoff; include current dense/convolution domains; raise scratch ceiling to 1 GiB while retaining the device-memory guard. Deadline/coverage qualification is in progress; do not claim exhaustive search. |
+| Explore the legal search space | Remove eight-class cutoff; include current dense/convolution domains; raise scratch ceiling to 1 GiB while retaining the device-memory guard. CUDA ResNet covers all classes under the 60-second/session ceiling; B570 can exhaust it. Report coverage, not exhaustive search. |
 | Stop multi-hour reference preparation | Default compiled reference without max-autotune; 120-second first-specialization watchdog kills compiler descendants and retains failure evidence. Optional max-autotune uses the same limit. No automatic eager fallback. |
-| Replay on every applicable backend | CUDA/HIP `CUDAGraph` and XPU `XPUGraph` use one preparation/run stream and unchanged full-tensor qualification. CUDA and XPU small live-input/weight replay checks pass; full-model checks follow. ROCm hardware qualification is still required. |
+| Replay on every applicable backend | CUDA/HIP `CUDAGraph` and XPU `XPUGraph` use one preparation/run stream and unchanged full-tensor qualification. CUDA and XPU pass all five models in both arithmetic classes and small live-input/weight replay checks. ROCm and Windows hardware qualification is still required. |
 | MPS compilation and timing | Remove eager bypass; compile requested forward/backward/minimal phases and include synchronized first specializations in `compile_s`. Routing/failure checks pass locally, but a Mac must qualify actual execution. MPS has no equivalent public whole-phase replay API. |
 | Reduce collection time | Primary cohort is 30 paired processes per device; graph ablation and max-autotune are opt-in. No duplicate qualification campaign is required before every measurement. |
 | No weakened validation | Retain v7 cross-engine/replicated-gradient and fixed full-gradient replay gates; malformed execution evidence is rejected. |
@@ -68,10 +68,16 @@ error after successful compilation and ordinary execution. An isolated
 grouped-query attention reproducer fails likewise; the public PyTorch math
 SDPA setting passes complete forward/backward replay validation. Inferena
 records that setting explicitly for XPU, including its uncaptured control,
-and full-model qualification is underway. This is a reference-stack
+and all ten model/arithmetic pairs pass full qualification. This is a reference-stack
 graph-compatibility workaround, not disabling replay or relaxing a gate.
 
+Final-default CUDA ResNet qualification passes at Inferena `1430d0d`; the full
+XPU qualification at `d8335a8` also passes that revision's receipt checker.
+Six broad execution/contract tests pass with each local vendor wheel, together
+with nine Rust harness tests. No qualification output is publication data.
+
 The Mac must still demonstrate real MPS compilation timings and native-f32
-cooperative use, and ROCm must qualify the new replay path, before an expensive
-common-source collection is released. The local routing/receipt tests cannot
-substitute for either hardware check.
+cooperative use, ROCm must qualify the new replay path, and Windows must check
+the new compilation/watchdog workflow before an expensive common-source
+collection is released. The local routing/receipt tests cannot substitute for
+those hardware checks.
