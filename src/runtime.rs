@@ -3412,51 +3412,27 @@ impl Session {
             )
             .entered();
             let mut slots = vec![None; alias.sizes.len()];
-            let mut create_class = |device_local: bool| {
-                for (i, &size) in alias.sizes.iter().enumerate() {
-                    if alias.device_local[i] != device_local {
-                        continue;
-                    }
-                    let size = size.max(4);
-                    trace.mark(
-                        "buffer.create.before",
-                        serde_json::json!({"slot": i, "bytes": size, "device_local": device_local}),
-                    );
-                    let handle = gpu.create_buffer(blade_graphics::BufferDesc {
-                        name: &format!("buf_{}", i),
-                        size: size as u64,
-                        memory: if device_local {
-                            parameter_memory[i].unwrap_or(blade_graphics::Memory::DeviceTransient)
-                        } else {
-                            blade_graphics::Memory::Shared
-                        },
-                    });
-                    slots[i] = Some(Arc::new(PhysicalBuffer {
-                        gpu: Arc::clone(&gpu),
-                        handle,
-                    }));
-                    trace.mark("buffer.create.after", serde_json::json!({"slot": i}));
-                }
-            };
-            {
-                let _span = tracing::info_span!(
-                    "buffer_create_shared",
-                    allocations = shared_allocations,
-                    bytes = shared_bytes,
-                    trace_min_duration_us = 1_000u64,
-                )
-                .entered();
-                create_class(false);
-            }
-            {
-                let _span = tracing::info_span!(
-                    "buffer_create_device",
-                    allocations = device_allocations,
-                    bytes = device_bytes,
-                    trace_min_duration_us = 1_000u64,
-                )
-                .entered();
-                create_class(true);
+            for (i, &size) in alias.sizes.iter().enumerate() {
+                let device_local = alias.device_local[i];
+                let size = size.max(4);
+                trace.mark(
+                    "buffer.create.before",
+                    serde_json::json!({"slot": i, "bytes": size, "device_local": device_local}),
+                );
+                let handle = gpu.create_buffer(blade_graphics::BufferDesc {
+                    name: &format!("buf_{}", i),
+                    size: size as u64,
+                    memory: if device_local {
+                        parameter_memory[i].unwrap_or(blade_graphics::Memory::DeviceTransient)
+                    } else {
+                        blade_graphics::Memory::Shared
+                    },
+                });
+                slots[i] = Some(Arc::new(PhysicalBuffer {
+                    gpu: Arc::clone(&gpu),
+                    handle,
+                }));
+                trace.mark("buffer.create.after", serde_json::json!({"slot": i}));
             }
             slots
                 .into_iter()
