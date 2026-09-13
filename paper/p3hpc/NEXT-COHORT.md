@@ -46,3 +46,32 @@ that a full workload used the requested path.
   needs ZIP, not the existing 23 MB evidence tarball; raw evidence needs hosting.
 
 No new collection tag or cloud run has been created during protocol repair.
+
+## Local qualification findings (September 13)
+
+CUDA completes all five models in both arithmetic classes with native tuning
+independent of default-compiled graph replay. The initial 10-second native
+ceiling covered all non-ResNet classes locally, but only 22/71 strict and
+25/59 accelerated ResNet training classes. A 60-second ceiling reached every
+ResNet class in 29/24 seconds and passed the cross-engine gates. This is
+qualification, not replicated speedup evidence; actual native preparation
+can exceed default PyTorch compilation on ResNet.
+
+XPU ResNet completes compiled whole-phase replay. Native strict search visits
+51/71 training classes before its 60-second deadline on the B570's present
+host/PCIe configuration; full native preparation is 89 seconds versus 39
+seconds for PyTorch compilation. Other native sessions finish early. Do not
+claim every search is exhaustive or faster than default reference compilation.
+
+XPU SmolLM2's default fused attention fails inside capture with an event-wait
+error after successful compilation and ordinary execution. An isolated
+grouped-query attention reproducer fails likewise; the public PyTorch math
+SDPA setting passes complete forward/backward replay validation. Inferena
+records that setting explicitly for XPU, including its uncaptured control,
+and full-model qualification is underway. This is a reference-stack
+graph-compatibility workaround, not disabling replay or relaxing a gate.
+
+The Mac must still demonstrate real MPS compilation timings and native-f32
+cooperative use, and ROCm must qualify the new replay path, before an expensive
+common-source collection is released. The local routing/receipt tests cannot
+substitute for either hardware check.
