@@ -3,6 +3,13 @@
 Submission **ws_p3hpc104**. Prepared September 13, 2026; nothing uploaded.
 The author must approve the manuscript and any publication agreement.
 
+**Superseded draft, not ready to upload.** The numerical tables still describe
+v7 / Inferena `efb1e520`. The author requested a corrected protocol with
+always-on native tuning, strict native-f32 cooperative tiles, broader replay,
+MPS compilation and bounded PyTorch preparation. That work is tracked in
+[NEXT-COHORT.md](NEXT-COHORT.md). Replace the numerical analysis and rebuild
+the packages after the corrected cohort; do not relabel the existing data.
+
 ## Files
 
 The local handoff directory is `~/Documents/P3HPC/camera-ready-20260913/`:
@@ -20,6 +27,16 @@ small generated LaTeX fragments, archive identities and study documentation.
 The main benchmark and separate profiling studies keep their own revisions.
 No new collection tag or benchmark was created during this update.
 
+The author has now supplied the upload requirements: PDF preferably below
+2 MB, files above 4 MB rejected, separate LaTeX source ZIP and supplementary
+ZIP fields. The existing PDF (~309 KB) and source ZIP (~175 KB) fit, but they
+are superseded drafts. The ~23 MB evidence tarball is not the required
+supplementary format or a size-compliant upload. Prepare a compact
+supplementary ZIP with the analyzer, provenance, summaries and a link to
+separately hosted raw records; do not silently omit raw data while describing
+that ZIP as self-contained. Confirm the supplementary field's own size limit.
+No copyright/ISBN line or PDF eXpress conference ID was supplied.
+
 ## Venue requirements
 
 P3HPC explicitly requires the **IEEE proceedings template**, at most 12
@@ -29,12 +46,16 @@ portal screenshot further specifies 11:59 p.m. AoE for Stage 3.
 [Official P3HPC instructions](https://p3hpc.org/workshop/2026/submissions/).
 
 The manuscript uses the vendored `IEEEtran` class in conference mode, 10-point
-type on US Letter, with no custom margin/line-spacing reductions. The final
-local build has 13 pages; the argument ends on page 12, followed by the
+type on US Letter, with no custom margin/line-spacing reductions. The packaged
+v7 build has 13 pages; the argument ends on page 12, followed by the
 acknowledgments, artifact description and references. Tables and all pages
 were visually inspected; fonts are embedded Type 1 and no overflowing boxes,
 undefined citations or references remain. PDF title/author metadata is set.
 These local checks are **not** an IEEE PDF eXpress certification.
+
+The working draft with the new Future Work section rebuilds to 14 pages
+(318,239 bytes); its main argument still ends on page 12. This is a layout
+check, not an updated-data camera-ready release.
 
 The screenshot labels Stage 3 **SC Workshop: P3HPC: Program Material**,
 separately from **Workshop Camera-Ready Upload**. Treat them as distinct
@@ -81,9 +102,9 @@ each vendor.
 
 ## Final author actions
 
-- Review the PDF and reviewer matrix in `REVISION.md`. In particular, approve
-  the declared non-NVIDIA replay/strict-f32 restrictions rather than implying
-  that the final cohort implemented the deferred protocol proposals.
+- Complete the corrected-protocol acceptance checks and collection, update
+  the manuscript and reviewer matrix in `REVISION.md`, then review the rebuilt
+  PDF. Requested protocol fixes are not deferred future work.
 - Choose permanent public hosting for the compact evidence bundle and, if
   available before upload, add its URL/DOI to the artifact description.
   The source commits and checksums are already fixed; Git has no raw data.
