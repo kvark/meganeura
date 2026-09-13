@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 mod checkpoint;
+mod initialization;
 mod tuning;
 pub use crate::tune::TuneOutcome;
 
@@ -2997,7 +2998,11 @@ impl Session {
     /// Returns false if the GPU doesn't support the required cooperative
     /// matrix types (e.g. AMD RADV advertises the extension but rejects
     /// the specific f32 matrix shapes).
-    fn test_coop_matmul(gpu: &Gpu, config: &crate::codegen::CoopConfig) -> bool {
+    fn test_coop_matmul(
+        gpu: &Gpu,
+        config: &crate::codegen::CoopConfig,
+        trace: &initialization::Trace,
+    ) -> bool {
         use crate::codegen::ShaderGroup;
         use blade_graphics as bg;
 
@@ -3103,8 +3108,11 @@ impl Session {
             );
             pc.dispatch([(m as u32).div_ceil(ot), (n_out as u32).div_ceil(ot), 1]);
         }
+        trace.mark("coop_probe.submit.before", serde_json::json!({}));
         let sp = gpu.submit(&mut encoder);
-        let _ = gpu.wait_for(&sp, !0);
+        trace.mark("coop_probe.submit.after", serde_json::json!({}));
+        trace.mark("coop_probe.wait.before", serde_json::json!({}));
+        trace.wait("coop_probe.wait.result", gpu.wait_for(&sp, !0));
 
         let result =
             unsafe { std::slice::from_raw_parts(c_buf.data() as *const f32, m * n_out).to_vec() };
@@ -3169,10 +3177,19 @@ impl Session {
     }
 
     fn build_session_impl(plan: ExecutionPlan, gpu: Arc<Gpu>, opts: SessionOptions) -> Self {
+        let trace = initialization::Trace::new();
+        let information = gpu.device_information();
+        trace.mark("initialization.begin", serde_json::json!({
+            "logical_buffers": plan.buffers.len(), "dispatches": plan.dispatches.len(),
+            "device_name": information.device_name, "driver_name": information.driver_name,
+            "driver_info": information.driver_info, "software": information.is_software_emulated,
+        }));
+        trace.mark("coop_probe.before", serde_json::json!({}));
         let coop_caps = gpu.capabilities().cooperative_matrix;
         let coop_config = Self::select_coop_config(&coop_caps, opts.coop)
-            .filter(|config| Self::test_coop_matmul(&gpu, config));
+            .filter(|config| Self::test_coop_matmul(&gpu, config, &trace));
         if let Some(ref config) = coop_config {
+            trace.mark("coop_probe.after", serde_json::json!({"enabled": true}));
             log::info!(
                 "cooperative matrix enabled (tile={}×{}, {}, f32_tile={}, f16_tile={})",
                 config.tile_size,
@@ -3187,6 +3204,7 @@ impl Session {
             );
         } else {
             let info = gpu.device_information();
+            trace.mark("coop_probe.after", serde_json::json!({"enabled": false}));
             log::warn!(
                 "cooperative matrix not available on {} ({}) (f32_tile={}, f16_tile={}); using naive matmul",
                 info.device_name,
@@ -3309,6 +3327,12 @@ impl Session {
             alias.device_local.fill(false);
         }
         let alias = alias;
+        trace.mark(
+            "allocation_plan",
+            serde_json::json!({
+                "sizes": &alias.sizes, "device_local": &alias.device_local, "map": &alias.map,
+            }),
+        );
         // Debug aid: dump dispatch order, declared accesses, and the
         // alias map for corruption bisection (see MEGANEURA_PIN_BUFS).
         if opts.dump_plan {
@@ -3361,6 +3385,10 @@ impl Session {
             .map(|(i, &size)| {
                 let size = size.max(4);
                 let device_local = alias.device_local[i];
+                trace.mark(
+                    "buffer.create.before",
+                    serde_json::json!({"slot": i, "bytes": size, "device_local": device_local}),
+                );
                 let handle = gpu.create_buffer(blade_graphics::BufferDesc {
                     name: &format!("buf_{}", i),
                     size: size as u64,
@@ -3370,14 +3398,20 @@ impl Session {
                         blade_graphics::Memory::Shared
                     },
                 });
+                trace.mark("buffer.create.after", serde_json::json!({"slot": i}));
                 // Zero-fill to prevent NaN from uninitialized padding regions
                 // (coop tiles read/write full tiles beyond logical dimensions).
                 // Device-local buffers have no host pointer; they are
                 // zero-filled on the GPU below, before the first step().
                 if !device_local {
+                    trace.mark(
+                        "buffer.zero_host.before",
+                        serde_json::json!({"slot": i, "bytes": size}),
+                    );
                     unsafe {
                         std::ptr::write_bytes(handle.data(), 0, size);
                     }
+                    trace.mark("buffer.zero_host.after", serde_json::json!({"slot": i}));
                 }
                 Arc::new(PhysicalBuffer {
                     gpu: Arc::clone(&gpu),
@@ -3400,7 +3434,9 @@ impl Session {
             }
         }
 
+        trace.mark("pipelines.before", serde_json::json!({}));
         let pipelines = Pipelines::new(&gpu, &plan, coop_config.as_ref());
+        trace.mark("pipelines.after", serde_json::json!({}));
         let mut encoder = gpu.create_command_encoder(blade_graphics::CommandEncoderDesc {
             name: "meganeura",
             buffer_count: 2,
@@ -3411,6 +3447,7 @@ impl Session {
         // One submission at build time; the wait below orders it before
         // the first step()'s reads.
         if alias.device_local.iter().any(|&d| d) {
+            trace.mark("zero_device_local.record.before", serde_json::json!({}));
             encoder.start();
             {
                 let mut transfer = encoder.transfer("zero_device_local");
@@ -3421,12 +3458,19 @@ impl Session {
                     }
                 }
             }
+            trace.mark("zero_device_local.submit.before", serde_json::json!({}));
             let sp = gpu.submit(&mut encoder);
-            let _ = gpu.wait_for(&sp, !0);
+            trace.mark("zero_device_local.submit.after", serde_json::json!({}));
+            trace.mark("zero_device_local.wait.before", serde_json::json!({}));
+            trace.wait("zero_device_local.wait.result", gpu.wait_for(&sp, !0));
         }
 
         let optimizer_device = !opts.no_device_local && !opts.debug;
         let mut optimizer_device_bufs: Vec<(blade_graphics::Buffer, u64)> = Vec::new();
+        trace.mark(
+            "optimizer.allocate.before",
+            serde_json::json!({"enabled": !plan.param_grad_pairs.is_empty()}),
+        );
         // Grad-clip accumulator: a single f32. GPU-only after the
         // barriered clip path landed; host-visible only in debug.
         let grad_clip_acc = if !plan.param_grad_pairs.is_empty() {
@@ -3441,6 +3485,11 @@ impl Session {
             None
         };
         if !optimizer_device_bufs.is_empty() {
+            trace.mark(
+                "optimizer.allocate.after",
+                serde_json::json!({"buffers": optimizer_device_bufs.len()}),
+            );
+            trace.mark("zero_optimizer.record.before", serde_json::json!({}));
             encoder.start();
             {
                 let mut transfer = encoder.transfer("zero_optimizer");
@@ -3448,8 +3497,11 @@ impl Session {
                     transfer.fill_buffer(buf.at(0), size, 0);
                 }
             }
+            trace.mark("zero_optimizer.submit.before", serde_json::json!({}));
             let sp = gpu.submit(&mut encoder);
-            let _ = gpu.wait_for(&sp, !0);
+            trace.mark("zero_optimizer.submit.after", serde_json::json!({}));
+            trace.mark("zero_optimizer.wait.before", serde_json::json!({}));
+            trace.wait("zero_optimizer.wait.result", gpu.wait_for(&sp, !0));
         }
 
         // Buffers that some dispatch (or session setup) actually writes.
@@ -3479,6 +3531,7 @@ impl Session {
             written[b.0 as usize] = true;
         }
 
+        trace.mark("initialization.ready", serde_json::json!({}));
         Self {
             gpu,
             buffers,
