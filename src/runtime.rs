@@ -2596,12 +2596,29 @@ pub enum CoopPolicy {
     /// dispatches retain scalar f32 operands.
     #[default]
     Auto,
+    /// Allow only native f32 operands and accumulators. Devices with only
+    /// reduced-input cooperative tiles retain scalar f32 implementations.
+    NativeF32,
     /// Never use cooperative matrices — force the scalar paths.
     Disabled,
     /// Use f16 tiles without residual compensation, including for
     /// derivative work. Faster than [`Self::Auto`] on f16-only devices,
     /// and can overflow or lose gradient range.
     AllowF16,
+}
+
+impl CoopPolicy {
+    pub(crate) fn filter_caps(
+        self,
+        mut caps: crate::codegen::CoopCaps,
+    ) -> crate::codegen::CoopCaps {
+        match self {
+            Self::Disabled => caps = crate::codegen::CoopCaps::default(),
+            Self::NativeF32 => caps.f16_tile = 0,
+            Self::Auto | Self::AllowF16 => {}
+        }
+        caps
+    }
 }
 
 /// Why [`Session::read_node`] could not return a value.
@@ -2933,6 +2950,10 @@ impl Session {
             log::warn!("cooperative matrices disabled by policy — forcing scalar matmul");
             return None;
         }
+        let caps = policy.filter_caps(crate::codegen::CoopCaps {
+            f16_tile: caps.f16_tile,
+            f32_tile: caps.f32_tile,
+        });
         log::info!(
             "coop caps: f16_tile={}, f32_tile={}",
             caps.f16_tile,
