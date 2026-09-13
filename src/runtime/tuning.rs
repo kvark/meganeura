@@ -437,6 +437,11 @@ impl Session {
                 report.outcomes.push(outcome);
             }
         }
+        if staging.buffer.is_some()
+            || report
+                .outcomes
+                .iter()
+                .any(|o| o.class.conv2d.is_some() && !o.compile_time.is_zero())
         {
             let _timer = PhaseTimer::new(&mut report.final_cleanup);
             staging.clear();
@@ -1567,7 +1572,10 @@ mod tests {
 
     fn check_distinct_training_swap(convolution: bool) {
         use crate::{CoopPolicy, SessionConfig, SessionOptions};
-        let gpu = std::sync::Arc::new(crate::init_gpu_context().unwrap());
+        let gpu = std::sync::Arc::new(
+            crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap(),
+        );
+        eprintln!("GPU: {}", gpu.device_information().device_name);
         let mut graph = crate::Graph::new();
         let input_len = if convolution {
             2 * 17 * 3 * 11
@@ -1651,10 +1659,18 @@ mod tests {
         b.pipelines
             .ensure_tune_tile(&gpu, &b.plan.dispatches[class.members[0]], alternative)
             .unwrap();
+        let pipeline_count = b.pipelines.map.len();
+        b.pipelines
+            .ensure_tune_tile(&gpu, &b.plan.dispatches[class.members[0]], alternative)
+            .unwrap();
+        assert_eq!(b.pipelines.map.len(), pipeline_count);
         for &index in &class.members {
             alternative.apply(&mut b.plan.dispatches[index], &class.key);
         }
         b.pipelines.discard_unused_convolutions(&gpu, &b.plan);
+        if convolution {
+            assert!(b.pipelines.map.len() < pipeline_count);
+        }
         let (a_keys, b_keys) = (a.dispatch_pipeline_keys(), b.dispatch_pipeline_keys());
         assert_ne!(a_keys, b_keys);
         for _ in 0..4 {
