@@ -19,16 +19,16 @@ that a full workload used the requested path.
 | Strict permits native-f32 cooperative tiles | Meganeura merged `428fc2d` adds `NativeF32`, filtering both planning and runtime capabilities. Scalar f32 remains the baseline; f16-input kernels stay forbidden. Local GPUs have no native-f32 tiles, so positive hardware use requires the Mac receipt. |
 | Explore the legal search space | Remove eight-class cutoff; include current dense/convolution domains; raise scratch ceiling to 1 GiB while retaining the device-memory guard. CUDA ResNet covers all classes under the 60-second/session ceiling; B570 can exhaust it. Report coverage, not exhaustive search. |
 | Stop multi-hour reference preparation | Default compiled reference without max-autotune; 120-second first-specialization watchdog kills compiler descendants and retains failure evidence. Optional max-autotune uses the same limit. No automatic eager fallback. |
-| Replay on every applicable backend | CUDA/HIP `CUDAGraph` and XPU `XPUGraph` use one preparation/run stream and unchanged full-tensor qualification. CUDA and XPU pass all five models in both arithmetic classes and small live-input/weight replay checks. ROCm and Windows hardware qualification is still required. |
+| Replay on every applicable backend | CUDA/HIP `CUDAGraph` and XPU `XPUGraph` use one preparation/run stream and full-tensor qualification. CUDA and XPU pass all five models in both arithmetic classes and small live-input/weight replay checks. ROCm and Windows hardware qualification is still required. |
 | MPS compilation and timing | Remove eager bypass; compile requested forward/backward/minimal phases and include synchronized first specializations in `compile_s`. Routing/failure checks pass locally, but a Mac must qualify actual execution. MPS has no equivalent public whole-phase replay API. |
 | Reduce collection time | Primary cohort is 30 paired processes per device; graph ablation and max-autotune are opt-in. No duplicate qualification campaign is required before every measurement. |
-| No weakened validation | Retain v7 cross-engine/replicated-gradient and fixed full-gradient replay gates; malformed execution evidence is rejected. |
+| Explicit numerical validation | Cross-engine/replicated-gradient and full-gradient gates stay unchanged. The v9 candidate uses fixed per-output maximum/RMS gates at the same `1e-4`/`1e-6` coefficients, replacing v8's near-zero-sensitive pointwise gate; this is a declared acceptance-rule change. |
 | Production convolution choices | Already merged and included in the pin. Search legal shape/staging alternatives; report invalid candidates and uncovered classes rather than treating heuristics as measurements. |
 | Honest memory and timing interpretation | Existing distinct native allocation/Torch allocator/MPS endpoint measurements retained; no fictitious common peak-VRAM or subtraction-based barrier metric. |
 
 ## Paper acceptance after collection
 
-- Recompute tables, preparation costs and the SmolLM2 figure from one v8 source;
+- Recompute tables, preparation costs and the SmolLM2 figure from one final source;
   retain incomplete conditions as operational findings, not favorable retries.
 - State actual platform failures and successful native execution directly;
   distinguish driver support, compile failure, budget exhaustion, and omitted
@@ -81,3 +81,17 @@ cooperative use, ROCm must qualify the new replay path, and Windows must check
 the new compilation/watchdog workflow before an expensive common-source
 collection is released. The local routing/receipt tests cannot substitute for
 those hardware checks.
+
+The author's RX 7900 XT v8 archive (`d5b46f2`) completes nine paired conditions
+before accelerated Whisper fails an ordinary training-output repeat, prior to
+training graph capture. Compilation takes 7.09 seconds, not a timeout. Two of
+576,000 values miss the pointwise gate, with a largest mismatch of `1.185e-6`;
+successful strict Whisper already varies by up to `1.529e-6`, with RMS error
+`7.171e-8`. The v9 correction applies fixed per-output maximum/RMS bounds and
+preserves pointwise mismatch counts as diagnostics. The failed record lacks
+the full statistics needed to apply that rule retrospectively; AMD Whisper
+must qualify again. This is not evidence of a GPU crash or Meganeura divergence.
+At Inferena `8826ef7`, both local GPUs pass paired v9 Whisper qualification in
+both arithmetic classes, along with the broad execution tests. All 192 saved
+output comparisons from the nine valid AMD pairs satisfy the new fixed norm
+bounds; this offline check neither relabels old data nor qualifies the failure.
