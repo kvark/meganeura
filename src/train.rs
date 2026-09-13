@@ -322,10 +322,10 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, Optimiz
         Some(gpu) => gpu,
         None => runtime::default_gpu_context(),
     };
-    let mut coop_caps = runtime::auto_tune(&gpu, 0).coop_caps;
-    if cfg.runtime.coop == runtime::CoopPolicy::Disabled {
-        coop_caps = crate::codegen::CoopCaps::default();
-    }
+    let coop_caps = cfg
+        .runtime
+        .coop
+        .filter_caps(runtime::auto_tune(&gpu, 0).coop_caps);
     let mode_tag = match mode {
         Mode::Training => 0,
         Mode::Inference => 1,
