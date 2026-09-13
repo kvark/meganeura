@@ -151,6 +151,95 @@ doubling K staging to 32 passes the full oracles but regresses ResNet training
 No global K change is justified. A separate cold-cache confirmation of constant
 native division amortizes its 2.757 s extra preparation after about 256 steps.
 
+## Production convolution search — September 13
+
+Measured code: `3996155`; source and the exact dependency lock are retained on
+[`experiment/conv-production-2026-09-13`](https://github.com/kvark/meganeura/tree/experiment/conv-production-2026-09-13).
+The lock-only child does not change the measured implementation. No raw records,
+caches or binaries are committed. NVIDIA RTX 5070 / 595.91.07 and Intel Arc B570 /
+Mesa 26.0.3-1ubuntu1 run sequentially on the same i5-12400F host. B570 occupies the
+secondary PCIe 3.0 ×1 slot; Linux 7.0.0-31-generic, Rust 1.98.0. Both advertise
+no native-f32 cooperative tile here; this study uses scalar f32 throughout.
+
+The existing `tune_crossover` runner adds `--convolution`: forward/dX/dW search
+with the production defaults (2 s soft deadline, eight classes, 64 MiB scratch).
+The existing generator's uniform 32/64 tiles compete with constant-parameter,
+native-division 32/64 tiles at K=16/32. No hardware/model rule, precision change
+or relaxed qualification. Each comparison must pass the full-output parity and
+sampled f64 checks on ordinary/tiny inputs before paired kernel measurements.
+Only fully qualified, guarded winners are installed; rejected and unused
+convolution pipelines are released at the end of search.
+
+Six fresh processes per GPU, ordinary driver caches (not flushed), include a
+40-pair untuned/untuned control and four 20-pair role-reversed blocks. Every
+sample times `step+wait`, including the optimizer when present. Search, swaps,
+settling and diagnostic readbacks are outside whole-step samples. Search itself
+includes compilation, uploads/readbacks, CPU validation, sampling and cleanup.
+Full control-session comparisons check outputs, gradients, parameters and
+optimizer state; search and swaps must preserve their own session bit-for-bit.
+The 250 ms NVIDIA telemetry process remains enabled on both devices; it does
+not measure Intel clocks. Timings below are medians across process reports.
+
+| GPU / workload | Baseline → selected, ms | Speedup | Search, s |
+|---|---:|---:|---:|
+| RTX 5070 / ResNet-50 F+loss+backward | 21.133 → 17.729 | 1.192× | 2.005 |
+| RTX 5070 / convolution chain + Adam | 0.1281 → 0.1023 | 1.246× | 0.158 |
+| RTX 5070 / convolution chain + SGD | 0.1277 → 0.1022 | 1.250× | 0.159 |
+| Arc B570 / ResNet-50 F+loss+backward | 35.880 → 31.651 | 1.134× | 2.009 |
+| Arc B570 / convolution chain + Adam | 0.2478 → 0.1863 | 1.330× | 0.388 |
+| Arc B570 / convolution chain + SGD | 0.2469 → 0.1854 | 1.331× | 0.381 |
+
+All 36 case runs complete, pass numerical/state checks and clear the unchanged
+5% plus paired-noise whole-step guard in both session roles. ResNet visits 7/68
+eligible classes on NVIDIA and 4/68 on Intel, changing 19 and 15–16 dispatches.
+NVIDIA selects both K sizes; every selected Intel ResNet specialization keeps
+K=16. This supports per-shape measurement, not a global K change. ResNet search
+amortizes after roughly 589/475 steps on NVIDIA/Intel; the short optimizer chains
+need about 6,100–6,300 steps. Session tensor allocation requests are unchanged;
+peak search scratch is 18.48 MiB for ResNet and 0.122 MiB for the chains. These
+are requested bytes, not measured peak VRAM including driver/compiler heaps.
+
+A separate three-process check per GPU starts with an empty private driver cache
+on the local SSD. All 18 case runs qualify and clear the whole-step guard.
+ResNet median speedups are 1.175× NVIDIA and 1.107× Intel, with 2.050/2.004 s
+search. The cold NVIDIA search reaches five classes instead of seven. The
+deadline is soft: the largest observed ResNet overrun across these cohorts is
+53 ms. Adam precedes SGD and can warm shared kernels even in the fresh-cache
+processes. Neither cohort resets OS caches, GPU clocks or driver process state.
+
+Reproduce at the retained branch, on one idle GPU at a time:
+
+```sh
+cargo build --locked --release --example tune_crossover
+MEGANEURA_DEVICE_ID=0x2f04 target/release/examples/tune_crossover /tmp/conv-r1.json 1 --convolution
+```
+
+Use six new output paths and seeds 1–6; `0xe20c` selects B570. The runner prints
+and records the actual adapter plus requested GPU options. For the cold check,
+use seeds 1–3 and a new **local** directory per process, setting
+`__GL_SHADER_DISK_CACHE=1`, `__GL_SHADER_DISK_CACHE_PATH=<dir>` and
+`MESA_SHADER_CACHE_DIR=<dir>`. Earlier implicit-adapter and network-cache pilots
+are not these confirmation cohorts.
+
+The existing full-f64 convolution oracle regressions also pass on both GPUs,
+covering forward/dX/dW, both spatial tiles, rectangular/odd/strided/padded and
+reciprocal-boundary shapes, ordinary/tiny operands, and zero budgets. Existing
+state-swap tests cover optimizer updates, pipeline reuse and unused-pipeline
+release. The known Naga Workgroup-layout validation warning remains; no new
+validation error is waived. This is synthetic ResNet batch 1 at 224² plus small
+optimizer chains, not the paper's batch-4 Inferena cohort, pretrained accuracy,
+convergence, Metal qualification or a PyTorch comparison. It supports opt-in
+production search; it does not silently change the collection protocol.
+
+Validation reuses existing tests: 275 library and 181 regression tests pass,
+plus five scalar tuning regressions and the convolution/state-swap checks on
+both GPUs. An isolated `cargo llvm-cov` run over these checks reports Rust host
+line coverage of 99.4% in `tune.rs`, 82.3% in `runtime/tuning.rs`, 90.8% in
+`codegen.rs` and 77.3% overall. This includes inline unit-test code but excludes
+`tests/`, `examples/` and `bench/`; it does not instrument WGSL or exercise
+unsupported native-f32 cooperative hardware. CI retains its ordinary suite's
+separate coverage artifact by revision. No new regression executable is added.
+
 ## Parameter placement and host RAM — September 10
 
 Source-only `experiment/parameter-allocation-2026-09-10` tags in Inferena,

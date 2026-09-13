@@ -436,7 +436,11 @@ staging management, encoder creation and binding/geometry work. The pipeline
 field is exactly `compile_time`, already within preparation. `phase_times.cleanup`
 measures comparison resource destruction, including early exits. Reused staging's
 last release is `TuneReport::final_cleanup`, inside total search but outside
-comparison times. Release of a previous size belongs to preparation's staging
+comparison times. This also charges release of unused convolution pipelines.
+Constant convolution choices appear as `SpecializedConv { tile_size, k_tile }`
+in the report and `fixed-native-div-k…` plus the exact shape in pipeline labels.
+WGSL dumps retain each generated source under its content hash.
+Release of a previous size belongs to preparation's staging
 management. Historical missing fields remain `None`; never add nested times twice.
 
 `TuneOutcome.scratch` records actual binding/staging requests and reuse status.
