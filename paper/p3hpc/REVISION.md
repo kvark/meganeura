@@ -1,6 +1,9 @@
 # P3HPC camera-ready revision status
 
-Updated September 12, 2026 after auditing the final supplied cohort.
+Updated September 13, 2026 after the author's detailed review.
+The [corrections and next-cohort gate](NEXT-COHORT.md) supersede the earlier
+recommendation below to submit without recollection. Current numerical
+tables still describe the supplied cohort, not the proposed protocol.
 The manuscript now uses the common-revision campaign rather than the
 original five-machine tables. See [RESULTS.md](RESULTS.md) for the evidence
 ledger, crash analysis, scaling limits, and Intel-server recommendation.
@@ -55,8 +58,8 @@ python3 paper/p3hpc/artifact/cohort.py "$HOME/Downloads/p3hpc" \
   --check paper/p3hpc/tables --output target/p3hpc-final-data
 ~~~
 
-This audits the external archives and regenerates the six camera-ready
-fragments without a GPU. The original `artifact/verify.py --repository`
+This audits the external archives and regenerates the manuscript tables
+and SmolLM2 figure without a GPU. The original `artifact/verify.py --repository`
 and its tests still check the companion report's historical dataset.
 Do not use the legacy packager as the final-cohort artifact.
 
@@ -77,9 +80,11 @@ pdflatex -interaction=nonstopmode -halt-on-error -output-directory=../../target/
 Local checks passed: all 366 pairs also pass the frozen Inferena checker;
 all seven complete campaigns reproduce its retained gradient-replication
 reports exactly. The offline analyzer rejects altered timing, gradient, and
-capture evidence. Generated tables, legacy artifact verification and its
-six tests, and the 11-page PDF build pass. The PDF was visually checked;
-fonts are embedded, with no undefined references or overflowing boxes.
+capture evidence. After the author-review edits, all 366 pairs and generated
+fragments re-audit successfully, the six existing artifact tests pass, and
+the PDF builds to 13 pages including references and the artifact appendix.
+Changed figures/tables were visually checked; fonts are embedded, with no
+undefined references or overflowing boxes.
 
 The recorded camera-ready deadline is September 25; check the
 [venue instructions](https://p3hpc.org/workshop/2026/submissions/) and any
@@ -91,5 +96,7 @@ acceptance-specific requirements before upload.
   archive source refs with the final submission, then tag the settled revision.
 - Approve and merge the source changes. Only the author merges or submits.
 
-The paper does not need another development benchmark or a speculative Intel
-server rental to complete these decisions.
+The author review identified actual protocol omissions that warrant a
+replacement primary cohort after bounded engineering and qualification.
+An Intel server rental is still not a prerequisite. See NEXT-COHORT.md;
+do not launch the old expensive campaign again.

@@ -1,5 +1,11 @@
 # Final P3HPC cohort: findings and interpretation
 
+The September 13 author review recommends a smaller replacement primary
+campaign after correcting strict-f32 and non-NVIDIA execution policy.
+See the [next-cohort gate](NEXT-COHORT.md). All current numerical tables
+still describe the supplied September 12 cohort; the manuscript adds
+preparation, memory accounting, and a SmolLM2 chart without new GPU runs.
+
 This is the camera-ready evidence guide. The original-submission numbers in
 `paper/results/` remain historical evidence for the companion report; the
 P3HPC manuscript now uses the September 12 cohort. No new measurements were
