@@ -1083,6 +1083,27 @@ gap. Work on several vendors informed this compiler; the experiment does
 not isolate general architecture from accumulated manual engineering.
 Nor do footprint and preparation metrics measure programmer productivity.
 
+\section{Future Work}
+
+Beyond kernel optimization, two directions test the generality of this
+design. Neural accelerators would require a backend that represents their
+operator, layout, and precision constraints; Vulkan/Metal GPU support does
+not itself expose these devices. Graph partitioning could retain unsupported
+operations on the GPU, but transfer and synchronization costs, numerical
+qualification, and observability must enter the placement decision. A useful
+extension should preserve one graph interface without promising identical
+hardware capabilities.
+
+Persistent megakernels could move dependency scheduling onto the device,
+reducing dispatch boundaries and some intermediate memory traffic. MPK
+demonstrates automatic tensor-program lowering to persistent CUDA task
+graphs~\cite{cheng2026mpk}. Applying this idea through graphics APIs raises
+different portability questions: workgroup forward progress, residency,
+cross-workgroup synchronization, and register pressure. A bounded search
+could choose profitable regions while retaining the ordinary multi-kernel
+schedule as a qualified baseline. Neither direction is an implemented or
+measured capability of the present system.
+
 \section{Conclusion}
 
 A single Vulkan/Metal compiler and runtime executes matched ML inference

@@ -5,6 +5,14 @@ author approval, not a claim of reviewer approval or an uploaded submission.
 [RESULTS.md](RESULTS.md) is the numerical/provenance ledger;
 [SUBMISSION.md](SUBMISSION.md) is the final handoff checklist.
 
+**Status correction:** the following matrix describes the superseded v7 draft,
+not acceptance of the author's requested protocol. Native tuning, strict
+native-f32 tiles, ROCm/XPU replay, MPS compilation and bounded preparation are
+being implemented and qualified in Inferena; see [NEXT-COHORT.md](NEXT-COHORT.md).
+New data are required before this matrix or the manuscript can claim those
+conditions were measured. A separate Future Work section now discusses neural
+accelerator backends and persistent megakernels, not these required fixes.
+
 The paper now uses Inferena efb1e520 / Meganeura 75dfe901: eight complete
 device campaigns (390 paired processes), plus five valid H100 extension
 pairs and one failed searched 1.7B attempt. All share one PyTorch source.
@@ -58,4 +66,4 @@ report, not a second GPU measurement or a claim of external artifact evaluation.
 Build and final package checks are recorded in SUBMISSION.md. Sources are
 reviewable on the paper branch; publication files remain outside Git.
 The author alone approves the text, chooses artifact hosting, merges, and
-submits. No new machine or expensive tuning run is needed for this scope.
+submits. The corrected cohort must not repeat unbounded max-autotune runs.
