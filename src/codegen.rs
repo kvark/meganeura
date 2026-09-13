@@ -2728,7 +2728,7 @@ mod coop_caps_tests {
     use super::CoopCaps;
 
     #[test]
-    fn flash_16x16_requires_exact_tile_size() {
+    fn cooperative_caps_respect_tile_and_precision_requirements() {
         assert!(
             CoopCaps {
                 f16_tile: 16,
@@ -2745,6 +2745,20 @@ mod coop_caps_tests {
                 .supports_16x16_f16(),
                 "hard-coded 16x16 shaders must reject tile {tile}",
             );
+        }
+        use crate::CoopPolicy;
+        for f32_tile in [0, 8, 16] {
+            let caps = CoopCaps {
+                f16_tile: 16,
+                f32_tile,
+            };
+            let strict = CoopPolicy::NativeF32.filter_caps(caps);
+            assert_eq!(strict.f32_tile, f32_tile);
+            assert!(!strict.supports_16x16_f16());
+            assert_eq!(strict.is_supported(), f32_tile != 0);
+            assert_eq!(CoopPolicy::Disabled.filter_caps(caps), CoopCaps::default());
+            assert_eq!(CoopPolicy::Auto.filter_caps(caps), caps);
+            assert_eq!(CoopPolicy::AllowF16.filter_caps(caps), caps);
         }
     }
 }
