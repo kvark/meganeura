@@ -1,5 +1,9 @@
 # CUDA Graph methodology and final outcomes
 
+September 13 review: this describes the retained cohort, not the proposed
+replacement. The harness's NVIDIA-only guard omitted ROCm and XPU graph APIs;
+MPS compilation also needs qualification. See [the next-cohort gate](NEXT-COHORT.md).
+
 The original paper-v1 path called default `torch.compile` but bypassed the
 legacy explicit CUDA Graph helpers. The reviewer concern was valid:
 compiler graph capture is not CUDA command-graph replay. The camera-ready
