@@ -326,8 +326,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut output = OpenOptions::new().write(true).create_new(true).open(path)?;
     let before = command("nvidia-smi", &[]).ok();
     let monitor = gpu_monitor::Monitor::start();
-    let gpu = Arc::new(meganeura::init_gpu_context()?);
+    let gpu_options = meganeura::GpuOptions::from_env();
+    let gpu = Arc::new(meganeura::init_gpu_context_with(gpu_options.clone())?);
     let info = gpu.device_information();
+    eprintln!("device: {} ({})", info.device_name, info.driver_info);
     let caps = &gpu.capabilities().cooperative_matrix;
     let policy = if caps.f32_tile > 0 {
         CoopPolicy::Auto
@@ -346,6 +348,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             "cargo_lock_sha256": sha256(&Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"))?,
             "executable_sha256": sha256(&std::env::current_exe()?)?, "rustc": command("rustc", &["--version"])?,
             "seed": seed, "scope": scope, "process_id": std::process::id(), "started_unix_ms": unix_ms(),
+            "gpu_options": {"device_id": gpu_options.device_id, "timing": gpu_options.timing, "capture": gpu_options.capture},
+            "shader_cache_environment": {"__GL_SHADER_DISK_CACHE_PATH": std::env::var("__GL_SHADER_DISK_CACHE_PATH").ok(),
+                "MESA_SHADER_CACHE_DIR": std::env::var("MESA_SHADER_CACHE_DIR").ok()},
             "device": {"name": info.device_name, "driver": info.driver_info, "f32_tile": caps.f32_tile, "f16_tile": caps.f16_tile},
             "cooperative_policy": format!("{policy:?}"), "compile_options": compile_options(),
             "runtime_options": format!("{:?}", runtime_options(policy)), "optimize": meganeura::optimize::OptimizeConfig::default(),

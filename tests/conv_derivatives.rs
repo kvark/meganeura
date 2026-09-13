@@ -37,6 +37,13 @@ impl Shape {
     }
 }
 
+fn gpu() -> Arc<blade_graphics::Context> {
+    let gpu =
+        Arc::new(meganeura::init_gpu_context_with(meganeura::GpuOptions::from_env()).unwrap());
+    eprintln!("GPU: {}", gpu.device_information().device_name);
+    gpu
+}
+
 fn data(n: usize, seed: u32, scale: f32) -> Vec<f32> {
     let mut state = seed;
     (0..n)
@@ -369,7 +376,7 @@ fn run_split(
 
 #[test]
 fn split_weight_gradients_and_every_partial_match_full_f64_oracles() {
-    let gpu = Arc::new(meganeura::init_gpu_context().unwrap());
+    let gpu = gpu();
     for (batch, ci, h, w, co, kh, kw, stride, ph, pw) in [
         (3, 5, 7, 9, 7, 2, 3, 1, 1, 0),
         (2, 17, 9, 11, 19, 3, 3, 2, 0, 1),
@@ -404,7 +411,7 @@ fn split_weight_gradients_and_every_partial_match_full_f64_oracles() {
 
 #[test]
 fn long_split_weight_gradients_report_partial_rejections_without_relaxing_the_gate() {
-    let gpu = Arc::new(meganeura::init_gpu_context().unwrap());
+    let gpu = gpu();
     let s = Shape {
         batch: 2,
         ci: 3,
@@ -499,7 +506,7 @@ fn split_sequence_measurement_preserves_state_budgets_and_subsequent_updates() {
 }
 
 fn optimizer_updates(measure: bool, tile: u32) {
-    let gpu = Arc::new(meganeura::init_gpu_context().unwrap());
+    let gpu = gpu();
     let s = Shape {
         batch: 3,
         ci: 5,
@@ -721,7 +728,7 @@ fn tuned_conv_indexing_matches_full_oracle_at_reciprocal_boundaries() {
 }
 
 fn reciprocal_boundary_oracles(tune: bool) {
-    let gpu = Arc::new(meganeura::init_gpu_context().unwrap());
+    let gpu = gpu();
     for divisor in [41, 47, 55] {
         // Old f32 reciprocal multiplication maps divisor/divisor to zero.
         // Cover spatial/batch boundaries, then kernel/channel decomposition.
@@ -760,7 +767,7 @@ fn tuned_conv_derivatives_match_full_oracle_and_preserve_state_and_budgets() {
 }
 
 fn scalar_oracles(tune: bool) {
-    let gpu = Arc::new(meganeura::init_gpu_context().unwrap());
+    let gpu = gpu();
     for (batch, ci, h, w, co, kh, kw, stride, ph, pw) in [
         (2, 3, 5, 7, 5, 3, 3, 1, 0, 0),
         (2, 3, 7, 9, 5, 2, 4, 1, 0, 1),
@@ -797,7 +804,7 @@ fn scalar_oracles(tune: bool) {
 #[test]
 #[ignore = "Requires cooperative hardware; verifies actual generated dX execution"]
 fn generated_conv_derivatives_match_oracle_without_assuming_same_padding() {
-    let gpu = Arc::new(meganeura::init_gpu_context().unwrap());
+    let gpu = gpu();
     let policy = cooperative_policy(&gpu);
     for (kh, kw, stride, ph, pw) in [(3, 3, 1, 0, 0), (2, 4, 1, 0, 1), (3, 2, 2, 0, 1)] {
         run(
@@ -835,7 +842,7 @@ fn cooperative_policy(gpu: &blade_graphics::Context) -> CoopPolicy {
 #[test]
 #[ignore = "Requires cooperative hardware; verifies generated dX and admitted forward execution"]
 fn generated_conv_indexing_matches_full_oracle_at_reciprocal_boundaries() {
-    let gpu = Arc::new(meganeura::init_gpu_context().unwrap());
+    let gpu = gpu();
     let policy = cooperative_policy(&gpu);
     for width in [41, 47, 55] {
         let session = run(
