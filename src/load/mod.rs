@@ -4,5 +4,6 @@
 //! `Graph` IR, which then flows through the normal pipeline:
 //! `Graph -> optimize -> compile -> ExecutionPlan -> Session`.
 
+pub mod gguf;
 pub mod nnef;
 pub mod onnx;

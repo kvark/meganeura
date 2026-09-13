@@ -1,5 +1,15 @@
 # Unreleased
 
+- GGUF weight import (`load::gguf`). Reads the container's metadata and tensor
+  inventory, and resolves GGML's block encodings into Meganeura's at load time
+  so no shader has to know GGUF exists. `Q4_0`, `Q4_1` and `Q8_0` repack
+  losslessly for `set_parameter_packed` — GGML splits a block's nibbles across
+  halves and interleaves each block's header with its payload, where Meganeura
+  pairs adjacent nibbles and keeps headers in their own region. The block
+  *order* already agreed, since packing performs the `[K, N]` transpose that
+  GGUF's layout implies. `Q4_K` and `Q6_K` are superblock formats with no
+  direct equivalent and reach f32 only, which requantizes. See
+  `examples/gguf_info.rs`.
 - Autotuning searches shape-specialized scalar convolutions and K-stage sizes
   for forward and both gradients; unused candidates are released after search.
 - Store-side unary epilogues (Relu/Sigmoid/Silu/Neg) now fuse into F16/Q4/Q8

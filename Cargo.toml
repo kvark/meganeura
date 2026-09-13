@@ -91,6 +91,10 @@ name = "mnist"
 path = "examples/mnist.rs"
 
 [[example]]
+name = "gguf_info"
+path = "examples/gguf_info.rs"
+
+[[example]]
 name = "train_deploy"
 path = "examples/train_deploy.rs"
 
