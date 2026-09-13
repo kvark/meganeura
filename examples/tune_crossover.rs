@@ -100,7 +100,7 @@ fn run_case(
         "seed": seed, "status": "running", "build": [left_build, right_build],
         "baseline_pipeline_keys": baseline_keys, "initial_memory": [memory(&sessions[0]), memory(&sessions[1])],
         "host_start": host_sample(), "blocks": []});
-    if scope == TuneScope::ConvDerivatives {
+    if matches!(scope, TuneScope::ConvDerivatives | TuneScope::Convolution) {
         record["baseline_dispatches"] = serde_json::to_value(&sessions[0].plan().dispatches)?;
         record["plan_buffers"] = json!(sessions[0].plan().buffers);
         if sessions[0]
@@ -164,7 +164,11 @@ fn run_case(
     let first_winner = seed % 2;
     let search = sessions[first_winner].tune_with(TuneOptions {
         scope,
-        max_time: Duration::from_secs(10),
+        max_time: Duration::from_secs(if scope == TuneScope::Convolution {
+            2
+        } else {
+            10
+        }),
         ..Default::default()
     })?;
     let after_search = snapshot(&mut sessions[first_winner], case);
@@ -183,7 +187,7 @@ fn run_case(
         return Ok(record);
     }
     let winner_keys = sessions[first_winner].dispatch_pipeline_keys();
-    if scope == TuneScope::ConvDerivatives {
+    if matches!(scope, TuneScope::ConvDerivatives | TuneScope::Convolution) {
         record["selected_dispatches"] =
             serde_json::to_value(&sessions[first_winner].plan().dispatches)?;
     }
@@ -298,9 +302,9 @@ fn run_case(
 fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
     let mut args = std::env::args_os().skip(1);
-    let path = args
-        .next()
-        .ok_or("usage: tune_crossover <new-output.json> <seed 1..6> [--conv-derivatives]")?;
+    let path = args.next().ok_or(
+        "usage: tune_crossover <new-output.json> <seed 1..6> [--conv-derivatives|--convolution]",
+    )?;
     let seed: usize = args
         .next()
         .ok_or("missing seed")?
@@ -310,10 +314,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let scope = match args.next() {
         None => TuneScope::Dense,
         Some(arg) if arg == "--conv-derivatives" => TuneScope::ConvDerivatives,
+        Some(arg) if arg == "--convolution" => TuneScope::Convolution,
         _ => return Err("unknown search scope".into()),
     };
     if !(1..=6).contains(&seed) || args.next().is_some() {
-        return Err("expected one output, seed 1..6, optional --conv-derivatives".into());
+        return Err("expected one output, seed 1..6, optional convolution scope".into());
     }
     if !command("git", &["status", "--porcelain", "--untracked-files=no"])?.is_empty() {
         return Err("commit tracked source before measuring".into());
@@ -329,7 +334,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     } else {
         CoopPolicy::Disabled
     };
-    let protocol = if scope == TuneScope::ConvDerivatives {
+    let protocol = if scope == TuneScope::Convolution {
+        "conv-specialization-2026-09-13"
+    } else if scope == TuneScope::ConvDerivatives {
         "conv-tiles-corrected-2026-09-06"
     } else {
         "crossover-2026-09-06"
@@ -348,7 +355,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "optimizer": {"adam_lr": 1e-4, "sgd_lr": 1e-3, "beta1": 0.9, "beta2": 0.999, "epsilon": 1e-8, "clip_norm": 1.0, "clip_every": 1, "accumulation": false, "decay": 0.0}}, "cases": []});
     write_record(&mut output, &document)?;
     let mut valid = true;
-    let cases = if scope == TuneScope::ConvDerivatives {
+    let cases = if matches!(scope, TuneScope::ConvDerivatives | TuneScope::Convolution) {
         conv_derivative_cases()
     } else {
         crossover_cases()

@@ -1,5 +1,7 @@
 # Unreleased
 
+- Autotuning searches shape-specialized scalar convolutions and K-stage sizes
+  for forward and both gradients; unused candidates are released after search.
 - Store-side unary epilogues (Relu/Sigmoid/Silu/Neg) now fuse into F16/Q4/Q8
   tiled matmuls instead of running as a separate dispatch. The epilogue does
   not inspect B, so the packed-weight kernels reuse the same `$STORE_BODY`

@@ -1,0 +1,18 @@
+struct Params {
+    batch: u32,
+    in_channels: u32,
+    in_h: u32,
+    in_w: u32,
+    out_channels: u32,
+    kernel_h: u32,
+    kernel_w: u32,
+    stride: u32,
+    padding_h: u32,
+    out_h: u32,
+    out_w: u32,
+    padding_w: u32,
+    kernel_w_multiplier: u32,
+    kernel_hw_multiplier: u32,
+    column_width_multiplier: u32,
+    output_spatial_multiplier: u32,
+}
