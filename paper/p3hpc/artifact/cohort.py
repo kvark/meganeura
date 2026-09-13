@@ -13,21 +13,21 @@ import tarfile
 
 
 HERE = Path(__file__).resolve().parent
-INFERENA = "17d13a3a94cc5bdfaa63f0eb2cb7e8ee7593c053"
-MEGANEURA = "fcdd76d1a4cd0e3d10507e56ea3f2412378a2ba7"
+INFERENA = "efb1e5206f07e316c94e8e021514cad60c0639bf"
+MEGANEURA = "75dfe901deb87ca0054c438437efd3aa388b7188"
 TORCH = "cf30153c4c131c8164ee7798e5022d810682e2cb"
 MODELS = ("SmolLM2-135M", "SmolVLA", "StableDiffusion", "ResNet-50", "Whisper-tiny")
 PHASES = ("inference", "latency", "training")
 DEVICES = {
     "nvidia-5070": "RTX 5070",
     "nvidia-h100": "H100",
+    "nvidia-3050": "RTX 3050 (Windows)",
     "amd-dgpu": "RX 7900 XT",
     "amd-igpu": "Radeon 780M",
     "intel-dgpu": "Arc B570",
     "apple-m3": "Apple M3",
     "intel-igpu": "Intel RPL-U (CPU ref.)",
-    "nvidia-3050": "RTX 3050 (Windows)",
-    "nvidia-h100-large": "H100 extension",
+    "nvidia-h100-long": "H100 extension",
 }
 ENGINES = ("meganeura", "pytorch")
 
@@ -57,6 +57,8 @@ def audit_replay(validation, training, accelerated):
             for name, row in sample.items():
                 require(row["elements"] > 0 and all(math.isfinite(x) and x >= 0 for x in row.values()),
                         "invalid replay metric")
+                if not name.startswith("gradient "):
+                    require(row["max_abs_error"] <= row["max_abs_bound"], "output replay failed")
                 if name.startswith("gradient ") and not accelerated:
                     require(row["rms_error"] <= row["rms_bound"] and row["max_abs_error"] <= row["max_abs_bound"],
                             "strict gradient replay failed")
@@ -185,8 +187,10 @@ def load_campaign(path):
         groups[precision, model, condition].append({"replicate": replicate, "pair": pair, "errors": errors})
     if campaign["status"] == "complete":
         require(not failed, "complete campaign contains failure")
-        expected = len(campaign["args"]["models"]) * len(campaign["args"]["precisions"]) * len(campaign["reference_conditions"]["selected"])
-        require(len(groups) == expected, "missing selected condition")
+        expected = {(precision, model, condition["mode"] + "-graph" + str(int(condition["cuda_graphs"])))
+                    for precision in campaign["args"]["precisions"] for model in campaign["args"]["models"]
+                    for condition in campaign["reference_conditions"]["selected"]}
+        require(set(groups) == expected, "missing selected condition")
         require(all(len(runs) == 3 for runs in groups.values()), "incomplete replication")
         require(campaign["replicated_gradient_validation"]["status"] == "pass", "replicated gate failed")
     for runs in groups.values():
@@ -242,7 +246,7 @@ def tables(campaigns, rows, groups):
     output = {}
     lines = []
     for device, label in DEVICES.items():
-        if device == "nvidia-h100-large":
+        if device == "nvidia-h100-long":
             continue
         c = campaigns[device]
         backend = c["args"]["backend"]
@@ -278,9 +282,11 @@ def tables(campaigns, rows, groups):
             lines.append([DEVICES[device] if model == MODELS[0] else "", model, *values])
     output["searched-ratios.tex"] = tex_table("llrrrrrr", ratio_heading, lines)
     lines = []
-    for device in ("nvidia-5070", "nvidia-h100"):
+    for device in ("nvidia-5070", "nvidia-h100", "nvidia-3050"):
         for condition in ("default-graph1", "max-autotune-graph1"):
             runs = [run for key, batch in groups[device].items() if key[2] == condition for run in batch]
+            if not runs:
+                continue
             compile_s = [sum(run["pair"][engine]["timings"]["compile_s"] for run in runs) for engine in ENGINES]
             graph_s = [sum(phase.get(part + "_s", 0) for run in runs
                            for phase in run["pair"]["pytorch"]["execution"]["cuda_graphs"]["phases"].values())
@@ -302,7 +308,7 @@ def tables(campaigns, rows, groups):
                           *[f"{light[engine + '_compile']:.2f}/{searched[engine + '_compile']:.2f}" for engine in ENGINES]])
     output["search.tex"] = tex_table("llrrrrrrr", r"Device & Workload & \multicolumn{3}{c}{PyTorch replay gain} & \multicolumn{2}{c}{Search inf. gain} & \multicolumn{2}{c}{Compile seconds: light/searched} \\ & & Inf. & Min. & F+L+B & M & P & M & P", lines)
     lines = []
-    for model, device in (("SmolLM2-135M", "nvidia-h100"), ("SmolLM2-360M", "nvidia-h100-large"), ("SmolLM2-1.7B", "nvidia-h100-large")):
+    for model, device in (("SmolLM2-135M", "nvidia-h100"), ("SmolLM2-360M", "nvidia-h100-long"), ("SmolLM2-1.7B", "nvidia-h100-long")):
         for condition in ("default-graph1", "max-autotune-graph1"):
             key = ("strict", model, condition)
             if key not in rows[device]:
@@ -314,7 +320,7 @@ def tables(campaigns, rows, groups):
                           *[f"{row[engine + '_compile']:.2f}" for engine in ENGINES]])
     output["scaling.tex"] = tex_table("llrrrrrrrrr", r"Model & Policy & $n$ & \multicolumn{2}{c}{Prefill ms} & \multicolumn{2}{c}{One token ms} & \multicolumn{2}{c}{F+L+B ms} & \multicolumn{2}{c}{Compile s} \\ & & & M & P & M & P & M & P & M & P", lines)
     lines = []
-    for model, device in (("SmolLM2-135M", "nvidia-h100"), ("SmolLM2-360M", "nvidia-h100-large"), ("SmolLM2-1.7B", "nvidia-h100-large")):
+    for model, device in (("SmolLM2-135M", "nvidia-h100"), ("SmolLM2-360M", "nvidia-h100-long"), ("SmolLM2-1.7B", "nvidia-h100-long")):
         row = rows[device]["strict", model, "default-graph1"]
         lines.append([model, str(row["replicates"]), *[f"{row[key] / 2**30:.2f}"
                       for key in ("meganeura_memory", "pytorch_memory", "pytorch_reserved")]])
@@ -335,13 +341,17 @@ def tables(campaigns, rows, groups):
     # Paired bars, not a stack: forward and F+L+B are separate measurements.
     chart = [r"\begin{tikzpicture}[x=1mm,y=1mm,font=\scriptsize]"]
     devices = [device for device, c in campaigns.items() if c["status"] == "complete" and c["args"]["backend"] != "cpu"]
-    for panel, (phase, title, limit) in enumerate((("inference", "Prefill (ms)", 60), ("training", "F+L+B (ms)", 180))):
-        origin = 24 + panel * 88
+    bottom = 1 - len(devices) * 10
+    for panel, (phase, title) in enumerate((("inference", "Prefill (ms)"), ("training", "F+L+B (ms)"))):
+        maximum = max(rows[device]["strict", "SmolLM2-135M", primary_condition(campaigns[device])][engine + "_" + phase + "_max"]
+                      for device in devices for engine in ENGINES)
+        limit = math.ceil(maximum / 30) * 30
+        origin = 32 + panel * 94
         chart.append(rf"\node at ({origin + 29},7) {{{title}}};")
         for tick in range(4):
             x = origin + tick * 18
-            chart.extend([rf"\draw[black!15] ({x},1) -- ({x},-59);",
-                          rf"\node[below] at ({x},-59) {{{limit * tick // 3}}};"])
+            chart.extend([rf"\draw[black!15] ({x},1) -- ({x},{bottom});",
+                          rf"\node[below] at ({x},{bottom}) {{{limit * tick // 3}}};"])
         for i, device in enumerate(devices):
             y = -i * 10
             row = rows[device]["strict", "SmolLM2-135M", primary_condition(campaigns[device])]
@@ -355,10 +365,10 @@ def tables(campaigns, rows, groups):
                 low = origin + row[engine + "_" + phase + "_min"] / limit * 54
                 high = origin + row[engine + "_" + phase + "_max"] / limit * 54
                 chart.append(rf"\draw[black,|-|] ({low:.4f},{top - 1.4}) -- ({high:.4f},{top - 1.4});")
-    chart.extend([r"\fill[blue!65!black] (49,-70) rectangle (53,-67);",
-                  r"\node[anchor=west] at (54,-68.5) {Meganeura};",
-                  r"\fill[orange!80!black] (85,-70) rectangle (89,-67);",
-                  r"\node[anchor=west] at (90,-68.5) {PyTorch};",
+    chart.extend([rf"\fill[blue!65!black] (49,{bottom - 11}) rectangle (53,{bottom - 8});",
+                  rf"\node[anchor=west] at (54,{bottom - 9.5}) {{Meganeura}};",
+                  rf"\fill[orange!80!black] (85,{bottom - 11}) rectangle (89,{bottom - 8});",
+                  rf"\node[anchor=west] at (90,{bottom - 9.5}) {{PyTorch}};",
                   r"\end{tikzpicture}", ""])
     output["smollm2.tex"] = "\n".join(chart)
     return output
@@ -376,10 +386,14 @@ def main():
         require(Path(name).name == name, "manifest path is not a filename")
         with (args.archives / name).open("rb") as file:
             require(hashlib.file_digest(file, "sha256").hexdigest() == expected, "input digest differs: " + name)
-    print("Archive and supplied-log SHA-256 digests match")
+    print("Campaign archive SHA-256 digests match")
+    input_hashes = {}
     for device in DEVICES:
         path = args.archives / (device + ".tgz")
         c, groups, failed = load_campaign(path)
+        for name, digest in c["sha256"].items():
+            name = name.replace("\\", "/")
+            require(input_hashes.setdefault(name, digest) == digest, "input identity differs: " + name)
         campaigns[device], rows[device], all_groups[device] = c, aggregate(groups), groups
         print(device, c["status"], dict(Counter(run["status"] for run in c["runs"])), "failed:", failed)
     generated = tables(campaigns, rows, all_groups)

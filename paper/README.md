@@ -42,7 +42,7 @@ the author's final review and submission remain. See the
 [current evidence guide](p3hpc/RESULTS.md).
 
 Replay the camera-ready evidence without a GPU, from the repository root
-with the supplied archives and text reports in one directory (Python 3.11+):
+with the nine supplied campaign archives in one directory (Python 3.11+):
 
 ```sh
 python3 paper/p3hpc/artifact/cohort.py "$HOME/Downloads/p3hpc" \
