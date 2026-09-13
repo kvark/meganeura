@@ -1,6 +1,19 @@
 # How to win while staying general
 
-## Current milestone: closed; split-K promotion deferred
+## September 13: convolution specialization joins the bounded search
+
+The constant-parameter convolution prototype now runs through the existing
+exact-class tuner, including forward, input gradients and weight gradients.
+Uniform 32/64 tiles compete with shape-specialized 32/64 tiles at K=16/32;
+there is no GPU/model rule or global K-stage change. Unused candidates are
+released after search. The existing two-second soft budget and numerical
+qualification remain unchanged; tuning is still opt-in at session preparation.
+
+The [two-device confirmation](../experiments.md#production-convolution-search--september-13)
+measures whole-step gains and preparation costs on RTX 5070 and Arc B570.
+It is an engineering ablation, not a replacement for the paper's Inferena cohort.
+
+## Completed milestone: split-K promotion deferred
 
 The author agreed to close this phase after one shared long-reduction accuracy
 attempt and, only if it qualifies, one predeclared whole-step acceptance cohort.
@@ -12,8 +25,8 @@ the milestone without changing tolerances or pretending every research question
 is solved.
 The broader priorities below are a research backlog, not prerequisites for this
 freeze or the accepted paper. Attention, persistent tuning, new precision and
-layout search belong to a later phase. The next active task is paper finalization,
-starting with the author's actual reviews and technical read-through.
+layout search belong to a later phase. Convolution specialization above is a
+separate, bounded production integration requested during paper preparation.
 
 This separates the implemented search from the remaining engineering and
 experiment plan. The initial September audit was CPU-only. After the user
@@ -58,9 +71,9 @@ default-on tuning. Outputs repeat exactly in both six-pair AB/BA cohorts.
 The later [profile-guided experiments](../experiments.md#residual-add-gemv-width--september-10)
 identify useful choices outside that narrow tile space: immutable convolution
 parameters, residual-add GEMV workgroup width and retaining unpacked weights.
-These yield confirmed whole-model gains on this device, but are still explicit
-ablation arms. The next integration should add compact legal candidates to
-measured selection, not promote the winning constants or GPU/model-name rules.
+These yield confirmed whole-model gains on this device. Convolution now joins
+measured selection; the other arms remain explicit ablations. Integrations
+should add compact legal candidates, not GPU/model-name rules.
 Representation choices also change allocation plans and need a wider contract
 than the current fixed-plan kernel tuner.
 
@@ -88,8 +101,9 @@ family-wide cooperative demotion tuner with bounded exact-class f32-matmul
 search. Scalar 32/64 tiles and advertised, smoke-tested native-f32 cooperative
 tiles can compete. Cooperative occupancy and native-8 large-shape thresholds
 choose the initial implementation, not the legal challengers in this domain.
-Scalar convolution dX/dW now also expose their existing 32/64 tiles to this
-bounded search. Other kernel families still use heuristics. Winners are not persisted. The misleadingly named
+Scalar convolution forward/dX/dW also expose 32/64 tiles, immutable shape
+parameters and K=16/32 staging to this bounded search. Other kernel families
+still use heuristics. Winners are not persisted. The misleadingly named
 `runtime::auto_tune` is capability probing.
 
 The CPU-only shape census now exposes the amount of repeated work. A full
@@ -178,10 +192,11 @@ cache must include device/driver, generator, exact class and validation contract
 it must not transfer a winner merely because a marketing name matches.
 
 The [profile-guided convolution experiment](../experiments.md#profile-guided-convolution-specialization--september-10)
-is a concrete next candidate: making immutable parameters compile-time constants
+motivated the production candidate: making immutable parameters compile-time constants
 improves ResNet training by about 1.28×; constant native division reaches about
 1.325× against the same untuned control. It is general by shape, not model or
-GPU name, but currently a source-level ablation rather than automatic selection.
+GPU name. Those figures are source-level ablations; the September 13 results
+measure automatic selection instead.
 Cold driver preparation takes about 319 training steps to amortize for constants
 alone, or 256 for constant native division. Doubling K staging passes validation
 but regresses the training step despite fewer barrier rounds. This supports
@@ -199,7 +214,7 @@ the invention of compile-time autotuning.
 [Ansor](https://www.usenix.org/conference/osdi20/presentation/zheng),
 [Triton autotune](https://triton-lang.org/main/python-api/generated/triton.autotune.html)
 
-## Implemented search: dense tiles and scalar convolution derivatives
+## Implemented search: dense tiles and scalar convolutions
 
 `Session::tune()` uses defaults; `Session::tune_with(TuneOptions)` returns a
 serializable `TuneReport`. `SessionConfig { tune: true }` invokes the safe
@@ -215,7 +230,7 @@ behind as a second unsafe default path.
 
 | Contract | Current implementation |
 |---|---|
-| Search space | Existing 32×32 and 64×64 scalar-f32 implementations, plus the device's native-f32 cooperative 8×8 or 16×16 primitive (2×2 output primitives/workgroup), for plain MatMul, MatMulAT, MatMulBT and forward MatMul+Add. Scalar tiles also cover convolution dX/dW, as detailed below. |
+| Search space | Existing 32×32 and 64×64 scalar-f32 implementations, plus the device's native-f32 cooperative 8×8 or 16×16 primitive (2×2 output primitives/workgroup), for plain MatMul, MatMulAT, MatMulBT and forward MatMul+Add. Convolution forward/dX/dW adds uniform and shape-specialized scalar tiles, as detailed below. |
 | Eligibility | Contiguous row-major f32; fixed supported binding arity; nonzero checked extents; portable workgroup limits; non-overlapping physical bindings. Cooperative candidates honor session policy, capability/smoke tests and existing binding capacity. No f16-input/compensated cooperative, GEMV, horizontal packs, arbitrary prologues/epilogues or reduced storage. |
 | Exact class | Entry/direction, M/N/K, derivative precision requirement, declared binding capacities and A/B/addend/output placement. Different initial choices are separate searches. No device-to-device transfer. |
 | Complete candidate | Exact pipeline key, variant flags, scalar fallback and recalculated X/Y/Z geometry together; cooperative and scalar axes differ. Logical extents, bindings, access sets and allocation plan stay fixed. Lazy shader rejection is reported; no fallback lookup during trials. |
@@ -223,26 +238,37 @@ behind as a second unsafe default path.
 | Qualification | Two deterministic signed, nonzero, full-mantissa patterns: ordinary magnitudes and tiny `1e-12` A/addend operands. Full logical-output finite and cross-variant comparisons; 32 f64 reference dots including 8/16/32/64 tile edges. Scratch padding is zeroed for inputs and NaN-poisoned for outputs; only logical outputs are checked. |
 | Numerical tolerance | `abs(reference-actual) <= scale*1e-5 + abs(reference)*2e-4`, with scale 1 or `1e-12`. A domain-specific screen, not a proof or training convergence test. |
 | Timing | Default six complete pairs, alternating AB/BA order; each sample encodes/submits/waits for 16 barrier-delimited repeated dispatches. Upload/qualification/readback excluded from samples, included in total cost. |
-| Decision | Up to two sequential challenger comparisons per class. Each uses the last accepted winner as incumbent. Candidate median and median paired gain must beat a 5% margin plus twice the MAD of paired differences. Noise guard is not a confidence interval. Invalid/incomplete comparisons retain the incumbent, including a completed earlier winner. |
+| Decision | Up to two dense or five convolution challengers per class. Each uses the last accepted winner as incumbent. Candidate median and median paired gain must beat a 5% margin plus twice the MAD of paired differences. Noise guard is not a confidence interval. Invalid/incomplete comparisons retain the incumbent, including a completed earlier winner. |
 | Budget | Default eight classes, 64 MiB GPU scratch including staging, two-second soft total deadline, one warmup per variant. An in-flight driver/validation/submission operation can overrun. Pipeline/CPU memory is not charged to the scratch byte cap. |
-| Priority/reporting | Descending repetition×M×N×K×Z structural prior (Z is batch for dX, otherwise 1), stable ties; resolved settings, eligible/visited classes, per-comparison and pipeline costs, exclusions, scratch/time/device-memory skips, qualification/rejection details and raw timings. This prior orders searches, never declares a winner. |
+| Priority/reporting | Descending repetition×M×N×K×Z structural prior (Z is batch for convolution forward/dX, otherwise 1), stable ties; resolved settings, eligible/visited classes, per-comparison and pipeline costs, exclusions, scratch/time/device-memory skips, qualification/rejection details and raw timings. This prior orders searches, never declares a winner. |
 | Lifetime | Choices affect this session only. Semantic plan cache and frozen results stay untouched. |
 
-The dense contract above now extends to scalar NCHW convolution dX/dW, with
-`TuneScope::{Dense, ConvDerivatives, All}` selecting the experiment domain.
+The dense contract above extends to scalar NCHW convolution forward/dX/dW, with
+`TuneScope::{Dense, ConvDerivatives, Convolution, All}` selecting the domain.
+`ConvDerivatives` still excludes forward; `Convolution` includes all three directions.
 New options use All; tuning remains default-off. Old missing scope settings
 deserialize as Dense, and historical runners explicitly keep Dense.
 
 `TuneClass.conv2d` records all twelve convolution parameters. Equal M/N/K is
 not enough: kernel aspect ratio, stride and padding change gathered values,
-and batch changes physical NCHW storage. dX uses M=Ci, N=H×W,
+and batch changes physical NCHW storage. Forward uses M=Co, N=Oh×Ow,
+K=Ci×Kh×Kw and Z=batch; dX uses M=Ci, N=H×W,
 K=Co×Kh×Kw and Z=batch; dW uses M=Co, N=Ci×Kh×Kw, K=batch×Oh×Ow and Z=1.
 Priority includes Z, and scratch/readback sizes use physical tensors without
 allocating im2col. Tile choices change the distinct Small/large shader entry
 and geometry together; dense `use_small_tiles` is not a convolution flag.
 
-Both scalar variants retain f32 arithmetic. The full finite/cross-variant
-scans include all dX batches, while the 32 f64 dots use convolution indexing
+Convolution has six implementations: uniform 32/64 tiles at K=16, and
+constant-parameter 32/64 tiles at K=16/32. Constants use native integer division
+by compile-time divisors; all three shader families share their parameter type
+and tiled code generator. `MatmulTile::SpecializedConv` and `Dispatch::conv_k_tile`
+record the chosen geometry, with shape-specific pipeline labels. Identical
+shapes share compiled pipelines; rejected/unused convolution pipelines are
+destroyed after the search. The prototype's `MEGANEURA_SPECIALIZE_CONV` switch
+and duplicate construction path are removed.
+
+All candidates retain f32 arithmetic. The full finite/cross-variant
+scans include all batches, while the 32 f64 dots use convolution indexing
 and explicit first/last/scattered batches. Checked integer products and signed
 coordinates and padded K loops reject overflow. Convolution now decomposes
 indices using exact integer arithmetic, including ordinary forward/cooperative
@@ -250,8 +276,8 @@ paths outside the tuner. The earlier f32 reciprocal interval filter and its four
 float uniforms were removed. A subsequent shared helper uses four derived u32
 multipliers with an exact, single remainder correction; it covers every u32
 numerator and positive divisor, not a narrower shape interval. This admits
-formerly excluded shapes without relaxing validation. Forward and cooperative
-convolution remain outside the search, but receive the shared correctness repair.
+formerly excluded shapes without relaxing validation. Cooperative convolution
+remains outside this search, but receives the shared correctness repair.
 
 This distinction matters: multiplying by the rounded f32 reciprocal mapped
 `41 / 41` to zero. A batch-2, width-41 GPU regression produced `dW[0]=0.9391`
