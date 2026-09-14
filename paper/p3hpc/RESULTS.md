@@ -145,7 +145,7 @@ cost is CPU/readback validation, not kernel tuning. All reference
 compilations finish below the enforced 120-second limit.
 
 The separate v7 H100 pilot has three-process search-off/on controls:
-native strict 135M prefill 13.265 → 9.744 ms, training 52.405 → 42.719 ms.
+native strict 135M prefill 13.265 → 9.744 ms, training 52.405 → 42.721 ms.
 Across 30 searched pairs, PyTorch compilation totals 170.3 minutes versus
 114.7 seconds native; default/replay PyTorch totals 14.0 minutes.
 Those pilot numbers are not the current 60-second search policy.
