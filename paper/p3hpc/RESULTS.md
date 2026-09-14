@@ -1,162 +1,192 @@
 # Final P3HPC cohort: evidence guide
 
-The camera-ready manuscript uses the September 13 collection. Analysis did
-not collect new timings, change a condition, or remove an outlier. The
-companion report's original data remain separately versioned in paper/results;
-they are not inputs to these tables.
+Updated September 14, 2026. The manuscript now uses the completed v9 cohort,
+not the superseded v7 tables. No new timing was collected, condition changed,
+or outlier removed during analysis.
 
-## Identity and coverage
+## Identity and health
 
-All nine archives share Inferena `efb1e5206f07e316c94e8e021514cad60c0639bf`,
-Meganeura `75dfe901deb87ca0054c438437efd3aa388b7188`, Blade
-`f6f2729e850cc0aefdc0bb18523da58a72765169`, Python 3.13.13, and
-PyTorch 2.13.0 at `cf30153c4c131c8164ee7798e5022d810682e2cb`.
-Vendor wheels/libraries differ. All manifests agree on the Cargo.lock and
-shared checkpoint/config hashes (Windows path separators normalized).
-[cohort.sha256](artifact/cohort.sha256) identifies the nine external inputs.
+All nine archives share Inferena fa5a04e1c1b38405cfa371a27c5dcef1319835d5,
+Meganeura 428fc2d2322229e5338f5d80a10d700340d593cd, Blade
+f6f2729e850cc0aefdc0bb18523da58a72765169, Python 3.13.13 and
+PyTorch 2.13.0 at cf30153c4c131c8164ee7798e5022d810682e2cb.
+Vendor wheels/libraries differ. Cargo.lock and shared checkpoint hashes agree
+after normalizing Windows separators.
+[cohort.sha256](artifact/cohort.sha256) identifies the original archives.
 
-| Configuration | Valid / selected pairs | Conditions |
+| Configuration | Valid / selected pairs | Reference |
 |---|---:|---|
-| RTX 5070, Linux | 90 / 90 | Default without/with replay; searched with replay |
-| H100 80GB, Linux | 90 / 90 | Same three conditions |
-| RTX 3050, Windows 11 | 60 / 60 | Default without/with replay; searched omitted |
-| RX 7900 XT | 30 / 30 | Default/no replay; searched omitted |
-| Radeon 780M | 30 / 30 | Same subset, with recorded ROCm overrides |
-| Arc B570 | 30 / 30 | Default/no replay; qualified embedding workaround |
-| Apple M3, macOS 15.7.3 | 30 / 30 | Eager MPS |
-| Intel RPL-U | 30 / 30 | Vulkan versus explicitly selected eager CPU |
-| H100 360M/1.7B extension | 5 / 36 | Five strict pairs, then searched 1.7B capture fails |
+| RTX 5070, Linux | 30 / 30 | Default compilation + CUDA Graph |
+| H100 80GB, Linux | 30 / 30 | Default compilation + CUDA Graph |
+| RTX 3050, Windows | 30 / 30 | Default compilation + CUDA Graph |
+| RX 7900 XT | 30 / 30 | Default compilation + HIP graph |
+| Radeon 780M | 30 / 30 | Same, with recorded ROCm overrides |
+| Arc B570 | 30 / 30 | Default compilation + XPU graph; math SDPA and embedding workaround |
+| Apple M3, macOS | 30 / 30 | Compiled MPS; no equivalent public whole-phase replay API |
+| Intel RPL-U | 30 / 30 | Vulkan versus explicitly selected compiled CPU |
+| H100 360M/1.7B extension | 12 / 12 | Both contracts, three processes each, CUDA Graph |
 
-Thus eight complete device campaigns contribute 390 pairs; the extension
-adds five valid pairs and one failed attempt. Seven configurations have GPU
-references; the RPL-U CPU reference is separate. RTX 5070 and B570 share one
-host and were measured sequentially. B570 uses a secondary PCIe 3.0 x1 link.
-An unrelated local Intel setup failure is not part of the supplied cohort or
-the paper's availability evidence.
+Eight main campaigns contribute 240 pairs; the extension adds 12. There are
+no interrupted campaigns or failed pairs. Seven configurations have GPU
+references; RPL-U stays separate. RTX 5070 and B570 share a host and were
+measured sequentially; B570 uses the secondary PCIe 3.0 x1 link.
 
-Every successful pair passes both the offline evidence audit and the frozen
-Inferena checker. All eight complete replication reports are reproduced
-exactly. Every pair individually meets the 5% gradient bounds: maxima are
-0.603% sampled-output L2, 0.0863% scalar loss, 2.95% total-gradient norm, and
-3.30% parameter-norm-vector L2. Full-element *PyTorch replay* qualification is
-distinct from sampled/norm-based *cross-engine* validation.
+Every pair passes the frozen Inferena checker and an independent audit of
+raw/joined agreement, timing medians, numerical errors, executed policies,
+full replay statistics and replication. All nine replication reports agree
+with the retained errors. Every pair individually meets the 5% gradient
+bounds: maxima are 0.6281% sampled-output L2, 0.0861% scalar loss, 2.9419%
+total-gradient norm, and 3.2983% parameter-norm-vector L2.
 
-## Final performance results
+Health does not imply low timing variance. M3 strict native SmolVLA training
+ranges 52.837–109.035 ms around a 70.404 ms median (79.8% range/median).
+H100 native strict ResNet inference ranges 4.259–6.554 ms around 4.581 ms
+(50.1%). These observations remain in the tables and range whiskers.
+The data do not identify whether tuning decisions, clocks, thermals or other
+machine activity caused the variation.
 
-Ratios are Meganeura/PyTorch elapsed time. Primary light comparisons use
-qualified CUDA replay, default/no-replay ROCm/XPU, and eager MPS.
+H100 records the intended GPU, CUDA 13.0, the correct Triton backend, qualified
+CUDA Graph execution and allocator peaks in every record. Its optional
+NVML/nvidia-smi process-memory measurement is missing, not zero. There is
+no CPU fallback. Do not infer continuous environment stability or complete
+VRAM telemetry solely from successful execution.
+
+## Final performance
+
+Ratios are Meganeura/PyTorch synchronized wall time; lower favors Meganeura.
+All native runs tune. All references compile, with applicable replay.
 
 | Contract / phase | Median ratio over 35 comparisons | Nominal native wins |
 |---|---:|---:|
-| Strict inference | 1.833 | 5 / 35 |
-| Strict minimal shape | 1.430 | 8 / 35 |
-| Strict F+L+B | 2.433 | 4 / 35 |
-| Accelerated inference | 1.898 | 7 / 35 |
-| Accelerated minimal shape | 1.574 | 10 / 35 |
-| Accelerated F+L+B | 2.761 | 4 / 35 |
+| Strict inference | 1.830 | 7 / 35 |
+| Strict minimal shape | 1.284 | 10 / 35 |
+| Strict F+L+B | 2.467 | 3 / 35 |
+| Accelerated inference | 2.119 | 6 / 35 |
+| Accelerated minimal shape | 1.611 | 9 / 35 |
+| Accelerated F+L+B | 2.908 | 4 / 35 |
 
-RTX 5070 strict ResNet inference is a nominal near-tie win (about 0.997),
-not demonstrated statistical superiority. Radeon is the strongest surface;
-H100 accelerated ResNet training is the largest deficit: 20.30x light,
-18.92x searched. Windows has complete three-replicate results, not a partial
-failure population. Arc's slow secondary link is disclosed, not assumed free.
+Strict Pennycook workload means are 0.51/0.93 inference, 0.60/0.85 minimal,
+and 0.39/0.98 training (Meganeura/PyTorch). These conditional GPU scores
+exclude RPL-U, the extra H100 model sizes and the separate MI300X attempt.
+Support across every attempted GPU would give both stacks a zero score:
+PyTorch lacks a usable RPL-U GPU path; Meganeura lacks a validated MI300X
+Vulkan driver path.
 
-Strict Pennycook workload means over the seven shared GPU-reference
-configurations are 0.52/0.96 inference, 0.66/0.86 minimal, and 0.38/0.99
-training (Meganeura/PyTorch). These conditional scores do not describe
-universal support. RPL-U lacks a PyTorch GPU path; the separate MI300X
-bring-up report lacks a validated Meganeura Vulkan path.
+## What changed from the preceding cohort?
 
-## Replay, preparation, and integrated tuning
+The comparison below uses the previous v7 primary condition at Inferena
+efb1e520 / Meganeura 75dfe901 (archives now in ~/Downloads/p3hpc-v3).
+That condition disabled native tuning and strict cooperative matrices.
+CUDA already replayed, but ROCm/XPU did not; MPS and CPU were eager.
+Consequently this is a cross-cohort comparison, not a controlled ablation.
 
-Default replay reduces H100 135M token time 3.496 to 1.275 ms (2.74x)
-and diffusion F+L+B 14.322 to 4.031 ms (3.55x). The token gains are 1.64x
-on RTX 5070 and 1.48x on Windows RTX 3050.
+| Device | Median native strict gain: inference / minimal / training |
+|---|---:|
+| RTX 5070 | 1.10 / 1.01 / 1.10 |
+| H100 | 1.09 / 1.11 / 1.29 |
+| RTX 3050 | 1.08 / 1.01 / 1.02 |
+| RX 7900 XT | 1.10 / 1.00 / 1.24 |
+| Radeon 780M | 1.01 / 1.00 / 1.02 |
+| Arc B570 | 1.27 / 1.03 / 1.17 |
+| Apple M3 | 1.09 / 1.00 / 0.92 |
+| Intel RPL-U | 1.11 / 1.03 / 1.19 |
 
-Native search improves strict 135M prefill 13.265 to 9.744 ms on H100 (1.36x)
-and 12.644 to 11.596 ms on RTX 5070 (1.09x). Recorded extra three-session
-preparation amortizes after about 109 and 234 prefills. H100 native training
-improves 1.23x. Production convolution candidates are now integrated:
-strict ResNet inference improves 1.20x on H100 and 1.07x on 5070.
-Searched PyTorch remains faster in all 60 matched CUDA phase comparisons.
+Each entry is the median of five old/new native time ratios, not a ratio of
+aggregate times. Particularly useful improvements are strict ResNet training:
 
-Across 30 H100 searched pairs, PyTorch compiler/first-execution time totals
-170.3 minutes (2.84 hours), versus 114.7 seconds native; default/replay
-PyTorch totals 14.0 minutes. Full-tensor replay qualification adds 281.7 s
-light / 292.5 s searched and is **not** kernel tuning. These are successful
-record sums, not total wall duration or one model's startup.
-Light native medians span 0.089–3.651 s strict and 0.115–3.633 s accelerated.
+- RTX 5070: 44.240 → 31.739 ms, 1.39x faster.
+- H100: 51.185 → 32.372 ms, 1.58x faster.
+- H100 135M training: 52.405 → 38.652 ms, 1.36x faster.
 
-H100 strict ResNet PyTorch inference gains 1.28x with search, but compilation
-grows 14.09 to 601.27 s: about 970,000 inference calls repay the additional
-recorded preparation including capture, excluding research validation.
-Private Inductor/Triton caches are fresh; persistent driver/library state is
-not reset. These are not guaranteed cold-start or equal-deadline results.
+The overall strict training ratio nevertheless changes 2.433 → 2.467;
+minimal latency improves 1.430 → 1.284; inference is nearly unchanged
+(1.833 → 1.830). The stronger reference matters. B570's median strict
+reference gain is 1.59x inference and 2.08x minimal latency; native
+improvements alone cannot predict the new paired ratio. M3 has substantial
+variation and mixed native changes. No causal cooperative-f32 speedup is
+established by these non-ablation data.
 
-## Scaling and failure interpretation
+The main paper presents v9 results standalone. It retains a separately
+identified H100 pilot for the actual search-off/on control and preparation
+costs, not a mixed-revision main table. The original v7 analyzer is available
+at paper commit 249464b; its load_campaign and aggregate functions reproduce
+the old side of this comparison.
 
-The H100 extension validates strict default 360M and 1.7B with and without
-replay, plus searched 360M. Each larger point has one process, not three;
-there are no accelerated extension results. Light/replay training ratios
-narrow 5.28 → 5.00 → 3.82 from 135M to 360M to 1.7B. Prefill ratios
-3.99 → 4.15 → 3.65 and token ratios 1.44 → 1.38 → 2.51 do not establish
-uniform amortization. No scaling law is fitted.
+## Search and preparation
 
-The searched 1.7B record contains a completed Meganeura result and a PyTorch
-error. Its traceback reaches a generated Triton reduction during training
-forward capture, then reports `cudaErrorStreamCaptureInvalidated`.
-It explicitly refers to a previous capture error without identifying that
-initiating error. This final log does **not** contain the older cohort's
-`CUBLAS_STATUS_EXECUTION_FAILED` diagnostic. Do not reuse that attribution.
-H100 now records graphics driver 580.126.09; the older 570/CUDA-compatibility
-provenance discussion no longer describes this allocation.
+Every native session reports measured search, All scope, no class cap,
+a 60-second soft deadline and a 1 GiB scratch ceiling with a device-memory
+guard. Strict uses NativeF32; accelerated uses Auto with full-width
+derivative protection. Apple M3 exposes native-f32 tiles and actually uses
+them in all five strict workloads (2,150 dispatch instances over 15 processes).
+No measured Vulkan device exposes native-f32 tiles through this stack;
+NVIDIA gains therefore cannot be attributed to strict cooperative f32.
 
-The requested policy fails operationally; no paired searched 1.7B time is
-admitted, no numerical gate was relaxed, and unreached conditions are simply
-unmeasured. This does not invalidate the complete main H100 campaign.
+Of 708 sessions, 684 visit every eligible class (including zero-class
+sessions); 13,322 / 14,085 class instances are visited. The 24 truncated
+sessions are ResNet training on 780M, B570, M3 and RPL-U. The longest search
+is 60.441 seconds. Candidate comparisons record 13,417 FasterCandidate,
+31,456 KeepBaseline, 330 InvalidOutput and 24 TimeBudget decisions.
+Numerically rejected candidates are not installed. Counts include repeated
+processes and candidate comparisons, not distinct kernels or graph speedups.
+GEMV, reduced-input cooperative variants and arbitrary graph representations
+remain outside the implemented search domain.
 
-## Availability and limits that remain
+Across 35 strict GPU groups, native compile+tune medians span 0.532–95.996 s
+(median 7.614), versus 1.914–84.402 s PyTorch (median 29.983).
+Native search can exceed reference compilation: RTX 5070 ResNet
+33.813/13.262 s and M3 ResNet 95.996/5.724 s. Do not claim uniformly cheaper
+startup or equal end-to-end budgets.
 
-- RPL-U is a working native GPU path versus PyTorch CPU, not evidence that
-  Meganeura beats a PyTorch GPU on that device.
-- ROCm search failures/timeouts and the 780M's architecture/SDMA overrides
-  are documented bring-up findings, not inferred from omitted final arms.
-  Arc's embedding-backward probe selects a qualified index-add equivalent.
-- Windows search was omitted after costly/intermittently failing bring-up;
-  the **final** light/replay campaign succeeds throughout.
-- MI300X remains a separately supplied driver-engineering report, not a
-  final-revision timing cell. Its original report is outside Git at
-  ~/Downloads/p3hpc-v2/MI300x-story.md (SHA-256
-  `e9be97e695140e8a36e09da0f0dd850113b0b22359182921dbc34b689d9776e8`).
-  Stock RADV excludes graphics-less CDNA; compute-only driver experiments
-  do not establish a working model path or a trivial fix.
-- The final protocol still omits ROCm/XPU replay and MPS compilation,
-  disables native-f32 cooperative tiles in strict mode, and pairs native
-  search with PyTorch max-autotune instead of enabling it in every arm.
-  These are explicit study limits, not backend impossibility or an
-  equal-startup-budget experiment. [Deferred work](NEXT-COHORT.md).
+H100's main campaign totals 7.10 minutes native compilation/search,
+13.73 PyTorch compilation and 4.66 research qualification. Its extension
+totals 1.91, 9.88 and 27.32 minutes respectively. Large-model qualification
+cost is CPU/readback validation, not kernel tuning. All reference
+compilations finish below the enforced 120-second limit.
 
-## Profiling evidence and reproduction
+The separate v7 H100 pilot has three-process search-off/on controls:
+native strict 135M prefill 13.265 → 9.744 ms, training 52.405 → 42.719 ms.
+Across 30 searched pairs, PyTorch compilation totals 170.3 minutes versus
+114.7 seconds native; default/replay PyTorch totals 14.0 minutes.
+Those pilot numbers are not the current 60-second search policy.
 
-The [same-pin RTX diagnostic](https://github.com/kvark/inferena/blob/experiment/nvidia-gap-2026-09-13/ANALYSIS-2026-09-13.md)
-localizes ResNet training: ordinary cohort 42.162/13.410 ms; separate Systems
-GPU span 39.736 ms versus CUDA kernel sum 13.312 ms. Structured profiling
-adds 16% overhead and attributes 77.3% of summed dispatch medians to
-convolution gradients. An ordinary tuner log visits 5/71 classes in 2.005 s
-and misses the small-output weight-gradient hotspots. Neither wall-minus-
-kernels nor a workgroup-barrier warp counter measures removable resource
-barriers. Raw traces stay outside Git; source, controls, and recipes are on
-the experiment branch.
+## Scaling and capacity
 
-Run from the repository root with Python 3.11+:
+Both 360M and 1.7B complete three processes under both arithmetic contracts.
+Strict training ratios narrow 3.91 → 3.51 → 2.89 with model size, but prefill
+stays near three and one-token ratio widens to 2.50 at 1.7B.
+Accelerated training instead widens 5.29 → 5.64 → 7.10. Accelerated 1.7B
+prefill is 12.22x PyTorch and is slower natively than strict (53.663 versus
+34.198 ms). Permissions do not guarantee a faster selected implementation.
 
-~~~sh
-python3 paper/p3hpc/artifact/cohort.py "$HOME/Downloads/p3hpc" \
-  --check paper/p3hpc/tables --output target/p3hpc-final-data
-~~~
+H100 strict 1.7B records 16.72 GiB of native execution-plan allocation versus
+12.86 GiB PyTorch allocator peak / 13.54 GiB reserved. These scopes differ;
+they do not establish a comparative peak-VRAM result. Small batch/sequence,
+stateless token forward and no optimizer/distributed execution still limit
+the scaling claim.
 
-This audits external archives, regenerates nine LaTeX fragments, and exports
-all per-condition medians/ranges to CSV without a GPU. Hashes identify exact
-observations; rerunning source reproduces the procedure, not the timing noise.
-Public hosting of the small measurement bundle remains an author decision.
-No Intel server rental or additional cohort is required for this scoped paper.
+## Other evidence and reproduction
+
+The RTX profiling study uses Meganeura 75dfe901 and two-second search,
+not the primary cohort's revision/policy. Its grouped GPU span localizes a
+convolution-gradient bottleneck, but its 5/71-class coverage is obsolete for
+the final NVIDIA runs. No new Nsight trace or removable-barrier fraction is
+claimed. [Diagnostic source and analysis](https://github.com/kvark/inferena/blob/experiment/nvidia-gap-2026-09-13/ANALYSIS-2026-09-13.md).
+
+The MI300X report remains separately identified (SHA-256
+e9be97e695140e8a36e09da0f0dd850113b0b22359182921dbc34b689d9776e8).
+Its driver experiments are not timing cells. RPL-U CPU, XPU workarounds,
+and the 780M ROCm overrides remain explicit portability evidence; old
+Windows/H100 failures are not attributed to the complete final cohort.
+
+From the repository root, using Python 3.11+:
+
+    python3 paper/p3hpc/artifact/cohort.py "$HOME/Downloads/p3hpc" \
+      --check paper/p3hpc/tables --output target/p3hpc-final-data
+
+The supplementary ZIP contains all original JSON content, losslessly
+recompressed as records.jsonl.xz; the same checker accepts that file instead
+of the archive directory. It checks eight generated table/figure fragments
+and exports all 84 condition groups to CSV, without a GPU or network.
+Original text logs are not included; no raw measurement value is discarded.
+No additional cohort or Intel server rental is required for this scoped paper.

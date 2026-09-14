@@ -2,31 +2,48 @@
 
 ## Camera-ready cohort
 
-The September 13 cohort supplies the P3HPC manuscript's measurements.
-Its nine campaign archives stay outside Git. Read [RESULTS.md](../RESULTS.md) for scope, failures,
-findings, and interpretation; [cohort.sha256](cohort.sha256) identifies inputs.
+The September 14 final analysis uses v9: eight complete 30-pair device
+campaigns and a complete 12-pair H100 extension, 252 valid pairs total.
+Inferena fa5a04e1 and Meganeura 428fc2d2 are the measured revisions.
+[RESULTS.md](../RESULTS.md) records scope, findings and interpretation;
+[cohort.sha256](cohort.sha256) identifies the nine original archives.
 
 From the repository root, with Python 3.11+:
 
-```sh
-python3 paper/p3hpc/artifact/cohort.py "$HOME/Downloads/p3hpc" \
-  --check paper/p3hpc/tables --output target/p3hpc-final-data
-```
+    python3 paper/p3hpc/artifact/cohort.py "$HOME/Downloads/p3hpc" \
+      --check paper/p3hpc/tables --output target/p3hpc-final-data
 
-This verifies archive hashes, revisions, retained outputs/gradient norms,
-timing medians, replay summaries, and replication, then checks the generated
-LaTeX fragments and exports a per-condition CSV. It needs no GPU or network.
-It does not reconstruct unretained tensor elements or diagnose capture errors.
-No partial campaign is admitted to the completed-population aggregates.
+The audit checks source/checkpoint identity, raw/joined agreement, 20-sample
+medians, cross-engine numerical gates, fixed per-tensor/whole-gradient
+replay bounds, native search/precision policies, compiled reference/replay
+receipts and all three-process gradient reports. Eight LaTeX table/figure
+fragments and an 84-row condition CSV are regenerated without a GPU/network.
 
-The supplied raw evidence needs external publication hosting before submission.
-The source branch remains `experiment/p3hpc-cuda-graphs` at Inferena `efb1e520`;
-no new collection tag was created during analysis.
-The eight complete device campaigns contain 390 pairs; the H100 extension
-adds five valid pairs and one failed attempt. Windows is complete.
-The separate MI300X report is not an input to timing tables or this verifier.
-See [submission preparation](../SUBMISSION.md) for the paper/source/evidence
-packages and remaining author upload checks.
+The supplementary ZIP is self-contained for this audit. Its records.jsonl.xz
+is a lossless compression of every original JSON value, including raw/joined
+records and full replay statistics. Pass it instead of the archive directory:
+
+    python cohort.py records.jsonl.xz --check tables --output regenerated
+
+To produce that compact representation from the original archives:
+
+    python3 paper/p3hpc/artifact/cohort.py "$HOME/Downloads/p3hpc" \
+      --bundle /absolute/path/to/records.jsonl.xz
+
+The stream contains an archive-digest header followed by nine JSON maps in
+the analyzer's declared device order. Standard-library lzma supplies XZ
+decompression; no executable/model/cache/trace data is stored. Original
+runner text logs are omitted, not measurement fields. The checker cannot
+reconstruct tensor elements that the runners never retained.
+
+The separately labeled H100 search pilot has its original v7 analyzer and
+does not enter primary tables/aggregates. The MI300X report likewise is not
+a timing cell. No public hosting choice is required to replay the supplied
+supplement; a persistent DOI would still help discovery.
+
+Publication files stay outside Git; [SUBMISSION.md](../SUBMISSION.md) describes
+the PDF, LaTeX source ZIP and supplementary ZIP. No new collection tag or GPU
+benchmark was created during analysis.
 
 ## Original-submission artifact (legacy)
 

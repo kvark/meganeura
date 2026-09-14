@@ -2,7 +2,7 @@
 
 For the camera-ready results, start with [the final cohort guide](../../paper/p3hpc/RESULTS.md)
 and [updated workshop questions](p3hpc-questions.md). The dated engineering
-history below is separate from the final Inferena `efb1e520` measurements.
+history below is separate from the final Inferena `fa5a04e1` measurements.
 
 Prepared 2026-09-05 against development base `bd6be08`, subsequently rebased
 onto `8069cf3` with checkpoint/memory work, `a455409` for training holdouts,
@@ -36,13 +36,15 @@ The research question is not whether Rust is faster than Python. It is how
 much useful ML performance a compact, shared graphics-API implementation can
 recover across consumer GPUs, including devices poorly served by vendor ML
 stacks. The final study covers eight device configurations, including H100
-and complete Windows results, at one PyTorch source revision with qualified
-CUDA replay. Across seven GPU-reference configurations, strict light-policy
-training has a 2.43× median time ratio. Native compile-time search improves
-H100 135M prefill by 1.36×, while searched PyTorch wins all measured CUDA
-phase comparisons.
-The larger-model extension and MI300X report make the scaling and availability
-limits explicit.
+and complete Windows results, at one PyTorch source revision. All references
+compile, CUDA/HIP/XPU replay is qualified, and every native session tunes.
+Strict native-f32 cooperative matrices are permitted and exercised on M3.
+Across seven GPU-reference configurations, strict training has a 2.47×
+median time ratio. All 252 pairs validate, including three-process strict
+and accelerated 360M/1.7B H100 extensions. Search covers all eligible classes
+in 684 of 708 sessions, but gains and preparation costs vary by workload.
+The larger-model results and MI300X report make scaling and support limits
+explicit; the final cohort is not a controlled tuning-off/on ablation.
 
 ## Earlier engineering milestones
 

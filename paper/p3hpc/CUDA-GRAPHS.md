@@ -1,64 +1,46 @@
 # Replay methodology and final outcomes
 
-The final Inferena revision is `efb1e520`; [RESULTS.md](RESULTS.md)
-identifies all observations. Compiler graph capture is not command-graph
-replay. The manuscript measures the latter explicitly on NVIDIA.
+The frozen final source is Inferena fa5a04e1; [RESULTS.md](RESULTS.md)
+identifies the observations. Compiler graph capture and command-graph replay
+are different; the latter is explicitly qualified here.
 
-## Frozen conditions
+| Backend | Primary reference execution |
+|---|---|
+| CUDA, including Windows | Default compilation, whole-phase torch.cuda.CUDAGraph replay |
+| ROCm | Default compilation, HIP graph replay through torch.cuda.CUDAGraph |
+| XPU | Default compilation, math SDPA, whole-phase torch.xpu.XPUGraph replay |
+| MPS | Default compilation of all requested phases; no equivalent public whole-phase replay API |
+| CPU support control | Explicit default-compiled CPU execution |
 
-| Condition | PyTorch | Meganeura |
-|---|---|---|
-| Light, no replay | Default compilation, uncaptured | Greedy compilation, empirical search off |
-| Light, replay | Default compilation, whole-phase CUDA Graph | Same light policy |
-| Searched, replay | Max-autotune compilation, whole-phase CUDA Graph | Bounded measured selection during build |
+Meganeura always performs bounded measured kernel selection during session
+construction. Inductor's internal triton.cudagraphs is disabled, leaving one
+explicit replay owner. Preparation and execution share one dedicated stream
+on CUDA/HIP/XPU. XPU's embedding-backward and attention accommodations are
+recorded; they are not an unmodified native XPU path.
 
-RTX 5070 and H100 complete all three conditions. Windows RTX 3050 completes
-the first two and explicitly omits searched compilation.
+Full inference, minimal forward and forward/loss/backward are captured
+separately. Qualification compares every participating PyTorch output and
+gradient element with the first uncaptured result: two ordinary repeats
+(eight for accelerated training) and two replays. V9 uses fixed per-output
+maximum/RMS bounds, strict per-parameter and whole-gradient bounds, and
+accelerated whole-gradient bounds. These are not fitted to repeat noise
+and are distinct from cross-engine sampled-output / gradient-norm checks.
 
-Inductor's internal `triton.cudagraphs` option is disabled in every condition;
-the explicit switch owns replay. Compilation, preparation, capture, warmup,
-and execution share one dedicated CUDA stream.
+Five warmups precede twenty synchronized samples. Loading, readback,
+compilation, capture and validation are outside steady-state samples.
+Default compilation has an enforced 120-second first-specialization deadline;
+graph preparation and research qualification are timed separately.
+No failure substitutes eager or CPU timings.
 
-Full inference, minimal forward, and F+loss+backward are captured separately.
-Replay qualification compares all participating outputs and gradient elements
-against uncaptured PyTorch. Each phase has two uncaptured repeats and two
-consecutive replays; accelerated training uses eight uncaptured repeats.
-Fixed RMS/maximum bounds are not fitted to the observed errors. This is
-distinct from the cross-engine sampled-output and gradient-norm gates.
+All 240 main pairs and 12 H100 extension pairs pass. Both larger models
+have three processes under both arithmetic contracts. No final Windows or
+H100 crash is carried over from preceding collections.
 
-Five warmups precede twenty synchronized samples. Loading, readback, capture,
-and validation are outside steady-state samples. Compiler preparation, capture,
-and research qualification have separate recorded costs. A failed requested
-compiler/capture condition never receives an eager substitute.
+Each process has an empty private Inductor/Triton cache. Persistent driver
+and vendor-library state remains as found: disabling max-autotune does not
+guarantee no reuse of lower-level choices. This remains a threat to validity,
+not a reason to change or repeat the completed protocol.
 
-Every condition has a fresh process and empty private Inductor/Triton caches.
-Persistent driver and vendor-library state remains as found. Rotated condition
-and engine order mitigates history dependence without guaranteeing a cold start;
-light may reuse lower-level state from earlier searched work.
-
-## Outcome
-
-RTX 5070 and H100 each complete 90 pairs; Windows completes 60. Default replay
-reduces H100 135M stateless-token latency 3.496 → 1.275 ms and diffusion
-F+L+B 14.322 → 4.031 ms. Windows has no failed pair in this final collection.
-
-The H100 extension completes five strict pairs: all three 360M conditions and
-both default 1.7B conditions. Searched 1.7B fails during training forward capture,
-with a generated Triton launch reporting an earlier capture error and graph
-finalization reporting `cudaErrorStreamCaptureInvalidated`. The initiating
-error is not identified. This is not a proven OOM or cuBLAS diagnosis.
-Meganeura completes, but that unpaired result supplies no validated speed ratio.
-Later conditions are unmeasured.
-
-## Important limits
-
-The collector still restricts explicit replay to NVIDIA. ROCm exposes graphs
-through PyTorch's CUDA API and XPU has its own graph API, but neither was
-qualified here. This is a protocol omission, **not** evidence of unavailable
-backend functionality. Their final default/no-replay subsets follow separately
-documented search failures or timeouts.
-
-MPS and CPU are eager. The pinned MPS API has no CUDA-style replay entry point,
-but an MPS Inductor backend exists and was not exercised. The paper does not
-claim these are the strongest automatic policies on every device.
-See [deferred methodology work](NEXT-COHORT.md); the frozen cohort is unchanged.
+The main paper separately labels an H100 search pilot and RTX profiles at
+older revisions/policies. Their observations are not current replay ablations
+or replacements for the final timing matrix.
