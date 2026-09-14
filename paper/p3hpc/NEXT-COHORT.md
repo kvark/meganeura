@@ -1,97 +1,35 @@
-# Corrected-protocol acceptance checklist
+# Corrected-protocol acceptance: complete
 
-The author's recovered feedback (`~/Downloads/p3hpc-v2/feedback.txt`) is the
-requirements source, together with the original review in the conversation.
-The former decision to defer these protocol changes was incorrect. The v7
-data (Inferena `efb1e520`, Meganeura `75dfe901`) remain valid observations of
-their declared conditions, but do not implement the requested comparison.
-The current paper tables and camera-ready packages still describe v7 and
-must not be uploaded as the corrected study.
+Closed September 14, 2026 by the final v9 cohort at Inferena fa5a04e1 /
+Meganeura 428fc2d2. The recovered author feedback and all three reviewer
+notes have been checked against executed records. The v7 paper packages
+remain superseded; the current manuscript and handoff now use v9.
 
-Collection instructions live in Inferena's `EXPERIMENT.md` on
-`experiment/p3hpc-cuda-graphs`. This checklist tracks implementation and
-evidence separately; a mode flag or successful generic test is not proof
-that a full workload used the requested path.
-
-| Requirement | Implementation / acceptance evidence |
+| Requirement | Executed evidence |
 |---|---|
-| Always tune Meganeura, independently of PyTorch | Collector enables it for every pair; each actual session reports policy, search coverage, decisions and cost. Missing/disabled receipts fail. |
-| Strict permits native-f32 cooperative tiles | Meganeura merged `428fc2d` adds `NativeF32`, filtering both planning and runtime capabilities. Scalar f32 remains the baseline; f16-input kernels stay forbidden. Local GPUs have no native-f32 tiles, so positive hardware use requires the Mac receipt. |
-| Explore the legal search space | Remove eight-class cutoff; include current dense/convolution domains; raise scratch ceiling to 1 GiB while retaining the device-memory guard. CUDA ResNet covers all classes under the 60-second/session ceiling; B570 can exhaust it. Report coverage, not exhaustive search. |
-| Stop multi-hour reference preparation | Default compiled reference without max-autotune; 120-second first-specialization watchdog kills compiler descendants and retains failure evidence. Optional max-autotune uses the same limit. No automatic eager fallback. |
-| Replay on every applicable backend | CUDA/HIP `CUDAGraph` and XPU `XPUGraph` use one preparation/run stream and full-tensor qualification. CUDA and XPU pass all five models in both arithmetic classes and small live-input/weight replay checks. ROCm and Windows hardware qualification is still required. |
-| MPS compilation and timing | Remove eager bypass; compile requested forward/backward/minimal phases and include synchronized first specializations in `compile_s`. Routing/failure checks pass locally, but a Mac must qualify actual execution. MPS has no equivalent public whole-phase replay API. |
-| Reduce collection time | Primary cohort is 30 paired processes per device; graph ablation and max-autotune are opt-in. No duplicate qualification campaign is required before every measurement. |
-| Explicit numerical validation | Cross-engine/replicated-gradient and full-gradient gates stay unchanged. The v9 candidate uses fixed per-output maximum/RMS gates at the same `1e-4`/`1e-6` coefficients, replacing v8's near-zero-sensitive pointwise gate; this is a declared acceptance-rule change. |
-| Production convolution choices | Already merged and included in the pin. Search legal shape/staging alternatives; report invalid candidates and uncovered classes rather than treating heuristics as measurements. |
-| Honest memory and timing interpretation | Existing distinct native allocation/Torch allocator/MPS endpoint measurements retained; no fictitious common peak-VRAM or subtraction-based barrier metric. |
+| Always tune Meganeura | All 252 pairs, 708 sessions report measured search independently of reference mode. |
+| Strict native-f32 cooperative tiles | Every strict receipt permits NativeF32 and forbids f16 inputs; M3 actually uses cooperative dispatches in all five workloads. |
+| Broaden legal search | All scope, no class cap, 1 GiB scratch with device guard, 60 s soft deadline. 684 sessions fully cover their eligible classes; 24 ResNet sessions reach the deadline. |
+| Bound PyTorch preparation | Default compilation, no max-autotune, enforced 120 s watchdog in every record. All finish under the limit. |
+| Replay on applicable backends | CUDA/HIP/XPU capture and full-element replay qualification pass all requested workloads and both contracts, including Windows and large H100 models. |
+| MPS compilation and timing | All 30 M3 pairs report compilation, first specializations and nonzero compile time. No public equivalent whole-phase replay API is assumed. |
+| Reduce cohort size | 30 paired processes per main device, plus 12 large-model H100 pairs; no duplicate qualification cohort or searched arm. |
+| Explicit numerical acceptance | V9 fixed per-output maximum/RMS bounds are recorded and replayed. Cross-engine and replicated-gradient gates pass. |
+| Production convolution choices | Included in the measured Meganeura pin and searched on NVIDIA, AMD, Intel and Apple. |
+| Honest memory and attribution | Plan sizes and allocator peaks stay distinct; missing H100 NVML telemetry is disclosed; no invented barrier percentage. |
 
-## Paper acceptance after collection
+The v9 output gate is an intentional change from v8's near-zero-sensitive
+pointwise rule: maximum and RMS errors must each satisfy fixed 1e-4 / 1e-6
+bounds. No tolerance is fitted to the run. Pointwise mismatch counts remain
+diagnostics. The failed v8 AMD Whisper run was recollected under v9, not
+relabelled or retrospectively accepted.
 
-- Recompute tables, preparation costs and the SmolLM2 figure from one final source;
-  retain incomplete conditions as operational findings, not favorable retries.
-- State actual platform failures and successful native execution directly;
-  distinguish driver support, compile failure, budget exhaustion, and omitted
-  experiments. Do not reintroduce superseded Windows or ROCm failure anecdotes.
-- Keep H100 as an unoptimized transfer/scaling test, not a tuned target. Collect
-  360M/1.7B only on the cloud GPU, and disclose replication and residency limits.
-- Keep the shared graphics-context use case, expanded abbreviations, readable
-  grouped table headings, observability and native-profile attribution.
-- Add neural accelerators and persistent megakernels as genuine future work;
-  they are now in the draft. Required benchmark corrections are not future work.
-- Replace the v7 limitations and artifacts only when new executed evidence
-  supports the replacement. Retain the cache-history threat to validity.
-- Rebuild and inspect the IEEE-format PDF and independent source ZIP. Prefer
-  <2 MB and stay below the portal's 4 MB rejection limit. Supplementary material
-  needs ZIP, not the existing 23 MB evidence tarball; raw evidence needs hosting.
+XPU uses qualified dense-index-add embedding backward and the public math
+SDPA setting for capture compatibility. Those accommodations remain in the
+paper and metadata. They are not silent eager fallback or disabled replay.
 
-No new collection tag or cloud run has been created during protocol repair.
-
-## Local qualification findings (September 13)
-
-CUDA completes all five models in both arithmetic classes with native tuning
-independent of default-compiled graph replay. The initial 10-second native
-ceiling covered all non-ResNet classes locally, but only 22/71 strict and
-25/59 accelerated ResNet training classes. A 60-second ceiling reached every
-ResNet class in 29/24 seconds and passed the cross-engine gates. This is
-qualification, not replicated speedup evidence; actual native preparation
-can exceed default PyTorch compilation on ResNet.
-
-XPU ResNet completes compiled whole-phase replay. Native strict search visits
-51/71 training classes before its 60-second deadline on the B570's present
-host/PCIe configuration; full native preparation is 89 seconds versus 39
-seconds for PyTorch compilation. Other native sessions finish early. Do not
-claim every search is exhaustive or faster than default reference compilation.
-
-XPU SmolLM2's default fused attention fails inside capture with an event-wait
-error after successful compilation and ordinary execution. An isolated
-grouped-query attention reproducer fails likewise; the public PyTorch math
-SDPA setting passes complete forward/backward replay validation. Inferena
-records that setting explicitly for XPU, including its uncaptured control,
-and all ten model/arithmetic pairs pass full qualification. This is a reference-stack
-graph-compatibility workaround, not disabling replay or relaxing a gate.
-
-Final-default CUDA ResNet qualification passes at Inferena `1430d0d`; the full
-XPU qualification at `d8335a8` also passes that revision's receipt checker.
-Six broad execution/contract tests pass with each local vendor wheel, together
-with nine Rust harness tests. No qualification output is publication data.
-
-The Mac must still demonstrate real MPS compilation timings and native-f32
-cooperative use, ROCm must qualify the new replay path, and Windows must check
-the new compilation/watchdog workflow before an expensive common-source
-collection is released. The local routing/receipt tests cannot substitute for
-those hardware checks.
-
-The author's RX 7900 XT v8 archive (`d5b46f2`) completes nine paired conditions
-before accelerated Whisper fails an ordinary training-output repeat, prior to
-training graph capture. Compilation takes 7.09 seconds, not a timeout. Two of
-576,000 values miss the pointwise gate, with a largest mismatch of `1.185e-6`;
-successful strict Whisper already varies by up to `1.529e-6`, with RMS error
-`7.171e-8`. The v9 correction applies fixed per-output maximum/RMS bounds and
-preserves pointwise mismatch counts as diagnostics. The failed record lacks
-the full statistics needed to apply that rule retrospectively; AMD Whisper
-must qualify again. This is not evidence of a GPU crash or Meganeura divergence.
-At Inferena `8826ef7`, both local GPUs pass paired v9 Whisper qualification in
-both arithmetic classes, along with the broad execution tests. All 192 saved
-output comparisons from the nine valid AMD pairs satisfy the new fixed norm
-bounds; this offline check neither relabels old data nor qualifies the failure.
+[RESULTS.md](RESULTS.md) records numerical outcomes and timing variability.
+[REVISION.md](REVISION.md) maps reviewer/author concerns to the manuscript.
+[SUBMISSION.md](SUBMISSION.md) describes final files and author upload checks.
+No further cohort is needed to support the paper's stated scope; broader
+search domains, neural accelerators and megakernels are genuinely future work.

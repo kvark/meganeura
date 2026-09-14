@@ -3,9 +3,11 @@
 
 import argparse
 from collections import Counter, defaultdict
+from contextlib import nullcontext
 import csv
 import hashlib
 import json
+import lzma
 import math
 from pathlib import Path, PurePosixPath
 import statistics
@@ -13,8 +15,8 @@ import tarfile
 
 
 HERE = Path(__file__).resolve().parent
-INFERENA = "efb1e5206f07e316c94e8e021514cad60c0639bf"
-MEGANEURA = "75dfe901deb87ca0054c438437efd3aa388b7188"
+INFERENA = "fa5a04e1c1b38405cfa371a27c5dcef1319835d5"
+MEGANEURA = "428fc2d2322229e5338f5d80a10d700340d593cd"
 TORCH = "cf30153c4c131c8164ee7798e5022d810682e2cb"
 MODELS = ("SmolLM2-135M", "SmolVLA", "StableDiffusion", "ResNet-50", "Whisper-tiny")
 PHASES = ("inference", "latency", "training")
@@ -24,10 +26,10 @@ DEVICES = {
     "nvidia-3050": "RTX 3050 (Windows)",
     "amd-dgpu": "RX 7900 XT",
     "amd-igpu": "Radeon 780M",
-    "intel-dgpu": "Arc B570",
+    "intel-b570": "Arc B570",
     "apple-m3": "Apple M3",
     "intel-igpu": "Intel RPL-U (CPU ref.)",
-    "nvidia-h100-long": "H100 extension",
+    "nvidia-h100-large": "H100 extension",
 }
 ENGINES = ("meganeura", "pytorch")
 
@@ -48,20 +50,27 @@ def relative_l2(actual, reference):
 def audit_replay(validation, training, accelerated):
     require(validation["rtol"] == 1e-4 and validation["atol"] == 1e-6
             and validation["accelerated_gradient_rtol"] == 0.01, "replay bounds changed")
+    anchor = validation["uncaptured"][0]
     for stage, count in (("uncaptured", validation["uncaptured_repeats"]), ("replays", 2)):
         tensors = validation[stage]
         require(len(tensors) == count, "missing replay evidence")
         for sample in tensors:
+            require(sample.keys() == anchor.keys(), "replay tensor inventory changed")
+            require({name for name in sample if not name.startswith("gradient ")}
+                    == ({"output 0", "output 1"} if training else {"output 0"}), "missing output evidence")
             require(sum(name.startswith("gradient ") for name in sample) == validation["gradient_tensors"],
                     "gradient inventory differs in replay")
             for name, row in sample.items():
+                require(all(row[key] == anchor[name][key] for key in ("elements", "max_abs_reference", "rms_reference")),
+                        "replay reference changed between calls")
                 require(row["elements"] > 0 and all(math.isfinite(x) and x >= 0 for x in row.values()),
                         "invalid replay metric")
-                if not name.startswith("gradient "):
-                    require(row["max_abs_error"] <= row["max_abs_bound"], "output replay failed")
-                if name.startswith("gradient ") and not accelerated:
+                for metric in ("max_abs", "rms"):
+                    require(math.isclose(row[metric + "_bound"], 1e-6 + 1e-4 * row[metric + "_reference"],
+                                         rel_tol=1e-12), "per-tensor bound changed")
+                if not (name.startswith("gradient ") and accelerated):
                     require(row["rms_error"] <= row["rms_bound"] and row["max_abs_error"] <= row["max_abs_bound"],
-                            "strict gradient replay failed")
+                            "tensor replay failed")
         totals = validation["full_gradient"][stage]
         require(len(totals) == (count if training else 0), "missing whole-gradient evidence")
         for sample, total in zip(tensors, totals):
@@ -107,20 +116,53 @@ def audit_pair(pair, campaign, run):
     require(pt["environment"]["python_version"] == "3.13.13", "Python changed")
     require(mg["environment"]["gpu_device_id"] == campaign["native_device"]["device_id"],
             "native GPU changed")
-    require(mg["optimizer"]["measured_kernel_search"] == (run["mode"] == "max-autotune"),
-            "native search policy differs")
+    require(not mg["environment"]["gpu_software_emulated"], "software GPU substituted")
+    backend = campaign["args"]["backend"]
+    require(mg["gpu_name"] == campaign["native_device"]["name"], "native device name changed")
+    if backend in ("cuda", "rocm", "xpu"):
+        require(pt["environment"]["triton_backend"] == {"cuda": "nvidia", "rocm": "amd", "xpu": "intel"}[backend],
+                "wrong reference compiler backend")
+        require(pt["device"] == pt["gpu_name"] and pt["device"].lower() != "cpu", "CPU fallback")
+    require(mg["optimizer"]["measured_kernel_search"] is True, "native search disabled")
+    strict = not mg["precision"]["reduced_precision_allowed"]
+    require(mg["precision"]["cooperative_matrix_policy"] == ("NativeF32" if strict else "Auto: protect full-precision derivative regions"),
+            "cooperative matrix policy changed")
+    require((not strict or mg["precision"]["native_f32_cooperative_matrix_permitted"] is True)
+            and mg["precision"]["f16_cooperative_matrix_permitted"] == (not strict), "cooperative permissions differ")
+    sessions = mg["optimizer"]["sessions"]
+    require(Counter(s["mode"] for s in sessions) == {"Inference": 1 if mg["model"] == "Whisper-tiny" else 2, "Training": 1},
+            "missing native sessions")
+    for session in sessions:
+        require(session["cooperative_matrix_policy"] == ("NativeF32" if strict else "Auto"), "session arithmetic changed")
+        search = session["search"]
+        require(search["scope"] == "All" and search["class_limit"] is None and not search["class_limit_reached"]
+                and search["max_seconds"] == 60.0 and search["max_scratch_bytes"] == 1024**3, "search policy changed")
+        require(0 <= search["visited_classes"] <= search["eligible_classes"]
+                and (search["visited_classes"] == search["eligible_classes"] or search["time_budget_exhausted"]),
+                "unexplained search truncation")
+        require(math.isfinite(search["elapsed_seconds"]) and search["elapsed_seconds"] >= 0
+                and sum(search["decisions"].values()) == search["comparisons"], "invalid search receipt")
     execution = pt["execution"]
-    require(execution["requested_mode"] == run["mode"], "reference mode differs")
-    require(execution["compiled"] == (run["mode"] != "eager"), "compiler fallback")
-    require(execution["cuda_graphs"]["requested"] == run["graphs"], "graph request differs")
+    require(execution["requested_mode"] == run["mode"] == "default" and execution["compiled"], "compiler fallback")
+    require(execution["compile_budget_seconds"] == 120.0 and execution["compile_budget_enforced"], "watchdog missing")
+    require(not any(execution["compiler_options"].values()), "unexpected compiler search or internal replay")
+    require(execution["sdpa_policy"] == ("math" if backend == "xpu" else "auto"), "attention policy changed")
+    allowed = {"MATH"} if backend == "xpu" else {"MATH", "CUDNN_ATTENTION", "FLASH_ATTENTION", "EFFICIENT_ATTENTION", "OVERRIDEABLE"}
+    require(set(execution["sdpa_enabled_backends"]) == allowed, "attention backends differ")
+    require(execution["graph_replay"]["requested"] == run["graphs"] == (backend in ("cuda", "rocm", "xpu")),
+            "graph request differs")
+    require(pt["protocol"]["name"] == "inferena-graph-replay-v4", "reference protocol changed")
     for phase in PHASES:
-        graph = execution["cuda_graphs"]["phases"][phase]
+        graph = execution["graph_replay"]["phases"][phase]
         require(graph["status"] == ("captured-and-validated" if run["graphs"] else "not-requested"),
                 "unqualified replay")
         if run["graphs"]:
+            require(graph["api"] == ("torch.xpu.XPUGraph" if backend == "xpu" else "torch.cuda.CUDAGraph")
+                    and execution["stream_policy"] == "single dedicated preparation/run stream", "wrong replay API/stream")
             v = graph["validation"]
             repeats = 8 if phase == "training" and pt["precision"]["reduced_precision_allowed"] else 2
-            require(v["policy"] == "fixed-full-gradient-v3" and v["uncaptured_repeats"] == repeats
+            require(v["policy"] == "fixed-full-tensor-v4" and v["uncaptured_repeats"] == repeats
+                    and v["output_metric"] == "per-tensor RMS and maximum absolute error"
                     and v["uncaptured_calls"] == repeats + 1 and v["consecutive_replays"] == 2,
                     "replay validation policy changed")
             audit_replay(v, phase == "training", phase == "training" and pt["precision"]["reduced_precision_allowed"])
@@ -149,10 +191,14 @@ def audit_pair(pair, campaign, run):
     return errors
 
 
-def load_campaign(path):
+def read_records(path):
     with tarfile.open(path) as archive:
-        records = {member.name: json.load(archive.extractfile(member)) for member in archive
-                   if member.isfile() and member.name.endswith(".json")}
+        return {member.name: json.load(archive.extractfile(member)) for member in archive
+                if member.isfile() and member.name.endswith(".json")}
+
+
+def load_campaign(path, records=None):
+    records = read_records(path) if records is None else records
     manifests = [name for name in records if name.endswith("/campaign.json")]
     require(len(manifests) == 1, "expected one campaign in " + path.name)
     prefix = str(PurePosixPath(manifests[0]).parent) + "/"
@@ -160,8 +206,14 @@ def load_campaign(path):
     require(campaign["source"] == INFERENA and campaign["meganeura"]["rev"] == MEGANEURA,
             "campaign revision mismatch")
     require(campaign["torch"]["git_version"] == TORCH, "campaign PyTorch mismatch")
-    require(campaign["protocol"] == "p3hpc-paired-campaign-v7", "campaign protocol mismatch")
+    require(campaign["protocol"] == "p3hpc-paired-campaign-v9", "campaign protocol mismatch")
     require(campaign["args"]["replicates"] == 3, "replicate policy changed")
+    expected_models = ["SmolLM2-360M", "SmolLM2-1.7B"] if path.stem == "nvidia-h100-large" else list(MODELS)
+    require(campaign["args"]["models"] == expected_models
+            and campaign["args"]["precisions"] == ["strict", "accelerated"], "campaign workload coverage changed")
+    require(campaign["native_policy"] == {"measured_kernel_search": True, "scope": "All", "class_limit": None,
+            "max_scratch_bytes": 1024**3, "search_seconds_per_session": 60.0, "strict_coop": "NativeF32"},
+            "manifest native policy differs")
     groups = defaultdict(list)
     failed = []
     seen = set()
@@ -187,16 +239,35 @@ def load_campaign(path):
         groups[precision, model, condition].append({"replicate": replicate, "pair": pair, "errors": errors})
     if campaign["status"] == "complete":
         require(not failed, "complete campaign contains failure")
-        expected = {(precision, model, condition["mode"] + "-graph" + str(int(condition["cuda_graphs"])))
+        expected = {(precision, model, condition["mode"] + "-graph" + str(int(condition["graph_replay"])))
                     for precision in campaign["args"]["precisions"] for model in campaign["args"]["models"]
                     for condition in campaign["reference_conditions"]["selected"]}
         require(set(groups) == expected, "missing selected condition")
-        require(all(len(runs) == 3 for runs in groups.values()), "incomplete replication")
+        require(all({run["replicate"] for run in runs} == {"r1", "r2", "r3"} and len(runs) == 3
+                    for runs in groups.values()), "incomplete replication")
         require(campaign["replicated_gradient_validation"]["status"] == "pass", "replicated gate failed")
     for runs in groups.values():
         for key in ("parameter_gradient_relative_l2_error", "total_gradient_relative_error"):
             if len(runs) == 3:
                 require(statistics.median(run["errors"][key] for run in runs) < 0.05, "replicated gradient gate failed")
+    report = campaign["replicated_gradient_validation"]
+    require(report["policy"] == "replicated-gradient-median-v1" and len(report["groups"]) == len(groups),
+            "replicated report policy/inventory differs")
+    checked = set()
+    for group in report["groups"]:
+        key = (group["precision"], group["model"], group["mode"] + "-graph" + str(int(group["graph_replay"])))
+        require(key not in checked and key in groups, "duplicate or unknown replicated group")
+        checked.add(key)
+        require(group["status"] == "pass" and group["median_limit"] == 0.05
+                and group["sample_limit"] == (0.1 if key[0] == "accelerated" else 0.05), "replication bounds changed")
+        require(set(group["metrics"]) == {"parameter_gradient_relative_l2", "total_gradient_relative"},
+                "missing replicated metric")
+        for metric, stored in group["metrics"].items():
+            values = [run["errors"][metric + "_error"] for run in groups[key]]
+            require(len(stored["samples"]) == 3
+                    and all(math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-12) for a, b in zip(values, stored["samples"]))
+                    and math.isclose(statistics.median(values), stored["median"], rel_tol=1e-9, abs_tol=1e-12),
+                    "replicated report differs from retained errors")
     return campaign, groups, failed
 
 
@@ -217,7 +288,7 @@ def aggregate(groups):
                           for run in runs if (memory := run["pair"][engine].get("memory"))
                           and all(field in phase for phase in memory["phases"].values())]
                 row[name] = statistics.median(values) if len(values) == len(runs) else None
-        graphs = [run["pair"]["pytorch"]["execution"]["cuda_graphs"]["phases"] for run in runs]
+        graphs = [run["pair"]["pytorch"]["execution"]["graph_replay"]["phases"] for run in runs]
         for part in ("capture", "validation"):
             row["pytorch_" + part] = statistics.median(sum(phase.get(part + "_s", 0) for phase in graph.values()) for graph in graphs)
         for phase in PHASES:
@@ -227,9 +298,7 @@ def aggregate(groups):
 
 
 def primary_condition(campaign):
-    if campaign["args"]["backend"] == "cuda":
-        return "default-graph1"
-    return "eager-graph0" if campaign["args"]["backend"] in ("mps", "cpu") else "default-graph0"
+    return "default-graph" + str(int(campaign["args"]["backend"] in ("cuda", "rocm", "xpu")))
 
 
 def tex_table(columns, heading, lines):
@@ -246,22 +315,20 @@ def tables(campaigns, rows, groups):
     output = {}
     lines = []
     for device, label in DEVICES.items():
-        if device == "nvidia-h100-long":
+        if device == "nvidia-h100-large":
             continue
         c = campaigns[device]
         backend = c["args"]["backend"]
         driver = c["native_device"]["driver_info"].split("-")[0] or "Metal"
         valid = sum(run["status"] == "valid" for run in c["runs"])
         expected = 3 * 10 * len(c["reference_conditions"]["selected"])
-        mode = "eager" if backend in ("mps", "cpu") else "compiled"
-        coverage = "partial" if c["status"] != "complete" else c["reference_conditions"]["coverage"]
-        coverage = "light only" if coverage == "availability-subset" else coverage
-        lines.append([label, backend.upper() + "/" + mode, driver, f"{valid}/{expected}", coverage])
-    output["devices.tex"] = tex_table("lllll", "Device & PyTorch path & Graphics driver & Valid/selected pairs & Coverage", lines)
+        replay = {"cuda": "CUDA Graph", "rocm": "HIP graph", "xpu": "XPU graph"}.get(backend, "no public replay" if backend == "mps" else "none")
+        lines.append([label, backend.upper() + "/compiled", driver, replay, f"{valid}/{expected}"])
+    output["devices.tex"] = tex_table("llllr", "Device & PyTorch path & Graphics driver & Explicit replay & Valid/selected pairs", lines)
     lines = []
     for device, label in DEVICES.items():
         c = campaigns[device]
-        if c["status"] != "complete":
+        if device == "nvidia-h100-large":
             continue
         condition = primary_condition(c)
         if device == "intel-igpu":
@@ -275,52 +342,36 @@ def tables(campaigns, rows, groups):
                      r" & & Inf. & Min. & F+L+B & Inf. & Min. & F+L+B")
     output["ratios.tex"] = tex_table("llrrrrrr", ratio_heading, lines)
     lines = []
-    for device in ("nvidia-5070", "nvidia-h100"):
-        for model in MODELS:
-            values = [ratio(rows[device][precision, model, "max-autotune-graph1"]["ratio_" + phase])
-                      for precision in ("strict", "accelerated") for phase in PHASES]
-            lines.append([DEVICES[device] if model == MODELS[0] else "", model, *values])
-    output["searched-ratios.tex"] = tex_table("llrrrrrr", ratio_heading, lines)
+    for device, label in DEVICES.items():
+        runs = [run for batch in groups[device].values() for run in batch]
+        compile_s = [sum(run["pair"][engine]["timings"]["compile_s"] for run in runs) for engine in ENGINES]
+        graph_s = [sum(phase.get(part + "_s", 0) for run in runs
+                       for phase in run["pair"]["pytorch"]["execution"]["graph_replay"]["phases"].values())
+                   for part in ("capture", "validation")]
+        lines.append([label, str(len(runs)), *[f"{value / 60:.2f}" for value in (*compile_s, *graph_s)]])
+    output["preparation.tex"] = tex_table("lrrrrr",
+        r"Device & Pairs & M compile+tune & P compile & P graph prep. & P qualification", lines)
     lines = []
-    for device in ("nvidia-5070", "nvidia-h100", "nvidia-3050"):
-        for condition in ("default-graph1", "max-autotune-graph1"):
-            runs = [run for key, batch in groups[device].items() if key[2] == condition for run in batch]
-            if not runs:
-                continue
-            compile_s = [sum(run["pair"][engine]["timings"]["compile_s"] for run in runs) for engine in ENGINES]
-            graph_s = [sum(phase.get(part + "_s", 0) for run in runs
-                           for phase in run["pair"]["pytorch"]["execution"]["cuda_graphs"]["phases"].values())
-                       for part in ("capture", "validation")]
-            lines.append([DEVICES[device], "light" if condition.startswith("default") else "searched",
-                          str(len(runs)), f"{compile_s[0]:.1f}", f"{compile_s[1] / 60:.1f}",
-                          *[f"{value:.1f}" for value in graph_s]])
-    output["preparation.tex"] = tex_table("llrrrrr",
-        r"Device & Policy & Pairs & M compile (s) & P compile (min) & P capture (s) & P qualification (s)", lines)
+    for device, label in DEVICES.items():
+        searches = [session["search"] for batch in groups[device].values() for run in batch
+                    for session in run["pair"]["meganeura"]["optimizer"]["sessions"]]
+        decisions = sum((Counter(s["decisions"]) for s in searches), Counter())
+        lines.append([label, str(len(searches)),
+                      f"{sum(s['visited_classes'] for s in searches)}/{sum(s['eligible_classes'] for s in searches)}",
+                      str(sum(s["time_budget_exhausted"] for s in searches)),
+                      str(decisions["FasterCandidate"]), str(decisions["InvalidOutput"])])
+    output["search.tex"] = tex_table("lrrrrr", r"Device & Sessions & Classes visited/eligible & Deadlines & Faster & Rejected", lines)
     lines = []
-    for device in ("nvidia-5070", "nvidia-h100"):
-        for model in MODELS:
-            base = rows[device]["strict", model, "default-graph0"]
-            light = rows[device]["strict", model, "default-graph1"]
-            searched = rows[device]["strict", model, "max-autotune-graph1"]
-            lines.append([DEVICES[device] if model == MODELS[0] else "", model,
-                          *[f"{base['pytorch_' + phase] / light['pytorch_' + phase]:.2f}" for phase in PHASES],
-                          *[f"{light[engine + '_inference'] / searched[engine + '_inference']:.2f}" for engine in ENGINES],
-                          *[f"{light[engine + '_compile']:.2f}/{searched[engine + '_compile']:.2f}" for engine in ENGINES]])
-    output["search.tex"] = tex_table("llrrrrrrr", r"Device & Workload & \multicolumn{3}{c}{PyTorch replay gain} & \multicolumn{2}{c}{Search inf. gain} & \multicolumn{2}{c}{Compile seconds: light/searched} \\ & & Inf. & Min. & F+L+B & M & P & M & P", lines)
-    lines = []
-    for model, device in (("SmolLM2-135M", "nvidia-h100"), ("SmolLM2-360M", "nvidia-h100-long"), ("SmolLM2-1.7B", "nvidia-h100-long")):
-        for condition in ("default-graph1", "max-autotune-graph1"):
-            key = ("strict", model, condition)
-            if key not in rows[device]:
-                lines.append([model, "searched", "0", *["--"] * 8])
-                continue
+    for model, device in (("SmolLM2-135M", "nvidia-h100"), ("SmolLM2-360M", "nvidia-h100-large"), ("SmolLM2-1.7B", "nvidia-h100-large")):
+        for precision in ("strict", "accelerated"):
+            key = (precision, model, "default-graph1")
             row = rows[device][key]
-            lines.append([model, "light" if condition.startswith("default") else "searched", str(row["replicates"]),
+            lines.append([model, precision, str(row["replicates"]),
                           *[f"{row[engine + '_' + phase]:.2f}" for phase in PHASES for engine in ENGINES],
                           *[f"{row[engine + '_compile']:.2f}" for engine in ENGINES]])
-    output["scaling.tex"] = tex_table("llrrrrrrrrr", r"Model & Policy & $n$ & \multicolumn{2}{c}{Prefill ms} & \multicolumn{2}{c}{One token ms} & \multicolumn{2}{c}{F+L+B ms} & \multicolumn{2}{c}{Compile s} \\ & & & M & P & M & P & M & P & M & P", lines)
+    output["scaling.tex"] = tex_table("llrrrrrrrrr", r"Model & Arithmetic & $n$ & \multicolumn{2}{c}{Prefill ms} & \multicolumn{2}{c}{One token ms} & \multicolumn{2}{c}{F+L+B ms} & \multicolumn{2}{c}{Compile s} \\ & & & M & P & M & P & M & P & M & P", lines)
     lines = []
-    for model, device in (("SmolLM2-135M", "nvidia-h100"), ("SmolLM2-360M", "nvidia-h100-long"), ("SmolLM2-1.7B", "nvidia-h100-long")):
+    for model, device in (("SmolLM2-135M", "nvidia-h100"), ("SmolLM2-360M", "nvidia-h100-large"), ("SmolLM2-1.7B", "nvidia-h100-large")):
         row = rows[device]["strict", model, "default-graph1"]
         lines.append([model, str(row["replicates"]), *[f"{row[key] / 2**30:.2f}"
                       for key in ("meganeura_memory", "pytorch_memory", "pytorch_reserved")]])
@@ -331,7 +382,7 @@ def tables(campaigns, rows, groups):
         values = []
         for phase in PHASES:
             ratios = [rows[device]["strict", model, primary_condition(c)]["ratio_" + phase]
-                      for device, c in campaigns.items() if c["status"] == "complete" and c["args"]["backend"] != "cpu"]
+                      for device, c in campaigns.items() if device != "nvidia-h100-large" and c["args"]["backend"] != "cpu"]
             values.extend((len(ratios) / sum(max(x, 1) for x in ratios),
                            len(ratios) / sum(max(1 / x, 1) for x in ratios)))
         scores.append(values)
@@ -340,7 +391,7 @@ def tables(campaigns, rows, groups):
     output["portability.tex"] = tex_table("lrrrrrr", r"Workload & \multicolumn{2}{c}{Inference} & \multicolumn{2}{c}{Minimal} & \multicolumn{2}{c}{F+L+B} \\ & M & P & M & P & M & P", lines)
     # Paired bars, not a stack: forward and F+L+B are separate measurements.
     chart = [r"\begin{tikzpicture}[x=1mm,y=1mm,font=\scriptsize]"]
-    devices = [device for device, c in campaigns.items() if c["status"] == "complete" and c["args"]["backend"] != "cpu"]
+    devices = [device for device, c in campaigns.items() if device != "nvidia-h100-large" and c["args"]["backend"] != "cpu"]
     bottom = 1 - len(devices) * 10
     for panel, (phase, title) in enumerate((("inference", "Prefill (ms)"), ("training", "F+L+B (ms)"))):
         maximum = max(rows[device]["strict", "SmolLM2-135M", primary_condition(campaigns[device])][engine + "_" + phase + "_max"]
@@ -360,10 +411,10 @@ def tables(campaigns, rows, groups):
                 value = row[engine + "_" + phase]
                 end = origin + value / limit * 54
                 top = y - j * 3.5
-                chart.extend([rf"\fill[{color}] ({origin},{top}) rectangle ({end:.4f},{top - 2.8});",
-                              rf"\node[anchor=west,inner sep=1pt] at ({end:.4f},{top - 1.4}) {{{value:.1f}}};"])
                 low = origin + row[engine + "_" + phase + "_min"] / limit * 54
                 high = origin + row[engine + "_" + phase + "_max"] / limit * 54
+                chart.extend([rf"\fill[{color}] ({origin},{top}) rectangle ({end:.4f},{top - 2.8});",
+                              rf"\node[anchor=west,inner sep=1pt] at ({high:.4f},{top - 1.4}) {{{value:.1f}}};"])
                 chart.append(rf"\draw[black,|-|] ({low:.4f},{top - 1.4}) -- ({high:.4f},{top - 1.4});")
     chart.extend([rf"\fill[blue!65!black] (49,{bottom - 11}) rectangle (53,{bottom - 8});",
                   rf"\node[anchor=west] at (54,{bottom - 9.5}) {{Meganeura}};",
@@ -376,26 +427,43 @@ def tables(campaigns, rows, groups):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("archives", type=Path, help="directory containing the supplied .tgz campaigns")
+    parser.add_argument("archives", type=Path, help="campaign .tgz directory or lossless records.jsonl.xz bundle")
     parser.add_argument("--output", type=Path, help="write generated tables and per-condition CSV here")
     parser.add_argument("--check", type=Path, help="compare generated tables against this directory")
+    parser.add_argument("--bundle", type=Path, help="export all original JSON content, losslessly compressed (no logs)")
     args = parser.parse_args()
+    require(args.bundle is None or args.bundle.resolve() != args.archives.resolve(), "cannot overwrite the input bundle")
     campaigns, rows, all_groups = {}, {}, {}
+    digests = {}
     for line in (HERE / "cohort.sha256").read_text().splitlines():
         expected, name = line.split("  ", 1)
         require(Path(name).name == name, "manifest path is not a filename")
-        with (args.archives / name).open("rb") as file:
-            require(hashlib.file_digest(file, "sha256").hexdigest() == expected, "input digest differs: " + name)
-    print("Campaign archive SHA-256 digests match")
+        digests[name] = expected
+        if args.archives.is_dir():
+            with (args.archives / name).open("rb") as file:
+                require(hashlib.file_digest(file, "sha256").hexdigest() == expected, "input digest differs: " + name)
+    print("Campaign archive SHA-256 digests match" if args.archives.is_dir() else "Auditing lossless JSON-content bundle")
     input_hashes = {}
-    for device in DEVICES:
-        path = args.archives / (device + ".tgz")
-        c, groups, failed = load_campaign(path)
-        for name, digest in c["sha256"].items():
-            name = name.replace("\\", "/")
-            require(input_hashes.setdefault(name, digest) == digest, "input identity differs: " + name)
-        campaigns[device], rows[device], all_groups[device] = c, aggregate(groups), groups
-        print(device, c["status"], dict(Counter(run["status"] for run in c["runs"])), "failed:", failed)
+    with (nullcontext(None) if args.archives.is_dir() else lzma.open(args.archives, "rt")) as source, \
+            (lzma.open(args.bundle, "wt") if args.bundle else nullcontext(None)) as bundle:
+        if source:
+            require(json.loads(next(source)) == digests, "bundle provenance differs")
+        if bundle:
+            bundle.write(json.dumps(digests) + "\n")
+        for device in DEVICES:
+            path = args.archives / (device + ".tgz")
+            records = json.loads(next(source)) if source else read_records(path)
+            c, groups, failed = load_campaign(path, records)
+            require(c["status"] == "complete" and not failed, "incomplete final campaign")
+            for name, digest in c["sha256"].items():
+                name = name.replace("\\", "/")
+                require(input_hashes.setdefault(name, digest) == digest, "input identity differs: " + name)
+            campaigns[device], rows[device], all_groups[device] = c, aggregate(groups), groups
+            if bundle:
+                bundle.write(json.dumps(records, separators=(",", ":")) + "\n")
+            print(device, c["status"], dict(Counter(run["status"] for run in c["runs"])), "failed:", failed)
+        if source:
+            require(not source.read().strip(), "unexpected trailing campaign")
     generated = tables(campaigns, rows, all_groups)
     if args.output:
         args.output.mkdir(parents=True, exist_ok=True)
@@ -411,10 +479,10 @@ def main():
         for name, content in generated.items():
             require((args.check / name).read_text() == content, "generated table differs: " + name)
     for precision in ("strict", "accelerated"):
-        print("\n", precision, "complete GPU/light cohort")
+        print("\n", precision, "complete GPU-reference cohort")
         for phase in PHASES:
             values = [rows[device][precision, model, primary_condition(c)]["ratio_" + phase]
-                      for device, c in campaigns.items() if c["status"] == "complete" and c["args"]["backend"] != "cpu"
+                      for device, c in campaigns.items() if device != "nvidia-h100-large" and c["args"]["backend"] != "cpu"
                       for model in MODELS]
             print(phase, "wins", sum(x < 1 for x in values), "/", len(values), "median ratio", statistics.median(values))
     errors = [(run["errors"], device, key) for device, groups in all_groups.items() for key, runs in groups.items() for run in runs]

@@ -1,25 +1,29 @@
 # Camera-ready handoff
 
-Submission **ws_p3hpc104**. Prepared September 13, 2026; nothing uploaded.
+Submission **ws_p3hpc104**. Prepared September 14, 2026; nothing uploaded.
 The author must approve the manuscript and any publication agreement.
 
-**Superseded draft, not ready to upload.** The numerical tables still describe
-v7 / Inferena `efb1e520`. The author requested a corrected protocol with
-always-on native tuning, strict native-f32 cooperative tiles, broader replay,
-MPS compilation and bounded PyTorch preparation. That work is tracked in
-[NEXT-COHORT.md](NEXT-COHORT.md). Replace the numerical analysis and rebuild
-the packages after the corrected cohort; do not relabel the existing data.
+The manuscript and packages use the completed v9 cohort at Inferena
+`fa5a04e1` / Meganeura `428fc2d2`: all 252 pairs validate. Always-on native
+tuning, strict native-f32 cooperative tiles, CUDA/HIP/XPU replay, compiled
+MPS and bounded default PyTorch compilation are checked in executed records.
+[RESULTS.md](RESULTS.md) gives the audit and cross-cohort interpretation;
+[REVISION.md](REVISION.md) maps reviewer and author feedback to the revision.
+The September 13 packages are superseded; no further cohort is needed for
+the claims in this manuscript.
 
 ## Files
 
-The local handoff directory is `~/Documents/P3HPC/camera-ready-20260913/`:
+The local handoff directory is `~/Documents/P3HPC/camera-ready-20260914/`:
 
 - `meganeura-p3hpc-camera-ready.pdf`: manuscript for final author review.
 - `meganeura-p3hpc-sources.zip`: TeX, bibliography, templates, figure and
   generated tables; build independently without a GPU or measurement archive.
-- `meganeura-p3hpc-evidence.tar.gz`: the nine supplied campaign archives,
-  offline analyzer, expected tables, per-condition CSV, and the separately
-  labeled MI300X report. No model weights, executables, driver caches or traces.
+- `meganeura-p3hpc-supplementary.zip`: every JSON record from the nine
+  supplied campaigns, losslessly compressed, the offline analyzer, expected
+  tables and per-condition CSV. The separately labeled H100 tuning pilot has
+  its original analyzer; the MI300X report is included. No runner text logs,
+  model weights, executables, driver caches or trace binaries.
 - `BUILD-INFO.txt` and `SHA256SUMS`: source/build provenance and package hashes.
 
 These publication files remain outside Git. The paper PR contains source,
@@ -27,15 +31,13 @@ small generated LaTeX fragments, archive identities and study documentation.
 The main benchmark and separate profiling studies keep their own revisions.
 No new collection tag or benchmark was created during this update.
 
-The author has now supplied the upload requirements: PDF preferably below
-2 MB, files above 4 MB rejected, separate LaTeX source ZIP and supplementary
-ZIP fields. The existing PDF (~309 KB) and source ZIP (~175 KB) fit, but they
-are superseded drafts. The ~23 MB evidence tarball is not the required
-supplementary format or a size-compliant upload. Prepare a compact
-supplementary ZIP with the analyzer, provenance, summaries and a link to
-separately hosted raw records; do not silently omit raw data while describing
-that ZIP as self-contained. Confirm the supplementary field's own size limit.
-No copyright/ISBN line or PDF eXpress conference ID was supplied.
+The supplied upload requirements prefer a PDF below 2 MB and reject files
+above 4 MB, with separate PDF, LaTeX source ZIP and supplementary ZIP fields.
+The PDF is about 320 KB, the source ZIP below 200 KB and the self-contained
+supplementary ZIP below 3 MB. Exact bytes and SHA-256 digests accompany the
+packages. No external data download is needed to reproduce the eight
+generated table/figure fragments and all 84 condition groups.
+No copyright/ISBN line or PDF eXpress conference ID was supplied or invented.
 
 ## Venue requirements
 
@@ -47,15 +49,11 @@ portal screenshot further specifies 11:59 p.m. AoE for Stage 3.
 
 The manuscript uses the vendored `IEEEtran` class in conference mode, 10-point
 type on US Letter, with no custom margin/line-spacing reductions. The packaged
-v7 build has 13 pages; the argument ends on page 12, followed by the
-acknowledgments, artifact description and references. Tables and all pages
+v9 build has 13 pages; the main argument, acknowledgments and artifact
+description end on page 12, with references continuing on page 13. Tables and all pages
 were visually inspected; fonts are embedded Type 1 and no overflowing boxes,
 undefined citations or references remain. PDF title/author metadata is set.
 These local checks are **not** an IEEE PDF eXpress certification.
-
-The working draft with the new Future Work section rebuilds to 14 pages
-(318,239 bytes); its main argument still ends on page 12. This is a layout
-check, not an updated-data camera-ready release.
 
 The screenshot labels Stage 3 **SC Workshop: P3HPC: Program Material**,
 separately from **Workshop Camera-Ready Upload**. Treat them as distinct
@@ -102,12 +100,12 @@ each vendor.
 
 ## Final author actions
 
-- Complete the corrected-protocol acceptance checks and collection, update
-  the manuscript and reviewer matrix in `REVISION.md`, then review the rebuilt
-  PDF. Requested protocol fixes are not deferred future work.
-- Choose permanent public hosting for the compact evidence bundle and, if
-  available before upload, add its URL/DOI to the artifact description.
-  The source commits and checksums are already fixed; Git has no raw data.
+- Review the final PDF and the evidence/reviewer guides. In particular,
+  native tuning improves several workloads but is not always cheaper than
+  default PyTorch compilation; M3 variation and the accelerated 1.7B regression
+  remain disclosed. The final cohort is not a controlled tuning/f32 ablation.
+- A permanent URL/DOI for the supplement would help discovery, but is not
+  required to replay this self-contained submission. Git has no raw data.
 - Confirm author/title/ORCID, disclosure, rights and any required first-page
   notice. The supplied portal screenshot already marks copyright submitted;
   verify that it still applies to this final title/version.
@@ -127,7 +125,10 @@ pdflatex -interaction=nonstopmode -halt-on-error main.tex
 pdflatex -interaction=nonstopmode -halt-on-error main.tex
 ```
 
-The evidence bundle's README gives the independent CPU-only analysis command.
-It checks 395 valid pairs and regenerates all nine table/figure fragments.
+The supplementary ZIP's README gives the independent CPU-only analysis command.
+It checks all 252 final pairs and regenerates eight table/figure fragments.
+The separate H100 pilot command checks its 90 earlier pairs and reproduces
+the explicitly labeled preparation/search example, outside primary aggregates.
 The separate legacy verifier still targets the original-submission dataset;
-it is not the verifier for this evidence bundle.
+it is not the verifier for the final cohort. Independent extraction/rebuild,
+ZIP integrity and lossless JSON-content checks are recorded in BUILD-INFO.txt.

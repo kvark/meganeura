@@ -1,12 +1,12 @@
 \begin{tabular}{llrrrrrrrrr}
 \toprule
-Model & Policy & $n$ & \multicolumn{2}{c}{Prefill ms} & \multicolumn{2}{c}{One token ms} & \multicolumn{2}{c}{F+L+B ms} & \multicolumn{2}{c}{Compile s} \\ & & & M & P & M & P & M & P & M & P \\
+Model & Arithmetic & $n$ & \multicolumn{2}{c}{Prefill ms} & \multicolumn{2}{c}{One token ms} & \multicolumn{2}{c}{F+L+B ms} & \multicolumn{2}{c}{Compile s} \\ & & & M & P & M & P & M & P & M & P \\
 \midrule
-SmolLM2-135M & light & 3 & 13.26 & 3.33 & 1.83 & 1.28 & 52.41 & 9.92 & 1.22 & 55.73 \\
-SmolLM2-135M & searched & 3 & 9.74 & 3.32 & 1.83 & 0.87 & 42.72 & 9.41 & 1.61 & 259.38 \\
-SmolLM2-360M & light & 1 & 21.31 & 5.13 & 2.57 & 1.86 & 74.91 & 14.98 & 2.19 & 57.84 \\
-SmolLM2-360M & searched & 1 & 15.29 & 5.13 & 2.56 & 1.22 & 58.30 & 14.49 & 2.92 & 271.32 \\
-SmolLM2-1.7B & light & 1 & 43.48 & 11.91 & 8.15 & 3.25 & 137.17 & 35.88 & 6.28 & 40.08 \\
-SmolLM2-1.7B & searched & 0 & -- & -- & -- & -- & -- & -- & -- & -- \\
+SmolLM2-135M & strict & 3 & 9.63 & 3.32 & 1.86 & 1.27 & 38.65 & 9.87 & 3.53 & 54.15 \\
+SmolLM2-135M & accelerated & 3 & 8.68 & 2.22 & 1.83 & 1.26 & 36.90 & 6.97 & 4.33 & 54.20 \\
+SmolLM2-360M & strict & 3 & 15.32 & 5.13 & 2.58 & 1.85 & 52.57 & 14.98 & 5.56 & 58.40 \\
+SmolLM2-360M & accelerated & 3 & 14.13 & 2.86 & 2.58 & 1.86 & 50.92 & 9.02 & 5.80 & 58.66 \\
+SmolLM2-1.7B & strict & 3 & 34.20 & 11.90 & 8.10 & 3.24 & 103.48 & 35.81 & 14.80 & 40.06 \\
+SmolLM2-1.7B & accelerated & 3 & 53.66 & 4.39 & 8.19 & 3.25 & 116.18 & 16.37 & 12.58 & 40.78 \\
 \bottomrule
 \end{tabular}

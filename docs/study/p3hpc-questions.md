@@ -20,15 +20,14 @@ and the evidence about what that implementation recovers and misses.
 
 ### 2. Does the evaluation cover HPC hardware and larger models?
 
-Short: H100 completes the five-model cohort; 360M and 1.7B have valid strict
-forward/backward results from one process per completed condition.
+Short: yes. H100 completes the five-model cohort and both 360M/1.7B
+extensions, with three processes under both arithmetic contracts.
 
-Detail: the larger-model extension stops in searched 1.7B PyTorch capture,
-so it supplies preliminary scaling evidence, not full replicated coverage.
-Batch/sequence shapes remain small, with no optimizer or distributed work.
-MI300X is an adverse availability result: the supplied report has working
-ROCm but no validated Vulkan model execution. The graphics substrate has
-limits as well as deployment advantages.
+Detail: all 252 primary pairs validate. Strict H100 training ratios narrow
+3.91 → 3.51 → 2.89 with model size; accelerated results do not follow that
+trend. Batch/context remain small, with no optimizer or distributed work.
+MI300X is a separate driver-availability finding: working ROCm but no
+validated Vulkan model execution. Neither stack has universal GPU support.
 
 ### 3. Why Rust? Is avoiding Python the speedup?
 
@@ -92,7 +91,7 @@ Detail: this avoids graph rediscovery and per-step tensor allocation. It
 does not eliminate all host work or CPU allocation. General runtime shape
 changes need explicit plan support; a changing KV position is not an arbitrary
 dynamic shape. Native command capture may or may not help particular cases;
-the final PyTorch replay ablation measures its effect on the reference, not a native command-replay implementation.
+the reference receives qualified replay on CUDA/HIP/XPU, while Meganeura still records its static plan each step.
 
 ### 9. How can the system be general if it has specialized attention kernels?
 
@@ -126,31 +125,28 @@ extend the relevant physical/lifetime contract.
 
 ### 12. How much autotuning exists now?
 
-Short: bounded measured kernel selection runs inside `build`. In the final
-cohort it improves strict 135M prefill 1.36× on H100 and 1.09× on RTX 5070.
+Short: every native session tunes in the final cohort. Of 708 sessions,
+684 visit every eligible class; the rest reach the 60-second search deadline.
 
-Detail: the light policy disables search; the searched policy enables it.
-Both use greedy graph rewriting. Exact classes cover scalar matmul/convolution
-tiles and eligible native-f32 cooperative matmuls, with private scratch,
-numerical qualification, timing/noise guards, and resource bounds.
-F16-input, complex-fusion, GEMV, representation search, persistent winners,
-and automatic whole-step confirmation remain opportunities.
+Detail: there is no class-count cap, with a 1 GiB scratch ceiling and a
+device-memory guard. Scalar matrix and convolution choices plus eligible
+native-f32 cooperative alternatives are searched after greedy graph rewriting.
+GEMV, reduced-input cooperative variants and arbitrary graph representations
+remain outside that domain. Coverage receipts are not proof of a whole-graph
+speedup: rejected candidates leave the qualified incumbent installed.
 
-The final recorded preparation difference amortizes after about 109 H100
-or 234 RTX 5070 prefills. These estimates charge all three benchmark sessions,
-not an inference-only deployment, and assume naturally warm driver state.
-Searched PyTorch is still faster in every CUDA phase comparison.
-The older six-pair 1.092× experiment and its 80-call break-even are separate
-development evidence, not interchangeable numbers for this cohort.
+The separate two-second H100 pilot establishes a 1.36x strict 135M prefill
+gain. The final revision has no search-off/cooperative-off ablation, so do not
+attribute every cross-cohort change solely to tuning. Strict ResNet training
+is 1.39x faster on 5070 and 1.58x on H100 than in the preceding primary runs,
+but M3 changes are mixed and noisy.
 
-One preparation API combines compilation and measured choice; graph rewriting
-and kernel selection are not jointly searched today. The separate compiler
-microstudy measures 141–172 µs WGSL parsing and roughly 31 ms native versus
-100–167 ms Triton preparation for another cold GEMM candidate after compiler
-warmup. Native driver work is included in the latter comparison. The useful
-claim is integrated portable deployment with a measured search budget, not
-invention of autotuning or a 10,000× end-to-end compiler advantage.
-[Compilation and search](performance-plan.md#cheap-compilation-as-a-search-budget).
+One preparation API combines compilation and measured choice; they are not
+a joint graph/kernel search. The compiler microstudy measures 141–172 us
+WGSL parsing and roughly 31 ms native versus 100–167 ms Triton candidate
+preparation, including native driver work. That is not a 10,000x end-to-end
+compiler advantage. Native tuning can also exceed default PyTorch compilation
+on ResNet. [Preparation and coverage](../../paper/p3hpc/RESULTS.md).
 
 ### 13. Does strict f32 mean identical results?
 
@@ -158,7 +154,8 @@ Short: no. It constrains arithmetic permissions, not operation ordering or
 bitwise identity.
 
 Detail: f32 storage/output does not prevent reduced-input matrix arithmetic.
-The strict harness disables TF32 and all cooperative-matrix paths, including native-f32 cooperative tiles.
+The strict harness disables TF32 and reduced-input cooperative paths, but
+permits native-f32 cooperative tiles. M3 demonstrably uses them in strict mode.
 Different reductions and contraction behavior can still differ. Accelerated
 mode deliberately permits different fast input formats on each engine and
 must independently pass the gates.
@@ -174,25 +171,27 @@ bf16 or scaling needs its own capability plumbing and numerical contract.
 
 ### 15. Are the gradients verified element by element?
 
-Short: CUDA replay is checked that way against uncaptured PyTorch; the
+Short: CUDA/HIP/XPU replay is checked that way against uncaptured PyTorch; the
 cross-engine comparison uses total and per-parameter gradient norms.
 
 Detail: replay qualification covers every participating element, checks
 fixed RMS/maximum bounds, and tests two consecutive replays. Accelerated
 training first checks eight ordinary repeats. Cross-engine norms can still
 miss a sign error (`g` and `-g`), and 256 output samples can miss localized
-errors. All 395 completed pairs individually pass the 5% gradient gate.
+errors. All 252 completed pairs individually pass the 5% gradient gate.
 This is not full cross-engine elementwise equivalence or convergence evidence.
 
-### 16. Did you find a PyTorch bug on the 780M?
+### 16. What are the consumer AMD portability findings?
 
-Short: the original submission had a reference inconsistency, not a proven
-root cause. It does not recur in the final cohort.
+Short: ROCm bring-up needed device-specific accommodations and its larger
+automatic search failed, while the final bounded, replayed cohort validates.
 
-Detail: the older cross-backend norm audit justified a symmetric exclusion
-under its declared analysis. The new pinned ROCm cohort passes Whisper in
-both contracts and all three processes. No oracle exclusion or old failure
-count belongs in the camera-ready tables.
+Detail: 780M records an architecture override and disabled SDMA. On both
+Radeon machines, max-autotune diffusion training encountered local-memory
+limits/timeouts and an invalid library fallback call. These are practical
+PyTorch/ROCm portability problems, not a numerical defect in the final
+Meganeura runs. Do not infer a new failure merely because max-autotune was
+omitted; default compilation is now the primary reference everywhere.
 
 ### 17. Do incomplete campaigns or exclusions bias the aggregate?
 
@@ -200,8 +199,8 @@ Short: the complete-GPU score is conditional, and the missing coverage is
 reported explicitly.
 
 Detail: the same seven complete GPU-reference systems enter every primary
-workload and phase. CPU support and the partial H100 extension
-are separate populations. Unreached conditions are not assigned failures,
+workload and phase. All primary campaigns complete; CPU support and the
+additional H100 model sizes are separate populations. Unreached conditions are not assigned failures,
 and failed conditions are not given replacement timings. Requiring support
 across every attempted GPU gives both stacks a known hole, hence zero
 universal-set portability; reporting only the conditional score would mislead.
@@ -210,63 +209,48 @@ universal-set portability; reporting only the conditional score would mislead.
 
 ### 18. In one sentence, do you beat PyTorch?
 
-Short: on selected workloads, especially Radeon and small transformer shapes,
-but the stronger CUDA baseline usually wins.
+Short: on selected workloads, especially Radeon, but not generally.
 
-Detail: across seven complete GPU-reference systems under light preparation,
-strict inference/minimal/training median ratios are 1.83/1.43/2.43, with
-nominal wins 5/35, 8/35, and 4/35. One inference win is essentially a tie.
-Searched PyTorch wins all 60 CUDA phase comparisons. Intel CPU and partial
-campaigns are excluded from these counts.
+Detail: with always-tuned native execution and compiled references,
+strict inference/minimal/training median ratios are 1.83/1.28/2.47 across
+seven GPU-reference systems, with nominal wins 7/35, 10/35 and 3/35.
+CPU support and extra H100 sizes are excluded from those counts.
+The stronger reference offsets some native improvements: better Meganeura
+times do not automatically mean better Meganeura/PyTorch ratios.
 
 ### 19. Isn't Intel GPU versus CPU unfair?
 
-Short: it answers support availability, not a GPU-to-GPU efficiency question.
+Short: it answers support availability, not equal-device efficiency.
 
-Detail: RPL-U explicitly uses eager CPU PyTorch and is excluded from all GPU
-scores. Native Vulkan wins its five full-inference comparisons; minimal
-SmolVLA is a near tie with CPU. Arc B570 supplies a separate real XPU
-comparison: default/no-graph completes 30 pairs. Its embedding backward
-requires a shape-probed dense `index_add` equivalent, recorded in the results.
-State this qualified workaround rather than calling the reference unmodified
-native-XPU execution.
+Detail: RPL-U has a working native Vulkan path but no usable PyTorch GPU
+path. Compiled CPU is explicitly selected and excluded from GPU scores.
+Native execution wins all five full-forward and four training comparisons.
+B570 separately supplies a real compiled/replayed XPU reference, with
+qualified dense-index-add embedding backward and math SDPA for capture
+compatibility. Those recorded accommodations are not stock unmodified XPU.
 
-### 20. Did the final comparison use PyTorch max-autotune and CUDA Graphs?
+### 20. Did the final comparison use graph replay and max-autotune?
 
-Short: 5070 and H100 have both; Windows 3050 has qualified default replay
-and its uncaptured ablation, with searched compilation explicitly omitted.
+Short: CUDA/HIP/XPU replay is qualified everywhere applicable, including
+Windows. Max-autotune is off everywhere; every reference still compiles.
 
-Detail: the original submission bypassed capture and the reviewer was right
-to question it. The camera-ready now uses the repaired common-source cohort.
-H100 135M one-token PyTorch time falls 3.496 → 1.275 ms with default replay
-alone; diffusion training falls 14.322 → 4.031 ms. These controls can reverse
-an apparent native win.
+Detail: the primary policy has a 120-second PyTorch first-specialization
+watchdog and a separate 60-second native search ceiling per session.
+MPS also compiles; it has no equivalent public whole-phase replay API.
+There is no silent eager/CPU replacement. All 30 Windows pairs and all
+12 larger-model H100 pairs pass.
 
-Max-autotune was requested during bring-up on every applicable backend.
-It failed in diffusion compilation on both Radeon systems and did not finish
-the first B570 qualification within an hour. Their final default-only
-campaigns label the omissions. This is an automatic-compilation portability
-finding; no eager timing substitutes for the failed request.
-ROCm replay itself was not qualified in this protocol.
+The separate H100 pilot demonstrates the preparation tradeoff: searched
+PyTorch compilation totals 170.3 minutes over 30 pairs, versus 14.0 minutes
+for default/replay. Its native two-second policy improves strict 135M
+prefill 1.36x. These are not equal search spaces or startup budgets.
+The final H100 main campaign spends 13.73 minutes in default compilation;
+the extension spends another 9.88 minutes compiling and 27.32 in research
+qualification, not kernel tuning.
 
-Pinned Inductor's 68-SM gate declines GEMM template search on 5070/3050;
-H100 executes that search. Other compiler choices still help some small-GPU
-workloads. H100 strict ResNet inference gains 1.28× from searched preparation
-but compilation grows 14.09 → 601.27 seconds, giving about 970,000 calls
-to repay the recorded extra setup. That does not make search unhelpful for
-every workload or phase.
-
-Light/searched is separate from strict/accelerated arithmetic. Both primary
-CUDA preparation policies use replay. Fresh processes and private
-TorchInductor/Triton caches prevent reuse of a saved compiler winner; persistent
-driver/library caches remain naturally warm. The frozen protocol treats this
-as a threat to validity, not independent first-use cold starts.
-
-Windows completes all 60 selected pairs. The H100 extension stops in
-searched 1.7B training capture: a Triton launch reports an unspecified earlier
-capture error, then graph finalization reports invalidated capture. The five
-preceding valid pairs survive, with no replacement timing for the failure.
-[Methodology and failures](../../paper/p3hpc/CUDA-GRAPHS.md).
+Fresh private Inductor/Triton caches do not clear persistent driver/library
+choices. We retain that cache-history threat to validity.
+[Replay methodology](../../paper/p3hpc/CUDA-GRAPHS.md).
 
 ### 21. Are the training times complete training steps?
 
@@ -287,28 +271,29 @@ quantization, batching and memory accounting. Serving adds request scheduling
 and tail latency. llama.cpp or vLLM comparisons need that expanded protocol,
 not a relabeling of the current column.
 
-### 23. What does a portability score of 0.38 mean?
+### 23. What does a portability score of 0.39 mean?
 
 Short: the mean of five workload-level harmonic efficiencies for strict
-light-policy training over seven complete GPU-reference systems.
+training over seven shared GPU-reference systems.
 
-Detail: the comparator is the faster valid result of the two engines on each
-machine. It is not 38% of peak or a median time ratio. The corresponding
-PyTorch score is 0.99. Every workload uses the same seven systems; the final
-cohort has no oracle-dispute exclusion. The CPU comparison and partial
-campaigns remain separate. Expanding to every attempted GPU exposes
-availability holes and gives both stacks zero under that support requirement.
+Detail: the comparator is the faster valid engine on each machine under
+the declared policy. It is not 39% of peak or a median time ratio.
+PyTorch's corresponding score is 0.98. CPU support and additional H100 sizes
+are separate. Requiring GPU support across every attempted device gives
+both stacks zero because each has an availability hole.
 
 ### 24. Do profiles prove the remaining gap is just missing kernels?
 
 Short: they identify where to work, not prove the absence of API or driver
 limits.
 
-Detail: the same-pin ResNet training diagnostic reports 39.736 ms grouped
+Detail: the separately pinned ResNet diagnostic reports 39.736 ms grouped
 native GPU time versus 13.312 ms of CUDA kernel intervals. Convolution
 weight/input gradients dominate the separately instrumented pass profile;
 the ordinary tuner log visits only 5/71 classes and misses small-output
-weight-gradient hotspots. No removable-barrier percentage follows.
+weight-gradient hotspots under its two-second policy. The final NVIDIA
+runs visit all eligible classes; those profiles are not an exact breakdown
+of their remaining gap. No removable-barrier percentage follows.
 
 The separate resident-parameter 5070 Nsight experiment puts 1.7B
 prefill's native grouped GPU span at 52.67 ms, versus 27.91 ms of CUDA
@@ -329,7 +314,8 @@ See the [paper's gap analysis](../../paper/p3hpc/main.tex).
 Short: matrix throughput is only one term in the cost.
 
 Detail: operand staging, padding, layouts, occupancy, reduction shape and
-dispatch structure can dominate. Accelerated RX 7900 XT SmolVLA also regresses in the final light cohort.
+dispatch structure can dominate. Final H100 1.7B native prefill is slower
+with accelerated permission than strict: 53.66 versus 34.20 ms.
 This motivates measured choice among correct candidates; it does not imply
 cooperative matrices are generally bad or always profitable above a fixed
 threshold.
@@ -361,8 +347,8 @@ Detail: final compile-time search already has measured gains. Separate
 convolution-specialization and GEMV experiments identify general opportunities.
 A future production change should charge preparation, retain failures, and
 confirm held-out end-to-end performance. Another Intel server rental is not a
-prerequisite for camera-ready; larger replicated models and multi-platform
-kernel attribution remain clear research limits.
+prerequisite for camera-ready; long-context/optimizer/distributed workloads
+and multi-platform kernel attribution remain research limits.
 
 ## Observability and debugging
 
@@ -422,6 +408,12 @@ separately; staging and driver objects are outside that sum. Reads of
 uninitialized moments return zeros without allocating; clearing the optimizer
 retains initialized state for later reuse. See
 [checkpoint and memory contracts](checkpoints-and-memory.md).
+
+## Separately versioned engineering experiments
+
+The following answers describe the dated experiments linked in each answer,
+not additional controls in the final v9 cohort. Library tuning is optional;
+the final benchmark enables it in every native session.
 
 ### 34. How do you distinguish a tuning gain from a lucky session or timing drift?
 
@@ -666,15 +658,15 @@ prepare approximately eight slides and leave detail in backup:
 | 0–1 min | Question: can a compact graphics-API layer support useful training and deployment? |
 | 1–2.5 min | Architecture diagram: shared graph/autodiff/plan, native embedding boundary. |
 | 2.5–4 min | Protocol: eight device configurations, common PyTorch source, explicit replay and arithmetic/preparation policies. |
-| 4–6 min | Results: 2.43× strict training median; replay reverses apparent wins; native H100 prefill search gains 1.36×. |
-| 6–7.5 min | Numerical gates, H100 searched capture failure, complete Windows, CPU support and MI300X. |
-| 7.5–9 min | H100 partial scaling and the separate host/GPU timeline; explain what the traces establish. |
+| 4–6 min | Results: 2.47× strict training median; complete native search in 684/708 sessions; separate H100 search pilot gains 1.36×. |
+| 6–7.5 min | All 252 pairs validate; complete Windows, GPU-versus-CPU support, XPU workarounds and MI300X. |
+| 7.5–9 min | H100 scaling through 1.7B under both contracts; separate host/GPU timeline and attribution limits. |
 | 9–10 min | Deployment and productivity scope; Quest inference, not headset training. |
-| 10–12 min | Limits, alternatives, bounded autotuning direction and takeaway. |
+| 10–12 min | Limits, alternatives, broader search, neural accelerators and megakernels. |
 
 Backup slides: complete strict/accelerated tables, portability equation,
-partial-campaign inventory, precision rollback, preparation/break-even accounting,
-variant-selection contract, API/operator limitations, and measured replay controls. For a longer slot, expand method and architecture before
+search-coverage inventory, precision rollback, preparation/break-even accounting,
+variant-selection contract, API/operator limitations, and the separately pinned replay controls. For a longer slot, expand method and architecture before
 adding more performance claims.
 
 ## Self-test exercises
@@ -698,6 +690,6 @@ Answers: (1) `dX=[32,784]`, `dW=[784,128]`, with derivative matmuls protected;
 (3) 0.75 versus arithmetic 0.833; (4) `g` versus `-g`;
 (5) `1/(0.27+0.73/2)=1.57×`; (6) optimizer moments/counter, KV state and
 accumulated gradients; device/driver, generator revision and numerical policy;
-(7) seven complete GPU-reference systems: 4/35 strict training wins and 2.43×
-median; eight complete campaigns: 390 pairs; adding the H100 extension
-records gives 395 valid pairs. Different denominators answer different questions.
+(7) seven complete GPU-reference systems: 3/35 strict training wins and 2.47×
+median; eight complete main campaigns: 240 pairs; adding the 12-pair H100
+extension gives 252 valid pairs. The pilot is separate from those denominators.

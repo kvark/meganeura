@@ -1,16 +1,15 @@
-\begin{tabular}{llrrrrrrr}
+\begin{tabular}{lrrrrr}
 \toprule
-Device & Workload & \multicolumn{3}{c}{PyTorch replay gain} & \multicolumn{2}{c}{Search inf. gain} & \multicolumn{2}{c}{Compile seconds: light/searched} \\ & & Inf. & Min. & F+L+B & M & P & M & P \\
+Device & Sessions & Classes visited/eligible & Deadlines & Faster & Rejected \\
 \midrule
-RTX 5070 & SmolLM2-135M & 1.06 & 1.64 & 1.04 & 1.09 & 1.00 & 0.88/1.12 & 46.69/72.75 \\
- & SmolVLA & 1.09 & 1.44 & 1.08 & 1.00 & 1.00 & 0.79/1.06 & 24.05/49.76 \\
- & StableDiffusion & 1.13 & 1.11 & 1.46 & 1.04 & 1.09 & 0.48/1.83 & 29.78/124.25 \\
- & ResNet-50 & 1.02 & 1.04 & 1.02 & 1.07 & 1.23 & 0.54/5.09 & 13.26/58.25 \\
- & Whisper-tiny & 1.03 & 1.03 & 1.02 & 1.00 & 1.00 & 0.45/2.25 & 7.09/30.18 \\
-H100 & SmolLM2-135M & 1.39 & 2.74 & 2.24 & 1.36 & 1.00 & 1.22/1.61 & 55.73/259.38 \\
- & SmolVLA & 1.35 & 1.68 & 3.06 & 1.10 & 1.27 & 0.99/1.52 & 33.97/163.44 \\
- & StableDiffusion & 1.49 & 1.54 & 3.55 & 1.08 & 1.08 & 0.69/2.81 & 29.69/592.06 \\
- & ResNet-50 & 1.18 & 1.24 & 1.21 & 1.20 & 1.28 & 0.77/6.16 & 14.09/601.27 \\
- & Whisper-tiny & 1.17 & 1.24 & 1.48 & 1.06 & 0.91 & 0.67/2.64 & 7.84/192.13 \\
+RTX 5070 & 84 & 1707/1707 & 0 & 2195 & 60 \\
+H100 & 84 & 1707/1707 & 0 & 2438 & 60 \\
+RTX 3050 (Windows) & 84 & 1707/1707 & 0 & 1728 & 60 \\
+RX 7900 XT & 84 & 1707/1707 & 0 & 2132 & 60 \\
+Radeon 780M & 84 & 1533/1707 & 6 & 876 & 30 \\
+Arc B570 & 84 & 1747/1842 & 6 & 1659 & 30 \\
+Apple M3 & 84 & 1594/1698 & 6 & 1143 & 30 \\
+Intel RPL-U (CPU ref.) & 84 & 1452/1842 & 6 & 1127 & 0 \\
+H100 extension & 36 & 168/168 & 0 & 119 & 0 \\
 \bottomrule
 \end{tabular}
