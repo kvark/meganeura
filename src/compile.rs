@@ -2940,17 +2940,17 @@ impl<'a> Compiler<'a> {
                 let a = self.get_buffer(node.inputs[0]);
                 let b = self.get_buffer(node.inputs[1]);
                 // Block-quantized weights pack along the parameter's first
-                // dimension, which is N for a transposed B. Every packed
-                // decoder indexes along K instead, so there is no correct
-                // reading of a K-quant on this op. Refuse at compile time
-                // rather than emit a kernel that returns plausible numbers.
+                // dimension, which is N for a transposed B, while every
+                // packed decoder indexes along K. There is no correct
+                // reading of a block format on this op, so refuse at
+                // compile time rather than emit a kernel that returns
+                // plausible numbers. f16 is unaffected: it is an
+                // elementwise cast at the same index, not a block layout.
                 assert!(
-                    !matches!(
-                        WeightFormat::from_dtype(self.graph.node(node.inputs[1]).ty.dtype),
-                        WeightFormat::Q4K | WeightFormat::Q6K
-                    ),
-                    "matmul_bt does not support K-quant weights: their blocks run \
-                     along the parameter's first dimension, which is N here, not K"
+                    !WeightFormat::from_dtype(self.graph.node(node.inputs[1]).ty.dtype)
+                        .is_quantized(),
+                    "matmul_bt does not support block-quantized weights: their blocks \
+                     run along the parameter's first dimension, which is N here, not K"
                 );
                 let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
@@ -2963,17 +2963,10 @@ impl<'a> Compiler<'a> {
                     // exact row broadcast. Preserve the MatMulBT graph node
                     // and its dependency order while avoiding tiled GEMM.
                     self.emit_broadcast_inner(a, out_buf, m, n);
-                } else if m == 1
-                    && k.is_multiple_of(4)
-                    && !matches!(wf, WeightFormat::Q4 | WeightFormat::Q4K | WeightFormat::Q6K)
-                {
-                    // Nibble-packed weights stay on the tiled path here. The
-                    // K-split GEMV-BT reads B as [N, K], while their block
-                    // layout runs along K per column of a [K, N] weight, so
-                    // it would need its own index mapping;
-                    // `generate_module_weighted` has no packed variant for
-                    // this group and would otherwise emit the f32 shader
-                    // over packed blocks.
+                } else if m == 1 && k.is_multiple_of(4) {
+                    // Only f32 and f16 reach here; the assert above turned
+                    // every block format away, so the K-split GEMV-BT never
+                    // sees packed data.
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::MatMulGemvBT,
                         workgroups: [n, 1, 1],

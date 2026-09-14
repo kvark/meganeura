@@ -10,8 +10,8 @@
   `examples/gguf_info.rs`.
 - Native GGML K-quant storage: `DType::Q4K` / `Graph::parameter_q4k` and
   `DType::Q6K` / `Graph::parameter_q6k`. Superblocks are stored byte-for-byte
-  as GGUF writes them, so loading is a copy and the tiled matmul and K-split
-  GEMV shaders decode them directly.
+  as GGUF writes them, so loading copies nothing and the tiled matmul and
+  K-split GEMV shaders decode them directly.
 
   Q4_K reads 10% less weight data than Meganeura Q4 (4.5 bits/weight against
   5.0), because it quantizes its own sub-block scales to 6 bits instead of
@@ -25,12 +25,22 @@
   alternate word alignment and the shader reads every field byte-addressed;
   buffers get a zero-padded tail while the superblocks stay verbatim.
 
-  These are the first load-only formats: a K-quant encoder searches for
-  per-sub-block scales rather than computing them, so they cannot be produced
-  from f32. `set_parameter` rejects such parameters and points at
-  `set_parameter_packed`; `generate_module_weighted` asserts rather than
-  falling through to an f32 shader for a group with no K-quant variant, and
-  `compile.rs` keeps them off `MatMulGemvBT` as it already does for Q4.
+  A GGUF file is read once and shared: tensors index ranges of one buffer
+  rather than owning copies, and `to_packed` borrows it for the K-quants,
+  so loading costs roughly the file rather than the file plus a copy of
+  every payload.
+
+  These are the first load-only formats: no K-quant encoder is implemented
+  here, so they only ever arrive already packed. `set_parameter` rejects
+  such parameters and points at `set_parameter_packed`, and
+  `generate_module_weighted` asserts rather than falling through to an f32
+  shader for a group with no K-quant variant.
+- `matmul_bt` now rejects block-quantized weights. Their blocks run along
+  the parameter's first dimension, which is N for a transposed B, while
+  every packed decoder indexes along K — so the kernels that served this
+  returned plausible but wrong numbers. Nothing in the tree produced one,
+  so the arms were dead as well as incorrect. f16 is unaffected, being an
+  elementwise cast rather than a block layout.
 - Autotuning searches shape-specialized scalar convolutions and K-stage sizes
   for forward and both gradients; unused candidates are released after search.
 - Store-side unary epilogues (Relu/Sigmoid/Silu/Neg) now fuse into F16/Q4/Q8

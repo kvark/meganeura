@@ -3586,11 +3586,7 @@ fn q4k_matmul_matches_ggml_reference() {
     for s in 0..(k / 256 * n) {
         data.extend_from_slice(&q4k_superblock(s as u32 + 1));
     }
-    let tensor = GgufTensor {
-        dims: vec![k, n],
-        ggml_type: GgmlType::Q4K,
-        data: data.clone(),
-    };
+    let tensor = GgufTensor::new(vec![k, n], GgmlType::Q4K, data.clone());
     // Reference weights in meganeura [K, N] order.
     let w_ref = tensor.to_f32().unwrap();
     let (dtype, packed) = tensor.to_packed().unwrap();
@@ -3647,11 +3643,7 @@ fn q4k_gemv_matches_ggml_reference() {
     for s in 0..(k / 256 * n) {
         data.extend_from_slice(&q4k_superblock(s as u32 + 41));
     }
-    let tensor = GgufTensor {
-        dims: vec![k, n],
-        ggml_type: GgmlType::Q4K,
-        data: data.clone(),
-    };
+    let tensor = GgufTensor::new(vec![k, n], GgmlType::Q4K, data.clone());
     let w_ref = tensor.to_f32().unwrap();
     let a: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
 
@@ -3726,11 +3718,7 @@ fn q6k_matmul_matches_ggml_reference() {
         data.extend_from_slice(&q6k_superblock(s as u32 + 7));
     }
     assert_eq!(data.len() % 4, 2, "expected a misaligned tail to exercise");
-    let tensor = GgufTensor {
-        dims: vec![k, n],
-        ggml_type: GgmlType::Q6K,
-        data: data.clone(),
-    };
+    let tensor = GgufTensor::new(vec![k, n], GgmlType::Q6K, data.clone());
     let w_ref = tensor.to_f32().unwrap();
     let (dtype, packed) = tensor.to_packed().unwrap();
     assert_eq!(dtype, meganeura::graph::DType::Q6K);
@@ -3794,11 +3782,7 @@ fn q6k_gemv_matches_ggml_reference() {
     for s in 0..(k / 256 * n) {
         data.extend_from_slice(&q6k_superblock(s as u32 + 91));
     }
-    let tensor = GgufTensor {
-        dims: vec![k, n],
-        ggml_type: GgmlType::Q6K,
-        data: data.clone(),
-    };
+    let tensor = GgufTensor::new(vec![k, n], GgmlType::Q6K, data.clone());
     let w_ref = tensor.to_f32().unwrap();
     let (_, packed) = tensor.to_packed().unwrap();
     let a: Vec<f32> = (0..k).map(|i| ((i % 17) as f32 - 8.0) * 0.04).collect();
@@ -3857,11 +3841,7 @@ fn q6k_preserves_subnormal_block_scales() {
     for _ in 0..n {
         data.extend_from_slice(&block);
     }
-    let tensor = GgufTensor {
-        dims: vec![k, n],
-        ggml_type: GgmlType::Q6K,
-        data,
-    };
+    let tensor = GgufTensor::new(vec![k, n], GgmlType::Q6K, data.clone());
     let w_ref = tensor.to_f32().unwrap();
     // 2^-16 * 127 * 31, an ordinary number.
     let want_elem = (2.0f32).powi(-16) * 127.0 * 31.0;
@@ -3907,13 +3887,27 @@ fn q6k_preserves_subnormal_block_scales() {
 /// K-quant on `matmul_bt` would read the wrong superblock and return
 /// plausible numbers. Refused at compile time instead.
 #[test]
-#[should_panic(expected = "matmul_bt does not support K-quant")]
+#[should_panic(expected = "does not support block-quantized")]
 fn k_quant_matmul_bt_is_refused() {
     let (m, k, n) = (1usize, 512usize, 256usize);
     let mut g = Graph::new();
     let x = g.input("x", &[m, k]);
     // B is [N, K] for a transposed multiply.
     let w = g.parameter_q4k("w", &[n, k]);
+    let out = g.matmul_bt(x, w);
+    g.set_outputs(vec![out]);
+    let _ = meganeura::build(&g, meganeura::SessionConfig::inference_from_env());
+}
+
+/// Q4 has the same defect, and nothing in the tree produced it — the arms
+/// that would have served it were dead and silently wrong.
+#[test]
+#[should_panic(expected = "does not support block-quantized")]
+fn q4_matmul_bt_is_refused() {
+    let (m, k, n) = (1usize, 64usize, 32usize);
+    let mut g = Graph::new();
+    let x = g.input("x", &[m, k]);
+    let w = g.parameter_q4("w", &[n, k]);
     let out = g.matmul_bt(x, w);
     g.set_outputs(vec![out]);
     let _ = meganeura::build(&g, meganeura::SessionConfig::inference_from_env());
