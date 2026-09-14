@@ -9,12 +9,12 @@ tuning, strict native-f32 cooperative tiles, CUDA/HIP/XPU replay, compiled
 MPS and bounded default PyTorch compilation are checked in executed records.
 [RESULTS.md](RESULTS.md) gives the audit and cross-cohort interpretation;
 [REVISION.md](REVISION.md) maps reviewer and author feedback to the revision.
-The September 13 packages are superseded; no further cohort is needed for
-the claims in this manuscript.
+The September 13 and first September 14 packages are superseded; no further
+cohort is needed for the claims in this manuscript.
 
 ## Files
 
-The local handoff directory is `~/Documents/P3HPC/camera-ready-20260914/`:
+The local handoff directory is `~/Documents/P3HPC/camera-ready-20260914-r2/`:
 
 - `meganeura-p3hpc-camera-ready.pdf`: manuscript for final author review.
 - `meganeura-p3hpc-sources.zip`: TeX, bibliography, templates, figure and
@@ -29,7 +29,16 @@ The local handoff directory is `~/Documents/P3HPC/camera-ready-20260914/`:
 These publication files remain outside Git. The paper PR contains source,
 small generated LaTeX fragments, archive identities and study documentation.
 The main benchmark and separate profiling studies keep their own revisions.
-No new collection tag or benchmark was created during this update.
+The annotated tag `paper-p3hpc-2026` identifies measured Meganeura commit
+`428fc2d2322229e5338f5d80a10d700340d593cd`, not the manuscript source.
+No new benchmark was run during either paper update.
+
+This author-review revision explains max-autotune's omission where the
+reference policy is introduced, adds a sourced discussion of Hopper WGMMA
+and the measured stack's subgroup-only matrix interface, and pins paper
+links to Meganeura/Inferena code and experiment reports. It also removes
+authorial em-dashes and repetitive rhetorical framing without changing data,
+validation or the AI-assistance disclosure.
 
 The supplied upload requirements prefer a PDF below 2 MB and reject files
 above 4 MB, with separate PDF, LaTeX source ZIP and supplementary ZIP fields.

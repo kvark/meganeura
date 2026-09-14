@@ -12,6 +12,9 @@ f6f2729e850cc0aefdc0bb18523da58a72765169, Python 3.13.13 and
 PyTorch 2.13.0 at cf30153c4c131c8164ee7798e5022d810682e2cb.
 Vendor wheels/libraries differ. Cargo.lock and shared checkpoint hashes agree
 after normalizing Windows separators.
+The annotated Meganeura tag
+[paper-p3hpc-2026](https://github.com/kvark/meganeura/tree/paper-p3hpc-2026)
+preserves the measured engine revision, separately from the manuscript branch.
 [cohort.sha256](artifact/cohort.sha256) identifies the original archives.
 
 | Configuration | Valid / selected pairs | Reference |
@@ -171,7 +174,7 @@ The RTX profiling study uses Meganeura 75dfe901 and two-second search,
 not the primary cohort's revision/policy. Its grouped GPU span localizes a
 convolution-gradient bottleneck, but its 5/71-class coverage is obsolete for
 the final NVIDIA runs. No new Nsight trace or removable-barrier fraction is
-claimed. [Diagnostic source and analysis](https://github.com/kvark/inferena/blob/experiment/nvidia-gap-2026-09-13/ANALYSIS-2026-09-13.md).
+claimed. [Diagnostic source and analysis](https://github.com/kvark/inferena/blob/3f8f994ce02aaf89ec5167d601403dc314b08e93/ANALYSIS-2026-09-13.md).
 
 The MI300X report remains separately identified (SHA-256
 e9be97e695140e8a36e09da0f0dd850113b0b22359182921dbc34b689d9776e8).
