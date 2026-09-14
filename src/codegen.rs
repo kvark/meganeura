@@ -547,7 +547,7 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::Conv2dGemm
         | ShaderGroup::Conv2dGemmSmall
         | ShaderGroup::Conv2dGradInputGemm
-        | ShaderGroup::Conv2dGradInputGemmSmall => generate_conv_module(group, 16, None),
+        | ShaderGroup::Conv2dGradInputGemmSmall => generate_conv_module(group, 16, None, None),
         ShaderGroup::Conv2dGemmCoop | ShaderGroup::Conv2dGradInputGemmCoop => {
             panic!(
                 "conv coop kernels are generated per (kernel, stride) via generate_conv2d_coop_module"
@@ -566,17 +566,11 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::WinogradWeightTransform => {
             parse_wgsl(include_str!("shaders/winograd_weight_transform.wgsl"))
         }
-        ShaderGroup::Conv2dGradWeightGemm => {
-            conv_grad_weight_tiled(MatMulTile::Large, false, 16, None)
-        }
-        ShaderGroup::Conv2dGradWeightGemmSmall => {
-            conv_grad_weight_tiled(MatMulTile::Small, false, 16, None)
-        }
-        ShaderGroup::Conv2dGradWeightGemmSplit => {
-            conv_grad_weight_tiled(MatMulTile::Large, true, 16, None)
-        }
+        ShaderGroup::Conv2dGradWeightGemm => conv_grad_weight_tiled([64, 64], false, 16, None),
+        ShaderGroup::Conv2dGradWeightGemmSmall => conv_grad_weight_tiled([32, 32], false, 16, None),
+        ShaderGroup::Conv2dGradWeightGemmSplit => conv_grad_weight_tiled([64, 64], true, 16, None),
         ShaderGroup::Conv2dGradWeightGemmSplitSmall => {
-            conv_grad_weight_tiled(MatMulTile::Small, true, 16, None)
+            conv_grad_weight_tiled([32, 32], true, 16, None)
         }
         ShaderGroup::CacheWrite => parse_wgsl(include_str!("shaders/cache_write.wgsl")),
         ShaderGroup::CacheWritePrefix => {
@@ -863,7 +857,13 @@ fn tiled_matmul_body(
     k_tile: u32,
     interleave_columns: bool,
 ) -> (String, String, String) {
-    tiled_gemm_body(tile.tm(), k_tile + 1, tile.bm() + 1, interleave_columns)
+    tiled_gemm_body(
+        tile.tm(),
+        tile.tm(),
+        k_tile + 1,
+        tile.bm() + 1,
+        interleave_columns,
+    )
 }
 
 fn matmul_k_stage() -> u32 {
@@ -875,10 +875,11 @@ fn matmul_k_stage() -> u32 {
     }
 }
 
-/// Generate an ordinary scalar convolution with a measured K-tile candidate.
+/// Generate a scalar convolution with measured output and K tiles.
 pub(crate) fn generate_conv_module(
     group: ShaderGroup,
     k_tile: u32,
+    output_tile: Option<[u32; 2]>,
     params: Option<&[u32]>,
 ) -> ShaderModule {
     let (source, tile) = match group {
@@ -895,28 +896,33 @@ pub(crate) fn generate_conv_module(
             MatMulTile::Small,
         ),
         ShaderGroup::Conv2dGradWeightGemm => {
-            return conv_grad_weight_tiled(MatMulTile::Large, false, k_tile, params);
+            return conv_grad_weight_tiled(output_tile.unwrap_or([64, 64]), false, k_tile, params);
         }
         ShaderGroup::Conv2dGradWeightGemmSmall => {
-            return conv_grad_weight_tiled(MatMulTile::Small, false, k_tile, params);
+            return conv_grad_weight_tiled(output_tile.unwrap_or([32, 32]), false, k_tile, params);
         }
         _ => panic!("not an ordinary scalar convolution: {group:?}"),
     };
-    conv_gemm_tiled(source, tile, k_tile, params)
+    conv_gemm_tiled(
+        source,
+        output_tile.unwrap_or([tile.bm(); 2]),
+        k_tile,
+        params,
+    )
 }
 
 /// All three implicit-GEMM conv skeletons stage A at stride K and B at
-/// stride BM, with BM·K/256 elements per thread.
+/// stride BN. Each thread stages BM·K/256 A and BN·K/256 B elements.
 fn conv_gemm_tiled(
     src: &str,
-    tile: MatMulTile,
+    [bm, bn]: [u32; 2],
     k_tile: u32,
     params: Option<&[u32]>,
 ) -> ShaderModule {
     assert!(matches!(k_tile, 16 | 32));
-    let bm = tile.bm();
-    let tm = tile.tm();
-    let (acc_decl, compute_body, acc_array) = tiled_gemm_body(tm, k_tile, bm, false);
+    assert!([bm, bn].iter().all(|&n| matches!(n, 16 | 32 | 64)));
+    let (tm, tn) = (bm / 16, bn / 16);
+    let (acc_decl, compute_body, acc_array) = tiled_gemm_body(tm, tn, k_tile, bn, false);
     let (declaration, divisor) = if let Some(values) = params {
         assert_eq!(values.len(), 16, "Conv2dParams layout");
         let arguments = values.iter().map(|v| format!("{v}u")).collect::<Vec<_>>();
@@ -937,10 +943,14 @@ fn conv_gemm_tiled(
             ("$PARAMS_TYPE", include_str!("shaders/conv2d_params.wgsl")),
             ("$PARAMS_DECL", &declaration),
             ("$BM_U", &format!("{bm}u")),
+            ("$BN_U", &format!("{bn}u")),
             ("$TM_U", &format!("{tm}u")),
+            ("$TN_U", &format!("{tn}u")),
             ("$KTILE_U", &format!("{k_tile}u")),
-            ("$STAGE_EPT_U", &format!("{}u", bm * k_tile / 256)),
-            ("$SHARED_SIZE", &(bm * k_tile).to_string()),
+            ("$STAGE_A_EPT_U", &format!("{}u", bm * k_tile / 256)),
+            ("$STAGE_B_EPT_U", &format!("{}u", bn * k_tile / 256)),
+            ("$SHARED_A_SIZE", &(bm * k_tile).to_string()),
+            ("$SHARED_B_SIZE", &(bn * k_tile).to_string()),
             ("$ACC_DECL", &acc_decl),
             ("$COMPUTE_BODY", &compute_body),
             ("$ACC_ARRAY", &acc_array),
@@ -950,7 +960,7 @@ fn conv_gemm_tiled(
 }
 
 fn conv_grad_weight_tiled(
-    tile: MatMulTile,
+    tile: [u32; 2],
     split_k: bool,
     k_tile: u32,
     params: Option<&[u32]>,
@@ -991,6 +1001,7 @@ fn conv_grad_weight_tiled(
 /// parameterized by register tile size and shared-memory strides.
 fn tiled_gemm_body(
     tm: u32,
+    tn: u32,
     a_stride: u32,
     b_stride: u32,
     interleave_columns: bool,
@@ -999,7 +1010,7 @@ fn tiled_gemm_body(
 
     let mut acc_decl = String::new();
     for i in 0..tm {
-        for j in 0..tm {
+        for j in 0..tn {
             let _ = write!(acc_decl, "var s{i}_{j} = 0.0; ");
         }
         acc_decl.push_str("\n    ");
@@ -1012,11 +1023,11 @@ fn tiled_gemm_body(
             "            let a{i} = shared_a[(ty * {tm}u + {i}u) * {a_stride}u + kk];"
         );
     }
-    for j in 0..tm {
+    for j in 0..tn {
         let column = if interleave_columns {
             format!("tx + {j}u * 16u")
         } else {
-            format!("tx * {tm}u + {j}u")
+            format!("tx * {tn}u + {j}u")
         };
         let _ = writeln!(
             body,
@@ -1025,16 +1036,16 @@ fn tiled_gemm_body(
     }
     for i in 0..tm {
         body.push_str("            ");
-        for j in 0..tm {
+        for j in 0..tn {
             let _ = write!(body, "s{i}_{j} += a{i} * b{j}; ");
         }
         body.push('\n');
     }
 
-    let mut acc_array = format!("array<array<f32, {tm}>, {tm}>(\n");
+    let mut acc_array = format!("array<array<f32, {tn}>, {tm}>(\n");
     for i in 0..tm {
-        let cols: Vec<String> = (0..tm).map(|j| format!("s{i}_{j}")).collect();
-        let _ = writeln!(acc_array, "        array<f32, {tm}>({}),", cols.join(", "));
+        let cols: Vec<String> = (0..tn).map(|j| format!("s{i}_{j}")).collect();
+        let _ = writeln!(acc_array, "        array<f32, {tn}>({}),", cols.join(", "));
     }
     acc_array.push_str("    )");
 
@@ -5456,11 +5467,11 @@ mod tests {
     #[test]
     fn ordinary_weight_gradients_have_no_split_partition_logic() {
         for tile in [MatMulTile::Small, MatMulTile::Large] {
-            let ordinary = conv_grad_weight_tiled(tile, false, 16, None);
+            let ordinary = conv_grad_weight_tiled([tile.bm(); 2], false, 16, None);
             assert!(!ordinary.source.contains("num_workgroups"));
             assert!(!ordinary.source.contains("k_end"));
             assert!(ordinary.source.contains("var t = 0u;"));
-            let split = conv_grad_weight_tiled(tile, true, 16, None);
+            let split = conv_grad_weight_tiled([tile.bm(); 2], true, 16, None);
             assert!(split.source.contains("num_workgroups"));
             assert!(split.source.contains("var t = first * 16u;"));
         }

@@ -93,6 +93,7 @@ fn tile_module(dispatch: &Dispatch, tile: MatmulTile) -> crate::codegen::ShaderM
         return crate::codegen::generate_conv_module(
             selected_entry.shader_group(),
             k_tile,
+            tile.conv_output_tile(),
             Some(bytemuck::cast_slice(std::slice::from_ref(&params))),
         );
     }
@@ -114,7 +115,12 @@ fn tile_module(dispatch: &Dispatch, tile: MatmulTile) -> crate::codegen::ShaderM
 fn tile_variant(dispatch: &Dispatch, tile: MatmulTile) -> Variant {
     let entry = &dispatch.shader;
     if let MatmulTile::SpecializedConv { k_tile, .. } = tile {
-        return Variant::SpecializedConv(tile.shader(entry), dispatch.params.clone(), k_tile);
+        return Variant::SpecializedConv(
+            tile.shader(entry),
+            dispatch.params.clone(),
+            k_tile,
+            tile.conv_output_tile().unwrap(),
+        );
     }
     if matches!(
         entry,
@@ -842,6 +848,7 @@ fn split_dispatches(
         .ok_or(TuneError("invalid split-K extents"))?;
     let mut dispatch = dispatch.clone();
     dispatch.conv_k_tile = None; // Split-K has its own unspecialized K=16 shader.
+    dispatch.conv_output_tile = None;
     dispatch.input_buffers = vec![BufferRef(0), BufferRef(1)];
     dispatch.output_buffer = BufferRef(2);
     plan.dispatches.push(dispatch);
@@ -1649,6 +1656,7 @@ mod tests {
         let alternative = if convolution {
             MatmulTile::SpecializedConv {
                 tile_size: 32,
+                tile_columns: Some(16),
                 k_tile: 16,
             }
         } else if class.initial == MatmulTile::Tile32 {
@@ -2039,11 +2047,28 @@ mod tests {
                 MatmulTile::CooperativeF32 { tile_size: 16 },
                 MatmulTile::SpecializedConv {
                     tile_size: 32,
+                    tile_columns: None,
                     k_tile: 16,
                 },
                 MatmulTile::SpecializedConv {
                     tile_size: 64,
+                    tile_columns: None,
                     k_tile: 32,
+                },
+                MatmulTile::SpecializedConv {
+                    tile_size: 16,
+                    tile_columns: None,
+                    k_tile: 16,
+                },
+                MatmulTile::SpecializedConv {
+                    tile_size: 16,
+                    tile_columns: Some(32),
+                    k_tile: 32,
+                },
+                MatmulTile::SpecializedConv {
+                    tile_size: 32,
+                    tile_columns: Some(16),
+                    k_tile: 16,
                 },
             ] {
                 let convolution = matches!(

@@ -1000,7 +1000,7 @@ fn epilogue_tile(dispatch: &Dispatch) -> crate::codegen::MatMulTile {
 /// arm rather than a map, a struct field, and four parallel match chains.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Variant {
-    SpecializedConv(ShaderEntry, Vec<u32>, u32),
+    SpecializedConv(ShaderEntry, Vec<u32>, u32, [u32; 2]),
     /// Schedule-template kernels, keyed by kernel content hash. These are
     /// generated from a DAG rather than a shader group, so no `ShaderEntry`
     /// identifies them.
@@ -1063,7 +1063,7 @@ impl Variant {
         match *self {
             Variant::Reduction(_) | Variant::Pointwise(_) => None,
             Variant::Attention(ref e, _)
-            | Variant::SpecializedConv(ref e, _, _)
+            | Variant::SpecializedConv(ref e, _, _, _)
             | Variant::Epilogue(ref e, _)
             | Variant::CoopEpilogue(ref e, _)
             | Variant::CoopPrologue(ref e, _)
@@ -1080,8 +1080,8 @@ impl Variant {
     /// Name used by the profiler and by pipeline-statistics dumps.
     fn label(&self) -> String {
         match *self {
-            Variant::SpecializedConv(ref e, ref params, k_tile) => {
-                format!("{e:?}:fixed-native-div-k{k_tile}-{params:?}")
+            Variant::SpecializedConv(ref e, ref params, k_tile, [rows, columns]) => {
+                format!("{e:?}:fixed-native-div-{rows}x{columns}-k{k_tile}-{params:?}")
             }
             Variant::Reduction(hash) => format!("generated-reduction:{hash:016x}"),
             Variant::Pointwise(hash) => format!("generated-pointwise:{hash:016x}"),
@@ -1695,6 +1695,10 @@ impl Pipelines {
                 entry.clone(),
                 dispatch.params.clone(),
                 k_tile,
+                crate::tune::MatmulTile::selected(dispatch, None)
+                    .unwrap()
+                    .conv_output_tile()
+                    .unwrap(),
             )];
         }
         if dispatch.horizontal_batch >= 2 {

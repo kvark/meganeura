@@ -914,6 +914,10 @@ pub struct Dispatch {
     /// Set by measured selection; None keeps the shared uniform-parameter kernel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conv_k_tile: Option<u32>,
+    /// Measured convolution output tile [rows, columns]. Absent for legacy
+    /// square tiles; only meaningful with `conv_k_tile`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conv_output_tile: Option<[u32; 2]>,
     /// The dispatch belongs to numerically sensitive derivative work and may
     /// not be promoted to a reduced-input-precision implementation. Native
     /// f32 cooperative kernels remain eligible.

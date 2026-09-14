@@ -3,7 +3,7 @@
 // grad_weight[Co, Ci*kH*kW] = grad_out_flat[Co, N*oH*oW] × im2col(input)[N*oH*oW, Ci*kH*kW]
 // C[Co, Ci*kH*kW] = A[Co, K] × B[K, Ci*kH*kW], K = batch*oH*oW.
 //
-// Register-tiled matmul, workgroup [16,16,1]. BM, TM and K are generated.
+// Register-tiled matmul, workgroup [16,16,1]. BM, BN, TM, TN and K are generated.
 // Dispatch: [ceil(Ci*kH*kW / 64), ceil(Co / 64), 1]
 
 $DIVISOR
@@ -14,15 +14,15 @@ var<storage> grad_out: array<f32>;           // [N, Co, oH, oW]
 var<storage> src: array<f32>;                // input [N, Ci, H, W]
 var<storage, read_write> dst: array<f32>;    // grad_kernel [Co, Ci, kH, kW]
 $PARAMS_DECL
-var<workgroup> shared_a: array<f32, $SHARED_SIZE>;   // A tile: [BM, K]
-var<workgroup> shared_b: array<f32, $SHARED_SIZE>;   // B tile: [K, BM]
+var<workgroup> shared_a: array<f32, $SHARED_A_SIZE>;   // A tile: [BM, K]
+var<workgroup> shared_b: array<f32, $SHARED_B_SIZE>;   // B tile: [K, BN]
 
 @compute @workgroup_size(16, 16)
 fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>$COUNTS) {
     let tx = lid.x;
     let ty = lid.y;
     let tile_row = wgid.y * $BM_U;   // M (Co) tile start
-    let tile_col = wgid.x * $BM_U;   // N (Ci*kH*kW) tile start
+    let tile_col = wgid.x * $BN_U;   // N (Ci*kH*kW) tile start
     let tid = ty * 16u + tx;
 
     let m_total = params.out_channels;                   // Co
@@ -41,7 +41,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
 
         // Load A tile: grad_out_flat[Co, N*oH*oW].
         // A[co, n*oH*oW + oh*oW + ow] = grad_out[n, co, oh, ow]
-        for (var e = 0u; e < $STAGE_EPT_U; e++) {
+        for (var e = 0u; e < $STAGE_A_EPT_U; e++) {
             let flat = tid + e * 256u;
             let row_local = flat / $KTILE_U;  // M dimension (Co)
             let col_local = flat % $KTILE_U;  // K dimension
@@ -60,10 +60,10 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         // Load B tile: im2col(input)[N*oH*oW, Ci*kH*kW].
         // B[k_idx, col] where k_idx = n*oH*oW + oh*oW + ow, col = ci*kH*kW + kh*kW + kw
         // B[k_idx, col] = input[n, ci, oh*stride+kh-padding, ow*stride+kw-padding]
-        for (var e = 0u; e < $STAGE_EPT_U; e++) {
+        for (var e = 0u; e < $STAGE_B_EPT_U; e++) {
             let flat = tid + e * 256u;
-            let row_local = flat / $BM_U;  // K dimension
-            let col_local = flat % $BM_U;  // N dimension (Ci*kH*kW)
+            let row_local = flat / $BN_U;  // K dimension
+            let col_local = flat % $BN_U;  // N dimension (Ci*kH*kW)
             let k_idx = t + row_local;
             let col_idx = tile_col + col_local;
 
@@ -86,7 +86,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
                     val = src[((n * params.in_channels + ci) * params.in_h + u32(ih)) * params.in_w + u32(iw)];
                 }
             }
-            shared_b[row_local * $BM_U + col_local] = val;
+            shared_b[row_local * $BN_U + col_local] = val;
         }
 
         workgroupBarrier();
@@ -104,9 +104,9 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     // Output layout: [Co, Ci, kH, kW] = [Co, Ci*kH*kW] row-major
     let s = $ACC_ARRAY;
     for (var i = 0u; i < $TM_U; i++) {
-        for (var j = 0u; j < $TM_U; j++) {
+        for (var j = 0u; j < $TN_U; j++) {
             let co = tile_row + ty * $TM_U + i;
-            let cikk = tile_col + tx * $TM_U + j;
+            let cikk = tile_col + tx * $TN_U + j;
             if co < m_total && cikk < n_total {
                 dst[$OUTPUT_OFFSET co * n_total + cikk] = s[i][j];
             }

@@ -3,7 +3,7 @@
 // Computes C[Co, oH*oW] = A[Co, K] × B[K, oH*oW] per batch item,
 // where K = Ci*kH*kW and B is the im2col matrix computed on-the-fly.
 //
-// Register-tiled matmul, workgroup [16,16,1]. BM, TM and K are generated.
+// Register-tiled matmul, workgroup [16,16,1]. BM, BN, TM, TN and K are generated.
 //
 // Dispatch: [ceil(oH*oW / 64), ceil(Co / 64), batch]
 
@@ -15,8 +15,8 @@ var<storage> src: array<f32>;              // input [N, Ci, H, W]
 var<storage> weight: array<f32>;           // kernel [Co, Ci, kH, kW] = [Co, K]
 var<storage, read_write> dst: array<f32>;  // output [N, Co, oH, oW]
 $PARAMS_DECL
-var<workgroup> shared_a: array<f32, $SHARED_SIZE>; // A tile: [BM, K]
-var<workgroup> shared_b: array<f32, $SHARED_SIZE>; // B tile: [K, BM]
+var<workgroup> shared_a: array<f32, $SHARED_A_SIZE>; // A tile: [BM, K]
+var<workgroup> shared_b: array<f32, $SHARED_B_SIZE>; // B tile: [K, BN]
 
 @compute @workgroup_size(16, 16)
 fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
@@ -24,7 +24,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let ty = lid.y;
     let n = wgid.z;           // batch index
     let tile_row = wgid.y * $BM_U;  // M (Co) tile start
-    let tile_col = wgid.x * $BM_U;  // N (oH*oW) tile start
+    let tile_col = wgid.x * $BN_U;  // N (oH*oW) tile start
     let tid = ty * 16u + tx;
 
     let k_total = params.in_channels * params.kernel_h * params.kernel_w;
@@ -40,7 +40,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         if t >= k_total { break; }
 
         // Load A tile: weight[Co, K].
-        for (var e = 0u; e < $STAGE_EPT_U; e++) {
+        for (var e = 0u; e < $STAGE_A_EPT_U; e++) {
             let flat = tid + e * 256u;
             let row_local = flat / $KTILE_U;  // M dimension (Co)
             let col_local = flat % $KTILE_U;  // K dimension
@@ -52,10 +52,10 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
 
         // Load B tile: im2col(input)^T [K, oH*oW].
         // B[k, hw] = input[n, ci, oh*stride+kh-pad, ow*stride+kw-pad]
-        for (var e = 0u; e < $STAGE_EPT_U; e++) {
+        for (var e = 0u; e < $STAGE_B_EPT_U; e++) {
             let flat = tid + e * 256u;
-            let row_local = flat / $BM_U;  // K dimension
-            let col_local = flat % $BM_U;  // N dimension (oH*oW)
+            let row_local = flat / $BN_U;  // K dimension
+            let col_local = flat % $BN_U;  // N dimension (oH*oW)
             let k_idx = t + row_local;
             let hw_idx = tile_col + col_local;
 
@@ -76,7 +76,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
                     val = src[n * input_stride + ci * params.in_h * params.in_w + u32(ih) * params.in_w + u32(iw)];
                 }
             }
-            shared_b[row_local * $BM_U + col_local] = val;
+            shared_b[row_local * $BN_U + col_local] = val;
         }
 
         workgroupBarrier();
@@ -94,9 +94,9 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let output_stride = m_total * n_total;  // Co * oH * oW per batch
     let s = $ACC_ARRAY;
     for (var i = 0u; i < $TM_U; i++) {
-        for (var j = 0u; j < $TM_U; j++) {
+        for (var j = 0u; j < $TN_U; j++) {
             let co = tile_row + ty * $TM_U + i;
-            let hw = tile_col + tx * $TM_U + j;
+            let hw = tile_col + tx * $TN_U + j;
             if co < m_total && hw < n_total {
                 dst[n * output_stride + co * n_total + hw] = s[i][j];
             }
