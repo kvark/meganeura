@@ -17,11 +17,14 @@ pub enum WeightFormat {
     /// GGML Q4_K: 256-element superblocks with 6-bit sub-block scales.
     /// Load-only; see [`crate::graph::DType::Q4K`].
     Q4K,
+    /// GGML Q6_K: 256-element superblocks with signed 8-bit sub-block
+    /// scales. Load-only; see [`crate::graph::DType::Q6K`].
+    Q6K,
 }
 
 impl WeightFormat {
     pub fn is_quantized(self) -> bool {
-        matches!(self, Self::Q4 | Self::Q8 | Self::Q4K)
+        matches!(self, Self::Q4 | Self::Q8 | Self::Q4K | Self::Q6K)
     }
 
     /// Whether the host can produce this format from f32.
@@ -29,7 +32,7 @@ impl WeightFormat {
     /// False for Q4_K: its encoder searches for per-sub-block scales, so
     /// these weights only ever arrive already packed, from a GGUF file.
     pub fn is_host_quantizable(self) -> bool {
-        !matches!(self, Self::Q4K)
+        !matches!(self, Self::Q4K | Self::Q6K)
     }
 
     /// Uses a B-buffer representation other than ordinary IEEE f32.
@@ -47,6 +50,7 @@ impl WeightFormat {
             DType::Q4_0 => Self::Q4,
             DType::Q8_0 => Self::Q8,
             DType::Q4K => Self::Q4K,
+            DType::Q6K => Self::Q6K,
             _ => Self::F32,
         }
     }
@@ -2956,7 +2960,7 @@ impl<'a> Compiler<'a> {
                     self.emit_broadcast_inner(a, out_buf, m, n);
                 } else if m == 1
                     && k.is_multiple_of(4)
-                    && !matches!(wf, WeightFormat::Q4 | WeightFormat::Q4K)
+                    && !matches!(wf, WeightFormat::Q4 | WeightFormat::Q4K | WeightFormat::Q6K)
                 {
                     // Nibble-packed weights stay on the tiled path here. The
                     // K-split GEMV-BT reads B as [N, K], while their block

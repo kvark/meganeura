@@ -3685,6 +3685,167 @@ fn q4k_gemv_matches_ggml_reference() {
     );
 }
 
+/// One Q6_K superblock with signed scales spanning both polarities and
+/// quants across the full 6-bit range.
+fn q6k_superblock(seed: u32) -> Vec<u8> {
+    let mut st = seed | 1;
+    let mut rnd = || {
+        st = st.wrapping_mul(747796405).wrapping_add(2891336453);
+        let w = ((st >> ((st >> 28) + 4)) ^ st).wrapping_mul(277803737);
+        (w >> 22) ^ w
+    };
+    let mut b = vec![0u8; 210];
+    // ql and qh: full range.
+    for byte in b[..192].iter_mut() {
+        *byte = (rnd() % 256) as u8;
+    }
+    // int8 scales, deliberately straddling zero.
+    for byte in b[192..208].iter_mut() {
+        *byte = ((rnd() % 80) as i32 - 40) as i8 as u8;
+    }
+    b[208..210].copy_from_slice(&half::f16::from_f32(0.0012).to_bits().to_le_bytes());
+    b
+}
+
+/// The Q6_K shader against the loader's CPU reference, which is checked
+/// line-by-line against `dequantize_row_q6_K`.
+///
+/// Superblocks are 210 bytes, so they alternate word alignment and every
+/// field is read byte-addressed. An odd superblock count also exercises the
+/// tail padding, since the buffer would otherwise end two bytes short of a
+/// word.
+#[test]
+fn q6k_matmul_matches_ggml_reference() {
+    use meganeura::load::gguf::{GgmlType, GgufTensor};
+
+    // N = 3 gives an odd superblock count, so half of them start at byte 2
+    // of a word and the buffer needs padding.
+    let (m, k, n) = (2usize, 256usize, 3usize);
+    let mut data = Vec::new();
+    for s in 0..(k / 256 * n) {
+        data.extend_from_slice(&q6k_superblock(s as u32 + 7));
+    }
+    assert_eq!(data.len() % 4, 2, "expected a misaligned tail to exercise");
+    let tensor = GgufTensor {
+        dims: vec![k, n],
+        ggml_type: GgmlType::Q6K,
+        data: data.clone(),
+    };
+    let w_ref = tensor.to_f32().unwrap();
+    let (dtype, packed) = tensor.to_packed().unwrap();
+    assert_eq!(dtype, meganeura::graph::DType::Q6K);
+    assert_eq!(
+        packed.len() % 4,
+        0,
+        "buffer must be a whole number of words"
+    );
+    assert_eq!(
+        &packed[..data.len()],
+        &data[..],
+        "superblocks must be verbatim"
+    );
+
+    let a: Vec<f32> = (0..m * k)
+        .map(|i| ((i % 31) as f32 - 15.0) * 0.02)
+        .collect();
+
+    let mut g = Graph::new();
+    let x = g.input("x", &[m, k]);
+    let w = g.parameter_q6k("w", &[k, n]);
+    let out = g.matmul(x, w);
+    g.set_outputs(vec![out]);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    session.set_input("x", &a);
+    session.set_parameter_packed("w", &packed);
+    session.step();
+    session.wait();
+    let gpu = session.read_output(m * n);
+
+    let mut max_err = 0.0f32;
+    let mut scale = 0.0f32;
+    for row in 0..m {
+        for col in 0..n {
+            let mut want = 0.0f32;
+            for i in 0..k {
+                want += a[row * k + i] * w_ref[i * n + col];
+            }
+            scale = scale.max(want.abs());
+            max_err = max_err.max((gpu[row * n + col] - want).abs());
+        }
+    }
+    assert!(
+        gpu.iter().all(|v| v.is_finite()),
+        "Q6_K matmul produced non-finite values"
+    );
+    assert!(
+        max_err / scale.max(1e-6) < 1e-5,
+        "Q6_K matmul diverged from the GGML reference: \
+         max_abs_err={max_err} (scale {scale})"
+    );
+}
+
+/// The K-split GEMV takes a different shader, and it is what decode runs.
+#[test]
+fn q6k_gemv_matches_ggml_reference() {
+    use meganeura::load::gguf::{GgmlType, GgufTensor};
+
+    let (k, n) = (256usize, 4usize);
+    let mut data = Vec::new();
+    for s in 0..(k / 256 * n) {
+        data.extend_from_slice(&q6k_superblock(s as u32 + 91));
+    }
+    let tensor = GgufTensor {
+        dims: vec![k, n],
+        ggml_type: GgmlType::Q6K,
+        data: data.clone(),
+    };
+    let w_ref = tensor.to_f32().unwrap();
+    let (_, packed) = tensor.to_packed().unwrap();
+    let a: Vec<f32> = (0..k).map(|i| ((i % 17) as f32 - 8.0) * 0.04).collect();
+
+    let mut g = Graph::new();
+    let x = g.input("x", &[1, k]);
+    let w = g.parameter_q6k("w", &[k, n]);
+    let out = g.matmul(x, w);
+    g.set_outputs(vec![out]);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    session.set_input("x", &a);
+    session.set_parameter_packed("w", &packed);
+    session.step();
+    session.wait();
+    let gpu = session.read_output(n);
+
+    let mut max_err = 0.0f32;
+    let mut scale = 0.0f32;
+    for col in 0..n {
+        let mut want = 0.0f32;
+        for i in 0..k {
+            want += a[i] * w_ref[i * n + col];
+        }
+        scale = scale.max(want.abs());
+        max_err = max_err.max((gpu[col] - want).abs());
+    }
+    assert!(
+        max_err / scale.max(1e-6) < 1e-5,
+        "Q6_K GEMV diverged from the GGML reference: \
+         max_abs_err={max_err} (scale {scale})"
+    );
+}
+
+/// Q6_K is load-only for the same reason Q4_K is.
+#[test]
+#[should_panic(expected = "set_parameter_packed")]
+fn q6k_rejects_f32_parameter_upload() {
+    let (k, n) = (256usize, 4usize);
+    let mut g = Graph::new();
+    let x = g.input("x", &[1, k]);
+    let w = g.parameter_q6k("w", &[k, n]);
+    let out = g.matmul(x, w);
+    g.set_outputs(vec![out]);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    session.set_parameter("w", &vec![0.1f32; k * n]);
+}
+
 /// Q4_K cannot be produced from f32 — its encoder searches for per-sub-block
 /// scales rather than computing them. Quantizing on the fly would silently
 /// hand back worse weights than the file the caller already has, so the

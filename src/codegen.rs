@@ -1161,6 +1161,12 @@ fn matmul_vars_tiled(
             "dequant_q4k(b_row, b_col)".to_string(),
             Q4K_DEQUANT_FN.to_string(),
         ),
+        WeightFormat::Q6K => (
+            "",
+            "array<u32>",
+            "dequant_q6k(b_row, b_col)".to_string(),
+            Q6K_DEQUANT_FN.to_string(),
+        ),
     };
     // Nibble-packed large tile: 32×64 B tile, 256 threads → each thread owns
     // 8 consecutive K of one column, which share a block header and, for Q4,
@@ -1168,6 +1174,7 @@ fn matmul_vars_tiled(
     let pack8 = match b_mode {
         WeightFormat::Q4 if tile == MatMulTile::Large => Some("dequant_q4_pack8"),
         WeightFormat::Q4K if tile == MatMulTile::Large => Some("dequant_q4k_pack8"),
+        WeightFormat::Q6K if tile == MatMulTile::Large => Some("dequant_q6k_pack8"),
         _ => None,
     };
     let b_stage_body = if let Some(pack8) = pack8 {
@@ -1375,6 +1382,83 @@ fn dequant_q4k_pack8(k_base: u32, n_idx: u32) -> array<f32, 8> {
         let byte = (w >> ((i % 4u) * 8u)) & 0xFFu;
         let q = select(byte >> 4u, byte & 0xFu, low);
         out[i] = scale * f32(q) - offset;
+    }
+    return out;
+}
+";
+
+/// GGML Q6_K dequantization, reading GGUF's bytes verbatim.
+///
+/// A 256-element superblock is 210 bytes: 128 low-nibble bytes `ql`, 64
+/// bytes of high bit-pairs `qh`, sixteen signed 8-bit sub-block scales, and
+/// an f16 `d`. Each 6-bit quant is `(ql nibble) | (qh bit-pair << 4)`,
+/// biased by 32, and one scale covers 16 elements.
+///
+/// 210 is not a multiple of 4, so a superblock starts at byte 0 or 2 of a
+/// word depending on its index, and every field is read byte-addressed.
+/// The f16 `d` at offset 208 lands on 0 or 2 either way, so it never spans
+/// two words.
+///
+/// The element mapping mirrors `dequantize_row_q6_K`: each 128-element half
+/// is walked in 32-element strides `j`, drawing the low nibble of
+/// `ql[l + (j & 1) * 32]` for `j < 2` and the high nibble for `j >= 2`, with
+/// the bit-pair at `qh[l] >> (j * 2)` and the scale at `j * 2 + l / 16`.
+const Q6K_DEQUANT_FN: &str = "
+fn q6k_decode_f16(bits: u32) -> f32 {
+    let sign = (bits >> 15u) & 1u;
+    let expo = (bits >> 10u) & 0x1Fu;
+    let mant = bits & 0x3FFu;
+    var f32_bits = (sign << 31u) | ((expo + 112u) << 23u) | (mant << 13u);
+    if expo == 0u { f32_bits = sign << 31u; }
+    return bitcast<f32>(f32_bits);
+}
+
+// Byte `off` of the superblock starting at absolute byte `byte_base`.
+fn q6k_byte(byte_base: u32, off: u32) -> u32 {
+    let at = byte_base + off;
+    return (matrix_b[at / 4u] >> ((at % 4u) * 8u)) & 0xFFu;
+}
+
+// scales[] is int8_t, and these do go negative.
+fn q6k_scale(byte_base: u32, i: u32) -> f32 {
+    let raw = q6k_byte(byte_base, 192u + i);
+    return f32(i32(raw) - select(0, 256, raw >= 128u));
+}
+
+fn q6k_d(byte_base: u32) -> f32 {
+    let lo = q6k_byte(byte_base, 208u);
+    let hi = q6k_byte(byte_base, 209u);
+    return q6k_decode_f16(lo | (hi << 8u));
+}
+
+fn q6k_value(byte_base: u32, e: u32, d: f32) -> f32 {
+    let half = e / 128u;
+    let within = e % 128u;
+    let j = within / 32u;
+    let l = within % 32u;
+    let ql = q6k_byte(byte_base, half * 64u + l + (j & 1u) * 32u);
+    let lo = select(ql >> 4u, ql & 0xFu, j < 2u);
+    let qh = q6k_byte(byte_base, 128u + half * 32u + l);
+    let hi = (qh >> (j * 2u)) & 3u;
+    let q = i32(lo | (hi << 4u)) - 32;
+    return d * q6k_scale(byte_base, half * 8u + j * 2u + l / 16u) * f32(q);
+}
+
+fn dequant_q6k(k_idx: u32, n_idx: u32) -> f32 {
+    let byte_base = (n_idx * (params.k / 256u) + k_idx / 256u) * 210u;
+    return q6k_value(byte_base, k_idx % 256u, q6k_d(byte_base));
+}
+
+fn dequant_q6k_pack8(k_base: u32, n_idx: u32) -> array<f32, 8> {
+    // Eight 8-aligned elements share a superblock, a 32-element stride and
+    // a 16-element scale group, so the f16 decode and the scale fetch are
+    // done once. The payload bytes stay individual: ql and qh are read from
+    // two separate regions at arbitrary word alignment.
+    let byte_base = (n_idx * (params.k / 256u) + k_base / 256u) * 210u;
+    let d = q6k_d(byte_base);
+    var out: array<f32, 8>;
+    for (var i = 0u; i < 8u; i++) {
+        out[i] = q6k_value(byte_base, (k_base % 256u) + i, d);
     }
     return out;
 }
@@ -1765,6 +1849,16 @@ pub fn generate_module_weighted(group: ShaderGroup, format: WeightFormat) -> Sha
             Q4K_DEQUANT_FN,
             "dequant_q4k",
         ),
+        ShaderGroup::MatMulGemv if mode == WeightFormat::Q6K => gen_matmul_gemv_packed(
+            include_str!("shaders/matmul_gemv.wgsl"),
+            Q6K_DEQUANT_FN,
+            "dequant_q6k",
+        ),
+        ShaderGroup::MatMulGemvAdd if mode == WeightFormat::Q6K => gen_matmul_gemv_packed(
+            include_str!("shaders/matmul_gemv_add.wgsl"),
+            Q6K_DEQUANT_FN,
+            "dequant_q6k",
+        ),
         ShaderGroup::MatMulGemv | ShaderGroup::MatMulGemvBT if mode == WeightFormat::F16 => {
             if group == ShaderGroup::MatMulGemv {
                 gen_matmul_gemv_f16()
@@ -1780,9 +1874,9 @@ pub fn generate_module_weighted(group: ShaderGroup, format: WeightFormat) -> Sha
         // asserts rather than trusting the routing: falling through here
         // would read 144-byte superblocks as f32 and produce plausible
         // garbage rather than an error.
-        _ if mode == WeightFormat::Q4K => panic!(
-            "no Q4_K variant for {group:?}; it is supported on the tiled \
-             matmul groups and the K-split GEMV only"
+        _ if matches!(mode, WeightFormat::Q4K | WeightFormat::Q6K) => panic!(
+            "no {mode:?} variant for {group:?}; the K-quants are supported on \
+             the tiled matmul groups and the K-split GEMV only"
         ),
         _ => generate_module(group),
     }
@@ -6578,6 +6672,45 @@ mod tests {
     /// Q4_K is read out of a GGUF file unmodified, so the shader must
     /// declare B as words and decode superblocks rather than load floats.
     #[test]
+    fn q6k_shaders_read_packed_superblocks() {
+        for group in [
+            ShaderGroup::MatMul,
+            ShaderGroup::MatMulAdd,
+            ShaderGroup::MatMulAT,
+            ShaderGroup::MatMulBT,
+        ] {
+            let sm = generate_module_weighted(group, WeightFormat::Q6K);
+            assert!(
+                sm.source.contains("dequant_q6k"),
+                "Q6_K {group:?}: missing the superblock decoder"
+            );
+            assert!(
+                sm.source.contains("array<u32>") && !sm.source.contains("matrix_b: array<f32>"),
+                "Q6_K {group:?}: B must be words, not floats"
+            );
+            // 210-byte superblocks, read byte-addressed.
+            assert!(
+                sm.source.contains("210u"),
+                "Q6_K {group:?}: missing the 210-byte superblock stride"
+            );
+            assert!(
+                sm.source.contains("select(0, 256, raw >= 128u)"),
+                "Q6_K {group:?}: sub-block scales are signed and must sign-extend"
+            );
+        }
+        let tiled = generate_module_weighted(ShaderGroup::MatMul, WeightFormat::Q6K);
+        assert!(
+            tiled.source.contains("dequant_q6k_pack8"),
+            "Q6_K tiled MatMul must use batched staging"
+        );
+        let gemv = generate_module_weighted(ShaderGroup::MatMulGemv, WeightFormat::Q6K);
+        assert!(
+            gemv.source.contains("dequant_q6k") && gemv.source.contains("array<u32>"),
+            "Q6_K GEMV must decode superblocks"
+        );
+    }
+
+    #[test]
     fn q4k_shaders_read_packed_superblocks() {
         for group in [
             ShaderGroup::MatMul,
@@ -6618,9 +6751,15 @@ mod tests {
     /// Falling through to the f32 module for a Q4_K dispatch would read
     /// 144-byte superblocks as floats and produce plausible garbage.
     #[test]
-    #[should_panic(expected = "no Q4_K variant")]
+    #[should_panic(expected = "no Q4K variant")]
     fn q4k_refuses_groups_without_a_variant() {
         let _ = generate_module_weighted(ShaderGroup::MatMulGemvBT, WeightFormat::Q4K);
+    }
+
+    #[test]
+    #[should_panic(expected = "no Q6K variant")]
+    fn q6k_refuses_groups_without_a_variant() {
+        let _ = generate_module_weighted(ShaderGroup::MatMulGemvBT, WeightFormat::Q6K);
     }
 
     /// The epilogue skeleton has to be specialized for the tile the

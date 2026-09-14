@@ -30,6 +30,23 @@ pub enum DType {
     /// [`crate::Session::set_parameter_packed`] from a GGUF file;
     /// `set_parameter` rejects them.
     Q4K,
+    /// GGML's Q6_K, stored byte-for-byte as it appears in a GGUF file:
+    /// 256-element superblocks of 210 bytes, holding 128 low-nibble bytes,
+    /// 64 bytes of high bit-pairs, sixteen *signed* 8-bit sub-block scales,
+    /// and an f16 superblock scale.
+    ///
+    /// Value is `d * scales[i] * (q - 32)` for a 6-bit `q` assembled from
+    /// `ql` and `qh`, with one scale per 16 elements. At 6.56 bits/weight
+    /// this is the high-precision end of the K-quants, and it replaces what
+    /// would otherwise be 9.0 bits/weight in [`DType::Q8_0`].
+    ///
+    /// 210 is not a multiple of 4, so superblocks alternate between word
+    /// alignments and the shader reads them byte-addressed. Buffers are
+    /// padded to a word boundary; the superblock bytes themselves are
+    /// untouched.
+    ///
+    /// Load-only, for the same reason as [`DType::Q4K`].
+    Q6K,
 }
 
 impl DType {
@@ -39,7 +56,7 @@ impl DType {
             DType::F32 => 4,
             DType::F16 => 2,
             DType::U32 => 4,
-            DType::Q4_0 | DType::Q8_0 | DType::Q4K => {
+            DType::Q4_0 | DType::Q8_0 | DType::Q4K | DType::Q6K => {
                 panic!("quantized types use block-level sizing")
             }
         }
@@ -50,7 +67,7 @@ impl DType {
     /// False for the K-quants, whose encoders search for per-sub-block
     /// scales rather than computing them.
     pub fn is_host_quantizable(self) -> bool {
-        !matches!(self, DType::Q4K)
+        !matches!(self, DType::Q4K | DType::Q6K)
     }
 }
 
@@ -96,6 +113,14 @@ impl TensorType {
                 // + 3 u32s (packed 6-bit scales) + 32 u32s (nibbles) = 36 u32s.
                 let blocks = self.num_elements().div_ceil(256);
                 blocks * 36 * 4
+            }
+            DType::Q6K => {
+                // 256-element superblocks, 210 bytes each. That is not a
+                // whole number of words, so the buffer is rounded up to one
+                // for the `array<u32>` binding; the superblocks keep GGML's
+                // exact bytes and the shader reads them byte-addressed.
+                let blocks = self.num_elements().div_ceil(256);
+                (blocks * 210).next_multiple_of(4)
             }
             _ => self.num_elements() * self.dtype.size_bytes(),
         }
@@ -1072,6 +1097,27 @@ impl Graph {
             "Q4_K needs the reduction extent to be a multiple of 256, got {shape:?}"
         );
         let ty = TensorType::new(shape.to_vec(), DType::Q4K);
+        self.add_node(
+            Op::Parameter {
+                name: name.to_string(),
+            },
+            vec![],
+            ty,
+        )
+    }
+
+    /// Create a parameter stored as GGML Q6_K (6.56 bits/element).
+    ///
+    /// The reduction extent — `shape[0]` — must be a multiple of 256, the
+    /// superblock size. Load-only, like [`Graph::parameter_q4k`]: fill it
+    /// with [`crate::Session::set_parameter_packed`] from
+    /// [`crate::load::gguf`]. See [`DType::Q6K`].
+    pub fn parameter_q6k(&mut self, name: &str, shape: &[usize]) -> NodeId {
+        assert!(
+            shape.first().is_some_and(|k| k.is_multiple_of(256)),
+            "Q6_K needs the reduction extent to be a multiple of 256, got {shape:?}"
+        );
+        let ty = TensorType::new(shape.to_vec(), DType::Q6K);
         self.add_node(
             Op::Parameter {
                 name: name.to_string(),
