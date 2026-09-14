@@ -4,7 +4,7 @@
 // C[Co, Ci*kH*kW] = A[Co, K] × B[K, Ci*kH*kW], K = batch*oH*oW.
 //
 // Register-tiled matmul, workgroup [16,16,1]. BM, BN, TM, TN and K are generated.
-// Dispatch: [ceil(Ci*kH*kW / 64), ceil(Co / 64), 1]
+// Dispatch: [ceil(Ci*kH*kW / BN), ceil(Co / BM), 1]
 
 $DIVISOR
 

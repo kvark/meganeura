@@ -8,7 +8,7 @@
 // C[Ci, H*W] = A[Ci, K] × B[K, H*W], K = Co*kH*kW, per batch item.
 // Register-tiled matmul, workgroup [16,16,1]. BM, BN, TM, TN and K are generated.
 //
-// Dispatch: [ceil(H*W / 64), ceil(Ci / 64), batch]
+// Dispatch: [ceil(H*W / BN), ceil(Ci / BM), batch]
 
 $DIVISOR
 

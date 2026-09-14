@@ -5,7 +5,7 @@
 //
 // Register-tiled matmul, workgroup [16,16,1]. BM, BN, TM, TN and K are generated.
 //
-// Dispatch: [ceil(oH*oW / 64), ceil(Co / 64), batch]
+// Dispatch: [ceil(oH*oW / BN), ceil(Co / BM), batch]
 
 $DIVISOR
 
