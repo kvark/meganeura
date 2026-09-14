@@ -65,8 +65,10 @@ fn main() {
     let mut unsupported = 0usize;
     for (name, t) in model.tensors.iter().collect::<BTreeMap<_, _>>() {
         total_bytes += t.data.len();
-        let stored = match t.to_packed() {
-            Ok((dtype, _)) => format!("{dtype:?}"),
+        // Metadata only - converting a tensor just to print its
+        // destination would allocate the whole payload.
+        let stored = match t.packed_dtype() {
+            Ok(dtype) => format!("{dtype:?}"),
             // Not a packed format; it uploads as plain f32.
             Err(GgufError::UnsupportedPack(_)) => "f32".to_string(),
             Err(GgufError::UnsupportedType(tag)) => {

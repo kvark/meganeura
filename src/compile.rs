@@ -27,14 +27,6 @@ impl WeightFormat {
         matches!(self, Self::Q4 | Self::Q8 | Self::Q4K | Self::Q6K)
     }
 
-    /// Whether the host can produce this format from f32.
-    ///
-    /// False for Q4_K: its encoder searches for per-sub-block scales, so
-    /// these weights only ever arrive already packed, from a GGUF file.
-    pub fn is_host_quantizable(self) -> bool {
-        !matches!(self, Self::Q4K | Self::Q6K)
-    }
-
     /// Uses a B-buffer representation other than ordinary IEEE f32.
     ///
     /// This deliberately includes f16 as well as block-quantized formats;
@@ -2947,6 +2939,19 @@ impl<'a> Compiler<'a> {
                 // C = A @ B^T  (A is [M, K], B is [N, K], C is [M, N])
                 let a = self.get_buffer(node.inputs[0]);
                 let b = self.get_buffer(node.inputs[1]);
+                // Block-quantized weights pack along the parameter's first
+                // dimension, which is N for a transposed B. Every packed
+                // decoder indexes along K instead, so there is no correct
+                // reading of a K-quant on this op. Refuse at compile time
+                // rather than emit a kernel that returns plausible numbers.
+                assert!(
+                    !matches!(
+                        WeightFormat::from_dtype(self.graph.node(node.inputs[1]).ty.dtype),
+                        WeightFormat::Q4K | WeightFormat::Q6K
+                    ),
+                    "matmul_bt does not support K-quant weights: their blocks run \
+                     along the parameter's first dimension, which is N here, not K"
+                );
                 let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
                 let wf = WeightFormat::from_dtype(self.graph.node(node.inputs[1]).ty.dtype);

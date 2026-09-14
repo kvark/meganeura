@@ -1257,17 +1257,29 @@ fn matmul_vars_tiled(
 
 /// f16 → f32 for the packed-weight kernels' block scales.
 ///
-/// Denormals flush to zero and `expo == 31` becomes a large finite rather
-/// than Inf/NaN. Quantizer-produced scales never reach either, and every
-/// packed format shares this one copy.
+/// Hand-assembled rather than `unpack2x16float`, which naga gates behind
+/// `SHADER_FLOAT16_IN_FLOAT32` — a capability Blade does not request.
+///
+/// Both edges of the exponent range are handled, because imported GGUF
+/// scales are not ours to constrain. A subnormal half is an ordinary f32:
+/// `0x0100` is 2^-16, which a quantizer emits for a block of very small
+/// weights, and folding it to zero would erase the block. `expo == 31`
+/// stays Inf or NaN rather than becoming a large finite value.
 const F16_DECODE_FN: &str = "
 fn decode_f16(bits: u32) -> f32 {
-    let sign = (bits >> 15u) & 1u;
-    let expo = (bits >> 10u) & 0x1Fu;
-    let mant = bits & 0x3FFu;
-    var f32_bits = (sign << 31u) | ((expo + 112u) << 23u) | (mant << 13u);
-    if expo == 0u { f32_bits = sign << 31u; }
-    return bitcast<f32>(f32_bits);
+    let h = bits & 0xFFFFu;
+    let sign = (h >> 15u) & 1u;
+    let expo = (h >> 10u) & 0x1Fu;
+    let mant = h & 0x3FFu;
+    if expo == 0u {
+        // Subnormal or zero: value = mant * 2^-24, exact in f32 since the
+        // mantissa is 10 bits. 0x33800000 is 2^-24.
+        let mag = f32(mant) * bitcast<f32>(0x33800000u);
+        return select(mag, -mag, sign == 1u);
+    }
+    // 112 = 127 - 15, the bias difference; 255 keeps Inf and NaN.
+    let biased = select(expo + 112u, 255u, expo == 31u);
+    return bitcast<f32>((sign << 31u) | (biased << 23u) | (mant << 13u));
 }
 ";
 
@@ -1792,6 +1804,20 @@ pub fn generate_module_weighted(group: ShaderGroup, format: WeightFormat) -> Sha
             " + src[idx]",
             mode,
         ),
+        // The packed decoders address blocks along `params.k`, but packing
+        // runs along the parameter's first dimension. Those coincide for a
+        // forward `[K, N]` weight and diverge for a transposed `[N, K]` one,
+        // so a K-quant here would decode the wrong superblock entirely.
+        // Rejected rather than silently wrong; `compile.rs` keeps them off
+        // this group so the panic is a backstop.
+        ShaderGroup::MatMulBT | ShaderGroup::MatMulBTAdd
+            if matches!(mode, WeightFormat::Q4K | WeightFormat::Q6K) =>
+        {
+            panic!(
+                "{mode:?} has no transposed-B variant: its blocks run along \
+                 the parameter's first dimension, which is N here, not K"
+            )
+        }
         ShaderGroup::MatMulBT => matmul_vars_with_mode(
             MATMUL_A_FWD,
             MATMUL_B_BT,
@@ -1819,36 +1845,18 @@ pub fn generate_module_weighted(group: ShaderGroup, format: WeightFormat) -> Sha
         ShaderGroup::Embedding if mode == WeightFormat::F16 => {
             parse_wgsl(include_str!("shaders/embedding_f16.wgsl"))
         }
-        ShaderGroup::MatMulGemv if mode == WeightFormat::Q4 => gen_matmul_gemv_packed(
-            include_str!("shaders/matmul_gemv.wgsl"),
-            Q4_DEQUANT_FN,
-            "dequant_q4",
-        ),
-        ShaderGroup::MatMulGemvAdd if mode == WeightFormat::Q4 => gen_matmul_gemv_packed(
-            include_str!("shaders/matmul_gemv_add.wgsl"),
-            Q4_DEQUANT_FN,
-            "dequant_q4",
-        ),
-        ShaderGroup::MatMulGemv if mode == WeightFormat::Q4K => gen_matmul_gemv_packed(
-            include_str!("shaders/matmul_gemv.wgsl"),
-            Q4K_DEQUANT_FN,
-            "dequant_q4k",
-        ),
-        ShaderGroup::MatMulGemvAdd if mode == WeightFormat::Q4K => gen_matmul_gemv_packed(
-            include_str!("shaders/matmul_gemv_add.wgsl"),
-            Q4K_DEQUANT_FN,
-            "dequant_q4k",
-        ),
-        ShaderGroup::MatMulGemv if mode == WeightFormat::Q6K => gen_matmul_gemv_packed(
-            include_str!("shaders/matmul_gemv.wgsl"),
-            Q6K_DEQUANT_FN,
-            "dequant_q6k",
-        ),
-        ShaderGroup::MatMulGemvAdd if mode == WeightFormat::Q6K => gen_matmul_gemv_packed(
-            include_str!("shaders/matmul_gemv_add.wgsl"),
-            Q6K_DEQUANT_FN,
-            "dequant_q6k",
-        ),
+        // Every nibble-packed format takes the same K-split GEMV with its
+        // own decoder substituted, so the format picks the helper rather
+        // than the arm.
+        ShaderGroup::MatMulGemv | ShaderGroup::MatMulGemvAdd if packed_decoder(mode).is_some() => {
+            let (helpers, call) = packed_decoder(mode).unwrap();
+            let src = if group == ShaderGroup::MatMulGemv {
+                include_str!("shaders/matmul_gemv.wgsl")
+            } else {
+                include_str!("shaders/matmul_gemv_add.wgsl")
+            };
+            gen_matmul_gemv_packed(src, helpers, call)
+        }
         ShaderGroup::MatMulGemv | ShaderGroup::MatMulGemvBT if mode == WeightFormat::F16 => {
             if group == ShaderGroup::MatMulGemv {
                 gen_matmul_gemv_f16()
@@ -2000,6 +2008,17 @@ fn gemv_width_source(source: &str, variable: &str, initial: u32) -> String {
 /// the declaration and the load line. `matmul_gemv_bt.wgsl` is not
 /// covered: it reads B as [N, K], and the Q4 block layout runs along K
 /// per column of a [K, N] weight, so it needs its own index mapping.
+/// The WGSL helper block and scalar entry point for a packed B format,
+/// or `None` for formats the GEMV reads directly.
+fn packed_decoder(mode: WeightFormat) -> Option<(&'static str, &'static str)> {
+    match mode {
+        WeightFormat::Q4 => Some((Q4_DEQUANT_FN, "dequant_q4")),
+        WeightFormat::Q4K => Some((Q4K_DEQUANT_FN, "dequant_q4k")),
+        WeightFormat::Q6K => Some((Q6K_DEQUANT_FN, "dequant_q6k")),
+        _ => None,
+    }
+}
+
 /// Re-point a K-split GEMV at a nibble-packed B buffer.
 ///
 /// The GEMV reads B as `vec4<f32>` rows; `helpers` supplies the WGSL dequant
@@ -6653,7 +6672,6 @@ mod tests {
             ShaderGroup::MatMul,
             ShaderGroup::MatMulAdd,
             ShaderGroup::MatMulAT,
-            ShaderGroup::MatMulBT,
         ] {
             let sm = generate_module_weighted(group, WeightFormat::Q6K);
             assert!(
@@ -6692,7 +6710,6 @@ mod tests {
             ShaderGroup::MatMul,
             ShaderGroup::MatMulAdd,
             ShaderGroup::MatMulAT,
-            ShaderGroup::MatMulBT,
         ] {
             let sm = generate_module_weighted(group, WeightFormat::Q4K);
             assert!(
@@ -6736,6 +6753,31 @@ mod tests {
     #[should_panic(expected = "no Q6K variant")]
     fn q6k_refuses_groups_without_a_variant() {
         let _ = generate_module_weighted(ShaderGroup::MatMulGemvBT, WeightFormat::Q6K);
+    }
+
+    /// Packing runs along the parameter's first dimension; every packed
+    /// decoder indexes along K. Those are the same axis for a forward
+    /// `[K, N]` weight and different axes for a transposed `[N, K]` one, so
+    /// there is no correct reading of a K-quant on the BT groups.
+    #[test]
+    fn k_quants_refuse_transposed_b() {
+        for group in [ShaderGroup::MatMulBT, ShaderGroup::MatMulBTAdd] {
+            for mode in [WeightFormat::Q4K, WeightFormat::Q6K] {
+                let caught = std::panic::catch_unwind(|| {
+                    let _ = generate_module_weighted(group, mode);
+                });
+                assert!(
+                    caught.is_err(),
+                    "{mode:?} on {group:?} must be refused, not decoded along the wrong axis"
+                );
+            }
+        }
+        // The forward groups are unaffected.
+        assert!(
+            generate_module_weighted(ShaderGroup::MatMul, WeightFormat::Q4K)
+                .source
+                .contains("dequant_q4k")
+        );
     }
 
     /// The epilogue skeleton has to be specialized for the tile the
