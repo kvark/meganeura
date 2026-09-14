@@ -56,8 +56,10 @@
 //! quantized weight requantizes on the way back in, roughly doubling the
 //! quantization error, so prefer `to_packed`.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::graph::DType;
 
@@ -293,11 +295,33 @@ pub struct GgufTensor {
     pub dims: Vec<usize>,
     /// How the bytes are encoded.
     pub ggml_type: GgmlType,
-    /// Raw file bytes for this tensor, unmodified.
-    pub data: Vec<u8>,
+    /// The whole file, shared by every tensor in the model.
+    file: Arc<[u8]>,
+    /// This tensor's slice of it. Empty for a type whose block size is
+    /// unknown, since there is no way to say where its bytes end.
+    range: std::ops::Range<usize>,
 }
 
 impl GgufTensor {
+    /// Build a tensor from its own bytes, for callers synthesizing one
+    /// rather than reading a file.
+    pub fn new(dims: Vec<usize>, ggml_type: GgmlType, data: Vec<u8>) -> Self {
+        let range = 0..data.len();
+        Self {
+            dims,
+            ggml_type,
+            file: Arc::from(data),
+            range,
+        }
+    }
+
+    /// This tensor's raw bytes, exactly as they appear in the file.
+    ///
+    /// Borrowed from the model's single backing buffer — reading a tensor
+    /// costs nothing beyond the file itself.
+    pub fn data(&self) -> &[u8] {
+        &self.file[self.range.clone()]
+    }
     /// Total element count.
     pub fn num_elements(&self) -> usize {
         self.dims.iter().product()
@@ -380,20 +404,28 @@ impl GgufTensor {
     /// `F32` and `F16` are not packed formats and are rejected — read them
     /// with [`GgufTensor::to_f32`]. So is any `ggml_type` this loader does
     /// not implement.
-    pub fn to_packed(&self) -> Result<(DType, Vec<u8>), GgufError> {
+    pub fn to_packed(&self) -> Result<(DType, Cow<'_, [u8]>), GgufError> {
         let dtype = self.packed_dtype()?;
         let bytes = match self.ggml_type {
-            GgmlType::Q4_0 | GgmlType::Q4_1 => self.repack_q4()?,
-            GgmlType::Q8_0 => self.repack_q8(),
-            // The K-quants are already in GGML's layout. Q6_K's 210-byte
-            // superblocks are not a whole number of words, so an odd count
-            // leaves the buffer two bytes short of the `array<u32>`
-            // binding; pad the tail and leave the superblocks alone.
-            GgmlType::Q4K => self.data.clone(),
+            GgmlType::Q4_0 | GgmlType::Q4_1 => Cow::Owned(self.repack_q4()?),
+            GgmlType::Q8_0 => Cow::Owned(self.repack_q8()),
+            // The K-quants are already in GGML's layout, so these borrow
+            // the file rather than copying it.
+            GgmlType::Q4K => Cow::Borrowed(self.data()),
             GgmlType::Q6K => {
-                let mut bytes = self.data.clone();
-                bytes.resize(bytes.len().next_multiple_of(4), 0);
-                bytes
+                // 210-byte superblocks are not a whole number of words, so
+                // an odd count leaves the buffer two bytes short of the
+                // `array<u32>` binding. Only then is a copy needed; the
+                // superblocks themselves are never touched.
+                let data = self.data();
+                let padded = data.len().next_multiple_of(4);
+                if padded == data.len() {
+                    Cow::Borrowed(data)
+                } else {
+                    let mut bytes = data.to_vec();
+                    bytes.resize(padded, 0);
+                    Cow::Owned(bytes)
+                }
             }
             // `packed_dtype` has already rejected everything else.
             _ => unreachable!("packed_dtype accepted an unpackable type"),
@@ -405,33 +437,33 @@ impl GgufTensor {
     fn dequantize_flat(&self) -> Result<Vec<f32>, GgufError> {
         let count = self.num_elements();
         let expect = self.ggml_type.stored_bytes(count)?;
-        if self.data.len() != expect {
+        if self.data().len() != expect {
             return Err(GgufError::BadShape(format!(
                 "{:?} tensor of {count} elements needs {expect} bytes, has {}",
                 self.ggml_type,
-                self.data.len()
+                self.data().len()
             )));
         }
         Ok(match self.ggml_type {
             GgmlType::F32 => self
-                .data
+                .data()
                 .as_chunks::<4>()
                 .0
                 .iter()
                 .map(|&c| f32::from_le_bytes(c))
                 .collect(),
             GgmlType::F16 => self
-                .data
+                .data()
                 .as_chunks::<2>()
                 .0
                 .iter()
                 .map(|&c| f16_from_bits(u16::from_le_bytes(c)))
                 .collect(),
-            GgmlType::Q4_0 => dequant_q4_0(&self.data, count),
-            GgmlType::Q4_1 => dequant_q4_1(&self.data, count),
-            GgmlType::Q8_0 => dequant_q8_0(&self.data, count),
-            GgmlType::Q4K => dequant_q4_k(&self.data, count),
-            GgmlType::Q6K => dequant_q6_k(&self.data, count),
+            GgmlType::Q4_0 => dequant_q4_0(self.data(), count),
+            GgmlType::Q4_1 => dequant_q4_1(self.data(), count),
+            GgmlType::Q8_0 => dequant_q8_0(self.data(), count),
+            GgmlType::Q4K => dequant_q4_k(self.data(), count),
+            GgmlType::Q6K => dequant_q6_k(self.data(), count),
             GgmlType::Other(tag) => return Err(GgufError::UnsupportedType(tag)),
         })
     }
@@ -449,6 +481,7 @@ impl GgufTensor {
     /// * GGML interleaves each block's header with its payload; Meganeura
     ///   keeps all `(d, m)` words first and all nibble words after.
     fn repack_q4(&self) -> Result<Vec<u8>, GgufError> {
+        let src_bytes = self.data();
         let count = self.num_elements();
         let blocks = count / 32;
         let stride = self
@@ -461,13 +494,13 @@ impl GgufTensor {
         let payload = blocks * 4;
         for b in 0..blocks {
             let src = b * stride;
-            let d_bits = u16::from_le_bytes([self.data[src], self.data[src + 1]]);
+            let d_bits = u16::from_le_bytes([src_bytes[src], src_bytes[src + 1]]);
             let (m_bits, qs) = if symmetric {
                 let d = f16_from_bits(d_bits);
                 (f16_to_bits(-8.0 * d), src + 2)
             } else {
                 (
-                    u16::from_le_bytes([self.data[src + 2], self.data[src + 3]]),
+                    u16::from_le_bytes([src_bytes[src + 2], src_bytes[src + 3]]),
                     src + 4,
                 )
             };
@@ -479,9 +512,9 @@ impl GgufTensor {
                 // Where GGML put element e.
                 let byte = (e % 16) as usize;
                 let nibble = if e < 16 {
-                    self.data[qs + byte] & 0x0F
+                    src_bytes[qs + byte] & 0x0F
                 } else {
-                    self.data[qs + byte] >> 4
+                    src_bytes[qs + byte] >> 4
                 };
                 // Where Meganeura wants it.
                 let slot = dst + (e / 2) as usize;
@@ -501,14 +534,15 @@ impl GgufTensor {
     /// difference is that Meganeura pads the f16 scale out to a full word so
     /// the quants start word-aligned, making each block 36 bytes to GGML's 34.
     fn repack_q8(&self) -> Vec<u8> {
+        let src_bytes = self.data();
         let blocks = self.num_elements() / 32;
         let mut out = vec![0u8; blocks * 36];
         for b in 0..blocks {
             let src = b * 34;
             let dst = b * 36;
-            out[dst..dst + 2].copy_from_slice(&self.data[src..src + 2]);
+            out[dst..dst + 2].copy_from_slice(&src_bytes[src..src + 2]);
             // dst + 2 .. dst + 4 stays zero padding.
-            out[dst + 4..dst + 36].copy_from_slice(&self.data[src + 2..src + 34]);
+            out[dst + 4..dst + 36].copy_from_slice(&src_bytes[src + 2..src + 34]);
         }
         out
     }
@@ -654,13 +688,27 @@ impl<'a> Reader<'a> {
 }
 
 /// Load a GGUF file from disk.
+///
+/// The file is read once and shared by every tensor, so peak memory is
+/// roughly the file itself rather than the file plus a copy of each
+/// payload.
 pub fn load_gguf(path: &Path) -> Result<GgufModel, GgufError> {
-    let bytes = std::fs::read(path)?;
-    load_gguf_bytes(&bytes)
+    load_gguf_shared(Arc::from(std::fs::read(path)?))
 }
 
 /// Parse a GGUF file already in memory.
+///
+/// Copies `bytes` into the shared buffer. A caller that can hand over
+/// ownership should use [`load_gguf_shared`] and avoid the copy.
 pub fn load_gguf_bytes(bytes: &[u8]) -> Result<GgufModel, GgufError> {
+    load_gguf_shared(Arc::from(bytes.to_vec()))
+}
+
+/// Parse a GGUF file from a buffer the model can take a share of.
+///
+/// Tensors borrow ranges of this buffer; none of them copies its payload.
+pub fn load_gguf_shared(file: Arc<[u8]>) -> Result<GgufModel, GgufError> {
+    let bytes: &[u8] = &file;
     let mut r = Reader::new(bytes);
     let magic = r.take(4, "magic")?;
     if magic != b"GGUF" {
@@ -772,7 +820,7 @@ pub fn load_gguf_bytes(bytes: &[u8]) -> Result<GgufModel, GgufError> {
         // readable should still yield an inventory, and `to_packed` /
         // `to_f32` report the unimplemented tag when someone asks for
         // values.
-        let data = if info.ggml_type.is_supported() {
+        let range = if info.ggml_type.is_supported() {
             let len = info.ggml_type.stored_bytes(count)?;
             let start = data_start
                 .checked_add(info.offset)
@@ -790,9 +838,9 @@ pub fn load_gguf_bytes(bytes: &[u8]) -> Result<GgufModel, GgufError> {
                     offset: start,
                 });
             }
-            bytes[start..end].to_vec()
+            start..end
         } else {
-            Vec::new()
+            0..0
         };
         if tensors.contains_key(&info.name) {
             return Err(GgufError::BadShape(format!(
@@ -805,7 +853,8 @@ pub fn load_gguf_bytes(bytes: &[u8]) -> Result<GgufModel, GgufError> {
             GgufTensor {
                 dims: info.dims,
                 ggml_type: info.ggml_type,
-                data,
+                file: Arc::clone(&file),
+                range,
             },
         );
     }
@@ -1318,7 +1367,7 @@ mod tests {
         assert_eq!(unknown.ggml_type, GgmlType::Other(13));
         assert!(!unknown.ggml_type.is_supported());
         // Its length depends on a block size we do not know, so no bytes.
-        assert!(unknown.data.is_empty());
+        assert!(unknown.data().is_empty());
         assert!(matches!(
             unknown.to_packed(),
             Err(GgufError::UnsupportedType(13))
@@ -1389,6 +1438,62 @@ mod tests {
             out.push(0);
         }
         assert!(matches!(load_gguf_bytes(&out), Err(GgufError::BadShape(_))));
+    }
+
+    /// Tensors index one shared buffer, and the K-quants hand it straight
+    /// back. Loading a model should not cost a second copy of every
+    /// payload on top of the file.
+    #[test]
+    fn k_quant_packing_borrows_the_file() {
+        let block = vec![7u8; 144];
+        let bytes = Builder::new()
+            .tensor("w", &[256, 1], GgmlType::Q4K, &block)
+            .build();
+        let file: Arc<[u8]> = Arc::from(bytes);
+        let m = load_gguf_shared(Arc::clone(&file)).unwrap();
+        let t = &m.tensors["w"];
+
+        // The tensor's bytes are a slice of the file, not a copy.
+        let (_, packed) = t.to_packed().unwrap();
+        assert!(
+            matches!(packed, Cow::Borrowed(_)),
+            "Q4_K should hand back the file's bytes, not clone them"
+        );
+        assert!(
+            std::ptr::eq(packed.as_ptr(), t.data().as_ptr()),
+            "the borrow should point into the shared buffer"
+        );
+        assert_eq!(&*packed, &block[..]);
+    }
+
+    /// Q6_K only copies when its superblock count leaves the buffer short
+    /// of a word, and even then the superblocks are untouched.
+    #[test]
+    fn q6_k_borrows_when_already_word_aligned() {
+        // Two superblocks: 420 bytes, a whole number of words.
+        let block = vec![3u8; 210];
+        let mut payload = block.clone();
+        payload.extend_from_slice(&block);
+        let bytes = Builder::new()
+            .tensor("w", &[256, 2], GgmlType::Q6K, &payload)
+            .build();
+        let m = load_gguf_bytes(&bytes).unwrap();
+        let (_, packed) = m.tensors["w"].to_packed().unwrap();
+        assert_eq!(packed.len(), 420);
+        assert!(
+            matches!(packed, Cow::Borrowed(_)),
+            "an aligned Q6_K buffer needs no copy"
+        );
+
+        // One superblock: 210 bytes, two short of a word.
+        let odd = Builder::new()
+            .tensor("w", &[256, 1], GgmlType::Q6K, &block)
+            .build();
+        let m = load_gguf_bytes(&odd).unwrap();
+        let (_, packed) = m.tensors["w"].to_packed().unwrap();
+        assert!(matches!(packed, Cow::Owned(_)), "padding needs a copy");
+        assert_eq!(packed.len(), 212);
+        assert_eq!(&packed[..210], &block[..]);
     }
 
     #[test]

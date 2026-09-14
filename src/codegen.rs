@@ -1807,17 +1807,16 @@ pub fn generate_module_weighted(group: ShaderGroup, format: WeightFormat) -> Sha
         // The packed decoders address blocks along `params.k`, but packing
         // runs along the parameter's first dimension. Those coincide for a
         // forward `[K, N]` weight and diverge for a transposed `[N, K]` one,
-        // so a K-quant here would decode the wrong superblock entirely.
-        // Rejected rather than silently wrong; `compile.rs` keeps them off
-        // this group so the panic is a backstop.
-        ShaderGroup::MatMulBT | ShaderGroup::MatMulBTAdd
-            if matches!(mode, WeightFormat::Q4K | WeightFormat::Q6K) =>
-        {
-            panic!(
-                "{mode:?} has no transposed-B variant: its blocks run along \
-                 the parameter's first dimension, which is N here, not K"
-            )
-        }
+        // so any block format here decodes the wrong block entirely. This
+        // covers Q4 and Q8 as well: nothing in the tree produced a
+        // quantized transposed matmul, so the arms that would have served
+        // them were dead and wrong rather than merely unused. `compile.rs`
+        // keeps them off this group, so the panic is a backstop. f16 is
+        // exempt - an elementwise cast, not a block layout.
+        ShaderGroup::MatMulBT | ShaderGroup::MatMulBTAdd if mode.is_quantized() => panic!(
+            "{mode:?} has no transposed-B variant: its blocks run along the \
+             parameter's first dimension, which is N here, not K"
+        ),
         ShaderGroup::MatMulBT => matmul_vars_with_mode(
             MATMUL_A_FWD,
             MATMUL_B_BT,
@@ -6593,6 +6592,10 @@ mod tests {
         }
     }
 
+    /// The BT groups are deliberately absent: Q4 blocks run along the
+    /// parameter's first dimension while the decoder indexes along K, so
+    /// the shader this used to generate read the wrong block. Covered by
+    /// `quantized_formats_refuse_transposed_b`.
     #[test]
     fn q4_matmul_shader_generates() {
         for group in [
@@ -6600,8 +6603,6 @@ mod tests {
             ShaderGroup::MatMulAdd,
             ShaderGroup::MatMulAT,
             ShaderGroup::MatMulATAdd,
-            ShaderGroup::MatMulBT,
-            ShaderGroup::MatMulBTAdd,
             // Decode is m=1, which compile.rs routes to these instead.
             ShaderGroup::MatMulGemv,
             ShaderGroup::MatMulGemvAdd,
@@ -6758,11 +6759,17 @@ mod tests {
     /// Packing runs along the parameter's first dimension; every packed
     /// decoder indexes along K. Those are the same axis for a forward
     /// `[K, N]` weight and different axes for a transposed `[N, K]` one, so
-    /// there is no correct reading of a K-quant on the BT groups.
+    /// no block format has a correct reading on the BT groups — Q4 and Q8
+    /// included, whose arms here were dead and wrong rather than unused.
     #[test]
-    fn k_quants_refuse_transposed_b() {
+    fn quantized_formats_refuse_transposed_b() {
         for group in [ShaderGroup::MatMulBT, ShaderGroup::MatMulBTAdd] {
-            for mode in [WeightFormat::Q4K, WeightFormat::Q6K] {
+            for mode in [
+                WeightFormat::Q4,
+                WeightFormat::Q8,
+                WeightFormat::Q4K,
+                WeightFormat::Q6K,
+            ] {
                 let caught = std::panic::catch_unwind(|| {
                     let _ = generate_module_weighted(group, mode);
                 });
@@ -6772,6 +6779,12 @@ mod tests {
                 );
             }
         }
+        // f16 is an elementwise cast at the same index, so it still works.
+        assert!(
+            generate_module_weighted(ShaderGroup::MatMulBT, WeightFormat::F16)
+                .source
+                .contains("array<f16>")
+        );
         // The forward groups are unaffected.
         assert!(
             generate_module_weighted(ShaderGroup::MatMul, WeightFormat::Q4K)
