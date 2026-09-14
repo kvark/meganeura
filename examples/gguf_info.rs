@@ -5,15 +5,17 @@
 //! cargo run --example gguf_info -- model.gguf
 //! ```
 //!
-//! The `packs` column is what matters for weight fidelity. `yes` means the
-//! tensor repacks losslessly into Meganeura's layout via
-//! `Session::set_parameter_packed`. `f32` means it has to be dequantized and
-//! requantized through `Session::set_parameter`, which loses precision.
+//! The `stored as` column is what matters for weight fidelity. A `DType`
+//! means the tensor reaches the GPU losslessly through
+//! `Session::set_parameter_packed`. `f32` means it is not a packed format
+//! and goes through `Session::set_parameter` unchanged. `unsupported`
+//! means this loader does not implement that `ggml_type`, so the tensor is
+//! listed but cannot be read.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use meganeura::load::gguf::{GgufValue, load_gguf};
+use meganeura::load::gguf::{GgufError, GgufValue, load_gguf};
 
 fn render(value: &GgufValue) -> String {
     match *value {
@@ -58,28 +60,32 @@ fn main() {
     }
 
     println!("\ntensors ({}):", model.tensors.len());
-    println!("  {:<44} {:<18} {:<7} packs", "name", "shape", "type");
+    println!("  {:<44} {:<18} {:<9} stored as", "name", "shape", "type");
     let mut total_bytes = 0usize;
-    let mut needs_requantize = 0usize;
+    let mut unsupported = 0usize;
     for (name, t) in model.tensors.iter().collect::<BTreeMap<_, _>>() {
         total_bytes += t.data.len();
-        let packs = match t.to_packed() {
+        let stored = match t.to_packed() {
             Ok((dtype, _)) => format!("{dtype:?}"),
-            Err(_) => {
-                needs_requantize += 1;
-                "f32".to_string()
+            // Not a packed format; it uploads as plain f32.
+            Err(GgufError::UnsupportedPack(_)) => "f32".to_string(),
+            Err(GgufError::UnsupportedType(tag)) => {
+                unsupported += 1;
+                format!("unsupported (tag {tag})")
             }
+            // Shapes this loader has no parameter form for, e.g. rank > 2.
+            Err(e) => format!("unpackable ({e})"),
         };
         println!(
-            "  {name:<44} {:<18} {:<7} {packs}",
+            "  {name:<44} {:<18} {:<9} {stored}",
             format!("{:?}", t.dims),
             format!("{:?}", t.ggml_type),
         );
     }
 
     println!(
-        "\n{:.1} MiB of tensor data; {needs_requantize} tensor(s) would be \
-         requantized through f32",
+        "\n{:.1} MiB of readable tensor data; {unsupported} tensor(s) use a \
+         ggml_type this loader does not implement",
         total_bytes as f64 / (1024.0 * 1024.0),
     );
 }
