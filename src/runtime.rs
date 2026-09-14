@@ -4719,6 +4719,15 @@ impl Session {
                             .map(|&v| half::f16::from_f32(v).to_bits())
                             .flat_map(|b| b.to_le_bytes())
                             .collect(),
+                        // Encoding Q4_K means searching for per-sub-block
+                        // scales, not computing them. Quantizing here would
+                        // silently produce worse weights than the file the
+                        // caller already has, so refuse and point at the
+                        // path that keeps them.
+                        crate::compile::WeightFormat::Q4K => panic!(
+                            "parameter `{name}` is Q4_K, which cannot be produced from f32; \
+                             load it with set_parameter_packed from a GGUF file"
+                        ),
                         crate::compile::WeightFormat::F32 => unreachable!(),
                     };
                     self.upload_parameter_bytes(buf_ref, &packed);

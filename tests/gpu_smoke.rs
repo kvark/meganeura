@@ -3540,6 +3540,176 @@ fn small_tile_matmul_with_epilogue_matches_cpu() {
     );
 }
 
+/// Build one Q4_K superblock with a realistic spread: per-sub-block scales
+/// and mins that actually differ, and quants across the whole nibble range.
+/// Packed exactly the way `get_scale_min_k4` expects to read it back.
+fn q4k_superblock(seed: u32) -> Vec<u8> {
+    let mut st = seed | 1;
+    let mut rnd = || {
+        st = st.wrapping_mul(747796405).wrapping_add(2891336453);
+        let w = ((st >> ((st >> 28) + 4)) ^ st).wrapping_mul(277803737);
+        (w >> 22) ^ w
+    };
+    let mut b = vec![0u8; 144];
+    b[0..2].copy_from_slice(&half::f16::from_f32(0.0035).to_bits().to_le_bytes());
+    b[2..4].copy_from_slice(&half::f16::from_f32(0.0021).to_bits().to_le_bytes());
+    let sc: Vec<u8> = (0..8).map(|_| (rnd() % 64) as u8).collect();
+    let mn: Vec<u8> = (0..8).map(|_| (rnd() % 64) as u8).collect();
+    for j in 0..4 {
+        b[4 + j] = sc[j] & 63;
+        b[8 + j] = mn[j] & 63;
+    }
+    for j in 4..8 {
+        b[8 + j] = (sc[j] & 0x0F) | ((mn[j] & 0x0F) << 4);
+        b[j] |= (sc[j] >> 4) << 6;
+        b[4 + j] |= (mn[j] >> 4) << 6;
+    }
+    for i in 0..128 {
+        b[16 + i] = (rnd() % 256) as u8;
+    }
+    b
+}
+
+/// The Q4_K shader against the loader's CPU reference, which is itself
+/// checked line-by-line against `dequantize_row_q4_K` in ggml-quants.c.
+///
+/// Q4_K is read straight out of a GGUF file with no repack, so a mistake in
+/// the WGSL — the `get_scale_min_k4` bit twiddling especially — would show up
+/// as plausible-looking weights rather than an error.
+#[test]
+fn q4k_matmul_matches_ggml_reference() {
+    use meganeura::load::gguf::{GgmlType, GgufTensor};
+
+    // K = 512 (two superblocks per column), N = 4.
+    let (m, k, n) = (3usize, 512usize, 4usize);
+    let mut data = Vec::new();
+    for s in 0..(k / 256 * n) {
+        data.extend_from_slice(&q4k_superblock(s as u32 + 1));
+    }
+    let tensor = GgufTensor {
+        dims: vec![k, n],
+        ggml_type: GgmlType::Q4K,
+        data: data.clone(),
+    };
+    // Reference weights in meganeura [K, N] order.
+    let w_ref = tensor.to_f32().unwrap();
+    let (dtype, packed) = tensor.to_packed().unwrap();
+    assert_eq!(dtype, meganeura::graph::DType::Q4K);
+    assert_eq!(packed, data, "Q4_K should reach the GPU unmodified");
+
+    let a: Vec<f32> = (0..m * k)
+        .map(|i| ((i % 29) as f32 - 14.0) * 0.03)
+        .collect();
+
+    let mut g = Graph::new();
+    let x = g.input("x", &[m, k]);
+    let w = g.parameter_q4k("w", &[k, n]);
+    let out = g.matmul(x, w);
+    g.set_outputs(vec![out]);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    session.set_input("x", &a);
+    session.set_parameter_packed("w", &packed);
+    session.step();
+    session.wait();
+    let gpu = session.read_output(m * n);
+
+    let mut max_err = 0.0f32;
+    let mut scale = 0.0f32;
+    for row in 0..m {
+        for col in 0..n {
+            let mut want = 0.0f32;
+            for i in 0..k {
+                want += a[row * k + i] * w_ref[i * n + col];
+            }
+            scale = scale.max(want.abs());
+            max_err = max_err.max((gpu[row * n + col] - want).abs());
+        }
+    }
+    assert!(
+        gpu.iter().all(|v| v.is_finite()),
+        "Q4_K matmul produced non-finite values"
+    );
+    assert!(
+        max_err / scale.max(1e-6) < 1e-5,
+        "Q4_K matmul diverged from the GGML reference: \
+         max_abs_err={max_err} (scale {scale})"
+    );
+}
+
+/// The K-split GEMV takes a different shader from the tiled path, and it is
+/// the one decode actually runs.
+#[test]
+fn q4k_gemv_matches_ggml_reference() {
+    use meganeura::load::gguf::{GgmlType, GgufTensor};
+
+    let (k, n) = (256usize, 8usize);
+    let mut data = Vec::new();
+    for s in 0..(k / 256 * n) {
+        data.extend_from_slice(&q4k_superblock(s as u32 + 41));
+    }
+    let tensor = GgufTensor {
+        dims: vec![k, n],
+        ggml_type: GgmlType::Q4K,
+        data: data.clone(),
+    };
+    let w_ref = tensor.to_f32().unwrap();
+    let a: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
+
+    let mut g = Graph::new();
+    // m = 1 and n % 4 == 0 routes this to MatMulGemv.
+    let x = g.input("x", &[1, k]);
+    let w = g.parameter_q4k("w", &[k, n]);
+    let out = g.matmul(x, w);
+    g.set_outputs(vec![out]);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    session.set_input("x", &a);
+    session.set_parameter_packed("w", &data);
+    session.step();
+    session.wait();
+    let gpu = session.read_output(n);
+
+    let mut max_err = 0.0f32;
+    let mut scale = 0.0f32;
+    for col in 0..n {
+        let mut want = 0.0f32;
+        for i in 0..k {
+            want += a[i] * w_ref[i * n + col];
+        }
+        scale = scale.max(want.abs());
+        max_err = max_err.max((gpu[col] - want).abs());
+    }
+    assert!(
+        max_err / scale.max(1e-6) < 1e-5,
+        "Q4_K GEMV diverged from the GGML reference: \
+         max_abs_err={max_err} (scale {scale})"
+    );
+}
+
+/// Q4_K cannot be produced from f32 — its encoder searches for per-sub-block
+/// scales rather than computing them. Quantizing on the fly would silently
+/// hand back worse weights than the file the caller already has, so the
+/// f32 entry point refuses and names the one that works.
+#[test]
+#[should_panic(expected = "set_parameter_packed")]
+fn q4k_rejects_f32_parameter_upload() {
+    let (k, n) = (256usize, 4usize);
+    let mut g = Graph::new();
+    let x = g.input("x", &[1, k]);
+    let w = g.parameter_q4k("w", &[k, n]);
+    let out = g.matmul(x, w);
+    g.set_outputs(vec![out]);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    session.set_parameter("w", &vec![0.1f32; k * n]);
+}
+
+/// The reduction extent has to fill whole 256-element superblocks.
+#[test]
+#[should_panic(expected = "multiple of 256")]
+fn q4k_rejects_unaligned_reduction_extent() {
+    let mut g = Graph::new();
+    let _ = g.parameter_q4k("w", &[128, 4]);
+}
+
 /// Incrementally build a 1-layer transformer with Q4 weights.
 /// Output each intermediate result to find where NaN first appears.
 #[test]

@@ -41,6 +41,7 @@ fn logical_bytes(ty: &TensorType) -> io::Result<usize> {
             DType::F16 => n.checked_mul(2),
             DType::Q4_0 => n.div_ceil(32).checked_mul(20),
             DType::Q8_0 => n.div_ceil(32).checked_mul(36),
+            DType::Q4K => n.div_ceil(256).checked_mul(144),
         })
         .ok_or_else(|| invalid("checkpoint logical shape overflows byte size"))
 }
@@ -90,7 +91,7 @@ fn tensor_layout(ty: &TensorType) -> io::Result<(Dtype, Vec<usize>)> {
         DType::F32 => (Dtype::F32, ty.shape.clone()),
         DType::F16 => (Dtype::F16, ty.shape.clone()),
         DType::U32 => (Dtype::U32, ty.shape.clone()),
-        DType::Q4_0 | DType::Q8_0 => (Dtype::U8, vec![logical_bytes(ty)?]),
+        DType::Q4_0 | DType::Q8_0 | DType::Q4K => (Dtype::U8, vec![logical_bytes(ty)?]),
     })
 }
 
@@ -335,7 +336,9 @@ fn restored_weight_staging(
                     super::dequantize_q8_0(write.data, rows, cols)
                 }
             }
-            WeightFormat::F32 => continue,
+            // Q4_K has no host encoder, so a derived weight could never
+            // have been produced in it; nothing to stage back.
+            WeightFormat::F32 | WeightFormat::Q4K => continue,
         };
         staging.insert(buffer, values);
     }

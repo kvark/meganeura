@@ -14,11 +14,22 @@ pub enum WeightFormat {
     F16,
     Q4,
     Q8,
+    /// GGML Q4_K: 256-element superblocks with 6-bit sub-block scales.
+    /// Load-only; see [`crate::graph::DType::Q4K`].
+    Q4K,
 }
 
 impl WeightFormat {
     pub fn is_quantized(self) -> bool {
-        matches!(self, Self::Q4 | Self::Q8)
+        matches!(self, Self::Q4 | Self::Q8 | Self::Q4K)
+    }
+
+    /// Whether the host can produce this format from f32.
+    ///
+    /// False for Q4_K: its encoder searches for per-sub-block scales, so
+    /// these weights only ever arrive already packed, from a GGUF file.
+    pub fn is_host_quantizable(self) -> bool {
+        !matches!(self, Self::Q4K)
     }
 
     /// Uses a B-buffer representation other than ordinary IEEE f32.
@@ -35,6 +46,7 @@ impl WeightFormat {
             DType::F16 => Self::F16,
             DType::Q4_0 => Self::Q4,
             DType::Q8_0 => Self::Q8,
+            DType::Q4K => Self::Q4K,
             _ => Self::F32,
         }
     }
@@ -2942,13 +2954,17 @@ impl<'a> Compiler<'a> {
                     // exact row broadcast. Preserve the MatMulBT graph node
                     // and its dependency order while avoiding tiled GEMM.
                     self.emit_broadcast_inner(a, out_buf, m, n);
-                } else if m == 1 && k.is_multiple_of(4) && wf != WeightFormat::Q4 {
-                    // Q4 stays on the tiled path here. The K-split GEMV-BT
-                    // reads B as [N, K], while the Q4 block layout runs
-                    // along K per column of a [K, N] weight, so it would
-                    // need its own index mapping; `generate_module_weighted`
-                    // has no Q4 variant for this group and would otherwise
-                    // emit the f32 shader over packed blocks.
+                } else if m == 1
+                    && k.is_multiple_of(4)
+                    && !matches!(wf, WeightFormat::Q4 | WeightFormat::Q4K)
+                {
+                    // Nibble-packed weights stay on the tiled path here. The
+                    // K-split GEMV-BT reads B as [N, K], while their block
+                    // layout runs along K per column of a [K, N] weight, so
+                    // it would need its own index mapping;
+                    // `generate_module_weighted` has no packed variant for
+                    // this group and would otherwise emit the f32 shader
+                    // over packed blocks.
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::MatMulGemvBT,
                         workgroups: [n, 1, 1],

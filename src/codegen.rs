@@ -1155,22 +1155,34 @@ fn matmul_vars_tiled(
             "dequant_q8(b_row, b_col)".to_string(),
             Q8_DEQUANT_FN.to_string(),
         ),
+        WeightFormat::Q4K => (
+            "",
+            "array<u32>",
+            "dequant_q4k(b_row, b_col)".to_string(),
+            Q4K_DEQUANT_FN.to_string(),
+        ),
     };
-    // Q4 large tile: 32×64 B tile, 256 threads → each thread owns 8
-    // consecutive K of one column, which is one data word + one (d, m).
-    // Small tile and Q8 stay on the per-element path.
-    let b_stage_body = if b_mode == WeightFormat::Q4 && tile == MatMulTile::Large {
-        "\
+    // Nibble-packed large tile: 32×64 B tile, 256 threads → each thread owns
+    // 8 consecutive K of one column, which share a block header and, for Q4,
+    // a single data word. Small tile and Q8 stay on the per-element path.
+    let pack8 = match b_mode {
+        WeightFormat::Q4 if tile == MatMulTile::Large => Some("dequant_q4_pack8"),
+        WeightFormat::Q4K if tile == MatMulTile::Large => Some("dequant_q4k_pack8"),
+        _ => None,
+    };
+    let b_stage_body = if let Some(pack8) = pack8 {
+        format!(
+            "\
         let n_local = tid % $BM_U;\n\
         let k_base = (tid / $BM_U) * 8u;\n\
         let b_col = tile_col + n_local;\n\
-        let unpacked = dequant_q4_pack8(t + k_base, b_col);\n\
-        for (var i = 0u; i < 8u; i++) {\n\
+        let unpacked = {pack8}(t + k_base, b_col);\n\
+        for (var i = 0u; i < 8u; i++) {{\n\
             let b_row = t + k_base + i;\n\
             let in_bounds = (b_row < params.k) && (b_col < params.n);\n\
             shared_b[(k_base + i) * $B_STRIDE_U + n_local] = select(0.0, unpacked[i], in_bounds);\n\
-        }"
-        .to_string()
+        }}"
+        )
     } else {
         "\
         for (var e = 0u; e < $STAGE_EPT_U; e++) {\n\
@@ -1283,6 +1295,86 @@ fn dequant_q4_pack8(k_base: u32, n_idx: u32) -> array<f32, 8> {
     var out: array<f32, 8>;
     for (var i = 0u; i < 8u; i++) {
         out[i] = q4_unpack_nibble(data_u32, d, m, i);
+    }
+    return out;
+}
+";
+
+/// GGML Q4_K dequantization, reading GGUF's bytes verbatim.
+///
+/// A 256-element superblock is 36 u32s: `[d|dmin]`, three words of eight
+/// 6-bit scale/min pairs, then 32 words of nibbles. The value is
+/// `d * sc_j * q - dmin * m_j` for sub-block `j = (k % 256) / 32`, which is
+/// the same `q * scale + min` shape the Q4 kernels already compute — only
+/// the pair is derived per sub-block instead of read outright.
+///
+/// The scale unpacking mirrors `get_scale_min_k4` in `ggml-quants.c`, and
+/// the nibble split mirrors `dequantize_row_q4_K`: within each 64-element
+/// span the low nibbles feed the first 32 elements and the high nibbles
+/// the second.
+const Q4K_DEQUANT_FN: &str = "
+fn q4k_decode_f16(bits: u32) -> f32 {
+    let sign = (bits >> 15u) & 1u;
+    let expo = (bits >> 10u) & 0x1Fu;
+    let mant = bits & 0x3FFu;
+    var f32_bits = (sign << 31u) | ((expo + 112u) << 23u) | (mant << 13u);
+    if expo == 0u { f32_bits = sign << 31u; }
+    return bitcast<f32>(f32_bits);
+}
+
+fn q4k_byte(base: u32, off: u32) -> u32 {
+    let w = matrix_b[base + off / 4u];
+    return (w >> ((off % 4u) * 8u)) & 0xFFu;
+}
+
+fn q4k_scale_min(base: u32, j: u32) -> vec2<f32> {
+    var sc: u32;
+    var mn: u32;
+    if j < 4u {
+        sc = q4k_byte(base, 4u + j) & 63u;
+        mn = q4k_byte(base, 8u + j) & 63u;
+    } else {
+        let hi = q4k_byte(base, j + 8u);
+        sc = (hi & 0xFu) | ((q4k_byte(base, j) >> 6u) << 4u);
+        mn = (hi >> 4u) | ((q4k_byte(base, 4u + j) >> 6u) << 4u);
+    }
+    return vec2<f32>(f32(sc), f32(mn));
+}
+
+fn dequant_q4k(k_idx: u32, n_idx: u32) -> f32 {
+    let base = (n_idx * (params.k / 256u) + k_idx / 256u) * 36u;
+    let hdr = matrix_b[base];
+    let d = q4k_decode_f16(hdr & 0xFFFFu);
+    let dmin = q4k_decode_f16(hdr >> 16u);
+    let e = k_idx % 256u;
+    let sm = q4k_scale_min(base, e / 32u);
+    let byte = q4k_byte(base, 16u + (e / 64u) * 32u + e % 32u);
+    let q = select(byte >> 4u, byte & 0xFu, (e % 64u) < 32u);
+    return d * sm.x * f32(q) - dmin * sm.y;
+}
+
+fn dequant_q4k_pack8(k_base: u32, n_idx: u32) -> array<f32, 8> {
+    let base = (n_idx * (params.k / 256u) + k_base / 256u) * 36u;
+    let hdr = matrix_b[base];
+    let d = q4k_decode_f16(hdr & 0xFFFFu);
+    let dmin = q4k_decode_f16(hdr >> 16u);
+    let e = k_base % 256u;
+    let sm = q4k_scale_min(base, e / 32u);
+    let scale = d * sm.x;
+    let offset = dmin * sm.y;
+    // Eight 8-aligned elements share a sub-block and a nibble half, and
+    // span eight consecutive bytes - two words, because GGML pairs e with
+    // e + 32 rather than e with e + 1.
+    let low = (e % 64u) < 32u;
+    let wbase = base + (16u + (e / 64u) * 32u + e % 32u) / 4u;
+    let w0 = matrix_b[wbase];
+    let w1 = matrix_b[wbase + 1u];
+    var out: array<f32, 8>;
+    for (var i = 0u; i < 8u; i++) {
+        let w = select(w1, w0, i < 4u);
+        let byte = (w >> ((i % 4u) * 8u)) & 0xFFu;
+        let q = select(byte >> 4u, byte & 0xFu, low);
+        out[i] = scale * f32(q) - offset;
     }
     return out;
 }
@@ -1653,12 +1745,26 @@ pub fn generate_module_weighted(group: ShaderGroup, format: WeightFormat) -> Sha
         ShaderGroup::Embedding if mode == WeightFormat::F16 => {
             parse_wgsl(include_str!("shaders/embedding_f16.wgsl"))
         }
-        ShaderGroup::MatMulGemv if mode == WeightFormat::Q4 => {
-            gen_matmul_gemv_q4(include_str!("shaders/matmul_gemv.wgsl"))
-        }
-        ShaderGroup::MatMulGemvAdd if mode == WeightFormat::Q4 => {
-            gen_matmul_gemv_q4(include_str!("shaders/matmul_gemv_add.wgsl"))
-        }
+        ShaderGroup::MatMulGemv if mode == WeightFormat::Q4 => gen_matmul_gemv_packed(
+            include_str!("shaders/matmul_gemv.wgsl"),
+            Q4_DEQUANT_FN,
+            "dequant_q4",
+        ),
+        ShaderGroup::MatMulGemvAdd if mode == WeightFormat::Q4 => gen_matmul_gemv_packed(
+            include_str!("shaders/matmul_gemv_add.wgsl"),
+            Q4_DEQUANT_FN,
+            "dequant_q4",
+        ),
+        ShaderGroup::MatMulGemv if mode == WeightFormat::Q4K => gen_matmul_gemv_packed(
+            include_str!("shaders/matmul_gemv.wgsl"),
+            Q4K_DEQUANT_FN,
+            "dequant_q4k",
+        ),
+        ShaderGroup::MatMulGemvAdd if mode == WeightFormat::Q4K => gen_matmul_gemv_packed(
+            include_str!("shaders/matmul_gemv_add.wgsl"),
+            Q4K_DEQUANT_FN,
+            "dequant_q4k",
+        ),
         ShaderGroup::MatMulGemv | ShaderGroup::MatMulGemvBT if mode == WeightFormat::F16 => {
             if group == ShaderGroup::MatMulGemv {
                 gen_matmul_gemv_f16()
@@ -1666,8 +1772,18 @@ pub fn generate_module_weighted(group: ShaderGroup, format: WeightFormat) -> Sha
                 gen_matmul_gemv_bt_f16()
             }
         }
-        // MatMulGemvBT has no Q4 variant; compile.rs keeps Q4 off that
-        // specialization so this never emits an f32 shader for packed data.
+        // MatMulGemvBT has no packed variant; compile.rs keeps Q4 and Q4_K
+        // off that specialization so this never emits an f32 shader for
+        // packed data.
+        //
+        // Q4_K is newer than that arrangement and has fewer variants, so it
+        // asserts rather than trusting the routing: falling through here
+        // would read 144-byte superblocks as f32 and produce plausible
+        // garbage rather than an error.
+        _ if mode == WeightFormat::Q4K => panic!(
+            "no Q4_K variant for {group:?}; it is supported on the tiled \
+             matmul groups and the K-split GEMV only"
+        ),
         _ => generate_module(group),
     }
 }
@@ -1800,7 +1916,12 @@ fn gemv_width_source(source: &str, variable: &str, initial: u32) -> String {
 /// the declaration and the load line. `matmul_gemv_bt.wgsl` is not
 /// covered: it reads B as [N, K], and the Q4 block layout runs along K
 /// per column of a [K, N] weight, so it needs its own index mapping.
-fn gen_matmul_gemv_q4(src: &str) -> ShaderModule {
+/// Re-point a K-split GEMV at a nibble-packed B buffer.
+///
+/// The GEMV reads B as `vec4<f32>` rows; `helpers` supplies the WGSL dequant
+/// functions and `call` names the scalar entry point, so the four columns of
+/// each vec4 are decoded individually instead of loaded.
+fn gen_matmul_gemv_packed(src: &str, helpers: &str, call: &str) -> ShaderModule {
     let src = src
         .replace(
             "var<storage> matrix_b: array<vec4<f32>>;",
@@ -1808,17 +1929,19 @@ fn gen_matmul_gemv_q4(src: &str) -> ShaderModule {
         )
         .replace(
             "@compute @workgroup_size(",
-            &format!("{Q4_DEQUANT_FN}\n@compute @workgroup_size("),
+            &format!("{helpers}\n@compute @workgroup_size("),
         )
         .replace(
             "let b = matrix_b[kk * n_v4 + col4];",
-            "let col = col4 * 4u;\n\
+            &format!(
+                "let col = col4 * 4u;\n\
         let b = vec4<f32>(\n\
-            dequant_q4(kk, col),\n\
-            dequant_q4(kk, col + 1u),\n\
-            dequant_q4(kk, col + 2u),\n\
-            dequant_q4(kk, col + 3u),\n\
-        );",
+            {call}(kk, col),\n\
+            {call}(kk, col + 1u),\n\
+            {call}(kk, col + 2u),\n\
+            {call}(kk, col + 3u),\n\
+        );"
+            ),
         );
     parse_wgsl(&src)
 }
@@ -6436,6 +6559,54 @@ mod tests {
             sm.source.contains("exp(-"),
             "Q4+sigmoid must emit a store-side sigmoid"
         );
+    }
+
+    /// Q4_K is read out of a GGUF file unmodified, so the shader must
+    /// declare B as words and decode superblocks rather than load floats.
+    #[test]
+    fn q4k_shaders_read_packed_superblocks() {
+        for group in [
+            ShaderGroup::MatMul,
+            ShaderGroup::MatMulAdd,
+            ShaderGroup::MatMulAT,
+            ShaderGroup::MatMulBT,
+        ] {
+            let sm = generate_module_weighted(group, WeightFormat::Q4K);
+            assert!(
+                sm.source.contains("dequant_q4k"),
+                "Q4_K {group:?}: missing the superblock decoder"
+            );
+            assert!(
+                sm.source.contains("array<u32>") && !sm.source.contains("matrix_b: array<f32>"),
+                "Q4_K {group:?}: B must be words, not floats"
+            );
+            // 36 u32s per superblock is the layout the decoder assumes.
+            assert!(
+                sm.source.contains("36u"),
+                "Q4_K {group:?}: missing the 144-byte superblock stride"
+            );
+        }
+        // The large tile stages eight elements per thread through one scale
+        // unpack; losing that silently falls back to eight scalar decodes.
+        let tiled = generate_module_weighted(ShaderGroup::MatMul, WeightFormat::Q4K);
+        assert!(
+            tiled.source.contains("dequant_q4k_pack8"),
+            "Q4_K tiled MatMul must use batched staging"
+        );
+        // Decode runs the K-split GEMV, which is a different shader.
+        let gemv = generate_module_weighted(ShaderGroup::MatMulGemv, WeightFormat::Q4K);
+        assert!(
+            gemv.source.contains("dequant_q4k") && gemv.source.contains("array<u32>"),
+            "Q4_K GEMV must decode superblocks"
+        );
+    }
+
+    /// Falling through to the f32 module for a Q4_K dispatch would read
+    /// 144-byte superblocks as floats and produce plausible garbage.
+    #[test]
+    #[should_panic(expected = "no Q4_K variant")]
+    fn q4k_refuses_groups_without_a_variant() {
+        let _ = generate_module_weighted(ShaderGroup::MatMulGemvBT, WeightFormat::Q4K);
     }
 
     /// The epilogue skeleton has to be specialized for the tile the
