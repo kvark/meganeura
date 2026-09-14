@@ -78,7 +78,7 @@ qualification belong on experiment refs, not the default regression path.
 ## Diagnose through the stack
 
 On failure, keep the source revision, configuration and deterministic inputs,
-then follow [the observability guide](study/observability.md): name values,
+then use the [debugging tools](../README.md#debugging): name values,
 materialize the suspect intermediates, disable aliasing/fusion as controls,
 inspect `step_debug`, parameter gradients and dispatch provenance, and dump
 the implicated shader. For time regressions use uninstrumented timing first,

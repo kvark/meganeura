@@ -41,9 +41,8 @@ does not enter primary tables/aggregates. The MI300X report likewise is not
 a timing cell. No public hosting choice is required to replay the supplied
 supplement; a persistent DOI would still help discovery.
 
-Publication files stay outside Git; [SUBMISSION.md](../SUBMISSION.md) describes
-the PDF, LaTeX source ZIP and supplementary ZIP. The annotated
-paper-p3hpc-2026 tag preserves the measured engine. No GPU benchmark was run
+The publication PDF, LaTeX source ZIP and supplementary ZIP stay outside Git.
+The annotated paper-p3hpc-2026 tag preserves the measured engine. No GPU benchmark was run
 during the paper update.
 
 ## Original-submission artifact (legacy)

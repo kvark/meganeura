@@ -13,18 +13,19 @@ The current tuning-foundation milestone is **closed**. The final
 passes 230/240 accuracy rows but fails tiny cancellation cases, so its arithmetic
 change is not retained and split-K promotion is deferred. No conditional
 whole-step cohort follows the failed gate. The next active milestone is
-[paper finalization](../paper/p3hpc/REVISION.md). The engineering tracks below
-are a deferred research backlog, not additional requirements for this freeze.
+paper finalization. The engineering tracks below are a deferred research
+backlog, not additional requirements for this freeze.
 
-The [study guide](study/README.md), [audit](audit-2026-09.md) and
-[performance plan](study/performance-plan.md) are the current decision record.
+The [audit](audit-2026-09.md) and [experiment ledger](experiments.md)
+record engineering decisions.
 The detailed tracks below retain earlier motivation and experiment notes;
 historical timings and rejected ideas are not current universal guarantees.
 
 The frozen GPU-reference matrix has 12/20 strict minimal-latency wins but a
 1.78× median valid training-time ratio. Discrete AMD is strong; Apple training
 still loses to eager MPS. Intel is compared with a labeled CPU fallback.
-See [results](study/results.md) for denominators and numerical gates. Do not
+See the [original-submission artifact](../paper/p3hpc/artifact/README.md#original-submission-artifact-legacy)
+for denominators and numerical gates. Do not
 mix exploratory Inferena history with publication-grade results.
 
 State-isolated exact-class search is implemented for the existing 32/64 scalar
@@ -32,7 +33,7 @@ and legal native-f32 cooperative matmul tiles. It is default-off. Scalar GPU
 qualification passed on RTX 5070; native-f32 hardware and fleet qualification
 remain ahead. A separate harness checks transfer to whole-step time;
 automatic confirmation, f16-input/complex-fusion search and persistence remain open.
-See the [implementation contract](study/performance-plan.md).
+See the [tuning API](../src/tune.rs).
 The [five-process synthetic transfer pilot](experiments.md#tuning-2026-09-05)
 shows repeatable 1.15×/1.13× whole-step gains on two larger chains, with no
 selection change on two smaller ones. It is not model/fleet qualification.
@@ -92,7 +93,7 @@ and whole-step confirmation;
 attention schedules remain a separate device-qualified family.
 Keep tuning opt-in; do not fit a smaller margin or model rule.
 
-The [checkpoint/memory follow-up](study/checkpoints-and-memory.md) implements
+The [checkpoint implementation](../src/runtime/checkpoint.rs) provides
 logical format-3 saves and preflighted restores, lazy Adam/LaProp state, and
 resident tensor-buffer accounting. RTX tests cover malformed late fields,
 different allocation padding, the next optimizer update, and an 8 MiB unused
@@ -336,7 +337,7 @@ overrun logical-sized grouped diagnostics. Raw F32 reads are capacity-checked.
 **Still open:** driver-peak sampling on larger workloads, Metal↔Vulkan restore
 qualification, structured allocation failures, crash-atomic checkpoint file
 replacement, and a separately designed complete training-loop snapshot.
-See the [contract and tests](study/checkpoints-and-memory.md). This does not
+See the [checkpoint implementation](../src/runtime/checkpoint.rs). This does not
 implement activation rematerialization or reduce Adam's required moment size.
 
 ### B3. [research] E-graph rematerialization (activation checkpointing)
@@ -406,7 +407,6 @@ end-to-end type, advertised tile, feature-bit and backend support, followed
 by numerical qualification. Its f32-like exponent range helps the underflow
 problem but its shorter mantissa is not f32 accuracy. This is research, not
 a one-enum implementation task or a prerequisite blocked on completing C1.
-See the [precision plan](study/performance-plan.md).
 
 ### C3. Mixed-precision training recipe
 
@@ -557,9 +557,8 @@ Q4/Q8 weight formats, derived-param plumbing, and the training stack
 already coexist. Frozen quantized base + trainable f16/f32 LoRA
 adapters = fine-tuning SmolLM2/Gemma-class models on Radeon 780M /
 Apple M-series. MLX-LM already offers LoRA/QLoRA on Apple; the opportunity is
-a common Vulkan/Metal path, not uniqueness. See the sourced
-[alternatives comparison](study/alternatives.md). The quantized-weights-disable-coop restriction is
-acceptable here (LoRA matmuls are small; base-model matmuls are
+a common Vulkan/Metal path, not uniqueness. The quantized-weights-disable-coop
+restriction is acceptable here (LoRA matmuls are small; base-model matmuls are
 inference-shaped). Needs: LoRA graph helper in `nn`, gradient flow
 around frozen quantized params (StopGradient exists), an example +
 bench. Mostly assembly of existing parts; good first "product"
