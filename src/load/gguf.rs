@@ -343,13 +343,17 @@ impl GgufTensor {
         Ok(match self.ggml_type {
             GgmlType::F32 => self
                 .data
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&c| f32::from_le_bytes(c))
                 .collect(),
             GgmlType::F16 => self
                 .data
-                .chunks_exact(2)
-                .map(|c| f16_from_bits(u16::from_le_bytes([c[0], c[1]])))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&c| f16_from_bits(u16::from_le_bytes(c)))
                 .collect(),
             GgmlType::Q4_0 => dequant_q4_0(&self.data, count),
             GgmlType::Q4_1 => dequant_q4_1(&self.data, count),
@@ -713,7 +717,7 @@ fn f16_to_bits(v: f32) -> u16 {
 
 fn dequant_q4_0(data: &[u8], count: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; count];
-    for (b, chunk) in data.chunks_exact(18).enumerate() {
+    for (b, chunk) in data.as_chunks::<18>().0.iter().enumerate() {
         let d = f16_from_bits(u16::from_le_bytes([chunk[0], chunk[1]]));
         for j in 0..16 {
             let byte = chunk[2 + j];
@@ -726,7 +730,7 @@ fn dequant_q4_0(data: &[u8], count: usize) -> Vec<f32> {
 
 fn dequant_q4_1(data: &[u8], count: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; count];
-    for (b, chunk) in data.chunks_exact(20).enumerate() {
+    for (b, chunk) in data.as_chunks::<20>().0.iter().enumerate() {
         let d = f16_from_bits(u16::from_le_bytes([chunk[0], chunk[1]]));
         let m = f16_from_bits(u16::from_le_bytes([chunk[2], chunk[3]]));
         for j in 0..16 {
@@ -740,7 +744,7 @@ fn dequant_q4_1(data: &[u8], count: usize) -> Vec<f32> {
 
 fn dequant_q8_0(data: &[u8], count: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; count];
-    for (b, chunk) in data.chunks_exact(34).enumerate() {
+    for (b, chunk) in data.as_chunks::<34>().0.iter().enumerate() {
         let d = f16_from_bits(u16::from_le_bytes([chunk[0], chunk[1]]));
         for j in 0..32 {
             out[b * 32 + j] = f32::from(chunk[2 + j] as i8) * d;
@@ -764,7 +768,7 @@ fn q4k_scale_min(j: usize, scales: &[u8]) -> (u8, u8) {
 
 fn dequant_q4_k(data: &[u8], count: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; count];
-    for (b, chunk) in data.chunks_exact(144).enumerate() {
+    for (b, chunk) in data.as_chunks::<144>().0.iter().enumerate() {
         let d = f16_from_bits(u16::from_le_bytes([chunk[0], chunk[1]]));
         let dmin = f16_from_bits(u16::from_le_bytes([chunk[2], chunk[3]]));
         let scales = &chunk[4..16];
@@ -791,7 +795,7 @@ fn dequant_q4_k(data: &[u8], count: usize) -> Vec<f32> {
 
 fn dequant_q6_k(data: &[u8], count: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; count];
-    for (b, chunk) in data.chunks_exact(210).enumerate() {
+    for (b, chunk) in data.as_chunks::<210>().0.iter().enumerate() {
         let ql = &chunk[0..128];
         let qh = &chunk[128..192];
         let scales = &chunk[192..208];
