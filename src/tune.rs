@@ -552,6 +552,7 @@ impl TuneClass {
             .chain(
                 [[16, 16], [16, 32], [32, 16]]
                     .into_iter()
+                    .filter(|_| self.shader == ShaderEntry::Conv2dGradWeightGemm)
                     .flat_map(|[rows, columns]| {
                         [16, 32]
                             .into_iter()
@@ -1108,7 +1109,7 @@ mod tests {
                 }
             );
             let candidates = class.challengers(MatmulTile::Tile64, Some(&native_config(16)));
-            assert_eq!(candidates.len(), 11);
+            assert_eq!(candidates.len(), if forward || dx { 5 } else { 11 });
             for candidate in candidates {
                 assert_eq!(
                     serde_json::from_value::<MatmulTile>(serde_json::to_value(candidate).unwrap())
