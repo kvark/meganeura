@@ -38,9 +38,9 @@ kvark@fastmail.com \quad ORCID: 0009-0005-6410-4276}}
 \maketitle
 
 \begin{abstract}
-Graphics application programming interfaces (APIs) offer a common execution path for machine learning across
-consumer and edge graphics processing units (GPUs), but their performance
-and accelerator coverage need measurement. Meganeura is a compact native
+Graphics application programming interfaces (APIs) offer a common execution
+path for machine learning across consumer and edge graphics processing
+units (GPUs). Meganeura is a compact native
 compiler and runtime that lowers tensor graphs and automatic
 differentiation to Vulkan and Metal kernels. We evaluate five workloads
 on eight device configurations, including an NVIDIA H100 and Windows, with one PyTorch
@@ -57,11 +57,10 @@ native sessions; preparation cost and performance gains remain workload-dependen
 Meganeura executes on an Intel integrated GPU without a usable PyTorch
 GPU path; a separate AMD MI300X attempt
 instead exposes missing Vulkan driver support.
-Numerical gates, preparation costs, failure records, and
-separate host/GPU diagnostics make the tradeoff explicit:
-graphics APIs broaden deployment options, but do not eliminate
-vendor-kernel advantages or guarantee access to every high-performance
-computing (HPC) accelerator.
+Graphics APIs broaden deployment options, while vendor compute stacks
+retain a performance advantage on most workloads. Validation, preparation
+costs, and host/GPU profiles help explain where this approach is useful
+and what limits its reach into high-performance computing (HPC).
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -77,10 +76,9 @@ program target heterogeneous hardware
 Graphics APIs suggest a complementary substrate for machine learning
 (ML): Vulkan exposes cross-vendor graphics and compute, while Metal
 serves Apple platforms \cite{khronos2026vulkan,apple2026metal}.
-An application already using these APIs can potentially share its driver,
-resources, and execution queue with a tensor runtime.
-That deployment advantage is useful from workstations to edge devices,
-but does not establish competitive kernel performance or universal support.
+An application already using these APIs can share its driver, resources,
+and execution queue with a tensor runtime. We investigate the performance
+and hardware coverage of that deployment choice.
 
 We study \system{}, a compact native compiler and runtime that lowers a
 typed tensor graph and its differentiated training graph to specialized
@@ -98,8 +96,8 @@ and CPU wheels. Every reference uses default compilation. CUDA, HIP, and
 XPU execute explicitly captured, numerically qualified whole-phase graphs;
 MPS has no equivalent public replay interface. Native empirical selection
 is always enabled, independently of the reference's compiler mode.
-The question is which performance a bounded preparation policy makes
-deployable, not what unlimited kernel search could eventually achieve.
+We measure the performance available after bounded preparation, including
+the cost of preparing each workload.
 
 Performance, portability, and productivity (P3) raise three distinct questions.
 \emph{Performance} is elapsed
@@ -232,11 +230,10 @@ The measured per-session search budget is 60 seconds, without a class-count
 cutoff, and at most 1\,GiB of scratch storage, also constrained by available
 device memory. The time limit is soft: it cannot preempt
 an in-flight driver compilation or GPU qualification.
-It follows greedy graph
-rewriting; it does not jointly search graph representations and all kernel
-families. Thus graph compilation and empirical kernel selection share one
-deployment step, but broad autotuning coverage is an engineering
-opportunity rather than an assumed property of this experiment.
+Search follows greedy graph rewriting. Graph compilation and measured
+kernel selection share one deployment step, although graph representations
+and some kernel families remain outside the search
+(Section~\ref{sec:search}).
 
 \section{Methodology}
 \label{sec:method}
@@ -244,10 +241,11 @@ opportunity rather than an assumed property of this experiment.
 \inferena{}, the open-source cross-framework harness, constructs matched
 workloads, alternates engine order, synchronizes timing boundaries,
 and records raw samples, outputs, gradient norms, revisions, and
-environment metadata.\footnote{\url{https://github.com/kvark/inferena}}
+environment metadata.\footnote{\href{https://github.com/kvark/inferena/tree/fa5a04e1c1b38405cfa371a27c5dcef1319835d5}{Inferena source, revision \code{fa5a04e1}}.}
 It supplies kernels to neither engine.
 
 \subsection{Revisions and reference conditions}
+\label{sec:reference-policy}
 
 Every supplied campaign uses \inferena{} \code{fa5a04e1} and
 \system{} \code{428fc2d2}, with Blade \code{f6f2729}.
@@ -260,15 +258,24 @@ Driver, host, and backend-library differences remain part of the platform;
 a common PyTorch revision does not make those implementations identical.
 
 Arithmetic and preparation are separate axes. Both arithmetic contracts
-pair tuned Meganeura with default-compiled PyTorch. PyTorch's
-\code{max-autotune}, GEMM/pointwise search and coordinate-descent options
-are disabled; default compiler and vendor-library heuristics still apply
-\cite{pytorch2026compile}. A supervisor enforces a 120-second compilation
-deadline covering the first forward, backward, and minimal-shape
+pair tuned Meganeura with default-compiled PyTorch.
+We choose this preparation policy because max-autotune was costly and
+unreliable during bring-up: an H100 pilot spent 170.3 minutes compiling
+30 searched pairs versus 14.0 minutes for the same default/replay matrix
+(Section~\ref{sec:productivity}), while Radeon searches failed and Arc's first
+searched ResNet qualification did not finish within an hour
+(Section~\ref{sec:availability}).
+Default compilation gives every backend the same practical reference policy.
+
+PyTorch's \code{max-autotune}, GEMM/pointwise search and coordinate-descent
+options are disabled; default compiler and vendor-library heuristics still
+apply \cite{pytorch2026compile}. A supervisor enforces a 120-second
+compilation deadline covering the first forward, backward, and minimal-shape
 specializations, terminating compiler descendants on failure.
-It does not charge model loading, graph capture, or research validation
-to that deadline. Meganeura instead uses the per-session search ceiling
-above; these are explicit practical limits, not equal end-to-end budgets.
+Model loading, graph capture, and research validation are outside that deadline.
+Meganeura uses the per-session search ceiling above. These limits bound
+preparation differently; this is neither an equal-budget contest nor a
+comparison with the fastest PyTorch configuration obtainable after a long search.
 
 CUDA and ROCm use \code{torch.cuda.CUDAGraph}; ROCm maps that interface
 to HIP graphs. Intel uses \code{torch.xpu.XPUGraph}
@@ -390,8 +397,8 @@ RTX~5070 and B570 share the same host and are measured sequentially,
 not concurrently. B570 uses a secondary PCIe~3.0 $\times$1 link;
 the study does not normalize interconnect bandwidth across platforms.
 Valid/selected counts whole paired processes across both arithmetic
-contracts and the selected condition. Max-autotune is omitted everywhere;
-omission alone is not a newly observed backend failure.
+contracts under the common default-compilation policy
+(Section~\ref{sec:reference-policy}).
 Eight completed campaigns contribute 240 pairs, including all 30
 selected Windows pairs. The H100 extension contributes 12 valid
 pairs: 252 valid pairs in total, with no interrupted campaign.
@@ -440,16 +447,15 @@ With accelerated arithmetic, the corresponding median ratios are
 These populations describe the declared available configurations, not
 equal accelerator capabilities or statistically established win counts.
 
-Radeon is the strongest performance surface. Strict RX~7900~XT SmolLM2
+Meganeura is most competitive on the Radeon devices. Strict RX~7900~XT SmolLM2
 and SmolVLA inference ratios are 0.89 and 0.76; their minimal shapes are
 0.32 and 0.34. SmolVLA training is faster at 0.70.
 Radeon~780M wins three inference and two training comparisons in strict
 mode, while convolution workloads remain its principal deficits.
 Arc~B570's compiled, replayed reference wins every phase in both contracts:
 strict full-inference ratios span 2.32--4.31 and training 3.46--5.98.
-Native-f32 cooperative use does not establish a universal Metal advantage:
-M3 wins diffusion inference (0.46) and three minimal shapes, but none of
-the five training comparisons.
+M3 uses native-f32 cooperative matrices and wins diffusion inference
+(0.46) and three minimal shapes, but none of the five training comparisons.
 
 On RTX~5070, strict ResNet inference is faster at 0.87, while other
 full-inference ratios span 1.24--2.72 and training spans 2.16--2.83.
@@ -464,11 +470,11 @@ Accelerated ResNet has the largest gap. These engine/driver results
 cannot, by themselves, attribute that difference to barriers or one
 instruction family.
 
-Process variation is visible rather than filtered out. The widest native
-range is M3 strict SmolVLA training: 52.84--109.03\,ms around a 70.40\,ms
-median. H100 strict ResNet inference ranges 4.26--6.55\,ms around 4.58\,ms.
-Neither a tuned receipt nor three short runs guarantees a stable optimum;
-the M3 results in particular warrant caution about small differences.
+The widest native process range is M3 strict SmolVLA training:
+52.84--109.03\,ms around a 70.40\,ms median. H100 strict ResNet inference
+ranges 4.26--6.55\,ms around 4.58\,ms.
+Three short runs cannot establish a stable optimum, especially for the
+small differences on M3.
 
 \subsection{What compile-time search actually explores}
 \label{sec:search}
@@ -482,8 +488,8 @@ the M3 results in particular warrant caution about small differences.
 \input{tables/search}
 \end{table*}
 
-Table~\ref{tab:search} makes search coverage observable.
-Across 708 sessions, 684 visit every eligible class, including sessions
+Table~\ref{tab:search} reports search coverage.
+Of 708 sessions, 684 visit every eligible class, including sessions
 with no eligible class. In total, 13,322 of 14,085 class instances are
 visited. The 24 deadline-limited sessions are ResNet training on 780M,
 B570, M3, and RPL-U; all other sessions finish their declared search.
@@ -497,10 +503,8 @@ The legal domain includes scalar-f32 matrix implementations, supported
 native-f32 cooperative alternatives, and shape/staging choices for
 convolution forward and derivatives. It does not include every generated
 kernel: matrix--vector multiplication (GEMV), reduced-input cooperative variants,
-complex fused prologues,
-and graph representation changes are not all searched. Removing a
-class-count cutoff therefore increases measured coverage without making
-the compiler an exhaustive whole-program optimizer.
+complex fused prologues, and graph representation changes remain outside
+the implemented search.
 M3 records 2,150 cooperative dispatch instances across the 15 strict
 processes; their presence is verified, but this cohort contains no
 cooperative-off ablation from which to infer a causal speedup.
@@ -542,8 +546,7 @@ Thus larger weights do not uniformly amortize the difference.
 Accelerated training instead widens 5.29$\rightarrow$5.64$\rightarrow$7.10;
 accelerated 1.7B prefill is $12.22\times$ PyTorch's, and native prefill
 itself is slower than strict (53.66 versus 34.20\,ms).
-A broader arithmetic permission is not a guarantee of a faster selected
-implementation; reduced-input paths remain an optimization target.
+The accelerated native path therefore also needs investigation.
 Architecture and shape also change between variants. These are
 small-batch, short-context scaling observations, not a fitted scaling
 law or a production LLM serving/training benchmark.
@@ -589,9 +592,8 @@ conditional performance scores.
 
 The matched matrix contains no Android reference, so Android contributes no
 performance-portability score. A separately versioned physical deployment
-tests whether the same source stack closes over an edge application rather
-than only benchmark runners. DinoVision reconstructs the headset cameras'
-live images from features computed by a vision encoder
+tests the stack in an interactive edge application. DinoVision reconstructs
+the headset cameras' live images from features computed by a vision encoder
 (DINOv3~\cite{simeoni2025dinov3}). Figure~\ref{fig:dinovision} shows the
 reconstructed view displayed on the headset. \system{} trains
 a 2.01-million-parameter decoder on a host GPU, saves its parameters, and
@@ -625,10 +627,9 @@ relative $L_2=0.000457$ against the host. An isolated synchronized run takes
 two chunks costs 4.1\% in isolation, but under a 90-second live stereo sweep
 it raises application render submissions by 18.8\%, raises the lower-eye
 update rate by 8.7\%, and reduces median worker latency by 20.2\%. Larger
-chunk counts regress non-monotonically. The lesson is not that two chunks
-are universally optimal; it is that graphics/compute co-tenancy exposes a
-scheduling dimension that an inference-only benchmark misses, and the
-shared graphics stack can expose that control without a second GPU runtime.
+chunk counts regress non-monotonically. The best schedule here differs
+between isolated inference and a shared rendering queue. A common graphics
+stack lets the application make that choice without a second GPU runtime.
 
 This case study establishes deployment closure and queue co-tenancy, not
 on-device training or speedup over PyTorch on Android. Its weights, raw
@@ -691,7 +692,7 @@ Just twelve small-output weight-gradient dispatches consume 34.1\%.
 The slowest takes 4.475\,ms and launches only ten workgroups on 48
 streaming multiprocessors (SMs),
 reducing 50,176 elements into each entry of a $64\times147$ matrix.
-This exposes inadequate output parallelism, not a uniform API penalty.
+The small output leaves most SMs without a workgroup to execute.
 
 A short grouped Nsight Graphics capture corroborates underutilization:
 one complete 40.64\,ms training interval reaches 32.1\% of peak SM
@@ -703,7 +704,7 @@ is \emph{not} Vulkan resource-barrier wall cost
 The Graphics-only runner shares a context and adds a phase trigger;
 its controls preserve the retained outputs and gradient norms.
 Source, instrumentation boundaries, and commands are retained on the
-diagnostic branch.\footnote{\url{https://github.com/kvark/inferena/blob/experiment/nvidia-gap-2026-09-13/ANALYSIS-2026-09-13.md}}
+diagnostic revision.\footnote{\href{https://github.com/kvark/inferena/blob/3f8f994ce02aaf89ec5167d601403dc314b08e93/ANALYSIS-2026-09-13.md}{RTX~5070 diagnostic, revision \code{3f8f994c}}.}
 
 The diagnostic's ordinary production-binary
 log run visits only five of 71 eligible training classes before its
@@ -731,7 +732,7 @@ response, rather than a system malfunction. Here it nevertheless raises
 command-recording cost and token latency; energy savings were not measured.
 This explains a short-window latency sensitivity; it is not a GPU-barrier
 measurement or a reason to discard slower final-cohort samples.
-\footnote{\url{https://github.com/kvark/inferena/blob/experiment/p3hpc-gap-2026-09-10/ANALYSIS.md}}
+\footnote{\href{https://github.com/kvark/inferena/blob/89b2d3e71d9a8cb9d22c6ab0800ca4a43e3ba3a7/ANALYSIS.md}{Transformer diagnostic, revision \code{89b2d3e7}}.}
 
 Profile-guided engineering already contributes a production improvement.
 Immutable convolution indexing and alternative staging are now ordinary
@@ -752,6 +753,19 @@ copy improve separate resident-model experiments; the current production
 tuner does not search those choices.
 These results identify workgroup geometry and graph representation as
 reusable search dimensions.
+
+Matrix instruction access may also contribute to the accelerated H100 gap.
+Hopper's CUDA/PTX path exposes asynchronous matrix operations across a
+128-thread warpgroup (\code{wgmma}), with explicit issue and completion
+control \cite{nvidia2026wgmma}. The measured Blade/Naga Vulkan path accepts
+only subgroup-scope $8\times8$ or $16\times16$ tiles
+\cite{blade2026matrices}; it does not expose that programming model.
+Vulkan's vendor extension \code{VK\_NV\_cooperative\_matrix2} adds workgroup
+scope and more flexible dimensions, but this stack does not use it
+\cite{khronos2024cooperative2}. This is a possible implementation/capability
+gap. Determining its contribution requires inspecting matched-precision
+machine code on H100; these measurements establish neither a specific
+instruction deficit nor a fundamental Vulkan limit.
 
 None of these measurements establishes a removable Vulkan-barrier
 percentage. Workgroup barriers inside shaders, resource dependencies
@@ -799,28 +813,26 @@ specialization spans 0.53--96.00\,s native and 1.91--84.40\,s PyTorch.
 The medians over these 35 workload/device groups are 7.61 and 29.98\,s.
 All reference compilations finish below the enforced 120-second limit.
 
-Always-on search is not uniformly cheaper than default compilation.
+Preparation cost varies substantially by workload.
 Native strict ResNet preparation takes 33.81 versus 13.26\,s on RTX~5070,
-and 96.00 versus 5.72\,s on M3. The primary question is performance under
-the declared preparation limits, not an assertion that every native
-search fits inside PyTorch's actual compilation time.
-Nor is qualification search: the H100 extension spends 27.32 cumulative
-minutes in full-tensor reference qualification versus 9.88 in compilation.
+and 96.00 versus 5.72\,s on M3. Native tuning can therefore take longer
+than default PyTorch compilation.
+Qualification adds a separate cost: the H100 extension spends 27.32
+cumulative minutes in full-tensor reference qualification versus 9.88
+in compilation.
 Large host readbacks and numerical comparisons can dominate a collection
 without indicating expensive GPU kernel tuning.
 
-The separately retained H100 pilot in Section~\ref{sec:search} quantifies
-why unbounded reference search is an operational concern. Over 30 searched
+The H100 pilot in Section~\ref{sec:search} measures the cost of max-autotune.
+Over 30 searched
 pairs (five models, both contracts, three replicates), PyTorch
 compilation/first execution totals 170.3 minutes, versus 114.7 seconds
 for that pilot's two-second native search policy. Default PyTorch
 compilation over the equivalent 30 replayed pairs totals 14.0 minutes.
 For strict ResNet, max-autotune improves inference $1.28\times$ while
 compilation rises 14.09$\rightarrow$601.27\,s.
-These are measured preparation/performance tradeoffs, not one model
-taking 2.84 hours to tune or an equal search-space comparison.
-The primary cohort selects bounded default compilation on every backend
-rather than repeatedly requiring this multi-hour searched arm.
+The 170.3-minute total covers the entire searched matrix, not one model.
+It motivates the primary cohort's default-compilation policy on every backend.
 
 Cheap shader translation makes deployment-time search practical, but is
 only one stage. A separate RTX~5070 compiler study measures median WGSL
@@ -831,9 +843,8 @@ and with fresh private disk caches, measures 30.8--31.2\,ms to prepare
 a native candidate versus 100.4--166.6\,ms for Triton.
 Both include machine-code preparation; allocation and execution are
 outside these intervals. This is a few-fold candidate-preparation
-advantage, not a comparison of WGSL parsing alone against complete
-Triton compilation. Sources and commands are retained with the
-compiler-stage experiments.\footnote{\url{https://github.com/kvark/meganeura/blob/main/docs/experiments.md}}
+advantage once native driver work is included. Sources and commands are
+retained with the compiler-stage experiments.\footnote{\href{https://github.com/kvark/meganeura/blob/428fc2d2322229e5338f5d80a10d700340d593cd/docs/experiments.md}{Compiler experiments, revision \code{428fc2d2}}.}
 
 Compile-time autotuning is established practice
 \cite{chen2018tvm,tillet2019triton}. The architectural opportunity here is
@@ -894,7 +905,7 @@ AMD- or Intel-only substitute. These measurements are deployable alternatives,
 not a claim that larger searches could never improve performance.
 Bring-up findings are documented separately from final timing records;
 omitted max-autotune arms do not count as new failures.
-\footnote{\url{https://github.com/kvark/inferena/blob/fa5a04e1/EXPERIMENT.md}}
+\footnote{\href{https://github.com/kvark/inferena/blob/fa5a04e1c1b38405cfa371a27c5dcef1319835d5/EXPERIMENT.md}{Inferena protocol and bring-up notes, revision \code{fa5a04e1}}.}
 
 MI300X exposes a different boundary: driver availability for a
 compute-focused accelerator. PyTorch/ROCm runs strict 135M on the attempted
@@ -1116,11 +1127,9 @@ a uniform scaling advantage; accelerated large-model behavior is less favorable.
 
 Meganeura's contribution is a compact, shared graphics deployment path in
 which graph compilation can also perform measured kernel choice.
-This integration yields useful candidates within bounded preparation,
-not universally cheaper compilation or superior steady-state performance.
-RPL-U and MI300X demonstrate complementary support boundaries.
-Performance, numerical validity, preparation cost, and actual availability
-must be reported together.
+Measured choice improves several workloads, but startup and steady-state
+costs still vary widely. RPL-U and MI300X also show why supported hardware
+belongs alongside timing and numerical validity in a portability comparison.
 
 \section*{Acknowledgments}
 
@@ -1132,21 +1141,22 @@ benchmark-harness and instrumentation development, experimental debugging,
 data analysis, and drafting and editing throughout all numbered sections and
 the Artifact Description.
 AI-generated draft passages were subsequently reviewed and revised.
-Substantial portions of the \system{} and \inferena{} source code ---
-themselves objects of study in this paper --- were likewise developed with AI
-assistance under my direction and review. I designed the study and directed the experiments and analysis, and
-accept full responsibility for the content.
+Substantial portions of the \system{} and \inferena{} source code were also
+developed with AI assistance under my direction and review. I designed the
+study, directed the experiments and analysis, and accept full responsibility
+for the content.
 
 \appendix
 
 \section*{Artifact Description}
 
 \textbf{Source and measurements.}
-The public \href{https://github.com/kvark/meganeura}{Meganeura} and
-\href{https://github.com/kvark/inferena}{Inferena} repositories retain the
+The public \href{https://github.com/kvark/meganeura/tree/428fc2d2322229e5338f5d80a10d700340d593cd}{Meganeura} and
+\href{https://github.com/kvark/inferena/tree/fa5a04e1c1b38405cfa371a27c5dcef1319835d5}{Inferena} repositories retain the
 measured revisions \code{428fc2d2} and \code{fa5a04e1}.
-The Inferena \href{https://github.com/kvark/inferena/tree/experiment/p3hpc-cuda-graphs}{collection branch}
-contains the workflow. Nine campaign archives hold eight complete device campaigns and
+Meganeura's annotated tag \code{paper-p3hpc-2026} identifies the measured
+engine. The \href{https://github.com/kvark/inferena/tree/fa5a04e1c1b38405cfa371a27c5dcef1319835d5}{frozen Inferena workflow}
+contains the collection instructions. Nine campaign archives hold eight complete device campaigns and
 the complete H100 extension. The supplementary ZIP contains every JSON
 record from those archives, losslessly recompressed as
 \path{records.jsonl.xz}: manifests, raw and joined records, all timing
