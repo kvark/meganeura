@@ -6,22 +6,31 @@
   GGML splits a block's nibbles across halves and interleaves each block's
   header with its payload, where Meganeura pairs adjacent nibbles and keeps
   headers in their own region. The block *order* already agreed, since packing
-  performs the `[K, N]` transpose that GGUF's layout implies. `Q6_K` has no
-  equivalent and reaches f32 only, which requantizes. See
+  performs the `[K, N]` transpose that GGUF's layout implies. See
   `examples/gguf_info.rs`.
-- Native GGML Q4_K storage (`DType::Q4K`, `Graph::parameter_q4k`). Superblocks
-  are stored byte-for-byte as GGUF writes them, so loading is a copy and the
-  tiled matmul and K-split GEMV shaders decode 144-byte superblocks directly.
-  At 4.5 bits/weight against Meganeura Q4's 5.0 this reads 10% less weight
-  data, and it removes a dequantize/requantize round trip that was costing
-  ~3% peak error — quantizing an already-quantized weight roughly doubles the
-  error, since each stage contributes its own half-step.
+- Native GGML K-quant storage: `DType::Q4K` / `Graph::parameter_q4k` and
+  `DType::Q6K` / `Graph::parameter_q6k`. Superblocks are stored byte-for-byte
+  as GGUF writes them, so loading is a copy and the tiled matmul and K-split
+  GEMV shaders decode them directly.
 
-  Q4_K is the first load-only format: its encoder searches for per-sub-block
-  scales rather than computing them, so it cannot be produced from f32.
-  `set_parameter` rejects these parameters and points at
+  Q4_K reads 10% less weight data than Meganeura Q4 (4.5 bits/weight against
+  5.0), because it quantizes its own sub-block scales to 6 bits instead of
+  storing an f16 pair per 32 elements. Q6_K replaces what would otherwise be
+  Q8_0 for high-precision layers, at 6.56 bits/weight against 9.0 — 27% less.
+  Both remove a dequantize/requantize round trip that measured ~3% peak error
+  on Q4_K: quantizing an already-quantized weight roughly doubles the error,
+  since each stage contributes its own half-step.
+
+  Q6_K's 210-byte superblocks are not a whole number of words, so they
+  alternate word alignment and the shader reads every field byte-addressed;
+  buffers get a zero-padded tail while the superblocks stay verbatim.
+
+  These are the first load-only formats: a K-quant encoder searches for
+  per-sub-block scales rather than computing them, so they cannot be produced
+  from f32. `set_parameter` rejects such parameters and points at
   `set_parameter_packed`; `generate_module_weighted` asserts rather than
-  falling through to an f32 shader for a group with no Q4_K variant.
+  falling through to an f32 shader for a group with no K-quant variant, and
+  `compile.rs` keeps them off `MatMulGemvBT` as it already does for Q4.
 - Autotuning searches shape-specialized scalar convolutions and K-stage sizes
   for forward and both gradients; unused candidates are released after search.
 - Store-side unary epilogues (Relu/Sigmoid/Silu/Neg) now fuse into F16/Q4/Q8

@@ -37,17 +37,18 @@
 //! | `Q4_0` | repack to Meganeura Q4, `m = -8d` |
 //! | `Q4_1` | repack to Meganeura Q4 |
 //! | `Q8_0` | repack to Meganeura Q8 |
-//! | `Q4_K` | none — stored in GGML's own layout |
-//! | `Q6_K` | [`GgufTensor::to_f32`] only — see below |
+//! | `Q4_K`, `Q6_K` | none — stored in GGML's own layout |
 //!
-//! All but `Q6_K` are lossless. `Q4_K` needs no repack at all: Meganeura
-//! stores it byte-for-byte as GGML does, so [`GgufTensor::to_packed`] hands
-//! back the file's bytes and the shaders read them directly.
+//! Every type is lossless. The K-quants need no repack at all: Meganeura
+//! stores them byte-for-byte as GGML does, so [`GgufTensor::to_packed`] hands
+//! back the file's bytes and the shaders read them directly. (Q6_K's 210-byte
+//! superblocks are not a whole number of words, so its buffer gets a zero-
+//! padded tail; the superblocks themselves are untouched.)
 //!
-//! `Q6_K` still has no Meganeura equivalent, so `to_packed` rejects it and
-//! callers must go through `to_f32` and `Session::set_parameter`, which
-//! requantizes. That round trip roughly doubles the quantization error, so
-//! it is the remaining argument for another native format.
+//! [`GgufTensor::to_f32`] remains available for every type, and is what the
+//! reference dequantizers below implement — but going through it for a
+//! quantized weight requantizes on the way back in, roughly doubling the
+//! quantization error, so prefer `to_packed`.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -313,6 +314,16 @@ impl GgufTensor {
             GgmlType::Q4K => {
                 require_block_aligned(k, 256, "Q4_K")?;
                 Ok((DType::Q4K, self.data.clone()))
+            }
+            GgmlType::Q6K => {
+                require_block_aligned(k, 256, "Q6_K")?;
+                // 210-byte superblocks are not a whole number of words, so
+                // an odd count leaves the buffer two bytes short of the
+                // `array<u32>` binding. Pad the tail; the superblocks
+                // themselves stay byte-for-byte.
+                let mut bytes = self.data.clone();
+                bytes.resize(bytes.len().next_multiple_of(4), 0);
+                Ok((DType::Q6K, bytes))
             }
             other => Err(GgufError::UnsupportedPack(other)),
         }
@@ -1080,17 +1091,27 @@ mod tests {
         assert_eq!(ty.size_bytes(), packed.len());
     }
 
-    /// Q6_K is the one type left without a native form.
+    /// Q6_K superblocks are 210 bytes, so an odd count leaves the buffer two
+    /// bytes short of a word. The tail is padded for the `array<u32>`
+    /// binding; the superblocks themselves must survive untouched.
     #[test]
-    fn q6_k_still_refuses_to_pack() {
+    fn q6_k_packs_verbatim_with_a_padded_tail() {
+        let mut block = vec![0u8; 210];
+        for (i, b) in block.iter_mut().enumerate() {
+            *b = (i * 5 % 253) as u8;
+        }
         let bytes = Builder::new()
-            .tensor("w", &[256, 1], GgmlType::Q6K, &vec![0u8; 210])
+            .tensor("w", &[256, 1], GgmlType::Q6K, &block)
             .build();
         let m = load_gguf_bytes(&bytes).unwrap();
-        assert!(matches!(
-            m.tensors["w"].to_packed(),
-            Err(GgufError::UnsupportedPack(GgmlType::Q6K))
-        ));
+        let (dtype, packed) = m.tensors["w"].to_packed().unwrap();
+        assert_eq!(dtype, DType::Q6K);
+        assert_eq!(packed.len(), 212, "one superblock rounds up to 53 words");
+        assert_eq!(&packed[..210], &block[..], "superblock must be verbatim");
+        assert_eq!(&packed[210..], &[0, 0], "tail is zero padding");
+        // The declared parameter size has to agree with what packing emits.
+        let ty = crate::graph::TensorType::new(vec![256, 1], DType::Q6K);
+        assert_eq!(ty.size_bytes(), packed.len());
     }
 
     #[test]
