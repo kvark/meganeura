@@ -72,8 +72,14 @@ pub enum GgufError {
     /// A tensor whose element count does not fill whole blocks, or whose
     /// shape cannot be expressed as a Meganeura parameter.
     BadShape(String),
-    /// A type that has no lossless Meganeura packed equivalent.
+    /// A type that has no packed Meganeura form. `F32` and `F16` are
+    /// stored unpacked — read them with [`GgufTensor::to_f32`].
     UnsupportedPack(GgmlType),
+    /// A `ggml_type` this loader does not implement. Such tensors are
+    /// still listed in the inventory, but their bytes are not read, so
+    /// neither [`GgufTensor::to_packed`] nor [`GgufTensor::to_f32`] can
+    /// produce values for them.
+    UnsupportedType(u32),
     /// Underlying I/O failure.
     Io(std::io::Error),
 }
@@ -89,9 +95,11 @@ impl std::fmt::Display for GgufError {
             Self::BadShape(ref e) => write!(f, "GGUF shape error: {e}"),
             Self::UnsupportedPack(t) => write!(
                 f,
-                "{t:?} has no lossless Meganeura packed form; use to_f32() and \
-                 Session::set_parameter, which requantizes"
+                "{t:?} has no packed Meganeura form; read it with to_f32()"
             ),
+            Self::UnsupportedType(tag) => {
+                write!(f, "ggml_type {tag} is not implemented by this loader")
+            }
             Self::Io(ref e) => write!(f, "GGUF I/O error: {e}"),
         }
     }
@@ -105,23 +113,29 @@ impl From<std::io::Error> for GgufError {
     }
 }
 
-/// The `ggml_type` tags this loader understands.
+/// The `ggml_type` tags this loader understands, plus a catch-all.
 ///
-/// Numeric values are GGML's and are part of the file format.
+/// Tags are GGML's and are part of the file format; [`GgmlType::tag`]
+/// maps back to them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GgmlType {
-    F32 = 0,
-    F16 = 1,
-    Q4_0 = 2,
-    Q4_1 = 3,
-    Q8_0 = 8,
-    Q4K = 12,
-    Q6K = 14,
+    F32,
+    F16,
+    Q4_0,
+    Q4_1,
+    Q8_0,
+    Q4K,
+    Q6K,
+    /// A tag outside the set above. Carried so that a file holding one
+    /// unimplemented tensor still yields an inventory for the rest; the
+    /// tensor's bytes are not read, because its length depends on a block
+    /// size this loader does not know.
+    Other(u32),
 }
 
 impl GgmlType {
-    fn from_tag(tag: u32) -> Result<Self, GgufError> {
-        Ok(match tag {
+    fn from_tag(tag: u32) -> Self {
+        match tag {
             0 => Self::F32,
             1 => Self::F16,
             2 => Self::Q4_0,
@@ -129,22 +143,30 @@ impl GgmlType {
             8 => Self::Q8_0,
             12 => Self::Q4K,
             14 => Self::Q6K,
-            other => return Err(GgufError::UnknownType(other)),
-        })
-    }
-
-    /// Elements per stored block. Non-block types report 1.
-    pub fn block_elements(self) -> usize {
-        match self {
-            Self::F32 | Self::F16 => 1,
-            Self::Q4_0 | Self::Q4_1 | Self::Q8_0 => 32,
-            Self::Q4K | Self::Q6K => 256,
+            other => Self::Other(other),
         }
     }
 
-    /// Bytes per stored block, straight from `ggml-common.h`.
-    pub fn block_bytes(self) -> usize {
-        match self {
+    /// Whether this loader can read values of this type.
+    pub fn is_supported(self) -> bool {
+        !matches!(self, Self::Other(_))
+    }
+
+    /// Elements per stored block, or `None` for an unimplemented type.
+    /// Non-block types report 1.
+    pub fn block_elements(self) -> Option<usize> {
+        Some(match self {
+            Self::F32 | Self::F16 => 1,
+            Self::Q4_0 | Self::Q4_1 | Self::Q8_0 => 32,
+            Self::Q4K | Self::Q6K => 256,
+            Self::Other(_) => return None,
+        })
+    }
+
+    /// Bytes per stored block, straight from `ggml-common.h`, or `None`
+    /// for an unimplemented type.
+    pub fn block_bytes(self) -> Option<usize> {
+        Some(match self {
             Self::F32 => 4,
             Self::F16 => 2,
             // f16 d + 16 packed nibble bytes
@@ -157,18 +179,35 @@ impl GgmlType {
             Self::Q4K => 144,
             // 128 low-nibble + 64 high-bit + 16 int8 scales + f16 d
             Self::Q6K => 210,
-        }
+            Self::Other(_) => return None,
+        })
     }
 
     /// Byte length of `count` elements stored in this type.
     fn stored_bytes(self, count: usize) -> Result<usize, GgufError> {
-        let per = self.block_elements();
+        let (Some(per), Some(bytes)) = (self.block_elements(), self.block_bytes()) else {
+            return Err(GgufError::UnsupportedType(self.tag()));
+        };
         if !count.is_multiple_of(per) {
             return Err(GgufError::BadShape(format!(
                 "{count} elements is not a whole number of {per}-element {self:?} blocks"
             )));
         }
-        Ok(count / per * self.block_bytes())
+        Ok(count / per * bytes)
+    }
+
+    /// The numeric tag as it appears in the file.
+    pub fn tag(self) -> u32 {
+        match self {
+            Self::F32 => 0,
+            Self::F16 => 1,
+            Self::Q4_0 => 2,
+            Self::Q4_1 => 3,
+            Self::Q8_0 => 8,
+            Self::Q4K => 12,
+            Self::Q6K => 14,
+            Self::Other(tag) => tag,
+        }
     }
 }
 
@@ -294,12 +333,16 @@ impl GgufTensor {
     /// Repack into Meganeura's packed layout for `Session::set_parameter_packed`,
     /// returning the [`DType`] the parameter must be declared with.
     ///
-    /// Lossless: the quantized values themselves are carried across unchanged
-    /// and only their arrangement and scale encoding are adjusted. Rejects
-    /// `Q6_K`, which has no Meganeura equivalent.
+    /// Lossless for every quantized type. `Q4_0`, `Q4_1` and `Q8_0` are
+    /// rearranged into Meganeura's block layout without touching a value;
+    /// the K-quants need no work at all, since Meganeura stores them in
+    /// GGML's own layout and this hands back the file's bytes (Q6_K with a
+    /// zero-padded tail, its 210-byte superblocks not being a whole number
+    /// of words).
     ///
-    /// `Q4_K` is the one type that needs no work at all — Meganeura stores it
-    /// in GGML's own layout, so this hands back the file's bytes verbatim.
+    /// `F32` and `F16` are not packed formats and are rejected — read them
+    /// with [`GgufTensor::to_f32`]. So is any `ggml_type` this loader does
+    /// not implement.
     pub fn to_packed(&self) -> Result<(DType, Vec<u8>), GgufError> {
         let (k, _n) = self.matrix_dims()?;
         match self.ggml_type {
@@ -325,6 +368,7 @@ impl GgufTensor {
                 bytes.resize(bytes.len().next_multiple_of(4), 0);
                 Ok((DType::Q6K, bytes))
             }
+            GgmlType::Other(tag) => Err(GgufError::UnsupportedType(tag)),
             other => Err(GgufError::UnsupportedPack(other)),
         }
     }
@@ -360,6 +404,7 @@ impl GgufTensor {
             GgmlType::Q8_0 => dequant_q8_0(&self.data, count),
             GgmlType::Q4K => dequant_q4_k(&self.data, count),
             GgmlType::Q6K => dequant_q6_k(&self.data, count),
+            GgmlType::Other(tag) => return Err(GgufError::UnsupportedType(tag)),
         })
     }
 
@@ -378,7 +423,10 @@ impl GgufTensor {
     fn repack_q4(&self) -> Result<Vec<u8>, GgufError> {
         let count = self.num_elements();
         let blocks = count / 32;
-        let stride = self.ggml_type.block_bytes();
+        let stride = self
+            .ggml_type
+            .block_bytes()
+            .ok_or(GgufError::UnsupportedType(self.ggml_type.tag()))?;
         let symmetric = self.ggml_type == GgmlType::Q4_0;
         // Header region then payload region, mirroring `quantize_q4_0`.
         let mut out = vec![0u8; blocks * 4 + blocks * 16];
@@ -639,7 +687,7 @@ pub fn load_gguf_bytes(bytes: &[u8]) -> Result<GgufModel, GgufError> {
                 ))
             })?);
         }
-        let ggml_type = GgmlType::from_tag(r.u32()?)?;
+        let ggml_type = GgmlType::from_tag(r.u32()?);
         let offset = usize::try_from(r.u64()?).map_err(|_| {
             GgufError::BadShape(format!(
                 "tensor `{name}` has an offset too large for this platform"
@@ -666,32 +714,49 @@ pub fn load_gguf_bytes(bytes: &[u8]) -> Result<GgufModel, GgufError> {
     }
     let data_start = r.pos.next_multiple_of(alignment);
 
-    let mut tensors = HashMap::with_capacity(infos.len());
+    let mut tensors: HashMap<String, GgufTensor> = HashMap::with_capacity(infos.len());
     for info in infos {
         let count: usize = info.dims.iter().product();
-        let len = info.ggml_type.stored_bytes(count)?;
-        let start = data_start
-            .checked_add(info.offset)
-            .ok_or(GgufError::Truncated {
-                what: "tensor offset",
-                offset: data_start,
-            })?;
-        let end = start.checked_add(len).ok_or(GgufError::Truncated {
-            what: "tensor data",
-            offset: start,
-        })?;
-        if end > bytes.len() {
-            return Err(GgufError::Truncated {
+        // A type this loader does not implement has an unknown block size,
+        // so there is no way to say where its bytes end. List it with no
+        // data rather than failing the whole file: a mix that is mostly
+        // readable should still yield an inventory, and `to_packed` /
+        // `to_f32` report the unimplemented tag when someone asks for
+        // values.
+        let data = if info.ggml_type.is_supported() {
+            let len = info.ggml_type.stored_bytes(count)?;
+            let start = data_start
+                .checked_add(info.offset)
+                .ok_or(GgufError::Truncated {
+                    what: "tensor offset",
+                    offset: data_start,
+                })?;
+            let end = start.checked_add(len).ok_or(GgufError::Truncated {
                 what: "tensor data",
                 offset: start,
-            });
+            })?;
+            if end > bytes.len() {
+                return Err(GgufError::Truncated {
+                    what: "tensor data",
+                    offset: start,
+                });
+            }
+            bytes[start..end].to_vec()
+        } else {
+            Vec::new()
+        };
+        if tensors.contains_key(&info.name) {
+            return Err(GgufError::BadShape(format!(
+                "duplicate tensor name `{}`",
+                info.name
+            )));
         }
         tensors.insert(
             info.name,
             GgufTensor {
                 dims: info.dims,
                 ggml_type: info.ggml_type,
-                data: bytes[start..end].to_vec(),
+                data,
             },
         );
     }
@@ -879,7 +944,7 @@ mod tests {
             for &d in dims {
                 self.infos.extend_from_slice(&(d as u64).to_le_bytes());
             }
-            self.infos.extend_from_slice(&(ty as u32).to_le_bytes());
+            self.infos.extend_from_slice(&ty.tag().to_le_bytes());
             self.infos
                 .extend_from_slice(&(self.data.len() as u64).to_le_bytes());
             self.data.extend_from_slice(bytes);
@@ -1023,25 +1088,61 @@ mod tests {
     }
 
     /// The CPU reference the Q4_K shader is tested against, on a superblock
-    /// whose answer is worked out by hand.
+    /// whose values are worked out by hand from `ggml-quants.c` rather than
+    /// from this crate's own reader.
+    ///
+    /// Covers the parts the one-element version missed: a `j >= 4` sub-block,
+    /// whose 6-bit scale and min are split across two bytes with their high
+    /// two bits borrowed from the `j < 4` entries, and both nibble halves of
+    /// a 64-element span.
     #[test]
-    fn q4_k_dequantizes_against_a_known_value() {
+    fn q4_k_dequantizes_against_hand_computed_values() {
+        // Per-sub-block (scale, min), 6-bit each. Sub-block 5 deliberately
+        // uses a scale above 15 so the borrowed high bits matter.
+        let sc = [1u8, 2, 0, 0, 5, 35, 0, 0];
+        let mn = [0u8, 1, 0, 0, 4, 20, 0, 0];
+
         let mut block = vec![0u8; 144];
-        block[0..2].copy_from_slice(&f16_to_bits(1.0).to_le_bytes());
-        block[2..4].copy_from_slice(&f16_to_bits(0.0).to_le_bytes());
-        // Sub-block 0 gets scale 1; every quant nibble is 1.
-        block[4] = 1;
-        for b in block.iter_mut().skip(16) {
-            *b = 0x11;
+        block[0..2].copy_from_slice(&f16_to_bits(1.0).to_le_bytes()); // d
+        block[2..4].copy_from_slice(&f16_to_bits(1.0).to_le_bytes()); // dmin
+
+        // Inverse of `get_scale_min_k4`, written from the C rather than
+        // from `q4k_scale_min`.
+        let scales = &mut block[4..16];
+        for j in 0..4 {
+            scales[j] = sc[j] & 63;
+            scales[j + 4] = mn[j] & 63;
         }
+        for j in 4..8 {
+            scales[j + 4] = (sc[j] & 0x0F) | ((mn[j] & 0x0F) << 4);
+            scales[j - 4] |= (sc[j] >> 4) << 6;
+            scales[j] |= (mn[j] >> 4) << 6;
+        }
+
+        // qs[0] feeds elements 0 (low) and 32 (high) of the first span;
+        // qs[64] feeds elements 128 (low) and 160 (high) of the third.
+        block[16] = 5 | (6 << 4);
+        block[16 + 64] = 7 << 4;
+
         let bytes = Builder::new()
             .tensor("w", &[256, 1], GgmlType::Q4K, &block)
             .build();
         let m = load_gguf_bytes(&bytes).unwrap();
         let f = m.tensors["w"].to_f32().unwrap();
-        assert_eq!(f.len(), 256);
-        // d = 1, sc_0 = 1, q = 1, dmin = 0 => 1.
-        assert!((f[0] - 1.0).abs() < 1e-3, "got {}", f[0]);
+
+        // value = d * sc_j * q - dmin * m_j, with d = dmin = 1.
+        for (idx, want) in [
+            (0usize, 1.0 * 5.0 - 0.0), // sub-block 0, low nibble
+            (32, 2.0 * 6.0 - 1.0),     // sub-block 1, high nibble
+            (128, 5.0 * 0.0 - 4.0),    // sub-block 4, low nibble
+            (160, 35.0 * 7.0 - 20.0),  // sub-block 5, high nibble
+        ] {
+            assert!(
+                (f[idx] - want).abs() < 1e-3,
+                "element {idx}: got {}, want {want}",
+                f[idx]
+            );
+        }
     }
 
     /// `block_q6_K::scales` is int8_t. Reading it unsigned turns a -1 scale
@@ -1118,6 +1219,81 @@ mod tests {
         assert_eq!(ty.size_bytes(), packed.len());
     }
 
+    /// A Q4_1 block differs from Q4_0 only by carrying its own `m`, so the
+    /// repack keeps both halves of the header rather than deriving one.
+    #[test]
+    fn q4_1_repack_keeps_the_stored_minimum() {
+        let (d, m) = (0.5f32, -3.0f32);
+        let nibbles: [u8; 32] = std::array::from_fn(|i| (i % 16) as u8);
+        let mut block = Vec::with_capacity(20);
+        block.extend_from_slice(&f16_to_bits(d).to_le_bytes());
+        block.extend_from_slice(&f16_to_bits(m).to_le_bytes());
+        for j in 0..16 {
+            block.push(nibbles[j] | (nibbles[j + 16] << 4));
+        }
+        let bytes = Builder::new()
+            .tensor("w", &[32, 1], GgmlType::Q4_1, &block)
+            .build();
+        let mm = load_gguf_bytes(&bytes).unwrap();
+        let (dtype, packed) = mm.tensors["w"].to_packed().unwrap();
+        assert_eq!(dtype, DType::Q4_0);
+        let got = crate::runtime::dequantize_q4_0(&packed, 32, 1);
+        for (e, &n) in nibbles.iter().enumerate() {
+            let want = f32::from(n) * d + m;
+            assert!(
+                (got[e] - want).abs() < 1e-2,
+                "element {e}: got {}, want {want}",
+                got[e]
+            );
+        }
+    }
+
+    /// A file holding one type this loader does not implement must still
+    /// yield an inventory for the rest of it — a Q5_K_M mix should list
+    /// even though its Q5_K tensors cannot be read.
+    #[test]
+    fn unknown_tensor_types_are_listed_not_fatal() {
+        // 13 is Q5_K, which this loader does not implement.
+        let bytes = Builder::new()
+            .tensor("known", &[32, 1], GgmlType::Q8_0, &q8_0_block(1.0, [0; 32]))
+            .tensor("unknown", &[256, 1], GgmlType::Other(13), &[])
+            .build();
+        let m = load_gguf_bytes(&bytes).unwrap();
+        assert_eq!(m.tensors.len(), 2, "both tensors must be listed");
+
+        let known = &m.tensors["known"];
+        assert!(known.to_packed().is_ok(), "the readable one still reads");
+
+        let unknown = &m.tensors["unknown"];
+        assert_eq!(unknown.dims, vec![256, 1], "shape survives");
+        assert_eq!(unknown.ggml_type, GgmlType::Other(13));
+        assert!(!unknown.ggml_type.is_supported());
+        // Its length depends on a block size we do not know, so no bytes.
+        assert!(unknown.data.is_empty());
+        assert!(matches!(
+            unknown.to_packed(),
+            Err(GgufError::UnsupportedType(13))
+        ));
+        assert!(matches!(
+            unknown.to_f32(),
+            Err(GgufError::UnsupportedType(13))
+        ));
+    }
+
+    /// Two tensors under one name would silently shadow each other in the
+    /// map, and the loser would never be uploaded.
+    #[test]
+    fn duplicate_tensor_names_are_rejected() {
+        let bytes = Builder::new()
+            .tensor("w", &[32, 1], GgmlType::Q8_0, &q8_0_block(1.0, [0; 32]))
+            .tensor("w", &[32, 1], GgmlType::Q8_0, &q8_0_block(2.0, [1; 32]))
+            .build();
+        assert!(matches!(
+            load_gguf_bytes(&bytes),
+            Err(GgufError::BadShape(_))
+        ));
+    }
+
     #[test]
     fn rejects_bad_magic_and_truncation() {
         assert!(matches!(
@@ -1135,14 +1311,27 @@ mod tests {
         ));
     }
 
+    /// Blocks run along K, so a tensor can hold whole blocks overall while
+    /// still splitting one across columns. `to_packed` has to catch that.
     #[test]
     fn rejects_misaligned_reduction_extent() {
-        // K = 16 is not a whole Q8 block.
+        // K = 16 is not a whole 32-block, though 16 x 2 elements is.
+        let block = q8_0_block(1.0, [0; 32]);
         let bytes = Builder::new()
-            .tensor("w", &[16, 1], GgmlType::F32, &[0u8; 64])
+            .tensor("w", &[16, 2], GgmlType::Q8_0, &block)
             .build();
         let m = load_gguf_bytes(&bytes).unwrap();
-        // F32 has no block constraint, but asking for a packed form does.
+        let err = m.tensors["w"].to_packed().unwrap_err();
+        assert!(
+            matches!(err, GgufError::BadShape(ref e) if e.contains("multiple of 32")),
+            "expected a block-alignment error, got {err}"
+        );
+
+        // F32 is not a packed format at all, which is a different refusal.
+        let f32_bytes = Builder::new()
+            .tensor("w", &[16, 1], GgmlType::F32, &[0u8; 64])
+            .build();
+        let m = load_gguf_bytes(&f32_bytes).unwrap();
         assert!(matches!(
             m.tensors["w"].to_packed(),
             Err(GgufError::UnsupportedPack(GgmlType::F32))

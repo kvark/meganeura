@@ -1147,25 +1147,25 @@ fn matmul_vars_tiled(
             "",
             "array<u32>",
             "dequant_q4(b_row, b_col)".to_string(),
-            Q4_DEQUANT_FN.to_string(),
+            format!("{F16_DECODE_FN}{Q4_DEQUANT_FN}"),
         ),
         WeightFormat::Q8 => (
             "",
             "array<u32>",
             "dequant_q8(b_row, b_col)".to_string(),
-            Q8_DEQUANT_FN.to_string(),
+            format!("{F16_DECODE_FN}{Q8_DEQUANT_FN}"),
         ),
         WeightFormat::Q4K => (
             "",
             "array<u32>",
             "dequant_q4k(b_row, b_col)".to_string(),
-            Q4K_DEQUANT_FN.to_string(),
+            format!("{F16_DECODE_FN}{Q4K_DEQUANT_FN}"),
         ),
         WeightFormat::Q6K => (
             "",
             "array<u32>",
             "dequant_q6k(b_row, b_col)".to_string(),
-            Q6K_DEQUANT_FN.to_string(),
+            format!("{F16_DECODE_FN}{Q6K_DEQUANT_FN}"),
         ),
     };
     // Nibble-packed large tile: 32×64 B tile, 256 threads → each thread owns
@@ -1255,14 +1255,13 @@ fn matmul_vars_tiled(
     parse_wgsl(&src)
 }
 
-/// Meganeura asymmetric Q4 (Q4_1-style) dequantization helper for WGSL.
-/// Buffer layout: [scales as packed f16 pairs (u32)][packed nibble data (u32)].
-/// Column-wise blocking: blocks of 32 elements along the K dimension per column.
+/// f16 → f32 for the packed-weight kernels' block scales.
 ///
-/// `dequant_q4` stays the scalar entry used by GEMV. Tiled staging uses
-/// `dequant_q4_pack8`: one (d, m) header and one data word → 8 values.
-const Q4_DEQUANT_FN: &str = "
-fn q4_decode_f16(bits: u32) -> f32 {
+/// Denormals flush to zero and `expo == 31` becomes a large finite rather
+/// than Inf/NaN. Quantizer-produced scales never reach either, and every
+/// packed format shares this one copy.
+const F16_DECODE_FN: &str = "
+fn decode_f16(bits: u32) -> f32 {
     let sign = (bits >> 15u) & 1u;
     let expo = (bits >> 10u) & 0x1Fu;
     let mant = bits & 0x3FFu;
@@ -1270,7 +1269,15 @@ fn q4_decode_f16(bits: u32) -> f32 {
     if expo == 0u { f32_bits = sign << 31u; }
     return bitcast<f32>(f32_bits);
 }
+";
 
+/// Meganeura asymmetric Q4 (Q4_1-style) dequantization helper for WGSL.
+/// Buffer layout: [scales as packed f16 pairs (u32)][packed nibble data (u32)].
+/// Column-wise blocking: blocks of 32 elements along the K dimension per column.
+///
+/// `dequant_q4` stays the scalar entry used by GEMV. Tiled staging uses
+/// `dequant_q4_pack8`: one (d, m) header and one data word → 8 values.
+const Q4_DEQUANT_FN: &str = "
 fn q4_unpack_nibble(data: u32, d: f32, m: f32, in_word: u32) -> f32 {
     let nibble = (data >> (in_word * 4u)) & 0xFu;
     return f32(nibble) * d + m;
@@ -1285,8 +1292,8 @@ fn dequant_q4(k_idx: u32, n_idx: u32) -> f32 {
     let in_block = k_idx % 32u;
 
     let dm = matrix_b[block];
-    let d = q4_decode_f16(dm & 0xFFFFu);
-    let m = q4_decode_f16(dm >> 16u);
+    let d = decode_f16(dm & 0xFFFFu);
+    let m = decode_f16(dm >> 16u);
     let data_u32 = matrix_b[num_blocks + block * 4u + in_block / 8u];
     return q4_unpack_nibble(data_u32, d, m, in_block % 8u);
 }
@@ -1296,8 +1303,8 @@ fn dequant_q4_pack8(k_base: u32, n_idx: u32) -> array<f32, 8> {
     let num_blocks = blocks_per_col * params.n;
     let block = n_idx * blocks_per_col + k_base / 32u;
     let dm = matrix_b[block];
-    let d = q4_decode_f16(dm & 0xFFFFu);
-    let m = q4_decode_f16(dm >> 16u);
+    let d = decode_f16(dm & 0xFFFFu);
+    let m = decode_f16(dm >> 16u);
     let data_u32 = matrix_b[num_blocks + block * 4u + (k_base % 32u) / 8u];
     var out: array<f32, 8>;
     for (var i = 0u; i < 8u; i++) {
@@ -1320,15 +1327,6 @@ fn dequant_q4_pack8(k_base: u32, n_idx: u32) -> array<f32, 8> {
 /// span the low nibbles feed the first 32 elements and the high nibbles
 /// the second.
 const Q4K_DEQUANT_FN: &str = "
-fn q4k_decode_f16(bits: u32) -> f32 {
-    let sign = (bits >> 15u) & 1u;
-    let expo = (bits >> 10u) & 0x1Fu;
-    let mant = bits & 0x3FFu;
-    var f32_bits = (sign << 31u) | ((expo + 112u) << 23u) | (mant << 13u);
-    if expo == 0u { f32_bits = sign << 31u; }
-    return bitcast<f32>(f32_bits);
-}
-
 fn q4k_byte(base: u32, off: u32) -> u32 {
     let w = matrix_b[base + off / 4u];
     return (w >> ((off % 4u) * 8u)) & 0xFFu;
@@ -1351,8 +1349,8 @@ fn q4k_scale_min(base: u32, j: u32) -> vec2<f32> {
 fn dequant_q4k(k_idx: u32, n_idx: u32) -> f32 {
     let base = (n_idx * (params.k / 256u) + k_idx / 256u) * 36u;
     let hdr = matrix_b[base];
-    let d = q4k_decode_f16(hdr & 0xFFFFu);
-    let dmin = q4k_decode_f16(hdr >> 16u);
+    let d = decode_f16(hdr & 0xFFFFu);
+    let dmin = decode_f16(hdr >> 16u);
     let e = k_idx % 256u;
     let sm = q4k_scale_min(base, e / 32u);
     let byte = q4k_byte(base, 16u + (e / 64u) * 32u + e % 32u);
@@ -1363,8 +1361,8 @@ fn dequant_q4k(k_idx: u32, n_idx: u32) -> f32 {
 fn dequant_q4k_pack8(k_base: u32, n_idx: u32) -> array<f32, 8> {
     let base = (n_idx * (params.k / 256u) + k_base / 256u) * 36u;
     let hdr = matrix_b[base];
-    let d = q4k_decode_f16(hdr & 0xFFFFu);
-    let dmin = q4k_decode_f16(hdr >> 16u);
+    let d = decode_f16(hdr & 0xFFFFu);
+    let dmin = decode_f16(hdr >> 16u);
     let e = k_base % 256u;
     let sm = q4k_scale_min(base, e / 32u);
     let scale = d * sm.x;
@@ -1404,15 +1402,6 @@ fn dequant_q4k_pack8(k_base: u32, n_idx: u32) -> array<f32, 8> {
 /// `ql[l + (j & 1) * 32]` for `j < 2` and the high nibble for `j >= 2`, with
 /// the bit-pair at `qh[l] >> (j * 2)` and the scale at `j * 2 + l / 16`.
 const Q6K_DEQUANT_FN: &str = "
-fn q6k_decode_f16(bits: u32) -> f32 {
-    let sign = (bits >> 15u) & 1u;
-    let expo = (bits >> 10u) & 0x1Fu;
-    let mant = bits & 0x3FFu;
-    var f32_bits = (sign << 31u) | ((expo + 112u) << 23u) | (mant << 13u);
-    if expo == 0u { f32_bits = sign << 31u; }
-    return bitcast<f32>(f32_bits);
-}
-
 // Byte `off` of the superblock starting at absolute byte `byte_base`.
 fn q6k_byte(byte_base: u32, off: u32) -> u32 {
     let at = byte_base + off;
@@ -1428,10 +1417,11 @@ fn q6k_scale(byte_base: u32, i: u32) -> f32 {
 fn q6k_d(byte_base: u32) -> f32 {
     let lo = q6k_byte(byte_base, 208u);
     let hi = q6k_byte(byte_base, 209u);
-    return q6k_decode_f16(lo | (hi << 8u));
+    return decode_f16(lo | (hi << 8u));
 }
 
-fn q6k_value(byte_base: u32, e: u32, d: f32) -> f32 {
+// The 6-bit quant for element `e`, before scaling.
+fn q6k_quant(byte_base: u32, e: u32) -> i32 {
     let half = e / 128u;
     let within = e % 128u;
     let j = within / 32u;
@@ -1440,25 +1430,34 @@ fn q6k_value(byte_base: u32, e: u32, d: f32) -> f32 {
     let lo = select(ql >> 4u, ql & 0xFu, j < 2u);
     let qh = q6k_byte(byte_base, 128u + half * 32u + l);
     let hi = (qh >> (j * 2u)) & 3u;
-    let q = i32(lo | (hi << 4u)) - 32;
-    return d * q6k_scale(byte_base, half * 8u + j * 2u + l / 16u) * f32(q);
+    return i32(lo | (hi << 4u)) - 32;
+}
+
+// Which of the sixteen sub-block scales covers element `e`.
+fn q6k_scale_index(e: u32) -> u32 {
+    let half = e / 128u;
+    let within = e % 128u;
+    return half * 8u + (within / 32u) * 2u + (within % 32u) / 16u;
 }
 
 fn dequant_q6k(k_idx: u32, n_idx: u32) -> f32 {
     let byte_base = (n_idx * (params.k / 256u) + k_idx / 256u) * 210u;
-    return q6k_value(byte_base, k_idx % 256u, q6k_d(byte_base));
+    let e = k_idx % 256u;
+    let scale = q6k_d(byte_base) * q6k_scale(byte_base, q6k_scale_index(e));
+    return scale * f32(q6k_quant(byte_base, e));
 }
 
 fn dequant_q6k_pack8(k_base: u32, n_idx: u32) -> array<f32, 8> {
     // Eight 8-aligned elements share a superblock, a 32-element stride and
-    // a 16-element scale group, so the f16 decode and the scale fetch are
-    // done once. The payload bytes stay individual: ql and qh are read from
-    // two separate regions at arbitrary word alignment.
+    // a 16-element scale group, so the f16 decode and the scale byte are
+    // read once for all of them. The payload stays per element: ql and qh
+    // live in separate regions at arbitrary word alignment.
     let byte_base = (n_idx * (params.k / 256u) + k_base / 256u) * 210u;
-    let d = q6k_d(byte_base);
+    let e = k_base % 256u;
+    let scale = q6k_d(byte_base) * q6k_scale(byte_base, q6k_scale_index(e));
     var out: array<f32, 8>;
     for (var i = 0u; i < 8u; i++) {
-        out[i] = q6k_value(byte_base, (k_base % 256u) + i, d);
+        out[i] = scale * f32(q6k_quant(byte_base, e + i));
     }
     return out;
 }
@@ -1468,15 +1467,6 @@ fn dequant_q6k_pack8(k_base: u32, n_idx: u32) -> array<f32, 8> {
 /// Layout: [9 u32s per block: 1 scale_u32 + 8 data_u32s].
 /// Block i starts at matrix_b[i * 9]. scale_f16 in low 16 bits of first u32.
 const Q8_DEQUANT_FN: &str = "
-fn q8_decode_f16(bits: u32) -> f32 {
-    let sign = (bits >> 15u) & 1u;
-    let expo = (bits >> 10u) & 0x1Fu;
-    let mant = bits & 0x3FFu;
-    var f32_bits = (sign << 31u) | ((expo + 112u) << 23u) | (mant << 13u);
-    if expo == 0u { f32_bits = sign << 31u; }
-    return bitcast<f32>(f32_bits);
-}
-
 fn dequant_q8(k_idx: u32, n_idx: u32) -> f32 {
     // Q8_0: value = int8 * scale
     let blocks_per_col = params.k / 32u;
@@ -1485,7 +1475,7 @@ fn dequant_q8(k_idx: u32, n_idx: u32) -> f32 {
 
     // Each block is 9 u32s: [scale_u32, data0..data7]
     let block_base = block * 9u;
-    let scale = q8_decode_f16(matrix_b[block_base] & 0xFFFFu);
+    let scale = decode_f16(matrix_b[block_base] & 0xFFFFu);
 
     // Extract int8 from data u32s (4 bytes per u32)
     let byte_idx = in_block;
@@ -2023,7 +2013,7 @@ fn gen_matmul_gemv_packed(src: &str, helpers: &str, call: &str) -> ShaderModule 
         )
         .replace(
             "@compute @workgroup_size(",
-            &format!("{helpers}\n@compute @workgroup_size("),
+            &format!("{F16_DECODE_FN}{helpers}\n@compute @workgroup_size("),
         )
         .replace(
             "let b = matrix_b[kk * n_v4 + col4];",
