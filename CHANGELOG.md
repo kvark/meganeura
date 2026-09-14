@@ -1,15 +1,27 @@
 # Unreleased
 
 - GGUF weight import (`load::gguf`). Reads the container's metadata and tensor
-  inventory, and resolves GGML's block encodings into Meganeura's at load time
-  so no shader has to know GGUF exists. `Q4_0`, `Q4_1` and `Q8_0` repack
-  losslessly for `set_parameter_packed` — GGML splits a block's nibbles across
-  halves and interleaves each block's header with its payload, where Meganeura
-  pairs adjacent nibbles and keeps headers in their own region. The block
-  *order* already agreed, since packing performs the `[K, N]` transpose that
-  GGUF's layout implies. `Q4_K` and `Q6_K` are superblock formats with no
-  direct equivalent and reach f32 only, which requantizes. See
+  inventory, and resolves GGML's block encodings into Meganeura's at load time.
+  `Q4_0`, `Q4_1` and `Q8_0` repack losslessly for `set_parameter_packed` —
+  GGML splits a block's nibbles across halves and interleaves each block's
+  header with its payload, where Meganeura pairs adjacent nibbles and keeps
+  headers in their own region. The block *order* already agreed, since packing
+  performs the `[K, N]` transpose that GGUF's layout implies. `Q6_K` has no
+  equivalent and reaches f32 only, which requantizes. See
   `examples/gguf_info.rs`.
+- Native GGML Q4_K storage (`DType::Q4K`, `Graph::parameter_q4k`). Superblocks
+  are stored byte-for-byte as GGUF writes them, so loading is a copy and the
+  tiled matmul and K-split GEMV shaders decode 144-byte superblocks directly.
+  At 4.5 bits/weight against Meganeura Q4's 5.0 this reads 10% less weight
+  data, and it removes a dequantize/requantize round trip that was costing
+  ~3% peak error — quantizing an already-quantized weight roughly doubles the
+  error, since each stage contributes its own half-step.
+
+  Q4_K is the first load-only format: its encoder searches for per-sub-block
+  scales rather than computing them, so it cannot be produced from f32.
+  `set_parameter` rejects these parameters and points at
+  `set_parameter_packed`; `generate_module_weighted` asserts rather than
+  falling through to an f32 shader for a group with no Q4_K variant.
 - Autotuning searches shape-specialized scalar convolutions and K-stage sizes
   for forward and both gradients; unused candidates are released after search.
 - Store-side unary epilogues (Relu/Sigmoid/Silu/Neg) now fuse into F16/Q4/Q8

@@ -37,14 +37,17 @@
 //! | `Q4_0` | repack to Meganeura Q4, `m = -8d` |
 //! | `Q4_1` | repack to Meganeura Q4 |
 //! | `Q8_0` | repack to Meganeura Q8 |
-//! | `Q4K`, `Q6K` | [`GgufTensor::to_f32`] only — see below |
+//! | `Q4_K` | none — stored in GGML's own layout |
+//! | `Q6_K` | [`GgufTensor::to_f32`] only — see below |
 //!
-//! The first four are lossless. The K-quants are superblock formats whose
-//! sub-block scales are themselves quantized; they have no direct Meganeura
-//! equivalent, so [`GgufTensor::to_packed`] rejects them and callers must go
-//! through `to_f32` and `Session::set_parameter`, which requantizes. That
-//! round trip is lossy, and it is the main reason to grow a native format
-//! later rather than keep resolving these at load time.
+//! All but `Q6_K` are lossless. `Q4_K` needs no repack at all: Meganeura
+//! stores it byte-for-byte as GGML does, so [`GgufTensor::to_packed`] hands
+//! back the file's bytes and the shaders read them directly.
+//!
+//! `Q6_K` still has no Meganeura equivalent, so `to_packed` rejects it and
+//! callers must go through `to_f32` and `Session::set_parameter`, which
+//! requantizes. That round trip roughly doubles the quantization error, so
+//! it is the remaining argument for another native format.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -291,8 +294,11 @@ impl GgufTensor {
     /// returning the [`DType`] the parameter must be declared with.
     ///
     /// Lossless: the quantized values themselves are carried across unchanged
-    /// and only their arrangement and scale encoding are adjusted. Rejects the
-    /// K-quants, which have no direct equivalent.
+    /// and only their arrangement and scale encoding are adjusted. Rejects
+    /// `Q6_K`, which has no Meganeura equivalent.
+    ///
+    /// `Q4_K` is the one type that needs no work at all — Meganeura stores it
+    /// in GGML's own layout, so this hands back the file's bytes verbatim.
     pub fn to_packed(&self) -> Result<(DType, Vec<u8>), GgufError> {
         let (k, _n) = self.matrix_dims()?;
         match self.ggml_type {
@@ -303,6 +309,10 @@ impl GgufTensor {
             GgmlType::Q8_0 => {
                 require_block_aligned(k, 32, "Q8")?;
                 Ok((DType::Q8_0, self.repack_q8()))
+            }
+            GgmlType::Q4K => {
+                require_block_aligned(k, 256, "Q4_K")?;
+                Ok((DType::Q4K, self.data.clone()))
             }
             other => Err(GgufError::UnsupportedPack(other)),
         }
@@ -997,8 +1007,10 @@ mod tests {
         }
     }
 
+    /// The CPU reference the Q4_K shader is tested against, on a superblock
+    /// whose answer is worked out by hand.
     #[test]
-    fn k_quants_reach_f32_but_refuse_to_pack() {
+    fn q4_k_dequantizes_against_a_known_value() {
         let mut block = vec![0u8; 144];
         block[0..2].copy_from_slice(&f16_to_bits(1.0).to_le_bytes());
         block[2..4].copy_from_slice(&f16_to_bits(0.0).to_le_bytes());
@@ -1011,14 +1023,10 @@ mod tests {
             .tensor("w", &[256, 1], GgmlType::Q4K, &block)
             .build();
         let m = load_gguf_bytes(&bytes).unwrap();
-        let t = &m.tensors["w"];
-        let f = t.to_f32().unwrap();
+        let f = m.tensors["w"].to_f32().unwrap();
         assert_eq!(f.len(), 256);
+        // d = 1, sc_0 = 1, q = 1, dmin = 0 => 1.
         assert!((f[0] - 1.0).abs() < 1e-3, "got {}", f[0]);
-        assert!(matches!(
-            t.to_packed(),
-            Err(GgufError::UnsupportedPack(GgmlType::Q4K))
-        ));
     }
 
     /// `block_q6_K::scales` is int8_t. Reading it unsigned turns a -1 scale
@@ -1048,6 +1056,41 @@ mod tests {
             "scales[1]=2 => -64, got {}",
             f[16]
         );
+    }
+
+    /// Q4_K is stored in GGML's own layout, so packing is a copy. Anything
+    /// that rearranged bytes here would have to be mirrored in the shader.
+    #[test]
+    fn q4_k_packs_without_touching_the_bytes() {
+        let mut block = vec![0u8; 144];
+        block[0..2].copy_from_slice(&f16_to_bits(0.0035).to_le_bytes());
+        block[2..4].copy_from_slice(&f16_to_bits(0.0021).to_le_bytes());
+        for (i, b) in block.iter_mut().enumerate().skip(4) {
+            *b = (i * 7 % 251) as u8;
+        }
+        let bytes = Builder::new()
+            .tensor("w", &[256, 1], GgmlType::Q4K, &block)
+            .build();
+        let m = load_gguf_bytes(&bytes).unwrap();
+        let (dtype, packed) = m.tensors["w"].to_packed().unwrap();
+        assert_eq!(dtype, DType::Q4K);
+        assert_eq!(packed, block, "Q4_K must reach the GPU byte-for-byte");
+        // And the declared parameter size has to agree with the file.
+        let ty = crate::graph::TensorType::new(vec![256, 1], DType::Q4K);
+        assert_eq!(ty.size_bytes(), packed.len());
+    }
+
+    /// Q6_K is the one type left without a native form.
+    #[test]
+    fn q6_k_still_refuses_to_pack() {
+        let bytes = Builder::new()
+            .tensor("w", &[256, 1], GgmlType::Q6K, &vec![0u8; 210])
+            .build();
+        let m = load_gguf_bytes(&bytes).unwrap();
+        assert!(matches!(
+            m.tensors["w"].to_packed(),
+            Err(GgufError::UnsupportedPack(GgmlType::Q6K))
+        ));
     }
 
     #[test]
