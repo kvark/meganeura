@@ -4740,15 +4740,14 @@ impl Session {
                             .map(|&v| half::f16::from_f32(v).to_bits())
                             .flat_map(|b| b.to_le_bytes())
                             .collect(),
-                        // Encoding a K-quant means searching for per-sub-block
-                        // scales, not computing them. Quantizing here would
-                        // silently produce worse weights than the file the
-                        // caller already has, so refuse and point at the
-                        // path that keeps them.
+                        // No K-quant encoder is implemented here. Falling
+                        // back to a cruder one would silently produce worse
+                        // weights than the file the caller already has, so
+                        // refuse and point at the path that keeps them.
                         fmt @ (crate::compile::WeightFormat::Q4K
                         | crate::compile::WeightFormat::Q6K) => panic!(
-                            "parameter `{name}` is {fmt:?}, which cannot be produced from f32; \
-                             load it with set_parameter_packed from a GGUF file"
+                            "parameter `{name}` is {fmt:?}; no encoder for it is implemented \
+                             here, so load it with set_parameter_packed from a GGUF file"
                         ),
                         crate::compile::WeightFormat::F32 => unreachable!(),
                     };

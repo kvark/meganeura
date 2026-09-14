@@ -19,12 +19,18 @@
 //! *unquantized* layouts are transposes of each other and [`GgufTensor::to_f32`]
 //! transposes on the way out.
 //!
-//! The *packed* layouts, on the other hand, already agree. Meganeura's
-//! quantizers walk columns of `[K, N]`, emitting block `n * (K/32) + k/32`;
-//! GGUF blocks run along `ne0 = K` within each row `n`, giving the same index.
-//! Packing already performs the transpose, so [`GgufTensor::to_packed`] never
-//! has to. What differs is the arrangement *within* a block, which is what
-//! the repack functions below fix up.
+//! The *packed* layouts agree. Meganeura's quantizers block along the
+//! parameter's **first** dimension, emitting block `n * (K/32) + k/32` for a
+//! `[K, N]` weight; GGUF blocks run along `ne0 = K` within each row `n`,
+//! which is the same index. Packing performs the transpose itself, so
+//! [`GgufTensor::to_packed`] never has to. What differs is the arrangement
+//! *within* a block, which is what the repack functions below fix up.
+//!
+//! That agreement is specific to the forward orientation. Blocking follows
+//! the first dimension while every packed decoder indexes along `params.k`;
+//! for a transposed `[N, K]` weight those are different axes, so block
+//! formats have no correct reading on `MatMulBT` and `compile.rs` refuses
+//! the K-quants there.
 //!
 //! # What is resolved here
 //!
@@ -193,7 +199,9 @@ impl GgmlType {
                 "{count} elements is not a whole number of {per}-element {self:?} blocks"
             )));
         }
-        Ok(count / per * bytes)
+        (count / per)
+            .checked_mul(bytes)
+            .ok_or_else(|| GgufError::BadShape(format!("{count} {self:?} elements overflow")))
     }
 
     /// The numeric tag as it appears in the file.
@@ -330,6 +338,35 @@ impl GgufTensor {
         Ok(out)
     }
 
+    /// The [`DType`] this tensor would occupy, without converting it.
+    ///
+    /// [`GgufTensor::to_packed`] allocates a whole tensor; callers that only
+    /// need the destination — an inventory listing, a shape check — should
+    /// ask here instead.
+    pub fn packed_dtype(&self) -> Result<DType, GgufError> {
+        let (k, _n) = self.matrix_dims()?;
+        match self.ggml_type {
+            GgmlType::Q4_0 | GgmlType::Q4_1 => {
+                require_block_aligned(k, 32, "Q4")?;
+                Ok(DType::Q4_0)
+            }
+            GgmlType::Q8_0 => {
+                require_block_aligned(k, 32, "Q8")?;
+                Ok(DType::Q8_0)
+            }
+            GgmlType::Q4K => {
+                require_block_aligned(k, 256, "Q4_K")?;
+                Ok(DType::Q4K)
+            }
+            GgmlType::Q6K => {
+                require_block_aligned(k, 256, "Q6_K")?;
+                Ok(DType::Q6K)
+            }
+            GgmlType::Other(tag) => Err(GgufError::UnsupportedType(tag)),
+            other => Err(GgufError::UnsupportedPack(other)),
+        }
+    }
+
     /// Repack into Meganeura's packed layout for `Session::set_parameter_packed`,
     /// returning the [`DType`] the parameter must be declared with.
     ///
@@ -344,33 +381,24 @@ impl GgufTensor {
     /// with [`GgufTensor::to_f32`]. So is any `ggml_type` this loader does
     /// not implement.
     pub fn to_packed(&self) -> Result<(DType, Vec<u8>), GgufError> {
-        let (k, _n) = self.matrix_dims()?;
-        match self.ggml_type {
-            GgmlType::Q4_0 | GgmlType::Q4_1 => {
-                require_block_aligned(k, 32, "Q4")?;
-                Ok((DType::Q4_0, self.repack_q4()?))
-            }
-            GgmlType::Q8_0 => {
-                require_block_aligned(k, 32, "Q8")?;
-                Ok((DType::Q8_0, self.repack_q8()))
-            }
-            GgmlType::Q4K => {
-                require_block_aligned(k, 256, "Q4_K")?;
-                Ok((DType::Q4K, self.data.clone()))
-            }
+        let dtype = self.packed_dtype()?;
+        let bytes = match self.ggml_type {
+            GgmlType::Q4_0 | GgmlType::Q4_1 => self.repack_q4()?,
+            GgmlType::Q8_0 => self.repack_q8(),
+            // The K-quants are already in GGML's layout. Q6_K's 210-byte
+            // superblocks are not a whole number of words, so an odd count
+            // leaves the buffer two bytes short of the `array<u32>`
+            // binding; pad the tail and leave the superblocks alone.
+            GgmlType::Q4K => self.data.clone(),
             GgmlType::Q6K => {
-                require_block_aligned(k, 256, "Q6_K")?;
-                // 210-byte superblocks are not a whole number of words, so
-                // an odd count leaves the buffer two bytes short of the
-                // `array<u32>` binding. Pad the tail; the superblocks
-                // themselves stay byte-for-byte.
                 let mut bytes = self.data.clone();
                 bytes.resize(bytes.len().next_multiple_of(4), 0);
-                Ok((DType::Q6K, bytes))
+                bytes
             }
-            GgmlType::Other(tag) => Err(GgufError::UnsupportedType(tag)),
-            other => Err(GgufError::UnsupportedPack(other)),
-        }
+            // `packed_dtype` has already rejected everything else.
+            _ => unreachable!("packed_dtype accepted an unpackable type"),
+        };
+        Ok((dtype, bytes))
     }
 
     /// GGUF-order values, one f32 per element.
@@ -654,6 +682,18 @@ pub fn load_gguf_bytes(bytes: &[u8]) -> Result<GgufModel, GgufError> {
         what: "metadata count",
         offset: 16,
     })?;
+    // These counts are file-controlled. Reserving on them directly lets a
+    // 24-byte header ask for a `usize::MAX` allocation, which aborts on
+    // capacity overflow instead of returning an error. The smallest record
+    // either can produce is a few bytes, so anything beyond the remaining
+    // input is a malformed header; reserve within what is actually there.
+    let remaining = bytes.len() - r.pos;
+    if tensor_count > remaining || kv_count > remaining {
+        return Err(GgufError::BadHeader(format!(
+            "header declares {tensor_count} tensors and {kv_count} metadata entries, \
+             more than the {remaining} bytes that follow it"
+        )));
+    }
 
     let mut metadata = HashMap::with_capacity(kv_count);
     for _ in 0..kv_count {
@@ -716,7 +756,16 @@ pub fn load_gguf_bytes(bytes: &[u8]) -> Result<GgufModel, GgufError> {
 
     let mut tensors: HashMap<String, GgufTensor> = HashMap::with_capacity(infos.len());
     for info in infos {
-        let count: usize = info.dims.iter().product();
+        let count = info
+            .dims
+            .iter()
+            .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+            .ok_or_else(|| {
+                GgufError::BadShape(format!(
+                    "tensor `{}` has dimensions {:?} whose product overflows this platform",
+                    info.name, info.dims
+                ))
+            })?;
         // A type this loader does not implement has an unknown block size,
         // so there is no way to say where its bytes end. List it with no
         // data rather than failing the whole file: a mix that is mostly
@@ -916,7 +965,7 @@ mod tests {
             }
         }
 
-        fn str_bytes(out: &mut Vec<u8>, s: &str) {
+        pub(super) fn str_bytes(out: &mut Vec<u8>, s: &str) {
             out.extend_from_slice(&(s.len() as u64).to_le_bytes());
             out.extend_from_slice(s.as_bytes());
         }
@@ -1292,6 +1341,54 @@ mod tests {
             load_gguf_bytes(&bytes),
             Err(GgufError::BadShape(_))
         ));
+    }
+
+    /// Counts in the header are file-controlled. Reserving on them
+    /// directly lets a 24-byte file ask for a `usize::MAX` allocation,
+    /// which aborts on capacity overflow instead of returning an error.
+    #[test]
+    fn rejects_absurd_declared_counts() {
+        let mut header = Vec::new();
+        header.extend_from_slice(b"GGUF");
+        header.extend_from_slice(&3u32.to_le_bytes());
+        header.extend_from_slice(&u64::MAX.to_le_bytes()); // tensor_count
+        header.extend_from_slice(&0u64.to_le_bytes()); // kv_count
+        assert!(matches!(
+            load_gguf_bytes(&header),
+            Err(GgufError::BadHeader(_))
+        ));
+
+        let mut kv = Vec::new();
+        kv.extend_from_slice(b"GGUF");
+        kv.extend_from_slice(&3u32.to_le_bytes());
+        kv.extend_from_slice(&0u64.to_le_bytes());
+        kv.extend_from_slice(&u64::MAX.to_le_bytes()); // kv_count
+        assert!(matches!(load_gguf_bytes(&kv), Err(GgufError::BadHeader(_))));
+    }
+
+    /// Individually representable dimensions can still overflow their
+    /// product, which would panic or wrap rather than report a bad shape.
+    #[test]
+    fn rejects_overflowing_shape_product() {
+        let huge = 1u64 << 40;
+        let mut infos = Vec::new();
+        Builder::str_bytes(&mut infos, "w");
+        infos.extend_from_slice(&2u32.to_le_bytes()); // n_dims
+        infos.extend_from_slice(&huge.to_le_bytes());
+        infos.extend_from_slice(&huge.to_le_bytes());
+        infos.extend_from_slice(&GgmlType::F32.tag().to_le_bytes());
+        infos.extend_from_slice(&0u64.to_le_bytes()); // offset
+
+        let mut out = Vec::new();
+        out.extend_from_slice(b"GGUF");
+        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(&1u64.to_le_bytes()); // one tensor
+        out.extend_from_slice(&0u64.to_le_bytes()); // no metadata
+        out.extend_from_slice(&infos);
+        while !out.len().is_multiple_of(32) {
+            out.push(0);
+        }
+        assert!(matches!(load_gguf_bytes(&out), Err(GgufError::BadShape(_))));
     }
 
     #[test]

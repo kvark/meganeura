@@ -3832,6 +3832,93 @@ fn q6k_gemv_matches_ggml_reference() {
     );
 }
 
+/// A subnormal f16 block scale is an ordinary f32, and must survive.
+///
+/// `0x0100` is 2^-16: subnormal as a half, exactly representable as a
+/// float. The hand-assembled decoder this replaced flushed `expo == 0` to
+/// zero, which erased the whole superblock. Every other fixture here uses
+/// a normal scale, so nothing else would catch it.
+#[test]
+fn q6k_preserves_subnormal_block_scales() {
+    use meganeura::load::gguf::{GgmlType, GgufTensor};
+
+    let (k, n) = (256usize, 4usize);
+    let mut block = vec![0u8; 210];
+    // ql = qh = 0xff gives the maximum 6-bit quant, 63 -> 63 - 32 = 31.
+    for b in block[..192].iter_mut() {
+        *b = 0xFF;
+    }
+    for b in block[192..208].iter_mut() {
+        *b = 127; // int8 subscale
+    }
+    block[208..210].copy_from_slice(&0x0100u16.to_le_bytes()); // d = 2^-16
+
+    let mut data = Vec::new();
+    for _ in 0..n {
+        data.extend_from_slice(&block);
+    }
+    let tensor = GgufTensor {
+        dims: vec![k, n],
+        ggml_type: GgmlType::Q6K,
+        data,
+    };
+    let w_ref = tensor.to_f32().unwrap();
+    // 2^-16 * 127 * 31, an ordinary number.
+    let want_elem = (2.0f32).powi(-16) * 127.0 * 31.0;
+    assert!(
+        (w_ref[0] - want_elem).abs() < 1e-9,
+        "CPU reference lost the subnormal scale: {}",
+        w_ref[0]
+    );
+
+    let (_, packed) = tensor.to_packed().unwrap();
+    // One-hot input, so each output is a single weight.
+    let mut a = vec![0.0f32; k];
+    a[0] = 1.0;
+
+    let mut g = Graph::new();
+    let x = g.input("x", &[1, k]);
+    let w = g.parameter_q6k("w", &[k, n]);
+    let out = g.matmul(x, w);
+    g.set_outputs(vec![out]);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    session.set_input("x", &a);
+    session.set_parameter_packed("w", &packed);
+    session.step();
+    session.wait();
+    let gpu = session.read_output(n);
+
+    for (col, &got) in gpu.iter().enumerate() {
+        assert!(
+            got != 0.0,
+            "column {col}: subnormal scale decoded to zero on the GPU"
+        );
+        assert!(
+            (got - w_ref[col]).abs() / w_ref[col].abs() < 1e-5,
+            "column {col}: got {got}, want {}",
+            w_ref[col]
+        );
+    }
+}
+
+/// Block formats pack along the parameter's first dimension while every
+/// packed decoder indexes along K. Those are the same axis for a forward
+/// `[K, N]` weight and different axes for a transposed `[N, K]` one, so a
+/// K-quant on `matmul_bt` would read the wrong superblock and return
+/// plausible numbers. Refused at compile time instead.
+#[test]
+#[should_panic(expected = "matmul_bt does not support K-quant")]
+fn k_quant_matmul_bt_is_refused() {
+    let (m, k, n) = (1usize, 512usize, 256usize);
+    let mut g = Graph::new();
+    let x = g.input("x", &[m, k]);
+    // B is [N, K] for a transposed multiply.
+    let w = g.parameter_q4k("w", &[n, k]);
+    let out = g.matmul_bt(x, w);
+    g.set_outputs(vec![out]);
+    let _ = meganeura::build(&g, meganeura::SessionConfig::inference_from_env());
+}
+
 /// Q6_K is load-only for the same reason Q4_K is.
 #[test]
 #[should_panic(expected = "set_parameter_packed")]

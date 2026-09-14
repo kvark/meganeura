@@ -24,9 +24,9 @@ pub enum DType {
     /// per 32-element sub-block instead of stored outright. That buys 4.5
     /// bits/weight against Q4_0's 5.0.
     ///
-    /// Unlike every other variant this one is **load-only**: producing it
-    /// from f32 needs a K-quant quantizer, which is an iterative search
-    /// rather than a formula. Set these parameters with
+    /// Unlike every other variant this one is **load-only**: no K-quant
+    /// encoder is implemented here, so these weights only ever arrive
+    /// already packed. Set them with
     /// [`crate::Session::set_parameter_packed`] from a GGUF file;
     /// `set_parameter` rejects them.
     Q4K,
@@ -60,14 +60,6 @@ impl DType {
                 panic!("quantized types use block-level sizing")
             }
         }
-    }
-
-    /// Whether values of this type can be produced from f32 on the host.
-    ///
-    /// False for the K-quants, whose encoders search for per-sub-block
-    /// scales rather than computing them.
-    pub fn is_host_quantizable(self) -> bool {
-        !matches!(self, DType::Q4K | DType::Q6K)
     }
 }
 
