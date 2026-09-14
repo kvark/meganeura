@@ -27,19 +27,19 @@ generator prints that audit and marks the affected table entry with
 
 `p3hpc/` holds the P3HPC (SC26 workshop) submission: IEEE format
 (vendored `IEEEtran.cls`/`.bst`), single-blind, with camera-ready tables in
-`p3hpc/tables/` and shared `../references.bib`. Build from that directory, but
+`p3hpc/tables/`. Its bibliography combines the shared `paper/references.bib`
+with workshop additions in `paper/p3hpc/references.bib`; these have distinct
+citation keys, so the LaTeX source ZIP includes both files. Build from
+`p3hpc/`, but
 note that IEEEtran needs the PostScript base fonts (Times/Courier/
 Helvetica), which the small TeX Live image lacks --- run
 `tlmgr install collection-fontsrecommended` in the container first (or
 use the full `texlive/texlive:latest` image). Do not substitute
 `lmodern`: it silently replaces the IEEE Times font.
-The P3HPC paper has been accepted. Camera-ready is due **September 25, 2026**;
-the working target is a reviewed draft by September 19. See the
-[official submission page](https://p3hpc.org/workshop/2026/submissions/),
-[revision plan](p3hpc/REVISION.md), and [study guide](../docs/study/README.md).
-The final common-revision cohort and reviewer responses are incorporated;
-the author's final review and submission remain. See the
-[current evidence guide](p3hpc/RESULTS.md).
+The P3HPC paper has been accepted. See the
+[official submission page](https://p3hpc.org/workshop/2026/submissions/)
+for venue requirements and the [current evidence guide](p3hpc/RESULTS.md)
+for the final common-revision cohort.
 
 Replay the camera-ready evidence without a GPU, from the repository root
 with the nine supplied campaign archives in one directory (Python 3.11+):

@@ -48,7 +48,7 @@ A two-layer MLP, trained end to end on the GPU, in one screen.
 For local iteration use `cargo test --lib` and
 `cargo test --test smoke -- --test-threads=1` (GPU). See
 [testing and coverage](docs/testing.md) and
-[debugging the stack](docs/study/observability.md).
+[debugging the stack](#debugging).
 
 ## Why Meganeura
 
@@ -100,12 +100,10 @@ Meganeura's wedge is a uniform graph, autodiff, compiler, and runtime stack for
 both training and inference across desktop and edge-class Vulkan/Metal
 devices.
 
-For the detailed, source-backed comparison, read the
-[study guide](docs/study/README.md) and [alternatives](docs/study/alternatives.md).
 The [September audit](docs/audit-2026-09.md) separates current implementation
-status from the frozen results; the [performance plan](docs/study/performance-plan.md)
-describes bounded f32 matmul and convolution search and the remaining
-qualification and broader-search work.
+status from the frozen results; the [roadmap](docs/roadmap.md) records
+engineering priorities and the [experiments](docs/experiments.md) record
+measured outcomes.
 
 ## Install
 
@@ -136,8 +134,8 @@ Worked examples live in [`examples/`](https://github.com/kvark/meganeura/tree/ma
 Current checkpoints store logical tensors without device padding and preflight
 the restore before mutation. Adam/LaProp moments are allocated only when
 requested; SGD and forward/backward-only sessions avoid that unused storage.
-See [checkpoints and memory](docs/study/checkpoints-and-memory.md) for format
-compatibility, resume limits and the distinction between buffer counts and
+See the [checkpoint implementation](src/runtime/checkpoint.rs) for format
+compatibility and restore checks. Resident buffer counts do not measure
 driver peak memory.
 
 Pretrained models can be loaded from ONNX or NNEF via `meganeura::load_onnx(...)` / `meganeura::load_nnef(...)`. Both lower through Meganeura’s IR, so the same graph rewrites apply to imported graphs and hand-built ones.
@@ -216,13 +214,14 @@ policy. Neither setting changes candidate bindings or numerical validation.
 One exact-size staging buffer is reused within a tuning call and released on
 size changes or return. `TuneOptions::staging_reuse = TuneStagingReuse::Fresh`
 disables reuse; reports include preparation, cleanup and scratch byte accounting.
-See the [search contract](docs/study/performance-plan.md) and
+See the [tuning API](src/tune.rs) and
 [whole-step experiment](examples/tune_session.rs).
 
 ## Debugging
 
-See the [debugging study chapter](docs/study/observability.md) for the detailed
-eager-PyTorch comparison, bisection workflow and observation limits.
+See [testing and coverage](docs/testing.md) for the failure-investigation
+workflow and [performance profiling](docs/performance-profiling.md) for
+timing and capture tools.
 
 Three levels, cheapest first:
 
