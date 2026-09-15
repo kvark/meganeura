@@ -4659,6 +4659,26 @@ fn scatter_packed_concat_columns(
             let off = col_offset * bpc * 210;
             dest[off..off + unpadded].copy_from_slice(&src[..unpadded]);
         }
+        crate::compile::WeightFormat::Q5K => {
+            // 176 bytes is a whole number of words, so superblocks
+            // concatenate without a padding seam, as for Q4_K.
+            assert!(rows.is_multiple_of(256));
+            let bpc = rows / 256;
+            let nbytes = bpc * src_cols * 176;
+            assert_eq!(src.len(), nbytes);
+            let off = col_offset * bpc * 176;
+            dest[off..off + nbytes].copy_from_slice(src);
+        }
+        crate::compile::WeightFormat::Q3K => {
+            // 110 bytes is not, so each source carries a word-alignment
+            // tail that must not land between superblocks.
+            assert!(rows.is_multiple_of(256));
+            let bpc = rows / 256;
+            let unpadded = bpc * src_cols * 110;
+            assert!(src.len() >= unpadded);
+            let off = col_offset * bpc * 110;
+            dest[off..off + unpadded].copy_from_slice(&src[..unpadded]);
+        }
         crate::compile::WeightFormat::Q4 => {
             assert!(rows.is_multiple_of(32));
             let bpc = rows / 32;
@@ -4872,7 +4892,9 @@ impl Session {
                         // weights than the file the caller already has, so
                         // refuse and point at the path that keeps them.
                         fmt @ (crate::compile::WeightFormat::Q4K
-                        | crate::compile::WeightFormat::Q6K) => panic!(
+                        | crate::compile::WeightFormat::Q6K
+                        | crate::compile::WeightFormat::Q5K
+                        | crate::compile::WeightFormat::Q3K) => panic!(
                             "parameter `{name}` is {fmt:?}; no encoder for it is implemented \
                              here, so load it with set_parameter_packed from a GGUF file"
                         ),
@@ -4929,7 +4951,9 @@ impl Session {
                                         .flat_map(|b| b.to_le_bytes())
                                         .collect(),
                                     fmt @ (crate::compile::WeightFormat::Q4K
-                                    | crate::compile::WeightFormat::Q6K) => panic!(
+                                    | crate::compile::WeightFormat::Q6K
+                                    | crate::compile::WeightFormat::Q5K
+                                    | crate::compile::WeightFormat::Q3K) => panic!(
                                         "derived parameter is {fmt:?}; load its sources with \
                                          set_parameter_packed"
                                     ),

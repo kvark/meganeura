@@ -47,6 +47,34 @@ pub enum DType {
     ///
     /// Load-only, for the same reason as [`DType::Q4K`].
     Q6K,
+    /// GGML's Q5_K, stored byte-for-byte as it appears in a GGUF file:
+    /// 256-element superblocks of 176 bytes, holding an f16 `d` and `dmin`,
+    /// eight 6-bit scale/min pairs in 12 bytes, 32 bytes of high bits, and
+    /// 128 nibble bytes.
+    ///
+    /// [`DType::Q4K`] plus one bit: the 5-bit quant is the nibble with
+    /// `qh`'s bit for that sub-block added as 16. At 5.5 bits/weight it
+    /// costs more than Meganeura Q4's 5.0 but carries a fifth mantissa bit
+    /// and finer scale granularity.
+    ///
+    /// Load-only, for the same reason as [`DType::Q4K`].
+    Q5K,
+    /// GGML's Q3_K, stored byte-for-byte as it appears in a GGUF file:
+    /// 256-element superblocks of 110 bytes, holding 32 bytes of high-bit
+    /// masks, 64 bytes of 2-bit quants, 12 bytes of packed 6-bit scales,
+    /// and an f16 superblock scale.
+    ///
+    /// Value is `d * (scale - 32) * (q - 4 * (1 - high_bit))` for a 2-bit
+    /// `q`, one scale per 16 elements. Note the high bit is *inverted*: a
+    /// clear `hmask` bit subtracts 4. At 3.4375 bits/weight this is the
+    /// smallest K-quant here.
+    ///
+    /// 110 is not a multiple of 4, so superblocks alternate between word
+    /// alignments and the shader reads them byte-addressed, as for
+    /// [`DType::Q6K`].
+    ///
+    /// Load-only, for the same reason as [`DType::Q4K`].
+    Q3K,
 }
 
 impl DType {
@@ -56,7 +84,7 @@ impl DType {
             DType::F32 => 4,
             DType::F16 => 2,
             DType::U32 => 4,
-            DType::Q4_0 | DType::Q8_0 | DType::Q4K | DType::Q6K => {
+            DType::Q4_0 | DType::Q8_0 | DType::Q4K | DType::Q6K | DType::Q5K | DType::Q3K => {
                 panic!("quantized types use block-level sizing")
             }
         }
@@ -113,6 +141,19 @@ impl TensorType {
                 // exact bytes and the shader reads them byte-addressed.
                 let blocks = self.num_elements().div_ceil(256);
                 (blocks * 210).next_multiple_of(4)
+            }
+            DType::Q5K => {
+                // 256-element superblocks, 176 bytes each: 1 u32 (d|dmin)
+                // + 3 u32s (packed scales) + 8 u32s (high bits) + 32 u32s
+                // (nibbles) = 44 u32s.
+                let blocks = self.num_elements().div_ceil(256);
+                blocks * 44 * 4
+            }
+            DType::Q3K => {
+                // 256-element superblocks, 110 bytes each — again not a
+                // whole number of words, so the tail is rounded up.
+                let blocks = self.num_elements().div_ceil(256);
+                (blocks * 110).next_multiple_of(4)
             }
             _ => self.num_elements() * self.dtype.size_bytes(),
         }
@@ -1110,6 +1151,44 @@ impl Graph {
             "Q6_K needs the reduction extent to be a multiple of 256, got {shape:?}"
         );
         let ty = TensorType::new(shape.to_vec(), DType::Q6K);
+        self.add_node(
+            Op::Parameter {
+                name: name.to_string(),
+            },
+            vec![],
+            ty,
+        )
+    }
+
+    /// Create a parameter stored as GGML Q5_K (5.5 bits/element).
+    ///
+    /// The reduction extent — `shape[0]` — must be a multiple of 256.
+    /// Load-only, like [`Graph::parameter_q4k`]. See [`DType::Q5K`].
+    pub fn parameter_q5k(&mut self, name: &str, shape: &[usize]) -> NodeId {
+        assert!(
+            shape.first().is_some_and(|k| k.is_multiple_of(256)),
+            "Q5_K needs the reduction extent to be a multiple of 256, got {shape:?}"
+        );
+        let ty = TensorType::new(shape.to_vec(), DType::Q5K);
+        self.add_node(
+            Op::Parameter {
+                name: name.to_string(),
+            },
+            vec![],
+            ty,
+        )
+    }
+
+    /// Create a parameter stored as GGML Q3_K (3.44 bits/element).
+    ///
+    /// The reduction extent — `shape[0]` — must be a multiple of 256.
+    /// Load-only, like [`Graph::parameter_q4k`]. See [`DType::Q3K`].
+    pub fn parameter_q3k(&mut self, name: &str, shape: &[usize]) -> NodeId {
+        assert!(
+            shape.first().is_some_and(|k| k.is_multiple_of(256)),
+            "Q3_K needs the reduction extent to be a multiple of 256, got {shape:?}"
+        );
+        let ty = TensorType::new(shape.to_vec(), DType::Q3K);
         self.add_node(
             Op::Parameter {
                 name: name.to_string(),

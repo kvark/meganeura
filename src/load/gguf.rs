@@ -134,6 +134,8 @@ pub enum GgmlType {
     Q8_0,
     Q4K,
     Q6K,
+    Q5K,
+    Q3K,
     /// A tag outside the set above. Carried so that a file holding one
     /// unimplemented tensor still yields an inventory for the rest; the
     /// tensor's bytes are not read, because its length depends on a block
@@ -149,7 +151,9 @@ impl GgmlType {
             2 => Self::Q4_0,
             3 => Self::Q4_1,
             8 => Self::Q8_0,
+            11 => Self::Q3K,
             12 => Self::Q4K,
+            13 => Self::Q5K,
             14 => Self::Q6K,
             other => Self::Other(other),
         }
@@ -166,7 +170,7 @@ impl GgmlType {
         Some(match self {
             Self::F32 | Self::F16 => 1,
             Self::Q4_0 | Self::Q4_1 | Self::Q8_0 => 32,
-            Self::Q4K | Self::Q6K => 256,
+            Self::Q4K | Self::Q6K | Self::Q5K | Self::Q3K => 256,
             Self::Other(_) => return None,
         })
     }
@@ -187,6 +191,10 @@ impl GgmlType {
             Self::Q4K => 144,
             // 128 low-nibble + 64 high-bit + 16 int8 scales + f16 d
             Self::Q6K => 210,
+            // f16 d + f16 dmin + 12 scale bytes + 32 high-bit + 128 nibble
+            Self::Q5K => 176,
+            // 32 hmask + 64 two-bit quants + 12 scale bytes + f16 d
+            Self::Q3K => 110,
             Self::Other(_) => return None,
         })
     }
@@ -216,6 +224,8 @@ impl GgmlType {
             Self::Q8_0 => 8,
             Self::Q4K => 12,
             Self::Q6K => 14,
+            Self::Q5K => 13,
+            Self::Q3K => 11,
             Self::Other(tag) => tag,
         }
     }
@@ -416,6 +426,14 @@ impl GgufTensor {
                 require_block_aligned(k, 256, "Q6_K")?;
                 Ok(DType::Q6K)
             }
+            GgmlType::Q5K => {
+                require_block_aligned(k, 256, "Q5_K")?;
+                Ok(DType::Q5K)
+            }
+            GgmlType::Q3K => {
+                require_block_aligned(k, 256, "Q3_K")?;
+                Ok(DType::Q3K)
+            }
             GgmlType::Other(tag) => Err(GgufError::UnsupportedType(tag)),
             other => Err(GgufError::UnsupportedPack(other)),
         }
@@ -450,10 +468,11 @@ impl GgufTensor {
             GgmlType::Q8_0 => Cow::Owned(self.repack_q8(count)),
             // The K-quants are already in GGML's layout, so these borrow
             // the file rather than copying it.
-            GgmlType::Q4K => Cow::Borrowed(self.data()),
-            GgmlType::Q6K => {
-                // 210-byte superblocks are not a whole number of words, so
-                // an odd count leaves the buffer two bytes short of the
+            // 144 and 176 are whole numbers of words, so these need no tail.
+            GgmlType::Q4K | GgmlType::Q5K => Cow::Borrowed(self.data()),
+            GgmlType::Q6K | GgmlType::Q3K => {
+                // 210- and 110-byte superblocks are not whole words, so an
+                // odd count leaves the buffer two bytes short of the
                 // `array<u32>` binding. Only then is a copy needed; the
                 // superblocks themselves are never touched.
                 let data = self.data();
@@ -503,6 +522,8 @@ impl GgufTensor {
             GgmlType::Q8_0 => dequant_q8_0(self.data(), count),
             GgmlType::Q4K => dequant_q4_k(self.data(), count),
             GgmlType::Q6K => dequant_q6_k(self.data(), count),
+            GgmlType::Q5K => dequant_q5_k(self.data(), count),
+            GgmlType::Q3K => dequant_q3_k(self.data(), count),
             GgmlType::Other(tag) => return Err(GgufError::UnsupportedType(tag)),
         })
     }
@@ -1001,6 +1022,87 @@ fn dequant_q4_k(data: &[u8], count: usize) -> Vec<f32> {
                 let byte = qs[pair * 32 + j];
                 out[base + pair * 64 + j] = d1 * f32::from(byte & 0x0F) - m1;
                 out[base + pair * 64 + 32 + j] = d2 * f32::from(byte >> 4) - m2;
+            }
+        }
+    }
+    out
+}
+
+/// Mirrors `dequantize_row_q5_K`. Q4_K's nibble plus one bit from `qh`,
+/// whose bit index is the sub-block number — `qh` is indexed by position
+/// within the 32-element stride and shared across all four spans.
+fn dequant_q5_k(data: &[u8], count: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; count];
+    for (b, chunk) in data.as_chunks::<176>().0.iter().enumerate() {
+        let d = f16_from_bits(u16::from_le_bytes([chunk[0], chunk[1]]));
+        let dmin = f16_from_bits(u16::from_le_bytes([chunk[2], chunk[3]]));
+        let scales = &chunk[4..16];
+        let qh = &chunk[16..48];
+        let qs = &chunk[48..176];
+        let base = b * 256;
+        for pair in 0..4 {
+            let (sc_lo, m_lo) = q4k_scale_min(pair * 2, scales);
+            let (sc_hi, m_hi) = q4k_scale_min(pair * 2 + 1, scales);
+            let d1 = d * f32::from(sc_lo);
+            let m1 = dmin * f32::from(m_lo);
+            let d2 = d * f32::from(sc_hi);
+            let m2 = dmin * f32::from(m_hi);
+            for l in 0..32 {
+                let byte = qs[pair * 32 + l];
+                let bits = qh[l];
+                let lo =
+                    u32::from(byte & 0x0F) + if bits & (1 << (pair * 2)) != 0 { 16 } else { 0 };
+                let hi = u32::from(byte >> 4)
+                    + if bits & (1 << (pair * 2 + 1)) != 0 {
+                        16
+                    } else {
+                        0
+                    };
+                out[base + pair * 64 + l] = d1 * lo as f32 - m1;
+                out[base + pair * 64 + 32 + l] = d2 * hi as f32 - m2;
+            }
+        }
+    }
+    out
+}
+
+/// Scale `i` of sixteen for a Q3_K superblock, before the -32 bias.
+///
+/// The twelve stored bytes expand to sixteen 6-bit values: groups 0 and 1
+/// take the low nibbles of `scales[0..8]`, groups 2 and 3 the high
+/// nibbles, and each borrows two more bits from `scales[8..12]`. Written
+/// from the `kmask1`/`kmask2` shuffle in `dequantize_row_q3_K` rather than
+/// from the shader.
+fn q3k_scale_6bit(i: usize, scales: &[u8]) -> u8 {
+    let b = i % 4;
+    let g = i / 4;
+    let raw = scales[if g.is_multiple_of(2) { b } else { 4 + b }];
+    let nib = if g < 2 { raw & 0x0F } else { raw >> 4 };
+    let hi = (scales[8 + b] >> (g * 2)) & 0x03;
+    nib | (hi << 4)
+}
+
+/// Mirrors `dequantize_row_q3_K`. Note the inverted high bit: a *clear*
+/// `hmask` bit subtracts 4 from the 2-bit quant.
+fn dequant_q3_k(data: &[u8], count: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; count];
+    for (b, chunk) in data.as_chunks::<110>().0.iter().enumerate() {
+        let hmask = &chunk[0..32];
+        let qs = &chunk[32..96];
+        let scales = &chunk[96..108];
+        let d = f16_from_bits(u16::from_le_bytes([chunk[108], chunk[109]]));
+        let base = b * 256;
+        for half in 0..2 {
+            for j in 0..4 {
+                for within in 0..32 {
+                    let sub = within / 16;
+                    let l = sub * 16 + within % 16;
+                    let q = (qs[half * 32 + l] >> (j * 2)) & 0x03;
+                    let set = hmask[l] & (1 << (half * 4 + j)) != 0;
+                    let v = i32::from(q) - if set { 0 } else { 4 };
+                    let sc = f32::from(q3k_scale_6bit(half * 8 + j * 2 + sub, scales)) - 32.0;
+                    out[base + half * 128 + j * 32 + within] = d * sc * v as f32;
+                }
             }
         }
     }
@@ -1508,14 +1610,14 @@ mod tests {
     }
 
     /// A file holding one type this loader does not implement must still
-    /// yield an inventory for the rest of it — a Q5_K_M mix should list
-    /// even though its Q5_K tensors cannot be read.
+    /// yield an inventory for the rest of it — a Q2_K mix should list even
+    /// though its Q2_K tensors cannot be read.
     #[test]
     fn unknown_tensor_types_are_listed_not_fatal() {
-        // 13 is Q5_K, which this loader does not implement.
+        // 10 is Q2_K, which this loader does not implement.
         let bytes = Builder::new()
             .tensor("known", &[32, 1], GgmlType::Q8_0, &q8_0_block(1.0, [0; 32]))
-            .tensor("unknown", &[256, 1], GgmlType::Other(13), &[])
+            .tensor("unknown", &[256, 1], GgmlType::Other(10), &[])
             .build();
         let m = load_gguf_bytes(&bytes).unwrap();
         assert_eq!(m.tensors.len(), 2, "both tensors must be listed");
@@ -1525,17 +1627,17 @@ mod tests {
 
         let unknown = &m.tensors["unknown"];
         assert_eq!(unknown.dims, vec![256, 1], "shape survives");
-        assert_eq!(unknown.ggml_type, GgmlType::Other(13));
+        assert_eq!(unknown.ggml_type, GgmlType::Other(10));
         assert!(!unknown.ggml_type.is_supported());
         // Its length depends on a block size we do not know, so no bytes.
         assert!(unknown.data().is_empty());
         assert!(matches!(
             unknown.to_packed(),
-            Err(GgufError::UnsupportedType(13))
+            Err(GgufError::UnsupportedType(10))
         ));
         assert!(matches!(
             unknown.to_f32(),
-            Err(GgufError::UnsupportedType(13))
+            Err(GgufError::UnsupportedType(10))
         ));
     }
 
@@ -1655,6 +1757,113 @@ mod tests {
         assert!(matches!(packed, Cow::Owned(_)), "padding needs a copy");
         assert_eq!(packed.len(), 212);
         assert_eq!(&packed[..210], &block[..]);
+    }
+
+    /// Q5_K is Q4_K's nibble plus a `qh` bit worth 16. Hand-computed, with
+    /// the bit set for one element and clear for its neighbour so the
+    /// per-sub-block bit index is pinned rather than assumed.
+    #[test]
+    fn q5_k_dequantizes_against_hand_computed_values() {
+        let sc = [2u8, 0, 0, 0, 0, 0, 0, 0];
+        let mn = [1u8, 0, 0, 0, 0, 0, 0, 0];
+        let mut block = vec![0u8; 176];
+        block[0..2].copy_from_slice(&f16_to_bits(1.0).to_le_bytes()); // d
+        block[2..4].copy_from_slice(&f16_to_bits(1.0).to_le_bytes()); // dmin
+        let scales = &mut block[4..16];
+        for j in 0..4 {
+            scales[j] = sc[j] & 63;
+            scales[j + 4] = mn[j] & 63;
+        }
+        // qs[0] feeds elements 0 (low nibble) and 32 (high nibble).
+        block[48] = 3 | (5 << 4);
+        // qh[0] bit 0 belongs to sub-block 0, bit 1 to sub-block 1. Set
+        // only bit 0, so element 0 gains 16 and element 32 does not.
+        block[16] = 0b01;
+
+        let bytes = Builder::new()
+            .tensor("w", &[256, 1], GgmlType::Q5K, &block)
+            .build();
+        let m = load_gguf_bytes(&bytes).unwrap();
+        let f = m.tensors["w"].to_f32().unwrap();
+
+        // element 0: sub-block 0, sc=2, m=1, q = 3 + 16 -> 2*19 - 1
+        assert!((f[0] - 37.0).abs() < 1e-3, "got {}", f[0]);
+        // element 32: sub-block 1, sc=0, m=0, q = 5 + 0 -> 0
+        assert!((f[32] - 0.0).abs() < 1e-3, "got {}", f[32]);
+    }
+
+    /// Q3_K's high bit is inverted — a *clear* `hmask` bit subtracts 4 —
+    /// and its scales use their own shuffle rather than
+    /// `get_scale_min_k4`. Both are pinned here with hand-computed values,
+    /// including a `g >= 2` scale group whose nibble comes from the high
+    /// half of a stored byte.
+    #[test]
+    fn q3_k_dequantizes_against_hand_computed_values() {
+        let mut block = vec![0u8; 110];
+        block[108..110].copy_from_slice(&f16_to_bits(1.0).to_le_bytes());
+
+        // scales[] holds sixteen 6-bit values. Index 0 takes the low
+        // nibble of byte 0 plus bits 0-1 of byte 8; index 8 takes the
+        // *high* nibble of byte 0 plus bits 4-5 of byte 8.
+        let scales = &mut block[96..108];
+        scales[0] = 0x04 | (0x03 << 4); // scale 0 nibble 4, scale 8 nibble 3
+        scales[8] = 0b0001_0001; // scale 0 hi bits = 1, scale 8 hi bits = 1
+        // scale 0  = 4 | (1 << 4) = 20 -> 20 - 32 = -12
+        // scale 8  = 3 | (1 << 4) = 19 -> 19 - 32 = -13
+
+        // Element 0: half 0, j 0, sub 0, l 0 -> qs[0] bits 0-1, hmask[0] bit 0.
+        block[32] = 0b11; // q = 3
+        block[0] = 0b0000_0001; // hmask bit 0 set -> no -4
+        // Element 128: half 1, j 0, sub 0, l 0 -> qs[32] bits 0-1,
+        // hmask[0] bit 4. Leave that bit clear so the -4 applies.
+        block[64] = 0b10; // q = 2, bit 4 of hmask[0] is clear -> 2 - 4 = -2
+
+        let bytes = Builder::new()
+            .tensor("w", &[256, 1], GgmlType::Q3K, &block)
+            .build();
+        let m = load_gguf_bytes(&bytes).unwrap();
+        let f = m.tensors["w"].to_f32().unwrap();
+
+        // element 0:   d=1, scale 0 = -12, q = 3 (bit set) -> -36
+        assert!((f[0] + 36.0).abs() < 1e-3, "element 0: got {}", f[0]);
+        // element 128: d=1, scale 8 = -13, q = 2 - 4 = -2 -> 26
+        assert!((f[128] - 26.0).abs() < 1e-3, "element 128: got {}", f[128]);
+    }
+
+    /// Q5_K needs no tail; Q3_K's 110-byte superblocks do.
+    #[test]
+    fn new_k_quants_pack_verbatim() {
+        let q5: Vec<u8> = (0..176).map(|i| (i * 7 % 251) as u8).collect();
+        let bytes = Builder::new()
+            .tensor("w", &[256, 1], GgmlType::Q5K, &q5)
+            .build();
+        let m = load_gguf_bytes(&bytes).unwrap();
+        let (dtype, packed) = m.tensors["w"].to_packed().unwrap();
+        assert_eq!(dtype, DType::Q5K);
+        assert!(
+            matches!(packed, Cow::Borrowed(_)),
+            "176 is a whole word count"
+        );
+        assert_eq!(&*packed, &q5[..]);
+        assert_eq!(
+            crate::graph::TensorType::new(vec![256, 1], DType::Q5K).size_bytes(),
+            packed.len()
+        );
+
+        let q3: Vec<u8> = (0..110).map(|i| (i * 5 % 253) as u8).collect();
+        let bytes = Builder::new()
+            .tensor("w", &[256, 1], GgmlType::Q3K, &q3)
+            .build();
+        let m = load_gguf_bytes(&bytes).unwrap();
+        let (dtype, packed) = m.tensors["w"].to_packed().unwrap();
+        assert_eq!(dtype, DType::Q3K);
+        assert_eq!(packed.len(), 112, "110 rounds up to 28 words");
+        assert_eq!(&packed[..110], &q3[..], "superblock must be verbatim");
+        assert_eq!(&packed[110..], &[0, 0]);
+        assert_eq!(
+            crate::graph::TensorType::new(vec![256, 1], DType::Q3K).size_bytes(),
+            packed.len()
+        );
     }
 
     #[test]
