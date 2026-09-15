@@ -1290,16 +1290,7 @@ fn matmul_vars_tiled(
 /// `SHADER_FLOAT16_IN_FLOAT32`, which Blade enables — it stores
 /// f16-precision values inside f32 rather than needing the `f16`
 /// extension, and lowers to core `GlslStd450 UnpackHalf2x16` on SPIR-V.
-const F16_DECODE_FN: &str = "
-fn decode_f16(bits: u32) -> f32 {
-    return unpack2x16float(bits & 0xFFFFu).x;
-}
-
-// Both halves of a packed (low, high) scale pair in one instruction.
-fn decode_f16_pair(bits: u32) -> vec2<f32> {
-    return unpack2x16float(bits);
-}
-";
+const F16_DECODE_FN: &str = include_str!("shaders/dequant_f16_decode.wgsl");
 
 /// Meganeura asymmetric Q4 (Q4_1-style) dequantization helper for WGSL.
 /// Buffer layout: [scales as packed f16 pairs (u32)][packed nibble data (u32)].
@@ -1307,67 +1298,13 @@ fn decode_f16_pair(bits: u32) -> vec2<f32> {
 ///
 /// `dequant_q4` stays the scalar entry used by GEMV. Tiled staging uses
 /// `dequant_q4_pack8`: one (d, m) header and one data word → 8 values.
-const Q4_DEQUANT_FN: &str = "
-fn q4_unpack_nibble(data: u32, d: f32, m: f32, in_word: u32) -> f32 {
-    let nibble = (data >> (in_word * 4u)) & 0xFu;
-    return f32(nibble) * d + m;
-}
-
-fn dequant_q4(k_idx: u32, n_idx: u32) -> f32 {
-    // Q4_1 asymmetric: value = nibble * d + m
-    // Layout: [num_blocks u32s: (d_f16|m_f16)][num_blocks*4 u32s: nibble data]
-    let blocks_per_col = params.k / 32u;
-    let num_blocks = blocks_per_col * params.n;
-    let block = n_idx * blocks_per_col + k_idx / 32u;
-    let in_block = k_idx % 32u;
-
-    let dm = decode_f16_pair(matrix_b[block]);
-    let d = dm.x;
-    let m = dm.y;
-    let data_u32 = matrix_b[num_blocks + block * 4u + in_block / 8u];
-    return q4_unpack_nibble(data_u32, d, m, in_block % 8u);
-}
-
-fn dequant_q4_pack8(k_base: u32, n_idx: u32) -> array<f32, 8> {
-    let blocks_per_col = params.k / 32u;
-    let num_blocks = blocks_per_col * params.n;
-    let block = n_idx * blocks_per_col + k_base / 32u;
-    let dm = decode_f16_pair(matrix_b[block]);
-    let d = dm.x;
-    let m = dm.y;
-    let data_u32 = matrix_b[num_blocks + block * 4u + (k_base % 32u) / 8u];
-    var out: array<f32, 8>;
-    for (var i = 0u; i < 8u; i++) {
-        out[i] = q4_unpack_nibble(data_u32, d, m, i);
-    }
-    return out;
-}
-";
+const Q4_DEQUANT_FN: &str = include_str!("shaders/dequant_q4.wgsl");
 
 /// The `get_scale_min_k4` scale/min decoder, shared by Q4_K and Q5_K.
 ///
 /// Both store eight 6-bit pairs in twelve bytes the same way, and both
 /// have word-aligned superblocks, so the byte reader is word-indexed.
-const K_SCALE_MIN_FN: &str = "
-fn kq_byte(base: u32, off: u32) -> u32 {
-    let w = matrix_b[base + off / 4u];
-    return (w >> ((off % 4u) * 8u)) & 0xFFu;
-}
-
-fn kq_scale_min(base: u32, j: u32) -> vec2<f32> {
-    var sc: u32;
-    var mn: u32;
-    if j < 4u {
-        sc = kq_byte(base, 4u + j) & 63u;
-        mn = kq_byte(base, 8u + j) & 63u;
-    } else {
-        let hi = kq_byte(base, j + 8u);
-        sc = (hi & 0xFu) | ((kq_byte(base, j) >> 6u) << 4u);
-        mn = (hi >> 4u) | ((kq_byte(base, 4u + j) >> 6u) << 4u);
-    }
-    return vec2<f32>(f32(sc), f32(mn));
-}
-";
+const K_SCALE_MIN_FN: &str = include_str!("shaders/dequant_k_scale_min.wgsl");
 
 /// GGML Q4_K dequantization, reading GGUF's bytes verbatim.
 ///
@@ -1381,45 +1318,7 @@ fn kq_scale_min(base: u32, j: u32) -> vec2<f32> {
 /// the nibble split mirrors `dequantize_row_q4_K`: within each 64-element
 /// span the low nibbles feed the first 32 elements and the high nibbles
 /// the second.
-const Q4K_DEQUANT_FN: &str = "
-fn dequant_q4k(k_idx: u32, n_idx: u32) -> f32 {
-    let base = (n_idx * (params.k / 256u) + k_idx / 256u) * 36u;
-    let hdr = decode_f16_pair(matrix_b[base]);
-    let d = hdr.x;
-    let dmin = hdr.y;
-    let e = k_idx % 256u;
-    let sm = kq_scale_min(base, e / 32u);
-    let byte = kq_byte(base, 16u + (e / 64u) * 32u + e % 32u);
-    let q = select(byte >> 4u, byte & 0xFu, (e % 64u) < 32u);
-    return d * sm.x * f32(q) - dmin * sm.y;
-}
-
-fn dequant_q4k_pack8(k_base: u32, n_idx: u32) -> array<f32, 8> {
-    let base = (n_idx * (params.k / 256u) + k_base / 256u) * 36u;
-    let hdr = decode_f16_pair(matrix_b[base]);
-    let d = hdr.x;
-    let dmin = hdr.y;
-    let e = k_base % 256u;
-    let sm = kq_scale_min(base, e / 32u);
-    let scale = d * sm.x;
-    let offset = dmin * sm.y;
-    // Eight 8-aligned elements share a sub-block and a nibble half, and
-    // span eight consecutive bytes - two words, because GGML pairs e with
-    // e + 32 rather than e with e + 1.
-    let low = (e % 64u) < 32u;
-    let wbase = base + (16u + (e / 64u) * 32u + e % 32u) / 4u;
-    let w0 = matrix_b[wbase];
-    let w1 = matrix_b[wbase + 1u];
-    var out: array<f32, 8>;
-    for (var i = 0u; i < 8u; i++) {
-        let w = select(w1, w0, i < 4u);
-        let byte = (w >> ((i % 4u) * 8u)) & 0xFFu;
-        let q = select(byte >> 4u, byte & 0xFu, low);
-        out[i] = scale * f32(q) - offset;
-    }
-    return out;
-}
-";
+const Q4K_DEQUANT_FN: &str = include_str!("shaders/dequant_q4k.wgsl");
 
 /// GGML Q6_K dequantization, reading GGUF's bytes verbatim.
 ///
@@ -1437,67 +1336,7 @@ fn dequant_q4k_pack8(k_base: u32, n_idx: u32) -> array<f32, 8> {
 /// is walked in 32-element strides `j`, drawing the low nibble of
 /// `ql[l + (j & 1) * 32]` for `j < 2` and the high nibble for `j >= 2`, with
 /// the bit-pair at `qh[l] >> (j * 2)` and the scale at `j * 2 + l / 16`.
-const Q6K_DEQUANT_FN: &str = "
-// Byte `off` of the superblock starting at absolute byte `byte_base`.
-fn q6k_byte(byte_base: u32, off: u32) -> u32 {
-    let at = byte_base + off;
-    return (matrix_b[at / 4u] >> ((at % 4u) * 8u)) & 0xFFu;
-}
-
-// scales[] is int8_t, and these do go negative.
-fn q6k_scale(byte_base: u32, i: u32) -> f32 {
-    let raw = q6k_byte(byte_base, 192u + i);
-    return f32(i32(raw) - select(0, 256, raw >= 128u));
-}
-
-fn q6k_d(byte_base: u32) -> f32 {
-    let lo = q6k_byte(byte_base, 208u);
-    let hi = q6k_byte(byte_base, 209u);
-    return decode_f16(lo | (hi << 8u));
-}
-
-// The 6-bit quant for element `e`, before scaling.
-fn q6k_quant(byte_base: u32, e: u32) -> i32 {
-    let half = e / 128u;
-    let within = e % 128u;
-    let j = within / 32u;
-    let l = within % 32u;
-    let ql = q6k_byte(byte_base, half * 64u + l + (j & 1u) * 32u);
-    let lo = select(ql >> 4u, ql & 0xFu, j < 2u);
-    let qh = q6k_byte(byte_base, 128u + half * 32u + l);
-    let hi = (qh >> (j * 2u)) & 3u;
-    return i32(lo | (hi << 4u)) - 32;
-}
-
-// Which of the sixteen sub-block scales covers element `e`.
-fn q6k_scale_index(e: u32) -> u32 {
-    let half = e / 128u;
-    let within = e % 128u;
-    return half * 8u + (within / 32u) * 2u + (within % 32u) / 16u;
-}
-
-fn dequant_q6k(k_idx: u32, n_idx: u32) -> f32 {
-    let byte_base = (n_idx * (params.k / 256u) + k_idx / 256u) * 210u;
-    let e = k_idx % 256u;
-    let scale = q6k_d(byte_base) * q6k_scale(byte_base, q6k_scale_index(e));
-    return scale * f32(q6k_quant(byte_base, e));
-}
-
-fn dequant_q6k_pack8(k_base: u32, n_idx: u32) -> array<f32, 8> {
-    // Eight 8-aligned elements share a superblock, a 32-element stride and
-    // a 16-element scale group, so the f16 decode and the scale byte are
-    // read once for all of them. The payload stays per element: ql and qh
-    // live in separate regions at arbitrary word alignment.
-    let byte_base = (n_idx * (params.k / 256u) + k_base / 256u) * 210u;
-    let e = k_base % 256u;
-    let scale = q6k_d(byte_base) * q6k_scale(byte_base, q6k_scale_index(e));
-    var out: array<f32, 8>;
-    for (var i = 0u; i < 8u; i++) {
-        out[i] = scale * f32(q6k_quant(byte_base, e + i));
-    }
-    return out;
-}
-";
+const Q6K_DEQUANT_FN: &str = include_str!("shaders/dequant_q6k.wgsl");
 
 /// GGML Q5_K dequantization, reading GGUF's bytes verbatim.
 ///
@@ -1512,42 +1351,7 @@ fn dequant_q6k_pack8(k_base: u32, n_idx: u32) -> array<f32, 8> {
 /// within its 32-element stride — `qh` is indexed by `l` alone and shared
 /// across all four 64-element spans, which is why the bit index is the
 /// sub-block number rather than an offset into `qh`.
-const Q5K_DEQUANT_FN: &str = "
-// The 5-bit quant for element `e`: nibble from qs, plus 16 if this
-// sub-block's bit is set in qh.
-fn q5k_quant(base: u32, e: u32) -> u32 {
-    let l = e % 32u;
-    let byte = kq_byte(base, 48u + (e / 64u) * 32u + l);
-    let nib = select(byte >> 4u, byte & 0xFu, (e % 64u) < 32u);
-    let hi = (kq_byte(base, 16u + l) >> (e / 32u)) & 1u;
-    return nib + hi * 16u;
-}
-
-fn dequant_q5k(k_idx: u32, n_idx: u32) -> f32 {
-    let base = (n_idx * (params.k / 256u) + k_idx / 256u) * 44u;
-    let hdr = decode_f16_pair(matrix_b[base]);
-    let e = k_idx % 256u;
-    let sm = kq_scale_min(base, e / 32u);
-    return hdr.x * sm.x * f32(q5k_quant(base, e)) - hdr.y * sm.y;
-}
-
-fn dequant_q5k_pack8(k_base: u32, n_idx: u32) -> array<f32, 8> {
-    // Eight 8-aligned elements share a sub-block, so the header and the
-    // scale pair are read once. The payload stays per element: the nibble
-    // and its high bit come from two separate regions.
-    let base = (n_idx * (params.k / 256u) + k_base / 256u) * 44u;
-    let hdr = decode_f16_pair(matrix_b[base]);
-    let e = k_base % 256u;
-    let sm = kq_scale_min(base, e / 32u);
-    let scale = hdr.x * sm.x;
-    let offset = hdr.y * sm.y;
-    var out: array<f32, 8>;
-    for (var i = 0u; i < 8u; i++) {
-        out[i] = scale * f32(q5k_quant(base, e + i)) - offset;
-    }
-    return out;
-}
-";
+const Q5K_DEQUANT_FN: &str = include_str!("shaders/dequant_q5k.wgsl");
 
 /// GGML Q3_K dequantization, reading GGUF's bytes verbatim.
 ///
@@ -1562,96 +1366,12 @@ fn dequant_q5k_pack8(k_base: u32, n_idx: u32) -> array<f32, 8> {
 /// scales are not `get_scale_min_k4`: they come from a shuffle of the 12
 /// bytes that pairs each low or high nibble with two bits drawn from the
 /// last four bytes, then biases by 32.
-const Q3K_DEQUANT_FN: &str = "
-fn q3k_byte(byte_base: u32, off: u32) -> u32 {
-    let at = byte_base + off;
-    return (matrix_b[at / 4u] >> ((at % 4u) * 8u)) & 0xFFu;
-}
-
-// Scale `i` of sixteen, biased by 32. Mirrors the kmask1/kmask2 shuffle in
-// dequantize_row_q3_K: groups 0 and 1 take low nibbles of scales[0..8],
-// groups 2 and 3 the high nibbles, and each borrows two more bits from
-// scales[8..12].
-fn q3k_scale(byte_base: u32, i: u32) -> f32 {
-    let b = i % 4u;
-    let g = i / 4u;
-    let src = select(4u + b, b, (g % 2u) == 0u);
-    let raw = q3k_byte(byte_base, 96u + src);
-    let nib = select(raw >> 4u, raw & 0xFu, g < 2u);
-    let hi = (q3k_byte(byte_base, 96u + 8u + b) >> (g * 2u)) & 3u;
-    return f32(i32(nib | (hi << 4u)) - 32);
-}
-
-// The 2-bit quant for element `e`, with the inverted high bit applied.
-//
-// `l` is the element's position within its 32-element stride, which is
-// `e % 32` once the half and stride terms cancel; `hmask` is shared across
-// halves and strides, and the bit that selects between them is `e / 32`.
-fn q3k_quant(byte_base: u32, e: u32) -> i32 {
-    let h = e / 128u;
-    let j = (e % 128u) / 32u;
-    let l = e % 32u;
-    let q = (q3k_byte(byte_base, 32u + h * 32u + l) >> (j * 2u)) & 3u;
-    let hbit = (q3k_byte(byte_base, l) >> (e / 32u)) & 1u;
-    return i32(q) - select(4, 0, hbit == 1u);
-}
-
-fn q3k_d(byte_base: u32) -> f32 {
-    let lo = q3k_byte(byte_base, 108u);
-    let hi = q3k_byte(byte_base, 109u);
-    return decode_f16(lo | (hi << 8u));
-}
-
-fn dequant_q3k(k_idx: u32, n_idx: u32) -> f32 {
-    let byte_base = (n_idx * (params.k / 256u) + k_idx / 256u) * 110u;
-    let e = k_idx % 256u;
-    // One scale per 16 elements.
-    let scale = q3k_d(byte_base) * q3k_scale(byte_base, e / 16u);
-    return scale * f32(q3k_quant(byte_base, e));
-}
-
-fn dequant_q3k_pack8(k_base: u32, n_idx: u32) -> array<f32, 8> {
-    // Eight 8-aligned elements share a superblock and a 16-element scale
-    // group, so the f16 decode and the scale shuffle run once for all of
-    // them. The payload stays per element: qs and hmask live in separate
-    // regions.
-    let byte_base = (n_idx * (params.k / 256u) + k_base / 256u) * 110u;
-    let e = k_base % 256u;
-    let scale = q3k_d(byte_base) * q3k_scale(byte_base, e / 16u);
-    var out: array<f32, 8>;
-    for (var i = 0u; i < 8u; i++) {
-        out[i] = scale * f32(q3k_quant(byte_base, e + i));
-    }
-    return out;
-}
-";
+const Q3K_DEQUANT_FN: &str = include_str!("shaders/dequant_q3k.wgsl");
 
 /// Q8_0 dequantization: symmetric 8-bit, 32-element blocks.
 /// Layout: [9 u32s per block: 1 scale_u32 + 8 data_u32s].
 /// Block i starts at matrix_b[i * 9]. scale_f16 in low 16 bits of first u32.
-const Q8_DEQUANT_FN: &str = "
-fn dequant_q8(k_idx: u32, n_idx: u32) -> f32 {
-    // Q8_0: value = int8 * scale
-    let blocks_per_col = params.k / 32u;
-    let block = n_idx * blocks_per_col + k_idx / 32u;
-    let in_block = k_idx % 32u;
-
-    // Each block is 9 u32s: [scale_u32, data0..data7]
-    let block_base = block * 9u;
-    let scale = decode_f16(matrix_b[block_base] & 0xFFFFu);
-
-    // Extract int8 from data u32s (4 bytes per u32)
-    let byte_idx = in_block;
-    let u32_idx = byte_idx / 4u;
-    let byte_in_u32 = byte_idx % 4u;
-    let data_u32 = matrix_b[block_base + 1u + u32_idx];
-    let raw_byte = (data_u32 >> (byte_in_u32 * 8u)) & 0xFFu;
-
-    // Sign-extend: if bit 7 is set, the value is negative
-    let signed = i32(raw_byte) - select(0, 256, raw_byte >= 128u);
-    return f32(signed) * scale;
-}
-";
+const Q8_DEQUANT_FN: &str = include_str!("shaders/dequant_q8.wgsl");
 
 fn matmul_small_vars(
     a_idx: &str,
