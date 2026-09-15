@@ -1,10 +1,20 @@
 //! Bounded, opt-in kernel selection. See [`crate::Session::tune_with`].
 //!
 //! The search space is deliberately small: scalar and native-f32 cooperative
-//! tiles for unpacked dense matmuls, and shape-specialized scalar convolutions,
+//! tiles for unpacked dense matmuls, shape-specialized scalar convolutions,
+//! and workgroup width and cross-lane reduction for the K-split GEMV family,
 //! with no precision or binding-layout changes.
 //! Measurements use synthetic, private scratch, not a live training step.
 //! Explicit split-K probes measure complete sequences without installing them.
+//!
+//! The GEMV axis is the one that carries reduced-storage weights. Every other
+//! candidate rewrites the arithmetic around B, which a packed B's decoder is
+//! not part of; a width or reduction choice leaves the decoder untouched, so
+//! a quantized decode kernel can be measured like any other. That matters
+//! because decode is mostly quantized GEMV, and a kernel the search cannot
+//! reach is a kernel nobody can tune — the candidate that wins on one
+//! vendor's wave width is not the one that wins on another's, and that
+//! disagreement is exactly what measurement is for.
 
 use crate::codegen::CoopConfig;
 use crate::compile::{Dispatch, ShaderEntry};
@@ -23,6 +33,11 @@ pub struct TuneClass {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conv2d: Option<TuneConv2d>,
     pub requires_full_precision: bool,
+    /// Storage format of B. Part of the key because it changes both the
+    /// kernel and the bytes behind the binding, so no winner transfers
+    /// between an f32 weight and a packed one of the same extents.
+    #[serde(default)]
+    pub weight_format: crate::compile::WeightFormat,
     /// Placement of A, B, addend (false if absent), and output, respectively.
     pub device_local: [bool; 4],
     /// Declared bytes for A, B, optional addend, output, in binding order.
@@ -138,7 +153,18 @@ impl TuneConv2d {
     }
 }
 
-/// f32 implementations with identical bindings and logical extents.
+/// The GEMV group a shader entry belongs to, if any.
+pub(crate) fn gemv_group(entry: &ShaderEntry) -> Option<crate::codegen::ShaderGroup> {
+    use crate::codegen::ShaderGroup;
+    match *entry {
+        ShaderEntry::MatMulGemv => Some(ShaderGroup::MatMulGemv),
+        ShaderEntry::MatMulGemvAdd => Some(ShaderGroup::MatMulGemvAdd),
+        ShaderEntry::MatMulGemvBT => Some(ShaderGroup::MatMulGemvBT),
+        _ => None,
+    }
+}
+
+/// Implementations with identical bindings and logical extents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MatmulTile {
     Tile32,
@@ -153,6 +179,13 @@ pub enum MatmulTile {
     CooperativeF32 {
         tile_size: u32,
     },
+    /// A K-split GEMV at one workgroup width and cross-lane reduction.
+    ///
+    /// Unlike the tiled entries this changes neither the shader entry, the
+    /// workgroup count, nor the buffer layout — only how the threads inside a
+    /// workgroup divide K and recombine. It is therefore the one candidate
+    /// that applies to reduced-storage weights too: the decoder is untouched.
+    Gemv(crate::codegen::GemvShape),
 }
 
 impl MatmulTile {
@@ -174,7 +207,11 @@ impl MatmulTile {
                     | ShaderEntry::Conv2dGradInputGemmSmall
                     | ShaderEntry::Conv2dGradWeightGemmSmall
             );
-        if let Some(k_tile) = dispatch.conv_k_tile {
+        if let Some(group) = gemv_group(&dispatch.shader) {
+            Some(Self::Gemv(dispatch.gemv_shape.unwrap_or_else(|| {
+                crate::codegen::GemvShape::initial(group)
+            })))
+        } else if let Some(k_tile) = dispatch.conv_k_tile {
             Some(Self::SpecializedConv {
                 tile_size: if small { 32 } else { 64 },
                 k_tile,
@@ -200,6 +237,13 @@ impl MatmulTile {
     }
 
     pub(crate) fn apply(self, dispatch: &mut Dispatch, class: &TuneClass) {
+        if let Self::Gemv(shape) = self {
+            // Width and reduction live inside the workgroup, so the entry,
+            // the workgroup count and every binding stay exactly as the
+            // compiler emitted them.
+            dispatch.gemv_shape = Some(shape);
+            return;
+        }
         dispatch.shader = self.shader(&class.shader);
         dispatch.use_small_tiles = class.conv2d.is_none() && self == Self::Tile32;
         dispatch.use_coop = matches!(self, Self::CooperativeF32 { .. });
@@ -246,6 +290,10 @@ impl MatmulTile {
 
     fn workgroups(self, class: &TuneClass) -> [u32; 3] {
         let tile = match self {
+            // One workgroup per output vec4 (or per row, transposed), set by
+            // N alone. Changing the threads per workgroup does not change how
+            // many there are.
+            Self::Gemv(_) => return class.gemv_workgroups(),
             Self::Tile32 => 32,
             Self::Tile64 => 64,
             Self::SpecializedConv { tile_size, .. } => tile_size,
@@ -265,6 +313,17 @@ impl MatmulTile {
     }
 
     pub(crate) fn buffer_sizes(self, class: &TuneClass) -> Option<Vec<usize>> {
+        if let Self::Gemv(shape) = self {
+            if gemv_group(&class.shader).is_none() || !matches!(shape.threads, 32 | 64 | 128 | 256)
+            {
+                return None;
+            }
+            let sizes = class.buffer_sizes()?;
+            if self.workgroups(class).iter().any(|&n| n == 0 || n > 65_535) {
+                return None;
+            }
+            return Some(sizes);
+        }
         if let Self::SpecializedConv { tile_size, k_tile } = self {
             if class.conv2d.is_none() || !matches!(tile_size, 32 | 64) || !matches!(k_tile, 16 | 32)
             {
@@ -314,13 +373,20 @@ impl MatmulTile {
 
 impl TuneClass {
     pub(crate) fn from_dispatch(dispatch: &Dispatch, config: Option<&CoopConfig>) -> Option<Self> {
-        let addend = dispatch.shader == ShaderEntry::FusedMatMulAdd;
+        let gemv = gemv_group(&dispatch.shader).is_some();
+        let addend = matches!(
+            dispatch.shader,
+            ShaderEntry::FusedMatMulAdd | ShaderEntry::MatMulGemvAdd
+        );
         if !matches!(
             dispatch.shader,
             ShaderEntry::MatMul
                 | ShaderEntry::FusedMatMulAdd
                 | ShaderEntry::MatMulAT
                 | ShaderEntry::MatMulBT
+                | ShaderEntry::MatMulGemv
+                | ShaderEntry::MatMulGemvAdd
+                | ShaderEntry::MatMulGemvBT
                 | ShaderEntry::Conv2dGemm
                 | ShaderEntry::Conv2dGemmSmall
                 | ShaderEntry::Conv2dGradInputGemm
@@ -329,7 +395,14 @@ impl TuneClass {
                 | ShaderEntry::Conv2dGradWeightGemmSmall
         ) || dispatch.use_coop_compensated
             || (dispatch.use_coop && dispatch.use_small_tiles)
-            || dispatch.weight_format.uses_reduced_storage()
+            // Packed storage changes the bytes behind B, not the arithmetic
+            // the tiled kernels do around it, so it stays out of the tiled
+            // search. The GEMV shape axis leaves the decoder alone and is the
+            // one candidate that can carry a packed weight.
+            || (!gemv && dispatch.weight_format.uses_reduced_storage())
+            // A folded RmsNorm is a different kernel with a second reduction
+            // of its own; it is not shaped here.
+            || dispatch.gemv_rmsnorm.is_some()
             || dispatch.horizontal_batch >= 2
             || dispatch.matmul_prologue.is_some()
             || dispatch.matmul_epilogue.is_some()
@@ -387,7 +460,15 @@ impl TuneClass {
                 let k = s.batch.checked_mul(spatial)?;
                 (s.out_channels, n, k)
             }
-        } else if matches!(shader, ShaderEntry::MatMul | ShaderEntry::FusedMatMulAdd) {
+        } else if matches!(
+            shader,
+            ShaderEntry::MatMul
+                | ShaderEntry::FusedMatMulAdd
+                // The forward GEMV pair carries `[m, k, n]` like the tiled
+                // forward matmul; only the transposed form is `[m, n, k]`.
+                | ShaderEntry::MatMulGemv
+                | ShaderEntry::MatMulGemvAdd
+        ) {
             (dispatch.params[0], dispatch.params[2], dispatch.params[1])
         } else {
             (dispatch.params[0], dispatch.params[1], dispatch.params[2])
@@ -409,17 +490,27 @@ impl TuneClass {
             k,
             conv2d,
             requires_full_precision: dispatch.requires_full_precision,
+            weight_format: dispatch.weight_format,
             device_local: [false; 4],
             binding_bytes: Vec::new(),
         };
         let initial = MatmulTile::selected(dispatch, config)?;
-        (initial.buffer_sizes(&class).is_some()
+        // A packed B's byte count comes from the plan, and the caller fills
+        // `binding_bytes` in after this returns, so its extents cannot be
+        // checked here. `collect_classes` settles them with `fits` once the
+        // bytes are known; the geometry check below still applies to every
+        // class.
+        let extents_derivable = !class.weight_format.uses_reduced_storage();
+        ((!extents_derivable || initial.buffer_sizes(&class).is_some())
             && dispatch.workgroups == initial.workgroups(&class))
         .then_some(class)
     }
 
     pub(crate) fn has_addend(&self) -> bool {
-        self.shader == ShaderEntry::FusedMatMulAdd
+        matches!(
+            self.shader,
+            ShaderEntry::FusedMatMulAdd | ShaderEntry::MatMulGemvAdd
+        )
     }
 
     pub(crate) fn batch_dispatches(&self) -> u32 {
@@ -457,12 +548,30 @@ impl TuneClass {
             };
             return Some(vec![bytes(upstream, 1)?, bytes(b, 1)?, bytes(output, 1)?]);
         }
-        let mut sizes = vec![bytes(self.m, self.k)?, bytes(self.k, self.n)?];
+        // A packed B holds blocks, not a `k * n` f32 grid, so its byte count
+        // comes from the plan rather than the extents. Everything else in the
+        // class is still f32 and still derived.
+        let b_bytes = if self.weight_format.uses_reduced_storage() {
+            *self.binding_bytes.get(1)?
+        } else {
+            bytes(self.k, self.n)?
+        };
+        let mut sizes = vec![bytes(self.m, self.k)?, b_bytes];
         if self.has_addend() {
             sizes.push(bytes(self.m, self.n)?);
         }
         sizes.push(bytes(self.m, self.n)?);
         Some(sizes)
+    }
+
+    /// Workgroups a K-split GEMV dispatches: one per output vec4, or one per
+    /// output row for the transposed form. Independent of the thread count.
+    pub(crate) fn gemv_workgroups(&self) -> [u32; 3] {
+        if self.shader == ShaderEntry::MatMulGemvBT {
+            [self.n, 1, 1]
+        } else {
+            [self.n / 4, 1, 1]
+        }
     }
 
     /// A small deterministic tournament: scalar alternative first, then
@@ -473,6 +582,24 @@ impl TuneClass {
         initial: MatmulTile,
         config: Option<&CoopConfig>,
     ) -> Vec<MatmulTile> {
+        if let MatmulTile::Gemv(shape) = initial {
+            // Both axes, widest first: wide workgroups hide DRAM latency at
+            // M=1, and the subgroup reduction removes barriers in proportion
+            // to the wave width. Which trade wins is exactly what a device
+            // disagrees with another device about, so measure the cross
+            // product rather than guessing a rule.
+            use crate::codegen::{GemvReduction, GemvShape};
+            let mut out = Vec::new();
+            for reduction in [GemvReduction::Subgroup, GemvReduction::Tree] {
+                for threads in [256, 128, 64, 32] {
+                    out.push(MatmulTile::Gemv(GemvShape { threads, reduction }));
+                }
+            }
+            return out
+                .into_iter()
+                .filter(|&tile| tile != MatmulTile::Gemv(shape) && tile.fits(self))
+                .collect();
+        }
         if self.conv2d.is_some() {
             let small = matches!(
                 initial,
@@ -1416,6 +1543,7 @@ mod tests {
 
     fn class(m: u32, n: u32, k: u32) -> TuneClass {
         let mut class = TuneClass {
+            weight_format: crate::compile::WeightFormat::F32,
             shader: ShaderEntry::MatMul,
             m,
             n,

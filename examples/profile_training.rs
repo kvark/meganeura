@@ -183,6 +183,7 @@ fn run_case(
             samples: PROFILE_SAMPLES,
             unprofiled_median_ms: record["normal_before"]["median_ms"].as_f64(),
             include_pipeline_statistics: true,
+            ..Default::default()
         },
     );
     record["profile_host_start"] = profile_start;

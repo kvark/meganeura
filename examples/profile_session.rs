@@ -77,6 +77,7 @@ fn main() {
             samples: 5,
             unprofiled_median_ms: Some(unprofiled_median_ms),
             include_pipeline_statistics: true,
+            ..Default::default()
         },
     )
     .expect("capture structured GPU profile");

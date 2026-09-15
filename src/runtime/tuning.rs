@@ -87,6 +87,17 @@ impl Pipelines {
 
 fn tile_module(dispatch: &Dispatch, tile: MatmulTile) -> crate::codegen::ShaderModule {
     let entry = &dispatch.shader;
+    if let MatmulTile::Gemv(shape) = tile {
+        // The int-dot kernel is a different computation, not a different
+        // route to the same one, so a shape candidate has to stay inside it.
+        // Generating the ordinary GEMV here would quietly swap the
+        // activation back to f32 and change what the plan computes.
+        if dispatch.gemv_int_dot {
+            return crate::codegen::generate_module_gemv_int_dot(shape);
+        }
+        let group = crate::tune::gemv_group(entry).expect("GEMV candidate on a GEMV entry");
+        return crate::codegen::generate_module_gemv(group, dispatch.weight_format, shape);
+    }
     let selected_entry = tile.shader(entry);
     if let MatmulTile::SpecializedConv { k_tile, .. } = tile {
         let params = super::Conv2dParams::from(dispatch);
@@ -106,13 +117,19 @@ fn tile_module(dispatch: &Dispatch, tile: MatmulTile) -> crate::codegen::ShaderM
                 entry.shader_group(),
                 &tile.coop_config().expect("cooperative candidate"),
             ),
-            MatmulTile::SpecializedConv { .. } => unreachable!(),
+            MatmulTile::SpecializedConv { .. } | MatmulTile::Gemv(_) => unreachable!(),
         }
     }
 }
 
 fn tile_variant(dispatch: &Dispatch, tile: MatmulTile) -> Variant {
     let entry = &dispatch.shader;
+    if let MatmulTile::Gemv(shape) = tile {
+        if dispatch.gemv_int_dot {
+            return Variant::GemvIntDot(entry.clone(), shape);
+        }
+        return Variant::Gemv(entry.clone(), dispatch.weight_format, shape);
+    }
     if let MatmulTile::SpecializedConv { k_tile, .. } = tile {
         return Variant::SpecializedConv(tile.shader(entry), dispatch.params.clone(), k_tile);
     }
@@ -131,7 +148,7 @@ fn tile_variant(dispatch: &Dispatch, tile: MatmulTile) -> Variant {
         MatmulTile::Tile32 => Variant::SmallTile(entry.clone()),
         MatmulTile::Tile64 => Variant::Scalar(entry.clone()),
         MatmulTile::CooperativeF32 { .. } => Variant::Coop(entry.clone()),
-        MatmulTile::SpecializedConv { .. } => unreachable!(),
+        MatmulTile::SpecializedConv { .. } | MatmulTile::Gemv(_) => unreachable!(),
     }
 }
 
@@ -703,11 +720,7 @@ impl Session {
             }
             let inputs = {
                 let _timer = PhaseTimer::new(&mut details.input_preparation);
-                let mut inputs = test_inputs(&logical_sizes, pattern);
-                for (index, data) in inputs.iter_mut().enumerate() {
-                    data.resize(sizes[index] / 4, 0.0);
-                }
-                inputs
+                prepared_inputs(&logical_sizes, &sizes, pattern, class.key.weight_format)
             };
             for (index, data) in inputs.iter().enumerate() {
                 scratch.upload(index, data, Some(&mut *details));
@@ -798,9 +811,16 @@ impl Session {
         outcome.qualified = true;
         drop(qualification);
         let warmup = PhaseTimer::new(&mut phases.warmup);
-        // Time ordinary-magnitude data, not a zero-filled or subnormal workload.
-        for (index, data) in test_inputs(&logical_sizes, 0).iter_mut().enumerate() {
-            data.resize(sizes[index] / 4, 0.0);
+        // Time ordinary-magnitude data, not a zero-filled or subnormal
+        // workload — and the *same* data qualification ran on. Rebuilding it
+        // here without the packed-scale taming timed a workload full of NaN
+        // and wildly scaled blocks that no candidate had been qualified
+        // against, which is both a different kernel cost on hardware that
+        // penalizes them and not the thing the measurement claims to compare.
+        for (index, data) in prepared_inputs(&logical_sizes, &sizes, 0, class.key.weight_format)
+            .iter()
+            .enumerate()
+        {
             scratch.upload(index, data, None);
         }
         for _ in 0..options.warmup_runs {
@@ -1180,6 +1200,28 @@ impl Drop for Scratch<'_, '_> {
     }
 }
 
+/// Synthetic operands for one input pattern, sized to the scratch buffers
+/// and made comparable where the weight is packed.
+///
+/// Qualification and timing both go through here. They must see identical
+/// bytes: a candidate qualified on tamed block scales and then timed on wild
+/// ones was not measured on the workload it was checked against.
+fn prepared_inputs(
+    logical_sizes: &[usize],
+    sizes: &[usize],
+    pattern: u32,
+    weight_format: crate::compile::WeightFormat,
+) -> Vec<Vec<f32>> {
+    let mut inputs = test_inputs(logical_sizes, pattern);
+    for (index, data) in inputs.iter_mut().enumerate() {
+        data.resize(sizes[index] / 4, 0.0);
+    }
+    if weight_format.uses_reduced_storage() {
+        tame_block_scales(&mut inputs[1]);
+    }
+    inputs
+}
+
 fn test_inputs(sizes: &[usize], pattern: u32) -> Vec<Vec<f32>> {
     (0..sizes.len() - 1)
         .map(|operand| {
@@ -1297,7 +1339,15 @@ fn reference_dot(class: &TuneClass, inputs: &[Vec<f32>], row: usize, col: usize)
         } else {
             row * k + inner
         };
-        let b = if class.shader == ShaderEntry::MatMulBT {
+        // Both transposed-B entries store B as `[N, K]` row-major, so a
+        // column's weights are contiguous. The GEMV form is a separate
+        // `ShaderEntry`, and leaving it out of this check silently gave it
+        // forward `[K, N]` addressing — a reference that disagrees with a
+        // correct kernel, which reads as the kernel failing.
+        let b = if matches!(
+            class.shader,
+            ShaderEntry::MatMulBT | ShaderEntry::MatMulGemvBT
+        ) {
             col * k + inner
         } else {
             inner * n + col
@@ -1307,9 +1357,57 @@ fn reference_dot(class: &TuneClass, inputs: &[Vec<f32>], row: usize, col: usize)
     value
 }
 
+/// Pin every f16-aligned halfword of a packed weight buffer to a sane
+/// magnitude, keeping its sign and mantissa.
+///
+/// The synthetic operands are pseudo-random f32 patterns, and read as block
+/// bytes those make hopeless block scales in two different ways. About one in
+/// thirty-two is a NaN or an infinity, which poisons its block in both the
+/// incumbent and the candidate so the two can never be compared. The rest
+/// span f16's whole range, 2^-14 to 2^15, so one block's scale can exceed
+/// another's by ten orders of magnitude; the dot product is then dominated by
+/// that block, and when its own terms cancel, the result is a small difference
+/// of enormous numbers. Two summation orders legitimately disagree there, and
+/// no tolerance distinguishes that from a broken kernel.
+///
+/// Clamping the exponent into a four-way band around 1 fixes both: nothing is
+/// NaN, infinite, subnormal or zero, and no block can dominate the sum. Every
+/// block format Meganeura reads stores its scales as f16 at an even byte
+/// offset and every block length is even, so treating all such halfwords this
+/// way covers whichever ones a decoder actually treats as scales, without
+/// needing to know where they are.
+///
+/// The quant payload is rewritten too, since it shares those halfwords; it
+/// keeps five random bits in every eight. That biases the synthetic data,
+/// which is fine for a measurement that only asks two kernels to agree on the
+/// same bytes.
+fn tame_block_scales(data: &mut [f32]) {
+    for value in data.iter_mut() {
+        let bits = value.to_bits();
+        let mut fixed = 0u32;
+        for half in 0..2 {
+            let part = (bits >> (16 * half)) as u16;
+            // Exponent field 13..=16 is 2^-2..2^1, so |value| lands in
+            // [0.25, 4). Sign and mantissa survive untouched.
+            let exponent = 13 + (part & 3);
+            let tamed = (part & 0x83FF) | (exponent << 10);
+            fixed |= u32::from(tamed) << (16 * half);
+        }
+        *value = f32::from_bits(fixed);
+    }
+}
+
 fn qualify_output(class: &TuneClass, inputs: &[Vec<f32>], output: &[f32], scale: f64) -> bool {
     if output.len() != class.output_elements() || output.iter().any(|x| !x.is_finite()) {
         return false;
+    }
+    // A packed B's logical values are whatever its decoder makes of the bytes.
+    // Reconstructing them here to form a reference dot would mean writing a
+    // second decoder and trusting it, so the cross-variant comparison in the
+    // caller carries the qualification instead. The finiteness and extent
+    // checks above still apply.
+    if class.weight_format.uses_reduced_storage() {
+        return true;
     }
     let (m, n) = (class.m as usize, class.n as usize);
     // Explicit tile boundaries and last row/column, then scattered dots.
@@ -1783,6 +1881,7 @@ mod tests {
         for (m, n, k) in [(3, 7, 5), (33, 65, 17), (2048, 1000, 1)] {
             for device_local in [false, true] {
                 let class = TuneClass {
+                    weight_format: crate::compile::WeightFormat::F32,
                     shader: ShaderEntry::MatMulAT,
                     m,
                     n,
@@ -1866,6 +1965,7 @@ mod tests {
     fn staging_reuse_replaces_sizes_and_cleans_up_after_early_returns() {
         fn trial(staging: &mut Staging<'_>, n: u32, stamp: u32) -> Result<(), ()> {
             let class = TuneClass {
+                weight_format: crate::compile::WeightFormat::F32,
                 shader: ShaderEntry::MatMul,
                 m: 3,
                 n,
@@ -1951,9 +2051,51 @@ mod tests {
         assert!(TuneClass::from_dispatch(dispatch, None).is_some());
     }
 
+    /// A transposed-B GEMV must be read as `[N, K]`, like the tiled one.
+    ///
+    /// Worked by hand rather than against the implementation: A is 1..8 and
+    /// B is 1..24 laid out as three contiguous rows of eight, so column `c`
+    /// is `sum_i A[i] * B[c][i]`. Forward `[K, N]` addressing over the same
+    /// bytes gives [540, 576, 612], which is what the oracle produced while
+    /// this entry was missing from the transposed branch — a wrong reference
+    /// that fails correct kernels.
+    #[test]
+    fn a_transposed_gemv_reference_reads_b_by_row() {
+        let class = TuneClass {
+            weight_format: crate::compile::WeightFormat::F32,
+            shader: ShaderEntry::MatMulGemvBT,
+            m: 1,
+            n: 3,
+            k: 8,
+            conv2d: None,
+            requires_full_precision: false,
+            device_local: [false; 4],
+            binding_bytes: vec![32, 96, 12],
+        };
+        let a: Vec<f32> = (1..=8).map(|v| v as f32).collect();
+        let b: Vec<f32> = (1..=24).map(|v| v as f32).collect();
+        let inputs = vec![a, b, Vec::new()];
+        let got: Vec<f64> = (0..3)
+            .map(|col| reference_dot(&class, &inputs, 0, col))
+            .collect();
+        assert_eq!(got, vec![204.0, 492.0, 780.0]);
+
+        // The tiled transposed entry has always read it this way, and the
+        // two must agree: they describe the same operand layout.
+        let tiled = TuneClass {
+            shader: ShaderEntry::MatMulBT,
+            ..class
+        };
+        let tiled_got: Vec<f64> = (0..3)
+            .map(|col| reference_dot(&tiled, &inputs, 0, col))
+            .collect();
+        assert_eq!(tiled_got, got);
+    }
+
     #[test]
     fn reference_dots_match_independent_rectangular_example() {
         let mut class = TuneClass {
+            weight_format: crate::compile::WeightFormat::F32,
             shader: ShaderEntry::MatMul,
             m: 2,
             n: 2,
@@ -2132,6 +2274,111 @@ mod tests {
         }
     }
 
+    /// Synthetic bytes for a packed weight must decode to block scales that
+    /// two kernels can be compared on.
+    ///
+    /// Two separate failures, both fatal to the measurement rather than to
+    /// the kernel. A NaN or infinite scale poisons its block in both variants
+    /// and two NaN outputs never compare equal. A merely *finite* scale is
+    /// not enough either: left to f16's full range, one block's scale can
+    /// dwarf the rest by ten orders of magnitude, and a dot product dominated
+    /// by one cancelling block differs between summation orders by more than
+    /// any honest tolerance allows.
+    ///
+    /// The sweep covers every 16-bit pattern, which is what justifies the
+    /// claim the caller relies on: whatever halfword a decoder picks up as a
+    /// scale, it is finite and within [0.25, 4) afterwards. Every block
+    /// format Meganeura reads puts its scales at an even byte offset (Q4_K
+    /// and Q5_K at 0 and 2, Q6_K at 208, Q3_K at 108, GGML Q4_0 at 0, and the
+    /// split Q4/Q8 header regions on a 4-byte stride), and every block length
+    /// is even, so even offsets are the only ones that need to hold.
+    /// Timing and qualification must upload the same bytes.
+    ///
+    /// The warmup used to rebuild its operands from `test_inputs` directly,
+    /// so a packed weight was tamed for qualification and left wild for every
+    /// timing sample. Reproduce both call sites' arguments and compare.
+    #[test]
+    fn timing_and_qualification_prepare_identical_operands() {
+        use crate::compile::WeightFormat;
+        // K=512, N=256 Q4_K: 512 bytes of A, the packed weight, 1 KiB of C.
+        let logical = [2048usize, 73_728, 1024];
+        let sizes = [2048usize, 73_728, 1024];
+        for format in [WeightFormat::F32, WeightFormat::Q4K, WeightFormat::Q6K] {
+            let qualification = prepared_inputs(&logical, &sizes, 0, format);
+            let warmup = prepared_inputs(&logical, &sizes, 0, format);
+            assert_eq!(
+                qualification
+                    .iter()
+                    .map(|v| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
+                    .collect::<Vec<_>>(),
+                warmup
+                    .iter()
+                    .map(|v| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
+                    .collect::<Vec<_>>(),
+                "{format:?}: the two preparation paths diverged"
+            );
+
+            // And a packed weight really is tamed on the way through, so the
+            // shared path is doing the work rather than merely being shared.
+            let wild = {
+                let mut raw = test_inputs(&logical, 0);
+                for (index, data) in raw.iter_mut().enumerate() {
+                    data.resize(sizes[index] / 4, 0.0);
+                }
+                raw
+            };
+            let nonfinite = |data: &[f32]| {
+                data.iter()
+                    .flat_map(|v| {
+                        let bits = v.to_bits();
+                        [(bits >> 16) as u16, bits as u16]
+                    })
+                    .filter(|half| half & 0x7C00 == 0x7C00)
+                    .count()
+            };
+            if format.uses_reduced_storage() {
+                assert!(
+                    nonfinite(&wild[1]) > 0,
+                    "{format:?}: the fixture no longer contains a wild scale"
+                );
+                assert_eq!(nonfinite(&qualification[1]), 0, "{format:?}");
+            } else {
+                assert_eq!(qualification[1], wild[1], "{format:?}: f32 B was altered");
+            }
+        }
+    }
+
+    #[test]
+    fn synthetic_packed_weights_decode_to_comparable_scales() {
+        let mut data: Vec<f32> = (0..=u32::from(u16::MAX))
+            .map(|low| f32::from_bits((low << 16) | low))
+            .collect();
+        let before = data.len();
+        tame_block_scales(&mut data);
+        assert_eq!(data.len(), before);
+        let mut seen_negative = false;
+        for (index, value) in data.iter().enumerate() {
+            let bits = value.to_bits();
+            for half in 0..2 {
+                let part = (bits >> (16 * half)) as u16;
+                let decoded = half::f16::from_bits(part).to_f32();
+                assert!(
+                    decoded.is_finite() && (0.25..4.0).contains(&decoded.abs()),
+                    "pattern {index:#x} half {half} decoded to {decoded}"
+                );
+                seen_negative |= decoded < 0.0;
+            }
+        }
+        // Signs survive, or every synthetic weight would be positive and a
+        // sign error in a decoder could not show up as disagreement.
+        assert!(seen_negative, "taming discarded the sign bit");
+
+        // Mantissas survive too, so the payload keeps varying.
+        let mantissas: std::collections::HashSet<u16> =
+            data.iter().map(|v| (v.to_bits() as u16) & 0x03FF).collect();
+        assert_eq!(mantissas.len(), 1024, "taming collapsed the mantissa");
+    }
+
     #[test]
     fn reference_qualification_checks_layout_and_tiny_operands() {
         for shader in [
@@ -2141,6 +2388,7 @@ mod tests {
             ShaderEntry::FusedMatMulAdd,
         ] {
             let class = TuneClass {
+                weight_format: crate::compile::WeightFormat::F32,
                 shader,
                 m: 3,
                 n: 5,

@@ -141,6 +141,8 @@ registry! {
         "Set to 0 to disable only cooperative flash-attention forward.";
     FLASH_BWD_COOP: "MEGANEURA_FLASH_BWD_COOP", Bool, Diagnostic,
         "Enable the experimental reduced-precision cooperative flash backward.";
+    QUANT_ACTS: "MEGANEURA_QUANTIZED_ACTIVATIONS", Bool, Selection,
+        "Quantize GEMV activations to Q8_1 and use integer dot products against Q4_0 weights. Changes the numbers.";
     NO_ALIAS: "MEGANEURA_NO_ALIAS", Bool, Diagnostic,
         "Disable buffer lifetime aliasing; every logical buffer gets its own allocation.";
     NO_DEVICE_LOCAL: "MEGANEURA_NO_DEVICE_LOCAL", Bool, Diagnostic,
@@ -278,6 +280,7 @@ impl CompileOptions {
             knobs: TuningKnobs::from_env(),
             flash_forward_coop: FLASH_FWD_COOP.bool_or(true),
             flash_backward_coop: FLASH_BWD_COOP.bool_or(false),
+            quantized_activations: QUANT_ACTS.bool_or(false),
             ..Self::default()
         }
     }

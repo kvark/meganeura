@@ -33,6 +33,61 @@ pub(super) fn wait_for_timed_encoder(
 const DEVICE_MEMORY_SAFE_PERCENT: u64 = 90;
 const DEVICE_MEMORY_RESERVE_PERCENT: u64 = 100 - DEVICE_MEMORY_SAFE_PERCENT;
 
+/// One compute pass of a profiled [`Session::step`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ProfilePass {
+    /// A single dispatch, timestamped under its own label.
+    Timed(usize),
+    /// Dispatches outside the timing window, batched into one pass. Each
+    /// range is the part of one barrier group that falls in this pass; a
+    /// barrier separates consecutive ranges, exactly as in normal execution.
+    Untimed(Vec<std::ops::Range<usize>>),
+}
+
+/// Clip `groups` to `span`, dropping the groups that fall outside it.
+fn clip_groups(
+    groups: &[std::ops::Range<usize>],
+    span: std::ops::Range<usize>,
+) -> Vec<std::ops::Range<usize>> {
+    groups
+        .iter()
+        .filter_map(|group| {
+            let start = group.start.max(span.start);
+            let end = group.end.min(span.end);
+            (start < end).then_some(start..end)
+        })
+        .collect()
+}
+
+/// Lay out the compute passes for one profiled step.
+///
+/// Dispatches inside `window` get a pass each, so Blade timestamps them
+/// individually. The rest keep the plan's barrier structure but collapse into
+/// a single pass on either side: Blade stops writing timestamps once a
+/// submission reaches `limits::PASS_COUNT`, and a pass per barrier group
+/// outside the window would spend that budget on dispatches nobody is
+/// measuring. Every dispatch still runs exactly once, in plan order.
+pub(crate) fn profile_pass_plan(
+    groups: &[std::ops::Range<usize>],
+    dispatch_count: usize,
+    window: std::ops::Range<usize>,
+) -> Vec<ProfilePass> {
+    let start = window.start.min(dispatch_count);
+    let end = window.end.clamp(start, dispatch_count);
+
+    let mut passes = Vec::with_capacity(end - start + 2);
+    let head = clip_groups(groups, 0..start);
+    if !head.is_empty() {
+        passes.push(ProfilePass::Untimed(head));
+    }
+    passes.extend((start..end).map(ProfilePass::Timed));
+    let tail = clip_groups(groups, end..dispatch_count);
+    if !tail.is_empty() {
+        passes.push(ProfilePass::Untimed(tail));
+    }
+    passes
+}
+
 fn safe_device_memory_remaining(usage: u64, budget: u64) -> u64 {
     let safe_limit = ((budget as u128 * DEVICE_MEMORY_SAFE_PERCENT as u128) / 100u128) as u64;
     safe_limit.saturating_sub(usage)
@@ -1022,6 +1077,18 @@ enum Variant {
     CoopPrologue(ShaderEntry, Vec<crate::compile::PrologueLoadKind>),
     /// GEMV with a RmsNorm folded into its A operand.
     GemvRmsNorm(ShaderEntry),
+    /// The Q8_1-activation, integer-dot K-split GEMV at a measured shape.
+    /// Only ever paired with a GGML Q4_0 weight, so the format is implied.
+    GemvIntDot(ShaderEntry, crate::codegen::GemvShape),
+    /// A K-split GEMV at a measured workgroup width and reduction, for the
+    /// weight format it reads. Every other axis of the GEMV family — fused
+    /// add, transposed B, f16, block-packed — is already in the entry and
+    /// the format, so the shape is the only thing this adds.
+    Gemv(
+        ShaderEntry,
+        crate::compile::WeightFormat,
+        crate::codegen::GemvShape,
+    ),
     /// Non-f32 weight storage (f16, Q4, Q8).
     Weight(ShaderEntry, crate::compile::WeightFormat),
     /// Cooperative-matrix and small-tile (32×32) forms. Unlike every other
@@ -1068,6 +1135,8 @@ impl Variant {
             | Variant::CoopEpilogue(ref e, _)
             | Variant::CoopPrologue(ref e, _)
             | Variant::GemvRmsNorm(ref e)
+            | Variant::Gemv(ref e, _, _)
+            | Variant::GemvIntDot(ref e, _)
             | Variant::Weight(ref e, _)
             | Variant::Coop(ref e)
             | Variant::CoopCompensated(ref e)
@@ -1092,6 +1161,13 @@ impl Variant {
                 format!("{e:?}:cooperative-prologue:{kinds:?}")
             }
             Variant::GemvRmsNorm(ref e) => format!("{e:?}:rmsnorm"),
+            Variant::GemvIntDot(ref e, shape) => {
+                format!("{e:?}:gemv-q40-q8-{}t-{:?}", shape.threads, shape.reduction)
+            }
+            Variant::Gemv(ref e, format, shape) => format!(
+                "{e:?}:gemv-{format:?}-{}t-{:?}",
+                shape.threads, shape.reduction
+            ),
             Variant::Weight(ref e, format) => format!("{e:?}:weight-{format:?}"),
             Variant::Coop(ref e) => format!("{e:?}:cooperative"),
             Variant::CoopCompensated(ref e) => format!("{e:?}:cooperative-compensated"),
@@ -1463,6 +1539,68 @@ impl Pipelines {
             map.insert(key, pipeline);
         }
 
+        // Compile the int-dot GEMV for any dispatch that asked for it.
+        // Unlike a shape, this is not something measurement can turn on, so
+        // it is always present when the plan says so.
+        for dispatch in &plan.dispatches {
+            if !dispatch.gemv_int_dot {
+                continue;
+            }
+            let shape = dispatch
+                .gemv_shape
+                .unwrap_or_else(|| crate::codegen::GemvShape::initial(ShaderGroup::MatMulGemv));
+            let key = Variant::GemvIntDot(dispatch.shader.clone(), shape);
+            if let std::collections::hash_map::Entry::Vacant(slot) = map.entry(key.clone()) {
+                let sm = crate::codegen::generate_module_gemv_int_dot(shape);
+                let shader = gpu.create_shader(bg::ShaderDesc {
+                    source: &sm.source,
+                    naga_module: Some(sm.module),
+                });
+                let layout = shader_data_layout(&dispatch.shader);
+                slot.insert(create_profiled_pipeline(
+                    gpu,
+                    key.label(),
+                    &layout,
+                    shader.at(dispatch.shader.entry_point()),
+                ));
+            }
+        }
+
+        // Compile any GEMV shape a plan already carries. Tuning inserts its
+        // own pipelines as it measures, so this is for a plan that arrives
+        // with a shape on it — deserialized, or rebuilt after a swap. Without
+        // it the dispatch would quietly fall back to the group's initial
+        // shape, which is correct but silently discards the measurement.
+        for dispatch in &plan.dispatches {
+            let Some(shape) = dispatch.gemv_shape else {
+                continue;
+            };
+            // The RmsNorm-fused form has its own module and its own binding
+            // layout, and is not shaped. Tuning never sets a shape on one;
+            // this keeps a hand-built plan from producing a pipeline whose
+            // bindings do not match the dispatch.
+            let Some(group) = crate::tune::gemv_group(&dispatch.shader)
+                .filter(|_| dispatch.gemv_rmsnorm.is_none())
+            else {
+                continue;
+            };
+            let key = Variant::Gemv(dispatch.shader.clone(), dispatch.weight_format, shape);
+            if let std::collections::hash_map::Entry::Vacant(slot) = map.entry(key.clone()) {
+                let sm = crate::codegen::generate_module_gemv(group, dispatch.weight_format, shape);
+                let shader = gpu.create_shader(bg::ShaderDesc {
+                    source: &sm.source,
+                    naga_module: Some(sm.module),
+                });
+                let layout = shader_data_layout(&dispatch.shader);
+                slot.insert(create_profiled_pipeline(
+                    gpu,
+                    key.label(),
+                    &layout,
+                    shader.at(dispatch.shader.entry_point()),
+                ));
+            }
+        }
+
         // Compile weight-format-specific pipelines (f16, Q4, Q8).
         for (&format, groups) in &needed_weighted {
             for &group in groups {
@@ -1721,8 +1859,24 @@ impl Pipelines {
         if dispatch.params.len() >= 4 {
             out.push(Variant::Attention(entry.clone(), dispatch.params[3]));
         }
+        // A measured shape outranks the group's initial one, and the RmsNorm
+        // fusion outranks both: folding the norm in removes a whole dispatch,
+        // which no reduction choice can make up for. Shapes are only measured
+        // for the unfused forms, so the two never compete for the same
+        // dispatch — the ordering just makes that explicit.
         if dispatch.gemv_rmsnorm.is_some() {
             out.push(Variant::GemvRmsNorm(entry.clone()));
+        }
+        if dispatch.gemv_int_dot {
+            out.push(Variant::GemvIntDot(
+                entry.clone(),
+                dispatch
+                    .gemv_shape
+                    .unwrap_or_else(|| crate::codegen::GemvShape::initial(entry.shader_group())),
+            ));
+        }
+        if let Some(shape) = dispatch.gemv_shape {
+            out.push(Variant::Gemv(entry.clone(), dispatch.weight_format, shape));
         }
         if dispatch.weight_format.uses_reduced_storage() {
             out.push(Variant::Weight(entry.clone(), dispatch.weight_format));
@@ -2763,9 +2917,15 @@ pub struct Session {
     sync_point: Option<blade_graphics::SyncPoint>,
     /// Calibrated timings harvested when the most recent submission completed.
     last_gpu_timings: Option<blade_graphics::Timings>,
-    /// When true, run in multi-pass mode: one compute pass per dispatch
-    /// with individual GPU timestamps. Enables `dump_gpu_timings()`.
-    profiling: bool,
+    /// When set, run in multi-pass mode over this range of dispatch indices:
+    /// one compute pass with an individual GPU timestamp per dispatch inside
+    /// the range, ordinary grouped passes outside it. Enables
+    /// `dump_gpu_timings()`. See [`Session::set_profiling_window`].
+    profile_window: Option<std::ops::Range<usize>>,
+    /// Plan dispatch behind each compute pass the last profiled `step()`
+    /// encoded, in pass order. `None` marks a grouped pass that batched many
+    /// dispatches under one timestamp.
+    profiled_pass_map: Vec<Option<usize>>,
     /// Debug session: aliasing off, every buffer host-visible, all node
     /// values readable via [`Session::read_node`].
     debug: bool,
@@ -3615,7 +3775,8 @@ impl Session {
             submission_chunks: 1,
             sync_point: None,
             last_gpu_timings: None,
-            profiling: false,
+            profile_window: None,
+            profiled_pass_map: Vec::new(),
             debug: opts.debug,
             optimizer_device,
             written,
@@ -3905,8 +4066,31 @@ impl Session {
     /// When enabled, `step()` runs one compute pass per dispatch with
     /// individual GPU timestamps. Call `wait()` and then
     /// `dump_gpu_timings()` to see per-pass timings from the profiled run.
+    ///
+    /// Blade writes at most [`blade_graphics::limits::PASS_COUNT`] timestamps
+    /// per submission and silently drops the rest, so plans larger than that
+    /// need [`Session::set_profiling_window`] to be measured in slices.
     pub fn set_profiling(&mut self, enabled: bool) {
-        self.profiling = enabled;
+        self.profile_window = enabled.then_some(0..self.plan.dispatches.len());
+    }
+
+    /// Timestamp only `window`, a range of plan dispatch indices.
+    ///
+    /// Each dispatch inside the window gets its own compute pass and
+    /// timestamp. The dispatches outside it still execute — the step remains
+    /// a complete, correct replay — but they collapse into one grouped pass
+    /// on either side of the window, keeping the plan's barriers between
+    /// barrier groups. That costs at most two of the submission's timestamp
+    /// slots regardless of how many dispatches lie outside the window, so a
+    /// plan with more dispatches than Blade's per-submission timestamp limit
+    /// can be measured by replaying it once per window and stitching the
+    /// results together. [`crate::profiler::capture_session_profile`] does
+    /// exactly that; prefer it over driving windows by hand.
+    ///
+    /// `None` restores unprofiled execution. The window is clamped to the
+    /// plan, so an over-long range simply times every remaining dispatch.
+    pub fn set_profiling_window(&mut self, window: Option<std::ops::Range<usize>>) {
+        self.profile_window = window;
     }
 
     /// Copy the GPU pass timings most recently resolved by Blade.
@@ -3924,6 +4108,32 @@ impl Session {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Per-dispatch timings from the most recent profiled [`Session::step`].
+    ///
+    /// Yields `(plan dispatch index, pass label, duration)` for every dispatch
+    /// the active profiling window timestamped on its own, in pass order. The
+    /// grouped passes carrying the dispatches outside the window are dropped:
+    /// their timestamps cover many dispatches at once and attributing them to
+    /// any single one would be a lie.
+    ///
+    /// Empty when the resolved pass count does not match what the step
+    /// encoded, which is how runtime-appended optimizer, gradient-accumulation
+    /// and gradient-clipping passes show up. Their timestamps would shift
+    /// every following entry, so no attribution is preferable to a wrong one.
+    pub fn profiled_dispatch_timings(&self) -> Vec<(usize, String, std::time::Duration)> {
+        let timings = self.gpu_timings();
+        if timings.len() != self.profiled_pass_map.len() {
+            return Vec::new();
+        }
+        self.profiled_pass_map
+            .iter()
+            .zip(timings)
+            .filter_map(|(dispatch, (label, duration))| {
+                dispatch.map(|index| (index, label, duration))
+            })
+            .collect()
     }
 
     /// Stable descriptive key for the pipeline selected by each plan
@@ -4382,6 +4592,119 @@ mod split_k_tests {
 }
 
 #[cfg(test)]
+mod profile_pass_tests {
+    use super::{ProfilePass, profile_pass_plan};
+
+    /// Six barrier groups over sixteen dispatches, including two groups of
+    /// one so that windows can land on a group boundary and inside a group.
+    fn groups() -> Vec<std::ops::Range<usize>> {
+        vec![0..3, 3..4, 4..9, 9..10, 10..14, 14..16]
+    }
+
+    /// Whatever the window, the plan must still run every dispatch exactly
+    /// once and in order, and must not spend more than two passes on the
+    /// dispatches outside the window.
+    #[test]
+    fn every_window_replays_the_whole_plan_in_order() {
+        let groups = groups();
+        for start in 0..=16 {
+            for end in start..=16 {
+                let passes = profile_pass_plan(&groups, 16, start..end);
+                let mut order = Vec::new();
+                let mut timed = Vec::new();
+                let mut untimed = 0;
+                for pass in passes {
+                    match pass {
+                        ProfilePass::Timed(index) => {
+                            order.push(index);
+                            timed.push(index);
+                        }
+                        ProfilePass::Untimed(spans) => {
+                            untimed += 1;
+                            order.extend(spans.into_iter().flatten());
+                        }
+                    }
+                }
+                assert_eq!(
+                    order,
+                    (0..16).collect::<Vec<_>>(),
+                    "window {start}..{end} did not replay the plan in order"
+                );
+                assert_eq!(
+                    timed,
+                    (start..end).collect::<Vec<_>>(),
+                    "window {start}..{end} timed the wrong dispatches"
+                );
+                assert!(
+                    untimed <= 2,
+                    "window {start}..{end} spent {untimed} passes outside the window"
+                );
+            }
+        }
+    }
+
+    /// The untimed passes keep the plan's barrier structure: each range is
+    /// one barrier group clipped to the pass, so the encoder emits a barrier
+    /// exactly where normal execution would.
+    #[test]
+    fn untimed_passes_preserve_barrier_group_boundaries() {
+        let passes = profile_pass_plan(&groups(), 16, 5..11);
+        assert_eq!(
+            passes.first(),
+            Some(&ProfilePass::Untimed(vec![0..3, 3..4, 4..5])),
+            "the head must keep its group seams and stop at the window"
+        );
+        assert_eq!(
+            passes.last(),
+            Some(&ProfilePass::Untimed(vec![11..14, 14..16])),
+            "the tail must resume mid-group and keep the remaining seams"
+        );
+    }
+
+    /// Timing everything is what `set_profiling(true)` asks for, and must
+    /// still be a pass per dispatch with nothing batched.
+    #[test]
+    fn a_full_window_times_every_dispatch_individually() {
+        let passes = profile_pass_plan(&groups(), 16, 0..16);
+        assert_eq!(passes.len(), 16);
+        assert!(
+            passes
+                .iter()
+                .all(|pass| matches!(pass, ProfilePass::Timed(_)))
+        );
+    }
+
+    /// An over-long or inverted window is clamped rather than panicking on
+    /// the range arithmetic.
+    #[test]
+    fn out_of_range_windows_are_clamped_to_the_plan() {
+        assert_eq!(profile_pass_plan(&groups(), 16, 0..99).len(), 16);
+        assert_eq!(
+            profile_pass_plan(&groups(), 16, 99..99),
+            vec![ProfilePass::Untimed(vec![
+                0..3,
+                3..4,
+                4..9,
+                9..10,
+                10..14,
+                14..16
+            ])]
+        );
+        // An inverted range collapses to an empty window at its start rather
+        // than underflowing the `end - start` capacity arithmetic.
+        let inverted = std::ops::Range { start: 9, end: 4 };
+        assert_eq!(
+            profile_pass_plan(&groups(), 16, inverted),
+            vec![
+                ProfilePass::Untimed(vec![0..3, 3..4, 4..9]),
+                ProfilePass::Untimed(vec![9..10, 10..14, 14..16]),
+            ]
+        );
+        assert!(profile_pass_plan(&[], 0, 0..0).is_empty());
+    }
+}
+
+#[cfg(test)]
 mod device_id_tests {
     use super::parse_device_id;
 
@@ -4647,19 +4970,24 @@ fn scatter_packed_concat_columns(
         // source arrives padded to a word, but that tail belongs at the
         // end of the whole parameter, not between two sources' blocks —
         // so only the unpadded span is copied. Q4_K (144) and Q5_K (176)
-        // have no tail to strip; Q6_K (210) and Q3_K (110) do.
-        fmt @ (crate::compile::WeightFormat::Q4K
+        // have no tail to strip; Q4_0 (18), Q6_K (210) and Q3_K (110) do.
+        fmt @ (crate::compile::WeightFormat::Q40
+        | crate::compile::WeightFormat::Q4K
         | crate::compile::WeightFormat::Q5K
         | crate::compile::WeightFormat::Q6K
         | crate::compile::WeightFormat::Q3K) => {
-            assert!(rows.is_multiple_of(256));
-            let stride = match fmt {
-                crate::compile::WeightFormat::Q4K => 144,
-                crate::compile::WeightFormat::Q5K => 176,
-                crate::compile::WeightFormat::Q6K => 210,
-                _ => 110,
+            // Q4_0 blocks 32 elements where the K-quants take 256; the
+            // copy is otherwise identical, so the block size joins the
+            // stride rather than earning a second arm.
+            let (block, stride) = match fmt {
+                crate::compile::WeightFormat::Q40 => (32, 18),
+                crate::compile::WeightFormat::Q4K => (256, 144),
+                crate::compile::WeightFormat::Q5K => (256, 176),
+                crate::compile::WeightFormat::Q6K => (256, 210),
+                _ => (256, 110),
             };
-            let bpc = rows / 256;
+            assert!(rows.is_multiple_of(block));
+            let bpc = rows / block;
             let unpadded = bpc * src_cols * stride;
             assert_eq!(
                 src.len(),
@@ -4947,7 +5275,8 @@ impl Session {
                         // back to a cruder one would silently produce worse
                         // weights than the file the caller already has, so
                         // refuse and point at the path that keeps them.
-                        fmt @ (crate::compile::WeightFormat::Q4K
+                        fmt @ (crate::compile::WeightFormat::Q40
+                        | crate::compile::WeightFormat::Q4K
                         | crate::compile::WeightFormat::Q6K
                         | crate::compile::WeightFormat::Q5K
                         | crate::compile::WeightFormat::Q3K) => panic!(
@@ -5006,7 +5335,8 @@ impl Session {
                                         .map(|&v| half::f16::from_f32(v).to_bits())
                                         .flat_map(|b| b.to_le_bytes())
                                         .collect(),
-                                    fmt @ (crate::compile::WeightFormat::Q4K
+                                    fmt @ (crate::compile::WeightFormat::Q40
+                                    | crate::compile::WeightFormat::Q4K
                                     | crate::compile::WeightFormat::Q6K
                                     | crate::compile::WeightFormat::Q5K
                                     | crate::compile::WeightFormat::Q3K) => panic!(
@@ -6325,16 +6655,42 @@ impl Session {
 
         self.encoder.start();
 
-        if self.profiling {
-            // Multi-pass mode: one compute pass per dispatch with per-pass barriers
-            // and GPU timestamps. Enables dump_gpu_timings() after wait().
-            for i in 0..self.plan.dispatches.len() {
-                let dispatch = &self.plan.dispatches[i];
-                let pipeline = self.pipelines.get(dispatch);
-                let mut pass = self.encoder.compute(&dispatch.label);
-                let mut pc = pass.with(pipeline);
-                Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
-                pc.dispatch(dispatch.workgroups);
+        if let Some(window) = self.profile_window.clone() {
+            // Multi-pass mode: one compute pass per dispatch in the window,
+            // with per-pass barriers and GPU timestamps. Enables
+            // dump_gpu_timings() and profiled_dispatch_timings() after wait().
+            let passes = profile_pass_plan(&self.groups, self.plan.dispatches.len(), window);
+            self.profiled_pass_map.clear();
+            for encoded in passes {
+                match encoded {
+                    ProfilePass::Timed(i) => {
+                        let dispatch = &self.plan.dispatches[i];
+                        let pipeline = self.pipelines.get(dispatch);
+                        let mut pass = self.encoder.compute(&dispatch.label);
+                        let mut pc = pass.with(pipeline);
+                        Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
+                        pc.dispatch(dispatch.workgroups);
+                        self.profiled_pass_map.push(Some(i));
+                    }
+                    ProfilePass::Untimed(spans) => {
+                        let label =
+                            format!("untimed {}..{}", spans[0].start, spans[spans.len() - 1].end);
+                        let mut pass = self.encoder.compute(&label);
+                        for (position, span) in spans.into_iter().enumerate() {
+                            if position > 0 {
+                                pass.barrier();
+                            }
+                            for i in span {
+                                let dispatch = &self.plan.dispatches[i];
+                                let pipeline = self.pipelines.get(dispatch);
+                                let mut pc = pass.with(pipeline);
+                                Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
+                                pc.dispatch(dispatch.workgroups);
+                            }
+                        }
+                        self.profiled_pass_map.push(None);
+                    }
+                }
             }
         } else {
             // Inline-barrier mode: dispatches share one compute pass with

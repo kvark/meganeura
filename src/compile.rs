@@ -26,13 +26,19 @@ pub enum WeightFormat {
     /// GGML Q3_K: 256-element superblocks, 2-bit quants with an inverted
     /// high bit. Load-only; see [`crate::graph::DType::Q3K`].
     Q3K,
+    /// GGML Q4_0: 32-element blocks of an f16 scale and 16 nibble bytes,
+    /// symmetric with no minimum. Load-only; see [`crate::graph::DType::Q40`].
+    ///
+    /// Distinct from [`WeightFormat::Q4`], which is Meganeura's own
+    /// asymmetric packing at half a bit per weight more.
+    Q40,
 }
 
 impl WeightFormat {
     pub fn is_quantized(self) -> bool {
         matches!(
             self,
-            Self::Q4 | Self::Q8 | Self::Q4K | Self::Q6K | Self::Q5K | Self::Q3K
+            Self::Q4 | Self::Q8 | Self::Q40 | Self::Q4K | Self::Q6K | Self::Q5K | Self::Q3K
         )
     }
 
@@ -50,6 +56,7 @@ impl WeightFormat {
             DType::F16 => Self::F16,
             DType::Q4_0 => Self::Q4,
             DType::Q8_0 => Self::Q8,
+            DType::Q40 => Self::Q40,
             DType::Q4K => Self::Q4K,
             DType::Q6K => Self::Q6K,
             DType::Q5K => Self::Q5K,
@@ -123,6 +130,17 @@ pub struct CompileOptions {
     /// Enable the experimental reduced-precision cooperative flash
     /// backward kernels.
     pub flash_backward_coop: bool,
+    /// Quantize the activation row to Q8_1 inside the K-split GEMV and do
+    /// the inner product with integer dot products, where the weight is
+    /// GGML Q4_0.
+    ///
+    /// Off by default because it is the one switch here that changes the
+    /// numbers: the activation loses precision on top of the weight. Every
+    /// other kernel choice in this crate computes the same thing by another
+    /// route, so measurement is free to pick among them; this one is a
+    /// trade the caller has to make. Once enabled, the resulting kernel's
+    /// workgroup width and reduction are still measured like any other.
+    pub quantized_activations: bool,
 }
 
 impl Default for CompileOptions {
@@ -134,6 +152,7 @@ impl Default for CompileOptions {
             knobs: TuningKnobs::default(),
             flash_forward_coop: true,
             flash_backward_coop: false,
+            quantized_activations: false,
         }
     }
 }
@@ -933,6 +952,21 @@ pub struct Dispatch {
     /// Set by measured selection; None keeps the shared uniform-parameter kernel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conv_k_tile: Option<u32>,
+    /// The K-split GEMV quantizes its activation row to Q8_1 and uses
+    /// integer dot products against a GGML Q4_0 weight.
+    ///
+    /// Set from [`CompileOptions::quantized_activations`]; changes the
+    /// numbers, so it is never turned on by measurement.
+    #[serde(default)]
+    pub gemv_int_dot: bool,
+    /// Workgroup width and cross-lane reduction for a K-split GEMV.
+    ///
+    /// Set by measured selection; None keeps the group's initial shape. Which
+    /// shape wins is a property of the device — how wide its waves are, how
+    /// much a `workgroupBarrier` costs — so it is measured rather than
+    /// predicted. See [`crate::codegen::GemvShape`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gemv_shape: Option<crate::codegen::GemvShape>,
     /// The dispatch belongs to numerically sensitive derivative work and may
     /// not be promoted to a reduced-input-precision implementation. Native
     /// f32 cooperative kernels remain eligible.
@@ -2904,6 +2938,10 @@ impl<'a> Compiler<'a> {
                         use_coop: false,
                         use_small_tiles: false,
                         weight_format: wf,
+                        // The int-dot kernel reads GGML's split-nibble Q4_0
+                        // directly; no other weight format has a layout it
+                        // can feed without a shuffle.
+                        gemv_int_dot: self.options.quantized_activations && wf == WeightFormat::Q40,
                         ..Default::default()
                     });
                 } else {

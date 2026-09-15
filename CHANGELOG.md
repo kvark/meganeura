@@ -1,11 +1,112 @@
 # Unreleased
 
+- Q8_1 activations and integer dot products for the K-split GEMV against
+  GGML Q4_0 weights, behind `CompileOptions::quantized_activations` (or
+  `MEGANEURA_QUANTIZED_ACTIVATIONS`). The arithmetic is llama.cpp's
+  `vec_dot_q4_0_q8_1`: a block reduces to eight `dot4I8Packed` calls plus one
+  correction term for Q4_0's -8 bias, and the integer products are exact.
+
+  This is the one kernel choice here that changes the numbers — the
+  activation loses precision on top of the weight — so it is never turned on
+  by measurement, only by the caller. Once on, the resulting kernel's
+  workgroup width and reduction are measured like any other, and a shape
+  candidate is generated inside it rather than falling back to the f32-
+  activation GEMV, which would have swapped the computation out silently.
+
+  GGML's split-nibble layout is what makes it work: one word of `qs` yields
+  two int8x4 vectors of consecutive elements, each pairing with one word of
+  Q8_1 quants. Meganeura's own Q4 pairs neighbouring elements in a byte and
+  could not feed this without a shuffle, so the path is Q4_0-only.
+
+  The activation is quantized in the kernel, not in a dispatch of its own:
+  every thread takes whole 32-element blocks and reuses each across the four
+  columns its workgroup owns, so no workgroup memory, no barrier and no extra
+  dispatch are involved. `dot4I8Packed` needs no capability — naga emits
+  `OpSDot` where the device has integer dot product and a shift-and-add
+  polyfill where it does not.
+- Native GGML Q4_0 storage (`DType::Q40`, `Graph::parameter_q40`). A `Q4_0`
+  GGUF is now read as GGML wrote it — 18-byte blocks of an f16 scale and 16
+  nibble bytes — instead of being rebuilt block by block into Meganeura's
+  wider Q4 at load. That removes the repack and 0.5 bits/weight: 4.5 against
+  5.0, because a symmetric format needs no per-block minimum.
+
+  The name is close to `DType::Q4_0`, which despite appearances is
+  Meganeura's own asymmetric Q4_1-style packing; `Q40` is GGML's symmetric
+  one. The two also order nibbles differently — GGML splits a block across
+  halves, pairing element `j` with `j + 16`, where Meganeura pairs
+  neighbours — so they are not interchangeable.
+
+  Load-only, like the K-quants: `set_parameter` refuses it and points at
+  `set_parameter_packed`. Q4_1 still repacks, since Meganeura's Q4 *is* the
+  Q4_1 shape, and that path no longer carries a symmetric branch.
+- The K-split GEMV family gains a measured shape: workgroup width (32, 64,
+  128 or 256) and cross-lane reduction (a workgroup-memory halving tree, or
+  `subgroupAdd` within a wave and one partial per wave through workgroup
+  memory). Every GEMV kernel — plain, fused-add, transposed-B, f16,
+  block-packed, RmsNorm-folded — is derived from one source and shaped in one
+  place, so the choice is a single axis across all of them rather than a knob
+  per kernel.
+
+  The subgroup reduction spends two `workgroupBarrier`s whatever the width,
+  against one per halving level for the tree: six fewer than a 256-wide
+  tree, three fewer than a 32-wide one. Neither the slot a wave writes nor
+  the lane that writes it is derived from the local invocation id, since
+  WGSL and Vulkan relate neither to subgroup membership; leaders are elected
+  with `subgroupBroadcastFirst` and claim slots from a workgroup atomic, so
+  the kernel is correct whatever the wave width and however waves happen to
+  be mapped onto lanes.
+
+  `Session::tune_with` now searches this axis, which required admitting the
+  GEMV entries and reduced-storage weights it had excluded outright — between
+  them most of what a decode step runs. A packed B is qualified by agreement
+  with the kernel the plan already runs rather than against an f32 reference
+  dot, since forming one would mean writing a second block decoder and
+  trusting it. Which shape wins is a device property and is not predicted.
+
+  The synthetic weights that qualification runs on have their block scales
+  pinned to [0.25, 4). Random bytes make hopeless scales twice over: about one
+  in thirty-two is NaN or infinite, and the rest span f16's whole range, so
+  one block can dwarf the others by ten orders of magnitude and a dot product
+  dominated by one cancelling block differs between summation orders by more
+  than any honest tolerance allows.
+
+  Each kernel in the family declares its width once, as a `LANES` constant
+  that its workgroup size, workgroup arrays and every loop stride derive
+  from, and the generator rewrites that declaration alone. Rewriting strides
+  by variable name instead had left the transposed GEMV — which strides in
+  vec4s rather than elements — counting overlapping ranges at every width but
+  its declared one.
+
+  `MEGANEURA_GEMV_REDUCTION=tree|subgroup` sets the starting point, alongside
+  the existing `MEGANEURA_GEMV_THREADS` and a new
+  `MEGANEURA_GEMV_BT_THREADS`.
+- Structured profiling of plans larger than Blade's timestamp budget.
+  `capture_session_profile` used to refuse outright any plan with more
+  dispatches than the 1,000 timestamps Blade writes per submission, which a
+  decode or training step of a real model exceeds. It now splits the plan into
+  windows of dispatch indices and replays the session once per window,
+  stitching the per-dispatch results back together. Every dispatch is still
+  measured `samples` times; only the replay count grows, and a plan that fits
+  in one window is captured exactly as before.
+
+  The dispatches outside a window still execute — each replay is a complete,
+  correct run — but batch into one grouped pass per side, keeping the plan's
+  barriers while costing two timestamp slots rather than one per barrier
+  group. `Session::set_profiling_window` exposes the same mechanism directly.
+
+  `measurement` gains `window_count` and `max_window_dispatches`.
+  `profiled_wall_samples_ms` now holds one entry per replay, and
+  `instrumentation_wall_ratio` understates full-instrumentation overhead once
+  windowing kicks in, since each replay runs most of the plan at nearly normal
+  pass counts; `gpu_total_samples_ms` still sums to whole-plan GPU time.
+  `schema_version` is 2 and `ProfileError::TooManyDispatches` is gone.
 - GGUF weight import (`load::gguf`). Reads the container's metadata and tensor
   inventory, and resolves GGML's block encodings into Meganeura's at load time.
-  `Q4_0`, `Q4_1` and `Q8_0` repack losslessly for `set_parameter_packed` —
-  GGML splits a block's nibbles across halves and interleaves each block's
-  header with its payload, where Meganeura pairs adjacent nibbles and keeps
-  headers in their own region. The block *order* already agreed, since packing
+  `Q4_1` and `Q8_0` repack losslessly for `set_parameter_packed` — GGML
+  splits a block's nibbles across halves and interleaves each block's header
+  with its payload, where Meganeura pairs adjacent nibbles and keeps headers
+  in their own region. (`Q4_0` repacked here too until it gained native
+  storage, above.) The block *order* already agreed, since packing
   performs the `[K, N]` transpose that GGUF's layout implies. See
   `examples/gguf_info.rs`.
 - Native GGML K-quant storage: `Q4K`, `Q6K`, `Q5K` and `Q3K`, each with a
