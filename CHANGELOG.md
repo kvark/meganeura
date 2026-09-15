@@ -25,6 +25,11 @@
   alternate word alignment and the shader reads every field byte-addressed;
   buffers get a zero-padded tail while the superblocks stay verbatim.
 
+  Block scales decode with `unpack2x16float`, so subnormals survive — an
+  imported `0x0100` is 2^-16, an ordinary f32, and the hand-assembled
+  decoder this replaces folded it to zero and erased the block. Needs
+  Blade's `SHADER_FLOAT16_IN_FLOAT32`, hence the dependency bump.
+
   A GGUF file is read once and shared: tensors index ranges of one buffer
   rather than owning copies, and `to_packed` borrows it for the K-quants,
   so loading costs roughly the file rather than the file plus a copy of

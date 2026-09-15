@@ -1257,29 +1257,23 @@ fn matmul_vars_tiled(
 
 /// f16 → f32 for the packed-weight kernels' block scales.
 ///
-/// Hand-assembled rather than `unpack2x16float`, which naga gates behind
-/// `SHADER_FLOAT16_IN_FLOAT32` — a capability Blade does not request.
+/// `unpack2x16float` handles subnormals, Inf and NaN, so imported GGUF
+/// scales are not ours to constrain: `0x0100` is 2^-16, which a quantizer
+/// emits for a block of very small weights and which the hand-assembled
+/// version this replaces folded to zero.
 ///
-/// Both edges of the exponent range are handled, because imported GGUF
-/// scales are not ours to constrain. A subnormal half is an ordinary f32:
-/// `0x0100` is 2^-16, which a quantizer emits for a block of very small
-/// weights, and folding it to zero would erase the block. `expo == 31`
-/// stays Inf or NaN rather than becoming a large finite value.
+/// Every packed format shares this one copy. Naga gates the builtin behind
+/// `SHADER_FLOAT16_IN_FLOAT32`, which Blade enables — it stores
+/// f16-precision values inside f32 rather than needing the `f16`
+/// extension, and lowers to core `GlslStd450 UnpackHalf2x16` on SPIR-V.
 const F16_DECODE_FN: &str = "
 fn decode_f16(bits: u32) -> f32 {
-    let h = bits & 0xFFFFu;
-    let sign = (h >> 15u) & 1u;
-    let expo = (h >> 10u) & 0x1Fu;
-    let mant = h & 0x3FFu;
-    if expo == 0u {
-        // Subnormal or zero: value = mant * 2^-24, exact in f32 since the
-        // mantissa is 10 bits. 0x33800000 is 2^-24.
-        let mag = f32(mant) * bitcast<f32>(0x33800000u);
-        return select(mag, -mag, sign == 1u);
-    }
-    // 112 = 127 - 15, the bias difference; 255 keeps Inf and NaN.
-    let biased = select(expo + 112u, 255u, expo == 31u);
-    return bitcast<f32>((sign << 31u) | (biased << 23u) | (mant << 13u));
+    return unpack2x16float(bits & 0xFFFFu).x;
+}
+
+// Both halves of a packed (low, high) scale pair in one instruction.
+fn decode_f16_pair(bits: u32) -> vec2<f32> {
+    return unpack2x16float(bits);
 }
 ";
 
@@ -1303,9 +1297,9 @@ fn dequant_q4(k_idx: u32, n_idx: u32) -> f32 {
     let block = n_idx * blocks_per_col + k_idx / 32u;
     let in_block = k_idx % 32u;
 
-    let dm = matrix_b[block];
-    let d = decode_f16(dm & 0xFFFFu);
-    let m = decode_f16(dm >> 16u);
+    let dm = decode_f16_pair(matrix_b[block]);
+    let d = dm.x;
+    let m = dm.y;
     let data_u32 = matrix_b[num_blocks + block * 4u + in_block / 8u];
     return q4_unpack_nibble(data_u32, d, m, in_block % 8u);
 }
@@ -1314,9 +1308,9 @@ fn dequant_q4_pack8(k_base: u32, n_idx: u32) -> array<f32, 8> {
     let blocks_per_col = params.k / 32u;
     let num_blocks = blocks_per_col * params.n;
     let block = n_idx * blocks_per_col + k_base / 32u;
-    let dm = matrix_b[block];
-    let d = decode_f16(dm & 0xFFFFu);
-    let m = decode_f16(dm >> 16u);
+    let dm = decode_f16_pair(matrix_b[block]);
+    let d = dm.x;
+    let m = dm.y;
     let data_u32 = matrix_b[num_blocks + block * 4u + (k_base % 32u) / 8u];
     var out: array<f32, 8>;
     for (var i = 0u; i < 8u; i++) {
@@ -1360,9 +1354,9 @@ fn q4k_scale_min(base: u32, j: u32) -> vec2<f32> {
 
 fn dequant_q4k(k_idx: u32, n_idx: u32) -> f32 {
     let base = (n_idx * (params.k / 256u) + k_idx / 256u) * 36u;
-    let hdr = matrix_b[base];
-    let d = decode_f16(hdr & 0xFFFFu);
-    let dmin = decode_f16(hdr >> 16u);
+    let hdr = decode_f16_pair(matrix_b[base]);
+    let d = hdr.x;
+    let dmin = hdr.y;
     let e = k_idx % 256u;
     let sm = q4k_scale_min(base, e / 32u);
     let byte = q4k_byte(base, 16u + (e / 64u) * 32u + e % 32u);
@@ -1372,9 +1366,9 @@ fn dequant_q4k(k_idx: u32, n_idx: u32) -> f32 {
 
 fn dequant_q4k_pack8(k_base: u32, n_idx: u32) -> array<f32, 8> {
     let base = (n_idx * (params.k / 256u) + k_base / 256u) * 36u;
-    let hdr = matrix_b[base];
-    let d = decode_f16(hdr & 0xFFFFu);
-    let dmin = decode_f16(hdr >> 16u);
+    let hdr = decode_f16_pair(matrix_b[base]);
+    let d = hdr.x;
+    let dmin = hdr.y;
     let e = k_base % 256u;
     let sm = q4k_scale_min(base, e / 32u);
     let scale = d * sm.x;
