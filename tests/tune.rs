@@ -637,3 +637,99 @@ fn tune_reaches_quantized_gemv_and_installs_a_shape() {
         );
     }
 }
+
+/// Transposed-B GEMV must be correct at every shape, not just its default.
+///
+/// Two separate things make this worth its own test. The widths are only
+/// reachable through measurement, and this kernel strides in vec4s where the
+/// rest of the family strides in elements — a difference that left it
+/// counting overlapping ranges at every width but the declared one. And the
+/// qualification oracle addresses B by row only for entries it knows are
+/// transposed, so admitting this one without telling it made a *correct*
+/// kernel fail.
+///
+/// Qualification compares each shape against an f64 reference dot as well as
+/// against the incumbent, so this is a numerical check at every width, not
+/// just a compile.
+#[test]
+#[ignore = "GPU tuning requires an idle device"]
+fn tune_covers_every_transposed_gemv_shape() {
+    use meganeura::compile::ShaderEntry;
+    use meganeura::{DType, GemvReduction, GemvShape};
+
+    // K a multiple of 4 routes through the K-split GEMV-BT; N stays small so
+    // the whole tournament is quick.
+    const K: usize = 512;
+    const N: usize = 12;
+    for dtype in [DType::F32, DType::F16] {
+        let mut g = Graph::new();
+        let a = g.input("a", &[1, K]);
+        let b = match dtype {
+            DType::F32 => g.parameter("b", &[N, K]),
+            DType::F16 => g.parameter_f16("b", &[N, K]),
+            other => panic!("unhandled {other:?}"),
+        };
+        let y = g.matmul_bt(a, b);
+        g.set_outputs(vec![y]);
+
+        let (mut session, _) = build(
+            &g,
+            SessionConfig {
+                mode: Mode::Inference,
+                runtime: SessionOptions {
+                    coop: CoopPolicy::Disabled,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert!(
+            session
+                .plan()
+                .dispatches
+                .iter()
+                .any(|d| d.shader == ShaderEntry::MatMulGemvBT),
+            "{dtype:?}: the plan did not route through the transposed K-split GEMV"
+        );
+
+        let report = session
+            .tune_with(TuneOptions {
+                max_time: Duration::from_secs(120),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(report.eligible_classes, 1, "{dtype:?}");
+        for outcome in &report.outcomes {
+            assert_eq!(outcome.class.shader, ShaderEntry::MatMulGemvBT);
+            assert!(
+                outcome.qualified,
+                "{dtype:?}: {:?} failed to qualify: {:?}",
+                outcome.candidate, outcome.failure
+            );
+        }
+
+        // Every width and both reductions must actually have been run. A
+        // candidate that silently failed to be offered would otherwise leave
+        // this test asserting nothing about the shapes it never saw.
+        let mut seen: Vec<GemvShape> = report
+            .outcomes
+            .iter()
+            .map(|o| match o.candidate {
+                MatmulTile::Gemv(shape) => shape,
+                other => unreachable!("{other:?}"),
+            })
+            .collect();
+        if let MatmulTile::Gemv(initial) = report.outcomes[0].initial {
+            seen.push(initial);
+        }
+        for threads in [32, 64, 128, 256] {
+            for reduction in [GemvReduction::Tree, GemvReduction::Subgroup] {
+                let shape = GemvShape { threads, reduction };
+                assert!(
+                    seen.contains(&shape),
+                    "{dtype:?}: {shape:?} was never measured; saw {seen:?}"
+                );
+            }
+        }
+    }
+}

@@ -235,8 +235,12 @@ pub struct CaptureOptions {
     /// Defaults to Blade's per-submission limit, which is what plans are
     /// actually measured against. Lower it to cut a plan into more, smaller
     /// windows — each replay then perturbs the schedule less, at the cost of
-    /// more replays. Values below 3 are treated as 3, since two slots always
-    /// go to the untimed passes around the window.
+    /// more replays.
+    ///
+    /// Clamped to `3 ..= blade_graphics::limits::PASS_COUNT`: two slots
+    /// always go to the untimed passes around the window, and raising the
+    /// bound past the backend's own limit would only build a window whose
+    /// timestamps the backend drops.
     pub max_timed_passes_per_replay: Option<usize>,
 }
 
@@ -477,10 +481,15 @@ pub fn capture_session_profile(
     }
 
     let dispatch_count = session.plan().dispatches.len();
+    // Clamped to the backend's own limit at both ends. An override above it
+    // does not raise anything — Blade still stops writing timestamps at
+    // `PASS_COUNT` — it just asks for one oversized window, which then
+    // recovers nothing and fails the capture instead of taking the windowed
+    // route that works.
     let pass_limit = options
         .max_timed_passes_per_replay
         .unwrap_or(blade_graphics::limits::PASS_COUNT)
-        .max(3);
+        .clamp(3, blade_graphics::limits::PASS_COUNT);
     let windows = profile_windows(dispatch_count, pass_limit);
     let window_count = windows.len();
     let replays = options.samples * window_count;
@@ -1363,6 +1372,23 @@ mod tests {
 
         // The common case replays exactly as often as before windowing.
         assert_eq!(profile_windows(1000, 1000), vec![0..1000]);
+        // An override above the backend limit must not build a window the
+        // backend will not timestamp. The clamp happens in the caller, so
+        // check the value it computes rather than only the planner.
+        let over = CaptureOptions {
+            max_timed_passes_per_replay: Some(blade_graphics::limits::PASS_COUNT * 2),
+            ..CaptureOptions::default()
+        };
+        let effective = over
+            .max_timed_passes_per_replay
+            .unwrap_or(blade_graphics::limits::PASS_COUNT)
+            .clamp(3, blade_graphics::limits::PASS_COUNT);
+        assert_eq!(effective, blade_graphics::limits::PASS_COUNT);
+        let windows = profile_windows(1500, effective);
+        assert!(
+            windows.len() > 1 && windows.iter().all(|w| w.len() <= effective),
+            "a 1500-dispatch plan must still be windowed: {windows:?}"
+        );
         // The motivating case: one decode step no longer refuses to profile.
         assert_eq!(profile_windows(1034, 1000).len(), 2);
         // Windows are evened out rather than leaving a stub at the end.

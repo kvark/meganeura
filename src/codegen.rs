@@ -1814,41 +1814,63 @@ pub fn generate_module_weighted(group: ShaderGroup, format: WeightFormat) -> Sha
 /// consuming workgroup recomputes. That is cheap: A is a few kilobytes
 /// read by all of them at once, so it is an L2 broadcast, and it buys the
 /// removal of the separate RmsNorm dispatch and the boundary after it.
+/// Substitute `old` for `new`, refusing to do nothing.
+///
+/// These kernels are built by rewriting a source that someone else is free
+/// to edit. A replacement whose anchor has drifted is not a no-op with a
+/// slightly different kernel at the end of it — it is a kernel missing a
+/// declaration or a stride, which surfaces as a parse error at best and a
+/// wrong answer at worst. Failing here names the anchor instead.
+fn substitute(source: &str, old: &str, new: &str) -> String {
+    assert!(
+        source.contains(old),
+        "GEMV substitution anchor is no longer present: {old:?}"
+    );
+    source.replace(old, new)
+}
+
 pub fn generate_module_gemv_rmsnorm() -> ShaderModule {
     // `_pad` carries eps; the fused kernel needs no other new parameter.
-    let src = include_str!("shaders/matmul_gemv.wgsl")
-        .replace("    _pad: u32,", "    eps_bits: u32,")
-        .replace(
-            "var<storage> matrix_b: array<vec4<f32>>;",
-            "var<storage> norm_w: array<f32>;\nvar<storage> matrix_b: array<vec4<f32>>;",
-        )
-        .replace(
-            "var<workgroup> reduce_buf: array<vec4<f32>, 256>;",
-            "var<workgroup> reduce_buf: array<vec4<f32>, 256>;\n\
-             var<workgroup> scale_buf: array<f32, 256>;\n\
-             var<workgroup> inv_rms: f32;",
-        )
-        // The early-out must not precede the prologue's barriers, which every
-        // lane has to reach. The dispatch is exactly N/4 workgroups, so it
-        // never fires in practice, but keep it uniform regardless.
-        .replace(
-            "    if col4 >= n_v4 { return; }\n    let k = params.k;\n",
-            "    let k = params.k;\n",
-        )
-        .replace(
-            "    // Each thread accumulates a partial sum over its K-stride slice.",
-            "    // Prologue: sum of squares over A, reduced across the workgroup.\n\
+    let src = substitute(
+        include_str!("shaders/matmul_gemv.wgsl"),
+        "    _pad: u32,",
+        "    eps_bits: u32,",
+    );
+    let src = substitute(
+        &src,
+        "var<storage> matrix_b: array<vec4<f32>>;",
+        "var<storage> norm_w: array<f32>;\nvar<storage> matrix_b: array<vec4<f32>>;",
+    );
+    let src = substitute(
+        &src,
+        "var<workgroup> reduce_buf: array<vec4<f32>, LANES>;",
+        "var<workgroup> reduce_buf: array<vec4<f32>, LANES>;\n\
+         var<workgroup> scale_buf: array<f32, LANES>;\n\
+         var<workgroup> inv_rms: f32;",
+    );
+    // The early-out must not precede the prologue's barriers, which every
+    // lane has to reach. The dispatch is exactly N/4 workgroups, so it
+    // never fires in practice, but keep it uniform regardless.
+    let src = substitute(
+        &src,
+        "    if col4 >= n_v4 { return; }\n    let k = params.k;\n",
+        "    let k = params.k;\n",
+    );
+    let src = substitute(
+        &src,
+        "    // Each thread accumulates a partial sum over its K-stride slice.",
+        "    // Prologue: sum of squares over A, reduced across the workgroup.\n\
     var ss = 0.0;\n\
     var si = lane;\n\
     loop {\n\
         if si >= k { break; }\n\
         let v = matrix_a[si];\n\
         ss += v * v;\n\
-        si += 256u;\n\
+        si += LANES;\n\
     }\n\
     scale_buf[lane] = ss;\n\
     workgroupBarrier();\n\
-    var sstride = 128u;\n\
+    var sstride = LANES / 2u;\n\
     loop {\n\
         if sstride == 0u { break; }\n\
         if lane < sstride { scale_buf[lane] += scale_buf[lane + sstride]; }\n\
@@ -1863,32 +1885,37 @@ pub fn generate_module_gemv_rmsnorm() -> ShaderModule {
     if col4 >= n_v4 { return; }\n\
 \n\
     // Each thread accumulates a partial sum over its K-stride slice.",
-        )
-        .replace(
-            "        let a = matrix_a[kk];",
-            "        let a = matrix_a[kk] * rs * norm_w[kk];",
-        );
+    );
+    let src = substitute(
+        &src,
+        "        let a = matrix_a[kk];",
+        "        let a = matrix_a[kk] * rs * norm_w[kk];",
+    );
     parse_wgsl(&gemv_shape_source(
         &src,
         GemvShape::initial(ShaderGroup::MatMulGemv),
     ))
 }
 
-/// The `@workgroup_size(N)` a GEMV source is written against.
+const LANES_PREFIX: &str = "const LANES: u32 = ";
+
+/// The width a GEMV source is written against, from its `LANES` constant.
 ///
-/// Every kernel in the family declares it once and sizes `reduce_buf`, the
-/// K-stride and the RmsNorm prologue stride to match, so the one number is
-/// enough to rewrite all of them.
+/// Every kernel in the family declares that constant once and derives its
+/// workgroup size, its `reduce_buf` extent and every loop stride from it, so
+/// rewriting the declaration rewrites all of them at once. That matters more
+/// than it looks: the strides are not spelled the same way across the family
+/// — elements here, vec4s in the transposed form, whole blocks in the
+/// int-dot one — and rewriting them one variable name at a time left the
+/// transposed kernel counting overlapping ranges at every width but its
+/// declared one.
 fn gemv_declared_threads(source: &str) -> u32 {
-    let start = source
-        .find("@compute @workgroup_size(")
-        .expect("GEMV entry point")
-        + "@compute @workgroup_size(".len();
-    let end = start + source[start..].find(')').expect("GEMV workgroup size");
+    let start = source.find(LANES_PREFIX).expect("GEMV LANES constant") + LANES_PREFIX.len();
+    let end = start + source[start..].find('u').expect("GEMV LANES literal");
     source[start..end]
         .trim()
         .parse()
-        .expect("GEMV workgroup size is a literal")
+        .expect("GEMV LANES is a literal")
 }
 
 /// Rewrite a GEMV source to the requested workgroup width and reduction.
@@ -1901,30 +1928,13 @@ fn gemv_declared_threads(source: &str) -> u32 {
 fn gemv_shape_source(source: &str, shape: GemvShape) -> String {
     let initial = gemv_declared_threads(source);
     let threads = shape.threads;
-    let mut source = source
-        .replace(
-            &format!("@workgroup_size({initial})"),
-            &format!("@workgroup_size({threads})"),
-        )
-        .replace(
-            &format!("array<vec4<f32>, {initial}>"),
-            &format!("array<vec4<f32>, {threads}>"),
-        )
-        .replace(
-            &format!("array<f32, {initial}>"),
-            &format!("array<f32, {threads}>"),
-        )
-        .replace(&format!("kk += {initial}u;"), &format!("kk += {threads}u;"))
-        // The int-dot GEMV strides whole blocks rather than elements.
-        .replace(
-            &format!("blk += {initial}u;"),
-            &format!("blk += {threads}u;"),
-        )
-        .replace(&format!("si += {initial}u;"), &format!("si += {threads}u;"))
-        .replace(
-            &format!("var sstride = {}u;", initial / 2),
-            &format!("var sstride = {}u;", threads / 2),
-        );
+    let declaration = format!("{LANES_PREFIX}{initial}u;");
+    assert_eq!(
+        source.matches(declaration.as_str()).count(),
+        1,
+        "a GEMV source must declare LANES exactly once"
+    );
+    let mut source = source.replace(&declaration, &format!("{LANES_PREFIX}{threads}u;"));
 
     let start = source
         .find("    reduce_buf[lane] = acc;")
@@ -1946,24 +1956,40 @@ fn gemv_shape_source(source: &str, shape: GemvShape) -> String {
             body
         }
         // One partial per wave reaches workgroup memory, and lane 0 sums the
-        // few that do. `subgroup_size` is read at runtime, so the same kernel
-        // is correct on any wave width; the loop bound is the workgroup width
-        // rather than a wave count, because the two need not divide evenly.
-        GemvReduction::Subgroup => format!(
-            "    let wave_total = subgroupAdd(acc);\n\
-             \x20   if sg_id == 0u {{ reduce_buf[lane / sg_size] = wave_total; }}\n\
+        // few that do.
+        //
+        // Neither the slot nor the leader may be derived from the local
+        // invocation id. WGSL and Vulkan both decline to relate
+        // `local_invocation_id` to subgroup membership, so `lane / sg_size`
+        // is not a subgroup index and `sg_id == 0` need not name exactly one
+        // invocation per subgroup — a wave holding the odd local ids, or a
+        // partially populated one, breaks both. Instead each wave's leader,
+        // elected by `subgroupBroadcastFirst`, claims a slot with an atomic,
+        // and the count comes back from the same counter. That costs one
+        // extra barrier to zero the counter, so two rather than the tree's
+        // one per halving level.
+        GemvReduction::Subgroup => {
+            let _ = threads;
+            "    if lane == 0u { atomicStore(&wave_slots, 0u); }\n\
              \x20   workgroupBarrier();\n\
-             \x20   if lane == 0u {{\n\
+             \x20   let wave_total = subgroupAdd(acc);\n\
+             \x20   if sg_id == subgroupBroadcastFirst(sg_id) {\n\
+             \x20       reduce_buf[atomicAdd(&wave_slots, 1u)] = wave_total;\n\
+             \x20   }\n\
+             \x20   workgroupBarrier();\n\
+             \x20   if lane == 0u {\n\
+             \x20       let waves = atomicLoad(&wave_slots);\n\
              \x20       var total = reduce_buf[0];\n\
              \x20       var g = 1u;\n\
-             \x20       loop {{\n\
-             \x20           if g * sg_size >= {threads}u {{ break; }}\n\
+             \x20       loop {\n\
+             \x20           if g >= waves { break; }\n\
              \x20           total = total + reduce_buf[g];\n\
              \x20           g = g + 1u;\n\
-             \x20       }}\n\
+             \x20       }\n\
              \x20       reduce_buf[0] = total;\n\
-             \x20   }}\n"
-        ),
+             \x20   }\n"
+                .to_owned()
+        }
     };
     source.replace_range(start..end, &reduction);
 
@@ -1979,11 +2005,21 @@ fn gemv_shape_source(source: &str, shape: GemvShape) -> String {
         let with_builtins = source.replace(
             signature,
             "@builtin(local_invocation_id) lid: vec3<u32>, \
-             @builtin(subgroup_size) sg_size: u32, \
              @builtin(subgroup_invocation_id) sg_id: u32)",
         );
         assert_ne!(with_builtins, source, "GEMV entry point signature changed");
         source = with_builtins;
+
+        // The slot counter lives next to the buffer it indexes, and only the
+        // subgroup form declares it: the tree has no use for it and should
+        // not spend workgroup memory on it.
+        let anchor = "var<workgroup> reduce_buf:";
+        let with_counter = source.replace(
+            anchor,
+            &format!("var<workgroup> wave_slots: atomic<u32>;\n{anchor}"),
+        );
+        assert_ne!(with_counter, source, "GEMV workgroup buffer declaration");
+        source = with_counter;
     }
     source
 }
@@ -6759,7 +6795,7 @@ mod tests {
                             "{format:?} {group:?} {shape:?} lost its B representation"
                         );
                         assert!(
-                            source.contains(&format!("@workgroup_size({threads})")),
+                            source.contains(&format!("{LANES_PREFIX}{threads}u;")),
                             "{format:?} {group:?} {shape:?} kept the declared width"
                         );
                         let subgroup = reduction == GemvReduction::Subgroup;
@@ -6820,14 +6856,15 @@ mod tests {
                 assert!(
                     module
                         .source
-                        .contains(&format!("@workgroup_size({threads})")),
+                        .contains(&format!("{LANES_PREFIX}{threads}u;")),
                     "{shape:?} kept the declared width"
                 );
-                // The K-stride here counts blocks, not elements, so it has
-                // its own rewrite and its own way to be missed.
+                // The K-stride here counts blocks, not elements. It derives
+                // from `LANES` like every other stride, which is the point:
+                // nothing outside the source has to know it exists.
                 assert!(
-                    module.source.contains(&format!("blk += {threads}u;")),
-                    "{shape:?} did not restride the block loop"
+                    module.source.contains("blk += LANES;"),
+                    "{shape:?} lost the block stride"
                 );
                 assert_eq!(
                     module.source.contains("subgroupAdd"),
@@ -6838,9 +6875,10 @@ mod tests {
         }
     }
 
-    /// The tree spends a barrier per level; the subgroup form spends one,
-    /// whatever the width. That difference is the entire point of the axis,
-    /// so pin it rather than trusting the generated text to stay correct.
+    /// The tree spends a barrier per halving level; the subgroup form spends
+    /// two whatever the width. That difference is the entire point of the
+    /// axis, so pin it rather than trusting the generated text to stay
+    /// correct.
     #[test]
     fn subgroup_reduction_replaces_the_barrier_chain() {
         let barriers = |shape| {
@@ -6858,9 +6896,12 @@ mod tests {
                 threads,
                 reduction: GemvReduction::Subgroup,
             });
+            // One barrier to zero the slot counter and one after the
+            // leaders have claimed their slots. Constant in the width,
+            // which is the point.
             assert_eq!(
-                subgroup, 1,
-                "the subgroup reduction needs exactly one barrier at {threads} threads"
+                subgroup, 2,
+                "the subgroup reduction needs exactly two barriers at {threads} threads"
             );
             assert_eq!(
                 tree,

@@ -720,14 +720,7 @@ impl Session {
             }
             let inputs = {
                 let _timer = PhaseTimer::new(&mut details.input_preparation);
-                let mut inputs = test_inputs(&logical_sizes, pattern);
-                for (index, data) in inputs.iter_mut().enumerate() {
-                    data.resize(sizes[index] / 4, 0.0);
-                }
-                if class.key.weight_format.uses_reduced_storage() {
-                    tame_block_scales(&mut inputs[1]);
-                }
-                inputs
+                prepared_inputs(&logical_sizes, &sizes, pattern, class.key.weight_format)
             };
             for (index, data) in inputs.iter().enumerate() {
                 scratch.upload(index, data, Some(&mut *details));
@@ -818,9 +811,16 @@ impl Session {
         outcome.qualified = true;
         drop(qualification);
         let warmup = PhaseTimer::new(&mut phases.warmup);
-        // Time ordinary-magnitude data, not a zero-filled or subnormal workload.
-        for (index, data) in test_inputs(&logical_sizes, 0).iter_mut().enumerate() {
-            data.resize(sizes[index] / 4, 0.0);
+        // Time ordinary-magnitude data, not a zero-filled or subnormal
+        // workload — and the *same* data qualification ran on. Rebuilding it
+        // here without the packed-scale taming timed a workload full of NaN
+        // and wildly scaled blocks that no candidate had been qualified
+        // against, which is both a different kernel cost on hardware that
+        // penalizes them and not the thing the measurement claims to compare.
+        for (index, data) in prepared_inputs(&logical_sizes, &sizes, 0, class.key.weight_format)
+            .iter()
+            .enumerate()
+        {
             scratch.upload(index, data, None);
         }
         for _ in 0..options.warmup_runs {
@@ -1200,6 +1200,28 @@ impl Drop for Scratch<'_, '_> {
     }
 }
 
+/// Synthetic operands for one input pattern, sized to the scratch buffers
+/// and made comparable where the weight is packed.
+///
+/// Qualification and timing both go through here. They must see identical
+/// bytes: a candidate qualified on tamed block scales and then timed on wild
+/// ones was not measured on the workload it was checked against.
+fn prepared_inputs(
+    logical_sizes: &[usize],
+    sizes: &[usize],
+    pattern: u32,
+    weight_format: crate::compile::WeightFormat,
+) -> Vec<Vec<f32>> {
+    let mut inputs = test_inputs(logical_sizes, pattern);
+    for (index, data) in inputs.iter_mut().enumerate() {
+        data.resize(sizes[index] / 4, 0.0);
+    }
+    if weight_format.uses_reduced_storage() {
+        tame_block_scales(&mut inputs[1]);
+    }
+    inputs
+}
+
 fn test_inputs(sizes: &[usize], pattern: u32) -> Vec<Vec<f32>> {
     (0..sizes.len() - 1)
         .map(|operand| {
@@ -1317,7 +1339,15 @@ fn reference_dot(class: &TuneClass, inputs: &[Vec<f32>], row: usize, col: usize)
         } else {
             row * k + inner
         };
-        let b = if class.shader == ShaderEntry::MatMulBT {
+        // Both transposed-B entries store B as `[N, K]` row-major, so a
+        // column's weights are contiguous. The GEMV form is a separate
+        // `ShaderEntry`, and leaving it out of this check silently gave it
+        // forward `[K, N]` addressing — a reference that disagrees with a
+        // correct kernel, which reads as the kernel failing.
+        let b = if matches!(
+            class.shader,
+            ShaderEntry::MatMulBT | ShaderEntry::MatMulGemvBT
+        ) {
             col * k + inner
         } else {
             inner * n + col
@@ -2021,6 +2051,47 @@ mod tests {
         assert!(TuneClass::from_dispatch(dispatch, None).is_some());
     }
 
+    /// A transposed-B GEMV must be read as `[N, K]`, like the tiled one.
+    ///
+    /// Worked by hand rather than against the implementation: A is 1..8 and
+    /// B is 1..24 laid out as three contiguous rows of eight, so column `c`
+    /// is `sum_i A[i] * B[c][i]`. Forward `[K, N]` addressing over the same
+    /// bytes gives [540, 576, 612], which is what the oracle produced while
+    /// this entry was missing from the transposed branch — a wrong reference
+    /// that fails correct kernels.
+    #[test]
+    fn a_transposed_gemv_reference_reads_b_by_row() {
+        let class = TuneClass {
+            weight_format: crate::compile::WeightFormat::F32,
+            shader: ShaderEntry::MatMulGemvBT,
+            m: 1,
+            n: 3,
+            k: 8,
+            conv2d: None,
+            requires_full_precision: false,
+            device_local: [false; 4],
+            binding_bytes: vec![32, 96, 12],
+        };
+        let a: Vec<f32> = (1..=8).map(|v| v as f32).collect();
+        let b: Vec<f32> = (1..=24).map(|v| v as f32).collect();
+        let inputs = vec![a, b, Vec::new()];
+        let got: Vec<f64> = (0..3)
+            .map(|col| reference_dot(&class, &inputs, 0, col))
+            .collect();
+        assert_eq!(got, vec![204.0, 492.0, 780.0]);
+
+        // The tiled transposed entry has always read it this way, and the
+        // two must agree: they describe the same operand layout.
+        let tiled = TuneClass {
+            shader: ShaderEntry::MatMulBT,
+            ..class
+        };
+        let tiled_got: Vec<f64> = (0..3)
+            .map(|col| reference_dot(&tiled, &inputs, 0, col))
+            .collect();
+        assert_eq!(tiled_got, got);
+    }
+
     #[test]
     fn reference_dots_match_independent_rectangular_example() {
         let mut class = TuneClass {
@@ -2221,6 +2292,62 @@ mod tests {
     /// and Q5_K at 0 and 2, Q6_K at 208, Q3_K at 108, GGML Q4_0 at 0, and the
     /// split Q4/Q8 header regions on a 4-byte stride), and every block length
     /// is even, so even offsets are the only ones that need to hold.
+    /// Timing and qualification must upload the same bytes.
+    ///
+    /// The warmup used to rebuild its operands from `test_inputs` directly,
+    /// so a packed weight was tamed for qualification and left wild for every
+    /// timing sample. Reproduce both call sites' arguments and compare.
+    #[test]
+    fn timing_and_qualification_prepare_identical_operands() {
+        use crate::compile::WeightFormat;
+        // K=512, N=256 Q4_K: 512 bytes of A, the packed weight, 1 KiB of C.
+        let logical = [2048usize, 73_728, 1024];
+        let sizes = [2048usize, 73_728, 1024];
+        for format in [WeightFormat::F32, WeightFormat::Q4K, WeightFormat::Q6K] {
+            let qualification = prepared_inputs(&logical, &sizes, 0, format);
+            let warmup = prepared_inputs(&logical, &sizes, 0, format);
+            assert_eq!(
+                qualification
+                    .iter()
+                    .map(|v| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
+                    .collect::<Vec<_>>(),
+                warmup
+                    .iter()
+                    .map(|v| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
+                    .collect::<Vec<_>>(),
+                "{format:?}: the two preparation paths diverged"
+            );
+
+            // And a packed weight really is tamed on the way through, so the
+            // shared path is doing the work rather than merely being shared.
+            let wild = {
+                let mut raw = test_inputs(&logical, 0);
+                for (index, data) in raw.iter_mut().enumerate() {
+                    data.resize(sizes[index] / 4, 0.0);
+                }
+                raw
+            };
+            let nonfinite = |data: &[f32]| {
+                data.iter()
+                    .flat_map(|v| {
+                        let bits = v.to_bits();
+                        [(bits >> 16) as u16, bits as u16]
+                    })
+                    .filter(|half| half & 0x7C00 == 0x7C00)
+                    .count()
+            };
+            if format.uses_reduced_storage() {
+                assert!(
+                    nonfinite(&wild[1]) > 0,
+                    "{format:?}: the fixture no longer contains a wild scale"
+                );
+                assert_eq!(nonfinite(&qualification[1]), 0, "{format:?}");
+            } else {
+                assert_eq!(qualification[1], wild[1], "{format:?}: f32 B was altered");
+            }
+        }
+    }
+
     #[test]
     fn synthetic_packed_weights_decode_to_comparable_scales() {
         let mut data: Vec<f32> = (0..=u32::from(u16::MAX))

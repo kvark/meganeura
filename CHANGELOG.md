@@ -47,11 +47,14 @@
   place, so the choice is a single axis across all of them rather than a knob
   per kernel.
 
-  The subgroup reduction spends one `workgroupBarrier` whatever the width,
-  against one per halving level for the tree: six fewer on AMD's 64-wide
-  wave, five on a 32-wide one. It is written against the `subgroup_size`
-  builtin rather than a compiled-in width, so one kernel is correct on wave64,
-  wave32 and the 8-wide waves of a software rasterizer.
+  The subgroup reduction spends two `workgroupBarrier`s whatever the width,
+  against one per halving level for the tree: six fewer than a 256-wide
+  tree, three fewer than a 32-wide one. Neither the slot a wave writes nor
+  the lane that writes it is derived from the local invocation id, since
+  WGSL and Vulkan relate neither to subgroup membership; leaders are elected
+  with `subgroupBroadcastFirst` and claim slots from a workgroup atomic, so
+  the kernel is correct whatever the wave width and however waves happen to
+  be mapped onto lanes.
 
   `Session::tune_with` now searches this axis, which required admitting the
   GEMV entries and reduced-storage weights it had excluded outright — between
@@ -67,8 +70,16 @@
   dominated by one cancelling block differs between summation orders by more
   than any honest tolerance allows.
 
+  Each kernel in the family declares its width once, as a `LANES` constant
+  that its workgroup size, workgroup arrays and every loop stride derive
+  from, and the generator rewrites that declaration alone. Rewriting strides
+  by variable name instead had left the transposed GEMV — which strides in
+  vec4s rather than elements — counting overlapping ranges at every width but
+  its declared one.
+
   `MEGANEURA_GEMV_REDUCTION=tree|subgroup` sets the starting point, alongside
-  the existing `MEGANEURA_GEMV_THREADS`.
+  the existing `MEGANEURA_GEMV_THREADS` and a new
+  `MEGANEURA_GEMV_BT_THREADS`.
 - Structured profiling of plans larger than Blade's timestamp budget.
   `capture_session_profile` used to refuse outright any plan with more
   dispatches than the 1,000 timestamps Blade writes per submission, which a

@@ -39,7 +39,10 @@ var<storage> matrix_a: array<f32>;
 var<storage> matrix_b: array<u32>;
 var<storage, read_write> matrix_c: array<vec4<f32>>;
 var<uniform> params: Params;
-var<workgroup> reduce_buf: array<vec4<f32>, 256>;
+// Workgroup width; see `matmul_gemv.wgsl`.
+const LANES: u32 = 256u;
+
+var<workgroup> reduce_buf: array<vec4<f32>, LANES>;
 
 // The f16 scale at the head of the Q4_0 block starting at `byte_base`.
 fn q40_scale(byte_base: u32) -> f32 {
@@ -67,7 +70,7 @@ fn q40_nibbles(byte_base: u32, i: u32) -> u32 {
     return (word >> shift) | (matrix_b[at / 4u + 1u] << (32u - shift));
 }
 
-@compute @workgroup_size(256)
+@compute @workgroup_size(LANES)
 fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let col4 = wgid.x;
     let lane = lid.x;
@@ -121,7 +124,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             }
             acc[c] += q40_scale(byte_base) * (d8 * f32(sumi) - 8.0 * s8);
         }
-        blk += 256u;
+        blk += LANES;
     }
 
     reduce_buf[lane] = acc;

@@ -109,42 +109,62 @@ fn run_unprofiled() -> Vec<f32> {
 /// each replay having carried the chain a little further. The guarantee that
 /// matters is per replay, so this steps one window at a time and compares
 /// after each one.
+///
+/// The input changes on every replay, against a reference session stepped on
+/// the same input. Reusing one input would let a stale but valid result from
+/// the previous replay stand in for work this one skipped.
 #[test]
 fn a_windowed_step_is_a_complete_replay() {
-    let reference = sanity_checked_reference();
+    sanity_check_reference();
+    let mut reference_session = build_session();
     let mut session = build_session();
     let dispatch_count = session.plan().dispatches.len();
     let mut out = vec![0.0f32; ROWS * DIM];
+    let mut reference = vec![0.0f32; ROWS * DIM];
 
     // Widths that divide the plan and widths that do not, so windows land on
     // barrier-group seams and inside groups alike. `None` is the unprofiled
     // path, and a window wider than the plan is the `set_profiling(true)` one.
+    let mut replay = 0u32;
     for width in [1, 2, 3, 5, dispatch_count] {
         for start in (0..dispatch_count).step_by(width) {
             let window = start..(start + width).min(dispatch_count);
+            replay += 1;
+            let x = varied_input(replay);
+
+            reference_session.set_input("x", &x);
+            reference_session.step();
+            reference_session.wait();
+            reference_session.read_output_by_index(0, &mut reference);
+
             session.set_profiling_window(Some(window.clone()));
-            session.set_input("x", &input());
+            session.set_input("x", &x);
             session.step();
             session.wait();
             session.read_output_by_index(0, &mut out);
+
             // The same kernels ran on the same data in the same order, so
-            // this is exact equality. Any difference means the grouped
-            // passes around the window dropped work or lost a barrier.
-            let worst = out
-                .iter()
-                .zip(&reference)
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0f32, f32::max);
+            // this is exact equality. Comparing bit patterns rather than a
+            // tolerance is deliberate: `f32::max` ignores NaN, so folding
+            // absolute differences would let an all-NaN output pass as zero
+            // error.
             assert_eq!(
-                worst, 0.0,
-                "window {window:?} of {dispatch_count} changed the result by {worst}"
+                out, reference,
+                "window {window:?} of {dispatch_count} changed the result"
             );
         }
     }
     session.set_profiling_window(None);
 }
 
-fn sanity_checked_reference() -> Vec<f32> {
+/// A different activation per replay, still in the range the fixture uses.
+fn varied_input(replay: u32) -> Vec<f32> {
+    (0..ROWS * DIM)
+        .map(|i| ((i as u32 * 7 + replay * 31) % 97) as f32 * 0.01 - 0.48)
+        .collect()
+}
+
+fn sanity_check_reference() -> Vec<f32> {
     let reference = run_unprofiled();
     assert!(
         reference.iter().all(|v| v.is_finite()),
@@ -163,7 +183,7 @@ fn sanity_checked_reference() -> Vec<f32> {
 
 #[test]
 fn windowed_capture_times_every_dispatch_and_preserves_the_result() {
-    let reference = sanity_checked_reference();
+    let reference = sanity_check_reference();
     let mut session = build_session();
     let dispatch_count = session.plan().dispatches.len();
     // Enough dispatches that a five-pass budget forces several windows,
@@ -237,18 +257,12 @@ fn windowed_capture_times_every_dispatch_and_preserves_the_result() {
 
     // Untimed head and tail passes must leave the computation alone. The same
     // kernels ran on the same data in the same order, so this is exact
-    // equality: any difference means a grouped pass lost a barrier.
+    // equality: any difference means a grouped pass lost a barrier. Compared
+    // as values rather than as a folded maximum difference, because
+    // `f32::max` ignores NaN and would report an all-NaN output as agreeing.
     let mut out = vec![0.0f32; ROWS * DIM];
     session.read_output_by_index(0, &mut out);
-    let worst = out
-        .iter()
-        .zip(&reference)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
-    assert_eq!(
-        worst, 0.0,
-        "windowed profiling changed the result by {worst}"
-    );
+    assert_eq!(out, reference, "windowed profiling changed the result");
 }
 
 /// A plan that fits in the budget must still be captured in exactly one

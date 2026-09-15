@@ -29,9 +29,14 @@ var<storage> matrix_a: array<vec4<f32>>;     // A: [1, K] as K/4 vec4s
 var<storage> matrix_b: array<vec4<f32>>;     // B: [N, K] as N × K/4 vec4s
 var<storage, read_write> matrix_c: array<f32>;  // C: [1, N]
 var<uniform> params: Params;
-var<workgroup> reduce_buf: array<f32, 32>;
+// Workgroup width; see `matmul_gemv.wgsl`. This kernel strides in vec4s
+// rather than elements, which is exactly the sort of difference a
+// per-variable rewrite used to miss.
+const LANES: u32 = 32u;
 
-@compute @workgroup_size(32)
+var<workgroup> reduce_buf: array<f32, LANES>;
+
+@compute @workgroup_size(LANES)
 fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let col = wgid.x;
     let lane = lid.x;
@@ -46,7 +51,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         let a = matrix_a[kk_v4];
         let b = matrix_b[row_off + kk_v4];
         acc = acc + dot(a, b);
-        kk_v4 += 32u;
+        kk_v4 += LANES;
     }
 
     reduce_buf[lane] = acc;

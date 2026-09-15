@@ -125,6 +125,23 @@ fn run(k: usize, n: usize, a: &[f32], packed: &[u8], quantized_activations: bool
     session.read_output(n)
 }
 
+/// Largest absolute difference between two outputs.
+///
+/// `f32::max` returns the non-NaN operand, so folding differences with it
+/// reports an all-NaN output as agreeing perfectly. Check finiteness first
+/// rather than letting a kernel that produced nothing pass as exact.
+fn max_abs_diff(got: &[f32], want: &[f32]) -> f32 {
+    assert_eq!(got.len(), want.len());
+    assert!(
+        got.iter().all(|v| v.is_finite()),
+        "the kernel produced a non-finite value"
+    );
+    got.iter()
+        .zip(want)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max)
+}
+
 fn activation(k: usize) -> Vec<f32> {
     (0..k)
         .map(|i| ((i * 37 % 61) as f32 - 30.0) * 0.021)
@@ -147,11 +164,7 @@ fn int_dot_gemv_matches_the_q4_0_q8_1_reference() {
 
         let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
         assert!(scale > 0.05, "k={k} n={n}: reference is ~zero, {scale}");
-        let worst = got
-            .iter()
-            .zip(&want)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+        let worst = max_abs_diff(&got, &want);
         // Both sides accumulate the same integer products; only the f32
         // block sum differs in order, so this is float-noise tight.
         assert!(
@@ -177,12 +190,7 @@ fn int_dot_gemv_stays_close_to_the_full_precision_path() {
     let full = run(k, n, &a, &packed, false);
     let quantized = run(k, n, &a, &packed, true);
 
-    let err = |v: &[f32]| {
-        v.iter()
-            .zip(&exact)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max)
-    };
+    let err = |v: &[f32]| max_abs_diff(v, &exact);
     let full_err = err(&full);
     let quantized_err = err(&quantized);
     eprintln!(
@@ -271,11 +279,7 @@ fn tuning_a_shape_keeps_the_int_dot_kernel() {
     session.wait();
     let got = session.read_output(n);
     let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-    let worst = got
-        .iter()
-        .zip(&want)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
+    let worst = max_abs_diff(&got, &want);
     assert!(
         worst <= scale * 2.0e-5,
         "tuning changed the computation: max_abs_err={worst}, scale={scale}"

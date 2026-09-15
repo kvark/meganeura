@@ -36,9 +36,14 @@ var<storage> matrix_a: array<f32>;
 var<storage> matrix_b: array<vec4<f32>>;
 var<storage, read_write> matrix_c: array<vec4<f32>>;
 var<uniform> params: Params;
-var<workgroup> reduce_buf: array<vec4<f32>, 256>;
+// Workgroup width. The shape generator rewrites this one declaration,
+// and every stride and workgroup array below is derived from it, so a
+// loop added later cannot silently keep a stale stride.
+const LANES: u32 = 256u;
 
-@compute @workgroup_size(256)
+var<workgroup> reduce_buf: array<vec4<f32>, LANES>;
+
+@compute @workgroup_size(LANES)
 fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let col4 = wgid.x;
     let lane = lid.x;
@@ -54,7 +59,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         let a = matrix_a[kk];
         let b = matrix_b[kk * n_v4 + col4];
         acc = acc + vec4<f32>(a) * b;
-        kk += 256u;
+        kk += LANES;
     }
 
     // Tree reduction via shared memory. The last three levels stay within
