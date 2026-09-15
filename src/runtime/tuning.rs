@@ -412,7 +412,7 @@ impl Session {
                     subgroup_size: self.gpu.capabilities().cooperative_matrix.subgroup_size,
                 };
                 if candidate != class.initial && candidate.fits(&class.key) {
-                    class.challengers.insert(0, candidate);
+                    class.challengers.push(candidate);
                 }
             }
         }
