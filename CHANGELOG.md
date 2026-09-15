@@ -8,10 +8,12 @@
   headers in their own region. The block *order* already agreed, since packing
   performs the `[K, N]` transpose that GGUF's layout implies. See
   `examples/gguf_info.rs`.
-- Native GGML K-quant storage: `DType::Q4K` / `Graph::parameter_q4k` and
-  `DType::Q6K` / `Graph::parameter_q6k`. Superblocks are stored byte-for-byte
-  as GGUF writes them, so loading copies nothing and the tiled matmul and
-  K-split GEMV shaders decode them directly.
+- Native GGML K-quant storage: `Q4K`, `Q6K`, `Q5K` and `Q3K`, each with a
+  `DType` and a `Graph::parameter_q*k` constructor. Superblocks are stored
+  byte-for-byte as GGUF writes them, so loading copies nothing and the tiled
+  matmul and K-split GEMV shaders decode them directly. That covers the
+  K-quant mixes end to end — a `Q4_K_M`, `Q5_K_M` or `Q3_K_M` file now reaches
+  the GPU without a single requantize.
 
   Q4_K reads 10% less weight data than Meganeura Q4 (4.5 bits/weight against
   5.0), because it quantizes its own sub-block scales to 6 bits instead of
@@ -21,9 +23,16 @@
   on Q4_K: quantizing an already-quantized weight roughly doubles the error,
   since each stage contributes its own half-step.
 
-  Q6_K's 210-byte superblocks are not a whole number of words, so they
-  alternate word alignment and the shader reads every field byte-addressed;
-  buffers get a zero-padded tail while the superblocks stay verbatim.
+  Q5_K is Q4_K plus one bit: the 5-bit quant is the nibble with `qh`'s bit
+  for that sub-block contributing 16, at 5.5 bits/weight. Q3_K is the
+  smallest at 3.44, and the only one whose high bit is *inverted* — a clear
+  `hmask` bit subtracts 4 — with its own 6-bit scale shuffle rather than
+  `get_scale_min_k4`.
+
+  Q6_K's 210-byte superblocks and Q3_K's 110-byte ones are not whole numbers
+  of words, so they alternate word alignment and the shader reads every field
+  byte-addressed; buffers get a zero-padded tail while the superblocks stay
+  verbatim. Q4_K (144) and Q5_K (176) need no tail.
 
   Block scales decode with `unpack2x16float`, so subnormals survive — an
   imported `0x0100` is 2^-16, an ordinary f32, and the hand-assembled

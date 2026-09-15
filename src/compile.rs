@@ -20,11 +20,20 @@ pub enum WeightFormat {
     /// GGML Q6_K: 256-element superblocks with signed 8-bit sub-block
     /// scales. Load-only; see [`crate::graph::DType::Q6K`].
     Q6K,
+    /// GGML Q5_K: 256-element superblocks, nibble plus a high bit.
+    /// Load-only; see [`crate::graph::DType::Q5K`].
+    Q5K,
+    /// GGML Q3_K: 256-element superblocks, 2-bit quants with an inverted
+    /// high bit. Load-only; see [`crate::graph::DType::Q3K`].
+    Q3K,
 }
 
 impl WeightFormat {
     pub fn is_quantized(self) -> bool {
-        matches!(self, Self::Q4 | Self::Q8 | Self::Q4K | Self::Q6K)
+        matches!(
+            self,
+            Self::Q4 | Self::Q8 | Self::Q4K | Self::Q6K | Self::Q5K | Self::Q3K
+        )
     }
 
     /// Uses a B-buffer representation other than ordinary IEEE f32.
@@ -43,6 +52,8 @@ impl WeightFormat {
             DType::Q8_0 => Self::Q8,
             DType::Q4K => Self::Q4K,
             DType::Q6K => Self::Q6K,
+            DType::Q5K => Self::Q5K,
+            DType::Q3K => Self::Q3K,
             _ => Self::F32,
         }
     }

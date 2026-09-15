@@ -1177,6 +1177,18 @@ fn matmul_vars_tiled(
             "dequant_q6k(b_row, b_col)".to_string(),
             format!("{F16_DECODE_FN}{Q6K_DEQUANT_FN}"),
         ),
+        WeightFormat::Q5K => (
+            "",
+            "array<u32>",
+            "dequant_q5k(b_row, b_col)".to_string(),
+            format!("{F16_DECODE_FN}{Q5K_DEQUANT_FN}"),
+        ),
+        WeightFormat::Q3K => (
+            "",
+            "array<u32>",
+            "dequant_q3k(b_row, b_col)".to_string(),
+            format!("{F16_DECODE_FN}{Q3K_DEQUANT_FN}"),
+        ),
     };
     // Nibble-packed large tile: 32×64 B tile, 256 threads → each thread owns
     // 8 consecutive K of one column, which share a block header and, for Q4,
@@ -1185,6 +1197,8 @@ fn matmul_vars_tiled(
         WeightFormat::Q4 if tile == MatMulTile::Large => Some("dequant_q4_pack8"),
         WeightFormat::Q4K if tile == MatMulTile::Large => Some("dequant_q4k_pack8"),
         WeightFormat::Q6K if tile == MatMulTile::Large => Some("dequant_q6k_pack8"),
+        WeightFormat::Q5K if tile == MatMulTile::Large => Some("dequant_q5k_pack8"),
+        WeightFormat::Q3K if tile == MatMulTile::Large => Some("dequant_q3k_pack8"),
         _ => None,
     };
     let b_stage_body = if let Some(pack8) = pack8 {
@@ -1474,6 +1488,146 @@ fn dequant_q6k_pack8(k_base: u32, n_idx: u32) -> array<f32, 8> {
     var out: array<f32, 8>;
     for (var i = 0u; i < 8u; i++) {
         out[i] = scale * f32(q6k_quant(byte_base, e + i));
+    }
+    return out;
+}
+";
+
+/// GGML Q5_K dequantization, reading GGUF's bytes verbatim.
+///
+/// [`Q4K_DEQUANT_FN`] plus one bit. A 256-element superblock is 44 u32s:
+/// `[d|dmin]`, three words of eight 6-bit scale/min pairs, eight words of
+/// high bits, then 32 words of nibbles. The 5-bit quant is the nibble with
+/// `qh`'s bit for this sub-block contributing 16, so the value is
+/// `d * sc_j * (nibble + 16*bit) - dmin * m_j`.
+///
+/// The scale packing is `get_scale_min_k4`, identical to Q4_K. The high
+/// bit lives at `qh[l] >> (e / 32)`, where `l` is the element's position
+/// within its 32-element stride — `qh` is indexed by `l` alone and shared
+/// across all four 64-element spans, which is why the bit index is the
+/// sub-block number rather than an offset into `qh`.
+const Q5K_DEQUANT_FN: &str = "
+fn q5k_byte(base: u32, off: u32) -> u32 {
+    let w = matrix_b[base + off / 4u];
+    return (w >> ((off % 4u) * 8u)) & 0xFFu;
+}
+
+fn q5k_scale_min(base: u32, j: u32) -> vec2<f32> {
+    var sc: u32;
+    var mn: u32;
+    if j < 4u {
+        sc = q5k_byte(base, 4u + j) & 63u;
+        mn = q5k_byte(base, 8u + j) & 63u;
+    } else {
+        let hi = q5k_byte(base, j + 8u);
+        sc = (hi & 0xFu) | ((q5k_byte(base, j) >> 6u) << 4u);
+        mn = (hi >> 4u) | ((q5k_byte(base, 4u + j) >> 6u) << 4u);
+    }
+    return vec2<f32>(f32(sc), f32(mn));
+}
+
+// The 5-bit quant for element `e`: nibble from qs, plus 16 if this
+// sub-block's bit is set in qh.
+fn q5k_quant(base: u32, e: u32) -> u32 {
+    let l = e % 32u;
+    let byte = q5k_byte(base, 48u + (e / 64u) * 32u + l);
+    let nib = select(byte >> 4u, byte & 0xFu, (e % 64u) < 32u);
+    let hi = (q5k_byte(base, 16u + l) >> (e / 32u)) & 1u;
+    return nib + hi * 16u;
+}
+
+fn dequant_q5k(k_idx: u32, n_idx: u32) -> f32 {
+    let base = (n_idx * (params.k / 256u) + k_idx / 256u) * 44u;
+    let hdr = decode_f16_pair(matrix_b[base]);
+    let e = k_idx % 256u;
+    let sm = q5k_scale_min(base, e / 32u);
+    return hdr.x * sm.x * f32(q5k_quant(base, e)) - hdr.y * sm.y;
+}
+
+fn dequant_q5k_pack8(k_base: u32, n_idx: u32) -> array<f32, 8> {
+    // Eight 8-aligned elements share a sub-block, so the header and the
+    // scale pair are read once. The payload stays per element: the nibble
+    // and its high bit come from two separate regions.
+    let base = (n_idx * (params.k / 256u) + k_base / 256u) * 44u;
+    let hdr = decode_f16_pair(matrix_b[base]);
+    let e = k_base % 256u;
+    let sm = q5k_scale_min(base, e / 32u);
+    let scale = hdr.x * sm.x;
+    let offset = hdr.y * sm.y;
+    var out: array<f32, 8>;
+    for (var i = 0u; i < 8u; i++) {
+        out[i] = scale * f32(q5k_quant(base, e + i)) - offset;
+    }
+    return out;
+}
+";
+
+/// GGML Q3_K dequantization, reading GGUF's bytes verbatim.
+///
+/// A 256-element superblock is 110 bytes: 32 bytes of `hmask`, 64 bytes of
+/// 2-bit quants, 12 bytes of packed 6-bit scales, and an f16 `d`. Like
+/// Q6_K that is not a whole number of words, so every field is read
+/// byte-addressed off a byte base.
+///
+/// Two things here have no analogue in the other K-quants. The high bit is
+/// **inverted** — a *clear* `hmask` bit subtracts 4 — so the quant is
+/// `(qs >> 2j) & 3` minus 4 unless the bit is set. And the sixteen 6-bit
+/// scales are not `get_scale_min_k4`: they come from a shuffle of the 12
+/// bytes that pairs each low or high nibble with two bits drawn from the
+/// last four bytes, then biases by 32.
+const Q3K_DEQUANT_FN: &str = "
+fn q3k_byte(byte_base: u32, off: u32) -> u32 {
+    let at = byte_base + off;
+    return (matrix_b[at / 4u] >> ((at % 4u) * 8u)) & 0xFFu;
+}
+
+// Scale `i` of sixteen, biased by 32. Mirrors the kmask1/kmask2 shuffle in
+// dequantize_row_q3_K: groups 0 and 1 take low nibbles of scales[0..8],
+// groups 2 and 3 the high nibbles, and each borrows two more bits from
+// scales[8..12].
+fn q3k_scale(byte_base: u32, i: u32) -> f32 {
+    let b = i % 4u;
+    let g = i / 4u;
+    let src = select(4u + b, b, (g % 2u) == 0u);
+    let raw = q3k_byte(byte_base, 96u + src);
+    let nib = select(raw >> 4u, raw & 0xFu, g < 2u);
+    let hi = (q3k_byte(byte_base, 96u + 8u + b) >> (g * 2u)) & 3u;
+    return f32(i32(nib | (hi << 4u)) - 32);
+}
+
+fn q3k_value(byte_base: u32, e: u32, d: f32) -> f32 {
+    let h = e / 128u;
+    let rem = e % 128u;
+    let j = rem / 32u;
+    let within = rem % 32u;
+    let half = within / 16u;
+    let l = half * 16u + within % 16u;
+    let q = (q3k_byte(byte_base, 32u + h * 32u + l) >> (j * 2u)) & 3u;
+    // hmask is shared across halves and strides; the bit selects which.
+    let hbit = (q3k_byte(byte_base, l) >> (h * 4u + j)) & 1u;
+    let v = i32(q) - select(4, 0, hbit == 1u);
+    return d * q3k_scale(byte_base, h * 8u + j * 2u + half) * f32(v);
+}
+
+fn dequant_q3k(k_idx: u32, n_idx: u32) -> f32 {
+    let byte_base = (n_idx * (params.k / 256u) + k_idx / 256u) * 110u;
+    let lo = q3k_byte(byte_base, 108u);
+    let hi = q3k_byte(byte_base, 109u);
+    return q3k_value(byte_base, k_idx % 256u, decode_f16(lo | (hi << 8u)));
+}
+
+fn dequant_q3k_pack8(k_base: u32, n_idx: u32) -> array<f32, 8> {
+    // Eight 8-aligned elements share a superblock and a 16-element scale
+    // group, so the f16 decode happens once. The payload stays per
+    // element: qs and hmask live in separate regions.
+    let byte_base = (n_idx * (params.k / 256u) + k_base / 256u) * 110u;
+    let lo = q3k_byte(byte_base, 108u);
+    let hi = q3k_byte(byte_base, 109u);
+    let d = decode_f16(lo | (hi << 8u));
+    let e = k_base % 256u;
+    var out: array<f32, 8>;
+    for (var i = 0u; i < 8u; i++) {
+        out[i] = q3k_value(byte_base, e + i, d);
     }
     return out;
 }
@@ -2015,6 +2169,8 @@ fn packed_decoder(mode: WeightFormat) -> Option<(&'static str, &'static str)> {
         WeightFormat::Q8 => Some((Q8_DEQUANT_FN, "dequant_q8")),
         WeightFormat::Q4K => Some((Q4K_DEQUANT_FN, "dequant_q4k")),
         WeightFormat::Q6K => Some((Q6K_DEQUANT_FN, "dequant_q6k")),
+        WeightFormat::Q5K => Some((Q5K_DEQUANT_FN, "dequant_q5k")),
+        WeightFormat::Q3K => Some((Q3K_DEQUANT_FN, "dequant_q3k")),
         _ => None,
     }
 }
@@ -6646,6 +6802,8 @@ mod tests {
             (WeightFormat::Q8, "dequant_q8("),
             (WeightFormat::Q4K, "dequant_q4k("),
             (WeightFormat::Q6K, "dequant_q6k("),
+            (WeightFormat::Q5K, "dequant_q5k("),
+            (WeightFormat::Q3K, "dequant_q3k("),
         ] {
             for group in [ShaderGroup::MatMulGemv, ShaderGroup::MatMulGemvAdd] {
                 let source = generate_module_weighted(group, format).source;
@@ -6799,6 +6957,47 @@ mod tests {
     /// `[K, N]` weight and different axes for a transposed `[N, K]` one, so
     /// no block format has a correct reading on the BT groups — Q4 and Q8
     /// included, whose arms here were dead and wrong rather than unused.
+    /// Q5_K and Q3_K read GGUF bytes directly, so the shader must declare
+    /// B as words and carry each format's own superblock stride.
+    #[test]
+    fn new_k_quant_shaders_read_packed_superblocks() {
+        for (mode, decoder, stride) in [
+            (WeightFormat::Q5K, "dequant_q5k", "44u"),
+            (WeightFormat::Q3K, "dequant_q3k", "110u"),
+        ] {
+            for group in [
+                ShaderGroup::MatMul,
+                ShaderGroup::MatMulAdd,
+                ShaderGroup::MatMulAT,
+            ] {
+                let sm = generate_module_weighted(group, mode);
+                assert!(
+                    sm.source.contains(decoder),
+                    "{mode:?} {group:?}: missing the superblock decoder"
+                );
+                assert!(
+                    sm.source.contains("array<u32>") && !sm.source.contains("matrix_b: array<f32>"),
+                    "{mode:?} {group:?}: B must be words, not floats"
+                );
+                assert!(
+                    sm.source.contains(stride),
+                    "{mode:?} {group:?}: missing the superblock stride"
+                );
+            }
+            let tiled = generate_module_weighted(ShaderGroup::MatMul, mode);
+            assert!(
+                tiled.source.contains(&format!("{decoder}_pack8")),
+                "{mode:?} tiled MatMul must use batched staging"
+            );
+        }
+        // Q3_K's high bit is inverted: a clear hmask bit subtracts 4.
+        let q3 = generate_module_weighted(ShaderGroup::MatMul, WeightFormat::Q3K);
+        assert!(
+            q3.source.contains("select(4, 0, hbit == 1u)"),
+            "Q3_K must subtract 4 when the hmask bit is clear"
+        );
+    }
+
     #[test]
     fn quantized_formats_refuse_transposed_b() {
         for group in [ShaderGroup::MatMulBT, ShaderGroup::MatMulBTAdd] {
@@ -6807,6 +7006,8 @@ mod tests {
                 WeightFormat::Q8,
                 WeightFormat::Q4K,
                 WeightFormat::Q6K,
+                WeightFormat::Q5K,
+                WeightFormat::Q3K,
             ] {
                 let caught = std::panic::catch_unwind(|| {
                     let _ = generate_module_weighted(group, mode);
