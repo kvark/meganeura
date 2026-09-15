@@ -1169,7 +1169,7 @@ fn matmul_vars_tiled(
             "",
             "array<u32>",
             "dequant_q4k(b_row, b_col)".to_string(),
-            format!("{F16_DECODE_FN}{Q4K_DEQUANT_FN}"),
+            format!("{F16_DECODE_FN}{K_SCALE_MIN_FN}{Q4K_DEQUANT_FN}"),
         ),
         WeightFormat::Q6K => (
             "",
@@ -1181,7 +1181,7 @@ fn matmul_vars_tiled(
             "",
             "array<u32>",
             "dequant_q5k(b_row, b_col)".to_string(),
-            format!("{F16_DECODE_FN}{Q5K_DEQUANT_FN}"),
+            format!("{F16_DECODE_FN}{K_SCALE_MIN_FN}{Q5K_DEQUANT_FN}"),
         ),
         WeightFormat::Q3K => (
             "",
@@ -1344,6 +1344,31 @@ fn dequant_q4_pack8(k_base: u32, n_idx: u32) -> array<f32, 8> {
 }
 ";
 
+/// The `get_scale_min_k4` scale/min decoder, shared by Q4_K and Q5_K.
+///
+/// Both store eight 6-bit pairs in twelve bytes the same way, and both
+/// have word-aligned superblocks, so the byte reader is word-indexed.
+const K_SCALE_MIN_FN: &str = "
+fn kq_byte(base: u32, off: u32) -> u32 {
+    let w = matrix_b[base + off / 4u];
+    return (w >> ((off % 4u) * 8u)) & 0xFFu;
+}
+
+fn kq_scale_min(base: u32, j: u32) -> vec2<f32> {
+    var sc: u32;
+    var mn: u32;
+    if j < 4u {
+        sc = kq_byte(base, 4u + j) & 63u;
+        mn = kq_byte(base, 8u + j) & 63u;
+    } else {
+        let hi = kq_byte(base, j + 8u);
+        sc = (hi & 0xFu) | ((kq_byte(base, j) >> 6u) << 4u);
+        mn = (hi >> 4u) | ((kq_byte(base, 4u + j) >> 6u) << 4u);
+    }
+    return vec2<f32>(f32(sc), f32(mn));
+}
+";
+
 /// GGML Q4_K dequantization, reading GGUF's bytes verbatim.
 ///
 /// A 256-element superblock is 36 u32s: `[d|dmin]`, three words of eight
@@ -1357,33 +1382,14 @@ fn dequant_q4_pack8(k_base: u32, n_idx: u32) -> array<f32, 8> {
 /// span the low nibbles feed the first 32 elements and the high nibbles
 /// the second.
 const Q4K_DEQUANT_FN: &str = "
-fn q4k_byte(base: u32, off: u32) -> u32 {
-    let w = matrix_b[base + off / 4u];
-    return (w >> ((off % 4u) * 8u)) & 0xFFu;
-}
-
-fn q4k_scale_min(base: u32, j: u32) -> vec2<f32> {
-    var sc: u32;
-    var mn: u32;
-    if j < 4u {
-        sc = q4k_byte(base, 4u + j) & 63u;
-        mn = q4k_byte(base, 8u + j) & 63u;
-    } else {
-        let hi = q4k_byte(base, j + 8u);
-        sc = (hi & 0xFu) | ((q4k_byte(base, j) >> 6u) << 4u);
-        mn = (hi >> 4u) | ((q4k_byte(base, 4u + j) >> 6u) << 4u);
-    }
-    return vec2<f32>(f32(sc), f32(mn));
-}
-
 fn dequant_q4k(k_idx: u32, n_idx: u32) -> f32 {
     let base = (n_idx * (params.k / 256u) + k_idx / 256u) * 36u;
     let hdr = decode_f16_pair(matrix_b[base]);
     let d = hdr.x;
     let dmin = hdr.y;
     let e = k_idx % 256u;
-    let sm = q4k_scale_min(base, e / 32u);
-    let byte = q4k_byte(base, 16u + (e / 64u) * 32u + e % 32u);
+    let sm = kq_scale_min(base, e / 32u);
+    let byte = kq_byte(base, 16u + (e / 64u) * 32u + e % 32u);
     let q = select(byte >> 4u, byte & 0xFu, (e % 64u) < 32u);
     return d * sm.x * f32(q) - dmin * sm.y;
 }
@@ -1394,7 +1400,7 @@ fn dequant_q4k_pack8(k_base: u32, n_idx: u32) -> array<f32, 8> {
     let d = hdr.x;
     let dmin = hdr.y;
     let e = k_base % 256u;
-    let sm = q4k_scale_min(base, e / 32u);
+    let sm = kq_scale_min(base, e / 32u);
     let scale = d * sm.x;
     let offset = dmin * sm.y;
     // Eight 8-aligned elements share a sub-block and a nibble half, and
@@ -1507,32 +1513,13 @@ fn dequant_q6k_pack8(k_base: u32, n_idx: u32) -> array<f32, 8> {
 /// across all four 64-element spans, which is why the bit index is the
 /// sub-block number rather than an offset into `qh`.
 const Q5K_DEQUANT_FN: &str = "
-fn q5k_byte(base: u32, off: u32) -> u32 {
-    let w = matrix_b[base + off / 4u];
-    return (w >> ((off % 4u) * 8u)) & 0xFFu;
-}
-
-fn q5k_scale_min(base: u32, j: u32) -> vec2<f32> {
-    var sc: u32;
-    var mn: u32;
-    if j < 4u {
-        sc = q5k_byte(base, 4u + j) & 63u;
-        mn = q5k_byte(base, 8u + j) & 63u;
-    } else {
-        let hi = q5k_byte(base, j + 8u);
-        sc = (hi & 0xFu) | ((q5k_byte(base, j) >> 6u) << 4u);
-        mn = (hi >> 4u) | ((q5k_byte(base, 4u + j) >> 6u) << 4u);
-    }
-    return vec2<f32>(f32(sc), f32(mn));
-}
-
 // The 5-bit quant for element `e`: nibble from qs, plus 16 if this
 // sub-block's bit is set in qh.
 fn q5k_quant(base: u32, e: u32) -> u32 {
     let l = e % 32u;
-    let byte = q5k_byte(base, 48u + (e / 64u) * 32u + l);
+    let byte = kq_byte(base, 48u + (e / 64u) * 32u + l);
     let nib = select(byte >> 4u, byte & 0xFu, (e % 64u) < 32u);
-    let hi = (q5k_byte(base, 16u + l) >> (e / 32u)) & 1u;
+    let hi = (kq_byte(base, 16u + l) >> (e / 32u)) & 1u;
     return nib + hi * 16u;
 }
 
@@ -1540,7 +1527,7 @@ fn dequant_q5k(k_idx: u32, n_idx: u32) -> f32 {
     let base = (n_idx * (params.k / 256u) + k_idx / 256u) * 44u;
     let hdr = decode_f16_pair(matrix_b[base]);
     let e = k_idx % 256u;
-    let sm = q5k_scale_min(base, e / 32u);
+    let sm = kq_scale_min(base, e / 32u);
     return hdr.x * sm.x * f32(q5k_quant(base, e)) - hdr.y * sm.y;
 }
 
@@ -1551,7 +1538,7 @@ fn dequant_q5k_pack8(k_base: u32, n_idx: u32) -> array<f32, 8> {
     let base = (n_idx * (params.k / 256u) + k_base / 256u) * 44u;
     let hdr = decode_f16_pair(matrix_b[base]);
     let e = k_base % 256u;
-    let sm = q5k_scale_min(base, e / 32u);
+    let sm = kq_scale_min(base, e / 32u);
     let scale = hdr.x * sm.x;
     let offset = hdr.y * sm.y;
     var out: array<f32, 8>;
@@ -1595,39 +1582,45 @@ fn q3k_scale(byte_base: u32, i: u32) -> f32 {
     return f32(i32(nib | (hi << 4u)) - 32);
 }
 
-fn q3k_value(byte_base: u32, e: u32, d: f32) -> f32 {
+// The 2-bit quant for element `e`, with the inverted high bit applied.
+//
+// `l` is the element's position within its 32-element stride, which is
+// `e % 32` once the half and stride terms cancel; `hmask` is shared across
+// halves and strides, and the bit that selects between them is `e / 32`.
+fn q3k_quant(byte_base: u32, e: u32) -> i32 {
     let h = e / 128u;
-    let rem = e % 128u;
-    let j = rem / 32u;
-    let within = rem % 32u;
-    let half = within / 16u;
-    let l = half * 16u + within % 16u;
+    let j = (e % 128u) / 32u;
+    let l = e % 32u;
     let q = (q3k_byte(byte_base, 32u + h * 32u + l) >> (j * 2u)) & 3u;
-    // hmask is shared across halves and strides; the bit selects which.
-    let hbit = (q3k_byte(byte_base, l) >> (h * 4u + j)) & 1u;
-    let v = i32(q) - select(4, 0, hbit == 1u);
-    return d * q3k_scale(byte_base, h * 8u + j * 2u + half) * f32(v);
+    let hbit = (q3k_byte(byte_base, l) >> (e / 32u)) & 1u;
+    return i32(q) - select(4, 0, hbit == 1u);
+}
+
+fn q3k_d(byte_base: u32) -> f32 {
+    let lo = q3k_byte(byte_base, 108u);
+    let hi = q3k_byte(byte_base, 109u);
+    return decode_f16(lo | (hi << 8u));
 }
 
 fn dequant_q3k(k_idx: u32, n_idx: u32) -> f32 {
     let byte_base = (n_idx * (params.k / 256u) + k_idx / 256u) * 110u;
-    let lo = q3k_byte(byte_base, 108u);
-    let hi = q3k_byte(byte_base, 109u);
-    return q3k_value(byte_base, k_idx % 256u, decode_f16(lo | (hi << 8u)));
+    let e = k_idx % 256u;
+    // One scale per 16 elements.
+    let scale = q3k_d(byte_base) * q3k_scale(byte_base, e / 16u);
+    return scale * f32(q3k_quant(byte_base, e));
 }
 
 fn dequant_q3k_pack8(k_base: u32, n_idx: u32) -> array<f32, 8> {
     // Eight 8-aligned elements share a superblock and a 16-element scale
-    // group, so the f16 decode happens once. The payload stays per
-    // element: qs and hmask live in separate regions.
+    // group, so the f16 decode and the scale shuffle run once for all of
+    // them. The payload stays per element: qs and hmask live in separate
+    // regions.
     let byte_base = (n_idx * (params.k / 256u) + k_base / 256u) * 110u;
-    let lo = q3k_byte(byte_base, 108u);
-    let hi = q3k_byte(byte_base, 109u);
-    let d = decode_f16(lo | (hi << 8u));
     let e = k_base % 256u;
+    let scale = q3k_d(byte_base) * q3k_scale(byte_base, e / 16u);
     var out: array<f32, 8>;
     for (var i = 0u; i < 8u; i++) {
-        out[i] = q3k_value(byte_base, e + i, d);
+        out[i] = scale * f32(q3k_quant(byte_base, e + i));
     }
     return out;
 }
@@ -2007,6 +2000,7 @@ pub fn generate_module_weighted(group: ShaderGroup, format: WeightFormat) -> Sha
         // than the arm.
         ShaderGroup::MatMulGemv | ShaderGroup::MatMulGemvAdd if packed_decoder(mode).is_some() => {
             let (helpers, call) = packed_decoder(mode).unwrap();
+            let helpers = helpers.as_str();
             let src = if group == ShaderGroup::MatMulGemv {
                 include_str!("shaders/matmul_gemv.wgsl")
             } else {
@@ -2163,14 +2157,16 @@ fn gemv_width_source(source: &str, variable: &str, initial: u32) -> String {
 /// per column of a [K, N] weight, so it needs its own index mapping.
 /// The WGSL helper block and scalar entry point for a packed B format,
 /// or `None` for formats the GEMV reads directly.
-fn packed_decoder(mode: WeightFormat) -> Option<(&'static str, &'static str)> {
+fn packed_decoder(mode: WeightFormat) -> Option<(String, &'static str)> {
+    // Q4_K and Q5_K share the `get_scale_min_k4` block, so it is prepended
+    // rather than duplicated in each decoder.
     match mode {
-        WeightFormat::Q4 => Some((Q4_DEQUANT_FN, "dequant_q4")),
-        WeightFormat::Q8 => Some((Q8_DEQUANT_FN, "dequant_q8")),
-        WeightFormat::Q4K => Some((Q4K_DEQUANT_FN, "dequant_q4k")),
-        WeightFormat::Q6K => Some((Q6K_DEQUANT_FN, "dequant_q6k")),
-        WeightFormat::Q5K => Some((Q5K_DEQUANT_FN, "dequant_q5k")),
-        WeightFormat::Q3K => Some((Q3K_DEQUANT_FN, "dequant_q3k")),
+        WeightFormat::Q4 => Some((Q4_DEQUANT_FN.to_string(), "dequant_q4")),
+        WeightFormat::Q8 => Some((Q8_DEQUANT_FN.to_string(), "dequant_q8")),
+        WeightFormat::Q4K => Some((format!("{K_SCALE_MIN_FN}{Q4K_DEQUANT_FN}"), "dequant_q4k")),
+        WeightFormat::Q6K => Some((Q6K_DEQUANT_FN.to_string(), "dequant_q6k")),
+        WeightFormat::Q5K => Some((format!("{K_SCALE_MIN_FN}{Q5K_DEQUANT_FN}"), "dequant_q5k")),
+        WeightFormat::Q3K => Some((Q3K_DEQUANT_FN.to_string(), "dequant_q3k")),
         _ => None,
     }
 }
@@ -6786,8 +6782,8 @@ mod tests {
             );
             if group == ShaderGroup::MatMul {
                 assert!(
-                    sm.source.contains("dequant_q4_pack8"),
-                    "Q4 tiled MatMul must use pack8 B staging"
+                    sm.source.contains("let unpacked = dequant_q4_pack8("),
+                    "Q4 tiled MatMul must call pack8 from its B staging"
                 );
             }
             eprintln!("Q4 {group:?} shader: {} chars", sm.source.len());
@@ -6898,8 +6894,8 @@ mod tests {
         }
         let tiled = generate_module_weighted(ShaderGroup::MatMul, WeightFormat::Q6K);
         assert!(
-            tiled.source.contains("dequant_q6k_pack8"),
-            "Q6_K tiled MatMul must use batched staging"
+            tiled.source.contains("let unpacked = dequant_q6k_pack8("),
+            "Q6_K tiled MatMul must call batched staging"
         );
     }
 
@@ -6929,8 +6925,8 @@ mod tests {
         // unpack; losing that silently falls back to eight scalar decodes.
         let tiled = generate_module_weighted(ShaderGroup::MatMul, WeightFormat::Q4K);
         assert!(
-            tiled.source.contains("dequant_q4k_pack8"),
-            "Q4_K tiled MatMul must use batched staging"
+            tiled.source.contains("let unpacked = dequant_q4k_pack8("),
+            "Q4_K tiled MatMul must call batched staging"
         );
     }
 
@@ -6959,6 +6955,11 @@ mod tests {
     /// included, whose arms here were dead and wrong rather than unused.
     /// Q5_K and Q3_K read GGUF bytes directly, so the shader must declare
     /// B as words and carry each format's own superblock stride.
+    ///
+    /// The batched-staging check looks for the *call*, not the helper name:
+    /// the decoder block always declares `fn dequant_*_pack8`, so a
+    /// `contains` on the name alone stays true even when the staging
+    /// selector has dropped the format back to the scalar path.
     #[test]
     fn new_k_quant_shaders_read_packed_superblocks() {
         for (mode, decoder, stride) in [
@@ -6986,8 +6987,10 @@ mod tests {
             }
             let tiled = generate_module_weighted(ShaderGroup::MatMul, mode);
             assert!(
-                tiled.source.contains(&format!("{decoder}_pack8")),
-                "{mode:?} tiled MatMul must use batched staging"
+                tiled
+                    .source
+                    .contains(&format!("let unpacked = {decoder}_pack8(")),
+                "{mode:?} tiled MatMul must call batched staging"
             );
         }
         // Q3_K's high bit is inverted: a clear hmask bit subtracts 4.

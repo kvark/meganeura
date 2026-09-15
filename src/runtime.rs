@@ -4643,40 +4643,30 @@ fn scatter_packed_concat_columns(
             let off = col_offset * bpc * 36;
             dest[off..off + nbytes].copy_from_slice(src);
         }
-        crate::compile::WeightFormat::Q4K => {
+        // The native K-quants differ only in superblock stride. Each
+        // source arrives padded to a word, but that tail belongs at the
+        // end of the whole parameter, not between two sources' blocks —
+        // so only the unpadded span is copied. Q4_K (144) and Q5_K (176)
+        // have no tail to strip; Q6_K (210) and Q3_K (110) do.
+        fmt @ (crate::compile::WeightFormat::Q4K
+        | crate::compile::WeightFormat::Q5K
+        | crate::compile::WeightFormat::Q6K
+        | crate::compile::WeightFormat::Q3K) => {
             assert!(rows.is_multiple_of(256));
+            let stride = match fmt {
+                crate::compile::WeightFormat::Q4K => 144,
+                crate::compile::WeightFormat::Q5K => 176,
+                crate::compile::WeightFormat::Q6K => 210,
+                _ => 110,
+            };
             let bpc = rows / 256;
-            let nbytes = bpc * src_cols * 144;
-            assert_eq!(src.len(), nbytes);
-            let off = col_offset * bpc * 144;
-            dest[off..off + nbytes].copy_from_slice(src);
-        }
-        crate::compile::WeightFormat::Q6K => {
-            assert!(rows.is_multiple_of(256));
-            let bpc = rows / 256;
-            let unpadded = bpc * src_cols * 210;
-            assert!(src.len() >= unpadded);
-            let off = col_offset * bpc * 210;
-            dest[off..off + unpadded].copy_from_slice(&src[..unpadded]);
-        }
-        crate::compile::WeightFormat::Q5K => {
-            // 176 bytes is a whole number of words, so superblocks
-            // concatenate without a padding seam, as for Q4_K.
-            assert!(rows.is_multiple_of(256));
-            let bpc = rows / 256;
-            let nbytes = bpc * src_cols * 176;
-            assert_eq!(src.len(), nbytes);
-            let off = col_offset * bpc * 176;
-            dest[off..off + nbytes].copy_from_slice(src);
-        }
-        crate::compile::WeightFormat::Q3K => {
-            // 110 bytes is not, so each source carries a word-alignment
-            // tail that must not land between superblocks.
-            assert!(rows.is_multiple_of(256));
-            let bpc = rows / 256;
-            let unpadded = bpc * src_cols * 110;
-            assert!(src.len() >= unpadded);
-            let off = col_offset * bpc * 110;
+            let unpadded = bpc * src_cols * stride;
+            assert_eq!(
+                src.len(),
+                unpadded.next_multiple_of(4),
+                "{fmt:?} source should be its superblocks padded to a word"
+            );
+            let off = col_offset * bpc * stride;
             dest[off..off + unpadded].copy_from_slice(&src[..unpadded]);
         }
         crate::compile::WeightFormat::Q4 => {
@@ -4823,6 +4813,72 @@ mod q4_tests {
         );
         assert_eq!(&dest[..210], &left[..]);
         assert_eq!(&dest[210..], &right[..]);
+    }
+
+    /// Q3_K's stride is 110, so two `[256, 1]` sources pad to 112 each but
+    /// the combined `[256, 2]` parameter is 220 bytes, not 224. Upload
+    /// order must not matter, and replacing one source must leave the
+    /// other intact.
+    #[test]
+    fn q3k_packed_concat_sizes_the_pair_without_inner_padding() {
+        use crate::compile::WeightFormat;
+        use crate::graph::{DType, TensorType};
+
+        let combined = TensorType::new(vec![256, 2], DType::Q3K).size_bytes();
+        assert_eq!(combined, 220, "two 110-byte superblocks, already a word");
+        assert_eq!(
+            TensorType::new(vec![256, 1], DType::Q3K).size_bytes(),
+            112,
+            "a lone superblock pads to a word"
+        );
+
+        let left = vec![1u8; 110];
+        let right = vec![2u8; 110];
+        let pad = |src: &[u8]| {
+            let mut v = src.to_vec();
+            v.resize(src.len().next_multiple_of(4), 0);
+            v
+        };
+
+        // Right first, then left: order must not matter.
+        let mut dest = vec![0u8; combined];
+        for (src, col) in [(&right, 1usize), (&left, 0usize)] {
+            scatter_packed_concat_columns(&mut dest, &pad(src), WeightFormat::Q3K, 256, 1, 2, col);
+        }
+        assert_eq!(&dest[..110], &left[..]);
+        assert_eq!(&dest[110..], &right[..]);
+
+        // Replacing one source leaves the other alone.
+        let replacement = vec![3u8; 110];
+        scatter_packed_concat_columns(
+            &mut dest,
+            &pad(&replacement),
+            WeightFormat::Q3K,
+            256,
+            1,
+            2,
+            0,
+        );
+        assert_eq!(&dest[..110], &replacement[..]);
+        assert_eq!(&dest[110..], &right[..], "the other column must survive");
+    }
+
+    /// Q5_K's 176-byte stride is already a word, so its sources carry no
+    /// tail and concatenate seamlessly.
+    #[test]
+    fn q5k_packed_concat_has_no_padding_seam() {
+        use crate::compile::WeightFormat;
+        use crate::graph::{DType, TensorType};
+
+        assert_eq!(TensorType::new(vec![256, 2], DType::Q5K).size_bytes(), 352);
+        let left = vec![4u8; 176];
+        let right = vec![5u8; 176];
+        let mut dest = vec![0u8; 352];
+        for (src, col) in [(&left, 0usize), (&right, 1usize)] {
+            scatter_packed_concat_columns(&mut dest, src, WeightFormat::Q5K, 256, 1, 2, col);
+        }
+        assert_eq!(&dest[..176], &left[..]);
+        assert_eq!(&dest[176..], &right[..]);
     }
 }
 

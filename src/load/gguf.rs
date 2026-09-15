@@ -1759,26 +1759,47 @@ mod tests {
         assert_eq!(&packed[..210], &block[..]);
     }
 
-    /// Q5_K is Q4_K's nibble plus a `qh` bit worth 16. Hand-computed, with
-    /// the bit set for one element and clear for its neighbour so the
-    /// per-sub-block bit index is pinned rather than assumed.
+    /// Q5_K is Q4_K's nibble plus a `qh` bit worth 16, and the bit index is
+    /// the sub-block number rather than a position within `qh`.
+    ///
+    /// Every asserted element has a nonzero scale, so a decoder that read
+    /// the wrong `qh` bit cannot hide behind a zero. Sub-block 7 also uses
+    /// a scale above 15, which exercises the `j >= 4` packing that borrows
+    /// its high two bits from the `j < 4` entries.
     #[test]
     fn q5_k_dequantizes_against_hand_computed_values() {
-        let sc = [2u8, 0, 0, 0, 0, 0, 0, 0];
-        let mn = [1u8, 0, 0, 0, 0, 0, 0, 0];
+        let mut sc = [0u8; 8];
+        let mut mn = [0u8; 8];
+        sc[0] = 2;
+        mn[0] = 1;
+        sc[1] = 2;
+        mn[1] = 1;
+        sc[7] = 35;
+        mn[7] = 20;
+
         let mut block = vec![0u8; 176];
         block[0..2].copy_from_slice(&f16_to_bits(1.0).to_le_bytes()); // d
         block[2..4].copy_from_slice(&f16_to_bits(1.0).to_le_bytes()); // dmin
+
+        // Inverse of `get_scale_min_k4`, written from the C.
         let scales = &mut block[4..16];
         for j in 0..4 {
             scales[j] = sc[j] & 63;
             scales[j + 4] = mn[j] & 63;
         }
-        // qs[0] feeds elements 0 (low nibble) and 32 (high nibble).
+        for j in 4..8 {
+            scales[j + 4] = (sc[j] & 0x0F) | ((mn[j] & 0x0F) << 4);
+            scales[j - 4] |= (sc[j] >> 4) << 6;
+            scales[j] |= (mn[j] >> 4) << 6;
+        }
+
+        // qh[0] carries one bit per sub-block: bit 0 set (element 0), bit 1
+        // clear (element 32), bit 7 set (element 224).
+        block[16] = 0b1000_0001;
+        // qs[0] feeds elements 0 (low) and 32 (high) of the first span.
         block[48] = 3 | (5 << 4);
-        // qh[0] bit 0 belongs to sub-block 0, bit 1 to sub-block 1. Set
-        // only bit 0, so element 0 gains 16 and element 32 does not.
-        block[16] = 0b01;
+        // qs[96] feeds elements 192 (low) and 224 (high) of the fourth.
+        block[48 + 96] = 6 << 4;
 
         let bytes = Builder::new()
             .tensor("w", &[256, 1], GgmlType::Q5K, &block)
@@ -1786,10 +1807,22 @@ mod tests {
         let m = load_gguf_bytes(&bytes).unwrap();
         let f = m.tensors["w"].to_f32().unwrap();
 
-        // element 0: sub-block 0, sc=2, m=1, q = 3 + 16 -> 2*19 - 1
-        assert!((f[0] - 37.0).abs() < 1e-3, "got {}", f[0]);
-        // element 32: sub-block 1, sc=0, m=0, q = 5 + 0 -> 0
-        assert!((f[32] - 0.0).abs() < 1e-3, "got {}", f[32]);
+        // d = dmin = 1, so value = sc_j * (nibble + 16*bit) - m_j.
+        for (idx, want) in [
+            // sub-block 0: nibble 3, bit set   -> 2*19 - 1
+            (0usize, 37.0f32),
+            // sub-block 1: nibble 5, bit clear -> 2*5 - 1. A decoder stuck
+            // on bit 0 would read 21 here and give 41.
+            (32, 9.0),
+            // sub-block 7: nibble 6, bit set   -> 35*22 - 20
+            (224, 750.0),
+        ] {
+            assert!(
+                (f[idx] - want).abs() < 1e-3,
+                "element {idx}: got {}, want {want}",
+                f[idx]
+            );
+        }
     }
 
     /// Q3_K's high bit is inverted — a *clear* `hmask` bit subtracts 4 —
