@@ -140,6 +140,16 @@ driver peak memory.
 
 Pretrained models can be loaded from ONNX or NNEF via `meganeura::load_onnx(...)` / `meganeura::load_nnef(...)`. Both lower through Meganeura’s IR, so the same graph rewrites apply to imported graphs and hand-built ones. GGUF files are a weight-and-metadata container rather than a graph: `meganeura::load_gguf(...)` yields named tensors; packed weights use `Session::set_parameter_packed`, while unpacked weights use `to_f32` and `set_parameter` (see `examples/gguf_info.rs`).
 
+GGUF quantized weights are imported without a requantize. `Q4_0`, `Q4_1` and
+`Q8_0` are repacked into Meganeura's own block layout on the host; the
+K-quants — `Q4_K`, `Q5_K`, `Q6_K` and `Q3_K` — are stored byte-for-byte as
+GGML writes them and decoded in the shaders, so the weights of a `Q3_K_M`,
+`Q4_K_M` or `Q5_K_M` file load as-is. These are load-only formats: no
+K-quant encoder is implemented here, so `set_parameter` rejects them and
+points at `set_parameter_packed`. `Q2_K` and `Q8_K` are listed in the
+inventory but not read, and quantized embedding tables have no gather
+variant.
+
 ## System requirements
 
 Meganeura runs best when the selected driver exposes hardware-accelerated

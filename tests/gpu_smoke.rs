@@ -3628,47 +3628,118 @@ fn assert_gguf_packed_matmul(
     );
 }
 
-/// The Q4_K shader against the loader's CPU reference, which is itself
-/// checked line-by-line against `dequantize_row_q4_K` in ggml-quants.c.
-///
-/// Q4_K is read straight out of a GGUF file with no repack, so a mistake in
-/// the WGSL — the `get_scale_min_k4` bit twiddling especially — would show up
-/// as plausible-looking weights rather than an error.
+/// Every native K-quant refuses the two things it cannot do, in one test
+/// rather than one per format: there is no host encoder, so `set_parameter`
+/// must send callers to `set_parameter_packed`; and blocks run along the
+/// parameter's first dimension while decoders index along K, so a
+/// transposed B has no correct reading.
 #[test]
-fn q4k_matmul_matches_ggml_reference() {
-    use meganeura::load::gguf::{GgmlType, GgufTensor};
+fn k_quants_are_load_only_and_refuse_transposed_b() {
+    use meganeura::graph::DType;
 
-    // K = 512 (two superblocks per column), N = 4.
-    let (m, k, n) = (3usize, 512usize, 4usize);
-    let mut data = Vec::new();
-    for s in 0..(k / 256 * n) {
-        data.extend_from_slice(&q4k_superblock(s as u32 + 1));
+    // Quiet the per-case backtraces; the assertions below report failures.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+
+    let build = |g: &mut Graph, dtype: DType, name: &str, shape: &[usize]| match dtype {
+        DType::Q4K => g.parameter_q4k(name, shape),
+        DType::Q5K => g.parameter_q5k(name, shape),
+        DType::Q6K => g.parameter_q6k(name, shape),
+        DType::Q3K => g.parameter_q3k(name, shape),
+        other => panic!("unexpected dtype {other:?}"),
+    };
+
+    let mut failures = Vec::new();
+    for dtype in [DType::Q4K, DType::Q5K, DType::Q6K, DType::Q3K] {
+        let (k, n) = (256usize, 4usize);
+
+        // No host encoder: f32 upload must be refused.
+        let upload = std::panic::catch_unwind(|| {
+            let mut g = Graph::new();
+            let x = g.input("x", &[1, k]);
+            let w = build(&mut g, dtype, "w", &[k, n]);
+            let out = g.matmul(x, w);
+            g.set_outputs(vec![out]);
+            let mut session =
+                meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+            session.set_parameter("w", &vec![0.1f32; k * n]);
+        });
+        if upload.is_ok() {
+            failures.push(format!("{dtype:?}: set_parameter should have been refused"));
+        }
+
+        // Transposed B has no correct reading for a block format.
+        let bt = std::panic::catch_unwind(|| {
+            let mut g = Graph::new();
+            let x = g.input("x", &[1, 512]);
+            let w = build(&mut g, dtype, "w", &[256, 512]);
+            let out = g.matmul_bt(x, w);
+            g.set_outputs(vec![out]);
+            let _ = meganeura::build(&g, meganeura::SessionConfig::inference_from_env());
+        });
+        if bt.is_ok() {
+            failures.push(format!("{dtype:?}: matmul_bt should have been refused"));
+        }
     }
-    assert_gguf_packed_matmul(
-        "Q4_K tiled",
-        GgufTensor::new(vec![k, n], GgmlType::Q4K, data),
-        m,
-        1e-5,
-    );
+
+    std::panic::set_hook(previous);
+    assert!(failures.is_empty(), "{failures:#?}");
 }
 
-/// The K-split GEMV takes a different shader from the tiled path, and it is
-/// the one decode actually runs.
+/// Every GGUF packed weight format against the loader's CPU references,
+/// which are themselves written from `ggml-quants.c`.
+///
+/// One test rather than one per format and shape: these all exercise the
+/// same decode-and-multiply path, and the per-case label says which row
+/// failed. The shapes cover what actually differs —
+///
+/// * `tiled` — the batched-staging path, one output tile.
+/// * `GEMV` — `m = 1`, the separate K-split shader decode runs.
+/// * `multi-tile` — 65 x 512 x 68, past one 64x64 tile in both M and N and
+///   two superblocks deep in K, so tile offsets and K-block progression are
+///   exercised rather than a single tile.
+/// * `odd pad` — an odd superblock count for the formats whose blocks are
+///   not a whole number of words, so half of them start at byte 2 and the
+///   buffer needs a tail.
 #[test]
-fn q4k_gemv_matches_ggml_reference() {
+fn gguf_packed_matmul_variants_match_ggml_reference() {
     use meganeura::load::gguf::{GgmlType, GgufTensor};
 
-    let (k, n) = (256usize, 8usize);
-    let mut data = Vec::new();
-    for s in 0..(k / 256 * n) {
-        data.extend_from_slice(&q4k_superblock(s as u32 + 41));
+    type Build = fn(u32) -> Vec<u8>;
+    let formats: [(GgmlType, Build, bool); 4] = [
+        (GgmlType::Q4K, q4k_superblock as Build, false),
+        (GgmlType::Q5K, q5k_superblock as Build, false),
+        // 210 and 110 bytes: not whole words, so the odd-count case matters.
+        (GgmlType::Q6K, q6k_superblock as Build, true),
+        (GgmlType::Q3K, q3k_superblock as Build, true),
+    ];
+
+    for (ty, build, unaligned) in formats {
+        // (label, m, k, n)
+        let mut shapes = vec![
+            ("tiled", 3usize, 512usize, 4usize),
+            ("GEMV", 1, 256, 8),
+            ("multi-tile", 65, 512, 68),
+        ];
+        if unaligned {
+            shapes.push(("odd pad", 2, 256, 3));
+        }
+        for (label, m, k, n) in shapes {
+            let mut data = Vec::new();
+            for s in 0..(k / 256 * n) {
+                data.extend_from_slice(&build(s as u32 + 1));
+            }
+            if unaligned && (k / 256 * n) % 2 == 1 {
+                assert_eq!(data.len() % 4, 2, "{ty:?} {label}: expected a ragged tail");
+            }
+            assert_gguf_packed_matmul(
+                &format!("{ty:?} {label}"),
+                GgufTensor::new(vec![k, n], ty, data),
+                m,
+                1e-5,
+            );
+        }
     }
-    assert_gguf_packed_matmul(
-        "Q4_K GEMV",
-        GgufTensor::new(vec![k, n], GgmlType::Q4K, data),
-        1,
-        1e-5,
-    );
 }
 
 /// One Q5_K superblock: a spread of scales and mins, plus full-range
@@ -3715,33 +3786,6 @@ fn q3k_superblock(seed: u32) -> Vec<u8> {
     }
     b[108..110].copy_from_slice(&half::f16::from_f32(0.0042).to_bits().to_le_bytes());
     b
-}
-
-/// A shape big enough to span several output tiles and more than one
-/// K-block, so tile offsets and K progression are exercised rather than a
-/// single tile's worth of the decoder.
-#[test]
-fn k_quants_match_reference_across_multiple_tiles() {
-    use meganeura::load::gguf::{GgmlType, GgufTensor};
-
-    // 65 x 512 x 68: past one 64x64 tile in both M and N, two superblocks
-    // deep in K.
-    let (m, k, n) = (65usize, 512usize, 68usize);
-    for (ty, build) in [
-        (GgmlType::Q5K, q5k_superblock as fn(u32) -> Vec<u8>),
-        (GgmlType::Q3K, q3k_superblock as fn(u32) -> Vec<u8>),
-    ] {
-        let mut data = Vec::new();
-        for s in 0..(k / 256 * n) {
-            data.extend_from_slice(&build(s as u32 + 101));
-        }
-        assert_gguf_packed_matmul(
-            &format!("{ty:?} multi-tile"),
-            GgufTensor::new(vec![k, n], ty, data),
-            m,
-            1e-5,
-        );
-    }
 }
 
 /// The packed SwiGLU concat restages a derived `gate+up` from two uploads.
@@ -3812,107 +3856,6 @@ fn q3k_swiglu_packed_concat_matches_reference() {
     );
 }
 
-/// Q5_K is Q4_K's nibble plus a `qh` bit worth 16, and that bit is indexed
-/// by sub-block rather than by position — the kind of thing a shader gets
-/// subtly wrong while still producing plausible weights.
-#[test]
-fn q5k_matmul_matches_ggml_reference() {
-    use meganeura::load::gguf::{GgmlType, GgufTensor};
-
-    let (m, k, n) = (3usize, 512usize, 4usize);
-    let mut data = Vec::new();
-    for s in 0..(k / 256 * n) {
-        data.extend_from_slice(&q5k_superblock(s as u32 + 3));
-    }
-    assert_gguf_packed_matmul(
-        "Q5_K tiled",
-        GgufTensor::new(vec![k, n], GgmlType::Q5K, data),
-        m,
-        1e-5,
-    );
-}
-
-#[test]
-fn q5k_gemv_matches_ggml_reference() {
-    use meganeura::load::gguf::{GgmlType, GgufTensor};
-
-    let (k, n) = (256usize, 8usize);
-    let mut data = Vec::new();
-    for s in 0..n {
-        data.extend_from_slice(&q5k_superblock(s as u32 + 61));
-    }
-    assert_gguf_packed_matmul(
-        "Q5_K GEMV",
-        GgufTensor::new(vec![k, n], GgmlType::Q5K, data),
-        1,
-        1e-5,
-    );
-}
-
-/// Q3_K has the inverted high bit and its own scale shuffle, and its
-/// 110-byte superblocks alternate word alignment. `n = 3` gives an odd
-/// count so half of them start at byte 2 of a word.
-#[test]
-fn q3k_matmul_matches_ggml_reference() {
-    use meganeura::load::gguf::{GgmlType, GgufTensor};
-
-    let (m, k, n) = (2usize, 256usize, 3usize);
-    let mut data = Vec::new();
-    for s in 0..n {
-        data.extend_from_slice(&q3k_superblock(s as u32 + 11));
-    }
-    assert_eq!(data.len() % 4, 2, "expected a misaligned tail to exercise");
-    assert_gguf_packed_matmul(
-        "Q3_K tiled",
-        GgufTensor::new(vec![k, n], GgmlType::Q3K, data),
-        m,
-        1e-5,
-    );
-}
-
-#[test]
-fn q3k_gemv_matches_ggml_reference() {
-    use meganeura::load::gguf::{GgmlType, GgufTensor};
-
-    let (k, n) = (256usize, 8usize);
-    let mut data = Vec::new();
-    for s in 0..n {
-        data.extend_from_slice(&q3k_superblock(s as u32 + 71));
-    }
-    assert_gguf_packed_matmul(
-        "Q3_K GEMV",
-        GgufTensor::new(vec![k, n], GgmlType::Q3K, data),
-        1,
-        1e-5,
-    );
-}
-
-/// Q5_K and Q3_K are load-only like the other K-quants.
-#[test]
-#[should_panic(expected = "set_parameter_packed")]
-fn q5k_rejects_f32_parameter_upload() {
-    let (k, n) = (256usize, 4usize);
-    let mut g = Graph::new();
-    let x = g.input("x", &[1, k]);
-    let w = g.parameter_q5k("w", &[k, n]);
-    let out = g.matmul(x, w);
-    g.set_outputs(vec![out]);
-    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
-    session.set_parameter("w", &vec![0.1f32; k * n]);
-}
-
-#[test]
-#[should_panic(expected = "does not support block-quantized")]
-fn q3k_matmul_bt_is_refused() {
-    let (k, n) = (512usize, 256usize);
-    let mut g = Graph::new();
-    let x = g.input("x", &[1, k]);
-    let w = g.parameter_q3k("w", &[n, k]);
-    let out = g.matmul_bt(x, w);
-    g.set_outputs(vec![out]);
-    let _ = meganeura::build(&g, meganeura::SessionConfig::inference_from_env());
-}
-
 /// One Q6_K superblock with signed scales spanning both polarities and
 /// quants across the full 6-bit range.
 fn q6k_superblock(seed: u32) -> Vec<u8> {
@@ -3933,51 +3876,6 @@ fn q6k_superblock(seed: u32) -> Vec<u8> {
     }
     b[208..210].copy_from_slice(&half::f16::from_f32(0.0012).to_bits().to_le_bytes());
     b
-}
-
-/// The Q6_K shader against the loader's CPU reference, which is checked
-/// line-by-line against `dequantize_row_q6_K`.
-///
-/// Superblocks are 210 bytes, so they alternate word alignment and every
-/// field is read byte-addressed. An odd superblock count also exercises the
-/// tail padding, since the buffer would otherwise end two bytes short of a
-/// word.
-#[test]
-fn q6k_matmul_matches_ggml_reference() {
-    use meganeura::load::gguf::{GgmlType, GgufTensor};
-
-    // N = 3 gives an odd superblock count, so half of them start at byte 2
-    // of a word and the buffer needs padding.
-    let (m, k, n) = (2usize, 256usize, 3usize);
-    let mut data = Vec::new();
-    for s in 0..(k / 256 * n) {
-        data.extend_from_slice(&q6k_superblock(s as u32 + 7));
-    }
-    assert_eq!(data.len() % 4, 2, "expected a misaligned tail to exercise");
-    assert_gguf_packed_matmul(
-        "Q6_K tiled with an odd superblock count",
-        GgufTensor::new(vec![k, n], GgmlType::Q6K, data),
-        m,
-        1e-5,
-    );
-}
-
-/// The K-split GEMV takes a different shader, and it is what decode runs.
-#[test]
-fn q6k_gemv_matches_ggml_reference() {
-    use meganeura::load::gguf::{GgmlType, GgufTensor};
-
-    let (k, n) = (256usize, 4usize);
-    let mut data = Vec::new();
-    for s in 0..(k / 256 * n) {
-        data.extend_from_slice(&q6k_superblock(s as u32 + 91));
-    }
-    assert_gguf_packed_matmul(
-        "Q6_K GEMV",
-        GgufTensor::new(vec![k, n], GgmlType::Q6K, data),
-        1,
-        1e-5,
-    );
 }
 
 /// A subnormal f16 block scale is an ordinary f32, and must survive.
