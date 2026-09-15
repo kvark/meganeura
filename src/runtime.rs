@@ -3428,10 +3428,22 @@ impl Session {
         // Upload constant buffer data (gradient constants, scale factors, etc.)
         for &(buf_ref, ref data) in &plan.constant_buffers {
             let buffer = &buffers[buf_ref.0 as usize];
+            trace.mark(
+                "constant.upload.before",
+                serde_json::json!({
+                    "logical": buf_ref.0,
+                    "slot": alias.map[buf_ref.0 as usize],
+                    "bytes": data.len() * std::mem::size_of::<f32>(),
+                }),
+            );
             unsafe {
                 let ptr = buffer.data() as *mut f32;
                 std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
             }
+            trace.mark(
+                "constant.upload.after",
+                serde_json::json!({"logical": buf_ref.0}),
+            );
         }
 
         trace.mark("pipelines.before", serde_json::json!({}));
