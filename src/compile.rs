@@ -933,6 +933,14 @@ pub struct Dispatch {
     /// Set by measured selection; None keeps the shared uniform-parameter kernel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conv_k_tile: Option<u32>,
+    /// Workgroup width and cross-lane reduction for a K-split GEMV.
+    ///
+    /// Set by measured selection; None keeps the group's initial shape. Which
+    /// shape wins is a property of the device — how wide its waves are, how
+    /// much a `workgroupBarrier` costs — so it is measured rather than
+    /// predicted. See [`crate::codegen::GemvShape`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gemv_shape: Option<crate::codegen::GemvShape>,
     /// The dispatch belongs to numerically sensitive derivative work and may
     /// not be promoted to a reduced-input-precision implementation. Native
     /// f32 cooperative kernels remain eligible.

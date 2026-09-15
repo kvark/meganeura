@@ -208,15 +208,23 @@ win, so explicit code always has the last word.
 | `MEGANEURA_FLASH_GRAD_KV_EPT_CAP=<n>` | EPT cap for fused flash dK/dV backward. |
 | `MEGANEURA_FLASH_BWD_EPT_CAP=<n>` | Shared fallback cap for both flash backward kernels. |
 | `MEGANEURA_DEVICE_ID=0x744c` | Adapter selection by numeric device id. |
+| `MEGANEURA_GEMV_THREADS=<n>` | Starting workgroup width for K-split GEMV: 32, 64, 128 or 256. Measurement challenges it. |
+| `MEGANEURA_GEMV_ADD_THREADS=<n>` | The same for the fused-add GEMV. |
+| `MEGANEURA_GEMV_BT_THREADS=<n>` | The same for the transposed-B GEMV. |
+| `MEGANEURA_GEMV_REDUCTION=tree\|subgroup` | Starting cross-lane reduction for K-split GEMV. |
 | `MEGANEURA_GPU_TIMING` | Enable hardware timestamp pools (set before context creation). |
 | `MEGANEURA_GPU_CAPTURE` | Enable Blade's native-tool labels and shader debug information before context creation; independent of GPU timing. |
 
 `Session::tune_with(TuneOptions)` searches 32/64 scalar and legal native-f32
-cooperative tiles for exact dense matmul classes, qualifies nonzero scratch outputs, interleaves measurements,
-and returns raw samples and decisions. It never runs the live graph or advances
-optimizer/KV state. Default-off: scalar GPU qualification passed on RTX 5070;
-native-f32 hardware coverage and automatic whole-step confirmation remain due.
-F16-input/complex-fusion/GEMV candidates and persistent winners are not included.
+cooperative tiles for exact dense matmul classes, and workgroup width and
+cross-lane reduction for K-split GEMV classes; it qualifies nonzero scratch
+outputs, interleaves measurements, and returns raw samples and decisions. It
+never runs the live graph or advances optimizer/KV state. Default-off: scalar
+GPU qualification passed on RTX 5070; native-f32 hardware coverage and
+automatic whole-step confirmation remain due. The GEMV axis is the one that
+covers reduced-storage weights, since a width or reduction choice leaves the
+packed decoder untouched; f16-input tiles, complex fusion and persistent
+winners are not included.
 Reports separate qualification's CPU preparation/copies/checks from
 transfer/dispatch/wait costs. Private tuning staging defaults to read-optimized
 Download; `TuneOptions::staging = TuneStaging::Shared` retains the original

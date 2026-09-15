@@ -1077,6 +1077,15 @@ enum Variant {
     CoopPrologue(ShaderEntry, Vec<crate::compile::PrologueLoadKind>),
     /// GEMV with a RmsNorm folded into its A operand.
     GemvRmsNorm(ShaderEntry),
+    /// A K-split GEMV at a measured workgroup width and reduction, for the
+    /// weight format it reads. Every other axis of the GEMV family — fused
+    /// add, transposed B, f16, block-packed — is already in the entry and
+    /// the format, so the shape is the only thing this adds.
+    Gemv(
+        ShaderEntry,
+        crate::compile::WeightFormat,
+        crate::codegen::GemvShape,
+    ),
     /// Non-f32 weight storage (f16, Q4, Q8).
     Weight(ShaderEntry, crate::compile::WeightFormat),
     /// Cooperative-matrix and small-tile (32×32) forms. Unlike every other
@@ -1123,6 +1132,7 @@ impl Variant {
             | Variant::CoopEpilogue(ref e, _)
             | Variant::CoopPrologue(ref e, _)
             | Variant::GemvRmsNorm(ref e)
+            | Variant::Gemv(ref e, _, _)
             | Variant::Weight(ref e, _)
             | Variant::Coop(ref e)
             | Variant::CoopCompensated(ref e)
@@ -1147,6 +1157,10 @@ impl Variant {
                 format!("{e:?}:cooperative-prologue:{kinds:?}")
             }
             Variant::GemvRmsNorm(ref e) => format!("{e:?}:rmsnorm"),
+            Variant::Gemv(ref e, format, shape) => format!(
+                "{e:?}:gemv-{format:?}-{}t-{:?}",
+                shape.threads, shape.reduction
+            ),
             Variant::Weight(ref e, format) => format!("{e:?}:weight-{format:?}"),
             Variant::Coop(ref e) => format!("{e:?}:cooperative"),
             Variant::CoopCompensated(ref e) => format!("{e:?}:cooperative-compensated"),
@@ -1518,6 +1532,41 @@ impl Pipelines {
             map.insert(key, pipeline);
         }
 
+        // Compile any GEMV shape a plan already carries. Tuning inserts its
+        // own pipelines as it measures, so this is for a plan that arrives
+        // with a shape on it — deserialized, or rebuilt after a swap. Without
+        // it the dispatch would quietly fall back to the group's initial
+        // shape, which is correct but silently discards the measurement.
+        for dispatch in &plan.dispatches {
+            let Some(shape) = dispatch.gemv_shape else {
+                continue;
+            };
+            // The RmsNorm-fused form has its own module and its own binding
+            // layout, and is not shaped. Tuning never sets a shape on one;
+            // this keeps a hand-built plan from producing a pipeline whose
+            // bindings do not match the dispatch.
+            let Some(group) = crate::tune::gemv_group(&dispatch.shader)
+                .filter(|_| dispatch.gemv_rmsnorm.is_none())
+            else {
+                continue;
+            };
+            let key = Variant::Gemv(dispatch.shader.clone(), dispatch.weight_format, shape);
+            if let std::collections::hash_map::Entry::Vacant(slot) = map.entry(key.clone()) {
+                let sm = crate::codegen::generate_module_gemv(group, dispatch.weight_format, shape);
+                let shader = gpu.create_shader(bg::ShaderDesc {
+                    source: &sm.source,
+                    naga_module: Some(sm.module),
+                });
+                let layout = shader_data_layout(&dispatch.shader);
+                slot.insert(create_profiled_pipeline(
+                    gpu,
+                    key.label(),
+                    &layout,
+                    shader.at(dispatch.shader.entry_point()),
+                ));
+            }
+        }
+
         // Compile weight-format-specific pipelines (f16, Q4, Q8).
         for (&format, groups) in &needed_weighted {
             for &group in groups {
@@ -1776,8 +1825,16 @@ impl Pipelines {
         if dispatch.params.len() >= 4 {
             out.push(Variant::Attention(entry.clone(), dispatch.params[3]));
         }
+        // A measured shape outranks the group's initial one, and the RmsNorm
+        // fusion outranks both: folding the norm in removes a whole dispatch,
+        // which no reduction choice can make up for. Shapes are only measured
+        // for the unfused forms, so the two never compete for the same
+        // dispatch — the ordering just makes that explicit.
         if dispatch.gemv_rmsnorm.is_some() {
             out.push(Variant::GemvRmsNorm(entry.clone()));
+        }
+        if let Some(shape) = dispatch.gemv_shape {
+            out.push(Variant::Gemv(entry.clone(), dispatch.weight_format, shape));
         }
         if dispatch.weight_format.uses_reduced_storage() {
             out.push(Variant::Weight(entry.clone(), dispatch.weight_format));

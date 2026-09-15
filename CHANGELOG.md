@@ -1,5 +1,28 @@
 # Unreleased
 
+- The K-split GEMV family gains a measured shape: workgroup width (32, 64,
+  128 or 256) and cross-lane reduction (a workgroup-memory halving tree, or
+  `subgroupAdd` within a wave and one partial per wave through workgroup
+  memory). Every GEMV kernel — plain, fused-add, transposed-B, f16,
+  block-packed, RmsNorm-folded — is derived from one source and shaped in one
+  place, so the choice is a single axis across all of them rather than a knob
+  per kernel.
+
+  The subgroup reduction spends one `workgroupBarrier` whatever the width,
+  against one per halving level for the tree: six fewer on AMD's 64-wide
+  wave, five on a 32-wide one. It is written against the `subgroup_size`
+  builtin rather than a compiled-in width, so one kernel is correct on wave64,
+  wave32 and the 8-wide waves of a software rasterizer.
+
+  `Session::tune_with` now searches this axis, which required admitting the
+  GEMV entries and reduced-storage weights it had excluded outright — between
+  them most of what a decode step runs. A packed B is qualified by agreement
+  with the kernel the plan already runs rather than against an f32 reference
+  dot, since forming one would mean writing a second block decoder and
+  trusting it. Which shape wins is a device property and is not predicted.
+
+  `MEGANEURA_GEMV_REDUCTION=tree|subgroup` sets the starting point, alongside
+  the existing `MEGANEURA_GEMV_THREADS`.
 - Structured profiling of plans larger than Blade's timestamp budget.
   `capture_session_profile` used to refuse outright any plan with more
   dispatches than the 1,000 timestamps Blade writes per submission, which a

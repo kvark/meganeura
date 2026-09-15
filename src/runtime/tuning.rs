@@ -87,6 +87,10 @@ impl Pipelines {
 
 fn tile_module(dispatch: &Dispatch, tile: MatmulTile) -> crate::codegen::ShaderModule {
     let entry = &dispatch.shader;
+    if let MatmulTile::Gemv(shape) = tile {
+        let group = crate::tune::gemv_group(entry).expect("GEMV candidate on a GEMV entry");
+        return crate::codegen::generate_module_gemv(group, dispatch.weight_format, shape);
+    }
     let selected_entry = tile.shader(entry);
     if let MatmulTile::SpecializedConv { k_tile, .. } = tile {
         let params = super::Conv2dParams::from(dispatch);
@@ -106,13 +110,16 @@ fn tile_module(dispatch: &Dispatch, tile: MatmulTile) -> crate::codegen::ShaderM
                 entry.shader_group(),
                 &tile.coop_config().expect("cooperative candidate"),
             ),
-            MatmulTile::SpecializedConv { .. } => unreachable!(),
+            MatmulTile::SpecializedConv { .. } | MatmulTile::Gemv(_) => unreachable!(),
         }
     }
 }
 
 fn tile_variant(dispatch: &Dispatch, tile: MatmulTile) -> Variant {
     let entry = &dispatch.shader;
+    if let MatmulTile::Gemv(shape) = tile {
+        return Variant::Gemv(entry.clone(), dispatch.weight_format, shape);
+    }
     if let MatmulTile::SpecializedConv { k_tile, .. } = tile {
         return Variant::SpecializedConv(tile.shader(entry), dispatch.params.clone(), k_tile);
     }
@@ -131,7 +138,7 @@ fn tile_variant(dispatch: &Dispatch, tile: MatmulTile) -> Variant {
         MatmulTile::Tile32 => Variant::SmallTile(entry.clone()),
         MatmulTile::Tile64 => Variant::Scalar(entry.clone()),
         MatmulTile::CooperativeF32 { .. } => Variant::Coop(entry.clone()),
-        MatmulTile::SpecializedConv { .. } => unreachable!(),
+        MatmulTile::SpecializedConv { .. } | MatmulTile::Gemv(_) => unreachable!(),
     }
 }
 
@@ -706,6 +713,9 @@ impl Session {
                 let mut inputs = test_inputs(&logical_sizes, pattern);
                 for (index, data) in inputs.iter_mut().enumerate() {
                     data.resize(sizes[index] / 4, 0.0);
+                }
+                if class.key.weight_format.uses_reduced_storage() {
+                    finite_block_scales(&mut inputs[1]);
                 }
                 inputs
             };
@@ -1307,9 +1317,46 @@ fn reference_dot(class: &TuneClass, inputs: &[Vec<f32>], row: usize, col: usize)
     value
 }
 
+/// Force every f16-aligned halfword in a packed weight buffer to be finite.
+///
+/// The synthetic operands are pseudo-random f32 patterns, which as block bytes
+/// put NaN and infinity into roughly one in thirty-two block scales — enough
+/// that a whole quantized buffer is essentially certain to contain some, and a
+/// NaN scale poisons its block's outputs in both the incumbent and the
+/// candidate, so they could never be compared.
+///
+/// Every block format Meganeura reads stores its scales as f16 at an even byte
+/// offset, so clearing one exponent bit of every such halfword makes whichever
+/// ones the decoder treats as scales finite, without needing to know where
+/// they are. The quant payload keeps its pseudo-random content: this biases
+/// the synthetic data slightly, and biased data is fine for a measurement that
+/// only asks two kernels to agree.
+fn finite_block_scales(data: &mut [f32]) {
+    for value in data.iter_mut() {
+        let bits = value.to_bits();
+        let mut fixed = 0u32;
+        for half in 0..2 {
+            let mut part = (bits >> (16 * half)) as u16;
+            if part & 0x7C00 == 0x7C00 {
+                part &= 0xFBFF;
+            }
+            fixed |= u32::from(part) << (16 * half);
+        }
+        *value = f32::from_bits(fixed);
+    }
+}
+
 fn qualify_output(class: &TuneClass, inputs: &[Vec<f32>], output: &[f32], scale: f64) -> bool {
     if output.len() != class.output_elements() || output.iter().any(|x| !x.is_finite()) {
         return false;
+    }
+    // A packed B's logical values are whatever its decoder makes of the bytes.
+    // Reconstructing them here to form a reference dot would mean writing a
+    // second decoder and trusting it, so the cross-variant comparison in the
+    // caller carries the qualification instead. The finiteness and extent
+    // checks above still apply.
+    if class.weight_format.uses_reduced_storage() {
+        return true;
     }
     let (m, n) = (class.m as usize, class.n as usize);
     // Explicit tile boundaries and last row/column, then scattered dots.
@@ -1783,6 +1830,7 @@ mod tests {
         for (m, n, k) in [(3, 7, 5), (33, 65, 17), (2048, 1000, 1)] {
             for device_local in [false, true] {
                 let class = TuneClass {
+                    weight_format: crate::compile::WeightFormat::F32,
                     shader: ShaderEntry::MatMulAT,
                     m,
                     n,
@@ -1866,6 +1914,7 @@ mod tests {
     fn staging_reuse_replaces_sizes_and_cleans_up_after_early_returns() {
         fn trial(staging: &mut Staging<'_>, n: u32, stamp: u32) -> Result<(), ()> {
             let class = TuneClass {
+                weight_format: crate::compile::WeightFormat::F32,
                 shader: ShaderEntry::MatMul,
                 m: 3,
                 n,
@@ -1954,6 +2003,7 @@ mod tests {
     #[test]
     fn reference_dots_match_independent_rectangular_example() {
         let mut class = TuneClass {
+            weight_format: crate::compile::WeightFormat::F32,
             shader: ShaderEntry::MatMul,
             m: 2,
             n: 2,
@@ -2132,6 +2182,55 @@ mod tests {
         }
     }
 
+    /// Synthetic bytes for a packed weight must decode to finite numbers.
+    ///
+    /// Without this the quantized GEMV classes cannot be measured at all: a
+    /// NaN block scale poisons its whole block in both the incumbent and the
+    /// candidate, and two NaN outputs never compare equal, so every candidate
+    /// would be rejected as an invalid output rather than measured.
+    ///
+    /// The sweep covers every 16-bit pattern, which is what justifies the
+    /// claim the caller relies on — that whatever halfword a decoder picks up
+    /// as a scale, it is finite afterwards. Every block format Meganeura reads
+    /// puts its scales at an even byte offset (Q4_K and Q5_K at 0 and 2, Q6_K
+    /// at 208, Q3_K at 108, and the split Q4/Q8 header regions on a 4-byte
+    /// stride), and every block length is even, so even offsets are the only
+    /// ones that need to hold.
+    #[test]
+    fn synthetic_packed_weights_decode_to_finite_scales() {
+        let mut data: Vec<f32> = (0..=u32::from(u16::MAX))
+            .map(|low| f32::from_bits((low << 16) | low))
+            .collect();
+        let before = data.len();
+        finite_block_scales(&mut data);
+        assert_eq!(data.len(), before);
+        for (index, value) in data.iter().enumerate() {
+            let bits = value.to_bits();
+            for half in 0..2 {
+                let part = (bits >> (16 * half)) as u16;
+                assert!(
+                    f16_is_finite(part),
+                    "pattern {index:#x} half {half} stayed non-finite: {part:#06x}"
+                );
+            }
+        }
+
+        // Finite halfwords must be left alone, or the synthetic data would be
+        // quietly narrowed to a corner of the range.
+        let mut untouched = vec![f32::from_bits(0x3C00_3C00), f32::from_bits(0x1234_5678)];
+        let expected = untouched.clone();
+        finite_block_scales(&mut untouched);
+        assert_eq!(
+            untouched.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        );
+    }
+
+    /// Is this f16 bit pattern a finite value (exponent not all ones)?
+    fn f16_is_finite(bits: u16) -> bool {
+        bits & 0x7C00 != 0x7C00
+    }
+
     #[test]
     fn reference_qualification_checks_layout_and_tiny_operands() {
         for shader in [
@@ -2141,6 +2240,7 @@ mod tests {
             ShaderEntry::FusedMatMulAdd,
         ] {
             let class = TuneClass {
+                weight_format: crate::compile::WeightFormat::F32,
                 shader,
                 m: 3,
                 n: 5,

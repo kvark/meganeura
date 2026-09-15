@@ -481,3 +481,157 @@ fn tune_native_cooperative_f32() {
         }
     }
 }
+
+/// The decode kernels must be reachable by measurement, quantized ones
+/// included.
+///
+/// They were not: the search rejected every GEMV entry and every
+/// reduced-storage weight, which between them are most of what a decode step
+/// runs. A kernel nobody can select is a kernel nobody can tune, so this
+/// checks the plumbing all the way through — the class is collected, a shape
+/// candidate qualifies against the incumbent on real bytes, and the winner is
+/// installed on the dispatch.
+///
+/// Which shape wins is a property of the device and deliberately not asserted.
+#[test]
+#[ignore = "GPU tuning requires an idle device"]
+fn tune_reaches_quantized_gemv_and_installs_a_shape() {
+    use meganeura::compile::{ShaderEntry, WeightFormat};
+    use meganeura::{DType, GemvReduction, GemvShape};
+
+    fn expected_format(dtype: DType) -> WeightFormat {
+        WeightFormat::from_dtype(dtype)
+    }
+
+    // Decode-shaped: one row against a [K, N] weight, K and N multiples of
+    // 256 so every K-quant's superblock divides the column.
+    const K: usize = 512;
+    const N: usize = 256;
+    for dtype in [
+        DType::F32,
+        DType::F16,
+        DType::Q4_0,
+        DType::Q8_0,
+        DType::Q4K,
+        DType::Q6K,
+        DType::Q5K,
+        DType::Q3K,
+    ] {
+        let mut g = Graph::new();
+        let a = g.input("a", &[1, K]);
+        let b = match dtype {
+            DType::F32 => g.parameter("b", &[K, N]),
+            DType::F16 => g.parameter_f16("b", &[K, N]),
+            DType::Q4_0 => g.parameter_q4("b", &[K, N]),
+            DType::Q8_0 => g.parameter_q8("b", &[K, N]),
+            DType::Q4K => g.parameter_q4k("b", &[K, N]),
+            DType::Q6K => g.parameter_q6k("b", &[K, N]),
+            DType::Q5K => g.parameter_q5k("b", &[K, N]),
+            DType::Q3K => g.parameter_q3k("b", &[K, N]),
+            other => panic!("unhandled {other:?}"),
+        };
+        let y = g.matmul(a, b);
+        g.set_outputs(vec![y]);
+
+        let (mut session, _) = build(
+            &g,
+            SessionConfig {
+                mode: Mode::Inference,
+                runtime: SessionOptions {
+                    coop: CoopPolicy::Disabled,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert!(
+            session
+                .plan()
+                .dispatches
+                .iter()
+                .any(|d| d.shader == ShaderEntry::MatMulGemv),
+            "{dtype:?}: the plan did not route through the K-split GEMV"
+        );
+
+        let report = session
+            .tune_with(TuneOptions {
+                max_time: Duration::from_secs(120),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            report.eligible_classes, 1,
+            "{dtype:?}: the GEMV class was not collected"
+        );
+        assert_eq!(report.excluded_dispatches, 0, "{dtype:?}");
+        assert!(
+            !report.outcomes.is_empty(),
+            "{dtype:?}: no shape was challenged"
+        );
+        for outcome in &report.outcomes {
+            assert_eq!(outcome.class.shader, ShaderEntry::MatMulGemv);
+            assert_eq!(outcome.class.weight_format, expected_format(dtype));
+            for tile in [outcome.initial, outcome.candidate, outcome.selected] {
+                assert!(
+                    matches!(tile, MatmulTile::Gemv(_)),
+                    "{dtype:?}: {tile:?} is not a GEMV shape"
+                );
+            }
+            // Qualification is what proves the candidate agrees with the
+            // kernel the plan already runs, on the same bytes. Without it a
+            // measurement is just two numbers.
+            assert!(
+                outcome.qualified,
+                "{dtype:?}: a shape failed to qualify: {:?}",
+                outcome.failure
+            );
+            assert!(matches!(
+                outcome.decision,
+                TuneDecision::FasterCandidate | TuneDecision::KeepBaseline
+            ));
+            assert!(outcome.candidate_median_ms.unwrap() > 0.0);
+        }
+        // Both axes have to be reachable, or half the space is unsearchable.
+        let tried: Vec<GemvShape> = report
+            .outcomes
+            .iter()
+            .map(|o| match o.candidate {
+                MatmulTile::Gemv(shape) => shape,
+                other => unreachable!("{other:?}"),
+            })
+            .collect();
+        assert!(
+            tried.iter().any(|s| s.reduction == GemvReduction::Subgroup)
+                && tried.iter().any(|s| s.reduction == GemvReduction::Tree),
+            "{dtype:?}: only one reduction was challenged: {tried:?}"
+        );
+        assert!(
+            tried.iter().map(|s| s.threads).collect::<Vec<_>>().len() > 1,
+            "{dtype:?}: only one width was challenged"
+        );
+
+        // The winner has to reach the dispatch, or the search changed nothing.
+        let MatmulTile::Gemv(winner) = report.outcomes.last().unwrap().selected else {
+            unreachable!("checked above")
+        };
+        let installed: Vec<Option<GemvShape>> = session
+            .plan()
+            .dispatches
+            .iter()
+            .filter(|d| d.shader == ShaderEntry::MatMulGemv)
+            .map(|d| d.gemv_shape)
+            .collect();
+        assert_eq!(
+            installed,
+            vec![Some(winner)],
+            "{dtype:?}: the selected shape was not installed"
+        );
+        let first = &report.outcomes[0];
+        eprintln!(
+            "{dtype:?}: {:?} {:.3}ms -> {winner:?} {:.3}ms",
+            first.initial,
+            first.baseline_median_ms.unwrap(),
+            report.outcomes.last().unwrap().candidate_median_ms.unwrap(),
+        );
+    }
+}
