@@ -787,6 +787,25 @@ mod tests {
             logical_bytes(&TensorType::new(vec![256], DType::Q6K)).unwrap(),
             212
         );
+        // 176 is already a word, so no tail.
+        assert_eq!(
+            logical_bytes(&TensorType::new(vec![256], DType::Q5K)).unwrap(),
+            176
+        );
+        assert_eq!(
+            logical_bytes(&TensorType::new(vec![512], DType::Q5K)).unwrap(),
+            352
+        );
+        // 110 is not: one superblock pads to 112, but two are 220 rather
+        // than 224 — the tail belongs to the parameter, not each block.
+        assert_eq!(
+            logical_bytes(&TensorType::new(vec![256], DType::Q3K)).unwrap(),
+            112
+        );
+        assert_eq!(
+            logical_bytes(&TensorType::new(vec![512], DType::Q3K)).unwrap(),
+            220
+        );
     }
 
     #[test]

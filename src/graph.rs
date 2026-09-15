@@ -53,9 +53,11 @@ pub enum DType {
     /// 128 nibble bytes.
     ///
     /// [`DType::Q4K`] plus one bit: the 5-bit quant is the nibble with
-    /// `qh`'s bit for that sub-block added as 16. At 5.5 bits/weight it
-    /// costs more than Meganeura Q4's 5.0 but carries a fifth mantissa bit
-    /// and finer scale granularity.
+    /// `qh`'s bit for that sub-block added as 16, giving 32 quantization
+    /// levels instead of 16. At 5.5 bits/weight it costs more than
+    /// Meganeura Q4's 5.0. Both use 32-element sub-blocks; Q5_K spends the
+    /// extra bit on quant resolution while *compressing* its sub-block
+    /// scales to 6 bits rather than storing an independent f16 pair.
     ///
     /// Load-only, for the same reason as [`DType::Q4K`].
     Q5K,

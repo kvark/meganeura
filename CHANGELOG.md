@@ -11,9 +11,10 @@
 - Native GGML K-quant storage: `Q4K`, `Q6K`, `Q5K` and `Q3K`, each with a
   `DType` and a `Graph::parameter_q*k` constructor. Superblocks are stored
   byte-for-byte as GGUF writes them, so loading copies nothing and the tiled
-  matmul and K-split GEMV shaders decode them directly. That covers the
-  K-quant mixes end to end — a `Q4_K_M`, `Q5_K_M` or `Q3_K_M` file now reaches
-  the GPU without a single requantize.
+  matmul and K-split GEMV shaders decode them directly. The weights of a
+  `Q3_K_M`, `Q4_K_M` or `Q5_K_M` file now load without a requantize. This is
+  weight-format support, not a GGUF model builder: `Q2_K` and `Q8_K` are
+  still unread, and quantized embedding tables have no gather variant.
 
   Q4_K reads 10% less weight data than Meganeura Q4 (4.5 bits/weight against
   5.0), because it quantizes its own sub-block scales to 6 bits instead of
@@ -50,8 +51,10 @@
   `generate_module_weighted` asserts rather than falling through to an f32
   shader for a group with no K-quant variant. Packed SwiGLU `gate+up`
   fusion restages the derived concat from those uploads: Q4 merges its
-  split header/nibble regions, and Q6_K concatenates unpadded superblocks
-  before the word-alignment tail.
+  split header/nibble regions, and the native K-quants concatenate
+  unpadded superblocks so a per-source word-alignment tail never lands
+  between two sources' blocks — two Q3_K `[256, 1]` sources pad to 112
+  bytes each but the combined parameter is 220, not 224.
 - `matmul_bt` now rejects block-quantized weights. Their blocks run along
   the parameter's first dimension, which is N for a transposed B, while
   every packed decoder indexes along K — so the kernels that served this

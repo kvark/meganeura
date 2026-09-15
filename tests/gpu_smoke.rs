@@ -3717,6 +3717,101 @@ fn q3k_superblock(seed: u32) -> Vec<u8> {
     b
 }
 
+/// A shape big enough to span several output tiles and more than one
+/// K-block, so tile offsets and K progression are exercised rather than a
+/// single tile's worth of the decoder.
+#[test]
+fn k_quants_match_reference_across_multiple_tiles() {
+    use meganeura::load::gguf::{GgmlType, GgufTensor};
+
+    // 65 x 512 x 68: past one 64x64 tile in both M and N, two superblocks
+    // deep in K.
+    let (m, k, n) = (65usize, 512usize, 68usize);
+    for (ty, build) in [
+        (GgmlType::Q5K, q5k_superblock as fn(u32) -> Vec<u8>),
+        (GgmlType::Q3K, q3k_superblock as fn(u32) -> Vec<u8>),
+    ] {
+        let mut data = Vec::new();
+        for s in 0..(k / 256 * n) {
+            data.extend_from_slice(&build(s as u32 + 101));
+        }
+        assert_gguf_packed_matmul(
+            &format!("{ty:?} multi-tile"),
+            GgufTensor::new(vec![k, n], ty, data),
+            m,
+            1e-5,
+        );
+    }
+}
+
+/// The packed SwiGLU concat restages a derived `gate+up` from two uploads.
+/// Q3_K is the interesting one: each source pads to a word, but that tail
+/// must not land between the two sources' superblocks.
+#[test]
+fn q3k_swiglu_packed_concat_matches_reference() {
+    use meganeura::load::gguf::{GgmlType, GgufTensor};
+
+    let (m, k, n) = (2usize, 256usize, 4usize);
+    let mut gate_data = Vec::new();
+    let mut up_data = Vec::new();
+    for s in 0..(k / 256 * n) {
+        gate_data.extend_from_slice(&q3k_superblock(s as u32 + 5));
+        up_data.extend_from_slice(&q3k_superblock(s as u32 + 23));
+    }
+    let gate_t = GgufTensor::new(vec![k, n], GgmlType::Q3K, gate_data);
+    let up_t = GgufTensor::new(vec![k, n], GgmlType::Q3K, up_data);
+    let gate_ref = gate_t.to_f32().unwrap();
+    let up_ref = up_t.to_f32().unwrap();
+    let (_, gate_packed) = gate_t.to_packed().unwrap();
+    let (_, up_packed) = up_t.to_packed().unwrap();
+
+    let a: Vec<f32> = (0..m * k)
+        .map(|i| ((i % 29) as f32 - 14.0) * 0.03)
+        .collect();
+
+    let mut g = Graph::new();
+    let x = g.input("x", &[m, k]);
+    let gate_w = g.parameter_q3k("gate", &[k, n]);
+    let up_w = g.parameter_q3k("up", &[k, n]);
+    let gate = g.matmul(x, gate_w);
+    let up = g.matmul(x, up_w);
+    let out = g.swiglu(gate, up);
+    g.set_outputs(vec![out]);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    assert!(
+        session.has_parameter("gate+up"),
+        "expected SwiGLU concat fusion so packed upload restages the derived weight"
+    );
+    session.set_input("x", &a);
+    // Upload order reversed relative to the declaration order.
+    session.set_parameter_packed("up", &up_packed);
+    session.set_parameter_packed("gate", &gate_packed);
+    session.step();
+    session.wait();
+    let gpu = session.read_output(m * n);
+
+    let silu = |v: f32| v / (1.0 + (-v).exp());
+    let mut max_err = 0.0f32;
+    let mut scale = 0.0f32;
+    for row in 0..m {
+        for col in 0..n {
+            let gate_v = (0..k)
+                .map(|i| a[row * k + i] * gate_ref[i * n + col])
+                .sum::<f32>();
+            let up_v = (0..k)
+                .map(|i| a[row * k + i] * up_ref[i * n + col])
+                .sum::<f32>();
+            let want = silu(gate_v) * up_v;
+            scale = scale.max(want.abs());
+            max_err = max_err.max((gpu[row * n + col] - want).abs());
+        }
+    }
+    assert!(
+        max_err / scale.max(1e-6) < 1e-4,
+        "Q3_K SwiGLU concat diverged: max_abs_err={max_err} (scale {scale})"
+    );
+}
+
 /// Q5_K is Q4_K's nibble plus a `qh` bit worth 16, and that bit is indexed
 /// by sub-block rather than by position — the kind of thing a shader gets
 /// subtly wrong while still producing plausible weights.
