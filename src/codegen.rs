@@ -1223,6 +1223,12 @@ fn matmul_vars_tiled(
             "dequant_q8(b_row, b_col)".to_string(),
             format!("{F16_DECODE_FN}{Q8_DEQUANT_FN}"),
         ),
+        WeightFormat::Q40 => (
+            "",
+            "array<u32>",
+            "dequant_q40(b_row, b_col)".to_string(),
+            format!("{F16_DECODE_FN}{Q40_DEQUANT_FN}"),
+        ),
         WeightFormat::Q4K => (
             "",
             "array<u32>",
@@ -1357,6 +1363,14 @@ const F16_DECODE_FN: &str = include_str!("shaders/dequant_f16_decode.wgsl");
 /// `dequant_q4` stays the scalar entry used by GEMV. Tiled staging uses
 /// `dequant_q4_pack8`: one (d, m) header and one data word → 8 values.
 const Q4_DEQUANT_FN: &str = include_str!("shaders/dequant_q4.wgsl");
+
+/// GGML's own Q4_0: 18-byte blocks of an f16 `d` and 16 nibble bytes, read
+/// byte-addressed because 18 is not a whole number of words.
+///
+/// Distinct from [`Q4_DEQUANT_FN`] in both the arithmetic — symmetric
+/// `d * (q - 8)` against Meganeura's `q * d + m` — and the nibble order:
+/// GGML splits a block across halves where Meganeura pairs neighbours.
+const Q40_DEQUANT_FN: &str = include_str!("shaders/dequant_q40.wgsl");
 
 /// The `get_scale_min_k4` scale/min decoder, shared by Q4_K and Q5_K.
 ///
@@ -1990,6 +2004,7 @@ fn packed_decoder(mode: WeightFormat) -> Option<(String, &'static str)> {
     match mode {
         WeightFormat::Q4 => Some((Q4_DEQUANT_FN.to_string(), "dequant_q4")),
         WeightFormat::Q8 => Some((Q8_DEQUANT_FN.to_string(), "dequant_q8")),
+        WeightFormat::Q40 => Some((Q40_DEQUANT_FN.to_string(), "dequant_q40")),
         WeightFormat::Q4K => Some((format!("{K_SCALE_MIN_FN}{Q4K_DEQUANT_FN}"), "dequant_q4k")),
         WeightFormat::Q6K => Some((Q6K_DEQUANT_FN.to_string(), "dequant_q6k")),
         WeightFormat::Q5K => Some((format!("{K_SCALE_MIN_FN}{Q5K_DEQUANT_FN}"), "dequant_q5k")),
@@ -6688,6 +6703,7 @@ mod tests {
             (WeightFormat::F16, "array<vec4<f16>>"),
             (WeightFormat::Q4, "dequant_q4("),
             (WeightFormat::Q8, "dequant_q8("),
+            (WeightFormat::Q40, "dequant_q40("),
             (WeightFormat::Q4K, "dequant_q4k("),
             (WeightFormat::Q6K, "dequant_q6k("),
             (WeightFormat::Q5K, "dequant_q5k("),
@@ -6793,6 +6809,7 @@ mod tests {
             (WeightFormat::F16, "array<vec4<f16>>"),
             (WeightFormat::Q4, "dequant_q4("),
             (WeightFormat::Q8, "dequant_q8("),
+            (WeightFormat::Q40, "dequant_q40("),
             (WeightFormat::Q4K, "dequant_q4k("),
             (WeightFormat::Q6K, "dequant_q6k("),
             (WeightFormat::Q5K, "dequant_q5k("),
@@ -6932,8 +6949,11 @@ mod tests {
         for format in [
             WeightFormat::Q4,
             WeightFormat::Q8,
+            WeightFormat::Q40,
             WeightFormat::Q4K,
             WeightFormat::Q6K,
+            WeightFormat::Q5K,
+            WeightFormat::Q3K,
         ] {
             assert!(
                 std::panic::catch_unwind(|| {

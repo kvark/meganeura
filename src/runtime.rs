@@ -4928,19 +4928,24 @@ fn scatter_packed_concat_columns(
         // source arrives padded to a word, but that tail belongs at the
         // end of the whole parameter, not between two sources' blocks —
         // so only the unpadded span is copied. Q4_K (144) and Q5_K (176)
-        // have no tail to strip; Q6_K (210) and Q3_K (110) do.
-        fmt @ (crate::compile::WeightFormat::Q4K
+        // have no tail to strip; Q4_0 (18), Q6_K (210) and Q3_K (110) do.
+        fmt @ (crate::compile::WeightFormat::Q40
+        | crate::compile::WeightFormat::Q4K
         | crate::compile::WeightFormat::Q5K
         | crate::compile::WeightFormat::Q6K
         | crate::compile::WeightFormat::Q3K) => {
-            assert!(rows.is_multiple_of(256));
-            let stride = match fmt {
-                crate::compile::WeightFormat::Q4K => 144,
-                crate::compile::WeightFormat::Q5K => 176,
-                crate::compile::WeightFormat::Q6K => 210,
-                _ => 110,
+            // Q4_0 blocks 32 elements where the K-quants take 256; the
+            // copy is otherwise identical, so the block size joins the
+            // stride rather than earning a second arm.
+            let (block, stride) = match fmt {
+                crate::compile::WeightFormat::Q40 => (32, 18),
+                crate::compile::WeightFormat::Q4K => (256, 144),
+                crate::compile::WeightFormat::Q5K => (256, 176),
+                crate::compile::WeightFormat::Q6K => (256, 210),
+                _ => (256, 110),
             };
-            let bpc = rows / 256;
+            assert!(rows.is_multiple_of(block));
+            let bpc = rows / block;
             let unpadded = bpc * src_cols * stride;
             assert_eq!(
                 src.len(),
@@ -5228,7 +5233,8 @@ impl Session {
                         // back to a cruder one would silently produce worse
                         // weights than the file the caller already has, so
                         // refuse and point at the path that keeps them.
-                        fmt @ (crate::compile::WeightFormat::Q4K
+                        fmt @ (crate::compile::WeightFormat::Q40
+                        | crate::compile::WeightFormat::Q4K
                         | crate::compile::WeightFormat::Q6K
                         | crate::compile::WeightFormat::Q5K
                         | crate::compile::WeightFormat::Q3K) => panic!(
@@ -5287,7 +5293,8 @@ impl Session {
                                         .map(|&v| half::f16::from_f32(v).to_bits())
                                         .flat_map(|b| b.to_le_bytes())
                                         .collect(),
-                                    fmt @ (crate::compile::WeightFormat::Q4K
+                                    fmt @ (crate::compile::WeightFormat::Q40
+                                    | crate::compile::WeightFormat::Q4K
                                     | crate::compile::WeightFormat::Q6K
                                     | crate::compile::WeightFormat::Q5K
                                     | crate::compile::WeightFormat::Q3K) => panic!(

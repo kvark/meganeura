@@ -410,8 +410,15 @@ impl GgufTensor {
     pub fn packed_dtype(&self) -> Result<DType, GgufError> {
         let (k, _n) = self.matrix_dims()?;
         match self.ggml_type {
-            GgmlType::Q4_0 | GgmlType::Q4_1 => {
-                require_block_aligned(k, 32, "Q4")?;
+            // GGML's Q4_0 is read natively; Q4_1 keeps the repack, because
+            // Meganeura's own Q4 is the Q4_1 shape and the conversion is
+            // lossless.
+            GgmlType::Q4_0 => {
+                require_block_aligned(k, 32, "Q4_0")?;
+                Ok(DType::Q40)
+            }
+            GgmlType::Q4_1 => {
+                require_block_aligned(k, 32, "Q4_1")?;
                 Ok(DType::Q4_0)
             }
             GgmlType::Q8_0 => {
@@ -464,17 +471,17 @@ impl GgufTensor {
             )));
         }
         let bytes = match self.ggml_type {
-            GgmlType::Q4_0 | GgmlType::Q4_1 => Cow::Owned(self.repack_q4(count)?),
+            GgmlType::Q4_1 => Cow::Owned(self.repack_q4(count)?),
             GgmlType::Q8_0 => Cow::Owned(self.repack_q8(count)),
-            // The K-quants are already in GGML's layout, so these borrow
-            // the file rather than copying it.
+            // Q4_0 and the K-quants are already in GGML's layout, so these
+            // borrow the file rather than copying it.
             // 144 and 176 are whole numbers of words, so these need no tail.
             GgmlType::Q4K | GgmlType::Q5K => Cow::Borrowed(self.data()),
-            GgmlType::Q6K | GgmlType::Q3K => {
-                // 210- and 110-byte superblocks are not whole words, so an
-                // odd count leaves the buffer two bytes short of the
-                // `array<u32>` binding. Only then is a copy needed; the
-                // superblocks themselves are never touched.
+            GgmlType::Q4_0 | GgmlType::Q6K | GgmlType::Q3K => {
+                // 18-, 210- and 110-byte blocks are not whole words, so an
+                // odd count leaves the buffer short of the `array<u32>`
+                // binding. Only then is a copy needed; the blocks
+                // themselves are never touched.
                 let data = self.data();
                 let padded = data.len().next_multiple_of(4);
                 if padded == data.len() {
@@ -528,41 +535,36 @@ impl GgufTensor {
         })
     }
 
-    /// GGML Q4_0/Q4_1 → Meganeura Q4.
+    /// GGML Q4_1 → Meganeura Q4.
     ///
-    /// Three things change and nothing else does:
+    /// Meganeura's own Q4 *is* the Q4_1 shape — `value = q * d + m` with a
+    /// per-block minimum — so this is a relayout, not a requantize. Two
+    /// things change and nothing else does:
     ///
-    /// * Q4_0 is symmetric (`value = (q - 8) * d`); Meganeura's form is
-    ///   always `q * d + m`, so `m = -8d`. Scaling by 8 only shifts an
-    ///   exponent, so this survives the f16 round trip exactly.
     /// * GGML splits a block's nibbles across halves — `qs[j]` holds element
     ///   `j` low and element `j + 16` high — while Meganeura pairs adjacent
     ///   elements, `qs[e / 2]` holding `e` and `e + 1`.
     /// * GGML interleaves each block's header with its payload; Meganeura
     ///   keeps all `(d, m)` words first and all nibble words after.
+    ///
+    /// GGML's symmetric Q4_0 does not come through here: it has its own
+    /// storage now, so nothing is rebuilt for it. See [`DType::Q40`].
     fn repack_q4(&self, count: usize) -> Result<Vec<u8>, GgufError> {
+        debug_assert_eq!(self.ggml_type, GgmlType::Q4_1);
         let src_bytes = self.data();
         let blocks = count / 32;
         let stride = self
             .ggml_type
             .block_bytes()
             .ok_or(GgufError::UnsupportedType(self.ggml_type.tag()))?;
-        let symmetric = self.ggml_type == GgmlType::Q4_0;
         // Header region then payload region, mirroring `quantize_q4_0`.
         let mut out = vec![0u8; blocks * 4 + blocks * 16];
         let payload = blocks * 4;
         for b in 0..blocks {
             let src = b * stride;
             let d_bits = u16::from_le_bytes([src_bytes[src], src_bytes[src + 1]]);
-            let (m_bits, qs) = if symmetric {
-                let d = f16_from_bits(d_bits);
-                (f16_to_bits(-8.0 * d), src + 2)
-            } else {
-                (
-                    u16::from_le_bytes([src_bytes[src + 2], src_bytes[src + 3]]),
-                    src + 4,
-                )
-            };
+            let m_bits = u16::from_le_bytes([src_bytes[src + 2], src_bytes[src + 3]]);
+            let qs = src + 4;
             let dm = u32::from(d_bits) | (u32::from(m_bits) << 16);
             out[b * 4..b * 4 + 4].copy_from_slice(&dm.to_le_bytes());
 
@@ -946,6 +948,9 @@ fn f16_from_bits(bits: u16) -> f32 {
     half::f16::from_bits(bits).to_f32()
 }
 
+/// Only the fixtures need this direction: nothing in the load path writes
+/// f16 any more, now that Q4_0 is stored as GGML wrote it.
+#[cfg(test)]
 fn f16_to_bits(v: f32) -> u16 {
     half::f16::from_f32(v).to_bits()
 }
@@ -1339,12 +1344,10 @@ mod tests {
         // every transcoded format through Meganeura's own decoder.
         let left: [u8; 32] = std::array::from_fn(|i| (i % 16) as u8);
         let right: [u8; 32] = std::array::from_fn(|i| ((i * 3) % 16) as u8);
+        // Q4_0 is absent because it no longer transcodes: it is read
+        // natively, and its column order is checked against GGML's own
+        // dequantizer on the GPU instead.
         let cases = [
-            (GgmlType::Q4_0, 1e-5, {
-                let mut p = q4_0_block(0.25, left);
-                p.extend(q4_0_block(0.5, right));
-                p
-            }),
             (GgmlType::Q4_1, 1e-2, {
                 let mut p = q4_1_block(0.5, -3.0, left);
                 p.extend(q4_1_block(0.25, -1.0, right));
@@ -1407,17 +1410,22 @@ mod tests {
         ));
     }
 
+    /// GGML splits a Q4_0 block's nibbles across halves: byte `j` holds
+    /// element `j` and element `j + 16`, never `j` and `j + 1`.
+    ///
+    /// This pins the reference dequantizer rather than a repack, because
+    /// Q4_0 is now read natively and it is this reference the shader is
+    /// compared against — so a mistake here would move the target instead
+    /// of failing the comparison.
     #[test]
-    fn q4_0_repack_preserves_the_split_half_nibble_order() {
-        // Distinct value per element, so any reordering shows up.
+    fn q4_0_reference_dequant_preserves_the_split_half_nibble_order() {
+        // Distinct value per element pair, so any reordering shows up.
         let nibbles: [u8; 32] = std::array::from_fn(|i| (i / 2) as u8);
         let bytes = Builder::new()
             .tensor("w", &[32, 1], GgmlType::Q4_0, &q4_0_block(1.0, nibbles))
             .build();
         let m = load_gguf_bytes(&bytes).unwrap();
-        let t = &m.tensors["w"];
-        let (_, packed) = t.to_packed().unwrap();
-        let got = crate::runtime::dequantize_q4_0(&packed, 32, 1);
+        let got = m.tensors["w"].to_f32().unwrap();
         for (e, &n) in nibbles.iter().enumerate() {
             // Q4_0 is symmetric about 8.
             let want = f32::from(n) - 8.0;
@@ -1727,6 +1735,58 @@ mod tests {
             "the borrow should point into the shared buffer"
         );
         assert_eq!(&*packed, &block[..]);
+    }
+
+    /// GGML Q4_0 is read natively, not rebuilt into Meganeura's wider Q4.
+    ///
+    /// This is the load path a `Q4_0` GGUF actually takes, and it used to
+    /// allocate and rewrite every block; 18 bytes in, 18 bytes out, borrowed
+    /// from the file when the block count leaves a whole number of words.
+    /// Q4_1 still repacks, because Meganeura's Q4 *is* the Q4_1 shape.
+    #[test]
+    fn ggml_q4_0_is_read_natively_and_q4_1_still_repacks() {
+        // Two blocks: 36 bytes, a whole number of words.
+        let block: Vec<u8> = (0..18u8).collect();
+        let mut payload = block.clone();
+        payload.extend_from_slice(&block);
+        let bytes = Builder::new()
+            .tensor("w", &[32, 2], GgmlType::Q4_0, &payload)
+            .build();
+        let file: Arc<[u8]> = Arc::from(bytes);
+        let m = load_gguf_shared(Arc::clone(&file)).unwrap();
+        let t = &m.tensors["w"];
+        let (dtype, packed) = t.to_packed().unwrap();
+        assert_eq!(dtype, DType::Q40);
+        assert_eq!(packed.len(), 36, "native Q4_0 is 18 bytes a block");
+        assert!(
+            matches!(packed, Cow::Borrowed(_)),
+            "an aligned Q4_0 buffer needs no copy"
+        );
+        assert!(
+            std::ptr::eq(packed.as_ptr(), t.data().as_ptr()),
+            "the borrow should point into the shared buffer"
+        );
+
+        // One block: 18 bytes, two short of a word. Only the tail is added.
+        let odd = Builder::new()
+            .tensor("w", &[32, 1], GgmlType::Q4_0, &block)
+            .build();
+        let odd_model = load_gguf_bytes(&odd).unwrap();
+        let (_, packed) = odd_model.tensors["w"].to_packed().unwrap();
+        assert_eq!(packed.len(), 20);
+        assert_eq!(&packed[..18], &block[..], "the block itself is untouched");
+        assert_eq!(&packed[18..], &[0, 0]);
+
+        // Q4_1 carries a per-block minimum, so it becomes Meganeura's Q4:
+        // 20 bytes a block, rebuilt rather than borrowed.
+        let q41 = Builder::new()
+            .tensor("w", &[32, 1], GgmlType::Q4_1, &[0u8; 20])
+            .build();
+        let q41_model = load_gguf_bytes(&q41).unwrap();
+        let (dtype, packed) = q41_model.tensors["w"].to_packed().unwrap();
+        assert_eq!(dtype, DType::Q4_0);
+        assert_eq!(packed.len(), 20);
+        assert!(matches!(packed, Cow::Owned(_)), "Q4_1 repacks");
     }
 
     /// Q6_K only copies when its superblock count leaves the buffer short

@@ -715,7 +715,7 @@ impl Session {
                     data.resize(sizes[index] / 4, 0.0);
                 }
                 if class.key.weight_format.uses_reduced_storage() {
-                    finite_block_scales(&mut inputs[1]);
+                    tame_block_scales(&mut inputs[1]);
                 }
                 inputs
             };
@@ -1317,30 +1317,41 @@ fn reference_dot(class: &TuneClass, inputs: &[Vec<f32>], row: usize, col: usize)
     value
 }
 
-/// Force every f16-aligned halfword in a packed weight buffer to be finite.
+/// Pin every f16-aligned halfword of a packed weight buffer to a sane
+/// magnitude, keeping its sign and mantissa.
 ///
-/// The synthetic operands are pseudo-random f32 patterns, which as block bytes
-/// put NaN and infinity into roughly one in thirty-two block scales — enough
-/// that a whole quantized buffer is essentially certain to contain some, and a
-/// NaN scale poisons its block's outputs in both the incumbent and the
-/// candidate, so they could never be compared.
+/// The synthetic operands are pseudo-random f32 patterns, and read as block
+/// bytes those make hopeless block scales in two different ways. About one in
+/// thirty-two is a NaN or an infinity, which poisons its block in both the
+/// incumbent and the candidate so the two can never be compared. The rest
+/// span f16's whole range, 2^-14 to 2^15, so one block's scale can exceed
+/// another's by ten orders of magnitude; the dot product is then dominated by
+/// that block, and when its own terms cancel, the result is a small difference
+/// of enormous numbers. Two summation orders legitimately disagree there, and
+/// no tolerance distinguishes that from a broken kernel.
 ///
-/// Every block format Meganeura reads stores its scales as f16 at an even byte
-/// offset, so clearing one exponent bit of every such halfword makes whichever
-/// ones the decoder treats as scales finite, without needing to know where
-/// they are. The quant payload keeps its pseudo-random content: this biases
-/// the synthetic data slightly, and biased data is fine for a measurement that
-/// only asks two kernels to agree.
-fn finite_block_scales(data: &mut [f32]) {
+/// Clamping the exponent into a four-way band around 1 fixes both: nothing is
+/// NaN, infinite, subnormal or zero, and no block can dominate the sum. Every
+/// block format Meganeura reads stores its scales as f16 at an even byte
+/// offset and every block length is even, so treating all such halfwords this
+/// way covers whichever ones a decoder actually treats as scales, without
+/// needing to know where they are.
+///
+/// The quant payload is rewritten too, since it shares those halfwords; it
+/// keeps five random bits in every eight. That biases the synthetic data,
+/// which is fine for a measurement that only asks two kernels to agree on the
+/// same bytes.
+fn tame_block_scales(data: &mut [f32]) {
     for value in data.iter_mut() {
         let bits = value.to_bits();
         let mut fixed = 0u32;
         for half in 0..2 {
-            let mut part = (bits >> (16 * half)) as u16;
-            if part & 0x7C00 == 0x7C00 {
-                part &= 0xFBFF;
-            }
-            fixed |= u32::from(part) << (16 * half);
+            let part = (bits >> (16 * half)) as u16;
+            // Exponent field 13..=16 is 2^-2..2^1, so |value| lands in
+            // [0.25, 4). Sign and mantissa survive untouched.
+            let exponent = 13 + (part & 3);
+            let tamed = (part & 0x83FF) | (exponent << 10);
+            fixed |= u32::from(tamed) << (16 * half);
         }
         *value = f32::from_bits(fixed);
     }
@@ -2182,53 +2193,53 @@ mod tests {
         }
     }
 
-    /// Synthetic bytes for a packed weight must decode to finite numbers.
+    /// Synthetic bytes for a packed weight must decode to block scales that
+    /// two kernels can be compared on.
     ///
-    /// Without this the quantized GEMV classes cannot be measured at all: a
-    /// NaN block scale poisons its whole block in both the incumbent and the
-    /// candidate, and two NaN outputs never compare equal, so every candidate
-    /// would be rejected as an invalid output rather than measured.
+    /// Two separate failures, both fatal to the measurement rather than to
+    /// the kernel. A NaN or infinite scale poisons its block in both variants
+    /// and two NaN outputs never compare equal. A merely *finite* scale is
+    /// not enough either: left to f16's full range, one block's scale can
+    /// dwarf the rest by ten orders of magnitude, and a dot product dominated
+    /// by one cancelling block differs between summation orders by more than
+    /// any honest tolerance allows.
     ///
     /// The sweep covers every 16-bit pattern, which is what justifies the
-    /// claim the caller relies on — that whatever halfword a decoder picks up
-    /// as a scale, it is finite afterwards. Every block format Meganeura reads
-    /// puts its scales at an even byte offset (Q4_K and Q5_K at 0 and 2, Q6_K
-    /// at 208, Q3_K at 108, and the split Q4/Q8 header regions on a 4-byte
-    /// stride), and every block length is even, so even offsets are the only
-    /// ones that need to hold.
+    /// claim the caller relies on: whatever halfword a decoder picks up as a
+    /// scale, it is finite and within [0.25, 4) afterwards. Every block
+    /// format Meganeura reads puts its scales at an even byte offset (Q4_K
+    /// and Q5_K at 0 and 2, Q6_K at 208, Q3_K at 108, GGML Q4_0 at 0, and the
+    /// split Q4/Q8 header regions on a 4-byte stride), and every block length
+    /// is even, so even offsets are the only ones that need to hold.
     #[test]
-    fn synthetic_packed_weights_decode_to_finite_scales() {
+    fn synthetic_packed_weights_decode_to_comparable_scales() {
         let mut data: Vec<f32> = (0..=u32::from(u16::MAX))
             .map(|low| f32::from_bits((low << 16) | low))
             .collect();
         let before = data.len();
-        finite_block_scales(&mut data);
+        tame_block_scales(&mut data);
         assert_eq!(data.len(), before);
+        let mut seen_negative = false;
         for (index, value) in data.iter().enumerate() {
             let bits = value.to_bits();
             for half in 0..2 {
                 let part = (bits >> (16 * half)) as u16;
+                let decoded = half::f16::from_bits(part).to_f32();
                 assert!(
-                    f16_is_finite(part),
-                    "pattern {index:#x} half {half} stayed non-finite: {part:#06x}"
+                    decoded.is_finite() && (0.25..4.0).contains(&decoded.abs()),
+                    "pattern {index:#x} half {half} decoded to {decoded}"
                 );
+                seen_negative |= decoded < 0.0;
             }
         }
+        // Signs survive, or every synthetic weight would be positive and a
+        // sign error in a decoder could not show up as disagreement.
+        assert!(seen_negative, "taming discarded the sign bit");
 
-        // Finite halfwords must be left alone, or the synthetic data would be
-        // quietly narrowed to a corner of the range.
-        let mut untouched = vec![f32::from_bits(0x3C00_3C00), f32::from_bits(0x1234_5678)];
-        let expected = untouched.clone();
-        finite_block_scales(&mut untouched);
-        assert_eq!(
-            untouched.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-        );
-    }
-
-    /// Is this f16 bit pattern a finite value (exponent not all ones)?
-    fn f16_is_finite(bits: u16) -> bool {
-        bits & 0x7C00 != 0x7C00
+        // Mantissas survive too, so the payload keeps varying.
+        let mantissas: std::collections::HashSet<u16> =
+            data.iter().map(|v| (v.to_bits() as u16) & 0x03FF).collect();
+        assert_eq!(mantissas.len(), 1024, "taming collapsed the mantissa");
     }
 
     #[test]

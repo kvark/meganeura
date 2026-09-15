@@ -3591,6 +3591,7 @@ fn assert_gguf_packed_matmul(
     let x = graph.input("x", &[m, k]);
     let w = match dtype {
         DType::Q4_0 => graph.parameter_q4("w", &[k, n]),
+        DType::Q40 => graph.parameter_q40("w", &[k, n]),
         DType::Q8_0 => graph.parameter_q8("w", &[k, n]),
         DType::Q4K => graph.parameter_q4k("w", &[k, n]),
         DType::Q6K => graph.parameter_q6k("w", &[k, n]),
@@ -3646,11 +3647,14 @@ fn k_quants_are_load_only_and_refuse_transposed_b() {
         DType::Q5K => g.parameter_q5k(name, shape),
         DType::Q6K => g.parameter_q6k(name, shape),
         DType::Q3K => g.parameter_q3k(name, shape),
+        DType::Q40 => g.parameter_q40(name, shape),
         other => panic!("unexpected dtype {other:?}"),
     };
 
     let mut failures = Vec::new();
-    for dtype in [DType::Q4K, DType::Q5K, DType::Q6K, DType::Q3K] {
+    // GGML Q4_0 is load-only for the same reason as the K-quants: the
+    // encoder Meganeura has produces its own asymmetric Q4, not this.
+    for dtype in [DType::Q4K, DType::Q5K, DType::Q6K, DType::Q3K, DType::Q40] {
         let (k, n) = (256usize, 4usize);
 
         // No host encoder: f32 upload must be refused.
@@ -3706,15 +3710,19 @@ fn gguf_packed_matmul_variants_match_ggml_reference() {
     use meganeura::load::gguf::{GgmlType, GgufTensor};
 
     type Build = fn(u32) -> Vec<u8>;
-    let formats: [(GgmlType, Build, bool); 4] = [
-        (GgmlType::Q4K, q4k_superblock as Build, false),
-        (GgmlType::Q5K, q5k_superblock as Build, false),
-        // 210 and 110 bytes: not whole words, so the odd-count case matters.
-        (GgmlType::Q6K, q6k_superblock as Build, true),
-        (GgmlType::Q3K, q3k_superblock as Build, true),
+    // (type, builder, elements per block, bytes per block)
+    let formats: [(GgmlType, Build, usize, usize); 5] = [
+        (GgmlType::Q4K, q4k_superblock as Build, 256, 144),
+        (GgmlType::Q5K, q5k_superblock as Build, 256, 176),
+        // 210, 110 and 18 bytes: not whole words, so the odd-count case
+        // matters for these three.
+        (GgmlType::Q6K, q6k_superblock as Build, 256, 210),
+        (GgmlType::Q3K, q3k_superblock as Build, 256, 110),
+        (GgmlType::Q4_0, q40_block as Build, 32, 18),
     ];
 
-    for (ty, build, unaligned) in formats {
+    for (ty, build, block, bytes) in formats {
+        let unaligned = !bytes.is_multiple_of(4);
         // (label, m, k, n)
         let mut shapes = vec![
             ("tiled", 3usize, 512usize, 4usize),
@@ -3725,12 +3733,14 @@ fn gguf_packed_matmul_variants_match_ggml_reference() {
             shapes.push(("odd pad", 2, 256, 3));
         }
         for (label, m, k, n) in shapes {
+            let blocks = k / block * n;
             let mut data = Vec::new();
-            for s in 0..(k / 256 * n) {
+            for s in 0..blocks {
                 data.extend_from_slice(&build(s as u32 + 1));
             }
-            if unaligned && (k / 256 * n) % 2 == 1 {
-                assert_eq!(data.len() % 4, 2, "{ty:?} {label}: expected a ragged tail");
+            assert_eq!(data.len(), blocks * bytes, "{ty:?} {label}: block size");
+            if unaligned && !(blocks * bytes).is_multiple_of(4) {
+                assert_ne!(data.len() % 4, 0, "{ty:?} {label}: expected a ragged tail");
             }
             assert_gguf_packed_matmul(
                 &format!("{ty:?} {label}"),
@@ -3740,6 +3750,30 @@ fn gguf_packed_matmul_variants_match_ggml_reference() {
             );
         }
     }
+}
+
+/// One GGML Q4_0 block: an f16 scale and sixteen nibble bytes spanning the
+/// full 0..15 range, so both halves of the split-nibble layout and both ends
+/// of the -8 bias are exercised.
+fn q40_block(seed: u32) -> Vec<u8> {
+    let mut st = seed | 1;
+    let mut rnd = || {
+        st = st.wrapping_mul(747796405).wrapping_add(2891336453);
+        let w = ((st >> ((st >> 28) + 4)) ^ st).wrapping_mul(277803737);
+        (w >> 22) ^ w
+    };
+    let mut b = vec![0u8; 18];
+    // A scale that varies per block, so a decoder reading the wrong block's
+    // header shows up rather than cancelling out.
+    let d = 0.015 + (seed % 7) as f32 * 0.004;
+    b[0..2].copy_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
+    for byte in b[2..18].iter_mut() {
+        *byte = (rnd() & 0xFF) as u8;
+    }
+    // Pin the extremes: nibble 0 decodes to -8d and nibble 15 to +7d.
+    b[2] = 0x0F;
+    b[3] = 0xF0;
+    b
 }
 
 /// One Q5_K superblock: a spread of scales and mins, plus full-range

@@ -26,13 +26,19 @@ pub enum WeightFormat {
     /// GGML Q3_K: 256-element superblocks, 2-bit quants with an inverted
     /// high bit. Load-only; see [`crate::graph::DType::Q3K`].
     Q3K,
+    /// GGML Q4_0: 32-element blocks of an f16 scale and 16 nibble bytes,
+    /// symmetric with no minimum. Load-only; see [`crate::graph::DType::Q40`].
+    ///
+    /// Distinct from [`WeightFormat::Q4`], which is Meganeura's own
+    /// asymmetric packing at half a bit per weight more.
+    Q40,
 }
 
 impl WeightFormat {
     pub fn is_quantized(self) -> bool {
         matches!(
             self,
-            Self::Q4 | Self::Q8 | Self::Q4K | Self::Q6K | Self::Q5K | Self::Q3K
+            Self::Q4 | Self::Q8 | Self::Q40 | Self::Q4K | Self::Q6K | Self::Q5K | Self::Q3K
         )
     }
 
@@ -50,6 +56,7 @@ impl WeightFormat {
             DType::F16 => Self::F16,
             DType::Q4_0 => Self::Q4,
             DType::Q8_0 => Self::Q8,
+            DType::Q40 => Self::Q40,
             DType::Q4K => Self::Q4K,
             DType::Q6K => Self::Q6K,
             DType::Q5K => Self::Q5K,

@@ -1,5 +1,20 @@
 # Unreleased
 
+- Native GGML Q4_0 storage (`DType::Q40`, `Graph::parameter_q40`). A `Q4_0`
+  GGUF is now read as GGML wrote it — 18-byte blocks of an f16 scale and 16
+  nibble bytes — instead of being rebuilt block by block into Meganeura's
+  wider Q4 at load. That removes the repack and 0.5 bits/weight: 4.5 against
+  5.0, because a symmetric format needs no per-block minimum.
+
+  The name is close to `DType::Q4_0`, which despite appearances is
+  Meganeura's own asymmetric Q4_1-style packing; `Q40` is GGML's symmetric
+  one. The two also order nibbles differently — GGML splits a block across
+  halves, pairing element `j` with `j + 16`, where Meganeura pairs
+  neighbours — so they are not interchangeable.
+
+  Load-only, like the K-quants: `set_parameter` refuses it and points at
+  `set_parameter_packed`. Q4_1 still repacks, since Meganeura's Q4 *is* the
+  Q4_1 shape, and that path no longer carries a symmetric branch.
 - The K-split GEMV family gains a measured shape: workgroup width (32, 64,
   128 or 256) and cross-lane reduction (a workgroup-memory halving tree, or
   `subgroupAdd` within a wave and one partial per wave through workgroup
@@ -20,6 +35,13 @@
   with the kernel the plan already runs rather than against an f32 reference
   dot, since forming one would mean writing a second block decoder and
   trusting it. Which shape wins is a device property and is not predicted.
+
+  The synthetic weights that qualification runs on have their block scales
+  pinned to [0.25, 4). Random bytes make hopeless scales twice over: about one
+  in thirty-two is NaN or infinite, and the rest span f16's whole range, so
+  one block can dwarf the others by ten orders of magnitude and a dot product
+  dominated by one cancelling block differs between summation orders by more
+  than any honest tolerance allows.
 
   `MEGANEURA_GEMV_REDUCTION=tree|subgroup` sets the starting point, alongside
   the existing `MEGANEURA_GEMV_THREADS`.
@@ -45,10 +67,11 @@
   `schema_version` is 2 and `ProfileError::TooManyDispatches` is gone.
 - GGUF weight import (`load::gguf`). Reads the container's metadata and tensor
   inventory, and resolves GGML's block encodings into Meganeura's at load time.
-  `Q4_0`, `Q4_1` and `Q8_0` repack losslessly for `set_parameter_packed` —
-  GGML splits a block's nibbles across halves and interleaves each block's
-  header with its payload, where Meganeura pairs adjacent nibbles and keeps
-  headers in their own region. The block *order* already agreed, since packing
+  `Q4_1` and `Q8_0` repack losslessly for `set_parameter_packed` — GGML
+  splits a block's nibbles across halves and interleaves each block's header
+  with its payload, where Meganeura pairs adjacent nibbles and keeps headers
+  in their own region. (`Q4_0` repacked here too until it gained native
+  storage, above.) The block *order* already agreed, since packing
   performs the `[K, N]` transpose that GGUF's layout implies. See
   `examples/gguf_info.rs`.
 - Native GGML K-quant storage: `Q4K`, `Q6K`, `Q5K` and `Q3K`, each with a
