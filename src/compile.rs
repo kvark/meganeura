@@ -130,6 +130,17 @@ pub struct CompileOptions {
     /// Enable the experimental reduced-precision cooperative flash
     /// backward kernels.
     pub flash_backward_coop: bool,
+    /// Quantize the activation row to Q8_1 inside the K-split GEMV and do
+    /// the inner product with integer dot products, where the weight is
+    /// GGML Q4_0.
+    ///
+    /// Off by default because it is the one switch here that changes the
+    /// numbers: the activation loses precision on top of the weight. Every
+    /// other kernel choice in this crate computes the same thing by another
+    /// route, so measurement is free to pick among them; this one is a
+    /// trade the caller has to make. Once enabled, the resulting kernel's
+    /// workgroup width and reduction are still measured like any other.
+    pub quantized_activations: bool,
 }
 
 impl Default for CompileOptions {
@@ -141,6 +152,7 @@ impl Default for CompileOptions {
             knobs: TuningKnobs::default(),
             flash_forward_coop: true,
             flash_backward_coop: false,
+            quantized_activations: false,
         }
     }
 }
@@ -940,6 +952,13 @@ pub struct Dispatch {
     /// Set by measured selection; None keeps the shared uniform-parameter kernel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conv_k_tile: Option<u32>,
+    /// The K-split GEMV quantizes its activation row to Q8_1 and uses
+    /// integer dot products against a GGML Q4_0 weight.
+    ///
+    /// Set from [`CompileOptions::quantized_activations`]; changes the
+    /// numbers, so it is never turned on by measurement.
+    #[serde(default)]
+    pub gemv_int_dot: bool,
     /// Workgroup width and cross-lane reduction for a K-split GEMV.
     ///
     /// Set by measured selection; None keeps the group's initial shape. Which
@@ -2919,6 +2938,10 @@ impl<'a> Compiler<'a> {
                         use_coop: false,
                         use_small_tiles: false,
                         weight_format: wf,
+                        // The int-dot kernel reads GGML's split-nibble Q4_0
+                        // directly; no other weight format has a layout it
+                        // can feed without a shuffle.
+                        gemv_int_dot: self.options.quantized_activations && wf == WeightFormat::Q40,
                         ..Default::default()
                     });
                 } else {

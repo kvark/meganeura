@@ -3601,7 +3601,21 @@ fn assert_gguf_packed_matmul(
     };
     let out = graph.matmul(x, w);
     graph.set_outputs(vec![out]);
-    let mut session = meganeura::build(&graph, meganeura::SessionConfig::inference_from_env()).0;
+    // This compares against GGML's own dequantizer at f32 tolerance, which
+    // is a claim about the decode path. Quantized activations deliberately
+    // compute something else, so they are pinned off here rather than
+    // letting the environment decide what this test measures.
+    let mut session = meganeura::build(
+        &graph,
+        meganeura::SessionConfig {
+            options: meganeura::compile::CompileOptions {
+                quantized_activations: false,
+                ..meganeura::compile::CompileOptions::from_env()
+            },
+            ..meganeura::SessionConfig::inference_from_env()
+        },
+    )
+    .0;
     session.set_input("x", &input);
     session.set_parameter_packed("w", &packed);
     session.step();

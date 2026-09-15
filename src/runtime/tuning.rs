@@ -88,6 +88,13 @@ impl Pipelines {
 fn tile_module(dispatch: &Dispatch, tile: MatmulTile) -> crate::codegen::ShaderModule {
     let entry = &dispatch.shader;
     if let MatmulTile::Gemv(shape) = tile {
+        // The int-dot kernel is a different computation, not a different
+        // route to the same one, so a shape candidate has to stay inside it.
+        // Generating the ordinary GEMV here would quietly swap the
+        // activation back to f32 and change what the plan computes.
+        if dispatch.gemv_int_dot {
+            return crate::codegen::generate_module_gemv_int_dot(shape);
+        }
         let group = crate::tune::gemv_group(entry).expect("GEMV candidate on a GEMV entry");
         return crate::codegen::generate_module_gemv(group, dispatch.weight_format, shape);
     }
@@ -118,6 +125,9 @@ fn tile_module(dispatch: &Dispatch, tile: MatmulTile) -> crate::codegen::ShaderM
 fn tile_variant(dispatch: &Dispatch, tile: MatmulTile) -> Variant {
     let entry = &dispatch.shader;
     if let MatmulTile::Gemv(shape) = tile {
+        if dispatch.gemv_int_dot {
+            return Variant::GemvIntDot(entry.clone(), shape);
+        }
         return Variant::Gemv(entry.clone(), dispatch.weight_format, shape);
     }
     if let MatmulTile::SpecializedConv { k_tile, .. } = tile {

@@ -1077,6 +1077,9 @@ enum Variant {
     CoopPrologue(ShaderEntry, Vec<crate::compile::PrologueLoadKind>),
     /// GEMV with a RmsNorm folded into its A operand.
     GemvRmsNorm(ShaderEntry),
+    /// The Q8_1-activation, integer-dot K-split GEMV at a measured shape.
+    /// Only ever paired with a GGML Q4_0 weight, so the format is implied.
+    GemvIntDot(ShaderEntry, crate::codegen::GemvShape),
     /// A K-split GEMV at a measured workgroup width and reduction, for the
     /// weight format it reads. Every other axis of the GEMV family — fused
     /// add, transposed B, f16, block-packed — is already in the entry and
@@ -1133,6 +1136,7 @@ impl Variant {
             | Variant::CoopPrologue(ref e, _)
             | Variant::GemvRmsNorm(ref e)
             | Variant::Gemv(ref e, _, _)
+            | Variant::GemvIntDot(ref e, _)
             | Variant::Weight(ref e, _)
             | Variant::Coop(ref e)
             | Variant::CoopCompensated(ref e)
@@ -1157,6 +1161,9 @@ impl Variant {
                 format!("{e:?}:cooperative-prologue:{kinds:?}")
             }
             Variant::GemvRmsNorm(ref e) => format!("{e:?}:rmsnorm"),
+            Variant::GemvIntDot(ref e, shape) => {
+                format!("{e:?}:gemv-q40-q8-{}t-{:?}", shape.threads, shape.reduction)
+            }
             Variant::Gemv(ref e, format, shape) => format!(
                 "{e:?}:gemv-{format:?}-{}t-{:?}",
                 shape.threads, shape.reduction
@@ -1532,6 +1539,33 @@ impl Pipelines {
             map.insert(key, pipeline);
         }
 
+        // Compile the int-dot GEMV for any dispatch that asked for it.
+        // Unlike a shape, this is not something measurement can turn on, so
+        // it is always present when the plan says so.
+        for dispatch in &plan.dispatches {
+            if !dispatch.gemv_int_dot {
+                continue;
+            }
+            let shape = dispatch
+                .gemv_shape
+                .unwrap_or_else(|| crate::codegen::GemvShape::initial(ShaderGroup::MatMulGemv));
+            let key = Variant::GemvIntDot(dispatch.shader.clone(), shape);
+            if let std::collections::hash_map::Entry::Vacant(slot) = map.entry(key.clone()) {
+                let sm = crate::codegen::generate_module_gemv_int_dot(shape);
+                let shader = gpu.create_shader(bg::ShaderDesc {
+                    source: &sm.source,
+                    naga_module: Some(sm.module),
+                });
+                let layout = shader_data_layout(&dispatch.shader);
+                slot.insert(create_profiled_pipeline(
+                    gpu,
+                    key.label(),
+                    &layout,
+                    shader.at(dispatch.shader.entry_point()),
+                ));
+            }
+        }
+
         // Compile any GEMV shape a plan already carries. Tuning inserts its
         // own pipelines as it measures, so this is for a plan that arrives
         // with a shape on it — deserialized, or rebuilt after a swap. Without
@@ -1832,6 +1866,14 @@ impl Pipelines {
         // dispatch — the ordering just makes that explicit.
         if dispatch.gemv_rmsnorm.is_some() {
             out.push(Variant::GemvRmsNorm(entry.clone()));
+        }
+        if dispatch.gemv_int_dot {
+            out.push(Variant::GemvIntDot(
+                entry.clone(),
+                dispatch
+                    .gemv_shape
+                    .unwrap_or_else(|| crate::codegen::GemvShape::initial(entry.shader_group())),
+            ));
         }
         if let Some(shape) = dispatch.gemv_shape {
             out.push(Variant::Gemv(entry.clone(), dispatch.weight_format, shape));

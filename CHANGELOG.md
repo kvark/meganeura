@@ -1,5 +1,29 @@
 # Unreleased
 
+- Q8_1 activations and integer dot products for the K-split GEMV against
+  GGML Q4_0 weights, behind `CompileOptions::quantized_activations` (or
+  `MEGANEURA_QUANTIZED_ACTIVATIONS`). The arithmetic is llama.cpp's
+  `vec_dot_q4_0_q8_1`: a block reduces to eight `dot4I8Packed` calls plus one
+  correction term for Q4_0's -8 bias, and the integer products are exact.
+
+  This is the one kernel choice here that changes the numbers — the
+  activation loses precision on top of the weight — so it is never turned on
+  by measurement, only by the caller. Once on, the resulting kernel's
+  workgroup width and reduction are measured like any other, and a shape
+  candidate is generated inside it rather than falling back to the f32-
+  activation GEMV, which would have swapped the computation out silently.
+
+  GGML's split-nibble layout is what makes it work: one word of `qs` yields
+  two int8x4 vectors of consecutive elements, each pairing with one word of
+  Q8_1 quants. Meganeura's own Q4 pairs neighbouring elements in a byte and
+  could not feed this without a shuffle, so the path is Q4_0-only.
+
+  The activation is quantized in the kernel, not in a dispatch of its own:
+  every thread takes whole 32-element blocks and reuses each across the four
+  columns its workgroup owns, so no workgroup memory, no barrier and no extra
+  dispatch are involved. `dot4I8Packed` needs no capability — naga emits
+  `OpSDot` where the device has integer dot product and a shift-and-add
+  polyfill where it does not.
 - Native GGML Q4_0 storage (`DType::Q40`, `Graph::parameter_q40`). A `Q4_0`
   GGUF is now read as GGML wrote it — 18-byte blocks of an f16 scale and 16
   nibble bytes — instead of being rebuilt block by block into Meganeura's

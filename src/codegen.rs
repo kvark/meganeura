@@ -1915,6 +1915,11 @@ fn gemv_shape_source(source: &str, shape: GemvShape) -> String {
             &format!("array<f32, {threads}>"),
         )
         .replace(&format!("kk += {initial}u;"), &format!("kk += {threads}u;"))
+        // The int-dot GEMV strides whole blocks rather than elements.
+        .replace(
+            &format!("blk += {initial}u;"),
+            &format!("blk += {threads}u;"),
+        )
         .replace(&format!("si += {initial}u;"), &format!("si += {threads}u;"))
         .replace(
             &format!("var sstride = {}u;", initial / 2),
@@ -2048,6 +2053,18 @@ fn gemv_source(group: ShaderGroup, mode: WeightFormat) -> String {
             gemv_packed_source(base, helpers.as_str(), call)
         }
     }
+}
+
+/// The Q8_1-activation, integer-dot GEMV at an explicit shape.
+///
+/// Only GGML Q4_0 feeds this: its split-nibble blocks hand out two int8x4
+/// vectors of consecutive elements per word, which is exactly what
+/// `dot4I8Packed` wants. See `shaders/matmul_gemv_q40_q8.wgsl`.
+pub(crate) fn generate_module_gemv_int_dot(shape: GemvShape) -> ShaderModule {
+    parse_wgsl(&gemv_shape_source(
+        include_str!("shaders/matmul_gemv_q40_q8.wgsl"),
+        shape,
+    ))
 }
 
 /// Generate one GEMV pipeline at an explicit shape.
@@ -6767,6 +6784,56 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// The int-dot GEMV takes the same shape axis as the rest of the family.
+    ///
+    /// It is a separate source rather than a substitution into
+    /// `matmul_gemv.wgsl`, so nothing guarantees the shaping markers still
+    /// line up except checking. Validation runs with `SUBGROUP` and
+    /// `SHADER_FLOAT16_IN_FLOAT32` only — notably not any integer-dot
+    /// capability, because `dot4I8Packed` needs none: naga emits `OpSDot`
+    /// where the device has it and a shift-and-add polyfill where it does
+    /// not.
+    #[test]
+    fn the_int_dot_gemv_takes_every_shape() {
+        for threads in [32, 64, 128, 256] {
+            for reduction in [GemvReduction::Tree, GemvReduction::Subgroup] {
+                let shape = GemvShape { threads, reduction };
+                let module = generate_module_gemv_int_dot(shape);
+                let caps = naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32
+                    | match reduction {
+                        GemvReduction::Tree => naga::valid::Capabilities::empty(),
+                        GemvReduction::Subgroup => naga::valid::Capabilities::SUBGROUP,
+                    };
+                let flags =
+                    naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
+                naga::valid::Validator::new(flags, caps)
+                    .validate(&module.module)
+                    .unwrap_or_else(|e| panic!("{shape:?} failed validation: {e:#?}"));
+                assert!(
+                    module.source.contains("dot4I8Packed"),
+                    "{shape:?} lost the integer dot product"
+                );
+                assert!(
+                    module
+                        .source
+                        .contains(&format!("@workgroup_size({threads})")),
+                    "{shape:?} kept the declared width"
+                );
+                // The K-stride here counts blocks, not elements, so it has
+                // its own rewrite and its own way to be missed.
+                assert!(
+                    module.source.contains(&format!("blk += {threads}u;")),
+                    "{shape:?} did not restride the block loop"
+                );
+                assert_eq!(
+                    module.source.contains("subgroupAdd"),
+                    reduction == GemvReduction::Subgroup,
+                    "{shape:?} reduction mismatch"
+                );
             }
         }
     }

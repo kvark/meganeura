@@ -147,7 +147,13 @@ GGML writes them and decoded in the shaders, so the weights of a `Q4_0`,
 repacked into Meganeura's own block layout on the host instead, since
 Meganeura's Q4 and Q8 are those same shapes. The natively stored formats are
 load-only: no encoder for them is implemented here, so `set_parameter`
-rejects them and points at `set_parameter_packed`. `Q2_K` and `Q8_K` are listed in the
+rejects them and points at `set_parameter_packed`.
+
+`CompileOptions::quantized_activations` additionally quantizes the GEMV
+activation row to Q8_1 and runs the inner product on integer dot products
+against a `Q4_0` weight, following llama.cpp's `vec_dot_q4_0_q8_1`. It is off
+by default and is the only kernel switch here that changes results rather
+than the route to them, so it is never selected by measurement. `Q2_K` and `Q8_K` are listed in the
 inventory but not read, and quantized embedding tables have no gather
 variant.
 
@@ -213,6 +219,7 @@ win, so explicit code always has the last word.
 | `MEGANEURA_GEMV_ADD_THREADS=<n>` | The same for the fused-add GEMV. |
 | `MEGANEURA_GEMV_BT_THREADS=<n>` | The same for the transposed-B GEMV. |
 | `MEGANEURA_GEMV_REDUCTION=tree\|subgroup` | Starting cross-lane reduction for K-split GEMV. |
+| `MEGANEURA_QUANTIZED_ACTIVATIONS` | Quantize GEMV activations to Q8_1 and use integer dot products against GGML Q4_0 weights. Changes the numbers. |
 | `MEGANEURA_GPU_TIMING` | Enable hardware timestamp pools (set before context creation). |
 | `MEGANEURA_GPU_CAPTURE` | Enable Blade's native-tool labels and shader debug information before context creation; independent of GPU timing. |
 

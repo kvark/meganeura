@@ -21,6 +21,7 @@ mod gradcheck_vision;
 mod gradcheck_vision_large;
 mod horizontal_matmul;
 mod inference_parity_large;
+mod int_dot_gemv;
 mod intermediate_output_aliasing;
 mod laprop;
 mod materialize;
