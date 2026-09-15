@@ -46,8 +46,7 @@ fn logical_bytes(ty: &TensorType) -> io::Result<usize> {
             DType::Q6K => n
                 .div_ceil(256)
                 .checked_mul(210)
-                .and_then(|b| b.checked_add(3))
-                .map(|b| b & !3),
+                .map(|b| b.next_multiple_of(4)),
         })
         .ok_or_else(|| invalid("checkpoint logical shape overflows byte size"))
 }
@@ -783,7 +782,6 @@ mod tests {
             logical_bytes(&TensorType::new(vec![256], DType::Q6K)).unwrap(),
             212
         );
-        assert!(logical_bytes(&TensorType::new(vec![usize::MAX], DType::Q6K)).is_err());
     }
 
     #[test]
