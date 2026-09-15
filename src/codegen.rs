@@ -262,6 +262,16 @@ pub fn generate_matmul_with_epilogue(
     epilogue: EpilogueSource<'_>,
     options: MatMulOptions,
 ) -> ShaderModule {
+    // Store-side fusion compiles through this generator rather than
+    // `generate_module_weighted`, which already refuses quantized BT.
+    if matches!(group, ShaderGroup::MatMulBT | ShaderGroup::MatMulBTAdd)
+        && options.format.is_quantized()
+    {
+        panic!(
+            "matmul_bt does not support block-quantized weights: their blocks \
+             run along the parameter's first dimension, which is N here, not K"
+        );
+    }
     let (epi_decl, epi_body) = match epilogue {
         EpilogueSource::Dag(dag) => matmul_epilogue_to_wgsl(dag),
         EpilogueSource::Ops(ops) => epilogue_to_wgsl(ops),
@@ -1838,7 +1848,7 @@ pub fn generate_module_weighted(group: ShaderGroup, format: WeightFormat) -> Sha
         ShaderGroup::Embedding if mode == WeightFormat::F16 => {
             parse_wgsl(include_str!("shaders/embedding_f16.wgsl"))
         }
-        // Every nibble-packed format takes the same K-split GEMV with its
+        // Every block-packed format takes the same K-split GEMV with its
         // own decoder substituted, so the format picks the helper rather
         // than the arm.
         ShaderGroup::MatMulGemv | ShaderGroup::MatMulGemvAdd if packed_decoder(mode).is_some() => {
@@ -1850,24 +1860,20 @@ pub fn generate_module_weighted(group: ShaderGroup, format: WeightFormat) -> Sha
             };
             gen_matmul_gemv_packed(src, helpers, call)
         }
-        ShaderGroup::MatMulGemv | ShaderGroup::MatMulGemvBT if mode == WeightFormat::F16 => {
-            if group == ShaderGroup::MatMulGemv {
-                gen_matmul_gemv_f16()
+        ShaderGroup::MatMulGemv | ShaderGroup::MatMulGemvAdd if mode == WeightFormat::F16 => {
+            let src = if group == ShaderGroup::MatMulGemv {
+                include_str!("shaders/matmul_gemv.wgsl")
             } else {
-                gen_matmul_gemv_bt_f16()
-            }
+                include_str!("shaders/matmul_gemv_add.wgsl")
+            };
+            gen_matmul_gemv_f16(src)
         }
-        // MatMulGemvBT has no packed variant; compile.rs keeps Q4 and Q4_K
-        // off that specialization so this never emits an f32 shader for
-        // packed data.
-        //
-        // Q4_K is newer than that arrangement and has fewer variants, so it
-        // asserts rather than trusting the routing: falling through here
-        // would read 144-byte superblocks as f32 and produce plausible
-        // garbage rather than an error.
-        _ if matches!(mode, WeightFormat::Q4K | WeightFormat::Q6K) => panic!(
-            "no {mode:?} variant for {group:?}; the K-quants are supported on \
-             the tiled matmul groups and the K-split GEMV only"
+        ShaderGroup::MatMulGemvBT if mode == WeightFormat::F16 => gen_matmul_gemv_bt_f16(),
+        // Unsupported packed routes must fail closed: falling through would
+        // read compressed bytes as f32 and produce plausible garbage.
+        _ if mode.is_quantized() => panic!(
+            "no {mode:?} variant for {group:?}; block-quantized weights are \
+             supported on forward tiled matmul groups and K-split GEMV only"
         ),
         _ => generate_module(group),
     }
@@ -2006,13 +2012,14 @@ fn gemv_width_source(source: &str, variable: &str, initial: u32) -> String {
 fn packed_decoder(mode: WeightFormat) -> Option<(&'static str, &'static str)> {
     match mode {
         WeightFormat::Q4 => Some((Q4_DEQUANT_FN, "dequant_q4")),
+        WeightFormat::Q8 => Some((Q8_DEQUANT_FN, "dequant_q8")),
         WeightFormat::Q4K => Some((Q4K_DEQUANT_FN, "dequant_q4k")),
         WeightFormat::Q6K => Some((Q6K_DEQUANT_FN, "dequant_q6k")),
         _ => None,
     }
 }
 
-/// Re-point a K-split GEMV at a nibble-packed B buffer.
+/// Re-point a K-split GEMV at a block-packed B buffer.
 ///
 /// The GEMV reads B as `vec4<f32>` rows; `helpers` supplies the WGSL dequant
 /// functions and `call` names the scalar entry point, so the four columns of
@@ -2042,12 +2049,12 @@ fn gen_matmul_gemv_packed(src: &str, helpers: &str, call: &str) -> ShaderModule 
     parse_wgsl(&src)
 }
 
-fn gen_matmul_gemv_f16() -> ShaderModule {
+fn gen_matmul_gemv_f16(src: &str) -> ShaderModule {
     // `enable` directives must precede every declaration, so prepend rather
     // than splice at the matrix_b declaration - spliced there it landed
     // after matrix_a and the shader could never compile.
     let src = "enable f16;\n".to_string()
-        + &include_str!("shaders/matmul_gemv.wgsl")
+        + &src
             .replace(
                 "var<storage> matrix_b: array<vec4<f32>>;",
                 "var<storage> matrix_b: array<vec4<f16>>;",
@@ -6611,9 +6618,6 @@ mod tests {
             ShaderGroup::MatMulAdd,
             ShaderGroup::MatMulAT,
             ShaderGroup::MatMulATAdd,
-            // Decode is m=1, which compile.rs routes to these instead.
-            ShaderGroup::MatMulGemv,
-            ShaderGroup::MatMulGemvAdd,
         ] {
             let sm = generate_module_weighted(group, WeightFormat::Q4);
             assert!(
@@ -6631,6 +6635,25 @@ mod tests {
                 );
             }
             eprintln!("Q4 {group:?} shader: {} chars", sm.source.len());
+        }
+    }
+
+    #[test]
+    fn reduced_storage_gemv_variants_keep_typed_b() {
+        for (format, marker) in [
+            (WeightFormat::F16, "array<vec4<f16>>"),
+            (WeightFormat::Q4, "dequant_q4("),
+            (WeightFormat::Q8, "dequant_q8("),
+            (WeightFormat::Q4K, "dequant_q4k("),
+            (WeightFormat::Q6K, "dequant_q6k("),
+        ] {
+            for group in [ShaderGroup::MatMulGemv, ShaderGroup::MatMulGemvAdd] {
+                let source = generate_module_weighted(group, format).source;
+                assert!(
+                    source.contains(marker) && !source.contains("matrix_b: array<vec4<f32>>"),
+                    "{format:?} {group:?} did not retain its B representation"
+                );
+            }
         }
     }
 
@@ -6673,6 +6696,20 @@ mod tests {
         );
     }
 
+    #[test]
+    #[should_panic(expected = "does not support block-quantized")]
+    fn quantized_bt_epilogue_is_refused() {
+        let relu = [crate::compile::EpilogueOp::Relu];
+        let _ = generate_matmul_with_epilogue(
+            ShaderGroup::MatMulBTAdd,
+            EpilogueSource::Ops(&relu),
+            MatMulOptions {
+                format: WeightFormat::Q4K,
+                ..Default::default()
+            },
+        );
+    }
+
     /// Q4_K is read out of a GGUF file unmodified, so the shader must
     /// declare B as words and decode superblocks rather than load floats.
     #[test]
@@ -6706,11 +6743,6 @@ mod tests {
             tiled.source.contains("dequant_q6k_pack8"),
             "Q6_K tiled MatMul must use batched staging"
         );
-        let gemv = generate_module_weighted(ShaderGroup::MatMulGemv, WeightFormat::Q6K);
-        assert!(
-            gemv.source.contains("dequant_q6k") && gemv.source.contains("array<u32>"),
-            "Q6_K GEMV must decode superblocks"
-        );
     }
 
     #[test]
@@ -6742,26 +6774,24 @@ mod tests {
             tiled.source.contains("dequant_q4k_pack8"),
             "Q4_K tiled MatMul must use batched staging"
         );
-        // Decode runs the K-split GEMV, which is a different shader.
-        let gemv = generate_module_weighted(ShaderGroup::MatMulGemv, WeightFormat::Q4K);
-        assert!(
-            gemv.source.contains("dequant_q4k") && gemv.source.contains("array<u32>"),
-            "Q4_K GEMV must decode superblocks"
-        );
-    }
-
-    /// Falling through to the f32 module for a Q4_K dispatch would read
-    /// 144-byte superblocks as floats and produce plausible garbage.
-    #[test]
-    #[should_panic(expected = "no Q4K variant")]
-    fn q4k_refuses_groups_without_a_variant() {
-        let _ = generate_module_weighted(ShaderGroup::MatMulGemvBT, WeightFormat::Q4K);
     }
 
     #[test]
-    #[should_panic(expected = "no Q6K variant")]
-    fn q6k_refuses_groups_without_a_variant() {
-        let _ = generate_module_weighted(ShaderGroup::MatMulGemvBT, WeightFormat::Q6K);
+    fn block_formats_refuse_groups_without_a_variant() {
+        for format in [
+            WeightFormat::Q4,
+            WeightFormat::Q8,
+            WeightFormat::Q4K,
+            WeightFormat::Q6K,
+        ] {
+            assert!(
+                std::panic::catch_unwind(|| {
+                    generate_module_weighted(ShaderGroup::MatMulGemvBT, format)
+                })
+                .is_err(),
+                "{format:?} GEMV-BT fell through to an f32 shader"
+            );
+        }
     }
 
     /// Packing runs along the parameter's first dimension; every packed
@@ -6845,24 +6875,5 @@ mod tests {
                 "{group:?}: small epilogue must not use 64-wide staging maps"
             );
         }
-    }
-
-    /// `MatMulGemvBT` is the one GEMV group still without a Q4 variant:
-    /// it reads B as [N, K] while the Q4 block layout runs along K per
-    /// column of a [K, N] weight. `compile.rs` therefore keeps Q4 off
-    /// that specialization — without the guard it would emit the f32
-    /// shader over packed blocks, which is how m=1 Q4 returned ~1e37.
-    ///
-    /// When a Q4 GEMV-BT shader lands, move the group into the test above
-    /// and drop that guard.
-    #[test]
-    fn q4_gemv_bt_shader_does_not_exist_yet() {
-        let sm = generate_module_weighted(ShaderGroup::MatMulGemvBT, WeightFormat::Q4);
-        assert!(
-            !sm.source.contains("dequant_q4"),
-            "MatMulGemvBT now has a Q4 variant — drop the WeightFormat::Q4 \
-             guard on the MatMulBT GEMV branch in compile.rs and move this \
-             group into q4_matmul_shader_generates"
-        );
     }
 }

@@ -138,7 +138,7 @@ See the [checkpoint implementation](src/runtime/checkpoint.rs) for format
 compatibility and restore checks. Resident buffer counts do not measure
 driver peak memory.
 
-Pretrained models can be loaded from ONNX or NNEF via `meganeura::load_onnx(...)` / `meganeura::load_nnef(...)`. Both lower through Meganeura’s IR, so the same graph rewrites apply to imported graphs and hand-built ones.
+Pretrained models can be loaded from ONNX or NNEF via `meganeura::load_onnx(...)` / `meganeura::load_nnef(...)`. Both lower through Meganeura’s IR, so the same graph rewrites apply to imported graphs and hand-built ones. GGUF files are a weight-and-metadata container rather than a graph: `meganeura::load_gguf(...)` yields named tensors; packed weights use `Session::set_parameter_packed`, while unpacked weights use `to_f32` and `set_parameter` (see `examples/gguf_info.rs`).
 
 ## System requirements
 

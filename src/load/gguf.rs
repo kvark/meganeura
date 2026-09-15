@@ -30,7 +30,7 @@
 //! the first dimension while every packed decoder indexes along `params.k`;
 //! for a transposed `[N, K]` weight those are different axes, so block
 //! formats have no correct reading on `MatMulBT` and `compile.rs` refuses
-//! the K-quants there.
+//! them there.
 //!
 //! # What is resolved here
 //!
@@ -265,7 +265,15 @@ impl GgufValue {
         Some(match *self {
             Self::F32(v) => f64::from(v),
             Self::F64(v) => v,
-            _ => return self.as_u64().map(|v| v as f64),
+            Self::U8(v) => f64::from(v),
+            Self::I8(v) => f64::from(v),
+            Self::U16(v) => f64::from(v),
+            Self::I16(v) => f64::from(v),
+            Self::U32(v) => f64::from(v),
+            Self::I32(v) => f64::from(v),
+            Self::U64(v) => v as f64,
+            Self::I64(v) => v as f64,
+            _ => return None,
         })
     }
 
@@ -288,7 +296,7 @@ impl GgufValue {
 
 /// One tensor: its logical shape, its GGML type, and its bytes exactly as
 /// they appear in the file.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct GgufTensor {
     /// Dimensions in GGUF order, fastest-varying first. For a 2-D
     /// projection weight this is `[K, N]`.
@@ -300,6 +308,16 @@ pub struct GgufTensor {
     /// This tensor's slice of it. Empty for a type whose block size is
     /// unknown, since there is no way to say where its bytes end.
     range: std::ops::Range<usize>,
+}
+
+impl std::fmt::Debug for GgufTensor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GgufTensor")
+            .field("dims", &self.dims)
+            .field("ggml_type", &self.ggml_type)
+            .field("data_range", &self.range)
+            .finish()
+    }
 }
 
 impl GgufTensor {
@@ -325,6 +343,18 @@ impl GgufTensor {
     /// Total element count.
     pub fn num_elements(&self) -> usize {
         self.dims.iter().product()
+    }
+
+    fn element_count(&self) -> Result<usize, GgufError> {
+        self.dims
+            .iter()
+            .try_fold(1usize, |n, &dim| n.checked_mul(dim))
+            .ok_or_else(|| {
+                GgufError::BadShape(format!(
+                    "tensor dimensions {:?} overflow this platform",
+                    self.dims
+                ))
+            })
     }
 
     /// `(K, N)` for a 2-D tensor; `(n, 1)` for a 1-D one.
@@ -406,9 +436,18 @@ impl GgufTensor {
     /// not implement.
     pub fn to_packed(&self) -> Result<(DType, Cow<'_, [u8]>), GgufError> {
         let dtype = self.packed_dtype()?;
+        let count = self.element_count()?;
+        let expect = self.ggml_type.stored_bytes(count)?;
+        if self.data().len() != expect {
+            return Err(GgufError::BadShape(format!(
+                "{:?} tensor of {count} elements needs {expect} bytes, has {}",
+                self.ggml_type,
+                self.data().len()
+            )));
+        }
         let bytes = match self.ggml_type {
-            GgmlType::Q4_0 | GgmlType::Q4_1 => Cow::Owned(self.repack_q4()?),
-            GgmlType::Q8_0 => Cow::Owned(self.repack_q8()),
+            GgmlType::Q4_0 | GgmlType::Q4_1 => Cow::Owned(self.repack_q4(count)?),
+            GgmlType::Q8_0 => Cow::Owned(self.repack_q8(count)),
             // The K-quants are already in GGML's layout, so these borrow
             // the file rather than copying it.
             GgmlType::Q4K => Cow::Borrowed(self.data()),
@@ -435,7 +474,7 @@ impl GgufTensor {
 
     /// GGUF-order values, one f32 per element.
     fn dequantize_flat(&self) -> Result<Vec<f32>, GgufError> {
-        let count = self.num_elements();
+        let count = self.element_count()?;
         let expect = self.ggml_type.stored_bytes(count)?;
         if self.data().len() != expect {
             return Err(GgufError::BadShape(format!(
@@ -480,9 +519,8 @@ impl GgufTensor {
     ///   elements, `qs[e / 2]` holding `e` and `e + 1`.
     /// * GGML interleaves each block's header with its payload; Meganeura
     ///   keeps all `(d, m)` words first and all nibble words after.
-    fn repack_q4(&self) -> Result<Vec<u8>, GgufError> {
+    fn repack_q4(&self, count: usize) -> Result<Vec<u8>, GgufError> {
         let src_bytes = self.data();
-        let count = self.num_elements();
         let blocks = count / 32;
         let stride = self
             .ggml_type
@@ -533,9 +571,9 @@ impl GgufTensor {
     /// Same block order, same element order, same `value = q * d`. The only
     /// difference is that Meganeura pads the f16 scale out to a full word so
     /// the quants start word-aligned, making each block 36 bytes to GGML's 34.
-    fn repack_q8(&self) -> Vec<u8> {
+    fn repack_q8(&self, count: usize) -> Vec<u8> {
         let src_bytes = self.data();
-        let blocks = self.num_elements() / 32;
+        let blocks = count / 32;
         let mut out = vec![0u8; blocks * 36];
         for b in 0..blocks {
             let src = b * 34;
@@ -689,9 +727,8 @@ impl<'a> Reader<'a> {
 
 /// Load a GGUF file from disk.
 ///
-/// The file is read once and shared by every tensor, so peak memory is
-/// roughly the file itself rather than the file plus a copy of each
-/// payload.
+/// The file is retained once and shared by every tensor rather than copied
+/// into one allocation per payload.
 pub fn load_gguf(path: &Path) -> Result<GgufModel, GgufError> {
     load_gguf_shared(Arc::from(std::fs::read(path)?))
 }
@@ -734,7 +771,7 @@ pub fn load_gguf_shared(file: Arc<[u8]>) -> Result<GgufModel, GgufError> {
     // 24-byte header ask for a `usize::MAX` allocation, which aborts on
     // capacity overflow instead of returning an error. The smallest record
     // either can produce is a few bytes, so anything beyond the remaining
-    // input is a malformed header; reserve within what is actually there.
+    // input is a malformed header; reject that and cap eager reservations.
     let remaining = bytes.len() - r.pos;
     if tensor_count > remaining || kv_count > remaining {
         return Err(GgufError::BadHeader(format!(
@@ -743,7 +780,7 @@ pub fn load_gguf_shared(file: Arc<[u8]>) -> Result<GgufModel, GgufError> {
         )));
     }
 
-    let mut metadata = HashMap::with_capacity(kv_count);
+    let mut metadata = HashMap::with_capacity(kv_count.min(1024));
     for _ in 0..kv_count {
         let key = r.string()?;
         let tag = r.u32()?;
@@ -758,7 +795,7 @@ pub fn load_gguf_shared(file: Arc<[u8]>) -> Result<GgufModel, GgufError> {
         ggml_type: GgmlType,
         offset: usize,
     }
-    let mut infos = Vec::with_capacity(tensor_count);
+    let mut infos = Vec::with_capacity(tensor_count.min(1024));
     for _ in 0..tensor_count {
         let name = r.string()?;
         let n_dims = r.u32()? as usize;
@@ -791,19 +828,33 @@ pub fn load_gguf_shared(file: Arc<[u8]>) -> Result<GgufModel, GgufError> {
 
     // Tensor data begins at the next alignment boundary after the infos, and
     // each offset is relative to that point rather than to the file start.
-    let alignment = metadata
-        .get("general.alignment")
-        .and_then(GgufValue::as_u64)
-        .unwrap_or(32) as usize;
-    if alignment == 0 || !alignment.is_power_of_two() {
+    let alignment = match metadata.get("general.alignment") {
+        Some(value) => value.as_u64().ok_or_else(|| {
+            GgufError::BadHeader("general.alignment must be an unsigned integer".into())
+        })?,
+        None => 32,
+    };
+    let alignment = usize::try_from(alignment)
+        .map_err(|_| GgufError::BadHeader("general.alignment is too large".into()))?;
+    if alignment == 0 || !alignment.is_multiple_of(8) {
         return Err(GgufError::BadHeader(format!(
-            "general.alignment must be a power of two, got {alignment}"
+            "general.alignment must be a non-zero multiple of 8, got {alignment}"
         )));
     }
-    let data_start = r.pos.next_multiple_of(alignment);
+    let data_start = r
+        .pos
+        .checked_add(alignment - 1)
+        .map(|end| end / alignment * alignment)
+        .ok_or_else(|| GgufError::BadHeader("tensor-data alignment overflows".into()))?;
 
     let mut tensors: HashMap<String, GgufTensor> = HashMap::with_capacity(infos.len());
     for info in infos {
+        if !info.offset.is_multiple_of(alignment) {
+            return Err(GgufError::BadHeader(format!(
+                "tensor `{}` offset {} is not aligned to {alignment} bytes",
+                info.name, info.offset
+            )));
+        }
         let count = info
             .dims
             .iter()
@@ -1001,6 +1052,7 @@ mod tests {
         infos: Vec<u8>,
         info_count: u64,
         data: Vec<u8>,
+        alignment: usize,
     }
 
     impl Builder {
@@ -1011,6 +1063,7 @@ mod tests {
                 infos: Vec::new(),
                 info_count: 0,
                 data: Vec::new(),
+                alignment: 32,
             }
         }
 
@@ -1035,7 +1088,26 @@ mod tests {
             self
         }
 
+        fn alignment(self, alignment: usize) -> Self {
+            let mut this = self.kv_u32("general.alignment", alignment as u32);
+            this.alignment = alignment;
+            this
+        }
+
         fn tensor(mut self, name: &str, dims: &[usize], ty: GgmlType, bytes: &[u8]) -> Self {
+            let offset = self.data.len();
+            self = self.tensor_at_offset(name, dims, ty, offset, bytes);
+            self
+        }
+
+        fn tensor_at_offset(
+            mut self,
+            name: &str,
+            dims: &[usize],
+            ty: GgmlType,
+            offset: usize,
+            bytes: &[u8],
+        ) -> Self {
             Self::str_bytes(&mut self.infos, name);
             self.infos
                 .extend_from_slice(&(dims.len() as u32).to_le_bytes());
@@ -1043,11 +1115,11 @@ mod tests {
                 self.infos.extend_from_slice(&(d as u64).to_le_bytes());
             }
             self.infos.extend_from_slice(&ty.tag().to_le_bytes());
-            self.infos
-                .extend_from_slice(&(self.data.len() as u64).to_le_bytes());
+            self.infos.extend_from_slice(&(offset as u64).to_le_bytes());
+            self.data.resize(offset, 0);
             self.data.extend_from_slice(bytes);
             // Keep every tensor offset alignment-legal.
-            while !self.data.len().is_multiple_of(32) {
+            while !self.data.len().is_multiple_of(self.alignment) {
                 self.data.push(0);
             }
             self.info_count += 1;
@@ -1062,7 +1134,7 @@ mod tests {
             out.extend_from_slice(&self.kv_count.to_le_bytes());
             out.extend_from_slice(&self.kv);
             out.extend_from_slice(&self.infos);
-            while !out.len().is_multiple_of(32) {
+            while !out.len().is_multiple_of(self.alignment) {
                 out.push(0);
             }
             out.extend_from_slice(&self.data);
@@ -1073,6 +1145,16 @@ mod tests {
     fn q4_0_block(d: f32, nibbles: [u8; 32]) -> Vec<u8> {
         let mut b = Vec::with_capacity(18);
         b.extend_from_slice(&f16_to_bits(d).to_le_bytes());
+        for j in 0..16 {
+            b.push(nibbles[j] | (nibbles[j + 16] << 4));
+        }
+        b
+    }
+
+    fn q4_1_block(d: f32, m: f32, nibbles: [u8; 32]) -> Vec<u8> {
+        let mut b = Vec::with_capacity(20);
+        b.extend_from_slice(&f16_to_bits(d).to_le_bytes());
+        b.extend_from_slice(&f16_to_bits(m).to_le_bytes());
         for j in 0..16 {
             b.push(nibbles[j] | (nibbles[j + 16] << 4));
         }
@@ -1102,6 +1184,35 @@ mod tests {
         assert_eq!(t.dims, vec![4, 2]);
         assert_eq!(t.ggml_type, GgmlType::F32);
         assert_eq!(t.num_elements(), 8);
+        assert_eq!(GgufValue::I32(-7).as_f64(), Some(-7.0));
+        assert_eq!(GgufValue::I32(-7).as_u64(), None);
+    }
+
+    #[test]
+    fn validates_spec_alignment_without_assuming_a_power_of_two() {
+        let valid = Builder::new()
+            .alignment(24)
+            .tensor("w", &[1], GgmlType::F32, &1.0f32.to_le_bytes())
+            .build();
+        assert!(
+            load_gguf_bytes(&valid).is_ok(),
+            "24-byte alignment is legal"
+        );
+
+        let too_small = Builder::new().kv_u32("general.alignment", 4).build();
+        assert!(matches!(
+            load_gguf_bytes(&too_small),
+            Err(GgufError::BadHeader(_))
+        ));
+
+        let bad_offset = Builder::new()
+            .tensor_at_offset("w", &[1], GgmlType::F32, 1, &1.0f32.to_le_bytes())
+            .build();
+        let err = load_gguf_bytes(&bad_offset).unwrap_err();
+        assert!(
+            matches!(err, GgufError::BadHeader(ref e) if e.contains("offset 1")),
+            "misaligned tensor offset produced {err}"
+        );
     }
 
     #[test]
@@ -1121,27 +1232,77 @@ mod tests {
     }
 
     #[test]
-    fn q4_0_repack_round_trips_through_meganeura_dequant() {
-        // One 32-element column: K = 32, N = 1.
-        let nibbles: [u8; 32] = std::array::from_fn(|i| (i % 16) as u8);
-        let d = 0.25f32;
-        let bytes = Builder::new()
-            .tensor("w", &[32, 1], GgmlType::Q4_0, &q4_0_block(d, nibbles))
-            .build();
-        let m = load_gguf_bytes(&bytes).unwrap();
-        let t = &m.tensors["w"];
+    fn quantized_repack_round_trips_multiple_columns() {
+        // N = 1 cannot catch a column-order mistake in block layout. Exercise
+        // every transcoded format through Meganeura's own decoder.
+        let left: [u8; 32] = std::array::from_fn(|i| (i % 16) as u8);
+        let right: [u8; 32] = std::array::from_fn(|i| ((i * 3) % 16) as u8);
+        let cases = [
+            (GgmlType::Q4_0, 1e-5, {
+                let mut p = q4_0_block(0.25, left);
+                p.extend(q4_0_block(0.5, right));
+                p
+            }),
+            (GgmlType::Q4_1, 1e-2, {
+                let mut p = q4_1_block(0.5, -3.0, left);
+                p.extend(q4_1_block(0.25, -1.0, right));
+                p
+            }),
+            (GgmlType::Q8_0, 1e-3, {
+                let l = std::array::from_fn(|i| (i as i32 - 16) as i8);
+                let r = std::array::from_fn(|i| (8 - i as i32) as i8);
+                let mut p = q8_0_block(0.5, l);
+                p.extend(q8_0_block(0.25, r));
+                p
+            }),
+        ];
 
-        let (dtype, packed) = t.to_packed().unwrap();
-        assert_eq!(dtype, DType::Q4_0);
-        // Meganeura's own reader must see exactly what GGML's semantics say.
-        let via_meganeura = crate::runtime::dequantize_q4_0(&packed, 32, 1);
-        let want = t.to_f32().unwrap();
-        for (i, (&got, &exp)) in via_meganeura.iter().zip(&want).enumerate() {
+        for (ty, tolerance, payload) in cases {
+            let bytes = Builder::new().tensor("w", &[32, 2], ty, &payload).build();
+            let model = load_gguf_bytes(&bytes).unwrap();
+            let tensor = &model.tensors["w"];
+            let (dtype, packed) = tensor.to_packed().unwrap();
+            let got = if ty == GgmlType::Q8_0 {
+                crate::runtime::dequantize_q8_0(&packed, 32, 2)
+            } else {
+                crate::runtime::dequantize_q4_0(&packed, 32, 2)
+            };
+            assert_eq!(
+                dtype,
+                if ty == GgmlType::Q8_0 {
+                    DType::Q8_0
+                } else {
+                    DType::Q4_0
+                },
+                "{ty:?}"
+            );
+            for (i, (&actual, expected)) in got.iter().zip(tensor.to_f32().unwrap()).enumerate() {
+                assert!(
+                    (actual - expected).abs() < tolerance,
+                    "{ty:?} element {i}: meganeura {actual} vs GGML {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn to_packed_rejects_a_short_payload() {
+        for tensor in [
+            GgufTensor::new(vec![256, 1], GgmlType::Q4K, vec![0u8; 10]),
+            GgufTensor::new(vec![32, 1], GgmlType::Q4_0, vec![0u8; 4]),
+        ] {
             assert!(
-                (got - exp).abs() < 1e-6,
-                "element {i}: meganeura {got} vs ggml {exp}"
+                matches!(tensor.to_packed(), Err(GgufError::BadShape(_))),
+                "short {:?} payload was accepted",
+                tensor.ggml_type
             );
         }
+
+        let overflow = GgufTensor::new(vec![usize::MAX - 31, 2], GgmlType::Q4_0, Vec::new());
+        assert!(matches!(
+            overflow.to_packed(),
+            Err(GgufError::BadShape(ref e)) if e.contains("overflow")
+        ));
     }
 
     #[test]
