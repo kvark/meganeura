@@ -1,5 +1,25 @@
 # Unreleased
 
+- Structured profiling of plans larger than Blade's timestamp budget.
+  `capture_session_profile` used to refuse outright any plan with more
+  dispatches than the 1,000 timestamps Blade writes per submission, which a
+  decode or training step of a real model exceeds. It now splits the plan into
+  windows of dispatch indices and replays the session once per window,
+  stitching the per-dispatch results back together. Every dispatch is still
+  measured `samples` times; only the replay count grows, and a plan that fits
+  in one window is captured exactly as before.
+
+  The dispatches outside a window still execute — each replay is a complete,
+  correct run — but batch into one grouped pass per side, keeping the plan's
+  barriers while costing two timestamp slots rather than one per barrier
+  group. `Session::set_profiling_window` exposes the same mechanism directly.
+
+  `measurement` gains `window_count` and `max_window_dispatches`.
+  `profiled_wall_samples_ms` now holds one entry per replay, and
+  `instrumentation_wall_ratio` understates full-instrumentation overhead once
+  windowing kicks in, since each replay runs most of the plan at nearly normal
+  pass counts; `gpu_total_samples_ms` still sums to whole-plan GPU time.
+  `schema_version` is 2 and `ProfileError::TooManyDispatches` is gone.
 - GGUF weight import (`load::gguf`). Reads the container's metadata and tensor
   inventory, and resolves GGML's block encodings into Meganeura's at load time.
   `Q4_0`, `Q4_1` and `Q8_0` repack losslessly for `set_parameter_packed` —

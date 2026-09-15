@@ -33,6 +33,61 @@ pub(super) fn wait_for_timed_encoder(
 const DEVICE_MEMORY_SAFE_PERCENT: u64 = 90;
 const DEVICE_MEMORY_RESERVE_PERCENT: u64 = 100 - DEVICE_MEMORY_SAFE_PERCENT;
 
+/// One compute pass of a profiled [`Session::step`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ProfilePass {
+    /// A single dispatch, timestamped under its own label.
+    Timed(usize),
+    /// Dispatches outside the timing window, batched into one pass. Each
+    /// range is the part of one barrier group that falls in this pass; a
+    /// barrier separates consecutive ranges, exactly as in normal execution.
+    Untimed(Vec<std::ops::Range<usize>>),
+}
+
+/// Clip `groups` to `span`, dropping the groups that fall outside it.
+fn clip_groups(
+    groups: &[std::ops::Range<usize>],
+    span: std::ops::Range<usize>,
+) -> Vec<std::ops::Range<usize>> {
+    groups
+        .iter()
+        .filter_map(|group| {
+            let start = group.start.max(span.start);
+            let end = group.end.min(span.end);
+            (start < end).then_some(start..end)
+        })
+        .collect()
+}
+
+/// Lay out the compute passes for one profiled step.
+///
+/// Dispatches inside `window` get a pass each, so Blade timestamps them
+/// individually. The rest keep the plan's barrier structure but collapse into
+/// a single pass on either side: Blade stops writing timestamps once a
+/// submission reaches `limits::PASS_COUNT`, and a pass per barrier group
+/// outside the window would spend that budget on dispatches nobody is
+/// measuring. Every dispatch still runs exactly once, in plan order.
+pub(crate) fn profile_pass_plan(
+    groups: &[std::ops::Range<usize>],
+    dispatch_count: usize,
+    window: std::ops::Range<usize>,
+) -> Vec<ProfilePass> {
+    let start = window.start.min(dispatch_count);
+    let end = window.end.clamp(start, dispatch_count);
+
+    let mut passes = Vec::with_capacity(end - start + 2);
+    let head = clip_groups(groups, 0..start);
+    if !head.is_empty() {
+        passes.push(ProfilePass::Untimed(head));
+    }
+    passes.extend((start..end).map(ProfilePass::Timed));
+    let tail = clip_groups(groups, end..dispatch_count);
+    if !tail.is_empty() {
+        passes.push(ProfilePass::Untimed(tail));
+    }
+    passes
+}
+
 fn safe_device_memory_remaining(usage: u64, budget: u64) -> u64 {
     let safe_limit = ((budget as u128 * DEVICE_MEMORY_SAFE_PERCENT as u128) / 100u128) as u64;
     safe_limit.saturating_sub(usage)
@@ -2763,9 +2818,15 @@ pub struct Session {
     sync_point: Option<blade_graphics::SyncPoint>,
     /// Calibrated timings harvested when the most recent submission completed.
     last_gpu_timings: Option<blade_graphics::Timings>,
-    /// When true, run in multi-pass mode: one compute pass per dispatch
-    /// with individual GPU timestamps. Enables `dump_gpu_timings()`.
-    profiling: bool,
+    /// When set, run in multi-pass mode over this range of dispatch indices:
+    /// one compute pass with an individual GPU timestamp per dispatch inside
+    /// the range, ordinary grouped passes outside it. Enables
+    /// `dump_gpu_timings()`. See [`Session::set_profiling_window`].
+    profile_window: Option<std::ops::Range<usize>>,
+    /// Plan dispatch behind each compute pass the last profiled `step()`
+    /// encoded, in pass order. `None` marks a grouped pass that batched many
+    /// dispatches under one timestamp.
+    profiled_pass_map: Vec<Option<usize>>,
     /// Debug session: aliasing off, every buffer host-visible, all node
     /// values readable via [`Session::read_node`].
     debug: bool,
@@ -3615,7 +3676,8 @@ impl Session {
             submission_chunks: 1,
             sync_point: None,
             last_gpu_timings: None,
-            profiling: false,
+            profile_window: None,
+            profiled_pass_map: Vec::new(),
             debug: opts.debug,
             optimizer_device,
             written,
@@ -3905,8 +3967,31 @@ impl Session {
     /// When enabled, `step()` runs one compute pass per dispatch with
     /// individual GPU timestamps. Call `wait()` and then
     /// `dump_gpu_timings()` to see per-pass timings from the profiled run.
+    ///
+    /// Blade writes at most [`blade_graphics::limits::PASS_COUNT`] timestamps
+    /// per submission and silently drops the rest, so plans larger than that
+    /// need [`Session::set_profiling_window`] to be measured in slices.
     pub fn set_profiling(&mut self, enabled: bool) {
-        self.profiling = enabled;
+        self.profile_window = enabled.then_some(0..self.plan.dispatches.len());
+    }
+
+    /// Timestamp only `window`, a range of plan dispatch indices.
+    ///
+    /// Each dispatch inside the window gets its own compute pass and
+    /// timestamp. The dispatches outside it still execute — the step remains
+    /// a complete, correct replay — but they collapse into one grouped pass
+    /// on either side of the window, keeping the plan's barriers between
+    /// barrier groups. That costs at most two of the submission's timestamp
+    /// slots regardless of how many dispatches lie outside the window, so a
+    /// plan with more dispatches than Blade's per-submission timestamp limit
+    /// can be measured by replaying it once per window and stitching the
+    /// results together. [`crate::profiler::capture_session_profile`] does
+    /// exactly that; prefer it over driving windows by hand.
+    ///
+    /// `None` restores unprofiled execution. The window is clamped to the
+    /// plan, so an over-long range simply times every remaining dispatch.
+    pub fn set_profiling_window(&mut self, window: Option<std::ops::Range<usize>>) {
+        self.profile_window = window;
     }
 
     /// Copy the GPU pass timings most recently resolved by Blade.
@@ -3924,6 +4009,32 @@ impl Session {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Per-dispatch timings from the most recent profiled [`Session::step`].
+    ///
+    /// Yields `(plan dispatch index, pass label, duration)` for every dispatch
+    /// the active profiling window timestamped on its own, in pass order. The
+    /// grouped passes carrying the dispatches outside the window are dropped:
+    /// their timestamps cover many dispatches at once and attributing them to
+    /// any single one would be a lie.
+    ///
+    /// Empty when the resolved pass count does not match what the step
+    /// encoded, which is how runtime-appended optimizer, gradient-accumulation
+    /// and gradient-clipping passes show up. Their timestamps would shift
+    /// every following entry, so no attribution is preferable to a wrong one.
+    pub fn profiled_dispatch_timings(&self) -> Vec<(usize, String, std::time::Duration)> {
+        let timings = self.gpu_timings();
+        if timings.len() != self.profiled_pass_map.len() {
+            return Vec::new();
+        }
+        self.profiled_pass_map
+            .iter()
+            .zip(timings)
+            .filter_map(|(dispatch, (label, duration))| {
+                dispatch.map(|index| (index, label, duration))
+            })
+            .collect()
     }
 
     /// Stable descriptive key for the pipeline selected by each plan
@@ -4378,6 +4489,119 @@ mod split_k_tests {
             no_alias.physical_bytes() - alias.physical_bytes(),
             bytes * 2
         );
+    }
+}
+
+#[cfg(test)]
+mod profile_pass_tests {
+    use super::{ProfilePass, profile_pass_plan};
+
+    /// Six barrier groups over sixteen dispatches, including two groups of
+    /// one so that windows can land on a group boundary and inside a group.
+    fn groups() -> Vec<std::ops::Range<usize>> {
+        vec![0..3, 3..4, 4..9, 9..10, 10..14, 14..16]
+    }
+
+    /// Whatever the window, the plan must still run every dispatch exactly
+    /// once and in order, and must not spend more than two passes on the
+    /// dispatches outside the window.
+    #[test]
+    fn every_window_replays_the_whole_plan_in_order() {
+        let groups = groups();
+        for start in 0..=16 {
+            for end in start..=16 {
+                let passes = profile_pass_plan(&groups, 16, start..end);
+                let mut order = Vec::new();
+                let mut timed = Vec::new();
+                let mut untimed = 0;
+                for pass in passes {
+                    match pass {
+                        ProfilePass::Timed(index) => {
+                            order.push(index);
+                            timed.push(index);
+                        }
+                        ProfilePass::Untimed(spans) => {
+                            untimed += 1;
+                            order.extend(spans.into_iter().flatten());
+                        }
+                    }
+                }
+                assert_eq!(
+                    order,
+                    (0..16).collect::<Vec<_>>(),
+                    "window {start}..{end} did not replay the plan in order"
+                );
+                assert_eq!(
+                    timed,
+                    (start..end).collect::<Vec<_>>(),
+                    "window {start}..{end} timed the wrong dispatches"
+                );
+                assert!(
+                    untimed <= 2,
+                    "window {start}..{end} spent {untimed} passes outside the window"
+                );
+            }
+        }
+    }
+
+    /// The untimed passes keep the plan's barrier structure: each range is
+    /// one barrier group clipped to the pass, so the encoder emits a barrier
+    /// exactly where normal execution would.
+    #[test]
+    fn untimed_passes_preserve_barrier_group_boundaries() {
+        let passes = profile_pass_plan(&groups(), 16, 5..11);
+        assert_eq!(
+            passes.first(),
+            Some(&ProfilePass::Untimed(vec![0..3, 3..4, 4..5])),
+            "the head must keep its group seams and stop at the window"
+        );
+        assert_eq!(
+            passes.last(),
+            Some(&ProfilePass::Untimed(vec![11..14, 14..16])),
+            "the tail must resume mid-group and keep the remaining seams"
+        );
+    }
+
+    /// Timing everything is what `set_profiling(true)` asks for, and must
+    /// still be a pass per dispatch with nothing batched.
+    #[test]
+    fn a_full_window_times_every_dispatch_individually() {
+        let passes = profile_pass_plan(&groups(), 16, 0..16);
+        assert_eq!(passes.len(), 16);
+        assert!(
+            passes
+                .iter()
+                .all(|pass| matches!(pass, ProfilePass::Timed(_)))
+        );
+    }
+
+    /// An over-long or inverted window is clamped rather than panicking on
+    /// the range arithmetic.
+    #[test]
+    fn out_of_range_windows_are_clamped_to_the_plan() {
+        assert_eq!(profile_pass_plan(&groups(), 16, 0..99).len(), 16);
+        assert_eq!(
+            profile_pass_plan(&groups(), 16, 99..99),
+            vec![ProfilePass::Untimed(vec![
+                0..3,
+                3..4,
+                4..9,
+                9..10,
+                10..14,
+                14..16
+            ])]
+        );
+        // An inverted range collapses to an empty window at its start rather
+        // than underflowing the `end - start` capacity arithmetic.
+        let inverted = std::ops::Range { start: 9, end: 4 };
+        assert_eq!(
+            profile_pass_plan(&groups(), 16, inverted),
+            vec![
+                ProfilePass::Untimed(vec![0..3, 3..4, 4..9]),
+                ProfilePass::Untimed(vec![9..10, 10..14, 14..16]),
+            ]
+        );
+        assert!(profile_pass_plan(&[], 0, 0..0).is_empty());
     }
 }
 
@@ -6325,16 +6549,42 @@ impl Session {
 
         self.encoder.start();
 
-        if self.profiling {
-            // Multi-pass mode: one compute pass per dispatch with per-pass barriers
-            // and GPU timestamps. Enables dump_gpu_timings() after wait().
-            for i in 0..self.plan.dispatches.len() {
-                let dispatch = &self.plan.dispatches[i];
-                let pipeline = self.pipelines.get(dispatch);
-                let mut pass = self.encoder.compute(&dispatch.label);
-                let mut pc = pass.with(pipeline);
-                Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
-                pc.dispatch(dispatch.workgroups);
+        if let Some(window) = self.profile_window.clone() {
+            // Multi-pass mode: one compute pass per dispatch in the window,
+            // with per-pass barriers and GPU timestamps. Enables
+            // dump_gpu_timings() and profiled_dispatch_timings() after wait().
+            let passes = profile_pass_plan(&self.groups, self.plan.dispatches.len(), window);
+            self.profiled_pass_map.clear();
+            for encoded in passes {
+                match encoded {
+                    ProfilePass::Timed(i) => {
+                        let dispatch = &self.plan.dispatches[i];
+                        let pipeline = self.pipelines.get(dispatch);
+                        let mut pass = self.encoder.compute(&dispatch.label);
+                        let mut pc = pass.with(pipeline);
+                        Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
+                        pc.dispatch(dispatch.workgroups);
+                        self.profiled_pass_map.push(Some(i));
+                    }
+                    ProfilePass::Untimed(spans) => {
+                        let label =
+                            format!("untimed {}..{}", spans[0].start, spans[spans.len() - 1].end);
+                        let mut pass = self.encoder.compute(&label);
+                        for (position, span) in spans.into_iter().enumerate() {
+                            if position > 0 {
+                                pass.barrier();
+                            }
+                            for i in span {
+                                let dispatch = &self.plan.dispatches[i];
+                                let pipeline = self.pipelines.get(dispatch);
+                                let mut pc = pass.with(pipeline);
+                                Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
+                                pc.dispatch(dispatch.workgroups);
+                            }
+                        }
+                        self.profiled_pass_map.push(None);
+                    }
+                }
             }
         } else {
             // Inline-barrier mode: dispatches share one compute pass with

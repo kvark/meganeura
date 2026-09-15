@@ -29,6 +29,7 @@ mod mha_head_dim32;
 mod mixed_attention_widths;
 mod multi_input_trainer;
 mod outline_optimize;
+mod profile_windows;
 mod resnet_correctness;
 mod scatter_add_atomic;
 mod schedule_pointwise;
