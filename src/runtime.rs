@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 mod checkpoint;
+mod initialization;
 mod tuning;
 pub use crate::tune::TuneOutcome;
 
@@ -30,10 +31,7 @@ pub(super) fn wait_for_timed_encoder(
     encoder: &mut blade_graphics::CommandEncoder,
     timing: bool,
 ) -> Result<Option<crate::profiler::GpuTimings>, blade_graphics::DeviceError> {
-    let result = gpu.wait_for(sync, !0);
-    if !result? {
-        return Ok(None);
-    }
+    assert!(gpu.wait_for(sync, !0)?, "GPU wait timed out");
     if !timing || !gpu.capabilities().timing {
         return Ok(None);
     }
@@ -3208,7 +3206,11 @@ impl Session {
     /// Returns false if the GPU doesn't support the required cooperative
     /// matrix types (e.g. AMD RADV advertises the extension but rejects
     /// the specific f32 matrix shapes).
-    fn test_coop_matmul(gpu: &Gpu, config: &crate::codegen::CoopConfig) -> bool {
+    fn test_coop_matmul(
+        gpu: &Gpu,
+        config: &crate::codegen::CoopConfig,
+        trace: &initialization::Trace,
+    ) -> bool {
         use crate::codegen::ShaderGroup;
         use blade_graphics as bg;
 
@@ -3311,10 +3313,14 @@ impl Session {
             );
             pc.dispatch([(m as u32).div_ceil(ot), (n_out as u32).div_ceil(ot), 1]);
         }
+        trace.mark("coop_probe.submit.before", serde_json::json!({}));
         let sp = gpu.submit(&mut encoder);
-        // A standalone scratch submission with no session behind it: nothing
-        // is profiling it, so do not ask for timestamps it may not collect.
-        let _ = wait_for_timed_encoder(gpu, &sp, &mut encoder, false);
+        trace.mark("coop_probe.submit.after", serde_json::json!({}));
+        trace.mark("coop_probe.wait.before", serde_json::json!({}));
+        trace.wait(
+            "coop_probe.wait.result",
+            wait_for_timed_encoder(gpu, &sp, &mut encoder, false).map(|_| true),
+        );
 
         let result =
             unsafe { std::slice::from_raw_parts(c_buf.data() as *const f32, m * n_out).to_vec() };
@@ -3379,6 +3385,14 @@ impl Session {
     }
 
     fn build_session_impl(plan: ExecutionPlan, gpu: Arc<Gpu>, opts: SessionOptions) -> Self {
+        let trace = initialization::Trace::new();
+        let information = gpu.device_information();
+        trace.mark("initialization.begin", serde_json::json!({
+            "logical_buffers": plan.buffers.len(), "dispatches": plan.dispatches.len(),
+            "device_name": information.device_name, "driver_name": information.driver_name,
+            "driver_info": information.driver_info, "software": information.is_software_emulated,
+        }));
+        trace.mark("coop_probe.before", serde_json::json!({}));
         let _session_span = tracing::info_span!(
             "session_init",
             dispatches = plan.dispatches.len(),
@@ -3389,9 +3403,10 @@ impl Session {
         let coop_config = {
             let _span = tracing::info_span!("coop_probe").entered();
             Self::select_coop_config(&coop_caps, opts.coop)
-                .filter(|config| Self::test_coop_matmul(&gpu, config))
+                .filter(|config| Self::test_coop_matmul(&gpu, config, &trace))
         };
         if let Some(ref config) = coop_config {
+            trace.mark("coop_probe.after", serde_json::json!({"enabled": true}));
             log::info!(
                 "cooperative matrix enabled (tile={}×{}, {}, f32_tile={}, f16_tile={})",
                 config.tile_size,
@@ -3406,6 +3421,7 @@ impl Session {
             );
         } else {
             let info = gpu.device_information();
+            trace.mark("coop_probe.after", serde_json::json!({"enabled": false}));
             log::warn!(
                 "cooperative matrix not available on {} ({}) (f32_tile={}, f16_tile={}); using naive matmul",
                 info.device_name,
@@ -3531,6 +3547,12 @@ impl Session {
             alias.device_local.fill(false);
         }
         let alias = alias;
+        trace.mark(
+            "allocation_plan",
+            serde_json::json!({
+                "sizes": &alias.sizes, "device_local": &alias.device_local, "map": &alias.map,
+            }),
+        );
         // Debug aid: dump dispatch order, declared accesses, and the
         // alias map for corruption bisection (see MEGANEURA_PIN_BUFS).
         if opts.dump_plan {
@@ -3629,16 +3651,22 @@ impl Session {
                 shared_bytes,
                 device_allocations,
                 device_bytes,
+                shared_zero_allocations,
+                shared_zero_bytes,
                 trace_min_duration_us = 1_000u64,
             )
             .entered();
-            let mut slots = vec![None; alias.sizes.len()];
-            let mut create_class = |device_local: bool| {
-                for (i, &size) in alias.sizes.iter().enumerate() {
-                    if alias.device_local[i] != device_local {
-                        continue;
-                    }
+            alias
+                .sizes
+                .iter()
+                .enumerate()
+                .map(|(i, &size)| {
+                    let device_local = alias.device_local[i];
                     let size = size.max(4);
+                    trace.mark(
+                        "buffer.create.before",
+                        serde_json::json!({"slot": i, "bytes": size, "device_local": device_local}),
+                    );
                     let handle = gpu.create_buffer(blade_graphics::BufferDesc {
                         name: &format!("buf_{}", i),
                         size: size as u64,
@@ -3648,57 +3676,26 @@ impl Session {
                             blade_graphics::Memory::Shared
                         },
                     });
-                    slots[i] = Some(Arc::new(PhysicalBuffer {
+                    trace.mark("buffer.create.after", serde_json::json!({"slot": i}));
+                    // Keep creation and Shared zeroing interleaved in alias order.
+                    // Preserve the explicit parameter-initialization opt-out.
+                    if !device_local && zero_on_init[i] {
+                        trace.mark(
+                            "buffer.zero_host.before",
+                            serde_json::json!({"slot": i, "bytes": size}),
+                        );
+                        unsafe {
+                            std::ptr::write_bytes(handle.data(), 0, size);
+                        }
+                        trace.mark("buffer.zero_host.after", serde_json::json!({"slot": i}));
+                    }
+                    Arc::new(PhysicalBuffer {
                         gpu: Arc::clone(&gpu),
                         handle,
-                    }));
-                }
-            };
-            {
-                let _span = tracing::info_span!(
-                    "buffer_create_shared",
-                    allocations = shared_allocations,
-                    bytes = shared_bytes,
-                    trace_min_duration_us = 1_000u64,
-                )
-                .entered();
-                create_class(false);
-            }
-            {
-                let _span = tracing::info_span!(
-                    "buffer_create_device",
-                    allocations = device_allocations,
-                    bytes = device_bytes,
-                    trace_min_duration_us = 1_000u64,
-                )
-                .entered();
-                create_class(true);
-            }
-            slots
-                .into_iter()
-                .map(|slot| slot.expect("every physical allocation was created"))
+                    })
+                })
                 .collect()
         };
-        // Zero-fill to prevent NaN from uninitialized padding regions (coop
-        // tiles read/write full tiles beyond logical dimensions). A caller
-        // which promises to initialize all parameters may skip those buffers;
-        // every other host-visible allocation remains deterministic.
-        {
-            let _span = tracing::info_span!(
-                "buffer_zero_host",
-                allocations = shared_zero_allocations,
-                bytes = shared_zero_bytes,
-                trace_min_duration_us = 1_000u64,
-            )
-            .entered();
-            for (index, buffer) in physical_buffers.iter().enumerate() {
-                if !alias.device_local[index] && zero_on_init[index] {
-                    unsafe {
-                        std::ptr::write_bytes(buffer.handle.data(), 0, alias.sizes[index].max(4));
-                    }
-                }
-            }
-        }
         let buffers: Vec<blade_graphics::Buffer> = alias
             .map
             .iter()
@@ -3715,18 +3712,32 @@ impl Session {
             .entered();
             for &(buf_ref, ref data) in &plan.constant_buffers {
                 let buffer = &buffers[buf_ref.0 as usize];
+                trace.mark(
+                    "constant.upload.before",
+                    serde_json::json!({
+                        "logical": buf_ref.0,
+                        "slot": alias.map[buf_ref.0 as usize],
+                        "bytes": data.len() * std::mem::size_of::<f32>(),
+                    }),
+                );
                 unsafe {
                     let ptr = buffer.data() as *mut f32;
                     std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
                 }
+                trace.mark(
+                    "constant.upload.after",
+                    serde_json::json!({"logical": buf_ref.0}),
+                );
             }
         }
         drop(buffer_alloc_span);
 
+        trace.mark("pipelines.before", serde_json::json!({}));
         let pipelines = {
             let _span = tracing::info_span!("pipeline_set").entered();
             Pipelines::new(&gpu, &plan, coop_config.as_ref())
         };
+        trace.mark("pipelines.after", serde_json::json!({}));
         let mut encoder = {
             let _span = tracing::info_span!("encoder_create").entered();
             gpu.create_command_encoder(blade_graphics::CommandEncoderDesc {
@@ -3753,6 +3764,7 @@ impl Session {
             .filter_map(|((&size, &device), &zero)| (device && zero).then_some(size.max(4)))
             .sum::<usize>();
         if device_zero_allocations != 0 {
+            trace.mark("zero_device_local.record.before", serde_json::json!({}));
             let _span = tracing::info_span!(
                 "buffer_zero_gpu",
                 allocations = device_zero_allocations,
@@ -3770,8 +3782,14 @@ impl Session {
                     }
                 }
             }
+            trace.mark("zero_device_local.submit.before", serde_json::json!({}));
             let sp = gpu.submit(&mut encoder);
-            let _ = wait_for_timed_encoder(&gpu, &sp, &mut encoder, opts.gpu_timing);
+            trace.mark("zero_device_local.submit.after", serde_json::json!({}));
+            trace.mark("zero_device_local.wait.before", serde_json::json!({}));
+            trace.wait(
+                "zero_device_local.wait.result",
+                wait_for_timed_encoder(&gpu, &sp, &mut encoder, opts.gpu_timing).map(|_| true),
+            );
         }
 
         // Both halves matter: the device has to be able to timestamp, and
@@ -3780,6 +3798,10 @@ impl Session {
 
         let optimizer_device = !opts.no_device_local && !opts.debug;
         let mut optimizer_device_bufs: Vec<(blade_graphics::Buffer, u64)> = Vec::new();
+        trace.mark(
+            "optimizer.allocate.before",
+            serde_json::json!({"enabled": !plan.param_grad_pairs.is_empty()}),
+        );
         // Grad-clip accumulator: a single f32. GPU-only after the
         // barriered clip path landed; host-visible only in debug.
         let grad_clip_acc = if !plan.param_grad_pairs.is_empty() {
@@ -3794,6 +3816,11 @@ impl Session {
             None
         };
         if !optimizer_device_bufs.is_empty() {
+            trace.mark(
+                "optimizer.allocate.after",
+                serde_json::json!({"buffers": optimizer_device_bufs.len()}),
+            );
+            trace.mark("zero_optimizer.record.before", serde_json::json!({}));
             encoder.start();
             {
                 let mut transfer = encoder.transfer("zero_optimizer");
@@ -3801,8 +3828,14 @@ impl Session {
                     transfer.fill_buffer(buf.at(0), size, 0);
                 }
             }
+            trace.mark("zero_optimizer.submit.before", serde_json::json!({}));
             let sp = gpu.submit(&mut encoder);
-            let _ = wait_for_timed_encoder(&gpu, &sp, &mut encoder, opts.gpu_timing);
+            trace.mark("zero_optimizer.submit.after", serde_json::json!({}));
+            trace.mark("zero_optimizer.wait.before", serde_json::json!({}));
+            trace.wait(
+                "zero_optimizer.wait.result",
+                wait_for_timed_encoder(&gpu, &sp, &mut encoder, opts.gpu_timing).map(|_| true),
+            );
         }
 
         // Buffers that some dispatch (or session setup) actually writes.
@@ -3832,6 +3865,7 @@ impl Session {
             written[b.0 as usize] = true;
         }
 
+        trace.mark("initialization.ready", serde_json::json!({}));
         Self {
             gpu,
             buffers,
@@ -5848,7 +5882,8 @@ impl Session {
             }
         }
         let sync = self.gpu.submit(&mut encoder);
-        let _ = wait_for_timed_encoder(&self.gpu, &sync, &mut encoder, self.gpu_timing);
+        wait_for_timed_encoder(&self.gpu, &sync, &mut encoder, self.gpu_timing)
+            .expect("GPU transfer wait failed");
         self.gpu.destroy_command_encoder(&mut encoder);
     }
 
@@ -5947,7 +5982,8 @@ impl Session {
                 chunk.len() as u64,
             );
             let sync = self.gpu.submit(&mut encoder);
-            let _ = wait_for_timed_encoder(&self.gpu, &sync, &mut encoder, self.gpu_timing);
+            wait_for_timed_encoder(&self.gpu, &sync, &mut encoder, self.gpu_timing)
+                .expect("GPU transfer wait failed");
         }
         self.gpu.destroy_command_encoder(&mut encoder);
         if !self.reuse_upload_staging {
@@ -5987,7 +6023,8 @@ impl Session {
             .transfer("readback_copy")
             .copy_buffer_to_buffer(buffer.at(0), staging.at(0), bytes);
         let sync = self.gpu.submit(&mut encoder);
-        let _ = wait_for_timed_encoder(&self.gpu, &sync, &mut encoder, self.gpu_timing);
+        wait_for_timed_encoder(&self.gpu, &sync, &mut encoder, self.gpu_timing)
+            .expect("GPU transfer wait failed");
         unsafe {
             std::ptr::copy_nonoverlapping(
                 staging.data() as *const f32,
@@ -6310,7 +6347,8 @@ impl Session {
             }
         }
         let sync = self.gpu.submit(&mut encoder);
-        let _ = wait_for_timed_encoder(&self.gpu, &sync, &mut encoder, self.gpu_timing);
+        wait_for_timed_encoder(&self.gpu, &sync, &mut encoder, self.gpu_timing)
+            .expect("GPU transfer wait failed");
 
         let mut outputs = Vec::with_capacity(requests.len());
         for &(_, offset, byte_len) in &requests {
@@ -6744,8 +6782,7 @@ impl Session {
             let _span = tracing::info_span!("wait").entered();
             self.last_gpu_timings =
                 wait_for_timed_encoder(&self.gpu, &sp, &mut self.encoder, self.gpu_timing)
-                    .ok()
-                    .flatten();
+                    .expect("GPU session wait failed");
         }
     }
 
@@ -8877,7 +8914,8 @@ impl Session {
                     }
                 }
                 let sync = self.gpu.submit(&mut encoder);
-                let _ = wait_for_timed_encoder(&self.gpu, &sync, &mut encoder, self.gpu_timing);
+                wait_for_timed_encoder(&self.gpu, &sync, &mut encoder, self.gpu_timing)
+                    .expect("GPU transfer wait failed");
                 self.gpu.destroy_command_encoder(&mut encoder);
             }
         }
