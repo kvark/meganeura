@@ -88,6 +88,16 @@ impl Pipelines {
 fn tile_module(dispatch: &Dispatch, tile: MatmulTile) -> crate::codegen::ShaderModule {
     let entry = &dispatch.shader;
     let selected_entry = tile.shader(entry);
+    if let MatmulTile::CooperativeScaledF16 { subgroup_size } = tile {
+        let params = (dispatch.params.len() == 12).then(|| super::Conv2dParams::from(dispatch));
+        return crate::codegen::generate_scaled_f16_module(
+            selected_entry.shader_group(),
+            subgroup_size,
+            params
+                .as_ref()
+                .map(|p| bytemuck::cast_slice(std::slice::from_ref(p))),
+        );
+    }
     if let MatmulTile::SpecializedConv { k_tile, .. } = tile {
         let params = super::Conv2dParams::from(dispatch);
         return crate::codegen::generate_conv_module(
@@ -107,13 +117,23 @@ fn tile_module(dispatch: &Dispatch, tile: MatmulTile) -> crate::codegen::ShaderM
                 entry.shader_group(),
                 &tile.coop_config().expect("cooperative candidate"),
             ),
-            MatmulTile::SpecializedConv { .. } => unreachable!(),
+            MatmulTile::SpecializedConv { .. } | MatmulTile::CooperativeScaledF16 { .. } => {
+                unreachable!()
+            }
         }
     }
 }
 
-fn tile_variant(dispatch: &Dispatch, tile: MatmulTile) -> Variant {
+pub(super) fn tile_variant(dispatch: &Dispatch, tile: MatmulTile) -> Variant {
     let entry = &dispatch.shader;
+    if matches!(tile, MatmulTile::CooperativeScaledF16 { .. }) {
+        let params = if dispatch.params.len() == 12 {
+            dispatch.params.clone()
+        } else {
+            Vec::new()
+        };
+        return Variant::TunedTile(tile.shader(entry), tile, params);
+    }
     if let MatmulTile::SpecializedConv { k_tile, .. } = tile {
         return Variant::SpecializedConv(
             tile.shader(entry),
@@ -137,7 +157,9 @@ fn tile_variant(dispatch: &Dispatch, tile: MatmulTile) -> Variant {
         MatmulTile::Tile32 => Variant::SmallTile(entry.clone()),
         MatmulTile::Tile64 => Variant::Scalar(entry.clone()),
         MatmulTile::CooperativeF32 { .. } => Variant::Coop(entry.clone()),
-        MatmulTile::SpecializedConv { .. } => unreachable!(),
+        MatmulTile::SpecializedConv { .. } | MatmulTile::CooperativeScaledF16 { .. } => {
+            unreachable!()
+        }
     }
 }
 
@@ -365,7 +387,8 @@ impl Session {
     /// Forward MatMul+Add and unpacked NCHW scalar convolution forward/dX/dW are supported;
     /// convolution keys include batch, channels, spatial extents, kernel, stride
     /// and padding. Index decomposition uses exact integer arithmetic.
-    /// Cooperative convolutions remain excluded.
+    /// This experiment also challenges scalar convolution with scaled,
+    /// compensated f16 cooperative products under a half-input policy.
     /// Other prologues/epilogues, horizontal
     /// packs, f16-input cooperative, reduced-storage, GEMV and overlapping-binding
     /// dispatches are excluded. Winners live in this session, not the plan cache.
@@ -381,6 +404,18 @@ impl Session {
         let start = Instant::now();
         let (mut classes, mut excluded_dispatches) =
             collect_classes(&self.plan, &self.alias, self.coop_config.as_ref());
+        if self.gpu.capabilities().cooperative_matrix.f16_tile == 16
+            && self.coop_config.as_ref().is_some_and(|c| c.use_f16_input)
+        {
+            for class in &mut classes {
+                let candidate = MatmulTile::CooperativeScaledF16 {
+                    subgroup_size: self.gpu.capabilities().cooperative_matrix.subgroup_size,
+                };
+                if candidate != class.initial && candidate.fits(&class.key) {
+                    class.challengers.insert(0, candidate);
+                }
+            }
+        }
         classes.retain(|class| {
             if options.scope.includes(&class.key) {
                 true
@@ -743,6 +778,22 @@ impl Session {
                         && (variant == 0 || outputs_agree(&reference, &output, scale))
                 };
                 if !valid {
+                    if let Some((index, (&a, &b))) = reference
+                        .iter()
+                        .zip(&output)
+                        .enumerate()
+                        .find(|&(_, (&a, &b))| !close(f64::from(a), b, scale))
+                    {
+                        let expected = reference_dot(
+                            &class.key,
+                            &inputs,
+                            index / class.key.n as usize,
+                            index % class.key.n as usize,
+                        );
+                        log::warn!(
+                            "tune: cross-variant element {index}: baseline {a:e}, candidate {b:e}, f64 {expected:e}, scale {scale:e}"
+                        );
+                    }
                     outcome.decision = TuneDecision::InvalidOutput;
                     outcome.failure = Some(format!(
                         "variant {variant}, {:?}, input pattern {pattern}: reference or cross-variant mismatch",
@@ -1353,11 +1404,12 @@ fn qualify_output(class: &TuneClass, inputs: &[Vec<f32>], output: &[f32], scale:
         } else {
             row
         };
-        if !close(
-            reference_dot(class, inputs, row, col),
-            output[row * n + col],
-            scale,
-        ) {
+        let reference = reference_dot(class, inputs, row, col);
+        let actual = output[row * n + col];
+        if !close(reference, actual, scale) {
+            log::warn!(
+                "tune: element ({row}, {col}): f64 reference {reference:e}, actual {actual:e}, scale {scale:e}"
+            );
             return false;
         }
     }
@@ -2045,6 +2097,7 @@ mod tests {
                 MatmulTile::Tile64,
                 MatmulTile::CooperativeF32 { tile_size: 8 },
                 MatmulTile::CooperativeF32 { tile_size: 16 },
+                MatmulTile::CooperativeScaledF16 { subgroup_size: 32 },
                 MatmulTile::SpecializedConv {
                     tile_size: 32,
                     tile_columns: None,
@@ -2078,6 +2131,9 @@ mod tests {
                         | ShaderEntry::Conv2dGradWeightGemm
                 );
                 let specialized = matches!(tile, MatmulTile::SpecializedConv { .. });
+                if !convolution && matches!(tile, MatmulTile::CooperativeScaledF16 { .. }) {
+                    continue;
+                }
                 if specialized && !convolution {
                     continue;
                 }
@@ -2089,7 +2145,10 @@ mod tests {
                     params: vec![2, 3, 7, 9, 5, 3, 2, 2, 0, 3, 5, 1],
                     ..Default::default()
                 };
-                if convolution && !specialized {
+                if convolution
+                    && !specialized
+                    && !matches!(tile, MatmulTile::CooperativeScaledF16 { .. })
+                {
                     assert_eq!(
                         tile_variant(&dispatch, tile),
                         Variant::Scalar(tile.shader(&entry))
@@ -2149,7 +2208,9 @@ mod tests {
                     ShaderEntry::Conv2dGemm => vec!["dst", "params", "src", "weight"],
                     _ => vec!["matrix_a", "matrix_b", "matrix_c", "params"],
                 };
-                if specialized {
+                if specialized
+                    || (convolution && matches!(tile, MatmulTile::CooperativeScaledF16 { .. }))
+                {
                     expected.retain(|&name| name != "params");
                 }
                 assert_eq!(names, expected);

@@ -156,6 +156,10 @@ pub enum MatmulTile {
     CooperativeF32 {
         tile_size: u32,
     },
+    /// Power-of-two tile scaling and compensated f16 products, f32 accumulation.
+    CooperativeScaledF16 {
+        subgroup_size: u32,
+    },
 }
 
 impl MatmulTile {
@@ -170,6 +174,9 @@ impl MatmulTile {
     }
 
     pub(crate) fn selected(dispatch: &Dispatch, config: Option<&CoopConfig>) -> Option<Self> {
+        if let Some(tile) = dispatch.tuned_coop {
+            return Some(tile);
+        }
         let small = dispatch.use_small_tiles
             || matches!(
                 dispatch.shader,
@@ -210,15 +217,18 @@ impl MatmulTile {
     pub(crate) fn apply(self, dispatch: &mut Dispatch, class: &TuneClass) {
         dispatch.shader = self.shader(&class.shader);
         dispatch.use_small_tiles = class.conv2d.is_none() && self == Self::Tile32;
-        dispatch.use_coop = matches!(self, Self::CooperativeF32 { .. });
+        dispatch.use_coop = matches!(
+            self,
+            Self::CooperativeF32 { .. } | Self::CooperativeScaledF16 { .. }
+        );
+        dispatch.tuned_coop = matches!(self, Self::CooperativeScaledF16 { .. }).then_some(self);
         dispatch.use_coop_compensated = false;
         dispatch.conv_k_tile = match self {
             Self::SpecializedConv { k_tile, .. } => Some(k_tile),
             _ => None,
         };
         dispatch.conv_output_tile = self.conv_output_tile();
-        dispatch.scalar_fallback = dispatch
-            .use_coop
+        dispatch.scalar_fallback = (dispatch.use_coop && dispatch.tuned_coop.is_none())
             .then(|| (dispatch.shader.clone(), Self::Tile64.workgroups(class)));
         dispatch.workgroups = self.workgroups(class);
     }
@@ -281,6 +291,13 @@ impl MatmulTile {
                 // Cooperative tiles use X for rows, Y for columns.
                 return [class.m.div_ceil(tile), class.n.div_ceil(tile), 1];
             }
+            Self::CooperativeScaledF16 { .. } => {
+                return [
+                    class.n.div_ceil(32),
+                    class.m.div_ceil(32),
+                    class.batch_dispatches(),
+                ];
+            }
         };
         // Scalar tiled kernels use X for columns, Y for rows. Derive exact
         // geometry; doubling rounded 64-tile counts overdispatches edges.
@@ -304,6 +321,11 @@ impl MatmulTile {
             }
         }
         let mut sizes = class.buffer_sizes()?;
+        if let Self::CooperativeScaledF16 { subgroup_size } = self {
+            if class.conv2d.is_none() || !matches!(subgroup_size, 16 | 32 | 64) {
+                return None;
+            }
+        }
         if let Self::CooperativeF32 { tile_size } = self {
             if class.conv2d.is_some()
                 || !matches!(tile_size, 8 | 16)
@@ -387,7 +409,7 @@ impl TuneClass {
                 | ShaderEntry::Conv2dGradInputGemm
                 | ShaderEntry::Conv2dGradWeightGemm
         ) {
-            if dispatch.use_coop
+            if (dispatch.use_coop && dispatch.tuned_coop.is_none())
                 || dispatch.use_small_tiles
                 || dispatch.scalar_fallback.is_some()
                 || (dispatch.conv_output_tile.is_some() && dispatch.conv_k_tile.is_none())

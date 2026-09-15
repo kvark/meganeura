@@ -33,6 +33,117 @@ impl CoopConfig {
     }
 }
 
+pub(crate) fn generate_scaled_f16_module(
+    group: ShaderGroup,
+    subgroup_size: u32,
+    params: Option<&[u32]>,
+) -> ShaderModule {
+    let source = match group {
+        ShaderGroup::Conv2dGemm => include_str!("shaders/conv2d_gemm.wgsl"),
+        ShaderGroup::Conv2dGradInputGemm => include_str!("shaders/conv2d_grad_input_gemm.wgsl"),
+        ShaderGroup::Conv2dGradWeightGemm => include_str!("shaders/conv2d_grad_weight_gemm.wgsl"),
+        _ => panic!("scaled cooperative convolution: {group:?}"),
+    };
+    let source = preprocess(
+        source,
+        &[
+            ("$COUNTS", ""),
+            ("$K_RANGE", ""),
+            ("$K_START", "0u"),
+            ("$K_END", "k_total"),
+            ("$OUTPUT_OFFSET", ""),
+        ],
+    );
+    conv_gemm_tiled(&source, [32, 32], 16, params, Some(subgroup_size))
+}
+
+fn conv_scaled_f16_body(
+    bm: u32,
+    bn: u32,
+    k: u32,
+    tm: u32,
+    tn: u32,
+    threads: u32,
+) -> (String, String, String, String, String) {
+    use std::fmt::Write;
+    let subgroup_size = threads / 4;
+    let mut shared = format!("var<workgroup> shared_output: array<f32, {}>;\n", bm * bn);
+    let mut compute = String::from("let slot = subgroup * 256u;\n");
+    for (name, address) in [
+        (
+            "a",
+            format!("(subgroup / 2u) * 16u * {k}u + (flat / 16u) * {k}u + flat % 16u"),
+        ),
+        (
+            "b",
+            format!("(flat / 16u) * {bn}u + (subgroup % 2u) * 16u + flat % 16u"),
+        ),
+    ] {
+        let _ = writeln!(shared, "var<workgroup> {name}_hi: array<f16, 1024>;");
+        let _ = writeln!(shared, "var<workgroup> {name}_lo: array<f16, 1024>;");
+        let _ = writeln!(compute, "var max_{name} = 0.0;");
+        let _ = writeln!(
+            compute,
+            "for (var flat = lane; flat < 256u; flat += {subgroup_size}u) {{"
+        );
+        let _ = writeln!(
+            compute,
+            "max_{name} = max(max_{name}, abs(shared_{name}[{address}])); }}"
+        );
+        let _ = writeln!(
+            compute,
+            "let exponent_{name} = clamp(i32((bitcast<u32>(subgroupMax(max_{name})) >> 23u) & 255u) - 137, -126, 126);"
+        );
+        let _ = writeln!(
+            compute,
+            "let normalize_{name} = bitcast<f32>(u32(127 - exponent_{name}) << 23u);"
+        );
+        let _ = writeln!(
+            compute,
+            "for (var flat = lane; flat < 256u; flat += {subgroup_size}u) {{"
+        );
+        let _ = writeln!(
+            compute,
+            "let x = shared_{name}[{address}] * normalize_{name}; let hi = quantizeToF16(x);"
+        );
+        let _ = writeln!(
+            compute,
+            "{name}_hi[slot + flat] = f16(hi); {name}_lo[slot + flat] = f16(x - hi); }}"
+        );
+    }
+    compute.push_str("workgroupBarrier();\n");
+    compute.push_str("let exponent = exponent_a + exponent_b;\n");
+    compute.push_str("let exponent0 = clamp(exponent, -126, 126);\n");
+    compute.push_str("let scale0 = bitcast<f32>(u32(127 + exponent0) << 23u);\n");
+    compute.push_str("let scale1 = bitcast<f32>(u32(127 + exponent - exponent0) << 23u);\n");
+    compute.push_str("let ah = coopLoadT<coop_mat16x16<f16,A>>(&a_hi[slot], 16u);\n");
+    compute.push_str("let al = coopLoadT<coop_mat16x16<f16,A>>(&a_lo[slot], 16u);\n");
+    compute.push_str("let bh = coopLoadT<coop_mat16x16<f16,B>>(&b_hi[slot], 16u);\n");
+    compute.push_str("let bl = coopLoadT<coop_mat16x16<f16,B>>(&b_lo[slot], 16u);\n");
+    compute.push_str("var part = coop_mat16x16<f32,C>();\n");
+    compute.push_str("part = coopMultiplyAdd(al, bh, part);\n");
+    compute.push_str("part = coopMultiplyAdd(ah, bl, part);\n");
+    compute.push_str("part = coopMultiplyAdd(ah, bh, part);\n");
+    compute.push_str("acc = acc + part * scale0 * scale1;\n");
+    let declarations = "var acc = coop_mat16x16<f32,C>();".to_string();
+    let store = format!(
+        "coopStoreT(acc, &shared_output[(subgroup / 2u) * 16u * {bn}u + (subgroup % 2u) * 16u], {bn}u);\nworkgroupBarrier();\n"
+    );
+    let mut array = format!("array<array<f32, {tn}>, {tm}>(");
+    for row in 0..tm {
+        let _ = write!(array, "array<f32, {tn}>(");
+        for col in 0..tn {
+            let _ = write!(
+                array,
+                "shared_output[(ty * {tm}u + {row}u) * {bn}u + tx * {tn}u + {col}u],"
+            );
+        }
+        array.push_str("),\n");
+    }
+    array.push(')');
+    (shared, declarations, compute, store, array)
+}
+
 /// Replace `$VAR` occurrences in `source` with the corresponding values.
 fn preprocess(source: &str, vars: &[(&str, &str)]) -> String {
     let mut s = source.to_string();
@@ -908,6 +1019,7 @@ pub(crate) fn generate_conv_module(
         output_tile.unwrap_or([tile.bm(); 2]),
         k_tile,
         params,
+        None,
     )
 }
 
@@ -918,11 +1030,20 @@ fn conv_gemm_tiled(
     [bm, bn]: [u32; 2],
     k_tile: u32,
     params: Option<&[u32]>,
+    cooperative_subgroup: Option<u32>,
 ) -> ShaderModule {
     assert!(matches!(k_tile, 16 | 32));
     assert!([bm, bn].iter().all(|&n| matches!(n, 16 | 32 | 64)));
-    let (tm, tn) = (bm / 16, bn / 16);
-    let (acc_decl, compute_body, acc_array) = tiled_gemm_body(tm, tn, k_tile, bn, false);
+    let threads = cooperative_subgroup.map_or(256, |size| 4 * size);
+    let threads_y = threads / 16;
+    let cooperative = cooperative_subgroup.is_some();
+    let (tm, tn) = (bm / threads_y, bn / 16);
+    let (extra_shared, acc_decl, compute_body, store_prepare, acc_array) = if cooperative {
+        conv_scaled_f16_body(bm, bn, k_tile, tm, tn, threads)
+    } else {
+        let (declaration, body, array) = tiled_gemm_body(tm, tn, k_tile, bn, false);
+        (String::new(), declaration, body, String::new(), array)
+    };
     let (declaration, divisor) = if let Some(values) = params {
         assert_eq!(values.len(), 16, "Conv2dParams layout");
         let arguments = values.iter().map(|v| format!("{v}u")).collect::<Vec<_>>();
@@ -939,6 +1060,34 @@ fn conv_gemm_tiled(
     let src = preprocess(
         src,
         &[
+            (
+                "$WORKGROUP_SIZE",
+                &if cooperative {
+                    threads.to_string()
+                } else {
+                    format!("16, {threads_y}")
+                },
+            ),
+            (
+                "$LOCAL_X",
+                if cooperative { "lid.x % 16u" } else { "lid.x" },
+            ),
+            (
+                "$LOCAL_Y",
+                if cooperative { "lid.x / 16u" } else { "lid.y" },
+            ),
+            (
+                "$SUBGROUP_PARAMS",
+                if cooperative {
+                    ", @builtin(subgroup_id) subgroup: u32, @builtin(subgroup_invocation_id) lane: u32"
+                } else {
+                    ""
+                },
+            ),
+            ("$THREADS_U", &format!("{threads}u")),
+            ("$K_STEP_U", if cooperative { "16u" } else { "1u" }),
+            ("$EXTRA_SHARED", &extra_shared),
+            ("$STORE_PREPARE", &store_prepare),
             ("$DIVISOR", divisor),
             ("$PARAMS_TYPE", include_str!("shaders/conv2d_params.wgsl")),
             ("$PARAMS_DECL", &declaration),
@@ -947,8 +1096,8 @@ fn conv_gemm_tiled(
             ("$TM_U", &format!("{tm}u")),
             ("$TN_U", &format!("{tn}u")),
             ("$KTILE_U", &format!("{k_tile}u")),
-            ("$STAGE_A_EPT_U", &format!("{}u", bm * k_tile / 256)),
-            ("$STAGE_B_EPT_U", &format!("{}u", bn * k_tile / 256)),
+            ("$STAGE_A_EPT_U", &format!("{}u", bm * k_tile / threads)),
+            ("$STAGE_B_EPT_U", &format!("{}u", bn * k_tile / threads)),
             ("$SHARED_A_SIZE", &(bm * k_tile).to_string()),
             ("$SHARED_B_SIZE", &(bn * k_tile).to_string()),
             ("$ACC_DECL", &acc_decl),
@@ -956,7 +1105,13 @@ fn conv_gemm_tiled(
             ("$ACC_ARRAY", &acc_array),
         ],
     );
-    parse_wgsl(&src)
+    if cooperative {
+        parse_wgsl(&format!(
+            "enable f16;\nenable wgpu_cooperative_matrix;\n{src}"
+        ))
+    } else {
+        parse_wgsl(&src)
+    }
 }
 
 fn conv_grad_weight_tiled(
@@ -992,7 +1147,7 @@ fn conv_grad_weight_tiled(
             ("$OUTPUT_OFFSET", offset),
         ],
     );
-    conv_gemm_tiled(&source, tile, k_tile, params)
+    conv_gemm_tiled(&source, tile, k_tile, params, None)
 }
 
 /// Shared unroll generator for every register-tiled GEMM skeleton

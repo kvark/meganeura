@@ -901,6 +901,8 @@ pub struct Dispatch {
     /// exponent range.
     #[serde(default)]
     pub use_coop_compensated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tuned_coop: Option<crate::tune::MatmulTile>,
     /// Number of same-A sibling matmuls packed into this dispatch (D1).
     /// 0/1 = not packed. Extra B operands follow A in `input_buffers`;
     /// extra C outputs are `extra_outputs`. `workgroups[2]` is the pack

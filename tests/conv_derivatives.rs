@@ -828,6 +828,112 @@ fn generated_conv_derivatives_match_oracle_without_assuming_same_padding() {
     }
 }
 
+#[test]
+#[ignore = "Requires f16 cooperative hardware; executes scaled forward, dX and dW against f64"]
+fn scaled_f16_conv_derivatives_match_full_oracle() {
+    let gpu = gpu();
+    let caps = gpu.capabilities().cooperative_matrix;
+    assert_eq!(caps.f16_tile, 16);
+    for (ci, co, kh, kw, stride, ph, pw) in [
+        (3, 5, 3, 3, 1, 0, 0),
+        (17, 19, 2, 4, 1, 0, 1),
+        (65, 33, 3, 2, 2, 0, 1),
+        (3, 5, 1, 1, 1, 0, 0),
+    ] {
+        let s = Shape {
+            batch: 2,
+            ci,
+            h: 9,
+            w: 41,
+            co,
+            kh,
+            kw,
+            stride,
+            ph,
+            pw,
+        };
+        let [nx, nw, ny] = s.sizes();
+        let (mut plan, _) = plan(s, 32, 1);
+        let mut buffers = Vec::new();
+        for d in &mut plan.dispatches {
+            if matches!(
+                d.shader,
+                ShaderEntry::Conv2dGemmSmall
+                    | ShaderEntry::Conv2dGradInputGemmSmall
+                    | ShaderEntry::Conv2dGradWeightGemmSmall
+            ) {
+                d.use_coop = true;
+                d.tuned_coop = Some(meganeura::tune::MatmulTile::CooperativeScaledF16 {
+                    subgroup_size: caps.subgroup_size,
+                });
+                buffers.push((d.output_buffer, d.shader.clone()));
+            }
+        }
+        assert_eq!(buffers.len(), 3);
+        let mut session = Session::with_context_opts(
+            plan,
+            Arc::clone(&gpu),
+            SessionOptions {
+                coop: CoopPolicy::Auto,
+                no_alias: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            session
+                .plan()
+                .dispatches
+                .iter()
+                .filter(|d| d.tuned_coop.is_some())
+                .count(),
+            3
+        );
+        let serialized = serde_json::to_string(session.plan()).unwrap();
+        let strict = Session::with_context_opts(
+            serde_json::from_str(&serialized).unwrap(),
+            Arc::clone(&gpu),
+            SessionOptions {
+                coop: CoopPolicy::NativeF32,
+                ..Default::default()
+            },
+        );
+        assert!(
+            strict
+                .plan()
+                .dispatches
+                .iter()
+                .all(|d| d.tuned_coop.is_none())
+        );
+        drop(strict);
+        let x = data(nx, 7, 1.0);
+        let w = data(nw, 19, 1.0);
+        session.set_parameter("x", &x);
+        session.set_parameter("w", &w);
+        for scale in [1.0, 1e-12] {
+            let dy = data(ny, 37, scale);
+            session.set_input("dy", &dy);
+            session.step();
+            session.wait();
+            let (y, dx, dw) = reference(s, &x, &w, &dy);
+            for (buffer, shader) in &buffers {
+                let (expected, scale) = match shader {
+                    ShaderEntry::Conv2dGemmSmall => (&y, 1.0),
+                    ShaderEntry::Conv2dGradInputGemmSmall => (&dx, scale),
+                    _ => (&dw, scale),
+                };
+                let mut actual = vec![f32::NAN; expected.len()];
+                session.read_buffer(*buffer, &mut actual);
+                check(
+                    &format!("{s:?}, {shader:?}, scale={scale:e}"),
+                    &actual,
+                    expected,
+                    scale,
+                );
+            }
+        }
+    }
+}
+
 fn cooperative_policy(gpu: &blade_graphics::Context) -> CoopPolicy {
     assert!(gpu.capabilities().cooperative_matrix.is_supported());
     if gpu.capabilities().cooperative_matrix.f32_tile > 0 {

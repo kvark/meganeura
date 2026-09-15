@@ -1030,6 +1030,7 @@ enum Variant {
     Coop(ShaderEntry),
     /// Cooperative f16 with hi/lo residual staging (C1).
     CoopCompensated(ShaderEntry),
+    TunedTile(ShaderEntry, crate::tune::MatmulTile, Vec<u32>),
     /// Same-A matmul pack (D1). The kind is part of the key so a
     /// forward Q/K/V pack (plain f16 coop) cannot share a pipeline with
     /// a backward pack of the same arity (compensated).
@@ -1071,6 +1072,7 @@ impl Variant {
             | Variant::Weight(ref e, _)
             | Variant::Coop(ref e)
             | Variant::CoopCompensated(ref e)
+            | Variant::TunedTile(ref e, _, _)
             | Variant::Horizontal(ref e, _, _)
             | Variant::SmallTile(ref e)
             | Variant::Scalar(ref e) => Some(e),
@@ -1095,6 +1097,7 @@ impl Variant {
             Variant::Weight(ref e, format) => format!("{e:?}:weight-{format:?}"),
             Variant::Coop(ref e) => format!("{e:?}:cooperative"),
             Variant::CoopCompensated(ref e) => format!("{e:?}:cooperative-compensated"),
+            Variant::TunedTile(ref e, tile, ref params) => format!("{e:?}:{tile:?}:{params:?}"),
             Variant::Horizontal(ref e, n, kind) => format!("{e:?}:horizontal-{n}-{kind:?}"),
             Variant::SmallTile(ref e) => format!("{e:?}:small-tile"),
             Variant::Scalar(ref e) => format!("{e:?}:scalar"),
@@ -1150,7 +1153,7 @@ impl Pipelines {
         let mut attention_entries: HashSet<(ShaderEntry, u32)> = HashSet::new();
 
         for dispatch in &plan.dispatches {
-            if dispatch.conv_k_tile.is_some() {
+            if dispatch.conv_k_tile.is_some() || dispatch.tuned_coop.is_some() {
                 continue;
             }
             let group = dispatch.shader.shader_group();
@@ -1670,12 +1673,12 @@ impl Pipelines {
 
         let mut pipelines = Self { map };
         for dispatch in &plan.dispatches {
-            if dispatch.conv_k_tile.is_some() {
+            if dispatch.conv_k_tile.is_some() || dispatch.tuned_coop.is_some() {
                 let tile = crate::tune::MatmulTile::selected(dispatch, None)
-                    .expect("scalar convolution specialization");
+                    .expect("selected tuning tile");
                 pipelines
                     .ensure_tune_tile(gpu, dispatch, tile)
-                    .expect("selected convolution pipeline");
+                    .expect("selected tuning pipeline");
             }
         }
         pipelines
@@ -1689,6 +1692,9 @@ impl Pipelines {
     /// ops, so running the unfused matmul would silently drop them. That
     /// list stays a single entry and a miss is a panic.
     fn candidates(dispatch: &Dispatch) -> Vec<Variant> {
+        if let Some(tile) = dispatch.tuned_coop {
+            return vec![tuning::tile_variant(dispatch, tile)];
+        }
         let entry = &dispatch.shader;
         if let Some(k_tile) = dispatch.conv_k_tile {
             return vec![Variant::SpecializedConv(
@@ -2216,7 +2222,7 @@ pub(crate) fn select_variants(
         // iOS and future 8×8 f32 advertisers need the same veto.
         let apple_f32_coop = !config.use_f16_input && config.tile_size == 8;
         for dispatch in &mut plan.dispatches {
-            if dispatch.conv_k_tile.is_some() {
+            if dispatch.conv_k_tile.is_some() || dispatch.tuned_coop.is_some() {
                 continue;
             }
             // Autodiff marks derivative work as requiring f32 operands. A
@@ -3194,6 +3200,22 @@ impl Session {
 
         let mut plan = plan;
         let schedule_span = tracing::info_span!("schedule").entered();
+
+        for dispatch in &mut plan.dispatches {
+            if let Some(crate::tune::MatmulTile::CooperativeScaledF16 { subgroup_size }) =
+                dispatch.tuned_coop
+            {
+                let compatible = coop_config
+                    .as_ref()
+                    .is_some_and(|c| c.use_f16_input && c.tile_size == 16)
+                    && coop_caps.subgroup_size == subgroup_size;
+                if !compatible {
+                    dispatch.tuned_coop = None;
+                    dispatch.use_coop = false;
+                    dispatch.shader = crate::tune::MatmulTile::Tile32.shader(&dispatch.shader);
+                }
+            }
+        }
 
         // Per-dispatch kernel-variant selection: one pass, one owner.
         select_variants(

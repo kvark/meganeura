@@ -17,10 +17,12 @@ $PARAMS_DECL
 var<workgroup> shared_a: array<f32, $SHARED_A_SIZE>;   // A tile: [BM, K]
 var<workgroup> shared_b: array<f32, $SHARED_B_SIZE>;   // B tile: [K, BN]
 
-@compute @workgroup_size(16, 16)
-fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>$COUNTS) {
-    let tx = lid.x;
-    let ty = lid.y;
+$EXTRA_SHARED
+
+@compute @workgroup_size($WORKGROUP_SIZE)
+fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>$COUNTS$SUBGROUP_PARAMS) {
+    let tx = $LOCAL_X;
+    let ty = $LOCAL_Y;
     let tile_row = wgid.y * $BM_U;   // M (Co) tile start
     let tile_col = wgid.x * $BN_U;   // N (Ci*kH*kW) tile start
     let tid = ty * 16u + tx;
@@ -42,7 +44,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         // Load A tile: grad_out_flat[Co, N*oH*oW].
         // A[co, n*oH*oW + oh*oW + ow] = grad_out[n, co, oh, ow]
         for (var e = 0u; e < $STAGE_A_EPT_U; e++) {
-            let flat = tid + e * 256u;
+            let flat = tid + e * $THREADS_U;
             let row_local = flat / $KTILE_U;  // M dimension (Co)
             let col_local = flat % $KTILE_U;  // K dimension
             let co = tile_row + row_local;
@@ -61,7 +63,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         // B[k_idx, col] where k_idx = n*oH*oW + oh*oW + ow, col = ci*kH*kW + kh*kW + kw
         // B[k_idx, col] = input[n, ci, oh*stride+kh-padding, ow*stride+kw-padding]
         for (var e = 0u; e < $STAGE_B_EPT_U; e++) {
-            let flat = tid + e * 256u;
+            let flat = tid + e * $THREADS_U;
             let row_local = flat / $BN_U;  // K dimension
             let col_local = flat % $BN_U;  // N dimension (Ci*kH*kW)
             let k_idx = t + row_local;
@@ -92,7 +94,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         workgroupBarrier();
 
         // Compute the register tile over one K stage.
-        for (var kk = 0u; kk < $KTILE_U; kk++) {
+        for (var kk = 0u; kk < $KTILE_U; kk += $K_STEP_U) {
             $COMPUTE_BODY
         }
 
@@ -102,6 +104,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
 
     // Store: grad_kernel[co, ci*kH*kW + kh*kW + kw]
     // Output layout: [Co, Ci, kH, kW] = [Co, Ci*kH*kW] row-major
+    $STORE_PREPARE
     let s = $ACC_ARRAY;
     for (var i = 0u; i < $TM_U; i++) {
         for (var j = 0u; j < $TN_U; j++) {
