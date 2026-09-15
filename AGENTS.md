@@ -1,5 +1,10 @@
 # Combined initialization control, CPU preparation only
 
+This versioned continuation pins Blade c96a9a87 directly in Cargo. It contains
+the same published-control code plus observability as the prior path fixture.
+Do not substitute newest Blade/main in this historical control. No GPU launch
+or native package is declared by this source pin.
+
 This is the ce80 control with flushed initialization/constant-upload traces and
 three checked waits. Preserve its allocation order, immediate Shared zeroing,
 math, policies and settings. The parent failed bundle remains quarantined.

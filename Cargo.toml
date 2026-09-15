@@ -52,7 +52,7 @@ hub = ["dep:hf-hub"]
 profiler = ["dep:tracing-subscriber"]
 
 [dependencies]
-blade-graphics = "0.9"
+blade-graphics = { git = "https://github.com/kvark/blade", rev = "c96a9a87ad47d525467f9b41c17ce480ff876240" }
 blade-macros = "0.3"
 # `default-features = false` drops egglog's `bin` stack (clap, mimalloc,
 # env_logger, chrono, graphviz). Greedy mode never constructs an EGraph
