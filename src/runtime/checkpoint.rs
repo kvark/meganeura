@@ -46,7 +46,8 @@ fn logical_bytes(ty: &TensorType) -> io::Result<usize> {
             DType::Q6K => n
                 .div_ceil(256)
                 .checked_mul(210)
-                .map(|b| b.next_multiple_of(4)),
+                .and_then(|b| b.checked_add(3))
+                .map(|b| b & !3),
         })
         .ok_or_else(|| invalid("checkpoint logical shape overflows byte size"))
 }
@@ -302,54 +303,28 @@ fn validate<'a>(plan: &ExecutionPlan, data: &'a [u8]) -> io::Result<Restore<'a>>
     })
 }
 
-fn restored_weight_staging(
+fn restored_packed_concat_staging(
     plan: &ExecutionPlan,
     writes: &[Write<'_>],
-) -> io::Result<HashMap<BufferRef, Vec<f32>>> {
-    use crate::compile::WeightFormat;
+) -> HashMap<BufferRef, Vec<u8>> {
     let mut staging = HashMap::new();
-    for &(buffer, _, _) in &plan.derived_params {
-        let Some(&(format, rows, cols)) = plan.weight_buffers.get(&buffer) else {
+    for entry in &plan.derived_params {
+        let buffer = entry.0;
+        let transform = &entry.2;
+        if !matches!(transform, crate::graph::ParamTransform::HorizontalConcat) {
             continue;
-        };
-        let Some(write) = writes
+        }
+        if !plan.weight_buffers.contains_key(&buffer) {
+            continue;
+        }
+        if let Some(write) = writes
             .iter()
             .find(|w| matches!(w.target, Target::Parameter(b) if b == buffer))
-        else {
-            continue;
-        };
-        let values = match format {
-            WeightFormat::F16 => write
-                .data
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|&b| half::f16::from_bits(u16::from_le_bytes(b)).to_f32())
-                .collect(),
-            WeightFormat::Q4 | WeightFormat::Q8 => {
-                let elements = rows
-                    .checked_mul(cols)
-                    .ok_or_else(|| invalid("derived weight size overflow"))?;
-                let block_bytes = if format == WeightFormat::Q4 { 20 } else { 36 };
-                let bytes = (elements / 32)
-                    .checked_mul(block_bytes)
-                    .ok_or_else(|| invalid("derived weight size overflow"))?;
-                if !rows.is_multiple_of(32) || write.data.len() < bytes {
-                    return Err(invalid("invalid packed derived weight layout"));
-                }
-                if format == WeightFormat::Q4 {
-                    super::dequantize_q4_0(write.data, rows, cols)
-                } else {
-                    super::dequantize_q8_0(write.data, rows, cols)
-                }
-            }
-            // The K-quants have no host encoder, so a derived weight could
-            // never have been produced in one; nothing to stage back.
-            WeightFormat::F32 | WeightFormat::Q4K | WeightFormat::Q6K => continue,
-        };
-        staging.insert(buffer, values);
+        {
+            staging.insert(buffer, write.data.to_vec());
+        }
     }
-    Ok(staging)
+    staging
 }
 
 impl Session {
@@ -588,7 +563,7 @@ impl Session {
                 return Err(invalid("unaligned device-only checkpoint destination"));
             }
         }
-        let staging = restored_weight_staging(&self.plan, &restore.writes)?;
+        let packed_staging = restored_packed_concat_staging(&self.plan, &restore.writes);
         let moment_indices: HashSet<_> = restore
             .writes
             .iter()
@@ -640,7 +615,7 @@ impl Session {
         if let Some(step) = restore.adam_step {
             self.adam_step = step;
         }
-        self.weight_staging.extend(staging);
+        self.packed_concat_staging.extend(packed_staging);
         Ok(())
     }
 }
@@ -804,6 +779,11 @@ mod tests {
             logical_bytes(&TensorType::new(vec![32, 33], DType::Q8_0)).unwrap(),
             1188
         );
+        assert_eq!(
+            logical_bytes(&TensorType::new(vec![256], DType::Q6K)).unwrap(),
+            212
+        );
+        assert!(logical_bytes(&TensorType::new(vec![usize::MAX], DType::Q6K)).is_err());
     }
 
     #[test]

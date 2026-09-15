@@ -3129,6 +3129,15 @@ impl<'a> Compiler<'a> {
                 let a = self.get_buffer(node.inputs[0]);
                 let b = self.get_buffer(node.inputs[1]);
                 let d = self.get_buffer(node.inputs[2]);
+                // Same block-axis mismatch as `Op::MatMulBT`. Greedy mode
+                // rewrites `Add(MatMulBT, ?)` into this op before compile,
+                // so the unfused assert would never see a quantized B.
+                assert!(
+                    !WeightFormat::from_dtype(self.graph.node(node.inputs[1]).ty.dtype)
+                        .is_quantized(),
+                    "matmul_bt does not support block-quantized weights: their blocks \
+                     run along the parameter's first dimension, which is N here, not K"
+                );
                 let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
                 let wf = WeightFormat::from_dtype(self.graph.node(node.inputs[1]).ty.dtype);

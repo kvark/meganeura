@@ -7,10 +7,10 @@
 //!
 //! The `stored as` column is what matters for weight fidelity. A `DType`
 //! means the tensor reaches the GPU losslessly through
-//! `Session::set_parameter_packed`. `f32` means it is not a packed format
-//! and goes through `Session::set_parameter` unchanged. `unsupported`
-//! means this loader does not implement that `ggml_type`, so the tensor is
-//! listed but cannot be read.
+//! `Session::set_parameter_packed`. `f16`/`f32` means it is not a packed
+//! format and is read with `to_f32`. `unsupported` means this loader does
+//! not implement that `ggml_type`, so the tensor is listed but cannot be
+//! read.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -69,8 +69,8 @@ fn main() {
         // destination would allocate the whole payload.
         let stored = match t.packed_dtype() {
             Ok(dtype) => format!("{dtype:?}"),
-            // Not a packed format; it uploads as plain f32.
-            Err(GgufError::UnsupportedPack(_)) => "f32".to_string(),
+            // Not a packed format; the GGML type is the host encoding.
+            Err(GgufError::UnsupportedPack(ty)) => format!("{ty:?}").to_ascii_lowercase(),
             Err(GgufError::UnsupportedType(tag)) => {
                 unsupported += 1;
                 format!("unsupported (tag {tag})")

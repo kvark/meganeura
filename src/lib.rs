@@ -54,6 +54,7 @@ pub use compile::CompileOptions;
 pub use compile::TuningKnobs;
 pub use data::{DataLoader, MnistDataset};
 pub use graph::{DType, Graph, NodeId, TensorType};
+pub use load::gguf::{GgufError, GgufModel, load_gguf, load_gguf_bytes};
 pub use load::nnef::{NnefError, NnefModel, load_nnef};
 pub use load::onnx::{OnnxError, OnnxModel, load_onnx, load_onnx_bytes};
 pub use optimize::{ExtractionCost, OptimizeConfig, OptimizeMode, OptimizeReport};

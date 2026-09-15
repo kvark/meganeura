@@ -39,13 +39,18 @@
   here, so they only ever arrive already packed. `set_parameter` rejects
   such parameters and points at `set_parameter_packed`, and
   `generate_module_weighted` asserts rather than falling through to an f32
-  shader for a group with no K-quant variant.
+  shader for a group with no K-quant variant. Packed SwiGLU `gate+up`
+  fusion restages the derived concat from those uploads: Q4 merges its
+  split header/nibble regions, and Q6_K concatenates unpadded superblocks
+  before the word-alignment tail.
 - `matmul_bt` now rejects block-quantized weights. Their blocks run along
   the parameter's first dimension, which is N for a transposed B, while
   every packed decoder indexes along K — so the kernels that served this
-  returned plausible but wrong numbers. Nothing in the tree produced one,
-  so the arms were dead as well as incorrect. f16 is unaffected, being an
-  elementwise cast rather than a block layout.
+  returned plausible but wrong numbers. The same refusal covers
+  `FusedMatMulBTAdd` (greedy `Add(MatMulBT, ?)`) and store-side epilogue
+  codegen, which previously compiled a quantized BT kernel after Relu
+  fusion. f16 is unaffected, being an elementwise cast rather than a
+  block layout.
 - Autotuning searches shape-specialized scalar convolutions and K-stage sizes
   for forward and both gradients; unused candidates are released after search.
 - Store-side unary epilogues (Relu/Sigmoid/Silu/Neg) now fuse into F16/Q4/Q8

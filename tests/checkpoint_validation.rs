@@ -408,3 +408,48 @@ fn checkpoint_refreshes_derived_f16_staging_before_later_source_updates() {
     target.wait();
     assert_eq!(target.read_output(2), vec![11.0, 7.0]);
 }
+
+#[test]
+fn checkpoint_refreshes_derived_packed_staging_before_later_source_updates() {
+    let mut graph = Graph::new();
+    graph.parameter_q4("a", &[32, 1]);
+    graph.parameter_q4("b", &[32, 1]);
+    let joined_node = graph.parameter_q4("joined", &[32, 2]);
+    let x = graph.input("x", &[1, 32]);
+    let y = graph.matmul(x, joined_node);
+    graph.set_outputs(vec![y]);
+    let mut plan = meganeura::compile::compile(&graph);
+    let joined = plan
+        .param_buffers
+        .iter()
+        .find(|p| p.0 == "joined")
+        .unwrap()
+        .1;
+    plan.derived_params.push((
+        joined,
+        vec![("a".into(), 1), ("b".into(), 1)],
+        meganeura::graph::ParamTransform::HorizontalConcat,
+    ));
+    let packed = |value| meganeura::runtime::quantize_q4_0(&[value; 32], 32, 1);
+
+    let mut source = Session::new(plan.clone());
+    source.set_parameter_packed("a", &packed(1.0));
+    source.set_parameter_packed("b", &packed(3.0));
+    let file = TestFile::new();
+    source.save_checkpoint(&file.0).unwrap();
+
+    let mut target = Session::new(plan);
+    target.set_parameter_packed("a", &packed(10.0));
+    target.set_parameter_packed("b", &packed(30.0));
+    target.load_checkpoint(&file.0).unwrap();
+    target.set_parameter("a", &[5.0; 32]);
+    target.set_input("x", &[1.0; 32]);
+    target.step();
+    target.wait();
+    assert_eq!(target.read_output(2), vec![160.0, 96.0]);
+
+    target.set_parameter_packed("b", &packed(7.0));
+    target.step();
+    target.wait();
+    assert_eq!(target.read_output(2), vec![160.0, 224.0]);
+}

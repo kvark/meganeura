@@ -2817,8 +2817,9 @@ pub struct Session {
     /// Longest-prefix-match wins; default multiplier is 1.0. Empty by
     /// default (preserves base LR for all params).
     lr_multipliers: Vec<(String, f32)>,
-    /// Staging buffers for Q4 HorizontalConcat derived params.
-    weight_staging: HashMap<crate::compile::BufferRef, Vec<f32>>,
+    /// Packed HorizontalConcat restage: source uploads write a column
+    /// range into this host copy, which is then uploaded as a whole.
+    packed_concat_staging: HashMap<crate::compile::BufferRef, Vec<u8>>,
     upload_staging: RefCell<Option<UploadStaging>>,
     reuse_upload_staging: bool,
 }
@@ -3611,7 +3612,7 @@ impl Session {
             adam_step: 0,
             pending_adam: None,
             adam_wd: 0.0,
-            weight_staging: HashMap::new(),
+            packed_concat_staging: HashMap::new(),
             upload_staging: RefCell::new(None),
             reuse_upload_staging: std::env::var("MEGANEURA_REUSE_UPLOAD").as_deref() == Ok("1"),
         }
@@ -4582,6 +4583,78 @@ pub fn dequantize_q8_0(buf: &[u8], rows: usize, cols: usize) -> Vec<f32> {
     out
 }
 
+/// Scatter one source's packed columns into a HorizontalConcat destination.
+///
+/// Block formats pack along K per column, so a source occupies a column
+/// range. Q4 splits headers and nibbles into two regions, so that range is
+/// not a single byte span; Q6_K's word padding belongs at the end of the
+/// concatenated superblocks, not after each source.
+fn scatter_packed_concat_columns(
+    dest: &mut [u8],
+    src: &[u8],
+    fmt: crate::compile::WeightFormat,
+    rows: usize,
+    src_cols: usize,
+    total_cols: usize,
+    col_offset: usize,
+) {
+    assert!(col_offset + src_cols <= total_cols);
+    match fmt {
+        crate::compile::WeightFormat::F32 | crate::compile::WeightFormat::F16 => {
+            let e = if fmt == crate::compile::WeightFormat::F32 {
+                4
+            } else {
+                2
+            };
+            assert_eq!(src.len(), rows * src_cols * e);
+            assert_eq!(dest.len(), rows * total_cols * e);
+            for r in 0..rows {
+                let s = r * src_cols * e;
+                let d = (r * total_cols + col_offset) * e;
+                dest[d..d + src_cols * e].copy_from_slice(&src[s..s + src_cols * e]);
+            }
+        }
+        crate::compile::WeightFormat::Q8 => {
+            assert!(rows.is_multiple_of(32));
+            let bpc = rows / 32;
+            let nbytes = bpc * src_cols * 36;
+            assert_eq!(src.len(), nbytes);
+            let off = col_offset * bpc * 36;
+            dest[off..off + nbytes].copy_from_slice(src);
+        }
+        crate::compile::WeightFormat::Q4K => {
+            assert!(rows.is_multiple_of(256));
+            let bpc = rows / 256;
+            let nbytes = bpc * src_cols * 144;
+            assert_eq!(src.len(), nbytes);
+            let off = col_offset * bpc * 144;
+            dest[off..off + nbytes].copy_from_slice(src);
+        }
+        crate::compile::WeightFormat::Q6K => {
+            assert!(rows.is_multiple_of(256));
+            let bpc = rows / 256;
+            let unpadded = bpc * src_cols * 210;
+            assert!(src.len() >= unpadded);
+            let off = col_offset * bpc * 210;
+            dest[off..off + unpadded].copy_from_slice(&src[..unpadded]);
+        }
+        crate::compile::WeightFormat::Q4 => {
+            assert!(rows.is_multiple_of(32));
+            let bpc = rows / 32;
+            let src_blocks = bpc * src_cols;
+            let dest_blocks = bpc * total_cols;
+            let src_hdr = src_blocks * 4;
+            let src_nib = src_blocks * 16;
+            assert_eq!(src.len(), src_hdr + src_nib);
+            let dest_hdr = dest_blocks * 4;
+            let col_blocks = col_offset * bpc;
+            dest[col_blocks * 4..col_blocks * 4 + src_hdr].copy_from_slice(&src[..src_hdr]);
+            dest[dest_hdr + col_blocks * 16..dest_hdr + col_blocks * 16 + src_nib]
+                .copy_from_slice(&src[src_hdr..]);
+        }
+    }
+}
+
 #[cfg(test)]
 mod q4_tests {
     use super::*;
@@ -4634,27 +4707,81 @@ mod q4_tests {
     }
 
     #[test]
-    fn q4_decode_f16_matches_half_crate() {
-        // Verify our manual f16 decode matches the half crate
-        for bits in [0x3C00u16, 0x4000, 0x3800, 0xBC00, 0x0000, 0x7BFF] {
-            let expected = half::f16::from_bits(bits).to_f32();
-            let sign = ((bits as u32) >> 15) & 1;
-            let expo = ((bits as u32) >> 10) & 0x1F;
-            let mant = (bits as u32) & 0x3FF;
-            let f32_bits = if expo == 0 {
-                sign << 31
-            } else {
-                (sign << 31) | ((expo + 112) << 23) | (mant << 13)
-            };
-            let decoded = f32::from_bits(f32_bits);
-            assert!(
-                (expected - decoded).abs() < 1e-6,
-                "f16 decode mismatch for 0x{:04x}: expected={}, decoded={}",
-                bits,
-                expected,
-                decoded,
-            );
+    fn q4_packed_concat_matches_quantizing_the_wide_matrix() {
+        let rows = 32;
+        let left_cols = 2;
+        let right_cols = 2;
+        let total = left_cols + right_cols;
+        let left: Vec<f32> = (0..rows * left_cols)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.05)
+            .collect();
+        let right: Vec<f32> = (0..rows * right_cols)
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.07)
+            .collect();
+        let mut wide = vec![0.0f32; rows * total];
+        for r in 0..rows {
+            for c in 0..left_cols {
+                wide[r * total + c] = left[r * left_cols + c];
+            }
+            for c in 0..right_cols {
+                wide[r * total + left_cols + c] = right[r * right_cols + c];
+            }
         }
+        let mut dest = vec![0u8; quantize_q4_0(&wide, rows, total).len()];
+        scatter_packed_concat_columns(
+            &mut dest,
+            &quantize_q4_0(&left, rows, left_cols),
+            crate::compile::WeightFormat::Q4,
+            rows,
+            left_cols,
+            total,
+            0,
+        );
+        scatter_packed_concat_columns(
+            &mut dest,
+            &quantize_q4_0(&right, rows, right_cols),
+            crate::compile::WeightFormat::Q4,
+            rows,
+            right_cols,
+            total,
+            left_cols,
+        );
+        assert_eq!(dest, quantize_q4_0(&wide, rows, total));
+    }
+
+    #[test]
+    fn q6k_packed_concat_strips_per_source_padding() {
+        // One superblock is 210 bytes, so each N=1 source pads to 212.
+        // Concatenating the padded blobs would insert two zeros in the
+        // middle of the superblock stream.
+        let left = vec![1u8; 210];
+        let right = vec![2u8; 210];
+        let pad = |src: &[u8]| {
+            let mut v = src.to_vec();
+            v.resize(src.len().next_multiple_of(4), 0);
+            v
+        };
+        let mut dest = vec![0u8; 420];
+        scatter_packed_concat_columns(
+            &mut dest,
+            &pad(&left),
+            crate::compile::WeightFormat::Q6K,
+            256,
+            1,
+            2,
+            0,
+        );
+        scatter_packed_concat_columns(
+            &mut dest,
+            &pad(&right),
+            crate::compile::WeightFormat::Q6K,
+            256,
+            1,
+            2,
+            1,
+        );
+        assert_eq!(&dest[..210], &left[..]);
+        assert_eq!(&dest[210..], &right[..]);
     }
 }
 
@@ -4737,68 +4864,61 @@ impl Session {
 
                 // If this source param feeds a derived param, fill the
                 // derived buffer according to the transform type.
-                for entry in &self.plan.derived_params {
-                    let derived_buf = &entry.0;
-                    let sources = entry.1.as_slice();
-
-                    // Check if this source name is referenced
-                    if !sources.iter().any(|s| s.0 == name) {
-                        continue;
-                    }
-
-                    match entry.2 {
+                let derived: Vec<_> = self
+                    .plan
+                    .derived_params
+                    .iter()
+                    .filter(|entry| entry.1.iter().any(|s| s.0 == name))
+                    .cloned()
+                    .collect();
+                for (derived_buf, sources, transform) in derived {
+                    let sources = sources.as_slice();
+                    match transform {
                         crate::graph::ParamTransform::HorizontalConcat => {
                             let total_cols: usize = sources.iter().map(|s| s.1).sum();
                             let derived_fmt = self
                                 .plan
                                 .weight_buffers
-                                .get(derived_buf)
+                                .get(&derived_buf)
                                 .map(|&(f, _, _)| f)
                                 .unwrap_or(crate::compile::WeightFormat::F32);
 
                             if derived_fmt.uses_reduced_storage() {
-                                // Quantized: accumulate sources into f32 staging,
-                                // then quantize the full interleaved matrix.
+                                // Packing runs per column, so encode this source
+                                // and merge it into the canonical packed staging.
+                                // This also keeps f32 and packed upload calls in
+                                // sync when callers mix the two APIs.
                                 let &(_, rows, _) =
-                                    self.plan.weight_buffers.get(derived_buf).unwrap();
-                                let staging = self
-                                    .weight_staging
-                                    .entry(*derived_buf)
-                                    .or_insert_with(|| vec![0.0f32; rows * total_cols]);
-                                let mut col_offset = 0usize;
-                                for src in sources {
-                                    if src.0 == name && rows > 0 {
-                                        let src_cols = src.1;
-                                        for r in 0..rows {
-                                            let src_start = r * src_cols;
-                                            let dst_start = r * total_cols + col_offset;
-                                            staging[dst_start..dst_start + src_cols]
-                                                .copy_from_slice(
-                                                    &data[src_start..src_start + src_cols],
-                                                );
-                                        }
-                                    }
-                                    col_offset += src.1;
-                                }
+                                    self.plan.weight_buffers.get(&derived_buf).unwrap();
+                                let src_cols = sources
+                                    .iter()
+                                    .find(|src| src.0 == name)
+                                    .map(|src| src.1)
+                                    .unwrap();
                                 let packed = match derived_fmt {
                                     crate::compile::WeightFormat::Q4 => {
-                                        quantize_q4_0(staging, rows, total_cols)
+                                        quantize_q4_0(data, rows, src_cols)
                                     }
                                     crate::compile::WeightFormat::Q8 => {
-                                        quantize_q8_0(staging, rows, total_cols)
+                                        quantize_q8_0(data, rows, src_cols)
                                     }
-                                    crate::compile::WeightFormat::F16 => staging
+                                    crate::compile::WeightFormat::F16 => data
                                         .iter()
                                         .map(|&v| half::f16::from_f32(v).to_bits())
                                         .flat_map(|b| b.to_le_bytes())
                                         .collect(),
-                                    _ => unreachable!(),
+                                    fmt @ (crate::compile::WeightFormat::Q4K
+                                    | crate::compile::WeightFormat::Q6K) => panic!(
+                                        "derived parameter is {fmt:?}; load its sources with \
+                                         set_parameter_packed"
+                                    ),
+                                    crate::compile::WeightFormat::F32 => unreachable!(),
                                 };
-                                self.upload_parameter_bytes(*derived_buf, &packed);
+                                self.restage_packed_concat(derived_buf, name, &packed, sources);
                             } else {
                                 // f32: direct copy into GPU buffer
                                 let buf_f32 =
-                                    self.plan.param_types.get(derived_buf).map_or(
+                                    self.plan.param_types.get(&derived_buf).map_or(
                                         self.plan.buffers[derived_buf.0 as usize] / 4,
                                         |ty| ty.num_elements(),
                                     );
@@ -4807,7 +4927,7 @@ impl Session {
                                 for src in sources {
                                     if src.0 == name && rows > 0 {
                                         let src_cols = src.1;
-                                        if self.logical_host_visible(*derived_buf) {
+                                        if self.logical_host_visible(derived_buf) {
                                             let derived_ptr = self.buffers[derived_buf.0 as usize]
                                                 .data()
                                                 as *mut f32;
@@ -4825,7 +4945,7 @@ impl Session {
                                         } else {
                                             self.copy_parameter_columns(
                                                 buf_ref,
-                                                *derived_buf,
+                                                derived_buf,
                                                 data,
                                                 rows,
                                                 src_cols,
@@ -4850,7 +4970,7 @@ impl Session {
                                 [0.0, 0.0, 1.0],
                             ];
                             let mut staging =
-                                (!self.logical_host_visible(*derived_buf)).then(|| {
+                                (!self.logical_host_visible(derived_buf)).then(|| {
                                     vec![0.0f32; self.plan.buffers[derived_buf.0 as usize] / 4]
                                 });
                             let derived_ptr = match staging {
@@ -4897,7 +5017,7 @@ impl Session {
                                 }
                             }
                             if let Some(data) = staging {
-                                self.upload_buffer(*derived_buf, bytemuck::cast_slice(&data));
+                                self.upload_buffer(derived_buf, bytemuck::cast_slice(&data));
                             }
                         }
                     }
@@ -4909,14 +5029,18 @@ impl Session {
         panic!("unknown parameter: {}", name);
     }
 
-    /// Upload a parameter in the exact packed representation described by
-    /// the graph's [`crate::graph::DType`].
+    /// Upload a reduced-storage parameter in the exact representation
+    /// described by the graph's [`crate::graph::DType`].
     ///
     /// This is intended for checkpoint readers which can losslessly transcode
     /// an external packed tensor into Meganeura's storage layout. Unlike
     /// [`Self::set_parameter`], this method does not dequantize or requantize
     /// the values. The byte count is validated against the logical tensor
     /// size before anything is copied to the device.
+    ///
+    /// HorizontalConcat derived parameters (the SwiGLU `gate+up` fusion)
+    /// are restaged in packed space. There is no K-quant encoder here, and
+    /// Q4/Q6_K packed blobs are not a byte-append of their sources.
     pub fn set_parameter_packed(&mut self, name: &str, data: &[u8]) {
         self.wait();
         for &(ref param_name, buf_ref) in &self.plan.param_buffers {
@@ -4928,6 +5052,10 @@ impl Session {
                 .param_types
                 .get(&buf_ref)
                 .unwrap_or_else(|| panic!("parameter `{name}` has no tensor type"));
+            assert!(
+                crate::compile::WeightFormat::from_dtype(ty.dtype).uses_reduced_storage(),
+                "parameter `{name}` is not packed; use set_parameter"
+            );
             let expected = ty.size_bytes();
             assert_eq!(
                 data.len(),
@@ -4936,9 +5064,66 @@ impl Session {
                 data.len()
             );
             self.upload_parameter_bytes(buf_ref, data);
+            let derived: Vec<_> = self
+                .plan
+                .derived_params
+                .iter()
+                .filter(|entry| {
+                    matches!(entry.2, crate::graph::ParamTransform::HorizontalConcat)
+                        && entry.1.iter().any(|s| s.0 == name)
+                })
+                .map(|entry| (entry.0, entry.1.clone()))
+                .collect();
+            for (derived_buf, sources) in derived {
+                self.restage_packed_concat(derived_buf, name, data, &sources);
+            }
             return;
         }
         panic!("unknown parameter: {name}");
+    }
+
+    fn restage_packed_concat(
+        &mut self,
+        derived_buf: BufferRef,
+        name: &str,
+        data: &[u8],
+        sources: &[(String, usize)],
+    ) {
+        let ty = self
+            .plan
+            .param_types
+            .get(&derived_buf)
+            .unwrap_or_else(|| panic!("derived concat has no tensor type"));
+        assert_eq!(ty.shape.len(), 2);
+        let rows = ty.shape[0];
+        let total_cols: usize = sources.iter().map(|s| s.1).sum();
+        assert_eq!(ty.shape[1], total_cols);
+        let expected = ty.size_bytes();
+        let fmt = crate::compile::WeightFormat::from_dtype(ty.dtype);
+        let mut staging = self
+            .packed_concat_staging
+            .remove(&derived_buf)
+            .unwrap_or_else(|| vec![0u8; expected]);
+        if staging.len() != expected {
+            staging = vec![0u8; expected];
+        }
+        let mut col_offset = 0usize;
+        for src in sources {
+            if src.0 == name {
+                scatter_packed_concat_columns(
+                    &mut staging,
+                    data,
+                    fmt,
+                    rows,
+                    src.1,
+                    total_cols,
+                    col_offset,
+                );
+            }
+            col_offset += src.1;
+        }
+        self.upload_parameter_bytes(derived_buf, &staging);
+        self.packed_concat_staging.insert(derived_buf, staging);
     }
 
     /// Upload input data.

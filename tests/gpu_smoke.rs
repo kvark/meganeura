@@ -3570,6 +3570,62 @@ fn q4k_superblock(seed: u32) -> Vec<u8> {
     b
 }
 
+fn assert_gguf_packed_matmul(
+    case: &str,
+    tensor: meganeura::load::gguf::GgufTensor,
+    m: usize,
+    tolerance: f32,
+) {
+    use meganeura::graph::DType;
+
+    let [k, n] = tensor.dims.as_slice() else {
+        panic!("{case}: expected a matrix, got {:?}", tensor.dims);
+    };
+    let (k, n) = (*k, *n);
+    let reference = tensor.to_f32().unwrap();
+    let (dtype, packed) = tensor.to_packed().unwrap();
+    let input: Vec<f32> = (0..m * k)
+        .map(|i| ((i % 29) as f32 - 14.0) * 0.03)
+        .collect();
+    let mut graph = Graph::new();
+    let x = graph.input("x", &[m, k]);
+    let w = match dtype {
+        DType::Q4_0 => graph.parameter_q4("w", &[k, n]),
+        DType::Q8_0 => graph.parameter_q8("w", &[k, n]),
+        DType::Q4K => graph.parameter_q4k("w", &[k, n]),
+        DType::Q6K => graph.parameter_q6k("w", &[k, n]),
+        other => panic!("{case}: unexpected packed dtype {other:?}"),
+    };
+    let out = graph.matmul(x, w);
+    graph.set_outputs(vec![out]);
+    let mut session = meganeura::build(&graph, meganeura::SessionConfig::inference_from_env()).0;
+    session.set_input("x", &input);
+    session.set_parameter_packed("w", &packed);
+    session.step();
+    session.wait();
+    let actual = session.read_output(m * n);
+
+    let mut max_error = 0.0f32;
+    let mut scale = 0.0f32;
+    for row in 0..m {
+        for col in 0..n {
+            let expected = (0..k)
+                .map(|i| input[row * k + i] * reference[i * n + col])
+                .sum::<f32>();
+            scale = scale.max(expected.abs());
+            max_error = max_error.max((actual[row * n + col] - expected).abs());
+        }
+    }
+    assert!(
+        actual.iter().all(|v| v.is_finite()),
+        "{case}: non-finite output"
+    );
+    assert!(
+        max_error / scale.max(1e-6) < tolerance,
+        "{case}: max_abs_err={max_error}, scale={scale}, tolerance={tolerance}"
+    );
+}
+
 /// The Q4_K shader against the loader's CPU reference, which is itself
 /// checked line-by-line against `dequantize_row_q4_K` in ggml-quants.c.
 ///
@@ -3586,49 +3642,11 @@ fn q4k_matmul_matches_ggml_reference() {
     for s in 0..(k / 256 * n) {
         data.extend_from_slice(&q4k_superblock(s as u32 + 1));
     }
-    let tensor = GgufTensor::new(vec![k, n], GgmlType::Q4K, data.clone());
-    // Reference weights in meganeura [K, N] order.
-    let w_ref = tensor.to_f32().unwrap();
-    let (dtype, packed) = tensor.to_packed().unwrap();
-    assert_eq!(dtype, meganeura::graph::DType::Q4K);
-    assert_eq!(packed, data, "Q4_K should reach the GPU unmodified");
-
-    let a: Vec<f32> = (0..m * k)
-        .map(|i| ((i % 29) as f32 - 14.0) * 0.03)
-        .collect();
-
-    let mut g = Graph::new();
-    let x = g.input("x", &[m, k]);
-    let w = g.parameter_q4k("w", &[k, n]);
-    let out = g.matmul(x, w);
-    g.set_outputs(vec![out]);
-    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
-    session.set_input("x", &a);
-    session.set_parameter_packed("w", &packed);
-    session.step();
-    session.wait();
-    let gpu = session.read_output(m * n);
-
-    let mut max_err = 0.0f32;
-    let mut scale = 0.0f32;
-    for row in 0..m {
-        for col in 0..n {
-            let mut want = 0.0f32;
-            for i in 0..k {
-                want += a[row * k + i] * w_ref[i * n + col];
-            }
-            scale = scale.max(want.abs());
-            max_err = max_err.max((gpu[row * n + col] - want).abs());
-        }
-    }
-    assert!(
-        gpu.iter().all(|v| v.is_finite()),
-        "Q4_K matmul produced non-finite values"
-    );
-    assert!(
-        max_err / scale.max(1e-6) < 1e-5,
-        "Q4_K matmul diverged from the GGML reference: \
-         max_abs_err={max_err} (scale {scale})"
+    assert_gguf_packed_matmul(
+        "Q4_K tiled",
+        GgufTensor::new(vec![k, n], GgmlType::Q4K, data),
+        m,
+        1e-5,
     );
 }
 
@@ -3643,37 +3661,11 @@ fn q4k_gemv_matches_ggml_reference() {
     for s in 0..(k / 256 * n) {
         data.extend_from_slice(&q4k_superblock(s as u32 + 41));
     }
-    let tensor = GgufTensor::new(vec![k, n], GgmlType::Q4K, data.clone());
-    let w_ref = tensor.to_f32().unwrap();
-    let a: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
-
-    let mut g = Graph::new();
-    // m = 1 and n % 4 == 0 routes this to MatMulGemv.
-    let x = g.input("x", &[1, k]);
-    let w = g.parameter_q4k("w", &[k, n]);
-    let out = g.matmul(x, w);
-    g.set_outputs(vec![out]);
-    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
-    session.set_input("x", &a);
-    session.set_parameter_packed("w", &data);
-    session.step();
-    session.wait();
-    let gpu = session.read_output(n);
-
-    let mut max_err = 0.0f32;
-    let mut scale = 0.0f32;
-    for col in 0..n {
-        let mut want = 0.0f32;
-        for i in 0..k {
-            want += a[i] * w_ref[i * n + col];
-        }
-        scale = scale.max(want.abs());
-        max_err = max_err.max((gpu[col] - want).abs());
-    }
-    assert!(
-        max_err / scale.max(1e-6) < 1e-5,
-        "Q4_K GEMV diverged from the GGML reference: \
-         max_abs_err={max_err} (scale {scale})"
+    assert_gguf_packed_matmul(
+        "Q4_K GEMV",
+        GgufTensor::new(vec![k, n], GgmlType::Q4K, data),
+        1,
+        1e-5,
     );
 }
 
@@ -3718,57 +3710,11 @@ fn q6k_matmul_matches_ggml_reference() {
         data.extend_from_slice(&q6k_superblock(s as u32 + 7));
     }
     assert_eq!(data.len() % 4, 2, "expected a misaligned tail to exercise");
-    let tensor = GgufTensor::new(vec![k, n], GgmlType::Q6K, data.clone());
-    let w_ref = tensor.to_f32().unwrap();
-    let (dtype, packed) = tensor.to_packed().unwrap();
-    assert_eq!(dtype, meganeura::graph::DType::Q6K);
-    assert_eq!(
-        packed.len() % 4,
-        0,
-        "buffer must be a whole number of words"
-    );
-    assert_eq!(
-        &packed[..data.len()],
-        &data[..],
-        "superblocks must be verbatim"
-    );
-
-    let a: Vec<f32> = (0..m * k)
-        .map(|i| ((i % 31) as f32 - 15.0) * 0.02)
-        .collect();
-
-    let mut g = Graph::new();
-    let x = g.input("x", &[m, k]);
-    let w = g.parameter_q6k("w", &[k, n]);
-    let out = g.matmul(x, w);
-    g.set_outputs(vec![out]);
-    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
-    session.set_input("x", &a);
-    session.set_parameter_packed("w", &packed);
-    session.step();
-    session.wait();
-    let gpu = session.read_output(m * n);
-
-    let mut max_err = 0.0f32;
-    let mut scale = 0.0f32;
-    for row in 0..m {
-        for col in 0..n {
-            let mut want = 0.0f32;
-            for i in 0..k {
-                want += a[row * k + i] * w_ref[i * n + col];
-            }
-            scale = scale.max(want.abs());
-            max_err = max_err.max((gpu[row * n + col] - want).abs());
-        }
-    }
-    assert!(
-        gpu.iter().all(|v| v.is_finite()),
-        "Q6_K matmul produced non-finite values"
-    );
-    assert!(
-        max_err / scale.max(1e-6) < 1e-5,
-        "Q6_K matmul diverged from the GGML reference: \
-         max_abs_err={max_err} (scale {scale})"
+    assert_gguf_packed_matmul(
+        "Q6_K tiled with an odd superblock count",
+        GgufTensor::new(vec![k, n], GgmlType::Q6K, data),
+        m,
+        1e-5,
     );
 }
 
@@ -3782,37 +3728,11 @@ fn q6k_gemv_matches_ggml_reference() {
     for s in 0..(k / 256 * n) {
         data.extend_from_slice(&q6k_superblock(s as u32 + 91));
     }
-    let tensor = GgufTensor::new(vec![k, n], GgmlType::Q6K, data.clone());
-    let w_ref = tensor.to_f32().unwrap();
-    let (_, packed) = tensor.to_packed().unwrap();
-    let a: Vec<f32> = (0..k).map(|i| ((i % 17) as f32 - 8.0) * 0.04).collect();
-
-    let mut g = Graph::new();
-    let x = g.input("x", &[1, k]);
-    let w = g.parameter_q6k("w", &[k, n]);
-    let out = g.matmul(x, w);
-    g.set_outputs(vec![out]);
-    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
-    session.set_input("x", &a);
-    session.set_parameter_packed("w", &packed);
-    session.step();
-    session.wait();
-    let gpu = session.read_output(n);
-
-    let mut max_err = 0.0f32;
-    let mut scale = 0.0f32;
-    for col in 0..n {
-        let mut want = 0.0f32;
-        for i in 0..k {
-            want += a[i] * w_ref[i * n + col];
-        }
-        scale = scale.max(want.abs());
-        max_err = max_err.max((gpu[col] - want).abs());
-    }
-    assert!(
-        max_err / scale.max(1e-6) < 1e-5,
-        "Q6_K GEMV diverged from the GGML reference: \
-         max_abs_err={max_err} (scale {scale})"
+    assert_gguf_packed_matmul(
+        "Q6_K GEMV",
+        GgufTensor::new(vec![k, n], GgmlType::Q6K, data),
+        1,
+        1e-5,
     );
 }
 
@@ -3881,67 +3801,185 @@ fn q6k_preserves_subnormal_block_scales() {
     }
 }
 
-/// Block formats pack along the parameter's first dimension while every
-/// packed decoder indexes along K. Those are the same axis for a forward
-/// `[K, N]` weight and different axes for a transposed `[N, K]` one, so a
-/// K-quant on `matmul_bt` would read the wrong superblock and return
-/// plausible numbers. Refused at compile time instead.
+/// Default greedy packing concatenates SwiGLU gate/up into one matmul.
+/// `set_parameter_packed` has to restage that derived buffer; uploading
+/// only the named sources leaves the fused weight uninitialized.
 #[test]
-#[should_panic(expected = "does not support block-quantized")]
-fn k_quant_matmul_bt_is_refused() {
+fn q4k_swiglu_packed_concat_matches_reference() {
+    use meganeura::load::gguf::{GgmlType, GgufTensor};
+
+    let (m, k, n) = (2usize, 256usize, 4usize);
+    let mut gate_data = Vec::new();
+    let mut up_data = Vec::new();
+    for s in 0..(k / 256 * n) {
+        gate_data.extend_from_slice(&q4k_superblock(s as u32 + 3));
+        up_data.extend_from_slice(&q4k_superblock(s as u32 + 19));
+    }
+    let gate_t = GgufTensor::new(vec![k, n], GgmlType::Q4K, gate_data);
+    let up_t = GgufTensor::new(vec![k, n], GgmlType::Q4K, up_data);
+    let gate_ref = gate_t.to_f32().unwrap();
+    let up_ref = up_t.to_f32().unwrap();
+    let (_, gate_packed) = gate_t.to_packed().unwrap();
+    let (_, up_packed) = up_t.to_packed().unwrap();
+
+    let a: Vec<f32> = (0..m * k)
+        .map(|i| ((i % 29) as f32 - 14.0) * 0.03)
+        .collect();
+
+    let mut g = Graph::new();
+    let x = g.input("x", &[m, k]);
+    let gate_w = g.parameter_q4k("gate", &[k, n]);
+    let up_w = g.parameter_q4k("up", &[k, n]);
+    let gate = g.matmul(x, gate_w);
+    let up = g.matmul(x, up_w);
+    let out = g.swiglu(gate, up);
+    g.set_outputs(vec![out]);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    assert!(
+        session.has_parameter("gate+up"),
+        "expected SwiGLU concat fusion so packed upload restages the derived weight"
+    );
+    session.set_input("x", &a);
+    session.set_parameter_packed("gate", &gate_packed);
+    session.set_parameter_packed("up", &up_packed);
+    session.step();
+    session.wait();
+    let gpu = session.read_output(m * n);
+
+    let silu = |v: f32| v / (1.0 + (-v).exp());
+    let mut max_err = 0.0f32;
+    let mut scale = 0.0f32;
+    for row in 0..m {
+        for col in 0..n {
+            let mut gate_acc = 0.0f32;
+            let mut up_acc = 0.0f32;
+            for i in 0..k {
+                gate_acc += a[row * k + i] * gate_ref[i * n + col];
+                up_acc += a[row * k + i] * up_ref[i * n + col];
+            }
+            let want = silu(gate_acc) * up_acc;
+            scale = scale.max(want.abs());
+            max_err = max_err.max((gpu[row * n + col] - want).abs());
+        }
+    }
+    assert!(
+        gpu.iter().all(|v| v.is_finite()),
+        "Q4_K SwiGLU produced non-finite values"
+    );
+    assert!(
+        max_err / scale.max(1e-6) < 1e-4,
+        "Q4_K SwiGLU concat diverged from the reference: \
+         max_abs_err={max_err} (scale {scale})"
+    );
+}
+
+/// Exercise both repacked legacy formats on the paths their layout is most
+/// likely to break: multi-column Q4 and K-split Q8 GEMV.
+#[test]
+fn gguf_repacked_matmuls_match_reference() {
+    use meganeura::load::gguf::{GgmlType, GgufTensor};
+
+    fn ggml_q4_0_block(d: f32, nibbles: [u8; 32]) -> Vec<u8> {
+        let mut b = Vec::with_capacity(18);
+        b.extend_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
+        for j in 0..16 {
+            b.push(nibbles[j] | (nibbles[j + 16] << 4));
+        }
+        b
+    }
+
+    let (m, k, n) = (2usize, 32usize, 4usize);
+    let mut data = Vec::new();
+    for col in 0..n {
+        let nibbles: [u8; 32] = std::array::from_fn(|i| ((i + col * 3) % 16) as u8);
+        data.extend(ggml_q4_0_block(0.25 * (col as f32 + 1.0), nibbles));
+    }
+    assert_gguf_packed_matmul(
+        "GGUF Q4_0 multi-column tiled matmul",
+        GgufTensor::new(vec![k, n], GgmlType::Q4_0, data),
+        m,
+        1e-5,
+    );
+
+    let mut q8 = Vec::new();
+    for col in 0..n {
+        q8.extend_from_slice(
+            &half::f16::from_f32(0.02 * (col + 1) as f32)
+                .to_bits()
+                .to_le_bytes(),
+        );
+        q8.extend((0..32).map(|i| (i - 16 + col as i32) as i8 as u8));
+    }
+    assert_gguf_packed_matmul(
+        "GGUF Q8_0 GEMV",
+        GgufTensor::new(vec![k, n], GgmlType::Q8_0, q8),
+        1,
+        1e-5,
+    );
+}
+
+/// Packed blocks run along the parameter's first dimension, which differs
+/// from K for transposed B. Cover the plain, greedy add-fused, and epilogue
+/// routes without emitting a GPU shader for any of them.
+#[test]
+fn block_quantized_matmul_bt_variants_are_refused() {
     let (m, k, n) = (1usize, 512usize, 256usize);
-    let mut g = Graph::new();
-    let x = g.input("x", &[m, k]);
-    // B is [N, K] for a transposed multiply.
-    let w = g.parameter_q4k("w", &[n, k]);
-    let out = g.matmul_bt(x, w);
-    g.set_outputs(vec![out]);
-    let _ = meganeura::build(&g, meganeura::SessionConfig::inference_from_env());
+    for (case, q4, add, relu) in [
+        ("Q4 plain", true, false, false),
+        ("Q4_K plain", false, false, false),
+        ("Q4_K fused add", false, true, false),
+        ("Q4_K fused add+relu", false, true, true),
+    ] {
+        let rejected = std::panic::catch_unwind(|| {
+            let mut graph = Graph::new();
+            let x = graph.input("x", &[m, k]);
+            let w = if q4 {
+                graph.parameter_q4("w", &[n, k])
+            } else {
+                graph.parameter_q4k("w", &[n, k])
+            };
+            let mut out = graph.matmul_bt(x, w);
+            if add {
+                let bias = graph.parameter("bias", &[m, n]);
+                out = graph.add(out, bias);
+            }
+            if relu {
+                out = graph.relu(out);
+            }
+            graph.set_outputs(vec![out]);
+            let optimized = meganeura::optimize::optimize(&graph);
+            meganeura::compile::compile(&optimized);
+        });
+        assert!(rejected.is_err(), "{case} reached codegen");
+    }
 }
 
-/// Q4 has the same defect, and nothing in the tree produced it — the arms
-/// that would have served it were dead and silently wrong.
+/// K-quants have no host encoder; silently substituting a cruder quantizer
+/// would discard the packed weights the caller already has.
 #[test]
-#[should_panic(expected = "does not support block-quantized")]
-fn q4_matmul_bt_is_refused() {
-    let (m, k, n) = (1usize, 64usize, 32usize);
-    let mut g = Graph::new();
-    let x = g.input("x", &[m, k]);
-    let w = g.parameter_q4("w", &[n, k]);
-    let out = g.matmul_bt(x, w);
-    g.set_outputs(vec![out]);
-    let _ = meganeura::build(&g, meganeura::SessionConfig::inference_from_env());
-}
-
-/// Q6_K is load-only for the same reason Q4_K is.
-#[test]
-#[should_panic(expected = "set_parameter_packed")]
-fn q6k_rejects_f32_parameter_upload() {
+fn k_quants_reject_f32_parameter_upload() {
     let (k, n) = (256usize, 4usize);
-    let mut g = Graph::new();
-    let x = g.input("x", &[1, k]);
-    let w = g.parameter_q6k("w", &[k, n]);
-    let out = g.matmul(x, w);
-    g.set_outputs(vec![out]);
-    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
-    session.set_parameter("w", &vec![0.1f32; k * n]);
-}
-
-/// Q4_K cannot be produced from f32 — its encoder searches for per-sub-block
-/// scales rather than computing them. Quantizing on the fly would silently
-/// hand back worse weights than the file the caller already has, so the
-/// f32 entry point refuses and names the one that works.
-#[test]
-#[should_panic(expected = "set_parameter_packed")]
-fn q4k_rejects_f32_parameter_upload() {
-    let (k, n) = (256usize, 4usize);
-    let mut g = Graph::new();
-    let x = g.input("x", &[1, k]);
-    let w = g.parameter_q4k("w", &[k, n]);
-    let out = g.matmul(x, w);
-    g.set_outputs(vec![out]);
-    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
-    session.set_parameter("w", &vec![0.1f32; k * n]);
+    for q4 in [true, false] {
+        let rejected = std::panic::catch_unwind(|| {
+            let mut graph = Graph::new();
+            let x = graph.input("x", &[1, k]);
+            let w = if q4 {
+                graph.parameter_q4k("w", &[k, n])
+            } else {
+                graph.parameter_q6k("w", &[k, n])
+            };
+            let out = graph.matmul(x, w);
+            graph.set_outputs(vec![out]);
+            let mut session =
+                meganeura::build(&graph, meganeura::SessionConfig::inference_from_env()).0;
+            session.set_parameter("w", &vec![0.1; k * n]);
+        });
+        assert!(
+            rejected.is_err(),
+            "{} accepted f32",
+            if q4 { "Q4_K" } else { "Q6_K" }
+        );
+    }
 }
 
 /// The reduction extent has to fill whole 256-element superblocks.
