@@ -1,6 +1,6 @@
 //! Filling a compiled session from the file.
 //!
-//! [`graph::build`](super::graph::build) declared every parameter under
+//! [`super::graph::build`] declared every parameter under
 //! GGUF's own tensor name and in the dtype the file stores it in, so loading
 //! is mostly a matter of handing each tensor's bytes straight over:
 //! [`Session::set_parameter_packed`] for the block formats, which keeps the

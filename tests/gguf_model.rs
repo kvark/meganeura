@@ -370,3 +370,301 @@ fn an_architecture_with_no_builder_is_refused_by_name() {
         "the error should name the architecture: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Through a real file
+//
+// Everything above builds a `GgufModel` directly. These serialize one to
+// GGUF bytes and read it back with the public loader, so the container
+// parser, the metadata typing and the tensor offsets are on the path too —
+// which is what a `.gguf` on disk actually exercises.
+// ---------------------------------------------------------------------------
+
+fn push_str(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// Serialize a value with its GGUF type tag.
+fn push_value(out: &mut Vec<u8>, value: &GgufValue) {
+    match *value {
+        GgufValue::U32(v) => {
+            out.extend_from_slice(&4u32.to_le_bytes());
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        GgufValue::F32(v) => {
+            out.extend_from_slice(&6u32.to_le_bytes());
+            out.extend_from_slice(&v.to_bits().to_le_bytes());
+        }
+        GgufValue::Bool(v) => {
+            out.extend_from_slice(&7u32.to_le_bytes());
+            out.push(u8::from(v));
+        }
+        GgufValue::String(ref v) => {
+            out.extend_from_slice(&8u32.to_le_bytes());
+            push_str(out, v);
+        }
+        GgufValue::Array(ref items) => {
+            out.extend_from_slice(&9u32.to_le_bytes());
+            // Arrays carry one element type for the whole run; the
+            // fixtures only ever build arrays of strings.
+            out.extend_from_slice(&8u32.to_le_bytes());
+            out.extend_from_slice(&(items.len() as u64).to_le_bytes());
+            for item in items {
+                push_str(out, item.as_str().expect("fixture arrays hold strings"));
+            }
+        }
+        ref other => panic!("the fixture writer has no case for {other:?}"),
+    }
+}
+
+/// Write `model` out as a GGUF v3 file.
+fn to_gguf_bytes(model: &GgufModel) -> Vec<u8> {
+    const ALIGNMENT: usize = 32;
+
+    // A HashMap has no order, but a file does; sorting keeps the bytes
+    // reproducible so a failure is the same failure twice.
+    let mut keys: Vec<&String> = model.metadata.keys().collect();
+    keys.sort();
+    let mut kv = Vec::new();
+    for key in &keys {
+        push_str(&mut kv, key);
+        push_value(&mut kv, &model.metadata[*key]);
+    }
+
+    let mut names: Vec<&String> = model.tensors.keys().collect();
+    names.sort();
+    let mut infos = Vec::new();
+    let mut data = Vec::new();
+    for name in &names {
+        let tensor = &model.tensors[*name];
+        push_str(&mut infos, name);
+        infos.extend_from_slice(&(tensor.dims.len() as u32).to_le_bytes());
+        for &d in &tensor.dims {
+            infos.extend_from_slice(&(d as u64).to_le_bytes());
+        }
+        infos.extend_from_slice(&tensor.ggml_type.tag().to_le_bytes());
+        infos.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        data.extend_from_slice(tensor.data());
+        while !data.len().is_multiple_of(ALIGNMENT) {
+            data.push(0);
+        }
+    }
+
+    let mut out = Vec::new();
+    out.extend_from_slice(b"GGUF");
+    out.extend_from_slice(&3u32.to_le_bytes());
+    out.extend_from_slice(&(names.len() as u64).to_le_bytes());
+    out.extend_from_slice(&(keys.len() as u64).to_le_bytes());
+    out.extend_from_slice(&kv);
+    out.extend_from_slice(&infos);
+    while !out.len().is_multiple_of(ALIGNMENT) {
+        out.push(0);
+    }
+    out.extend_from_slice(&data);
+    out
+}
+
+#[test]
+fn a_serialized_model_reads_back_identically() {
+    let original = tiny_llama();
+    let bytes = to_gguf_bytes(&original);
+    let reloaded = meganeura::load::gguf::load_gguf_bytes(&bytes).expect("valid GGUF");
+
+    assert_eq!(reloaded.tensors.len(), original.tensors.len());
+    assert_eq!(reloaded.architecture(), Some("llama"));
+    for (name, tensor) in &original.tensors {
+        let round_tripped = reloaded
+            .tensors
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} did not survive the file"));
+        assert_eq!(&round_tripped.dims, &tensor.dims, "{name} dims");
+        assert_eq!(round_tripped.data(), tensor.data(), "{name} bytes");
+    }
+}
+
+#[test]
+fn generation_from_parsed_file_bytes_matches_the_in_memory_model() {
+    let options = GenerationOptions {
+        max_tokens: 4,
+        stop_at_end_of_generation: false,
+        ..GenerationOptions::default()
+    };
+
+    let mut direct = generator(4);
+    let from_memory = direct.generate_tokens(&[1, 2, 3], &options).unwrap();
+
+    let bytes = to_gguf_bytes(&tiny_llama());
+    let parsed = meganeura::load::gguf::load_gguf_bytes(&bytes).unwrap();
+    let mut from_file = Generator::with_options(
+        &parsed,
+        &GeneratorOptions {
+            max_seq_len: 32,
+            prefill_block: 4,
+        },
+    )
+    .unwrap();
+    let from_disk = from_file.generate_tokens(&[1, 2, 3], &options).unwrap();
+
+    assert_eq!(
+        from_memory, from_disk,
+        "going through the container should change nothing"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Quantized weights
+// ---------------------------------------------------------------------------
+
+/// Quantize to GGML Q4_0: per 32 elements, an f16 scale and 16 nibble
+/// bytes holding `q` such that the value is `d * (q - 8)`.
+fn quantize_q4_0(values: &[f32]) -> Vec<u8> {
+    assert!(values.len().is_multiple_of(32));
+    let mut out = Vec::with_capacity(values.len() / 32 * 18);
+    for block in values.chunks(32) {
+        // GGML picks the scale from the largest magnitude, signed, so
+        // that the extreme value lands on -8.
+        let mut amax = 0.0f32;
+        let mut max = 0.0f32;
+        for &v in block {
+            if v.abs() > amax {
+                amax = v.abs();
+                max = v;
+            }
+        }
+        let d = max / -8.0;
+        let inv = if d != 0.0 { 1.0 / d } else { 0.0 };
+        let quants: Vec<u8> = block
+            .iter()
+            .map(|&v| (((v * inv) + 8.5) as i32).clamp(0, 15) as u8)
+            .collect();
+        out.extend_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
+        for j in 0..16 {
+            out.push(quants[j] | (quants[j + 16] << 4));
+        }
+    }
+    out
+}
+
+/// The same model with every 2-D weight stored as Q4_0 instead of f32.
+fn tiny_llama_q4_0() -> GgufModel {
+    let mut model = tiny_llama();
+    let names: Vec<String> = model.tensors.keys().cloned().collect();
+    for name in names {
+        let tensor = &model.tensors[&name];
+        // Norms stay f32, and the embedding table is dequantized on load
+        // anyway, so quantizing it would only add noise to the comparison.
+        if tensor.dims.len() != 2 || name == "token_embd.weight" {
+            continue;
+        }
+        let values = tensor.to_f32_rows().unwrap();
+        if !values.len().is_multiple_of(32) {
+            continue;
+        }
+        let dims = tensor.dims.clone();
+        model.tensors.insert(
+            name,
+            GgufTensor::new(dims, GgmlType::Q4_0, quantize_q4_0(&values)),
+        );
+    }
+    model
+}
+
+/// `model` with every quantized tensor replaced by its exact f32
+/// dequantization — the same numbers, stored unpacked.
+fn dequantized(model: &GgufModel) -> GgufModel {
+    let mut out = model.clone();
+    let names: Vec<String> = out.tensors.keys().cloned().collect();
+    for name in names {
+        let tensor = &out.tensors[&name];
+        if matches!(tensor.ggml_type, GgmlType::F32) {
+            continue;
+        }
+        let values = tensor.to_f32_rows().unwrap();
+        let mut bytes = Vec::with_capacity(values.len() * 4);
+        for v in values {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let dims = tensor.dims.clone();
+        out.tensors
+            .insert(name, GgufTensor::new(dims, GgmlType::F32, bytes));
+    }
+    out
+}
+
+#[test]
+fn quantized_weights_take_the_packed_path() {
+    let model = tiny_llama_q4_0();
+    let model_gen = Generator::with_options(
+        &model,
+        &GeneratorOptions {
+            max_seq_len: 32,
+            prefill_block: 4,
+        },
+    )
+    .unwrap();
+    let report = model_gen.load_report();
+    assert!(
+        report.packed >= LAYERS * 5,
+        "the projections should keep their block encoding, got {report:?}"
+    );
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+}
+
+/// The test that says the quantized path is *correct* rather than merely
+/// taken: a Q4_0 model and an f32 model holding the identical numbers must
+/// agree. Any error in the repack, the packed upload or the quantized
+/// shader shows up here, where comparing against the unquantized weights
+/// would only show quantization noise.
+#[test]
+fn a_quantized_model_agrees_with_its_own_dequantization() {
+    let quantized = tiny_llama_q4_0();
+    let unpacked = dequantized(&quantized);
+
+    let feed = |model: &GgufModel| {
+        let mut model_gen = Generator::with_options(
+            model,
+            &GeneratorOptions {
+                max_seq_len: 32,
+                prefill_block: 4,
+            },
+        )
+        .unwrap();
+        model_gen.feed(&[2, 5, 1, 7, 3]).unwrap()
+    };
+
+    let from_packed = feed(&quantized);
+    let from_f32 = feed(&unpacked);
+    assert!(
+        close(&from_packed, &from_f32, 5.0e-3),
+        "the packed and unpacked forms of the same weights disagree.\n \
+         packed: {:?}\n f32: {:?}",
+        &from_packed[..6.min(from_packed.len())],
+        &from_f32[..6.min(from_f32.len())],
+    );
+}
+
+/// A guard on the test above: if quantizing were a no-op, that agreement
+/// would be trivially true. Q4_0 is lossy, so the quantized model must
+/// differ measurably from the f32 original it was made from.
+#[test]
+fn quantizing_actually_changes_the_weights() {
+    let feed = |model: &GgufModel| {
+        let mut model_gen = Generator::with_options(
+            model,
+            &GeneratorOptions {
+                max_seq_len: 32,
+                prefill_block: 4,
+            },
+        )
+        .unwrap();
+        model_gen.feed(&[2, 5, 1, 7, 3]).unwrap()
+    };
+    let original = feed(&tiny_llama());
+    let quantized = feed(&tiny_llama_q4_0());
+    assert!(
+        !close(&original, &quantized, 1.0e-6),
+        "Q4_0 is lossy, so these should not match to 1e-6; \
+         if they do, the quantization never took effect"
+    );
+}
