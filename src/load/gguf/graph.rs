@@ -482,15 +482,23 @@ fn projection(
             tensor.dims
         )));
     }
-    let dtype = match tensor.ggml_type {
+    Ok(parameter_of(g, name, shape, weight_dtype(tensor)?))
+}
+
+/// The dtype a projection weight is declared — and so must be *filled* —
+/// with.
+///
+/// [`super::weights`] reads this too, so the loader cannot disagree with
+/// the graph about whether a tensor arrives packed or as f32.
+pub(super) fn weight_dtype(tensor: &super::GgufTensor) -> Result<DType, GgufError> {
+    Ok(match tensor.ggml_type {
         super::GgmlType::F32 => DType::F32,
         super::GgmlType::F16 => DType::F16,
         // Anything block-packed keeps the file's own encoding: going
         // through f32 would requantize on the way back in and roughly
         // double the error the file already carries.
         _ => tensor.packed_dtype()?,
-    };
-    Ok(parameter_of(g, name, shape, dtype))
+    })
 }
 
 /// Declare a parameter of a given dtype, choosing the constructor that
