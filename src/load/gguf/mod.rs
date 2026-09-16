@@ -1,12 +1,32 @@
-//! GGUF weight import: read GGML's container format into Meganeura's
-//! parameter buffers.
+//! GGUF import: read GGML's container format into a runnable model.
 //!
-//! GGUF is a weight-and-metadata container, not a graph format. There is no
-//! computation graph to import — a GGUF file carries named tensors plus
-//! key/value metadata describing the architecture (`llama.block_count`,
-//! `llama.attention.head_count`, …). So this module pairs with a model
-//! builder in [`crate::models`] the way SafeTensors loading does, rather
-//! than producing a [`crate::Graph`] the way [`super::onnx`] does.
+//! GGUF is a weight-and-metadata container rather than a graph format: it
+//! carries named tensors plus key/value metadata describing the architecture
+//! (`llama.block_count`, `llama.attention.head_count`, …), and leaves the
+//! graph implied. [`arch`] reads that description into a [`ModelConfig`] and
+//! [`graph`] builds the graph it implies, so the file is enough on its own —
+//! nothing here is compiled against a particular model's dimensions.
+//!
+//! The whole path, from a path on disk to generated text, is
+//! [`GgufModel::generator`]:
+//!
+//! ```no_run
+//! use meganeura::load::gguf::{load_gguf, GenerationOptions};
+//!
+//! let model = load_gguf(std::path::Path::new("model.gguf"))?;
+//! let mut gen = model.generator(256)?;
+//! println!("{}", gen.generate("The meaning of life is", &GenerationOptions::default())?);
+//! # Ok::<(), meganeura::load::gguf::GgufError>(())
+//! ```
+//!
+//! The pieces are separable for callers who want fewer of them: [`arch`] for
+//! the description, [`graph`] for the graph, [`weights`] to fill a session
+//! from the file, [`vocab`] for the tokenizer the file embeds, and
+//! [`generate`] for the loop over the two sessions.
+//!
+//! The rest of this module is the container itself — parsing, and the
+//! block-format conversions that let a GGML tensor land in a Meganeura
+//! parameter without losing a bit.
 //!
 //! # Layouts
 //!
@@ -56,12 +76,22 @@
 //! quantized weight requantizes on the way back in, roughly doubling the
 //! quantization error, so prefer `to_packed`.
 
+pub mod arch;
+#[cfg(test)]
+pub(crate) mod fixture;
+pub mod generate;
+pub mod graph;
+pub mod vocab;
+pub mod weights;
+
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::graph::DType;
+
+pub use arch::{Architecture, ModelConfig};
 
 /// Errors that can occur during GGUF import.
 #[derive(Debug)]
@@ -88,6 +118,19 @@ pub enum GgufError {
     /// neither [`GgufTensor::to_packed`] nor [`GgufTensor::to_f32`] can
     /// produce values for them.
     UnsupportedType(u32),
+    /// A metadata key the graph builder needs is absent. Holds the key as
+    /// the file would have written it, architecture prefix and all.
+    MissingKey(String),
+    /// A metadata key is present but holds something unusable — the wrong
+    /// value type, or a number outside the range it must lie in.
+    BadMetadata(String),
+    /// `general.architecture` names a family this loader cannot build a
+    /// graph for. The weights are still readable; only
+    /// [`ModelConfig::from_gguf`] and the builders above it refuse.
+    UnsupportedArchitecture(String),
+    /// A tensor the graph declares as a parameter is absent from the file,
+    /// or is present with the wrong shape.
+    MissingTensor(String),
     /// Underlying I/O failure.
     Io(std::io::Error),
 }
@@ -108,6 +151,14 @@ impl std::fmt::Display for GgufError {
             Self::UnsupportedType(tag) => {
                 write!(f, "ggml_type {tag} is not implemented by this loader")
             }
+            Self::MissingKey(ref k) => write!(f, "GGUF metadata has no `{k}`"),
+            Self::BadMetadata(ref e) => write!(f, "GGUF metadata error: {e}"),
+            Self::UnsupportedArchitecture(ref a) => write!(
+                f,
+                "no graph builder for architecture `{a}`; its weights can still be \
+                 read tensor by tensor"
+            ),
+            Self::MissingTensor(ref e) => write!(f, "GGUF tensor error: {e}"),
             Self::Io(ref e) => write!(f, "GGUF I/O error: {e}"),
         }
     }
@@ -400,6 +451,21 @@ impl GgufTensor {
             }
         }
         Ok(out)
+    }
+
+    /// Dequantize to f32 in GGUF's own order: `[ne1, ne0]` row-major, the
+    /// transpose of what [`GgufTensor::to_f32`] returns.
+    ///
+    /// This is the orientation an *embedding table* wants. A projection
+    /// weight is a matrix whose reduction extent Meganeura stores slowest,
+    /// so it needs the transpose; a lookup table is a list of rows, and
+    /// GGUF already stores `token_embd.weight` as `n_vocab` rows of
+    /// `n_embd`, which is exactly `Graph::embedding`'s `[vocab, hidden]`.
+    /// Transposing it would be a second, wrong conversion.
+    pub fn to_f32_rows(&self) -> Result<Vec<f32>, GgufError> {
+        // Element (i0, i1) already lies at i1 * ne0 + i0, which reads as
+        // row i1 of length ne0.
+        self.dequantize_flat()
     }
 
     /// The [`DType`] this tensor would occupy, without converting it.
