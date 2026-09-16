@@ -138,7 +138,29 @@ See the [checkpoint implementation](src/runtime/checkpoint.rs) for format
 compatibility and restore checks. Resident buffer counts do not measure
 driver peak memory.
 
-Pretrained models can be loaded from ONNX or NNEF via `meganeura::load_onnx(...)` / `meganeura::load_nnef(...)`. Both lower through Meganeura’s IR, so the same graph rewrites apply to imported graphs and hand-built ones. GGUF files are a weight-and-metadata container rather than a graph: `meganeura::load_gguf(...)` yields named tensors; packed weights use `Session::set_parameter_packed`, while unpacked weights use `to_f32` and `set_parameter` (see `examples/gguf_info.rs`).
+Pretrained models can be loaded from ONNX or NNEF via `meganeura::load_onnx(...)` / `meganeura::load_nnef(...)`. Both lower through Meganeura’s IR, so the same graph rewrites apply to imported graphs and hand-built ones.
+
+A GGUF file needs nothing alongside it. It carries no graph, but it carries a
+description — an architecture name and a set of dimensions — and
+`load::gguf` reads that into a graph, fills it from the file's own tensors,
+and uses the tokenizer the file embeds:
+
+```rust
+use meganeura::load::gguf::{load_gguf, GenerationOptions};
+
+let model = load_gguf(std::path::Path::new("model.gguf"))?;
+let mut generator = model.generator(2048)?;
+println!("{}", generator.generate("The meaning of life is", &GenerationOptions::default())?);
+```
+
+Nothing there names an architecture or a dimension; see
+`examples/gguf_generate.rs`. The llama, Qwen2/3 and Gemma families are
+built generically from `{arch}.*` metadata, and an architecture whose graph
+cannot be expressed exactly is refused by name rather than approximated.
+The layers below are usable on their own: `arch` for the description,
+`graph` for the graph, `weights` to fill a session, `vocab` for the
+tokenizer, and `load_gguf(...)` for the raw tensor inventory
+(`examples/gguf_info.rs`).
 
 GGUF quantized weights are imported without a requantize. `Q4_0` and the
 K-quants — `Q4_K`, `Q5_K`, `Q6_K` and `Q3_K` — are stored byte-for-byte as

@@ -1,5 +1,61 @@
 # Unreleased
 
+- GGUF is now a model format, not just a weight container. `load::gguf`
+  reads the architecture description into a `ModelConfig`, builds the graph
+  it implies, fills it from the file's own tensors, and tokenizes with the
+  vocabulary the file embeds — so `load_gguf(path)?.generator(2048)?` is
+  everything between a `.gguf` and generated text, with no `tokenizer.json`
+  and no hard-coded dimensions. See `examples/gguf_generate.rs`.
+
+  The llama family (also Mistral, SmolLM2, TinyLlama), Qwen2, Qwen3, Gemma,
+  Gemma2/3 and Phi3 build from one parameterised decoder; the enum records
+  only where a family departs from the llama shape — Qwen2's QKV biases,
+  Qwen3's per-head Q/K norms, Gemma's scaled embeddings and `1 + w` norm
+  weights and second pair of norms. An architecture whose graph cannot be
+  expressed *exactly* is refused by name rather than approximated, since a
+  subtly wrong decoder still emits fluent text: partial RoPE
+  (`rope.dimension_count < head_dim`, as Phi2 uses) needs a strided split
+  with no op behind it, and Gemma2's `attn_logit_softcapping` has no
+  parameter on the cached attention ops. Final logit softcapping *is*
+  applied, being expressible after the head.
+
+  One graph shape serves prompt and decode: a block of `block_size` token
+  slots of which `valid` are real, starting at `position`, which is what
+  `rope_dynamic_offset` and `cached_block_attention` already assume.
+  `prefix_last` narrows to the one row that can predict before the output
+  head rather than after, so the widest matmul in the model runs once per
+  step instead of `block_size` times.
+
+  Two sessions are compiled from it, differing only in `block_size`,
+  because a single-row matmul takes the tuned K-split GEMV where a block of
+  rows takes the tiled matmul. They are not two copies of the model:
+  `share_parameter_from` aliases buffers rather than copying, so the
+  weights are stored once and the K/V caches are literally the same
+  buffers — a prompt the prefill session processes is already in the cache
+  the decode session attends over, with no handoff. `tests/gguf_model.rs`
+  pins that: feeding a prompt as one wide block and a token at a time must
+  reach the same logits.
+
+  The embedding table is dequantized to f16 whatever the file stores,
+  because the gather has no block-quantized variant and a tied head reads
+  the same tensor through `matmul_bt`, which block formats cannot serve
+  either. It is also the one tensor read in GGUF's own row order rather
+  than transposed, hence `GgufTensor::to_f32_rows` alongside `to_f32`: a
+  lookup table is a list of rows and is already oriented, where a
+  projection weight is a matrix and is not. Every other quantized weight
+  keeps the file's own block encoding.
+
+  The tokenizer is implemented here rather than delegated, because
+  `tokenizers` is a dev-dependency on purpose — it pulls `onig`'s C library
+  through every cross-compile. Both GGUF models are covered: BPE (`gpt2`)
+  recodes into GPT-2's printable byte alphabet and merges by merge-list
+  rank, and SentencePiece (`llama`) merges by score with `<0x..>` byte
+  fallback. The GPT-2 pre-tokenizer pattern is a hand-written scan; std's
+  `char::is_alphabetic` and `is_numeric` carry the real Unicode tables, so
+  the character classes are not ASCII approximations. End-of-generation is
+  a set rather than one id, since an instruction-tuned model ends its turn
+  with `<|im_end|>` or `<|eot_id|>` rather than the declared EOS.
+
 - Optional Q8_1 activations for Q4_0 GEMV, following llama.cpp's
   `vec_dot_q4_0_q8_1`. `CompileOptions::quantized_activations` is explicit
   because this changes results; tuning may reshape the selected kernel but

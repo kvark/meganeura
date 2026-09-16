@@ -98,6 +98,10 @@ name = "gguf_info"
 path = "examples/gguf_info.rs"
 
 [[example]]
+name = "gguf_generate"
+path = "examples/gguf_generate.rs"
+
+[[example]]
 name = "train_deploy"
 path = "examples/train_deploy.rs"
 
