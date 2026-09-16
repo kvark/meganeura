@@ -59,6 +59,10 @@ fn run_gpu_gemv(a_data: &[f32], b_data: &[f32], k: usize, n: usize) -> Vec<f32> 
 }
 
 fn assert_close(a: &[f32], b: &[f32], rel_tol: f32, abs_tol: f32) {
+    assert_close_named("GEMV", a, b, rel_tol, abs_tol);
+}
+
+fn assert_close_named(label: &str, a: &[f32], b: &[f32], rel_tol: f32, abs_tol: f32) {
     assert_eq!(a.len(), b.len());
     for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
         let scale = x.abs().max(y.abs()).max(1e-6);
@@ -66,7 +70,7 @@ fn assert_close(a: &[f32], b: &[f32], rel_tol: f32, abs_tol: f32) {
         let abs = (x - y).abs();
         assert!(
             abs <= abs_tol || rel <= rel_tol,
-            "mismatch at [{i}]: gpu={x}, cpu={y}, rel={rel:.3e}, abs={abs:.3e}",
+            "{label} mismatch at [{i}]: gpu={x}, cpu={y}, rel={rel:.3e}, abs={abs:.3e}",
         );
     }
 }
@@ -296,4 +300,107 @@ fn gemv_non_multiple_k() {
     test_shape(100, 256, 10);
     test_shape(511, 256, 11);
     test_shape(513, 256, 12);
+}
+
+/// Every GEMV kernel must be correct at every shape the search may install.
+/// Plain, fused-add and transposed-B run together so eight sessions cover the
+/// 24 combinations while failures retain the shape and kernel name.
+#[test]
+fn every_gemv_shape_computes_the_same_product() {
+    use meganeura::compile::{CompileOptions, ShaderEntry};
+    use meganeura::train::{Mode, SessionConfig};
+    use meganeura::{GemvReduction, GemvShape};
+
+    let data = |n: usize, seed: u32| -> Vec<f32> {
+        let mut state = seed | 1;
+        (0..n)
+            .map(|_| {
+                state = state.wrapping_mul(747796405).wrapping_add(2891336453);
+                let w = ((state >> ((state >> 28) + 4)) ^ state).wrapping_mul(277803737);
+                (((w >> 22) ^ w) % 2001) as f32 * 0.001 - 1.0
+            })
+            .collect()
+    };
+
+    // K and N large enough that a 256-wide workgroup has real work to split,
+    // and not multiples of every width, so the loop tails are exercised.
+    const K: usize = 320;
+    const N: usize = 36;
+    let a = data(K, 1);
+    let b = data(K * N, 2);
+    let addend = data(N, 3);
+    // B for the transposed form is [N, K]; transpose the same numbers so all
+    // three kernels are compared against the same product.
+    let mut b_t = vec![0.0f32; K * N];
+    for col in 0..N {
+        for row in 0..K {
+            b_t[col * K + row] = b[row * N + col];
+        }
+    }
+
+    let want = cpu_gemv(&a, &b, K, N);
+    let want_add = cpu_gemv_add(&a, &b, &addend, K, N);
+    let want_bt = cpu_gemv_bt(&a, &b_t, K, N);
+
+    for threads in GemvShape::WIDTHS {
+        for reduction in [GemvReduction::Tree, GemvReduction::Subgroup] {
+            let shape = GemvShape { threads, reduction };
+            let mut g = Graph::new();
+            let x = g.input("x", &[1, K]);
+            let x_add = g.input("x_add", &[1, K]);
+            let x_bt = g.input("x_bt", &[1, K]);
+            let w = g.input("w", &[K, N]);
+            let w_add = g.input("w_add", &[K, N]);
+            let w_t = g.input("w_t", &[N, K]);
+            let d = g.input("d", &[1, N]);
+            let plain = g.matmul(x, w);
+            let product = g.matmul(x_add, w_add);
+            let add = g.add(product, d);
+            let bt = g.matmul_bt(x_bt, w_t);
+            g.set_outputs(vec![plain, add, bt]);
+
+            let config = SessionConfig {
+                mode: Mode::Inference,
+                options: CompileOptions {
+                    gemv_shape: Some(shape),
+                    ..CompileOptions::from_env()
+                },
+                ..SessionConfig::from_env()
+            };
+            let mut s = meganeura::build(&g, config).0;
+            let shaders: Vec<_> = s.plan().dispatches.iter().map(|d| &d.shader).collect();
+            for expected in [
+                ShaderEntry::MatMulGemv,
+                ShaderEntry::MatMulGemvAdd,
+                ShaderEntry::MatMulGemvBT,
+            ] {
+                assert_eq!(
+                    shaders
+                        .iter()
+                        .filter(|&&shader| *shader == expected)
+                        .count(),
+                    1,
+                    "{shape:?}: missing {expected:?}; got {shaders:?}"
+                );
+            }
+            for name in ["x", "x_add", "x_bt"] {
+                s.set_input(name, &a);
+            }
+            s.set_input("w", &b);
+            s.set_input("w_add", &b);
+            s.set_input("w_t", &b_t);
+            s.set_input("d", &addend);
+            s.step();
+            s.wait();
+            for (index, (label, expected)) in
+                [("plain", &want), ("add", &want_add), ("bt", &want_bt)]
+                    .into_iter()
+                    .enumerate()
+            {
+                let mut got = vec![0.0; N];
+                s.read_output_by_index(index, &mut got);
+                assert_close_named(&format!("{shape:?} {label}"), &got, expected, 2e-4, 2e-4);
+            }
+        }
+    }
 }

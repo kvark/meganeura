@@ -41,6 +41,11 @@ fn logical_bytes(ty: &TensorType) -> io::Result<usize> {
             DType::F16 => n.checked_mul(2),
             DType::Q4_0 => n.div_ceil(32).checked_mul(20),
             DType::Q8_0 => n.div_ceil(32).checked_mul(36),
+            // Rounded up to a word, matching `TensorType::size_bytes`.
+            DType::Q40 => n
+                .div_ceil(32)
+                .checked_mul(18)
+                .map(|b| b.next_multiple_of(4)),
             DType::Q4K => n.div_ceil(256).checked_mul(144),
             // Rounded up to a word, matching `TensorType::size_bytes`.
             DType::Q6K => n
@@ -101,9 +106,13 @@ fn tensor_layout(ty: &TensorType) -> io::Result<(Dtype, Vec<usize>)> {
         DType::F32 => (Dtype::F32, ty.shape.clone()),
         DType::F16 => (Dtype::F16, ty.shape.clone()),
         DType::U32 => (Dtype::U32, ty.shape.clone()),
-        DType::Q4_0 | DType::Q8_0 | DType::Q4K | DType::Q6K | DType::Q5K | DType::Q3K => {
-            (Dtype::U8, vec![logical_bytes(ty)?])
-        }
+        DType::Q4_0
+        | DType::Q8_0
+        | DType::Q40
+        | DType::Q4K
+        | DType::Q6K
+        | DType::Q5K
+        | DType::Q3K => (Dtype::U8, vec![logical_bytes(ty)?]),
     })
 }
 
@@ -482,7 +491,7 @@ impl Session {
             }
         }
         let sync = self.gpu.submit(&mut encoder);
-        let _ = super::wait_for_timed_encoder(&self.gpu, &sync, &mut encoder);
+        let _ = super::wait_for_timed_encoder(&self.gpu, &sync, &mut encoder, self.gpu_timing());
         for tensor in &tensors {
             let aligned_len = tensor.byte_len / 4 * 4;
             let tail_len = tensor.byte_len - aligned_len;

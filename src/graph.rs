@@ -15,6 +15,22 @@ pub enum DType {
     /// Q8_0: symmetric 8-bit quantization, 32-element blocks.
     /// Each block: 1 f16 scale (padded to u32) + 32 int8 values (8 u32s) = 36 bytes.
     Q8_0,
+    /// GGML's Q4_0 — the real one — stored byte-for-byte as it appears in a
+    /// GGUF file: 32-element blocks of 18 bytes, holding an f16 `d` and 16
+    /// nibble bytes. Value is `d * (q - 8)`, symmetric with no minimum.
+    ///
+    /// Not to be confused with [`DType::Q4_0`], which despite the name is
+    /// Meganeura's own asymmetric Q4_1-style packing at 5.0 bits/weight.
+    /// This is 4.5, because a symmetric format needs no per-block minimum,
+    /// and it is what a `Q4_0` GGUF actually contains — so loading one no
+    /// longer has to rebuild every block into the wider layout.
+    ///
+    /// GGML splits a block's nibbles across halves: byte `j` holds element
+    /// `j` in its low nibble and element `j + 16` in its high nibble, where
+    /// Meganeura's own Q4 pairs adjacent elements.
+    ///
+    /// Load-only, for the same reason as [`DType::Q4K`].
+    Q40,
     /// GGML's Q4_K, stored byte-for-byte as it appears in a GGUF file:
     /// 256-element superblocks of 144 bytes, holding an f16 `d` and `dmin`,
     /// eight 6-bit scale/min pairs packed into 12 bytes, and 128 nibble bytes.
@@ -86,7 +102,13 @@ impl DType {
             DType::F32 => 4,
             DType::F16 => 2,
             DType::U32 => 4,
-            DType::Q4_0 | DType::Q8_0 | DType::Q4K | DType::Q6K | DType::Q5K | DType::Q3K => {
+            DType::Q4_0
+            | DType::Q8_0
+            | DType::Q40
+            | DType::Q4K
+            | DType::Q6K
+            | DType::Q5K
+            | DType::Q3K => {
                 panic!("quantized types use block-level sizing")
             }
         }
@@ -129,6 +151,14 @@ impl TensorType {
                 // Per block: 1 u32 (scale_f16 padded) + 8 u32s (32 int8s) = 9 u32s.
                 let blocks = self.num_elements().div_ceil(32);
                 blocks * 9 * 4
+            }
+            DType::Q40 => {
+                // GGML Q4_0: 32-element blocks, 18 bytes each — an f16 `d`
+                // and 16 nibble bytes. Not a whole number of words, so the
+                // buffer is rounded up for the `array<u32>` binding while
+                // the blocks keep GGML's exact bytes, as for Q6_K and Q3_K.
+                let blocks = self.num_elements().div_ceil(32);
+                (blocks * 18).next_multiple_of(4)
             }
             DType::Q4K => {
                 // 256-element superblocks, 144 bytes each: 1 u32 (d|dmin)
@@ -1132,6 +1162,31 @@ impl Graph {
             "Q4_K needs the reduction extent to be a multiple of 256, got {shape:?}"
         );
         let ty = TensorType::new(shape.to_vec(), DType::Q4K);
+        self.add_node(
+            Op::Parameter {
+                name: name.to_string(),
+            },
+            vec![],
+            ty,
+        )
+    }
+
+    /// Create a parameter stored as GGML Q4_0 (4.5 bits/element).
+    ///
+    /// The reduction extent — `shape[0]` — must be a multiple of 32, the
+    /// block size. Load-only, like [`Graph::parameter_q4k`]: fill it with
+    /// [`crate::Session::set_parameter_packed`] from
+    /// [`crate::load::gguf`]. See [`DType::Q40`].
+    ///
+    /// This is GGML's symmetric Q4_0. For Meganeura's own asymmetric Q4,
+    /// which can be produced from f32 on the host, use
+    /// [`Graph::parameter_q4`].
+    pub fn parameter_q40(&mut self, name: &str, shape: &[usize]) -> NodeId {
+        assert!(
+            shape.first().is_some_and(|k| k.is_multiple_of(32)),
+            "GGML Q4_0 needs the reduction extent to be a multiple of 32, got {shape:?}"
+        );
+        let ty = TensorType::new(shape.to_vec(), DType::Q40);
         self.add_node(
             Op::Parameter {
                 name: name.to_string(),

@@ -1,11 +1,28 @@
 # Unreleased
 
+- Optional Q8_1 activations for Q4_0 GEMV, following llama.cpp's
+  `vec_dot_q4_0_q8_1`. `CompileOptions::quantized_activations` is explicit
+  because this changes results; tuning may reshape the selected kernel but
+  never enables it. Metal uses `dot4I8Packed`, while Vulkan uses an exact
+  scalar expansion until Blade exposes `shaderIntegerDotProduct`.
+- Native, load-only GGML Q4_0 storage (`DType::Q40` and
+  `Graph::parameter_q40`) removes the host repack and stores 4.5 rather than
+  5 bits per weight. Q4_1 continues to use Meganeura's existing Q4 layout.
+- K-split GEMV now supports 32/64/128/256-thread tree and subgroup reductions
+  across plain, fused-add, transposed, f16 and packed-weight kernels.
+  `Session::tune_with` searches the shape for GEMV, including reduced-storage
+  weights; `CompileOptions::gemv_shape` pins one for reproduction.
+- Structured profiles split plans larger than Blade's timestamp budget into
+  complete replay windows and stitch per-dispatch samples. The schema is now
+  version 2, failed captures restore unprofiled execution, and Blade is pinned
+  to resolve after waiting and tolerate Vulkan calibration skew.
 - GGUF weight import (`load::gguf`). Reads the container's metadata and tensor
   inventory, and resolves GGML's block encodings into Meganeura's at load time.
-  `Q4_0`, `Q4_1` and `Q8_0` repack losslessly for `set_parameter_packed` —
-  GGML splits a block's nibbles across halves and interleaves each block's
-  header with its payload, where Meganeura pairs adjacent nibbles and keeps
-  headers in their own region. The block *order* already agreed, since packing
+  `Q4_1` and `Q8_0` repack losslessly for `set_parameter_packed` — GGML
+  splits a block's nibbles across halves and interleaves each block's header
+  with its payload, where Meganeura pairs adjacent nibbles and keeps headers
+  in their own region. (`Q4_0` repacked here too until it gained native
+  storage, above.) The block *order* already agreed, since packing
   performs the `[K, N]` transpose that GGUF's layout implies. See
   `examples/gguf_info.rs`.
 - Native GGML K-quant storage: `Q4K`, `Q6K`, `Q5K` and `Q3K`, each with a
