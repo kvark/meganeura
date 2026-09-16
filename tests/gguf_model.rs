@@ -668,3 +668,138 @@ fn quantizing_actually_changes_the_weights() {
          if they do, the quantization never took effect"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Packed tensors
+//
+// Phi packs Q, K and V into one `attn_qkv.weight` and Phi3 packs the
+// feed-forward gate and up into one double-width `ffn_up.weight`. Qwen2
+// builds the *same graph* — RMSNorm, gated SwiGLU, no embedding scale, no
+// per-head norms, half-split RoPE — from separate tensors, so the two must
+// agree when given the same numbers. That is what makes this a test of the
+// slicing rather than of Phi3.
+// ---------------------------------------------------------------------------
+
+/// Re-key `tiny_llama`'s metadata under another architecture name.
+fn rekeyed(arch: &str) -> GgufModel {
+    let mut model = tiny_llama();
+    let mut moved = HashMap::new();
+    for (key, value) in &model.metadata {
+        match key.strip_prefix("llama.") {
+            Some(suffix) => {
+                moved.insert(format!("{arch}.{suffix}"), value.clone());
+            }
+            None => {
+                moved.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    moved.insert(
+        "general.architecture".to_string(),
+        GgufValue::String(arch.to_string()),
+    );
+    model.metadata = moved;
+    model
+}
+
+/// Concatenate tensors along their output rows, which in GGUF's
+/// fastest-first order is `dims[1]`.
+fn concat_rows(parts: &[&GgufTensor]) -> GgufTensor {
+    let k = parts[0].dims[0];
+    let rows: usize = parts.iter().map(|t| t.dims[1]).sum();
+    let mut bytes = Vec::new();
+    for part in parts {
+        assert_eq!(part.dims[0], k, "concatenated rows must be the same width");
+        bytes.extend_from_slice(part.data());
+    }
+    GgufTensor::new(vec![k, rows], GgmlType::F32, bytes)
+}
+
+#[test]
+fn a_phi3_packed_model_matches_the_same_weights_split_apart() {
+    let split = rekeyed("qwen2");
+
+    let mut packed = rekeyed("phi3");
+    for layer in 0..LAYERS {
+        let p = format!("blk.{layer}");
+        let qkv = concat_rows(&[
+            &split.tensors[&format!("{p}.attn_q.weight")],
+            &split.tensors[&format!("{p}.attn_k.weight")],
+            &split.tensors[&format!("{p}.attn_v.weight")],
+        ]);
+        let gate_up = concat_rows(&[
+            &split.tensors[&format!("{p}.ffn_gate.weight")],
+            &split.tensors[&format!("{p}.ffn_up.weight")],
+        ]);
+        packed.tensors.remove(&format!("{p}.attn_q.weight"));
+        packed.tensors.remove(&format!("{p}.attn_k.weight"));
+        packed.tensors.remove(&format!("{p}.attn_v.weight"));
+        packed.tensors.remove(&format!("{p}.ffn_gate.weight"));
+        packed.tensors.insert(format!("{p}.attn_qkv.weight"), qkv);
+        packed.tensors.insert(format!("{p}.ffn_up.weight"), gate_up);
+    }
+
+    let feed = |model: &GgufModel| {
+        let mut model_gen = Generator::with_options(
+            model,
+            &GeneratorOptions {
+                max_seq_len: 32,
+                prefill_block: 4,
+            },
+        )
+        .unwrap();
+        model_gen.feed(&[4, 2, 9, 1]).unwrap()
+    };
+
+    let from_packed = feed(&packed);
+    let from_split = feed(&split);
+    assert!(
+        close(&from_packed, &from_split, 1.0e-5),
+        "slicing the packed tensors should recover the separate ones.\n \
+         packed: {:?}\n split: {:?}",
+        &from_packed[..6.min(from_packed.len())],
+        &from_split[..6.min(from_split.len())],
+    );
+}
+
+#[test]
+fn the_llama_family_unpermutes_its_rope_pairs_and_qwen_does_not() {
+    // The same numbers under two architecture names must *disagree*: one
+    // un-permutes Q and K on load and the other does not, so an
+    // implementation that quietly skipped the permutation would make these
+    // match. The prompt is long because the two conventions differ by the
+    // rotation angle, which is near zero at position 0 — a three-token
+    // prompt separates them by less than this model's own rounding.
+    let prompt: Vec<u32> = (0..24).map(|i| i * 5 % VOCAB as u32).collect();
+    let feed = |model: &GgufModel| {
+        let mut model_gen = Generator::with_options(
+            model,
+            &GeneratorOptions {
+                max_seq_len: 32,
+                prefill_block: 8,
+            },
+        )
+        .unwrap();
+        model_gen.feed(&prompt).unwrap()
+    };
+    let as_llama = feed(&tiny_llama());
+    let as_qwen = feed(&rekeyed("qwen2"));
+
+    let spread = as_llama
+        .iter()
+        .zip(&as_qwen)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let scale = as_llama.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    // Identical weights give bit-identical logits here — the same-prompt
+    // determinism test above relies on that — so any measurable gap is the
+    // permutation and nothing else. The threshold is loose because these
+    // fixture weights are a smooth ramp and attention over them is close
+    // to uniform, which damps the difference; the permutation itself is
+    // pinned exactly by the unit tests in `load::gguf::weights`.
+    assert!(
+        spread > 1.0e-5 * scale,
+        "llama should un-permute Q and K where qwen2 should not, but the \
+         logits differ by only {spread} against a scale of {scale}"
+    );
+}

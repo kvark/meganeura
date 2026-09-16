@@ -13,11 +13,17 @@
 //!
 //! Every architecture here is a pre-norm decoder stack, so the enum is not a
 //! choice of model so much as a record of where each family departs from the
-//! llama shape. The departures are few, and each is a field or two below:
-//! Qwen2's QKV biases, Qwen3's per-head Q/K norms, Gemma's scaled embeddings
-//! and its second pair of norms, Phi's parallel residual and LayerNorm. A
-//! family that departs in none of these ways — Mistral, SmolLM2, TinyLlama —
-//! is [`Architecture::Llama`] and needs no entry of its own.
+//! llama shape. The departures are few, and each is a predicate below:
+//! Qwen3's per-head Q/K norms, Gemma's scaled embeddings and its second pair
+//! of norms, Gemma3's five-to-one window pattern and its separate local RoPE
+//! base, Phi's parallel residual, LayerNorm and packed tensors — and, least
+//! visibly, whether the file's Q and K were permuted for GGML's interleaved
+//! RoPE ([`Architecture::rope_is_interleaved`]).
+//!
+//! A name is mapped onto a variant only when its graph is that variant's
+//! graph, not merely close to it. The alias list is short on purpose: a
+//! family that differs anywhere would load without complaint and decode
+//! wrongly, which is the failure mode hardest to notice.
 
 use super::{GgufError, GgufModel, GgufValue};
 
@@ -46,6 +52,10 @@ pub enum Architecture {
     /// blocks, alternating sliding-window and full attention, and logit
     /// softcapping.
     Gemma2,
+    /// Gemma2's block shape, but with per-head Q/K norms, five local
+    /// layers to each global one rather than alternating, and a separate
+    /// RoPE base for the local layers. It dropped the softcapping.
+    Gemma3,
     /// LayerNorm rather than RMSNorm, a single norm per block feeding
     /// attention and feed-forward *in parallel*, GELU, and biases
     /// throughout.
@@ -64,17 +74,44 @@ impl Architecture {
     /// worse to debug than a refusal naming the architecture.
     pub fn from_name(name: &str) -> Result<Self, GgufError> {
         Ok(match name {
-            // Families whose graph is the llama graph.
-            "llama" | "mistral" | "smollm" | "smollm2" | "tinyllama" | "vicuna" | "yi"
-            | "deepseek" | "olmo" | "minicpm" | "internlm2" | "stablelm2" => Self::Llama,
-            "qwen2" | "qwen2moe" => Self::Qwen2,
+            // Families that are the llama graph, not merely close to it.
+            // A name is listed here only if its GGUF converter is
+            // llama.cpp's `LlamaModel` — the list is deliberately short,
+            // because aliasing a family that differs anywhere would load
+            // cleanly and decode wrongly.
+            "llama" | "mistral" | "smollm" | "smollm2" | "tinyllama" | "vicuna" => Self::Llama,
+            "qwen2" => Self::Qwen2,
             "qwen3" => Self::Qwen3,
             "gemma" => Self::Gemma,
-            "gemma2" | "gemma3" => Self::Gemma2,
+            "gemma2" => Self::Gemma2,
+            "gemma3" => Self::Gemma3,
             "phi2" => Self::Phi2,
             "phi3" => Self::Phi3,
             other => return Err(GgufError::UnsupportedArchitecture(other.to_string())),
         })
+    }
+
+    /// Whether RoPE rotates *adjacent* pairs rather than halves of a head.
+    ///
+    /// GGML has both conventions. Meganeura's RoPE is the half-split one,
+    /// and llama.cpp's converter permutes Q and K on the way into a llama
+    /// GGUF so that GGML's interleaved rope reproduces the same rotation.
+    /// Those permuted weights therefore have to be permuted *back* on load
+    /// — see [`super::weights`]. Every other family here converts without
+    /// the permutation and needs nothing.
+    pub fn rope_is_interleaved(self) -> bool {
+        matches!(self, Self::Llama)
+    }
+
+    /// Whether the file packs Q, K and V into one `attn_qkv.weight`.
+    pub fn packs_qkv(self) -> bool {
+        matches!(self, Self::Phi2 | Self::Phi3)
+    }
+
+    /// Whether the file packs the feed-forward gate and up projections
+    /// into one double-width `ffn_up.weight`.
+    pub fn packs_gate_up(self) -> bool {
+        matches!(self, Self::Phi3)
     }
 
     /// Whether blocks normalize with LayerNorm instead of RMSNorm.
@@ -109,13 +146,13 @@ impl Architecture {
 
     /// Whether Q and K are normed per head before RoPE.
     pub fn qk_norm(self) -> bool {
-        matches!(self, Self::Qwen3)
+        matches!(self, Self::Qwen3 | Self::Gemma3)
     }
 
     /// Whether the token embedding is scaled by `sqrt(n_embd)` on the way
     /// in.
     pub fn scales_embeddings(self) -> bool {
-        matches!(self, Self::Gemma | Self::Gemma2)
+        matches!(self, Self::Gemma | Self::Gemma2 | Self::Gemma3)
     }
 
     /// Whether norm weights are stored as `w` but applied as `1 + w`.
@@ -123,13 +160,13 @@ impl Architecture {
     /// Gemma trains its norm weights centred on zero. Folding the `+1` in
     /// at load time keeps the shaders unaware of it.
     pub fn norm_weight_offset_by_one(self) -> bool {
-        matches!(self, Self::Gemma | Self::Gemma2)
+        matches!(self, Self::Gemma | Self::Gemma2 | Self::Gemma3)
     }
 
     /// Whether each block carries a second pair of norms, applied to the
     /// attention and feed-forward outputs before they rejoin the residual.
     pub fn post_block_norms(self) -> bool {
-        matches!(self, Self::Gemma2)
+        matches!(self, Self::Gemma2 | Self::Gemma3)
     }
 }
 
@@ -141,6 +178,7 @@ impl std::fmt::Display for Architecture {
             Self::Qwen3 => "qwen3",
             Self::Gemma => "gemma",
             Self::Gemma2 => "gemma2",
+            Self::Gemma3 => "gemma3",
             Self::Phi2 => "phi2",
             Self::Phi3 => "phi3",
         };
@@ -181,6 +219,10 @@ pub struct ModelConfig {
     pub norm_eps: f32,
     /// RoPE base frequency, `{arch}.rope.freq_base`.
     pub rope_theta: f32,
+    /// RoPE base for the sliding-window layers, where the file gives them
+    /// their own — Gemma3's `{arch}.rope.local_freq_base`. `None` means
+    /// every layer rotates with [`Self::rope_theta`].
+    pub rope_theta_local: Option<f32>,
     /// How many of each head's dimensions RoPE rotates.
     ///
     /// Phi2 rotates a fraction of the head and leaves the rest untouched;
@@ -262,6 +304,7 @@ impl ModelConfig {
         };
 
         let rope_theta = opt_f32(model, "rope.freq_base")?.unwrap_or(10_000.0);
+        let rope_theta_local = opt_f32(model, "rope.local_freq_base")?.filter(|v| *v > 0.0);
         let rope_dim = opt_u32(model, "rope.dimension_count")?.unwrap_or(head_dim);
         let context_length = opt_usize(model, "context_length")?.unwrap_or(2048);
         let sliding_window = opt_usize(model, "attention.sliding_window")?.filter(|&w| w > 0);
@@ -284,6 +327,7 @@ impl ModelConfig {
             intermediate_size,
             norm_eps,
             rope_theta,
+            rope_theta_local,
             rope_dim,
             context_length,
             sliding_window,
@@ -309,13 +353,31 @@ impl ModelConfig {
     /// Whether layer `index` attends to a sliding window rather than the
     /// whole prefix.
     ///
-    /// Gemma2 alternates, starting with a windowed layer; a model with no
-    /// window attends fully everywhere.
+    /// The two Gemmas interleave differently — Gemma2 alternates one for
+    /// one, Gemma3 takes five local layers to each global one, the global
+    /// being every sixth. A model with no window attends fully everywhere,
+    /// and one with a window and no interleaving pattern uses it in every
+    /// layer.
     pub fn layer_is_windowed(&self, index: usize) -> bool {
         match self.sliding_window {
             None => false,
-            Some(_) if self.architecture == Architecture::Gemma2 => index.is_multiple_of(2),
-            Some(_) => true,
+            Some(_) => match self.architecture {
+                Architecture::Gemma2 => index.is_multiple_of(2),
+                Architecture::Gemma3 => !(index + 1).is_multiple_of(6),
+                _ => true,
+            },
+        }
+    }
+
+    /// The RoPE base layer `index` rotates with.
+    ///
+    /// Gemma3 gives its local layers a much smaller base than its global
+    /// ones, so the base is a property of the layer rather than of the
+    /// model. Everything else uses one base throughout.
+    pub fn layer_rope_theta(&self, index: usize) -> f32 {
+        match self.rope_theta_local {
+            Some(local) if self.layer_is_windowed(index) => local,
+            _ => self.rope_theta,
         }
     }
 }

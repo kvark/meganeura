@@ -31,6 +31,20 @@
 //! head. The head is the widest matmul in the model — `hidden × vocab` — and
 //! this way it runs once per step rather than `block_size` times.
 //!
+//! # Where a parameter's bytes come from
+//!
+//! A parameter is usually a tensor of its own, but not always: Phi packs Q,
+//! K and V into one `attn_qkv.weight`, and Phi3 packs the feed-forward gate
+//! and up into one double-width `ffn_up.weight`. `source_of` resolves a
+//! parameter name to the tensor and row range backing it, and both this
+//! module and [`super::weights`] go through it, so the shape a parameter is
+//! declared with and the bytes it is filled from cannot disagree.
+//!
+//! Biases are *optional*. GGUF families are inconsistent about them in ways
+//! not worth a variant each — Qwen2 biases Q, K and V but leaves the
+//! attention output unbiased — and an absent bias is a zero bias, which is
+//! the graph without the add.
+//!
 //! # What is refused
 //!
 //! An architecture whose graph cannot be expressed exactly is rejected by
@@ -122,7 +136,6 @@ pub fn build(
     let q_dim = config.q_dim();
     let head_dim = config.head_dim;
     let eps = config.norm_eps;
-    let theta = config.rope_theta;
 
     let token_ids = g.input_u32("token_ids", &[block_size]);
     let position = g.input_u32("position", &[1]);
@@ -155,19 +168,38 @@ pub fn build(
         // together; everything else re-norms between them.
         let attn_in = normed;
 
-        let q = projection(g, model, &format!("{p}.attn_q.weight"), &[hidden, q_dim])?;
-        let k = projection(g, model, &format!("{p}.attn_k.weight"), &[hidden, kv_dim])?;
-        let v = projection(g, model, &format!("{p}.attn_v.weight"), &[hidden, kv_dim])?;
+        let q = projection(
+            g,
+            model,
+            config,
+            &format!("{p}.attn_q.weight"),
+            &[hidden, q_dim],
+        )?;
+        let k = projection(
+            g,
+            model,
+            config,
+            &format!("{p}.attn_k.weight"),
+            &[hidden, kv_dim],
+        )?;
+        let v = projection(
+            g,
+            model,
+            config,
+            &format!("{p}.attn_v.weight"),
+            &[hidden, kv_dim],
+        )?;
 
         let mut q = g.matmul(attn_in, q);
         let mut k = g.matmul(attn_in, k);
         let mut v = g.matmul(attn_in, v);
 
-        if arch.qkv_bias() {
-            q = bias(g, model, &format!("{p}.attn_q.bias"), q, q_dim)?;
-            k = bias(g, model, &format!("{p}.attn_k.bias"), k, kv_dim)?;
-            v = bias(g, model, &format!("{p}.attn_v.bias"), v, kv_dim)?;
-        }
+        // Optional rather than gated on the architecture: Qwen2 biases Q,
+        // K and V but not the attention output, and requiring all four
+        // would fail on every real Qwen2 file.
+        q = optional_bias(g, model, &format!("{p}.attn_q.bias"), q, q_dim)?;
+        k = optional_bias(g, model, &format!("{p}.attn_k.bias"), k, kv_dim)?;
+        v = optional_bias(g, model, &format!("{p}.attn_v.bias"), v, kv_dim)?;
 
         // Qwen3 norms each head of Q and K before the rotation. The weight
         // is one head wide and shared across heads, which is exactly what
@@ -198,8 +230,11 @@ pub fn build(
         // Row i sits at absolute position `position + i`, which is the
         // offset form's own rule, so one call covers a whole prompt block
         // and a single decode step alike.
-        let q = g.rope_dynamic_offset(q, theta, position, head_dim);
-        let k = g.rope_dynamic_offset(k, theta, position, head_dim);
+        // Gemma3 rotates its local layers with a smaller base than its
+        // global ones, so the base is read per layer rather than once.
+        let layer_theta = config.layer_rope_theta(layer);
+        let q = g.rope_dynamic_offset(q, layer_theta, position, head_dim);
+        let k = g.rope_dynamic_offset(k, layer_theta, position, head_dim);
 
         let k_cache = g.parameter(&ModelGraph::k_cache_name(layer), &[max_seq_len, kv_dim]);
         let v_cache = g.parameter(&ModelGraph::v_cache_name(layer), &[max_seq_len, kv_dim]);
@@ -235,13 +270,12 @@ pub fn build(
         let wo = projection(
             g,
             model,
+            config,
             &format!("{p}.attn_output.weight"),
             &[q_dim, hidden],
         )?;
         let mut attn_out = g.matmul(attn, wo);
-        if arch.qkv_bias() {
-            attn_out = bias(g, model, &format!("{p}.attn_output.bias"), attn_out, hidden)?;
-        }
+        attn_out = optional_bias(g, model, &format!("{p}.attn_output.bias"), attn_out, hidden)?;
         // Gemma2 norms each block's output before it rejoins the residual.
         if arch.post_block_norms() {
             attn_out = norm(
@@ -289,7 +323,7 @@ pub fn build(
         // which is the same orientation — no transposed copy is needed.
         g.matmul_bt(last, embed)
     } else {
-        let head = projection(g, model, OUTPUT, &[hidden, config.vocab_size])?;
+        let head = projection(g, model, config, OUTPUT, &[hidden, config.vocab_size])?;
         g.matmul(last, head)
     };
 
@@ -368,10 +402,17 @@ fn feed_forward(
         let w_gate = projection(
             g,
             model,
+            config,
             &format!("{prefix}.ffn_gate.weight"),
             &[hidden, ffn],
         )?;
-        let w_up = projection(g, model, &format!("{prefix}.ffn_up.weight"), &[hidden, ffn])?;
+        let w_up = projection(
+            g,
+            model,
+            config,
+            &format!("{prefix}.ffn_up.weight"),
+            &[hidden, ffn],
+        )?;
         let gate = g.matmul(input, w_gate);
         let up = g.matmul(input, w_up);
         if arch.scales_embeddings() {
@@ -384,22 +425,27 @@ fn feed_forward(
             g.swiglu(gate, up)
         }
     } else {
-        let w_up = projection(g, model, &format!("{prefix}.ffn_up.weight"), &[hidden, ffn])?;
+        let w_up = projection(
+            g,
+            model,
+            config,
+            &format!("{prefix}.ffn_up.weight"),
+            &[hidden, ffn],
+        )?;
         let mut up = g.matmul(input, w_up);
-        up = bias(g, model, &format!("{prefix}.ffn_up.bias"), up, ffn)?;
+        up = optional_bias(g, model, &format!("{prefix}.ffn_up.bias"), up, ffn)?;
         g.gelu(up)
     };
 
     let w_down = projection(
         g,
         model,
+        config,
         &format!("{prefix}.ffn_down.weight"),
         &[ffn, hidden],
     )?;
     let mut out = g.matmul(hidden_act, w_down);
-    if !arch.gated_ffn() {
-        out = bias(g, model, &format!("{prefix}.ffn_down.bias"), out, hidden)?;
-    }
+    out = optional_bias(g, model, &format!("{prefix}.ffn_down.bias"), out, hidden)?;
     Ok(out)
 }
 
@@ -415,11 +461,11 @@ fn norm(
 ) -> Result<NodeId, GgufError> {
     let hidden = g.node(x).ty.shape[1];
     let weight_name = format!("{name}.weight");
-    require_tensor(model, &weight_name)?;
+    check_vector(&weight_name, require_tensor(model, &weight_name)?, hidden)?;
     let w = g.parameter(&weight_name, &[hidden]);
     if config.architecture.uses_layer_norm() {
         let bias_name = format!("{name}.bias");
-        require_tensor(model, &bias_name)?;
+        check_vector(&bias_name, require_tensor(model, &bias_name)?, hidden)?;
         let b = g.parameter(&bias_name, &[hidden]);
         Ok(g.layer_norm(x, w, b, eps))
     } else {
@@ -443,24 +489,132 @@ fn per_head_norm(
     head_dim: u32,
     eps: f32,
 ) -> Result<NodeId, GgufError> {
-    require_tensor(model, name)?;
+    check_vector(name, require_tensor(model, name)?, head_dim as usize)?;
     let w = g.parameter(name, &[head_dim as usize]);
     let wide = g.reshape(x, &[rows * heads as usize, head_dim as usize]);
     let normed = g.rms_norm(wide, w, eps);
     Ok(g.reshape(normed, &[rows, heads as usize * head_dim as usize]))
 }
 
-/// Add a bias vector, which GGUF stores as a plain f32 row.
-fn bias(
+/// Add a bias vector, if the file carries one.
+///
+/// Biases are optional because GGUF families are inconsistent about them
+/// in ways that are not worth a variant each: Qwen2 biases Q, K and V but
+/// *not* the attention output, and producers differ over the
+/// feed-forward. An absent bias is a zero bias, which is exactly the graph
+/// without the add — so a missing tensor here means "no bias", not an
+/// error. A bias of the wrong *width* is still an error.
+fn optional_bias(
     g: &mut Graph,
     model: &GgufModel,
     name: &str,
     x: NodeId,
     width: usize,
 ) -> Result<NodeId, GgufError> {
-    require_tensor(model, name)?;
+    let Some(tensor) = model.tensors.get(name) else {
+        return Ok(x);
+    };
+    check_vector(name, tensor, width)?;
     let b = g.parameter(name, &[width]);
     Ok(g.bias_add(x, b))
+}
+
+/// A 1-D tensor must be exactly as wide as the thing it applies to.
+///
+/// Without this a norm weight of the wrong length reaches the runtime's
+/// buffer-size assertion and panics, where a mis-shaped *projection*
+/// already returns an error.
+fn check_vector(name: &str, tensor: &super::GgufTensor, width: usize) -> Result<(), GgufError> {
+    if tensor.dims.as_slice() != [width] {
+        return Err(GgufError::MissingTensor(format!(
+            "`{name}` is {:?}, but the architecture makes it [{width}]",
+            tensor.dims
+        )));
+    }
+    Ok(())
+}
+
+/// Where a parameter's values live in the file.
+///
+/// Usually a tensor of its own, but Phi packs Q, K and V into one
+/// `attn_qkv.weight` and Phi3 packs the feed-forward gate and up into one
+/// double-width `ffn_up.weight`. Those parameters name a *row range*
+/// within the packed tensor, which [`super::weights`] slices out. Rows are
+/// output features, and GGUF blocks along the other axis, so a row range
+/// is a contiguous run of bytes whatever the encoding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Source {
+    /// The tensor to read, as the file names it.
+    pub tensor: String,
+    /// Output rows to take from it, or `None` for all of them.
+    pub rows: Option<std::ops::Range<usize>>,
+}
+
+impl Source {
+    fn whole(name: &str) -> Self {
+        Self {
+            tensor: name.to_string(),
+            rows: None,
+        }
+    }
+
+    fn slice(name: &str, rows: std::ops::Range<usize>) -> Self {
+        Self {
+            tensor: name.to_string(),
+            rows: Some(rows),
+        }
+    }
+}
+
+/// Resolve a parameter name to the tensor and rows backing it.
+///
+/// Both the builder and the loader go through this, so they cannot
+/// disagree about which bytes a parameter is made of.
+pub(super) fn source_of(config: &ModelConfig, param: &str) -> Source {
+    let arch = config.architecture;
+    if !arch.packs_qkv() && !arch.packs_gate_up() {
+        return Source::whole(param);
+    }
+    // `blk.0.attn_q.weight` splits into the block prefix `blk.0` and the
+    // leaf `attn_q.weight` — two dotted components, not one, which is why
+    // a single `rsplit_once` is not enough.
+    let Some((prefix, leaf)) = split_block_leaf(param) else {
+        return Source::whole(param);
+    };
+
+    let q = config.q_dim();
+    let kv = config.kv_dim();
+    let ffn = config.intermediate_size;
+
+    if arch.packs_qkv() {
+        let packed = format!("{prefix}.attn_qkv.weight");
+        match leaf {
+            "attn_q.weight" => return Source::slice(&packed, 0..q),
+            "attn_k.weight" => return Source::slice(&packed, q..q + kv),
+            "attn_v.weight" => return Source::slice(&packed, q + kv..q + 2 * kv),
+            _ => {}
+        }
+    }
+    if arch.packs_gate_up() {
+        // Gate first, then up — the order llama.cpp's converter writes
+        // them in. Reversed, the gate would silently become the value it
+        // is supposed to multiply.
+        let packed = format!("{prefix}.ffn_up.weight");
+        match leaf {
+            "ffn_gate.weight" => return Source::slice(&packed, 0..ffn),
+            "ffn_up.weight" => return Source::slice(&packed, ffn..2 * ffn),
+            _ => {}
+        }
+    }
+    Source::whole(param)
+}
+
+/// Split `blk.<n>.<part>.<kind>` into `blk.<n>` and `<part>.<kind>`.
+fn split_block_leaf(param: &str) -> Option<(&str, &str)> {
+    let (head, kind) = param.rsplit_once('.')?;
+    let (prefix, part) = head.rsplit_once('.')?;
+    let leaf_start = param.len() - (part.len() + 1 + kind.len());
+    Some((prefix, &param[leaf_start..]))
 }
 
 /// Declare a projection weight in the dtype the file stores it in.
@@ -472,16 +626,25 @@ fn bias(
 fn projection(
     g: &mut Graph,
     model: &GgufModel,
+    config: &ModelConfig,
     name: &str,
     shape: &[usize; 2],
 ) -> Result<NodeId, GgufError> {
-    let tensor = require_tensor(model, name)?;
-    if tensor.dims.len() != 2 || tensor.dims[0] != shape[0] || tensor.dims[1] != shape[1] {
+    let source = source_of(config, name);
+    let tensor = require_tensor(model, &source.tensor)?;
+    // A sliced source is checked against the range it must contain; a
+    // whole one against the shape the architecture gives it.
+    let rows = source.rows.clone().map_or(shape[1], |r| r.len());
+    let expected_rows = source.rows.as_ref().map_or(shape[1], |r| r.end);
+    if tensor.dims.len() != 2 || tensor.dims[0] != shape[0] || tensor.dims[1] < expected_rows {
         return Err(GgufError::MissingTensor(format!(
-            "`{name}` is {:?}, but the architecture makes it {shape:?}",
-            tensor.dims
+            "`{}` is {:?}, but `{name}` needs {:?} of it",
+            source.tensor,
+            tensor.dims,
+            [shape[0], expected_rows]
         )));
     }
+    debug_assert_eq!(rows, shape[1]);
     Ok(parameter_of(g, name, shape, weight_dtype(tensor)?))
 }
 
@@ -551,9 +714,6 @@ pub fn parameter_names(config: &ModelConfig) -> Vec<String> {
         }
         for part in ["attn_q", "attn_k", "attn_v", "attn_output"] {
             names.push(format!("{p}.{part}.weight"));
-            if arch.qkv_bias() {
-                names.push(format!("{p}.{part}.bias"));
-            }
         }
         if arch.qk_norm() {
             names.push(format!("{p}.attn_q_norm.weight"));
@@ -568,13 +728,27 @@ pub fn parameter_names(config: &ModelConfig) -> Vec<String> {
         }
         if arch.gated_ffn() {
             names.push(format!("{p}.ffn_gate.weight"));
-            names.push(format!("{p}.ffn_up.weight"));
-        } else {
-            names.push(format!("{p}.ffn_up.weight"));
-            names.push(format!("{p}.ffn_up.bias"));
-            names.push(format!("{p}.ffn_down.bias"));
         }
+        names.push(format!("{p}.ffn_up.weight"));
         names.push(format!("{p}.ffn_down.weight"));
+    }
+    names
+}
+
+/// The bias parameters [`build`] will add *if* the file carries them.
+///
+/// Separate from [`parameter_names`] because these are not required: an
+/// absent bias is a zero bias and the graph simply omits the add. The
+/// loader needs the list to fill the ones that are present.
+pub fn optional_parameter_names(config: &ModelConfig) -> Vec<String> {
+    let mut names = Vec::new();
+    for layer in 0..config.num_layers {
+        let p = format!("blk.{layer}");
+        for part in ["attn_q", "attn_k", "attn_v", "attn_output"] {
+            names.push(format!("{p}.{part}.bias"));
+        }
+        names.push(format!("{p}.ffn_up.bias"));
+        names.push(format!("{p}.ffn_down.bias"));
     }
     names
 }
