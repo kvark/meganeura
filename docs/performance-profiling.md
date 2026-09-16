@@ -43,7 +43,9 @@ Inferena writes one sidecar per execution mode under
 
 Set `MEGANEURA_GPU_TIMING=1` before constructing the first GPU context. Blade
 then allocates hardware timestamp queries. During structured capture,
-Meganeura deliberately records one compute pass per plan dispatch. Once the
+Meganeura deliberately records one compute pass per timed plan dispatch — see
+"Plans larger than the timestamp budget" below for what happens to the rest.
+Once the
 completion fence signals, Blade resolves every pass start and the final
 completion timestamp directly onto the process monotonic clock; no follow-up
 execution is needed.
@@ -74,7 +76,7 @@ The separate median of each family's per-run total is retained as well.
 
 Call `meganeura::profiler::capture_session_profile` after the normal benchmark
 and pass the normal median through `CaptureOptions::unprofiled_median_ms`.
-The input-preparation closure runs once before each retained execution.
+The input-preparation closure runs once before each replay.
 
 The collector describes dispatches in the compiled execution plan. Disable
 optimizer, gradient-accumulation, and gradient-clipping passes before capture;
@@ -82,8 +84,32 @@ those passes are appended by the runtime and do not have plan metadata. The
 collector rejects a timestamp-count mismatch instead of silently assigning
 an auxiliary pass to the wrong shader.
 
-Blade currently supports at most 1,000 timed passes per command encoder. The
-collector reports an explicit error if a plan exceeds that limit.
+## Plans larger than the timestamp budget
+
+Blade writes at most `limits::PASS_COUNT` timestamps per submission and
+silently skips the rest, so no single replay can measure a larger plan — and a
+decode or training step of a real model runs well past that.
+
+The collector therefore splits such a plan into windows of dispatch indices
+and replays the session once per window. The window's dispatches each get
+their own timestamped pass; everything outside it still executes, but batched
+into one grouped pass on either side, which keeps the plan's barriers while
+costing only two of the timestamp slots however many dispatches are out there.
+The preparation closure runs before every replay, so each window observes the
+same execution, and the per-dispatch results are stitched back together. Every
+dispatch is still measured `samples` times; only the number of replays grows.
+
+`measurement.window_count` reports how many replays one sample took and is 1
+for a plan that fits, in which case capture behaves exactly as it did before.
+`CaptureOptions::max_timed_passes_per_replay` lowers the budget below Blade's
+limit, cutting the plan into more and smaller windows so that each replay
+perturbs the schedule less.
+
+When `window_count` exceeds 1, each `profiled_wall_samples_ms` entry is the sum
+of all replay wall times needed for that sample. Consequently,
+`instrumentation_wall_ratio` reports total capture cost rather than the
+perturbation of one execution. `gpu_total_samples_ms` likewise sums a sample's
+windows, so both aggregates still describe one complete profile sample.
 
 ## Escalating beyond the built-in profile
 

@@ -9,6 +9,72 @@
 
 use naga::Module;
 
+/// How a K-split GEMV combines the per-lane partial sums.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum GemvReduction {
+    /// Halving tree through workgroup memory, one `workgroupBarrier` per
+    /// level. Portable and the historical default.
+    Tree,
+    /// One `subgroupAdd` per wave, then a single partial per wave through
+    /// workgroup memory. The wave-wide add replaces `log2(wave)` tree levels
+    /// and their barriers, so the wider the wave the more it removes — six
+    /// levels on AMD's 64-wide wave against five on a 32-wide one.
+    ///
+    /// Subgroup leaders claim workgroup slots dynamically, so this does not
+    /// assume a subgroup width or a mapping from local lanes to subgroups.
+    Subgroup,
+}
+
+/// Workgroup width and reduction style for the K-split GEMV family.
+///
+/// Every GEMV kernel — plain, fused-add, transposed-B, f16, block-packed and
+/// RmsNorm-folded — is derived from `matmul_gemv.wgsl` and shaped here, so
+/// this is one axis across all of them rather than a choice per kernel.
+/// Which shape wins is a property of the device, not of the graph, so it is
+/// measured rather than predicted: see `Session::tune_with`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct GemvShape {
+    /// Threads per workgroup: 32, 64, 128 or 256.
+    pub threads: u32,
+    pub reduction: GemvReduction,
+}
+
+impl GemvShape {
+    /// Widths a K-split GEMV can be generated at.
+    pub const WIDTHS: [u32; 4] = [32, 64, 128, 256];
+
+    /// The shape a group is generated with when nothing has chosen one.
+    ///
+    /// Every GEMV kernel is written at the width that suits its own access
+    /// pattern — the plain form wide enough to hide DRAM latency at M=1, the
+    /// fused-add and transposed forms narrow enough to stay coalesced — so
+    /// the default is per group rather than one number.
+    ///
+    /// [`crate::compile::CompileOptions::gemv_shape`] replaces it, and
+    /// measurement challenges whichever is in force.
+    pub(crate) fn initial(group: ShaderGroup) -> Self {
+        let threads = match group {
+            ShaderGroup::MatMulGemv => 256,
+            ShaderGroup::MatMulGemvAdd | ShaderGroup::MatMulGemvBT => 32,
+            _ => panic!("{group:?} is not a GEMV group"),
+        };
+        Self {
+            threads,
+            reduction: GemvReduction::Tree,
+        }
+    }
+
+    /// Reject a width no GEMV source can be generated at.
+    pub(crate) fn validate(self) {
+        assert!(
+            Self::WIDTHS.contains(&self.threads),
+            "GEMV workgroup width must be one of {:?}, got {}",
+            Self::WIDTHS,
+            self.threads
+        );
+    }
+}
+
 /// Configuration for cooperative matrix tile size and precision.
 ///
 /// Derived from `blade_graphics::CooperativeMatrix` capabilities at runtime.
@@ -485,17 +551,9 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         }
         ShaderGroup::MatMulATAdd => gen_matmul_at_add(),
         ShaderGroup::MatMulBTAdd => gen_matmul_bt_add(),
-        ShaderGroup::MatMulGemv => parse_wgsl(&gemv_width_source(
-            include_str!("shaders/matmul_gemv.wgsl"),
-            "MEGANEURA_GEMV_THREADS",
-            256,
-        )),
-        ShaderGroup::MatMulGemvAdd => parse_wgsl(&gemv_width_source(
-            include_str!("shaders/matmul_gemv_add.wgsl"),
-            "MEGANEURA_GEMV_ADD_THREADS",
-            32,
-        )),
-        ShaderGroup::MatMulGemvBT => parse_wgsl(include_str!("shaders/matmul_gemv_bt.wgsl")),
+        ShaderGroup::MatMulGemv | ShaderGroup::MatMulGemvAdd | ShaderGroup::MatMulGemvBT => {
+            generate_module_gemv(group, WeightFormat::F32, GemvShape::initial(group))
+        }
         ShaderGroup::Reduce => parse_wgsl(include_str!("shaders/reduce.wgsl")),
         ShaderGroup::Softmax => parse_wgsl(include_str!("shaders/softmax.wgsl")),
         ShaderGroup::CrossEntropy => parse_wgsl(include_str!("shaders/cross_entropy.wgsl")),
@@ -1165,6 +1223,12 @@ fn matmul_vars_tiled(
             "dequant_q8(b_row, b_col)".to_string(),
             format!("{F16_DECODE_FN}{Q8_DEQUANT_FN}"),
         ),
+        WeightFormat::Q40 => (
+            "",
+            "array<u32>",
+            "dequant_q40(b_row, b_col)".to_string(),
+            format!("{F16_DECODE_FN}{Q40_DEQUANT_FN}"),
+        ),
         WeightFormat::Q4K => (
             "",
             "array<u32>",
@@ -1299,6 +1363,14 @@ const F16_DECODE_FN: &str = include_str!("shaders/dequant_f16_decode.wgsl");
 /// `dequant_q4` stays the scalar entry used by GEMV. Tiled staging uses
 /// `dequant_q4_pack8`: one (d, m) header and one data word → 8 values.
 const Q4_DEQUANT_FN: &str = include_str!("shaders/dequant_q4.wgsl");
+
+/// GGML's own Q4_0: 18-byte blocks of an f16 `d` and 16 nibble bytes, read
+/// byte-addressed because 18 is not a whole number of words.
+///
+/// Distinct from [`Q4_DEQUANT_FN`] in both the arithmetic — symmetric
+/// `d * (q - 8)` against Meganeura's `q * d + m` — and the nibble order:
+/// GGML splits a block across halves where Meganeura pairs neighbours.
+const Q40_DEQUANT_FN: &str = include_str!("shaders/dequant_q40.wgsl");
 
 /// The `get_scale_min_k4` scale/min decoder, shared by Q4_K and Q5_K.
 ///
@@ -1718,25 +1790,9 @@ pub fn generate_module_weighted(group: ShaderGroup, format: WeightFormat) -> Sha
         // Every block-packed format takes the same K-split GEMV with its
         // own decoder substituted, so the format picks the helper rather
         // than the arm.
-        ShaderGroup::MatMulGemv | ShaderGroup::MatMulGemvAdd if packed_decoder(mode).is_some() => {
-            let (helpers, call) = packed_decoder(mode).unwrap();
-            let helpers = helpers.as_str();
-            let src = if group == ShaderGroup::MatMulGemv {
-                include_str!("shaders/matmul_gemv.wgsl")
-            } else {
-                include_str!("shaders/matmul_gemv_add.wgsl")
-            };
-            gen_matmul_gemv_packed(src, helpers, call)
+        ShaderGroup::MatMulGemv | ShaderGroup::MatMulGemvAdd | ShaderGroup::MatMulGemvBT => {
+            generate_module_gemv(group, mode, GemvShape::initial(group))
         }
-        ShaderGroup::MatMulGemv | ShaderGroup::MatMulGemvAdd if mode == WeightFormat::F16 => {
-            let src = if group == ShaderGroup::MatMulGemv {
-                include_str!("shaders/matmul_gemv.wgsl")
-            } else {
-                include_str!("shaders/matmul_gemv_add.wgsl")
-            };
-            gen_matmul_gemv_f16(src)
-        }
-        ShaderGroup::MatMulGemvBT if mode == WeightFormat::F16 => gen_matmul_gemv_bt_f16(),
         // Unsupported packed routes must fail closed: falling through would
         // read compressed bytes as f32 and produce plausible garbage.
         _ if mode.is_quantized() => panic!(
@@ -1747,52 +1803,69 @@ pub fn generate_module_weighted(group: ShaderGroup, format: WeightFormat) -> Sha
     }
 }
 
+/// Substitute `old` for `new`, refusing to do nothing.
+///
+/// These kernels are built by rewriting a source that someone else is free
+/// to edit. A replacement whose anchor has drifted is not a no-op with a
+/// slightly different kernel at the end of it — it is a kernel missing a
+/// declaration or a stride, which surfaces as a parse error at best and a
+/// wrong answer at worst. Failing here names the anchor instead.
+fn substitute(source: &str, old: &str, new: &str) -> String {
+    assert!(
+        source.contains(old),
+        "GEMV substitution anchor is no longer present: {old:?}"
+    );
+    source.replace(old, new)
+}
+
 /// The K-split GEMV with the RmsNorm of its input folded in:
-///   C[1, N] = (rmsnorm(A) * norm_w) x B[K, N]
+/// `C[1, N] = (rmsnorm(A) * norm_w) × B[K, N]`.
 ///
-/// Derived from `matmul_gemv.wgsl` by substitution rather than kept as a
-/// second copy, so improvements to the canonical GEMV — tile shape, thread
-/// count, reduction — reach this variant automatically.
-///
-/// The prologue is a workgroup-wide sum of squares over A, which every
-/// consuming workgroup recomputes. That is cheap: A is a few kilobytes
-/// read by all of them at once, so it is an L2 broadcast, and it buys the
-/// removal of the separate RmsNorm dispatch and the boundary after it.
-pub fn generate_module_gemv_rmsnorm() -> ShaderModule {
+/// Derived from `matmul_gemv.wgsl` by substitution so shape and reduction
+/// changes reach it automatically. Each consuming workgroup recomputes the
+/// small sum-of-squares prologue, avoiding a separate dispatch and boundary.
+pub fn generate_module_gemv_rmsnorm(shape: GemvShape) -> ShaderModule {
     // `_pad` carries eps; the fused kernel needs no other new parameter.
-    let src = include_str!("shaders/matmul_gemv.wgsl")
-        .replace("    _pad: u32,", "    eps_bits: u32,")
-        .replace(
-            "var<storage> matrix_b: array<vec4<f32>>;",
-            "var<storage> norm_w: array<f32>;\nvar<storage> matrix_b: array<vec4<f32>>;",
-        )
-        .replace(
-            "var<workgroup> reduce_buf: array<vec4<f32>, 256>;",
-            "var<workgroup> reduce_buf: array<vec4<f32>, 256>;\n\
-             var<workgroup> scale_buf: array<f32, 256>;\n\
-             var<workgroup> inv_rms: f32;",
-        )
-        // The early-out must not precede the prologue's barriers, which every
-        // lane has to reach. The dispatch is exactly N/4 workgroups, so it
-        // never fires in practice, but keep it uniform regardless.
-        .replace(
-            "    if col4 >= n_v4 { return; }\n    let k = params.k;\n",
-            "    let k = params.k;\n",
-        )
-        .replace(
-            "    // Each thread accumulates a partial sum over its K-stride slice.",
-            "    // Prologue: sum of squares over A, reduced across the workgroup.\n\
+    let src = substitute(
+        include_str!("shaders/matmul_gemv.wgsl"),
+        "    _pad: u32,",
+        "    eps_bits: u32,",
+    );
+    let src = substitute(
+        &src,
+        "var<storage> matrix_b: array<vec4<f32>>;",
+        "var<storage> norm_w: array<f32>;\nvar<storage> matrix_b: array<vec4<f32>>;",
+    );
+    let src = substitute(
+        &src,
+        "var<workgroup> reduce_buf: array<vec4<f32>, LANES>;",
+        "var<workgroup> reduce_buf: array<vec4<f32>, LANES>;\n\
+         var<workgroup> scale_buf: array<f32, LANES>;\n\
+         var<workgroup> inv_rms: f32;",
+    );
+    // The early-out must not precede the prologue's barriers, which every
+    // lane has to reach. The dispatch is exactly N/4 workgroups, so it
+    // never fires in practice, but keep it uniform regardless.
+    let src = substitute(
+        &src,
+        "    if col4 >= n_v4 { return; }\n    let k = params.k;\n",
+        "    let k = params.k;\n",
+    );
+    let src = substitute(
+        &src,
+        "    // Each thread accumulates a partial sum over its K-stride slice.",
+        "    // Prologue: sum of squares over A, reduced across the workgroup.\n\
     var ss = 0.0;\n\
     var si = lane;\n\
     loop {\n\
         if si >= k { break; }\n\
         let v = matrix_a[si];\n\
         ss += v * v;\n\
-        si += 256u;\n\
+        si += LANES;\n\
     }\n\
     scale_buf[lane] = ss;\n\
     workgroupBarrier();\n\
-    var sstride = 128u;\n\
+    var sstride = LANES / 2u;\n\
     loop {\n\
         if sstride == 0u { break; }\n\
         if lane < sstride { scale_buf[lane] += scale_buf[lane + sstride]; }\n\
@@ -1807,42 +1880,58 @@ pub fn generate_module_gemv_rmsnorm() -> ShaderModule {
     if col4 >= n_v4 { return; }\n\
 \n\
     // Each thread accumulates a partial sum over its K-stride slice.",
-        )
-        .replace(
-            "        let a = matrix_a[kk];",
-            "        let a = matrix_a[kk] * rs * norm_w[kk];",
-        );
-    parse_wgsl(&gemv_width_source(&src, "MEGANEURA_GEMV_THREADS", 256))
+    );
+    let src = substitute(
+        &src,
+        "        let a = matrix_a[kk];",
+        "        let a = matrix_a[kk] * rs * norm_w[kk];",
+    );
+    parse_wgsl(&gemv_shape_source(&src, shape))
 }
 
-fn gemv_width_source(source: &str, variable: &str, initial: u32) -> String {
-    let threads = match std::env::var(variable) {
-        Err(_) => return source.to_owned(),
-        Ok(value) => value.parse::<u32>().expect("GEMV workgroup width"),
-    };
-    assert!(matches!(threads, 32 | 64 | 128 | 256));
-    if threads == initial {
-        return source.to_owned();
-    }
-    let mut source = source
-        .replace(
-            &format!("@workgroup_size({initial})"),
-            &format!("@workgroup_size({threads})"),
-        )
-        .replace(
-            &format!("array<vec4<f32>, {initial}>"),
-            &format!("array<vec4<f32>, {threads}>"),
-        )
-        .replace(
-            &format!("array<f32, {initial}>"),
-            &format!("array<f32, {threads}>"),
-        )
-        .replace(&format!("kk += {initial}u;"), &format!("kk += {threads}u;"))
-        .replace(&format!("si += {initial}u;"), &format!("si += {threads}u;"))
-        .replace(
-            &format!("var sstride = {}u;", initial / 2),
-            &format!("var sstride = {}u;", threads / 2),
-        );
+const LANES_PREFIX: &str = "const LANES: u32 = ";
+
+/// The width a GEMV source is written against, from its `LANES` constant.
+///
+/// Every kernel in the family declares that constant once and derives its
+/// workgroup size, its `reduce_buf` extent and every loop stride from it, so
+/// rewriting the declaration rewrites all of them at once. That matters more
+/// than it looks: the strides are not spelled the same way across the family
+/// — elements here, vec4s in the transposed form, whole blocks in the
+/// int-dot one — and rewriting them one variable name at a time left the
+/// transposed kernel counting overlapping ranges at every width but its
+/// declared one.
+fn gemv_declared_threads(source: &str) -> u32 {
+    let start = source.find(LANES_PREFIX).expect("GEMV LANES constant") + LANES_PREFIX.len();
+    let end = start + source[start..].find('u').expect("GEMV LANES literal");
+    source[start..end]
+        .trim()
+        .parse()
+        .expect("GEMV LANES is a literal")
+}
+
+/// Rewrite a GEMV source to the requested workgroup width and reduction.
+///
+/// The sources are written for readability at their declared width with a
+/// spelled-out halving tree; both are regenerated here. Everything outside
+/// the reduction — the K-stride loop, the store expression, any fused add or
+/// decoder — is untouched, so this composes with the format-specific
+/// substitutions rather than duplicating them.
+fn gemv_shape_source(source: &str, shape: GemvShape) -> String {
+    // Every generated GEMV passes through here, whether its shape came from
+    // the caller's configuration or from measurement, so this is the one
+    // place a width that no source can be built at has to be refused.
+    shape.validate();
+    let initial = gemv_declared_threads(source);
+    let threads = shape.threads;
+    let declaration = format!("{LANES_PREFIX}{initial}u;");
+    assert_eq!(
+        source.matches(declaration.as_str()).count(),
+        1,
+        "a GEMV source must declare LANES exactly once"
+    );
+    let mut source = source.replace(&declaration, &format!("{LANES_PREFIX}{threads}u;"));
+
     let start = source
         .find("    reduce_buf[lane] = acc;")
         .expect("GEMV reduction");
@@ -1850,15 +1939,84 @@ fn gemv_width_source(source: &str, variable: &str, initial: u32) -> String {
         + source[start..]
             .find("    if lane == 0u")
             .expect("GEMV store");
-    let mut reduction = "    reduce_buf[lane] = acc;\n    workgroupBarrier();\n".to_owned();
-    let mut stride = threads / 2;
-    while stride > 1 {
-        reduction.push_str(&format!(
-            "    if lane < {stride}u {{ reduce_buf[lane] += reduce_buf[lane + {stride}u]; }}\n    workgroupBarrier();\n"
-        ));
-        stride /= 2;
-    }
+    let reduction = match shape.reduction {
+        GemvReduction::Tree => {
+            let mut body = "    reduce_buf[lane] = acc;\n    workgroupBarrier();\n".to_owned();
+            let mut stride = threads / 2;
+            while stride > 1 {
+                body.push_str(&format!(
+                    "    if lane < {stride}u {{ reduce_buf[lane] += reduce_buf[lane + {stride}u]; }}\n    workgroupBarrier();\n"
+                ));
+                stride /= 2;
+            }
+            body
+        }
+        // One partial per wave reaches workgroup memory, and lane 0 sums the
+        // few that do.
+        //
+        // Neither the slot nor the leader may be derived from the local
+        // invocation id. WGSL and Vulkan both decline to relate
+        // `local_invocation_id` to subgroup membership, so `lane / sg_size`
+        // is not a subgroup index and `sg_id == 0` need not name exactly one
+        // invocation per subgroup — a wave holding the odd local ids, or a
+        // partially populated one, breaks both. Instead each wave's leader,
+        // elected by `subgroupBroadcastFirst`, claims a slot with an atomic,
+        // and the count comes back from the same counter. That costs one
+        // extra barrier to zero the counter, so two rather than the tree's
+        // one per halving level.
+        GemvReduction::Subgroup => {
+            let _ = threads;
+            "    if lane == 0u { atomicStore(&wave_slots, 0u); }\n\
+             \x20   workgroupBarrier();\n\
+             \x20   let wave_total = subgroupAdd(acc);\n\
+             \x20   if sg_id == subgroupBroadcastFirst(sg_id) {\n\
+             \x20       reduce_buf[atomicAdd(&wave_slots, 1u)] = wave_total;\n\
+             \x20   }\n\
+             \x20   workgroupBarrier();\n\
+             \x20   if lane == 0u {\n\
+             \x20       let waves = atomicLoad(&wave_slots);\n\
+             \x20       var total = reduce_buf[0];\n\
+             \x20       var g = 1u;\n\
+             \x20       loop {\n\
+             \x20           if g >= waves { break; }\n\
+             \x20           total = total + reduce_buf[g];\n\
+             \x20           g = g + 1u;\n\
+             \x20       }\n\
+             \x20       reduce_buf[0] = total;\n\
+             \x20   }\n"
+                .to_owned()
+        }
+    };
     source.replace_range(start..end, &reduction);
+
+    if shape.reduction == GemvReduction::Subgroup {
+        // Lane 0 already holds the whole workgroup's sum, so the store must
+        // not fold in a second slot. The store expression is otherwise left
+        // alone, which is what keeps the fused-add and transposed-B forms
+        // working without their own reduction code.
+        let folded = source.replace("reduce_buf[0] + reduce_buf[1]", "reduce_buf[0]");
+        assert_ne!(folded, source, "GEMV store did not fold two reduce slots");
+        source = folded;
+        let signature = "@builtin(local_invocation_id) lid: vec3<u32>)";
+        let with_builtins = source.replace(
+            signature,
+            "@builtin(local_invocation_id) lid: vec3<u32>, \
+             @builtin(subgroup_invocation_id) sg_id: u32)",
+        );
+        assert_ne!(with_builtins, source, "GEMV entry point signature changed");
+        source = with_builtins;
+
+        // The slot counter lives next to the buffer it indexes, and only the
+        // subgroup form declares it: the tree has no use for it and should
+        // not spend workgroup memory on it.
+        let anchor = "var<workgroup> reduce_buf:";
+        let with_counter = source.replace(
+            anchor,
+            &format!("var<workgroup> wave_slots: atomic<u32>;\n{anchor}"),
+        );
+        assert_ne!(with_counter, source, "GEMV workgroup buffer declaration");
+        source = with_counter;
+    }
     source
 }
 
@@ -1883,6 +2041,7 @@ fn packed_decoder(mode: WeightFormat) -> Option<(String, &'static str)> {
     match mode {
         WeightFormat::Q4 => Some((Q4_DEQUANT_FN.to_string(), "dequant_q4")),
         WeightFormat::Q8 => Some((Q8_DEQUANT_FN.to_string(), "dequant_q8")),
+        WeightFormat::Q40 => Some((Q40_DEQUANT_FN.to_string(), "dequant_q40")),
         WeightFormat::Q4K => Some((format!("{K_SCALE_MIN_FN}{Q4K_DEQUANT_FN}"), "dequant_q4k")),
         WeightFormat::Q6K => Some((Q6K_DEQUANT_FN.to_string(), "dequant_q6k")),
         WeightFormat::Q5K => Some((format!("{K_SCALE_MIN_FN}{Q5K_DEQUANT_FN}"), "dequant_q5k")),
@@ -1896,36 +2055,122 @@ fn packed_decoder(mode: WeightFormat) -> Option<(String, &'static str)> {
 /// The GEMV reads B as `vec4<f32>` rows; `helpers` supplies the WGSL dequant
 /// functions and `call` names the scalar entry point, so the four columns of
 /// each vec4 are decoded individually instead of loaded.
-fn gen_matmul_gemv_packed(src: &str, helpers: &str, call: &str) -> ShaderModule {
-    let src = src
-        .replace(
-            "var<storage> matrix_b: array<vec4<f32>>;",
-            "var<storage> matrix_b: array<u32>;",
-        )
-        .replace(
-            "@compute @workgroup_size(",
-            &format!("{F16_DECODE_FN}{helpers}\n@compute @workgroup_size("),
-        )
-        .replace(
-            "let b = matrix_b[kk * n_v4 + col4];",
-            &format!(
-                "let col = col4 * 4u;\n\
+/// The WGSL for one GEMV group and weight format, at its declared width.
+///
+/// Shaping is deliberately not done here: [`gemv_shape_source`] applies it
+/// once, afterwards, so a width or reduction choice reaches the f16 and
+/// block-packed forms without each substitution having to know about it.
+fn gemv_source(group: ShaderGroup, mode: WeightFormat) -> String {
+    let base = match group {
+        ShaderGroup::MatMulGemv => include_str!("shaders/matmul_gemv.wgsl"),
+        ShaderGroup::MatMulGemvAdd => include_str!("shaders/matmul_gemv_add.wgsl"),
+        ShaderGroup::MatMulGemvBT => include_str!("shaders/matmul_gemv_bt.wgsl"),
+        _ => panic!("{group:?} is not a GEMV group"),
+    };
+    match (group, mode) {
+        (_, WeightFormat::F32) => base.to_owned(),
+        (ShaderGroup::MatMulGemvBT, WeightFormat::F16) => gemv_bt_f16_source(base),
+        (_, WeightFormat::F16) => gemv_f16_source(base),
+        // Blocks run along the parameter's first dimension, which is N for a
+        // transposed B, while every packed decoder indexes along K. The
+        // kernel would return plausible but wrong numbers, so refuse.
+        (ShaderGroup::MatMulGemvBT, _) => panic!(
+            "no {mode:?} variant for {group:?}; block-quantized weights run \
+             their blocks along K and cannot serve a transposed B"
+        ),
+        _ => {
+            let (helpers, call) = packed_decoder(mode).unwrap_or_else(|| {
+                panic!("no {mode:?} decoder for {group:?}");
+            });
+            gemv_packed_source(base, helpers.as_str(), call)
+        }
+    }
+}
+
+/// The Q8_1-activation, integer-dot GEMV at an explicit shape.
+///
+/// Only GGML Q4_0 feeds this: its split-nibble blocks hand out two int8x4
+/// vectors of consecutive elements per word, which is exactly what
+/// `dot4I8Packed` wants. See `shaders/matmul_gemv_q40_q8.wgsl`.
+pub(crate) fn generate_module_gemv_int_dot(group: ShaderGroup, shape: GemvShape) -> ShaderModule {
+    // Blade's Vulkan backend does not yet query/enable
+    // `shaderIntegerDotProduct`; letting naga emit OpSDot there produces an
+    // invalid pipeline even on devices that support the instruction. Metal
+    // has no opt-in feature, so retain the packed intrinsic on Apple and use
+    // the exact scalar expansion elsewhere.
+    let helper = if cfg!(target_vendor = "apple") {
+        "fn dot_q4_q8_packed(q4: u32, q8: u32) -> i32 {\n\
+             return dot4I8Packed(q4, q8);\n\
+         }"
+    } else {
+        "fn dot_q4_q8_packed(q4: u32, q8: u32) -> i32 {\n\
+             var sum: i32 = 0;\n\
+             for (var shift = 0u; shift < 32u; shift += 8u) {\n\
+                 let w = i32((q4 >> shift) & 0xFFu);\n\
+                 let byte = i32((q8 >> shift) & 0xFFu);\n\
+                 let a = select(byte, byte - 256, byte >= 128);\n\
+                 sum += w * a;\n\
+             }\n\
+             return sum;\n\
+         }"
+    };
+    let (addend_decl, addend) = match group {
+        ShaderGroup::MatMulGemv => ("", ""),
+        ShaderGroup::MatMulGemvAdd => ("var<storage> src: array<vec4<f32>>;", " + src[col4]"),
+        _ => panic!("no int-dot variant for {group:?}"),
+    };
+    let source = preprocess(
+        include_str!("shaders/matmul_gemv_q40_q8.wgsl"),
+        &[
+            ("$PACKED_DOT_HELPER", helper),
+            ("$ADDEND_DECL", addend_decl),
+            ("$ADDEND", addend),
+        ],
+    );
+    parse_wgsl(&gemv_shape_source(&source, shape))
+}
+
+/// Generate one GEMV pipeline at an explicit shape.
+///
+/// `generate_module` and `generate_module_weighted` call this with
+/// [`GemvShape::initial`]; the tuner calls it with whichever shape it is
+/// measuring.
+pub(crate) fn generate_module_gemv(
+    group: ShaderGroup,
+    mode: WeightFormat,
+    shape: GemvShape,
+) -> ShaderModule {
+    parse_wgsl(&gemv_shape_source(&gemv_source(group, mode), shape))
+}
+
+fn gemv_packed_source(src: &str, helpers: &str, call: &str) -> String {
+    src.replace(
+        "var<storage> matrix_b: array<vec4<f32>>;",
+        "var<storage> matrix_b: array<u32>;",
+    )
+    .replace(
+        "@compute @workgroup_size(",
+        &format!("{F16_DECODE_FN}{helpers}\n@compute @workgroup_size("),
+    )
+    .replace(
+        "let b = matrix_b[kk * n_v4 + col4];",
+        &format!(
+            "let col = col4 * 4u;\n\
         let b = vec4<f32>(\n\
             {call}(kk, col),\n\
             {call}(kk, col + 1u),\n\
             {call}(kk, col + 2u),\n\
             {call}(kk, col + 3u),\n\
         );"
-            ),
-        );
-    parse_wgsl(&src)
+        ),
+    )
 }
 
-fn gen_matmul_gemv_f16(src: &str) -> ShaderModule {
+fn gemv_f16_source(src: &str) -> String {
     // `enable` directives must precede every declaration, so prepend rather
     // than splice at the matrix_b declaration - spliced there it landed
     // after matrix_a and the shader could never compile.
-    let src = "enable f16;\n".to_string()
+    "enable f16;\n".to_string()
         + &src
             .replace(
                 "var<storage> matrix_b: array<vec4<f32>>;",
@@ -1934,13 +2179,12 @@ fn gen_matmul_gemv_f16(src: &str) -> ShaderModule {
             .replace(
                 "let b = matrix_b[kk * n_v4 + col4];",
                 "let b = vec4<f32>(matrix_b[kk * n_v4 + col4]);",
-            );
-    parse_wgsl(&src)
+            )
 }
 
-fn gen_matmul_gemv_bt_f16() -> ShaderModule {
-    let src = "enable f16;\n".to_string()
-        + &include_str!("shaders/matmul_gemv_bt.wgsl")
+fn gemv_bt_f16_source(src: &str) -> String {
+    "enable f16;\n".to_string()
+        + &src
             .replace(
                 "var<storage> matrix_b: array<vec4<f32>>;",
                 "var<storage> matrix_b: array<vec4<f16>>;",
@@ -1950,8 +2194,7 @@ fn gen_matmul_gemv_bt_f16() -> ShaderModule {
             .replace(
                 "let b = matrix_b[row_off + kk_v4];",
                 "let b = vec4<f32>(matrix_b[row_off + kk_v4]);",
-            );
-    parse_wgsl(&src)
+            )
 }
 
 fn gen_matmul_coop_wgsl(
@@ -5593,14 +5836,19 @@ mod tests {
             ),
             (ShaderGroup::MatMulATAdd, naga::valid::Capabilities::empty()),
             (ShaderGroup::MatMulBTAdd, naga::valid::Capabilities::empty()),
-            (ShaderGroup::MatMulGemv, naga::valid::Capabilities::empty()),
+            // The GEMV family's reduction is a generation-time choice, and
+            // the subgroup form needs `SUBGROUP`. Derive the requirement from
+            // the shape these groups are actually generated with rather than
+            // asserting the tree's, or this table silently stops describing
+            // what `generate_module` emits.
+            (ShaderGroup::MatMulGemv, gemv_caps(ShaderGroup::MatMulGemv)),
             (
                 ShaderGroup::MatMulGemvAdd,
-                naga::valid::Capabilities::empty(),
+                gemv_caps(ShaderGroup::MatMulGemvAdd),
             ),
             (
                 ShaderGroup::MatMulGemvBT,
-                naga::valid::Capabilities::empty(),
+                gemv_caps(ShaderGroup::MatMulGemvBT),
             ),
             (ShaderGroup::Reduce, naga::valid::Capabilities::empty()),
             (ShaderGroup::Softmax, naga::valid::Capabilities::empty()),
@@ -6510,12 +6758,194 @@ mod tests {
         }
     }
 
+    /// Naga capabilities a GEMV group's generated module needs.
+    fn gemv_caps(group: ShaderGroup) -> naga::valid::Capabilities {
+        match GemvShape::initial(group).reduction {
+            GemvReduction::Tree => naga::valid::Capabilities::empty(),
+            GemvReduction::Subgroup => naga::valid::Capabilities::SUBGROUP,
+        }
+    }
+
+    /// Every shape must parse, validate and keep the kernel's own store.
+    ///
+    /// The shapes are generated by substitution into one source per group, so
+    /// the risk is not that a shape is wrong in isolation but that it fails to
+    /// compose with a format's substitutions — the fused add's extra `src`
+    /// term, or a decoder call spliced where the vec4 load used to be. Each is
+    /// run through naga's validator with exactly the capabilities
+    /// its reduction justifies, so a shape that produces invalid WGSL — or one
+    /// that quietly starts needing a capability the caller does not request —
+    /// fails here rather than at pipeline creation on someone's GPU.
+    #[test]
+    fn every_gemv_shape_composes_with_every_weight_format() {
+        let formats = [
+            (WeightFormat::F32, "matrix_b: array<vec4<f32>>"),
+            (WeightFormat::F16, "array<vec4<f16>>"),
+            (WeightFormat::Q4, "dequant_q4("),
+            (WeightFormat::Q8, "dequant_q8("),
+            (WeightFormat::Q40, "dequant_q40("),
+            (WeightFormat::Q4K, "dequant_q4k("),
+            (WeightFormat::Q6K, "dequant_q6k("),
+            (WeightFormat::Q5K, "dequant_q5k("),
+            (WeightFormat::Q3K, "dequant_q3k("),
+        ];
+        for (format, marker) in formats {
+            for group in [ShaderGroup::MatMulGemv, ShaderGroup::MatMulGemvAdd] {
+                for threads in [32, 64, 128, 256] {
+                    for reduction in [GemvReduction::Tree, GemvReduction::Subgroup] {
+                        let shape = GemvShape { threads, reduction };
+                        let module = generate_module_gemv(group, format, shape);
+                        let caps = match reduction {
+                            GemvReduction::Tree => naga::valid::Capabilities::empty(),
+                            GemvReduction::Subgroup => naga::valid::Capabilities::SUBGROUP,
+                        } | match format {
+                            // f16 storage reads real `f16` values.
+                            WeightFormat::F16 => naga::valid::Capabilities::SHADER_FLOAT16,
+                            // Block scales are f16 bit patterns decoded with
+                            // `unpack2x16float` into f32, which is the weaker
+                            // capability — it needs no f16 arithmetic type.
+                            f if f.is_quantized() => {
+                                naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32
+                            }
+                            _ => naga::valid::Capabilities::empty(),
+                        };
+                        let flags = naga::valid::ValidationFlags::all()
+                            ^ naga::valid::ValidationFlags::BINDINGS;
+                        naga::valid::Validator::new(flags, caps)
+                            .validate(&module.module)
+                            .unwrap_or_else(|e| {
+                                panic!("{format:?} {group:?} {shape:?} failed validation: {e:#?}")
+                            });
+                        let source = module.source;
+                        assert!(
+                            source.contains(marker),
+                            "{format:?} {group:?} {shape:?} lost its B representation"
+                        );
+                        assert!(
+                            source.contains(&format!("{LANES_PREFIX}{threads}u;")),
+                            "{format:?} {group:?} {shape:?} kept the declared width"
+                        );
+                        let subgroup = reduction == GemvReduction::Subgroup;
+                        assert_eq!(
+                            source.contains("subgroupAdd"),
+                            subgroup,
+                            "{format:?} {group:?} {shape:?} reduction mismatch"
+                        );
+                        // The tree walks the workgroup in halves; the subgroup
+                        // form must leave the total in slot 0 alone.
+                        assert_eq!(
+                            source.contains("reduce_buf[0] + reduce_buf[1]"),
+                            !subgroup,
+                            "{format:?} {group:?} {shape:?} store expression mismatch"
+                        );
+                        // The fused add's own term survives the rewrite.
+                        if group == ShaderGroup::MatMulGemvAdd {
+                            assert!(
+                                source.contains("src[col4]"),
+                                "{format:?} {shape:?} dropped the fused addend"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The int-dot GEMV takes the same shape axis as the rest of the family.
+    ///
+    /// It is a separate source rather than a substitution into
+    /// `matmul_gemv.wgsl`, so nothing guarantees the shaping markers still
+    /// line up except checking. The source also pins the backend split: Metal
+    /// keeps the packed intrinsic, while Vulkan gets the portable expansion
+    /// until Blade exposes the required device feature.
+    #[test]
+    fn the_int_dot_gemv_takes_every_shape() {
+        for group in [ShaderGroup::MatMulGemv, ShaderGroup::MatMulGemvAdd] {
+            for threads in [32, 64, 128, 256] {
+                for reduction in [GemvReduction::Tree, GemvReduction::Subgroup] {
+                    let shape = GemvShape { threads, reduction };
+                    let module = generate_module_gemv_int_dot(group, shape);
+                    let caps = naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32
+                        | match reduction {
+                            GemvReduction::Tree => naga::valid::Capabilities::empty(),
+                            GemvReduction::Subgroup => naga::valid::Capabilities::SUBGROUP,
+                        };
+                    let flags = naga::valid::ValidationFlags::all()
+                        ^ naga::valid::ValidationFlags::BINDINGS;
+                    naga::valid::Validator::new(flags, caps)
+                        .validate(&module.module)
+                        .unwrap_or_else(|e| panic!("{group:?} {shape:?}: {e:#?}"));
+                    assert!(module.source.contains("fn dot_q4_q8_packed"));
+                    assert_eq!(
+                        module.source.contains("return dot4I8Packed(q4, q8)"),
+                        cfg!(target_vendor = "apple"),
+                        "{group:?} {shape:?}: wrong packed-dot implementation"
+                    );
+                    assert_eq!(
+                        module.source.contains("src[col4]"),
+                        group == ShaderGroup::MatMulGemvAdd,
+                        "{group:?} {shape:?}: wrong residual handling"
+                    );
+                    assert!(
+                        module
+                            .source
+                            .contains(&format!("{LANES_PREFIX}{threads}u;")),
+                        "{group:?} {shape:?}: wrong width"
+                    );
+                    assert!(module.source.contains("blk += LANES;"));
+                    assert_eq!(
+                        module.source.contains("subgroupAdd"),
+                        reduction == GemvReduction::Subgroup,
+                        "{group:?} {shape:?}: reduction mismatch"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The tree spends a barrier per halving level; the subgroup form spends
+    /// two whatever the width. That difference is the entire point of the
+    /// axis, so pin it rather than trusting the generated text to stay
+    /// correct.
+    #[test]
+    fn subgroup_reduction_replaces_the_barrier_chain() {
+        let barriers = |shape| {
+            generate_module_gemv(ShaderGroup::MatMulGemv, WeightFormat::F32, shape)
+                .source
+                .matches("workgroupBarrier()")
+                .count()
+        };
+        for threads in [32, 64, 128, 256] {
+            let tree = barriers(GemvShape {
+                threads,
+                reduction: GemvReduction::Tree,
+            });
+            let subgroup = barriers(GemvShape {
+                threads,
+                reduction: GemvReduction::Subgroup,
+            });
+            // One barrier to zero the slot counter and one after the
+            // leaders have claimed their slots. Constant in the width,
+            // which is the point.
+            assert_eq!(
+                subgroup, 2,
+                "the subgroup reduction needs exactly two barriers at {threads} threads"
+            );
+            assert_eq!(
+                tree,
+                threads.ilog2() as usize,
+                "the tree needs one barrier per halving level at {threads} threads"
+            );
+        }
+    }
+
     #[test]
     fn reduced_storage_gemv_variants_keep_typed_b() {
         for (format, marker) in [
             (WeightFormat::F16, "array<vec4<f16>>"),
             (WeightFormat::Q4, "dequant_q4("),
             (WeightFormat::Q8, "dequant_q8("),
+            (WeightFormat::Q40, "dequant_q40("),
             (WeightFormat::Q4K, "dequant_q4k("),
             (WeightFormat::Q6K, "dequant_q6k("),
             (WeightFormat::Q5K, "dequant_q5k("),
@@ -6655,8 +7085,11 @@ mod tests {
         for format in [
             WeightFormat::Q4,
             WeightFormat::Q8,
+            WeightFormat::Q40,
             WeightFormat::Q4K,
             WeightFormat::Q6K,
+            WeightFormat::Q5K,
+            WeightFormat::Q3K,
         ] {
             assert!(
                 std::panic::catch_unwind(|| {

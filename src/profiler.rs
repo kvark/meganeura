@@ -113,19 +113,49 @@ pub fn init_with_targets(additional_targets: &[&str]) {
     }
 }
 
+/// GPU pass timestamps copied out of Blade's borrowed view.
+///
+/// `blade_graphics::Timing` borrows its pass names from the encoder, which
+/// reuses that storage on the next submission, so anything kept past the
+/// harvest has to own them.
+#[derive(Clone, Debug, Default)]
+pub struct GpuTimings {
+    /// Pass starts in execution order.
+    pub passes: Vec<(String, Instant)>,
+    /// Completion time of the final pass.
+    pub done: Option<Instant>,
+}
+
+impl GpuTimings {
+    /// Each pass's start-to-next-start duration, the last ending at `done`.
+    pub fn pass_durations(&self) -> impl Iterator<Item = (&str, std::time::Duration)> + '_ {
+        self.passes.iter().enumerate().filter_map(move |(i, pass)| {
+            let end = match self.passes.get(i + 1) {
+                Some(next) => Some(next.1),
+                None => self.done,
+            }?;
+            Some((pass.0.as_str(), end.duration_since(pass.1)))
+        })
+    }
+}
+
 /// Record calibrated GPU pass ranges on the GPU track.
 ///
 /// Blade maps hardware timestamp queries into the same monotonic clock as
 /// [`Instant`]. Each pass ends at the next pass start, or at `done` for the
 /// final pass. CPU submission time is intentionally not involved.
-pub fn record_gpu_timings(timings: &blade_graphics::Timings) {
+pub fn record_gpu_timings(timings: &GpuTimings) {
     if let Some(inner) = PROFILER.get() {
         let mut guard = inner.lock().unwrap();
         for (index, &(ref name, start)) in timings.passes.iter().enumerate() {
-            let end = timings
+            let Some(end) = timings
                 .passes
                 .get(index + 1)
-                .map_or(timings.done, |next| next.1);
+                .map(|next| next.1)
+                .or(timings.done)
+            else {
+                continue;
+            };
             let start_ns = match start.checked_duration_since(guard.epoch) {
                 Some(duration) => duration.as_nanos() as u64,
                 None => {
@@ -230,6 +260,18 @@ pub struct CaptureOptions {
     /// Query driver-reported pipeline statistics such as register and spill
     /// counts where the backend exposes them.
     pub include_pipeline_statistics: bool,
+    /// Upper bound on the compute passes one replay may timestamp.
+    ///
+    /// Defaults to Blade's per-submission limit, which is what plans are
+    /// actually measured against. Lower it to cut a plan into more, smaller
+    /// windows — each replay then perturbs the schedule less, at the cost of
+    /// more replays.
+    ///
+    /// Clamped to `3 ..= blade_graphics::limits::PASS_COUNT`: two slots
+    /// always go to the untimed passes around the window, and raising the
+    /// bound past the backend's own limit would only build a window whose
+    /// timestamps the backend drops.
+    pub max_timed_passes_per_replay: Option<usize>,
 }
 
 impl Default for CaptureOptions {
@@ -238,6 +280,7 @@ impl Default for CaptureOptions {
             samples: 3,
             unprofiled_median_ms: None,
             include_pipeline_statistics: true,
+            max_timed_passes_per_replay: None,
         }
     }
 }
@@ -284,12 +327,22 @@ pub struct ProfilePlan {
 #[derive(Clone, Debug, Serialize)]
 pub struct ProfileMeasurement {
     pub sample_count: usize,
+    /// Replays per sample. Each covers a disjoint range of dispatch indices,
+    /// because Blade timestamps a bounded number of passes per submission.
+    /// One means the whole plan was timed in a single replay.
+    pub window_count: usize,
+    /// Largest number of dispatches timestamped in one replay.
+    pub max_window_dispatches: usize,
     pub unprofiled_median_ms: Option<f64>,
+    /// One entry per sample: the sum of that sample's replay wall times.
     pub profiled_wall_samples_ms: Vec<f64>,
     pub profiled_wall_median_ms: f64,
+    /// One entry per sample: the sum over that sample's windows, so it covers
+    /// every dispatch however many replays it took to time them.
     pub gpu_total_samples_ms: Vec<f64>,
     pub gpu_total_median_ms: f64,
-    /// Profiled wall median divided by the unprofiled benchmark median.
+    /// Profiled wall median divided by the unprofiled benchmark median. For a
+    /// windowed capture this includes every replay needed for one sample.
     pub instrumentation_wall_ratio: Option<f64>,
     /// Timestamped GPU total divided by profiled wall time.
     pub timestamped_gpu_share_of_profiled_wall_pct: f64,
@@ -360,9 +413,13 @@ pub struct PipelineStatisticProfile {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProfileError {
     ZeroSamples,
-    TooManyDispatches {
-        count: usize,
-        limit: usize,
+    /// The session reported timings for dispatches other than the window's.
+    /// An internal inconsistency rather than a caller error, reported instead
+    /// of panicking so that the capture still unwinds through one place and
+    /// leaves the session unprofiled.
+    Attribution {
+        sample: usize,
+        detail: String,
     },
     MissingGpuTimings {
         sample: usize,
@@ -378,14 +435,15 @@ impl fmt::Display for ProfileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             Self::ZeroSamples => f.write_str("profile sample count must be positive"),
-            Self::TooManyDispatches { count, limit } => write!(
+            Self::Attribution { sample, ref detail } => write!(
                 f,
-                "session has {count} dispatches, exceeding Blade's {limit}-pass timestamp limit"
+                "profile sample {sample} mis-attributed a window: {detail}"
             ),
             Self::MissingGpuTimings { sample } => write!(
                 f,
-                "no GPU timings resolved for profile sample {sample}; set \
-                 MEGANEURA_GPU_TIMING=1 before constructing the session"
+                "no GPU timings resolved for profile sample {sample}; build the \
+                 context with GpuOptions {{ timing: true, .. }} and set \
+                 SessionOptions::gpu_timing to match"
             ),
             Self::TimingCount {
                 sample,
@@ -393,7 +451,7 @@ impl fmt::Display for ProfileError {
                 actual,
             } => write!(
                 f,
-                "profile sample {sample} resolved {actual} timed passes, expected {expected}; \
+                "profile sample {sample} recovered {actual} of {expected} timed dispatches; \
                  disable runtime-appended optimizer, gradient-accumulation, and \
                  gradient-clipping passes before capture"
             ),
@@ -402,6 +460,31 @@ impl fmt::Display for ProfileError {
 }
 
 impl std::error::Error for ProfileError {}
+
+/// Split a plan into the dispatch ranges that can be timed one replay each.
+///
+/// Blade writes at most `pass_limit` timestamps per submission and silently
+/// drops the rest, so a replay can time at most that many passes. Two of the
+/// slots go to the grouped passes carrying the dispatches on either side of
+/// the window, whatever their number — see [`crate::runtime::Session::
+/// set_profiling_window`]. A plan that fits in one window yields exactly one,
+/// which replays the session the same number of times as before windowing.
+fn profile_windows(dispatch_count: usize, pass_limit: usize) -> Vec<std::ops::Range<usize>> {
+    let whole_plan = 0..dispatch_count;
+    if dispatch_count <= pass_limit {
+        return vec![whole_plan];
+    }
+    let per_window = pass_limit.saturating_sub(2).max(1);
+    // Even out the last window rather than leaving it a short remainder: an
+    // uneven split would measure the tail under a different pass count than
+    // the rest, and pass count is what the instrumentation overhead tracks.
+    let count = dispatch_count.div_ceil(per_window);
+    let per_window = dispatch_count.div_ceil(count);
+    (0..dispatch_count)
+        .step_by(per_window)
+        .map(|start| start..(start + per_window).min(dispatch_count))
+        .collect()
+}
 
 /// Capture repeated, structured per-dispatch GPU timings for a session.
 ///
@@ -412,8 +495,16 @@ impl std::error::Error for ProfileError {}
 /// optional normal benchmark median, and aggregates dispatches by
 /// forward/backward phase and coarse kernel family.
 ///
-/// `prepare` is called immediately before every retained execution. It should
-/// restore inputs and any state that the workload mutates.
+/// Blade timestamps a bounded number of passes per submission, so a plan
+/// larger than that is measured as several deterministic replays, each timing
+/// one window of dispatch indices and running the rest in grouped passes. The
+/// windows tile the plan, so every dispatch is still measured `samples` times;
+/// only the replay count grows. `measurement.window_count` reports how many
+/// replays one sample took, and is 1 for plans that fit in a single one.
+///
+/// `prepare` is called immediately before every replay, windows included. It
+/// should restore inputs and any state that the workload mutates, so that
+/// every window observes the same execution.
 ///
 /// The structured dispatch table describes the compiled execution plan.
 /// Capture with optimizer, gradient-accumulation, and gradient-clipping passes
@@ -421,6 +512,20 @@ impl std::error::Error for ProfileError {}
 /// collector rejects their additional timestamps instead of misattributing
 /// them to plan dispatches.
 pub fn capture_session_profile(
+    session: &mut crate::runtime::Session,
+    prepare: impl FnMut(&mut crate::runtime::Session),
+    options: CaptureOptions,
+) -> Result<SessionProfile, ProfileError> {
+    let result = capture_windows(session, prepare, options);
+    // However this ended, the session must not be left timing a window. A
+    // caller that handles the error and keeps stepping would otherwise run
+    // every later step one pass per dispatch, which is slower and not what
+    // it asked for.
+    session.set_profiling_window(None);
+    result
+}
+
+fn capture_windows(
     session: &mut crate::runtime::Session,
     mut prepare: impl FnMut(&mut crate::runtime::Session),
     options: CaptureOptions,
@@ -430,52 +535,69 @@ pub fn capture_session_profile(
     }
 
     let dispatch_count = session.plan().dispatches.len();
-    let pass_limit = blade_graphics::limits::PASS_COUNT;
-    if dispatch_count > pass_limit {
-        return Err(ProfileError::TooManyDispatches {
-            count: dispatch_count,
-            limit: pass_limit,
-        });
-    }
-
+    // Clamped to the backend's own limit at both ends. An override above it
+    // does not raise anything — Blade still stops writing timestamps at
+    // `PASS_COUNT` — it just asks for one oversized window, which then
+    // recovers nothing and fails the capture instead of taking the windowed
+    // route that works.
+    let pass_limit = options
+        .max_timed_passes_per_replay
+        .unwrap_or(blade_graphics::limits::PASS_COUNT)
+        .clamp(3, blade_graphics::limits::PASS_COUNT);
+    let windows = profile_windows(dispatch_count, pass_limit);
+    let window_count = windows.len();
     let mut timing_samples = vec![Vec::with_capacity(options.samples); dispatch_count];
     let mut timestamp_labels = vec![String::new(); dispatch_count];
     let mut profiled_wall_samples_ms = Vec::with_capacity(options.samples);
     let mut gpu_total_samples_ms = Vec::with_capacity(options.samples);
 
     for sample in 0..options.samples {
-        session.set_profiling(true);
-        prepare(session);
-        let wall_start = Instant::now();
-        session.step();
-        session.wait();
-        profiled_wall_samples_ms.push(wall_start.elapsed().as_secs_f64() * 1000.0);
-
-        let timings = session.gpu_timings();
-        if timings.is_empty() {
-            return Err(ProfileError::MissingGpuTimings { sample });
-        }
-        if timings.len() != dispatch_count {
-            return Err(ProfileError::TimingCount {
-                sample,
-                expected: dispatch_count,
-                actual: timings.len(),
-            });
-        }
-
         let mut total_ms = 0.0;
-        for (index, (name, duration)) in timings.into_iter().enumerate() {
-            let duration_ms = duration.as_secs_f64() * 1000.0;
-            total_ms += duration_ms;
-            timing_samples[index].push(duration_ms);
-            if sample == 0 {
-                timestamp_labels[index] = name;
+        let mut wall_ms = 0.0;
+        for window in &windows {
+            session.set_profiling_window(Some(window.clone()));
+            prepare(session);
+            let wall_start = Instant::now();
+            session.step();
+            session.wait();
+            wall_ms += wall_start.elapsed().as_secs_f64() * 1000.0;
+
+            let timed = session.profiled_dispatch_timings();
+            if timed.len() != window.len() {
+                if session.gpu_timings().is_empty() {
+                    return Err(ProfileError::MissingGpuTimings { sample });
+                }
+                return Err(ProfileError::TimingCount {
+                    sample,
+                    expected: window.len(),
+                    actual: timed.len(),
+                });
+            }
+
+            // The session reports one entry per dispatch in the window, in
+            // order. Checking it here keeps a stitching bug from surfacing
+            // later as an out-of-bounds index in the aggregation, where the
+            // cause would be a good deal harder to see.
+            let attributed: Vec<usize> = timed.iter().map(|entry| entry.0).collect();
+            if !attributed.iter().copied().eq(window.clone()) {
+                return Err(ProfileError::Attribution {
+                    sample,
+                    detail: format!("window {window:?} came back as {attributed:?}"),
+                });
+            }
+
+            for (index, name, duration) in timed {
+                let duration_ms = duration.as_secs_f64() * 1000.0;
+                total_ms += duration_ms;
+                timing_samples[index].push(duration_ms);
+                if sample == 0 {
+                    timestamp_labels[index] = name;
+                }
             }
         }
+        profiled_wall_samples_ms.push(wall_ms);
         gpu_total_samples_ms.push(total_ms);
-        session.set_profiling(false);
     }
-    session.set_profiling(false);
 
     let plan = session.plan();
     let pipeline_keys = session.dispatch_pipeline_keys();
@@ -622,10 +744,10 @@ pub fn capture_session_profile(
     let backward_dispatch_count = dispatch_count - forward_dispatch_count;
     let profiled_wall_median_ms = quantile(&profiled_wall_samples_ms, 0.5);
     let gpu_total_median_ms = quantile(&gpu_total_samples_ms, 0.5);
-    let timing_contract = "Blade calibrated pass-start timestamps on the process monotonic clock; each interval ends at the next pass start or final submission completion; one compute pass per plan dispatch";
+    let timing_contract = "Blade calibrated pass-start timestamps on the process monotonic clock; each interval ends at the next pass start or final submission completion; one compute pass per timed plan dispatch, with the dispatches outside the replay's window batched into one untimed pass per side";
 
     Ok(SessionProfile {
-        schema_version: 1,
+        schema_version: 2,
         timing_contract: timing_contract.to_string(),
         device: ProfileDevice {
             backend: if device.driver_name == "Metal" {
@@ -654,6 +776,8 @@ pub fn capture_session_profile(
         },
         measurement: ProfileMeasurement {
             sample_count: options.samples,
+            window_count,
+            max_window_dispatches: windows.iter().map(|window| window.len()).max().unwrap_or(0),
             unprofiled_median_ms: options.unprofiled_median_ms,
             profiled_wall_samples_ms,
             profiled_wall_median_ms,
@@ -1142,12 +1266,12 @@ mod tests {
             guard.epoch
         };
 
-        record_gpu_timings(&blade_graphics::Timings {
+        record_gpu_timings(&GpuTimings {
             passes: vec![
                 ("relu".into(), epoch + Duration::from_nanos(5_000)),
                 ("matmul".into(), epoch + Duration::from_nanos(5_100)),
             ],
-            done: epoch + Duration::from_nanos(5_550),
+            done: Some(epoch + Duration::from_nanos(5_550)),
         });
 
         let guard = inner.lock().unwrap();
@@ -1259,6 +1383,70 @@ mod tests {
         assert_eq!(quantile(&values, 0.25), 1.75);
         assert_eq!(quantile(&values, 0.5), 2.5);
         assert_eq!(quantile(&values, 0.75), 3.25);
+    }
+
+    /// A window may hold at most `pass_limit - 2` dispatches, must tile the
+    /// plan exactly, and must stay a single window for plans that already fit.
+    #[test]
+    fn profile_windows_tile_the_plan_within_the_timestamp_limit() {
+        for (dispatch_count, pass_limit) in [
+            (0, 8),
+            (1, 8),
+            (8, 8),
+            (9, 8),
+            (100, 8),
+            (1034, 1000),
+            (5000, 1000),
+            (7, 3),
+        ] {
+            let windows = profile_windows(dispatch_count, pass_limit);
+            let mut next = 0;
+            for window in &windows {
+                assert_eq!(
+                    window.start, next,
+                    "{dispatch_count}/{pass_limit}: windows must be contiguous"
+                );
+                // A replay costs one pass per timed dispatch plus one for
+                // each side that has dispatches left outside the window.
+                let passes = window.len()
+                    + usize::from(window.start > 0)
+                    + usize::from(window.end < dispatch_count);
+                assert!(
+                    passes <= pass_limit,
+                    "{dispatch_count}/{pass_limit}: window {window:?} needs \
+                     {passes} passes, over the {pass_limit} limit"
+                );
+                next = window.end;
+            }
+            assert_eq!(
+                next, dispatch_count,
+                "{dispatch_count}/{pass_limit}: windows must cover the plan"
+            );
+        }
+
+        // The common case replays exactly as often as before windowing.
+        assert_eq!(profile_windows(1000, 1000), vec![0..1000]);
+        // An override above the backend limit must not build a window the
+        // backend will not timestamp. The clamp happens in the caller, so
+        // check the value it computes rather than only the planner.
+        let over = CaptureOptions {
+            max_timed_passes_per_replay: Some(blade_graphics::limits::PASS_COUNT * 2),
+            ..CaptureOptions::default()
+        };
+        let effective = over
+            .max_timed_passes_per_replay
+            .unwrap_or(blade_graphics::limits::PASS_COUNT)
+            .clamp(3, blade_graphics::limits::PASS_COUNT);
+        assert_eq!(effective, blade_graphics::limits::PASS_COUNT);
+        let windows = profile_windows(1500, effective);
+        assert!(
+            windows.len() > 1 && windows.iter().all(|w| w.len() <= effective),
+            "a 1500-dispatch plan must still be windowed: {windows:?}"
+        );
+        // The motivating case: one decode step no longer refuses to profile.
+        assert_eq!(profile_windows(1034, 1000).len(), 2);
+        // Windows are evened out rather than leaving a stub at the end.
+        assert_eq!(profile_windows(1034, 1000), vec![0..517, 517..1034]);
     }
 
     #[test]

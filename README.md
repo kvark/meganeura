@@ -140,15 +140,23 @@ driver peak memory.
 
 Pretrained models can be loaded from ONNX or NNEF via `meganeura::load_onnx(...)` / `meganeura::load_nnef(...)`. Both lower through Meganeura’s IR, so the same graph rewrites apply to imported graphs and hand-built ones. GGUF files are a weight-and-metadata container rather than a graph: `meganeura::load_gguf(...)` yields named tensors; packed weights use `Session::set_parameter_packed`, while unpacked weights use `to_f32` and `set_parameter` (see `examples/gguf_info.rs`).
 
-GGUF quantized weights are imported without a requantize. `Q4_0`, `Q4_1` and
-`Q8_0` are repacked into Meganeura's own block layout on the host; the
+GGUF quantized weights are imported without a requantize. `Q4_0` and the
 K-quants — `Q4_K`, `Q5_K`, `Q6_K` and `Q3_K` — are stored byte-for-byte as
-GGML writes them and decoded in the shaders, so the weights of a `Q3_K_M`,
-`Q4_K_M` or `Q5_K_M` file load as-is. These are load-only formats: no
-K-quant encoder is implemented here, so `set_parameter` rejects them and
-points at `set_parameter_packed`. `Q2_K` and `Q8_K` are listed in the
-inventory but not read, and quantized embedding tables have no gather
-variant.
+GGML writes them and decoded in the shaders, so the weights of a `Q4_0`,
+`Q3_K_M`, `Q4_K_M` or `Q5_K_M` file load as-is. `Q4_1` and `Q8_0` are
+repacked into Meganeura's own block layout on the host instead, since
+Meganeura's Q4 and Q8 are those same shapes. The natively stored formats are
+load-only: no encoder for them is implemented here, so `set_parameter`
+rejects them and points at `set_parameter_packed`.
+
+`CompileOptions::quantized_activations` additionally quantizes the GEMV
+activation row to Q8_1 and runs the inner product on integer dot products
+against a `Q4_0` weight, following llama.cpp's `vec_dot_q4_0_q8_1`. It is off
+by default and is the only kernel switch here that changes results rather
+than the route to them, so it is never selected by measurement. Metal uses
+the packed integer-dot intrinsic; Vulkan uses an exact scalar expansion until
+Blade exposes `shaderIntegerDotProduct`. `Q2_K` and `Q8_K` are listed in the
+inventory but not read, and quantized embedding tables have no gather variant.
 
 ## System requirements
 
@@ -212,11 +220,15 @@ win, so explicit code always has the last word.
 | `MEGANEURA_GPU_CAPTURE` | Enable Blade's native-tool labels and shader debug information before context creation; independent of GPU timing. |
 
 `Session::tune_with(TuneOptions)` searches 32/64 scalar and legal native-f32
-cooperative tiles for exact dense matmul classes, qualifies nonzero scratch outputs, interleaves measurements,
-and returns raw samples and decisions. It never runs the live graph or advances
-optimizer/KV state. Default-off: scalar GPU qualification passed on RTX 5070;
-native-f32 hardware coverage and automatic whole-step confirmation remain due.
-F16-input/complex-fusion/GEMV candidates and persistent winners are not included.
+cooperative tiles for exact dense matmul classes, and workgroup width and
+cross-lane reduction for K-split GEMV classes; it qualifies nonzero scratch
+outputs, interleaves measurements, and returns raw samples and decisions. It
+never runs the live graph or advances optimizer/KV state. Default-off: scalar
+GPU qualification passed on RTX 5070; native-f32 hardware coverage and
+automatic whole-step confirmation remain due. The GEMV axis is the one that
+covers reduced-storage weights, since a width or reduction choice leaves the
+packed decoder untouched; f16-input tiles, complex fusion and persistent
+winners are not included.
 Reports separate qualification's CPU preparation/copies/checks from
 transfer/dispatch/wait costs. Private tuning staging defaults to read-optimized
 Download; `TuneOptions::staging = TuneStaging::Shared` retains the original

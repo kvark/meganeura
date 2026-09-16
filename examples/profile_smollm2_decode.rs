@@ -1,20 +1,30 @@
 //! Profile a single SmolLM2-135M decode step with blade GPU timestamps.
 //!
 //! Builds the decode graph, fills weights with small random data (perf is
-//! independent of weight values), then runs with per-pass profiling enabled.
-//! Prints the per-pass GPU timing breakdown aggregated by shader type, plus
-//! total GPU time vs wall time so we can see how much is launch/submission
-//! overhead vs actual kernel work.
+//! independent of weight values), then captures a structured profile. Prints
+//! the timing breakdown by phase and kernel family and the costliest
+//! individual dispatches, plus total GPU time vs wall time so we can see how
+//! much is launch/submission overhead vs actual kernel work.
+//!
+//! A decode step is over a thousand dispatches, more than Blade timestamps in
+//! one submission, so the capture replays it once per window of dispatches
+//! and stitches the results — see `docs/performance-profiling.md`.
 //!
 //! Usage:
-//!   cargo run --release --example profile_smollm2_decode
+//!   MEGANEURA_GPU_TIMING=1 cargo run --release --example profile_smollm2_decode
 
 use std::time::Instant;
 
+use meganeura::profiler::{CaptureOptions, capture_session_profile};
 use meganeura::{Graph, models::smollm2};
 
 fn main() {
     env_logger::init();
+
+    if std::env::var_os("MEGANEURA_GPU_TIMING").is_none() {
+        eprintln!("set MEGANEURA_GPU_TIMING=1 before starting the example");
+        std::process::exit(2);
+    }
 
     let config = smollm2::SmolLM2Config::smollm2_135m();
     let max_seq_len = 128;
@@ -71,17 +81,78 @@ fn main() {
     let baseline_per_step = t0.elapsed().as_secs_f64() * 1000.0 / 20.0;
     eprintln!("  baseline: {:.2}ms / decode step", baseline_per_step);
 
-    eprintln!("\nenabling profiling (one pass per dispatch)...");
-    session.set_profiling(true);
+    eprintln!("\ncapturing a structured profile (one pass per timed dispatch)...");
+    let profile = capture_session_profile(
+        &mut session,
+        |session| {
+            session.set_input_u32("token_ids", &[42]);
+            session.set_input_u32("kv_pos", &[10]);
+        },
+        CaptureOptions {
+            samples: 3,
+            unprofiled_median_ms: Some(baseline_per_step),
+            ..CaptureOptions::default()
+        },
+    )
+    .expect("capture structured GPU profile");
 
-    session.step();
-    session.wait();
-    eprintln!("\n=== GPU pass timings for a single decode step ===");
-    session.dump_gpu_timings();
+    let measurement = &profile.measurement;
+    eprintln!(
+        "  {} dispatches over {} window(s) x {} sample(s), \
+         largest window {} dispatches",
+        profile.plan.dispatch_count,
+        measurement.window_count,
+        measurement.sample_count,
+        measurement.max_window_dispatches,
+    );
+
+    eprintln!("\n=== GPU time by kernel family ===");
+    let mut families = profile.families.clone();
+    families.sort_by(|a, b| {
+        b.dispatch_median_sum_ms
+            .total_cmp(&a.dispatch_median_sum_ms)
+    });
+    for family in families.iter().take(12) {
+        eprintln!(
+            "  {:>10} {:>18}: {:>4}x {:>8.3}ms ({:>5.1}%)",
+            family.phase,
+            family.family,
+            family.dispatch_count,
+            family.dispatch_median_sum_ms,
+            family.share_of_dispatch_median_sum_pct,
+        );
+    }
+
+    eprintln!("\n=== costliest individual dispatches ===");
+    let mut dispatches = profile.dispatches.clone();
+    dispatches.sort_by(|a, b| b.median_ms.total_cmp(&a.median_ms));
+    for dispatch in dispatches.iter().take(15) {
+        eprintln!(
+            "  #{:<5} {:>8.3}ms ({:>4.1}%) {} [{}]",
+            dispatch.index,
+            dispatch.median_ms,
+            dispatch.share_of_dispatch_median_sum_pct,
+            dispatch.label,
+            dispatch.pipeline,
+        );
+    }
 
     eprintln!(
-        "\nnote: baseline wall-time per step = {:.2}ms. Compare to sum of GPU \
-         pass timings above to localize overhead vs kernel time.",
+        "\ntotal timestamped GPU time: {:.2}ms (median over samples)",
+        measurement.gpu_total_median_ms,
+    );
+    eprintln!(
+        "baseline wall-time per step: {:.2}ms. The gap is launch and \
+         submission overhead, not kernel work.",
         baseline_per_step,
     );
+    if measurement.window_count > 1 {
+        eprintln!(
+            "profiled wall time includes all {} replays per sample; each timed \
+             at most {} of {} dispatches and ran the rest at normal pass counts.",
+            measurement.window_count,
+            measurement.max_window_dispatches,
+            profile.plan.dispatch_count,
+        );
+    }
 }

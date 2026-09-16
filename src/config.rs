@@ -298,6 +298,9 @@ impl SessionOptions {
         Self {
             debug: false,
             coop,
+            // The context is created from the same variable, so the two
+            // agree by construction on this path.
+            gpu_timing: GPU_TIMING.bool_or(false),
             no_alias: NO_ALIAS.bool_or(false),
             no_device_local: NO_DEVICE_LOCAL.bool_or(false),
             skip_parameter_zero: false,
@@ -358,6 +361,7 @@ impl SessionConfig<'_> {
     /// "explicit code runs last".
     pub fn from_env() -> Self {
         let gpu_opts = GpuOptions::from_env();
+        let timing_requested = gpu_opts.timing;
         let gpu = if gpu_opts.device_id.is_some() || gpu_opts.timing || gpu_opts.capture {
             match crate::runtime::init_gpu_context_with(gpu_opts) {
                 Ok(context) => Some(std::sync::Arc::new(context)),
@@ -369,7 +373,13 @@ impl SessionConfig<'_> {
         } else {
             None
         };
-        Self::from_env_with_gpu(gpu)
+        let timing_enabled = timing_requested && gpu.is_some();
+        let mut config = Self::from_env_with_gpu(gpu);
+        // A failed env-selected context falls back to the untimed default
+        // context, so it must not retain the request as a statement about
+        // how that fallback was created.
+        config.runtime.gpu_timing = timing_enabled;
+        config
     }
 
     /// [`SessionConfig::from_env`] with `mode: Inference`.
