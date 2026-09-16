@@ -57,7 +57,9 @@ pub fn tensor_shapes(config: &ModelConfig) -> Vec<(String, Vec<usize>)> {
     let kv_dim = config.kv_dim();
     let head_dim = config.head_dim as usize;
 
-    graph::parameter_names(config)
+    let mut names = graph::parameter_names(config);
+    names.extend(optional_names_present(config));
+    names
         .into_iter()
         .map(|name| {
             let dims = match name.rsplit_once('.').map(|(_, last)| last) {
@@ -87,6 +89,33 @@ pub fn tensor_shapes(config: &ModelConfig) -> Vec<(String, Vec<usize>)> {
             (name, dims)
         })
         .collect()
+}
+
+/// The optional biases a *real* file of this architecture would carry.
+///
+/// Not simply every optional name: Qwen2 biases Q, K and V but leaves the
+/// attention output unbiased, and a fixture that invented one would hide
+/// exactly the mismatch that broke real Qwen2 files.
+fn optional_names_present(config: &ModelConfig) -> Vec<String> {
+    let arch = config.architecture;
+    let mut names = Vec::new();
+    for layer in 0..config.num_layers {
+        let p = format!("blk.{layer}");
+        if matches!(
+            arch,
+            super::arch::Architecture::Qwen2 | super::arch::Architecture::Phi2
+        ) {
+            for part in ["attn_q", "attn_k", "attn_v"] {
+                names.push(format!("{p}.{part}.bias"));
+            }
+        }
+        if arch == super::arch::Architecture::Phi2 {
+            names.push(format!("{p}.attn_output.bias"));
+            names.push(format!("{p}.ffn_up.bias"));
+            names.push(format!("{p}.ffn_down.bias"));
+        }
+    }
+    names
 }
 
 fn bias_width(name: &str, config: &ModelConfig) -> usize {

@@ -8,16 +8,38 @@
   and no hard-coded dimensions. See `examples/gguf_generate.rs`.
 
   The llama family (also Mistral, SmolLM2, TinyLlama), Qwen2, Qwen3, Gemma,
-  Gemma2/3 and Phi3 build from one parameterised decoder; the enum records
-  only where a family departs from the llama shape — Qwen2's QKV biases,
-  Qwen3's per-head Q/K norms, Gemma's scaled embeddings and `1 + w` norm
-  weights and second pair of norms. An architecture whose graph cannot be
-  expressed *exactly* is refused by name rather than approximated, since a
-  subtly wrong decoder still emits fluent text: partial RoPE
+  Gemma2, Gemma3 and Phi3 build from one parameterised decoder; the enum
+  records only where a family departs from the llama shape — Qwen3's
+  per-head Q/K norms, Gemma's scaled embeddings and `1 + w` norm weights and
+  second pair of norms, Gemma3's five-local-to-one-global window pattern and
+  its separate RoPE base for the local layers. An architecture whose graph
+  cannot be expressed *exactly* is refused by name rather than approximated,
+  since a subtly wrong decoder still emits fluent text: partial RoPE
   (`rope.dimension_count < head_dim`, as Phi2 uses) needs a strided split
   with no op behind it, and Gemma2's `attn_logit_softcapping` has no
   parameter on the cached attention ops. Final logit softcapping *is*
-  applied, being expressible after the head.
+  applied, being expressible after the head. The alias list is deliberately
+  short for the same reason — a family mapped onto a graph that is merely
+  close to its own would load without complaint and decode wrongly.
+
+  Llama's Q and K are un-permuted on load. GGML has two RoPE conventions,
+  and llama.cpp's converter permutes those two weights into a llama GGUF so
+  that GGML's *interleaved* rope reproduces what HuggingFace's *half-split*
+  rope would have done. Meganeura's RoPE is the half-split one, so the
+  permutation has to come back out; leaving it in is not a crash but fluent,
+  wrong text. Every other family here converts unpermuted.
+
+  Phi's packed tensors are sliced rather than refused: `attn_qkv.weight`
+  backs three projections and Phi3's double-width `ffn_up.weight` backs two.
+  Rows are output features and GGUF blocks along the other axis, so a row
+  range is a contiguous run of bytes whatever the encoding — and both the
+  slice and the un-permute happen in GGUF's own layout, where one rule
+  covers every format, rather than after packing into Meganeura's, where
+  Q4 keeps block headers in a region of their own.
+
+  Biases are optional. Qwen2 biases Q, K and V but leaves the attention
+  output unbiased, and requiring all four rejected every real Qwen2 file; an
+  absent bias is a zero bias, which is the graph without the add.
 
   One graph shape serves prompt and decode: a block of `block_size` token
   slots of which `valid` are real, starting at `position`, which is what

@@ -119,6 +119,8 @@ pub struct Generator {
     /// Tokens seen since the last reset, for the repetition penalty.
     history: Vec<u32>,
     report: LoadReport,
+    /// Why [`Self::vocab`] is absent, when it is.
+    vocab_error: Option<String>,
 }
 
 impl Generator {
@@ -170,8 +172,13 @@ impl Generator {
         };
 
         // A file may carry weights and no vocabulary, which is still
-        // usable through the token-level API.
-        let vocab = Vocab::from_gguf(model).ok();
+        // usable through the token-level API — but keep *why* it has none,
+        // so "no tokenizer" is not reported for a tokenizer this loader
+        // simply does not implement.
+        let (vocab, vocab_error) = match Vocab::from_gguf(model) {
+            Ok(vocab) => (Some(vocab), None),
+            Err(e) => (None, Some(e.to_string())),
+        };
 
         Ok(Self {
             prefill,
@@ -183,6 +190,7 @@ impl Generator {
             position: 0,
             history: Vec::new(),
             report,
+            vocab_error,
         })
     }
 
@@ -381,11 +389,11 @@ impl Generator {
         mut on_token: impl FnMut(&str) -> bool,
     ) -> Result<(), GgufError> {
         let vocab = self.vocab.as_ref().ok_or_else(|| {
-            GgufError::MissingKey(
-                "tokenizer.ggml.tokens; this file carries weights but no vocabulary, \
-                 so text generation needs generate_tokens instead"
-                    .to_string(),
-            )
+            GgufError::BadMetadata(format!(
+                "no usable tokenizer, so text generation needs generate_tokens \
+                 instead ({})",
+                self.vocab_error.as_deref().unwrap_or("reason unrecorded")
+            ))
         })?;
         let prompt_tokens = vocab.encode(prompt);
         if prompt_tokens.is_empty() {
@@ -409,15 +417,20 @@ impl Generator {
             }
             emitted.push(next);
 
-            // Re-decode the whole run and show only what is newly valid,
-            // so a character split across tokens is never shown as a
-            // replacement character.
+            // Re-decode the whole run and show what has settled. A
+            // character can straddle two tokens, so a replacement
+            // character at the *end* may still complete when the next
+            // token arrives and is held back. One in the middle never
+            // will — it is a byte that decodes to nothing else — so it is
+            // shown, or a single bad byte would stall the stream for the
+            // rest of the run.
             let text = vocab.decode(&emitted);
-            if text.len() > shown && !text[shown..].contains('\u{FFFD}') {
-                let piece = text[shown..].to_string();
-                shown = text.len();
+            let ready = settled(&text);
+            if ready > shown {
+                let piece = text[shown..ready].to_string();
+                shown = ready;
                 if !on_token(&piece) {
-                    break;
+                    return Ok(());
                 }
             }
 
@@ -425,6 +438,15 @@ impl Generator {
                 break;
             }
             logits = self.feed(&[next])?;
+        }
+
+        // Whatever was held back waiting for a continuation that never
+        // came is still output, so the text a caller assembles is the
+        // whole of what was generated.
+        let vocab = self.vocab.as_ref().expect("checked above");
+        let text = vocab.decode(&emitted);
+        if text.len() > shown {
+            on_token(&text[shown..]);
         }
         Ok(())
     }
@@ -535,6 +557,16 @@ fn sample_with_temperature(logits: &[f32], options: &GenerationOptions, rng: &mu
         }
     }
     candidates.last().map_or(0, |c| c.0)
+}
+
+/// How much of `text` will not change when more tokens arrive.
+///
+/// Only a *trailing* replacement character can still become something
+/// else — it is a multi-byte character whose remaining bytes are in the
+/// next token. Everything before it has settled, including any earlier
+/// replacement characters, which are bytes that decode to nothing else.
+fn settled(text: &str) -> usize {
+    text.trim_end_matches('\u{FFFD}').len()
 }
 
 /// A small deterministic generator, so a seeded run reproduces.
@@ -730,6 +762,48 @@ mod tests {
             first.windows(2).any(|w| w[0] != w[1]),
             "a zero seed should still vary: {first:?}"
         );
+    }
+
+    #[test]
+    fn a_complete_string_has_settled_entirely() {
+        assert_eq!(settled("hello"), "hello".len());
+        assert_eq!(settled(""), 0);
+    }
+
+    #[test]
+    fn a_trailing_replacement_character_is_held_back() {
+        // Half of a multi-byte character; the next token completes it.
+        let partial = "the caf\u{FFFD}";
+        assert_eq!(&partial[..settled(partial)], "the caf");
+    }
+
+    #[test]
+    fn a_byte_that_never_completes_a_character_does_not_stall_the_stream() {
+        // A stray byte-fallback token decodes to U+FFFD with text after
+        // it, so it has settled — holding it back would end the stream
+        // silently for the rest of the run.
+        let text = "ok\u{FFFD}more text";
+        assert_eq!(settled(text), text.len());
+    }
+
+    #[test]
+    fn the_stream_keeps_moving_as_tokens_arrive() {
+        // Each prefix of a growing decode must show at least as much as
+        // the last, and reach the whole once it is complete.
+        let steps = ["ca", "caf\u{FFFD}", "caf\u{e9}", "caf\u{e9} au"];
+        let mut shown = 0;
+        for step in steps {
+            let ready = settled(step);
+            assert!(ready >= shown.min(ready), "went backwards at {step:?}");
+            shown = ready;
+        }
+        assert_eq!(shown, "caf\u{e9} au".len(), "the whole text should arrive");
+    }
+
+    #[test]
+    fn several_undecodable_bytes_in_the_middle_all_settle() {
+        let text = "a\u{FFFD}b\u{FFFD}c";
+        assert_eq!(settled(text), text.len());
     }
 
     #[test]
