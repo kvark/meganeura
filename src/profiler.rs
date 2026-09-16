@@ -118,10 +118,10 @@ pub fn init_with_targets(additional_targets: &[&str]) {
 /// Blade maps hardware timestamp queries into the same monotonic clock as
 /// [`Instant`]. Each pass ends at the next pass start, or at `done` for the
 /// final pass. CPU submission time is intentionally not involved.
-pub fn record_gpu_timings(timings: &blade_graphics::Timings) {
+pub fn record_gpu_timings(timings: &blade_graphics::Timing<'_>) {
     if let Some(inner) = PROFILER.get() {
         let mut guard = inner.lock().unwrap();
-        for (index, &(ref name, start)) in timings.passes.iter().enumerate() {
+        for (index, &(name, start)) in timings.passes.iter().enumerate() {
             let end = timings
                 .passes
                 .get(index + 1)
@@ -161,13 +161,13 @@ pub fn record_gpu_timings(timings: &blade_graphics::Timings) {
                 }
             };
             guard.events.push(TraceEvent {
-                name: name.clone(),
+                name: name.to_owned(),
                 timestamp_ns: start_ns,
                 track_uuid: GPU_TRACK_UUID,
                 kind: EventKind::SliceBegin,
             });
             guard.events.push(TraceEvent {
-                name: name.clone(),
+                name: name.to_owned(),
                 timestamp_ns: end_ns,
                 track_uuid: GPU_TRACK_UUID,
                 kind: EventKind::SliceEnd,
@@ -1142,10 +1142,10 @@ mod tests {
             guard.epoch
         };
 
-        record_gpu_timings(&blade_graphics::Timings {
+        record_gpu_timings(&blade_graphics::Timing {
             passes: vec![
-                ("relu".into(), epoch + Duration::from_nanos(5_000)),
-                ("matmul".into(), epoch + Duration::from_nanos(5_100)),
+                ("relu", epoch + Duration::from_nanos(5_000)),
+                ("matmul", epoch + Duration::from_nanos(5_100)),
             ],
             done: epoch + Duration::from_nanos(5_550),
         });

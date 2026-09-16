@@ -9,6 +9,7 @@ mod tuning;
 pub use crate::tune::TuneOutcome;
 
 type Gpu = blade_graphics::Context;
+type GpuTimings = Vec<(String, std::time::Duration)>;
 
 /// Wait for a command encoder and harvest every completed timestamp query.
 ///
@@ -18,15 +19,23 @@ pub(super) fn wait_for_timed_encoder(
     gpu: &Gpu,
     sync: &blade_graphics::SyncPoint,
     encoder: &mut blade_graphics::CommandEncoder,
-) -> Result<Option<blade_graphics::Timings>, blade_graphics::DeviceError> {
+) -> Result<Option<GpuTimings>, blade_graphics::DeviceError> {
     let result = gpu.wait_for(sync, !0);
     if !result? {
         return Ok(None);
     }
-    let timings = encoder.get_timings().clone();
+    if !encoder.timing_enabled() {
+        return Ok(Some(Vec::new()));
+    }
+    let timings = encoder.last_timing();
     tracing::debug!(passes = timings.passes.len(), "GPU timestamps resolved");
     crate::profiler::record_gpu_timings(&timings);
-    Ok(Some(timings))
+    Ok(Some(
+        timings
+            .pass_durations()
+            .map(|(name, duration)| (name.to_owned(), duration))
+            .collect(),
+    ))
 }
 
 /// Leave room for pipelines, command buffers, and driver-owned allocations
@@ -2763,7 +2772,7 @@ pub struct Session {
     submission_chunks: usize,
     sync_point: Option<blade_graphics::SyncPoint>,
     /// Calibrated timings harvested when the most recent submission completed.
-    last_gpu_timings: Option<blade_graphics::Timings>,
+    last_gpu_timings: Option<GpuTimings>,
     /// When true, run in multi-pass mode: one compute pass per dispatch
     /// with individual GPU timestamps. Enables `dump_gpu_timings()`.
     profiling: bool,
@@ -3954,15 +3963,7 @@ impl Session {
     /// callers should normally use [`crate::profiler::capture_session_profile`]
     /// rather than managing timestamp collection directly.
     pub fn gpu_timings(&self) -> Vec<(String, std::time::Duration)> {
-        self.last_gpu_timings
-            .as_ref()
-            .map(|timings| {
-                timings
-                    .pass_durations()
-                    .map(|(name, duration)| (name.to_owned(), duration))
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.last_gpu_timings.clone().unwrap_or_default()
     }
 
     /// Stable descriptive key for the pipeline selected by each plan
@@ -5451,7 +5452,9 @@ impl Session {
             }
         }
         let sync = self.gpu.submit(&mut encoder);
-        let _ = wait_for_timed_encoder(&self.gpu, &sync, &mut encoder);
+        wait_for_timed_encoder(&self.gpu, &sync, &mut encoder)
+            .expect("GPU transfer wait failed")
+            .expect("GPU transfer wait timed out");
         self.gpu.destroy_command_encoder(&mut encoder);
     }
 
@@ -5550,7 +5553,9 @@ impl Session {
                 chunk.len() as u64,
             );
             let sync = self.gpu.submit(&mut encoder);
-            let _ = wait_for_timed_encoder(&self.gpu, &sync, &mut encoder);
+            wait_for_timed_encoder(&self.gpu, &sync, &mut encoder)
+                .expect("GPU transfer wait failed")
+                .expect("GPU transfer wait timed out");
         }
         self.gpu.destroy_command_encoder(&mut encoder);
         if !self.reuse_upload_staging {
@@ -5590,7 +5595,9 @@ impl Session {
             .transfer("readback_copy")
             .copy_buffer_to_buffer(buffer.at(0), staging.at(0), bytes);
         let sync = self.gpu.submit(&mut encoder);
-        let _ = wait_for_timed_encoder(&self.gpu, &sync, &mut encoder);
+        wait_for_timed_encoder(&self.gpu, &sync, &mut encoder)
+            .expect("GPU transfer wait failed")
+            .expect("GPU transfer wait timed out");
         unsafe {
             std::ptr::copy_nonoverlapping(
                 staging.data() as *const f32,
@@ -5913,7 +5920,9 @@ impl Session {
             }
         }
         let sync = self.gpu.submit(&mut encoder);
-        let _ = wait_for_timed_encoder(&self.gpu, &sync, &mut encoder);
+        wait_for_timed_encoder(&self.gpu, &sync, &mut encoder)
+            .expect("GPU transfer wait failed")
+            .expect("GPU transfer wait timed out");
 
         let mut outputs = Vec::with_capacity(requests.len());
         for &(_, offset, byte_len) in &requests {
@@ -6345,9 +6354,10 @@ impl Session {
     pub fn wait(&mut self) {
         if let Some(sp) = self.sync_point.take() {
             let _span = tracing::info_span!("wait").entered();
-            if let Ok(Some(timings)) = wait_for_timed_encoder(&self.gpu, &sp, &mut self.encoder) {
-                self.last_gpu_timings = Some(timings);
-            }
+            let timings = wait_for_timed_encoder(&self.gpu, &sp, &mut self.encoder)
+                .expect("GPU session wait failed")
+                .expect("GPU session wait timed out");
+            self.last_gpu_timings = Some(timings);
         }
     }
 
@@ -8453,7 +8463,9 @@ impl Session {
                     }
                 }
                 let sync = self.gpu.submit(&mut encoder);
-                let _ = wait_for_timed_encoder(&self.gpu, &sync, &mut encoder);
+                wait_for_timed_encoder(&self.gpu, &sync, &mut encoder)
+                    .expect("GPU test readback wait failed")
+                    .expect("GPU test readback wait timed out");
                 self.gpu.destroy_command_encoder(&mut encoder);
             }
         }

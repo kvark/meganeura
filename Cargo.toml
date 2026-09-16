@@ -34,6 +34,9 @@ name = "gemma_inference_ops"
 name = "shared_parameters"
 
 [[test]]
+name = "gpu_timing"
+
+[[test]]
 name = "block_matmul"
 
 [[test]]
@@ -53,7 +56,7 @@ profiler = ["dep:tracing-subscriber"]
 
 [dependencies]
 # Calibrated GPU pass timestamps resolved after the completion fence.
-blade-graphics = { version = "0.9", git = "https://github.com/kvark/blade", rev = "100bb813d8b66b120e9a28e2c533227d0db64cd0" }
+blade-graphics = { version = "0.9", git = "https://github.com/kvark/blade", rev = "aeb554e6daedc77d9f2ba487adc7cf4666d20970" }
 blade-macros = "0.3"
 # `default-features = false` drops egglog's `bin` stack (clap, mimalloc,
 # env_logger, chrono, graphviz). Greedy mode never constructs an EGraph

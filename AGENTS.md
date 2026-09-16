@@ -1,4 +1,4 @@
-# Combined-initialization hypothesis only
+# Kindle timing candidate
 
 Base this candidate on current upstream 5a570099, retaining packed-weight and
 all other runtime fixes. Restore alias-order allocation with immediate Shared
@@ -11,10 +11,16 @@ Use the same flushed initialization/upload/wait observations as control
 matched allocation observability. Do not change math, default precision, memory
 placement, cooperative policy or the production graph. Main remains ce80.
 
-Prepare CPU source/fixture checks only. Meganeura's full library test suite
+The September 16 user resumes bounded GPU work with NVML disabled. Adapt the
+runtime to current Blade last_timing, retain owned pass durations and record
+borrowed timestamps immediately. Never call timing APIs on a disabled encoder.
+Fail fast on unsuccessful waits; do not change learning arithmetic or dispatch
+grouping. This candidate is separate from completed driver-580 comparisons.
+
+Meganeura's full library test suite
 contains an unignored GPU test; invoke only reviewed CPU module filters.
-A separately declared combined LeVJEPA/first-world initialization test is the
-next possible GPU boundary, never a training or full pixel retry. Use fresh
-host/upstream checks, actual-device/memory gates and direct-child guard, with
-no automatic successor. No reset/reload/reboot or other host recovery without
+A separately declared timing-on/off native regression precedes the remaining
+production hardware/state/pixel/throughput gates. Use fresh host/upstream checks,
+actual-device assertions and the direct-child host guard. No NVML or blind retry.
+Review each result before follow-up. No reset/reload/reboot or other recovery without
 user approval. Preserve old writers, raw control/failure evidence and Pong hold.

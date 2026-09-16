@@ -1148,7 +1148,9 @@ impl<'gpu, 'trial> Scratch<'gpu, 'trial> {
 
     fn submit_wait(&mut self) {
         let sync = self.gpu.submit(&mut self.encoder);
-        let _ = super::wait_for_timed_encoder(self.gpu, &sync, &mut self.encoder);
+        super::wait_for_timed_encoder(self.gpu, &sync, &mut self.encoder)
+            .expect("GPU tuning wait failed")
+            .expect("GPU tuning wait timed out");
     }
 
     fn run(&mut self, sequence: &[(&bg::ComputePipeline, &Dispatch)], repeats: u32) -> f64 {

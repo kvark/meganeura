@@ -482,7 +482,9 @@ impl Session {
             }
         }
         let sync = self.gpu.submit(&mut encoder);
-        let _ = super::wait_for_timed_encoder(&self.gpu, &sync, &mut encoder);
+        super::wait_for_timed_encoder(&self.gpu, &sync, &mut encoder)
+            .expect("GPU checkpoint readback wait failed")
+            .expect("GPU checkpoint readback wait timed out");
         for tensor in &tensors {
             let aligned_len = tensor.byte_len / 4 * 4;
             let tail_len = tensor.byte_len - aligned_len;
