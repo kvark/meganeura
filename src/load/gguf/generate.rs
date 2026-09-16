@@ -395,7 +395,16 @@ impl Generator {
                 self.vocab_error.as_deref().unwrap_or("reason unrecorded")
             ))
         })?;
-        let prompt_tokens = vocab.encode(prompt);
+        // Only a sequence that is actually starting gets the
+        // vocabulary's BOS. A generator keeps its cache across calls, so
+        // a second `generate` continues the first — and re-applying the
+        // policy would plant another BOS in the middle of the sequence,
+        // which the token-level API would never do.
+        let prompt_tokens = if self.position == 0 {
+            vocab.encode(prompt)
+        } else {
+            vocab.encode_plain(prompt)
+        };
         if prompt_tokens.is_empty() {
             return Err(GgufError::BadMetadata(
                 "the prompt tokenized to nothing".into(),
@@ -430,6 +439,14 @@ impl Generator {
                 let piece = text[shown..ready].to_string();
                 shown = ready;
                 if !on_token(&piece) {
+                    // The caller has seen this token, so it is part of
+                    // the sequence. Commit it before returning, or a
+                    // continuation would resume from a shorter prefix
+                    // than the one the caller was shown — and differ from
+                    // the same output stopped by `max_tokens`.
+                    if self.position < self.built.max_seq_len {
+                        self.feed(&[next])?;
+                    }
                     return Ok(());
                 }
             }

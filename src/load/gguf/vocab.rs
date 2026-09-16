@@ -1,7 +1,7 @@
 //! The tokenizer the file carries.
 //!
 //! GGUF embeds the whole vocabulary — every token, the merge list or the
-//! unigram scores, and the special-token ids — under `tokenizer.ggml.*`. So
+//! piece scores, and the special-token ids — under `tokenizer.ggml.*`. So
 //! a `.gguf` is self-sufficient: turning a prompt into ids needs nothing
 //! from the Hub and no `tokenizer.json` alongside.
 //!
@@ -20,10 +20,12 @@
 //!   byte alphabet, and adjacent symbols are merged in the order the merge
 //!   list ranks them. Every byte is representable, so there is no unknown
 //!   token.
-//! - **SentencePiece** (`llama`), used by Llama-2, Mistral and Gemma.
-//!   Spaces become `▁`, and adjacent symbols merge by *score* — highest
-//!   first — rather than by a merge list. Characters outside the vocabulary
-//!   fall back to one `<0x..>` token per UTF-8 byte.
+//! - **SentencePiece** (`llama`), used by Llama-2, Mistral and Gemma. This
+//!   is SentencePiece's *BPE* mode, not its unigram mode — the two are
+//!   different algorithms. Spaces become `▁`, and adjacent symbols merge by
+//!   *score*, highest first, rather than by a merge list; ties go to the
+//!   leftmost pair. Characters outside the vocabulary fall back to one
+//!   `<0x..>` token per UTF-8 byte.
 
 use std::collections::HashMap;
 
@@ -34,7 +36,8 @@ use super::{GgufError, GgufModel, GgufValue};
 pub enum TokenizerKind {
     /// Byte-level byte-pair encoding, merged in merge-list order.
     Bpe,
-    /// SentencePiece unigram, merged by score.
+    /// SentencePiece's BPE mode, merged by score. Not its unigram mode —
+    /// the two are different algorithms and GGUF names both `llama`.
     SentencePiece,
 }
 
@@ -57,6 +60,9 @@ enum TokenKind {
 /// The vocabulary, and everything needed to apply it.
 #[derive(Clone, Debug)]
 pub struct Vocab {
+    /// How text is split before merges apply. Only meaningful for
+    /// [`TokenizerKind::Bpe`]; SentencePiece has no separate rule.
+    pre: PreTokenizer,
     kind: TokenizerKind,
     tokens: Vec<String>,
     ids: HashMap<String, u32>,
@@ -84,6 +90,7 @@ impl Vocab {
     /// Returns [`GgufError::MissingKey`] when the file carries no
     /// vocabulary at all, which a weights-only GGUF legitimately might.
     pub fn from_gguf(model: &GgufModel) -> Result<Self, GgufError> {
+        let pre = PreTokenizer::from_name(meta_str(model, "tokenizer.ggml.pre"))?;
         let kind = match meta_str(model, "tokenizer.ggml.model") {
             Some("gpt2") => TokenizerKind::Bpe,
             Some("llama") => TokenizerKind::SentencePiece,
@@ -139,6 +146,7 @@ impl Vocab {
         let eog = end_of_generation(model, &tokens, eos);
 
         Ok(Self {
+            pre,
             kind,
             // SentencePiece prepends a space so that a leading word is
             // tokenized the same as a word in the middle of a sentence.
@@ -376,7 +384,7 @@ impl Vocab {
 
     /// Byte-level BPE: pre-tokenize, recode, then merge by rank.
     fn encode_bpe(&self, text: &str, out: &mut Vec<u32>) {
-        for word in pretokenize(text) {
+        for word in self.pre.split(text) {
             // Each byte becomes one printable character, so the merge list
             // — which is written in that alphabet — applies directly.
             let mut symbols: Vec<String> = word
@@ -442,6 +450,13 @@ impl Vocab {
         loop {
             // Highest score wins here, where BPE takes the lowest rank —
             // the two models order their merges in opposite directions.
+            //
+            // Ties go to the *leftmost* pair. GGML's `llm_bigram_spm`
+            // comparator breaks an equal score by the lower left index,
+            // and `Iterator::max_by` keeps the last maximum rather than
+            // the first, so the tie-break has to be written out. With
+            // pieces `ab` and `bc` scored equally, `abc` is `[ab, c]`
+            // here and `[a, bc]` without it.
             let best = symbols
                 .windows(2)
                 .enumerate()
@@ -451,7 +466,13 @@ impl Vocab {
                     let score = self.scores.get(id as usize).copied().unwrap_or(0.0);
                     Some((score, i, joined))
                 })
-                .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                .max_by(|a, b| {
+                    a.0.partial_cmp(&b.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        // Reversed, so that on an equal score the *lower*
+                        // index compares greater and `max_by` keeps it.
+                        .then(b.1.cmp(&a.1))
+                });
             let Some((_, at, joined)) = best else { break };
             symbols.splice(at..at + 2, [joined]);
             if symbols.len() == 1 {
@@ -493,20 +514,156 @@ const SPM_SPACE: &str = "\u{2581}";
 // Pre-tokenization
 // ---------------------------------------------------------------------------
 
+/// Which pre-tokenizer a byte-level BPE file declares.
+///
+/// `tokenizer.ggml.model = gpt2` names the *merge algorithm*, not the rule
+/// that decides where merges may apply. Llama 3, Qwen and SmolLM all write
+/// `gpt2` there and split text differently, and merges cannot cross a
+/// pre-token boundary — so reading the model alone and assuming GPT-2's
+/// rule silently retokenizes those files. `1234` is one pre-token under
+/// GPT-2, `123|4` under Llama 3 and `1|2|3|4` under Qwen2.
+///
+/// Each variant here reproduces one of llama.cpp's `regex_exprs` entries
+/// exactly. An identifier that maps to any other rule is refused rather
+/// than approximated, because the result would be fluent and wrong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreTokenizer {
+    /// The classic GPT-2 rule:
+    /// `'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)`
+    Gpt2,
+    /// Llama 3's: case-insensitive contractions, one free character before
+    /// a letter run, digits in groups of up to three, and newline-aware
+    /// punctuation and whitespace.
+    Llama3,
+    /// Llama 3's rule with digits taken one at a time.
+    Qwen2,
+    /// Digits one at a time, then GPT-2's rule over what is left.
+    SmolLm,
+}
+
+impl PreTokenizer {
+    /// Resolve `tokenizer.ggml.pre`.
+    ///
+    /// Absent, the file predates the key and GPT-2's rule is the only
+    /// reading available. Each accepted name is one llama.cpp maps to the
+    /// same `regex_exprs` as the variant it is listed under; anything else
+    /// — including `default`, which is its own four-pattern cascade — is
+    /// refused by name.
+    pub fn from_name(name: Option<&str>) -> Result<Self, GgufError> {
+        let Some(name) = name else {
+            return Ok(Self::Gpt2);
+        };
+        Ok(match name {
+            "gpt-2" | "phi-2" | "jina-es" | "jina-de" | "jina-v2-es" | "jina-v2-de"
+            | "gigachat" | "a.x-4.0" | "mellum" | "modern-bert" | "mpt" | "olmo" | "jais"
+            | "trillion" | "granite-docling" => Self::Gpt2,
+            "llama3" | "llama-v3" | "llama-bpe" | "falcon3" | "falcon-h1" | "pixtral"
+            | "midm-2.0" | "lfm2" | "jina-v5-nano" => Self::Llama3,
+            "qwen2" | "deepseek-r1-qwen" | "kormo" | "f2llmv2" | "stablelm2" | "hunyuan" => {
+                Self::Qwen2
+            }
+            "smollm" | "codeshell" | "exaone" | "minerva-7b" => Self::SmolLm,
+            other => {
+                return Err(GgufError::UnsupportedArchitecture(format!(
+                    "tokenizer.ggml.pre = `{other}` selects a pre-tokenizer this \
+                     loader does not implement; merges cannot cross the boundaries \
+                     it would place, so the wrong rule retokenizes the text"
+                )));
+            }
+        })
+    }
+
+    /// Split `text` into pre-tokens. Merges apply within these and never
+    /// across them.
+    fn split<'a>(self, text: &'a str) -> Vec<&'a str> {
+        match self {
+            Self::Gpt2 => scan_gpt2(text),
+            Self::Llama3 => scan_llama3(text, 3),
+            Self::Qwen2 => scan_llama3(text, 1),
+            // llama.cpp lists `\p{N}` before GPT-2's pattern, and each
+            // regex splits the pieces the one before it produced. Severing
+            // the digits first is why ` 123` becomes ` `, `1`, `2`, `3`
+            // here where GPT-2 alone keeps ` 123` whole.
+            Self::SmolLm => split_digits(text)
+                .into_iter()
+                .flat_map(|piece| {
+                    if piece.chars().next().is_some_and(is_digit) {
+                        vec![piece]
+                    } else {
+                        scan_gpt2(piece)
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
+/// `\p{L}` as std spells it.
+///
+/// `char::is_alphabetic` is Unicode's Alphabetic property, which is
+/// `\p{L}` plus `Nl` and the characters carrying `Other_Alphabetic` —
+/// mostly combining marks in Indic and Hebrew scripts. Text in those
+/// scripts can therefore split differently here than under a true
+/// `\p{L}`; for the Latin, Greek, Cyrillic and CJK text these vocabularies
+/// are overwhelmingly built from, the two agree.
+fn is_letter(c: char) -> bool {
+    c.is_alphabetic()
+}
+
+/// `\p{N}` as std spells it — `is_numeric` is `Nd | Nl | No`, which is
+/// exactly `\p{N}`.
+fn is_digit(c: char) -> bool {
+    c.is_numeric()
+}
+
+/// Each digit as its own piece, with the spans between them intact.
+fn split_digits(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (at, c) in text.char_indices() {
+        if is_digit(c) {
+            if at > start {
+                out.push(&text[start..at]);
+            }
+            out.push(&text[at..at + c.len_utf8()]);
+            start = at + c.len_utf8();
+        }
+    }
+    if start < text.len() {
+        out.push(&text[start..]);
+    }
+    out
+}
+
+/// The byte length of a contraction at the start of `rest`.
+///
+/// `case_insensitive` selects between GPT-2's literal lowercase list and
+/// the `'[sS]|'[tT]|…` form Llama 3 and Qwen2 use.
+fn contraction_len(rest: &str, case_insensitive: bool) -> Option<usize> {
+    for suffix in ["'re", "'ve", "'ll", "'s", "'t", "'m", "'d"] {
+        let matches = if case_insensitive {
+            rest.len() >= suffix.len()
+                && rest.as_bytes()[..suffix.len()].eq_ignore_ascii_case(suffix.as_bytes())
+        } else {
+            rest.starts_with(suffix)
+        };
+        if matches {
+            return Some(suffix.len());
+        }
+    }
+    None
+}
+
 /// Split text the way GPT-2's pre-tokenizer regex does.
 ///
 /// The pattern is
-/// `'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+`,
+/// `'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)`,
 /// hand-written here rather than run through a regex engine: it is a small
 /// deterministic scan, and pulling in a regex crate — or `onig`'s C library,
 /// which is exactly what keeping `tokenizers` out of `[dependencies]`
 /// avoids — to read a vocabulary the file already contains would be a poor
 /// trade.
-///
-/// `char::is_alphabetic` and `char::is_numeric` carry std's own Unicode
-/// tables, so the character classes are the real ones rather than ASCII
-/// approximations.
-fn pretokenize(text: &str) -> Vec<&str> {
+fn scan_gpt2(text: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     let end = text.len();
@@ -519,7 +676,7 @@ fn pretokenize(text: &str) -> Vec<&str> {
 
         // Contractions, which the pattern lists first and so match first.
         if ch(i) == Some('\'')
-            && let Some(len) = contraction_len(&text[start..])
+            && let Some(len) = contraction_len(&text[start..], false)
         {
             out.push(&text[start..start + len]);
             i += text[start..start + len].chars().count();
@@ -574,14 +731,108 @@ fn pretokenize(text: &str) -> Vec<&str> {
     out
 }
 
-/// The byte length of a contraction at the start of `rest`, if any.
-fn contraction_len(rest: &str) -> Option<usize> {
-    for suffix in ["'re", "'ve", "'ll", "'s", "'t", "'m", "'d"] {
-        if rest.starts_with(suffix) {
-            return Some(suffix.len());
+/// Split text the way Llama 3's pre-tokenizer regex does, with digits
+/// taken `max_digits` at a time.
+///
+/// The pattern is
+/// `(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`,
+/// and Qwen2's differs from it only in `\p{N}` where this has `\p{N}{1,3}`.
+/// The alternatives are tried in order, first match winning, exactly as
+/// the engine would.
+///
+/// Three things separate it from [`scan_gpt2`]: contractions match in
+/// either case, a letter run may be preceded by any one character that is
+/// not a newline, letter or digit rather than only a space, and a digit
+/// run is capped and never takes a leading space.
+fn scan_llama3(text: &str, max_digits: usize) -> Vec<&str> {
+    let mut out = Vec::new();
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let end = text.len();
+    let at_byte = |i: usize| chars.get(i).map_or(end, |&(b, _)| b);
+    let ch = |i: usize| chars.get(i).map(|&(_, c)| c);
+    let is_newline = |c: char| c == '\r' || c == '\n';
+
+    let mut i = 0;
+    while i < chars.len() {
+        let start = at_byte(i);
+
+        // `(?:'[sS]|'[tT]|…)`
+        if ch(i) == Some('\'')
+            && let Some(len) = contraction_len(&text[start..], true)
+        {
+            out.push(&text[start..start + len]);
+            i += text[start..start + len].chars().count();
+            continue;
         }
+
+        // `[^\r\n\p{L}\p{N}]?\p{L}+` — one optional free character, then
+        // at least one letter. The optional character is only consumed if
+        // letters actually follow it.
+        let prefixed = ch(i).is_some_and(|c| !is_newline(c) && !is_letter(c) && !is_digit(c))
+            && ch(i + 1).is_some_and(is_letter);
+        if prefixed || ch(i).is_some_and(is_letter) {
+            let mut j = if prefixed { i + 1 } else { i };
+            while ch(j).is_some_and(is_letter) {
+                j += 1;
+            }
+            out.push(&text[start..at_byte(j)]);
+            i = j;
+            continue;
+        }
+
+        // `\p{N}{1,max}` — no leading space, and capped.
+        if ch(i).is_some_and(is_digit) {
+            let mut j = i;
+            while j < i + max_digits && ch(j).is_some_and(is_digit) {
+                j += 1;
+            }
+            out.push(&text[start..at_byte(j)]);
+            i = j;
+            continue;
+        }
+
+        // ` ?[^\s\p{L}\p{N}]+[\r\n]*`
+        let space = ch(i) == Some(' ');
+        let head = if space { i + 1 } else { i };
+        if ch(head).is_some_and(|c| !c.is_whitespace() && !is_letter(c) && !is_digit(c)) {
+            let mut j = head;
+            while ch(j).is_some_and(|c| !c.is_whitespace() && !is_letter(c) && !is_digit(c)) {
+                j += 1;
+            }
+            while ch(j).is_some_and(is_newline) {
+                j += 1;
+            }
+            out.push(&text[start..at_byte(j)]);
+            i = j;
+            continue;
+        }
+
+        // The whitespace alternatives. Take the run once and decide which
+        // of the three it is.
+        let mut j = i;
+        while ch(j).is_some_and(char::is_whitespace) {
+            j += 1;
+        }
+        if j > i {
+            // `\s*[\r\n]+` is greedy and then backtracks, so it matches
+            // through the *last* newline in the run.
+            let last_newline = (i..j).rev().find(|&k| ch(k).is_some_and(is_newline));
+            let stop = match last_newline {
+                Some(k) => k + 1,
+                // `\s+(?!\S)` takes the whole run at end of text;
+                // otherwise `\s+` leaves the final character for the piece
+                // that follows, as in GPT-2's rule.
+                None if ch(j).is_some() && j - i > 1 => j - 1,
+                None => j,
+            };
+            out.push(&text[start..at_byte(stop)]);
+            i = stop.max(i + 1);
+            continue;
+        }
+
+        i += 1;
     }
-    None
+    out
 }
 
 /// Which of the pattern's three character runs `c` belongs to.
@@ -802,6 +1053,169 @@ mod tests {
 
     // -- the byte alphabet ------------------------------------------------
 
+    /// A SentencePiece vocabulary of exactly the pieces given, all scored
+    /// alike, with no byte fallback and no automatic BOS — so segmentation
+    /// is the only thing under test.
+    fn tied_score_vocab(pieces: &[&str]) -> Vocab {
+        let mut tokens = vec!["<unk>".to_string()];
+        let mut scores = vec![0.0f32];
+        let mut types = vec![2u32];
+        for piece in pieces {
+            tokens.push((*piece).to_string());
+            scores.push(-1.0);
+            types.push(1);
+        }
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            "tokenizer.ggml.model".to_string(),
+            GgufValue::String("llama".to_string()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.tokens".to_string(),
+            value_array(tokens.into_iter().map(GgufValue::String).collect()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.scores".to_string(),
+            value_array(scores.into_iter().map(GgufValue::F32).collect()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.token_type".to_string(),
+            value_array(types.into_iter().map(GgufValue::U32).collect()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.unknown_token_id".to_string(),
+            GgufValue::U32(0),
+        );
+        metadata.insert(
+            "tokenizer.ggml.add_bos_token".to_string(),
+            GgufValue::Bool(false),
+        );
+        metadata.insert(
+            "tokenizer.ggml.add_eos_token".to_string(),
+            GgufValue::Bool(false),
+        );
+        Vocab::from_gguf(&GgufModel {
+            metadata,
+            tensors: std::collections::HashMap::new(),
+        })
+        .expect("a minimal SentencePiece vocabulary")
+    }
+
+    /// The pieces `text` encodes to, less the word-prefix marker.
+    ///
+    /// SentencePiece prefixes a word with U+2581, which
+    /// [`tied_score_vocab`] deliberately cannot represent — it carries no
+    /// byte fallback, so the prefix arrives as unknowns. Dropping them
+    /// leaves the merge order, which is what these tests are about.
+    fn merged_pieces<'a>(vocab: &'a Vocab, text: &str) -> Vec<&'a str> {
+        vocab
+            .encode(text)
+            .iter()
+            .filter_map(|&id| vocab.token_text(id))
+            .filter(|piece| *piece != "<unk>")
+            .collect()
+    }
+
+    #[test]
+    fn an_equal_score_merges_the_leftmost_pair() {
+        // `ab` and `bc` both apply to `abc` and score the same. GGML's
+        // `llm_bigram_spm` comparator breaks the tie by the lower left
+        // index, giving `[ab, c]`; taking the last maximum instead gives
+        // `[a, bc]`, which is a different tokenization of the same text.
+        let vocab = tied_score_vocab(&["a", "b", "c", "ab", "bc"]);
+        assert_eq!(
+            merged_pieces(&vocab, "abc"),
+            ["ab", "c"],
+            "the leftmost tied pair should win"
+        );
+    }
+
+    #[test]
+    fn a_higher_score_still_beats_position() {
+        // The tie-break must only apply to ties: `bc` scoring higher has
+        // to win even though `ab` is further left.
+        let mut vocab = tied_score_vocab(&["a", "b", "c", "ab", "bc"]);
+        let bc = vocab.ids["bc"] as usize;
+        vocab.scores[bc] = 10.0;
+        assert_eq!(merged_pieces(&vocab, "abc"), ["a", "bc"]);
+    }
+
+    #[test]
+    fn the_pre_tokenizers_disagree_exactly_where_upstream_says_they_do() {
+        // Each row is a case where reading `tokenizer.ggml.model = gpt2`
+        // and assuming GPT-2's rule would place different boundaries than
+        // the file's own pre-tokenizer. Merges cannot cross these, so a
+        // wrong rule cannot be repaired by the merge list.
+        /// Input, then the boundaries GPT-2, Llama 3 and Qwen2 place.
+        type Row = (
+            &'static str,
+            &'static [&'static str],
+            &'static [&'static str],
+            &'static [&'static str],
+        );
+        let cases: [Row; 3] = [
+            ("1234", &["1234"], &["123", "4"], &["1", "2", "3", "4"]),
+            (
+                "I'M here",
+                &["I", "'", "M", " here"],
+                &["I", "'M", " here"],
+                &["I", "'M", " here"],
+            ),
+            (
+                "hi!\nworld",
+                &["hi", "!", "\n", "world"],
+                &["hi", "!\n", "world"],
+                &["hi", "!\n", "world"],
+            ),
+        ];
+        for (input, gpt2, llama3, qwen2) in cases {
+            assert_eq!(PreTokenizer::Gpt2.split(input), gpt2, "gpt2 {input:?}");
+            assert_eq!(
+                PreTokenizer::Llama3.split(input),
+                llama3,
+                "llama3 {input:?}"
+            );
+            assert_eq!(PreTokenizer::Qwen2.split(input), qwen2, "qwen2 {input:?}");
+        }
+    }
+
+    #[test]
+    fn smollm_severs_digits_and_keeps_gpt2s_rule_elsewhere() {
+        // llama.cpp lists `\p{N}` before GPT-2's pattern, so the digit
+        // split happens first and takes the leading space with it.
+        assert_eq!(PreTokenizer::SmolLm.split(" 12 ab"), [" ", "1", "2", " ab"]);
+        assert_eq!(PreTokenizer::Gpt2.split(" 12 ab"), [" 12", " ab"]);
+        // Away from digits the two agree.
+        assert_eq!(
+            PreTokenizer::SmolLm.split("Hello world"),
+            PreTokenizer::Gpt2.split("Hello world")
+        );
+    }
+
+    #[test]
+    fn a_letter_run_may_follow_one_free_character() {
+        // `[^\r\n\p{L}\p{N}]?\p{L}+` takes any single non-letter that
+        // is not a newline, where GPT-2 only ever joins a space.
+        assert_eq!(PreTokenizer::Llama3.split("(word"), ["(word"]);
+        assert_eq!(PreTokenizer::Gpt2.split("(word"), ["(", "word"]);
+        // But only when letters actually follow it.
+        assert_eq!(PreTokenizer::Llama3.split("((("), ["((("]);
+    }
+
+    #[test]
+    fn an_unimplemented_pre_tokenizer_is_refused_by_name() {
+        let err = PreTokenizer::from_name(Some("gpt-4o")).unwrap_err();
+        assert!(format!("{err}").contains("gpt-4o"), "{err}");
+        // `default` is its own cascade upstream, not a synonym for gpt-2.
+        assert!(PreTokenizer::from_name(Some("default")).is_err());
+        // Absent, the file predates the key.
+        assert_eq!(PreTokenizer::from_name(None).unwrap(), PreTokenizer::Gpt2);
+        assert_eq!(
+            PreTokenizer::from_name(Some("llama-bpe")).unwrap(),
+            PreTokenizer::Llama3
+        );
+    }
+
     #[test]
     fn the_byte_alphabet_is_a_bijection() {
         let mut seen = std::collections::HashSet::new();
@@ -836,33 +1250,33 @@ mod tests {
 
     #[test]
     fn a_leading_space_joins_the_word_after_it() {
-        assert_eq!(pretokenize("Hello world"), vec!["Hello", " world"]);
+        assert_eq!(scan_gpt2("Hello world"), vec!["Hello", " world"]);
     }
 
     #[test]
     fn letters_numbers_and_punctuation_are_separate_runs() {
-        assert_eq!(pretokenize("abc123!!"), vec!["abc", "123", "!!"]);
+        assert_eq!(scan_gpt2("abc123!!"), vec!["abc", "123", "!!"]);
     }
 
     #[test]
     fn contractions_split_the_way_the_pattern_lists_them() {
-        assert_eq!(pretokenize("don't"), vec!["don", "'t"]);
-        assert_eq!(pretokenize("we've"), vec!["we", "'ve"]);
-        assert_eq!(pretokenize("they'll"), vec!["they", "'ll"]);
-        assert_eq!(pretokenize("it's"), vec!["it", "'s"]);
+        assert_eq!(scan_gpt2("don't"), vec!["don", "'t"]);
+        assert_eq!(scan_gpt2("we've"), vec!["we", "'ve"]);
+        assert_eq!(scan_gpt2("they'll"), vec!["they", "'ll"]);
+        assert_eq!(scan_gpt2("it's"), vec!["it", "'s"]);
     }
 
     #[test]
     fn a_run_of_spaces_leaves_its_last_for_the_word() {
         // The lookahead means "a   b" is "a", "  ", " b" — the final space
         // belongs to the word, not the run.
-        assert_eq!(pretokenize("a   b"), vec!["a", "  ", " b"]);
+        assert_eq!(scan_gpt2("a   b"), vec!["a", "  ", " b"]);
     }
 
     #[test]
     fn trailing_whitespace_is_kept_whole() {
-        assert_eq!(pretokenize("a   "), vec!["a", "   "]);
-        assert_eq!(pretokenize("hi\n"), vec!["hi", "\n"]);
+        assert_eq!(scan_gpt2("a   "), vec!["a", "   "]);
+        assert_eq!(scan_gpt2("hi\n"), vec!["hi", "\n"]);
     }
 
     #[test]
@@ -881,7 +1295,7 @@ mod tests {
             "",
         ] {
             assert_eq!(
-                pretokenize(text).concat(),
+                scan_gpt2(text).concat(),
                 text,
                 "pretokenizing {text:?} changed it"
             );
@@ -890,8 +1304,8 @@ mod tests {
 
     #[test]
     fn unicode_letters_group_with_letters() {
-        assert_eq!(pretokenize("héllo"), vec!["héllo"]);
-        assert_eq!(pretokenize(" 日本"), vec![" 日本"]);
+        assert_eq!(scan_gpt2("héllo"), vec!["héllo"]);
+        assert_eq!(scan_gpt2(" 日本"), vec![" 日本"]);
     }
 
     // -- vocabularies -----------------------------------------------------
