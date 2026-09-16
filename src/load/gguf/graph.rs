@@ -122,7 +122,7 @@ pub fn build(
     block_size: usize,
     max_seq_len: usize,
 ) -> Result<ModelGraph, GgufError> {
-    check_expressible(config)?;
+    check_expressible(model, config)?;
     if block_size == 0 {
         return Err(GgufError::BadMetadata("block_size must be > 0".into()));
     }
@@ -348,7 +348,7 @@ pub const OUTPUT_NORM: &str = "output_norm";
 pub const OUTPUT: &str = "output.weight";
 
 /// Reject what the ops cannot express, naming the reason.
-fn check_expressible(config: &ModelConfig) -> Result<(), GgufError> {
+fn check_expressible(model: &GgufModel, config: &ModelConfig) -> Result<(), GgufError> {
     if config.rope_dim != config.head_dim {
         return Err(GgufError::UnsupportedArchitecture(format!(
             "{}: rope.dimension_count {} is narrower than the {}-wide head, and \
@@ -375,7 +375,47 @@ fn check_expressible(config: &ModelConfig) -> Result<(), GgufError> {
             config.architecture
         )));
     }
+    // Position scaling changes the angle at every position, so reading the
+    // base and ignoring the scheme loads a different model that still
+    // produces fluent text. Refuse rather than approximate.
+    if let Some(ref scaling) = config.rope_scaling {
+        return Err(GgufError::UnsupportedArchitecture(format!(
+            "{}: the file declares RoPE scaling ({scaling}), which the graph \
+             has no op for — it emits base-theta rotation only, so honouring \
+             the base alone would rotate every position wrongly",
+            config.architecture
+        )));
+    }
+    if let Some(name) = rope_factor_tensor(model) {
+        return Err(GgufError::UnsupportedArchitecture(format!(
+            "{}: the file carries `{name}`, a per-frequency RoPE correction \
+             that the graph cannot apply; dropping it would rotate long \
+             positions wrongly",
+            config.architecture
+        )));
+    }
     Ok(())
+}
+
+/// The name of a RoPE correction tensor, if the file carries one.
+///
+/// Llama 3.1 writes `rope_freqs.weight` and Phi3's long-context variants
+/// write per-layer `rope_factors_long` / `rope_factors_short`. Upstream
+/// passes these into `ggml_rope_ext`; there is nowhere to put them here,
+/// and a file that ships them is not a plain-RoPE model however ordinary
+/// its architecture name looks.
+fn rope_factor_tensor(model: &GgufModel) -> Option<&str> {
+    let mut found: Option<&str> = None;
+    for name in model.tensors.keys() {
+        if name.contains("rope_freqs") || name.contains("rope_factors") {
+            // Deterministic across runs, since `tensors` is a HashMap.
+            found = Some(match found {
+                Some(seen) if seen <= name.as_str() => seen,
+                _ => name.as_str(),
+            });
+        }
+    }
+    found
 }
 
 /// `cap * tanh(x / cap)` — a smooth ceiling on the logits.
@@ -415,7 +455,7 @@ fn feed_forward(
         )?;
         let gate = g.matmul(input, w_gate);
         let up = g.matmul(input, w_up);
-        if arch.scales_embeddings() {
+        if arch.gates_with_gelu() {
             // Gemma gates with GELU where llama gates with SiLU. The
             // multiply is the same; only the activation differs, so this
             // cannot go through the fused `swiglu`.
@@ -632,19 +672,26 @@ fn projection(
 ) -> Result<NodeId, GgufError> {
     let source = source_of(config, name);
     let tensor = require_tensor(model, &source.tensor)?;
-    // A sliced source is checked against the range it must contain; a
-    // whole one against the shape the architecture gives it.
-    let rows = source.rows.clone().map_or(shape[1], |r| r.len());
-    let expected_rows = source.rows.as_ref().map_or(shape[1], |r| r.end);
-    if tensor.dims.len() != 2 || tensor.dims[0] != shape[0] || tensor.dims[1] < expected_rows {
+    // A sliced source only has to *contain* the rows taken from it — the
+    // other slices account for the rest. A whole one must match exactly:
+    // nothing would read the surplus rows of an oversized tensor, so
+    // accepting it would silently load a differently shaped model.
+    let fits = tensor.dims.len() == 2
+        && tensor.dims[0] == shape[0]
+        && match source.rows.as_ref() {
+            Some(rows) => tensor.dims[1] >= rows.end && rows.len() == shape[1],
+            None => tensor.dims[1] == shape[1],
+        };
+    if !fits {
+        let needed = match source.rows.as_ref() {
+            Some(rows) => format!("rows {}..{} of [{}, _]", rows.start, rows.end, shape[0]),
+            None => format!("{shape:?}"),
+        };
         return Err(GgufError::MissingTensor(format!(
-            "`{}` is {:?}, but `{name}` needs {:?} of it",
-            source.tensor,
-            tensor.dims,
-            [shape[0], expected_rows]
+            "`{}` is {:?}, but `{name}` needs {needed}",
+            source.tensor, tensor.dims,
         )));
     }
-    debug_assert_eq!(rows, shape[1]);
     Ok(parameter_of(g, name, shape, weight_dtype(tensor)?))
 }
 
@@ -756,6 +803,83 @@ pub fn optional_parameter_names(config: &ModelConfig) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_declared_rope_scaling_is_refused_rather_than_ignored() {
+        // The graph emits base-theta rotation only. Honouring the base and
+        // dropping the scheme would rotate every position wrongly while
+        // still producing fluent text.
+        for (kind, factor) in [("linear", 4.0), ("yarn", 8.0), ("longrope", 2.0)] {
+            let model = fixture::model_with("llama", |m| {
+                fixture::set_arch_key(m, "rope.scaling.type", GgufValue::String(kind.into()));
+                fixture::set_arch_key(m, "rope.scaling.factor", GgufValue::F32(factor));
+            });
+            let config = ModelConfig::from_gguf(&model).unwrap();
+            let mut g = crate::Graph::new();
+            let err = build(&mut g, &model, &config, 4, 16).unwrap_err();
+            assert!(format!("{err}").contains(kind), "{err}");
+        }
+    }
+
+    #[test]
+    fn an_identity_scaling_declaration_is_not_a_refusal() {
+        // Producers write the keys even when they mean "none"; a factor of
+        // one changes nothing and must not reject the file.
+        for (kind, factor) in [("none", 8.0), ("linear", 1.0)] {
+            let model = fixture::model_with("llama", |m| {
+                fixture::set_arch_key(m, "rope.scaling.type", GgufValue::String(kind.into()));
+                fixture::set_arch_key(m, "rope.scaling.factor", GgufValue::F32(factor));
+            });
+            let config = ModelConfig::from_gguf(&model).unwrap();
+            assert_eq!(config.rope_scaling, None, "{kind} {factor}");
+            let mut g = crate::Graph::new();
+            build(&mut g, &model, &config, 4, 16).expect("identity scaling should build");
+        }
+    }
+
+    #[test]
+    fn a_legacy_linear_scale_is_refused_too() {
+        let model = fixture::model_with("llama", |m| {
+            fixture::set_arch_key(m, "rope.scale_linear", GgufValue::F32(4.0));
+        });
+        let config = ModelConfig::from_gguf(&model).unwrap();
+        let mut g = crate::Graph::new();
+        assert!(build(&mut g, &model, &config, 4, 16).is_err());
+    }
+
+    #[test]
+    fn a_rope_correction_tensor_is_refused_by_name() {
+        // Llama 3.1 ships `rope_freqs.weight`; Phi3's long-context
+        // variants ship per-layer factors. Either makes the file something
+        // other than a plain-RoPE model, whatever its architecture says.
+        for name in ["rope_freqs.weight", "blk.0.rope_factors_long.weight"] {
+            let model = fixture::model_with("llama", |m| {
+                m.tensors
+                    .insert(name.to_string(), fixture::f32_tensor(vec![8]));
+            });
+            let config = ModelConfig::from_gguf(&model).unwrap();
+            let mut g = crate::Graph::new();
+            let err = build(&mut g, &model, &config, 4, 16).unwrap_err();
+            assert!(format!("{err}").contains(name), "{err}");
+        }
+    }
+
+    #[test]
+    fn an_oversized_whole_tensor_is_rejected() {
+        // Nothing reads the surplus rows, so accepting it would load a
+        // differently shaped model than the one declared.
+        let model = fixture::model_with("llama", |m| {
+            let dims = m.tensors["blk.0.attn_q.weight"].dims.clone();
+            m.tensors.insert(
+                "blk.0.attn_q.weight".to_string(),
+                fixture::f32_tensor(vec![dims[0], dims[1] + 1]),
+            );
+        });
+        let config = ModelConfig::from_gguf(&model).unwrap();
+        let mut g = crate::Graph::new();
+        let err = build(&mut g, &model, &config, 4, 16).unwrap_err();
+        assert!(format!("{err}").contains("attn_q.weight"), "{err}");
+    }
     use crate::load::gguf::fixture;
     use crate::load::gguf::{GgmlType, GgufTensor, GgufValue};
     use std::collections::HashMap;

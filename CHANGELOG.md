@@ -41,6 +41,40 @@
   output unbiased, and requiring all four rejected every real Qwen2 file; an
   absent bias is a zero bias, which is the graph without the add.
 
+  Gemma norm weights are loaded exactly as written. They are trained centred
+  on zero and applied as `1 + w`, but llama.cpp's converter already folds
+  the one in, so the file holds the applied scale; shifting again would turn
+  a trained zero into two rather than one.
+
+  RoPE position scaling is refused rather than dropped. A file declaring
+  `rope.scaling.*`, the legacy `rope.scale_linear`, or carrying a correction
+  tensor (Llama 3.1's `rope_freqs.weight`, Phi3's long-context factors) is
+  not a plain-RoPE model however ordinary its architecture name looks, and
+  reading the base while ignoring the scheme rotates every position wrongly
+  while still producing fluent text.
+
+  `tokenizer.ggml.pre` selects the pre-tokenizer, because
+  `tokenizer.ggml.model = gpt2` names the merge algorithm and not the rule
+  that decides where merges may apply. Llama 3, Qwen and SmolLM all declare
+  `gpt2` and split differently — `1234` is one pre-token under GPT-2,
+  `123|4` under Llama 3 and `1|2|3|4` under Qwen2 — and merges cannot cross
+  a boundary, so the merge list cannot repair the wrong rule. Four rule sets
+  are implemented against llama.cpp's own `regex_exprs`; any other
+  identifier is refused by name, `default` included, since it is its own
+  cascade rather than a synonym for `gpt-2`.
+
+  SentencePiece score ties merge the leftmost pair, matching GGML's
+  `llm_bigram_spm` comparator — `Iterator::max_by` keeps the *last* maximum,
+  so with `ab` and `bc` scored alike, `abc` would otherwise tokenize as
+  `[a, bc]` instead of `[ab, c]`.
+
+  Text generation continues rather than restarts. A generator keeps its KV
+  cache between calls, so a second `generate` encodes without the
+  vocabulary's BOS — re-applying the policy planted another one mid-sequence
+  — and a token the streaming callback has already been shown is committed
+  before returning, so cancelling leaves the same state as stopping at
+  `max_tokens`.
+
   One graph shape serves prompt and decode: a block of `block_size` token
   slots of which `valid` are real, starting at `position`, which is what
   `rope_dynamic_offset` and `cached_block_attention` already assume.

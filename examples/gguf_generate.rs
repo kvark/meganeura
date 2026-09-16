@@ -146,14 +146,17 @@ fn main() {
     }
 
     println!("\n{}", args.prompt);
+    // Where the sequence stood before this run, so the rate below counts
+    // tokens rather than callbacks: a character split across two tokens
+    // arrives in one call, and a token held back for a continuation
+    // arrives in none.
+    let started_at = generator.position();
     let generating = Instant::now();
-    let mut tokens = 0usize;
     let result = generator.generate_streaming(&args.prompt, &args.options, |piece| {
         print!("{piece}");
         // Streaming output is only streaming if it leaves the buffer.
         use std::io::Write;
         let _ = std::io::stdout().flush();
-        tokens += 1;
         true
     });
     println!();
@@ -163,6 +166,9 @@ fn main() {
         std::process::exit(1);
     }
     let elapsed = generating.elapsed().as_secs_f32();
+    // The prompt went through the same sessions, so it counts toward the
+    // rate exactly as the generated tokens do.
+    let tokens = generator.position().saturating_sub(started_at);
     println!(
         "\n{tokens} tokens in {elapsed:.2}s ({:.1} tok/s), {} of {} context used",
         tokens as f32 / elapsed.max(f32::EPSILON),

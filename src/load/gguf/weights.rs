@@ -244,15 +244,8 @@ fn load_one(
         return Ok(());
     }
 
-    // Norms and biases are one-dimensional, so `to_f32` has nothing to
-    // transpose and the values arrive in order.
     if tensor.dims.len() == 1 {
-        let mut values = tensor.to_f32()?;
-        if is_norm_weight(name) && config.architecture.norm_weight_offset_by_one() {
-            for v in &mut values {
-                *v += 1.0;
-            }
-        }
+        let values = vector_values(tensor)?;
         session.set_parameter(name, &values);
         report.dequantized += 1;
         return Ok(());
@@ -275,12 +268,22 @@ fn load_one(
     Ok(())
 }
 
-/// Whether a name is a norm's scale, as against a bias or a projection.
+/// Values for a one-dimensional parameter — a norm weight or a bias.
 ///
-/// Gemma's `1 + w` applies to the scales only, so this must not catch
-/// `output.weight` — hence the `_norm.` rather than a bare `norm`.
-fn is_norm_weight(name: &str) -> bool {
-    name.ends_with("_norm.weight") || name == "output_norm.weight"
+/// These are read straight through. `to_f32` has nothing to transpose for
+/// a single dimension, so the values arrive in order, and *no*
+/// architecture adjusts them.
+///
+/// That last part is the whole reason this is a named function. Gemma's
+/// norm weights are trained centred on zero and applied as `1 + w`, which
+/// invites folding the one in here — but llama.cpp's converter has already
+/// done it (`GemmaModel::modify_tensors` writes `data_torch + 1`, and
+/// Gemma2 and Gemma3 do the same). The file holds the *applied* scale, not
+/// the trained parameter. Adding one again would turn a trained zero into
+/// two rather than one, doubling that norm's contribution on every layer
+/// including the final one.
+fn vector_values(tensor: &GgufTensor) -> Result<Vec<f32>, GgufError> {
+    tensor.to_f32()
 }
 
 fn expect_len(name: &str, got: usize, want: usize) -> Result<(), GgufError> {
@@ -538,17 +541,6 @@ mod tests {
         graph::build(&mut g, &model, &config, 4, 16).expect("a real Qwen2 shape must build");
     }
 
-    #[test]
-    fn a_norm_weight_is_recognized_but_a_projection_is_not() {
-        assert!(is_norm_weight("output_norm.weight"));
-        assert!(is_norm_weight("blk.0.attn_norm.weight"));
-        assert!(is_norm_weight("blk.0.ffn_norm.weight"));
-        assert!(is_norm_weight("blk.0.attn_q_norm.weight"));
-        assert!(!is_norm_weight("output.weight"));
-        assert!(!is_norm_weight("blk.0.attn_q.weight"));
-        assert!(!is_norm_weight("blk.0.attn_norm.bias"));
-    }
-
     /// The load path and the graph must agree about every tensor, or the
     /// loader would hand packed bytes to an f32 buffer.
     #[test]
@@ -599,29 +591,32 @@ mod tests {
     }
 
     #[test]
-    fn gemma_norm_weights_gain_the_one_that_llama_does_not() {
-        // The fold is applied on load, so the shaders never learn about it.
-        for (arch, offset) in [("llama", false), ("gemma", true)] {
+    fn a_norm_weight_is_loaded_exactly_as_the_file_stores_it() {
+        // llama.cpp's converter writes `data_torch + 1` for Gemma norms,
+        // so a trained zero is already 1 in the file. Adding one here
+        // would make it 2 — a doubling of that norm, not a rounding
+        // difference — so no architecture may adjust these.
+        for arch in ["llama", "gemma", "gemma2", "gemma3", "qwen3", "phi2"] {
             let model = fixture::model(arch);
-            let config = ModelConfig::from_gguf(&model).unwrap();
-            assert_eq!(config.architecture.norm_weight_offset_by_one(), offset);
-
-            let stored = model.tensors["blk.0.attn_norm.weight"].to_f32().unwrap();
-            let expected: Vec<f32> = stored
-                .iter()
-                .map(|v| if offset { v + 1.0 } else { *v })
-                .collect();
-            // Mirror what `load_one` does for a 1-D norm weight.
-            let mut values = stored.clone();
-            if is_norm_weight("blk.0.attn_norm.weight")
-                && config.architecture.norm_weight_offset_by_one()
-            {
-                for v in &mut values {
-                    *v += 1.0;
-                }
-            }
-            assert_eq!(values, expected, "{arch}");
+            let tensor = &model.tensors["blk.0.attn_norm.weight"];
+            assert_eq!(
+                vector_values(tensor).unwrap(),
+                tensor.to_f32().unwrap(),
+                "{arch} adjusted a norm weight on load"
+            );
         }
+    }
+
+    #[test]
+    fn a_converted_gemma_norm_of_one_stays_one() {
+        // The value a trained zero has *after* conversion, which is what a
+        // real file carries. It must survive the load unchanged.
+        let tensor = GgufTensor::new(
+            vec![4],
+            GgmlType::F32,
+            [1.0f32; 4].iter().flat_map(|v| v.to_le_bytes()).collect(),
+        );
+        assert_eq!(vector_values(&tensor).unwrap(), vec![1.0; 4]);
     }
 
     #[test]

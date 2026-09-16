@@ -44,9 +44,10 @@ pub enum Architecture {
     /// Llama plus RMSNorm on Q and K *per head*, before RoPE. Qwen3 dropped
     /// Qwen2's QKV biases when it added these.
     Qwen3,
-    /// Embeddings scaled by `sqrt(n_embd)`, GELU rather than SiLU in the
-    /// feed-forward, and a norm weight that is stored as `w` but applied as
-    /// `1 + w`.
+    /// Embeddings scaled by `sqrt(n_embd)` and GELU rather than SiLU in the
+    /// feed-forward. Its norm weights are trained centred on zero and
+    /// applied as `1 + w`, but the converter folds that one in, so the file
+    /// already holds the applied scale.
     Gemma,
     /// Gemma plus a norm after each of the attention and feed-forward
     /// blocks, alternating sliding-window and full attention, and logit
@@ -128,6 +129,17 @@ impl Architecture {
         matches!(self, Self::Phi2)
     }
 
+    /// Whether the gated feed-forward activates with GELU rather than
+    /// SiLU.
+    ///
+    /// Separate from [`Self::scales_embeddings`] although the Gemmas
+    /// satisfy both: one describes the embedding and the other the
+    /// feed-forward, and selecting an activation through an unrelated
+    /// predicate hides which computation a family actually changes.
+    pub fn gates_with_gelu(self) -> bool {
+        matches!(self, Self::Gemma | Self::Gemma2 | Self::Gemma3)
+    }
+
     /// Whether the feed-forward gates — `down(act(gate(x)) * up(x))`.
     pub fn gated_ffn(self) -> bool {
         !self.uses_gelu_mlp()
@@ -155,14 +167,6 @@ impl Architecture {
         matches!(self, Self::Gemma | Self::Gemma2 | Self::Gemma3)
     }
 
-    /// Whether norm weights are stored as `w` but applied as `1 + w`.
-    ///
-    /// Gemma trains its norm weights centred on zero. Folding the `+1` in
-    /// at load time keeps the shaders unaware of it.
-    pub fn norm_weight_offset_by_one(self) -> bool {
-        matches!(self, Self::Gemma | Self::Gemma2 | Self::Gemma3)
-    }
-
     /// Whether each block carries a second pair of norms, applied to the
     /// attention and feed-forward outputs before they rejoin the residual.
     pub fn post_block_norms(self) -> bool {
@@ -183,6 +187,71 @@ impl std::fmt::Display for Architecture {
             Self::Phi3 => "phi3",
         };
         f.write_str(name)
+    }
+}
+
+/// A position-scaling scheme the file declares for RoPE.
+///
+/// Long-context variants stretch or interpolate positions rather than
+/// rotating them as written — linear interpolation, YaRN, LongRoPE. Each
+/// changes the angle at every position, so a loader that reads the base
+/// and ignores the scheme is not loading the same model.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RopeScaling {
+    /// `{arch}.rope.scaling.type`, or `linear` when only the legacy
+    /// `{arch}.rope.scale_linear` key is present.
+    pub kind: String,
+    /// The declared factor, where the file gives one.
+    pub factor: Option<f32>,
+}
+
+impl RopeScaling {
+    /// Read the declaration, returning `None` when it is the identity.
+    ///
+    /// A type of `none` is the identity whatever factor accompanies it,
+    /// and so is a factor of exactly one, which is how producers write
+    /// "no scaling" when they write the key at all.
+    fn from_gguf(model: &GgufModel) -> Result<Option<Self>, GgufError> {
+        let kind = opt_string(model, "rope.scaling.type")?;
+        let factor = opt_f32(model, "rope.scaling.factor")?;
+        let legacy = opt_f32(model, "rope.scale_linear")?;
+
+        // An explicit `none` settles it, whatever factor sits beside it —
+        // producers write both keys and mean the type.
+        if kind
+            .as_deref()
+            .is_some_and(|k| k.eq_ignore_ascii_case("none"))
+        {
+            return Ok(None);
+        }
+        if let Some(kind) = kind {
+            // Linear by a factor of one is the identity. Other schemes are
+            // not read as identities even at one, because they carry more
+            // than a factor.
+            if kind.eq_ignore_ascii_case("linear") && factor.unwrap_or(1.0) == 1.0 {
+                return Ok(None);
+            }
+            return Ok(Some(Self { kind, factor }));
+        }
+        // No type, but a factor on its own still scales.
+        for candidate in [factor, legacy] {
+            if let Some(factor) = candidate.filter(|f| *f != 1.0) {
+                return Ok(Some(Self {
+                    kind: "linear".to_string(),
+                    factor: Some(factor),
+                }));
+            }
+        }
+        Ok(None)
+    }
+}
+
+impl std::fmt::Display for RopeScaling {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.factor {
+            Some(factor) => write!(f, "{} by {factor}", self.kind),
+            None => f.write_str(&self.kind),
+        }
     }
 }
 
@@ -219,9 +288,16 @@ pub struct ModelConfig {
     pub norm_eps: f32,
     /// RoPE base frequency, `{arch}.rope.freq_base`.
     pub rope_theta: f32,
+    /// A RoPE scaling the file declares that is not the identity, or
+    /// `None` when positions are rotated as written.
+    ///
+    /// Carried rather than applied: the graph emits plain base-theta RoPE,
+    /// so a file declaring YaRN or a long-context factor is *refused*. It
+    /// is recorded here so the refusal can name what it found.
+    pub rope_scaling: Option<RopeScaling>,
     /// RoPE base for the sliding-window layers, where the file gives them
-    /// their own — Gemma3's `{arch}.rope.local_freq_base`. `None` means
-    /// every layer rotates with [`Self::rope_theta`].
+    /// their own — Gemma3's `{arch}.rope.freq_base_swa`. `None` means every
+    /// layer rotates with [`Self::rope_theta`].
     pub rope_theta_local: Option<f32>,
     /// How many of each head's dimensions RoPE rotates.
     ///
@@ -234,6 +310,11 @@ pub struct ModelConfig {
     /// Sliding-window width for the layers that use one, or `None` when
     /// every layer attends to the whole prefix.
     pub sliding_window: Option<usize>,
+    /// How many layers one global layer interrupts — Gemma2's alternation
+    /// is 2, Gemma3's five-local-to-one-global is 6, and 1 means every
+    /// layer uses the window. Read from
+    /// `{arch}.attention.sliding_window_pattern` where the file gives it.
+    pub sliding_window_pattern: usize,
     /// Ceiling applied to attention logits, Gemma2's
     /// `{arch}.attn_logit_softcapping`.
     pub attn_logit_softcap: Option<f32>,
@@ -304,10 +385,28 @@ impl ModelConfig {
         };
 
         let rope_theta = opt_f32(model, "rope.freq_base")?.unwrap_or(10_000.0);
-        let rope_theta_local = opt_f32(model, "rope.local_freq_base")?.filter(|v| *v > 0.0);
+        // `rope.freq_base_swa` is the canonical key (llama-arch.cpp's
+        // `LLM_KV_ROPE_FREQ_BASE_SWA`); `rope.local_freq_base` is accepted
+        // as well because some producers write that instead.
+        let rope_theta_local = match opt_f32(model, "rope.freq_base_swa")? {
+            Some(v) => Some(v),
+            None => opt_f32(model, "rope.local_freq_base")?,
+        }
+        .filter(|v| *v > 0.0);
+        let rope_scaling = RopeScaling::from_gguf(model)?;
         let rope_dim = opt_u32(model, "rope.dimension_count")?.unwrap_or(head_dim);
         let context_length = opt_usize(model, "context_length")?.unwrap_or(2048);
         let sliding_window = opt_usize(model, "attention.sliding_window")?.filter(|&w| w > 0);
+        // Gemma3 declares how often a global layer interrupts the local
+        // ones. Reading it rather than hard-coding six means a file that
+        // says otherwise is honoured instead of quietly reinterpreted.
+        let sliding_window_pattern = opt_usize(model, "attention.sliding_window_pattern")?
+            .filter(|&p| p > 0)
+            .unwrap_or(match architecture {
+                Architecture::Gemma2 => 2,
+                Architecture::Gemma3 => 6,
+                _ => 1,
+            });
         let attn_logit_softcap = opt_f32(model, "attn_logit_softcapping")?.filter(|v| *v > 0.0);
         let final_logit_softcap = opt_f32(model, "final_logit_softcapping")?.filter(|v| *v > 0.0);
 
@@ -328,9 +427,11 @@ impl ModelConfig {
             norm_eps,
             rope_theta,
             rope_theta_local,
+            rope_scaling,
             rope_dim,
             context_length,
             sliding_window,
+            sliding_window_pattern,
             attn_logit_softcap,
             final_logit_softcap,
             tie_word_embeddings,
@@ -354,18 +455,18 @@ impl ModelConfig {
     /// whole prefix.
     ///
     /// The two Gemmas interleave differently — Gemma2 alternates one for
-    /// one, Gemma3 takes five local layers to each global one, the global
-    /// being every sixth. A model with no window attends fully everywhere,
-    /// and one with a window and no interleaving pattern uses it in every
-    /// layer.
+    /// one, Gemma3 takes five local layers to each global one — and both
+    /// fall out of [`Self::sliding_window_pattern`]: the global layer is
+    /// every `pattern`-th, and the rest are local. A pattern of 1 makes
+    /// every layer windowed, and a model with no window attends fully
+    /// everywhere.
     pub fn layer_is_windowed(&self, index: usize) -> bool {
-        match self.sliding_window {
-            None => false,
-            Some(_) => match self.architecture {
-                Architecture::Gemma2 => index.is_multiple_of(2),
-                Architecture::Gemma3 => !(index + 1).is_multiple_of(6),
-                _ => true,
-            },
+        if self.sliding_window.is_none() {
+            return false;
+        }
+        match self.sliding_window_pattern {
+            0 | 1 => true,
+            pattern => !(index + 1).is_multiple_of(pattern),
         }
     }
 
@@ -450,6 +551,14 @@ fn opt_u32(model: &GgufModel, suffix: &str) -> Result<Option<u32>, GgufError> {
 
 fn opt_f32(model: &GgufModel, suffix: &str) -> Result<Option<f32>, GgufError> {
     Ok(typed(model, suffix, "a number", GgufValue::as_f64)?.map(|v| v as f32))
+}
+
+fn opt_string(model: &GgufModel, suffix: &str) -> Result<Option<String>, GgufError> {
+    Ok(typed(model, suffix, "a string", |v| match *v {
+        GgufValue::String(ref s) => Some(s.as_str()),
+        _ => None,
+    })?
+    .map(str::to_string))
 }
 
 fn require_usize(model: &GgufModel, suffix: &str) -> Result<usize, GgufError> {
@@ -707,7 +816,6 @@ mod tests {
         assert!(!Architecture::Qwen3.qkv_bias());
         assert!(Architecture::Qwen3.qk_norm());
         assert!(Architecture::Gemma.scales_embeddings());
-        assert!(Architecture::Gemma.norm_weight_offset_by_one());
         assert!(!Architecture::Gemma.post_block_norms());
         assert!(Architecture::Gemma2.post_block_norms());
         assert!(Architecture::Phi2.uses_gelu_mlp());

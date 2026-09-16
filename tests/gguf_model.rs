@@ -803,3 +803,140 @@ fn the_llama_family_unpermutes_its_rope_pairs_and_qwen_does_not() {
          logits differ by only {spread} against a scale of {scale}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Generation state across calls
+//
+// A generator keeps its KV cache between calls, so a second `generate` is a
+// continuation of the first. Two things have to agree with that: the
+// sequence markers the tokenizer inserts, and what a cancelled callback
+// leaves behind. Both are only visible by comparing a text-level run
+// against the equivalent token-level one.
+// ---------------------------------------------------------------------------
+
+/// `tiny_llama`, but the vocabulary declares an automatic BOS.
+fn bos_bearing_model() -> GgufModel {
+    let mut model = tiny_llama();
+    model.metadata.insert(
+        "tokenizer.ggml.add_bos_token".to_string(),
+        GgufValue::Bool(true),
+    );
+    model
+        .metadata
+        .insert("tokenizer.ggml.bos_token_id".to_string(), GgufValue::U32(0));
+    model
+}
+
+fn generator_for(model: &GgufModel) -> Generator {
+    Generator::with_options(
+        model,
+        &GeneratorOptions {
+            max_seq_len: 64,
+            prefill_block: 4,
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn continuing_a_text_generation_does_not_insert_a_second_bos() {
+    let model = bos_bearing_model();
+
+    // Two text calls in a row. The second continues the first, so only the
+    // first may carry the automatic BOS.
+    let mut streamed = generator_for(&model);
+    streamed
+        .generate(
+            "ab",
+            &GenerationOptions {
+                max_tokens: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let after_first = streamed.position();
+    streamed
+        .generate(
+            "cd",
+            &GenerationOptions {
+                max_tokens: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    // The same sequence fed as tokens, which never inserts markers.
+    let vocab_model = bos_bearing_model();
+    let vocab = Generator::with_options(
+        &vocab_model,
+        &GeneratorOptions {
+            max_seq_len: 64,
+            prefill_block: 4,
+        },
+    )
+    .unwrap();
+    let continuation = vocab.vocab().unwrap().encode_plain("cd");
+    drop(vocab);
+
+    let mut tokened = generator_for(&model);
+    tokened
+        .generate(
+            "ab",
+            &GenerationOptions {
+                max_tokens: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        tokened.position(),
+        after_first,
+        "the first calls must agree"
+    );
+    tokened.feed(&continuation).unwrap();
+
+    assert_eq!(
+        streamed.position() - after_first,
+        // The text call also appends its two generated tokens.
+        tokened.position() - after_first + 2,
+        "the continuation should add the prompt's tokens and no marker"
+    );
+}
+
+#[test]
+fn a_cancelled_callback_leaves_the_same_state_as_stopping_by_max_tokens() {
+    let model = tiny_llama();
+    let options = GenerationOptions {
+        max_tokens: 8,
+        ..Default::default()
+    };
+
+    // Stop after the first shown piece by returning false.
+    let mut cancelled = generator_for(&model);
+    let mut seen = String::new();
+    cancelled
+        .generate_streaming("ab", &options, |piece| {
+            seen.push_str(piece);
+            false
+        })
+        .unwrap();
+
+    // The same one token of output, stopped by the budget instead.
+    let mut budgeted = generator_for(&model);
+    let text = budgeted
+        .generate(
+            "ab",
+            &GenerationOptions {
+                max_tokens: 1,
+                ..options
+            },
+        )
+        .unwrap();
+
+    assert_eq!(seen, text, "both should show the same output");
+    assert_eq!(
+        cancelled.position(),
+        budgeted.position(),
+        "a token the caller was shown belongs in the cache either way"
+    );
+}
