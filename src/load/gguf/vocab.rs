@@ -273,7 +273,7 @@ impl Vocab {
         let Some(text) = self.tokens.get(id as usize) else {
             return;
         };
-        match self.kinds.get(id as usize) {
+        match self.kinds.get(id as usize).copied() {
             // Markers are structure, not text. A chat template puts them
             // in; rendering them back would show the scaffolding.
             Some(TokenKind::Control) => {}
@@ -355,8 +355,8 @@ impl Vocab {
             let rest = &text[at..];
             let hit = added
                 .iter()
-                .filter(|(marker, _)| rest.starts_with(marker))
-                .max_by_key(|(marker, _)| marker.len());
+                .filter(|&&(marker, _)| rest.starts_with(marker))
+                .max_by_key(|&&(marker, _)| marker.len());
             if let Some(&(marker, id)) = hit {
                 if start < at {
                     pieces.push(Piece::Text(&text[start..at]));
@@ -471,8 +471,8 @@ impl Vocab {
 
     fn push_byte_fallback(&self, symbol: &str, out: &mut Vec<u32>) {
         for &b in symbol.as_bytes() {
-            if let Some(Some(id)) = self.byte_ids.get(b as usize) {
-                out.push(*id);
+            if let Some(Some(id)) = self.byte_ids.get(b as usize).copied() {
+                out.push(id);
             } else if let Some(unk) = self.unknown {
                 out.push(unk);
             }
@@ -1158,8 +1158,9 @@ mod tests {
     fn a_marker_in_the_prompt_is_matched_literally() {
         let mut m = bpe_model();
         // Add a chat marker after the merges, as a template would use.
-        let Some(GgufValue::Array(tokens)) = m.metadata.get_mut("tokenizer.ggml.tokens") else {
-            unreachable!()
+        let tokens = match m.metadata.get_mut("tokenizer.ggml.tokens") {
+            Some(&mut GgufValue::Array(ref mut tokens)) => tokens,
+            _ => unreachable!(),
         };
         tokens.push(GgufValue::String("<|im_start|>".to_string()));
         let marker_id = (tokens.len() - 1) as u32;
