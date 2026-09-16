@@ -92,6 +92,10 @@ use std::sync::Arc;
 use crate::graph::DType;
 
 pub use arch::{Architecture, ModelConfig};
+pub use generate::{GenerationOptions, Generator, GeneratorOptions};
+pub use graph::ModelGraph;
+pub use vocab::{TokenizerKind, Vocab};
+pub use weights::LoadReport;
 
 /// Errors that can occur during GGUF import.
 #[derive(Debug)]

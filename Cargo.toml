@@ -15,6 +15,9 @@ exclude = ["/paper/"]
 name = "smoke"
 
 [[test]]
+name = "gguf_model"
+
+[[test]]
 name = "regression"
 
 # These tests change process-global environment variables.
