@@ -1098,8 +1098,14 @@ enum Variant {
     /// is set; the kind sequence alone determines the shader, since buffer
     /// IDs are resolved at dispatch time.
     CoopPrologue(ShaderEntry, Vec<crate::compile::PrologueLoadKind>),
-    /// GEMV with a RmsNorm folded into its A operand.
-    GemvRmsNorm(ShaderEntry),
+    /// GEMV with a RmsNorm folded into its A operand, at a weight format
+    /// and measured shape. Packing and width are part of the key so a Q4_0
+    /// winner cannot be installed on an f32 fused GEMV of the same extents.
+    GemvRmsNorm(
+        ShaderEntry,
+        crate::compile::WeightFormat,
+        crate::codegen::GemvShape,
+    ),
     /// The Q8_1-activation, integer-dot K-split GEMV at a measured shape.
     /// Only ever paired with a GGML Q4_0 weight, so the format is implied.
     GemvIntDot(ShaderEntry, crate::codegen::GemvShape),
@@ -1157,7 +1163,7 @@ impl Variant {
             | Variant::Epilogue(ref e, _)
             | Variant::CoopEpilogue(ref e, _)
             | Variant::CoopPrologue(ref e, _)
-            | Variant::GemvRmsNorm(ref e)
+            | Variant::GemvRmsNorm(ref e, _, _)
             | Variant::Gemv(ref e, _, _)
             | Variant::GemvIntDot(ref e, _)
             | Variant::Weight(ref e, _)
@@ -1183,7 +1189,10 @@ impl Variant {
             Variant::CoopPrologue(ref e, ref kinds) => {
                 format!("{e:?}:cooperative-prologue:{kinds:?}")
             }
-            Variant::GemvRmsNorm(ref e) => format!("{e:?}:rmsnorm"),
+            Variant::GemvRmsNorm(ref e, format, shape) => format!(
+                "{e:?}:rmsnorm-{format:?}-{}t-{:?}",
+                shape.threads, shape.reduction
+            ),
             Variant::GemvIntDot(ref e, shape) => {
                 format!("{e:?}:gemv-q40-q8-{}t-{:?}", shape.threads, shape.reduction)
             }
@@ -1572,20 +1581,24 @@ impl Pipelines {
         // module is derived from the plain GEMV, so it needs no ShaderGroup
         // of its own; it is a variant of `MatMulGemv`, resolved by
         // `get_pipeline` the same way a weight format is.
-        if let Some(fused) = plan.dispatches.iter().find(|d| d.gemv_rmsnorm.is_some()) {
-            // The fused form is not tuned, but it must still honour a shape
-            // the caller pinned, or a benchmark would compare a chosen width
-            // against a default one.
-            let sm =
-                crate::codegen::generate_module_gemv_rmsnorm(fused.gemv_shape.unwrap_or_else(
-                    || crate::codegen::GemvShape::initial(ShaderGroup::MatMulGemv),
-                ));
+        let mut fused_keys = std::collections::HashSet::new();
+        for fused in plan.dispatches.iter().filter(|d| d.gemv_rmsnorm.is_some()) {
+            let shape = fused
+                .gemv_shape
+                .unwrap_or_else(|| crate::codegen::GemvShape::initial(ShaderGroup::MatMulGemv));
+            let key = Variant::GemvRmsNorm(fused.shader.clone(), fused.weight_format, shape);
+            if !fused_keys.insert(key.clone()) {
+                continue;
+            }
+            let sm = crate::codegen::generate_module_gemv_rmsnorm(shape, fused.weight_format);
             let shader = create_gen_shader(gpu, sm, wgsl_dump_dir);
-            let entry = ShaderEntry::MatMulGemv;
             let layout = <MatMulRmsNormData as blade_graphics::ShaderData>::layout();
-            let key = Variant::GemvRmsNorm(entry.clone());
-            let pipeline =
-                create_profiled_pipeline(gpu, key.label(), &layout, shader.at(entry.entry_point()));
+            let pipeline = create_profiled_pipeline(
+                gpu,
+                key.label(),
+                &layout,
+                shader.at(fused.shader.entry_point()),
+            );
             map.insert(key, pipeline);
         }
 
@@ -1917,7 +1930,14 @@ impl Pipelines {
         // for the unfused forms, so the two never compete for the same
         // dispatch — the ordering just makes that explicit.
         if dispatch.gemv_rmsnorm.is_some() {
-            out.push(Variant::GemvRmsNorm(entry.clone()));
+            let shape = dispatch
+                .gemv_shape
+                .unwrap_or_else(|| crate::codegen::GemvShape::initial(entry.shader_group()));
+            return vec![Variant::GemvRmsNorm(
+                entry.clone(),
+                dispatch.weight_format,
+                shape,
+            )];
         }
         if let Some(shape) = dispatch.gemv_shape {
             out.push(Variant::Gemv(entry.clone(), dispatch.weight_format, shape));
@@ -2231,16 +2251,21 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         | ShaderEntry::Log
         | ShaderEntry::Recip
         | ShaderEntry::Silu => UnaryData::layout(),
-        ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater | ShaderEntry::SwiGLU => {
-            BinaryData::layout()
-        }
+        ShaderEntry::Add
+        | ShaderEntry::Mul
+        | ShaderEntry::Greater
+        | ShaderEntry::SwiGLU
+        | ShaderEntry::GeGLU => BinaryData::layout(),
         ShaderEntry::PairwiseGrad => TernaryData::layout(),
         ShaderEntry::BiasAdd | ShaderEntry::BiasMul => BiasAddData::layout(),
         ShaderEntry::SgdUpdate => SgdData::layout(),
         ShaderEntry::AdamUpdate => AdamData::layout(),
         ShaderEntry::ScatterAdd => ScatterAddData::layout(),
         ShaderEntry::ScatterAddAtomic => ScatterAddAtomicData::layout(),
-        ShaderEntry::SwiGLUConcat | ShaderEntry::SwiGLUConcatGrad => BinaryData::layout(),
+        ShaderEntry::SwiGLUConcat
+        | ShaderEntry::SwiGLUConcatGrad
+        | ShaderEntry::GeGLUConcat
+        | ShaderEntry::GeGLUConcatGrad => BinaryData::layout(),
         ShaderEntry::SumAll | ShaderEntry::MeanAll | ShaderEntry::SumRows => UnaryData::layout(),
         ShaderEntry::Softmax => SoftmaxData::layout(),
         ShaderEntry::CrossEntropyLoss => CrossEntropyData::layout(),
@@ -7476,7 +7501,10 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::SwiGLUConcat | ShaderEntry::SwiGLUConcatGrad => {
+            ShaderEntry::SwiGLUConcat
+            | ShaderEntry::SwiGLUConcatGrad
+            | ShaderEntry::GeGLUConcat
+            | ShaderEntry::GeGLUConcatGrad => {
                 pc.bind(
                     0,
                     &BinaryData {
@@ -7492,7 +7520,11 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater | ShaderEntry::SwiGLU => {
+            ShaderEntry::Add
+            | ShaderEntry::Mul
+            | ShaderEntry::Greater
+            | ShaderEntry::SwiGLU
+            | ShaderEntry::GeGLU => {
                 pc.bind(
                     0,
                     &BinaryData {

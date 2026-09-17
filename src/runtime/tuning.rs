@@ -53,7 +53,12 @@ impl Pipelines {
                 naga_module: Some(module.module),
             })
             .map_err(|error| error.to_string())?;
-        let layout = super::shader_data_layout(&selected_entry);
+        let layout = if dispatch.gemv_rmsnorm.is_some() {
+            use blade_graphics::ShaderData;
+            super::MatMulRmsNormData::layout()
+        } else {
+            super::shader_data_layout(&selected_entry)
+        };
         let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
             name: &key.label(),
             data_layouts: &[&layout],
@@ -103,6 +108,9 @@ fn tile_module(
         if dispatch.gemv_int_dot {
             return crate::codegen::generate_module_gemv_int_dot(group, shape);
         }
+        if dispatch.gemv_rmsnorm.is_some() {
+            return crate::codegen::generate_module_gemv_rmsnorm(shape, dispatch.weight_format);
+        }
         return crate::codegen::generate_module_gemv(group, dispatch.weight_format, shape);
     }
     let selected_entry = tile.shader(entry);
@@ -136,6 +144,9 @@ fn tile_variant(dispatch: &Dispatch, tile: MatmulTile) -> Variant {
     if let MatmulTile::Gemv(shape) = tile {
         if dispatch.gemv_int_dot {
             return Variant::GemvIntDot(entry.clone(), shape);
+        }
+        if dispatch.gemv_rmsnorm.is_some() {
+            return Variant::GemvRmsNorm(entry.clone(), dispatch.weight_format, shape);
         }
         return Variant::Gemv(entry.clone(), dispatch.weight_format, shape);
     }
@@ -240,11 +251,12 @@ fn collect_classes(
             excluded += 1;
             continue;
         };
-        let bindings: Vec<_> = dispatch
-            .input_buffers
-            .iter()
-            .chain(std::iter::once(&dispatch.output_buffer))
-            .collect();
+        let mut binding_refs: Vec<BufferRef> = dispatch.input_buffers.clone();
+        if let Some(ref rn) = dispatch.gemv_rmsnorm {
+            binding_refs.push(rn.weight);
+        }
+        binding_refs.push(dispatch.output_buffer);
+        let bindings: Vec<_> = binding_refs.iter().collect();
         let physical: Vec<_> = bindings.iter().map(|b| alias.map[b.0 as usize]).collect();
         // Do not transfer isolated timings to overlapping bindings, even if
         // readonly input aliasing is legal. It changes the cache working set.
@@ -615,6 +627,13 @@ impl Session {
         let mut dispatch = self.plan.dispatches[class.members[0]].clone();
         dispatch.input_buffers = (0..output_index).map(|i| BufferRef(i as u32)).collect();
         dispatch.output_buffer = BufferRef(output_index as u32);
+        if let Some(ref mut rn) = dispatch.gemv_rmsnorm {
+            // A, B, norm_w, C. bind_dispatch reads A/B from input_buffers
+            // and the norm vector from the fusion record.
+            dispatch.input_buffers = vec![BufferRef(0), BufferRef(1)];
+            rn.weight = BufferRef(2);
+            dispatch.output_buffer = BufferRef(3);
+        }
         let mut variants = [vec![dispatch.clone()], vec![dispatch]];
         outcome.initial.apply(&mut variants[0][0], &class.key);
         outcome.candidate.apply(&mut variants[1][0], &class.key);
@@ -1344,6 +1363,17 @@ fn reference_dot(class: &TuneClass, inputs: &[Vec<f32>], row: usize, col: usize)
     } else {
         0.0
     };
+    let (inv_rms, norm_w) = if class.gemv_rmsnorm {
+        let eps = f32::from_bits(class.gemv_rmsnorm_eps_bits) as f64;
+        let mut ss = 0.0f64;
+        for inner in 0..k {
+            let a = inputs[0][row * k + inner] as f64;
+            ss += a * a;
+        }
+        (1.0 / (ss / k as f64 + eps).sqrt(), Some(&inputs[2]))
+    } else {
+        (1.0, None)
+    };
     for inner in 0..k {
         let a = if class.shader == ShaderEntry::MatMulAT {
             inner * m + row
@@ -1363,7 +1393,11 @@ fn reference_dot(class: &TuneClass, inputs: &[Vec<f32>], row: usize, col: usize)
         } else {
             inner * n + col
         };
-        value += inputs[0][a] as f64 * inputs[1][b] as f64;
+        let mut av = inputs[0][a] as f64;
+        if let Some(w) = norm_w {
+            av *= inv_rms * w[inner] as f64;
+        }
+        value += av * inputs[1][b] as f64;
     }
     value
 }
@@ -1927,6 +1961,7 @@ mod tests {
                     requires_full_precision: true,
                     device_local: [device_local; 4],
                     binding_bytes: Vec::new(),
+                    ..Default::default()
                 };
                 let sizes = class.buffer_sizes().unwrap();
                 let bytes = scratch_bytes(&sizes).unwrap();
@@ -2012,6 +2047,7 @@ mod tests {
                 requires_full_precision: false,
                 device_local: [true; 4],
                 binding_bytes: Vec::new(),
+                ..Default::default()
             };
             let sizes = class.buffer_sizes().unwrap();
             staging.discard_unmatched(*sizes.iter().max().unwrap());
@@ -2110,6 +2146,7 @@ mod tests {
             requires_full_precision: false,
             device_local: [false; 4],
             binding_bytes: vec![32, 96, 12],
+            ..Default::default()
         };
         let a: Vec<f32> = (1..=8).map(|v| v as f32).collect();
         let b: Vec<f32> = (1..=24).map(|v| v as f32).collect();
@@ -2144,6 +2181,7 @@ mod tests {
             requires_full_precision: false,
             device_local: [false; 4],
             binding_bytes: Vec::new(),
+            ..Default::default()
         };
         let normal = vec![
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
@@ -2376,6 +2414,7 @@ mod tests {
                 requires_full_precision: true,
                 device_local: [false; 4],
                 binding_bytes: Vec::new(),
+                ..Default::default()
             };
             let sizes = class.buffer_sizes().unwrap();
             for pattern in 0..2 {

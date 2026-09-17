@@ -16,7 +16,7 @@ use std::time::Duration;
 
 /// Complete key within the supported contiguous-row-major, non-aliasing domain.
 /// No winner is transferred between shapes, directions, or memory placements.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TuneClass {
     pub shader: ShaderEntry,
     pub m: u32,
@@ -41,6 +41,15 @@ pub struct TuneClass {
     /// other with a shape it has no pipeline for.
     #[serde(default)]
     pub gemv_int_dot: bool,
+    /// RmsNorm is folded into this GEMV. A different kernel (second
+    /// reduction + extra binding), so winners do not transfer from the
+    /// unfused class of the same extents.
+    #[serde(default)]
+    pub gemv_rmsnorm: bool,
+    /// `f32::to_bits` of the folded norm's epsilon. Ignored unless
+    /// [`Self::gemv_rmsnorm`].
+    #[serde(default)]
+    pub gemv_rmsnorm_eps_bits: u32,
     /// Placement of A, B, addend (false if absent), and output, respectively.
     pub device_local: [bool; 4],
     /// Declared bytes for A, B, optional addend, output, in binding order.
@@ -322,7 +331,13 @@ impl MatmulTile {
                 return None;
             }
             let sizes = class.buffer_sizes()?;
-            if self.workgroups(class).iter().any(|&n| n == 0 || n > 65_535) {
+            // GEMV workgroup count is N/4, independent of thread count.
+            // Vocab-width decode (N=262144) needs 65536 groups — one past the
+            // Vulkan *minimum* maxComputeWorkGroupCount. The live plan already
+            // dispatches that on devices that advertise more; applying the
+            // portable 65535 cap here would drop the kernel that dominates
+            // Gemma 4 logits from `tune_with`.
+            if self.workgroups(class).iter().any(|&n| n == 0) {
                 return None;
             }
             return Some(sizes);
@@ -403,9 +418,6 @@ impl TuneClass {
             // search. The GEMV shape axis leaves the decoder alone and is the
             // one candidate that can carry a packed weight.
             || (!gemv && dispatch.weight_format.uses_reduced_storage())
-            // A folded RmsNorm is a different kernel with a second reduction
-            // of its own; it is not shaped here.
-            || dispatch.gemv_rmsnorm.is_some()
             || dispatch.horizontal_batch >= 2
             || dispatch.matmul_prologue.is_some()
             || dispatch.matmul_epilogue.is_some()
@@ -494,6 +506,12 @@ impl TuneClass {
             requires_full_precision: dispatch.requires_full_precision,
             weight_format: dispatch.weight_format,
             gemv_int_dot: dispatch.gemv_int_dot,
+            gemv_rmsnorm: dispatch.gemv_rmsnorm.is_some(),
+            gemv_rmsnorm_eps_bits: dispatch
+                .gemv_rmsnorm
+                .as_ref()
+                .map(|rn| rn.eps_bits)
+                .unwrap_or(0),
             device_local: [false; 4],
             binding_bytes: Vec::new(),
         };
@@ -560,6 +578,9 @@ impl TuneClass {
             bytes(self.k, self.n)?
         };
         let mut sizes = vec![bytes(self.m, self.k)?, b_bytes];
+        if self.gemv_rmsnorm {
+            sizes.push(bytes(self.m, self.k)?);
+        }
         if self.has_addend() {
             sizes.push(bytes(self.m, self.n)?);
         }
@@ -1159,6 +1180,113 @@ mod tests {
         }
     }
 
+    /// RMSNorm folded into a packed Q4_0 GEMV is its own search class, and
+    /// the subgroup-reduction shapes are legal challengers. Without this,
+    /// `tune_with` would skip the kernels that dominate Gemma 4 decode.
+    #[test]
+    fn fused_packed_q40_gemv_is_searchable_including_subgroup() {
+        use crate::codegen::{GemvReduction, GemvShape};
+
+        const K: usize = 256;
+        const N: usize = 64;
+        let mut graph = crate::Graph::new();
+        let x = graph.input("x", &[1, K]);
+        let nw = graph.parameter("nw", &[K]);
+        let h = graph.rms_norm(x, nw, 1e-5);
+        let w = graph.parameter_q40("w", &[K, N]);
+        let y = graph.matmul(h, w);
+        graph.set_outputs(vec![y]);
+        let mut plan = crate::compile::compile_with(&graph, &Default::default());
+        crate::compile::fuse_rmsnorm_into_gemv(&mut plan);
+        let dispatch = plan
+            .dispatches
+            .iter()
+            .find(|d| d.shader == ShaderEntry::MatMulGemv && d.gemv_rmsnorm.is_some())
+            .expect("packed GEMV did not absorb the RmsNorm");
+        assert!(
+            plan.dispatches
+                .iter()
+                .all(|d| d.shader != ShaderEntry::RmsNorm)
+        );
+        let mut class =
+            TuneClass::from_dispatch(dispatch, None).expect("fused packed Q4_0 GEMV is tunable");
+        assert!(class.gemv_rmsnorm);
+        assert_eq!(class.weight_format, crate::compile::WeightFormat::Q40);
+        assert_eq!((class.m, class.n, class.k), (1, N as u32, K as u32));
+        let mut bindings: Vec<_> = dispatch.input_buffers.clone();
+        bindings.push(dispatch.gemv_rmsnorm.as_ref().unwrap().weight);
+        bindings.push(dispatch.output_buffer);
+        class.binding_bytes = bindings
+            .iter()
+            .map(|b| plan.buffers[b.0 as usize])
+            .collect();
+        let initial = MatmulTile::selected(dispatch, None).unwrap();
+        let challengers = class.challengers(initial, None);
+        assert!(
+            challengers.iter().any(|tile| matches!(
+                tile,
+                MatmulTile::Gemv(GemvShape {
+                    reduction: GemvReduction::Subgroup,
+                    ..
+                })
+            )),
+            "fused packed GEMV has no subgroup challenger: {challengers:?}"
+        );
+        assert!(
+            MatmulTile::Gemv(GemvShape {
+                threads: 64,
+                reduction: GemvReduction::Subgroup,
+            })
+            .fits(&class),
+            "64-wide subgroup fused Q4_0 GEMV must fit the class scratch"
+        );
+    }
+
+    /// Gemma 4's tied vocab projection is Q8, M=1, N=262144. That is 65536
+    /// workgroups, which the portable 65535 cap used to reject, so `tune_with`
+    /// never measured subgroup variants of the costliest decode kernel.
+    #[test]
+    fn vocab_width_q8_rmsnorm_gemv_is_searchable_past_portable_workgroup_min() {
+        use crate::codegen::{GemvReduction, GemvShape};
+
+        const K: u32 = 1536;
+        const N: u32 = 262_144;
+        let dispatch = Dispatch {
+            shader: ShaderEntry::MatMulGemv,
+            params: vec![1, K, N, 0],
+            workgroups: [N / 4, 1, 1],
+            weight_format: crate::compile::WeightFormat::Q8,
+            gemv_rmsnorm: Some(crate::compile::GemvRmsNorm {
+                weight: crate::compile::BufferRef(2),
+                eps_bits: 1e-6f32.to_bits(),
+            }),
+            input_buffers: vec![crate::compile::BufferRef(0), crate::compile::BufferRef(1)],
+            output_buffer: crate::compile::BufferRef(3),
+            ..Default::default()
+        };
+        let mut class = TuneClass::from_dispatch(&dispatch, None)
+            .expect("vocab-width fused Q8 GEMV must be a tune class");
+        assert!(class.gemv_rmsnorm);
+        assert_eq!(class.weight_format, crate::compile::WeightFormat::Q8);
+        assert_eq!((class.m, class.n, class.k), (1, N, K));
+        class.binding_bytes = vec![K as usize * 4, 428_000_000, K as usize * 4, N as usize * 4];
+        let initial = MatmulTile::selected(&dispatch, None).unwrap();
+        assert!(
+            initial.fits(&class),
+            "vocab-width GEMV must survive the workgroup-count check"
+        );
+        assert!(
+            class.challengers(initial, None).iter().any(|tile| matches!(
+                tile,
+                MatmulTile::Gemv(GemvShape {
+                    reduction: GemvReduction::Subgroup,
+                    ..
+                })
+            )),
+            "vocab-width fused Q8 GEMV has no subgroup challenger"
+        );
+    }
+
     #[test]
     fn complete_geometry_handles_edges_in_both_directions() {
         let mut d = dispatch();
@@ -1650,6 +1778,7 @@ mod tests {
             requires_full_precision: true,
             device_local: [false; 4],
             binding_bytes: Vec::new(),
+            ..Default::default()
         };
         class.binding_bytes = class.buffer_sizes().unwrap();
         class

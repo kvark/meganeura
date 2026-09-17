@@ -201,6 +201,10 @@ path = "examples/qwen3.rs"
 required-features = ["hf-hub"]
 
 [[example]]
+name = "gemma4"
+path = "examples/gemma4.rs"
+
+[[example]]
 name = "grad_check"
 path = "bench/grad_check.rs"
 required-features = ["models"]

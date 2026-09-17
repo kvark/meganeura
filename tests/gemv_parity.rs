@@ -119,6 +119,73 @@ fn gemv_smolvla_shapes() {
 }
 
 #[test]
+fn q40_rmsnorm_folds_into_gemv() {
+    const K: usize = 256;
+    const N: usize = 64;
+    const BLOCK: usize = 32;
+    let x: Vec<f32> = (0..K).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
+    let nw: Vec<f32> = (0..K).map(|i| 1.0 + ((i % 5) as f32 - 2.0) * 0.1).collect();
+    let mut packed = Vec::new();
+    let mut reference = vec![0.0f32; K * N];
+    for col in 0..N {
+        for blk in 0..K / BLOCK {
+            let d = 0.02 + (blk as f32) * 0.001;
+            let d16 = half::f16::from_f32(d).to_f32();
+            packed.extend_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
+            let mut nibbles = [0u8; 16];
+            for j in 0..16 {
+                let q0 = ((blk + j) % 16) as u8;
+                let q1 = ((blk + j + 3) % 16) as u8;
+                nibbles[j] = q0 | (q1 << 4);
+                reference[(blk * BLOCK + j) * N + col] = (f32::from(q0) - 8.0) * d16;
+                reference[(blk * BLOCK + j + 16) * N + col] = (f32::from(q1) - 8.0) * d16;
+            }
+            packed.extend_from_slice(&nibbles);
+        }
+    }
+    packed.resize(packed.len().next_multiple_of(4), 0);
+
+    let mut g = Graph::new();
+    let xin = g.input("x", &[1, K]);
+    let norm = g.parameter("nw", &[K]);
+    let h = g.rms_norm(xin, norm, 1e-5);
+    let w = g.parameter_q40("w", &[K, N]);
+    let y = g.matmul(h, w);
+    g.set_outputs(vec![y]);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    let fused = session
+        .plan()
+        .dispatches
+        .iter()
+        .filter(|d| d.gemv_rmsnorm.is_some())
+        .count();
+    assert_eq!(fused, 1, "Q40 GEMV should fold the RmsNorm");
+    assert!(
+        session
+            .plan()
+            .dispatches
+            .iter()
+            .all(|d| d.shader != compile::ShaderEntry::RmsNorm)
+    );
+    session.set_input("x", &x);
+    session.set_parameter("nw", &nw);
+    session.set_parameter_packed("w", &packed);
+    session.step();
+    session.wait();
+    let gpu = session.read_output(N);
+
+    let ms = x.iter().map(|v| v * v).sum::<f32>() / K as f32;
+    let inv = (ms + 1e-5).sqrt().recip();
+    let mut want = vec![0.0f32; N];
+    for col in 0..N {
+        for i in 0..K {
+            want[col] += x[i] * inv * nw[i] * reference[i * N + col];
+        }
+    }
+    assert_close_named("Q40 RmsNorm GEMV", &gpu, &want, 2e-2, 2e-2);
+}
+
+#[test]
 fn gemv_non_multiple_of_256() {
     // N not a multiple of the workgroup size — exercises the
     // `col < n` bounds check at the tail.

@@ -510,6 +510,36 @@ pub fn differentiate(forward: &Graph) -> Graph {
                     graph.add_raw_node(Op::SwiGLUConcatGrad, vec![grad_output, input], input_ty);
                 accumulate_grad(&mut graph, &mut grads, input, grad_input);
             }
+            Op::GeGLU => {
+                let gate = node.inputs[0];
+                let up = node.inputs[1];
+                let gelu_g = graph.gelu(gate);
+                let grad_up = graph.mul(grad_output, gelu_g);
+                accumulate_grad(&mut graph, &mut grads, up, grad_up);
+                let dgelu_in = graph.mul(grad_output, up);
+                let x = gate;
+                let x_shape = &forward.nodes()[x as usize].ty.shape;
+                let n = x_shape.iter().product();
+                let k_const = graph.constant(vec![1.702; n], x_shape);
+                let kx = graph.mul(k_const, x);
+                let sig_kx = graph.sigmoid(kx);
+                let ones = graph.constant(vec![1.0; n], x_shape);
+                let neg_sig = graph.neg(sig_kx);
+                let one_minus_sig = graph.add(ones, neg_sig);
+                let inner = graph.mul(kx, one_minus_sig);
+                let ones2 = graph.constant(vec![1.0; n], x_shape);
+                let bracket = graph.add(ones2, inner);
+                let dgelu = graph.mul(sig_kx, bracket);
+                let grad_gate = graph.mul(dgelu_in, dgelu);
+                accumulate_grad(&mut graph, &mut grads, x, grad_gate);
+            }
+            Op::GeGLUConcat => {
+                let input = node.inputs[0];
+                let input_ty = forward.nodes()[input as usize].ty.clone();
+                let grad_input =
+                    graph.add_raw_node(Op::GeGLUConcatGrad, vec![grad_output, input], input_ty);
+                accumulate_grad(&mut graph, &mut grads, input, grad_input);
+            }
             Op::RmsNorm { eps } => {
                 let x = node.inputs[0];
                 let w = node.inputs[1];
@@ -654,6 +684,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::SwiGLUGradUp
             | Op::SiluGrad
             | Op::SwiGLUConcatGrad
+            | Op::GeGLUConcatGrad
             | Op::RmsNormGradW { .. }
             | Op::RmsNormGradX { .. }
             | Op::LayerNormGradWB { .. }
