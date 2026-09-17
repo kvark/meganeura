@@ -57,10 +57,12 @@
   decoder this replaces folded it to zero and erased the block. Needs
   Blade's `SHADER_FLOAT16_IN_FLOAT32`, hence the dependency bump.
 
-  A GGUF file is read once and shared: tensors index ranges of one buffer
-  rather than owning copies, and `to_packed` borrows it for the K-quants,
-  so loading costs roughly the file rather than the file plus a copy of
-  every payload.
+  A GGUF file is mapped once and shared: tensors index ranges of that
+  mapping rather than owning copies, and `to_packed` borrows it for the
+  K-quants. `load_gguf` does not `read()` the file into a heap buffer;
+  pages fault in when a tensor is first touched. `load_gguf_bytes` /
+  `load_gguf_shared` still own an in-memory copy for tests and embedded
+  payloads.
 
   These are the first load-only formats: no K-quant encoder is implemented
   here, so they only ever arrive already packed. `set_parameter` rejects

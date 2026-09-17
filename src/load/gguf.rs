@@ -58,6 +58,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -304,6 +305,38 @@ impl GgufValue {
     }
 }
 
+/// Shared backing for every tensor in a GGUF file.
+///
+/// Disk loads map the file; in-memory loads own a copy. Tensors only store
+/// a range into this buffer, so packing a K-quant still borrows the file.
+#[derive(Clone)]
+enum GgufBytes {
+    Owned(Arc<[u8]>),
+    Mapped(Arc<memmap2::Mmap>),
+}
+
+impl GgufBytes {
+    fn as_slice(&self) -> &[u8] {
+        match *self {
+            Self::Owned(ref bytes) => bytes,
+            Self::Mapped(ref map) => map,
+        }
+    }
+
+    #[cfg(test)]
+    fn is_mapped(&self) -> bool {
+        matches!(*self, Self::Mapped(_))
+    }
+}
+
+impl Deref for GgufBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
 /// One tensor: its logical shape, its GGML type, and its bytes exactly as
 /// they appear in the file.
 #[derive(Clone)]
@@ -314,7 +347,7 @@ pub struct GgufTensor {
     /// How the bytes are encoded.
     pub ggml_type: GgmlType,
     /// The whole file, shared by every tensor in the model.
-    file: Arc<[u8]>,
+    file: GgufBytes,
     /// This tensor's slice of it. Empty for a type whose block size is
     /// unknown, since there is no way to say where its bytes end.
     range: std::ops::Range<usize>,
@@ -338,7 +371,7 @@ impl GgufTensor {
         Self {
             dims,
             ggml_type,
-            file: Arc::from(data),
+            file: GgufBytes::Owned(Arc::from(data)),
             range,
         }
     }
@@ -750,10 +783,17 @@ impl<'a> Reader<'a> {
 
 /// Load a GGUF file from disk.
 ///
-/// The file is retained once and shared by every tensor rather than copied
-/// into one allocation per payload.
+/// The file is mapped read-only and shared by every tensor. That is the
+/// same contract llama.cpp uses: open is a syscall, and pages enter memory
+/// when a tensor is first touched rather than as a multi-gigabyte `read()`.
+/// The mapping is invalid if the file is truncated while the model is alive.
 pub fn load_gguf(path: &Path) -> Result<GgufModel, GgufError> {
-    load_gguf_shared(Arc::from(std::fs::read(path)?))
+    let file = std::fs::File::open(path)?;
+    // SAFETY: the mapping is `PROT_READ`. Weights are not written through
+    // it. Another process truncating or rewriting the file while this
+    // mapping lives is undefined, as with llama.cpp's mmap loader.
+    let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
+    load_gguf_from(GgufBytes::Mapped(Arc::new(map)))
 }
 
 /// Parse a GGUF file already in memory.
@@ -768,6 +808,10 @@ pub fn load_gguf_bytes(bytes: &[u8]) -> Result<GgufModel, GgufError> {
 ///
 /// Tensors borrow ranges of this buffer; none of them copies its payload.
 pub fn load_gguf_shared(file: Arc<[u8]>) -> Result<GgufModel, GgufError> {
+    load_gguf_from(GgufBytes::Owned(file))
+}
+
+fn load_gguf_from(file: GgufBytes) -> Result<GgufModel, GgufError> {
     let bytes: &[u8] = &file;
     let mut r = Reader::new(bytes);
     let magic = r.take(4, "magic")?;
@@ -927,7 +971,7 @@ pub fn load_gguf_shared(file: Arc<[u8]>) -> Result<GgufModel, GgufError> {
             GgufTensor {
                 dims: info.dims,
                 ggml_type: info.ggml_type,
-                file: Arc::clone(&file),
+                file: file.clone(),
                 range,
             },
         );
@@ -1709,6 +1753,34 @@ mod tests {
             out.push(0);
         }
         assert!(matches!(load_gguf_bytes(&out), Err(GgufError::BadShape(_))));
+    }
+
+    /// Disk loads map the file. A 3 GiB GGUF must not become a 3 GiB heap
+    /// copy before the first tensor is touched.
+    #[test]
+    fn load_gguf_maps_the_file() {
+        let payload: Vec<u8> = (0..8u32).flat_map(|i| (i as f32).to_le_bytes()).collect();
+        let bytes = Builder::new()
+            .tensor("w", &[4, 2], GgmlType::F32, &payload)
+            .build();
+        let path = std::env::temp_dir().join(format!(
+            "meganeura-gguf-mmap-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&path, &bytes).unwrap();
+        let loaded = load_gguf(&path);
+        let _ = std::fs::remove_file(&path);
+        let model = loaded.unwrap();
+        let tensor = &model.tensors["w"];
+        assert!(
+            tensor.file.is_mapped(),
+            "load_gguf should map the file, not copy it into an Arc<[u8]>"
+        );
+        assert_eq!(tensor.data(), payload.as_slice());
     }
 
     /// Tensors index one shared buffer, and the K-quants hand it straight

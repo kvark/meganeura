@@ -73,6 +73,8 @@ hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustl
 oxionnx-core = "0.1"
 oxionnx-proto = "0.1"
 half = "2"
+# Read-only GGUF mappings. Pin 0.9.11 for the advise/flush range fix.
+memmap2 = "0.9.11"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", optional = true, features = ["registry"] }
 
