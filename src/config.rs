@@ -51,6 +51,16 @@ use crate::runtime::{CoopPolicy, GpuOptions, SessionOptions};
 use crate::train::SessionConfig;
 use std::sync::OnceLock;
 
+/// Every boolean variable shares one decoding: unset → `default`,
+/// `"0"` → off, anything else → on. (Historically some flags treated any
+/// value, including `0`, as on.)
+pub fn decode_bool(raw: Option<&str>, default: bool) -> bool {
+    match raw {
+        None => default,
+        Some(v) => v != "0",
+    }
+}
+
 /// How a variable's value is interpreted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VarKind {
@@ -92,10 +102,7 @@ impl VarSpec {
     /// Boolean read: unset → `default`, `"0"` → `false`, else `true`.
     pub fn bool_or(&self, default: bool) -> bool {
         debug_assert_eq!(self.kind, VarKind::Bool, "{} is not boolean", self.name);
-        match self.raw() {
-            None => default,
-            Some(v) => v != "0",
-        }
+        decode_bool(self.raw().as_deref(), default)
     }
 
     /// `u32` read; unparsable values are ignored with a warning.
@@ -161,6 +168,15 @@ registry! {
         "Extraction objective: ast-size | tensor-traffic.";
     EGRAPH_CUTOFF: "MEGANEURA_EGRAPH_CUTOFF", U32, Diagnostic,
         "Saturation segment-size ceiling (default 300).";
+    GREEDY_PACK_SWIGLU: "MEGANEURA_GREEDY_PACK_SWIGLU", Bool, Diagnostic,
+        "Set to 0 to skip packing consecutive SwiGLU ops into one parameter buffer \
+         during the greedy sweep.";
+    DEVICE_PARAMETERS: "MEGANEURA_DEVICE_PARAMETERS", Text, Diagnostic,
+        "Experimental placement of unaliased parameter buffers on the device: \
+         1 → device-transient, device-buddy → device (default: host-visible).";
+    REUSE_UPLOAD: "MEGANEURA_REUSE_UPLOAD", Bool, Diagnostic,
+        "Reuse one staging buffer across set_parameter uploads instead of \
+         restaging per parameter.";
 
     // --- Tuning defaults (explicit code-level options win) ---
     TUNE: "MEGANEURA_TUNE", Bool, Tuning,
@@ -173,6 +189,11 @@ registry! {
         "EPT cap for the fused flash dK/dV backward kernel.";
     FLASH_BWD_EPT_CAP: "MEGANEURA_FLASH_BWD_EPT_CAP", U32, Tuning,
         "Shared fallback EPT cap for both flash backward kernels.";
+    MATMUL_K_STAGE: "MEGANEURA_MATMUL_K_STAGE", Text, Tuning,
+        "K staging depth of the scalar tiled matmul: 8 | 16 | 32 (default 32).";
+    INTERLEAVE_COLUMNS: "MEGANEURA_INTERLEAVE_COLUMNS", Bool, Tuning,
+        "Stagger scalar-matmul B loads across columns (16 lanes apart) instead of \
+         tying a thread to consecutive columns.";
 
     // --- Resource / mode selection ---
     DEVICE_ID: "MEGANEURA_DEVICE_ID", Text, Selection,
@@ -234,6 +255,7 @@ impl OptimizeConfig {
                 log::warn!("MEGANEURA_EGRAPH_CUTOFF must be > 0; using the default");
             }
         }
+        config.greedy_pack_swiglu = GREEDY_PACK_SWIGLU.bool_or(true);
         config
     }
 }
@@ -255,7 +277,7 @@ impl TuningKnobs {
         let d = Self::default();
         let bwd = cap(&FLASH_BWD_EPT_CAP);
         let fwd = cap(&FLASH_EPT_CAP);
-        Self {
+        let mut knobs = Self {
             flash_ept_cap: fwd.unwrap_or(d.flash_ept_cap),
             flash_grad_q_ept_cap: cap(&FLASH_GRAD_Q_EPT_CAP)
                 .or(bwd)
@@ -265,7 +287,25 @@ impl TuningKnobs {
                 .or(bwd)
                 .or(fwd)
                 .unwrap_or(d.flash_grad_kv_ept_cap),
+            ..Self::default()
+        };
+        // The scalar matmul is codegen'd from these; the resolver installs
+        // them process-wide the same way `set_wgsl_dump_dir` and the coop
+        // caps travel. Must be a valid staging depth or the plain default.
+        if let Some(value) = MATMUL_K_STAGE.text() {
+            match value.as_str().parse::<u32>() {
+                Ok(stage @ (8 | 16 | 32)) => knobs.matmul_k_stage = stage,
+                _ => log::warn!(
+                    "MEGANEURA_MATMUL_K_STAGE must be 8, 16 or 32; using the plain-kernel default"
+                ),
+            }
         }
+        knobs.matmul_interleave_columns = INTERLEAVE_COLUMNS.bool_or(false);
+        crate::codegen::set_matmul_knobs(crate::codegen::MatmulKnobs {
+            k_stage: knobs.matmul_k_stage,
+            interleave_columns: knobs.matmul_interleave_columns,
+        });
+        knobs
     }
 }
 
@@ -307,6 +347,17 @@ impl SessionOptions {
             serial_dispatch: SERIAL_DISPATCH.bool_or(false),
             dump_plan: DUMP_PLAN.bool_or(false),
             pin_buffers: PIN_BUFS.text(),
+            // Reuse one staging buffer over restaging per set_parameter call.
+            reuse_upload_staging: REUSE_UPLOAD.bool_or(false),
+            device_parameters: match DEVICE_PARAMETERS.text().as_deref() {
+                None | Some("") | Some("0") => None,
+                Some("1") => Some(blade_graphics::Memory::DeviceTransient),
+                Some("device-buddy") => Some(blade_graphics::Memory::Device),
+                Some(other) => {
+                    log::warn!("unknown MEGANEURA_DEVICE_PARAMETERS={other:?}; using host-visible");
+                    None
+                }
+            },
         }
     }
 }
@@ -490,27 +541,24 @@ mod tests {
         );
     }
 
+    /// The one boolean decoding rule, for every boolean variable: unset
+    /// → the declared default, `0` → off, anything else → on. This is
+    /// tested against [`decode_bool`] rather than by mutating the
+    /// process environment: the resolver's product is configuration,
+    /// a changed env var is a process-global side effect nothing in the
+    /// core should need.
     #[test]
-    fn boolean_overrides_reach_typed_options() {
-        for (value, enabled) in [(None, false), (Some("1"), true), (Some("0"), false)] {
-            for name in ["MEGANEURA_NO_WINOGRAD", "MEGANEURA_GPU_CAPTURE"] {
-                unsafe {
-                    match value {
-                        Some(value) => std::env::set_var(name, value),
-                        None => std::env::remove_var(name),
-                    }
-                }
-            }
-            assert_eq!(
-                crate::optimize::OptimizeConfig::from_env().no_winograd,
-                enabled
-            );
-            assert_eq!(GpuOptions::from_env().capture, enabled);
-            assert!(!GpuOptions::default().capture);
-        }
-        unsafe {
-            std::env::remove_var("MEGANEURA_NO_WINOGRAD");
-            std::env::remove_var("MEGANEURA_GPU_CAPTURE");
+    fn booleans_decode_uniformly() {
+        for (raw, default, expected) in [
+            (None, false, false),
+            (None, true, true),
+            (Some("0"), false, false),
+            (Some("0"), true, false),
+            (Some("1"), false, true),
+            (Some(""), false, true),
+            (Some("anything"), false, true),
+        ] {
+            assert_eq!(decode_bool(raw, default), expected);
         }
     }
 

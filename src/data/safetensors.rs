@@ -9,7 +9,7 @@
 //! use meganeura::data::safetensors::SafeTensorsModel;
 //!
 //! // `SafeTensorsModel::download("dacorvo/mnist-mlp")` fetches from the
-//! // Hub instead, when the `hub` feature is enabled. Embedded assets
+//! // Hub instead, when the `hf-hub` feature is enabled. Embedded assets
 //! // use `SafeTensorsModel::from_bytes`.
 //! let model = SafeTensorsModel::load("model.safetensors".into()).unwrap();
 //! for (name, info) in model.tensor_info() {
@@ -45,9 +45,9 @@ impl SafeTensorsModel {
     ///
     /// Downloads `model.safetensors` from the given repo (e.g. `"dacorvo/mnist-mlp"`).
     ///
-    /// Requires the `hub` feature. Without it, fetch the weights ahead of
+    /// Requires the `hf-hub` feature. Without it, fetch the weights ahead of
     /// time and use [`SafeTensorsModel::load`].
-    #[cfg(feature = "hub")]
+    #[cfg(feature = "hf-hub")]
     pub fn download(repo_id: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let api = hf_hub::api::sync::Api::new()?;
         let repo = api.model(repo_id.to_string());
@@ -112,9 +112,9 @@ impl SafeTensorsModel {
 
     /// Download a specific safetensors file from a HuggingFace Hub repo.
     ///
-    /// Requires the `hub` feature. Without it, fetch the weights ahead of
+    /// Requires the `hf-hub` feature. Without it, fetch the weights ahead of
     /// time and use [`SafeTensorsModel::load`].
-    #[cfg(feature = "hub")]
+    #[cfg(feature = "hf-hub")]
     pub fn download_file(
         repo_id: &str,
         filename: &str,
@@ -259,9 +259,14 @@ impl SafeTensorsModel {
     }
 
     /// Read a tensor as f32 and transpose, auto-converting from BF16 if necessary.
+    ///
+    /// `tile` bounds the transpose staging buffer in elements — `0` means
+    /// untiled. One row at a time (`tile` of 32-ish multiples of the row
+    /// width) keeps large-model imports off the memory ceiling.
     pub fn tensor_f32_auto_transposed(
         &self,
         name: &str,
+        tile: usize,
     ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         let info = self
             .info
@@ -280,19 +285,18 @@ impl SafeTensorsModel {
         let data = self.tensor_f32_auto(name)?;
         let rows = info.shape[0];
         let cols = info.shape[1];
-        let tile = std::env::var("MEGANEURA_TRANSPOSE_TILE")
-            .map(|value| value.parse().expect("transpose tile size"))
-            .unwrap_or(0);
         Ok(super::transpose::transpose(&data, rows, cols, tile))
     }
 
     /// Read a tensor as f32 and transpose it from (rows, cols) to (cols, rows).
     ///
     /// PyTorch Linear layers store weights as (out_features, in_features),
-    /// but meganeura's matmul expects (in_features, out_features).
+    /// but meganeura's matmul expects (in_features, out_features). `tile`
+    /// bounds the staging buffer in elements — `0` means untiled.
     pub fn tensor_f32_transposed(
         &self,
         name: &str,
+        tile: usize,
     ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         let info = self
             .info
@@ -311,9 +315,6 @@ impl SafeTensorsModel {
         let data = self.tensor_f32(name)?;
         let rows = info.shape[0];
         let cols = info.shape[1];
-        let tile = std::env::var("MEGANEURA_TRANSPOSE_TILE")
-            .map(|value| value.parse().expect("transpose tile size"))
-            .unwrap_or(0);
         Ok(super::transpose::transpose(&data, rows, cols, tile))
     }
 }

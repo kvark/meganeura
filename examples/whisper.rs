@@ -8,7 +8,7 @@
 use meganeura::{
     Graph,
     data::safetensors::SafeTensorsModel,
-    models::whisper::{self, WhisperConfig},
+    models::whisper::{self, Config},
 };
 
 const REPO_ID: &str = "openai/whisper-tiny";
@@ -16,7 +16,7 @@ const REPO_ID: &str = "openai/whisper-tiny";
 fn main() {
     env_logger::init();
 
-    let config = WhisperConfig::whisper_tiny();
+    let config = Config::whisper_tiny();
     let batch = 1u32;
     let mel_len = 3000u32; // 30 seconds of audio
 
@@ -80,7 +80,7 @@ fn main() {
         }
         if transposed_set.contains(name.as_str()) {
             let data = model
-                .tensor_f32_auto_transposed(&name)
+                .tensor_f32_auto_transposed(&name, 0)
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
             session.set_parameter(&name, &data);
         } else {

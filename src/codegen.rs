@@ -304,6 +304,47 @@ pub enum EpilogueSource<'a> {
     Ops(&'a [crate::compile::EpilogueOp]),
 }
 
+/// Tuning knobs for the register-tiled scalar matmul codegen.
+///
+/// Defaults are what the plain kernel ships with: 32-row K staging and
+/// sequential columns. `TuningKnobs` (compile.rs) carries the resolved
+/// values, which the config resolver copies in through
+/// [`set_matmul_knobs`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MatmulKnobs {
+    /// K staging depth: how many B rows each shared-memory stage loads
+    /// before the accumulator loop consumes them. 8 | 16 | 32.
+    pub k_stage: u32,
+    /// Stagger the B loads across columns instead of tying a thread to
+    /// `tm` consecutive ones.
+    pub interleave_columns: bool,
+}
+
+impl Default for MatmulKnobs {
+    fn default() -> Self {
+        Self {
+            k_stage: 32,
+            interleave_columns: false,
+        }
+    }
+}
+
+static MATMUL_KNOBS: std::sync::OnceLock<MatmulKnobs> = std::sync::OnceLock::new();
+
+/// Install the matmul codegen knobs the config resolver resolved.
+///
+/// First call wins for the process lifetime, like
+/// [`set_wgsl_dump_dir`]: the generated variants are fixed when a
+/// pipeline is first compiled.
+pub fn set_matmul_knobs(knobs: MatmulKnobs) {
+    let _ = MATMUL_KNOBS.set(knobs);
+}
+
+/// The installed knobs, or the plain-kernel defaults.
+fn matmul_knobs() -> MatmulKnobs {
+    *MATMUL_KNOBS.get().unwrap_or(&MatmulKnobs::default())
+}
+
 /// How to specialize the matmul the epilogue is fused into.
 ///
 /// [`Default`] is the plain f32 64×64 kernel, so a caller that only wants
@@ -934,15 +975,6 @@ fn tiled_matmul_body(
     tiled_gemm_body(tile.tm(), k_tile + 1, tile.bm() + 1, interleave_columns)
 }
 
-fn matmul_k_stage() -> u32 {
-    match std::env::var("MEGANEURA_MATMUL_K_STAGE").as_deref() {
-        Ok("8") => 8,
-        Ok("16") => 16,
-        Ok("32") | Err(_) => 32,
-        value => panic!("unsupported scalar matmul K stage: {value:?}"),
-    }
-}
-
 /// Generate an ordinary scalar convolution with a measured K-tile candidate.
 pub(crate) fn generate_conv_module(
     group: ShaderGroup,
@@ -1293,13 +1325,18 @@ fn matmul_vars_tiled(
     };
     let bm = tile.bm();
     let tm = tile.tm();
+    let knobs = matmul_knobs();
     let k_tile = if b_mode == WeightFormat::F32 {
-        matmul_k_stage()
+        assert!(
+            matches!(knobs.k_stage, 8 | 16 | 32),
+            "unsupported scalar matmul K stage: {}",
+            knobs.k_stage
+        );
+        knobs.k_stage
     } else {
         32
     };
-    let interleave_columns = b_mode == WeightFormat::F32
-        && std::env::var("MEGANEURA_INTERLEAVE_COLUMNS").as_deref() == Ok("1");
+    let interleave_columns = b_mode == WeightFormat::F32 && knobs.interleave_columns;
     let (acc_decl, compute_body, acc_array) = tiled_matmul_body(tile, k_tile, interleave_columns);
     let output_column = if interleave_columns {
         "tx + j * 16u".to_string()
@@ -7217,14 +7254,14 @@ mod tests {
                 small.source, large.source,
                 "{group:?}: small and large epilogue shaders must differ"
             );
-            let k_tile = matmul_k_stage();
+            let k_stage = matmul_knobs().k_stage;
             assert!(
                 small
                     .source
-                    .contains(&format!("array<f32, {}>", 32 * (k_tile + 1)))
+                    .contains(&format!("array<f32, {}>", 32 * (k_stage + 1)))
                     && small
                         .source
-                        .contains(&format!("array<f32, {}>", k_tile * 33)),
+                        .contains(&format!("array<f32, {}>", k_stage * 33)),
                 "{group:?}: small epilogue must stage 32-wide tiles at the requested K depth"
             );
             assert!(

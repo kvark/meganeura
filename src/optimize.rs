@@ -91,6 +91,9 @@ pub struct OptimizeConfig {
     /// with few channels over a large image sits near its boundary; this
     /// makes which side it should be on measurable without a rebuild.
     pub no_winograd: bool,
+    /// Pack consecutive SwiGLU ops into one packed parameter buffer during
+    /// the greedy sweep.
+    pub greedy_pack_swiglu: bool,
 }
 
 impl Default for OptimizeConfig {
@@ -100,6 +103,7 @@ impl Default for OptimizeConfig {
             extraction_cost: ExtractionCost::TensorTraffic,
             saturation_cutoff: SATURATION_CUTOFF,
             no_winograd: false,
+            greedy_pack_swiglu: true,
         }
     }
 }
@@ -467,7 +471,9 @@ fn optimize_greedy(mut g: Graph, config: OptimizeConfig) -> (Graph, OptimizeRepo
         apply_greedy_matmul_add(&mut g, &mut fusions);
         apply_greedy_silu(&mut g, &mut fusions);
         apply_greedy_swiglu(&mut g, &mut fusions);
-        apply_greedy_swiglu_packed(&mut g, &mut fusions);
+        if config.greedy_pack_swiglu {
+            apply_greedy_swiglu_packed(&mut g, &mut fusions);
+        }
         if fusions.len() == before {
             break;
         }
@@ -621,9 +627,6 @@ fn apply_greedy_swiglu(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
 }
 
 fn apply_greedy_swiglu_packed(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
-    if std::env::var("MEGANEURA_GREEDY_PACK_SWIGLU").as_deref() == Ok("0") {
-        return;
-    }
     let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
     for id in node_ids {
         let (gate_id, up_id) = {

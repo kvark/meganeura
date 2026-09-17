@@ -1,7 +1,7 @@
 /// Gradient check: run one meganeura forward+backward pass and emit parameter
 /// gradients as JSON for comparison with a reference implementation (PyTorch).
 ///
-/// By default uses SmolVLAConfig::smolvla_base() (full production config).
+/// By default uses Config::smolvla_base() (full production config).
 /// Use --small for the tiny smoke-test config.
 ///
 /// Output (stdout): JSON with loss, and per-parameter gradient norms + first-N
@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use meganeura::{
     graph::Op,
-    models::smolvla::{self, SmolVLAConfig},
+    models::smolvla::{self, Config},
 };
 
 fn main() {
@@ -41,9 +41,9 @@ fn main() {
     }
 
     let config = if use_small {
-        SmolVLAConfig::small_test()
+        Config::small_test()
     } else {
-        SmolVLAConfig::smolvla_base()
+        Config::smolvla_base()
     };
     let action_seq_len = config.chunk_size;
     let expert_hidden = config.expert.hidden_size;

@@ -11,7 +11,7 @@ use std::time::Instant;
 use meganeura::{
     Graph,
     data::safetensors::SafeTensorsModel,
-    models::smollm2::{self, SmolLM2Config},
+    models::smollm2::{self, Config},
 };
 
 const REPO_ID: &str = "HuggingFaceTB/SmolLM2-135M";
@@ -44,14 +44,14 @@ fn load_weights(
         if name == "lm_head.weight" {
             if model.tensor_info().contains_key("lm_head.weight") {
                 let data = if transposed_set.contains(name.as_str()) {
-                    model.tensor_f32_auto_transposed(&name)
+                    model.tensor_f32_auto_transposed(&name, 0)
                 } else {
                     model.tensor_f32_auto(&name)
                 };
                 session.set_parameter(&name, &data.unwrap());
             } else {
                 let data = model
-                    .tensor_f32_auto_transposed("model.embed_tokens.weight")
+                    .tensor_f32_auto_transposed("model.embed_tokens.weight", 0)
                     .unwrap();
                 session.set_parameter("lm_head.weight", &data);
             }
@@ -78,7 +78,7 @@ fn load_weights(
                 session.set_parameter(&name, &combined);
             }
         } else if transposed_set.contains(name.as_str()) {
-            let data = model.tensor_f32_auto_transposed(&name).unwrap();
+            let data = model.tensor_f32_auto_transposed(&name, 0).unwrap();
             session.set_parameter(&name, &data);
         } else {
             let data = model.tensor_f32_auto(&name).unwrap();
@@ -117,7 +117,7 @@ fn main() {
         }
     }
 
-    let config = SmolLM2Config::smollm2_135m();
+    let config = Config::smollm2_135m();
 
     // --- Download model + tokenizer ---
     eprintln!("downloading model...");

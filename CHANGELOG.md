@@ -1,5 +1,22 @@
 # Unreleased
 
+- The environment is resolved once: `src/config.rs` is the only place that
+  reads `MEGANEURA_*` variables, and its product is configuration — it no
+  longer modifies the process environment. The one boolean decoding rule
+  is a pure function under test, so the config tests don't flip env vars.
+  The six stragglers that still read the environment inline are typed
+  options now: `MEGANEURA_OPTIMIZER` neighbors `GREEDY_PACK_SWIGLU`
+  (`OptimizeConfig::greedy_pack_swiglu`), `MATMUL_K_STAGE` and
+  `MEGANEURA_INTERLEAVE_COLUMNS` ride `TuningKnobs` into the matmul
+  codegen, and `MEGANEURA_DEVICE_PARAMETERS` / `MEGANEURA_REUSE_UPLOAD`
+  are `SessionOptions` fields. All are registered and documented in the
+  README; an unknown `MEGANEURA_*` name warns instead of panicking.
+- First-party model configs drop their prefixed names — `SmolLM2Config`,
+  `SmolVLAConfig`, `SmolVLM2Config`, `SDUNetConfig` and `WhisperConfig`
+  are simply `Config` in their modules, so `use
+  meganeura::models::smollm2::Config` reads on its own.
+- The optional weight-download feature is named `hf-hub` after its
+  dependency rather than the generic `hub`.
 - GGUF is now a model format, not just a weight container. `load::gguf`
   reads the architecture description into a `ModelConfig`, builds the graph
   it implies, fills it from the file's own tensors, and tokenizes with the

@@ -10,7 +10,7 @@
 
 use meganeura::{
     Graph,
-    models::whisper::{self, WhisperConfig},
+    models::whisper::{self, Config},
 };
 
 fn main() {
@@ -25,7 +25,7 @@ fn main() {
     meganeura::runtime::install_auto_tune(result);
     drop(gpu);
 
-    let config = WhisperConfig::whisper_tiny();
+    let config = Config::whisper_tiny();
     let batch = 1u32;
     let mel_len = 3000u32;
     let seq_len = ((mel_len + 2 - 3) / 2 + 1) as usize;

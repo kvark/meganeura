@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use meganeura::{
     compile_training_graph,
-    models::smolvla::{self, SmolVLAConfig},
+    models::smolvla::{self, Config},
 };
 
 fn check_bench_preconditions(abort_on_warn: bool) {
@@ -132,7 +132,7 @@ fn main() {
     eprintln!("checking preconditions...");
     check_bench_preconditions(!force);
 
-    let mut config = SmolVLAConfig::smolvla_base();
+    let mut config = Config::smolvla_base();
     if let Some(cs) = chunk_override {
         config.chunk_size = cs;
     }

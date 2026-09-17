@@ -8,7 +8,7 @@ use crate::graph::{Graph, NodeId};
 /// How the large projection weights are stored on the GPU.
 ///
 /// This is a deployment choice, not a model hyperparameter, so it is a
-/// builder argument rather than a [`SmolLM2Config`] field — that struct
+/// builder argument rather than a [`Config`] field — that struct
 /// mirrors the published `config.json`.
 ///
 /// Only the seven per-layer projections (q/k/v/o, gate/up/down) and an
@@ -44,7 +44,7 @@ fn projection(g: &mut Graph, weights: ProjectionWeights, name: &str, shape: &[us
 ///
 /// Values correspond to the `config.json` published alongside the
 /// HuggingFace model weights.
-pub struct SmolLM2Config {
+pub struct Config {
     /// Vocabulary size (number of token embeddings).
     pub vocab_size: usize,
     /// Dimensionality of the transformer hidden state.
@@ -65,7 +65,7 @@ pub struct SmolLM2Config {
     pub tie_word_embeddings: bool,
 }
 
-impl SmolLM2Config {
+impl Config {
     /// SmolLM2-135M configuration.
     pub fn smollm2_135m() -> Self {
         Self {
@@ -129,7 +129,7 @@ impl SmolLM2Config {
 /// - Input "token_ids": U32 tensor of shape `[seq_len]`
 /// - Parameters named following the safetensors convention:
 ///   `model.embed_tokens.weight`, `model.layers.{i}.input_layernorm.weight`, etc.
-pub fn build_graph(g: &mut Graph, config: &SmolLM2Config, seq_len: usize) -> NodeId {
+pub fn build_graph(g: &mut Graph, config: &Config, seq_len: usize) -> NodeId {
     let hidden = config.hidden_size;
     let kv_dim = config.kv_dim();
     let ffn = config.intermediate_size;
@@ -232,7 +232,7 @@ pub fn build_graph(g: &mut Graph, config: &SmolLM2Config, seq_len: usize) -> Nod
 /// Returns the loss node. The graph expects:
 /// - Input "token_ids": U32 tensor of shape `[seq_len]`
 /// - Input "labels": f32 one-hot tensor of shape `[seq_len, vocab_size]`
-pub fn build_training_graph(config: &SmolLM2Config, seq_len: usize) -> Graph {
+pub fn build_training_graph(config: &Config, seq_len: usize) -> Graph {
     let mut g = Graph::new();
     let logits = build_graph(&mut g, config, seq_len);
     let labels = g.input("labels", &[seq_len, config.vocab_size]);
@@ -249,7 +249,7 @@ pub fn build_training_graph(config: &SmolLM2Config, seq_len: usize) -> Graph {
 /// Returns (logits, k_outputs, v_outputs) where k/v_outputs are per-layer.
 pub fn build_prefill_graph(
     g: &mut Graph,
-    config: &SmolLM2Config,
+    config: &Config,
     seq_len: usize,
 ) -> (NodeId, Vec<NodeId>, Vec<NodeId>) {
     build_prefill_graph_with(g, config, seq_len, ProjectionWeights::F32)
@@ -261,7 +261,7 @@ pub fn build_prefill_graph(
 /// which has had a Q4 variant all along.
 pub fn build_prefill_graph_with(
     g: &mut Graph,
-    config: &SmolLM2Config,
+    config: &Config,
     seq_len: usize,
     weights: ProjectionWeights,
 ) -> (NodeId, Vec<NodeId>, Vec<NodeId>) {
@@ -387,7 +387,7 @@ pub fn build_prefill_graph_with(
 /// the parameter NodeIds for pre-allocated cache buffers.
 pub fn build_decode_graph(
     g: &mut Graph,
-    config: &SmolLM2Config,
+    config: &Config,
     max_seq_len: usize,
 ) -> (NodeId, Vec<NodeId>, Vec<NodeId>) {
     build_decode_graph_with(g, config, max_seq_len, ProjectionWeights::F32)
@@ -400,7 +400,7 @@ pub fn build_decode_graph(
 /// fast path here.
 pub fn build_decode_graph_with(
     g: &mut Graph,
-    config: &SmolLM2Config,
+    config: &Config,
     max_seq_len: usize,
     weights: ProjectionWeights,
 ) -> (NodeId, Vec<NodeId>, Vec<NodeId>) {
@@ -535,7 +535,7 @@ pub fn build_decode_graph_with(
 }
 
 /// Get all weight parameter names for SmolLM2.
-pub fn weight_names(config: &SmolLM2Config) -> Vec<String> {
+pub fn weight_names(config: &Config) -> Vec<String> {
     let mut names = Vec::new();
     names.push("model.embed_tokens.weight".to_string());
 
@@ -560,7 +560,7 @@ pub fn weight_names(config: &SmolLM2Config) -> Vec<String> {
 }
 
 /// Names of weight tensors that need transposing (linear layer weights).
-pub fn transposed_weight_names(config: &SmolLM2Config) -> Vec<String> {
+pub fn transposed_weight_names(config: &Config) -> Vec<String> {
     let mut names = Vec::new();
     for i in 0..config.num_hidden_layers {
         let p = format!("model.layers.{}", i);

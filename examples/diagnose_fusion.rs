@@ -16,8 +16,8 @@ use meganeura::{
     compile::{BufferRef, Dispatch, ExecutionPlan, ShaderEntry},
     compile_training_graph,
     models::{
-        smollm2::{self, SmolLM2Config},
-        smolvla::{self, SmolVLAConfig},
+        smollm2::{self as smollm2, Config as Smollm2Config},
+        smolvla::{self as smolvla, Config as SmolvlaConfig},
     },
 };
 
@@ -285,7 +285,7 @@ fn main() {
     let run = |name: &str| {
         match name {
             "smolvla-train" => {
-                let config = SmolVLAConfig::smolvla_base();
+                let config = SmolvlaConfig::smolvla_base();
                 eprintln!(
                     "Building SmolVLA training (chunk={}, vlm_seq=16)",
                     config.chunk_size
@@ -295,7 +295,7 @@ fn main() {
                 analyze("SmolVLA training", &plan);
             }
             "smollm2-train" => {
-                let config = SmolLM2Config::smollm2_135m();
+                let config = Smollm2Config::smollm2_135m();
                 let seq = 128;
                 eprintln!("Building SmolLM2-135M training (seq={})", seq);
                 let g = smollm2::build_training_graph(&config, seq);
@@ -303,7 +303,7 @@ fn main() {
                 analyze("SmolLM2-135M training", &plan);
             }
             "smollm2-prefill" => {
-                let config = SmolLM2Config::smollm2_135m();
+                let config = Smollm2Config::smollm2_135m();
                 let seq = 128;
                 eprintln!("Building SmolLM2-135M prefill (seq={})", seq);
                 let mut g = meganeura::Graph::new();
@@ -315,7 +315,7 @@ fn main() {
                 analyze("SmolLM2-135M prefill", &plan);
             }
             "smollm2-decode" => {
-                let config = SmolLM2Config::smollm2_135m();
+                let config = Smollm2Config::smollm2_135m();
                 let max_seq = 256;
                 eprintln!("Building SmolLM2-135M decode (max_seq={})", max_seq);
                 let mut g = meganeura::Graph::new();

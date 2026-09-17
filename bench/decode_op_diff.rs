@@ -11,7 +11,7 @@
 //!
 //! Usage: MEGANEURA_DEVICE_ID=<id> cargo run --release --example decode_op_diff
 
-use meganeura::models::smollm2::SmolLM2Config;
+use meganeura::models::smollm2::Config;
 use meganeura::{Graph, Mode, SessionConfig};
 
 fn synth(name: &str, n: usize) -> Vec<f32> {
@@ -90,7 +90,7 @@ fn report(label: &str, gpu: &[f32], cpu: &[f32]) {
 
 fn main() {
     env_logger::init();
-    let cfg = SmolLM2Config::smollm2_135m();
+    let cfg = Config::smollm2_135m();
     let h = cfg.hidden_size;
     let kv = cfg.kv_dim();
     let hd = cfg.head_dim() as usize;

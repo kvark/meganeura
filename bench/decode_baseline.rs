@@ -27,7 +27,7 @@ fn decode_pos() -> u32 {
 
 fn main() {
     env_logger::init();
-    let mut cfg = smollm2::SmolLM2Config::smollm2_135m();
+    let mut cfg = smollm2::Config::smollm2_135m();
     if let Ok(n) = std::env::var("DECODE_LAYERS") {
         cfg.num_hidden_layers = n.parse().expect("DECODE_LAYERS");
     }
@@ -248,7 +248,7 @@ fn main() {
 /// from the same synthetic parameters. Comparing both GPU paths against it
 /// says which one is wrong, rather than only that they disagree.
 #[allow(clippy::too_many_arguments)]
-pub fn cpu_reference(cfg: &smollm2::SmolLM2Config, token: u32, pos: u32) -> Vec<f32> {
+pub fn cpu_reference(cfg: &smollm2::Config, token: u32, pos: u32) -> Vec<f32> {
     let h = cfg.hidden_size;
     let kv = cfg.kv_dim();
     let ffn = cfg.intermediate_size;

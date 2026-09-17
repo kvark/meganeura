@@ -97,7 +97,7 @@ fn main() {
         "output_layer.weight",
     ] {
         let data = hf
-            .tensor_f32_transposed(name)
+            .tensor_f32_transposed(name, 0)
             .unwrap_or_else(|e| panic!("failed to load {}: {}", name, e));
         session.set_parameter(name, &data);
     }

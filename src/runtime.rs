@@ -2799,6 +2799,13 @@ pub struct SessionOptions {
     /// Force-pin logical buffers by id/range, e.g. `"3,17,25-40"` — the
     /// aliasing-corruption bisection aid.
     pub pin_buffers: Option<String>,
+    /// Reuse one staging buffer across `set_parameter` uploads instead of
+    /// restaging per parameter.
+    pub reuse_upload_staging: bool,
+    /// Experimental parameter placement for parameters whose buffers stay
+    /// unaliased: host-visible by default, `Some(Memory::DeviceTransient)`
+    /// or `Some(Memory::Device)` relocates them for measurement.
+    pub device_parameters: Option<blade_graphics::Memory>,
 }
 
 /// How cooperative-matrix hardware may be used.
@@ -3483,12 +3490,9 @@ impl Session {
         } else {
             crate::memplan::plan_buffer_aliasing(&plan, &groups, opts.pin_buffers.as_deref())
         };
-        let device_parameters = match std::env::var("MEGANEURA_DEVICE_PARAMETERS").as_deref() {
-            Err(_) | Ok("0") => None,
-            Ok("1") => Some(blade_graphics::Memory::DeviceTransient),
-            Ok("device-buddy") => Some(blade_graphics::Memory::Device),
-            Ok(other) => panic!("unknown parameter placement experiment: {other}"),
-        };
+        let device_parameters = opts.device_parameters;
+        // Only a parameter-bearing physical allocation may be
+        // relocated, and it must be on its own physical buffer.
         let mut parameter_memory = vec![None; alias.sizes.len()];
         if let Some(memory) = device_parameters {
             for buffer in plan
@@ -3867,7 +3871,7 @@ impl Session {
             adam_wd: 0.0,
             packed_concat_staging: HashMap::new(),
             upload_staging: RefCell::new(None),
-            reuse_upload_staging: std::env::var("MEGANEURA_REUSE_UPLOAD").as_deref() == Ok("1"),
+            reuse_upload_staging: opts.reuse_upload_staging,
         }
     }
 

@@ -361,7 +361,7 @@ fn main() {
         if name == "lm_head.weight" {
             if model.tensor_info().contains_key("lm_head.weight") {
                 let data = if transposed_set.contains(name.as_str()) {
-                    model.tensor_f32_auto_transposed(&name)
+                    model.tensor_f32_auto_transposed(&name, 0)
                 } else {
                     model.tensor_f32_auto(&name)
                 };
@@ -369,7 +369,7 @@ fn main() {
             } else {
                 println!("  lm_head tied to embed_tokens, transposing...");
                 let data = model
-                    .tensor_f32_auto_transposed("model.embed_tokens.weight")
+                    .tensor_f32_auto_transposed("model.embed_tokens.weight", 0)
                     .expect("failed to load embed_tokens for lm_head");
                 session.set_parameter("lm_head.weight", &data);
             }
@@ -400,7 +400,7 @@ fn main() {
             }
         } else if transposed_set.contains(name.as_str()) {
             let data = model
-                .tensor_f32_auto_transposed(&name)
+                .tensor_f32_auto_transposed(&name, 0)
                 .unwrap_or_else(|e| panic!("{}: {}", name, e));
             session.set_parameter(&name, &data);
         } else {

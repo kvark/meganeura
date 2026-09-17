@@ -8,7 +8,7 @@
 use meganeura::{
     Graph,
     data::safetensors::SafeTensorsModel,
-    models::smollm2::{self, SmolLM2Config},
+    models::smollm2::{self, Config},
 };
 
 const REPO_ID: &str = "HuggingFaceTB/SmolLM2-135M";
@@ -27,7 +27,7 @@ fn main() {
         .unwrap_or_else(|| "The meaning of life is".to_string());
     let max_new_tokens = 32;
 
-    let config = SmolLM2Config::smollm2_135m();
+    let config = Config::smollm2_135m();
 
     // --- Download model and tokenizer ---
     println!("downloading {} from HuggingFace Hub...", REPO_ID);
@@ -98,7 +98,7 @@ fn main() {
             // file we load it; otherwise we reuse embed_tokens transposed.
             if model.tensor_info().contains_key("lm_head.weight") {
                 let data = if transposed_set.contains(name.as_str()) {
-                    model.tensor_f32_auto_transposed(&name)
+                    model.tensor_f32_auto_transposed(&name, 0)
                 } else {
                     model.tensor_f32_auto(&name)
                 };
@@ -107,7 +107,7 @@ fn main() {
                 // Tied weights: use embed_tokens transposed
                 println!("  lm_head tied to embed_tokens, transposing...");
                 let data = model
-                    .tensor_f32_auto_transposed("model.embed_tokens.weight")
+                    .tensor_f32_auto_transposed("model.embed_tokens.weight", 0)
                     .expect("failed to load embed_tokens for lm_head");
                 session.set_parameter("lm_head.weight", &data);
             }
@@ -140,7 +140,7 @@ fn main() {
             }
         } else if transposed_set.contains(name.as_str()) {
             let data = model
-                .tensor_f32_auto_transposed(&name)
+                .tensor_f32_auto_transposed(&name, 0)
                 .unwrap_or_else(|e| panic!("{}: {}", name, e));
             session.set_parameter(&name, &data);
         } else {
