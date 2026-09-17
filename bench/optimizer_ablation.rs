@@ -42,34 +42,34 @@ fn parse_cost(value: &str) -> ExtractionCost {
 fn build_model_graph(model: &str, phase: Phase) -> Graph {
     match (model, phase) {
         ("SmolLM2-135M", Phase::Inference) => {
-            let config = smollm2::SmolLM2Config::smollm2_135m();
+            let config = smollm2::Config::smollm2_135m();
             let mut graph = Graph::new();
             let output = smollm2::build_graph(&mut graph, &config, 128);
             graph.set_outputs(vec![output]);
             graph
         }
         ("SmolLM2-135M", Phase::Training) => {
-            smollm2::build_training_graph(&smollm2::SmolLM2Config::smollm2_135m(), 128)
+            smollm2::build_training_graph(&smollm2::Config::smollm2_135m(), 128)
         }
         ("SmolVLA", Phase::Inference) => {
-            let config = smolvla::SmolVLAConfig::smolvla_base();
+            let config = smolvla::Config::smolvla_base();
             let mut graph = Graph::new();
             let output = smolvla::build_action_expert(&mut graph, &config, 50, 16);
             graph.set_outputs(vec![output]);
             graph
         }
         ("SmolVLA", Phase::Training) => {
-            smolvla::build_action_expert_training(&smolvla::SmolVLAConfig::smolvla_base(), 50, 16)
+            smolvla::build_action_expert_training(&smolvla::Config::smolvla_base(), 50, 16)
         }
         ("SD-style-UNet" | "StableDiffusion", Phase::Inference) => {
-            let config = sd_unet::SDUNetConfig::small();
+            let config = sd_unet::Config::small();
             let mut graph = Graph::new();
             let output = sd_unet::build_unet(&mut graph, &config);
             graph.set_outputs(vec![output]);
             graph
         }
         ("SD-style-UNet" | "StableDiffusion", Phase::Training) => {
-            let config = sd_unet::SDUNetConfig::small();
+            let config = sd_unet::Config::small();
             let mut graph = Graph::new();
             let loss = sd_unet::build_training_graph(&mut graph, &config);
             graph.set_outputs(vec![loss]);
@@ -83,14 +83,14 @@ fn build_model_graph(model: &str, phase: Phase) -> Graph {
         }
         ("ResNet-50", Phase::Training) => resnet::build_resnet50_training(4),
         ("Whisper-tiny", Phase::Inference) => {
-            let config = whisper::WhisperConfig::whisper_tiny();
+            let config = whisper::Config::whisper_tiny();
             let mut graph = Graph::new();
             let output = whisper::build_encoder(&mut graph, &config, 1, 3000);
             graph.set_outputs(vec![output]);
             graph
         }
         ("Whisper-tiny", Phase::Training) => {
-            whisper::build_training_graph(&whisper::WhisperConfig::whisper_tiny(), 1, 3000)
+            whisper::build_training_graph(&whisper::Config::whisper_tiny(), 1, 3000)
         }
         _ => panic!("unsupported model/phase: {model} {phase:?}"),
     }

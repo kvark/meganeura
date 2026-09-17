@@ -91,7 +91,7 @@ fn main() {
     let hf = SafeTensorsModel::download("dacorvo/mnist-mlp").expect("failed to download model");
     for (name, hf_name, transpose) in &native_weight_map {
         let data = if *transpose {
-            hf.tensor_f32_transposed(hf_name)
+            hf.tensor_f32_transposed(hf_name, 0)
         } else {
             hf.tensor_f32(hf_name)
         }

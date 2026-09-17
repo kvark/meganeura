@@ -117,10 +117,10 @@ See the [changelog](CHANGELOG.md) for API and feature changes from 0.2.
 CI assembles the packaged crate; full registry verification waits on a Blade
 release that includes this timing API.
 
-Hub downloads (`SafeTensorsModel::download`) need the optional `hub` feature:
+Hub downloads (`SafeTensorsModel::download`) need the optional `hf-hub` feature:
 
 ```
-cargo add meganeura --features hub
+cargo add meganeura --features hf-hub
 ```
 
 Embedded targets should load weights with `SafeTensorsModel::from_bytes` or `SafeTensorsModel::load` instead.
@@ -236,11 +236,16 @@ win, so explicit code always has the last word.
 | `MEGANEURA_OPTIMIZER` | Rewrite mode: `off` \| `greedy` \| `egglog-windowed` \| `egglog-outlined` \| `egglog-whole`. |
 | `MEGANEURA_EGRAPH_COST` | Extraction objective: `ast-size` \| `tensor-traffic`. |
 | `MEGANEURA_EGRAPH_CUTOFF=<n>` | Saturation segment-size ceiling (default 300). |
+| `MEGANEURA_GREEDY_PACK_SWIGLU=0` | Skip packing consecutive SwiGLU ops into one parameter buffer during the greedy sweep. |
+| `MEGANEURA_DEVICE_PARAMETERS` | Experimental placement of unaliased parameter buffers on the device: `1` → device-transient, `device-buddy` → device. Default is host-visible. |
+| `MEGANEURA_REUSE_UPLOAD` | Reuse one staging buffer across `set_parameter` uploads instead of restaging per parameter. |
 | `MEGANEURA_TUNE` | Opt-in bounded f32 matmul/convolution search at build (`SessionConfig { tune: true }`), using private scratch. |
 | `MEGANEURA_FLASH_EPT_CAP=<n>` | Flash forward elements-per-thread cap (power of two ≥ 2). |
 | `MEGANEURA_FLASH_GRAD_Q_EPT_CAP=<n>` | EPT cap for flash dQ backward. |
 | `MEGANEURA_FLASH_GRAD_KV_EPT_CAP=<n>` | EPT cap for fused flash dK/dV backward. |
 | `MEGANEURA_FLASH_BWD_EPT_CAP=<n>` | Shared fallback cap for both flash backward kernels. |
+| `MEGANEURA_MATMUL_K_STAGE=<n>` | Scalar tiled matmul K staging depth: 8 \| 16 \| 32 (default 32). |
+| `MEGANEURA_INTERLEAVE_COLUMNS` | Stagger scalar-matmul B loads across columns (16 lanes apart) instead of through consecutive ones. |
 | `MEGANEURA_DEVICE_ID=0x744c` | Adapter selection by numeric device id. |
 | `MEGANEURA_GPU_TIMING` | Enable hardware timestamp pools (set before context creation). |
 | `MEGANEURA_GPU_CAPTURE` | Enable Blade's native-tool labels and shader debug information before context creation; independent of GPU timing. |

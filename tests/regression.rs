@@ -34,7 +34,7 @@ mod multi_input_trainer;
 mod scatter_add_atomic;
 mod schedule_pointwise;
 mod schedule_reduction;
-#[cfg(all(feature = "hub", feature = "models"))]
+#[cfg(all(feature = "hf-hub", feature = "models"))]
 mod smollm2_correctness;
 mod softplus_tail;
 mod submission_chunks;

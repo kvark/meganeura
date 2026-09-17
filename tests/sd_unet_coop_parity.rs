@@ -3,7 +3,7 @@
 //! vec4 staging map and wrote beyond its 64-element workgroup arrays. The
 //! opening 4-to-64-channel convolution then corrupted the whole SD U-Net.
 
-use meganeura::models::sd_unet::{self, SDUNetConfig};
+use meganeura::models::sd_unet::{self, Config};
 use meganeura::{Graph, Session};
 use std::sync::Mutex;
 
@@ -46,7 +46,7 @@ fn run(cooperative: bool) -> Vec<f32> {
         }
     }
 
-    let config = SDUNetConfig::small();
+    let config = Config::small();
     let output_len =
         (config.batch_size * config.in_channels * config.resolution * config.resolution) as usize;
     let mut graph = Graph::new();

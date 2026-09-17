@@ -8,7 +8,7 @@
 
 use crate::graph::{Graph, NodeId};
 
-pub struct WhisperConfig {
+pub struct Config {
     pub d_model: usize,
     pub n_heads: u32,
     pub n_layers: usize,
@@ -18,7 +18,7 @@ pub struct WhisperConfig {
     pub layer_norm_eps: f32,
 }
 
-impl WhisperConfig {
+impl Config {
     pub fn whisper_tiny() -> Self {
         Self {
             d_model: 384,
@@ -44,7 +44,7 @@ impl WhisperConfig {
 ///
 /// Weight names follow the HuggingFace convention:
 /// `model.encoder.conv1.weight`, `model.encoder.layers.0.self_attn.q_proj.weight`, etc.
-pub fn build_encoder(g: &mut Graph, config: &WhisperConfig, batch: u32, mel_len: u32) -> NodeId {
+pub fn build_encoder(g: &mut Graph, config: &Config, batch: u32, mel_len: u32) -> NodeId {
     let d = config.d_model;
     let prefix = "model.encoder";
 
@@ -169,7 +169,7 @@ pub fn build_encoder(g: &mut Graph, config: &WhisperConfig, batch: u32, mel_len:
 ///
 /// This synthetic objective keeps the timed work focused on the encoder and
 /// matches the reference benchmark's `mean(encoder_output²)` objective.
-pub fn build_training_graph(config: &WhisperConfig, batch: u32, mel_len: u32) -> Graph {
+pub fn build_training_graph(config: &Config, batch: u32, mel_len: u32) -> Graph {
     let mut g = Graph::new();
     let encoder_out = build_encoder(&mut g, config, batch, mel_len);
     let squared = g.mul(encoder_out, encoder_out);
@@ -181,7 +181,7 @@ pub fn build_training_graph(config: &WhisperConfig, batch: u32, mel_len: u32) ->
 /// Names of parameters that need transposing when loaded from HuggingFace.
 ///
 /// HuggingFace stores Linear weights as `[out, in]`; meganeura expects `[in, out]`.
-pub fn transposed_weight_names(config: &WhisperConfig) -> Vec<String> {
+pub fn transposed_weight_names(config: &Config) -> Vec<String> {
     let prefix = "model.encoder";
     let mut names = Vec::new();
     for i in 0..config.n_layers {

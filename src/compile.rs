@@ -80,14 +80,20 @@ pub struct TuningKnobs {
     pub flash_grad_q_ept_cap: u32,
     /// EPT cap for the fused flash dK/dV backward kernel.
     pub flash_grad_kv_ept_cap: u32,
+    /// K staging depth of the scalar tiled matmul: 8 | 16 | 32.
+    pub matmul_k_stage: u32,
+    /// Stagger scalar-matmul B loads across columns instead of routing a
+    /// thread through consecutive ones.
+    pub matmul_interleave_columns: bool,
 }
 
 impl Default for TuningKnobs {
     /// Pure per-platform defaults. Apple Silicon benefits from the extra
     /// parallelism of smaller EPT; 32 keeps register count below the
     /// spilling cliff on Ampere/Blackwell. `MEGANEURA_FLASH_*_EPT_CAP`
-    /// overrides are applied only by [`TuningKnobs::from_env`] (in
-    /// `crate::config`) — the library itself never reads the environment.
+    /// and `MEGANEURA_MATMUL_*` overrides are applied only by
+    /// [`TuningKnobs::from_env`] (in `crate::config`) — the library
+    /// itself never reads the environment.
     fn default() -> Self {
         let apple = cfg!(all(target_vendor = "apple", target_arch = "aarch64"));
         let fwd = if apple { 16 } else { 32 };
@@ -95,6 +101,8 @@ impl Default for TuningKnobs {
             flash_ept_cap: fwd,
             flash_grad_q_ept_cap: fwd,
             flash_grad_kv_ept_cap: if apple { 8 } else { 32 },
+            matmul_k_stage: 32,
+            matmul_interleave_columns: false,
         }
     }
 }

@@ -2,7 +2,7 @@ use std::time::Instant;
 
 fn main() {
     env_logger::init();
-    let config = meganeura::models::smollm2::SmolLM2Config::smollm2_135m();
+    let config = meganeura::models::smollm2::Config::smollm2_135m();
     let seq_len: usize = std::env::args()
         .nth(1)
         .and_then(|s| s.parse().ok())

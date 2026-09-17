@@ -74,14 +74,14 @@ impl TextConfig {
 }
 
 /// Full SmolVLM2 configuration.
-pub struct SmolVLM2Config {
+pub struct Config {
     pub vision: VisionConfig,
     pub text: TextConfig,
     /// Pixel shuffle scale factor (spatial downsampling before projection).
     pub scale_factor: usize,
 }
 
-impl SmolVLM2Config {
+impl Config {
     /// SmolVLM2-500M-Video-Instruct configuration.
     pub fn smolvlm2_500m() -> Self {
         Self {
@@ -339,7 +339,7 @@ pub fn build_text_decoder(
 /// - "combined_embeds": F32 `[total_seq_len, text_hidden]` — combined vision + text embeddings
 ///
 /// Returns logits node, shape `[total_seq_len, vocab_size]`.
-pub fn build_graph(g: &mut Graph, config: &SmolVLM2Config, text_seq_len: usize) -> NodeId {
+pub fn build_graph(g: &mut Graph, config: &Config, text_seq_len: usize) -> NodeId {
     let num_patches = config.vision.num_patches();
     let num_vision_tokens = config.num_vision_tokens();
     let total_seq_len = num_vision_tokens + text_seq_len;
@@ -389,7 +389,7 @@ pub fn build_graph(g: &mut Graph, config: &SmolVLM2Config, text_seq_len: usize) 
 }
 
 /// Get all weight parameter names for SmolVLM2.
-pub fn weight_names(config: &SmolVLM2Config) -> Vec<String> {
+pub fn weight_names(config: &Config) -> Vec<String> {
     let mut names = Vec::new();
 
     // Vision encoder
@@ -446,7 +446,7 @@ pub fn weight_names(config: &SmolVLM2Config) -> Vec<String> {
 }
 
 /// Names of weight tensors that need transposing (linear layer weights stored as [out, in]).
-pub fn transposed_weight_names(config: &SmolVLM2Config) -> Vec<String> {
+pub fn transposed_weight_names(config: &Config) -> Vec<String> {
     let mut names = Vec::new();
 
     // Vision encoder linear weights

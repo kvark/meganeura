@@ -13,7 +13,7 @@
 //! Reference: <https://huggingface.co/lerobot/smolvla_base>
 
 use crate::graph::{Graph, NodeId};
-use crate::models::smolvlm2::{SmolVLM2Config, TextConfig, VisionConfig};
+use crate::models::smolvlm2::{Config as VlmConfig, TextConfig, VisionConfig};
 
 /// Action expert configuration.
 pub struct ExpertConfig {
@@ -42,9 +42,9 @@ impl ExpertConfig {
 }
 
 /// Full SmolVLA configuration.
-pub struct SmolVLAConfig {
+pub struct Config {
     /// VLM backbone (SmolVLM2).
-    pub vlm: SmolVLM2Config,
+    pub vlm: VlmConfig,
     /// Action expert decoder.
     pub expert: ExpertConfig,
     /// Maximum action dimension.
@@ -59,11 +59,11 @@ pub struct SmolVLAConfig {
     pub num_vlm_layers: usize,
 }
 
-impl SmolVLAConfig {
+impl Config {
     /// Small configuration for unit/smoke tests (no download needed).
     pub fn small_test() -> Self {
         Self {
-            vlm: SmolVLM2Config {
+            vlm: VlmConfig {
                 vision: VisionConfig {
                     image_size: 32,
                     patch_size: 16,
@@ -106,7 +106,7 @@ impl SmolVLAConfig {
     /// Default SmolVLA base configuration (lerobot/smolvla_base).
     pub fn smolvla_base() -> Self {
         Self {
-            vlm: SmolVLM2Config {
+            vlm: VlmConfig {
                 vision: VisionConfig {
                     image_size: 512,
                     patch_size: 16,
@@ -159,7 +159,7 @@ impl SmolVLAConfig {
 /// Returns: denoised action prediction `[chunk_size, action_dim]`
 pub fn build_action_expert(
     g: &mut Graph,
-    config: &SmolVLAConfig,
+    config: &Config,
     action_seq_len: usize,
     vlm_seq_len: usize,
 ) -> NodeId {
@@ -340,7 +340,7 @@ pub fn build_action_expert(
 /// Projects robot state observations into the VLM embedding space.
 /// Input: "observation_state" F32 `[1, state_dim]`
 /// Returns: projected state token `[1, text_hidden]`
-pub fn build_state_projection(g: &mut Graph, config: &SmolVLAConfig) -> NodeId {
+pub fn build_state_projection(g: &mut Graph, config: &Config) -> NodeId {
     let state_input = g.input("observation_state", &[1, config.max_state_dim]);
     let w = g.parameter(
         "model.state_proj.weight",
@@ -352,7 +352,7 @@ pub fn build_state_projection(g: &mut Graph, config: &SmolVLAConfig) -> NodeId {
 }
 
 /// Get all weight parameter names for the SmolVLA action expert.
-pub fn expert_weight_names(config: &SmolVLAConfig) -> Vec<String> {
+pub fn expert_weight_names(config: &Config) -> Vec<String> {
     let expert = &config.expert;
     let mut names = vec![
         // State projection
@@ -400,7 +400,7 @@ pub fn expert_weight_names(config: &SmolVLAConfig) -> Vec<String> {
 ///
 /// Output: scalar MSE loss.
 pub fn build_action_expert_training(
-    config: &SmolVLAConfig,
+    config: &Config,
     action_seq_len: usize,
     vlm_seq_len: usize,
 ) -> Graph {
@@ -563,7 +563,7 @@ pub fn build_action_expert_training(
 }
 
 /// Names of expert weight tensors that need transposing.
-pub fn expert_transposed_weight_names(config: &SmolVLAConfig) -> Vec<String> {
+pub fn expert_transposed_weight_names(config: &Config) -> Vec<String> {
     let expert = &config.expert;
     let mut names = vec![
         "model.state_proj.weight".into(),

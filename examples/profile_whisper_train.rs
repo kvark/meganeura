@@ -2,7 +2,7 @@
 //! LayerNorm forward rewrite. Mirrors profile_whisper_inference but
 //! builds the training graph (encoder + projection + MSE loss).
 
-use meganeura::models::whisper::{self, WhisperConfig};
+use meganeura::models::whisper::{self, Config};
 
 fn main() {
     env_logger::init();
@@ -13,7 +13,7 @@ fn main() {
     meganeura::runtime::install_auto_tune(result);
     drop(gpu);
 
-    let config = WhisperConfig::whisper_tiny();
+    let config = Config::whisper_tiny();
     let batch = 1u32;
     let mel_len = 3000u32;
     let g = whisper::build_training_graph(&config, batch, mel_len);

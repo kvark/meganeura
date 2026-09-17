@@ -66,7 +66,7 @@ gguf = []
 # embedders (Android, iOS, hermetic CI) do not pull ureq/rustls or write
 # `~/.cache/huggingface`. Those targets ship weights as assets and load
 # them through `SafeTensorsModel::from_bytes` or `::load`.
-hub = ["dep:hf-hub"]
+hf-hub = ["dep:hf-hub"]
 # Installs a tracing subscriber in `profiler::init` for Perfetto CPU
 # spans. GPU timestamp recording does not need this feature.
 profiler = ["dep:tracing-subscriber"]
@@ -139,17 +139,17 @@ path = "examples/diffusion.rs"
 [[example]]
 name = "huggingface"
 path = "examples/huggingface.rs"
-required-features = ["hub"]
+required-features = ["hf-hub"]
 
 [[example]]
 name = "smollm2"
 path = "examples/smollm2.rs"
-required-features = ["hub"]
+required-features = ["hf-hub"]
 
 [[example]]
 name = "smolvlm2"
 path = "examples/smolvlm2.rs"
-required-features = ["hub"]
+required-features = ["hf-hub"]
 
 [[example]]
 name = "sd_unet_train"
@@ -164,12 +164,12 @@ required-features = ["models"]
 [[example]]
 name = "bench_meganeura"
 path = "bench/bench_meganeura.rs"
-required-features = ["hub"]
+required-features = ["hf-hub"]
 
 [[example]]
 name = "bench_smolvla_meganeura"
 path = "bench/bench_smolvla_meganeura.rs"
-required-features = ["hub"]
+required-features = ["hf-hub"]
 
 [[example]]
 name = "bench_smolvla_train"
@@ -179,17 +179,17 @@ required-features = ["models"]
 [[example]]
 name = "onnx_compare"
 path = "examples/onnx_compare.rs"
-required-features = ["hub"]
+required-features = ["hf-hub"]
 
 [[example]]
 name = "resnet"
 path = "examples/resnet.rs"
-required-features = ["hub"]
+required-features = ["hf-hub"]
 
 [[example]]
 name = "whisper"
 path = "examples/whisper.rs"
-required-features = ["hub"]
+required-features = ["hf-hub"]
 
 [[example]]
 name = "bench_ci_latency"
@@ -198,7 +198,7 @@ path = "bench/bench_ci_latency.rs"
 [[example]]
 name = "qwen3"
 path = "examples/qwen3.rs"
-required-features = ["hub"]
+required-features = ["hf-hub"]
 
 [[example]]
 name = "grad_check"

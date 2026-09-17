@@ -26,7 +26,7 @@ fn main() {
         std::process::exit(2);
     }
 
-    let config = smollm2::SmolLM2Config::smollm2_135m();
+    let config = smollm2::Config::smollm2_135m();
     let max_seq_len = 128;
 
     eprintln!(

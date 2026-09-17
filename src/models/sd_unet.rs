@@ -16,7 +16,7 @@
 use crate::graph::{Graph, NodeId};
 
 /// Configuration for the scaled conditioned U-Net.
-pub struct SDUNetConfig {
+pub struct Config {
     /// Number of images in a batch.
     pub batch_size: u32,
     /// Number of input/output channels (e.g. 4 for latent space).
@@ -43,7 +43,7 @@ pub struct SDUNetConfig {
     pub attention_head_dim: u32,
 }
 
-impl SDUNetConfig {
+impl Config {
     /// A tiny configuration suitable for quick smoke tests.
     ///
     /// This configuration omits no operator families from [`Self::small`],
@@ -127,7 +127,7 @@ fn linear(
     }
 }
 
-fn timestep_embedding(g: &mut Graph, cfg: &SDUNetConfig) -> NodeId {
+fn timestep_embedding(g: &mut Graph, cfg: &Config) -> NodeId {
     let input = g.input(
         "timestep_embedding",
         &[cfg.batch_size as usize, cfg.time_input_dim as usize],
@@ -160,7 +160,7 @@ fn resblock(
     x: NodeId,
     time_emb: NodeId,
     prefix: &str,
-    cfg: &SDUNetConfig,
+    cfg: &Config,
     s: &SpatialState,
     out_c: u32,
 ) -> NodeId {
@@ -254,7 +254,7 @@ fn spatial_transformer(
     x: NodeId,
     context: NodeId,
     prefix: &str,
-    cfg: &SDUNetConfig,
+    cfg: &Config,
     s: &SpatialState,
 ) -> NodeId {
     assert_eq!(
@@ -421,7 +421,7 @@ fn spatial_transformer(
 /// - Input "noisy_latent": flat `[batch * in_c * res * res]`
 /// - Input "timestep_embedding": `[batch, time_input_dim]`
 /// - Input "text_context": `[context_len, context_dim]`
-pub fn build_unet(g: &mut Graph, cfg: &SDUNetConfig) -> NodeId {
+pub fn build_unet(g: &mut Graph, cfg: &Config) -> NodeId {
     build_unet_inner(g, cfg)
 }
 
@@ -432,7 +432,7 @@ pub fn build_unet(g: &mut Graph, cfg: &SDUNetConfig) -> NodeId {
 /// - Input "timestep_embedding": `[batch, time_input_dim]`
 /// - Input "text_context": `[context_len, context_dim]`
 /// - Input "noise_target": flat `[batch * in_c * res * res]` (the noise to predict)
-pub fn build_training_graph(g: &mut Graph, cfg: &SDUNetConfig) -> NodeId {
+pub fn build_training_graph(g: &mut Graph, cfg: &Config) -> NodeId {
     let batch = cfg.batch_size;
     let res = cfg.resolution;
     let in_c = cfg.in_channels;
@@ -449,7 +449,7 @@ pub fn build_training_graph(g: &mut Graph, cfg: &SDUNetConfig) -> NodeId {
 }
 
 /// Inner U-Net forward pass that returns the noise prediction tensor.
-fn build_unet_inner(g: &mut Graph, cfg: &SDUNetConfig) -> NodeId {
+fn build_unet_inner(g: &mut Graph, cfg: &Config) -> NodeId {
     let batch = cfg.batch_size;
     let res = cfg.resolution;
     let in_c = cfg.in_channels;
@@ -581,7 +581,7 @@ fn build_unet_inner(g: &mut Graph, cfg: &SDUNetConfig) -> NodeId {
 }
 
 /// Count the total number of parameters in the U-Net.
-pub fn count_params(cfg: &SDUNetConfig) -> usize {
+pub fn count_params(cfg: &Config) -> usize {
     let mut g = Graph::new();
     let _loss = build_training_graph(&mut g, cfg);
     g.nodes()
@@ -598,7 +598,7 @@ mod tests {
 
     #[test]
     fn paper_workload_shape_is_stable() {
-        let cfg = SDUNetConfig::small();
+        let cfg = Config::small();
         assert_eq!(count_params(&cfg), 10_928_768);
 
         let mut graph = Graph::new();

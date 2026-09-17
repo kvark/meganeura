@@ -231,7 +231,7 @@ fn load_resnet_weights(session: &mut meganeura::Session, model: &SafeTensorsMode
 
     // FC layer (needs transposing: HF stores [out, in])
     let fc_w = model
-        .tensor_f32_auto_transposed(&hf_name("fc.weight"))
+        .tensor_f32_auto_transposed(&hf_name("fc.weight"), 0)
         .expect("fc weight");
     session.set_parameter("fc.weight", &fc_w);
     let fc_b = model.tensor_f32_auto(&hf_name("fc.bias")).expect("fc bias");

@@ -12,7 +12,7 @@ use std::time::Instant;
 use meganeura::{
     Graph,
     data::safetensors::SafeTensorsModel,
-    models::smolvla::{self, SmolVLAConfig},
+    models::smolvla::{self, Config},
 };
 
 /// Check that the system is in a good state for reliable benchmarking.
@@ -209,7 +209,7 @@ fn main() {
     eprintln!("checking preconditions...");
     check_bench_preconditions(!force);
 
-    let config = SmolVLAConfig::smolvla_base();
+    let config = Config::smolvla_base();
     let action_seq_len = config.chunk_size; // 50
     let vlm_seq_len = 16; // representative VLM context length
     let denoise_steps = if num_steps > 0 {
@@ -280,7 +280,7 @@ fn main() {
             }
         } else if transposed_set.contains(name.as_str()) {
             let data = model
-                .tensor_f32_auto_transposed(&name)
+                .tensor_f32_auto_transposed(&name, 0)
                 .unwrap_or_else(|e| panic!("{}: {}", name, e));
             session.set_parameter(&name, &data);
         } else {

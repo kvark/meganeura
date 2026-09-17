@@ -77,9 +77,9 @@ fn smollm2_training_loss_decreases() {
         return;
     }
 
-    use meganeura::models::smollm2::{self, SmolLM2Config};
+    use meganeura::models::smollm2::{self, Config};
 
-    let config = SmolLM2Config::small_test();
+    let config = Config::small_test();
     let seq_len = 8;
     let vocab = config.vocab_size;
 
@@ -119,9 +119,9 @@ fn smollm2_weight_sharing_inference_to_training() {
         return;
     }
 
-    use meganeura::models::smollm2::{self, SmolLM2Config};
+    use meganeura::models::smollm2::{self, Config};
 
-    let config = SmolLM2Config::small_test();
+    let config = Config::small_test();
     let seq_len = 8;
     let vocab = config.vocab_size;
 
@@ -197,9 +197,9 @@ fn smolvla_weight_sharing_inference_to_training() {
         return;
     }
 
-    use meganeura::models::smolvla::{self, SmolVLAConfig};
+    use meganeura::models::smolvla::{self, Config};
 
-    let config = SmolVLAConfig::small_test();
+    let config = Config::small_test();
     let action_seq_len = config.chunk_size;
     let vlm_seq_len = 4;
 
@@ -271,9 +271,9 @@ fn smolvla_training_loss_decreases() {
         return;
     }
 
-    use meganeura::models::smolvla::{self, SmolVLAConfig};
+    use meganeura::models::smolvla::{self, Config};
 
-    let config = SmolVLAConfig::small_test();
+    let config = Config::small_test();
     let action_seq_len = config.chunk_size;
     let vlm_seq_len = 4;
 
@@ -321,9 +321,9 @@ fn sd_unet_training_loss_decreases() {
         return;
     }
 
-    use meganeura::models::sd_unet::{self, SDUNetConfig};
+    use meganeura::models::sd_unet::{self, Config};
 
-    let config = SDUNetConfig::tiny();
+    let config = Config::tiny();
     let batch = config.batch_size;
     let in_c = config.in_channels;
     let res = config.resolution;
@@ -362,13 +362,13 @@ fn sd_unet_training_loss_decreases() {
 
 #[test]
 fn smollm2_kv_cache_decode_graph() {
-    use meganeura::models::smollm2::{self, SmolLM2Config};
+    use meganeura::models::smollm2::{self, Config};
 
-    let config = SmolLM2Config {
+    let config = Config {
         hidden_size: 64, // One 64-wide head keeps the decode fixture small.
         num_attention_heads: 1,
         num_key_value_heads: 1,
-        ..SmolLM2Config::small_test()
+        ..Config::small_test()
     };
     let max_seq = 16;
     let _hidden = config.hidden_size;
@@ -491,9 +491,9 @@ fn resnet50_training_loss_decreases() {
 
 #[test]
 fn whisper_encoder_training_loss_decreases() {
-    use meganeura::models::whisper::{self, WhisperConfig};
+    use meganeura::models::whisper::{self, Config};
 
-    let config = WhisperConfig::whisper_tiny();
+    let config = Config::whisper_tiny();
     let batch = 1;
     let mel_len = 100; // short clip for testing
 

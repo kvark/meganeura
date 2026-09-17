@@ -9,7 +9,7 @@
 use meganeura::{
     Graph,
     data::safetensors::SafeTensorsModel,
-    models::smolvlm2::{self, SmolVLM2Config},
+    models::smolvlm2::{self, Config},
 };
 use std::collections::HashSet;
 
@@ -48,7 +48,7 @@ fn load_param(
         }
     } else if transposed_set.contains(name) {
         let data = model
-            .tensor_f32_auto_transposed(name)
+            .tensor_f32_auto_transposed(name, 0)
             .unwrap_or_else(|e| panic!("{}: {}", name, e));
         session.set_parameter(name, &data);
     } else {
@@ -62,7 +62,7 @@ fn load_param(
 fn main() {
     env_logger::init();
 
-    let config = SmolVLM2Config::smolvlm2_500m();
+    let config = Config::smolvlm2_500m();
 
     // --- Download model ---
     println!("downloading {} ...", REPO_ID);
@@ -192,7 +192,7 @@ fn main() {
     let text_hidden = config.text.hidden_size; // 960
 
     let connector_weight = model
-        .tensor_f32_auto_transposed("model.connector.modality_projection.proj.weight")
+        .tensor_f32_auto_transposed("model.connector.modality_projection.proj.weight", 0)
         .unwrap_or_else(|e| panic!("connector weight: {}", e));
 
     // CPU matmul: [test_vision_tokens, 12288] @ [12288, 960] → [test_vision_tokens, 960]
@@ -246,7 +246,7 @@ fn main() {
             } else {
                 println!("  lm_head tied to embed_tokens");
                 let data = model
-                    .tensor_f32_auto_transposed("model.text_model.embed_tokens.weight")
+                    .tensor_f32_auto_transposed("model.text_model.embed_tokens.weight", 0)
                     .expect("embed_tokens for tied lm_head");
                 text_session.set_parameter("lm_head.weight", &data);
             }
