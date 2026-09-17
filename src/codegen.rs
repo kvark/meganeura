@@ -1894,18 +1894,35 @@ fn substitute(source: &str, old: &str, new: &str) -> String {
 /// Derived from `matmul_gemv.wgsl` by substitution so shape and reduction
 /// changes reach it automatically. Each consuming workgroup recomputes the
 /// small sum-of-squares prologue, avoiding a separate dispatch and boundary.
-pub fn generate_module_gemv_rmsnorm(shape: GemvShape) -> ShaderModule {
+pub fn generate_module_gemv_rmsnorm(shape: GemvShape, format: WeightFormat) -> ShaderModule {
+    parse_wgsl(&gemv_shape_source(&gemv_rmsnorm_source(format), shape))
+}
+
+fn gemv_rmsnorm_source(format: WeightFormat) -> String {
     // `_pad` carries eps; the fused kernel needs no other new parameter.
-    let src = substitute(
-        include_str!("shaders/matmul_gemv.wgsl"),
-        "    _pad: u32,",
-        "    eps_bits: u32,",
-    );
-    let src = substitute(
-        &src,
-        "var<storage> matrix_b: array<vec4<f32>>;",
-        "var<storage> norm_w: array<f32>;\nvar<storage> matrix_b: array<vec4<f32>>;",
-    );
+    // Start from the already-format-specialized GEMV so packed decoders
+    // compose with the prologue rather than being overwritten by it.
+    let src = gemv_source(ShaderGroup::MatMulGemv, format);
+    let src = substitute(&src, "    _pad: u32,", "    eps_bits: u32,");
+    let src = if src.contains("var<storage> matrix_b: array<vec4<f32>>;") {
+        substitute(
+            &src,
+            "var<storage> matrix_b: array<vec4<f32>>;",
+            "var<storage> norm_w: array<f32>;\nvar<storage> matrix_b: array<vec4<f32>>;",
+        )
+    } else if src.contains("var<storage> matrix_b: array<vec4<f16>>;") {
+        substitute(
+            &src,
+            "var<storage> matrix_b: array<vec4<f16>>;",
+            "var<storage> norm_w: array<f32>;\nvar<storage> matrix_b: array<vec4<f16>>;",
+        )
+    } else {
+        substitute(
+            &src,
+            "var<storage> matrix_b: array<u32>;",
+            "var<storage> norm_w: array<f32>;\nvar<storage> matrix_b: array<u32>;",
+        )
+    };
     let src = substitute(
         &src,
         "var<workgroup> reduce_buf: array<vec4<f32>, LANES>;",
@@ -1951,12 +1968,13 @@ pub fn generate_module_gemv_rmsnorm(shape: GemvShape) -> ShaderModule {
 \n\
     // Each thread accumulates a partial sum over its K-stride slice.",
     );
-    let src = substitute(
+    substitute(
         &src,
         "        let a = matrix_a[kk];",
         "        let a = matrix_a[kk] * rs * norm_w[kk];",
     );
     ShaderModule::new(&gemv_shape_source(&src, shape))
+}
 }
 
 const LANES_PREFIX: &str = "const LANES: u32 = ";
@@ -6443,7 +6461,8 @@ mod tests {
                 ShaderEntry::Add
                 | ShaderEntry::Mul
                 | ShaderEntry::Greater
-                | ShaderEntry::SwiGLU => {
+                | ShaderEntry::SwiGLU
+                | ShaderEntry::GeGLU => {
                     vec!["src_a", "src_b", "dst", "params"]
                 }
                 ShaderEntry::BiasAdd | ShaderEntry::BiasMul => {
@@ -6491,7 +6510,10 @@ mod tests {
                 ShaderEntry::SwiGLUGradGate | ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => {
                     vec!["src_a", "src_b", "src_c", "dst", "params"]
                 }
-                ShaderEntry::SwiGLUConcat | ShaderEntry::SwiGLUConcatGrad => {
+                ShaderEntry::SwiGLUConcat
+                | ShaderEntry::SwiGLUConcatGrad
+                | ShaderEntry::GeGLUConcat
+                | ShaderEntry::GeGLUConcatGrad => {
                     vec!["src_a", "src_b", "dst", "params"]
                 }
                 ShaderEntry::RmsNormGradW
@@ -6622,6 +6644,7 @@ mod tests {
             ShaderEntry::RoPE,
             ShaderEntry::RoPEGrad,
             ShaderEntry::Gelu,
+            ShaderEntry::GeGLU,
             ShaderEntry::Tanh,
             ShaderEntry::LayerNorm,
             ShaderEntry::MultiHeadAttn,
@@ -6637,6 +6660,8 @@ mod tests {
             ShaderEntry::SwiGLUGradUp,
             ShaderEntry::SwiGLUConcat,
             ShaderEntry::SwiGLUConcatGrad,
+            ShaderEntry::GeGLUConcat,
+            ShaderEntry::GeGLUConcatGrad,
             ShaderEntry::SiluGrad,
             ShaderEntry::RmsNormGradW,
             ShaderEntry::RmsNormGradWRowPar,
@@ -6968,6 +6993,39 @@ mod tests {
     /// two whatever the width. That difference is the entire point of the
     /// axis, so pin it rather than trusting the generated text to stay
     /// correct.
+    #[test]
+    fn packed_gemv_rmsnorm_keeps_the_decoder() {
+        for format in [
+            WeightFormat::F32,
+            WeightFormat::Q40,
+            WeightFormat::Q4K,
+            WeightFormat::Q8,
+        ] {
+            let sm = generate_module_gemv_rmsnorm(
+                GemvShape {
+                    threads: 64,
+                    reduction: GemvReduction::Subgroup,
+                },
+                format,
+            );
+            assert!(
+                sm.source.contains("inv_rms"),
+                "{format:?} fused GEMV lost the RmsNorm prologue"
+            );
+            assert!(
+                sm.source.contains("norm_w"),
+                "{format:?} fused GEMV lost the norm-weight binding"
+            );
+            match format {
+                WeightFormat::F32 => assert!(sm.source.contains("matrix_b: array<vec4<f32>>")),
+                WeightFormat::Q40 => assert!(sm.source.contains("dequant_q40(")),
+                WeightFormat::Q4K => assert!(sm.source.contains("dequant_q4k(")),
+                WeightFormat::Q8 => assert!(sm.source.contains("dequant_q8(")),
+                _ => {}
+            }
+        }
+    }
+
     #[test]
     fn subgroup_reduction_replaces_the_barrier_chain() {
         let barriers = |shape| {

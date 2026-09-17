@@ -191,6 +191,8 @@ pub enum GgmlType {
     Q6K,
     Q5K,
     Q3K,
+    /// GGML BF16, two bytes per element. Unpacked to f32 on read.
+    BF16,
     /// A tag outside the set above. Carried so that a file holding one
     /// unimplemented tensor still yields an inventory for the rest; the
     /// tensor's bytes are not read, because its length depends on a block
@@ -210,6 +212,7 @@ impl GgmlType {
             12 => Self::Q4K,
             13 => Self::Q5K,
             14 => Self::Q6K,
+            30 => Self::BF16,
             other => Self::Other(other),
         }
     }
@@ -223,7 +226,7 @@ impl GgmlType {
     /// Non-block types report 1.
     pub fn block_elements(self) -> Option<usize> {
         Some(match self {
-            Self::F32 | Self::F16 => 1,
+            Self::F32 | Self::F16 | Self::BF16 => 1,
             Self::Q4_0 | Self::Q4_1 | Self::Q8_0 => 32,
             Self::Q4K | Self::Q6K | Self::Q5K | Self::Q3K => 256,
             Self::Other(_) => return None,
@@ -235,7 +238,7 @@ impl GgmlType {
     pub fn block_bytes(self) -> Option<usize> {
         Some(match self {
             Self::F32 => 4,
-            Self::F16 => 2,
+            Self::F16 | Self::BF16 => 2,
             // f16 d + 16 packed nibble bytes
             Self::Q4_0 => 18,
             // f16 d + f16 m + 16 packed nibble bytes
@@ -274,6 +277,7 @@ impl GgmlType {
         match self {
             Self::F32 => 0,
             Self::F16 => 1,
+            Self::BF16 => 30,
             Self::Q4_0 => 2,
             Self::Q4_1 => 3,
             Self::Q8_0 => 8,
@@ -472,6 +476,34 @@ impl GgufTensor {
         self.dequantize_flat()
     }
 
+    /// One column of a 2-D tensor (or the whole vector, for 1-D), dequantized
+    /// to f32 in Meganeura's K-major order.
+    ///
+    /// Used for embedding tables that have no GPU gather: decode looks up a
+    /// single token, which is one GGUF column, without dequantizing the rest
+    /// of a multi-gigabyte PLE table.
+    pub fn column_f32(&self, col: usize) -> Result<Vec<f32>, GgufError> {
+        let (k, n) = self.matrix_dims()?;
+        if col >= n {
+            return Err(GgufError::BadShape(format!(
+                "column {col} is out of range for shape {:?}",
+                self.dims
+            )));
+        }
+        let bytes = self
+            .ggml_type
+            .stored_bytes(k)
+            .map_err(|_| GgufError::UnsupportedType(self.ggml_type.tag()))?;
+        let start = col * bytes;
+        let end = start + bytes;
+        let slice = self.data().get(start..end).ok_or(GgufError::Truncated {
+            what: "tensor column",
+            offset: start,
+        })?;
+        let column = GgufTensor::new(vec![k], self.ggml_type, slice.to_vec());
+        column.dequantize_flat()
+    }
+
     /// The [`DType`] this tensor would occupy, without converting it.
     ///
     /// [`GgufTensor::to_packed`] allocates a whole tensor; callers that only
@@ -593,6 +625,13 @@ impl GgufTensor {
                 .0
                 .iter()
                 .map(|&c| f16_from_bits(u16::from_le_bytes(c)))
+                .collect(),
+            GgmlType::BF16 => self
+                .data()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&c| bf16_from_bits(u16::from_le_bytes(c)))
                 .collect(),
             GgmlType::Q4_0 => dequant_q4_0(self.data(), count),
             GgmlType::Q4_1 => dequant_q4_1(self.data(), count),
@@ -1016,6 +1055,10 @@ pub fn load_gguf_shared(file: Arc<[u8]>) -> Result<GgufModel, GgufError> {
 
 fn f16_from_bits(bits: u16) -> f32 {
     half::f16::from_bits(bits).to_f32()
+}
+
+fn bf16_from_bits(bits: u16) -> f32 {
+    half::bf16::from_bits(bits).to_f32()
 }
 
 /// Only the fixtures need this direction: nothing in the load path writes

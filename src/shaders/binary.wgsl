@@ -41,3 +41,15 @@ fn swiglu(@builtin(global_invocation_id) gid: vec3<u32>) {
     let sig = 1.0 / (1.0 + exp(-gate));
     dst[i] = gate * sig * up;
 }
+
+// geglu: gelu(gate) * up, tanh approximation matching unary.wgsl's gelu
+@compute @workgroup_size(256)
+fn geglu(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if i >= params.len { return; }
+    let gate = src_a[i];
+    let up = src_b[i];
+    let x3 = gate * gate * gate;
+    let inner = 0.7978845608 * (gate + 0.044715 * x3);
+    dst[i] = 0.5 * gate * (1.0 + tanh(inner)) * up;
+}

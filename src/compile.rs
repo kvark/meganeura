@@ -220,6 +220,7 @@ pub enum ShaderEntry {
     Transpose,
     Silu,
     SwiGLU,
+    GeGLU,
     RmsNorm,
     Embedding,
     ToF16,
@@ -254,6 +255,8 @@ pub enum ShaderEntry {
     SiluGrad,
     SwiGLUConcat,
     SwiGLUConcatGrad,
+    GeGLUConcat,
+    GeGLUConcatGrad,
     SumRows,
     RmsNormGradW,
     RmsNormGradWRowPar,
@@ -443,6 +446,7 @@ impl ShaderEntry {
             | ShaderEntry::BiasMul
             | ShaderEntry::Silu
             | ShaderEntry::SwiGLU
+            | ShaderEntry::GeGLU
             | ShaderEntry::RoPE
             | ShaderEntry::RoPEGrad
             | ShaderEntry::Gelu
@@ -451,6 +455,8 @@ impl ShaderEntry {
             | ShaderEntry::SiluGrad
             | ShaderEntry::SwiGLUConcat
             | ShaderEntry::SwiGLUConcatGrad
+            | ShaderEntry::GeGLUConcat
+            | ShaderEntry::GeGLUConcatGrad
             | ShaderEntry::MulPerChannel
             | ShaderEntry::AddPerChannel
             | ShaderEntry::RoPEDynamic
@@ -492,7 +498,7 @@ impl ShaderEntry {
             ShaderEntry::BceLoss => ShaderGroup::BceLoss,
             ShaderEntry::Transpose => ShaderGroup::Transpose,
             ShaderEntry::Silu => ShaderGroup::Unary,
-            ShaderEntry::SwiGLU => ShaderGroup::Binary,
+            ShaderEntry::SwiGLU | ShaderEntry::GeGLU => ShaderGroup::Binary,
             ShaderEntry::RmsNorm => ShaderGroup::RmsNorm,
             ShaderEntry::Embedding => ShaderGroup::Embedding,
             ShaderEntry::ToF16 => ShaderGroup::ToF16,
@@ -512,7 +518,10 @@ impl ShaderEntry {
             ShaderEntry::SwiGLUGradGate | ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => {
                 ShaderGroup::SwiGLUGrad
             }
-            ShaderEntry::SwiGLUConcat | ShaderEntry::SwiGLUConcatGrad => ShaderGroup::SwiGLUConcat,
+            ShaderEntry::SwiGLUConcat
+            | ShaderEntry::SwiGLUConcatGrad
+            | ShaderEntry::GeGLUConcat
+            | ShaderEntry::GeGLUConcatGrad => ShaderGroup::SwiGLUConcat,
             ShaderEntry::SumRows => ShaderGroup::SumRows,
             ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradX => ShaderGroup::RmsNormGrad,
             ShaderEntry::RmsNormGradWRowPar => ShaderGroup::RmsNormGradWRowPar,
@@ -607,6 +616,7 @@ impl ShaderEntry {
             ShaderEntry::MeanAll => "mean_all",
             ShaderEntry::Silu => "silu",
             ShaderEntry::SwiGLU => "swiglu",
+            ShaderEntry::GeGLU => "geglu",
             ShaderEntry::RmsNorm => "main",
             ShaderEntry::Embedding => "main",
             ShaderEntry::ToF16 => "main",
@@ -628,6 +638,8 @@ impl ShaderEntry {
             ShaderEntry::SiluGrad => "silu_grad",
             ShaderEntry::SwiGLUConcat => "swiglu_concat",
             ShaderEntry::SwiGLUConcatGrad => "swiglu_concat_grad",
+            ShaderEntry::GeGLUConcat => "geglu_concat",
+            ShaderEntry::GeGLUConcatGrad => "geglu_concat_grad",
             ShaderEntry::SumRows => "sum_rows",
             ShaderEntry::RmsNormGradW => "rms_norm_grad_w",
             ShaderEntry::RmsNormGradWRowPar => "rms_norm_grad_w_rowpar",
@@ -2014,18 +2026,16 @@ pub fn fuse_rmsnorm_into_gemv(plan: &mut ExecutionPlan) {
         let Some(consumers) = readers.get(&normed) else {
             continue;
         };
-        // `generate_module_gemv_rmsnorm` derives from the f32 GEMV, and the
-        // fused pipeline is a `Variant::GemvRmsNorm`, which does not compose
-        // with `Variant::Weight`. Folding the norm into a GEMV whose weight
-        // is not f32 would therefore run the f32 kernel over packed blocks —
-        // and under a binding layout with an extra buffer, so the damage
-        // lands in neighbouring buffers rather than just the result.
+        // Folding is a variant of MatMulGemv: the fused pipeline is
+        // `Variant::GemvRmsNorm`, keyed by weight format and shape, so a
+        // packed GEMV keeps its decoder. Only the unfused GEMV path is
+        // rewritten; fused-add / BT / int-dot stay separate kernels.
         if consumers.is_empty()
             || consumers.iter().any(|&c| {
                 let d = &plan.dispatches[c];
                 d.shader != ShaderEntry::MatMulGemv
                     || d.input_buffers.first() != Some(&normed)
-                    || d.weight_format != WeightFormat::F32
+                    || d.gemv_int_dot
             })
         {
             continue;
@@ -3869,6 +3879,10 @@ impl<'a> Compiler<'a> {
                 self.emit_binary(ShaderEntry::SwiGLU, node, out_buf);
             }
 
+            Op::GeGLU => {
+                self.emit_binary(ShaderEntry::GeGLU, node, out_buf);
+            }
+
             Op::SwiGLUConcat => {
                 // input[M, 2*N] → output[M, N]
                 let input = self.get_buffer(node.inputs[0]);
@@ -3887,6 +3901,23 @@ impl<'a> Compiler<'a> {
                 });
             }
 
+            Op::GeGLUConcat => {
+                let input = self.get_buffer(node.inputs[0]);
+                let out_len = node.ty.num_elements() as u32;
+                let half_n = node.ty.shape[1] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::GeGLUConcat,
+                    workgroups: [out_len.div_ceil(256), 1, 1],
+                    input_buffers: vec![input, input],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![out_len, half_n, 0, 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
             Op::SwiGLUConcatGrad => {
                 // (grad_out[M,N], input[M,2*N]) → grad_input[M,2*N]
                 let grad_out = self.get_buffer(node.inputs[0]);
@@ -3895,6 +3926,24 @@ impl<'a> Compiler<'a> {
                 let half_n = self.graph.node(node.inputs[0]).ty.shape[1] as u32;
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::SwiGLUConcatGrad,
+                    workgroups: [grad_out_len.div_ceil(256), 1, 1],
+                    input_buffers: vec![input, grad_out],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![grad_out_len, half_n, 0, 0],
+                    use_coop: false,
+                    use_small_tiles: false,
+                    ..Default::default()
+                });
+            }
+
+            Op::GeGLUConcatGrad => {
+                let grad_out = self.get_buffer(node.inputs[0]);
+                let input = self.get_buffer(node.inputs[1]);
+                let grad_out_len = self.graph.node(node.inputs[0]).ty.num_elements() as u32;
+                let half_n = self.graph.node(node.inputs[0]).ty.shape[1] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::GeGLUConcatGrad,
                     workgroups: [grad_out_len.div_ceil(256), 1, 1],
                     input_buffers: vec![input, grad_out],
                     output_buffer: out_buf,

@@ -178,7 +178,8 @@ impl egglog::extract::CostModel<u64> for FusionCostModel {
         // node binds, e.g. the packed matmul inside SwiGLUPacked): fall
         // back to constants that keep fused ops preferred.
         match name {
-            "FusedMatMulAdd" | "FusedMatMulATAdd" | "FusedMatMulBTAdd" | "SwiGLUPacked" => 9,
+            "FusedMatMulAdd" | "FusedMatMulATAdd" | "FusedMatMulBTAdd" | "SwiGLUPacked"
+            | "GeGLUPacked" => 9,
             _ => 10,
         }
     }
@@ -474,6 +475,8 @@ fn optimize_greedy(mut g: Graph, config: OptimizeConfig) -> (Graph, OptimizeRepo
         if config.greedy_pack_swiglu {
             apply_greedy_swiglu_packed(&mut g, &mut fusions);
         }
+        apply_greedy_geglu(&mut g, &mut fusions);
+        apply_greedy_geglu_packed(&mut g, &mut fusions);
         if fusions.len() == before {
             break;
         }
@@ -700,6 +703,103 @@ fn apply_greedy_swiglu_packed(graph: &mut Graph, fusions: &mut Vec<(String, u32)
     }
 }
 
+fn apply_greedy_geglu(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
+    let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
+    for id in node_ids {
+        let (a, b) = {
+            let node = &graph.nodes()[id];
+            if !matches!(node.op, Op::Mul) {
+                continue;
+            }
+            (node.inputs[0], node.inputs[1])
+        };
+        let (gate, up) = if matches!(graph.node(a).op, Op::Gelu) {
+            (graph.node(a).inputs[0], b)
+        } else if matches!(graph.node(b).op, Op::Gelu) {
+            (graph.node(b).inputs[0], a)
+        } else {
+            continue;
+        };
+        graph.nodes_mut()[id].op = Op::GeGLU;
+        graph.nodes_mut()[id].inputs = vec![gate, up];
+        fusions.push(("Gelu+Mul→GeGLU".to_string(), id as u32));
+    }
+}
+
+fn apply_greedy_geglu_packed(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
+    let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
+    for id in node_ids {
+        let (gate_id, up_id) = {
+            let node = &graph.nodes()[id];
+            if !matches!(node.op, Op::GeGLU) {
+                continue;
+            }
+            (node.inputs[0], node.inputs[1])
+        };
+        let (h, wg, wu) = {
+            let gate = graph.node(gate_id);
+            let up = graph.node(up_id);
+            if !matches!(gate.op, Op::MatMul)
+                || !matches!(up.op, Op::MatMul)
+                || gate.inputs[0] != up.inputs[0]
+            {
+                continue;
+            }
+            (gate.inputs[0], gate.inputs[1], up.inputs[1])
+        };
+        let (gate_name, up_name, in_features, out_features, dtype) = {
+            let gate_weight = graph.node(wg);
+            let up_weight = graph.node(wu);
+            let (gate_name, up_name) = match (gate_weight.op.clone(), up_weight.op.clone()) {
+                (Op::Parameter { name: gate }, Op::Parameter { name: up }) => (gate, up),
+                _ => continue,
+            };
+            if gate_weight.ty.shape.len() != 2
+                || gate_weight.ty.shape != up_weight.ty.shape
+                || gate_weight.ty.dtype != up_weight.ty.dtype
+                || graph.node(h).ty.shape.len() != 2
+            {
+                continue;
+            }
+            (
+                gate_name,
+                up_name,
+                gate_weight.ty.shape[0],
+                gate_weight.ty.shape[1],
+                gate_weight.ty.dtype,
+            )
+        };
+
+        let concat_name = format!("{gate_name}+{up_name}");
+        graph.derived_params.push(crate::graph::DerivedParam {
+            name: concat_name.clone(),
+            sources: vec![(gate_name, out_features), (up_name, out_features)],
+            rows: in_features,
+            transform: crate::graph::ParamTransform::HorizontalConcat,
+        });
+        let requires_full_precision = graph.node(id as NodeId).requires_full_precision;
+        let concat_w = graph.add_raw_node_with_precision(
+            Op::Parameter { name: concat_name },
+            vec![],
+            TensorType::new(vec![in_features, 2 * out_features], dtype),
+            requires_full_precision,
+        );
+        let m = graph.node(h).ty.shape[0];
+        let wide_mm = graph.add_raw_node_with_precision(
+            Op::MatMul,
+            vec![h, concat_w],
+            TensorType::f32(vec![m, 2 * out_features]),
+            requires_full_precision,
+        );
+        graph.nodes_mut()[id].op = Op::GeGLUConcat;
+        graph.nodes_mut()[id].inputs = vec![wide_mm];
+        fusions.push((
+            "GeGLU(MatMul,MatMul)→GeGLUConcat(MatMul)".to_string(),
+            id as u32,
+        ));
+    }
+}
+
 /// Dump the whole-graph egglog program (for standalone debugging).
 /// Requires topologically-ordered node ids, like `optimize` itself.
 pub fn dump_egglog_program(graph: &Graph) -> String {
@@ -820,6 +920,9 @@ fn egglog_prelude(prog: &mut String) {
   (Silu Op)
   (SwiGLU Op Op)
   (SwiGLUPacked Op Op Op)
+  (Gelu Op)
+  (GeGLU Op Op)
+  (GeGLUPacked Op Op Op)
   (Op1 i64 Op)
   (Op2 i64 Op Op)
   (Op3 i64 Op Op Op)
@@ -861,6 +964,10 @@ fn egglog_prelude(prog: &mut String) {
 ; the weights are not plain 2D parameters).
 (rewrite (SwiGLU (MatMul ?h ?wg) (MatMul ?h ?wu)) (SwiGLUPacked ?h ?wg ?wu))
 
+; GeGLU: gelu(gate) * up, then the same HorizontalConcat packing as SwiGLU.
+(rewrite (Mul (Gelu ?gate) ?up) (GeGLU ?gate ?up))
+(rewrite (GeGLU (MatMul ?h ?wg) (MatMul ?h ?wu)) (GeGLUPacked ?h ?wg ?wu))
+
 ",
     );
     // Saturation is bounded: the deepest rewrite chain is three rules
@@ -887,6 +994,8 @@ fn named_constructor(op: &Op) -> Option<&'static str> {
         Op::Transpose => "Transpose",
         Op::Silu => "Silu",
         Op::SwiGLU => "SwiGLU",
+        Op::Gelu => "Gelu",
+        Op::GeGLU => "GeGLU",
         _ => return None,
     })
 }
@@ -1305,7 +1414,10 @@ impl Stamper<'_> {
         target: Option<NodeId>,
     ) -> Result<NodeId, String> {
         if name == "SwiGLUPacked" {
-            return self.build_swiglu_packed(&inputs, target);
+            return self.build_glu_packed(&inputs, target, Op::SwiGLUConcat, "SwiGLUPacked");
+        }
+        if name == "GeGLUPacked" {
+            return self.build_glu_packed(&inputs, target, Op::GeGLUConcat, "GeGLUPacked");
         }
         let shape = |id: NodeId| self.g.node(id).ty.shape.clone();
         let ty_of = |id: NodeId| self.g.node(id).ty.clone();
@@ -1358,6 +1470,8 @@ impl Stamper<'_> {
             }
             "Silu" => (Op::Silu, ty_of(inputs[0]), Some("Mul+Sigmoid→Silu")),
             "SwiGLU" => (Op::SwiGLU, ty_of(inputs[0]), Some("Silu+Mul→SwiGLU")),
+            "Gelu" => (Op::Gelu, ty_of(inputs[0]), None),
+            "GeGLU" => (Op::GeGLU, ty_of(inputs[0]), Some("Gelu+Mul→GeGLU")),
             other => return Err(format!("unknown constructor {}", other)),
         };
         let id = self.place(op, inputs.clone(), ty, target);
@@ -1375,14 +1489,16 @@ impl Stamper<'_> {
         Ok(id)
     }
 
-    /// SwiGLU(MatMul(h, wg), MatMul(h, wu)) → SwiGLUConcat(MatMul(h, wg|wu))
+    /// SwiGLU/GeGLU(MatMul(h, wg), MatMul(h, wu)) → Concat(MatMul(h, wg|wu))
     /// with a derived concatenated-weight parameter. Falls back to the
     /// equivalent unpacked form when the weights are not plain same-shape
     /// 2D parameters (e.g. ONNX constants).
-    fn build_swiglu_packed(
+    fn build_glu_packed(
         &mut self,
         inputs: &[NodeId],
         target: Option<NodeId>,
+        concat_op: Op,
+        packed_key: &'static str,
     ) -> Result<NodeId, String> {
         let (h, wg, wu) = (inputs[0], inputs[1], inputs[2]);
         let packable = {
@@ -1394,10 +1510,15 @@ impl Stamper<'_> {
                 && g_node.ty.dtype == u_node.ty.dtype
                 && self.g.node(h).ty.shape.len() == 2
         };
+        let unpacked = match concat_op {
+            Op::SwiGLUConcat => "SwiGLU",
+            Op::GeGLUConcat => "GeGLU",
+            _ => unreachable!("glu pack only for SwiGLU/GeGLU concat"),
+        };
         if !packable {
             let gate = self.lookup_or_build("MatMul", vec![h, wg])?;
             let up = self.lookup_or_build("MatMul", vec![h, wu])?;
-            return self.build_named("SwiGLU", vec![gate, up], target);
+            return self.build_named(unpacked, vec![gate, up], target);
         }
         let param_name = |id: NodeId| match self.g.node(id).op {
             Op::Parameter { ref name } => name.clone(),
@@ -1430,21 +1551,19 @@ impl Stamper<'_> {
             self.requires_full_precision,
         );
         let id = self.place(
-            Op::SwiGLUConcat,
+            concat_op,
             vec![wide_mm],
             TensorType::f32(vec![m, out_features]),
             target,
         );
         self.index.insert(
-            (
-                "SwiGLUPacked",
-                inputs.to_vec(),
-                self.requires_full_precision,
-            ),
+            (packed_key, inputs.to_vec(), self.requires_full_precision),
             id,
         );
-        self.fusions
-            .push(("SwiGLU(MatMul,MatMul)→SwiGLUConcat(MatMul)".to_string(), id));
+        self.fusions.push((
+            format!("{unpacked}(MatMul,MatMul)→{unpacked}Concat(MatMul)"),
+            id,
+        ));
         Ok(id)
     }
 
@@ -1507,6 +1626,9 @@ fn static_constructor(name: &str) -> Result<&'static str, String> {
         "Silu" => "Silu",
         "SwiGLU" => "SwiGLU",
         "SwiGLUPacked" => "SwiGLUPacked",
+        "Gelu" => "Gelu",
+        "GeGLU" => "GeGLU",
+        "GeGLUPacked" => "GeGLUPacked",
         other => return Err(format!("unknown constructor {}", other)),
     })
 }
@@ -2123,6 +2245,40 @@ mod tests {
             report.fusions_applied
         );
         // The fused matmul should have shape [50, 4096] (2*2048)
+        let mm_id = output_node.inputs[0];
+        let mm_node = opt.node(mm_id);
+        assert!(matches!(mm_node.op, Op::MatMul));
+        assert_eq!(mm_node.ty.shape, vec![50, 4096]);
+        assert_eq!(opt.derived_params.len(), 1);
+    }
+
+    /// GeGLU(MatMul, MatMul) → GeGLUConcat(MatMul) fusion.
+    #[test]
+    fn test_geglu_concat_fusion() {
+        let mut g = Graph::new();
+        let h = g.input("h", &[50, 720]);
+        let w_gate = g.parameter("w_gate", &[720, 2048]);
+        let w_up = g.parameter("w_up", &[720, 2048]);
+        let gate = g.matmul(h, w_gate);
+        let up = g.matmul(h, w_up);
+        let out = g.geglu(gate, up);
+        g.set_outputs(vec![out]);
+
+        let (opt, report) = optimize_with_report(&g);
+        let output_node = opt.node(opt.outputs()[0]);
+        assert!(
+            matches!(output_node.op, Op::GeGLUConcat),
+            "expected GeGLUConcat, got {:?}",
+            output_node.op
+        );
+        assert!(
+            report
+                .fusions_applied
+                .iter()
+                .any(|entry| entry.0.contains("GeGLU")),
+            "no GeGLU fusion in report: {:?}",
+            report.fusions_applied
+        );
         let mm_id = output_node.inputs[0];
         let mm_node = opt.node(mm_id);
         assert!(matches!(mm_node.op, Op::MatMul));

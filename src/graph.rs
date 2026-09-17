@@ -389,6 +389,13 @@ pub enum Op {
     // Backward for SwiGLUConcat: (grad_out[M,N], input[M,2*N]) → grad_input[M,2*N]
     SwiGLUConcatGrad,
 
+    // GeGLU: gelu(gate) * up  (inputs: [gate, up])
+    GeGLU,
+    // GeGLU on concatenated input: input[M, 2*N] → output[M, N]
+    GeGLUConcat,
+    // Backward for GeGLUConcat: (grad_out[M,N], input[M,2*N]) → grad_input[M,2*N]
+    GeGLUConcatGrad,
+
     // Fused backward gradient ops for SwiGLU and Silu
     // SwiGLUGradGate: (grad_out, gate, up) → grad_gate
     SwiGLUGradGate,
@@ -1835,6 +1842,22 @@ impl Graph {
         assert_eq!(in_shape[1] % 2, 0, "SwiGLUConcat requires even N");
         let ty = TensorType::f32(vec![in_shape[0], in_shape[1] / 2]);
         self.add_raw_node(Op::SwiGLUConcat, vec![input], ty)
+    }
+
+    /// Fused GeGLU: gelu(gate) * up. gate and up must have the same shape.
+    pub fn geglu(&mut self, gate: NodeId, up: NodeId) -> NodeId {
+        let ty = self.node(gate).ty.clone();
+        self.add_node(Op::GeGLU, vec![gate, up], ty)
+    }
+
+    /// GeGLU on concatenated input: input[M, 2*N] → output[M, N].
+    #[track_caller]
+    pub fn geglu_concat(&mut self, input: NodeId) -> NodeId {
+        let in_shape = &self.node(input).ty.shape;
+        assert_eq!(in_shape.len(), 2);
+        assert_eq!(in_shape[1] % 2, 0, "GeGLUConcat requires even N");
+        let ty = TensorType::f32(vec![in_shape[0], in_shape[1] / 2]);
+        self.add_raw_node(Op::GeGLUConcat, vec![input], ty)
     }
 
     /// Fused SwiGLU backward: grad_gate = grad_out * up * dsilu(gate)

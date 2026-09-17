@@ -1,4 +1,5 @@
 /target/
+/models/
 /Cargo.lock
 data/mnist-mlp.safetensors
 data/*.gz

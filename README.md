@@ -92,6 +92,7 @@ Worked examples live in [`examples/`](https://github.com/kvark/meganeura/tree/ma
 - [`mnist.rs`](https://github.com/kvark/meganeura/blob/main/examples/mnist.rs) — MNIST training end to end.
 - [`train_deploy.rs`](https://github.com/kvark/meganeura/blob/main/examples/train_deploy.rs) — optimizer-backed training, checkpoint save, and reload into a fresh inference session.
 - [`smollm2.rs`](https://github.com/kvark/meganeura/blob/main/examples/smollm2.rs) — LLM inference with HuggingFace weights.
+- [`gemma4.rs`](https://github.com/kvark/meganeura/blob/main/examples/gemma4.rs) — Gemma 4 GGUF decode vs llama.cpp.
 
 Current checkpoints store logical tensors without device padding and preflight
 the restore before mutation. Adam/LaProp moments are allocated only when
