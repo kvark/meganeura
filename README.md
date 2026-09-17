@@ -156,11 +156,15 @@ println!("{}", generator.generate("The meaning of life is", &GenerationOptions::
 Nothing there names an architecture or a dimension; see
 `examples/gguf_generate.rs`. The llama, Qwen2/3 and Gemma families are
 built generically from `{arch}.*` metadata, and an architecture whose graph
-cannot be expressed exactly is refused by name rather than approximated.
+cannot be expressed exactly is refused by name rather than approximated —
+so a stock Gemma2 GGUF (attention logit softcapping) and Phi2 (RoPE over
+part of the head) are among those this loader rejects.
 The layers below are usable on their own: `arch` for the description,
 `graph` for the graph, `weights` to fill a session, `vocab` for the
 tokenizer, and `load_gguf(...)` for the raw tensor inventory
-(`examples/gguf_info.rs`).
+(`examples/gguf_info.rs`). All of this is behind the `gguf` cargo
+feature (like the `models` feature for `src/models`, nothing is on by
+default); the loader pulls no external dependency of its own.
 
 GGUF quantized weights are imported without a requantize. `Q4_0` and the
 K-quants — `Q4_K`, `Q5_K`, `Q6_K` and `Q3_K` — are stored byte-for-byte as

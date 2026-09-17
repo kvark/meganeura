@@ -43,8 +43,10 @@ pub struct GeneratorOptions {
     /// Longest sequence the caches can hold, prompt included.
     ///
     /// Bounds memory: each layer holds two `max_seq_len × kv_dim` f32
-    /// buffers. Defaults to the file's own `context_length`, capped, since
-    /// a model advertising 128k would otherwise allocate for it.
+    /// buffers. `Default` is a hard 2048; pass
+    /// [`Generator::with_config`] a config whose `context_length` you
+    /// have capped yourself — nothing here clamps against the file's
+    /// own `context_length`.
     pub max_seq_len: usize,
     /// Token slots the prefill session consumes per step.
     ///
@@ -533,10 +535,18 @@ fn argmax(logits: &[f32]) -> u32 {
 
 fn sample_with_temperature(logits: &[f32], options: &GenerationOptions, rng: &mut Rng) -> u32 {
     // Softmax over the shifted logits; the shift keeps exp() in range.
-    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    // NaN is filtered for the same reason `argmax` filters it: `total_cmp`
+    // ranks a positive NaN above every real number, so one bad logit
+    // would win the sort and its `exp(NaN)` would poison the total.
+    let max = logits
+        .iter()
+        .copied()
+        .filter(|l| !l.is_nan())
+        .fold(f32::NEG_INFINITY, f32::max);
     let mut candidates: Vec<(u32, f32)> = logits
         .iter()
         .enumerate()
+        .filter(|&(_, &l)| !l.is_nan())
         .map(|(i, &l)| (i as u32, ((l - max) / options.temperature).exp()))
         .collect();
     candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -717,6 +727,24 @@ mod tests {
         let mut rng = Rng::new(7);
         // A top_p of zero would empty the set if it were not floored.
         assert_eq!(sample_with_temperature(&logits, &opts, &mut rng), 1);
+    }
+
+    #[test]
+    fn temperature_sampling_never_picks_a_nan() {
+        let mut opts = options();
+        opts.temperature = 1.0;
+        opts.top_k = 0;
+        opts.top_p = 1.0;
+        // Index 1 carried a NaN, so it must never come out — and the
+        // surviving softmax total must stay finite, or 0's `exp(NaN)`
+        // weight would win through the not-finite fallback.
+        for seed in 0..64 {
+            let mut rng = Rng::new(seed);
+            assert_ne!(
+                sample_with_temperature(&[1.0f32, f32::NAN, 2.0], &opts, &mut rng),
+                1
+            );
+        }
     }
 
     #[test]

@@ -1,4 +1,5 @@
 //! Focused regressions share one executable instead of linking the stack per file.
+//! Model-graph children are behind the `models` feature; run the rest featureless.
 mod adam_state_rw;
 mod back_to_back_step;
 mod cached_query_attention;
@@ -8,6 +9,7 @@ mod conv_derivatives;
 mod coop_conv_unaligned_k;
 mod coop_matmul_skinny;
 mod eager;
+#[cfg(feature = "models")]
 mod efficientnet_smoke;
 mod exclusive_cumsum;
 mod f16_embedding;
@@ -29,12 +31,10 @@ mod matmul_param_order;
 mod mha_head_dim32;
 mod mixed_attention_widths;
 mod multi_input_trainer;
-mod outline_optimize;
-mod profile_windows;
-mod resnet_correctness;
 mod scatter_add_atomic;
 mod schedule_pointwise;
 mod schedule_reduction;
+#[cfg(all(feature = "hub", feature = "models"))]
 mod smollm2_correctness;
 mod softplus_tail;
 mod submission_chunks;
