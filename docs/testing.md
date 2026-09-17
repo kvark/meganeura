@@ -13,6 +13,9 @@ cargo test --test smoke -- --test-threads=1
 
 # CI/full regression check, including the narrower historical cases.
 cargo test --tests -- --test-threads=1
+# ...to also cover the first-party models (`models`) and the GGUF loader
+# (`gguf`), which nothing enables by default:
+cargo test --tests --all-features -- --test-threads=1
 ```
 
 `smoke` and `regression` compile their modules into two executables. Four

@@ -1,8 +1,9 @@
 /// GPU smoke test: validates that all shaders compile with blade + lavapipe
 /// and that a simple forward pass executes without errors.
+use meganeura::{Graph, build_session, compile::BufferRef};
+#[cfg(feature = "models")]
 use meganeura::{
-    Graph, build_session, build_session_unoptimized,
-    compile::BufferRef,
+    build_session_unoptimized,
     models::smolvla::{self, SmolVLAConfig},
 };
 
@@ -360,6 +361,7 @@ fn narrow_rms_norm_matches_cpu_forward_and_grad_x() {
 }
 
 #[test]
+#[cfg(feature = "models")]
 fn smolvla_training_backprop_smoke() {
     // GPU-less validation jobs may opt out of the full model backpropagation test.
     if std::env::var("MEGANEURA_SKIP_BACKPROP").unwrap_or_default() == "1" {
@@ -628,6 +630,7 @@ fn multi_head_attn_gradient_check() {
 
 /// Check that all non-fused parameters have non-zero gradients.
 /// Returns (total_params, zero_param_names).
+#[cfg(feature = "models")]
 fn check_ffn_gradients(session: &meganeura::Session) -> (usize, Vec<String>) {
     let param_buffers: std::collections::HashMap<String, BufferRef> =
         session.plan().param_buffers.iter().cloned().collect();
@@ -657,6 +660,7 @@ fn check_ffn_gradients(session: &meganeura::Session) -> (usize, Vec<String>) {
 }
 
 /// Run SmolLM2 training graph with given session builder and check gradients.
+#[cfg(feature = "models")]
 fn run_smollm2_gradient_check(
     config: &meganeura::models::smollm2::SmolLM2Config,
     builder: fn(&Graph) -> meganeura::Session,
@@ -689,6 +693,7 @@ fn run_smollm2_gradient_check(
 }
 
 #[test]
+#[cfg(feature = "models")]
 fn smollm2_ffn_gradients_nonzero() {
     use meganeura::models::smollm2::SmolLM2Config;
     let config = SmolLM2Config::small_test();
@@ -702,6 +707,7 @@ fn smollm2_ffn_gradients_nonzero() {
 }
 
 #[test]
+#[cfg(feature = "models")]
 fn smollm2_ffn_gradients_unoptimized() {
     use meganeura::models::smollm2::SmolLM2Config;
     let config = SmolLM2Config::small_test();
@@ -715,6 +721,7 @@ fn smollm2_ffn_gradients_unoptimized() {
 }
 
 #[test]
+#[cfg(feature = "models")]
 #[ignore] // ~22 min in debug mode; run with --release --ignored
 fn smollm2_medium_ffn_gradients_optimized() {
     use meganeura::models::smollm2::SmolLM2Config;
@@ -729,6 +736,7 @@ fn smollm2_medium_ffn_gradients_optimized() {
 }
 
 #[test]
+#[cfg(feature = "models")]
 #[ignore] // ~22 min in debug mode; run with --release --ignored
 fn smollm2_medium_ffn_gradients_unoptimized() {
     use meganeura::models::smollm2::SmolLM2Config;
@@ -745,6 +753,7 @@ fn smollm2_medium_ffn_gradients_unoptimized() {
 /// End-to-end SmolLM2 gradient check via finite differences.
 /// Uses 1 layer with head_dim=64 (matching production shaders).
 #[test]
+#[cfg(feature = "models")]
 fn smollm2_e2e_gradient_finite_diff() {
     if std::env::var("MEGANEURA_SKIP_BACKPROP").unwrap_or_default() == "1" {
         eprintln!("MEGANEURA_SKIP_BACKPROP set — skipping SmolLM2 e2e gradient check");
@@ -3281,6 +3290,7 @@ fn q4_matmul_single_row_matches_reference() {
 /// stays f32 (`embedding` has no Q4 gather, and a tied `lm_head` shares
 /// it), as do the norms and the KV cache.
 #[test]
+#[cfg(feature = "models")]
 fn smollm2_q4_projections_match_f32_decode() {
     use meganeura::models::smollm2::{self, ProjectionWeights, SmolLM2Config};
 
@@ -3543,6 +3553,7 @@ fn small_tile_matmul_with_epilogue_matches_cpu() {
 /// Build one Q4_K superblock with a realistic spread: per-sub-block scales
 /// and mins that actually differ, and quants across the whole nibble range.
 /// Packed exactly the way `get_scale_min_k4` expects to read it back.
+#[cfg(feature = "gguf")]
 fn q4k_superblock(seed: u32) -> Vec<u8> {
     let mut st = seed | 1;
     let mut rnd = || {
@@ -3570,6 +3581,7 @@ fn q4k_superblock(seed: u32) -> Vec<u8> {
     b
 }
 
+#[cfg(feature = "gguf")]
 fn assert_gguf_packed_matmul(
     case: &str,
     tensor: meganeura::load::gguf::GgufTensor,
@@ -3720,6 +3732,7 @@ fn k_quants_are_load_only_and_refuse_transposed_b() {
 ///   not a whole number of words, so half of them start at byte 2 and the
 ///   buffer needs a tail.
 #[test]
+#[cfg(feature = "gguf")]
 fn gguf_packed_matmul_variants_match_ggml_reference() {
     use meganeura::load::gguf::{GgmlType, GgufTensor};
 
@@ -3769,6 +3782,7 @@ fn gguf_packed_matmul_variants_match_ggml_reference() {
 /// One GGML Q4_0 block: an f16 scale and sixteen nibble bytes spanning the
 /// full 0..15 range, so both halves of the split-nibble layout and both ends
 /// of the -8 bias are exercised.
+#[cfg(feature = "gguf")]
 fn q40_block(seed: u32) -> Vec<u8> {
     let mut st = seed | 1;
     let mut rnd = || {
@@ -3792,6 +3806,7 @@ fn q40_block(seed: u32) -> Vec<u8> {
 
 /// One Q5_K superblock: a spread of scales and mins, plus full-range
 /// nibbles and high bits.
+#[cfg(feature = "gguf")]
 fn q5k_superblock(seed: u32) -> Vec<u8> {
     let mut st = seed | 1;
     let mut rnd = || {
@@ -3821,6 +3836,7 @@ fn q5k_superblock(seed: u32) -> Vec<u8> {
 }
 
 /// One Q3_K superblock: full-range hmask, 2-bit quants and packed scales.
+#[cfg(feature = "gguf")]
 fn q3k_superblock(seed: u32) -> Vec<u8> {
     let mut st = seed | 1;
     let mut rnd = || {
@@ -3840,6 +3856,7 @@ fn q3k_superblock(seed: u32) -> Vec<u8> {
 /// Q3_K is the interesting one: each source pads to a word, but that tail
 /// must not land between the two sources' superblocks.
 #[test]
+#[cfg(feature = "gguf")]
 fn q3k_swiglu_packed_concat_matches_reference() {
     use meganeura::load::gguf::{GgmlType, GgufTensor};
 
@@ -3906,6 +3923,7 @@ fn q3k_swiglu_packed_concat_matches_reference() {
 
 /// One Q6_K superblock with signed scales spanning both polarities and
 /// quants across the full 6-bit range.
+#[cfg(feature = "gguf")]
 fn q6k_superblock(seed: u32) -> Vec<u8> {
     let mut st = seed | 1;
     let mut rnd = || {
@@ -3933,6 +3951,7 @@ fn q6k_superblock(seed: u32) -> Vec<u8> {
 /// zero, which erased the whole superblock. Every other fixture here uses
 /// a normal scale, so nothing else would catch it.
 #[test]
+#[cfg(feature = "gguf")]
 fn q6k_preserves_subnormal_block_scales() {
     use meganeura::load::gguf::{GgmlType, GgufTensor};
 
@@ -3995,6 +4014,7 @@ fn q6k_preserves_subnormal_block_scales() {
 /// `set_parameter_packed` has to restage that derived buffer; uploading
 /// only the named sources leaves the fused weight uninitialized.
 #[test]
+#[cfg(feature = "gguf")]
 fn q4k_swiglu_packed_concat_matches_reference() {
     use meganeura::load::gguf::{GgmlType, GgufTensor};
 
@@ -4066,6 +4086,7 @@ fn q4k_swiglu_packed_concat_matches_reference() {
 /// Exercise both repacked legacy formats on the paths their layout is most
 /// likely to break: multi-column Q4 and K-split Q8 GEMV.
 #[test]
+#[cfg(feature = "gguf")]
 fn gguf_repacked_matmuls_match_reference() {
     use meganeura::load::gguf::{GgmlType, GgufTensor};
 

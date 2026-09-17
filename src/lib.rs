@@ -37,6 +37,7 @@ pub mod graph;
 pub mod load;
 #[doc(hidden)]
 pub mod memplan;
+#[cfg(feature = "models")]
 pub mod models;
 pub mod nn;
 pub mod optimize;
@@ -55,6 +56,7 @@ pub use compile::CompileOptions;
 pub use compile::TuningKnobs;
 pub use data::{DataLoader, MnistDataset};
 pub use graph::{DType, Graph, NodeId, TensorType};
+#[cfg(feature = "gguf")]
 pub use load::gguf::{GgufError, GgufModel, load_gguf, load_gguf_bytes};
 pub use load::nnef::{NnefError, NnefModel, load_nnef};
 pub use load::onnx::{OnnxError, OnnxModel, load_onnx, load_onnx_bytes};

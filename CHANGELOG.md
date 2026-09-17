@@ -5,7 +5,11 @@
   it implies, fills it from the file's own tensors, and tokenizes with the
   vocabulary the file embeds — so `load_gguf(path)?.generator(2048)?` is
   everything between a `.gguf` and generated text, with no `tokenizer.json`
-  and no hard-coded dimensions. See `examples/gguf_generate.rs`.
+  and no hard-coded dimensions. See `examples/gguf_generate.rs`. This lives
+  behind the new `gguf` cargo feature; nothing is on by default, so a
+  pinning embedder chooses `--features gguf` (and optionally `models`)
+  and the loader pulls no external dependency of its own. First-party
+  model definitions moved behind a new `models` feature the same way.
 
   The llama family (also Mistral, SmolLM2, TinyLlama), Qwen2, Qwen3, Gemma,
   Gemma2, Gemma3 and Phi3 build from one parameterised decoder; the enum

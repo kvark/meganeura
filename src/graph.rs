@@ -1153,9 +1153,9 @@ impl Graph {
     ///
     /// The reduction extent — `shape[0]` — must be a multiple of 256, the
     /// superblock size. These parameters are load-only: fill them with
-    /// [`crate::Session::set_parameter_packed`] from
-    /// [`crate::load::gguf`], since Q4_K cannot be produced from f32 on the
-    /// host. See [`DType::Q4K`].
+    /// [`crate::Session::set_parameter_packed`] from the GGUF loader
+    /// (`crate::load::gguf`, `gguf` feature), since Q4_K cannot be
+    /// produced from f32 on the host. See [`DType::Q4K`].
     pub fn parameter_q4k(&mut self, name: &str, shape: &[usize]) -> NodeId {
         assert!(
             shape.first().is_some_and(|k| k.is_multiple_of(256)),
@@ -1175,8 +1175,8 @@ impl Graph {
     ///
     /// The reduction extent — `shape[0]` — must be a multiple of 32, the
     /// block size. Load-only, like [`Graph::parameter_q4k`]: fill it with
-    /// [`crate::Session::set_parameter_packed`] from
-    /// [`crate::load::gguf`]. See [`DType::Q40`].
+    /// [`crate::Session::set_parameter_packed`] from the GGUF loader
+    /// (`gguf` feature). See [`DType::Q40`].
     ///
     /// This is GGML's symmetric Q4_0. For Meganeura's own asymmetric Q4,
     /// which can be produced from f32 on the host, use
@@ -1200,8 +1200,8 @@ impl Graph {
     ///
     /// The reduction extent — `shape[0]` — must be a multiple of 256, the
     /// superblock size. Load-only, like [`Graph::parameter_q4k`]: fill it
-    /// with [`crate::Session::set_parameter_packed`] from
-    /// [`crate::load::gguf`]. See [`DType::Q6K`].
+    /// with [`crate::Session::set_parameter_packed`] from the GGUF loader
+    /// (`gguf` feature). See [`DType::Q6K`].
     pub fn parameter_q6k(&mut self, name: &str, shape: &[usize]) -> NodeId {
         assert!(
             shape.first().is_some_and(|k| k.is_multiple_of(256)),

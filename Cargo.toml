@@ -16,6 +16,7 @@ name = "smoke"
 
 [[test]]
 name = "gguf_model"
+required-features = ["gguf"]
 
 [[test]]
 name = "regression"
@@ -41,9 +42,25 @@ name = "block_matmul"
 
 [[test]]
 name = "sd_unet_coop_parity"
+required-features = ["models"]
 
 [features]
+# Nothing is enabled by default: a pinning embedder gets the core graph,
+# compile and runtime without first-party model definitions or the GGUF
+# loader. The tests and examples declare what they need, and CI checks
+# the bare build before the all-features one.
 default = []
+# First-party model definitions: `src/models` (SmolLM2, SmolVLA, SD-UNet,
+# ResNet, EfficientNet, Whisper, SmolVLM2). Stays a module rather than a
+# crate for now — see the crate-splitting discussion on PR #52 — but a
+# pinning embedder can drop them the same way as `gguf`.
+models = []
+# Native GGUF authoring/format support: the `load::gguf` module and the
+# `gguf_*` examples and tests. The loader pulls no external dependency
+# of its own, so hiding it trims compiled code, not the dependency tree.
+# The GGML-block `DType`s and their decode kernels stay put — they are
+# part of the core graph and serve this loader too.
+gguf = []
 # Downloading weights from the HuggingFace Hub
 # (`SafeTensorsModel::download` / `download_file`). Off by default so
 # embedders (Android, iOS, hermetic CI) do not pull ureq/rustls or write
@@ -96,10 +113,12 @@ path = "examples/mnist.rs"
 [[example]]
 name = "gguf_info"
 path = "examples/gguf_info.rs"
+required-features = ["gguf"]
 
 [[example]]
 name = "gguf_generate"
 path = "examples/gguf_generate.rs"
+required-features = ["gguf"]
 
 [[example]]
 name = "train_deploy"
@@ -135,10 +154,12 @@ required-features = ["hub"]
 [[example]]
 name = "sd_unet_train"
 path = "examples/sd_unet_train.rs"
+required-features = ["models"]
 
 [[example]]
 name = "bench_sd_unet_train"
 path = "bench/bench_sd_unet_train.rs"
+required-features = ["models"]
 
 [[example]]
 name = "bench_meganeura"
@@ -153,6 +174,7 @@ required-features = ["hub"]
 [[example]]
 name = "bench_smolvla_train"
 path = "bench/bench_smolvla_train.rs"
+required-features = ["models"]
 
 [[example]]
 name = "onnx_compare"
@@ -181,15 +203,81 @@ required-features = ["hub"]
 [[example]]
 name = "grad_check"
 path = "bench/grad_check.rs"
+required-features = ["models"]
 
 [[example]]
 name = "optimizer_ablation"
 path = "bench/optimizer_ablation.rs"
+required-features = ["models"]
 
 [[example]]
 name = "decode_baseline"
 path = "bench/decode_baseline.rs"
+required-features = ["models"]
 
 [[example]]
 name = "decode_op_diff"
 path = "bench/decode_op_diff.rs"
+required-features = ["models"]
+
+# Auto-discovered examples that need first-party models registered so
+# they are skipped (rather than failing) in a no-features build.
+[[example]]
+name = "profile_resnet50_train"
+path = "examples/profile_resnet50_train.rs"
+required-features = ["models"]
+
+[[example]]
+name = "profile_whisper_train"
+path = "examples/profile_whisper_train.rs"
+required-features = ["models"]
+
+[[example]]
+name = "smollm2_train_bench"
+path = "examples/smollm2_train_bench.rs"
+required-features = ["models"]
+
+[[example]]
+name = "v2s_lane_bisect"
+path = "examples/v2s_lane_bisect.rs"
+required-features = ["models"]
+
+[[example]]
+name = "tune_crossover"
+path = "examples/tune_crossover.rs"
+required-features = ["models"]
+
+[[example]]
+name = "tune_holdouts"
+path = "examples/tune_holdouts.rs"
+required-features = ["models"]
+
+[[example]]
+name = "profile_training"
+path = "examples/profile_training.rs"
+required-features = ["models"]
+
+[[example]]
+name = "profile_smollm2_decode"
+path = "examples/profile_smollm2_decode.rs"
+required-features = ["models"]
+
+[[example]]
+name = "profile_whisper_inference"
+path = "examples/profile_whisper_inference.rs"
+required-features = ["models"]
+
+[[example]]
+name = "diagnose_fusion"
+path = "examples/diagnose_fusion.rs"
+required-features = ["models"]
+
+[[example]]
+name = "tune_readback"
+path = "examples/tune_readback.rs"
+required-features = ["models"]
+
+[[example]]
+name = "tune_staging_reuse"
+path = "examples/tune_staging_reuse.rs"
+required-features = ["models"]
