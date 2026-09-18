@@ -1,7 +1,7 @@
 name: CI
 on:
   push:
-    branches: ["main", "claude/*"]
+    branches: ["main"]
   pull_request:
 
 env:

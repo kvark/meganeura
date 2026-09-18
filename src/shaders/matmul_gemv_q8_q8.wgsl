@@ -1,26 +1,25 @@
-// K-split GEMV for M=1 against a GGML Q4_0 weight, with the activation row
-// quantized to Q8_1 so the inner product uses packed integer arithmetic
-// instead of f32 multiply-add. Where the device reports
+// K-split GEMV for M=1 against a Meganeura Q8 weight (GGML Q8_0 after its
+// host repack), with the activation row quantized to Q8_1 so the inner
+// product uses packed integer arithmetic. Where the device reports
 // `shader_integer_dot_product` the four-byte dot products are the hardware
 // `dot4I8Packed` (DP4A); otherwise the exact scalar expansion runs.
 //
-// The arithmetic is llama.cpp's `vec_dot_q4_0_q8_1`. A Q4_0 block stores
-// `value = d4 * (q - 8)` for a nibble `q`, and a Q8_1 block stores int8
-// quants with `d8` and `s8 = d8 * sum(q8)`. Over one block:
+// The arithmetic is llama.cpp's `vec_dot_q8_0_q8_1`. A Q8 block stores
+// `value = d * q8w` for an int8 quant and an f16 scale, and a Q8_1 block
+// stores int8 quants with `d8` and `s8 = d8 * sum(q8a)`. Over one block:
 //
-//     sum_i (q4_i - 8) * d4 * q8_i * d8
-//   = d4 * (d8 * sum_i(q4_i * q8_i) - 8 * s8)
+//     sum_i q8w_i * d * q8a_i * d8 = d * (d8 * sum_i(q8w_i * q8a_i))
 //
 // so the whole 32-element block reduces to eight integer dot products and
-// one correction term. `sum_i(q4_i * q8_i)` is exact in i32: the operands
-// are bounded by 15 and 127, and 32 such products cannot overflow.
+// one scale product. Q8_0 is symmetric about zero, so — unlike Q4_0 — there
+// is no -8 bias and no `s8` correction term. The sum is exact in i32: the
+// operands are bounded by 127, and 32 such products cannot overflow.
 //
-// GGML's split-nibble layout is what makes this work. One 4-byte word of
-// `qs` holds eight nibbles: four low ones for elements 4i..4i+3 and four
-// high ones for elements 16+4i..16+4i+3. Masking gives two int8x4 vectors of
-// *consecutive* elements, each of which pairs with one word of the Q8_1
-// quants. Meganeura's own Q4, which pairs neighbouring elements in a byte,
-// could not feed this without a shuffle.
+// Meganeura's Q8 block is nine words: the f16 scale in the low half of word
+// zero and the thirty-two int8 quants in words one through eight, four per
+// word with element 4j + b in byte b. Every word is whole and aligned, so
+// each pairs *directly* with one word of the Q8_1 activation quants — no
+// nibble splitting, no unaligned stitching.
 //
 // The activation is quantized in the kernel rather than in a dispatch of its
 // own. Each workgroup covers four output columns and every thread takes
@@ -56,32 +55,6 @@ var<workgroup> reduce_buf: array<vec4<f32>, LANES>;
 $PACKED_DOT_HELPER
 
 $A_FN_DECL
-
-// The f16 scale at the head of the Q4_0 block starting at `byte_base`.
-fn q40_scale(byte_base: u32) -> f32 {
-    let lo = (matrix_b[byte_base / 4u] >> ((byte_base % 4u) * 8u)) & 0xFFu;
-    let at = byte_base + 1u;
-    let hi = (matrix_b[at / 4u] >> ((at % 4u) * 8u)) & 0xFFu;
-    return unpack2x16float(lo | (hi << 8u)).x;
-}
-
-// Nibble word `i` of the block: bytes 2 + 4i .. 2 + 4i + 4.
-//
-// Blocks are 18 bytes, so this is word-aligned for odd blocks and offset by
-// two bytes for even ones; the unaligned case stitches two words. The second
-// word is always in bounds: the last read of an even block ends at
-// `byte_base + 19`, and a buffer whose final block is even has an odd block
-// count, which leaves `18 * blocks` two bytes short of a word and so gets
-// padded by exactly the two bytes needed.
-fn q40_nibbles(byte_base: u32, i: u32) -> u32 {
-    let at = byte_base + 2u + i * 4u;
-    let word = matrix_b[at / 4u];
-    let shift = (at % 4u) * 8u;
-    if shift == 0u {
-        return word;
-    }
-    return (word >> shift) | (matrix_b[at / 4u + 1u] << (32u - shift));
-}
 
 @compute @workgroup_size(LANES)
 fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
@@ -128,16 +101,15 @@ $NORM_PROLOGUE
         // Four columns share the quantized block.
         let col = col4 * 4u;
         for (var c = 0u; c < 4u; c++) {
-            let byte_base = ((col + c) * blocks + blk) * 18u;
+            let base = ((col + c) * blocks + blk) * 9u;
             var sumi = 0;
-            for (var i = 0u; i < 4u; i++) {
-                let vi = q40_nibbles(byte_base, i);
-                // Low nibbles are elements 4i..4i+3, high nibbles are
-                // 16+4i..16+4i+3, so they pair with quant words i and 4+i.
-                sumi += dot_q4_q8_packed(vi & 0x0F0F0F0Fu, u[i]);
-                sumi += dot_q4_q8_packed((vi >> 4u) & 0x0F0F0F0Fu, u[4u + i]);
+            for (var j = 0u; j < 8u; j++) {
+                sumi += dot_q8_q8_packed(matrix_b[base + 1u + j], u[j]);
             }
-            acc[c] += q40_scale(byte_base) * (d8 * f32(sumi) - 8.0 * s8);
+            // The f16 scale rides in the low half of the block's first
+            // word; `unpack2x16float` decodes it exactly as the plain
+            // decoder's `decode_f16` does.
+            acc[c] += unpack2x16float(matrix_b[base] & 0xFFFFu).x * (d8 * f32(sumi));
         }
         blk += LANES;
     }

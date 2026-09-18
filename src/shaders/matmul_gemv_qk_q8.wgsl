@@ -1,29 +1,31 @@
-// K-split GEMV for M=1 against a GGML Q4_0 weight, with the activation row
-// quantized to Q8_1 so the inner product uses packed integer arithmetic
-// instead of f32 multiply-add. Where the device reports
+// K-split GEMV for M=1 against a GGML K-quant weight (Q4_K, Q5_K, Q6_K or
+// Q3_K superblocks), with the activation row quantized to Q8_1 so the inner
+// product uses packed integer arithmetic. Where the device reports
 // `shader_integer_dot_product` the four-byte dot products are the hardware
 // `dot4I8Packed` (DP4A); otherwise the exact scalar expansion runs.
 //
-// The arithmetic is llama.cpp's `vec_dot_q4_0_q8_1`. A Q4_0 block stores
-// `value = d4 * (q - 8)` for a nibble `q`, and a Q8_1 block stores int8
-// quants with `d8` and `s8 = d8 * sum(q8)`. Over one block:
+// A superblock spans 256 elements in eight 32-element sub-blocks, which
+// pair one-to-one with Q8_1 activation blocks, so the loop below stays
+// per-32-elements like the Q4_0 and Q8 kernels; `$BLOCK_DOT` derives the
+// superblock index from the activation-block index and applies the
+// format's per-sub-block scale arithmetic. GGML's CUDA `vec_dot_*_K_q8_1`
+// kernels compute exactly this shape of sum: an integer dot of the raw
+// quants against the activation quants, scaled per sub-block, minus one
+// constant term per sub-block times the activation block's raw sum.
 //
-//     sum_i (q4_i - 8) * d4 * q8_i * d8
-//   = d4 * (d8 * sum_i(q4_i * q8_i) - 8 * s8)
+//   Q4_K: value = d * sc * q - dmin * mn
+//         → (d*sc)*d8*sumi - (dmin*mn)*s8
+//   Q5_K: value = d * sc * (nib + 16*hi) - dmin * mn
+//         → (d*sc)*d8*(sumi_nib + 16*sumi_hi) - (dmin*mn)*s8
+//   Q6_K: value = d * sc * (q6 - 32), two 16-element sub-blocks per block
+//         → Σ_j (d*sc_j)*d8*(sumi_j - 32*qsum)
+//   Q3_K: value = d * sc * (q2 - (hbit ? 0 : 4)), likewise two sub-blocks
 //
-// so the whole 32-element block reduces to eight integer dot products and
-// one correction term. `sum_i(q4_i * q8_i)` is exact in i32: the operands
-// are bounded by 15 and 127, and 32 such products cannot overflow.
+// Every integer dot is exact in i32: the packed operands stay within one
+// signed byte and at most 32 products per dot, so nothing overflows.
 //
-// GGML's split-nibble layout is what makes this work. One 4-byte word of
-// `qs` holds eight nibbles: four low ones for elements 4i..4i+3 and four
-// high ones for elements 16+4i..16+4i+3. Masking gives two int8x4 vectors of
-// *consecutive* elements, each of which pairs with one word of the Q8_1
-// quants. Meganeura's own Q4, which pairs neighbouring elements in a byte,
-// could not feed this without a shuffle.
-//
-// The activation is quantized in the kernel rather than in a dispatch of its
-// own. Each workgroup covers four output columns and every thread takes
+// The activation is quantized in the kernel rather than in a dispatch of
+// its own. Each workgroup covers four output columns and every thread takes
 // whole 32-element blocks, so a block is quantized once per workgroup and
 // reused across its four columns; no workgroup memory and no barrier are
 // needed for it. That repeats the work across workgroups the way the
@@ -53,28 +55,17 @@ const LANES: u32 = 256u;
 
 var<workgroup> reduce_buf: array<vec4<f32>, LANES>;
 
-$PACKED_DOT_HELPER
-
-$A_FN_DECL
-
-// The f16 scale at the head of the Q4_0 block starting at `byte_base`.
-fn q40_scale(byte_base: u32) -> f32 {
-    let lo = (matrix_b[byte_base / 4u] >> ((byte_base % 4u) * 8u)) & 0xFFu;
-    let at = byte_base + 1u;
-    let hi = (matrix_b[at / 4u] >> ((at % 4u) * 8u)) & 0xFFu;
-    return unpack2x16float(lo | (hi << 8u)).x;
+// One byte at `byte_base + off`, and four consecutive bytes as one word.
+// The 210- and 110-byte superblocks are not whole numbers of words, so
+// every read is byte-addressed and the unaligned ones stitch two words;
+// the word-aligned Q4_K and Q5_K take the shift-zero path for free.
+fn kq_byte_at(byte_base: u32, off: u32) -> u32 {
+    let at = byte_base + off;
+    return (matrix_b[at / 4u] >> ((at % 4u) * 8u)) & 0xFFu;
 }
 
-// Nibble word `i` of the block: bytes 2 + 4i .. 2 + 4i + 4.
-//
-// Blocks are 18 bytes, so this is word-aligned for odd blocks and offset by
-// two bytes for even ones; the unaligned case stitches two words. The second
-// word is always in bounds: the last read of an even block ends at
-// `byte_base + 19`, and a buffer whose final block is even has an odd block
-// count, which leaves `18 * blocks` two bytes short of a word and so gets
-// padded by exactly the two bytes needed.
-fn q40_nibbles(byte_base: u32, i: u32) -> u32 {
-    let at = byte_base + 2u + i * 4u;
+fn kq_word4(byte_base: u32, off: u32) -> u32 {
+    let at = byte_base + off;
     let word = matrix_b[at / 4u];
     let shift = (at % 4u) * 8u;
     if shift == 0u {
@@ -82,6 +73,12 @@ fn q40_nibbles(byte_base: u32, i: u32) -> u32 {
     }
     return (word >> shift) | (matrix_b[at / 4u + 1u] << (32u - shift));
 }
+
+$PACKED_DOT_HELPER
+
+$WEIGHT_HELPERS
+
+$A_FN_DECL
 
 @compute @workgroup_size(LANES)
 fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
@@ -128,16 +125,7 @@ $NORM_PROLOGUE
         // Four columns share the quantized block.
         let col = col4 * 4u;
         for (var c = 0u; c < 4u; c++) {
-            let byte_base = ((col + c) * blocks + blk) * 18u;
-            var sumi = 0;
-            for (var i = 0u; i < 4u; i++) {
-                let vi = q40_nibbles(byte_base, i);
-                // Low nibbles are elements 4i..4i+3, high nibbles are
-                // 16+4i..16+4i+3, so they pair with quant words i and 4+i.
-                sumi += dot_q4_q8_packed(vi & 0x0F0F0F0Fu, u[i]);
-                sumi += dot_q4_q8_packed((vi >> 4u) & 0x0F0F0F0Fu, u[4u + i]);
-            }
-            acc[c] += q40_scale(byte_base) * (d8 * f32(sumi) - 8.0 * s8);
+            acc[c] += $BLOCK_DOT(col + c, blk, &u, d8, s8);
         }
         blk += LANES;
     }

@@ -73,7 +73,7 @@ profiler = ["dep:tracing-subscriber"]
 
 [dependencies]
 # Calibrated GPU pass timestamps resolved after the completion fence.
-blade-graphics = { version = "0.9", git = "https://github.com/kvark/blade", rev = "92553493a832d505e3d22b7ce3f7b0ac4fc9461d" }
+blade-graphics = { version = "0.9", git = "https://github.com/kvark/blade", rev = "eaff5092096aab136f11fa728b81c1bed3c0dcd4" }
 blade-macros = "0.3"
 # `default-features = false` drops egglog's `bin` stack (clap, mimalloc,
 # env_logger, chrono, graphviz). Greedy mode never constructs an EGraph

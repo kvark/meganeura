@@ -19,46 +19,28 @@ var<storage> kv_pos_buf: array<u32>;
 var<storage> valid_len_buf: array<u32>;
 var<storage, read_write> dst: array<f32>;
 var<uniform> params: Params;
-var<workgroup> wg_dot: array<f32, 64>;
-var<workgroup> wg_scores: array<f32, 512>;
+var<workgroup> wg_scores: array<f32, 1024>;
+var<workgroup> wave_slots: atomic<u32>;
 
-const BKV: u32 = 8u;
+// Tokens per reduction round; the round's masked tail costs no extra
+// barrier, so a ragged remainder costs one round instead of one per token.
+const BKV: u32 = 16u;
 const MAX_VALUES_PER_THREAD: u32 = 8u;
 
-fn tree_reduce(tid: u32) {
-    workgroupBarrier();
-    if tid < 32u { wg_dot[tid] += wg_dot[tid + 32u]; }
-    workgroupBarrier();
-    if tid < 16u { wg_dot[tid] += wg_dot[tid + 16u]; }
-    workgroupBarrier();
-    if tid < 8u { wg_dot[tid] += wg_dot[tid + 8u]; }
-    workgroupBarrier();
-    if tid < 4u { wg_dot[tid] += wg_dot[tid + 4u]; }
-    workgroupBarrier();
-    if tid < 2u { wg_dot[tid] += wg_dot[tid + 2u]; }
-    workgroupBarrier();
-    if tid < 1u { wg_dot[tid] += wg_dot[tid + 1u]; }
-    workgroupBarrier();
-}
-
-fn tree_reduce_8(tid: u32) {
-    workgroupBarrier();
-    if tid < 32u { for (var i = 0u; i < BKV; i++) { wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 32u]; } }
-    workgroupBarrier();
-    if tid < 16u { for (var i = 0u; i < BKV; i++) { wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 16u]; } }
-    workgroupBarrier();
-    if tid < 8u { for (var i = 0u; i < BKV; i++) { wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 8u]; } }
-    workgroupBarrier();
-    if tid < 4u { for (var i = 0u; i < BKV; i++) { wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 4u]; } }
-    workgroupBarrier();
-    if tid < 2u { for (var i = 0u; i < BKV; i++) { wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 2u]; } }
-    workgroupBarrier();
-    if tid < 1u { for (var i = 0u; i < BKV; i++) { wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 1u]; } }
-    workgroupBarrier();
+// One round of the BKV-wide score reduction: every thread's per-token
+// partial in wg_scores collapses to one value per slot, visible to all
+// threads. The generator supplies the body — the barrier tree by default,
+// or the two-barrier subgroup form where the device supports it.
+fn tree_reduce_bkv(tid: u32, sg_id: u32) {
+$SCORE_REDUCE
 }
 
 @compute @workgroup_size(64)
-fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+fn main(
+    @builtin(workgroup_id) wgid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(subgroup_invocation_id) sg_id: u32,
+) {
     let query_row = wgid.x;
     let head = wgid.y;
     let tid = lid.x;
@@ -85,63 +67,42 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     var max_score = -1e30;
     var sum_exp = 0.0;
 
-    let tile_end = first_kv + ((kv_len - first_kv) / BKV) * BKV;
-    var t = first_kv;
-    for (; t < tile_end; t += BKV) {
+    // Every tile is a full BKV-wide reduction round; the final one masks the
+    // slots past kv_len, so a ragged remainder costs one round instead of a
+    // per-token loop of barrier rounds.
+    let rounds = (kv_len - first_kv + BKV - 1u) / BKV;
+    for (var round = 0u; round < rounds; round++) {
         for (var i = 0u; i < BKV; i++) {
-            let k_base = (t + i) * kv_dim + kv_head_off;
+            let t = first_kv + round * BKV + i;
+            let k_base = t * kv_dim + kv_head_off;
             var partial = 0.0;
             for (var lane = 0u; lane < MAX_VALUES_PER_THREAD; lane++) {
                 let d = lane * 64u + tid;
-                if d < params.head_dim {
+                if d < params.head_dim && t < kv_len {
                     partial += src_a[q_base + d] * src_b[k_base + d];
                 }
             }
             wg_scores[i * 64u + tid] = partial;
         }
-        tree_reduce_8(tid);
+        tree_reduce_bkv(tid, sg_id);
         for (var i = 0u; i < BKV; i++) {
-            let score = wg_scores[i * 64u] * scale;
+            let t = first_kv + round * BKV + i;
+            let live = t < kv_len;
+            let score = select(-1e30, wg_scores[i * 64u] * scale, live);
             let new_max = max(max_score, score);
             let correction = exp(max_score - new_max);
-            let weight = exp(score - new_max);
+            let weight = select(0.0, exp(score - new_max), live);
             sum_exp = sum_exp * correction + weight;
-            let v_base = (t + i) * kv_dim + kv_head_off;
+            let v_base = t * kv_dim + kv_head_off;
             for (var lane = 0u; lane < MAX_VALUES_PER_THREAD; lane++) {
                 let d = lane * 64u + tid;
-                if d < params.head_dim {
+                if d < params.head_dim && live {
                     my_out[lane] = my_out[lane] * correction + weight * bias[v_base + d];
                 }
             }
             max_score = new_max;
         }
         workgroupBarrier();
-    }
-
-    for (; t < kv_len; t++) {
-        let k_base = t * kv_dim + kv_head_off;
-        var partial = 0.0;
-        for (var lane = 0u; lane < MAX_VALUES_PER_THREAD; lane++) {
-            let d = lane * 64u + tid;
-            if d < params.head_dim {
-                partial += src_a[q_base + d] * src_b[k_base + d];
-            }
-        }
-        wg_dot[tid] = partial;
-        tree_reduce(tid);
-        let score = wg_dot[0] * scale;
-        workgroupBarrier();
-        let new_max = max(max_score, score);
-        let correction = exp(max_score - new_max);
-        let weight = exp(score - new_max);
-        sum_exp = sum_exp * correction + weight;
-        for (var lane = 0u; lane < MAX_VALUES_PER_THREAD; lane++) {
-            let d = lane * 64u + tid;
-            if d < params.head_dim {
-                my_out[lane] = my_out[lane] * correction + weight * bias[k_base + d];
-            }
-        }
-        max_score = new_max;
     }
 
     let safe_sum = select(sum_exp, 1.0, sum_exp == 0.0);

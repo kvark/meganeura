@@ -43,10 +43,18 @@ impl Pipelines {
             return Ok(());
         }
         let selected_entry = tile.shader(&dispatch.shader);
+<<<<<<< HEAD
         let module = tile_module(dispatch, tile, self.matmul_knobs);
         if let Some(dir) = self.dump_dir.as_deref() {
             module.dump(dir);
         }
+=======
+        let module = tile_module(
+            dispatch,
+            tile,
+            gpu.capabilities().shader_integer_dot_product,
+        );
+>>>>>>> a897556 (DP4A int-dot GEMVs for all packed formats, norm+add fusion, split-K attention.)
         let shader = gpu
             .try_create_shader(bg::ShaderDesc {
                 source: &module.source,
@@ -96,7 +104,11 @@ impl Pipelines {
 fn tile_module(
     dispatch: &Dispatch,
     tile: MatmulTile,
+<<<<<<< HEAD
     knobs: crate::codegen::MatmulKnobs,
+=======
+    packed_dot: bool,
+>>>>>>> a897556 (DP4A int-dot GEMVs for all packed formats, norm+add fusion, split-K attention.)
 ) -> crate::codegen::ShaderModule {
     let entry = &dispatch.shader;
     if let MatmulTile::Gemv(shape) = tile {
@@ -106,7 +118,13 @@ fn tile_module(
         // activation back to f32 and change what the plan computes.
         let group = crate::tune::gemv_group(entry).expect("GEMV candidate on a GEMV entry");
         if dispatch.gemv_int_dot {
-            return crate::codegen::generate_module_gemv_int_dot(group, shape);
+            return crate::codegen::generate_module_gemv_int_dot(
+                group,
+                dispatch.weight_format,
+                shape,
+                packed_dot,
+                dispatch.gemv_rmsnorm.is_some(),
+            );
         }
         if dispatch.gemv_rmsnorm.is_some() {
             return crate::codegen::generate_module_gemv_rmsnorm(shape, dispatch.weight_format);
@@ -143,7 +161,10 @@ fn tile_variant(dispatch: &Dispatch, tile: MatmulTile) -> Variant {
     let entry = &dispatch.shader;
     if let MatmulTile::Gemv(shape) = tile {
         if dispatch.gemv_int_dot {
-            return Variant::GemvIntDot(entry.clone(), shape);
+            if dispatch.gemv_rmsnorm.is_some() {
+                return Variant::GemvRmsNormIntDot(entry.clone(), dispatch.weight_format, shape);
+            }
+            return Variant::GemvIntDot(entry.clone(), dispatch.weight_format, shape);
         }
         if dispatch.gemv_rmsnorm.is_some() {
             return Variant::GemvRmsNorm(entry.clone(), dispatch.weight_format, shape);
@@ -1503,9 +1524,10 @@ mod tests {
         assert!(matches!(candidates.as_slice(), [Variant::GemvIntDot(..)]));
         assert!(matches!(
             tile_variant(&dispatch, MatmulTile::Gemv(shape)),
-            Variant::GemvIntDot(_, selected) if selected == shape
+            Variant::GemvIntDot(_, format, selected) if format == crate::compile::WeightFormat::Q40 && selected == shape
         ));
         assert!(
+<<<<<<< HEAD
             tile_module(
                 &dispatch,
                 MatmulTile::Gemv(shape),
@@ -1513,6 +1535,11 @@ mod tests {
             )
             .source
             .contains("dot_q4_q8_packed")
+=======
+            tile_module(&dispatch, MatmulTile::Gemv(shape), false)
+                .source
+                .contains("dot_q4_q8_packed")
+>>>>>>> a897556 (DP4A int-dot GEMVs for all packed formats, norm+add fusion, split-K attention.)
         );
 
         let ordinary = Dispatch {
@@ -2290,8 +2317,12 @@ mod tests {
                         Variant::Scalar(tile.shader(&entry))
                     );
                 }
+<<<<<<< HEAD
                 let mut module =
                     tile_module(&dispatch, tile, crate::codegen::MatmulKnobs::default());
+=======
+                let mut module = tile_module(&dispatch, tile, false);
+>>>>>>> a897556 (DP4A int-dot GEMVs for all packed formats, norm+add fusion, split-K attention.)
                 // Blade assigns resource bindings by ShaderData field name.
                 // Assign distinct test bindings before full offline validation.
                 for (index, (_, var)) in module.module.global_variables.iter_mut().enumerate() {

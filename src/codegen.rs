@@ -474,6 +474,9 @@ pub enum ShaderGroup {
     Softmax,
     CrossEntropy,
     RmsNorm,
+    RmsNormAdd,
+    CachedBlockAttentionSplit,
+    CachedBlockAttentionCombine,
     Embedding,
     ToF16,
     RoPE,
@@ -581,6 +584,13 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
         ShaderGroup::Softmax => ShaderModule::new(include_str!("shaders/softmax.wgsl")),
         ShaderGroup::CrossEntropy => ShaderModule::new(include_str!("shaders/cross_entropy.wgsl")),
         ShaderGroup::RmsNorm => ShaderModule::new(include_str!("shaders/rms_norm.wgsl")),
+        ShaderGroup::RmsNormAdd => ShaderModule::new(include_str!("shaders/rms_norm_add.wgsl")),
+        ShaderGroup::CachedBlockAttentionSplit => {
+            ShaderModule::new(include_str!("shaders/cached_block_attention_split.wgsl"))
+        }
+        ShaderGroup::CachedBlockAttentionCombine => {
+            ShaderModule::new(include_str!("shaders/cached_block_attention_combine.wgsl"))
+        }
         ShaderGroup::Embedding => ShaderModule::new(include_str!("shaders/embedding.wgsl")),
         ShaderGroup::ToF16 => ShaderModule::new(include_str!("shaders/to_f16.wgsl")),
         ShaderGroup::RoPE => ShaderModule::new(include_str!("shaders/rope.wgsl")),
@@ -691,9 +701,7 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
             ShaderModule::new(include_str!("shaders/cached_attention.wgsl"))
         }
         ShaderGroup::CachedQueryAttention => generate_flash_attention(64, 8, true),
-        ShaderGroup::CachedBlockAttention => {
-            ShaderModule::new(include_str!("shaders/cached_block_attention.wgsl"))
-        }
+        ShaderGroup::CachedBlockAttention => generate_module_block_attention(),
         ShaderGroup::ChunkedRelativeAttention => {
             ShaderModule::new(include_str!("shaders/chunked_relative_attention.wgsl"))
         }
@@ -2177,45 +2185,368 @@ fn gemv_source(group: ShaderGroup, mode: WeightFormat) -> String {
 
 /// The Q8_1-activation, integer-dot GEMV at an explicit shape.
 ///
-/// Only GGML Q4_0 feeds this: its split-nibble blocks hand out two int8x4
-/// vectors of consecutive elements per word, which is exactly what
-/// `dot4I8Packed` wants. See `shaders/matmul_gemv_q40_q8.wgsl`.
-pub(crate) fn generate_module_gemv_int_dot(group: ShaderGroup, shape: GemvShape) -> ShaderModule {
-    // Blade's Vulkan backend does not yet query/enable
-    // `shaderIntegerDotProduct`; letting naga emit OpSDot there produces an
-    // invalid pipeline even on devices that support the instruction. Metal
-    // has no opt-in feature, so retain the packed intrinsic on Apple and use
-    // the exact scalar expansion elsewhere.
-    let helper = if cfg!(target_vendor = "apple") {
-        "fn dot_q4_q8_packed(q4: u32, q8: u32) -> i32 {\n\
-             return dot4I8Packed(q4, q8);\n\
-         }"
-    } else {
-        "fn dot_q4_q8_packed(q4: u32, q8: u32) -> i32 {\n\
-             var sum: i32 = 0;\n\
-             for (var shift = 0u; shift < 32u; shift += 8u) {\n\
-                 let w = i32((q4 >> shift) & 0xFFu);\n\
-                 let byte = i32((q8 >> shift) & 0xFFu);\n\
-                 let a = select(byte, byte - 256, byte >= 128);\n\
-                 sum += w * a;\n\
-             }\n\
-             return sum;\n\
-         }"
+/// The weight format selects the kernel: GGML Q4_0 feeds
+/// `dot_q4_q8_packed` through its split-nibble blocks, which hand out two
+/// int8x4 vectors of consecutive elements per word, exactly what
+/// `dot4I8Packed` wants. Meganeura Q8 stores four int8s per whole word and
+/// pairs directly as `dot_q8_q8_packed`. See the two shader files.
+///
+/// `packed_dot` selects the hardware `dot4I8Packed` (DP4A) intrinsic where
+/// the device reports `shader_integer_dot_product`; other devices run the
+/// exact scalar expansion of the same integer arithmetic. `norm` folds an
+/// RmsNorm prologue in, matching the non-integer fused form.
+pub(crate) fn generate_module_gemv_int_dot(
+    group: ShaderGroup,
+    format: crate::compile::WeightFormat,
+    shape: GemvShape,
+    packed_dot: bool,
+    norm: bool,
+) -> ShaderModule {
+    // The scalar expansion exists for devices without the integer-dot
+    // capability. It computes the same sums: each byte is sign-extended and
+    // multiplied exactly, so results are identical on both sides — which
+    // keeps a device-capability choice out of the plan's arithmetic.
+    let helper = match (format, packed_dot) {
+        // Q4_0 nibbles are 0..15, so their bytes never carry a sign bit;
+        // only the Q8_1 operand needs extending.
+        (crate::compile::WeightFormat::Q40, true) => {
+            "fn dot_q4_q8_packed(q4: u32, q8: u32) -> i32 {\n\
+                 return dot4I8Packed(q4, q8);\n\
+             }"
+        }
+        (crate::compile::WeightFormat::Q40, false) => {
+            "fn dot_q4_q8_packed(q4: u32, q8: u32) -> i32 {\n\
+                 var sum: i32 = 0;\n\
+                 for (var shift = 0u; shift < 32u; shift += 8u) {\n\
+                     let w = i32((q4 >> shift) & 0xFFu);\n\
+                     let byte = i32((q8 >> shift) & 0xFFu);\n\
+                     let a = select(byte, byte - 256, byte >= 128);\n\
+                     sum += w * a;\n\
+                 }\n\
+                 return sum;\n\
+             }"
+        }
+        // Q8 weights are signed int8 quants, so both operands extend.
+        (crate::compile::WeightFormat::Q8, true) => {
+            "fn dot_q8_q8_packed(a: u32, b: u32) -> i32 {\n\
+                 return dot4I8Packed(a, b);\n\
+             }"
+        }
+        (crate::compile::WeightFormat::Q8, false) => {
+            "fn dot_q8_q8_packed(a: u32, b: u32) -> i32 {\n\
+                 var sum: i32 = 0;\n\
+                 for (var shift = 0u; shift < 32u; shift += 8u) {\n\
+                     let x = i32((a >> shift) & 0xFFu);\n\
+                     let y = i32((b >> shift) & 0xFFu);\n\
+                     sum += select(x, x - 256, x >= 128) * select(y, y - 256, y >= 128);\n\
+                 }\n\
+                 return sum;\n\
+             }"
+        }
+        (
+            crate::compile::WeightFormat::Q4K
+            | crate::compile::WeightFormat::Q5K
+            | crate::compile::WeightFormat::Q6K
+            | crate::compile::WeightFormat::Q3K,
+            true,
+        ) => {
+            "fn dot_qk_packed(a: u32, b: u32) -> i32 {\n\
+                 return dot4I8Packed(a, b);\n\
+             }"
+        }
+        // K-quant packed quants stay non-negative everywhere but Q3_K,
+        // whose hmask-adjusted value is -4..3 and so extends both operands.
+        (
+            crate::compile::WeightFormat::Q4K
+            | crate::compile::WeightFormat::Q5K
+            | crate::compile::WeightFormat::Q6K,
+            false,
+        ) => {
+            "fn dot_qk_packed(a: u32, b: u32) -> i32 {\n\
+                 var sum: i32 = 0;\n\
+                 for (var shift = 0u; shift < 32u; shift += 8u) {\n\
+                     let w = i32((a >> shift) & 0xFFu);\n\
+                     let byte = i32((b >> shift) & 0xFFu);\n\
+                     let u = select(byte, byte - 256, byte >= 128);\n\
+                     sum += w * u;\n\
+                 }\n\
+                 return sum;\n\
+             }"
+        }
+        (crate::compile::WeightFormat::Q3K, false) => {
+            "fn dot_qk_packed(a: u32, b: u32) -> i32 {\n\
+                 var sum: i32 = 0;\n\
+                 for (var shift = 0u; shift < 32u; shift += 8u) {\n\
+                     let x = i32((a >> shift) & 0xFFu);\n\
+                     let y = i32((b >> shift) & 0xFFu);\n\
+                     sum += select(x, x - 256, x >= 128) * select(y, y - 256, y >= 128);\n\
+                 }\n\
+                 return sum;\n\
+             }"
+        }
+        _ => panic!("no {format:?} int-dot kernel for {group:?}"),
     };
     let (addend_decl, addend) = match group {
         ShaderGroup::MatMulGemv => ("", ""),
         ShaderGroup::MatMulGemvAdd => ("var<storage> src: array<vec4<f32>>;", " + src[col4]"),
         _ => panic!("no int-dot variant for {group:?}"),
     };
+    let base = match format {
+        crate::compile::WeightFormat::Q40 => include_str!("shaders/matmul_gemv_q40_q8.wgsl"),
+        crate::compile::WeightFormat::Q8 => include_str!("shaders/matmul_gemv_q8_q8.wgsl"),
+        crate::compile::WeightFormat::Q4K
+        | crate::compile::WeightFormat::Q5K
+        | crate::compile::WeightFormat::Q6K
+        | crate::compile::WeightFormat::Q3K => include_str!("shaders/matmul_gemv_qk_q8.wgsl"),
+        _ => unreachable!("checked above"),
+    };
+    // K-quants carry their layout readers, dot function and per-block dot
+    // in `$WEIGHT_HELPERS`; the small formats inline both in their files.
+    let weight_helpers = match format {
+        crate::compile::WeightFormat::Q40 | crate::compile::WeightFormat::Q8 => String::new(),
+        crate::compile::WeightFormat::Q4K => q4k_int_dot_helpers(packed_dot),
+        crate::compile::WeightFormat::Q5K => q5k_int_dot_helpers(packed_dot),
+        crate::compile::WeightFormat::Q6K => q6k_int_dot_helpers(packed_dot),
+        crate::compile::WeightFormat::Q3K => q3k_int_dot_helpers(packed_dot),
+        _ => unreachable!("checked above"),
+    };
+    let block_dot = match format {
+        crate::compile::WeightFormat::Q4K
+        | crate::compile::WeightFormat::Q5K
+        | crate::compile::WeightFormat::Q6K
+        | crate::compile::WeightFormat::Q3K => "qk_block_dot",
+        _ => "",
+    };
+    // The fused prologue mirrors `gemv_rmsnorm_source`: a workgroup-wide sum
+    // of squares over A, then `a_val` scales each element on the way to the
+    // quantizer. `eps` arrives in the params' spare slot, as for the plain
+    // fused form.
+    let (norm_decl, a_fn_decl, norm_prologue, param_pad) = if norm {
+        (
+            concat!(
+                "var<storage> norm_w: array<f32>;\n",
+                "var<workgroup> scale_buf: array<f32, LANES>;\n",
+                "var<workgroup> inv_rms: f32;",
+            ),
+            "fn a_val(at: u32) -> f32 {\n\
+                 return matrix_a[at] * inv_rms * norm_w[at];\n\
+             }",
+            concat!(
+                "    // Prologue: sum of squares over A, reduced across the\n",
+                "    // workgroup. Every lane must reach every barrier, so the\n",
+                "    // early-out below the prologue stays put.\n",
+                "    var ss = 0.0;\n",
+                "    var si = lane;\n",
+                "    loop {\n",
+                "        if si >= k { break; }\n",
+                "        let v = matrix_a[si];\n",
+                "        ss += v * v;\n",
+                "        si += LANES;\n",
+                "    }\n",
+                "    scale_buf[lane] = ss;\n",
+                "    workgroupBarrier();\n",
+                "    var sstride = LANES / 2u;\n",
+                "    loop {\n",
+                "        if sstride == 0u { break; }\n",
+                "        if lane < sstride { scale_buf[lane] += scale_buf[lane + sstride]; }\n",
+                "        workgroupBarrier();\n",
+                "        sstride >>= 1u;\n",
+                "    }\n",
+                "    if lane == 0u {\n",
+                "        inv_rms = inverseSqrt(scale_buf[0] / f32(k) + bitcast<f32>(params.eps_bits));\n",
+                "    }\n",
+                "    workgroupBarrier();\n",
+            ),
+            "eps_bits: u32,",
+        )
+    } else {
+        (
+            "",
+            "fn a_val(at: u32) -> f32 {\n    return matrix_a[at];\n}",
+            "",
+            "_pad: u32,",
+        )
+    };
     let source = preprocess(
-        include_str!("shaders/matmul_gemv_q40_q8.wgsl"),
+        base,
         &[
             ("$PACKED_DOT_HELPER", helper),
+            ("$A_FN_DECL", a_fn_decl),
+            ("$NORM_DECL", norm_decl),
+            ("$NORM_PROLOGUE", norm_prologue),
+            ("$PARAM_PAD", param_pad),
             ("$ADDEND_DECL", addend_decl),
             ("$ADDEND", addend),
+            ("$WEIGHT_HELPERS", weight_helpers.as_str()),
+            ("$BLOCK_DOT", block_dot),
         ],
     );
     ShaderModule::new(&gemv_shape_source(&source, shape))
+}
+
+/// The Q4_K int-dot layout: word-aligned 144-byte superblocks, the shared
+/// `get_scale_min_k4` scale shuffle, and GGML's paired-nibble quants — the
+/// same dp4a-friendly halves as Q4_0.
+fn q4k_int_dot_helpers(packed_dot: bool) -> String {
+    let _ = packed_dot;
+    format!(
+        "{F16_DECODE_FN}{}\n{}",
+        K_SCALE_MIN_FN,
+        concat!(
+            "fn qk_block_dot(col: u32, blk: u32, u: ptr<function, array<u32, 8u>>, d8: f32, s8: f32) -> f32 {\n",
+            "    let sblocks = params.k / 256u;\n",
+            "    let base = (col * sblocks + blk / 8u) * 36u;\n",
+            "    let hdr = decode_f16_pair(matrix_b[base]);\n",
+            "    let sm = kq_scale_min(base, blk % 8u);\n",
+            "    let even = (blk % 2u) == 0u;\n",
+            "    let qbase = base * 4u + 16u + ((blk % 8u) / 2u) * 32u;\n",
+            "    var sumi = 0;\n",
+            "    for (var i = 0u; i < 4u; i++) {\n",
+            // GGML pairs element e with e + 32: the sub-block's 32 nibbles
+            // live in 32 bytes, elements 0..15 in the first 16 and 16..31 in
+            // the second, so each dot group needs its own word.
+            "        let w_lo = kq_word4(qbase, i * 4u);\n",
+            "        let w_hi = kq_word4(qbase, 16u + i * 4u);\n",
+            "        let v_lo = select((w_lo >> 4u) & 0x0F0F0F0Fu, w_lo & 0x0F0F0F0Fu, even);\n",
+            "        let v_hi = select((w_hi >> 4u) & 0x0F0F0F0Fu, w_hi & 0x0F0F0F0Fu, even);\n",
+            "        sumi += dot_qk_packed(v_lo, (*u)[i]) + dot_qk_packed(v_hi, (*u)[4u + i]);\n",
+            "    }\n",
+            "    return hdr.x * sm.x * (d8 * f32(sumi)) - hdr.y * sm.y * s8;\n",
+            "}",
+        )
+    )
+}
+
+/// Q5_K is Q4_K plus one bit: the qh region folds a 16 into the packed
+/// quant, so the dot spans nib and high-bit words alike.
+fn q5k_int_dot_helpers(packed_dot: bool) -> String {
+    let _ = packed_dot;
+    format!(
+        "{F16_DECODE_FN}{}\n{}",
+        K_SCALE_MIN_FN,
+        concat!(
+            "fn qk_block_dot(col: u32, blk: u32, u: ptr<function, array<u32, 8u>>, d8: f32, s8: f32) -> f32 {\n",
+            "    let sblocks = params.k / 256u;\n",
+            "    let base = (col * sblocks + blk / 8u) * 44u;\n",
+            "    let hdr = decode_f16_pair(matrix_b[base]);\n",
+            "    let sm = kq_scale_min(base, blk % 8u);\n",
+            "    let even = (blk % 2u) == 0u;\n",
+            "    let hshift = blk % 8u;\n",
+            "    let qhbase = base * 4u + 16u;\n",
+            "    let qsbase = base * 4u + 48u + ((blk % 8u) / 2u) * 32u;\n",
+            "    var sumi = 0;\n",
+            "    for (var i = 0u; i < 4u; i++) {\n",
+            "        let wl_lo = kq_word4(qsbase, i * 4u);\n",
+            "        let wl_hi = kq_word4(qsbase, 16u + i * 4u);\n",
+            "        let nib_lo = select((wl_lo >> 4u) & 0x0F0F0F0Fu, wl_lo & 0x0F0F0F0Fu, even);\n",
+            "        let nib_hi = select((wl_hi >> 4u) & 0x0F0F0F0Fu, wl_hi & 0x0F0F0F0Fu, even);\n",
+            "        let hb_lo = (kq_word4(qhbase, i * 4u) >> hshift) & 0x01010101u;\n",
+            "        let hb_hi = (kq_word4(qhbase, 16u + i * 4u) >> hshift) & 0x01010101u;\n",
+            "        sumi += dot_qk_packed(nib_lo | (hb_lo << 4u), (*u)[i]);\n",
+            "        sumi += dot_qk_packed(nib_hi | (hb_hi << 4u), (*u)[4u + i]);\n",
+            "    }\n",
+            "    return hdr.x * sm.x * (d8 * f32(sumi)) - hdr.y * sm.y * s8;\n",
+            "}",
+        )
+    )
+}
+
+/// Q6_K: 210-byte superblocks (not a whole number of words), int8 scales
+/// and 6-bit quants. Two 16-element sub-blocks pair with one activation
+/// block, each contributing `sc * (d8*sumi - 32*s8)`.
+fn q6k_int_dot_helpers(packed_dot: bool) -> String {
+    let _ = packed_dot;
+    format!(
+        "{F16_DECODE_FN}{}",
+        concat!(
+            "fn q6k_scale(base: u32, i: u32) -> f32 {\n",
+            "    let raw = kq_byte_at(base, 192u + i);\n",
+            "    return f32(i32(raw) - select(0, 256, raw >= 128u));\n",
+            "}\n",
+            "fn qk_block_dot(col: u32, blk: u32, u: ptr<function, array<u32, 8u>>, d8: f32, s8: f32) -> f32 {\n",
+            "    let sblocks = params.k / 256u;\n",
+            "    let base = (col * sblocks + blk / 8u) * 210u;\n",
+            "    let j8 = blk % 8u;\n",
+            "    let half = j8 / 4u;\n",
+            "    let j6 = j8 % 4u;\n",
+            "    let qlbase = base + half * 64u + (j6 & 1u) * 32u;\n",
+            "    let qhbase = base + 128u + half * 32u;\n",
+            "    var sumi_a = 0;\n",
+            "    var sumi_b = 0;\n",
+            "    var usum_a = 0;\n",
+            "    var usum_b = 0;\n",
+            "    for (var i = 0u; i < 4u; i++) {\n",
+            "        let la = kq_word4(qlbase, i * 4u);\n",
+            "        let lb = kq_word4(qlbase, 16u + i * 4u);\n",
+            "        let lo_a = select((la >> 4u) & 0x0F0F0F0Fu, la & 0x0F0F0F0Fu, j6 < 2u);\n",
+            "        let lo_b = select((lb >> 4u) & 0x0F0F0F0Fu, lb & 0x0F0F0F0Fu, j6 < 2u);\n",
+            "        let hi_a = ((kq_word4(qhbase, i * 4u) >> (j6 * 2u)) & 0x03030303u) << 4u;\n",
+            "        let hi_b = ((kq_word4(qhbase, 16u + i * 4u) >> (j6 * 2u)) & 0x03030303u) << 4u;\n",
+            "        sumi_a += dot_qk_packed(lo_a | hi_a, (*u)[i]);\n",
+            "        sumi_b += dot_qk_packed(lo_b | hi_b, (*u)[4u + i]);\n",
+            // The -32 offset belongs to the 16-element sub-block, so it is
+            // weighted by that sub-block's own activation sum, not the
+            // whole 32-element block's.
+            "        usum_a += dot_qk_packed(0x01010101u, (*u)[i]);\n",
+            "        usum_b += dot_qk_packed(0x01010101u, (*u)[4u + i]);\n",
+            "    }\n",
+            "    let d = decode_f16(kq_byte_at(base, 208u) | (kq_byte_at(base, 209u) << 8u));\n",
+            "    let sc_a = d * q6k_scale(base, half * 8u + j6 * 2u);\n",
+            "    let sc_b = d * q6k_scale(base, half * 8u + j6 * 2u + 1u);\n",
+            "    return sc_a * (d8 * f32(sumi_a - 32 * usum_a))\n",
+            "         + sc_b * (d8 * f32(sumi_b - 32 * usum_b));\n",
+            "}",
+        )
+    )
+}
+
+/// Q3_K: 110-byte superblocks, a 6-bit scale shuffle and the inverted
+/// hmask bit: the packed value is `q2 - (hbit ? 0 : 4)`, applied inside
+/// the dot operand so the sum needs no correction term.
+fn q3k_int_dot_helpers(packed_dot: bool) -> String {
+    let _ = packed_dot;
+    format!(
+        "{F16_DECODE_FN}{}",
+        concat!(
+            "fn q3k_scale(base: u32, i: u32) -> f32 {\n",
+            "    let b = i % 4u;\n",
+            "    let g = i / 4u;\n",
+            "    let src = select(4u + b, b, (g % 2u) == 0u);\n",
+            "    let raw = kq_byte_at(base, 96u + src);\n",
+            "    let nib = select(raw >> 4u, raw & 0xFu, g < 2u);\n",
+            "    let hi = (kq_byte_at(base, 96u + 8u + b) >> (g * 2u)) & 3u;\n",
+            "    return f32(i32(nib | (hi << 4u)) - 32);\n",
+            "}\n",
+            "fn qk_block_dot(col: u32, blk: u32, u: ptr<function, array<u32, 8u>>, d8: f32, s8: f32) -> f32 {\n",
+            "    let sblocks = params.k / 256u;\n",
+            "    let base = (col * sblocks + blk / 8u) * 110u;\n",
+            "    let j8 = blk % 8u;\n",
+            "    let h = j8 / 4u;\n",
+            "    let j3 = j8 % 4u;\n",
+            "    let qshift = j3 * 2u;\n",
+            "    let hshift = blk % 8u;\n",
+            "    var sumi_a = 0;\n",
+            "    var sumi_b = 0;\n",
+            "    for (var i = 0u; i < 4u; i++) {\n",
+            "        let q_a = (kq_word4(base, 32u + h * 32u + i * 4u) >> qshift) & 0x03030303u;\n",
+            "        let q_b = (kq_word4(base, 32u + h * 32u + 16u + i * 4u) >> qshift) & 0x03030303u;\n",
+            "        let hb_a = (kq_word4(base, i * 4u) >> hshift) & 0x01010101u;\n",
+            "        let hb_b = (kq_word4(base, 16u + i * 4u) >> hshift) & 0x01010101u;\n",
+            // GGML subtracts 4 where the hmask bit is CLEAR. Splitting the
+            // per-byte value into two dots keeps every operand a byte-sized
+            // non-negative number: a u32 subtraction here would borrow
+            // across bytes and corrupt the neighboring quants.
+            "        sumi_a += dot_qk_packed(q_a, (*u)[i])\n",
+            "                 - 4 * dot_qk_packed(hb_a ^ 0x01010101u, (*u)[i]);\n",
+            "        sumi_b += dot_qk_packed(q_b, (*u)[4u + i])\n",
+            "                 - 4 * dot_qk_packed(hb_b ^ 0x01010101u, (*u)[4u + i]);\n",
+            "    }\n",
+            "    let d = decode_f16(kq_byte_at(base, 108u) | (kq_byte_at(base, 109u) << 8u));\n",
+            "    return d * q3k_scale(base, (blk % 8u) * 2u) * (d8 * f32(sumi_a))\n",
+            "         + d * q3k_scale(base, (blk % 8u) * 2u + 1u) * (d8 * f32(sumi_b));\n",
+            "}",
+        )
+    )
 }
 
 /// Generate one GEMV pipeline at an explicit shape.
@@ -2937,6 +3268,36 @@ pub enum MatMulCoopVariant {
 //   kv_seq >  0 → non-causal (kv_len = kv_seq)
 //   window_size > 0 → sliding window (kv_start = max(0, pos+1-window))
 // ---------------------------------------------------------------------------
+
+/// The score-reduction round of `cached_block_attention.wgsl`: one value
+/// per slot in workgroup memory, visible to all threads. The tree spends a
+/// barrier per halving level. A subgroup form (one `subgroupAdd` per wave
+/// behind a leader-elected slot, as the GEMV family does) measured slower
+/// here: the wave's cross-lane adds cost more than the barriers they
+/// remove at a 64-thread workgroup.
+const ATTENTION_TREE_REDUCE: &str = "\
+    workgroupBarrier();\n\
+    if tid < 32u { for (var i = 0u; i < BKV; i++) { wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 32u]; } }\n\
+    workgroupBarrier();\n\
+    if tid < 16u { for (var i = 0u; i < BKV; i++) { wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 16u]; } }\n\
+    workgroupBarrier();\n\
+    if tid < 8u { for (var i = 0u; i < BKV; i++) { wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 8u]; } }\n\
+    workgroupBarrier();\n\
+    if tid < 4u { for (var i = 0u; i < BKV; i++) { wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 4u]; } }\n\
+    workgroupBarrier();\n\
+    if tid < 2u { for (var i = 0u; i < BKV; i++) { wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 2u]; } }\n\
+    workgroupBarrier();\n\
+    if tid < 1u { for (var i = 0u; i < BKV; i++) { wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 1u]; } }\n\
+    workgroupBarrier();";
+
+/// The cached-block attention kernel. `generate_module` routes here with
+/// the tree score reduction as the portable default.
+pub fn generate_module_block_attention() -> ShaderModule {
+    parse_wgsl(&preprocess(
+        include_str!("shaders/cached_block_attention.wgsl"),
+        &[("$SCORE_REDUCE", ATTENTION_TREE_REDUCE)],
+    ))
+}
 
 /// Generate a BKV=8 tiled attention shader parameterized by `head_dim`.
 ///
@@ -6483,6 +6844,7 @@ mod tests {
                 }
                 ShaderEntry::Transpose => vec!["src", "dst", "params"],
                 ShaderEntry::RmsNorm => vec!["src", "bias", "dst", "params"],
+                ShaderEntry::RmsNormAdd => vec!["src", "bias", "residual", "dst", "params"],
                 ShaderEntry::Embedding => vec!["indices", "src", "dst", "params"],
                 ShaderEntry::ToF16 => vec!["src", "dst", "params"],
                 ShaderEntry::LayerNorm => vec!["src", "src_b", "bias", "dst", "params"],
@@ -6532,15 +6894,20 @@ mod tests {
                 ShaderEntry::CachedAttention | ShaderEntry::CachedQueryAttention => {
                     vec!["src_a", "src_b", "bias", "kv_pos_buf", "dst", "params"]
                 }
-                ShaderEntry::CachedBlockAttention => vec![
-                    "src_a",
-                    "src_b",
-                    "bias",
-                    "kv_pos_buf",
-                    "valid_len_buf",
-                    "dst",
-                    "params",
-                ],
+                ShaderEntry::CachedBlockAttention | ShaderEntry::CachedBlockAttentionSplit => {
+                    vec![
+                        "src_a",
+                        "src_b",
+                        "bias",
+                        "kv_pos_buf",
+                        "valid_len_buf",
+                        "dst",
+                        "params",
+                    ]
+                }
+                ShaderEntry::CachedBlockAttentionCombine => {
+                    vec!["partials", "dst", "params"]
+                }
                 ShaderEntry::ChunkedRelativeAttention => {
                     vec!["src_a", "src_b", "bias", "relative_k", "dst", "params"]
                 }
@@ -6941,49 +7308,78 @@ mod tests {
     ///
     /// It is a separate source rather than a substitution into
     /// `matmul_gemv.wgsl`, so nothing guarantees the shaping markers still
-    /// line up except checking. The source also pins the backend split: Metal
-    /// keeps the packed intrinsic, while Vulkan gets the portable expansion
-    /// until Blade exposes the required device feature.
+    /// line up except checking. The packed intrinsic is chosen by the
+    /// device's `shader_integer_dot_product` capability; this pins that a
+    /// module generated without the capability expands the dot product
+    /// scalar-wise, and one generated with it emits the intrinsic.
     #[test]
     fn the_int_dot_gemv_takes_every_shape() {
         for group in [ShaderGroup::MatMulGemv, ShaderGroup::MatMulGemvAdd] {
-            for threads in [32, 64, 128, 256] {
-                for reduction in [GemvReduction::Tree, GemvReduction::Subgroup] {
-                    let shape = GemvShape { threads, reduction };
-                    let module = generate_module_gemv_int_dot(group, shape);
-                    let caps = naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32
-                        | match reduction {
-                            GemvReduction::Tree => naga::valid::Capabilities::empty(),
-                            GemvReduction::Subgroup => naga::valid::Capabilities::SUBGROUP,
-                        };
-                    let flags = naga::valid::ValidationFlags::all()
-                        ^ naga::valid::ValidationFlags::BINDINGS;
-                    naga::valid::Validator::new(flags, caps)
-                        .validate(&module.module)
-                        .unwrap_or_else(|e| panic!("{group:?} {shape:?}: {e:#?}"));
-                    assert!(module.source.contains("fn dot_q4_q8_packed"));
-                    assert_eq!(
-                        module.source.contains("return dot4I8Packed(q4, q8)"),
-                        cfg!(target_vendor = "apple"),
-                        "{group:?} {shape:?}: wrong packed-dot implementation"
-                    );
-                    assert_eq!(
-                        module.source.contains("src[col4]"),
-                        group == ShaderGroup::MatMulGemvAdd,
-                        "{group:?} {shape:?}: wrong residual handling"
-                    );
-                    assert!(
-                        module
-                            .source
-                            .contains(&format!("{LANES_PREFIX}{threads}u;")),
-                        "{group:?} {shape:?}: wrong width"
-                    );
-                    assert!(module.source.contains("blk += LANES;"));
-                    assert_eq!(
-                        module.source.contains("subgroupAdd"),
-                        reduction == GemvReduction::Subgroup,
-                        "{group:?} {shape:?}: reduction mismatch"
-                    );
+            for format in [
+                crate::compile::WeightFormat::Q40,
+                crate::compile::WeightFormat::Q8,
+            ] {
+                let dot_call = match format {
+                    crate::compile::WeightFormat::Q40 => "return dot4I8Packed(q4, q8)",
+                    crate::compile::WeightFormat::Q8 => "return dot4I8Packed(a, b)",
+                    _ => unreachable!(),
+                };
+                let helper_name = match format {
+                    crate::compile::WeightFormat::Q40 => "fn dot_q4_q8_packed",
+                    crate::compile::WeightFormat::Q8 => "fn dot_q8_q8_packed",
+                    _ => unreachable!(),
+                };
+                for threads in [32, 64, 128, 256] {
+                    for reduction in [GemvReduction::Tree, GemvReduction::Subgroup] {
+                        let shape = GemvShape { threads, reduction };
+                        for packed_dot in [true, false] {
+                            for norm in [false, true] {
+                                let module = generate_module_gemv_int_dot(
+                                    group, format, shape, packed_dot, norm,
+                                );
+                                let caps = naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32
+                                    | match reduction {
+                                        GemvReduction::Tree => naga::valid::Capabilities::empty(),
+                                        GemvReduction::Subgroup => {
+                                            naga::valid::Capabilities::SUBGROUP
+                                        }
+                                    };
+                                let flags = naga::valid::ValidationFlags::all()
+                                    ^ naga::valid::ValidationFlags::BINDINGS;
+                                naga::valid::Validator::new(flags, caps)
+                                    .validate(&module.module)
+                                    .unwrap_or_else(|e| panic!("{group:?} {shape:?}: {e:#?}"));
+                                assert!(module.source.contains(helper_name));
+                                assert_eq!(
+                                    module.source.contains(dot_call),
+                                    packed_dot,
+                                    "{group:?} {format:?} {shape:?}: wrong packed-dot implementation"
+                                );
+                                assert_eq!(
+                                    module.source.contains("src[col4]"),
+                                    group == ShaderGroup::MatMulGemvAdd,
+                                    "{group:?} {shape:?}: wrong residual handling"
+                                );
+                                assert!(
+                                    module
+                                        .source
+                                        .contains(&format!("{LANES_PREFIX}{threads}u;")),
+                                    "{group:?} {format:?} {shape:?}: wrong width"
+                                );
+                                assert!(module.source.contains("blk += LANES;"));
+                                assert_eq!(
+                                    module.source.contains("subgroupAdd"),
+                                    reduction == GemvReduction::Subgroup,
+                                    "{group:?} {shape:?}: reduction mismatch"
+                                );
+                                assert_eq!(
+                                    module.source.contains("params.eps_bits"),
+                                    norm,
+                                    "{group:?} {format:?}: wrong norm prologue"
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }

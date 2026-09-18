@@ -44,24 +44,32 @@ fn check_conv3x3(c_in: u32, c_out: u32, hw: u32) {
     let got = session.read_output(out_size);
 
     let (h, w) = (hw as usize, hw as usize);
+    // Accumulate tap-by-tap: each output plane stays cache-resident across
+    // all Cin×9 passes, which keeps the CPU reference from dominating the
+    // test's runtime at the SR-scale shapes.
     let mut want = vec![0.0f32; out_size];
     for co in 0..c_out as usize {
-        for oy in 0..h {
-            for ox in 0..w {
-                let mut s = 0.0f32;
-                for ci in 0..c_in as usize {
-                    for ky in 0..3usize {
-                        for kx in 0..3usize {
-                            let iy = oy as isize + ky as isize - 1;
-                            let ix = ox as isize + kx as isize - 1;
-                            if iy >= 0 && iy < h as isize && ix >= 0 && ix < w as isize {
-                                s += x_data[(ci * h + iy as usize) * w + ix as usize]
-                                    * k_data[((co * c_in as usize + ci) * 3 + ky) * 3 + kx];
-                            }
+        let want_plane = co * h * w;
+        for ci in 0..c_in as usize {
+            for ky in 0..3usize {
+                for kx in 0..3usize {
+                    let kk = k_data[((co * c_in as usize + ci) * 3 + ky) * 3 + kx];
+                    let ys = ky as isize - 1;
+                    let xs = kx as isize - 1;
+                    let iy0 = ys.clamp(0, h as isize);
+                    let iy1 = (h as isize + ys).clamp(0, h as isize);
+                    let ox0 = (-xs).clamp(0, w as isize);
+                    let ox1 = (w as isize - xs).clamp(0, w as isize);
+                    for iy in iy0..iy1 {
+                        let row = (iy - ys) as usize;
+                        let want_row = want_plane + row * w;
+                        let x_row = (ci * h + iy as usize) * w;
+                        for ox in ox0..ox1 {
+                            want[want_row + ox as usize] +=
+                                x_data[x_row + (ox as isize + xs) as usize] * kk;
                         }
                     }
                 }
-                want[(co * h + oy) * w + ox] = s;
             }
         }
     }

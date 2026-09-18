@@ -9,7 +9,12 @@
 //!     model.gguf --profile
 //!
 //! cargo run --release --example gemma4 -- model.gguf --tune --tune-secs 90
+//!
+//! cargo run --release --example gemma4 -- model.gguf --f32-activations
 //! ```
+//!
+//! Quantized models decode with quantized (Q8_1) activations by default;
+//! `--f32-activations` opts back out for an A/B.
 //!
 //! Set `MEGANEURA_DEVICE_ID` to the discrete GPU's PCI id when an iGPU is
 //! also visible.
@@ -36,6 +41,7 @@ fn main() {
         .unwrap_or_else(|| PathBuf::from("models/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_0.gguf"));
     let do_profile = args.iter().any(|a| a == "--profile");
     let do_tune = args.iter().any(|a| a == "--tune");
+    let f32_activations = args.iter().any(|a| a == "--f32-activations");
     let steps: usize = args
         .iter()
         .position(|a| a == "--steps")
@@ -83,8 +89,21 @@ fn main() {
     g.set_outputs(vec![logits]);
 
     println!("compiling...");
-    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    let mut session_config = meganeura::SessionConfig::inference_from_env();
+    if f32_activations {
+        // Explicit code wins over the quantized-model default.
+        session_config.options.quantized_activations = false;
+    }
+    let mut session = meganeura::build(&g, session_config).0;
     session.set_submission_chunks(1);
+    println!(
+        "activations: {}",
+        if f32_activations {
+            "f32"
+        } else {
+            "Q8_1 int-dot"
+        }
+    );
     println!(
         "session: {} buffers, {} dispatches, {} groups, {:.1} MiB plan",
         session.plan().buffers.len(),
