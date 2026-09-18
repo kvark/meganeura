@@ -538,6 +538,24 @@ struct RmsNormData {
     params: BiasAddParams, // reuse: rows=len, cols=bias_len, _pad x2
 }
 
+// split-K combine: var partials, dst, params
+#[derive(blade_macros::ShaderData)]
+struct CachedBlockAttentionCombineData {
+    partials: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: CachedBlockAttentionParams,
+}
+
+// rms_norm_add: var src, bias (weight), residual, dst, params
+#[derive(blade_macros::ShaderData)]
+struct RmsNormAddData {
+    src: blade_graphics::BufferPiece,
+    bias: blade_graphics::BufferPiece,
+    residual: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: BiasAddParams,
+}
+
 // embedding: var indices (u32), src (table), dst, params
 #[derive(blade_macros::ShaderData)]
 struct EmbeddingData {
@@ -857,8 +875,11 @@ struct CachedBlockAttentionParams {
     head_dim: u32,
     block_len: u32,
     max_seq: u32,
-    _pad0: u32,
-    _pad1: u32,
+    // Split-K: the split count and per-split token chunk. Zero splits on
+    // the fused single-kernel form; the spare slots avoid a new params
+    // struct and layout.
+    splits: u32,
+    chunk: u32,
 }
 
 #[derive(blade_macros::ShaderData)]
@@ -1106,9 +1127,20 @@ enum Variant {
         crate::compile::WeightFormat,
         crate::codegen::GemvShape,
     ),
-    /// The Q8_1-activation, integer-dot K-split GEMV at a measured shape.
-    /// Only ever paired with a GGML Q4_0 weight, so the format is implied.
-    GemvIntDot(ShaderEntry, crate::codegen::GemvShape),
+    /// The Q8_1-activation, integer-dot K-split GEMV at a measured shape,
+    /// with the weight format selecting between the GGML Q4_0 and Meganeura
+    /// Q8 kernels.
+    GemvIntDot(
+        ShaderEntry,
+        crate::compile::WeightFormat,
+        crate::codegen::GemvShape,
+    ),
+    /// Same, with the source RmsNorm folded into the prologue.
+    GemvRmsNormIntDot(
+        ShaderEntry,
+        crate::compile::WeightFormat,
+        crate::codegen::GemvShape,
+    ),
     /// A K-split GEMV at a measured workgroup width and reduction, for the
     /// weight format it reads. Every other axis of the GEMV family — fused
     /// add, transposed B, f16, block-packed — is already in the entry and
@@ -1165,7 +1197,8 @@ impl Variant {
             | Variant::CoopPrologue(ref e, _)
             | Variant::GemvRmsNorm(ref e, _, _)
             | Variant::Gemv(ref e, _, _)
-            | Variant::GemvIntDot(ref e, _)
+            | Variant::GemvIntDot(ref e, _, _)
+            | Variant::GemvRmsNormIntDot(ref e, _, _)
             | Variant::Weight(ref e, _)
             | Variant::Coop(ref e)
             | Variant::CoopCompensated(ref e)
@@ -1193,9 +1226,14 @@ impl Variant {
                 "{e:?}:rmsnorm-{format:?}-{}t-{:?}",
                 shape.threads, shape.reduction
             ),
-            Variant::GemvIntDot(ref e, shape) => {
-                format!("{e:?}:gemv-q40-q8-{}t-{:?}", shape.threads, shape.reduction)
-            }
+            Variant::GemvIntDot(ref e, format, shape) => format!(
+                "{e:?}:gemv-intdot-{format:?}-{}t-{:?}",
+                shape.threads, shape.reduction
+            ),
+            Variant::GemvRmsNormIntDot(ref e, format, shape) => format!(
+                "{e:?}:gemv-rmsnorm-intdot-{format:?}-{}t-{:?}",
+                shape.threads, shape.reduction
+            ),
             Variant::Gemv(ref e, format, shape) => format!(
                 "{e:?}:gemv-{format:?}-{}t-{:?}",
                 shape.threads, shape.reduction
@@ -1580,9 +1618,14 @@ impl Pipelines {
         // Compile the RmsNorm-fused GEMV when any dispatch asks for it. The
         // module is derived from the plain GEMV, so it needs no ShaderGroup
         // of its own; it is a variant of `MatMulGemv`, resolved by
-        // `get_pipeline` the same way a weight format is.
+        // `get_pipeline` the same way a weight format is. Int-dot GEMVs
+        // have their own fused form, compiled below.
         let mut fused_keys = std::collections::HashSet::new();
-        for fused in plan.dispatches.iter().filter(|d| d.gemv_rmsnorm.is_some()) {
+        for fused in plan
+            .dispatches
+            .iter()
+            .filter(|d| d.gemv_rmsnorm.is_some() && !d.gemv_int_dot)
+        {
             let shape = fused
                 .gemv_shape
                 .unwrap_or_else(|| crate::codegen::GemvShape::initial(ShaderGroup::MatMulGemv));
@@ -1604,22 +1647,37 @@ impl Pipelines {
 
         // Compile the int-dot GEMV for any dispatch that asked for it.
         // Unlike a shape, this is not something measurement can turn on, so
-        // it is always present when the plan says so.
+        // it is always present when the plan says so. The packed-dot
+        // intrinsic follows the device's `shader_integer_dot_product`
+        // capability; the scalar expansion is the exact fallback.
+        let packed_dot = gpu.capabilities().shader_integer_dot_product;
         for dispatch in &plan.dispatches {
             if !dispatch.gemv_int_dot {
                 continue;
             }
+            let fused = dispatch.gemv_rmsnorm.is_some();
             let shape = dispatch.gemv_shape.unwrap_or_else(|| {
                 crate::codegen::GemvShape::initial(dispatch.shader.shader_group())
             });
-            let key = Variant::GemvIntDot(dispatch.shader.clone(), shape);
+            let key = if fused {
+                Variant::GemvRmsNormIntDot(dispatch.shader.clone(), dispatch.weight_format, shape)
+            } else {
+                Variant::GemvIntDot(dispatch.shader.clone(), dispatch.weight_format, shape)
+            };
             if let std::collections::hash_map::Entry::Vacant(slot) = map.entry(key.clone()) {
                 let sm = crate::codegen::generate_module_gemv_int_dot(
                     dispatch.shader.shader_group(),
+                    dispatch.weight_format,
                     shape,
+                    packed_dot,
+                    fused,
                 );
                 let shader = create_gen_shader(gpu, sm, wgsl_dump_dir);
-                let layout = shader_data_layout(&dispatch.shader);
+                let layout = if fused {
+                    <MatMulRmsNormData as blade_graphics::ShaderData>::layout()
+                } else {
+                    shader_data_layout(&dispatch.shader)
+                };
                 slot.insert(create_profiled_pipeline(
                     gpu,
                     key.label(),
@@ -1907,12 +1965,15 @@ impl Pipelines {
         // activation back in f32 and change the session's arithmetic on the
         // strength of a missing pipeline.
         if dispatch.gemv_int_dot {
-            return vec![Variant::GemvIntDot(
-                entry.clone(),
-                dispatch
-                    .gemv_shape
-                    .unwrap_or_else(|| crate::codegen::GemvShape::initial(entry.shader_group())),
-            )];
+            let shape = dispatch
+                .gemv_shape
+                .unwrap_or_else(|| crate::codegen::GemvShape::initial(entry.shader_group()));
+            let format = dispatch.weight_format;
+            return vec![if dispatch.gemv_rmsnorm.is_some() {
+                Variant::GemvRmsNormIntDot(entry.clone(), format, shape)
+            } else {
+                Variant::GemvIntDot(entry.clone(), format, shape)
+            }];
         }
         let mut out = Vec::new();
         if let Some(ref kernel) = dispatch.reduction {
@@ -2277,6 +2338,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::RoPE | ShaderEntry::RoPEGrad => RoPEData::layout(),
         ShaderEntry::Gelu => UnaryData::layout(),
         ShaderEntry::LayerNorm => LayerNormData::layout(),
+        ShaderEntry::RmsNormAdd => RmsNormAddData::layout(),
         ShaderEntry::MultiHeadAttn
         | ShaderEntry::FlashAttention
         | ShaderEntry::FlashAttentionCoop => MultiHeadAttnData::layout(),
@@ -2319,7 +2381,10 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::CachedAttention | ShaderEntry::CachedQueryAttention => {
             CachedAttentionData::layout()
         }
-        ShaderEntry::CachedBlockAttention => CachedBlockAttentionData::layout(),
+        ShaderEntry::CachedBlockAttention | ShaderEntry::CachedBlockAttentionSplit => {
+            CachedBlockAttentionData::layout()
+        }
+        ShaderEntry::CachedBlockAttentionCombine => CachedBlockAttentionCombineData::layout(),
         ShaderEntry::ChunkedRelativeAttention => ChunkedRelativeAttentionData::layout(),
         ShaderEntry::PrefixLast => PrefixLastData::layout(),
         ShaderEntry::MaxPool2d => MaxPool2dData::layout(),
@@ -2629,6 +2694,7 @@ pub(crate) fn select_variants(
     // output materialized is the point of debug mode.
     if fuse_prologues {
         crate::compile::fuse_rmsnorm_prologues(plan);
+        crate::compile::fuse_rmsnorm_into_add(plan);
         crate::compile::fuse_rmsnorm_into_gemv(plan);
     }
 
@@ -7704,6 +7770,23 @@ impl Session {
                     },
                 );
             }
+            ShaderEntry::RmsNormAdd => {
+                pc.bind(
+                    0,
+                    &RmsNormAddData {
+                        src: buf(dispatch.input_buffers[0]),
+                        bias: buf(dispatch.input_buffers[1]),
+                        residual: buf(dispatch.input_buffers[2]),
+                        dst: buf(dispatch.output_buffer),
+                        params: BiasAddParams {
+                            len: dispatch.params[0],
+                            bias_len: dispatch.params[1],
+                            _pad0: dispatch.params[2], // eps_bits
+                            _pad1: 0,
+                        },
+                    },
+                );
+            }
             ShaderEntry::Embedding => {
                 pc.bind(
                     0,
@@ -8307,7 +8390,7 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::CachedBlockAttention => {
+            ShaderEntry::CachedBlockAttention | ShaderEntry::CachedBlockAttentionSplit => {
                 pc.bind(
                     0,
                     &CachedBlockAttentionData {
@@ -8324,8 +8407,27 @@ impl Session {
                             head_dim: dispatch.params[3],
                             block_len: dispatch.params[4],
                             max_seq: dispatch.params[5],
-                            _pad0: 0,
-                            _pad1: 0,
+                            splits: dispatch.params[6],
+                            chunk: dispatch.params[7],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::CachedBlockAttentionCombine => {
+                pc.bind(
+                    0,
+                    &CachedBlockAttentionCombineData {
+                        partials: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: CachedBlockAttentionParams {
+                            window_size: dispatch.params[0],
+                            num_heads: dispatch.params[1],
+                            num_kv_heads: dispatch.params[2],
+                            head_dim: dispatch.params[3],
+                            block_len: dispatch.params[4],
+                            max_seq: dispatch.params[5],
+                            splits: dispatch.params[6],
+                            chunk: dispatch.params[7],
                         },
                     },
                 );

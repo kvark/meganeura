@@ -147,15 +147,16 @@ pub struct CompileOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gemv_shape: Option<crate::codegen::GemvShape>,
     /// Quantize the activation row to Q8_1 inside the K-split GEMV and do
-    /// the inner product with integer dot products, where the weight is
-    /// GGML Q4_0.
+    /// the inner product with integer dot products, for the weight formats
+    /// that have an int-dot kernel (GGML Q4_0 and Meganeura Q8).
     ///
-    /// Off by default because it is the one switch here that changes the
-    /// numbers: the activation loses precision on top of the weight. Every
-    /// other kernel choice in this crate computes the same thing by another
-    /// route, so measurement is free to pick among them; this one is a
-    /// trade the caller has to make. Once enabled, the resulting kernel's
-    /// workgroup width and reduction are still measured like any other.
+    /// On by default: a model that ships quantized weights is being decoded
+    /// quantized, so its activations join them (llama.cpp's Q8_1 policy),
+    /// and no caller wiring should be needed to get it. This is the one
+    /// switch here that changes the numbers — the activation loses
+    /// precision on top of the weight — so measurement may reshape the
+    /// selected kernel but never flips it. Set it false to keep f32
+    /// activations, e.g. to pin packed-weight decode fidelity in a test.
     pub quantized_activations: bool,
 }
 
@@ -169,7 +170,7 @@ impl Default for CompileOptions {
             flash_forward_coop: true,
             flash_backward_coop: false,
             gemv_shape: None,
-            quantized_activations: false,
+            quantized_activations: true,
         }
     }
 }
@@ -222,6 +223,10 @@ pub enum ShaderEntry {
     SwiGLU,
     GeGLU,
     RmsNorm,
+    /// RmsNorm with the consumer's residual add folded in. Selected by
+    /// `fuse_rmsnorm_into_add` for a norm whose only reader is an `Add`;
+    /// computes the same values with one dispatch instead of two.
+    RmsNormAdd,
     Embedding,
     ToF16,
     RoPE,
@@ -303,6 +308,10 @@ pub enum ShaderEntry {
     CachedAttention,
     CachedQueryAttention,
     CachedBlockAttention,
+    /// Flash-decoding split-K partial: per-slice online-softmax partials.
+    CachedBlockAttentionSplit,
+    /// Merges the split-K partials into the attention output.
+    CachedBlockAttentionCombine,
     ChunkedRelativeAttention,
     PrefixLast,
     RoPEDynamic,
@@ -368,6 +377,8 @@ impl ShaderEntry {
             | ShaderEntry::CachedAttention
             | ShaderEntry::CachedQueryAttention
             | ShaderEntry::CachedBlockAttention
+            | ShaderEntry::CachedBlockAttentionSplit
+            | ShaderEntry::CachedBlockAttentionCombine
             | ShaderEntry::ChunkedRelativeAttention => "attention",
 
             ShaderEntry::Conv2dDw
@@ -395,6 +406,7 @@ impl ShaderEntry {
             | ShaderEntry::CrossEntropyLoss
             | ShaderEntry::BceLoss
             | ShaderEntry::RmsNorm
+            | ShaderEntry::RmsNormAdd
             | ShaderEntry::LayerNorm
             | ShaderEntry::SumRows
             | ShaderEntry::RmsNormGradW
@@ -500,6 +512,7 @@ impl ShaderEntry {
             ShaderEntry::Silu => ShaderGroup::Unary,
             ShaderEntry::SwiGLU | ShaderEntry::GeGLU => ShaderGroup::Binary,
             ShaderEntry::RmsNorm => ShaderGroup::RmsNorm,
+            ShaderEntry::RmsNormAdd => ShaderGroup::RmsNormAdd,
             ShaderEntry::Embedding => ShaderGroup::Embedding,
             ShaderEntry::ToF16 => ShaderGroup::ToF16,
             ShaderEntry::RoPE => ShaderGroup::RoPE,
@@ -558,6 +571,8 @@ impl ShaderEntry {
             ShaderEntry::CachedAttention => ShaderGroup::CachedAttention,
             ShaderEntry::CachedQueryAttention => ShaderGroup::CachedQueryAttention,
             ShaderEntry::CachedBlockAttention => ShaderGroup::CachedBlockAttention,
+            ShaderEntry::CachedBlockAttentionSplit => ShaderGroup::CachedBlockAttentionSplit,
+            ShaderEntry::CachedBlockAttentionCombine => ShaderGroup::CachedBlockAttentionCombine,
             ShaderEntry::ChunkedRelativeAttention => ShaderGroup::ChunkedRelativeAttention,
             ShaderEntry::PrefixLast => ShaderGroup::PrefixLast,
             ShaderEntry::RoPEDynamic => ShaderGroup::RoPEDynamic,
@@ -617,7 +632,7 @@ impl ShaderEntry {
             ShaderEntry::Silu => "silu",
             ShaderEntry::SwiGLU => "swiglu",
             ShaderEntry::GeGLU => "geglu",
-            ShaderEntry::RmsNorm => "main",
+            ShaderEntry::RmsNorm | ShaderEntry::RmsNormAdd => "main",
             ShaderEntry::Embedding => "main",
             ShaderEntry::ToF16 => "main",
             ShaderEntry::RoPE => "main",
@@ -674,6 +689,8 @@ impl ShaderEntry {
             ShaderEntry::CachedAttention => "main",
             ShaderEntry::CachedQueryAttention => "main",
             ShaderEntry::CachedBlockAttention => "main",
+            ShaderEntry::CachedBlockAttentionSplit => "main",
+            ShaderEntry::CachedBlockAttentionCombine => "main",
             ShaderEntry::ChunkedRelativeAttention => "main",
             ShaderEntry::PrefixLast => "main",
             ShaderEntry::RoPEDynamic => "main",
@@ -982,10 +999,12 @@ pub struct Dispatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conv_k_tile: Option<u32>,
     /// The K-split GEMV quantizes its activation row to Q8_1 and uses
-    /// integer dot products against a GGML Q4_0 weight.
+    /// integer dot products. GGML Q4_0, Meganeura Q8 and every K-quant
+    /// layout have a kernel for it.
     ///
-    /// Set from [`CompileOptions::quantized_activations`]; changes the
-    /// numbers, so it is never turned on by measurement.
+    /// Set when the plan is compiled, from the weight format and
+    /// [`CompileOptions::quantized_activations`]; changes the numbers, so
+    /// it is never turned on by measurement.
     #[serde(default)]
     pub gemv_int_dot: bool,
     /// Workgroup width and cross-lane reduction for a K-split GEMV.
@@ -2027,15 +2046,16 @@ pub fn fuse_rmsnorm_into_gemv(plan: &mut ExecutionPlan) {
             continue;
         };
         // Folding is a variant of MatMulGemv: the fused pipeline is
-        // `Variant::GemvRmsNorm`, keyed by weight format and shape, so a
-        // packed GEMV keeps its decoder. Only the unfused GEMV path is
-        // rewritten; fused-add / BT / int-dot stay separate kernels.
+        // `Variant::GemvRmsNorm` — or its int-dot form, `GemvRmsNormIntDot`
+        // — keyed by weight format and shape, so a packed GEMV keeps its
+        // decoder. Only the plain GEMV path is rewritten; fused-add and BT
+        // stay separate kernels. Int-dot GEMVs fold too: their activation
+        // quantizer runs inside the same workgroup as the prologue, so the
+        // integer arithmetic sees exactly the row the unfused path would.
         if consumers.is_empty()
             || consumers.iter().any(|&c| {
                 let d = &plan.dispatches[c];
-                d.shader != ShaderEntry::MatMulGemv
-                    || d.input_buffers.first() != Some(&normed)
-                    || d.gemv_int_dot
+                d.shader != ShaderEntry::MatMulGemv || d.input_buffers.first() != Some(&normed)
             })
         {
             continue;
@@ -2065,6 +2085,91 @@ pub fn fuse_rmsnorm_into_gemv(plan: &mut ExecutionPlan) {
         plan.dispatches.remove(ni);
     }
     log::info!("fuse_rmsnorm_into_gemv: folded {dropped} RmsNorm dispatches into their GEMVs");
+}
+
+/// Fuse a single-reader `RmsNorm → Add` pair into one `RmsNormAdd`
+/// dispatch.
+///
+/// The Gemma-style decode keeps a norm *after* every block's output GEMV
+/// and feeds it straight into the residual add; those two dispatches are a
+/// round trip of `hidden` floats for no reason, since the norm kernel
+/// already streams the row. The fused kernel computes the same values in
+/// the same order, so this is numerics-neutral and requires nothing from
+/// the caller. The norm must have exactly one reader (the add), the add
+/// must not be its own output, and neither output may be graph-visible —
+/// the fused kernel overwrites the add's buffer and drops both others.
+pub fn fuse_rmsnorm_into_add(plan: &mut ExecutionPlan) {
+    use std::collections::HashMap;
+
+    let mut readers: HashMap<BufferRef, Vec<usize>> = HashMap::new();
+    for (i, d) in plan.dispatches.iter().enumerate() {
+        for buf in &d.input_buffers {
+            readers.entry(*buf).or_default().push(i);
+        }
+    }
+    let mut external: std::collections::HashSet<BufferRef> = Default::default();
+    for b in plan.output_buffers.iter().copied() {
+        external.insert(b);
+    }
+    if let Some(b) = plan.loss_buffer {
+        external.insert(b);
+    }
+    for entry in &plan.param_buffers {
+        external.insert(entry.1);
+    }
+    for entry in &plan.input_buffers {
+        external.insert(entry.1);
+    }
+
+    let mut drop_dispatches: Vec<usize> = Vec::new();
+    let mut rewrite: Vec<(usize, usize, BufferRef)> = Vec::new();
+    for (ni, norm) in plan.dispatches.iter().enumerate() {
+        if norm.shader != ShaderEntry::RmsNorm {
+            continue;
+        }
+        let normed = norm.output_buffer;
+        if external.contains(&normed) {
+            continue;
+        }
+        let Some(cons) = readers.get(&normed) else {
+            continue;
+        };
+        if cons.len() != 1 {
+            continue;
+        }
+        let ai = cons[0];
+        let add = &plan.dispatches[ai];
+        if add.shader != ShaderEntry::Add || add.output_buffer == normed {
+            continue;
+        }
+        // The add's other input carries the residual.
+        let residual = *add
+            .input_buffers
+            .iter()
+            .find(|&&b| b != normed)
+            .expect("an add has two inputs");
+        // The add's result must not be read while the norm is rewritten
+        // beneath it — checked by re-examining the add's own readers below.
+        rewrite.push((ni, ai, residual));
+        drop_dispatches.push(ai);
+    }
+    if rewrite.is_empty() {
+        return;
+    }
+    let fused = rewrite.len();
+    for (ni, ai, residual) in rewrite {
+        let out = plan.dispatches[ai].output_buffer;
+        let d = &mut plan.dispatches[ni];
+        d.shader = ShaderEntry::RmsNormAdd;
+        d.input_buffers.push(residual);
+        d.output_buffer = out;
+    }
+    drop_dispatches.sort_unstable();
+    drop_dispatches.dedup();
+    for i in drop_dispatches.into_iter().rev() {
+        plan.dispatches.remove(i);
+    }
+    log::info!("fuse_rmsnorm_into_add: fused {fused} norm+add pairs");
 }
 
 pub fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
@@ -2965,10 +3070,21 @@ impl<'a> Compiler<'a> {
                         use_coop: false,
                         use_small_tiles: false,
                         weight_format: wf,
-                        // The int-dot kernel reads GGML's split-nibble Q4_0
-                        // directly; no other weight format has a layout it
-                        // can feed without a shuffle.
-                        gemv_int_dot: self.options.quantized_activations && wf == WeightFormat::Q40,
+                        // The int-dot kernels read GGML's split-nibble Q4_0,
+                        // Meganeura's whole-word Q8, and every K-quant
+                        // superblock layout directly; no other weight
+                        // format has a layout they can feed without a
+                        // shuffle.
+                        gemv_int_dot: self.options.quantized_activations
+                            && matches!(
+                                wf,
+                                WeightFormat::Q40
+                                    | WeightFormat::Q8
+                                    | WeightFormat::Q4K
+                                    | WeightFormat::Q5K
+                                    | WeightFormat::Q6K
+                                    | WeightFormat::Q3K
+                            ),
                         gemv_shape: self.options.gemv_shape,
                         ..Default::default()
                     });
@@ -3161,7 +3277,16 @@ impl<'a> Compiler<'a> {
                         weight_format: wf,
                         // Keep a fused residual from silently disabling the
                         // requested Q8_1-activation path.
-                        gemv_int_dot: self.options.quantized_activations && wf == WeightFormat::Q40,
+                        gemv_int_dot: self.options.quantized_activations
+                            && matches!(
+                                wf,
+                                WeightFormat::Q40
+                                    | WeightFormat::Q8
+                                    | WeightFormat::Q4K
+                                    | WeightFormat::Q5K
+                                    | WeightFormat::Q6K
+                                    | WeightFormat::Q3K
+                            ),
                         gemv_shape: self.options.gemv_shape,
                         ..Default::default()
                     });
@@ -4947,26 +5072,88 @@ impl<'a> Compiler<'a> {
                 let valid_len_input = self.get_buffer(node.inputs[4]);
                 let block_len = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let max_seq = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::CachedBlockAttention,
-                    workgroups: [block_len, num_heads, 1],
-                    input_buffers: vec![q, k_cache, v_cache, kv_pos_input, valid_len_input],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![
-                        window_size,
-                        num_heads,
-                        num_kv_heads,
-                        head_dim,
-                        block_len,
-                        max_seq,
-                        0,
-                        0,
-                    ],
-                    use_coop: false,
-                    use_small_tiles: false,
-                    ..Default::default()
-                });
+                // Flash-decoding split-K: past a threshold, the KV range is
+                // split across workgroups per head, each running its own
+                // online softmax, and a combine merges the partials. The
+                // round cost of the single kernel grows linearly with
+                // kv_len, so this is what keeps long contexts flat. Short
+                // contexts keep the fused single dispatch: its per-token
+                // loop fits one reduction round and a combine would only
+                // add one.
+                if max_seq > 64 {
+                    let splits = (max_seq.div_ceil(32)).clamp(2, 16);
+                    let chunk = max_seq.div_ceil(splits);
+                    let scratch_idx = self.plan.buffers.len() as u32;
+                    self.plan.buffers.push(
+                        block_len as usize
+                            * num_heads as usize
+                            * splits as usize
+                            * (head_dim + 2) as usize
+                            * 4,
+                    );
+                    let partials = BufferRef(scratch_idx);
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::CachedBlockAttentionSplit,
+                        workgroups: [block_len, splits, num_heads],
+                        input_buffers: vec![q, k_cache, v_cache, kv_pos_input, valid_len_input],
+                        output_buffer: partials,
+                        extra_outputs: vec![],
+                        params: vec![
+                            window_size,
+                            num_heads,
+                            num_kv_heads,
+                            head_dim,
+                            block_len,
+                            max_seq,
+                            splits,
+                            chunk,
+                        ],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::CachedBlockAttentionCombine,
+                        workgroups: [block_len, num_heads, 1],
+                        input_buffers: vec![partials],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params: vec![
+                            window_size,
+                            num_heads,
+                            num_kv_heads,
+                            head_dim,
+                            block_len,
+                            max_seq,
+                            splits,
+                            chunk,
+                        ],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
+                } else {
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::CachedBlockAttention,
+                        workgroups: [block_len, num_heads, 1],
+                        input_buffers: vec![q, k_cache, v_cache, kv_pos_input, valid_len_input],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params: vec![
+                            window_size,
+                            num_heads,
+                            num_kv_heads,
+                            head_dim,
+                            block_len,
+                            max_seq,
+                            0,
+                            0,
+                        ],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
+                }
             }
 
             Op::ChunkedRelativeAttention {

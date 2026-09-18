@@ -145,11 +145,44 @@
   a set rather than one id, since an instruction-tuned model ends its turn
   with `<|im_end|>` or `<|eot_id|>` rather than the declared EOS.
 
-- Optional Q8_1 activations for Q4_0 GEMV, following llama.cpp's
-  `vec_dot_q4_0_q8_1`. `CompileOptions::quantized_activations` is explicit
-  because this changes results; tuning may reshape the selected kernel but
-  never enables it. Metal uses `dot4I8Packed`, while Vulkan uses an exact
-  scalar expansion until Blade exposes `shaderIntegerDotProduct`.
+- Flash-decoding split-K for cached-block attention (`max_seq > 64`):
+  the KV range splits across workgroups per head, each running its own
+  online softmax over 32-token chunks, and a combine kernel merges the
+  partials into the output. The single kernel's reduction rounds grow
+  linearly with kv_len — at a 512-token context that was 85% of decode
+  time — while the split form stays flat, matching llama.cpp's
+  context-insensitive decode. Gemma 4 tg512 goes from 35 to 125 tok/s.
+  Short contexts keep the fused single dispatch, whose per-token loop
+  already fits one reduction round.
+- RmsNorm with its consumer's residual add fused into one dispatch
+  (`ShaderEntry::RmsNormAdd`, selected automatically by
+  `fuse_rmsnorm_into_add`). The post-norm of every transformer block feeds
+  a residual add; the fused kernel computes the same values without a
+  dispatch and a round trip between them. Gemma 4 decode drops from 740 to
+  635 dispatches.
+- Cached-block attention processes its KV range in 16-token masked
+  reduction rounds instead of full tiles plus a per-token remainder loop.
+  A ragged tail costs one round instead of six barriers, and long
+  contexts halve the round count outright. A subgroup-add form of the
+  score reduction was measured and rejected: the wave's cross-lane adds
+  cost more than the barriers they remove at a 64-thread workgroup.
+- Gemma 4 GGUF text decode (`examples/gemma4.rs`). Pull a GGUF from
+  HuggingFace, load it into Meganeura and llama.cpp, and compare decode
+  throughput. GeGLU packing uses the same HorizontalConcat as SwiGLU.
+  RmsNorm folds into packed GEMVs; `tune_with` searches that kernel,
+  including vocab-width Q8 GEMV whose N/4 workgroups exceed the portable
+  65535 minimum. Default comparison uses `set_submission_chunks(1)`.
+- Quantized activations for packed GEMVs, following llama.cpp's
+  `vec_dot_*_q8_1` kernels. A model that ships quantized weights now
+  decodes with quantized (Q8_1) activations by default — for GGML Q4_0,
+  Meganeura Q8 and the K-quants Q4_K/Q5_K/Q6_K/Q3_K, the formats with a
+  kernel layout for it. `CompileOptions::quantized_activations` stays as
+  an explicit opt-out because this changes results; tuning may reshape the
+  selected kernel but never flips it. Where the device reports
+  `shader_integer_dot_product` the four-byte dots are the hardware
+  `dot4I8Packed` (DP4A) instruction; other devices run an exact scalar
+  expansion of the same arithmetic. An RmsNorm before the GEMV folds into
+  the same kernel, keeping one fewer dispatch than the unfused form.
 - Native, load-only GGML Q4_0 storage (`DType::Q40` and
   `Graph::parameter_q40`) removes the host repack and stores 4.5 rather than
   5 bits per weight. Q4_1 continues to use Meganeura's existing Q4 layout.

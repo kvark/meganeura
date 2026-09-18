@@ -1,9 +1,9 @@
+# Meganeura
+
 [![CI](https://github.com/kvark/meganeura/actions/workflows/ci.yml/badge.svg)](https://github.com/kvark/meganeura/actions/workflows/ci.yml)
 [![Docs](https://docs.rs/meganeura/badge.svg)](https://docs.rs/meganeura)
 [![Crates.io](https://img.shields.io/crates/v/meganeura.svg?label=meganeura)](https://crates.io/crates/meganeura)
 [![arXiv](https://img.shields.io/badge/arXiv-2608.01563-b31b1b.svg)](https://arxiv.org/abs/2608.01563)
-
-# meganeura
 
 **Portable neural-network training and inference in Rust.** Look, ma, no CUDA!
 
@@ -72,15 +72,7 @@ Meganeura's strong sides are uniform graph, autodiff, compiler, and runtime stac
 both training and inference across desktop and edge-class Vulkan/Metal
 devices.
 
-## Install
-
-```
-cargo add meganeura
-```
-
-See the [changelog](CHANGELOG.md) for API and feature changes from 0.2.
-CI assembles the packaged crate; full registry verification waits on a Blade
-release that includes this timing API.
+## Contents
 
 Features:
 - "hf-hub" to enable HuggingFace downloads
@@ -116,6 +108,21 @@ let model = load_gguf(std::path::Path::new("model.gguf"))?;
 let mut generator = model.generator(2048)?;
 println!("{}", generator.generate("The meaning of life is", &GenerationOptions::default())?);
 ```
+
+`CompileOptions::quantized_activations` quantizes the GEMV activation row
+to Q8_1 and runs the inner product on integer dot products, following
+llama.cpp's `vec_dot_*_q8_1` kernels. It is on by default: a model that
+ships quantized weights is decoded quantized, so its activations join
+them, and every format with a kernel layout for it — GGML `Q4_0`, Meganeura
+`Q8`, and the K-quants `Q4_K`, `Q5_K`, `Q6_K` and `Q3_K` — gets it
+automatically. It is the only kernel switch here that changes results
+rather than the route to them, so it is never selected by measurement; set
+it false to keep f32 activations. Where the device reports
+`shader_integer_dot_product` (Metal, and Vulkan 1.3 devices exposing
+`VK_KHR_shader_integer_dot_product`) the dot products are the hardware
+`dot4I8Packed` (DP4A); otherwise an exact scalar expansion of the same
+integer arithmetic runs. `Q2_K` and `Q8_K` are listed in the inventory but
+not read, and quantized embedding tables have no gather variant.
 
 ## System requirements
 
