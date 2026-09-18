@@ -337,7 +337,7 @@ impl MatmulTile {
             // dispatches that on devices that advertise more; applying the
             // portable 65535 cap here would drop the kernel that dominates
             // Gemma 4 logits from `tune_with`.
-            if self.workgroups(class).iter().any(|&n| n == 0) {
+            if self.workgroups(class).contains(&0) {
                 return None;
             }
             return Some(sizes);

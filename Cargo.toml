@@ -203,6 +203,7 @@ required-features = ["hf-hub"]
 [[example]]
 name = "gemma4"
 path = "examples/gemma4.rs"
+required-features = ["gguf"]
 
 [[example]]
 name = "grad_check"

@@ -295,6 +295,41 @@ fn expect_len(name: &str, got: usize, want: usize) -> Result<(), GgufError> {
     )))
 }
 
+/// The block's gathered per-layer token-embedding rows: one row per real
+/// token, scaled the way the embedding is, laid out token-major (row
+/// `(t, l)` is token `t`'s layer-`l` row) to match the projection rows the
+/// graph normed. The table stays block-quantized in the file; the gather
+/// reads one column per token.
+pub fn gather_per_layer_embeddings(
+    table: &GgufTensor,
+    config: &ModelConfig,
+    tokens: &[u32],
+) -> Result<Vec<f32>, GgufError> {
+    let ple_size = config.per_layer_embed_size;
+    let span = config.num_layers * ple_size;
+    if table.dims.as_slice() != [span, config.vocab_size] {
+        return Err(GgufError::BadShape(format!(
+            "per_layer_token_embd.weight has shape {:?}, expected GGUF dimensions [{span}, {}]",
+            table.dims, config.vocab_size
+        )));
+    }
+    let mut out = vec![0.0f32; tokens.len() * span];
+    for (i, &token) in tokens.iter().enumerate() {
+        let row = table.column_f32(token as usize)?;
+        if row.len() != span {
+            return Err(GgufError::BadShape(format!(
+                "per_layer_token_embd.weight token {token} has {} values, expected {span}",
+                row.len()
+            )));
+        }
+        let scale = (ple_size as f32).sqrt();
+        for (dst, &v) in out[i * span..][..span].iter_mut().zip(&row) {
+            *dst = v * scale;
+        }
+    }
+    Ok(out)
+}
+
 /// Zero every KV cache, so the next generation starts from an empty
 /// prefix.
 ///
@@ -303,8 +338,11 @@ fn expect_len(name: &str, got: usize, want: usize) -> Result<(), GgufError> {
 /// *shorter* prompt would otherwise leave the tail of a previous
 /// conversation attendable.
 pub fn reset_caches(session: &mut Session, built: &graph::ModelGraph, config: &ModelConfig) {
-    let zeros = vec![0.0f32; built.max_seq_len * config.kv_dim()];
+    // Caches differ in width where heads do — zero each with its own span.
+    let mut zeros = vec![0.0f32; built.max_seq_len * config.kv_dim_at(0)];
     for layer in 0..config.num_layers {
+        let span = built.max_seq_len * config.kv_dim_at(layer);
+        zeros.resize(span, 0.0);
         for name in [
             graph::ModelGraph::k_cache_name(layer),
             graph::ModelGraph::v_cache_name(layer),
@@ -467,7 +505,7 @@ mod tests {
         let mut model = fixture::model("llama");
         let config = ModelConfig::from_gguf(&model).unwrap();
         let q = config.q_dim();
-        let kv = config.kv_dim();
+        let kv = config.kv_dim_at(0);
         let hidden = config.hidden_size;
         model.metadata.insert(
             "general.architecture".to_string(),
@@ -545,7 +583,7 @@ mod tests {
     /// loader would hand packed bytes to an f32 buffer.
     #[test]
     fn the_loader_and_the_builder_agree_on_every_dtype() {
-        for arch in ["llama", "qwen2", "qwen3", "gemma", "gemma2"] {
+        for arch in ["llama", "qwen2", "qwen3", "gemma", "gemma2", "gemma4"] {
             let model = fixture::model(arch);
             let config = ModelConfig::from_gguf(&model).unwrap();
             for name in graph::parameter_names(&config) {
@@ -585,6 +623,27 @@ mod tests {
                     rows[v * hidden + h],
                     transposed[h * config.vocab_size + v],
                     "row {v} column {h}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn per_layer_embedding_gather_is_token_major_and_scaled() {
+        let model = fixture::model("gemma4");
+        let config = ModelConfig::from_gguf(&model).unwrap();
+        let table = &model.tensors["per_layer_token_embd.weight"];
+        let tokens = [3, 1];
+        let got = gather_per_layer_embeddings(table, &config, &tokens).unwrap();
+        let span = config.num_layers * config.per_layer_embed_size;
+        assert_eq!(got.len(), tokens.len() * span);
+        for (token_index, &token) in tokens.iter().enumerate() {
+            let column = table.column_f32(token as usize).unwrap();
+            for element in 0..span {
+                assert_eq!(
+                    got[token_index * span + element],
+                    column[element] * (config.per_layer_embed_size as f32).sqrt(),
+                    "token {token}, PLE element {element}"
                 );
             }
         }
@@ -660,7 +719,7 @@ mod tests {
 
     #[test]
     fn every_fixture_architecture_has_a_tensor_for_every_parameter() {
-        for arch in ["llama", "qwen2", "qwen3", "gemma", "gemma2"] {
+        for arch in ["llama", "qwen2", "qwen3", "gemma", "gemma2", "gemma4"] {
             let model = fixture::model(arch);
             let config = ModelConfig::from_gguf(&model).unwrap();
             for name in graph::parameter_names(&config) {

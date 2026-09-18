@@ -313,6 +313,10 @@ pub struct MatmulKnobs {
     /// Stagger the B loads across columns instead of tying a thread to
     /// `tm` consecutive ones.
     pub interleave_columns: bool,
+    /// Emit the hardware `dot4I8Packed` in the int-dot GEMV kernels where
+    /// the device reports `shader_integer_dot_product`; the exact scalar
+    /// expansion is the fallback.
+    pub integer_dot: bool,
 }
 
 impl Default for MatmulKnobs {
@@ -320,6 +324,7 @@ impl Default for MatmulKnobs {
         Self {
             k_stage: 32,
             interleave_columns: false,
+            integer_dot: false,
         }
     }
 }
@@ -1902,10 +1907,6 @@ fn substitute(source: &str, old: &str, new: &str) -> String {
 /// Derived from `matmul_gemv.wgsl` by substitution so shape and reduction
 /// changes reach it automatically. Each consuming workgroup recomputes the
 /// small sum-of-squares prologue, avoiding a separate dispatch and boundary.
-pub fn generate_module_gemv_rmsnorm(shape: GemvShape, format: WeightFormat) -> ShaderModule {
-    parse_wgsl(&gemv_shape_source(&gemv_rmsnorm_source(format), shape))
-}
-
 fn gemv_rmsnorm_source(format: WeightFormat) -> String {
     // `_pad` carries eps; the fused kernel needs no other new parameter.
     // Start from the already-format-specialized GEMV so packed decoders
@@ -1980,9 +1981,11 @@ fn gemv_rmsnorm_source(format: WeightFormat) -> String {
         &src,
         "        let a = matrix_a[kk];",
         "        let a = matrix_a[kk] * rs * norm_w[kk];",
-    );
-    ShaderModule::new(&gemv_shape_source(&src, shape))
+    )
 }
+
+pub fn generate_module_gemv_rmsnorm(shape: GemvShape, format: WeightFormat) -> ShaderModule {
+    ShaderModule::new(&gemv_shape_source(&gemv_rmsnorm_source(format), shape))
 }
 
 const LANES_PREFIX: &str = "const LANES: u32 = ";
@@ -3293,7 +3296,7 @@ const ATTENTION_TREE_REDUCE: &str = "\
 /// The cached-block attention kernel. `generate_module` routes here with
 /// the tree score reduction as the portable default.
 pub fn generate_module_block_attention() -> ShaderModule {
-    parse_wgsl(&preprocess(
+    ShaderModule::new(&preprocess(
         include_str!("shaders/cached_block_attention.wgsl"),
         &[("$SCORE_REDUCE", ATTENTION_TREE_REDUCE)],
     ))
@@ -6949,6 +6952,9 @@ mod tests {
                 ShaderEntry::RoPEDynamic | ShaderEntry::RoPEPositions => {
                     vec!["src", "dst", "pos_offset_buf", "params"]
                 }
+                ShaderEntry::RoPEDynamicFactors => {
+                    vec!["src", "dst", "pos_offset_buf", "factors", "params"]
+                }
                 ShaderEntry::MaxPool2d
                 | ShaderEntry::GlobalAvgPool
                 | ShaderEntry::GlobalAvgPoolGrad => vec!["src", "dst", "params"],
@@ -7072,6 +7078,7 @@ mod tests {
             ShaderEntry::ChunkedRelativeAttention,
             ShaderEntry::PrefixLast,
             ShaderEntry::RoPEDynamic,
+            ShaderEntry::RoPEDynamicFactors,
             ShaderEntry::RoPEPositions,
             ShaderEntry::MaxPool2d,
             ShaderEntry::GlobalAvgPool,

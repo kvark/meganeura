@@ -985,6 +985,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 theta,
                 pos_offset,
                 head_dim,
+                ..
             } => {
                 // RoPE is a rotation: [x0, x1] → [x0*cos - x1*sin, x0*sin + x1*cos].
                 // Backward applies the inverse rotation (transpose of rotation matrix):
@@ -1025,6 +1026,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
                             theta: rope_theta,
                             pos_offset: 0,
                             head_dim,
+                            freq_factors: false,
                         },
                         vec![q_raw],
                         q_ty.clone(),
@@ -1034,6 +1036,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
                             theta: rope_theta,
                             pos_offset: 0,
                             head_dim,
+                            freq_factors: false,
                         },
                         vec![k_raw],
                         k_ty.clone(),

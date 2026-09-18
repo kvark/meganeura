@@ -605,6 +605,16 @@ struct RoPEDynamicData {
     params: RoPEParams,
 }
 
+// rope_dynamic with per-pair divisors: the same four, plus the factors.
+#[derive(blade_macros::ShaderData)]
+struct RoPEDynamicFactorsData {
+    src: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    pos_offset_buf: blade_graphics::BufferPiece,
+    factors: blade_graphics::BufferPiece,
+    params: RoPEParams,
+}
+
 // cache_write: var src, dst (read_write), kv_pos_buf, params
 #[derive(blade_macros::ShaderData)]
 struct CacheWriteData {
@@ -1473,10 +1483,12 @@ impl Pipelines {
                     }
                 }
             };
-        let matmul_knobs = crate::codegen::MatmulKnobs {
+        let mut matmul_knobs = crate::codegen::MatmulKnobs {
             k_stage: plan.knobs.matmul_k_stage,
             interleave_columns: plan.knobs.matmul_interleave_columns,
+            ..Default::default()
         };
+        matmul_knobs.integer_dot = gpu.capabilities().shader_integer_dot_product;
         let compile_group =
             |group: ShaderGroup,
              key: &dyn Fn(ShaderEntry) -> Variant,
@@ -1650,7 +1662,7 @@ impl Pipelines {
         // it is always present when the plan says so. The packed-dot
         // intrinsic follows the device's `shader_integer_dot_product`
         // capability; the scalar expansion is the exact fallback.
-        let packed_dot = gpu.capabilities().shader_integer_dot_product;
+        let knobs = matmul_knobs;
         for dispatch in &plan.dispatches {
             if !dispatch.gemv_int_dot {
                 continue;
@@ -1669,7 +1681,7 @@ impl Pipelines {
                     dispatch.shader.shader_group(),
                     dispatch.weight_format,
                     shape,
-                    packed_dot,
+                    knobs.integer_dot,
                     fused,
                 );
                 let shader = create_gen_shader(gpu, sm, wgsl_dump_dir);
@@ -2376,6 +2388,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         | ShaderEntry::Conv2dGradWeightGemmSplit
         | ShaderEntry::Conv2dGradWeightGemmSplitSmall => Conv2dGradWeightData::layout(),
         ShaderEntry::RoPEDynamic | ShaderEntry::RoPEPositions => RoPEDynamicData::layout(),
+        ShaderEntry::RoPEDynamicFactors => RoPEDynamicFactorsData::layout(),
         ShaderEntry::CacheWrite => CacheWriteData::layout(),
         ShaderEntry::CacheWritePrefix => CacheWritePrefixData::layout(),
         ShaderEntry::CachedAttention | ShaderEntry::CachedQueryAttention => {
@@ -8316,6 +8329,27 @@ impl Session {
                         src: buf(dispatch.input_buffers[1]),
                         dst: buf(dispatch.output_buffer),
                         params: Conv2dParams::from(dispatch),
+                    },
+                );
+            }
+            ShaderEntry::RoPEDynamicFactors => {
+                pc.bind(
+                    0,
+                    &RoPEDynamicFactorsData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        pos_offset_buf: buf(dispatch.input_buffers[1]),
+                        factors: buf(dispatch.input_buffers[2]),
+                        params: RoPEParams {
+                            seq: dispatch.params[0],
+                            dim: dispatch.params[1],
+                            theta_bits: dispatch.params[2],
+                            pos_offset: 0,
+                            head_dim: dispatch.params[4],
+                            _pad0: 0,
+                            _pad1: 0,
+                            _pad2: 0,
+                        },
                     },
                 );
             }

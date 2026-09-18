@@ -58,15 +58,14 @@ fn check_conv3x3(c_in: u32, c_out: u32, hw: u32) {
                     let xs = kx as isize - 1;
                     let iy0 = ys.clamp(0, h as isize);
                     let iy1 = (h as isize + ys).clamp(0, h as isize);
-                    let ox0 = (-xs).clamp(0, w as isize);
-                    let ox1 = (w as isize - xs).clamp(0, w as isize);
+                    let ix0 = xs.clamp(0, w as isize);
+                    let ix1 = (w as isize + xs).clamp(0, w as isize);
                     for iy in iy0..iy1 {
                         let row = (iy - ys) as usize;
                         let want_row = want_plane + row * w;
                         let x_row = (ci * h + iy as usize) * w;
-                        for ox in ox0..ox1 {
-                            want[want_row + ox as usize] +=
-                                x_data[x_row + (ox as isize + xs) as usize] * kk;
+                        for ix in ix0..ix1 {
+                            want[want_row + (ix - xs) as usize] += x_data[x_row + ix as usize] * kk;
                         }
                     }
                 }

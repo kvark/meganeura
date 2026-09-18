@@ -43,18 +43,12 @@ impl Pipelines {
             return Ok(());
         }
         let selected_entry = tile.shader(&dispatch.shader);
-<<<<<<< HEAD
-        let module = tile_module(dispatch, tile, self.matmul_knobs);
+        let mut knobs = self.matmul_knobs;
+        knobs.integer_dot = gpu.capabilities().shader_integer_dot_product;
+        let module = tile_module(dispatch, tile, knobs);
         if let Some(dir) = self.dump_dir.as_deref() {
             module.dump(dir);
         }
-=======
-        let module = tile_module(
-            dispatch,
-            tile,
-            gpu.capabilities().shader_integer_dot_product,
-        );
->>>>>>> a897556 (DP4A int-dot GEMVs for all packed formats, norm+add fusion, split-K attention.)
         let shader = gpu
             .try_create_shader(bg::ShaderDesc {
                 source: &module.source,
@@ -104,11 +98,7 @@ impl Pipelines {
 fn tile_module(
     dispatch: &Dispatch,
     tile: MatmulTile,
-<<<<<<< HEAD
     knobs: crate::codegen::MatmulKnobs,
-=======
-    packed_dot: bool,
->>>>>>> a897556 (DP4A int-dot GEMVs for all packed formats, norm+add fusion, split-K attention.)
 ) -> crate::codegen::ShaderModule {
     let entry = &dispatch.shader;
     if let MatmulTile::Gemv(shape) = tile {
@@ -122,7 +112,7 @@ fn tile_module(
                 group,
                 dispatch.weight_format,
                 shape,
-                packed_dot,
+                knobs.integer_dot,
                 dispatch.gemv_rmsnorm.is_some(),
             );
         }
@@ -1527,19 +1517,13 @@ mod tests {
             Variant::GemvIntDot(_, format, selected) if format == crate::compile::WeightFormat::Q40 && selected == shape
         ));
         assert!(
-<<<<<<< HEAD
             tile_module(
                 &dispatch,
                 MatmulTile::Gemv(shape),
-                crate::codegen::MatmulKnobs::default()
+                crate::codegen::MatmulKnobs::default(),
             )
             .source
             .contains("dot_q4_q8_packed")
-=======
-            tile_module(&dispatch, MatmulTile::Gemv(shape), false)
-                .source
-                .contains("dot_q4_q8_packed")
->>>>>>> a897556 (DP4A int-dot GEMVs for all packed formats, norm+add fusion, split-K attention.)
         );
 
         let ordinary = Dispatch {
@@ -2317,12 +2301,8 @@ mod tests {
                         Variant::Scalar(tile.shader(&entry))
                     );
                 }
-<<<<<<< HEAD
                 let mut module =
                     tile_module(&dispatch, tile, crate::codegen::MatmulKnobs::default());
-=======
-                let mut module = tile_module(&dispatch, tile, false);
->>>>>>> a897556 (DP4A int-dot GEMVs for all packed formats, norm+add fusion, split-K attention.)
                 // Blade assigns resource bindings by ShaderData field name.
                 // Assign distinct test bindings before full offline validation.
                 for (index, (_, var)) in module.module.global_variables.iter_mut().enumerate() {

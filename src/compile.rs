@@ -315,6 +315,7 @@ pub enum ShaderEntry {
     ChunkedRelativeAttention,
     PrefixLast,
     RoPEDynamic,
+    RoPEDynamicFactors,
     RoPEPositions,
     MaxPool2d,
     GlobalAvgPool,
@@ -472,6 +473,7 @@ impl ShaderEntry {
             | ShaderEntry::MulPerChannel
             | ShaderEntry::AddPerChannel
             | ShaderEntry::RoPEDynamic
+            | ShaderEntry::RoPEDynamicFactors
             | ShaderEntry::RoPEPositions => "pointwise",
         }
     }
@@ -575,7 +577,7 @@ impl ShaderEntry {
             ShaderEntry::CachedBlockAttentionCombine => ShaderGroup::CachedBlockAttentionCombine,
             ShaderEntry::ChunkedRelativeAttention => ShaderGroup::ChunkedRelativeAttention,
             ShaderEntry::PrefixLast => ShaderGroup::PrefixLast,
-            ShaderEntry::RoPEDynamic => ShaderGroup::RoPEDynamic,
+            ShaderEntry::RoPEDynamic | ShaderEntry::RoPEDynamicFactors => ShaderGroup::RoPEDynamic,
             ShaderEntry::RoPEPositions => ShaderGroup::RoPEDynamic,
             ShaderEntry::MaxPool2d => ShaderGroup::MaxPool2d,
             ShaderEntry::GlobalAvgPool => ShaderGroup::GlobalAvgPool,
@@ -694,6 +696,7 @@ impl ShaderEntry {
             ShaderEntry::ChunkedRelativeAttention => "main",
             ShaderEntry::PrefixLast => "main",
             ShaderEntry::RoPEDynamic => "main",
+            ShaderEntry::RoPEDynamicFactors => "with_factors",
             ShaderEntry::RoPEPositions => "with_positions",
             ShaderEntry::MaxPool2d => "max_pool_2d",
             ShaderEntry::GlobalAvgPool => "global_avg_pool",
@@ -4207,12 +4210,28 @@ impl<'a> Compiler<'a> {
                 theta,
                 pos_offset,
                 head_dim,
+                ..
             } => {
                 let input = self.get_buffer(node.inputs[0]);
                 let shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let seq = shape[0] as u32;
                 let dim = shape[1] as u32;
-                if node.inputs.len() == 2 {
+                if node.inputs.len() == 3 {
+                    // Dynamic offset with per-pair divisors.
+                    let offset_buf = self.get_buffer(node.inputs[1]);
+                    let factors = self.get_buffer(node.inputs[2]);
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::RoPEDynamicFactors,
+                        workgroups: [(seq * dim / 2).div_ceil(256), 1, 1],
+                        input_buffers: vec![input, offset_buf, factors],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params: vec![seq, dim, theta.to_bits(), 0, head_dim, 0, 0, 0],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        ..Default::default()
+                    });
+                } else if node.inputs.len() == 2 {
                     // Dynamic offset: read pos_offset from input buffer
                     let offset_buf = self.get_buffer(node.inputs[1]);
                     self.plan.dispatches.push(Dispatch {

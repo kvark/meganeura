@@ -1,34 +1,60 @@
-//! Gemma 4 GGUF decode: load a HuggingFace GGUF, run Meganeura, optionally
-//! profile, and print tok/s next to a llama.cpp command for the same file.
+//! Gemma 4 GGUF decode through the generic `load::gguf` path, with
+//! explicit step control for benchmarking, and tok/s next to a llama.cpp
+//! command for the same file.
 //!
 //! ```text
-//! cargo run --release --example gemma4 -- \
+//! cargo run --release --features gguf --example gemma4 -- \
 //!     models/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_0.gguf
 //!
-//! MEGANEURA_GPU_TIMING=1 cargo run --release --example gemma4 -- \
+//! MEGANEURA_GPU_TIMING=1 cargo run --release --features gguf --example gemma4 -- \
 //!     model.gguf --profile
 //!
-//! cargo run --release --example gemma4 -- model.gguf --tune --tune-secs 90
+//! cargo run --release --features gguf --example gemma4 -- model.gguf --tune --tune-secs 90
 //!
-//! cargo run --release --example gemma4 -- model.gguf --f32-activations
+//! cargo run --release --features gguf --example gemma4 -- model.gguf --f32-activations
 //! ```
 //!
 //! Quantized models decode with quantized (Q8_1) activations by default;
 //! `--f32-activations` opts back out for an A/B.
 //!
 //! Set `MEGANEURA_DEVICE_ID` to the discrete GPU's PCI id when an iGPU is
-//! also visible.
-//!
-//! Fair throughput uses a single GPU submission (`set_submission_chunks(1)`).
-//! Chunking of 8 is compositor fairness, not llama.cpp's policy.
+//! also visible. Fair throughput uses a single GPU submission
+//! (`set_submission_chunks(1)`); chunking of 8 is compositor fairness, not
+//! llama.cpp's policy.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use meganeura::models::gemma4::{self, Gemma4Config};
+use meganeura::load::gguf::{self, ModelConfig};
 use meganeura::profiler::{CaptureOptions, capture_session_profile};
 use meganeura::tune::TuneOptions;
-use meganeura::{Graph, load_gguf};
+use meganeura::{Graph, Session, load_gguf};
+
+/// One decode step: a single real token at `position`, with the
+/// architecture's per-layer embedding rows gathered on the host.
+fn step(
+    session: &mut Session,
+    gguf: &gguf::GgufModel,
+    config: &ModelConfig,
+    token: u32,
+    position: u32,
+) {
+    session.set_input_u32("token_ids", &[token]);
+    session.set_input_u32("position", &[position]);
+    session.set_input_u32("valid", &[1]);
+    if config.architecture.uses_per_layer_embeddings() {
+        let ple = gguf::weights::gather_per_layer_embeddings(
+            gguf.tensors
+                .get("per_layer_token_embd.weight")
+                .expect("per-layer embedding table"),
+            config,
+            &[token],
+        )
+        .expect("per-layer embedding gather");
+        session.set_input("ple", &ple);
+    }
+    session.step();
+}
 
 fn main() {
     env_logger::init();
@@ -65,36 +91,29 @@ fn main() {
         eprintln!("{e}");
         std::process::exit(1);
     });
-    let config = Gemma4Config::from_gguf(&gguf).unwrap_or_else(|e| {
+    let config = ModelConfig::from_gguf(&gguf).unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(1);
     });
-    println!(
-        "gemma4: layers={} hidden={} vocab={} swa={} kv_from_start={} ple={}",
-        config.num_hidden_layers,
-        config.hidden_size,
-        config.vocab_size,
-        config.sliding_window,
-        config.n_kv_from_start,
-        config.n_embd_per_layer,
-    );
-
-    println!("building decode graph (ctx={max_seq})...");
-    let mut g = Graph::new();
-    let (logits, _k, _v) = gemma4::build_decode_graph(&mut g, &gguf, &config, max_seq)
-        .unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(1);
-        });
-    g.set_outputs(vec![logits]);
+    let mut graph = Graph::new();
+    let built = gguf::graph::build(&mut graph, &gguf, &config, 1, max_seq).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
 
     println!("compiling...");
     let mut session_config = meganeura::SessionConfig::inference_from_env();
     if f32_activations {
-        // Explicit code wins over the quantized-model default.
         session_config.options.quantized_activations = false;
     }
-    let mut session = meganeura::build(&g, session_config).0;
+    graph.set_outputs(built.outputs());
+    let (mut session, _) = meganeura::train::build(
+        &graph,
+        meganeura::train::SessionConfig {
+            mode: meganeura::train::Mode::Inference,
+            ..session_config
+        },
+    );
     session.set_submission_chunks(1);
     println!(
         "activations: {}",
@@ -113,10 +132,12 @@ fn main() {
     );
 
     println!("loading weights...");
-    gemma4::load_parameters(&mut session, &gguf).unwrap_or_else(|e| {
+    gguf::weights::load(&mut session, &gguf, &config).unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(1);
     });
+
+    let token = 2u32; // BOS
 
     if do_tune {
         let tune_secs: u64 = args
@@ -126,12 +147,14 @@ fn main() {
             .and_then(|s| s.parse().ok())
             .unwrap_or(90);
         println!("tune_with GEMV shapes (packed + RmsNorm-folded, {tune_secs}s budget)...");
-        let mut options = TuneOptions::default();
-        options.max_time = Duration::from_secs(tune_secs);
         // Vocab Q8 GEMV is ~0.4 GiB of packed B; the default 64 MiB scratch
         // would skip the kernel that dominates decode.
-        options.max_scratch_bytes = 512 * 1024 * 1024;
-        options.max_classes = 32;
+        let options = TuneOptions {
+            max_time: Duration::from_secs(tune_secs),
+            max_scratch_bytes: 512 * 1024 * 1024,
+            max_classes: 32,
+            ..Default::default()
+        };
         match session.tune_with(options) {
             Ok(report) => {
                 println!(
@@ -142,68 +165,27 @@ fn main() {
                     report.excluded_dispatches,
                     report.elapsed
                 );
-                let mut last = std::collections::BTreeMap::new();
-                for outcome in &report.outcomes {
-                    let c = &outcome.class;
-                    let key = (
-                        format!("{:?}", c.shader),
-                        c.m,
-                        c.n,
-                        c.k,
-                        c.gemv_rmsnorm,
-                        format!("{:?}", c.weight_format),
-                    );
-                    last.entry(key)
-                        .and_modify(|(_, selected)| *selected = outcome.selected)
-                        .or_insert((outcome, outcome.selected));
-                }
-                for (outcome, selected) in last.values() {
-                    let c = &outcome.class;
-                    let tag = if *selected != outcome.initial {
-                        "pin"
-                    } else {
-                        "keep"
-                    };
-                    println!(
-                        "  {tag} {:?} {}x{}x{} rms={} fmt={:?}  {:?} -> {:?}",
-                        c.shader,
-                        c.m,
-                        c.n,
-                        c.k,
-                        c.gemv_rmsnorm,
-                        c.weight_format,
-                        outcome.initial,
-                        selected
-                    );
-                }
             }
             Err(e) => eprintln!("tune skipped: {e}"),
         }
     }
 
-    let token = 2u32; // BOS
-    let (x, ple) = gemma4::gather_token(&gguf, &config, token).unwrap_or_else(|e| {
-        eprintln!("gather: {e}");
-        std::process::exit(1);
-    });
-    session.set_input("x", &x);
-    if let Some(ref ple_row) = ple {
-        session.set_input("ple", ple_row);
-    }
-    session.set_input_u32("kv_pos", &[8]);
-    session.set_input_u32("valid_len", &[1]);
-
     println!("warmup...");
     for _ in 0..3 {
-        session.step();
+        step(&mut session, &gguf, &config, token, 8);
     }
     session.wait();
 
     println!("timing {steps} decode steps...");
     let t0 = Instant::now();
     for i in 0..steps {
-        session.set_input_u32("kv_pos", &[(8 + i as u32) % max_seq as u32]);
-        session.step();
+        step(
+            &mut session,
+            &gguf,
+            &config,
+            token,
+            (8 + i as u32) % max_seq as u32,
+        );
     }
     session.wait();
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -225,12 +207,7 @@ fn main() {
     let profile = capture_session_profile(
         &mut session,
         |session| {
-            session.set_input("x", &x);
-            if let Some(ref ple) = ple {
-                session.set_input("ple", ple);
-            }
-            session.set_input_u32("kv_pos", &[8]);
-            session.set_input_u32("valid_len", &[1]);
+            step(session, &gguf, &config, token, 8);
         },
         CaptureOptions {
             samples: 3,
@@ -240,10 +217,7 @@ fn main() {
     )
     .expect("capture profile");
 
-    println!(
-        "\nprofile: {} dispatches, {} windows",
-        profile.plan.dispatch_count, profile.measurement.window_count
-    );
+    println!("\nprofile: {} dispatches", profile.plan.dispatch_count);
     println!("=== GPU time by kernel family ===");
     let mut families = profile.families.clone();
     families.sort_by(|a, b| {

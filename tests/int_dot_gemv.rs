@@ -417,7 +417,7 @@ fn element_weight(format: Format, packed: &[u8], at: usize, j: usize, e: usize) 
             let idx = e / 16;
             let b = idx % 4;
             let g = idx / 4;
-            let src = if g % 2 == 0 { b } else { 4 + b };
+            let src = if g.is_multiple_of(2) { b } else { 4 + b };
             let raw = packed[at + 96 + src];
             let nib = if g < 2 { raw & 0xF } else { raw >> 4 };
             let hi = (packed[at + 96 + 8 + b] >> (g * 2)) & 3;
@@ -577,7 +577,7 @@ fn q3k_weight_sum_with_unit_activation() {
     let scale_at = |i: usize| -> f32 {
         let b = i % 4;
         let g = i / 4;
-        let src = if g % 2 == 0 { b } else { 4 + b };
+        let src = if g.is_multiple_of(2) { b } else { 4 + b };
         let raw = byte_at(96 + src);
         let nib = if g < 2 { raw & 0xF } else { raw >> 4 };
         let hi = (byte_at(96 + 8 + b) >> (g * 2)) & 3;
@@ -845,6 +845,9 @@ fn q3k_sub_block_correction_matches_the_reference() {
     }
 }
 
+// The GGML reference comes from the loader itself, which lives behind the
+// `gguf` feature; CI runs the suite with --all-features.
+#[cfg(feature = "gguf")]
 #[test]
 fn host_dequant_matches_ggml() {
     use meganeura::load::gguf::{GgmlType, GgufTensor};

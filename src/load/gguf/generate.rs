@@ -107,6 +107,9 @@ pub struct Generator {
     /// Absent when [`GeneratorOptions::prefill_block`] is 1, in which case
     /// prompts go through the decode session a token at a time.
     prefill: Option<Session>,
+    /// The per-layer token-embedding table, kept for the per-step host
+    /// gather on architectures that carry one.
+    ple_table: Option<super::GgufTensor>,
     decode: Session,
     prefill_block: usize,
     built: graph::ModelGraph,
@@ -173,6 +176,20 @@ impl Generator {
         // usable through the token-level API — but keep *why* it has none,
         // so "no tokenizer" is not reported for a tokenizer this loader
         // simply does not implement.
+        let ple_table = if config.architecture.uses_per_layer_embeddings() {
+            Some(
+                model
+                    .tensors
+                    .get("per_layer_token_embd.weight")
+                    .ok_or_else(|| {
+                        GgufError::MissingTensor("per_layer_token_embd.weight".to_string())
+                    })?
+                    .clone(),
+            )
+        } else {
+            None
+        };
+
         let (vocab, vocab_error) = match Vocab::from_gguf(model) {
             Ok(vocab) => (Some(vocab), None),
             Err(e) => (None, Some(e.to_string())),
@@ -184,6 +201,7 @@ impl Generator {
             prefill_block,
             built,
             config,
+            ple_table,
             vocab,
             position: 0,
             history: Vec::new(),
@@ -310,11 +328,20 @@ impl Generator {
         } else {
             &mut self.decode
         };
+        // The graph has a fixed row count even when the final prefill chunk
+        // is short, so every input (including Gemma4's PLE rows) must cover
+        // the padded token batch.
+        let mut padded = vec![0u32; block];
+        padded[..tokens.len()].copy_from_slice(tokens);
+        if let Some(ref table) = self.ple_table {
+            let gathered =
+                super::weights::gather_per_layer_embeddings(table, &self.config, &padded)
+                    .expect("the per-layer embedding gather is in range");
+            session.set_input("ple", &gathered);
+        }
 
         // Slots past `valid` are never read, but they are still uploaded,
         // so they must at least be in range of the embedding table.
-        let mut padded = vec![0u32; block];
-        padded[..tokens.len()].copy_from_slice(tokens);
         session.set_input_u32("token_ids", &padded);
         session.set_input_u32("position", &[self.position as u32]);
         session.set_input_u32("valid", &[tokens.len() as u32]);
@@ -627,6 +654,7 @@ pub type Context = Arc<blade_graphics::Context>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::load::gguf::{ModelConfig, fixture};
 
     fn options() -> GenerationOptions {
         GenerationOptions::default()
@@ -645,6 +673,20 @@ mod tests {
             // Sampling must not consume randomness on the greedy path.
             assert_eq!(rng.0, Rng::new(0).0);
         }
+    }
+
+    #[test]
+    fn gemma4_prefill_gathers_ple_rows_for_the_padded_batch() {
+        let model = fixture::model("gemma4");
+        let config = ModelConfig::from_gguf(&model).unwrap();
+        let options = GeneratorOptions {
+            max_seq_len: 8,
+            prefill_block: 4,
+        };
+        let mut generator = Generator::with_config(&model, config, &options).unwrap();
+        let logits = generator.feed(&[3, 4, 5]).unwrap();
+        assert_eq!(logits.len(), generator.config.vocab_size);
+        assert_eq!(generator.position(), 3);
     }
 
     #[test]
