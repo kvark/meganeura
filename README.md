@@ -1,21 +1,17 @@
-# meganeura
-
 [![CI](https://github.com/kvark/meganeura/actions/workflows/ci.yml/badge.svg)](https://github.com/kvark/meganeura/actions/workflows/ci.yml)
 [![Docs](https://docs.rs/meganeura/badge.svg)](https://docs.rs/meganeura)
 [![Crates.io](https://img.shields.io/crates/v/meganeura.svg?label=meganeura)](https://crates.io/crates/meganeura)
 [![arXiv](https://img.shields.io/badge/arXiv-2608.01563-b31b1b.svg)](https://arxiv.org/abs/2608.01563)
 
-**Portable neural-network training and inference in Rust.** Meganeura uses
-Vulkan on Linux, Windows, and Android and Metal on Apple platforms. It does
-not require CUDA, ROCm, or Python at runtime.
+# meganeura
+
+**Portable neural-network training and inference in Rust.** Look, ma, no CUDA!
 
 [![logo](https://github.com/kvark/meganeura/raw/main/etc/logo.png)](/kvark/meganeura/blob/main/etc/logo.png)
 
-> **Status:** actively developed; APIs and benchmark methodology are still in
-> motion. Current workloads include SmolLM2, a SmolVLA action expert,
-> ResNet-50, the Whisper-tiny encoder, and a scaled, timestep- and
-> text-conditioned latent-diffusion U-Net. Issues and pull requests are
-> welcome.
+**Warning:** project is actively developed. Mostly optimization work, expanding the ops coverage, but with occasional fixes in correctness.
+
+## Example
 
 Define a graph, call `build_session`, train. Meganeura handles autodiff,
 graph rewrites, WGSL specialization, Naga parsing and validation, and GPU
@@ -45,47 +41,23 @@ trainer.train(&mut data, /* epochs = */ 10); // data loader: see examples/mnist.
 
 A two-layer MLP, trained end to end on the GPU, in one screen.
 
-For local iteration use `cargo test --lib` and
-`cargo test --test smoke -- --test-threads=1` (GPU). See
-[testing and coverage](docs/testing.md) and
-[debugging the stack](#debugging).
+For local iteration see [testing and coverage](docs/testing.md) and [debugging the stack](#debugging).
 
 ## Why Meganeura
-
-**Fast.** Meganeura is competitive with vendor-native ML stacks on selected
-workloads while retaining one Vulkan/Metal implementation. Results vary
-substantially by model, device, precision policy, and driver. The historical
-[Inferena](https://inferena.tech) tables are useful exploratory data, but they
-predate the audited paper protocol and should not be treated as
-publication-grade comparisons. The new protocol reports raw samples, uses
-matched workloads and full forward-plus-backward timing, and separates strict
-f32 from reduced-input accelerated modes.
-
-In the frozen paper matrix, PyTorch CUDA leads several RTX 5070 workloads,
-especially training.
-Meganeura's strongest result is therefore not universal speed superiority; it
-is how much of that performance can be reached through a portable execution
-stack that also runs on AMD, Intel, and Apple GPUs.
 
 **Portable.** GPU access is provided by
 [blade-graphics](https://github.com/kvark/blade/tree/main/blade-graphics):
 Vulkan on Linux, Windows, and Android, and Metal on Apple platforms. Mesa's
-Lavapipe provides a software Vulkan target for headless CI. The compute stack
-does not require CUDA or ROCm, although performance and feature availability
-still depend on each vendor's driver.
+Lavapipe provides a software Vulkan target for headless CI. Doesn't need any runtime.
 
-**Composable.** A small set of
-[kernel archetypes](https://github.com/kvark/meganeura/blob/main/docs/kernel-archetypes.md)
-— pointwise, reduction, matmul, convolution, and attention — compose into
-specialized GPU shaders at compile time. The rewrite set recognizes
-equivalent fused forms (for example, `x * sigmoid(x)` → SiLU and
-`SiLU(gate) * up` → SwiGLU).
-It can run either as a deterministic greedy pass or through equality
-saturation with a traffic-aware extraction cost. Current ablations find the
-same selected graph for the benchmark rewrite set, so equality saturation is
-research infrastructure rather than a claimed source of runtime speedup.
-Consolidating the remaining hand-written WGSL variants into parameterized
-generators is active work.
+**Lean.** Around 50K LOC of Rust+WGSL code in this repository.
+Automatic shader composition based on kernel archetypes: pointwise, reduction, matmul, convolution, attention.
+May produce a single 12Mb self-contained binary for deployment.
+
+**Fast.** Meganeura is pretty fast.
+It tries to be competitive with vendor-native ML stacks but lands at around 0.5x of their performance today.
+Your results may very by model, device, precision policy, and the driver.
+See [Inferena](https://inferena.tech) tables to get an idea.
 
 ## How it compares
 
@@ -96,14 +68,9 @@ generators is active work.
 |[Burn](https://github.com/tracel-ai/burn)        |CubeCL: CUDA, ROCm, Metal, Vulkan, WebGPU; CPU paths |yes |modular backends, JIT fusion      |
 |[tch-rs](https://github.com/LaurentMazare/tch-rs)|CUDA, CPU (via libtorch)            |yes           |PyTorch FFI bindings                    |
 
-Meganeura's wedge is a uniform graph, autodiff, compiler, and runtime stack for
+Meganeura's strong sides are uniform graph, autodiff, compiler, and runtime stack for
 both training and inference across desktop and edge-class Vulkan/Metal
 devices.
-
-The [September audit](docs/audit-2026-09.md) separates current implementation
-status from the frozen results; the [roadmap](docs/roadmap.md) records
-engineering priorities and the [experiments](docs/experiments.md) record
-measured outcomes.
 
 ## Install
 
@@ -111,19 +78,14 @@ measured outcomes.
 cargo add meganeura
 ```
 
-Version 0.3 currently pins Blade commit `f6f2729` for calibrated GPU timings and
-uses Naga 30 with Rust 1.92 or newer.
 See the [changelog](CHANGELOG.md) for API and feature changes from 0.2.
 CI assembles the packaged crate; full registry verification waits on a Blade
 release that includes this timing API.
 
-Hub downloads (`SafeTensorsModel::download`) need the optional `hf-hub` feature:
-
-```
-cargo add meganeura --features hf-hub
-```
-
-Embedded targets should load weights with `SafeTensorsModel::from_bytes` or `SafeTensorsModel::load` instead.
+Features:
+- "hf-hub" to enable HuggingFace downloads
+- "models" for built-in models: SmolLM2, SmolVLA, SD_Unet, ResNet, Whisper
+- "gguf" for [GGUF](https://huggingface.co/docs/hub/en/gguf) format loading of weights and graphs
 
 Worked examples live in [`examples/`](https://github.com/kvark/meganeura/tree/main/examples):
 
@@ -138,7 +100,8 @@ See the [checkpoint implementation](src/runtime/checkpoint.rs) for format
 compatibility and restore checks. Resident buffer counts do not measure
 driver peak memory.
 
-Pretrained models can be loaded from ONNX or NNEF via `meganeura::load_onnx(...)` / `meganeura::load_nnef(...)`. Both lower through Meganeura’s IR, so the same graph rewrites apply to imported graphs and hand-built ones.
+Pretrained models can be loaded from ONNX or NNEF via `meganeura::load_onnx(...)` / `meganeura::load_nnef(...)`.
+Both lower through Meganeura’s IR, so the same graph rewrites apply to imported graphs and hand-built ones.
 
 A GGUF file needs nothing alongside it. It carries no graph, but it carries a
 description — an architecture name and a set of dimensions — and
@@ -152,37 +115,6 @@ let model = load_gguf(std::path::Path::new("model.gguf"))?;
 let mut generator = model.generator(2048)?;
 println!("{}", generator.generate("The meaning of life is", &GenerationOptions::default())?);
 ```
-
-Nothing there names an architecture or a dimension; see
-`examples/gguf_generate.rs`. The llama, Qwen2/3 and Gemma families are
-built generically from `{arch}.*` metadata, and an architecture whose graph
-cannot be expressed exactly is refused by name rather than approximated —
-so a stock Gemma2 GGUF (attention logit softcapping) and Phi2 (RoPE over
-part of the head) are among those this loader rejects.
-The layers below are usable on their own: `arch` for the description,
-`graph` for the graph, `weights` to fill a session, `vocab` for the
-tokenizer, and `load_gguf(...)` for the raw tensor inventory
-(`examples/gguf_info.rs`). All of this is behind the `gguf` cargo
-feature (like the `models` feature for `src/models`, nothing is on by
-default); the loader pulls no external dependency of its own.
-
-GGUF quantized weights are imported without a requantize. `Q4_0` and the
-K-quants — `Q4_K`, `Q5_K`, `Q6_K` and `Q3_K` — are stored byte-for-byte as
-GGML writes them and decoded in the shaders, so the weights of a `Q4_0`,
-`Q3_K_M`, `Q4_K_M` or `Q5_K_M` file load as-is. `Q4_1` and `Q8_0` are
-repacked into Meganeura's own block layout on the host instead, since
-Meganeura's Q4 and Q8 are those same shapes. The natively stored formats are
-load-only: no encoder for them is implemented here, so `set_parameter`
-rejects them and points at `set_parameter_packed`.
-
-`CompileOptions::quantized_activations` additionally quantizes the GEMV
-activation row to Q8_1 and runs the inner product on integer dot products
-against a `Q4_0` weight, following llama.cpp's `vec_dot_q4_0_q8_1`. It is off
-by default and is the only kernel switch here that changes results rather
-than the route to them, so it is never selected by measurement. Metal uses
-the packed integer-dot intrinsic; Vulkan uses an exact scalar expansion until
-Blade exposes `shaderIntegerDotProduct`. `Q2_K` and `Q8_K` are listed in the
-inventory but not read, and quantized embedding tables have no gather variant.
 
 ## System requirements
 
@@ -202,23 +134,9 @@ device ID (on Vulkan this is normally the PCI device ID, not an adapter ordinal)
 MEGANEURA_DEVICE_ID=0x744c cargo run --release --example mnist
 ```
 
-Decimal IDs are accepted too.
-
 ## Environment variables
 
-The library core never reads the environment: `compile`, `runtime`,
-`codegen`, and `optimize` accept strongly typed options only. Env-driven
-behavior is an explicit client opt-in through the `from_env` constructors
-in `meganeura::config` — `SessionConfig::from_env()` is the one-liner
-that resolves everything below (the repo's own examples, benches, and
-tests use it; embedders that want a hermetic library simply never call
-it). Every `MEGANEURA_*` variable is declared in
-`meganeura::config::REGISTRY` (a test pins this table against it).
-Semantics are uniform: boolean variables treat unset as their default,
-`0` as off, and anything else as on; `from_env` logs the active
-overrides, and unrecognized `MEGANEURA_*` names produce a warning
-instead of silently doing nothing. Fields assigned after `from_env`
-win, so explicit code always has the last word.
+All of the environment variables are resolved in `SessionConfig::from_env()` and never visible to the core modules directly.
 
 | Variable | Effect |
 |---|---|
@@ -250,24 +168,7 @@ win, so explicit code always has the last word.
 | `MEGANEURA_GPU_TIMING` | Enable hardware timestamp pools (set before context creation). |
 | `MEGANEURA_GPU_CAPTURE` | Enable Blade's native-tool labels and shader debug information before context creation; independent of GPU timing. |
 
-`Session::tune_with(TuneOptions)` searches 32/64 scalar and legal native-f32
-cooperative tiles for exact dense matmul classes, and workgroup width and
-cross-lane reduction for K-split GEMV classes; it qualifies nonzero scratch
-outputs, interleaves measurements, and returns raw samples and decisions. It
-never runs the live graph or advances optimizer/KV state. Default-off: scalar
-GPU qualification passed on RTX 5070; native-f32 hardware coverage and
-automatic whole-step confirmation remain due. The GEMV axis is the one that
-covers reduced-storage weights, since a width or reduction choice leaves the
-packed decoder untouched; f16-input tiles, complex fusion and persistent
-winners are not included.
-Reports separate qualification's CPU preparation/copies/checks from
-transfer/dispatch/wait costs. Private tuning staging defaults to read-optimized
-Download; `TuneOptions::staging = TuneStaging::Shared` retains the original
-policy. Neither setting changes candidate bindings or numerical validation.
-One exact-size staging buffer is reused within a tuning call and released on
-size changes or return. `TuneOptions::staging_reuse = TuneStagingReuse::Fresh`
-disables reuse; reports include preparation, cleanup and scratch byte accounting.
-See the [tuning API](src/tune.rs) and
+`Session::tune_with(TuneOptions)` enables auto-tuning across multiple dimensions. See the [tuning API](src/tune.rs) and
 [whole-step experiment](examples/tune_session.rs).
 
 ## Debugging
@@ -294,12 +195,6 @@ Three levels, cheapest first:
   *still building*, one `eval(&g, node)` at a time, on the same kernels the
   compiled path uses — the PyTorch-style inspect-as-you-go loop. The same
   graph then compiles unchanged via `build_session` for training speed.
-
-Hosted CI executes Linux Vulkan (Lavapipe) and macOS Metal tests and compile-checks
-Windows. Generated Vulkan shaders, including the f16 cooperative-matrix path used
-on supported NVIDIA and AMD adapters, are also validated and translated to SPIR-V
-offline. Real AMD and NVIDIA hardware testing remains part of release
-qualification because software drivers cannot reproduce vendor-driver behavior.
 
 ## Profiling
 
@@ -331,7 +226,3 @@ Open the trace in [Perfetto](https://ui.perfetto.dev):
 Machine-readable author and project metadata is available in
 [`CITATION.cff`](https://github.com/kvark/meganeura/blob/main/CITATION.cff).
 The paper citation and archival identifier will be added after publication.
-
-## Contributing
-
-Early project, small API surface, small community — a good time to show up. Open an issue before starting anything sizeable so we can align on direction.

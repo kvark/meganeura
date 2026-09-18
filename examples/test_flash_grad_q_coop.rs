@@ -52,8 +52,8 @@ fn main() {
         eprintln!("\n=== {label} ===");
 
         // Force scalar FORWARD in both runs so the only difference is
-        // the backward kernel — otherwise the install_auto_tune from
-        // the first iteration leaves coop forward on, and the test
+        // the backward kernel — otherwise a coop-capable session from
+        // an earlier iteration leaves coop forward on, and the test
         // compares (scalar+scalar) vs (coop+coop) which conflates
         // forward and backward errors.
         unsafe {

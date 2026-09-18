@@ -263,7 +263,10 @@ fn cpu_both_tile_sizes_generate_valid_f32_shaders() {
         ShaderGroup::MatMulAT,
         ShaderGroup::MatMulBT,
     ] {
-        for module in [generate_module(group), generate_module_small(group)] {
+        for module in [
+            generate_module(group, meganeura::codegen::MatmulKnobs::default()),
+            generate_module_small(group, meganeura::codegen::MatmulKnobs::default()),
+        ] {
             assert!(!module.source.contains('$'));
             assert!(!module.source.contains("enable f16"));
             let info = naga::valid::Validator::new(

@@ -1211,16 +1211,16 @@ pub fn compile(graph: &Graph) -> ExecutionPlan {
 }
 
 pub fn compile_with(graph: &Graph, options: &CompileOptions) -> ExecutionPlan {
-    compile_with_caps(graph, options, crate::codegen::coop_caps())
+    // No coop capability — callers that know the target hardware go
+    // through the capabilities-taking paths below.
+    compile_with_caps(graph, options, crate::codegen::CoopCaps::default())
 }
 
 /// Compile for a concrete cooperative-matrix capability set.
 ///
 /// `build()` uses this path after probing the context it will attach to the
 /// session. Keeping the target explicit avoids a process-global "first GPU
-/// wins" decision when an application owns multiple adapters. The public
-/// [`compile_with`] entry point retains the installed global capabilities for
-/// callers that intentionally compile a plan before constructing a session.
+/// wins" decision when an application owns multiple adapters.
 pub(crate) fn compile_with_caps(
     graph: &Graph,
     options: &CompileOptions,

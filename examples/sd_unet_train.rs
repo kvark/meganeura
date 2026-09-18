@@ -12,7 +12,7 @@ use meganeura::Graph;
 ///
 /// This is structurally equivalent to the Stable Diffusion 1.5 U-Net, scaled
 /// down to fit in GPU memory and run quickly for benchmarking.
-use meganeura::models::sd_unet::{self, Config};
+use meganeura::models::sd_unet;
 use std::time::Instant;
 
 fn main() {
@@ -25,9 +25,9 @@ fn main() {
 
     let use_small = std::env::args().any(|a| a == "--small");
     let cfg = if use_small {
-        Config::small()
+        sd_unet::Config::small()
     } else {
-        Config::tiny()
+        sd_unet::Config::tiny()
     };
 
     let batch = cfg.batch_size;

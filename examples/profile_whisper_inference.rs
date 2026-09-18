@@ -8,10 +8,7 @@
 //! Usage:
 //!   MEGANEURA_DEVICE_ID=<id> cargo run --release --example profile_whisper_inference
 
-use meganeura::{
-    Graph,
-    models::whisper::{self, Config},
-};
+use meganeura::{Graph, models::whisper};
 
 fn main() {
     env_logger::init();
@@ -22,10 +19,9 @@ fn main() {
     let gpu = meganeura::init_gpu_context_with(meganeura::GpuOptions::from_env()).expect("gpu");
     let result = meganeura::runtime::auto_tune(&gpu, 64);
     eprintln!("coop_matrix_available={}", result.coop_caps.is_supported());
-    meganeura::runtime::install_auto_tune(result);
     drop(gpu);
 
-    let config = Config::whisper_tiny();
+    let config = whisper::Config::whisper_tiny();
     let batch = 1u32;
     let mel_len = 3000u32;
     let seq_len = ((mel_len + 2 - 3) / 2 + 1) as usize;

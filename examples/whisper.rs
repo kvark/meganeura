@@ -5,18 +5,14 @@
 ///
 /// Usage:
 ///   cargo run --release --example whisper
-use meganeura::{
-    Graph,
-    data::safetensors::SafeTensorsModel,
-    models::whisper::{self, Config},
-};
+use meganeura::{Graph, data::safetensors::SafeTensorsModel, models::whisper};
 
 const REPO_ID: &str = "openai/whisper-tiny";
 
 fn main() {
     env_logger::init();
 
-    let config = Config::whisper_tiny();
+    let config = whisper::Config::whisper_tiny();
     let batch = 1u32;
     let mel_len = 3000u32; // 30 seconds of audio
 

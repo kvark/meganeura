@@ -43,7 +43,10 @@ impl Pipelines {
             return Ok(());
         }
         let selected_entry = tile.shader(&dispatch.shader);
-        let module = tile_module(dispatch, tile);
+        let module = tile_module(dispatch, tile, self.matmul_knobs);
+        if let Some(dir) = self.dump_dir.as_deref() {
+            module.dump(dir);
+        }
         let shader = gpu
             .try_create_shader(bg::ShaderDesc {
                 source: &module.source,
@@ -85,7 +88,11 @@ impl Pipelines {
     }
 }
 
-fn tile_module(dispatch: &Dispatch, tile: MatmulTile) -> crate::codegen::ShaderModule {
+fn tile_module(
+    dispatch: &Dispatch,
+    tile: MatmulTile,
+    knobs: crate::codegen::MatmulKnobs,
+) -> crate::codegen::ShaderModule {
     let entry = &dispatch.shader;
     if let MatmulTile::Gemv(shape) = tile {
         // The int-dot kernel is a different computation, not a different
@@ -108,11 +115,13 @@ fn tile_module(dispatch: &Dispatch, tile: MatmulTile) -> crate::codegen::ShaderM
         );
     }
     if selected_entry != *entry {
-        crate::codegen::generate_module(selected_entry.shader_group())
+        crate::codegen::generate_module(selected_entry.shader_group(), knobs)
     } else {
         match tile {
-            MatmulTile::Tile32 => crate::codegen::generate_module_small(entry.shader_group()),
-            MatmulTile::Tile64 => crate::codegen::generate_module(entry.shader_group()),
+            MatmulTile::Tile32 => {
+                crate::codegen::generate_module_small(entry.shader_group(), knobs)
+            }
+            MatmulTile::Tile64 => crate::codegen::generate_module(entry.shader_group(), knobs),
             MatmulTile::CooperativeF32 { .. } => crate::codegen::generate_module_coop(
                 entry.shader_group(),
                 &tile.coop_config().expect("cooperative candidate"),
@@ -1463,9 +1472,13 @@ mod tests {
             Variant::GemvIntDot(_, selected) if selected == shape
         ));
         assert!(
-            tile_module(&dispatch, MatmulTile::Gemv(shape))
-                .source
-                .contains("dot_q4_q8_packed")
+            tile_module(
+                &dispatch,
+                MatmulTile::Gemv(shape),
+                crate::codegen::MatmulKnobs::default()
+            )
+            .source
+            .contains("dot_q4_q8_packed")
         );
 
         let ordinary = Dispatch {
@@ -2239,7 +2252,8 @@ mod tests {
                         Variant::Scalar(tile.shader(&entry))
                     );
                 }
-                let mut module = tile_module(&dispatch, tile);
+                let mut module =
+                    tile_module(&dispatch, tile, crate::codegen::MatmulKnobs::default());
                 // Blade assigns resource bindings by ShaderData field name.
                 // Assign distinct test bindings before full offline validation.
                 for (index, (_, var)) in module.module.global_variables.iter_mut().enumerate() {

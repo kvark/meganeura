@@ -9,11 +9,7 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
-use meganeura::{
-    Graph,
-    data::safetensors::SafeTensorsModel,
-    models::smolvla::{self, Config},
-};
+use meganeura::{Graph, data::safetensors::SafeTensorsModel, models::smolvla};
 
 /// Check that the system is in a good state for reliable benchmarking.
 ///
@@ -209,7 +205,7 @@ fn main() {
     eprintln!("checking preconditions...");
     check_bench_preconditions(!force);
 
-    let config = Config::smolvla_base();
+    let config = smolvla::Config::smolvla_base();
     let action_seq_len = config.chunk_size; // 50
     let vlm_seq_len = 16; // representative VLM context length
     let denoise_steps = if num_steps > 0 {

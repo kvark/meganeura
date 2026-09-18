@@ -44,7 +44,7 @@ use std::borrow::Cow;
 use crate::Session;
 
 use super::arch::ModelConfig;
-use super::graph::{self, ModelGraph, Source};
+use super::graph;
 use super::{GgufError, GgufModel, GgufTensor};
 
 /// What a load actually did, for callers that want to report it.
@@ -138,7 +138,7 @@ fn resolve<'a>(
 fn rows_of(
     tensor: &GgufTensor,
     rows: std::ops::Range<usize>,
-    source: &Source,
+    source: &graph::Source,
 ) -> Result<GgufTensor, GgufError> {
     let stride = row_bytes(tensor)?;
     let total = tensor.dims.get(1).copied().unwrap_or(1);
@@ -302,12 +302,12 @@ fn expect_len(name: &str, got: usize, want: usize) -> Result<(), GgufError> {
 /// current prefix are never consulted — but a cache carried across a
 /// *shorter* prompt would otherwise leave the tail of a previous
 /// conversation attendable.
-pub fn reset_caches(session: &mut Session, built: &ModelGraph, config: &ModelConfig) {
+pub fn reset_caches(session: &mut Session, built: &graph::ModelGraph, config: &ModelConfig) {
     let zeros = vec![0.0f32; built.max_seq_len * config.kv_dim()];
     for layer in 0..config.num_layers {
         for name in [
-            ModelGraph::k_cache_name(layer),
-            ModelGraph::v_cache_name(layer),
+            graph::ModelGraph::k_cache_name(layer),
+            graph::ModelGraph::v_cache_name(layer),
         ] {
             if session.has_parameter(&name) {
                 session.set_parameter(&name, &zeros);

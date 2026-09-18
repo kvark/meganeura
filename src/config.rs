@@ -189,7 +189,7 @@ registry! {
         "EPT cap for the fused flash dK/dV backward kernel.";
     FLASH_BWD_EPT_CAP: "MEGANEURA_FLASH_BWD_EPT_CAP", U32, Tuning,
         "Shared fallback EPT cap for both flash backward kernels.";
-    MATMUL_K_STAGE: "MEGANEURA_MATMUL_K_STAGE", Text, Tuning,
+    MATMUL_K_STAGE: "MEGANEURA_MATMUL_K_STAGE", U32, Tuning,
         "K staging depth of the scalar tiled matmul: 8 | 16 | 32 (default 32).";
     INTERLEAVE_COLUMNS: "MEGANEURA_INTERLEAVE_COLUMNS", Bool, Tuning,
         "Stagger scalar-matmul B loads across columns (16 lanes apart) instead of \
@@ -277,7 +277,7 @@ impl TuningKnobs {
         let d = Self::default();
         let bwd = cap(&FLASH_BWD_EPT_CAP);
         let fwd = cap(&FLASH_EPT_CAP);
-        let mut knobs = Self {
+        Self {
             flash_ept_cap: fwd.unwrap_or(d.flash_ept_cap),
             flash_grad_q_ept_cap: cap(&FLASH_GRAD_Q_EPT_CAP)
                 .or(bwd)
@@ -287,25 +287,18 @@ impl TuningKnobs {
                 .or(bwd)
                 .or(fwd)
                 .unwrap_or(d.flash_grad_kv_ept_cap),
-            ..Self::default()
-        };
-        // The scalar matmul is codegen'd from these; the resolver installs
-        // them process-wide the same way `set_wgsl_dump_dir` and the coop
-        // caps travel. Must be a valid staging depth or the plain default.
-        if let Some(value) = MATMUL_K_STAGE.text() {
-            match value.as_str().parse::<u32>() {
-                Ok(stage @ (8 | 16 | 32)) => knobs.matmul_k_stage = stage,
-                _ => log::warn!(
-                    "MEGANEURA_MATMUL_K_STAGE must be 8, 16 or 32; using the plain-kernel default"
-                ),
-            }
+            matmul_k_stage: MATMUL_K_STAGE
+                .u32_value()
+                .filter(|v| {
+                    let ok = matches!(v, 8 | 16 | 32);
+                    if !ok {
+                        log::warn!("MEGANEURA_MATMUL_K_STAGE must be 8, 16 or 32; ignoring");
+                    }
+                    ok
+                })
+                .unwrap_or(d.matmul_k_stage),
+            matmul_interleave_columns: INTERLEAVE_COLUMNS.bool_or(false),
         }
-        knobs.matmul_interleave_columns = INTERLEAVE_COLUMNS.bool_or(false);
-        crate::codegen::set_matmul_knobs(crate::codegen::MatmulKnobs {
-            k_stage: knobs.matmul_k_stage,
-            interleave_columns: knobs.matmul_interleave_columns,
-        });
-        knobs
     }
 }
 
@@ -358,6 +351,7 @@ impl SessionOptions {
                     None
                 }
             },
+            wgsl_dump_dir: DUMP_WGSL.text(),
         }
     }
 }
@@ -387,9 +381,6 @@ impl GpuOptions {
 impl SessionConfig<'_> {
     fn from_env_with_gpu(gpu: Option<std::sync::Arc<blade_graphics::Context>>) -> Self {
         log_overrides();
-        if let Some(dir) = DUMP_WGSL.text() {
-            crate::codegen::set_wgsl_dump_dir(dir);
-        }
         Self {
             gpu,
             options: CompileOptions::from_env(),
@@ -405,8 +396,8 @@ impl SessionConfig<'_> {
     /// compile options, tuning knobs, optimizer mode, diagnostic switches,
     /// coop policy, `MEGANEURA_TUNE`, and a GPU context when device selection,
     /// `MEGANEURA_GPU_TIMING` or `MEGANEURA_GPU_CAPTURE` is enabled.
-    /// Also installs the WGSL dump directory when
-    /// `MEGANEURA_DUMP_WGSL` is set.
+    /// `MEGANEURA_DUMP_WGSL` resolves into
+    /// [`SessionOptions::wgsl_dump_dir`].
     ///
     /// Fields assigned *after* this call win — precedence is simply
     /// "explicit code runs last".

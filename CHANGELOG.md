@@ -1,5 +1,17 @@
 # Unreleased
 
+- The codegen debug hooks are parameters, not process state. WGSL dumping
+  resolved `MEGANEURA_DUMP_WGSL` into a `SessionOptions::wgsl_dump_dir`
+  that each session's pipeline layer owns; every module it compiles (the
+  standard, coop, weighted, epilogue-fused and scheduled forms, plus the
+  tuner's candidates) is written there, each file naming the shader and a
+  content hash. The matmul knobs (`MEGANEURA_MATMUL_K_STAGE`,
+  `MEGANEURA_INTERLEAVE_COLUMNS`) ride `TuningKnobs` into the plan the
+  same way the flash caps do. The profiler state is armed once — by
+  `init` or by GPU-context initialization — instead of being lazily
+  conjured on first use, and `default_gpu_context` returns a fresh
+  context per call rather than a hidden process-global first-device
+  cache.
 - The environment is resolved once: `src/config.rs` is the only place that
   reads `MEGANEURA_*` variables, and its product is configuration — it no
   longer modifies the process environment. The one boolean decoding rule

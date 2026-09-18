@@ -6,11 +6,7 @@
 //!
 //! Run: cargo test --test smollm2_correctness -- --ignored
 
-use meganeura::{
-    Graph,
-    data::safetensors::SafeTensorsModel,
-    models::smollm2::{self, Config},
-};
+use meganeura::{Graph, data::safetensors::SafeTensorsModel, models::smollm2};
 use std::collections::HashSet;
 
 /// Reference values from PyTorch (HuggingFace transformers) with SmolLM2-135M.
@@ -21,7 +17,11 @@ const VOCAB_SIZE: usize = 49152;
 /// Greedy argmax at each position from PyTorch.
 const REF_GREEDY: &[u32] = &[808, 282, 260, 314, 288];
 
-fn load_weights(session: &mut meganeura::Session, model: &SafeTensorsModel, config: &Config) {
+fn load_weights(
+    session: &mut meganeura::Session,
+    model: &SafeTensorsModel,
+    config: &smollm2::Config,
+) {
     let transposed = smollm2::transposed_weight_names(config);
     let transposed_set: HashSet<&str> = transposed.iter().map(|s| s.as_str()).collect();
 
@@ -111,7 +111,7 @@ fn smollm2_logits_match_pytorch() {
         .collect();
     assert_eq!(ref_logits.len(), SEQ_LEN * VOCAB_SIZE);
 
-    let config = Config::smollm2_135m();
+    let config = smollm2::Config::smollm2_135m();
     let mut g = Graph::new();
     let logits = smollm2::build_graph(&mut g, &config, SEQ_LEN);
     g.set_outputs(vec![logits]);

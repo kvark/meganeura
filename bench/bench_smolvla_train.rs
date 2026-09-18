@@ -10,10 +10,7 @@
 ///   cargo run --release --example bench_smolvla_train [-- --warmup 3 --runs 5]
 use std::time::Instant;
 
-use meganeura::{
-    compile_training_graph,
-    models::smolvla::{self, Config},
-};
+use meganeura::{compile_training_graph, models::smolvla};
 
 fn check_bench_preconditions(abort_on_warn: bool) {
     #[cfg(not(target_os = "linux"))]
@@ -132,7 +129,7 @@ fn main() {
     eprintln!("checking preconditions...");
     check_bench_preconditions(!force);
 
-    let mut config = Config::smolvla_base();
+    let mut config = smolvla::Config::smolvla_base();
     if let Some(cs) = chunk_override {
         config.chunk_size = cs;
     }

@@ -5,11 +5,7 @@
 ///
 /// Usage:
 ///   cargo run --release --example smollm2 [-- "Your prompt here"]
-use meganeura::{
-    Graph,
-    data::safetensors::SafeTensorsModel,
-    models::smollm2::{self, Config},
-};
+use meganeura::{Graph, data::safetensors::SafeTensorsModel, models::smollm2};
 
 const REPO_ID: &str = "HuggingFaceTB/SmolLM2-135M";
 
@@ -27,7 +23,7 @@ fn main() {
         .unwrap_or_else(|| "The meaning of life is".to_string());
     let max_new_tokens = 32;
 
-    let config = Config::smollm2_135m();
+    let config = smollm2::Config::smollm2_135m();
 
     // --- Download model and tokenizer ---
     println!("downloading {} from HuggingFace Hub...", REPO_ID);

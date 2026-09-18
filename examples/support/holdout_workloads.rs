@@ -94,8 +94,8 @@ pub fn cases() -> Vec<Case> {
         });
     }
     for work in [Work::Inference, Work::Adam] {
-        use meganeura::models::smollm2::{self, Config};
-        let config = Config::medium_test();
+        use meganeura::models::smollm2;
+        let config = smollm2::Config::medium_test();
         let seq = 127;
         let graph = if work == Work::Adam {
             smollm2::build_training_graph(&config, seq)
@@ -114,7 +114,7 @@ pub fn cases() -> Vec<Case> {
         }
         cases.push(Case {
             name: if work == Work::Inference { "smollm2-inference" } else { "smollm2-adam" },
-            description: json!({"builder": "Config::medium_test", "sequence": seq, "layers": config.num_hidden_layers, "hidden": config.hidden_size, "ffn": config.intermediate_size, "heads": config.num_attention_heads, "kv_heads": config.num_key_value_heads, "vocabulary": config.vocab_size, "kv_cache": false}),
+            description: json!({"builder": "smollm2::Config::medium_test", "sequence": seq, "layers": config.num_hidden_layers, "hidden": config.hidden_size, "ffn": config.intermediate_size, "heads": config.num_attention_heads, "kv_heads": config.num_key_value_heads, "vocabulary": config.vocab_size, "kv_cache": false}),
             work,
             graph,
             inputs,
@@ -124,7 +124,7 @@ pub fn cases() -> Vec<Case> {
     let config = meganeura::models::whisper::Config::whisper_tiny();
     cases.push(Case {
         name: "whisper-sgd",
-        description: json!({"builder": "Config::whisper_tiny encoder", "batch": 1, "mel_frames": 100, "hidden": config.d_model, "layers": config.n_layers, "loss": "mean squared encoder output"}),
+        description: json!({"builder": "smollm2::Config::whisper_tiny encoder", "batch": 1, "mel_frames": 100, "hidden": config.d_model, "layers": config.n_layers, "loss": "mean squared encoder output"}),
         work: Work::Sgd,
         graph: meganeura::models::whisper::build_training_graph(&config, 1, 100),
         inputs: vec![Input::F32("mel", data(config.n_mels * 100, 1, 2.0))],

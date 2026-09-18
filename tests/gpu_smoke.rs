@@ -2,10 +2,7 @@
 /// and that a simple forward pass executes without errors.
 use meganeura::{Graph, build_session, compile::BufferRef};
 #[cfg(feature = "models")]
-use meganeura::{
-    build_session_unoptimized,
-    models::smolvla::{self, Config},
-};
+use meganeura::{build_session_unoptimized, models::smolvla};
 
 /// Noise-aware relative error for finite-difference gradient checks.
 ///
@@ -370,7 +367,7 @@ fn smolvla_training_backprop_smoke() {
     }
     // Smoke test: SmolVLA action expert training graph compiles, runs,
     // and decreases loss over 5 gradient steps.
-    let config = Config::small_test();
+    let config = smolvla::Config::small_test();
     let action_seq_len = config.chunk_size; // 4
     let vlm_seq_len = 4;
 
@@ -695,8 +692,8 @@ fn run_smollm2_gradient_check(
 #[test]
 #[cfg(feature = "models")]
 fn smollm2_ffn_gradients_nonzero() {
-    use meganeura::models::smollm2::Config;
-    let config = Config::small_test();
+    use meganeura::models::smollm2;
+    let config = smollm2::Config::small_test();
     let (total, zeros) = run_smollm2_gradient_check(&config, build_session);
     eprintln!("optimized: {total} params, {} zero", zeros.len());
     assert!(
@@ -709,8 +706,8 @@ fn smollm2_ffn_gradients_nonzero() {
 #[test]
 #[cfg(feature = "models")]
 fn smollm2_ffn_gradients_unoptimized() {
-    use meganeura::models::smollm2::Config;
-    let config = Config::small_test();
+    use meganeura::models::smollm2;
+    let config = smollm2::Config::small_test();
     let (total, zeros) = run_smollm2_gradient_check(&config, build_session_unoptimized);
     eprintln!("unoptimized: {total} params, {} zero", zeros.len());
     assert!(
@@ -724,8 +721,8 @@ fn smollm2_ffn_gradients_unoptimized() {
 #[cfg(feature = "models")]
 #[ignore] // ~22 min in debug mode; run with --release --ignored
 fn smollm2_medium_ffn_gradients_optimized() {
-    use meganeura::models::smollm2::Config;
-    let config = Config::medium_test();
+    use meganeura::models::smollm2;
+    let config = smollm2::Config::medium_test();
     let (total, zeros) = run_smollm2_gradient_check(&config, build_session);
     eprintln!("medium optimized: {total} params, {} zero", zeros.len());
     assert!(
@@ -739,8 +736,8 @@ fn smollm2_medium_ffn_gradients_optimized() {
 #[cfg(feature = "models")]
 #[ignore] // ~22 min in debug mode; run with --release --ignored
 fn smollm2_medium_ffn_gradients_unoptimized() {
-    use meganeura::models::smollm2::Config;
-    let config = Config::medium_test();
+    use meganeura::models::smollm2;
+    let config = smollm2::Config::medium_test();
     let (total, zeros) = run_smollm2_gradient_check(&config, build_session_unoptimized);
     eprintln!("medium unoptimized: {total} params, {} zero", zeros.len());
     assert!(
@@ -759,14 +756,14 @@ fn smollm2_e2e_gradient_finite_diff() {
         eprintln!("MEGANEURA_SKIP_BACKPROP set — skipping SmolLM2 e2e gradient check");
         return;
     }
-    use meganeura::models::smollm2::Config;
+    use meganeura::models::smollm2;
 
     let num_layers = std::env::var("SMOLLM2_LAYERS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
     let tie = std::env::var("TIE_WEIGHTS").unwrap_or_default() != "0";
-    let config = Config {
+    let config = smollm2::Config {
         vocab_size: 256,
         hidden_size: 576,
         num_hidden_layers: num_layers,
@@ -3292,9 +3289,9 @@ fn q4_matmul_single_row_matches_reference() {
 #[test]
 #[cfg(feature = "models")]
 fn smollm2_q4_projections_match_f32_decode() {
-    use meganeura::models::smollm2::{self, Config, ProjectionWeights};
+    use meganeura::models::smollm2;
 
-    fn decode(config: &Config, weights: ProjectionWeights) -> (Vec<f32>, usize) {
+    fn decode(config: &smollm2::Config, weights: smollm2::ProjectionWeights) -> (Vec<f32>, usize) {
         let mut g = Graph::new();
         let (logits, _k, _v) = smollm2::build_decode_graph_with(&mut g, config, 16, weights);
         g.set_outputs(vec![logits]);
@@ -3338,14 +3335,14 @@ fn smollm2_q4_projections_match_f32_decode() {
         (logits, param_bytes)
     }
 
-    let config = Config {
+    let config = smollm2::Config {
         hidden_size: 64, // One 64-wide head keeps the decode fixture small.
         num_attention_heads: 1,
         num_key_value_heads: 1,
-        ..Config::small_test()
+        ..smollm2::Config::small_test()
     };
-    let (f32_logits, f32_bytes) = decode(&config, ProjectionWeights::F32);
-    let (q4_logits, q4_bytes) = decode(&config, ProjectionWeights::Q4);
+    let (f32_logits, f32_bytes) = decode(&config, smollm2::ProjectionWeights::F32);
+    let (q4_logits, q4_bytes) = decode(&config, smollm2::ProjectionWeights::Q4);
 
     assert!(
         q4_logits.iter().all(|v| v.is_finite()),

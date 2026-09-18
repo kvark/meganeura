@@ -16,7 +16,6 @@ fn main() {
     let gpu = meganeura::init_gpu_context_with(meganeura::GpuOptions::from_env()).expect("gpu");
     let result = meganeura::runtime::auto_tune(&gpu, 64);
     eprintln!("coop_matrix_available={}", result.coop_caps.is_supported());
-    meganeura::runtime::install_auto_tune(result);
     drop(gpu);
 
     let batch = 1u32;
