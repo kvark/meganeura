@@ -132,9 +132,6 @@ pub fn build(
 
     let arch = config.architecture;
     let hidden = config.hidden_size;
-    let kv_dim = config.kv_dim();
-    let q_dim = config.q_dim();
-    let head_dim = config.head_dim;
     let eps = config.norm_eps;
 
     let token_ids = g.input_u32("token_ids", &[block_size]);
@@ -156,11 +153,70 @@ pub fn build(
         x = g.scale(x, (hidden as f32).sqrt());
     }
 
+    // Gemma4's per-layer embeddings: every block projects the residual
+    // through one wide projection into all layers' PLE rows, normed per
+    // row, and adds the token's gathered per-layer embedding — the latter
+    // read on the host, since the table is block-quantized and the gather
+    // has no quantized variant.
+    // Token-major rows: row (t, l) is token t's layer-l PLE row, which is
+    // what a one-hot matmul over the row axis selects from later.
+    let ple_rows = config.num_layers * block_size;
+    let ple = if arch.uses_per_layer_embeddings() {
+        let ple_size = config.per_layer_embed_size;
+        if ple_size == 0 {
+            return Err(GgufError::BadMetadata(
+                "the architecture carries per-layer embeddings but embedding_length_per_layer_input is absent or zero"
+                    .to_string(),
+            ));
+        }
+        let table = require_tensor(model, "per_layer_token_embd.weight")?;
+        let expected_ple_width = config.num_layers * ple_size;
+        if table.dims.as_slice() != [expected_ple_width, config.vocab_size] {
+            return Err(GgufError::BadShape(format!(
+                "`per_layer_token_embd.weight` has shape {:?}, expected GGUF dimensions [{expected_ple_width}, {}]",
+                table.dims, config.vocab_size
+            )));
+        }
+        let w_proj = projection(
+            g,
+            model,
+            config,
+            PER_LAYER_PROJ,
+            &[hidden, config.num_layers * ple_size],
+        )?;
+        let proj_norm_name = "per_layer_proj_norm.weight";
+        check_vector(
+            proj_norm_name,
+            require_tensor(model, proj_norm_name)?,
+            ple_size,
+        )?;
+        let proj_norm = g.parameter(proj_norm_name, &[ple_size]);
+        let layered = g.matmul(x, w_proj);
+        let layered = g.scale(layered, 1.0 / (hidden as f32).sqrt());
+        let layered = g.reshape(layered, &[ple_rows, ple_size]);
+        let layered = g.rms_norm(layered, proj_norm, eps);
+        let ple_in = g.input("ple", &[ple_rows, ple_size]);
+        let layered = g.add(layered, ple_in);
+        Some(g.scale(layered, 1.0 / 2.0f32.sqrt()))
+    } else {
+        None
+    };
+    let rope_factors = if arch.uses_rope_factors() {
+        Some(g.parameter("rope_freqs.weight", &[(config.rope_dim / 2) as usize]))
+    } else {
+        None
+    };
+
     let mut k_caches = Vec::with_capacity(config.num_layers);
     let mut v_caches = Vec::with_capacity(config.num_layers);
+    let mut k_updated: Vec<Option<NodeId>> = vec![None; config.num_layers];
+    let mut v_updated: Vec<Option<NodeId>> = vec![None; config.num_layers];
 
     for layer in 0..config.num_layers {
         let p = format!("blk.{layer}");
+        let head_dim = config.head_dim_at(layer);
+        let kv_dim = config.kv_dim_at(layer);
+        let q_dim = config.num_heads as usize * head_dim as usize;
 
         let normed = norm(g, model, config, &format!("{p}.attn_norm"), x, eps)?;
 
@@ -175,31 +231,13 @@ pub fn build(
             &format!("{p}.attn_q.weight"),
             &[hidden, q_dim],
         )?;
-        let k = projection(
-            g,
-            model,
-            config,
-            &format!("{p}.attn_k.weight"),
-            &[hidden, kv_dim],
-        )?;
-        let v = projection(
-            g,
-            model,
-            config,
-            &format!("{p}.attn_v.weight"),
-            &[hidden, kv_dim],
-        )?;
-
         let mut q = g.matmul(attn_in, q);
-        let mut k = g.matmul(attn_in, k);
-        let mut v = g.matmul(attn_in, v);
 
         // Optional rather than gated on the architecture: Qwen2 biases Q,
         // K and V but not the attention output, and requiring all four
-        // would fail on every real Qwen2 file.
+        // would fail on every real Qwen2 file. K/V biases apply where the
+        // projections exist; a shared-KV layer has none of either.
         q = optional_bias(g, model, &format!("{p}.attn_q.bias"), q, q_dim)?;
-        k = optional_bias(g, model, &format!("{p}.attn_k.bias"), k, kv_dim)?;
-        v = optional_bias(g, model, &format!("{p}.attn_v.bias"), v, kv_dim)?;
 
         // Qwen3 norms each head of Q and K before the rotation. The weight
         // is one head wide and shared across heads, which is exactly what
@@ -215,16 +253,6 @@ pub fn build(
                 head_dim,
                 eps,
             )?;
-            k = per_head_norm(
-                g,
-                model,
-                &format!("{p}.attn_k_norm.weight"),
-                k,
-                block_size,
-                config.num_kv_heads,
-                head_dim,
-                eps,
-            )?;
         }
 
         // Row i sits at absolute position `position + i`, which is the
@@ -233,17 +261,89 @@ pub fn build(
         // Gemma3 rotates its local layers with a smaller base than its
         // global ones, so the base is read per layer rather than once.
         let layer_theta = config.layer_rope_theta(layer);
-        let q = g.rope_dynamic_offset(q, layer_theta, position, head_dim);
-        let k = g.rope_dynamic_offset(k, layer_theta, position, head_dim);
+        let freqs = if config.layer_is_windowed(layer) {
+            None
+        } else {
+            rope_factors
+        };
+        let q = match freqs {
+            Some(freqs) => g.rope_dynamic_offset_factors(q, layer_theta, position, head_dim, freqs),
+            None => g.rope_dynamic_offset(q, layer_theta, position, head_dim),
+        };
 
-        let k_cache = g.parameter(&ModelGraph::k_cache_name(layer), &[max_seq_len, kv_dim]);
-        let v_cache = g.parameter(&ModelGraph::v_cache_name(layer), &[max_seq_len, kv_dim]);
+        // Layers sharing a KV cache have no K/V projections and no cache
+        // write: their attention reads the owning layer's cache, written
+        // earlier in the same block.
+        let source = config.kv_source(layer);
+        let (k_written, v_written) = if source == layer {
+            let w_k = projection(
+                g,
+                model,
+                config,
+                &format!("{p}.attn_k.weight"),
+                &[hidden, kv_dim],
+            )?;
+            let w_v = projection(
+                g,
+                model,
+                config,
+                &format!("{p}.attn_v.weight"),
+                &[hidden, kv_dim],
+            )?;
+            let mut k = g.matmul(attn_in, w_k);
+            let mut v = g.matmul(attn_in, w_v);
+            if arch.qk_norm() {
+                k = per_head_norm(
+                    g,
+                    model,
+                    &format!("{p}.attn_k_norm.weight"),
+                    k,
+                    block_size,
+                    config.num_kv_heads_at(layer),
+                    head_dim,
+                    eps,
+                )?;
+            }
+            if arch.norms_values() {
+                // Gemma4 norms V with an all-ones weight — the same
+                // head-wide rsqrt as Q and K, but no learned scale.
+                let ones = g.constant(vec![1.0; head_dim as usize], &[head_dim as usize]);
+                let wide = g.reshape(
+                    v,
+                    &[
+                        block_size * config.num_kv_heads_at(layer) as usize,
+                        head_dim as usize,
+                    ],
+                );
+                let normed = g.rms_norm(wide, ones, eps);
+                v = g.reshape(normed, &[block_size, kv_dim]);
+            }
+            let k = match freqs {
+                Some(freqs) => {
+                    g.rope_dynamic_offset_factors(k, layer_theta, position, head_dim, freqs)
+                }
+                None => g.rope_dynamic_offset(k, layer_theta, position, head_dim),
+            };
+            let k_cache = g.parameter(&ModelGraph::k_cache_name(layer), &[max_seq_len, kv_dim]);
+            let v_cache = g.parameter(&ModelGraph::v_cache_name(layer), &[max_seq_len, kv_dim]);
+            // Only the valid rows enter the cache, and attention must read
+            // the *written* caches: with no data dependency the scheduler
+            // may order this block's write after the attention that should
+            // see it.
+            let k_written = g.cache_write_prefix(k, k_cache, position, valid);
+            let v_cache_w = g.cache_write_prefix(v, v_cache, position, valid);
+            (k_written, Some(v_cache_w))
+        } else {
+            (
+                k_updated[source].expect("a shared layer's source is always earlier"),
+                None,
+            )
+        };
 
-        // Only the valid rows enter the cache, and attention must read the
-        // *written* caches: with no data dependency the scheduler may order
-        // this block's write after the attention that should see it.
-        let k_written = g.cache_write_prefix(k, k_cache, position, valid);
-        let v_written = g.cache_write_prefix(v, v_cache, position, valid);
+        let v_written = match v_written {
+            Some(w) => w,
+            None => v_updated[source].expect("a shared layer's source is always earlier"),
+        };
 
         // `window_size = 0` is the op's spelling of "attend to the whole
         // prefix"; Gemma2 alternates, so the layer index decides.
@@ -259,13 +359,17 @@ pub fn build(
             position,
             valid,
             config.num_heads,
-            config.num_kv_heads,
+            config.num_kv_heads_at(layer),
             head_dim,
             window,
         );
 
-        k_caches.push(k_written);
-        v_caches.push(v_written);
+        k_updated[layer] = Some(k_written);
+        v_updated[layer] = Some(v_written);
+        if source == layer {
+            k_caches.push(k_written);
+            v_caches.push(v_written);
+        }
 
         let wo = projection(
             g,
@@ -310,6 +414,53 @@ pub fn build(
             }
             x = g.add(x, ffn_out);
         }
+
+        // Gemma4's per-layer embedding mixing: the block gates its own
+        // output against the layer's PLE row, projects, normed, and adds —
+        // the one-hot matmul selects layer `layer`'s token-major rows.
+        if let Some(ple) = ple {
+            let ple_size = config.per_layer_embed_size;
+            let w_gate = projection(
+                g,
+                model,
+                config,
+                &format!("{p}.inp_gate.weight"),
+                &[hidden, ple_size],
+            )?;
+            let w_proj = projection(
+                g,
+                model,
+                config,
+                &format!("{p}.proj.weight"),
+                &[ple_size, hidden],
+            )?;
+            let post_name = format!("{p}.post_norm.weight");
+            check_vector(&post_name, require_tensor(model, &post_name)?, hidden)?;
+            let post = g.parameter(&post_name, &[hidden]);
+
+            let mut sel = vec![0.0f32; block_size * ple_rows];
+            for (t, slot) in sel.chunks_mut(ple_rows).enumerate() {
+                slot[t * config.num_layers + layer] = 1.0;
+            }
+            let sel = g.constant(sel, &[block_size, ple_rows]);
+            let selected = g.matmul(sel, ple);
+            let ple_layer = g.reshape(selected, &[block_size, ple_size]);
+
+            let gated = g.matmul(x, w_gate);
+            let gated = g.gelu(gated);
+            let mixed = g.mul(gated, ple_layer);
+            let mixed = g.matmul(mixed, w_proj);
+            let mixed = g.rms_norm(mixed, post, eps);
+            x = g.add(x, mixed);
+        }
+        if arch.scales_block_outputs() {
+            let name = format!("{p}.layer_output_scale.weight");
+            if let Some(tensor) = model.tensors.get(&name) {
+                check_vector(&name, tensor, 1)?;
+                let scale = tensor.to_f32()?;
+                x = g.scale(x, scale[0]);
+            }
+        }
     }
 
     let x = norm(g, model, config, OUTPUT_NORM, x, eps)?;
@@ -346,6 +497,10 @@ pub const TOKEN_EMBD: &str = "token_embd.weight";
 pub const OUTPUT_NORM: &str = "output_norm";
 /// The output head, absent when the model ties it to [`TOKEN_EMBD`].
 pub const OUTPUT: &str = "output.weight";
+/// The per-layer embedding projection: all layers' PLE rows in one wide
+/// output, which each block normed per row and added the gathered table
+/// row onto.
+pub const PER_LAYER_PROJ: &str = "per_layer_model_proj.weight";
 
 /// Reject what the ops cannot express, naming the reason.
 fn check_expressible(model: &GgufModel, config: &ModelConfig) -> Result<(), GgufError> {
@@ -368,6 +523,28 @@ fn check_expressible(model: &GgufModel, config: &ModelConfig) -> Result<(), Gguf
             config.architecture, config.head_dim
         )));
     }
+    for layer in 0..config.num_layers {
+        let head_dim = config.head_dim_at(layer);
+        if !head_dim.is_multiple_of(2) {
+            return Err(GgufError::UnsupportedArchitecture(format!(
+                "{}: RoPE needs an even head width at layer {layer}, got {head_dim}",
+                config.architecture
+            )));
+        }
+        if head_dim > 512 {
+            return Err(GgufError::UnsupportedArchitecture(format!(
+                "{}: cached attention supports heads up to 512 wide, got {head_dim} at layer {layer}",
+                config.architecture
+            )));
+        }
+        let rope_dim = config.rope_dim_at(layer);
+        if rope_dim != head_dim {
+            return Err(GgufError::UnsupportedArchitecture(format!(
+                "{}: RoPE rotates {rope_dim} dimensions of the {head_dim}-wide head at layer {layer}; this graph requires whole-head rotation",
+                config.architecture
+            )));
+        }
+    }
     if config.attn_logit_softcap.is_some() {
         return Err(GgufError::UnsupportedArchitecture(format!(
             "{}: attn_logit_softcapping has no parameter on the cached attention \
@@ -386,11 +563,69 @@ fn check_expressible(model: &GgufModel, config: &ModelConfig) -> Result<(), Gguf
             config.architecture
         )));
     }
-    if let Some(name) = rope_factor_tensor(model) {
+    if config.architecture.uses_rope_factors() {
+        // Gemma4's file-wide factors encode proportional RoPE on full-
+        // attention layers. Those layers require exactly this tensor.
+        let name = "rope_freqs.weight";
+        let tensor = model
+            .tensors
+            .get(name)
+            .ok_or_else(|| GgufError::MissingTensor(format!("the file has no `{name}`")))?;
+        let freqs = tensor.to_f32()?;
+        let expected = (config.rope_dim / 2) as usize;
+        if tensor.dims.as_slice() != [expected] || freqs.len() != expected {
+            return Err(GgufError::BadShape(format!(
+                "{name} has shape {:?}, expected [{expected}] for the {}-wide full-attention head",
+                tensor.dims, config.rope_dim
+            )));
+        }
+        for (i, &f) in freqs.iter().enumerate() {
+            if !f.is_finite() || f <= 0.0 {
+                return Err(GgufError::BadMetadata(format!(
+                    "{name} pair {i} carries {f}, which is not a rope divisor"
+                )));
+            }
+        }
+        if let Some(extra) = model.tensors.keys().find(|candidate| {
+            candidate.as_str() != name
+                && (candidate.contains("rope_freqs") || candidate.contains("rope_factors"))
+        }) {
+            return Err(GgufError::UnsupportedArchitecture(format!(
+                "{}: the extra RoPE correction `{extra}` has no graph path",
+                config.architecture
+            )));
+        }
+    } else if let Some(name) = rope_factor_tensor(model) {
         return Err(GgufError::UnsupportedArchitecture(format!(
             "{}: the file carries `{name}`, a per-frequency RoPE correction \
              that the graph cannot apply; dropping it would rotate long \
              positions wrongly",
+            config.architecture
+        )));
+    }
+    for key in ["expert_count", "expert_used_count"] {
+        if let Some(value) = model.arch_key(key) {
+            let count = value.as_u64().ok_or_else(|| {
+                GgufError::BadMetadata(format!("{key} is not an unsigned integer: {value:?}"))
+            })?;
+            if count > 0 {
+                return Err(GgufError::UnsupportedArchitecture(format!(
+                    "{}: MoE metadata `{key} = {count}` has no graph path",
+                    config.architecture
+                )));
+            }
+        }
+    }
+    if let Some(name) = model.tensors.keys().find(|name| {
+        name.contains(".experts.")
+            || name.contains("ffn_gate_inp")
+            || name.contains("ffn_gate_exps")
+            || name.contains("ffn_up_exps")
+            || name.contains("ffn_down_exps")
+            || name.contains("ffn_gate_up_exps")
+    }) {
+        return Err(GgufError::UnsupportedArchitecture(format!(
+            "{}: expert tensor `{name}` has no graph path",
             config.architecture
         )));
     }
@@ -403,8 +638,9 @@ fn check_expressible(model: &GgufModel, config: &ModelConfig) -> Result<(), Gguf
 /// write per-layer `rope_factors_long` / `rope_factors_short`. Upstream
 /// passes these into `ggml_rope_ext`; there is nowhere to put them here,
 /// and a file that ships them is not a plain-RoPE model however ordinary
-/// its architecture name looks.
-fn rope_factor_tensor(model: &GgufModel) -> Option<&str> {
+/// its architecture name looks. Gemma4's `rope_freqs.weight` is handled
+/// separately because its factors encode proportional RoPE on full layers.
+fn rope_factor_tensor<'a>(model: &'a GgufModel) -> Option<&'a str> {
     let mut found: Option<&str> = None;
     for name in model.tensors.keys() {
         if name.contains("rope_freqs") || name.contains("rope_factors") {
@@ -436,7 +672,7 @@ fn feed_forward(
 ) -> Result<NodeId, GgufError> {
     let arch = config.architecture;
     let hidden = config.hidden_size;
-    let ffn = config.intermediate_size;
+    let ffn = config.layer_ffn_size(layer_index(prefix));
 
     let hidden_act = if arch.gated_ffn() {
         let w_gate = projection(
@@ -610,6 +846,13 @@ impl Source {
 ///
 /// Both the builder and the loader go through this, so they cannot
 /// disagree about which bytes a parameter is made of.
+pub(super) fn layer_index(prefix: &str) -> usize {
+    prefix
+        .strip_prefix("blk.")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
 pub(super) fn source_of(config: &ModelConfig, param: &str) -> Source {
     let arch = config.architecture;
     if !arch.packs_qkv() && !arch.packs_gate_up() {
@@ -623,7 +866,7 @@ pub(super) fn source_of(config: &ModelConfig, param: &str) -> Source {
     };
 
     let q = config.q_dim();
-    let kv = config.kv_dim();
+    let kv = config.kv_dim_at(0);
     let ffn = config.intermediate_size;
 
     if arch.packs_qkv() {
@@ -704,6 +947,9 @@ pub(super) fn weight_dtype(tensor: &super::GgufTensor) -> Result<DType, GgufErro
     Ok(match tensor.ggml_type {
         super::GgmlType::F32 => DType::F32,
         super::GgmlType::F16 => DType::F16,
+        // BF16 has no packed Meganeura form; f32 holds every bf16 value
+        // exactly, so that is the lossless spelling.
+        super::GgmlType::BF16 => DType::F32,
         // Anything block-packed keeps the file's own encoding: going
         // through f32 would requantize on the way back in and roughly
         // double the error the file already carries.
@@ -750,6 +996,13 @@ pub fn parameter_names(config: &ModelConfig) -> Vec<String> {
     if arch.uses_layer_norm() {
         names.push(format!("{OUTPUT_NORM}.bias"));
     }
+    if arch.uses_rope_factors() && config.rope_dim > 0 {
+        names.push("rope_freqs.weight".to_string());
+    }
+    if arch.uses_per_layer_embeddings() {
+        names.push(PER_LAYER_PROJ.to_string());
+        names.push("per_layer_proj_norm.weight".to_string());
+    }
     if !config.tie_word_embeddings {
         names.push(OUTPUT.to_string());
     }
@@ -759,12 +1012,25 @@ pub fn parameter_names(config: &ModelConfig) -> Vec<String> {
         if arch.uses_layer_norm() {
             names.push(format!("{p}.attn_norm.bias"));
         }
-        for part in ["attn_q", "attn_k", "attn_v", "attn_output"] {
-            names.push(format!("{p}.{part}.weight"));
+        // Layers sharing a KV cache declare no K/V projections of their
+        // own: their attention reads the owning layer's cache, which
+        // `weights::load` fills from the owner's tensors.
+        let has_kv = config.kv_source(layer) == layer;
+        for (part, needed) in [
+            ("attn_q", true),
+            ("attn_k", has_kv),
+            ("attn_v", has_kv),
+            ("attn_output", true),
+        ] {
+            if needed {
+                names.push(format!("{p}.{part}.weight"));
+            }
         }
         if arch.qk_norm() {
             names.push(format!("{p}.attn_q_norm.weight"));
-            names.push(format!("{p}.attn_k_norm.weight"));
+            if has_kv {
+                names.push(format!("{p}.attn_k_norm.weight"));
+            }
         }
         if arch.post_block_norms() {
             names.push(format!("{p}.post_attention_norm.weight"));
@@ -778,6 +1044,11 @@ pub fn parameter_names(config: &ModelConfig) -> Vec<String> {
         }
         names.push(format!("{p}.ffn_up.weight"));
         names.push(format!("{p}.ffn_down.weight"));
+        if arch.uses_per_layer_embeddings() {
+            for part in ["inp_gate.weight", "proj.weight", "post_norm.weight"] {
+                names.push(format!("{p}.{part}"));
+            }
+        }
     }
     names
 }
@@ -926,6 +1197,121 @@ mod tests {
     }
 
     #[test]
+    fn the_gemma4_graph_declares_every_weight_the_loader_must_fill() {
+        let (g, _, config) = build_fixture("gemma4");
+        let declared = declared_parameters(&g);
+        let mut expected = parameter_names(&config);
+        for layer in 0..config.num_layers {
+            if config.kv_source(layer) == layer {
+                expected.push(ModelGraph::k_cache_name(layer));
+                expected.push(ModelGraph::v_cache_name(layer));
+            }
+        }
+        expected.sort();
+        let mut actual: Vec<String> = declared.keys().cloned().collect();
+        actual.sort();
+        assert_eq!(actual, expected);
+        for name in [
+            PER_LAYER_PROJ,
+            "per_layer_proj_norm.weight",
+            "blk.0.inp_gate.weight",
+            "blk.0.proj.weight",
+            "blk.0.post_norm.weight",
+        ] {
+            assert!(
+                parameter_names(&config).iter().any(|param| param == name),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn gemma4_rope_factors_apply_only_to_full_attention_layers() {
+        let (g, _, config) = build_fixture("gemma4");
+        let declared = declared_parameters(&g);
+        assert_eq!(
+            declared["blk.0.attn_k.weight"],
+            vec![config.hidden_size, config.kv_dim_at(0)]
+        );
+        assert_eq!(
+            declared["blk.1.attn_k.weight"],
+            vec![config.hidden_size, config.kv_dim_at(1)]
+        );
+        let kv_heads: Vec<_> = g
+            .nodes()
+            .iter()
+            .filter_map(|node| match node.op {
+                crate::graph::Op::CachedBlockAttention { num_kv_heads, .. } => Some(num_kv_heads),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kv_heads, vec![1, 2]);
+        let factors: Vec<_> = g
+            .nodes()
+            .iter()
+            .filter_map(|node| match node.op {
+                crate::graph::Op::RoPE {
+                    head_dim,
+                    freq_factors: true,
+                    ..
+                } => Some(head_dim),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(factors, vec![config.head_dim; 2]);
+    }
+
+    #[test]
+    fn gemma4_refuses_unsupported_local_rotary_width_and_moe() {
+        let mut missing_factors = fixture::model("gemma4");
+        missing_factors.tensors.remove("rope_freqs.weight");
+        let config = ModelConfig::from_gguf(&missing_factors).unwrap();
+        assert!(matches!(
+            build(&mut Graph::new(), &missing_factors, &config, 4, 16),
+            Err(GgufError::MissingTensor(_))
+        ));
+
+        let mut local_rope = fixture::model("gemma4");
+        fixture::set_arch_key(
+            &mut local_rope,
+            "rope.dimension_count_swa",
+            GgufValue::U32(4),
+        );
+        let config = ModelConfig::from_gguf(&local_rope).unwrap();
+        assert!(matches!(
+            build(&mut Graph::new(), &local_rope, &config, 4, 16),
+            Err(GgufError::UnsupportedArchitecture(_))
+        ));
+
+        for key in ["expert_count", "expert_used_count"] {
+            let mut moe = fixture::model("gemma4");
+            fixture::set_arch_key(&mut moe, key, GgufValue::U32(128));
+            let config = ModelConfig::from_gguf(&moe).unwrap();
+            assert!(matches!(
+                build(&mut Graph::new(), &moe, &config, 4, 16),
+                Err(GgufError::UnsupportedArchitecture(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn gemma4_layer_output_scale_is_optional_but_must_be_scalar_when_present() {
+        let mut model = fixture::model("gemma4");
+        model.tensors.remove("blk.0.layer_output_scale.weight");
+        let config = ModelConfig::from_gguf(&model).unwrap();
+        assert!(build(&mut Graph::new(), &model, &config, 4, 16).is_ok());
+
+        model.tensors.insert(
+            "blk.0.layer_output_scale.weight".to_string(),
+            fixture::f32_tensor(vec![2]),
+        );
+        assert!(matches!(
+            build(&mut Graph::new(), &model, &config, 4, 16),
+            Err(GgufError::MissingTensor(_))
+        ));
+    }
+
+    #[test]
     fn projection_shapes_follow_the_files_dimensions() {
         let (g, _, config) = build_fixture("llama");
         let declared = declared_parameters(&g);
@@ -935,7 +1321,7 @@ mod tests {
         );
         assert_eq!(
             declared["blk.0.attn_k.weight"],
-            vec![config.hidden_size, config.kv_dim()]
+            vec![config.hidden_size, config.kv_dim_at(0)]
         );
         assert_eq!(
             declared["blk.0.ffn_down.weight"],
@@ -1030,7 +1416,7 @@ mod tests {
         let declared = declared_parameters(&g);
         assert_eq!(
             declared[&ModelGraph::k_cache_name(0)],
-            vec![128, config.kv_dim()]
+            vec![128, config.kv_dim_at(0)]
         );
         assert_eq!(built.k_caches.len(), config.num_layers);
         assert_eq!(built.v_caches.len(), config.num_layers);

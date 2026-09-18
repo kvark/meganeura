@@ -429,6 +429,9 @@ pub enum Op {
         /// independently within each head. When equal to the last dim of
         /// the input tensor, the behavior is identical to "global" RoPE.
         head_dim: u32,
+        /// When true, a third input supplies one per-pair divisor on the
+        /// base-derived rotation — GGML's `rope_freqs` spelling.
+        freq_factors: bool,
     },
     /// Backward gradient op for RoPE: applies inverse (transpose) rotation.
     /// Inputs: `[grad_output]`.
@@ -2031,6 +2034,7 @@ impl Graph {
                 theta,
                 pos_offset,
                 head_dim,
+                freq_factors: false,
             },
             vec![x],
             ty,
@@ -2047,20 +2051,52 @@ impl Graph {
         offset_input: NodeId,
         head_dim: u32,
     ) -> NodeId {
-        let x_shape = &self.node(x).ty.shape;
-        assert_eq!(x_shape.len(), 2, "rope requires 2D input");
-        let dim = x_shape[1] as u32;
-        assert_eq!(dim % 2, 0, "rope requires even last dim");
-        assert_eq!(dim % head_dim, 0, "rope: dim must be divisible by head_dim");
-        assert_eq!(head_dim % 2, 0, "rope: head_dim must be even");
         let ty = self.node(x).ty.clone();
         self.add_node(
             Op::RoPE {
                 theta,
                 pos_offset: 0,
                 head_dim,
+                freq_factors: false,
             },
             vec![x, offset_input],
+            ty,
+        )
+    }
+
+    /// [`Self::rope_dynamic_offset`] with a per-pair divisor, GGML's
+    /// `rope_freqs` spelling.
+    #[track_caller]
+    pub fn rope_dynamic_offset_factors(
+        &mut self,
+        x: NodeId,
+        theta: f32,
+        offset_input: NodeId,
+        head_dim: u32,
+        factors: NodeId,
+    ) -> NodeId {
+        let x_shape = &self.node(x).ty.shape;
+        assert_eq!(x_shape.len(), 2, "rope requires 2D input");
+        let dim = x_shape[1] as u32;
+        assert_eq!(dim % 2, 0, "rope requires even last dim");
+        assert_eq!(dim % head_dim, 0, "rope: dim must be divisible by head_dim");
+        assert_eq!(head_dim % 2, 0, "rope: head_dim must be even");
+        let factor_ty = &self.node(factors).ty;
+        assert_eq!(factor_ty.dtype, DType::F32, "rope factors must be f32");
+        assert_eq!(
+            factor_ty.shape,
+            vec![(head_dim / 2) as usize],
+            "rope factors must have one value per pair in a head"
+        );
+        let ty = self.node(x).ty.clone();
+        self.add_node(
+            Op::RoPE {
+                theta,
+                pos_offset: 0,
+                head_dim,
+                freq_factors: true,
+            },
+            vec![x, offset_input, factors],
             ty,
         )
     }

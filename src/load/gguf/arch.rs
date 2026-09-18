@@ -5,9 +5,10 @@
 //! `gemma2.block_count`. [`GgufModel::arch_key`](super::GgufModel::arch_key)
 //! resolves that prefix, and everything here is read through it.
 //!
-//! The point of this module is that no dimension is hard-coded. A
-//! [`ModelConfig`] is entirely a reading of the file, which is what lets one
-//! builder serve models it has never been compiled against.
+//! Dimensions come from the file; architecture-defined defaults are used
+//! only for fields the family specifies when a producer omits them. A
+//! [`ModelConfig`] is what lets one builder serve models it has never been
+//! compiled against.
 //!
 //! # What the [`Architecture`] discriminates
 //!
@@ -65,6 +66,14 @@ pub enum Architecture {
     /// biases, two norms per block. It differs from llama only in packing
     /// QKV and gate/up as single tensors.
     Phi3,
+    /// Gemma3's block shape (scaled embeddings, per-head Q/K/V norms,
+    /// GeGLU, post-block norms, softcapping) with two further departures:
+    /// sliding-window layers carry narrower heads than global ones, so the
+    /// head width is a property of the layer, and the first
+    /// `attention.shared_kv_layers` layers own the KV cache with the rest
+    /// of the stack sharing theirs. Blocks also mix in per-layer token
+    /// embeddings and scale each block's output.
+    Gemma4,
 }
 
 impl Architecture {
@@ -86,6 +95,7 @@ impl Architecture {
             "gemma" => Self::Gemma,
             "gemma2" => Self::Gemma2,
             "gemma3" => Self::Gemma3,
+            "gemma4" => Self::Gemma4,
             "phi2" => Self::Phi2,
             "phi3" => Self::Phi3,
             other => return Err(GgufError::UnsupportedArchitecture(other.to_string())),
@@ -137,7 +147,10 @@ impl Architecture {
     /// feed-forward, and selecting an activation through an unrelated
     /// predicate hides which computation a family actually changes.
     pub fn gates_with_gelu(self) -> bool {
-        matches!(self, Self::Gemma | Self::Gemma2 | Self::Gemma3)
+        matches!(
+            self,
+            Self::Gemma | Self::Gemma2 | Self::Gemma3 | Self::Gemma4
+        )
     }
 
     /// Whether the feed-forward gates — `down(act(gate(x)) * up(x))`.
@@ -158,19 +171,45 @@ impl Architecture {
 
     /// Whether Q and K are normed per head before RoPE.
     pub fn qk_norm(self) -> bool {
-        matches!(self, Self::Qwen3 | Self::Gemma3)
+        matches!(self, Self::Qwen3 | Self::Gemma3 | Self::Gemma4)
+    }
+
+    /// Whether V is normed per head alongside Q and K.
+    pub fn norms_values(self) -> bool {
+        matches!(self, Self::Gemma4)
+    }
+
+    /// Whether blocks carry per-layer token embeddings that mix into each
+    /// block through a gated projection.
+    pub fn uses_per_layer_embeddings(self) -> bool {
+        matches!(self, Self::Gemma4)
+    }
+
+    /// Whether the rope's rotating band carries per-pair divisors from the
+    /// file (`rope_freqs.weight`), as GGML's rope consumes it.
+    pub fn uses_rope_factors(self) -> bool {
+        matches!(self, Self::Gemma4)
+    }
+
+    /// Whether each block's output is scaled before it rejoins the
+    /// residual.
+    pub fn scales_block_outputs(self) -> bool {
+        matches!(self, Self::Gemma4)
     }
 
     /// Whether the token embedding is scaled by `sqrt(n_embd)` on the way
     /// in.
     pub fn scales_embeddings(self) -> bool {
-        matches!(self, Self::Gemma | Self::Gemma2 | Self::Gemma3)
+        matches!(
+            self,
+            Self::Gemma | Self::Gemma2 | Self::Gemma3 | Self::Gemma4
+        )
     }
 
     /// Whether each block carries a second pair of norms, applied to the
     /// attention and feed-forward outputs before they rejoin the residual.
     pub fn post_block_norms(self) -> bool {
-        matches!(self, Self::Gemma2 | Self::Gemma3)
+        matches!(self, Self::Gemma2 | Self::Gemma3 | Self::Gemma4)
     }
 }
 
@@ -183,6 +222,7 @@ impl std::fmt::Display for Architecture {
             Self::Gemma => "gemma",
             Self::Gemma2 => "gemma2",
             Self::Gemma3 => "gemma3",
+            Self::Gemma4 => "gemma4",
             Self::Phi2 => "phi2",
             Self::Phi3 => "phi3",
         };
@@ -274,7 +314,8 @@ pub struct ModelConfig {
     pub num_heads: u32,
     /// Key/value heads, `{arch}.attention.head_count_kv`. Equal to
     /// [`Self::num_heads`] for multi-head attention, fewer for grouped-query,
-    /// one for multi-query.
+    /// one for multi-query. When GGUF stores one count per layer, this is
+    /// the first layer's count.
     pub num_kv_heads: u32,
     /// Width of one attention head.
     ///
@@ -304,6 +345,9 @@ pub struct ModelConfig {
     /// Phi2 rotates a fraction of the head and leaves the rest untouched;
     /// everything else here rotates the whole head.
     pub rope_dim: u32,
+    /// RoPE width on sliding-window layers when the file writes a separate
+    /// `{arch}.rope.dimension_count_swa` value.
+    pub rope_dim_swa: Option<u32>,
     /// Longest sequence the file claims to support,
     /// `{arch}.context_length`.
     pub context_length: usize,
@@ -326,6 +370,27 @@ pub struct ModelConfig {
     /// Not a metadata key: GGUF records weight tying by *omitting*
     /// `output.weight`, so this is read off the tensor inventory.
     pub tie_word_embeddings: bool,
+    /// Width of one sliding-window head, where the file gives it one —
+    /// Gemma4 writes `attention.key_length_swa`. `None` means every layer's
+    /// head is [`Self::head_dim`] wide.
+    pub head_dim_swa: Option<u32>,
+    /// Layers that own a KV cache; the rest of the stack reads one of
+    /// their own, so the cache depth of a block equals the sharing span.
+    /// 0 means every layer owns one.
+    pub shared_kv_layers: usize,
+    /// Width of one block's per-layer token-embedding row, from
+    /// `{arch}.embedding_length_per_layer_input`. 0 when the architecture
+    /// carries none.
+    pub per_layer_embed_size: usize,
+    /// Per-layer window decisions the file spells out as a bool array
+    /// (Gemma4's `attention.sliding_window_pattern`); `None` falls back to
+    /// the [`Self::sliding_window_pattern`] rule.
+    layer_window_flags: Option<Vec<bool>>,
+    /// Per-layer feed-forward widths the file spells out as an array
+    /// (Gemma4's `feed_forward_length`); `None` keeps the single width.
+    layer_ffn_sizes: Option<Vec<usize>>,
+    /// Per-layer K/V head counts the file spells out as an array.
+    layer_kv_heads: Option<Vec<u32>>,
 }
 
 impl ModelConfig {
@@ -344,26 +409,105 @@ impl ModelConfig {
 
         let hidden_size = require_usize(model, "embedding_length")?;
         let num_layers = require_usize(model, "block_count")?;
+        if num_layers == 0 {
+            return Err(GgufError::BadMetadata(
+                "block_count must be greater than zero".to_string(),
+            ));
+        }
         let num_heads = require_u32(model, "attention.head_count")?;
-        let num_kv_heads = opt_u32(model, "attention.head_count_kv")?.unwrap_or(num_heads);
-        let intermediate_size = require_usize(model, "feed_forward_length")?;
+        let layer_kv_heads = match opt_array(model, "attention.head_count_kv")? {
+            Some(items) => {
+                if items.len() != num_layers {
+                    return Err(GgufError::BadMetadata(format!(
+                        "attention.head_count_kv holds {} entries, block_count is {num_layers}",
+                        items.len()
+                    )));
+                }
+                let mut counts = Vec::with_capacity(items.len());
+                for (index, item) in items.iter().enumerate() {
+                    let Some(raw) = item.as_u64() else {
+                        return Err(GgufError::BadMetadata(format!(
+                            "attention.head_count_kv entry {index} is not an unsigned integer: {item:?}"
+                        )));
+                    };
+                    let count = u32::try_from(raw).map_err(|_| {
+                        GgufError::BadMetadata(format!(
+                            "attention.head_count_kv entry {index} = {raw} exceeds u32"
+                        ))
+                    })?;
+                    if count == 0 {
+                        return Err(GgufError::BadMetadata(format!(
+                            "attention.head_count_kv entry {index} must be greater than zero"
+                        )));
+                    }
+                    counts.push(count);
+                }
+                Some(counts)
+            }
+            None => None,
+        };
+        let num_kv_heads = match layer_kv_heads.as_deref() {
+            Some(counts) => counts[0],
+            None => opt_u32(model, "attention.head_count_kv")?.unwrap_or(num_heads),
+        };
+        // Gemma4 writes one feed-forward width per layer; the file's
+        // array is the layers' widths, and a scalar keeps the single
+        // width. The blocks use the width of their own entry.
+        let layer_ffn_sizes = match opt_array(model, "feed_forward_length")? {
+            Some(items) => {
+                if items.len() != num_layers {
+                    return Err(GgufError::BadMetadata(format!(
+                        "feed_forward_length holds {} entries, block_count is {num_layers}",
+                        items.len()
+                    )));
+                }
+                let mut widths = Vec::with_capacity(items.len());
+                for (index, item) in items.iter().enumerate() {
+                    let Some(raw) = item.as_u64() else {
+                        return Err(GgufError::BadMetadata(format!(
+                            "feed_forward_length entry {index} is not an unsigned integer: {item:?}"
+                        )));
+                    };
+                    let width = usize::try_from(raw).map_err(|_| {
+                        GgufError::BadMetadata(format!(
+                            "feed_forward_length entry {index} = {raw} does not fit this platform"
+                        ))
+                    })?;
+                    if width == 0 {
+                        return Err(GgufError::BadMetadata(format!(
+                            "feed_forward_length entry {index} must be greater than zero"
+                        )));
+                    }
+                    widths.push(width);
+                }
+                Some(widths)
+            }
+            None => None,
+        };
+        // The model-wide width is the largest of the layers'; the
+        // per-layer reads go through `layer_ffn_size`.
+        let intermediate_size = match layer_ffn_sizes.as_deref() {
+            Some(widths) => widths.iter().copied().max().unwrap_or(0),
+            None => opt_usize(model, "feed_forward_length")?
+                .ok_or_else(|| missing(model, "feed_forward_length"))?,
+        };
+        if intermediate_size == 0 {
+            return Err(GgufError::BadMetadata(
+                "feed_forward_length must be greater than zero".to_string(),
+            ));
+        }
 
         if num_heads == 0 {
             return Err(GgufError::BadMetadata(
                 "attention.head_count is zero".to_string(),
             ));
         }
-        if num_kv_heads == 0 || !num_heads.is_multiple_of(num_kv_heads) {
-            return Err(GgufError::BadMetadata(format!(
-                "attention.head_count {num_heads} is not a whole multiple of \
-                 head_count_kv {num_kv_heads}"
-            )));
-        }
-
         // Gemma's head is wider than hidden/heads, so the file's own
-        // key_length wins wherever it is written.
+        // key_length wins wherever it is written. Gemma4's converter
+        // default is 256 when the key is absent.
         let head_dim = match opt_u32(model, "attention.key_length")? {
             Some(k) => k,
+            None if architecture == Architecture::Gemma4 => 256,
             None => {
                 if !hidden_size.is_multiple_of(num_heads as usize) {
                     return Err(GgufError::BadMetadata(format!(
@@ -374,39 +518,161 @@ impl ModelConfig {
                 (hidden_size / num_heads as usize) as u32
             }
         };
+        if head_dim == 0 {
+            return Err(GgufError::BadMetadata(
+                "attention.key_length must be greater than zero".to_string(),
+            ));
+        }
+        if let Some(value_dim) = opt_u32(model, "attention.value_length")? {
+            if value_dim != head_dim {
+                return Err(GgufError::BadMetadata(format!(
+                    "attention.value_length {value_dim} differs from key width {head_dim}, \
+                     but this attention graph requires equal key and value widths"
+                )));
+            }
+        }
 
         // The two norms are alternatives, not fallbacks for one another:
         // reading an RMS epsilon into a LayerNorm would be a quiet change
         // of model, so each architecture asks for its own.
-        let norm_eps = if architecture.uses_layer_norm() {
-            opt_f32(model, "attention.layer_norm_epsilon")?.unwrap_or(1e-5)
+        let norm_eps_key = if architecture.uses_layer_norm() {
+            "attention.layer_norm_epsilon"
         } else {
-            opt_f32(model, "attention.layer_norm_rms_epsilon")?.unwrap_or(1e-5)
+            "attention.layer_norm_rms_epsilon"
         };
+        let norm_eps_value = opt_f32(model, norm_eps_key)?;
+        if architecture == Architecture::Gemma4 && norm_eps_value.is_none() {
+            return Err(missing(model, norm_eps_key));
+        }
+        let norm_eps = norm_eps_value.unwrap_or(1e-5);
+        if !norm_eps.is_finite() || norm_eps <= 0.0 {
+            return Err(GgufError::BadMetadata(format!(
+                "{norm_eps_key} must be a positive finite number"
+            )));
+        }
 
-        let rope_theta = opt_f32(model, "rope.freq_base")?.unwrap_or(10_000.0);
+        let rope_theta = opt_f32(model, "rope.freq_base")?.unwrap_or(match architecture {
+            Architecture::Gemma4 => 1_000_000.0,
+            _ => 10_000.0,
+        });
         // `rope.freq_base_swa` is the canonical key (llama-arch.cpp's
         // `LLM_KV_ROPE_FREQ_BASE_SWA`); `rope.local_freq_base` is accepted
         // as well because some producers write that instead.
-        let rope_theta_local = match opt_f32(model, "rope.freq_base_swa")? {
+        let rope_theta_local_value = match opt_f32(model, "rope.freq_base_swa")? {
             Some(v) => Some(v),
             None => opt_f32(model, "rope.local_freq_base")?,
+        };
+        if !rope_theta.is_finite() || rope_theta <= 0.0 {
+            return Err(GgufError::BadMetadata(
+                "rope.freq_base must be a positive finite number".to_string(),
+            ));
         }
-        .filter(|v| *v > 0.0);
+        if rope_theta_local_value.is_some_and(|v| !v.is_finite() || v <= 0.0) {
+            return Err(GgufError::BadMetadata(
+                "rope.freq_base_swa must be a positive finite number".to_string(),
+            ));
+        }
+        let rope_theta_local = rope_theta_local_value
+            .or_else(|| (architecture == Architecture::Gemma4).then_some(10_000.0));
+        // Sliding-window layers may carry narrower heads — Gemma4 writes
+        // `attention.key_length_swa` beside `attention.key_length`.
+        let head_dim_swa = opt_u32(model, "attention.key_length_swa")?;
+        if head_dim_swa == Some(0) {
+            return Err(GgufError::BadMetadata(
+                "attention.key_length_swa must be greater than zero".to_string(),
+            ));
+        }
+        if let Some(value_dim) = opt_u32(model, "attention.value_length_swa")? {
+            let key_dim = head_dim_swa.unwrap_or(head_dim);
+            if value_dim != key_dim {
+                return Err(GgufError::BadMetadata(format!(
+                    "attention.value_length_swa {value_dim} differs from key width {key_dim}, \
+                     but this attention graph requires equal key and value widths"
+                )));
+            }
+        }
+        let shared_kv_layers = opt_usize(model, "attention.shared_kv_layers")?.unwrap_or(0);
+        if shared_kv_layers > num_layers {
+            return Err(GgufError::BadMetadata(format!(
+                "attention.shared_kv_layers {shared_kv_layers} exceeds block_count {num_layers}"
+            )));
+        }
+        let per_layer_embed_size =
+            opt_usize(model, "embedding_length_per_layer_input")?.unwrap_or(0);
+
         let rope_scaling = RopeScaling::from_gguf(model)?;
         let rope_dim = opt_u32(model, "rope.dimension_count")?.unwrap_or(head_dim);
+        if rope_dim == 0 {
+            return Err(GgufError::BadMetadata(
+                "rope.dimension_count must be greater than zero".to_string(),
+            ));
+        }
+        let rope_dim_swa = opt_u32(model, "rope.dimension_count_swa")?;
+        if rope_dim_swa == Some(0) {
+            return Err(GgufError::BadMetadata(
+                "rope.dimension_count_swa must be greater than zero".to_string(),
+            ));
+        }
         let context_length = opt_usize(model, "context_length")?.unwrap_or(2048);
-        let sliding_window = opt_usize(model, "attention.sliding_window")?.filter(|&w| w > 0);
+        let sliding_window_value = opt_usize(model, "attention.sliding_window")?;
+        if architecture == Architecture::Gemma4 && sliding_window_value.is_none() {
+            return Err(missing(model, "attention.sliding_window"));
+        }
+        let sliding_window = sliding_window_value.filter(|&w| w > 0);
         // Gemma3 declares how often a global layer interrupts the local
         // ones. Reading it rather than hard-coding six means a file that
         // says otherwise is honoured instead of quietly reinterpreted.
-        let sliding_window_pattern = opt_usize(model, "attention.sliding_window_pattern")?
-            .filter(|&p| p > 0)
-            .unwrap_or(match architecture {
-                Architecture::Gemma2 => 2,
-                Architecture::Gemma3 => 6,
-                _ => 1,
-            });
+        // Gemma4 instead writes one bool per layer; an array here is read
+        // as the flags themselves, and a scalar keeps the pattern rule.
+        let window_pattern = opt_array(model, "attention.sliding_window_pattern")?;
+        if architecture == Architecture::Gemma4 && window_pattern.is_none() {
+            return Err(missing(model, "attention.sliding_window_pattern"));
+        }
+        let layer_window_flags = match window_pattern {
+            Some(items) => {
+                if items.len() != num_layers {
+                    return Err(GgufError::BadMetadata(format!(
+                        "attention.sliding_window_pattern holds {} entries, block_count is {num_layers}",
+                        items.len()
+                    )));
+                }
+                let mut flags = Vec::with_capacity(items.len());
+                for (index, item) in items.iter().enumerate() {
+                    let flag = match *item {
+                        GgufValue::Bool(value) => value,
+                        _ => item.as_u64().map(|n| n != 0).ok_or_else(|| {
+                            GgufError::BadMetadata(format!(
+                                "attention.sliding_window_pattern entry {index} is not a boolean or unsigned integer: {item:?}"
+                            ))
+                        })?,
+                    };
+                    flags.push(flag);
+                }
+                Some(flags)
+            }
+            None => None,
+        };
+        if layer_window_flags
+            .as_deref()
+            .is_some_and(|flags| flags.iter().any(|&windowed| windowed) && sliding_window.is_none())
+        {
+            return Err(GgufError::BadMetadata(
+                "attention.sliding_window must be greater than zero when a layer is windowed"
+                    .to_string(),
+            ));
+        }
+        // A scalar keeps the pattern rule; the bool-array spelling (Gemma4)
+        // carries no scalar fallback.
+        let sliding_window_pattern = match opt_array(model, "attention.sliding_window_pattern")? {
+            Some(_) => 0,
+            None => opt_usize(model, "attention.sliding_window_pattern")?
+                .filter(|&p| p > 0)
+                .unwrap_or(match architecture {
+                    Architecture::Gemma2 => 2,
+                    Architecture::Gemma3 => 6,
+                    _ => 1,
+                }),
+        };
         let attn_logit_softcap = opt_f32(model, "attn_logit_softcapping")?.filter(|v| *v > 0.0);
         let final_logit_softcap = opt_f32(model, "final_logit_softcapping")?.filter(|v| *v > 0.0);
 
@@ -415,7 +681,7 @@ impl ModelConfig {
         // inventory is the only statement of it.
         let tie_word_embeddings = !model.tensors.contains_key("output.weight");
 
-        Ok(Self {
+        let config = Self {
             architecture,
             vocab_size,
             hidden_size,
@@ -429,18 +695,107 @@ impl ModelConfig {
             rope_theta_local,
             rope_scaling,
             rope_dim,
+            rope_dim_swa,
             context_length,
             sliding_window,
             sliding_window_pattern,
             attn_logit_softcap,
             final_logit_softcap,
             tie_word_embeddings,
-        })
+            head_dim_swa,
+            shared_kv_layers,
+            per_layer_embed_size,
+            layer_window_flags,
+            layer_ffn_sizes,
+            layer_kv_heads,
+        };
+        for layer in 0..config.num_layers {
+            let kv_heads = config.num_kv_heads_at(layer);
+            if !num_heads.is_multiple_of(kv_heads) {
+                return Err(GgufError::BadMetadata(format!(
+                    "attention.head_count {num_heads} is not a whole multiple of \
+                     attention.head_count_kv {kv_heads} at layer {layer}"
+                )));
+            }
+            let source = config.kv_source(layer);
+            if config.head_dim_at(layer) != config.head_dim_at(source)
+                || kv_heads != config.num_kv_heads_at(source)
+            {
+                return Err(GgufError::BadMetadata(format!(
+                    "layer {layer} shares KV with layer {source}, but their cache layouts differ ({} heads × {} wide vs {} heads × {} wide)",
+                    kv_heads,
+                    config.head_dim_at(layer),
+                    config.num_kv_heads_at(source),
+                    config.head_dim_at(source)
+                )));
+            }
+        }
+        Ok(config)
     }
 
-    /// Combined width of the key (or value) projection across all KV heads.
-    pub fn kv_dim(&self) -> usize {
-        self.num_kv_heads as usize * self.head_dim as usize
+    /// The feed-forward width of layer `index`.
+    ///
+    /// Gemma4 writes one width per layer; the default is the model-wide
+    /// [`Self::intermediate_size`].
+    pub fn layer_ffn_size(&self, index: usize) -> usize {
+        self.layer_ffn_sizes
+            .as_deref()
+            .and_then(|widths| widths.get(index))
+            .copied()
+            .unwrap_or(self.intermediate_size)
+    }
+
+    /// Combined width of the key (or value) projection across all KV heads
+    /// on layer `index`.
+    pub fn kv_dim_at(&self, index: usize) -> usize {
+        self.num_kv_heads_at(index) as usize * self.head_dim_at(index) as usize
+    }
+
+    /// Number of K/V heads on layer `index`.
+    pub fn num_kv_heads_at(&self, index: usize) -> u32 {
+        self.layer_kv_heads
+            .as_deref()
+            .and_then(|counts| counts.get(index))
+            .copied()
+            .unwrap_or(self.num_kv_heads)
+    }
+
+    /// Width of one attention head on layer `index`.
+    ///
+    /// Sliding-window layers may be narrower than global ones — Gemma4
+    /// writes `key_length_swa` alongside `key_length` — so this is a
+    /// property of the layer, not of the model.
+    pub fn head_dim_at(&self, index: usize) -> u32 {
+        if self.layer_is_windowed(index) {
+            self.head_dim_swa.unwrap_or(self.head_dim)
+        } else {
+            self.head_dim
+        }
+    }
+
+    /// Number of rotary dimensions on layer `index`.
+    pub fn rope_dim_at(&self, index: usize) -> u32 {
+        if self.layer_is_windowed(index) {
+            self.rope_dim_swa.unwrap_or(self.head_dim_at(index))
+        } else {
+            self.rope_dim
+        }
+    }
+
+    /// The layer whose KV cache layer `index` reads.
+    ///
+    /// [`Self::shared_kv_layers`] counts the layers *sharing* the stack's
+    /// caches: the first `num_layers - shared` blocks own their caches and
+    /// every later one reuses layer `index % owners`'s.
+    pub fn kv_source(&self, index: usize) -> usize {
+        // At least one layer must own a cache, even if the metadata says
+        // every layer shares KV. This matches Gemma4's single-owner case.
+        let owners = self.num_layers.saturating_sub(self.shared_kv_layers).max(1);
+        if index < owners {
+            index
+        } else {
+            index % owners
+        }
     }
 
     /// Combined width of the query projection across all heads.
@@ -463,6 +818,9 @@ impl ModelConfig {
     pub fn layer_is_windowed(&self, index: usize) -> bool {
         if self.sliding_window.is_none() {
             return false;
+        }
+        if let Some(flags) = self.layer_window_flags.as_deref() {
+            return flags.get(index).copied().unwrap_or(false);
         }
         match self.sliding_window_pattern {
             0 | 1 => true,
@@ -553,6 +911,13 @@ fn opt_f32(model: &GgufModel, suffix: &str) -> Result<Option<f32>, GgufError> {
     Ok(typed(model, suffix, "a number", GgufValue::as_f64)?.map(|v| v as f32))
 }
 
+fn opt_array(model: &GgufModel, suffix: &str) -> Result<Option<Vec<GgufValue>>, GgufError> {
+    Ok(model
+        .arch_key(suffix)
+        .and_then(|v| v.as_array())
+        .map(|items| items.to_vec()))
+}
+
 fn opt_string(model: &GgufModel, suffix: &str) -> Result<Option<String>, GgufError> {
     Ok(typed(model, suffix, "a string", |v| match *v {
         GgufValue::String(ref s) => Some(s.as_str()),
@@ -602,12 +967,57 @@ pub(super) fn test_metadata(arch: &str) -> std::collections::HashMap<String, Ggu
     set(&format!("{arch}.rope.freq_base"), GgufValue::F32(10_000.0));
     set(&format!("{arch}.context_length"), GgufValue::U32(512));
     set(&format!("{arch}.vocab_size"), GgufValue::U32(32));
+    if arch == "gemma4" {
+        set(
+            &format!("{arch}.attention.head_count_kv"),
+            GgufValue::Array(vec![GgufValue::U32(1), GgufValue::U32(2)]),
+        );
+        set(&format!("{arch}.attention.key_length"), GgufValue::U32(16));
+        set(
+            &format!("{arch}.attention.value_length"),
+            GgufValue::U32(16),
+        );
+        set(
+            &format!("{arch}.attention.key_length_swa"),
+            GgufValue::U32(8),
+        );
+        set(
+            &format!("{arch}.attention.value_length_swa"),
+            GgufValue::U32(8),
+        );
+        set(&format!("{arch}.rope.dimension_count"), GgufValue::U32(16));
+        set(
+            &format!("{arch}.rope.dimension_count_swa"),
+            GgufValue::U32(8),
+        );
+        set(
+            &format!("{arch}.attention.sliding_window"),
+            GgufValue::U32(128),
+        );
+        set(
+            &format!("{arch}.attention.sliding_window_pattern"),
+            GgufValue::Array(vec![GgufValue::Bool(true), GgufValue::Bool(false)]),
+        );
+        set(
+            &format!("{arch}.feed_forward_length"),
+            GgufValue::Array(vec![GgufValue::U32(128), GgufValue::U32(96)]),
+        );
+        set(
+            &format!("{arch}.embedding_length_per_layer_input"),
+            GgufValue::U32(8),
+        );
+        set(
+            &format!("{arch}.attention.shared_kv_layers"),
+            GgufValue::U32(0),
+        );
+    }
     m
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::load::gguf::fixture::set_arch_key;
     use crate::load::gguf::{GgmlType, GgufTensor};
 
     fn model(arch: &str) -> GgufModel {
@@ -627,7 +1037,7 @@ mod tests {
         assert_eq!(cfg.num_kv_heads, 2);
         assert_eq!(cfg.intermediate_size, 128);
         assert_eq!(cfg.head_dim, 16, "derived from hidden/heads");
-        assert_eq!(cfg.kv_dim(), 32);
+        assert_eq!(cfg.kv_dim_at(0), 32);
         assert_eq!(cfg.context_length, 512);
     }
 
@@ -774,6 +1184,181 @@ mod tests {
         assert!(cfg.layer_is_windowed(0));
         assert!(!cfg.layer_is_windowed(1));
         assert!(cfg.layer_is_windowed(2));
+    }
+
+    #[test]
+    fn gemma4_reads_per_layer_dimensions_and_boolean_window_flags() {
+        let config = ModelConfig::from_gguf(&model("gemma4")).unwrap();
+        assert_eq!(config.layer_ffn_size(0), 128);
+        assert_eq!(config.layer_ffn_size(1), 96);
+        assert_eq!(config.head_dim_at(0), 8);
+        assert_eq!(config.head_dim_at(1), 16);
+        assert_eq!(config.num_kv_heads_at(0), 1);
+        assert_eq!(config.num_kv_heads_at(1), 2);
+        assert_eq!(config.kv_dim_at(0), 8);
+        assert_eq!(config.kv_dim_at(1), 32);
+        assert_eq!(config.rope_dim_at(0), 8);
+        assert_eq!(config.rope_dim_at(1), 16);
+        assert!(config.layer_is_windowed(0));
+        assert!(!config.layer_is_windowed(1));
+        assert_eq!(config.rope_theta, 10_000.0);
+        assert_eq!(config.layer_rope_theta(0), 10_000.0);
+    }
+
+    #[test]
+    fn gemma4_layer_arrays_reject_bad_entries_and_lengths() {
+        for (key, value) in [
+            (
+                "feed_forward_length",
+                GgufValue::Array(vec![GgufValue::U32(128), GgufValue::String("96".into())]),
+            ),
+            (
+                "feed_forward_length",
+                GgufValue::Array(vec![GgufValue::U32(128)]),
+            ),
+            (
+                "attention.sliding_window_pattern",
+                GgufValue::Array(vec![GgufValue::Bool(true)]),
+            ),
+            (
+                "attention.sliding_window_pattern",
+                GgufValue::Array(vec![
+                    GgufValue::Bool(true),
+                    GgufValue::String("false".into()),
+                ]),
+            ),
+            (
+                "attention.head_count_kv",
+                GgufValue::Array(vec![GgufValue::U32(1)]),
+            ),
+            (
+                "attention.head_count_kv",
+                GgufValue::Array(vec![GgufValue::U32(1), GgufValue::U32(0)]),
+            ),
+        ] {
+            let mut m = model("gemma4");
+            m.metadata.insert(format!("gemma4.{key}"), value);
+            assert!(
+                matches!(ModelConfig::from_gguf(&m), Err(GgufError::BadMetadata(_))),
+                "accepted malformed {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn gemma4_requires_its_window_metadata_and_rejects_zero_windows() {
+        let mut missing_pattern = model("gemma4");
+        missing_pattern
+            .metadata
+            .remove("gemma4.attention.sliding_window_pattern");
+        assert!(matches!(
+            ModelConfig::from_gguf(&missing_pattern),
+            Err(GgufError::MissingKey(_))
+        ));
+
+        let mut zero_window = model("gemma4");
+        zero_window.metadata.insert(
+            "gemma4.attention.sliding_window".to_string(),
+            GgufValue::U32(0),
+        );
+        assert!(matches!(
+            ModelConfig::from_gguf(&zero_window),
+            Err(GgufError::BadMetadata(_))
+        ));
+
+        let mut missing_epsilon = model("gemma4");
+        missing_epsilon
+            .metadata
+            .remove("gemma4.attention.layer_norm_rms_epsilon");
+        assert!(matches!(
+            ModelConfig::from_gguf(&missing_epsilon),
+            Err(GgufError::MissingKey(_))
+        ));
+    }
+
+    #[test]
+    fn gemma4_preserves_the_model_specific_rope_defaults() {
+        let mut m = model("gemma4");
+        m.metadata.remove("gemma4.rope.freq_base");
+        m.metadata.remove("gemma4.attention.key_length");
+        m.metadata.remove("gemma4.attention.value_length");
+        m.metadata.remove("gemma4.attention.key_length_swa");
+        m.metadata.remove("gemma4.attention.value_length_swa");
+        m.metadata.remove("gemma4.rope.dimension_count_swa");
+        let config = ModelConfig::from_gguf(&m).unwrap();
+        assert_eq!(config.rope_theta, 1_000_000.0);
+        assert_eq!(config.layer_rope_theta(0), 10_000.0);
+        assert_eq!(config.head_dim_at(0), 256);
+        assert_eq!(config.head_dim_at(1), 256);
+        assert_eq!(config.rope_dim_at(0), 256);
+    }
+
+    #[test]
+    fn shared_kv_uses_a_single_owner_and_requires_matching_head_widths() {
+        let mut m = model("gemma4");
+        set_arch_key(&mut m, "attention.shared_kv_layers", GgufValue::U32(2));
+        set_arch_key(
+            &mut m,
+            "attention.head_count_kv",
+            GgufValue::Array(vec![GgufValue::U32(1), GgufValue::U32(1)]),
+        );
+        // The windowed layer has a narrower head, so both layers sharing
+        // the first cache must use the same width.
+        set_arch_key(&mut m, "attention.key_length_swa", GgufValue::U32(16));
+        set_arch_key(&mut m, "attention.value_length_swa", GgufValue::U32(16));
+        let config = ModelConfig::from_gguf(&m).unwrap();
+        assert_eq!(config.kv_source(0), 0);
+        assert_eq!(config.kv_source(1), 0);
+
+        // Equal flattened cache widths are not enough: the query-to-KV
+        // head mapping also depends on the number of heads.
+        set_arch_key(
+            &mut m,
+            "attention.head_count_kv",
+            GgufValue::Array(vec![GgufValue::U32(2), GgufValue::U32(1)]),
+        );
+        assert!(matches!(
+            ModelConfig::from_gguf(&m),
+            Err(GgufError::BadMetadata(_))
+        ));
+
+        set_arch_key(&mut m, "attention.shared_kv_layers", GgufValue::U32(3));
+        assert!(matches!(
+            ModelConfig::from_gguf(&m),
+            Err(GgufError::BadMetadata(_))
+        ));
+
+        set_arch_key(&mut m, "attention.shared_kv_layers", GgufValue::U32(1));
+        set_arch_key(&mut m, "attention.key_length_swa", GgufValue::U32(8));
+        set_arch_key(&mut m, "attention.value_length_swa", GgufValue::U32(8));
+        assert!(matches!(
+            ModelConfig::from_gguf(&m),
+            Err(GgufError::BadMetadata(_))
+        ));
+    }
+
+    #[test]
+    fn key_value_and_rotary_widths_must_match_the_decoder_ops() {
+        let mut value_mismatch = model("gemma4");
+        set_arch_key(
+            &mut value_mismatch,
+            "attention.value_length_swa",
+            GgufValue::U32(16),
+        );
+        assert!(matches!(
+            ModelConfig::from_gguf(&value_mismatch),
+            Err(GgufError::BadMetadata(_))
+        ));
+
+        let mut rope_mismatch = model("gemma4");
+        set_arch_key(
+            &mut rope_mismatch,
+            "rope.dimension_count_swa",
+            GgufValue::U32(4),
+        );
+        let config = ModelConfig::from_gguf(&rope_mismatch).unwrap();
+        assert_eq!(config.rope_dim_at(0), 4);
+        assert_ne!(config.rope_dim_at(0), config.head_dim_at(0));
     }
 
     #[test]

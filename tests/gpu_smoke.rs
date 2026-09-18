@@ -2484,6 +2484,54 @@ fn rope_per_head_correctness() {
 }
 
 #[test]
+fn rope_dynamic_offset_factors_matches_per_pair_reference() {
+    let seq = 2usize;
+    let head_dim = 8u32;
+    let dim = head_dim as usize;
+    let theta = 10_000.0f32;
+    let factors = [1.0f32, 1.0e30, 0.5, 2.0];
+
+    let mut g = Graph::new();
+    let x = g.input("x", &[seq, dim]);
+    let position = g.input_u32("position", &[1]);
+    let factor_param = g.parameter("factors", &[factors.len()]);
+    let y = g.rope_dynamic_offset_factors(x, theta, position, head_dim, factor_param);
+    g.set_outputs(vec![y]);
+
+    let input: Vec<f32> = (0..seq * dim).map(|i| (i as f32 + 1.0) * 0.25).collect();
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    session.set_input("x", &input);
+    session.set_input_u32("position", &[3]);
+    session.set_parameter("factors", &factors);
+    session.step();
+    session.wait();
+    let output = session.read_output(seq * dim);
+
+    let half_head = (head_dim / 2) as usize;
+    let mut expected = input.clone();
+    for row in 0..seq {
+        let pos = (3 + row) as f32;
+        for (pair, &factor) in factors.iter().enumerate() {
+            let angle = pos * theta.powf(-2.0 * pair as f32 / head_dim as f32) / factor;
+            let (sin, cos) = angle.sin_cos();
+            let i0 = row * dim + pair;
+            let i1 = i0 + half_head;
+            let v0 = input[i0];
+            let v1 = input[i1];
+            expected[i0] = v0 * cos - v1 * sin;
+            expected[i1] = v0 * sin + v1 * cos;
+        }
+    }
+
+    for (i, (&actual, &expected)) in output.iter().zip(&expected).enumerate() {
+        assert!(
+            (actual - expected).abs() < 1e-4,
+            "rope factor result {i}: got {actual}, expected {expected}"
+        );
+    }
+}
+
+#[test]
 fn cross_entropy_gradient_check() {
     // Verify cross_entropy_loss backward via finite differences.
     // loss = cross_entropy(W @ x, labels)
