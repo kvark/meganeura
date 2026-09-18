@@ -573,6 +573,7 @@ fn lower_pointwise(dag: &PointwiseDAG, grid: GridShape) -> ShaderModule {
     ShaderModule {
         module,
         source: src,
+        hint: "pointwise",
     }
 }
 
@@ -864,6 +865,7 @@ fn lower_reduction(
     ShaderModule {
         module,
         source: src,
+        hint: "reduction",
     }
 }
 
@@ -989,6 +991,7 @@ fn lower_attention(mask: AttentionMask, head_dim: u32, output_lse: bool) -> Shad
     ShaderModule {
         module,
         source: src,
+        hint: "attention",
     }
 }
 

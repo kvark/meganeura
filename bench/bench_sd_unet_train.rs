@@ -5,7 +5,7 @@ use meganeura::Graph;
 /// structurally matching the Stable Diffusion 1.5 U-Net.
 ///
 /// Outputs JSON to stdout (for compare.sh), human-readable to stderr.
-use meganeura::models::sd_unet::{self, Config};
+use meganeura::models::sd_unet;
 use std::time::Instant;
 
 fn main() {
@@ -23,9 +23,9 @@ fn main() {
     let steps_per_run: usize = parse_arg("--steps").unwrap_or(20);
 
     let cfg = if use_small {
-        Config::small()
+        sd_unet::Config::small()
     } else {
-        Config::tiny()
+        sd_unet::Config::tiny()
     };
 
     let batch = cfg.batch_size;

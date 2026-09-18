@@ -1,7 +1,4 @@
-use meganeura::{
-    Graph, Mode, SessionConfig,
-    optimize::{self, OptimizeConfig},
-};
+use meganeura::{Graph, Mode, SessionConfig, optimize};
 
 fn graph() -> Graph {
     let mut g = Graph::new();
@@ -18,7 +15,7 @@ fn graph() -> Graph {
 #[test]
 fn tied_convolutions_share_one_derived_weight() {
     let mut g = graph();
-    optimize::apply_winograd_conv_fusions(&mut g, &mut Vec::new(), &OptimizeConfig::default());
+    optimize::apply_winograd_conv_fusions(&mut g, &mut Vec::new(), &Default::default());
     assert_eq!(g.derived_params.len(), 1);
     let nodes: Vec<_> = g
         .nodes()
@@ -39,7 +36,7 @@ fn portable_checkpoint_roundtrips_between_direct_and_shared_winograd() {
             SessionConfig {
                 mode: Mode::Inference,
                 gpu: Some(context.clone()),
-                optimize: OptimizeConfig {
+                optimize: optimize::OptimizeConfig {
                     no_winograd: direct,
                     ..Default::default()
                 },

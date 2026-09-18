@@ -114,41 +114,36 @@ fn preprocess(source: &str, vars: &[(&str, &str)]) -> String {
 pub struct ShaderModule {
     pub module: Module,
     pub source: String,
+    pub hint: &'static str,
 }
 
-static WGSL_DUMP_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+impl ShaderModule {
+    fn new(source: &str) -> Self {
+        Self {
+            module: parse_source(source).expect("WGSL parse failed"),
+            source: source.to_string(),
+            hint: "",
+        }
+    }
 
-/// Route every generated/parsed WGSL shader into `dir` (debug hook; the
-/// `MEGANEURA_DUMP_WGSL` mapping in `crate::config` calls this). First
-/// call wins for the process lifetime.
-pub fn set_wgsl_dump_dir(dir: impl Into<String>) {
-    let _ = WGSL_DUMP_DIR.set(dir.into());
-}
+    /// Dump WGSL source into the configured directory.
+    pub fn dump(&self, dir: &str) {
+        let hint = if self.hint.is_empty() {
+            self.module
+                .entry_points
+                .first()
+                .map(|e| e.name.as_str())
+                .unwrap_or("shader")
+        } else {
+            self.hint
+        };
 
-/// Dump WGSL source to the configured dump dir, if any.
-fn maybe_dump_wgsl(source: &str, hint: &str) {
-    if let Some(dir) = WGSL_DUMP_DIR.get() {
         let _ = std::fs::create_dir_all(dir);
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        std::hash::Hash::hash(source, &mut hasher);
+        std::hash::Hash::hash(&self.source, &mut hasher);
         let h = std::hash::Hasher::finish(&hasher);
         let path = std::path::Path::new(&dir).join(format!("{hint}_{h:x}.wgsl"));
-        let _ = std::fs::write(path, source);
-    }
-}
-
-/// Parse a WGSL source string into a [`ShaderModule`].
-fn parse_wgsl(source: &str) -> ShaderModule {
-    let module = parse_source(source).expect("WGSL parse failed");
-    let entry = module
-        .entry_points
-        .first()
-        .map(|e| e.name.as_str())
-        .unwrap_or("shader");
-    maybe_dump_wgsl(source, entry);
-    ShaderModule {
-        module,
-        source: source.to_string(),
+        let _ = std::fs::write(path, self.source.as_bytes());
     }
 }
 
@@ -307,9 +302,9 @@ pub enum EpilogueSource<'a> {
 /// Tuning knobs for the register-tiled scalar matmul codegen.
 ///
 /// Defaults are what the plain kernel ships with: 32-row K staging and
-/// sequential columns. `TuningKnobs` (compile.rs) carries the resolved
-/// values, which the config resolver copies in through
-/// [`set_matmul_knobs`].
+/// sequential columns. Resolved values come from `TuningKnobs`
+/// (`crate::compile`) and travel with `MatMulOptions` — nothing reads a
+/// process global.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MatmulKnobs {
     /// K staging depth: how many B rows each shared-memory stage loads
@@ -329,22 +324,6 @@ impl Default for MatmulKnobs {
     }
 }
 
-static MATMUL_KNOBS: std::sync::OnceLock<MatmulKnobs> = std::sync::OnceLock::new();
-
-/// Install the matmul codegen knobs the config resolver resolved.
-///
-/// First call wins for the process lifetime, like
-/// [`set_wgsl_dump_dir`]: the generated variants are fixed when a
-/// pipeline is first compiled.
-pub fn set_matmul_knobs(knobs: MatmulKnobs) {
-    let _ = MATMUL_KNOBS.set(knobs);
-}
-
-/// The installed knobs, or the plain-kernel defaults.
-fn matmul_knobs() -> MatmulKnobs {
-    *MATMUL_KNOBS.get().unwrap_or(&MatmulKnobs::default())
-}
-
 /// How to specialize the matmul the epilogue is fused into.
 ///
 /// [`Default`] is the plain f32 64×64 kernel, so a caller that only wants
@@ -356,6 +335,9 @@ pub struct MatMulOptions {
     /// Tile geometry. Must match what the dispatch's workgroup count was
     /// computed for, or the grid and the kernel disagree about coverage.
     pub tile: MatMulTile,
+    /// K staging depth and column layout for the tiled skeleton; only
+    /// consulted for f32 B storage, quantized formats have their own.
+    pub knobs: MatmulKnobs,
 }
 
 /// Generate a matmul shader module with a fused epilogue chain.
@@ -575,35 +557,35 @@ pub enum ShaderGroup {
 }
 
 /// Generate a `naga::Module` for a shader group.
-pub fn generate_module(group: ShaderGroup) -> ShaderModule {
+pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
     match group {
-        ShaderGroup::Unary => parse_wgsl(include_str!("shaders/unary.wgsl")),
-        ShaderGroup::Binary => parse_wgsl(include_str!("shaders/binary.wgsl")),
-        ShaderGroup::BiasAdd => parse_wgsl(include_str!("shaders/bias_add.wgsl")),
-        ShaderGroup::Sgd => parse_wgsl(include_str!("shaders/sgd.wgsl")),
-        ShaderGroup::Adam => parse_wgsl(include_str!("shaders/adam.wgsl")),
-        ShaderGroup::Transpose => parse_wgsl(include_str!("shaders/transpose.wgsl")),
-        ShaderGroup::MatMul => gen_matmul(),
-        ShaderGroup::MatMulAdd => gen_matmul_add(),
-        ShaderGroup::MatMulAT => gen_matmul_at(),
-        ShaderGroup::MatMulBT => gen_matmul_bt(),
+        ShaderGroup::Unary => ShaderModule::new(include_str!("shaders/unary.wgsl")),
+        ShaderGroup::Binary => ShaderModule::new(include_str!("shaders/binary.wgsl")),
+        ShaderGroup::BiasAdd => ShaderModule::new(include_str!("shaders/bias_add.wgsl")),
+        ShaderGroup::Sgd => ShaderModule::new(include_str!("shaders/sgd.wgsl")),
+        ShaderGroup::Adam => ShaderModule::new(include_str!("shaders/adam.wgsl")),
+        ShaderGroup::Transpose => ShaderModule::new(include_str!("shaders/transpose.wgsl")),
+        ShaderGroup::MatMul => gen_matmul(knobs),
+        ShaderGroup::MatMulAdd => gen_matmul_add(knobs),
+        ShaderGroup::MatMulAT => gen_matmul_at(knobs),
+        ShaderGroup::MatMulBT => gen_matmul_bt(knobs),
         ShaderGroup::BlockMatMul | ShaderGroup::BlockMatMulAT | ShaderGroup::BlockMatMulBT => {
             gen_block_matmul(group, MatMulTile::Large)
         }
-        ShaderGroup::MatMulATAdd => gen_matmul_at_add(),
-        ShaderGroup::MatMulBTAdd => gen_matmul_bt_add(),
+        ShaderGroup::MatMulATAdd => gen_matmul_at_add(knobs),
+        ShaderGroup::MatMulBTAdd => gen_matmul_bt_add(knobs),
         ShaderGroup::MatMulGemv | ShaderGroup::MatMulGemvAdd | ShaderGroup::MatMulGemvBT => {
             generate_module_gemv(group, WeightFormat::F32, GemvShape::initial(group))
         }
-        ShaderGroup::Reduce => parse_wgsl(include_str!("shaders/reduce.wgsl")),
-        ShaderGroup::Softmax => parse_wgsl(include_str!("shaders/softmax.wgsl")),
-        ShaderGroup::CrossEntropy => parse_wgsl(include_str!("shaders/cross_entropy.wgsl")),
-        ShaderGroup::RmsNorm => parse_wgsl(include_str!("shaders/rms_norm.wgsl")),
-        ShaderGroup::Embedding => parse_wgsl(include_str!("shaders/embedding.wgsl")),
-        ShaderGroup::ToF16 => parse_wgsl(include_str!("shaders/to_f16.wgsl")),
-        ShaderGroup::RoPE => parse_wgsl(include_str!("shaders/rope.wgsl")),
-        ShaderGroup::RoPEGrad => parse_wgsl(include_str!("shaders/rope_grad.wgsl")),
-        ShaderGroup::LayerNorm => parse_wgsl(include_str!("shaders/layer_norm.wgsl")),
+        ShaderGroup::Reduce => ShaderModule::new(include_str!("shaders/reduce.wgsl")),
+        ShaderGroup::Softmax => ShaderModule::new(include_str!("shaders/softmax.wgsl")),
+        ShaderGroup::CrossEntropy => ShaderModule::new(include_str!("shaders/cross_entropy.wgsl")),
+        ShaderGroup::RmsNorm => ShaderModule::new(include_str!("shaders/rms_norm.wgsl")),
+        ShaderGroup::Embedding => ShaderModule::new(include_str!("shaders/embedding.wgsl")),
+        ShaderGroup::ToF16 => ShaderModule::new(include_str!("shaders/to_f16.wgsl")),
+        ShaderGroup::RoPE => ShaderModule::new(include_str!("shaders/rope.wgsl")),
+        ShaderGroup::RoPEGrad => ShaderModule::new(include_str!("shaders/rope_grad.wgsl")),
+        ShaderGroup::LayerNorm => ShaderModule::new(include_str!("shaders/layer_norm.wgsl")),
         ShaderGroup::MultiHeadAttn => {
             // Default head_dim=64 fallback; runtime calls
             // generate_attention_module(head_dim) directly for the actual value.
@@ -620,39 +602,51 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::FlashAttentionCoop => generate_flash_attention_coop_module(64),
         ShaderGroup::FlashGradQCoop => generate_flash_grad_q_coop_module(64),
         ShaderGroup::FlashGradKVCoop => generate_flash_grad_kv_coop_module(64),
-        ShaderGroup::MultiHeadAttnGradQ => parse_wgsl(include_str!("shaders/mha_grad_q.wgsl")),
+        ShaderGroup::MultiHeadAttnGradQ => {
+            ShaderModule::new(include_str!("shaders/mha_grad_q.wgsl"))
+        }
         ShaderGroup::FlashGradQ => generate_flash_grad_q_module(
             64,
             crate::compile::TuningKnobs::default().flash_grad_q_ept_cap,
         ),
-        ShaderGroup::MultiHeadAttnGradKV => parse_wgsl(include_str!("shaders/mha_grad_kv.wgsl")),
+        ShaderGroup::MultiHeadAttnGradKV => {
+            ShaderModule::new(include_str!("shaders/mha_grad_kv.wgsl"))
+        }
         ShaderGroup::FlashGradKV => generate_flash_grad_kv_module(
             64,
             crate::compile::TuningKnobs::default().flash_grad_kv_ept_cap,
         ),
-        ShaderGroup::SwiGLUGrad => parse_wgsl(include_str!("shaders/swiglu_grad.wgsl")),
-        ShaderGroup::SwiGLUConcat => parse_wgsl(include_str!("shaders/swiglu_concat.wgsl")),
-        ShaderGroup::SumRows => parse_wgsl(include_str!("shaders/sum_rows.wgsl")),
-        ShaderGroup::RmsNormGrad => parse_wgsl(include_str!("shaders/rms_norm_grad.wgsl")),
+        ShaderGroup::SwiGLUGrad => ShaderModule::new(include_str!("shaders/swiglu_grad.wgsl")),
+        ShaderGroup::SwiGLUConcat => ShaderModule::new(include_str!("shaders/swiglu_concat.wgsl")),
+        ShaderGroup::SumRows => ShaderModule::new(include_str!("shaders/sum_rows.wgsl")),
+        ShaderGroup::RmsNormGrad => ShaderModule::new(include_str!("shaders/rms_norm_grad.wgsl")),
         ShaderGroup::RmsNormGradWRowPar => {
-            parse_wgsl(include_str!("shaders/rms_norm_grad_w_rowpar.wgsl"))
+            ShaderModule::new(include_str!("shaders/rms_norm_grad_w_rowpar.wgsl"))
         }
-        ShaderGroup::LayerNormGrad => parse_wgsl(include_str!("shaders/layer_norm_grad.wgsl")),
-        ShaderGroup::RmsNormRsqrt => parse_wgsl(include_str!("shaders/rms_norm_rsqrt.wgsl")),
-        ShaderGroup::ScatterAdd => parse_wgsl(include_str!("shaders/scatter_add.wgsl")),
+        ShaderGroup::LayerNormGrad => {
+            ShaderModule::new(include_str!("shaders/layer_norm_grad.wgsl"))
+        }
+        ShaderGroup::RmsNormRsqrt => ShaderModule::new(include_str!("shaders/rms_norm_rsqrt.wgsl")),
+        ShaderGroup::ScatterAdd => ShaderModule::new(include_str!("shaders/scatter_add.wgsl")),
         ShaderGroup::ScatterAddAtomic => {
-            parse_wgsl(include_str!("shaders/scatter_add_atomic.wgsl"))
+            ShaderModule::new(include_str!("shaders/scatter_add_atomic.wgsl"))
         }
-        ShaderGroup::BceLoss => parse_wgsl(include_str!("shaders/bce.wgsl")),
-        ShaderGroup::GroupNorm => parse_wgsl(include_str!("shaders/group_norm.wgsl")),
-        ShaderGroup::GroupNormGrad => parse_wgsl(include_str!("shaders/group_norm_grad.wgsl")),
-        ShaderGroup::Concat => parse_wgsl(include_str!("shaders/concat.wgsl")),
-        ShaderGroup::Split => parse_wgsl(include_str!("shaders/split.wgsl")),
-        ShaderGroup::Upsample => parse_wgsl(include_str!("shaders/upsample.wgsl")),
-        ShaderGroup::UpsampleGrad => parse_wgsl(include_str!("shaders/upsample_grad.wgsl")),
-        ShaderGroup::Conv2dDw => parse_wgsl(include_str!("shaders/conv2d_dw.wgsl")),
-        ShaderGroup::MulPerChannel => parse_wgsl(include_str!("shaders/mul_per_channel.wgsl")),
-        ShaderGroup::AddPerChannel => parse_wgsl(include_str!("shaders/add_per_channel.wgsl")),
+        ShaderGroup::BceLoss => ShaderModule::new(include_str!("shaders/bce.wgsl")),
+        ShaderGroup::GroupNorm => ShaderModule::new(include_str!("shaders/group_norm.wgsl")),
+        ShaderGroup::GroupNormGrad => {
+            ShaderModule::new(include_str!("shaders/group_norm_grad.wgsl"))
+        }
+        ShaderGroup::Concat => ShaderModule::new(include_str!("shaders/concat.wgsl")),
+        ShaderGroup::Split => ShaderModule::new(include_str!("shaders/split.wgsl")),
+        ShaderGroup::Upsample => ShaderModule::new(include_str!("shaders/upsample.wgsl")),
+        ShaderGroup::UpsampleGrad => ShaderModule::new(include_str!("shaders/upsample_grad.wgsl")),
+        ShaderGroup::Conv2dDw => ShaderModule::new(include_str!("shaders/conv2d_dw.wgsl")),
+        ShaderGroup::MulPerChannel => {
+            ShaderModule::new(include_str!("shaders/mul_per_channel.wgsl"))
+        }
+        ShaderGroup::AddPerChannel => {
+            ShaderModule::new(include_str!("shaders/add_per_channel.wgsl"))
+        }
         ShaderGroup::Conv2dGemm
         | ShaderGroup::Conv2dGemmSmall
         | ShaderGroup::Conv2dGradInputGemm
@@ -662,18 +656,20 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
                 "conv coop kernels are generated per (kernel, stride) via generate_conv2d_coop_module"
             )
         }
-        ShaderGroup::GroupNormSilu => parse_wgsl(include_str!("shaders/group_norm_silu.wgsl")),
+        ShaderGroup::GroupNormSilu => {
+            ShaderModule::new(include_str!("shaders/group_norm_silu.wgsl"))
+        }
         ShaderGroup::WinogradInputTransform => {
-            parse_wgsl(include_str!("shaders/winograd_input_transform.wgsl"))
+            ShaderModule::new(include_str!("shaders/winograd_input_transform.wgsl"))
         }
         ShaderGroup::WinogradOutputTransform => {
-            parse_wgsl(include_str!("shaders/winograd_output_transform.wgsl"))
+            ShaderModule::new(include_str!("shaders/winograd_output_transform.wgsl"))
         }
         ShaderGroup::WinogradBatchedMatMul => {
-            parse_wgsl(include_str!("shaders/winograd_matmul.wgsl"))
+            ShaderModule::new(include_str!("shaders/winograd_matmul.wgsl"))
         }
         ShaderGroup::WinogradWeightTransform => {
-            parse_wgsl(include_str!("shaders/winograd_weight_transform.wgsl"))
+            ShaderModule::new(include_str!("shaders/winograd_weight_transform.wgsl"))
         }
         ShaderGroup::Conv2dGradWeightGemm => {
             conv_grad_weight_tiled(MatMulTile::Large, false, 16, None)
@@ -687,33 +683,41 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         ShaderGroup::Conv2dGradWeightGemmSplitSmall => {
             conv_grad_weight_tiled(MatMulTile::Small, true, 16, None)
         }
-        ShaderGroup::CacheWrite => parse_wgsl(include_str!("shaders/cache_write.wgsl")),
+        ShaderGroup::CacheWrite => ShaderModule::new(include_str!("shaders/cache_write.wgsl")),
         ShaderGroup::CacheWritePrefix => {
-            parse_wgsl(include_str!("shaders/cache_write_prefix.wgsl"))
+            ShaderModule::new(include_str!("shaders/cache_write_prefix.wgsl"))
         }
-        ShaderGroup::CachedAttention => parse_wgsl(include_str!("shaders/cached_attention.wgsl")),
+        ShaderGroup::CachedAttention => {
+            ShaderModule::new(include_str!("shaders/cached_attention.wgsl"))
+        }
         ShaderGroup::CachedQueryAttention => generate_flash_attention(64, 8, true),
         ShaderGroup::CachedBlockAttention => {
-            parse_wgsl(include_str!("shaders/cached_block_attention.wgsl"))
+            ShaderModule::new(include_str!("shaders/cached_block_attention.wgsl"))
         }
         ShaderGroup::ChunkedRelativeAttention => {
-            parse_wgsl(include_str!("shaders/chunked_relative_attention.wgsl"))
+            ShaderModule::new(include_str!("shaders/chunked_relative_attention.wgsl"))
         }
-        ShaderGroup::PrefixLast => parse_wgsl(include_str!("shaders/prefix_last.wgsl")),
-        ShaderGroup::RoPEDynamic => parse_wgsl(include_str!("shaders/rope_dynamic.wgsl")),
-        ShaderGroup::MaxPool2d => parse_wgsl(include_str!("shaders/max_pool_2d.wgsl")),
-        ShaderGroup::GlobalAvgPool => parse_wgsl(include_str!("shaders/global_avg_pool.wgsl")),
+        ShaderGroup::PrefixLast => ShaderModule::new(include_str!("shaders/prefix_last.wgsl")),
+        ShaderGroup::RoPEDynamic => ShaderModule::new(include_str!("shaders/rope_dynamic.wgsl")),
+        ShaderGroup::MaxPool2d => ShaderModule::new(include_str!("shaders/max_pool_2d.wgsl")),
+        ShaderGroup::GlobalAvgPool => {
+            ShaderModule::new(include_str!("shaders/global_avg_pool.wgsl"))
+        }
         ShaderGroup::GlobalAvgPoolGrad => {
-            parse_wgsl(include_str!("shaders/global_avg_pool_grad.wgsl"))
+            ShaderModule::new(include_str!("shaders/global_avg_pool_grad.wgsl"))
         }
-        ShaderGroup::PairwiseGrad => parse_wgsl(include_str!("shaders/pairwise_grad.wgsl")),
-        ShaderGroup::GradClipZero => parse_wgsl(include_str!("shaders/grad_clip_zero.wgsl")),
-        ShaderGroup::GradClipNormSq => parse_wgsl(include_str!("shaders/grad_clip_norm_sq.wgsl")),
-        ShaderGroup::GradClipScale => parse_wgsl(include_str!("shaders/grad_clip_scale.wgsl")),
+        ShaderGroup::PairwiseGrad => ShaderModule::new(include_str!("shaders/pairwise_grad.wgsl")),
+        ShaderGroup::GradClipZero => ShaderModule::new(include_str!("shaders/grad_clip_zero.wgsl")),
+        ShaderGroup::GradClipNormSq => {
+            ShaderModule::new(include_str!("shaders/grad_clip_norm_sq.wgsl"))
+        }
+        ShaderGroup::GradClipScale => {
+            ShaderModule::new(include_str!("shaders/grad_clip_scale.wgsl"))
+        }
         ShaderGroup::AdaptiveGradClip => {
-            parse_wgsl(include_str!("shaders/adaptive_grad_clip.wgsl"))
+            ShaderModule::new(include_str!("shaders/adaptive_grad_clip.wgsl"))
         }
-        ShaderGroup::GradAccum => parse_wgsl(include_str!("shaders/grad_accum.wgsl")),
+        ShaderGroup::GradAccum => ShaderModule::new(include_str!("shaders/grad_accum.wgsl")),
     }
 }
 
@@ -754,7 +758,7 @@ pub fn generate_horizontal_matmul(
     assert!((2..=3).contains(&count));
     let base = match coop {
         Some(config) => generate_module_coop(group, config),
-        None => generate_module(group),
+        None => generate_module(group, MatmulKnobs::default()),
     };
     let src = &base.source;
     let Some((header, rest)) = src.split_once("@compute") else {
@@ -818,12 +822,12 @@ pub fn generate_horizontal_matmul(
         dispatch.push_str(&format!("    {cond} {{ horiz_{i}(wgid, lid); }}\n"));
     }
     dispatch.push_str("}\n");
-    parse_wgsl(&format!("{header}{bodies}{dispatch}"))
+    ShaderModule::new(&format!("{header}{bodies}{dispatch}"))
 }
 
 /// Generate WGSL source for a shader group.
 pub fn generate_wgsl(group: ShaderGroup) -> String {
-    let sm = generate_module(group);
+    let sm = generate_module(group, MatmulKnobs::default());
     let capabilities = match group {
         ShaderGroup::Conv2dGemmCoop | ShaderGroup::Conv2dGradInputGemmCoop => {
             naga::valid::Capabilities::COOPERATIVE_MATRIX
@@ -901,6 +905,7 @@ fn matmul_vars(
     b_col: &str,
     fused_decl: &str,
     fused_expr: &str,
+    knobs: MatmulKnobs,
 ) -> ShaderModule {
     matmul_vars_full(
         a_idx,
@@ -914,6 +919,7 @@ fn matmul_vars(
         "",
         "",
         WeightFormat::F32,
+        knobs,
     )
 }
 
@@ -927,9 +933,10 @@ fn matmul_vars_with_mode(
     fused_decl: &str,
     fused_expr: &str,
     mode: WeightFormat,
+    knobs: MatmulKnobs,
 ) -> ShaderModule {
     matmul_vars_full(
-        a_idx, b_idx, a_row, a_col, b_row, b_col, fused_decl, fused_expr, "", "", mode,
+        a_idx, b_idx, a_row, a_col, b_row, b_col, fused_decl, fused_expr, "", "", mode, knobs,
     )
 }
 
@@ -1046,7 +1053,7 @@ fn conv_gemm_tiled(
             ("$ACC_ARRAY", &acc_array),
         ],
     );
-    parse_wgsl(&src)
+    ShaderModule::new(&src)
 }
 
 fn conv_grad_weight_tiled(
@@ -1153,6 +1160,7 @@ fn matmul_vars_full(
     epilogue_decl: &str,
     epilogue_body: &str,
     b_mode: WeightFormat,
+    knobs: MatmulKnobs,
 ) -> ShaderModule {
     matmul_vars_tiled(
         MatMulIndexing {
@@ -1172,6 +1180,7 @@ fn matmul_vars_full(
         MatMulOptions {
             format: b_mode,
             tile: MatMulTile::Large,
+            knobs,
         },
     )
 }
@@ -1215,6 +1224,7 @@ fn matmul_vars_tiled(
     let MatMulOptions {
         format: b_mode,
         tile,
+        knobs,
     } = options;
     let src = include_str!("shaders/matmul.wgsl");
     let full_decl = if epilogue_decl.is_empty() {
@@ -1325,17 +1335,17 @@ fn matmul_vars_tiled(
     };
     let bm = tile.bm();
     let tm = tile.tm();
-    let knobs = matmul_knobs();
-    let k_tile = if b_mode == WeightFormat::F32 {
-        assert!(
-            matches!(knobs.k_stage, 8 | 16 | 32),
-            "unsupported scalar matmul K stage: {}",
-            knobs.k_stage
-        );
-        knobs.k_stage
-    } else {
-        32
+    // The knobs only define the f32 skeleton; quantized and f16 B storage
+    // have their own layouts.
+    let k_tile = match b_mode {
+        WeightFormat::F32 => knobs.k_stage,
+        _ => 32,
     };
+    assert!(
+        matches!(knobs.k_stage, 8 | 16 | 32),
+        "unsupported scalar matmul K stage: {}",
+        knobs.k_stage
+    );
     let interleave_columns = b_mode == WeightFormat::F32 && knobs.interleave_columns;
     let (acc_decl, compute_body, acc_array) = tiled_matmul_body(tile, k_tile, interleave_columns);
     let output_column = if interleave_columns {
@@ -1377,7 +1387,7 @@ fn matmul_vars_tiled(
             ("$ACC_ARRAY", &acc_array),
         ],
     );
-    parse_wgsl(&src)
+    ShaderModule::new(&src)
 }
 
 /// f16 → f32 for the packed-weight kernels' block scales.
@@ -1491,6 +1501,7 @@ fn matmul_small_vars(
     b_col: &str,
     fused_decl: &str,
     fused_expr: &str,
+    knobs: MatmulKnobs,
 ) -> ShaderModule {
     matmul_vars_tiled(
         MatMulIndexing {
@@ -1508,13 +1519,14 @@ fn matmul_small_vars(
         "",
         "",
         MatMulOptions {
+            format: WeightFormat::F32,
             tile: MatMulTile::Small,
-            ..Default::default()
+            knobs,
         },
     )
 }
 
-fn gen_matmul_small() -> ShaderModule {
+fn gen_matmul_small(knobs: MatmulKnobs) -> ShaderModule {
     matmul_small_vars(
         MATMUL_A_FWD,
         MATMUL_B_FWD,
@@ -1524,9 +1536,10 @@ fn gen_matmul_small() -> ShaderModule {
         B_COL_FWD_S,
         "",
         "",
+        knobs,
     )
 }
-fn gen_matmul_small_add() -> ShaderModule {
+fn gen_matmul_small_add(knobs: MatmulKnobs) -> ShaderModule {
     matmul_small_vars(
         MATMUL_A_FWD,
         MATMUL_B_FWD,
@@ -1536,9 +1549,10 @@ fn gen_matmul_small_add() -> ShaderModule {
         B_COL_FWD_S,
         "var<storage> src: array<f32>;",
         " + src[idx]",
+        knobs,
     )
 }
-fn gen_matmul_small_at() -> ShaderModule {
+fn gen_matmul_small_at(knobs: MatmulKnobs) -> ShaderModule {
     matmul_small_vars(
         MATMUL_A_AT,
         MATMUL_B_FWD,
@@ -1548,9 +1562,10 @@ fn gen_matmul_small_at() -> ShaderModule {
         B_COL_FWD_S,
         "",
         "",
+        knobs,
     )
 }
-fn gen_matmul_small_bt() -> ShaderModule {
+fn gen_matmul_small_bt(knobs: MatmulKnobs) -> ShaderModule {
     matmul_small_vars(
         MATMUL_A_FWD,
         MATMUL_B_BT,
@@ -1560,10 +1575,11 @@ fn gen_matmul_small_bt() -> ShaderModule {
         B_COL_BT_S,
         "",
         "",
+        knobs,
     )
 }
 
-fn gen_matmul() -> ShaderModule {
+fn gen_matmul(knobs: MatmulKnobs) -> ShaderModule {
     matmul_vars(
         MATMUL_A_FWD,
         MATMUL_B_FWD,
@@ -1573,10 +1589,11 @@ fn gen_matmul() -> ShaderModule {
         B_COL_FWD,
         "",
         "",
+        knobs,
     )
 }
 
-fn gen_matmul_add() -> ShaderModule {
+fn gen_matmul_add(knobs: MatmulKnobs) -> ShaderModule {
     matmul_vars(
         MATMUL_A_FWD,
         MATMUL_B_FWD,
@@ -1586,11 +1603,12 @@ fn gen_matmul_add() -> ShaderModule {
         B_COL_FWD,
         "var<storage> src: array<f32>;",
         " + src[idx]",
+        knobs,
     )
 }
 
 /// FusedMatMulATAdd: C = A^T × B + D  (A=[K,M], B=[K,N], D=[M,N], C=[M,N])
-fn gen_matmul_at_add() -> ShaderModule {
+fn gen_matmul_at_add(knobs: MatmulKnobs) -> ShaderModule {
     matmul_vars(
         MATMUL_A_AT,
         MATMUL_B_FWD,
@@ -1600,11 +1618,12 @@ fn gen_matmul_at_add() -> ShaderModule {
         B_COL_FWD,
         "var<storage> src: array<f32>;",
         " + src[idx]",
+        knobs,
     )
 }
 
 /// FusedMatMulBTAdd: C = A × B^T + D  (A=[M,K], B=[N,K], D=[M,N], C=[M,N])
-fn gen_matmul_bt_add() -> ShaderModule {
+fn gen_matmul_bt_add(knobs: MatmulKnobs) -> ShaderModule {
     matmul_vars(
         MATMUL_A_FWD,
         MATMUL_B_BT,
@@ -1614,6 +1633,7 @@ fn gen_matmul_bt_add() -> ShaderModule {
         B_COL_BT,
         "var<storage> src: array<f32>;",
         " + src[idx]",
+        knobs,
     )
 }
 
@@ -1621,7 +1641,7 @@ fn gen_matmul_bt_add() -> ShaderModule {
 ///
 /// Coalesced B load: consecutive threads read adjacent K values from B[N,K]
 /// (K is the row-major fast dimension), then store transposed into shared_b.
-fn gen_matmul_bt() -> ShaderModule {
+fn gen_matmul_bt(knobs: MatmulKnobs) -> ShaderModule {
     matmul_vars(
         MATMUL_A_FWD,
         MATMUL_B_BT,
@@ -1631,6 +1651,7 @@ fn gen_matmul_bt() -> ShaderModule {
         B_COL_BT,
         "",
         "",
+        knobs,
     )
 }
 
@@ -1638,7 +1659,7 @@ fn gen_matmul_bt() -> ShaderModule {
 ///
 /// Coalesced A load: consecutive threads read adjacent M values from A[K,M]
 /// (M is the row-major fast dimension), then store transposed into shared_a.
-fn gen_matmul_at() -> ShaderModule {
+fn gen_matmul_at(knobs: MatmulKnobs) -> ShaderModule {
     matmul_vars(
         MATMUL_A_AT,
         MATMUL_B_FWD,
@@ -1648,6 +1669,7 @@ fn gen_matmul_at() -> ShaderModule {
         B_COL_FWD,
         "",
         "",
+        knobs,
     )
 }
 
@@ -1679,16 +1701,16 @@ fn gen_matmul_at() -> ShaderModule {
 /// Tiling is a modifier on the matmul groups, like weight format: the
 /// dispatch carries `use_small_tiles` and the pipeline is picked from it,
 /// so the tiling does not multiply the group enum.
-pub fn generate_module_small(group: ShaderGroup) -> ShaderModule {
+pub fn generate_module_small(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
     match group {
         ShaderGroup::BlockMatMul | ShaderGroup::BlockMatMulAT | ShaderGroup::BlockMatMulBT => {
             gen_block_matmul(group, MatMulTile::Small)
         }
-        ShaderGroup::MatMul => gen_matmul_small(),
-        ShaderGroup::MatMulAdd => gen_matmul_small_add(),
-        ShaderGroup::MatMulAT => gen_matmul_small_at(),
-        ShaderGroup::MatMulBT => gen_matmul_small_bt(),
-        _ => generate_module(group),
+        ShaderGroup::MatMul => gen_matmul_small(knobs),
+        ShaderGroup::MatMulAdd => gen_matmul_small_add(knobs),
+        ShaderGroup::MatMulAT => gen_matmul_small_at(knobs),
+        ShaderGroup::MatMulBT => gen_matmul_small_bt(knobs),
+        _ => generate_module(group, knobs),
     }
 }
 
@@ -1733,11 +1755,16 @@ fn gen_block_matmul(group: ShaderGroup, tile: MatMulTile) -> ShaderModule {
         MatMulOptions {
             format: WeightFormat::F32,
             tile,
+            ..Default::default()
         },
     )
 }
 
-pub fn generate_module_weighted(group: ShaderGroup, format: WeightFormat) -> ShaderModule {
+pub fn generate_module_weighted(
+    group: ShaderGroup,
+    format: WeightFormat,
+    knobs: MatmulKnobs,
+) -> ShaderModule {
     let mode = format;
     match group {
         ShaderGroup::MatMul => matmul_vars_with_mode(
@@ -1750,6 +1777,7 @@ pub fn generate_module_weighted(group: ShaderGroup, format: WeightFormat) -> Sha
             "",
             "",
             mode,
+            knobs,
         ),
         ShaderGroup::MatMulAdd => matmul_vars_with_mode(
             MATMUL_A_FWD,
@@ -1761,6 +1789,7 @@ pub fn generate_module_weighted(group: ShaderGroup, format: WeightFormat) -> Sha
             "var<storage> src: array<f32>;",
             " + src[idx]",
             mode,
+            knobs,
         ),
         ShaderGroup::MatMulAT => matmul_vars_with_mode(
             MATMUL_A_AT,
@@ -1772,6 +1801,7 @@ pub fn generate_module_weighted(group: ShaderGroup, format: WeightFormat) -> Sha
             "",
             "",
             mode,
+            knobs,
         ),
         ShaderGroup::MatMulATAdd => matmul_vars_with_mode(
             MATMUL_A_AT,
@@ -1783,6 +1813,7 @@ pub fn generate_module_weighted(group: ShaderGroup, format: WeightFormat) -> Sha
             "var<storage> src: array<f32>;",
             " + src[idx]",
             mode,
+            knobs,
         ),
         // The packed decoders address blocks along `params.k`, but packing
         // runs along the parameter's first dimension. Those coincide for a
@@ -1807,6 +1838,7 @@ pub fn generate_module_weighted(group: ShaderGroup, format: WeightFormat) -> Sha
             "",
             "",
             mode,
+            knobs,
         ),
         ShaderGroup::MatMulBTAdd => matmul_vars_with_mode(
             MATMUL_A_FWD,
@@ -1818,11 +1850,12 @@ pub fn generate_module_weighted(group: ShaderGroup, format: WeightFormat) -> Sha
             "var<storage> src: array<f32>;",
             " + src[idx]",
             mode,
+            knobs,
         ),
         // The f16 embedding is a variant of the same gather, selected by the
         // table's dtype rather than by a separate op and shader group.
         ShaderGroup::Embedding if mode == WeightFormat::F16 => {
-            parse_wgsl(include_str!("shaders/embedding_f16.wgsl"))
+            ShaderModule::new(include_str!("shaders/embedding_f16.wgsl"))
         }
         // Every block-packed format takes the same K-split GEMV with its
         // own decoder substituted, so the format picks the helper rather
@@ -1836,7 +1869,7 @@ pub fn generate_module_weighted(group: ShaderGroup, format: WeightFormat) -> Sha
             "no {mode:?} variant for {group:?}; block-quantized weights are \
              supported on forward tiled matmul groups and K-split GEMV only"
         ),
-        _ => generate_module(group),
+        _ => generate_module(group, knobs),
     }
 }
 
@@ -1923,7 +1956,7 @@ pub fn generate_module_gemv_rmsnorm(shape: GemvShape) -> ShaderModule {
         "        let a = matrix_a[kk];",
         "        let a = matrix_a[kk] * rs * norm_w[kk];",
     );
-    parse_wgsl(&gemv_shape_source(&src, shape))
+    ShaderModule::new(&gemv_shape_source(&src, shape))
 }
 
 const LANES_PREFIX: &str = "const LANES: u32 = ";
@@ -2164,7 +2197,7 @@ pub(crate) fn generate_module_gemv_int_dot(group: ShaderGroup, shape: GemvShape)
             ("$ADDEND", addend),
         ],
     );
-    parse_wgsl(&gemv_shape_source(&source, shape))
+    ShaderModule::new(&gemv_shape_source(&source, shape))
 }
 
 /// Generate one GEMV pipeline at an explicit shape.
@@ -2177,7 +2210,7 @@ pub(crate) fn generate_module_gemv(
     mode: WeightFormat,
     shape: GemvShape,
 ) -> ShaderModule {
-    parse_wgsl(&gemv_shape_source(&gemv_source(group, mode), shape))
+    ShaderModule::new(&gemv_shape_source(&gemv_source(group, mode), shape))
 }
 
 fn gemv_packed_source(src: &str, helpers: &str, call: &str) -> String {
@@ -2856,7 +2889,8 @@ fn gen_matmul_coop_wgsl_full(
             ("$COMPENSATED_MMA", &compensated_mma),
         ],
     );
-    parse_wgsl(&src)
+
+    ShaderModule::new(&src)
 }
 
 /// Variant selector for gen_matmul_coop_inner.
@@ -3044,7 +3078,6 @@ pub fn generate_attention_module(head_dim: u32) -> ShaderModule {
     src.push_str("    }\n");
     src.push_str("}\n");
 
-    maybe_dump_wgsl(&src, "attention");
     let module = parse_source(&src).unwrap_or_else(|e| {
         panic!(
             "generated unified attention WGSL failed to parse:\n{}\n---\n{}",
@@ -3054,6 +3087,7 @@ pub fn generate_attention_module(head_dim: u32) -> ShaderModule {
     ShaderModule {
         module,
         source: src,
+        hint: "attention",
     }
 }
 
@@ -3139,16 +3173,6 @@ mod coop_caps_tests {
             assert_eq!(CoopPolicy::AllowF16.filter_caps(caps), caps);
         }
     }
-}
-
-static COOP_CAPS: std::sync::OnceLock<CoopCaps> = std::sync::OnceLock::new();
-
-pub fn set_coop_caps(caps: CoopCaps) {
-    let _ = COOP_CAPS.set(caps);
-}
-
-pub fn coop_caps() -> CoopCaps {
-    *COOP_CAPS.get().unwrap_or(&CoopCaps::default())
 }
 
 pub const CACHED_ATTENTION_QUERIES: u32 = 32; // 256 threads / (64 dimensions / 8 elements)
@@ -3449,14 +3473,6 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     src.push_str("    }\n");
     src.push_str("}\n");
 
-    maybe_dump_wgsl(
-        &src,
-        if cached {
-            "cached_query_attention"
-        } else {
-            "flash_attention"
-        },
-    );
     let module = parse_source(&src).unwrap_or_else(|e| {
         panic!(
             "generated flash attention WGSL failed to parse:\n{}\n---\n{}",
@@ -3466,6 +3482,11 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     ShaderModule {
         module,
         source: src,
+        hint: if cached {
+            "cached_query_attention"
+        } else {
+            "flash_attention"
+        },
     }
 }
 
@@ -3742,6 +3763,7 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
     ShaderModule {
         module,
         source: src,
+        hint: "flash_attention_coop",
     }
 }
 
@@ -4076,6 +4098,7 @@ pub fn generate_flash_grad_q_coop_module(head_dim: u32) -> ShaderModule {
     ShaderModule {
         module,
         source: src,
+        hint: "flash_grad_q_coop",
     }
 }
 
@@ -4483,6 +4506,7 @@ pub fn generate_flash_grad_kv_coop_module(head_dim: u32) -> ShaderModule {
     ShaderModule {
         module,
         source: src,
+        hint: "flash_grad_kv_coop",
     }
 }
 
@@ -4504,7 +4528,7 @@ pub fn generate_flash_grad_q_module(head_dim: u32, ept_cap: u32) -> ShaderModule
     let bq: u32 = (256 / tpq).max(1);
     if bq <= 1 {
         // Fall back to hand-written shader
-        return parse_wgsl(include_str!("shaders/mha_grad_q.wgsl"));
+        return ShaderModule::new(include_str!("shaders/mha_grad_q.wgsl"));
     }
     let wg_size = bq * tpq;
     let mut src = String::new();
@@ -4779,7 +4803,6 @@ pub fn generate_flash_grad_q_module(head_dim: u32, ept_cap: u32) -> ShaderModule
     src.push_str("    }\n");
     src.push_str("}\n");
 
-    maybe_dump_wgsl(&src, "flash_grad_q");
     let module = parse_source(&src).unwrap_or_else(|e| {
         panic!(
             "generated flash grad_q WGSL failed to parse:\n{}\n---\n{}",
@@ -4789,6 +4812,7 @@ pub fn generate_flash_grad_q_module(head_dim: u32, ept_cap: u32) -> ShaderModule
     ShaderModule {
         module,
         source: src,
+        hint: "flash_grad_q",
     }
 }
 
@@ -4812,7 +4836,7 @@ pub fn generate_flash_grad_kv_module(head_dim: u32, ept_cap: u32) -> ShaderModul
     let tpq = hd / ept; // threads per KV position
     let bkv: u32 = (256 / tpq).max(1);
     if bkv <= 1 {
-        return parse_wgsl(include_str!("shaders/mha_grad_kv.wgsl"));
+        return ShaderModule::new(include_str!("shaders/mha_grad_kv.wgsl"));
     }
     let wg_size = bkv * tpq;
     let mut src = String::new();
@@ -4997,7 +5021,6 @@ pub fn generate_flash_grad_kv_module(head_dim: u32, ept_cap: u32) -> ShaderModul
     src.push_str("    }\n");
     src.push_str("}\n");
 
-    maybe_dump_wgsl(&src, "flash_grad_kv");
     let module = parse_source(&src).unwrap_or_else(|e| {
         panic!(
             "generated flash grad_kv WGSL failed to parse:\n{}\n---\n{}",
@@ -5007,6 +5030,7 @@ pub fn generate_flash_grad_kv_module(head_dim: u32, ept_cap: u32) -> ShaderModul
     ShaderModule {
         module,
         source: src,
+        hint: "flash_grad_kv",
     }
 }
 
@@ -5463,7 +5487,7 @@ pub fn generate_conv2d_coop_module(
     }
     src.push_str("}\n");
 
-    parse_wgsl(&src)
+    ShaderModule::new(&src)
 }
 
 /// Emit the im2col staging loop for grad_input (backward) direction.
@@ -5997,7 +6021,7 @@ mod tests {
 
         let flags = naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
         for &(group, caps) in &groups {
-            let sm = generate_module(group);
+            let sm = generate_module(group, MatmulKnobs::default());
             naga::valid::Validator::new(flags, caps)
                 .validate(&sm.module)
                 .unwrap_or_else(|e| {
@@ -6030,7 +6054,7 @@ mod tests {
     /// Verify the generated modules contain the expected entry points.
     #[test]
     fn entry_points_present() {
-        let m = generate_module(ShaderGroup::Unary);
+        let m = generate_module(ShaderGroup::Unary, MatmulKnobs::default());
         let names: Vec<&str> = m
             .module
             .entry_points
@@ -6042,7 +6066,7 @@ mod tests {
         assert!(names.contains(&"neg"), "missing neg");
         assert!(names.contains(&"silu"), "missing silu");
 
-        let m = generate_module(ShaderGroup::Binary);
+        let m = generate_module(ShaderGroup::Binary, MatmulKnobs::default());
         let names: Vec<&str> = m
             .module
             .entry_points
@@ -6053,7 +6077,7 @@ mod tests {
         assert!(names.contains(&"mul"));
         assert!(names.contains(&"greater"));
 
-        let m = generate_module(ShaderGroup::Reduce);
+        let m = generate_module(ShaderGroup::Reduce, MatmulKnobs::default());
         let names: Vec<&str> = m
             .module
             .entry_points
@@ -6063,7 +6087,7 @@ mod tests {
         assert!(names.contains(&"sum_all"));
         assert!(names.contains(&"mean_all"));
 
-        let m = generate_module(ShaderGroup::SumRows);
+        let m = generate_module(ShaderGroup::SumRows, MatmulKnobs::default());
         let names: Vec<&str> = m
             .module
             .entry_points
@@ -6124,14 +6148,14 @@ mod tests {
 
     #[test]
     fn grad_clip_norm_avoids_device_scope_storage_atomics() {
-        let module = generate_module(ShaderGroup::GradClipNormSq);
+        let module = generate_module(ShaderGroup::GradClipNormSq, MatmulKnobs::default());
         assert!(!module.source.contains("array<atomic"));
         assert!(!module.source.contains("atomicLoad"));
     }
 
     #[test]
     fn scatter_add_uses_float_cas() {
-        let module = generate_module(ShaderGroup::ScatterAddAtomic);
+        let module = generate_module(ShaderGroup::ScatterAddAtomic, MatmulKnobs::default());
         assert!(module.source.contains("array<atomic"));
         assert!(module.source.contains("atomicLoad"));
         assert!(module.source.contains("atomicCompareExchangeWeak"));
@@ -6335,7 +6359,7 @@ mod tests {
             ) {
                 continue;
             }
-            let sm = generate_module(group);
+            let sm = generate_module(group, MatmulKnobs::default());
             let info = match naga::valid::Validator::new(flags, caps).validate(&sm.module) {
                 Ok(info) => info,
                 Err(e) => {
@@ -6667,7 +6691,7 @@ mod tests {
             let group = entry.shader_group();
             let expected: HashSet<&str> = expected_globals(entry).into_iter().collect();
 
-            let sm = generate_module(group);
+            let sm = generate_module(group, MatmulKnobs::default());
             let info = naga::valid::Validator::new(
                 naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS,
                 naga::valid::Capabilities::all(),
@@ -6776,7 +6800,7 @@ mod tests {
             ShaderGroup::MatMulAT,
             ShaderGroup::MatMulATAdd,
         ] {
-            let sm = generate_module_weighted(group, WeightFormat::Q4);
+            let sm = generate_module_weighted(group, WeightFormat::Q4, MatmulKnobs::default());
             assert!(
                 sm.source.contains("dequant_q4"),
                 "Q4 {group:?}: missing dequant_q4"
@@ -6989,7 +7013,7 @@ mod tests {
             (WeightFormat::Q3K, "dequant_q3k("),
         ] {
             for group in [ShaderGroup::MatMulGemv, ShaderGroup::MatMulGemvAdd] {
-                let source = generate_module_weighted(group, format).source;
+                let source = generate_module_weighted(group, format, MatmulKnobs::default()).source;
                 assert!(
                     source.contains(marker) && !source.contains("matrix_b: array<vec4<f32>>"),
                     "{format:?} {group:?} did not retain its B representation"
@@ -7060,7 +7084,7 @@ mod tests {
             ShaderGroup::MatMulAdd,
             ShaderGroup::MatMulAT,
         ] {
-            let sm = generate_module_weighted(group, WeightFormat::Q6K);
+            let sm = generate_module_weighted(group, WeightFormat::Q6K, MatmulKnobs::default());
             assert!(
                 sm.source.contains("dequant_q6k"),
                 "Q6_K {group:?}: missing the superblock decoder"
@@ -7079,7 +7103,11 @@ mod tests {
                 "Q6_K {group:?}: sub-block scales are signed and must sign-extend"
             );
         }
-        let tiled = generate_module_weighted(ShaderGroup::MatMul, WeightFormat::Q6K);
+        let tiled = generate_module_weighted(
+            ShaderGroup::MatMul,
+            WeightFormat::Q6K,
+            MatmulKnobs::default(),
+        );
         assert!(
             tiled.source.contains("let unpacked = dequant_q6k_pack8("),
             "Q6_K tiled MatMul must call batched staging"
@@ -7093,7 +7121,7 @@ mod tests {
             ShaderGroup::MatMulAdd,
             ShaderGroup::MatMulAT,
         ] {
-            let sm = generate_module_weighted(group, WeightFormat::Q4K);
+            let sm = generate_module_weighted(group, WeightFormat::Q4K, MatmulKnobs::default());
             assert!(
                 sm.source.contains("dequant_q4k"),
                 "Q4_K {group:?}: missing the superblock decoder"
@@ -7110,7 +7138,11 @@ mod tests {
         }
         // The large tile stages eight elements per thread through one scale
         // unpack; losing that silently falls back to eight scalar decodes.
-        let tiled = generate_module_weighted(ShaderGroup::MatMul, WeightFormat::Q4K);
+        let tiled = generate_module_weighted(
+            ShaderGroup::MatMul,
+            WeightFormat::Q4K,
+            MatmulKnobs::default(),
+        );
         assert!(
             tiled.source.contains("let unpacked = dequant_q4k_pack8("),
             "Q4_K tiled MatMul must call batched staging"
@@ -7130,7 +7162,11 @@ mod tests {
         ] {
             assert!(
                 std::panic::catch_unwind(|| {
-                    generate_module_weighted(ShaderGroup::MatMulGemvBT, format)
+                    generate_module_weighted(
+                        ShaderGroup::MatMulGemvBT,
+                        format,
+                        MatmulKnobs::default(),
+                    )
                 })
                 .is_err(),
                 "{format:?} GEMV-BT fell through to an f32 shader"
@@ -7161,7 +7197,7 @@ mod tests {
                 ShaderGroup::MatMulAdd,
                 ShaderGroup::MatMulAT,
             ] {
-                let sm = generate_module_weighted(group, mode);
+                let sm = generate_module_weighted(group, mode, MatmulKnobs::default());
                 assert!(
                     sm.source.contains(decoder),
                     "{mode:?} {group:?}: missing the superblock decoder"
@@ -7175,7 +7211,7 @@ mod tests {
                     "{mode:?} {group:?}: missing the superblock stride"
                 );
             }
-            let tiled = generate_module_weighted(ShaderGroup::MatMul, mode);
+            let tiled = generate_module_weighted(ShaderGroup::MatMul, mode, MatmulKnobs::default());
             assert!(
                 tiled
                     .source
@@ -7184,7 +7220,11 @@ mod tests {
             );
         }
         // Q3_K's high bit is inverted: a clear hmask bit subtracts 4.
-        let q3 = generate_module_weighted(ShaderGroup::MatMul, WeightFormat::Q3K);
+        let q3 = generate_module_weighted(
+            ShaderGroup::MatMul,
+            WeightFormat::Q3K,
+            MatmulKnobs::default(),
+        );
         assert!(
             q3.source.contains("select(4, 0, hbit == 1u)"),
             "Q3_K must subtract 4 when the hmask bit is clear"
@@ -7203,7 +7243,7 @@ mod tests {
                 WeightFormat::Q3K,
             ] {
                 let caught = std::panic::catch_unwind(|| {
-                    let _ = generate_module_weighted(group, mode);
+                    let _ = generate_module_weighted(group, mode, MatmulKnobs::default());
                 });
                 assert!(
                     caught.is_err(),
@@ -7213,15 +7253,23 @@ mod tests {
         }
         // f16 is an elementwise cast at the same index, so it still works.
         assert!(
-            generate_module_weighted(ShaderGroup::MatMulBT, WeightFormat::F16)
-                .source
-                .contains("array<f16>")
+            generate_module_weighted(
+                ShaderGroup::MatMulBT,
+                WeightFormat::F16,
+                MatmulKnobs::default()
+            )
+            .source
+            .contains("array<f16>")
         );
         // The forward groups are unaffected.
         assert!(
-            generate_module_weighted(ShaderGroup::MatMul, WeightFormat::Q4K)
-                .source
-                .contains("dequant_q4k")
+            generate_module_weighted(
+                ShaderGroup::MatMul,
+                WeightFormat::Q4K,
+                MatmulKnobs::default()
+            )
+            .source
+            .contains("dequant_q4k")
         );
     }
 
@@ -7254,7 +7302,7 @@ mod tests {
                 small.source, large.source,
                 "{group:?}: small and large epilogue shaders must differ"
             );
-            let k_stage = matmul_knobs().k_stage;
+            let k_stage = crate::codegen::MatMulOptions::default().knobs.k_stage;
             assert!(
                 small
                     .source

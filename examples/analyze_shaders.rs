@@ -231,7 +231,10 @@ fn main() {
     // 3. Non-coop matmul (register-tiled)
     println!("\nRegister-tiled matmul (no tensor cores):");
     {
-        let sm = meganeura::codegen::generate_module(ShaderGroup::MatMul);
+        let sm = meganeura::codegen::generate_module(
+            ShaderGroup::MatMul,
+            meganeura::codegen::MatmulKnobs::default(),
+        );
         analyze(
             "matmul_64x64_register",
             &sm,
@@ -244,10 +247,16 @@ fn main() {
     // 4. GEMV kernels
     println!("\nGEMV kernels:");
     {
-        let sm = meganeura::codegen::generate_module(ShaderGroup::MatMulGemv);
+        let sm = meganeura::codegen::generate_module(
+            ShaderGroup::MatMulGemv,
+            meganeura::codegen::MatmulKnobs::default(),
+        );
         analyze("matmul_gemv", &sm, &ShaderEntry::MatMulGemv, dump, gpu_ref);
 
-        let sm_bt = meganeura::codegen::generate_module(ShaderGroup::MatMulGemvBT);
+        let sm_bt = meganeura::codegen::generate_module(
+            ShaderGroup::MatMulGemvBT,
+            meganeura::codegen::MatmulKnobs::default(),
+        );
         analyze(
             "matmul_gemv_bt",
             &sm_bt,
@@ -260,7 +269,10 @@ fn main() {
     // 5. Conv2d GEMM (forward)
     println!("\nConv2d GEMM:");
     {
-        let sm = meganeura::codegen::generate_module(ShaderGroup::Conv2dGemm);
+        let sm = meganeura::codegen::generate_module(
+            ShaderGroup::Conv2dGemm,
+            meganeura::codegen::MatmulKnobs::default(),
+        );
         analyze(
             "conv2d_gemm_64x64",
             &sm,
@@ -269,7 +281,10 @@ fn main() {
             gpu_ref,
         );
 
-        let sm_small = meganeura::codegen::generate_module(ShaderGroup::Conv2dGemmSmall);
+        let sm_small = meganeura::codegen::generate_module(
+            ShaderGroup::Conv2dGemmSmall,
+            meganeura::codegen::MatmulKnobs::default(),
+        );
         analyze(
             "conv2d_gemm_32x32",
             &sm_small,
@@ -282,7 +297,10 @@ fn main() {
     // 6. Conv2d backward
     println!("\nConv2d backward:");
     {
-        let sm = meganeura::codegen::generate_module(ShaderGroup::Conv2dGradInputGemm);
+        let sm = meganeura::codegen::generate_module(
+            ShaderGroup::Conv2dGradInputGemm,
+            meganeura::codegen::MatmulKnobs::default(),
+        );
         analyze(
             "conv2d_grad_input_gemm",
             &sm,
@@ -291,7 +309,10 @@ fn main() {
             gpu_ref,
         );
 
-        let sm_wt = meganeura::codegen::generate_module(ShaderGroup::Conv2dGradWeightGemm);
+        let sm_wt = meganeura::codegen::generate_module(
+            ShaderGroup::Conv2dGradWeightGemm,
+            meganeura::codegen::MatmulKnobs::default(),
+        );
         analyze(
             "conv2d_grad_weight_gemm",
             &sm_wt,
@@ -304,7 +325,10 @@ fn main() {
     // 7. Attention
     println!("\nAttention:");
     {
-        let sm = meganeura::codegen::generate_module(ShaderGroup::MultiHeadAttn);
+        let sm = meganeura::codegen::generate_module(
+            ShaderGroup::MultiHeadAttn,
+            meganeura::codegen::MatmulKnobs::default(),
+        );
         analyze(
             "multi_head_attn",
             &sm,
@@ -366,7 +390,10 @@ fn main() {
     // 9. Normalization backward
     println!("\nNormalization backward:");
     {
-        let sm = meganeura::codegen::generate_module(ShaderGroup::RmsNormGrad);
+        let sm = meganeura::codegen::generate_module(
+            ShaderGroup::RmsNormGrad,
+            meganeura::codegen::MatmulKnobs::default(),
+        );
         analyze(
             "rms_norm_grad_w",
             &sm,
@@ -382,7 +409,10 @@ fn main() {
             gpu_ref,
         );
 
-        let sm_lnorm = meganeura::codegen::generate_module(ShaderGroup::LayerNormGrad);
+        let sm_lnorm = meganeura::codegen::generate_module(
+            ShaderGroup::LayerNormGrad,
+            meganeura::codegen::MatmulKnobs::default(),
+        );
         analyze(
             "layer_norm_grad_wb",
             &sm_lnorm,
@@ -402,16 +432,25 @@ fn main() {
     // 10. Unary/Binary ops
     println!("\nElementwise ops:");
     {
-        let sm_unary = meganeura::codegen::generate_module(ShaderGroup::Unary);
+        let sm_unary = meganeura::codegen::generate_module(
+            ShaderGroup::Unary,
+            meganeura::codegen::MatmulKnobs::default(),
+        );
         analyze("relu", &sm_unary, &ShaderEntry::Relu, dump, gpu_ref);
         analyze("silu", &sm_unary, &ShaderEntry::Silu, dump, gpu_ref);
         analyze("gelu", &sm_unary, &ShaderEntry::Gelu, dump, gpu_ref);
 
-        let sm_binary = meganeura::codegen::generate_module(ShaderGroup::Binary);
+        let sm_binary = meganeura::codegen::generate_module(
+            ShaderGroup::Binary,
+            meganeura::codegen::MatmulKnobs::default(),
+        );
         analyze("add", &sm_binary, &ShaderEntry::Add, dump, gpu_ref);
         analyze("mul", &sm_binary, &ShaderEntry::Mul, dump, gpu_ref);
 
-        let sm_reduce = meganeura::codegen::generate_module(ShaderGroup::Reduce);
+        let sm_reduce = meganeura::codegen::generate_module(
+            ShaderGroup::Reduce,
+            meganeura::codegen::MatmulKnobs::default(),
+        );
         analyze("sum_all", &sm_reduce, &ShaderEntry::SumAll, dump, gpu_ref);
         analyze("mean_all", &sm_reduce, &ShaderEntry::MeanAll, dump, gpu_ref);
     }
@@ -419,10 +458,16 @@ fn main() {
     // 11. Softmax + losses
     println!("\nSoftmax/Losses:");
     {
-        let sm = meganeura::codegen::generate_module(ShaderGroup::Softmax);
+        let sm = meganeura::codegen::generate_module(
+            ShaderGroup::Softmax,
+            meganeura::codegen::MatmulKnobs::default(),
+        );
         analyze("softmax", &sm, &ShaderEntry::Softmax, dump, gpu_ref);
 
-        let sm_ce = meganeura::codegen::generate_module(ShaderGroup::CrossEntropy);
+        let sm_ce = meganeura::codegen::generate_module(
+            ShaderGroup::CrossEntropy,
+            meganeura::codegen::MatmulKnobs::default(),
+        );
         analyze(
             "cross_entropy",
             &sm_ce,
@@ -438,7 +483,10 @@ fn main() {
     //     fusions.
     println!("\nFused ops (FusionCostModel inputs):");
     {
-        let sm = meganeura::codegen::generate_module(ShaderGroup::MatMulAdd);
+        let sm = meganeura::codegen::generate_module(
+            ShaderGroup::MatMulAdd,
+            meganeura::codegen::MatmulKnobs::default(),
+        );
         analyze(
             "fused_matmul_add",
             &sm,
@@ -446,7 +494,10 @@ fn main() {
             dump,
             gpu_ref,
         );
-        let sm_at = meganeura::codegen::generate_module(ShaderGroup::MatMulATAdd);
+        let sm_at = meganeura::codegen::generate_module(
+            ShaderGroup::MatMulATAdd,
+            meganeura::codegen::MatmulKnobs::default(),
+        );
         analyze(
             "fused_matmul_at_add",
             &sm_at,
@@ -454,7 +505,10 @@ fn main() {
             dump,
             gpu_ref,
         );
-        let sm_bt = meganeura::codegen::generate_module(ShaderGroup::MatMulBTAdd);
+        let sm_bt = meganeura::codegen::generate_module(
+            ShaderGroup::MatMulBTAdd,
+            meganeura::codegen::MatmulKnobs::default(),
+        );
         analyze(
             "fused_matmul_bt_add",
             &sm_bt,
@@ -462,7 +516,10 @@ fn main() {
             dump,
             gpu_ref,
         );
-        let sm_swi = meganeura::codegen::generate_module(ShaderGroup::SwiGLUConcat);
+        let sm_swi = meganeura::codegen::generate_module(
+            ShaderGroup::SwiGLUConcat,
+            meganeura::codegen::MatmulKnobs::default(),
+        );
         analyze(
             "swiglu_concat",
             &sm_swi,

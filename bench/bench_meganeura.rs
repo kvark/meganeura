@@ -8,11 +8,7 @@
 ///   cargo run --release --example bench_meganeura -- --kv-cache
 use std::time::Instant;
 
-use meganeura::{
-    Graph,
-    data::safetensors::SafeTensorsModel,
-    models::smollm2::{self, Config},
-};
+use meganeura::{Graph, data::safetensors::SafeTensorsModel, models::smollm2};
 
 const REPO_ID: &str = "HuggingFaceTB/SmolLM2-135M";
 
@@ -117,7 +113,7 @@ fn main() {
         }
     }
 
-    let config = Config::smollm2_135m();
+    let config = smollm2::Config::smollm2_135m();
 
     // --- Download model + tokenizer ---
     eprintln!("downloading model...");

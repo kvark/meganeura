@@ -4,7 +4,7 @@
 
 use super::DataLoader;
 use std::{
-    io::{self, Read},
+    io::{self, Read as _},
     path::Path,
 };
 

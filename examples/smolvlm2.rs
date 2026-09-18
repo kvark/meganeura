@@ -6,11 +6,7 @@
 ///
 /// Usage:
 ///   cargo run --release --example smolvlm2
-use meganeura::{
-    Graph,
-    data::safetensors::SafeTensorsModel,
-    models::smolvlm2::{self, Config},
-};
+use meganeura::{Graph, data::safetensors::SafeTensorsModel, models::smolvlm2};
 use std::collections::HashSet;
 
 const REPO_ID: &str = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct";
@@ -62,7 +58,7 @@ fn load_param(
 fn main() {
     env_logger::init();
 
-    let config = Config::smolvlm2_500m();
+    let config = smolvlm2::Config::smolvlm2_500m();
 
     // --- Download model ---
     println!("downloading {} ...", REPO_ID);

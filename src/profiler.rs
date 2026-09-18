@@ -20,7 +20,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     path::Path,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex},
     time::Instant,
 };
 #[cfg(feature = "profiler")]
@@ -63,15 +63,47 @@ impl ProfilerInner {
     }
 }
 
-static PROFILER: OnceLock<Arc<Mutex<ProfilerInner>>> = OnceLock::new();
+/// The profiler state: armed once — by `init` or the first GPU-context
+/// initialization — and thereafter only read. The event buffer inside is
+/// a `Mutex`, so post-arming sharing is lock-sharing as usual and the
+/// static is never rewritten.
+///
+/// [`arm`]: arm
+static mut PROFILER: Option<Arc<Mutex<ProfilerInner>>> = None;
 
-fn get_or_init() -> &'static Arc<Mutex<ProfilerInner>> {
-    PROFILER.get_or_init(|| {
-        Arc::new(Mutex::new(ProfilerInner {
-            epoch: Instant::now(),
-            events: Vec::with_capacity(8192),
-        }))
-    })
+/// The profiler state, when it is armed. Everything that records or dumps
+/// runs after `init`, or after a GPU context existed to have armed it —
+/// so regular paths read through [`profiler`], and only
+/// `now_ns`/`event_count`/GPU-timestamp recording keep a soft option.
+fn armed() -> Option<&'static Arc<Mutex<ProfilerInner>>> {
+    // SAFETY: the static is written only by [`arm`], which runs before any
+    // recording or dumping (from `init` and from context initialization),
+    // and then never rewritten.
+    unsafe { (&raw const PROFILER).as_ref().and_then(|st| st.as_ref()) }
+}
+
+/// Arm the in-process event buffer without installing a tracing
+/// subscriber.
+///
+/// Called by GPU-context initialization and by `init`; after that,
+/// GPU-timestamp recording and trace dumping never see an unarmed state.
+pub fn arm() {
+    // SAFETY: arming happens before any recording; gated on being unarmed
+    // so it runs once per process, and `init` races nothing — its callers
+    // run before GPU work starts.
+    if armed().is_none() {
+        unsafe {
+            PROFILER = Some(Arc::new(Mutex::new(ProfilerInner {
+                epoch: Instant::now(),
+                events: Vec::with_capacity(8192),
+            })));
+        }
+    }
+}
+
+/// The armed profiler; panics when used before [`arm`].
+fn profiler() -> &'static Arc<Mutex<ProfilerInner>> {
+    armed().expect("profiler used before init: call meganeura::profiler::init first")
 }
 
 // ---- Public API ----
@@ -93,12 +125,12 @@ pub fn init() {
 /// target prefix, such as `"my_app"`; dependency targets remain out of the
 /// performance trace unless explicitly requested.
 pub fn init_with_targets(additional_targets: &[&str]) {
-    let _ = get_or_init();
+    arm();
     #[cfg(not(feature = "profiler"))]
     let _ = additional_targets;
     #[cfg(feature = "profiler")]
     {
-        let inner = get_or_init().clone();
+        let inner = profiler().clone();
         let mut targets = vec!["meganeura".to_string()];
         targets.extend(
             additional_targets
@@ -145,7 +177,8 @@ impl GpuTimings {
 /// [`Instant`]. Each pass ends at the next pass start, or at `done` for the
 /// final pass. CPU submission time is intentionally not involved.
 pub fn record_gpu_timings(timings: &GpuTimings) {
-    if let Some(inner) = PROFILER.get() {
+    if armed().is_some() {
+        let inner = profiler();
         let mut guard = inner.lock().unwrap();
         for (index, &(ref name, start)) in timings.passes.iter().enumerate() {
             let Some(end) = timings
@@ -208,39 +241,34 @@ pub fn record_gpu_timings(timings: &GpuTimings) {
 
 /// Record a single CPU event (for use outside tracing spans).
 pub fn record_instant(name: &str) {
-    if let Some(inner) = PROFILER.get() {
-        let mut guard = inner.lock().unwrap();
-        let ts = guard.now_ns();
-        guard.events.push(TraceEvent {
-            name: name.to_string(),
-            timestamp_ns: ts,
-            track_uuid: CPU_TRACK_UUID,
-            kind: EventKind::Instant,
-        });
-    }
+    let inner = profiler();
+    let mut guard = inner.lock().unwrap();
+    let ts = guard.now_ns();
+    guard.events.push(TraceEvent {
+        name: name.to_string(),
+        timestamp_ns: ts,
+        track_uuid: CPU_TRACK_UUID,
+        kind: EventKind::Instant,
+    });
 }
 
 /// Return the nanosecond offset from the profiler epoch (for GPU timing placement).
 pub fn now_ns() -> u64 {
-    PROFILER
-        .get()
+    armed()
         .map(|inner| inner.lock().unwrap().now_ns())
         .unwrap_or(0)
 }
 
 /// Number of recorded events (including both CPU spans and GPU passes).
 pub fn event_count() -> usize {
-    PROFILER
-        .get()
+    armed()
         .map(|inner| inner.lock().unwrap().events.len())
         .unwrap_or(0)
 }
 
 /// Write all collected events to a Perfetto `.pftrace` binary trace file.
 pub fn save(path: impl AsRef<Path>) -> std::io::Result<()> {
-    let inner = PROFILER
-        .get()
-        .ok_or_else(|| std::io::Error::other("profiler not initialized"))?;
+    let inner = profiler();
     let guard = inner.lock().unwrap();
     write_pftrace(path.as_ref(), &guard.events)
 }
@@ -1205,7 +1233,8 @@ mod tests {
     #[test]
     fn test_save_produces_nonempty_file() {
         // Initialize the profiler for this test.
-        let inner = get_or_init();
+        arm();
+        let inner = profiler();
         {
             let mut guard = inner.lock().unwrap();
             guard.events.push(TraceEvent {
@@ -1259,7 +1288,8 @@ mod tests {
 
     #[test]
     fn test_record_gpu_timings() {
-        let inner = get_or_init();
+        arm();
+        let inner = profiler();
         let epoch = {
             let mut guard = inner.lock().unwrap();
             guard.events.clear();
@@ -1291,7 +1321,7 @@ mod tests {
 
     #[test]
     fn test_now_ns_increases() {
-        let _ = get_or_init();
+        arm();
         let t1 = now_ns();
         for _ in 0..1000 {
             std::hint::black_box(0);
@@ -1345,7 +1375,7 @@ mod tests {
     #[test]
     fn profile_targets_exclude_dependency_noise() {
         let layer = ProfileLayer {
-            inner: get_or_init().clone(),
+            inner: profiler().clone(),
             targets: vec!["meganeura".into(), "buddy".into()],
         };
         assert!(layer.captures_target("meganeura::runtime"));

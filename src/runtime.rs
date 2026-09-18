@@ -1,7 +1,7 @@
 use crate::compile::{BufferRef, Dispatch, ExecutionPlan, ShaderEntry};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 mod checkpoint;
 mod tuning;
@@ -1203,6 +1203,28 @@ impl Variant {
 
 struct Pipelines {
     map: HashMap<Variant, blade_graphics::ComputePipeline>,
+    /// Matmul codegen knobs the plan was compiled with.
+    matmul_knobs: crate::codegen::MatmulKnobs,
+    /// Where to write every WGSL the pipeline layer compiles — [`SessionOptions::wgsl_dump_dir`].
+    dump_dir: Option<String>,
+}
+
+/// Turn a generated module into a Blade shader, writing its WGSL into the
+/// configured dump directory first. Every module a session compiles — the
+/// standard, coop, weighted, epilogue-fused and scheduled forms alike —
+/// passes through here, so the dump sees exactly what a plan would run.
+fn create_gen_shader(
+    gpu: &Gpu,
+    module: crate::codegen::ShaderModule,
+    dump_dir: Option<&str>,
+) -> blade_graphics::Shader {
+    if let Some(dir) = dump_dir {
+        module.dump(dir);
+    }
+    gpu.create_shader(blade_graphics::ShaderDesc {
+        source: &module.source,
+        naga_module: Some(module.module),
+    })
 }
 
 fn create_profiled_pipeline(
@@ -1229,9 +1251,8 @@ impl Pipelines {
         gpu: &Gpu,
         plan: &ExecutionPlan,
         coop_config: Option<&crate::codegen::CoopConfig>,
+        wgsl_dump_dir: Option<&str>,
     ) -> Self {
-        use blade_graphics as bg;
-
         // Generated attention kernels must agree with the plan's dispatch
         // geometry, so their knobs come from the plan itself.
         let knobs = plan.knobs;
@@ -1390,10 +1411,7 @@ impl Pipelines {
              group: ShaderGroup,
              key: &dyn Fn(ShaderEntry) -> Variant,
              target: &mut HashMap<Variant, blade_graphics::ComputePipeline>| {
-                let shader = gpu.create_shader(bg::ShaderDesc {
-                    source: &sm.source,
-                    naga_module: Some(sm.module),
-                });
+                let shader = create_gen_shader(gpu, sm, wgsl_dump_dir);
                 if let Some(entries) = entries_for_group.get(&group) {
                     for entry in entries {
                         let layout = shader_data_layout(entry);
@@ -1408,16 +1426,25 @@ impl Pipelines {
                     }
                 }
             };
+        let matmul_knobs = crate::codegen::MatmulKnobs {
+            k_stage: plan.knobs.matmul_k_stage,
+            interleave_columns: plan.knobs.matmul_interleave_columns,
+        };
         let compile_group =
             |group: ShaderGroup,
              key: &dyn Fn(ShaderEntry) -> Variant,
              target: &mut HashMap<Variant, blade_graphics::ComputePipeline>| {
-                compile_variant(crate::codegen::generate_module(group), group, key, target);
+                compile_variant(
+                    crate::codegen::generate_module(group, matmul_knobs),
+                    group,
+                    key,
+                    target,
+                );
             };
 
         for &group in &needed_small {
             compile_variant(
-                crate::codegen::generate_module_small(group),
+                crate::codegen::generate_module_small(group, matmul_knobs),
                 group,
                 &Variant::SmallTile,
                 &mut map,
@@ -1466,10 +1493,7 @@ impl Pipelines {
                 ShaderGroup::MultiHeadAttn => crate::codegen::generate_attention_module(hd),
                 _ => unreachable!("non-parameterized attention group {group:?}"),
             };
-            let shader = gpu.create_shader(bg::ShaderDesc {
-                source: &sm.source,
-                naga_module: Some(sm.module),
-            });
+            let shader = create_gen_shader(gpu, sm, wgsl_dump_dir);
             let layout = shader_data_layout(&entry);
             let key = Variant::Attention(entry.clone(), hd);
             let pipeline =
@@ -1531,10 +1555,7 @@ impl Pipelines {
                 };
                 let sm =
                     crate::codegen::generate_conv2d_coop_module(kh, kw, stride, direction, config);
-                let shader = gpu.create_shader(bg::ShaderDesc {
-                    source: &sm.source,
-                    naga_module: Some(sm.module),
-                });
+                let shader = create_gen_shader(gpu, sm, wgsl_dump_dir);
                 let layout = shader_data_layout(entry);
                 let key = Variant::Coop(entry.clone());
                 let pipeline = create_profiled_pipeline(
@@ -1559,10 +1580,7 @@ impl Pipelines {
                 crate::codegen::generate_module_gemv_rmsnorm(fused.gemv_shape.unwrap_or_else(
                     || crate::codegen::GemvShape::initial(ShaderGroup::MatMulGemv),
                 ));
-            let shader = gpu.create_shader(bg::ShaderDesc {
-                source: &sm.source,
-                naga_module: Some(sm.module),
-            });
+            let shader = create_gen_shader(gpu, sm, wgsl_dump_dir);
             let entry = ShaderEntry::MatMulGemv;
             let layout = <MatMulRmsNormData as blade_graphics::ShaderData>::layout();
             let key = Variant::GemvRmsNorm(entry.clone());
@@ -1587,10 +1605,7 @@ impl Pipelines {
                     dispatch.shader.shader_group(),
                     shape,
                 );
-                let shader = gpu.create_shader(bg::ShaderDesc {
-                    source: &sm.source,
-                    naga_module: Some(sm.module),
-                });
+                let shader = create_gen_shader(gpu, sm, wgsl_dump_dir);
                 let layout = shader_data_layout(&dispatch.shader);
                 slot.insert(create_profiled_pipeline(
                     gpu,
@@ -1627,10 +1642,7 @@ impl Pipelines {
             let key = Variant::Gemv(dispatch.shader.clone(), dispatch.weight_format, shape);
             if let std::collections::hash_map::Entry::Vacant(slot) = map.entry(key.clone()) {
                 let sm = crate::codegen::generate_module_gemv(group, dispatch.weight_format, shape);
-                let shader = gpu.create_shader(bg::ShaderDesc {
-                    source: &sm.source,
-                    naga_module: Some(sm.module),
-                });
+                let shader = create_gen_shader(gpu, sm, wgsl_dump_dir);
                 let layout = shader_data_layout(&dispatch.shader);
                 slot.insert(create_profiled_pipeline(
                     gpu,
@@ -1645,7 +1657,7 @@ impl Pipelines {
         for (&format, groups) in &needed_weighted {
             for &group in groups {
                 compile_variant(
-                    crate::codegen::generate_module_weighted(group, format),
+                    crate::codegen::generate_module_weighted(group, format, matmul_knobs),
                     group,
                     &|entry| Variant::Weight(entry, format),
                     &mut map,
@@ -1674,12 +1686,10 @@ impl Pipelines {
                     crate::codegen::MatMulOptions {
                         format: dispatch.weight_format,
                         tile: epilogue_tile(dispatch),
+                        knobs: matmul_knobs,
                     },
                 );
-                let shader = gpu.create_shader(bg::ShaderDesc {
-                    source: &sm.source,
-                    naga_module: Some(sm.module),
-                });
+                let shader = create_gen_shader(gpu, sm, wgsl_dump_dir);
                 let layout = shader_data_layout(&dispatch.shader);
                 let pipeline = create_profiled_pipeline(
                     gpu,
@@ -1702,10 +1712,7 @@ impl Pipelines {
                     config,
                     epi,
                 );
-                let shader = gpu.create_shader(bg::ShaderDesc {
-                    source: &sm.source,
-                    naga_module: Some(sm.module),
-                });
+                let shader = create_gen_shader(gpu, sm, wgsl_dump_dir);
                 let layout = shader_data_layout(&dispatch.shader);
                 let pipeline = create_profiled_pipeline(
                     gpu,
@@ -1741,10 +1748,7 @@ impl Pipelines {
                 let sm = crate::codegen::gen_matmul_coop_with_prologue(
                     fused_add, variant, coop_cfg, prologue,
                 );
-                let shader = gpu.create_shader(bg::ShaderDesc {
-                    source: &sm.source,
-                    naga_module: Some(sm.module),
-                });
+                let shader = create_gen_shader(gpu, sm, wgsl_dump_dir);
                 let layout = matmul_with_prologue_layout(prologue.factors.len());
                 let pipeline = create_profiled_pipeline(
                     gpu,
@@ -1775,10 +1779,7 @@ impl Pipelines {
                 grid: crate::schedule::GridShape::default(),
             };
             let sm = crate::schedule::lower(&template);
-            let shader = gpu.create_shader(bg::ShaderDesc {
-                source: &sm.source,
-                naga_module: Some(sm.module),
-            });
+            let shader = create_gen_shader(gpu, sm, wgsl_dump_dir);
             let layout = pointwise_data_layout(dag.n_inputs);
             let pipeline = create_profiled_pipeline(
                 gpu,
@@ -1800,10 +1801,7 @@ impl Pipelines {
                 continue;
             }
             let sm = crate::schedule::lower(&kernel.to_template());
-            let shader = gpu.create_shader(bg::ShaderDesc {
-                source: &sm.source,
-                naga_module: Some(sm.module),
-            });
+            let shader = create_gen_shader(gpu, sm, wgsl_dump_dir);
             let layout = reduction_data_layout(kernel);
             let pipeline = create_profiled_pipeline(
                 gpu,
@@ -1837,16 +1835,17 @@ impl Pipelines {
                 count,
                 coop.as_ref(),
             );
-            let shader = gpu.create_shader(bg::ShaderDesc {
-                source: &sm.source,
-                naga_module: Some(sm.module),
-            });
+            let shader = create_gen_shader(gpu, sm, wgsl_dump_dir);
             let layout = horizontal_matmul_layout(count);
             let pipeline = create_profiled_pipeline(gpu, key.label(), &layout, shader.at("main"));
             map.insert(key, pipeline);
         }
 
-        let mut pipelines = Self { map };
+        let mut pipelines = Self {
+            map,
+            matmul_knobs,
+            dump_dir: wgsl_dump_dir.map(str::to_string),
+        };
         for dispatch in &plan.dispatches {
             if dispatch.conv_k_tile.is_some() {
                 let tile = crate::tune::MatmulTile::selected(dispatch, None)
@@ -2806,6 +2805,11 @@ pub struct SessionOptions {
     /// unaliased: host-visible by default, `Some(Memory::DeviceTransient)`
     /// or `Some(Memory::Device)` relocates them for measurement.
     pub device_parameters: Option<blade_graphics::Memory>,
+    /// Directory to write every WGSL shader the session's pipeline layer
+    /// compiles into, up front and during tuning. Debug hook: each file
+    /// names the shader (or its entry point) and a content hash. Nothing
+    /// is written when unset.
+    pub wgsl_dump_dir: Option<String>,
 }
 
 /// How cooperative-matrix hardware may be used.
@@ -3729,7 +3733,12 @@ impl Session {
 
         let pipelines = {
             let _span = tracing::info_span!("pipeline_set").entered();
-            Pipelines::new(&gpu, &plan, coop_config.as_ref())
+            Pipelines::new(
+                &gpu,
+                &plan,
+                coop_config.as_ref(),
+                opts.wgsl_dump_dir.as_deref(),
+            )
         };
         let mut encoder = {
             let _span = tracing::info_span!("encoder_create").entered();
@@ -4358,6 +4367,10 @@ pub fn init_gpu_context_with(
         device = ?options.device_id
     )
     .entered();
+    // From here on there is a context that can record GPU pass ranges, so
+    // arm the static profiler state now: every later recording path takes
+    // it as given instead of lazily conjuring the state on first use.
+    crate::profiler::arm();
     let dev_id = options.device_id;
     unsafe {
         blade_graphics::Context::init(blade_graphics::ContextDesc {
@@ -4374,11 +4387,14 @@ pub fn init_gpu_context_with(
     }
 }
 
+/// A context to own when the caller did not bring one.
+///
+/// Deliberately no process-global cache: a session that asked for the
+/// default context owns it, and a caller that wants sharing passes its
+/// context through [`Session::with_context`] / [`SessionConfig::gpu`] —
+/// nothing here decides that for them.
 pub(crate) fn default_gpu_context() -> Arc<Gpu> {
-    static CONTEXT: OnceLock<Arc<Gpu>> = OnceLock::new();
-    Arc::clone(CONTEXT.get_or_init(|| {
-        Arc::new(init_gpu_context().expect("failed to initialize blade GPU context"))
-    }))
+    Arc::new(init_gpu_context().expect("failed to initialize blade GPU context"))
 }
 
 pub(crate) fn parse_device_id(value: &str) -> Option<u32> {
@@ -4565,7 +4581,7 @@ mod variant_tests {
         };
         select_variants(&mut demoted, None, false, false);
         assert!(demoted.dispatches[0].use_small_tiles);
-        let pipelines = Pipelines::new(&gpu, &demoted, None);
+        let pipelines = Pipelines::new(&gpu, &demoted, None, None);
         assert!(
             pipelines
                 .map
@@ -4595,7 +4611,7 @@ mod variant_tests {
             weighted.dispatches[0].weight_format,
             crate::compile::WeightFormat::Q4
         );
-        let pipelines = Pipelines::new(&gpu, &weighted, None);
+        let pipelines = Pipelines::new(&gpu, &weighted, None, None);
         assert!(
             !pipelines.map.contains_key(&Variant::Weight(
                 ShaderEntry::MatMul,
@@ -5320,9 +5336,9 @@ mod q4_tests {
     }
 }
 
-/// Result of [`auto_tune`] — capability snapshot from the connected GPU
-/// suitable for installing as global compilation defaults via
-/// [`install_auto_tune`].
+/// Result of [`auto_tune`] — capability snapshot from the connected GPU,
+/// suitable for reporting or as the capabilities argument of a
+/// capabilities-taking compile call.
 #[derive(Clone, Debug)]
 pub struct AutoTuneResult {
     /// Cooperative-matrix capabilities. Compile-time decisions
@@ -5330,10 +5346,10 @@ pub struct AutoTuneResult {
     pub coop_caps: crate::codegen::CoopCaps,
 }
 
-/// Probe the GPU for cooperative_matrix capabilities. The returned
-/// [`AutoTuneResult`] is consumed by [`install_auto_tune`] before any
-/// sessions are built, so the compiler can pick the coop kernel
-/// variants where supported.
+/// Probe the GPU for cooperative_matrix capabilities. The result is a
+/// capability description the caller compiles for or reports; there is
+/// no shared global to install — everything that reaches the compiler
+/// or the pipeline layer takes it as a parameter.
 pub fn auto_tune(gpu: &blade_graphics::Context, _head_dim: u32) -> AutoTuneResult {
     let cm = gpu.capabilities().cooperative_matrix;
     AutoTuneResult {
@@ -5342,14 +5358,6 @@ pub fn auto_tune(gpu: &blade_graphics::Context, _head_dim: u32) -> AutoTuneResul
             f32_tile: cm.f32_tile,
         },
     }
-}
-
-/// Install the auto-tuned configuration into process-wide globals.
-/// Only the first install wins (the underlying `OnceLock` is
-/// write-once). Call before constructing any Session whose dispatches
-/// should pick up the coop kernel variants.
-pub fn install_auto_tune(result: AutoTuneResult) {
-    crate::codegen::set_coop_caps(result.coop_caps);
 }
 
 impl Session {

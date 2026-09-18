@@ -33,12 +33,12 @@
 //! mode: expect whole-prefix re-execution per growth step, and use
 //! `build_session` for anything performance-sensitive.
 
-use crate::compile::{self, CompileOptions};
-use crate::graph::{Graph, NodeId};
-use crate::runtime::{Session, SessionOptions, init_gpu_context};
-use std::collections::HashMap;
-use std::fmt;
-use std::sync::Arc;
+use crate::{
+    compile,
+    graph::{Graph, NodeId},
+    runtime::{Session, SessionOptions, init_gpu_context},
+};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 /// A materialized tensor value returned by [`Eager::eval`].
 #[derive(Clone, Debug, PartialEq)]
@@ -175,9 +175,9 @@ impl Eager {
         }
         let plan = compile::compile_with(
             &g,
-            &CompileOptions {
+            &compile::CompileOptions {
                 fuse_dispatches: false,
-                ..CompileOptions::default()
+                ..Default::default()
             },
         );
         Session::with_context_opts(

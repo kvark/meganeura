@@ -31,11 +31,7 @@ use std::sync::Arc;
 
 use crate::Session;
 
-use super::arch::ModelConfig;
-use super::graph::{self, ModelGraph};
-use super::vocab::Vocab;
-use super::weights::{self, LoadReport};
-use super::{GgufError, GgufModel};
+use super::{GgufError, GgufModel, arch::ModelConfig, graph, vocab::Vocab, weights};
 
 /// How to build the sessions.
 #[derive(Clone, Debug)]
@@ -113,14 +109,14 @@ pub struct Generator {
     prefill: Option<Session>,
     decode: Session,
     prefill_block: usize,
-    built: ModelGraph,
+    built: graph::ModelGraph,
     config: ModelConfig,
     vocab: Option<Vocab>,
     /// How much of the cache is populated — the next absolute position.
     position: usize,
     /// Tokens seen since the last reset, for the repetition penalty.
     history: Vec<u32>,
-    report: LoadReport,
+    report: weights::LoadReport,
     /// Why [`Self::vocab`] is absent, when it is.
     vocab_error: Option<String>,
 }
@@ -245,7 +241,7 @@ impl Generator {
     }
 
     /// What loading the weights actually did.
-    pub fn load_report(&self) -> &LoadReport {
+    pub fn load_report(&self) -> &weights::LoadReport {
         &self.report
     }
 

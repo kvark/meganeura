@@ -2,11 +2,10 @@ use crate::{
     autodiff, cache, compile,
     data::DataLoader,
     graph::Graph,
-    optimize::{self, OptimizeReport},
+    optimize,
     runtime::{self, Session},
 };
-use std::path::Path;
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 /// Optimizer selection.
 #[derive(Clone, Debug)]
@@ -298,7 +297,7 @@ impl SessionConfig<'_> {
 /// Build stages (`optimize_forward`, `autodiff`, `optimize_full`,
 /// `compile`, `session_init`) are captured as tracing spans and appear in
 /// Perfetto traces when profiling is active.
-pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, OptimizeReport) {
+pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, optimize::OptimizeReport) {
     let _span = tracing::info_span!("build_session").entered();
     let mode = cfg.mode;
     let mut options = cfg.options;
@@ -343,7 +342,7 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, Optimiz
             Ok(Some(plan)) => {
                 log::info!("loaded cached execution plan from {}", path.display());
                 let session = make_session(plan, gpu, cfg.runtime.clone(), cfg.tune);
-                return (session, OptimizeReport::empty());
+                return (session, optimize::OptimizeReport::empty());
             }
             Ok(None) => log::info!("no valid cache found, recompiling"),
             Err(e) => log::warn!("failed to load cache: {}, recompiling", e),
@@ -478,7 +477,7 @@ pub fn build_session_unoptimized(forward_graph: &Graph) -> Session {
 /// Useful for testing compilation in environments without GPU access.
 pub fn compile_training_graph(
     forward_graph: &Graph,
-) -> (crate::compile::ExecutionPlan, OptimizeReport) {
+) -> (crate::compile::ExecutionPlan, optimize::OptimizeReport) {
     let optimized_forward = optimize::optimize(forward_graph).toposort();
     let full_graph = autodiff::differentiate(&optimized_forward);
     let (optimized, report) = optimize::optimize_with_report(&full_graph);

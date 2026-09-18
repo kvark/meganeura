@@ -2,7 +2,7 @@
 //! LayerNorm forward rewrite. Mirrors profile_whisper_inference but
 //! builds the training graph (encoder + projection + MSE loss).
 
-use meganeura::models::whisper::{self, Config};
+use meganeura::models::whisper;
 
 fn main() {
     env_logger::init();
@@ -10,10 +10,9 @@ fn main() {
     let gpu = meganeura::init_gpu_context_with(meganeura::GpuOptions::from_env()).expect("gpu");
     let result = meganeura::runtime::auto_tune(&gpu, 64);
     eprintln!("coop_matrix_available={}", result.coop_caps.is_supported());
-    meganeura::runtime::install_auto_tune(result);
     drop(gpu);
 
-    let config = Config::whisper_tiny();
+    let config = whisper::Config::whisper_tiny();
     let batch = 1u32;
     let mel_len = 3000u32;
     let g = whisper::build_training_graph(&config, batch, mel_len);
