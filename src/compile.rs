@@ -2056,14 +2056,17 @@ pub fn fuse_rmsnorm_into_gemv(plan: &mut ExecutionPlan) {
         // Folding is a variant of MatMulGemv: the fused pipeline is
         // `Variant::GemvRmsNorm` — or its int-dot form, `GemvRmsNormIntDot`
         // — keyed by weight format and shape, so a packed GEMV keeps its
-        // decoder. Only the plain GEMV path is rewritten; fused-add and BT
-        // stay separate kernels. Int-dot GEMVs fold too: their activation
+        // decoder. Plain GEMV and dense transposed-B GEMV are eligible;
+        // fused-add remains separate. Int-dot GEMVs fold too: their activation
         // quantizer runs inside the same workgroup as the prologue, so the
         // integer arithmetic sees exactly the row the unfused path would.
         if consumers.is_empty()
             || consumers.iter().any(|&c| {
                 let d = &plan.dispatches[c];
-                d.shader != ShaderEntry::MatMulGemv || d.input_buffers.first() != Some(&normed)
+                !matches!(
+                    d.shader,
+                    ShaderEntry::MatMulGemv | ShaderEntry::MatMulGemvBT
+                ) || d.input_buffers.first() != Some(&normed)
             })
         {
             continue;

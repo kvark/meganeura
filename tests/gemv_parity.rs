@@ -194,6 +194,164 @@ fn gemv_non_multiple_of_256() {
     test_shape(128, 1, 9);
 }
 
+#[test]
+fn dense_transposed_glu_matches_reference_after_restage() {
+    for (m, k, n) in [(1, 12, 7), (3, 5, 7)] {
+        for f16 in [false, true] {
+            for gelu in [false, true] {
+                let mut g = Graph::new();
+                let x = g.input("x", &[m, k]);
+                let projected = if m == 1 {
+                    let nw = g.parameter("norm", &[k]);
+                    g.rms_norm(x, nw, 1e-5)
+                } else {
+                    x
+                };
+                let mut project = |name| {
+                    let w = if f16 {
+                        g.parameter_f16(name, &[n, k])
+                    } else {
+                        g.parameter(name, &[n, k])
+                    };
+                    g.matmul_bt(projected, w)
+                };
+                let gate = project("gate");
+                let up = project("up");
+                let out = if gelu {
+                    g.geglu(gate, up)
+                } else {
+                    g.swiglu(gate, up)
+                };
+                g.set_outputs(vec![out]);
+                let mut config = meganeura::SessionConfig::inference_from_env();
+                config.tune = false;
+                let mut session = meganeura::build(&g, config).0;
+                assert_eq!(session.plan().derived_params.len(), 1);
+                assert!(matches!(
+                    session.plan().derived_params[0].2,
+                    meganeura::graph::ParamTransform::VerticalConcat
+                ));
+                let x: Vec<_> = (0..m * k).map(|i| (i as f32 * 0.7).sin()).collect();
+                let mut gate: Vec<_> = (0..n * k).map(|i| (i as f32 * 0.3).cos() * 0.25).collect();
+                let mut up: Vec<_> = (0..n * k).map(|i| (i as f32 * 0.2).sin() * 0.25).collect();
+                session.set_input("x", &x);
+                let nw: Vec<_> = (0..k).map(|i| 0.75 + (i % 5) as f32 * 0.125).collect();
+                if m == 1 {
+                    session.set_parameter("norm", &nw);
+                    assert_eq!(
+                        session
+                            .plan()
+                            .dispatches
+                            .iter()
+                            .filter(|d| d.gemv_rmsnorm.is_some())
+                            .count(),
+                        1
+                    );
+                }
+                let inv_rms = if m == 1 {
+                    (x.iter().map(|v| v * v).sum::<f32>() / k as f32 + 1e-5)
+                        .sqrt()
+                        .recip()
+                } else {
+                    1.0
+                };
+                for pass in 0..3 {
+                    if pass == 1 {
+                        gate.iter_mut().for_each(|v| *v *= -0.5);
+                    }
+                    if pass == 2 {
+                        up.iter_mut().for_each(|v| *v *= 0.75);
+                    }
+                    // Reverse source order; mix f32 and exact f16 uploads.
+                    if f16 && pass == 2 {
+                        let bytes: Vec<_> = up
+                            .iter()
+                            .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+                            .collect();
+                        session.set_parameter_packed("up", &bytes);
+                    } else {
+                        session.set_parameter("up", &up);
+                    }
+                    session.set_parameter("gate", &gate);
+                    session.step();
+                    session.wait();
+                    let rounded = |v| {
+                        if f16 {
+                            half::f16::from_f32(v).to_f32()
+                        } else {
+                            v
+                        }
+                    };
+                    let mut expected = Vec::new();
+                    for row in 0..m {
+                        for col in 0..n {
+                            let a: f32 = (0..k)
+                                .map(|i| {
+                                    x[row * k + i]
+                                        * inv_rms
+                                        * if m == 1 { nw[i] } else { 1.0 }
+                                        * rounded(gate[col * k + i])
+                                })
+                                .sum();
+                            let b: f32 = (0..k)
+                                .map(|i| {
+                                    x[row * k + i]
+                                        * inv_rms
+                                        * if m == 1 { nw[i] } else { 1.0 }
+                                        * rounded(up[col * k + i])
+                                })
+                                .sum();
+                            let activated = if gelu {
+                                0.5 * a * (1.0 + (0.7978846 * (a + 0.044715 * a * a * a)).tanh())
+                            } else {
+                                a / (1.0 + (-a).exp())
+                            };
+                            expected.push(activated * b);
+                        }
+                    }
+                    assert_close_named(
+                        "transposed GLU",
+                        &session.read_output(m * n),
+                        &expected,
+                        1e-4,
+                        1e-5,
+                    );
+                    if m == 1 && !gelu && pass == 0 {
+                        let before = session.read_output(m * n);
+                        let report = session
+                            .tune_with(meganeura::tune::TuneOptions {
+                                scope: meganeura::tune::TuneScope::Dense,
+                                max_time: std::time::Duration::from_secs(10),
+                                sample_pairs: 4,
+                                dispatches_per_sample: 1,
+                                ..Default::default()
+                            })
+                            .unwrap();
+                        assert_eq!(report.eligible_classes, 1);
+                        assert_eq!(report.outcomes.len(), 7);
+                        assert!(
+                            report
+                                .outcomes
+                                .iter()
+                                .all(|o| o.qualified && o.class.gemv_rmsnorm)
+                        );
+                        assert_eq!(session.read_output(m * n), before);
+                        session.step();
+                        session.wait();
+                        assert_close_named(
+                            "tuned transposed GLU",
+                            &session.read_output(m * n),
+                            &expected,
+                            1e-4,
+                            1e-5,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ---- FusedMatMulAdd (GEMV + residual) ----
 
 /// CPU reference: 1×K × K×N + D[1,N].
