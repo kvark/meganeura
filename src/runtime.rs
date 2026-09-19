@@ -1373,6 +1373,9 @@ impl Pipelines {
                     | ShaderGroup::FlashGradQCoop
                     | ShaderGroup::FlashGradKV
                     | ShaderGroup::FlashGradKVCoop
+                    | ShaderGroup::CachedBlockAttention
+                    | ShaderGroup::CachedBlockAttentionSplit
+                    | ShaderGroup::CachedBlockAttentionCombine
             ) && dispatch.params.len() >= 4
             {
                 attention_entries.insert((dispatch.shader.clone(), dispatch.params[3]));
@@ -1526,6 +1529,9 @@ impl Pipelines {
                     | ShaderGroup::FlashGradQCoop
                     | ShaderGroup::FlashGradKV
                     | ShaderGroup::FlashGradKVCoop
+                    | ShaderGroup::CachedBlockAttention
+                    | ShaderGroup::CachedBlockAttentionSplit
+                    | ShaderGroup::CachedBlockAttentionCombine
             ) {
                 // Compiled below per (entry, head_dim), not once per group.
                 continue;
@@ -1556,6 +1562,11 @@ impl Pipelines {
                     crate::codegen::generate_flash_grad_kv_coop_module(hd)
                 }
                 ShaderGroup::MultiHeadAttn => crate::codegen::generate_attention_module(hd),
+                ShaderGroup::CachedBlockAttention
+                | ShaderGroup::CachedBlockAttentionSplit
+                | ShaderGroup::CachedBlockAttentionCombine => {
+                    crate::codegen::generate_cached_attention_module(group, Some(hd))
+                }
                 _ => unreachable!("non-parameterized attention group {group:?}"),
             };
             let shader = create_gen_shader(gpu, sm, wgsl_dump_dir);

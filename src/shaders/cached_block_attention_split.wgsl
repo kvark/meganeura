@@ -31,7 +31,7 @@ var<uniform> params: Params;
 var<workgroup> wg_scores: array<f32, 2048>;
 
 const BKV: u32 = 16u;
-const MAX_VALUES_PER_THREAD: u32 = 8u;
+const MAX_VALUES_PER_THREAD: u32 = $VALUES_PER_THREAD;
 
 fn tree_reduce_bkv(tid: u32) {
     workgroupBarrier();
@@ -70,29 +70,29 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let split_end = min(split_begin + params.chunk, kv_len);
 
     let kv_head = head / (params.num_heads / params.num_kv_heads);
-    let kv_head_off = kv_head * params.head_dim;
-    let kv_dim = params.num_kv_heads * params.head_dim;
-    let scale = inverseSqrt(f32(params.head_dim));
-    let q_base = query_row * params.num_heads * params.head_dim + head * params.head_dim;
+    let kv_head_off = kv_head * $HEAD_DIM;
+    let kv_dim = params.num_kv_heads * $HEAD_DIM;
+    let scale = inverseSqrt(f32($HEAD_DIM));
+    let q_base = query_row * params.num_heads * $HEAD_DIM + head * $HEAD_DIM;
 
     // Layout: partial row = [(row * heads + head) * splits + split] * (head_dim + 2)
     let part = ((query_row * params.num_heads + head) * params.splits + split)
-        * (params.head_dim + 2u);
+        * ($HEAD_DIM + 2u);
 
     if split_begin >= kv_len {
-        for (var d = tid; d < params.head_dim; d += 64u) {
+        for (var d = tid; d < $HEAD_DIM; d += 64u) {
             dst[part + d] = 0.0;
         }
         // An empty slice: the identity partial. The combine folds it away
         // with weight exp(-1e30 - m) = 0.
         if tid == 0u {
-            dst[part + params.head_dim] = -1e30;
-            dst[part + params.head_dim + 1u] = 0.0;
+            dst[part + $HEAD_DIM] = -1e30;
+            dst[part + $HEAD_DIM + 1u] = 0.0;
         }
         return;
     }
 
-    var my_out: array<f32, 8>;
+    var my_out: array<f32, MAX_VALUES_PER_THREAD>;
     for (var lane = 0u; lane < MAX_VALUES_PER_THREAD; lane++) {
         my_out[lane] = 0.0;
     }
@@ -107,7 +107,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             var partial = 0.0;
             for (var lane = 0u; lane < MAX_VALUES_PER_THREAD; lane++) {
                 let d = lane * 64u + tid;
-                if d < params.head_dim && at < split_end {
+                if d < $HEAD_DIM && at < split_end {
                     partial += src_a[q_base + d] * src_b[k_base + d];
                 }
             }
@@ -125,7 +125,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             let v_base = at * kv_dim + kv_head_off;
             for (var lane = 0u; lane < MAX_VALUES_PER_THREAD; lane++) {
                 let d = lane * 64u + tid;
-                if d < params.head_dim && live {
+                if d < $HEAD_DIM && live {
                     my_out[lane] = my_out[lane] * correction + weight * bias[v_base + d];
                 }
             }
@@ -138,12 +138,12 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     // Unnormalized: the combine rescales by exp(m_i - m).
     for (var lane = 0u; lane < MAX_VALUES_PER_THREAD; lane++) {
         let d = lane * 64u + tid;
-        if d < params.head_dim {
+        if d < $HEAD_DIM {
             dst[part + d] = my_out[lane];
         }
     }
     if tid == 0u {
-        dst[part + params.head_dim] = max_score;
-        dst[part + params.head_dim + 1u] = sum_exp;
+        dst[part + $HEAD_DIM] = max_score;
+        dst[part + $HEAD_DIM + 1u] = sum_exp;
     }
 }

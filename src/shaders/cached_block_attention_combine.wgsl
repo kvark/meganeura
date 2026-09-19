@@ -26,7 +26,7 @@ var<storage> partials: array<f32>;
 var<storage, read_write> dst: array<f32>;
 var<uniform> params: Params;
 
-const MAX_VALUES_PER_THREAD: u32 = 8u;
+const MAX_VALUES_PER_THREAD: u32 = $VALUES_PER_THREAD;
 
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
@@ -35,44 +35,44 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let tid = lid.x;
     if query_row >= params.block_len || head >= params.num_heads { return; }
 
-    let stride = params.head_dim + 2u;
+    let stride = $HEAD_DIM + 2u;
     let row_part = (query_row * params.num_heads + head) * params.splits;
 
     // Global max over the splits.
     var m = -1e30;
     for (var i = 0u; i < params.splits; i++) {
         let part = (row_part + i) * stride;
-        m = max(m, partials[part + params.head_dim]);
+        m = max(m, partials[part + $HEAD_DIM]);
     }
 
     // Global sum of exp and combined accumulator.
     var l = 0.0;
     for (var i = 0u; i < params.splits; i++) {
         let part = (row_part + i) * stride;
-        let w = exp(partials[part + params.head_dim] - m);
-        l += w * partials[part + params.head_dim + 1u];
+        let w = exp(partials[part + $HEAD_DIM] - m);
+        l += w * partials[part + $HEAD_DIM + 1u];
     }
 
-    var my_out: array<f32, 8>;
+    var my_out: array<f32, MAX_VALUES_PER_THREAD>;
     for (var lane = 0u; lane < MAX_VALUES_PER_THREAD; lane++) {
         my_out[lane] = 0.0;
     }
     for (var i = 0u; i < params.splits; i++) {
         let part = (row_part + i) * stride;
-        let w = exp(partials[part + params.head_dim] - m);
+        let w = exp(partials[part + $HEAD_DIM] - m);
         for (var lane = 0u; lane < MAX_VALUES_PER_THREAD; lane++) {
             let d = lane * 64u + tid;
-            if d < params.head_dim {
+            if d < $HEAD_DIM {
                 my_out[lane] += w * partials[part + d];
             }
         }
     }
 
     let safe_sum = select(l, 1.0, l == 0.0);
-    let dst_base = query_row * params.num_heads * params.head_dim + head * params.head_dim;
+    let dst_base = query_row * params.num_heads * $HEAD_DIM + head * $HEAD_DIM;
     for (var lane = 0u; lane < MAX_VALUES_PER_THREAD; lane++) {
         let d = lane * 64u + tid;
-        if d < params.head_dim {
+        if d < $HEAD_DIM {
             dst[dst_base + d] = my_out[lane] / safe_sum;
         }
     }
