@@ -1540,6 +1540,7 @@ mod tests {
         let shape = crate::codegen::GemvShape {
             threads: 64,
             reduction: crate::codegen::GemvReduction::Subgroup,
+            bt_rows: 1,
         };
         let dispatch = Dispatch {
             shader: ShaderEntry::MatMulGemv,
