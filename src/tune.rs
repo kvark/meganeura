@@ -394,7 +394,10 @@ impl TuneClass {
     pub(crate) fn from_dispatch(dispatch: &Dispatch, config: Option<&CoopConfig>) -> Option<Self> {
         let addend = matches!(
             dispatch.shader,
-            ShaderEntry::FusedMatMulAdd | ShaderEntry::MatMulGemvAdd
+            ShaderEntry::FusedMatMulAdd
+                | ShaderEntry::FusedMatMulATAdd
+                | ShaderEntry::FusedMatMulBTAdd
+                | ShaderEntry::MatMulGemvAdd
         );
         if !matches!(
             dispatch.shader,
@@ -402,6 +405,8 @@ impl TuneClass {
                 | ShaderEntry::FusedMatMulAdd
                 | ShaderEntry::MatMulAT
                 | ShaderEntry::MatMulBT
+                | ShaderEntry::FusedMatMulATAdd
+                | ShaderEntry::FusedMatMulBTAdd
                 | ShaderEntry::MatMulGemv
                 | ShaderEntry::MatMulGemvAdd
                 | ShaderEntry::MatMulGemvBT
@@ -530,7 +535,10 @@ impl TuneClass {
     pub(crate) fn has_addend(&self) -> bool {
         matches!(
             self.shader,
-            ShaderEntry::FusedMatMulAdd | ShaderEntry::MatMulGemvAdd
+            ShaderEntry::FusedMatMulAdd
+                | ShaderEntry::FusedMatMulATAdd
+                | ShaderEntry::FusedMatMulBTAdd
+                | ShaderEntry::MatMulGemvAdd
         )
     }
 
