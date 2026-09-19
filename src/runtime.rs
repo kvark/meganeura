@@ -2357,6 +2357,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::FusedMatMulAdd
         | ShaderEntry::FusedMatMulATAdd
         | ShaderEntry::FusedMatMulBTAdd
+        | ShaderEntry::MatMulGemvBTAdd
         | ShaderEntry::MatMulGemvAdd => FusedMatMulAddData::layout(),
         ShaderEntry::Relu
         | ShaderEntry::Sigmoid
@@ -7672,7 +7673,9 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::FusedMatMulATAdd | ShaderEntry::FusedMatMulBTAdd => {
+            ShaderEntry::FusedMatMulATAdd
+            | ShaderEntry::FusedMatMulBTAdd
+            | ShaderEntry::MatMulGemvBTAdd => {
                 // params layout: [m, n, k, 0] (same as AT/BT, no swizzle)
                 pc.bind(
                     0,

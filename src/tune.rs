@@ -172,6 +172,7 @@ pub(crate) fn gemv_group(entry: &ShaderEntry) -> Option<crate::codegen::ShaderGr
         ShaderEntry::MatMulGemv => Some(ShaderGroup::MatMulGemv),
         ShaderEntry::MatMulGemvAdd => Some(ShaderGroup::MatMulGemvAdd),
         ShaderEntry::MatMulGemvBT => Some(ShaderGroup::MatMulGemvBT),
+        ShaderEntry::MatMulGemvBTAdd => Some(ShaderGroup::MatMulGemvBTAdd),
         _ => None,
     }
 }
@@ -398,6 +399,7 @@ impl TuneClass {
                 | ShaderEntry::FusedMatMulATAdd
                 | ShaderEntry::FusedMatMulBTAdd
                 | ShaderEntry::MatMulGemvAdd
+                | ShaderEntry::MatMulGemvBTAdd
         );
         if !matches!(
             dispatch.shader,
@@ -410,6 +412,7 @@ impl TuneClass {
                 | ShaderEntry::MatMulGemv
                 | ShaderEntry::MatMulGemvAdd
                 | ShaderEntry::MatMulGemvBT
+                | ShaderEntry::MatMulGemvBTAdd
                 | ShaderEntry::Conv2dGemm
                 | ShaderEntry::Conv2dGemmSmall
                 | ShaderEntry::Conv2dGradInputGemm
@@ -539,6 +542,7 @@ impl TuneClass {
                 | ShaderEntry::FusedMatMulATAdd
                 | ShaderEntry::FusedMatMulBTAdd
                 | ShaderEntry::MatMulGemvAdd
+                | ShaderEntry::MatMulGemvBTAdd
         )
     }
 
@@ -599,7 +603,10 @@ impl TuneClass {
     /// Workgroups a K-split GEMV dispatches: one per output vec4, or one per
     /// output row for the transposed form. Independent of the thread count.
     pub(crate) fn gemv_workgroups(&self) -> [u32; 3] {
-        if self.shader == ShaderEntry::MatMulGemvBT {
+        if matches!(
+            self.shader,
+            ShaderEntry::MatMulGemvBT | ShaderEntry::MatMulGemvBTAdd
+        ) {
             [self.n, 1, 1]
         } else {
             [self.n / 4, 1, 1]

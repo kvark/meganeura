@@ -194,6 +194,8 @@ pub enum ShaderEntry {
     /// M=1 MatMulBT specialization (`B` stored `[N,K]`). K-split with
     /// naturally coalesced vec4 reads along the contiguous K axis.
     MatMulGemvBT,
+    /// M=1 transposed-B GEMV with a fused addend.
+    MatMulGemvBTAdd,
     FusedMatMulAdd,
     FusedMatMulATAdd,
     FusedMatMulBTAdd,
@@ -362,6 +364,7 @@ impl ShaderEntry {
             | ShaderEntry::MatMulGemv
             | ShaderEntry::MatMulGemvAdd
             | ShaderEntry::MatMulGemvBT
+            | ShaderEntry::MatMulGemvBTAdd
             | ShaderEntry::FusedMatMulAdd
             | ShaderEntry::FusedMatMulATAdd
             | ShaderEntry::FusedMatMulBTAdd => "matrix",
@@ -490,6 +493,7 @@ impl ShaderEntry {
             ShaderEntry::MatMulGemv => ShaderGroup::MatMulGemv,
             ShaderEntry::MatMulGemvAdd => ShaderGroup::MatMulGemvAdd,
             ShaderEntry::MatMulGemvBT => ShaderGroup::MatMulGemvBT,
+            ShaderEntry::MatMulGemvBTAdd => ShaderGroup::MatMulGemvBTAdd,
             ShaderEntry::FusedMatMulAdd => ShaderGroup::MatMulAdd,
             ShaderEntry::FusedMatMulATAdd => ShaderGroup::MatMulATAdd,
             ShaderEntry::FusedMatMulBTAdd => ShaderGroup::MatMulBTAdd,
@@ -606,6 +610,7 @@ impl ShaderEntry {
             | ShaderEntry::MatMulGemv
             | ShaderEntry::MatMulGemvAdd
             | ShaderEntry::MatMulGemvBT
+            | ShaderEntry::MatMulGemvBTAdd
             | ShaderEntry::FusedMatMulAdd
             | ShaderEntry::FusedMatMulATAdd
             | ShaderEntry::FusedMatMulBTAdd
@@ -2224,7 +2229,10 @@ pub fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
         // Skip GEMV variants (M=1) — those use a different kernel path.
         if matches!(
             d.shader,
-            ShaderEntry::MatMulGemv | ShaderEntry::MatMulGemvAdd | ShaderEntry::MatMulGemvBT
+            ShaderEntry::MatMulGemv
+                | ShaderEntry::MatMulGemvAdd
+                | ShaderEntry::MatMulGemvBT
+                | ShaderEntry::MatMulGemvBTAdd
         ) {
             continue;
         }
@@ -2917,6 +2925,7 @@ impl<'a> Compiler<'a> {
                 ShaderEntry::MatMulAT
                 | ShaderEntry::MatMulBT
                 | ShaderEntry::MatMulGemvBT
+                | ShaderEntry::MatMulGemvBTAdd
                 | ShaderEntry::FusedMatMulATAdd
                 | ShaderEntry::FusedMatMulBTAdd => {
                     format!(
@@ -3354,9 +3363,18 @@ impl<'a> Compiler<'a> {
                 let m = a_shape[0] as u32;
                 let k = a_shape[1] as u32;
                 let n = b_shape[0] as u32;
+                let gemv = m == 1 && k.is_multiple_of(4);
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::FusedMatMulBTAdd,
-                    workgroups: matmul_workgroups(m, n, 64),
+                    shader: if gemv {
+                        ShaderEntry::MatMulGemvBTAdd
+                    } else {
+                        ShaderEntry::FusedMatMulBTAdd
+                    },
+                    workgroups: if gemv {
+                        [n, 1, 1]
+                    } else {
+                        matmul_workgroups(m, n, 64)
+                    },
                     input_buffers: vec![a, b, d],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
@@ -3364,6 +3382,7 @@ impl<'a> Compiler<'a> {
                     use_coop: false,
                     use_small_tiles: false,
                     weight_format: wf,
+                    gemv_shape: if gemv { self.options.gemv_shape } else { None },
                     ..Default::default()
                 });
             }
