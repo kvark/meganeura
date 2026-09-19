@@ -1342,7 +1342,7 @@ fn accumulate_grad(
 }
 
 /// Broadcast a scalar gradient (shape `[1]`) to an arbitrary `target_shape`
-/// using reshape→matmul→reshape. Required by reduction-to-scalar backwards
+/// using the row-broadcast kernel. Required by reduction-to-scalar backwards
 /// (SumAll, MeanAll) and by losses whose backward emits a per-element
 /// gradient that must still be chained with the upstream `dL/dy` from the
 /// rest of the graph (CrossEntropyLoss, BceLoss). Without this multiplier,
@@ -1351,8 +1351,7 @@ fn accumulate_grad(
 fn broadcast_scalar(graph: &mut Graph, scalar: NodeId, target_shape: &[usize]) -> NodeId {
     let n = target_shape.iter().product::<usize>();
     let go_2d = graph.reshape(scalar, &[1, 1]);
-    let ones_row = graph.constant(vec![1.0; n], &[1, n]);
-    let broadcast_2d = graph.matmul(go_2d, ones_row);
+    let broadcast_2d = graph.broadcast_inner(go_2d, n);
     graph.reshape(broadcast_2d, target_shape)
 }
 
@@ -1418,6 +1417,11 @@ mod tests {
         // Should produce gradients for w1, b1, w2
         // outputs: [loss, grad_w1, grad_b1, grad_w2]
         assert_eq!(diff.outputs().len(), 4, "expected loss + 3 param grads");
+        assert!(
+            diff.nodes()
+                .iter()
+                .any(|node| matches!(node.op, Op::BroadcastInner { .. }))
+        );
     }
 
     #[test]

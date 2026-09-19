@@ -543,6 +543,24 @@ fn apply_greedy_unary_simplifications(graph: &mut Graph, fusions: &mut Vec<(Stri
             (Op::Neg, Op::Neg) => (inner.inputs[0], "Neg(Neg(x))→x"),
             (Op::Transpose, Op::Transpose) => (inner.inputs[0], "Transpose(Transpose(x))→x"),
             (Op::Relu, Op::Relu) => (inner_id, "Relu(Relu(x))→Relu(x)"),
+            (
+                Op::RoPE {
+                    theta,
+                    pos_offset: 0,
+                    ..
+                }
+                | Op::RoPEGrad {
+                    theta,
+                    pos_offset: 0,
+                    ..
+                },
+                _,
+            ) if theta.is_finite()
+                && theta > 0.0
+                && graph.nodes()[id].ty.shape.first() == Some(&1) =>
+            {
+                (inner_id, "RoPE(position=0)→x")
+            }
             _ => continue,
         };
         graph.nodes_mut()[id].op = Op::Identity;
@@ -2019,6 +2037,31 @@ mod tests {
             .filter(|n| matches!(n.op, Op::Neg))
             .count();
         assert_eq!(negs, 0, "dead Neg nodes should be swept");
+    }
+
+    #[test]
+    fn static_rope_identity() {
+        for (rows, offset, dynamic) in [(1, 0, false), (1, 1, false), (2, 0, false), (1, 0, true)] {
+            let mut g = Graph::new();
+            let x = g.input("x", &[rows, 8]);
+            let y = if dynamic {
+                let pos = g.input_u32("pos", &[1]);
+                g.rope_dynamic_offset(x, 10000.0, pos, 4)
+            } else {
+                g.rope_with_offset(x, 10000.0, offset, 4)
+            };
+            let grad = g.rope_grad(x, 10000.0, offset, 4);
+            g.set_outputs(vec![y, grad]);
+            let opt = optimize(&g);
+            assert_eq!(
+                matches!(opt.node(opt.outputs()[0]).op, Op::Identity),
+                rows == 1 && offset == 0 && !dynamic
+            );
+            assert_eq!(
+                matches!(opt.node(opt.outputs()[1]).op, Op::Identity),
+                rows == 1 && offset == 0
+            );
+        }
     }
 
     #[test]
