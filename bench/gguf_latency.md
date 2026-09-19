@@ -221,6 +221,34 @@ in Meganeura (`5af8494`) and Blade (`1b4157a`). CPU-stage instrumentation is on
 Meganeura `experiment/llama-cpu-record-2026-09-19` (`29e3cd4`). These source-only
 experiments are not part of the production branch's ancestry.
 
+### Further kernel probes
+
+`b6d6971cce673c559fbcbcc162b5fd5a8313379d` adds fused transposed matmuls to
+the existing qualified tile search. It changes neither precision policy nor
+the search budget. Existing CPU reference/layout checks and the opt-in GPU
+tuning regression cover both transpose directions and nonzero addends.
+
+Three source-only probes are separate from production:
+
+- `experiment/rmsnorm-subgroup-2026-09-19` (`04421dd`): using subgroup sums
+  for the fused norm as well as the matrix reduction gave less than 1% decode
+  improvement, smaller than process variation. Not retained.
+- `experiment/attention-split-counts-2026-09-19` (`a3fbd89`): a pilot over
+  1/2/4/8/16 splits found different preferred geometry for prefill and decode.
+  It does not justify a replacement fixed threshold.
+- `experiment/gguf-row-weights-2026-09-19` (`621de44`): retaining dense GGUF
+  rows and using transposed GEMV reduced decode from 1.814 to 1.609 ms on
+  NVIDIA and 4.549 to 4.284 ms on Intel in three reversed-order pairs.
+  Prefill stayed near 7.27 and 21.2 ms after extending tile search; without
+  that fix, Intel prefill took 27.3 ms in a pilot. All saved logits passed
+  the same reference checks. The layout still loses existing norm/packing
+  fusions and adds temporary GEMV-plus-add dispatches, so it remains an
+  experiment, not part of the production latency table above.
+
+Each experiment branch contains its source and a short result summary, without
+raw timings or binaries. The next layout work is to preserve the applicable
+fusions, not to add model-specific kernels or change the paper cohort.
+
 ### Verification
 
 Formatting and all-target/all-feature Clippy passed. CPU unit tests: 449 passed,

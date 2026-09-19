@@ -1325,12 +1325,31 @@ mod tests {
         changed = base.clone();
         changed.binding_bytes = vec![4096; 3];
         assert_ne!(base, changed);
-        let mut at = d;
-        at.shader = ShaderEntry::MatMulAT;
-        at.params = vec![33, 65, 17, 0];
-        let at_class = TuneClass::from_dispatch(&at, None).unwrap();
-        assert_eq!((at_class.m, at_class.n, at_class.k), (33, 65, 17));
-        assert_ne!(base, at_class);
+        for shader in [
+            ShaderEntry::MatMulAT,
+            ShaderEntry::MatMulBT,
+            ShaderEntry::FusedMatMulATAdd,
+            ShaderEntry::FusedMatMulBTAdd,
+        ] {
+            let fused = matches!(
+                shader,
+                ShaderEntry::FusedMatMulATAdd | ShaderEntry::FusedMatMulBTAdd
+            );
+            let mut transposed = d.clone();
+            transposed.shader = shader;
+            transposed.params = vec![33, 65, 17, 0];
+            if fused {
+                transposed.input_buffers.push(crate::compile::BufferRef(3));
+            }
+            let class = TuneClass::from_dispatch(&transposed, None).unwrap();
+            assert_eq!((class.m, class.n, class.k), (33, 65, 17));
+            assert_eq!(class.has_addend(), fused);
+            assert_eq!(
+                class.buffer_sizes().unwrap().len(),
+                if fused { 4 } else { 3 }
+            );
+            assert_ne!(base, class);
+        }
     }
 
     #[test]
