@@ -3035,6 +3035,13 @@ struct UploadStaging {
     size: usize,
 }
 
+#[derive(Default)]
+struct Readback {
+    staging: Option<UploadStaging>,
+    // Mapped address and byte count: imported buffers may use a different heap.
+    staged: HashMap<(usize, usize), bool>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ShareParameterError {
     DifferentContext,
@@ -3177,6 +3184,7 @@ pub struct Session {
     /// range into this host copy, which is then uploaded as a whole.
     packed_concat_staging: HashMap<crate::compile::BufferRef, Vec<u8>>,
     upload_staging: RefCell<Option<UploadStaging>>,
+    readback: RefCell<Readback>,
     reuse_upload_staging: bool,
 }
 
@@ -3984,6 +3992,7 @@ impl Session {
             adam_wd: 0.0,
             packed_concat_staging: HashMap::new(),
             upload_staging: RefCell::new(None),
+            readback: RefCell::new(Readback::default()),
             reuse_upload_staging: opts.reuse_upload_staging,
         }
     }
@@ -6075,21 +6084,65 @@ impl Session {
         if out.is_empty() {
             return;
         }
+        let direct = |out: &mut [f32]| unsafe {
+            std::ptr::copy_nonoverlapping(buffer.data() as *const f32, out.as_mut_ptr(), out.len());
+        };
+        let mut readback = self.readback.borrow_mut();
         if host_visible {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    buffer.data() as *const f32,
-                    out.as_mut_ptr(),
-                    out.len(),
+            let key = (buffer.data() as usize, std::mem::size_of_val(out));
+            if let Some(&staged) = readback.staged.get(&key) {
+                if staged {
+                    self.read_staged_f32(buffer, out, &mut readback.staging);
+                } else {
+                    direct(out);
+                }
+                return;
+            }
+            // A mapped device heap need not be CPU-cached. Measure the actual
+            // allocation instead of assuming that host-visible means fast reads.
+            let mut direct_time = std::time::Duration::MAX;
+            let mut staged_time = std::time::Duration::MAX;
+            for _ in 0..3 {
+                let start = std::time::Instant::now();
+                direct(out);
+                direct_time = direct_time.min(start.elapsed());
+                let bits: Vec<_> = out.iter().map(|x| x.to_bits()).collect();
+                let start = std::time::Instant::now();
+                self.read_staged_f32(buffer, out, &mut readback.staging);
+                staged_time = staged_time.min(start.elapsed());
+                assert!(
+                    out.iter().zip(bits).all(|(a, b)| a.to_bits() == b),
+                    "readback changed buffer contents"
                 );
             }
+            let staged = staged_time.as_secs_f64() < direct_time.as_secs_f64() * 0.9;
+            log::debug!(
+                "readback {} bytes: mapped {direct_time:?}, staged {staged_time:?}, use staging={staged}",
+                key.1
+            );
+            readback.staged.insert(key, staged);
             return;
         }
-        let bytes = std::mem::size_of_val(out) as u64;
-        let staging = self.gpu.create_buffer(blade_graphics::BufferDesc {
-            name: "readback_staging",
-            size: bytes.max(4),
-            memory: blade_graphics::Memory::Download,
+        self.read_staged_f32(buffer, out, &mut readback.staging);
+    }
+
+    fn read_staged_f32(
+        &self,
+        buffer: &blade_graphics::Buffer,
+        out: &mut [f32],
+        cached: &mut Option<UploadStaging>,
+    ) {
+        let staging_bytes = std::mem::size_of_val(out).clamp(4, 16 * 1024 * 1024);
+        if cached.as_ref().is_some_and(|s| s.size < staging_bytes) {
+            self.gpu.destroy_buffer(cached.take().unwrap().buffer);
+        }
+        let staging = cached.get_or_insert_with(|| UploadStaging {
+            buffer: self.gpu.create_buffer(blade_graphics::BufferDesc {
+                name: "readback_staging",
+                size: staging_bytes as u64,
+                memory: blade_graphics::Memory::Download,
+            }),
+            size: staging_bytes,
         });
         let mut encoder = self
             .gpu
@@ -6098,21 +6151,25 @@ impl Session {
                 buffer_count: 1,
                 manual_barriers: false,
             });
-        encoder.start();
-        encoder
-            .transfer("readback_copy")
-            .copy_buffer_to_buffer(buffer.at(0), staging.at(0), bytes);
-        let sync = self.gpu.submit(&mut encoder);
-        let _ = wait_for_timed_encoder(&self.gpu, &sync, &mut encoder, self.gpu_timing);
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                staging.data() as *const f32,
-                out.as_mut_ptr(),
-                out.len(),
+        for (index, chunk) in out.chunks_mut(staging.size / 4).enumerate() {
+            encoder.start();
+            encoder.transfer("readback_copy").copy_buffer_to_buffer(
+                buffer.at((index * staging.size) as u64),
+                staging.buffer.at(0),
+                std::mem::size_of_val(chunk) as u64,
             );
+            let sync = self.gpu.submit(&mut encoder);
+            wait_for_timed_encoder(&self.gpu, &sync, &mut encoder, self.gpu_timing)
+                .expect("readback submission failed");
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    staging.buffer.data() as *const f32,
+                    chunk.as_mut_ptr(),
+                    chunk.len(),
+                );
+            }
         }
         self.gpu.destroy_command_encoder(&mut encoder);
-        self.gpu.destroy_buffer(staging);
     }
 
     /// Read back the loss value.
@@ -9186,6 +9243,9 @@ impl Drop for Session {
         self.wait();
         self.gpu.destroy_command_encoder(&mut self.encoder);
         if let Some(staging) = self.upload_staging.get_mut().take() {
+            self.gpu.destroy_buffer(staging.buffer);
+        }
+        if let Some(staging) = self.readback.get_mut().staging.take() {
             self.gpu.destroy_buffer(staging.buffer);
         }
         for pipeline in self.pipelines.map.values_mut() {
