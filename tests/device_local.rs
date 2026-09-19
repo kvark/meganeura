@@ -9,6 +9,41 @@
 
 use meganeura::{Graph, nn};
 
+#[test]
+fn readback_preserves_bits_across_sizes_and_updates() {
+    let len = 4 * 1024 * 1024 + 3; // Includes a partial final staging chunk.
+    let mut graph = Graph::new();
+    let input = graph.input("x", &[len]);
+    let output = graph.materialize(input);
+    graph.set_outputs(vec![output]);
+    let mut session = meganeura::build(&graph, meganeura::SessionConfig::inference_from_env()).0;
+    for seed in [0u32, 17] {
+        let values: Vec<_> = (0..len)
+            .map(|i| {
+                f32::from_bits(match i % 7 {
+                    0 => 0x7fc0_0123,
+                    1 => 0x8000_0000,
+                    2 => 0x7f80_0000,
+                    _ => (i as u32 + seed).wrapping_mul(2654435761),
+                })
+            })
+            .collect();
+        session.set_input("x", &values);
+        session.step();
+        session.wait();
+        for count in [0, 17, len, 1024, len] {
+            let mut actual = vec![0.0; count];
+            session.read_output_by_index(0, &mut actual);
+            assert!(
+                actual
+                    .iter()
+                    .zip(&values)
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+            );
+        }
+    }
+}
+
 fn model(bs: usize) -> Graph {
     let mut g = Graph::new();
     let x = g.input("x", &[bs, 8]);

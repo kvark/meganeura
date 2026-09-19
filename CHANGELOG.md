@@ -2,6 +2,7 @@
 
 - Broadcast scalar gradients directly and eliminate single-row RoPE at static position zero.
 - Fix split-attention partial indexing and clear empty splits when reusing a KV cache.
+- Measure mapped versus staged readback per allocation and size; reuse bounded staging for faster CPU reads.
 - The codegen debug hooks are parameters, not process state. WGSL dumping
   resolved `MEGANEURA_DUMP_WGSL` into a `SessionOptions::wgsl_dump_dir`
   that each session's pipeline layer owns; every module it compiles (the
