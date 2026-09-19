@@ -395,6 +395,8 @@ impl Session {
         }
         self.wait();
         other.wait();
+        self.replay_recorded = false;
+        other.replay_recorded = false;
         for swap in &swaps {
             swap.right
                 .apply(&mut self.plan.dispatches[swap.index], &swap.class);
@@ -445,6 +447,8 @@ impl Session {
     /// an incomplete comparison always retains its incumbent.
     pub fn tune_with(&mut self, options: TuneOptions) -> Result<TuneReport, TuneError> {
         options.validate()?;
+        self.wait();
+        self.replay_recorded = false;
         let start = Instant::now();
         let (mut classes, mut excluded_dispatches) =
             collect_classes(&self.plan, &self.alias, self.coop_config.as_ref());

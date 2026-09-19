@@ -162,9 +162,10 @@ gain (11.64 to 11.17 ms) and no Intel gain in three reversed-order pairs.
 
 ### Fixed-head attention follow-up
 
-`75c7e53` compiles cached attention at the graph's known head dimension, using
-the existing per-head pipeline mechanism. It removes unused per-thread values
-and dynamic head-width branches without changing the algorithm or precision.
+`dd9f56f9f9d334f791ce64ae7b0163d6ed631058` compiles cached attention at the graph's
+known head dimension, using the existing per-head pipeline mechanism. It removes
+unused per-thread values and dynamic head-width branches without changing the
+algorithm or precision.
 Three fresh-process pairs, reversing order, compared it with `5aeb856`:
 
 | GPU | Phase | Before | Fixed head width |
@@ -181,6 +182,44 @@ covers head widths 64, 80 and 512, including partially occupied thread lanes.
 NVIDIA attention pass intervals fell from 0.98 to 0.49 ms for decode and from
 3.80 to 1.66 ms for prefill in separate captures. This is still not parity with
 llama.cpp; matrix kernels and host submission remain substantial costs.
+
+### Serialized command replay
+
+The follow-up pins Blade `4befad4f5fbd427c1aca4b1b001fb8b7acd8e109` and reuses
+an unchanged Vulkan inference recording after waiting for its previous execution.
+Input contents remain dynamic. Rebinding, tuning, profiling, changing submission
+chunks, and other uses of the encoder invalidate the recording. Training,
+timestamped sessions, Metal and GLES keep ordinary recording. The normal
+`Session::step` path selects this automatically; no benchmark-specific toggle
+or numerical change is involved.
+
+Three fresh-process trials per engine, with rotated order and the same diagnostic:
+
+| GPU | Phase | Fixed head, recording | Fixed head, replay | llama.cpp |
+| --- | --- | ---: | ---: | ---: |
+| RTX 5070 | Prefill | 8.65 | 7.23 | 7.11 |
+| RTX 5070 | Decode | 3.13 | 1.82 | 1.38 |
+| Arc B570 | Prefill | 22.89 | 21.31 | 15.61 |
+| Arc B570 | Decode | 5.64 | 4.48 | 3.42 |
+
+The NVIDIA recording control varied from 2.28 to 3.15 ms per decode; replay
+ranged from 1.81 to 1.85 ms. Intel replay ranged from 4.45 to 4.54 ms. CPU clocks
+remain uncontrolled. The CPU record/submit stage fell from 1.26 to 0.040 ms on
+NVIDIA and from 1.42 to 0.044 ms on Intel. Replay does not remove GPU barriers
+or change kernel arithmetic. All 33 next-token choices still match the CPU
+reference; maximum relative L2 errors are 0.0000102 and 0.000177 respectively.
+Median preparation remains 3.46 s and 9.79 s, including tuning.
+
+NVIDIA prefill is now within 2% of llama.cpp on this case. Decode remains about
+32% slower on NVIDIA and 31% on Intel; Intel prefill remains 37% slower.
+This is not general parity and does not establish an improvement in the paper's
+training workloads. Keep the frozen paper cohort unchanged until the remaining
+kernel work and measurements on the paper's own graphs justify recollection.
+
+The timing-only precursor is preserved on `experiment/llama-replay-2026-09-19`
+in Meganeura (`5af8494`) and Blade (`1b4157a`). CPU-stage instrumentation is on
+Meganeura `experiment/llama-cpu-record-2026-09-19` (`29e3cd4`). These source-only
+experiments are not part of the production branch's ancestry.
 
 ### Verification
 

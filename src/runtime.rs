@@ -3139,6 +3139,9 @@ pub struct Session {
     /// Caller-selected upper bound on the submissions used by `step()`.
     /// See [`Session::set_submission_chunks`]. Always at least 1.
     submission_chunks: usize,
+    /// The encoder holds an unchanged inference step eligible for replay.
+    /// Plan/binding changes invalidate this; other recordings use `start_commands`.
+    replay_recorded: bool,
     sync_point: Option<blade_graphics::SyncPoint>,
     /// Calibrated timings harvested when the most recent submission completed.
     last_gpu_timings: Option<crate::profiler::GpuTimings>,
@@ -4011,6 +4014,7 @@ impl Session {
             groups,
             encoder,
             submission_chunks: 1,
+            replay_recorded: false,
             sync_point: None,
             gpu_timing,
             last_gpu_timings: None,
@@ -4137,6 +4141,7 @@ impl Session {
         // Finish any outstanding GPU work that might still reference the
         // internal buffer, then release it before swapping in the import.
         self.wait();
+        self.replay_recorded = false;
 
         let imported = self.gpu.create_buffer(blade_graphics::BufferDesc {
             name: "meganeura_imported",
@@ -4183,6 +4188,7 @@ impl Session {
         }
         self.wait();
         source.wait();
+        self.replay_recorded = false;
         let target = self
             .plan
             .param_buffers
@@ -4290,6 +4296,7 @@ impl Session {
         // number in flight keeps that from happening.
         self.wait();
         self.gpu.destroy_command_encoder(&mut self.encoder);
+        self.replay_recorded = false;
         self.encoder = self
             .gpu
             .create_command_encoder(blade_graphics::CommandEncoderDesc {
@@ -4311,7 +4318,7 @@ impl Session {
     /// per submission and silently drops the rest, so plans larger than that
     /// need [`Session::set_profiling_window`] to be measured in slices.
     pub fn set_profiling(&mut self, enabled: bool) {
-        self.profile_window = enabled.then_some(0..self.plan.dispatches.len());
+        self.set_profiling_window(enabled.then_some(0..self.plan.dispatches.len()));
     }
 
     /// Timestamp only `window`, a range of plan dispatch indices.
@@ -4330,6 +4337,7 @@ impl Session {
     /// `None` restores unprofiled execution. The window is clamped to the
     /// plan, so an over-long range simply times every remaining dispatch.
     pub fn set_profiling_window(&mut self, window: Option<std::ops::Range<usize>>) {
+        self.replay_recorded = false;
         self.profile_window = window;
     }
 
@@ -6824,7 +6832,7 @@ impl Session {
             })
             .collect();
         if !device_buffers.is_empty() {
-            self.encoder.start();
+            self.start_commands();
             {
                 let mut transfer = self.encoder.transfer("zero_adam");
                 for (buffer, size) in device_buffers {
@@ -6978,7 +6986,25 @@ impl Session {
         .entered();
         self.wait();
 
-        self.encoder.start();
+        let reusable = !self.debug
+            && !self.gpu_timing
+            && self.profile_window.is_none()
+            && self.submission_chunks == 1
+            && self.plan.param_grad_pairs.is_empty()
+            && self.pending_lr.is_none()
+            && self.pending_adam.is_none()
+            && self.grad_accum_scale.is_none();
+        if reusable
+            && self.replay_recorded
+            && let Some(sync) = self.gpu.try_replay(&mut self.encoder)
+        {
+            self.sync_point = Some(sync);
+            return;
+        }
+        self.replay_recorded = reusable && self.encoder.start_reusable();
+        if !self.replay_recorded {
+            self.start_commands();
+        }
         self.profiled_pass_map.clear();
 
         if let Some(window) = self.profile_window.clone() {
@@ -7060,7 +7086,7 @@ impl Session {
                 chunk_index += 1;
                 if start < total {
                     self.sync_point = Some(self.gpu.submit(&mut self.encoder));
-                    self.encoder.start();
+                    self.start_commands();
                 }
             }
         }
@@ -7098,7 +7124,7 @@ impl Session {
             // corrupted the accumulator on the apply step.
             self.sync_point = Some(self.gpu.submit(&mut self.encoder));
             self.wait();
-            self.encoder.start();
+            self.start_commands();
         }
 
         // Gradient clipping runs after backward and before the optimizer in
@@ -7339,6 +7365,11 @@ impl Session {
         }
 
         self.sync_point = Some(self.gpu.submit(&mut self.encoder));
+    }
+
+    fn start_commands(&mut self) {
+        self.replay_recorded = false;
+        self.encoder.start();
     }
 
     fn optimizer_len(plan: &ExecutionPlan, param: BufferRef) -> u32 {
@@ -8705,7 +8736,7 @@ impl Session {
     pub fn sgd_step(&mut self, learning_rate: f32) {
         let _span = tracing::info_span!("sgd_step").entered();
         self.wait();
-        self.encoder.start();
+        self.start_commands();
 
         // All SGD updates are independent (different param/grad buffers),
         // so they share a single compute pass — no barriers between them.
@@ -8936,7 +8967,7 @@ impl Session {
         self.ensure_adam_state();
         self.adam_step += 1;
         self.wait();
-        self.encoder.start();
+        self.start_commands();
 
         let pipeline = self.pipelines.scalar(ShaderEntry::AdamUpdate);
         let mut pass = self.encoder.compute("adam_update");
@@ -9178,7 +9209,7 @@ impl Session {
         }
         self.wait();
         if self.optimizer_device {
-            self.encoder.start();
+            self.start_commands();
             {
                 let mut transfer = self.encoder.transfer("zero_grad");
                 for (buf, &(_, grad_buf)) in
