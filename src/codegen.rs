@@ -590,11 +590,8 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
         ShaderGroup::CrossEntropy => ShaderModule::new(include_str!("shaders/cross_entropy.wgsl")),
         ShaderGroup::RmsNorm => generate_rms_norm_module(false),
         ShaderGroup::RmsNormAdd => generate_rms_norm_module(true),
-        ShaderGroup::CachedBlockAttentionSplit => {
-            ShaderModule::new(include_str!("shaders/cached_block_attention_split.wgsl"))
-        }
-        ShaderGroup::CachedBlockAttentionCombine => {
-            ShaderModule::new(include_str!("shaders/cached_block_attention_combine.wgsl"))
+        ShaderGroup::CachedBlockAttentionSplit | ShaderGroup::CachedBlockAttentionCombine => {
+            generate_cached_attention_module(group, None)
         }
         ShaderGroup::Embedding => ShaderModule::new(include_str!("shaders/embedding.wgsl")),
         ShaderGroup::ToF16 => ShaderModule::new(include_str!("shaders/to_f16.wgsl")),
@@ -3026,9 +3023,37 @@ const ATTENTION_TREE_REDUCE: &str = "\
 /// The cached-block attention kernel. `generate_module` routes here with
 /// the tree score reduction as the portable default.
 pub fn generate_module_block_attention() -> ShaderModule {
+    generate_cached_attention_module(ShaderGroup::CachedBlockAttention, None)
+}
+
+pub(crate) fn generate_cached_attention_module(
+    group: ShaderGroup,
+    head_dim: Option<u32>,
+) -> ShaderModule {
+    let source = match group {
+        ShaderGroup::CachedBlockAttention => include_str!("shaders/cached_block_attention.wgsl"),
+        ShaderGroup::CachedBlockAttentionSplit => {
+            include_str!("shaders/cached_block_attention_split.wgsl")
+        }
+        ShaderGroup::CachedBlockAttentionCombine => {
+            include_str!("shaders/cached_block_attention_combine.wgsl")
+        }
+        _ => unreachable!("not cached attention: {group:?}"),
+    };
+    let (dimension, values) = match head_dim {
+        Some(hd) => {
+            assert!((1..=512).contains(&hd));
+            (format!("{hd}u"), hd.div_ceil(64))
+        }
+        None => ("params.head_dim".to_string(), 8),
+    };
     ShaderModule::new(&preprocess(
-        include_str!("shaders/cached_block_attention.wgsl"),
-        &[("$SCORE_REDUCE", ATTENTION_TREE_REDUCE)],
+        source,
+        &[
+            ("$SCORE_REDUCE", ATTENTION_TREE_REDUCE),
+            ("$HEAD_DIM", &dimension),
+            ("$VALUES_PER_THREAD", &format!("{values}u")),
+        ],
     ))
 }
 

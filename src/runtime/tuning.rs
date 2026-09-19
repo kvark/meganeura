@@ -1408,19 +1408,19 @@ fn reference_dot(class: &TuneClass, inputs: &[Vec<f32>], row: usize, col: usize)
         (1.0, None)
     };
     for inner in 0..k {
-        let a = if class.shader == ShaderEntry::MatMulAT {
+        let a = if matches!(
+            class.shader,
+            ShaderEntry::MatMulAT | ShaderEntry::FusedMatMulATAdd
+        ) {
             inner * m + row
         } else {
             row * k + inner
         };
-        // Both transposed-B entries store B as `[N, K]` row-major, so a
-        // column's weights are contiguous. The GEMV form is a separate
-        // `ShaderEntry`, and leaving it out of this check silently gave it
-        // forward `[K, N]` addressing — a reference that disagrees with a
-        // correct kernel, which reads as the kernel failing.
+        // Transposed-B kernels, including fused-add and GEMV forms, read
+        // contiguous rows of B rather than forward `[K, N]` columns.
         let b = if matches!(
             class.shader,
-            ShaderEntry::MatMulBT | ShaderEntry::MatMulGemvBT
+            ShaderEntry::MatMulBT | ShaderEntry::FusedMatMulBTAdd | ShaderEntry::MatMulGemvBT
         ) {
             col * k + inner
         } else {
@@ -2226,13 +2226,21 @@ mod tests {
             ShaderEntry::MatMulAT,
             ShaderEntry::MatMulBT,
             ShaderEntry::FusedMatMulAdd,
+            ShaderEntry::FusedMatMulATAdd,
+            ShaderEntry::FusedMatMulBTAdd,
         ] {
             class.shader = shader;
             let mut inputs = normal.clone();
-            if class.shader == ShaderEntry::MatMulAT {
+            if matches!(
+                class.shader,
+                ShaderEntry::MatMulAT | ShaderEntry::FusedMatMulATAdd
+            ) {
                 inputs[0] = vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0];
             }
-            if class.shader == ShaderEntry::MatMulBT {
+            if matches!(
+                class.shader,
+                ShaderEntry::MatMulBT | ShaderEntry::FusedMatMulBTAdd
+            ) {
                 inputs[1] = vec![7.0, 9.0, 11.0, 8.0, 10.0, 12.0];
             }
             if class.has_addend() {
@@ -2281,6 +2289,8 @@ mod tests {
             ShaderEntry::FusedMatMulAdd,
             ShaderEntry::MatMulAT,
             ShaderEntry::MatMulBT,
+            ShaderEntry::FusedMatMulATAdd,
+            ShaderEntry::FusedMatMulBTAdd,
             ShaderEntry::Conv2dGemm,
             ShaderEntry::Conv2dGradInputGemm,
             ShaderEntry::Conv2dGradWeightGemm,
@@ -2370,7 +2380,9 @@ mod tests {
                     .collect();
                 names.sort_unstable();
                 let mut expected = match entry {
-                    ShaderEntry::FusedMatMulAdd => {
+                    ShaderEntry::FusedMatMulAdd
+                    | ShaderEntry::FusedMatMulATAdd
+                    | ShaderEntry::FusedMatMulBTAdd => {
                         vec!["matrix_a", "matrix_b", "matrix_c", "params", "src"]
                     }
                     ShaderEntry::Conv2dGradInputGemm => vec!["dst", "grad_out", "params", "weight"],
@@ -2435,6 +2447,8 @@ mod tests {
             ShaderEntry::MatMulAT,
             ShaderEntry::MatMulBT,
             ShaderEntry::FusedMatMulAdd,
+            ShaderEntry::FusedMatMulATAdd,
+            ShaderEntry::FusedMatMulBTAdd,
         ] {
             let class = TuneClass {
                 weight_format: crate::compile::WeightFormat::F32,
