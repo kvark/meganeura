@@ -3135,6 +3135,9 @@ pub struct Session {
     /// Pre-computed barrier groups: each range of dispatch indices shares one
     /// compute pass. Pass boundaries in blade emit ALL_COMMANDS barriers.
     groups: Vec<std::ops::Range<usize>>,
+    /// Retain partial-buffer identity when tuning collapses attention to one
+    /// dispatch, so repeated searches do not accumulate scratch allocations.
+    attention_partials: HashMap<BufferRef, BufferRef>,
     encoder: blade_graphics::CommandEncoder,
     /// Caller-selected upper bound on the submissions used by `step()`.
     /// See [`Session::set_submission_chunks`]. Always at least 1.
@@ -4009,6 +4012,7 @@ impl Session {
             coop_config,
             plan,
             groups,
+            attention_partials: HashMap::new(),
             encoder,
             submission_chunks: 1,
             sync_point: None,

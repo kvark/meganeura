@@ -2,8 +2,8 @@
 //!
 //! The search space is deliberately small: scalar and native-f32 cooperative
 //! tiles for unpacked dense matmuls, shape-specialized scalar convolutions,
-//! and workgroup width and cross-lane reduction for the K-split GEMV family,
-//! with no precision or binding-layout changes.
+//! workgroup width and cross-lane reduction for the K-split GEMV family, and
+//! cached-attention split/combine sequences. Precision remains unchanged.
 //! Measurements use synthetic, private scratch, not a live training step.
 //! Explicit split-K probes measure complete sequences without installing them.
 //! Scalar tile and GEMV shape changes leave packed-weight decoding intact, so
@@ -693,6 +693,8 @@ pub enum TuneScope {
     ConvDerivatives,
     /// Scalar forward, input gradient and weight gradient convolutions.
     Convolution,
+    /// Cached block attention, including the complete split/combine sequence.
+    Attention,
     All,
 }
 
@@ -702,6 +704,7 @@ impl TuneScope {
             Self::All => true,
             Self::Dense => class.conv2d.is_none(),
             Self::Convolution => class.conv2d.is_some(),
+            Self::Attention => false,
             Self::ConvDerivatives => {
                 class.conv2d.is_some() && class.shader != ShaderEntry::Conv2dGemm
             }
@@ -739,7 +742,8 @@ pub struct TuneOptions {
     #[serde(default)]
     pub scope: TuneScope,
     pub max_classes: usize,
-    /// GPU scratch including the upload/readback buffer, not pipelines.
+    /// GPU comparison scratch including staging, not pipelines. Attention can
+    /// also retain/grow its partial storage when installing a qualified choice.
     pub max_scratch_bytes: usize,
     /// Defaults to Download. Does not alter scratch binding placement,
     /// validation or kernel candidates.
@@ -758,7 +762,7 @@ pub struct TuneOptions {
     /// Complete, alternating baseline/candidate pairs required for a decision.
     pub sample_pairs: usize,
     /// Separate, barrier-delimited dispatches in each timed submission;
-    /// complete sequences for explicit split-K measurements.
+    /// complete sequences for split-K and cached-attention measurements.
     pub dispatches_per_sample: u32,
     /// Required fractional improvement, in addition to a noise margin.
     pub min_improvement: f64,
@@ -892,14 +896,15 @@ pub struct TuneQualificationTimes {
 
 /// Evidence for one candidate comparison within an exact class. Times are
 /// batched scratch wall times per dispatch (per complete sequence when
-/// `candidate_split_k` is present), not GPU timestamps or whole-step latency.
+/// `candidate_split_k` is present or Class is [`TuneAttention`]), not GPU
+/// timestamps or whole-step latency.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TuneOutcome {
-    pub class: TuneClass,
+pub struct TuneOutcome<Class = TuneClass, Choice = MatmulTile> {
+    pub class: Class,
     pub dispatches: usize,
-    pub initial: MatmulTile,
-    pub candidate: MatmulTile,
-    pub selected: MatmulTile,
+    pub initial: Choice,
+    pub candidate: Choice,
+    pub selected: Choice,
     /// Experimental two-pass dW challenger; baseline is unsplit with the same
     /// tile. Times are per complete sequence. `decision` reports the result;
     /// no live plan is changed and `selected` still describes only the tile.
@@ -928,13 +933,8 @@ pub struct TuneOutcome {
     pub noise_margin_ms: Option<f64>,
 }
 
-impl TuneOutcome {
-    pub(crate) fn new(
-        class: TuneClass,
-        dispatches: usize,
-        initial: MatmulTile,
-        candidate: MatmulTile,
-    ) -> Self {
+impl<Class, Choice: Copy> TuneOutcome<Class, Choice> {
+    pub(crate) fn new(class: Class, dispatches: usize, initial: Choice, candidate: Choice) -> Self {
         Self {
             class,
             dispatches,
@@ -956,6 +956,23 @@ impl TuneOutcome {
             noise_margin_ms: None,
         }
     }
+}
+
+/// Cached-attention contract. Positions are sampled across the cache capacity;
+/// measurements never read the live position or KV buffers.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TuneAttention {
+    pub window_size: u32,
+    pub num_heads: u32,
+    pub num_kv_heads: u32,
+    pub head_dim: u32,
+    pub block_len: u32,
+    pub max_seq: u32,
+    pub positions: Vec<u32>,
+    /// Q, K, V, position, valid length, output, partials.
+    pub device_local: [bool; 7],
+    /// Declared bytes of the first six bindings; partials can be resized.
+    pub binding_bytes: Vec<usize>,
 }
 
 /// Per-comparison buffer requests, not driver heap sizes or peak VRAM.
@@ -982,6 +999,10 @@ pub struct TuneScratchStats {
 pub struct TuneReport {
     pub options: TuneOptions,
     pub outcomes: Vec<TuneOutcome>,
+    /// Split count one denotes the single-dispatch implementation. Times are
+    /// per complete attention sequence, averaged over the recorded positions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attention_outcomes: Vec<TuneOutcome<TuneAttention, u32>>,
     pub eligible_classes: usize,
     /// Live search visits a bounded candidate set per class; explicit split-K
     /// probes accept up to four counts against the same unsplit control.
@@ -1040,7 +1061,10 @@ pub(crate) fn measure_pairs(
     (baseline, candidate)
 }
 
-pub(crate) fn decide(outcome: &mut TuneOutcome, options: &TuneOptions) {
+pub(crate) fn decide<Class, Choice: Copy>(
+    outcome: &mut TuneOutcome<Class, Choice>,
+    options: &TuneOptions,
+) {
     if outcome.baseline_ms.len() != options.sample_pairs
         || outcome.candidate_ms.len() != options.sample_pairs
     {
@@ -1551,13 +1575,20 @@ mod tests {
             TuneScope::Dense,
             TuneScope::ConvDerivatives,
             TuneScope::Convolution,
+            TuneScope::Attention,
             TuneScope::All,
         ] {
             assert_eq!(
                 scope.includes(&dense),
                 matches!(scope, TuneScope::Dense | TuneScope::All)
             );
-            assert_eq!(scope.includes(&conv), scope != TuneScope::Dense);
+            assert_eq!(
+                scope.includes(&conv),
+                matches!(
+                    scope,
+                    TuneScope::ConvDerivatives | TuneScope::Convolution | TuneScope::All
+                )
+            );
             let options = TuneOptions {
                 scope,
                 ..Default::default()

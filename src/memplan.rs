@@ -418,6 +418,30 @@ fn compute_pinned(
             _ => {}
         }
     }
+    // Keep an attention operation's external bindings live across its whole
+    // split/combine sequence. Tuning can then replace it with a single dispatch
+    // without moving an output onto storage still occupied by its query.
+    let partials: HashMap<_, _> = plan
+        .dispatches
+        .iter()
+        .enumerate()
+        .filter(|&(_, d)| d.shader == ShaderEntry::CachedBlockAttentionSplit)
+        .map(|(i, d)| (d.output_buffer, i))
+        .collect();
+    for (i, d) in plan.dispatches.iter().enumerate() {
+        if d.shader != ShaderEntry::CachedBlockAttentionCombine {
+            continue;
+        }
+        let Some(&producer) = d.input_buffers.first().and_then(|b| partials.get(b)) else {
+            continue;
+        };
+        let first = group_of[producer];
+        let last = group_of[i];
+        uses[d.output_buffer.0 as usize].write(first);
+        for b in &plan.dispatches[producer].input_buffers {
+            uses[b.0 as usize].read(last);
+        }
+    }
     // Debug aid: MEGANEURA_PIN_BUFS="3,17,25-40" force-pins logical
     // buffers, excluding them from aliasing. Used to bisect aliasing
     // corruption down to a single buffer.
@@ -567,6 +591,14 @@ mod tests {
             "output stays host-visible"
         );
         assert_eq!(alias.device_local.len(), alias.sizes.len());
+
+        // A split attention result may not reuse its query's allocation:
+        // the tuner must be free to evaluate the same operation unsplit.
+        p.dispatches[1].shader = ShaderEntry::CachedBlockAttentionSplit;
+        p.dispatches[2].shader = ShaderEntry::CachedBlockAttentionCombine;
+        let alias = plan_buffer_aliasing(&p, &groups, None);
+        assert_ne!(alias.map[1], alias.map[3]);
+        check_disjoint(&p, &groups, &alias);
     }
 
     #[test]
