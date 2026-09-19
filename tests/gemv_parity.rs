@@ -328,7 +328,7 @@ fn dense_transposed_glu_matches_reference_after_restage() {
                             })
                             .unwrap();
                         assert_eq!(report.eligible_classes, 1);
-                        assert_eq!(report.outcomes.len(), 7);
+                        assert_eq!(report.outcomes.len(), 23);
                         assert!(
                             report
                                 .outcomes
@@ -460,7 +460,13 @@ fn test_gemv_bt_shape(k: usize, n: usize, seed: u32) {
     let c = g.matmul_bt(a_n, b_n);
     g.set_outputs(vec![c]);
 
-    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    let mut config = meganeura::SessionConfig::inference_from_env();
+    config.options.gemv_shape = Some(meganeura::GemvShape {
+        threads: 32,
+        reduction: meganeura::GemvReduction::Tree,
+        bt_rows: 4,
+    });
+    let mut session = meganeura::build(&g, config).0;
 
     let plan = session.plan();
     let gemv_bt_count = plan
@@ -506,7 +512,7 @@ fn test_gemv_bt_shape(k: usize, n: usize, seed: u32) {
 fn gemv_bt_smollm2_lm_head() {
     // SmolLM2-135M LM head (weight-tied): 1×576 × 49152×576^T → 1×49152.
     test_gemv_bt_shape(576, 49152, 200);
-    test_gemv_bt_shape(4, 131_071, 204);
+    test_gemv_bt_shape(4, 262_145, 204);
 }
 
 #[test]
@@ -556,6 +562,7 @@ fn every_gemv_shape_computes_the_same_product() {
     // and not multiples of every width, so the loop tails are exercised.
     const K: usize = 320;
     const N: usize = 36;
+    const BT_N: usize = N - 1;
     let a = data(K, 1);
     let b = data(K * N, 2);
     let addend = data(N, 3);
@@ -570,77 +577,85 @@ fn every_gemv_shape_computes_the_same_product() {
 
     let want = cpu_gemv(&a, &b, K, N);
     let want_add = cpu_gemv_add(&a, &b, &addend, K, N);
-    let want_bt = cpu_gemv_bt(&a, &b_t, K, N);
+    let want_bt = cpu_gemv_bt(&a, &b_t, K, BT_N);
     let want_bt_add: Vec<_> = want_bt.iter().zip(&addend).map(|(a, b)| a + b).collect();
 
     for threads in GemvShape::WIDTHS {
         for reduction in [GemvReduction::Tree, GemvReduction::Subgroup] {
-            let shape = GemvShape { threads, reduction };
-            let mut g = Graph::new();
-            let x = g.input("x", &[1, K]);
-            let x_add = g.input("x_add", &[1, K]);
-            let x_bt = g.input("x_bt", &[1, K]);
-            let x_bt_add = g.input("x_bt_add", &[1, K]);
-            let w = g.input("w", &[K, N]);
-            let w_add = g.input("w_add", &[K, N]);
-            let w_t = g.input("w_t", &[N, K]);
-            let w_t_add = g.input("w_t_add", &[N, K]);
-            let d = g.input("d", &[1, N]);
-            let plain = g.matmul(x, w);
-            let product = g.matmul(x_add, w_add);
-            let add = g.add(product, d);
-            let bt = g.matmul_bt(x_bt, w_t);
-            let bt_product = g.matmul_bt(x_bt_add, w_t_add);
-            let bt_add = g.add(bt_product, d);
-            g.set_outputs(vec![plain, add, bt, bt_add]);
+            for bt_rows in GemvShape::BT_ROWS {
+                let shape = GemvShape {
+                    threads,
+                    reduction,
+                    bt_rows,
+                };
+                let mut g = Graph::new();
+                let x = g.input("x", &[1, K]);
+                let x_add = g.input("x_add", &[1, K]);
+                let x_bt = g.input("x_bt", &[1, K]);
+                let x_bt_add = g.input("x_bt_add", &[1, K]);
+                let w = g.input("w", &[K, N]);
+                let w_add = g.input("w_add", &[K, N]);
+                let w_t = g.input("w_t", &[BT_N, K]);
+                let w_t_add = g.input("w_t_add", &[BT_N, K]);
+                let d = g.input("d", &[1, N]);
+                let d_bt = g.input("d_bt", &[1, BT_N]);
+                let plain = g.matmul(x, w);
+                let product = g.matmul(x_add, w_add);
+                let add = g.add(product, d);
+                let bt = g.matmul_bt(x_bt, w_t);
+                let bt_product = g.matmul_bt(x_bt_add, w_t_add);
+                let bt_add = g.add(bt_product, d_bt);
+                g.set_outputs(vec![plain, add, bt, bt_add]);
 
-            let config = SessionConfig {
-                mode: Mode::Inference,
-                options: CompileOptions {
-                    gemv_shape: Some(shape),
-                    ..CompileOptions::from_env()
-                },
-                ..SessionConfig::from_env()
-            };
-            let mut s = meganeura::build(&g, config).0;
-            let shaders: Vec<_> = s.plan().dispatches.iter().map(|d| &d.shader).collect();
-            for expected in [
-                ShaderEntry::MatMulGemv,
-                ShaderEntry::MatMulGemvAdd,
-                ShaderEntry::MatMulGemvBT,
-                ShaderEntry::MatMulGemvBTAdd,
-            ] {
-                assert_eq!(
-                    shaders
-                        .iter()
-                        .filter(|&&shader| *shader == expected)
-                        .count(),
-                    1,
-                    "{shape:?}: missing {expected:?}; got {shaders:?}"
-                );
-            }
-            for name in ["x", "x_add", "x_bt", "x_bt_add"] {
-                s.set_input(name, &a);
-            }
-            s.set_input("w", &b);
-            s.set_input("w_add", &b);
-            s.set_input("w_t", &b_t);
-            s.set_input("w_t_add", &b_t);
-            s.set_input("d", &addend);
-            s.step();
-            s.wait();
-            for (index, (label, expected)) in [
-                ("plain", &want),
-                ("add", &want_add),
-                ("bt", &want_bt),
-                ("bt_add", &want_bt_add),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let mut got = vec![0.0; N];
-                s.read_output_by_index(index, &mut got);
-                assert_close_named(&format!("{shape:?} {label}"), &got, expected, 2e-4, 2e-4);
+                let config = SessionConfig {
+                    mode: Mode::Inference,
+                    options: CompileOptions {
+                        gemv_shape: Some(shape),
+                        ..CompileOptions::from_env()
+                    },
+                    ..SessionConfig::from_env()
+                };
+                let mut s = meganeura::build(&g, config).0;
+                let shaders: Vec<_> = s.plan().dispatches.iter().map(|d| &d.shader).collect();
+                for expected in [
+                    ShaderEntry::MatMulGemv,
+                    ShaderEntry::MatMulGemvAdd,
+                    ShaderEntry::MatMulGemvBT,
+                    ShaderEntry::MatMulGemvBTAdd,
+                ] {
+                    assert_eq!(
+                        shaders
+                            .iter()
+                            .filter(|&&shader| *shader == expected)
+                            .count(),
+                        1,
+                        "{shape:?}: missing {expected:?}; got {shaders:?}"
+                    );
+                }
+                for name in ["x", "x_add", "x_bt", "x_bt_add"] {
+                    s.set_input(name, &a);
+                }
+                s.set_input("w", &b);
+                s.set_input("w_add", &b);
+                s.set_input("w_t", &b_t[..BT_N * K]);
+                s.set_input("w_t_add", &b_t[..BT_N * K]);
+                s.set_input("d", &addend);
+                s.set_input("d_bt", &addend[..BT_N]);
+                s.step();
+                s.wait();
+                for (index, (label, expected)) in [
+                    ("plain", &want),
+                    ("add", &want_add),
+                    ("bt", &want_bt),
+                    ("bt_add", &want_bt_add),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let mut got = vec![0.0; expected.len()];
+                    s.read_output_by_index(index, &mut got);
+                    assert_close_named(&format!("{shape:?} {label}"), &got, expected, 2e-4, 2e-4);
+                }
             }
         }
     }
