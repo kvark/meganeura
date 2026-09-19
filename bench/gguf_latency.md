@@ -5,13 +5,21 @@ token IDs through Meganeura and llama.cpp. This is a kernel/runtime diagnostic,
 not a replacement for the frozen Inferena paper cohort or a language-quality
 evaluation.
 
-Both use a 128-token prefill, 32 subsequent cached decode steps, context capacity
+Both use one sequence: a 128-token prefill, 32 subsequent cached decode steps, context capacity
 256, f32 K/V caches, three warmups and seven measured sequences. Prefill produces
 only the last row of logits. Every measured call includes submission, waiting,
 and copying the full vocabulary's logits to CPU memory. The first measured
 sequence saves 33 logit vectors for comparison. llama.cpp uses Vulkan with all
 layers offloaded and flash attention enabled; it refuses a missing Vulkan device.
 The helpers intentionally do not tokenize text.
+
+Decode's token batch is one. Prefill's 128 tokens belong to that same sequence,
+not 128 concurrent requests. SmolLM2-135M at batch one exposes host recording
+and readback overhead; it is an interactive-latency diagnostic, not batched
+throughput evidence. Larger token blocks amortize recording, but increasing
+prefill length alone does not establish batched-decode performance. Report
+GPU work and whole-call latency separately before generalizing to larger models
+or request batches. Command-buffer reuse is not a production optimization goal.
 
 Build against a recorded llama.cpp checkout:
 
@@ -159,6 +167,110 @@ A tilewise softmax-rescaling trial is retained at
 (`bd25688a585ee6e093ea0beb8ae98edfe56fca88`), not included in the production
 branch. It passed the numerical checks but gave only a small NVIDIA prefill
 gain (11.64 to 11.17 ms) and no Intel gain in three reversed-order pairs.
+
+### Fixed-head attention follow-up
+
+`dd9f56f9f9d334f791ce64ae7b0163d6ed631058` compiles cached attention at the graph's
+known head dimension, using the existing per-head pipeline mechanism. It removes
+unused per-thread values and dynamic head-width branches without changing the
+algorithm or precision.
+Three fresh-process pairs, reversing order, compared it with `5aeb856`:
+
+| GPU | Phase | Before | Fixed head width |
+| --- | --- | ---: | ---: |
+| RTX 5070 | Prefill | 11.58 | 8.82 |
+| RTX 5070 | Decode | 4.29 | 3.20 |
+| Arc B570 | Prefill | 27.63 | 22.79 |
+| Arc B570 | Decode | 6.09 | 5.66 |
+
+Units and sampling are unchanged. All 33 token predictions match the independent
+CPU reference on both devices; maximum per-row relative L2 error remains below
+0.000010 on NVIDIA and 0.000178 on Intel. The existing cache regression now also
+covers head widths 64, 80 and 512, including partially occupied thread lanes.
+NVIDIA attention pass intervals fell from 0.98 to 0.49 ms for decode and from
+3.80 to 1.66 ms for prefill in separate captures. This is still not parity with
+llama.cpp; matrix kernels and host submission remain substantial costs.
+
+### Serialized command replay: attribution mini-study, not production
+
+The experiment at Meganeura `6672ef385d79e73accae5cc7c7d2eefca8ff50fd`
+pins Blade `4befad4f5fbd427c1aca4b1b001fb8b7acd8e109` and reuses an unchanged
+Vulkan inference recording after waiting for its previous execution.
+Input contents remain dynamic. Rebinding, tuning, profiling, changing submission
+chunks, and other uses of the encoder invalidate the recording. Training,
+timestamped sessions, Metal and GLES keep ordinary recording. The normal
+`Session::step` path in that experiment selects this automatically; no numerical
+change is involved. Production keeps ordinary command recording. The replay
+API and its invalidation machinery were rejected as a poor fit for Blade and
+for the project's intended workloads, despite helping this small decode case.
+
+Three fresh-process trials per engine, with rotated order and the same diagnostic:
+
+| GPU | Phase | Fixed head, recording | Fixed head, replay | llama.cpp |
+| --- | --- | ---: | ---: | ---: |
+| RTX 5070 | Prefill | 8.65 | 7.23 | 7.11 |
+| RTX 5070 | Decode | 3.13 | 1.82 | 1.38 |
+| Arc B570 | Prefill | 22.89 | 21.31 | 15.61 |
+| Arc B570 | Decode | 5.64 | 4.48 | 3.42 |
+
+The NVIDIA recording control varied from 2.28 to 3.15 ms per decode; replay
+ranged from 1.81 to 1.85 ms. Intel replay ranged from 4.45 to 4.54 ms. CPU clocks
+remain uncontrolled. The CPU record/submit stage fell from 1.26 to 0.040 ms on
+NVIDIA and from 1.42 to 0.044 ms on Intel. Replay does not remove GPU barriers
+or change kernel arithmetic. All 33 next-token choices still match the CPU
+reference; maximum relative L2 errors are 0.0000102 and 0.000177 respectively.
+Median preparation remains 3.46 s and 9.79 s, including tuning.
+
+The replay arm gets NVIDIA prefill within 2% of llama.cpp on this case, but
+those are not production results. The ordinary-recording column remains the
+relevant baseline: 8.65/3.13 ms prefill/decode on NVIDIA and 22.89/5.64 ms on
+Intel. Replay improves CPU recording, not GPU kernels, and does not establish
+an improvement in the paper's GPU-resident training workloads. Keep the frozen
+paper cohort unchanged until kernel work and measurements on its own graphs
+justify recollection.
+
+The complete source is preserved on Meganeura
+`experiment/serialized-replay-2026-09-19` (the revision above) and Blade
+`perf/compute-command-replay` (the pinned revision above). The timing-only
+precursor remains on both repositories' `experiment/llama-replay-2026-09-19`.
+CPU-stage instrumentation is on Meganeura
+`experiment/llama-cpu-record-2026-09-19` (`29e3cd4`). No binary artifacts are needed.
+
+### Further kernel probes
+
+`b6d6971cce673c559fbcbcc162b5fd5a8313379d` adds fused transposed matmuls to
+the existing qualified tile search. It changes neither precision policy nor
+the search budget. Existing CPU reference/layout checks and the opt-in GPU
+tuning regression cover both transpose directions and nonzero addends.
+
+Three source-only probes are separate from production:
+
+- `experiment/rmsnorm-subgroup-2026-09-19` (`04421dd`): using subgroup sums
+  for the fused norm as well as the matrix reduction gave less than 1% decode
+  improvement, smaller than process variation. Not retained.
+- `experiment/attention-split-counts-2026-09-19` (`a3fbd89`): a pilot over
+  1/2/4/8/16 splits found different preferred geometry for prefill and decode.
+  It does not justify a replacement fixed threshold. The intended production
+  route is a bounded, numerically qualified search over complete split/combine
+  sequences, including scratch and combine cost, keyed by shape and device.
+  This search is not implemented yet; the existing matrix tuner does not select
+  attention split counts. Cache position and sliding-window lengths also vary
+  at runtime, so a winner must not be chosen from one unrepresentative length.
+- `experiment/gguf-row-weights-2026-09-19` (`621de44`): retaining dense GGUF
+  rows and using transposed GEMV reduced decode from 1.814 to 1.609 ms on
+  NVIDIA and 4.549 to 4.284 ms on Intel in three reversed-order pairs.
+  Prefill stayed near 7.27 and 21.2 ms after extending tile search; without
+  that fix, Intel prefill took 27.3 ms in a pilot. All saved logits passed
+  the same reference checks. The layout still loses existing norm/packing
+  fusions and adds temporary GEMV-plus-add dispatches, so it remains an
+  experiment, not part of the production latency table above.
+
+All three probes above used serialized replay. Their improvements must be
+rechecked with ordinary recording before making production latency claims.
+
+Each experiment branch contains its source and a short result summary, without
+raw timings or binaries. The next layout work is to preserve the applicable
+fusions, not to add model-specific kernels or change the paper cohort.
 
 ### Verification
 

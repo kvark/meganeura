@@ -150,30 +150,59 @@ fn tune_preserves_correctness() {
 #[ignore = "GPU tuning requires an idle device"]
 fn reduced_storage_tiles_preserve_outputs() {
     use meganeura::compile::{ShaderEntry, WeightFormat};
-    for (format, transposed) in [
-        (WeightFormat::F16, false),
-        (WeightFormat::F16, true),
-        (WeightFormat::Q4, false),
+    for (format, shader) in [
+        (WeightFormat::F16, ShaderEntry::MatMul),
+        (WeightFormat::F16, ShaderEntry::MatMulBT),
+        (WeightFormat::F16, ShaderEntry::FusedMatMulBTAdd),
+        (WeightFormat::F32, ShaderEntry::FusedMatMulATAdd),
+        (WeightFormat::Q4, ShaderEntry::MatMul),
     ] {
         let (m, n, k) = (33, 64, 256);
         let mut graph = Graph::new();
-        let x = graph.input("x", &[m, k]);
+        let transposed = matches!(
+            shader,
+            ShaderEntry::MatMulBT | ShaderEntry::FusedMatMulBTAdd
+        );
+        let transposed_a = shader == ShaderEntry::FusedMatMulATAdd;
+        let fused = matches!(
+            shader,
+            ShaderEntry::FusedMatMulATAdd | ShaderEntry::FusedMatMulBTAdd
+        );
+        let x = graph.input("x", &if transposed_a { [k, m] } else { [m, k] });
         let shape = if transposed { [n, k] } else { [k, n] };
         let w = if format == WeightFormat::F16 {
             graph.parameter_f16("w", &shape)
+        } else if format == WeightFormat::F32 {
+            graph.parameter("w", &shape)
         } else {
             graph.parameter_q4("w", &shape)
         };
         let y = if transposed {
             graph.matmul_bt(x, w)
+        } else if transposed_a {
+            graph.matmul_at(x, w)
         } else {
             graph.matmul(x, w)
+        };
+        let y = if fused {
+            let addend = graph.input("addend", &[m, n]);
+            graph.add(y, addend)
+        } else {
+            y
         };
         graph.set_outputs(vec![y]);
         let mut config = SessionConfig::inference_from_env();
         config.runtime.coop = CoopPolicy::Disabled;
         config.tune = false;
         let mut session = build(&graph, config).0;
+        if fused {
+            session.set_input(
+                "addend",
+                &(0..m * n)
+                    .map(|i| (i % 11) as f32 * 0.025 - 0.1)
+                    .collect::<Vec<_>>(),
+            );
+        }
         session.set_input(
             "x",
             &(0..m * k)
@@ -200,14 +229,7 @@ fn reduced_storage_tiles_preserve_outputs() {
         let outcome = &report.outcomes[0];
         assert!(outcome.qualified, "{outcome:?}");
         assert_eq!(outcome.class.weight_format, format);
-        assert_eq!(
-            outcome.class.shader,
-            if transposed {
-                ShaderEntry::MatMulBT
-            } else {
-                ShaderEntry::MatMul
-            }
-        );
+        assert_eq!(outcome.class.shader, shader);
         assert_eq!(
             before,
             session.read_output(m * n),
