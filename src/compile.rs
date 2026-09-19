@@ -2550,6 +2550,13 @@ const MAX_COMPUTE_WORKGROUPS_PER_DIMENSION: u32 = 65_535;
 
 /// Tile a scalar matmul across Y and Z without exceeding the portable
 /// per-dimension compute-dispatch limit.
+pub(crate) fn row_gemv_workgroups(n: u32) -> [u32; 3] {
+    // Large vocabularies can exceed the portable X workgroup limit. Spread
+    // rows over Y as well; the kernel flattens the actual dispatch grid.
+    let y = n.div_ceil(65_535).max(1);
+    [n.div_ceil(y), y, 1]
+}
+
 fn matmul_workgroups(m: u32, n: u32, tile: u32) -> [u32; 3] {
     let columns = n.div_ceil(tile);
     assert!(
@@ -3177,7 +3184,7 @@ impl<'a> Compiler<'a> {
                     // sees packed data.
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::MatMulGemvBT,
-                        workgroups: [n, 1, 1],
+                        workgroups: row_gemv_workgroups(n),
                         input_buffers: vec![a, b],
                         output_buffer: out_buf,
                         extra_outputs: vec![],
@@ -3374,7 +3381,7 @@ impl<'a> Compiler<'a> {
                         ShaderEntry::FusedMatMulBTAdd
                     },
                     workgroups: if gemv {
-                        [n, 1, 1]
+                        row_gemv_workgroups(n)
                     } else {
                         matmul_workgroups(m, n, 64)
                     },
