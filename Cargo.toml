@@ -121,6 +121,11 @@ path = "examples/gguf_generate.rs"
 required-features = ["gguf"]
 
 [[example]]
+name = "gguf_latency"
+path = "bench/gguf_latency.rs"
+required-features = ["gguf"]
+
+[[example]]
 name = "train_deploy"
 path = "examples/train_deploy.rs"
 
