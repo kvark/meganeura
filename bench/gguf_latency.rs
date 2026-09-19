@@ -95,6 +95,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sessions.push(session);
     }
     let prepare_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let chunks: Vec<usize> = std::env::var("GGUF_SUBMISSION_CHUNKS")
+        .unwrap_or_else(|_| "1".to_owned())
+        .split(',')
+        .map(str::parse)
+        .collect::<Result<_, _>>()?;
+    for (trial, &count) in chunks.iter().enumerate() {
+        assert!(count > 0);
+        for session in &mut sessions {
+            session.set_submission_chunks(count);
+        }
+        let prefix = format!("{}-chunks{count}-{trial}", args[2]);
+        measure(
+            &mut sessions,
+            &config,
+            &args[1],
+            &prefix,
+            prepare_ms,
+            count,
+            &tuning,
+        )?;
+    }
+    Ok(())
+}
+
+fn measure(
+    sessions: &mut [Session],
+    config: &gguf::arch::ModelConfig,
+    model: &str,
+    prefix: &str,
+    prepare_ms: f64,
+    chunks: usize,
+    tuning: &[meganeura::tune::TuneReport],
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut prefill_ms = Vec::new();
     let mut decode_ms = Vec::new();
     let mut decode_parts_ms = Vec::new();
@@ -124,9 +157,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let data: Vec<u8> = outputs.iter().flat_map(|x| x.to_le_bytes()).collect();
-    std::fs::write(format!("{}.logits.f32", args[2]), data)?;
+    std::fs::write(format!("{prefix}.logits.f32"), data)?;
     let result = serde_json::json!({
-        "engine": "meganeura", "model": args[1],
+        "engine": "meganeura", "model": model,
         "device": sessions[0].context().device_information().device_name,
         "prompt": PROMPT, "decode": DECODE, "context": CONTEXT, "cache": "f32",
         "vocab": config.vocab_size, "prepare_ms": prepare_ms,
@@ -134,9 +167,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "decode_record_wait_read_ms": decode_parts_ms,
         "dispatches": [sessions[1].plan().dispatches.len(), sessions[0].plan().dispatches.len()],
         "tuning": tuning,
+        "submission_chunks": chunks,
     });
     std::fs::write(
-        format!("{}.json", args[2]),
+        format!("{prefix}.json"),
         serde_json::to_vec_pretty(&result)?,
     )?;
     if std::env::var_os("MEGANEURA_GPU_TIMING").is_some() {
@@ -147,7 +181,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 meganeura::profiler::CaptureOptions::default(),
             )?;
             meganeura::profiler::save_session_profile_json(
-                Path::new(&format!("{}.profile-{i}.json", args[2])),
+                Path::new(&format!("{prefix}.profile-{i}.json")),
                 &profile,
             )?;
         }
