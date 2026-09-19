@@ -1,4 +1,4 @@
-use crate::compile::{BufferRef, Dispatch, ExecutionPlan, ShaderEntry};
+use crate::compile::{BufferRef, CachedBlockAttentionParams, Dispatch, ExecutionPlan, ShaderEntry};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -876,22 +876,6 @@ struct CachedAttentionData {
     params: MatMulParams, // queries, num_heads, num_kv_heads, head_dim
 }
 
-#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
-#[repr(C)]
-struct CachedBlockAttentionParams {
-    window_size: u32,
-    num_heads: u32,
-    num_kv_heads: u32,
-    head_dim: u32,
-    block_len: u32,
-    max_seq: u32,
-    // Split-K: the split count and per-split token chunk. Zero splits on
-    // the fused single-kernel form; the spare slots avoid a new params
-    // struct and layout.
-    splits: u32,
-    chunk: u32,
-}
-
 #[derive(blade_macros::ShaderData)]
 struct CachedBlockAttentionData {
     src_a: blade_graphics::BufferPiece,
@@ -1363,7 +1347,6 @@ impl Pipelines {
                     .or_default()
                     .insert(fb_shader.clone());
             }
-            // Attention dispatches store head_dim at params[3].
             if matches!(
                 group,
                 ShaderGroup::MultiHeadAttn
@@ -1376,9 +1359,9 @@ impl Pipelines {
                     | ShaderGroup::CachedBlockAttention
                     | ShaderGroup::CachedBlockAttentionSplit
                     | ShaderGroup::CachedBlockAttentionCombine
-            ) && dispatch.params.len() >= 4
+            ) && let Some(dim) = Self::attention_head_dim(dispatch)
             {
-                attention_entries.insert((dispatch.shader.clone(), dispatch.params[3]));
+                attention_entries.insert((dispatch.shader.clone(), dim));
             }
             if dispatch.use_small_tiles
                 && !dispatch.weight_format.uses_reduced_storage()
@@ -1980,13 +1963,19 @@ impl Pipelines {
         pipelines
     }
 
-    /// Pipelines this dispatch can run, most specific first; `get` takes the
-    /// first one that was compiled.
-    ///
-    /// Every list ends with `Scalar`, which is always compiled - except for
-    /// epilogue fusion, where the plan has already deleted the standalone
-    /// ops, so running the unfused matmul would silently drop them. That
-    /// list stays a single entry and a miss is a panic.
+    fn attention_head_dim(dispatch: &Dispatch) -> Option<u32> {
+        match dispatch.shader {
+            ShaderEntry::CachedBlockAttention
+            | ShaderEntry::CachedBlockAttentionSplit
+            | ShaderEntry::CachedBlockAttentionCombine => {
+                CachedBlockAttentionParams::from_words(&dispatch.params).map(|p| p.head_dim)
+            }
+            _ => dispatch.params.get(3).copied(),
+        }
+    }
+
+    /// Compiled choices, most specific first. Fused and precision-changing
+    /// variants have no unfused fallback: that would change the computation.
     fn candidates(dispatch: &Dispatch) -> Vec<Variant> {
         let entry = &dispatch.shader;
         if let Some(k_tile) = dispatch.conv_k_tile {
@@ -2033,8 +2022,8 @@ impl Pipelines {
         if let Some(ref dag) = dispatch.pointwise {
             out.push(Variant::Pointwise(dag.hash_key()));
         }
-        if dispatch.params.len() >= 4 {
-            out.push(Variant::Attention(entry.clone(), dispatch.params[3]));
+        if let Some(dim) = Self::attention_head_dim(dispatch) {
+            out.push(Variant::Attention(entry.clone(), dim));
         }
         // A measured shape outranks the group's initial one, and the RmsNorm
         // fusion outranks both: folding the norm in removes a whole dispatch,
@@ -3135,6 +3124,9 @@ pub struct Session {
     /// Pre-computed barrier groups: each range of dispatch indices shares one
     /// compute pass. Pass boundaries in blade emit ALL_COMMANDS barriers.
     groups: Vec<std::ops::Range<usize>>,
+    /// Retain partial-buffer identity when tuning collapses attention to one
+    /// dispatch, so repeated searches do not accumulate scratch allocations.
+    attention_partials: HashMap<BufferRef, BufferRef>,
     encoder: blade_graphics::CommandEncoder,
     /// Caller-selected upper bound on the submissions used by `step()`.
     /// See [`Session::set_submission_chunks`]. Always at least 1.
@@ -4009,6 +4001,7 @@ impl Session {
             coop_config,
             plan,
             groups,
+            attention_partials: HashMap::new(),
             encoder,
             submission_chunks: 1,
             sync_point: None,
@@ -8536,16 +8529,8 @@ impl Session {
                         kv_pos_buf: buf(dispatch.input_buffers[3]),
                         valid_len_buf: buf(dispatch.input_buffers[4]),
                         dst: buf(dispatch.output_buffer),
-                        params: CachedBlockAttentionParams {
-                            window_size: dispatch.params[0],
-                            num_heads: dispatch.params[1],
-                            num_kv_heads: dispatch.params[2],
-                            head_dim: dispatch.params[3],
-                            block_len: dispatch.params[4],
-                            max_seq: dispatch.params[5],
-                            splits: dispatch.params[6],
-                            chunk: dispatch.params[7],
-                        },
+                        params: CachedBlockAttentionParams::from_words(&dispatch.params)
+                            .expect("cached attention parameter layout"),
                     },
                 );
             }
@@ -8555,16 +8540,8 @@ impl Session {
                     &CachedBlockAttentionCombineData {
                         partials: buf(dispatch.input_buffers[0]),
                         dst: buf(dispatch.output_buffer),
-                        params: CachedBlockAttentionParams {
-                            window_size: dispatch.params[0],
-                            num_heads: dispatch.params[1],
-                            num_kv_heads: dispatch.params[2],
-                            head_dim: dispatch.params[3],
-                            block_len: dispatch.params[4],
-                            max_seq: dispatch.params[5],
-                            splits: dispatch.params[6],
-                            chunk: dispatch.params[7],
-                        },
+                        params: CachedBlockAttentionParams::from_words(&dispatch.params)
+                            .expect("cached attention parameter layout"),
                     },
                 );
             }
