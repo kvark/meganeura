@@ -1,5 +1,7 @@
 # Qualified GEMV row grouping
 
+Follow-up: [ordinary recording costs and pipeline selection](command-recording.md).
+
 Source: `a5a47c6e9abbdd2e8272d2ae3f15f5f9de1360c5`. The row-only
 intermediate is `192eed7755c94f421fafbcebf60b56d2a379aed5`; control is
 `69bbb48450fee8f9957b682ffec95733ca50c1f4`, the [native-row fusion work](gguf-row-weights.md).
