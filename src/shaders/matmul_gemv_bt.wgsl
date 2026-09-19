@@ -37,8 +37,8 @@ const LANES: u32 = 32u;
 var<workgroup> reduce_buf: array<f32, LANES>;
 
 @compute @workgroup_size(LANES)
-fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let col = wgid.x;
+fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(num_workgroups) grid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let col = wgid.x + grid.x * wgid.y;
     let lane = lid.x;
     if col >= params.n { return; }
     let k_v4 = params.k / 4u;

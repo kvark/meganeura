@@ -474,6 +474,11 @@ fn test_gemv_bt_shape(k: usize, n: usize, seed: u32) {
             "expected one MatMulGemvBT dispatch for k%4==0, got {}",
             gemv_bt_count,
         );
+        assert!(
+            plan.dispatches
+                .iter()
+                .all(|d| d.workgroups.iter().all(|&n| n <= 65_535))
+        );
     } else {
         assert_eq!(
             gemv_bt_count, 0,
@@ -501,6 +506,7 @@ fn test_gemv_bt_shape(k: usize, n: usize, seed: u32) {
 fn gemv_bt_smollm2_lm_head() {
     // SmolLM2-135M LM head (weight-tied): 1×576 × 49152×576^T → 1×49152.
     test_gemv_bt_shape(576, 49152, 200);
+    test_gemv_bt_shape(4, 131_071, 204);
 }
 
 #[test]
