@@ -86,6 +86,9 @@ Worked examples live in [`examples/`](https://github.com/kvark/meganeura/tree/ma
 - [`smollm2.rs`](https://github.com/kvark/meganeura/blob/main/examples/smollm2.rs) — LLM inference with HuggingFace weights.
 - [`gemma4.rs`](https://github.com/kvark/meganeura/blob/main/examples/gemma4.rs) — Gemma 4 GGUF decode vs llama.cpp.
 
+The [matched GGUF diagnostic](bench/gguf_latency.md) compares Vulkan latency
+and logits against a pinned llama.cpp checkout, including host readback.
+
 Current checkpoints store logical tensors without device padding and preflight
 the restore before mutation. Adam/LaProp moments are allocated only when
 requested; SGD and forward/backward-only sessions avoid that unused storage.
@@ -165,7 +168,7 @@ All of the environment variables are resolved in `SessionConfig::from_env()` and
 | `MEGANEURA_GREEDY_PACK_SWIGLU=0` | Skip packing consecutive SwiGLU ops into one parameter buffer during the greedy sweep. |
 | `MEGANEURA_DEVICE_PARAMETERS` | Experimental placement of unaliased parameter buffers on the device: `1` → device-transient, `device-buddy` → device. Default is host-visible. |
 | `MEGANEURA_REUSE_UPLOAD` | Reuse one staging buffer across `set_parameter` uploads instead of restaging per parameter. |
-| `MEGANEURA_TUNE` | Opt-in bounded f32 matmul/convolution search at build (`SessionConfig { tune: true }`), using private scratch. |
+| `MEGANEURA_TUNE` | Opt-in bounded matmul, convolution and GEMV search at build (`SessionConfig { tune: true }`), using private scratch. Scalar tiles and GEMV shapes also support reduced-storage weights. |
 | `MEGANEURA_FLASH_EPT_CAP=<n>` | Flash forward elements-per-thread cap (power of two ≥ 2). |
 | `MEGANEURA_FLASH_GRAD_Q_EPT_CAP=<n>` | EPT cap for flash dQ backward. |
 | `MEGANEURA_FLASH_GRAD_KV_EPT_CAP=<n>` | EPT cap for fused flash dK/dV backward. |
