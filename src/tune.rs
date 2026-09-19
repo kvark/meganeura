@@ -1030,6 +1030,70 @@ pub struct TuneReport {
     pub scratch: Option<TuneScratchStats>,
 }
 
+/// Bounds for whole-graph scheduling probes after inputs are initialized.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TuneSubmissionOptions {
+    /// Search powers of two and this upper bound, at most 64 chunks.
+    pub max_chunks: usize,
+    pub max_time: Duration,
+    /// Private writable images, their bitwise references and the check flag;
+    /// excludes command/descriptor pools and pipelines owned by the driver.
+    pub max_scratch_bytes: usize,
+    pub warmup_runs: u32,
+    pub sample_pairs: usize,
+    pub min_improvement: f64,
+}
+
+impl Default for TuneSubmissionOptions {
+    fn default() -> Self {
+        let policy = TuneOptions::default();
+        Self {
+            max_chunks: 64,
+            max_time: policy.max_time,
+            max_scratch_bytes: policy.max_scratch_bytes,
+            warmup_runs: policy.warmup_runs,
+            sample_pairs: policy.sample_pairs,
+            min_improvement: policy.min_improvement,
+        }
+    }
+}
+
+impl TuneSubmissionOptions {
+    pub(crate) fn policy(&self) -> Result<TuneOptions, TuneError> {
+        if !(1..=64).contains(&self.max_chunks) {
+            return Err(TuneError("submission search supports 1 to 64 chunks"));
+        }
+        let policy = TuneOptions {
+            max_time: self.max_time,
+            max_scratch_bytes: self.max_scratch_bytes,
+            warmup_runs: self.warmup_runs,
+            sample_pairs: self.sample_pairs,
+            min_improvement: self.min_improvement,
+            dispatches_per_sample: 1,
+            ..Default::default()
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+}
+
+/// Scheduling evidence on initialized, representative graph inputs.
+/// Unlike kernel tuning, times cover one compiled graph's recording,
+/// submissions and completion. Input reset and bitwise checks are outside
+/// those samples, but inside `elapsed`. Runtime-appended optimizers are not run.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TuneSubmissionReport {
+    pub selected: usize,
+    pub max_chunks: usize,
+    pub options: TuneSubmissionOptions,
+    /// `qualified` means every writable allocation matched the original
+    /// schedule bit for bit on private copies, not just the final output.
+    pub outcomes: Vec<TuneOutcome<(), usize>>,
+    pub scratch_bytes: usize,
+    pub elapsed: Duration,
+    pub skipped: Option<TuneDecision>,
+}
+
 pub(crate) fn median(values: &[f64]) -> f64 {
     let mut sorted = values.to_vec();
     sorted.sort_by(f64::total_cmp);
