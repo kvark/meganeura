@@ -253,8 +253,9 @@ Three source-only probes are separate from production:
   It does not justify a replacement fixed threshold. The intended production
   route is a bounded, numerically qualified search over complete split/combine
   sequences, including scratch and combine cost, keyed by shape and device.
-  This search is not implemented yet; the existing matrix tuner does not select
-  attention split counts. Cache position and sliding-window lengths also vary
+  At that checkpoint the matrix tuner did not select attention split counts.
+  The [subsequent sequence search](cached-attention-tuning.md) measures these
+  choices with ordinary recording. Cache position and sliding-window lengths also vary
   at runtime, so a winner must not be chosen from one unrepresentative length.
 - `experiment/gguf-row-weights-2026-09-19` (`621de44`): retaining dense GGUF
   rows and using transposed GEMV reduced decode from 1.814 to 1.609 ms on
