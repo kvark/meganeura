@@ -338,3 +338,68 @@ fn cached_block_writes_only_valid_rows_and_selects_last() {
         }
     }
 }
+
+#[test]
+fn fused_rms_norm_add_matches_cpu_for_prefill_and_decode() {
+    const EPS: f32 = 1.0e-6;
+
+    for (rows, cols) in [(1, 1536), (64, 1536), (17, 3)] {
+        let input = (0..rows * cols)
+            .map(|index| ((index * 17 % 101) as f32 - 50.0) / 23.0)
+            .collect::<Vec<_>>();
+        let weight = (0..cols)
+            .map(|index| 0.75 + (index * 7 % 19) as f32 / 32.0)
+            .collect::<Vec<_>>();
+        let residual = (0..rows * cols)
+            .map(|index| ((index * 29 % 83) as f32 - 41.0) / 31.0)
+            .collect::<Vec<_>>();
+        let mut expected = vec![0.0; input.len()];
+        for row in 0..rows {
+            let offset = row * cols;
+            let mean_square = input[offset..offset + cols]
+                .iter()
+                .map(|value| value * value)
+                .sum::<f32>()
+                / cols as f32;
+            let inverse_rms = (mean_square + EPS).sqrt().recip();
+            for (column, &scale) in weight.iter().enumerate() {
+                let index = offset + column;
+                expected[index] = input[index] * inverse_rms * scale + residual[index];
+            }
+        }
+
+        let mut graph = Graph::new();
+        let input_node = graph.input("input", &[rows, cols]);
+        let weight_node = graph.parameter("weight", &[cols]);
+        let residual_node = graph.input("residual", &[rows, cols]);
+        let normalized = graph.rms_norm(input_node, weight_node, EPS);
+        let output = graph.add(normalized, residual_node);
+        graph.set_outputs(vec![output]);
+
+        let mut session =
+            meganeura::build(&graph, meganeura::SessionConfig::inference_from_env()).0;
+        assert_eq!(
+            session
+                .plan()
+                .dispatches
+                .iter()
+                .filter(|dispatch| {
+                    dispatch.shader == meganeura::compile::ShaderEntry::RmsNormAdd
+                })
+                .count(),
+            1,
+            "rows={rows}: expected the fused RMSNorm+add dispatch"
+        );
+        session.set_input("input", &input);
+        session.set_parameter("weight", &weight);
+        session.set_input("residual", &residual);
+        session.step();
+        session.wait();
+        assert_eq!(
+            session.read_node(residual_node).unwrap(),
+            residual,
+            "rows={rows}: residual input was not uploaded"
+        );
+        assert_close(&session.read_output(input.len()), &expected, 2.0e-5);
+    }
+}
