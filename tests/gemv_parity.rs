@@ -152,7 +152,13 @@ fn q40_rmsnorm_folds_into_gemv() {
     let w = g.parameter_q40("w", &[K, N]);
     let y = g.matmul(h, w);
     g.set_outputs(vec![y]);
-    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    let mut config = meganeura::SessionConfig::inference_from_env();
+    config.options.gemv_shape = Some(meganeura::GemvShape {
+        threads: 64,
+        reduction: meganeura::GemvReduction::Subgroup,
+        bt_rows: 1,
+    });
+    let mut session = meganeura::build(&g, config).0;
     let fused = session
         .plan()
         .dispatches

@@ -20,8 +20,8 @@ pub enum GemvReduction {
     /// and their barriers, so the wider the wave the more it removes — six
     /// levels on AMD's 64-wide wave against five on a 32-wide one.
     ///
-    /// Subgroup leaders claim workgroup slots dynamically, so this does not
-    /// assume a subgroup width or a mapping from local lanes to subgroups.
+    /// Subgroup IDs/counts index the partials without assuming a width or a
+    /// mapping from local lanes. A one-subgroup workgroup needs no barrier.
     Subgroup,
 }
 
@@ -2194,41 +2194,23 @@ fn gemv_shape_source(source: &str, shape: GemvShape) -> String {
             }
             body
         }
-        // One partial per wave reaches workgroup memory, and lane 0 sums the
-        // few that do.
-        //
-        // Neither the slot nor the leader may be derived from the local
-        // invocation id. WGSL and Vulkan both decline to relate
-        // `local_invocation_id` to subgroup membership, so `lane / sg_size`
-        // is not a subgroup index and `sg_id == 0` need not name exactly one
-        // invocation per subgroup — a wave holding the odd local ids, or a
-        // partially populated one, breaks both. Instead each wave's leader,
-        // elected by `subgroupBroadcastFirst`, claims a slot with an atomic,
-        // and the count comes back from the same counter. That costs one
-        // extra barrier to zero the counter, so two rather than the tree's
-        // one per halving level.
-        GemvReduction::Subgroup => {
-            let _ = threads;
-            "    if lane == 0u { atomicStore(&wave_slots, 0u); }\n\
-             \x20   workgroupBarrier();\n\
-             \x20   let wave_total = subgroupAdd(acc);\n\
-             \x20   if sg_id == subgroupBroadcastFirst(sg_id) {\n\
-             \x20       reduce_buf[atomicAdd(&wave_slots, 1u)] = wave_total;\n\
-             \x20   }\n\
-             \x20   workgroupBarrier();\n\
-             \x20   if lane == 0u {\n\
-             \x20       let waves = atomicLoad(&wave_slots);\n\
-             \x20       var total = reduce_buf[0];\n\
-             \x20       var g = 1u;\n\
-             \x20       loop {\n\
-             \x20           if g >= waves { break; }\n\
-             \x20           total = total + reduce_buf[g];\n\
-             \x20           g = g + 1u;\n\
+        // Use actual subgroup IDs, never lane/width. Elect a participating
+        // leader even for a partially populated subgroup. The subgroup count
+        // is workgroup-uniform, so the conditional barrier is convergent.
+        GemvReduction::Subgroup => "    var group_total = subgroupAdd(acc);\n\
+             \x20   if wave_count > 1u {\n\
+             \x20       if sg_id == subgroupBroadcastFirst(sg_id) {\n\
+             \x20           reduce_buf[wave_id] = group_total;\n\
              \x20       }\n\
-             \x20       reduce_buf[0] = total;\n\
+             \x20       workgroupBarrier();\n\
+             \x20       if lane == 0u {\n\
+             \x20           group_total = reduce_buf[0];\n\
+             \x20           for (var g = 1u; g < wave_count; g += 1u) {\n\
+             \x20               group_total += reduce_buf[g];\n\
+             \x20           }\n\
+             \x20       }\n\
              \x20   }\n"
-                .to_owned()
-        }
+            .to_owned(),
     };
     source.replace_range(start..end, &reduction);
 
@@ -2237,28 +2219,19 @@ fn gemv_shape_source(source: &str, shape: GemvShape) -> String {
         // not fold in a second slot. The store expression is otherwise left
         // alone, which is what keeps the fused-add and transposed-B forms
         // working without their own reduction code.
-        let folded = source.replace("reduce_buf[0] + reduce_buf[1]", "reduce_buf[0]");
+        let folded = source.replace("reduce_buf[0] + reduce_buf[1]", "group_total");
         assert_ne!(folded, source, "GEMV store did not fold two reduce slots");
         source = folded;
         let signature = "@builtin(local_invocation_id) lid: vec3<u32>)";
         let with_builtins = source.replace(
             signature,
             "@builtin(local_invocation_id) lid: vec3<u32>, \
-             @builtin(subgroup_invocation_id) sg_id: u32)",
+             @builtin(subgroup_invocation_id) sg_id: u32, \
+             @builtin(subgroup_id) wave_id: u32, \
+             @builtin(num_subgroups) wave_count: u32)",
         );
         assert_ne!(with_builtins, source, "GEMV entry point signature changed");
         source = with_builtins;
-
-        // The slot counter lives next to the buffer it indexes, and only the
-        // subgroup form declares it: the tree has no use for it and should
-        // not spend workgroup memory on it.
-        let anchor = "var<workgroup> reduce_buf:";
-        let with_counter = source.replace(
-            anchor,
-            &format!("var<workgroup> wave_slots: atomic<u32>;\n{anchor}"),
-        );
-        assert_ne!(with_counter, source, "GEMV workgroup buffer declaration");
-        source = with_counter;
     }
     source
 }
@@ -7418,12 +7391,11 @@ mod tests {
                 reduction: GemvReduction::Subgroup,
                 bt_rows: 1,
             });
-            // One barrier to zero the slot counter and one after the
-            // leaders have claimed their slots. Constant in the width,
-            // which is the point.
+            // The only barrier gathers partials when there is more than
+            // one subgroup; a single subgroup keeps its sum in registers.
             assert_eq!(
-                subgroup, 2,
-                "the subgroup reduction needs exactly two barriers at {threads} threads"
+                subgroup, 1,
+                "the subgroup reduction needs one conditional barrier at {threads} threads"
             );
             assert_eq!(
                 tree,
