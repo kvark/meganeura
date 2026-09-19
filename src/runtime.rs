@@ -6969,6 +6969,8 @@ impl Session {
 
     /// Execute the full dispatch sequence (forward + backward + update).
     pub fn step(&mut self) {
+        let cpu_started = std::time::Instant::now();
+        let mut cpu_parts = [std::time::Duration::ZERO; 5];
         let _span = tracing::info_span!(
             "step",
             dispatches = self.plan.dispatches.len(),
@@ -7043,16 +7045,26 @@ impl Session {
                     let label = format!("step {}/{}", chunk_index + 1, chunk_count);
                     let mut pass = self.encoder.compute(&label);
                     for gi in start..end {
+                        let cpu_part = std::time::Instant::now();
                         if gi > start {
                             pass.barrier();
                         }
                         let group = self.groups[gi].clone();
+                        cpu_parts[0] += cpu_part.elapsed();
                         for i in group {
                             let dispatch = &self.plan.dispatches[i];
+                            let cpu_part = std::time::Instant::now();
                             let pipeline = self.pipelines.get(dispatch);
+                            cpu_parts[1] += cpu_part.elapsed();
+                            let cpu_part = std::time::Instant::now();
                             let mut pc = pass.with(pipeline);
+                            cpu_parts[2] += cpu_part.elapsed();
+                            let cpu_part = std::time::Instant::now();
                             Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
+                            cpu_parts[3] += cpu_part.elapsed();
+                            let cpu_part = std::time::Instant::now();
                             pc.dispatch(dispatch.workgroups);
+                            cpu_parts[4] += cpu_part.elapsed();
                         }
                     }
                 }
@@ -7065,6 +7077,12 @@ impl Session {
             }
         }
 
+        eprintln!(
+            "CPU-RECORD {} {:?} {:?}",
+            self.plan.dispatches.len(),
+            cpu_started.elapsed(),
+            cpu_parts
+        );
         // Temporal grad accumulation: add this step's (overwritten) grads
         // into the persistent accumulators that the clip/optimizer below
         // will read. Runs in its own pass after backward (it reads grad
