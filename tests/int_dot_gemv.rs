@@ -514,6 +514,60 @@ fn run(
     session.read_output(n)
 }
 
+fn run_q40_rmsnorm(
+    k: usize,
+    n: usize,
+    x: &[f32],
+    norm_weight: &[f32],
+    packed: &[u8],
+    expose_normalized: bool,
+) -> Vec<f32> {
+    let mut g = Graph::new();
+    let input = g.input("x", &[1, k]);
+    let scale = g.parameter("norm", &[k]);
+    let normalized = g.rms_norm(input, scale, 1.0e-6);
+    let weight = g.parameter_q40("w", &[k, n]);
+    let output = g.matmul(normalized, weight);
+    if expose_normalized {
+        g.set_outputs(vec![normalized, output]);
+    } else {
+        g.set_outputs(vec![output]);
+    }
+
+    let (mut session, _): (Session, _) = meganeura::train::build(
+        &g,
+        SessionConfig {
+            mode: Mode::Inference,
+            options: CompileOptions {
+                quantized_activations: true,
+                ..CompileOptions::from_env()
+            },
+            ..SessionConfig::from_env()
+        },
+    );
+    let dispatch = session
+        .plan()
+        .dispatches
+        .iter()
+        .find(|dispatch| dispatch.shader == ShaderEntry::MatMulGemv)
+        .expect("RmsNorm output should feed a GEMV");
+    assert!(dispatch.gemv_int_dot);
+    assert_eq!(dispatch.gemv_rmsnorm.is_some(), !expose_normalized);
+
+    session.set_input("x", x);
+    session.set_parameter("norm", norm_weight);
+    session.set_parameter_packed("w", packed);
+    session.step();
+    session.wait();
+    if expose_normalized {
+        let mut values = vec![0.0; n];
+        session.read_output_by_index(1, &mut values);
+        values
+    } else {
+        session.read_output(n)
+    }
+}
+
 /// Largest absolute difference between two outputs.
 ///
 /// `f32::max` returns the non-NaN operand, so folding differences with it
@@ -640,7 +694,14 @@ fn int_dot_gemv_matches_the_q4_0_q8_1_reference() {
         Format::Q3K,
     ] {
         let shapes: &[(usize, usize)] = match format {
-            Format::Q40 | Format::Q8 => &[(64usize, 8usize), (96, 4), (256, 16), (8224, 4)],
+            Format::Q40 => &[
+                (64usize, 8usize),
+                (96, 4),
+                (256, 16),
+                (6144, 1536),
+                (8224, 4),
+            ],
+            Format::Q8 => &[(64usize, 8usize), (96, 4), (256, 16), (8224, 4)],
             // The envelope only opens where an element sits on a rounding
             // boundary, and each such element contributes up to a full quant
             // step of its weight. At 8192 elements a Q4_K/Q5_K/Q6_K column
@@ -758,6 +819,27 @@ fn int_dot_gemv_stays_close_to_the_full_precision_path() {
             );
         }
     }
+}
+
+#[test]
+fn q40_q8_1_rmsnorm_fusion_matches_the_unfused_path() {
+    let (k, n) = (1536, 64);
+    let x = (0..k)
+        .map(|i| ((i * 37 % 257) as f32 - 128.0) * 0.013)
+        .collect::<Vec<_>>();
+    let norm_weight = (0..k)
+        .map(|i| 0.5 + (i * 17 % 101) as f32 * 0.011)
+        .collect::<Vec<_>>();
+    let (packed, _) = q40_weight(k, n, 0x51a7);
+
+    let fused = run_q40_rmsnorm(k, n, &x, &norm_weight, &packed, false);
+    let unfused = run_q40_rmsnorm(k, n, &x, &norm_weight, &packed, true);
+    let scale = unfused.iter().fold(0.0f32, |m, value| m.max(value.abs()));
+    let difference = max_abs_diff(&fused, &unfused);
+    assert!(
+        difference <= scale * 0.01,
+        "fused Q8_1 activation changed RMSNorm GEMV by {difference} at scale {scale}"
+    );
 }
 
 #[test]
