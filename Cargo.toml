@@ -35,6 +35,9 @@ name = "rmsnorm_matmul_prologue"
 name = "gemma_inference_ops"
 
 [[test]]
+name = "int_dot_gemv"
+
+[[test]]
 name = "shared_parameters"
 
 [[test]]

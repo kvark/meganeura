@@ -179,6 +179,15 @@ impl Architecture {
         matches!(self, Self::Gemma4)
     }
 
+    /// Whether attention logits use the raw Q·K product instead of the
+    /// conventional `1 / sqrt(head_dim)` scale.
+    ///
+    /// The cached-attention primitive applies the conventional scale
+    /// internally, so callers compensate by pre-scaling Q for this family.
+    pub fn uses_unit_attention_scale(self) -> bool {
+        matches!(self, Self::Gemma4)
+    }
+
     /// Whether blocks carry per-layer token embeddings that mix into each
     /// block through a gated projection.
     pub fn uses_per_layer_embeddings(self) -> bool {
@@ -793,6 +802,21 @@ impl ModelConfig {
         let owners = self.num_layers.saturating_sub(self.shared_kv_layers).max(1);
         if index < owners {
             index
+        } else if self.architecture == Architecture::Gemma4 {
+            // Gemma4's tail layers reuse the most recent owning cache of
+            // the same attention kind.  The official E2B checkpoint owns
+            // layers 0..15, so every later SWA layer reads layer 13 while
+            // every later full-attention layer reads layer 14.  Cycling by
+            // `index % owners` silently connected those layers to unrelated
+            // early caches and changed the model after block 15.
+            (0..owners)
+                .rev()
+                .find(|&source| self.layer_is_windowed(source) == self.layer_is_windowed(index))
+                // A synthetic or future file can have only one attention
+                // kind among its owners. Sharing remains valid when its
+                // actual cache layout agrees; metadata validation below
+                // rejects an incompatible fallback.
+                .unwrap_or(owners - 1)
         } else {
             index % owners
         }
@@ -1335,6 +1359,39 @@ mod tests {
             ModelConfig::from_gguf(&m),
             Err(GgufError::BadMetadata(_))
         ));
+    }
+
+    #[test]
+    fn gemma4_shared_kv_reuses_the_latest_matching_attention_kind() {
+        let mut m = model("gemma4");
+        set_arch_key(&mut m, "block_count", GgufValue::U32(35));
+        set_arch_key(
+            &mut m,
+            "attention.sliding_window_pattern",
+            GgufValue::Array(
+                (0..35)
+                    .map(|layer| GgufValue::Bool(layer % 5 != 4))
+                    .collect(),
+            ),
+        );
+        set_arch_key(
+            &mut m,
+            "feed_forward_length",
+            GgufValue::Array((0..35).map(|_| GgufValue::U32(128)).collect()),
+        );
+        set_arch_key(
+            &mut m,
+            "attention.head_count_kv",
+            GgufValue::Array((0..35).map(|_| GgufValue::U32(1)).collect()),
+        );
+        set_arch_key(&mut m, "attention.shared_kv_layers", GgufValue::U32(20));
+
+        let config = ModelConfig::from_gguf(&m).unwrap();
+        assert_eq!(config.kv_source(13), 13);
+        assert_eq!(config.kv_source(14), 14);
+        assert_eq!(config.kv_source(15), 13);
+        assert_eq!(config.kv_source(19), 14);
+        assert_eq!(config.kv_source(34), 14);
     }
 
     #[test]

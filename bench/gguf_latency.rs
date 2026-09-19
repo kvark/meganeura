@@ -13,19 +13,37 @@ const DECODE: usize = 32;
 const CONTEXT: usize = 256;
 const SAMPLES: usize = 7;
 
-fn run(session: &mut Session, position: usize, count: usize, vocab: usize) -> (Vec<f32>, [f64; 3]) {
+fn run(
+    session: &mut Session,
+    model: &gguf::GgufModel,
+    config: &gguf::arch::ModelConfig,
+    position: usize,
+    count: usize,
+) -> (Vec<f32>, [f64; 3]) {
     let tokens: Vec<u32> = (position..position + count)
         .map(|i| 42 + (i % 31) as u32)
         .collect();
     session.set_input_u32("token_ids", &tokens);
     session.set_input_u32("position", &[position as u32]);
     session.set_input_u32("valid", &[count as u32]);
+    if config.architecture.uses_per_layer_embeddings() {
+        let ple = gguf::weights::gather_per_layer_embeddings(
+            model
+                .tensors
+                .get("per_layer_token_embd.weight")
+                .expect("per-layer embedding table"),
+            config,
+            &tokens,
+        )
+        .expect("per-layer embedding gather");
+        session.set_input("ple", &ple);
+    }
     let start = Instant::now();
     session.step();
     let submitted = Instant::now();
     session.wait();
     let finished = Instant::now();
-    let mut logits = vec![0.0; vocab];
+    let mut logits = vec![0.0; config.vocab_size];
     session.read_output_by_index(0, &mut logits);
     assert!(logits.iter().all(|x| x.is_finite()));
     let read = Instant::now();
@@ -50,10 +68,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let started = Instant::now();
     let model = gguf::load_gguf(Path::new(&args[1]))?;
     let config = gguf::arch::ModelConfig::from_gguf(&model)?;
-    assert!(
-        !config.architecture.uses_per_layer_embeddings(),
-        "PLE needs host gathering"
-    );
+    let f32_activations = std::env::var_os("MEGANEURA_F32_ACTIVATIONS").is_some();
     let mut sessions = Vec::new();
     let mut tuning = Vec::new();
     for block in [1, PROMPT] {
@@ -65,6 +80,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             None => SessionConfig::inference_from_env(),
         };
         cfg.tune = false;
+        if f32_activations {
+            cfg.options.quantized_activations = false;
+        }
         let mut session = meganeura::build(&graph, cfg).0;
         session.set_submission_chunks(1);
         if tune_seconds != 0 {
@@ -95,7 +113,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for sample in 0..SAMPLES + 3 {
         // Every run overwrites the same cache prefix. Attention masks the suffix.
         let start = Instant::now();
-        let (logits, _) = run(&mut sessions[1], 0, PROMPT, config.vocab_size);
+        let (logits, _) = run(&mut sessions[1], &model, &config, 0, PROMPT);
         let elapsed = start.elapsed().as_secs_f64() * 1000.0;
         if sample >= 3 {
             prefill_ms.push(elapsed);
@@ -105,7 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         for pos in PROMPT..PROMPT + DECODE {
             let start = Instant::now();
-            let (logits, parts) = run(&mut sessions[0], pos, 1, config.vocab_size);
+            let (logits, parts) = run(&mut sessions[0], &model, &config, pos, 1);
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
             if sample >= 3 {
                 decode_ms.push(elapsed);
@@ -123,6 +141,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "device": sessions[0].context().device_information().device_name,
         "prompt": PROMPT, "decode": DECODE, "context": CONTEXT, "cache": "f32",
         "vocab": config.vocab_size, "prepare_ms": prepare_ms,
+        "activations": if f32_activations { "f32" } else { "q8_1" },
         "prefill_ms": prefill_ms, "decode_ms": decode_ms,
         "decode_record_wait_read_ms": decode_parts_ms,
         "dispatches": [sessions[1].plan().dispatches.len(), sessions[0].plan().dispatches.len()],

@@ -270,6 +270,14 @@ pub fn build(
             Some(freqs) => g.rope_dynamic_offset_factors(q, layer_theta, position, head_dim, freqs),
             None => g.rope_dynamic_offset(q, layer_theta, position, head_dim),
         };
+        // CachedBlockAttention applies the conventional 1/sqrt(head_dim)
+        // score scale internally. Gemma4 deliberately uses a unit attention
+        // scale, so compensate on Q before entering the primitive.
+        let q = if arch.uses_unit_attention_scale() {
+            g.scale(q, (head_dim as f32).sqrt())
+        } else {
+            q
+        };
 
         // Layers sharing a KV cache have no K/V projections and no cache
         // write: their attention reads the owning layer's cache, written
@@ -1259,6 +1267,36 @@ mod tests {
             })
             .collect();
         assert_eq!(factors, vec![config.head_dim; 2]);
+    }
+
+    #[test]
+    fn gemma4_cancels_the_cached_attention_score_scale() {
+        let (g, _, config) = build_fixture("gemma4");
+        let attention = g
+            .nodes()
+            .iter()
+            .find(|node| matches!(node.op, crate::graph::Op::CachedBlockAttention { .. }))
+            .expect("cached attention");
+        let q = g.node(attention.inputs[0]);
+        let crate::graph::Op::Scale { factor } = q.op else {
+            panic!("Gemma4 attention Q must compensate the primitive's implicit scale");
+        };
+        assert_eq!(factor, (config.head_dim_at(0) as f32).sqrt());
+        assert!(matches!(
+            g.node(q.inputs[0]).op,
+            crate::graph::Op::RoPE { .. }
+        ));
+
+        let (llama, _, _) = build_fixture("llama");
+        let attention = llama
+            .nodes()
+            .iter()
+            .find(|node| matches!(node.op, crate::graph::Op::CachedBlockAttention { .. }))
+            .expect("cached attention");
+        assert!(!matches!(
+            llama.node(attention.inputs[0]).op,
+            crate::graph::Op::Scale { .. }
+        ));
     }
 
     #[test]
