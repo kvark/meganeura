@@ -80,6 +80,9 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         * (params.head_dim + 2u);
 
     if split_begin >= kv_len {
+        for (var d = tid; d < params.head_dim; d += 64u) {
+            dst[part + d] = 0.0;
+        }
         // An empty slice: the identity partial. The combine folds it away
         // with weight exp(-1e30 - m) = 0.
         if tid == 0u {

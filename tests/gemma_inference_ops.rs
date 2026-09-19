@@ -227,53 +227,55 @@ fn chunked_relative_attention_matches_blocked_reference() {
 
 #[test]
 fn cached_block_writes_only_valid_rows_and_selects_last() {
-    let block = 3;
-    let dim = 4;
-    let max_seq = 6;
-    let mut graph = Graph::new();
-    let q = graph.input("q", &[block, dim]);
-    let new_k = graph.input("new_k", &[block, dim]);
-    let new_v = graph.input("new_v", &[block, dim]);
-    let k_cache = graph.parameter("k", &[max_seq, dim]);
-    let v_cache = graph.parameter("v", &[max_seq, dim]);
-    let position = graph.input_u32("position", &[1]);
-    let valid = graph.input_u32("valid", &[1]);
-    let k_cache = graph.cache_write_prefix(new_k, k_cache, position, valid);
-    let v_cache = graph.cache_write_prefix(new_v, v_cache, position, valid);
-    let attended =
-        graph.cached_block_attention(q, k_cache, v_cache, position, valid, 1, 1, dim as u32, 0);
-    let output = graph.prefix_last(attended, valid);
-    graph.set_outputs(vec![output]);
+    for max_seq in [6, 96] {
+        let block = 3;
+        let dim = 4;
+        let mut graph = Graph::new();
+        let q = graph.input("q", &[block, 2 * dim]);
+        let new_k = graph.input("new_k", &[block, dim]);
+        let new_v = graph.input("new_v", &[block, dim]);
+        let k_cache = graph.parameter("k", &[max_seq, dim]);
+        let v_cache = graph.parameter("v", &[max_seq, dim]);
+        let position = graph.input_u32("position", &[1]);
+        let valid = graph.input_u32("valid", &[1]);
+        let k_cache = graph.cache_write_prefix(new_k, k_cache, position, valid);
+        let v_cache = graph.cache_write_prefix(new_v, v_cache, position, valid);
+        let attended =
+            graph.cached_block_attention(q, k_cache, v_cache, position, valid, 2, 1, dim as u32, 0);
+        let output = graph.prefix_last(attended, valid);
+        graph.set_outputs(vec![output]);
 
-    let mut session = meganeura::build(&graph, meganeura::SessionConfig::inference_from_env()).0;
-    session.set_input("q", &[0.0; 12]);
-    session.set_input(
-        "new_k",
-        &[
-            3.0, 3.0, 3.0, 3.0, 4.0, 4.0, 4.0, 4.0, 1.0e6, 1.0e6, 1.0e6, 1.0e6,
-        ],
-    );
-    session.set_input(
-        "new_v",
-        &[
-            3.0, 6.0, 9.0, 12.0, 4.0, 8.0, 12.0, 16.0, 1.0e6, 1.0e6, 1.0e6, 1.0e6,
-        ],
-    );
-    let mut initial_k = vec![0.0; max_seq * dim];
-    let mut initial_v = vec![0.0; max_seq * dim];
-    for row in 0..2 {
-        for col in 0..dim {
-            initial_k[row * dim + col] = (row + 1) as f32;
-            initial_v[row * dim + col] = (row + 1) as f32 * (col + 1) as f32;
+        let mut session =
+            meganeura::build(&graph, meganeura::SessionConfig::inference_from_env()).0;
+        session.set_input("q", &[0.0; 24]);
+        session.set_input(
+            "new_k",
+            &[
+                3.0, 3.0, 3.0, 3.0, 4.0, 4.0, 4.0, 4.0, 1.0e6, 1.0e6, 1.0e6, 1.0e6,
+            ],
+        );
+        session.set_input(
+            "new_v",
+            &[
+                3.0, 6.0, 9.0, 12.0, 4.0, 8.0, 12.0, 16.0, 1.0e6, 1.0e6, 1.0e6, 1.0e6,
+            ],
+        );
+        let mut initial_k = vec![0.0; max_seq * dim];
+        let mut initial_v = vec![0.0; max_seq * dim];
+        for row in 0..2 {
+            for col in 0..dim {
+                initial_k[row * dim + col] = (row + 1) as f32;
+                initial_v[row * dim + col] = (row + 1) as f32 * (col + 1) as f32;
+            }
         }
+        session.set_parameter("k", &initial_k);
+        session.set_parameter("v", &initial_v);
+        session.set_input_u32("position", &[2]);
+        session.set_input_u32("valid", &[2]);
+        session.step();
+        session.wait();
+        let actual = session.read_output(2 * dim);
+        // The second valid query sees cache rows 0..3. Q=0 makes them uniform.
+        assert_close(&actual, &[2.5, 5.0, 7.5, 10.0, 2.5, 5.0, 7.5, 10.0], 1e-5);
     }
-    session.set_parameter("k", &initial_k);
-    session.set_parameter("v", &initial_v);
-    session.set_input_u32("position", &[2]);
-    session.set_input_u32("valid", &[2]);
-    session.step();
-    session.wait();
-    let actual = session.read_output(dim);
-    // The second valid query sees cache rows 0..3. Q=0 makes them uniform.
-    assert_eq!(actual, vec![2.5, 5.0, 7.5, 10.0]);
 }

@@ -36,8 +36,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     if query_row >= params.block_len || head >= params.num_heads { return; }
 
     let stride = params.head_dim + 2u;
-    let row_part = ((query_row * params.num_heads + head) * params.splits)
-        * (params.head_dim + 2u);
+    let row_part = (query_row * params.num_heads + head) * params.splits;
 
     // Global max over the splits.
     var m = -1e30;
