@@ -1430,7 +1430,10 @@ fn reference_dot(class: &TuneClass, inputs: &[Vec<f32>], row: usize, col: usize)
         // contiguous rows of B rather than forward `[K, N]` columns.
         let b = if matches!(
             class.shader,
-            ShaderEntry::MatMulBT | ShaderEntry::FusedMatMulBTAdd | ShaderEntry::MatMulGemvBT
+            ShaderEntry::MatMulBT
+                | ShaderEntry::FusedMatMulBTAdd
+                | ShaderEntry::MatMulGemvBT
+                | ShaderEntry::MatMulGemvBTAdd
         ) {
             col * k + inner
         } else {

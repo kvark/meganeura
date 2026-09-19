@@ -11,8 +11,8 @@
 //! model rather than of the container:
 //!
 //! - The **embedding table** is dequantized to f16, because the gather has
-//!   no block-quantized variant. It is also the one tensor read in GGUF's
-//!   own row order rather than transposed — see
+//!   no block-quantized variant. Like dense projection weights it retains
+//!   GGUF's own row order — see
 //!   [`GgufTensor::to_f32_rows`](super::GgufTensor::to_f32_rows).
 //! - **Gemma's norm weights** are stored centred on zero and applied as
 //!   `1 + w`. Folding the `+1` in here keeps every shader unaware of it.
@@ -255,7 +255,7 @@ fn load_one(
         crate::graph::DType::F32 | crate::graph::DType::F16 => {
             // Declared f32 or f16; either way `set_parameter` takes f32 and
             // the runtime narrows it if the buffer is half-width.
-            let values = tensor.to_f32()?;
+            let values = tensor.to_f32_rows()?;
             session.set_parameter(name, &values);
             report.dequantized += 1;
         }
@@ -586,6 +586,8 @@ mod tests {
         for arch in ["llama", "qwen2", "qwen3", "gemma", "gemma2", "gemma4"] {
             let model = fixture::model(arch);
             let config = ModelConfig::from_gguf(&model).unwrap();
+            let mut g = crate::Graph::new();
+            graph::build(&mut g, &model, &config, 4, 16).unwrap();
             for name in graph::parameter_names(&config) {
                 let tensor = &model.tensors[&name];
                 if name == graph::TOKEN_EMBD || tensor.dims.len() == 1 {
@@ -597,6 +599,13 @@ mod tests {
                     crate::graph::DType::F32,
                     "{arch}/{name}"
                 );
+                let param = g.nodes().iter().find(|node| matches!(&node.op, crate::graph::Op::Parameter { name: param } if param == &name)).unwrap();
+                assert_eq!(
+                    param.ty.shape,
+                    [tensor.dims[1], tensor.dims[0]],
+                    "{arch}/{name}"
+                );
+                assert_eq!(param.ty.dtype, crate::graph::DType::F32);
             }
         }
     }
