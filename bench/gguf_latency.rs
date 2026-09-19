@@ -1,5 +1,5 @@
 //! Matched GGUF diagnostic; see gguf_latency.cpp for the llama.cpp counterpart.
-//! Usage: gguf_latency model.gguf output-prefix [tune-seconds]
+//! Usage: gguf_latency model.gguf output-prefix [tune-seconds] [all|dense|attention]
 //! GPU selection and precision use the usual SessionConfig environment options.
 
 use meganeura::{Graph, Session, SessionConfig, load::gguf};
@@ -61,10 +61,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     let args: Vec<_> = std::env::args().collect();
     assert!(
-        (3..=4).contains(&args.len()),
-        "gguf_latency model.gguf output-prefix [tune-seconds]"
+        (3..=5).contains(&args.len()),
+        "gguf_latency model.gguf output-prefix [tune-seconds] [all|dense|attention]"
     );
     let tune_seconds: u64 = args.get(3).map_or(Ok(0), |s| s.parse())?;
+    let scope = match args.get(4).map(String::as_str).unwrap_or("all") {
+        "all" => meganeura::tune::TuneScope::All,
+        "dense" => meganeura::tune::TuneScope::Dense,
+        "attention" => meganeura::tune::TuneScope::Attention,
+        _ => return Err("expected all, dense or attention tuning scope".into()),
+    };
     let started = Instant::now();
     let model = gguf::load_gguf(Path::new(&args[1]))?;
     let config = gguf::arch::ModelConfig::from_gguf(&model)?;
@@ -87,6 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         session.set_submission_chunks(1);
         if tune_seconds != 0 {
             tuning.push(session.tune_with(meganeura::tune::TuneOptions {
+                scope,
                 max_time: Duration::from_secs(tune_seconds),
                 max_classes: 64,
                 max_scratch_bytes: 256 * 1024 * 1024,
