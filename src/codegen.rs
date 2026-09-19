@@ -1917,7 +1917,7 @@ fn substitute(source: &str, old: &str, new: &str) -> String {
 /// Derived from `matmul_gemv.wgsl` by substitution so shape and reduction
 /// changes reach it automatically. Each consuming workgroup recomputes the
 /// small sum-of-squares prologue, avoiding a separate dispatch and boundary.
-fn gemv_rmsnorm_source(format: WeightFormat) -> String {
+fn gemv_rmsnorm_source(format: WeightFormat, reduction: GemvReduction) -> String {
     // `_pad` carries eps; the fused kernel needs no other new parameter.
     // Start from the already-format-specialized GEMV so packed decoders
     // compose with the prologue rather than being overwritten by it.
@@ -1969,15 +1969,7 @@ fn gemv_rmsnorm_source(format: WeightFormat) -> String {
         ss += v * v;\n\
         si += LANES;\n\
     }\n\
-    scale_buf[lane] = ss;\n\
-    workgroupBarrier();\n\
-    var sstride = LANES / 2u;\n\
-    loop {\n\
-        if sstride == 0u { break; }\n\
-        if lane < sstride { scale_buf[lane] += scale_buf[lane + sstride]; }\n\
-        workgroupBarrier();\n\
-        sstride >>= 1u;\n\
-    }\n\
+    $NORM_REDUCTION\n\
     if lane == 0u {\n\
         inv_rms = inverseSqrt(scale_buf[0] / f32(k) + bitcast<f32>(params.eps_bits));\n\
     }\n\
@@ -1987,6 +1979,20 @@ fn gemv_rmsnorm_source(format: WeightFormat) -> String {
 \n\
     // Each thread accumulates a partial sum over its K-stride slice.",
     );
+    let norm_reduction = match reduction {
+        GemvReduction::Tree => "scale_buf[lane] = ss;\n\
+            workgroupBarrier();\n\
+            var sstride = LANES / 2u;\n\
+            loop {\n\
+                if sstride == 0u { break; }\n\
+                if lane < sstride { scale_buf[lane] += scale_buf[lane + sstride]; }\n\
+                workgroupBarrier();\n\
+                sstride >>= 1u;\n\
+            }\n"
+        .to_owned(),
+        GemvReduction::Subgroup => subgroup_reduce_source("scale_buf", "ss"),
+    };
+    let src = substitute(&src, "$NORM_REDUCTION", &norm_reduction);
     substitute(
         &src,
         "        let a = matrix_a[kk];",
@@ -1995,10 +2001,37 @@ fn gemv_rmsnorm_source(format: WeightFormat) -> String {
 }
 
 pub fn generate_module_gemv_rmsnorm(shape: GemvShape, format: WeightFormat) -> ShaderModule {
-    ShaderModule::new(&gemv_shape_source(&gemv_rmsnorm_source(format), shape))
+    let source = gemv_rmsnorm_source(format, shape.reduction);
+    ShaderModule::new(&gemv_shape_source(&source, shape))
 }
 
 const LANES_PREFIX: &str = "const LANES: u32 = ";
+
+fn subgroup_reduce_source(buffer: &str, value: &str) -> String {
+    preprocess(
+        "    {\n\
+         \x20   if lane == 0u { atomicStore(&wave_slots, 0u); }\n\
+         \x20   workgroupBarrier();\n\
+         \x20   let wave_total = subgroupAdd($VALUE);\n\
+         \x20   if sg_id == subgroupBroadcastFirst(sg_id) {\n\
+         \x20       $BUFFER[atomicAdd(&wave_slots, 1u)] = wave_total;\n\
+         \x20   }\n\
+         \x20   workgroupBarrier();\n\
+         \x20   if lane == 0u {\n\
+         \x20       let waves = atomicLoad(&wave_slots);\n\
+         \x20       var total = $BUFFER[0];\n\
+         \x20       var g = 1u;\n\
+         \x20       loop {\n\
+         \x20           if g >= waves { break; }\n\
+         \x20           total = total + $BUFFER[g];\n\
+         \x20           g = g + 1u;\n\
+         \x20       }\n\
+         \x20       $BUFFER[0] = total;\n\
+         \x20   }\n\
+         \x20   }\n",
+        &[("$BUFFER", buffer), ("$VALUE", value)],
+    )
+}
 
 /// The width a GEMV source is written against, from its `LANES` constant.
 ///
@@ -2073,28 +2106,7 @@ fn gemv_shape_source(source: &str, shape: GemvShape) -> String {
         // and the count comes back from the same counter. That costs one
         // extra barrier to zero the counter, so two rather than the tree's
         // one per halving level.
-        GemvReduction::Subgroup => {
-            let _ = threads;
-            "    if lane == 0u { atomicStore(&wave_slots, 0u); }\n\
-             \x20   workgroupBarrier();\n\
-             \x20   let wave_total = subgroupAdd(acc);\n\
-             \x20   if sg_id == subgroupBroadcastFirst(sg_id) {\n\
-             \x20       reduce_buf[atomicAdd(&wave_slots, 1u)] = wave_total;\n\
-             \x20   }\n\
-             \x20   workgroupBarrier();\n\
-             \x20   if lane == 0u {\n\
-             \x20       let waves = atomicLoad(&wave_slots);\n\
-             \x20       var total = reduce_buf[0];\n\
-             \x20       var g = 1u;\n\
-             \x20       loop {\n\
-             \x20           if g >= waves { break; }\n\
-             \x20           total = total + reduce_buf[g];\n\
-             \x20           g = g + 1u;\n\
-             \x20       }\n\
-             \x20       reduce_buf[0] = total;\n\
-             \x20   }\n"
-                .to_owned()
-        }
+        GemvReduction::Subgroup => subgroup_reduce_source("reduce_buf", "acc"),
     };
     source.replace_range(start..end, &reduction);
 
