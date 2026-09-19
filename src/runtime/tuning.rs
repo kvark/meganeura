@@ -119,7 +119,11 @@ pub(super) fn tile_module(
             );
         }
         if dispatch.gemv_rmsnorm.is_some() {
-            return crate::codegen::generate_module_gemv_rmsnorm(shape, dispatch.weight_format);
+            return crate::codegen::generate_module_gemv_rmsnorm(
+                group,
+                shape,
+                dispatch.weight_format,
+            );
         }
         return crate::codegen::generate_module_gemv(group, dispatch.weight_format, shape);
     }

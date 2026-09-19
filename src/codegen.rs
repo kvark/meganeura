@@ -1926,11 +1926,16 @@ fn substitute(source: &str, old: &str, new: &str) -> String {
 /// Derived from `matmul_gemv.wgsl` by substitution so shape and reduction
 /// changes reach it automatically. Each consuming workgroup recomputes the
 /// small sum-of-squares prologue, avoiding a separate dispatch and boundary.
-fn gemv_rmsnorm_source(format: WeightFormat) -> String {
+fn gemv_rmsnorm_source(group: ShaderGroup, format: WeightFormat) -> String {
+    assert!(matches!(
+        group,
+        ShaderGroup::MatMulGemv | ShaderGroup::MatMulGemvBT
+    ));
+    let transposed = group == ShaderGroup::MatMulGemvBT;
     // `_pad` carries eps; the fused kernel needs no other new parameter.
     // Start from the already-format-specialized GEMV so packed decoders
     // compose with the prologue rather than being overwritten by it.
-    let src = gemv_source(ShaderGroup::MatMulGemv, format);
+    let src = gemv_source(group, format);
     let src = substitute(&src, "    _pad: u32,", "    eps_bits: u32,");
     let src = if src.contains("var<storage> matrix_b: array<vec4<f32>>;") {
         substitute(
@@ -1953,19 +1958,27 @@ fn gemv_rmsnorm_source(format: WeightFormat) -> String {
     };
     let src = substitute(
         &src,
-        "var<workgroup> reduce_buf: array<vec4<f32>, LANES>;",
-        "var<workgroup> reduce_buf: array<vec4<f32>, LANES>;\n\
-         var<workgroup> scale_buf: array<f32, LANES>;\n\
-         var<workgroup> inv_rms: f32;",
+        "var<workgroup> reduce_buf:",
+        "var<workgroup> scale_buf: array<f32, LANES>;\n\
+         var<workgroup> inv_rms: f32;\nvar<workgroup> reduce_buf:",
     );
     // The early-out must not precede the prologue's barriers, which every
     // lane has to reach. The dispatch is exactly N/4 workgroups, so it
     // never fires in practice, but keep it uniform regardless.
-    let src = substitute(
-        &src,
-        "    if col4 >= n_v4 { return; }\n    let k = params.k;\n",
-        "    let k = params.k;\n",
-    );
+    let src = if transposed {
+        let src = substitute(&src, "    if col >= params.n { return; }\n", "");
+        substitute(
+            &src,
+            "    var acc = 0.0;",
+            "    let k = params.k;\n    // Each thread accumulates a partial sum over its K-stride slice.\n    var acc = 0.0;",
+        )
+    } else {
+        substitute(
+            &src,
+            "    if col4 >= n_v4 { return; }\n    let k = params.k;\n",
+            "    let k = params.k;\n",
+        )
+    };
     let src = substitute(
         &src,
         "    // Each thread accumulates a partial sum over its K-stride slice.",
@@ -1996,15 +2009,40 @@ fn gemv_rmsnorm_source(format: WeightFormat) -> String {
 \n\
     // Each thread accumulates a partial sum over its K-stride slice.",
     );
-    substitute(
-        &src,
-        "        let a = matrix_a[kk];",
-        "        let a = matrix_a[kk] * rs * norm_w[kk];",
-    )
+    if transposed {
+        let src = substitute(
+            &src,
+            "if col4 >= n_v4 { return; }",
+            "if col >= params.n { return; }",
+        );
+        let src = substitute(
+            &src,
+            "let v = matrix_a[si];",
+            "let v = matrix_a[si / 4u][si % 4u];",
+        );
+        substitute(
+            &src,
+            "        let a = matrix_a[kk_v4];",
+            "        let at = kk_v4 * 4u;\n        let a = matrix_a[kk_v4] * rs * vec4<f32>(norm_w[at], norm_w[at+1u], norm_w[at+2u], norm_w[at+3u]);",
+        )
+    } else {
+        substitute(
+            &src,
+            "        let a = matrix_a[kk];",
+            "        let a = matrix_a[kk] * rs * norm_w[kk];",
+        )
+    }
 }
 
-pub fn generate_module_gemv_rmsnorm(shape: GemvShape, format: WeightFormat) -> ShaderModule {
-    ShaderModule::new(&gemv_shape_source(&gemv_rmsnorm_source(format), shape))
+pub fn generate_module_gemv_rmsnorm(
+    group: ShaderGroup,
+    shape: GemvShape,
+    format: WeightFormat,
+) -> ShaderModule {
+    ShaderModule::new(&gemv_shape_source(
+        &gemv_rmsnorm_source(group, format),
+        shape,
+    ))
 }
 
 const LANES_PREFIX: &str = "const LANES: u32 = ";
@@ -7206,31 +7244,43 @@ mod tests {
     fn packed_gemv_rmsnorm_keeps_the_decoder() {
         for format in [
             WeightFormat::F32,
+            WeightFormat::F16,
             WeightFormat::Q40,
             WeightFormat::Q4K,
             WeightFormat::Q8,
         ] {
-            let sm = generate_module_gemv_rmsnorm(
-                GemvShape {
-                    threads: 64,
-                    reduction: GemvReduction::Subgroup,
-                },
-                format,
-            );
-            assert!(
-                sm.source.contains("inv_rms"),
-                "{format:?} fused GEMV lost the RmsNorm prologue"
-            );
-            assert!(
-                sm.source.contains("norm_w"),
-                "{format:?} fused GEMV lost the norm-weight binding"
-            );
-            match format {
-                WeightFormat::F32 => assert!(sm.source.contains("matrix_b: array<vec4<f32>>")),
-                WeightFormat::Q40 => assert!(sm.source.contains("dequant_q40(")),
-                WeightFormat::Q4K => assert!(sm.source.contains("dequant_q4k(")),
-                WeightFormat::Q8 => assert!(sm.source.contains("dequant_q8(")),
-                _ => {}
+            for group in [ShaderGroup::MatMulGemv, ShaderGroup::MatMulGemvBT] {
+                if group == ShaderGroup::MatMulGemvBT && format.is_quantized() {
+                    continue;
+                }
+                let sm = generate_module_gemv_rmsnorm(
+                    group,
+                    GemvShape {
+                        threads: 64,
+                        reduction: GemvReduction::Subgroup,
+                    },
+                    format,
+                );
+                let flags =
+                    naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
+                naga::valid::Validator::new(flags, naga::valid::Capabilities::all())
+                    .validate(&sm.module)
+                    .unwrap();
+                assert!(
+                    sm.source.contains("inv_rms"),
+                    "{format:?} fused GEMV lost the RmsNorm prologue"
+                );
+                assert!(
+                    sm.source.contains("norm_w"),
+                    "{format:?} fused GEMV lost the norm-weight binding"
+                );
+                match format {
+                    WeightFormat::F32 => assert!(sm.source.contains("matrix_b: array<vec4<f32>>")),
+                    WeightFormat::Q40 => assert!(sm.source.contains("dequant_q40(")),
+                    WeightFormat::Q4K => assert!(sm.source.contains("dequant_q4k(")),
+                    WeightFormat::Q8 => assert!(sm.source.contains("dequant_q8(")),
+                    _ => {}
+                }
             }
         }
     }
