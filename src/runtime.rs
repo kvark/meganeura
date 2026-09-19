@@ -7045,6 +7045,8 @@ impl Session {
 
     /// Execute the full dispatch sequence (forward + backward + update).
     pub fn step(&mut self) {
+        let record_started = std::time::Instant::now();
+        let mut record_parts = [std::time::Duration::ZERO; 7];
         let _span = tracing::info_span!(
             "step",
             dispatches = self.plan.dispatches.len(),
@@ -7056,6 +7058,7 @@ impl Session {
 
         self.encoder.start();
         self.profiled_pass_map.clear();
+        record_parts[0] = record_started.elapsed();
 
         if let Some(window) = self.profile_window.clone() {
             // Multi-pass mode: one compute pass per dispatch in the window,
@@ -7119,16 +7122,27 @@ impl Session {
                     let label = format!("step {}/{}", chunk_index + 1, chunk_count);
                     let mut pass = self.encoder.compute(&label);
                     for gi in start..end {
+                        let barrier_started = std::time::Instant::now();
                         if gi > start {
                             pass.barrier();
                         }
+                        record_parts[1] += barrier_started.elapsed();
                         let group = self.groups[gi].clone();
                         for i in group {
+                            let lookup_started = std::time::Instant::now();
                             let dispatch = &self.plan.dispatches[i];
                             let pipeline = self.pipelines.get(dispatch);
+                            let pipeline_started = std::time::Instant::now();
                             let mut pc = pass.with(pipeline);
+                            let bind_started = std::time::Instant::now();
                             Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
+                            let dispatch_started = std::time::Instant::now();
                             pc.dispatch(dispatch.workgroups);
+                            let dispatch_finished = std::time::Instant::now();
+                            record_parts[2] += pipeline_started - lookup_started;
+                            record_parts[3] += bind_started - pipeline_started;
+                            record_parts[4] += dispatch_started - bind_started;
+                            record_parts[5] += dispatch_finished - dispatch_started;
                         }
                     }
                 }
@@ -7414,7 +7428,16 @@ impl Session {
             }
         }
 
+        let submit_started = std::time::Instant::now();
         self.sync_point = Some(self.gpu.submit(&mut self.encoder));
+        record_parts[6] = submit_started.elapsed();
+        let total = record_started.elapsed().as_secs_f64() * 1e6;
+        eprintln!(
+            "record-us {} {:?} {}",
+            self.plan.dispatches.len(),
+            record_parts.map(|part| part.as_secs_f64() * 1e6),
+            total,
+        );
     }
 
     fn optimizer_len(plan: &ExecutionPlan, param: BufferRef) -> u32 {
