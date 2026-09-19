@@ -255,7 +255,7 @@ fn load_one(
         crate::graph::DType::F32 | crate::graph::DType::F16 => {
             // Declared f32 or f16; either way `set_parameter` takes f32 and
             // the runtime narrows it if the buffer is half-width.
-            let values = tensor.to_f32()?;
+            let values = tensor.to_f32_rows()?;
             session.set_parameter(name, &values);
             report.dequantized += 1;
         }

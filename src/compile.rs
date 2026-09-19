@@ -3354,18 +3354,41 @@ impl<'a> Compiler<'a> {
                 let m = a_shape[0] as u32;
                 let k = a_shape[1] as u32;
                 let n = b_shape[0] as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::FusedMatMulBTAdd,
-                    workgroups: matmul_workgroups(m, n, 64),
-                    input_buffers: vec![a, b, d],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![m, n, k, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
-                    weight_format: wf,
-                    ..Default::default()
-                });
+                if m == 1 && k.is_multiple_of(4) {
+                    let product = BufferRef(self.plan.buffers.len() as u32);
+                    self.plan.buffers.push(n as usize * 4);
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::MatMulGemvBT,
+                        workgroups: [n, 1, 1],
+                        input_buffers: vec![a, b],
+                        output_buffer: product,
+                        params: vec![m, n, k, 0],
+                        weight_format: wf,
+                        gemv_shape: self.options.gemv_shape,
+                        ..Default::default()
+                    });
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::Add,
+                        workgroups: [n.div_ceil(256), 1, 1],
+                        input_buffers: vec![product, d],
+                        output_buffer: out_buf,
+                        params: vec![n, 0, 0, 0],
+                        ..Default::default()
+                    });
+                } else {
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::FusedMatMulBTAdd,
+                        workgroups: matmul_workgroups(m, n, 64),
+                        input_buffers: vec![a, b, d],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params: vec![m, n, k, 0],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        weight_format: wf,
+                        ..Default::default()
+                    });
+                }
             }
 
             Op::Add => {
