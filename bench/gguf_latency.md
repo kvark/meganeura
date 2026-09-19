@@ -48,6 +48,24 @@ profilers or builds competing with the timed runs. Repeat in fresh processes
 and reverse their order. First-read mapped/staged qualification is absorbed
 by warmup, not included in steady-state latency.
 
+With tuning enabled and the default `all` scope, the helper also calls
+`Session::tune_submissions` after priming representative inputs and caches.
+This separately allows two seconds per session to search fresh-command
+submission counts, with a 1% minimum gain plus the paired-sample noise guard
+(the library default is 5%). `submission_tuning` records this search; its
+cost and input priming are included in `prepare_ms`. A zero tuning budget or
+the `dense`/`attention` isolation scopes leave submission count at one.
+
+Scheduling probes borrow readonly weights and privately copy every writable
+allocation, preserving the graph's aliasing and requested memory placement.
+Complete writable images must agree bit for bit, including during timing.
+No live cache or training update is executed. Input resets and checks count
+toward the search budget, but not its graph latency samples; readback and
+runtime-appended optimizer work are not sampled. Counts are measured on the
+target machine, not selected by a GPU/model table. The API needs initialized
+representative inputs, so ordinary session construction still defaults to
+one submission until this explicit post-initialization search is requested.
+
 For separate attribution captures, add `MEGANEURA_GPU_TIMING=1` to the Meganeura
 command or `GGML_VK_PERF_LOGGER=1` to llama.cpp. Profiled numbers are not substitute
 latencies: instrumentation changes execution, and Meganeura's pass intervals

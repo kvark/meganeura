@@ -12,6 +12,7 @@ use std::{
 };
 
 mod attention;
+mod submission;
 
 struct PhaseTimer<'a> {
     start: Instant,
@@ -1877,6 +1878,27 @@ mod tests {
             }
             values
         };
+        let before = state(&a);
+        let schedule = a
+            .tune_submissions(crate::tune::TuneSubmissionOptions {
+                max_chunks: 4,
+                sample_pairs: 4,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!schedule.outcomes.is_empty());
+        assert_ne!(schedule.skipped, Some(TuneDecision::InvalidOutput));
+        assert!(
+            schedule
+                .outcomes
+                .iter()
+                .all(|o| o.decision != TuneDecision::InvalidOutput)
+        );
+        assert_eq!(
+            state(&a),
+            before,
+            "submission tuning changed training state"
+        );
         let class = collect_classes(&b.plan, &b.alias, None).0.remove(0);
         let alternative = if convolution {
             MatmulTile::SpecializedConv {
