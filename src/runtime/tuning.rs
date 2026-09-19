@@ -11,6 +11,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod attention;
+
 struct PhaseTimer<'a> {
     start: Instant,
     elapsed: &'a mut Option<Duration>,
@@ -46,6 +48,22 @@ impl Pipelines {
         let mut knobs = self.matmul_knobs;
         knobs.integer_dot = gpu.capabilities().shader_integer_dot_product;
         let module = tile_module(dispatch, tile, knobs);
+        let layout = if dispatch.gemv_rmsnorm.is_some() {
+            use blade_graphics::ShaderData;
+            super::MatMulRmsNormData::layout()
+        } else {
+            super::shader_data_layout(&selected_entry)
+        };
+        self.insert_tuning_pipeline(gpu, key, module, layout)
+    }
+
+    fn insert_tuning_pipeline(
+        &mut self,
+        gpu: &Gpu,
+        key: Variant,
+        module: crate::codegen::ShaderModule,
+        layout: bg::ShaderDataLayout,
+    ) -> Result<(), String> {
         if let Some(dir) = self.dump_dir.as_deref() {
             module.dump(dir);
         }
@@ -55,16 +73,10 @@ impl Pipelines {
                 naga_module: Some(module.module),
             })
             .map_err(|error| error.to_string())?;
-        let layout = if dispatch.gemv_rmsnorm.is_some() {
-            use blade_graphics::ShaderData;
-            super::MatMulRmsNormData::layout()
-        } else {
-            super::shader_data_layout(&selected_entry)
-        };
         let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
             name: &key.label(),
             data_layouts: &[&layout],
-            compute: shader.at(selected_entry.entry_point()),
+            compute: shader.at(key.entry().expect("tuning shader entry").entry_point()),
         });
         self.map.insert(key, pipeline);
         Ok(())
@@ -405,7 +417,8 @@ impl Session {
     }
 
     /// Bounded kernel search with default options; logs skips and returns
-    /// per-comparison evidence. Use [`Self::tune_with`] for budgets and full reporting.
+    /// matrix/convolution evidence for compatibility. Use [`Self::tune_with`]
+    /// for budgets and the complete report, including attention choices.
     ///
     /// Unlike the former family-wide tuner, this never calls `step()` and
     /// never reads or writes live tensor, optimizer, accumulator, or KV state.
@@ -417,7 +430,7 @@ impl Session {
     }
 
     /// Search scalar tiles and advertised, smoke-tested native-f32 cooperative
-    /// matmul, scalar convolution shapes, and GEMV shapes for eligible classes.
+    /// matmul, scalar convolution/GEMV shapes, and cached-attention split counts.
     /// Occupancy/large-shape thresholds only
     /// choose the starting implementation; they do not remove challengers.
     ///
@@ -436,10 +449,13 @@ impl Session {
     /// Other prologues/epilogues, horizontal packs, f16-input cooperative,
     /// cooperative reduced-storage and overlapping-binding dispatches are excluded.
     /// Winners live in this session, not the plan cache.
-    /// Only selected dispatch geometry and pipeline resources change. No graph
-    /// execution occurs, including when an optimizer or external buffer is bound.
+    /// No live graph execution occurs, including with optimizers or external buffers.
     /// Cooperative padding must fit each binding's declared size; the live
-    /// allocation/alias plan is never resized. Sequential challenger
+    /// matrix bindings are never resized. Attention measures whole one- or
+    /// two-dispatch sequences at short, middle and full cache positions. Its
+    /// private partial storage may grow; old allocation contents and barrier
+    /// boundaries are preserved. Dispatch indices and profiling windows are
+    /// remapped when the sequence length changes. Sequential challenger
     /// comparisons per class reuse the latest fully qualified winner as the
     /// incumbent. A soft deadline may be exceeded by one in-flight operation;
     /// an incomplete comparison always retains its incumbent.
@@ -510,6 +526,7 @@ impl Session {
                 report.outcomes.push(outcome);
             }
         }
+        self.tune_attention(&mut report, start, &mut staging);
         if staging.buffer.is_some()
             || report
                 .outcomes
@@ -528,7 +545,7 @@ impl Session {
             "tune: {}/{} classes visited, {} comparisons; {} dispatches excluded; {:.3}s; class limit={}, time limit={}",
             report.visited_classes,
             report.eligible_classes,
-            report.outcomes.len(),
+            report.outcomes.len() + report.attention_outcomes.len(),
             report.excluded_dispatches,
             report.elapsed.as_secs_f64(),
             report.class_limit_reached,
@@ -740,9 +757,16 @@ impl Session {
             return;
         }
         let mut scratch = Scratch::new(
-            &class.key,
+            &sizes
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    i > output_index
+                        || class.key.device_local[if i == output_index { 3 } else { i }]
+                })
+                .collect::<Vec<_>>(),
             &sizes,
-            output_index,
+            (output_index, class.key.output_elements()),
             bytes,
             staging,
             prep,
@@ -1109,14 +1133,15 @@ struct Scratch<'gpu, 'trial> {
 
 impl<'gpu, 'trial> Scratch<'gpu, 'trial> {
     fn new(
-        class: &TuneClass,
+        device_local: &[bool],
         sizes: &[usize],
-        output_index: usize,
+        output: (usize, usize),
         bytes: usize,
         staging: &'trial mut Staging<'gpu>,
         preparation: &mut TunePreparationTimes,
         cleanup: &'trial mut Option<Duration>,
     ) -> Self {
+        let (output_index, output_elements) = output;
         let gpu = staging.gpu;
         assert!(
             staging.buffer.is_none()
@@ -1138,15 +1163,10 @@ impl<'gpu, 'trial> Scratch<'gpu, 'trial> {
             .iter()
             .enumerate()
             .map(|(i, &size)| {
-                let device_local = if i > output_index {
-                    true
-                } else {
-                    class.device_local[if i == output_index { 3 } else { i }]
-                };
                 gpu.create_buffer(bg::BufferDesc {
                     name: "tune_scratch",
                     size: size as u64,
-                    memory: if device_local {
+                    memory: if device_local[i] {
                         bg::Memory::DeviceTransient
                     } else {
                         bg::Memory::Shared
@@ -1172,7 +1192,7 @@ impl<'gpu, 'trial> Scratch<'gpu, 'trial> {
             staging,
             staging_reused,
             output_index,
-            output_elements: class.output_elements(),
+            output_elements,
             encoder,
             cleanup,
         }
@@ -2016,9 +2036,9 @@ mod tests {
                     let mut prep = TunePreparationTimes::default();
                     let mut cleanup = None;
                     let mut scratch = Scratch::new(
-                        &class,
+                        &vec![device_local; sizes.len()],
                         &sizes,
-                        sizes.len() - 1,
+                        (sizes.len() - 1, class.output_elements()),
                         bytes,
                         &mut staging,
                         &mut prep,
@@ -2088,9 +2108,9 @@ mod tests {
             let mut cleanup = None;
             let result = (|| {
                 let mut scratch = Scratch::new(
-                    &class,
+                    &vec![true; sizes.len()],
                     &sizes,
-                    sizes.len() - 1,
+                    (sizes.len() - 1, class.output_elements()),
                     scratch_bytes(&sizes).unwrap(),
                     staging,
                     &mut prep,

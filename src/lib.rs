@@ -72,7 +72,7 @@ pub use train::{
     build_session_unoptimized, compile_training_graph,
 };
 pub use tune::{
-    MatmulTile, TuneClass, TuneConv2d, TuneDecision, TuneError, TuneOptions, TunePhaseTimes,
-    TunePreparationTimes, TuneQualificationTimes, TuneReport, TuneScope, TuneScratchStats,
-    TuneScratchUsage, TuneStaging, TuneStagingReuse,
+    MatmulTile, TuneAttention, TuneClass, TuneConv2d, TuneDecision, TuneError, TuneOptions,
+    TunePhaseTimes, TunePreparationTimes, TuneQualificationTimes, TuneReport, TuneScope,
+    TuneScratchStats, TuneScratchUsage, TuneStaging, TuneStagingReuse,
 };

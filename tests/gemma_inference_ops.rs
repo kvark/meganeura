@@ -227,17 +227,19 @@ fn chunked_relative_attention_matches_blocked_reference() {
 
 #[test]
 fn cached_block_writes_only_valid_rows_and_selects_last() {
-    for (max_seq, window, dim) in [
-        (6, 0, 4),
-        (96, 0, 4),
-        (96, 37, 4),
-        (96, 0, 64),
-        (96, 37, 80),
-        (6, 0, 512),
+    // Search once on a ragged sliding-window case; the other cases cover geometry.
+    for (max_seq, window, dim, tune) in [
+        (6, 0, 4, false),
+        (96, 0, 4, false),
+        (96, 37, 4, false),
+        (96, 0, 64, false),
+        (96, 37, 80, true),
+        (6, 0, 512, false),
     ] {
         let block = 3;
         let mut graph = Graph::new();
         let q = graph.input("q", &[block, 2 * dim]);
+        let q = graph.scale(q, 0.5);
         let new_k = graph.input("new_k", &[block, dim]);
         let new_v = graph.input("new_v", &[block, dim]);
         let k_cache = graph.parameter("k", &[max_seq, dim]);
@@ -252,8 +254,9 @@ fn cached_block_writes_only_valid_rows_and_selects_last() {
         let output = graph.prefix_last(attended, valid);
         graph.set_outputs(vec![output]);
 
-        let mut session =
-            meganeura::build(&graph, meganeura::SessionConfig::inference_from_env()).0;
+        let mut config = meganeura::SessionConfig::inference_from_env();
+        config.tune = false;
+        let mut session = meganeura::build(&graph, config).0;
         session.set_input("q", &vec![0.0; block * 2 * dim]);
         let new_k: Vec<_> = (0..block * dim)
             .map(|i| {
@@ -295,7 +298,7 @@ fn cached_block_writes_only_valid_rows_and_selects_last() {
         let queries: Vec<_> = (0..block * 2 * dim)
             .map(|i| (i as f32 * 0.7).sin())
             .collect();
-        session.set_input("q", &queries);
+        session.set_input("q", &queries.iter().map(|x| x * 2.0).collect::<Vec<_>>());
         for (i, (k, v)) in initial_k.iter_mut().zip(&mut initial_v).enumerate() {
             *k = (i as f32 * 0.3).sin() * 4.0;
             *v = (i as f32 * 0.4).cos();
@@ -348,6 +351,39 @@ fn cached_block_writes_only_valid_rows_and_selects_last() {
             session.step();
             session.wait();
             assert_close(&session.read_output(2 * dim), &expected, 1e-5);
+        }
+        if tune {
+            let before = session.read_output(2 * dim);
+            let report = session
+                .tune_with(meganeura::tune::TuneOptions {
+                    scope: meganeura::tune::TuneScope::Attention,
+                    max_time: std::time::Duration::from_secs(30),
+                    sample_pairs: 4,
+                    dispatches_per_sample: 1,
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(report.eligible_classes, 1);
+            assert!(!report.time_budget_exhausted);
+            assert!(!report.attention_outcomes.is_empty());
+            assert!(
+                report.attention_outcomes.iter().all(|o| o.qualified),
+                "{report:?}"
+            );
+            assert_eq!(
+                session.read_output(2 * dim),
+                before,
+                "tuning mutated live output"
+            );
+            session.step();
+            session.wait();
+            assert_close(&session.read_output(2 * dim), &before, 1e-5);
+            let encoded = serde_json::to_vec(&report).unwrap();
+            let decoded: meganeura::tune::TuneReport = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(
+                decoded.attention_outcomes.len(),
+                report.attention_outcomes.len()
+            );
         }
     }
 }

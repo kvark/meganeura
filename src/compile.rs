@@ -6,6 +6,33 @@ use std::collections::HashMap;
 mod softplus;
 mod split_k;
 
+/// Host layout of the cached block-attention WGSL uniform. Dispatch encoding,
+/// runtime binding and tuning all use this layout rather than indexing words.
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+pub(crate) struct CachedBlockAttentionParams {
+    pub window_size: u32,
+    pub num_heads: u32,
+    pub num_kv_heads: u32,
+    pub head_dim: u32,
+    pub block_len: u32,
+    pub max_seq: u32,
+    pub splits: u32,
+    pub chunk: u32,
+}
+
+impl CachedBlockAttentionParams {
+    pub fn from_words(words: &[u32]) -> Option<Self> {
+        bytemuck::try_from_bytes(bytemuck::cast_slice(words))
+            .ok()
+            .copied()
+    }
+
+    pub fn to_words(self) -> Vec<u32> {
+        bytemuck::cast_slice(std::slice::from_ref(&self)).to_vec()
+    }
+}
+
 /// Weight storage format for matmul B operands.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WeightFormat {
@@ -5110,6 +5137,16 @@ impl<'a> Compiler<'a> {
                 let valid_len_input = self.get_buffer(node.inputs[4]);
                 let block_len = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let max_seq = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
+                let mut params = CachedBlockAttentionParams {
+                    window_size,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    block_len,
+                    max_seq,
+                    splits: 0,
+                    chunk: 0,
+                };
                 // Flash-decoding split-K: for a single decode query past a
                 // threshold, split the KV range across workgroups per head
                 // and combine their online-softmax partials. Batched prefill
@@ -5118,7 +5155,8 @@ impl<'a> Compiler<'a> {
                 // to every query produces incorrect causal attention.
                 if block_len == 1 && max_seq > 64 {
                     let splits = (max_seq.div_ceil(32)).clamp(2, 16);
-                    let chunk = max_seq.div_ceil(splits);
+                    params.splits = splits;
+                    params.chunk = max_seq.div_ceil(splits);
                     let scratch_idx = self.plan.buffers.len() as u32;
                     self.plan.buffers.push(
                         block_len as usize
@@ -5134,16 +5172,7 @@ impl<'a> Compiler<'a> {
                         input_buffers: vec![q, k_cache, v_cache, kv_pos_input, valid_len_input],
                         output_buffer: partials,
                         extra_outputs: vec![],
-                        params: vec![
-                            window_size,
-                            num_heads,
-                            num_kv_heads,
-                            head_dim,
-                            block_len,
-                            max_seq,
-                            splits,
-                            chunk,
-                        ],
+                        params: params.to_words(),
                         use_coop: false,
                         use_small_tiles: false,
                         ..Default::default()
@@ -5154,16 +5183,7 @@ impl<'a> Compiler<'a> {
                         input_buffers: vec![partials],
                         output_buffer: out_buf,
                         extra_outputs: vec![],
-                        params: vec![
-                            window_size,
-                            num_heads,
-                            num_kv_heads,
-                            head_dim,
-                            block_len,
-                            max_seq,
-                            splits,
-                            chunk,
-                        ],
+                        params: params.to_words(),
                         use_coop: false,
                         use_small_tiles: false,
                         ..Default::default()
@@ -5175,16 +5195,7 @@ impl<'a> Compiler<'a> {
                         input_buffers: vec![q, k_cache, v_cache, kv_pos_input, valid_len_input],
                         output_buffer: out_buf,
                         extra_outputs: vec![],
-                        params: vec![
-                            window_size,
-                            num_heads,
-                            num_kv_heads,
-                            head_dim,
-                            block_len,
-                            max_seq,
-                            0,
-                            0,
-                        ],
+                        params: params.to_words(),
                         use_coop: false,
                         use_small_tiles: false,
                         ..Default::default()
