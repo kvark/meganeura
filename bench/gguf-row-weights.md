@@ -56,6 +56,8 @@ language quality or identical intermediate arithmetic across engines.
 The gap remains: decode is 1.82x/1.50x llama.cpp; prefill is 1.20x/1.36x.
 Next candidates are measured output-row grouping in GEMV and cooperative-matrix
 coverage. Fewer dispatches alone did not predict the pilot's winners.
+The [row-grouping follow-up](gemv-row-grouping.md) measures the first of these
+without changing the precision policy or tuning limits.
 
 452 CPU tests, the 22-test GGUF suite and the 17-test GEMV group pass, with GPU
 checks on both devices. The broad regression includes source restaging, odd
