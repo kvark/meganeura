@@ -3139,6 +3139,7 @@ pub struct Session {
     /// Caller-selected upper bound on the submissions used by `step()`.
     /// See [`Session::set_submission_chunks`]. Always at least 1.
     submission_chunks: usize,
+    replay_recorded: bool,
     sync_point: Option<blade_graphics::SyncPoint>,
     /// Calibrated timings harvested when the most recent submission completed.
     last_gpu_timings: Option<crate::profiler::GpuTimings>,
@@ -4011,6 +4012,7 @@ impl Session {
             groups,
             encoder,
             submission_chunks: 1,
+            replay_recorded: false,
             sync_point: None,
             gpu_timing,
             last_gpu_timings: None,
@@ -6969,6 +6971,11 @@ impl Session {
 
     /// Execute the full dispatch sequence (forward + backward + update).
     pub fn step(&mut self) {
+        let replay = std::env::var_os("MEGANEURA_REPLAY").is_some()
+            && !self.gpu_timing
+            && !self.debug
+            && self.plan.param_grad_pairs.is_empty()
+            && self.submission_chunks == 1;
         let _span = tracing::info_span!(
             "step",
             dispatches = self.plan.dispatches.len(),
@@ -6978,6 +6985,11 @@ impl Session {
         .entered();
         self.wait();
 
+        if replay && self.replay_recorded {
+            self.sync_point = Some(self.gpu.submit(&mut self.encoder));
+            return;
+        }
+        self.replay_recorded = false;
         self.encoder.start();
         self.profiled_pass_map.clear();
 
@@ -7339,6 +7351,7 @@ impl Session {
         }
 
         self.sync_point = Some(self.gpu.submit(&mut self.encoder));
+        self.replay_recorded = replay;
     }
 
     fn optimizer_len(plan: &ExecutionPlan, param: BufferRef) -> u32 {
