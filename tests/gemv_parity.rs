@@ -370,8 +370,7 @@ fn gemv_non_multiple_k() {
 }
 
 /// Every GEMV kernel must be correct at every shape the search may install.
-/// Plain, fused-add and transposed-B run together so eight sessions cover the
-/// 24 combinations while failures retain the shape and kernel name.
+/// Plain and transposed-B products, with and without addends, share each session.
 #[test]
 fn every_gemv_shape_computes_the_same_product() {
     use meganeura::compile::{CompileOptions, ShaderEntry};
@@ -408,6 +407,7 @@ fn every_gemv_shape_computes_the_same_product() {
     let want = cpu_gemv(&a, &b, K, N);
     let want_add = cpu_gemv_add(&a, &b, &addend, K, N);
     let want_bt = cpu_gemv_bt(&a, &b_t, K, N);
+    let want_bt_add: Vec<_> = want_bt.iter().zip(&addend).map(|(a, b)| a + b).collect();
 
     for threads in GemvShape::WIDTHS {
         for reduction in [GemvReduction::Tree, GemvReduction::Subgroup] {
@@ -416,15 +416,19 @@ fn every_gemv_shape_computes_the_same_product() {
             let x = g.input("x", &[1, K]);
             let x_add = g.input("x_add", &[1, K]);
             let x_bt = g.input("x_bt", &[1, K]);
+            let x_bt_add = g.input("x_bt_add", &[1, K]);
             let w = g.input("w", &[K, N]);
             let w_add = g.input("w_add", &[K, N]);
             let w_t = g.input("w_t", &[N, K]);
+            let w_t_add = g.input("w_t_add", &[N, K]);
             let d = g.input("d", &[1, N]);
             let plain = g.matmul(x, w);
             let product = g.matmul(x_add, w_add);
             let add = g.add(product, d);
             let bt = g.matmul_bt(x_bt, w_t);
-            g.set_outputs(vec![plain, add, bt]);
+            let bt_product = g.matmul_bt(x_bt_add, w_t_add);
+            let bt_add = g.add(bt_product, d);
+            g.set_outputs(vec![plain, add, bt, bt_add]);
 
             let config = SessionConfig {
                 mode: Mode::Inference,
@@ -440,6 +444,7 @@ fn every_gemv_shape_computes_the_same_product() {
                 ShaderEntry::MatMulGemv,
                 ShaderEntry::MatMulGemvAdd,
                 ShaderEntry::MatMulGemvBT,
+                ShaderEntry::MatMulGemvBTAdd,
             ] {
                 assert_eq!(
                     shaders
@@ -450,19 +455,24 @@ fn every_gemv_shape_computes_the_same_product() {
                     "{shape:?}: missing {expected:?}; got {shaders:?}"
                 );
             }
-            for name in ["x", "x_add", "x_bt"] {
+            for name in ["x", "x_add", "x_bt", "x_bt_add"] {
                 s.set_input(name, &a);
             }
             s.set_input("w", &b);
             s.set_input("w_add", &b);
             s.set_input("w_t", &b_t);
+            s.set_input("w_t_add", &b_t);
             s.set_input("d", &addend);
             s.step();
             s.wait();
-            for (index, (label, expected)) in
-                [("plain", &want), ("add", &want_add), ("bt", &want_bt)]
-                    .into_iter()
-                    .enumerate()
+            for (index, (label, expected)) in [
+                ("plain", &want),
+                ("add", &want_add),
+                ("bt", &want_bt),
+                ("bt_add", &want_bt_add),
+            ]
+            .into_iter()
+            .enumerate()
             {
                 let mut got = vec![0.0; N];
                 s.read_output_by_index(index, &mut got);
