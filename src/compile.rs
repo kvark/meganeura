@@ -1,3 +1,4 @@
+use crate::codegen::ShaderGroup;
 use crate::graph::{DType, Graph, Node, NodeId, Op, PairwiseGradKind};
 use crate::schedule::{PointwiseDAG, Pw, ReductionEpilogue, ReductionKernel};
 use serde::{Deserialize, Serialize};
@@ -138,7 +139,7 @@ pub struct CompileOptions {
     /// Enable the experimental reduced-precision cooperative flash
     /// backward kernels.
     pub flash_backward_coop: bool,
-    /// Starting workgroup width and cross-lane reduction for the K-split
+    /// Starting workgroup geometry and cross-lane reduction for the K-split
     /// GEMV family, overriding each group's own default.
     ///
     /// This is a starting point, not a decision: `Session::tune_with`
@@ -2548,8 +2549,7 @@ fn binary_shader_to_pointwise(shader: &ShaderEntry) -> Option<PointwiseDAG> {
 
 const MAX_COMPUTE_WORKGROUPS_PER_DIMENSION: u32 = 65_535;
 
-/// Tile a scalar matmul across Y and Z without exceeding the portable
-/// per-dimension compute-dispatch limit.
+/// Tile row-GEMV workgroups across X and Y within the portable limit.
 pub(crate) fn row_gemv_workgroups(n: u32) -> [u32; 3] {
     // Large vocabularies can exceed the portable X workgroup limit. Spread
     // rows over Y as well; the kernel flattens the actual dispatch grid.
@@ -2602,6 +2602,9 @@ impl<'a> Compiler<'a> {
         coop_caps: crate::codegen::CoopCaps,
         allow_reduced_precision_attention_backward: bool,
     ) -> Self {
+        if let Some(shape) = options.gemv_shape {
+            shape.validate();
+        }
         Self {
             graph,
             plan: ExecutionPlan {
@@ -3107,7 +3110,10 @@ impl<'a> Compiler<'a> {
                                     | WeightFormat::Q6K
                                     | WeightFormat::Q3K
                             ),
-                        gemv_shape: self.options.gemv_shape,
+                        gemv_shape: self
+                            .options
+                            .gemv_shape
+                            .map(|s| s.for_group(ShaderGroup::MatMulGemv)),
                         ..Default::default()
                     });
                 } else {
@@ -3184,7 +3190,9 @@ impl<'a> Compiler<'a> {
                     // sees packed data.
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::MatMulGemvBT,
-                        workgroups: row_gemv_workgroups(n),
+                        workgroups: row_gemv_workgroups(
+                            n.div_ceil(self.options.gemv_shape.map_or(1, |s| s.bt_rows)),
+                        ),
                         input_buffers: vec![a, b],
                         output_buffer: out_buf,
                         extra_outputs: vec![],
@@ -3192,7 +3200,10 @@ impl<'a> Compiler<'a> {
                         use_coop: false,
                         use_small_tiles: false,
                         weight_format: wf,
-                        gemv_shape: self.options.gemv_shape,
+                        gemv_shape: self
+                            .options
+                            .gemv_shape
+                            .map(|s| s.for_group(ShaderGroup::MatMulGemvBT)),
                         ..Default::default()
                     });
                 } else {
@@ -3309,7 +3320,10 @@ impl<'a> Compiler<'a> {
                                     | WeightFormat::Q6K
                                     | WeightFormat::Q3K
                             ),
-                        gemv_shape: self.options.gemv_shape,
+                        gemv_shape: self
+                            .options
+                            .gemv_shape
+                            .map(|s| s.for_group(ShaderGroup::MatMulGemvAdd)),
                         ..Default::default()
                     });
                 } else {
@@ -3381,7 +3395,9 @@ impl<'a> Compiler<'a> {
                         ShaderEntry::FusedMatMulBTAdd
                     },
                     workgroups: if gemv {
-                        row_gemv_workgroups(n)
+                        row_gemv_workgroups(
+                            n.div_ceil(self.options.gemv_shape.map_or(1, |s| s.bt_rows)),
+                        )
                     } else {
                         matmul_workgroups(m, n, 64)
                     },
