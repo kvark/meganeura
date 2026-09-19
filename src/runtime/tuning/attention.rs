@@ -93,6 +93,11 @@ impl TuneAttention {
         partials: BufferRef,
         splits: u32,
     ) -> Vec<Dispatch> {
+        let old_entry = format!("{:?}", source.shader);
+        let label = |entry: &ShaderEntry| match source.label.rsplit_once(&old_entry) {
+            Some((prefix, suffix)) => format!("{prefix}{entry:?}{suffix}"),
+            None => format!("{entry:?}"),
+        };
         let mut first = source.clone();
         first.params[6] = if splits == 1 { 0 } else { splits };
         first.params[7] = if splits == 1 {
@@ -102,15 +107,18 @@ impl TuneAttention {
         };
         first.output_buffer = output;
         first.shader = ShaderEntry::CachedBlockAttention;
+        first.label = label(&first.shader);
         first.workgroups = [self.block_len, self.num_heads, 1];
         if splits == 1 {
             return vec![first];
         }
         first.shader = ShaderEntry::CachedBlockAttentionSplit;
+        first.label = label(&first.shader);
         first.workgroups = [self.block_len, splits, self.num_heads];
         first.output_buffer = partials;
         let mut combine = first.clone();
         combine.shader = ShaderEntry::CachedBlockAttentionCombine;
+        combine.label = label(&combine.shader);
         combine.input_buffers = vec![partials];
         combine.output_buffer = output;
         combine.workgroups = [self.block_len, self.num_heads, 1];
@@ -821,6 +829,7 @@ mod tests {
     fn attention_contract_and_oracles_cover_geometry_and_corruption() {
         let d = Dispatch {
             shader: ShaderEntry::CachedBlockAttentionSplit,
+            label: "node: CachedBlockAttentionSplit[3]".into(),
             input_buffers: (0..5).map(BufferRef).collect(),
             output_buffer: BufferRef(6),
             params: vec![3, 2, 1, 5, 3, 7, 4, 2],
@@ -836,6 +845,9 @@ mod tests {
             let sequence = key.sequence(&d, BufferRef(5), BufferRef(6), count);
             assert_eq!(sequence.len(), if count == 1 { 1 } else { 2 });
             assert_eq!(sequence.last().unwrap().output_buffer, BufferRef(5));
+            for d in &sequence {
+                assert_eq!(d.label, format!("node: {:?}[3]", d.shader));
+            }
             assert_eq!(sizes[5], 3 * 2 * 5 * 4);
             if count != 1 {
                 assert_eq!(sequence[0].params[6..], [count, 7u32.div_ceil(count)]);
