@@ -148,6 +148,81 @@ fn tune_preserves_correctness() {
 
 #[test]
 #[ignore = "GPU tuning requires an idle device"]
+fn reduced_storage_tiles_preserve_outputs() {
+    use meganeura::compile::{ShaderEntry, WeightFormat};
+    for (format, transposed) in [
+        (WeightFormat::F16, false),
+        (WeightFormat::F16, true),
+        (WeightFormat::Q4, false),
+    ] {
+        let (m, n, k) = (33, 64, 256);
+        let mut graph = Graph::new();
+        let x = graph.input("x", &[m, k]);
+        let shape = if transposed { [n, k] } else { [k, n] };
+        let w = if format == WeightFormat::F16 {
+            graph.parameter_f16("w", &shape)
+        } else {
+            graph.parameter_q4("w", &shape)
+        };
+        let y = if transposed {
+            graph.matmul_bt(x, w)
+        } else {
+            graph.matmul(x, w)
+        };
+        graph.set_outputs(vec![y]);
+        let mut config = SessionConfig::inference_from_env();
+        config.runtime.coop = CoopPolicy::Disabled;
+        config.tune = false;
+        let mut session = build(&graph, config).0;
+        session.set_input(
+            "x",
+            &(0..m * k)
+                .map(|i| (i % 23) as f32 * 0.025 - 0.2)
+                .collect::<Vec<_>>(),
+        );
+        session.set_parameter(
+            "w",
+            &(0..k * n)
+                .map(|i| (i % 17) as f32 * 0.01 - 0.1)
+                .collect::<Vec<_>>(),
+        );
+        session.step();
+        session.wait();
+        let before = session.read_output(m * n);
+        let report = session
+            .tune_with(TuneOptions {
+                max_time: Duration::from_secs(30),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(report.eligible_classes, 1);
+        assert_eq!(report.outcomes.len(), 1);
+        let outcome = &report.outcomes[0];
+        assert!(outcome.qualified, "{outcome:?}");
+        assert_eq!(outcome.class.weight_format, format);
+        assert_eq!(
+            outcome.class.shader,
+            if transposed {
+                ShaderEntry::MatMulBT
+            } else {
+                ShaderEntry::MatMul
+            }
+        );
+        assert_eq!(
+            before,
+            session.read_output(m * n),
+            "tuning touched the live output"
+        );
+        session.step();
+        session.wait();
+        for (a, b) in session.read_output(m * n).iter().zip(before) {
+            assert!((a - b).abs() <= 1e-5 + b.abs() * 2e-4);
+        }
+    }
+}
+
+#[test]
+#[ignore = "GPU tuning requires an idle device"]
 fn tune_preserves_training_parameters_gradients_and_moments() {
     for staging in [TuneStaging::Shared, TuneStaging::Download] {
         for reuse in [TuneStagingReuse::Fresh, TuneStagingReuse::SameSize] {
