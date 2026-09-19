@@ -407,6 +407,8 @@ impl Session {
             swap.left
                 .apply(&mut other.plan.dispatches[swap.index], &swap.class);
         }
+        self.pipelines.select(&self.plan.dispatches);
+        other.pipelines.select(&other.plan.dispatches);
         Ok(swaps.len())
     }
 
@@ -532,6 +534,7 @@ impl Session {
             self.wait();
             self.pipelines.discard_unused_convolutions(&gpu, &self.plan);
         }
+        self.pipelines.select(&self.plan.dispatches);
         report.scratch = Some(staging.stats);
         report.elapsed = start.elapsed();
         report.time_budget_exhausted |= report.elapsed >= options.max_time;
@@ -1887,6 +1890,7 @@ mod tests {
             alternative.apply(&mut b.plan.dispatches[index], &class.key);
         }
         b.pipelines.discard_unused_convolutions(&gpu, &b.plan);
+        b.pipelines.select(&b.plan.dispatches);
         if convolution {
             assert!(b.pipelines.map.len() < pipeline_count);
         }
