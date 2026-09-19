@@ -607,7 +607,7 @@ impl TuneClass {
             self.shader,
             ShaderEntry::MatMulGemvBT | ShaderEntry::MatMulGemvBTAdd
         ) {
-            [self.n, 1, 1]
+            crate::compile::row_gemv_workgroups(self.n)
         } else {
             [self.n / 4, 1, 1]
         }
