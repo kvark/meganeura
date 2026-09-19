@@ -2527,6 +2527,54 @@ fn compute_groups(dispatches: &[Dispatch]) -> Vec<std::ops::Range<usize>> {
     groups
 }
 
+/// Record the compiled graph, leaving the last chunk open for appended work.
+#[allow(clippy::too_many_arguments)]
+fn record_groups(
+    gpu: &Gpu,
+    encoder: &mut blade_graphics::CommandEncoder,
+    sync_point: &mut Option<blade_graphics::SyncPoint>,
+    plan: &ExecutionPlan,
+    groups: &[std::ops::Range<usize>],
+    pipelines: &Pipelines,
+    buffers: &[blade_graphics::Buffer],
+    chunks: usize,
+) {
+    let total = groups.len();
+    let per_chunk = total.div_ceil(chunks.min(total).max(1));
+    let chunk_count = if total == 0 {
+        0
+    } else {
+        total.div_ceil(per_chunk)
+    };
+    let mut start = 0;
+    let mut chunk_index = 0;
+    while start < total {
+        let end = (start + per_chunk).min(total);
+        {
+            let label = format!("step {}/{}", chunk_index + 1, chunk_count);
+            let mut pass = encoder.compute(&label);
+            for (gi, group) in groups.iter().enumerate().take(end).skip(start) {
+                if gi > start {
+                    pass.barrier();
+                }
+                for i in group.clone() {
+                    let dispatch = &plan.dispatches[i];
+                    let pipeline = pipelines.get(i);
+                    let mut pc = pass.with(pipeline);
+                    Session::bind_dispatch(buffers, dispatch, &mut pc);
+                    pc.dispatch(dispatch.workgroups);
+                }
+            }
+        }
+        start = end;
+        chunk_index += 1;
+        if start < total {
+            *sync_point = Some(gpu.submit(encoder));
+            encoder.start();
+        }
+    }
+}
+
 // ---- Session ----
 
 /// A compiled, ready-to-execute GPU session.
@@ -4276,6 +4324,8 @@ impl Session {
     /// upper bound, since a short plan can produce fewer chunks. Profile the
     /// end-to-end workload on the target device: extra submissions have CPU
     /// and driver overhead and can make either workload slower.
+    /// [`Self::tune_submissions`] can measure this choice on initialized inputs
+    /// when optimizing this graph's latency without competing queue users.
     ///
     /// Correctness across the resulting submission boundaries does not need
     /// extra synchronization. Blade ends every command buffer with a
@@ -7105,41 +7155,16 @@ impl Session {
             // typically) can slot its own work between them. The chunk
             // boundary needs no explicit barrier: blade closes each command
             // buffer with a conservative global one.
-            let total = self.groups.len();
-            let per_chunk = total.div_ceil(self.submission_chunks.min(total).max(1));
-            let mut start = 0;
-            let chunk_count = if total == 0 {
-                0
-            } else {
-                total.div_ceil(per_chunk)
-            };
-            let mut chunk_index = 0;
-            while start < total {
-                let end = (start + per_chunk).min(total);
-                {
-                    let label = format!("step {}/{}", chunk_index + 1, chunk_count);
-                    let mut pass = self.encoder.compute(&label);
-                    for gi in start..end {
-                        if gi > start {
-                            pass.barrier();
-                        }
-                        let group = self.groups[gi].clone();
-                        for i in group {
-                            let dispatch = &self.plan.dispatches[i];
-                            let pipeline = self.pipelines.get(i);
-                            let mut pc = pass.with(pipeline);
-                            Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
-                            pc.dispatch(dispatch.workgroups);
-                        }
-                    }
-                }
-                start = end;
-                chunk_index += 1;
-                if start < total {
-                    self.sync_point = Some(self.gpu.submit(&mut self.encoder));
-                    self.encoder.start();
-                }
-            }
+            record_groups(
+                &self.gpu,
+                &mut self.encoder,
+                &mut self.sync_point,
+                &self.plan,
+                &self.groups,
+                &self.pipelines,
+                &self.buffers,
+                self.submission_chunks,
+            );
         }
 
         // Temporal grad accumulation: add this step's (overwritten) grads
