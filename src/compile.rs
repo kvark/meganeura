@@ -5099,8 +5099,18 @@ impl<'a> Compiler<'a> {
                 // contexts keep the fused single dispatch: its per-token
                 // loop fits one reduction round and a combine would only
                 // add one.
-                if max_seq > 64 {
-                    let splits = (max_seq.div_ceil(32)).clamp(2, 16);
+                let splits = std::env::var("MEGANEURA_ATTENTION_SPLITS")
+                    .ok()
+                    .map(|s| s.parse::<u32>().expect("attention split count"))
+                    .unwrap_or_else(|| {
+                        if max_seq > 64 {
+                            (max_seq.div_ceil(32)).clamp(2, 16)
+                        } else {
+                            1
+                        }
+                    });
+                assert!((1..=16).contains(&splits));
+                if splits > 1 {
                     let chunk = max_seq.div_ceil(splits);
                     let scratch_idx = self.plan.buffers.len() as u32;
                     self.plan.buffers.push(
