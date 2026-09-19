@@ -1162,6 +1162,7 @@ enum Variant {
     ),
     /// Non-f32 weight storage (f16, Q4, Q8).
     Weight(ShaderEntry, crate::compile::WeightFormat),
+    WeightSmall(ShaderEntry, crate::compile::WeightFormat),
     /// Cooperative-matrix and small-tile (32×32) forms. Unlike every other
     /// axis these are pure performance: the scalar pipeline computes the
     /// same thing, so falling back to it is safe.
@@ -1210,6 +1211,7 @@ impl Variant {
             | Variant::GemvIntDot(ref e, _, _)
             | Variant::GemvRmsNormIntDot(ref e, _, _)
             | Variant::Weight(ref e, _)
+            | Variant::WeightSmall(ref e, _)
             | Variant::Coop(ref e)
             | Variant::CoopCompensated(ref e)
             | Variant::Horizontal(ref e, _, _)
@@ -1249,6 +1251,7 @@ impl Variant {
                 shape.threads, shape.reduction
             ),
             Variant::Weight(ref e, format) => format!("{e:?}:weight-{format:?}"),
+            Variant::WeightSmall(ref e, format) => format!("{e:?}:weight-{format:?}-small-tile"),
             Variant::Coop(ref e) => format!("{e:?}:cooperative"),
             Variant::CoopCompensated(ref e) => format!("{e:?}:cooperative-compensated"),
             Variant::Horizontal(ref e, n, kind) => format!("{e:?}:horizontal-{n}-{kind:?}"),
@@ -1374,7 +1377,10 @@ impl Pipelines {
             {
                 attention_entries.insert((dispatch.shader.clone(), dispatch.params[3]));
             }
-            if dispatch.use_small_tiles && !resolves_to_epilogue {
+            if dispatch.use_small_tiles
+                && !dispatch.weight_format.uses_reduced_storage()
+                && !resolves_to_epilogue
+            {
                 needed_small.insert(group);
                 entries_for_group
                     .entry(group)
@@ -1747,6 +1753,28 @@ impl Pipelines {
                 );
             }
         }
+        for dispatch in &plan.dispatches {
+            if dispatch.use_small_tiles
+                && dispatch.weight_format.uses_reduced_storage()
+                && epilogue_pipeline_key(dispatch).is_none()
+            {
+                let key = Variant::WeightSmall(dispatch.shader.clone(), dispatch.weight_format);
+                if let std::collections::hash_map::Entry::Vacant(slot) = map.entry(key.clone()) {
+                    let module = tuning::tile_module(
+                        dispatch,
+                        crate::tune::MatmulTile::Tile32,
+                        matmul_knobs,
+                    );
+                    let shader = create_gen_shader(gpu, module, wgsl_dump_dir);
+                    slot.insert(create_profiled_pipeline(
+                        gpu,
+                        key.label(),
+                        &shader_data_layout(&dispatch.shader),
+                        shader.at(dispatch.shader.entry_point()),
+                    ));
+                }
+            }
+        }
 
         // Compile epilogue-fused pipelines for dispatches with non-empty epilogue.
         // Prefer the new MatMulEpilogue (PointwiseDAG); fall back to legacy
@@ -2016,6 +2044,9 @@ impl Pipelines {
             out.push(Variant::Gemv(entry.clone(), dispatch.weight_format, shape));
         }
         if dispatch.weight_format.uses_reduced_storage() {
+            if dispatch.use_small_tiles {
+                out.push(Variant::WeightSmall(entry.clone(), dispatch.weight_format));
+            }
             out.push(Variant::Weight(entry.clone(), dispatch.weight_format));
         }
         if dispatch.use_coop {
@@ -4565,6 +4596,7 @@ mod variant_tests {
                 d.weight_format = crate::compile::WeightFormat::F16;
             }),
             vec![
+                Variant::WeightSmall(ShaderEntry::MatMul, crate::compile::WeightFormat::F16),
                 Variant::Weight(ShaderEntry::MatMul, crate::compile::WeightFormat::F16),
                 Variant::Coop(ShaderEntry::MatMul),
                 Variant::SmallTile(ShaderEntry::MatMul),

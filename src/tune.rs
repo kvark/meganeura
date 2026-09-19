@@ -6,8 +6,8 @@
 //! with no precision or binding-layout changes.
 //! Measurements use synthetic, private scratch, not a live training step.
 //! Explicit split-K probes measure complete sequences without installing them.
-//! GEMV shape changes leave packed-weight decoding intact, so reduced-storage
-//! decode kernels participate in that axis without changing their arithmetic.
+//! Scalar tile and GEMV shape changes leave packed-weight decoding intact, so
+//! reduced-storage kernels participate without changing their arithmetic.
 
 use crate::codegen::CoopConfig;
 use crate::compile::{Dispatch, ShaderEntry};
@@ -195,8 +195,8 @@ pub enum MatmulTile {
     ///
     /// Unlike the tiled entries this changes neither the shader entry, the
     /// workgroup count, nor the buffer layout — only how the threads inside a
-    /// workgroup divide K and recombine. It is therefore the one candidate
-    /// that applies to reduced-storage weights too: the decoder is untouched.
+    /// workgroup divide K and recombine. Like scalar tiles, it also applies
+    /// to reduced-storage weights without changing the decoder.
     Gemv(crate::codegen::GemvShape),
 }
 
@@ -351,6 +351,7 @@ impl MatmulTile {
         let mut sizes = class.buffer_sizes()?;
         if let Self::CooperativeF32 { tile_size } = self {
             if class.conv2d.is_some()
+                || class.weight_format.uses_reduced_storage()
                 || !matches!(tile_size, 8 | 16)
                 || !class.n.is_multiple_of(16)
                 || (matches!(
@@ -391,7 +392,6 @@ impl MatmulTile {
 
 impl TuneClass {
     pub(crate) fn from_dispatch(dispatch: &Dispatch, config: Option<&CoopConfig>) -> Option<Self> {
-        let gemv = gemv_group(&dispatch.shader).is_some();
         let addend = matches!(
             dispatch.shader,
             ShaderEntry::FusedMatMulAdd | ShaderEntry::MatMulGemvAdd
@@ -413,11 +413,7 @@ impl TuneClass {
                 | ShaderEntry::Conv2dGradWeightGemmSmall
         ) || dispatch.use_coop_compensated
             || (dispatch.use_coop && dispatch.use_small_tiles)
-            // Packed storage changes the bytes behind B, not the arithmetic
-            // the tiled kernels do around it, so it stays out of the tiled
-            // search. The GEMV shape axis leaves the decoder alone and is the
-            // one candidate that can carry a packed weight.
-            || (!gemv && dispatch.weight_format.uses_reduced_storage())
+            || (dispatch.use_coop && dispatch.weight_format.uses_reduced_storage())
             || dispatch.horizontal_batch >= 2
             || dispatch.matmul_prologue.is_some()
             || dispatch.matmul_epilogue.is_some()
@@ -442,7 +438,11 @@ impl TuneClass {
                 | ShaderEntry::Conv2dGradInputGemm
                 | ShaderEntry::Conv2dGradWeightGemm
         ) {
-            if dispatch.use_coop || dispatch.use_small_tiles || dispatch.scalar_fallback.is_some() {
+            if dispatch.use_coop
+                || dispatch.use_small_tiles
+                || dispatch.scalar_fallback.is_some()
+                || dispatch.weight_format.uses_reduced_storage()
+            {
                 return None;
             }
             Some(TuneConv2d::from_params(&dispatch.params)?)
@@ -665,7 +665,8 @@ impl TuneClass {
         [
             Some(MatmulTile::Tile64),
             Some(MatmulTile::Tile32),
-            MatmulTile::native_cooperative(config),
+            MatmulTile::native_cooperative(config)
+                .filter(|_| !self.weight_format.uses_reduced_storage()),
         ]
         .into_iter()
         .flatten()
@@ -1330,7 +1331,7 @@ mod tests {
         let mut variants = vec![base.clone(); 10];
         variants[0].use_coop = true;
         variants[1].horizontal_batch = 2;
-        variants[2].weight_format = crate::compile::WeightFormat::F16;
+        variants[2].use_coop_compensated = true;
         variants[3].extra_outputs.push(crate::compile::BufferRef(3));
         variants[4].workgroups[2] = 2;
         variants[5].shader = ShaderEntry::MatMulGemv;

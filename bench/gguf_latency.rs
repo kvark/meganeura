@@ -71,6 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tuning.push(session.tune_with(meganeura::tune::TuneOptions {
                 max_time: Duration::from_secs(tune_seconds),
                 max_classes: 64,
+                max_scratch_bytes: 256 * 1024 * 1024,
                 ..Default::default()
             })?);
         }

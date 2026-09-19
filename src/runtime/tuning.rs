@@ -95,7 +95,7 @@ impl Pipelines {
     }
 }
 
-fn tile_module(
+pub(super) fn tile_module(
     dispatch: &Dispatch,
     tile: MatmulTile,
     knobs: crate::codegen::MatmulKnobs,
@@ -122,6 +122,21 @@ fn tile_module(
         return crate::codegen::generate_module_gemv(group, dispatch.weight_format, shape);
     }
     let selected_entry = tile.shader(entry);
+    if dispatch.weight_format.uses_reduced_storage() {
+        return crate::codegen::generate_matmul_with_epilogue(
+            selected_entry.shader_group(),
+            crate::codegen::EpilogueSource::Ops(&[]),
+            crate::codegen::MatMulOptions {
+                format: dispatch.weight_format,
+                tile: match tile {
+                    MatmulTile::Tile32 => crate::codegen::MatMulTile::Small,
+                    MatmulTile::Tile64 => crate::codegen::MatMulTile::Large,
+                    _ => unreachable!("reduced storage only changes scalar tile geometry"),
+                },
+                knobs,
+            },
+        );
+    }
     if let MatmulTile::SpecializedConv { k_tile, .. } = tile {
         let params = super::Conv2dParams::from(dispatch);
         return crate::codegen::generate_conv_module(
@@ -163,6 +178,13 @@ fn tile_variant(dispatch: &Dispatch, tile: MatmulTile) -> Variant {
     }
     if let MatmulTile::SpecializedConv { k_tile, .. } = tile {
         return Variant::SpecializedConv(tile.shader(entry), dispatch.params.clone(), k_tile);
+    }
+    if dispatch.weight_format.uses_reduced_storage() {
+        return match tile {
+            MatmulTile::Tile32 => Variant::WeightSmall(entry.clone(), dispatch.weight_format),
+            MatmulTile::Tile64 => Variant::Weight(entry.clone(), dispatch.weight_format),
+            _ => unreachable!("reduced storage only changes scalar tile geometry"),
+        };
     }
     if matches!(
         entry,
@@ -410,9 +432,9 @@ impl Session {
     /// convolution keys include batch, channels, spatial extents, kernel, stride
     /// and padding. Index decomposition uses exact integer arithmetic.
     /// Cooperative convolutions remain excluded.
-    /// GEMV width/reduction candidates include reduced-storage weights.
+    /// Scalar tile and GEMV width/reduction candidates include reduced-storage weights.
     /// Other prologues/epilogues, horizontal packs, f16-input cooperative,
-    /// non-GEMV reduced-storage and overlapping-binding dispatches are excluded.
+    /// cooperative reduced-storage and overlapping-binding dispatches are excluded.
     /// Winners live in this session, not the plan cache.
     /// Only selected dispatch geometry and pipeline resources change. No graph
     /// execution occurs, including when an optimizer or external buffer is bound.
