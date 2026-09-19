@@ -71,6 +71,10 @@ fn evaluate(g: &Graph, leaves: &HashMap<String, Vec<f64>>) -> Vec<Vec<f64>> {
             Op::Input { name } | Op::Parameter { name } => leaves[name].clone(),
             Op::Constant { data } => data.iter().map(|&v| f64::from(v)).collect(),
             Op::Identity => inputs[0].clone(),
+            Op::BroadcastInner { inner } => inputs[0]
+                .iter()
+                .flat_map(|&v| std::iter::repeat_n(v, *inner as usize))
+                .collect(),
             Op::Add => inputs[0]
                 .iter()
                 .zip(inputs[1])
