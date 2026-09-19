@@ -588,8 +588,8 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
         ShaderGroup::Reduce => ShaderModule::new(include_str!("shaders/reduce.wgsl")),
         ShaderGroup::Softmax => ShaderModule::new(include_str!("shaders/softmax.wgsl")),
         ShaderGroup::CrossEntropy => ShaderModule::new(include_str!("shaders/cross_entropy.wgsl")),
-        ShaderGroup::RmsNorm => ShaderModule::new(include_str!("shaders/rms_norm.wgsl")),
-        ShaderGroup::RmsNormAdd => ShaderModule::new(include_str!("shaders/rms_norm_add.wgsl")),
+        ShaderGroup::RmsNorm => generate_rms_norm_module(false),
+        ShaderGroup::RmsNormAdd => generate_rms_norm_module(true),
         ShaderGroup::CachedBlockAttentionSplit => {
             ShaderModule::new(include_str!("shaders/cached_block_attention_split.wgsl"))
         }
@@ -732,6 +732,19 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
         }
         ShaderGroup::GradAccum => ShaderModule::new(include_str!("shaders/grad_accum.wgsl")),
     }
+}
+
+fn generate_rms_norm_module(add_residual: bool) -> ShaderModule {
+    let epilogue = if add_residual {
+        include_str!("shaders/rms_norm_add_epilogue.wgsl")
+    } else {
+        include_str!("shaders/rms_norm_epilogue.wgsl")
+    };
+    let source = preprocess(
+        include_str!("shaders/rms_norm.wgsl"),
+        &[("$EPILOGUE", epilogue)],
+    );
+    ShaderModule::new(&source)
 }
 
 /// The cooperative-matrix form of a matmul group: whether it fuses a
@@ -2200,94 +2213,15 @@ fn gemv_source(group: ShaderGroup, mode: WeightFormat) -> String {
 /// RmsNorm prologue in, matching the non-integer fused form.
 pub(crate) fn generate_module_gemv_int_dot(
     group: ShaderGroup,
-    format: crate::compile::WeightFormat,
+    format: WeightFormat,
     shape: GemvShape,
     packed_dot: bool,
     norm: bool,
 ) -> ShaderModule {
-    // The scalar expansion exists for devices without the integer-dot
-    // capability. It computes the same sums: each byte is sign-extended and
-    // multiplied exactly, so results are identical on both sides — which
-    // keeps a device-capability choice out of the plan's arithmetic.
-    let helper = match (format, packed_dot) {
-        // Q4_0 nibbles are 0..15, so their bytes never carry a sign bit;
-        // only the Q8_1 operand needs extending.
-        (crate::compile::WeightFormat::Q40, true) => {
-            "fn dot_q4_q8_packed(q4: u32, q8: u32) -> i32 {\n\
-                 return dot4I8Packed(q4, q8);\n\
-             }"
-        }
-        (crate::compile::WeightFormat::Q40, false) => {
-            "fn dot_q4_q8_packed(q4: u32, q8: u32) -> i32 {\n\
-                 var sum: i32 = 0;\n\
-                 for (var shift = 0u; shift < 32u; shift += 8u) {\n\
-                     let w = i32((q4 >> shift) & 0xFFu);\n\
-                     let byte = i32((q8 >> shift) & 0xFFu);\n\
-                     let a = select(byte, byte - 256, byte >= 128);\n\
-                     sum += w * a;\n\
-                 }\n\
-                 return sum;\n\
-             }"
-        }
-        // Q8 weights are signed int8 quants, so both operands extend.
-        (crate::compile::WeightFormat::Q8, true) => {
-            "fn dot_q8_q8_packed(a: u32, b: u32) -> i32 {\n\
-                 return dot4I8Packed(a, b);\n\
-             }"
-        }
-        (crate::compile::WeightFormat::Q8, false) => {
-            "fn dot_q8_q8_packed(a: u32, b: u32) -> i32 {\n\
-                 var sum: i32 = 0;\n\
-                 for (var shift = 0u; shift < 32u; shift += 8u) {\n\
-                     let x = i32((a >> shift) & 0xFFu);\n\
-                     let y = i32((b >> shift) & 0xFFu);\n\
-                     sum += select(x, x - 256, x >= 128) * select(y, y - 256, y >= 128);\n\
-                 }\n\
-                 return sum;\n\
-             }"
-        }
-        (
-            crate::compile::WeightFormat::Q4K
-            | crate::compile::WeightFormat::Q5K
-            | crate::compile::WeightFormat::Q6K
-            | crate::compile::WeightFormat::Q3K,
-            true,
-        ) => {
-            "fn dot_qk_packed(a: u32, b: u32) -> i32 {\n\
-                 return dot4I8Packed(a, b);\n\
-             }"
-        }
-        // K-quant packed quants stay non-negative everywhere but Q3_K,
-        // whose hmask-adjusted value is -4..3 and so extends both operands.
-        (
-            crate::compile::WeightFormat::Q4K
-            | crate::compile::WeightFormat::Q5K
-            | crate::compile::WeightFormat::Q6K,
-            false,
-        ) => {
-            "fn dot_qk_packed(a: u32, b: u32) -> i32 {\n\
-                 var sum: i32 = 0;\n\
-                 for (var shift = 0u; shift < 32u; shift += 8u) {\n\
-                     let w = i32((a >> shift) & 0xFFu);\n\
-                     let byte = i32((b >> shift) & 0xFFu);\n\
-                     let u = select(byte, byte - 256, byte >= 128);\n\
-                     sum += w * u;\n\
-                 }\n\
-                 return sum;\n\
-             }"
-        }
-        (crate::compile::WeightFormat::Q3K, false) => {
-            "fn dot_qk_packed(a: u32, b: u32) -> i32 {\n\
-                 var sum: i32 = 0;\n\
-                 for (var shift = 0u; shift < 32u; shift += 8u) {\n\
-                     let x = i32((a >> shift) & 0xFFu);\n\
-                     let y = i32((b >> shift) & 0xFFu);\n\
-                     sum += select(x, x - 256, x >= 128) * select(y, y - 256, y >= 128);\n\
-                 }\n\
-                 return sum;\n\
-             }"
-        }
-        _ => panic!("no {format:?} int-dot kernel for {group:?}"),
+    let dot_helpers = if packed_dot {
+        include_str!("shaders/matmul_gemv_int_dot_packed.wgsl")
+    } else {
+        include_str!("shaders/matmul_gemv_int_dot_scalar.wgsl")
     };
     let (addend_decl, addend) = match group {
         ShaderGroup::MatMulGemv => ("", ""),
@@ -2295,89 +2229,50 @@ pub(crate) fn generate_module_gemv_int_dot(
         _ => panic!("no int-dot variant for {group:?}"),
     };
     let base = match format {
-        crate::compile::WeightFormat::Q40 => include_str!("shaders/matmul_gemv_q40_q8.wgsl"),
-        crate::compile::WeightFormat::Q8 => include_str!("shaders/matmul_gemv_q8_q8.wgsl"),
-        crate::compile::WeightFormat::Q4K
-        | crate::compile::WeightFormat::Q5K
-        | crate::compile::WeightFormat::Q6K
-        | crate::compile::WeightFormat::Q3K => include_str!("shaders/matmul_gemv_qk_q8.wgsl"),
+        WeightFormat::Q40 => include_str!("shaders/matmul_gemv_q40_q8.wgsl"),
+        WeightFormat::Q8 => include_str!("shaders/matmul_gemv_q8_q8.wgsl"),
+        WeightFormat::Q4K | WeightFormat::Q5K | WeightFormat::Q6K | WeightFormat::Q3K => {
+            include_str!("shaders/matmul_gemv_qk_q8.wgsl")
+        }
         _ => unreachable!("checked above"),
     };
-    // K-quants carry their layout readers, dot function and per-block dot
-    // in `$WEIGHT_HELPERS`; the small formats inline both in their files.
     let weight_helpers = match format {
-        crate::compile::WeightFormat::Q40 | crate::compile::WeightFormat::Q8 => String::new(),
-        crate::compile::WeightFormat::Q4K => q4k_int_dot_helpers(packed_dot),
-        crate::compile::WeightFormat::Q5K => q5k_int_dot_helpers(packed_dot),
-        crate::compile::WeightFormat::Q6K => q6k_int_dot_helpers(packed_dot),
-        crate::compile::WeightFormat::Q3K => q3k_int_dot_helpers(packed_dot),
+        WeightFormat::Q40 | WeightFormat::Q8 => String::new(),
+        WeightFormat::Q4K | WeightFormat::Q5K | WeightFormat::Q6K | WeightFormat::Q3K => {
+            preprocess(
+                include_str!("shaders/matmul_gemv_qk_helpers.wgsl"),
+                &[
+                    ("$F16_DECODE_FN", F16_DECODE_FN),
+                    ("$K_SCALE_MIN_FN", K_SCALE_MIN_FN),
+                ],
+            )
+        }
         _ => unreachable!("checked above"),
     };
     let block_dot = match format {
-        crate::compile::WeightFormat::Q4K
-        | crate::compile::WeightFormat::Q5K
-        | crate::compile::WeightFormat::Q6K
-        | crate::compile::WeightFormat::Q3K => "qk_block_dot",
-        _ => "",
+        WeightFormat::Q4K => "q4k_block_dot",
+        WeightFormat::Q5K => "q5k_block_dot",
+        WeightFormat::Q6K => "q6k_block_dot",
+        WeightFormat::Q3K => "q3k_block_dot",
+        WeightFormat::Q40 | WeightFormat::Q8 => "",
+        _ => unreachable!("checked above"),
     };
-    // The fused prologue mirrors `gemv_rmsnorm_source`: a workgroup-wide sum
-    // of squares over A, then `a_val` scales each element on the way to the
-    // quantizer. `eps` arrives in the params' spare slot, as for the plain
-    // fused form.
-    let (norm_decl, a_fn_decl, norm_prologue, param_pad) = if norm {
+    let (norm_decl, a_fn, norm_prologue) = if norm {
         (
-            concat!(
-                "var<storage> norm_w: array<f32>;\n",
-                "var<workgroup> scale_buf: array<f32, LANES>;\n",
-                "var<workgroup> inv_rms: f32;",
-            ),
-            "fn a_val(at: u32) -> f32 {\n\
-                 return matrix_a[at] * inv_rms * norm_w[at];\n\
-             }",
-            concat!(
-                "    // Prologue: sum of squares over A, reduced across the\n",
-                "    // workgroup. Every lane must reach every barrier, so the\n",
-                "    // early-out below the prologue stays put.\n",
-                "    var ss = 0.0;\n",
-                "    var si = lane;\n",
-                "    loop {\n",
-                "        if si >= k { break; }\n",
-                "        let v = matrix_a[si];\n",
-                "        ss += v * v;\n",
-                "        si += LANES;\n",
-                "    }\n",
-                "    scale_buf[lane] = ss;\n",
-                "    workgroupBarrier();\n",
-                "    var sstride = LANES / 2u;\n",
-                "    loop {\n",
-                "        if sstride == 0u { break; }\n",
-                "        if lane < sstride { scale_buf[lane] += scale_buf[lane + sstride]; }\n",
-                "        workgroupBarrier();\n",
-                "        sstride >>= 1u;\n",
-                "    }\n",
-                "    if lane == 0u {\n",
-                "        inv_rms = inverseSqrt(scale_buf[0] / f32(k) + bitcast<f32>(params.eps_bits));\n",
-                "    }\n",
-                "    workgroupBarrier();\n",
-            ),
-            "eps_bits: u32,",
+            include_str!("shaders/matmul_gemv_int_dot_norm_decl.wgsl"),
+            include_str!("shaders/matmul_gemv_int_dot_norm_a.wgsl"),
+            include_str!("shaders/matmul_gemv_int_dot_norm_prologue.wgsl"),
         )
     } else {
-        (
-            "",
-            "fn a_val(at: u32) -> f32 {\n    return matrix_a[at];\n}",
-            "",
-            "_pad: u32,",
-        )
+        ("", include_str!("shaders/matmul_gemv_int_dot_a.wgsl"), "")
     };
     let source = preprocess(
         base,
         &[
-            ("$PACKED_DOT_HELPER", helper),
-            ("$A_FN_DECL", a_fn_decl),
+            ("$PACKED_DOT_HELPER", dot_helpers),
+            ("$A_FN_DECL", a_fn),
             ("$NORM_DECL", norm_decl),
             ("$NORM_PROLOGUE", norm_prologue),
-            ("$PARAM_PAD", param_pad),
             ("$ADDEND_DECL", addend_decl),
             ("$ADDEND", addend),
             ("$WEIGHT_HELPERS", weight_helpers.as_str()),
@@ -2385,171 +2280,6 @@ pub(crate) fn generate_module_gemv_int_dot(
         ],
     );
     ShaderModule::new(&gemv_shape_source(&source, shape))
-}
-
-/// The Q4_K int-dot layout: word-aligned 144-byte superblocks, the shared
-/// `get_scale_min_k4` scale shuffle, and GGML's paired-nibble quants — the
-/// same dp4a-friendly halves as Q4_0.
-fn q4k_int_dot_helpers(packed_dot: bool) -> String {
-    let _ = packed_dot;
-    format!(
-        "{F16_DECODE_FN}{}\n{}",
-        K_SCALE_MIN_FN,
-        concat!(
-            "fn qk_block_dot(col: u32, blk: u32, u: ptr<function, array<u32, 8u>>, d8: f32, s8: f32) -> f32 {\n",
-            "    let sblocks = params.k / 256u;\n",
-            "    let base = (col * sblocks + blk / 8u) * 36u;\n",
-            "    let hdr = decode_f16_pair(matrix_b[base]);\n",
-            "    let sm = kq_scale_min(base, blk % 8u);\n",
-            "    let even = (blk % 2u) == 0u;\n",
-            "    let qbase = base * 4u + 16u + ((blk % 8u) / 2u) * 32u;\n",
-            "    var sumi = 0;\n",
-            "    for (var i = 0u; i < 4u; i++) {\n",
-            // GGML pairs element e with e + 32: the sub-block's 32 nibbles
-            // live in 32 bytes, elements 0..15 in the first 16 and 16..31 in
-            // the second, so each dot group needs its own word.
-            "        let w_lo = kq_word4(qbase, i * 4u);\n",
-            "        let w_hi = kq_word4(qbase, 16u + i * 4u);\n",
-            "        let v_lo = select((w_lo >> 4u) & 0x0F0F0F0Fu, w_lo & 0x0F0F0F0Fu, even);\n",
-            "        let v_hi = select((w_hi >> 4u) & 0x0F0F0F0Fu, w_hi & 0x0F0F0F0Fu, even);\n",
-            "        sumi += dot_qk_packed(v_lo, (*u)[i]) + dot_qk_packed(v_hi, (*u)[4u + i]);\n",
-            "    }\n",
-            "    return hdr.x * sm.x * (d8 * f32(sumi)) - hdr.y * sm.y * s8;\n",
-            "}",
-        )
-    )
-}
-
-/// Q5_K is Q4_K plus one bit: the qh region folds a 16 into the packed
-/// quant, so the dot spans nib and high-bit words alike.
-fn q5k_int_dot_helpers(packed_dot: bool) -> String {
-    let _ = packed_dot;
-    format!(
-        "{F16_DECODE_FN}{}\n{}",
-        K_SCALE_MIN_FN,
-        concat!(
-            "fn qk_block_dot(col: u32, blk: u32, u: ptr<function, array<u32, 8u>>, d8: f32, s8: f32) -> f32 {\n",
-            "    let sblocks = params.k / 256u;\n",
-            "    let base = (col * sblocks + blk / 8u) * 44u;\n",
-            "    let hdr = decode_f16_pair(matrix_b[base]);\n",
-            "    let sm = kq_scale_min(base, blk % 8u);\n",
-            "    let even = (blk % 2u) == 0u;\n",
-            "    let hshift = blk % 8u;\n",
-            "    let qhbase = base * 4u + 16u;\n",
-            "    let qsbase = base * 4u + 48u + ((blk % 8u) / 2u) * 32u;\n",
-            "    var sumi = 0;\n",
-            "    for (var i = 0u; i < 4u; i++) {\n",
-            "        let wl_lo = kq_word4(qsbase, i * 4u);\n",
-            "        let wl_hi = kq_word4(qsbase, 16u + i * 4u);\n",
-            "        let nib_lo = select((wl_lo >> 4u) & 0x0F0F0F0Fu, wl_lo & 0x0F0F0F0Fu, even);\n",
-            "        let nib_hi = select((wl_hi >> 4u) & 0x0F0F0F0Fu, wl_hi & 0x0F0F0F0Fu, even);\n",
-            "        let hb_lo = (kq_word4(qhbase, i * 4u) >> hshift) & 0x01010101u;\n",
-            "        let hb_hi = (kq_word4(qhbase, 16u + i * 4u) >> hshift) & 0x01010101u;\n",
-            "        sumi += dot_qk_packed(nib_lo | (hb_lo << 4u), (*u)[i]);\n",
-            "        sumi += dot_qk_packed(nib_hi | (hb_hi << 4u), (*u)[4u + i]);\n",
-            "    }\n",
-            "    return hdr.x * sm.x * (d8 * f32(sumi)) - hdr.y * sm.y * s8;\n",
-            "}",
-        )
-    )
-}
-
-/// Q6_K: 210-byte superblocks (not a whole number of words), int8 scales
-/// and 6-bit quants. Two 16-element sub-blocks pair with one activation
-/// block, each contributing `sc * (d8*sumi - 32*s8)`.
-fn q6k_int_dot_helpers(packed_dot: bool) -> String {
-    let _ = packed_dot;
-    format!(
-        "{F16_DECODE_FN}{}",
-        concat!(
-            "fn q6k_scale(base: u32, i: u32) -> f32 {\n",
-            "    let raw = kq_byte_at(base, 192u + i);\n",
-            "    return f32(i32(raw) - select(0, 256, raw >= 128u));\n",
-            "}\n",
-            "fn qk_block_dot(col: u32, blk: u32, u: ptr<function, array<u32, 8u>>, d8: f32, s8: f32) -> f32 {\n",
-            "    let sblocks = params.k / 256u;\n",
-            "    let base = (col * sblocks + blk / 8u) * 210u;\n",
-            "    let j8 = blk % 8u;\n",
-            "    let half = j8 / 4u;\n",
-            "    let j6 = j8 % 4u;\n",
-            "    let qlbase = base + half * 64u + (j6 & 1u) * 32u;\n",
-            "    let qhbase = base + 128u + half * 32u;\n",
-            "    var sumi_a = 0;\n",
-            "    var sumi_b = 0;\n",
-            "    var usum_a = 0;\n",
-            "    var usum_b = 0;\n",
-            "    for (var i = 0u; i < 4u; i++) {\n",
-            "        let la = kq_word4(qlbase, i * 4u);\n",
-            "        let lb = kq_word4(qlbase, 16u + i * 4u);\n",
-            "        let lo_a = select((la >> 4u) & 0x0F0F0F0Fu, la & 0x0F0F0F0Fu, j6 < 2u);\n",
-            "        let lo_b = select((lb >> 4u) & 0x0F0F0F0Fu, lb & 0x0F0F0F0Fu, j6 < 2u);\n",
-            "        let hi_a = ((kq_word4(qhbase, i * 4u) >> (j6 * 2u)) & 0x03030303u) << 4u;\n",
-            "        let hi_b = ((kq_word4(qhbase, 16u + i * 4u) >> (j6 * 2u)) & 0x03030303u) << 4u;\n",
-            "        sumi_a += dot_qk_packed(lo_a | hi_a, (*u)[i]);\n",
-            "        sumi_b += dot_qk_packed(lo_b | hi_b, (*u)[4u + i]);\n",
-            // The -32 offset belongs to the 16-element sub-block, so it is
-            // weighted by that sub-block's own activation sum, not the
-            // whole 32-element block's.
-            "        usum_a += dot_qk_packed(0x01010101u, (*u)[i]);\n",
-            "        usum_b += dot_qk_packed(0x01010101u, (*u)[4u + i]);\n",
-            "    }\n",
-            "    let d = decode_f16(kq_byte_at(base, 208u) | (kq_byte_at(base, 209u) << 8u));\n",
-            "    let sc_a = d * q6k_scale(base, half * 8u + j6 * 2u);\n",
-            "    let sc_b = d * q6k_scale(base, half * 8u + j6 * 2u + 1u);\n",
-            "    return sc_a * (d8 * f32(sumi_a - 32 * usum_a))\n",
-            "         + sc_b * (d8 * f32(sumi_b - 32 * usum_b));\n",
-            "}",
-        )
-    )
-}
-
-/// Q3_K: 110-byte superblocks, a 6-bit scale shuffle and the inverted
-/// hmask bit: the packed value is `q2 - (hbit ? 0 : 4)`, applied inside
-/// the dot operand so the sum needs no correction term.
-fn q3k_int_dot_helpers(packed_dot: bool) -> String {
-    let _ = packed_dot;
-    format!(
-        "{F16_DECODE_FN}{}",
-        concat!(
-            "fn q3k_scale(base: u32, i: u32) -> f32 {\n",
-            "    let b = i % 4u;\n",
-            "    let g = i / 4u;\n",
-            "    let src = select(4u + b, b, (g % 2u) == 0u);\n",
-            "    let raw = kq_byte_at(base, 96u + src);\n",
-            "    let nib = select(raw >> 4u, raw & 0xFu, g < 2u);\n",
-            "    let hi = (kq_byte_at(base, 96u + 8u + b) >> (g * 2u)) & 3u;\n",
-            "    return f32(i32(nib | (hi << 4u)) - 32);\n",
-            "}\n",
-            "fn qk_block_dot(col: u32, blk: u32, u: ptr<function, array<u32, 8u>>, d8: f32, s8: f32) -> f32 {\n",
-            "    let sblocks = params.k / 256u;\n",
-            "    let base = (col * sblocks + blk / 8u) * 110u;\n",
-            "    let j8 = blk % 8u;\n",
-            "    let h = j8 / 4u;\n",
-            "    let j3 = j8 % 4u;\n",
-            "    let qshift = j3 * 2u;\n",
-            "    let hshift = blk % 8u;\n",
-            "    var sumi_a = 0;\n",
-            "    var sumi_b = 0;\n",
-            "    for (var i = 0u; i < 4u; i++) {\n",
-            "        let q_a = (kq_word4(base, 32u + h * 32u + i * 4u) >> qshift) & 0x03030303u;\n",
-            "        let q_b = (kq_word4(base, 32u + h * 32u + 16u + i * 4u) >> qshift) & 0x03030303u;\n",
-            "        let hb_a = (kq_word4(base, i * 4u) >> hshift) & 0x01010101u;\n",
-            "        let hb_b = (kq_word4(base, 16u + i * 4u) >> hshift) & 0x01010101u;\n",
-            // GGML subtracts 4 where the hmask bit is CLEAR. Splitting the
-            // per-byte value into two dots keeps every operand a byte-sized
-            // non-negative number: a u32 subtraction here would borrow
-            // across bytes and corrupt the neighboring quants.
-            "        sumi_a += dot_qk_packed(q_a, (*u)[i])\n",
-            "                 - 4 * dot_qk_packed(hb_a ^ 0x01010101u, (*u)[i]);\n",
-            "        sumi_b += dot_qk_packed(q_b, (*u)[4u + i])\n",
-            "                 - 4 * dot_qk_packed(hb_b ^ 0x01010101u, (*u)[4u + i]);\n",
-            "    }\n",
-            "    let d = decode_f16(kq_byte_at(base, 108u) | (kq_byte_at(base, 109u) << 8u));\n",
-            "    return d * q3k_scale(base, (blk % 8u) * 2u) * (d8 * f32(sumi_a))\n",
-            "         + d * q3k_scale(base, (blk % 8u) * 2u + 1u) * (d8 * f32(sumi_b));\n",
-            "}",
-        )
-    )
 }
 
 /// Generate one GEMV pipeline at an explicit shape.
@@ -6300,6 +6030,7 @@ mod tests {
                 naga::valid::Capabilities::empty(),
             ),
             (ShaderGroup::RmsNorm, naga::valid::Capabilities::empty()),
+            (ShaderGroup::RmsNormAdd, naga::valid::Capabilities::empty()),
             (ShaderGroup::Embedding, naga::valid::Capabilities::empty()),
             (
                 ShaderGroup::ToF16,
@@ -6482,6 +6213,7 @@ mod tests {
     #[test]
     fn test_rms_norm_wgsl() {
         let _ = generate_wgsl(ShaderGroup::RmsNorm);
+        let _ = generate_wgsl(ShaderGroup::RmsNormAdd);
     }
 
     #[test]
@@ -6687,6 +6419,7 @@ mod tests {
             (ShaderGroup::Softmax, empty),
             (ShaderGroup::CrossEntropy, empty),
             (ShaderGroup::RmsNorm, empty),
+            (ShaderGroup::RmsNormAdd, empty),
             (ShaderGroup::Embedding, empty),
             (ShaderGroup::ToF16, f16),
             (ShaderGroup::RoPE, empty),
