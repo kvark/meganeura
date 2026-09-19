@@ -227,7 +227,7 @@ fn chunked_relative_attention_matches_blocked_reference() {
 
 #[test]
 fn cached_block_writes_only_valid_rows_and_selects_last() {
-    for max_seq in [6, 96] {
+    for (max_seq, window) in [(6, 0), (96, 0), (96, 37)] {
         let block = 3;
         let dim = 4;
         let mut graph = Graph::new();
@@ -240,8 +240,9 @@ fn cached_block_writes_only_valid_rows_and_selects_last() {
         let valid = graph.input_u32("valid", &[1]);
         let k_cache = graph.cache_write_prefix(new_k, k_cache, position, valid);
         let v_cache = graph.cache_write_prefix(new_v, v_cache, position, valid);
-        let attended =
-            graph.cached_block_attention(q, k_cache, v_cache, position, valid, 2, 1, dim as u32, 0);
+        let attended = graph.cached_block_attention(
+            q, k_cache, v_cache, position, valid, 2, 1, dim as u32, window,
+        );
         let output = graph.prefix_last(attended, valid);
         graph.set_outputs(vec![output]);
 
@@ -277,5 +278,63 @@ fn cached_block_writes_only_valid_rows_and_selects_last() {
         let actual = session.read_output(2 * dim);
         // The second valid query sees cache rows 0..3. Q=0 makes them uniform.
         assert_close(&actual, &[2.5, 5.0, 7.5, 10.0, 2.5, 5.0, 7.5, 10.0], 1e-5);
+
+        let queries: Vec<_> = (0..block * 2 * dim)
+            .map(|i| (i as f32 * 0.7).sin())
+            .collect();
+        session.set_input("q", &queries);
+        for (i, (k, v)) in initial_k.iter_mut().zip(&mut initial_v).enumerate() {
+            *k = (i as f32 * 0.3).sin() * 4.0;
+            *v = (i as f32 * 0.4).cos();
+        }
+        session.set_parameter("k", &initial_k);
+        session.set_parameter("v", &initial_v);
+        // Reuse partial storage from a long context in a short one. This also
+        // covers unequal scores, multiple reduction tiles and ragged windows.
+        for position in [max_seq - 2, 2] {
+            session.set_input_u32("position", &[position as u32]);
+            for row in 0..2 {
+                for col in 0..dim {
+                    initial_k[(position + row) * dim + col] = (row + 3) as f32;
+                    initial_v[(position + row) * dim + col] = (row + 3) as f32 * (col + 1) as f32;
+                }
+            }
+            let end = position + 2;
+            let start = if window == 0 {
+                0
+            } else {
+                end.saturating_sub(window as usize)
+            };
+            let mut expected = Vec::new();
+            for head in 0..2 {
+                let query = &queries[(2 + head) * dim..(3 + head) * dim];
+                let scores: Vec<f64> = (start..end)
+                    .map(|row| {
+                        query
+                            .iter()
+                            .enumerate()
+                            .map(|(col, &q)| f64::from(q) * f64::from(initial_k[row * dim + col]))
+                            .sum::<f64>()
+                            / (dim as f64).sqrt()
+                    })
+                    .collect();
+                let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let weights: Vec<_> = scores.iter().map(|s| (s - max).exp()).collect();
+                let sum: f64 = weights.iter().sum();
+                for col in 0..dim {
+                    expected.push(
+                        (weights
+                            .iter()
+                            .enumerate()
+                            .map(|(row, &w)| w * f64::from(initial_v[(start + row) * dim + col]))
+                            .sum::<f64>()
+                            / sum) as f32,
+                    );
+                }
+            }
+            session.step();
+            session.wait();
+            assert_close(&session.read_output(2 * dim), &expected, 1e-5);
+        }
     }
 }
