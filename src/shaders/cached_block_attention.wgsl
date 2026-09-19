@@ -25,7 +25,7 @@ var<workgroup> wave_slots: atomic<u32>;
 // Tokens per reduction round; the round's masked tail costs no extra
 // barrier, so a ragged remainder costs one round instead of one per token.
 const BKV: u32 = 16u;
-const MAX_VALUES_PER_THREAD: u32 = 8u;
+const MAX_VALUES_PER_THREAD: u32 = $VALUES_PER_THREAD;
 
 // One round of the BKV-wide score reduction: every thread's per-token
 // partial in wg_scores collapses to one value per slot, visible to all
@@ -55,12 +55,12 @@ fn main(
         params.window_size != 0u && kv_len > params.window_size,
     );
     let kv_head = head / (params.num_heads / params.num_kv_heads);
-    let kv_head_off = kv_head * params.head_dim;
-    let kv_dim = params.num_kv_heads * params.head_dim;
-    let scale = inverseSqrt(f32(params.head_dim));
-    let q_base = query_row * params.num_heads * params.head_dim + head * params.head_dim;
+    let kv_head_off = kv_head * $HEAD_DIM;
+    let kv_dim = params.num_kv_heads * $HEAD_DIM;
+    let scale = inverseSqrt(f32($HEAD_DIM));
+    let q_base = query_row * params.num_heads * $HEAD_DIM + head * $HEAD_DIM;
 
-    var my_out: array<f32, 8>;
+    var my_out: array<f32, MAX_VALUES_PER_THREAD>;
     for (var lane = 0u; lane < MAX_VALUES_PER_THREAD; lane++) {
         my_out[lane] = 0.0;
     }
@@ -78,7 +78,7 @@ fn main(
             var partial = 0.0;
             for (var lane = 0u; lane < MAX_VALUES_PER_THREAD; lane++) {
                 let d = lane * 64u + tid;
-                if d < params.head_dim && t < kv_len {
+                if d < $HEAD_DIM && t < kv_len {
                     partial += src_a[q_base + d] * src_b[k_base + d];
                 }
             }
@@ -96,7 +96,7 @@ fn main(
             let v_base = t * kv_dim + kv_head_off;
             for (var lane = 0u; lane < MAX_VALUES_PER_THREAD; lane++) {
                 let d = lane * 64u + tid;
-                if d < params.head_dim && live {
+                if d < $HEAD_DIM && live {
                     my_out[lane] = my_out[lane] * correction + weight * bias[v_base + d];
                 }
             }
@@ -106,10 +106,10 @@ fn main(
     }
 
     let safe_sum = select(sum_exp, 1.0, sum_exp == 0.0);
-    let dst_base = query_row * params.num_heads * params.head_dim + head * params.head_dim;
+    let dst_base = query_row * params.num_heads * $HEAD_DIM + head * $HEAD_DIM;
     for (var lane = 0u; lane < MAX_VALUES_PER_THREAD; lane++) {
         let d = lane * 64u + tid;
-        if d < params.head_dim {
+        if d < $HEAD_DIM {
             dst[dst_base + d] = my_out[lane] / safe_sum;
         }
     }
