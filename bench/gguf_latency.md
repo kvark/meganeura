@@ -270,8 +270,9 @@ All three probes above used serialized replay. Their improvements must be
 rechecked with ordinary recording before making production latency claims.
 
 Each experiment branch contains its source and a short result summary, without
-raw timings or binaries. The next layout work is to preserve the applicable
-fusions, not to add model-specific kernels or change the paper cohort.
+raw timings or binaries. The [native-row follow-up](gguf-row-weights.md)
+preserves those fusions and remeasures them with ordinary recording on both
+GPUs. It adds no model-specific kernels and leaves the paper cohort unchanged.
 
 ### Verification
 
