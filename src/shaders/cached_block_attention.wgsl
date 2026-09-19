@@ -85,23 +85,32 @@ fn main(
             wg_scores[i * 64u + tid] = partial;
         }
         tree_reduce_bkv(tid, sg_id);
+        var tile_max = max_score;
+        for (var i = 0u; i < BKV; i++) {
+            if first_kv + round * BKV + i < kv_len {
+                tile_max = max(tile_max, wg_scores[i * 64u] * scale);
+            }
+        }
+        let correction = exp(max_score - tile_max);
+        sum_exp *= correction;
+        for (var lane = 0u; lane < MAX_VALUES_PER_THREAD; lane++) {
+            my_out[lane] *= correction;
+        }
         for (var i = 0u; i < BKV; i++) {
             let t = first_kv + round * BKV + i;
             let live = t < kv_len;
             let score = select(-1e30, wg_scores[i * 64u] * scale, live);
-            let new_max = max(max_score, score);
-            let correction = exp(max_score - new_max);
-            let weight = select(0.0, exp(score - new_max), live);
-            sum_exp = sum_exp * correction + weight;
+            let weight = select(0.0, exp(score - tile_max), live);
+            sum_exp += weight;
             let v_base = t * kv_dim + kv_head_off;
             for (var lane = 0u; lane < MAX_VALUES_PER_THREAD; lane++) {
                 let d = lane * 64u + tid;
                 if d < params.head_dim && live {
-                    my_out[lane] = my_out[lane] * correction + weight * bias[v_base + d];
+                    my_out[lane] += weight * bias[v_base + d];
                 }
             }
-            max_score = new_max;
         }
+        max_score = tile_max;
         workgroupBarrier();
     }
 
