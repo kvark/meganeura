@@ -185,6 +185,8 @@ pub enum ShaderEntry {
     /// M=1 MatMulBT specialization (`B` stored `[N,K]`). K-split with
     /// naturally coalesced vec4 reads along the contiguous K axis.
     MatMulGemvBT,
+    /// M=1 MatMulBT with fused residual add.
+    MatMulGemvBTAdd,
     FusedMatMulAdd,
     FusedMatMulATAdd,
     FusedMatMulBTAdd,
@@ -218,6 +220,8 @@ pub enum ShaderEntry {
     RoPE,
     RoPEGrad,
     Gelu,
+    /// Repeat each KV head `n_q/n_kv` times. Seq=1 GQA attention.
+    RepeatKv,
     LayerNorm,
     MultiHeadAttn,
     /// Flash Attention 2 forward: BQ>1 multi-query tiling.
@@ -341,6 +345,7 @@ impl ShaderEntry {
             | ShaderEntry::MatMulGemv
             | ShaderEntry::MatMulGemvAdd
             | ShaderEntry::MatMulGemvBT
+            | ShaderEntry::MatMulGemvBTAdd
             | ShaderEntry::FusedMatMulAdd
             | ShaderEntry::FusedMatMulATAdd
             | ShaderEntry::FusedMatMulBTAdd => "matrix",
@@ -438,6 +443,7 @@ impl ShaderEntry {
             | ShaderEntry::RoPE
             | ShaderEntry::RoPEGrad
             | ShaderEntry::Gelu
+            | ShaderEntry::RepeatKv
             | ShaderEntry::SwiGLUGradGate
             | ShaderEntry::SwiGLUGradUp
             | ShaderEntry::SiluGrad
@@ -462,6 +468,7 @@ impl ShaderEntry {
             ShaderEntry::MatMulGemv => ShaderGroup::MatMulGemv,
             ShaderEntry::MatMulGemvAdd => ShaderGroup::MatMulGemvAdd,
             ShaderEntry::MatMulGemvBT => ShaderGroup::MatMulGemvBT,
+            ShaderEntry::MatMulGemvBTAdd => ShaderGroup::MatMulGemvBTAdd,
             ShaderEntry::FusedMatMulAdd => ShaderGroup::MatMulAdd,
             ShaderEntry::FusedMatMulATAdd => ShaderGroup::MatMulATAdd,
             ShaderEntry::FusedMatMulBTAdd => ShaderGroup::MatMulBTAdd,
@@ -490,7 +497,7 @@ impl ShaderEntry {
             ShaderEntry::ToF16 => ShaderGroup::ToF16,
             ShaderEntry::RoPE => ShaderGroup::RoPE,
             ShaderEntry::RoPEGrad => ShaderGroup::RoPEGrad,
-            ShaderEntry::Gelu => ShaderGroup::Unary,
+            ShaderEntry::Gelu | ShaderEntry::RepeatKv => ShaderGroup::Unary,
             ShaderEntry::LayerNorm => ShaderGroup::LayerNorm,
             ShaderEntry::MultiHeadAttn => ShaderGroup::MultiHeadAttn,
             ShaderEntry::FlashAttention => ShaderGroup::FlashAttention,
@@ -572,6 +579,7 @@ impl ShaderEntry {
             | ShaderEntry::MatMulGemv
             | ShaderEntry::MatMulGemvAdd
             | ShaderEntry::MatMulGemvBT
+            | ShaderEntry::MatMulGemvBTAdd
             | ShaderEntry::FusedMatMulAdd
             | ShaderEntry::FusedMatMulATAdd
             | ShaderEntry::FusedMatMulBTAdd
@@ -605,6 +613,7 @@ impl ShaderEntry {
             ShaderEntry::RoPE => "main",
             ShaderEntry::RoPEGrad => "main",
             ShaderEntry::Gelu => "gelu",
+            ShaderEntry::RepeatKv => "repeat_kv",
             ShaderEntry::LayerNorm => "main",
             ShaderEntry::MultiHeadAttn
             | ShaderEntry::FlashAttention
@@ -850,7 +859,11 @@ pub fn fuse_horizontal_matmuls(
 fn can_horizontal_fuse(a: &Dispatch, b: &Dispatch) -> bool {
     matches!(
         a.shader,
-        ShaderEntry::MatMul | ShaderEntry::MatMulAT | ShaderEntry::MatMulBT
+        ShaderEntry::MatMul
+            | ShaderEntry::MatMulAT
+            | ShaderEntry::MatMulBT
+            | ShaderEntry::MatMulGemv
+            | ShaderEntry::MatMulGemvBT
     ) && a.shader == b.shader
         && a.workgroups == b.workgroups
         && a.workgroups[2] == 1
@@ -870,8 +883,15 @@ fn can_horizontal_fuse(a: &Dispatch, b: &Dispatch) -> bool {
         && b.pointwise.is_none()
         && a.reduction.is_none()
         && b.reduction.is_none()
-        && a.gemv_rmsnorm.is_none()
-        && b.gemv_rmsnorm.is_none()
+        && a.gemv_rmsnorm == b.gemv_rmsnorm
+        && !a.gemv_swiglu
+        && !b.gemv_swiglu
+        && a.gemv_repeat_kv.is_none()
+        && b.gemv_repeat_kv.is_none()
+        && !a.gemv_ntile
+        && !b.gemv_ntile
+        && !a.gemv_physical_bt
+        && !b.gemv_physical_bt
         && a.input_buffers.len() == 2
         && b.input_buffers.len() == 2
         && a.input_buffers[0] == b.input_buffers[0]
@@ -942,6 +962,10 @@ pub struct Dispatch {
     /// (set at runtime based on per-dispatch eligibility).
     #[serde(default)]
     pub use_coop: bool,
+    /// Cooperative matmul launches a 2×2 hardware-tile grid per workgroup.
+    /// Skinny prefill stays on one tile; wide FFN / lm_head use this.
+    #[serde(default)]
+    pub use_coop_2x2: bool,
     /// Cooperative f16 path with hi/lo residual staging (C1). Retained as an
     /// explicit experimental variant; automatic selection does not use it
     /// for `requires_full_precision` work because it cannot preserve f32's
@@ -993,6 +1017,24 @@ pub struct Dispatch {
     /// RmsNorm folded into this GEMV's A operand. See [`GemvRmsNorm`].
     #[serde(default)]
     pub gemv_rmsnorm: Option<GemvRmsNorm>,
+    /// SwiGLUConcat folded into this GEMV's A operand: A is `[1, 2K]` packed
+    /// `gate|up`, and the kernel applies `silu(gate)*up` while loading K.
+    #[serde(default)]
+    pub gemv_swiglu: bool,
+    /// GQA V-repeat folded into this GEMV's A operand: A is `[1, n_kv*hd]`
+    /// and loads map `q_head → kv_head`. `(n_kv, head_dim)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gemv_repeat_kv: Option<(u32, u32)>,
+    /// N-tile GEMV: 32 coalesced output columns per workgroup, 8-way K-split.
+    /// Selected for wide-N or long-K fused-add f32 GEMVs; see
+    /// [`gemv_ntile_eligible`].
+    #[serde(default)]
+    pub gemv_ntile: bool,
+    /// Logical B is `[K, N]` in the graph, but the buffer is stored `[N, K]`
+    /// so 4-column GEMV-BT can walk K coalesced (N/4 workgroups, 256-wide).
+    /// Prefill keeps `[K, N]` cooperative matmul.
+    #[serde(default)]
+    pub gemv_physical_bt: bool,
     /// Multiplicative prologue applied during matmul A-tile staging.
     /// When present, the coop matmul fills `$A_TRANSFORM` and
     /// `$PROLOGUE_DECL` template variables from the prologue's factors.
@@ -1097,6 +1139,18 @@ pub struct ExecutionPlan {
 }
 
 impl ExecutionPlan {
+    /// `(K, N)` for a logical `[K, N]` weight stored physically as `[N, K]`.
+    pub fn physical_bt_dims(&self, buf: BufferRef) -> Option<(u32, u32)> {
+        self.dispatches.iter().find_map(|d| {
+            if d.gemv_physical_bt && d.input_buffers.get(1) == Some(&buf) {
+                // BT params are `[m, n, k]`.
+                Some((d.params[2], d.params[1]))
+            } else {
+                None
+            }
+        })
+    }
+
     fn node_buffer(&self, node_id: NodeId) -> BufferRef {
         let &(mapped_id, buffer) = self
             .node_buffers
@@ -1129,6 +1183,7 @@ impl ExecutionPlan {
     }
 
     fn finish(mut self, options: &CompileOptions) -> Self {
+        revoke_mixed_physical_bt(&mut self);
         if options.fuse_dispatches {
             fuse_epilogues(&mut self);
             if options.use_schedule_pointwise {
@@ -1959,6 +2014,92 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
 /// prologue is only two scalar multiplies per A element — essentially free.
 /// Dispatches must already have their runtime `use_coop` decision; scalar
 /// matmuls are deliberately left unchanged.
+/// N-tile GEMV (32 cols/WG, 32-way K-split) is legal for this f32 projection.
+///
+/// Wide N (packed FFN-up, N≥1536) is the shape whose K-split vec4 form is
+/// strided along K. A 256-thread N-tile under-occupied seq=1 on a 48-SM
+/// GPU; 1024 threads recover llama.cpp-like warp counts. A pinned
+/// [`CompileOptions::gemv_shape`] or the Q8_1 int-dot path keeps K-split.
+pub fn gemv_ntile_eligible(
+    fused_add: bool,
+    weight_format: WeightFormat,
+    k: u32,
+    n: u32,
+    options: &CompileOptions,
+) -> bool {
+    let _ = (fused_add, k, n, weight_format, options);
+    // 256-thread and 1024-thread N-tile both raised SmolLM2 seq=1 wall
+    // time on RTX 5070 versus K-split (2.03 ms / 1.67 ms vs 1.63 ms).
+    false
+}
+
+/// Wide f32 GEMV *could* store B as `[N, K]` and run GEMV-BT. Measured
+/// Inferena seq=1 wall time is worse than K-split, so this stays off.
+pub fn gemv_physical_bt_eligible(
+    fused_add: bool,
+    weight_format: WeightFormat,
+    k: u32,
+    n: u32,
+    options: &CompileOptions,
+) -> bool {
+    let _ = (fused_add, weight_format, k, n, options);
+    // 1-col 64-wide, 4-col 64-wide, and 4-col 256-wide all raised
+    // Inferena SmolLM2 seq=1 wall time versus K-split 256-wide tree
+    // (1.70–1.77 ms vs 1.63 ms on RTX 5070). Isolated GEMV-BT timestamps
+    // win; the seq=1 chain of short kernels does not.
+    false
+}
+
+/// A physical `[N,K]` store is only legal when every reader of B is a
+/// 4-col GEMV-BT that expects that layout. Training reuses the same
+/// weight as MatMulBT `B` (still `[K,N]` addressing), so those graphs
+/// stay on K-split GEMV.
+fn revoke_mixed_physical_bt(plan: &mut ExecutionPlan) {
+    use std::collections::HashSet;
+
+    let mut bt_b: HashSet<BufferRef> = HashSet::new();
+    let mut other: HashSet<BufferRef> = HashSet::new();
+    for d in &plan.dispatches {
+        for (i, buf) in d.input_buffers.iter().enumerate() {
+            if d.gemv_physical_bt && i == 1 {
+                bt_b.insert(*buf);
+            } else {
+                other.insert(*buf);
+            }
+        }
+        if !d.gemv_physical_bt {
+            other.insert(d.output_buffer);
+            other.extend(d.extra_outputs.iter().copied());
+        }
+    }
+    let mixed: HashSet<BufferRef> = bt_b.intersection(&other).copied().collect();
+    if mixed.is_empty() {
+        return;
+    }
+    for d in &mut plan.dispatches {
+        if !d.gemv_physical_bt {
+            continue;
+        }
+        if !d.input_buffers.get(1).is_some_and(|b| mixed.contains(b)) {
+            continue;
+        }
+        let fused_add = matches!(
+            d.shader,
+            ShaderEntry::MatMulGemvBTAdd | ShaderEntry::MatMulGemvAdd
+        );
+        d.shader = if fused_add {
+            ShaderEntry::MatMulGemvAdd
+        } else {
+            ShaderEntry::MatMulGemv
+        };
+        d.gemv_physical_bt = false;
+        // Physical-BT params are `[m, n, k]`; K-split GEMV is `[m, k, n]`.
+        if d.params.len() >= 3 {
+            d.params.swap(1, 2);
+        }
+    }
+}
+
 /// Fold a RmsNorm into every GEMV that consumes it, removing both the
 /// norm's dispatch and the boundary that separated it.
 ///
@@ -2015,8 +2156,10 @@ pub fn fuse_rmsnorm_into_gemv(plan: &mut ExecutionPlan) {
         if consumers.is_empty()
             || consumers.iter().any(|&c| {
                 let d = &plan.dispatches[c];
-                d.shader != ShaderEntry::MatMulGemv
-                    || d.input_buffers.first() != Some(&normed)
+                !matches!(
+                    d.shader,
+                    ShaderEntry::MatMulGemv | ShaderEntry::MatMulGemvBT
+                ) || d.input_buffers.first() != Some(&normed)
                     || d.weight_format != WeightFormat::F32
             })
         {
@@ -2040,6 +2183,8 @@ pub fn fuse_rmsnorm_into_gemv(plan: &mut ExecutionPlan) {
         let d = &mut plan.dispatches[idx];
         d.input_buffers[0] = src;
         d.gemv_rmsnorm = Some(GemvRmsNorm { weight, eps_bits });
+        // Width stays the group's default. 32-wide and N-tile both raised
+        // seq=1 wall time on RTX 5070 versus 256-wide tree.
     }
     let dropped = drop_norm.len();
     drop_norm.sort_unstable();
@@ -2047,6 +2192,248 @@ pub fn fuse_rmsnorm_into_gemv(plan: &mut ExecutionPlan) {
         plan.dispatches.remove(ni);
     }
     log::info!("fuse_rmsnorm_into_gemv: folded {dropped} RmsNorm dispatches into their GEMVs");
+}
+
+/// Fold SwiGLUConcat into a unique GEMV consumer that reads its output.
+///
+/// The concat is `silu(wide[:, :K]) * wide[:, K:]`. The GEMV already
+/// streams K of A, so reading both halves and combining on the way past
+/// removes a dispatch. Seq=1 FFN is the target (30 copies on SmolLM2).
+pub fn fuse_swiglu_into_gemv(plan: &mut ExecutionPlan) {
+    use std::collections::HashMap;
+
+    let mut readers: HashMap<BufferRef, Vec<usize>> = HashMap::new();
+    for (i, d) in plan.dispatches.iter().enumerate() {
+        for buf in &d.input_buffers {
+            readers.entry(*buf).or_default().push(i);
+        }
+    }
+    let mut external: std::collections::HashSet<BufferRef> = Default::default();
+    external.extend(plan.output_buffers.iter().copied());
+    if let Some(b) = plan.loss_buffer {
+        external.insert(b);
+    }
+    for entry in &plan.param_buffers {
+        external.insert(entry.1);
+    }
+    for entry in &plan.input_buffers {
+        external.insert(entry.1);
+    }
+
+    let mut drop_swiglu: Vec<usize> = Vec::new();
+    let mut rewrite: Vec<(usize, BufferRef)> = Vec::new();
+    for (si, sw) in plan.dispatches.iter().enumerate() {
+        if sw.shader != ShaderEntry::SwiGLUConcat {
+            continue;
+        }
+        let out = sw.output_buffer;
+        if external.contains(&out) {
+            continue;
+        }
+        let Some(consumers) = readers.get(&out) else {
+            continue;
+        };
+        let half_n = sw.params.get(1).copied().unwrap_or(0);
+        if consumers.len() != 1 {
+            continue;
+        }
+        let c = consumers[0];
+        let d = &plan.dispatches[c];
+        if d.gemv_rmsnorm.is_some()
+            || d.gemv_swiglu
+            || d.horizontal_batch >= 2
+            || d.input_buffers.first() != Some(&out)
+        {
+            continue;
+        }
+        let k = match d.shader {
+            ShaderEntry::MatMulGemv | ShaderEntry::MatMulGemvAdd => d.params.get(1).copied(),
+            _ => None,
+        };
+        if k != Some(half_n) || half_n == 0 {
+            continue;
+        }
+        rewrite.push((c, sw.input_buffers[0]));
+        drop_swiglu.push(si);
+    }
+    if drop_swiglu.is_empty() {
+        return;
+    }
+    for (idx, wide) in rewrite {
+        let d = &mut plan.dispatches[idx];
+        d.input_buffers[0] = wide;
+        d.gemv_swiglu = true;
+    }
+    drop_swiglu.sort_unstable();
+    let dropped = drop_swiglu.len();
+    for si in drop_swiglu.into_iter().rev() {
+        plan.dispatches.remove(si);
+    }
+    log::info!("fuse_swiglu_into_gemv: folded {dropped} SwiGLUConcat dispatches into their GEMVs");
+}
+
+fn is_seq1_attention(d: &Dispatch) -> bool {
+    matches!(
+        d.shader,
+        ShaderEntry::MultiHeadAttn | ShaderEntry::FlashAttention | ShaderEntry::FlashAttentionCoop
+    ) && d.params.len() >= 4
+        && d.input_buffers.len() >= 3
+        // params: [q_seq, kv_seq, packed_heads, head_dim]. Causal seq>1
+        // stores kv_seq=0 (kv_len = q_pos+1). Seq=1 causal is emitted with
+        // kv_seq=1, matching non-causal 1×1. Cross-attn with q=1 kv>1 keeps
+        // kv_seq>1 and must not be replaced by repeat(V).
+        && d.params[0] == 1
+        && d.params[1] == 1
+}
+
+fn plan_has_attention_grad(plan: &ExecutionPlan) -> bool {
+    plan.dispatches.iter().any(|d| {
+        matches!(
+            d.shader,
+            ShaderEntry::MultiHeadAttnGradQ
+                | ShaderEntry::MultiHeadAttnGradKV
+                | ShaderEntry::FlashGradQ
+                | ShaderEntry::FlashGradKV
+                | ShaderEntry::FlashGradQCoop
+                | ShaderEntry::FlashGradKVCoop
+        )
+    })
+}
+
+fn dce_unused_dispatches(plan: &mut ExecutionPlan) {
+    use std::collections::HashSet;
+    loop {
+        let mut used: HashSet<BufferRef> = HashSet::new();
+        used.extend(plan.output_buffers.iter().copied());
+        used.extend(plan.input_buffers.iter().map(|e| e.1));
+        used.extend(plan.param_buffers.iter().map(|e| e.1));
+        if let Some(b) = plan.loss_buffer {
+            used.insert(b);
+        }
+        for d in &plan.dispatches {
+            used.extend(d.input_buffers.iter().copied());
+        }
+        let n = plan.dispatches.len();
+        plan.dispatches.retain(|d| {
+            d.fusion_barrier
+                || used.contains(&d.output_buffer)
+                || d.extra_outputs.iter().any(|b| used.contains(b))
+        });
+        if plan.dispatches.len() == n {
+            break;
+        }
+    }
+}
+
+/// Seq=1 causal attention is softmax of a single score, hence 1, so the
+/// output is V with GQA head repeat. Dropping Q/K GEMVs is the seq=1 win.
+pub fn elide_seq1_attention(plan: &mut ExecutionPlan) {
+    if plan_has_attention_grad(plan) {
+        return;
+    }
+    let mut rewrite: Vec<(usize, BufferRef, u32, u32, u32)> = Vec::new();
+    for (i, d) in plan.dispatches.iter().enumerate() {
+        if !is_seq1_attention(d) {
+            continue;
+        }
+        let n_heads = d.params[2] >> 16;
+        let n_kv = d.params[2] & 0xffff;
+        let head_dim = d.params[3];
+        rewrite.push((i, d.input_buffers[2], n_heads, n_kv, head_dim));
+    }
+    if rewrite.is_empty() {
+        return;
+    }
+    for (idx, v, n_heads, n_kv, head_dim) in rewrite {
+        let out = plan.dispatches[idx].output_buffer;
+        if n_heads == n_kv {
+            for d in &mut plan.dispatches {
+                for b in &mut d.input_buffers {
+                    if *b == out {
+                        *b = v;
+                    }
+                }
+            }
+            for b in &mut plan.output_buffers {
+                if *b == out {
+                    *b = v;
+                }
+            }
+            plan.dispatches[idx].shader = ShaderEntry::RepeatKv;
+            plan.dispatches[idx].fusion_barrier = true;
+        } else {
+            let n_out = n_heads * head_dim;
+            let d = &mut plan.dispatches[idx];
+            d.shader = ShaderEntry::RepeatKv;
+            d.input_buffers = vec![v];
+            d.extra_outputs.clear();
+            d.workgroups = [n_out.div_ceil(256), 1, 1];
+            d.params = vec![n_out, n_heads, n_kv, head_dim];
+            d.pointwise = None;
+        }
+    }
+    plan.dispatches
+        .retain(|d| !(d.shader == ShaderEntry::RepeatKv && d.fusion_barrier));
+    dce_unused_dispatches(plan);
+    fuse_repeatkv_into_gemv(plan);
+    log::info!("elide_seq1_attention: seq=1 attention is repeat(V)");
+}
+
+fn fuse_repeatkv_into_gemv(plan: &mut ExecutionPlan) {
+    use std::collections::HashMap;
+    let mut readers: HashMap<BufferRef, Vec<usize>> = HashMap::new();
+    for (i, d) in plan.dispatches.iter().enumerate() {
+        for buf in &d.input_buffers {
+            readers.entry(*buf).or_default().push(i);
+        }
+    }
+    let mut drop = Vec::new();
+    let mut rewrite = Vec::new();
+    for (ri, d) in plan.dispatches.iter().enumerate() {
+        if d.shader != ShaderEntry::RepeatKv || d.input_buffers.is_empty() {
+            continue;
+        }
+        let out = d.output_buffer;
+        let Some(cons) = readers.get(&out) else {
+            continue;
+        };
+        if cons.len() != 1 {
+            continue;
+        }
+        let c = cons[0];
+        let g = &plan.dispatches[c];
+        if !matches!(
+            g.shader,
+            ShaderEntry::MatMulGemv | ShaderEntry::MatMulGemvAdd
+        ) || g.input_buffers.first() != Some(&out)
+            || g.gemv_rmsnorm.is_some()
+            || g.gemv_swiglu
+            || g.gemv_ntile
+            || g.gemv_physical_bt
+            || g.horizontal_batch >= 2
+        {
+            continue;
+        }
+        let n_kv = d.params.get(2).copied().unwrap_or(0);
+        let hd = d.params.get(3).copied().unwrap_or(0);
+        if n_kv == 0 || hd == 0 {
+            continue;
+        }
+        rewrite.push((c, d.input_buffers[0], n_kv, hd));
+        drop.push(ri);
+    }
+    if drop.is_empty() {
+        return;
+    }
+    for (idx, src, n_kv, hd) in rewrite {
+        let d = &mut plan.dispatches[idx];
+        d.input_buffers[0] = src;
+        d.gemv_repeat_kv = Some((n_kv, hd));
+    }
+    drop.sort_unstable();
+    for i in drop.into_iter().rev() {
+        plan.dispatches.remove(i);
+    }
 }
 
 pub fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
@@ -2451,6 +2838,17 @@ struct Compiler<'a> {
     fused_grad_kv_dv: HashMap<NodeId, BufferRef>,
 }
 
+/// Static RoPE at position 0 on a single row is the identity rotation:
+/// `angle = pos * θ^(-2i/d) = 0`, so `(cos, sin) = (1, 0)`.
+fn rope_static_is_identity(op: &Op, n_inputs: usize, seq: Option<usize>) -> bool {
+    match op {
+        Op::RoPE { pos_offset, .. } | Op::RoPEGrad { pos_offset, .. } => {
+            n_inputs == 1 && *pos_offset == 0 && seq == Some(1)
+        }
+        _ => false,
+    }
+}
+
 impl<'a> Compiler<'a> {
     fn new_with_options(
         graph: &'a Graph,
@@ -2689,6 +3087,17 @@ impl<'a> Compiler<'a> {
                     continue;
                 }
             }
+            // RoPE at position 0 on a single row is the identity rotation
+            // (angle = pos * inv_freq = 0). Stateless seq=1 Inferena
+            // latency would otherwise launch 60 copies. Dynamic offsets
+            // stay as kernels.
+            if rope_static_is_identity(&node.op, node.inputs.len(), node.ty.shape.first().copied())
+            {
+                if let Some(&input_buf) = self.node_buffers.get(&node.inputs[0]) {
+                    self.node_buffers.insert(node.id, input_buf);
+                    continue;
+                }
+            }
             // Loss ops output scalar [1] but the shader writes per-batch
             // or per-workgroup partial losses. Allocate enough space for
             // the shader; read_loss() sums all elements on the CPU side.
@@ -2884,6 +3293,11 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_node(&mut self, node: &Node) {
+        if rope_static_is_identity(&node.op, node.inputs.len(), node.ty.shape.first().copied())
+            && self.get_buffer(node.id) == self.get_buffer(node.inputs[0])
+        {
+            return;
+        }
         let out_buf = self.get_buffer(node.id);
         let dispatch_start = self.plan.dispatches.len();
 
@@ -2896,6 +3310,13 @@ impl<'a> Compiler<'a> {
             | Op::Identity
             | Op::StopGradient
             | Op::CrossEntropyLogitsGrad => {}
+
+            Op::Broadcast => {
+                let input = self.get_buffer(node.inputs[0]);
+                let n = node.ty.num_elements() as u32;
+                // rows=1, inner=n ⇒ dst[i] = src[i / n] = src[0].
+                self.emit_broadcast_inner(input, out_buf, 1, n);
+            }
 
             Op::Materialize => {
                 let input = self.get_buffer(node.inputs[0]);
@@ -2932,18 +3353,27 @@ impl<'a> Compiler<'a> {
                     // autodiff topology and accumulation order are unchanged;
                     // specialize only the physical forward dispatch.
                     self.emit_sum_inner(a, out_buf, m, k);
-                } else if m == 1 && n.is_multiple_of(4) {
-                    // K-split GEMV: one WG per 4 output columns (vec4),
-                    // 32 threads cooperatively K-split with a shared-
-                    // memory tree reduction. Many more WGs than N/128,
-                    // giving occupancy to hide DRAM latency at M=1.
+                } else if m == 1 && k >= 4 && n.is_multiple_of(4) {
+                    // K-split GEMV: one WG per 4 output columns (vec4).
+                    // Wide N physically transposes B to [N,K] and runs
+                    // 4-column GEMV-BT (N/4 WGs, coalesced K-walk, 256-wide).
+                    let physical_bt = gemv_physical_bt_eligible(false, wf, k, n, &self.options);
+                    let ntile = !physical_bt && gemv_ntile_eligible(false, wf, k, n, &self.options);
                     self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::MatMulGemv,
+                        shader: if physical_bt {
+                            ShaderEntry::MatMulGemvBT
+                        } else {
+                            ShaderEntry::MatMulGemv
+                        },
                         workgroups: [n / 4, 1, 1],
                         input_buffers: vec![a, b],
                         output_buffer: out_buf,
                         extra_outputs: vec![],
-                        params: vec![m, k, n, 0],
+                        params: if physical_bt {
+                            vec![m, n, k, 0]
+                        } else {
+                            vec![m, k, n, 0]
+                        },
                         use_coop: false,
                         use_small_tiles: false,
                         weight_format: wf,
@@ -2951,7 +3381,16 @@ impl<'a> Compiler<'a> {
                         // directly; no other weight format has a layout it
                         // can feed without a shuffle.
                         gemv_int_dot: self.options.quantized_activations && wf == WeightFormat::Q40,
-                        gemv_shape: self.options.gemv_shape,
+                        gemv_shape: if physical_bt {
+                            Some(crate::codegen::GemvShape {
+                                threads: 256,
+                                reduction: crate::codegen::GemvReduction::Tree,
+                            })
+                        } else {
+                            self.options.gemv_shape
+                        },
+                        gemv_ntile: ntile,
+                        gemv_physical_bt: physical_bt,
                         ..Default::default()
                     });
                 } else {
@@ -3130,21 +3569,40 @@ impl<'a> Compiler<'a> {
                 let m = a_shape[0] as u32;
                 let k = a_shape[1] as u32;
                 let n = b_shape[1] as u32;
-                if m == 1 && n.is_multiple_of(4) {
+                if m == 1 && k >= 4 && n.is_multiple_of(4) {
+                    let physical_bt = gemv_physical_bt_eligible(true, wf, k, n, &self.options);
+                    let ntile = !physical_bt && gemv_ntile_eligible(true, wf, k, n, &self.options);
                     self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::MatMulGemvAdd,
+                        shader: if physical_bt {
+                            ShaderEntry::MatMulGemvBTAdd
+                        } else {
+                            ShaderEntry::MatMulGemvAdd
+                        },
                         workgroups: [n / 4, 1, 1],
                         input_buffers: vec![a, b, d],
                         output_buffer: out_buf,
                         extra_outputs: vec![],
-                        params: vec![m, k, n, 0],
+                        params: if physical_bt {
+                            vec![m, n, k, 0]
+                        } else {
+                            vec![m, k, n, 0]
+                        },
                         use_coop: false,
                         use_small_tiles: false,
                         weight_format: wf,
                         // Keep a fused residual from silently disabling the
                         // requested Q8_1-activation path.
                         gemv_int_dot: self.options.quantized_activations && wf == WeightFormat::Q40,
-                        gemv_shape: self.options.gemv_shape,
+                        gemv_shape: if physical_bt {
+                            Some(crate::codegen::GemvShape {
+                                threads: 256,
+                                reduction: crate::codegen::GemvReduction::Tree,
+                            })
+                        } else {
+                            self.options.gemv_shape
+                        },
+                        gemv_ntile: ntile,
+                        gemv_physical_bt: physical_bt,
                         ..Default::default()
                     });
                 } else {
@@ -3208,18 +3666,34 @@ impl<'a> Compiler<'a> {
                 let m = a_shape[0] as u32;
                 let k = a_shape[1] as u32;
                 let n = b_shape[0] as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::FusedMatMulBTAdd,
-                    workgroups: matmul_workgroups(m, n, 64),
-                    input_buffers: vec![a, b, d],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![m, n, k, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
-                    weight_format: wf,
-                    ..Default::default()
-                });
+                if m == 1 && k.is_multiple_of(4) {
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::MatMulGemvBTAdd,
+                        workgroups: [n, 1, 1],
+                        input_buffers: vec![a, b, d],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params: vec![m, n, k, 0],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        weight_format: wf,
+                        gemv_shape: self.options.gemv_shape,
+                        ..Default::default()
+                    });
+                } else {
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::FusedMatMulBTAdd,
+                        workgroups: matmul_workgroups(m, n, 64),
+                        input_buffers: vec![a, b, d],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params: vec![m, n, k, 0],
+                        use_coop: false,
+                        use_small_tiles: false,
+                        weight_format: wf,
+                        ..Default::default()
+                    });
+                }
             }
 
             Op::Add => {
@@ -4097,13 +4571,17 @@ impl<'a> Compiler<'a> {
                 let seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let lse_buf = self.find_lse_buffer(node.id);
                 let (shader, workgroups) = self.attention_dispatch(seq, head_dim, num_heads);
+                // kv_seq=0 is the causal sentinel (kv_len = pos+1). Seq=1
+                // stores kv_seq=1 so elision can require a KV length of 1
+                // without swallowing cross-attention (q=1, kv>1).
+                let kv_seq = if seq == 1 { 1 } else { 0 };
                 self.plan.dispatches.push(Dispatch {
                     shader,
                     workgroups,
                     input_buffers: vec![q, k, v],
                     output_buffer: out_buf,
                     extra_outputs: vec![lse_buf],
-                    params: vec![seq, 0, (num_heads << 16) | num_kv_heads, head_dim],
+                    params: vec![seq, kv_seq, (num_heads << 16) | num_kv_heads, head_dim],
                     use_coop: false,
                     use_small_tiles: false,
                     ..Default::default()
@@ -4132,7 +4610,7 @@ impl<'a> Compiler<'a> {
                     extra_outputs: vec![lse_buf],
                     params: vec![
                         seq,
-                        0,
+                        if seq == 1 { 1 } else { 0 },
                         (num_heads << 16) | num_kv_heads,
                         head_dim,
                         window_size,

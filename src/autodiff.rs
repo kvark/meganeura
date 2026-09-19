@@ -646,6 +646,12 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 // The forward copy does not change values or shape.
                 accumulate_grad(&mut graph, &mut grads, node.inputs[0], grad_output);
             }
+            Op::Broadcast => {
+                // y[i] = x[0] ⇒ dL/dx = Σ_i dL/dy[i].
+                let x = node.inputs[0];
+                let grad_x = graph.sum_all(grad_output);
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
             // Backward grad ops: never appear in forward pass
             Op::MultiHeadAttnGradQ { .. }
             | Op::MultiHeadAttnGradK { .. }
@@ -1315,11 +1321,7 @@ fn accumulate_grad(
 /// any coefficient or downstream op multiplied onto a reduction-to-scalar
 /// output is silently dropped from the parameter gradient.
 fn broadcast_scalar(graph: &mut Graph, scalar: NodeId, target_shape: &[usize]) -> NodeId {
-    let n = target_shape.iter().product::<usize>();
-    let go_2d = graph.reshape(scalar, &[1, 1]);
-    let ones_row = graph.constant(vec![1.0; n], &[1, n]);
-    let broadcast_2d = graph.matmul(go_2d, ones_row);
-    graph.reshape(broadcast_2d, target_shape)
+    graph.broadcast(scalar, target_shape)
 }
 
 #[cfg(test)]
@@ -1384,6 +1386,23 @@ mod tests {
         // Should produce gradients for w1, b1, w2
         // outputs: [loss, grad_w1, grad_b1, grad_w2]
         assert_eq!(diff.outputs().len(), 4, "expected loss + 3 param grads");
+        assert!(
+            diff.nodes()
+                .iter()
+                .any(|node| matches!(node.op, Op::Broadcast)),
+            "CE chains grad_output through Broadcast, not a ones-row matmul"
+        );
+        let (plan, _) = crate::compile_training_graph(&g);
+        assert!(
+            !plan.dispatches.iter().any(|dispatch| {
+                matches!(
+                    dispatch.shader,
+                    crate::compile::ShaderEntry::MatMulGemv
+                        | crate::compile::ShaderEntry::MatMulGemvAdd
+                ) && dispatch.params.get(1) == Some(&1)
+            }),
+            "K=1 must not select K-split GEMV"
+        );
     }
 
     #[test]

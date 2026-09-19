@@ -137,3 +137,106 @@ fn different_a_does_not_pack() {
         "independent A operands must not pack"
     );
 }
+
+#[test]
+fn seq1_kv_gemv_pack_matches_cpu() {
+    let m = 1usize;
+    let k = 64usize;
+    let n = 32usize;
+    let mut g = Graph::new();
+    let a = g.input("a", &[m, k]);
+    let wk = g.input("wk", &[k, n]);
+    let wv = g.input("wv", &[k, n]);
+    let kk = g.matmul(a, wk);
+    let v = g.matmul(a, wv);
+    g.set_outputs(vec![kk, v]);
+
+    let (mut session, _) = build(
+        &g,
+        SessionConfig {
+            mode: Mode::Inference,
+            ..SessionConfig::from_env()
+        },
+    );
+    assert!(
+        session
+            .plan()
+            .dispatches
+            .iter()
+            .any(|d| d.horizontal_batch == 2),
+        "seq=1 K/V GEMVs should pack; got {:?}",
+        session
+            .plan()
+            .dispatches
+            .iter()
+            .map(|d| (d.shader.clone(), d.horizontal_batch, d.workgroups))
+            .collect::<Vec<_>>()
+    );
+
+    let a_data = pcg_inputs(m * k, 11);
+    let wk_data = pcg_inputs(k * n, 12);
+    let wv_data = pcg_inputs(k * n, 13);
+    session.set_input("a", &a_data);
+    session.set_input("wk", &wk_data);
+    session.set_input("wv", &wv_data);
+    session.step();
+    session.wait();
+
+    for (idx, weight) in [(0, &wk_data), (1, &wv_data)] {
+        let mut gpu = vec![0.0_f32; m * n];
+        session.read_output_by_index(idx, &mut gpu);
+        let cpu = cpu_matmul(&a_data, weight, m, k, n);
+        assert_close(&gpu, &cpu, &format!("gemv sibling {idx}"));
+    }
+}
+
+fn silu(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
+#[test]
+fn seq1_swiglu_folds_into_down_gemv() {
+    let hidden = 32usize;
+    let inter = 64usize;
+    let mut g = Graph::new();
+    let h = g.input("h", &[1, hidden]);
+    let w_pack = g.input("w_pack", &[hidden, 2 * inter]);
+    let w_down = g.input("w_down", &[inter, hidden]);
+    let residual = g.input("res", &[1, hidden]);
+    let wide = g.matmul(h, w_pack);
+    let mid = g.swiglu_concat(wide);
+    let down = g.matmul(mid, w_down);
+    let y = g.add(down, residual);
+    g.set_outputs(vec![y]);
+
+    let (mut session, _) = build(
+        &g,
+        SessionConfig {
+            mode: Mode::Inference,
+            ..SessionConfig::from_env()
+        },
+    );
+    let h_data = pcg_inputs(hidden, 21);
+    let pack_data = pcg_inputs(hidden * 2 * inter, 22);
+    let down_data = pcg_inputs(inter * hidden, 23);
+    let res_data = pcg_inputs(hidden, 24);
+    session.set_input("h", &h_data);
+    session.set_input("w_pack", &pack_data);
+    session.set_input("w_down", &down_data);
+    session.set_input("res", &res_data);
+    session.step();
+    session.wait();
+    let mut gpu = vec![0.0_f32; hidden];
+    session.read_output_by_index(0, &mut gpu);
+
+    let wide = cpu_matmul(&h_data, &pack_data, 1, hidden, 2 * inter);
+    let mut mid = vec![0.0_f32; inter];
+    for i in 0..inter {
+        mid[i] = silu(wide[i]) * wide[inter + i];
+    }
+    let mut cpu = cpu_matmul(&mid, &down_data, 1, inter, hidden);
+    for i in 0..hidden {
+        cpu[i] += res_data[i];
+    }
+    assert_close(&gpu, &cpu, "swiglu-gemv");
+}

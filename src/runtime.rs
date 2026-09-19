@@ -245,6 +245,18 @@ impl std::fmt::Display for MemorySummary {
 /// and only 64 threads vs 256 for the scalar shader.
 const MIN_COOP_WORKGROUPS_CONV_BWD: u32 = 16;
 
+/// Minimum f16-input cooperative workgroups for ordinary matmul.
+///
+/// Legal f16 tiles need enough independent 32×32 output tiles to hide
+/// shared-memory staging. Transformer prefill projections such as
+/// SmolLM2 Q/O (`128×576`, 72 tiles) are above this floor; the 16-row
+/// skinny cases used by block-matmul tests stay on scalar.
+const MIN_COOP_WORKGROUPS_F16: u32 = 64;
+/// 2×2 hardware tiles need more independent WGs than 1×1: SmolLM2 Q/O
+/// (`128×576` → 72 tiles of 32×32) lost to 1×1, while packed FFN
+/// (`128×3072` → 384) and the lm_head have enough.
+const MIN_COOP_WORKGROUPS_F16_2X2: u32 = 128;
+
 // ---- ShaderData structs matching codegen global variable names ----
 
 // matmul: var matrix_a, matrix_b, matrix_c, params
@@ -1099,7 +1111,13 @@ enum Variant {
     /// IDs are resolved at dispatch time.
     CoopPrologue(ShaderEntry, Vec<crate::compile::PrologueLoadKind>),
     /// GEMV with a RmsNorm folded into its A operand.
-    GemvRmsNorm(ShaderEntry),
+    GemvRmsNorm(ShaderEntry, crate::codegen::GemvShape),
+    /// N-tile GEMV (32 cols/WG, 8-way K-split). The entry is MatMulGemv or
+    /// MatMulGemvAdd; RmsNorm-folded uses [`Self::GemvRmsNormNTile`].
+    GemvNTile(ShaderEntry),
+    GemvRmsNormNTile,
+    GemvSwiglu(ShaderEntry, crate::codegen::GemvShape),
+    GemvRepeatKv(ShaderEntry, crate::codegen::GemvShape),
     /// The Q8_1-activation, integer-dot K-split GEMV at a measured shape.
     /// Only ever paired with a GGML Q4_0 weight, so the format is implied.
     GemvIntDot(ShaderEntry, crate::codegen::GemvShape),
@@ -1118,6 +1136,8 @@ enum Variant {
     /// axis these are pure performance: the scalar pipeline computes the
     /// same thing, so falling back to it is safe.
     Coop(ShaderEntry),
+    /// Cooperative matmul with a 2×2 hardware-tile grid per workgroup.
+    Coop2x2(ShaderEntry),
     /// Cooperative f16 with hi/lo residual staging (C1).
     CoopCompensated(ShaderEntry),
     /// Same-A matmul pack (D1). The kind is part of the key so a
@@ -1151,17 +1171,21 @@ impl Variant {
     /// schedule-template kernels, which have no entry of their own.
     fn entry(&self) -> Option<&ShaderEntry> {
         match *self {
-            Variant::Reduction(_) | Variant::Pointwise(_) => None,
+            Variant::Reduction(_) | Variant::Pointwise(_) | Variant::GemvRmsNormNTile => None,
             Variant::Attention(ref e, _)
             | Variant::SpecializedConv(ref e, _, _)
             | Variant::Epilogue(ref e, _)
             | Variant::CoopEpilogue(ref e, _)
             | Variant::CoopPrologue(ref e, _)
-            | Variant::GemvRmsNorm(ref e)
+            | Variant::GemvRmsNorm(ref e, _)
+            | Variant::GemvNTile(ref e)
+            | Variant::GemvSwiglu(ref e, _)
+            | Variant::GemvRepeatKv(ref e, _)
             | Variant::Gemv(ref e, _, _)
             | Variant::GemvIntDot(ref e, _)
             | Variant::Weight(ref e, _)
             | Variant::Coop(ref e)
+            | Variant::Coop2x2(ref e)
             | Variant::CoopCompensated(ref e)
             | Variant::Horizontal(ref e, _, _)
             | Variant::SmallTile(ref e)
@@ -1183,7 +1207,17 @@ impl Variant {
             Variant::CoopPrologue(ref e, ref kinds) => {
                 format!("{e:?}:cooperative-prologue:{kinds:?}")
             }
-            Variant::GemvRmsNorm(ref e) => format!("{e:?}:rmsnorm"),
+            Variant::GemvRmsNorm(ref e, shape) => {
+                format!("{e:?}:rmsnorm-{}t-{:?}", shape.threads, shape.reduction)
+            }
+            Variant::GemvNTile(ref e) => format!("{e:?}:ntile-32x32"),
+            Variant::GemvRmsNormNTile => "MatMulGemv:rmsnorm-ntile-32x32".into(),
+            Variant::GemvSwiglu(ref e, shape) => {
+                format!("{e:?}:swiglu-{}t-{:?}", shape.threads, shape.reduction)
+            }
+            Variant::GemvRepeatKv(ref e, shape) => {
+                format!("{e:?}:repeat-kv-{}t-{:?}", shape.threads, shape.reduction)
+            }
             Variant::GemvIntDot(ref e, shape) => {
                 format!("{e:?}:gemv-q40-q8-{}t-{:?}", shape.threads, shape.reduction)
             }
@@ -1193,6 +1227,7 @@ impl Variant {
             ),
             Variant::Weight(ref e, format) => format!("{e:?}:weight-{format:?}"),
             Variant::Coop(ref e) => format!("{e:?}:cooperative"),
+            Variant::Coop2x2(ref e) => format!("{e:?}:cooperative-2x2"),
             Variant::CoopCompensated(ref e) => format!("{e:?}:cooperative-compensated"),
             Variant::Horizontal(ref e, n, kind) => format!("{e:?}:horizontal-{n}-{kind:?}"),
             Variant::SmallTile(ref e) => format!("{e:?}:small-tile"),
@@ -1241,6 +1276,7 @@ impl Pipelines {
         use crate::codegen::ShaderGroup;
         let mut needed: HashSet<ShaderGroup> = HashSet::new();
         let mut needed_coop: HashSet<ShaderGroup> = HashSet::new();
+        let mut needed_coop_2x2: HashSet<ShaderGroup> = HashSet::new();
         let mut needed_coop_compensated: HashSet<ShaderGroup> = HashSet::new();
         let mut needed_weighted: HashMap<crate::compile::WeightFormat, HashSet<ShaderGroup>> =
             HashMap::new();
@@ -1316,6 +1352,9 @@ impl Pipelines {
                     ))
             {
                 needed_coop.insert(group);
+                if dispatch.use_coop_2x2 {
+                    needed_coop_2x2.insert(group);
+                }
                 if dispatch.use_coop_compensated {
                     needed_coop_compensated.insert(group);
                 }
@@ -1502,6 +1541,19 @@ impl Pipelines {
             }
         }
         if let Some(config) = coop_config {
+            for &group in &needed_coop_2x2 {
+                if crate::codegen::coop_shape(group).is_none() {
+                    continue;
+                }
+                compile_variant(
+                    crate::codegen::generate_module_coop_grid(group, config, 2),
+                    group,
+                    &Variant::Coop2x2,
+                    &mut map,
+                );
+            }
+        }
+        if let Some(config) = coop_config {
             for &group in &needed_coop_compensated {
                 if crate::codegen::coop_shape(group).is_none() {
                     continue;
@@ -1551,24 +1603,126 @@ impl Pipelines {
         // module is derived from the plain GEMV, so it needs no ShaderGroup
         // of its own; it is a variant of `MatMulGemv`, resolved by
         // `get_pipeline` the same way a weight format is.
-        if let Some(fused) = plan.dispatches.iter().find(|d| d.gemv_rmsnorm.is_some()) {
-            // The fused form is not tuned, but it must still honour a shape
-            // the caller pinned, or a benchmark would compare a chosen width
-            // against a default one.
-            let sm =
-                crate::codegen::generate_module_gemv_rmsnorm(fused.gemv_shape.unwrap_or_else(
-                    || crate::codegen::GemvShape::initial(ShaderGroup::MatMulGemv),
+        let mut rmsnorm_keys = std::collections::HashSet::new();
+        for dispatch in &plan.dispatches {
+            if dispatch.gemv_rmsnorm.is_some() && !dispatch.gemv_ntile {
+                let group = dispatch.shader.shader_group();
+                rmsnorm_keys.insert((
+                    dispatch.shader.clone(),
+                    dispatch
+                        .gemv_shape
+                        .unwrap_or_else(|| crate::codegen::GemvShape::initial(group)),
                 ));
+            }
+        }
+        for (entry, shape) in rmsnorm_keys {
+            let sm = if matches!(entry, ShaderEntry::MatMulGemvBT) {
+                crate::codegen::generate_module_gemv_bt_rmsnorm(shape)
+            } else {
+                crate::codegen::generate_module_gemv_rmsnorm(shape)
+            };
             let shader = gpu.create_shader(bg::ShaderDesc {
                 source: &sm.source,
                 naga_module: Some(sm.module),
             });
-            let entry = ShaderEntry::MatMulGemv;
             let layout = <MatMulRmsNormData as blade_graphics::ShaderData>::layout();
-            let key = Variant::GemvRmsNorm(entry.clone());
+            let key = Variant::GemvRmsNorm(entry.clone(), shape);
             let pipeline =
                 create_profiled_pipeline(gpu, key.label(), &layout, shader.at(entry.entry_point()));
             map.insert(key, pipeline);
+        }
+
+        for dispatch in &plan.dispatches {
+            if !dispatch.gemv_ntile {
+                continue;
+            }
+            let fused_add = matches!(dispatch.shader, ShaderEntry::MatMulGemvAdd);
+            let rmsnorm = dispatch.gemv_rmsnorm.is_some();
+            let key = if rmsnorm {
+                Variant::GemvRmsNormNTile
+            } else {
+                Variant::GemvNTile(dispatch.shader.clone())
+            };
+            if let std::collections::hash_map::Entry::Vacant(slot) = map.entry(key.clone()) {
+                let sm = crate::codegen::generate_module_gemv_ntile(fused_add, rmsnorm);
+                let shader = gpu.create_shader(bg::ShaderDesc {
+                    source: &sm.source,
+                    naga_module: Some(sm.module),
+                });
+                let layout = if rmsnorm {
+                    <MatMulRmsNormData as blade_graphics::ShaderData>::layout()
+                } else {
+                    shader_data_layout(&dispatch.shader)
+                };
+                let entry_point = if rmsnorm {
+                    ShaderEntry::MatMulGemv.entry_point()
+                } else {
+                    dispatch.shader.entry_point()
+                };
+                slot.insert(create_profiled_pipeline(
+                    gpu,
+                    key.label(),
+                    &layout,
+                    shader.at(entry_point),
+                ));
+            }
+        }
+
+        for dispatch in &plan.dispatches {
+            if dispatch.gemv_repeat_kv.is_none() {
+                continue;
+            }
+            let shape = dispatch.gemv_shape.unwrap_or_else(|| {
+                crate::codegen::GemvShape::initial(dispatch.shader.shader_group())
+            });
+            let key = Variant::GemvRepeatKv(dispatch.shader.clone(), shape);
+            if let std::collections::hash_map::Entry::Vacant(slot) = map.entry(key.clone()) {
+                let (n_kv, hd) = dispatch.gemv_repeat_kv.unwrap();
+                let sm = crate::codegen::generate_module_gemv_repeat_kv(
+                    dispatch.shader.shader_group(),
+                    shape,
+                    n_kv,
+                    hd,
+                );
+                let shader = gpu.create_shader(bg::ShaderDesc {
+                    source: &sm.source,
+                    naga_module: Some(sm.module),
+                });
+                let layout = shader_data_layout(&dispatch.shader);
+                slot.insert(create_profiled_pipeline(
+                    gpu,
+                    key.label(),
+                    &layout,
+                    shader.at(dispatch.shader.entry_point()),
+                ));
+            }
+        }
+
+        for dispatch in &plan.dispatches {
+            if !dispatch.gemv_swiglu {
+                continue;
+            }
+            let shape = dispatch.gemv_shape.unwrap_or_else(|| {
+                crate::codegen::GemvShape::initial(dispatch.shader.shader_group())
+            });
+            let key = Variant::GemvSwiglu(dispatch.shader.clone(), shape);
+            if let std::collections::hash_map::Entry::Vacant(slot) = map.entry(key.clone()) {
+                let sm = crate::codegen::generate_module_gemv_swiglu(
+                    dispatch.shader.shader_group(),
+                    shape,
+                );
+                let shader = gpu.create_shader(bg::ShaderDesc {
+                    source: &sm.source,
+                    naga_module: Some(sm.module),
+                });
+                let layout = shader_data_layout(&dispatch.shader);
+                slot.insert(create_profiled_pipeline(
+                    gpu,
+                    key.label(),
+                    &layout,
+                    shader.at(dispatch.shader.entry_point()),
+                ));
+            }
         }
 
         // Compile the int-dot GEMV for any dispatch that asked for it.
@@ -1609,7 +1763,7 @@ impl Pipelines {
         for dispatch in &plan.dispatches {
             // Its shaped pipeline was compiled above and ordinary GEMV is an
             // invalid fallback because it changes the activation arithmetic.
-            if dispatch.gemv_int_dot {
+            if dispatch.gemv_int_dot || dispatch.gemv_ntile {
                 continue;
             }
             let Some(shape) = dispatch.gemv_shape else {
@@ -1832,16 +1986,26 @@ impl Pipelines {
                     cfg
                 }),
             };
-            let sm = crate::codegen::generate_horizontal_matmul(
-                dispatch.shader.shader_group(),
-                count,
-                coop.as_ref(),
-            );
+            let sm = if dispatch.gemv_rmsnorm.is_some() {
+                let shape = dispatch.gemv_shape.unwrap_or_else(|| {
+                    crate::codegen::GemvShape::initial(dispatch.shader.shader_group())
+                });
+                crate::codegen::generate_horizontal_matmul_from(
+                    crate::codegen::generate_module_gemv_rmsnorm(shape),
+                    count,
+                )
+            } else {
+                crate::codegen::generate_horizontal_matmul(
+                    dispatch.shader.shader_group(),
+                    count,
+                    coop.as_ref(),
+                )
+            };
             let shader = gpu.create_shader(bg::ShaderDesc {
                 source: &sm.source,
                 naga_module: Some(sm.module),
             });
-            let layout = horizontal_matmul_layout(count);
+            let layout = horizontal_matmul_layout(count, dispatch.gemv_rmsnorm.is_some());
             let pipeline = create_profiled_pipeline(gpu, key.label(), &layout, shader.at("main"));
             map.insert(key, pipeline);
         }
@@ -1902,6 +2066,16 @@ impl Pipelines {
                     .unwrap_or_else(|| crate::codegen::GemvShape::initial(entry.shader_group())),
             )];
         }
+        // N-tile has a different workgroup grid than K-split; falling
+        // through to Scalar would run the vec4 kernel over N/32 groups
+        // and drop most of the output.
+        if dispatch.gemv_ntile {
+            return vec![if dispatch.gemv_rmsnorm.is_some() {
+                Variant::GemvRmsNormNTile
+            } else {
+                Variant::GemvNTile(entry.clone())
+            }];
+        }
         let mut out = Vec::new();
         if let Some(ref kernel) = dispatch.reduction {
             out.push(Variant::Reduction(kernel.hash_key()));
@@ -1918,7 +2092,28 @@ impl Pipelines {
         // for the unfused forms, so the two never compete for the same
         // dispatch — the ordering just makes that explicit.
         if dispatch.gemv_rmsnorm.is_some() {
-            out.push(Variant::GemvRmsNorm(entry.clone()));
+            out.push(Variant::GemvRmsNorm(
+                entry.clone(),
+                dispatch
+                    .gemv_shape
+                    .unwrap_or_else(|| crate::codegen::GemvShape::initial(entry.shader_group())),
+            ));
+        }
+        if dispatch.gemv_repeat_kv.is_some() {
+            return vec![Variant::GemvRepeatKv(
+                entry.clone(),
+                dispatch
+                    .gemv_shape
+                    .unwrap_or_else(|| crate::codegen::GemvShape::initial(entry.shader_group())),
+            )];
+        }
+        if dispatch.gemv_swiglu {
+            out.push(Variant::GemvSwiglu(
+                entry.clone(),
+                dispatch
+                    .gemv_shape
+                    .unwrap_or_else(|| crate::codegen::GemvShape::initial(entry.shader_group())),
+            ));
         }
         if let Some(shape) = dispatch.gemv_shape {
             out.push(Variant::Gemv(entry.clone(), dispatch.weight_format, shape));
@@ -1933,6 +2128,8 @@ impl Pipelines {
             }
             if dispatch.use_coop_compensated {
                 out.push(Variant::CoopCompensated(entry.clone()));
+            } else if dispatch.use_coop_2x2 {
+                out.push(Variant::Coop2x2(entry.clone()));
             } else {
                 out.push(Variant::Coop(entry.clone()));
             }
@@ -1999,9 +2196,12 @@ fn epilogue_profile_key(
     format!("{entry:?}:{variant}:{:016x}", hasher.finish())
 }
 
-fn horizontal_matmul_layout(count: u32) -> blade_graphics::ShaderDataLayout {
+fn horizontal_matmul_layout(count: u32, rmsnorm: bool) -> blade_graphics::ShaderDataLayout {
     let mut bindings: Vec<(&'static str, blade_graphics::ShaderBinding)> =
         vec![("matrix_a", blade_graphics::ShaderBinding::Buffer)];
+    if rmsnorm {
+        bindings.push(("norm_w", blade_graphics::ShaderBinding::Buffer));
+    }
     for i in 0..count {
         bindings.push((
             match i {
@@ -2223,7 +2423,8 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::FusedMatMulAdd
         | ShaderEntry::FusedMatMulATAdd
         | ShaderEntry::FusedMatMulBTAdd
-        | ShaderEntry::MatMulGemvAdd => FusedMatMulAddData::layout(),
+        | ShaderEntry::MatMulGemvAdd
+        | ShaderEntry::MatMulGemvBTAdd => FusedMatMulAddData::layout(),
         ShaderEntry::Relu
         | ShaderEntry::Sigmoid
         | ShaderEntry::Tanh
@@ -2251,7 +2452,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::Embedding => EmbeddingData::layout(),
         ShaderEntry::ToF16 => UnaryData::layout(),
         ShaderEntry::RoPE | ShaderEntry::RoPEGrad => RoPEData::layout(),
-        ShaderEntry::Gelu => UnaryData::layout(),
+        ShaderEntry::Gelu | ShaderEntry::RepeatKv => UnaryData::layout(),
         ShaderEntry::LayerNorm => LayerNormData::layout(),
         ShaderEntry::MultiHeadAttn
         | ShaderEntry::FlashAttention
@@ -2399,7 +2600,12 @@ pub(crate) fn select_variants(
 ) {
     if let Some(config) = coop_config {
         use crate::codegen::ShaderGroup;
-        let output_tile = config.output_tile();
+        // Convolution cooperative kernels still use a 2×2 tile grid.
+        // Ordinary matmul uses one hardware tile per workgroup so
+        // transformer prefill (e.g. 128×576) launches enough workgroups
+        // to hide f16 staging.
+        let matmul_output_tile = config.tile_size;
+        let conv_output_tile = config.output_tile();
         let _half_tile = config.tile_size;
         // Apple's native 8x8 f32 cooperative matrix path is useful for
         // compact GEMMs, but loses to the scalar tiled kernels once a
@@ -2436,6 +2642,15 @@ pub(crate) fn select_variants(
                 }
             }
             let group = dispatch.shader.shader_group();
+            let is_conv_coop_group = matches!(
+                group,
+                ShaderGroup::Conv2dGemm | ShaderGroup::Conv2dGradInputGemm
+            );
+            let mut output_tile = if is_conv_coop_group {
+                conv_output_tile
+            } else {
+                matmul_output_tile
+            };
             // Extract (m, n, k, batch) from dispatch params based on shader group.
             let (m, n, k, batch) = match group {
                 ShaderGroup::MatMul | ShaderGroup::MatMulAdd => (
@@ -2493,13 +2708,7 @@ pub(crate) fn select_variants(
             let min_wgs = if is_conv_bwd {
                 MIN_COOP_WORKGROUPS_CONV_BWD
             } else if config.use_f16_input {
-                // On discrete NVIDIA GPUs the f16 cooperative kernel's
-                // shared-memory staging costs more than the scalar tile
-                // kernel at low occupancy. Representative transformer
-                // projections with 20--72 output workgroups regress,
-                // while the wider backward/MLP shapes win once there are
-                // enough independent tiles to fill the device.
-                128
+                MIN_COOP_WORKGROUPS_F16
             } else {
                 16 // enables coop for attention K/V projections (N=320, 20 WGs)
             };
@@ -2562,6 +2771,19 @@ pub(crate) fn select_variants(
                 dispatch.scalar_fallback = Some((dispatch.shader.clone(), dispatch.workgroups));
                 dispatch.use_coop = true;
                 dispatch.use_coop_compensated = false;
+                dispatch.use_coop_2x2 = false;
+                if !is_conv_coop_group
+                    && dispatch.horizontal_batch < 2
+                    && dispatch.epilogue.is_empty()
+                    && dispatch.matmul_epilogue.is_none()
+                    && dispatch.matmul_prologue.is_none()
+                {
+                    let wgs2 = m.div_ceil(conv_output_tile) * n.div_ceil(conv_output_tile) * batch;
+                    if wgs2 >= MIN_COOP_WORKGROUPS_F16_2X2 {
+                        output_tile = conv_output_tile;
+                        dispatch.use_coop_2x2 = true;
+                    }
+                }
                 // Route conv2d coop dispatches to generated specialized kernels
                 if is_conv_bwd {
                     let kh = dispatch.params[5];
@@ -2606,6 +2828,7 @@ pub(crate) fn select_variants(
     if fuse_prologues {
         crate::compile::fuse_rmsnorm_prologues(plan);
         crate::compile::fuse_rmsnorm_into_gemv(plan);
+        crate::compile::elide_seq1_attention(plan);
     }
 
     // Small-tile selection: use 32×32 tiles when the 64×64 dispatch
@@ -2688,6 +2911,69 @@ mod block_matmul_variant_tests {
                 assert_eq!(grouped.workgroups[2], 8);
             }
         }
+    }
+
+    #[test]
+    fn smollm2_prefill_q_uses_f16_coop_at_16x16() {
+        let coop = CoopConfig {
+            tile_size: 16,
+            use_f16_input: true,
+            compensated: false,
+        };
+        let mut graph = Graph::new();
+        let a = graph.input("a", &[128, 576]);
+        let b = graph.parameter("b", &[576, 576]);
+        let residual = graph.input("residual", &[128, 576]);
+        let projected = graph.matmul(a, b);
+        let out = graph.add(projected, residual);
+        graph.set_outputs(vec![out]);
+        let optimized = crate::optimize::optimize(&graph);
+        let mut plan = compile::compile(&optimized);
+        select_variants(&mut plan, Some(&coop), true, false);
+        let matmul = plan
+            .dispatches
+            .iter()
+            .find(|d| {
+                matches!(
+                    d.shader,
+                    crate::compile::ShaderEntry::MatMul
+                        | crate::compile::ShaderEntry::FusedMatMulAdd
+                )
+            })
+            .expect("matmul dispatch");
+        assert!(
+            matmul.use_coop,
+            "128×576 f16-legal projection must use cooperative tiles, shader={:?} wgs={:?}",
+            matmul.shader, matmul.workgroups
+        );
+        assert_eq!(matmul.workgroups, [8, 36, 1]);
+        assert!(!matmul.use_coop_2x2);
+    }
+
+    #[test]
+    fn smollm2_prefill_ffn_up_uses_2x2_coop() {
+        let coop = CoopConfig {
+            tile_size: 16,
+            use_f16_input: true,
+            compensated: false,
+        };
+        let mut graph = Graph::new();
+        let a = graph.input("a", &[128, 576]);
+        let b = graph.parameter("b", &[576, 3072]);
+        let y = graph.matmul(a, b);
+        graph.set_outputs(vec![y]);
+        let mut plan = compile::compile(&graph);
+        select_variants(&mut plan, Some(&coop), false, false);
+        let matmul = &plan.dispatches[0];
+        assert!(
+            matmul.use_coop && matmul.use_coop_2x2,
+            "128×3072 packed FFN must use 2×2 coop tiles, shader={:?} wgs={:?} coop={} grid2={}",
+            matmul.shader,
+            matmul.workgroups,
+            matmul.use_coop,
+            matmul.use_coop_2x2
+        );
+        assert_eq!(matmul.workgroups, [4, 96, 1]);
     }
 }
 
@@ -3231,7 +3517,10 @@ impl Session {
         // pattern like A[i,j]=i+1, B[i,j]=j+1 misses bugs where the shader
         // loses index dependence (e.g. coop-load layout mismatches that
         // only surface when neighboring K-indices carry different weights).
-        let ot = config.output_tile() as usize;
+        // Match the ordinary matmul cooperative kernel, which launches one
+        // hardware tile per workgroup (`tile_size`). Convolution still uses
+        // `output_tile()` = 2×tile.
+        let ot = config.tile_size as usize;
         let m: usize = ot * 2; // 2 row tiles
         let inner: usize = ot * 2; // 2 K-tiles (exercises K-loop accumulation)
         let n_out: usize = ot * 2; // 2 column tiles
@@ -3294,7 +3583,7 @@ impl Session {
         {
             let mut pass = encoder.compute("coop_test");
             let mut pc = pass.with(&pipeline);
-            let ot = config.output_tile();
+            let ot = config.tile_size;
             pc.bind(
                 0,
                 &MatMulData {
@@ -3321,9 +3610,6 @@ impl Session {
 
         gpu.destroy_command_encoder(&mut encoder);
         gpu.destroy_compute_pipeline(&mut pipeline);
-        gpu.destroy_buffer(a_buf);
-        gpu.destroy_buffer(b_buf);
-        gpu.destroy_buffer(c_buf);
 
         // Compare against CPU-computed reference. f16 coop paths accumulate
         // in f32 but the inputs are truncated, so leave ~5% slack per term.
@@ -3348,7 +3634,95 @@ impl Session {
                 }
             }
         }
-        ok
+        if !ok {
+            gpu.destroy_buffer(a_buf);
+            gpu.destroy_buffer(b_buf);
+            gpu.destroy_buffer(c_buf);
+            return false;
+        }
+
+        // Same 2×2-tile problem with the 2×2 shader (one WG of 32×32).
+        let sm2 = crate::codegen::generate_module_coop_grid(ShaderGroup::MatMul, config, 2);
+        let shader2 = match gpu.try_create_shader(bg::ShaderDesc {
+            source: &sm2.source,
+            naga_module: Some(sm2.module),
+        }) {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("cooperative 2x2 matmul shader rejected: {}", e);
+                gpu.destroy_buffer(a_buf);
+                gpu.destroy_buffer(b_buf);
+                gpu.destroy_buffer(c_buf);
+                return false;
+            }
+        };
+        let mut pipeline2 = create_profiled_pipeline(
+            gpu,
+            "coop_probe_2x2".to_string(),
+            &layout,
+            shader2.at("main"),
+        );
+        unsafe {
+            let c = std::slice::from_raw_parts_mut(c_buf.data() as *mut f32, m * n_out);
+            c.fill(0.0);
+        }
+        let mut encoder = gpu.create_command_encoder(bg::CommandEncoderDesc {
+            name: "coop_test_2x2",
+            buffer_count: 2,
+            manual_barriers: false,
+        });
+        encoder.start();
+        {
+            let mut pass = encoder.compute("coop_test_2x2");
+            let mut pc = pass.with(&pipeline2);
+            let ot2 = config.output_tile();
+            pc.bind(
+                0,
+                &MatMulData {
+                    matrix_a: a_buf.at(0),
+                    matrix_b: b_buf.at(0),
+                    matrix_c: c_buf.at(0),
+                    params: MatMulParams {
+                        m: m as u32,
+                        n: n_out as u32,
+                        k: inner as u32,
+                        _pad: 0,
+                    },
+                },
+            );
+            pc.dispatch([(m as u32).div_ceil(ot2), (n_out as u32).div_ceil(ot2), 1]);
+        }
+        let sp = gpu.submit(&mut encoder);
+        let _ = wait_for_timed_encoder(gpu, &sp, &mut encoder, false);
+        let result2 =
+            unsafe { std::slice::from_raw_parts(c_buf.data() as *const f32, m * n_out).to_vec() };
+        gpu.destroy_command_encoder(&mut encoder);
+        gpu.destroy_compute_pipeline(&mut pipeline2);
+        gpu.destroy_buffer(a_buf);
+        gpu.destroy_buffer(b_buf);
+        gpu.destroy_buffer(c_buf);
+
+        let mut ok2 = true;
+        let mut first2 = true;
+        for i in 0..m {
+            for j in 0..n_out {
+                let got = result2[i * n_out + j];
+                let want = expected[i * n_out + j];
+                if (got - want).abs() > tol && (got - want).abs() > 1e-3 {
+                    if first2 {
+                        log::warn!(
+                            "coop 2x2 self-test FAILED (m={m}, n={n_out}, k={inner}, tile={}, tol={tol:.3})",
+                            config.tile_size
+                        );
+                        log::warn!("  got row 0: {:?}", &result2[..n_out.min(8)]);
+                        log::warn!("  want row 0: {:?}", &expected[..n_out.min(8)]);
+                        first2 = false;
+                    }
+                    ok2 = false;
+                }
+            }
+        }
+        ok2
     }
 
     /// Create a session from a compiled execution plan.
@@ -5348,6 +5722,47 @@ pub fn install_auto_tune(result: AutoTuneResult) {
     crate::codegen::set_coop_caps(result.coop_caps);
 }
 
+fn transpose_kn(data: &[f32], k: usize, n: usize) -> Vec<f32> {
+    assert_eq!(data.len(), k.saturating_mul(n), "transpose_kn length");
+    let mut out = vec![0.0f32; data.len()];
+    for r in 0..k {
+        for c in 0..n {
+            out[c * k + r] = data[r * n + c];
+        }
+    }
+    out
+}
+
+fn fill_horizontal_concat_physical_bt(
+    session: &Session,
+    derived_buf: crate::compile::BufferRef,
+    name: &str,
+    data: &[f32],
+    sources: &[(String, usize)],
+    k: usize,
+) {
+    let mut col_offset = 0usize;
+    for src in sources {
+        if src.0 == name {
+            let src_cols = src.1;
+            assert_eq!(data.len(), k * src_cols);
+            assert!(
+                session.logical_host_visible(derived_buf),
+                "physical-BT packed weights need a host-visible derived buffer"
+            );
+            let ptr = session.buffers[derived_buf.0 as usize].data() as *mut f32;
+            for ki in 0..k {
+                for ni in 0..src_cols {
+                    unsafe {
+                        *ptr.add((col_offset + ni) * k + ki) = data[ki * src_cols + ni];
+                    }
+                }
+            }
+        }
+        col_offset += src.1;
+    }
+}
+
 impl Session {
     /// Whether the plan has a parameter with this name.
     pub fn has_parameter(&self, name: &str) -> bool {
@@ -5392,6 +5807,9 @@ impl Session {
                         crate::compile::WeightFormat::F32 => unreachable!(),
                     };
                     self.upload_parameter_bytes(buf_ref, &packed);
+                } else if let Some((k, n)) = self.plan.physical_bt_dims(buf_ref) {
+                    let transposed = transpose_kn(data, k as usize, n as usize);
+                    self.upload_parameter_bytes(buf_ref, bytemuck::cast_slice(&transposed));
                 } else {
                     self.upload_parameter_bytes(buf_ref, bytemuck::cast_slice(data));
                 }
@@ -5409,6 +5827,17 @@ impl Session {
                     let sources = sources.as_slice();
                     match transform {
                         crate::graph::ParamTransform::HorizontalConcat => {
+                            if let Some((k, _n)) = self.plan.physical_bt_dims(derived_buf) {
+                                fill_horizontal_concat_physical_bt(
+                                    self,
+                                    derived_buf,
+                                    name,
+                                    data,
+                                    sources,
+                                    k as usize,
+                                );
+                                continue;
+                            }
                             let total_cols: usize = sources.iter().map(|s| s.1).sum();
                             let derived_fmt = self
                                 .plan
@@ -5493,6 +5922,42 @@ impl Session {
                                     }
                                     col_offset += src.1;
                                 }
+                            }
+                        }
+                        crate::graph::ParamTransform::VerticalConcat => {
+                            let total_rows: usize = sources.iter().map(|s| s.1).sum();
+                            let buf_f32 = self
+                                .plan
+                                .param_types
+                                .get(&derived_buf)
+                                .map_or(self.plan.buffers[derived_buf.0 as usize] / 4, |ty| {
+                                    ty.num_elements()
+                                });
+                            let cols = buf_f32.checked_div(total_rows).unwrap_or(0);
+                            let mut row_offset = 0usize;
+                            for src in sources {
+                                if src.0 == name && cols > 0 {
+                                    let src_rows = src.1;
+                                    let elems = src_rows * cols;
+                                    let dst = row_offset * cols;
+                                    if self.logical_host_visible(derived_buf) {
+                                        let derived_ptr =
+                                            self.buffers[derived_buf.0 as usize].data() as *mut f32;
+                                        unsafe {
+                                            std::ptr::copy_nonoverlapping(
+                                                data.as_ptr(),
+                                                derived_ptr.add(dst),
+                                                elems,
+                                            );
+                                        }
+                                    } else {
+                                        self.upload_parameter_bytes(
+                                            derived_buf,
+                                            bytemuck::cast_slice(&data[..elems]),
+                                        );
+                                    }
+                                }
+                                row_offset += src.1;
                             }
                         }
                         crate::graph::ParamTransform::Winograd3x3 {
@@ -7177,20 +7642,30 @@ impl Session {
         if dispatch.horizontal_batch >= 2 {
             let count = dispatch.horizontal_batch as usize;
             let mut pieces = vec![buf(dispatch.input_buffers[0])];
+            if let Some(ref rn) = dispatch.gemv_rmsnorm {
+                pieces.push(buf(rn.weight));
+            }
             for i in 0..count {
                 pieces.push(buf(dispatch.input_buffers[1 + i]));
             }
             pieces.push(buf(dispatch.output_buffer));
             pieces.extend(dispatch.extra_outputs.iter().map(|&r| buf(r)));
             let (m, n, k) = match dispatch.shader {
-                ShaderEntry::MatMul => (dispatch.params[0], dispatch.params[2], dispatch.params[1]),
+                ShaderEntry::MatMul | ShaderEntry::MatMulGemv | ShaderEntry::MatMulGemvAdd => {
+                    (dispatch.params[0], dispatch.params[2], dispatch.params[1])
+                }
                 _ => (dispatch.params[0], dispatch.params[1], dispatch.params[2]),
             };
+            let _pad = dispatch
+                .gemv_rmsnorm
+                .as_ref()
+                .map(|rn| rn.eps_bits)
+                .unwrap_or(0);
             pc.bind(
                 0,
                 &HorizMatMulData {
                     buffers: pieces,
-                    params: MatMulParams { m, n, k, _pad: 0 },
+                    params: MatMulParams { m, n, k, _pad },
                 },
             );
             return;
@@ -7198,6 +7673,11 @@ impl Session {
         // A GEMV with its RmsNorm folded in takes the norm's weight vector
         // as an extra binding and carries eps in the params' spare slot.
         if let Some(ref rn) = dispatch.gemv_rmsnorm {
+            let (m, n, k) = if matches!(dispatch.shader, ShaderEntry::MatMulGemvBT) {
+                (dispatch.params[0], dispatch.params[1], dispatch.params[2])
+            } else {
+                (dispatch.params[0], dispatch.params[2], dispatch.params[1])
+            };
             pc.bind(
                 0,
                 &MatMulRmsNormData {
@@ -7206,9 +7686,9 @@ impl Session {
                     matrix_b: buf(dispatch.input_buffers[1]),
                     matrix_c: buf(dispatch.output_buffer),
                     params: MatMulRmsNormParams {
-                        m: dispatch.params[0],
-                        n: dispatch.params[2],
-                        k: dispatch.params[1],
+                        m,
+                        n,
+                        k,
                         eps_bits: rn.eps_bits,
                     },
                 },
@@ -7418,6 +7898,23 @@ impl Session {
                             m: dispatch.params[0],
                             n: dispatch.params[2],
                             k: dispatch.params[1],
+                            _pad: dispatch.workgroups[1],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::MatMulGemvBTAdd => {
+                pc.bind(
+                    0,
+                    &FusedMatMulAddData {
+                        matrix_a: buf(dispatch.input_buffers[0]),
+                        matrix_b: buf(dispatch.input_buffers[1]),
+                        matrix_c: buf(dispatch.output_buffer),
+                        src: buf(dispatch.input_buffers[2]),
+                        params: MatMulParams {
+                            m: dispatch.params[0],
+                            n: dispatch.params[1],
+                            k: dispatch.params[2],
                             _pad: dispatch.workgroups[1],
                         },
                     },
@@ -7706,6 +8203,21 @@ impl Session {
                             _pad0: 0,
                             _pad1: 0,
                             _pad2: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::RepeatKv => {
+                pc.bind(
+                    0,
+                    &UnaryData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: UnaryParams {
+                            len: dispatch.params[0],
+                            _pad0: dispatch.params[1],
+                            _pad1: dispatch.params[2],
+                            _pad2: dispatch.params[3],
                         },
                     },
                 );

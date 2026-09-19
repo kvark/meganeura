@@ -464,6 +464,7 @@ fn optimize_greedy(mut g: Graph, config: OptimizeConfig) -> (Graph, OptimizeRepo
     loop {
         let before = fusions.len();
         apply_greedy_unary_simplifications(&mut g, &mut fusions);
+        apply_greedy_identity_rope(&mut g, &mut fusions);
         apply_greedy_matmul_add(&mut g, &mut fusions);
         apply_greedy_silu(&mut g, &mut fusions);
         apply_greedy_swiglu(&mut g, &mut fusions);
@@ -539,6 +540,25 @@ fn apply_greedy_unary_simplifications(graph: &mut Graph, fusions: &mut Vec<(Stri
         graph.nodes_mut()[id].op = Op::Identity;
         graph.nodes_mut()[id].inputs = vec![replacement];
         fusions.push((label.to_string(), id as u32));
+    }
+}
+
+/// RoPE / RoPEGrad at position 0 on a single row is the identity rotation.
+fn apply_greedy_identity_rope(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
+    let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
+    for id in node_ids {
+        let node = &graph.nodes()[id];
+        let pos_offset = match node.op {
+            Op::RoPE { pos_offset, .. } | Op::RoPEGrad { pos_offset, .. } => pos_offset,
+            _ => continue,
+        };
+        if node.inputs.len() != 1 || pos_offset != 0 || node.ty.shape.first() != Some(&1) {
+            continue;
+        }
+        let input = node.inputs[0];
+        graph.nodes_mut()[id].op = Op::Identity;
+        graph.nodes_mut()[id].inputs = vec![input];
+        fusions.push(("RoPE(seq=1,pos=0)→Identity".to_string(), id as u32));
     }
 }
 
@@ -633,16 +653,15 @@ fn apply_greedy_swiglu_packed(graph: &mut Graph, fusions: &mut Vec<(String, u32)
             }
             (node.inputs[0], node.inputs[1])
         };
-        let (h, wg, wu) = {
+        let (h, wg, wu, mm_op) = {
             let gate = graph.node(gate_id);
             let up = graph.node(up_id);
-            if !matches!(gate.op, Op::MatMul)
-                || !matches!(up.op, Op::MatMul)
+            if !(matches!((&gate.op, &up.op), (Op::MatMul, Op::MatMul) | (Op::MatMulBT, Op::MatMulBT)))
                 || gate.inputs[0] != up.inputs[0]
             {
                 continue;
             }
-            (gate.inputs[0], gate.inputs[1], up.inputs[1])
+            (gate.inputs[0], gate.inputs[1], up.inputs[1], gate.op.clone())
         };
         let (gate_name, up_name, in_features, out_features, dtype) = {
             let gate_weight = graph.node(wg);
@@ -658,32 +677,47 @@ fn apply_greedy_swiglu_packed(graph: &mut Graph, fusions: &mut Vec<(String, u32)
             {
                 continue;
             }
+            let (in_features, out_features) = if matches!(mm_op, Op::MatMulBT) {
+                (gate_weight.ty.shape[1], gate_weight.ty.shape[0])
+            } else {
+                (gate_weight.ty.shape[0], gate_weight.ty.shape[1])
+            };
             (
                 gate_name,
                 up_name,
-                gate_weight.ty.shape[0],
-                gate_weight.ty.shape[1],
+                in_features,
+                out_features,
                 gate_weight.ty.dtype,
             )
         };
 
         let concat_name = format!("{gate_name}+{up_name}");
+        let bt = matches!(mm_op, Op::MatMulBT);
         graph.derived_params.push(crate::graph::DerivedParam {
             name: concat_name.clone(),
             sources: vec![(gate_name, out_features), (up_name, out_features)],
             rows: in_features,
-            transform: crate::graph::ParamTransform::HorizontalConcat,
+            transform: if bt {
+                crate::graph::ParamTransform::VerticalConcat
+            } else {
+                crate::graph::ParamTransform::HorizontalConcat
+            },
         });
         let requires_full_precision = graph.node(id as NodeId).requires_full_precision;
+        let concat_shape = if bt {
+            vec![2 * out_features, in_features]
+        } else {
+            vec![in_features, 2 * out_features]
+        };
         let concat_w = graph.add_raw_node_with_precision(
             Op::Parameter { name: concat_name },
             vec![],
-            TensorType::new(vec![in_features, 2 * out_features], dtype),
+            TensorType::new(concat_shape, dtype),
             requires_full_precision,
         );
         let m = graph.node(h).ty.shape[0];
         let wide_mm = graph.add_raw_node_with_precision(
-            Op::MatMul,
+            if bt { Op::MatMulBT } else { Op::MatMul },
             vec![h, concat_w],
             TensorType::f32(vec![m, 2 * out_features]),
             requires_full_precision,
@@ -2125,6 +2159,38 @@ mod tests {
         assert!(matches!(mm_node.op, Op::MatMul));
         assert_eq!(mm_node.ty.shape, vec![50, 4096]);
         assert_eq!(opt.derived_params.len(), 1);
+    }
+
+    #[test]
+    fn seq1_rope_rewrites_to_identity() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[1, 8]);
+        let y = g.rope(x, 10000.0, 4);
+        g.set_outputs(vec![y]);
+        let (opt, report) = optimize_with_report(&g);
+        assert!(
+            matches!(opt.node(opt.outputs()[0]).op, Op::Identity),
+            "expected Identity, got {:?}",
+            opt.node(opt.outputs()[0]).op
+        );
+        assert!(
+            report
+                .fusions_applied
+                .iter()
+                .any(|entry| entry.0.contains("RoPE")),
+            "no RoPE identity fold: {:?}",
+            report.fusions_applied
+        );
+        let mut g128 = Graph::new();
+        let x128 = g128.input("x", &[128, 8]);
+        let y128 = g128.rope(x128, 10000.0, 4);
+        g128.set_outputs(vec![y128]);
+        let opt128 = optimize(&g128);
+        assert!(
+            matches!(opt128.node(opt128.outputs()[0]).op, Op::RoPE { .. }),
+            "seq=128 RoPE must remain, got {:?}",
+            opt128.node(opt128.outputs()[0]).op
+        );
     }
 
     /// Backward ops are encoded into egglog (not skipped).

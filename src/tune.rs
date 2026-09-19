@@ -163,6 +163,7 @@ pub(crate) fn gemv_group(entry: &ShaderEntry) -> Option<crate::codegen::ShaderGr
         ShaderEntry::MatMulGemv => Some(ShaderGroup::MatMulGemv),
         ShaderEntry::MatMulGemvAdd => Some(ShaderGroup::MatMulGemvAdd),
         ShaderEntry::MatMulGemvBT => Some(ShaderGroup::MatMulGemvBT),
+        ShaderEntry::MatMulGemvBTAdd => Some(ShaderGroup::MatMulGemvBTAdd),
         _ => None,
     }
 }
@@ -406,6 +407,10 @@ impl TuneClass {
             // A folded RmsNorm is a different kernel with a second reduction
             // of its own; it is not shaped here.
             || dispatch.gemv_rmsnorm.is_some()
+            || dispatch.gemv_swiglu
+            || dispatch.gemv_repeat_kv.is_some()
+            || dispatch.gemv_ntile
+            || dispatch.gemv_physical_bt
             || dispatch.horizontal_batch >= 2
             || dispatch.matmul_prologue.is_some()
             || dispatch.matmul_epilogue.is_some()

@@ -35,6 +35,7 @@ mod resnet_correctness;
 mod scatter_add_atomic;
 mod schedule_pointwise;
 mod schedule_reduction;
+mod inferena_llama_gaps;
 mod smollm2_correctness;
 mod softplus_tail;
 mod submission_chunks;

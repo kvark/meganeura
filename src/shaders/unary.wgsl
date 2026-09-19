@@ -78,3 +78,22 @@ fn gelu(@builtin(global_invocation_id) gid: vec3<u32>) {
     let inner = 0.7978845608 * (x + 0.044715 * x3);
     dst[i] = 0.5 * x * (1.0 + tanh(inner));
 }
+
+// GQA seq=1 attention is softmax([x])=1, so the output is V with each
+// KV head repeated `n_q/n_kv` times. params: len=n_out, n_q, n_kv, head_dim.
+@compute @workgroup_size(256)
+fn repeat_kv(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if i >= params.len { return; }
+    let n_q = params._pad0;
+    let n_kv = params._pad1;
+    let hd = params._pad2;
+    let heads_out = n_q * hd;
+    let seq_i = i / heads_out;
+    let rest = i % heads_out;
+    let q_head = rest / hd;
+    let d = rest % hd;
+    let group = n_q / n_kv;
+    let kv_head = q_head / group;
+    dst[i] = src[seq_i * n_kv * hd + kv_head * hd + d];
+}

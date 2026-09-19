@@ -2388,6 +2388,40 @@ fn lr_multipliers_apply_to_sgd_update() {
     );
 }
 
+#[test]
+fn seq1_static_rope_aliases_input() {
+    let mut g = Graph::new();
+    let x = g.input("x", &[1, 8]);
+    let y = g.rope(x, 10000.0, 4);
+    g.set_outputs(vec![y]);
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    assert!(
+        session
+            .plan()
+            .dispatches
+            .iter()
+            .all(|d| !matches!(d.shader, meganeura::compile::ShaderEntry::RoPE)),
+        "seq=1 pos=0 RoPE must not launch, got {:?}",
+        session
+            .plan()
+            .dispatches
+            .iter()
+            .map(|d| &d.shader)
+            .collect::<Vec<_>>()
+    );
+    let input: Vec<f32> = (0..8).map(|i| i as f32 * 0.25).collect();
+    session.set_input("x", &input);
+    session.step();
+    session.wait();
+    let output = session.read_output(8);
+    for (i, (got, want)) in output.iter().zip(&input).enumerate() {
+        assert!(
+            (got - want).abs() < 1e-6,
+            "identity RoPE[{i}]: got={got} want={want}"
+        );
+    }
+}
+
 /// Verify RoPE applies per-head rotation correctly (not global-dim rotation).
 /// With 2 heads of head_dim=4, the rotation pairs within each head should use
 /// exponents based on head_dim=4, NOT the full dim=8.

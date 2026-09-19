@@ -32,22 +32,25 @@ fn run_gpu_gemv(a_data: &[f32], b_data: &[f32], k: usize, n: usize) -> Vec<f32> 
     // Sanity: when N % 4 == 0 the plan should route through GEMV;
     // otherwise it falls back to the tile matmul.
     let plan = session.plan();
-    let gemv_count = plan
-        .dispatches
-        .iter()
-        .filter(|d| matches!(d.shader, compile::ShaderEntry::MatMulGemv))
-        .count();
+    let gemv = plan.dispatches.iter().find(|d| {
+        matches!(
+            d.shader,
+            compile::ShaderEntry::MatMulGemv | compile::ShaderEntry::MatMulGemvBT
+        )
+    });
     if n.is_multiple_of(4) {
-        assert_eq!(
-            gemv_count, 1,
-            "expected one MatMulGemv dispatch for n%4==0, found {}",
-            gemv_count
+        let d = gemv.expect("expected a GEMV dispatch for n%4==0");
+        assert_eq!(d.workgroups, [n as u32 / 4, 1, 1]);
+        assert!(
+            !d.gemv_physical_bt && matches!(d.shader, compile::ShaderEntry::MatMulGemv),
+            "physical-BT is not selected; expected K-split GEMV, got {:?}",
+            (&d.shader, d.gemv_physical_bt)
         );
     } else {
-        assert_eq!(
-            gemv_count, 0,
-            "expected tile-matmul fallback for n%4!=0, got {} GEMV",
-            gemv_count
+        assert!(
+            gemv.is_none(),
+            "expected tile-matmul fallback for n%4!=0, got {:?}",
+            gemv.map(|d| (&d.shader, d.workgroups, d.gemv_physical_bt))
         );
     }
 
@@ -89,6 +92,59 @@ fn test_shape(k: usize, n: usize, seed: u32) {
     // fp32 matmul accumulates K products; rel tol scales with sqrt(K) roughly.
     // Allow 1e-4 rel / 1e-5 abs which covers K up to a few thousand.
     assert_close(&gpu, &cpu, 1e-4, 1e-5);
+}
+
+#[test]
+#[ignore = "GPU timestamp microbench; run with --ignored"]
+fn bench_smollm2_gemv_vs_bt() {
+    use meganeura::profiler::{CaptureOptions, capture_session_profile};
+    use meganeura::{CompileOptions, GemvReduction, GemvShape};
+    unsafe { std::env::set_var("MEGANEURA_GPU_TIMING", "1") };
+    fn gpu_us(bt: bool, k: usize, n: usize, shape: GemvShape) -> f64 {
+        let mut g = Graph::new();
+        let a = g.input("a", &[1, k]);
+        let c = if bt {
+            let b = g.parameter("b", &[n, k]);
+            g.matmul_bt(a, b)
+        } else {
+            let b = g.parameter("b", &[k, n]);
+            g.matmul(a, b)
+        };
+        g.set_outputs(vec![c]);
+        let mut cfg = meganeura::SessionConfig::inference_from_env();
+        cfg.options = CompileOptions {
+            gemv_shape: Some(shape),
+            ..CompileOptions::default()
+        };
+        let mut session = meganeura::build(&g, cfg).0;
+        let a_data = vec![0.01_f32; k];
+        let b_data = vec![0.001_f32; k * n];
+        session.set_input("a", &a_data);
+        session.set_parameter("b", &b_data);
+        let profile = capture_session_profile(
+            &mut session,
+            |s| {
+                s.set_input("a", &a_data);
+            },
+            CaptureOptions {
+                samples: 8,
+                ..CaptureOptions::default()
+            },
+        )
+        .expect("profile");
+        profile.dispatches[0].median_ms * 1e3
+    }
+    let shapes = [32, 64, 256].map(|threads| GemvShape {
+        threads,
+        reduction: GemvReduction::Tree,
+    });
+    for (k, n, label) in [(576, 3072, "ffn-up packed"), (1536, 576, "ffn-down")] {
+        for shape in shapes {
+            let gemv = gpu_us(false, k, n, shape);
+            let bt = gpu_us(true, k, n, shape);
+            eprintln!("{label} {shape:?}: GEMV {gemv:.1} µs | GEMV-BT {bt:.1} µs");
+        }
+    }
 }
 
 #[test]
@@ -161,20 +217,18 @@ fn test_gemv_add_shape(k: usize, n: usize, seed: u32) {
     // Sanity: the optimizer should fuse MatMul+Add to FusedMatMulAdd, which
     // at M=1 with N%4==0 routes through MatMulGemvAdd.
     let plan = session.plan();
-    let gemv_add_count = plan
-        .dispatches
-        .iter()
-        .filter(|disp| matches!(disp.shader, compile::ShaderEntry::MatMulGemvAdd))
-        .count();
-    assert_eq!(
-        gemv_add_count,
-        1,
-        "expected one MatMulGemvAdd dispatch, got {}; plan:\n{:?}",
-        gemv_add_count,
-        plan.dispatches
-            .iter()
-            .map(|d| format!("{:?}", d.shader))
-            .collect::<Vec<_>>(),
+    let gemv_add = plan.dispatches.iter().find(|disp| {
+        matches!(
+            disp.shader,
+            compile::ShaderEntry::MatMulGemvAdd | compile::ShaderEntry::MatMulGemvBTAdd
+        )
+    });
+    let disp = gemv_add.expect("expected a fused GEMV-add dispatch");
+    assert_eq!(disp.workgroups, [n as u32 / 4, 1, 1]);
+    assert!(
+        !disp.gemv_physical_bt && matches!(disp.shader, compile::ShaderEntry::MatMulGemvAdd),
+        "physical-BT is not selected; expected K-split GEMV-add, got {:?}",
+        (&disp.shader, disp.gemv_physical_bt)
     );
 
     session.set_input("a", &a);
@@ -185,6 +239,54 @@ fn test_gemv_add_shape(k: usize, n: usize, seed: u32) {
     let gpu = session.read_output(n);
     let cpu = cpu_gemv_add(&a, &b, &d, k, n);
     assert_close(&gpu, &cpu, 1e-4, 1e-5);
+}
+
+#[test]
+fn gemv_ntile_rmsnorm_smollm2_ffn_up() {
+    // Packed FFN-up: RmsNorm folded into N-tile GEMV, N=3072, K=576.
+    const K: usize = 576;
+    const N: usize = 3072;
+    const EPS: f32 = 1e-5;
+    let a: Vec<f32> = (0..K)
+        .map(|i| ((i as u32 ^ 9) as f32 * 0.003).sin())
+        .collect();
+    let w: Vec<f32> = (0..K)
+        .map(|i| 0.9 + ((i as u32 ^ 13) as f32 * 0.001).sin() * 0.1)
+        .collect();
+    let b: Vec<f32> = (0..K * N)
+        .map(|i| ((i as u32 ^ 31) as f32 * 0.0007).cos())
+        .collect();
+
+    let mut g = Graph::new();
+    let x = g.input("x", &[1, K]);
+    let nw = g.parameter("norm", &[K]);
+    let bw = g.parameter("b", &[K, N]);
+    let h = g.rms_norm(x, nw, EPS);
+    let c = g.matmul(h, bw);
+    g.set_outputs(vec![c]);
+
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    let plan = session.plan();
+    let fused = plan
+        .dispatches
+        .iter()
+        .find(|d| d.gemv_rmsnorm.is_some() && matches!(d.shader, compile::ShaderEntry::MatMulGemv));
+    let fused = fused.expect("RmsNorm must fold into the FFN-up GEMV");
+    assert!(!fused.gemv_physical_bt);
+    assert_eq!(fused.workgroups, [N as u32 / 4, 1, 1]);
+
+    session.set_input("x", &a);
+    session.set_parameter("norm", &w);
+    session.set_parameter("b", &b);
+    session.step();
+    session.wait();
+    let gpu = session.read_output(N);
+
+    let mean_sq: f32 = a.iter().map(|v| v * v).sum::<f32>() / K as f32;
+    let inv_rms = (mean_sq + EPS).sqrt().recip();
+    let a_hat: Vec<f32> = a.iter().zip(&w).map(|(x, wi)| x * inv_rms * wi).collect();
+    let cpu = cpu_gemv(&a_hat, &b, K, N);
+    assert_close_named("ntile-rmsnorm", &gpu, &cpu, 1e-4, 1e-5);
 }
 
 #[test]
@@ -202,6 +304,107 @@ fn gemv_add_smollm2_o_proj() {
 #[test]
 fn gemv_add_smolvla_mlp_down() {
     test_gemv_add_shape(2048, 720, 102);
+}
+
+fn cpu_repeat_kv(v: &[f32], n_q: usize, n_kv: usize, head_dim: usize) -> Vec<f32> {
+    let group = n_q / n_kv;
+    let mut out = vec![0.0_f32; n_q * head_dim];
+    for q_head in 0..n_q {
+        let kv_head = q_head / group;
+        let src = kv_head * head_dim;
+        let dst = q_head * head_dim;
+        out[dst..dst + head_dim].copy_from_slice(&v[src..src + head_dim]);
+    }
+    out
+}
+
+#[test]
+fn seq1_gqa_elide_folds_repeat_into_o_proj() {
+    // Stateless seq=1 GQA: softmax of one score is 1, so attention is
+    // repeat(V). The shipped session path must fold that into o_proj GEMV-add.
+    const HIDDEN: usize = 16;
+    const N_Q: usize = 4;
+    const N_KV: usize = 2;
+    const HD: usize = 4;
+    const Q_DIM: usize = N_Q * HD;
+    const KV_DIM: usize = N_KV * HD;
+    let seed = 77u32;
+    let x: Vec<f32> = (0..HIDDEN)
+        .map(|i| ((i as u32 ^ seed) as f32 * 0.003).sin())
+        .collect();
+    let wq: Vec<f32> = (0..HIDDEN * Q_DIM)
+        .map(|i| ((i as u32 ^ seed.wrapping_mul(3)) as f32 * 0.0007).cos())
+        .collect();
+    let wk: Vec<f32> = (0..HIDDEN * KV_DIM)
+        .map(|i| ((i as u32 ^ seed.wrapping_mul(5)) as f32 * 0.0007).cos())
+        .collect();
+    let wv: Vec<f32> = (0..HIDDEN * KV_DIM)
+        .map(|i| ((i as u32 ^ seed.wrapping_mul(7)) as f32 * 0.0007).cos())
+        .collect();
+    let wo: Vec<f32> = (0..Q_DIM * HIDDEN)
+        .map(|i| ((i as u32 ^ seed.wrapping_mul(11)) as f32 * 0.0007).cos())
+        .collect();
+    let residual: Vec<f32> = (0..HIDDEN)
+        .map(|i| ((i as u32 ^ seed.wrapping_mul(13)) as f32 * 0.01).sin() * 0.1)
+        .collect();
+
+    let mut g = Graph::new();
+    let x_n = g.input("x", &[1, HIDDEN]);
+    let wq_n = g.parameter("wq", &[HIDDEN, Q_DIM]);
+    let wk_n = g.parameter("wk", &[HIDDEN, KV_DIM]);
+    let wv_n = g.parameter("wv", &[HIDDEN, KV_DIM]);
+    let wo_n = g.parameter("wo", &[Q_DIM, HIDDEN]);
+    let res_n = g.parameter("residual", &[1, HIDDEN]);
+    let q = g.matmul(x_n, wq_n);
+    let k = g.matmul(x_n, wk_n);
+    let v = g.matmul(x_n, wv_n);
+    let attn = g.causal_attention(q, k, v, N_Q as u32, N_KV as u32, HD as u32);
+    let proj = g.matmul(attn, wo_n);
+    let out = g.add(proj, res_n);
+    g.set_outputs(vec![out]);
+
+    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    let plan = session.plan();
+    assert!(
+        !plan.dispatches.iter().any(|d| {
+            matches!(
+                d.shader,
+                compile::ShaderEntry::MultiHeadAttn
+                    | compile::ShaderEntry::FlashAttention
+                    | compile::ShaderEntry::FlashAttentionCoop
+                    | compile::ShaderEntry::RepeatKv
+            )
+        }),
+        "seq=1 GQA must drop attention and fold repeat(V) into o_proj, got {:?}",
+        plan.dispatches
+            .iter()
+            .map(|d| (&d.label, d.shader.clone(), d.gemv_repeat_kv, d.workgroups))
+            .collect::<Vec<_>>()
+    );
+    let o_proj = plan
+        .dispatches
+        .iter()
+        .find(|d| {
+            d.gemv_repeat_kv == Some((N_KV as u32, HD as u32))
+                && matches!(d.shader, compile::ShaderEntry::MatMulGemvAdd)
+        })
+        .expect("o_proj GEMV-add must carry gemv_repeat_kv");
+    assert_eq!(o_proj.workgroups, [HIDDEN as u32 / 4, 1, 1]);
+
+    session.set_input("x", &x);
+    session.set_parameter("wq", &wq);
+    session.set_parameter("wk", &wk);
+    session.set_parameter("wv", &wv);
+    session.set_parameter("wo", &wo);
+    session.set_parameter("residual", &residual);
+    session.step();
+    session.wait();
+    let gpu = session.read_output(HIDDEN);
+
+    let v_row = cpu_gemv(&x, &wv, HIDDEN, KV_DIM);
+    let attn_row = cpu_repeat_kv(&v_row, N_Q, N_KV, HD);
+    let cpu = cpu_gemv_add(&attn_row, &wo, &residual, Q_DIM, HIDDEN);
+    assert_close_named("seq1-gqa-repeat-kv", &gpu, &cpu, 1e-4, 1e-5);
 }
 
 // ---- MatMulBT GEMV (B stored [N, K]) ----

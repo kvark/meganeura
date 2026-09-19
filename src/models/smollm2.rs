@@ -32,6 +32,17 @@ pub enum ProjectionWeights {
 /// weight rather than fail. Such a projection stays f32; every SmolLM2
 /// shape in this file satisfies the constraint, so this only guards
 /// hand-written configs.
+fn linear(
+    g: &mut Graph,
+    name: &str,
+    out_features: usize,
+    in_features: usize,
+    x: NodeId,
+) -> NodeId {
+    let w = g.parameter(name, &[in_features, out_features]);
+    g.matmul(x, w)
+}
+
 fn projection(g: &mut Graph, weights: ProjectionWeights, name: &str, shape: &[usize]) -> NodeId {
     if weights == ProjectionWeights::Q4 && shape[0].is_multiple_of(32) {
         g.parameter_q4(name, shape)
@@ -136,6 +147,7 @@ pub fn build_graph(g: &mut Graph, config: &SmolLM2Config, seq_len: usize) -> Nod
     let eps = config.rms_norm_eps;
     let theta = config.rope_theta;
 
+
     // Token embedding
     let token_ids = g.input_u32("token_ids", &[seq_len]);
     let embed_weight = g.parameter("model.embed_tokens.weight", &[config.vocab_size, hidden]);
@@ -149,23 +161,27 @@ pub fn build_graph(g: &mut Graph, config: &SmolLM2Config, seq_len: usize) -> Nod
         let ln1_w = g.parameter(&format!("{}.input_layernorm.weight", prefix), &[hidden]);
         let h = g.rms_norm(x, ln1_w, eps);
 
-        // QKV projections (weights are [out, in] in HF, we transpose during loading)
-        let wq = g.parameter(
+        let q = linear(
+            g,
             &format!("{}.self_attn.q_proj.weight", prefix),
-            &[hidden, hidden],
+            hidden,
+            hidden,
+            h,
         );
-        let wk = g.parameter(
+        let k = linear(
+            g,
             &format!("{}.self_attn.k_proj.weight", prefix),
-            &[hidden, kv_dim],
+            kv_dim,
+            hidden,
+            h,
         );
-        let wv = g.parameter(
+        let v = linear(
+            g,
             &format!("{}.self_attn.v_proj.weight", prefix),
-            &[hidden, kv_dim],
+            kv_dim,
+            hidden,
+            h,
         );
-
-        let q = g.matmul(h, wq); // [seq, hidden]
-        let k = g.matmul(h, wk); // [seq, kv_dim]
-        let v = g.matmul(h, wv); // [seq, kv_dim]
 
         // RoPE
         let q = g.rope(q, theta, config.head_dim());
@@ -182,11 +198,13 @@ pub fn build_graph(g: &mut Graph, config: &SmolLM2Config, seq_len: usize) -> Nod
         );
 
         // Output projection
-        let wo = g.parameter(
+        let attn_out = linear(
+            g,
             &format!("{}.self_attn.o_proj.weight", prefix),
-            &[hidden, hidden],
+            hidden,
+            hidden,
+            attn,
         );
-        let attn_out = g.matmul(attn, wo);
 
         // Residual connection
         x = g.add(x, attn_out);
@@ -198,15 +216,28 @@ pub fn build_graph(g: &mut Graph, config: &SmolLM2Config, seq_len: usize) -> Nod
         );
         let h = g.rms_norm(x, ln2_w, eps);
 
-        // SwiGLU FFN
-        let w_gate = g.parameter(&format!("{}.mlp.gate_proj.weight", prefix), &[hidden, ffn]);
-        let w_up = g.parameter(&format!("{}.mlp.up_proj.weight", prefix), &[hidden, ffn]);
-        let w_down = g.parameter(&format!("{}.mlp.down_proj.weight", prefix), &[ffn, hidden]);
-
-        let gate = g.matmul(h, w_gate); // [seq, ffn]
-        let up = g.matmul(h, w_up); // [seq, ffn]
+        let gate = linear(
+            g,
+            &format!("{}.mlp.gate_proj.weight", prefix),
+            ffn,
+            hidden,
+            h,
+        );
+        let up = linear(
+            g,
+            &format!("{}.mlp.up_proj.weight", prefix),
+            ffn,
+            hidden,
+            h,
+        );
         let ffn_out = g.swiglu(gate, up);
-        let ffn_out = g.matmul(ffn_out, w_down); // [seq, hidden]
+        let ffn_out = linear(
+            g,
+            &format!("{}.mlp.down_proj.weight", prefix),
+            hidden,
+            ffn,
+            ffn_out,
+        );
 
         // Residual connection
         x = g.add(x, ffn_out);
@@ -222,8 +253,7 @@ pub fn build_graph(g: &mut Graph, config: &SmolLM2Config, seq_len: usize) -> Nod
         // x @ embed_weight^T = [seq, hidden] @ [hidden, vocab] = [seq, vocab]
         g.matmul_bt(x, embed_weight)
     } else {
-        let lm_head = g.parameter("lm_head.weight", &[hidden, config.vocab_size]);
-        g.matmul(x, lm_head) // [seq, vocab]
+        linear(g, "lm_head.weight", config.vocab_size, hidden, x)
     }
 }
 
@@ -560,6 +590,10 @@ pub fn weight_names(config: &SmolLM2Config) -> Vec<String> {
 }
 
 /// Names of weight tensors that need transposing (linear layer weights).
+///
+/// Seq>1 `build_graph` stores `[in, out]` for cooperative prefill. Seq=1
+/// stores HuggingFace `[out, in]` for GEMV-BT and does not use this list
+/// (Inferena name-seeds by element count).
 pub fn transposed_weight_names(config: &SmolLM2Config) -> Vec<String> {
     let mut names = Vec::new();
     for i in 0..config.num_hidden_layers {

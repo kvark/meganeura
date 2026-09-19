@@ -360,6 +360,13 @@ pub enum Op {
     /// externally-backed or otherwise non-local buffer in device-local memory.
     /// Backward is the identity.
     Materialize,
+    /// Expand a one-element tensor to `shape` by repeating the scalar.
+    ///
+    /// Autodiff uses this to chain a scalar `grad_output` onto a tensor
+    /// Jacobian. Implemented as a broadcast kernel, not a dummy matmul
+    /// against a ones-row — that path selected K-split GEMV at M=1,K=1
+    /// and launched one workgroup per four output columns.
+    Broadcast,
     /// Forward identity, backward zero. Lets a graph use a value in two
     /// places where one branch's gradient should not flow back to the
     /// shared producer (the standard "detach" / "stop_gradient" op in
@@ -825,6 +832,9 @@ pub struct Node {
 pub enum ParamTransform {
     /// Horizontal concatenation: interleave source columns per row.
     HorizontalConcat,
+    /// Vertical concatenation: stack source row-blocks. Used when packing
+    /// SwiGLU gate+up weights stored as HuggingFace `[out, in]`.
+    VerticalConcat,
     /// Winograd F(2,3) weight transform: [Co, Ci, 3, 3] → [16, Co, Ci].
     Winograd3x3 {
         out_channels: usize,
@@ -1558,6 +1568,20 @@ impl Graph {
             "materialize only supports f32 tensors"
         );
         self.add_raw_node(Op::Materialize, vec![x], ty)
+    }
+
+    /// Repeat a one-element tensor across `shape`.
+    #[track_caller]
+    pub fn broadcast(&mut self, scalar: NodeId, shape: &[usize]) -> NodeId {
+        let src = self.node(scalar);
+        assert_eq!(
+            src.ty.num_elements(),
+            1,
+            "broadcast requires a one-element source, got {:?}",
+            src.ty.shape
+        );
+        assert_eq!(src.ty.dtype, DType::F32, "broadcast only supports f32");
+        self.add_raw_node(Op::Broadcast, vec![scalar], TensorType::f32(shape.to_vec()))
     }
 
     /// Forward identity, backward zero — the "detach" / `stop_gradient`

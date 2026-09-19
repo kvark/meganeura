@@ -54,8 +54,10 @@ impl GemvShape {
     /// measurement challenges whichever is in force.
     pub(crate) fn initial(group: ShaderGroup) -> Self {
         let threads = match group {
-            ShaderGroup::MatMulGemv => 256,
-            ShaderGroup::MatMulGemvAdd | ShaderGroup::MatMulGemvBT => 32,
+            ShaderGroup::MatMulGemv | ShaderGroup::MatMulGemvAdd => 256,
+            // Coalesced K-walk: 64 threads beat 256 on SmolLM2 FFN GEMV-BT
+            // (7.1 µs vs 14.5 µs for packed FFN-up on RTX 5070).
+            ShaderGroup::MatMulGemvBT | ShaderGroup::MatMulGemvBTAdd => 64,
             _ => panic!("{group:?} is not a GEMV group"),
         };
         Self {
@@ -93,7 +95,9 @@ pub struct CoopConfig {
 }
 
 impl CoopConfig {
-    /// Output tile per workgroup = 2 × tile_size (2×2 grid of coop tiles).
+    /// Output tile per workgroup for generated convolution cooperative
+    /// kernels (2×2 hardware tiles). Ordinary matmul cooperative kernels
+    /// use [`Self::tile_size`] so transformer prefill has enough workgroups.
     pub fn output_tile(&self) -> u32 {
         2 * self.tile_size
     }
@@ -447,6 +451,8 @@ pub enum ShaderGroup {
     /// M=1 MatMulBT (`B` stored `[N,K]`): `C[1,N] = A × Bᵀ`. K-split with
     /// coalesced contiguous-K vec4 loads.
     MatMulGemvBT,
+    /// M=1 MatMulBT with fused residual add.
+    MatMulGemvBTAdd,
     Reduce,
     Softmax,
     CrossEntropy,
@@ -551,7 +557,10 @@ pub fn generate_module(group: ShaderGroup) -> ShaderModule {
         }
         ShaderGroup::MatMulATAdd => gen_matmul_at_add(),
         ShaderGroup::MatMulBTAdd => gen_matmul_bt_add(),
-        ShaderGroup::MatMulGemv | ShaderGroup::MatMulGemvAdd | ShaderGroup::MatMulGemvBT => {
+        ShaderGroup::MatMulGemv
+        | ShaderGroup::MatMulGemvAdd
+        | ShaderGroup::MatMulGemvBT
+        | ShaderGroup::MatMulGemvBTAdd => {
             generate_module_gemv(group, WeightFormat::F32, GemvShape::initial(group))
         }
         ShaderGroup::Reduce => parse_wgsl(include_str!("shaders/reduce.wgsl")),
@@ -698,9 +707,19 @@ pub(crate) fn coop_shape(group: ShaderGroup) -> Option<(bool, MatMulCoopVariant)
 /// tile config. Takes the scalar group: cooperative execution is a
 /// modifier on a dispatch, not a group of its own.
 pub fn generate_module_coop(group: ShaderGroup, config: &CoopConfig) -> ShaderModule {
+    generate_module_coop_grid(group, config, 1)
+}
+
+/// `grid` is 1 (one hardware tile per WG) or 2 (2×2 tiles, llama-style 32×32
+/// on a 16×16 device). Convolution still uses [`CoopConfig::output_tile`].
+pub fn generate_module_coop_grid(
+    group: ShaderGroup,
+    config: &CoopConfig,
+    grid: u32,
+) -> ShaderModule {
     let (fused_add, variant) =
         coop_shape(group).unwrap_or_else(|| panic!("no cooperative form for {group:?}"));
-    gen_matmul_coop_wgsl(fused_add, variant, config)
+    gen_matmul_coop_wgsl(fused_add, variant, config, grid)
 }
 
 /// Pack `count` same-A matmuls into one dispatch (`workgroups.z = count`).
@@ -710,25 +729,51 @@ pub fn generate_horizontal_matmul(
     count: u32,
     coop: Option<&CoopConfig>,
 ) -> ShaderModule {
-    assert!((2..=3).contains(&count));
     let base = match coop {
         Some(config) => generate_module_coop(group, config),
         None => generate_module(group),
     };
+    generate_horizontal_matmul_from(base, count)
+}
+
+/// Pack `count` same-A kernels from an already-generated module.
+pub fn generate_horizontal_matmul_from(base: ShaderModule, count: u32) -> ShaderModule {
+    assert!((2..=3).contains(&count));
     let src = &base.source;
     let Some((header, rest)) = src.split_once("@compute") else {
         panic!("matmul source missing @compute");
     };
-    let compute_attr = if rest.contains("@workgroup_size(64)") {
-        "@compute @workgroup_size(64)"
+    let wg = if rest.contains("@workgroup_size(LANES)") {
+        gemv_declared_threads(src)
+    } else if rest.contains("@workgroup_size(256)") {
+        256
+    } else if rest.contains("@workgroup_size(128)") {
+        128
+    } else if rest.contains("@workgroup_size(64)") {
+        64
+    } else if rest.contains("@workgroup_size(32)") {
+        32
     } else {
-        "@compute @workgroup_size(16, 16)"
+        16
+    };
+    let compute_attr = if wg == 16 {
+        "@compute @workgroup_size(16, 16)".to_string()
+    } else {
+        format!("@compute @workgroup_size({wg})")
     };
     let b_line = header
         .lines()
         .find(|l| l.contains("var<storage> matrix_b"))
         .unwrap_or("var<storage> matrix_b: array<f32>;");
     let b_ty = b_line
+        .split_once(':')
+        .map(|(_, t)| t.trim().trim_end_matches(';').trim())
+        .unwrap_or("array<f32>");
+    let c_line = header
+        .lines()
+        .find(|l| l.contains("var<storage, read_write> matrix_c"))
+        .unwrap_or("var<storage, read_write> matrix_c: array<f32>;");
+    let c_ty = c_line
         .split_once(':')
         .map(|(_, t)| t.trim().trim_end_matches(';').trim())
         .unwrap_or("array<f32>");
@@ -739,7 +784,9 @@ pub fn generate_horizontal_matmul(
     );
     let extras: String = (1..count)
         .map(|i| {
-            format!("var<storage> matrix_b{i}: {b_ty};\nvar<storage, read_write> matrix_c{i}: array<f32>;\n")
+            format!(
+                "var<storage> matrix_b{i}: {b_ty};\nvar<storage, read_write> matrix_c{i}: {c_ty};\n"
+            )
         })
         .collect();
     if let Some(pos) = header.find("var<storage, read_write> matrix_c0:") {
@@ -754,18 +801,33 @@ pub fn generate_horizontal_matmul(
     let mut bodies = String::new();
     for i in 0..count {
         let mut fn_src = rest.replace("fn main", &format!("fn horiz_{i}"));
+        fn_src = fn_src.replacen("@workgroup_size(LANES)", "", 1);
+        fn_src = fn_src.replacen("@workgroup_size(256)", "", 1);
+        fn_src = fn_src.replacen("@workgroup_size(128)", "", 1);
         fn_src = fn_src.replacen("@workgroup_size(64)", "", 1);
+        fn_src = fn_src.replacen("@workgroup_size(32)", "", 1);
         fn_src = fn_src.replacen("@workgroup_size(16, 16)", "", 1);
         fn_src = fn_src.replace("@builtin(workgroup_id) ", "");
         fn_src = fn_src.replace("@builtin(local_invocation_id) ", "");
+        fn_src = fn_src.replace("@builtin(subgroup_invocation_id) ", "");
+        fn_src = fn_src.replace("@builtin(subgroup_size) ", "");
         fn_src = fn_src.replace("matrix_b[", &format!("matrix_b{i}["));
         fn_src = fn_src.replace("matrix_c[", &format!("matrix_c{i}["));
         bodies.push_str(&fn_src);
         bodies.push('\n');
     }
-    let mut dispatch = format!(
-        "{compute_attr}\nfn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{\n"
-    );
+    let needs_sg = rest.contains("sg_id");
+    let main_args = if needs_sg {
+        "@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(subgroup_invocation_id) sg_id: u32"
+    } else {
+        "@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>"
+    };
+    let call_args = if needs_sg {
+        "wgid, lid, sg_id"
+    } else {
+        "wgid, lid"
+    };
+    let mut dispatch = format!("{compute_attr}\nfn main({main_args}) {{\n");
     for i in 0..count {
         let cond = if i + 1 == count {
             "else".to_string()
@@ -774,7 +836,7 @@ pub fn generate_horizontal_matmul(
         } else {
             format!("else if wgid.z == {i}u")
         };
-        dispatch.push_str(&format!("    {cond} {{ horiz_{i}(wgid, lid); }}\n"));
+        dispatch.push_str(&format!("    {cond} {{ horiz_{i}({call_args}); }}\n"));
     }
     dispatch.push_str("}\n");
     parse_wgsl(&format!("{header}{bodies}{dispatch}"))
@@ -1790,7 +1852,10 @@ pub fn generate_module_weighted(group: ShaderGroup, format: WeightFormat) -> Sha
         // Every block-packed format takes the same K-split GEMV with its
         // own decoder substituted, so the format picks the helper rather
         // than the arm.
-        ShaderGroup::MatMulGemv | ShaderGroup::MatMulGemvAdd | ShaderGroup::MatMulGemvBT => {
+        ShaderGroup::MatMulGemv
+        | ShaderGroup::MatMulGemvAdd
+        | ShaderGroup::MatMulGemvBT
+        | ShaderGroup::MatMulGemvBTAdd => {
             generate_module_gemv(group, mode, GemvShape::initial(group))
         }
         // Unsupported packed routes must fail closed: falling through would
@@ -1885,6 +1950,249 @@ pub fn generate_module_gemv_rmsnorm(shape: GemvShape) -> ShaderModule {
         &src,
         "        let a = matrix_a[kk];",
         "        let a = matrix_a[kk] * rs * norm_w[kk];",
+    );
+    parse_wgsl(&gemv_shape_source(&src, shape))
+}
+
+/// RmsNorm folded into GEMV-BT: `C[1,N] = (rmsnorm(A)*w) × B[N,K]ᵀ`.
+pub fn generate_module_gemv_bt_rmsnorm(shape: GemvShape) -> ShaderModule {
+    let src = substitute(
+        include_str!("shaders/matmul_gemv_bt.wgsl"),
+        "    _pad: u32,",
+        "    eps_bits: u32,",
+    );
+    let src = substitute(
+        &src,
+        "var<storage> matrix_b: array<vec4<f32>>;",
+        "var<storage> norm_w: array<vec4<f32>>;\nvar<storage> matrix_b: array<vec4<f32>>;",
+    );
+    let src = substitute(
+        &src,
+        "var<workgroup> reduce_buf: array<f32, LANES>;",
+        "var<workgroup> reduce_buf: array<f32, LANES>;\n\
+         var<workgroup> scale_buf: array<f32, LANES>;\n\
+         var<workgroup> inv_rms: f32;",
+    );
+    let src = substitute(
+        &src,
+        "    if col >= params.n { return; }\n    let k_v4 = params.k / 4u;\n",
+        "    let k_v4 = params.k / 4u;\n",
+    );
+    let src = substitute(
+        &src,
+        "    var acc = 0.0;",
+        "    var ss = 0.0;\n\
+    var si = lane;\n\
+    loop {\n\
+        if si >= k_v4 { break; }\n\
+        let v = matrix_a[si];\n\
+        ss += dot(v, v);\n\
+        si += LANES;\n\
+    }\n\
+    scale_buf[lane] = ss;\n\
+    workgroupBarrier();\n\
+    var sstride = LANES / 2u;\n\
+    loop {\n\
+        if sstride == 0u { break; }\n\
+        if lane < sstride { scale_buf[lane] += scale_buf[lane + sstride]; }\n\
+        workgroupBarrier();\n\
+        sstride >>= 1u;\n\
+    }\n\
+    if lane == 0u {\n\
+        inv_rms = inverseSqrt(scale_buf[0] / f32(params.k) + bitcast<f32>(params.eps_bits));\n\
+    }\n\
+    workgroupBarrier();\n\
+    let rs = inv_rms;\n\
+    if col >= params.n { return; }\n\
+    var acc = 0.0;",
+    );
+    let src = substitute(
+        &src,
+        "        let a = matrix_a[kk_v4];",
+        "        let a = matrix_a[kk_v4] * rs * norm_w[kk_v4];",
+    );
+    parse_wgsl(&gemv_shape_source(&src, shape))
+}
+
+/// 4-output GEMV-BT used when a logical `[K,N]` weight is stored `[N,K]`.
+pub fn generate_module_gemv_bt_x4(
+    fused_add: bool,
+    rmsnorm: bool,
+    shape: GemvShape,
+) -> ShaderModule {
+    assert!(
+        !(fused_add && rmsnorm),
+        "4-col GEMV-BT has no combined residual+RmsNorm form"
+    );
+    let mut src = include_str!("shaders/matmul_gemv_bt_x4.wgsl").to_string();
+    if rmsnorm {
+        src = substitute(&src, "    _pad: u32,", "    eps_bits: u32,");
+        src = substitute(
+            &src,
+            "var<storage> matrix_b: array<vec4<f32>>;",
+            "var<storage> norm_w: array<vec4<f32>>;\nvar<storage> matrix_b: array<vec4<f32>>;",
+        );
+        src = substitute(
+            &src,
+            "var<workgroup> reduce_buf: array<vec4<f32>, LANES>;",
+            "var<workgroup> reduce_buf: array<vec4<f32>, LANES>;\n\
+             var<workgroup> scale_buf: array<f32, LANES>;\n\
+             var<workgroup> inv_rms: f32;",
+        );
+        src = substitute(
+            &src,
+            "    var acc = vec4<f32>(0.0);",
+            "    var ss = 0.0;\n\
+    var si = lane;\n\
+    loop {\n\
+        if si >= k_v4 { break; }\n\
+        let v = matrix_a[si];\n\
+        ss += dot(v, v);\n\
+        si += LANES;\n\
+    }\n\
+    scale_buf[lane] = ss;\n\
+    workgroupBarrier();\n\
+    var sstride = LANES / 2u;\n\
+    loop {\n\
+        if sstride == 0u { break; }\n\
+        if lane < sstride { scale_buf[lane] += scale_buf[lane + sstride]; }\n\
+        workgroupBarrier();\n\
+        sstride >>= 1u;\n\
+    }\n\
+    if lane == 0u {\n\
+        inv_rms = inverseSqrt(scale_buf[0] / f32(params.k) + bitcast<f32>(params.eps_bits));\n\
+    }\n\
+    workgroupBarrier();\n\
+    let rs = inv_rms;\n\
+    var acc = vec4<f32>(0.0);",
+        );
+        src = substitute(
+            &src,
+            "        let a = matrix_a[kk_v4];",
+            "        let a = matrix_a[kk_v4] * rs * norm_w[kk_v4];",
+        );
+    }
+    if fused_add {
+        src = substitute(
+            &src,
+            "var<storage, read_write> matrix_c: array<f32>;",
+            "var<storage, read_write> matrix_c: array<f32>;\nvar<storage> src: array<f32>;",
+        );
+        src = src
+            .replace(
+                "matrix_c[col0] = total.x;",
+                "matrix_c[col0] = total.x + src[col0];",
+            )
+            .replace(
+                "matrix_c[col0 + 1u] = total.y;",
+                "matrix_c[col0 + 1u] = total.y + src[col0 + 1u];",
+            )
+            .replace(
+                "matrix_c[col0 + 2u] = total.z;",
+                "matrix_c[col0 + 2u] = total.z + src[col0 + 2u];",
+            )
+            .replace(
+                "matrix_c[col0 + 3u] = total.w;",
+                "matrix_c[col0 + 3u] = total.w + src[col0 + 3u];",
+            );
+    }
+    parse_wgsl(&gemv_shape_source(&src, shape))
+}
+
+/// Columns per workgroup for the N-tile GEMV (`matmul_gemv_ntile.wgsl`).
+pub const GEMV_N_TILE: u32 = 32;
+
+/// N-tile GEMV: 32 coalesced output columns per WG, 8-way K-split.
+///
+/// `fused_add` writes `C = A×B + D`. `rmsnorm` folds `rmsnorm(A)*w` into the
+/// A load. The two are mutually exclusive — fused-add is the residual, and
+/// the RmsNorm fold is the FFN-up / Q projection prologue.
+pub fn generate_module_gemv_ntile(fused_add: bool, rmsnorm: bool) -> ShaderModule {
+    assert!(
+        !(fused_add && rmsnorm),
+        "N-tile GEMV has no combined residual+RmsNorm form"
+    );
+    let (norm_w_decl, wg_extra, prologue, a_at_body, pad_field) = if rmsnorm {
+        (
+            "var<storage> norm_w: array<f32>;",
+            "var<workgroup> scale_buf: array<f32, 1024>;\nvar<workgroup> inv_rms: f32;",
+            "\
+    var ss = 0.0;\n\
+    var si = lane;\n\
+    loop {\n\
+        if si >= k { break; }\n\
+        let v = matrix_a[si];\n\
+        ss += v * v;\n\
+        si += 1024u;\n\
+    }\n\
+    scale_buf[lane] = ss;\n\
+    workgroupBarrier();\n\
+    var sstride = 512u;\n\
+    loop {\n\
+        if sstride == 0u { break; }\n\
+        if lane < sstride { scale_buf[lane] += scale_buf[lane + sstride]; }\n\
+        workgroupBarrier();\n\
+        sstride >>= 1u;\n\
+    }\n\
+    if lane == 0u {\n\
+        inv_rms = inverseSqrt(scale_buf[0] / f32(k) + bitcast<f32>(params.eps_bits));\n\
+    }\n\
+    workgroupBarrier();",
+            "matrix_a[kk] * inv_rms * norm_w[kk]",
+            "eps_bits",
+        )
+    } else {
+        ("", "", "", "matrix_a[kk]", "_pad")
+    };
+    let (addend_decl, addend) = if fused_add {
+        ("var<storage> src: array<f32>;", " + src[col]")
+    } else {
+        ("", "")
+    };
+    parse_wgsl(&preprocess(
+        include_str!("shaders/matmul_gemv_ntile.wgsl"),
+        &[
+            ("$NORM_W_DECL", norm_w_decl),
+            ("$SRC_DECL", addend_decl),
+            ("$WG_EXTRA", wg_extra),
+            ("$A_AT_BODY", a_at_body),
+            ("$PROLOGUE", prologue),
+            ("$PAD_FIELD", pad_field),
+            ("$ADDEND", addend),
+        ],
+    ))
+}
+
+/// GEMV whose A is packed `[gate|up]` of length `2K`; applies SwiGLU while loading.
+pub fn generate_module_gemv_repeat_kv(
+    group: ShaderGroup,
+    shape: GemvShape,
+    n_kv: u32,
+    head_dim: u32,
+) -> ShaderModule {
+    let src = gemv_source(group, crate::compile::WeightFormat::F32);
+    let src = substitute(
+        &src,
+        "        let a = matrix_a[kk];",
+        &format!(
+            "        let hd = {head_dim}u;\n\
+             \x20       let n_kv = {n_kv}u;\n\
+             \x20       let group = params.k / (hd * n_kv);\n\
+             \x20       let a = matrix_a[(kk / hd / group) * hd + (kk % hd)];"
+        ),
+    );
+    parse_wgsl(&gemv_shape_source(&src, shape))
+}
+
+pub fn generate_module_gemv_swiglu(group: ShaderGroup, shape: GemvShape) -> ShaderModule {
+    let src = gemv_source(group, crate::compile::WeightFormat::F32);
+    let src = substitute(
+        &src,
+        "        let a = matrix_a[kk];",
+        "        let gate = matrix_a[kk];\n\
+         \x20       let up = matrix_a[kk + k];\n\
+         \x20       let sig = 1.0 / (1.0 + exp(-gate));\n\
+         \x20       let a = gate * sig * up;",
     );
     parse_wgsl(&gemv_shape_source(&src, shape))
 }
@@ -2065,11 +2373,37 @@ fn gemv_source(group: ShaderGroup, mode: WeightFormat) -> String {
         ShaderGroup::MatMulGemv => include_str!("shaders/matmul_gemv.wgsl"),
         ShaderGroup::MatMulGemvAdd => include_str!("shaders/matmul_gemv_add.wgsl"),
         ShaderGroup::MatMulGemvBT => include_str!("shaders/matmul_gemv_bt.wgsl"),
+        ShaderGroup::MatMulGemvBTAdd => {
+            let src = include_str!("shaders/matmul_gemv_bt.wgsl");
+            let src = substitute(
+                src,
+                "var<storage, read_write> matrix_c: array<f32>;",
+                "var<storage, read_write> matrix_c: array<f32>;\nvar<storage> src: array<f32>;",
+            );
+            return match mode {
+                WeightFormat::F32 => substitute(
+                    &src,
+                    "        matrix_c[col] = reduce_buf[0] + reduce_buf[1];",
+                    "        matrix_c[col] = reduce_buf[0] + reduce_buf[1] + src[col];",
+                ),
+                WeightFormat::F16 => gemv_bt_f16_source(&substitute(
+                    &src,
+                    "        matrix_c[col] = reduce_buf[0] + reduce_buf[1];",
+                    "        matrix_c[col] = reduce_buf[0] + reduce_buf[1] + src[col];",
+                )),
+                _ => panic!(
+                    "no {mode:?} variant for {group:?}; block-quantized weights run \
+                     their blocks along K and cannot serve a transposed B"
+                ),
+            };
+        }
         _ => panic!("{group:?} is not a GEMV group"),
     };
     match (group, mode) {
         (_, WeightFormat::F32) => base.to_owned(),
-        (ShaderGroup::MatMulGemvBT, WeightFormat::F16) => gemv_bt_f16_source(base),
+        (ShaderGroup::MatMulGemvBT | ShaderGroup::MatMulGemvBTAdd, WeightFormat::F16) => {
+            gemv_bt_f16_source(base)
+        }
         (_, WeightFormat::F16) => gemv_f16_source(base),
         // Blocks run along the parameter's first dimension, which is N for a
         // transposed B, while every packed decoder indexes along K. The
@@ -2189,8 +2523,6 @@ fn gemv_bt_f16_source(src: &str) -> String {
                 "var<storage> matrix_b: array<vec4<f32>>;",
                 "var<storage> matrix_b: array<vec4<f16>>;",
             )
-            // The shader reads `matrix_b[row_off + kk_v4]`; convert at the load
-            // so the f32 accumulation below is unchanged.
             .replace(
                 "let b = matrix_b[row_off + kk_v4];",
                 "let b = vec4<f32>(matrix_b[row_off + kk_v4]);",
@@ -2201,8 +2533,9 @@ fn gen_matmul_coop_wgsl(
     fused_add: bool,
     variant: MatMulCoopVariant,
     config: &CoopConfig,
+    grid: u32,
 ) -> ShaderModule {
-    gen_matmul_coop_wgsl_full(fused_add, variant, config, None, None)
+    gen_matmul_coop_wgsl_full(fused_add, variant, config, None, None, grid)
 }
 
 /// Generate coop matmul with an optional [`crate::compile::MatMulPrologue`].
@@ -2212,7 +2545,7 @@ pub fn gen_matmul_coop_with_prologue(
     config: &CoopConfig,
     prologue: &crate::compile::MatMulPrologue,
 ) -> ShaderModule {
-    gen_matmul_coop_wgsl_full(fused_add, variant, config, Some(prologue), None)
+    gen_matmul_coop_wgsl_full(fused_add, variant, config, Some(prologue), None, 1)
 }
 
 /// Generate a cooperative matmul that stages its f32 accumulators through
@@ -2234,7 +2567,7 @@ pub fn generate_coop_matmul_with_dag_epilogue(
     );
     let (fused_add, variant) = coop_shape(group)
         .unwrap_or_else(|| panic!("cooperative epilogue not supported for {group:?}"));
-    gen_matmul_coop_wgsl_full(fused_add, variant, config, None, Some(epilogue))
+    gen_matmul_coop_wgsl_full(fused_add, variant, config, None, Some(epilogue), 1)
 }
 
 fn gen_matmul_coop_wgsl_full(
@@ -2243,9 +2576,17 @@ fn gen_matmul_coop_wgsl_full(
     config: &CoopConfig,
     prologue: Option<&crate::compile::MatMulPrologue>,
     epilogue: Option<&crate::compile::MatMulEpilogue>,
+    grid: u32,
 ) -> ShaderModule {
     let tile = config.tile_size;
-    let output_tile = config.output_tile();
+    // `grid == 1`: one hardware tile per WG (skinny prefill, 128×576 → 288 WGs).
+    // `grid == 2`: 2×2 tiles (wide FFN / lm_head) matching llama.cpp's 32×32
+    // KHR launch when that grid still has enough workgroups.
+    let output_tile = if grid >= 2 {
+        config.output_tile()
+    } else {
+        tile
+    };
     let shared_size = tile * tile;
     let wg_size: u32 = 64;
     let staging_iters = shared_size / wg_size;
@@ -2686,26 +3027,31 @@ fn gen_matmul_coop_wgsl_full(
         )
     };
 
+    let grid2 = grid >= 2;
     let (fused_decl, acc_init) = if fused_add {
-        (
-            "var<storage> src: array<f32>;".to_string(),
+        let init = if grid2 {
             format!(
                 "var acc00 = coopLoadT<{coop_c}>(&src[c00], n);\n\
                  \x20   var acc01 = coopLoadT<{coop_c}>(&src[c01], n);\n\
                  \x20   var acc10 = coopLoadT<{coop_c}>(&src[c10], n);\n\
                  \x20   var acc11 = coopLoadT<{coop_c}>(&src[c11], n);"
-            ),
-        )
+            )
+        } else {
+            format!("var acc00 = coopLoadT<{coop_c}>(&src[c00], n);")
+        };
+        ("var<storage> src: array<f32>;".to_string(), init)
     } else {
-        (
-            String::new(),
+        let init = if grid2 {
             format!(
                 "var acc00 = {coop_c}();\n\
                  \x20   var acc01 = {coop_c}();\n\
                  \x20   var acc10 = {coop_c}();\n\
                  \x20   var acc11 = {coop_c}();"
-            ),
-        )
+            )
+        } else {
+            format!("var acc00 = {coop_c}();")
+        };
+        (String::new(), init)
     };
 
     let output_tile_u = format!("{}u", output_tile);
@@ -2714,16 +3060,25 @@ fn gen_matmul_coop_wgsl_full(
     let result_shared_size = output_tile * output_tile;
     let (result_shared_decl, result_store) = if epilogue.is_some() {
         let store_iters = result_shared_size.div_ceil(wg_size);
+        let coop_stores = if grid2 {
+            format!(
+                "coopStoreT(acc00, &shared_c[0], {output_tile}u);\n\
+                 \x20   coopStoreT(acc01, &shared_c[{tile}u], {output_tile}u);\n\
+                 \x20   coopStoreT(acc10, &shared_c[{}u], {output_tile}u);\n\
+                 \x20   coopStoreT(acc11, &shared_c[{}u], {output_tile}u);",
+                tile * output_tile,
+                tile * output_tile + tile,
+            )
+        } else {
+            format!("coopStoreT(acc00, &shared_c[0], {output_tile}u);")
+        };
         (
             format!(
                 "var<workgroup> shared_c: array<f32, {}>;",
                 result_shared_size
             ),
             format!(
-                "coopStoreT(acc00, &shared_c[0], {output_tile}u);\n\
-                 \x20   coopStoreT(acc01, &shared_c[{tile}u], {output_tile}u);\n\
-                 \x20   coopStoreT(acc10, &shared_c[{}u], {output_tile}u);\n\
-                 \x20   coopStoreT(acc11, &shared_c[{}u], {output_tile}u);\n\
+                "{coop_stores}\n\
                  \x20   workgroupBarrier();\n\
                  \n\
                  \x20   for (var e = 0u; e < {store_iters}u; e++) {{\n\
@@ -2740,12 +3095,10 @@ fn gen_matmul_coop_wgsl_full(
                  \x20               matrix_c[idx] = val;\n\
                  \x20           }}\n\
                  \x20       }}\n\
-                 \x20   }}",
-                tile * output_tile,
-                tile * output_tile + tile,
+                 \x20   }}"
             ),
         )
-    } else {
+    } else if grid2 {
         (
             String::new(),
             "coopStoreT(acc00, &matrix_c[c00], n);\n\
@@ -2760,36 +3113,60 @@ fn gen_matmul_coop_wgsl_full(
              \x20   }"
                 .to_string(),
         )
+    } else {
+        (
+            String::new(),
+            "coopStoreT(acc00, &matrix_c[c00], n);".to_string(),
+        )
     };
 
     let (shared_lo_decl, compensated_mma) = if compensated {
-        (
-            format!(
-                "var<workgroup> shared_a0_lo: array<f16, {shared_size}>;\n\
-                 var<workgroup> shared_a1_lo: array<f16, {shared_size}>;\n\
-                 var<workgroup> shared_b0_lo: array<f16, {shared_size}>;\n\
-                 var<workgroup> shared_b1_lo: array<f16, {shared_size}>;"
-            ),
-            format!(
-                "let a0_lo = coopLoadT<{coop_ab}>(&shared_b0_lo[0], {tile}u);\n\
-                 \x20   let a1_lo = coopLoadT<{coop_ab}>(&shared_b1_lo[0], {tile}u);\n\
-                 \x20   let b0_lo = coopLoadT<{coop_ba}>(&shared_a0_lo[0], {tile}u);\n\
-                 \x20   let b1_lo = coopLoadT<{coop_ba}>(&shared_a1_lo[0], {tile}u);\n\
-                 \x20   acc00 = coopMultiplyAdd(a0, b0_lo, acc00);\n\
-                 \x20   acc00 = coopMultiplyAdd(a0_lo, b0, acc00);\n\
-                 \x20   acc01 = coopMultiplyAdd(a0, b1_lo, acc01);\n\
-                 \x20   acc01 = coopMultiplyAdd(a0_lo, b1, acc01);\n\
-                 \x20   acc10 = coopMultiplyAdd(a1, b0_lo, acc10);\n\
-                 \x20   acc10 = coopMultiplyAdd(a1_lo, b0, acc10);\n\
-                 \x20   acc11 = coopMultiplyAdd(a1, b1_lo, acc11);\n\
-                 \x20   acc11 = coopMultiplyAdd(a1_lo, b1, acc11);"
-            ),
-        )
+        if grid2 {
+            (
+                format!(
+                    "var<workgroup> shared_a0_lo: array<f16, {shared_size}>;\n\
+                     var<workgroup> shared_a1_lo: array<f16, {shared_size}>;\n\
+                     var<workgroup> shared_b0_lo: array<f16, {shared_size}>;\n\
+                     var<workgroup> shared_b1_lo: array<f16, {shared_size}>;"
+                ),
+                format!(
+                    "let a0_lo = coopLoadT<{coop_ab}>(&shared_b0_lo[0], {tile}u);\n\
+                     \x20   let a1_lo = coopLoadT<{coop_ab}>(&shared_b1_lo[0], {tile}u);\n\
+                     \x20   let b0_lo = coopLoadT<{coop_ba}>(&shared_a0_lo[0], {tile}u);\n\
+                     \x20   let b1_lo = coopLoadT<{coop_ba}>(&shared_a1_lo[0], {tile}u);\n\
+                     \x20   acc00 = coopMultiplyAdd(a0, b0_lo, acc00);\n\
+                     \x20   acc00 = coopMultiplyAdd(a0_lo, b0, acc00);\n\
+                     \x20   acc01 = coopMultiplyAdd(a0, b1_lo, acc01);\n\
+                     \x20   acc01 = coopMultiplyAdd(a0_lo, b1, acc01);\n\
+                     \x20   acc10 = coopMultiplyAdd(a1, b0_lo, acc10);\n\
+                     \x20   acc10 = coopMultiplyAdd(a1_lo, b0, acc10);\n\
+                     \x20   acc11 = coopMultiplyAdd(a1, b1_lo, acc11);\n\
+                     \x20   acc11 = coopMultiplyAdd(a1_lo, b1, acc11);"
+                ),
+            )
+        } else {
+            (
+                format!(
+                    "var<workgroup> shared_a0_lo: array<f16, {shared_size}>;\n\
+                     var<workgroup> shared_b0_lo: array<f16, {shared_size}>;"
+                ),
+                format!(
+                    "let a0_lo = coopLoadT<{coop_ab}>(&shared_b0_lo[0], {tile}u);\n\
+                     \x20   let b0_lo = coopLoadT<{coop_ba}>(&shared_a0_lo[0], {tile}u);\n\
+                     \x20   acc00 = coopMultiplyAdd(a0, b0_lo, acc00);\n\
+                     \x20   acc00 = coopMultiplyAdd(a0_lo, b0, acc00);"
+                ),
+            )
+        }
     } else {
         (String::new(), String::new())
     };
 
-    let src = include_str!("shaders/matmul_coop.wgsl");
+    let src = if grid2 {
+        include_str!("shaders/matmul_coop_2x2.wgsl")
+    } else {
+        include_str!("shaders/matmul_coop.wgsl")
+    };
     let src = preprocess(
         src,
         &[
@@ -6004,6 +6381,7 @@ mod tests {
         assert!(names.contains(&"sigmoid"), "missing sigmoid");
         assert!(names.contains(&"neg"), "missing neg");
         assert!(names.contains(&"silu"), "missing silu");
+        assert!(names.contains(&"repeat_kv"), "missing repeat_kv");
 
         let m = generate_module(ShaderGroup::Binary);
         let names: Vec<&str> = m
@@ -6039,6 +6417,132 @@ mod tests {
     #[test]
     fn test_rms_norm_wgsl() {
         let _ = generate_wgsl(ShaderGroup::RmsNorm);
+    }
+
+    #[test]
+    fn gemv_bt_x4_shaders_parse() {
+        for (fused_add, rmsnorm, marker) in [
+            (false, false, "col0"),
+            (true, false, "src[col0]"),
+            (false, true, "norm_w[kk_v4]"),
+        ] {
+            let sm = generate_module_gemv_bt_x4(
+                fused_add,
+                rmsnorm,
+                GemvShape {
+                    threads: 64,
+                    reduction: GemvReduction::Tree,
+                },
+            );
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS,
+                naga::valid::Capabilities::empty(),
+            )
+            .validate(&sm.module)
+            .unwrap_or_else(|e| panic!("bt_x4 fused_add={fused_add} rmsnorm={rmsnorm}: {e:#?}"));
+            assert!(
+                sm.source.contains(marker),
+                "bt_x4 fused_add={fused_add} rmsnorm={rmsnorm} lost {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn gemv_bt_add_shader_parses() {
+        let sm = generate_module_gemv(
+            ShaderGroup::MatMulGemvBTAdd,
+            crate::compile::WeightFormat::F32,
+            GemvShape {
+                threads: 64,
+                reduction: GemvReduction::Tree,
+            },
+        );
+        assert!(sm.source.contains("src[col]") && sm.source.contains("src[col]"));
+    }
+
+    #[test]
+    fn gemv_bt_rmsnorm_shader_parses() {
+        let sm = generate_module_gemv_bt_rmsnorm(GemvShape {
+            threads: 64,
+            reduction: GemvReduction::Tree,
+        });
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS,
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&sm.module)
+        .unwrap();
+        assert!(sm.source.contains("norm_w") && sm.source.contains("inv_rms"));
+    }
+
+    #[test]
+    fn gemv_ntile_shaders_parse() {
+        for (fused_add, rmsnorm, marker) in [
+            (false, false, "matrix_a[kk]"),
+            (true, false, "src[col]"),
+            (false, true, "norm_w[kk]"),
+        ] {
+            let sm = generate_module_gemv_ntile(fused_add, rmsnorm);
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS,
+                naga::valid::Capabilities::empty(),
+            )
+            .validate(&sm.module)
+            .unwrap_or_else(|e| {
+                panic!("ntile fused_add={fused_add} rmsnorm={rmsnorm} failed validation: {e:#?}")
+            });
+            assert!(
+                sm.source.contains(marker) && sm.source.contains("@workgroup_size(1024)"),
+                "ntile fused_add={fused_add} rmsnorm={rmsnorm} lost {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn gemv_repeat_kv_shader_parses() {
+        let shape = GemvShape {
+            threads: 256,
+            reduction: GemvReduction::Tree,
+        };
+        let sm = generate_module_gemv_repeat_kv(ShaderGroup::MatMulGemvAdd, shape, 3, 64);
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS,
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&sm.module)
+        .unwrap();
+        assert!(sm.source.contains("n_kv"));
+    }
+
+    #[test]
+    fn gemv_swiglu_shader_parses() {
+        let shape = GemvShape::initial(ShaderGroup::MatMulGemvAdd);
+        let sm = generate_module_gemv_swiglu(ShaderGroup::MatMulGemvAdd, shape);
+        assert!(
+            sm.source.contains("gate") && sm.source.contains("kk + k"),
+            "SwiGLU GEMV must load packed gate|up"
+        );
+    }
+
+    #[test]
+    fn horizontal_gemv_rmsnorm_shader_parses() {
+        let shape = GemvShape {
+            threads: 256,
+            reduction: GemvReduction::Subgroup,
+        };
+        let sm = generate_module_gemv_rmsnorm(shape);
+        let packed = generate_horizontal_matmul_from(sm, 2);
+        assert!(
+            packed.source.contains("sg_id") && packed.source.contains("horiz_0(wgid, lid, sg_id)"),
+            "packed subgroup GEMV must pass sg_id from the entry point"
+        );
+        assert!(
+            packed.source.contains("matrix_b0")
+                && packed.source.contains("matrix_b1")
+                && packed.source.contains("norm_w")
+                && packed.source.contains("@workgroup_size(256)"),
+            "packed GEMV+RmsNorm must keep the fused binding and GEMV width"
+        );
     }
 
     #[test]
@@ -6357,7 +6861,7 @@ mod tests {
                 | ShaderEntry::MatMulGemvBT => {
                     vec!["matrix_a", "matrix_b", "matrix_c", "params"]
                 }
-                ShaderEntry::MatMulGemvAdd => {
+                ShaderEntry::MatMulGemvAdd | ShaderEntry::MatMulGemvBTAdd => {
                     vec!["matrix_a", "matrix_b", "matrix_c", "src", "params"]
                 }
                 ShaderEntry::FusedMatMulAdd
@@ -6373,6 +6877,7 @@ mod tests {
                 | ShaderEntry::Recip
                 | ShaderEntry::Silu
                 | ShaderEntry::Gelu
+                | ShaderEntry::RepeatKv
                 | ShaderEntry::Tanh
                 | ShaderEntry::SumAll
                 | ShaderEntry::MeanAll
@@ -6561,6 +7066,7 @@ mod tests {
             ShaderEntry::RoPE,
             ShaderEntry::RoPEGrad,
             ShaderEntry::Gelu,
+            ShaderEntry::RepeatKv,
             ShaderEntry::Tanh,
             ShaderEntry::LayerNorm,
             ShaderEntry::MultiHeadAttn,

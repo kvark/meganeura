@@ -50,7 +50,7 @@ pub mod train;
 pub mod tune;
 
 pub use codegen::{CoopCaps, coop_caps, set_coop_caps};
-pub use codegen::{GemvReduction, GemvShape};
+pub use codegen::{GEMV_N_TILE, GemvReduction, GemvShape};
 pub use compile::CompileOptions;
 pub use compile::TuningKnobs;
 pub use data::{DataLoader, MnistDataset};

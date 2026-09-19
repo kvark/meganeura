@@ -1,10 +1,7 @@
-// Cooperative matrix matmul: one $TILE_SIZE×$TILE_SIZE output tile per WG.
+// Cooperative matrix matmul: 2×2 hardware tiles per WG ($OUTPUT_TILE = 2×$TILE_SIZE).
 // Dispatch: [ceil(m/$OUTPUT_TILE), ceil(n/$OUTPUT_TILE), 1], WG=64.
-// $OUTPUT_TILE equals $TILE_SIZE. A 2×2 grid of tiles starved occupancy on
-// transformer prefill (SmolLM2 128×576 → 72 workgroups); one tile per WG
-// yields 288 and matches llama.cpp's KHR cooperative-matrix launch density.
-// - 16×16 f16 path: RDNA3/Volta+ (VK_KHR_cooperative_matrix)
-// -  8×8 f32 path:  Apple Silicon (simdgroup_matrix)
+// Used when that grid still has enough workgroups (wide FFN / lm_head).
+// Skinny prefill projections (128×576) stay on the 1×1 shader.
 
 $ENABLE_F16
 enable wgpu_cooperative_matrix;
@@ -24,7 +21,9 @@ $PROLOGUE_DECL
 $EPILOGUE_DECL
 var<uniform> params: Params;
 var<workgroup> shared_a0: array<$ELEM_TYPE, $SHARED_SIZE>;
+var<workgroup> shared_a1: array<$ELEM_TYPE, $SHARED_SIZE>;
 var<workgroup> shared_b0: array<$ELEM_TYPE, $SHARED_SIZE>;
+var<workgroup> shared_b1: array<$ELEM_TYPE, $SHARED_SIZE>;
 $SHARED_LO_DECL
 $RESULT_SHARED_DECL
 $PROLOGUE_CACHE_DECL
@@ -38,31 +37,38 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let k = params.k;
 
     let c00 = tile_row * n + tile_col;
+    let c01 = tile_row * n + (tile_col + $TILE_SIZE_U);
+    let c10 = (tile_row + $TILE_SIZE_U) * n + tile_col;
+    let c11 = (tile_row + $TILE_SIZE_U) * n + (tile_col + $TILE_SIZE_U);
 
-    // Initialize accumulators
+    let n1_valid = (tile_col + $TILE_SIZE_U) < n;
+    let m1_valid = (tile_row + $TILE_SIZE_U) < m;
+
     $ACC_INIT
 
-    // Hoisted staging index components
     $STAGING_VARS
 
-    // Prologue cache init (e.g. per-row rsqrt). Loaded once per workgroup
-    // from global into shared memory so the K-loop staging reads are cheap.
     $PROLOGUE_CACHE_INIT
 
     var t = 0u;
     loop {
         if t >= k { break; }
 
-        // Stage B tile → shared_a0, A tile → shared_b0.
         $B_STAGE_0
+        $B_STAGE_1
         $A_STAGE_0
+        $A_STAGE_1
 
         workgroupBarrier();
 
-        // Cooperative matrix multiply-add: C += A × B
         let a0 = coopLoadT<$COOP_AB>(&shared_b0[0], $TILE_SIZE_U);
+        let a1 = coopLoadT<$COOP_AB>(&shared_b1[0], $TILE_SIZE_U);
         let b0 = coopLoadT<$COOP_BA>(&shared_a0[0], $TILE_SIZE_U);
+        let b1 = coopLoadT<$COOP_BA>(&shared_a1[0], $TILE_SIZE_U);
         acc00 = coopMultiplyAdd(a0, b0, acc00);
+        acc01 = coopMultiplyAdd(a0, b1, acc01);
+        acc10 = coopMultiplyAdd(a1, b0, acc10);
+        acc11 = coopMultiplyAdd(a1, b1, acc11);
         $COMPENSATED_MMA
 
         workgroupBarrier();

@@ -1,5 +1,27 @@
 # Unreleased
 
+- Autodiff no longer broadcasts a scalar `grad_output` through a ones-row
+  matmul. That `[1,1]×[1,N]` shape selected K-split GEMV (K=1) and, on
+  SmolLM2-135M training, launched 1.57M workgroups for a 5 ms fill. `Op::Broadcast`
+  repeats the scalar; GEMV now requires `K >= 4`.
+- Cooperative matmul uses one hardware tile per workgroup (16×16 on f16
+  devices) for skinny prefill projections (`128×576` → 288 workgroups).
+  Wide GEMMs whose 2×2 grid still has ≥128 workgroups (packed FFN
+  `128×3072`, lm_head) keep a 2×2 tile so each WG does llama.cpp-like
+  32×32 output. Convolution cooperative kernels stay 2×2. Seq=1 K/V GEMVs
+  pack into one dispatch like prefill. Static RoPE at position 0 on a
+  single row is the identity rotation and aliases away. Wide f32 GEMV
+  layout. GEMV-BT (lm_head / `[N,K]` weights) defaults to 64 threads
+  after timestamps showed 7.1 µs vs 14.5 µs at 256 on packed FFN-up.
+  Seq=1 SmolLM2 stays K-split `[K,N]` GEMV (256-wide tree). Physically
+  transposing wide weights to `[N,K]` won isolated GEMV-BT timestamps
+  but raised Inferena seq=1 wall time. Switching the graph to
+  `matmul_bt` also lost wall time and seq=128 cooperative prefill.
+  Stateless seq=1 causal attention is softmax of one score, so Q/K
+  GEMVs and the attention kernel are dropped; GQA repeats V heads
+  inside o_proj. Elision requires KV length 1 (`params[1]==1`); causal
+  seq=1 stores that explicitly so q=1 kv>1 cross-attention is not
+  replaced by repeat(V). Fused GEMV-add defaults to 256 threads.
 - Optional Q8_1 activations for Q4_0 GEMV, following llama.cpp's
   `vec_dot_q4_0_q8_1`. `CompileOptions::quantized_activations` is explicit
   because this changes results; tuning may reshape the selected kernel but

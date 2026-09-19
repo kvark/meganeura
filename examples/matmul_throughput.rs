@@ -167,7 +167,10 @@ fn main() {
         (16, 320, 320, "SmolVLA VLM-side (seq=16)"),
         // SmolLM2-135M shapes (hidden=576, intermediate=1536, kv_dim=192)
         (128, 576, 576, "SmolLM2 Q-proj (seq=128)"),
-        (128, 576, 1536, "SmolLM2 MLP up (seq=128)"),
+        (128, 1536, 576, "SmolLM2 FFN up unpacked (seq=128)"),
+        (128, 3072, 576, "SmolLM2 packed FFN up (seq=128)"),
+        (128, 49152, 576, "SmolLM2 lm_head (seq=128)"),
+        (128, 576, 1536, "SmolLM2 MLP down (seq=128)"),
         // Decode regime (batch=1)
         (1, 576, 576, "SmolLM2 decode Q-proj (M=1)"),
         (1, 576, 1536, "SmolLM2 decode MLP up (M=1)"),

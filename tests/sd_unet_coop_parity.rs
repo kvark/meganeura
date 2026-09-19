@@ -75,6 +75,14 @@ fn run(cooperative: bool) -> Vec<f32> {
 #[test]
 fn sd_unet_f32_coop_matches_scalar() {
     let _guard = GPU_TEST_LOCK.lock().expect("GPU test lock poisoned");
+    let gpu = meganeura::init_gpu_context_with(meganeura::GpuOptions::from_env()).expect("GPU");
+    if gpu.capabilities().cooperative_matrix.f32_tile == 0 {
+        eprintln!(
+            "skip: no native-f32 cooperative matrix on {}",
+            gpu.device_information().device_name
+        );
+        return;
+    }
     let scalar = run(false);
     let cooperative = run(true);
 
