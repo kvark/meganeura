@@ -7,6 +7,7 @@ struct Params {
 
 var<storage> src: array<f32>;
 var<storage> bias: array<f32>;  // weight vector
+$EPILOGUE
 var<storage, read_write> dst: array<f32>;
 var<uniform> params: Params;
 var<workgroup> wg_data: array<f32, 256>;
@@ -47,11 +48,12 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let mean_sq = wg_data[0] / f32(params.cols);
     let rsqrt_val = inverseSqrt(mean_sq + eps);
 
-    // Phase 4: Normalize and scale
+    // Phase 4: Normalize, scale, and apply the selected epilogue.
     var j2 = tid;
     loop {
         if j2 >= params.cols { break; }
-        dst[offset + j2] = src[offset + j2] * rsqrt_val * bias[j2];
+        let value = src[offset + j2] * rsqrt_val * bias[j2];
+        dst[offset + j2] = apply_rms_norm_epilogue(offset + j2, value);
         j2 += 256u;
     }
 }

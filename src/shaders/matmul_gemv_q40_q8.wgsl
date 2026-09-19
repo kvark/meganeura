@@ -39,7 +39,7 @@ struct Params {
     m: u32,
     n: u32,
     k: u32,
-$PARAM_PAD
+    eps_bits: u32,
 }
 
 var<storage> matrix_a: array<f32>;
