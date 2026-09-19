@@ -160,6 +160,28 @@ A tilewise softmax-rescaling trial is retained at
 branch. It passed the numerical checks but gave only a small NVIDIA prefill
 gain (11.64 to 11.17 ms) and no Intel gain in three reversed-order pairs.
 
+### Fixed-head attention follow-up
+
+`75c7e53` compiles cached attention at the graph's known head dimension, using
+the existing per-head pipeline mechanism. It removes unused per-thread values
+and dynamic head-width branches without changing the algorithm or precision.
+Three fresh-process pairs, reversing order, compared it with `5aeb856`:
+
+| GPU | Phase | Before | Fixed head width |
+| --- | --- | ---: | ---: |
+| RTX 5070 | Prefill | 11.58 | 8.82 |
+| RTX 5070 | Decode | 4.29 | 3.20 |
+| Arc B570 | Prefill | 27.63 | 22.79 |
+| Arc B570 | Decode | 6.09 | 5.66 |
+
+Units and sampling are unchanged. All 33 token predictions match the independent
+CPU reference on both devices; maximum per-row relative L2 error remains below
+0.000010 on NVIDIA and 0.000178 on Intel. The existing cache regression now also
+covers head widths 64, 80 and 512, including partially occupied thread lanes.
+NVIDIA attention pass intervals fell from 0.98 to 0.49 ms for decode and from
+3.80 to 1.66 ms for prefill in separate captures. This is still not parity with
+llama.cpp; matrix kernels and host submission remain substantial costs.
+
 ### Verification
 
 Formatting and all-target/all-feature Clippy passed. CPU unit tests: 449 passed,
