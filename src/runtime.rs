@@ -3069,6 +3069,7 @@ struct UploadStaging {
 #[derive(Default)]
 struct Readback {
     staging: Option<UploadStaging>,
+    encoder: Option<blade_graphics::CommandEncoder>,
     // Mapped address and byte count: imported buffers may use a different heap.
     staged: HashMap<(usize, usize), bool>,
 }
@@ -6124,7 +6125,7 @@ impl Session {
             let key = (buffer.data() as usize, std::mem::size_of_val(out));
             if let Some(&staged) = readback.staged.get(&key) {
                 if staged {
-                    self.read_staged_f32(buffer, out, &mut readback.staging);
+                    self.read_staged_f32(buffer, out, &mut readback);
                 } else {
                     direct(out);
                 }
@@ -6140,7 +6141,7 @@ impl Session {
                 direct_time = direct_time.min(start.elapsed());
                 let bits: Vec<_> = out.iter().map(|x| x.to_bits()).collect();
                 let start = std::time::Instant::now();
-                self.read_staged_f32(buffer, out, &mut readback.staging);
+                self.read_staged_f32(buffer, out, &mut readback);
                 staged_time = staged_time.min(start.elapsed());
                 assert!(
                     out.iter().zip(bits).all(|(a, b)| a.to_bits() == b),
@@ -6155,15 +6156,16 @@ impl Session {
             readback.staged.insert(key, staged);
             return;
         }
-        self.read_staged_f32(buffer, out, &mut readback.staging);
+        self.read_staged_f32(buffer, out, &mut readback);
     }
 
     fn read_staged_f32(
         &self,
         buffer: &blade_graphics::Buffer,
         out: &mut [f32],
-        cached: &mut Option<UploadStaging>,
+        readback: &mut Readback,
     ) {
+        let cached = &mut readback.staging;
         let staging_bytes = std::mem::size_of_val(out).clamp(4, 16 * 1024 * 1024);
         if cached.as_ref().is_some_and(|s| s.size < staging_bytes) {
             self.gpu.destroy_buffer(cached.take().unwrap().buffer);
@@ -6176,13 +6178,14 @@ impl Session {
             }),
             size: staging_bytes,
         });
-        let mut encoder = self
-            .gpu
-            .create_command_encoder(blade_graphics::CommandEncoderDesc {
-                name: "readback",
-                buffer_count: 1,
-                manual_barriers: false,
-            });
+        let encoder = readback.encoder.get_or_insert_with(|| {
+            self.gpu
+                .create_command_encoder(blade_graphics::CommandEncoderDesc {
+                    name: "readback",
+                    buffer_count: 1,
+                    manual_barriers: false,
+                })
+        });
         for (index, chunk) in out.chunks_mut(staging.size / 4).enumerate() {
             encoder.start();
             encoder.transfer("readback_copy").copy_buffer_to_buffer(
@@ -6190,8 +6193,8 @@ impl Session {
                 staging.buffer.at(0),
                 std::mem::size_of_val(chunk) as u64,
             );
-            let sync = self.gpu.submit(&mut encoder);
-            wait_for_timed_encoder(&self.gpu, &sync, &mut encoder, self.gpu_timing)
+            let sync = self.gpu.submit(encoder);
+            wait_for_timed_encoder(&self.gpu, &sync, encoder, self.gpu_timing)
                 .expect("readback submission failed");
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -6201,7 +6204,6 @@ impl Session {
                 );
             }
         }
-        self.gpu.destroy_command_encoder(&mut encoder);
     }
 
     /// Read back the loss value.
@@ -9276,6 +9278,9 @@ impl Drop for Session {
         self.gpu.destroy_command_encoder(&mut self.encoder);
         if let Some(staging) = self.upload_staging.get_mut().take() {
             self.gpu.destroy_buffer(staging.buffer);
+        }
+        if let Some(mut encoder) = self.readback.get_mut().encoder.take() {
+            self.gpu.destroy_command_encoder(&mut encoder);
         }
         if let Some(staging) = self.readback.get_mut().staging.take() {
             self.gpu.destroy_buffer(staging.buffer);
