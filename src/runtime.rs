@@ -1241,6 +1241,8 @@ impl Variant {
 
 struct Pipelines {
     map: HashMap<Variant, blade_graphics::ComputePipeline>,
+    /// Resolved after compilation or tuning, never while recording a step.
+    selected: Vec<Variant>,
     /// Matmul codegen knobs the plan was compiled with.
     matmul_knobs: crate::codegen::MatmulKnobs,
     /// Where to write every WGSL the pipeline layer compiles — [`SessionOptions::wgsl_dump_dir`].
@@ -1868,6 +1870,7 @@ impl Pipelines {
 
         let mut pipelines = Self {
             map,
+            selected: Vec::new(),
             matmul_knobs,
             dump_dir: wgsl_dump_dir.map(str::to_string),
         };
@@ -1880,6 +1883,7 @@ impl Pipelines {
                     .expect("selected convolution pipeline");
             }
         }
+        pipelines.select(&plan.dispatches);
         pipelines
     }
 
@@ -1974,19 +1978,20 @@ impl Pipelines {
         &self.map[&Variant::Scalar(entry)]
     }
 
-    fn get(&self, dispatch: &Dispatch) -> &blade_graphics::ComputePipeline {
-        let candidates = Self::candidates(dispatch);
-        candidates
+    fn select(&mut self, dispatches: &[Dispatch]) {
+        self.selected = dispatches
             .iter()
-            .find_map(|variant| self.map.get(variant))
-            .unwrap_or_else(|| panic!("no pipeline was compiled for any of {candidates:?}"))
+            .map(|dispatch| {
+                Self::candidates(dispatch)
+                    .into_iter()
+                    .find(|variant| self.map.contains_key(variant))
+                    .unwrap_or_else(|| panic!("no pipeline was compiled for {dispatch:?}"))
+            })
+            .collect();
     }
 
-    fn profile_key(&self, dispatch: &Dispatch) -> String {
-        Self::candidates(dispatch)
-            .into_iter()
-            .find(|variant| self.map.contains_key(variant))
-            .map_or_else(|| format!("{:?}:scalar", dispatch.shader), |v| v.label())
+    fn get(&self, dispatch_index: usize) -> &blade_graphics::ComputePipeline {
+        &self.map[&self.selected[dispatch_index]]
     }
 
     fn all_pipelines(&self) -> Vec<(&str, &blade_graphics::ComputePipeline)> {
@@ -4289,11 +4294,7 @@ impl Session {
     /// fused RmsNorm, fused epilogue or prologue, attention width, or a
     /// generated pointwise/reduction kernel.
     pub fn dispatch_pipeline_keys(&self) -> Vec<String> {
-        self.plan
-            .dispatches
-            .iter()
-            .map(|dispatch| self.pipelines.profile_key(dispatch))
-            .collect()
+        self.pipelines.selected.iter().map(Variant::label).collect()
     }
 
     /// Shared handle to the underlying Blade GPU context.
@@ -6955,7 +6956,7 @@ impl Session {
                 match encoded {
                     ProfilePass::Timed(i) => {
                         let dispatch = &self.plan.dispatches[i];
-                        let pipeline = self.pipelines.get(dispatch);
+                        let pipeline = self.pipelines.get(i);
                         let mut pass = self.encoder.compute(&dispatch.label);
                         let mut pc = pass.with(pipeline);
                         Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
@@ -6972,7 +6973,7 @@ impl Session {
                             }
                             for i in span {
                                 let dispatch = &self.plan.dispatches[i];
-                                let pipeline = self.pipelines.get(dispatch);
+                                let pipeline = self.pipelines.get(i);
                                 let mut pc = pass.with(pipeline);
                                 Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
                                 pc.dispatch(dispatch.workgroups);
@@ -7014,7 +7015,7 @@ impl Session {
                         let group = self.groups[gi].clone();
                         for i in group {
                             let dispatch = &self.plan.dispatches[i];
-                            let pipeline = self.pipelines.get(dispatch);
+                            let pipeline = self.pipelines.get(i);
                             let mut pc = pass.with(pipeline);
                             Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
                             pc.dispatch(dispatch.workgroups);
