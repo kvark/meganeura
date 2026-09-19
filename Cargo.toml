@@ -126,6 +126,10 @@ path = "bench/gguf_latency.rs"
 required-features = ["gguf"]
 
 [[example]]
+name = "timestamp_boundaries"
+path = "bench/timestamp_boundaries.rs"
+
+[[example]]
 name = "train_deploy"
 path = "examples/train_deploy.rs"
 
