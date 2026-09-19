@@ -74,12 +74,41 @@ fn run(chunks: usize, layers: usize, rows: usize, dim: usize, steps: usize) -> V
     // buffer in the ring is still in flight, which only shows up once the
     // encoder has wrapped around at least once.
     let mut out = vec![0.0f32; rows * dim];
-    for _ in 0..steps {
+    let mut reference = None;
+    for step in 0..steps {
         session.step();
         session.wait();
         session.read_output_by_index(0, &mut out);
+        if let Some(ref expected) = reference {
+            assert_eq!(&out, expected, "schedule changed repeated graph output");
+        }
+        if chunks == 1 && step == 0 {
+            reference = Some(out.clone());
+            let report = session
+                .tune_submissions(meganeura::tune::TuneSubmissionOptions {
+                    max_chunks: 8,
+                    sample_pairs: 4,
+                    warmup_runs: 0,
+                    ..Default::default()
+                })
+                .unwrap();
+            assert!((1..=8).contains(&report.selected));
+            assert!(matches!(
+                report.skipped,
+                None | Some(meganeura::tune::TuneDecision::TimeBudget)
+            ));
+            assert!(
+                report
+                    .outcomes
+                    .iter()
+                    .all(|o| o.decision != meganeura::tune::TuneDecision::InvalidOutput)
+            );
+            let mut after = vec![0.0; out.len()];
+            session.read_output_by_index(0, &mut after);
+            assert_eq!(after, out, "submission tuning changed the live output");
+        }
     }
-    out
+    reference.unwrap_or(out)
 }
 
 #[test]

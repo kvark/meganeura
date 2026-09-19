@@ -94,6 +94,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         sessions.push(session);
     }
+    let mut scheduling = Vec::new();
+    if tune_seconds != 0 && matches!(scope, meganeura::tune::TuneScope::All) {
+        run(&mut sessions[1], 0, PROMPT, config.vocab_size);
+        for pos in PROMPT..PROMPT + DECODE {
+            run(&mut sessions[0], pos, 1, config.vocab_size);
+        }
+        for session in &mut sessions {
+            scheduling.push(
+                session.tune_submissions(meganeura::tune::TuneSubmissionOptions {
+                    max_scratch_bytes: 256 * 1024 * 1024,
+                    min_improvement: 0.01,
+                    ..Default::default()
+                })?,
+            );
+        }
+    }
     let prepare_ms = started.elapsed().as_secs_f64() * 1000.0;
     let mut prefill_ms = Vec::new();
     let mut decode_ms = Vec::new();
@@ -134,6 +150,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "decode_record_wait_read_ms": decode_parts_ms,
         "dispatches": [sessions[1].plan().dispatches.len(), sessions[0].plan().dispatches.len()],
         "tuning": tuning,
+        "submission_tuning": scheduling,
     });
     std::fs::write(
         format!("{}.json", args[2]),
