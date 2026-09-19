@@ -430,6 +430,7 @@ impl Session {
         // on those barriers, even where a removed combine would allow merging.
         self.plan.dispatches = dispatches;
         self.groups = groups;
+        self.pipelines.select(&self.plan.dispatches);
         self.profiled_pass_map.clear();
         self.last_gpu_timings = None;
     }
