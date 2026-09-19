@@ -138,3 +138,6 @@ and native captures outside Git. The next engineering step is a bounded
 scheduling search on representative work, respecting caller scheduling policy
 and live KV/training state. The production default remains one submission;
 this PR does not silently install the best point from the sweep.
+
+The [automatic-search follow-up](submission-autotune.md) now measures this
+choice on private initialized graph state and reports post-search latencies.
