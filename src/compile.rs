@@ -2164,6 +2164,13 @@ pub fn fuse_rmsnorm_into_add(plan: &mut ExecutionPlan) {
         let out = plan.dispatches[ai].output_buffer;
         let d = &mut plan.dispatches[ni];
         d.shader = ShaderEntry::RmsNormAdd;
+        // A scheduled RmsNorm carries a generated reduction kernel which
+        // implements only the original normalization. If it survives this
+        // rewrite, pipeline selection prefers that kernel over RmsNormAdd
+        // and silently drops the residual. Route the fused operation through
+        // its dedicated shader and restore its one-workgroup-per-row shape.
+        d.reduction = None;
+        d.workgroups = [d.params[0], 1, 1];
         d.input_buffers.push(residual);
         d.output_buffer = out;
     }
@@ -5091,15 +5098,13 @@ impl<'a> Compiler<'a> {
                 let valid_len_input = self.get_buffer(node.inputs[4]);
                 let block_len = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let max_seq = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
-                // Flash-decoding split-K: past a threshold, the KV range is
-                // split across workgroups per head, each running its own
-                // online softmax, and a combine merges the partials. The
-                // round cost of the single kernel grows linearly with
-                // kv_len, so this is what keeps long contexts flat. Short
-                // contexts keep the fused single dispatch: its per-token
-                // loop fits one reduction round and a combine would only
-                // add one.
-                if max_seq > 64 {
+                // Flash-decoding split-K: for a single decode query past a
+                // threshold, split the KV range across workgroups per head
+                // and combine their online-softmax partials. Batched prefill
+                // stays on CachedBlockAttention: the split shader's slices
+                // are a decode-only layout, and applying them independently
+                // to every query produces incorrect causal attention.
+                if block_len == 1 && max_seq > 64 {
                     let splits = (max_seq.div_ceil(32)).clamp(2, 16);
                     let chunk = max_seq.div_ceil(splits);
                     let scratch_idx = self.plan.buffers.len() as u32;
@@ -6187,6 +6192,50 @@ mod tests {
         assert_eq!(plan.input_buffers.len(), 1);
         assert_eq!(plan.param_buffers.len(), 1);
         assert_eq!(plan.dispatches.len(), 1); // matmul with fused relu epilogue
+    }
+
+    #[test]
+    fn cached_block_attention_splits_decode_but_not_batched_prefill() {
+        let compile_shape = |block_len: usize| {
+            let mut g = Graph::new();
+            let head_dim = 8;
+            let max_seq = 128;
+            let q = g.input("q", &[block_len, head_dim]);
+            let k = g.parameter("k", &[max_seq, head_dim]);
+            let v = g.parameter("v", &[max_seq, head_dim]);
+            let position = g.input_u32("position", &[1]);
+            let valid = g.input_u32("valid", &[1]);
+            let output =
+                g.cached_block_attention(q, k, v, position, valid, 1, 1, head_dim as u32, 0);
+            g.set_outputs(vec![output]);
+            compile(&g)
+        };
+
+        let decode = compile_shape(1);
+        assert!(
+            decode
+                .dispatches
+                .iter()
+                .any(|dispatch| dispatch.shader == ShaderEntry::CachedBlockAttentionSplit)
+        );
+        assert!(
+            decode
+                .dispatches
+                .iter()
+                .any(|dispatch| dispatch.shader == ShaderEntry::CachedBlockAttentionCombine)
+        );
+
+        let prefill = compile_shape(4);
+        assert!(
+            prefill
+                .dispatches
+                .iter()
+                .any(|dispatch| dispatch.shader == ShaderEntry::CachedBlockAttention)
+        );
+        assert!(prefill.dispatches.iter().all(|dispatch| !matches!(
+            dispatch.shader,
+            ShaderEntry::CachedBlockAttentionSplit | ShaderEntry::CachedBlockAttentionCombine
+        )));
     }
 
     #[test]
