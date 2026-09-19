@@ -55,7 +55,9 @@ impl GemvShape {
     pub(crate) fn initial(group: ShaderGroup) -> Self {
         let threads = match group {
             ShaderGroup::MatMulGemv => 256,
-            ShaderGroup::MatMulGemvAdd | ShaderGroup::MatMulGemvBT => 32,
+            ShaderGroup::MatMulGemvAdd
+            | ShaderGroup::MatMulGemvBT
+            | ShaderGroup::MatMulGemvBTAdd => 32,
             _ => panic!("{group:?} is not a GEMV group"),
         };
         Self {
@@ -475,6 +477,7 @@ pub enum ShaderGroup {
     /// M=1 MatMulBT (`B` stored `[N,K]`): `C[1,N] = A × Bᵀ`. K-split with
     /// coalesced contiguous-K vec4 loads.
     MatMulGemvBT,
+    MatMulGemvBTAdd,
     Reduce,
     Softmax,
     CrossEntropy,
@@ -582,7 +585,10 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
         }
         ShaderGroup::MatMulATAdd => gen_matmul_at_add(knobs),
         ShaderGroup::MatMulBTAdd => gen_matmul_bt_add(knobs),
-        ShaderGroup::MatMulGemv | ShaderGroup::MatMulGemvAdd | ShaderGroup::MatMulGemvBT => {
+        ShaderGroup::MatMulGemv
+        | ShaderGroup::MatMulGemvAdd
+        | ShaderGroup::MatMulGemvBT
+        | ShaderGroup::MatMulGemvBTAdd => {
             generate_module_gemv(group, WeightFormat::F32, GemvShape::initial(group))
         }
         ShaderGroup::Reduce => ShaderModule::new(include_str!("shaders/reduce.wgsl")),
@@ -1883,7 +1889,10 @@ pub fn generate_module_weighted(
         // Every block-packed format takes the same K-split GEMV with its
         // own decoder substituted, so the format picks the helper rather
         // than the arm.
-        ShaderGroup::MatMulGemv | ShaderGroup::MatMulGemvAdd | ShaderGroup::MatMulGemvBT => {
+        ShaderGroup::MatMulGemv
+        | ShaderGroup::MatMulGemvAdd
+        | ShaderGroup::MatMulGemvBT
+        | ShaderGroup::MatMulGemvBTAdd => {
             generate_module_gemv(group, mode, GemvShape::initial(group))
         }
         // Unsupported packed routes must fail closed: falling through would
@@ -1917,11 +1926,16 @@ fn substitute(source: &str, old: &str, new: &str) -> String {
 /// Derived from `matmul_gemv.wgsl` by substitution so shape and reduction
 /// changes reach it automatically. Each consuming workgroup recomputes the
 /// small sum-of-squares prologue, avoiding a separate dispatch and boundary.
-fn gemv_rmsnorm_source(format: WeightFormat) -> String {
+fn gemv_rmsnorm_source(group: ShaderGroup, format: WeightFormat) -> String {
+    assert!(matches!(
+        group,
+        ShaderGroup::MatMulGemv | ShaderGroup::MatMulGemvBT
+    ));
+    let transposed = group == ShaderGroup::MatMulGemvBT;
     // `_pad` carries eps; the fused kernel needs no other new parameter.
     // Start from the already-format-specialized GEMV so packed decoders
     // compose with the prologue rather than being overwritten by it.
-    let src = gemv_source(ShaderGroup::MatMulGemv, format);
+    let src = gemv_source(group, format);
     let src = substitute(&src, "    _pad: u32,", "    eps_bits: u32,");
     let src = if src.contains("var<storage> matrix_b: array<vec4<f32>>;") {
         substitute(
@@ -1944,19 +1958,27 @@ fn gemv_rmsnorm_source(format: WeightFormat) -> String {
     };
     let src = substitute(
         &src,
-        "var<workgroup> reduce_buf: array<vec4<f32>, LANES>;",
-        "var<workgroup> reduce_buf: array<vec4<f32>, LANES>;\n\
-         var<workgroup> scale_buf: array<f32, LANES>;\n\
-         var<workgroup> inv_rms: f32;",
+        "var<workgroup> reduce_buf:",
+        "var<workgroup> scale_buf: array<f32, LANES>;\n\
+         var<workgroup> inv_rms: f32;\nvar<workgroup> reduce_buf:",
     );
     // The early-out must not precede the prologue's barriers, which every
     // lane has to reach. The dispatch is exactly N/4 workgroups, so it
     // never fires in practice, but keep it uniform regardless.
-    let src = substitute(
-        &src,
-        "    if col4 >= n_v4 { return; }\n    let k = params.k;\n",
-        "    let k = params.k;\n",
-    );
+    let src = if transposed {
+        let src = substitute(&src, "    if col >= params.n { return; }\n", "");
+        substitute(
+            &src,
+            "    var acc = 0.0;",
+            "    let k = params.k;\n    // Each thread accumulates a partial sum over its K-stride slice.\n    var acc = 0.0;",
+        )
+    } else {
+        substitute(
+            &src,
+            "    if col4 >= n_v4 { return; }\n    let k = params.k;\n",
+            "    let k = params.k;\n",
+        )
+    };
     let src = substitute(
         &src,
         "    // Each thread accumulates a partial sum over its K-stride slice.",
@@ -1987,15 +2009,40 @@ fn gemv_rmsnorm_source(format: WeightFormat) -> String {
 \n\
     // Each thread accumulates a partial sum over its K-stride slice.",
     );
-    substitute(
-        &src,
-        "        let a = matrix_a[kk];",
-        "        let a = matrix_a[kk] * rs * norm_w[kk];",
-    )
+    if transposed {
+        let src = substitute(
+            &src,
+            "if col4 >= n_v4 { return; }",
+            "if col >= params.n { return; }",
+        );
+        let src = substitute(
+            &src,
+            "let v = matrix_a[si];",
+            "let v = matrix_a[si / 4u][si % 4u];",
+        );
+        substitute(
+            &src,
+            "        let a = matrix_a[kk_v4];",
+            "        let at = kk_v4 * 4u;\n        let a = matrix_a[kk_v4] * rs * vec4<f32>(norm_w[at], norm_w[at+1u], norm_w[at+2u], norm_w[at+3u]);",
+        )
+    } else {
+        substitute(
+            &src,
+            "        let a = matrix_a[kk];",
+            "        let a = matrix_a[kk] * rs * norm_w[kk];",
+        )
+    }
 }
 
-pub fn generate_module_gemv_rmsnorm(shape: GemvShape, format: WeightFormat) -> ShaderModule {
-    ShaderModule::new(&gemv_shape_source(&gemv_rmsnorm_source(format), shape))
+pub fn generate_module_gemv_rmsnorm(
+    group: ShaderGroup,
+    shape: GemvShape,
+    format: WeightFormat,
+) -> ShaderModule {
+    ShaderModule::new(&gemv_shape_source(
+        &gemv_rmsnorm_source(group, format),
+        shape,
+    ))
 }
 
 const LANES_PREFIX: &str = "const LANES: u32 = ";
@@ -2173,17 +2220,21 @@ fn gemv_source(group: ShaderGroup, mode: WeightFormat) -> String {
     let base = match group {
         ShaderGroup::MatMulGemv => include_str!("shaders/matmul_gemv.wgsl"),
         ShaderGroup::MatMulGemvAdd => include_str!("shaders/matmul_gemv_add.wgsl"),
-        ShaderGroup::MatMulGemvBT => include_str!("shaders/matmul_gemv_bt.wgsl"),
+        ShaderGroup::MatMulGemvBT | ShaderGroup::MatMulGemvBTAdd => {
+            include_str!("shaders/matmul_gemv_bt.wgsl")
+        }
         _ => panic!("{group:?} is not a GEMV group"),
     };
-    match (group, mode) {
+    let source = match (group, mode) {
         (_, WeightFormat::F32) => base.to_owned(),
-        (ShaderGroup::MatMulGemvBT, WeightFormat::F16) => gemv_bt_f16_source(base),
+        (ShaderGroup::MatMulGemvBT | ShaderGroup::MatMulGemvBTAdd, WeightFormat::F16) => {
+            gemv_bt_f16_source(base)
+        }
         (_, WeightFormat::F16) => gemv_f16_source(base),
         // Blocks run along the parameter's first dimension, which is N for a
         // transposed B, while every packed decoder indexes along K. The
         // kernel would return plausible but wrong numbers, so refuse.
-        (ShaderGroup::MatMulGemvBT, _) => panic!(
+        (ShaderGroup::MatMulGemvBT | ShaderGroup::MatMulGemvBTAdd, _) => panic!(
             "no {mode:?} variant for {group:?}; block-quantized weights run \
              their blocks along K and cannot serve a transposed B"
         ),
@@ -2193,6 +2244,20 @@ fn gemv_source(group: ShaderGroup, mode: WeightFormat) -> String {
             });
             gemv_packed_source(base, helpers.as_str(), call)
         }
+    };
+    if group == ShaderGroup::MatMulGemvBTAdd {
+        let source = substitute(
+            &source,
+            "var<uniform> params:",
+            "var<storage> src: array<f32>;\nvar<uniform> params:",
+        );
+        substitute(
+            &source,
+            "matrix_c[col] = reduce_buf[0] + reduce_buf[1];",
+            "matrix_c[col] = reduce_buf[0] + reduce_buf[1] + src[col];",
+        )
+    } else {
+        source
     }
 }
 
@@ -6048,6 +6113,10 @@ mod tests {
                 ShaderGroup::MatMulGemvBT,
                 gemv_caps(ShaderGroup::MatMulGemvBT),
             ),
+            (
+                ShaderGroup::MatMulGemvBTAdd,
+                gemv_caps(ShaderGroup::MatMulGemvBTAdd),
+            ),
             (ShaderGroup::Reduce, naga::valid::Capabilities::empty()),
             (ShaderGroup::Softmax, naga::valid::Capabilities::empty()),
             (
@@ -6558,7 +6627,7 @@ mod tests {
                 | ShaderEntry::MatMulGemvBT => {
                     vec!["matrix_a", "matrix_b", "matrix_c", "params"]
                 }
-                ShaderEntry::MatMulGemvAdd => {
+                ShaderEntry::MatMulGemvAdd | ShaderEntry::MatMulGemvBTAdd => {
                     vec!["matrix_a", "matrix_b", "matrix_c", "src", "params"]
                 }
                 ShaderEntry::FusedMatMulAdd
@@ -6744,6 +6813,7 @@ mod tests {
             ShaderEntry::MatMulGemv,
             ShaderEntry::MatMulGemvAdd,
             ShaderEntry::MatMulGemvBT,
+            ShaderEntry::MatMulGemvBTAdd,
             ShaderEntry::FusedMatMulAdd,
             ShaderEntry::FusedMatMulATAdd,
             ShaderEntry::FusedMatMulBTAdd,
@@ -7008,7 +7078,20 @@ mod tests {
             (WeightFormat::Q3K, "dequant_q3k("),
         ];
         for (format, marker) in formats {
-            for group in [ShaderGroup::MatMulGemv, ShaderGroup::MatMulGemvAdd] {
+            for group in [
+                ShaderGroup::MatMulGemv,
+                ShaderGroup::MatMulGemvAdd,
+                ShaderGroup::MatMulGemvBT,
+                ShaderGroup::MatMulGemvBTAdd,
+            ] {
+                if format.is_quantized()
+                    && matches!(
+                        group,
+                        ShaderGroup::MatMulGemvBT | ShaderGroup::MatMulGemvBTAdd
+                    )
+                {
+                    continue;
+                }
                 for threads in [32, 64, 128, 256] {
                     for reduction in [GemvReduction::Tree, GemvReduction::Subgroup] {
                         let shape = GemvShape { threads, reduction };
@@ -7062,6 +7145,9 @@ mod tests {
                                 source.contains("src[col4]"),
                                 "{format:?} {shape:?} dropped the fused addend"
                             );
+                        }
+                        if group == ShaderGroup::MatMulGemvBTAdd {
+                            assert!(source.contains("src[col]"));
                         }
                     }
                 }
@@ -7158,31 +7244,43 @@ mod tests {
     fn packed_gemv_rmsnorm_keeps_the_decoder() {
         for format in [
             WeightFormat::F32,
+            WeightFormat::F16,
             WeightFormat::Q40,
             WeightFormat::Q4K,
             WeightFormat::Q8,
         ] {
-            let sm = generate_module_gemv_rmsnorm(
-                GemvShape {
-                    threads: 64,
-                    reduction: GemvReduction::Subgroup,
-                },
-                format,
-            );
-            assert!(
-                sm.source.contains("inv_rms"),
-                "{format:?} fused GEMV lost the RmsNorm prologue"
-            );
-            assert!(
-                sm.source.contains("norm_w"),
-                "{format:?} fused GEMV lost the norm-weight binding"
-            );
-            match format {
-                WeightFormat::F32 => assert!(sm.source.contains("matrix_b: array<vec4<f32>>")),
-                WeightFormat::Q40 => assert!(sm.source.contains("dequant_q40(")),
-                WeightFormat::Q4K => assert!(sm.source.contains("dequant_q4k(")),
-                WeightFormat::Q8 => assert!(sm.source.contains("dequant_q8(")),
-                _ => {}
+            for group in [ShaderGroup::MatMulGemv, ShaderGroup::MatMulGemvBT] {
+                if group == ShaderGroup::MatMulGemvBT && format.is_quantized() {
+                    continue;
+                }
+                let sm = generate_module_gemv_rmsnorm(
+                    group,
+                    GemvShape {
+                        threads: 64,
+                        reduction: GemvReduction::Subgroup,
+                    },
+                    format,
+                );
+                let flags =
+                    naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
+                naga::valid::Validator::new(flags, naga::valid::Capabilities::all())
+                    .validate(&sm.module)
+                    .unwrap();
+                assert!(
+                    sm.source.contains("inv_rms"),
+                    "{format:?} fused GEMV lost the RmsNorm prologue"
+                );
+                assert!(
+                    sm.source.contains("norm_w"),
+                    "{format:?} fused GEMV lost the norm-weight binding"
+                );
+                match format {
+                    WeightFormat::F32 => assert!(sm.source.contains("matrix_b: array<vec4<f32>>")),
+                    WeightFormat::Q40 => assert!(sm.source.contains("dequant_q40(")),
+                    WeightFormat::Q4K => assert!(sm.source.contains("dequant_q4k(")),
+                    WeightFormat::Q8 => assert!(sm.source.contains("dequant_q8(")),
+                    _ => {}
+                }
             }
         }
     }

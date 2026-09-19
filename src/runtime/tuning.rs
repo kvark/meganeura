@@ -119,7 +119,11 @@ pub(super) fn tile_module(
             );
         }
         if dispatch.gemv_rmsnorm.is_some() {
-            return crate::codegen::generate_module_gemv_rmsnorm(shape, dispatch.weight_format);
+            return crate::codegen::generate_module_gemv_rmsnorm(
+                group,
+                shape,
+                dispatch.weight_format,
+            );
         }
         return crate::codegen::generate_module_gemv(group, dispatch.weight_format, shape);
     }
@@ -1430,7 +1434,10 @@ fn reference_dot(class: &TuneClass, inputs: &[Vec<f32>], row: usize, col: usize)
         // contiguous rows of B rather than forward `[K, N]` columns.
         let b = if matches!(
             class.shader,
-            ShaderEntry::MatMulBT | ShaderEntry::FusedMatMulBTAdd | ShaderEntry::MatMulGemvBT
+            ShaderEntry::MatMulBT
+                | ShaderEntry::FusedMatMulBTAdd
+                | ShaderEntry::MatMulGemvBT
+                | ShaderEntry::MatMulGemvBTAdd
         ) {
             col * k + inner
         } else {

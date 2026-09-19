@@ -191,7 +191,7 @@ pub fn build(
             ple_size,
         )?;
         let proj_norm = g.parameter(proj_norm_name, &[ple_size]);
-        let layered = g.matmul(x, w_proj);
+        let layered = project(g, x, w_proj);
         let layered = g.scale(layered, 1.0 / (hidden as f32).sqrt());
         let layered = g.reshape(layered, &[ple_rows, ple_size]);
         let layered = g.rms_norm(layered, proj_norm, eps);
@@ -231,7 +231,7 @@ pub fn build(
             &format!("{p}.attn_q.weight"),
             &[hidden, q_dim],
         )?;
-        let mut q = g.matmul(attn_in, q);
+        let mut q = project(g, attn_in, q);
 
         // Optional rather than gated on the architecture: Qwen2 biases Q,
         // K and V but not the attention output, and requiring all four
@@ -290,8 +290,8 @@ pub fn build(
                 &format!("{p}.attn_v.weight"),
                 &[hidden, kv_dim],
             )?;
-            let mut k = g.matmul(attn_in, w_k);
-            let mut v = g.matmul(attn_in, w_v);
+            let mut k = project(g, attn_in, w_k);
+            let mut v = project(g, attn_in, w_v);
             if arch.qk_norm() {
                 k = per_head_norm(
                     g,
@@ -378,7 +378,7 @@ pub fn build(
             &format!("{p}.attn_output.weight"),
             &[q_dim, hidden],
         )?;
-        let mut attn_out = g.matmul(attn, wo);
+        let mut attn_out = project(g, attn, wo);
         attn_out = optional_bias(g, model, &format!("{p}.attn_output.bias"), attn_out, hidden)?;
         // Gemma2 norms each block's output before it rejoins the residual.
         if arch.post_block_norms() {
@@ -446,10 +446,10 @@ pub fn build(
             let selected = g.matmul(sel, ple);
             let ple_layer = g.reshape(selected, &[block_size, ple_size]);
 
-            let gated = g.matmul(x, w_gate);
+            let gated = project(g, x, w_gate);
             let gated = g.gelu(gated);
             let mixed = g.mul(gated, ple_layer);
-            let mixed = g.matmul(mixed, w_proj);
+            let mixed = project(g, mixed, w_proj);
             let mixed = g.rms_norm(mixed, post, eps);
             x = g.add(x, mixed);
         }
@@ -475,7 +475,7 @@ pub fn build(
         g.matmul_bt(last, embed)
     } else {
         let head = projection(g, model, config, OUTPUT, &[hidden, config.vocab_size])?;
-        g.matmul(last, head)
+        project(g, last, head)
     };
 
     if let Some(cap) = config.final_logit_softcap {
@@ -689,8 +689,8 @@ fn feed_forward(
             &format!("{prefix}.ffn_up.weight"),
             &[hidden, ffn],
         )?;
-        let gate = g.matmul(input, w_gate);
-        let up = g.matmul(input, w_up);
+        let gate = project(g, input, w_gate);
+        let up = project(g, input, w_up);
         if arch.gates_with_gelu() {
             // Gemma gates with GELU where llama gates with SiLU. The
             // multiply is the same; only the activation differs, so this
@@ -708,7 +708,7 @@ fn feed_forward(
             &format!("{prefix}.ffn_up.weight"),
             &[hidden, ffn],
         )?;
-        let mut up = g.matmul(input, w_up);
+        let mut up = project(g, input, w_up);
         up = optional_bias(g, model, &format!("{prefix}.ffn_up.bias"), up, ffn)?;
         g.gelu(up)
     };
@@ -720,7 +720,7 @@ fn feed_forward(
         &format!("{prefix}.ffn_down.weight"),
         &[ffn, hidden],
     )?;
-    let mut out = g.matmul(hidden_act, w_down);
+    let mut out = project(g, hidden_act, w_down);
     out = optional_bias(g, model, &format!("{prefix}.ffn_down.bias"), out, hidden)?;
     Ok(out)
 }
@@ -902,10 +902,8 @@ fn split_block_leaf(param: &str) -> Option<(&str, &str)> {
 
 /// Declare a projection weight in the dtype the file stores it in.
 ///
-/// GGUF names dimensions fastest-first, so a `[K, N]` tensor there is a
-/// `[K, N]` Meganeura parameter — the orientations agree for weights, and
-/// [`super::GgufTensor::to_packed`] performs the transpose that the packed
-/// layouts imply.
+/// Dense weights retain GGUF's contiguous `[N, K]` rows for `MatMulBT`.
+/// Block formats keep the existing `[K, N]` logical shape and decoder layout.
 fn projection(
     g: &mut Graph,
     model: &GgufModel,
@@ -935,7 +933,21 @@ fn projection(
             source.tensor, tensor.dims,
         )));
     }
-    Ok(parameter_of(g, name, shape, weight_dtype(tensor)?))
+    let dtype = weight_dtype(tensor)?;
+    let shape = if matches!(dtype, DType::F32 | DType::F16) {
+        [shape[1], shape[0]]
+    } else {
+        *shape
+    };
+    Ok(parameter_of(g, name, &shape, dtype))
+}
+
+fn project(g: &mut Graph, input: NodeId, weight: NodeId) -> NodeId {
+    if matches!(g.node(weight).ty.dtype, DType::F32 | DType::F16) {
+        g.matmul_bt(input, weight)
+    } else {
+        g.matmul(input, weight)
+    }
 }
 
 /// The dtype a projection weight is declared — and so must be *filled* —
@@ -1231,11 +1243,11 @@ mod tests {
         let declared = declared_parameters(&g);
         assert_eq!(
             declared["blk.0.attn_k.weight"],
-            vec![config.hidden_size, config.kv_dim_at(0)]
+            vec![config.kv_dim_at(0), config.hidden_size]
         );
         assert_eq!(
             declared["blk.1.attn_k.weight"],
-            vec![config.hidden_size, config.kv_dim_at(1)]
+            vec![config.kv_dim_at(1), config.hidden_size]
         );
         let kv_heads: Vec<_> = g
             .nodes()
@@ -1317,20 +1329,20 @@ mod tests {
         let declared = declared_parameters(&g);
         assert_eq!(
             declared["blk.0.attn_q.weight"],
-            vec![config.hidden_size, config.q_dim()]
+            vec![config.q_dim(), config.hidden_size]
         );
         assert_eq!(
             declared["blk.0.attn_k.weight"],
-            vec![config.hidden_size, config.kv_dim_at(0)]
+            vec![config.kv_dim_at(0), config.hidden_size]
         );
         assert_eq!(
             declared["blk.0.ffn_down.weight"],
-            vec![config.intermediate_size, config.hidden_size]
+            vec![config.hidden_size, config.intermediate_size]
         );
         assert_eq!(
             declared[TOKEN_EMBD],
             vec![config.vocab_size, config.hidden_size],
-            "the table is a list of rows, not a [K, N] weight"
+            "the table retains its token-major rows"
         );
     }
 
@@ -1454,7 +1466,7 @@ mod tests {
         build(&mut g, &model, &config, 4, 16).unwrap();
         assert_eq!(
             declared_parameters(&g)[OUTPUT],
-            vec![config.hidden_size, config.vocab_size]
+            vec![config.vocab_size, config.hidden_size]
         );
     }
 
