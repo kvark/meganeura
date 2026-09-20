@@ -18,7 +18,7 @@ fn readback_preserves_bits_across_sizes_and_updates() {
     graph.set_outputs(vec![output]);
     let mut session = meganeura::build(&graph, meganeura::SessionConfig::inference_from_env()).0;
     for seed in [0u32, 17] {
-        let values: Vec<_> = (0..len)
+        let mut values: Vec<_> = (0..len)
             .map(|i| {
                 f32::from_bits(match i % 7 {
                     0 => 0x7fc0_0123,
@@ -28,12 +28,13 @@ fn readback_preserves_bits_across_sizes_and_updates() {
                 })
             })
             .collect();
-        session.set_input("x", &values);
-        session.step();
-        session.wait();
         for count in [0, 17, len, 1024, len] {
+            values[3] = f32::from_bits(values[3].to_bits().wrapping_add(1));
+            values[len - 1] = values[3];
+            session.set_input("x", &values);
+            session.step();
             let mut actual = vec![0.0; count];
-            session.read_output_by_index(0, &mut actual);
+            session.wait_read_output(0, &mut actual);
             assert!(
                 actual
                     .iter()
