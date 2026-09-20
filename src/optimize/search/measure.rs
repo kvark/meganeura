@@ -33,6 +33,8 @@ pub struct Trial {
     pub description: String,
     /// Full session construction, including allocations, not shader-only compile time.
     pub construction_time: Duration,
+    pub initialization_time: Duration,
+    pub qualification_time: Duration,
     pub kernel_tuning: Option<TuneReport>,
     pub outcome: TuneOutcome<(), usize>,
 }
@@ -118,6 +120,8 @@ pub fn select(
         let mut trial = Trial {
             description: program.description,
             construction_time: Duration::ZERO,
+            initialization_time: Duration::ZERO,
+            qualification_time: Duration::ZERO,
             kernel_tuning: None,
             outcome: TuneOutcome::new((), program.plan.dispatches.len(), report.selected, index),
         };
@@ -133,8 +137,17 @@ pub fn select(
                 Session::with_context_opts(program.plan, gpu.clone(), runtime.clone());
             trial.construction_time = build.elapsed();
             let result = (|| {
-                initialize(&mut candidate)?;
-                qualify(&mut candidate)?;
+                let init = Instant::now();
+                let initialized = initialize(&mut candidate);
+                trial.initialization_time = init.elapsed();
+                initialized?;
+                let mut validate = |session: &mut Session| {
+                    let began = Instant::now();
+                    let result = qualify(session);
+                    trial.qualification_time += began.elapsed();
+                    result
+                };
+                validate(&mut candidate)?;
                 let mut policy = options.tuning.clone();
                 policy.max_time = policy
                     .max_time
@@ -144,7 +157,7 @@ pub fn select(
                         .tune_with(policy)
                         .map_err(|error| error.to_string())?,
                 );
-                qualify(&mut candidate)?;
+                validate(&mut candidate)?;
                 trial.outcome.qualified = true;
                 if let Some(ref mut baseline) = incumbent {
                     for _ in 0..options.tuning.warmup_runs {
@@ -171,7 +184,7 @@ pub fn select(
                             session.wait();
                             Some(sample.elapsed().as_secs_f64() * 1000.0)
                         });
-                    qualify(&mut candidate)?;
+                    validate(&mut candidate)?;
                     decide(&mut trial.outcome, &options.tuning);
                 } else {
                     trial.outcome.selected = index;
