@@ -2032,6 +2032,31 @@ fn compute_groups(dispatches: &[Dispatch]) -> Vec<std::ops::Range<usize>> {
     groups
 }
 
+/// Select kernels and schedule a compiled plan without allocating GPU resources.
+///
+/// The session uses this same path. CPU allocation analysis can pass the groups
+/// to `memplan::plan_buffer_aliasing`; use `None` for a disabled cooperative
+/// policy, or the *actual selected* cooperative configuration for other policies.
+/// This does not estimate driver allocations or establish device memory headroom.
+pub fn plan_dispatches(
+    plan: &mut ExecutionPlan,
+    coop: Option<&crate::codegen::CoopConfig>,
+    opts: &SessionOptions,
+) -> Vec<std::ops::Range<usize>> {
+    select_variants(plan, coop, !opts.debug, opts.coop == CoopPolicy::AllowF16);
+    reorder_by_level(&mut plan.dispatches);
+    let mut groups = if opts.serial_dispatch {
+        log::info!("MEGANEURA_SERIAL_DISPATCH: forcing one dispatch per pass");
+        (0..plan.dispatches.len()).map(|i| i..i + 1).collect()
+    } else {
+        compute_groups(&plan.dispatches)
+    };
+    if !opts.serial_dispatch && !opts.debug {
+        crate::compile::fuse_horizontal_matmuls(&mut plan.dispatches, &mut groups);
+    }
+    groups
+}
+
 /// Record the compiled graph, leaving the last chunk open for appended work.
 #[allow(clippy::too_many_arguments)]
 fn record_groups(
@@ -3139,27 +3164,7 @@ impl Session {
         let mut plan = plan;
         let schedule_span = tracing::info_span!("schedule").entered();
 
-        // Per-dispatch kernel-variant selection: one pass, one owner.
-        select_variants(
-            &mut plan,
-            coop_config.as_ref(),
-            !opts.debug,
-            opts.coop == CoopPolicy::AllowF16,
-        );
-
-        // Reorder dispatches by dependency level so parallel branches (e.g. Q/K/V
-        // projections) cluster together, then partition into barrier groups.
-        reorder_by_level(&mut plan.dispatches);
-        let mut groups = if opts.serial_dispatch {
-            // Debug: one dispatch per pass — guarantees serial execution.
-            log::info!("MEGANEURA_SERIAL_DISPATCH: forcing one dispatch per pass");
-            (0..plan.dispatches.len()).map(|i| i..i + 1).collect()
-        } else {
-            compute_groups(&plan.dispatches)
-        };
-        if !opts.serial_dispatch && !opts.debug {
-            crate::compile::fuse_horizontal_matmuls(&mut plan.dispatches, &mut groups);
-        }
+        let groups = plan_dispatches(&mut plan, coop_config.as_ref(), &opts);
         log::info!(
             "{} dispatches → {} barrier groups",
             plan.dispatches.len(),
@@ -4124,6 +4129,47 @@ mod variant_tests {
         epilogue_tile, select_variants,
     };
 
+    #[test]
+    fn cpu_dispatch_planning_preserves_dependencies_and_allocation_inputs() {
+        let mut graph = crate::Graph::new();
+        let x = graph.input("x", &[3, 5]);
+        let a = graph.parameter("a", &[5, 7]);
+        let b = graph.parameter("b", &[5, 7]);
+        let xa = graph.matmul(x, a);
+        let xb = graph.matmul(x, b);
+        let sum = graph.add(xa, xb);
+        let loss = graph.mean_all(sum);
+        graph.set_outputs(vec![loss]);
+        let (original, _) = crate::compile_training_graph(&graph);
+        for serial_dispatch in [false, true] {
+            let mut plan = original.clone();
+            let options = super::SessionOptions {
+                coop: super::CoopPolicy::Disabled,
+                serial_dispatch,
+                ..Default::default()
+            };
+            let groups = super::plan_dispatches(&mut plan, None, &options);
+            assert_eq!(groups.first().unwrap().start, 0);
+            assert_eq!(groups.last().unwrap().end, plan.dispatches.len());
+            for group in &groups {
+                let mut written = std::collections::HashSet::new();
+                for dispatch in &plan.dispatches[group.clone()] {
+                    assert!(dispatch.input_buffers.iter().all(|b| !written.contains(b)));
+                    written.insert(dispatch.output_buffer);
+                    written.extend(dispatch.extra_outputs.iter().copied());
+                }
+            }
+            if serial_dispatch {
+                assert!(groups.iter().all(|g| g.len() == 1));
+            }
+            let aliases = crate::memplan::plan_buffer_aliasing(&plan, &groups, None);
+            assert_eq!(aliases.map.len(), plan.buffers.len());
+            assert!(aliases.physical_bytes() <= aliases.logical_bytes(&plan.buffers));
+            assert_eq!(plan.param_grad_pairs, original.param_grad_pairs);
+            assert_eq!(plan.output_buffers, original.output_buffers);
+        }
+    }
+
     fn relu_epilogue() -> crate::compile::MatMulEpilogue {
         crate::compile::MatMulEpilogue {
             dag: crate::schedule::PointwiseDAG {
@@ -4257,6 +4303,7 @@ mod variant_tests {
     /// `Pipelines::new`: a variant absent from the map is a kernel that was
     /// never compiled.
     #[test]
+    #[ignore = "requires exclusive GPU; creates a context and shader pipelines"]
     fn epilogue_dispatch_compiles_no_unreachable_pipeline() {
         let gpu = crate::init_gpu_context().unwrap();
 
