@@ -52,6 +52,43 @@ control. Attention time rises from 2.360 to 4.276 ms; matrix time is unchanged.
 Full-output relative L2 is 8.6848e-5. The unchanged validation gate passes.
 This version was reverted on the experiment branch.
 
+## Measured layout selection
+
+Revision `ec7929f94cb4be4ec67f10046a9680a7ff745829` restores the original default
+and makes 1/2/4 independent query tiles explicit candidates in the existing
+whole-program selector. It uses Blade
+`2b328f8b643798813d8c9319b807030215d33b98`, whose new capability reports a fixed
+compute subgroup width only when Vulkan's minimum and maximum agree. Metal,
+GLES, and unknown/variable-width devices conservatively report no guarantee.
+There is no vendor-name gate or assumed default width. Candidate workgroup
+storage is capped at Vulkan's minimum 16-KiB guarantee. One broader existing
+GPU test checks all legal layouts against F64 across masks, mixed heads, and
+ragged sizes; it passes on NVIDIA and takes the existing fallback on Intel.
+
+```sh
+target/release/examples/egglog_model_search \
+  Whisper-tiny /path/to/whisper-cpu.f32 fast baseline \
+  --static --attention-tiles --confirm
+# Repeat with --reverse; this reverses challengers, not the control.
+```
+
+`--static` disables the inner matmul tuner for this layout-only ablation; it
+does not disable whole-program measurement. Three independent processes:
+
+| Search order | Selected query tiles | Control (ms) | Selected (ms) | Paired reduction |
+| --- | ---: | ---: | ---: | ---: |
+| Forward | 2 | 4.9612 | 4.0291 | 18.8% |
+| Reverse | 4 | 4.9665 | 3.9818 | 19.8% |
+| Forward | 2 | 4.9544 | 4.0198 | 18.8% |
+
+Each selected layout wins all 40 independent confirmation pairs. The 2% noise
+guard does not consistently distinguish two from four tiles, which is fine:
+neither is a universal hard-coded choice. Search, construction and qualification
+together take 3.367 / 2.050 / 2.000 seconds; warm caches and four candidates,
+not a cold compiler comparison. Full-output error remains 8.4823e-5. B570
+reports variable subgroup width, excludes the independent-query candidates,
+and passes its full-output reference check through the existing implementation.
+
 Another ablation (`79822865052ec23be6c56d2339af62e7eaf01f07`) removes only the
 minimum-workgroup estimate for F16 cooperative matrix products. SmolVLA slows
 from 4.3895 / 4.3924 / 4.3995 ms to 6.7445 / 6.7408 / 6.7034 ms. The full-output
