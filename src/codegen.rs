@@ -1974,8 +1974,13 @@ pub(crate) fn generate_serial_sum_rows(workgroup_size: u32) -> ShaderModule {
 /// One 32-lane subgroup computes four 16x16 F16 cooperative partial tiles.
 /// Reuse the canonical staging and masked epilogue store, including ragged
 /// row/column tails. Unmasked cooperative stores could overwrite the next split.
-pub(crate) fn generate_split_cooperative_matmul(group: ShaderGroup, splits: u32) -> ShaderModule {
+pub(crate) fn generate_split_cooperative_matmul(
+    group: ShaderGroup,
+    splits: u32,
+    k_stage: u32,
+) -> ShaderModule {
     use crate::schedule::{PointwiseDAG, Pw};
+    assert!(matches!(k_stage, 16 | 32 | 64));
     assert!(matches!(
         group,
         ShaderGroup::MatMul | ShaderGroup::MatMulAT | ShaderGroup::MatMulBT
@@ -2030,6 +2035,44 @@ pub(crate) fn generate_split_cooperative_matmul(group: ShaderGroup, splits: u32)
         "let idx = row * n + col;",
         "let idx = wgid.z * m * n + row * n + col;",
     );
+    if k_stage > 16 {
+        let rounds = k_stage / 16;
+        assert_eq!(source.matches("array<f16, 256>").count(), 4);
+        source = source.replace("array<f16, 256>", &format!("array<f16, {}>", rounds * 256));
+        source = substitute(
+            &source,
+            "var t = start_tile * 16u;",
+            "var stage_offset = 0u;\n        var t = start_tile * 16u;",
+        );
+        for name in ["shared_a0", "shared_a1", "shared_b0", "shared_b1"] {
+            source = source.replace(&format!("{name}["), &format!("{name}[stage_offset + "));
+        }
+        source = substitute(
+            &source,
+            "for (var staging_round = 0u; staging_round < 2u; staging_round++) {",
+            &format!(
+                "for (var staging_k = 0u; staging_k < {rounds}u; staging_k++) {{\n        stage_offset = staging_k * 256u;\n        let t = t + staging_k * 16u;\n        for (var staging_round = 0u; staging_round < 2u; staging_round++) {{"
+            ),
+        );
+        source = substitute(
+            &source,
+            "        }\n        workgroupBarrier();",
+            "        }}\n        workgroupBarrier();",
+        );
+        source = source.replace("< k", "< end_k");
+        source = substitute(
+            &source,
+            "// Cooperative matrix multiply-add:",
+            &format!(
+                "for (var mma_k = 0u; mma_k < {rounds}u; mma_k++) {{\n        stage_offset = mma_k * 256u;\n        // Cooperative matrix multiply-add:"
+            ),
+        );
+        source = substitute(
+            &source,
+            "workgroupBarrier();\n        t += 16u;",
+            &format!("}}\n        workgroupBarrier();\n        t += {k_stage}u;"),
+        );
+    }
     ShaderModule::new(&source)
 }
 

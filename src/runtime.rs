@@ -1078,7 +1078,7 @@ fn epilogue_tile(dispatch: &Dispatch) -> crate::codegen::MatMulTile {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Variant {
     SplitMatmul(ShaderEntry, crate::codegen::ScalarMatmulShape, u32),
-    SplitCooperativeMatmul(ShaderEntry, u32),
+    SplitCooperativeMatmul(ShaderEntry, u32, u32),
     SumRowsSerial(ShaderEntry, u32),
     SpecializedConv(ShaderEntry, Vec<u32>, u32),
     ScalarMatmul(
@@ -1178,7 +1178,7 @@ impl Variant {
             Variant::Attention(ref e, _)
             | Variant::CooperativeAttention(ref e, _, _)
             | Variant::SplitMatmul(ref e, _, _)
-            | Variant::SplitCooperativeMatmul(ref e, _)
+            | Variant::SplitCooperativeMatmul(ref e, _, _)
             | Variant::SumRowsSerial(ref e, _)
             | Variant::SpecializedConv(ref e, _, _)
             | Variant::ScalarMatmul(ref e, _, _)
@@ -1205,8 +1205,8 @@ impl Variant {
             Variant::SplitMatmul(ref e, shape, splits) => {
                 format!("{e:?}:split-{splits}-{shape:?}")
             }
-            Variant::SplitCooperativeMatmul(ref e, splits) => {
-                format!("{e:?}:cooperative-split-{splits}")
+            Variant::SplitCooperativeMatmul(ref e, splits, k_stage) => {
+                format!("{e:?}:cooperative-split-{splits}-K{k_stage}")
             }
             Variant::SumRowsSerial(ref e, size) => format!("{e:?}:serial-{size}"),
             Variant::ScalarMatmul(ref e, format, shape) => {
@@ -1379,7 +1379,7 @@ impl Pipelines {
                 }
                 crate::codegen::generate_serial_sum_rows(size)
             }
-            Variant::SplitCooperativeMatmul(_, splits) => {
+            Variant::SplitCooperativeMatmul(_, splits, k_stage) => {
                 if gpu.capabilities().fixed_compute_subgroup_size != Some(32)
                     || dispatch.requires_full_precision
                     || !coop_config
@@ -1389,7 +1389,7 @@ impl Pipelines {
                         "cooperative split-K requires fixed 32-lane F16 support and policy".into(),
                     );
                 }
-                crate::codegen::generate_split_cooperative_matmul(group, splits)
+                crate::codegen::generate_split_cooperative_matmul(group, splits, k_stage)
             }
             Variant::ScalarMatmul(_, _, shape) => tuning::tile_module(
                 dispatch,
@@ -1565,8 +1565,9 @@ impl Pipelines {
         if let crate::compile::Kernel::SumRowsSerial { workgroup_size } = dispatch.kernel {
             return Variant::SumRowsSerial(entry, workgroup_size);
         }
-        if let crate::compile::Kernel::SplitCooperativeMatmul { splits } = dispatch.kernel {
-            return Variant::SplitCooperativeMatmul(entry, splits);
+        if let crate::compile::Kernel::SplitCooperativeMatmul { splits, k_stage } = dispatch.kernel
+        {
+            return Variant::SplitCooperativeMatmul(entry, splits, k_stage);
         }
         if let crate::compile::Kernel::SplitMatmul { shape, splits } = dispatch.kernel {
             return Variant::SplitMatmul(entry, shape, splits);

@@ -179,15 +179,20 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
     {
         let mut variants = Vec::new();
         for program in &programs {
-            let mut plan = program.plan.clone();
-            let changed = (0..plan.dispatches.len())
-                .filter(|&i| plan.cooperative_split_matmul(i).is_ok())
-                .count();
-            if changed > 0 {
-                variants.push(search::measure::Program {
-                    description: format!("cooperative_split={changed}; {}", program.description),
-                    plan,
-                });
+            for k_stage in [16, 32, 64] {
+                let mut plan = program.plan.clone();
+                let changed = (0..plan.dispatches.len())
+                    .filter(|&i| plan.cooperative_split_matmul(i, k_stage).is_ok())
+                    .count();
+                if changed > 0 {
+                    variants.push(search::measure::Program {
+                        description: format!(
+                            "cooperative_split={changed}, K={k_stage}; {}",
+                            program.description
+                        ),
+                        plan,
+                    });
+                }
             }
         }
         programs.extend(variants);
@@ -295,7 +300,7 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
         search::measure::Options {
             tuning: tuning.clone(),
             max_time: Duration::from_secs(search_seconds),
-            max_programs: 32,
+            max_programs: 64,
             max_plan_bytes: 3 * 1024 * 1024 * 1024,
         },
         |session| {

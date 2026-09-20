@@ -1081,6 +1081,7 @@ pub enum Kernel {
     /// F16 cooperative partials followed by the existing split-K reduction.
     SplitCooperativeMatmul {
         splits: u32,
+        k_stage: u32,
     },
     SumRowsSerial {
         workgroup_size: u32,

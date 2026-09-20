@@ -4,7 +4,11 @@ use crate::tune::{MatmulTile, TuneClass, TuneError};
 impl ExecutionPlan {
     /// Change an existing plain split-K producer, retaining its partial storage
     /// and reduction. Device/precision policy must also permit the F16 candidate.
-    pub fn cooperative_split_matmul(&mut self, index: usize) -> Result<(), TuneError> {
+    pub fn cooperative_split_matmul(
+        &mut self,
+        index: usize,
+        k_stage: u32,
+    ) -> Result<(), TuneError> {
         let d = self
             .dispatches
             .get_mut(index)
@@ -20,15 +24,16 @@ impl ExecutionPlan {
         } else {
             (second, third)
         };
-        if d.requires_full_precision
+        if !matches!(k_stage, 16 | 32 | 64)
+            || d.requires_full_precision
             || splits > k.div_ceil(16)
-            || k.checked_add(15).is_none()
+            || k.checked_add(k_stage - 1).is_none()
             || m.div_ceil(32) > 65535
             || n.div_ceil(32) > 65535
         {
             return Err(TuneError("illegal cooperative split-K candidate"));
         }
-        d.kernel = super::Kernel::SplitCooperativeMatmul { splits };
+        d.kernel = super::Kernel::SplitCooperativeMatmul { splits, k_stage };
         d.workgroups = [m.div_ceil(32), n.div_ceil(32), splits];
         Ok(())
     }
@@ -282,17 +287,17 @@ mod tests {
                 }
             }
             for (tile_size, k_stage, splits, cooperative, serial_sum) in [
-                (32, 8, 3, false, 0),
-                (64, 16, 4, false, 0),
-                (32, 32, 2, false, 0),
-                (32, 16, 3, true, 0),
-                (64, 16, 4, true, 0),
-                (32, 32, 2, true, 0),
-                (32, 8, 3, false, 64),
-                (64, 16, 4, false, 128),
-                (32, 32, 2, false, 256),
+                (32, 8, 3, 0, 0),
+                (64, 16, 4, 0, 0),
+                (32, 32, 2, 0, 0),
+                (32, 16, 3, 16, 0),
+                (64, 16, 4, 32, 0),
+                (32, 32, 2, 64, 0),
+                (32, 8, 3, 0, 64),
+                (64, 16, 4, 0, 128),
+                (32, 32, 2, 0, 256),
             ] {
-                if cooperative
+                if cooperative != 0
                     && (gpu.capabilities().fixed_compute_subgroup_size != Some(32)
                         || gpu.capabilities().cooperative_matrix.f16_tile != 16)
                 {
@@ -308,8 +313,8 @@ mod tests {
                 assert!(plan.split_matmul(0, shape, splits, 0).is_err());
                 assert_eq!(before, serde_json::to_value(&plan).unwrap());
                 plan.split_matmul(0, shape, splits, 1024 * 1024).unwrap();
-                if cooperative {
-                    plan.cooperative_split_matmul(0).unwrap();
+                if cooperative != 0 {
+                    plan.cooperative_split_matmul(0, cooperative).unwrap();
                 }
                 if serial_sum > 0 {
                     let d = &mut plan.dispatches[1];
@@ -323,7 +328,7 @@ mod tests {
                     plan,
                     gpu.clone(),
                     crate::SessionOptions {
-                        coop: if cooperative {
+                        coop: if cooperative != 0 {
                             crate::CoopPolicy::Auto
                         } else {
                             crate::CoopPolicy::Disabled
@@ -335,7 +340,7 @@ mod tests {
                 session.set_parameter("b", &b);
                 session.step();
                 session.wait();
-                let (atol, rtol) = if cooperative {
+                let (atol, rtol) = if cooperative != 0 {
                     (0.003, 0.002)
                 } else {
                     (2e-5, 2e-4)
