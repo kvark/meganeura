@@ -97,6 +97,57 @@ small product onto the currently available cooperative implementation is not
 the solution. Keep family alternatives for measurement; do not replace this
 estimate with a blanket cooperative preference.
 
+## SmolVLA: split-K and its final reduction
+
+Revision `58e4f2c2637de66c60e00f18a1836d64944f4630` also tests cooperative
+split-K products. One fixed 32-lane subgroup computes each partial tile,
+then the existing SumRows combines partials. The generator reuses cooperative
+staging and the masked epilogue store; unmasked ragged stores would overwrite
+the next partial. Precision and subgroup guards remain explicit.
+
+All 27 whole-program candidates qualify in both search orders, but neither
+search selects the cooperative family. Scalar split-K gives held-out medians
+3.9261 / 3.9248 ms, against greedy controls of 4.4546 / 4.4434 ms.
+Cooperative challengers take about 4.06–4.22 ms during selection. Full CPU
+relative L2 is 1.96e-4 for the cooperative plan and 5.55e-6 for scalar split-K.
+The broad full-F64 check covers normal and transposed products, ragged output
+dimensions, and uneven K partitions. This is a qualified negative result,
+not a reason to force cooperative execution.
+
+Separate fixed-plan Nsight Systems captures complete successfully for the
+greedy, scalar-split and cooperative-split implementations. Companion GPU
+pass timings inside those instrumented captures put matrix work at
+3.637 / 2.096 / 2.405 ms respectively. Reduction and normalization passes
+rise from 0.132 to 0.749 / 0.759 ms. These are diagnostic instrumented
+intervals, not clean benchmark latencies or measurements of barrier cost.
+
+Revision `ad00f74db4afe9bf6694dc0c983e636d2f0c3832` addresses that reduction
+work with another generic candidate: one lane serially sums the rows for
+one output column. Adjacent lanes read adjacent columns; no workgroup
+storage or barriers are needed. Workgroup sizes 64, 128 and 256 are measured
+as alternatives, without a shape or device threshold. The existing broad
+split-K oracle covers every variant on both GPUs.
+
+Run `SmolVLA REFERENCE fast --program=3 --serial-sums --static --confirm`,
+then repeat with `--reverse`; use `strict` on B570. Here the confirmation
+control is the selected scalar split-K program, not the original greedy
+graph. The only change is the row reduction implementation:
+
+| GPU / order | Split-K control | Serial reduction | Median paired reduction |
+| --- | ---: | ---: | ---: |
+| RTX 5070 / forward | 3.9154 ms | 3.6748 ms | 6.2% |
+| RTX 5070 / reverse | 3.8931 ms | 3.6086 ms | 7.5% |
+| B570 / forward | 6.5871 ms | 6.0923 ms | 7.6% |
+| B570 / reverse | 6.6028 ms | 6.0880 ms | 7.9% |
+
+Held-out wins are 40/40, 36/40, 40/40 and 40/40; full CPU errors remain
+below 5.6e-6. Forward order chooses width 64, reverse order 256: the 2% guard
+does not establish a material difference between the serial widths. The
+four-program searches take 2.8–3.2 s on NVIDIA and 6.0 s on Intel, including
+construction and qualification, with inner matrix tuning disabled for this
+ablation. Combining these candidates with graph search is the next step;
+do not add the separate percentage improvements as if they were independent.
+
 ## Reproduce
 
 Check out the indicated source revision, using a separate target directory for
