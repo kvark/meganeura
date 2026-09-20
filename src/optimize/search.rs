@@ -105,8 +105,8 @@ fn edges(
         if let Some(&value) = values.get(&id) {
             return Ok(value);
         }
-        let value = match terms.get(id) {
-            Term::App(head, args) => {
+        let value = match *terms.get(id) {
+            Term::App(ref head, ref args) => {
                 let inputs = args
                     .iter()
                     .map(|&arg| visit(egraph, terms, arg, values, edges))
