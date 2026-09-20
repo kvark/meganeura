@@ -147,7 +147,6 @@ fn plain(d: &Dispatch) -> bool {
         matmul_prologue: None,
         label: _,
         origin: _,
-        scalar_fallback: None,
         weight_format: crate::compile::WeightFormat::F32,
     } if outputs.is_empty())
 }

@@ -2045,7 +2045,7 @@ mod tests {
             let mut selected = left.dispatches[0].clone();
             swaps[0].right.apply(&mut selected, &swaps[0].class);
             assert_eq!(selected, right.dispatches[0]);
-            assert!(selected.scalar_fallback.is_some());
+            assert!(selected.use_coop());
             let reduced = crate::codegen::CoopConfig {
                 use_f16_input: true,
                 ..config

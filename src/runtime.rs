@@ -1327,16 +1327,6 @@ impl Pipelines {
                 .entry(group)
                 .or_default()
                 .insert(dispatch.shader.clone());
-            // Retain the recorded scalar pipeline for cooperative fallback
-            // provenance. The current scratch tuner only searches scalar tiles.
-            if let Some((ref fb_shader, _)) = dispatch.scalar_fallback {
-                let fb_group = fb_shader.shader_group();
-                needed.insert(fb_group);
-                entries_for_group
-                    .entry(fb_group)
-                    .or_default()
-                    .insert(fb_shader.clone());
-            }
             if matches!(
                 group,
                 ShaderGroup::MultiHeadAttn
@@ -2638,9 +2628,6 @@ pub(crate) fn select_variants(
             };
             let _ = k;
             if coop_wgs >= min_wgs && !dispatch.weight_format.uses_reduced_storage() && vec4_ok {
-                // Retain pre-promotion geometry for diagnostics and future
-                // complete cooperative candidates. Survives reordering.
-                dispatch.scalar_fallback = Some((dispatch.shader.clone(), dispatch.workgroups));
                 dispatch.kernel = crate::compile::Kernel::Cooperative;
                 // Route conv2d coop dispatches to generated specialized kernels
                 if is_conv_bwd {

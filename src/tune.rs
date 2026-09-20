@@ -274,9 +274,6 @@ impl MatmulTile {
             }
             Self::Gemv(_) => unreachable!(),
         };
-        dispatch.scalar_fallback = dispatch
-            .use_coop()
-            .then(|| (dispatch.shader.clone(), Self::Tile64.workgroups(class)));
         dispatch.workgroups = self.workgroups(class);
     }
 
@@ -464,7 +461,6 @@ impl TuneClass {
         ) {
             if dispatch.use_coop()
                 || dispatch.use_small_tiles()
-                || dispatch.scalar_fallback.is_some()
                 || dispatch.weight_format.uses_reduced_storage()
             {
                 return None;
@@ -1635,7 +1631,7 @@ mod tests {
                     [1, 1, 1]
                 }
             );
-            assert!(!d.use_small_tiles() && !d.use_coop() && d.scalar_fallback.is_none());
+            assert!(!d.use_small_tiles() && !d.use_coop());
             assert_eq!(MatmulTile::selected(&d, None), Some(MatmulTile::Tile32));
             let small = TuneClass::from_dispatch(&d, None).unwrap();
             let mut expected = class.clone();
@@ -1666,7 +1662,7 @@ mod tests {
             let mut variants = vec![base; 17];
             variants[0].kernel = crate::compile::Kernel::SmallTile;
             variants[1].kernel = crate::compile::Kernel::Cooperative;
-            variants[2].scalar_fallback = Some((ShaderEntry::MatMul, [1; 3]));
+            variants[2].kernel = crate::compile::Kernel::CooperativeCompensated;
             variants[3].params.pop();
             variants[4].params[7] = 0;
             variants[5].params[9] += 1;
@@ -2053,7 +2049,7 @@ mod tests {
     }
 
     #[test]
-    fn native_geometry_flags_and_scalar_fallback_move_together() {
+    fn native_geometry_and_kernel_move_together() {
         let config = native_config(8);
         let native = MatmulTile::CooperativeF32 { tile_size: 8 };
         let class = class(32, 64, 17);
@@ -2062,12 +2058,11 @@ mod tests {
         native.apply(&mut d, &class);
         assert_eq!(d.workgroups, [2, 4, 1]);
         assert!(d.use_coop() && !d.use_coop_compensated() && !d.use_small_tiles());
-        assert_eq!(d.scalar_fallback, Some((ShaderEntry::MatMul, [1, 1, 1])));
         assert!(TuneClass::from_dispatch(&d, Some(&config)).is_some());
         assert!(TuneClass::from_dispatch(&d, None).is_none());
         MatmulTile::Tile32.apply(&mut d, &class);
         assert_eq!(d.workgroups, [2, 1, 1]);
-        assert!(!d.use_coop() && d.use_small_tiles() && d.scalar_fallback.is_none());
+        assert!(!d.use_coop() && d.use_small_tiles());
         assert!(TuneClass::from_dispatch(&d, Some(&config)).is_some());
     }
 
