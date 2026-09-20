@@ -24,9 +24,7 @@ fn main() {
     let mut results = Vec::new();
     for region in regions {
         let start = Instant::now();
-        let space =
-            search::region_candidates(&graph, region.start..region.start + region.period, 8)
-                .unwrap();
+        let space = search::repeated_candidates(&graph, region, 8).unwrap();
         results.push(serde_json::json!({
             "start": region.start, "nodes": region.period, "instances": region.count,
             "search_ms": start.elapsed().as_secs_f64() * 1000.0,

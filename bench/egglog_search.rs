@@ -1,5 +1,5 @@
 //! Small-region experiment: retain egglog alternatives through kernel tuning.
-//! Usage: egglog_search [M K N] [reverse|forward] [split]
+//! Usage: egglog_search [M K N] [reverse|forward] [split] [select]
 use meganeura::{Graph, Session, SessionConfig, optimize::search};
 use std::time::Instant;
 
@@ -18,20 +18,19 @@ fn median(samples: &[f64]) -> f64 {
     sorted[sorted.len() / 2]
 }
 
-fn qualify(session: &mut Session, reference: &[f64]) -> f64 {
+fn qualify(session: &mut Session, reference: &[f64]) -> Result<f64, String> {
     session.step();
     session.wait();
     let out = session.read_output(reference.len());
     let mut error = 0.0_f64;
     for (&actual, &expected) in out.iter().zip(reference) {
         let diff = (f64::from(actual) - expected).abs();
-        assert!(
-            actual.is_finite() && diff < 2e-5 + 2e-4 * expected.abs(),
-            "{actual} != {expected}"
-        );
+        if !actual.is_finite() || diff >= 2e-5 + 2e-4 * expected.abs() {
+            return Err(format!("{actual} != {expected}"));
+        }
         error = error.max(diff);
     }
-    error
+    Ok(error)
 }
 
 fn main() {
@@ -76,10 +75,13 @@ fn main() {
         })
         .collect();
     let split_search = args.get(4).is_some_and(|s| s == "split");
+    let select = args.get(5).is_some_and(|s| s == "select");
+    assert!(!select || split_search);
     let tiles: &[u32] = if split_search { &[32, 64] } else { &[64] };
     let splits: &[u32] = if split_search { &[1, 2, 4, 8] } else { &[1] };
     let gpu = std::sync::Arc::new(meganeura::runtime::init_gpu_context().unwrap());
     let mut trials = Vec::new();
+    let mut programs = Vec::new();
     for candidate in candidates {
         for (tile_size, splits, k_stage, interleave_columns) in tiles.iter().flat_map(|&tile| {
             splits.iter().flat_map(move |&splits| {
@@ -131,6 +133,13 @@ fn main() {
                         }
                     }
                 }
+                if select {
+                    programs.push(search::measure::Program {
+                        description: format!("{}; tile={tile_size}, k={k_stage}, interleave={interleave_columns}, splits={splits}", candidate.expression),
+                        plan,
+                    });
+                    continue;
+                }
                 Session::with_context_opts(plan, gpu.clone(), cfg.runtime)
             } else {
                 meganeura::build(&candidate.graph, cfg).0
@@ -139,7 +148,7 @@ fn main() {
             session.set_input("a", &a);
             session.set_input("c", &c);
             session.set_parameter("b", &b);
-            let error = qualify(&mut session, &reference);
+            let error = qualify(&mut session, &reference).unwrap();
             let row = serde_json::json!({
                 "expression": candidate.expression,
                 "k_stage": k_stage, "interleave_columns": interleave_columns,
@@ -150,6 +159,45 @@ fn main() {
             });
             trials.push((session, row, Vec::new()));
         }
+    }
+    if select {
+        let (mut selected, report) = search::measure::select(
+            programs,
+            gpu.clone(),
+            meganeura::SessionOptions {
+                coop: meganeura::CoopPolicy::NativeF32,
+                ..Default::default()
+            },
+            search::measure::Options {
+                tuning: meganeura::TuneOptions {
+                    max_time: std::time::Duration::from_millis(200),
+                    min_improvement: 0.02,
+                    sample_pairs: 12,
+                    ..Default::default()
+                },
+                max_time: std::time::Duration::from_secs(60),
+                max_programs: 64,
+                max_plan_bytes: 256 * 1024 * 1024,
+            },
+            |session| {
+                session.set_input("a", &a);
+                session.set_input("c", &c);
+                session.set_parameter("b", &b);
+                qualify(session, &reference).map(|_| ())
+            },
+        )
+        .unwrap();
+        let samples: Vec<_> = (0..12).map(|_| sample(&mut selected)).skip(3).collect();
+        let error = qualify(&mut selected, &reference).unwrap();
+        println!(
+            "{}",
+            serde_json::json!({
+                "shape": [m,k,n], "device": gpu.device_information().device_name,
+                "extraction_ms": extraction_ms, "report": report,
+                "held_out_ms": samples, "median_ms": median(&samples), "max_abs_error": error,
+            })
+        );
+        return;
     }
     for repeat in 0..12 {
         let len = trials.len();

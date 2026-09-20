@@ -6,6 +6,8 @@
 //! comparing its complete execution, not ranked by its untuned kernel timings.
 
 use super::{FusionCostModel, Segment, Stamper};
+
+pub mod measure;
 use crate::{Graph, graph::Op};
 use egglog::{
     Term, TermDag, TermId, Value,
@@ -169,6 +171,46 @@ pub fn region_candidates(
     {
         return Err("expected a bounded region and a positive candidate limit".into());
     }
+    let segment = Segment {
+        ids: region
+            .filter(|&id| !matches!(graph.nodes()[id].op, Op::Nop))
+            .collect(),
+        shifts: vec![0],
+    };
+    segment_candidates(graph, segment, limit)
+}
+
+/// Apply each extracted alternative to all verified instances, then return the
+/// complete model. Parameters and cut-edge placement remain model properties,
+/// not newly introduced host-visible region inputs.
+pub fn repeated_candidates(
+    graph: &Graph,
+    region: crate::outline::Region,
+    limit: usize,
+) -> Result<SearchSpace, String> {
+    if limit == 0
+        || !crate::outline::detect_repeated_regions(graph).contains(&region)
+        || region.period > super::SATURATION_CUTOFF
+    {
+        return Err("expected a verified repeated region and a positive candidate limit".into());
+    }
+    segment_candidates(
+        graph,
+        Segment {
+            ids: (region.start..region.start + region.period)
+                .filter(|&id| !matches!(graph.nodes()[id].op, Op::Nop))
+                .collect(),
+            shifts: (0..region.count).map(|i| i * region.period).collect(),
+        },
+        limit,
+    )
+}
+
+fn segment_candidates(
+    graph: &Graph,
+    segment: Segment,
+    limit: usize,
+) -> Result<SearchSpace, String> {
     if graph
         .nodes()
         .iter()
@@ -176,18 +218,16 @@ pub fn region_candidates(
     {
         return Err("region search requires topologically ordered nodes".into());
     }
-    let segment = Segment {
-        ids: region
-            .filter(|&id| !matches!(graph.nodes()[id].op, Op::Nop))
-            .collect(),
-        shifts: vec![0],
-    };
     let roots = super::segment_roots(graph, &segment);
     if roots.is_empty() {
         return Err("region has no observable output".into());
     }
     let full_precision = graph.node(roots[0] as u32).requires_full_precision;
-    for &id in &segment.ids {
+    for id in segment
+        .shifts
+        .iter()
+        .flat_map(|shift| segment.ids.iter().map(move |id| id + shift))
+    {
         let node = &graph.nodes()[id];
         if matches!(
             node.op,
@@ -236,7 +276,13 @@ pub fn region_candidates(
         segment.ids.iter().chain(&externals).copied(),
     ));
     let ids: HashSet<_> = segment.ids.iter().copied().collect();
-    let ext_map: HashMap<_, _> = externals.iter().map(|&id| (id, id as u32)).collect();
+    let uses = super::external_uses(graph, &segment);
+    let ext_maps = segment
+        .shifts
+        .iter()
+        .map(|&shift| super::instance_ext_map(graph, &segment, &uses, shift))
+        .collect::<Option<Vec<_>>>()
+        .ok_or("region instances have ambiguous external edges")?;
     let mut pending = VecDeque::from([Vec::new()]);
     let mut visited = HashSet::from([Vec::new()]);
     let mut expressions = HashSet::new();
@@ -301,18 +347,20 @@ pub fn region_candidates(
                 _ => return Err("missing joint extraction roots".into()),
             }
         };
-        for (&root, term) in roots.iter().zip(terms_to_stamp) {
-            Stamper {
-                g: &mut candidate,
-                index: &mut index,
-                seg_ids: &ids,
-                shift: 0,
-                ext_map: &ext_map,
-                fusions: &mut Vec::new(),
-                memo: HashMap::new(),
-                requires_full_precision: graph.node(root as u32).requires_full_precision,
+        for (&shift, ext_map) in segment.shifts.iter().zip(&ext_maps) {
+            for (&root, &term) in roots.iter().zip(&terms_to_stamp) {
+                Stamper {
+                    g: &mut candidate,
+                    index: &mut index,
+                    seg_ids: &ids,
+                    shift,
+                    ext_map,
+                    fusions: &mut Vec::new(),
+                    memo: HashMap::new(),
+                    requires_full_precision: full_precision,
+                }
+                .stamp_root(root + shift, &terms, term)?;
             }
-            .stamp_root(root, &terms, term)?;
         }
         super::sweep_dead_nodes(&mut candidate);
         result.push(Candidate {
@@ -429,5 +477,30 @@ mod tests {
                 .all(|c| c.expression.matches("FusedMatMulAdd").count() <= 1)
         );
         assert!(super::region_candidates(&graph, 0..0, 8).is_err());
+
+        let mut graph = Graph::new();
+        let mut h = graph.input("x", &[3, 8]);
+        for layer in 0..10 {
+            let w = graph.parameter(&format!("w{layer}"), &[8, 8]);
+            let c = graph.parameter(&format!("c{layer}"), &[3, 8]);
+            let mm = graph.matmul(h, w);
+            h = graph.add(mm, c);
+        }
+        graph.set_outputs(vec![h]);
+        let region = crate::outline::detect_repeated_regions(&graph)[0];
+        let space = super::repeated_candidates(&graph, region, 8).unwrap();
+        assert!(!space.truncated);
+        assert_eq!(space.candidates.len(), 2);
+        assert!(space.candidates.iter().any(|candidate| {
+            candidate
+                .graph
+                .nodes()
+                .iter()
+                .filter(|node| matches!(node.op, Op::FusedMatMulAdd))
+                .count()
+                == region.count
+        }));
+        graph.nodes_mut()[region.start + region.period + 2].requires_full_precision = true;
+        assert!(super::repeated_candidates(&graph, region, 8).is_err());
     }
 }
