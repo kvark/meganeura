@@ -128,6 +128,7 @@ required-features = ["gguf"]
 [[example]]
 name = "native_f16_coop"
 path = "bench/native_f16_coop.rs"
+required-features = ["gguf"]
 
 [[example]]
 name = "train_deploy"

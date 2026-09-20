@@ -3,6 +3,95 @@ use blade_graphics::{self as bg, ShaderData};
 use meganeura::codegen::{self, MatMulOptions, MatMulTile, ShaderGroup, ShaderModule};
 use std::time::Instant;
 
+struct Inputs {
+    shape: [u32; 3],
+    label: String,
+    a: Vec<f32>,
+    b: Vec<f32>,
+    src: Vec<f32>,
+    model_add: Option<bool>,
+    model_output: Vec<f32>,
+}
+
+fn model_inputs(gpu: std::sync::Arc<bg::Context>, path: &str) -> Vec<Inputs> {
+    use meganeura::{Graph, SessionConfig, compile::ShaderEntry, load::gguf};
+    let model = gguf::load_gguf(std::path::Path::new(path)).unwrap();
+    let config = gguf::arch::ModelConfig::from_gguf(&model).unwrap();
+    let mut graph = Graph::new();
+    let built = gguf::graph::build(&mut graph, &model, &config, 128, 256).unwrap();
+    graph.set_outputs(built.outputs());
+    let mut cfg = SessionConfig::inference_from_env();
+    cfg.gpu = Some(gpu);
+    cfg.tune = false;
+    cfg.runtime.no_alias = true;
+    cfg.runtime.gpu_timing = true;
+    cfg.runtime.coop = meganeura::CoopPolicy::NativeF32;
+    let mut session = meganeura::build(&graph, cfg).0;
+    gguf::weights::load(&mut session, &model, &config).unwrap();
+    gguf::weights::reset_caches(&mut session, &built, &config);
+    let tokens: Vec<_> = (0..128).map(|i| 42 + i % 31).collect();
+    session.set_input_u32("token_ids", &tokens);
+    session.set_input_u32("position", &[0]);
+    session.set_input_u32("valid", &[128]);
+    session.step();
+    session.wait();
+    let read = |buffer, count| {
+        let mut values = vec![0.0f32; count];
+        session.read_buffer(buffer, &mut values);
+        values
+    };
+    let mut classes = std::collections::BTreeMap::<_, Vec<_>>::new();
+    for (index, dispatch) in session.plan().dispatches.iter().enumerate() {
+        if !matches!(
+            dispatch.shader,
+            ShaderEntry::MatMulBT | ShaderEntry::FusedMatMulBTAdd
+        ) || dispatch.weight_format != meganeura::compile::WeightFormat::F16
+            || dispatch.matmul_prologue.is_some()
+            || dispatch.matmul_epilogue.is_some()
+            || !dispatch.epilogue.is_empty()
+            || dispatch.horizontal_batch >= 2
+        {
+            continue;
+        }
+        let add = dispatch.shader == ShaderEntry::FusedMatMulBTAdd;
+        let shape = [dispatch.params[0], dispatch.params[1], dispatch.params[2]];
+        classes
+            .entry((shape, add))
+            .or_default()
+            .push((index, dispatch));
+    }
+    let mut inputs = Vec::new();
+    for (([m, n, k], add), members) in classes {
+        let mut selected = vec![0, members.len() / 2, members.len() - 1];
+        selected.dedup();
+        for member in selected {
+            let (index, dispatch) = members[member];
+            let raw = read(dispatch.input_buffers[1], (n * k / 2) as usize);
+            let b = bytemuck::cast_slice::<f32, u16>(&raw)
+                .iter()
+                .map(|&bits| half::f16::from_bits(bits).to_f32())
+                .collect();
+            let label = format!("dispatch {index}: {}", dispatch.label);
+            eprintln!("capture {label}, {m}x{n}x{k}, add={add}");
+            inputs.push(Inputs {
+                shape: [m, n, k],
+                label,
+                a: read(dispatch.input_buffers[0], (m * k) as usize),
+                b,
+                src: if add {
+                    read(dispatch.input_buffers[2], (m * n) as usize)
+                } else {
+                    vec![0.0; (m * n) as usize]
+                },
+                model_add: Some(add),
+                model_output: read(dispatch.output_buffer, (m * n) as usize),
+            });
+        }
+    }
+    assert!(!inputs.is_empty());
+    inputs
+}
+
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 struct Params {
@@ -221,7 +310,7 @@ fn cooperative_store_emits_its_arguments() {
 
 fn main() {
     env_logger::init();
-    let gpu = unsafe {
+    let gpu = std::sync::Arc::new(unsafe {
         bg::Context::init(bg::ContextDesc {
             timing: true,
             validation: cfg!(debug_assertions),
@@ -229,7 +318,7 @@ fn main() {
             ..Default::default()
         })
         .unwrap()
-    };
+    });
     let caps = gpu.capabilities();
     assert!(
         caps.timing
@@ -243,25 +332,54 @@ fn main() {
         manual_barriers: false,
     });
     let mut records = Vec::new();
-    for [m, n, k] in [
-        [17, 35, 41],
-        [128, 576, 576],
-        [128, 3072, 576],
-        [128, 576, 1536],
-    ] {
+    let model_path = std::env::args().nth(1);
+    let workloads = if let Some(ref path) = model_path {
+        model_inputs(std::sync::Arc::clone(&gpu), path)
+    } else {
+        [
+            [17, 35, 41],
+            [128, 576, 576],
+            [128, 3072, 576],
+            [128, 576, 1536],
+        ]
+        .into_iter()
+        .map(|[m, n, k]| Inputs {
+            shape: [m, n, k],
+            label: "synthetic".into(),
+            a: values((m * k) as usize, 42),
+            b: values((n * k) as usize, 73),
+            src: values((m * n) as usize, 101),
+            model_add: None,
+            model_output: Vec::new(),
+        })
+        .collect()
+    };
+    for inputs in workloads {
+        let Inputs {
+            shape: [m, n, k],
+            label,
+            a,
+            b,
+            src,
+            model_add,
+            model_output,
+        } = inputs;
         let params = Params { m, n, k, pad: 0 };
-        let a = values((m * k) as usize, 42);
-        let b = values((n * k) as usize, 73);
-        let src = values((m * n) as usize, 101);
-        let mut reference = vec![0.0f32; (m * n) as usize];
+        let mut reference = vec![0.0f64; (m * n) as usize];
+        let mut rounded_reference = reference.clone();
+        let rounded_a: Vec<_> = a.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect();
         for row in 0..m as usize {
             for col in 0..n as usize {
                 let mut sum = 0.0f64;
+                let mut rounded_sum = 0.0f64;
                 for inner in 0..k as usize {
                     sum += f64::from(a[row * k as usize + inner])
                         * f64::from(b[col * k as usize + inner]);
+                    rounded_sum += f64::from(rounded_a[row * k as usize + inner])
+                        * f64::from(b[col * k as usize + inner]);
                 }
-                reference[row * n as usize + col] = sum as f32;
+                reference[row * n as usize + col] = sum;
+                rounded_reference[row * n as usize + col] = rounded_sum;
             }
         }
         let packed: Vec<u16> = b
@@ -313,6 +431,18 @@ fn main() {
             params,
         };
         for add in [false, true] {
+            if model_add.is_some_and(|wanted| wanted != add) {
+                continue;
+            }
+            assert!(model_output.iter().all(|v| v.is_finite()));
+            let capture_mismatches = model_output
+                .iter()
+                .enumerate()
+                .filter(|&(i, &actual)| {
+                    let expected = reference[i] + if add { f64::from(src[i]) } else { 0.0 };
+                    (f64::from(actual) - expected).abs() > 1e-5 + 2e-4 * expected.abs()
+                })
+                .count();
             let mut candidates = Vec::new();
             for (tile, width) in [(MatMulTile::Small, 32), (MatMulTile::Large, 64)] {
                 let sm = codegen::generate_matmul_with_epilogue(
@@ -440,9 +570,19 @@ fn main() {
                 }).collect();
                 let mut gpu_us = Vec::new();
                 let mut wall_us = Vec::new();
-                let mut max_abs = 0.0f32;
+                let mut max_abs = 0.0f64;
                 let mut failure = None;
-                'samples: for sample in 0..10 {
+                let mut full_precision_mismatches = 0;
+                let mut relative_l2 = 0.0;
+                let mut rounding_max_abs = 0.0f64;
+                let half_arithmetic = name != "scalar-32" && name != "scalar-64";
+                let arithmetic_reference = if half_arithmetic {
+                    &rounded_reference
+                } else {
+                    &reference
+                };
+                let repeats = if model_path.is_some() { 1 } else { 32 };
+                'samples: for sample in 0..if model_path.is_some() { 1 } else { 10 } {
                     unsafe {
                         std::ptr::copy_nonoverlapping(
                             bytes[2].as_ptr(),
@@ -460,7 +600,7 @@ fn main() {
                     assert!(gpu.wait_for(&sync, !0).unwrap());
                     let started = Instant::now();
                     encoder.start();
-                    for _ in 0..32 {
+                    for _ in 0..repeats {
                         let mut pass = encoder.compute(&name);
                         let mut pc = pass.with(&pipeline);
                         pc.bind(0, &data);
@@ -473,25 +613,49 @@ fn main() {
                     );
                     let sync = gpu.submit(&mut encoder);
                     assert!(gpu.wait_for(&sync, !0).unwrap());
-                    let elapsed = started.elapsed().as_secs_f64() * 1e6 / 32.0;
+                    let elapsed = started.elapsed().as_secs_f64() * 1e6 / f64::from(repeats);
                     let output = unsafe {
                         std::slice::from_raw_parts(upload[2].data().cast::<f32>(), initial.len())
                     }
                     .to_vec();
-                    for (i, (&actual, &expected)) in output.iter().zip(&reference).enumerate() {
-                        let expected = expected + if add { src[i] } else { 0.0 };
-                        let error = (actual - expected).abs();
-                        if !actual.is_finite() || error > 0.0001 {
-                            failure = Some(format!("at {i}: actual {actual}, expected {expected}"));
-                            break 'samples;
+                    let mut difference = 0.0;
+                    let mut norm = 0.0;
+                    for (i, (&actual, &expected)) in
+                        output.iter().zip(arithmetic_reference).enumerate()
+                    {
+                        let expected = expected + if add { f64::from(src[i]) } else { 0.0 };
+                        let error = (f64::from(actual) - expected).abs();
+                        let tolerance = if model_path.is_some() {
+                            1e-5 + 2e-4 * expected.abs()
+                        } else {
+                            0.0001
+                        };
+                        if !actual.is_finite() || error > tolerance {
+                            failure.get_or_insert_with(|| {
+                                format!("at {i}: actual {actual}, expected {expected}")
+                            });
                         }
                         max_abs = max_abs.max(error);
+                        let full = reference[i] + if add { f64::from(src[i]) } else { 0.0 };
+                        let delta = (f64::from(actual) - full).abs();
+                        full_precision_mismatches += usize::from(delta > 1e-5 + 2e-4 * full.abs());
+                        rounding_max_abs = rounding_max_abs.max(delta);
+                        difference += (f64::from(actual) - full).powi(2);
+                        norm += full.powi(2);
                     }
+                    relative_l2 = if norm > 0.0 {
+                        (difference / norm).sqrt()
+                    } else {
+                        0.0
+                    };
                     if output[reference.len()..]
                         .iter()
                         .any(|x| x.to_bits() != sentinel.to_bits())
                     {
                         failure = Some("output guard overwritten".into());
+                        break 'samples;
+                    }
+                    if failure.is_some() {
                         break 'samples;
                     }
                     if sample >= 3 {
@@ -507,7 +671,10 @@ fn main() {
                     gpu_us.clear();
                     wall_us.clear();
                 }
-                records.push(serde_json::json!({ "shape": [m,n,k], "add": add, "candidate": name,
+                records.push(serde_json::json!({ "shape": [m,n,k], "label": label, "add": add, "candidate": name,
+                    "capture_f32_mismatches": capture_mismatches,
+                    "f16_activation_arithmetic": half_arithmetic, "full_precision_mismatches": full_precision_mismatches,
+                    "f32_reference_relative_l2": relative_l2, "f32_reference_max_abs": rounding_max_abs,
                     "compile_ms": compile_ms, "statistics": stats, "failure": failure, "max_abs": max_abs, "gpu_us": gpu_us, "wall_us": wall_us }));
                 gpu.destroy_compute_pipeline(&mut pipeline);
             }
@@ -519,6 +686,7 @@ fn main() {
     println!(
         "{}",
         serde_json::json!({ "device": gpu.device_information().device_name,
+        "model": model_path, "qualification_only": model_path.is_some(),
         "capture": std::env::var_os("MEGANEURA_GPU_CAPTURE").is_some(),
         "validation": cfg!(debug_assertions),
         "subgroup_size": caps.cooperative_matrix.subgroup_size,

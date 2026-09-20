@@ -166,7 +166,7 @@ patch -d "$naga_coop_dir" -p1 < bench/naga-coop-store.patch
 
 cargo test --features gguf --lib --example native_f16_coop -j2 \
   --config "patch.crates-io.naga.path=\"$naga_coop_dir\""
-cargo build --release --example native_f16_coop -j2 \
+cargo build --release --features gguf --example native_f16_coop -j2 \
   --config "patch.crates-io.naga.path=\"$naga_coop_dir\""
 
 env -u LD_PRELOAD VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json \
@@ -184,3 +184,48 @@ Before production: fold the useful choices into the existing generator and
 qualified tuning pass, check real model data under the declared precision
 policy, then repeat the whole-model comparison. Microbenchmark improvements
 alone are not grounds for a new paper cohort.
+
+## Real prefill operands (September 20 follow-up)
+
+Passing a GGUF path runs qualification only, without performance samples:
+
+```sh
+target/release/examples/native_f16_coop model.gguf > /tmp/coop-model.json
+```
+
+This uses the pinned SmolLM2-135M file from `gguf_latency.md`: one 128-token
+prefix with the same fixed tokens and a 256-token cache. A native-F32-policy
+session retains the original F16 weights. Only aliasing is disabled so actual
+operands remain readable after the step; dispatch fusion is kept. The first,
+middle and last members of each eligible dense class provide fifteen workloads
+across five shape/addend classes. Capture is not a performance measurement.
+
+CPU F64 dots provide two separate references: original F32 activations, and
+activations rounded to F16. The addend stays F32 and is added in F64 before
+comparison. The diagnostic records complete error counts, maximum error and
+relative L2 against the original-activation reference. Model-mode arithmetic
+checks use the tuner's existing `1e-5 + 2e-4 * abs(reference)` threshold against
+the applicable reference; synthetic-mode checks remain at absolute `1e-4`.
+No threshold or candidate in the production tuner changes.
+
+NVIDIA records 390 comparisons, with 47 arithmetic-check failures. The minimal
+existing-generator/native-F16 adaptation passes its rounded-activation reference
+on fourteen of fifteen workloads, but differs substantially more from the
+original-activation reference: relative L2 reaches 0.0002624. Intel records 150
+comparisons, with 108 failures. All 105 generic cooperative comparisons fail
+against the rounded-activation reference, whereas the scalar-F16-staging control
+passes fourteen of fifteen. The responsible arithmetic behavior is not yet
+isolated; this is not evidence for promoting those kernels or loosening a gate.
+
+Both ordinary scalar controls also fail the fixed per-element threshold on
+the last down-projection, at 29 elements each. Their relative L2 there is
+about 0.0000005; large intermediate values and near-zero results make the
+fixed threshold sensitive to accumulation order. These failures are retained,
+not declared passes based on an aggregate metric. The initial attempt stopped
+at one such mismatch; the completed diagnostic collects all errors instead.
+
+Raw F16 staging also loses the tiny activation values intentionally covered
+by the production tuner. A legitimate reduced-precision tuning contract needs
+separate consideration of permitted arithmetic, exponent range and model
+accuracy. Meanwhile, testing scalar layout/staging choices for F16 storage can
+preserve F32 activation arithmetic and the existing qualification unchanged.
