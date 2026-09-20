@@ -260,3 +260,28 @@ forms under a small bound. Region coverage and exploration order need work.
 Keep the greedy incumbent, and consider both logical and lowered alternatives
 under one budget. Do not replace a working bounded tuner with an unbounded
 whole-model saturation or claim that enumerating eight forms solves extraction.
+
+Revision `df3bce41c87ccd2091aada50df5f742ae4f31c5a` improves that exploration
+order. Before excluding individual selected fusion sites, it excludes all
+selected sites of the same constructor. This reaches an entirely unfused
+family early, instead of spending the eight-form bound on small variations
+of the same fused family. It still uses the same egglog rules and extractor.
+The existing broad extraction test checks this ordering on two independent
+products, including a bound of two representatives.
+
+With the original graph and a 20-second budget:
+
+| GPU / search order | Plans visited | Greedy control | Selected plan | Median paired reduction |
+| --- | ---: | ---: | ---: | ---: |
+| RTX 5070 / forward | 10 | 4.398 ms | 3.858 ms | 12.4% |
+| RTX 5070 / reverse | 10 | 4.426 ms | 4.031 ms | 8.9% |
+| B570 / forward | 7 | 9.627 ms | 6.422 ms | 33.4% |
+| B570 / reverse | 6 | 9.519 ms | 7.817 ms | 18.8% |
+
+Every selection wins all 40 held-out pairs and passes the same full CPU
+reference, with relative L2 below 5.6e-6. Actual selector duration is
+20.02–20.03 seconds. Forward order reaches 99 split products; reversed order
+deliberately postpones that family and reaches only 78 before the deadline.
+The bounded search is therefore still order-sensitive. The useful result is
+that the original, pre-greedy graph now reaches the earlier 12%/33% gains
+within 20 seconds, not that the global extraction problem is solved.
