@@ -229,7 +229,7 @@ fn run_split(
                 .plan()
                 .dispatches
                 .iter()
-                .any(|d| d.use_coop
+                .any(|d| d.use_coop()
                     && matches!(d.shader, ShaderEntry::Conv2dGradInputGemmCoopGen(..))),
             "generated dX kernel must actually execute"
         );
@@ -870,7 +870,7 @@ fn generated_conv_indexing_matches_full_oracle_at_reciprocal_boundaries() {
                     .plan()
                     .dispatches
                     .iter()
-                    .any(|d| d.use_coop && matches!(d.shader, ShaderEntry::Conv2dGemmCoopGen(..)))
+                    .any(|d| d.use_coop() && matches!(d.shader, ShaderEntry::Conv2dGemmCoopGen(..)))
             );
         }
     }

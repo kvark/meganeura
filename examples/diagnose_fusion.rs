@@ -34,7 +34,7 @@ fn shader_name(s: &ShaderEntry) -> String {
 /// epilogue absorption on the scalar plan inspected here.
 fn is_scalar_matmul(d: &Dispatch) -> bool {
     use ShaderEntry::*;
-    !d.use_coop
+    !d.use_coop()
         && matches!(
             d.shader,
             MatMul | MatMulAT | MatMulBT | FusedMatMulAdd | FusedMatMulATAdd | FusedMatMulBTAdd
@@ -139,7 +139,7 @@ fn diagnose(plan: &ExecutionPlan) -> Vec<Finding> {
         if matches!(
             d.shader,
             ShaderEntry::MatMul | ShaderEntry::MatMulBT | ShaderEntry::MatMulAT
-        ) && !d.use_coop
+        ) && !d.use_coop()
             && d.input_buffers.len() >= 2
         {
             for (slot_idx, in_buf) in d.input_buffers[..2].iter().enumerate() {
@@ -161,7 +161,7 @@ fn diagnose(plan: &ExecutionPlan) -> Vec<Finding> {
         // Pattern 3: MatMul → (single consumer) Add/BiasAdd with a matmul-fused variant
         // already existing (FusedMatMulAdd). Count cases where this is being done in
         // two dispatches.
-        if matches!(d.shader, ShaderEntry::Add | ShaderEntry::BiasAdd) && d.pointwise.is_none() {
+        if matches!(d.shader, ShaderEntry::Add | ShaderEntry::BiasAdd) && d.pointwise().is_none() {
             for (slot_idx, in_buf) in d.input_buffers.iter().enumerate() {
                 if !external.contains(in_buf)
                     && let Some(&prod_i) = producer.get(in_buf)

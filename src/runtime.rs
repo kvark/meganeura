@@ -1062,7 +1062,7 @@ fn epilogue_pipeline_key(dispatch: &Dispatch) -> Option<EpiloguePipelineKey> {
 /// check keeps the result correct, but three quarters of the workgroups
 /// do nothing.
 fn epilogue_tile(dispatch: &Dispatch) -> crate::codegen::MatMulTile {
-    if dispatch.use_small_tiles {
+    if dispatch.use_small_tiles() {
         crate::codegen::MatMulTile::Small
     } else {
         crate::codegen::MatMulTile::Large
@@ -1160,9 +1160,9 @@ enum HorizMatMulKind {
 }
 
 fn horiz_kind(dispatch: &Dispatch) -> HorizMatMulKind {
-    if dispatch.use_coop_compensated {
+    if dispatch.use_coop_compensated() {
         HorizMatMulKind::CoopCompensated
-    } else if dispatch.use_coop {
+    } else if dispatch.use_coop() {
         HorizMatMulKind::Coop
     } else {
         HorizMatMulKind::Scalar
@@ -1304,7 +1304,7 @@ impl Pipelines {
         let mut attention_entries: HashSet<(ShaderEntry, u32)> = HashSet::new();
 
         for dispatch in &plan.dispatches {
-            if dispatch.conv_k_tile.is_some() {
+            if dispatch.conv_k_tile().is_some() {
                 continue;
             }
             let group = dispatch.shader.shader_group();
@@ -1320,7 +1320,7 @@ impl Pipelines {
                 dispatch.shader,
                 ShaderEntry::Conv2dGradInputGemmCoopGen(..) | ShaderEntry::Conv2dGemmCoopGen(..)
             );
-            if !is_gen_coop && !dispatch.gemv_int_dot {
+            if !is_gen_coop && !dispatch.gemv_int_dot() {
                 needed.insert(group);
             }
             entries_for_group
@@ -1353,7 +1353,7 @@ impl Pipelines {
             {
                 attention_entries.insert((dispatch.shader.clone(), dim));
             }
-            if dispatch.use_small_tiles
+            if dispatch.use_small_tiles()
                 && !dispatch.weight_format.uses_reduced_storage()
                 && !resolves_to_epilogue
             {
@@ -1368,7 +1368,7 @@ impl Pipelines {
             // differs. Conv2d is the exception: `select_variants` already
             // rewrote those dispatches to their per-kernel generated
             // entries, which carry their own group.
-            if dispatch.use_coop
+            if dispatch.use_coop()
                 && (crate::codegen::coop_shape(group).is_some()
                     || matches!(
                         group,
@@ -1376,13 +1376,13 @@ impl Pipelines {
                     ))
             {
                 needed_coop.insert(group);
-                if dispatch.use_coop_compensated {
+                if dispatch.use_coop_compensated() {
                     needed_coop_compensated.insert(group);
                 }
             }
             if dispatch.weight_format.uses_reduced_storage()
                 && !resolves_to_epilogue
-                && !dispatch.gemv_int_dot
+                && !dispatch.gemv_int_dot()
             {
                 needed_weighted
                     .entry(dispatch.weight_format)
@@ -1621,9 +1621,9 @@ impl Pipelines {
         // Fusion and activation quantization must survive a measured shape.
         let knobs = matmul_knobs;
         for dispatch in &plan.dispatches {
-            if !dispatch.gemv_int_dot
+            if !dispatch.gemv_int_dot()
                 && dispatch.gemv_rmsnorm.is_none()
-                && dispatch.gemv_shape.is_none()
+                && dispatch.gemv_shape().is_none()
             {
                 continue;
             }
@@ -1631,7 +1631,7 @@ impl Pipelines {
                 continue;
             };
             let shape = dispatch
-                .gemv_shape
+                .gemv_shape()
                 .unwrap_or_else(|| crate::codegen::GemvShape::initial(group));
             let tile = crate::tune::MatmulTile::Gemv(shape);
             let key = tuning::tile_variant(dispatch, tile);
@@ -1664,7 +1664,7 @@ impl Pipelines {
             }
         }
         for dispatch in &plan.dispatches {
-            if dispatch.use_small_tiles
+            if dispatch.use_small_tiles()
                 && dispatch.weight_format.uses_reduced_storage()
                 && epilogue_pipeline_key(dispatch).is_none()
             {
@@ -1715,7 +1715,7 @@ impl Pipelines {
                 slot.insert(pipeline);
             }
 
-            if dispatch.use_coop && !map.contains_key(&coop_key) {
+            if dispatch.use_coop() && !map.contains_key(&coop_key) {
                 let config = coop_config
                     .expect("dispatch selected cooperative epilogue without a coop config");
                 let epi = dispatch
@@ -1748,7 +1748,7 @@ impl Pipelines {
                 let Some(ref prologue) = dispatch.matmul_prologue else {
                     continue;
                 };
-                if !dispatch.use_coop {
+                if !dispatch.use_coop() {
                     continue;
                 }
                 let kinds = prologue.factors.iter().map(|f| f.1.clone()).collect();
@@ -1781,8 +1781,8 @@ impl Pipelines {
         // (UnaryData for n=1 inputs, BinaryData for n=2), which already
         // matches the generated WGSL's binding names.
         for dispatch in &plan.dispatches {
-            let dag = match dispatch.pointwise {
-                Some(ref d) => d,
+            let dag = match dispatch.pointwise() {
+                Some(d) => d,
                 None => continue,
             };
             let key = Variant::Pointwise(dag.hash_key());
@@ -1807,8 +1807,8 @@ impl Pipelines {
 
         // Compile schedule-template reduction pipelines.
         for dispatch in &plan.dispatches {
-            let kernel = match dispatch.reduction {
-                Some(ref k) => k,
+            let kernel = match dispatch.reduction() {
+                Some(k) => k,
                 None => continue,
             };
             let key = Variant::Reduction(kernel.hash_key());
@@ -1863,7 +1863,7 @@ impl Pipelines {
             dump_dir: wgsl_dump_dir.map(str::to_string),
         };
         for dispatch in &plan.dispatches {
-            if dispatch.conv_k_tile.is_some() || dispatch.scalar_matmul.is_some() {
+            if dispatch.conv_k_tile().is_some() || dispatch.scalar_matmul().is_some() {
                 let tile = crate::tune::MatmulTile::selected(dispatch, None)
                     .expect("scalar specialization");
                 pipelines
@@ -1890,14 +1890,14 @@ impl Pipelines {
     /// variants have no unfused fallback: that would change the computation.
     fn candidates(dispatch: &Dispatch) -> Vec<Variant> {
         let entry = &dispatch.shader;
-        if let Some(shape) = dispatch.scalar_matmul {
+        if let Some(shape) = dispatch.scalar_matmul() {
             return vec![Variant::ScalarMatmul(
                 entry.clone(),
                 dispatch.weight_format,
                 shape,
             )];
         }
-        if let Some(k_tile) = dispatch.conv_k_tile {
+        if let Some(k_tile) = dispatch.conv_k_tile() {
             return vec![Variant::SpecializedConv(
                 entry.clone(),
                 dispatch.params.clone(),
@@ -1912,16 +1912,16 @@ impl Pipelines {
             )];
         }
         if let Some(epilogue) = epilogue_pipeline_key(dispatch) {
-            return vec![if dispatch.use_coop {
+            return vec![if dispatch.use_coop() {
                 Variant::CoopEpilogue(entry.clone(), epilogue)
             } else {
                 Variant::Epilogue(entry.clone(), epilogue)
             }];
         }
         // An ordinary GEMV cannot replace normalization or quantized activations.
-        if dispatch.gemv_int_dot || dispatch.gemv_rmsnorm.is_some() {
+        if dispatch.gemv_int_dot() || dispatch.gemv_rmsnorm.is_some() {
             let shape = dispatch
-                .gemv_shape
+                .gemv_shape()
                 .unwrap_or_else(|| crate::codegen::GemvShape::initial(entry.shader_group()));
             return vec![tuning::tile_variant(
                 dispatch,
@@ -1929,36 +1929,36 @@ impl Pipelines {
             )];
         }
         let mut out = Vec::new();
-        if let Some(ref kernel) = dispatch.reduction {
+        if let Some(kernel) = dispatch.reduction() {
             out.push(Variant::Reduction(kernel.hash_key()));
         }
-        if let Some(ref dag) = dispatch.pointwise {
+        if let Some(dag) = dispatch.pointwise() {
             out.push(Variant::Pointwise(dag.hash_key()));
         }
         if let Some(dim) = Self::attention_head_dim(dispatch) {
             out.push(Variant::Attention(entry.clone(), dim));
         }
-        if let Some(shape) = dispatch.gemv_shape {
+        if let Some(shape) = dispatch.gemv_shape() {
             out.push(Variant::Gemv(entry.clone(), dispatch.weight_format, shape));
         }
         if dispatch.weight_format.uses_reduced_storage() {
-            if dispatch.use_small_tiles {
+            if dispatch.use_small_tiles() {
                 out.push(Variant::WeightSmall(entry.clone(), dispatch.weight_format));
             }
             out.push(Variant::Weight(entry.clone(), dispatch.weight_format));
         }
-        if dispatch.use_coop {
+        if dispatch.use_coop() {
             if let Some(ref prologue) = dispatch.matmul_prologue {
                 let kinds = prologue.factors.iter().map(|f| f.1.clone()).collect();
                 out.push(Variant::CoopPrologue(entry.clone(), kinds));
             }
-            if dispatch.use_coop_compensated {
+            if dispatch.use_coop_compensated() {
                 out.push(Variant::CoopCompensated(entry.clone()));
             } else {
                 out.push(Variant::Coop(entry.clone()));
             }
         }
-        if dispatch.use_small_tiles {
+        if dispatch.use_small_tiles() {
             out.push(Variant::SmallTile(entry.clone()));
         }
         out.push(Variant::Scalar(entry.clone()));
@@ -2492,7 +2492,7 @@ pub(crate) fn select_variants(
         // iOS and future 8×8 f32 advertisers need the same veto.
         let apple_f32_coop = !config.use_f16_input && config.tile_size == 8;
         for dispatch in &mut plan.dispatches {
-            if dispatch.conv_k_tile.is_some() || dispatch.scalar_matmul.is_some() {
+            if dispatch.conv_k_tile().is_some() || dispatch.scalar_matmul().is_some() {
                 continue;
             }
             // Autodiff marks derivative work as requiring f32 operands. A
@@ -2641,8 +2641,7 @@ pub(crate) fn select_variants(
                 // Retain pre-promotion geometry for diagnostics and future
                 // complete cooperative candidates. Survives reordering.
                 dispatch.scalar_fallback = Some((dispatch.shader.clone(), dispatch.workgroups));
-                dispatch.use_coop = true;
-                dispatch.use_coop_compensated = false;
+                dispatch.kernel = crate::compile::Kernel::Cooperative;
                 // Route conv2d coop dispatches to generated specialized kernels
                 if is_conv_bwd {
                     let kh = dispatch.params[5];
@@ -2696,9 +2695,9 @@ pub(crate) fn select_variants(
     {
         use crate::codegen::ShaderGroup;
         for dispatch in plan.dispatches.iter_mut() {
-            if dispatch.use_coop
-                || dispatch.use_small_tiles
-                || dispatch.scalar_matmul.is_some()
+            if dispatch.use_coop()
+                || dispatch.use_small_tiles()
+                || dispatch.scalar_matmul().is_some()
                 || dispatch.weight_format.uses_reduced_storage()
             {
                 continue;
@@ -2713,7 +2712,7 @@ pub(crate) fn select_variants(
                     | ShaderGroup::MatMulBT
             );
             if has_small && wgs_64 < 16 {
-                dispatch.use_small_tiles = true;
+                dispatch.kernel = crate::compile::Kernel::SmallTile;
                 let (m, n) = match group {
                     ShaderGroup::MatMul | ShaderGroup::MatMulAdd => {
                         (dispatch.params[0], dispatch.params[2])
@@ -2765,8 +2764,8 @@ mod block_matmul_variant_tests {
                 select_variants(&mut grouped, Some(&coop), false, false);
                 let serial = &serial.dispatches[0];
                 let grouped = &grouped.dispatches[0];
-                assert!(!serial.use_coop && !grouped.use_coop);
-                assert_eq!(serial.use_small_tiles, grouped.use_small_tiles);
+                assert!(!serial.use_coop() && !grouped.use_coop());
+                assert_eq!(serial.use_small_tiles(), grouped.use_small_tiles());
                 assert_eq!(serial.workgroups[..2], grouped.workgroups[..2]);
                 assert_eq!(grouped.workgroups[2], 8);
             }
@@ -3649,7 +3648,7 @@ impl Session {
                             d.label.clone()
                         },
                         d.origin,
-                        d.use_coop,
+                        d.use_coop(),
                         d.matmul_epilogue.is_some(),
                         d.input_buffers.iter().map(|b| b.0).collect::<Vec<_>>(),
                         d.output_buffer.0,
@@ -4543,16 +4542,21 @@ mod variant_tests {
 
         assert_eq!(
             matmul(|d| {
-                d.use_coop = true;
-                d.use_small_tiles = true;
+                d.kernel = crate::compile::Kernel::SmallTile;
                 d.weight_format = crate::compile::WeightFormat::F16;
             }),
             vec![
                 Variant::WeightSmall(ShaderEntry::MatMul, crate::compile::WeightFormat::F16),
                 Variant::Weight(ShaderEntry::MatMul, crate::compile::WeightFormat::F16),
-                Variant::Coop(ShaderEntry::MatMul),
                 Variant::SmallTile(ShaderEntry::MatMul),
                 Variant::Scalar(ShaderEntry::MatMul),
+            ],
+        );
+        assert_eq!(
+            matmul(|d| d.kernel = crate::compile::Kernel::Cooperative),
+            vec![
+                Variant::Coop(ShaderEntry::MatMul),
+                Variant::Scalar(ShaderEntry::MatMul)
             ],
         );
     }
@@ -4570,7 +4574,7 @@ mod variant_tests {
 
         let coop = matmul(|d| {
             d.matmul_epilogue = Some(relu_epilogue());
-            d.use_coop = true;
+            d.kernel = crate::compile::Kernel::Cooperative;
         });
         assert_eq!(coop.len(), 1);
         assert!(matches!(coop[0], Variant::CoopEpilogue(..)));
@@ -4611,7 +4615,7 @@ mod variant_tests {
             ..Default::default()
         };
         let small = Dispatch {
-            use_small_tiles: true,
+            kernel: crate::compile::Kernel::SmallTile,
             ..large.clone()
         };
         assert_ne!(
@@ -4630,7 +4634,7 @@ mod variant_tests {
     fn epilogue_dispatch_does_not_request_unreachable_variants() {
         let epilogue_small = matmul(|d| {
             d.matmul_epilogue = Some(relu_epilogue());
-            d.use_small_tiles = true;
+            d.kernel = crate::compile::Kernel::SmallTile;
             d.weight_format = crate::compile::WeightFormat::Q4;
         });
         assert_eq!(
@@ -4642,7 +4646,7 @@ mod variant_tests {
 
         // The same modifiers without an epilogue do need those variants.
         let plain_small = matmul(|d| {
-            d.use_small_tiles = true;
+            d.kernel = crate::compile::Kernel::SmallTile;
             d.weight_format = crate::compile::WeightFormat::Q4;
         });
         assert!(
@@ -4677,7 +4681,7 @@ mod variant_tests {
             crate::compile::compile(&g)
         };
         select_variants(&mut demoted, None, false, false);
-        assert!(demoted.dispatches[0].use_small_tiles);
+        assert!(demoted.dispatches[0].use_small_tiles());
         let pipelines = Pipelines::new(&gpu, &demoted, None, None);
         assert!(
             pipelines
@@ -4739,7 +4743,7 @@ mod variant_tests {
         );
         select_variants(&mut plan, None, false, false);
         let d = &plan.dispatches[0];
-        assert!(d.use_small_tiles, "64×64 matmul should demote to 32×32");
+        assert!(d.use_small_tiles(), "64×64 matmul should demote to 32×32");
         assert_eq!(
             d.workgroups,
             [2, 2, 1],
@@ -4757,12 +4761,11 @@ mod variant_tests {
         let scalar = matmul(|d| d.horizontal_batch = 3);
         let coop = matmul(|d| {
             d.horizontal_batch = 3;
-            d.use_coop = true;
+            d.kernel = crate::compile::Kernel::Cooperative;
         });
         let compensated = matmul(|d| {
             d.horizontal_batch = 3;
-            d.use_coop = true;
-            d.use_coop_compensated = true;
+            d.kernel = crate::compile::Kernel::CooperativeCompensated;
         });
         assert_eq!(
             scalar,
@@ -7448,7 +7451,7 @@ impl Session {
         }
         // Schedule-template reduction dispatches have priority and route
         // by kernel arity (n_per_elem, n_per_row, n_per_col).
-        if let Some(ref k) = dispatch.reduction {
+        if let Some(k) = dispatch.reduction() {
             let params = ReductionParams {
                 outer: dispatch.params[0],
                 inner: dispatch.params[1],
@@ -7517,7 +7520,7 @@ impl Session {
         // Schedule-template pointwise dispatches route by DAG arity, not
         // by the dummy `shader` entry — arity may be 3 after fusion, which
         // no ShaderEntry variant represents.
-        if let Some(ref dag) = dispatch.pointwise {
+        if let Some(dag) = dispatch.pointwise() {
             let params = UnaryParams {
                 len: dispatch.params[0],
                 _pad0: 0,
@@ -7565,7 +7568,7 @@ impl Session {
         // Prologue-fused coop matmul: 2-factor prologue (RmsNorm rsqrt + w_norm).
         // Only applies when use_coop is set AND a prologue is attached.
         if let Some(ref prologue) = dispatch.matmul_prologue {
-            if dispatch.use_coop && prologue.factors.len() == 2 {
+            if dispatch.use_coop() && prologue.factors.len() == 2 {
                 let (m, n, k) = match dispatch.shader {
                     ShaderEntry::MatMul | ShaderEntry::FusedMatMulAdd => {
                         (dispatch.params[0], dispatch.params[2], dispatch.params[1])

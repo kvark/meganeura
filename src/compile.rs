@@ -203,6 +203,28 @@ impl Default for CompileOptions {
     }
 }
 
+impl CompileOptions {
+    fn gemv_kernel(&self, group: ShaderGroup, format: WeightFormat) -> Kernel {
+        Kernel::Gemv {
+            shape: self.gemv_shape.map_or_else(
+                || crate::codegen::GemvShape::initial(group),
+                |shape| shape.for_group(group),
+            ),
+            integer_dot: self.quantized_activations
+                && matches!(group, ShaderGroup::MatMulGemv | ShaderGroup::MatMulGemvAdd)
+                && matches!(
+                    format,
+                    WeightFormat::Q40
+                        | WeightFormat::Q8
+                        | WeightFormat::Q4K
+                        | WeightFormat::Q5K
+                        | WeightFormat::Q6K
+                        | WeightFormat::Q3K
+                ),
+        }
+    }
+}
+
 /// Identifies which shader and entry point to use.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ShaderEntry {
@@ -757,9 +779,9 @@ impl Dispatch {
     pub fn profile_family(&self) -> &'static str {
         if self.is_row_data_movement() {
             "data_movement"
-        } else if self.reduction.is_some() {
+        } else if self.reduction().is_some() {
             "normalization_reduction"
-        } else if self.pointwise.is_some() {
+        } else if self.pointwise().is_some() {
             "pointwise"
         } else {
             self.shader.profile_family()
@@ -776,7 +798,7 @@ impl Dispatch {
     }
 
     fn is_zero_fill(&self) -> bool {
-        self.pointwise.as_ref().is_some_and(|dag| {
+        self.pointwise().is_some_and(|dag| {
             dag.n_inputs == 1 && dag.ops == [Pw::const_f32(0.0)] && dag.output == 0
         })
     }
@@ -916,21 +938,21 @@ fn can_horizontal_fuse(a: &Dispatch, b: &Dispatch) -> bool {
         && a.workgroups == b.workgroups
         && a.workgroups[2] == 1
         && a.params == b.params
-        && a.use_coop == b.use_coop
-        && a.use_coop_compensated == b.use_coop_compensated
-        && a.use_small_tiles == b.use_small_tiles
-        && a.scalar_matmul.is_none()
-        && b.scalar_matmul.is_none()
+        && a.use_coop() == b.use_coop()
+        && a.use_coop_compensated() == b.use_coop_compensated()
+        && a.use_small_tiles() == b.use_small_tiles()
+        && a.scalar_matmul().is_none()
+        && b.scalar_matmul().is_none()
         && !a.weight_format.uses_reduced_storage()
         && a.weight_format == b.weight_format
         && a.matmul_prologue.is_none()
         && b.matmul_prologue.is_none()
         && a.matmul_epilogue.is_none()
         && b.matmul_epilogue.is_none()
-        && a.pointwise.is_none()
-        && b.pointwise.is_none()
-        && a.reduction.is_none()
-        && b.reduction.is_none()
+        && a.pointwise().is_none()
+        && b.pointwise().is_none()
+        && a.reduction().is_none()
+        && b.reduction().is_none()
         && a.gemv_rmsnorm.is_none()
         && b.gemv_rmsnorm.is_none()
         && a.input_buffers.len() == 2
@@ -999,49 +1021,15 @@ pub struct Dispatch {
     pub extra_outputs: Vec<BufferRef>,
     /// Extra params to upload as a uniform buffer.
     pub params: Vec<u32>,
-    /// When true, this dispatch uses the cooperative matrix pipeline
-    /// (set at runtime based on per-dispatch eligibility).
+    /// Exactly one implementation of the shader's binding contract.
     #[serde(default)]
-    pub use_coop: bool,
-    /// Cooperative f16 path with hi/lo residual staging (C1). Retained as an
-    /// explicit experimental variant; automatic selection does not use it
-    /// for `requires_full_precision` work because it cannot preserve f32's
-    /// exponent range.
-    #[serde(default)]
-    pub use_coop_compensated: bool,
+    pub kernel: Kernel,
     /// Number of same-A sibling matmuls packed into this dispatch (D1).
     /// 0/1 = not packed. Extra B operands follow A in `input_buffers`;
     /// extra C outputs are `extra_outputs`. `workgroups[2]` is the pack
     /// count when this is ≥ 2 (only applied when the original Z was 1).
     #[serde(default)]
     pub horizontal_batch: u32,
-    /// When true, use the 32×32 small-tile matmul pipeline instead of 64×64.
-    #[serde(default)]
-    pub use_small_tiles: bool,
-    /// Measured scalar tile, K stage and column layout; None uses plan knobs.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scalar_matmul: Option<crate::codegen::ScalarMatmulShape>,
-    /// Shape-specialized scalar convolution, with this many K elements staged.
-    /// Set by measured selection; None keeps the shared uniform-parameter kernel.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub conv_k_tile: Option<u32>,
-    /// The K-split GEMV quantizes its activation row to Q8_1 and uses
-    /// integer dot products. GGML Q4_0, Meganeura Q8 and every K-quant
-    /// layout have a kernel for it.
-    ///
-    /// Set when the plan is compiled, from the weight format and
-    /// [`CompileOptions::quantized_activations`]; changes the numbers, so
-    /// it is never turned on by measurement.
-    #[serde(default)]
-    pub gemv_int_dot: bool,
-    /// Workgroup width and cross-lane reduction for a K-split GEMV.
-    ///
-    /// Set by measured selection; None keeps the group's initial shape. Which
-    /// shape wins is a property of the device — how wide its waves are, how
-    /// much a `workgroupBarrier` costs — so it is measured rather than
-    /// predicted. See [`crate::codegen::GemvShape`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gemv_shape: Option<crate::codegen::GemvShape>,
     /// The dispatch belongs to numerically sensitive derivative work and may
     /// not be promoted to a reduced-input-precision implementation. Native
     /// f32 cooperative kernels remain eligible.
@@ -1080,22 +1068,105 @@ pub struct Dispatch {
     /// re-selected per session.
     #[serde(skip)]
     pub scalar_fallback: Option<(ShaderEntry, [u32; 3])>,
-    /// When `Some`, this dispatch uses a schedule-template-generated
-    /// pointwise kernel. The runtime compiles a dedicated pipeline from the
-    /// DAG (keyed by `PointwiseDAG::hash_key`) and binds it using the same
-    /// `UnaryData` / `BinaryData` layout that `shader` already selects.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pointwise: Option<PointwiseDAG>,
-    /// When `Some`, this dispatch uses a schedule-template-generated
-    /// reduction kernel. Mutually exclusive with `pointwise`. The runtime
-    /// compiles a dedicated pipeline from the kernel spec (keyed by
-    /// `ReductionKernel::hash_key`) and picks the binding layout based on
-    /// the kernel's buffer-input arity.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reduction: Option<ReductionKernel>,
     /// Storage format of the B (weight) input buffer.
     #[serde(default)]
     pub weight_format: WeightFormat,
+}
+
+/// Mutually exclusive implementations. Bindings and launch geometry live on
+/// the dispatch; shader-specific configuration lives only in its variant.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Kernel {
+    #[default]
+    Default,
+    SmallTile,
+    ScalarMatmul(crate::codegen::ScalarMatmulShape),
+    SpecializedConv {
+        k_tile: u32,
+    },
+    Cooperative,
+    /// Experimental f16 hi/lo staging, not a full-range f32 implementation.
+    CooperativeCompensated,
+    Gemv {
+        shape: crate::codegen::GemvShape,
+        /// Precision policy, never enabled by measurement.
+        integer_dot: bool,
+    },
+    Pointwise(PointwiseDAG),
+    Reduction(ReductionKernel),
+}
+
+impl Dispatch {
+    pub fn use_coop(&self) -> bool {
+        matches!(
+            self.kernel,
+            Kernel::Cooperative | Kernel::CooperativeCompensated
+        )
+    }
+
+    pub fn use_coop_compensated(&self) -> bool {
+        matches!(self.kernel, Kernel::CooperativeCompensated)
+    }
+
+    pub fn use_small_tiles(&self) -> bool {
+        matches!(
+            self.kernel,
+            Kernel::SmallTile
+                | Kernel::ScalarMatmul(crate::codegen::ScalarMatmulShape { tile_size: 32, .. })
+        )
+    }
+
+    pub fn scalar_matmul(&self) -> Option<crate::codegen::ScalarMatmulShape> {
+        match self.kernel {
+            Kernel::ScalarMatmul(shape) => Some(shape),
+            _ => None,
+        }
+    }
+
+    pub fn conv_k_tile(&self) -> Option<u32> {
+        match self.kernel {
+            Kernel::SpecializedConv { k_tile } => Some(k_tile),
+            _ => None,
+        }
+    }
+
+    pub fn gemv_shape(&self) -> Option<crate::codegen::GemvShape> {
+        match self.kernel {
+            Kernel::Gemv { shape, .. } => Some(shape),
+            _ => None,
+        }
+    }
+
+    pub fn gemv_int_dot(&self) -> bool {
+        matches!(
+            self.kernel,
+            Kernel::Gemv {
+                integer_dot: true,
+                ..
+            }
+        )
+    }
+
+    pub fn pointwise(&self) -> Option<&PointwiseDAG> {
+        match self.kernel {
+            Kernel::Pointwise(ref dag) => Some(dag),
+            _ => None,
+        }
+    }
+
+    pub fn reduction(&self) -> Option<&ReductionKernel> {
+        match self.kernel {
+            Kernel::Reduction(ref kernel) => Some(kernel),
+            _ => None,
+        }
+    }
+
+    pub fn reduction_mut(&mut self) -> Option<&mut ReductionKernel> {
+        match self.kernel {
+            Kernel::Reduction(ref mut kernel) => Some(kernel),
+            _ => None,
+        }
+    }
 }
 
 /// Reference to a GPU buffer in the execution plan.
@@ -1379,8 +1450,8 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
             let mul = &plan.dispatches[mul_index];
             let plain_mul = mul.shader == ShaderEntry::Mul
                 && mul.input_buffers.len() == 2
-                && mul.reduction.is_none()
-                && match mul.pointwise.as_ref() {
+                && mul.reduction().is_none()
+                && match mul.pointwise() {
                     None => true,
                     Some(dag) => {
                         dag.n_inputs == 2
@@ -1468,7 +1539,7 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
         if small_row {
             scatter.workgroups = [scatter.params[1].div_ceil(256), 1, 1];
         }
-        scatter.pointwise = None;
+        scatter.kernel = Kernel::Default;
         scatter.label = format!("ScatterAddAtomicRowMul[{total}]");
         // The zero entry point does not read `src`, but its shared binding
         // layout still requires a valid buffer. Stop it from retaining the
@@ -1490,7 +1561,7 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
 /// carry the DAG the pass needs).
 ///
 /// Conservative criteria — a producer P is fused into consumer C only when:
-///   1. Both `P.pointwise` and `C.pointwise` are `Some`.
+///   1. Both `P.pointwise()` and `C.pointwise()` are `Some`.
 ///   2. P's output buffer is read by exactly one dispatch (C) and appears
 ///      in no plan-level role (output/loss/param/input/constant/extra).
 ///   3. C's workgroups match P's (same output length).
@@ -1545,7 +1616,7 @@ fn fuse_pointwise_chains(plan: &mut ExecutionPlan) {
         let mut fused_any = false;
         for ci in 0..n {
             let c = &plan.dispatches[ci];
-            if c.pointwise.is_none() || c.fusion_barrier {
+            if c.pointwise().is_none() || c.fusion_barrier {
                 continue;
             }
 
@@ -1563,7 +1634,7 @@ fn fuse_pointwise_chains(plan: &mut ExecutionPlan) {
                     continue;
                 }
                 let p = &plan.dispatches[pi];
-                if p.pointwise.is_none() || p.fusion_barrier {
+                if p.pointwise().is_none() || p.fusion_barrier {
                     continue;
                 }
                 if reads.get(buf).copied().unwrap_or(0) != 1 {
@@ -1601,13 +1672,9 @@ fn fuse_pointwise_chains(plan: &mut ExecutionPlan) {
             let producer_d = plan.dispatches[pi].clone();
             let consumer_d = &mut plan.dispatches[ci];
 
-            let p_dag = producer_d.pointwise.expect("checked above");
-            let c_dag = consumer_d
-                .pointwise
-                .as_ref()
-                .expect("checked above")
-                .clone();
-            let fused_dag = c_dag.fuse_input(input_idx, &p_dag);
+            let p_dag = producer_d.pointwise().expect("checked above");
+            let c_dag = consumer_d.pointwise().expect("checked above").clone();
+            let fused_dag = c_dag.fuse_input(input_idx, p_dag);
 
             // Rebuild consumer input_buffers: producer inputs, then
             // consumer inputs with the fused slot removed, in order.
@@ -1618,7 +1685,7 @@ fn fuse_pointwise_chains(plan: &mut ExecutionPlan) {
                 }
             }
             consumer_d.input_buffers = new_inputs;
-            consumer_d.pointwise = Some(fused_dag);
+            consumer_d.kernel = Kernel::Pointwise(fused_dag);
             consumer_d.origin.extend(producer_d.origin.iter().copied());
             // The consumer now reads from more buffers; its ShaderEntry
             // (used only to pick the data layout) must reflect the new
@@ -1667,7 +1734,7 @@ fn shared_pointwise_consumers_are_foldable(
         if occurrences > 1 {
             return false;
         }
-        let Some(ref kernel) = dispatch.reduction else {
+        let Some(kernel) = dispatch.reduction() else {
             return false;
         };
         if kernel.input_row_repeats.iter().any(|&factor| factor != 1) {
@@ -1713,7 +1780,7 @@ fn shared_embedding_consumers_are_foldable(
         if occurrences > 1 {
             return false;
         }
-        let Some(ref kernel) = dispatch.reduction else {
+        let Some(kernel) = dispatch.reduction() else {
             return false;
         };
         if kernel.input_row_repeats.iter().any(|&factor| factor != 1) {
@@ -1815,7 +1882,7 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
 
         'outer: for ci in 0..plan.dispatches.len() {
             let c = &plan.dispatches[ci];
-            let Some(kernel) = c.reduction.as_ref() else {
+            let Some(kernel) = c.reduction() else {
                 continue;
             };
             // Phase 1 invariant: no gather streams yet, so input_buffers
@@ -1841,7 +1908,7 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                     continue;
                 }
                 let p = &plan.dispatches[pi];
-                if p.pointwise.is_none() || p.reduction.is_some() || p.fusion_barrier {
+                if p.pointwise().is_none() || p.reduction().is_some() || p.fusion_barrier {
                     continue;
                 }
                 // Producer must cover the per-element domain (outer*inner).
@@ -1862,12 +1929,12 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                 }
 
                 let producer_d = plan.dispatches[pi].clone();
-                let p_dag = producer_d.pointwise.clone().expect("checked");
+                let p_dag = producer_d.pointwise().expect("checked");
                 let c = &mut plan.dispatches[ci];
-                let kernel = c.reduction.as_mut().expect("checked");
-                kernel.prologue = kernel.prologue.fuse_input(s as u8, &p_dag);
+                let kernel = c.reduction_mut().expect("checked");
+                kernel.prologue = kernel.prologue.fuse_input(s as u8, p_dag);
                 for prologue in &mut kernel.extra_prologues {
-                    *prologue = prologue.fuse_input(s as u8, &p_dag);
+                    *prologue = prologue.fuse_input(s as u8, p_dag);
                 }
                 // The reduction epilogue sees the same per-element streams
                 // before its per-column and reduced-value inputs. If it
@@ -1875,7 +1942,7 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                 // well; otherwise its declared arity no longer matches
                 // n_per_elem and lowering aborts.
                 if let Some(epilogue) = kernel.epilogue.as_mut() {
-                    epilogue.dag = epilogue.dag.fuse_input(s as u8, &p_dag);
+                    epilogue.dag = epilogue.dag.fuse_input(s as u8, p_dag);
                 }
                 kernel.n_per_elem = new_n_per_elem as u8;
                 kernel.gather_elem = Vec::new();
@@ -1909,7 +1976,7 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
 
         'outer2: for ci in 0..plan.dispatches.len() {
             let c = &plan.dispatches[ci];
-            let Some(kernel) = c.reduction.as_ref() else {
+            let Some(kernel) = c.reduction() else {
                 continue;
             };
             if kernel.input_row_repeats.iter().any(|&factor| factor != 1) {
@@ -1950,8 +2017,8 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                 // Plain Embedding dispatch: indexed load, gathered axis ==
                 // reduced axis (params [seq, hidden] = [outer, inner]).
                 let is_embedding = p.shader == ShaderEntry::Embedding
-                    && p.reduction.is_none()
-                    && p.pointwise.is_none()
+                    && p.reduction().is_none()
+                    && p.pointwise().is_none()
                     && p.params.first().copied() == Some(outer)
                     && p.params.get(1).copied() == Some(inner)
                     && p.input_buffers.len() == 2;
@@ -1969,7 +2036,7 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                 let producer_origin = p.origin.clone();
 
                 let c = &mut plan.dispatches[ci];
-                let kernel = c.reduction.as_mut().expect("checked");
+                let kernel = c.reduction_mut().expect("checked");
                 if kernel.gather_elem.is_empty() {
                     kernel.gather_elem = vec![false; per_elem];
                 }
@@ -2157,8 +2224,7 @@ pub fn fuse_rmsnorm_into_add(plan: &mut ExecutionPlan) {
         // RmsNormAdd has no pointwise epilogue, so replacing a non-canonical
         // Add dispatch would silently drop the absorbed consumer.
         let has_fused_epilogue = add
-            .pointwise
-            .as_ref()
+            .pointwise()
             .is_some_and(|pointwise| pointwise != &plain_add);
         if add.shader != ShaderEntry::Add || add.output_buffer == normed || has_fused_epilogue {
             continue;
@@ -2187,7 +2253,7 @@ pub fn fuse_rmsnorm_into_add(plan: &mut ExecutionPlan) {
         // rewrite, pipeline selection prefers that kernel over RmsNormAdd
         // and silently drops the residual. Route the fused operation through
         // its dedicated shader and restore its one-workgroup-per-row shape.
-        d.reduction = None;
+        d.kernel = Kernel::Default;
         d.workgroups = [d.params[0], 1, 1];
         d.input_buffers.push(residual);
         d.output_buffer = out;
@@ -2235,7 +2301,7 @@ pub fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
         // single-consumer RmsNorm. The scalar pipeline cannot execute a
         // matmul prologue, so only transform dispatches that runtime policy
         // has already selected for cooperative matrices.
-        if !d.use_coop
+        if !d.use_coop()
             || !matches!(
                 d.shader,
                 ShaderEntry::MatMul
@@ -2301,8 +2367,7 @@ pub fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
             output_buffer: rsqrt_buf,
             extra_outputs: vec![],
             params: vec![rows, cols, eps_bits, 0],
-            use_coop: false,
-            use_small_tiles: false,
+
             origin: norm_origin.clone(),
             label: norm_label,
             ..Default::default()
@@ -2406,7 +2471,7 @@ fn fuse_epilogues(plan: &mut ExecutionPlan) {
             ops: vec![Pw::LoadInput(0), pw_op],
             output: 1,
         };
-        let epilogue_dag = match d.pointwise.as_ref() {
+        let epilogue_dag = match d.pointwise() {
             Some(dag) if dag.n_inputs == 1 => dag.clone(),
             Some(_) => continue,
             None => canonical_dag,
@@ -2435,7 +2500,7 @@ fn fuse_epilogues(plan: &mut ExecutionPlan) {
                 | ShaderEntry::FusedMatMulATAdd
                 | ShaderEntry::FusedMatMulBTAdd
         );
-        if !is_matmul || prod.use_coop {
+        if !is_matmul || prod.use_coop() {
             continue;
         }
 
@@ -2803,9 +2868,8 @@ impl<'a> Compiler<'a> {
             output_buffer: output,
             extra_outputs: vec![],
             params: vec![rows, inner, 1.0_f32.to_bits(), 0],
-            use_coop: false,
-            use_small_tiles: false,
-            reduction: Some(kernel),
+
+            kernel: Kernel::Reduction(kernel),
             ..Default::default()
         });
     }
@@ -2821,8 +2885,7 @@ impl<'a> Compiler<'a> {
             output_buffer: output,
             extra_outputs: vec![],
             params: vec![total, inner, 1, 0],
-            use_coop: false,
-            use_small_tiles: false,
+
             ..Default::default()
         });
     }
@@ -3064,7 +3127,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![len, 0, 0, 0],
-                    pointwise: Some(PointwiseDAG {
+                    kernel: Kernel::Pointwise(PointwiseDAG {
                         n_inputs: 1,
                         ops: vec![Pw::LoadInput(0)],
                         output: 0,
@@ -3101,28 +3164,9 @@ impl<'a> Compiler<'a> {
                         output_buffer: out_buf,
                         extra_outputs: vec![],
                         params: vec![m, k, n, 0],
-                        use_coop: false,
-                        use_small_tiles: false,
+
                         weight_format: wf,
-                        // The int-dot kernels read GGML's split-nibble Q4_0,
-                        // Meganeura's whole-word Q8, and every K-quant
-                        // superblock layout directly; no other weight
-                        // format has a layout they can feed without a
-                        // shuffle.
-                        gemv_int_dot: self.options.quantized_activations
-                            && matches!(
-                                wf,
-                                WeightFormat::Q40
-                                    | WeightFormat::Q8
-                                    | WeightFormat::Q4K
-                                    | WeightFormat::Q5K
-                                    | WeightFormat::Q6K
-                                    | WeightFormat::Q3K
-                            ),
-                        gemv_shape: self
-                            .options
-                            .gemv_shape
-                            .map(|s| s.for_group(ShaderGroup::MatMulGemv)),
+                        kernel: self.options.gemv_kernel(ShaderGroup::MatMulGemv, wf),
                         ..Default::default()
                     });
                 } else {
@@ -3133,8 +3177,7 @@ impl<'a> Compiler<'a> {
                         output_buffer: out_buf,
                         extra_outputs: vec![],
                         params: vec![m, k, n, 0],
-                        use_coop: false,
-                        use_small_tiles: false,
+
                         weight_format: wf,
                         ..Default::default()
                     });
@@ -3158,8 +3201,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![m, n, k, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     weight_format: wf,
                     ..Default::default()
                 });
@@ -3206,13 +3248,9 @@ impl<'a> Compiler<'a> {
                         output_buffer: out_buf,
                         extra_outputs: vec![],
                         params: vec![m, n, k, 0],
-                        use_coop: false,
-                        use_small_tiles: false,
+
                         weight_format: wf,
-                        gemv_shape: self
-                            .options
-                            .gemv_shape
-                            .map(|s| s.for_group(ShaderGroup::MatMulGemvBT)),
+                        kernel: self.options.gemv_kernel(ShaderGroup::MatMulGemvBT, wf),
                         ..Default::default()
                     });
                 } else {
@@ -3223,8 +3261,7 @@ impl<'a> Compiler<'a> {
                         output_buffer: out_buf,
                         extra_outputs: vec![],
                         params: vec![m, n, k, 0],
-                        use_coop: false,
-                        use_small_tiles: false,
+
                         weight_format: wf,
                         ..Default::default()
                     });
@@ -3290,7 +3327,11 @@ impl<'a> Compiler<'a> {
                     input_buffers: vec![a, b],
                     output_buffer: out_buf,
                     params: vec![m, n, k, groups],
-                    use_small_tiles: small,
+                    kernel: if small {
+                        Kernel::SmallTile
+                    } else {
+                        Kernel::Default
+                    },
                     ..Default::default()
                 });
             }
@@ -3314,25 +3355,9 @@ impl<'a> Compiler<'a> {
                         output_buffer: out_buf,
                         extra_outputs: vec![],
                         params: vec![m, k, n, 0],
-                        use_coop: false,
-                        use_small_tiles: false,
+
                         weight_format: wf,
-                        // Keep a fused residual from silently disabling the
-                        // requested Q8_1-activation path.
-                        gemv_int_dot: self.options.quantized_activations
-                            && matches!(
-                                wf,
-                                WeightFormat::Q40
-                                    | WeightFormat::Q8
-                                    | WeightFormat::Q4K
-                                    | WeightFormat::Q5K
-                                    | WeightFormat::Q6K
-                                    | WeightFormat::Q3K
-                            ),
-                        gemv_shape: self
-                            .options
-                            .gemv_shape
-                            .map(|s| s.for_group(ShaderGroup::MatMulGemvAdd)),
+                        kernel: self.options.gemv_kernel(ShaderGroup::MatMulGemvAdd, wf),
                         ..Default::default()
                     });
                 } else {
@@ -3343,8 +3368,7 @@ impl<'a> Compiler<'a> {
                         output_buffer: out_buf,
                         extra_outputs: vec![],
                         params: vec![m, k, n, 0],
-                        use_coop: false,
-                        use_small_tiles: false,
+
                         weight_format: wf,
                         ..Default::default()
                     });
@@ -3369,8 +3393,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![m, n, k, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     weight_format: wf,
                     ..Default::default()
                 });
@@ -3414,10 +3437,13 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![m, n, k, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     weight_format: wf,
-                    gemv_shape: if gemv { self.options.gemv_shape } else { None },
+                    kernel: if gemv {
+                        self.options.gemv_kernel(ShaderGroup::MatMulGemvBTAdd, wf)
+                    } else {
+                        Kernel::Default
+                    },
                     ..Default::default()
                 });
             }
@@ -3444,8 +3470,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![len, bias_len, 0, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -3462,8 +3487,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![len, scale_len, 0, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -3502,7 +3526,7 @@ impl<'a> Compiler<'a> {
                     input_buffers: vec![input],
                     output_buffer: out_buf,
                     params: vec![len, 0, 0, 0],
-                    pointwise: Some(pointwise),
+                    kernel: Kernel::Pointwise(pointwise),
                     ..Default::default()
                 });
             }
@@ -3529,7 +3553,7 @@ impl<'a> Compiler<'a> {
                     input_buffers: vec![input],
                     output_buffer: out_buf,
                     params: vec![len, 0, 0, 0],
-                    pointwise: Some(pointwise),
+                    kernel: Kernel::Pointwise(pointwise),
                     ..Default::default()
                 });
             }
@@ -3547,7 +3571,7 @@ impl<'a> Compiler<'a> {
                     input_buffers: vec![input],
                     output_buffer: out_buf,
                     params: vec![len, 0, 0, 0],
-                    pointwise: Some(pointwise),
+                    kernel: Kernel::Pointwise(pointwise),
                     ..Default::default()
                 });
             }
@@ -3562,7 +3586,7 @@ impl<'a> Compiler<'a> {
                     input_buffers: vec![grad_output, input],
                     output_buffer: out_buf,
                     params: vec![len, 0, 0, 0],
-                    pointwise: Some(pointwise),
+                    kernel: Kernel::Pointwise(pointwise),
                     ..Default::default()
                 });
             }
@@ -3577,8 +3601,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![len, 0, 0, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -3593,8 +3616,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![len, 0, 0, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -3613,8 +3635,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![m, n, 0, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -3633,8 +3654,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![m, n, 3, u32::from(reverse)],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -3654,8 +3674,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![len, n, 2, offset as u32],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -3724,9 +3743,8 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![rows, inner, 1.0_f32.to_bits(), 0],
-                    use_coop: false,
-                    use_small_tiles: false,
-                    reduction: Some(kernel),
+
+                    kernel: Kernel::Reduction(kernel),
                     ..Default::default()
                 });
             }
@@ -3796,9 +3814,8 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![rows, inner, 1.0_f32.to_bits(), 0],
-                    use_coop: false,
-                    use_small_tiles: false,
-                    reduction: Some(kernel),
+
+                    kernel: Kernel::Reduction(kernel),
                     ..Default::default()
                 });
             }
@@ -3838,9 +3855,8 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![total, inner, 1.0_f32.to_bits(), 0],
-                    use_coop: false,
-                    use_small_tiles: false,
-                    reduction: Some(kernel),
+
+                    kernel: Kernel::Reduction(kernel),
                     ..Default::default()
                 });
             }
@@ -3863,8 +3879,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![total, inner, pairs, mode],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -3912,9 +3927,8 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![vector_rows, inner, 1.0_f32.to_bits(), 0],
-                    use_coop: false,
-                    use_small_tiles: false,
-                    reduction: Some(kernel),
+
+                    kernel: Kernel::Reduction(kernel),
                     ..Default::default()
                 });
             }
@@ -3934,8 +3948,7 @@ impl<'a> Compiler<'a> {
                         output_buffer: out_buf,
                         extra_outputs: vec![],
                         params: vec![batch, features, 0, 0],
-                        use_coop: false,
-                        use_small_tiles: false,
+
                         ..Default::default()
                     });
                 }
@@ -3971,8 +3984,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: softmax_buf,
                     extra_outputs: vec![],
                     params: vec![batch, features, 0, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
                 let len = batch * features;
@@ -3983,8 +3995,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![len, 0, 0, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -4011,8 +4022,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: grad_buf,
                     extra_outputs: vec![out_buf],
                     params: vec![batch, features, write_grad, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -4029,8 +4039,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![len, 0, 0, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -4047,8 +4056,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![m, n, 0, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -4077,8 +4085,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![out_len, half_n, 0, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -4094,8 +4101,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![out_len, half_n, 0, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -4113,8 +4119,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![grad_out_len, half_n, 0, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -4131,8 +4136,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![grad_out_len, half_n, 0, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -4153,8 +4157,7 @@ impl<'a> Compiler<'a> {
                         output_buffer: out_buf,
                         extra_outputs: vec![],
                         params: vec![rows, cols, eps.to_bits(), 0],
-                        use_coop: false,
-                        use_small_tiles: false,
+
                         ..Default::default()
                     });
                 }
@@ -4182,8 +4185,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![seq, hidden, 0, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     weight_format: wf,
                     ..Default::default()
                 });
@@ -4201,8 +4203,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![len, 0, 0, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -4223,13 +4224,12 @@ impl<'a> Compiler<'a> {
                         output_buffer: out_buf,
                         extra_outputs: vec![],
                         params: vec![total, 0, 0, 0],
-                        pointwise: Some(PointwiseDAG {
+                        kernel: Kernel::Pointwise(PointwiseDAG {
                             n_inputs: 1,
                             ops: vec![Pw::const_f32(0.0)],
                             output: 0,
                         }),
-                        use_coop: false,
-                        use_small_tiles: false,
+
                         ..Default::default()
                     });
                     self.plan.dispatches.push(Dispatch {
@@ -4241,8 +4241,7 @@ impl<'a> Compiler<'a> {
                         output_buffer: out_buf,
                         extra_outputs: vec![],
                         params,
-                        use_coop: false,
-                        use_small_tiles: false,
+
                         ..Default::default()
                     });
                 } else {
@@ -4253,8 +4252,7 @@ impl<'a> Compiler<'a> {
                         output_buffer: out_buf,
                         extra_outputs: vec![],
                         params,
-                        use_coop: false,
-                        use_small_tiles: false,
+
                         ..Default::default()
                     });
                 }
@@ -4281,8 +4279,7 @@ impl<'a> Compiler<'a> {
                         output_buffer: out_buf,
                         extra_outputs: vec![],
                         params: vec![seq, dim, theta.to_bits(), 0, head_dim, 0, 0, 0],
-                        use_coop: false,
-                        use_small_tiles: false,
+
                         ..Default::default()
                     });
                 } else if node.inputs.len() == 2 {
@@ -4295,8 +4292,7 @@ impl<'a> Compiler<'a> {
                         output_buffer: out_buf,
                         extra_outputs: vec![],
                         params: vec![seq, dim, theta.to_bits(), 0, head_dim, 0, 0, 0],
-                        use_coop: false,
-                        use_small_tiles: false,
+
                         ..Default::default()
                     });
                 } else {
@@ -4307,8 +4303,7 @@ impl<'a> Compiler<'a> {
                         output_buffer: out_buf,
                         extra_outputs: vec![],
                         params: vec![seq, dim, theta.to_bits(), pos_offset, head_dim, 0, 0, 0],
-                        use_coop: false,
-                        use_small_tiles: false,
+
                         ..Default::default()
                     });
                 }
@@ -4327,8 +4322,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![seq, dim, theta.to_bits(), 0, head_dim, 0, 0, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -4359,8 +4353,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![lse_buf],
                     params: vec![seq, 0, (num_heads << 16) | num_kv_heads, head_dim],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -4392,8 +4385,7 @@ impl<'a> Compiler<'a> {
                         head_dim,
                         window_size,
                     ],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -4414,8 +4406,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![seq, dim, theta.to_bits(), pos_offset, head_dim, 0, 0, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -4446,8 +4437,7 @@ impl<'a> Compiler<'a> {
                         output_buffer: out_buf,
                         extra_outputs: vec![],
                         params: vec![batch, channels, spatial, num_groups, eps.to_bits(), 0, 0, 0],
-                        use_coop: false,
-                        use_small_tiles: false,
+
                         ..Default::default()
                     });
                 } else {
@@ -4473,9 +4463,8 @@ impl<'a> Compiler<'a> {
                         output_buffer: partials,
                         extra_outputs: vec![],
                         params: vec![slices, group_size / chunks, 0, 0],
-                        use_coop: false,
-                        use_small_tiles: false,
-                        reduction: Some(group_norm_stats_kernel()),
+
+                        kernel: Kernel::Reduction(group_norm_stats_kernel()),
                         ..Default::default()
                     });
                     self.plan.dispatches.push(Dispatch {
@@ -4485,8 +4474,7 @@ impl<'a> Compiler<'a> {
                         output_buffer: out_buf,
                         extra_outputs: vec![],
                         params,
-                        use_coop: false,
-                        use_small_tiles: false,
+
                         ..Default::default()
                     });
                 }
@@ -4514,8 +4502,7 @@ impl<'a> Compiler<'a> {
                         output_buffer: out_buf,
                         extra_outputs: vec![],
                         params: vec![batch, channels, spatial, num_groups, eps.to_bits(), 0, 0, 0],
-                        use_coop: false,
-                        use_small_tiles: false,
+
                         ..Default::default()
                     });
                 } else {
@@ -4539,9 +4526,8 @@ impl<'a> Compiler<'a> {
                         output_buffer: partials,
                         extra_outputs: vec![],
                         params: vec![slices, group_size / chunks, 0, 0],
-                        use_coop: false,
-                        use_small_tiles: false,
-                        reduction: Some(group_norm_stats_kernel()),
+
+                        kernel: Kernel::Reduction(group_norm_stats_kernel()),
                         ..Default::default()
                     });
                     self.plan.dispatches.push(Dispatch {
@@ -4551,8 +4537,7 @@ impl<'a> Compiler<'a> {
                         output_buffer: out_buf,
                         extra_outputs: vec![],
                         params,
-                        use_coop: false,
-                        use_small_tiles: false,
+
                         ..Default::default()
                     });
                 }
@@ -4576,8 +4561,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![batch, channels, spatial, num_groups, eps.to_bits(), 0, 0, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -4599,8 +4583,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![batch, channels, spatial, num_groups, eps.to_bits(), 0, 0, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -4621,8 +4604,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![batch, channels_a, channels_b, spatial],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -4642,8 +4624,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![batch, channels_a, channels_b, spatial],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -4663,8 +4644,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![batch, channels_a, channels_b, spatial],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -4684,8 +4664,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![batch, channels, in_h, in_w],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -4705,8 +4684,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![batch, channels, in_h, in_w],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -4771,8 +4749,7 @@ impl<'a> Compiler<'a> {
                             out_w,
                             padding_w,
                         ],
-                        use_coop: false,
-                        use_small_tiles: false,
+
                         ..Default::default()
                     });
                 } // else (non-1x1 conv)
@@ -4789,8 +4766,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![len, spatial, channels, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -4806,8 +4782,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![len, spatial, channels, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -4838,8 +4813,7 @@ impl<'a> Compiler<'a> {
                         batch, channels, in_h, in_w, kernel_h, kernel_w, stride, padding_h, out_h,
                         out_w, padding_w,
                     ],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -4877,8 +4851,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: weight_xform,
                     extra_outputs: vec![],
                     params: vec![out_channels, in_channels, 0, 0, 0, 0, 0, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
 
@@ -4899,8 +4872,7 @@ impl<'a> Compiler<'a> {
                         tiles_w,
                         total_tiles,
                     ],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
 
@@ -4913,8 +4885,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: mm_out_buf,
                     extra_outputs: vec![],
                     params: vec![out_channels, total_tiles, in_channels, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
 
@@ -4935,8 +4906,7 @@ impl<'a> Compiler<'a> {
                         total_tiles,
                         0,
                     ],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -4994,8 +4964,7 @@ impl<'a> Compiler<'a> {
                                 out_w,
                                 padding_w,
                             ],
-                            use_coop: false,
-                            use_small_tiles: false,
+
                             ..Default::default()
                         });
                     }
@@ -5054,8 +5023,7 @@ impl<'a> Compiler<'a> {
                             out_w,
                             padding_w,
                         ],
-                        use_coop: false,
-                        use_small_tiles: false,
+
                         ..Default::default()
                     });
                 }
@@ -5074,8 +5042,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: cache,
                     extra_outputs: vec![],
                     params: vec![dim, 0, 0, 0], // kv_pos read from input buffer at runtime
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -5098,8 +5065,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: cache,
                     extra_outputs: vec![],
                     params: vec![dim, block_len, max_seq, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -5126,8 +5092,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![q_seq, num_heads, num_kv_heads, head_dim],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -5181,8 +5146,7 @@ impl<'a> Compiler<'a> {
                         output_buffer: partials,
                         extra_outputs: vec![],
                         params: params.to_words(),
-                        use_coop: false,
-                        use_small_tiles: false,
+
                         ..Default::default()
                     });
                     self.plan.dispatches.push(Dispatch {
@@ -5192,8 +5156,7 @@ impl<'a> Compiler<'a> {
                         output_buffer: out_buf,
                         extra_outputs: vec![],
                         params: params.to_words(),
-                        use_coop: false,
-                        use_small_tiles: false,
+
                         ..Default::default()
                     });
                 } else {
@@ -5204,8 +5167,7 @@ impl<'a> Compiler<'a> {
                         output_buffer: out_buf,
                         extra_outputs: vec![],
                         params: params.to_words(),
-                        use_coop: false,
-                        use_small_tiles: false,
+
                         ..Default::default()
                     });
                 }
@@ -5238,8 +5200,7 @@ impl<'a> Compiler<'a> {
                         0,
                         0,
                     ],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -5257,8 +5218,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![cols, rows, 0, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -5288,8 +5248,7 @@ impl<'a> Compiler<'a> {
                         batch, channels, in_h, in_w, kernel_h, kernel_w, stride, padding, out_h,
                         out_w, 0, 0,
                     ],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -5304,8 +5263,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![channels, spatial, total_out, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -5323,8 +5281,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![total, spatial, 0, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -5353,8 +5310,7 @@ impl<'a> Compiler<'a> {
                         output_buffer: out_buf,
                         extra_outputs: vec![],
                         params: vec![rows, cols, eps.to_bits(), 0],
-                        use_coop: false,
-                        use_small_tiles: false,
+
                         ..Default::default()
                     });
                 }
@@ -5380,8 +5336,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![lse_buf],
                     params: vec![seq, seq, (num_heads << 16) | num_kv_heads, head_dim],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -5406,8 +5361,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![lse_buf],
                     params: vec![q_seq, kv_seq, (num_heads << 16) | num_kv_heads, head_dim],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -5432,8 +5386,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![lse_buf],
                     params: vec![q_seq, kv_seq, (num_heads << 16) | num_kv_heads, head_dim],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -5509,8 +5462,7 @@ impl<'a> Compiler<'a> {
                         head_dim,
                         window_size,
                     ],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -5592,8 +5544,7 @@ impl<'a> Compiler<'a> {
                         output_buffer: out_buf,
                         extra_outputs: vec![dv_buf],
                         params: attention_params,
-                        use_coop: false,
-                        use_small_tiles: false,
+
                         ..Default::default()
                     });
                 }
@@ -5625,8 +5576,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![len, 0, 0, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -5643,8 +5593,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![len, 0, 0, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -5661,8 +5610,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![len, 0, 0, 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -5686,8 +5634,7 @@ impl<'a> Compiler<'a> {
                         output_buffer: temp_buf,
                         extra_outputs: vec![],
                         params: vec![rows, cols, eps.to_bits(), 0],
-                        use_coop: false,
-                        use_small_tiles: false,
+
                         ..Default::default()
                     });
                     self.plan.dispatches.push(Dispatch {
@@ -5697,8 +5644,7 @@ impl<'a> Compiler<'a> {
                         output_buffer: out_buf,
                         extra_outputs: vec![],
                         params: vec![rows, cols, 0, 0],
-                        use_coop: false,
-                        use_small_tiles: false,
+
                         ..Default::default()
                     });
                 } else {
@@ -5710,8 +5656,7 @@ impl<'a> Compiler<'a> {
                         output_buffer: out_buf,
                         extra_outputs: vec![],
                         params: vec![rows, cols, eps.to_bits(), 0],
-                        use_coop: false,
-                        use_small_tiles: false,
+
                         ..Default::default()
                     });
                 }
@@ -5740,8 +5685,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![rows, cols, eps.to_bits(), lanes_per_row],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -5763,8 +5707,7 @@ impl<'a> Compiler<'a> {
                         output_buffer: temp_buf,
                         extra_outputs: vec![],
                         params: vec![rows, cols, eps.to_bits(), 0],
-                        use_coop: false,
-                        use_small_tiles: false,
+
                         ..Default::default()
                     });
                     self.plan.dispatches.push(Dispatch {
@@ -5774,8 +5717,7 @@ impl<'a> Compiler<'a> {
                         output_buffer: out_buf,
                         extra_outputs: vec![],
                         params: vec![rows, cols, 0, 0],
-                        use_coop: false,
-                        use_small_tiles: false,
+
                         ..Default::default()
                     });
                 } else {
@@ -5786,8 +5728,7 @@ impl<'a> Compiler<'a> {
                         output_buffer: out_buf,
                         extra_outputs: vec![],
                         params: vec![rows, cols, eps.to_bits(), 0],
-                        use_coop: false,
-                        use_small_tiles: false,
+
                         ..Default::default()
                     });
                 }
@@ -5807,8 +5748,7 @@ impl<'a> Compiler<'a> {
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![rows, cols, eps.to_bits(), 0],
-                    use_coop: false,
-                    use_small_tiles: false,
+
                     ..Default::default()
                 });
             }
@@ -5887,9 +5827,8 @@ impl<'a> Compiler<'a> {
             output_buffer: row_max,
             extra_outputs: vec![],
             params: vec![batch, features, 0, 0],
-            use_coop: false,
-            use_small_tiles: false,
-            reduction: Some(max_kernel),
+
+            kernel: Kernel::Reduction(max_kernel),
             ..Default::default()
         });
 
@@ -5946,9 +5885,8 @@ impl<'a> Compiler<'a> {
             output_buffer: out_buf,
             extra_outputs: vec![],
             params: vec![batch, features, 0, 0],
-            use_coop: false,
-            use_small_tiles: false,
-            reduction: Some(sum_kernel),
+
+            kernel: Kernel::Reduction(sum_kernel),
             ..Default::default()
         });
     }
@@ -6040,9 +5978,8 @@ impl<'a> Compiler<'a> {
             output_buffer: out_buf,
             extra_outputs: vec![],
             params: vec![rows, cols, eps.to_bits(), 0],
-            use_coop: false,
-            use_small_tiles: false,
-            reduction: Some(kernel),
+
+            kernel: Kernel::Reduction(kernel),
             ..Default::default()
         });
     }
@@ -6131,9 +6068,8 @@ impl<'a> Compiler<'a> {
             // bits in dispatch metadata as well: runtime may rewrite this
             // dispatch to RmsNormRsqrt for a cooperative matmul prologue.
             params: vec![rows, cols, eps.to_bits(), 0],
-            use_coop: false,
-            use_small_tiles: false,
-            reduction: Some(kernel),
+
+            kernel: Kernel::Reduction(kernel),
             ..Default::default()
         });
     }
@@ -6148,9 +6084,8 @@ impl<'a> Compiler<'a> {
             output_buffer: out_buf,
             extra_outputs: vec![],
             params: vec![len, 0, 0, 0],
-            use_coop: false,
-            use_small_tiles: false,
-            pointwise: Some(PointwiseDAG {
+
+            kernel: Kernel::Pointwise(PointwiseDAG {
                 n_inputs: 1,
                 ops: vec![Pw::LoadInput(0), op],
                 output: 1,
@@ -6174,9 +6109,8 @@ impl<'a> Compiler<'a> {
             output_buffer: out_buf,
             extra_outputs: vec![],
             params: vec![len, 0, 0, 0],
-            use_coop: false,
-            use_small_tiles: false,
-            pointwise,
+
+            kernel: pointwise.map_or(Kernel::Default, Kernel::Pointwise),
             ..Default::default()
         });
     }
@@ -6197,9 +6131,8 @@ impl<'a> Compiler<'a> {
             output_buffer: out_buf,
             extra_outputs: vec![],
             params: vec![len, 0, 0, 0],
-            use_coop: false,
-            use_small_tiles: false,
-            pointwise,
+
+            kernel: pointwise.map_or(Kernel::Default, Kernel::Pointwise),
             ..Default::default()
         });
     }
@@ -6334,7 +6267,7 @@ mod tests {
         assert_eq!(plan.dispatches[1].shader, ShaderEntry::Sigmoid);
         assert_eq!(plan.dispatches[2].shader, ShaderEntry::Neg);
         assert_eq!(plan.dispatches[3].shader, ShaderEntry::Relu);
-        assert!(plan.dispatches[3].pointwise.is_some());
+        assert!(plan.dispatches[3].pointwise().is_some());
         // All unary ops: params = [len, 0, 0, 0]
         for d in &plan.dispatches {
             assert_eq!(d.params[0], 32); // 4*8
@@ -6360,7 +6293,7 @@ mod tests {
         assert_eq!(copy.workgroups, [1, 1, 1]);
         assert_eq!(copy.input_buffers.len(), 1);
         assert_ne!(copy.input_buffers[0], copy.output_buffer);
-        assert!(copy.pointwise.is_some());
+        assert!(copy.pointwise().is_some());
         assert!(copy.fusion_barrier);
 
         let split = &plan.dispatches[1];
@@ -6431,14 +6364,7 @@ mod tests {
         let narrow_plan = compile(&narrow);
         let narrow_dispatch = &narrow_plan.dispatches[0];
         assert_eq!(narrow_dispatch.workgroups, [1, 1, 1]);
-        assert_eq!(
-            narrow_dispatch
-                .reduction
-                .as_ref()
-                .unwrap()
-                .rows_per_workgroup,
-            256
-        );
+        assert_eq!(narrow_dispatch.reduction().unwrap().rows_per_workgroup, 256);
 
         let mut wide = Graph::new();
         let input = wide.input("input", &[100, 33]);
@@ -6447,10 +6373,7 @@ mod tests {
         let wide_plan = compile(&wide);
         let wide_dispatch = &wide_plan.dispatches[0];
         assert_eq!(wide_dispatch.workgroups, [100, 1, 1]);
-        assert_eq!(
-            wide_dispatch.reduction.as_ref().unwrap().rows_per_workgroup,
-            1
-        );
+        assert_eq!(wide_dispatch.reduction().unwrap().rows_per_workgroup, 1);
 
         let mut product = Graph::new();
         let a = product.input("a", &[100, 9]);
@@ -6464,7 +6387,7 @@ mod tests {
             1,
             "narrow reductions should fold their pointwise producer"
         );
-        let product_kernel = product_plan.dispatches[0].reduction.as_ref().unwrap();
+        let product_kernel = product_plan.dispatches[0].reduction().unwrap();
         assert_eq!(product_kernel.n_per_elem, 2);
     }
 
@@ -6478,7 +6401,7 @@ mod tests {
         let forward_plan = compile(&forward);
         assert_eq!(forward_plan.dispatches.len(), 1);
         let reduction = &forward_plan.dispatches[0];
-        assert!(reduction.reduction.is_some());
+        assert!(reduction.reduction().is_some());
         assert_eq!(reduction.params[..2], [100, 3]);
         assert_eq!(reduction.input_buffers.len(), 1);
 
@@ -6502,7 +6425,7 @@ mod tests {
         let non_unit_plan = compile(&non_unit);
         assert_eq!(non_unit_plan.dispatches.len(), 1);
         assert_eq!(non_unit_plan.dispatches[0].shader, ShaderEntry::MatMul);
-        assert!(non_unit_plan.dispatches[0].reduction.is_none());
+        assert!(non_unit_plan.dispatches[0].reduction().is_none());
     }
 
     #[test]
@@ -6535,7 +6458,7 @@ mod tests {
         let narrow_plan = compile(&narrow);
         let forward = &narrow_plan.dispatches[0];
         assert_eq!(forward.workgroups, [2, 1, 1]);
-        assert_eq!(forward.reduction.as_ref().unwrap().rows_per_workgroup, 64);
+        assert_eq!(forward.reduction().unwrap().rows_per_workgroup, 64);
 
         let mut narrow_grad = Graph::new();
         let dy = narrow_grad.input("dy", &[100, 3]);
@@ -6708,7 +6631,7 @@ mod tests {
         assert_eq!(plan.dispatches[0].params[1], 10); // features/inner
         for dispatch in &plan.dispatches {
             assert_eq!(dispatch.workgroups, [7, 1, 1]);
-            assert_eq!(dispatch.reduction.as_ref().unwrap().rows_per_workgroup, 16);
+            assert_eq!(dispatch.reduction().unwrap().rows_per_workgroup, 16);
         }
     }
 
@@ -6723,7 +6646,7 @@ mod tests {
         let plan = compile(&g);
         assert!(!plan.dispatches.is_empty());
         for dispatch in &plan.dispatches {
-            if let Some(reduction) = dispatch.reduction.as_ref()
+            if let Some(reduction) = dispatch.reduction()
                 && let Some(epilogue) = reduction.epilogue.as_ref()
             {
                 assert_eq!(
@@ -6769,7 +6692,7 @@ mod tests {
         let softmax_dispatches = plan
             .dispatches
             .iter()
-            .filter(|d| d.shader == ShaderEntry::Softmax || d.reduction.is_some())
+            .filter(|d| d.shader == ShaderEntry::Softmax || d.reduction().is_some())
             .count();
         assert_eq!(
             softmax_dispatches, 0,
@@ -6846,7 +6769,7 @@ mod tests {
     fn horizontal_fusion_drops_unpacked_fallback_and_preserves_precision() {
         let mut dispatches = vec![mm_dispatch(0, 1, 2, 1, 32), mm_dispatch(0, 3, 4, 1, 32)];
         for d in &mut dispatches {
-            d.use_coop = true;
+            d.kernel = crate::compile::Kernel::Cooperative;
             d.scalar_fallback = Some((d.shader.clone(), [1, 1, 1]));
         }
         dispatches[1].requires_full_precision = true;
@@ -6859,7 +6782,7 @@ mod tests {
         let packed = &dispatches[0];
         assert_eq!(packed.horizontal_batch, 2);
         assert_eq!(packed.workgroups, [2, 2, 2]);
-        assert!(packed.use_coop);
+        assert!(packed.use_coop());
         assert!(packed.requires_full_precision);
         assert!(packed.scalar_fallback.is_none());
         assert_eq!(packed.extra_outputs, [BufferRef(4)]);
@@ -6983,7 +6906,7 @@ mod tests {
             .iter()
             .position(|dispatch| dispatch.shader == ShaderEntry::MatMul)
             .expect("matmul dispatch");
-        coop_plan.dispatches[matmul_index].use_coop = true;
+        coop_plan.dispatches[matmul_index].kernel = crate::compile::Kernel::Cooperative;
         fuse_rmsnorm_prologues(&mut coop_plan);
 
         let rsqrt = coop_plan
@@ -7357,12 +7280,12 @@ mod tests {
         assert!(
             plan.dispatches
                 .iter()
-                .any(|dispatch| dispatch.reduction.is_some())
+                .any(|dispatch| dispatch.reduction().is_some())
         );
         assert!(
             plan.dispatches
                 .iter()
-                .filter(|dispatch| dispatch.reduction.is_some())
+                .filter(|dispatch| dispatch.reduction().is_some())
                 .all(|dispatch| dispatch.profile_family() == "normalization_reduction")
         );
     }
@@ -7388,7 +7311,7 @@ mod tests {
 
         let large = make_plan(8202);
         assert_eq!(large.dispatches.len(), 2);
-        assert!(large.dispatches[0].reduction.is_some());
+        assert!(large.dispatches[0].reduction().is_some());
         assert_eq!(large.dispatches[1].shader, ShaderEntry::GroupNormApply);
         let chunks = large.dispatches[1].params[5];
         assert_eq!(chunks, 3);

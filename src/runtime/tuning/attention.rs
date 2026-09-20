@@ -137,14 +137,9 @@ fn plain(d: &Dispatch) -> bool {
         output_buffer: _,
         extra_outputs: ref outputs,
         params: _,
-        use_coop: false,
-        use_coop_compensated: false,
+
+        kernel: crate::compile::Kernel::Default,
         horizontal_batch: 0 | 1,
-        use_small_tiles: false,
-        scalar_matmul: None,
-        conv_k_tile: None,
-        gemv_int_dot: false,
-        gemv_shape: None,
         requires_full_precision: _,
         fusion_barrier: _,
         matmul_epilogue: None,
@@ -153,8 +148,6 @@ fn plain(d: &Dispatch) -> bool {
         label: _,
         origin: _,
         scalar_fallback: None,
-        pointwise: None,
-        reduction: None,
         weight_format: crate::compile::WeightFormat::F32,
     } if outputs.is_empty())
 }

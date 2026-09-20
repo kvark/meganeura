@@ -9,8 +9,8 @@ use std::{io, path::Path};
 
 /// Increment whenever the serialized execution plan or build pipeline changes
 /// in a way that can make an older plan unsafe to reuse.
-// Version 8 removes the redundant legacy epilogue representation.
-const CACHE_FORMAT_VERSION: u32 = 8;
+// Version 9 represents mutually exclusive dispatch implementations as an enum.
+const CACHE_FORMAT_VERSION: u32 = 9;
 
 /// Cached execution plan with a graph fingerprint for invalidation.
 #[derive(Serialize, Deserialize)]

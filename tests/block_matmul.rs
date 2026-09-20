@@ -218,7 +218,7 @@ fn cpu_all_three_chain_rules_match_finite_differences() {
                 })
                 .collect();
             assert_eq!(block_gradients.len(), 2);
-            assert!(block_gradients.iter().all(|d| !d.use_coop));
+            assert!(block_gradients.iter().all(|d| !d.use_coop()));
         }
     }
 }
@@ -245,12 +245,12 @@ fn cpu_production_shapes_use_one_dispatch_per_product() {
                         | ShaderEntry::BlockMatMulBT
                 ));
                 assert_eq!(d.params, [rows as u32, n as u32, k as u32, 8]);
-                let tile = if d.use_small_tiles { 32 } else { 64 };
+                let tile = if d.use_small_tiles() { 32 } else { 64 };
                 assert_eq!(
                     d.workgroups,
                     [(n as u32).div_ceil(tile), (rows as u32).div_ceil(tile), 8]
                 );
-                assert!(!d.use_coop);
+                assert!(!d.use_coop());
             }
         }
     }
