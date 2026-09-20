@@ -1,6 +1,7 @@
 //! CPU survey, or whole-model search with a full independent CPU reference.
 //! Usage: egglog_model_search MODEL [REFERENCE.f32|optimized] [fast] [baseline]
-//! Options: --static, --confirm, --reverse, --profile, --seconds=N (soft search budget).
+//! Options: --static, --confirm, --reverse, --profile, --original-graph,
+//! --seconds=N (soft search budget).
 use meganeura::{
     Graph,
     models::{smolvla, whisper},
@@ -90,7 +91,10 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
     use meganeura::{SessionOptions, codegen, compile};
     let output_len = graph.node(graph.outputs()[0]).ty.num_elements();
     assert_eq!(output_len, reference.len());
-    let graph = meganeura::optimize::optimize(&graph);
+    let original = graph;
+    let graph = meganeura::optimize::optimize(&original);
+    let original_graph = std::env::args().any(|arg| arg == "--original-graph");
+    let search_source = if original_graph { &original } else { &graph };
     let profile = std::env::args().any(|arg| arg == "--profile");
     let gpu = std::sync::Arc::new(
         meganeura::runtime::init_gpu_context_with(meganeura::runtime::GpuOptions {
@@ -112,11 +116,11 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
     let mut extraction_truncated = false;
     let extraction_start = Instant::now();
     if !baseline {
-        for region in meganeura::outline::detect_repeated_regions(&graph)
+        for region in meganeura::outline::detect_repeated_regions(search_source)
             .into_iter()
             .take(1)
         {
-            let space = search::repeated_candidates(&graph, region, 8).unwrap();
+            let space = search::repeated_candidates(search_source, region, 8).unwrap();
             extraction_truncated |= space.truncated;
             forms.extend(space.candidates);
         }
@@ -166,7 +170,7 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
                 }
             }
             programs.push(search::measure::Program {
-                description: format!("form={index}, dispatch_fusion={fuse_dispatches}, split_products={split_products}; {}", form.expression),
+                description: format!("form={index}, dispatch_fusion={fuse_dispatches}, split_products={split_products}"),
                 plan,
             });
         }
@@ -272,7 +276,8 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
     println!(
         "{}",
         serde_json::json!({"model": model, "device": session.device_information().device_name,
-            "fast": fast, "extraction_ms": extraction_ms, "extraction_truncated": extraction_truncated,
+            "fast": fast, "original_graph": original_graph,
+            "extraction_ms": extraction_ms, "extraction_truncated": extraction_truncated,
             "report": report, "held_out_ms": samples, "median_ms": sorted[sorted.len()/2],
             "relative_l2_error": errors.0, "loss_relative_error": errors.1, "max_abs_error": errors.2,
             "dispatches": session.plan().dispatches.len(), "groups": session.num_groups(),
