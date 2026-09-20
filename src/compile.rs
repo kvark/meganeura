@@ -291,7 +291,7 @@ pub enum ShaderEntry {
     /// Cooperative-matrix flash attention forward (Phase 1: coop QK^T,
     /// scalar softmax + PV). Enabled on compatible devices unless
     /// `MEGANEURA_FLASH_FWD_COOP=0`.
-    /// BQ=BKV=16, dispatched as `[ceil(q_seq/16), num_heads, 1]`.
+    /// Experimental BQ=32, BKV=16, two 32-lane subgroups per workgroup.
     FlashAttentionCoop,
     /// Cooperative-matrix flash backward dQ kernel. Three coop matmuls
     /// per KV tile: score=Q·K^T, dp=dO·V^T, dQ+=ds·K. Opt-in via
@@ -2768,7 +2768,7 @@ impl<'a> Compiler<'a> {
         {
             return (
                 ShaderEntry::FlashAttentionCoop,
-                [q_seq.div_ceil(16), num_heads, 1],
+                [q_seq.div_ceil(32), num_heads, 1],
             );
         }
         // EPT (elements per thread) must match forward codegen.

@@ -3767,12 +3767,12 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
 /// accumulator is held in *registers* across the entire KV loop (not
 /// re-staged through shared memory each iteration), and the per-row
 /// rescale runs INSIDE the same thread that owns the accumulator.
-/// Each row's softmax math is duplicated 4× (once per d-chunk) but
+/// Each row's softmax math is duplicated 2× (once per d-chunk) but
 /// that's a small constant (16 ops/row) vs the cost of the shared-mem
 /// roundtrip.
 ///
-/// Workgroup layout (64 threads = 16 rows × 4 d-chunks):
-///   * `BQ = 16`, `BKV = 16` — match the coop_mat tile size.
+/// Experimental layout: two 32-lane subgroups handle independent query tiles.
+///   * `BQ = 32`, `BKV = 16`; each subgroup computes 16 query rows.
 ///   * Each thread owns one (row, d_chunk) pair: holds
 ///     `O_acc[chunk_hd]` and `local_max` / `local_sum` in registers.
 ///   * Q is staged once per workgroup into shared as f16 [BQ × hd].
@@ -3783,7 +3783,8 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
 ///     each thread reads its row's BKV scores and runs softmax
 ///     locally.
 ///
-/// Caller dispatch must use workgroups = `[ceil(q_seq/16), num_heads, 1]`.
+/// Caller dispatch must use workgroups = `[ceil(q_seq/32), num_heads, 1]`.
+/// This experiment requires exactly 32 lanes per subgroup.
 /// `head_dim` must be a multiple of 16.
 pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
     use std::fmt::Write;
@@ -3793,14 +3794,10 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
     );
     let hd = head_dim;
     let hd_tiles = hd / 16;
-    let bq: u32 = 16;
+    let bq: u32 = 32;
     let bkv: u32 = 16;
     let wg_size: u32 = 64;
-    assert!(
-        wg_size == bq * 4,
-        "coop flash assumes wg_size=64 / BQ=16 / 4 hd-chunks per row"
-    );
-    let chunks_per_row: u32 = 4;
+    let chunks_per_row: u32 = 2;
     let chunk_hd: u32 = hd / chunks_per_row;
 
     let mut src = String::new();
@@ -3825,7 +3822,7 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
     src.push('\n');
 
     let _ = writeln!(src, "@compute @workgroup_size({wg_size})");
-    src.push_str("fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n");
+    src.push_str("fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(subgroup_id) sg: u32, @builtin(subgroup_invocation_id) lane: u32) {\n");
     let _ = writeln!(src, "    let pos_base = wgid.x * {bq}u;");
     src.push_str("    let head = wgid.y;\n");
     src.push_str("    let q_seq = params.q_seq;\n");
@@ -3840,8 +3837,8 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
     src.push_str("    let scale = inverseSqrt(f32(head_dim));\n\n");
 
     // Per-thread (row, chunk) — index hoisted to top.
-    let _ = writeln!(src, "    let row = lid.x / {chunks_per_row}u;");
-    let _ = writeln!(src, "    let chunk = lid.x % {chunks_per_row}u;");
+    let _ = writeln!(src, "    let row = sg * 16u + lane / {chunks_per_row}u;");
+    let _ = writeln!(src, "    let chunk = lane % {chunks_per_row}u;");
     let _ = writeln!(src, "    let d_off = chunk * {chunk_hd}u;");
     src.push_str("    let qpos = pos_base + row;\n");
     src.push_str("    let q_valid = qpos < q_seq && head < num_heads;\n\n");
@@ -3918,7 +3915,7 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
     );
     let _ = writeln!(
         src,
-        "            let a = coopLoadT<coop_mat16x16<f16,A>>(&shared_q[ht * 16u], {hd}u);"
+        "            let a = coopLoadT<coop_mat16x16<f16,A>>(&shared_q[sg * 16u * {hd}u + ht * 16u], {hd}u);"
     );
     let _ = writeln!(
         src,
@@ -3928,12 +3925,12 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
     src.push_str("        }\n");
     let _ = writeln!(
         src,
-        "        coopStoreT(score_acc, &shared_score[0], {bkv}u);"
+        "        coopStoreT(score_acc, &shared_score[sg * 16u * {bkv}u], {bkv}u);"
     );
     src.push_str("        workgroupBarrier();\n\n");
 
     // Per-thread row softmax + PV. Each thread owns one (row, chunk).
-    // The 4 chunks of a row redundantly compute the same row max/sum
+    // The chunks of a row redundantly compute the same row max/sum
     // (16 mul/add/exp ops per row — small constant).
     src.push_str("        var rowmax = -1e30;\n");
     let _ = writeln!(src, "        for (var j = 0u; j < {bkv}u; j = j + 1u) {{");
@@ -4019,7 +4016,7 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
     );
     src.push_str("            dst[q_base + d_off + e] = local_o[e] / safe_sum;\n");
     src.push_str("        }\n");
-    // LSE: only the first chunk-thread per row writes (avoids 4-way duplicate write).
+    // LSE: only the first chunk-thread per row writes.
     src.push_str("        if chunk == 0u {\n");
     src.push_str("            let idx = (qpos * num_heads + head) * 2u;\n");
     src.push_str("            lse[idx] = local_max;\n");
