@@ -98,13 +98,13 @@ fn bench_shape(
         .map(|d| {
             let kernel = match d.shader {
                 meganeura::compile::ShaderEntry::MatMulGemv => "gemv",
-                _ if d.use_coop => "coop",
-                _ if d.use_small_tiles => "small",
+                _ if d.use_coop() => "coop",
+                _ if d.use_small_tiles() => "small",
                 _ => "tile",
             };
             (
-                if d.use_coop { 1 } else { 0 },
-                if d.use_small_tiles { 1 } else { 0 },
+                if d.use_coop() { 1 } else { 0 },
+                if d.use_small_tiles() { 1 } else { 0 },
                 d.workgroups[0] * d.workgroups[1] * d.workgroups[2],
                 kernel,
             )

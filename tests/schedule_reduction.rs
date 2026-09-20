@@ -761,10 +761,10 @@ fn two_gather_reduction_actually_fuses() {
     let reductions: Vec<_> = plan
         .dispatches
         .iter()
-        .filter(|d| d.reduction.is_some())
+        .filter(|d| d.reduction().is_some())
         .collect();
     assert_eq!(reductions.len(), 1, "expected exactly one fused reduction");
-    let k = reductions[0].reduction.as_ref().unwrap();
+    let k = reductions[0].reduction().unwrap();
     assert_eq!(
         k.n_per_elem, 2,
         "mul producer should fold to 2 per-elem streams"
@@ -780,7 +780,7 @@ fn two_gather_reduction_actually_fuses() {
     let embeds = plan
         .dispatches
         .iter()
-        .filter(|d| d.shader == ShaderEntry::Embedding && d.reduction.is_none())
+        .filter(|d| d.shader == ShaderEntry::Embedding && d.reduction().is_none())
         .count();
     assert_eq!(embeds, 0, "embedding dispatches should be folded away");
 }
@@ -813,17 +813,17 @@ fn shared_gather_and_offset_fold_into_each_reduction() {
     let reductions: Vec<_> = plan
         .dispatches
         .iter()
-        .filter(|dispatch| dispatch.reduction.is_some())
+        .filter(|dispatch| dispatch.reduction().is_some())
         .collect();
     assert_eq!(reductions.len(), 2);
     for reduction in reductions {
-        let kernel = reduction.reduction.as_ref().unwrap();
+        let kernel = reduction.reduction().unwrap();
         assert_eq!(kernel.n_per_elem, 3);
         assert_eq!(kernel.gather_elem, vec![true, false, false]);
         assert_eq!(reduction.input_buffers.len(), 4);
     }
     assert!(!plan.dispatches.iter().any(|dispatch| {
-        dispatch.shader == ShaderEntry::Embedding && dispatch.reduction.is_none()
+        dispatch.shader == ShaderEntry::Embedding && dispatch.reduction().is_none()
     }));
     assert!(!plan.dispatches.iter().any(|dispatch| {
         dispatch.shader == ShaderEntry::Add && dispatch.params[0] == (m * n) as u32

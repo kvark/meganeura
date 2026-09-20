@@ -78,7 +78,7 @@ fn coop_rmsnorm_matmul_prologue_matches_scalar_after_updates() {
         .plan()
         .dispatches
         .iter()
-        .any(|dispatch| dispatch.use_coop && dispatch.matmul_prologue.is_some());
+        .any(|dispatch| dispatch.use_coop() && dispatch.matmul_prologue.is_some());
 
     let projection = (0..INNER * COLS)
         .map(|index| ((index * 17 % 101) as f32 - 50.0) * 0.001)

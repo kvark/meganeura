@@ -34,7 +34,7 @@ impl ExecutionPlan {
             let mut class = TuneClass::from_dispatch(dispatch, None)
                 .filter(|class| {
                     class.shader == ShaderEntry::Conv2dGradWeightGemm
-                        && dispatch.conv_k_tile.is_none()
+                        && dispatch.conv_k_tile().is_none()
                 })
                 .ok_or(TuneError(
                     "split-K requires an unmodified legal scalar weight gradient",
@@ -230,7 +230,7 @@ mod tests {
         }
         rejected(plan.clone(), &[(index, 2)], 0);
         for change in [
-            |d: &mut Dispatch| d.use_coop = true,
+            |d: &mut Dispatch| d.kernel = crate::compile::Kernel::Cooperative,
             |d: &mut Dispatch| d.workgroups[2] = 2,
             |d: &mut Dispatch| d.params[6] = 0,
             |d: &mut Dispatch| d.input_buffers[0] = d.output_buffer,
