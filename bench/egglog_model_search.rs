@@ -1,6 +1,6 @@
 //! CPU survey, or whole-model search with a full independent CPU reference.
 //! Usage: egglog_model_search MODEL [REFERENCE.f32|optimized] [fast] [baseline]
-//! Options: --static, --confirm, --reverse, --seconds=N (soft search budget).
+//! Options: --static, --confirm, --reverse, --profile, --seconds=N (soft search budget).
 use meganeura::{
     Graph,
     models::{smolvla, whisper},
@@ -8,24 +8,30 @@ use meganeura::{
 };
 use std::time::{Duration, Instant};
 
-fn initialize(session: &mut meganeura::Session, model: &str) {
+fn initialize(
+    session: &mut meganeura::Session,
+    model: &str,
+    parameters: &mut std::collections::HashMap<(String, usize), Vec<f32>>,
+) {
     for (name, buffer) in session.plan().param_buffers.clone() {
-        let seed_name = if model == "Whisper-tiny" {
-            name.strip_prefix("model.encoder.")
-                .unwrap_or(&name)
-                .replace("fused_bias", "bias")
-        } else {
-            name.clone()
-        };
-        let seed = seed_name
-            .bytes()
-            .fold(0u32, |hash, c| hash.wrapping_mul(31).wrapping_add(c as u32))
-            % 10000;
         let len = session.plan().buffers[buffer.0 as usize] / 4;
-        let values: Vec<_> = (0..len)
-            .map(|i| (i as f32 * 0.01 + seed as f32).sin() * 0.02)
-            .collect();
-        session.set_parameter(&name, &values);
+        let values = parameters.entry((name.clone(), len)).or_insert_with(|| {
+            let seed_name = if model == "Whisper-tiny" {
+                name.strip_prefix("model.encoder.")
+                    .unwrap_or(&name)
+                    .replace("fused_bias", "bias")
+            } else {
+                name.clone()
+            };
+            let seed = seed_name
+                .bytes()
+                .fold(0u32, |hash, c| hash.wrapping_mul(31).wrapping_add(c as u32))
+                % 10000;
+            (0..len)
+                .map(|i| (i as f32 * 0.01 + seed as f32).sin() * 0.02)
+                .collect()
+        });
+        session.set_parameter(&name, values);
     }
     for (name, buffer) in session.plan().input_buffers.clone() {
         if !session
@@ -85,7 +91,15 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
     let output_len = graph.node(graph.outputs()[0]).ty.num_elements();
     assert_eq!(output_len, reference.len());
     let graph = meganeura::optimize::optimize(&graph);
-    let gpu = std::sync::Arc::new(meganeura::runtime::init_gpu_context().unwrap());
+    let profile = std::env::args().any(|arg| arg == "--profile");
+    let gpu = std::sync::Arc::new(
+        meganeura::runtime::init_gpu_context_with(meganeura::runtime::GpuOptions {
+            timing: profile,
+            capture: profile,
+            ..Default::default()
+        })
+        .unwrap(),
+    );
     let caps = gpu.capabilities().cooperative_matrix;
     let caps = codegen::CoopCaps {
         f16_tile: if fast { caps.f16_tile } else { 0 },
@@ -158,7 +172,10 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
         }
     }
     let runtime = SessionOptions {
+        gpu_timing: profile,
         wgsl_dump_dir: std::env::var("MEGANEURA_DUMP_WGSL").ok(),
+        skip_parameter_zero: true,
+        reuse_upload_staging: true,
         coop: if fast {
             meganeura::CoopPolicy::Auto
         } else {
@@ -189,6 +206,7 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
                 .map(|s| s.parse::<u64>().unwrap())
         })
         .unwrap_or(180);
+    let mut parameters = std::collections::HashMap::new();
     let (mut session, report) = search::measure::select(
         programs,
         gpu.clone(),
@@ -200,7 +218,7 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
             max_plan_bytes: 3 * 1024 * 1024 * 1024,
         },
         |session| {
-            initialize(session, model);
+            initialize(session, model, &mut parameters);
             Ok(())
         },
         |session| check(session, reference).map(|_| ()),
@@ -220,7 +238,7 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
     let errors = check(&mut session, reference).unwrap();
     let confirmation = control_plan.map(|plan| {
         let mut control = meganeura::Session::with_context_opts(plan, gpu, runtime);
-        initialize(&mut control, model);
+        initialize(&mut control, model, &mut parameters);
         check(&mut control, reference).unwrap();
         let control_tuning = control.tune_with(tuning).unwrap();
         check(&mut control, reference).unwrap();
@@ -238,6 +256,19 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
         check(&mut session, reference).unwrap();
         serde_json::json!({"control_ms": times[0], "selected_ms": times[1], "control_tuning": control_tuning})
     });
+    let profile = profile.then(|| {
+        let result = meganeura::profiler::capture_session_profile(
+            &mut session,
+            |_| {},
+            meganeura::profiler::CaptureOptions {
+                samples: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        check(&mut session, reference).unwrap();
+        result
+    });
     println!(
         "{}",
         serde_json::json!({"model": model, "device": session.device_information().device_name,
@@ -247,6 +278,7 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
             "dispatches": session.plan().dispatches.len(), "groups": session.num_groups(),
             "allocated_buffer_bytes": session.memory_summary().allocated_buffer_bytes,
             "confirmation": confirmation,
+            "profile": profile,
         })
     );
 }
