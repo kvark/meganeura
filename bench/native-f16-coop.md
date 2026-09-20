@@ -7,6 +7,8 @@ query to this branch's experimental Blade API. The submitted paper, Inferena
 cohort and production PRs are unchanged. Keep raw outputs and binaries outside
 Git.
 
+Implementation: `80c809b405e25c88c8b9c597ce5c0dd4511c195b`.
+
 Corrected pass attribution identifies dense F16-weight matmuls as the largest
 prefill target: about 69% of instrumented pass intervals on the RTX 5070 and
 77% on the B570. These are not uninstrumented shader costs or a decomposition
@@ -63,6 +65,16 @@ to a NaN sentinel. Every logical output must be finite and within 0.0001 of
 the CPU reference; all guards must remain bit-identical. Rejected candidates
 have no retained timing samples. The current cases pass with zero maximum
 absolute error: 204 candidate/shape combinations on NVIDIA and 80 on Intel.
+This also holds in debug runs with Vulkan validation enabled. Those runs are
+not validation-clean: both emit the existing
+`VUID-StandaloneSpirv-None-10684` Workgroup `ArrayStride` error. No other Vulkan
+validation diagnostic was observed. Blade prints these messages to stdout;
+in debug runs the final JSON line follows the messages.
+
+With the private Naga patch, 449 library CPU tests and the example's one CPU
+regression pass; four opt-in GPU tests are ignored by that invocation. Blade's
+nine CPU tests pass. Clippy passes for the library and diagnostic. No new
+production test executable was added.
 
 Each candidate gets ten samples, with three discarded as warmup. A sample
 freshly records 32 dependent dispatches, then reads the output. Reset and CPU
@@ -78,6 +90,40 @@ are not fixed. Candidate order is fixed within a process; these are exploratory
 microbenchmarks, not held-out autotuner or whole-model results. Larger layouts
 lose on some shapes. A production tuner must measure the available choices;
 there is no device table selecting a presumed winner.
+
+## Repeated exploratory results
+
+Three fresh release processes per GPU, run alternately and sequentially, with
+the pinned implementation above. All 284 candidate/shape combinations pass in
+all three processes. Microseconds, median of process medians; plain matmul:
+
+| GPU | M x N x K | Best scalar | Best generic cooperative | Existing generator, native F16 weights |
+| --- | --- | ---: | ---: | ---: |
+| RTX 5070 | 128 x 576 x 576 | 25.17 | 30.72 | 28.67 |
+| RTX 5070 | 128 x 3072 x 576 | 47.10 | 43.01 | 36.86 |
+| RTX 5070 | 128 x 576 x 1536 | 63.49 | 75.78 | 71.78 |
+| Arc B570 | 128 x 576 x 576 | 49.22 | 58.59 | unavailable |
+| Arc B570 | 128 x 3072 x 576 | 183.75 | 112.76 | unavailable |
+| Arc B570 | 128 x 576 x 1536 | 123.65 | 146.67 | unavailable |
+
+The best NVIDIA generic layout uses 16x16x16 native tiles and a 32x32x16
+workgroup block with four subgroups. The existing generator with native F16
+weights is faster still. On Intel, four subgroups and a 32x32x16 block are
+best for the two narrower projections; the wide projection prefers 32x64x32.
+Those are observations from this search, not proposed fixed platform rules.
+Candidate minima are selected from the same measurements, not held-out trials.
+
+Only the wide projection beats the best scalar control: about 22% lower pass
+time on NVIDIA and 39% on Intel using the best observed cooperative choices.
+Intel's winning plain-projection medians span 112.66-139.64 us; this variation
+must not be hidden by the median. The wide residual-add variant also improves
+in all three processes, with medians 36.83 versus 47.10 us on NVIDIA and
+136.98 versus 194.17 us on Intel. Intel's residual cooperative medians span
+119.11-158.33 us. Scalar kernels still win both narrower aligned shapes.
+
+This is evidence for adding legal choices to the tuner, not for globally
+switching to cooperative matrices. It does not establish a new whole-model
+latency or close the remaining llama.cpp gap.
 
 ## Compiler findings
 
