@@ -13,11 +13,14 @@
 //! candidate (start, period, count) lattices by sequence periodicity,
 //! then exact verification checks op/type equality (parameter and input
 //! names wildcarded) and edge isomorphism — every edge must either shift
-//! with the instance (in-block and chain edges) or point at the same
-//! shared global node for all instances.
+//! with the instance (in-block and chain edges), point at the same shared
+//! global node, or consistently rebind a dependency outside the region.
 
 use crate::graph::{Graph, Op};
-use std::hash::{Hash, Hasher};
+use std::{
+    collections::HashMap,
+    hash::{Hash, Hasher},
+};
 
 /// Longest block period considered. Also bounds the outlined egglog
 /// program size, keeping saturation fast (the full-graph cutoff is 300).
@@ -74,6 +77,7 @@ fn node_signature(graph: &Graph, id: usize) -> u64 {
     }
     node.ty.shape.hash(&mut h);
     format!("{:?}", node.ty.dtype).hash(&mut h);
+    node.requires_full_precision.hash(&mut h);
     node.inputs.len().hash(&mut h);
     h.finish()
 }
@@ -92,9 +96,9 @@ fn ops_equivalent(a: &Op, b: &Op) -> bool {
 
 /// Check that instance `m` and instance `m+1` of the lattice are exact
 /// structural copies: equivalent ops and types at each offset, and every
-/// input edge either shifts by one period (in-block and chain edges —
-/// instance m+1 reading from instance m is `ia + period`) or points at
-/// the same shared global node (embeddings, masks, …).
+/// internal or chain edge shifts by one period. Dependencies before the entire
+/// region can be rebound consistently by type: topological sorting may have
+/// hoisted independent parameter projections ahead of the compute blocks.
 ///
 /// Comparing *consecutive* pairs matters: the first instance's incoming
 /// chain edge points at whatever pre-region node produced the initial
@@ -106,22 +110,32 @@ fn pair_isomorphic(graph: &Graph, start: usize, period: usize, m: usize) -> bool
     if start + (m + 2) * period > nodes.len() {
         return false;
     }
+    let left = start + m * period..start + (m + 1) * period;
+    let right = left.end..left.end + period;
+    let mut external = HashMap::new();
     for off in 0..period {
         let a = &nodes[start + m * period + off];
         let b = &nodes[start + (m + 1) * period + off];
-        if !ops_equivalent(&a.op, &b.op) || a.ty != b.ty || a.inputs.len() != b.inputs.len() {
+        if !ops_equivalent(&a.op, &b.op)
+            || a.ty != b.ty
+            || a.inputs.len() != b.inputs.len()
+            || a.requires_full_precision != b.requires_full_precision
+        {
             return false;
         }
         for (&ia, &ib) in a.inputs.iter().zip(b.inputs.iter()) {
             let ia = ia as usize;
             let ib = ib as usize;
-            if ib == ia + period {
-                continue; // lattice edge (in-block or chain)
+            if left.contains(&ia) || right.contains(&ib) {
+                if !left.contains(&ia) || !right.contains(&ib) || ib != ia + period {
+                    return false;
+                }
+            } else if nodes[ia].ty != nodes[ib].ty
+                || external.insert(ia, ib).is_some_and(|old| old != ib)
+                || (ib != ia + period && ib != ia && !(ia < start && ib < start))
+            {
+                return false;
             }
-            if ib == ia {
-                continue; // shared global
-            }
-            return false;
         }
     }
     true
@@ -203,6 +217,17 @@ pub fn detect_repeated_regions(graph: &Graph) -> Vec<Region> {
         if cand.period > MAX_PERIOD || cand.len() < MIN_COVERAGE {
             continue;
         }
+        if graph.nodes()[cand.start..cand.start + cand.period]
+            .iter()
+            .all(|node| {
+                matches!(
+                    node.op,
+                    Op::Input { .. } | Op::Parameter { .. } | Op::Constant { .. } | Op::Nop
+                )
+            })
+        {
+            continue;
+        }
         if accepted.iter().any(|r| r.overlaps(&cand)) {
             continue;
         }
@@ -244,6 +269,42 @@ mod tests {
         assert_eq!(r.period, 5);
         assert_eq!(r.count, 12);
         assert_eq!(r.start, 1); // node 0 is the input
+
+        let sorted = g.toposort();
+        let regions = detect_repeated_regions(&sorted);
+        assert!(!regions.is_empty());
+        assert!(regions.iter().all(|region| {
+            sorted.nodes()[region.start..region.start + region.period]
+                .iter()
+                .any(|node| !matches!(node.op, Op::Parameter { .. } | Op::Input { .. }))
+        }));
+        let mut split_precision = sorted;
+        let region = regions[0];
+        let at = region.start + region.period;
+        split_precision.nodes_mut()[at].requires_full_precision = true;
+        assert!(!pair_isomorphic(
+            &split_precision,
+            region.start,
+            region.period,
+            0
+        ));
+
+        let mut projected = Graph::new();
+        let mut h = projected.input("x", &[4, 16]);
+        let weights: Vec<_> = (0..12)
+            .map(|i| {
+                let weight = projected.parameter(&format!("w{i}"), &[16, 16]);
+                projected.neg(weight)
+            })
+            .collect();
+        for weight in weights {
+            h = projected.matmul(h, weight);
+            h = projected.relu(h);
+            h = projected.neg(h);
+        }
+        projected.set_outputs(vec![h]);
+        let regions = detect_repeated_regions(&projected.toposort());
+        assert!(regions.iter().any(|r| r.period == 3 && r.count >= 10));
     }
 
     #[test]

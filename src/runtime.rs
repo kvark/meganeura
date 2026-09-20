@@ -4,8 +4,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 mod checkpoint;
+pub(crate) mod search_state;
 mod tuning;
 pub use crate::tune::TuneOutcome;
+pub(crate) use tuning::KernelMemo;
 
 type Gpu = blade_graphics::Context;
 
@@ -2688,9 +2690,6 @@ pub struct Session {
     /// Pre-computed barrier groups: each range of dispatch indices shares one
     /// compute pass. Pass boundaries in blade emit ALL_COMMANDS barriers.
     groups: Vec<std::ops::Range<usize>>,
-    /// Retain partial-buffer identity when tuning collapses attention to one
-    /// dispatch, so repeated searches do not accumulate scratch allocations.
-    attention_partials: HashMap<BufferRef, BufferRef>,
     encoder: blade_graphics::CommandEncoder,
     /// Caller-selected upper bound on the submissions used by `step()`.
     /// See [`Session::set_submission_chunks`]. Always at least 1.
@@ -3565,7 +3564,6 @@ impl Session {
             coop_config,
             plan,
             groups,
-            attention_partials: HashMap::new(),
             encoder,
             submission_chunks: 1,
             sync_point: None,
@@ -3824,7 +3822,7 @@ impl Session {
     /// upper bound, since a short plan can produce fewer chunks. Profile the
     /// end-to-end workload on the target device: extra submissions have CPU
     /// and driver overhead and can make either workload slower.
-    /// [`Self::tune_submissions`] can measure this choice on initialized inputs
+    /// [`crate::train::build_measured`] can measure this choice on initialized inputs
     /// when optimizing this graph's latency without competing queue users.
     ///
     /// Correctness across the resulting submission boundaries does not need
@@ -6038,6 +6036,18 @@ impl Session {
             out,
             self.logical_host_visible(buf_ref),
         );
+    }
+
+    /// Read complete buffers as F32 views in one staged transfer, preserving
+    /// request order. Includes any declared padding, just like [`Self::read_buffer`].
+    /// Call after waiting for the producing step. Useful for full-output checks
+    /// without separately probing mapped reads for every allocation.
+    pub fn read_buffers(&self, buffers: &[BufferRef]) -> Vec<Vec<f32>> {
+        let requests: Vec<_> = buffers
+            .iter()
+            .map(|b| (self.buffers[b.0 as usize], self.plan.buffers[b.0 as usize]))
+            .collect();
+        self.read_f32_buffers(&requests, "buffer_readback")
     }
 
     /// Read back a graph output by index.

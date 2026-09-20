@@ -1,8 +1,6 @@
-//! Graph optimization with deterministic greedy rewrites by default and
-//! optional equality saturation through egglog. The current local rule set
-//! reaches the same useful forms with greedy rewriting at much lower build
-//! cost. Equality saturation retains alternatives for extraction using an
-//! expression-size or estimated tensor-traffic objective.
+//! Graph optimization through bounded equality saturation. Ordinary construction
+//! extracts a deterministic candidate; calibrated construction retains alternatives
+//! until their complete implementations can be measured.
 //!
 //! In outlined mode, graphs over `SATURATION_CUTOFF` are split into segments:
 //! repeated regions
@@ -18,6 +16,7 @@
 //! `Graph::toposort` restores it after passes that append nodes.
 
 use crate::graph::{Graph, Node, NodeId, Op, TensorType};
+pub(crate) mod search;
 use egglog::{Term, TermDag, TermId, ast::Literal};
 use std::collections::{HashMap, HashSet};
 use std::{fmt, time::Instant};
@@ -26,20 +25,16 @@ use std::{fmt, time::Instant};
 /// graph is segmented (see module docs). Shared-parameter graphs create
 /// large e-classes that make pattern matching superlinear: the SmolVLA
 /// training graph (~750 nodes) takes minutes unsegmented.
-const SATURATION_CUTOFF: usize = 300;
+pub(crate) const SATURATION_CUTOFF: usize = 300;
 
 /// Rewrite strategy used by the graph optimizer.
 ///
-/// Equality-saturation variants are primarily useful for controlled compiler
-/// ablations and future global rewrites. `Greedy` is the production strategy:
-/// for the current local rewrite set it extracts the same useful forms with
-/// far less compile-time overhead.
+/// Outlined saturation is the production strategy. Windowed and whole-graph
+/// modes expose the region-boundary tradeoff for compiler diagnostics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum OptimizeMode {
     /// Preserve the graph as written (apart from dead-code elimination).
     Off,
-    /// Apply the same rewrite patterns deterministically to a fixed point.
-    Greedy,
     /// Run equality saturation in fixed-size windows, without outlining.
     EgglogWindowed,
     /// Outline repeated regions, then saturate regions and residual windows.
@@ -52,7 +47,6 @@ impl OptimizeMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
-            Self::Greedy => "greedy",
             Self::EgglogWindowed => "egglog-windowed",
             Self::EgglogOutlined => "egglog-outlined",
             Self::EgglogWhole => "egglog-whole",
@@ -91,19 +85,19 @@ pub struct OptimizeConfig {
     /// with few channels over a large image sits near its boundary; this
     /// makes which side it should be on measurable without a rebuild.
     pub no_winograd: bool,
-    /// Pack consecutive SwiGLU ops into one packed parameter buffer during
-    /// the greedy sweep.
-    pub greedy_pack_swiglu: bool,
+    /// Pack SwiGLU projections into one derived parameter buffer.
+    #[serde(alias = "greedy_pack_swiglu")]
+    pub pack_swiglu: bool,
 }
 
 impl Default for OptimizeConfig {
     fn default() -> Self {
         Self {
-            mode: OptimizeMode::Greedy,
+            mode: OptimizeMode::EgglogOutlined,
             extraction_cost: ExtractionCost::TensorTraffic,
             saturation_cutoff: SATURATION_CUTOFF,
             no_winograd: false,
-            greedy_pack_swiglu: true,
+            pack_swiglu: true,
         }
     }
 }
@@ -342,7 +336,6 @@ pub(crate) fn optimize_owned_with_config(
 ) -> (Graph, OptimizeReport) {
     match config.mode {
         OptimizeMode::Off => optimize_off(graph, config),
-        OptimizeMode::Greedy => optimize_greedy(graph, config),
         OptimizeMode::EgglogWindowed | OptimizeMode::EgglogOutlined | OptimizeMode::EgglogWhole => {
             optimize_egglog(graph, config)
         }
@@ -378,7 +371,7 @@ fn optimize_egglog(mut g: Graph, config: OptimizeConfig) -> (Graph, OptimizeRepo
             &mut egglog_time,
             &mut extract_time,
             &mut extraction_failures,
-            config.extraction_cost,
+            config,
         );
     }
 
@@ -459,258 +452,6 @@ fn optimize_off(mut g: Graph, config: OptimizeConfig) -> (Graph, OptimizeReport)
             extraction_failures: 0,
         },
     )
-}
-
-fn optimize_greedy(mut g: Graph, config: OptimizeConfig) -> (Graph, OptimizeReport) {
-    let nodes_before = g.nodes().len();
-    let start = Instant::now();
-    let mut fusions = Vec::new();
-
-    loop {
-        let before = fusions.len();
-        apply_greedy_unary_simplifications(&mut g, &mut fusions);
-        apply_greedy_matmul_add(&mut g, &mut fusions);
-        apply_greedy_silu(&mut g, &mut fusions);
-        apply_greedy_swiglu(&mut g, &mut fusions);
-        if config.greedy_pack_swiglu {
-            apply_greedy_glu_packed(&mut g, &mut fusions, false);
-        }
-        apply_greedy_geglu(&mut g, &mut fusions);
-        apply_greedy_glu_packed(&mut g, &mut fusions, true);
-        if fusions.len() == before {
-            break;
-        }
-    }
-    sweep_dead_nodes(&mut g);
-    let extract_time = start.elapsed();
-    let nodes_after = g
-        .nodes()
-        .iter()
-        .filter(|node| !matches!(node.op, Op::Nop))
-        .count();
-    let rules_fired = summarize_fusions(&fusions);
-
-    (
-        g.into_toposort(),
-        OptimizeReport {
-            mode: config.mode,
-            extraction_cost: config.extraction_cost,
-            egglog_program: String::new(),
-            num_eclasses: 0,
-            num_enodes: 0,
-            rules_fired,
-            nodes_before,
-            nodes_after,
-            fusions_applied: fusions,
-            egglog_time: std::time::Duration::ZERO,
-            extract_time,
-            outlined_regions: 0,
-            segments: 0,
-            max_segment_nodes: 0,
-            extraction_failures: 0,
-        },
-    )
-}
-
-fn summarize_fusions(fusions: &[(String, u32)]) -> Vec<(String, usize)> {
-    let mut summary = Vec::new();
-    for fusion in fusions {
-        let name = &fusion.0;
-        if let Some(entry) = summary
-            .iter_mut()
-            .find(|entry: &&mut (String, usize)| entry.0 == *name)
-        {
-            entry.1 += 1;
-        } else {
-            summary.push((name.clone(), 1));
-        }
-    }
-    summary
-}
-
-fn apply_greedy_unary_simplifications(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
-    let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
-    for id in node_ids {
-        let (outer, inner_id) = {
-            let node = &graph.nodes()[id];
-            if node.inputs.len() != 1 {
-                continue;
-            }
-            (node.op.clone(), node.inputs[0])
-        };
-        let inner = graph.node(inner_id);
-        let (replacement, label) = match (outer, inner.op.clone()) {
-            (Op::Neg, Op::Neg) => (inner.inputs[0], "Neg(Neg(x))→x"),
-            (Op::Transpose, Op::Transpose) => (inner.inputs[0], "Transpose(Transpose(x))→x"),
-            (Op::Relu, Op::Relu) => (inner_id, "Relu(Relu(x))→Relu(x)"),
-            (
-                Op::RoPE {
-                    theta,
-                    pos_offset: 0,
-                    ..
-                }
-                | Op::RoPEGrad {
-                    theta,
-                    pos_offset: 0,
-                    ..
-                },
-                _,
-            ) if theta.is_finite()
-                && theta > 0.0
-                && graph.nodes()[id].ty.shape.first() == Some(&1) =>
-            {
-                (inner_id, "RoPE(position=0)→x")
-            }
-            _ => continue,
-        };
-        graph.nodes_mut()[id].op = Op::Identity;
-        graph.nodes_mut()[id].inputs = vec![replacement];
-        fusions.push((label.to_string(), id as u32));
-    }
-}
-
-fn apply_greedy_matmul_add(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
-    let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
-    for id in node_ids {
-        let (lhs, rhs) = {
-            let node = &graph.nodes()[id];
-            if !matches!(node.op, Op::Add) {
-                continue;
-            }
-            (node.inputs[0], node.inputs[1])
-        };
-        let (mm_id, addend) =
-            if matches!(graph.node(lhs).op, Op::MatMul | Op::MatMulAT | Op::MatMulBT) {
-                (lhs, rhs)
-            } else if matches!(graph.node(rhs).op, Op::MatMul | Op::MatMulAT | Op::MatMulBT) {
-                (rhs, lhs)
-            } else {
-                continue;
-            };
-        let mm = graph.node(mm_id);
-        let (op, label) = match mm.op {
-            Op::MatMul => (Op::FusedMatMulAdd, "MatMul+Add→FusedMatMulAdd"),
-            Op::MatMulAT => (Op::FusedMatMulATAdd, "MatMulAT+Add→FusedMatMulATAdd"),
-            Op::MatMulBT => (Op::FusedMatMulBTAdd, "MatMulBT+Add→FusedMatMulBTAdd"),
-            _ => unreachable!(),
-        };
-        let inputs = vec![mm.inputs[0], mm.inputs[1], addend];
-        graph.nodes_mut()[id].op = op;
-        graph.nodes_mut()[id].inputs = inputs;
-        fusions.push((label.to_string(), id as u32));
-    }
-}
-
-fn apply_greedy_silu(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
-    let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
-    for id in node_ids {
-        let (a, b) = {
-            let node = &graph.nodes()[id];
-            if !matches!(node.op, Op::Mul) {
-                continue;
-            }
-            (node.inputs[0], node.inputs[1])
-        };
-        let x = if matches!(graph.node(b).op, Op::Sigmoid) && graph.node(b).inputs[0] == a {
-            a
-        } else if matches!(graph.node(a).op, Op::Sigmoid) && graph.node(a).inputs[0] == b {
-            b
-        } else {
-            continue;
-        };
-        graph.nodes_mut()[id].op = Op::Silu;
-        graph.nodes_mut()[id].inputs = vec![x];
-        fusions.push(("Mul+Sigmoid→Silu".to_string(), id as u32));
-    }
-}
-
-fn apply_greedy_swiglu(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
-    let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
-    for id in node_ids {
-        let (a, b) = {
-            let node = &graph.nodes()[id];
-            if !matches!(node.op, Op::Mul) {
-                continue;
-            }
-            (node.inputs[0], node.inputs[1])
-        };
-        let (gate, up) = if matches!(graph.node(a).op, Op::Silu) {
-            (graph.node(a).inputs[0], b)
-        } else if matches!(graph.node(b).op, Op::Silu) {
-            (graph.node(b).inputs[0], a)
-        } else {
-            continue;
-        };
-        graph.nodes_mut()[id].op = Op::SwiGLU;
-        graph.nodes_mut()[id].inputs = vec![gate, up];
-        fusions.push(("Silu+Mul→SwiGLU".to_string(), id as u32));
-    }
-}
-
-fn apply_greedy_glu_packed(graph: &mut Graph, fusions: &mut Vec<(String, u32)>, gelu: bool) {
-    let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
-    for id in node_ids {
-        let (gate_id, up_id) = {
-            let node = &graph.nodes()[id];
-            if !matches!((&node.op, gelu), (Op::SwiGLU, false) | (Op::GeGLU, true)) {
-                continue;
-            }
-            (node.inputs[0], node.inputs[1])
-        };
-        let (h, wg, wu, transposed) = {
-            let gate = graph.node(gate_id);
-            let up = graph.node(up_id);
-            let transposed = match (&gate.op, &up.op) {
-                (&Op::MatMul, &Op::MatMul) => false,
-                (&Op::MatMulBT, &Op::MatMulBT) => true,
-                _ => continue,
-            };
-            if gate.inputs[0] != up.inputs[0] {
-                continue;
-            }
-            (gate.inputs[0], gate.inputs[1], up.inputs[1], transposed)
-        };
-        let requires_full_precision = graph.node(id as NodeId).requires_full_precision;
-        let Some(wide_mm) = pack_glu_matmul(graph, h, wg, wu, transposed, requires_full_precision)
-        else {
-            continue;
-        };
-        graph.nodes_mut()[id].op = if gelu {
-            Op::GeGLUConcat
-        } else {
-            Op::SwiGLUConcat
-        };
-        graph.nodes_mut()[id].inputs = vec![wide_mm];
-        let glu = if gelu { "GeGLU" } else { "SwiGLU" };
-        let matmul = if transposed { "MatMulBT" } else { "MatMul" };
-        fusions.push((
-            format!("{glu}({matmul},{matmul})→{glu}Concat({matmul})"),
-            id as u32,
-        ));
-    }
-}
-
-fn apply_greedy_geglu(graph: &mut Graph, fusions: &mut Vec<(String, u32)>) {
-    let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
-    for id in node_ids {
-        let (a, b) = {
-            let node = &graph.nodes()[id];
-            if !matches!(node.op, Op::Mul) {
-                continue;
-            }
-            (node.inputs[0], node.inputs[1])
-        };
-        let (gate, up) = if matches!(graph.node(a).op, Op::Gelu) {
-            (graph.node(a).inputs[0], b)
-        } else if matches!(graph.node(b).op, Op::Gelu) {
-            (graph.node(b).inputs[0], a)
-        } else {
-            continue;
-        };
-        graph.nodes_mut()[id].op = Op::GeGLU;
-        graph.nodes_mut()[id].inputs = vec![gate, up];
-        fusions.push(("Gelu+Mul→GeGLU".to_string(), id as u32));
-    }
 }
 
 fn pack_glu_matmul(
@@ -799,7 +540,7 @@ pub fn dump_egglog_program(graph: &Graph) -> String {
         ids,
         shifts: vec![0],
     };
-    segment_program(graph, &seg).0
+    segment_program(graph, &seg, true).0
 }
 
 // ---------------------------------------------------------------------------
@@ -822,19 +563,11 @@ fn plan_segments(g: &Graph, mode: OptimizeMode, saturation_cutoff: usize) -> Vec
         .iter()
         .filter(|n| !matches!(n.op, Op::Nop))
         .count();
-    if mode == OptimizeMode::EgglogWhole {
-        return vec![Segment {
-            ids: g
-                .nodes()
-                .iter()
-                .filter(|node| !matches!(node.op, Op::Nop))
-                .map(|node| node.id as usize)
-                .collect(),
-            shifts: vec![0],
-        }];
-    }
-
-    let saturation_cutoff = saturation_cutoff.max(1);
+    let saturation_cutoff = if mode == OptimizeMode::EgglogWhole {
+        n.max(1)
+    } else {
+        saturation_cutoff.max(1)
+    };
     let mut segments = Vec::new();
     let mut covered = vec![false; n];
     if mode == OptimizeMode::EgglogOutlined && active > saturation_cutoff {
@@ -874,7 +607,30 @@ fn plan_segments(g: &Graph, mode: OptimizeMode, saturation_cutoff: usize) -> Vec
             shifts: vec![0],
         });
     }
+    // A derivative may read a forward result, including an output shared with
+    // another kernel (for example cross-entropy logits gradients). Keep such
+    // cut edges opaque: reconstructing a forward expression under the backward
+    // root's precision policy can duplicate its producer and lose that identity.
     segments
+        .into_iter()
+        .flat_map(|seg| {
+            let (full, relaxed) = seg
+                .ids
+                .into_iter()
+                .partition(|&id| g.nodes()[id].requires_full_precision);
+            [
+                Segment {
+                    ids: relaxed,
+                    shifts: seg.shifts.clone(),
+                },
+                Segment {
+                    ids: full,
+                    shifts: seg.shifts,
+                },
+            ]
+        })
+        .filter(|seg| !seg.ids.is_empty())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -886,7 +642,7 @@ fn plan_segments(g: &Graph, mode: OptimizeMode, saturation_cutoff: usize) -> Vec
 /// ones added later — encodes through the arity-generic `Op1..Op6`
 /// constructors, tagged with the node id so ops with different
 /// attributes (eps, strides, head counts) never unify.
-fn egglog_prelude(prog: &mut String) {
+fn egglog_prelude(prog: &mut String, pack_swiglu: bool) {
     prog.push_str(
         "\
 (datatype Op
@@ -933,6 +689,9 @@ fn egglog_prelude(prog: &mut String) {
 (rewrite (Add ?d (MatMulAT ?a ?b))  (FusedMatMulATAdd ?a ?b ?d))
 (rewrite (Add (MatMulBT ?a ?b) ?d)  (FusedMatMulBTAdd ?a ?b ?d))
 (rewrite (Add ?d (MatMulBT ?a ?b))  (FusedMatMulBTAdd ?a ?b ?d))
+(rewrite (FusedMatMulAdd ?a ?b ?d) (Add (MatMul ?a ?b) ?d))
+(rewrite (FusedMatMulATAdd ?a ?b ?d) (Add (MatMulAT ?a ?b) ?d))
+(rewrite (FusedMatMulBTAdd ?a ?b ?d) (Add (MatMulBT ?a ?b) ?d))
 
 ; --- ONNX decomposed op recognition ---
 ; PyTorch decomposes compound ops when exporting to ONNX. These rules
@@ -945,21 +704,21 @@ fn egglog_prelude(prog: &mut String) {
 
 ; SwiGLU: silu(gate) * up
 (rewrite (Mul (Silu ?gate) ?up) (SwiGLU ?gate ?up))
-
-; Packed SwiGLU: gate and up projections sharing the input become one
-; wide matmul over a concatenated weight (the derived parameter is
-; created at stamp time; stamping falls back to the unpacked form when
-; the weights are not plain 2D parameters).
-(rewrite (SwiGLU (MatMul ?h ?wg) (MatMul ?h ?wu)) (SwiGLUPacked ?h ?wg ?wu))
-(rewrite (SwiGLU (MatMulBT ?h ?wg) (MatMulBT ?h ?wu)) (SwiGLUPackedBT ?h ?wg ?wu))
+(rewrite (Mul ?up (Silu ?gate)) (SwiGLU ?gate ?up))
 
 ; GeGLU: gelu(gate) * up, then the same HorizontalConcat packing as SwiGLU.
 (rewrite (Mul (Gelu ?gate) ?up) (GeGLU ?gate ?up))
+(rewrite (Mul ?up (Gelu ?gate)) (GeGLU ?gate ?up))
 (rewrite (GeGLU (MatMul ?h ?wg) (MatMul ?h ?wu)) (GeGLUPacked ?h ?wg ?wu))
 (rewrite (GeGLU (MatMulBT ?h ?wg) (MatMulBT ?h ?wu)) (GeGLUPackedBT ?h ?wg ?wu))
 
 ",
     );
+    if pack_swiglu {
+        // Stamping creates the derived weight, or retains separate projections
+        // when the operands are not compatible 2D parameters.
+        prog.push_str("(rewrite (SwiGLU (MatMul ?h ?wg) (MatMul ?h ?wu)) (SwiGLUPacked ?h ?wg ?wu))\n(rewrite (SwiGLU (MatMulBT ?h ?wg) (MatMulBT ?h ?wu)) (SwiGLUPackedBT ?h ?wg ?wu))\n");
+    }
     // Saturation is bounded: the deepest rewrite chain is three rules
     // (Mul(x, Sigmoid(x)) -> Silu, Mul(Silu, up) -> SwiGLU, then
     // SwiGLU(MatMul, MatMul) -> SwiGLUPacked), so three iterations reach
@@ -995,6 +754,22 @@ fn node_to_egglog_expr(node: &Node) -> String {
         Op::Input { .. } | Op::Parameter { .. } | Op::Constant { .. } => {
             format!("(Leaf {})", node.id)
         }
+        Op::RoPE {
+            theta,
+            pos_offset: 0,
+            ..
+        }
+        | Op::RoPEGrad {
+            theta,
+            pos_offset: 0,
+            ..
+        } if theta.is_finite()
+            && theta > 0.0
+            && node.ty.shape.first() == Some(&1)
+            && node.inputs.len() == 1 =>
+        {
+            format!("$n{}", node.inputs[0])
+        }
         Op::Nop => unreachable!("Nop nodes are filtered before encoding"),
         ref op => {
             let args: Vec<String> = node.inputs.iter().map(|i| format!("$n{}", i)).collect();
@@ -1017,7 +792,7 @@ fn node_to_egglog_expr(node: &Node) -> String {
 /// opaque `Leaf` terms, segment nodes are encoded in id order. Returns
 /// the program and the external node ids (needed to size their e-classes
 /// for traffic-aware extraction).
-fn segment_program(g: &Graph, seg: &Segment) -> (String, Vec<usize>) {
+fn segment_program(g: &Graph, seg: &Segment, pack_swiglu: bool) -> (String, Vec<usize>) {
     let idset: HashSet<usize> = seg.ids.iter().copied().collect();
     let mut externals: Vec<usize> = Vec::new();
     let mut seen = HashSet::new();
@@ -1036,7 +811,7 @@ fn segment_program(g: &Graph, seg: &Segment) -> (String, Vec<usize>) {
     externals.sort_unstable();
 
     let mut prog = String::new();
-    egglog_prelude(&mut prog);
+    egglog_prelude(&mut prog, pack_swiglu);
     for &e in &externals {
         prog.push_str(&format!("(let $n{} (Leaf {}))\n", e, e));
     }
@@ -1174,10 +949,10 @@ fn process_segment(
     egglog_time: &mut std::time::Duration,
     extract_time: &mut std::time::Duration,
     extraction_failures: &mut usize,
-    extraction_cost: ExtractionCost,
+    config: OptimizeConfig,
 ) {
     let egglog_start = Instant::now();
-    let (program, externals) = segment_program(g, seg);
+    let (program, externals) = segment_program(g, seg, config.pack_swiglu);
     if first_program.is_empty() {
         first_program.clone_from(&program);
     }
@@ -1192,7 +967,7 @@ fn process_segment(
         *egglog_time += egglog_start.elapsed();
         return;
     }
-    let cm = match extraction_cost {
+    let cm = match config.extraction_cost {
         ExtractionCost::AstSize => FusionCostModel::ast_size(),
         ExtractionCost::TensorTraffic => {
             let size_ids = externals.iter().copied().chain(seg.ids.iter().copied());
@@ -1837,8 +1612,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn greedy_is_the_production_default() {
-        assert_eq!(OptimizeConfig::default().mode, OptimizeMode::Greedy);
+    fn outlined_egglog_is_the_production_default() {
+        assert_eq!(OptimizeConfig::default().mode, OptimizeMode::EgglogOutlined);
     }
 
     #[test]
@@ -2009,11 +1784,13 @@ mod tests {
             let opt = optimize(&g);
             assert_eq!(
                 matches!(opt.node(opt.outputs()[0]).op, Op::Identity),
-                rows == 1 && offset == 0 && !dynamic
+                rows == 1 && offset == 0 && !dynamic,
+                "rows={rows}, offset={offset}, dynamic={dynamic}: {opt}"
             );
             assert_eq!(
                 matches!(opt.node(opt.outputs()[1]).op, Op::Identity),
-                rows == 1 && offset == 0
+                rows == 1 && offset == 0,
+                "rows={rows}, offset={offset}, dynamic={dynamic}: {opt}"
             );
         }
     }
@@ -2186,7 +1963,6 @@ mod tests {
         assert_eq!(off_report.mode, OptimizeMode::Off);
 
         for mode in [
-            OptimizeMode::Greedy,
             OptimizeMode::EgglogWindowed,
             OptimizeMode::EgglogOutlined,
             OptimizeMode::EgglogWhole,
@@ -2242,11 +2018,21 @@ mod tests {
                         g.swiglu(gate, up)
                     };
                     g.set_outputs(vec![out]);
-                    for mode in [
-                        OptimizeMode::Greedy,
-                        OptimizeMode::EgglogWhole,
-                        OptimizeMode::EgglogOutlined,
-                    ] {
+                    if !gelu {
+                        let (unpacked, _) = optimize_with_config(
+                            &g,
+                            OptimizeConfig {
+                                pack_swiglu: false,
+                                ..Default::default()
+                            },
+                        );
+                        assert!(unpacked.derived_params.is_empty());
+                        assert!(matches!(
+                            unpacked.node(unpacked.outputs()[0]).op,
+                            Op::SwiGLU
+                        ));
+                    }
+                    for mode in [OptimizeMode::EgglogWhole, OptimizeMode::EgglogOutlined] {
                         for extraction_cost in
                             [ExtractionCost::AstSize, ExtractionCost::TensorTraffic]
                         {

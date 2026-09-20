@@ -749,8 +749,6 @@ pub enum TuneScope {
     ConvDerivatives,
     /// Scalar forward, input gradient and weight gradient convolutions.
     Convolution,
-    /// Cached block attention, including the complete split/combine sequence.
-    Attention,
     All,
 }
 
@@ -760,7 +758,6 @@ impl TuneScope {
             Self::All => true,
             Self::Dense => class.conv2d.is_none(),
             Self::Convolution => class.conv2d.is_some(),
-            Self::Attention => false,
             Self::ConvDerivatives => {
                 class.conv2d.is_some() && class.shader != ShaderEntry::Conv2dGemm
             }
@@ -798,8 +795,7 @@ pub struct TuneOptions {
     #[serde(default)]
     pub scope: TuneScope,
     pub max_classes: usize,
-    /// GPU comparison scratch including staging, not pipelines. Attention can
-    /// also retain/grow its partial storage when installing a qualified choice.
+    /// GPU comparison scratch including staging, not pipelines.
     pub max_scratch_bytes: usize,
     /// Defaults to Download. Does not alter scratch binding placement,
     /// validation or kernel candidates.
@@ -952,7 +948,7 @@ pub struct TuneQualificationTimes {
 
 /// Evidence for one candidate comparison within an exact class. Times are
 /// batched scratch wall times per dispatch (per complete sequence when
-/// `candidate_split_k` is present or Class is [`TuneAttention`]), not GPU
+/// `candidate_split_k` is present), not GPU
 /// timestamps or whole-step latency.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TuneOutcome<Class = TuneClass, Choice = MatmulTile> {
@@ -1014,23 +1010,6 @@ impl<Class, Choice: Copy> TuneOutcome<Class, Choice> {
     }
 }
 
-/// Cached-attention contract. Positions are sampled across the cache capacity;
-/// measurements never read the live position or KV buffers.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct TuneAttention {
-    pub window_size: u32,
-    pub num_heads: u32,
-    pub num_kv_heads: u32,
-    pub head_dim: u32,
-    pub block_len: u32,
-    pub max_seq: u32,
-    pub positions: Vec<u32>,
-    /// Q, K, V, position, valid length, output, partials.
-    pub device_local: [bool; 7],
-    /// Declared bytes of the first six bindings; partials can be resized.
-    pub binding_bytes: Vec<usize>,
-}
-
 /// Per-comparison buffer requests, not driver heap sizes or peak VRAM.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TuneScratchUsage {
@@ -1055,14 +1034,13 @@ pub struct TuneScratchStats {
 pub struct TuneReport {
     pub options: TuneOptions,
     pub outcomes: Vec<TuneOutcome>,
-    /// Split count one denotes the single-dispatch implementation. Times are
-    /// per complete attention sequence, averaged over the recorded positions.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub attention_outcomes: Vec<TuneOutcome<TuneAttention, u32>>,
     pub eligible_classes: usize,
     /// Live search visits a bounded candidate set per class; explicit split-K
     /// probes accept up to four counts against the same unsplit control.
     pub visited_classes: usize,
+    /// Qualified selections reused inside one calibrated build, never globally.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reused_classes: Vec<(TuneClass, MatmulTile)>,
     pub excluded_dispatches: usize,
     pub class_limit_reached: bool,
     pub time_budget_exhausted: bool,
@@ -1073,70 +1051,6 @@ pub struct TuneReport {
     pub final_cleanup: Option<Duration>,
     #[serde(default)]
     pub scratch: Option<TuneScratchStats>,
-}
-
-/// Bounds for whole-graph scheduling probes after inputs are initialized.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TuneSubmissionOptions {
-    /// Search powers of two and this upper bound, at most 64 chunks.
-    pub max_chunks: usize,
-    pub max_time: Duration,
-    /// Private writable images, their bitwise references and the check flag;
-    /// excludes command/descriptor pools and pipelines owned by the driver.
-    pub max_scratch_bytes: usize,
-    pub warmup_runs: u32,
-    pub sample_pairs: usize,
-    pub min_improvement: f64,
-}
-
-impl Default for TuneSubmissionOptions {
-    fn default() -> Self {
-        let policy = TuneOptions::default();
-        Self {
-            max_chunks: 64,
-            max_time: policy.max_time,
-            max_scratch_bytes: policy.max_scratch_bytes,
-            warmup_runs: policy.warmup_runs,
-            sample_pairs: policy.sample_pairs,
-            min_improvement: policy.min_improvement,
-        }
-    }
-}
-
-impl TuneSubmissionOptions {
-    pub(crate) fn policy(&self) -> Result<TuneOptions, TuneError> {
-        if !(1..=64).contains(&self.max_chunks) {
-            return Err(TuneError("submission search supports 1 to 64 chunks"));
-        }
-        let policy = TuneOptions {
-            max_time: self.max_time,
-            max_scratch_bytes: self.max_scratch_bytes,
-            warmup_runs: self.warmup_runs,
-            sample_pairs: self.sample_pairs,
-            min_improvement: self.min_improvement,
-            dispatches_per_sample: 1,
-            ..Default::default()
-        };
-        policy.validate()?;
-        Ok(policy)
-    }
-}
-
-/// Scheduling evidence on initialized, representative graph inputs.
-/// Unlike kernel tuning, times cover one compiled graph's recording,
-/// submissions and completion. Input reset and bitwise checks are outside
-/// those samples, but inside `elapsed`. Runtime-appended optimizers are not run.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TuneSubmissionReport {
-    pub selected: usize,
-    pub max_chunks: usize,
-    pub options: TuneSubmissionOptions,
-    /// `qualified` means every writable allocation matched the original
-    /// schedule bit for bit on private copies, not just the final output.
-    pub outcomes: Vec<TuneOutcome<(), usize>>,
-    pub scratch_bytes: usize,
-    pub elapsed: Duration,
-    pub skipped: Option<TuneDecision>,
 }
 
 pub(crate) fn median(values: &[f64]) -> f64 {
@@ -1730,7 +1644,6 @@ mod tests {
             TuneScope::Dense,
             TuneScope::ConvDerivatives,
             TuneScope::Convolution,
-            TuneScope::Attention,
             TuneScope::All,
         ] {
             assert_eq!(

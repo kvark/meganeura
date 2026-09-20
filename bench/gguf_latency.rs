@@ -1,5 +1,5 @@
 //! Matched GGUF diagnostic; see gguf_latency.cpp for the llama.cpp counterpart.
-//! Usage: gguf_latency model.gguf output-prefix [tune-seconds] [all|dense|attention]
+//! Usage: gguf_latency model.gguf output-prefix [tune-seconds]
 //! GPU selection and precision use the usual SessionConfig environment options.
 
 use meganeura::{Graph, Session, SessionConfig, load::gguf};
@@ -13,13 +13,13 @@ const DECODE: usize = 32;
 const CONTEXT: usize = 256;
 const SAMPLES: usize = 7;
 
-fn run(
+fn set_inputs(
     session: &mut Session,
     model: &gguf::GgufModel,
     config: &gguf::arch::ModelConfig,
     position: usize,
     count: usize,
-) -> (Vec<f32>, [f64; 2]) {
+) {
     let tokens: Vec<u32> = (position..position + count)
         .map(|i| 42 + (i % 31) as u32)
         .collect();
@@ -38,6 +38,16 @@ fn run(
         .expect("per-layer embedding gather");
         session.set_input("ple", &ple);
     }
+}
+
+fn run(
+    session: &mut Session,
+    model: &gguf::GgufModel,
+    config: &gguf::arch::ModelConfig,
+    position: usize,
+    count: usize,
+) -> (Vec<f32>, [f64; 2]) {
+    set_inputs(session, model, config, position, count);
     let start = Instant::now();
     session.step();
     let submitted = Instant::now();
@@ -54,27 +64,25 @@ fn run(
     )
 }
 
+fn read_outputs(session: &Session) -> Vec<Vec<f32>> {
+    session.read_buffers(&session.plan().output_buffers)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     let args: Vec<_> = std::env::args().collect();
     assert!(
-        (3..=5).contains(&args.len()),
-        "gguf_latency model.gguf output-prefix [tune-seconds] [all|dense|attention]"
+        (3..=4).contains(&args.len()),
+        "gguf_latency model.gguf output-prefix [tune-seconds]"
     );
     let tune_seconds: u64 = args.get(3).map_or(Ok(0), |s| s.parse())?;
-    let scope = match args.get(4).map(String::as_str).unwrap_or("all") {
-        "all" => meganeura::tune::TuneScope::All,
-        "dense" => meganeura::tune::TuneScope::Dense,
-        "attention" => meganeura::tune::TuneScope::Attention,
-        _ => return Err("expected all, dense or attention tuning scope".into()),
-    };
     let started = Instant::now();
     let model = gguf::load_gguf(Path::new(&args[1]))?;
     let config = gguf::arch::ModelConfig::from_gguf(&model)?;
     let f32_activations = std::env::var_os("MEGANEURA_F32_ACTIVATIONS").is_some();
     let mut sessions = Vec::new();
     let mut tuning = Vec::new();
-    for block in [1, PROMPT] {
+    for block in [PROMPT, 1] {
         let mut graph = Graph::new();
         let built = gguf::graph::build(&mut graph, &model, &config, block, CONTEXT)?;
         graph.set_outputs(built.outputs());
@@ -87,44 +95,103 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cfg.options.quantized_activations = false;
         }
         let mut session = meganeura::build(&graph, cfg).0;
-        session.set_submission_chunks(1);
-        if tune_seconds != 0 {
-            tuning.push(session.tune_with(meganeura::tune::TuneOptions {
-                scope,
-                max_time: Duration::from_secs(tune_seconds),
-                max_classes: 64,
-                max_scratch_bytes: 256 * 1024 * 1024,
-                ..Default::default()
-            })?);
-        }
-        if let Some(decode) = sessions.first_mut() {
-            for (name, _) in session.plan().param_buffers.clone() {
-                if decode.has_parameter(&name) {
-                    session.share_parameter_from(decode, &name)?;
+        gguf::weights::load(&mut session, &model, &config)?;
+        gguf::weights::reset_caches(&mut session, &built, &config);
+        let position = if block == 1 { PROMPT + DECODE / 2 } else { 0 };
+        let mut initial_caches = Vec::new();
+        if let Some(prefill) = sessions.first_mut() {
+            run(prefill, &model, &config, 0, PROMPT);
+            for (name, _) in &prefill.plan().param_buffers {
+                if name.starts_with("cache.") {
+                    let values = prefill.read_params(&[name])[0].clone();
+                    session.set_parameter(name, &values);
+                    initial_caches.push((name.clone(), values));
                 }
             }
-        } else {
-            gguf::weights::load(&mut session, &model, &config)?;
-            gguf::weights::reset_caches(&mut session, &built, &config);
+        }
+        if tune_seconds != 0 {
+            if block == 1 {
+                for pos in PROMPT..position {
+                    run(&mut session, &model, &config, pos, 1);
+                }
+                for (name, values) in &mut initial_caches {
+                    *values = session.read_params(&[name])[0].clone();
+                }
+            }
+            run(&mut session, &model, &config, position, block);
+            let expected = read_outputs(&session);
+            let mut cfg = SessionConfig::inference_from_env_on(session.context());
+            cfg.tune = false;
+            cfg.cache = None;
+            if f32_activations {
+                cfg.options.quantized_activations = false;
+            }
+            drop(session);
+            let (selected, report) = meganeura::train::build_measured(
+                &graph,
+                cfg,
+                meganeura::train::BuildSearchOptions {
+                    max_time: Duration::from_secs(tune_seconds),
+                    max_plan_bytes: 4 << 30,
+                    tuning: meganeura::TuneOptions {
+                        max_classes: 64,
+                        max_scratch_bytes: 256 << 20,
+                        min_improvement: 0.01,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                |s, donor| {
+                    if let Some(source) = donor.or_else(|| sessions.first_mut()).filter(|source| {
+                        s.plan().param_buffers.iter().all(|(name, _)| {
+                            name.starts_with("cache.") || source.has_parameter(name)
+                        })
+                    }) {
+                        for (name, _) in s.plan().param_buffers.clone() {
+                            if !name.starts_with("cache.") {
+                                s.share_parameter_from(source, &name)
+                                    .map_err(|e| e.to_string())?;
+                            }
+                        }
+                    } else {
+                        gguf::weights::load(s, &model, &config).map_err(|e| e.to_string())?;
+                    }
+                    gguf::weights::reset_caches(s, &built, &config);
+                    for (name, values) in &initial_caches {
+                        s.set_parameter(name, values);
+                    }
+                    set_inputs(s, &model, &config, position, block);
+                    Ok(())
+                },
+                |s| {
+                    let actual = read_outputs(s);
+                    for (index, (a, b)) in actual.iter().zip(&expected).enumerate() {
+                        if a.len() != b.len()
+                            || a.iter().zip(b).any(|(&a, &b)| {
+                                !a.is_finite() || (a - b).abs() > 1e-5 + 1e-4 * b.abs()
+                            })
+                        {
+                            return Err(format!(
+                                "full output/cache {index} differs from untuned reference"
+                            ));
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
+            session = selected;
+            tuning.push(report);
+        }
+        if let Some(prefill) = sessions.first_mut() {
+            for (name, _) in session.plan().param_buffers.clone() {
+                if prefill.has_parameter(&name) {
+                    session.share_parameter_from(prefill, &name)?;
+                }
+            }
         }
         sessions.push(session);
     }
-    let mut scheduling = Vec::new();
-    if tune_seconds != 0 && matches!(scope, meganeura::tune::TuneScope::All) {
-        run(&mut sessions[1], &model, &config, 0, PROMPT);
-        for pos in PROMPT..PROMPT + DECODE {
-            run(&mut sessions[0], &model, &config, pos, 1);
-        }
-        for session in &mut sessions {
-            scheduling.push(
-                session.tune_submissions(meganeura::tune::TuneSubmissionOptions {
-                    max_scratch_bytes: 256 * 1024 * 1024,
-                    min_improvement: 0.01,
-                    ..Default::default()
-                })?,
-            );
-        }
-    }
+    sessions.swap(0, 1);
     let prepare_ms = started.elapsed().as_secs_f64() * 1000.0;
     let mut prefill_ms = Vec::new();
     let mut decode_ms = Vec::new();
@@ -166,7 +233,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "decode_record_finish_ms": decode_parts_ms,
         "dispatches": [sessions[1].plan().dispatches.len(), sessions[0].plan().dispatches.len()],
         "tuning": tuning,
-        "submission_tuning": scheduling,
     });
     std::fs::write(
         format!("{}.json", args[2]),

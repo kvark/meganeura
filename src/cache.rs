@@ -9,8 +9,8 @@ use std::{io, path::Path};
 
 /// Increment whenever the serialized execution plan or build pipeline changes
 /// in a way that can make an older plan unsafe to reuse.
-// Version 9 represents mutually exclusive dispatch implementations as an enum.
-const CACHE_FORMAT_VERSION: u32 = 9;
+// Version 10 changes default extraction and adds pre-allocation attention choices.
+const CACHE_FORMAT_VERSION: u32 = 10;
 
 /// Cached execution plan with a graph fingerprint for invalidation.
 #[derive(Serialize, Deserialize)]
@@ -422,7 +422,7 @@ mod tests {
                 ..defaults
             },
             OptimizeConfig {
-                mode: OptimizeMode::EgglogOutlined,
+                mode: OptimizeMode::EgglogWhole,
                 ..defaults
             },
             OptimizeConfig {
@@ -435,6 +435,10 @@ mod tests {
             },
             OptimizeConfig {
                 no_winograd: true,
+                ..defaults
+            },
+            OptimizeConfig {
+                pack_swiglu: false,
                 ..defaults
             },
         ] {

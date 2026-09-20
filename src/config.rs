@@ -163,14 +163,14 @@ registry! {
     DUMP_WGSL: "MEGANEURA_DUMP_WGSL", Text, Diagnostic,
         "Directory to write every generated/parsed WGSL shader into.";
     OPTIMIZER: "MEGANEURA_OPTIMIZER", Text, Diagnostic,
-        "Rewrite mode: off | greedy | egglog-windowed | egglog-outlined | egglog-whole.";
+        "Rewrite mode: off | egglog-windowed | egglog-outlined (default) | egglog-whole.";
     EGRAPH_COST: "MEGANEURA_EGRAPH_COST", Text, Diagnostic,
         "Extraction objective: ast-size | tensor-traffic.";
     EGRAPH_CUTOFF: "MEGANEURA_EGRAPH_CUTOFF", U32, Diagnostic,
         "Saturation segment-size ceiling (default 300).";
     GREEDY_PACK_SWIGLU: "MEGANEURA_GREEDY_PACK_SWIGLU", Bool, Diagnostic,
         "Set to 0 to skip packing consecutive SwiGLU ops into one parameter buffer \
-         during the greedy sweep.";
+         during graph optimization (legacy environment variable name).";
     DEVICE_PARAMETERS: "MEGANEURA_DEVICE_PARAMETERS", Text, Diagnostic,
         "Experimental placement of unaliased parameter buffers on the device: \
          1 → device-transient, device-buddy → device (default: host-visible).";
@@ -215,7 +215,7 @@ registry! {
 impl OptimizeConfig {
     /// Read benchmark-oriented overrides while retaining production defaults.
     ///
-    /// - `MEGANEURA_OPTIMIZER=off|greedy|egglog-windowed|egglog-outlined|egglog-whole`
+    /// - `MEGANEURA_OPTIMIZER=off|egglog-windowed|egglog-outlined|egglog-whole`
     /// - `MEGANEURA_EGRAPH_COST=ast-size|tensor-traffic`
     /// - `MEGANEURA_EGRAPH_CUTOFF=<positive integer>`
     /// - `MEGANEURA_NO_WINOGRAD`
@@ -228,13 +228,18 @@ impl OptimizeConfig {
         if let Some(value) = OPTIMIZER.text() {
             config.mode = match value.as_str() {
                 "off" => OptimizeMode::Off,
-                "greedy" => OptimizeMode::Greedy,
+                "greedy" => {
+                    log::warn!(
+                        "MEGANEURA_OPTIMIZER=greedy now uses the shared outlined egglog optimizer"
+                    );
+                    OptimizeMode::EgglogOutlined
+                }
                 "egglog-windowed" | "windowed" => OptimizeMode::EgglogWindowed,
                 "egglog-outlined" | "outlined" => OptimizeMode::EgglogOutlined,
                 "egglog-whole" | "whole" => OptimizeMode::EgglogWhole,
                 _ => {
-                    log::warn!("unknown MEGANEURA_OPTIMIZER={value:?}; using greedy");
-                    OptimizeMode::Greedy
+                    log::warn!("unknown MEGANEURA_OPTIMIZER={value:?}; using outlined egglog");
+                    OptimizeMode::EgglogOutlined
                 }
             };
         }
@@ -255,7 +260,7 @@ impl OptimizeConfig {
                 log::warn!("MEGANEURA_EGRAPH_CUTOFF must be > 0; using the default");
             }
         }
-        config.greedy_pack_swiglu = GREEDY_PACK_SWIGLU.bool_or(true);
+        config.pack_swiglu = GREEDY_PACK_SWIGLU.bool_or(true);
         config
     }
 }

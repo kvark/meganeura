@@ -15,8 +15,8 @@
 
 Define a graph, call `build_session`, train. Meganeura handles autodiff,
 graph rewrites, WGSL specialization, Naga parsing and validation, and GPU
-dispatch automatically. The rewrite engine supports a fast deterministic
-greedy mode and experimental equality-saturation modes.
+dispatch automatically. Graph rewriting uses bounded equality saturation
+through egglog.
 
 ```rust
 use meganeura::{Graph, Trainer, TrainConfig, build_session};
@@ -149,6 +149,11 @@ MEGANEURA_DEVICE_ID=0x744c cargo run --release --example mnist
 
 All of the environment variables are resolved in `SessionConfig::from_env()` and never visible to the core modules directly.
 
+For joint graph and implementation search with representative inputs, use
+`train::build_measured` with initialization and numerical-qualification callbacks.
+It replaces live attention/submission retuning; ordinary `build` does not execute
+an uninitialized model. See [compiler search](docs/compiler-search.md).
+
 | Variable | Effect |
 |---|---|
 | `MEGANEURA_DISABLE_COOP` | Force the portable scalar matmul path (regression diagnosis). |
@@ -162,10 +167,10 @@ All of the environment variables are resolved in `SessionConfig::from_env()` and
 | `MEGANEURA_PIN_BUFS=3,25-40` | Force-pin logical buffers to bisect aliasing corruption. |
 | `MEGANEURA_DUMP_PLAN` | Dump dispatch order, provenance, and the alias map at build. |
 | `MEGANEURA_DUMP_WGSL=<dir>` | Write every generated shader into `<dir>`. |
-| `MEGANEURA_OPTIMIZER` | Rewrite mode: `off` \| `greedy` \| `egglog-windowed` \| `egglog-outlined` \| `egglog-whole`. |
+| `MEGANEURA_OPTIMIZER` | Rewrite mode: `off` \| `egglog-windowed` \| `egglog-outlined` (default) \| `egglog-whole`. Legacy `greedy` maps to outlined egglog. |
 | `MEGANEURA_EGRAPH_COST` | Extraction objective: `ast-size` \| `tensor-traffic`. |
 | `MEGANEURA_EGRAPH_CUTOFF=<n>` | Saturation segment-size ceiling (default 300). |
-| `MEGANEURA_GREEDY_PACK_SWIGLU=0` | Skip packing consecutive SwiGLU ops into one parameter buffer during the greedy sweep. |
+| `MEGANEURA_GREEDY_PACK_SWIGLU=0` | Skip packing consecutive SwiGLU ops into one parameter buffer during graph optimization (legacy variable name). |
 | `MEGANEURA_DEVICE_PARAMETERS` | Experimental placement of unaliased parameter buffers on the device: `1` → device-transient, `device-buddy` → device. Default is host-visible. |
 | `MEGANEURA_REUSE_UPLOAD` | Reuse one staging buffer across `set_parameter` uploads instead of restaging per parameter. |
 | `MEGANEURA_TUNE` | Opt-in bounded matmul, convolution and GEMV search at build (`SessionConfig { tune: true }`), using private scratch. Scalar tiles and GEMV shapes also support reduced-storage weights. |

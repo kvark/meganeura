@@ -100,7 +100,7 @@ impl WeightFormat {
 /// participates in the plan-cache fingerprint automatically. Defaults come
 /// from capability-signature heuristics plus `MEGANEURA_FLASH_*` env
 /// overrides; a session-build tuner can substitute measured values instead.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TuningKnobs {
     /// Elements-per-thread cap for flash-attention forward codegen.
     pub flash_ept_cap: u32,
@@ -174,6 +174,10 @@ pub struct CompileOptions {
     /// faster. Set it to pin a shape for a benchmark or a reproduction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gemv_shape: Option<crate::codegen::GemvShape>,
+    /// Cached-attention implementation: 1 is unsplit, 2..=16 use partials.
+    /// None retains the ordinary lowering; measured construction searches this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_attention_splits: Option<u32>,
     /// Quantize the activation row to Q8_1 inside the K-split GEMV and do
     /// the inner product with integer dot products, for the weight formats
     /// that have an int-dot kernel (GGML Q4_0 and Meganeura Q8).
@@ -198,6 +202,7 @@ impl Default for CompileOptions {
             flash_forward_coop: true,
             flash_backward_coop: false,
             gemv_shape: None,
+            cached_attention_splits: None,
             quantized_activations: true,
         }
     }
@@ -1162,7 +1167,7 @@ impl Dispatch {
 pub struct BufferRef(pub u32);
 
 /// The complete execution plan: a static sequence of dispatches.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionPlan {
     /// Buffer sizes in bytes, indexed by BufferRef.
     pub buffers: Vec<usize>,
@@ -3392,8 +3397,8 @@ impl<'a> Compiler<'a> {
                 let a = self.get_buffer(node.inputs[0]);
                 let b = self.get_buffer(node.inputs[1]);
                 let d = self.get_buffer(node.inputs[2]);
-                // Same block-axis mismatch as `Op::MatMulBT`. Greedy mode
-                // rewrites `Add(MatMulBT, ?)` into this op before compile,
+                // Same block-axis mismatch as `Op::MatMulBT`. Graph rewrites
+                // can fuse `Add(MatMulBT, ?)` into this op before compile,
                 // so the unfused assert would never see a quantized B.
                 assert!(
                     !WeightFormat::from_dtype(self.graph.node(node.inputs[1]).ty.dtype)
@@ -5108,14 +5113,18 @@ impl<'a> Compiler<'a> {
                     splits: 0,
                     chunk: 0,
                 };
-                // Flash-decoding split-K: for a single decode query past a
-                // threshold, split the KV range across workgroups per head
-                // and combine their online-softmax partials. Batched prefill
-                // stays on CachedBlockAttention: the split shader's slices
-                // are a decode-only layout, and applying them independently
-                // to every query produces incorrect causal attention.
-                if block_len == 1 && max_seq > 64 {
-                    let splits = (max_seq.div_ceil(32)).clamp(2, 16);
+                let splits = self.options.cached_attention_splits.unwrap_or_else(|| {
+                    if block_len == 1 && max_seq > 64 {
+                        (max_seq.div_ceil(32)).clamp(2, 16)
+                    } else {
+                        1
+                    }
+                });
+                assert!(
+                    (1..=16).contains(&splits),
+                    "cached attention needs 1..=16 splits"
+                );
+                if splits > 1 {
                     params.splits = splits;
                     params.chunk = max_seq.div_ceil(splits);
                     let scratch_idx = self.plan.buffers.len() as u32;

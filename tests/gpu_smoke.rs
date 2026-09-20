@@ -1687,6 +1687,13 @@ fn batched_parameter_read_matches_uploaded_values() {
 
     let values = session.read_params(&["b", "a"]);
     assert_eq!(values, [b_values.to_vec(), a_values.to_vec()]);
+    let a = session.param_buffer("a").unwrap();
+    let b = session.param_buffer("b").unwrap();
+    assert_eq!(
+        session.read_buffers(&[b, a, b]),
+        [b_values.to_vec(), a_values.to_vec(), b_values.to_vec()]
+    );
+    assert!(session.read_buffers(&[]).is_empty());
 }
 
 #[test]
@@ -4055,7 +4062,7 @@ fn q6k_preserves_subnormal_block_scales() {
     }
 }
 
-/// Default greedy packing concatenates SwiGLU gate/up into one matmul.
+/// Default extraction concatenates SwiGLU gate/up into one matmul.
 /// `set_parameter_packed` has to restage that derived buffer; uploading
 /// only the named sources leaves the fused weight uninitialized.
 #[test]
@@ -4175,7 +4182,7 @@ fn gguf_repacked_matmuls_match_reference() {
 }
 
 /// Packed blocks run along the parameter's first dimension, which differs
-/// from K for transposed B. Cover the plain, greedy add-fused, and epilogue
+/// from K for transposed B. Cover the plain, add-fused, and epilogue
 /// routes without emitting a GPU shader for any of them.
 #[test]
 fn block_quantized_matmul_bt_variants_are_refused() {
