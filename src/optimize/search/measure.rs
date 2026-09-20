@@ -181,6 +181,7 @@ pub fn select(
                 }
                 Ok(()) => {}
                 Err(error) => {
+                    log::warn!("program {index} qualification failed: {error}");
                     trial.outcome.qualified = false;
                     trial.outcome.selected = report.selected;
                     trial.outcome.decision = TuneDecision::InvalidOutput;
@@ -189,6 +190,13 @@ pub fn select(
             }
         }
         trial.outcome.elapsed = trial_start.elapsed();
+        log::info!(
+            "program {index}: {:?}, selected={}, {:?}/{:?} ms",
+            trial.outcome.decision,
+            trial.outcome.selected,
+            trial.outcome.baseline_median_ms,
+            trial.outcome.candidate_median_ms
+        );
         report.trials.push(trial);
     }
     report.truncated |= start.elapsed() >= options.max_time || programs.next().is_some();
