@@ -68,7 +68,46 @@ For separate captures, use `MEGANEURA_GPU_TIMING=1` or llama.cpp's
 `GGML_VK_PERF_LOGGER=1`. Instrumentation changes execution; wall time minus
 summed pass intervals is not a measurement of barrier cost.
 
-## Measured checkpoint and experiment history
+## Calibrated-construction checkpoint, 2026-09-20
+
+Exact `789bcb60e82d8a2993a440acb500bf53b797cbeb` versus
+`b06629cb19467ac00e75f3b383bd3ef70442d2a7`, two fresh processes per arm and
+GPU, reversing the second pair. Same model, inputs, precision and host/device
+setup as below; GPUs and builds ran sequentially. These are diagnostics, not a
+new publication cohort or a new llama.cpp comparison.
+
+Median of process medians; execution in milliseconds, preparation in seconds:
+
+| GPU | Prefill before / after | Decode before / after | Preparation before / after |
+| --- | ---: | ---: | ---: |
+| RTX 5070 | 7.251 / 7.404 | 1.425 / 1.463 | 15.40 / 37.77 |
+| Arc B570 | 14.060 / 14.062 | 3.871 / 3.786 | 31.75 / 63.76 |
+
+NVIDIA is about 2–3% slower in these aggregate medians. Decode process medians
+range from 1.392–1.458 before to 1.460–1.466 after. Intel's ranges are
+3.865–3.877 before and 3.541–4.032 after; the apparent aggregate improvement is
+not a stable gain. No performance-neutrality claim is made.
+
+Preparation is not measured under an identical policy: the old diagnostic gave
+each session 30 seconds of isolated kernel tuning plus a separate submission
+search. The new 30-second construction budget includes allocation, initialization,
+full output/state qualification and whole-program comparisons. Reference priming
+is additional. Full staged readback avoids repeated mapped-read probes without
+dropping checked values. Rebuilding candidates remains costly, particularly on
+Intel; avoiding that cost is unfinished work.
+
+All eight full-logit sets are finite and match all 33 independent CPU-reference
+token choices. Maximum per-row relative L2 is 1.33e-5 on NVIDIA and 1.77e-4 on
+Intel. Some NVIDIA prefill alternatives fail the stricter whole-output gate and
+are discarded. The selected programs retain that gate.
+
+This GGUF graph's outlined region contains cache writes, so logical alternative
+extraction is explicitly skipped. This check exercises the shared rewrite engine,
+kernel choices, pre-allocation attention choices and submission search; it does
+not demonstrate a graph-alternative win. NVIDIA exhausts the generated choices;
+Intel reaches the time bound. See [the design and remaining limits](../docs/compiler-search.md).
+
+## Earlier measured checkpoint and experiment history
 
 The source-only branch `experiment/llama-catchup-pre-cleanup-2026-09-20` at
 `137f93364afe06cfff89c888efddb6bb05c54d33` preserves the implementations,
