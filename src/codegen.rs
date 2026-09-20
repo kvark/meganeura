@@ -3759,26 +3759,18 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     }
 }
 
-/// Cooperative-matrix flash attention forward (Phase 1).
+/// Cooperative-matrix flash attention forward experiment: both QK and PV
+/// use f16-input, f32-accumulating matrix products. Softmax and the running
+/// output remain f32. Probabilities for each tile are rounded to f16 for PV.
 ///
-/// Replaces only the QK^T product with a `coop_mat` MMA — softmax and
-/// PV stay scalar — to keep the change tractable and validate the
-/// coop path before tackling PV. Critical design point: the O
-/// accumulator is held in *registers* across the entire KV loop (not
-/// re-staged through shared memory each iteration), and the per-row
-/// rescale runs INSIDE the same thread that owns the accumulator.
-/// Each row's softmax math is duplicated 4× (once per d-chunk) but
-/// that's a small constant (16 ops/row) vs the cost of the shared-mem
-/// roundtrip.
-///
-/// Workgroup layout (64 threads = 16 rows × 4 d-chunks):
+/// Workgroup layout (32 threads = 16 rows × 2 d-chunks):
 ///   * `BQ = 16`, `BKV = 16` — match the coop_mat tile size.
 ///   * Each thread owns one (row, d_chunk) pair: holds
 ///     `O_acc[chunk_hd]` and `local_max` / `local_sum` in registers.
 ///   * Q is staged once per workgroup into shared as f16 [BQ × hd].
 ///   * K is staged per KV tile, **transposed** into shared as f16
 ///     [hd × BKV] so the MMA reads it as the B operand for Q @ K^T.
-///   * V is staged per KV tile as f16 [BKV × hd] for the scalar PV.
+///   * V is staged per KV tile as f16 [BKV × hd].
 ///   * The score tile (after MMA) goes to shared_score[BQ × BKV];
 ///     each thread reads its row's BKV scores and runs softmax
 ///     locally.
@@ -3813,6 +3805,8 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
     let _ = writeln!(src, "var<workgroup> shared_q: array<f16, {}>;", bq * hd);
     let _ = writeln!(src, "var<workgroup> shared_k_t: array<f16, {}>;", hd * bkv);
     let _ = writeln!(src, "var<workgroup> shared_v: array<f16, {}>;", bkv * hd);
+    let _ = writeln!(src, "var<workgroup> shared_p: array<f16, {}>;", bq * bkv);
+    let _ = writeln!(src, "var<workgroup> shared_pv: array<f32, {}>;", bq * hd);
     let _ = writeln!(
         src,
         "var<workgroup> shared_score: array<f32, {}>;",
@@ -3929,7 +3923,7 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
     src.push_str("        workgroupBarrier();\n\n");
 
     // Per-thread row softmax + PV. Each thread owns one (row, chunk).
-    // The 4 chunks of a row redundantly compute the same row max/sum
+    // The chunks of a row redundantly compute the same row max/sum
     // (16 mul/add/exp ops per row — small constant).
     src.push_str("        var rowmax = -1e30;\n");
     let _ = writeln!(src, "        for (var j = 0u; j < {bkv}u; j = j + 1u) {{");
@@ -3952,7 +3946,7 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
     src.push_str("            local_o[e] = local_o[e] * correction;\n");
     src.push_str("        }\n");
 
-    // PV: for each j compute p_j = exp(score-new_max), accumulate into local_o.
+    // Stage softmax probabilities for a cooperative PV product.
     src.push_str("        var rowsum = 0.0;\n");
     let _ = writeln!(src, "        for (var j = 0u; j < {bkv}u; j = j + 1u) {{");
     src.push_str("            let kv_pos = t + j;\n");
@@ -3967,13 +3961,37 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
     src.push_str("            rowsum = rowsum + p;\n");
     let _ = writeln!(
         src,
-        "            for (var e = 0u; e < {chunk_hd}u; e = e + 1u) {{"
+        "            if chunk == 0u {{ shared_p[row * {bkv}u + j] = f16(p); }}"
+    );
+    src.push_str("        }\n");
+    src.push_str("        workgroupBarrier();\n");
+    let _ = writeln!(
+        src,
+        "        let probabilities = coopLoadT<coop_mat16x16<f16,A>>(&shared_p[0], {bkv}u);"
     );
     let _ = writeln!(
         src,
-        "                local_o[e] = local_o[e] + p * f32(shared_v[j * {hd}u + d_off + e]);"
+        "        for (var ot = 0u; ot < {hd_tiles}u; ot = ot + 1u) {{"
     );
-    src.push_str("            }\n");
+    let _ = writeln!(
+        src,
+        "            let values = coopLoadT<coop_mat16x16<f16,B>>(&shared_v[ot * 16u], {hd}u);"
+    );
+    src.push_str("            let product = coopMultiplyAdd(probabilities, values, coop_mat16x16<f32,C>());\n");
+    let _ = writeln!(
+        src,
+        "            coopStoreT(product, &shared_pv[ot * 16u], {hd}u);"
+    );
+    src.push_str("        }\n");
+    src.push_str("        workgroupBarrier();\n");
+    let _ = writeln!(
+        src,
+        "        for (var e = 0u; e < {chunk_hd}u; e = e + 1u) {{"
+    );
+    let _ = writeln!(
+        src,
+        "            local_o[e] = local_o[e] + shared_pv[row * {hd}u + d_off + e];"
+    );
     src.push_str("        }\n");
     src.push_str("        local_sum = local_sum * correction + rowsum;\n");
     src.push_str("        local_max = select(local_max, new_max, q_valid);\n");
@@ -4015,7 +4033,7 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
     );
     src.push_str("            dst[q_base + d_off + e] = local_o[e] / safe_sum;\n");
     src.push_str("        }\n");
-    // LSE: only the first chunk-thread per row writes (avoids 4-way duplicate write).
+    // Only the first chunk-thread writes LSE.
     src.push_str("        if chunk == 0u {\n");
     src.push_str("            let idx = (qpos * num_heads + head) * 2u;\n");
     src.push_str("            lse[idx] = local_max;\n");
