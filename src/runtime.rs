@@ -1078,6 +1078,7 @@ fn epilogue_tile(dispatch: &Dispatch) -> crate::codegen::MatMulTile {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Variant {
     SplitMatmul(ShaderEntry, crate::codegen::ScalarMatmulShape, u32),
+    SplitCooperativeMatmul(ShaderEntry, u32),
     SpecializedConv(ShaderEntry, Vec<u32>, u32),
     ScalarMatmul(
         ShaderEntry,
@@ -1176,6 +1177,7 @@ impl Variant {
             Variant::Attention(ref e, _)
             | Variant::CooperativeAttention(ref e, _, _)
             | Variant::SplitMatmul(ref e, _, _)
+            | Variant::SplitCooperativeMatmul(ref e, _)
             | Variant::SpecializedConv(ref e, _, _)
             | Variant::ScalarMatmul(ref e, _, _)
             | Variant::Epilogue(ref e, _)
@@ -1200,6 +1202,9 @@ impl Variant {
         match *self {
             Variant::SplitMatmul(ref e, shape, splits) => {
                 format!("{e:?}:split-{splits}-{shape:?}")
+            }
+            Variant::SplitCooperativeMatmul(ref e, splits) => {
+                format!("{e:?}:cooperative-split-{splits}")
             }
             Variant::ScalarMatmul(ref e, format, shape) => {
                 format!("{e:?}:scalar-{format:?}-{shape:?}")
@@ -1364,6 +1369,18 @@ impl Pipelines {
             }
             Variant::SplitMatmul(_, shape, splits) => {
                 crate::codegen::generate_split_matmul(group, shape, splits)
+            }
+            Variant::SplitCooperativeMatmul(_, splits) => {
+                if gpu.capabilities().fixed_compute_subgroup_size != Some(32)
+                    || dispatch.requires_full_precision
+                    || !coop_config
+                        .is_some_and(|c| c.tile_size == 16 && c.use_f16_input && !c.compensated)
+                {
+                    return Err(
+                        "cooperative split-K requires fixed 32-lane F16 support and policy".into(),
+                    );
+                }
+                crate::codegen::generate_split_cooperative_matmul(group, splits)
             }
             Variant::ScalarMatmul(_, _, shape) => tuning::tile_module(
                 dispatch,
@@ -1536,6 +1553,9 @@ impl Pipelines {
     /// which unrelated pipelines happen to have been compiled.
     fn key(dispatch: &Dispatch) -> Variant {
         let entry = dispatch.shader.clone();
+        if let crate::compile::Kernel::SplitCooperativeMatmul { splits } = dispatch.kernel {
+            return Variant::SplitCooperativeMatmul(entry, splits);
+        }
         if let crate::compile::Kernel::SplitMatmul { shape, splits } = dispatch.kernel {
             return Variant::SplitMatmul(entry, shape, splits);
         }
@@ -2141,7 +2161,11 @@ pub(crate) fn select_variants(
         for dispatch in &mut plan.dispatches {
             if dispatch.conv_k_tile().is_some()
                 || dispatch.scalar_matmul().is_some()
-                || matches!(dispatch.kernel, crate::compile::Kernel::SplitMatmul { .. })
+                || matches!(
+                    dispatch.kernel,
+                    crate::compile::Kernel::SplitMatmul { .. }
+                        | crate::compile::Kernel::SplitCooperativeMatmul { .. }
+                )
             {
                 continue;
             }
@@ -2345,7 +2369,11 @@ pub(crate) fn select_variants(
             if dispatch.use_coop()
                 || dispatch.use_small_tiles()
                 || dispatch.scalar_matmul().is_some()
-                || matches!(dispatch.kernel, crate::compile::Kernel::SplitMatmul { .. })
+                || matches!(
+                    dispatch.kernel,
+                    crate::compile::Kernel::SplitMatmul { .. }
+                        | crate::compile::Kernel::SplitCooperativeMatmul { .. }
+                )
                 || dispatch.weight_format.uses_reduced_storage()
             {
                 continue;

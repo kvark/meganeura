@@ -1078,6 +1078,10 @@ pub enum Kernel {
     CooperativeAttention {
         query_tiles: u32,
     },
+    /// F16 cooperative partials followed by the existing split-K reduction.
+    SplitCooperativeMatmul {
+        splits: u32,
+    },
     SpecializedConv {
         k_tile: u32,
     },

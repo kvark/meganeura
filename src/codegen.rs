@@ -1949,6 +1949,68 @@ pub(crate) fn generate_split_matmul(
     ShaderModule::new(&source)
 }
 
+/// One 32-lane subgroup computes four 16x16 F16 cooperative partial tiles.
+/// Reuse the canonical staging and masked epilogue store, including ragged
+/// row/column tails. Unmasked cooperative stores could overwrite the next split.
+pub(crate) fn generate_split_cooperative_matmul(group: ShaderGroup, splits: u32) -> ShaderModule {
+    use crate::schedule::{PointwiseDAG, Pw};
+    assert!(matches!(
+        group,
+        ShaderGroup::MatMul | ShaderGroup::MatMulAT | ShaderGroup::MatMulBT
+    ));
+    let config = CoopConfig {
+        tile_size: 16,
+        use_f16_input: true,
+        compensated: false,
+    };
+    let identity = crate::compile::MatMulEpilogue {
+        dag: PointwiseDAG {
+            n_inputs: 1,
+            ops: vec![Pw::LoadInput(0)],
+            output: 0,
+        },
+        inputs: Vec::new(),
+    };
+    let mut source = generate_coop_matmul_with_dag_epilogue(group, &config, &identity).source;
+    source = substitute(&source, "@workgroup_size(64)", "@workgroup_size(32)");
+    // The original vector staging covers 256 elements with 64 threads. Cover
+    // the same elements in two rounds before the single subgroup's MMA.
+    source = substitute(
+        &source,
+        "// Stage sa0:",
+        "for (var staging_round = 0u; staging_round < 2u; staging_round++) {\n        let v4_row = (lid.x + staging_round * 32u) >> 2u;\n        let v4_col = (lid.x & 3u) << 2u;\n        // Stage sa0:",
+    );
+    source = substitute(
+        &source,
+        "        workgroupBarrier();\n\n        // Cooperative matrix multiply-add:",
+        "        }\n        workgroupBarrier();\n\n        // Cooperative matrix multiply-add:",
+    );
+    source = substitute(&source, "e < 16u", "e < 32u");
+    source = substitute(
+        &source,
+        "let local_idx = lid.x + e * 64u;",
+        "let local_idx = lid.x + e * 32u;",
+    );
+    source = substitute(
+        &source,
+        "var t = 0u;",
+        &format!(
+            "let tiles = (k + 15u) / 16u;\n\
+         let start_tile = (tiles / {splits}u) * wgid.z + min(wgid.z, tiles % {splits}u);\n\
+         let end_tile = (tiles / {splits}u) * (wgid.z + 1u) + min(wgid.z + 1u, tiles % {splits}u);\n\
+         let end_k = min(end_tile * 16u, k);\n\
+         var t = start_tile * 16u;"
+        ),
+    );
+    source = substitute(&source, "if t >= k", "if t >= end_k");
+    source = substitute(
+        &source,
+        "let idx = row * n + col;",
+        "let idx = wgid.z * m * n + row * n + col;",
+    );
+    ShaderModule::new(&source)
+}
+
 /// The K-split GEMV with the RmsNorm of its input folded in:
 /// `C[1, N] = (rmsnorm(A) * norm_w) × B[K, N]`.
 ///

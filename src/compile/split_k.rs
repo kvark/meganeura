@@ -2,6 +2,37 @@ use super::{BufferRef, Dispatch, ExecutionPlan, ShaderEntry};
 use crate::tune::{MatmulTile, TuneClass, TuneError};
 
 impl ExecutionPlan {
+    /// Change an existing plain split-K producer, retaining its partial storage
+    /// and reduction. Device/precision policy must also permit the F16 candidate.
+    pub fn cooperative_split_matmul(&mut self, index: usize) -> Result<(), TuneError> {
+        let d = self
+            .dispatches
+            .get_mut(index)
+            .ok_or(TuneError("missing split producer"))?;
+        let super::Kernel::SplitMatmul { splits, .. } = d.kernel else {
+            return Err(TuneError("expected a scalar split-K producer"));
+        };
+        let &[m, second, third, _] = d.params.as_slice() else {
+            return Err(TuneError("invalid matrix parameters"));
+        };
+        let (n, k) = if d.shader == ShaderEntry::MatMul {
+            (third, second)
+        } else {
+            (second, third)
+        };
+        if d.requires_full_precision
+            || splits > k.div_ceil(16)
+            || k.checked_add(15).is_none()
+            || m.div_ceil(32) > 65535
+            || n.div_ceil(32) > 65535
+        {
+            return Err(TuneError("illegal cooperative split-K candidate"));
+        }
+        d.kernel = super::Kernel::SplitCooperativeMatmul { splits };
+        d.workgroups = [m.div_ceil(32), n.div_ceil(32), splits];
+        Ok(())
+    }
+
     /// Lower one plain matrix product to partials + SumRows before allocation.
     /// This is a candidate, not a selection: qualify and time the entire sequence.
     pub fn split_matmul(
@@ -250,7 +281,20 @@ mod tests {
                         .sum();
                 }
             }
-            for (tile_size, k_stage, splits) in [(32, 8, 3), (64, 16, 4), (32, 32, 2)] {
+            for (tile_size, k_stage, splits, cooperative) in [
+                (32, 8, 3, false),
+                (64, 16, 4, false),
+                (32, 32, 2, false),
+                (32, 16, 3, true),
+                (64, 16, 4, true),
+                (32, 32, 2, true),
+            ] {
+                if cooperative
+                    && (gpu.capabilities().fixed_compute_subgroup_size != Some(32)
+                        || gpu.capabilities().cooperative_matrix.f16_tile != 16)
+                {
+                    continue;
+                }
                 let mut plan = super::super::compile(&graph);
                 let shape = crate::codegen::ScalarMatmulShape {
                     tile_size,
@@ -261,12 +305,19 @@ mod tests {
                 assert!(plan.split_matmul(0, shape, splits, 0).is_err());
                 assert_eq!(before, serde_json::to_value(&plan).unwrap());
                 plan.split_matmul(0, shape, splits, 1024 * 1024).unwrap();
+                if cooperative {
+                    plan.cooperative_split_matmul(0).unwrap();
+                }
                 assert!(TuneClass::from_dispatch(&plan.dispatches[0], None).is_none());
                 let mut session = crate::Session::with_context_opts(
                     plan,
                     gpu.clone(),
                     crate::SessionOptions {
-                        coop: crate::CoopPolicy::Disabled,
+                        coop: if cooperative {
+                            crate::CoopPolicy::Auto
+                        } else {
+                            crate::CoopPolicy::Disabled
+                        },
                         ..Default::default()
                     },
                 );
@@ -274,11 +325,16 @@ mod tests {
                 session.set_parameter("b", &b);
                 session.step();
                 session.wait();
+                let (atol, rtol) = if cooperative {
+                    (0.003, 0.002)
+                } else {
+                    (2e-5, 2e-4)
+                };
                 for (actual, expected) in session.read_output(m * n).into_iter().zip(&reference) {
                     assert!(
                         actual.is_finite()
-                            && (f64::from(actual) - expected).abs() < 2e-5 + 2e-4 * expected.abs(),
-                        "{actual} != {expected}"
+                            && (f64::from(actual) - expected).abs() < atol + rtol * expected.abs(),
+                        "cooperative={cooperative}, transpose={transpose}, splits={splits}: {actual} != {expected}"
                     );
                 }
             }

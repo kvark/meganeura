@@ -1,6 +1,6 @@
 //! CPU survey, or whole-model search with a full independent CPU reference.
 //! Usage: egglog_model_search MODEL [REFERENCE.f32|optimized] [fast] [baseline]
-//! Options: --static, --confirm, --reverse, --profile, --attention-tiles,
+//! Options: --static, --confirm, --reverse, --profile, --attention-tiles, --cooperative-split,
 //! --program=N (one generated plan, for attribution), --seconds=N.
 use meganeura::{
     Graph,
@@ -171,6 +171,26 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
                 plan,
             });
         }
+    }
+    if std::env::args().any(|arg| arg == "--cooperative-split")
+        && fast
+        && caps.f16_tile == 16
+        && gpu.capabilities().fixed_compute_subgroup_size == Some(32)
+    {
+        let mut variants = Vec::new();
+        for program in &programs {
+            let mut plan = program.plan.clone();
+            let changed = (0..plan.dispatches.len())
+                .filter(|&i| plan.cooperative_split_matmul(i).is_ok())
+                .count();
+            if changed > 0 {
+                variants.push(search::measure::Program {
+                    description: format!("cooperative_split={changed}; {}", program.description),
+                    plan,
+                });
+            }
+        }
+        programs.extend(variants);
     }
     if std::env::args().any(|arg| arg == "--attention-tiles")
         && gpu.capabilities().fixed_compute_subgroup_size == Some(32)
