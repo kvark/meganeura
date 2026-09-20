@@ -42,7 +42,11 @@ MEGANEURA_COOP_F16=1 target/release/examples/gguf_latency model.gguf /tmp/meg 30
 The optional final argument bounds tuning to 30 seconds **per session**;
 the diagnostic allows 256 MiB of scratch so the vocabulary projection is not
 silently excluded by the default 64 MiB limit. Reports record candidates,
-qualification, selections, preparation time and CPU record/wait/readback stages.
+qualification, selections, preparation time and CPU record/finish stages.
+`decode_record_finish_ms` combines waiting and host copying in its second
+interval. The helper uses `Session::wait_read_output`: known staged downloads
+are queued before the CPU wait; initial probes and mapped reads still wait
+first. This does not change the work included in whole-call latency.
 No precision tolerances are changed. Run engines and GPUs sequentially, without
 profilers or builds competing with the timed runs. Repeat in fresh processes
 and reverse their order. First-read mapped/staged qualification is absorbed
@@ -65,6 +69,10 @@ runtime-appended optimizer work are not sampled. Counts are measured on the
 target machine, not selected by a GPU/model table. The API needs initialized
 representative inputs, so ordinary session construction still defaults to
 one submission until this explicit post-initialization search is requested.
+
+The latest [scalar-layout search](scalar-matmul-autotune.md) and
+[queued-readback comparison](queued-readback.md) report fresh-recording results
+on both GPUs. The checkpoints below retain the earlier diagnostic history.
 
 For separate attribution captures, add `MEGANEURA_GPU_TIMING=1` to the Meganeura
 command or `GGML_VK_PERF_LOGGER=1` to llama.cpp. Profiled numbers are not substitute
