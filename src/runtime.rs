@@ -1094,6 +1094,11 @@ fn epilogue_tile(dispatch: &Dispatch) -> crate::codegen::MatMulTile {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Variant {
     SpecializedConv(ShaderEntry, Vec<u32>, u32),
+    ScalarMatmul(
+        ShaderEntry,
+        crate::compile::WeightFormat,
+        crate::codegen::ScalarMatmulShape,
+    ),
     /// Schedule-template kernels, keyed by kernel content hash. These are
     /// generated from a DAG rather than a shader group, so no `ShaderEntry`
     /// identifies them.
@@ -1187,6 +1192,7 @@ impl Variant {
             Variant::Reduction(_) | Variant::Pointwise(_) => None,
             Variant::Attention(ref e, _)
             | Variant::SpecializedConv(ref e, _, _)
+            | Variant::ScalarMatmul(ref e, _, _)
             | Variant::Epilogue(ref e, _)
             | Variant::CoopEpilogue(ref e, _)
             | Variant::CoopPrologue(ref e, _)
@@ -1207,6 +1213,9 @@ impl Variant {
     /// Name used by the profiler and by pipeline-statistics dumps.
     fn label(&self) -> String {
         match *self {
+            Variant::ScalarMatmul(ref e, format, shape) => {
+                format!("{e:?}:scalar-{format:?}-{shape:?}")
+            }
             Variant::SpecializedConv(ref e, ref params, k_tile) => {
                 format!("{e:?}:fixed-native-div-k{k_tile}-{params:?}")
             }
@@ -1875,12 +1884,12 @@ impl Pipelines {
             dump_dir: wgsl_dump_dir.map(str::to_string),
         };
         for dispatch in &plan.dispatches {
-            if dispatch.conv_k_tile.is_some() {
+            if dispatch.conv_k_tile.is_some() || dispatch.scalar_matmul.is_some() {
                 let tile = crate::tune::MatmulTile::selected(dispatch, None)
-                    .expect("scalar convolution specialization");
+                    .expect("scalar specialization");
                 pipelines
                     .ensure_tune_tile(gpu, dispatch, tile)
-                    .expect("selected convolution pipeline");
+                    .expect("selected scalar pipeline");
             }
         }
         pipelines.select(&plan.dispatches);
@@ -1902,6 +1911,13 @@ impl Pipelines {
     /// variants have no unfused fallback: that would change the computation.
     fn candidates(dispatch: &Dispatch) -> Vec<Variant> {
         let entry = &dispatch.shader;
+        if let Some(shape) = dispatch.scalar_matmul {
+            return vec![Variant::ScalarMatmul(
+                entry.clone(),
+                dispatch.weight_format,
+                shape,
+            )];
+        }
         if let Some(k_tile) = dispatch.conv_k_tile {
             return vec![Variant::SpecializedConv(
                 entry.clone(),
@@ -2497,7 +2513,7 @@ pub(crate) fn select_variants(
         // iOS and future 8×8 f32 advertisers need the same veto.
         let apple_f32_coop = !config.use_f16_input && config.tile_size == 8;
         for dispatch in &mut plan.dispatches {
-            if dispatch.conv_k_tile.is_some() {
+            if dispatch.conv_k_tile.is_some() || dispatch.scalar_matmul.is_some() {
                 continue;
             }
             // Autodiff marks derivative work as requiring f32 operands. A
@@ -2703,6 +2719,7 @@ pub(crate) fn select_variants(
         for dispatch in plan.dispatches.iter_mut() {
             if dispatch.use_coop
                 || dispatch.use_small_tiles
+                || dispatch.scalar_matmul.is_some()
                 || dispatch.weight_format.uses_reduced_storage()
             {
                 continue;
