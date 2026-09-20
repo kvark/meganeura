@@ -26,9 +26,9 @@ fn bench_matmul(n: usize, warmup: usize, iters: usize) -> (f64, &'static str) {
         .iter()
         .find(|d| matches!(d.shader, meganeura::compile::ShaderEntry::MatMul))
         .map(|d| {
-            if d.use_coop {
+            if d.use_coop() {
                 "coop"
-            } else if d.use_small_tiles {
+            } else if d.use_small_tiles() {
                 "small"
             } else {
                 "tile"

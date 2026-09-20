@@ -117,7 +117,7 @@ pub(super) fn tile_module(
     if let MatmulTile::Scalar(shape) = tile {
         return crate::codegen::generate_matmul_with_epilogue(
             entry.shader_group(),
-            crate::codegen::EpilogueSource::Ops(&[]),
+            None,
             crate::codegen::MatMulOptions {
                 format: dispatch.weight_format,
                 tile: match shape.tile_size {
@@ -139,7 +139,7 @@ pub(super) fn tile_module(
         // Generating the ordinary GEMV here would quietly swap the
         // activation back to f32 and change what the plan computes.
         let group = crate::tune::gemv_group(entry).expect("GEMV candidate on a GEMV entry");
-        if dispatch.gemv_int_dot {
+        if dispatch.gemv_int_dot() {
             return crate::codegen::generate_module_gemv_int_dot(
                 group,
                 dispatch.weight_format,
@@ -161,7 +161,7 @@ pub(super) fn tile_module(
     if dispatch.weight_format.uses_reduced_storage() {
         return crate::codegen::generate_matmul_with_epilogue(
             selected_entry.shader_group(),
-            crate::codegen::EpilogueSource::Ops(&[]),
+            None,
             crate::codegen::MatMulOptions {
                 format: dispatch.weight_format,
                 tile: match tile {
@@ -206,7 +206,7 @@ pub(super) fn tile_variant(dispatch: &Dispatch, tile: MatmulTile) -> Variant {
         return Variant::ScalarMatmul(entry.clone(), dispatch.weight_format, shape);
     }
     if let MatmulTile::Gemv(shape) = tile {
-        if dispatch.gemv_int_dot {
+        if dispatch.gemv_int_dot() {
             if dispatch.gemv_rmsnorm.is_some() {
                 return Variant::GemvRmsNormIntDot(entry.clone(), dispatch.weight_format, shape);
             }
@@ -1004,7 +1004,7 @@ fn split_dispatches(
         .buffer_sizes()
         .ok_or(TuneError("invalid split-K extents"))?;
     let mut dispatch = dispatch.clone();
-    dispatch.conv_k_tile = None; // Split-K has its own unspecialized K=16 shader.
+    dispatch.kernel = crate::compile::Kernel::Default; // Split-K has its own K=16 shader.
     dispatch.input_buffers = vec![BufferRef(0), BufferRef(1)];
     dispatch.output_buffer = BufferRef(2);
     plan.dispatches.push(dispatch);
@@ -1609,7 +1609,10 @@ mod tests {
             params: vec![1, 256, 16, 0],
             workgroups: [4, 1, 1],
             weight_format: crate::compile::WeightFormat::Q40,
-            gemv_int_dot: true,
+            kernel: crate::compile::Kernel::Gemv {
+                shape: crate::codegen::GemvShape::initial(crate::codegen::ShaderGroup::MatMulGemv),
+                integer_dot: true,
+            },
             ..Default::default()
         };
         let candidates = Pipelines::candidates(&dispatch);
@@ -1629,7 +1632,7 @@ mod tests {
         );
 
         let ordinary = Dispatch {
-            gemv_int_dot: false,
+            kernel: crate::compile::Kernel::Default,
             ..dispatch
         };
         let candidates = Pipelines::candidates(&ordinary);
@@ -2042,7 +2045,7 @@ mod tests {
             let mut selected = left.dispatches[0].clone();
             swaps[0].right.apply(&mut selected, &swaps[0].class);
             assert_eq!(selected, right.dispatches[0]);
-            assert!(selected.scalar_fallback.is_some());
+            assert!(selected.use_coop());
             let reduced = crate::codegen::CoopConfig {
                 use_f16_input: true,
                 ..config
@@ -2262,7 +2265,7 @@ mod tests {
         let mut plan = crate::compile::compile_with(&graph, &crate::CompileOptions::default());
         super::super::select_variants(&mut plan, None, false, false);
         let dispatch = &plan.dispatches[0];
-        assert!(dispatch.use_small_tiles);
+        assert!(dispatch.use_small_tiles());
         assert_eq!(dispatch.workgroups, [3, 2, 1]);
         assert!(TuneClass::from_dispatch(dispatch, None).is_some());
     }

@@ -213,7 +213,8 @@ impl MatmulTile {
     }
 
     pub(crate) fn selected(dispatch: &Dispatch, config: Option<&CoopConfig>) -> Option<Self> {
-        let small = dispatch.use_small_tiles
+        use crate::compile::Kernel;
+        let small = dispatch.use_small_tiles()
             || matches!(
                 dispatch.shader,
                 ShaderEntry::Conv2dGemmSmall
@@ -221,22 +222,24 @@ impl MatmulTile {
                     | ShaderEntry::Conv2dGradWeightGemmSmall
             );
         if let Some(group) = gemv_group(&dispatch.shader) {
-            Some(Self::Gemv(dispatch.gemv_shape.unwrap_or_else(|| {
-                crate::codegen::GemvShape::initial(group)
-            })))
-        } else if let Some(shape) = dispatch.scalar_matmul {
-            Some(Self::Scalar(shape))
-        } else if let Some(k_tile) = dispatch.conv_k_tile {
-            Some(Self::SpecializedConv {
-                tile_size: if small { 32 } else { 64 },
-                k_tile,
-            })
-        } else if dispatch.use_coop {
-            Self::native_cooperative(config)
-        } else if small {
-            Some(Self::Tile32)
+            match dispatch.kernel {
+                Kernel::Default => Some(Self::Gemv(crate::codegen::GemvShape::initial(group))),
+                Kernel::Gemv { shape, .. } => Some(Self::Gemv(shape)),
+                _ => None,
+            }
         } else {
-            Some(Self::Tile64)
+            match dispatch.kernel {
+                Kernel::Default | Kernel::SmallTile => {
+                    Some(if small { Self::Tile32 } else { Self::Tile64 })
+                }
+                Kernel::ScalarMatmul(shape) => Some(Self::Scalar(shape)),
+                Kernel::SpecializedConv { k_tile } => Some(Self::SpecializedConv {
+                    tile_size: if small { 32 } else { 64 },
+                    k_tile,
+                }),
+                Kernel::Cooperative => Self::native_cooperative(config),
+                _ => None,
+            }
         }
     }
 
@@ -253,30 +256,24 @@ impl MatmulTile {
 
     pub(crate) fn apply(self, dispatch: &mut Dispatch, class: &TuneClass) {
         if let Self::Gemv(shape) = self {
-            dispatch.gemv_shape = Some(shape);
+            dispatch.kernel = crate::compile::Kernel::Gemv {
+                shape,
+                integer_dot: dispatch.gemv_int_dot(),
+            };
             dispatch.workgroups = self.workgroups(class);
             return;
         }
         dispatch.shader = self.shader(&class.shader);
-        dispatch.use_small_tiles = class.conv2d.is_none()
-            && matches!(
-                self,
-                Self::Tile32
-                    | Self::Scalar(crate::codegen::ScalarMatmulShape { tile_size: 32, .. })
-            );
-        dispatch.scalar_matmul = match self {
-            Self::Scalar(shape) => Some(shape),
-            _ => None,
+        dispatch.kernel = match self {
+            Self::Tile32 if class.conv2d.is_none() => crate::compile::Kernel::SmallTile,
+            Self::Tile32 | Self::Tile64 => crate::compile::Kernel::Default,
+            Self::Scalar(shape) => crate::compile::Kernel::ScalarMatmul(shape),
+            Self::CooperativeF32 { .. } => crate::compile::Kernel::Cooperative,
+            Self::SpecializedConv { k_tile, .. } => {
+                crate::compile::Kernel::SpecializedConv { k_tile }
+            }
+            Self::Gemv(_) => unreachable!(),
         };
-        dispatch.use_coop = matches!(self, Self::CooperativeF32 { .. });
-        dispatch.use_coop_compensated = false;
-        dispatch.conv_k_tile = match self {
-            Self::SpecializedConv { k_tile, .. } => Some(k_tile),
-            _ => None,
-        };
-        dispatch.scalar_fallback = dispatch
-            .use_coop
-            .then(|| (dispatch.shader.clone(), Self::Tile64.workgroups(class)));
         dispatch.workgroups = self.workgroups(class);
     }
 
@@ -438,17 +435,14 @@ impl TuneClass {
                 | ShaderEntry::Conv2dGradInputGemmSmall
                 | ShaderEntry::Conv2dGradWeightGemm
                 | ShaderEntry::Conv2dGradWeightGemmSmall
-        ) || dispatch.use_coop_compensated
-            || (dispatch.use_coop && dispatch.use_small_tiles)
-            || (dispatch.use_coop && dispatch.weight_format.uses_reduced_storage())
+        ) || dispatch.use_coop_compensated()
+            || (dispatch.use_coop() && dispatch.weight_format.uses_reduced_storage())
             || dispatch.horizontal_batch >= 2
             || dispatch.matmul_prologue.is_some()
             || dispatch.matmul_epilogue.is_some()
-            || !dispatch.epilogue.is_empty()
-            || !dispatch.epilogue_buffers.is_empty()
             || !dispatch.extra_outputs.is_empty()
-            || dispatch.pointwise.is_some()
-            || dispatch.reduction.is_some()
+            || dispatch.pointwise().is_some()
+            || dispatch.reduction().is_some()
             || dispatch.input_buffers.len() != if addend { 3 } else { 2 }
         {
             return None;
@@ -465,16 +459,15 @@ impl TuneClass {
                 | ShaderEntry::Conv2dGradInputGemm
                 | ShaderEntry::Conv2dGradWeightGemm
         ) {
-            if dispatch.use_coop
-                || dispatch.use_small_tiles
-                || dispatch.scalar_fallback.is_some()
+            if dispatch.use_coop()
+                || dispatch.use_small_tiles()
                 || dispatch.weight_format.uses_reduced_storage()
             {
                 return None;
             }
             Some(TuneConv2d::from_params(&dispatch.params)?)
         } else {
-            if dispatch.conv_k_tile.is_some()
+            if dispatch.conv_k_tile().is_some()
                 || dispatch.workgroups[2] != 1
                 || dispatch.params.len() != 4
                 || dispatch.params[3] != 0
@@ -532,7 +525,7 @@ impl TuneClass {
             conv2d,
             requires_full_precision: dispatch.requires_full_precision,
             weight_format: dispatch.weight_format,
-            gemv_int_dot: dispatch.gemv_int_dot,
+            gemv_int_dot: dispatch.gemv_int_dot(),
             gemv_rmsnorm: dispatch.gemv_rmsnorm.is_some(),
             gemv_rmsnorm_eps_bits: dispatch
                 .gemv_rmsnorm
@@ -1246,7 +1239,10 @@ mod tests {
             ..Default::default()
         };
         let quantized = Dispatch {
-            gemv_int_dot: true,
+            kernel: crate::compile::Kernel::Gemv {
+                shape: crate::codegen::GemvShape::initial(crate::codegen::ShaderGroup::MatMulGemv),
+                integer_dot: true,
+            },
             ..ordinary.clone()
         };
 
@@ -1449,18 +1445,18 @@ mod tests {
         for candidate in class.challengers(MatmulTile::Tile64, None) {
             candidate.apply(&mut d, &class);
             assert_eq!(MatmulTile::selected(&d, None), Some(candidate));
-            assert_eq!(d.use_small_tiles, d.workgroups == [3, 2, 1]);
+            assert_eq!(d.use_small_tiles(), d.workgroups == [3, 2, 1]);
             let roundtrip: Dispatch =
                 serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap();
             assert_eq!(roundtrip, d);
         }
         MatmulTile::Tile32.apply(&mut d, &class);
-        assert!(d.scalar_matmul.is_none());
+        assert!(d.scalar_matmul().is_none());
         assert_eq!(d.workgroups, [3, 2, 1]);
-        assert!(d.use_small_tiles);
+        assert!(d.use_small_tiles());
         MatmulTile::Tile64.apply(&mut d, &class);
         assert_eq!(d.workgroups, [2, 1, 1]);
-        assert!(!d.use_small_tiles);
+        assert!(!d.use_small_tiles());
         d.shader = ShaderEntry::MatMulGemvBT;
         d.params = vec![1, 262_145, 4, 0];
         d.workgroups = crate::compile::row_gemv_workgroups(262_145);
@@ -1527,9 +1523,9 @@ mod tests {
     fn unsupported_modifiers_never_enter_the_search() {
         let base = dispatch();
         let mut variants = vec![base.clone(); 10];
-        variants[0].use_coop = true;
+        variants[0].kernel = crate::compile::Kernel::Cooperative;
         variants[1].horizontal_batch = 2;
-        variants[2].use_coop_compensated = true;
+        variants[2].kernel = crate::compile::Kernel::CooperativeCompensated;
         variants[3].extra_outputs.push(crate::compile::BufferRef(3));
         variants[4].workgroups[2] = 2;
         variants[5].shader = ShaderEntry::MatMulGemv;
@@ -1548,7 +1544,7 @@ mod tests {
     fn conv_dispatch(shader: ShaderEntry) -> Dispatch {
         let mut d = dispatch();
         d.shader = shader;
-        d.use_small_tiles = false;
+        d.kernel = crate::compile::Kernel::Default;
         d.params = vec![2, 3, 7, 9, 5, 3, 2, 2, 0, 3, 5, 1];
         d.workgroups = if matches!(
             d.shader,
@@ -1635,7 +1631,7 @@ mod tests {
                     [1, 1, 1]
                 }
             );
-            assert!(!d.use_small_tiles && !d.use_coop && d.scalar_fallback.is_none());
+            assert!(!d.use_small_tiles() && !d.use_coop());
             assert_eq!(MatmulTile::selected(&d, None), Some(MatmulTile::Tile32));
             let small = TuneClass::from_dispatch(&d, None).unwrap();
             let mut expected = class.clone();
@@ -1664,9 +1660,9 @@ mod tests {
         ] {
             let base = conv_dispatch(shader);
             let mut variants = vec![base; 17];
-            variants[0].use_small_tiles = true;
-            variants[1].use_coop = true;
-            variants[2].scalar_fallback = Some((ShaderEntry::MatMul, [1; 3]));
+            variants[0].kernel = crate::compile::Kernel::SmallTile;
+            variants[1].kernel = crate::compile::Kernel::Cooperative;
+            variants[2].kernel = crate::compile::Kernel::CooperativeCompensated;
             variants[3].params.pop();
             variants[4].params[7] = 0;
             variants[5].params[9] += 1;
@@ -1678,7 +1674,7 @@ mod tests {
             variants[11].params[1] = u32::MAX;
             variants[12].weight_format = crate::compile::WeightFormat::F16;
             variants[13].shader = ShaderEntry::Conv2dGradInputGemmCoopGen(3, 2, 2);
-            variants[14].conv_k_tile = Some(7);
+            variants[14].kernel = crate::compile::Kernel::SpecializedConv { k_tile: 7 };
             variants[15].input_buffers.pop();
             variants[16].params[5] = 100;
             for d in variants {
@@ -2053,7 +2049,7 @@ mod tests {
     }
 
     #[test]
-    fn native_geometry_flags_and_scalar_fallback_move_together() {
+    fn native_geometry_and_kernel_move_together() {
         let config = native_config(8);
         let native = MatmulTile::CooperativeF32 { tile_size: 8 };
         let class = class(32, 64, 17);
@@ -2061,13 +2057,12 @@ mod tests {
         d.params = vec![class.m, class.k, class.n, 0];
         native.apply(&mut d, &class);
         assert_eq!(d.workgroups, [2, 4, 1]);
-        assert!(d.use_coop && !d.use_coop_compensated && !d.use_small_tiles);
-        assert_eq!(d.scalar_fallback, Some((ShaderEntry::MatMul, [1, 1, 1])));
+        assert!(d.use_coop() && !d.use_coop_compensated() && !d.use_small_tiles());
         assert!(TuneClass::from_dispatch(&d, Some(&config)).is_some());
         assert!(TuneClass::from_dispatch(&d, None).is_none());
         MatmulTile::Tile32.apply(&mut d, &class);
         assert_eq!(d.workgroups, [2, 1, 1]);
-        assert!(!d.use_coop && d.use_small_tiles && d.scalar_fallback.is_none());
+        assert!(!d.use_coop() && d.use_small_tiles());
         assert!(TuneClass::from_dispatch(&d, Some(&config)).is_some());
     }
 

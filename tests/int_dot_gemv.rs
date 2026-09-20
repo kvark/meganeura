@@ -503,7 +503,7 @@ fn run(
             ShaderEntry::MatMulGemv
         }
     );
-    assert_eq!(dispatch.gemv_int_dot, quantized_activations);
+    assert_eq!(dispatch.gemv_int_dot(), quantized_activations);
     session.set_input("x", a);
     if let Some(d) = addend {
         session.set_input("d", d);
@@ -551,7 +551,7 @@ fn run_q40_rmsnorm(
         .iter()
         .find(|dispatch| dispatch.shader == ShaderEntry::MatMulGemv)
         .expect("RmsNorm output should feed a GEMV");
-    assert!(dispatch.gemv_int_dot);
+    assert!(dispatch.gemv_int_dot());
     assert_eq!(dispatch.gemv_rmsnorm.is_some(), !expose_normalized);
 
     session.set_input("x", x);
