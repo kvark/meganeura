@@ -1136,9 +1136,7 @@ enum Variant {
     /// Non-f32 weight storage (f16, Q4, Q8).
     Weight(ShaderEntry, crate::compile::WeightFormat),
     WeightSmall(ShaderEntry, crate::compile::WeightFormat),
-    /// Cooperative-matrix and small-tile (32×32) forms. Unlike every other
-    /// axis these are pure performance: the scalar pipeline computes the
-    /// same thing, so falling back to it is safe.
+    /// Cooperative-matrix implementation qualified for the session's precision policy.
     Coop(ShaderEntry),
     /// Cooperative f16 with hi/lo residual staging (C1).
     CoopCompensated(ShaderEntry),
@@ -1147,7 +1145,7 @@ enum Variant {
     /// a backward pack of the same arity (compensated).
     Horizontal(ShaderEntry, u32, HorizMatMulKind),
     SmallTile(ShaderEntry),
-    /// The unmodified pipeline. Always compiled.
+    /// The unmodified pipeline.
     Scalar(ShaderEntry),
 }
 
@@ -1240,8 +1238,8 @@ struct Pipelines {
     map: HashMap<Variant, blade_graphics::ComputePipeline>,
     /// Resolved after compilation or tuning, never while recording a step.
     selected: Vec<Variant>,
-    /// Matmul codegen knobs the plan was compiled with.
-    matmul_knobs: crate::codegen::MatmulKnobs,
+    /// Codegen knobs the plan was compiled with.
+    knobs: crate::compile::TuningKnobs,
     /// Where to write every WGSL the pipeline layer compiles — [`SessionOptions::wgsl_dump_dir`].
     dump_dir: Option<String>,
 }
@@ -1294,15 +1292,13 @@ impl Pipelines {
         let mut pipelines = Self {
             map: HashMap::new(),
             selected: Vec::new(),
-            matmul_knobs: crate::codegen::MatmulKnobs {
-                k_stage: plan.knobs.matmul_k_stage,
-                interleave_columns: plan.knobs.matmul_interleave_columns,
-                integer_dot: gpu.capabilities().shader_integer_dot_product,
-            },
+            knobs: plan.knobs,
             dump_dir: wgsl_dump_dir.map(str::to_string),
         };
         for dispatch in &plan.dispatches {
-            pipelines.prepare(gpu, dispatch, plan.knobs, coop_config);
+            pipelines
+                .prepare(gpu, dispatch, coop_config)
+                .expect("selected shader was rejected");
         }
         if !plan.param_grad_pairs.is_empty() {
             for shader in [
@@ -1314,15 +1310,16 @@ impl Pipelines {
                 ShaderEntry::AdaptiveGradClip,
                 ShaderEntry::GradAccum,
             ] {
-                pipelines.prepare(
-                    gpu,
-                    &Dispatch {
-                        shader,
-                        ..Default::default()
-                    },
-                    plan.knobs,
-                    None,
-                );
+                pipelines
+                    .prepare(
+                        gpu,
+                        &Dispatch {
+                            shader,
+                            ..Default::default()
+                        },
+                        None,
+                    )
+                    .expect("optimizer shader was rejected");
             }
         }
         pipelines.select(&plan.dispatches);
@@ -1333,29 +1330,32 @@ impl Pipelines {
         &mut self,
         gpu: &Gpu,
         dispatch: &Dispatch,
-        knobs: crate::compile::TuningKnobs,
         coop_config: Option<&crate::codegen::CoopConfig>,
-    ) {
+    ) -> Result<(), String> {
         use crate::codegen::ShaderGroup;
         let key = Self::key(dispatch);
         if self.map.contains_key(&key) {
-            return;
+            return Ok(());
         }
+        let knobs = self.knobs;
+        let matmul_knobs = crate::codegen::MatmulKnobs {
+            k_stage: knobs.matmul_k_stage,
+            interleave_columns: knobs.matmul_interleave_columns,
+            integer_dot: gpu.capabilities().shader_integer_dot_product,
+        };
         let group = dispatch.shader.shader_group();
         let mut layout = shader_data_layout(&dispatch.shader);
         let mut entry_point = dispatch.shader.entry_point();
         let cooperative =
             || *coop_config.expect("cooperative dispatch needs a qualified device configuration");
         let module = match key {
-            Variant::Scalar(_) => crate::codegen::generate_module(group, self.matmul_knobs),
-            Variant::SmallTile(_) => {
-                crate::codegen::generate_module_small(group, self.matmul_knobs)
-            }
+            Variant::Scalar(_) => crate::codegen::generate_module(group, matmul_knobs),
+            Variant::SmallTile(_) => crate::codegen::generate_module_small(group, matmul_knobs),
             Variant::Weight(_, format) => {
-                crate::codegen::generate_module_weighted(group, format, self.matmul_knobs)
+                crate::codegen::generate_module_weighted(group, format, matmul_knobs)
             }
             Variant::WeightSmall(..) => {
-                tuning::tile_module(dispatch, crate::tune::MatmulTile::Tile32, self.matmul_knobs)
+                tuning::tile_module(dispatch, crate::tune::MatmulTile::Tile32, matmul_knobs)
             }
             Variant::SplitMatmul(_, shape, splits) => {
                 crate::codegen::generate_split_matmul(group, shape, splits)
@@ -1363,12 +1363,12 @@ impl Pipelines {
             Variant::ScalarMatmul(_, _, shape) => tuning::tile_module(
                 dispatch,
                 crate::tune::MatmulTile::Scalar(shape),
-                self.matmul_knobs,
+                matmul_knobs,
             ),
             Variant::SpecializedConv(..) => {
                 let tile = crate::tune::MatmulTile::selected(dispatch, None)
                     .expect("specialized convolution");
-                tuning::tile_module(dispatch, tile, self.matmul_knobs)
+                tuning::tile_module(dispatch, tile, matmul_knobs)
             }
             Variant::Gemv(_, _, shape)
             | Variant::GemvIntDot(_, _, shape)
@@ -1377,11 +1377,7 @@ impl Pipelines {
                 if dispatch.gemv_rmsnorm.is_some() {
                     layout = <MatMulRmsNormData as blade_graphics::ShaderData>::layout();
                 }
-                tuning::tile_module(
-                    dispatch,
-                    crate::tune::MatmulTile::Gemv(shape),
-                    self.matmul_knobs,
-                )
+                tuning::tile_module(dispatch, crate::tune::MatmulTile::Gemv(shape), matmul_knobs)
             }
             Variant::Coop(_) | Variant::CoopCompensated(_) => {
                 let mut config = cooperative();
@@ -1415,7 +1411,7 @@ impl Pipelines {
                 crate::codegen::MatMulOptions {
                     format: dispatch.weight_format,
                     tile: epilogue_tile(dispatch),
-                    knobs: self.matmul_knobs,
+                    knobs: matmul_knobs,
                 },
             ),
             Variant::CoopEpilogue(..) => crate::codegen::generate_coop_matmul_with_dag_epilogue(
@@ -1497,10 +1493,10 @@ impl Pipelines {
                 crate::codegen::generate_horizontal_matmul(group, count, coop.as_ref())
             }
         };
-        let shader = create_gen_shader(gpu, module, self.dump_dir.as_deref())
-            .expect("selected shader was rejected");
+        let shader = create_gen_shader(gpu, module, self.dump_dir.as_deref())?;
         let pipeline = create_profiled_pipeline(gpu, key.label(), &layout, shader.at(entry_point));
         self.map.insert(key, pipeline);
+        Ok(())
     }
 
     fn attention_head_dim(dispatch: &Dispatch) -> Option<u32> {
@@ -1549,7 +1545,15 @@ impl Pipelines {
             let shape = dispatch
                 .gemv_shape()
                 .unwrap_or_else(|| crate::codegen::GemvShape::initial(entry.shader_group()));
-            return tuning::tile_variant(dispatch, crate::tune::MatmulTile::Gemv(shape));
+            return if dispatch.gemv_int_dot() {
+                if dispatch.gemv_rmsnorm.is_some() {
+                    Variant::GemvRmsNormIntDot(entry, dispatch.weight_format, shape)
+                } else {
+                    Variant::GemvIntDot(entry, dispatch.weight_format, shape)
+                }
+            } else {
+                Variant::GemvRmsNorm(entry, dispatch.weight_format, shape)
+            };
         }
         if let Some(kernel) = dispatch.reduction() {
             return Variant::Reduction(kernel.hash_key());

@@ -183,8 +183,9 @@ fn main() {
                 session.set_input("a", &a);
                 session.set_input("c", &c);
                 session.set_parameter("b", &b);
-                qualify(session, &reference).map(|_| ())
+                Ok(())
             },
+            |session| qualify(session, &reference).map(|_| ()),
         )
         .unwrap();
         let samples: Vec<_> = (0..12).map(|_| sample(&mut selected)).skip(3).collect();

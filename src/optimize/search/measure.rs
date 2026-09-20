@@ -31,6 +31,8 @@ pub struct Options {
 #[derive(Serialize)]
 pub struct Trial {
     pub description: String,
+    /// Full session construction, including allocations, not shader-only compile time.
+    pub construction_time: Duration,
     pub kernel_tuning: Option<TuneReport>,
     pub outcome: TuneOutcome<(), usize>,
 }
@@ -70,9 +72,9 @@ fn plan_bytes(plan: &ExecutionPlan) -> Result<usize, String> {
 
 /// Search complete, legal implementations of the same immutable inference graph.
 /// Each has private buffers and is kernel-tuned *before* comparing graph forms.
-/// `qualify` initializes representative inputs/weights, executes and checks all
-/// observable outputs against the caller's numerical contract. It is called
-/// before tuning, after tuning and after measurements; no live session is used.
+/// `initialize` writes representative inputs/weights once into each private
+/// session. `qualify` executes and checks all observable outputs against the
+/// caller's numerical contract before tuning, after tuning and after measurements.
 ///
 /// Samples include fresh recording, submission and wait, not output readback.
 /// Existing paired-order/noise guards select the incumbent; incomplete pairs
@@ -83,6 +85,7 @@ pub fn select(
     gpu: Arc<blade_graphics::Context>,
     runtime: SessionOptions,
     options: Options,
+    mut initialize: impl FnMut(&mut Session) -> Result<(), String>,
     mut qualify: impl FnMut(&mut Session) -> Result<(), String>,
 ) -> Result<(Session, Report), String> {
     options
@@ -114,6 +117,7 @@ pub fn select(
         let bytes = plan_bytes(&program.plan)?;
         let mut trial = Trial {
             description: program.description,
+            construction_time: Duration::ZERO,
             kernel_tuning: None,
             outcome: TuneOutcome::new((), program.plan.dispatches.len(), report.selected, index),
         };
@@ -127,8 +131,9 @@ pub fn select(
             let build = Instant::now();
             let mut candidate =
                 Session::with_context_opts(program.plan, gpu.clone(), runtime.clone());
-            trial.outcome.compile_time = build.elapsed();
+            trial.construction_time = build.elapsed();
             let result = (|| {
+                initialize(&mut candidate)?;
                 qualify(&mut candidate)?;
                 let mut policy = options.tuning.clone();
                 policy.max_time = policy

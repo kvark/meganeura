@@ -41,39 +41,9 @@ impl Pipelines {
         dispatch: &Dispatch,
         tile: MatmulTile,
     ) -> Result<(), String> {
-        let key = tile_variant(dispatch, tile);
-        if self.map.contains_key(&key) {
-            return Ok(());
-        }
-        let selected_entry = tile.shader(&dispatch.shader);
-        let mut knobs = self.matmul_knobs;
-        knobs.integer_dot = gpu.capabilities().shader_integer_dot_product;
-        let module = tile_module(dispatch, tile, knobs);
-        let layout = if dispatch.gemv_rmsnorm.is_some() {
-            use blade_graphics::ShaderData;
-            super::MatMulRmsNormData::layout()
-        } else {
-            super::shader_data_layout(&selected_entry)
-        };
-        self.insert_tuning_pipeline(gpu, key, module, layout)
-    }
-
-    fn insert_tuning_pipeline(
-        &mut self,
-        gpu: &Gpu,
-        key: Variant,
-        module: crate::codegen::ShaderModule,
-        layout: bg::ShaderDataLayout,
-    ) -> Result<(), String> {
-        let shader = super::create_gen_shader(gpu, module, self.dump_dir.as_deref())?;
-        let pipeline = super::create_profiled_pipeline(
-            gpu,
-            key.label(),
-            &layout,
-            shader.at(key.entry().expect("tuning shader entry").entry_point()),
-        );
-        self.map.insert(key, pipeline);
-        Ok(())
+        let mut selected = dispatch.clone();
+        tile.configure(&mut selected);
+        self.prepare(gpu, &selected, tile.coop_config().as_ref())
     }
 
     fn discard_unused_convolutions(&mut self, gpu: &Gpu, plan: &crate::compile::ExecutionPlan) {
@@ -193,51 +163,9 @@ pub(super) fn tile_module(
 }
 
 pub(super) fn tile_variant(dispatch: &Dispatch, tile: MatmulTile) -> Variant {
-    let entry = &dispatch.shader;
-    if let MatmulTile::Scalar(shape) = tile {
-        return Variant::ScalarMatmul(entry.clone(), dispatch.weight_format, shape);
-    }
-    if let MatmulTile::Gemv(shape) = tile {
-        if dispatch.gemv_int_dot() {
-            if dispatch.gemv_rmsnorm.is_some() {
-                return Variant::GemvRmsNormIntDot(entry.clone(), dispatch.weight_format, shape);
-            }
-            return Variant::GemvIntDot(entry.clone(), dispatch.weight_format, shape);
-        }
-        if dispatch.gemv_rmsnorm.is_some() {
-            return Variant::GemvRmsNorm(entry.clone(), dispatch.weight_format, shape);
-        }
-        return Variant::Gemv(entry.clone(), dispatch.weight_format, shape);
-    }
-    if let MatmulTile::SpecializedConv { k_tile, .. } = tile {
-        return Variant::SpecializedConv(tile.shader(entry), dispatch.params.clone(), k_tile);
-    }
-    if dispatch.weight_format.uses_reduced_storage() {
-        return match tile {
-            MatmulTile::Tile32 => Variant::WeightSmall(entry.clone(), dispatch.weight_format),
-            MatmulTile::Tile64 => Variant::Weight(entry.clone(), dispatch.weight_format),
-            _ => unreachable!("reduced storage only changes scalar tile geometry"),
-        };
-    }
-    if matches!(
-        entry,
-        ShaderEntry::Conv2dGemm
-            | ShaderEntry::Conv2dGemmSmall
-            | ShaderEntry::Conv2dGradInputGemm
-            | ShaderEntry::Conv2dGradInputGemmSmall
-            | ShaderEntry::Conv2dGradWeightGemm
-            | ShaderEntry::Conv2dGradWeightGemmSmall
-    ) {
-        return Variant::Scalar(tile.shader(entry));
-    }
-    match tile {
-        MatmulTile::Tile32 => Variant::SmallTile(entry.clone()),
-        MatmulTile::Tile64 => Variant::Scalar(entry.clone()),
-        MatmulTile::CooperativeF32 { .. } => Variant::Coop(entry.clone()),
-        MatmulTile::SpecializedConv { .. } | MatmulTile::Gemv(_) | MatmulTile::Scalar(_) => {
-            unreachable!()
-        }
-    }
+    let mut selected = dispatch.clone();
+    tile.configure(&mut selected);
+    Pipelines::key(&selected)
 }
 
 struct SearchClass {
