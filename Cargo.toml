@@ -129,6 +129,10 @@ path = "bench/gguf_latency.rs"
 required-features = ["gguf"]
 
 [[example]]
+name = "egglog_search"
+path = "bench/egglog_search.rs"
+
+[[example]]
 name = "train_deploy"
 path = "examples/train_deploy.rs"
 
