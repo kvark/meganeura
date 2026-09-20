@@ -225,11 +225,16 @@ fn reduced_storage_tiles_preserve_outputs() {
             })
             .unwrap();
         assert_eq!(report.eligible_classes, 1);
-        assert_eq!(report.outcomes.len(), 1);
-        let outcome = &report.outcomes[0];
-        assert!(outcome.qualified, "{outcome:?}");
-        assert_eq!(outcome.class.weight_format, format);
-        assert_eq!(outcome.class.shader, shader);
+        assert!(!report.time_budget_exhausted);
+        assert_eq!(
+            report.outcomes.len(),
+            if format.is_quantized() { 1 } else { 11 }
+        );
+        for outcome in &report.outcomes {
+            assert!(outcome.qualified, "{outcome:?}");
+            assert_eq!(outcome.class.weight_format, format);
+            assert_eq!(outcome.class.shader, shader);
+        }
         assert_eq!(
             before,
             session.read_output(m * n),
@@ -388,22 +393,24 @@ fn qualify_scalar_entries(staging: TuneStaging, staging_reuse: TuneStagingReuse)
                 .unwrap();
             assert_eq!(
                 report.outcomes.len(),
-                1,
+                11,
                 "{shader:?} {m}x{n}x{k}: {report:?}"
             );
-            let outcome = &report.outcomes[0];
+            assert!(!report.time_budget_exhausted);
             assert_eq!(report.scratch.unwrap().retained_staging_bytes, 0);
             assert_eq!(
                 report.scratch.unwrap().staging_allocations,
                 report.scratch.unwrap().staging_releases
             );
             assert!(report.scratch.unwrap().peak_bytes <= report.options.max_scratch_bytes);
-            assert_eq!(outcome.class.shader, shader);
-            assert!(outcome.qualified, "{outcome:?}");
-            assert!(matches!(
-                outcome.decision,
-                TuneDecision::FasterCandidate | TuneDecision::KeepBaseline
-            ));
+            for outcome in &report.outcomes {
+                assert_eq!(outcome.class.shader, shader);
+                assert!(outcome.qualified, "{outcome:?}");
+                assert!(matches!(
+                    outcome.decision,
+                    TuneDecision::FasterCandidate | TuneDecision::KeepBaseline
+                ));
+            }
         }
     }
 }
@@ -501,14 +508,23 @@ fn tuning_releases_retained_staging_after_a_later_scratch_skip() {
             ..Default::default()
         })
         .unwrap();
-    assert_eq!(report.outcomes.len(), 2);
-    assert!(report.outcomes[0].qualified);
-    assert_eq!(report.outcomes[1].decision, TuneDecision::ScratchLimit);
-    assert_eq!(report.outcomes[1].scratch, None);
+    assert!(!report.time_budget_exhausted);
+    let qualified = report.outcomes.iter().filter(|o| o.qualified).count();
+    assert!(qualified > 0);
+    assert!(
+        report
+            .outcomes
+            .iter()
+            .any(|o| o.decision == TuneDecision::ScratchLimit)
+    );
+    for outcome in report.outcomes.iter().filter(|o| !o.qualified) {
+        assert_eq!(outcome.decision, TuneDecision::ScratchLimit);
+        assert_eq!(outcome.scratch, None);
+    }
     let stats = report.scratch.unwrap();
     assert_eq!(stats.staging_allocations, 1);
     assert_eq!(stats.staging_releases, 1);
-    assert_eq!(stats.staging_reuses, 0);
+    assert_eq!(stats.staging_reuses, qualified - 1);
     assert_eq!(stats.retained_staging_bytes, 0);
     assert_eq!(stats.peak_bytes, 3 * 32 * 4096 * 4 + 32 * 32 * 4);
     assert!(report.final_cleanup.is_some());
@@ -562,7 +578,7 @@ fn tune_native_cooperative_f32() {
                 })
                 .unwrap();
             assert_eq!(report.visited_classes, 1, "{report:?}");
-            assert_eq!(report.outcomes.len(), 2, "{report:?}");
+            assert_eq!(report.outcomes.len(), 12, "{report:?}");
             let native = report
                 .outcomes
                 .iter()

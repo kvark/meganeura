@@ -143,6 +143,7 @@ fn plain(d: &Dispatch) -> bool {
         && d.pointwise.is_none()
         && d.reduction.is_none()
         && d.conv_k_tile.is_none()
+        && d.scalar_matmul.is_none()
         && d.gemv_shape.is_none()
         && d.gemv_rmsnorm.is_none()
         && !d.gemv_int_dot
