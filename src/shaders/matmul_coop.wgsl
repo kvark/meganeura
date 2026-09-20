@@ -30,7 +30,7 @@ $RESULT_SHARED_DECL
 $PROLOGUE_CACHE_DECL
 
 @compute @workgroup_size(64)
-fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(subgroup_id) sg: u32) {
     let tile_row = wgid.x * $OUTPUT_TILE_U;
     let tile_col = wgid.y * $OUTPUT_TILE_U;
     let m = params.m;
