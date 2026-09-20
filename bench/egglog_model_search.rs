@@ -1,6 +1,6 @@
 //! CPU survey, or whole-model search with a full independent CPU reference.
 //! Usage: egglog_model_search MODEL [REFERENCE.f32|optimized] [fast] [baseline]
-//! Options: --static, --confirm, --reverse, --profile, --original-graph,
+//! Options: --static, --confirm, --reverse, --profile, --optimized-graph,
 //! --attention-tiles, --cooperative-split,
 //! --program=N (one generated plan, for attribution), --serial-sums,
 //! --seconds=N, --warmup=N (whole-program warmup pairs; default 32).
@@ -141,7 +141,7 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
     assert_eq!(output_len, reference.len());
     let original = graph;
     let graph = meganeura::optimize::optimize(&original);
-    let original_graph = std::env::args().any(|arg| arg == "--original-graph");
+    let original_graph = !std::env::args().any(|arg| arg == "--optimized-graph");
     let search_source = if original_graph { &original } else { &graph };
     let profile = std::env::args().any(|arg| arg == "--profile");
     let gpu = std::sync::Arc::new(
@@ -270,12 +270,6 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
         }
         programs.extend(variants);
     }
-    if let Some(index) = std::env::args().find_map(|arg| {
-        arg.strip_prefix("--program=")
-            .map(|s| s.parse::<usize>().unwrap())
-    }) {
-        programs = vec![programs.remove(index)];
-    }
     if std::env::args().any(|arg| arg == "--serial-sums") {
         let mut expanded = Vec::new();
         for program in programs {
@@ -304,6 +298,12 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
             expanded.extend(variants);
         }
         programs = expanded;
+    }
+    if let Some(index) = std::env::args().find_map(|arg| {
+        arg.strip_prefix("--program=")
+            .map(|s| s.parse::<usize>().unwrap())
+    }) {
+        programs = vec![programs.remove(index)];
     }
     let fixed_subgroup_size = gpu.capabilities().fixed_compute_subgroup_size;
     let runtime = SessionOptions {
