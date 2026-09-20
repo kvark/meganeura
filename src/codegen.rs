@@ -3764,7 +3764,7 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
 /// output remain f32. Probabilities for each tile are rounded to f16 for PV.
 ///
 /// Workgroup layout (32 threads = 16 rows × 2 d-chunks):
-///   * `BQ = 16`, `BKV = 16` — match the coop_mat tile size.
+///   * `BQ = 16`, `BKV = 32`; cooperative products use 16-element tiles.
 ///   * Each thread owns one (row, d_chunk) pair: holds
 ///     `O_acc[chunk_hd]` and `local_max` / `local_sum` in registers.
 ///   * Q is staged once per workgroup into shared as f16 [BQ × hd].
@@ -3786,7 +3786,8 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
     let hd = head_dim;
     let hd_tiles = hd / 16;
     let bq: u32 = 16;
-    let bkv: u32 = 16;
+    let bkv: u32 = 32;
+    let kv_tiles = bkv / 16;
     let chunks_per_row: u32 = 2;
     let wg_size = bq * chunks_per_row;
     let chunk_hd: u32 = hd / chunks_per_row;
@@ -3891,8 +3892,9 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
     let _ = writeln!(src, "            let ki = i / {hd}u;");
     let _ = writeln!(src, "            let d  = i % {hd}u;");
     src.push_str("            let kv_pos = t + ki;\n");
-    src.push_str(
-        "            shared_k_t[d * 16u + ki] = f16(src_b[kv_pos * kv_dim + kv_head_off + d]);\n",
+    let _ = writeln!(
+        src,
+        "            shared_k_t[d * {bkv}u + ki] = f16(src_b[kv_pos * kv_dim + kv_head_off + d]);"
     );
     src.push_str(
         "            shared_v[ki * head_dim + d] = f16(bias[kv_pos * kv_dim + kv_head_off + d]);\n",
@@ -3901,6 +3903,10 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
     src.push_str("        workgroupBarrier();\n\n");
 
     // Cooperative QK^T → shared_score.
+    let _ = writeln!(
+        src,
+        "        for (var kt = 0u; kt < {kv_tiles}u; kt = kt + 1u) {{"
+    );
     src.push_str("        var score_acc = coop_mat16x16<f32,C>();\n");
     let _ = writeln!(
         src,
@@ -3912,14 +3918,15 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
     );
     let _ = writeln!(
         src,
-        "            let b = coopLoadT<coop_mat16x16<f16,B>>(&shared_k_t[ht * 16u * {bkv}u], {bkv}u);"
+        "            let b = coopLoadT<coop_mat16x16<f16,B>>(&shared_k_t[ht * 16u * {bkv}u + kt * 16u], {bkv}u);"
     );
     src.push_str("            score_acc = coopMultiplyAdd(a, b, score_acc);\n");
     src.push_str("        }\n");
     let _ = writeln!(
         src,
-        "        coopStoreT(score_acc, &shared_score[0], {bkv}u);"
+        "        coopStoreT(score_acc, &shared_score[kt * 16u], {bkv}u);"
     );
+    src.push_str("        }\n");
     src.push_str("        workgroupBarrier();\n\n");
 
     // Per-thread row softmax + PV. Each thread owns one (row, chunk).
@@ -3967,17 +3974,23 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
     src.push_str("        workgroupBarrier();\n");
     let _ = writeln!(
         src,
-        "        let probabilities = coopLoadT<coop_mat16x16<f16,A>>(&shared_p[0], {bkv}u);"
-    );
-    let _ = writeln!(
-        src,
         "        for (var ot = 0u; ot < {hd_tiles}u; ot = ot + 1u) {{"
     );
+    src.push_str("            var product = coop_mat16x16<f32,C>();\n");
     let _ = writeln!(
         src,
-        "            let values = coopLoadT<coop_mat16x16<f16,B>>(&shared_v[ot * 16u], {hd}u);"
+        "            for (var kt = 0u; kt < {kv_tiles}u; kt = kt + 1u) {{"
     );
-    src.push_str("            let product = coopMultiplyAdd(probabilities, values, coop_mat16x16<f32,C>());\n");
+    let _ = writeln!(
+        src,
+        "                let probabilities = coopLoadT<coop_mat16x16<f16,A>>(&shared_p[kt * 16u], {bkv}u);"
+    );
+    let _ = writeln!(
+        src,
+        "                let values = coopLoadT<coop_mat16x16<f16,B>>(&shared_v[kt * 16u * {hd}u + ot * 16u], {hd}u);"
+    );
+    src.push_str("                product = coopMultiplyAdd(probabilities, values, product);\n");
+    src.push_str("            }\n");
     let _ = writeln!(
         src,
         "            coopStoreT(product, &shared_pv[ot * 16u], {hd}u);"
