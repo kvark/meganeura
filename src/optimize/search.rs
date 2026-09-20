@@ -15,6 +15,7 @@ use egglog::{
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     ops::Range,
+    sync::Arc,
 };
 
 pub(crate) struct Candidate {
@@ -63,7 +64,7 @@ impl egglog::extract::Cost for Cost {
 #[derive(Clone)]
 struct Excluding {
     costs: FusionCostModel,
-    forbidden: Vec<Edge>,
+    forbidden: Arc<[Edge]>,
 }
 
 impl CostModel<Cost> for Excluding {
@@ -83,9 +84,10 @@ impl CostModel<Cost> for Excluding {
         Cost {
             forbidden: usize::from(
                 self.forbidden
-                    .binary_search(&Edge {
-                        head: func.name().to_string(),
-                        inputs: row.vals[..row.vals.len() - 1].to_vec(),
+                    .binary_search_by(|edge| {
+                        edge.head.as_str().cmp(func.name()).then_with(|| {
+                            edge.inputs.as_slice().cmp(&row.vals[..row.vals.len() - 1])
+                        })
                     })
                     .is_ok(),
             ),
@@ -95,31 +97,30 @@ impl CostModel<Cost> for Excluding {
 }
 
 fn edges(
-    egraph: &mut egglog::EGraph,
+    egraph: &egglog::EGraph,
     terms: &TermDag,
     root: TermId,
 ) -> Result<Vec<(Value, Edge)>, String> {
-    fn visit(
-        egraph: &mut egglog::EGraph,
-        terms: &TermDag,
-        id: TermId,
-        values: &mut HashMap<TermId, Value>,
-        edges: &mut Vec<(Value, Edge)>,
-    ) -> Result<Value, String> {
-        if let Some(&value) = values.get(&id) {
-            return Ok(value);
+    let mut result = Vec::new();
+    let mut values = vec![None; terms.size()];
+    let mut stack = vec![(root, false)];
+    while let Some((id, expanded)) = stack.pop() {
+        if values[id].is_some() {
+            continue;
         }
         let value = match *terms.get(id) {
             Term::App(ref head, ref args) => {
-                let inputs = args
-                    .iter()
-                    .map(|&arg| visit(egraph, terms, arg, values, edges))
-                    .collect::<Result<Vec<_>, _>>()?;
+                if !expanded {
+                    stack.push((id, true));
+                    stack.extend(args.iter().rev().map(|&arg| (arg, false)));
+                    continue;
+                }
+                let inputs: Vec<_> = args.iter().map(|&arg| values[arg].unwrap()).collect();
                 let value = egraph
                     .lookup_function(head, &inputs)
                     .ok_or("extracted term is missing from the e-graph")?;
                 if head != "Leaf" {
-                    edges.push((
+                    result.push((
                         value,
                         Edge {
                             head: head.clone(),
@@ -129,18 +130,11 @@ fn edges(
                 }
                 value
             }
-            _ => {
-                egraph
-                    .eval_expr(&terms.term_to_expr(&id, egglog::ast::Span::Panic))
-                    .map_err(|e| e.to_string())?
-                    .1
-            }
+            Term::Lit(egglog::ast::Literal::Int(value)) => egraph.base_to_value(value),
+            _ => return Err("expected an operator or node-id literal".into()),
         };
-        values.insert(id, value);
-        Ok(value)
+        values[id] = Some(value);
     }
-    let mut result = Vec::new();
-    visit(egraph, terms, root, &mut HashMap::new(), &mut result)?;
     Ok(result)
 }
 
@@ -236,17 +230,12 @@ fn segment_candidates(
         .flat_map(|shift| segment.ids.iter().map(move |id| id + shift))
     {
         let node = &graph.nodes()[id];
-        if matches!(
-            node.op,
-            Op::Input { .. } | Op::Parameter { .. } | Op::Constant { .. }
-        ) {
-            continue;
-        }
-        if matches!(
-            node.op,
-            Op::CacheWrite | Op::CacheWritePrefix | Op::ScatterAdd { .. }
-        ) {
-            return Err("stateful regions need an explicit mutation contract".into());
+        match node.op {
+            Op::Input { .. } | Op::Parameter { .. } | Op::Constant { .. } => continue,
+            Op::CacheWrite | Op::CacheWritePrefix | Op::ScatterAdd { .. } => {
+                return Err("stateful regions need an explicit mutation contract".into());
+            }
+            _ => {}
         }
         if node.requires_full_precision != full_precision {
             return Err("region crosses a precision boundary".into());
@@ -274,14 +263,15 @@ fn segment_candidates(
     egraph
         .parse_and_run_program(None, &program)
         .map_err(|e| e.to_string())?;
-    let (sort, value) = egraph
-        .eval_expr(&egglog::ast::Expr::Var(egglog::ast::Span::Panic, root_name))
-        .map_err(|e| e.to_string())?;
+    let sort = egraph.get_sort_by_name("Op").unwrap().clone();
+    let value = egraph
+        .lookup_function(&root_name, &[])
+        .ok_or("missing extraction root")?;
     let costs = match config.extraction_cost {
         super::ExtractionCost::AstSize => FusionCostModel::ast_size(),
         super::ExtractionCost::TensorTraffic => FusionCostModel::with_sizes(super::eclass_sizes(
             graph,
-            &mut egraph,
+            &egraph,
             segment.ids.iter().chain(&externals).copied(),
         )),
     };
@@ -293,9 +283,11 @@ fn segment_candidates(
         .map(|&shift| super::instance_ext_map(graph, &segment, &uses, shift))
         .collect::<Option<Vec<_>>>()
         .ok_or("region instances have ambiguous external edges")?;
-    let mut pending = VecDeque::from([Vec::new()]);
-    let mut visited = HashSet::from([Vec::new()]);
+    let empty = Arc::<[Edge]>::from([]);
+    let mut pending = VecDeque::from([empty.clone()]);
+    let mut visited = HashSet::from([empty]);
     let mut expressions = HashSet::new();
+    let mut terms = TermDag::default();
     let mut choices = HashMap::new();
     let mut result = Vec::new();
     let attempts = limit.saturating_mul(segment.ids.len());
@@ -312,7 +304,6 @@ fn segment_candidates(
                 forbidden: forbidden.clone(),
             },
         );
-        let mut terms = TermDag::default();
         let Some((cost, term)) = extractor.extract_best(&egraph, &mut terms, value) else {
             continue;
         };
@@ -321,7 +312,7 @@ fn segment_candidates(
         }
         let mut branches = Vec::new();
         let mut families = BTreeMap::<String, Vec<Edge>>::new();
-        for (value, edge) in edges(&mut egraph, &terms, term)? {
+        for (value, edge) in edges(&egraph, &terms, term)? {
             let branching = *choices.entry(value).or_insert_with(|| {
                 extractor
                     .extract_variants(&egraph, &mut TermDag::default(), value, 2)
@@ -345,22 +336,22 @@ fn segment_candidates(
             .filter(|edges| edges.len() > 1)
             .chain(branches.into_iter().map(|edge| vec![edge]));
         for excluded in exclusions {
-            let mut next = forbidden.clone();
+            let mut next = forbidden.to_vec();
             next.extend(excluded);
             next.sort_unstable();
             next.dedup();
-            if visited.contains(&next) {
+            if visited.contains(next.as_slice()) {
                 continue;
             }
             if visited.len() == attempts {
                 bounded = true;
             } else {
+                let next = Arc::<[Edge]>::from(next);
                 visited.insert(next.clone());
                 pending.push_back(next);
             }
         }
-        let expression = terms.to_string(term);
-        if !expressions.insert(expression.clone()) {
+        if !expressions.insert(term) {
             continue;
         }
         let mut candidate = graph.deep_clone();
@@ -391,7 +382,7 @@ fn segment_candidates(
         super::sweep_dead_nodes(&mut candidate);
         result.push(Candidate {
             graph: candidate.into_toposort(),
-            expression,
+            expression: terms.to_string(term),
         });
         if result.len() == limit {
             break;
@@ -407,6 +398,43 @@ fn segment_candidates(
 mod tests {
     use super::candidates;
     use crate::{Graph, graph::Op};
+
+    #[test]
+    #[ignore = "CPU search timing, run separately from correctness tests"]
+    #[cfg(feature = "models")]
+    fn cpu_search_overhead() {
+        use crate::models::{smollm2, smolvla, whisper};
+        for model in ["SmolLM2-135M", "SmolVLA", "Whisper-tiny"] {
+            let mut graph = Graph::new();
+            let output = match model {
+                "SmolLM2-135M" => {
+                    smollm2::build_graph(&mut graph, &smollm2::Config::smollm2_135m(), 128)
+                }
+                "SmolVLA" => smolvla::build_action_expert(
+                    &mut graph,
+                    &smolvla::Config::smolvla_base(),
+                    50,
+                    16,
+                ),
+                _ => whisper::build_encoder(&mut graph, &whisper::Config::whisper_tiny(), 1, 3000),
+            };
+            graph.set_outputs(vec![output]);
+            let region = crate::outline::detect_repeated_regions(&graph)[0];
+            for sample in 0..6 {
+                let start = std::time::Instant::now();
+                let space =
+                    super::repeated_candidates(&graph, region, Default::default(), 4).unwrap();
+                println!(
+                    "{model} sample={sample} region_nodes={} candidates={} truncated={} ms={:.3}",
+                    region.period,
+                    space.candidates.len(),
+                    space.truncated,
+                    start.elapsed().as_secs_f64() * 1000.0
+                );
+                assert!(!space.candidates.is_empty());
+            }
+        }
+    }
 
     #[test]
     fn keeps_fused_and_unfused_implementations_before_kernel_tuning() {

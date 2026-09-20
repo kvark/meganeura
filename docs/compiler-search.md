@@ -138,6 +138,80 @@ not actual execution time automatically. Tree extraction can also overcharge
 shared work in a DAG. Keeping two separately implemented rule sets adds drift
 without resolving any of these problems.
 
+## CPU overhead and review follow-up
+
+The September 20 review found avoidable work in our integration, not just in
+egglog. Ordinary extraction rebuilt the same cost table for every escaping
+root. It now computes one extractor and shares one term DAG per saturated
+segment. Node bindings use direct e-graph lookup rather than evaluating new
+expressions. The segment report is passed as one object instead of eleven
+independent arguments.
+
+Alternative extraction uses an explicit postorder stack, term-ID memoization
+and directly interned integer literals. It no longer creates an AST to recover
+literal values. Exclusion lookup borrows function names and argument slices,
+without allocating an edge on every cost query. The queue, visited set and
+extractor share immutable exclusion sets. Candidates are deduplicated by term
+ID in a shared DAG; expression strings are generated only for retained reports.
+Egglog's public terms and function lookup still use constructor names; replacing
+those with a second local operator registry would add another mapping to maintain.
+
+CPU-only release measurements on zork's i5-12400F, pinned to physical CPU 0,
+compare `dd743f4` with this follow-up. Each cell is the median of five warm
+invocations after one discarded invocation, in a fresh process per model/arm.
+No GPU context, shader compilation or GPU tuning is involved. Training totals
+include automatic differentiation and the ablation harness's graph copies;
+they are not complete deployment preparation times.
+
+| Workload | Inference before / after (ms) | Training before / after (ms) |
+|---|---:|---:|
+| SmolLM2-135M | 4.92 / 4.31 | 734.19 / 91.85 |
+| SmolVLA | 6.61 / 5.98 | 387.24 / 51.54 |
+| StableDiffusion | 28.05 / 17.65 | 521.42 / 88.39 |
+| ResNet-50 | 11.61 / 10.27 | 541.29 / 450.10 |
+| Whisper-tiny | 6.01 / 5.49 | 175.81 / 125.51 |
+
+The bounded four-form repeated-region search separately takes 4.19 / 3.57 ms
+for SmolLM2, 4.24 / 3.59 ms for SmolVLA, and 2.54 / 2.27 ms for Whisper.
+Whisper has one represented candidate here; the other two hit the four-form
+bound. This measures enumeration, not the subsequent physical-program search.
+The same small timing harness was applied to the baseline. Ordinary graph
+node/fusion counts, e-graph sizes and extraction-failure counts match in all
+ten cases. Peak process RSS does not increase (8.5--325.3 MiB after the change).
+
+Reproduce with `cargo run --release --features models --example
+optimizer_ablation -- --model SmolVLA --phase training --repeats 6`, discarding
+the first returned sample. The opt-in CPU search probe is `cargo test --release
+--features models --lib cpu_search_overhead -- --ignored --nocapture`.
+Neither adds a default CI timing test or another test executable.
+
+The remaining ResNet/Whisper preparation cost is mostly outside the reported
+egglog/stamping intervals, which total about 40/22 ms in the final training
+samples. Differentiation and graph-copy costs need separate attribution before
+changing egglog again. Linux sampling was unavailable (`perf_event_paranoid=4`);
+these are elapsed-time experiments, not a claim about sampled CPU hotspots.
+
+## Next cohort gate
+
+Do not start a distributed cohort merely by merging this PR. Inferena at
+`fa5a04e1` still calls ordinary `build` and then `tune_with`, before model inputs
+and weights are initialized. A pin update alone would miss joint structural
+search. Its `hub` feature and direct `Dispatch.use_coop` field access also need
+the current API spellings.
+
+First adapt the runner to initialized, qualified `build_measured` sessions;
+retain graph/plan coverage and skipped-region receipts, explicit total budgets,
+and peak-memory bounds for two candidate sessions. Then run all five models in
+both contracts on the local NVIDIA and Intel devices, check outputs/gradients,
+and compare held-out latency and preparation costs before freezing one pin.
+The previous GGUF check still has a small NVIDIA regression, variable Intel
+decode timing and higher preparation cost; these CPU improvements do not
+establish a GPU speedup or resolve calibration stability.
+
+Platforms without a usable PyTorch GPU path belong in the separate
+[qualification workflow](../paper/p3hpc/QUALIFICATION.md), never a CPU/GPU speed
+comparison. RPL-U has retained qualification evidence; Mendocino is pending.
+
 ## Alternatives for a later session
 
 The judgments below concern fit for Meganeura, not a ranking of published

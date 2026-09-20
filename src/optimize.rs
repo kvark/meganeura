@@ -17,7 +17,7 @@
 
 use crate::graph::{Graph, Node, NodeId, Op, TensorType};
 pub(crate) mod search;
-use egglog::{Term, TermDag, TermId, ast::Literal};
+use egglog::{Term, TermDag, TermId, ast::Literal, extract::Extractor};
 use std::collections::{HashMap, HashSet};
 use std::{fmt, time::Instant};
 
@@ -209,9 +209,9 @@ pub struct OptimizeReport {
     pub nodes_after: usize,
     /// Fusions applied: list of (fusion_name, node_index) pairs.
     pub fusions_applied: Vec<(String, u32)>,
-    /// Wall-clock time for egglog saturation.
+    /// Encoding, egglog parsing/saturation, extraction and e-graph statistics.
     pub egglog_time: std::time::Duration,
-    /// Wall-clock time for extraction + term stamping.
+    /// Term stamping and dead-code elimination.
     pub extract_time: std::time::Duration,
     /// Repeated regions outlined for per-block saturation (0 when the
     /// whole graph fit under the saturation cutoff).
@@ -350,36 +350,26 @@ fn optimize_egglog(mut g: Graph, config: OptimizeConfig) -> (Graph, OptimizeRepo
     let segment_count = segments.len();
     let max_segment_nodes = segments.iter().map(|s| s.ids.len()).max().unwrap_or(0);
 
-    let mut fusions: Vec<(String, u32)> = Vec::new();
     let mut index = build_structural_index(&g);
-    let mut first_program = String::new();
-    let mut num_eclasses = 0;
-    let mut num_enodes = 0;
-    let mut egglog_time = std::time::Duration::ZERO;
-    let mut extract_time = std::time::Duration::ZERO;
-    let mut extraction_failures = 0;
+    let mut report = OptimizeReport {
+        mode: config.mode,
+        extraction_cost: config.extraction_cost,
+        nodes_before,
+        outlined_regions,
+        segments: segment_count,
+        max_segment_nodes,
+        ..OptimizeReport::empty()
+    };
 
     for seg in &segments {
-        process_segment(
-            &mut g,
-            seg,
-            &mut index,
-            &mut fusions,
-            &mut first_program,
-            &mut num_eclasses,
-            &mut num_enodes,
-            &mut egglog_time,
-            &mut extract_time,
-            &mut extraction_failures,
-            config,
-        );
+        process_segment(&mut g, seg, &mut index, &mut report, config);
     }
 
     let dce_start = Instant::now();
     sweep_dead_nodes(&mut g);
-    extract_time += dce_start.elapsed();
+    report.extract_time += dce_start.elapsed();
 
-    let nodes_after = g
+    report.nodes_after = g
         .nodes()
         .iter()
         .filter(|n| !matches!(n.op, Op::Nop))
@@ -387,38 +377,20 @@ fn optimize_egglog(mut g: Graph, config: OptimizeConfig) -> (Graph, OptimizeRepo
 
     log::info!(
         "optimizer: {} fusions on {} nodes",
-        fusions.len(),
-        nodes_after
+        report.fusions_applied.len(),
+        report.nodes_after
     );
-    let mut rules_fired: Vec<(String, usize)> = Vec::new();
-    for fusion in &fusions {
-        if let Some(entry) = rules_fired.iter_mut().find(|e| e.0 == fusion.0) {
+    for fusion in &report.fusions_applied {
+        if let Some(entry) = report.rules_fired.iter_mut().find(|e| e.0 == fusion.0) {
             entry.1 += 1;
         } else {
-            rules_fired.push((fusion.0.clone(), 1));
+            report.rules_fired.push((fusion.0.clone(), 1));
         }
     }
-    for &(ref name, count) in &rules_fired {
+    for &(ref name, count) in &report.rules_fired {
         log::info!("  {}x {}", count, name);
     }
 
-    let report = OptimizeReport {
-        mode: config.mode,
-        extraction_cost: config.extraction_cost,
-        egglog_program: first_program,
-        num_eclasses,
-        num_enodes,
-        rules_fired,
-        nodes_before,
-        nodes_after,
-        fusions_applied: fusions,
-        egglog_time,
-        extract_time,
-        outlined_regions,
-        segments: segment_count,
-        max_segment_nodes,
-        extraction_failures,
-    };
     (g.into_toposort(), report)
 }
 
@@ -835,7 +807,7 @@ fn segment_program(g: &Graph, seg: &Segment, pack_swiglu: bool) -> (String, Vec<
 /// of their own.
 fn eclass_sizes(
     graph: &Graph,
-    egraph: &mut egglog::EGraph,
+    egraph: &egglog::EGraph,
     ids: impl Iterator<Item = usize>,
 ) -> HashMap<egglog::Value, u64> {
     let mut sizes = HashMap::new();
@@ -845,9 +817,7 @@ fn eclass_sizes(
             continue;
         }
         let var = format!("$n{}", node.id);
-        if let Ok((_sort, value)) =
-            egraph.eval_expr(&egglog::ast::Expr::Var(egglog::ast::Span::Panic, var))
-        {
+        if let Some(value) = egraph.lookup_function(&var, &[]) {
             sizes.insert(value, node.ty.size_bytes() as u64);
         }
     }
@@ -937,24 +907,17 @@ fn instance_ext_map(
     Some(map)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn process_segment(
     g: &mut Graph,
     seg: &Segment,
     index: &mut HashMap<(&'static str, Vec<NodeId>, bool), NodeId>,
-    fusions: &mut Vec<(String, u32)>,
-    first_program: &mut String,
-    num_eclasses: &mut usize,
-    num_enodes: &mut usize,
-    egglog_time: &mut std::time::Duration,
-    extract_time: &mut std::time::Duration,
-    extraction_failures: &mut usize,
+    report: &mut OptimizeReport,
     config: OptimizeConfig,
 ) {
     let egglog_start = Instant::now();
     let (program, externals) = segment_program(g, seg, config.pack_swiglu);
-    if first_program.is_empty() {
-        first_program.clone_from(&program);
+    if report.egglog_program.is_empty() {
+        report.egglog_program.clone_from(&program);
     }
     let mut egraph = egglog::EGraph::default();
     if let Err(e) = egraph.parse_and_run_program(None, &program) {
@@ -963,43 +926,46 @@ fn process_segment(
             seg.ids.len(),
             e
         );
-        *extraction_failures += 1;
-        *egglog_time += egglog_start.elapsed();
+        report.extraction_failures += 1;
+        report.egglog_time += egglog_start.elapsed();
         return;
     }
     let cm = match config.extraction_cost {
         ExtractionCost::AstSize => FusionCostModel::ast_size(),
         ExtractionCost::TensorTraffic => {
             let size_ids = externals.iter().copied().chain(seg.ids.iter().copied());
-            FusionCostModel::with_sizes(eclass_sizes(g, &mut egraph, size_ids))
+            FusionCostModel::with_sizes(eclass_sizes(g, &egraph, size_ids))
         }
     };
 
     let roots = segment_roots(g, seg);
-    let mut terms: Vec<(usize, TermDag, TermId)> = Vec::new();
+    let sort = egraph.get_sort_by_name("Op").unwrap().clone();
+    let extractor = Extractor::compute_costs_from_rootsorts(Some(vec![sort]), &egraph, cm);
+    let mut dag = TermDag::default();
+    let mut terms = Vec::new();
     for &root in &roots {
         let var = format!("$n{}", root);
-        match egraph.eval_expr(&egglog::ast::Expr::Var(egglog::ast::Span::Panic, var)) {
-            Ok((sort, value)) => {
+        match egraph.lookup_function(&var, &[]) {
+            Some(value) => {
                 let extraction = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    egraph.extract_value_with_cost_model(&sort, value, cm.clone())
+                    extractor.extract_best(&egraph, &mut dag, value)
                 }));
                 match extraction {
-                    Ok(Ok((dag, term_id, cost))) => {
+                    Ok(Some((cost, term_id))) => {
                         log::debug!(
                             "extracted $n{} (cost {}): {}",
                             root,
                             cost,
                             dag.to_string(term_id)
                         );
-                        terms.push((root, dag, term_id));
+                        terms.push((root, term_id));
                     }
-                    Ok(Err(e)) => {
-                        *extraction_failures += 1;
-                        log::warn!("extraction failed for $n{}: {}", root, e);
+                    Ok(None) => {
+                        report.extraction_failures += 1;
+                        log::warn!("extraction failed for $n{}", root);
                     }
                     Err(_) => {
-                        *extraction_failures += 1;
+                        report.extraction_failures += 1;
                         log::warn!(
                             "egglog panicked while reconstructing $n{} — root left unchanged",
                             root
@@ -1007,16 +973,16 @@ fn process_segment(
                     }
                 }
             }
-            Err(e) => {
-                *extraction_failures += 1;
-                log::warn!("failed to eval $n{}: {}", root, e);
+            None => {
+                report.extraction_failures += 1;
+                log::warn!("missing e-class for $n{}", root);
             }
         }
     }
     let serialized = egraph.serialize(egglog::SerializeConfig::default());
-    *num_eclasses += serialized.egraph.class_data.len();
-    *num_enodes += serialized.egraph.nodes.len();
-    *egglog_time += egglog_start.elapsed();
+    report.num_eclasses += serialized.egraph.class_data.len();
+    report.num_enodes += serialized.egraph.nodes.len();
+    report.egglog_time += egglog_start.elapsed();
 
     // Stamping. All instance translations are computed before any
     // mutation: stamping overwrites root inputs, which may be the very
@@ -1037,7 +1003,7 @@ fn process_segment(
             );
             continue;
         };
-        for &(root, ref dag, term_id) in &terms {
+        for &(root, term_id) in &terms {
             let requires_full_precision = g.node((root + shift) as NodeId).requires_full_precision;
             let mut stamper = Stamper {
                 g,
@@ -1045,16 +1011,16 @@ fn process_segment(
                 seg_ids: &idset,
                 shift,
                 ext_map,
-                fusions,
+                fusions: &mut report.fusions_applied,
                 memo: HashMap::new(),
                 requires_full_precision,
             };
-            if let Err(e) = stamper.stamp_root(root + shift, dag, term_id) {
+            if let Err(e) = stamper.stamp_root(root + shift, &dag, term_id) {
                 log::warn!("stamping $n{} (+{}) failed: {}", root, shift, e);
             }
         }
     }
-    *extract_time += stamp_start.elapsed();
+    report.extract_time += stamp_start.elapsed();
 }
 
 /// Rebuilds extracted terms in the graph IR. Interior nodes whose
@@ -1086,7 +1052,7 @@ struct Stamper<'a> {
 impl Stamper<'_> {
     /// Overwrite the root node in place with the extracted term.
     fn stamp_root(&mut self, root: usize, dag: &TermDag, term_id: TermId) -> Result<(), String> {
-        match dag.get(term_id).clone() {
+        match *dag.get(term_id) {
             Term::App(ref name, ref children) if named_constructor_exists(name) => {
                 let inputs = self.resolve_children(dag, children)?;
                 // Unchanged term → nothing to do.
@@ -1127,7 +1093,7 @@ impl Stamper<'_> {
         if let Some(&id) = self.memo.get(&term_id) {
             return Ok(id);
         }
-        let id = match dag.get(term_id).clone() {
+        let id = match *dag.get(term_id) {
             Term::App(ref name, ref children) if name == "Leaf" => {
                 self.translate(lit_node_id(dag, children[0])?)?
             }
@@ -1153,7 +1119,7 @@ impl Stamper<'_> {
                     None => self.build_named(name, inputs, None)?,
                 }
             }
-            other => return Err(format!("unexpected term {:?}", other)),
+            ref other => return Err(format!("unexpected term {:?}", other)),
         };
         self.memo.insert(term_id, id);
         Ok(id)
