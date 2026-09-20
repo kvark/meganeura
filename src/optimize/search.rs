@@ -249,6 +249,15 @@ fn segment_candidates(
         }
     }
     let (mut program, externals) = super::segment_program(graph, &segment);
+    // Seed the other side when the input already contains a fused product.
+    // Forward-only rules cannot recover an implementation erased by an earlier
+    // greedy pass. Keep the rest of that model's optimization intact.
+    program.push_str(
+        "(rewrite (FusedMatMulAdd ?a ?b ?c) (Add (MatMul ?a ?b) ?c))\n\
+         (rewrite (FusedMatMulATAdd ?a ?b ?c) (Add (MatMulAT ?a ?b) ?c))\n\
+         (rewrite (FusedMatMulBTAdd ?a ?b ?c) (Add (MatMulBT ?a ?b) ?c))\n\
+         (run 6)\n",
+    );
     let root_name = if roots.len() == 1 {
         format!("$n{}", roots[0])
     } else {
@@ -410,6 +419,14 @@ mod tests {
                 .all(|c| c.graph.node(c.graph.outputs()[0]).ty.shape == [3, 5])
         );
         assert!(candidates(&graph, 0).is_err());
+        let optimized = crate::optimize::optimize(&graph);
+        let recovered = candidates(&optimized, 8).unwrap();
+        assert!(recovered.candidates.iter().any(|candidate| {
+            matches!(
+                candidate.graph.node(candidate.graph.outputs()[0]).op,
+                Op::Add
+            )
+        }));
         graph.set_outputs(vec![product, out]);
         let space = candidates(&graph, 8).unwrap();
         assert!(!space.truncated);

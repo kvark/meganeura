@@ -1337,7 +1337,7 @@ pub fn compile_with(graph: &Graph, options: &CompileOptions) -> ExecutionPlan {
 /// `build()` uses this path after probing the context it will attach to the
 /// session. Keeping the target explicit avoids a process-global "first GPU
 /// wins" decision when an application owns multiple adapters.
-pub(crate) fn compile_with_caps(
+pub fn compile_with_caps(
     graph: &Graph,
     options: &CompileOptions,
     coop_caps: crate::codegen::CoopCaps,
