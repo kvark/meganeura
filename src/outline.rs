@@ -14,7 +14,7 @@
 //! then exact verification checks op/type equality (parameter and input
 //! names wildcarded) and edge isomorphism — every edge must either shift
 //! with the instance (in-block and chain edges), point at the same shared
-//! global node, or consistently rebind an equivalent external leaf.
+//! global node, or consistently rebind a dependency outside the region.
 
 use crate::graph::{Graph, Op};
 use std::{
@@ -96,9 +96,9 @@ fn ops_equivalent(a: &Op, b: &Op) -> bool {
 
 /// Check that instance `m` and instance `m+1` of the lattice are exact
 /// structural copies: equivalent ops and types at each offset, and every
-/// internal or chain edge shifts by one period. External leaves can be rebound
-/// consistently by type and kind: topological sorting may have moved parameters
-/// ahead of their users, so their IDs need not shift with the compute block.
+/// internal or chain edge shifts by one period. Dependencies before the entire
+/// region can be rebound consistently by type: topological sorting may have
+/// hoisted independent parameter projections ahead of the compute blocks.
 ///
 /// Comparing *consecutive* pairs matters: the first instance's incoming
 /// chain edge points at whatever pre-region node produced the initial
@@ -132,12 +132,7 @@ fn pair_isomorphic(graph: &Graph, start: usize, period: usize, m: usize) -> bool
                 }
             } else if nodes[ia].ty != nodes[ib].ty
                 || external.insert(ia, ib).is_some_and(|old| old != ib)
-                || (ib != ia + period
-                    && ib != ia
-                    && !(matches!(
-                        nodes[ia].op,
-                        Op::Input { .. } | Op::Parameter { .. } | Op::Constant { .. }
-                    ) && ops_equivalent(&nodes[ia].op, &nodes[ib].op)))
+                || (ib != ia + period && ib != ia && !(ia < start && ib < start))
             {
                 return false;
             }
@@ -293,6 +288,23 @@ mod tests {
             region.period,
             0
         ));
+
+        let mut projected = Graph::new();
+        let mut h = projected.input("x", &[4, 16]);
+        let weights: Vec<_> = (0..12)
+            .map(|i| {
+                let weight = projected.parameter(&format!("w{i}"), &[16, 16]);
+                projected.neg(weight)
+            })
+            .collect();
+        for weight in weights {
+            h = projected.matmul(h, weight);
+            h = projected.relu(h);
+            h = projected.neg(h);
+        }
+        projected.set_outputs(vec![h]);
+        let regions = detect_repeated_regions(&projected.toposort());
+        assert!(regions.iter().any(|r| r.period == 3 && r.count >= 10));
     }
 
     #[test]

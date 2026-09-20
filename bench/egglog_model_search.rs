@@ -1,5 +1,5 @@
 //! CPU survey, or whole-model search with a full independent CPU reference.
-//! Usage: egglog_model_search MODEL [REFERENCE.f32] [fast] [baseline] [--static]
+//! Usage: egglog_model_search MODEL [REFERENCE.f32|optimized] [fast] [baseline] [--static]
 use meganeura::{
     Graph,
     models::{smolvla, whisper},
@@ -175,8 +175,9 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
         },
         |session| {
             initialize(session, model);
-            check(session, reference).map(|_| ())
+            Ok(())
         },
+        |session| check(session, reference).map(|_| ()),
     )
     .unwrap();
     let mut samples = Vec::new();
@@ -217,7 +218,7 @@ fn main() {
         _ => panic!("SmolVLA or Whisper-tiny"),
     };
     graph.set_outputs(vec![output]);
-    if let Some(reference) = std::env::args().nth(2) {
+    if let Some(reference) = std::env::args().nth(2).filter(|arg| arg != "optimized") {
         let bytes = std::fs::read(reference).unwrap();
         assert_eq!(bytes.len() % 4, 0);
         let values: Vec<_> = bytes
@@ -235,8 +236,22 @@ fn main() {
         );
         return;
     }
+    if std::env::args()
+        .nth(2)
+        .is_some_and(|arg| arg == "optimized")
+    {
+        graph = meganeura::optimize::optimize(&graph);
+    }
+    for node in graph.nodes() {
+        log::debug!(
+            "{}: {:?} {:?} {:?}",
+            node.id,
+            node.op,
+            node.ty.shape,
+            node.inputs
+        );
+    }
     let regions = meganeura::outline::detect_repeated_regions(&graph);
-    assert!(!regions.is_empty());
     let mut results = Vec::new();
     for region in regions {
         let start = Instant::now();
