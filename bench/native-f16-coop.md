@@ -144,12 +144,14 @@ or tolerances. Intel passed both versions. This isolates a triggering shader
 pattern, not the responsible compiler layer; it is not yet an upstream driver
 bug diagnosis. Do not reuse timings from the rejected version.
 
-Intel pipeline statistics also show that large accumulator sets can spill.
-For the earlier direct-output 32x32x16 block, one subgroup generated 33 spills
-and 34 fills, while two generated none. A 32x64x32 block with two subgroups
-generated 67 spills and 74 fills. Those statistics explain a concrete cost in
+An additional capture of the pinned source confirms register pressure on Intel.
+For the direct-output 32x32x16 block, one subgroup generated 33 spills and
+34 fills, while two and four generated none. A 32x64x32 block generated
+67 spills and 76 fills with two subgroups, and none with four. These are static
+compiler counts, not measured memory traffic. They identify a concrete cost in
 these layouts, not all of Intel's performance gap. The driver's estimated
-cycle count is not a hardware measurement.
+cycle count is not a hardware measurement. All 80 cases also pass numerically
+in this separate capture; its timings are not used in the table.
 
 ## Reproduce
 
