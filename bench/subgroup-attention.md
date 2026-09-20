@@ -181,6 +181,9 @@ four convolution, full attention oracle, 11 convolution-derivative and Q/K/V
 gradient checks. Intel fallback checks pass; its two explicitly cooperative-only
 convolution tests stop at their existing capability assertion, not a numerical
 failure. No new test executable or relaxed tolerance is needed.
+[Production CI](https://github.com/kvark/meganeura/actions/runs/35515431629)
+passes all six jobs, including Metal. Rust host line coverage is 84.07%; WGSL
+execution is not instrumented and the existing CI backprop/bit-exact skips apply.
 
 Three before/after process pairs leave complete SmolVLA and Whisper CPU errors
 unchanged. Stable process medians suggest a small SmolVLA cost (~1%) and a small
