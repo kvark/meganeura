@@ -204,6 +204,7 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
 }
 
 fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let model = std::env::args().nth(1).expect("SmolVLA or Whisper-tiny");
     let mut graph = Graph::new();
     let output = match model.as_str() {
