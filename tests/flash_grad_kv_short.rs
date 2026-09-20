@@ -1,4 +1,4 @@
-//! Short-sequence cooperative dK/dV parity on GPUs with 16x16 f16 tiles.
+//! Short-sequence cooperative forward/backward parity on GPUs with f16 tiles.
 //!
 //! SmolVLA uses Q=50 with both KV=16 (cross attention) and KV=50 (self
 //! attention). These shapes must not inherit the scalar flash kernel's much
@@ -12,10 +12,14 @@ fn run(
     gpu: Arc<blade_graphics::Context>,
     q_seq: usize,
     kv_seq: usize,
+    window: u32,
     cooperative: bool,
-) -> (Vec<f32>, Vec<f32>, bool) {
+) -> ([Vec<f32>; 3], bool) {
     unsafe {
-        std::env::set_var("MEGANEURA_FLASH_FWD_COOP", "0");
+        std::env::set_var(
+            "MEGANEURA_FLASH_FWD_COOP",
+            if cooperative { "1" } else { "0" },
+        );
         std::env::set_var(
             "MEGANEURA_FLASH_BWD_COOP",
             if cooperative { "1" } else { "0" },
@@ -27,8 +31,11 @@ fn run(
     let q = graph.parameter("q", &[q_seq, num_heads as usize * head_dim as usize]);
     let k = graph.parameter("k", &[kv_seq, num_kv_heads as usize * head_dim as usize]);
     let v = graph.parameter("v", &[kv_seq, num_kv_heads as usize * head_dim as usize]);
-    let attention =
-        graph.multi_head_attn(q, k, v, num_heads, num_kv_heads, head_dim, q_seq != kv_seq);
+    let attention = if window == 0 {
+        graph.multi_head_attn(q, k, v, num_heads, num_kv_heads, head_dim, q_seq != kv_seq)
+    } else {
+        graph.sliding_window_attention(q, k, v, num_heads, num_kv_heads, head_dim, window)
+    };
     let loss = graph.mean_all(attention);
     graph.set_outputs(vec![loss]);
 
@@ -61,11 +68,17 @@ fn run(
     session.step();
     session.wait();
 
-    let mut dk = vec![0.0; k_data.len()];
-    let mut dv = vec![0.0; v_data.len()];
-    session.read_param_grad("k", &mut dk);
-    session.read_param_grad("v", &mut dv);
-    (dk, dv, uses_coop)
+    let gradients = [
+        ("q", q_data.len()),
+        ("k", k_data.len()),
+        ("v", v_data.len()),
+    ]
+    .map(|(name, len)| {
+        let mut gradient = vec![0.0; len];
+        session.read_param_grad(name, &mut gradient);
+        gradient
+    });
+    (gradients, uses_coop)
 }
 
 fn assert_close(label: &str, scalar: &[f32], cooperative: &[f32]) {
@@ -81,24 +94,29 @@ fn assert_close(label: &str, scalar: &[f32], cooperative: &[f32]) {
         .max(1e-6);
     assert!(
         max_abs / scale < 0.02,
-        "{label}: cooperative dK/dV differs from scalar by {:.3}% (max abs {max_abs:.3e})",
+        "{label}: cooperative gradient differs from scalar by {:.3}% (max abs {max_abs:.3e})",
         max_abs / scale * 100.0,
     );
 }
 
 #[test]
-fn short_cross_and_self_attention_grad_kv_match_scalar() {
+fn short_cross_self_and_window_attention_gradients_match_scalar() {
     let gpu = Arc::new(
         meganeura::init_gpu_context_with(meganeura::GpuOptions::from_env()).expect("GPU context"),
     );
     let has_coop = gpu.capabilities().cooperative_matrix.f16_tile == 16;
 
-    for (label, q_seq, kv_seq) in [("cross", 50, 16), ("self", 50, 50)] {
-        let (scalar_k, scalar_v, scalar_used_coop) = run(gpu.clone(), q_seq, kv_seq, false);
-        let (coop_k, coop_v, coop_used_coop) = run(gpu.clone(), q_seq, kv_seq, true);
+    for (label, q_seq, kv_seq, window) in [
+        ("cross", 50, 16, 0),
+        ("self", 50, 50, 0),
+        ("window", 50, 50, 17),
+    ] {
+        let (scalar, scalar_used_coop) = run(gpu.clone(), q_seq, kv_seq, window, false);
+        let (cooperative, coop_used_coop) = run(gpu.clone(), q_seq, kv_seq, window, true);
         assert!(!scalar_used_coop);
         assert_eq!(coop_used_coop, has_coop);
-        assert_close(&format!("{label} dK"), &scalar_k, &coop_k);
-        assert_close(&format!("{label} dV"), &scalar_v, &coop_v);
+        for (i, name) in ["dQ", "dK", "dV"].into_iter().enumerate() {
+            assert_close(&format!("{label} {name}"), &scalar[i], &cooperative[i]);
+        }
     }
 }
