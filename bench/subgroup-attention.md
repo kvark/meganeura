@@ -1,187 +1,171 @@
-# Cooperative attention layout study
+# Kernel gap studies
 
-Source-only experiment, 20 September 2026. No change to the submitted paper's
-benchmark cohort or production defaults. See `egglog_search.md` for model,
-CPU-reference, machine, and resource-limit details.
+Source-only experiments, 20 September 2026; no production defaults or paper
+protocol changed. [egglog_search.md](egglog_search.md) records model/reference
+pins, machine details, validation and the joint graph-search results.
 
-The workload is Inferena's deterministic Whisper-tiny encoder (3000 mel frames),
-not full audio transcription. RTX 5070, NVIDIA 595.91.07, accelerated F32 policy:
-F16 cooperative QK, F32 accumulation, scalar softmax and PV. Each sample freshly
-records, submits and waits. Five warmups, 30 samples per process, three process
-pairs with the middle pair reversed. Clocks are not locked. Timed samples exclude
-validation/readback; every run checks the complete output against the same CPU
-reference. Builds have separate target directories to avoid stale worktree
-artifacts. Per-pass profiles are separate runs, not headline timings.
+## What profiling identifies
 
-## Independent query tiles win
+Validated NVIDIA captures of the unchanged Inferena models show different
+bottlenecks. SmolVLA's greedy action expert spends about 91% of its instrumented
+pass intervals in matrix products. Attention is below 4%. The PyTorch capture
+uses many split-K CUTLASS GEMMs and combine kernels. This motivates keeping
+unfused/split implementations in the search, not just changing an attention
+kernel or forcing every product onto cooperative matrices.
 
-Baseline source: `5b4c97377b5d24378322bd8d7f42ee6c34da920f`.
-Candidate: `17cebb9338b23d73a7fdb68461f5d4cf1ddeb050`.
+Whisper's encoder spends about 53% in attention and 33% in matrix products;
+convolution is only about 4%. The useful first target is its attention layout.
+These are instrumented attribution percentages, not an additive explanation
+of wall latency or barrier cost.
 
-The original 64-thread workgroup processes 16 query rows. The candidate assigns
-16 different query rows to each of its two 32-lane subgroups, for 32 rows per
-workgroup. Both subgroups share K/V staging. PV remains scalar. There is no
-change to model math, precision, or backward kernels.
+Source leads:
 
-| Process pair | Baseline median (ms) | Independent queries (ms) |
-| --- | ---: | ---: |
-| 1 | 4.9233 | 3.9765 |
-| 2 | 4.9308 | 3.9989 |
-| 3 | 4.9602 | 3.9969 |
+- `vla.cpp` at `57a21c01383ae4322d9f7f81cf17a54cd1da31f7` hoists fixed
+  context K/V across denoising and uses F16 K/V in some paths. Its complete VLA
+  policy is not the same workload as Inferena's action expert.
+- `whisper.cpp` at `5670d5c0bbcb148feabef84400a07cfca9aa3b30` uses
+  Conv1d im2col plus matrix products and tiled Vulkan attention. Its native
+  cooperative-matrix paths are not equivalent to Naga's available interface.
+  No end-to-end vla.cpp/whisper.cpp performance comparison is claimed here.
 
-This is about 19% less whole-model time. The four attention passes total
-2.360 ms in the baseline profile and 1.413 ms in the candidate profile (40% less).
-Matrix passes stay at 1.437 ms. Full-output relative L2 error is unchanged at
-8.4823e-5. Driver-reported registers rise from 122 to 146 and workgroup storage
-from 7168 to 10240 bytes; fewer registers alone would not predict this result.
+## Whisper: independent query tiles
 
-The candidate requires a guaranteed 32-lane subgroup, not a guessed/default
-width or a vendor-name check. It is not yet a portable default. A production
-implementation must check the subgroup contract and measure legal layouts.
-The full-F64 oracle covers ragged lengths, mixed query/KV heads, full, causal,
-and windowed masks. It caught a causal bound that was still hard-coded to 16
-rows; the measured revision fixes it. Existing Q/K/V gradient checks also pass.
+At `17cebb9338b23d73a7fdb68461f5d4cf1ddeb050`, a 64-thread workgroup gives
+each fixed 32-lane subgroup 16 different query rows, instead of processing
+the same 16 rows. Both share K/V staging. QK uses F16 cooperative inputs and
+F32 accumulation; softmax and PV remain scalar. The control is
+`5b4c97377b5d24378322bd8d7f42ee6c34da920f`.
 
-## Negative results matter
+Three fresh-process pairs, reversing the middle pair, give Whisper encoder
+medians 4.923/4.931/4.960 ms before and 3.977/3.999/3.997 ms after:
+about 19% less whole-model time. Five warmups and 30 samples per process,
+fresh recording/submission/waiting, complete CPU checks before and after.
+Relative L2 is unchanged at 8.4823e-5.
 
-At `650f9337d80e3709a6f05000e2e441bdc403d4b8`, a 32-thread layout with a
-32-key tile computes both QK and PV with cooperative matrices. Converting and
-staging probabilities for PV does not pay off here: three candidate medians
-are 6.8932 / 6.8778 / 6.8748 ms, versus 4.9684 / 4.9812 / 4.9618 ms for the
-control. Attention time rises from 2.360 to 4.276 ms; matrix time is unchanged.
-Full-output relative L2 is 8.6848e-5. The unchanged validation gate passes.
-This version was reverted on the experiment branch.
+Separate attention pass intervals fall from 2.360 to 1.413 ms; matrix intervals
+stay at 1.437 ms. Registers rise from 122 to 146, and shared storage from
+7168 to 10240 bytes. Register count alone would predict this poorly.
+The driver's implausible per-thread local-memory statistic is not evidence
+of spills and is not used.
 
-## Measured layout selection
-
-Revision `ec7929f94cb4be4ec67f10046a9680a7ff745829` restores the original default
-and makes 1/2/4 independent query tiles explicit candidates in the existing
-whole-program selector. It uses Blade
-`2b328f8b643798813d8c9319b807030215d33b98`, whose new capability reports a fixed
-compute subgroup width only when Vulkan's minimum and maximum agree. Metal,
-GLES, and unknown/variable-width devices conservatively report no guarantee.
-There is no vendor-name gate or assumed default width. Candidate workgroup
-storage is capped at Vulkan's minimum 16-KiB guarantee. One broader existing
-GPU test checks all legal layouts against F64 across masks, mixed heads, and
-ragged sizes; it passes on NVIDIA and takes the existing fallback on Intel.
+Revision `ec7929f94cb4be4ec67f10046a9680a7ff745829` restores the old default
+and exposes 1/2/4 query tiles as whole-program candidates. Blade
+`2b328f8b643798813d8c9319b807030215d33b98` reports a guaranteed fixed
+compute subgroup width only when Vulkan minimum and maximum agree.
+Unknown/variable widths and other backends conservatively report no guarantee.
+Candidate shared storage stays within Vulkan's minimum 16-KiB guarantee.
+This is a capability check, not a vendor-name rule or an assumed default width.
 
 ```sh
 target/release/examples/egglog_model_search \
   Whisper-tiny /path/to/whisper-cpu.f32 fast baseline \
   --static --attention-tiles --confirm
-# Repeat with --reverse; this reverses challengers, not the control.
+# Repeat with --reverse. --static disables inner matmul tuning only.
 ```
 
-`--static` disables the inner matmul tuner for this layout-only ablation; it
-does not disable whole-program measurement. Three independent processes:
-
-| Search order | Selected query tiles | Control (ms) | Selected (ms) | Paired reduction |
+| Search order | Query tiles selected | Control | Selected | Paired reduction |
 | --- | ---: | ---: | ---: | ---: |
-| Forward | 2 | 4.9612 | 4.0291 | 18.8% |
-| Reverse | 4 | 4.9665 | 3.9818 | 19.8% |
-| Forward | 2 | 4.9544 | 4.0198 | 18.8% |
+| Forward | 2 | 4.961 ms | 4.029 ms | 18.8% |
+| Reverse | 4 | 4.966 ms | 3.982 ms | 19.8% |
+| Forward | 2 | 4.954 ms | 4.020 ms | 18.8% |
 
-Each selected layout wins all 40 independent confirmation pairs. The 2% noise
-guard does not consistently distinguish two from four tiles, which is fine:
-neither is a universal hard-coded choice. Search, construction and qualification
-together take 3.367 / 2.050 / 2.000 seconds; warm caches and four candidates,
-not a cold compiler comparison. Full-output error remains 8.4823e-5. B570
-reports variable subgroup width, excludes the independent-query candidates,
-and passes its full-output reference check through the existing implementation.
+All three win 40/40 held-out pairs. Search costs 2.0–3.4 seconds with warm
+caches and four candidates, not a cold compiler comparison. The 2% guard
+does not reliably distinguish two from four tiles; neither becomes a
+hard-coded universal choice.
 
-Another ablation (`79822865052ec23be6c56d2339af62e7eaf01f07`) removes only the
-minimum-workgroup estimate for F16 cooperative matrix products. SmolVLA slows
-from 4.3895 / 4.3924 / 4.3995 ms to 6.7445 / 6.7408 / 6.7034 ms. The full-output
-gate and all 26 existing skinny-matrix GPU checks pass. Simply forcing every
-small product onto the currently available cooperative implementation is not
-the solution. Keep family alternatives for measurement; do not replace this
-estimate with a blanket cooperative preference.
+The existing broad F64 oracle covers ragged Q/KV lengths, different query/KV
+head counts, full, causal and windowed masks; existing Q/K/V gradient checks
+also pass. It caught an initial causal bound still assuming 16 rows.
+B570 excludes these fixed-width candidates and passes its existing fallback.
 
-## SmolVLA: split-K and its final reduction
+## SmolVLA: matrix split-K and reduction cost
 
-Revision `58e4f2c2637de66c60e00f18a1836d64944f4630` also tests cooperative
-split-K products. One fixed 32-lane subgroup computes each partial tile,
-then the existing SumRows combines partials. The generator reuses cooperative
-staging and the masked epilogue store; unmasked ragged stores would overwrite
-the next partial. Precision and subgroup guards remain explicit.
+The generic serial SumRows candidate at
+`ad00f74db4afe9bf6694dc0c983e636d2f0c3832` assigns one lane to a column and
+serially sums its rows. Adjacent lanes read adjacent columns; no workgroup
+storage or barriers are needed. Widths 64/128/256 are measured alternatives,
+not shape/device thresholds.
 
-All 27 whole-program candidates qualify in both search orders, but neither
-search selects the cooperative family. Scalar split-K gives held-out medians
-3.9261 / 3.9248 ms, against greedy controls of 4.4546 / 4.4434 ms.
-Cooperative challengers take about 4.06–4.22 ms during selection. Full CPU
-relative L2 is 1.96e-4 for the cooperative plan and 5.55e-6 for scalar split-K.
-The broad full-F64 check covers normal and transposed products, ragged output
-dimensions, and uneven K partitions. This is a qualified negative result,
-not a reason to force cooperative execution.
+In the earlier isolated split-K ablation, it reduces whole-model time by
+6.2–7.5% on NVIDIA and 7.6–7.9% on Intel, with full CPU errors below 5.6e-6.
+These are not percentages to add to the graph-search gains. The combined
+45-plan study in `egglog_search.md` measures their interaction directly.
 
-Separate fixed-plan Nsight Systems captures complete successfully for the
-greedy, scalar-split and cooperative-split implementations. Companion GPU
-pass timings inside those instrumented captures put matrix work at
-3.637 / 2.096 / 2.405 ms respectively. Reduction and normalization passes
-rise from 0.132 to 0.749 / 0.759 ms. These are diagnostic instrumented
-intervals, not clean benchmark latencies or measurements of barrier cost.
+Fresh Nsight Systems 2026.4.1 captures at
+`52a9f25545cdd0ba0aedf9c74a34af22d62dfcd1` compare the greedy program,
+the original-graph 99-product scalar split-K program, and the same program
+with serial reductions. All complete and pass full-output validation.
 
-SQLite export still exposes Vulkan work as submissions, despite requesting
-individual workloads. CPU command-buffer boundaries and pipeline-bind counts
-identify 44 complete inference steps in each capture: two qualifications,
-five warmups, 30 ordinary samples, one output check, five pass-profile samples,
-and one final check. Using only the 30 ordinary samples:
+Despite requesting individual Vulkan workload tracing, this driver reports
+GPU work at `vkQueueSubmit` granularity. Match each workload's correlation ID
+to its host submit and preceding command-buffer begin. Identify the 44 full
+steps by their pipeline-bind count (154 or 303): two qualification, five warmup,
+30 ordinary timed, one output check, five pass-profile samples and a final check.
+Use only ordinary steps 7–36 for this table.
 
-| Plan | GPU submission span | Host recording interval | Queue-submit call |
-| --- | ---: | ---: | ---: |
-| Greedy | 3.425 ms | 1.462 ms | 0.050 ms |
-| Scalar split-K | 2.334 ms | 1.702 ms | 0.034 ms |
-| Cooperative split-K | 2.556 ms | 2.002 ms | 0.041 ms |
+| Plan | Dispatches | GPU submission span | Host begin-to-submit interval | Submit API call |
+| --- | ---: | ---: | ---: | ---: |
+| Greedy | 154 | 3.429 ms | 1.467 ms | 0.050 ms |
+| Scalar split-K | 303 | 2.349 ms | 1.763 ms | 0.041 ms |
+| Split-K + serial reduction | 303 | 2.112 ms | 1.473 ms | 0.036 ms |
 
-The host interval runs from command-buffer begin to queue-submit entry. It is
-not CPU busy time. Splitting speeds GPU execution while increasing recording
-work, because dispatch count grows from 154 to 299. The extra per-pass timing
-instrumentation also changes GPU spans, so its family totals must not be
-subtracted from these ordinary submission spans to infer barrier overhead.
-CPU stack sampling is unavailable under this machine's current perf policy;
-no system settings were changed to enable it.
+The selected program reduces the observed GPU span substantially, but still
+has substantial host recording work. Host intervals are not CPU-busy time.
+They and GPU spans are diagnostic, not independently additive causal costs.
 
-Revision `ad00f74db4afe9bf6694dc0c983e636d2f0c3832` addresses that reduction
-work with another generic candidate: one lane serially sums the rows for
-one output column. Adjacent lanes read adjacent columns; no workgroup
-storage or barriers are needed. Workgroup sizes 64, 128 and 256 are measured
-as alternatives, without a shape or device threshold. The existing broad
-split-K oracle covers every variant on both GPUs.
+Separate pass-instrumented samples put matrix work at 3.647/2.121/2.123 ms
+and normalization/reduction at 0.131/0.754/0.561 ms. This isolates the reduction
+change: matrix and attention intervals stay almost unchanged between the two
+split plans. Instrumentation raises the selected GPU interval total to 3.054 ms,
+versus the ordinary submission span of 2.112 ms. Do not subtract these quantities
+or interpret wall time minus a sum of pass times as barrier overhead.
+CPU stack sampling is unavailable under the current perf policy; no system
+settings were changed.
 
-Run `SmolVLA REFERENCE fast --program=3 --serial-sums --static --confirm`,
-then repeat with `--reverse`; use `strict` on B570. Here the confirmation
-control is the selected scalar split-K program, not the original greedy
-graph. The only change is the row reduction implementation:
-
-| GPU / order | Split-K control | Serial reduction | Median paired reduction |
-| --- | ---: | ---: | ---: |
-| RTX 5070 / forward | 3.9154 ms | 3.6748 ms | 6.2% |
-| RTX 5070 / reverse | 3.8931 ms | 3.6086 ms | 7.5% |
-| B570 / forward | 6.5871 ms | 6.0923 ms | 7.6% |
-| B570 / reverse | 6.6028 ms | 6.0880 ms | 7.9% |
-
-Held-out wins are 40/40, 36/40, 40/40 and 40/40; full CPU errors remain
-below 5.6e-6. Forward order chooses width 64, reverse order 256: the 2% guard
-does not establish a material difference between the serial widths. The
-four-program searches take 2.8–3.2 s on NVIDIA and 6.0 s on Intel, including
-construction and qualification, with inner matrix tuning disabled for this
-ablation. Combining these candidates with graph search is the next step;
-do not add the separate percentage improvements as if they were independent.
-
-## Reproduce
-
-Check out the indicated source revision, using a separate target directory for
-each worktree. Generate `whisper-cpu.f32` with `bench/egglog_reference.py` as
-described in `egglog_search.md`, then build and run:
+For these exact candidate IDs at the recorded revision:
 
 ```sh
-CARGO_BUILD_JOBS=1 cargo build --release --features models --example egglog_model_search
-VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json \
+# Replace PROGRAM with 0, 11 or 12. Run one process at a time.
+env -u LD_PRELOAD VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json \
+  nsys profile --trace=vulkan,nvtx --sample=none --cpuctxsw=none \
+  --wait=primary --vulkan-gpu-workload=individual --output=UNIQUE_PREFIX \
   target/release/examples/egglog_model_search \
-  Whisper-tiny /path/to/whisper-cpu.f32 fast baseline --static
+  SmolVLA /path/to/smolvla-cpu.f32 fast \
+  --serial-sums --program=PROGRAM --static --profile
 ```
 
-Use `--profile` only for a separate attribution run. The resource envelope used
-here is 4 GiB host memory, zero swap, a 120-second process limit, and six physical
-CPU cores. Raw JSON, traces, and frozen binaries remain outside Git. These are
-diagnostic model studies, not replacements for the frozen P3HPC campaign.
+## Trials not promoted to production
+
+These are qualified negative or small-effect results, not missing benchmark
+rows. Source branches preserve them without committing raw data or binaries.
+
+| Trial / revision | Result |
+| --- | --- |
+| Cooperative QK and PV, 32 keys (`650f9337d80e3709a6f05000e2e441bdc403d4b8`) | Whisper slows from ~4.97 to ~6.88 ms; probability conversion/staging does not pay off. |
+| Remove the minimum-workgroup estimate (`79822865052ec23be6c56d2339af62e7eaf01f07`) | SmolVLA slows from ~4.39 to ~6.73 ms. Blanket cooperative routing is not a solution. |
+| Cooperative split-K (`58e4f2c2637de66c60e00f18a1836d64944f4630`) | All 27 plans qualify; both search orders retain scalar split-K, ~3.93 ms versus cooperative challengers ~4.06–4.22 ms. |
+| Cooperative K stages 16/32/64 (`94a65c1bfb205ade8b84b86832a703486eaa47e8`) | All 45 plans qualify; neither order selects the cooperative family. Deeper staging is slower here. |
+| One 32-thread matrix subgroup (`bb16789dbc2fad074a530489d597c0abbae75456`) | Three pairs: Whisper ~4.97→5.45 ms, SmolVLA ~4.45→5.15 ms. |
+| Two independent matrix row tiles (`6174fbadf77a17463acb27409705dbdf7ee12459`) | Three pairs: only ~1–3% less model time; full CPU errors unchanged. |
+
+The last two use fixed-32 ablation branches, not capability-independent defaults.
+The cooperative split-K oracle checks full F64 products across normal/AT/BT
+directions, ragged edges and uneven K partitions. The independent-row trial
+also passes the 26 existing skinny-matrix checks with F16 explicitly enabled.
+The general subgroup contract and store ownership need a separate correctness
+review before promoting cooperative layouts.
+
+In particular, Naga 30 emits subgroup-scoped cooperative matrices, while the
+old 64-thread generator addresses the same output tiles from each subgroup.
+Passing numerical checks is not proof that overlapping stores are race-free.
+The [Vulkan memory model](https://docs.vulkan.org/spec/latest/appendices/memorymodel.html#memory-model-data-race)
+does not exempt equal-value writes, and the
+[cooperative-matrix scope contract](https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_cooperative_matrix.html)
+is per scope instance. This is a source-level correctness concern, not an
+observed output divergence in these runs. Independent tile ownership avoids
+that overlap in the tested layouts; F32 and other subgroup widths still need
+a portable treatment.
+
+All studies use sequential GPUs/builds, bounded host memory and unchanged
+numerical gates. Raw traces, JSON and frozen binaries stay outside Git.
