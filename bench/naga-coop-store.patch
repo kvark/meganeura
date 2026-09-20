@@ -1,0 +1,10 @@
+diff --git a/src/front/wgsl/lower/mod.rs b/src/front/wgsl/lower/mod.rs
+index 0d65416..90e34ae 100644
+--- a/src/front/wgsl/lower/mod.rs
++++ b/src/front/wgsl/lower/mod.rs
+@@ -3789,2 +3789,5 @@ impl<'source, 'temp> Lowerer<'source, 'temp> {
+                     let rctx = ctx.runtime_expression_ctx(function_span)?;
++                    rctx.block
++                        .extend(rctx.emitter.finish(&rctx.function.expressions));
++                    rctx.emitter.start(&rctx.function.expressions);
+                     rctx.block.push(

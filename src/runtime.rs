@@ -3387,7 +3387,7 @@ impl Session {
     /// Prefers native f32 for training correctness. The faster f16-input path
     /// remains opt-in because rounding compounds across deep training graphs.
     fn select_coop_config(
-        caps: &blade_graphics::CooperativeMatrix,
+        caps: &crate::codegen::CoopCaps,
         policy: CoopPolicy,
     ) -> Option<crate::codegen::CoopConfig> {
         use crate::codegen::CoopConfig;
@@ -3607,7 +3607,7 @@ impl Session {
             buffers = plan.buffers.len()
         )
         .entered();
-        let coop_caps = gpu.capabilities().cooperative_matrix;
+        let coop_caps = auto_tune(&gpu, 0).coop_caps;
         let coop_config = {
             let _span = tracing::info_span!("coop_probe").entered();
             Self::select_coop_config(&coop_caps, opts.coop)
@@ -5564,10 +5564,16 @@ pub struct AutoTuneResult {
 /// or the pipeline layer takes it as a parameter.
 pub fn auto_tune(gpu: &blade_graphics::Context, _head_dim: u32) -> AutoTuneResult {
     let cm = gpu.capabilities().cooperative_matrix;
+    let square = |shapes: &[[u32; 3]]| {
+        shapes
+            .iter()
+            .find(|s| s[0] == s[1] && s[1] == s[2])
+            .map_or(0, |s| s[0])
+    };
     AutoTuneResult {
         coop_caps: crate::codegen::CoopCaps {
-            f16_tile: cm.f16_tile,
-            f32_tile: cm.f32_tile,
+            f16_tile: square(&cm.f16),
+            f32_tile: square(&cm.f32),
         },
     }
 }

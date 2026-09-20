@@ -72,8 +72,8 @@ hf-hub = ["dep:hf-hub"]
 profiler = ["dep:tracing-subscriber"]
 
 [dependencies]
-# Calibrated GPU pass timestamps resolved after the completion fence.
-blade-graphics = { version = "0.9", git = "https://github.com/kvark/blade", rev = "eaff5092096aab136f11fa728b81c1bed3c0dcd4" }
+# Experimental native cooperative shapes; see bench/native-f16-coop.md.
+blade-graphics = { version = "0.9", git = "https://github.com/kvark/blade", rev = "8f80abb794c89b1299ec2a0e13386ee5296aad0b" }
 blade-macros = "0.3"
 # `default-features = false` drops egglog's `bin` stack (clap, mimalloc,
 # env_logger, chrono, graphviz). Greedy mode never constructs an EGraph
@@ -82,7 +82,7 @@ blade-macros = "0.3"
 egglog = { version = "2.0", default-features = false }
 bytemuck = { version = "1", features = ["derive"] }
 # Match Blade's Naga major: generated modules cross the public API boundary.
-naga = { version = "30", default-features = false, features = ["wgsl-in", "wgsl-out", "spv-out"] }
+naga = { version = "=30.0.1", default-features = false, features = ["wgsl-in", "wgsl-out", "spv-out"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ron = "0.8"
@@ -124,6 +124,10 @@ required-features = ["gguf"]
 name = "gguf_latency"
 path = "bench/gguf_latency.rs"
 required-features = ["gguf"]
+
+[[example]]
+name = "native_f16_coop"
+path = "bench/native_f16_coop.rs"
 
 [[example]]
 name = "train_deploy"
