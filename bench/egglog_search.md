@@ -97,6 +97,14 @@ The small-shape probe alone does not establish a whole-model improvement.
 The following model experiment tests that separately. Production search is
 still unchanged.
 
+The initial whole-model helper starts from the greedy graph and recovers both
+sides of the matmul/add equality. This does not recover every alternative an
+earlier rewrite might discard. The extraction API itself accepts the original
+graph; the final section tests that path separately. A production search should
+retain the original equivalence space, with the greedy plan as a cheap incumbent,
+not depend on reconstructing lost choices through an ever-growing reverse-rule
+catalog.
+
 ## Split-K as a structural candidate
 
 `egglog_search 50 720 960 forward split` also crosses 32/64 output tiles with
@@ -229,3 +237,26 @@ individual shaders. Portable pass timings came from separate instrumented
 runs. Neither host wait time nor wall-minus-summed-GPU-time is a measurement
 of CPU busy time or removable barrier cost. No P3HPC protocol or cohort was
 changed, and no vla.cpp/whisper.cpp end-to-end speed comparison is claimed.
+
+## Extraction before greedy rewriting
+
+Revision `d8d5876079ded4ed3585283e7c35f367bb3078ae` adds `--original-graph`.
+Only the control is greedily optimized; the other representations are extracted
+from a repeated region in the original model graph. The source API already
+supports this. No final greedy pass is allowed to collapse the alternatives.
+
+With `SmolVLA REFERENCE fast --original-graph --seconds=60 --confirm`, and then
+`--reverse`, the NVIDIA controls are 4.4433 / 4.4637 ms and the selected plans
+4.1797 / 4.1785 ms. Median paired reductions are 5.9% / 6.5%, winning 39/40
+held-out pairs each. B570 (`strict`) gives 9.8401 / 9.7891 ms controls and
+7.6115 / 7.6160 ms selected, 22.6% reductions and 40/40 wins. Full-output errors
+remain below 5.6e-6. All 18 lowered plans complete, in 36–38 s on NVIDIA and
+59.4 s on Intel; logical enumeration is still truncated at eight forms.
+
+This bounded search finds less than the earlier optimized-region experiment:
+it reaches 71/78 split products, not 97. Starting earlier is necessary to retain
+the general equivalence space, but is not enough to enumerate the best useful
+forms under a small bound. Region coverage and exploration order need work.
+Keep the greedy incumbent, and consider both logical and lowered alternatives
+under one budget. Do not replace a working bounded tuner with an unbounded
+whole-model saturation or claim that enumerating eight forms solves extraction.
