@@ -182,6 +182,7 @@ pub(crate) fn gemv_group(entry: &ShaderEntry) -> Option<crate::codegen::ShaderGr
 pub enum MatmulTile {
     Tile32,
     Tile64,
+    Scalar(crate::codegen::ScalarMatmulShape),
     /// Scalar convolution with immutable parameters and native integer division.
     /// Both spatial tiles and K-stage sizes are selected by measurement.
     SpecializedConv {
@@ -223,6 +224,8 @@ impl MatmulTile {
             Some(Self::Gemv(dispatch.gemv_shape.unwrap_or_else(|| {
                 crate::codegen::GemvShape::initial(group)
             })))
+        } else if let Some(shape) = dispatch.scalar_matmul {
+            Some(Self::Scalar(shape))
         } else if let Some(k_tile) = dispatch.conv_k_tile {
             Some(Self::SpecializedConv {
                 tile_size: if small { 32 } else { 64 },
@@ -255,7 +258,16 @@ impl MatmulTile {
             return;
         }
         dispatch.shader = self.shader(&class.shader);
-        dispatch.use_small_tiles = class.conv2d.is_none() && self == Self::Tile32;
+        dispatch.use_small_tiles = class.conv2d.is_none()
+            && matches!(
+                self,
+                Self::Tile32
+                    | Self::Scalar(crate::codegen::ScalarMatmulShape { tile_size: 32, .. })
+            );
+        dispatch.scalar_matmul = match self {
+            Self::Scalar(shape) => Some(shape),
+            _ => None,
+        };
         dispatch.use_coop = matches!(self, Self::CooperativeF32 { .. });
         dispatch.use_coop_compensated = false;
         dispatch.conv_k_tile = match self {
@@ -303,6 +315,7 @@ impl MatmulTile {
             Self::Gemv(shape) => return class.gemv_workgroups(shape),
             Self::Tile32 => 32,
             Self::Tile64 => 64,
+            Self::Scalar(shape) => shape.tile_size,
             Self::SpecializedConv { tile_size, .. } => tile_size,
             Self::CooperativeF32 { tile_size } => {
                 let tile = 2 * tile_size;
@@ -320,6 +333,16 @@ impl MatmulTile {
     }
 
     pub(crate) fn buffer_sizes(self, class: &TuneClass) -> Option<Vec<usize>> {
+        if let Self::Scalar(shape) = self {
+            if class.conv2d.is_some()
+                || gemv_group(&class.shader).is_some()
+                || class.weight_format.is_quantized()
+                || !matches!(shape.tile_size, 32 | 64)
+                || !matches!(shape.k_stage, 8 | 16 | 32)
+            {
+                return None;
+            }
+        }
         if let Self::Gemv(shape) = self {
             if gemv_group(&class.shader).is_none()
                 || !matches!(shape.threads, 32 | 64 | 128 | 256)
@@ -608,8 +631,8 @@ impl TuneClass {
         }
     }
 
-    /// A small deterministic tournament: scalar alternative first, then
-    /// native f32 where it fits. Capability/precision/padding are legality;
+    /// A bounded tournament over scalar layouts and native f32 where it fits.
+    /// Capability/precision/padding are legality;
     /// occupancy and the static large-shape veto do not exclude candidates.
     pub(crate) fn challengers(
         &self,
@@ -681,7 +704,7 @@ impl TuneClass {
             .filter(|&tile| tile != initial && tile.fits(self))
             .collect();
         }
-        [
+        let mut candidates: Vec<_> = [
             Some(MatmulTile::Tile64),
             Some(MatmulTile::Tile32),
             MatmulTile::native_cooperative(config)
@@ -689,8 +712,25 @@ impl TuneClass {
         ]
         .into_iter()
         .flatten()
-        .filter(|&tile| tile != initial && tile.fits(self))
-        .collect()
+        .collect();
+        if !self.weight_format.is_quantized() {
+            candidates.retain(|tile| matches!(tile, MatmulTile::CooperativeF32 { .. }));
+            for interleave_columns in [false, true] {
+                for k_stage in [32, 16, 8] {
+                    for tile_size in [64, 32] {
+                        candidates.push(MatmulTile::Scalar(crate::codegen::ScalarMatmulShape {
+                            tile_size,
+                            k_stage,
+                            interleave_columns,
+                        }));
+                    }
+                }
+            }
+        }
+        candidates
+            .into_iter()
+            .filter(|&tile| tile != initial && tile.fits(self))
+            .collect()
     }
 }
 
@@ -1403,9 +1443,19 @@ mod tests {
     #[test]
     fn complete_geometry_handles_edges_in_both_directions() {
         let mut d = dispatch();
-        let class = TuneClass::from_dispatch(&d, None).unwrap();
+        let mut class = TuneClass::from_dispatch(&d, None).unwrap();
         assert_eq!((class.m, class.n, class.k), (33, 65, 17));
+        class.binding_bytes = class.buffer_sizes().unwrap();
+        for candidate in class.challengers(MatmulTile::Tile64, None) {
+            candidate.apply(&mut d, &class);
+            assert_eq!(MatmulTile::selected(&d, None), Some(candidate));
+            assert_eq!(d.use_small_tiles, d.workgroups == [3, 2, 1]);
+            let roundtrip: Dispatch =
+                serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap();
+            assert_eq!(roundtrip, d);
+        }
         MatmulTile::Tile32.apply(&mut d, &class);
+        assert!(d.scalar_matmul.is_none());
         assert_eq!(d.workgroups, [3, 2, 1]);
         assert!(d.use_small_tiles);
         MatmulTile::Tile64.apply(&mut d, &class);
