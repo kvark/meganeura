@@ -12,10 +12,35 @@ use std::time::{Duration, Instant};
 
 fn initialize(
     session: &mut meganeura::Session,
+    mut incumbent: Option<&mut meganeura::Session>,
     model: &str,
     parameters: &mut std::collections::HashMap<(String, usize), Vec<f32>>,
 ) {
     for (name, buffer) in session.plan().param_buffers.clone() {
+        if let Some(source) = incumbent.as_deref_mut() {
+            let target = session.plan();
+            let origin = source.plan();
+            let compatible = origin
+                .param_buffers
+                .iter()
+                .find(|p| p.0 == name)
+                .is_some_and(|p| {
+                    target.param_types.contains_key(&buffer)
+                        && target.param_types.get(&buffer) == origin.param_types.get(&p.1)
+                        && target.weight_buffers.get(&buffer) == origin.weight_buffers.get(&p.1)
+                        && !origin.derived_params.iter().any(|d| d.0 == p.1)
+                })
+                && !target
+                    .derived_params
+                    .iter()
+                    .any(|d| d.0 == buffer || d.1.iter().any(|source| source.0 == name));
+            if compatible {
+                // Same deterministic named tensor; derived weights still take
+                // the ordinary initialization path, including their transforms.
+                session.share_parameter_from(source, &name).unwrap();
+                continue;
+            }
+        }
         let len = session.plan().buffers[buffer.0 as usize] / 4;
         let values = parameters.entry((name.clone(), len)).or_insert_with(|| {
             let seed_name = if model == "Whisper-tiny" {
@@ -306,8 +331,8 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
             max_programs: 64,
             max_plan_bytes: 3 * 1024 * 1024 * 1024,
         },
-        |session| {
-            initialize(session, model, &mut parameters);
+        |session, incumbent| {
+            initialize(session, incumbent, model, &mut parameters);
             Ok(())
         },
         |session| check(session, reference).map(|_| ()),
@@ -327,7 +352,7 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
     let errors = check(&mut session, reference).unwrap();
     let confirmation = control_plan.map(|plan| {
         let mut control = meganeura::Session::with_context_opts(plan, gpu, runtime);
-        initialize(&mut control, model, &mut parameters);
+        initialize(&mut control, None, model, &mut parameters);
         check(&mut control, reference).unwrap();
         let control_tuning = control.tune_with(tuning).unwrap();
         check(&mut control, reference).unwrap();

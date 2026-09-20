@@ -77,9 +77,12 @@ fn plan_bytes(plan: &ExecutionPlan) -> Result<usize, String> {
 }
 
 /// Search complete, legal implementations of the same immutable inference graph.
-/// Each has private buffers and is kernel-tuned *before* comparing graph forms.
-/// `initialize` writes representative inputs/weights once into each private
-/// session. `qualify` executes and checks all observable outputs against the
+/// Each has private state and is kernel-tuned *before* comparing graph forms.
+/// `initialize` writes representative inputs/weights once. Its optional idle
+/// incumbent permits sharing immutable, identically represented parameters via
+/// `Session::share_parameter_from`; it must not modify the incumbent's contents.
+/// Inputs, outputs and intermediate buffers remain private. `qualify` checks all
+/// observable outputs against the
 /// caller's numerical contract before tuning, after tuning and after measurements.
 /// Completed kernel-class searches are reused only inside this call, with exact
 /// geometry, placement, precision, knobs and candidate order. Whole-program
@@ -94,7 +97,7 @@ pub fn select(
     gpu: Arc<blade_graphics::Context>,
     runtime: SessionOptions,
     options: Options,
-    mut initialize: impl FnMut(&mut Session) -> Result<(), String>,
+    mut initialize: impl FnMut(&mut Session, Option<&mut Session>) -> Result<(), String>,
     mut qualify: impl FnMut(&mut Session) -> Result<(), String>,
 ) -> Result<(Session, Report), String> {
     options
@@ -147,7 +150,7 @@ pub fn select(
             trial.construction_time = build.elapsed();
             let result = (|| {
                 let init = Instant::now();
-                let initialized = initialize(&mut candidate);
+                let initialized = initialize(&mut candidate, incumbent.as_mut());
                 trial.initialization_time = init.elapsed();
                 initialized?;
                 let mut validate = |session: &mut Session| {
@@ -251,7 +254,8 @@ mod tests {
                 description: i.to_string(),
                 plan: plan.clone(),
             });
-            let (session, report) = select(
+            let mut shares = 0;
+            let (mut session, report) = select(
                 programs,
                 gpu.clone(),
                 SessionOptions {
@@ -271,9 +275,14 @@ mod tests {
                     max_programs: 2,
                     max_plan_bytes: 1 << 20,
                 },
-                |s| {
+                |s, incumbent| {
                     s.set_input("x", &vec![0.25; 33 * 17]);
-                    s.set_parameter("w", &vec![0.125; 17 * 65]);
+                    if let Some(incumbent) = incumbent {
+                        s.share_parameter_from(incumbent, "w").unwrap();
+                        shares += 1;
+                    } else {
+                        s.set_parameter("w", &vec![0.125; 17 * 65]);
+                    }
                     Ok(())
                 },
                 |s| {
@@ -289,6 +298,15 @@ mod tests {
                 },
             )
             .unwrap();
+            assert_eq!(shares, 1);
+            session.step();
+            session.wait();
+            assert!(
+                session
+                    .read_output(33 * 65)
+                    .iter()
+                    .all(|&v| v == 17.0 / 32.0)
+            );
             assert!(!report.truncated);
             let first = report.trials[0].kernel_tuning.as_ref().unwrap();
             let second = report.trials[1].kernel_tuning.as_ref().unwrap();

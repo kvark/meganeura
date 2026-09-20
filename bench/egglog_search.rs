@@ -180,7 +180,7 @@ fn main() {
                 max_programs: 64,
                 max_plan_bytes: 256 * 1024 * 1024,
             },
-            |session| {
+            |session, _| {
                 session.set_input("a", &a);
                 session.set_input("c", &c);
                 session.set_parameter("b", &b);
