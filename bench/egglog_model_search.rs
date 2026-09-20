@@ -257,6 +257,13 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
         programs.extend(variants);
     }
     let fixed_subgroup_size = gpu.capabilities().fixed_compute_subgroup_size;
+    if fast {
+        assert_eq!(
+            fixed_subgroup_size,
+            Some(32),
+            "independent-row ablation requires fixed 32-lane subgroups"
+        );
+    }
     let runtime = SessionOptions {
         gpu_timing: profile,
         wgsl_dump_dir: std::env::var("MEGANEURA_DUMP_WGSL").ok(),

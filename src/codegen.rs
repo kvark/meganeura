@@ -770,6 +770,11 @@ pub fn generate_horizontal_matmul(
     let Some((header, rest)) = src.split_once("@compute") else {
         panic!("matmul source missing @compute");
     };
+    let subgroup_argument = if rest.contains("@builtin(subgroup_id)") {
+        ", @builtin(subgroup_id) sg: u32"
+    } else {
+        ""
+    };
     let compute_attr = if rest.contains("@workgroup_size(64)") {
         "@compute @workgroup_size(64)"
     } else {
@@ -809,13 +814,14 @@ pub fn generate_horizontal_matmul(
         fn_src = fn_src.replacen("@workgroup_size(16, 16)", "", 1);
         fn_src = fn_src.replace("@builtin(workgroup_id) ", "");
         fn_src = fn_src.replace("@builtin(local_invocation_id) ", "");
+        fn_src = fn_src.replace("@builtin(subgroup_id) ", "");
         fn_src = fn_src.replace("matrix_b[", &format!("matrix_b{i}["));
         fn_src = fn_src.replace("matrix_c[", &format!("matrix_c{i}["));
         bodies.push_str(&fn_src);
         bodies.push('\n');
     }
     let mut dispatch = format!(
-        "{compute_attr}\nfn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{\n"
+        "{compute_attr}\nfn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>{subgroup_argument}) {{\n"
     );
     for i in 0..count {
         let cond = if i + 1 == count {
@@ -825,7 +831,12 @@ pub fn generate_horizontal_matmul(
         } else {
             format!("else if wgid.z == {i}u")
         };
-        dispatch.push_str(&format!("    {cond} {{ horiz_{i}(wgid, lid); }}\n"));
+        let extra = if subgroup_argument.is_empty() {
+            ""
+        } else {
+            ", sg"
+        };
+        dispatch.push_str(&format!("    {cond} {{ horiz_{i}(wgid, lid{extra}); }}\n"));
     }
     dispatch.push_str("}\n");
     ShaderModule::new(&format!("{header}{bodies}{dispatch}"))
@@ -1998,7 +2009,9 @@ pub(crate) fn generate_split_cooperative_matmul(
         },
         inputs: Vec::new(),
     };
-    let mut source = generate_coop_matmul_with_dag_epilogue(group, &config, &identity).source;
+    let (fused_add, variant) = coop_shape(group).unwrap();
+    let mut source =
+        gen_matmul_coop_wgsl_full(fused_add, variant, &config, None, Some(&identity), false).source;
     source = substitute(&source, "@workgroup_size(64)", "@workgroup_size(32)");
     // The original vector staging covers 256 elements with 64 threads. Cover
     // the same elements in two rounds before the single subgroup's MMA.
@@ -2610,7 +2623,7 @@ fn gen_matmul_coop_wgsl(
     variant: MatMulCoopVariant,
     config: &CoopConfig,
 ) -> ShaderModule {
-    gen_matmul_coop_wgsl_full(fused_add, variant, config, None, None)
+    gen_matmul_coop_wgsl_full(fused_add, variant, config, None, None, true)
 }
 
 /// Generate coop matmul with an optional [`crate::compile::MatMulPrologue`].
@@ -2620,7 +2633,7 @@ pub fn gen_matmul_coop_with_prologue(
     config: &CoopConfig,
     prologue: &crate::compile::MatMulPrologue,
 ) -> ShaderModule {
-    gen_matmul_coop_wgsl_full(fused_add, variant, config, Some(prologue), None)
+    gen_matmul_coop_wgsl_full(fused_add, variant, config, Some(prologue), None, true)
 }
 
 /// Generate a cooperative matmul that stages its f32 accumulators through
@@ -2642,7 +2655,7 @@ pub fn generate_coop_matmul_with_dag_epilogue(
     );
     let (fused_add, variant) = coop_shape(group)
         .unwrap_or_else(|| panic!("cooperative epilogue not supported for {group:?}"));
-    gen_matmul_coop_wgsl_full(fused_add, variant, config, None, Some(epilogue))
+    gen_matmul_coop_wgsl_full(fused_add, variant, config, None, Some(epilogue), true)
 }
 
 fn gen_matmul_coop_wgsl_full(
@@ -2651,6 +2664,7 @@ fn gen_matmul_coop_wgsl_full(
     config: &CoopConfig,
     prologue: Option<&crate::compile::MatMulPrologue>,
     epilogue: Option<&crate::compile::MatMulEpilogue>,
+    independent_rows: bool,
 ) -> ShaderModule {
     let tile = config.tile_size;
     let output_tile = config.output_tile();
@@ -2662,6 +2676,7 @@ fn gen_matmul_coop_wgsl_full(
     let tile_shift = tile.trailing_zeros();
 
     let compensated = config.compensated && config.use_f16_input;
+    let independent_rows = independent_rows && config.use_f16_input && tile == 16 && !compensated;
     let (elem_type, enable_f16) = if config.use_f16_input {
         ("f16", "enable f16;")
     } else {
@@ -3120,7 +3135,7 @@ fn gen_matmul_coop_wgsl_full(
     let tile_size_u = format!("{}u", tile);
     let shared_size_s = format!("{}", shared_size);
     let result_shared_size = output_tile * output_tile;
-    let (result_shared_decl, result_store) = if epilogue.is_some() {
+    let (result_shared_decl, result_store) = if epilogue.is_some() || independent_rows {
         let store_iters = result_shared_size.div_ceil(wg_size);
         (
             format!(
@@ -3198,7 +3213,7 @@ fn gen_matmul_coop_wgsl_full(
     };
 
     let src = include_str!("shaders/matmul_coop.wgsl");
-    let src = preprocess(
+    let mut src = preprocess(
         src,
         &[
             ("$ENABLE_F16", enable_f16),
@@ -3227,6 +3242,52 @@ fn gen_matmul_coop_wgsl_full(
             ("$COMPENSATED_MMA", &compensated_mma),
         ],
     );
+
+    // Fixed-32 ablation: both subgroups stage, each owns different output rows.
+    if independent_rows {
+        src = substitute(
+            &src,
+            "lid: vec3<u32>)",
+            "lid: vec3<u32>, @builtin(subgroup_id) sg: u32)",
+        );
+        src = substitute(
+            &src,
+            "shared_b0: array<f16, 256>",
+            "shared_b0: array<f16, 512>",
+        );
+        src = substitute(&src, "var<workgroup> shared_b1: array<f16, 256>;", "");
+        src = src.replace("shared_b1[", "shared_b0[256u + ");
+        src = substitute(&src, "(&shared_b0[0], 16u)", "(&shared_b0[sg * 256u], 16u)");
+        src = substitute(
+            &src,
+            "let c00 = tile_row * n",
+            "let c00 = (tile_row + sg * 16u) * n",
+        );
+        src = substitute(
+            &src,
+            "let c01 = tile_row * n",
+            "let c01 = (tile_row + sg * 16u) * n",
+        );
+        src = substitute(
+            &src,
+            "coopStoreT(acc00, &shared_c[0], 32u)",
+            "coopStoreT(acc00, &shared_c[sg * 512u], 32u)",
+        );
+        src = substitute(
+            &src,
+            "coopStoreT(acc01, &shared_c[16u], 32u)",
+            "coopStoreT(acc01, &shared_c[sg * 512u + 16u], 32u)",
+        );
+        src = src
+            .lines()
+            .filter(|line| {
+                !line.contains("acc10")
+                    && !line.contains("acc11")
+                    && !line.contains("let a1 = coopLoadT")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
 
     ShaderModule::new(&src)
 }
