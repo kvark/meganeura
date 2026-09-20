@@ -809,13 +809,20 @@ pub fn generate_horizontal_matmul(
         fn_src = fn_src.replacen("@workgroup_size(16, 16)", "", 1);
         fn_src = fn_src.replace("@builtin(workgroup_id) ", "");
         fn_src = fn_src.replace("@builtin(local_invocation_id) ", "");
+        fn_src = fn_src.replace("@builtin(subgroup_id) ", "");
         fn_src = fn_src.replace("matrix_b[", &format!("matrix_b{i}["));
         fn_src = fn_src.replace("matrix_c[", &format!("matrix_c{i}["));
         bodies.push_str(&fn_src);
         bodies.push('\n');
     }
+    let subgroup_arg = if coop.is_some() {
+        ", @builtin(subgroup_id) sg: u32"
+    } else {
+        ""
+    };
+    let subgroup_call = if coop.is_some() { ", sg" } else { "" };
     let mut dispatch = format!(
-        "{compute_attr}\nfn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{\n"
+        "{compute_attr}\nfn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>{subgroup_arg}) {{\n"
     );
     for i in 0..count {
         let cond = if i + 1 == count {
@@ -825,7 +832,9 @@ pub fn generate_horizontal_matmul(
         } else {
             format!("else if wgid.z == {i}u")
         };
-        dispatch.push_str(&format!("    {cond} {{ horiz_{i}(wgid, lid); }}\n"));
+        dispatch.push_str(&format!(
+            "    {cond} {{ horiz_{i}(wgid, lid{subgroup_call}); }}\n"
+        ));
     }
     dispatch.push_str("}\n");
     ShaderModule::new(&format!("{header}{bodies}{dispatch}"))
@@ -838,6 +847,7 @@ pub fn generate_wgsl(group: ShaderGroup) -> String {
         ShaderGroup::Conv2dGemmCoop | ShaderGroup::Conv2dGradInputGemmCoop => {
             naga::valid::Capabilities::COOPERATIVE_MATRIX
                 | naga::valid::Capabilities::SHADER_FLOAT16
+                | naga::valid::Capabilities::SUBGROUP
         }
         ShaderGroup::ToF16 => naga::valid::Capabilities::SHADER_FLOAT16,
         _ => naga::valid::Capabilities::empty(),
@@ -3078,6 +3088,8 @@ fn gen_matmul_coop_wgsl_full(
     let shared_size_s = format!("{}", shared_size);
     let result_shared_size = output_tile * output_tile;
     let (result_shared_decl, result_store) = if epilogue.is_some() {
+        // Cooperative matrices are subgroup-scoped. Only one subgroup may
+        // store these shared tiles; every invocation still reaches the barrier.
         let store_iters = result_shared_size.div_ceil(wg_size);
         (
             format!(
@@ -3085,10 +3097,12 @@ fn gen_matmul_coop_wgsl_full(
                 result_shared_size
             ),
             format!(
-                "coopStoreT(acc00, &shared_c[0], {output_tile}u);\n\
+                "if sg == 0u {{\n\
+                 \x20   coopStoreT(acc00, &shared_c[0], {output_tile}u);\n\
                  \x20   coopStoreT(acc01, &shared_c[{tile}u], {output_tile}u);\n\
                  \x20   coopStoreT(acc10, &shared_c[{}u], {output_tile}u);\n\
                  \x20   coopStoreT(acc11, &shared_c[{}u], {output_tile}u);\n\
+                 \x20   }}\n\
                  \x20   workgroupBarrier();\n\
                  \n\
                  \x20   for (var e = 0u; e < {store_iters}u; e++) {{\n\
@@ -3113,7 +3127,8 @@ fn gen_matmul_coop_wgsl_full(
     } else {
         (
             String::new(),
-            "coopStoreT(acc00, &matrix_c[c00], n);\n\
+            "if sg == 0u {\n\
+             \x20   coopStoreT(acc00, &matrix_c[c00], n);\n\
              \x20   if n1_valid {\n\
              \x20       coopStoreT(acc01, &matrix_c[c01], n);\n\
              \x20   }\n\
@@ -3122,6 +3137,7 @@ fn gen_matmul_coop_wgsl_full(
              \x20   }\n\
              \x20   if n1_valid && m1_valid {\n\
              \x20       coopStoreT(acc11, &matrix_c[c11], n);\n\
+             \x20   }\n\
              \x20   }"
                 .to_string(),
         )
@@ -4038,10 +4054,16 @@ pub fn generate_flash_attention_coop_tiled_module(head_dim: u32, query_tiles: u3
     );
     src.push_str("            score_acc = coopMultiplyAdd(a, b, score_acc);\n");
     src.push_str("        }\n");
+    if query_tiles == 0 {
+        src.push_str("        if sg == 0u {\n");
+    }
     let _ = writeln!(
         src,
         "        coopStoreT(score_acc, &shared_score[({query_offset}) * {bkv}u], {bkv}u);"
     );
+    if query_tiles == 0 {
+        src.push_str("        }\n");
+    }
     src.push_str("        workgroupBarrier();\n\n");
 
     // Per-thread row softmax + PV. Each thread owns one (row, chunk).
@@ -4219,7 +4241,7 @@ pub fn generate_flash_grad_q_coop_module(head_dim: u32) -> ShaderModule {
     src.push('\n');
 
     let _ = writeln!(src, "@compute @workgroup_size({wg_size})");
-    src.push_str("fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n");
+    src.push_str("fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(subgroup_id) sg: u32) {\n");
     let _ = writeln!(src, "    let pos_base = wgid.x * {bq}u;");
     src.push_str("    let head = wgid.y;\n");
     src.push_str("    let q_seq = params.q_seq;\n");
@@ -4346,7 +4368,7 @@ pub fn generate_flash_grad_q_coop_module(head_dim: u32) -> ShaderModule {
     src.push_str("        }\n");
     let _ = writeln!(
         src,
-        "        coopStoreT(score_acc, &shared_score[0], {bkv}u);"
+        "        if sg == 0u {{ coopStoreT(score_acc, &shared_score[0], {bkv}u); }}"
     );
 
     // dp = dO @ V^T.
@@ -4365,7 +4387,10 @@ pub fn generate_flash_grad_q_coop_module(head_dim: u32) -> ShaderModule {
     );
     src.push_str("            dp_acc = coopMultiplyAdd(a, b, dp_acc);\n");
     src.push_str("        }\n");
-    let _ = writeln!(src, "        coopStoreT(dp_acc, &shared_dp[0], {bkv}u);");
+    let _ = writeln!(
+        src,
+        "        if sg == 0u {{ coopStoreT(dp_acc, &shared_dp[0], {bkv}u); }}"
+    );
     src.push_str("        workgroupBarrier();\n\n");
 
     // ds = p * (dp - row_sum). 64 threads × 4 elements each = 256 entries
@@ -4557,7 +4582,7 @@ pub fn generate_flash_grad_kv_coop_module(head_dim: u32) -> ShaderModule {
     src.push('\n');
 
     let _ = writeln!(src, "@compute @workgroup_size({wg_size})");
-    src.push_str("fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n");
+    src.push_str("fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(subgroup_id) sg: u32) {\n");
     let _ = writeln!(src, "    let kv_base = wgid.x * {bkv}u;");
     src.push_str("    let kv_head = wgid.y;\n");
     src.push_str("    let q_seq = params.q_seq;\n");
@@ -4718,7 +4743,7 @@ pub fn generate_flash_grad_kv_coop_module(head_dim: u32) -> ShaderModule {
     src.push_str("            }\n");
     let _ = writeln!(
         src,
-        "            coopStoreT(score_acc, &shared_score[0], {bq}u);"
+        "            if sg == 0u {{ coopStoreT(score_acc, &shared_score[0], {bq}u); }}"
     );
 
     // dp = V @ dO^T (BKV x BQ).
@@ -4737,7 +4762,10 @@ pub fn generate_flash_grad_kv_coop_module(head_dim: u32) -> ShaderModule {
     );
     src.push_str("                dp_acc = coopMultiplyAdd(a_v, b_dot, dp_acc);\n");
     src.push_str("            }\n");
-    let _ = writeln!(src, "            coopStoreT(dp_acc, &shared_dp[0], {bq}u);");
+    let _ = writeln!(
+        src,
+        "            if sg == 0u {{ coopStoreT(dp_acc, &shared_dp[0], {bq}u); }}"
+    );
     src.push_str("            workgroupBarrier();\n\n");
 
     // p[kv, q] = exp(score * scale - lse[q]); ds[kv, q] = p * (dp - row_sum[q]).
@@ -5552,7 +5580,7 @@ pub fn generate_conv2d_coop_module(
     // Main function
     let _ = writeln!(src, "@compute @workgroup_size(64)");
     src.push_str(
-        "fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n",
+        "fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(subgroup_id) sg: u32) {\n",
     );
 
     if backward {
@@ -5807,6 +5835,7 @@ pub fn generate_conv2d_coop_module(
     if config.use_f16_input || !backward {
         // Forward and f16 cooperative kernels retain the direct-store
         // alignment requirement enforced by runtime selection.
+        src.push_str("    if sg == 0u {\n");
         src.push_str("    coopStoreT(acc00, &dst[c00], n_total);\n");
         src.push_str("    if n1_valid {\n");
         src.push_str("        coopStoreT(acc01, &dst[c01], n_total);\n");
@@ -5817,23 +5846,28 @@ pub fn generate_conv2d_coop_module(
         src.push_str("    if n1_valid && m1_valid {\n");
         src.push_str("        coopStoreT(acc11, &dst[c11], n_total);\n");
         src.push_str("    }\n");
+        src.push_str("    }\n");
     } else {
         // A direct cooperative store at a partial right edge crosses the
         // logical NCHW row boundary. Full column tiles keep the fast path;
         // only the final partial workgroup stages through the now-dead f32
         // input tiles and performs bounds-checked scalar stores.
         let _ = writeln!(src, "    if (tile_col + {output_tile}u) <= n_total {{");
+        src.push_str("        if sg == 0u {\n");
         src.push_str("        coopStoreT(acc00, &dst[c00], n_total);\n");
         src.push_str("        coopStoreT(acc01, &dst[c01], n_total);\n");
         src.push_str("        if m1_valid {\n");
         src.push_str("            coopStoreT(acc10, &dst[c10], n_total);\n");
         src.push_str("            coopStoreT(acc11, &dst[c11], n_total);\n");
         src.push_str("        }\n");
+        src.push_str("        }\n");
         src.push_str("    } else {\n");
+        src.push_str("        if sg == 0u {\n");
         let _ = writeln!(src, "        coopStoreT(acc00, &shared_b0[0], {tile}u);");
         let _ = writeln!(src, "        coopStoreT(acc01, &shared_b1[0], {tile}u);");
         let _ = writeln!(src, "        coopStoreT(acc10, &shared_a0[0], {tile}u);");
         let _ = writeln!(src, "        coopStoreT(acc11, &shared_a1[0], {tile}u);");
+        src.push_str("        }\n");
         src.push_str("        workgroupBarrier();\n");
         let _ = writeln!(
             src,
@@ -6325,17 +6359,20 @@ mod tests {
             (
                 ShaderGroup::FlashAttentionCoop,
                 naga::valid::Capabilities::COOPERATIVE_MATRIX
-                    | naga::valid::Capabilities::SHADER_FLOAT16,
+                    | naga::valid::Capabilities::SHADER_FLOAT16
+                    | naga::valid::Capabilities::SUBGROUP,
             ),
             (
                 ShaderGroup::FlashGradQCoop,
                 naga::valid::Capabilities::COOPERATIVE_MATRIX
-                    | naga::valid::Capabilities::SHADER_FLOAT16,
+                    | naga::valid::Capabilities::SHADER_FLOAT16
+                    | naga::valid::Capabilities::SUBGROUP,
             ),
             (
                 ShaderGroup::FlashGradKVCoop,
                 naga::valid::Capabilities::COOPERATIVE_MATRIX
-                    | naga::valid::Capabilities::SHADER_FLOAT16,
+                    | naga::valid::Capabilities::SHADER_FLOAT16
+                    | naga::valid::Capabilities::SUBGROUP,
             ),
             (
                 ShaderGroup::MultiHeadAttnGradQ,
@@ -6420,7 +6457,8 @@ mod tests {
         // Cooperative execution is a modifier rather than a group, so its
         // modules are reached through the scalar group they derive from.
         let coop_caps = naga::valid::Capabilities::COOPERATIVE_MATRIX
-            | naga::valid::Capabilities::SHADER_FLOAT16;
+            | naga::valid::Capabilities::SHADER_FLOAT16
+            | naga::valid::Capabilities::SUBGROUP;
         let config = CoopConfig {
             tile_size: 16,
             use_f16_input: true,
@@ -6581,12 +6619,16 @@ mod tests {
                 (
                     "coop",
                     coop,
-                    Capabilities::COOPERATIVE_MATRIX | Capabilities::SHADER_FLOAT16,
+                    Capabilities::COOPERATIVE_MATRIX
+                        | Capabilities::SHADER_FLOAT16
+                        | Capabilities::SUBGROUP,
                 ),
                 (
                     "compensated",
                     compensated,
-                    Capabilities::COOPERATIVE_MATRIX | Capabilities::SHADER_FLOAT16,
+                    Capabilities::COOPERATIVE_MATRIX
+                        | Capabilities::SHADER_FLOAT16
+                        | Capabilities::SUBGROUP,
                 ),
             ] {
                 let module = generate_horizontal_matmul(ShaderGroup::MatMul, count, Some(&cfg));
@@ -6618,7 +6660,9 @@ mod tests {
             );
             Validator::new(
                 ValidationFlags::all() ^ ValidationFlags::BINDINGS,
-                Capabilities::COOPERATIVE_MATRIX | Capabilities::SHADER_FLOAT16,
+                Capabilities::COOPERATIVE_MATRIX
+                    | Capabilities::SHADER_FLOAT16
+                    | Capabilities::SUBGROUP,
             )
             .validate(&module.module)
             .unwrap_or_else(|error| panic!("{group:?} compensated coop failed: {error:#?}"));
@@ -6644,7 +6688,9 @@ mod tests {
             use_f16_input: true,
             compensated: false,
         };
-        let capabilities = Capabilities::COOPERATIVE_MATRIX | Capabilities::SHADER_FLOAT16;
+        let capabilities = Capabilities::COOPERATIVE_MATRIX
+            | Capabilities::SHADER_FLOAT16
+            | Capabilities::SUBGROUP;
         let flags = ValidationFlags::all() ^ ValidationFlags::BINDINGS;
 
         for group in [
@@ -6673,7 +6719,8 @@ mod tests {
         let empty = naga::valid::Capabilities::empty();
         let f16 = naga::valid::Capabilities::SHADER_FLOAT16;
         let coop = naga::valid::Capabilities::COOPERATIVE_MATRIX
-            | naga::valid::Capabilities::SHADER_FLOAT16;
+            | naga::valid::Capabilities::SHADER_FLOAT16
+            | naga::valid::Capabilities::SUBGROUP;
         let groups: &[(ShaderGroup, naga::valid::Capabilities)] = &[
             (ShaderGroup::Unary, empty),
             (ShaderGroup::Binary, empty),
@@ -7141,7 +7188,9 @@ mod tests {
     fn generated_conv2d_coop_modules_are_valid() {
         use naga::valid::{Capabilities, ValidationFlags, Validator};
 
-        let coop_caps = Capabilities::COOPERATIVE_MATRIX | Capabilities::SHADER_FLOAT16;
+        let coop_caps = Capabilities::COOPERATIVE_MATRIX
+            | Capabilities::SHADER_FLOAT16
+            | Capabilities::SUBGROUP;
         let flags = ValidationFlags::all() ^ ValidationFlags::BINDINGS;
         let configs = [
             CoopConfig {
