@@ -3742,12 +3742,8 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
     let hd_tiles = hd / 16;
     let bq: u32 = 16;
     let bkv: u32 = 16;
-    let wg_size: u32 = 64;
-    assert!(
-        wg_size == bq * 4,
-        "coop flash assumes wg_size=64 / BQ=16 / 4 hd-chunks per row"
-    );
-    let chunks_per_row: u32 = 4;
+    let chunks_per_row: u32 = 2;
+    let wg_size = bq * chunks_per_row;
     let chunk_hd: u32 = hd / chunks_per_row;
 
     let mut src = String::new();
