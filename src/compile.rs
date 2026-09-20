@@ -938,21 +938,20 @@ fn can_horizontal_fuse(a: &Dispatch, b: &Dispatch) -> bool {
         && a.workgroups == b.workgroups
         && a.workgroups[2] == 1
         && a.params == b.params
-        && a.use_coop() == b.use_coop()
-        && a.use_coop_compensated() == b.use_coop_compensated()
-        && a.use_small_tiles() == b.use_small_tiles()
-        && a.scalar_matmul().is_none()
-        && b.scalar_matmul().is_none()
+        && a.kernel == b.kernel
+        && matches!(
+            a.kernel,
+            Kernel::Default
+                | Kernel::SmallTile
+                | Kernel::Cooperative
+                | Kernel::CooperativeCompensated
+        )
         && !a.weight_format.uses_reduced_storage()
         && a.weight_format == b.weight_format
         && a.matmul_prologue.is_none()
         && b.matmul_prologue.is_none()
         && a.matmul_epilogue.is_none()
         && b.matmul_epilogue.is_none()
-        && a.pointwise().is_none()
-        && b.pointwise().is_none()
-        && a.reduction().is_none()
-        && b.reduction().is_none()
         && a.gemv_rmsnorm.is_none()
         && b.gemv_rmsnorm.is_none()
         && a.input_buffers.len() == 2
@@ -965,10 +964,6 @@ fn merge_horizontal(dispatches: &[Dispatch], batch: &[usize]) -> Dispatch {
     let n = batch.len() as u32;
     merged.horizontal_batch = n;
     merged.workgroups[2] = n;
-    // The original fallback describes one output with z=1. The packed
-    // pipeline has different bindings, and only its selected variant is
-    // compiled. A future cooperative search must construct a packed fallback.
-    merged.scalar_fallback = None;
     merged.input_buffers = vec![merged.input_buffers[0]];
     merged.extra_outputs.clear();
     for (k, &idx) in batch.iter().enumerate() {
@@ -1061,13 +1056,6 @@ pub struct Dispatch {
     /// `Session::read_node` do.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub origin: Vec<NodeId>,
-    /// The scalar `(shader, workgroups)` this dispatch had before
-    /// cooperative-matrix promotion. Retained for diagnostics and future
-    /// complete cooperative candidates; the current tuner searches scalar
-    /// tiles only. Not serialized: cached plans are stored pre-selection and
-    /// re-selected per session.
-    #[serde(skip)]
-    pub scalar_fallback: Option<(ShaderEntry, [u32; 3])>,
     /// Storage format of the B (weight) input buffer.
     #[serde(default)]
     pub weight_format: WeightFormat,
@@ -1908,7 +1896,7 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                     continue;
                 }
                 let p = &plan.dispatches[pi];
-                if p.pointwise().is_none() || p.reduction().is_some() || p.fusion_barrier {
+                if p.pointwise().is_none() || p.fusion_barrier {
                     continue;
                 }
                 // Producer must cover the per-element domain (outer*inner).
@@ -6766,11 +6754,10 @@ mod tests {
     }
 
     #[test]
-    fn horizontal_fusion_drops_unpacked_fallback_and_preserves_precision() {
+    fn horizontal_fusion_preserves_precision() {
         let mut dispatches = vec![mm_dispatch(0, 1, 2, 1, 32), mm_dispatch(0, 3, 4, 1, 32)];
         for d in &mut dispatches {
             d.kernel = crate::compile::Kernel::Cooperative;
-            d.scalar_fallback = Some((d.shader.clone(), [1, 1, 1]));
         }
         dispatches[1].requires_full_precision = true;
         let mut groups = Vec::new();
@@ -6784,7 +6771,6 @@ mod tests {
         assert_eq!(packed.workgroups, [2, 2, 2]);
         assert!(packed.use_coop());
         assert!(packed.requires_full_precision);
-        assert!(packed.scalar_fallback.is_none());
         assert_eq!(packed.extra_outputs, [BufferRef(4)]);
     }
 
