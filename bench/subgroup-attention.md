@@ -121,6 +121,26 @@ pass timings inside those instrumented captures put matrix work at
 rise from 0.132 to 0.749 / 0.759 ms. These are diagnostic instrumented
 intervals, not clean benchmark latencies or measurements of barrier cost.
 
+SQLite export still exposes Vulkan work as submissions, despite requesting
+individual workloads. CPU command-buffer boundaries and pipeline-bind counts
+identify 44 complete inference steps in each capture: two qualifications,
+five warmups, 30 ordinary samples, one output check, five pass-profile samples,
+and one final check. Using only the 30 ordinary samples:
+
+| Plan | GPU submission span | Host recording interval | Queue-submit call |
+| --- | ---: | ---: | ---: |
+| Greedy | 3.425 ms | 1.462 ms | 0.050 ms |
+| Scalar split-K | 2.334 ms | 1.702 ms | 0.034 ms |
+| Cooperative split-K | 2.556 ms | 2.002 ms | 0.041 ms |
+
+The host interval runs from command-buffer begin to queue-submit entry. It is
+not CPU busy time. Splitting speeds GPU execution while increasing recording
+work, because dispatch count grows from 154 to 299. The extra per-pass timing
+instrumentation also changes GPU spans, so its family totals must not be
+subtracted from these ordinary submission spans to infer barrier overhead.
+CPU stack sampling is unavailable under this machine's current perf policy;
+no system settings were changed to enable it.
+
 Revision `ad00f74db4afe9bf6694dc0c983e636d2f0c3832` addresses that reduction
 work with another generic candidate: one lane serially sums the rows for
 one output column. Adjacent lanes read adjacent columns; no workgroup

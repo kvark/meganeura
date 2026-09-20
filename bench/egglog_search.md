@@ -285,3 +285,42 @@ deliberately postpones that family and reaches only 78 before the deadline.
 The bounded search is therefore still order-sensitive. The useful result is
 that the original, pre-greedy graph now reaches the earlier 12%/33% gains
 within 20 seconds, not that the global extraction problem is solved.
+
+## Reusing measurements within compilation
+
+Revision `43deac764ac6d225ae08899b62ef66a78ed0b72d` reuses completed
+private-scratch kernel searches within one whole-program selection. The key
+includes shape, direction, storage precision, binding sizes and placement,
+code-generation knobs, and the initial/challenger sequence. The memo belongs
+to one device and policy; it is neither a disk cache nor a global cache.
+Incomplete, failed, or unqualified searches do not populate it. Reports list
+reused choices separately rather than inventing new timing samples. Every
+whole program is still initialized, checked and measured independently.
+
+The opt-in broad GPU check covers two equivalent programs, full output and
+parameter checks, reuse after a completed search, and no reuse after a
+zero-budget search. It passes on both GPUs; Clippy and the existing CPU
+extraction checks also pass.
+
+The same original-graph helper, 18 plans, two-second inner tuning budget,
+and warm driver caches give these forward/reverse results:
+
+| GPU | Without reuse | With reuse | Kernel comparisons, without / with |
+| --- | ---: | ---: | ---: |
+| RTX 5070 | 35.8 / 35.5 s | 13.8 / 12.3 s | 921 / 935 versus 93 / 91 |
+| B570 | 56.7 / 57.1 s | 32.0 / 32.8 s | 307 / 308 versus 126 / 128 |
+
+The no-reuse control is `df3bce41c87ccd2091aada50df5f742ae4f31c5a`.
+NVIDIA completes all 18 plans even with a 20-second bound. Intel visits eight
+under that bound; a complete search still needs about 32 seconds. Full CPU
+errors stay below 5.6e-6. Selected plans win all 40 held-out confirmation
+pairs: about 12.4% / 8.8% reduction on NVIDIA and 33.1% / 32.3% on Intel
+for the complete memoized search. Reversing a bounded Intel search gives
+23.0% instead of 32.6%. A full non-memoized Intel run varies as far as 37.3%;
+unlocked clocks and different tuning decisions remain relevant.
+
+Even the complete NVIDIA search can retain a weaker graph family: one paired
+comparison drifts from roughly 3 to 4 ms and does not clear the existing noise
+guard. Reuse saves search work; it does not make a short, noisy comparison
+conclusive. Longer warmup and joint graph/reduction candidates are tested
+separately next, without weakening that guard.
