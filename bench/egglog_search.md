@@ -115,15 +115,20 @@ It passes on both RTX 5070 and B570 against full independent f64 products.
 
 ## Whole-model search
 
-At `0c0e2fa`, `egglog_model_search` retains the optimized greedy control and
+At `5b4c97377b5d24378322bd8d7f42ee6c34da920f`, `egglog_model_search` retains the optimized greedy control and
 up to eight alternatives for one repeated region. Each crosses dispatch
 fusion and plain/split-K lowering. All plans are lowered before allocation;
 the selector then holds at most an incumbent and one challenger session.
-Each candidate receives up to two seconds of ordinary kernel tuning before
+Identical dispatch-fusion alternatives within the same graph are skipped.
+The helper reuses deterministic host weights, but each session has private
+GPU allocations and receives a full upload. It skips parameter zeroing only
+because initialization fills every named parameter. Each candidate receives
+up to two seconds of ordinary kernel tuning before
 paired whole-step selection. The total search has a soft 180-second limit,
 a 32-program limit and a 3-GiB declared-plan-byte limit. The latter does not
 bound driver allocations, pipeline objects or staging. Runs also used a
-4-GiB process cgroup with no swap and a 300-second external timeout.
+4-GiB process cgroup with no swap and a 300-second external timeout. Construction,
+initialization, qualification and kernel tuning have separate report fields.
 
 This uses the same action expert (50 action tokens, 16 context tokens) and
 Whisper encoder (3000 mel frames) as Inferena, not the complete VLA policy or
@@ -140,6 +145,7 @@ VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json \
   target/release/examples/egglog_model_search \
   SmolVLA /tmp/smolvla.f32 fast --confirm
 # Repeat with --reverse. For B570 use intel_icd.json and strict.
+# --seconds=20 tests a shorter soft budget; --profile is a separate diagnostic.
 ```
 
 Every candidate is checked over the full model output before tuning, after
@@ -155,21 +161,42 @@ input precision; B570 uses native f32:
 
 | GPU / search order | Greedy control | Selected plan | Median paired reduction |
 | --- | ---: | ---: | ---: |
-| RTX 5070 / forward | 4.445 ms | 3.903 ms | 12.1% |
-| RTX 5070 / reverse | 4.477 ms | 3.935 ms | 12.2% |
-| B570 / forward | 9.825 ms | 6.580 ms | 33.5% |
-| B570 / reverse | 9.858 ms | 6.604 ms | 33.0% |
+| RTX 5070 / forward | 4.450 ms | 3.918 ms | 12.0% |
+| RTX 5070 / reverse | 4.470 ms | 3.925 ms | 12.1% |
+| B570 / forward | 9.857 ms | 6.597 ms | 32.9% |
+| B570 / reverse | 9.856 ms | 6.603 ms | 33.2% |
 
 The selected plan won all 40 confirmation pairs in each run. Different
 orders on NVIDIA selected different members of the same unfused-plus-split-K
 family: 97 versus 89 split products. Intel selected 97 in both orders.
 This is bounded exploration, not proof of a
-unique optimum. All 27 lowered candidates completed, but logical extraction
-was truncated at eight representatives. Search took about 74 seconds per
-NVIDIA run and 135 seconds per Intel run, including construction and qualification,
+unique optimum. All 18 distinct lowered candidates completed, but logical extraction
+was truncated at eight representatives. Search took 32.5–33.6 seconds per
+NVIDIA run and 58.2–58.3 seconds per Intel run, including construction and qualification,
 but excluding earlier graph extraction/lowering and the final confirmation.
 Graph extraction itself took 7–9 ms. Do not label session-construction time
 as shader compilation time.
+
+With a 20-second soft budget, search stops with explicit truncation:
+
+| GPU / search order | Candidates visited | Median paired reduction |
+| --- | ---: | ---: |
+| RTX 5070 / forward | 11 | 12.2% |
+| RTX 5070 / reverse | 11 | 8.8% |
+| B570 / forward | 7 | 33.2% |
+| B570 / reverse | 6 | 28.2% |
+
+Every selected plan again wins all 40 held-out pairs and passes the full CPU
+reference. The reverse searches retain an 81-product split family instead of
+reaching the better alternatives. Actual selector duration is 20.02–20.19 s;
+this is a soft deadline, not preemption of in-flight driver/validation work.
+
+Earlier `0c0e2fa` runs found the same approximate 12%/33% gains but rebuilt
+27 candidates and regenerated weights each time (74/135 s). The table above
+uses a fresh isolated Cargo build and the deduplicated selector. Independent
+worktrees must not share Meganeura build metadata. Clocks remain unlocked;
+both arms can drift within a run, so retain paired samples, not just minima.
+These budgets are not a like-for-like compiler comparison with PyTorch.
 
 Optimized SmolVLA required an outliner correction: topological sorting hoists
 independent K/V projections before the repeated blocks. Those dependencies
