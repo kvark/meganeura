@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 mod checkpoint;
+pub(crate) mod search_state;
 mod tuning;
 pub use crate::tune::TuneOutcome;
 pub(crate) use tuning::KernelMemo;

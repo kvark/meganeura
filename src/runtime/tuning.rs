@@ -442,13 +442,24 @@ impl Session {
     /// incumbent. A soft deadline may be exceeded by one in-flight operation;
     /// an incomplete comparison always retains its incumbent.
     pub fn tune_with(&mut self, options: TuneOptions) -> Result<TuneReport, TuneError> {
-        self.tune_with_memo(options, None)
+        self.tune_impl(options, None, true)
     }
 
     pub(crate) fn tune_with_memo(
         &mut self,
         options: TuneOptions,
+        memo: Option<&mut KernelMemo>,
+    ) -> Result<TuneReport, TuneError> {
+        // Whole-plan search has already lowered structural alternatives. Only
+        // retune kernels here, so no candidate silently becomes another plan.
+        self.tune_impl(options, memo, false)
+    }
+
+    fn tune_impl(
+        &mut self,
+        options: TuneOptions,
         mut memo: Option<&mut KernelMemo>,
+        attention_sequences: bool,
     ) -> Result<TuneReport, TuneError> {
         options.validate()?;
         let start = Instant::now();
@@ -547,7 +558,9 @@ impl Session {
                 memo.0.insert(memo_key, incumbent);
             }
         }
-        self.tune_attention(&mut report, start, &mut staging);
+        if attention_sequences {
+            self.tune_attention(&mut report, start, &mut staging);
+        }
         if staging.buffer.is_some()
             || report
                 .outcomes
