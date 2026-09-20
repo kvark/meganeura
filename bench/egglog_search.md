@@ -31,8 +31,9 @@ not exhaustive optimization. Other physical choices may not be represented.
 
 Alternatives are lowered before allocation and scheduling. The current public
 `select` prototype accepts complete plans and caller initialization/qualification
-callbacks. It supports immutable inference only. It does not yet replace the
-stateful attention installer that grows buffers and repairs live scheduling.
+callbacks. The follow-up below adds pre-allocation cached-attention choices and
+private persistent-state restoration. The public live-session tuner remains
+unchanged; migrating that API is still required before removing its installer.
 
 ## Isolation, reuse and validation
 
@@ -53,8 +54,9 @@ can change which local choice would be best.
 Every complete model is checked before tuning, after tuning and after sampling.
 All outputs must be finite and meet Inferena's unchanged forward gates:
 relative L2 and relative squared-norm error below 1%. Independent full CPU
-references are used in this study, not a sample of tensor elements. Training
-and stateful plans are rejected. No numerical threshold was relaxed.
+references are used in the model study, not a sample of tensor elements. Those
+measurements used the immutable-only selector at the revision below. No numerical
+threshold was relaxed.
 
 Whole-step samples include fresh recording, submission and waiting, but exclude
 output readback. Existing alternating pairs, a 2% improvement threshold and
@@ -191,8 +193,10 @@ Make graph/lowering alternatives a pre-allocation build-stage choice, rather
 than adding another operation-specific live-plan patcher. Retain the greedy
 incumbent, a bounded budget, legal numerical policies and explicit truncation.
 
-Production integration still needs a representative-data/qualification contract,
-stateful and training support, and removal of the old attention installer.
+Production integration still needs a representative-data/qualification contract
+at the build API, runtime optimizer support, and removal of the old attention
+installer after its callers migrate. Explicit persistent writes are now supported
+by the experimental selector, as described below.
 Broader physical choices, better bounded exploration order and reuse of compiled
 pipelines remain opportunities. Do not infer global optimality or PyTorch
 parity from these results.
@@ -200,3 +204,80 @@ parity from these results.
 See [subgroup-attention.md](subgroup-attention.md) for the Nsight attribution,
 Whisper attention result and negative cooperative-kernel trials. Raw results,
 traces and binaries remain outside Git; source revisions preserve reproduction.
+
+## Stateful attention follow-up
+
+Implementation and measurement helper: `84f65f2` (same Blade revision as above).
+This is a cached-attention region with input/output scaling and KV writes, not
+a whole-model or paper-cohort result. It does not change the model timings above.
+
+`ExecutionPlan::set_attention_splits` lowers one or two dispatches before a
+session exists. The ordinary scheduler and allocator then handle barriers and
+scratch lifetimes. Legality checks are shared with the existing tuner. The inner
+kernel search cannot change the structural alternative being compared.
+
+The common selector snapshots inputs, parameters and constants that the plan
+writes, then restores them before each validation, warmup and timed trial. It
+returns the selected session with its initial persistent state. Immutable weights
+can still be shared; sharing writable parameters is rejected. Runtime-added SGD,
+Adam and accumulation must be configured after search: their additional buffers
+and counters are not part of this snapshot contract. Updates explicitly encoded
+in the execution plan are supported. A failed incumbent invalidates the search;
+it cannot silently survive as the fallback.
+
+The API refinement at `a8edb56` makes qualification read-only: the selector owns the
+step and wait, then gives the checker an immutable session. A checker cannot
+accidentally advance the cache again, re-upload weights or change the optimizer
+through the ordinary session API. Broad workflow checks cover cache mutation,
+compiled forward/backward/SGD, rejected sharing and invalid-incumbent handling
+inside the existing library test binary; no additional test executables are used.
+All 468 all-feature library tests, including the opt-in GPU checks, pass in both
+the NVIDIA-selected and Intel-selected runs. All-target/all-feature Clippy passes.
+This is local prototype verification, not additional coverage claimed for PR #200.
+
+Snapshots count towards the logical memory bound. Reports separate snapshot
+bytes and capture/restore time from qualification and execution. Restoration is
+outside the execution timer but affects cache warmth. The following held-out
+comparison instead repeats an idempotent prefix write without restoration in
+either arm, to check ordinary steady-state execution.
+
+All five split choices are checked against every element of an independent f64
+output, plus exact complete K/V contents. Geometry: 12 query heads, four KV heads,
+head dimension 64, capacity 2048, F32, full-cache position. Search uses 16 warmup
+pairs and 12 selection pairs; confirmation uses 30 warmup pairs and 40 new pairs.
+The control is the existing position-balanced attention tuner, not an untuned
+kernel. Both GPUs and both challenger orders complete all five plans.
+
+| GPU / queries | Existing tuner, ms | Pre-allocated search, ms | Selected splits |
+| --- | ---: | ---: | --- |
+| RTX 5070 / 1 | 0.077 / 0.077 | 0.077 / 0.076 | 16 / 16 |
+| RTX 5070 / 16 | 0.266 / 0.265 | 0.265 / 0.265 | 16 / 16 |
+| B570 / 1 | 0.172 / 0.194 | 0.172 / 0.193 | 16 / 16 |
+| B570 / 16 | 0.884 / 0.885 | 0.884 / 0.869 | 4 / 16 |
+
+Pairs are forward/reverse challenger order. This supports performance parity,
+not a general speedup. Intel's reverse-order 16-query result is about 1.9% faster,
+near the 2% selection threshold; the control picks four splits in both orders.
+Unlocked-clock drift also changes absolute Intel decode times across processes.
+
+Search takes 1.42–1.83 seconds on NVIDIA and 0.44–0.67 on Intel; total state copying
+takes 9–11 and 38–46 ms respectively, with a 4-MiB snapshot per session. These are
+not comparable cold-start compilation costs: external CPU-reference construction
+is excluded, driver caches are warm, and the legacy tuner excludes session build.
+
+```sh
+CARGO_BUILD_JOBS=1 cargo build --release --example egglog_search
+VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json \
+  taskset -c 0,2,4,6,8,10 target/release/examples/egglog_search attention 16 2048 forward
+# Repeat with reverse; replace 16 with 1 for decode, and nvidia with intel.
+```
+
+This removes the need for a live patcher on the experimental path. It does not
+yet remove the production patcher or automatically choose representative inputs.
+
+A forward-order SmolVLA regression check at `a8edb56`, using the same 45 plans
+and validation gates, takes 33.3 / 42.9 seconds on NVIDIA / Intel. Held-out
+medians are 4.465→3.627 ms and 9.679→5.941 ms (18.8% / 38.5% paired reductions,
+40/40 wins each). All candidates qualify; relative L2 remains 5.55e-6 / 5.42e-6.
+These single repeats confirm the earlier result, not an additional optimization
+gain from state handling or a replacement for the two-order table above.
