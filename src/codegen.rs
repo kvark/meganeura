@@ -3851,7 +3851,11 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
 
     // Workgroup-wide bounds (drives all threads through the same
     // outer KV loop).
-    src.push_str("    let last_pos = min(pos_base + 15u, q_seq - 1u);\n");
+    let _ = writeln!(
+        src,
+        "    let last_pos = min(pos_base + {}u, q_seq - 1u);",
+        bq - 1
+    );
     src.push_str("    let max_kv_len = select(kv_seq, last_pos + 1u, kv_seq == 0u);\n");
     src.push_str("    let first_kv_len = select(kv_seq, pos_base + 1u, kv_seq == 0u);\n");
     src.push_str(
