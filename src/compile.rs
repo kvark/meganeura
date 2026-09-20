@@ -1069,6 +1069,11 @@ pub enum Kernel {
     Default,
     SmallTile,
     ScalarMatmul(crate::codegen::ScalarMatmulShape),
+    /// Complete split-K implementations also contain a following reduction.
+    SplitMatmul {
+        shape: crate::codegen::ScalarMatmulShape,
+        splits: u32,
+    },
     SpecializedConv {
         k_tile: u32,
     },
@@ -1332,7 +1337,7 @@ pub fn compile_with(graph: &Graph, options: &CompileOptions) -> ExecutionPlan {
 /// `build()` uses this path after probing the context it will attach to the
 /// session. Keeping the target explicit avoids a process-global "first GPU
 /// wins" decision when an application owns multiple adapters.
-pub(crate) fn compile_with_caps(
+pub fn compile_with_caps(
     graph: &Graph,
     options: &CompileOptions,
     coop_caps: crate::codegen::CoopCaps,

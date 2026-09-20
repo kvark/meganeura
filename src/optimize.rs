@@ -22,6 +22,8 @@ use egglog::{Term, TermDag, TermId, ast::Literal};
 use std::collections::{HashMap, HashSet};
 use std::{fmt, time::Instant};
 
+pub mod search;
+
 /// Node-count ceiling for a single egglog saturation. Above this, the
 /// graph is segmented (see module docs). Shared-parameter graphs create
 /// large e-classes that make pattern matching superlinear: the SmolVLA
