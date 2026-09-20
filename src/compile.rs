@@ -788,18 +788,6 @@ impl Dispatch {
     }
 }
 
-/// Legacy enum — kept for serde backward compat of cached plans.
-/// New code should use `MatMulEpilogue` (a `PointwiseDAG`).
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum EpilogueOp {
-    Add(u8),
-    BiasAdd(u8),
-    Relu,
-    Silu,
-    Sigmoid,
-    Neg,
-}
-
 /// A RmsNorm folded into a GEMV's A operand.
 ///
 /// A modifier on `ShaderEntry::MatMulGemv` rather than a shader entry of
@@ -824,8 +812,8 @@ pub enum EpilogueLoadKind {
 }
 
 /// A fused epilogue applied in the matmul store loop, expressed as a
-/// [`PointwiseDAG`]. Replaces the closed `EpilogueOp` enum so arbitrary
-/// per-element transforms can be fused without new enum variants.
+/// [`PointwiseDAG`], so arbitrary per-element transforms can be fused
+/// without new enum variants.
 ///
 /// `LoadInput(0)` in the DAG = `val` (the matmul accumulator result).
 /// `LoadInput(1+)` indexes into `inputs`, each with its own buffer +
@@ -939,8 +927,6 @@ fn can_horizontal_fuse(a: &Dispatch, b: &Dispatch) -> bool {
         && b.matmul_prologue.is_none()
         && a.matmul_epilogue.is_none()
         && b.matmul_epilogue.is_none()
-        && a.epilogue.is_empty()
-        && b.epilogue.is_empty()
         && a.pointwise.is_none()
         && b.pointwise.is_none()
         && a.reduction.is_none()
@@ -1078,12 +1064,6 @@ pub struct Dispatch {
     /// `$PROLOGUE_DECL` template variables from the prologue's factors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matmul_prologue: Option<MatMulPrologue>,
-    /// Legacy fields — kept for serde backward compat of cached plans.
-    /// New code uses `matmul_epilogue` instead.
-    #[serde(default)]
-    pub epilogue: Vec<EpilogueOp>,
-    #[serde(default)]
-    pub epilogue_buffers: Vec<BufferRef>,
     /// Human-readable label for profiling (e.g. `"MatMul[50,720,960]"`).
     #[serde(default)]
     pub label: String,
@@ -1381,9 +1361,6 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
             for buffer in &dispatch.input_buffers {
                 *reads.entry(*buffer).or_insert(0usize) += 1;
             }
-            for buffer in &dispatch.epilogue_buffers {
-                *reads.entry(*buffer).or_insert(0usize) += 1;
-            }
         }
 
         let mut candidate = None;
@@ -1563,9 +1540,6 @@ fn fuse_pointwise_chains(plan: &mut ExecutionPlan) {
             for b in &d.extra_outputs {
                 protected.insert(*b);
             }
-            for b in &d.epilogue_buffers {
-                *reads.entry(*b).or_default() += 1;
-            }
         }
 
         let mut fused_any = false;
@@ -1682,9 +1656,6 @@ fn shared_pointwise_consumers_are_foldable(
 ) -> bool {
     let mut foldable_reads = 0usize;
     for dispatch in &plan.dispatches {
-        if dispatch.epilogue_buffers.contains(&buffer) {
-            return false;
-        }
         let occurrences = dispatch
             .input_buffers
             .iter()
@@ -1731,9 +1702,6 @@ fn shared_embedding_consumers_are_foldable(
 ) -> bool {
     let mut foldable_reads = 0usize;
     for dispatch in &plan.dispatches {
-        if dispatch.epilogue_buffers.contains(&buffer) {
-            return false;
-        }
         let occurrences = dispatch
             .input_buffers
             .iter()
@@ -1833,9 +1801,6 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
         let mut reads: HashMap<BufferRef, usize> = HashMap::new();
         for d in &plan.dispatches {
             for b in &d.input_buffers {
-                *reads.entry(*b).or_default() += 1;
-            }
-            for b in &d.epilogue_buffers {
                 *reads.entry(*b).or_default() += 1;
             }
         }
@@ -2429,11 +2394,11 @@ fn fuse_epilogues(plan: &mut ExecutionPlan) {
         // DAG when one is present instead of silently changing its meaning.
         use crate::schedule::Pw;
         let d_shader = d.shader.clone();
-        let (pw_op, legacy_op) = match d_shader {
-            ShaderEntry::Relu => (Pw::Relu(0), EpilogueOp::Relu),
-            ShaderEntry::Sigmoid => (Pw::Sigmoid(0), EpilogueOp::Sigmoid),
-            ShaderEntry::Neg => (Pw::Neg(0), EpilogueOp::Neg),
-            ShaderEntry::Silu => (Pw::Silu(0), EpilogueOp::Silu),
+        let pw_op = match d_shader {
+            ShaderEntry::Relu => Pw::Relu(0),
+            ShaderEntry::Sigmoid => Pw::Sigmoid(0),
+            ShaderEntry::Neg => Pw::Neg(0),
+            ShaderEntry::Silu => Pw::Silu(0),
             _ => continue,
         };
         let canonical_dag = PointwiseDAG {
@@ -2441,10 +2406,10 @@ fn fuse_epilogues(plan: &mut ExecutionPlan) {
             ops: vec![Pw::LoadInput(0), pw_op],
             output: 1,
         };
-        let (epilogue_dag, has_legacy_equivalent) = match d.pointwise.as_ref() {
-            Some(dag) if dag.n_inputs == 1 => (dag.clone(), *dag == canonical_dag),
+        let epilogue_dag = match d.pointwise.as_ref() {
+            Some(dag) if dag.n_inputs == 1 => dag.clone(),
             Some(_) => continue,
-            None => (canonical_dag, true),
+            None => canonical_dag,
         };
         let primary_buf = d.input_buffers[0];
         let elem_output = d.output_buffer;
@@ -2495,13 +2460,6 @@ fn fuse_epilogues(plan: &mut ExecutionPlan) {
                 inputs: vec![],
             });
         }
-        // Maintain the old flat field only when it describes the same op.
-        // New readers use `matmul_epilogue`; inventing a legacy Relu for a
-        // Clamp DAG is actively misleading to old diagnostics and caches.
-        if has_legacy_equivalent {
-            dispatches[prod_idx].epilogue.push(legacy_op);
-        }
-
         dispatches[prod_idx].requires_full_precision |= consumer_requires_full_precision;
         dispatches[prod_idx].output_buffer = elem_output;
         let absorbed_origin = dispatches[i].origin.clone();
@@ -6351,7 +6309,13 @@ mod tests {
         // MatMul with Relu fused into epilogue (epilogue fusion pass)
         assert_eq!(plan.dispatches.len(), 1);
         assert_eq!(plan.dispatches[0].shader, ShaderEntry::MatMul);
-        assert_eq!(plan.dispatches[0].epilogue, vec![EpilogueOp::Relu]);
+        assert_eq!(
+            plan.dispatches[0].matmul_epilogue.as_ref().unwrap().dag.ops,
+            [
+                crate::schedule::Pw::LoadInput(0),
+                crate::schedule::Pw::Relu(0)
+            ]
+        );
     }
 
     #[test]
@@ -7189,7 +7153,6 @@ mod tests {
                 output: 4,
             }
         );
-        assert!(plan.dispatches[0].epilogue.is_empty());
     }
 
     #[test]

@@ -117,7 +117,7 @@ pub(super) fn tile_module(
     if let MatmulTile::Scalar(shape) = tile {
         return crate::codegen::generate_matmul_with_epilogue(
             entry.shader_group(),
-            crate::codegen::EpilogueSource::Ops(&[]),
+            None,
             crate::codegen::MatMulOptions {
                 format: dispatch.weight_format,
                 tile: match shape.tile_size {
@@ -161,7 +161,7 @@ pub(super) fn tile_module(
     if dispatch.weight_format.uses_reduced_storage() {
         return crate::codegen::generate_matmul_with_epilogue(
             selected_entry.shader_group(),
-            crate::codegen::EpilogueSource::Ops(&[]),
+            None,
             crate::codegen::MatMulOptions {
                 format: dispatch.weight_format,
                 tile: match tile {

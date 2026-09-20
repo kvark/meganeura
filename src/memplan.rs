@@ -391,9 +391,6 @@ fn compute_pinned(
         for b in &d.input_buffers {
             uses[b.0 as usize].read(g);
         }
-        for b in &d.epilogue_buffers {
-            uses[b.0 as usize].read(g);
-        }
         if let Some(epi) = d.matmul_epilogue.as_ref() {
             for &(b, _) in &epi.inputs {
                 uses[b.0 as usize].read(g);

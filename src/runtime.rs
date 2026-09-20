@@ -1039,33 +1039,19 @@ struct MultiHeadAttnGradKVData {
 /// f32 shader over packed blocks, or a 64×64 shader under a workgroup
 /// count computed for 32×32 tiles.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum EpiloguePipelineKey {
-    Dag(
-        crate::compile::MatMulEpilogue,
-        crate::compile::WeightFormat,
-        crate::codegen::MatMulTile,
-    ),
-    Legacy(
-        Vec<crate::compile::EpilogueOp>,
-        crate::compile::WeightFormat,
-        crate::codegen::MatMulTile,
-    ),
-}
+struct EpiloguePipelineKey(
+    crate::compile::MatMulEpilogue,
+    crate::compile::WeightFormat,
+    crate::codegen::MatMulTile,
+);
 
 fn epilogue_pipeline_key(dispatch: &Dispatch) -> Option<EpiloguePipelineKey> {
     let format = dispatch.weight_format;
     let tile = epilogue_tile(dispatch);
-    if let Some(ref epilogue) = dispatch.matmul_epilogue {
-        Some(EpiloguePipelineKey::Dag(epilogue.clone(), format, tile))
-    } else if !dispatch.epilogue.is_empty() {
-        Some(EpiloguePipelineKey::Legacy(
-            dispatch.epilogue.clone(),
-            format,
-            tile,
-        ))
-    } else {
-        None
-    }
+    dispatch
+        .matmul_epilogue
+        .as_ref()
+        .map(|epilogue| EpiloguePipelineKey(epilogue.clone(), format, tile))
 }
 
 /// Tile geometry the epilogue shader must be generated for.
@@ -1109,8 +1095,7 @@ enum Variant {
     /// containing different attention widths run every dispatch through
     /// whichever width happened to be encountered last.
     Attention(ShaderEntry, u32),
-    /// Epilogue-fused matmuls, keyed by their actual DAG (or the legacy
-    /// closed op list for deserialized old plans). The cooperative form
+    /// Epilogue-fused matmuls, keyed by their actual DAG. The cooperative form
     /// uses workgroup memory to expose accumulator lanes to the epilogue.
     Epilogue(ShaderEntry, EpiloguePipelineKey),
     CoopEpilogue(ShaderEntry, EpiloguePipelineKey),
@@ -1701,9 +1686,7 @@ impl Pipelines {
             }
         }
 
-        // Compile epilogue-fused pipelines for dispatches with non-empty epilogue.
-        // Prefer the new MatMulEpilogue (PointwiseDAG); fall back to legacy
-        // Vec<EpilogueOp> for cached plans that predate the DAG migration.
+        // Compile epilogue-fused pipelines.
         for dispatch in &plan.dispatches {
             let Some(epilogue_key) = epilogue_pipeline_key(dispatch) else {
                 continue;
@@ -1712,13 +1695,9 @@ impl Pipelines {
             let coop_key = Variant::CoopEpilogue(dispatch.shader.clone(), epilogue_key);
             if let std::collections::hash_map::Entry::Vacant(slot) = map.entry(key) {
                 let group = dispatch.shader.shader_group();
-                let epilogue = match dispatch.matmul_epilogue {
-                    Some(ref epi) => crate::codegen::EpilogueSource::Dag(epi),
-                    None => crate::codegen::EpilogueSource::Ops(&dispatch.epilogue),
-                };
                 let sm = crate::codegen::generate_matmul_with_epilogue(
                     group,
-                    epilogue,
+                    dispatch.matmul_epilogue.as_ref(),
                     crate::codegen::MatMulOptions {
                         format: dispatch.weight_format,
                         tile: epilogue_tile(dispatch),
@@ -2531,7 +2510,7 @@ pub(crate) fn select_variants(
             // accumulators through workgroup memory, then apply scalar
             // WGSL with bounds checks. Legacy-only plans and DAGs needing
             // extra storage bindings stay on scalar geometry.
-            if !dispatch.epilogue.is_empty() || dispatch.matmul_epilogue.is_some() {
+            if dispatch.matmul_epilogue.is_some() {
                 match dispatch.matmul_epilogue {
                     Some(ref epilogue) if epilogue.inputs.is_empty() => {}
                     _ => continue,
@@ -3671,7 +3650,7 @@ impl Session {
                         },
                         d.origin,
                         d.use_coop,
-                        d.matmul_epilogue.is_some() || !d.epilogue.is_empty(),
+                        d.matmul_epilogue.is_some(),
                         d.input_buffers.iter().map(|b| b.0).collect::<Vec<_>>(),
                         d.output_buffer.0,
                         d.workgroups,

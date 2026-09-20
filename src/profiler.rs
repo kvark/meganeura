@@ -694,7 +694,7 @@ fn capture_windows(
             requires_full_precision: dispatch.requires_full_precision,
             weight_format: format!("{:?}", dispatch.weight_format),
             has_prologue: dispatch.matmul_prologue.is_some(),
-            has_epilogue: dispatch.matmul_epilogue.is_some() || !dispatch.epilogue.is_empty(),
+            has_epilogue: dispatch.matmul_epilogue.is_some(),
             timing_samples_ms: timing_samples[index].clone(),
             median_ms,
             p25_ms: quantile(&timing_samples[index], 0.25),

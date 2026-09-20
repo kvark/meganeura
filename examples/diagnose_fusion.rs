@@ -71,9 +71,6 @@ fn count_consumers(plan: &ExecutionPlan) -> HashMap<BufferRef, Vec<usize>> {
         for b in &d.input_buffers {
             m.entry(*b).or_default().push(i);
         }
-        for b in &d.epilogue_buffers {
-            m.entry(*b).or_default().push(i);
-        }
     }
     m
 }
