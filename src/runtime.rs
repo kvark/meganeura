@@ -1079,6 +1079,7 @@ fn epilogue_tile(dispatch: &Dispatch) -> crate::codegen::MatMulTile {
 enum Variant {
     SplitMatmul(ShaderEntry, crate::codegen::ScalarMatmulShape, u32),
     SplitCooperativeMatmul(ShaderEntry, u32),
+    SumRowsSerial(ShaderEntry, u32),
     SpecializedConv(ShaderEntry, Vec<u32>, u32),
     ScalarMatmul(
         ShaderEntry,
@@ -1178,6 +1179,7 @@ impl Variant {
             | Variant::CooperativeAttention(ref e, _, _)
             | Variant::SplitMatmul(ref e, _, _)
             | Variant::SplitCooperativeMatmul(ref e, _)
+            | Variant::SumRowsSerial(ref e, _)
             | Variant::SpecializedConv(ref e, _, _)
             | Variant::ScalarMatmul(ref e, _, _)
             | Variant::Epilogue(ref e, _)
@@ -1206,6 +1208,7 @@ impl Variant {
             Variant::SplitCooperativeMatmul(ref e, splits) => {
                 format!("{e:?}:cooperative-split-{splits}")
             }
+            Variant::SumRowsSerial(ref e, size) => format!("{e:?}:serial-{size}"),
             Variant::ScalarMatmul(ref e, format, shape) => {
                 format!("{e:?}:scalar-{format:?}-{shape:?}")
             }
@@ -1369,6 +1372,12 @@ impl Pipelines {
             }
             Variant::SplitMatmul(_, shape, splits) => {
                 crate::codegen::generate_split_matmul(group, shape, splits)
+            }
+            Variant::SumRowsSerial(_, size) => {
+                if group != ShaderGroup::SumRows {
+                    return Err("serial sum-rows implementation requires SumRows".into());
+                }
+                crate::codegen::generate_serial_sum_rows(size)
             }
             Variant::SplitCooperativeMatmul(_, splits) => {
                 if gpu.capabilities().fixed_compute_subgroup_size != Some(32)
@@ -1553,6 +1562,9 @@ impl Pipelines {
     /// which unrelated pipelines happen to have been compiled.
     fn key(dispatch: &Dispatch) -> Variant {
         let entry = dispatch.shader.clone();
+        if let crate::compile::Kernel::SumRowsSerial { workgroup_size } = dispatch.kernel {
+            return Variant::SumRowsSerial(entry, workgroup_size);
+        }
         if let crate::compile::Kernel::SplitCooperativeMatmul { splits } = dispatch.kernel {
             return Variant::SplitCooperativeMatmul(entry, splits);
         }

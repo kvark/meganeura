@@ -281,13 +281,16 @@ mod tests {
                         .sum();
                 }
             }
-            for (tile_size, k_stage, splits, cooperative) in [
-                (32, 8, 3, false),
-                (64, 16, 4, false),
-                (32, 32, 2, false),
-                (32, 16, 3, true),
-                (64, 16, 4, true),
-                (32, 32, 2, true),
+            for (tile_size, k_stage, splits, cooperative, serial_sum) in [
+                (32, 8, 3, false, 0),
+                (64, 16, 4, false, 0),
+                (32, 32, 2, false, 0),
+                (32, 16, 3, true, 0),
+                (64, 16, 4, true, 0),
+                (32, 32, 2, true, 0),
+                (32, 8, 3, false, 64),
+                (64, 16, 4, false, 128),
+                (32, 32, 2, false, 256),
             ] {
                 if cooperative
                     && (gpu.capabilities().fixed_compute_subgroup_size != Some(32)
@@ -307,6 +310,13 @@ mod tests {
                 plan.split_matmul(0, shape, splits, 1024 * 1024).unwrap();
                 if cooperative {
                     plan.cooperative_split_matmul(0).unwrap();
+                }
+                if serial_sum > 0 {
+                    let d = &mut plan.dispatches[1];
+                    d.kernel = super::super::Kernel::SumRowsSerial {
+                        workgroup_size: serial_sum,
+                    };
+                    d.workgroups[0] = d.params[1].div_ceil(serial_sum);
                 }
                 assert!(TuneClass::from_dispatch(&plan.dispatches[0], None).is_none());
                 let mut session = crate::Session::with_context_opts(

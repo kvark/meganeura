@@ -1082,6 +1082,9 @@ pub enum Kernel {
     SplitCooperativeMatmul {
         splits: u32,
     },
+    SumRowsSerial {
+        workgroup_size: u32,
+    },
     SpecializedConv {
         k_tile: u32,
     },

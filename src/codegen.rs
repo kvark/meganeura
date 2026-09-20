@@ -1949,6 +1949,28 @@ pub(crate) fn generate_split_matmul(
     ShaderModule::new(&source)
 }
 
+/// Reduce rows serially per output column, keeping neighboring columns
+/// coalesced. This alternative needs no workgroup memory or barriers.
+pub(crate) fn generate_serial_sum_rows(workgroup_size: u32) -> ShaderModule {
+    assert!(matches!(workgroup_size, 64 | 128 | 256));
+    let (header, _) = include_str!("shaders/sum_rows.wgsl")
+        .split_once("var<workgroup>")
+        .expect("sum-rows declarations");
+    ShaderModule::new(&format!(
+        "{header}\n\
+        @compute @workgroup_size({workgroup_size})\n\
+        fn sum_rows(@builtin(global_invocation_id) gid: vec3<u32>) {{\n\
+            let col = gid.x;\n\
+            if col >= params.n {{ return; }}\n\
+            var acc = 0.0;\n\
+            for (var row = 0u; row < params.m; row++) {{\n\
+                acc += src[row * params.n + col];\n\
+            }}\n\
+            dst[col] = acc;\n\
+        }}\n"
+    ))
+}
+
 /// One 32-lane subgroup computes four 16x16 F16 cooperative partial tiles.
 /// Reuse the canonical staging and masked epilogue store, including ragged
 /// row/column tails. Unmasked cooperative stores could overwrite the next split.

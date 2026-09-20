@@ -1,7 +1,7 @@
 //! CPU survey, or whole-model search with a full independent CPU reference.
 //! Usage: egglog_model_search MODEL [REFERENCE.f32|optimized] [fast] [baseline]
 //! Options: --static, --confirm, --reverse, --profile, --attention-tiles, --cooperative-split,
-//! --program=N (one generated plan, for attribution), --seconds=N.
+//! --program=N (one generated plan, for attribution), --serial-sums, --seconds=N.
 use meganeura::{
     Graph,
     models::{smolvla, whisper},
@@ -224,6 +224,32 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
             .map(|s| s.parse::<usize>().unwrap())
     }) {
         programs = vec![programs.remove(index)];
+    }
+    if std::env::args().any(|arg| arg == "--serial-sums") {
+        let mut variants = Vec::new();
+        for program in &programs {
+            for workgroup_size in [64, 128, 256] {
+                let mut plan = program.plan.clone();
+                let mut changed = 0;
+                for d in &mut plan.dispatches {
+                    if d.shader == compile::ShaderEntry::SumRows {
+                        d.kernel = compile::Kernel::SumRowsSerial { workgroup_size };
+                        d.workgroups[0] = d.params[1].div_ceil(workgroup_size);
+                        changed += 1;
+                    }
+                }
+                if changed > 0 {
+                    variants.push(search::measure::Program {
+                        description: format!(
+                            "serial_sums={workgroup_size}; {}",
+                            program.description
+                        ),
+                        plan,
+                    });
+                }
+            }
+        }
+        programs.extend(variants);
     }
     let fixed_subgroup_size = gpu.capabilities().fixed_compute_subgroup_size;
     let runtime = SessionOptions {
