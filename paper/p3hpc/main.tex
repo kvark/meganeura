@@ -43,16 +43,16 @@ path for machine learning across consumer and edge graphics processing
 units (GPUs). Meganeura is a compact native
 compiler and runtime that lowers tensor graphs and automatic
 differentiation to Vulkan and Metal kernels. We evaluate five workloads
-on eight device configurations, including an NVIDIA H100 and Windows, with one PyTorch
+on seven GPU-reference configurations, including an NVIDIA H100 and Windows, with one PyTorch
 source revision, compiled references, and independently qualified CUDA, HIP,
 and XPU graph replay wherever those APIs are available.
 Meganeura always performs bounded kernel search during compilation, and
 strict arithmetic permits native-f32 cooperative matrices.
-All 252 paired process runs pass the numerical gates, including replicated
+All 222 paired process runs pass the numerical gates, including replicated
 360-million- and 1.7-billion-parameter H100 extensions.
 Across seven complete GPU-reference configurations, median strict
 32-bit floating-point inference and training times are $1.83\times$ and
-$2.47\times$ PyTorch's. Search covers every eligible class in 684 of 708
+$2.47\times$ PyTorch's. Search covers every eligible class in 606 of 624
 native sessions; preparation cost and performance gains remain workload-dependent.
 Meganeura executes on an Intel integrated GPU without a usable PyTorch
 GPU path; a separate AMD MI300X attempt
@@ -92,7 +92,7 @@ so deployment-time compilation can also perform bounded measurement.
 
 The evaluation compares \system{} with PyTorch
 \cite{paszke2019pytorch} at one source commit across CUDA, ROCm, XPU, MPS,
-and CPU wheels. Every reference uses default compilation. CUDA, HIP, and
+and CPU-oracle wheels. Every timed reference uses default compilation. CUDA, HIP, and
 XPU execute explicitly captured, numerically qualified whole-phase graphs;
 MPS has no equivalent public replay interface. Native empirical selection
 is always enabled, independently of the reference's compiler mode.
@@ -126,8 +126,8 @@ Our contributions are:
 
 An arithmetic contract (Section~\ref{sec:contracts}) specifies permitted
 numerical fast paths. Each device--workload--contract--policy comparison
-is validated before its timings are admitted. GPU-versus-CPU support
-comparisons remain visible without entering the GPU performance aggregate.
+is validated before its timings are admitted. Graphics-only qualification
+remains visible without entering the GPU performance aggregate.
 This study includes datacenter hardware and up to 1.7-billion-parameter
 models, but not production-scale large language model (LLM) training, optimizer updates,
 distributed execution, or scientific simulation workloads.
@@ -252,7 +252,7 @@ Every supplied campaign uses \inferena{} \code{fa5a04e1} and
 All wheels report PyTorch 2.13.0 at source
 commit \code{cf30153}, with Python 3.13.13. NVIDIA uses
 \code{+cu130}, AMD \code{+rocm7.2}, Arc \code{+xpu}, Apple the MPS
-wheel, and the RPL-U comparison \code{+cpu}.
+wheel. RPL-U qualification uses \code{+cpu} as a correctness oracle only.
 Checkpoint revisions and hashes are recorded in the manifests.
 Driver, host, and backend-library differences remain part of the platform;
 a common PyTorch revision does not make those implementations identical.
@@ -285,7 +285,7 @@ explicit capture is the sole replay owner. XPU uses the public math
 scaled-dot-product-attention (SDPA) backend to accommodate graph capture;
 the setting and a qualified embedding-backward workaround are recorded
 (Section~\ref{sec:availability}). Other backends retain automatic SDPA selection.
-MPS and the explicitly selected CPU reference also compile all requested
+MPS also compiles all requested
 phases. MPS's Inductor path is exercised \cite{pytorch2026mpssource}, but
 the pinned MPS API offers no equivalent public whole-phase replay interface.
 MPSGraph execution is not CUDA Graph capture. No failed compiled or
@@ -387,11 +387,11 @@ contain all tensor elements for independent offline revalidation.
 \input{tables/devices}
 \end{table*}
 
-Table~\ref{tab:devices} lists eight device configurations; the seven complete
-GPU-reference configurations are RTX~5070, H100, RTX~3050, RX~7900~XT,
+Table~\ref{tab:devices} lists the seven complete
+GPU-reference configurations: RTX~5070, H100, RTX~3050, RX~7900~XT,
 Radeon~780M, Arc~B570, and Apple~M3.
-The complete RPL-U campaign compares Vulkan with compiled CPU and is
-reported separately. RTX~3050 runs natively on Windows with driver 591.86;
+RPL-U has no usable PyTorch GPU path and appears only in the qualification
+table (Table~\ref{tab:qualification}). RTX~3050 runs natively on Windows with driver 591.86;
 the other Vulkan campaigns run on Linux, and M3 uses macOS.
 RTX~5070 and B570 share the same host and are measured sequentially,
 not concurrently. B570 uses a secondary PCIe~3.0 $\times$1 link;
@@ -399,9 +399,11 @@ the study does not normalize interconnect bandwidth across platforms.
 Valid/selected counts whole paired processes across both arithmetic
 contracts under the common default-compilation policy
 (Section~\ref{sec:reference-policy}).
-Eight completed campaigns contribute 240 pairs, including all 30
+Seven completed GPU-reference campaigns contribute 210 pairs, including all 30
 selected Windows pairs. The H100 extension contributes 12 valid
-pairs: 252 valid pairs in total, with no interrupted campaign.
+pairs: 222 valid GPU pairs in total, with no interrupted campaign.
+The 30 retained RPL-U processes establish numerical qualification only;
+their CPU-reference timings are not reported or aggregated.
 All forward and backward pairwise gates replay from the retained evidence.
 
 \section{Results}
@@ -420,8 +422,8 @@ Table~\ref{tab:performance} reports three-process medians under both arithmetic
 contracts. Each group of three columns is full inference, minimal-shape
 latency, and F+L+B. Ratios below one are bold; a rounded 1.00 is a near tie,
 not evidence of a significant win. CUDA, HIP, and XPU use qualified replay;
-MPS and CPU are compiled without explicit replay.
-The CPU support block is excluded from GPU counts and scores.
+MPS is compiled without explicit replay. Graphics-only qualification
+has its own table and contributes no timing ratios.
 Absolute times and process ranges are retained in the supplementary CSV.
 Figure~\ref{fig:smollm2} visualizes the SmolLM2 subset in milliseconds.
 
@@ -489,11 +491,11 @@ small differences on M3.
 \end{table*}
 
 Table~\ref{tab:search} reports search coverage.
-Of 708 sessions, 684 visit every eligible class, including sessions
-with no eligible class. In total, 13,322 of 14,085 class instances are
-visited. The 24 deadline-limited sessions are ResNet training on 780M,
-B570, M3, and RPL-U; all other sessions finish their declared search.
-The longest search lasts 60.44\,s against the soft 60-second ceiling.
+Of 624 sessions in the paired GPU campaigns, 606 visit every eligible class,
+including sessions with no eligible class. In total, 11,870 of 12,243 class
+instances are visited. The 18 deadline-limited sessions are ResNet training
+on 780M, B570, and M3; all other sessions finish their declared search.
+The longest search lasts 60.11\,s against the soft 60-second ceiling.
 The table counts class instances across processes, not distinct
 algorithms. \emph{Faster} counts candidate comparisons that replace an
 incumbent, not an end-to-end graph speedup; all 330 numerically rejected
@@ -579,7 +581,7 @@ workload scores, not a new harmonic aggregate over applications.
 Meganeura/PyTorch means are 0.51/0.93 for inference, 0.60/0.85 for minimal
 shapes, and 0.39/0.98 for training.
 
-This is explicitly conditional on shared GPU support. It excludes the CPU
+This is explicitly conditional on shared GPU support. It excludes the RPL-U
 reference, additional H100 model sizes, and MI300X availability attempt;
 it cannot stand in for universal support.
 If support is required across every attempted GPU, both stacks have a
@@ -789,7 +791,7 @@ including empirical search. Most models construct three sessions;
 Whisper reuses one inference session for its two timing shapes.
 PyTorch \code{compile\_s} includes compilation and the first
 specializations/executions of forward, backward, and minimal shapes,
-including on MPS and CPU.
+including on MPS.
 Graph preparation and full-tensor qualification are recorded separately;
 model loading, cross-engine validation, and other process startup
 are outside these fields. These are declared preparation components,
@@ -865,13 +867,20 @@ provides no usable GPU execution path, while Meganeura runs all five
 workloads through Vulkan and passes the numerical gates.
 This is a concrete graphics-API deployment advantage: PyTorch's available
 reference on this machine is CPU, not a GPU path awaiting benchmark
-configuration. The campaign explicitly selects compiled CPU PyTorch.
-Meganeura is faster in all five
-strict full-inference comparisons (ratios 0.51--0.76), and in four
-training comparisons. CPU wins minimal SmolVLA (1.37) and Whisper training (1.41).
-These are GPU-versus-CPU results and are labeled as such; they do not
-claim an equal-device speedup. Other Intel GPU generations can support
+configuration. CPU PyTorch supplies only the numerical oracle for the
+qualification in Table~\ref{tab:qualification}; no CPU-versus-GPU timing
+comparison is included. Other Intel GPU generations can support
 XPU, as the separate Arc comparison demonstrates.
+
+\begin{table}[t]
+\caption{Qualified graphics-API platforms without a usable PyTorch GPU path
+in the evaluated stack. Conditions are five workloads in two arithmetic contracts.}
+\label{tab:qualification}
+\centering
+\scriptsize
+\setlength{\tabcolsep}{3pt}
+\input{tables/qualification}
+\end{table}
 
 Arc~B570 provides the separate, working XPU comparison.
 Its pinned native dense embedding backward passes only 19,968 of
@@ -1028,7 +1037,7 @@ drivers, host CPUs, operating systems, or permitted fast paths.
 All primary references compile; CUDA/HIP/XPU use qualified replay, while
 MPS has no equivalent public whole-phase API. XPU's recorded embedding
 and math-attention accommodations are not an unmodified stock execution path.
-The RPL-U CPU comparison, additional H100 models, and MI300X report
+The RPL-U qualification, additional H100 models, and MI300X report
 cannot be pooled into the seven-system, five-workload GPU aggregate.
 Conditional scores would overstate universal portability if support holes
 were omitted.
@@ -1067,7 +1076,8 @@ Strict f32 constrains permissions, not operation order or bitwise identity.
 Cross-engine sampled outputs and gradient norms can miss localized or sign
 errors. Full-element replay qualification checks PyTorch against itself;
 it does not turn the cross-engine gate into an elementwise gradient
-comparison. All 252 pairs individually pass the 5\% gradient bound as well
+comparison. All 222 GPU pairs and 30 RPL-U qualification processes individually
+pass the 5\% gradient bound as well
 as their required three-process rule. Replay's fixed tensor maximum/RMS
 bounds and their coefficients are explicit; pointwise mismatch counts are
 diagnostics, not a second acceptance rule.
@@ -1112,14 +1122,14 @@ measured capability of the present system.
 A single Vulkan/Metal compiler and runtime executes matched ML inference
 and backward workloads across heterogeneous consumer systems and H100,
 including Windows and an Intel GPU lacking a usable PyTorch GPU path.
-All 252 paired processes validate at common source revisions. Every native
+All 222 paired GPU processes validate at common source revisions. Every native
 session performs bounded measured search, strict arithmetic permits native-f32
 cooperative matrices, and the compiled reference receives qualified
 CUDA/HIP/XPU replay wherever available.
 
 The performance result remains mixed: median strict inference and training
 times are $1.83\times$ and $2.47\times$ PyTorch's across seven shared GPU
-configurations. Search visits every eligible class in 684 of 708 sessions,
+configurations. Search visits every eligible class in 606 of 624 paired-GPU sessions,
 but the remaining gap includes limited kernel parallelism, excluded search
 dimensions, and backend-specific implementation choices.
 Replicated 1.7B results narrow the strict training gap without establishing
@@ -1183,8 +1193,9 @@ At the frozen Inferena revision, the platform setup script installs managed
 Python and pinned vendor requirements.
 \code{python scripts/p3hpc.py} collects the five-model cohort with native
 tuning, default reference compilation, and applicable replay.
-No \code{--no-max-autotune} flag is needed; \code{--backend cpu} explicitly
-selects the CPU support comparison, and \code{--gpu} disambiguates multiple
+No \code{--no-max-autotune} flag is needed. Use \code{--backend cpu --qualify-only}
+for a CPU correctness oracle on GPUs without a usable PyTorch path;
+\code{--gpu} disambiguates multiple
 installed GPUs. The optional
 \code{--models SmolLM2-360M SmolLM2-1.7B} command collects the extension
 on H100. Each campaign writes a manifest and a sibling \code{latest.tgz};

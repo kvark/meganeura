@@ -1,6 +1,6 @@
 # Final P3HPC cohort: evidence guide
 
-Updated September 14, 2026. The manuscript now uses the completed v9 cohort,
+Updated September 20, 2026. The manuscript uses the completed v9 cohort,
 not the superseded v7 tables. No new timing was collected, condition changed,
 or outlier removed during analysis.
 
@@ -26,13 +26,21 @@ preserves the measured engine revision, separately from the manuscript branch.
 | Radeon 780M | 30 / 30 | Same, with recorded ROCm overrides |
 | Arc B570 | 30 / 30 | Default compilation + XPU graph; math SDPA and embedding workaround |
 | Apple M3, macOS | 30 / 30 | Compiled MPS; no equivalent public whole-phase replay API |
-| Intel RPL-U | 30 / 30 | Vulkan versus explicitly selected compiled CPU |
 | H100 360M/1.7B extension | 12 / 12 | Both contracts, three processes each, CUDA Graph |
 
-Eight main campaigns contribute 240 pairs; the extension adds 12. There are
-no interrupted campaigns or failed pairs. Seven configurations have GPU
-references; RPL-U stays separate. RTX 5070 and B570 share a host and were
+Seven main GPU-reference campaigns contribute 210 pairs; the extension adds
+12. There are no interrupted campaigns or failed pairs. RTX 5070 and B570 share a host and were
 measured sequentially; B570 uses the secondary PCIe 3.0 x1 link.
+
+| Qualified platform without a usable PyTorch GPU path | Native path | Qualified workload/precision conditions |
+|---|---|---:|
+| Intel RPL-U | Vulkan, ANV Mesa 26.0.3 | 10 / 10, each in three processes |
+
+The 30 retained RPL-U processes supply numerical qualification evidence, using
+CPU PyTorch only as an oracle. Their timings are excluded from all current
+performance, preparation and search tables and the generated condition CSV.
+Original records remain unchanged. AMD Mendocino on `rubik` is a prospective
+addition, not yet a qualified result; see [qualification instructions](QUALIFICATION.md).
 
 Every pair passes the frozen Inferena checker and an independent audit of
 raw/joined agreement, timing medians, numerical errors, executed policies,
@@ -92,7 +100,6 @@ Consequently this is a cross-cohort comparison, not a controlled ablation.
 | Radeon 780M | 1.01 / 1.00 / 1.02 |
 | Arc B570 | 1.27 / 1.03 / 1.17 |
 | Apple M3 | 1.09 / 1.00 / 0.92 |
-| Intel RPL-U | 1.11 / 1.03 / 1.19 |
 
 Each entry is the median of five old/new native time ratios, not a ratio of
 aggregate times. Particularly useful improvements are strict ResNet training:
@@ -125,11 +132,11 @@ them in all five strict workloads (2,150 dispatch instances over 15 processes).
 No measured Vulkan device exposes native-f32 tiles through this stack;
 NVIDIA gains therefore cannot be attributed to strict cooperative f32.
 
-Of 708 sessions, 684 visit every eligible class (including zero-class
-sessions); 13,322 / 14,085 class instances are visited. The 24 truncated
-sessions are ResNet training on 780M, B570, M3 and RPL-U. The longest search
-is 60.441 seconds. Candidate comparisons record 13,417 FasterCandidate,
-31,456 KeepBaseline, 330 InvalidOutput and 24 TimeBudget decisions.
+Of 624 sessions in paired GPU campaigns, 606 visit every eligible class
+(including zero-class sessions); 11,870 / 12,243 class instances are visited.
+The 18 truncated sessions are ResNet training on 780M, B570 and M3. The longest
+search is 60.112 seconds. Candidate comparisons record 12,290 FasterCandidate,
+28,053 KeepBaseline, 330 InvalidOutput and 18 TimeBudget decisions.
 Numerically rejected candidates are not installed. Counts include repeated
 processes and candidate comparisons, not distinct kernels or graph speedups.
 GEMV, reduced-input cooperative variants and arbitrary graph representations
@@ -178,7 +185,7 @@ claimed. [Diagnostic source and analysis](https://github.com/kvark/inferena/blob
 
 The MI300X report remains separately identified (SHA-256
 e9be97e695140e8a36e09da0f0dd850113b0b22359182921dbc34b689d9776e8).
-Its driver experiments are not timing cells. RPL-U CPU, XPU workarounds,
+Its driver experiments are not timing cells. RPL-U qualification, XPU workarounds,
 and the 780M ROCm overrides remain explicit portability evidence; old
 Windows/H100 failures are not attributed to the complete final cohort.
 

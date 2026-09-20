@@ -2,8 +2,10 @@
 
 ## Camera-ready cohort
 
-The September 14 final analysis uses v9: eight complete 30-pair device
-campaigns and a complete 12-pair H100 extension, 252 valid pairs total.
+The v9 archives contain eight complete 30-pair device campaigns and a complete
+12-pair H100 extension. The September 20 presentation separates 222 GPU-reference
+pairs from 30 RPL-U qualification processes. CPU-reference timings are not
+reported; the original records remain intact for numerical/provenance checks.
 Inferena fa5a04e1 and Meganeura 428fc2d2 are the measured revisions.
 [RESULTS.md](../RESULTS.md) records scope, findings and interpretation;
 [cohort.sha256](cohort.sha256) identifies the nine original archives.
@@ -16,8 +18,10 @@ From the repository root, with Python 3.11+:
 The audit checks source/checkpoint identity, raw/joined agreement, 20-sample
 medians, cross-engine numerical gates, fixed per-tensor/whole-gradient
 replay bounds, native search/precision policies, compiled reference/replay
-receipts and all three-process gradient reports. Eight LaTeX table/figure
-fragments and an 84-row condition CSV are regenerated without a GPU/network.
+receipts and all three-process gradient reports. Nine LaTeX table/figure
+fragments and a 74-row GPU-reference condition CSV are regenerated without a
+GPU/network. A separate qualification table lists RPL-U's ten passing
+workload/precision conditions without CPU-versus-GPU timing ratios.
 
 The supplementary ZIP is self-contained for this audit. Its records.jsonl.xz
 is a lossless compression of every original JSON value, including raw/joined

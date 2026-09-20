@@ -28,7 +28,7 @@ DEVICES = {
     "amd-igpu": "Radeon 780M",
     "intel-b570": "Arc B570",
     "apple-m3": "Apple M3",
-    "intel-igpu": "Intel RPL-U (CPU ref.)",
+    "intel-igpu": "Intel RPL-U",
     "nvidia-h100-large": "H100 extension",
 }
 ENGINES = ("meganeura", "pytorch")
@@ -313,8 +313,10 @@ def ratio(value):
 
 def tables(campaigns, rows, groups):
     output = {}
+    paired_devices = {device: label for device, label in DEVICES.items()
+                      if campaigns[device]["args"]["backend"] != "cpu"}
     lines = []
-    for device, label in DEVICES.items():
+    for device, label in paired_devices.items():
         if device == "nvidia-h100-large":
             continue
         c = campaigns[device]
@@ -327,12 +329,18 @@ def tables(campaigns, rows, groups):
     output["devices.tex"] = tex_table("llllr", "Device & PyTorch path & Graphics driver & Explicit replay & Valid/selected pairs", lines)
     lines = []
     for device, label in DEVICES.items():
+        if device in paired_devices:
+            continue
+        conditions = len(groups[device])
+        lines.append([label, "Vulkan", f"{conditions}/{conditions}", "Unavailable"])
+    output["qualification.tex"] = tex_table("llrl",
+        "Device & Meganeura path & Qualified conditions & PyTorch GPU", lines)
+    lines = []
+    for device, label in paired_devices.items():
         c = campaigns[device]
         if device == "nvidia-h100-large":
             continue
         condition = primary_condition(c)
-        if device == "intel-igpu":
-            lines.append([r"\multicolumn{8}{l}{\emph{GPU-versus-CPU support comparison; excluded from GPU aggregates}}"])
         for model in MODELS:
             values = [ratio(rows[device][precision, model, condition]["ratio_" + phase])
                       for precision in ("strict", "accelerated") for phase in PHASES]
@@ -342,7 +350,7 @@ def tables(campaigns, rows, groups):
                      r" & & Inf. & Min. & F+L+B & Inf. & Min. & F+L+B")
     output["ratios.tex"] = tex_table("llrrrrrr", ratio_heading, lines)
     lines = []
-    for device, label in DEVICES.items():
+    for device, label in paired_devices.items():
         runs = [run for batch in groups[device].values() for run in batch]
         compile_s = [sum(run["pair"][engine]["timings"]["compile_s"] for run in runs) for engine in ENGINES]
         graph_s = [sum(phase.get(part + "_s", 0) for run in runs
@@ -352,7 +360,7 @@ def tables(campaigns, rows, groups):
     output["preparation.tex"] = tex_table("lrrrrr",
         r"Device & Pairs & M compile+tune & P compile & P graph prep. & P qualification", lines)
     lines = []
-    for device, label in DEVICES.items():
+    for device, label in paired_devices.items():
         searches = [session["search"] for batch in groups[device].values() for run in batch
                     for session in run["pair"]["meganeura"]["optimizer"]["sessions"]]
         decisions = sum((Counter(s["decisions"]) for s in searches), Counter())
@@ -458,7 +466,8 @@ def main():
             for name, digest in c["sha256"].items():
                 name = name.replace("\\", "/")
                 require(input_hashes.setdefault(name, digest) == digest, "input identity differs: " + name)
-            campaigns[device], rows[device], all_groups[device] = c, aggregate(groups), groups
+            campaigns[device], all_groups[device] = c, groups
+            rows[device] = aggregate(groups) if c["args"]["backend"] != "cpu" else {}
             if bundle:
                 bundle.write(json.dumps(records, separators=(",", ":")) + "\n")
             print(device, c["status"], dict(Counter(run["status"] for run in c["runs"])), "failed:", failed)
@@ -488,6 +497,16 @@ def main():
     errors = [(run["errors"], device, key) for device, groups in all_groups.items() for key, runs in groups.items() for run in runs]
     for key in errors[0][0]:
         print("maximum", key, max((e[key], device, group) for e, device, group in errors))
+    searches = [session["search"] for device, groups in all_groups.items()
+                if campaigns[device]["args"]["backend"] != "cpu"
+                for runs in groups.values() for run in runs
+                for session in run["pair"]["meganeura"]["optimizer"]["sessions"]]
+    print("GPU-paired native search:", len(searches), "sessions;",
+          sum(s["visited_classes"] == s["eligible_classes"] for s in searches), "complete;",
+          sum(s["visited_classes"] for s in searches), "/",
+          sum(s["eligible_classes"] for s in searches), "classes; longest",
+          max(s["elapsed_seconds"] for s in searches), "seconds")
+    print("GPU-paired decisions:", sum((Counter(s["decisions"]) for s in searches), Counter()))
 
 
 if __name__ == "__main__":
