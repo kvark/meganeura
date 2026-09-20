@@ -82,3 +82,132 @@ fn mixed_head_dims_match_independent_sessions() {
         assert!(max_abs < 1e-5, "{label} pipeline mismatch: {max_abs}");
     }
 }
+
+#[test]
+#[ignore = "cooperative attention source experiment; run on a GPU"]
+fn cooperative_attention_matches_full_reference_with_masks_and_tails() {
+    use meganeura::{codegen, compile};
+    let gpu = std::sync::Arc::new(meganeura::runtime::init_gpu_context().unwrap());
+    for (q_len, kv_len, hd, causal, window) in [
+        (33, 49, 16, false, 0),
+        (49, 49, 64, true, 0),
+        (50, 50, 128, true, 17),
+        (50, 50, 64, true, 1),
+    ] {
+        let (heads, kv_heads) = (3, 1);
+        let q = values(q_len * heads * hd, 0.3);
+        let k = values(kv_len * kv_heads * hd, 1.3);
+        let v = values(kv_len * kv_heads * hd, 2.3);
+        let mut expected = vec![0.0f64; q.len()];
+        for row in 0..q_len {
+            let end = if causal { row + 1 } else { kv_len };
+            let begin = if window == 0 {
+                0
+            } else {
+                end.saturating_sub(window)
+            };
+            for head in 0..heads {
+                let kv_head = head / (heads / kv_heads);
+                let scores: Vec<f64> = (begin..end)
+                    .map(|key| {
+                        (0..hd)
+                            .map(|d| {
+                                f64::from(q[(row * heads + head) * hd + d])
+                                    * f64::from(k[(key * kv_heads + kv_head) * hd + d])
+                            })
+                            .sum::<f64>()
+                            / (hd as f64).sqrt()
+                    })
+                    .collect();
+                let maximum = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let probabilities: Vec<_> =
+                    scores.iter().map(|score| (score - maximum).exp()).collect();
+                let sum: f64 = probabilities.iter().sum();
+                for d in 0..hd {
+                    expected[(row * heads + head) * hd + d] = probabilities
+                        .iter()
+                        .enumerate()
+                        .map(|(key, p)| {
+                            p / sum * f64::from(v[((begin + key) * kv_heads + kv_head) * hd + d])
+                        })
+                        .sum();
+                }
+            }
+        }
+        for (cooperative, query_tiles) in [(false, 0), (true, 0), (true, 1), (true, 2), (true, 4)] {
+            if query_tiles > 0
+                && (gpu.capabilities().fixed_compute_subgroup_size != Some(32)
+                    || gpu.capabilities().cooperative_matrix.f16_tile != 16
+                    || !codegen::cooperative_attention_tile_is_legal(hd as u32, query_tiles))
+            {
+                continue;
+            }
+            let mut graph = Graph::new();
+            let qn = graph.input("q", &[q_len, heads * hd]);
+            let kn = graph.input("k", &[kv_len, kv_heads * hd]);
+            let vn = graph.input("v", &[kv_len, kv_heads * hd]);
+            let output = if window != 0 {
+                graph.sliding_window_attention(
+                    qn,
+                    kn,
+                    vn,
+                    heads as u32,
+                    kv_heads as u32,
+                    hd as u32,
+                    window as u32,
+                )
+            } else if causal {
+                graph.causal_attention(qn, kn, vn, heads as u32, kv_heads as u32, hd as u32)
+            } else {
+                graph.cross_attention(qn, kn, vn, heads as u32, kv_heads as u32, hd as u32)
+            };
+            graph.set_outputs(vec![output]);
+            let advertised = gpu.capabilities().cooperative_matrix;
+            let mut plan = compile::compile_with_caps(
+                &graph,
+                &compile::CompileOptions {
+                    flash_forward_coop: cooperative,
+                    ..Default::default()
+                },
+                codegen::CoopCaps {
+                    f16_tile: advertised.f16_tile,
+                    f32_tile: advertised.f32_tile,
+                },
+            );
+            if query_tiles > 0 {
+                for d in &mut plan.dispatches {
+                    if d.shader == compile::ShaderEntry::FlashAttentionCoop {
+                        d.kernel = compile::Kernel::CooperativeAttention { query_tiles };
+                        d.workgroups[0] = d.params[0].div_ceil(16 * query_tiles);
+                    }
+                }
+            }
+            let mut session = meganeura::Session::with_context(plan, gpu.clone());
+            assert_eq!(
+                session
+                    .plan()
+                    .dispatches
+                    .iter()
+                    .any(|d| d.shader == compile::ShaderEntry::FlashAttentionCoop),
+                cooperative && advertised.f16_tile == 16
+            );
+            session.set_input("q", &q);
+            session.set_input("k", &k);
+            session.set_input("v", &v);
+            session.step();
+            session.wait();
+            let actual = session.read_output(q.len());
+            let error: f64 = actual
+                .iter()
+                .zip(&expected)
+                .map(|(&a, &b)| (f64::from(a) - b).powi(2))
+                .sum();
+            let norm: f64 = expected.iter().map(|v| v * v).sum();
+            let relative = (error / norm.max(1e-24)).sqrt();
+            assert!(
+                actual.iter().all(|v| v.is_finite()) && relative < 0.002,
+                "Q={q_len}, KV={kv_len}, HD={hd}, causal={causal}, window={window}, cooperative={cooperative}, query_tiles={query_tiles}: relL2={relative}"
+            );
+        }
+    }
+}

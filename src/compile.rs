@@ -291,7 +291,7 @@ pub enum ShaderEntry {
     /// Cooperative-matrix flash attention forward (Phase 1: coop QK^T,
     /// scalar softmax + PV). Enabled on compatible devices unless
     /// `MEGANEURA_FLASH_FWD_COOP=0`.
-    /// BQ=BKV=16, dispatched as `[ceil(q_seq/16), num_heads, 1]`.
+    /// Experimental BQ=32, BKV=16, two 32-lane subgroups per workgroup.
     FlashAttentionCoop,
     /// Cooperative-matrix flash backward dQ kernel. Three coop matmuls
     /// per KV tile: score=Q·K^T, dp=dO·V^T, dQ+=ds·K. Opt-in via
@@ -1073,6 +1073,17 @@ pub enum Kernel {
     SplitMatmul {
         shape: crate::codegen::ScalarMatmulShape,
         splits: u32,
+    },
+    /// Independent 16-row query tiles, requiring a fixed 32-lane subgroup.
+    CooperativeAttention {
+        query_tiles: u32,
+    },
+    /// F16 cooperative partials followed by the existing split-K reduction.
+    SplitCooperativeMatmul {
+        splits: u32,
+    },
+    SumRowsSerial {
+        workgroup_size: u32,
     },
     SpecializedConv {
         k_tile: u32,

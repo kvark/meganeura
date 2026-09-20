@@ -1079,6 +1079,8 @@ fn epilogue_tile(dispatch: &Dispatch) -> crate::codegen::MatMulTile {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Variant {
     SplitMatmul(ShaderEntry, crate::codegen::ScalarMatmulShape, u32),
+    SplitCooperativeMatmul(ShaderEntry, u32),
+    SumRowsSerial(ShaderEntry, u32),
     SpecializedConv(ShaderEntry, Vec<u32>, u32),
     ScalarMatmul(
         ShaderEntry,
@@ -1095,6 +1097,7 @@ enum Variant {
     /// containing different attention widths run every dispatch through
     /// whichever width happened to be encountered last.
     Attention(ShaderEntry, u32),
+    CooperativeAttention(ShaderEntry, u32, u32),
     /// Epilogue-fused matmuls, keyed by their actual DAG. The cooperative form
     /// uses workgroup memory to expose accumulator lanes to the epilogue.
     Epilogue(ShaderEntry, EpiloguePipelineKey),
@@ -1174,7 +1177,10 @@ impl Variant {
         match *self {
             Variant::Reduction(_) | Variant::Pointwise(_) => None,
             Variant::Attention(ref e, _)
+            | Variant::CooperativeAttention(ref e, _, _)
             | Variant::SplitMatmul(ref e, _, _)
+            | Variant::SplitCooperativeMatmul(ref e, _)
+            | Variant::SumRowsSerial(ref e, _)
             | Variant::SpecializedConv(ref e, _, _)
             | Variant::ScalarMatmul(ref e, _, _)
             | Variant::Epilogue(ref e, _)
@@ -1200,6 +1206,10 @@ impl Variant {
             Variant::SplitMatmul(ref e, shape, splits) => {
                 format!("{e:?}:split-{splits}-{shape:?}")
             }
+            Variant::SplitCooperativeMatmul(ref e, splits) => {
+                format!("{e:?}:cooperative-split-{splits}")
+            }
+            Variant::SumRowsSerial(ref e, size) => format!("{e:?}:serial-{size}"),
             Variant::ScalarMatmul(ref e, format, shape) => {
                 format!("{e:?}:scalar-{format:?}-{shape:?}")
             }
@@ -1209,6 +1219,9 @@ impl Variant {
             Variant::Reduction(hash) => format!("generated-reduction:{hash:016x}"),
             Variant::Pointwise(hash) => format!("generated-pointwise:{hash:016x}"),
             Variant::Attention(ref e, head_dim) => format!("{e:?}:head-dim-{head_dim}"),
+            Variant::CooperativeAttention(ref e, head_dim, query_tiles) => {
+                format!("{e:?}:head-dim-{head_dim}:query-tiles-{query_tiles}")
+            }
             Variant::Epilogue(ref e, ref key) => epilogue_profile_key(e, key, false),
             Variant::CoopEpilogue(ref e, ref key) => epilogue_profile_key(e, key, true),
             Variant::CoopPrologue(ref e, ref kinds) => {
@@ -1361,6 +1374,24 @@ impl Pipelines {
             Variant::SplitMatmul(_, shape, splits) => {
                 crate::codegen::generate_split_matmul(group, shape, splits)
             }
+            Variant::SumRowsSerial(_, size) => {
+                if group != ShaderGroup::SumRows {
+                    return Err("serial sum-rows implementation requires SumRows".into());
+                }
+                crate::codegen::generate_serial_sum_rows(size)
+            }
+            Variant::SplitCooperativeMatmul(_, splits) => {
+                if gpu.capabilities().fixed_compute_subgroup_size != Some(32)
+                    || dispatch.requires_full_precision
+                    || !coop_config
+                        .is_some_and(|c| c.tile_size == 16 && c.use_f16_input && !c.compensated)
+                {
+                    return Err(
+                        "cooperative split-K requires fixed 32-lane F16 support and policy".into(),
+                    );
+                }
+                crate::codegen::generate_split_cooperative_matmul(group, splits)
+            }
             Variant::ScalarMatmul(_, _, shape) => tuning::tile_module(
                 dispatch,
                 crate::tune::MatmulTile::Scalar(shape),
@@ -1437,6 +1468,15 @@ impl Pipelines {
                     &cooperative(),
                     prologue,
                 )
+            }
+            Variant::CooperativeAttention(_, hd, query_tiles) => {
+                if gpu.capabilities().fixed_compute_subgroup_size != Some(32)
+                    || !crate::codegen::cooperative_attention_tile_is_legal(hd, query_tiles)
+                    || group != ShaderGroup::FlashAttentionCoop
+                {
+                    return Err("unsupported independent-query cooperative layout".into());
+                }
+                crate::codegen::generate_flash_attention_coop_tiled_module(hd, query_tiles)
             }
             Variant::Attention(_, hd) => match group {
                 ShaderGroup::FlashAttention => {
@@ -1523,6 +1563,12 @@ impl Pipelines {
     /// which unrelated pipelines happen to have been compiled.
     fn key(dispatch: &Dispatch) -> Variant {
         let entry = dispatch.shader.clone();
+        if let crate::compile::Kernel::SumRowsSerial { workgroup_size } = dispatch.kernel {
+            return Variant::SumRowsSerial(entry, workgroup_size);
+        }
+        if let crate::compile::Kernel::SplitCooperativeMatmul { splits } = dispatch.kernel {
+            return Variant::SplitCooperativeMatmul(entry, splits);
+        }
         if let crate::compile::Kernel::SplitMatmul { shape, splits } = dispatch.kernel {
             return Variant::SplitMatmul(entry, shape, splits);
         }
@@ -1563,6 +1609,9 @@ impl Pipelines {
             return Variant::Pointwise(dag.hash_key());
         }
         if let Some(dim) = Self::attention_head_dim(dispatch) {
+            if let crate::compile::Kernel::CooperativeAttention { query_tiles } = dispatch.kernel {
+                return Variant::CooperativeAttention(entry, dim, query_tiles);
+            }
             return Variant::Attention(entry, dim);
         }
         if let Some(shape) = dispatch.gemv_shape() {
@@ -2125,7 +2174,11 @@ pub(crate) fn select_variants(
         for dispatch in &mut plan.dispatches {
             if dispatch.conv_k_tile().is_some()
                 || dispatch.scalar_matmul().is_some()
-                || matches!(dispatch.kernel, crate::compile::Kernel::SplitMatmul { .. })
+                || matches!(
+                    dispatch.kernel,
+                    crate::compile::Kernel::SplitMatmul { .. }
+                        | crate::compile::Kernel::SplitCooperativeMatmul { .. }
+                )
             {
                 continue;
             }
@@ -2329,7 +2382,11 @@ pub(crate) fn select_variants(
             if dispatch.use_coop()
                 || dispatch.use_small_tiles()
                 || dispatch.scalar_matmul().is_some()
-                || matches!(dispatch.kernel, crate::compile::Kernel::SplitMatmul { .. })
+                || matches!(
+                    dispatch.kernel,
+                    crate::compile::Kernel::SplitMatmul { .. }
+                        | crate::compile::Kernel::SplitCooperativeMatmul { .. }
+                )
                 || dispatch.weight_format.uses_reduced_storage()
             {
                 continue;
