@@ -93,7 +93,9 @@ Before production integration:
   record exclusions and unfinished searches. Do not replace them with a sum
   of independently measured kernel times.
 
-No whole-model timing improvement or automatic production search is claimed.
+The small-shape probe alone does not establish a whole-model improvement.
+The following model experiment tests that separately. Production search is
+still unchanged.
 
 ## Split-K as a structural candidate
 
@@ -110,3 +112,93 @@ The prototype changes neither the benchmark protocol nor production defaults.
 The source branch includes an opt-in broad test of normal/AT/BT products,
 uneven K partitions, ragged output edges and rejection without plan mutation.
 It passes on both RTX 5070 and B570 against full independent f64 products.
+
+## Whole-model search
+
+At `0c0e2fa`, `egglog_model_search` retains the optimized greedy control and
+up to eight alternatives for one repeated region. Each crosses dispatch
+fusion and plain/split-K lowering. All plans are lowered before allocation;
+the selector then holds at most an incumbent and one challenger session.
+Each candidate receives up to two seconds of ordinary kernel tuning before
+paired whole-step selection. The total search has a soft 180-second limit,
+a 32-program limit and a 3-GiB declared-plan-byte limit. The latter does not
+bound driver allocations, pipeline objects or staging. Runs also used a
+4-GiB process cgroup with no swap and a 300-second external timeout.
+
+This uses the same action expert (50 action tokens, 16 context tokens) and
+Whisper encoder (3000 mel frames) as Inferena, not the complete VLA policy or
+Whisper decoder. Inputs and named weights use Inferena's fixed deterministic
+initialization, not pretrained weights. `egglog_reference.py` imports the
+unchanged PyTorch model code from Inferena
+`fa5a04e1c1b38405cfa371a27c5dcef1319835d5`. References use CPU f32 and PyTorch
+2.13.0, git revision `cf30153c4c131c8164ee7798e5022d810682e2cb`.
+
+```sh
+python bench/egglog_reference.py ../inferena SmolVLA /tmp/smolvla.f32
+cargo build --release --features models --example egglog_model_search
+VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json \
+  target/release/examples/egglog_model_search \
+  SmolVLA /tmp/smolvla.f32 fast --confirm
+# Repeat with --reverse. For B570 use intel_icd.json and strict.
+```
+
+Every candidate is checked over the full model output before tuning, after
+tuning and after selection samples, using the fixed Inferena forward gates:
+relative L2 and relative squared-norm error both below 1%. This is inference
+qualification, not a training or language-quality result. SmolVLA's measured
+errors were below 5.6e-6 relative L2; no candidate was rejected numerically.
+
+`--confirm` builds and tunes a fresh greedy control after selection, warms
+both sessions for 30 pairs, then measures 40 alternating-order pairs. These
+confirmation samples are not used to pick a plan. RTX 5070 allows reduced
+input precision; B570 uses native f32:
+
+| GPU / search order | Greedy control | Selected plan | Median paired reduction |
+| --- | ---: | ---: | ---: |
+| RTX 5070 / forward | 4.445 ms | 3.903 ms | 12.1% |
+| RTX 5070 / reverse | 4.477 ms | 3.935 ms | 12.2% |
+| B570 / forward | 9.825 ms | 6.580 ms | 33.5% |
+| B570 / reverse | 9.858 ms | 6.604 ms | 33.0% |
+
+The selected plan won all 40 confirmation pairs in each run. Different
+orders on NVIDIA selected different members of the same unfused-plus-split-K
+family: 97 versus 89 split products. Intel selected 97 in both orders.
+This is bounded exploration, not proof of a
+unique optimum. All 27 lowered candidates completed, but logical extraction
+was truncated at eight representatives. Search took about 74 seconds per
+NVIDIA run and 135 seconds per Intel run, including construction and qualification,
+but excluding earlier graph extraction/lowering and the final confirmation.
+Graph extraction itself took 7–9 ms. Do not label session-construction time
+as shader compilation time.
+
+Optimized SmolVLA required an outliner correction: topological sorting hoists
+independent K/V projections before the repeated blocks. Those dependencies
+must stay opaque and retain their actual bindings. Internal and inter-block
+chain edges must still match; declaration-only regions are not useful search
+targets. Earlier runs that selected those regions tested only physical
+split-K alternatives and are not evidence of model-level logical search.
+
+## Why these candidates
+
+Separate validated Nsight Systems captures at Meganeura `e374a18` showed
+many PyTorch split-K GEMMs and combine kernels in SmolVLA. Portable per-pass
+profiling attributed about 91% of native inference intervals to matrix
+products and less than 4% to attention. The split-K experiment targets that
+measured bottleneck. In Whisper, cooperative attention was about 53% and
+matrix products 33%; convolutions accounted for only 4%. The same structural
+search retained Whisper's control, so this is not a universal split-K policy.
+
+[vla.cpp](https://github.com/VinRobotics/vla.cpp/tree/57a21c01383ae4322d9f7f81cf17a54cd1da31f7)
+also hoists fixed context K/V across denoising steps. That is a different
+workload/lifetime contract from one Inferena action-expert call and is not
+counted as a measured speedup here. Its attention paths can use f16 K/V even
+with f32 accumulation.
+[whisper.cpp](https://github.com/ggml-org/whisper.cpp/tree/5670d5c0bbcb148feabef84400a07cfca9aa3b30)
+provides a second lead: its Vulkan attention tiles both QK and PV, whereas
+Meganeura's current cooperative forward kernel accelerates only QK.
+
+Nsight Vulkan intervals in these captures are grouped submissions, not
+individual shaders. Portable pass timings came from separate instrumented
+runs. Neither host wait time nor wall-minus-summed-GPU-time is a measurement
+of CPU busy time or removable barrier cost. No P3HPC protocol or cohort was
+changed, and no vla.cpp/whisper.cpp end-to-end speed comparison is claimed.

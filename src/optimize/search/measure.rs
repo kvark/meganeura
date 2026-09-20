@@ -31,6 +31,8 @@ pub struct Options {
 #[derive(Serialize)]
 pub struct Trial {
     pub description: String,
+    /// Full session construction, including allocations, not shader-only compile time.
+    pub construction_time: Duration,
     pub kernel_tuning: Option<TuneReport>,
     pub outcome: TuneOutcome<(), usize>,
 }
@@ -115,6 +117,7 @@ pub fn select(
         let bytes = plan_bytes(&program.plan)?;
         let mut trial = Trial {
             description: program.description,
+            construction_time: Duration::ZERO,
             kernel_tuning: None,
             outcome: TuneOutcome::new((), program.plan.dispatches.len(), report.selected, index),
         };
@@ -128,7 +131,7 @@ pub fn select(
             let build = Instant::now();
             let mut candidate =
                 Session::with_context_opts(program.plan, gpu.clone(), runtime.clone());
-            trial.outcome.compile_time = build.elapsed();
+            trial.construction_time = build.elapsed();
             let result = (|| {
                 initialize(&mut candidate)?;
                 qualify(&mut candidate)?;

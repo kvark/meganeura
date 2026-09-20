@@ -1,5 +1,6 @@
 //! CPU survey, or whole-model search with a full independent CPU reference.
-//! Usage: egglog_model_search MODEL [REFERENCE.f32|optimized] [fast] [baseline] [--static]
+//! Usage: egglog_model_search MODEL [REFERENCE.f32|optimized] [fast] [baseline]
+//! Options: --static, --confirm, --reverse, --seconds=N (soft search budget).
 use meganeura::{
     Graph,
     models::{smolvla, whisper},
@@ -107,7 +108,7 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
         }
     }
     let extraction_ms = extraction_start.elapsed().as_secs_f64() * 1000.0;
-    let mut programs = Vec::new();
+    let mut programs: Vec<search::measure::Program> = Vec::new();
     for (index, form) in forms.into_iter().enumerate() {
         let variants: &[(bool, u32)] = if baseline {
             &[(true, 1)]
@@ -121,6 +122,16 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
                 ..Default::default()
             };
             let mut plan = compile::compile_with_caps(&form.graph, &options, caps);
+            // These two plans came from the same graph. If dispatch fusion did
+            // not change its lowering, do not rebuild and retune it a second time.
+            if !fuse_dispatches
+                && splits == 1
+                && programs.last().is_some_and(|p| {
+                    p.plan.dispatches == plan.dispatches && p.plan.buffers == plan.buffers
+                })
+            {
+                continue;
+            }
             let mut split_products = 0;
             if splits > 1 {
                 for i in (0..plan.dispatches.len()).rev() {
@@ -147,6 +158,7 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
         }
     }
     let runtime = SessionOptions {
+        wgsl_dump_dir: std::env::var("MEGANEURA_DUMP_WGSL").ok(),
         coop: if fast {
             meganeura::CoopPolicy::Auto
         } else {
@@ -171,13 +183,19 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
     if std::env::args().any(|arg| arg == "--reverse") {
         programs[1..].reverse();
     }
+    let search_seconds = std::env::args()
+        .find_map(|arg| {
+            arg.strip_prefix("--seconds=")
+                .map(|s| s.parse::<u64>().unwrap())
+        })
+        .unwrap_or(180);
     let (mut session, report) = search::measure::select(
         programs,
         gpu.clone(),
         runtime.clone(),
         search::measure::Options {
             tuning: tuning.clone(),
-            max_time: Duration::from_secs(180),
+            max_time: Duration::from_secs(search_seconds),
             max_programs: 32,
             max_plan_bytes: 3 * 1024 * 1024 * 1024,
         },
