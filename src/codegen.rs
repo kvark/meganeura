@@ -772,6 +772,8 @@ pub fn generate_horizontal_matmul(
     };
     let compute_attr = if rest.contains("@workgroup_size(64)") {
         "@compute @workgroup_size(64)"
+    } else if rest.contains("@workgroup_size(32)") {
+        "@compute @workgroup_size(32)"
     } else {
         "@compute @workgroup_size(16, 16)"
     };
@@ -806,6 +808,7 @@ pub fn generate_horizontal_matmul(
     for i in 0..count {
         let mut fn_src = rest.replace("fn main", &format!("fn horiz_{i}"));
         fn_src = fn_src.replacen("@workgroup_size(64)", "", 1);
+        fn_src = fn_src.replacen("@workgroup_size(32)", "", 1);
         fn_src = fn_src.replacen("@workgroup_size(16, 16)", "", 1);
         fn_src = fn_src.replace("@builtin(workgroup_id) ", "");
         fn_src = fn_src.replace("@builtin(local_invocation_id) ", "");
@@ -1999,25 +2002,27 @@ pub(crate) fn generate_split_cooperative_matmul(
         inputs: Vec::new(),
     };
     let mut source = generate_coop_matmul_with_dag_epilogue(group, &config, &identity).source;
-    source = substitute(&source, "@workgroup_size(64)", "@workgroup_size(32)");
-    // The original vector staging covers 256 elements with 64 threads. Cover
-    // the same elements in two rounds before the single subgroup's MMA.
-    source = substitute(
-        &source,
-        "// Stage sa0:",
-        "for (var staging_round = 0u; staging_round < 2u; staging_round++) {\n        let v4_row = (lid.x + staging_round * 32u) >> 2u;\n        let v4_col = (lid.x & 3u) << 2u;\n        // Stage sa0:",
-    );
-    source = substitute(
-        &source,
-        "        workgroupBarrier();\n\n        // Cooperative matrix multiply-add:",
-        "        }\n        workgroupBarrier();\n\n        // Cooperative matrix multiply-add:",
-    );
-    source = substitute(&source, "e < 16u", "e < 32u");
-    source = substitute(
-        &source,
-        "let local_idx = lid.x + e * 64u;",
-        "let local_idx = lid.x + e * 32u;",
-    );
+    if source.contains("@workgroup_size(64)") {
+        source = substitute(&source, "@workgroup_size(64)", "@workgroup_size(32)");
+        // The original vector staging covers 256 elements with 64 threads. Cover
+        // the same elements in two rounds before the single subgroup's MMA.
+        source = substitute(
+            &source,
+            "// Stage sa0:",
+            "for (var staging_round = 0u; staging_round < 2u; staging_round++) {\n        let v4_row = (lid.x + staging_round * 32u) >> 2u;\n        let v4_col = (lid.x & 3u) << 2u;\n        // Stage sa0:",
+        );
+        source = substitute(
+            &source,
+            "        workgroupBarrier();\n\n        // Cooperative matrix multiply-add:",
+            "        }\n        workgroupBarrier();\n\n        // Cooperative matrix multiply-add:",
+        );
+        source = substitute(&source, "e < 16u", "e < 32u");
+        source = substitute(
+            &source,
+            "let local_idx = lid.x + e * 64u;",
+            "let local_idx = lid.x + e * 32u;",
+        );
+    }
     source = substitute(
         &source,
         "var t = 0u;",
@@ -3198,7 +3203,7 @@ fn gen_matmul_coop_wgsl_full(
     };
 
     let src = include_str!("shaders/matmul_coop.wgsl");
-    let src = preprocess(
+    let mut src = preprocess(
         src,
         &[
             ("$ENABLE_F16", enable_f16),
@@ -3228,6 +3233,26 @@ fn gen_matmul_coop_wgsl_full(
         ],
     );
 
+    // Fixed-32 subgroup ablation, not a capability-independent default.
+    if config.use_f16_input && tile == 16 && !compensated {
+        src = substitute(&src, "@workgroup_size(64)", "@workgroup_size(32)");
+        src = substitute(
+            &src,
+            "// Stage sa0:",
+            &format!(
+                "for (var staging_round = 0u; staging_round < 2u; staging_round++) {{\n        let lid = vec3<u32>(lid.x + staging_round * 32u, lid.y, lid.z);\n        {staging_vars}\n        // Stage sa0:"
+            ),
+        );
+        src = substitute(
+            &src,
+            "        workgroupBarrier();\n\n        // Cooperative matrix multiply-add:",
+            "        }\n        workgroupBarrier();\n\n        // Cooperative matrix multiply-add:",
+        );
+        src = src.replace("e < 16u", "e < 32u").replace(
+            "let local_idx = lid.x + e * 64u;",
+            "let local_idx = lid.x + e * 32u;",
+        );
+    }
     ShaderModule::new(&src)
 }
 

@@ -102,6 +102,10 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
         .unwrap(),
     );
     let caps = gpu.capabilities().cooperative_matrix;
+    assert!(
+        !fast || gpu.capabilities().fixed_compute_subgroup_size == Some(32),
+        "this source-only ablation requires a fixed 32-lane subgroup"
+    );
     let caps = codegen::CoopCaps {
         f16_tile: if fast { caps.f16_tile } else { 0 },
         f32_tile: caps.f32_tile,
