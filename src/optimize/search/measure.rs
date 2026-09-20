@@ -77,6 +77,9 @@ fn plan_bytes(plan: &ExecutionPlan) -> Result<usize, String> {
 /// `initialize` writes representative inputs/weights once into each private
 /// session. `qualify` executes and checks all observable outputs against the
 /// caller's numerical contract before tuning, after tuning and after measurements.
+/// Completed kernel-class searches are reused only inside this call, with exact
+/// geometry, placement, precision, knobs and candidate order. Whole-program
+/// validation and timing are never reused.
 ///
 /// Samples include fresh recording, submission and wait, not output readback.
 /// Existing paired-order/noise guards select the incumbent; incomplete pairs
@@ -106,6 +109,7 @@ pub fn select(
     };
     let mut incumbent: Option<Session> = None;
     let mut incumbent_bytes = 0usize;
+    let mut kernels = crate::runtime::KernelMemo::default();
     let mut programs = programs.into_iter();
     for index in 0..options.max_programs {
         if start.elapsed() >= options.max_time {
@@ -154,7 +158,7 @@ pub fn select(
                     .min(options.max_time.saturating_sub(start.elapsed()));
                 trial.kernel_tuning = Some(
                     candidate
-                        .tune_with(policy)
+                        .tune_with_memo(policy, Some(&mut kernels))
                         .map_err(|error| error.to_string())?,
                 );
                 validate(&mut candidate)?;
@@ -226,6 +230,78 @@ pub fn select(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "GPU qualification of whole-program search and local kernel reuse"]
+    fn repeated_programs_reuse_only_completed_kernel_searches() {
+        use super::*;
+        let gpu = Arc::new(crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap());
+        let mut graph = crate::Graph::new();
+        let x = graph.input("x", &[33, 17]);
+        let w = graph.parameter("w", &[17, 65]);
+        let y = graph.matmul(x, w);
+        graph.set_outputs(vec![y]);
+        let plan = crate::compile::compile(&graph);
+        for budget in [Duration::ZERO, Duration::from_secs(30)] {
+            let programs = (0..2).map(|i| Program {
+                description: i.to_string(),
+                plan: plan.clone(),
+            });
+            let (session, report) = select(
+                programs,
+                gpu.clone(),
+                SessionOptions {
+                    coop: crate::CoopPolicy::Disabled,
+                    ..Default::default()
+                },
+                Options {
+                    tuning: TuneOptions {
+                        max_time: budget,
+                        sample_pairs: 4,
+                        warmup_runs: 1,
+                        dispatches_per_sample: 2,
+                        ..Default::default()
+                    },
+                    max_time: Duration::from_secs(60),
+                    max_programs: 2,
+                    max_plan_bytes: 1 << 20,
+                },
+                |s| {
+                    s.set_input("x", &vec![0.25; 33 * 17]);
+                    s.set_parameter("w", &vec![0.125; 17 * 65]);
+                    Ok(())
+                },
+                |s| {
+                    s.step();
+                    s.wait();
+                    let mut output = vec![0.0; 33 * 65];
+                    s.read_output_by_index(0, &mut output);
+                    if output.iter().all(|&v| v == 17.0 / 32.0) {
+                        Ok(())
+                    } else {
+                        Err("whole-output reference mismatch".into())
+                    }
+                },
+            )
+            .unwrap();
+            assert!(!report.truncated);
+            let first = report.trials[0].kernel_tuning.as_ref().unwrap();
+            let second = report.trials[1].kernel_tuning.as_ref().unwrap();
+            assert_eq!(first.outcomes.is_empty(), budget.is_zero());
+            assert!(first.outcomes.iter().all(|o| o.qualified));
+            assert!(first.reused_classes.is_empty());
+            assert_eq!(
+                second.reused_classes.len(),
+                if budget.is_zero() {
+                    0
+                } else {
+                    first.eligible_classes
+                }
+            );
+            assert!(second.outcomes.is_empty());
+            assert_eq!(session.read_params(&["w"])[0], vec![0.125; 17 * 65]);
+        }
+    }
+
     #[test]
     fn rejects_mutable_plans_before_allocation() {
         use crate::compile::{BufferRef, Dispatch};

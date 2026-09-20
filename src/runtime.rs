@@ -6,6 +6,7 @@ use std::sync::Arc;
 mod checkpoint;
 mod tuning;
 pub use crate::tune::TuneOutcome;
+pub(crate) use tuning::KernelMemo;
 
 type Gpu = blade_graphics::Context;
 

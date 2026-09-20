@@ -100,7 +100,7 @@ impl WeightFormat {
 /// participates in the plan-cache fingerprint automatically. Defaults come
 /// from capability-signature heuristics plus `MEGANEURA_FLASH_*` env
 /// overrides; a session-build tuner can substitute measured values instead.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TuningKnobs {
     /// Elements-per-thread cap for flash-attention forward codegen.
     pub flash_ept_cap: u32,

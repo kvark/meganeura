@@ -1063,6 +1063,10 @@ pub struct TuneReport {
     /// Live search visits a bounded candidate set per class; explicit split-K
     /// probes accept up to four counts against the same unsplit control.
     pub visited_classes: usize,
+    /// Completed searches reused within the same whole-program selection.
+    /// These are prior choices, not new timing or qualification samples.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reused_classes: Vec<(TuneClass, MatmulTile)>,
     pub excluded_dispatches: usize,
     pub class_limit_reached: bool,
     pub time_budget_exhausted: bool,

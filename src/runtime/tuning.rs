@@ -14,6 +14,13 @@ use std::{
 mod attention;
 mod submission;
 
+/// Completed private-scratch searches within one graph search, on one device
+/// and under one numerical/timing policy. Never persisted or shared globally.
+#[derive(Default)]
+pub(crate) struct KernelMemo(
+    HashMap<(crate::compile::TuningKnobs, TuneClass, Vec<MatmulTile>), MatmulTile>,
+);
+
 struct PhaseTimer<'a> {
     start: Instant,
     elapsed: &'a mut Option<Duration>,
@@ -435,6 +442,14 @@ impl Session {
     /// incumbent. A soft deadline may be exceeded by one in-flight operation;
     /// an incomplete comparison always retains its incumbent.
     pub fn tune_with(&mut self, options: TuneOptions) -> Result<TuneReport, TuneError> {
+        self.tune_with_memo(options, None)
+    }
+
+    pub(crate) fn tune_with_memo(
+        &mut self,
+        options: TuneOptions,
+        mut memo: Option<&mut KernelMemo>,
+    ) -> Result<TuneReport, TuneError> {
         options.validate()?;
         let start = Instant::now();
         let (mut classes, mut excluded_dispatches) =
@@ -462,10 +477,33 @@ impl Session {
                 break;
             }
             report.visited_classes += 1;
+            let memo_key = (
+                self.plan.knobs,
+                class.key.clone(),
+                std::iter::once(class.initial)
+                    .chain(class.challengers.iter().copied())
+                    .collect(),
+            );
+            if let Some(&selected) = memo.as_ref().and_then(|m| m.0.get(&memo_key)) {
+                if (selected == class.initial || class.challengers.contains(&selected))
+                    && self
+                        .pipelines
+                        .ensure_tune_tile(&gpu, &self.plan.dispatches[class.members[0]], selected)
+                        .is_ok()
+                {
+                    for &index in &class.members {
+                        selected.apply(&mut self.plan.dispatches[index], &class.key);
+                    }
+                    report.reused_classes.push((class.key.clone(), selected));
+                    continue;
+                }
+            }
             let mut incumbent = class.initial;
+            let mut completed = true;
             for &candidate in &class.challengers {
                 if start.elapsed() >= options.max_time {
                     report.time_budget_exhausted = true;
+                    completed = false;
                     break;
                 }
                 let mut outcome =
@@ -498,7 +536,15 @@ impl Session {
                 if let Some(ref failure) = outcome.failure {
                     log::warn!("tune: {failure}");
                 }
+                completed &= outcome.qualified
+                    && matches!(
+                        outcome.decision,
+                        TuneDecision::FasterCandidate | TuneDecision::KeepBaseline
+                    );
                 report.outcomes.push(outcome);
+            }
+            if completed && let Some(ref mut memo) = memo {
+                memo.0.insert(memo_key, incumbent);
             }
         }
         self.tune_attention(&mut report, start, &mut staging);
