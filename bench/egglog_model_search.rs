@@ -230,8 +230,9 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
         programs = vec![programs.remove(index)];
     }
     if std::env::args().any(|arg| arg == "--serial-sums") {
-        let mut variants = Vec::new();
-        for program in &programs {
+        let mut expanded = Vec::new();
+        for program in programs {
+            let mut variants = Vec::new();
             for workgroup_size in [64, 128, 256] {
                 let mut plan = program.plan.clone();
                 let mut changed = 0;
@@ -252,8 +253,10 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
                     });
                 }
             }
+            expanded.push(program);
+            expanded.extend(variants);
         }
-        programs.extend(variants);
+        programs = expanded;
     }
     let fixed_subgroup_size = gpu.capabilities().fixed_compute_subgroup_size;
     let runtime = SessionOptions {
@@ -275,6 +278,7 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
             Duration::from_secs(2)
         },
         max_classes: 32,
+        warmup_runs: 32,
         sample_pairs: 12,
         min_improvement: 0.02,
         ..Default::default()
@@ -299,7 +303,7 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
         search::measure::Options {
             tuning: tuning.clone(),
             max_time: Duration::from_secs(search_seconds),
-            max_programs: 32,
+            max_programs: 64,
             max_plan_bytes: 3 * 1024 * 1024 * 1024,
         },
         |session| {
