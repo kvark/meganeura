@@ -835,6 +835,8 @@ pub struct Node {
 pub enum ParamTransform {
     /// Horizontal concatenation: interleave source columns per row.
     HorizontalConcat,
+    /// Vertical concatenation: append dense source rows without transposing.
+    VerticalConcat,
     /// Winograd F(2,3) weight transform: [Co, Ci, 3, 3] → [16, Co, Ci].
     Winograd3x3 {
         out_channels: usize,
@@ -848,9 +850,9 @@ pub enum ParamTransform {
 pub struct DerivedParam {
     /// Name of the new parameter (e.g. "gate_proj.weight+up_proj.weight")
     pub name: String,
-    /// Source parameters to concatenate horizontally: (name, cols)
+    /// Source parameters and their extent along the concatenated axis.
     pub sources: Vec<(String, usize)>,
-    /// Total rows (shared across all sources)
+    /// Rows in the derived parameter.
     pub rows: usize,
     /// How to compute this parameter from sources.
     pub transform: ParamTransform,
