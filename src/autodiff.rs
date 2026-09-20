@@ -693,6 +693,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::SwiGLUGradGate
             | Op::SwiGLUGradUp
             | Op::SiluGrad
+            | Op::GeluErfGrad
             | Op::SwiGLUConcatGrad
             | Op::GeGLUConcatGrad
             | Op::RmsNormGradW { .. }
@@ -704,6 +705,12 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::PairwiseGrad { .. }
             | Op::GlobalAvgPoolGrad { .. }
             | Op::CrossEntropyLogitsGrad => {}
+            Op::GeluErf => {
+                let x = node.inputs[0];
+                let gradient =
+                    graph.add_raw_node(Op::GeluErfGrad, vec![grad_output, x], node.ty.clone());
+                accumulate_grad(&mut graph, &mut grads, x, gradient);
+            }
             Op::Gelu => {
                 // gelu(x) ≈ x * sigmoid(1.702 * x) (sigmoid approximation)
                 // gelu'(x) ≈ sigmoid(1.702x) * (1 + 1.702*x*(1 - sigmoid(1.702x)))
@@ -1373,6 +1380,35 @@ fn broadcast_constant(graph: &mut Graph, value: f32, target_shape: &[usize]) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn erf_gelu_backward_retains_only_original_input() {
+        let mut graph = Graph::new();
+        let x = graph.parameter("x", &[2_000_000]);
+        let y = graph.gelu_erf(x);
+        let loss = graph.mean_all(y);
+        graph.set_outputs(vec![loss]);
+        let full = differentiate(&graph);
+        let gradient = full.node(*full.outputs().last().unwrap());
+        assert!(matches!(gradient.op, Op::GeluErfGrad));
+        assert_eq!(gradient.inputs[1], x);
+        let constants: usize = full
+            .nodes()
+            .iter()
+            .map(|node| match node.op {
+                Op::Constant { ref data } => data.len(),
+                _ => 0,
+            })
+            .sum();
+        assert!(constants < 16);
+        assert_eq!(
+            crate::compile_training_graph(&graph)
+                .0
+                .param_grad_pairs
+                .len(),
+            1
+        );
+    }
 
     #[test]
     fn abs_and_split_gradients_do_not_allocate_input_sized_constants() {

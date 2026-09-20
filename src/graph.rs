@@ -468,8 +468,12 @@ pub enum Op {
 
     // --- Vision / VLA ops ---
 
-    // GELU activation: x * 0.5 * (1 + erf(x / sqrt(2)))
+    // Historical tanh-approximate GELU.
     Gelu,
+    /// Gaussian-CDF GELU, distinct from the historical tanh approximation.
+    GeluErf,
+    /// Inputs: upstream gradient, original activation.
+    GeluErfGrad,
 
     // Standard Layer Normalization: (x - mean) / sqrt(var + eps) * weight + bias
     // inputs: [x, weight, bias]
@@ -2941,6 +2945,13 @@ impl Graph {
     pub fn gelu(&mut self, x: NodeId) -> NodeId {
         let ty = self.node(x).ty.clone();
         self.add_node(Op::Gelu, vec![x], ty)
+    }
+
+    /// Gaussian-CDF GELU with an analytical derivative and no retained
+    /// approximation intermediates. Erf absolute approximation error <1.5e-7.
+    pub fn gelu_erf(&mut self, x: NodeId) -> NodeId {
+        let ty = self.node(x).ty.clone();
+        self.add_node(Op::GeluErf, vec![x], ty)
     }
 
     #[track_caller]

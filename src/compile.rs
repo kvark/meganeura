@@ -4,6 +4,7 @@ use crate::schedule::{PointwiseDAG, Pw, ReductionEpilogue, ReductionKernel};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+mod gelu_erf;
 mod softplus;
 mod split_k;
 
@@ -3514,6 +3515,24 @@ impl<'a> Compiler<'a> {
             }
             Op::Cos => {
                 self.emit_generated_unary(Pw::Cos(0), node, out_buf);
+            }
+            Op::GeluErf | Op::GeluErfGrad => {
+                let backward = matches!(node.op, Op::GeluErfGrad);
+                let input_buffers = node.inputs.iter().map(|&id| self.get_buffer(id)).collect();
+                let len = node.ty.num_elements() as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: if backward {
+                        ShaderEntry::Mul
+                    } else {
+                        ShaderEntry::Relu
+                    },
+                    workgroups: [len.div_ceil(256), 1, 1],
+                    input_buffers,
+                    output_buffer: out_buf,
+                    params: vec![len, 0, 0, 0],
+                    kernel: Kernel::Pointwise(gelu_erf::pointwise(backward)),
+                    ..Default::default()
+                });
             }
             Op::Softplus { beta } => {
                 let input = self.get_buffer(node.inputs[0]);

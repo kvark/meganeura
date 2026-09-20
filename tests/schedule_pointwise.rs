@@ -147,6 +147,54 @@ fn trigonometric_forward_and_gradient_match_cpu() {
 }
 
 #[test]
+fn erf_gelu_forward_and_gradient_match_gaussian_integral() {
+    let input: Vec<f32> = (0..513).map(|i| (i as f32 - 256.0) / 32.0).collect();
+    let mut graph = Graph::new();
+    let x = graph.parameter("x", &[input.len()]);
+    let y = graph.gelu_erf(x);
+    let loss = graph.sum_all(y);
+    graph.set_outputs(vec![loss, y]);
+    let mut session = meganeura::build_session(&graph);
+    session.set_parameter("x", &input);
+    session.step();
+    session.wait();
+    let mut output = vec![0.0; input.len()];
+    let mut gradient = output.clone();
+    session.read_output_by_index(1, &mut output);
+    session.read_param_grad("x", &mut gradient);
+    for (i, &x) in input.iter().enumerate() {
+        // Simpson integration is independent of the shader's erf polynomial.
+        let x = f64::from(x);
+        let dt = x / 512.0;
+        let density = |v: f64| (-v * v / 2.0).exp() / std::f64::consts::TAU.sqrt();
+        let integral = (0..=512)
+            .map(|k| {
+                let weight = if k == 0 || k == 512 {
+                    1.0
+                } else if k % 2 == 0 {
+                    2.0
+                } else {
+                    4.0
+                };
+                weight * density(k as f64 * dt)
+            })
+            .sum::<f64>()
+            * dt
+            / 3.0;
+        let cdf = 0.5 + integral;
+        for (name, actual, expected) in [
+            ("forward", output[i], x * cdf),
+            ("gradient", gradient[i], cdf + x * density(x)),
+        ] {
+            assert!(
+                (f64::from(actual) - expected).abs() < 2e-6,
+                "{name}[{i}]: {actual} != {expected}"
+            );
+        }
+    }
+}
+
+#[test]
 fn abs_and_split_gradient_broadcasts_match_cpu() {
     const LEN: usize = 1026;
     let input = (0..LEN)
