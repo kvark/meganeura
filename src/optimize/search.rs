@@ -1,8 +1,8 @@
 //! Bounded equivalent-region extraction for measured implementation selection.
 //!
 //! This uses the existing egglog rules and graph reconstruction. It deliberately
-//! accepts one small, single-output region: timing unrelated roots independently
-//! would double-count shared work. Each candidate must be lowered and tuned before
+//! accepts a bounded region and extracts its observable roots together. Timing
+//! roots independently would double-count shared work. Each candidate is tuned before
 //! comparing its complete execution, not ranked by its untuned kernel timings.
 
 use super::{FusionCostModel, Segment, Stamper};
@@ -11,7 +11,10 @@ use egglog::{
     Term, TermDag, TermId, Value,
     extract::{CostModel, Extractor},
 };
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    ops::Range,
+};
 
 pub struct Candidate {
     pub graph: Graph,
@@ -148,12 +151,24 @@ fn edges(
 /// orders exploration only; callers must measure complete lowered candidates.
 /// `truncated` reports an unfinished search. No GPU measurement happens here.
 pub fn candidates(graph: &Graph, limit: usize) -> Result<SearchSpace, String> {
-    if limit == 0 || graph.nodes().len() > super::SATURATION_CUTOFF {
+    region_candidates(graph, 0..graph.nodes().len(), limit)
+}
+
+/// Explore a contiguous region without changing the surrounding graph. Its
+/// escaping values are extracted together; dependencies outside the region stay
+/// opaque. Returned graphs preserve the original inputs, parameters and outputs.
+pub fn region_candidates(
+    graph: &Graph,
+    region: Range<usize>,
+    limit: usize,
+) -> Result<SearchSpace, String> {
+    if limit == 0
+        || region.is_empty()
+        || region.len() > super::SATURATION_CUTOFF
+        || region.end > graph.nodes().len()
+    {
         return Err("expected a bounded region and a positive candidate limit".into());
     }
-    let &[root] = graph.outputs() else {
-        return Err("region search requires one observable output".into());
-    };
     if graph
         .nodes()
         .iter()
@@ -162,37 +177,74 @@ pub fn candidates(graph: &Graph, limit: usize) -> Result<SearchSpace, String> {
         return Err("region search requires topologically ordered nodes".into());
     }
     let segment = Segment {
-        ids: graph
-            .nodes()
-            .iter()
-            .filter(|n| !matches!(n.op, Op::Nop))
-            .map(|n| n.id as usize)
+        ids: region
+            .filter(|&id| !matches!(graph.nodes()[id].op, Op::Nop))
             .collect(),
         shifts: vec![0],
     };
-    let (program, _) = super::segment_program(graph, &segment);
+    let roots = super::segment_roots(graph, &segment);
+    if roots.is_empty() {
+        return Err("region has no observable output".into());
+    }
+    let full_precision = graph.node(roots[0] as u32).requires_full_precision;
+    for &id in &segment.ids {
+        let node = &graph.nodes()[id];
+        if matches!(
+            node.op,
+            Op::Input { .. } | Op::Parameter { .. } | Op::Constant { .. }
+        ) {
+            continue;
+        }
+        if matches!(
+            node.op,
+            Op::CacheWrite | Op::CacheWritePrefix | Op::ScatterAdd { .. }
+        ) {
+            return Err("stateful regions need an explicit mutation contract".into());
+        }
+        if node.requires_full_precision != full_precision {
+            return Err("region crosses a precision boundary".into());
+        }
+        if !(1..=6).contains(&node.inputs.len()) {
+            return Err("region contains an unsupported operator arity".into());
+        }
+    }
+    let (mut program, externals) = super::segment_program(graph, &segment);
+    let root_name = if roots.len() == 1 {
+        format!("$n{}", roots[0])
+    } else {
+        program.push_str(&format!(
+            "(constructor SearchOutputs ({}) Op)\n(let $outputs (SearchOutputs {}))\n",
+            vec!["Op"; roots.len()].join(" "),
+            roots
+                .iter()
+                .map(|id| format!("$n{id}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        ));
+        "$outputs".into()
+    };
     let mut egraph = egglog::EGraph::default();
     egraph
         .parse_and_run_program(None, &program)
         .map_err(|e| e.to_string())?;
     let (sort, value) = egraph
-        .eval_expr(&egglog::ast::Expr::Var(
-            egglog::ast::Span::Panic,
-            format!("$n{root}"),
-        ))
+        .eval_expr(&egglog::ast::Expr::Var(egglog::ast::Span::Panic, root_name))
         .map_err(|e| e.to_string())?;
     let costs = FusionCostModel::with_sizes(super::eclass_sizes(
         graph,
         &mut egraph,
-        segment.ids.iter().copied(),
+        segment.ids.iter().chain(&externals).copied(),
     ));
     let ids: HashSet<_> = segment.ids.iter().copied().collect();
+    let ext_map: HashMap<_, _> = externals.iter().map(|&id| (id, id as u32)).collect();
     let mut pending = VecDeque::from([Vec::new()]);
     let mut visited = HashSet::from([Vec::new()]);
     let mut expressions = HashSet::new();
     let mut choices = HashMap::new();
     let mut result = Vec::new();
-    for _ in 0..limit.saturating_mul(segment.ids.len()) {
+    let attempts = limit.saturating_mul(segment.ids.len());
+    let mut bounded = false;
+    for _ in 0..attempts {
         let Some(forbidden) = pending.pop_front() else {
             break;
         };
@@ -225,7 +277,13 @@ pub fn candidates(graph: &Graph, limit: usize) -> Result<SearchSpace, String> {
             next.push(edge);
             next.sort_unstable();
             next.dedup();
-            if visited.insert(next.clone()) {
+            if visited.contains(&next) {
+                continue;
+            }
+            if visited.len() == attempts {
+                bounded = true;
+            } else {
+                visited.insert(next.clone());
                 pending.push_back(next);
             }
         }
@@ -235,17 +293,27 @@ pub fn candidates(graph: &Graph, limit: usize) -> Result<SearchSpace, String> {
         }
         let mut candidate = graph.deep_clone();
         let mut index = super::build_structural_index(&candidate);
-        Stamper {
-            g: &mut candidate,
-            index: &mut index,
-            seg_ids: &ids,
-            shift: 0,
-            ext_map: &HashMap::new(),
-            fusions: &mut Vec::new(),
-            memo: HashMap::new(),
-            requires_full_precision: graph.node(root).requires_full_precision,
+        let terms_to_stamp = if roots.len() == 1 {
+            vec![term]
+        } else {
+            match *terms.get(term) {
+                Term::App(ref head, ref args) if head == "SearchOutputs" => args.clone(),
+                _ => return Err("missing joint extraction roots".into()),
+            }
+        };
+        for (&root, term) in roots.iter().zip(terms_to_stamp) {
+            Stamper {
+                g: &mut candidate,
+                index: &mut index,
+                seg_ids: &ids,
+                shift: 0,
+                ext_map: &ext_map,
+                fusions: &mut Vec::new(),
+                memo: HashMap::new(),
+                requires_full_precision: graph.node(root as u32).requires_full_precision,
+            }
+            .stamp_root(root, &terms, term)?;
         }
-        .stamp_root(root as usize, &terms, term)?;
         super::sweep_dead_nodes(&mut candidate);
         result.push(Candidate {
             graph: candidate.into_toposort(),
@@ -257,7 +325,7 @@ pub fn candidates(graph: &Graph, limit: usize) -> Result<SearchSpace, String> {
     }
     Ok(SearchSpace {
         candidates: result,
-        truncated: !pending.is_empty(),
+        truncated: bounded || !pending.is_empty(),
     })
 }
 
@@ -295,6 +363,15 @@ mod tests {
         );
         assert!(candidates(&graph, 0).is_err());
         graph.set_outputs(vec![product, out]);
+        let space = candidates(&graph, 8).unwrap();
+        assert!(!space.truncated);
+        assert!(
+            space
+                .candidates
+                .iter()
+                .all(|c| c.graph.outputs().len() == 2)
+        );
+        graph.nodes_mut()[out as usize].requires_full_precision = true;
         assert!(candidates(&graph, 8).is_err());
     }
 
@@ -340,5 +417,17 @@ mod tests {
             .collect();
         assert_eq!(forms, [0, 1, 2].into_iter().collect());
         assert_eq!(space.candidates.len(), 4);
+
+        // Search only the second pair. External inputs keep their identities,
+        // and the first independent pair is not rewritten as a side effect.
+        let region = super::region_candidates(&graph, mm2 as usize..add2 as usize + 1, 8).unwrap();
+        assert_eq!(region.candidates.len(), 2);
+        assert!(
+            region
+                .candidates
+                .iter()
+                .all(|c| c.expression.matches("FusedMatMulAdd").count() <= 1)
+        );
+        assert!(super::region_candidates(&graph, 0..0, 8).is_err());
     }
 }
