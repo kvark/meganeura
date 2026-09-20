@@ -111,9 +111,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut scheduling = Vec::new();
     if tune_seconds != 0 && matches!(scope, meganeura::tune::TuneScope::All) {
-        run(&mut sessions[1], 0, PROMPT, config.vocab_size);
+        run(&mut sessions[1], &model, &config, 0, PROMPT);
         for pos in PROMPT..PROMPT + DECODE {
-            run(&mut sessions[0], pos, 1, config.vocab_size);
+            run(&mut sessions[0], &model, &config, pos, 1);
         }
         for session in &mut sessions {
             scheduling.push(
