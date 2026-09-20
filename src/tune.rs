@@ -255,17 +255,30 @@ impl MatmulTile {
     }
 
     pub(crate) fn apply(self, dispatch: &mut Dispatch, class: &TuneClass) {
+        self.configure(dispatch);
+        dispatch.workgroups = self.workgroups(class);
+    }
+
+    pub(crate) fn configure(self, dispatch: &mut Dispatch) {
         if let Self::Gemv(shape) = self {
             dispatch.kernel = crate::compile::Kernel::Gemv {
                 shape,
                 integer_dot: dispatch.gemv_int_dot(),
             };
-            dispatch.workgroups = self.workgroups(class);
             return;
         }
-        dispatch.shader = self.shader(&class.shader);
+        dispatch.shader = self.shader(&dispatch.shader);
         dispatch.kernel = match self {
-            Self::Tile32 if class.conv2d.is_none() => crate::compile::Kernel::SmallTile,
+            Self::Tile32
+                if !matches!(
+                    dispatch.shader,
+                    ShaderEntry::Conv2dGemmSmall
+                        | ShaderEntry::Conv2dGradInputGemmSmall
+                        | ShaderEntry::Conv2dGradWeightGemmSmall
+                ) =>
+            {
+                crate::compile::Kernel::SmallTile
+            }
             Self::Tile32 | Self::Tile64 => crate::compile::Kernel::Default,
             Self::Scalar(shape) => crate::compile::Kernel::ScalarMatmul(shape),
             Self::CooperativeF32 { .. } => crate::compile::Kernel::Cooperative,
@@ -274,7 +287,6 @@ impl MatmulTile {
             }
             Self::Gemv(_) => unreachable!(),
         };
-        dispatch.workgroups = self.workgroups(class);
     }
 
     pub(crate) fn shader(self, entry: &ShaderEntry) -> ShaderEntry {
