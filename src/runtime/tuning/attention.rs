@@ -1,4 +1,4 @@
-use crate::compile::{BufferRef, CachedBlockAttentionParams, Dispatch, ShaderEntry};
+use crate::compile::{BufferRef, Dispatch};
 use crate::tune::{
     TuneAttention, TuneDecision, TuneOptions, TuneOutcome, TuneQualificationTimes, TuneReport,
     TuneScope, TuneScratchUsage,
@@ -19,199 +19,17 @@ struct Class {
     members: Vec<Member>,
 }
 
-impl TuneAttention {
-    fn from_dispatch(d: &Dispatch) -> Option<Self> {
-        let CachedBlockAttentionParams {
-            window_size,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            block_len,
-            max_seq,
-            ..
-        } = CachedBlockAttentionParams::from_words(&d.params)?;
-        if [num_heads, num_kv_heads, head_dim, block_len, max_seq].contains(&0)
-            || !num_heads.is_multiple_of(num_kv_heads)
-            || head_dim > 512
-            || block_len > max_seq
-            || num_heads > 0xFFFF
-            || block_len > 0xFFFF
-            || max_seq > u32::MAX / 2
-        {
-            return None;
-        }
-        let last = max_seq - block_len;
-        let mut positions = vec![0, last / 2, last];
-        positions.dedup();
-        let key = Self {
-            window_size,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            block_len,
-            max_seq,
-            positions,
-            device_local: [false; 7],
-            binding_bytes: Vec::new(),
-        };
-        key.sizes(1)?;
-        Some(key)
-    }
-
-    fn sizes(&self, splits: u32) -> Option<Vec<usize>> {
-        if !(1..=16).contains(&splits) {
-            return None;
-        }
-        let bytes = |elements: u32| usize::try_from(elements).ok()?.checked_mul(4);
-        let query = bytes(
-            self.block_len
-                .checked_mul(self.num_heads)?
-                .checked_mul(self.head_dim)?,
-        )?;
-        let cache = bytes(
-            self.max_seq
-                .checked_mul(self.num_kv_heads)?
-                .checked_mul(self.head_dim)?,
-        )?;
-        let partials = if splits == 1 {
-            4
-        } else {
-            bytes(
-                self.block_len
-                    .checked_mul(self.num_heads)?
-                    .checked_mul(splits)?
-                    .checked_mul(self.head_dim.checked_add(2)?)?,
-            )?
-        };
-        Some(vec![query, cache, cache, 4, 4, query, partials])
-    }
-
-    fn sequence(
-        &self,
-        source: &Dispatch,
-        output: BufferRef,
-        partials: BufferRef,
-        splits: u32,
-    ) -> Vec<Dispatch> {
-        let old_entry = format!("{:?}", source.shader);
-        let label = |entry: &ShaderEntry| match source.label.rsplit_once(&old_entry) {
-            Some((prefix, suffix)) => format!("{prefix}{entry:?}{suffix}"),
-            None => format!("{entry:?}"),
-        };
-        let mut first = source.clone();
-        let mut params = CachedBlockAttentionParams::from_words(&source.params)
-            .expect("qualified attention parameters");
-        params.splits = if splits == 1 { 0 } else { splits };
-        params.chunk = if splits == 1 {
-            0
-        } else {
-            self.max_seq.div_ceil(splits)
-        };
-        first.params = params.to_words();
-        first.output_buffer = output;
-        first.shader = ShaderEntry::CachedBlockAttention;
-        first.label = label(&first.shader);
-        first.workgroups = [self.block_len, self.num_heads, 1];
-        if splits == 1 {
-            return vec![first];
-        }
-        first.shader = ShaderEntry::CachedBlockAttentionSplit;
-        first.label = label(&first.shader);
-        first.workgroups = [self.block_len, splits, self.num_heads];
-        first.output_buffer = partials;
-        let mut combine = first.clone();
-        combine.shader = ShaderEntry::CachedBlockAttentionCombine;
-        combine.label = label(&combine.shader);
-        combine.input_buffers = vec![partials];
-        combine.output_buffer = output;
-        combine.workgroups = [self.block_len, self.num_heads, 1];
-        vec![first, combine]
-    }
-}
-
-fn plain(d: &Dispatch) -> bool {
-    matches!(*d, Dispatch {
-        shader: _,
-        workgroups: _,
-        input_buffers: _,
-        output_buffer: _,
-        extra_outputs: ref outputs,
-        params: _,
-
-        kernel: crate::compile::Kernel::Default,
-        horizontal_batch: 0 | 1,
-        requires_full_precision: _,
-        fusion_barrier: _,
-        matmul_epilogue: None,
-        gemv_rmsnorm: None,
-        matmul_prologue: None,
-        label: _,
-        origin: _,
-        weight_format: crate::compile::WeightFormat::F32,
-    } if outputs.is_empty())
-}
-
 fn collect(session: &super::Session) -> Vec<Class> {
     let plan = &session.plan;
     let mut classes: Vec<Class> = Vec::new();
     let mut indices = HashMap::new();
-    for (first, d) in plan.dispatches.iter().enumerate() {
-        if !matches!(
-            d.shader,
-            ShaderEntry::CachedBlockAttention | ShaderEntry::CachedBlockAttentionSplit
-        ) || d.input_buffers.len() != 5
-            || !plain(d)
-        {
-            continue;
-        }
-        let Some(mut key) = TuneAttention::from_dispatch(d) else {
-            continue;
-        };
-        let combine = if d.shader == ShaderEntry::CachedBlockAttentionSplit {
-            let consumers: Vec<_> = plan
-                .dispatches
-                .iter()
-                .enumerate()
-                .filter(|&(_, c)| c.input_buffers.contains(&d.output_buffer))
-                .collect();
-            let &[(index, c)] = consumers.as_slice() else {
-                continue;
-            };
-            if index <= first
-                || c.shader != ShaderEntry::CachedBlockAttentionCombine
-                || c.input_buffers != [d.output_buffer]
-                || c.params != d.params
-                || !plain(c)
-                || c.workgroups != [key.block_len, key.num_heads, 1]
-            {
-                continue;
-            }
-            Some(index)
-        } else {
-            None
-        };
-        let initial = if combine.is_some() {
-            CachedBlockAttentionParams::from_words(&d.params)
-                .unwrap()
-                .splits
-        } else {
-            1
-        };
-        // The compiler may start at non-power-of-two counts. Keep that legal
-        // incumbent as well as the small power-of-two challenger set.
-        if initial == 0 || initial > 16 {
-            continue;
-        }
-        let output = plan.dispatches[combine.unwrap_or(first)].output_buffer;
-        let expected = key.sequence(d, output, d.output_buffer, initial);
-        if d.workgroups != expected[0].workgroups || d.params != expected[0].params {
-            continue;
-        }
-        let mut bindings = d.input_buffers.clone();
-        bindings.push(output);
-        if combine.is_some() {
-            bindings.push(d.output_buffer);
-        }
+    for sequence in plan.attention_sequences() {
+        let bindings = sequence.bindings(plan);
+        let first = sequence.first;
+        let combine = sequence.combine;
+        let initial = sequence.initial;
+        let output = bindings[5];
+        let mut key = sequence.key;
         let physical: Vec<_> = bindings
             .iter()
             .map(|b| session.alias.map[b.0 as usize])
@@ -231,17 +49,6 @@ fn collect(session: &super::Session) -> Vec<Class> {
                 .get(&output)
                 .map(|b| session.alias.device_local[session.alias.map[b.0 as usize]])
                 .unwrap_or(session.optimizer_device);
-        }
-        key.binding_bytes = bindings[..6]
-            .iter()
-            .map(|b| plan.buffers[b.0 as usize])
-            .collect();
-        if key.sizes(1).unwrap()[..6]
-            .iter()
-            .zip(&key.binding_bytes)
-            .any(|(need, have)| need > have)
-        {
-            continue;
         }
         let next = classes.len();
         let index = *indices.entry((key.clone(), initial)).or_insert(next);
@@ -830,9 +637,9 @@ fn qualify_partials(
 #[cfg(test)]
 mod tests {
     use super::{
-        BufferRef, CachedBlockAttentionParams, Dispatch, HashMap, ShaderEntry, TuneAttention,
-        collect, qualify_partials, qualify_reference,
+        BufferRef, Dispatch, HashMap, TuneAttention, collect, qualify_partials, qualify_reference,
     };
+    use crate::compile::{CachedBlockAttentionParams, ShaderEntry};
 
     #[test]
     fn attention_contract_and_oracles_cover_geometry_and_corruption() {

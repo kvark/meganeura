@@ -4,6 +4,7 @@ use crate::schedule::{PointwiseDAG, Pw, ReductionEpilogue, ReductionKernel};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+mod attention;
 mod softplus;
 mod split_k;
 
