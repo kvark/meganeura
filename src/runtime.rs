@@ -6483,6 +6483,27 @@ impl Session {
         self.read_buffer(buf_ref, out);
     }
 
+    /// Wait for pending work and read a graph output.
+    ///
+    /// Queues a staged download before waiting on the CPU. Mapped reads and
+    /// the initial readback probe still wait before accessing the buffer.
+    pub fn wait_read_output(&mut self, index: usize, out: &mut [f32]) {
+        let buf_ref = self.plan.output_buffers[index];
+        let buffer = self.buffers[buf_ref.0 as usize];
+        let staged = !self.logical_host_visible(buf_ref)
+            || self
+                .readback
+                .borrow()
+                .staged
+                .get(&(buffer.data() as usize, std::mem::size_of_val(out)))
+                == Some(&true);
+        if !staged {
+            self.wait();
+        }
+        self.read_buffer(buf_ref, out);
+        self.wait();
+    }
+
     /// Number of graph outputs.
     pub fn num_outputs(&self) -> usize {
         self.plan.output_buffers.len()

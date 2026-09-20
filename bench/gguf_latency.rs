@@ -19,7 +19,7 @@ fn run(
     config: &gguf::arch::ModelConfig,
     position: usize,
     count: usize,
-) -> (Vec<f32>, [f64; 3]) {
+) -> (Vec<f32>, [f64; 2]) {
     let tokens: Vec<u32> = (position..position + count)
         .map(|i| 42 + (i % 31) as u32)
         .collect();
@@ -41,18 +41,15 @@ fn run(
     let start = Instant::now();
     session.step();
     let submitted = Instant::now();
-    session.wait();
-    let finished = Instant::now();
     let mut logits = vec![0.0; config.vocab_size];
-    session.read_output_by_index(0, &mut logits);
+    session.wait_read_output(0, &mut logits);
     assert!(logits.iter().all(|x| x.is_finite()));
     let read = Instant::now();
     (
         logits,
         [
             submitted.duration_since(start).as_secs_f64() * 1000.0,
-            finished.duration_since(submitted).as_secs_f64() * 1000.0,
-            read.duration_since(finished).as_secs_f64() * 1000.0,
+            read.duration_since(submitted).as_secs_f64() * 1000.0,
         ],
     )
 }
@@ -166,7 +163,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "vocab": config.vocab_size, "prepare_ms": prepare_ms,
         "activations": if f32_activations { "f32" } else { "q8_1" },
         "prefill_ms": prefill_ms, "decode_ms": decode_ms,
-        "decode_record_wait_read_ms": decode_parts_ms,
+        "decode_record_finish_ms": decode_parts_ms,
         "dispatches": [sessions[1].plan().dispatches.len(), sessions[0].plan().dispatches.len()],
         "tuning": tuning,
         "submission_tuning": scheduling,
