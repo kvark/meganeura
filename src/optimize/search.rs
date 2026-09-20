@@ -7,21 +7,147 @@
 
 use super::{FusionCostModel, Segment, Stamper};
 use crate::{Graph, graph::Op};
-use egglog::{TermDag, extract::Extractor};
-use std::collections::{HashMap, HashSet};
+use egglog::{
+    Term, TermDag, TermId, Value,
+    extract::{CostModel, Extractor},
+};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 pub struct Candidate {
     pub graph: Graph,
     pub expression: String,
 }
 
-/// Retain root implementation alternatives instead of immediately extracting one.
+pub struct SearchSpace {
+    pub candidates: Vec<Candidate>,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct Edge {
+    head: String,
+    inputs: Vec<Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Cost {
+    forbidden: usize,
+    estimate: u64,
+}
+
+impl egglog::extract::Cost for Cost {
+    fn identity() -> Self {
+        Self {
+            forbidden: 0,
+            estimate: 0,
+        }
+    }
+    fn unit() -> Self {
+        Self {
+            forbidden: 0,
+            estimate: 1,
+        }
+    }
+    fn combine(self, other: &Self) -> Self {
+        Self {
+            forbidden: self.forbidden.saturating_add(other.forbidden),
+            estimate: self.estimate.saturating_add(other.estimate),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Excluding {
+    costs: FusionCostModel,
+    forbidden: Vec<Edge>,
+}
+
+impl CostModel<Cost> for Excluding {
+    fn fold(&self, _: &str, children: &[Cost], head: Cost) -> Cost {
+        use egglog::extract::Cost as _;
+        children
+            .iter()
+            .fold(head, |cost, child| cost.combine(child))
+    }
+
+    fn enode_cost(
+        &self,
+        egraph: &egglog::EGraph,
+        func: &egglog::Function,
+        row: &egglog::FunctionRow,
+    ) -> Cost {
+        Cost {
+            forbidden: usize::from(
+                self.forbidden
+                    .binary_search(&Edge {
+                        head: func.name().to_string(),
+                        inputs: row.vals[..row.vals.len() - 1].to_vec(),
+                    })
+                    .is_ok(),
+            ),
+            estimate: self.costs.enode_cost(egraph, func, row).max(1),
+        }
+    }
+}
+
+fn edges(
+    egraph: &mut egglog::EGraph,
+    terms: &TermDag,
+    root: TermId,
+) -> Result<Vec<(Value, Edge)>, String> {
+    fn visit(
+        egraph: &mut egglog::EGraph,
+        terms: &TermDag,
+        id: TermId,
+        values: &mut HashMap<TermId, Value>,
+        edges: &mut Vec<(Value, Edge)>,
+    ) -> Result<Value, String> {
+        if let Some(&value) = values.get(&id) {
+            return Ok(value);
+        }
+        let value = match terms.get(id) {
+            Term::App(head, args) => {
+                let inputs = args
+                    .iter()
+                    .map(|&arg| visit(egraph, terms, arg, values, edges))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let value = egraph
+                    .lookup_function(head, &inputs)
+                    .ok_or("extracted term is missing from the e-graph")?;
+                if head != "Leaf" {
+                    edges.push((
+                        value,
+                        Edge {
+                            head: head.clone(),
+                            inputs,
+                        },
+                    ));
+                }
+                value
+            }
+            _ => {
+                egraph
+                    .eval_expr(&terms.term_to_expr(&id, egglog::ast::Span::Panic))
+                    .map_err(|e| e.to_string())?
+                    .1
+            }
+        };
+        values.insert(id, value);
+        Ok(value)
+    }
+    let mut result = Vec::new();
+    visit(egraph, terms, root, &mut HashMap::new(), &mut result)?;
+    Ok(result)
+}
+
+/// Retain equivalent implementations before lowering or kernel tuning.
 ///
-/// This is not a global or k-best graph search: egglog extracts the cheapest
-/// children of each root alternative. The limit bounds root alternatives, not
-/// saturation. Inputs must therefore already be a bounded, topologically sorted
-/// region. Kernel configurations are searched separately for *each* candidate.
-pub fn candidates(graph: &Graph, limit: usize) -> Result<Vec<Candidate>, String> {
+/// Egglog's extractor reconstructs each candidate. Excluding a selected e-node
+/// exposes alternative choices, including inside children. This is bounded
+/// enumeration, not a globally optimal or k-best schedule search. The estimate
+/// orders exploration only; callers must measure complete lowered candidates.
+/// `truncated` reports an unfinished search. No GPU measurement happens here.
+pub fn candidates(graph: &Graph, limit: usize) -> Result<SearchSpace, String> {
     if limit == 0 || graph.nodes().len() > super::SATURATION_CUTOFF {
         return Err("expected a bounded region and a positive candidate limit".into());
     }
@@ -60,12 +186,53 @@ pub fn candidates(graph: &Graph, limit: usize) -> Result<Vec<Candidate>, String>
         &mut egraph,
         segment.ids.iter().copied(),
     ));
-    let extractor = Extractor::compute_costs_from_rootsorts(Some(vec![sort]), &egraph, costs);
-    let mut terms = TermDag::default();
-    let variants = extractor.extract_variants(&egraph, &mut terms, value, limit);
     let ids: HashSet<_> = segment.ids.iter().copied().collect();
+    let mut pending = VecDeque::from([Vec::new()]);
+    let mut visited = HashSet::from([Vec::new()]);
+    let mut expressions = HashSet::new();
+    let mut choices = HashMap::new();
     let mut result = Vec::new();
-    for (_, term) in variants {
+    for _ in 0..limit.saturating_mul(segment.ids.len()) {
+        let Some(forbidden) = pending.pop_front() else {
+            break;
+        };
+        let extractor = Extractor::compute_costs_from_rootsorts(
+            Some(vec![sort.clone()]),
+            &egraph,
+            Excluding {
+                costs: costs.clone(),
+                forbidden: forbidden.clone(),
+            },
+        );
+        let mut terms = TermDag::default();
+        let Some((cost, term)) = extractor.extract_best(&egraph, &mut terms, value) else {
+            continue;
+        };
+        if cost.forbidden != 0 {
+            continue;
+        }
+        for (value, edge) in edges(&mut egraph, &terms, term)? {
+            let branching = *choices.entry(value).or_insert_with(|| {
+                extractor
+                    .extract_variants(&egraph, &mut TermDag::default(), value, 2)
+                    .len()
+                    > 1
+            });
+            if !branching {
+                continue;
+            }
+            let mut next = forbidden.clone();
+            next.push(edge);
+            next.sort_unstable();
+            next.dedup();
+            if visited.insert(next.clone()) {
+                pending.push_back(next);
+            }
+        }
+        let expression = terms.to_string(term);
+        if !expressions.insert(expression.clone()) {
+            continue;
+        }
         let mut candidate = graph.deep_clone();
         let mut index = super::build_structural_index(&candidate);
         Stamper {
@@ -82,10 +249,16 @@ pub fn candidates(graph: &Graph, limit: usize) -> Result<Vec<Candidate>, String>
         super::sweep_dead_nodes(&mut candidate);
         result.push(Candidate {
             graph: candidate.into_toposort(),
-            expression: terms.to_string(term),
+            expression,
         });
+        if result.len() == limit {
+            break;
+        }
     }
-    Ok(result)
+    Ok(SearchSpace {
+        candidates: result,
+        truncated: !pending.is_empty(),
+    })
 }
 
 #[cfg(test)]
@@ -102,7 +275,9 @@ mod tests {
         let product = graph.matmul(a, b);
         let out = graph.add(product, c);
         graph.set_outputs(vec![out]);
-        let choices = candidates(&graph, 8).unwrap();
+        let space = candidates(&graph, 8).unwrap();
+        assert!(!space.truncated);
+        let choices = space.candidates;
         assert!(
             choices
                 .iter()
@@ -121,5 +296,49 @@ mod tests {
         assert!(candidates(&graph, 0).is_err());
         graph.set_outputs(vec![product, out]);
         assert!(candidates(&graph, 8).is_err());
+    }
+
+    #[test]
+    fn explores_inner_choices_without_committing_to_the_cheapest_child() {
+        let mut graph = Graph::new();
+        let a = graph.input("a", &[3, 7]);
+        let b = graph.parameter("b", &[7, 5]);
+        let c = graph.input("c", &[3, 5]);
+        let mm = graph.matmul(a, b);
+        let add = graph.add(mm, c);
+        let out = graph.neg(add);
+        graph.set_outputs(vec![out]);
+        let space = candidates(&graph, 8).unwrap();
+        assert!(!space.truncated);
+        assert!(
+            space
+                .candidates
+                .iter()
+                .any(|c| c.expression.starts_with("(Neg (FusedMatMulAdd"))
+        );
+        assert!(
+            space
+                .candidates
+                .iter()
+                .any(|c| c.expression.starts_with("(Neg (Add (MatMul"))
+        );
+        assert!(candidates(&graph, 1).unwrap().truncated);
+
+        let d = graph.input("d", &[3, 7]);
+        let e = graph.parameter("e", &[7, 5]);
+        let f = graph.input("f", &[3, 5]);
+        let mm2 = graph.matmul(d, e);
+        let add2 = graph.add(mm2, f);
+        let out = graph.mul(add, add2);
+        graph.set_outputs(vec![out]);
+        let space = candidates(&graph, 16).unwrap();
+        assert!(!space.truncated);
+        let forms: std::collections::HashSet<_> = space
+            .candidates
+            .iter()
+            .map(|candidate| candidate.expression.matches("FusedMatMulAdd").count())
+            .collect();
+        assert_eq!(forms, [0, 1, 2].into_iter().collect());
+        assert_eq!(space.candidates.len(), 4);
     }
 }

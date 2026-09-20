@@ -1,19 +1,15 @@
 //! Small-region experiment: retain egglog alternatives through kernel tuning.
 //! Usage: egglog_search [M K N] [reverse]
-use meganeura::{Graph, Session, SessionConfig, optimize::search, tune::TuneOptions};
-use std::time::{Duration, Instant};
+use meganeura::{Graph, Session, SessionConfig, optimize::search};
+use std::time::Instant;
 
-fn samples(session: &mut Session) -> Vec<f64> {
-    (0..9)
-        .map(|_| {
-            let start = Instant::now();
-            for _ in 0..20 {
-                session.step();
-                session.wait();
-            }
-            start.elapsed().as_secs_f64() * 50.0
-        })
-        .collect()
+fn sample(session: &mut Session) -> f64 {
+    let start = Instant::now();
+    for _ in 0..20 {
+        session.step();
+        session.wait();
+    }
+    start.elapsed().as_secs_f64() * 50.0
 }
 
 fn median(samples: &[f64]) -> f64 {
@@ -55,7 +51,9 @@ fn main() {
     let output = graph.add(mm, c);
     graph.set_outputs(vec![output]);
     let started = Instant::now();
-    let mut candidates = search::candidates(&graph, 8).unwrap();
+    let space = search::candidates(&graph, 8).unwrap();
+    assert!(!space.truncated);
+    let mut candidates = space.candidates;
     let extraction_ms = started.elapsed().as_secs_f64() * 1000.0;
     if args.get(3).is_some_and(|s| s == "reverse") {
         candidates.reverse();
@@ -78,42 +76,61 @@ fn main() {
         })
         .collect();
     let mut gpu = None;
-    let mut rows = Vec::new();
+    let mut trials = Vec::new();
     for candidate in candidates {
-        let mut cfg = SessionConfig::inference_from_env();
-        cfg.gpu = gpu.clone();
-        cfg.optimize.mode = meganeura::OptimizeMode::Off;
-        cfg.options.fuse_dispatches = false;
-        cfg.runtime.coop = meganeura::CoopPolicy::NativeF32;
-        cfg.tune = false;
-        let start = Instant::now();
-        let mut session = meganeura::build(&candidate.graph, cfg).0;
-        let build_ms = start.elapsed().as_secs_f64() * 1000.0;
-        gpu = Some(session.context());
-        session.set_input("a", &a);
-        session.set_input("c", &c);
-        session.set_parameter("b", &b);
-        let initial_error = qualify(&mut session, &reference);
-        let initial = samples(&mut session);
-        let tuning = session
-            .tune_with(TuneOptions {
-                max_time: Duration::from_secs(15),
-                max_scratch_bytes: 128 * 1024 * 1024,
-                ..Default::default()
-            })
-            .unwrap();
-        let tuned_error = qualify(&mut session, &reference);
-        let tuned = samples(&mut session);
-        rows.push(serde_json::json!({
-            "expression": candidate.expression,
-            "build_ms": build_ms,
-            "dispatches": session.plan().dispatches.len(),
-            "initial_ms": initial, "initial_median_ms": median(&initial),
-            "tuned_ms": tuned, "tuned_median_ms": median(&tuned),
-            "initial_max_abs_error": initial_error, "tuned_max_abs_error": tuned_error,
-            "tuning": tuning,
-        }));
+        for (k_stage, interleave_columns) in [8, 16, 32]
+            .into_iter()
+            .flat_map(|k| [false, true].map(|i| (k, i)))
+        {
+            let mut cfg = SessionConfig::inference_from_env();
+            cfg.gpu = gpu.clone();
+            cfg.optimize.mode = meganeura::OptimizeMode::Off;
+            cfg.options.fuse_dispatches = false;
+            cfg.options.knobs.matmul_k_stage = k_stage;
+            cfg.options.knobs.matmul_interleave_columns = interleave_columns;
+            cfg.runtime.coop = meganeura::CoopPolicy::NativeF32;
+            cfg.tune = false;
+            let start = Instant::now();
+            let mut session = meganeura::build(&candidate.graph, cfg).0;
+            let build_ms = start.elapsed().as_secs_f64() * 1000.0;
+            gpu = Some(session.context());
+            session.set_input("a", &a);
+            session.set_input("c", &c);
+            session.set_parameter("b", &b);
+            let error = qualify(&mut session, &reference);
+            let row = serde_json::json!({
+                "expression": candidate.expression,
+                "k_stage": k_stage, "interleave_columns": interleave_columns,
+                "build_ms": build_ms,
+                "dispatches": session.plan().dispatches.len(),
+                "max_abs_error": error,
+            });
+            trials.push((session, row, Vec::new()));
+        }
     }
+    for repeat in 0..12 {
+        let len = trials.len();
+        for i in 0..len {
+            let index = if repeat % 2 == 0 {
+                (i + repeat) % len
+            } else {
+                (len - 1 - i + repeat) % len
+            };
+            let (session, _, samples) = &mut trials[index];
+            let time = sample(session);
+            if repeat >= 3 {
+                samples.push(time);
+            }
+        }
+    }
+    let rows: Vec<_> = trials
+        .into_iter()
+        .map(|(_, mut row, samples)| {
+            row["median_ms"] = median(&samples).into();
+            row["samples_ms"] = samples.into();
+            row
+        })
+        .collect();
     println!(
         "{}",
         serde_json::json!({
