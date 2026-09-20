@@ -58,34 +58,26 @@ impl Pipelines {
         self.insert_tuning_pipeline(gpu, key, module, layout)
     }
 
-    pub(super) fn insert_tuning_pipeline(
+    fn insert_tuning_pipeline(
         &mut self,
         gpu: &Gpu,
         key: Variant,
         module: crate::codegen::ShaderModule,
         layout: bg::ShaderDataLayout,
     ) -> Result<(), String> {
-        if let Some(dir) = self.dump_dir.as_deref() {
-            module.dump(dir);
-        }
-        let shader = gpu
-            .try_create_shader(bg::ShaderDesc {
-                source: &module.source,
-                naga_module: Some(module.module),
-            })
-            .map_err(|error| error.to_string())?;
-        let pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-            name: &key.label(),
-            data_layouts: &[&layout],
-            compute: shader.at(key.entry().expect("tuning shader entry").entry_point()),
-        });
+        let shader = super::create_gen_shader(gpu, module, self.dump_dir.as_deref())?;
+        let pipeline = super::create_profiled_pipeline(
+            gpu,
+            key.label(),
+            &layout,
+            shader.at(key.entry().expect("tuning shader entry").entry_point()),
+        );
         self.map.insert(key, pipeline);
         Ok(())
     }
 
     fn discard_unused_convolutions(&mut self, gpu: &Gpu, plan: &crate::compile::ExecutionPlan) {
-        let used: std::collections::HashSet<_> =
-            plan.dispatches.iter().flat_map(Self::candidates).collect();
+        let used: std::collections::HashSet<_> = plan.dispatches.iter().map(Self::key).collect();
         self.map.retain(|key, pipeline| {
             let convolution = key.entry().is_some_and(|entry| {
                 matches!(
@@ -1615,8 +1607,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let candidates = Pipelines::candidates(&dispatch);
-        assert!(matches!(candidates.as_slice(), [Variant::GemvIntDot(..)]));
+        assert!(matches!(Pipelines::key(&dispatch), Variant::GemvIntDot(..)));
         assert!(matches!(
             tile_variant(&dispatch, MatmulTile::Gemv(shape)),
             Variant::GemvIntDot(_, format, selected) if format == crate::compile::WeightFormat::Q40 && selected == shape
@@ -1635,14 +1626,10 @@ mod tests {
             kernel: crate::compile::Kernel::Default,
             ..dispatch
         };
-        let candidates = Pipelines::candidates(&ordinary);
-        assert!(candidates.len() > 1);
-        assert!(matches!(candidates.last(), Some(Variant::Scalar(_))));
-        assert!(
-            !candidates
-                .iter()
-                .any(|v| matches!(v, Variant::GemvIntDot(..)))
-        );
+        assert!(matches!(
+            Pipelines::key(&ordinary),
+            Variant::Weight(_, crate::compile::WeightFormat::Q40)
+        ));
     }
 
     #[test]
