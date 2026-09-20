@@ -2207,13 +2207,10 @@ pub(crate) fn select_variants(
             let min_wgs = if is_conv_bwd {
                 MIN_COOP_WORKGROUPS_CONV_BWD
             } else if config.use_f16_input {
-                // On discrete NVIDIA GPUs the f16 cooperative kernel's
-                // shared-memory staging costs more than the scalar tile
-                // kernel at low occupancy. Representative transformer
-                // projections with 20--72 output workgroups regress,
-                // while the wider backward/MLP shapes win once there are
-                // enough independent tiles to fill the device.
-                128
+                // Experiment: keep the precision, staging and capacity gates,
+                // but measure legal small projections instead of vetoing them
+                // from an occupancy estimate. Not a production default.
+                0
             } else {
                 16 // enables coop for attention K/V projections (N=320, 20 WGs)
             };
