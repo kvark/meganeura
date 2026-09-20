@@ -368,7 +368,7 @@ pub struct MatMulOptions {
     /// computed for, or the grid and the kernel disagree about coverage.
     pub tile: MatMulTile,
     /// K staging depth and column layout for the tiled skeleton; only
-    /// consulted for f32 B storage, quantized formats have their own.
+    /// consulted for F32/F16 B storage; block-quantized formats have their own.
     pub knobs: MatmulKnobs,
 }
 
@@ -1389,10 +1389,9 @@ fn matmul_vars_tiled(
     };
     let bm = tile.bm();
     let tm = tile.tm();
-    // The knobs only define the f32 skeleton; quantized and f16 B storage
-    // have their own layouts.
+    // Block decoders have fixed layouts; plain F32/F16 share the same skeleton.
     let k_tile = match b_mode {
-        WeightFormat::F32 => knobs.k_stage,
+        WeightFormat::F32 | WeightFormat::F16 => knobs.k_stage,
         _ => 32,
     };
     assert!(
@@ -1400,7 +1399,7 @@ fn matmul_vars_tiled(
         "unsupported scalar matmul K stage: {}",
         knobs.k_stage
     );
-    let interleave_columns = b_mode == WeightFormat::F32 && knobs.interleave_columns;
+    let interleave_columns = !b_mode.is_quantized() && knobs.interleave_columns;
     let (acc_decl, compute_body, acc_array) = tiled_matmul_body(tile, k_tile, interleave_columns);
     let output_column = if interleave_columns {
         "tx + j * 16u".to_string()
