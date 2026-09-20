@@ -295,7 +295,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let n = x_shape.iter().product::<usize>();
                 let scale = 1.0 / n as f32;
                 let go_broadcast = broadcast_scalar(&mut graph, grad_output, &x_shape);
-                let scale_const = graph.constant(vec![scale; n], &x_shape);
+                let scale_const = broadcast_constant(&mut graph, scale, &x_shape);
                 let grad_x = graph.mul(go_broadcast, scale_const);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
@@ -407,12 +407,11 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 // sign(x) = 2*(x > 0) - 1
                 let x = node.inputs[0];
                 let x_shape = &forward.nodes()[x as usize].ty.shape;
-                let n = x_shape.iter().product();
-                let zero = graph.constant(vec![0.0; n], x_shape);
+                let zero = broadcast_constant(&mut graph, 0.0, x_shape);
                 let pos_mask = graph.greater(x, zero);
-                let two = graph.constant(vec![2.0; n], x_shape);
+                let two = broadcast_constant(&mut graph, 2.0, x_shape);
                 let sign = graph.mul(pos_mask, two);
-                let ones = graph.constant(vec![1.0; n], x_shape);
+                let ones = broadcast_constant(&mut graph, 1.0, x_shape);
                 let neg_ones = graph.neg(ones);
                 let sign = graph.add(sign, neg_ones);
                 let grad_x = graph.mul(grad_output, sign);
@@ -963,7 +962,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let grad_out_size = forward.nodes()[node.id as usize].ty.shape[0] as u32;
                 let batch = grad_out_size / (channels_a * spatial);
                 let zeros_b_size = batch as usize * channels_b as usize * spatial as usize;
-                let zeros_b = graph.constant(vec![0.0; zeros_b_size], &[zeros_b_size]);
+                let zeros_b = broadcast_constant(&mut graph, 0.0, &[zeros_b_size]);
                 let grad_x =
                     graph.concat(grad_output, zeros_b, batch, channels_a, channels_b, spatial);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
@@ -980,7 +979,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let grad_out_size = forward.nodes()[node.id as usize].ty.shape[0] as u32;
                 let batch = grad_out_size / (channels_b * spatial);
                 let zeros_a_size = batch as usize * channels_a as usize * spatial as usize;
-                let zeros_a = graph.constant(vec![0.0; zeros_a_size], &[zeros_a_size]);
+                let zeros_a = broadcast_constant(&mut graph, 0.0, &[zeros_a_size]);
                 let grad_x =
                     graph.concat(zeros_a, grad_output, batch, channels_a, channels_b, spatial);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
@@ -1366,9 +1365,41 @@ fn broadcast_scalar(graph: &mut Graph, scalar: NodeId, target_shape: &[usize]) -
     graph.reshape(broadcast_2d, target_shape)
 }
 
+fn broadcast_constant(graph: &mut Graph, value: f32, target_shape: &[usize]) -> NodeId {
+    let scalar = graph.scalar(value);
+    broadcast_scalar(graph, scalar, target_shape)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn abs_and_split_gradients_do_not_allocate_input_sized_constants() {
+        let mut graph = Graph::new();
+        let x = graph.parameter("x", &[2_000_000]);
+        let absolute = graph.abs(x);
+        let first = graph.split_a(absolute, 1, 1_000_000, 1_000_000, 1);
+        let last = graph.split_b(absolute, 1, 1_000_000, 1_000_000, 1);
+        let sum = graph.add(first, last);
+        let loss = graph.mean_all(sum);
+        graph.set_outputs(vec![loss]);
+        let diff = differentiate(&graph);
+        let constants: usize = diff
+            .nodes()
+            .iter()
+            .map(|node| match node.op {
+                Op::Constant { ref data } => data.len(),
+                _ => 0,
+            })
+            .sum();
+        assert!(
+            constants < 16,
+            "unexpected dense gradient constants: {constants}"
+        );
+        assert_eq!(diff.node(diff.outputs()[1]).ty.shape, [2_000_000]);
+        assert_eq!(crate::compile::compile(&diff).param_grad_pairs.len(), 1);
+    }
 
     #[test]
     fn trigonometric_derivatives_use_the_input_and_opposite_function() {

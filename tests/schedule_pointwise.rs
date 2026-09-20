@@ -147,6 +147,35 @@ fn trigonometric_forward_and_gradient_match_cpu() {
 }
 
 #[test]
+fn abs_and_split_gradient_broadcasts_match_cpu() {
+    const LEN: usize = 1026;
+    let input = (0..LEN)
+        .map(|i| i as f32 * 0.25 - 128.0)
+        .collect::<Vec<_>>();
+    let mut graph = Graph::new();
+    let x = graph.parameter("x", &[LEN]);
+    let absolute = graph.abs(x);
+    let first = graph.split_a(absolute, 1, 513, 513, 1);
+    let last = graph.split_b(absolute, 1, 513, 513, 1);
+    let last = graph.scale(last, 0.5);
+    let sum = graph.add(first, last);
+    let loss = graph.mean_all(sum);
+    graph.set_outputs(vec![loss]);
+    let mut session = meganeura::build_session(&graph);
+    session.set_parameter("x", &input);
+    session.step();
+    session.wait();
+    let mut gradient = vec![0.0; LEN];
+    session.read_param_grad("x", &mut gradient);
+    for i in 0..LEN {
+        // Preserve the existing Abs derivative convention at zero.
+        let sign = if input[i] > 0.0 { 1.0 } else { -1.0 };
+        let expected = sign * if i < 513 { 1.0 } else { 0.5 } / 513.0;
+        assert_eq!(gradient[i], expected, "gradient[{i}]");
+    }
+}
+
+#[test]
 fn exp_matches_cpu_forward_and_gradient() {
     const LEN: usize = 513;
     let input = (0..LEN)
