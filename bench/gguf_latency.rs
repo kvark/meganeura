@@ -13,7 +13,13 @@ const DECODE: usize = 32;
 const CONTEXT: usize = 256;
 const SAMPLES: usize = 7;
 
-fn run(session: &mut Session, position: usize, count: usize, vocab: usize) -> (Vec<f32>, [f64; 3]) {
+fn run(
+    session: &mut Session,
+    position: usize,
+    count: usize,
+    vocab: usize,
+    overlap: bool,
+) -> (Vec<f32>, [f64; 3]) {
     let tokens: Vec<u32> = (position..position + count)
         .map(|i| 42 + (i % 31) as u32)
         .collect();
@@ -23,6 +29,19 @@ fn run(session: &mut Session, position: usize, count: usize, vocab: usize) -> (V
     let start = Instant::now();
     session.step();
     let submitted = Instant::now();
+    if overlap {
+        let mut logits = vec![0.0; vocab];
+        session.wait_read_output(0, &mut logits);
+        assert!(logits.iter().all(|x| x.is_finite()));
+        return (
+            logits,
+            [
+                submitted.duration_since(start).as_secs_f64() * 1000.0,
+                submitted.elapsed().as_secs_f64() * 1000.0,
+                0.0,
+            ],
+        );
+    }
     session.wait();
     let finished = Instant::now();
     let mut logits = vec![0.0; vocab];
@@ -96,9 +115,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut scheduling = Vec::new();
     if tune_seconds != 0 && matches!(scope, meganeura::tune::TuneScope::All) {
-        run(&mut sessions[1], 0, PROMPT, config.vocab_size);
+        run(&mut sessions[1], 0, PROMPT, config.vocab_size, false);
         for pos in PROMPT..PROMPT + DECODE {
-            run(&mut sessions[0], pos, 1, config.vocab_size);
+            run(&mut sessions[0], pos, 1, config.vocab_size, false);
         }
         for session in &mut sessions {
             scheduling.push(
@@ -111,51 +130,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let prepare_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let mut prefill_ms = Vec::new();
-    let mut decode_ms = Vec::new();
-    let mut decode_parts_ms = Vec::new();
-    let mut outputs = Vec::new();
-    for sample in 0..SAMPLES + 3 {
-        // Every run overwrites the same cache prefix. Attention masks the suffix.
-        let start = Instant::now();
-        let (logits, _) = run(&mut sessions[1], 0, PROMPT, config.vocab_size);
-        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-        if sample >= 3 {
-            prefill_ms.push(elapsed);
-        }
-        if sample == 3 {
-            outputs.extend(logits);
-        }
-        for pos in PROMPT..PROMPT + DECODE {
+    let first = std::env::var_os("MEGANEURA_OVERLAP_READBACK").is_some();
+    let paired = std::env::var_os("MEGANEURA_COMPARE_READBACK").is_some();
+    for overlap in [first, !first].into_iter().take(if paired { 2 } else { 1 }) {
+        let prefix = if paired {
+            format!("{}-{}", args[2], if overlap { "queued" } else { "serial" })
+        } else {
+            args[2].clone()
+        };
+        let mut prefill_ms = Vec::new();
+        let mut decode_ms = Vec::new();
+        let mut decode_parts_ms = Vec::new();
+        let mut outputs = Vec::new();
+        for sample in 0..SAMPLES + 3 {
+            // Every run overwrites the same cache prefix. Attention masks the suffix.
             let start = Instant::now();
-            let (logits, parts) = run(&mut sessions[0], pos, 1, config.vocab_size);
+            let (logits, _) = run(&mut sessions[1], 0, PROMPT, config.vocab_size, overlap);
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
             if sample >= 3 {
-                decode_ms.push(elapsed);
-                decode_parts_ms.push(parts);
+                prefill_ms.push(elapsed);
             }
             if sample == 3 {
                 outputs.extend(logits);
             }
+            for pos in PROMPT..PROMPT + DECODE {
+                let start = Instant::now();
+                let (logits, parts) = run(&mut sessions[0], pos, 1, config.vocab_size, overlap);
+                let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                if sample >= 3 {
+                    decode_ms.push(elapsed);
+                    decode_parts_ms.push(parts);
+                }
+                if sample == 3 {
+                    outputs.extend(logits);
+                }
+            }
         }
+        let data: Vec<u8> = outputs.iter().flat_map(|x| x.to_le_bytes()).collect();
+        std::fs::write(format!("{prefix}.logits.f32"), data)?;
+        let result = serde_json::json!({
+            "engine": "meganeura", "model": args[1],
+            "device": sessions[0].context().device_information().device_name,
+            "prompt": PROMPT, "decode": DECODE, "context": CONTEXT, "cache": "f32",
+            "vocab": config.vocab_size, "prepare_ms": prepare_ms,
+            "combined_wait_readback": overlap,
+            "prefill_ms": prefill_ms, "decode_ms": decode_ms,
+            "decode_record_wait_read_ms": decode_parts_ms,
+            "dispatches": [sessions[1].plan().dispatches.len(), sessions[0].plan().dispatches.len()],
+            "tuning": tuning,
+            "submission_tuning": scheduling,
+        });
+        std::fs::write(
+            format!("{prefix}.json"),
+            serde_json::to_vec_pretty(&result)?,
+        )?;
     }
-    let data: Vec<u8> = outputs.iter().flat_map(|x| x.to_le_bytes()).collect();
-    std::fs::write(format!("{}.logits.f32", args[2]), data)?;
-    let result = serde_json::json!({
-        "engine": "meganeura", "model": args[1],
-        "device": sessions[0].context().device_information().device_name,
-        "prompt": PROMPT, "decode": DECODE, "context": CONTEXT, "cache": "f32",
-        "vocab": config.vocab_size, "prepare_ms": prepare_ms,
-        "prefill_ms": prefill_ms, "decode_ms": decode_ms,
-        "decode_record_wait_read_ms": decode_parts_ms,
-        "dispatches": [sessions[1].plan().dispatches.len(), sessions[0].plan().dispatches.len()],
-        "tuning": tuning,
-        "submission_tuning": scheduling,
-    });
-    std::fs::write(
-        format!("{}.json", args[2]),
-        serde_json::to_vec_pretty(&result)?,
-    )?;
     if std::env::var_os("MEGANEURA_GPU_TIMING").is_some() {
         for (i, session) in sessions.iter_mut().enumerate() {
             let profile = meganeura::profiler::capture_session_profile(
