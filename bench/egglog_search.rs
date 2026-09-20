@@ -1,5 +1,7 @@
 //! Small-region experiment: retain egglog alternatives through kernel tuning.
 //! Usage: egglog_search [M K N] [reverse|forward] [split] [select]
+//! Or: egglog_search attention [block=16] [capacity=2048] [reverse]
+mod cached_attention_search;
 use meganeura::{Graph, Session, SessionConfig, optimize::search};
 use std::time::Instant;
 
@@ -36,6 +38,10 @@ fn qualify(session: &mut Session, reference: &[f64]) -> Result<f64, String> {
 fn main() {
     env_logger::init();
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|s| s == "attention") {
+        cached_attention_search::run(&args[1..]);
+        return;
+    }
     let dims: Vec<usize> = args.iter().take(3).map(|s| s.parse().unwrap()).collect();
     let [m, k, n] = if dims.is_empty() {
         [50, 512, 512]
