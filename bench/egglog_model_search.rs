@@ -27,6 +27,14 @@ fn initialize(session: &mut meganeura::Session, model: &str) {
         session.set_parameter(&name, &values);
     }
     for (name, buffer) in session.plan().input_buffers.clone() {
+        if !session
+            .plan()
+            .dispatches
+            .iter()
+            .any(|dispatch| dispatch.input_buffers.contains(&buffer))
+        {
+            continue;
+        }
         let len = session.plan().buffers[buffer.0 as usize] / 4;
         let values: Vec<_> = (0..len)
             .map(|i| match name.as_str() {
