@@ -146,29 +146,37 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
             });
         }
     }
+    let runtime = SessionOptions {
+        coop: if fast {
+            meganeura::CoopPolicy::Auto
+        } else {
+            meganeura::CoopPolicy::NativeF32
+        },
+        ..Default::default()
+    };
+    let tuning = meganeura::TuneOptions {
+        max_time: if std::env::args().any(|arg| arg == "--static") {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(2)
+        },
+        max_classes: 32,
+        sample_pairs: 12,
+        min_improvement: 0.02,
+        ..Default::default()
+    };
+    let control_plan = std::env::args()
+        .any(|arg| arg == "--confirm")
+        .then(|| programs[0].plan.clone());
+    if std::env::args().any(|arg| arg == "--reverse") {
+        programs[1..].reverse();
+    }
     let (mut session, report) = search::measure::select(
         programs,
-        gpu,
-        SessionOptions {
-            coop: if fast {
-                meganeura::CoopPolicy::Auto
-            } else {
-                meganeura::CoopPolicy::NativeF32
-            },
-            ..Default::default()
-        },
+        gpu.clone(),
+        runtime.clone(),
         search::measure::Options {
-            tuning: meganeura::TuneOptions {
-                max_time: if std::env::args().any(|arg| arg == "--static") {
-                    Duration::ZERO
-                } else {
-                    Duration::from_secs(2)
-                },
-                max_classes: 32,
-                sample_pairs: 12,
-                min_improvement: 0.02,
-                ..Default::default()
-            },
+            tuning: tuning.clone(),
             max_time: Duration::from_secs(180),
             max_programs: 32,
             max_plan_bytes: 3 * 1024 * 1024 * 1024,
@@ -192,6 +200,26 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
     let mut sorted = samples.clone();
     sorted.sort_by(f64::total_cmp);
     let errors = check(&mut session, reference).unwrap();
+    let confirmation = control_plan.map(|plan| {
+        let mut control = meganeura::Session::with_context_opts(plan, gpu, runtime);
+        initialize(&mut control, model);
+        check(&mut control, reference).unwrap();
+        let control_tuning = control.tune_with(tuning).unwrap();
+        check(&mut control, reference).unwrap();
+        let mut times = [Vec::new(), Vec::new()];
+        for pair in 0..70 {
+            for index in if pair % 2 == 0 { [0, 1] } else { [1, 0] } {
+                let target = if index == 0 { &mut control } else { &mut session };
+                let start = Instant::now();
+                target.step();
+                target.wait();
+                if pair >= 30 { times[index].push(start.elapsed().as_secs_f64() * 1000.0); }
+            }
+        }
+        check(&mut control, reference).unwrap();
+        check(&mut session, reference).unwrap();
+        serde_json::json!({"control_ms": times[0], "selected_ms": times[1], "control_tuning": control_tuning})
+    });
     println!(
         "{}",
         serde_json::json!({"model": model, "device": session.device_information().device_name,
@@ -200,6 +228,7 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
             "relative_l2_error": errors.0, "loss_relative_error": errors.1, "max_abs_error": errors.2,
             "dispatches": session.plan().dispatches.len(), "groups": session.num_groups(),
             "allocated_buffer_bytes": session.memory_summary().allocated_buffer_bytes,
+            "confirmation": confirmation,
         })
     );
 }
