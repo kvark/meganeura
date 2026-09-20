@@ -266,23 +266,6 @@ fn collect(session: &super::Session) -> Vec<Class> {
     classes
 }
 
-impl super::Pipelines {
-    fn ensure_attention(
-        &mut self,
-        gpu: &super::Gpu,
-        entry: ShaderEntry,
-        dim: u32,
-    ) -> Result<(), String> {
-        let key = super::Variant::Attention(entry.clone(), dim);
-        if self.map.contains_key(&key) {
-            return Ok(());
-        }
-        let module =
-            crate::codegen::generate_cached_attention_module(entry.shader_group(), Some(dim));
-        self.insert_tuning_pipeline(gpu, key, module, super::super::shader_data_layout(&entry))
-    }
-}
-
 impl super::Session {
     fn install_attention(
         &mut self,
@@ -563,8 +546,7 @@ impl super::Session {
                     }
                     let compiled = {
                         let _timer = super::PhaseTimer::new(&mut prep.pipelines);
-                        self.pipelines
-                            .ensure_attention(&self.gpu, d.shader.clone(), key.head_dim)
+                        self.pipelines.prepare(&self.gpu, d, None)
                     };
                     outcome.compile_time = prep.pipelines.unwrap();
                     if let Err(error) = compiled {
@@ -957,7 +939,14 @@ mod tests {
                 ] {
                     session
                         .pipelines
-                        .ensure_attention(&session.gpu, entry, 4)
+                        .prepare(
+                            &session.gpu,
+                            &Dispatch {
+                                shader: entry,
+                                ..session.plan.dispatches[classes[0].members[0].first].clone()
+                            },
+                            None,
+                        )
                         .unwrap();
                 }
                 session.set_profiling(true);

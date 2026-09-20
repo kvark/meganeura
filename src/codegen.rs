@@ -3856,8 +3856,9 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
     // outer KV loop).
     src.push_str("    let last_pos = min(pos_base + 15u, q_seq - 1u);\n");
     src.push_str("    let max_kv_len = select(kv_seq, last_pos + 1u, kv_seq == 0u);\n");
+    src.push_str("    let first_kv_len = select(kv_seq, pos_base + 1u, kv_seq == 0u);\n");
     src.push_str(
-        "    let min_kv_start = select(0u, max_kv_len - min(max_kv_len, window_size), window_size > 0u);\n\n",
+        "    let min_kv_start = select(0u, first_kv_len - min(first_kv_len, window_size), window_size > 0u);\n\n",
     );
 
     // Per-thread O accumulator and softmax state — REGISTERS.
@@ -4123,8 +4124,9 @@ pub fn generate_flash_grad_q_coop_module(head_dim: u32) -> ShaderModule {
     // Workgroup-wide KV iteration bounds.
     src.push_str("    let last_pos = min(pos_base + 15u, q_seq - 1u);\n");
     src.push_str("    let max_kv_len = select(kv_seq, last_pos + 1u, kv_seq == 0u);\n");
+    src.push_str("    let first_kv_len = select(kv_seq, pos_base + 1u, kv_seq == 0u);\n");
     src.push_str(
-        "    let min_kv_start = select(0u, max_kv_len - min(max_kv_len, window_size), window_size > 0u);\n\n",
+        "    let min_kv_start = select(0u, first_kv_len - min(first_kv_len, window_size), window_size > 0u);\n\n",
     );
 
     // ---- Stage Q + dO into shared (once per workgroup) ----
