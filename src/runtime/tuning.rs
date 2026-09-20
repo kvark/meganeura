@@ -104,6 +104,25 @@ pub(super) fn tile_module(
     knobs: crate::codegen::MatmulKnobs,
 ) -> crate::codegen::ShaderModule {
     let entry = &dispatch.shader;
+    if let MatmulTile::Scalar(shape) = tile {
+        return crate::codegen::generate_matmul_with_epilogue(
+            entry.shader_group(),
+            crate::codegen::EpilogueSource::Ops(&[]),
+            crate::codegen::MatMulOptions {
+                format: dispatch.weight_format,
+                tile: match shape.tile_size {
+                    32 => crate::codegen::MatMulTile::Small,
+                    64 => crate::codegen::MatMulTile::Large,
+                    _ => unreachable!("unsupported scalar tile"),
+                },
+                knobs: crate::codegen::MatmulKnobs {
+                    k_stage: shape.k_stage,
+                    interleave_columns: shape.interleave_columns,
+                    ..knobs
+                },
+            },
+        );
+    }
     if let MatmulTile::Gemv(shape) = tile {
         // The int-dot kernel is a different computation, not a different
         // route to the same one, so a shape candidate has to stay inside it.
@@ -164,13 +183,18 @@ pub(super) fn tile_module(
                 entry.shader_group(),
                 &tile.coop_config().expect("cooperative candidate"),
             ),
-            MatmulTile::SpecializedConv { .. } | MatmulTile::Gemv(_) => unreachable!(),
+            MatmulTile::SpecializedConv { .. } | MatmulTile::Gemv(_) | MatmulTile::Scalar(_) => {
+                unreachable!()
+            }
         }
     }
 }
 
 fn tile_variant(dispatch: &Dispatch, tile: MatmulTile) -> Variant {
     let entry = &dispatch.shader;
+    if let MatmulTile::Scalar(shape) = tile {
+        return Variant::ScalarMatmul(entry.clone(), dispatch.weight_format, shape);
+    }
     if let MatmulTile::Gemv(shape) = tile {
         if dispatch.gemv_int_dot {
             if dispatch.gemv_rmsnorm.is_some() {
@@ -208,7 +232,9 @@ fn tile_variant(dispatch: &Dispatch, tile: MatmulTile) -> Variant {
         MatmulTile::Tile32 => Variant::SmallTile(entry.clone()),
         MatmulTile::Tile64 => Variant::Scalar(entry.clone()),
         MatmulTile::CooperativeF32 { .. } => Variant::Coop(entry.clone()),
-        MatmulTile::SpecializedConv { .. } | MatmulTile::Gemv(_) => unreachable!(),
+        MatmulTile::SpecializedConv { .. } | MatmulTile::Gemv(_) | MatmulTile::Scalar(_) => {
+            unreachable!()
+        }
     }
 }
 
@@ -317,11 +343,33 @@ fn collect_classes(
             .map(|b| plan.buffers[b.0 as usize])
             .collect();
         let initial = MatmulTile::selected(dispatch, coop_config).expect("checked class geometry");
+        let equivalent = if key.conv2d.is_none() && !key.weight_format.is_quantized() {
+            match initial {
+                MatmulTile::Tile32 | MatmulTile::Tile64 => {
+                    Some(MatmulTile::Scalar(crate::codegen::ScalarMatmulShape {
+                        tile_size: if initial == MatmulTile::Tile32 {
+                            32
+                        } else {
+                            64
+                        },
+                        k_stage: plan.knobs.matmul_k_stage,
+                        interleave_columns: plan.knobs.matmul_interleave_columns,
+                    }))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         if !initial.fits(&key) {
             excluded += 1;
             continue;
         }
-        let challengers = key.challengers(initial, coop_config);
+        let challengers = key
+            .challengers(initial, coop_config)
+            .into_iter()
+            .filter(|candidate| Some(*candidate) != equivalent)
+            .collect();
         let next_index = classes.len();
         let class_index = *indices.entry((key.clone(), initial)).or_insert(next_index);
         if class_index == next_index {
@@ -1747,7 +1795,12 @@ mod tests {
         let mut right = left.clone();
         for class in &classes {
             for &index in &class.members {
-                MatmulTile::Tile32.apply(&mut right.dispatches[index], &class.key);
+                MatmulTile::Scalar(crate::codegen::ScalarMatmulShape {
+                    tile_size: 32,
+                    k_stage: 8,
+                    interleave_columns: true,
+                })
+                .apply(&mut right.dispatches[index], &class.key);
             }
         }
         let right_classes = collect_classes(&right, &alias, None).0;
@@ -1895,10 +1948,12 @@ mod tests {
                 tile_size: 32,
                 k_tile: 16,
             }
-        } else if class.initial == MatmulTile::Tile32 {
-            MatmulTile::Tile64
         } else {
-            MatmulTile::Tile32
+            MatmulTile::Scalar(crate::codegen::ScalarMatmulShape {
+                tile_size: 64,
+                k_stage: 8,
+                interleave_columns: true,
+            })
         };
         b.pipelines
             .ensure_tune_tile(&gpu, &b.plan.dispatches[class.members[0]], alternative)
@@ -2328,6 +2383,7 @@ mod tests {
 
     #[test]
     fn tuning_tiles_generate_valid_exact_binding_layouts() {
+        use crate::compile::WeightFormat;
         for entry in [
             ShaderEntry::MatMul,
             ShaderEntry::FusedMatMulAdd,
@@ -2339,7 +2395,7 @@ mod tests {
             ShaderEntry::Conv2dGradInputGemm,
             ShaderEntry::Conv2dGradWeightGemm,
         ] {
-            for tile in [
+            let mut tiles = vec![
                 MatmulTile::Tile32,
                 MatmulTile::Tile64,
                 MatmulTile::CooperativeF32 { tile_size: 8 },
@@ -2352,7 +2408,30 @@ mod tests {
                     tile_size: 64,
                     k_tile: 32,
                 },
-            ] {
+            ];
+            for tile_size in [32, 64] {
+                for k_stage in [8, 16, 32] {
+                    for interleave_columns in [false, true] {
+                        tiles.push(MatmulTile::Scalar(crate::codegen::ScalarMatmulShape {
+                            tile_size,
+                            k_stage,
+                            interleave_columns,
+                        }));
+                    }
+                }
+            }
+            for (tile, format) in tiles.into_iter().flat_map(|tile| {
+                [WeightFormat::F32, WeightFormat::F16]
+                    .into_iter()
+                    .filter(move |format| {
+                        *format == WeightFormat::F32
+                            || matches!(
+                                tile,
+                                MatmulTile::Scalar(_) | MatmulTile::Tile32 | MatmulTile::Tile64
+                            )
+                    })
+                    .map(move |format| (tile, format))
+            }) {
                 let convolution = matches!(
                     entry,
                     ShaderEntry::Conv2dGemm
@@ -2363,11 +2442,16 @@ mod tests {
                 if specialized && !convolution {
                     continue;
                 }
-                if convolution && tile.coop_config().is_some() {
+                if convolution
+                    && (tile.coop_config().is_some()
+                        || matches!(tile, MatmulTile::Scalar(_))
+                        || format != WeightFormat::F32)
+                {
                     continue;
                 }
                 let dispatch = Dispatch {
                     shader: entry.clone(),
+                    weight_format: format,
                     params: vec![2, 3, 7, 9, 5, 3, 2, 2, 0, 3, 5, 1],
                     ..Default::default()
                 };

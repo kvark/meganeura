@@ -356,6 +356,14 @@ impl Default for MatmulKnobs {
     }
 }
 
+/// Measured scalar layout for plain F32/F16 weights, with F32 accumulation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct ScalarMatmulShape {
+    pub tile_size: u32,
+    pub k_stage: u32,
+    pub interleave_columns: bool,
+}
+
 /// How to specialize the matmul the epilogue is fused into.
 ///
 /// [`Default`] is the plain f32 64×64 kernel, so a caller that only wants

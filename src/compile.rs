@@ -904,6 +904,8 @@ fn can_horizontal_fuse(a: &Dispatch, b: &Dispatch) -> bool {
         && a.use_coop == b.use_coop
         && a.use_coop_compensated == b.use_coop_compensated
         && a.use_small_tiles == b.use_small_tiles
+        && a.scalar_matmul.is_none()
+        && b.scalar_matmul.is_none()
         && !a.weight_format.uses_reduced_storage()
         && a.weight_format == b.weight_format
         && a.matmul_prologue.is_none()
@@ -1003,6 +1005,9 @@ pub struct Dispatch {
     /// When true, use the 32×32 small-tile matmul pipeline instead of 64×64.
     #[serde(default)]
     pub use_small_tiles: bool,
+    /// Measured scalar tile, K stage and column layout; None uses plan knobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scalar_matmul: Option<crate::codegen::ScalarMatmulShape>,
     /// Shape-specialized scalar convolution, with this many K elements staged.
     /// Set by measured selection; None keeps the shared uniform-parameter kernel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
