@@ -2054,26 +2054,85 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
     }
 }
 
-/// Post-compile pass: fuse single-consumer `RmsNorm → MatMul` pairs into
-/// `RmsNormRsqrt + MatMul-with-prologue`. Instead of computing the full
-/// normalized output and writing it to DRAM, the matmul reads raw x and
-/// multiplies by pre-computed rsqrt and weight during A-tile staging.
-///
-/// Unlike the deleted single-dispatch fused form (which computed rsqrt
-/// INSIDE the matmul via 64-thread tree reduction → 25% regression), this
-/// uses a separate lightweight `RmsNormRsqrt` dispatch, so the matmul
-/// prologue is only two scalar multiplies per A element — essentially free.
-/// Dispatches must already have their runtime `use_coop` decision; scalar
-/// matmuls are deliberately left unchanged.
-/// Fold a RmsNorm into every GEMV that consumes it, removing both the
-/// norm's dispatch and the boundary that separated it.
-///
-/// The norm's own work is trivial — one workgroup over `hidden` elements —
-/// while each consuming GEMV already streams a `K`-element input vector, so
-/// reading the un-normalized one and scaling on the way past costs no extra
-/// traffic; only the per-workgroup sum of squares is duplicated. Requires
-/// every consumer to be a GEMV and nothing else to read the normalized
-/// values.
+fn rmsnorm_kernel(cols: u32, eps: f32) -> ReductionKernel {
+    use crate::schedule::{PointwiseDAG, Pw, ReduceOp, ReductionEpilogue, ReductionKernel};
+
+    const WG: u32 = 256;
+    // A power-of-two lane group at least as wide as the row preserves the
+    // existing tree-reduction order. Pack several narrow rows into the
+    // otherwise idle lanes of one workgroup.
+    let rows_per_workgroup = if (2..=32).contains(&cols) {
+        WG / cols.next_power_of_two()
+    } else {
+        1
+    };
+
+    // Prologue: v*v → scalar contribution to sum-of-squares.
+    let prologue = PointwiseDAG {
+        n_inputs: 1,
+        ops: vec![Pw::LoadInput(0), Pw::Mul(0, 0)],
+        output: 1,
+    };
+
+    // Epilogue inputs (per the canonical layout):
+    //   0 = src[row, col]    (per-elem)
+    //   1 = weight[col]      (per-col)
+    //   2 = sum_of_squares   (reduced scalar, always last)
+    //
+    // Computes: src * rsqrt(sum_sq * inv_cols + eps) * weight
+    let inv_cols = Pw::const_f32(1.0 / cols as f32);
+    let eps_c = Pw::const_f32(eps);
+    let epilogue_dag = PointwiseDAG {
+        n_inputs: 3,
+        ops: vec![
+            Pw::LoadInput(0), // v0 = src[row, col]
+            Pw::LoadInput(1), // v1 = weight[col]
+            Pw::LoadInput(2), // v2 = sum_of_squares
+            inv_cols,         // v3 = 1/cols
+            eps_c,            // v4 = eps
+            Pw::Mul(2, 3),    // v5 = mean_sq
+            Pw::Add(5, 4),    // v6 = mean_sq + eps
+            Pw::Rsqrt(6),     // v7 = rsqrt(...)
+            Pw::Mul(0, 7),    // v8 = src * rsqrt
+            Pw::Mul(8, 1),    // v9 = (src * rsqrt) * weight
+        ],
+        output: 9,
+    };
+
+    ReductionKernel {
+        op: ReduceOp::Sum,
+        prologue,
+        extra_prologues: vec![],
+        epilogue: Some(ReductionEpilogue {
+            dag: epilogue_dag,
+            n_per_col_inputs: 1,
+        }),
+        n_per_elem: 1,
+        n_per_row: 0,
+        workgroup_size: WG,
+        rows_per_workgroup,
+        gather_elem: Vec::new(),
+        input_row_repeats: Vec::new(),
+    }
+}
+
+fn is_plain_rmsnorm(dispatch: &Dispatch) -> bool {
+    if dispatch.shader != ShaderEntry::RmsNorm || dispatch.input_buffers.len() != 2 {
+        return false;
+    }
+    match dispatch.kernel {
+        Kernel::Default => true,
+        Kernel::Reduction(ref kernel) => {
+            // The shader entry survives pointwise/gather fusion. Only the
+            // canonical norm can be replaced by a dedicated runtime shader.
+            *kernel == rmsnorm_kernel(dispatch.params[1], f32::from_bits(dispatch.params[2]))
+        }
+        _ => false,
+    }
+}
+
+/// Fold a plain RmsNorm into its GEMV consumers, provided no other operation
+/// needs the materialized normalized values.
 pub fn fuse_rmsnorm_into_gemv(plan: &mut ExecutionPlan) {
     use std::collections::HashMap;
 
@@ -2098,7 +2157,7 @@ pub fn fuse_rmsnorm_into_gemv(plan: &mut ExecutionPlan) {
     let mut drop_norm: Vec<usize> = Vec::new();
     let mut rewrite: Vec<(usize, BufferRef, BufferRef, u32)> = Vec::new();
     for (ni, norm) in plan.dispatches.iter().enumerate() {
-        if norm.shader != ShaderEntry::RmsNorm || norm.input_buffers.len() < 2 {
+        if !is_plain_rmsnorm(norm) {
             continue;
         }
         let normed = norm.output_buffer;
@@ -2197,7 +2256,7 @@ pub fn fuse_rmsnorm_into_add(plan: &mut ExecutionPlan) {
     let mut drop_dispatches: Vec<usize> = Vec::new();
     let mut rewrite: Vec<(usize, usize, BufferRef)> = Vec::new();
     for (ni, norm) in plan.dispatches.iter().enumerate() {
-        if norm.shader != ShaderEntry::RmsNorm {
+        if !is_plain_rmsnorm(norm) {
             continue;
         }
         let normed = norm.output_buffer;
@@ -2260,6 +2319,8 @@ pub fn fuse_rmsnorm_into_add(plan: &mut ExecutionPlan) {
     log::info!("fuse_rmsnorm_into_add: fused {fused} norm+add pairs");
 }
 
+/// Replace a single-consumer plain RmsNorm with a row factor and cooperative
+/// matmul prologue. Scalar matmuls keep their materialized normalized input.
 pub fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
     use std::collections::HashMap;
 
@@ -2327,7 +2388,7 @@ pub fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
             continue;
         };
         let norm = &plan.dispatches[norm_idx];
-        if norm.shader != ShaderEntry::RmsNorm {
+        if !is_plain_rmsnorm(norm) {
             continue;
         }
         // RmsNorm output must be single-consumer (only this matmul reads it).
@@ -6019,65 +6080,8 @@ impl<'a> Compiler<'a> {
         cols: u32,
         eps: f32,
     ) {
-        use crate::schedule::{PointwiseDAG, Pw, ReduceOp, ReductionEpilogue, ReductionKernel};
-
-        const WG: u32 = 256;
-        // A power-of-two lane group at least as wide as the row preserves the
-        // existing tree-reduction order. Pack several narrow rows into the
-        // otherwise idle lanes of one workgroup.
-        let rows_per_workgroup = if (2..=32).contains(&cols) {
-            WG / cols.next_power_of_two()
-        } else {
-            1
-        };
-
-        // Prologue: v*v → scalar contribution to sum-of-squares.
-        let prologue = PointwiseDAG {
-            n_inputs: 1,
-            ops: vec![Pw::LoadInput(0), Pw::Mul(0, 0)],
-            output: 1,
-        };
-
-        // Epilogue inputs (per the canonical layout):
-        //   0 = src[row, col]    (per-elem)
-        //   1 = weight[col]      (per-col)
-        //   2 = sum_of_squares   (reduced scalar, always last)
-        //
-        // Computes: src * rsqrt(sum_sq * inv_cols + eps) * weight
-        let inv_cols = Pw::const_f32(1.0 / cols as f32);
-        let eps_c = Pw::const_f32(eps);
-        let epilogue_dag = PointwiseDAG {
-            n_inputs: 3,
-            ops: vec![
-                Pw::LoadInput(0), // v0 = src[row, col]
-                Pw::LoadInput(1), // v1 = weight[col]
-                Pw::LoadInput(2), // v2 = sum_of_squares
-                inv_cols,         // v3 = 1/cols
-                eps_c,            // v4 = eps
-                Pw::Mul(2, 3),    // v5 = mean_sq
-                Pw::Add(5, 4),    // v6 = mean_sq + eps
-                Pw::Rsqrt(6),     // v7 = rsqrt(...)
-                Pw::Mul(0, 7),    // v8 = src * rsqrt
-                Pw::Mul(8, 1),    // v9 = (src * rsqrt) * weight
-            ],
-            output: 9,
-        };
-
-        let kernel = ReductionKernel {
-            op: ReduceOp::Sum,
-            prologue,
-            extra_prologues: vec![],
-            epilogue: Some(ReductionEpilogue {
-                dag: epilogue_dag,
-                n_per_col_inputs: 1,
-            }),
-            n_per_elem: 1,
-            n_per_row: 0,
-            workgroup_size: WG,
-            rows_per_workgroup,
-            gather_elem: Vec::new(),
-            input_row_repeats: Vec::new(),
-        };
+        let kernel = rmsnorm_kernel(cols, eps);
+        let rows_per_workgroup = kernel.rows_per_workgroup;
 
         // Uses RmsNormData layout: src + bias (per-col weight) + dst + params.
         self.plan.dispatches.push(Dispatch {
@@ -6939,6 +6943,52 @@ mod tests {
                 .iter()
                 .all(|&count| count <= MAX_COMPUTE_WORKGROUPS_PER_DIMENSION)
         );
+    }
+
+    #[test]
+    fn rmsnorm_runtime_fusions_preserve_scheduled_inputs() {
+        for unary in [false, true] {
+            for consumer in 0..3 {
+                let mut graph = Graph::new();
+                let rows = if consumer == 2 { 32 } else { 1 };
+                let input = graph.input("input", &[rows, 64]);
+                let residual = graph.input("residual", &[rows, 64]);
+                let source = if unary {
+                    graph.silu(input)
+                } else {
+                    graph.add(input, residual)
+                };
+                let weight = graph.parameter("weight", &[64]);
+                let normalized = graph.rms_norm(source, weight, 1e-5);
+                let projection = graph.parameter("projection", &[64, 64]);
+                let output = if consumer == 0 {
+                    graph.add(normalized, residual)
+                } else {
+                    graph.matmul(normalized, projection)
+                };
+                graph.set_outputs(vec![output]);
+                let mut plan = compile(&graph);
+                let normalized = plan
+                    .dispatches
+                    .iter()
+                    .find(|dispatch| dispatch.shader == ShaderEntry::RmsNorm)
+                    .expect("scheduled normalization")
+                    .clone();
+                assert!(normalized.reduction().is_some());
+                assert!(!is_plain_rmsnorm(&normalized));
+                for dispatch in &mut plan.dispatches {
+                    if dispatch.shader == ShaderEntry::MatMul {
+                        dispatch.kernel = Kernel::Cooperative;
+                    }
+                }
+                match consumer {
+                    0 => fuse_rmsnorm_into_add(&mut plan),
+                    1 => fuse_rmsnorm_into_gemv(&mut plan),
+                    _ => fuse_rmsnorm_prologues(&mut plan),
+                }
+                assert!(plan.dispatches.contains(&normalized));
+            }
+        }
     }
 
     #[test]
