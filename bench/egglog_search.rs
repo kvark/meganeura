@@ -23,6 +23,10 @@ fn median(samples: &[f64]) -> f64 {
 fn qualify(session: &mut Session, reference: &[f64]) -> Result<f64, String> {
     session.step();
     session.wait();
+    verify(session, reference)
+}
+
+fn verify(session: &Session, reference: &[f64]) -> Result<f64, String> {
     let out = session.read_output(reference.len());
     let mut error = 0.0_f64;
     for (&actual, &expected) in out.iter().zip(reference) {
@@ -192,7 +196,7 @@ fn main() {
                 session.set_parameter("b", &b);
                 Ok(())
             },
-            |session| qualify(session, &reference).map(|_| ()),
+            |session| verify(session, &reference).map(|_| ()),
         )
         .unwrap();
         let samples: Vec<_> = (0..12).map(|_| sample(&mut selected)).skip(3).collect();

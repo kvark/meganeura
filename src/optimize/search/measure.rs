@@ -93,10 +93,12 @@ fn validate(
     session: &mut Session,
     state: &SearchState,
     trial: &mut Trial,
-    check: &mut impl FnMut(&mut Session) -> Result<(), String>,
+    check: &mut impl FnMut(&Session) -> Result<(), String>,
 ) -> Result<(), String> {
     restore(session, state, &mut trial.state_copy_time)?;
     let start = Instant::now();
+    session.step();
+    session.wait();
     let result = check(session);
     trial.qualification_time += start.elapsed();
     restore(session, state, &mut trial.state_copy_time)?;
@@ -113,10 +115,10 @@ fn validate(
 /// every trial, outside timing. Shared mutable parameters are rejected. Runtime
 /// optimizers/accumulation must be configured after search; updates explicitly in
 /// the plan are supported. Callbacks must not import external writable memory or
-/// change execution policy. `qualify` must not upload new inputs or weights; it
-/// executes one step and checks every observable
-/// output and state change against the
-/// caller's numerical contract before tuning, after tuning and after measurements.
+/// change execution policy. The selector executes exactly one step before each
+/// read-only `qualify` callback, which checks every observable output and state
+/// change against the caller's numerical contract before tuning, after tuning
+/// and after measurements.
 /// Completed kernel-class searches are reused only inside this call, with exact
 /// geometry, placement, precision, knobs and candidate order. Whole-program
 /// validation and timing are never reused.
@@ -133,7 +135,7 @@ pub fn select(
     runtime: SessionOptions,
     options: Options,
     mut initialize: impl FnMut(&mut Session, Option<&mut Session>) -> Result<(), String>,
-    mut qualify: impl FnMut(&mut Session) -> Result<(), String>,
+    mut qualify: impl FnMut(&Session) -> Result<(), String>,
 ) -> Result<(Session, Report), String> {
     options
         .tuning
@@ -341,8 +343,6 @@ mod tests {
                     Ok(())
                 },
                 |s| {
-                    s.step();
-                    s.wait();
                     let mut output = vec![0.0; 33 * 65];
                     s.read_output_by_index(0, &mut output);
                     if output.iter().all(|&v| v == 17.0 / 32.0) {
@@ -398,6 +398,92 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(super::plan_bytes(&plan).unwrap(), bytes + 8);
+    }
+
+    #[test]
+    #[ignore = "GPU qualification of compiled updates and invalid incumbent handling"]
+    fn program_search_preserves_update_and_failure_contracts() {
+        use super::*;
+        use crate::compile::{Dispatch, ShaderEntry};
+        let gpu = Arc::new(crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap());
+        let mut graph = crate::Graph::new();
+        let x = graph.input("x", &[2]);
+        let w = graph.parameter("w", &[2]);
+        let y = graph.mul(x, w);
+        let loss = graph.sum_all(y);
+        graph.set_outputs(vec![loss]);
+        let mut plan = crate::compile::compile(&crate::autodiff::differentiate(&graph));
+        let (w, grad) = plan.param_grad_pairs[0];
+        plan.dispatches.push(Dispatch {
+            shader: ShaderEntry::SgdUpdate,
+            input_buffers: vec![w, grad],
+            output_buffer: w,
+            workgroups: [1, 1, 1],
+            params: vec![2, 0.25f32.to_bits(), 0, 0],
+            ..Default::default()
+        });
+        for invalidate in [false, true] {
+            let initialized = std::cell::Cell::new(0);
+            let programs = ["baseline", "candidate"].map(|name| {
+                let mut plan = plan.clone();
+                plan.dispatches[0].label = name.into();
+                Program {
+                    description: name.into(),
+                    plan,
+                }
+            });
+            let result = select(
+                programs,
+                gpu.clone(),
+                SessionOptions::default(),
+                Options {
+                    tuning: TuneOptions {
+                        max_time: Duration::ZERO,
+                        sample_pairs: 4,
+                        ..Default::default()
+                    },
+                    warmup_runs: 2,
+                    max_time: Duration::from_secs(30),
+                    max_programs: 2,
+                    max_plan_bytes: 1 << 20,
+                },
+                |s, _| {
+                    initialized.set(initialized.get() + 1);
+                    s.set_input("x", &[2.0, 4.0]);
+                    s.set_parameter("w", &[3.0, 5.0]);
+                    Ok(())
+                },
+                |s| {
+                    if invalidate
+                        && initialized.get() == 2
+                        && s.plan().dispatches.iter().any(|d| d.label == "baseline")
+                    {
+                        return Err("injected incumbent qualification failure".into());
+                    }
+                    assert_eq!(s.read_loss(), 26.0);
+                    let mut gradient = [0.0; 2];
+                    s.read_param_grad("w", &mut gradient);
+                    assert_eq!(gradient, [2.0, 4.0]);
+                    assert_eq!(s.read_params(&["w"])[0], [2.5, 4.0]);
+                    Ok(())
+                },
+            );
+            if invalidate {
+                assert!(
+                    result
+                        .err()
+                        .unwrap()
+                        .contains("incumbent failed repeated qualification")
+                );
+            } else {
+                let (mut selected, report) = result.unwrap();
+                assert!(report.trials.iter().all(|t| t.outcome.qualified));
+                assert_eq!(selected.read_params(&["w"])[0], [3.0, 5.0]);
+                selected.step();
+                selected.wait();
+                assert_eq!(selected.read_params(&["w"])[0], [2.5, 4.0]);
+            }
+        }
     }
 
     #[test]
@@ -518,13 +604,6 @@ mod tests {
                     Ok(())
                 },
                 |s| {
-                    assert_eq!(
-                        s.read_params(&["k", "v"]),
-                        original,
-                        "a trial advanced the cache"
-                    );
-                    s.step();
-                    s.wait();
                     let actual = s.read_output(valid * 8);
                     assert_eq!(s.read_params(&["k", "v"]), changed);
                     if actual

@@ -108,9 +108,7 @@ pub fn run(args: &[String]) {
         s.set_parameter("k", &initial[0]);
         s.set_parameter("v", &initial[1]);
     };
-    let qualify = |s: &mut Session| -> Result<(), String> {
-        s.step();
-        s.wait();
+    let qualify = |s: &Session| -> Result<(), String> {
         if s.read_output(reference.len())
             .iter()
             .zip(&reference)
@@ -184,8 +182,12 @@ pub fn run(args: &[String]) {
             ..policy
         })
         .unwrap();
-    qualify(&mut baseline).unwrap();
-    qualify(&mut selected).unwrap();
+    baseline.step();
+    baseline.wait();
+    selected.step();
+    selected.wait();
+    qualify(&baseline).unwrap();
+    qualify(&selected).unwrap();
     let sample = |s: &mut Session| {
         let start = Instant::now();
         s.step();
@@ -206,8 +208,8 @@ pub fn run(args: &[String]) {
             before.push(sample(&mut baseline));
         }
     }
-    qualify(&mut baseline).unwrap();
-    qualify(&mut selected).unwrap();
+    qualify(&baseline).unwrap();
+    qualify(&selected).unwrap();
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({

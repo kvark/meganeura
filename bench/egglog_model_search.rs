@@ -108,6 +108,10 @@ fn initialize(
 fn check(session: &mut meganeura::Session, reference: &[f32]) -> Result<(f64, f64, f64), String> {
     session.step();
     session.wait();
+    verify(session, reference)
+}
+
+fn verify(session: &meganeura::Session, reference: &[f32]) -> Result<(f64, f64, f64), String> {
     let output = session.read_output(reference.len());
     let mut squared_error = 0.0;
     let mut max_error = 0.0f64;
@@ -363,7 +367,7 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
             initialize(session, incumbent, model, &mut parameters);
             Ok(())
         },
-        |session| check(session, reference).map(|_| ()),
+        |session| verify(session, reference).map(|_| ()),
     )
     .unwrap();
     let mut samples = Vec::new();
