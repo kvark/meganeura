@@ -79,9 +79,7 @@ profiler = ["dep:tracing-subscriber"]
 blade-graphics = { version = "0.9", git = "https://github.com/kvark/blade", rev = "eaff5092096aab136f11fa728b81c1bed3c0dcd4" }
 blade-macros = "0.3"
 # `default-features = false` drops egglog's `bin` stack (clap, mimalloc,
-# env_logger, chrono, graphviz). Greedy mode never constructs an EGraph
-# but the crate is still linked for the optional equality-saturation
-# modes.
+# env_logger, chrono, graphviz); library builds use the shared rewrite engine.
 egglog = { version = "2.0", default-features = false }
 bytemuck = { version = "1", features = ["derive"] }
 # Match Blade's Naga major: generated modules cross the public API boundary.

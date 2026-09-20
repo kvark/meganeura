@@ -11,8 +11,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-mod attention;
-mod submission;
+/// Qualified private-scratch comparisons within one graph search, on one device
+/// and under one numerical/timing policy. Never persisted or shared globally.
+#[derive(Default)]
+pub(crate) struct KernelMemo(
+    HashMap<(crate::compile::TuningKnobs, TuneClass, Vec<MatmulTile>), KernelProgress>,
+);
+
+#[derive(Clone, Copy)]
+struct KernelProgress {
+    selected: MatmulTile,
+    next_candidate: usize,
+}
 
 struct PhaseTimer<'a> {
     start: Instant,
@@ -426,15 +436,20 @@ impl Session {
     /// Winners live in this session, not the plan cache.
     /// No live graph execution occurs, including with optimizers or external buffers.
     /// Cooperative padding must fit each binding's declared size; the live
-    /// matrix bindings are never resized. Attention measures whole one- or
-    /// two-dispatch sequences at short, middle and full cache positions. Its
-    /// private partial storage may grow; old allocation contents and barrier
-    /// boundaries are preserved. Dispatch indices and profiling windows are
-    /// remapped when the sequence length changes. Sequential challenger
+    /// matrix bindings are never resized. Structural choices are made by
+    /// `build_measured` before allocation. Sequential challenger
     /// comparisons per class reuse the latest fully qualified winner as the
     /// incumbent. A soft deadline may be exceeded by one in-flight operation;
     /// an incomplete comparison always retains its incumbent.
     pub fn tune_with(&mut self, options: TuneOptions) -> Result<TuneReport, TuneError> {
+        self.tune_with_memo(options, None)
+    }
+
+    pub(crate) fn tune_with_memo(
+        &mut self,
+        options: TuneOptions,
+        mut memo: Option<&mut KernelMemo>,
+    ) -> Result<TuneReport, TuneError> {
         options.validate()?;
         let start = Instant::now();
         let (mut classes, mut excluded_dispatches) =
@@ -462,8 +477,33 @@ impl Session {
                 break;
             }
             report.visited_classes += 1;
+            let memo_key = (
+                self.plan.knobs,
+                class.key.clone(),
+                std::iter::once(class.initial)
+                    .chain(class.challengers.iter().copied())
+                    .collect(),
+            );
             let mut incumbent = class.initial;
-            for &candidate in &class.challengers {
+            let mut next_candidate = 0;
+            if let Some(&progress) = memo.as_ref().and_then(|m| m.0.get(&memo_key)) {
+                let selected = progress.selected;
+                if progress.next_candidate <= class.challengers.len()
+                    && (selected == class.initial || class.challengers.contains(&selected))
+                    && self
+                        .pipelines
+                        .ensure_tune_tile(&gpu, &self.plan.dispatches[class.members[0]], selected)
+                        .is_ok()
+                {
+                    for &index in &class.members {
+                        selected.apply(&mut self.plan.dispatches[index], &class.key);
+                    }
+                    report.reused_classes.push((class.key.clone(), selected));
+                    incumbent = selected;
+                    next_candidate = progress.next_candidate;
+                }
+            }
+            for (index, &candidate) in class.challengers.iter().enumerate().skip(next_candidate) {
                 if start.elapsed() >= options.max_time {
                     report.time_budget_exhausted = true;
                     break;
@@ -498,10 +538,31 @@ impl Session {
                 if let Some(ref failure) = outcome.failure {
                     log::warn!("tune: {failure}");
                 }
+                if outcome.qualified
+                    && matches!(
+                        outcome.decision,
+                        TuneDecision::FasterCandidate | TuneDecision::KeepBaseline
+                    )
+                {
+                    // Only skip a contiguous, fully measured prefix. A failed
+                    // or interrupted challenger is retried; later qualified
+                    // winners may still seed that retry.
+                    if index == next_candidate {
+                        next_candidate += 1;
+                    }
+                    if let Some(ref mut memo) = memo {
+                        memo.0.insert(
+                            memo_key.clone(),
+                            KernelProgress {
+                                selected: incumbent,
+                                next_candidate,
+                            },
+                        );
+                    }
+                }
                 report.outcomes.push(outcome);
             }
         }
-        self.tune_attention(&mut report, start, &mut staging);
         if staging.buffer.is_some()
             || report
                 .outcomes
@@ -521,7 +582,7 @@ impl Session {
             "tune: {}/{} classes visited, {} comparisons; {} dispatches excluded; {:.3}s; class limit={}, time limit={}",
             report.visited_classes,
             report.eligible_classes,
-            report.outcomes.len() + report.attention_outcomes.len(),
+            report.outcomes.len(),
             report.excluded_dispatches,
             report.elapsed.as_secs_f64(),
             report.class_limit_reached,
@@ -1518,6 +1579,93 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "GPU qualification of resumable private kernel searches"]
+    fn kernel_memo_resumes_only_qualified_comparisons() {
+        let gpu = std::sync::Arc::new(
+            crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap(),
+        );
+        let mut graph = crate::Graph::new();
+        let x = graph.input("x", &[33, 17]);
+        let w = graph.parameter("w", &[17, 65]);
+        let y = graph.matmul(x, w);
+        graph.set_outputs(vec![y]);
+        let plan = crate::compile::compile(&graph);
+        let create = || {
+            Session::with_context_opts(
+                plan.clone(),
+                gpu.clone(),
+                crate::SessionOptions {
+                    coop: crate::CoopPolicy::Disabled,
+                    ..Default::default()
+                },
+            )
+        };
+        let options = TuneOptions {
+            max_time: Duration::from_secs(30),
+            sample_pairs: 4,
+            dispatches_per_sample: 1,
+            ..Default::default()
+        };
+        let mut memo = KernelMemo::default();
+        let first = create()
+            .tune_with_memo(options.clone(), Some(&mut memo))
+            .unwrap();
+        assert!(first.outcomes.len() > 1);
+        assert!(first.outcomes.iter().all(|o| o.qualified));
+        assert!(!first.time_budget_exhausted);
+        assert_eq!(memo.0.len(), 1);
+        // Keep an actual qualified prefix, without timing-dependent sleeps or
+        // an assumed GPU speed to interrupt the first search at this point.
+        *memo.0.values_mut().next().unwrap() = KernelProgress {
+            selected: first.outcomes[0].selected,
+            next_candidate: 1,
+        };
+        let mut session = create();
+        session.set_input("x", &[0.25; 33 * 17]);
+        session.set_parameter("w", &[0.125; 17 * 65]);
+        let skipped = session
+            .tune_with_memo(
+                TuneOptions {
+                    max_time: Duration::ZERO,
+                    ..options.clone()
+                },
+                Some(&mut memo),
+            )
+            .unwrap();
+        assert!(skipped.outcomes.is_empty() && skipped.reused_classes.is_empty());
+        assert_eq!(memo.0.values().next().unwrap().next_candidate, 1);
+        let resumed = session
+            .tune_with_memo(options.clone(), Some(&mut memo))
+            .unwrap();
+        assert_eq!(resumed.reused_classes.len(), 1);
+        assert_eq!(resumed.outcomes.len(), first.outcomes.len() - 1);
+        assert!(resumed.outcomes.iter().all(|o| o.qualified));
+        assert_eq!(
+            resumed
+                .outcomes
+                .iter()
+                .map(|o| o.candidate)
+                .collect::<Vec<_>>(),
+            first.outcomes[1..]
+                .iter()
+                .map(|o| o.candidate)
+                .collect::<Vec<_>>()
+        );
+        session.step();
+        session.wait();
+        assert!(
+            session
+                .read_output(33 * 65)
+                .iter()
+                .all(|&x| x == 17.0 / 32.0)
+        );
+        assert_eq!(session.read_params(&["w"])[0], [0.125; 17 * 65]);
+        let complete = create().tune_with_memo(options, Some(&mut memo)).unwrap();
+        assert_eq!(complete.reused_classes.len(), 1);
+        assert!(complete.outcomes.is_empty());
+    }
+
+    #[test]
     fn int_dot_candidates_never_fall_back_or_change_arithmetic() {
         let shape = crate::codegen::GemvShape {
             threads: 64,
@@ -1849,27 +1997,6 @@ mod tests {
             }
             values
         };
-        let before = state(&a);
-        let schedule = a
-            .tune_submissions(crate::tune::TuneSubmissionOptions {
-                max_chunks: 4,
-                sample_pairs: 4,
-                ..Default::default()
-            })
-            .unwrap();
-        assert!(!schedule.outcomes.is_empty());
-        assert_ne!(schedule.skipped, Some(TuneDecision::InvalidOutput));
-        assert!(
-            schedule
-                .outcomes
-                .iter()
-                .all(|o| o.decision != TuneDecision::InvalidOutput)
-        );
-        assert_eq!(
-            state(&a),
-            before,
-            "submission tuning changed training state"
-        );
         let class = collect_classes(&b.plan, &b.alias, None).0.remove(0);
         let alternative = if convolution {
             MatmulTile::SpecializedConv {

@@ -17,7 +17,7 @@
 //! Meganeura: graph-optimized neural network framework on blade-graphics.
 //!
 //! Models are defined as declarative computation graphs, optimized with
-//! greedy rewrites by default (or optional equality saturation via egglog),
+//! bounded equality saturation through egglog,
 //! and compiled to static GPU dispatch sequences — no manual CUDA-graphing
 //! needed.
 
@@ -72,7 +72,7 @@ pub use train::{
     build_session_unoptimized, compile_training_graph,
 };
 pub use tune::{
-    MatmulTile, TuneAttention, TuneClass, TuneConv2d, TuneDecision, TuneError, TuneOptions,
-    TunePhaseTimes, TunePreparationTimes, TuneQualificationTimes, TuneReport, TuneScope,
-    TuneScratchStats, TuneScratchUsage, TuneStaging, TuneStagingReuse,
+    MatmulTile, TuneClass, TuneConv2d, TuneDecision, TuneError, TuneOptions, TunePhaseTimes,
+    TunePreparationTimes, TuneQualificationTimes, TuneReport, TuneScope, TuneScratchStats,
+    TuneScratchUsage, TuneStaging, TuneStagingReuse,
 };

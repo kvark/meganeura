@@ -7,6 +7,9 @@ use crate::{
 };
 use std::{path::Path, sync::Arc};
 
+mod search;
+pub use search::{BuildSearchOptions, BuildSearchReport, BuildSearchTrial, build_measured};
+
 /// Optimizer selection.
 #[derive(Clone, Debug)]
 pub enum Optimizer {
@@ -349,21 +352,51 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, optimiz
         }
     }
 
+    let (final_graph, report) =
+        prepare_graph(forward_graph, mode, cfg.optimize, skip_full_optimize);
+    let plan = {
+        let _span = tracing::info_span!("compile").entered();
+        compile::compile_owned_with_caps(final_graph, &options, coop_caps)
+    };
+    log::info!(
+        "execution plan: {} buffers, {} dispatches",
+        plan.buffers.len(),
+        plan.dispatches.len()
+    );
+
+    if let Some(path) = cache_path {
+        if let Err(e) = cache::save_build_plan(&plan, forward_graph, build_hash, path) {
+            log::warn!("failed to save cache: {}", e);
+        } else {
+            log::info!("saved execution plan cache to {}", path.display());
+        }
+    }
+
+    let session = make_session(plan, gpu, cfg.runtime.clone(), cfg.tune);
+    (session, report)
+}
+
+fn prepare_graph(
+    forward_graph: &Graph,
+    mode: Mode,
+    optimize: optimize::OptimizeConfig,
+    skip_full_optimize: bool,
+) -> (Graph, optimize::OptimizeReport) {
     let (optimized_forward, forward_report) = {
         let _span = tracing::info_span!("optimize_forward").entered();
-        optimize::optimize_with_config(forward_graph, cfg.optimize)
+        optimize::optimize_with_config(forward_graph, optimize)
     };
     log::info!(
         "optimized forward: {} nodes",
         optimized_forward.nodes().len()
     );
 
-    let (final_graph, report) = match mode {
+    match mode {
         Mode::Inference => {
             let mut g = optimized_forward;
             let mut fusions = Vec::new();
             optimize::apply_group_norm_silu_fusions(&mut g, &mut fusions);
-            optimize::apply_winograd_conv_fusions(&mut g, &mut fusions, &cfg.optimize);
+            optimize::apply_winograd_conv_fusions(&mut g, &mut fusions, &optimize);
             for (name, count) in fusions.iter().fold(
                 std::collections::BTreeMap::<&str, usize>::new(),
                 |mut acc, entry| {
@@ -394,31 +427,10 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, optimiz
                 (full, forward_report)
             } else {
                 let _span = tracing::info_span!("optimize_full").entered();
-                optimize::optimize_owned_with_config(full, cfg.optimize)
+                optimize::optimize_owned_with_config(full, optimize)
             }
         }
-    };
-
-    let plan = {
-        let _span = tracing::info_span!("compile").entered();
-        compile::compile_owned_with_caps(final_graph, &options, coop_caps)
-    };
-    log::info!(
-        "execution plan: {} buffers, {} dispatches",
-        plan.buffers.len(),
-        plan.dispatches.len()
-    );
-
-    if let Some(path) = cache_path {
-        if let Err(e) = cache::save_build_plan(&plan, forward_graph, build_hash, path) {
-            log::warn!("failed to save cache: {}", e);
-        } else {
-            log::info!("saved execution plan cache to {}", path.display());
-        }
     }
-
-    let session = make_session(plan, gpu, cfg.runtime.clone(), cfg.tune);
-    (session, report)
 }
 
 fn make_session(

@@ -1,5 +1,6 @@
 # Unreleased
 
+- Use one egglog rewrite engine and calibrated whole-program search instead of live attention/submission retuning.
 - Broadcast scalar gradients directly and eliminate single-row RoPE at static position zero.
 - Fix split-attention partial indexing and clear empty splits when reusing a KV cache.
 - Measure mapped versus staged readback per allocation and size; reuse bounded staging for faster CPU reads.
@@ -22,7 +23,7 @@
   is a pure function under test, so the config tests don't flip env vars.
   The six stragglers that still read the environment inline are typed
   options now: `MEGANEURA_OPTIMIZER` neighbors `GREEDY_PACK_SWIGLU`
-  (`OptimizeConfig::greedy_pack_swiglu`), `MATMUL_K_STAGE` and
+  (`OptimizeConfig::pack_swiglu`), `MATMUL_K_STAGE` and
   `MEGANEURA_INTERLEAVE_COLUMNS` ride `TuningKnobs` into the matmul
   codegen, and `MEGANEURA_DEVICE_PARAMETERS` / `MEGANEURA_REUSE_UPLOAD`
   are `SessionOptions` fields. All are registered and documented in the

@@ -831,7 +831,7 @@ pub struct Node {
 }
 
 /// How a derived parameter is computed from its source(s).
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ParamTransform {
     /// Horizontal concatenation: interleave source columns per row.
     HorizontalConcat,

@@ -45,17 +45,21 @@ MEGANEURA_COOP_F16=1 target/release/examples/gguf_latency model.gguf /tmp/meg 30
 ```
 
 Run engines and GPUs sequentially, without competing builds or profilers.
-Repeat in fresh processes and reverse engine order. The optional budget is
-seconds per session; `0` disables tuning. Kernel probes use 256 MiB of scratch
-and unchanged numerical qualification. An optional fifth argument selects
-`all`, `dense` or `attention` for attribution experiments.
+Repeat in fresh processes and reverse engine order. The optional budget is a soft
+construction-time limit in seconds per session; `0` disables measured search.
+It includes compilation, initialization, qualification and measurements. In-flight
+driver calls cannot be preempted. Private kernel probes retain their full
+qualification and the diagnostic's original 256 MiB scratch limit.
 
-With `all`, initialized representative inputs also enter a separate two-second
-submission search (1% minimum gain plus the paired noise guard; library default
-5%). Writable allocations are privately copied with identical aliasing and
-placement, and checked bitwise, including during timing. Runtime-appended
-optimizers and readback are excluded from scheduling samples. All preparation,
-priming and searches count toward `prepare_ms`.
+`build_measured` compares graph forms, kernel choices and submission chunks in one
+complete-plan search. Each candidate checks every logit and cache element against
+an untuned reference (`atol=1e-5`, `rtol=1e-4`), with full staged readback.
+Decode calibration primes that cache through the middle of the decode range
+(position 144). Trials reset private mutable state;
+selected prefill/decode sessions share caches only after search. Reference
+preparation and priming are outside the search budget but inside `prepare_ms`.
+The old scope argument and separate live submission tuner are removed. Historical
+measurements below retain their original protocol and revision.
 
 Known staged output downloads are queued before the CPU wait. Initial probes
 and mapped reads still wait first. `decode_record_finish_ms` reports CPU

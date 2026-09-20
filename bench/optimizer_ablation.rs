@@ -23,7 +23,6 @@ enum Phase {
 fn parse_mode(value: &str) -> OptimizeMode {
     match value {
         "off" => OptimizeMode::Off,
-        "greedy" => OptimizeMode::Greedy,
         "egglog-windowed" | "windowed" => OptimizeMode::EgglogWindowed,
         "egglog-outlined" | "outlined" => OptimizeMode::EgglogOutlined,
         "egglog-whole" | "whole" => OptimizeMode::EgglogWhole,

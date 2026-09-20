@@ -84,28 +84,6 @@ fn run(chunks: usize, layers: usize, rows: usize, dim: usize, steps: usize) -> V
         }
         if chunks == 1 && step == 0 {
             reference = Some(out.clone());
-            let report = session
-                .tune_submissions(meganeura::tune::TuneSubmissionOptions {
-                    max_chunks: 8,
-                    sample_pairs: 4,
-                    warmup_runs: 0,
-                    ..Default::default()
-                })
-                .unwrap();
-            assert!((1..=8).contains(&report.selected));
-            assert!(matches!(
-                report.skipped,
-                None | Some(meganeura::tune::TuneDecision::TimeBudget)
-            ));
-            assert!(
-                report
-                    .outcomes
-                    .iter()
-                    .all(|o| o.decision != meganeura::tune::TuneDecision::InvalidOutput)
-            );
-            let mut after = vec![0.0; out.len()];
-            session.read_output_by_index(0, &mut after);
-            assert_eq!(after, out, "submission tuning changed the live output");
         }
     }
     reference.unwrap_or(out)

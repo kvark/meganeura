@@ -227,14 +227,13 @@ fn chunked_relative_attention_matches_blocked_reference() {
 
 #[test]
 fn cached_block_writes_only_valid_rows_and_selects_last() {
-    // Search once on a ragged sliding-window case; the other cases cover geometry.
-    for (max_seq, window, dim, tune) in [
-        (6, 0, 4, false),
-        (96, 0, 4, false),
-        (96, 37, 4, false),
-        (96, 0, 64, false),
-        (96, 37, 80, true),
-        (6, 0, 512, false),
+    for (max_seq, window, dim, splits) in [
+        (6, 0, 4, 1),
+        (96, 0, 4, 2),
+        (96, 37, 4, 4),
+        (96, 0, 64, 8),
+        (96, 37, 80, 16),
+        (6, 0, 512, 4),
     ] {
         let block = 3;
         let mut graph = Graph::new();
@@ -256,6 +255,7 @@ fn cached_block_writes_only_valid_rows_and_selects_last() {
 
         let mut config = meganeura::SessionConfig::inference_from_env();
         config.tune = false;
+        config.options.cached_attention_splits = Some(splits);
         let mut session = meganeura::build(&graph, config).0;
         session.set_input("q", &vec![0.0; block * 2 * dim]);
         let new_k: Vec<_> = (0..block * dim)
@@ -351,39 +351,6 @@ fn cached_block_writes_only_valid_rows_and_selects_last() {
             session.step();
             session.wait();
             assert_close(&session.read_output(2 * dim), &expected, 1e-5);
-        }
-        if tune {
-            let before = session.read_output(2 * dim);
-            let report = session
-                .tune_with(meganeura::tune::TuneOptions {
-                    scope: meganeura::tune::TuneScope::Attention,
-                    max_time: std::time::Duration::from_secs(30),
-                    sample_pairs: 4,
-                    dispatches_per_sample: 1,
-                    ..Default::default()
-                })
-                .unwrap();
-            assert_eq!(report.eligible_classes, 1);
-            assert!(!report.time_budget_exhausted);
-            assert!(!report.attention_outcomes.is_empty());
-            assert!(
-                report.attention_outcomes.iter().all(|o| o.qualified),
-                "{report:?}"
-            );
-            assert_eq!(
-                session.read_output(2 * dim),
-                before,
-                "tuning mutated live output"
-            );
-            session.step();
-            session.wait();
-            assert_close(&session.read_output(2 * dim), &before, 1e-5);
-            let encoded = serde_json::to_vec(&report).unwrap();
-            let decoded: meganeura::tune::TuneReport = serde_json::from_slice(&encoded).unwrap();
-            assert_eq!(
-                decoded.attention_outcomes.len(),
-                report.attention_outcomes.len()
-            );
         }
     }
 }
