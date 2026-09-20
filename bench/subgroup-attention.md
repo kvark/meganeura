@@ -65,11 +65,13 @@ target/release/examples/egglog_model_search \
 
 | Search order | Query tiles selected | Control | Selected | Paired reduction |
 | --- | ---: | ---: | ---: | ---: |
-| Forward | 2 | 4.961 ms | 4.029 ms | 18.8% |
-| Reverse | 4 | 4.966 ms | 3.982 ms | 19.8% |
-| Forward | 2 | 4.954 ms | 4.020 ms | 18.8% |
+| Forward | 2 | 4.897 ms | 3.991 ms | 18.6% |
+| Reverse | 4 | 4.892 ms | 3.944 ms | 19.4% |
+| Forward | 2 | 4.886 ms | 3.985 ms | 18.5% |
 
-All three win 40/40 held-out pairs. Search costs 2.0–3.4 seconds with warm
+These final repeats use `95d55651f411ae68e2b19a59d1082562d5c4a2bf`, including
+the store-ownership correction below in both the control and candidates.
+All three win 39/40 held-out pairs. Search costs 2.7–3.9 seconds with warm
 caches and four candidates, not a cold compiler comparison. The 2% guard
 does not reliably distinguish two from four tiles; neither becomes a
 hard-coded universal choice.
@@ -96,6 +98,8 @@ Fresh Nsight Systems 2026.4.1 captures at
 `52a9f25545cdd0ba0aedf9c74a34af22d62dfcd1` compare the greedy program,
 the original-graph 99-product scalar split-K program, and the same program
 with serial reductions. All complete and pass full-output validation.
+These captures predate the store-ownership correction described below;
+they identify the kernel costs, not final production performance.
 
 Despite requesting individual Vulkan workload tracing, this driver reports
 GPU work at `vkQueueSubmit` granularity. Match each workload's correlation ID
@@ -153,19 +157,36 @@ The last two use fixed-32 ablation branches, not capability-independent defaults
 The cooperative split-K oracle checks full F64 products across normal/AT/BT
 directions, ragged edges and uneven K partitions. The independent-row trial
 also passes the 26 existing skinny-matrix checks with F16 explicitly enabled.
-The general subgroup contract and store ownership need a separate correctness
-review before promoting cooperative layouts.
-
-In particular, Naga 30 emits subgroup-scoped cooperative matrices, while the
+Naga 30 emits subgroup-scoped cooperative matrices, while the
 old 64-thread generator addresses the same output tiles from each subgroup.
 Passing numerical checks is not proof that overlapping stores are race-free.
 The [Vulkan memory model](https://docs.vulkan.org/spec/latest/appendices/memorymodel.html#memory-model-data-race)
 does not exempt equal-value writes, and the
 [cooperative-matrix scope contract](https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_cooperative_matrix.html)
-is per scope instance. This is a source-level correctness concern, not an
-observed output divergence in these runs. Independent tile ownership avoids
-that overlap in the tested layouts; F32 and other subgroup widths still need
-a portable treatment.
+is per scope instance. This was found from source and the specification, not
+from an observed output divergence in these runs.
+
+The follow-up at `95d55651f411ae68e2b19a59d1082562d5c4a2bf` guards only the
+stores of duplicated tiles with `subgroup_id == 0`. Staging, matrix arithmetic
+and workgroup barriers stay unchanged. Independent-query candidates keep
+their separate output tiles. This does not assume a 32-lane subgroup or add
+another tuning parameter. Unlike subgroup-conditional matrix arithmetic,
+the store-only guard passes Naga validation without disabling checks.
+
+The production form is `789bcb60e82d8a2993a440acb500bf53b797cbeb` in PR #200:
+matrix, convolution and attention forward/gradient generators, including
+horizontal matrix wrappers. All 31 existing code-generation checks and
+all-target/all-feature Clippy pass. NVIDIA passes the existing 26 skinny-matrix,
+four convolution, full attention oracle, 11 convolution-derivative and Q/K/V
+gradient checks. Intel fallback checks pass; its two explicitly cooperative-only
+convolution tests stop at their existing capability assertion, not a numerical
+failure. No new test executable or relaxed tolerance is needed.
+
+Three before/after process pairs leave complete SmolVLA and Whisper CPU errors
+unchanged. Stable process medians suggest a small SmolVLA cost (~1%) and a small
+Whisper reduction (~2%), with other pairs showing substantial timing drift.
+This is a correctness fix, not a claimed speedup. The main model-search
+comparison is repeated with corrected stores in both control and candidates.
 
 All studies use sequential GPUs/builds, bounded host memory and unchanged
 numerical gates. Raw traces, JSON and frozen binaries stay outside Git.

@@ -71,7 +71,7 @@ from finishing all enumerated plans.
 ## Workload and reproduction
 
 Measured implementation:
-`3d65bb05c8e497a527f6d77cf9592f68f39065b4`.
+`95d55651f411ae68e2b19a59d1082562d5c4a2bf`.
 Blade:
 `2b328f8b643798813d8c9319b807030215d33b98`.
 Inferena model/reference code:
@@ -96,15 +96,15 @@ python bench/egglog_reference.py ../inferena SmolVLA /tmp/smolvla.f32
 CARGO_BUILD_JOBS=1 cargo build --release --features models --example egglog_model_search
 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json \
   taskset -c 0,2,4,6,8,10 target/release/examples/egglog_model_search \
-  SmolVLA /tmp/smolvla.f32 fast --original-graph --serial-sums \
+  SmolVLA /tmp/smolvla.f32 fast --serial-sums \
   --warmup=32 --seconds=120 --confirm
 # Repeat with --reverse; only challengers are reversed.
 # For B570: intel_icd.json and strict instead of fast.
 # For a shorter search: --seconds=20. For warmup ablation: --warmup=8.
 ```
 
-At the measured revision, `--original-graph` is required; later revisions make
-it the default and retain `--optimized-graph` for the earlier diagnostic.
+The original graph is the default; `--optimized-graph` retains the earlier
+diagnostic. Before `52a9f25`, the helper required `--original-graph` instead.
 `--static` disables inner kernel tuning only. `--profile` adds separate
 instrumented pass samples, not headline latency. Later `--program=N` selects
 one fully expanded plan for attribution; older revisions applied it before
@@ -118,20 +118,30 @@ These are warm-cache process starts, not cold driver-compilation measurements.
 
 ## SmolVLA results
 
-Default 32 warmup pairs, complete 45-plan search. Times are held-out medians
-in milliseconds; reduction is the median paired reduction.
+Default 32 warmup pairs, complete 45-plan search. Both control and candidates
+include the single-subgroup-writer correction described in the kernel report.
+Times are held-out medians in milliseconds; reduction is the median paired
+reduction.
 
 | GPU / search order | Greedy, freshly tuned | Selected | Reduction | Search cost |
 | --- | ---: | ---: | ---: | ---: |
-| RTX 5070 / forward | 4.454 | 3.656 | 17.9% | 33.1 s |
-| RTX 5070 / reverse | 4.443 | 3.646 | 17.9% | 32.3 s |
-| B570 / forward | 9.856 | 6.140 | 37.6% | 42.9 s |
-| B570 / reverse | 9.800 | 6.122 | 37.5% | 47.9 s |
+| RTX 5070 / forward | 4.475 | 3.633 | 18.9% | 33.2 s |
+| RTX 5070 / reverse | 4.501 | 3.654 | 18.8% | 32.3 s |
+| B570 / forward | 9.800 | 6.133 | 37.7% | 42.6 s |
+| B570 / reverse | 9.822 | 6.125 | 37.6% | 47.9 s |
 
 All four selected plans win all 40 held-out pairs. Full CPU relative L2 stays
 below 5.6e-6. Selection reaches 99 split products plus serial row reductions.
 Forward order chooses width 64, reverse width 256; the noise guard does not
 establish a universal winning width.
+
+### Budget and warmup ablations
+
+The following cost ablations use `3d65bb05c8e497a527f6d77cf9592f68f39065b4`,
+before the store-only correction. That revision's full searches give roughly
+18%/37.5% reductions, with the same selected graph families and numerical errors.
+The table above repeats the main comparison after the correction; these
+historical ablations are not presented as additional final-revision samples.
 
 With a 20-second bound and the same warmup policy, NVIDIA visits 27/26 plans
 and retains 18.2%/13.7% reductions; Intel visits 13/12 and retains 32.1%/23.8%.
