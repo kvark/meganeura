@@ -16,9 +16,12 @@ pub struct Program {
     pub plan: ExecutionPlan,
 }
 
+#[derive(Clone, Serialize)]
 pub struct Options {
     /// Per-program kernel tuning and paired whole-step decision policy.
     pub tuning: TuneOptions,
+    /// Whole-program warmup pairs, independent of private kernel warmup.
+    pub warmup_runs: u32,
     /// Soft total deadline, including construction, initialization and validation.
     /// In-flight driver work and caller validation cannot be preempted.
     pub max_time: Duration,
@@ -41,6 +44,7 @@ pub struct Trial {
 
 #[derive(Serialize)]
 pub struct Report {
+    pub options: Options,
     pub selected: usize,
     pub trials: Vec<Trial>,
     pub elapsed: Duration,
@@ -102,6 +106,7 @@ pub fn select(
     }
     let start = Instant::now();
     let mut report = Report {
+        options: options.clone(),
         selected: 0,
         trials: Vec::new(),
         elapsed: Duration::ZERO,
@@ -164,7 +169,7 @@ pub fn select(
                 validate(&mut candidate)?;
                 trial.outcome.qualified = true;
                 if let Some(ref mut baseline) = incumbent {
-                    for _ in 0..options.tuning.warmup_runs {
+                    for _ in 0..options.warmup_runs {
                         if start.elapsed() >= options.max_time {
                             break;
                         }
@@ -254,6 +259,7 @@ mod tests {
                     ..Default::default()
                 },
                 Options {
+                    warmup_runs: 1,
                     tuning: TuneOptions {
                         max_time: budget,
                         sample_pairs: 4,

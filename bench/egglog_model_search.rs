@@ -278,7 +278,6 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
             Duration::from_secs(2)
         },
         max_classes: 32,
-        warmup_runs: 32,
         sample_pairs: 12,
         min_improvement: 0.02,
         ..Default::default()
@@ -302,6 +301,7 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
         runtime.clone(),
         search::measure::Options {
             tuning: tuning.clone(),
+            warmup_runs: 32,
             max_time: Duration::from_secs(search_seconds),
             max_programs: 64,
             max_plan_bytes: 3 * 1024 * 1024 * 1024,

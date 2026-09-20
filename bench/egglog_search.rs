@@ -169,6 +169,7 @@ fn main() {
                 ..Default::default()
             },
             search::measure::Options {
+                warmup_runs: 3,
                 tuning: meganeura::TuneOptions {
                     max_time: std::time::Duration::from_millis(200),
                     min_improvement: 0.02,
