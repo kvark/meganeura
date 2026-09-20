@@ -2,7 +2,8 @@
 //! Usage: egglog_model_search MODEL [REFERENCE.f32|optimized] [fast] [baseline]
 //! Options: --static, --confirm, --reverse, --profile, --original-graph,
 //! --attention-tiles, --cooperative-split,
-//! --program=N (one generated plan, for attribution), --serial-sums, --seconds=N.
+//! --program=N (one generated plan, for attribution), --serial-sums,
+//! --seconds=N, --warmup=N (whole-program warmup pairs; default 32).
 use meganeura::{
     Graph,
     models::{smolvla, whisper},
@@ -16,30 +17,51 @@ fn initialize(
     model: &str,
     parameters: &mut std::collections::HashMap<(String, usize), Vec<f32>>,
 ) {
-    for (name, buffer) in session.plan().param_buffers.clone() {
-        if let Some(source) = incumbent.as_deref_mut() {
-            let target = session.plan();
-            let origin = source.plan();
-            let compatible = origin
+    // A complete matching interface can share prepared derived weights too.
+    // Otherwise initialize dependent sources normally so transforms are rebuilt.
+    let mut shareable = std::collections::HashSet::new();
+    if let Some(source) = incumbent.as_ref() {
+        let target = session.plan();
+        let origin = source.plan();
+        for (name, buffer) in &target.param_buffers {
+            let matches = origin
                 .param_buffers
                 .iter()
-                .find(|p| p.0 == name)
+                .find(|p| &p.0 == name)
                 .is_some_and(|p| {
-                    target.param_types.contains_key(&buffer)
-                        && target.param_types.get(&buffer) == origin.param_types.get(&p.1)
-                        && target.weight_buffers.get(&buffer) == origin.weight_buffers.get(&p.1)
-                        && !origin.derived_params.iter().any(|d| d.0 == p.1)
-                })
-                && !target
+                    let transform = |plan: &meganeura::compile::ExecutionPlan, b| {
+                        plan.derived_params
+                            .iter()
+                            .find(|d| d.0 == b)
+                            .map(|d| (d.1.clone(), d.2.clone()))
+                    };
+                    target.param_types.contains_key(buffer)
+                        && target.param_types.get(buffer) == origin.param_types.get(&p.1)
+                        && target.weight_buffers.get(buffer) == origin.weight_buffers.get(&p.1)
+                        && transform(target, *buffer) == transform(origin, p.1)
+                });
+            if matches {
+                shareable.insert(name.clone());
+            }
+        }
+        if shareable.len() != target.param_buffers.len() {
+            for (name, buffer) in &target.param_buffers {
+                if target
                     .derived_params
                     .iter()
-                    .any(|d| d.0 == buffer || d.1.iter().any(|source| source.0 == name));
-            if compatible {
-                // Same deterministic named tensor; derived weights still take
-                // the ordinary initialization path, including their transforms.
-                session.share_parameter_from(source, &name).unwrap();
-                continue;
+                    .any(|d| d.0 == *buffer || d.1.iter().any(|source| source.0 == *name))
+                {
+                    shareable.remove(name);
+                }
             }
+        }
+    }
+    for (name, buffer) in session.plan().param_buffers.clone() {
+        if shareable.contains(&name) {
+            session
+                .share_parameter_from(incumbent.as_deref_mut().unwrap(), &name)
+                .unwrap();
+            continue;
         }
         let len = session.plan().buffers[buffer.0 as usize] / 4;
         let values = parameters.entry((name.clone(), len)).or_insert_with(|| {
@@ -320,13 +342,19 @@ fn measure(model: &str, graph: Graph, reference: &[f32], fast: bool, baseline: b
         })
         .unwrap_or(180);
     let mut parameters = std::collections::HashMap::new();
+    let warmup_runs = std::env::args()
+        .find_map(|arg| {
+            arg.strip_prefix("--warmup=")
+                .map(|n| n.parse::<u32>().unwrap())
+        })
+        .unwrap_or(32);
     let (mut session, report) = search::measure::select(
         programs,
         gpu.clone(),
         runtime.clone(),
         search::measure::Options {
             tuning: tuning.clone(),
-            warmup_runs: 32,
+            warmup_runs,
             max_time: Duration::from_secs(search_seconds),
             max_programs: 64,
             max_plan_bytes: 3 * 1024 * 1024 * 1024,
